@@ -208,6 +208,24 @@ pkill simple_server
 - Error handling paths tested
 - Security tests (path traversal, malformed requests)
 
+### Troubleshooting tests
+
+If `zig build test` appears to run but prints no tests or no output, try the following steps:
+
+- Ensure you are running the command from the repository root (where `build.zig` lives).
+- Run tests for a single module to confirm they run: `zig test src/http/response.zig`.
+- If individual module tests run but `zig build test` does not, verify `build.zig` exposes the test step and that the root module imports the modules with tests.
+- Check your Zig version (`zig version`) — use Zig 0.14.x as the project expects.
+- For CI/debugging, run individual module tests or create a small test runner file that imports modules with tests and run `zig test` on it.
+
+If you want, report the `zig` output and I can help diagnose further.
+
+Quick visibility tip: when everything passes `zig build test` can appear to print nothing. To force a summary of all test results, run:
+
+```bash
+zig build test --summary all
+```
+
 ## Security Considerations
 
 When contributing, please ensure:
@@ -227,7 +245,7 @@ When contributing, please ensure:
 
 ## Project Roadmap
 
-See CLAUDE.md for the complete nginx feature parity roadmap.
+See PLAN.md for the complete nginx feature parity roadmap and contribution instructions.
 
 ### Current Priority (Tier 1: MVP)
 
@@ -246,6 +264,19 @@ See CLAUDE.md for the complete nginx feature parity roadmap.
 10. Virtual hosts
 11. Location routing
 12. TLS termination
+
+## Contributing to the Plan
+
+If you'd like to propose roadmap changes or additions, follow these steps:
+
+1. Create a `changes/` document for your proposal (e.g. `changes/feature-name.md`) that includes:
+   - Overview of the feature
+   - Scope and files to change
+   - Testing plan and acceptance criteria
+
+2. Open a pull request that includes your `changes/` document and any updates to `PLAN.md` to reflect the proposed status.
+
+3. Discuss and iterate on the PR until it is merged. The `PLAN.md` is the single source of truth for roadmap priorities.
 
 ## Getting Help
 

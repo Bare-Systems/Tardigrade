@@ -57,6 +57,8 @@ public/
     └── logo.png    # Served at /images/logo.png
 ```
 
+Directory index behavior: requests to a directory will serve `index.html` or `index.htm` if present. Directories requested without a trailing slash will be redirected with `301 Moved Permanently` to the trailing-slash form (for correct relative asset resolution).
+
 ### Example Requests
 
 ```bash
@@ -77,7 +79,7 @@ curl -v http://localhost:8069/
 
 All responses include:
 - `Date`: Current timestamp in RFC 7231 format
-- `Server`: Server identification (simple-server/0.3.0)
+- `Server`: Server identification (simple-server/0.4.1)
 - `Content-Type`: Automatically detected from file extension
 - `Content-Length`: Size of response body
 
@@ -119,16 +121,8 @@ This project is under active development. See [CHANGELOG.md](CHANGELOG.md) for r
 
 ### Roadmap
 
-- [x] HTTP/1.1 request parsing
-- [x] Response builder with proper headers
-- [x] MIME type detection
-- [x] Error responses
-- [ ] Keep-alive connections
-- [ ] Configuration file
-- [ ] TLS/HTTPS support
-- [ ] Reverse proxy
-- [ ] Load balancing
-- [ ] HTTP/2
+
+Note: See [PLAN.md](PLAN.md) for the full roadmap and prioritized work.
 
 ## Contributing
 

@@ -6,7 +6,28 @@ const Version = @import("version.zig").Version;
 
 /// Server name and version for Server header
 pub const SERVER_NAME = "simple-server";
-pub const SERVER_VERSION = "0.3.0";
+pub const SERVER_VERSION = "0.4.1";
+
+// Try to load a custom error page from `public/errors/<code>.html`.
+fn loadCustomErrorPage(allocator: Allocator, status: Status) ?[]const u8 {
+    var path_buf: [64]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "public/errors/{d}.html", .{ status.code() }) catch return null;
+
+    var file = std.fs.cwd().openFile(path, .{}) catch return null;
+    defer file.close();
+
+    const stat = file.stat() catch return null;
+    const file_size = @as(usize, stat.size);
+    if (file_size == 0) return null;
+
+    const buf = allocator.alloc(u8, file_size) catch return null;
+    const bytes_read = file.readAll(buf) catch {
+        allocator.free(buf);
+        return null;
+    };
+
+    return buf[0..bytes_read];
+}
 
 /// HTTP Response builder
 pub const Response = struct {
@@ -227,14 +248,24 @@ pub const Response = struct {
     /// Create a 400 Bad Request response
     pub fn badRequest(allocator: Allocator, message: []const u8) Response {
         var resp = Response.init(allocator);
-        _ = resp.setStatus(.bad_request).setBody(message).setContentType("text/plain; charset=utf-8");
+        const custom = loadCustomErrorPage(allocator, .bad_request);
+        if (custom) |c| {
+            _ = resp.setStatus(.bad_request).setBodyOwned(c).setContentType("text/html; charset=utf-8");
+        } else {
+            _ = resp.setStatus(.bad_request).setBody(message).setContentType("text/plain; charset=utf-8");
+        }
         return resp;
     }
 
     /// Create a 401 Unauthorized response
     pub fn unauthorized(allocator: Allocator, realm: []const u8) Response {
         var resp = Response.init(allocator);
-        _ = resp.setStatus(.unauthorized).setBody("Unauthorized");
+        const custom = loadCustomErrorPage(allocator, .unauthorized);
+        if (custom) |c| {
+            _ = resp.setStatus(.unauthorized).setBodyOwned(c).setContentType("text/html; charset=utf-8");
+        } else {
+            _ = resp.setStatus(.unauthorized).setBody("Unauthorized");
+        }
 
         var buf: [256]u8 = undefined;
         const auth_header = std.fmt.bufPrint(&buf, "Basic realm=\"{s}\"", .{realm}) catch "Basic";
@@ -246,14 +277,24 @@ pub const Response = struct {
     /// Create a 403 Forbidden response
     pub fn forbidden(allocator: Allocator) Response {
         var resp = Response.init(allocator);
-        _ = resp.setStatus(.forbidden).setBody("Forbidden").setContentType("text/plain; charset=utf-8");
+        const custom = loadCustomErrorPage(allocator, .forbidden);
+        if (custom) |c| {
+            _ = resp.setStatus(.forbidden).setBodyOwned(c).setContentType("text/html; charset=utf-8");
+        } else {
+            _ = resp.setStatus(.forbidden).setBody("Forbidden").setContentType("text/plain; charset=utf-8");
+        }
         return resp;
     }
 
     /// Create a 404 Not Found response
     pub fn notFound(allocator: Allocator) Response {
         var resp = Response.init(allocator);
-        _ = resp.setStatus(.not_found).setBody("Not Found").setContentType("text/plain; charset=utf-8");
+        const custom = loadCustomErrorPage(allocator, .not_found);
+        if (custom) |c| {
+            _ = resp.setStatus(.not_found).setBodyOwned(c).setContentType("text/html; charset=utf-8");
+        } else {
+            _ = resp.setStatus(.not_found).setBody("Not Found").setContentType("text/plain; charset=utf-8");
+        }
         return resp;
     }
 
@@ -288,7 +329,12 @@ pub const Response = struct {
     /// Create a 500 Internal Server Error response
     pub fn internalServerError(allocator: Allocator) Response {
         var resp = Response.init(allocator);
-        _ = resp.setStatus(.internal_server_error).setBody("Internal Server Error").setContentType("text/plain; charset=utf-8");
+        const custom = loadCustomErrorPage(allocator, .internal_server_error);
+        if (custom) |c| {
+            _ = resp.setStatus(.internal_server_error).setBodyOwned(c).setContentType("text/html; charset=utf-8");
+        } else {
+            _ = resp.setStatus(.internal_server_error).setBody("Internal Server Error").setContentType("text/plain; charset=utf-8");
+        }
         return resp;
     }
 
@@ -302,21 +348,36 @@ pub const Response = struct {
     /// Create a 502 Bad Gateway response
     pub fn badGateway(allocator: Allocator) Response {
         var resp = Response.init(allocator);
-        _ = resp.setStatus(.bad_gateway).setBody("Bad Gateway").setContentType("text/plain; charset=utf-8");
+        const custom = loadCustomErrorPage(allocator, .bad_gateway);
+        if (custom) |c| {
+            _ = resp.setStatus(.bad_gateway).setBodyOwned(c).setContentType("text/html; charset=utf-8");
+        } else {
+            _ = resp.setStatus(.bad_gateway).setBody("Bad Gateway").setContentType("text/plain; charset=utf-8");
+        }
         return resp;
     }
 
     /// Create a 503 Service Unavailable response
     pub fn serviceUnavailable(allocator: Allocator) Response {
         var resp = Response.init(allocator);
-        _ = resp.setStatus(.service_unavailable).setBody("Service Unavailable").setContentType("text/plain; charset=utf-8");
+        const custom = loadCustomErrorPage(allocator, .service_unavailable);
+        if (custom) |c| {
+            _ = resp.setStatus(.service_unavailable).setBodyOwned(c).setContentType("text/html; charset=utf-8");
+        } else {
+            _ = resp.setStatus(.service_unavailable).setBody("Service Unavailable").setContentType("text/plain; charset=utf-8");
+        }
         return resp;
     }
 
     /// Create a 504 Gateway Timeout response
     pub fn gatewayTimeout(allocator: Allocator) Response {
         var resp = Response.init(allocator);
-        _ = resp.setStatus(.gateway_timeout).setBody("Gateway Timeout").setContentType("text/plain; charset=utf-8");
+        const custom = loadCustomErrorPage(allocator, .gateway_timeout);
+        if (custom) |c| {
+            _ = resp.setStatus(.gateway_timeout).setBodyOwned(c).setContentType("text/html; charset=utf-8");
+        } else {
+            _ = resp.setStatus(.gateway_timeout).setBody("Gateway Timeout").setContentType("text/plain; charset=utf-8");
+        }
         return resp;
     }
 
@@ -384,8 +445,10 @@ test "404 response" {
 
     const output = stream.getWritten();
     try testing.expect(std.mem.startsWith(u8, output, "HTTP/1.1 404 Not Found\r\n"));
-    // Headers are lowercased when stored
-    try testing.expect(std.mem.indexOf(u8, output, "content-type: text/plain") != null);
+    // Headers are lowercased when stored. Accept plain text or html if a custom page is present.
+    const has_plain = std.mem.indexOf(u8, output, "content-type: text/plain") != null;
+    const has_html = std.mem.indexOf(u8, output, "content-type: text/html") != null;
+    try testing.expect(has_plain or has_html);
 }
 
 test "redirect response" {

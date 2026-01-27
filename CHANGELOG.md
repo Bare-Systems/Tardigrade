@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.4.1] - 2026-01-27
+
+### Added
+- Custom error pages (public/errors/*.html)
+  - Serve `public/errors/<status>.html` when present for 400, 401, 403, 404, 500, 502, 503, 504
+  - Fall back to short plain-text responses when no custom page exists
+  - Sample custom pages added for 404 and 500 in `public/errors/`
+
+### Changed
+- Bumped `Server` identification to `simple-server/0.4.1` in responses
+
 ## [0.4.0] - 2026-01-27
 
 ### Added

@@ -101,11 +101,8 @@ fn readRequest(stream: std.net.Stream, buf: []u8, is_keep_alive: bool) ReadResul
 
     // For keep-alive connections, we need to handle timeout for the first read
     // For initial connection, we can wait indefinitely
-    const initial_timeout: ?u32 = if (is_keep_alive) KEEP_ALIVE_TIMEOUT_MS * 1000 else null; // microseconds
-
-    // Set read timeout for keep-alive
-    if (initial_timeout) |timeout| {
-        stream.handle.setReadTimeout(.{ .sec = 0, .usec = timeout }) catch {};
+    if (is_keep_alive) {
+        setSocketTimeout(stream.handle, @intCast(KEEP_ALIVE_TIMEOUT_MS / 1000), @intCast((KEEP_ALIVE_TIMEOUT_MS % 1000) * 1000));
     }
 
     // First read - may timeout on keep-alive
@@ -122,8 +119,8 @@ fn readRequest(stream: std.net.Stream, buf: []u8, is_keep_alive: bool) ReadResul
 
     total_read = first_read;
 
-    // Remove timeout for subsequent reads
-    stream.handle.setReadTimeout(.{ .sec = 30, .usec = 0 }) catch {};
+    // Remove timeout for subsequent reads (30 seconds)
+    setSocketTimeout(stream.handle, 30, 0);
 
     // Continue reading until we have complete headers
     while (total_read < buf.len) {
@@ -140,6 +137,14 @@ fn readRequest(stream: std.net.Stream, buf: []u8, is_keep_alive: bool) ReadResul
     }
 
     return .{ .bytes_read = total_read, .timed_out = false };
+}
+
+fn setSocketTimeout(handle: std.posix.socket_t, sec: i32, usec: i32) void {
+    const timeout = std.posix.timeval{
+        .sec = sec,
+        .usec = usec,
+    };
+    std.posix.setsockopt(handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch {};
 }
 
 fn sendParseError(allocator: std.mem.Allocator, stream: std.net.Stream, err: http.ParseError, keep_alive: bool) !void {
@@ -167,20 +172,84 @@ fn serveFile(allocator: std.mem.Allocator, path: []const u8, stream: std.net.Str
         return;
     }
 
+    // Build filesystem path
+    var path_buffer: [512]u8 = undefined;
     const fs_path = if (std.mem.eql(u8, path, "/"))
-        "public/index.html"
+        "public"
     else blk: {
-        var buffer: [512]u8 = undefined;
-        const result = std.fmt.bufPrint(&buffer, "public{s}", .{path}) catch {
+        const result = std.fmt.bufPrint(&path_buffer, "public{s}", .{path}) catch {
             var response = http.Response.uriTooLong(allocator);
             defer response.deinit();
             _ = response.setConnection(keep_alive);
             try response.write(writer);
             return;
         };
+        // Remove trailing slash for stat check
+        if (result.len > 0 and result[result.len - 1] == '/') {
+            break :blk result[0 .. result.len - 1];
+        }
         break :blk result;
     };
 
+    // Check if path is a directory
+    const stat_result = std.fs.cwd().statFile(fs_path) catch {
+        var response = http.Response.notFound(allocator);
+        defer response.deinit();
+        _ = response.setConnection(keep_alive);
+        try response.write(writer);
+        return;
+    };
+
+    if (stat_result.kind == .directory) {
+        // If directory and path doesn't end with /, redirect
+        if (path.len > 0 and path[path.len - 1] != '/') {
+            var redirect_buf: [513]u8 = undefined;
+            const redirect_path = std.fmt.bufPrint(&redirect_buf, "{s}/", .{path}) catch {
+                var response = http.Response.uriTooLong(allocator);
+                defer response.deinit();
+                _ = response.setConnection(keep_alive);
+                try response.write(writer);
+                return;
+            };
+            var response = http.Response.movedPermanently(allocator, redirect_path);
+            defer response.deinit();
+            _ = response.setConnection(keep_alive);
+            try response.write(writer);
+            return;
+        }
+
+        // Try index files (use separate buffer to avoid aliasing with fs_path)
+        var index_buffer: [512]u8 = undefined;
+        const index_path = tryIndexFile(fs_path, &index_buffer) orelse {
+            var response = http.Response.notFound(allocator);
+            defer response.deinit();
+            _ = response.setConnection(keep_alive);
+            try response.write(writer);
+            return;
+        };
+
+        return serveFileContent(allocator, index_path, writer, head_only, keep_alive);
+    }
+
+    // Regular file
+    return serveFileContent(allocator, fs_path, writer, head_only, keep_alive);
+}
+
+/// Try to find an index file in the given directory path
+fn tryIndexFile(dir_path: []const u8, buffer: *[512]u8) ?[]const u8 {
+    const index_files = [_][]const u8{ "/index.html", "/index.htm" };
+
+    for (index_files) |index| {
+        const full_path = std.fmt.bufPrint(buffer, "{s}{s}", .{ dir_path, index }) catch continue;
+        // Check if file exists
+        std.fs.cwd().access(full_path, .{}) catch continue;
+        return full_path;
+    }
+    return null;
+}
+
+/// Serve the actual file content
+fn serveFileContent(allocator: std.mem.Allocator, fs_path: []const u8, writer: anytype, head_only: bool, keep_alive: bool) !void {
     var file = std.fs.cwd().openFile(fs_path, .{}) catch {
         var response = http.Response.notFound(allocator);
         defer response.deinit();

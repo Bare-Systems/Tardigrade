@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.4.0] - 2026-01-27
+
+### Added
+- Directory index support (index.html, index.htm)
+  - Requests to directories automatically serve index.html or index.htm
+  - Directories without trailing slash get 301 redirect (e.g., /docs → /docs/)
+  - Returns 404 if no index file exists in the directory
+
+### Changed
+- Refactored `serveFile` into smaller functions for clarity
+- Fixed keep-alive socket timeout to use POSIX `setsockopt` (macOS/Linux compatible)
+
 ## [0.3.0] - 2026-01-27
 
 ### Added

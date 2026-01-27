@@ -220,15 +220,22 @@ fn serveFile(allocator: std.mem.Allocator, path: []const u8, stream: std.net.Str
 
         // Try index files (use separate buffer to avoid aliasing with fs_path)
         var index_buffer: [512]u8 = undefined;
-        const index_path = tryIndexFile(fs_path, &index_buffer) orelse {
-            var response = http.Response.notFound(allocator);
-            defer response.deinit();
-            _ = response.setConnection(keep_alive);
-            try response.write(writer);
-            return;
-        };
+        const index_path = tryIndexFile(fs_path, &index_buffer);
+        if (index_path) |p| {
+            return serveFileContent(allocator, p, writer, head_only, keep_alive);
+        }
 
-        return serveFileContent(allocator, index_path, writer, head_only, keep_alive);
+        // No index file found; if auto-index is enabled, serve directory listing
+        if (isAutoIndexEnabled()) {
+            try serveDirectoryListing(allocator, fs_path, path, writer, head_only, keep_alive);
+            return;
+        }
+
+        var response = http.Response.notFound(allocator);
+        defer response.deinit();
+        _ = response.setConnection(keep_alive);
+        try response.write(writer);
+        return;
     }
 
     // Regular file
@@ -398,6 +405,106 @@ fn getContentType(path: []const u8) []const u8 {
     });
 
     return content_types.get(extension) orelse "application/octet-stream";
+}
+
+/// Return true if environment enables auto-indexing.
+fn isAutoIndexEnabled() bool {
+    const val = std.os.getenv("SIMPLE_SERVER_AUTO_INDEX");
+    if (val) |v| {
+        if (v.len == 0) return false;
+        const c = v[0];
+        if (c == '1' or c == 't' or c == 'T' or c == 'y' or c == 'Y') return true;
+    }
+    return false;
+}
+
+fn htmlEscapeAppend(list: *std.ArrayList(u8), s: []const u8) !void {
+    for (s) |b| {
+        switch (b) {
+            '<' => try list.appendSlice("&lt;"),
+            '>' => try list.appendSlice("&gt;"),
+            '&' => try list.appendSlice("&amp;"),
+            '"' => try list.appendSlice("&quot;"),
+            else => try list.append(b),
+        }
+    }
+}
+
+fn urlEncodeAppend(list: *std.ArrayList(u8), s: []const u8) !void {
+    const hex = "0123456789ABCDEF";
+    for (s) |b| {
+        // Encode control, non-ascii, space
+        if (b <= 0x20 or b >= 0x7f) {
+            try list.append('%');
+            try list.append(hex[(b >> 4) & 0xF]);
+            try list.append(hex[b & 0xF]);
+            continue;
+        }
+
+        // Reserved or unsafe characters
+        switch (b) {
+            '#' , '%' , '?' , '&' , '"' , '\'' , '<' , '>' => {
+                try list.append('%');
+                try list.append(hex[(b >> 4) & 0xF]);
+                try list.append(hex[b & 0xF]);
+            },
+            else => try list.append(b),
+        }
+    }
+}
+
+/// Generate and write a simple HTML directory listing for `dir_fs_path`.
+fn serveDirectoryListing(allocator: std.mem.Allocator, dir_fs_path: []const u8, uri_path: []const u8, writer: anytype, head_only: bool, keep_alive: bool) !void {
+    var dir = try std.fs.cwd().openDir(dir_fs_path, .{});
+    defer dir.close();
+
+    var list = std.ArrayList(u8).init(allocator);
+    defer list.deinit();
+
+    try list.appendSlice("<!doctype html><html><head><meta charset=\"utf-8\">\n");
+    try list.appendSlice("<title>Index of ");
+    try htmlEscapeAppend(&list, uri_path);
+    try list.appendSlice("</title>\n</head><body>\n");
+    try list.appendSlice("<h1>Index of ");
+    try htmlEscapeAppend(&list, uri_path);
+    try list.appendSlice("</h1>\n<pre>\n");
+
+    // Parent link if not root
+    if (!(uri_path.len == 1 and uri_path[0] == '/')) {
+        try list.appendSlice("<a href=\"../\">../</a>\n");
+    }
+
+    var it = dir.iterate();
+    while (it.next()) |entry| {
+        // name is a []const u8
+        const name = entry.name;
+        // append link
+        try list.appendSlice("<a href=\"");
+        // href = uri_path + name (+ '/' if directory)
+        try urlEncodeAppend(&list, uri_path);
+        try urlEncodeAppend(&list, name);
+        if (entry.kind == .directory) {
+            try list.append('/');
+        }
+        try list.appendSlice("\">");
+        try htmlEscapeAppend(&list, name);
+        if (entry.kind == .directory) {
+            try list.append('/');
+        }
+        try list.appendSlice("</a>\n");
+    }
+
+    try list.appendSlice("</pre>\n<hr>\n</body></html>\n");
+
+    var response = http.Response.ok(allocator, list.toOwnedSlice(), "text/html; charset=utf-8");
+    defer response.deinit();
+    _ = response.setConnection(keep_alive);
+
+    if (head_only) {
+        try response.writeHead(writer);
+    } else {
+        try response.write(writer);
+    }
 }
 
 test {

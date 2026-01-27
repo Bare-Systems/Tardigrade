@@ -4,6 +4,25 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.3.0] - 2026-01-27
+
+### Added
+- HTTP Response builder module (`src/http/response.zig`)
+  - Builder pattern for constructing HTTP responses
+  - Auto-generated Date header (RFC 7231 format)
+  - Auto-generated Server header (simple-server/0.3.0)
+  - Auto-calculated Content-Length
+  - Convenience constructors for common responses (ok, notFound, redirect, etc.)
+- HTTP Status code module (`src/http/status.zig`)
+  - All standard HTTP status codes (1xx-5xx)
+  - Status code to reason phrase mapping
+  - Helper methods (isSuccess, isError, isRedirection, etc.)
+
+### Changed
+- Refactored main.zig to use Response builder
+- All responses now include Date and Server headers
+- Method Not Allowed (405) responses now include Allow header
+
 ## [0.2.0] - 2026-01-26
 
 ### Added

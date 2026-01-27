@@ -59,7 +59,7 @@ fn handleConnection(stream: *const std.net.Stream) !void {
     // Parse the request
     const parse_result = http.Request.parse(allocator, request_data, MAX_BODY_SIZE) catch |err| {
         std.log.err("Parse error: {}", .{err});
-        try sendError(writer, err);
+        try sendParseError(allocator, writer, err);
         return;
     };
     var request = parse_result.request;
@@ -74,37 +74,34 @@ fn handleConnection(stream: *const std.net.Stream) !void {
     // Handle the request based on method
     switch (request.method) {
         .GET, .HEAD => {
-            try serveFile(request.uri.path, writer, request.method == .HEAD);
+            try serveFile(allocator, request.uri.path, writer, request.method == .HEAD);
         },
         else => {
-            try sendResponse(writer, 405, "Method Not Allowed", "Method Not Allowed");
+            var response = http.Response.methodNotAllowed(allocator, "GET, HEAD");
+            defer response.deinit();
+            try response.write(writer);
         },
     }
 }
 
-fn sendError(writer: anytype, err: http.ParseError) !void {
-    switch (err) {
-        error.InvalidMethod => try sendResponse(writer, 501, "Not Implemented", "Unsupported HTTP method"),
-        error.InvalidVersion => try sendResponse(writer, 505, "HTTP Version Not Supported", "HTTP Version Not Supported"),
-        error.BodyTooLarge => try sendResponse(writer, 413, "Payload Too Large", "Request body too large"),
-        error.HeaderTooLarge, error.HeadersTooLarge, error.TooManyHeaders => try sendResponse(writer, 431, "Request Header Fields Too Large", "Headers too large"),
-        else => try sendResponse(writer, 400, "Bad Request", "Malformed request"),
-    }
+fn sendParseError(allocator: std.mem.Allocator, writer: anytype, err: http.ParseError) !void {
+    var response = switch (err) {
+        error.InvalidMethod => http.Response.notImplemented(allocator),
+        error.InvalidVersion => http.Response.httpVersionNotSupported(allocator),
+        error.BodyTooLarge => http.Response.payloadTooLarge(allocator),
+        error.HeaderTooLarge, error.HeadersTooLarge, error.TooManyHeaders => http.Response.headersTooLarge(allocator),
+        else => http.Response.badRequest(allocator, "Malformed request"),
+    };
+    defer response.deinit();
+    try response.write(writer);
 }
 
-fn sendResponse(writer: anytype, status: u16, status_text: []const u8, body: []const u8) !void {
-    try writer.print("HTTP/1.1 {d} {s}\r\n", .{ status, status_text });
-    try writer.print("Content-Type: text/plain\r\n", .{});
-    try writer.print("Content-Length: {d}\r\n", .{body.len});
-    try writer.print("Connection: close\r\n", .{});
-    try writer.print("\r\n", .{});
-    try writer.writeAll(body);
-}
-
-fn serveFile(path: []const u8, writer: anytype, head_only: bool) !void {
+fn serveFile(allocator: std.mem.Allocator, path: []const u8, writer: anytype, head_only: bool) !void {
     // Prevent path traversal
     if (std.mem.indexOf(u8, path, "..") != null) {
-        try sendResponse(writer, 403, "Forbidden", "Access denied");
+        var response = http.Response.forbidden(allocator);
+        defer response.deinit();
+        try response.write(writer);
         return;
     }
 
@@ -113,43 +110,113 @@ fn serveFile(path: []const u8, writer: anytype, head_only: bool) !void {
     else blk: {
         var buffer: [512]u8 = undefined;
         const result = std.fmt.bufPrint(&buffer, "public{s}", .{path}) catch {
-            try sendResponse(writer, 414, "URI Too Long", "URI Too Long");
+            var response = http.Response.uriTooLong(allocator);
+            defer response.deinit();
+            try response.write(writer);
             return;
         };
         break :blk result;
     };
 
     var file = std.fs.cwd().openFile(fs_path, .{}) catch {
-        try sendResponse(writer, 404, "Not Found", "Not Found");
+        var response = http.Response.notFound(allocator);
+        defer response.deinit();
+        try response.write(writer);
         return;
     };
     defer file.close();
 
-    // Get file size
+    // Get file size and read content
     const stat = file.stat() catch {
-        try sendResponse(writer, 500, "Internal Server Error", "Internal Server Error");
+        var response = http.Response.internalServerError(allocator);
+        defer response.deinit();
+        try response.write(writer);
         return;
     };
     const file_size = stat.size;
 
-    // Determine content type
-    const content_type = getContentType(fs_path);
+    // For small files, read into memory and use response builder
+    // For large files, stream directly
+    if (file_size <= 1024 * 1024) { // 1MB threshold
+        const content = allocator.alloc(u8, file_size) catch {
+            var response = http.Response.internalServerError(allocator);
+            defer response.deinit();
+            try response.write(writer);
+            return;
+        };
+        defer allocator.free(content);
 
-    // Send headers
-    try writer.print("HTTP/1.1 200 OK\r\n", .{});
-    try writer.print("Content-Type: {s}\r\n", .{content_type});
-    try writer.print("Content-Length: {d}\r\n", .{file_size});
-    try writer.print("Connection: close\r\n", .{});
-    try writer.print("\r\n", .{});
+        const bytes_read = file.readAll(content) catch {
+            var response = http.Response.internalServerError(allocator);
+            defer response.deinit();
+            try response.write(writer);
+            return;
+        };
 
-    // Send body (unless HEAD request)
-    if (!head_only) {
-        var file_reader = file.reader();
-        var read_buf: [4096]u8 = undefined;
-        while (true) {
-            const n = try file_reader.read(&read_buf);
-            if (n == 0) break;
-            try writer.writeAll(read_buf[0..n]);
+        const content_type = getContentType(fs_path);
+        var response = http.Response.ok(allocator, content[0..bytes_read], content_type);
+        defer response.deinit();
+
+        if (head_only) {
+            try response.writeHead(writer);
+        } else {
+            try response.write(writer);
+        }
+    } else {
+        // Stream large files directly
+        const content_type = getContentType(fs_path);
+
+        var response = http.Response.init(allocator);
+        defer response.deinit();
+        _ = response.setStatus(.ok).setContentType(content_type);
+
+        // Manually build response with streaming body
+        try writer.print("{s} {d} {s}\r\n", .{
+            response.version.toString(),
+            response.status.code(),
+            response.status.phrase(),
+        });
+
+        // Write date
+        const timestamp = std.time.timestamp();
+        const epoch_secs: std.time.epoch.EpochSeconds = .{ .secs = @intCast(timestamp) };
+        const day_secs = epoch_secs.getDaySeconds();
+        const epoch_day = epoch_secs.getEpochDay();
+        const year_day = epoch_day.calculateYearDay();
+        const month_day = year_day.calculateMonthDay();
+
+        // Day names starting from Thursday (epoch day 0 = 1970-01-01 = Thursday)
+        const day_names = [_][]const u8{ "Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed" };
+        const month_names = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+
+        const day_of_week = @mod(epoch_day.day, 7);
+        const day_name = day_names[day_of_week];
+        const month_name = month_names[@intFromEnum(month_day.month) - 1];
+
+        try writer.print("Date: {s}, {d:0>2} {s} {d} {d:0>2}:{d:0>2}:{d:0>2} GMT\r\n", .{
+            day_name,
+            month_day.day_index + 1, // day_index is 0-based
+            month_name,
+            year_day.year,
+            day_secs.getHoursIntoDay(),
+            day_secs.getMinutesIntoHour(),
+            day_secs.getSecondsIntoMinute(),
+        });
+
+        try writer.print("Server: {s}/{s}\r\n", .{ http.SERVER_NAME, http.SERVER_VERSION });
+        try writer.print("Content-Type: {s}\r\n", .{content_type});
+        try writer.print("Content-Length: {d}\r\n", .{file_size});
+        try writer.writeAll("\r\n");
+
+        // Stream body (unless HEAD request)
+        if (!head_only) {
+            var file_reader = file.reader();
+            var read_buf: [8192]u8 = undefined;
+            while (true) {
+                const n = try file_reader.read(&read_buf);
+                if (n == 0) break;
+                try writer.writeAll(read_buf[0..n]);
+            }
         }
     }
 }

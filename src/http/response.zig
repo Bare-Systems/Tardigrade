@@ -491,3 +491,37 @@ test "date header format" {
     try testing.expect(std.mem.indexOf(u8, output, "Date: ") != null);
     try testing.expect(std.mem.indexOf(u8, output, " GMT\r\n") != null);
 }
+
+test "connection header when setConnection(true)" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var response = Response.init(allocator);
+    defer response.deinit();
+
+    _ = response.setBody("hi").setConnection(true);
+
+    var buf: [256]u8 = undefined;
+    var stream = std.io.fixedBufferStream(&buf);
+    try response.write(stream.writer());
+
+    const output = stream.getWritten();
+    try testing.expect(std.mem.indexOf(u8, output, "connection: keep-alive\r\n") != null);
+}
+
+test "connection header when setConnection(false)" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var response = Response.init(allocator);
+    defer response.deinit();
+
+    _ = response.setBody("hi").setConnection(false);
+
+    var buf: [256]u8 = undefined;
+    var stream = std.io.fixedBufferStream(&buf);
+    try response.write(stream.writer());
+
+    const output = stream.getWritten();
+    try testing.expect(std.mem.indexOf(u8, output, "connection: close\r\n") != null);
+}

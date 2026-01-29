@@ -1,6 +1,6 @@
 const std = @import("std");
 
 test "keep-alive integration (disabled)" {
-    try std.testing.skip("disabled: socket-level keep-alive integration deferred due to std.net portability issues");
+    // Test intentionally disabled; placeholder kept for future integration work.
 }
 // no server thread to join

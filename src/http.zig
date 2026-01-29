@@ -14,6 +14,7 @@ pub const request = @import("http/request.zig");
 pub const status = @import("http/status.zig");
 pub const response = @import("http/response.zig");
 pub const autoindex = @import("http/autoindex.zig");
+pub const dates = @import("http/dates.zig");
 
 // Re-export constants
 pub const MAX_HEADERS = headers.MAX_HEADERS;

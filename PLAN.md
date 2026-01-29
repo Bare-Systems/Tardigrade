@@ -69,7 +69,7 @@ Based on comprehensive research of nginx capabilities, here is everything needed
  - [x] Directory listing (autoindex)
 - [ ] Range requests (partial content, byte ranges)
 - [ ] ETag generation and If-None-Match
-- [ ] Last-Modified and If-Modified-Since
+ - [x] Last-Modified and If-Modified-Since
 - [ ] Content-Encoding negotiation
 - [ ] sendfile() zero-copy optimization
 

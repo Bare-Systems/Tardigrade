@@ -75,7 +75,7 @@ fn handleConnection(stream: std.net.Stream) !void {
         // Handle the request based on method
         switch (request.method) {
             .GET, .HEAD => {
-                try serveFile(allocator, request.uri.path, stream, request.method == .HEAD, keep_alive);
+                try serveFile(allocator, &request, stream, request.method == .HEAD, keep_alive);
             },
             else => {
                 var response = http.Response.methodNotAllowed(allocator, "GET, HEAD");
@@ -161,8 +161,9 @@ fn sendParseError(allocator: std.mem.Allocator, stream: std.net.Stream, err: htt
     try response.write(stream.writer());
 }
 
-fn serveFile(allocator: std.mem.Allocator, path: []const u8, stream: std.net.Stream, head_only: bool, keep_alive: bool) !void {
+fn serveFile(allocator: std.mem.Allocator, request: *http.Request, stream: std.net.Stream, head_only: bool, keep_alive: bool) !void {
     const writer = stream.writer();
+    const path = request.uri.path;
 
     // Prevent path traversal
     if (std.mem.indexOf(u8, path, "..") != null) {
@@ -223,7 +224,7 @@ fn serveFile(allocator: std.mem.Allocator, path: []const u8, stream: std.net.Str
         var index_buffer: [512]u8 = undefined;
         const index_path = tryIndexFile(fs_path, &index_buffer);
         if (index_path) |p| {
-            return serveFileContent(allocator, p, writer, head_only, keep_alive);
+            return serveFileContent(allocator, request, p, writer, head_only, keep_alive);
         }
 
         // No index file found; generate autoindex listing if enabled
@@ -249,7 +250,7 @@ fn serveFile(allocator: std.mem.Allocator, path: []const u8, stream: std.net.Str
     }
 
     // Regular file
-    return serveFileContent(allocator, fs_path, writer, head_only, keep_alive);
+    return serveFileContent(allocator, request, fs_path, writer, head_only, keep_alive);
 }
 
 /// Try to find an index file in the given directory path
@@ -266,7 +267,7 @@ fn tryIndexFile(dir_path: []const u8, buffer: *[512]u8) ?[]const u8 {
 }
 
 /// Serve the actual file content
-fn serveFileContent(allocator: std.mem.Allocator, fs_path: []const u8, writer: anytype, head_only: bool, keep_alive: bool) !void {
+fn serveFileContent(allocator: std.mem.Allocator, request: *http.Request, fs_path: []const u8, writer: anytype, head_only: bool, keep_alive: bool) !void {
     var file = std.fs.cwd().openFile(fs_path, .{}) catch {
         var response = http.Response.notFound(allocator);
         defer response.deinit();
@@ -285,6 +286,39 @@ fn serveFileContent(allocator: std.mem.Allocator, fs_path: []const u8, writer: a
         return;
     };
     const file_size = stat.size;
+
+    // Get file mtime via OS stat for portability
+    var last_mod_str_buf: [64]u8 = undefined;
+    var last_mod_slice: []const u8 = "";
+    const os_stat = std.os.stat(fs_path) catch null;
+    var msecs_opt: ?usize = null;
+    if (os_stat) |s| {
+        // Attempt to read mtime seconds (platform dependent field name)
+        const msecs = @intCast(usize, s.st_mtime);
+        msecs_opt = msecs;
+
+        const epoch_secs: std.time.epoch.EpochSeconds = .{ .secs = msecs };
+        const day_secs = epoch_secs.getDaySeconds();
+        const epoch_day = epoch_secs.getEpochDay();
+        const year_day = epoch_day.calculateYearDay();
+
+        const day_names = [_][]const u8{ "Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed" };
+        const month_names = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+        const day_of_week = @mod(epoch_day.day, 7);
+        const day_name = day_names[day_of_week];
+        const month_name = month_names[@intFromEnum(year_day.calculateMonthDay().month) - 1];
+
+        const written = std.fmt.bufPrint(&last_mod_str_buf, "{s}, {d:0>2} {s} {d} {d:0>2}:{d:0>2}:{d:0>2} GMT", .{
+            day_name,
+            year_day.calculateMonthDay().day_index + 1,
+            month_name,
+            year_day.year,
+            day_secs.getHoursIntoDay(),
+            day_secs.getMinutesIntoHour(),
+            day_secs.getSecondsIntoMinute(),
+        }) catch 0;
+        if (written != 0) last_mod_slice = last_mod_str_buf[0..written];
+    }
 
     // For small files, read into memory and use response builder
     // For large files, stream directly
@@ -308,6 +342,29 @@ fn serveFileContent(allocator: std.mem.Allocator, fs_path: []const u8, writer: a
 
         const content_type = getContentType(fs_path);
         var response = http.Response.ok(allocator, content[0..bytes_read], content_type);
+        if (last_mod_slice.len != 0) {
+            _ = response.setHeader("Last-Modified", last_mod_slice);
+        }
+
+        // Conditional GET: parse If-Modified-Since and compare to file mtime
+        if (request.headers.get("if-modified-since")) |ims| {
+            if (msecs_opt) |fm| {
+                if (http.dates.parseHttpDate(ims)) |ts| {
+                    if (ts >= fm) {
+                        var not_mod = http.Response.init(allocator);
+                        _ = not_mod.setStatus(.not_modified);
+                        _ = not_mod.setConnection(keep_alive);
+                        if (head_only) {
+                            try not_mod.writeHead(writer);
+                        } else {
+                            try not_mod.write(writer);
+                        }
+                        not_mod.deinit();
+                        return;
+                    }
+                }
+            }
+        }
         defer response.deinit();
         _ = response.setConnection(keep_alive);
 
@@ -321,6 +378,9 @@ fn serveFileContent(allocator: std.mem.Allocator, fs_path: []const u8, writer: a
         const content_type = getContentType(fs_path);
 
         var response = http.Response.init(allocator);
+        if (last_mod_slice.len != 0) {
+            _ = response.setHeader("Last-Modified", last_mod_slice);
+        }
         defer response.deinit();
         _ = response.setStatus(.ok).setContentType(content_type).setConnection(keep_alive);
 
@@ -364,6 +424,25 @@ fn serveFileContent(allocator: std.mem.Allocator, fs_path: []const u8, writer: a
         try writer.writeAll("\r\n");
 
         // Stream body (unless HEAD request)
+        // Conditional GET: parse If-Modified-Since and compare to file mtime
+        if (request.headers.get("if-modified-since")) |ims| {
+            if (msecs_opt) |fm| {
+                if (http.dates.parseHttpDate(ims)) |ts| {
+                    if (ts >= fm) {
+                        var not_mod = http.Response.init(allocator);
+                        _ = not_mod.setStatus(.not_modified).setConnection(keep_alive);
+                        if (head_only) {
+                            try not_mod.writeHead(writer);
+                        } else {
+                            try not_mod.write(writer);
+                        }
+                        not_mod.deinit();
+                        return;
+                    }
+                }
+            }
+        }
+
         if (!head_only) {
             var file_reader = file.reader();
             var read_buf: [8192]u8 = undefined;

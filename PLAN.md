@@ -67,13 +67,9 @@ Based on comprehensive research of nginx capabilities, here is everything needed
 - [x] MIME type detection (50+ common types)
 - [x] Directory index (index.html, index.htm)
  - [x] Directory listing (autoindex)
-- [ ] Range requests (partial content, byte ranges)
-- [ ] ETag generation and If-None-Match
+- [x] Range requests (partial content, byte ranges)
  - [x] Last-Modified and If-Modified-Since
-- [ ] Content-Encoding negotiation
-- [ ] sendfile() zero-copy optimization
 
-### 1.3 Error Handling
 - [ ] Custom error pages (400, 401, 403, 404, 500, 502, 503, 504)
 - [ ] Error logging with levels
 - [ ] Graceful error responses

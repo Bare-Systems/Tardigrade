@@ -1,8 +1,24 @@
+
 # Changelog
 
 All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+
+# [0.7.0] - unreleased
+
+### Added
+- sendfile() zero-copy optimization for static file serving (in progress)
+
+# [0.6.0] - 2026-01-29
+
+### Added
+- Content-Encoding negotiation for static file serving:
+  - Parses `Accept-Encoding` header and negotiates supported encodings.
+  - Responds with `identity` (no compression) for supported requests.
+  - Returns `406 Not Acceptable` for requests with only unsupported encodings (e.g., `br`, `deflate`).
+  - Lays groundwork for future gzip support.
+  - Comprehensive tests for Accept-Encoding negotiation in `src/http/content_encoding_test.zig`.
 
 ## [0.5.0] - 2026-01-30
 

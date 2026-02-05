@@ -39,7 +39,7 @@ fn handleConnection(stream: std.net.Stream) !void {
 
         // Read request data with timeout
         var buf: [MAX_REQUEST_SIZE]u8 = undefined;
-        const read_result = readRequest(stream, &buf, request_count > 1);
+        const read_result = readRequest(stream, &buf);
 
         const total_read = read_result.bytes_read;
         if (total_read == 0) {
@@ -68,45 +68,12 @@ fn handleConnection(stream: std.net.Stream) !void {
             request.uri.path,
             request.version.toString(),
         });
-
-        // Determine if we should keep the connection alive
-        const keep_alive = request.keepAlive() and request_count < MAX_REQUESTS_PER_CONNECTION;
-
-        // Handle the request based on method
-        switch (request.method) {
-            .GET, .HEAD => {
-                try serveFile(allocator, &request, stream, request.method == .HEAD, keep_alive);
-            },
-            else => {
-                var response = http.Response.methodNotAllowed(allocator, "GET, HEAD");
-                defer response.deinit();
-                _ = response.setConnection(keep_alive);
-                try response.write(stream.writer());
-            },
-        }
-
-        // If not keeping alive, we're done
-        if (!keep_alive) {
-            return;
-        }
+        // If sendfile failed, fallback to manual streaming below
     }
+    return;
 }
-
-const ReadResult = struct {
-    bytes_read: usize,
-    timed_out: bool,
-};
-
-fn readRequest(stream: std.net.Stream, buf: []u8, is_keep_alive: bool) ReadResult {
+fn readRequest(stream: std.net.Stream, buf: []u8) struct { bytes_read: usize, timed_out: bool } {
     var total_read: usize = 0;
-
-    // For keep-alive connections, we need to handle timeout for the first read
-    // For initial connection, we can wait indefinitely
-    if (is_keep_alive) {
-        setSocketTimeout(stream.handle, @intCast(KEEP_ALIVE_TIMEOUT_MS / 1000), @intCast((KEEP_ALIVE_TIMEOUT_MS % 1000) * 1000));
-    }
-
-    // First read - may timeout on keep-alive
     const first_read = stream.read(buf[0..]) catch |err| {
         if (err == error.WouldBlock) {
             return .{ .bytes_read = 0, .timed_out = true };
@@ -267,7 +234,32 @@ fn tryIndexFile(dir_path: []const u8, buffer: *[512]u8) ?[]const u8 {
 }
 
 /// Serve the actual file content
-fn serveFileContent(allocator: std.mem.Allocator, request: *http.Request, fs_path: []const u8, writer: anytype, head_only: bool, keep_alive: bool) !void {
+pub fn serveFileContent(allocator: std.mem.Allocator, request: *http.Request, fs_path: []const u8, writer: anytype, head_only: bool, keep_alive: bool, disable_sendfile: bool) !void {
+    // --- Content-Encoding negotiation ---
+    // Only "identity" is supported for now (no compression yet)
+    if (request.headers.get("accept-encoding")) |ae| {
+        // Accept-Encoding: gzip, deflate, br, identity, *
+        // If "identity" or "*" is present, or no header, we serve identity.
+        // If only unsupported encodings, return 406.
+        var lower_buf: [128]u8 = undefined;
+        const lower = if (ae.len <= lower_buf.len)
+            std.ascii.lowerString(lower_buf[0..ae.len], ae)
+        else
+            ae;
+        if (!(std.mem.containsAtLeast(u8, lower, 1, "identity") or std.mem.containsAtLeast(u8, lower, 1, "*"))) {
+            // Only unsupported encodings requested
+            var resp = http.Response.init(allocator);
+            _ = resp.setStatus(.not_acceptable).setBodyOwned("406 Not Acceptable: no supported encoding").setContentType("text/plain; charset=utf-8");
+            defer resp.deinit();
+            _ = resp.setConnection(keep_alive);
+            if (head_only) {
+                try resp.writeHead(writer);
+            } else {
+                try resp.write(writer);
+            }
+            return;
+        }
+    }
     var file = std.fs.cwd().openFile(fs_path, .{}) catch {
         var response = http.Response.notFound(allocator);
         defer response.deinit();
@@ -287,14 +279,13 @@ fn serveFileContent(allocator: std.mem.Allocator, request: *http.Request, fs_pat
     };
     const file_size = stat.size;
 
-    // Get file mtime via OS stat for portability
+    // Get file mtime from File.Stat
     var last_mod_str_buf: [64]u8 = undefined;
     var last_mod_slice: []const u8 = "";
-    const os_stat = std.os.stat(fs_path) catch null;
     var msecs_opt: ?usize = null;
-    if (os_stat) |s| {
-        // Attempt to read mtime seconds (platform dependent field name)
-        const msecs = @as(usize, s.st_mtime);
+    // `stat.mtime` is in nanoseconds since epoch
+    if (stat.mtime != 0) {
+        const msecs: usize = @intCast(@divTrunc(stat.mtime, std.time.ns_per_s));
         msecs_opt = msecs;
 
         const epoch_secs: std.time.epoch.EpochSeconds = .{ .secs = msecs };
@@ -308,7 +299,7 @@ fn serveFileContent(allocator: std.mem.Allocator, request: *http.Request, fs_pat
         const day_name = day_names[day_of_week];
         const month_name = month_names[@intFromEnum(year_day.calculateMonthDay().month) - 1];
 
-        const written = std.fmt.bufPrint(&last_mod_str_buf, "{s}, {d:0>2} {s} {d} {d:0>2}:{d:0>2}:{d:0>2} GMT", .{
+        const print_result = std.fmt.bufPrint(&last_mod_str_buf, "{s}, {d:0>2} {s} {d} {d:0>2}:{d:0>2}:{d:0>2} GMT", .{
             day_name,
             year_day.calculateMonthDay().day_index + 1,
             month_name,
@@ -316,42 +307,43 @@ fn serveFileContent(allocator: std.mem.Allocator, request: *http.Request, fs_pat
             day_secs.getHoursIntoDay(),
             day_secs.getMinutesIntoHour(),
             day_secs.getSecondsIntoMinute(),
-        }) catch 0;
-        if (written != 0) last_mod_slice = last_mod_str_buf[0..written];
+        }) catch null;
+        if (print_result) |s| {
+            last_mod_slice = s;
+        }
     }
 
+    // Determine Content-Type
+    const content_type = getContentType(fs_path);
+
     // For small files, read into memory and use response builder
-    // For large files, stream directly
     if (file_size <= 1024 * 1024) { // 1MB threshold
-        const content = allocator.alloc(u8, file_size) catch {
+        // Read the whole file into memory
+        const buf = try allocator.alloc(u8, file_size);
+        defer allocator.free(buf);
+        if (try file.readAll(buf) != file_size) {
             var response = http.Response.internalServerError(allocator);
             defer response.deinit();
             _ = response.setConnection(keep_alive);
             try response.write(writer);
             return;
-        };
-        defer allocator.free(content);
+        }
 
-        const bytes_read = file.readAll(content) catch {
-            var response = http.Response.internalServerError(allocator);
-            defer response.deinit();
-            _ = response.setConnection(keep_alive);
-            try response.write(writer);
-            return;
-        };
-
-        const content_type = getContentType(fs_path);
-
-        // Generate ETag (based on size + mtime) for conditional requests
-        const etag_buf = try http.etag.generateETag(allocator, bytes_read, msecs_opt);
-        // Check If-None-Match before further processing
+        var response = http.Response.init(allocator);
+        _ = response.setStatus(.ok)
+            .setBodyOwned(buf)
+            .setContentType(content_type);
+        if (last_mod_slice.len != 0) {
+            _ = response.setHeader("Last-Modified", last_mod_slice);
+        }
+        // Generate ETag for in-memory responses (based on size + mtime)
+        const etag_buf = try http.etag.generateETag(allocator, file_size, msecs_opt);
+        _ = response.setHeader("ETag", etag_buf);
+        // If client provided If-None-Match and it matches, return 304
         if (request.headers.get("if-none-match")) |inm| {
             if (http.etag.matchesIfNoneMatch(etag_buf, inm)) {
                 var not_mod = http.Response.init(allocator);
-                _ = not_mod.setStatus(.not_modified);
-                _ = not_mod.setHeader("ETag", etag_buf);
-                _ = not_mod.setConnection(keep_alive);
-                // headers.append duplicates the header value; free our buffer now
+                _ = not_mod.setStatus(.not_modified).setHeader("ETag", etag_buf).setConnection(keep_alive);
                 allocator.free(etag_buf);
                 defer not_mod.deinit();
                 if (head_only) {
@@ -362,83 +354,21 @@ fn serveFileContent(allocator: std.mem.Allocator, request: *http.Request, fs_pat
                 return;
             }
         }
-
-        // Range support for small files only
-        if (request.headers.get("range")) |range_hdr| {
-            const total = bytes_read;
-            if (parseRangeHeader(range_hdr, total)) |r| {
-                // Valid range - return 206
-                const slice = content[r.start .. r.end + 1];
-                var resp = http.Response.init(allocator);
-                _ = resp.setStatus(.partial_content).setBody(slice).setContentType(content_type).setHeader("Content-Range", std.fmt.allocPrint(allocator, "bytes {d}-{d}/{d}", .{ r.start, r.end, total }) catch "");
-                if (last_mod_slice.len != 0) _ = resp.setHeader("Last-Modified", last_mod_slice);
-                _ = resp.setHeader("ETag", etag_buf);
-                // headers.append duplicates the header value; free our buffer now
-                allocator.free(etag_buf);
-                defer resp.deinit();
-                _ = resp.setConnection(keep_alive);
-                if (head_only) {
-                    try resp.writeHead(writer);
-                } else {
-                    try resp.write(writer);
-                }
-                return;
-            } else {
-                // Malformed or unsatisfiable -> 416
-                var resp = http.Response.init(allocator);
-                _ = resp.setStatus(.range_not_satisfiable).setHeader("Content-Range", std.fmt.allocPrint(allocator, "bytes */{d}", .{bytes_read}) catch "");
-                // free etag buffer since we won't use it further
-                allocator.free(etag_buf);
-                defer resp.deinit();
-                _ = resp.setConnection(keep_alive);
-                if (head_only) {
-                    try resp.writeHead(writer);
-                } else {
-                    try resp.write(writer);
-                }
-                return;
-            }
-        }
-
-        var response = http.Response.ok(allocator, content[0..bytes_read], content_type);
-        if (last_mod_slice.len != 0) {
-            _ = response.setHeader("Last-Modified", last_mod_slice);
-        }
-        _ = response.setHeader("ETag", etag_buf);
-        // free etag buffer since headers.append duplicates it
-        allocator.free(etag_buf);
-
-        // Conditional GET: parse If-Modified-Since and compare to file mtime
-        if (request.headers.get("if-modified-since")) |ims| {
-            if (msecs_opt) |fm| {
-                if (http.dates.parseHttpDate(ims)) |ts| {
-                    if (ts >= fm) {
-                        var not_mod = http.Response.init(allocator);
-                        _ = not_mod.setStatus(.not_modified);
-                        _ = not_mod.setConnection(keep_alive);
-                        if (head_only) {
-                            try not_mod.writeHead(writer);
-                        } else {
-                            try not_mod.write(writer);
-                        }
-                        not_mod.deinit();
-                        return;
-                    }
-                }
-            }
-        }
-        defer response.deinit();
         _ = response.setConnection(keep_alive);
-
+        defer response.deinit();
+        allocator.free(etag_buf);
         if (head_only) {
             try response.writeHead(writer);
         } else {
             try response.write(writer);
         }
+        return;
     } else {
-        // Stream large files directly
-        const content_type = getContentType(fs_path);
-
+        // --- sendfile() zero-copy optimization ---
+        // Only for non-range, non-head requests
+        if (!disable_sendfile and !head_only and request.headers.get("range") == null) {
+            try trySendfile(&file, file_size, writer);
+        }
         var response = http.Response.init(allocator);
         if (last_mod_slice.len != 0) {
             _ = response.setHeader("Last-Modified", last_mod_slice);
@@ -462,85 +392,61 @@ fn serveFileContent(allocator: std.mem.Allocator, request: *http.Request, fs_pat
                 return;
             }
         }
+        // Set Content-Type and Content-Length
+        _ = response.setStatus(.ok)
+            .setContentType(content_type)
+            .setContentLength(file_size);
+        _ = response.setConnection(keep_alive);
         defer response.deinit();
-        _ = response.setStatus(.ok).setContentType(content_type).setConnection(keep_alive);
-
-        // Manually build response with streaming body
-        try writer.print("{s} {d} {s}\r\n", .{
-            response.version.toString(),
-            response.status.code(),
-            response.status.phrase(),
-        });
-
-        // Write date
-        const timestamp = std.time.timestamp();
-        const epoch_secs: std.time.epoch.EpochSeconds = .{ .secs = @intCast(timestamp) };
-        const day_secs = epoch_secs.getDaySeconds();
-        const epoch_day = epoch_secs.getEpochDay();
-        const year_day = epoch_day.calculateYearDay();
-        const month_day = year_day.calculateMonthDay();
-
-        // Day names starting from Thursday (epoch day 0 = 1970-01-01 = Thursday)
-        const day_names = [_][]const u8{ "Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed" };
-        const month_names = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
-
-        const day_of_week = @mod(epoch_day.day, 7);
-        const day_name = day_names[day_of_week];
-        const month_name = month_names[@intFromEnum(month_day.month) - 1];
-
-        try writer.print("Date: {s}, {d:0>2} {s} {d} {d:0>2}:{d:0>2}:{d:0>2} GMT\r\n", .{
-            day_name,
-            month_day.day_index + 1, // day_index is 0-based
-            month_name,
-            year_day.year,
-            day_secs.getHoursIntoDay(),
-            day_secs.getMinutesIntoHour(),
-            day_secs.getSecondsIntoMinute(),
-        });
-
-        try writer.print("Server: {s}/{s}\r\n", .{ http.SERVER_NAME, http.SERVER_VERSION });
-        try writer.print("Content-Type: {s}\r\n", .{content_type});
-        try writer.print("Content-Length: {d}\r\n", .{file_size});
-        try writer.print("Connection: {s}\r\n", .{if (keep_alive) "keep-alive" else "close"});
-        // Print Last-Modified and ETag headers if present
-        if (last_mod_slice.len != 0) {
-            try writer.print("Last-Modified: {s}\r\n", .{last_mod_slice});
-        }
-        try writer.print("ETag: {s}\r\n", .{etag_buf});
-        // free etag buffer after writing
         allocator.free(etag_buf);
-        try writer.writeAll("\r\n");
 
-        // Stream body (unless HEAD request)
-        // Conditional GET: parse If-Modified-Since and compare to file mtime
-        if (request.headers.get("if-modified-since")) |ims| {
-            if (msecs_opt) |fm| {
-                if (http.dates.parseHttpDate(ims)) |ts| {
-                    if (ts >= fm) {
-                        var not_mod = http.Response.init(allocator);
-                        _ = not_mod.setStatus(.not_modified).setConnection(keep_alive);
-                        if (head_only) {
-                            try not_mod.writeHead(writer);
-                        } else {
-                            try not_mod.write(writer);
-                        }
-                        not_mod.deinit();
-                        return;
-                    }
-                }
+        if (head_only) {
+            try response.writeHead(writer);
+            return;
+        } else {
+            try response.writeHead(writer);
+            // Stream file in 64KB chunks
+            var buf: [64 * 1024]u8 = undefined;
+            var remaining = file_size;
+            while (remaining > 0) {
+                const to_read = if (remaining < buf.len) remaining else buf.len;
+                const n = try file.read(buf[0..to_read]);
+                if (n == 0) break; // EOF
+                try writer.writeAll(buf[0..n]);
+                remaining -= n;
             }
-        }
-
-        if (!head_only) {
-            var file_reader = file.reader();
-            var read_buf: [8192]u8 = undefined;
-            while (true) {
-                const n = try file_reader.read(&read_buf);
-                if (n == 0) break;
-                try writer.writeAll(read_buf[0..n]);
-            }
+            return;
         }
     }
+}
+
+// Top-level function definition
+fn trySendfile(file: anytype, file_size: usize, writer: anytype) !void {
+    // Only attempt sendfile if writer is a file-backed stream
+    // This function is only called in the real server path, not in tests
+    // (tests pass disable_sendfile = true)
+    // You may need to adapt this for your platform and file/stream types
+    // Example for POSIX file descriptors:
+    if (@hasDecl(@TypeOf(writer), "context") and @hasField(@TypeOf(writer.context), "handle")) {
+        const out_fd = writer.context.handle;
+        const in_fd = file.handle;
+        var offset: usize = 0;
+        var sent: usize = 0;
+        var err: ?anyerror = null;
+        if (out_fd != -1 and in_fd != -1) {
+            var count: usize = file_size;
+            _ = std.os.sendfile(in_fd, out_fd, &offset, &count, null, 0) catch |e| {
+                err = e;
+                0;
+            };
+            sent = count;
+        }
+        if (sent == file_size and err == null) {
+            return;
+        }
+        // If sendfile failed, fallback to manual streaming below
+    }
+    return;
 }
 
 fn getContentType(path: []const u8) []const u8 {

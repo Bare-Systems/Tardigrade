@@ -1,4 +1,4 @@
-# Contributing to Simple Server
+# Contributing to Tardigrade
 
 Thank you for your interest in contributing! This document provides guidelines and information for developers.
 
@@ -14,8 +14,8 @@ Thank you for your interest in contributing! This document provides guidelines a
 
 ```bash
 # Clone the repository
-git clone https://gitlab.com/joseph.caruso/simple-server.git
-cd simple-server
+git clone https://github.com/Bare-Labs/Tardigrade.git
+cd Tardigrade
 
 # Build and run tests
 zig build test
@@ -132,7 +132,7 @@ const req_alloc = arena.allocator();
    zig build test
 
    # Manual testing with curl
-   ./zig-out/bin/simple_server &
+   ./zig-out/bin/tardigrade &
    curl -v http://localhost:8069/
    ```
 
@@ -183,7 +183,7 @@ test "parse simple GET request" {
 
 ```bash
 # Start the server
-./zig-out/bin/simple_server &
+./zig-out/bin/tardigrade &
 
 # Basic GET
 curl -v http://localhost:8069/
@@ -198,7 +198,7 @@ curl -v http://localhost:8069/nonexistent
 curl -v -X POST http://localhost:8069/
 
 # Kill the server
-pkill simple_server
+pkill tardigrade
 ```
 
 ### Test Coverage Goals

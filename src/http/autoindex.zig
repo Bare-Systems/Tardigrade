@@ -95,7 +95,7 @@ pub fn generateAutoIndex(allocator: std.mem.Allocator, dirPath: []const u8, uriP
         for ("</a>\n") |b| try out.append(b);
     }
 
-    for ("</pre><hr><address>simple-server</address></body></html>\n") |b| try out.append(b);
+    for ("</pre><hr><address>tardigrade</address></body></html>\n") |b| try out.append(b);
 
     const slice = try out.toOwnedSlice();
     // free copied names

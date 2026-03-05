@@ -1,4 +1,4 @@
-# Simple Server
+# Tardigrade
 
 A high-performance HTTP server written in Zig, designed as a modern replacement for nginx.
 
@@ -21,8 +21,8 @@ A high-performance HTTP server written in Zig, designed as a modern replacement 
 
 ```bash
 # Clone the repository
-git clone https://gitlab.com/joseph.caruso/simple-server.git
-cd simple-server
+git clone https://github.com/Bare-Labs/Tardigrade.git
+cd Tardigrade
 
 # Build and run
 zig build run
@@ -37,7 +37,7 @@ The server starts on `http://localhost:8069` by default.
 zig build -Doptimize=ReleaseFast
 
 # Run the binary directly
-./zig-out/bin/simple_server
+./zig-out/bin/tardigrade
 ```
 
 ## Usage
@@ -79,7 +79,7 @@ curl -v http://localhost:8069/
 
 All responses include:
 - `Date`: Current timestamp in RFC 7231 format
-- `Server`: Server identification (simple-server/0.4.1)
+- `Server`: Server identification (tardigrade/0.4.1)
 - `Content-Type`: Automatically detected from file extension
 - `Content-Length`: Size of response body
 

@@ -5,7 +5,7 @@ const Headers = @import("headers.zig").Headers;
 const Version = @import("version.zig").Version;
 
 /// Server name and version for Server header
-pub const SERVER_NAME = "simple-server";
+pub const SERVER_NAME = "tardigrade";
 pub const SERVER_VERSION = "0.4.1";
 
 // Try to load a custom error page from `public/errors/<code>.html`.
@@ -427,7 +427,7 @@ test "build simple 200 response" {
     const output = stream.getWritten();
     try testing.expect(std.mem.startsWith(u8, output, "HTTP/1.1 200 OK\r\n"));
     try testing.expect(std.mem.indexOf(u8, output, "Content-Length: 13\r\n") != null);
-    try testing.expect(std.mem.indexOf(u8, output, "Server: simple-server/") != null);
+    try testing.expect(std.mem.indexOf(u8, output, "Server: tardigrade/") != null);
     try testing.expect(std.mem.indexOf(u8, output, "Date: ") != null);
     try testing.expect(std.mem.endsWith(u8, output, "Hello, World!"));
 }

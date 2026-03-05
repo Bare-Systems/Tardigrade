@@ -1,4 +1,4 @@
-# Simple Server - Zig nginx Replacement
+# Tardigrade - Zig nginx Replacement
 
 ## Project Vision
 

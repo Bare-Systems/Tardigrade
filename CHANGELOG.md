@@ -38,7 +38,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   - Sample custom pages added for 404 and 500 in `public/errors/`
 
 ### Changed
-- Bumped `Server` identification to `simple-server/0.4.1` in responses
+- Bumped `Server` identification to `tardigrade/0.4.1` in responses
 
 ## [0.4.0] - 2026-01-27
 
@@ -58,7 +58,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - HTTP Response builder module (`src/http/response.zig`)
   - Builder pattern for constructing HTTP responses
   - Auto-generated Date header (RFC 7231 format)
-  - Auto-generated Server header (simple-server/0.3.0)
+  - Auto-generated Server header (tardigrade/0.3.0)
   - Auto-calculated Content-Length
   - Convenience constructors for common responses (ok, notFound, redirect, etc.)
 - HTTP Status code module (`src/http/status.zig`)

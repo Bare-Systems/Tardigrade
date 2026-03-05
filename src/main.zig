@@ -527,7 +527,7 @@ pub fn parseRangeHeader(range_hdr: []const u8, total: usize) ?struct { start: us
 
 /// Return true if environment enables auto-indexing.
 fn isAutoIndexEnabled() bool {
-    const val = std.os.getenv("SIMPLE_SERVER_AUTO_INDEX");
+    const val = std.os.getenv("TARDIGRADE_AUTO_INDEX");
     if (val) |v| {
         if (v.len == 0) return false;
         const c = v[0];

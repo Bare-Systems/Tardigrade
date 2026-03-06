@@ -33,7 +33,7 @@ test "static file large streaming sends full body" {
     defer allocator.free(out_buf);
     var stream = std.io.fixedBufferStream(out_buf);
 
-    try main.serveFileContent(allocator, &req, file_name, stream.writer(), false, false, true);
+    try main.serveFileContent(allocator, &req, file_name, stream.writer(), false, false, true, null);
     const output = stream.getWritten();
     try std.testing.expect(std.mem.indexOf(u8, output, "200 OK") != null);
 
@@ -72,7 +72,7 @@ test "static file If-None-Match returns 304 Not Modified" {
     defer allocator.free(out_buf);
     var stream = std.io.fixedBufferStream(out_buf);
 
-    try main.serveFileContent(allocator, &req, file_name, stream.writer(), false, false, true);
+    try main.serveFileContent(allocator, &req, file_name, stream.writer(), false, false, true, null);
     const output = stream.getWritten();
     try std.testing.expect(std.mem.indexOf(u8, output, "304 Not Modified") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "\r\n\r\n") == std.mem.indexOf(u8, output, "\r\n\r\n"));

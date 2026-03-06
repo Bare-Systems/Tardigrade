@@ -9,6 +9,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 - sendfile() zero-copy optimization for static file serving (in progress)
+- Correlation ID support via `X-Correlation-ID` header:
+  - Echoes valid client-provided IDs in responses.
+  - Generates `tg-<timestamp>-<random>` IDs when missing or invalid.
+  - Applies to static-file and parse-error responses.
 
 # [0.6.0] - 2026-01-29
 

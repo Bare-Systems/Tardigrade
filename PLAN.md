@@ -71,9 +71,12 @@ These features allow Tardigrade to become the Panda/BearClaw gateway early.
 ### 0.3 API Gateway Core
 - [ ] JSON request validation
 - [ ] API version routing
-- [ ] Correlation IDs
+- [x] Correlation IDs
 - [ ] Idempotency key support
 - [ ] Request metadata injection
+
+Resolved: `X-Correlation-ID` propagation is implemented for static-file and parse-error responses.
+Decision: trust and echo only safe token-style incoming IDs; generate `tg-<timestamp>-<random-hex>` when missing/invalid.
 
 ### 0.4 Agent Command Routing
 - [ ] structured command routing

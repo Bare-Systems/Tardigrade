@@ -107,6 +107,13 @@ pub const Response = struct {
         return self.setHeader("Content-Type", content_type);
     }
 
+    /// Set Content-Length header
+    pub fn setContentLength(self: *Response, content_length: usize) *Response {
+        var buf: [32]u8 = undefined;
+        const rendered = std.fmt.bufPrint(&buf, "{d}", .{content_length}) catch return self;
+        return self.setHeader("Content-Length", rendered);
+    }
+
     /// Set Connection header (keep-alive or close)
     pub fn setConnection(self: *Response, keep_alive: bool) *Response {
         return self.setHeader("Connection", if (keep_alive) "keep-alive" else "close");

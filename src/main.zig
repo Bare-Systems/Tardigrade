@@ -116,6 +116,9 @@ fn setSocketTimeout(handle: std.posix.socket_t, sec: i32, usec: i32) void {
 }
 
 fn sendParseError(allocator: std.mem.Allocator, stream: std.net.Stream, err: http.ParseError, keep_alive: bool) !void {
+    const correlation_id = try http.correlation.generate(allocator);
+    defer allocator.free(correlation_id);
+
     var response = switch (err) {
         error.InvalidMethod => http.Response.notImplemented(allocator),
         error.InvalidVersion => http.Response.httpVersionNotSupported(allocator),
@@ -124,19 +127,21 @@ fn sendParseError(allocator: std.mem.Allocator, stream: std.net.Stream, err: htt
         else => http.Response.badRequest(allocator, "Malformed request"),
     };
     defer response.deinit();
-    _ = response.setConnection(keep_alive);
+    setResponseMeta(&response, keep_alive, correlation_id);
     try response.write(stream.writer());
 }
 
 fn serveFile(allocator: std.mem.Allocator, request: *http.Request, stream: std.net.Stream, head_only: bool, keep_alive: bool) !void {
     const writer = stream.writer();
     const path = request.uri.path;
+    const correlation_id = try http.correlation.fromHeadersOrGenerate(allocator, &request.headers);
+    defer allocator.free(correlation_id);
 
     // Prevent path traversal
     if (std.mem.indexOf(u8, path, "..") != null) {
         var response = http.Response.forbidden(allocator);
         defer response.deinit();
-        _ = response.setConnection(keep_alive);
+        setResponseMeta(&response, keep_alive, correlation_id);
         try response.write(writer);
         return;
     }
@@ -149,7 +154,7 @@ fn serveFile(allocator: std.mem.Allocator, request: *http.Request, stream: std.n
         const result = std.fmt.bufPrint(&path_buffer, "public{s}", .{path}) catch {
             var response = http.Response.uriTooLong(allocator);
             defer response.deinit();
-            _ = response.setConnection(keep_alive);
+            setResponseMeta(&response, keep_alive, correlation_id);
             try response.write(writer);
             return;
         };
@@ -164,7 +169,7 @@ fn serveFile(allocator: std.mem.Allocator, request: *http.Request, stream: std.n
     const stat_result = std.fs.cwd().statFile(fs_path) catch {
         var response = http.Response.notFound(allocator);
         defer response.deinit();
-        _ = response.setConnection(keep_alive);
+        setResponseMeta(&response, keep_alive, correlation_id);
         try response.write(writer);
         return;
     };
@@ -176,13 +181,13 @@ fn serveFile(allocator: std.mem.Allocator, request: *http.Request, stream: std.n
             const redirect_path = std.fmt.bufPrint(&redirect_buf, "{s}/", .{path}) catch {
                 var response = http.Response.uriTooLong(allocator);
                 defer response.deinit();
-                _ = response.setConnection(keep_alive);
+                setResponseMeta(&response, keep_alive, correlation_id);
                 try response.write(writer);
                 return;
             };
             var response = http.Response.movedPermanently(allocator, redirect_path);
             defer response.deinit();
-            _ = response.setConnection(keep_alive);
+            setResponseMeta(&response, keep_alive, correlation_id);
             try response.write(writer);
             return;
         }
@@ -191,7 +196,7 @@ fn serveFile(allocator: std.mem.Allocator, request: *http.Request, stream: std.n
         var index_buffer: [512]u8 = undefined;
         const index_path = tryIndexFile(fs_path, &index_buffer);
         if (index_path) |p| {
-            return serveFileContent(allocator, request, p, writer, head_only, keep_alive);
+            return serveFileContent(allocator, request, p, writer, head_only, keep_alive, correlation_id);
         }
 
         // No index file found; generate autoindex listing if enabled
@@ -200,7 +205,7 @@ fn serveFile(allocator: std.mem.Allocator, request: *http.Request, stream: std.n
             var response = http.Response.init(allocator);
             _ = response.setStatus(.ok).setBodyOwned(body).setContentType("text/html; charset=utf-8");
             defer response.deinit();
-            _ = response.setConnection(keep_alive);
+            setResponseMeta(&response, keep_alive, correlation_id);
             if (head_only) {
                 try response.writeHead(writer);
             } else {
@@ -211,13 +216,13 @@ fn serveFile(allocator: std.mem.Allocator, request: *http.Request, stream: std.n
 
         var response = http.Response.notFound(allocator);
         defer response.deinit();
-        _ = response.setConnection(keep_alive);
+        setResponseMeta(&response, keep_alive, correlation_id);
         try response.write(writer);
         return;
     }
 
     // Regular file
-    return serveFileContent(allocator, request, fs_path, writer, head_only, keep_alive);
+    return serveFileContent(allocator, request, fs_path, writer, head_only, keep_alive, correlation_id);
 }
 
 /// Try to find an index file in the given directory path
@@ -234,7 +239,13 @@ fn tryIndexFile(dir_path: []const u8, buffer: *[512]u8) ?[]const u8 {
 }
 
 /// Serve the actual file content
-pub fn serveFileContent(allocator: std.mem.Allocator, request: *http.Request, fs_path: []const u8, writer: anytype, head_only: bool, keep_alive: bool, disable_sendfile: bool) !void {
+pub fn serveFileContent(allocator: std.mem.Allocator, request: *http.Request, fs_path: []const u8, writer: anytype, head_only: bool, keep_alive: bool, disable_sendfile: bool, correlation_id: ?[]const u8) !void {
+    const resolved_correlation_id = if (correlation_id) |cid|
+        cid
+    else
+        try http.correlation.fromHeadersOrGenerate(allocator, &request.headers);
+    defer if (correlation_id == null) allocator.free(resolved_correlation_id);
+
     // --- Content-Encoding negotiation ---
     // Only "identity" is supported for now (no compression yet)
     if (request.headers.get("accept-encoding")) |ae| {
@@ -251,7 +262,7 @@ pub fn serveFileContent(allocator: std.mem.Allocator, request: *http.Request, fs
             var resp = http.Response.init(allocator);
             _ = resp.setStatus(.not_acceptable).setBodyOwned("406 Not Acceptable: no supported encoding").setContentType("text/plain; charset=utf-8");
             defer resp.deinit();
-            _ = resp.setConnection(keep_alive);
+            setResponseMeta(&resp, keep_alive, resolved_correlation_id);
             if (head_only) {
                 try resp.writeHead(writer);
             } else {
@@ -263,7 +274,7 @@ pub fn serveFileContent(allocator: std.mem.Allocator, request: *http.Request, fs
     var file = std.fs.cwd().openFile(fs_path, .{}) catch {
         var response = http.Response.notFound(allocator);
         defer response.deinit();
-        _ = response.setConnection(keep_alive);
+        setResponseMeta(&response, keep_alive, resolved_correlation_id);
         try response.write(writer);
         return;
     };
@@ -273,7 +284,7 @@ pub fn serveFileContent(allocator: std.mem.Allocator, request: *http.Request, fs
     const stat = file.stat() catch {
         var response = http.Response.internalServerError(allocator);
         defer response.deinit();
-        _ = response.setConnection(keep_alive);
+        setResponseMeta(&response, keep_alive, resolved_correlation_id);
         try response.write(writer);
         return;
     };
@@ -324,7 +335,7 @@ pub fn serveFileContent(allocator: std.mem.Allocator, request: *http.Request, fs
         if (try file.readAll(buf) != file_size) {
             var response = http.Response.internalServerError(allocator);
             defer response.deinit();
-            _ = response.setConnection(keep_alive);
+            setResponseMeta(&response, keep_alive, resolved_correlation_id);
             try response.write(writer);
             return;
         }
@@ -343,7 +354,8 @@ pub fn serveFileContent(allocator: std.mem.Allocator, request: *http.Request, fs
         if (request.headers.get("if-none-match")) |inm| {
             if (http.etag.matchesIfNoneMatch(etag_buf, inm)) {
                 var not_mod = http.Response.init(allocator);
-                _ = not_mod.setStatus(.not_modified).setHeader("ETag", etag_buf).setConnection(keep_alive);
+                _ = not_mod.setStatus(.not_modified).setHeader("ETag", etag_buf);
+                setResponseMeta(&not_mod, keep_alive, resolved_correlation_id);
                 allocator.free(etag_buf);
                 defer not_mod.deinit();
                 if (head_only) {
@@ -354,7 +366,7 @@ pub fn serveFileContent(allocator: std.mem.Allocator, request: *http.Request, fs
                 return;
             }
         }
-        _ = response.setConnection(keep_alive);
+        setResponseMeta(&response, keep_alive, resolved_correlation_id);
         defer response.deinit();
         allocator.free(etag_buf);
         if (head_only) {
@@ -380,7 +392,8 @@ pub fn serveFileContent(allocator: std.mem.Allocator, request: *http.Request, fs
         if (request.headers.get("if-none-match")) |inm| {
             if (http.etag.matchesIfNoneMatch(etag_buf, inm)) {
                 var not_mod = http.Response.init(allocator);
-                _ = not_mod.setStatus(.not_modified).setHeader("ETag", etag_buf).setConnection(keep_alive);
+                _ = not_mod.setStatus(.not_modified).setHeader("ETag", etag_buf);
+                setResponseMeta(&not_mod, keep_alive, resolved_correlation_id);
                 // free our etag buffer now that headers copied
                 allocator.free(etag_buf);
                 defer not_mod.deinit();
@@ -396,7 +409,7 @@ pub fn serveFileContent(allocator: std.mem.Allocator, request: *http.Request, fs
         _ = response.setStatus(.ok)
             .setContentType(content_type)
             .setContentLength(file_size);
-        _ = response.setConnection(keep_alive);
+        setResponseMeta(&response, keep_alive, resolved_correlation_id);
         defer response.deinit();
         allocator.free(etag_buf);
 
@@ -418,6 +431,10 @@ pub fn serveFileContent(allocator: std.mem.Allocator, request: *http.Request, fs
             return;
         }
     }
+}
+
+fn setResponseMeta(response: *http.Response, keep_alive: bool, correlation_id: []const u8) void {
+    _ = response.setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
 }
 
 // Top-level function definition

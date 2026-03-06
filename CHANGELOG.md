@@ -9,6 +9,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 - sendfile() zero-copy optimization for static file serving (in progress)
+- Remote BearClaw gateway MVP edge path:
+  - New edge config loader (`src/edge_config.zig`) with `listen_host`, `listen_port`, `tls_cert_path`, `tls_key_path`, `upstream_base_url`, auth token hashes.
+  - New edge runtime (`src/edge_gateway.zig`) with `GET /health` and authenticated `POST /v1/chat`.
+  - Static bearer token auth using SHA-256 hash allowlist.
+  - Request validation and stable API error envelopes with `request_id`.
+  - Upstream forwarding to BearClaw with `X-Correlation-ID` propagation.
+  - Structured audit logs for route/status/auth/correlation/latency.
 - Correlation ID support via `X-Correlation-ID` header:
   - Echoes valid client-provided IDs in responses.
   - Generates `tg-<timestamp>-<random>` IDs when missing or invalid.

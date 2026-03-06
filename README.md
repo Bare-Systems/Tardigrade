@@ -30,6 +30,21 @@ zig build run
 
 The server starts on `http://localhost:8069` by default.
 
+## BearClaw Edge Gateway MVP
+
+Tardigrade now supports an edge-gateway path for BearClaw:
+- `GET /health`
+- `POST /v1/chat` (Bearer auth required)
+
+Environment variables:
+- `TARDIGRADE_LISTEN_HOST` (default `0.0.0.0`)
+- `TARDIGRADE_LISTEN_PORT` (default `8069`)
+- `TARDIGRADE_TLS_CERT_PATH` (configured path, runtime TLS socket termination pending)
+- `TARDIGRADE_TLS_KEY_PATH` (configured path, runtime TLS socket termination pending)
+- `TARDIGRADE_UPSTREAM_BASE_URL` (default `http://127.0.0.1:8080`)
+- `TARDIGRADE_AUTH_TOKEN_HASHES` (comma-separated lowercase SHA-256 token hashes)
+- `TARDIGRADE_MAX_MESSAGE_CHARS` (default `4000`)
+
 ### Build for Production
 
 ```bash

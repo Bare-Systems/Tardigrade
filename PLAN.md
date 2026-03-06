@@ -53,6 +53,18 @@ Priority: CRITICAL
 
 These features allow Tardigrade to become the Panda/BearClaw gateway early.
 
+### 0.0 Remote BearClaw MVP Track (NEW)
+- [x] edge runtime config (`listen_host`, `listen_port`, `tls_cert_path`, `tls_key_path`, `upstream_base_url`)
+- [x] `GET /health` gateway status route
+- [x] authenticated `POST /v1/chat` route
+- [x] static bearer token auth with SHA-256 token hash allowlist
+- [x] JSON request validation for `{ "message": "..." }`
+- [x] request forwarding to BearClaw `http://127.0.0.1:8080/v1/chat`
+- [x] `X-Correlation-ID` propagation downstream and in responses
+- [x] stable API error mapping (`unauthorized`, `invalid_request`, `rate_limited`, `tool_unavailable`, `upstream_timeout`, `internal_error`) with `request_id`
+- [x] structured audit logging (`route`, `status`, `auth_ok`, `correlation_id`, `latency_ms`)
+- [ ] native HTTPS socket termination in Zig runtime (deferred; cert/key config is in place)
+
 ### 0.1 Identity & Authentication
 - [x] Bearer token authentication
 - [ ] Device identity registration

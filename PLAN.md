@@ -2,56 +2,86 @@
 
 ## Project Vision
 
-Build a high-performance HTTP server in Zig as a complete replacement for nginx. This project aims to replicate nginx's core functionality while leveraging Zig's safety, performance, and simplicity.
+Build a high-performance HTTP server in Zig as a complete replacement for nginx while also acting as the secure gateway and runtime edge for Bare Labs services.
 
-## Current State
+The project has two parallel goals:
 
-Minimal HTTP server serving static files from `public/` directory on port 8069. Recent releases have significantly extended functionality:
+1. nginx parity — full high-performance HTTP server functionality
+2. Agent Gateway — a secure edge gateway for BearClaw and Panda clients
 
-- RFC-compliant HTTP/1.1 request parser (methods, URI/path+query, headers, Content-Length bodies)
-- HEAD request support
-- MIME type detection for many common file types
-- Structured logging via `std.log`
-- Modular HTTP response builder (`src/http/response.zig`) and HTTP status module (`src/http/status.zig`)
-- Responses automatically include `Date` and `Server` headers; `Content-Length` now calculated by the response builder
-- Method Not Allowed (405) responses include an `Allow` header
+Tardigrade should eventually function as:
 
-Core constraints still apply: single-threaded blocking I/O, no async/event loop or worker pool, and limited production hardening (see Known Issues).
+- HTTP server
+- reverse proxy
+- API gateway
+- event stream broker
+- TLS termination point
+- Bare Labs service mesh edge
 
-## Development Commands
+## Updated Architecture Role
 
-```bash
-# Build
-zig build
+Panda (iOS app)
+      |
+      | HTTPS / WebSocket / SSE
+      v
+Tardigrade (gateway / runtime edge)
+      |
+      v
+BearClaw
+      |
+      |- Koala
+      |- Polar
+      |- Kodiak
+      |- Ursa
+      |- Bear Arms
 
-# Build and run
-zig build run
+Responsibilities:
 
-# Run tests
-zig build test
+Component | Responsibility
+---|---
+Panda | client UI / secure device
+Tardigrade | secure gateway + runtime
+BearClaw | agent brain
+Other services | internal tools
 
-# Build optimized release
-zig build -Doptimize=ReleaseFast
-```
+## COMPLETE NGINX FEATURE PARITY ROADMAP
 
-## Development Workflow
+Keep the existing roadmap content, but reorganize phases so a gateway MVP happens early.
 
-For each feature:
-1. Create a branch: `git checkout -b feature/feature-name`
-2. Create `changes/feature-name.md` with scope and test plan
-3. Implement the feature
-4. Test thoroughly (manual + automated)
-5. Update documentation
-6. Commit and push: `git push -u origin feature/feature-name`
+## PHASE 0: Gateway Foundations (NEW)
+Priority: CRITICAL
 
----
+These features allow Tardigrade to become the Panda/BearClaw gateway early.
 
-# COMPLETE NGINX FEATURE PARITY ROADMAP
+### 0.1 Identity & Authentication
+- [ ] Bearer token authentication
+- [ ] Device identity registration
+- [ ] Public/private key device authentication
+- [ ] Auth middleware pipeline
+- [ ] Request auth context propagation
+- [ ] Token validation hooks
+- [ ] Token expiration / refresh logic
 
-Based on comprehensive research of nginx capabilities, here is everything needed for full replacement.
+### 0.2 Session Management
+- [ ] Session token issuance
+- [ ] Session storage abstraction
+- [ ] Device session tracking
+- [ ] Revocation support
+
+### 0.3 API Gateway Core
+- [ ] JSON request validation
+- [ ] API version routing
+- [ ] Correlation IDs
+- [ ] Idempotency key support
+- [ ] Request metadata injection
+
+### 0.4 Agent Command Routing
+- [ ] structured command routing
+- [ ] upstream request envelope
+- [ ] authenticated request forwarding
+- [ ] request auditing
 
 ## PHASE 1: Core HTTP Server Foundation
-**Priority: CRITICAL - Must complete first**
 
 ### 1.1 HTTP/1.1 Protocol Compliance
 - [x] Full request parser (method, URI, version, headers, body)
@@ -70,6 +100,7 @@ Based on comprehensive research of nginx capabilities, here is everything needed
 - [x] Range requests (partial content, byte ranges)
  - [x] Last-Modified and If-Modified-Since
 
+### 1.3 Error pages
 - [ ] Custom error pages (400, 401, 403, 404, 500, 502, 503, 504)
 - [ ] Error logging with levels
 - [ ] Graceful error responses
@@ -77,15 +108,12 @@ Based on comprehensive research of nginx capabilities, here is everything needed
 Resolved: custom error pages implemented and samples added under `public/errors/`.
 
 ### 1.4 Basic Logging
-- [ ] Access log (combined format)
+- [x] Access log (combined format)
 - [ ] Error log with severity levels
 - [ ] Timestamps and request IDs
 - [ ] Log rotation support
 
----
-
 ## PHASE 2: Async I/O & Performance
-**Priority: HIGH - Required for production use**
 
 ### 2.1 Event Loop
 - [ ] epoll (Linux) / kqueue (macOS/BSD) abstraction
@@ -112,10 +140,7 @@ Resolved: custom error pages implemented and samples added under `public/errors/
 - [ ] Zero-copy where possible
 - [ ] Memory limits per connection
 
----
-
 ## PHASE 3: Configuration System
-**Priority: HIGH - Needed for flexibility**
 
 ### 3.1 Configuration File Parser
 - [ ] keep-alive integration tests (low priority)
@@ -146,10 +171,20 @@ Resolved: custom error pages implemented and samples added under `public/errors/
 - [ ] Zero-downtime reload
 - [ ] Configuration validation before apply
 
----
+### 3.5 Secret Management (NEW)
+- [ ] encrypted secret storage
+- [ ] environment overrides
+- [ ] runtime secret reload
+- [ ] key rotation support
+
+Secrets may include:
+
+- TLS keys
+- auth signing keys
+- upstream API credentials
+- service tokens
 
 ## PHASE 4: Reverse Proxy
-**Priority: HIGH - Core nginx use case**
 
 ### 4.1 Basic Proxying
 - [ ] proxy_pass directive
@@ -184,10 +219,18 @@ Resolved: custom error pages implemented and samples added under `public/errors/
 - [ ] Protocol v1 and v2
 - [ ] Extracting real client IP
 
----
+### 4.6 Service Trust Model (NEW)
+- [ ] trusted upstream configuration
+- [ ] signed upstream headers
+- [ ] auth context forwarding
+- [ ] upstream identity verification
+
+### 4.7 Unix Socket Upstreams (NEW)
+- [ ] unix domain socket backends
+- [ ] local IPC routing
+- [ ] socket-based load balancing
 
 ## PHASE 5: Caching
-**Priority: MEDIUM - Performance optimization**
 
 ### 5.1 Proxy Cache
 - [ ] proxy_cache_path (disk-based)
@@ -208,10 +251,7 @@ Resolved: custom error pages implemented and samples added under `public/errors/
 - [ ] Cache-Control header
 - [ ] ETag/Last-Modified validation
 
----
-
 ## PHASE 6: Security Features
-**Priority: HIGH - Required for production**
 
 ### 6.1 Access Control
 - [ ] allow/deny directives (IP-based)
@@ -243,10 +283,14 @@ Resolved: custom error pages implemented and samples added under `public/errors/
 - [ ] Content-Security-Policy
 - [ ] Strict-Transport-Security
 
----
+### 6.6 Policy Engine (NEW)
+- [ ] route-level policy evaluation
+- [ ] device-based restrictions
+- [ ] per-user scopes
+- [ ] approval-required routes
+- [ ] time-based policy rules
 
-## PHASE 7: TLS/SSL
-**Priority: HIGH - Required for HTTPS**
+## PHASE 7: TLS / SSL
 
 ### 7.1 Basic TLS
 - [ ] TLS termination
@@ -271,10 +315,7 @@ Resolved: custom error pages implemented and samples added under `public/errors/
 - [ ] Dynamic certificate loading
 - [ ] ACME/Let's Encrypt integration (optional)
 
----
-
 ## PHASE 8: HTTP/2 & HTTP/3
-**Priority: MEDIUM - Modern protocol support**
 
 ### 8.1 HTTP/2
 - [ ] HPACK header compression
@@ -290,26 +331,31 @@ Resolved: custom error pages implemented and samples added under `public/errors/
 - [ ] Connection migration
 - [ ] QPACK header compression
 
----
-
-## PHASE 9: WebSocket Support
-**Priority: MEDIUM - Real-time applications**
+## PHASE 9: WebSocket & Event Streaming
 
 ### 9.1 WebSocket Proxying
-- [ ] Upgrade header handling
-- [ ] Connection upgrade to WebSocket
-- [ ] Bidirectional proxying
-- [ ] WebSocket over TLS (wss://)
+- [ ] upgrade handling
+- [ ] bidirectional proxying
+- [ ] wss support
 
-### 9.2 WebSocket Features
-- [ ] Ping/pong handling
-- [ ] Connection timeouts
-- [ ] Load balancing (sticky sessions)
+### 9.2 WebSocket Runtime
+- [ ] ping/pong
+- [ ] idle timeout
+- [ ] load balancing
 
----
+### 9.3 Server-Sent Events (NEW)
+- [ ] SSE protocol support
+- [ ] long-lived stream connections
+- [ ] reconnect tokens
+- [ ] stream backpressure
+
+### 9.4 Event Fanout (NEW)
+- [ ] event broadcast to subscribers
+- [ ] topic-based subscriptions
+- [ ] event buffering
+- [ ] slow client protection
 
 ## PHASE 10: Compression
-**Priority: MEDIUM - Bandwidth optimization**
 
 ### 10.1 Response Compression
 - [ ] gzip compression
@@ -322,10 +368,7 @@ Resolved: custom error pages implemented and samples added under `public/errors/
 ### 10.2 Decompression
 - [ ] gunzip for backends that don't support it
 
----
-
 ## PHASE 11: Advanced Features
-**Priority: LOW - Nice to have**
 
 ### 11.1 URL Rewriting
 - [ ] rewrite directive (regex-based)
@@ -356,10 +399,7 @@ Resolved: custom error pages implemented and samples added under `public/errors/
 - [ ] UDP proxying
 - [ ] Stream SSL termination
 
----
-
 ## PHASE 12: Observability
-**Priority: MEDIUM - Production operations**
 
 ### 12.1 Logging
 - [ ] Custom log formats
@@ -380,10 +420,15 @@ Resolved: custom error pages implemented and samples added under `public/errors/
 - [ ] Request tracing
 - [ ] Error categorization
 
----
+### 12.4 Admin API
+- [ ] route inspection
+- [ ] active connections
+- [ ] stream status
+- [ ] upstream health
+- [ ] loaded certificates
+- [ ] auth/device registry
 
 ## PHASE 13: Production Hardening
-**Priority: HIGH - Before production deployment**
 
 ### 13.1 Process Management
 - [ ] Master/worker process model
@@ -403,139 +448,78 @@ Resolved: custom error pages implemented and samples added under `public/errors/
 - [ ] Privilege dropping after bind
 - [ ] Chroot support (optional)
 
----
+### 13.4 Resilience Features (NEW)
+- [ ] circuit breakers
+- [ ] retry policies
+- [ ] timeout budgets
+- [ ] overload protection
+- [ ] request queue management
 
-# IMPLEMENTATION PRIORITY ORDER
+## PHASE 14: Real-Time Messaging Gateway (NEW)
 
-## Tier 1: MVP (Usable HTTP Server)
-1. HTTP/1.1 request parser
-2. Response builder with proper headers
-3. MIME type detection
-4. Error responses (400, 404, 405, 500)
-5. Keep-alive connections
-6. Basic logging
+This phase enables Tardigrade to function as the Panda/BearClaw gateway.
 
-## Tier 2: Production Static Server
-7. Async I/O (epoll/kqueue)
-8. Worker threads
-9. Configuration file
-10. Virtual hosts (server blocks)
-11. Location routing
-12. TLS termination
-13. Access logging
-14. Graceful shutdown
+### 14.1 Command Protocol
+- [ ] structured command envelopes
+- [ ] command lifecycle tracking
+- [ ] async command completion
 
-## Tier 3: Reverse Proxy
-15. Basic proxy_pass
-16. Upstream blocks
-17. Load balancing (round-robin)
-18. Health checks
-19. Header manipulation
-20. Proxy caching
+### 14.2 Stream Multiplexing
+- [ ] multiplex multiple streams
+- [ ] command + event streams
+- [ ] per-device stream isolation
 
-## Tier 4: Security & Rate Limiting
-21. Rate limiting
-22. Connection limits
-23. IP allow/deny
-24. Request size limits
-25. Security headers
+### 14.3 Approval Workflows
+- [ ] approval request routing
+- [ ] approval response handling
+- [ ] timeout escalation
 
-## Tier 5: Advanced Features
-26. HTTP/2
-27. WebSocket proxy
-28. Compression (gzip)
-29. URL rewriting
-30. HTTP/3 (QUIC)
+## IMPLEMENTATION PRIORITY ORDER
 
----
+Tier 1: Gateway MVP
 
-# TESTING STRATEGY
+1. HTTP parser
+2. Response builder
+3. Async I/O
+4. TLS termination
+5. Reverse proxy
+6. WebSocket support
+7. Authentication middleware
+8. Basic configuration
+9. Request size limits
+10. Connection timeouts
 
-## Unit Tests
-- HTTP parser edge cases
-- Header parsing
-- MIME type detection
-- Configuration parsing
-- URL routing logic
+At this stage Panda -> Tardigrade -> BearClaw communication works.
 
-## Integration Tests
-- Full HTTP request/response cycles
-- Keep-alive behavior
-- Error handling
-- TLS handshakes
-- Proxy forwarding
+Tier 2: Production Gateway
 
-- [ ] Socket-level keep-alive integration test (deferred): spawn server, open a single TCP connection and verify multiple requests reuse the same connection. Schedule after keep-alive implementation stabilizes.
+11. Logging
+12. Request IDs
+13. device identity
+14. policy engine
+15. SSE streaming
+16. admin API
+17. graceful shutdown
 
-## Load Tests
-- Requests per second (wrk, hey)
-- Concurrent connections
-- Memory usage under load
-- Latency percentiles
+Tier 3: Nginx Parity Core
 
-## Conformance Tests
-- HTTP/1.1 RFC compliance
-- TLS protocol compliance
-- HTTP/2 h2spec tests
+18. full config system
+19. virtual hosts
+20. location routing
+21. upstream pools
+22. load balancing
+23. caching
 
-## Security Tests
-- Path traversal attempts
-- Header injection
-- Request smuggling
-- Malformed requests
+Tier 4: Security & Performance
 
----
+24. rate limiting
+25. connection limits
+26. security headers
+27. compression
+28. circuit breakers
 
-# PERFORMANCE TARGETS
+Tier 5: Advanced Protocols
 
-| Metric | Target | nginx Reference |
-|--------|--------|-----------------|
-| Static file RPS (1 worker) | 50,000+ | ~60,000 |
-| Memory per idle connection | <4KB | ~2.5KB |
-| Latency p99 (static) | <1ms | <1ms |
-| Max concurrent connections | 10,000+ | 10,000+ |
-| TLS handshakes/sec | 5,000+ | ~8,000 |
-
----
-
-# CURRENT KNOWN ISSUES
-
-- Single-threaded blocking I/O (no epoll/kqueue abstraction or worker threads yet)
-- No request size limits configured (client_max_body_size not enforced)
-- No timeout enforcement (client_body_timeout, client_header_timeout, etc.)
-- Limited configuration system (no nginx-like config yet)
-- No TLS termination (HTTPS) or certificate management
-
-Resolved (recent releases):
-- Naive HTTP parsing — replaced by RFC-compliant HTTP/1.1 parser
-- Hardcoded `Content-Type` — MIME type detection implemented
-- Path traversal vulnerability — path traversal protection implemented
-- No logging — structured logging added
-
----
-
-# REFERENCES
-
-- [nginx documentation](https://nginx.org/en/docs/)
-- [HTTP/1.1 RFC 7230-7235](https://tools.ietf.org/html/rfc7230)
-- [HTTP/2 RFC 7540](https://tools.ietf.org/html/rfc7540)
-- [Zig std.net documentation](https://ziglang.org/documentation/master/std/#std.net)
-- [nginx architecture blog](https://www.nginx.com/blog/inside-nginx-how-we-designed-for-performance-scale/)
-
----
-
-# AGENT INSTRUCTIONS
-
-When implementing features:
-
-1. **Follow the workflow**: Branch → changes/doc → implement → test → commit
-2. **One feature at a time**: Complete and test before moving on
-3. **Test thoroughly**: Both automated and manual with curl
-4. **Update this doc**: Mark checkboxes as features complete
-5. **Keep it building**: Never commit broken code
-6. **Security first**: Validate all inputs, prevent path traversal
-7. **Handle errors**: No panics in production paths
-
-## Contributing to the Plan
-
-To propose roadmap changes or add new work items, create a `changes/` document describing the proposal (overview, scope, files to change, testing plan, and acceptance criteria) and open a pull request that includes the `changes/` file and any suggested updates to `PLAN.md`. Discuss and iterate on the PR until merged — `PLAN.md` is the single source of truth for roadmap priorities.
+29. HTTP/2
+30. HTTP/3
+31. advanced proxy protocols

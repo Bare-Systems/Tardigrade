@@ -182,10 +182,12 @@ Decision: queue dispatch currently uses a single shared queue (basic balancing b
 Resolved: worker shutdown now supports graceful draining; when drain mode is enabled, pool shutdown waits for queued and in-flight connection jobs to finish before joining worker threads.
 
 ### 2.4 Memory Management
-- [ ] Arena allocators for request scope
+- [x] Arena allocators for request scope
 - [ ] Buffer pooling
 - [ ] Zero-copy where possible
 - [ ] Memory limits per connection
+
+Resolved (incremental): request handling path now uses a request-scoped arena allocator in `src/edge_gateway.zig`, reducing allocator churn and centralizing per-request memory cleanup at end-of-request.
 
 ## PHASE 3: Configuration System
 

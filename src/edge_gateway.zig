@@ -483,9 +483,9 @@ fn handleConnection(conn: anytype, cfg: *const edge_config.EdgeConfig, state: *G
     keep_alive_out.* = false;
     defer keep_alive_out.* = keep_alive;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
 
     var req_buf: [MAX_REQUEST_SIZE]u8 = undefined;
     const total_read = try readHttpRequest(conn, req_buf[0..]);

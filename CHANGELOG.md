@@ -1,6 +1,13 @@
 
 # Changelog
 
+## [0.26.0] - 2026-03-xx
+
+### Added
+- Phase 2.4 request arena allocation (`src/edge_gateway.zig`):
+  - Request processing now uses a request-scoped arena allocator instead of a per-request general-purpose allocator.
+  - Per-request temporary allocations are reclaimed in one step at request completion.
+
 ## [0.25.0] - 2026-03-xx
 
 ### Added

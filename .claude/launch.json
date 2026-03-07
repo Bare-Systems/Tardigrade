@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "tardigrade",
+      "runtimeExecutable": "zig",
+      "runtimeArgs": ["build", "run"],
+      "port": 8069
+    }
+  ]
+}

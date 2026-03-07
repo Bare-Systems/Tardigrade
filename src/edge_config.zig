@@ -9,6 +9,14 @@ pub const EdgeConfig = struct {
     auth_token_hashes: [][]const u8,
     max_message_chars: usize,
     upstream_timeout_ms: u32,
+    /// Requests per second per client IP (0 = disabled).
+    rate_limit_rps: f64,
+    /// Burst capacity for rate limiter.
+    rate_limit_burst: u32,
+    /// Whether to add security headers to responses.
+    security_headers_enabled: bool,
+    /// Idempotency cache TTL in seconds (0 = disabled).
+    idempotency_ttl_seconds: u32,
 
     pub fn deinit(self: *EdgeConfig, allocator: std.mem.Allocator) void {
         allocator.free(self.listen_host);
@@ -50,6 +58,22 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     defer allocator.free(raw_hashes);
     const hashes = try parseHashes(allocator, raw_hashes);
 
+    const rate_rps_str = envOrDefault(allocator, "TARDIGRADE_RATE_LIMIT_RPS", "10") catch unreachable;
+    defer allocator.free(rate_rps_str);
+    const rate_limit_rps = std.fmt.parseFloat(f64, rate_rps_str) catch 10.0;
+
+    const rate_burst_str = envOrDefault(allocator, "TARDIGRADE_RATE_LIMIT_BURST", "20") catch unreachable;
+    defer allocator.free(rate_burst_str);
+    const rate_limit_burst = std.fmt.parseInt(u32, rate_burst_str, 10) catch 20;
+
+    const sec_headers_str = envOrDefault(allocator, "TARDIGRADE_SECURITY_HEADERS", "true") catch unreachable;
+    defer allocator.free(sec_headers_str);
+    const security_headers_enabled = std.mem.eql(u8, sec_headers_str, "true") or std.mem.eql(u8, sec_headers_str, "1");
+
+    const idem_ttl_str = envOrDefault(allocator, "TARDIGRADE_IDEMPOTENCY_TTL", "300") catch unreachable;
+    defer allocator.free(idem_ttl_str);
+    const idempotency_ttl_seconds = std.fmt.parseInt(u32, idem_ttl_str, 10) catch 300;
+
     return .{
         .listen_host = listen_host,
         .listen_port = listen_port,
@@ -59,6 +83,10 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .auth_token_hashes = hashes,
         .max_message_chars = max_message_chars,
         .upstream_timeout_ms = upstream_timeout_ms,
+        .rate_limit_rps = rate_limit_rps,
+        .rate_limit_burst = rate_limit_burst,
+        .security_headers_enabled = security_headers_enabled,
+        .idempotency_ttl_seconds = idempotency_ttl_seconds,
     };
 }
 

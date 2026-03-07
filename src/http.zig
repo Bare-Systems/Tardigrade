@@ -18,6 +18,11 @@ pub const dates = @import("http/dates.zig");
 pub const etag = @import("http/etag.zig");
 pub const correlation = @import("http/correlation_id.zig");
 pub const auth = @import("http/auth.zig");
+pub const rate_limiter = @import("http/rate_limiter.zig");
+pub const security_headers = @import("http/security_headers.zig");
+pub const request_context = @import("http/request_context.zig");
+pub const api_router = @import("http/api_router.zig");
+pub const idempotency = @import("http/idempotency.zig");
 
 // Re-export constants
 pub const MAX_HEADERS = headers.MAX_HEADERS;

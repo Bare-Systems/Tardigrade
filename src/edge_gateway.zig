@@ -6,6 +6,11 @@ const MAX_REQUEST_SIZE: usize = 256 * 1024;
 const STREAM_RELAY_BUFFER_SIZE: usize = 16 * 1024;
 const JSON_CONTENT_TYPE = "application/json";
 
+const UpstreamHealth = struct {
+    fail_count: u32 = 0,
+    unhealthy_until_ms: u64 = 0,
+};
+
 /// Persistent gateway state shared across connections.
 const GatewayState = struct {
     allocator: std.mem.Allocator,
@@ -24,6 +29,7 @@ const GatewayState = struct {
     relay_buffer_pool: http.buffer_pool.BufferPool,
     max_connections_per_ip: u32,
     upstream_rr_index: usize,
+    upstream_health: std.StringHashMap(UpstreamHealth),
     active_connections_by_ip: std.StringHashMap(u32),
     fd_to_ip: std.AutoHashMap(std.posix.fd_t, []u8),
 
@@ -35,6 +41,9 @@ const GatewayState = struct {
         self.upstream_client.deinit();
         self.request_buffer_pool.deinit();
         self.relay_buffer_pool.deinit();
+        var upstream_it = self.upstream_health.iterator();
+        while (upstream_it.next()) |entry| self.allocator.free(entry.key_ptr.*);
+        self.upstream_health.deinit();
         var ip_it = self.active_connections_by_ip.iterator();
         while (ip_it.next()) |entry| self.allocator.free(entry.key_ptr.*);
         self.active_connections_by_ip.deinit();
@@ -201,7 +210,79 @@ const GatewayState = struct {
     fn nextUpstreamBaseUrl(self: *GatewayState, cfg: *const edge_config.EdgeConfig) []const u8 {
         self.mutex.lock();
         defer self.mutex.unlock();
+        if (cfg.upstream_max_fails == 0) {
+            return selectUpstreamBaseUrl(cfg.upstream_base_urls, cfg.upstream_base_url, &self.upstream_rr_index);
+        }
+
+        if (cfg.upstream_base_urls.len == 0) return cfg.upstream_base_url;
+        const now_ms = http.event_loop.monotonicMs();
+        const start = self.upstream_rr_index % cfg.upstream_base_urls.len;
+
+        var offset: usize = 0;
+        while (offset < cfg.upstream_base_urls.len) : (offset += 1) {
+            const idx = (start + offset) % cfg.upstream_base_urls.len;
+            const candidate = cfg.upstream_base_urls[idx];
+            if (self.isUpstreamHealthyLocked(candidate, now_ms)) {
+                self.upstream_rr_index = (idx + 1) % cfg.upstream_base_urls.len;
+                return candidate;
+            }
+        }
+
+        // If all backends are currently unhealthy, still probe in round-robin order.
         return selectUpstreamBaseUrl(cfg.upstream_base_urls, cfg.upstream_base_url, &self.upstream_rr_index);
+    }
+
+    fn recordUpstreamFailure(self: *GatewayState, cfg: *const edge_config.EdgeConfig, upstream_base_url: []const u8) void {
+        if (cfg.upstream_max_fails == 0) return;
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (self.upstream_health.getPtr(upstream_base_url)) |health| {
+            health.fail_count +|= 1;
+            if (health.fail_count >= cfg.upstream_max_fails) {
+                health.fail_count = 0;
+                health.unhealthy_until_ms = http.event_loop.monotonicMs() + cfg.upstream_fail_timeout_ms;
+            }
+            return;
+        }
+
+        const owned = self.allocator.dupe(u8, upstream_base_url) catch return;
+        self.upstream_health.put(owned, .{}) catch {
+            self.allocator.free(owned);
+            return;
+        };
+        if (self.upstream_health.getPtr(owned)) |health| {
+            health.fail_count = 1;
+            if (health.fail_count >= cfg.upstream_max_fails) {
+                health.fail_count = 0;
+                health.unhealthy_until_ms = http.event_loop.monotonicMs() + cfg.upstream_fail_timeout_ms;
+            }
+        }
+    }
+
+    fn recordUpstreamSuccess(self: *GatewayState, cfg: *const edge_config.EdgeConfig, upstream_base_url: []const u8) void {
+        if (cfg.upstream_max_fails == 0) return;
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.upstream_health.getPtr(upstream_base_url)) |health| {
+            health.fail_count = 0;
+            health.unhealthy_until_ms = 0;
+        }
+    }
+
+    fn isUpstreamHealthyLocked(self: *GatewayState, upstream_base_url: []const u8, now_ms: u64) bool {
+        if (self.upstream_health.getPtr(upstream_base_url)) |health| {
+            if (health.unhealthy_until_ms == 0) return true;
+            if (now_ms >= health.unhealthy_until_ms) {
+                health.unhealthy_until_ms = 0;
+                health.fail_count = 0;
+                return true;
+            }
+            return false;
+        }
+        return true;
     }
 };
 
@@ -314,6 +395,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         .relay_buffer_pool = http.buffer_pool.BufferPool.init(state_allocator, STREAM_RELAY_BUFFER_SIZE, cfg.connection_pool_size),
         .max_connections_per_ip = cfg.max_connections_per_ip,
         .upstream_rr_index = 0,
+        .upstream_health = std.StringHashMap(UpstreamHealth).init(state_allocator),
         .active_connections_by_ip = std.StringHashMap(u32).init(state_allocator),
         .fd_to_ip = std.AutoHashMap(std.posix.fd_t, []u8).init(state_allocator),
     };
@@ -410,6 +492,9 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     }
     if (cfg.upstream_retry_attempts > 1) {
         state.logger.info(null, "Upstream retry attempts configured: {d}", .{cfg.upstream_retry_attempts});
+    }
+    if (cfg.upstream_max_fails > 0) {
+        state.logger.info(null, "Passive upstream health enabled: max_fails={d} fail_timeout={d}ms", .{ cfg.upstream_max_fails, cfg.upstream_fail_timeout_ms });
     }
     if (cfg.max_connections_per_ip > 0) {
         state.logger.info(null, "Per-IP connection limit enabled: {d}", .{cfg.max_connections_per_ip});
@@ -1445,6 +1530,7 @@ fn proxyJsonExecute(
             state,
             enable_streaming_success,
         ) catch |err| {
+            state.recordUpstreamFailure(cfg, upstream_base_url);
             last_err = err;
             if (attempt + 1 < max_attempts) {
                 state.logger.warn(correlation_id, "upstream attempt {d}/{d} failed: {}", .{ attempt + 1, max_attempts, err });
@@ -1452,7 +1538,31 @@ fn proxyJsonExecute(
             }
             return err;
         };
-        return exec;
+
+        switch (exec) {
+            .streamed_status => |status| {
+                if (status >= 500) {
+                    state.recordUpstreamFailure(cfg, upstream_base_url);
+                } else {
+                    state.recordUpstreamSuccess(cfg, upstream_base_url);
+                }
+                return exec;
+            },
+            .buffered => |res| {
+                if (res.status >= 500) {
+                    state.recordUpstreamFailure(cfg, upstream_base_url);
+                    if (attempt + 1 < max_attempts) {
+                        allocator.free(res.body);
+                        allocator.free(res.content_type);
+                        if (res.content_disposition) |cd| allocator.free(cd);
+                        continue;
+                    }
+                } else {
+                    state.recordUpstreamSuccess(cfg, upstream_base_url);
+                }
+                return exec;
+            },
+        }
     }
 
     return last_err orelse error.UpstreamUnavailable;
@@ -1936,6 +2046,8 @@ test "resolveProxyTarget handles absolute and relative proxy_pass" {
         .max_connection_memory_bytes = 2 * 1024 * 1024,
         .proxy_stream_all_statuses = false,
         .upstream_retry_attempts = 1,
+        .upstream_max_fails = 0,
+        .upstream_fail_timeout_ms = 10_000,
     };
 
     const abs = try resolveProxyTarget(allocator, cfg.upstream_base_url, "https://api.example.com/base", "/v1/chat");
@@ -1997,6 +2109,8 @@ test "authorizeRequest accepts valid hash" {
         .max_connection_memory_bytes = 2 * 1024 * 1024,
         .proxy_stream_all_statuses = false,
         .upstream_retry_attempts = 1,
+        .upstream_max_fails = 0,
+        .upstream_fail_timeout_ms = 10_000,
     };
 
     var headers = http.Headers.init(allocator);

@@ -37,6 +37,10 @@
 - Phase 13.4 retry policy foundation (`src/edge_config.zig`, `src/edge_gateway.zig`):
   - Added `TARDIGRADE_UPSTREAM_RETRY_ATTEMPTS` (minimum 1) for proxy upstream retries.
   - Proxy execution now retries failed attempts and rotates upstream base URL selection between attempts.
+- Phase 4.2/4.4 passive upstream health tracking (`src/edge_config.zig`, `src/edge_gateway.zig`):
+  - Added `TARDIGRADE_UPSTREAM_MAX_FAILS` and `TARDIGRADE_UPSTREAM_FAIL_TIMEOUT_MS`.
+  - Backends are marked temporarily unhealthy after threshold failures and skipped by round-robin selection until cooldown expires.
+  - Retry + backend rotation now records upstream success/failure outcomes for passive failover decisions.
 
 ## [0.26.0] - 2026-03-xx
 

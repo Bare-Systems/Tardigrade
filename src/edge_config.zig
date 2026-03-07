@@ -63,6 +63,10 @@ pub const EdgeConfig = struct {
     proxy_stream_all_statuses: bool,
     /// Number of upstream attempt retries for proxy requests (minimum 1).
     upstream_retry_attempts: u32,
+    /// Passive health threshold: mark upstream as failed after this many failed attempts (0 = disabled).
+    upstream_max_fails: u32,
+    /// Passive health timeout (ms) for failed upstreams before retry eligibility.
+    upstream_fail_timeout_ms: u64,
 
     pub fn deinit(self: *EdgeConfig, allocator: std.mem.Allocator) void {
         allocator.free(self.listen_host);
@@ -239,6 +243,14 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     defer allocator.free(retry_attempts_str);
     const upstream_retry_attempts = @max(std.fmt.parseInt(u32, retry_attempts_str, 10) catch 1, 1);
 
+    const max_fails_str = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_MAX_FAILS", "0") catch unreachable;
+    defer allocator.free(max_fails_str);
+    const upstream_max_fails = std.fmt.parseInt(u32, max_fails_str, 10) catch 0;
+
+    const fail_timeout_str = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_FAIL_TIMEOUT_MS", "10000") catch unreachable;
+    defer allocator.free(fail_timeout_str);
+    const upstream_fail_timeout_ms = std.fmt.parseInt(u64, fail_timeout_str, 10) catch 10_000;
+
     return .{
         .listen_host = listen_host,
         .listen_port = listen_port,
@@ -281,6 +293,8 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .max_connection_memory_bytes = max_connection_memory_bytes,
         .proxy_stream_all_statuses = proxy_stream_all_statuses,
         .upstream_retry_attempts = upstream_retry_attempts,
+        .upstream_max_fails = upstream_max_fails,
+        .upstream_fail_timeout_ms = upstream_fail_timeout_ms,
     };
 }
 

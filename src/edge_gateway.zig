@@ -197,11 +197,59 @@ const WorkerContext = struct {
     cfg: *const edge_config.EdgeConfig,
     state: *GatewayState,
     tls: ?*http.tls_termination.TlsTerminator,
+    session_pool: *ConnectionSessionPool,
 };
 
 const ConnectionSession = struct {
     pending_buf: [MAX_REQUEST_SIZE]u8 = undefined,
     pending_len: usize = 0,
+};
+
+const ConnectionSessionPool = struct {
+    allocator: std.mem.Allocator,
+    mutex: std.Thread.Mutex = .{},
+    free_list: std.ArrayList(*ConnectionSession),
+    max_cached: usize,
+
+    fn init(allocator: std.mem.Allocator, max_cached: usize) ConnectionSessionPool {
+        return .{
+            .allocator = allocator,
+            .free_list = std.ArrayList(*ConnectionSession).init(allocator),
+            .max_cached = max_cached,
+        };
+    }
+
+    fn deinit(self: *ConnectionSessionPool) void {
+        for (self.free_list.items) |session| {
+            self.allocator.destroy(session);
+        }
+        self.free_list.deinit();
+    }
+
+    fn acquire(self: *ConnectionSessionPool) !*ConnectionSession {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (self.free_list.items.len > 0) {
+            return self.free_list.pop().?;
+        }
+        return try self.allocator.create(ConnectionSession);
+    }
+
+    fn release(self: *ConnectionSessionPool, session: *ConnectionSession) void {
+        session.pending_len = 0;
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (self.free_list.items.len >= self.max_cached) {
+            self.allocator.destroy(session);
+            return;
+        }
+        self.free_list.append(session) catch {
+            self.allocator.destroy(session);
+        };
+    }
 };
 
 pub fn run(cfg: *const edge_config.EdgeConfig) !void {
@@ -275,7 +323,12 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         .cfg = cfg,
         .state = &state,
         .tls = if (tls_terminator) |*tls| tls else null,
+        .session_pool = undefined,
     };
+    var session_pool = ConnectionSessionPool.init(state_allocator, cfg.connection_pool_size);
+    defer session_pool.deinit();
+    worker_ctx.session_pool = &session_pool;
+
     var worker_pool: http.worker_pool.WorkerPool = undefined;
     try worker_pool.init(
         state_allocator,
@@ -322,6 +375,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     }
     state.logger.info(null, "Worker pool enabled: workers={d} queue={d}", .{ worker_count, cfg.worker_queue_size });
     state.logger.info(null, "Keep-alive configured: timeout={d}ms max_requests={d}", .{ cfg.keep_alive_timeout_ms, cfg.max_requests_per_connection });
+    state.logger.info(null, "Connection session pool configured: max_cached={d}", .{cfg.connection_pool_size});
     if (cfg.max_connections_per_ip > 0) {
         state.logger.info(null, "Per-IP connection limit enabled: {d}", .{cfg.max_connections_per_ip});
     }
@@ -351,6 +405,8 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         }
     }
 
+    state.logger.info(null, "Shutdown requested; draining active connection work", .{});
+    worker_pool.shutdownAndJoin(true);
     state.logger.info(null, "Graceful shutdown complete", .{});
 }
 
@@ -400,6 +456,12 @@ fn acceptReadyConnections(listen_fd: std.posix.fd_t, worker_pool: *http.worker_p
 fn handleAcceptedClient(raw_ctx: *anyopaque, client_fd: std.posix.fd_t) void {
     const ctx: *WorkerContext = @ptrCast(@alignCast(raw_ctx));
     defer ctx.state.releaseConnectionSlot(client_fd);
+    const session = ctx.session_pool.acquire() catch |err| {
+        ctx.state.logger.warn(null, "failed to acquire pooled connection session: {}", .{err});
+        std.posix.close(client_fd);
+        return;
+    };
+    defer ctx.session_pool.release(session);
 
     const idle_timeout_ms = if (ctx.cfg.keep_alive_timeout_ms > 0)
         ctx.cfg.keep_alive_timeout_ms
@@ -425,16 +487,16 @@ fn handleAcceptedClient(raw_ctx: *anyopaque, client_fd: std.posix.fd_t) void {
         };
         defer tls_conn.deinit();
         defer std.posix.close(client_fd);
-        var session = ConnectionSession{};
 
         var served: u32 = 0;
         while (true) {
             var keep_alive = false;
-            handleConnection(&tls_conn, &session, ctx.cfg, ctx.state, &keep_alive) catch |err| {
+            handleConnection(&tls_conn, session, ctx.cfg, ctx.state, &keep_alive) catch |err| {
                 ctx.state.logger.err(null, "edge connection error: {}", .{err});
                 break;
             };
             served += 1;
+            if (http.shutdown.isShutdownRequested()) break;
             if (!keep_alive) break;
             if (ctx.cfg.max_requests_per_connection > 0 and served >= ctx.cfg.max_requests_per_connection) break;
         }
@@ -444,16 +506,16 @@ fn handleAcceptedClient(raw_ctx: *anyopaque, client_fd: std.posix.fd_t) void {
     } else {
         const stream = std.net.Stream{ .handle = client_fd };
         defer stream.close();
-        var session = ConnectionSession{};
 
         var served: u32 = 0;
         while (true) {
             var keep_alive = false;
-            handleConnection(stream, &session, ctx.cfg, ctx.state, &keep_alive) catch |err| {
+            handleConnection(stream, session, ctx.cfg, ctx.state, &keep_alive) catch |err| {
                 ctx.state.logger.err(null, "edge connection error: {}", .{err});
                 break;
             };
             served += 1;
+            if (http.shutdown.isShutdownRequested()) break;
             if (!keep_alive) break;
             if (ctx.cfg.max_requests_per_connection > 0 and served >= ctx.cfg.max_requests_per_connection) break;
         }
@@ -515,6 +577,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
     defer request.deinit();
     const writer = conn.writer();
     keep_alive = request.keepAlive();
+    if (http.shutdown.isShutdownRequested()) keep_alive = false;
 
     // --- Correlation ID ---
     const correlation_id = try http.correlation.fromHeadersOrGenerate(allocator, &request.headers);
@@ -1589,6 +1652,21 @@ test "firstRequestCompleteLen waits for complete body" {
     try std.testing.expectEqual(@as(usize, complete.len), firstRequestCompleteLen(complete).?);
 }
 
+test "connection session pool reuses released sessions" {
+    var pool = ConnectionSessionPool.init(std.testing.allocator, 4);
+    defer pool.deinit();
+
+    const first = try pool.acquire();
+    first.pending_len = 42;
+    pool.release(first);
+
+    const second = try pool.acquire();
+    defer pool.release(second);
+
+    try std.testing.expect(first == second);
+    try std.testing.expectEqual(@as(usize, 0), second.pending_len);
+}
+
 test "combineProxyTarget joins prefix and suffix" {
     const allocator = std.testing.allocator;
     const joined = try combineProxyTarget(allocator, "/api", "/v1/chat");
@@ -1628,6 +1706,7 @@ test "resolveProxyTarget handles absolute and relative proxy_pass" {
         .max_connections_per_ip = 0,
         .keep_alive_timeout_ms = 5000,
         .max_requests_per_connection = 100,
+        .connection_pool_size = 256,
     };
 
     const abs = try resolveProxyTarget(allocator, &cfg, "https://api.example.com/base", "/v1/chat");
@@ -1684,6 +1763,7 @@ test "authorizeRequest accepts valid hash" {
         .max_connections_per_ip = 0,
         .keep_alive_timeout_ms = 5000,
         .max_requests_per_connection = 100,
+        .connection_pool_size = 256,
     };
 
     var headers = http.Headers.init(allocator);

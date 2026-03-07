@@ -8,6 +8,11 @@
   - Added per-connection pending buffer/session state for keep-alive request loops.
   - HTTP parser `bytes_consumed` is now used to preserve unread bytes for subsequent requests on the same socket.
   - Added request-boundary helper tests for pipelined and body-length-delimited requests.
+- Phase 2.2 connection pooling + graceful draining completion (`src/edge_gateway.zig`, `src/edge_config.zig`):
+  - Added thread-safe `ConnectionSessionPool` used by workers to reuse connection session objects across accepted sockets.
+  - Added `TARDIGRADE_CONNECTION_POOL_SIZE` to bound cached connection-session objects.
+  - Gateway shutdown now explicitly drains active/queued connection work before worker join, and keep-alive responses switch to `Connection: close` during drain.
+  - Added unit coverage for connection-session pool reuse/reset behavior.
 
 ## [0.26.0] - 2026-03-xx
 

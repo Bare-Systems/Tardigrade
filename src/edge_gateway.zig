@@ -199,6 +199,11 @@ const WorkerContext = struct {
     tls: ?*http.tls_termination.TlsTerminator,
 };
 
+const ConnectionSession = struct {
+    pending_buf: [MAX_REQUEST_SIZE]u8 = undefined,
+    pending_len: usize = 0,
+};
+
 pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -420,11 +425,12 @@ fn handleAcceptedClient(raw_ctx: *anyopaque, client_fd: std.posix.fd_t) void {
         };
         defer tls_conn.deinit();
         defer std.posix.close(client_fd);
+        var session = ConnectionSession{};
 
         var served: u32 = 0;
         while (true) {
             var keep_alive = false;
-            handleConnection(&tls_conn, ctx.cfg, ctx.state, &keep_alive) catch |err| {
+            handleConnection(&tls_conn, &session, ctx.cfg, ctx.state, &keep_alive) catch |err| {
                 ctx.state.logger.err(null, "edge connection error: {}", .{err});
                 break;
             };
@@ -438,11 +444,12 @@ fn handleAcceptedClient(raw_ctx: *anyopaque, client_fd: std.posix.fd_t) void {
     } else {
         const stream = std.net.Stream{ .handle = client_fd };
         defer stream.close();
+        var session = ConnectionSession{};
 
         var served: u32 = 0;
         while (true) {
             var keep_alive = false;
-            handleConnection(stream, ctx.cfg, ctx.state, &keep_alive) catch |err| {
+            handleConnection(stream, &session, ctx.cfg, ctx.state, &keep_alive) catch |err| {
                 ctx.state.logger.err(null, "edge connection error: {}", .{err});
                 break;
             };
@@ -478,7 +485,7 @@ fn setNonBlocking(fd: std.posix.fd_t, enabled: bool) !void {
     _ = try std.posix.fcntl(fd, std.posix.F.SETFL, flags);
 }
 
-fn handleConnection(conn: anytype, cfg: *const edge_config.EdgeConfig, state: *GatewayState, keep_alive_out: *bool) !void {
+fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge_config.EdgeConfig, state: *GatewayState, keep_alive_out: *bool) !void {
     var keep_alive = false;
     keep_alive_out.* = false;
     defer keep_alive_out.* = keep_alive;
@@ -487,15 +494,22 @@ fn handleConnection(conn: anytype, cfg: *const edge_config.EdgeConfig, state: *G
     defer arena_state.deinit();
     const allocator = arena_state.allocator();
 
-    var req_buf: [MAX_REQUEST_SIZE]u8 = undefined;
-    const total_read = try readHttpRequest(conn, req_buf[0..]);
+    const total_read = try readHttpRequest(conn, session.pending_buf[0..], &session.pending_len);
     if (total_read == 0) return;
 
-    const parse_result = http.Request.parse(allocator, req_buf[0..total_read], MAX_REQUEST_SIZE) catch |err| {
+    const parse_result = http.Request.parse(allocator, session.pending_buf[0..total_read], MAX_REQUEST_SIZE) catch |err| {
         try sendApiError(allocator, conn.writer(), .bad_request, "invalid_request", "Malformed request", null, keep_alive, state);
         state.logger.warn(null, "parse error: {}", .{err});
         return;
     };
+    const bytes_consumed = parse_result.bytes_consumed;
+    if (bytes_consumed < total_read) {
+        const remaining = total_read - bytes_consumed;
+        std.mem.copyForwards(u8, session.pending_buf[0..remaining], session.pending_buf[bytes_consumed..total_read]);
+        session.pending_len = remaining;
+    } else {
+        session.pending_len = 0;
+    }
 
     var request = parse_result.request;
     defer request.deinit();
@@ -1487,31 +1501,35 @@ fn logAccess(ctx: *const http.request_context.RequestContext, method: []const u8
     entry.log();
 }
 
-fn readHttpRequest(conn: anytype, buf: []u8) !usize {
-    var total_read: usize = 0;
-    var header_end: ?usize = null;
+fn readHttpRequest(conn: anytype, buf: []u8, pending_len: *usize) !usize {
+    var total_read = pending_len.*;
 
-    while (total_read < buf.len) {
+    while (total_read <= buf.len) {
+        if (firstRequestCompleteLen(buf[0..total_read])) |request_len| {
+            pending_len.* = total_read;
+            return @min(total_read, request_len);
+        }
+        if (total_read == buf.len) break;
+
         const n = conn.read(buf[total_read..]) catch |err| switch (err) {
             error.WouldBlock => return 0,
             else => return err,
         };
         if (n == 0) break;
         total_read += n;
-
-        if (header_end == null) {
-            if (std.mem.indexOf(u8, buf[0..total_read], "\r\n\r\n")) |pos| {
-                header_end = pos + 4;
-            }
-        }
-
-        if (header_end) |headers_len| {
-            const content_length = parseContentLength(buf[0..headers_len]) orelse 0;
-            if (total_read >= headers_len + content_length) break;
-        }
     }
 
+    pending_len.* = total_read;
     return total_read;
+}
+
+fn firstRequestCompleteLen(data: []const u8) ?usize {
+    const header_pos = std.mem.indexOf(u8, data, "\r\n\r\n") orelse return null;
+    const headers_len = header_pos + 4;
+    const content_length = parseContentLength(data[0..headers_len]) orelse 0;
+    const full_len = headers_len + content_length;
+    if (data.len >= full_len) return full_len;
+    return null;
 }
 
 fn parseContentLength(headers: []const u8) ?usize {
@@ -1553,6 +1571,22 @@ test "parseUpstreamHost extracts authority" {
     try std.testing.expectEqualStrings("127.0.0.1:8080", parseUpstreamHost("http://127.0.0.1:8080") orelse "");
     try std.testing.expectEqualStrings("api.example.com", parseUpstreamHost("https://api.example.com/v1") orelse "");
     try std.testing.expect(parseUpstreamHost("invalid-url") == null);
+}
+
+test "firstRequestCompleteLen detects pipelined boundary" {
+    const pipelined =
+        "GET /one HTTP/1.1\r\nHost: localhost\r\n\r\n" ++
+        "GET /two HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    const first_len = firstRequestCompleteLen(pipelined).?;
+    try std.testing.expectEqual(@as(usize, 38), first_len);
+}
+
+test "firstRequestCompleteLen waits for complete body" {
+    const partial = "POST /x HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nhel";
+    try std.testing.expect(firstRequestCompleteLen(partial) == null);
+
+    const complete = "POST /x HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nhello";
+    try std.testing.expectEqual(@as(usize, complete.len), firstRequestCompleteLen(complete).?);
 }
 
 test "combineProxyTarget joins prefix and suffix" {

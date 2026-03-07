@@ -1,6 +1,14 @@
 
 # Changelog
 
+## [0.27.0] - 2026-03-xx
+
+### Added
+- Phase 2.2 request pipelining boundary support (`src/edge_gateway.zig`):
+  - Added per-connection pending buffer/session state for keep-alive request loops.
+  - HTTP parser `bytes_consumed` is now used to preserve unread bytes for subsequent requests on the same socket.
+  - Added request-boundary helper tests for pipelined and body-length-delimited requests.
+
 ## [0.26.0] - 2026-03-xx
 
 ### Added

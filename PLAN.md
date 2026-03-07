@@ -255,6 +255,7 @@ Resolved: basic proxy_pass-style routing now supports config-driven targets for 
 Resolved (incremental): `/v1/chat` and `/v1/commands` now support streamed relay for successful upstream responses via chunked downstream writes, avoiding full buffering on the hot path.
 Resolved: upstream requests now use a shared `std.http.Client` in gateway state with keep-alive enabled, allowing backend connection reuse across requests.
 Resolved (incremental): added optional full-status streaming mode via `TARDIGRADE_PROXY_STREAM_ALL_STATUSES` to relay non-200 upstream responses directly when desired.
+Resolved (incremental): buffered proxy responses now preserve upstream `Content-Type` and `Content-Disposition` metadata for successful upstream responses, reducing streamed vs buffered response behavior drift.
 Decision: default behavior still maps non-200 upstream errors into stable gateway error envelopes; full-status passthrough streaming is opt-in to preserve compatibility.
 
 ### 4.2 Upstream Management

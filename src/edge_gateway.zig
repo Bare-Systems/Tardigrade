@@ -997,7 +997,13 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         };
         var cmd_final_status: u16 = undefined;
         var cmd_final_body: []const u8 = "";
+        var cmd_final_content_type: []const u8 = JSON_CONTENT_TYPE;
+        var cmd_final_content_disposition: ?[]const u8 = null;
+        var cmd_final_content_type_alloc: ?[]u8 = null;
+        var cmd_final_content_disposition_alloc: ?[]u8 = null;
         var cmd_error_body: ?[]const u8 = null;
+        defer if (cmd_final_content_type_alloc) |ct| allocator.free(ct);
+        defer if (cmd_final_content_disposition_alloc) |cd| allocator.free(cd);
         switch (cmd_exec) {
             .streamed_status => |status| {
                 cmd_final_status = status;
@@ -1031,10 +1037,23 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
                 cmd_final_status = proxy_result.status;
                 cmd_final_body = proxy_result.body;
                 if (proxy_result.status != 200) {
+                    allocator.free(proxy_result.content_type);
+                    if (proxy_result.content_disposition) |cd| allocator.free(cd);
                     const mapped = mapUpstreamError(proxy_result.status);
                     cmd_final_status = mapped.status;
                     cmd_final_body = try buildApiErrorJson(allocator, mapped.code, mapped.message, correlation_id);
+                    cmd_final_content_type = JSON_CONTENT_TYPE;
+                    cmd_final_content_disposition = null;
                     cmd_error_body = cmd_final_body;
+                } else {
+                    cmd_final_content_type_alloc = proxy_result.content_type;
+                    cmd_final_content_type = proxy_result.content_type;
+                    if (proxy_result.content_disposition) |cd| {
+                        cmd_final_content_disposition_alloc = cd;
+                        cmd_final_content_disposition = cd;
+                    } else {
+                        cmd_final_content_disposition = null;
+                    }
                 }
             },
         }
@@ -1044,14 +1063,20 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
 
         // --- Compress and send ---
         const cmd_accept_encoding = request.headers.get("Accept-Encoding");
-        const cmd_comp = http.compression.compressResponse(allocator, cmd_final_body, JSON_CONTENT_TYPE, cmd_accept_encoding, state.compression_config);
+        const cmd_comp = http.compression.compressResponse(allocator, cmd_final_body, cmd_final_content_type, cmd_accept_encoding, state.compression_config);
         defer if (cmd_comp.body) |cb| allocator.free(cb);
         const cmd_resp_body = if (cmd_comp.body) |cb| cb else cmd_final_body;
-        var response = http.Response.json(allocator, cmd_resp_body);
+        var response = http.Response.init(allocator);
         defer response.deinit();
-        _ = response.setStatus(@enumFromInt(cmd_final_status))
+        _ = response
+            .setStatus(@enumFromInt(cmd_final_status))
+            .setBody(cmd_resp_body)
+            .setContentType(cmd_final_content_type)
             .setConnection(keep_alive)
             .setHeader(http.correlation.HEADER_NAME, correlation_id);
+        if (cmd_final_content_disposition) |cd| {
+            _ = response.setHeader("Content-Disposition", cd);
+        }
         if (cmd_comp.compressed) _ = response.setHeader("Content-Encoding", "gzip");
         state.security_headers.apply(&response);
         try response.write(writer);
@@ -1185,7 +1210,13 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
 
         var final_status: u16 = undefined;
         var final_body: []const u8 = "";
+        var final_content_type: []const u8 = JSON_CONTENT_TYPE;
+        var final_content_disposition: ?[]const u8 = null;
+        var final_content_type_alloc: ?[]u8 = null;
+        var final_content_disposition_alloc: ?[]u8 = null;
         var error_body_to_free: ?[]const u8 = null;
+        defer if (final_content_type_alloc) |ct| allocator.free(ct);
+        defer if (final_content_disposition_alloc) |cd| allocator.free(cd);
         switch (chat_exec) {
             .streamed_status => |status| {
                 final_status = status;
@@ -1210,10 +1241,23 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
                 final_status = proxy_result.status;
                 final_body = proxy_result.body;
                 if (proxy_result.status != 200) {
+                    allocator.free(proxy_result.content_type);
+                    if (proxy_result.content_disposition) |cd| allocator.free(cd);
                     const mapped = mapUpstreamError(proxy_result.status);
                     final_status = mapped.status;
                     final_body = try buildApiErrorJson(allocator, mapped.code, mapped.message, correlation_id);
+                    final_content_type = JSON_CONTENT_TYPE;
+                    final_content_disposition = null;
                     error_body_to_free = final_body;
+                } else {
+                    final_content_type_alloc = proxy_result.content_type;
+                    final_content_type = proxy_result.content_type;
+                    if (proxy_result.content_disposition) |cd| {
+                        final_content_disposition_alloc = cd;
+                        final_content_disposition = cd;
+                    } else {
+                        final_content_disposition = null;
+                    }
                 }
             },
         }
@@ -1223,14 +1267,20 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
 
         // --- Compress and send ---
         const chat_accept_encoding = request.headers.get("Accept-Encoding");
-        const chat_comp = http.compression.compressResponse(allocator, final_body, JSON_CONTENT_TYPE, chat_accept_encoding, state.compression_config);
+        const chat_comp = http.compression.compressResponse(allocator, final_body, final_content_type, chat_accept_encoding, state.compression_config);
         defer if (chat_comp.body) |cb| allocator.free(cb);
         const chat_resp_body = if (chat_comp.body) |cb| cb else final_body;
-        var response = http.Response.json(allocator, chat_resp_body);
+        var response = http.Response.init(allocator);
         defer response.deinit();
-        _ = response.setStatus(@enumFromInt(final_status))
+        _ = response
+            .setStatus(@enumFromInt(final_status))
+            .setBody(chat_resp_body)
+            .setContentType(final_content_type)
             .setConnection(keep_alive)
             .setHeader(http.correlation.HEADER_NAME, correlation_id);
+        if (final_content_disposition) |cd| {
+            _ = response.setHeader("Content-Disposition", cd);
+        }
         if (chat_comp.compressed) _ = response.setHeader("Content-Encoding", "gzip");
         state.security_headers.apply(&response);
         try response.write(writer);
@@ -1326,6 +1376,8 @@ fn parseChatMessage(allocator: std.mem.Allocator, body: []const u8, max_len: usi
 const ProxyResult = struct {
     status: u16,
     body: []u8,
+    content_type: []u8,
+    content_disposition: ?[]u8,
 };
 
 const ProxyExecution = union(enum) {
@@ -1391,14 +1443,16 @@ fn proxyJsonExecute(
     try req.wait();
 
     const status_code: u16 = @intFromEnum(req.response.status);
+    const upstream_content_type = req.response.content_type orelse JSON_CONTENT_TYPE;
+    const upstream_content_disposition = req.response.content_disposition;
     const stream_status = enable_streaming_success and (status_code == 200 or cfg.proxy_stream_all_statuses);
     if (stream_status) {
         try writeStreamedUpstreamResponse(
             downstream_writer,
             status_code,
             req.response.reason,
-            req.response.content_type orelse JSON_CONTENT_TYPE,
-            req.response.content_disposition,
+            upstream_content_type,
+            upstream_content_disposition,
             correlation_id,
             &state.security_headers,
         );
@@ -1415,6 +1469,14 @@ fn proxyJsonExecute(
     }
 
     if (status_code != 200) {
+        const buffered_content_type = try allocator.dupe(u8, upstream_content_type);
+        errdefer allocator.free(buffered_content_type);
+        const buffered_content_disposition = if (upstream_content_disposition) |cd|
+            try allocator.dupe(u8, cd)
+        else
+            null;
+        errdefer if (buffered_content_disposition) |cd| allocator.free(cd);
+
         const drain_buf = try state.relay_buffer_pool.acquire();
         defer state.relay_buffer_pool.release(drain_buf);
         while (true) {
@@ -1425,6 +1487,8 @@ fn proxyJsonExecute(
             .buffered = .{
                 .status = status_code,
                 .body = try allocator.alloc(u8, 0),
+                .content_type = buffered_content_type,
+                .content_disposition = buffered_content_disposition,
             },
         };
     }
@@ -1436,10 +1500,19 @@ fn proxyJsonExecute(
     var body = std.ArrayList(u8).init(allocator);
     errdefer body.deinit();
     try req.reader().readAllArrayList(&body, max_buffered);
+    const buffered_content_type = try allocator.dupe(u8, upstream_content_type);
+    errdefer allocator.free(buffered_content_type);
+    const buffered_content_disposition = if (upstream_content_disposition) |cd|
+        try allocator.dupe(u8, cd)
+    else
+        null;
+    errdefer if (buffered_content_disposition) |cd| allocator.free(cd);
     return .{
         .buffered = .{
             .status = status_code,
             .body = try body.toOwnedSlice(),
+            .content_type = buffered_content_type,
+            .content_disposition = buffered_content_disposition,
         },
     };
 }

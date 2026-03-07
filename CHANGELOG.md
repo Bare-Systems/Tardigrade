@@ -26,6 +26,10 @@
 - Phase 4.1 streaming proxy extension (`src/edge_gateway.zig`, `src/edge_config.zig`):
   - Added `TARDIGRADE_PROXY_STREAM_ALL_STATUSES` to optionally stream non-200 upstream responses directly.
   - Streamed-status circuit breaker accounting now treats 5xx responses as failures.
+- Phase 4.1 buffered proxy metadata preservation (`src/edge_gateway.zig`):
+  - Buffered success responses now retain upstream `Content-Type` and `Content-Disposition` values.
+  - Successful buffered proxy responses are no longer always forced to JSON content type.
+  - Reduced streamed vs buffered response mismatch for proxy paths when idempotency requires buffered handling.
 
 ## [0.26.0] - 2026-03-xx
 

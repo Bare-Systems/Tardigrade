@@ -30,6 +30,9 @@ pub const request_limits = @import("http/request_limits.zig");
 pub const basic_auth = @import("http/basic_auth.zig");
 pub const logger = @import("http/logger.zig");
 pub const cache_control = @import("http/cache_control.zig");
+pub const compression = @import("http/compression.zig");
+pub const metrics = @import("http/metrics.zig");
+pub const shutdown = @import("http/shutdown.zig");
 
 // Re-export constants
 pub const MAX_HEADERS = headers.MAX_HEADERS;

@@ -31,6 +31,10 @@ pub const EdgeConfig = struct {
     basic_auth_hashes: [][]const u8,
     /// Minimum log level (debug, info, warn, error).
     log_level: http.logger.Level,
+    /// Whether response compression is enabled.
+    compression_enabled: bool,
+    /// Minimum response body size to compress (bytes).
+    compression_min_size: usize,
 
     pub fn deinit(self: *EdgeConfig, allocator: std.mem.Allocator) void {
         allocator.free(self.listen_host);
@@ -137,6 +141,15 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     defer allocator.free(log_level_str);
     const log_level = http.logger.Level.parse(log_level_str) orelse .info;
 
+    // Compression
+    const comp_enabled_str = envOrDefault(allocator, "TARDIGRADE_COMPRESSION_ENABLED", "true") catch unreachable;
+    defer allocator.free(comp_enabled_str);
+    const compression_enabled = std.mem.eql(u8, comp_enabled_str, "true") or std.mem.eql(u8, comp_enabled_str, "1");
+
+    const comp_min_str = envOrDefault(allocator, "TARDIGRADE_COMPRESSION_MIN_SIZE", "256") catch unreachable;
+    defer allocator.free(comp_min_str);
+    const compression_min_size = std.fmt.parseInt(usize, comp_min_str, 10) catch 256;
+
     return .{
         .listen_host = listen_host,
         .listen_port = listen_port,
@@ -163,6 +176,8 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         },
         .basic_auth_hashes = basic_auth_hashes,
         .log_level = log_level,
+        .compression_enabled = compression_enabled,
+        .compression_min_size = compression_min_size,
     };
 }
 

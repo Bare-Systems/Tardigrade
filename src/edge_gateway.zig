@@ -13,6 +13,8 @@ const GatewayState = struct {
     session_store: ?http.session.SessionStore,
     access_control: ?http.access_control.AccessControl,
     logger: http.logger.Logger,
+    metrics: http.metrics.Metrics,
+    compression_config: http.compression.CompressionConfig,
 };
 
 pub fn run(cfg: *const edge_config.EdgeConfig) !void {
@@ -42,6 +44,11 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         else
             null,
         .logger = http.logger.Logger.init(cfg.log_level, "gateway"),
+        .metrics = http.metrics.Metrics.init(),
+        .compression_config = .{
+            .enabled = cfg.compression_enabled,
+            .min_size = cfg.compression_min_size,
+        },
     };
     defer {
         if (state.rate_limiter) |*rl| rl.deinit();
@@ -81,14 +88,27 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
             state.logger.info(null, "Request limits configured", .{});
         }
     }
+    if (cfg.compression_enabled) {
+        state.logger.info(null, "Gzip compression enabled (min size: {d} bytes)", .{cfg.compression_min_size});
+    }
 
-    while (true) {
-        const conn = try server.accept();
+    // Install signal handlers for graceful shutdown
+    http.shutdown.installSignalHandlers();
+    state.logger.info(null, "Signal handlers installed (SIGTERM/SIGINT for graceful shutdown)", .{});
+
+    while (!http.shutdown.isShutdownRequested()) {
+        const conn = server.accept() catch |err| {
+            if (http.shutdown.isShutdownRequested()) break;
+            state.logger.err(null, "accept error: {}", .{err});
+            continue;
+        };
         handleConnection(conn.stream, cfg, &state) catch |err| {
             state.logger.err(null, "edge connection error: {}", .{err});
         };
         conn.stream.close();
     }
+
+    state.logger.info(null, "Graceful shutdown complete", .{});
 }
 
 fn handleConnection(stream: std.net.Stream, cfg: *const edge_config.EdgeConfig, state: *GatewayState) !void {

@@ -26,6 +26,7 @@ pub const idempotency = @import("http/idempotency.zig");
 pub const session = @import("http/session.zig");
 pub const command = @import("http/command.zig");
 pub const access_control = @import("http/access_control.zig");
+pub const request_limits = @import("http/request_limits.zig");
 
 // Re-export constants
 pub const MAX_HEADERS = headers.MAX_HEADERS;

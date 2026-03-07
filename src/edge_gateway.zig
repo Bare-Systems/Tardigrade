@@ -11,6 +11,12 @@ const UpstreamHealth = struct {
     unhealthy_until_ms: u64 = 0,
 };
 
+const ConnectionSlotResult = enum {
+    accepted,
+    over_ip_limit,
+    over_global_limit,
+};
+
 /// Persistent gateway state shared across connections.
 const GatewayState = struct {
     allocator: std.mem.Allocator,
@@ -28,9 +34,12 @@ const GatewayState = struct {
     request_buffer_pool: http.buffer_pool.BufferPool,
     relay_buffer_pool: http.buffer_pool.BufferPool,
     max_connections_per_ip: u32,
+    max_active_connections: u32,
+    active_connections_total: usize,
     upstream_rr_index: usize,
     upstream_health: std.StringHashMap(UpstreamHealth),
     active_connections_by_ip: std.StringHashMap(u32),
+    active_fds: std.AutoHashMap(std.posix.fd_t, void),
     fd_to_ip: std.AutoHashMap(std.posix.fd_t, []u8),
 
     fn deinit(self: *GatewayState) void {
@@ -47,38 +56,78 @@ const GatewayState = struct {
         var ip_it = self.active_connections_by_ip.iterator();
         while (ip_it.next()) |entry| self.allocator.free(entry.key_ptr.*);
         self.active_connections_by_ip.deinit();
+        self.active_fds.deinit();
 
         var fd_it = self.fd_to_ip.iterator();
         while (fd_it.next()) |entry| self.allocator.free(entry.value_ptr.*);
         self.fd_to_ip.deinit();
     }
 
-    fn tryAcquireConnectionSlot(self: *GatewayState, fd: std.posix.fd_t, ip_key: []const u8) !bool {
-        if (self.max_connections_per_ip == 0) return true;
-
+    fn tryAcquireConnectionSlot(self: *GatewayState, fd: std.posix.fd_t, ip_key: []const u8) !ConnectionSlotResult {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        const current = self.active_connections_by_ip.get(ip_key) orelse 0;
-        if (current >= self.max_connections_per_ip) return false;
-
-        if (current == 0) {
-            const owned_key = try self.allocator.dupe(u8, ip_key);
-            try self.active_connections_by_ip.put(owned_key, 1);
-        } else {
-            try self.active_connections_by_ip.put(ip_key, current + 1);
+        if (self.max_active_connections > 0 and self.active_connections_total >= self.max_active_connections) {
+            return .over_global_limit;
         }
 
-        const owned_fd_ip = try self.allocator.dupe(u8, ip_key);
-        try self.fd_to_ip.put(fd, owned_fd_ip);
-        return true;
+        var ip_slot_acquired = false;
+        if (self.max_connections_per_ip > 0) {
+            const current = self.active_connections_by_ip.get(ip_key) orelse 0;
+            if (current >= self.max_connections_per_ip) return .over_ip_limit;
+
+            if (current == 0) {
+                const owned_key = try self.allocator.dupe(u8, ip_key);
+                errdefer self.allocator.free(owned_key);
+                try self.active_connections_by_ip.put(owned_key, 1);
+            } else {
+                try self.active_connections_by_ip.put(ip_key, current + 1);
+            }
+            ip_slot_acquired = true;
+
+            const owned_fd_ip = try self.allocator.dupe(u8, ip_key);
+            errdefer self.allocator.free(owned_fd_ip);
+            self.fd_to_ip.put(fd, owned_fd_ip) catch |err| {
+                if (self.active_connections_by_ip.getPtr(ip_key)) |count| {
+                    if (count.* > 1) {
+                        count.* -= 1;
+                    } else {
+                        if (self.active_connections_by_ip.fetchRemove(ip_key)) |kv| {
+                            self.allocator.free(kv.key);
+                        }
+                    }
+                }
+                return err;
+            };
+        }
+
+        self.active_fds.put(fd, {}) catch |err| {
+            if (ip_slot_acquired) {
+                if (self.fd_to_ip.fetchRemove(fd)) |removed| self.allocator.free(removed.value);
+                if (self.active_connections_by_ip.getPtr(ip_key)) |count| {
+                    if (count.* > 1) {
+                        count.* -= 1;
+                    } else {
+                        if (self.active_connections_by_ip.fetchRemove(ip_key)) |kv| {
+                            self.allocator.free(kv.key);
+                        }
+                    }
+                }
+            }
+            return err;
+        };
+        self.active_connections_total += 1;
+        return .accepted;
     }
 
     fn releaseConnectionSlot(self: *GatewayState, fd: std.posix.fd_t) void {
-        if (self.max_connections_per_ip == 0) return;
-
         self.mutex.lock();
         defer self.mutex.unlock();
+
+        if (self.active_fds.fetchRemove(fd) != null and self.active_connections_total > 0) {
+            self.active_connections_total -= 1;
+        }
+        if (self.max_connections_per_ip == 0) return;
 
         const removed = self.fd_to_ip.fetchRemove(fd) orelse return;
         defer self.allocator.free(removed.value);
@@ -394,9 +443,12 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         .request_buffer_pool = http.buffer_pool.BufferPool.init(state_allocator, MAX_REQUEST_SIZE, cfg.connection_pool_size),
         .relay_buffer_pool = http.buffer_pool.BufferPool.init(state_allocator, STREAM_RELAY_BUFFER_SIZE, cfg.connection_pool_size),
         .max_connections_per_ip = cfg.max_connections_per_ip,
+        .max_active_connections = cfg.max_active_connections,
+        .active_connections_total = 0,
         .upstream_rr_index = 0,
         .upstream_health = std.StringHashMap(UpstreamHealth).init(state_allocator),
         .active_connections_by_ip = std.StringHashMap(u32).init(state_allocator),
+        .active_fds = std.AutoHashMap(std.posix.fd_t, void).init(state_allocator),
         .fd_to_ip = std.AutoHashMap(std.posix.fd_t, []u8).init(state_allocator),
     };
     defer state.deinit();
@@ -502,6 +554,9 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     if (cfg.max_connections_per_ip > 0) {
         state.logger.info(null, "Per-IP connection limit enabled: {d}", .{cfg.max_connections_per_ip});
     }
+    if (cfg.max_active_connections > 0) {
+        state.logger.info(null, "Global active connection limit enabled: {d}", .{cfg.max_active_connections});
+    }
 
     // Install signal handlers for graceful shutdown
     http.shutdown.installSignalHandlers();
@@ -556,24 +611,45 @@ fn acceptReadyConnections(listen_fd: std.posix.fd_t, worker_pool: *http.worker_p
         defer if (owned_ip_key) |key| state.allocator.free(key);
         const ip_key = owned_ip_key orelse "unknown";
 
-        const allowed = state.tryAcquireConnectionSlot(client_fd, ip_key) catch |err| {
+        const slot_result = state.tryAcquireConnectionSlot(client_fd, ip_key) catch |err| {
             state.logger.warn(null, "connection slot tracking error: {}", .{err});
             std.posix.close(client_fd);
             continue;
         };
-        if (!allowed) {
-            state.logger.warn(null, "per-IP connection limit reached for {s}", .{ip_key});
-            std.posix.close(client_fd);
-            continue;
+        switch (slot_result) {
+            .accepted => {},
+            .over_ip_limit => {
+                state.logger.warn(null, "per-IP connection limit reached for {s}", .{ip_key});
+                rejectOverloadedClient(client_fd);
+                continue;
+            },
+            .over_global_limit => {
+                state.logger.warn(null, "global active connection limit reached", .{});
+                rejectOverloadedClient(client_fd);
+                continue;
+            },
         }
 
         worker_pool.submit(client_fd) catch |err| {
             state.logger.warn(null, "worker queue submit failed: {}", .{err});
             state.releaseConnectionSlot(client_fd);
-            std.posix.close(client_fd);
+            rejectOverloadedClient(client_fd);
             continue;
         };
     }
+}
+
+fn rejectOverloadedClient(client_fd: std.posix.fd_t) void {
+    setNonBlocking(client_fd, false) catch {};
+    const stream = std.net.Stream{ .handle = client_fd };
+    stream.writer().writeAll(
+        "HTTP/1.1 503 Service Unavailable\r\n" ++
+            "Connection: close\r\n" ++
+            "Content-Length: 0\r\n" ++
+            "Retry-After: 1\r\n" ++
+            "\r\n",
+    ) catch {};
+    stream.close();
 }
 
 fn handleAcceptedClient(raw_ctx: *anyopaque, client_fd: std.posix.fd_t) void {
@@ -2057,6 +2133,7 @@ test "resolveProxyTarget handles absolute and relative proxy_pass" {
         .worker_threads = 0,
         .worker_queue_size = 1024,
         .max_connections_per_ip = 0,
+        .max_active_connections = 0,
         .keep_alive_timeout_ms = 5000,
         .max_requests_per_connection = 100,
         .connection_pool_size = 256,
@@ -2121,6 +2198,7 @@ test "authorizeRequest accepts valid hash" {
         .worker_threads = 0,
         .worker_queue_size = 1024,
         .max_connections_per_ip = 0,
+        .max_active_connections = 0,
         .keep_alive_timeout_ms = 5000,
         .max_requests_per_connection = 100,
         .connection_pool_size = 256,

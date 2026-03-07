@@ -60,6 +60,7 @@ Environment variables:
 - `TARDIGRADE_KEEP_ALIVE_TIMEOUT_MS` (default `5000`; idle timeout for keep-alive client connections)
 - `TARDIGRADE_MAX_REQUESTS_PER_CONNECTION` (default `100`; max requests served before closing keep-alive connection)
 - `TARDIGRADE_CONNECTION_POOL_SIZE` (default `256`; max cached connection-session objects reused by workers)
+- `TARDIGRADE_MAX_ACTIVE_CONNECTIONS` (default `0`; global active client connection cap; `0` disables)
 - `TARDIGRADE_MAX_CONNECTION_MEMORY_BYTES` (default `2097152`; max memory retained per active connection for request/proxy buffering)
 - `TARDIGRADE_PROXY_STREAM_ALL_STATUSES` (default `false`; when enabled, streams non-200 upstream responses directly instead of mapping to gateway error envelopes)
 - `TARDIGRADE_UPSTREAM_RETRY_ATTEMPTS` (default `1`; number of upstream attempts per proxy request; when multiple upstream base URLs are configured, attempts rotate across them)

@@ -51,6 +51,8 @@ pub const EdgeConfig = struct {
     worker_queue_size: usize,
     /// Maximum active connections per client IP (0 = unlimited).
     max_connections_per_ip: u32,
+    /// Maximum total active client connections across all IPs (0 = unlimited).
+    max_active_connections: u32,
     /// Idle keep-alive timeout for client connections (ms, 0 = disabled).
     keep_alive_timeout_ms: u32,
     /// Maximum requests served per client connection (0 = unlimited).
@@ -221,6 +223,10 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     defer allocator.free(max_conn_ip_str);
     const max_connections_per_ip = std.fmt.parseInt(u32, max_conn_ip_str, 10) catch 0;
 
+    const max_active_conn_str = envOrDefault(allocator, "TARDIGRADE_MAX_ACTIVE_CONNECTIONS", "0") catch unreachable;
+    defer allocator.free(max_active_conn_str);
+    const max_active_connections = std.fmt.parseInt(u32, max_active_conn_str, 10) catch 0;
+
     const keep_alive_timeout_str = envOrDefault(allocator, "TARDIGRADE_KEEP_ALIVE_TIMEOUT_MS", "5000") catch unreachable;
     defer allocator.free(keep_alive_timeout_str);
     const keep_alive_timeout_ms = std.fmt.parseInt(u32, keep_alive_timeout_str, 10) catch 5000;
@@ -293,6 +299,7 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .worker_threads = worker_threads,
         .worker_queue_size = worker_queue_size,
         .max_connections_per_ip = max_connections_per_ip,
+        .max_active_connections = max_active_connections,
         .keep_alive_timeout_ms = keep_alive_timeout_ms,
         .max_requests_per_connection = max_requests_per_connection,
         .connection_pool_size = connection_pool_size,

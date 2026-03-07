@@ -44,6 +44,10 @@
 - Phase 13.4 timeout budget foundation (`src/edge_config.zig`, `src/edge_gateway.zig`):
   - Added `TARDIGRADE_UPSTREAM_TIMEOUT_BUDGET_MS` for total upstream retry-window timeout budgeting.
   - Proxy retry attempts now enforce a shared per-request timeout budget, not only per-attempt socket timeouts.
+- Phase 13 overload protection + request queue management (`src/edge_config.zig`, `src/edge_gateway.zig`):
+  - Added `TARDIGRADE_MAX_ACTIVE_CONNECTIONS` global active-connection cap.
+  - Listener now sends explicit `503 Service Unavailable` load-shedding responses when over global/per-IP limits or when worker queue submission is full.
+  - Queue/connection rejections now use `Retry-After: 1` to signal transient overload.
 
 ## [0.26.0] - 2026-03-xx
 

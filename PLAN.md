@@ -530,9 +530,12 @@ Resolved: Graceful shutdown implemented in `src/http/shutdown.zig`. SIGTERM and 
 
 ### 13.2 Resource Limits
 - [ ] File descriptor limits
-- [ ] Worker connection limits
+- [x] Worker connection limits
 - [ ] Memory limits
-- [ ] Request queue limits
+- [x] Request queue limits
+
+Resolved (incremental): global active worker connection cap added via `TARDIGRADE_MAX_ACTIVE_CONNECTIONS`. Listener now rejects excess connections with explicit 503 load-shedding responses.
+Resolved (incremental): worker queue saturation now triggers explicit 503 load-shedding responses (with `Retry-After`) instead of silent close.
 
 ### 13.3 Privilege Management
 - [ ] Run as unprivileged user
@@ -543,8 +546,8 @@ Resolved: Graceful shutdown implemented in `src/http/shutdown.zig`. SIGTERM and 
 - [x] circuit breakers
 - [x] retry policies
 - [x] timeout budgets
-- [ ] overload protection
-- [ ] request queue management
+- [x] overload protection
+- [x] request queue management
 
 Resolved: Upstream circuit breaker implemented in `src/http/circuit_breaker.zig`. Three-state machine (closed/open/half-open) with configurable failure threshold (`TARDIGRADE_CB_THRESHOLD`, default 0 = disabled), recovery timeout (`TARDIGRADE_CB_TIMEOUT_MS`, default 30 s), and probe success count. Applied to `/v1/chat` and `/v1/commands` proxy calls; returns 503 `upstream_unavailable` when circuit is open. Circuit breaker state logged on failure and at startup.
 Resolved (incremental): upstream retry policy added for proxy requests. `TARDIGRADE_UPSTREAM_RETRY_ATTEMPTS` controls attempt count (minimum 1); with multiple configured upstream base URLs, retries rotate across upstream targets.

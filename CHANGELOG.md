@@ -1,6 +1,15 @@
 
 # Changelog
 
+## [0.19.0] - 2026-03-xx
+
+### Added
+- Phase 2.2 per-IP connection limiting (`src/edge_gateway.zig`, `src/edge_config.zig`):
+  - New `TARDIGRADE_MAX_CONNECTIONS_PER_IP` runtime setting (default disabled).
+  - Listener accept path now enforces active connection slots per client IP before queueing to workers.
+  - Connection slot lifecycle is tracked by fd and released on worker completion or queue submission failure.
+  - Supports IPv4 and IPv6 client keying in the connection tracker.
+
 ## [0.18.0] - 2026-03-xx
 
 ### Added

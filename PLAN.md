@@ -161,8 +161,11 @@ Resolved: Timer manager (`TimerManager`) now drives periodic loop ticks for time
 - [ ] Connection pooling
 - [ ] Keep-alive with configurable timeout
 - [ ] Request pipelining
-- [ ] Connection limits per IP
+- [x] Connection limits per IP
 - [ ] Graceful connection draining
+
+Resolved (incremental): listener accept path now enforces active per-IP connection slots with fd-to-ip lifecycle tracking. Limit is configured via `TARDIGRADE_MAX_CONNECTIONS_PER_IP` (0 = disabled).
+Decision: connection limits are enforced before worker queue dispatch; rejected sockets are closed immediately to keep worker capacity available for accepted clients.
 
 ### 2.3 Worker Model
 - [x] Multi-threaded worker pool

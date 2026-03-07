@@ -7,6 +7,7 @@ const JSON_CONTENT_TYPE = "application/json";
 
 /// Persistent gateway state shared across connections.
 const GatewayState = struct {
+    allocator: std.mem.Allocator,
     mutex: std.Thread.Mutex = .{},
     rate_limiter: ?http.rate_limiter.RateLimiter,
     idempotency_store: ?http.idempotency.IdempotencyStore,
@@ -17,12 +18,63 @@ const GatewayState = struct {
     metrics: http.metrics.Metrics,
     compression_config: http.compression.CompressionConfig,
     circuit_breaker: http.circuit_breaker.CircuitBreaker,
+    max_connections_per_ip: u32,
+    active_connections_by_ip: std.StringHashMap(u32),
+    fd_to_ip: std.AutoHashMap(std.posix.fd_t, []u8),
 
     fn deinit(self: *GatewayState) void {
         if (self.rate_limiter) |*rl| rl.deinit();
         if (self.idempotency_store) |*is| is.deinit();
         if (self.session_store) |*ss| ss.deinit();
         if (self.access_control) |*acl| acl.deinit();
+        var ip_it = self.active_connections_by_ip.iterator();
+        while (ip_it.next()) |entry| self.allocator.free(entry.key_ptr.*);
+        self.active_connections_by_ip.deinit();
+
+        var fd_it = self.fd_to_ip.iterator();
+        while (fd_it.next()) |entry| self.allocator.free(entry.value_ptr.*);
+        self.fd_to_ip.deinit();
+    }
+
+    fn tryAcquireConnectionSlot(self: *GatewayState, fd: std.posix.fd_t, ip_key: []const u8) !bool {
+        if (self.max_connections_per_ip == 0) return true;
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const current = self.active_connections_by_ip.get(ip_key) orelse 0;
+        if (current >= self.max_connections_per_ip) return false;
+
+        if (current == 0) {
+            const owned_key = try self.allocator.dupe(u8, ip_key);
+            try self.active_connections_by_ip.put(owned_key, 1);
+        } else {
+            try self.active_connections_by_ip.put(ip_key, current + 1);
+        }
+
+        const owned_fd_ip = try self.allocator.dupe(u8, ip_key);
+        try self.fd_to_ip.put(fd, owned_fd_ip);
+        return true;
+    }
+
+    fn releaseConnectionSlot(self: *GatewayState, fd: std.posix.fd_t) void {
+        if (self.max_connections_per_ip == 0) return;
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const removed = self.fd_to_ip.fetchRemove(fd) orelse return;
+        defer self.allocator.free(removed.value);
+
+        if (self.active_connections_by_ip.getPtr(removed.value)) |count| {
+            if (count.* > 1) {
+                count.* -= 1;
+            } else {
+                if (self.active_connections_by_ip.fetchRemove(removed.value)) |kv| {
+                    self.allocator.free(kv.key);
+                }
+            }
+        }
     }
 
     fn rateLimitAllow(self: *GatewayState, client_ip: []const u8) bool {
@@ -150,6 +202,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     const state_allocator = gpa.allocator();
 
     var state = GatewayState{
+        .allocator = state_allocator,
         .rate_limiter = if (cfg.rate_limit_rps > 0)
             http.rate_limiter.RateLimiter.init(state_allocator, cfg.rate_limit_rps, cfg.rate_limit_burst)
         else
@@ -180,6 +233,9 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
             .threshold = cfg.cb_threshold,
             .timeout_ms = cfg.cb_timeout_ms,
         }),
+        .max_connections_per_ip = cfg.max_connections_per_ip,
+        .active_connections_by_ip = std.StringHashMap(u32).init(state_allocator),
+        .fd_to_ip = std.AutoHashMap(std.posix.fd_t, []u8).init(state_allocator),
     };
     defer state.deinit();
 
@@ -247,6 +303,9 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         state.logger.info(null, "Circuit breaker enabled: threshold={d} timeout={d}ms", .{ cfg.cb_threshold, cfg.cb_timeout_ms });
     }
     state.logger.info(null, "Worker pool enabled: workers={d} queue={d}", .{ worker_count, cfg.worker_queue_size });
+    if (cfg.max_connections_per_ip > 0) {
+        state.logger.info(null, "Per-IP connection limit enabled: {d}", .{cfg.max_connections_per_ip});
+    }
 
     // Install signal handlers for graceful shutdown
     http.shutdown.installSignalHandlers();
@@ -295,8 +354,24 @@ fn acceptReadyConnections(listen_fd: std.posix.fd_t, worker_pool: *http.worker_p
             },
         };
 
+        const owned_ip_key = clientIpKeyFromAddress(state.allocator, accepted_addr) catch null;
+        defer if (owned_ip_key) |key| state.allocator.free(key);
+        const ip_key = owned_ip_key orelse "unknown";
+
+        const allowed = state.tryAcquireConnectionSlot(client_fd, ip_key) catch |err| {
+            state.logger.warn(null, "connection slot tracking error: {}", .{err});
+            std.posix.close(client_fd);
+            continue;
+        };
+        if (!allowed) {
+            state.logger.warn(null, "per-IP connection limit reached for {s}", .{ip_key});
+            std.posix.close(client_fd);
+            continue;
+        }
+
         worker_pool.submit(client_fd) catch |err| {
             state.logger.warn(null, "worker queue submit failed: {}", .{err});
+            state.releaseConnectionSlot(client_fd);
             std.posix.close(client_fd);
             continue;
         };
@@ -305,6 +380,7 @@ fn acceptReadyConnections(listen_fd: std.posix.fd_t, worker_pool: *http.worker_p
 
 fn handleAcceptedClient(raw_ctx: *anyopaque, client_fd: std.posix.fd_t) void {
     const ctx: *WorkerContext = @ptrCast(@alignCast(raw_ctx));
+    defer ctx.state.releaseConnectionSlot(client_fd);
 
     setNonBlocking(client_fd, false) catch |err| {
         ctx.state.logger.warn(null, "failed to switch client fd to blocking mode: {}", .{err});
@@ -317,6 +393,17 @@ fn handleAcceptedClient(raw_ctx: *anyopaque, client_fd: std.posix.fd_t) void {
 
     handleConnection(stream, ctx.cfg, ctx.state) catch |err| {
         ctx.state.logger.err(null, "edge connection error: {}", .{err});
+    };
+}
+
+fn clientIpKeyFromAddress(allocator: std.mem.Allocator, address: std.net.Address) ![]const u8 {
+    return switch (address.any.family) {
+        std.posix.AF.INET => blk: {
+            const b = @as(*const [4]u8, @ptrCast(&address.in.sa.addr));
+            break :blk std.fmt.allocPrint(allocator, "v4:{d}.{d}.{d}.{d}", .{ b[0], b[1], b[2], b[3] });
+        },
+        std.posix.AF.INET6 => std.fmt.allocPrint(allocator, "v6:{s}", .{std.fmt.fmtSliceHexLower(address.in6.sa.addr[0..])}),
+        else => error.UnsupportedAddressFamily,
     };
 }
 
@@ -1278,6 +1365,7 @@ test "authorizeRequest accepts valid hash" {
         .cb_timeout_ms = 30_000,
         .worker_threads = 0,
         .worker_queue_size = 1024,
+        .max_connections_per_ip = 0,
     };
 
     var headers = http.Headers.init(allocator);

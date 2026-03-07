@@ -1,6 +1,16 @@
 
 # Changelog
 
+## [0.16.0] - 2026-03-xx
+
+### Added
+- Phase 2.3 worker model foundation (`src/http/worker_pool.zig`, `src/edge_gateway.zig`):
+  - Fixed-size worker thread pool for accepted connection handling with bounded queue backpressure.
+  - Event-loop accept path now dispatches sockets to worker threads instead of processing inline on the listener thread.
+  - Thread-safe shared gateway state access for rate limiting, sessions, idempotency, circuit breaker, and metrics via synchronized state helpers.
+  - Configurable worker settings via `TARDIGRADE_WORKER_THREADS` (default auto) and `TARDIGRADE_WORKER_QUEUE_SIZE` (default 1024).
+  - Worker pool unit test covering queue submission/processing.
+
 ## [0.15.0] - 2026-03-xx
 
 ### Added

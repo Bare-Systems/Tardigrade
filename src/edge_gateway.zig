@@ -7,6 +7,7 @@ const JSON_CONTENT_TYPE = "application/json";
 
 /// Persistent gateway state shared across connections.
 const GatewayState = struct {
+    mutex: std.Thread.Mutex = .{},
     rate_limiter: ?http.rate_limiter.RateLimiter,
     idempotency_store: ?http.idempotency.IdempotencyStore,
     security_headers: http.security_headers.SecurityHeaders,
@@ -16,6 +17,131 @@ const GatewayState = struct {
     metrics: http.metrics.Metrics,
     compression_config: http.compression.CompressionConfig,
     circuit_breaker: http.circuit_breaker.CircuitBreaker,
+
+    fn deinit(self: *GatewayState) void {
+        if (self.rate_limiter) |*rl| rl.deinit();
+        if (self.idempotency_store) |*is| is.deinit();
+        if (self.session_store) |*ss| ss.deinit();
+        if (self.access_control) |*acl| acl.deinit();
+    }
+
+    fn rateLimitAllow(self: *GatewayState, client_ip: []const u8) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.rate_limiter) |*rl| {
+            return rl.allow(client_ip) != null;
+        }
+        return true;
+    }
+
+    fn idempotencyGetCopy(self: *GatewayState, allocator: std.mem.Allocator, key: []const u8) !?http.idempotency.CachedResponse {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.idempotency_store) |*store| {
+            if (store.get(key)) |cached| {
+                const body = try allocator.dupe(u8, cached.body);
+                errdefer allocator.free(body);
+                const ct = try allocator.dupe(u8, cached.content_type);
+                return .{
+                    .status = cached.status,
+                    .body = body,
+                    .content_type = ct,
+                    .created_ns = cached.created_ns,
+                };
+            }
+        }
+        return null;
+    }
+
+    fn idempotencyPut(self: *GatewayState, key: []const u8, status: u16, body: []const u8, content_type: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.idempotency_store) |*store| {
+            try store.put(key, status, body, content_type);
+        }
+    }
+
+    fn createSession(self: *GatewayState, allocator: std.mem.Allocator, identity: []const u8, client_ip: []const u8, device_id: ?[]const u8) ![]const u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.session_store == null) return error.SessionsDisabled;
+        const token = try self.session_store.?.create(identity, client_ip, device_id);
+        return try allocator.dupe(u8, token);
+    }
+
+    fn validateSessionIdentity(self: *GatewayState, allocator: std.mem.Allocator, token: []const u8) ?[]const u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.session_store) |*ss| {
+            if (ss.validate(token)) |session| {
+                return allocator.dupe(u8, session.identity) catch null;
+            }
+        }
+        return null;
+    }
+
+    fn revokeSession(self: *GatewayState, token: []const u8) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.session_store) |*ss| return ss.revoke(token);
+        return false;
+    }
+
+    fn countSessionsByIdentity(self: *GatewayState, allocator: std.mem.Allocator, identity: []const u8) !usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.session_store == null) return error.SessionsDisabled;
+        const sessions = try self.session_store.?.listByIdentity(allocator, identity);
+        defer allocator.free(sessions);
+        return sessions.len;
+    }
+
+    fn circuitTryAcquire(self: *GatewayState) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.circuit_breaker.tryAcquire();
+    }
+
+    fn circuitRecordFailure(self: *GatewayState) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.circuit_breaker.recordFailure();
+    }
+
+    fn circuitRecordSuccess(self: *GatewayState) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.circuit_breaker.recordSuccess();
+    }
+
+    fn circuitStateName(self: *GatewayState) []const u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.circuit_breaker.stateName();
+    }
+
+    fn metricsRecord(self: *GatewayState, status: u16) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.metrics.recordRequest(status);
+    }
+
+    fn metricsToJson(self: *GatewayState, allocator: std.mem.Allocator) ![]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.metrics.toJson(allocator);
+    }
+
+    fn metricsToPrometheus(self: *GatewayState, allocator: std.mem.Allocator) ![]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.metrics.toPrometheus(allocator);
+    }
+};
+
+const WorkerContext = struct {
+    cfg: *const edge_config.EdgeConfig,
+    state: *GatewayState,
 };
 
 pub fn run(cfg: *const edge_config.EdgeConfig) !void {
@@ -55,12 +181,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
             .timeout_ms = cfg.cb_timeout_ms,
         }),
     };
-    defer {
-        if (state.rate_limiter) |*rl| rl.deinit();
-        if (state.idempotency_store) |*is| is.deinit();
-        if (state.session_store) |*ss| ss.deinit();
-        if (state.access_control) |*acl| acl.deinit();
-    }
+    defer state.deinit();
 
     const address = try std.net.Address.parseIp(cfg.listen_host, cfg.listen_port);
     var server = try std.net.Address.listen(address, .{ .reuse_address = true });
@@ -73,6 +194,23 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     defer event_loop.deinit();
     try event_loop.addReadFd(listen_fd);
     var timer = http.event_loop.TimerManager.init(250);
+    const worker_count: usize = blk: {
+        const configured = if (cfg.worker_threads == 0)
+            (std.Thread.getCpuCount() catch 1)
+        else
+            cfg.worker_threads;
+        break :blk @intCast(@max(configured, @as(u32, 1)));
+    };
+    var worker_ctx = WorkerContext{ .cfg = cfg, .state = &state };
+    var worker_pool: http.worker_pool.WorkerPool = undefined;
+    try worker_pool.init(
+        state_allocator,
+        worker_count,
+        cfg.worker_queue_size,
+        handleAcceptedClient,
+        &worker_ctx,
+    );
+    defer worker_pool.deinit();
 
     state.logger.info(null, "Tardigrade edge listening on {s}:{d}", .{ cfg.listen_host, cfg.listen_port });
     state.logger.info(null, "Event loop initialized with backend: {s}", .{event_loop.backendName()});
@@ -108,6 +246,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     if (cfg.cb_threshold > 0) {
         state.logger.info(null, "Circuit breaker enabled: threshold={d} timeout={d}ms", .{ cfg.cb_threshold, cfg.cb_timeout_ms });
     }
+    state.logger.info(null, "Worker pool enabled: workers={d} queue={d}", .{ worker_count, cfg.worker_queue_size });
 
     // Install signal handlers for graceful shutdown
     http.shutdown.installSignalHandlers();
@@ -126,7 +265,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         while (i < event_count) : (i += 1) {
             const ev = ready_events[i];
             if (!ev.readable or ev.fd != listen_fd) continue;
-            acceptReadyConnections(listen_fd, cfg, &state);
+            acceptReadyConnections(listen_fd, &worker_pool, &state);
         }
 
         if (timer.consumeTick(http.event_loop.monotonicMs())) {
@@ -137,7 +276,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     state.logger.info(null, "Graceful shutdown complete", .{});
 }
 
-fn acceptReadyConnections(listen_fd: std.posix.fd_t, cfg: *const edge_config.EdgeConfig, state: *GatewayState) void {
+fn acceptReadyConnections(listen_fd: std.posix.fd_t, worker_pool: *http.worker_pool.WorkerPool, state: *GatewayState) void {
     while (!http.shutdown.isShutdownRequested()) {
         var accepted_addr: std.net.Address = undefined;
         var addr_len: std.posix.socklen_t = @sizeOf(std.net.Address);
@@ -156,18 +295,29 @@ fn acceptReadyConnections(listen_fd: std.posix.fd_t, cfg: *const edge_config.Edg
             },
         };
 
-        setNonBlocking(client_fd, false) catch |err| {
-            state.logger.warn(null, "failed to switch client fd to blocking mode: {}", .{err});
+        worker_pool.submit(client_fd) catch |err| {
+            state.logger.warn(null, "worker queue submit failed: {}", .{err});
             std.posix.close(client_fd);
             continue;
         };
-
-        const stream = std.net.Stream{ .handle = client_fd };
-        handleConnection(stream, cfg, state) catch |err| {
-            state.logger.err(null, "edge connection error: {}", .{err});
-        };
-        stream.close();
     }
+}
+
+fn handleAcceptedClient(raw_ctx: *anyopaque, client_fd: std.posix.fd_t) void {
+    const ctx: *WorkerContext = @ptrCast(@alignCast(raw_ctx));
+
+    setNonBlocking(client_fd, false) catch |err| {
+        ctx.state.logger.warn(null, "failed to switch client fd to blocking mode: {}", .{err});
+        std.posix.close(client_fd);
+        return;
+    };
+
+    const stream = std.net.Stream{ .handle = client_fd };
+    defer stream.close();
+
+    handleConnection(stream, ctx.cfg, ctx.state) catch |err| {
+        ctx.state.logger.err(null, "edge connection error: {}", .{err});
+    };
 }
 
 fn setNonBlocking(fd: std.posix.fd_t, enabled: bool) !void {
@@ -256,15 +406,10 @@ fn handleConnection(stream: std.net.Stream, cfg: *const edge_config.EdgeConfig, 
     }
 
     // --- Rate Limiting ---
-    if (state.rate_limiter) |*rl| {
-        if (rl.allow(client_ip)) |rl_result| {
-            // Attach rate limit info — will be added to response headers below
-            _ = rl_result;
-        } else {
-            try sendApiError(allocator, writer, .too_many_requests, "rate_limited", "Rate limit exceeded", correlation_id, false, state);
-            logAccess(&ctx, request.method.toString(), request.uri.path, 429, request.headers.get("user-agent") orelse "");
-            return;
-        }
+    if (!state.rateLimitAllow(client_ip)) {
+        try sendApiError(allocator, writer, .too_many_requests, "rate_limited", "Rate limit exceeded", correlation_id, false, state);
+        logAccess(&ctx, request.method.toString(), request.uri.path, 429, request.headers.get("user-agent") orelse "");
+        return;
     }
 
     // --- Health endpoint ---
@@ -274,14 +419,14 @@ fn handleConnection(stream: std.net.Stream, cfg: *const edge_config.EdgeConfig, 
         _ = response.setConnection(false).setHeader(http.correlation.HEADER_NAME, correlation_id);
         state.security_headers.apply(&response);
         try response.write(writer);
-        state.metrics.recordRequest(200);
+        state.metricsRecord(200);
         logAccess(&ctx, request.method.toString(), "/health", 200, request.headers.get("user-agent") orelse "");
         return;
     }
 
     // --- Metrics endpoint ---
     if (request.method == .GET and std.mem.eql(u8, request.uri.path, "/metrics")) {
-        const metrics_json = state.metrics.toJson(allocator) catch {
+        const metrics_json = state.metricsToJson(allocator) catch {
             try sendApiError(allocator, writer, .internal_server_error, "internal_error", "Failed to generate metrics", correlation_id, false, state);
             return;
         };
@@ -292,14 +437,14 @@ fn handleConnection(stream: std.net.Stream, cfg: *const edge_config.EdgeConfig, 
         _ = response.setConnection(false).setHeader(http.correlation.HEADER_NAME, correlation_id);
         state.security_headers.apply(&response);
         try response.write(writer);
-        state.metrics.recordRequest(200);
+        state.metricsRecord(200);
         logAccess(&ctx, request.method.toString(), "/metrics", 200, request.headers.get("user-agent") orelse "");
         return;
     }
 
     // --- Prometheus metrics endpoint ---
     if (request.method == .GET and std.mem.eql(u8, request.uri.path, "/metrics/prometheus")) {
-        const prom_text = state.metrics.toPrometheus(allocator) catch {
+        const prom_text = state.metricsToPrometheus(allocator) catch {
             try sendApiError(allocator, writer, .internal_server_error, "internal_error", "Failed to generate metrics", correlation_id, false, state);
             return;
         };
@@ -313,7 +458,7 @@ fn handleConnection(stream: std.net.Stream, cfg: *const edge_config.EdgeConfig, 
             .setHeader(http.correlation.HEADER_NAME, correlation_id);
         state.security_headers.apply(&response);
         try response.write(writer);
-        state.metrics.recordRequest(200);
+        state.metricsRecord(200);
         logAccess(&ctx, request.method.toString(), "/metrics/prometheus", 200, request.headers.get("user-agent") orelse "");
         return;
     }
@@ -355,7 +500,7 @@ fn handleConnection(stream: std.net.Stream, cfg: *const edge_config.EdgeConfig, 
         }
         defer if (device_id) |d| allocator.free(d);
 
-        const session_token = state.session_store.?.create(identity, client_ip, device_id) catch |err| {
+        const session_token = state.createSession(allocator, identity, client_ip, device_id) catch |err| {
             const msg = switch (err) {
                 error.TooManySessions => "Too many active sessions",
                 else => "Session creation failed",
@@ -364,6 +509,7 @@ fn handleConnection(stream: std.net.Stream, cfg: *const edge_config.EdgeConfig, 
             logAccess(&ctx, request.method.toString(), "/v1/sessions", 429, request.headers.get("user-agent") orelse "");
             return;
         };
+        defer allocator.free(session_token);
 
         const resp_body = try std.fmt.allocPrint(allocator, "{{\"session_token\":\"{s}\"}}", .{session_token});
         defer allocator.free(resp_body);
@@ -376,7 +522,7 @@ fn handleConnection(stream: std.net.Stream, cfg: *const edge_config.EdgeConfig, 
             .setHeader(http.session.SESSION_HEADER, session_token);
         state.security_headers.apply(&response);
         try response.write(writer);
-        state.metrics.recordRequest(201);
+        state.metricsRecord(201);
         logAccess(&ctx, request.method.toString(), "/v1/sessions", 201, request.headers.get("user-agent") orelse "");
         return;
     }
@@ -395,7 +541,7 @@ fn handleConnection(stream: std.net.Stream, cfg: *const edge_config.EdgeConfig, 
             return;
         };
 
-        const revoked = state.session_store.?.revoke(session_token);
+        const revoked = state.revokeSession(session_token);
         const resp_body = if (revoked)
             "{\"revoked\":true}"
         else
@@ -407,7 +553,7 @@ fn handleConnection(stream: std.net.Stream, cfg: *const edge_config.EdgeConfig, 
             .setHeader(http.correlation.HEADER_NAME, correlation_id);
         state.security_headers.apply(&response);
         try response.write(writer);
-        state.metrics.recordRequest(200);
+        state.metricsRecord(200);
         logAccess(&ctx, request.method.toString(), "/v1/sessions", 200, request.headers.get("user-agent") orelse "");
         return;
     }
@@ -429,14 +575,13 @@ fn handleConnection(stream: std.net.Stream, cfg: *const edge_config.EdgeConfig, 
         }
         const identity = auth_result.token_hash orelse "-";
 
-        const sessions = state.session_store.?.listByIdentity(allocator, identity) catch {
+        const active_sessions = state.countSessionsByIdentity(allocator, identity) catch {
             try sendApiError(allocator, writer, .internal_server_error, "internal_error", "Failed to list sessions", correlation_id, false, state);
             logAccess(&ctx, request.method.toString(), "/v1/sessions", 500, request.headers.get("user-agent") orelse "");
             return;
         };
-        defer allocator.free(sessions);
 
-        const resp_body = try std.fmt.allocPrint(allocator, "{{\"active_sessions\":{d}}}", .{sessions.len});
+        const resp_body = try std.fmt.allocPrint(allocator, "{{\"active_sessions\":{d}}}", .{active_sessions});
         defer allocator.free(resp_body);
 
         var response = http.Response.json(allocator, resp_body);
@@ -445,7 +590,7 @@ fn handleConnection(stream: std.net.Stream, cfg: *const edge_config.EdgeConfig, 
             .setHeader(http.correlation.HEADER_NAME, correlation_id);
         state.security_headers.apply(&response);
         try response.write(writer);
-        state.metrics.recordRequest(200);
+        state.metricsRecord(200);
         logAccess(&ctx, request.method.toString(), "/v1/sessions", 200, request.headers.get("user-agent") orelse "");
         return;
     }
@@ -460,12 +605,11 @@ fn handleConnection(stream: std.net.Stream, cfg: *const edge_config.EdgeConfig, 
             cmd_authenticated = true;
         }
         if (!cmd_authenticated) {
-            if (state.session_store) |*ss| {
-                if (http.session.fromHeaders(&request.headers)) |session_token| {
-                    if (ss.validate(session_token)) |session| {
-                        ctx.setIdentity(session.identity);
-                        cmd_authenticated = true;
-                    }
+            if (http.session.fromHeaders(&request.headers)) |session_token| {
+                if (state.validateSessionIdentity(allocator, session_token)) |identity| {
+                    defer allocator.free(identity);
+                    ctx.setIdentity(identity);
+                    cmd_authenticated = true;
                 }
             }
         }
@@ -505,22 +649,23 @@ fn handleConnection(stream: std.net.Stream, cfg: *const edge_config.EdgeConfig, 
         // --- Idempotency (inline key overrides header) ---
         const effective_idem_key = cmd.idempotency_key orelse ctx.idempotency_key;
         if (effective_idem_key) |idem_key| {
-            if (state.idempotency_store) |*store| {
-                if (store.get(idem_key)) |cached| {
-                    var response = http.Response.init(allocator);
-                    defer response.deinit();
-                    _ = response.setStatus(@enumFromInt(cached.status))
-                        .setBody(cached.body)
-                        .setContentType(cached.content_type)
-                        .setConnection(false)
-                        .setHeader(http.correlation.HEADER_NAME, correlation_id)
-                        .setHeader("X-Idempotent-Replayed", "true");
-                    state.security_headers.apply(&response);
-                    try response.write(writer);
-                    state.metrics.recordRequest(cached.status);
-                    logAccess(&ctx, request.method.toString(), "/v1/commands", cached.status, request.headers.get("user-agent") orelse "");
-                    return;
-                }
+            if (try state.idempotencyGetCopy(allocator, idem_key)) |cached| {
+                defer allocator.free(cached.body);
+                defer allocator.free(cached.content_type);
+
+                var response = http.Response.init(allocator);
+                defer response.deinit();
+                _ = response.setStatus(@enumFromInt(cached.status))
+                    .setBody(cached.body)
+                    .setContentType(cached.content_type)
+                    .setConnection(false)
+                    .setHeader(http.correlation.HEADER_NAME, correlation_id)
+                    .setHeader("X-Idempotent-Replayed", "true");
+                state.security_headers.apply(&response);
+                try response.write(writer);
+                state.metricsRecord(cached.status);
+                logAccess(&ctx, request.method.toString(), "/v1/commands", cached.status, request.headers.get("user-agent") orelse "");
+                return;
             }
         }
 
@@ -544,7 +689,7 @@ fn handleConnection(stream: std.net.Stream, cfg: *const edge_config.EdgeConfig, 
         const upstream_path = cmd.command_type.upstreamPath();
 
         // --- Circuit breaker check ---
-        if (!state.circuit_breaker.tryAcquire()) {
+        if (!state.circuitTryAcquire()) {
             state.logger.warn(null, "circuit breaker open, rejecting /v1/commands", .{});
             try sendApiError(allocator, writer, .service_unavailable, "upstream_unavailable", "Upstream unavailable", correlation_id, false, state);
             const cb_audit = http.command.CommandAudit{
@@ -559,8 +704,8 @@ fn handleConnection(stream: std.net.Stream, cfg: *const edge_config.EdgeConfig, 
         }
 
         const cmd_proxy_result = proxyCommand(allocator, cfg, upstream_path, envelope, correlation_id) catch {
-            state.circuit_breaker.recordFailure();
-            state.logger.warn(null, "circuit breaker: recorded failure, state={s}", .{state.circuit_breaker.stateName()});
+            state.circuitRecordFailure();
+            state.logger.warn(null, "circuit breaker: recorded failure, state={s}", .{state.circuitStateName()});
             try sendApiError(allocator, writer, .gateway_timeout, "upstream_timeout", "Upstream timeout", correlation_id, false, state);
             // Audit
             const cmd_audit = http.command.CommandAudit{
@@ -577,9 +722,9 @@ fn handleConnection(stream: std.net.Stream, cfg: *const edge_config.EdgeConfig, 
 
         // Record circuit breaker outcome based on upstream status
         if (cmd_proxy_result.status >= 500) {
-            state.circuit_breaker.recordFailure();
+            state.circuitRecordFailure();
         } else {
-            state.circuit_breaker.recordSuccess();
+            state.circuitRecordSuccess();
         }
 
         var cmd_final_status: u16 = cmd_proxy_result.status;
@@ -608,15 +753,13 @@ fn handleConnection(stream: std.net.Stream, cfg: *const edge_config.EdgeConfig, 
         if (cmd_comp.compressed) _ = response.setHeader("Content-Encoding", "gzip");
         state.security_headers.apply(&response);
         try response.write(writer);
-        state.metrics.recordRequest(cmd_final_status);
+        state.metricsRecord(cmd_final_status);
 
         // --- Store idempotency result ---
         if (effective_idem_key) |idem_key| {
-            if (state.idempotency_store) |*store| {
-                store.put(idem_key, cmd_final_status, cmd_final_body, JSON_CONTENT_TYPE) catch |err| {
-                    std.log.warn("idempotency store error: {}", .{err});
-                };
-            }
+            state.idempotencyPut(idem_key, cmd_final_status, cmd_final_body, JSON_CONTENT_TYPE) catch |err| {
+                std.log.warn("idempotency store error: {}", .{err});
+            };
         }
 
         // --- Structured command audit ---
@@ -635,22 +778,23 @@ fn handleConnection(stream: std.net.Stream, cfg: *const edge_config.EdgeConfig, 
     if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/chat")) {
         // --- Idempotency check ---
         if (ctx.idempotency_key) |idem_key| {
-            if (state.idempotency_store) |*store| {
-                if (store.get(idem_key)) |cached| {
-                    var response = http.Response.init(allocator);
-                    defer response.deinit();
-                    _ = response.setStatus(@enumFromInt(cached.status))
-                        .setBody(cached.body)
-                        .setContentType(cached.content_type)
-                        .setConnection(false)
-                        .setHeader(http.correlation.HEADER_NAME, correlation_id)
-                        .setHeader("X-Idempotent-Replayed", "true");
-                    state.security_headers.apply(&response);
-                    try response.write(writer);
-                    state.metrics.recordRequest(cached.status);
-                    logAccess(&ctx, request.method.toString(), "/v1/chat", cached.status, request.headers.get("user-agent") orelse "");
-                    return;
-                }
+            if (try state.idempotencyGetCopy(allocator, idem_key)) |cached| {
+                defer allocator.free(cached.body);
+                defer allocator.free(cached.content_type);
+
+                var response = http.Response.init(allocator);
+                defer response.deinit();
+                _ = response.setStatus(@enumFromInt(cached.status))
+                    .setBody(cached.body)
+                    .setContentType(cached.content_type)
+                    .setConnection(false)
+                    .setHeader(http.correlation.HEADER_NAME, correlation_id)
+                    .setHeader("X-Idempotent-Replayed", "true");
+                state.security_headers.apply(&response);
+                try response.write(writer);
+                state.metricsRecord(cached.status);
+                logAccess(&ctx, request.method.toString(), "/v1/chat", cached.status, request.headers.get("user-agent") orelse "");
+                return;
             }
         }
 
@@ -664,12 +808,11 @@ fn handleConnection(stream: std.net.Stream, cfg: *const edge_config.EdgeConfig, 
         }
         // Fall back to session token
         if (!authenticated) {
-            if (state.session_store) |*ss| {
-                if (http.session.fromHeaders(&request.headers)) |session_token| {
-                    if (ss.validate(session_token)) |session| {
-                        ctx.setIdentity(session.identity);
-                        authenticated = true;
-                    }
+            if (http.session.fromHeaders(&request.headers)) |session_token| {
+                if (state.validateSessionIdentity(allocator, session_token)) |identity| {
+                    defer allocator.free(identity);
+                    ctx.setIdentity(identity);
+                    authenticated = true;
                 }
             }
         }
@@ -705,7 +848,7 @@ fn handleConnection(stream: std.net.Stream, cfg: *const edge_config.EdgeConfig, 
         };
 
         // --- Circuit breaker check ---
-        if (!state.circuit_breaker.tryAcquire()) {
+        if (!state.circuitTryAcquire()) {
             state.logger.warn(null, "circuit breaker open, rejecting /v1/chat", .{});
             try sendApiError(allocator, writer, .service_unavailable, "upstream_unavailable", "Upstream unavailable", correlation_id, false, state);
             logAccess(&ctx, request.method.toString(), "/v1/chat", 503, request.headers.get("user-agent") orelse "");
@@ -714,8 +857,8 @@ fn handleConnection(stream: std.net.Stream, cfg: *const edge_config.EdgeConfig, 
 
         // --- Upstream proxy ---
         const proxy_result = proxyChat(allocator, cfg, message, correlation_id) catch {
-            state.circuit_breaker.recordFailure();
-            state.logger.warn(null, "circuit breaker: recorded failure, state={s}", .{state.circuit_breaker.stateName()});
+            state.circuitRecordFailure();
+            state.logger.warn(null, "circuit breaker: recorded failure, state={s}", .{state.circuitStateName()});
             try sendApiError(allocator, writer, .gateway_timeout, "upstream_timeout", "Upstream timeout", correlation_id, false, state);
             logAccess(&ctx, request.method.toString(), "/v1/chat", 504, request.headers.get("user-agent") orelse "");
             return;
@@ -724,9 +867,9 @@ fn handleConnection(stream: std.net.Stream, cfg: *const edge_config.EdgeConfig, 
 
         // Record circuit breaker outcome based on upstream status
         if (proxy_result.status >= 500) {
-            state.circuit_breaker.recordFailure();
+            state.circuitRecordFailure();
         } else {
-            state.circuit_breaker.recordSuccess();
+            state.circuitRecordSuccess();
         }
 
         var final_status: u16 = proxy_result.status;
@@ -755,15 +898,13 @@ fn handleConnection(stream: std.net.Stream, cfg: *const edge_config.EdgeConfig, 
         if (chat_comp.compressed) _ = response.setHeader("Content-Encoding", "gzip");
         state.security_headers.apply(&response);
         try response.write(writer);
-        state.metrics.recordRequest(final_status);
+        state.metricsRecord(final_status);
 
         // --- Store idempotency result ---
         if (ctx.idempotency_key) |idem_key| {
-            if (state.idempotency_store) |*store| {
-                store.put(idem_key, final_status, final_body, JSON_CONTENT_TYPE) catch |err| {
-                    std.log.warn("idempotency store error: {}", .{err});
-                };
-            }
+            state.idempotencyPut(idem_key, final_status, final_body, JSON_CONTENT_TYPE) catch |err| {
+                std.log.warn("idempotency store error: {}", .{err});
+            };
         }
 
         logAccess(&ctx, request.method.toString(), "/v1/chat", final_status, request.headers.get("user-agent") orelse "");
@@ -947,7 +1088,7 @@ fn sendApiError(allocator: std.mem.Allocator, writer: anytype, status: http.Stat
     }
     state.security_headers.apply(&response);
     try response.write(writer);
-    state.metrics.recordRequest(@intFromEnum(status));
+    state.metricsRecord(@intFromEnum(status));
 }
 
 /// Emit a structured JSON access log entry for a completed request.
@@ -1043,6 +1184,8 @@ test "authorizeRequest accepts valid hash" {
         .compression_min_size = 256,
         .cb_threshold = 0,
         .cb_timeout_ms = 30_000,
+        .worker_threads = 0,
+        .worker_queue_size = 1024,
     };
 
     var headers = http.Headers.init(allocator);

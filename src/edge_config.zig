@@ -39,6 +39,10 @@ pub const EdgeConfig = struct {
     cb_threshold: u32,
     /// Circuit breaker open timeout in milliseconds before half-open probe.
     cb_timeout_ms: u64,
+    /// Number of worker threads for connection handling (0 = auto CPU count).
+    worker_threads: u32,
+    /// Maximum queued accepted connections waiting for workers.
+    worker_queue_size: usize,
 
     pub fn deinit(self: *EdgeConfig, allocator: std.mem.Allocator) void {
         allocator.free(self.listen_host);
@@ -163,6 +167,15 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     defer allocator.free(cb_timeout_str);
     const cb_timeout_ms = std.fmt.parseInt(u64, cb_timeout_str, 10) catch 30_000;
 
+    // Worker pool
+    const worker_threads_str = envOrDefault(allocator, "TARDIGRADE_WORKER_THREADS", "0") catch unreachable;
+    defer allocator.free(worker_threads_str);
+    const worker_threads = std.fmt.parseInt(u32, worker_threads_str, 10) catch 0;
+
+    const worker_queue_str = envOrDefault(allocator, "TARDIGRADE_WORKER_QUEUE_SIZE", "1024") catch unreachable;
+    defer allocator.free(worker_queue_str);
+    const worker_queue_size = std.fmt.parseInt(usize, worker_queue_str, 10) catch 1024;
+
     return .{
         .listen_host = listen_host,
         .listen_port = listen_port,
@@ -193,6 +206,8 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .compression_min_size = compression_min_size,
         .cb_threshold = cb_threshold,
         .cb_timeout_ms = cb_timeout_ms,
+        .worker_threads = worker_threads,
+        .worker_queue_size = worker_queue_size,
     };
 }
 

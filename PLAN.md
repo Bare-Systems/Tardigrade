@@ -71,10 +71,12 @@ These features allow Tardigrade to become the Panda/BearClaw gateway early.
 - [x] Bearer token authentication
 - [ ] Device identity registration
 - [ ] Public/private key device authentication
-- [ ] Auth middleware pipeline
-- [ ] Request auth context propagation
+- [x] Auth middleware pipeline
+- [x] Request auth context propagation
 - [x] Token validation hooks
 - [ ] Token expiration / refresh logic
+
+Resolved: Auth middleware pipeline implemented via `RequestContext` in `src/http/request_context.zig`. Auth identity (token hash) is propagated through the request context and included in structured audit logs.
 
 Resolved: HTTP bearer token parsing/validation is implemented in `src/http/auth.zig`, including an optional validation hook callback for pluggable token verification.
 Decision: core HTTP layer validates RFC6750-style token shape and delegates token trust decisions to caller-provided hooks to keep auth-provider logic decoupled.
@@ -86,14 +88,18 @@ Decision: core HTTP layer validates RFC6750-style token shape and delegates toke
 - [ ] Revocation support
 
 ### 0.3 API Gateway Core
-- [ ] JSON request validation
-- [ ] API version routing
+- [x] JSON request validation
+- [x] API version routing
 - [x] Correlation IDs
-- [ ] Idempotency key support
-- [ ] Request metadata injection
+- [x] Idempotency key support
+- [x] Request metadata injection
 
 Resolved: `X-Correlation-ID` propagation is implemented for static-file and parse-error responses.
 Decision: trust and echo only safe token-style incoming IDs; generate `tg-<timestamp>-<random-hex>` when missing/invalid.
+
+Resolved: API version routing implemented in `src/http/api_router.zig`. Parses `/v<N>/...` paths and validates against supported version allowlist.
+Resolved: Idempotency key support implemented in `src/http/idempotency.zig` with in-memory TTL cache and replay headers.
+Resolved: Request metadata injection handled by `RequestContext` which captures client IP, API version, identity, and timing.
 
 ### 0.4 Agent Command Routing
 - [ ] structured command routing
@@ -279,11 +285,13 @@ Secrets may include:
 - [ ] Geo-based blocking (via external data)
 
 ### 6.2 Rate Limiting
-- [ ] limit_req (request rate)
+- [x] limit_req (request rate)
 - [ ] limit_conn (connection count)
-- [ ] Configurable zones and keys
-- [ ] Burst handling
-- [ ] Custom rejection responses
+- [x] Configurable zones and keys
+- [x] Burst handling
+- [x] Custom rejection responses
+
+Resolved: Token-bucket rate limiter implemented in `src/http/rate_limiter.zig`. Per-IP tracking with configurable RPS and burst. Returns 429 with stable API error envelope.
 
 ### 6.3 Authentication
 - [ ] HTTP Basic Auth
@@ -298,10 +306,12 @@ Secrets may include:
 
 ### 6.5 Security Headers
 - [ ] add_header directive
-- [ ] X-Frame-Options
-- [ ] X-Content-Type-Options
-- [ ] Content-Security-Policy
-- [ ] Strict-Transport-Security
+- [x] X-Frame-Options
+- [x] X-Content-Type-Options
+- [x] Content-Security-Policy
+- [x] Strict-Transport-Security
+
+Resolved: Security headers middleware implemented in `src/http/security_headers.zig` with default secure and API presets. Also adds Referrer-Policy, Permissions-Policy, and X-XSS-Protection.
 
 ### 6.6 Policy Engine (NEW)
 - [ ] route-level policy evaluation

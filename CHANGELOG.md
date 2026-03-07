@@ -5,6 +5,40 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.8.0] - 2026-03-xx
+
+### Added
+- Token-bucket rate limiter per client IP (`src/http/rate_limiter.zig`):
+  - Configurable requests-per-second and burst capacity via `TARDIGRADE_RATE_LIMIT_RPS` and `TARDIGRADE_RATE_LIMIT_BURST` env vars.
+  - Automatic stale bucket cleanup (5-minute idle expiry).
+  - Returns 429 Too Many Requests when exceeded.
+- Security headers middleware (`src/http/security_headers.zig`):
+  - X-Frame-Options, X-Content-Type-Options, Content-Security-Policy, Strict-Transport-Security, Referrer-Policy, Permissions-Policy, X-XSS-Protection.
+  - Default secure and API presets; configurable via `TARDIGRADE_SECURITY_HEADERS` env var.
+  - Applied to all gateway responses including error responses.
+- Request context and auth context propagation (`src/http/request_context.zig`):
+  - Per-request context struct carrying identity, timing, client IP, API version, and idempotency key.
+  - Client IP extraction from X-Forwarded-For, X-Real-IP, or connection default.
+  - Structured audit logging with identity and API version fields.
+- API version routing (`src/http/api_router.zig`):
+  - Parses `/v<N>/...` paths and extracts version number and sub-route.
+  - Supported version allowlist (v1, v2).
+  - Rejects unsupported API versions with 400 error.
+  - Edge gateway now uses version-aware route matching.
+- Idempotency key support (`src/http/idempotency.zig`):
+  - Parses and validates `Idempotency-Key` header.
+  - In-memory cache with configurable TTL (default 300s) via `TARDIGRADE_IDEMPOTENCY_TTL`.
+  - Replays cached responses for duplicate POST requests with `X-Idempotent-Replayed: true` header.
+  - Automatic expired entry cleanup.
+
+### Changed
+- Edge gateway refactored to use middleware pipeline:
+  - Rate limiting applied before route dispatch.
+  - Security headers applied to all responses.
+  - Request context propagated through handler chain.
+  - Auth result now includes token hash for identity tracking.
+- Edge config extended with rate limiting, security headers, and idempotency settings.
+
 # [0.7.0] - unreleased
 
 ### Added

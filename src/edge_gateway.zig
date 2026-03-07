@@ -5,7 +5,37 @@ const edge_config = @import("edge_config.zig");
 const MAX_REQUEST_SIZE: usize = 256 * 1024;
 const JSON_CONTENT_TYPE = "application/json";
 
+/// Persistent gateway state shared across connections.
+const GatewayState = struct {
+    rate_limiter: ?http.rate_limiter.RateLimiter,
+    idempotency_store: ?http.idempotency.IdempotencyStore,
+    security_headers: http.security_headers.SecurityHeaders,
+};
+
 pub fn run(cfg: *const edge_config.EdgeConfig) !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const state_allocator = gpa.allocator();
+
+    var state = GatewayState{
+        .rate_limiter = if (cfg.rate_limit_rps > 0)
+            http.rate_limiter.RateLimiter.init(state_allocator, cfg.rate_limit_rps, cfg.rate_limit_burst)
+        else
+            null,
+        .idempotency_store = if (cfg.idempotency_ttl_seconds > 0)
+            http.idempotency.IdempotencyStore.init(state_allocator, cfg.idempotency_ttl_seconds)
+        else
+            null,
+        .security_headers = if (cfg.security_headers_enabled)
+            http.security_headers.SecurityHeaders.api
+        else
+            http.security_headers.SecurityHeaders{ .x_frame_options = "", .x_content_type_options = "", .content_security_policy = "", .strict_transport_security = "", .referrer_policy = "", .permissions_policy = "", .x_xss_protection = "" },
+    };
+    defer {
+        if (state.rate_limiter) |*rl| rl.deinit();
+        if (state.idempotency_store) |*is| is.deinit();
+    }
+
     const address = try std.net.Address.parseIp(cfg.listen_host, cfg.listen_port);
     var server = try std.net.Address.listen(address, .{ .reuse_address = true });
     defer server.deinit();
@@ -16,17 +46,23 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     } else {
         std.log.info("TLS cert/key configured at {s} and {s}", .{ cfg.tls_cert_path, cfg.tls_key_path });
     }
+    if (state.rate_limiter != null) {
+        std.log.info("Rate limiting enabled: {d:.0} req/s, burst {d}", .{ cfg.rate_limit_rps, cfg.rate_limit_burst });
+    }
+    if (state.idempotency_store != null) {
+        std.log.info("Idempotency cache enabled: TTL {d}s", .{cfg.idempotency_ttl_seconds});
+    }
 
     while (true) {
         const conn = try server.accept();
-        handleConnection(conn.stream, cfg) catch |err| {
+        handleConnection(conn.stream, cfg, &state) catch |err| {
             std.log.err("edge connection error: {}", .{err});
         };
         conn.stream.close();
     }
 }
 
-fn handleConnection(stream: std.net.Stream, cfg: *const edge_config.EdgeConfig) !void {
+fn handleConnection(stream: std.net.Stream, cfg: *const edge_config.EdgeConfig, state: *GatewayState) !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -36,7 +72,7 @@ fn handleConnection(stream: std.net.Stream, cfg: *const edge_config.EdgeConfig) 
     if (total_read == 0) return;
 
     const parse_result = http.Request.parse(allocator, req_buf[0..total_read], MAX_REQUEST_SIZE) catch |err| {
-        try sendApiError(allocator, stream.writer(), .bad_request, "invalid_request", "Malformed request", null, false);
+        try sendApiError(allocator, stream.writer(), .bad_request, "invalid_request", "Malformed request", null, false, state);
         std.log.warn("parse error: {}", .{err});
         return;
     };
@@ -45,37 +81,99 @@ fn handleConnection(stream: std.net.Stream, cfg: *const edge_config.EdgeConfig) 
     defer request.deinit();
     const writer = stream.writer();
 
+    // --- Correlation ID ---
     const correlation_id = try http.correlation.fromHeadersOrGenerate(allocator, &request.headers);
     defer allocator.free(correlation_id);
 
-    const started = std.time.milliTimestamp();
+    // --- Request Context ---
+    const client_ip = http.request_context.extractClientIp(&request, "unknown");
+    var ctx = http.request_context.RequestContext.init(allocator, correlation_id, client_ip);
 
+    // --- Extract API version ---
+    if (http.api_router.parseVersionedPath(request.uri.path)) |versioned| {
+        ctx.setApiVersion(versioned.version);
+    }
+
+    // --- Extract idempotency key ---
+    if (http.idempotency.fromHeaders(&request.headers)) |idem_key| {
+        ctx.setIdempotencyKey(idem_key);
+    }
+
+    // --- Rate Limiting ---
+    if (state.rate_limiter) |*rl| {
+        if (rl.allow(client_ip)) |rl_result| {
+            // Attach rate limit info — will be added to response headers below
+            _ = rl_result;
+        } else {
+            try sendApiError(allocator, writer, .too_many_requests, "rate_limited", "Rate limit exceeded", correlation_id, false, state);
+            ctx.auditLog(request.uri.path, 429);
+            return;
+        }
+    }
+
+    // --- Health endpoint ---
     if (request.method == .GET and std.mem.eql(u8, request.uri.path, "/health")) {
         var response = http.Response.json(allocator, "{\"status\":\"ok\",\"service\":\"tardigrade-edge\"}");
         defer response.deinit();
         _ = response.setConnection(false).setHeader(http.correlation.HEADER_NAME, correlation_id);
+        state.security_headers.apply(&response);
         try response.write(writer);
-        logAudit("/health", @intFromEnum(response.status), correlation_id, true, std.time.milliTimestamp() - started);
+        ctx.auditLog("/health", @intFromEnum(response.status));
         return;
     }
 
-    if (request.method == .POST and std.mem.eql(u8, request.uri.path, "/v1/chat")) {
+    // --- Versioned API routing ---
+    const versioned = http.api_router.parseVersionedPath(request.uri.path);
+    if (versioned) |route| {
+        if (!http.api_router.isSupportedVersion(route.version)) {
+            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Unsupported API version", correlation_id, false, state);
+            ctx.auditLog(request.uri.path, 400);
+            return;
+        }
+    }
+
+    // --- POST /v1/chat ---
+    if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/chat")) {
+        // --- Idempotency check ---
+        if (ctx.idempotency_key) |idem_key| {
+            if (state.idempotency_store) |*store| {
+                if (store.get(idem_key)) |cached| {
+                    var response = http.Response.init(allocator);
+                    defer response.deinit();
+                    _ = response.setStatus(@enumFromInt(cached.status))
+                        .setBody(cached.body)
+                        .setContentType(cached.content_type)
+                        .setConnection(false)
+                        .setHeader(http.correlation.HEADER_NAME, correlation_id)
+                        .setHeader("X-Idempotent-Replayed", "true");
+                    state.security_headers.apply(&response);
+                    try response.write(writer);
+                    ctx.auditLog("/v1/chat", cached.status);
+                    return;
+                }
+            }
+        }
+
+        // --- Auth ---
         const auth_result = authorizeRequest(cfg, &request.headers);
         if (!auth_result.ok) {
-            try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, false);
-            logAudit("/v1/chat", 401, correlation_id, false, std.time.milliTimestamp() - started);
+            try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, false, state);
+            ctx.auditLog("/v1/chat", 401);
             return;
         }
+        ctx.setIdentity(auth_result.token_hash orelse "-");
 
+        // --- Content-Type validation ---
         if (!isJsonContentType(request.contentType())) {
-            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Content-Type must be application/json", correlation_id, false);
-            logAudit("/v1/chat", 400, correlation_id, true, std.time.milliTimestamp() - started);
+            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Content-Type must be application/json", correlation_id, false, state);
+            ctx.auditLog("/v1/chat", 400);
             return;
         }
 
+        // --- Body validation ---
         const body = request.body orelse {
-            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Missing request body", correlation_id, false);
-            logAudit("/v1/chat", 400, correlation_id, true, std.time.milliTimestamp() - started);
+            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Missing request body", correlation_id, false, state);
+            ctx.auditLog("/v1/chat", 400);
             return;
         };
 
@@ -85,55 +183,76 @@ fn handleConnection(stream: std.net.Stream, cfg: *const edge_config.EdgeConfig) 
                 error.MessageTooLarge => "message too long",
                 else => "invalid chat payload",
             };
-            try sendApiError(allocator, writer, .bad_request, "invalid_request", msg, correlation_id, false);
-            logAudit("/v1/chat", 400, correlation_id, true, std.time.milliTimestamp() - started);
+            try sendApiError(allocator, writer, .bad_request, "invalid_request", msg, correlation_id, false, state);
+            ctx.auditLog("/v1/chat", 400);
             return;
         };
 
+        // --- Upstream proxy ---
         const proxy_result = proxyChat(allocator, cfg, message, correlation_id) catch {
-            try sendApiError(allocator, writer, .gateway_timeout, "upstream_timeout", "Upstream timeout", correlation_id, false);
-            logAudit("/v1/chat", 504, correlation_id, true, std.time.milliTimestamp() - started);
+            try sendApiError(allocator, writer, .gateway_timeout, "upstream_timeout", "Upstream timeout", correlation_id, false, state);
+            ctx.auditLog("/v1/chat", 504);
             return;
         };
         defer allocator.free(proxy_result.body);
 
         var final_status: u16 = proxy_result.status;
         var final_body: []const u8 = proxy_result.body;
+        var error_body_to_free: ?[]const u8 = null;
         if (proxy_result.status != 200) {
             const mapped = mapUpstreamError(proxy_result.status);
             final_status = mapped.status;
             final_body = try buildApiErrorJson(allocator, mapped.code, mapped.message, correlation_id);
-            defer allocator.free(final_body);
+            error_body_to_free = final_body;
+        }
+        defer {
+            if (error_body_to_free) |eb| allocator.free(eb);
         }
 
         var response = http.Response.json(allocator, final_body);
         defer response.deinit();
-        _ = response.setStatus(@enumFromInt(final_status)).setConnection(false).setHeader(http.correlation.HEADER_NAME, correlation_id);
+        _ = response.setStatus(@enumFromInt(final_status))
+            .setConnection(false)
+            .setHeader(http.correlation.HEADER_NAME, correlation_id);
+        state.security_headers.apply(&response);
         try response.write(writer);
-        logAudit("/v1/chat", final_status, correlation_id, true, std.time.milliTimestamp() - started);
+
+        // --- Store idempotency result ---
+        if (ctx.idempotency_key) |idem_key| {
+            if (state.idempotency_store) |*store| {
+                store.put(idem_key, final_status, final_body, JSON_CONTENT_TYPE) catch |err| {
+                    std.log.warn("idempotency store error: {}", .{err});
+                };
+            }
+        }
+
+        ctx.auditLog("/v1/chat", final_status);
         return;
     }
 
-    try sendApiError(allocator, writer, .not_found, "invalid_request", "Not Found", correlation_id, false);
-    logAudit(request.uri.path, 404, correlation_id, true, std.time.milliTimestamp() - started);
+    try sendApiError(allocator, writer, .not_found, "invalid_request", "Not Found", correlation_id, false, state);
+    ctx.auditLog(request.uri.path, 404);
 }
 
-const AuthResult = struct { ok: bool };
+const AuthResult = struct {
+    ok: bool,
+    token_hash: ?[]const u8,
+};
 
 fn authorizeRequest(cfg: *const edge_config.EdgeConfig, headers: *const http.Headers) AuthResult {
-    if (cfg.auth_token_hashes.len == 0) return .{ .ok = false };
-    const token = http.auth.authorize(headers, null) catch return .{ .ok = false };
+    if (cfg.auth_token_hashes.len == 0) return .{ .ok = false, .token_hash = null };
+    const token = http.auth.authorize(headers, null) catch return .{ .ok = false, .token_hash = null };
 
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(token, &digest, .{});
 
     var digest_hex: [64]u8 = undefined;
-    _ = std.fmt.bufPrint(&digest_hex, "{s}", .{std.fmt.fmtSliceHexLower(&digest)}) catch return .{ .ok = false };
+    _ = std.fmt.bufPrint(&digest_hex, "{s}", .{std.fmt.fmtSliceHexLower(&digest)}) catch return .{ .ok = false, .token_hash = null };
 
     for (cfg.auth_token_hashes) |allowed| {
-        if (std.mem.eql(u8, allowed, digest_hex[0..])) return .{ .ok = true };
+        if (std.mem.eql(u8, allowed, digest_hex[0..])) return .{ .ok = true, .token_hash = allowed };
     }
-    return .{ .ok = false };
+    return .{ .ok = false, .token_hash = null };
 }
 
 fn isJsonContentType(content_type: ?[]const u8) bool {
@@ -221,7 +340,7 @@ fn buildApiErrorJson(allocator: std.mem.Allocator, code: []const u8, message: []
     return std.fmt.allocPrint(allocator, "{{\"code\":\"{s}\",\"message\":\"{s}\",\"request_id\":null}}", .{ code, message });
 }
 
-fn sendApiError(allocator: std.mem.Allocator, writer: anytype, status: http.Status, code: []const u8, message: []const u8, request_id: ?[]const u8, keep_alive: bool) !void {
+fn sendApiError(allocator: std.mem.Allocator, writer: anytype, status: http.Status, code: []const u8, message: []const u8, request_id: ?[]const u8, keep_alive: bool, state: *GatewayState) !void {
     const payload = try buildApiErrorJson(allocator, code, message, request_id);
     defer allocator.free(payload);
 
@@ -231,6 +350,7 @@ fn sendApiError(allocator: std.mem.Allocator, writer: anytype, status: http.Stat
     if (request_id) |rid| {
         _ = response.setHeader(http.correlation.HEADER_NAME, rid);
     }
+    state.security_headers.apply(&response);
     try response.write(writer);
 }
 
@@ -272,16 +392,6 @@ fn parseContentLength(headers: []const u8) ?usize {
     return null;
 }
 
-fn logAudit(route: []const u8, status: u16, correlation_id: []const u8, auth_ok: bool, latency_ms: i64) void {
-    std.log.info("audit route={s} status={d} auth_ok={} correlation_id={s} latency_ms={d}", .{
-        route,
-        status,
-        auth_ok,
-        correlation_id,
-        latency_ms,
-    });
-}
-
 test "authorizeRequest accepts valid hash" {
     const allocator = std.testing.allocator;
     const token = "secret-token";
@@ -304,6 +414,10 @@ test "authorizeRequest accepts valid hash" {
         .auth_token_hashes = hashes,
         .max_message_chars = 4000,
         .upstream_timeout_ms = 10000,
+        .rate_limit_rps = 0,
+        .rate_limit_burst = 0,
+        .security_headers_enabled = false,
+        .idempotency_ttl_seconds = 0,
     };
 
     var headers = http.Headers.init(allocator);

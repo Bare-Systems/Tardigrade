@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.10.0] - 2026-03-xx
+
+### Added
+- Structured command routing (`src/http/command.zig`):
+  - Command envelope format with typed commands (`chat`, `tool.list`, `tool.run`, `status`).
+  - Params validation (must be JSON object, max 128KB).
+  - Inline idempotency key support within command envelope.
+  - Upstream envelope builder that wraps params with gateway context (identity, correlation ID, client IP, API version, timestamp).
+  - Structured `CommandAudit` logging per command.
+- Gateway `POST /v1/commands` endpoint:
+  - Accepts bearer token or session token auth.
+  - Parses command envelope and routes to appropriate upstream path.
+  - Idempotency support (inline key or header-based).
+  - Full upstream error mapping and structured audit.
+
+### Changed
+- Edge gateway extended with `proxyCommand` for command-specific upstream forwarding.
+
 ## [0.9.0] - 2026-03-xx
 
 ### Added

@@ -104,10 +104,12 @@ Resolved: Idempotency key support implemented in `src/http/idempotency.zig` with
 Resolved: Request metadata injection handled by `RequestContext` which captures client IP, API version, identity, and timing.
 
 ### 0.4 Agent Command Routing
-- [ ] structured command routing
-- [ ] upstream request envelope
-- [ ] authenticated request forwarding
-- [ ] request auditing
+- [x] structured command routing
+- [x] upstream request envelope
+- [x] authenticated request forwarding
+- [x] request auditing
+
+Resolved: Command routing implemented in `src/http/command.zig`. Structured command envelope with typed commands (chat, tool.list, tool.run, status), params validation, and inline idempotency key support. Gateway `POST /v1/commands` endpoint wraps commands in upstream envelope with identity, correlation ID, client IP, API version, and timestamp context. Structured `CommandAudit` log for every command.
 
 ## PHASE 1: Core HTTP Server Foundation
 

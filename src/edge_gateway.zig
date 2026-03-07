@@ -260,6 +260,154 @@ fn handleConnection(stream: std.net.Stream, cfg: *const edge_config.EdgeConfig, 
         return;
     }
 
+    // --- POST /v1/commands (structured command routing) ---
+    if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/commands")) {
+        // --- Auth (bearer token or session token) ---
+        var cmd_authenticated = false;
+        const cmd_auth_result = authorizeRequest(cfg, &request.headers);
+        if (cmd_auth_result.ok) {
+            ctx.setIdentity(cmd_auth_result.token_hash orelse "-");
+            cmd_authenticated = true;
+        }
+        if (!cmd_authenticated) {
+            if (state.session_store) |*ss| {
+                if (http.session.fromHeaders(&request.headers)) |session_token| {
+                    if (ss.validate(session_token)) |session| {
+                        ctx.setIdentity(session.identity);
+                        cmd_authenticated = true;
+                    }
+                }
+            }
+        }
+        if (!cmd_authenticated) {
+            try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, false, state);
+            ctx.auditLog("/v1/commands", 401);
+            return;
+        }
+
+        // --- Content-Type validation ---
+        if (!isJsonContentType(request.contentType())) {
+            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Content-Type must be application/json", correlation_id, false, state);
+            ctx.auditLog("/v1/commands", 400);
+            return;
+        }
+
+        // --- Body parsing ---
+        const cmd_body = request.body orelse {
+            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Missing request body", correlation_id, false, state);
+            ctx.auditLog("/v1/commands", 400);
+            return;
+        };
+
+        var cmd = http.command.parseCommand(allocator, cmd_body) catch |err| {
+            const msg = switch (err) {
+                http.command.ParseError.MissingCommand => "Missing 'command' field",
+                http.command.ParseError.UnknownCommand => "Unknown command type",
+                http.command.ParseError.InvalidParams => "Invalid or missing 'params' object",
+                else => "Invalid command envelope",
+            };
+            try sendApiError(allocator, writer, .bad_request, "invalid_request", msg, correlation_id, false, state);
+            ctx.auditLog("/v1/commands", 400);
+            return;
+        };
+        defer cmd.deinit(allocator);
+
+        // --- Idempotency (inline key overrides header) ---
+        const effective_idem_key = cmd.idempotency_key orelse ctx.idempotency_key;
+        if (effective_idem_key) |idem_key| {
+            if (state.idempotency_store) |*store| {
+                if (store.get(idem_key)) |cached| {
+                    var response = http.Response.init(allocator);
+                    defer response.deinit();
+                    _ = response.setStatus(@enumFromInt(cached.status))
+                        .setBody(cached.body)
+                        .setContentType(cached.content_type)
+                        .setConnection(false)
+                        .setHeader(http.correlation.HEADER_NAME, correlation_id)
+                        .setHeader("X-Idempotent-Replayed", "true");
+                    state.security_headers.apply(&response);
+                    try response.write(writer);
+                    ctx.auditLog("/v1/commands", cached.status);
+                    return;
+                }
+            }
+        }
+
+        // --- Build upstream envelope with context ---
+        const envelope = http.command.buildUpstreamEnvelope(
+            allocator,
+            cmd.command_type,
+            cmd.params_raw,
+            correlation_id,
+            ctx.identity orelse "-",
+            client_ip,
+            ctx.api_version,
+        ) catch {
+            try sendApiError(allocator, writer, .internal_server_error, "internal_error", "Failed to build upstream request", correlation_id, false, state);
+            ctx.auditLog("/v1/commands", 500);
+            return;
+        };
+        defer allocator.free(envelope);
+
+        // --- Forward to upstream ---
+        const upstream_path = cmd.command_type.upstreamPath();
+        const cmd_proxy_result = proxyCommand(allocator, cfg, upstream_path, envelope, correlation_id) catch {
+            try sendApiError(allocator, writer, .gateway_timeout, "upstream_timeout", "Upstream timeout", correlation_id, false, state);
+            // Audit
+            const cmd_audit = http.command.CommandAudit{
+                .command = cmd.command_type.toString(),
+                .correlation_id = correlation_id,
+                .identity = ctx.identity orelse "-",
+                .status = 504,
+                .latency_ms = ctx.elapsedMs(),
+            };
+            cmd_audit.log();
+            return;
+        };
+        defer allocator.free(cmd_proxy_result.body);
+
+        var cmd_final_status: u16 = cmd_proxy_result.status;
+        var cmd_final_body: []const u8 = cmd_proxy_result.body;
+        var cmd_error_body: ?[]const u8 = null;
+        if (cmd_proxy_result.status != 200) {
+            const mapped = mapUpstreamError(cmd_proxy_result.status);
+            cmd_final_status = mapped.status;
+            cmd_final_body = try buildApiErrorJson(allocator, mapped.code, mapped.message, correlation_id);
+            cmd_error_body = cmd_final_body;
+        }
+        defer {
+            if (cmd_error_body) |eb| allocator.free(eb);
+        }
+
+        var response = http.Response.json(allocator, cmd_final_body);
+        defer response.deinit();
+        _ = response.setStatus(@enumFromInt(cmd_final_status))
+            .setConnection(false)
+            .setHeader(http.correlation.HEADER_NAME, correlation_id);
+        state.security_headers.apply(&response);
+        try response.write(writer);
+
+        // --- Store idempotency result ---
+        if (effective_idem_key) |idem_key| {
+            if (state.idempotency_store) |*store| {
+                store.put(idem_key, cmd_final_status, cmd_final_body, JSON_CONTENT_TYPE) catch |err| {
+                    std.log.warn("idempotency store error: {}", .{err});
+                };
+            }
+        }
+
+        // --- Structured command audit ---
+        const audit = http.command.CommandAudit{
+            .command = cmd.command_type.toString(),
+            .correlation_id = correlation_id,
+            .identity = ctx.identity orelse "-",
+            .status = cmd_final_status,
+            .latency_ms = ctx.elapsedMs(),
+        };
+        audit.log();
+        return;
+    }
+
     // --- POST /v1/chat ---
     if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/chat")) {
         // --- Idempotency check ---
@@ -461,6 +609,34 @@ fn proxyChat(allocator: std.mem.Allocator, cfg: *const edge_config.EdgeConfig, m
         .location = .{ .url = url },
         .method = .POST,
         .payload = request_body,
+        .response_storage = .{ .dynamic = &body },
+        .headers = .{ .content_type = .{ .override = "application/json" } },
+        .extra_headers = &[_]std.http.Header{
+            .{ .name = http.correlation.HEADER_NAME, .value = correlation_id },
+        },
+    };
+
+    const result = try client.fetch(opts);
+    return .{
+        .status = @intFromEnum(result.status),
+        .body = try body.toOwnedSlice(),
+    };
+}
+
+fn proxyCommand(allocator: std.mem.Allocator, cfg: *const edge_config.EdgeConfig, upstream_path: []const u8, envelope: []const u8, correlation_id: []const u8) !ProxyResult {
+    const url = try std.fmt.allocPrint(allocator, "{s}{s}", .{ cfg.upstream_base_url, upstream_path });
+    defer allocator.free(url);
+
+    var client = std.http.Client{ .allocator = allocator };
+    defer client.deinit();
+
+    var body = std.ArrayList(u8).init(allocator);
+    errdefer body.deinit();
+
+    const opts = std.http.Client.FetchOptions{
+        .location = .{ .url = url },
+        .method = .POST,
+        .payload = envelope,
         .response_storage = .{ .dynamic = &body },
         .headers = .{ .content_type = .{ .override = "application/json" } },
         .extra_headers = &[_]std.http.Header{

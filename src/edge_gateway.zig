@@ -820,6 +820,7 @@ fn handleConnection(conn: anytype, cfg: *const edge_config.EdgeConfig, state: *G
         const cmd_exec = proxyJsonExecute(
             allocator,
             cfg,
+            cfg.proxy_pass_commands_prefix,
             upstream_path,
             envelope,
             correlation_id,
@@ -1009,7 +1010,8 @@ fn handleConnection(conn: anytype, cfg: *const edge_config.EdgeConfig, state: *G
         const chat_exec = proxyJsonExecute(
             allocator,
             cfg,
-            "/v1/chat",
+            cfg.proxy_pass_chat,
+            null,
             chat_request_body,
             correlation_id,
             client_ip,
@@ -1173,115 +1175,11 @@ const ProxyExecution = union(enum) {
     buffered: ProxyResult,
 };
 
-fn proxyChat(
-    allocator: std.mem.Allocator,
-    cfg: *const edge_config.EdgeConfig,
-    message: []const u8,
-    correlation_id: []const u8,
-    client_ip: []const u8,
-    incoming_host: ?[]const u8,
-    incoming_x_forwarded_for: ?[]const u8,
-) !ProxyResult {
-    defer allocator.free(message);
-
-    const request_body = try std.fmt.allocPrint(allocator, "{{\"message\":{s}}}", .{std.json.fmt(message, .{})});
-    defer allocator.free(request_body);
-
-    const result = try proxyJsonRequest(
-        allocator,
-        cfg,
-        "/v1/chat",
-        request_body,
-        correlation_id,
-        client_ip,
-        incoming_host,
-        incoming_x_forwarded_for,
-    );
-    return result;
-}
-
-fn proxyCommand(
-    allocator: std.mem.Allocator,
-    cfg: *const edge_config.EdgeConfig,
-    upstream_path: []const u8,
-    envelope: []const u8,
-    correlation_id: []const u8,
-    client_ip: []const u8,
-    incoming_host: ?[]const u8,
-    incoming_x_forwarded_for: ?[]const u8,
-) !ProxyResult {
-    const result = try proxyJsonRequest(
-        allocator,
-        cfg,
-        upstream_path,
-        envelope,
-        correlation_id,
-        client_ip,
-        incoming_host,
-        incoming_x_forwarded_for,
-    );
-    return result;
-}
-
-fn proxyJsonRequest(
-    allocator: std.mem.Allocator,
-    cfg: *const edge_config.EdgeConfig,
-    upstream_path: []const u8,
-    payload: []const u8,
-    correlation_id: []const u8,
-    client_ip: []const u8,
-    incoming_host: ?[]const u8,
-    incoming_x_forwarded_for: ?[]const u8,
-) !ProxyResult {
-    const url = try std.fmt.allocPrint(allocator, "{s}{s}", .{ cfg.upstream_base_url, upstream_path });
-    defer allocator.free(url);
-
-    const forwarded_for = try buildForwardedFor(allocator, incoming_x_forwarded_for, client_ip);
-    defer allocator.free(forwarded_for);
-
-    const forwarded_host = incoming_host orelse "";
-    const forwarded_proto = if (edge_config.hasTlsFiles(cfg)) "https" else "http";
-    const upstream_host = parseUpstreamHost(cfg.upstream_base_url) orelse "";
-
-    var extra_headers = std.ArrayList(std.http.Header).init(allocator);
-    defer extra_headers.deinit();
-    try extra_headers.append(.{ .name = http.correlation.HEADER_NAME, .value = correlation_id });
-    try extra_headers.append(.{ .name = "X-Forwarded-For", .value = forwarded_for });
-    try extra_headers.append(.{ .name = "X-Real-IP", .value = client_ip });
-    try extra_headers.append(.{ .name = "X-Forwarded-Proto", .value = forwarded_proto });
-    if (forwarded_host.len > 0) {
-        try extra_headers.append(.{ .name = "X-Forwarded-Host", .value = forwarded_host });
-    }
-    if (upstream_host.len > 0) {
-        try extra_headers.append(.{ .name = "Host", .value = upstream_host });
-    }
-
-    var client = std.http.Client{ .allocator = allocator };
-    defer client.deinit();
-
-    var body = std.ArrayList(u8).init(allocator);
-    errdefer body.deinit();
-
-    const opts = std.http.Client.FetchOptions{
-        .location = .{ .url = url },
-        .method = .POST,
-        .payload = payload,
-        .response_storage = .{ .dynamic = &body },
-        .headers = .{ .content_type = .{ .override = "application/json" } },
-        .extra_headers = extra_headers.items,
-    };
-
-    const result = try client.fetch(opts);
-    return .{
-        .status = @intFromEnum(result.status),
-        .body = try body.toOwnedSlice(),
-    };
-}
-
 fn proxyJsonExecute(
     allocator: std.mem.Allocator,
     cfg: *const edge_config.EdgeConfig,
-    upstream_path: []const u8,
+    proxy_pass_target: []const u8,
+    suffix_path: ?[]const u8,
     payload: []const u8,
     correlation_id: []const u8,
     client_ip: []const u8,
@@ -1291,15 +1189,15 @@ fn proxyJsonExecute(
     state: *GatewayState,
     enable_streaming_success: bool,
 ) !ProxyExecution {
-    const url = try std.fmt.allocPrint(allocator, "{s}{s}", .{ cfg.upstream_base_url, upstream_path });
-    defer allocator.free(url);
+    const resolved_target = try resolveProxyTarget(allocator, cfg, proxy_pass_target, suffix_path);
+    defer allocator.free(resolved_target.url);
 
     const forwarded_for = try buildForwardedFor(allocator, incoming_x_forwarded_for, client_ip);
     defer allocator.free(forwarded_for);
 
     const forwarded_host = incoming_host orelse "";
     const forwarded_proto = if (edge_config.hasTlsFiles(cfg)) "https" else "http";
-    const upstream_host = parseUpstreamHost(cfg.upstream_base_url) orelse "";
+    const upstream_host = resolved_target.upstream_host;
 
     var extra_headers = std.ArrayList(std.http.Header).init(allocator);
     defer extra_headers.deinit();
@@ -1311,7 +1209,7 @@ fn proxyJsonExecute(
     if (upstream_host.len > 0) try extra_headers.append(.{ .name = "Host", .value = upstream_host });
 
     var server_header_buffer: [16 * 1024]u8 = undefined;
-    const uri = try std.Uri.parse(url);
+    const uri = try std.Uri.parse(resolved_target.url);
     var req = try state.upstream_client.open(.POST, uri, .{
         .server_header_buffer = &server_header_buffer,
         .headers = .{ .content_type = .{ .override = "application/json" } },
@@ -1411,6 +1309,69 @@ fn buildForwardedFor(allocator: std.mem.Allocator, incoming: ?[]const u8, client
         }
     }
     return allocator.dupe(u8, client_ip);
+}
+
+const ResolvedProxyTarget = struct {
+    url: []u8,
+    upstream_host: []const u8,
+};
+
+fn resolveProxyTarget(
+    allocator: std.mem.Allocator,
+    cfg: *const edge_config.EdgeConfig,
+    proxy_pass_target: []const u8,
+    suffix_path: ?[]const u8,
+) !ResolvedProxyTarget {
+    const target_trimmed = std.mem.trim(u8, proxy_pass_target, " \t\r\n");
+    const target = if (target_trimmed.len == 0) "/" else target_trimmed;
+    const combined_target = try combineProxyTarget(allocator, target, suffix_path);
+    errdefer allocator.free(combined_target);
+
+    if (isAbsoluteHttpUrl(target)) {
+        return .{
+            .url = combined_target,
+            .upstream_host = parseUpstreamHost(combined_target) orelse "",
+        };
+    }
+
+    var normalized: []const u8 = combined_target;
+    if (!std.mem.startsWith(u8, normalized, "/")) {
+        const with_slash = try std.fmt.allocPrint(allocator, "/{s}", .{normalized});
+        allocator.free(combined_target);
+        normalized = with_slash;
+    }
+    errdefer if (normalized.ptr != combined_target.ptr) allocator.free(normalized);
+
+    const full_url = try std.fmt.allocPrint(allocator, "{s}{s}", .{ cfg.upstream_base_url, normalized });
+    if (normalized.ptr != combined_target.ptr) allocator.free(normalized);
+    allocator.free(combined_target);
+
+    return .{
+        .url = full_url,
+        .upstream_host = parseUpstreamHost(cfg.upstream_base_url) orelse "",
+    };
+}
+
+fn combineProxyTarget(allocator: std.mem.Allocator, target: []const u8, suffix_path: ?[]const u8) ![]u8 {
+    if (suffix_path == null) return allocator.dupe(u8, target);
+
+    const suffix = suffix_path.?;
+    const left_trimmed = std.mem.trimRight(u8, target, "/");
+    const right_trimmed = std.mem.trimLeft(u8, suffix, "/");
+
+    if (left_trimmed.len == 0) {
+        return std.fmt.allocPrint(allocator, "/{s}", .{right_trimmed});
+    }
+
+    if (right_trimmed.len == 0) {
+        return allocator.dupe(u8, left_trimmed);
+    }
+
+    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ left_trimmed, right_trimmed });
+}
+
+fn isAbsoluteHttpUrl(value: []const u8) bool {
+    return std.mem.startsWith(u8, value, "http://") or std.mem.startsWith(u8, value, "https://");
 }
 
 fn parseUpstreamHost(base_url: []const u8) ?[]const u8 {
@@ -1531,6 +1492,56 @@ test "parseUpstreamHost extracts authority" {
     try std.testing.expect(parseUpstreamHost("invalid-url") == null);
 }
 
+test "combineProxyTarget joins prefix and suffix" {
+    const allocator = std.testing.allocator;
+    const joined = try combineProxyTarget(allocator, "/api", "/v1/chat");
+    defer allocator.free(joined);
+    try std.testing.expectEqualStrings("/api/v1/chat", joined);
+}
+
+test "resolveProxyTarget handles absolute and relative proxy_pass" {
+    const allocator = std.testing.allocator;
+    const cfg = edge_config.EdgeConfig{
+        .listen_host = "0.0.0.0",
+        .listen_port = 8069,
+        .tls_cert_path = "",
+        .tls_key_path = "",
+        .upstream_base_url = "http://127.0.0.1:8080",
+        .proxy_pass_chat = "/v1/chat",
+        .proxy_pass_commands_prefix = "",
+        .auth_token_hashes = &[_][]const u8{},
+        .max_message_chars = 4000,
+        .upstream_timeout_ms = 10000,
+        .rate_limit_rps = 0,
+        .rate_limit_burst = 0,
+        .security_headers_enabled = false,
+        .idempotency_ttl_seconds = 0,
+        .session_ttl_seconds = 0,
+        .session_max = 0,
+        .access_control_rules = "",
+        .request_limits = http.request_limits.RequestLimits.default,
+        .basic_auth_hashes = &[_][]const u8{},
+        .log_level = .info,
+        .compression_enabled = false,
+        .compression_min_size = 256,
+        .cb_threshold = 0,
+        .cb_timeout_ms = 30_000,
+        .worker_threads = 0,
+        .worker_queue_size = 1024,
+        .max_connections_per_ip = 0,
+    };
+
+    const abs = try resolveProxyTarget(allocator, &cfg, "https://api.example.com/base", "/v1/chat");
+    defer allocator.free(abs.url);
+    try std.testing.expectEqualStrings("https://api.example.com/base/v1/chat", abs.url);
+    try std.testing.expectEqualStrings("api.example.com", abs.upstream_host);
+
+    const rel = try resolveProxyTarget(allocator, &cfg, "/gateway", "/v1/tools");
+    defer allocator.free(rel.url);
+    try std.testing.expectEqualStrings("http://127.0.0.1:8080/gateway/v1/tools", rel.url);
+    try std.testing.expectEqualStrings("127.0.0.1:8080", rel.upstream_host);
+}
+
 test "authorizeRequest accepts valid hash" {
     const allocator = std.testing.allocator;
     const token = "secret-token";
@@ -1550,6 +1561,8 @@ test "authorizeRequest accepts valid hash" {
         .tls_cert_path = "",
         .tls_key_path = "",
         .upstream_base_url = "http://127.0.0.1:8080",
+        .proxy_pass_chat = "/v1/chat",
+        .proxy_pass_commands_prefix = "",
         .auth_token_hashes = hashes,
         .max_message_chars = 4000,
         .upstream_timeout_ms = 10000,

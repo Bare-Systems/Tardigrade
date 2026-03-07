@@ -233,7 +233,7 @@ Secrets may include:
 ## PHASE 4: Reverse Proxy
 
 ### 4.1 Basic Proxying
-- [ ] proxy_pass directive
+- [x] proxy_pass directive
 - [x] Backend connection pooling
 - [x] Request/response streaming
 - [x] Header manipulation (add, remove, modify)
@@ -242,6 +242,7 @@ Secrets may include:
 - [x] Host header rewriting
 
 Resolved (incremental): Gateway upstream proxy calls now flow through a shared proxy request helper that rewrites/augments forwarding headers (`X-Forwarded-*`, `X-Real-IP`) and rewrites `Host` to upstream authority.
+Resolved: basic proxy_pass-style routing now supports config-driven targets for `/v1/chat` and `/v1/commands` subpaths via `TARDIGRADE_PROXY_PASS_CHAT` and `TARDIGRADE_PROXY_PASS_COMMANDS_PREFIX` (absolute URL or path mode).
 Resolved (incremental): `/v1/chat` and `/v1/commands` now support streamed relay for successful upstream responses via chunked downstream writes, avoiding full buffering on the hot path.
 Resolved: upstream requests now use a shared `std.http.Client` in gateway state with keep-alive enabled, allowing backend connection reuse across requests.
 Decision: kept buffered fallback for non-200/error-mapped/idempotency-cached paths to preserve current API semantics; full streaming coverage for all proxy paths remains open follow-up work under 4.1.

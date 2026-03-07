@@ -52,6 +52,8 @@ Environment variables:
 - `TARDIGRADE_TLS_CERT_PATH` (PEM certificate path; enables TLS termination when paired with key)
 - `TARDIGRADE_TLS_KEY_PATH` (PEM private key path; enables TLS termination when paired with cert)
 - `TARDIGRADE_UPSTREAM_BASE_URL` (default `http://127.0.0.1:8080`)
+- `TARDIGRADE_PROXY_PASS_CHAT` (default `/v1/chat`; absolute URL or path target)
+- `TARDIGRADE_PROXY_PASS_COMMANDS_PREFIX` (default empty; absolute URL or path prefix used before command upstream subpaths)
 - `TARDIGRADE_AUTH_TOKEN_HASHES` (comma-separated lowercase SHA-256 token hashes)
 - `TARDIGRADE_MAX_MESSAGE_CHARS` (default `4000`)
 

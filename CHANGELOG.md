@@ -1,6 +1,15 @@
 
 # Changelog
 
+## [0.23.0] - 2026-03-xx
+
+### Added
+- Phase 4.1 proxy_pass directive foundation (`src/edge_config.zig`, `src/edge_gateway.zig`):
+  - Added `TARDIGRADE_PROXY_PASS_CHAT` for `/v1/chat` upstream target selection.
+  - Added `TARDIGRADE_PROXY_PASS_COMMANDS_PREFIX` for `/v1/commands` command upstream path prefixing.
+  - Proxy target resolver supports absolute URL mode and relative-path mode (joined with `TARDIGRADE_UPSTREAM_BASE_URL`).
+  - Added target resolution helper coverage for path joining and absolute/relative routing behavior.
+
 ## [0.22.0] - 2026-03-xx
 
 ### Added

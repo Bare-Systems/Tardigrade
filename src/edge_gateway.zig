@@ -316,6 +316,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         state.logger.info(null, "Circuit breaker enabled: threshold={d} timeout={d}ms", .{ cfg.cb_threshold, cfg.cb_timeout_ms });
     }
     state.logger.info(null, "Worker pool enabled: workers={d} queue={d}", .{ worker_count, cfg.worker_queue_size });
+    state.logger.info(null, "Keep-alive configured: timeout={d}ms max_requests={d}", .{ cfg.keep_alive_timeout_ms, cfg.max_requests_per_connection });
     if (cfg.max_connections_per_ip > 0) {
         state.logger.info(null, "Per-IP connection limit enabled: {d}", .{cfg.max_connections_per_ip});
     }
@@ -395,8 +396,12 @@ fn handleAcceptedClient(raw_ctx: *anyopaque, client_fd: std.posix.fd_t) void {
     const ctx: *WorkerContext = @ptrCast(@alignCast(raw_ctx));
     defer ctx.state.releaseConnectionSlot(client_fd);
 
-    if (ctx.cfg.request_limits.header_timeout_ms > 0) {
-        setSocketTimeoutMs(client_fd, ctx.cfg.request_limits.header_timeout_ms, ctx.cfg.request_limits.header_timeout_ms) catch |err| {
+    const idle_timeout_ms = if (ctx.cfg.keep_alive_timeout_ms > 0)
+        ctx.cfg.keep_alive_timeout_ms
+    else
+        ctx.cfg.request_limits.header_timeout_ms;
+    if (idle_timeout_ms > 0) {
+        setSocketTimeoutMs(client_fd, idle_timeout_ms, idle_timeout_ms) catch |err| {
             ctx.state.logger.warn(null, "failed to set client socket timeout: {}", .{err});
         };
     }
@@ -416,16 +421,38 @@ fn handleAcceptedClient(raw_ctx: *anyopaque, client_fd: std.posix.fd_t) void {
         defer tls_conn.deinit();
         defer std.posix.close(client_fd);
 
-        handleConnection(&tls_conn, ctx.cfg, ctx.state) catch |err| {
-            ctx.state.logger.err(null, "edge connection error: {}", .{err});
-        };
+        var served: u32 = 0;
+        while (true) {
+            var keep_alive = false;
+            handleConnection(&tls_conn, ctx.cfg, ctx.state, &keep_alive) catch |err| {
+                ctx.state.logger.err(null, "edge connection error: {}", .{err});
+                break;
+            };
+            served += 1;
+            if (!keep_alive) break;
+            if (ctx.cfg.max_requests_per_connection > 0 and served >= ctx.cfg.max_requests_per_connection) break;
+        }
+        if (served == ctx.cfg.max_requests_per_connection and ctx.cfg.max_requests_per_connection > 0) {
+            ctx.state.logger.debug(null, "closing connection after max requests per connection reached ({d})", .{ctx.cfg.max_requests_per_connection});
+        }
     } else {
         const stream = std.net.Stream{ .handle = client_fd };
         defer stream.close();
 
-        handleConnection(stream, ctx.cfg, ctx.state) catch |err| {
-            ctx.state.logger.err(null, "edge connection error: {}", .{err});
-        };
+        var served: u32 = 0;
+        while (true) {
+            var keep_alive = false;
+            handleConnection(stream, ctx.cfg, ctx.state, &keep_alive) catch |err| {
+                ctx.state.logger.err(null, "edge connection error: {}", .{err});
+                break;
+            };
+            served += 1;
+            if (!keep_alive) break;
+            if (ctx.cfg.max_requests_per_connection > 0 and served >= ctx.cfg.max_requests_per_connection) break;
+        }
+        if (served == ctx.cfg.max_requests_per_connection and ctx.cfg.max_requests_per_connection > 0) {
+            ctx.state.logger.debug(null, "closing connection after max requests per connection reached ({d})", .{ctx.cfg.max_requests_per_connection});
+        }
     }
 }
 
@@ -451,7 +478,11 @@ fn setNonBlocking(fd: std.posix.fd_t, enabled: bool) !void {
     _ = try std.posix.fcntl(fd, std.posix.F.SETFL, flags);
 }
 
-fn handleConnection(conn: anytype, cfg: *const edge_config.EdgeConfig, state: *GatewayState) !void {
+fn handleConnection(conn: anytype, cfg: *const edge_config.EdgeConfig, state: *GatewayState, keep_alive_out: *bool) !void {
+    var keep_alive = false;
+    keep_alive_out.* = false;
+    defer keep_alive_out.* = keep_alive;
+
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -461,7 +492,7 @@ fn handleConnection(conn: anytype, cfg: *const edge_config.EdgeConfig, state: *G
     if (total_read == 0) return;
 
     const parse_result = http.Request.parse(allocator, req_buf[0..total_read], MAX_REQUEST_SIZE) catch |err| {
-        try sendApiError(allocator, conn.writer(), .bad_request, "invalid_request", "Malformed request", null, false, state);
+        try sendApiError(allocator, conn.writer(), .bad_request, "invalid_request", "Malformed request", null, keep_alive, state);
         state.logger.warn(null, "parse error: {}", .{err});
         return;
     };
@@ -469,6 +500,7 @@ fn handleConnection(conn: anytype, cfg: *const edge_config.EdgeConfig, state: *G
     var request = parse_result.request;
     defer request.deinit();
     const writer = conn.writer();
+    keep_alive = request.keepAlive();
 
     // --- Correlation ID ---
     const correlation_id = try http.correlation.fromHeadersOrGenerate(allocator, &request.headers);
@@ -484,14 +516,14 @@ fn handleConnection(conn: anytype, cfg: *const edge_config.EdgeConfig, state: *G
     if (uri_check != .ok) {
         var msg_buf: [256]u8 = undefined;
         const msg = http.request_limits.rejectionMessage(uri_check, &msg_buf);
-        try sendApiError(allocator, writer, .uri_too_long, "invalid_request", msg, correlation_id, false, state);
+        try sendApiError(allocator, writer, .uri_too_long, "invalid_request", msg, correlation_id, keep_alive, state);
         state.logger.warn(correlation_id, "URI too long: {d} bytes", .{request.uri.path.len});
         logAccess(&ctx, request.method.toString(), request.uri.path, 414, request.headers.get("user-agent") orelse "");
         return;
     }
     const header_count_check = http.request_limits.validateHeaderCount(request.headers.count(), limits);
     if (header_count_check != .ok) {
-        try sendApiError(allocator, writer, .bad_request, "invalid_request", "Too many headers", correlation_id, false, state);
+        try sendApiError(allocator, writer, .bad_request, "invalid_request", "Too many headers", correlation_id, keep_alive, state);
         state.logger.warn(correlation_id, "Too many headers: {d}", .{request.headers.count()});
         logAccess(&ctx, request.method.toString(), request.uri.path, 400, request.headers.get("user-agent") orelse "");
         return;
@@ -499,7 +531,7 @@ fn handleConnection(conn: anytype, cfg: *const edge_config.EdgeConfig, state: *G
     if (request.body) |body| {
         const body_check = http.request_limits.validateBodySize(body.len, limits);
         if (body_check != .ok) {
-            try sendApiError(allocator, writer, .payload_too_large, "invalid_request", "Request body too large", correlation_id, false, state);
+            try sendApiError(allocator, writer, .payload_too_large, "invalid_request", "Request body too large", correlation_id, keep_alive, state);
             state.logger.warn(correlation_id, "Body too large: {d} bytes", .{body.len});
             logAccess(&ctx, request.method.toString(), request.uri.path, 413, request.headers.get("user-agent") orelse "");
             return;
@@ -519,7 +551,7 @@ fn handleConnection(conn: anytype, cfg: *const edge_config.EdgeConfig, state: *G
     // --- IP Access Control ---
     if (state.access_control) |*acl| {
         if (acl.check(client_ip) == .denied) {
-            try sendApiError(allocator, writer, .forbidden, "forbidden", "Access denied", correlation_id, false, state);
+            try sendApiError(allocator, writer, .forbidden, "forbidden", "Access denied", correlation_id, keep_alive, state);
             logAccess(&ctx, request.method.toString(), request.uri.path, 403, request.headers.get("user-agent") orelse "");
             return;
         }
@@ -527,7 +559,7 @@ fn handleConnection(conn: anytype, cfg: *const edge_config.EdgeConfig, state: *G
 
     // --- Rate Limiting ---
     if (!state.rateLimitAllow(client_ip)) {
-        try sendApiError(allocator, writer, .too_many_requests, "rate_limited", "Rate limit exceeded", correlation_id, false, state);
+        try sendApiError(allocator, writer, .too_many_requests, "rate_limited", "Rate limit exceeded", correlation_id, keep_alive, state);
         logAccess(&ctx, request.method.toString(), request.uri.path, 429, request.headers.get("user-agent") orelse "");
         return;
     }
@@ -536,7 +568,7 @@ fn handleConnection(conn: anytype, cfg: *const edge_config.EdgeConfig, state: *G
     if (request.method == .GET and std.mem.eql(u8, request.uri.path, "/health")) {
         var response = http.Response.json(allocator, "{\"status\":\"ok\",\"service\":\"tardigrade-edge\"}");
         defer response.deinit();
-        _ = response.setConnection(false).setHeader(http.correlation.HEADER_NAME, correlation_id);
+        _ = response.setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
         state.security_headers.apply(&response);
         try response.write(writer);
         state.metricsRecord(200);
@@ -547,14 +579,14 @@ fn handleConnection(conn: anytype, cfg: *const edge_config.EdgeConfig, state: *G
     // --- Metrics endpoint ---
     if (request.method == .GET and std.mem.eql(u8, request.uri.path, "/metrics")) {
         const metrics_json = state.metricsToJson(allocator) catch {
-            try sendApiError(allocator, writer, .internal_server_error, "internal_error", "Failed to generate metrics", correlation_id, false, state);
+            try sendApiError(allocator, writer, .internal_server_error, "internal_error", "Failed to generate metrics", correlation_id, keep_alive, state);
             return;
         };
         defer allocator.free(metrics_json);
 
         var response = http.Response.json(allocator, metrics_json);
         defer response.deinit();
-        _ = response.setConnection(false).setHeader(http.correlation.HEADER_NAME, correlation_id);
+        _ = response.setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
         state.security_headers.apply(&response);
         try response.write(writer);
         state.metricsRecord(200);
@@ -565,7 +597,7 @@ fn handleConnection(conn: anytype, cfg: *const edge_config.EdgeConfig, state: *G
     // --- Prometheus metrics endpoint ---
     if (request.method == .GET and std.mem.eql(u8, request.uri.path, "/metrics/prometheus")) {
         const prom_text = state.metricsToPrometheus(allocator) catch {
-            try sendApiError(allocator, writer, .internal_server_error, "internal_error", "Failed to generate metrics", correlation_id, false, state);
+            try sendApiError(allocator, writer, .internal_server_error, "internal_error", "Failed to generate metrics", correlation_id, keep_alive, state);
             return;
         };
         defer allocator.free(prom_text);
@@ -574,7 +606,7 @@ fn handleConnection(conn: anytype, cfg: *const edge_config.EdgeConfig, state: *G
         defer response.deinit();
         _ = response.setBody(prom_text)
             .setContentType("text/plain; version=0.0.4; charset=utf-8")
-            .setConnection(false)
+            .setConnection(keep_alive)
             .setHeader(http.correlation.HEADER_NAME, correlation_id);
         state.security_headers.apply(&response);
         try response.write(writer);
@@ -587,7 +619,7 @@ fn handleConnection(conn: anytype, cfg: *const edge_config.EdgeConfig, state: *G
     const versioned = http.api_router.parseVersionedPath(request.uri.path);
     if (versioned) |route| {
         if (!http.api_router.isSupportedVersion(route.version)) {
-            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Unsupported API version", correlation_id, false, state);
+            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Unsupported API version", correlation_id, keep_alive, state);
             logAccess(&ctx, request.method.toString(), request.uri.path, 400, request.headers.get("user-agent") orelse "");
             return;
         }
@@ -596,7 +628,7 @@ fn handleConnection(conn: anytype, cfg: *const edge_config.EdgeConfig, state: *G
     // --- POST /v1/sessions (create session) ---
     if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/sessions")) {
         if (state.session_store == null) {
-            try sendApiError(allocator, writer, .not_found, "invalid_request", "Sessions not enabled", correlation_id, false, state);
+            try sendApiError(allocator, writer, .not_found, "invalid_request", "Sessions not enabled", correlation_id, keep_alive, state);
             logAccess(&ctx, request.method.toString(), "/v1/sessions", 404, request.headers.get("user-agent") orelse "");
             return;
         }
@@ -604,7 +636,7 @@ fn handleConnection(conn: anytype, cfg: *const edge_config.EdgeConfig, state: *G
         // Requires bearer auth to create a session
         const auth_result = authorizeRequest(cfg, &request.headers);
         if (!auth_result.ok) {
-            try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, false, state);
+            try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, keep_alive, state);
             logAccess(&ctx, request.method.toString(), "/v1/sessions", 401, request.headers.get("user-agent") orelse "");
             return;
         }
@@ -625,7 +657,7 @@ fn handleConnection(conn: anytype, cfg: *const edge_config.EdgeConfig, state: *G
                 error.TooManySessions => "Too many active sessions",
                 else => "Session creation failed",
             };
-            try sendApiError(allocator, writer, .too_many_requests, "rate_limited", msg, correlation_id, false, state);
+            try sendApiError(allocator, writer, .too_many_requests, "rate_limited", msg, correlation_id, keep_alive, state);
             logAccess(&ctx, request.method.toString(), "/v1/sessions", 429, request.headers.get("user-agent") orelse "");
             return;
         };
@@ -637,7 +669,7 @@ fn handleConnection(conn: anytype, cfg: *const edge_config.EdgeConfig, state: *G
         var response = http.Response.json(allocator, resp_body);
         defer response.deinit();
         _ = response.setStatus(.created)
-            .setConnection(false)
+            .setConnection(keep_alive)
             .setHeader(http.correlation.HEADER_NAME, correlation_id)
             .setHeader(http.session.SESSION_HEADER, session_token);
         state.security_headers.apply(&response);
@@ -650,13 +682,13 @@ fn handleConnection(conn: anytype, cfg: *const edge_config.EdgeConfig, state: *G
     // --- DELETE /v1/sessions (revoke session) ---
     if (request.method == .DELETE and http.api_router.matchRoute(request.uri.path, 1, "/sessions")) {
         if (state.session_store == null) {
-            try sendApiError(allocator, writer, .not_found, "invalid_request", "Sessions not enabled", correlation_id, false, state);
+            try sendApiError(allocator, writer, .not_found, "invalid_request", "Sessions not enabled", correlation_id, keep_alive, state);
             logAccess(&ctx, request.method.toString(), "/v1/sessions", 404, request.headers.get("user-agent") orelse "");
             return;
         }
 
         const session_token = http.session.fromHeaders(&request.headers) orelse {
-            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Missing or invalid X-Session-Token", correlation_id, false, state);
+            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Missing or invalid X-Session-Token", correlation_id, keep_alive, state);
             logAccess(&ctx, request.method.toString(), "/v1/sessions", 400, request.headers.get("user-agent") orelse "");
             return;
         };
@@ -669,7 +701,7 @@ fn handleConnection(conn: anytype, cfg: *const edge_config.EdgeConfig, state: *G
 
         var response = http.Response.json(allocator, resp_body);
         defer response.deinit();
-        _ = response.setConnection(false)
+        _ = response.setConnection(keep_alive)
             .setHeader(http.correlation.HEADER_NAME, correlation_id);
         state.security_headers.apply(&response);
         try response.write(writer);
@@ -681,7 +713,7 @@ fn handleConnection(conn: anytype, cfg: *const edge_config.EdgeConfig, state: *G
     // --- GET /v1/sessions (list sessions for identity) ---
     if (request.method == .GET and http.api_router.matchRoute(request.uri.path, 1, "/sessions")) {
         if (state.session_store == null) {
-            try sendApiError(allocator, writer, .not_found, "invalid_request", "Sessions not enabled", correlation_id, false, state);
+            try sendApiError(allocator, writer, .not_found, "invalid_request", "Sessions not enabled", correlation_id, keep_alive, state);
             logAccess(&ctx, request.method.toString(), "/v1/sessions", 404, request.headers.get("user-agent") orelse "");
             return;
         }
@@ -689,14 +721,14 @@ fn handleConnection(conn: anytype, cfg: *const edge_config.EdgeConfig, state: *G
         // Requires bearer auth
         const auth_result = authorizeRequest(cfg, &request.headers);
         if (!auth_result.ok) {
-            try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, false, state);
+            try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, keep_alive, state);
             logAccess(&ctx, request.method.toString(), "/v1/sessions", 401, request.headers.get("user-agent") orelse "");
             return;
         }
         const identity = auth_result.token_hash orelse "-";
 
         const active_sessions = state.countSessionsByIdentity(allocator, identity) catch {
-            try sendApiError(allocator, writer, .internal_server_error, "internal_error", "Failed to list sessions", correlation_id, false, state);
+            try sendApiError(allocator, writer, .internal_server_error, "internal_error", "Failed to list sessions", correlation_id, keep_alive, state);
             logAccess(&ctx, request.method.toString(), "/v1/sessions", 500, request.headers.get("user-agent") orelse "");
             return;
         };
@@ -706,7 +738,7 @@ fn handleConnection(conn: anytype, cfg: *const edge_config.EdgeConfig, state: *G
 
         var response = http.Response.json(allocator, resp_body);
         defer response.deinit();
-        _ = response.setConnection(false)
+        _ = response.setConnection(keep_alive)
             .setHeader(http.correlation.HEADER_NAME, correlation_id);
         state.security_headers.apply(&response);
         try response.write(writer);
@@ -734,21 +766,21 @@ fn handleConnection(conn: anytype, cfg: *const edge_config.EdgeConfig, state: *G
             }
         }
         if (!cmd_authenticated) {
-            try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, false, state);
+            try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, keep_alive, state);
             logAccess(&ctx, request.method.toString(), "/v1/commands", 401, request.headers.get("user-agent") orelse "");
             return;
         }
 
         // --- Content-Type validation ---
         if (!isJsonContentType(request.contentType())) {
-            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Content-Type must be application/json", correlation_id, false, state);
+            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Content-Type must be application/json", correlation_id, keep_alive, state);
             logAccess(&ctx, request.method.toString(), "/v1/commands", 400, request.headers.get("user-agent") orelse "");
             return;
         }
 
         // --- Body parsing ---
         const cmd_body = request.body orelse {
-            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Missing request body", correlation_id, false, state);
+            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Missing request body", correlation_id, keep_alive, state);
             logAccess(&ctx, request.method.toString(), "/v1/commands", 400, request.headers.get("user-agent") orelse "");
             return;
         };
@@ -760,7 +792,7 @@ fn handleConnection(conn: anytype, cfg: *const edge_config.EdgeConfig, state: *G
                 http.command.ParseError.InvalidParams => "Invalid or missing 'params' object",
                 else => "Invalid command envelope",
             };
-            try sendApiError(allocator, writer, .bad_request, "invalid_request", msg, correlation_id, false, state);
+            try sendApiError(allocator, writer, .bad_request, "invalid_request", msg, correlation_id, keep_alive, state);
             logAccess(&ctx, request.method.toString(), "/v1/commands", 400, request.headers.get("user-agent") orelse "");
             return;
         };
@@ -778,7 +810,7 @@ fn handleConnection(conn: anytype, cfg: *const edge_config.EdgeConfig, state: *G
                 _ = response.setStatus(@enumFromInt(cached.status))
                     .setBody(cached.body)
                     .setContentType(cached.content_type)
-                    .setConnection(false)
+                    .setConnection(keep_alive)
                     .setHeader(http.correlation.HEADER_NAME, correlation_id)
                     .setHeader("X-Idempotent-Replayed", "true");
                 state.security_headers.apply(&response);
@@ -799,7 +831,7 @@ fn handleConnection(conn: anytype, cfg: *const edge_config.EdgeConfig, state: *G
             client_ip,
             ctx.api_version,
         ) catch {
-            try sendApiError(allocator, writer, .internal_server_error, "internal_error", "Failed to build upstream request", correlation_id, false, state);
+            try sendApiError(allocator, writer, .internal_server_error, "internal_error", "Failed to build upstream request", correlation_id, keep_alive, state);
             logAccess(&ctx, request.method.toString(), "/v1/commands", 500, request.headers.get("user-agent") orelse "");
             return;
         };
@@ -811,7 +843,7 @@ fn handleConnection(conn: anytype, cfg: *const edge_config.EdgeConfig, state: *G
         // --- Circuit breaker check ---
         if (!state.circuitTryAcquire()) {
             state.logger.warn(null, "circuit breaker open, rejecting /v1/commands", .{});
-            try sendApiError(allocator, writer, .service_unavailable, "upstream_unavailable", "Upstream unavailable", correlation_id, false, state);
+            try sendApiError(allocator, writer, .service_unavailable, "upstream_unavailable", "Upstream unavailable", correlation_id, keep_alive, state);
             const cb_audit = http.command.CommandAudit{
                 .command = cmd.command_type.toString(),
                 .correlation_id = correlation_id,
@@ -839,7 +871,7 @@ fn handleConnection(conn: anytype, cfg: *const edge_config.EdgeConfig, state: *G
         ) catch {
             state.circuitRecordFailure();
             state.logger.warn(null, "circuit breaker: recorded failure, state={s}", .{state.circuitStateName()});
-            try sendApiError(allocator, writer, .gateway_timeout, "upstream_timeout", "Upstream timeout", correlation_id, false, state);
+            try sendApiError(allocator, writer, .gateway_timeout, "upstream_timeout", "Upstream timeout", correlation_id, keep_alive, state);
             // Audit
             const cmd_audit = http.command.CommandAudit{
                 .command = cmd.command_type.toString(),
@@ -902,7 +934,7 @@ fn handleConnection(conn: anytype, cfg: *const edge_config.EdgeConfig, state: *G
         var response = http.Response.json(allocator, cmd_resp_body);
         defer response.deinit();
         _ = response.setStatus(@enumFromInt(cmd_final_status))
-            .setConnection(false)
+            .setConnection(keep_alive)
             .setHeader(http.correlation.HEADER_NAME, correlation_id);
         if (cmd_comp.compressed) _ = response.setHeader("Content-Encoding", "gzip");
         state.security_headers.apply(&response);
@@ -941,7 +973,7 @@ fn handleConnection(conn: anytype, cfg: *const edge_config.EdgeConfig, state: *G
                 _ = response.setStatus(@enumFromInt(cached.status))
                     .setBody(cached.body)
                     .setContentType(cached.content_type)
-                    .setConnection(false)
+                    .setConnection(keep_alive)
                     .setHeader(http.correlation.HEADER_NAME, correlation_id)
                     .setHeader("X-Idempotent-Replayed", "true");
                 state.security_headers.apply(&response);
@@ -971,21 +1003,21 @@ fn handleConnection(conn: anytype, cfg: *const edge_config.EdgeConfig, state: *G
             }
         }
         if (!authenticated) {
-            try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, false, state);
+            try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, keep_alive, state);
             logAccess(&ctx, request.method.toString(), "/v1/chat", 401, request.headers.get("user-agent") orelse "");
             return;
         }
 
         // --- Content-Type validation ---
         if (!isJsonContentType(request.contentType())) {
-            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Content-Type must be application/json", correlation_id, false, state);
+            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Content-Type must be application/json", correlation_id, keep_alive, state);
             logAccess(&ctx, request.method.toString(), "/v1/chat", 400, request.headers.get("user-agent") orelse "");
             return;
         }
 
         // --- Body validation ---
         const body = request.body orelse {
-            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Missing request body", correlation_id, false, state);
+            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Missing request body", correlation_id, keep_alive, state);
             logAccess(&ctx, request.method.toString(), "/v1/chat", 400, request.headers.get("user-agent") orelse "");
             return;
         };
@@ -996,7 +1028,7 @@ fn handleConnection(conn: anytype, cfg: *const edge_config.EdgeConfig, state: *G
                 error.MessageTooLarge => "message too long",
                 else => "invalid chat payload",
             };
-            try sendApiError(allocator, writer, .bad_request, "invalid_request", msg, correlation_id, false, state);
+            try sendApiError(allocator, writer, .bad_request, "invalid_request", msg, correlation_id, keep_alive, state);
             logAccess(&ctx, request.method.toString(), "/v1/chat", 400, request.headers.get("user-agent") orelse "");
             return;
         };
@@ -1004,7 +1036,7 @@ fn handleConnection(conn: anytype, cfg: *const edge_config.EdgeConfig, state: *G
         // --- Circuit breaker check ---
         if (!state.circuitTryAcquire()) {
             state.logger.warn(null, "circuit breaker open, rejecting /v1/chat", .{});
-            try sendApiError(allocator, writer, .service_unavailable, "upstream_unavailable", "Upstream unavailable", correlation_id, false, state);
+            try sendApiError(allocator, writer, .service_unavailable, "upstream_unavailable", "Upstream unavailable", correlation_id, keep_alive, state);
             logAccess(&ctx, request.method.toString(), "/v1/chat", 503, request.headers.get("user-agent") orelse "");
             return;
         }
@@ -1029,7 +1061,7 @@ fn handleConnection(conn: anytype, cfg: *const edge_config.EdgeConfig, state: *G
         ) catch {
             state.circuitRecordFailure();
             state.logger.warn(null, "circuit breaker: recorded failure, state={s}", .{state.circuitStateName()});
-            try sendApiError(allocator, writer, .gateway_timeout, "upstream_timeout", "Upstream timeout", correlation_id, false, state);
+            try sendApiError(allocator, writer, .gateway_timeout, "upstream_timeout", "Upstream timeout", correlation_id, keep_alive, state);
             logAccess(&ctx, request.method.toString(), "/v1/chat", 504, request.headers.get("user-agent") orelse "");
             return;
         };
@@ -1077,7 +1109,7 @@ fn handleConnection(conn: anytype, cfg: *const edge_config.EdgeConfig, state: *G
         var response = http.Response.json(allocator, chat_resp_body);
         defer response.deinit();
         _ = response.setStatus(@enumFromInt(final_status))
-            .setConnection(false)
+            .setConnection(keep_alive)
             .setHeader(http.correlation.HEADER_NAME, correlation_id);
         if (chat_comp.compressed) _ = response.setHeader("Content-Encoding", "gzip");
         state.security_headers.apply(&response);
@@ -1095,7 +1127,7 @@ fn handleConnection(conn: anytype, cfg: *const edge_config.EdgeConfig, state: *G
         return;
     }
 
-    try sendApiError(allocator, writer, .not_found, "invalid_request", "Not Found", correlation_id, false, state);
+    try sendApiError(allocator, writer, .not_found, "invalid_request", "Not Found", correlation_id, keep_alive, state);
     logAccess(&ctx, request.method.toString(), request.uri.path, 404, request.headers.get("user-agent") orelse "");
 }
 
@@ -1460,7 +1492,10 @@ fn readHttpRequest(conn: anytype, buf: []u8) !usize {
     var header_end: ?usize = null;
 
     while (total_read < buf.len) {
-        const n = try conn.read(buf[total_read..]);
+        const n = conn.read(buf[total_read..]) catch |err| switch (err) {
+            error.WouldBlock => return 0,
+            else => return err,
+        };
         if (n == 0) break;
         total_read += n;
 
@@ -1557,6 +1592,8 @@ test "resolveProxyTarget handles absolute and relative proxy_pass" {
         .worker_threads = 0,
         .worker_queue_size = 1024,
         .max_connections_per_ip = 0,
+        .keep_alive_timeout_ms = 5000,
+        .max_requests_per_connection = 100,
     };
 
     const abs = try resolveProxyTarget(allocator, &cfg, "https://api.example.com/base", "/v1/chat");
@@ -1611,6 +1648,8 @@ test "authorizeRequest accepts valid hash" {
         .worker_threads = 0,
         .worker_queue_size = 1024,
         .max_connections_per_ip = 0,
+        .keep_alive_timeout_ms = 5000,
+        .max_requests_per_connection = 100,
     };
 
     var headers = http.Headers.init(allocator);

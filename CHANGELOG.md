@@ -1,6 +1,15 @@
 
 # Changelog
 
+## [0.25.0] - 2026-03-xx
+
+### Added
+- Phase 2.2 keep-alive connection reuse (`src/edge_gateway.zig`, `src/edge_config.zig`):
+  - Worker connection handlers now support sequential multi-request processing per client socket.
+  - Responses now honor parsed request keep-alive behavior (`Connection: keep-alive`/`close`).
+  - Added `TARDIGRADE_KEEP_ALIVE_TIMEOUT_MS` for idle keep-alive socket timeout.
+  - Added `TARDIGRADE_MAX_REQUESTS_PER_CONNECTION` to bound requests served per connection.
+
 ## [0.24.0] - 2026-03-xx
 
 ### Added

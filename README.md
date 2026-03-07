@@ -56,6 +56,8 @@ Environment variables:
 - `TARDIGRADE_PROXY_PASS_COMMANDS_PREFIX` (default empty; absolute URL or path prefix used before command upstream subpaths)
 - `TARDIGRADE_AUTH_TOKEN_HASHES` (comma-separated lowercase SHA-256 token hashes)
 - `TARDIGRADE_MAX_MESSAGE_CHARS` (default `4000`)
+- `TARDIGRADE_KEEP_ALIVE_TIMEOUT_MS` (default `5000`; idle timeout for keep-alive client connections)
+- `TARDIGRADE_MAX_REQUESTS_PER_CONNECTION` (default `100`; max requests served before closing keep-alive connection)
 
 ### Build for Production
 

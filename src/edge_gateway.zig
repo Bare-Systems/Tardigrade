@@ -703,7 +703,16 @@ fn handleConnection(stream: std.net.Stream, cfg: *const edge_config.EdgeConfig, 
             return;
         }
 
-        const cmd_proxy_result = proxyCommand(allocator, cfg, upstream_path, envelope, correlation_id) catch {
+        const cmd_proxy_result = proxyCommand(
+            allocator,
+            cfg,
+            upstream_path,
+            envelope,
+            correlation_id,
+            client_ip,
+            request.headers.get("host"),
+            request.headers.get("x-forwarded-for"),
+        ) catch {
             state.circuitRecordFailure();
             state.logger.warn(null, "circuit breaker: recorded failure, state={s}", .{state.circuitStateName()});
             try sendApiError(allocator, writer, .gateway_timeout, "upstream_timeout", "Upstream timeout", correlation_id, false, state);
@@ -856,7 +865,15 @@ fn handleConnection(stream: std.net.Stream, cfg: *const edge_config.EdgeConfig, 
         }
 
         // --- Upstream proxy ---
-        const proxy_result = proxyChat(allocator, cfg, message, correlation_id) catch {
+        const proxy_result = proxyChat(
+            allocator,
+            cfg,
+            message,
+            correlation_id,
+            client_ip,
+            request.headers.get("host"),
+            request.headers.get("x-forwarded-for"),
+        ) catch {
             state.circuitRecordFailure();
             state.logger.warn(null, "circuit breaker: recorded failure, state={s}", .{state.circuitStateName()});
             try sendApiError(allocator, writer, .gateway_timeout, "upstream_timeout", "Upstream timeout", correlation_id, false, state);
@@ -992,14 +1009,86 @@ const ProxyResult = struct {
     body: []u8,
 };
 
-fn proxyChat(allocator: std.mem.Allocator, cfg: *const edge_config.EdgeConfig, message: []const u8, correlation_id: []const u8) !ProxyResult {
+fn proxyChat(
+    allocator: std.mem.Allocator,
+    cfg: *const edge_config.EdgeConfig,
+    message: []const u8,
+    correlation_id: []const u8,
+    client_ip: []const u8,
+    incoming_host: ?[]const u8,
+    incoming_x_forwarded_for: ?[]const u8,
+) !ProxyResult {
     defer allocator.free(message);
-
-    const url = try std.fmt.allocPrint(allocator, "{s}/v1/chat", .{cfg.upstream_base_url});
-    defer allocator.free(url);
 
     const request_body = try std.fmt.allocPrint(allocator, "{{\"message\":{s}}}", .{std.json.fmt(message, .{})});
     defer allocator.free(request_body);
+
+    return proxyJsonRequest(
+        allocator,
+        cfg,
+        "/v1/chat",
+        request_body,
+        correlation_id,
+        client_ip,
+        incoming_host,
+        incoming_x_forwarded_for,
+    );
+}
+
+fn proxyCommand(
+    allocator: std.mem.Allocator,
+    cfg: *const edge_config.EdgeConfig,
+    upstream_path: []const u8,
+    envelope: []const u8,
+    correlation_id: []const u8,
+    client_ip: []const u8,
+    incoming_host: ?[]const u8,
+    incoming_x_forwarded_for: ?[]const u8,
+) !ProxyResult {
+    return proxyJsonRequest(
+        allocator,
+        cfg,
+        upstream_path,
+        envelope,
+        correlation_id,
+        client_ip,
+        incoming_host,
+        incoming_x_forwarded_for,
+    );
+}
+
+fn proxyJsonRequest(
+    allocator: std.mem.Allocator,
+    cfg: *const edge_config.EdgeConfig,
+    upstream_path: []const u8,
+    payload: []const u8,
+    correlation_id: []const u8,
+    client_ip: []const u8,
+    incoming_host: ?[]const u8,
+    incoming_x_forwarded_for: ?[]const u8,
+) !ProxyResult {
+    const url = try std.fmt.allocPrint(allocator, "{s}{s}", .{ cfg.upstream_base_url, upstream_path });
+    defer allocator.free(url);
+
+    const forwarded_for = try buildForwardedFor(allocator, incoming_x_forwarded_for, client_ip);
+    defer allocator.free(forwarded_for);
+
+    const forwarded_host = incoming_host orelse "";
+    const forwarded_proto = if (edge_config.hasTlsFiles(cfg)) "https" else "http";
+    const upstream_host = parseUpstreamHost(cfg.upstream_base_url) orelse "";
+
+    var extra_headers = std.ArrayList(std.http.Header).init(allocator);
+    defer extra_headers.deinit();
+    try extra_headers.append(.{ .name = http.correlation.HEADER_NAME, .value = correlation_id });
+    try extra_headers.append(.{ .name = "X-Forwarded-For", .value = forwarded_for });
+    try extra_headers.append(.{ .name = "X-Real-IP", .value = client_ip });
+    try extra_headers.append(.{ .name = "X-Forwarded-Proto", .value = forwarded_proto });
+    if (forwarded_host.len > 0) {
+        try extra_headers.append(.{ .name = "X-Forwarded-Host", .value = forwarded_host });
+    }
+    if (upstream_host.len > 0) {
+        try extra_headers.append(.{ .name = "Host", .value = upstream_host });
+    }
 
     var client = std.http.Client{ .allocator = allocator };
     defer client.deinit();
@@ -1010,12 +1099,10 @@ fn proxyChat(allocator: std.mem.Allocator, cfg: *const edge_config.EdgeConfig, m
     const opts = std.http.Client.FetchOptions{
         .location = .{ .url = url },
         .method = .POST,
-        .payload = request_body,
+        .payload = payload,
         .response_storage = .{ .dynamic = &body },
         .headers = .{ .content_type = .{ .override = "application/json" } },
-        .extra_headers = &[_]std.http.Header{
-            .{ .name = http.correlation.HEADER_NAME, .value = correlation_id },
-        },
+        .extra_headers = extra_headers.items,
     };
 
     const result = try client.fetch(opts);
@@ -1025,32 +1112,24 @@ fn proxyChat(allocator: std.mem.Allocator, cfg: *const edge_config.EdgeConfig, m
     };
 }
 
-fn proxyCommand(allocator: std.mem.Allocator, cfg: *const edge_config.EdgeConfig, upstream_path: []const u8, envelope: []const u8, correlation_id: []const u8) !ProxyResult {
-    const url = try std.fmt.allocPrint(allocator, "{s}{s}", .{ cfg.upstream_base_url, upstream_path });
-    defer allocator.free(url);
+fn buildForwardedFor(allocator: std.mem.Allocator, incoming: ?[]const u8, client_ip: []const u8) ![]const u8 {
+    if (incoming) |value| {
+        const trimmed = std.mem.trim(u8, value, " \t\r\n");
+        if (trimmed.len > 0) {
+            return std.fmt.allocPrint(allocator, "{s}, {s}", .{ trimmed, client_ip });
+        }
+    }
+    return allocator.dupe(u8, client_ip);
+}
 
-    var client = std.http.Client{ .allocator = allocator };
-    defer client.deinit();
+fn parseUpstreamHost(base_url: []const u8) ?[]const u8 {
+    const scheme_end = std.mem.indexOf(u8, base_url, "://") orelse return null;
+    const authority_start = scheme_end + 3;
+    if (authority_start >= base_url.len) return null;
 
-    var body = std.ArrayList(u8).init(allocator);
-    errdefer body.deinit();
-
-    const opts = std.http.Client.FetchOptions{
-        .location = .{ .url = url },
-        .method = .POST,
-        .payload = envelope,
-        .response_storage = .{ .dynamic = &body },
-        .headers = .{ .content_type = .{ .override = "application/json" } },
-        .extra_headers = &[_]std.http.Header{
-            .{ .name = http.correlation.HEADER_NAME, .value = correlation_id },
-        },
-    };
-
-    const result = try client.fetch(opts);
-    return .{
-        .status = @intFromEnum(result.status),
-        .body = try body.toOwnedSlice(),
-    };
+    const path_start = std.mem.indexOfScalarPos(u8, base_url, authority_start, '/') orelse base_url.len;
+    if (path_start <= authority_start) return null;
+    return base_url[authority_start..path_start];
 }
 
 const UpstreamMappedError = struct {
@@ -1146,6 +1225,19 @@ fn parseContentLength(headers: []const u8) ?usize {
         return std.fmt.parseInt(usize, value, 10) catch null;
     }
     return null;
+}
+
+test "buildForwardedFor appends client ip" {
+    const allocator = std.testing.allocator;
+    const value = try buildForwardedFor(allocator, "10.0.0.1, 10.0.0.2", "127.0.0.1");
+    defer allocator.free(value);
+    try std.testing.expectEqualStrings("10.0.0.1, 10.0.0.2, 127.0.0.1", value);
+}
+
+test "parseUpstreamHost extracts authority" {
+    try std.testing.expectEqualStrings("127.0.0.1:8080", parseUpstreamHost("http://127.0.0.1:8080") orelse "");
+    try std.testing.expectEqualStrings("api.example.com", parseUpstreamHost("https://api.example.com/v1") orelse "");
+    try std.testing.expect(parseUpstreamHost("invalid-url") == null);
 }
 
 test "authorizeRequest accepts valid hash" {

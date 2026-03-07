@@ -1,6 +1,15 @@
 
 # Changelog
 
+## [0.17.0] - 2026-03-xx
+
+### Added
+- Phase 4.1 reverse proxy header foundation (`src/edge_gateway.zig`):
+  - Unified JSON proxy request path shared by `/v1/chat` and `/v1/commands`.
+  - Forwarded client headers added on upstream calls: `X-Forwarded-For`, `X-Real-IP`, `X-Forwarded-Proto`, `X-Forwarded-Host`.
+  - `Host` header rewriting to upstream authority derived from `upstream_base_url`.
+  - Helper coverage for forwarded-for composition and upstream host parsing.
+
 ## [0.16.0] - 2026-03-xx
 
 ### Added

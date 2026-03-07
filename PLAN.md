@@ -230,10 +230,13 @@ Secrets may include:
 - [ ] proxy_pass directive
 - [ ] Backend connection pooling
 - [ ] Request/response streaming
-- [ ] Header manipulation (add, remove, modify)
-- [ ] X-Forwarded-For, X-Real-IP
-- [ ] X-Forwarded-Proto, X-Forwarded-Host
-- [ ] Host header rewriting
+- [x] Header manipulation (add, remove, modify)
+- [x] X-Forwarded-For, X-Real-IP
+- [x] X-Forwarded-Proto, X-Forwarded-Host
+- [x] Host header rewriting
+
+Resolved (incremental): Gateway upstream proxy calls now flow through a shared proxy request helper that rewrites/augments forwarding headers (`X-Forwarded-*`, `X-Real-IP`) and rewrites `Host` to upstream authority.
+Decision: kept upstream response buffering behavior for compatibility; true streaming request/response proxying remains open under 4.1 and is coupled with the remaining async connection state-machine work.
 
 ### 4.2 Upstream Management
 - [ ] upstream blocks

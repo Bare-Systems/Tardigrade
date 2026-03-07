@@ -260,17 +260,21 @@ Decision: default behavior still maps non-200 upstream errors into stable gatewa
 
 ### 4.2 Upstream Management
 - [ ] upstream blocks
-- [ ] Multiple backend servers
+- [x] Multiple backend servers
 - [ ] Server weights
 - [ ] Backup servers
 - [ ] max_fails / fail_timeout
 
+Resolved (incremental): edge config now supports multiple upstream base URLs via `TARDIGRADE_UPSTREAM_BASE_URLS` (comma-separated), enabling multi-backend proxy target selection at runtime.
+
 ### 4.3 Load Balancing Algorithms
-- [ ] Round-robin (default)
+- [x] Round-robin (default)
 - [ ] Least connections
 - [ ] IP hash (session persistence)
 - [ ] Generic hash
 - [ ] Random with two choices
+
+Resolved (incremental): proxy upstream base URL selection now uses round-robin rotation per request across configured upstream base URLs.
 
 ### 4.4 Health Checks
 - [ ] Passive health checks (mark failed on errors)

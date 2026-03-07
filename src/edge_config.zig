@@ -7,6 +7,7 @@ pub const EdgeConfig = struct {
     tls_cert_path: []const u8,
     tls_key_path: []const u8,
     upstream_base_url: []const u8,
+    upstream_base_urls: [][]const u8,
     /// Proxy target for /v1/chat. Supports absolute URL or path.
     proxy_pass_chat: []const u8,
     /// Proxy target prefix for /v1/commands upstream subpaths.
@@ -66,6 +67,8 @@ pub const EdgeConfig = struct {
         allocator.free(self.tls_cert_path);
         allocator.free(self.tls_key_path);
         allocator.free(self.upstream_base_url);
+        for (self.upstream_base_urls) |u| allocator.free(u);
+        allocator.free(self.upstream_base_urls);
         allocator.free(self.proxy_pass_chat);
         allocator.free(self.proxy_pass_commands_prefix);
         for (self.auth_token_hashes) |h| allocator.free(h);
@@ -93,6 +96,13 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
 
     const upstream_base_url = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_BASE_URL", "http://127.0.0.1:8080") catch unreachable;
     errdefer allocator.free(upstream_base_url);
+    const upstream_base_urls_raw = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_BASE_URLS", "") catch unreachable;
+    defer allocator.free(upstream_base_urls_raw);
+    const upstream_base_urls = try parseCsvValues(allocator, upstream_base_urls_raw);
+    errdefer {
+        for (upstream_base_urls) |u| allocator.free(u);
+        allocator.free(upstream_base_urls);
+    }
     const proxy_pass_chat = envOrDefault(allocator, "TARDIGRADE_PROXY_PASS_CHAT", "/v1/chat") catch unreachable;
     errdefer allocator.free(proxy_pass_chat);
     const proxy_pass_commands_prefix = envOrDefault(allocator, "TARDIGRADE_PROXY_PASS_COMMANDS_PREFIX", "") catch unreachable;
@@ -229,6 +239,7 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .tls_cert_path = tls_cert_path,
         .tls_key_path = tls_key_path,
         .upstream_base_url = upstream_base_url,
+        .upstream_base_urls = upstream_base_urls,
         .proxy_pass_chat = proxy_pass_chat,
         .proxy_pass_commands_prefix = proxy_pass_commands_prefix,
         .auth_token_hashes = hashes,
@@ -292,6 +303,24 @@ fn parseHashes(allocator: std.mem.Allocator, raw: []const u8) ![][]const u8 {
             lower[i] = std.ascii.toLower(c);
         }
         try out.append(lower);
+    }
+
+    return out.toOwnedSlice();
+}
+
+fn parseCsvValues(allocator: std.mem.Allocator, raw: []const u8) ![][]const u8 {
+    var out = std.ArrayList([]const u8).init(allocator);
+    errdefer {
+        for (out.items) |v| allocator.free(v);
+        out.deinit();
+    }
+
+    var it = std.mem.splitScalar(u8, raw, ',');
+    while (it.next()) |part| {
+        const trimmed = std.mem.trim(u8, part, " \t\r\n");
+        if (trimmed.len == 0) continue;
+        const duped = try allocator.dupe(u8, trimmed);
+        try out.append(duped);
     }
 
     return out.toOwnedSlice();

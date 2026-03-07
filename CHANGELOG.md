@@ -30,6 +30,10 @@
   - Buffered success responses now retain upstream `Content-Type` and `Content-Disposition` values.
   - Successful buffered proxy responses are no longer always forced to JSON content type.
   - Reduced streamed vs buffered response mismatch for proxy paths when idempotency requires buffered handling.
+- Phase 4.2/4.3 upstream multi-backend round-robin foundation (`src/edge_config.zig`, `src/edge_gateway.zig`):
+  - Added `TARDIGRADE_UPSTREAM_BASE_URLS` (comma-separated) for configuring multiple upstream base URLs.
+  - Proxy target resolution now selects upstream base URLs via round-robin across configured backends.
+  - Added deterministic unit coverage for upstream base URL round-robin selection.
 
 ## [0.26.0] - 2026-03-xx
 

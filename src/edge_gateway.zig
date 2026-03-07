@@ -23,6 +23,7 @@ const GatewayState = struct {
     request_buffer_pool: http.buffer_pool.BufferPool,
     relay_buffer_pool: http.buffer_pool.BufferPool,
     max_connections_per_ip: u32,
+    upstream_rr_index: usize,
     active_connections_by_ip: std.StringHashMap(u32),
     fd_to_ip: std.AutoHashMap(std.posix.fd_t, []u8),
 
@@ -196,7 +197,20 @@ const GatewayState = struct {
         defer self.mutex.unlock();
         return self.metrics.toPrometheus(allocator);
     }
+
+    fn nextUpstreamBaseUrl(self: *GatewayState, cfg: *const edge_config.EdgeConfig) []const u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return selectUpstreamBaseUrl(cfg.upstream_base_urls, cfg.upstream_base_url, &self.upstream_rr_index);
+    }
 };
+
+fn selectUpstreamBaseUrl(base_urls: []const []const u8, fallback: []const u8, rr_index: *usize) []const u8 {
+    if (base_urls.len == 0) return fallback;
+    const idx = rr_index.* % base_urls.len;
+    rr_index.* = (idx + 1) % base_urls.len;
+    return base_urls[idx];
+}
 
 const WorkerContext = struct {
     cfg: *const edge_config.EdgeConfig,
@@ -299,6 +313,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         .request_buffer_pool = http.buffer_pool.BufferPool.init(state_allocator, MAX_REQUEST_SIZE, cfg.connection_pool_size),
         .relay_buffer_pool = http.buffer_pool.BufferPool.init(state_allocator, STREAM_RELAY_BUFFER_SIZE, cfg.connection_pool_size),
         .max_connections_per_ip = cfg.max_connections_per_ip,
+        .upstream_rr_index = 0,
         .active_connections_by_ip = std.StringHashMap(u32).init(state_allocator),
         .fd_to_ip = std.AutoHashMap(std.posix.fd_t, []u8).init(state_allocator),
     };
@@ -389,6 +404,9 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     }
     if (cfg.proxy_stream_all_statuses) {
         state.logger.info(null, "Proxy streaming for all upstream statuses enabled", .{});
+    }
+    if (cfg.upstream_base_urls.len > 0) {
+        state.logger.info(null, "Upstream round-robin enabled with {d} base URLs", .{cfg.upstream_base_urls.len});
     }
     if (cfg.max_connections_per_ip > 0) {
         state.logger.info(null, "Per-IP connection limit enabled: {d}", .{cfg.max_connections_per_ip});
@@ -1399,7 +1417,8 @@ fn proxyJsonExecute(
     state: *GatewayState,
     enable_streaming_success: bool,
 ) !ProxyExecution {
-    const resolved_target = try resolveProxyTarget(allocator, cfg, proxy_pass_target, suffix_path);
+    const upstream_base_url = state.nextUpstreamBaseUrl(cfg);
+    const resolved_target = try resolveProxyTarget(allocator, upstream_base_url, proxy_pass_target, suffix_path);
     defer allocator.free(resolved_target.url);
 
     const forwarded_for = try buildForwardedFor(allocator, incoming_x_forwarded_for, client_ip);
@@ -1578,7 +1597,7 @@ const ResolvedProxyTarget = struct {
 
 fn resolveProxyTarget(
     allocator: std.mem.Allocator,
-    cfg: *const edge_config.EdgeConfig,
+    upstream_base_url: []const u8,
     proxy_pass_target: []const u8,
     suffix_path: ?[]const u8,
 ) !ResolvedProxyTarget {
@@ -1602,13 +1621,13 @@ fn resolveProxyTarget(
     }
     errdefer if (normalized.ptr != combined_target.ptr) allocator.free(normalized);
 
-    const full_url = try std.fmt.allocPrint(allocator, "{s}{s}", .{ cfg.upstream_base_url, normalized });
+    const full_url = try std.fmt.allocPrint(allocator, "{s}{s}", .{ upstream_base_url, normalized });
     if (normalized.ptr != combined_target.ptr) allocator.free(normalized);
     allocator.free(combined_target);
 
     return .{
         .url = full_url,
-        .upstream_host = parseUpstreamHost(cfg.upstream_base_url) orelse "",
+        .upstream_host = parseUpstreamHost(upstream_base_url) orelse "",
     };
 }
 
@@ -1773,6 +1792,20 @@ test "parseUpstreamHost extracts authority" {
     try std.testing.expect(parseUpstreamHost("invalid-url") == null);
 }
 
+test "selectUpstreamBaseUrl round-robins across configured bases" {
+    var idx: usize = 0;
+    const base_urls = [_][]const u8{
+        "http://upstream-a:8080",
+        "http://upstream-b:8080",
+        "http://upstream-c:8080",
+    };
+
+    try std.testing.expectEqualStrings("http://upstream-a:8080", selectUpstreamBaseUrl(base_urls[0..], "http://fallback:8080", &idx));
+    try std.testing.expectEqualStrings("http://upstream-b:8080", selectUpstreamBaseUrl(base_urls[0..], "http://fallback:8080", &idx));
+    try std.testing.expectEqualStrings("http://upstream-c:8080", selectUpstreamBaseUrl(base_urls[0..], "http://fallback:8080", &idx));
+    try std.testing.expectEqualStrings("http://upstream-a:8080", selectUpstreamBaseUrl(base_urls[0..], "http://fallback:8080", &idx));
+}
+
 test "firstRequestCompleteLen detects pipelined boundary" {
     const pipelined =
         "GET /one HTTP/1.1\r\nHost: localhost\r\n\r\n" ++
@@ -1819,6 +1852,7 @@ test "resolveProxyTarget handles absolute and relative proxy_pass" {
         .tls_cert_path = "",
         .tls_key_path = "",
         .upstream_base_url = "http://127.0.0.1:8080",
+        .upstream_base_urls = &[_][]const u8{},
         .proxy_pass_chat = "/v1/chat",
         .proxy_pass_commands_prefix = "",
         .auth_token_hashes = &[_][]const u8{},
@@ -1848,12 +1882,12 @@ test "resolveProxyTarget handles absolute and relative proxy_pass" {
         .proxy_stream_all_statuses = false,
     };
 
-    const abs = try resolveProxyTarget(allocator, &cfg, "https://api.example.com/base", "/v1/chat");
+    const abs = try resolveProxyTarget(allocator, cfg.upstream_base_url, "https://api.example.com/base", "/v1/chat");
     defer allocator.free(abs.url);
     try std.testing.expectEqualStrings("https://api.example.com/base/v1/chat", abs.url);
     try std.testing.expectEqualStrings("api.example.com", abs.upstream_host);
 
-    const rel = try resolveProxyTarget(allocator, &cfg, "/gateway", "/v1/tools");
+    const rel = try resolveProxyTarget(allocator, cfg.upstream_base_url, "/gateway", "/v1/tools");
     defer allocator.free(rel.url);
     try std.testing.expectEqualStrings("http://127.0.0.1:8080/gateway/v1/tools", rel.url);
     try std.testing.expectEqualStrings("127.0.0.1:8080", rel.upstream_host);
@@ -1878,6 +1912,7 @@ test "authorizeRequest accepts valid hash" {
         .tls_cert_path = "",
         .tls_key_path = "",
         .upstream_base_url = "http://127.0.0.1:8080",
+        .upstream_base_urls = &[_][]const u8{},
         .proxy_pass_chat = "/v1/chat",
         .proxy_pass_commands_prefix = "",
         .auth_token_hashes = hashes,

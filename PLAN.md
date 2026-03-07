@@ -542,12 +542,13 @@ Resolved: Graceful shutdown implemented in `src/http/shutdown.zig`. SIGTERM and 
 ### 13.4 Resilience Features
 - [x] circuit breakers
 - [x] retry policies
-- [ ] timeout budgets
+- [x] timeout budgets
 - [ ] overload protection
 - [ ] request queue management
 
 Resolved: Upstream circuit breaker implemented in `src/http/circuit_breaker.zig`. Three-state machine (closed/open/half-open) with configurable failure threshold (`TARDIGRADE_CB_THRESHOLD`, default 0 = disabled), recovery timeout (`TARDIGRADE_CB_TIMEOUT_MS`, default 30 s), and probe success count. Applied to `/v1/chat` and `/v1/commands` proxy calls; returns 503 `upstream_unavailable` when circuit is open. Circuit breaker state logged on failure and at startup.
 Resolved (incremental): upstream retry policy added for proxy requests. `TARDIGRADE_UPSTREAM_RETRY_ATTEMPTS` controls attempt count (minimum 1); with multiple configured upstream base URLs, retries rotate across upstream targets.
+Resolved (incremental): request-level upstream timeout budgets added via `TARDIGRADE_UPSTREAM_TIMEOUT_BUDGET_MS`; retry attempts now share a single total timeout budget to prevent runaway cumulative wait time.
 
 ## PHASE 14: Real-Time Messaging Gateway
 

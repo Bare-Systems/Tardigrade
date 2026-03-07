@@ -41,6 +41,9 @@
   - Added `TARDIGRADE_UPSTREAM_MAX_FAILS` and `TARDIGRADE_UPSTREAM_FAIL_TIMEOUT_MS`.
   - Backends are marked temporarily unhealthy after threshold failures and skipped by round-robin selection until cooldown expires.
   - Retry + backend rotation now records upstream success/failure outcomes for passive failover decisions.
+- Phase 13.4 timeout budget foundation (`src/edge_config.zig`, `src/edge_gateway.zig`):
+  - Added `TARDIGRADE_UPSTREAM_TIMEOUT_BUDGET_MS` for total upstream retry-window timeout budgeting.
+  - Proxy retry attempts now enforce a shared per-request timeout budget, not only per-attempt socket timeouts.
 
 ## [0.26.0] - 2026-03-xx
 

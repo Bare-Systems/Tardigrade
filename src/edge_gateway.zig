@@ -493,6 +493,9 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     if (cfg.upstream_retry_attempts > 1) {
         state.logger.info(null, "Upstream retry attempts configured: {d}", .{cfg.upstream_retry_attempts});
     }
+    if (cfg.upstream_timeout_budget_ms > 0) {
+        state.logger.info(null, "Upstream timeout budget configured: {d}ms", .{cfg.upstream_timeout_budget_ms});
+    }
     if (cfg.upstream_max_fails > 0) {
         state.logger.info(null, "Passive upstream health enabled: max_fails={d} fail_timeout={d}ms", .{ cfg.upstream_max_fails, cfg.upstream_fail_timeout_ms });
     }
@@ -1510,14 +1513,27 @@ fn proxyJsonExecute(
         @min(configured_attempts, cfg.upstream_base_urls.len)
     else
         configured_attempts;
+    const start_ms = http.event_loop.monotonicMs();
 
     var attempt: usize = 0;
     var last_err: ?anyerror = null;
     while (attempt < max_attempts) : (attempt += 1) {
+        const per_attempt_timeout_ms: u32 = blk: {
+            if (cfg.upstream_timeout_budget_ms == 0) break :blk cfg.upstream_timeout_ms;
+            const elapsed_ms = http.event_loop.monotonicMs() - start_ms;
+            if (elapsed_ms >= cfg.upstream_timeout_budget_ms) return error.Timeout;
+            const remaining = cfg.upstream_timeout_budget_ms - elapsed_ms;
+            if (cfg.upstream_timeout_ms == 0) {
+                break :blk @intCast(@min(remaining, @as(u64, std.math.maxInt(u32))));
+            }
+            break :blk @intCast(@min(@as(u64, cfg.upstream_timeout_ms), remaining));
+        };
+
         const upstream_base_url = state.nextUpstreamBaseUrl(cfg);
         const exec = proxyJsonExecuteSingleAttempt(
             allocator,
             cfg,
+            per_attempt_timeout_ms,
             upstream_base_url,
             proxy_pass_target,
             suffix_path,
@@ -1571,6 +1587,7 @@ fn proxyJsonExecute(
 fn proxyJsonExecuteSingleAttempt(
     allocator: std.mem.Allocator,
     cfg: *const edge_config.EdgeConfig,
+    attempt_timeout_ms: u32,
     upstream_base_url: []const u8,
     proxy_pass_target: []const u8,
     suffix_path: ?[]const u8,
@@ -1612,9 +1629,9 @@ fn proxyJsonExecuteSingleAttempt(
     });
     defer req.deinit();
 
-    if (cfg.upstream_timeout_ms > 0) {
+    if (attempt_timeout_ms > 0) {
         if (req.connection) |conn| {
-            setSocketTimeoutMs(conn.stream.handle, cfg.upstream_timeout_ms, cfg.upstream_timeout_ms) catch |err| {
+            setSocketTimeoutMs(conn.stream.handle, attempt_timeout_ms, attempt_timeout_ms) catch |err| {
                 state.logger.warn(null, "failed to set upstream socket timeout: {}", .{err});
             };
         }
@@ -2046,6 +2063,7 @@ test "resolveProxyTarget handles absolute and relative proxy_pass" {
         .max_connection_memory_bytes = 2 * 1024 * 1024,
         .proxy_stream_all_statuses = false,
         .upstream_retry_attempts = 1,
+        .upstream_timeout_budget_ms = 0,
         .upstream_max_fails = 0,
         .upstream_fail_timeout_ms = 10_000,
     };
@@ -2109,6 +2127,7 @@ test "authorizeRequest accepts valid hash" {
         .max_connection_memory_bytes = 2 * 1024 * 1024,
         .proxy_stream_all_statuses = false,
         .upstream_retry_attempts = 1,
+        .upstream_timeout_budget_ms = 0,
         .upstream_max_fails = 0,
         .upstream_fail_timeout_ms = 10_000,
     };

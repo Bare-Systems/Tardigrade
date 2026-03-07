@@ -63,6 +63,7 @@ Environment variables:
 - `TARDIGRADE_MAX_CONNECTION_MEMORY_BYTES` (default `2097152`; max memory retained per active connection for request/proxy buffering)
 - `TARDIGRADE_PROXY_STREAM_ALL_STATUSES` (default `false`; when enabled, streams non-200 upstream responses directly instead of mapping to gateway error envelopes)
 - `TARDIGRADE_UPSTREAM_RETRY_ATTEMPTS` (default `1`; number of upstream attempts per proxy request; when multiple upstream base URLs are configured, attempts rotate across them)
+- `TARDIGRADE_UPSTREAM_TIMEOUT_BUDGET_MS` (default `0`; total timeout budget across all upstream attempts; `0` disables budget enforcement)
 - `TARDIGRADE_UPSTREAM_MAX_FAILS` (default `0`; passive health threshold; `0` disables passive unhealthy marking)
 - `TARDIGRADE_UPSTREAM_FAIL_TIMEOUT_MS` (default `10000`; cooldown window before a failed upstream is retried)
 

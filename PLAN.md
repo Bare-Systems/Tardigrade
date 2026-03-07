@@ -148,10 +148,14 @@ Resolved: Structured JSON logger implemented in `src/http/logger.zig`. Configura
 ## PHASE 2: Async I/O & Performance
 
 ### 2.1 Event Loop
-- [ ] epoll (Linux) / kqueue (macOS/BSD) abstraction
-- [ ] Non-blocking socket I/O
-- [ ] Event-driven connection handling
-- [ ] Timer management for timeouts
+- [x] epoll (Linux) / kqueue (macOS/BSD) abstraction
+- [x] Non-blocking socket I/O
+- [x] Event-driven connection handling
+- [x] Timer management for timeouts
+
+Resolved (incremental): Event loop foundation implemented in `src/http/event_loop.zig` with runtime backend selection (`epoll` on Linux, `kqueue` on macOS/BSD), readable-fd registration, and timeout-based waits. Gateway listener in `src/edge_gateway.zig` now runs non-blocking and accepts connections from event notifications rather than blocking `accept()`.
+Decision: for compatibility with current request parser/proxy path, accepted client sockets are switched back to blocking mode before `handleConnection`; full non-blocking per-connection read/write state machines are deferred to 2.2/2.3.
+Resolved: Timer manager (`TimerManager`) now drives periodic loop ticks for timeout/housekeeping hooks and keeps graceful shutdown responsive even when no new clients connect.
 
 ### 2.2 Connection Management
 - [ ] Connection pooling
@@ -487,7 +491,7 @@ Resolved: Structured access log implemented in `src/http/access_log.zig`. `Acces
 - [ ] Worker process recycling
 - [ ] CPU affinity
 
-Resolved: Graceful shutdown implemented in `src/http/shutdown.zig`. SIGTERM and SIGINT handlers set a global atomic flag. Gateway accept loop checks the flag before each accept and exits cleanly. Note: with the current single-threaded blocking accept, shutdown takes effect between connections; fully responsive shutdown during blocking accept will be improved when async I/O is added (Phase 2).
+Resolved: Graceful shutdown implemented in `src/http/shutdown.zig`. SIGTERM and SIGINT handlers set a global atomic flag. With the Phase 2.1 event loop, the listener no longer blocks indefinitely in `accept()`, so shutdown is serviced on the next event-loop tick even when the server is idle.
 
 ### 13.2 Resource Limits
 - [ ] File descriptor limits

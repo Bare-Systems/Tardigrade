@@ -65,8 +65,17 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     const address = try std.net.Address.parseIp(cfg.listen_host, cfg.listen_port);
     var server = try std.net.Address.listen(address, .{ .reuse_address = true });
     defer server.deinit();
+    const listen_fd = server.stream.handle;
+
+    try setNonBlocking(listen_fd, true);
+
+    var event_loop = try http.event_loop.EventLoop.init();
+    defer event_loop.deinit();
+    try event_loop.addReadFd(listen_fd);
+    var timer = http.event_loop.TimerManager.init(250);
 
     state.logger.info(null, "Tardigrade edge listening on {s}:{d}", .{ cfg.listen_host, cfg.listen_port });
+    state.logger.info(null, "Event loop initialized with backend: {s}", .{event_loop.backendName()});
     if (!edge_config.hasTlsFiles(cfg)) {
         state.logger.warn(null, "TLS cert/key not set; serving HTTP only", .{});
     } else {
@@ -104,19 +113,72 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     http.shutdown.installSignalHandlers();
     state.logger.info(null, "Signal handlers installed (SIGTERM/SIGINT for graceful shutdown)", .{});
 
+    var ready_events: [64]http.event_loop.Event = undefined;
     while (!http.shutdown.isShutdownRequested()) {
-        const conn = server.accept() catch |err| {
-            if (http.shutdown.isShutdownRequested()) break;
-            state.logger.err(null, "accept error: {}", .{err});
+        const now_ms = http.event_loop.monotonicMs();
+        const timeout_ms = timer.msUntilNextTick(now_ms);
+        const event_count = event_loop.wait(ready_events[0..], timeout_ms) catch |err| {
+            state.logger.err(null, "event loop wait error: {}", .{err});
             continue;
         };
-        handleConnection(conn.stream, cfg, &state) catch |err| {
-            state.logger.err(null, "edge connection error: {}", .{err});
-        };
-        conn.stream.close();
+
+        var i: usize = 0;
+        while (i < event_count) : (i += 1) {
+            const ev = ready_events[i];
+            if (!ev.readable or ev.fd != listen_fd) continue;
+            acceptReadyConnections(listen_fd, cfg, &state);
+        }
+
+        if (timer.consumeTick(http.event_loop.monotonicMs())) {
+            // Timer hook for periodic housekeeping (timeouts, cleanup) as async features expand.
+        }
     }
 
     state.logger.info(null, "Graceful shutdown complete", .{});
+}
+
+fn acceptReadyConnections(listen_fd: std.posix.fd_t, cfg: *const edge_config.EdgeConfig, state: *GatewayState) void {
+    while (!http.shutdown.isShutdownRequested()) {
+        var accepted_addr: std.net.Address = undefined;
+        var addr_len: std.posix.socklen_t = @sizeOf(std.net.Address);
+
+        const client_fd = std.posix.accept(
+            listen_fd,
+            &accepted_addr.any,
+            &addr_len,
+            std.posix.SOCK.CLOEXEC | std.posix.SOCK.NONBLOCK,
+        ) catch |err| switch (err) {
+            error.WouldBlock => return,
+            error.ConnectionAborted => continue,
+            else => {
+                state.logger.err(null, "accept error: {}", .{err});
+                return;
+            },
+        };
+
+        setNonBlocking(client_fd, false) catch |err| {
+            state.logger.warn(null, "failed to switch client fd to blocking mode: {}", .{err});
+            std.posix.close(client_fd);
+            continue;
+        };
+
+        const stream = std.net.Stream{ .handle = client_fd };
+        handleConnection(stream, cfg, state) catch |err| {
+            state.logger.err(null, "edge connection error: {}", .{err});
+        };
+        stream.close();
+    }
+}
+
+fn setNonBlocking(fd: std.posix.fd_t, enabled: bool) !void {
+    var flags = try std.posix.fcntl(fd, std.posix.F.GETFL, 0);
+    const nonblock_mask = @as(i32, 1 << @bitOffsetOf(std.posix.O, "NONBLOCK"));
+    if (enabled) {
+        flags |= nonblock_mask;
+    } else {
+        flags &= ~nonblock_mask;
+    }
+    _ = try std.posix.fcntl(fd, std.posix.F.SETFL, flags);
 }
 
 fn handleConnection(stream: std.net.Stream, cfg: *const edge_config.EdgeConfig, state: *GatewayState) !void {

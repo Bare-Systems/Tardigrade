@@ -1,6 +1,16 @@
 
 # Changelog
 
+## [0.15.0] - 2026-03-xx
+
+### Added
+- Phase 2.1 async event loop foundation (`src/http/event_loop.zig`, `src/edge_gateway.zig`):
+  - Cross-platform event loop abstraction with `epoll` (Linux) and `kqueue` (macOS/BSD) backends.
+  - Non-blocking listening socket registration and event-driven accept handling in the gateway runtime.
+  - Timer manager for periodic event-loop ticks and responsive shutdown checks without blocking in `accept()`.
+  - Gateway startup now logs the selected event loop backend.
+  - Unit tests for backend selection and timer tick behavior.
+
 ## [0.14.0] - 2026-03-07
 
 ### Added

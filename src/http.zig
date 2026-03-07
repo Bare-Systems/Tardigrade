@@ -35,6 +35,7 @@ pub const metrics = @import("http/metrics.zig");
 pub const shutdown = @import("http/shutdown.zig");
 pub const circuit_breaker = @import("http/circuit_breaker.zig");
 pub const access_log = @import("http/access_log.zig");
+pub const event_loop = @import("http/event_loop.zig");
 
 // Re-export constants
 pub const MAX_HEADERS = headers.MAX_HEADERS;

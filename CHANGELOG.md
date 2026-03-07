@@ -13,6 +13,11 @@
   - Added `TARDIGRADE_CONNECTION_POOL_SIZE` to bound cached connection-session objects.
   - Gateway shutdown now explicitly drains active/queued connection work before worker join, and keep-alive responses switch to `Connection: close` during drain.
   - Added unit coverage for connection-session pool reuse/reset behavior.
+- Phase 2.3 work stealing / load balancing (`src/http/worker_pool.zig`):
+  - Replaced the single shared queue with per-worker queues.
+  - Listener submit path now chooses the least-loaded worker queue.
+  - Workers now steal queued sockets from peer queues when local queues are empty.
+  - Added unit coverage for queue selection and stealing behavior.
 
 ## [0.26.0] - 2026-03-xx
 

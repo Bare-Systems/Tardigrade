@@ -176,12 +176,12 @@ Resolved: graceful connection draining is now explicit at shutdown: the listener
 ### 2.3 Worker Model
 - [x] Multi-threaded worker pool
 - [x] Thread-safe shared state
-- [ ] Work stealing / load balancing between workers
+- [x] Work stealing / load balancing between workers
 - [x] Graceful shutdown with connection draining
 
 Resolved (incremental): Connection handling is now dispatched from the listener event loop into a fixed-size worker thread pool (`src/http/worker_pool.zig`). Accepted sockets are queued with bounded capacity and processed by workers so blocking upstream calls no longer stall the listener loop.
 Decision: shared mutable runtime components (rate limiter, idempotency cache, session store, circuit breaker, metrics) are synchronized behind gateway state locks to preserve existing behavior while enabling concurrent request execution.
-Decision: queue dispatch currently uses a single shared queue (basic balancing by first available worker). Work stealing and advanced scheduling remain open follow-up work under 2.3.
+Resolved: worker queueing now uses per-worker queues with least-loaded submit selection and worker-side stealing when local queues are empty. This provides basic load balancing and reduces head-of-line blocking from single-queue dispatch contention.
 Resolved: worker shutdown now supports graceful draining; when drain mode is enabled, pool shutdown waits for queued and in-flight connection jobs to finish before joining worker threads.
 
 ### 2.4 Memory Management

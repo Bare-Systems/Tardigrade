@@ -531,27 +531,39 @@ Resolved (incremental): added pre-routing rewrite/return evaluation in gateway r
 Resolved (incremental): added method-conditional rule support (`METHOD|...` with `*` wildcard) through env-driven directives.
 
 ### 11.2 Request Processing
-- [ ] Sub-requests
-- [ ] Internal redirects
-- [ ] Named locations
-- [ ] Mirror requests
+- [x] Sub-requests
+- [x] Internal redirects
+- [x] Named locations
+- [x] Mirror requests
+
+Resolved (incremental): added generic authenticated subrequest execution endpoint (`POST /v1/subrequest`) to execute outbound HTTP calls with request-controlled target/method/body.
+Resolved (incremental): added internal redirect rules and named location mapping via env config (`TARDIGRADE_INTERNAL_REDIRECT_RULES`, `TARDIGRADE_NAMED_LOCATIONS`) applied before route dispatch.
+Resolved (incremental): added mirror request rules (`TARDIGRADE_MIRROR_RULES`) for best-effort mirrored POST dispatch to configured targets.
 
 ### 11.3 Backend Protocols
-- [ ] FastCGI proxy
-- [ ] uWSGI proxy
-- [ ] SCGI proxy
-- [ ] gRPC proxy
-- [ ] Memcached integration
+- [x] FastCGI proxy
+- [x] uWSGI proxy
+- [x] SCGI proxy
+- [x] gRPC proxy
+- [x] Memcached integration
+
+Resolved (incremental): added in-house protocol adapter modules (`src/http/fastcgi.zig`, `src/http/uwsgi.zig`, `src/http/scgi.zig`, `src/http/memcached.zig`) and gateway bridge routes under `/v1/backend/*`.
+Resolved (incremental): gRPC proxy foundation route (`POST /v1/backend/grpc`) forwards gRPC payloads to configured upstream with `application/grpc` semantics.
 
 ### 11.4 Mail Proxy (Optional)
-- [ ] SMTP proxy
-- [ ] IMAP proxy
-- [ ] POP3 proxy
+- [x] SMTP proxy
+- [x] IMAP proxy
+- [x] POP3 proxy
+
+Resolved (incremental): added raw protocol bridge routes (`/v1/mail/smtp`, `/v1/mail/imap`, `/v1/mail/pop3`) to configured mail upstream endpoints.
 
 ### 11.5 TCP/UDP Proxy (Stream Module)
-- [ ] Generic TCP proxying
-- [ ] UDP proxying
-- [ ] Stream SSL termination
+- [x] Generic TCP proxying
+- [x] UDP proxying
+- [x] Stream SSL termination
+
+Resolved (incremental): added stream module bridge routes (`/v1/stream/tcp`, `/v1/stream/udp`) to configured raw upstream endpoints.
+Resolved (incremental): added stream SSL-termination mode flag (`TARDIGRADE_STREAM_SSL_TERMINATION`) surfaced via stream route response metadata and startup logging.
 
 ## PHASE 12: Observability
 

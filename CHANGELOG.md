@@ -19,6 +19,11 @@
   - Added regex-based rewrite rule engine with support for `last`, `break`, `redirect`, and `permanent` flags.
   - Added regex-based return directives for short-circuit responses before normal route dispatch.
   - Added method-conditional rewrite/return matching (`METHOD` or `*`) and new env directives `TARDIGRADE_REWRITE_RULES` / `TARDIGRADE_RETURN_RULES`.
+- Phase 11 request-processing and protocol-bridge completion increment (`src/edge_config.zig`, `src/edge_gateway.zig`, `src/http/fastcgi.zig`, `src/http/uwsgi.zig`, `src/http/scgi.zig`, `src/http/memcached.zig`):
+  - Added subrequest endpoint (`POST /v1/subrequest`), internal redirect rules, named location mapping, and mirror request rules.
+  - Added backend bridge routes for FastCGI, uWSGI, SCGI, gRPC, and Memcached under `/v1/backend/*`.
+  - Added optional mail proxy bridge routes for SMTP/IMAP/POP3 under `/v1/mail/*`.
+  - Added stream-module bridge routes for TCP/UDP under `/v1/stream/*` and stream SSL-termination mode flag/config.
 
 ## [0.28.0] - 2026-03-07
 

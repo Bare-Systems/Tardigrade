@@ -45,6 +45,20 @@ pub const EdgeConfig = struct {
     };
     pub const RewriteRule = http.rewrite.RewriteRule;
     pub const ReturnRule = http.rewrite.ReturnRule;
+    pub const InternalRedirectRule = struct {
+        method: []const u8,
+        pattern: []const u8,
+        target: []const u8,
+    };
+    pub const NamedLocation = struct {
+        name: []const u8,
+        path: []const u8,
+    };
+    pub const MirrorRule = struct {
+        method: []const u8,
+        pattern: []const u8,
+        target_url: []const u8,
+    };
 
     listen_host: []const u8,
     listen_port: u16,
@@ -230,6 +244,34 @@ pub const EdgeConfig = struct {
     rewrite_rules: []RewriteRule,
     /// Return rules evaluated after rewrites and before route dispatch.
     return_rules: []ReturnRule,
+    /// Internal redirect rules evaluated before route dispatch.
+    internal_redirect_rules: []InternalRedirectRule,
+    /// Named location map for redirect targets prefixed with '@'.
+    named_locations: []NamedLocation,
+    /// Mirror request rules (best-effort asynchronous copies).
+    mirror_rules: []MirrorRule,
+    /// FastCGI upstream endpoint (`host:port`).
+    fastcgi_upstream: []const u8,
+    /// uWSGI upstream endpoint (`host:port`).
+    uwsgi_upstream: []const u8,
+    /// SCGI upstream endpoint (`host:port`).
+    scgi_upstream: []const u8,
+    /// gRPC upstream base URL (`http://host:port`).
+    grpc_upstream: []const u8,
+    /// Memcached endpoint (`host:port`).
+    memcached_upstream: []const u8,
+    /// SMTP upstream endpoint (`host:port`).
+    smtp_upstream: []const u8,
+    /// IMAP upstream endpoint (`host:port`).
+    imap_upstream: []const u8,
+    /// POP3 upstream endpoint (`host:port`).
+    pop3_upstream: []const u8,
+    /// Generic TCP proxy upstream endpoint (`host:port`).
+    tcp_proxy_upstream: []const u8,
+    /// Generic UDP proxy upstream endpoint (`host:port`).
+    udp_proxy_upstream: []const u8,
+    /// Enable stream-module SSL termination mode for stream proxy routes.
+    stream_ssl_termination: bool,
 
     pub fn deinit(self: *EdgeConfig, allocator: std.mem.Allocator) void {
         allocator.free(self.listen_host);
@@ -303,6 +345,33 @@ pub const EdgeConfig = struct {
             allocator.free(rule.body);
         }
         allocator.free(self.return_rules);
+        for (self.internal_redirect_rules) |rule| {
+            allocator.free(rule.method);
+            allocator.free(rule.pattern);
+            allocator.free(rule.target);
+        }
+        allocator.free(self.internal_redirect_rules);
+        for (self.named_locations) |entry| {
+            allocator.free(entry.name);
+            allocator.free(entry.path);
+        }
+        allocator.free(self.named_locations);
+        for (self.mirror_rules) |rule| {
+            allocator.free(rule.method);
+            allocator.free(rule.pattern);
+            allocator.free(rule.target_url);
+        }
+        allocator.free(self.mirror_rules);
+        allocator.free(self.fastcgi_upstream);
+        allocator.free(self.uwsgi_upstream);
+        allocator.free(self.scgi_upstream);
+        allocator.free(self.grpc_upstream);
+        allocator.free(self.memcached_upstream);
+        allocator.free(self.smtp_upstream);
+        allocator.free(self.imap_upstream);
+        allocator.free(self.pop3_upstream);
+        allocator.free(self.tcp_proxy_upstream);
+        allocator.free(self.udp_proxy_upstream);
         self.* = undefined;
     }
 };
@@ -724,6 +793,59 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         }
         allocator.free(return_rules);
     }
+    const internal_redirects_raw = envOrDefault(allocator, "TARDIGRADE_INTERNAL_REDIRECT_RULES", "") catch unreachable;
+    defer allocator.free(internal_redirects_raw);
+    const internal_redirect_rules = try parseInternalRedirectRules(allocator, internal_redirects_raw);
+    errdefer {
+        for (internal_redirect_rules) |rule| {
+            allocator.free(rule.method);
+            allocator.free(rule.pattern);
+            allocator.free(rule.target);
+        }
+        allocator.free(internal_redirect_rules);
+    }
+    const named_locations_raw = envOrDefault(allocator, "TARDIGRADE_NAMED_LOCATIONS", "") catch unreachable;
+    defer allocator.free(named_locations_raw);
+    const named_locations = try parseNamedLocations(allocator, named_locations_raw);
+    errdefer {
+        for (named_locations) |entry| {
+            allocator.free(entry.name);
+            allocator.free(entry.path);
+        }
+        allocator.free(named_locations);
+    }
+    const mirror_rules_raw = envOrDefault(allocator, "TARDIGRADE_MIRROR_RULES", "") catch unreachable;
+    defer allocator.free(mirror_rules_raw);
+    const mirror_rules = try parseMirrorRules(allocator, mirror_rules_raw);
+    errdefer {
+        for (mirror_rules) |rule| {
+            allocator.free(rule.method);
+            allocator.free(rule.pattern);
+            allocator.free(rule.target_url);
+        }
+        allocator.free(mirror_rules);
+    }
+    const fastcgi_upstream = envOrDefault(allocator, "TARDIGRADE_FASTCGI_UPSTREAM", "") catch unreachable;
+    errdefer allocator.free(fastcgi_upstream);
+    const uwsgi_upstream = envOrDefault(allocator, "TARDIGRADE_UWSGI_UPSTREAM", "") catch unreachable;
+    errdefer allocator.free(uwsgi_upstream);
+    const scgi_upstream = envOrDefault(allocator, "TARDIGRADE_SCGI_UPSTREAM", "") catch unreachable;
+    errdefer allocator.free(scgi_upstream);
+    const grpc_upstream = envOrDefault(allocator, "TARDIGRADE_GRPC_UPSTREAM", "") catch unreachable;
+    errdefer allocator.free(grpc_upstream);
+    const memcached_upstream = envOrDefault(allocator, "TARDIGRADE_MEMCACHED_UPSTREAM", "") catch unreachable;
+    errdefer allocator.free(memcached_upstream);
+    const smtp_upstream = envOrDefault(allocator, "TARDIGRADE_SMTP_UPSTREAM", "") catch unreachable;
+    errdefer allocator.free(smtp_upstream);
+    const imap_upstream = envOrDefault(allocator, "TARDIGRADE_IMAP_UPSTREAM", "") catch unreachable;
+    errdefer allocator.free(imap_upstream);
+    const pop3_upstream = envOrDefault(allocator, "TARDIGRADE_POP3_UPSTREAM", "") catch unreachable;
+    errdefer allocator.free(pop3_upstream);
+    const tcp_proxy_upstream = envOrDefault(allocator, "TARDIGRADE_TCP_PROXY_UPSTREAM", "") catch unreachable;
+    errdefer allocator.free(tcp_proxy_upstream);
+    const udp_proxy_upstream = envOrDefault(allocator, "TARDIGRADE_UDP_PROXY_UPSTREAM", "") catch unreachable;
+    errdefer allocator.free(udp_proxy_upstream);
+    const stream_ssl_termination = parseBoolEnv(allocator, "TARDIGRADE_STREAM_SSL_TERMINATION", false);
 
     return .{
         .listen_host = listen_host,
@@ -845,6 +967,20 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .sse_idle_timeout_ms = sse_idle_timeout_ms,
         .rewrite_rules = rewrite_rules,
         .return_rules = return_rules,
+        .internal_redirect_rules = internal_redirect_rules,
+        .named_locations = named_locations,
+        .mirror_rules = mirror_rules,
+        .fastcgi_upstream = fastcgi_upstream,
+        .uwsgi_upstream = uwsgi_upstream,
+        .scgi_upstream = scgi_upstream,
+        .grpc_upstream = grpc_upstream,
+        .memcached_upstream = memcached_upstream,
+        .smtp_upstream = smtp_upstream,
+        .imap_upstream = imap_upstream,
+        .pop3_upstream = pop3_upstream,
+        .tcp_proxy_upstream = tcp_proxy_upstream,
+        .udp_proxy_upstream = udp_proxy_upstream,
+        .stream_ssl_termination = stream_ssl_termination,
     };
 }
 
@@ -1047,6 +1183,98 @@ fn parseReturnRules(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeConfig
     return out.toOwnedSlice();
 }
 
+fn parseInternalRedirectRules(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeConfig.InternalRedirectRule {
+    var out = std.ArrayList(EdgeConfig.InternalRedirectRule).init(allocator);
+    errdefer {
+        for (out.items) |rule| {
+            allocator.free(rule.method);
+            allocator.free(rule.pattern);
+            allocator.free(rule.target);
+        }
+        out.deinit();
+    }
+
+    var it = std.mem.splitScalar(u8, raw, ';');
+    while (it.next()) |entry| {
+        const trimmed = std.mem.trim(u8, entry, " \t\r\n");
+        if (trimmed.len == 0) continue;
+        var fields = std.mem.splitScalar(u8, trimmed, '|');
+        const method_raw = fields.next() orelse return error.InvalidInternalRedirectRuleFormat;
+        const pattern_raw = fields.next() orelse return error.InvalidInternalRedirectRuleFormat;
+        const target_raw = fields.next() orelse return error.InvalidInternalRedirectRuleFormat;
+        if (fields.next() != null) return error.InvalidInternalRedirectRuleFormat;
+        const method = std.mem.trim(u8, method_raw, " \t\r\n");
+        const pattern = std.mem.trim(u8, pattern_raw, " \t\r\n");
+        const target = std.mem.trim(u8, target_raw, " \t\r\n");
+        if (method.len == 0 or pattern.len == 0 or target.len == 0) return error.InvalidInternalRedirectRuleFormat;
+        try out.append(.{
+            .method = try allocator.dupe(u8, method),
+            .pattern = try allocator.dupe(u8, pattern),
+            .target = try allocator.dupe(u8, target),
+        });
+    }
+    return out.toOwnedSlice();
+}
+
+fn parseNamedLocations(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeConfig.NamedLocation {
+    var out = std.ArrayList(EdgeConfig.NamedLocation).init(allocator);
+    errdefer {
+        for (out.items) |entry| {
+            allocator.free(entry.name);
+            allocator.free(entry.path);
+        }
+        out.deinit();
+    }
+
+    var it = std.mem.splitScalar(u8, raw, ';');
+    while (it.next()) |entry_raw| {
+        const entry = std.mem.trim(u8, entry_raw, " \t\r\n");
+        if (entry.len == 0) continue;
+        const sep = std.mem.indexOfScalar(u8, entry, '|') orelse return error.InvalidNamedLocationFormat;
+        const name = std.mem.trim(u8, entry[0..sep], " \t\r\n");
+        const path = std.mem.trim(u8, entry[sep + 1 ..], " \t\r\n");
+        if (name.len == 0 or path.len == 0) return error.InvalidNamedLocationFormat;
+        try out.append(.{
+            .name = try allocator.dupe(u8, name),
+            .path = try allocator.dupe(u8, path),
+        });
+    }
+    return out.toOwnedSlice();
+}
+
+fn parseMirrorRules(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeConfig.MirrorRule {
+    var out = std.ArrayList(EdgeConfig.MirrorRule).init(allocator);
+    errdefer {
+        for (out.items) |rule| {
+            allocator.free(rule.method);
+            allocator.free(rule.pattern);
+            allocator.free(rule.target_url);
+        }
+        out.deinit();
+    }
+
+    var it = std.mem.splitScalar(u8, raw, ';');
+    while (it.next()) |entry| {
+        const trimmed = std.mem.trim(u8, entry, " \t\r\n");
+        if (trimmed.len == 0) continue;
+        var fields = std.mem.splitScalar(u8, trimmed, '|');
+        const method_raw = fields.next() orelse return error.InvalidMirrorRuleFormat;
+        const pattern_raw = fields.next() orelse return error.InvalidMirrorRuleFormat;
+        const target_raw = fields.next() orelse return error.InvalidMirrorRuleFormat;
+        if (fields.next() != null) return error.InvalidMirrorRuleFormat;
+        const method = std.mem.trim(u8, method_raw, " \t\r\n");
+        const pattern = std.mem.trim(u8, pattern_raw, " \t\r\n");
+        const target = std.mem.trim(u8, target_raw, " \t\r\n");
+        if (method.len == 0 or pattern.len == 0 or target.len == 0) return error.InvalidMirrorRuleFormat;
+        try out.append(.{
+            .method = try allocator.dupe(u8, method),
+            .pattern = try allocator.dupe(u8, pattern),
+            .target_url = try allocator.dupe(u8, target),
+        });
+    }
+    return out.toOwnedSlice();
+}
+
 fn parseTlsSniCerts(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeConfig.TlsSniCert {
     var out = std.ArrayList(EdgeConfig.TlsSniCert).init(allocator);
     errdefer {
@@ -1156,4 +1384,48 @@ test "parse return rules csv" {
     try std.testing.expectEqual(@as(usize, 2), rules.len);
     try std.testing.expectEqual(@as(u16, 204), rules[0].status);
     try std.testing.expectEqualStrings("blocked", rules[1].body);
+}
+
+test "parse internal redirect rules csv" {
+    const allocator = std.testing.allocator;
+    const rules = try parseInternalRedirectRules(allocator, "GET|^/a$|/b;*|^/x$|@named");
+    defer {
+        for (rules) |rule| {
+            allocator.free(rule.method);
+            allocator.free(rule.pattern);
+            allocator.free(rule.target);
+        }
+        allocator.free(rules);
+    }
+    try std.testing.expectEqual(@as(usize, 2), rules.len);
+    try std.testing.expectEqualStrings("@named", rules[1].target);
+}
+
+test "parse named locations csv" {
+    const allocator = std.testing.allocator;
+    const entries = try parseNamedLocations(allocator, "admin|/v1/chat;metrics|/metrics");
+    defer {
+        for (entries) |entry| {
+            allocator.free(entry.name);
+            allocator.free(entry.path);
+        }
+        allocator.free(entries);
+    }
+    try std.testing.expectEqual(@as(usize, 2), entries.len);
+    try std.testing.expectEqualStrings("metrics", entries[1].name);
+}
+
+test "parse mirror rules csv" {
+    const allocator = std.testing.allocator;
+    const rules = try parseMirrorRules(allocator, "POST|^/v1/chat$|http://127.0.0.1:9000/mirror");
+    defer {
+        for (rules) |rule| {
+            allocator.free(rule.method);
+            allocator.free(rule.pattern);
+            allocator.free(rule.target_url);
+        }
+        allocator.free(rules);
+    }
+    try std.testing.expectEqual(@as(usize, 1), rules.len);
+    try std.testing.expectEqualStrings("POST", rules[0].method);
 }

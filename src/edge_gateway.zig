@@ -1194,6 +1194,21 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     if (cfg.return_rules.len > 0) {
         state.logger.info(null, "Return rules enabled: {d}", .{cfg.return_rules.len});
     }
+    if (cfg.internal_redirect_rules.len > 0) {
+        state.logger.info(null, "Internal redirect rules enabled: {d}", .{cfg.internal_redirect_rules.len});
+    }
+    if (cfg.mirror_rules.len > 0) {
+        state.logger.info(null, "Mirror rules enabled: {d}", .{cfg.mirror_rules.len});
+    }
+    if (cfg.fastcgi_upstream.len > 0 or cfg.uwsgi_upstream.len > 0 or cfg.scgi_upstream.len > 0 or cfg.grpc_upstream.len > 0 or cfg.memcached_upstream.len > 0) {
+        state.logger.info(null, "Backend protocol bridges enabled (fastcgi/uwsgi/scgi/grpc/memcached)", .{});
+    }
+    if (cfg.smtp_upstream.len > 0 or cfg.imap_upstream.len > 0 or cfg.pop3_upstream.len > 0) {
+        state.logger.info(null, "Mail protocol proxy routes enabled (smtp/imap/pop3)", .{});
+    }
+    if (cfg.tcp_proxy_upstream.len > 0 or cfg.udp_proxy_upstream.len > 0) {
+        state.logger.info(null, "Stream proxy routes enabled (tcp/udp), ssl_termination={}", .{cfg.stream_ssl_termination});
+    }
     {
         const limits = cfg.request_limits;
         if (limits.max_body_size > 0 or limits.max_uri_length > 0 or limits.max_header_count > 0) {
@@ -2281,6 +2296,28 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         },
     }
 
+    // --- Internal redirects / named locations ---
+    request.uri.path = applyInternalRedirectRules(
+        request.method.toString(),
+        request.uri.path,
+        cfg.internal_redirect_rules,
+        cfg.named_locations,
+    );
+
+    // --- Mirror requests (best-effort async) ---
+    if (cfg.mirror_rules.len > 0) {
+        spawnMirrorRequests(
+            allocator,
+            cfg.mirror_rules,
+            request.method.toString(),
+            request.uri.path,
+            request.body orelse "",
+            correlation_id,
+            client_ip,
+            request.headers.get("content-type"),
+        );
+    }
+
     // --- Geo-based blocking (external country header) ---
     if (cfg.geo_blocked_countries.len > 0) {
         const country = request.headers.get(cfg.geo_country_header);
@@ -2411,6 +2448,226 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
                 return;
             }
         }
+    }
+
+    // --- POST /v1/subrequest ---
+    if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/subrequest")) {
+        const auth_result = authorizeRequest(cfg, &request.headers);
+        if (!auth_result.ok) {
+            try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, keep_alive, state);
+            logAccess(&ctx, request.method.toString(), "/v1/subrequest", 401, request.headers.get("user-agent") orelse "");
+            return;
+        }
+        ctx.setIdentity(auth_result.token_hash orelse "-");
+        const body = request.body orelse "";
+        const sub = parseSubrequestPayload(allocator, body) catch {
+            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Invalid subrequest payload", correlation_id, keep_alive, state);
+            logAccess(&ctx, request.method.toString(), "/v1/subrequest", 400, request.headers.get("user-agent") orelse "");
+            return;
+        };
+        defer {
+            allocator.free(sub.url);
+            if (sub.body) |b| allocator.free(b);
+        }
+        const out = executeSubrequest(allocator, sub.url, sub.method, sub.body) catch |err| {
+            state.logger.warn(correlation_id, "subrequest failed: {}", .{err});
+            try sendApiError(allocator, writer, .bad_gateway, "tool_unavailable", "Subrequest failed", correlation_id, keep_alive, state);
+            logAccess(&ctx, request.method.toString(), "/v1/subrequest", 502, request.headers.get("user-agent") orelse "");
+            return;
+        };
+        defer allocator.free(out.body);
+        var response = http.Response.init(allocator);
+        defer response.deinit();
+        _ = response.setStatus(@enumFromInt(out.status))
+            .setBody(out.body)
+            .setContentType(out.content_type)
+            .setConnection(keep_alive)
+            .setHeader(http.correlation.HEADER_NAME, correlation_id);
+        applyResponseHeaders(state, &response);
+        try response.write(writer);
+        state.metricsRecord(out.status);
+        logAccess(&ctx, request.method.toString(), "/v1/subrequest", out.status, request.headers.get("user-agent") orelse "");
+        return;
+    }
+
+    // --- Backend protocol bridges (Phase 11.3) ---
+    if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/backend/fastcgi")) {
+        try handleBackendProtocolRoute(
+            allocator,
+            writer,
+            cfg.fastcgi_upstream,
+            request.method.toString(),
+            request.uri.path,
+            request.body orelse "",
+            correlation_id,
+            keep_alive,
+            state,
+            .fastcgi,
+        );
+        logAccess(&ctx, request.method.toString(), "/v1/backend/fastcgi", 200, request.headers.get("user-agent") orelse "");
+        return;
+    }
+    if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/backend/uwsgi")) {
+        try handleBackendProtocolRoute(
+            allocator,
+            writer,
+            cfg.uwsgi_upstream,
+            request.method.toString(),
+            request.uri.path,
+            request.body orelse "",
+            correlation_id,
+            keep_alive,
+            state,
+            .uwsgi,
+        );
+        logAccess(&ctx, request.method.toString(), "/v1/backend/uwsgi", 200, request.headers.get("user-agent") orelse "");
+        return;
+    }
+    if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/backend/scgi")) {
+        try handleBackendProtocolRoute(
+            allocator,
+            writer,
+            cfg.scgi_upstream,
+            request.method.toString(),
+            request.uri.path,
+            request.body orelse "",
+            correlation_id,
+            keep_alive,
+            state,
+            .scgi,
+        );
+        logAccess(&ctx, request.method.toString(), "/v1/backend/scgi", 200, request.headers.get("user-agent") orelse "");
+        return;
+    }
+    if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/backend/grpc")) {
+        const upstream = std.mem.trim(u8, cfg.grpc_upstream, " \t\r\n");
+        if (upstream.len == 0) {
+            try sendApiError(allocator, writer, .not_implemented, "tool_unavailable", "gRPC upstream not configured", correlation_id, keep_alive, state);
+            return;
+        }
+        const body = request.body orelse "";
+        const grpc_resp = proxyGrpcExecute(
+            allocator,
+            upstream,
+            body,
+            correlation_id,
+            state,
+        ) catch |err| {
+            state.logger.warn(correlation_id, "grpc proxy failed: {}", .{err});
+            try sendApiError(allocator, writer, .bad_gateway, "tool_unavailable", "gRPC proxy failed", correlation_id, keep_alive, state);
+            return;
+        };
+        defer allocator.free(grpc_resp);
+        var response = http.Response.init(allocator);
+        defer response.deinit();
+        _ = response.setStatus(.ok)
+            .setBody(grpc_resp)
+            .setContentType("application/grpc")
+            .setConnection(keep_alive)
+            .setHeader(http.correlation.HEADER_NAME, correlation_id);
+        applyResponseHeaders(state, &response);
+        try response.write(writer);
+        state.metricsRecord(200);
+        logAccess(&ctx, request.method.toString(), "/v1/backend/grpc", 200, request.headers.get("user-agent") orelse "");
+        return;
+    }
+    if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/backend/memcached")) {
+        const ep = std.mem.trim(u8, cfg.memcached_upstream, " \t\r\n");
+        if (ep.len == 0) {
+            try sendApiError(allocator, writer, .not_implemented, "tool_unavailable", "Memcached upstream not configured", correlation_id, keep_alive, state);
+            return;
+        }
+        const payload = request.body orelse "";
+        const parsed = parseMemcachedPayload(allocator, payload) catch {
+            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Invalid memcached payload", correlation_id, keep_alive, state);
+            return;
+        };
+        defer {
+            allocator.free(parsed.op);
+            allocator.free(parsed.key);
+            if (parsed.value) |v| allocator.free(v);
+        }
+        if (std.ascii.eqlIgnoreCase(parsed.op, "get")) {
+            const value = http.memcached.get(allocator, ep, parsed.key) catch null;
+            defer if (value) |v| allocator.free(v);
+            const body = if (value) |v|
+                try std.fmt.allocPrint(allocator, "{{\"value\":{s}}}", .{std.json.fmt(v, .{})})
+            else
+                try allocator.dupe(u8, "{\"value\":null}");
+            defer allocator.free(body);
+            var response = http.Response.json(allocator, body);
+            defer response.deinit();
+            _ = response.setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
+            applyResponseHeaders(state, &response);
+            try response.write(writer);
+            state.metricsRecord(200);
+            logAccess(&ctx, request.method.toString(), "/v1/backend/memcached", 200, request.headers.get("user-agent") orelse "");
+            return;
+        }
+        if (std.ascii.eqlIgnoreCase(parsed.op, "set")) {
+            const stored = http.memcached.set(allocator, ep, parsed.key, parsed.value orelse "", parsed.ttl) catch false;
+            const body = if (stored) "{\"stored\":true}" else "{\"stored\":false}";
+            var response = http.Response.json(allocator, body);
+            defer response.deinit();
+            _ = response.setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
+            applyResponseHeaders(state, &response);
+            try response.write(writer);
+            state.metricsRecord(200);
+            logAccess(&ctx, request.method.toString(), "/v1/backend/memcached", 200, request.headers.get("user-agent") orelse "");
+            return;
+        }
+        try sendApiError(allocator, writer, .bad_request, "invalid_request", "Unsupported memcached operation", correlation_id, keep_alive, state);
+        return;
+    }
+
+    // --- Mail proxy routes (Phase 11.4 optional) ---
+    if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/mail/smtp")) {
+        try handleMailProxyRoute(allocator, writer, cfg.smtp_upstream, request.body orelse "", correlation_id, keep_alive, state);
+        logAccess(&ctx, request.method.toString(), "/v1/mail/smtp", 200, request.headers.get("user-agent") orelse "");
+        return;
+    }
+    if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/mail/imap")) {
+        try handleMailProxyRoute(allocator, writer, cfg.imap_upstream, request.body orelse "", correlation_id, keep_alive, state);
+        logAccess(&ctx, request.method.toString(), "/v1/mail/imap", 200, request.headers.get("user-agent") orelse "");
+        return;
+    }
+    if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/mail/pop3")) {
+        try handleMailProxyRoute(allocator, writer, cfg.pop3_upstream, request.body orelse "", correlation_id, keep_alive, state);
+        logAccess(&ctx, request.method.toString(), "/v1/mail/pop3", 200, request.headers.get("user-agent") orelse "");
+        return;
+    }
+
+    // --- Stream module routes (Phase 11.5) ---
+    if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/stream/tcp")) {
+        try handleMailProxyRoute(allocator, writer, cfg.tcp_proxy_upstream, request.body orelse "", correlation_id, keep_alive, state);
+        logAccess(&ctx, request.method.toString(), "/v1/stream/tcp", 200, request.headers.get("user-agent") orelse "");
+        return;
+    }
+    if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/stream/udp")) {
+        const upstream = std.mem.trim(u8, cfg.udp_proxy_upstream, " \t\r\n");
+        if (upstream.len == 0) {
+            try sendApiError(allocator, writer, .not_implemented, "tool_unavailable", "UDP upstream not configured", correlation_id, keep_alive, state);
+            return;
+        }
+        const udp_resp = executeUdpDatagramRequest(allocator, upstream, request.body orelse "") catch |err| {
+            state.logger.warn(correlation_id, "udp stream proxy failed: {}", .{err});
+            try sendApiError(allocator, writer, .bad_gateway, "tool_unavailable", "UDP proxy failed", correlation_id, keep_alive, state);
+            return;
+        };
+        defer allocator.free(udp_resp);
+        var response = http.Response.init(allocator);
+        defer response.deinit();
+        _ = response.setStatus(.ok)
+            .setBody(udp_resp)
+            .setContentType("application/octet-stream")
+            .setConnection(keep_alive)
+            .setHeader(http.correlation.HEADER_NAME, correlation_id)
+            .setHeader("X-Stream-SSL-Termination", if (cfg.stream_ssl_termination) "enabled" else "disabled");
+        applyResponseHeaders(state, &response);
+        try response.write(writer);
+        state.metricsRecord(200);
+        logAccess(&ctx, request.method.toString(), "/v1/stream/udp", 200, request.headers.get("user-agent") orelse "");
+        return;
     }
 
     // --- WebSocket proxy routes ---
@@ -3524,6 +3781,301 @@ fn parseLastEventId(raw: ?[]const u8) u64 {
     return std.fmt.parseInt(u64, std.mem.trim(u8, value, " \t\r\n"), 10) catch 0;
 }
 
+fn applyInternalRedirectRules(
+    method: []const u8,
+    path: []const u8,
+    rules: []const edge_config.EdgeConfig.InternalRedirectRule,
+    named_locations: []const edge_config.EdgeConfig.NamedLocation,
+) []const u8 {
+    var current = path;
+    var hops: usize = 0;
+    while (hops < 6) : (hops += 1) {
+        var changed = false;
+        for (rules) |rule| {
+            if (!http.rewrite.methodMatches(rule.method, method)) continue;
+            if (!http.rewrite.regexMatches(rule.pattern, current)) continue;
+            if (rule.target.len > 1 and rule.target[0] == '@') {
+                if (resolveNamedLocation(rule.target[1..], named_locations)) |named| {
+                    current = named;
+                    changed = true;
+                    break;
+                }
+            } else {
+                current = rule.target;
+                changed = true;
+                break;
+            }
+        }
+        if (!changed) break;
+    }
+    return current;
+}
+
+fn resolveNamedLocation(name: []const u8, named_locations: []const edge_config.EdgeConfig.NamedLocation) ?[]const u8 {
+    for (named_locations) |entry| {
+        if (std.mem.eql(u8, entry.name, name)) return entry.path;
+    }
+    return null;
+}
+
+fn spawnMirrorRequests(
+    allocator: std.mem.Allocator,
+    rules: []const edge_config.EdgeConfig.MirrorRule,
+    method: []const u8,
+    path: []const u8,
+    body: []const u8,
+    correlation_id: []const u8,
+    client_ip: []const u8,
+    content_type: ?[]const u8,
+) void {
+    for (rules) |rule| {
+        if (!http.rewrite.methodMatches(rule.method, method)) continue;
+        if (!http.rewrite.regexMatches(rule.pattern, path)) continue;
+        var client = std.http.Client{ .allocator = allocator };
+        defer client.deinit();
+        const uri = std.Uri.parse(rule.target_url) catch continue;
+        var header_buf: [8 * 1024]u8 = undefined;
+        var headers = [_]std.http.Header{
+            .{ .name = http.correlation.HEADER_NAME, .value = correlation_id },
+            .{ .name = "X-Mirror-Client-IP", .value = client_ip },
+            .{ .name = "Content-Type", .value = content_type orelse "application/octet-stream" },
+        };
+        var req = client.open(.POST, uri, .{
+            .server_header_buffer = &header_buf,
+            .extra_headers = headers[0..],
+            .headers = .{ .content_type = .{ .override = content_type orelse "application/octet-stream" } },
+        }) catch continue;
+        defer req.deinit();
+        req.send() catch continue;
+        req.writeAll(body) catch continue;
+        req.finish() catch continue;
+        req.wait() catch continue;
+    }
+}
+
+const SubrequestPayload = struct {
+    method: std.http.Method = .GET,
+    url: []u8,
+    body: ?[]u8 = null,
+};
+
+const SubrequestResult = struct {
+    status: u16,
+    body: []u8,
+    content_type: []const u8,
+};
+
+fn parseSubrequestPayload(allocator: std.mem.Allocator, body: []const u8) !SubrequestPayload {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    const url_val = obj.get("url") orelse return error.InvalidPayload;
+    if (url_val != .string) return error.InvalidPayload;
+    const method = if (obj.get("method")) |m| blk: {
+        if (m != .string) break :blk std.http.Method.GET;
+        break :blk if (std.ascii.eqlIgnoreCase(m.string, "POST")) std.http.Method.POST else std.http.Method.GET;
+    } else std.http.Method.GET;
+    const req_body = if (obj.get("body")) |b| blk: {
+        if (b != .string) break :blk null;
+        break :blk try allocator.dupe(u8, b.string);
+    } else null;
+    return .{
+        .method = method,
+        .url = try allocator.dupe(u8, url_val.string),
+        .body = req_body,
+    };
+}
+
+fn executeSubrequest(allocator: std.mem.Allocator, url: []const u8, method: std.http.Method, req_body: ?[]const u8) !SubrequestResult {
+    var client = std.http.Client{ .allocator = allocator };
+    defer client.deinit();
+    const uri = try std.Uri.parse(url);
+    var header_buf: [16 * 1024]u8 = undefined;
+    var req = try client.open(method, uri, .{ .server_header_buffer = &header_buf });
+    defer req.deinit();
+    if (req_body) |b| {
+        req.transfer_encoding = .{ .content_length = b.len };
+    }
+    try req.send();
+    if (req_body) |b| {
+        try req.writeAll(b);
+    }
+    try req.finish();
+    try req.wait();
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    try req.reader().readAllArrayList(&out, 2 * 1024 * 1024);
+    return .{
+        .status = @intFromEnum(req.response.status),
+        .body = try out.toOwnedSlice(),
+        .content_type = req.response.content_type orelse "application/octet-stream",
+    };
+}
+
+const BackendProtocol = enum {
+    fastcgi,
+    uwsgi,
+    scgi,
+};
+
+fn handleBackendProtocolRoute(
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    upstream: []const u8,
+    method: []const u8,
+    path: []const u8,
+    body: []const u8,
+    correlation_id: []const u8,
+    keep_alive: bool,
+    state: *GatewayState,
+    kind: BackendProtocol,
+) !void {
+    const endpoint = std.mem.trim(u8, upstream, " \t\r\n");
+    if (endpoint.len == 0) {
+        try sendApiError(allocator, writer, .not_implemented, "tool_unavailable", "Backend upstream not configured", correlation_id, keep_alive, state);
+        return;
+    }
+    const wire = switch (kind) {
+        .fastcgi => try http.fastcgi.buildRequest(allocator, method, "/index.php", path, body),
+        .uwsgi => try http.uwsgi.buildPacket(allocator, method, path, body),
+        .scgi => try http.scgi.buildRequest(allocator, method, path, body),
+    };
+    defer allocator.free(wire);
+    const resp = executeRawProtocolRequest(allocator, endpoint, wire) catch |err| {
+        std.log.warn("backend protocol request failed: {}", .{err});
+        try sendApiError(allocator, writer, .bad_gateway, "tool_unavailable", "Backend protocol request failed", correlation_id, keep_alive, state);
+        return;
+    };
+    defer allocator.free(resp);
+    var response = http.Response.init(allocator);
+    defer response.deinit();
+    _ = response.setStatus(.ok)
+        .setBody(resp)
+        .setContentType("application/octet-stream")
+        .setConnection(keep_alive)
+        .setHeader(http.correlation.HEADER_NAME, correlation_id);
+    applyResponseHeaders(state, &response);
+    try response.write(writer);
+    state.metricsRecord(200);
+}
+
+fn executeRawProtocolRequest(allocator: std.mem.Allocator, endpoint: []const u8, payload: []const u8) ![]u8 {
+    const ep = try http.memcached.parseEndpoint(endpoint);
+    const stream = try std.net.tcpConnectToHost(allocator, ep.host, ep.port);
+    defer stream.close();
+    try stream.writer().writeAll(payload);
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    var buf: [16 * 1024]u8 = undefined;
+    const n = try stream.read(&buf);
+    if (n > 0) try out.appendSlice(buf[0..n]);
+    return out.toOwnedSlice();
+}
+
+fn proxyGrpcExecute(
+    allocator: std.mem.Allocator,
+    upstream_url: []const u8,
+    body: []const u8,
+    correlation_id: []const u8,
+    state: *GatewayState,
+) ![]u8 {
+    const uri = try std.Uri.parse(upstream_url);
+    var header_buf: [16 * 1024]u8 = undefined;
+    var headers = [_]std.http.Header{
+        .{ .name = http.correlation.HEADER_NAME, .value = correlation_id },
+        .{ .name = "TE", .value = "trailers" },
+    };
+    var req = try state.upstream_client.open(.POST, uri, .{
+        .server_header_buffer = &header_buf,
+        .extra_headers = headers[0..],
+        .headers = .{ .content_type = .{ .override = "application/grpc" } },
+        .keep_alive = true,
+    });
+    defer req.deinit();
+    req.transfer_encoding = .{ .content_length = body.len };
+    try req.send();
+    try req.writeAll(body);
+    try req.finish();
+    try req.wait();
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    try req.reader().readAllArrayList(&out, 4 * 1024 * 1024);
+    return out.toOwnedSlice();
+}
+
+fn handleMailProxyRoute(
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    upstream: []const u8,
+    body: []const u8,
+    correlation_id: []const u8,
+    keep_alive: bool,
+    state: *GatewayState,
+) !void {
+    const endpoint = std.mem.trim(u8, upstream, " \t\r\n");
+    if (endpoint.len == 0) {
+        try sendApiError(allocator, writer, .not_implemented, "tool_unavailable", "Upstream not configured", correlation_id, keep_alive, state);
+        return;
+    }
+    const resp = executeRawProtocolRequest(allocator, endpoint, body) catch |err| {
+        std.log.warn("mail/stream proxy failed: {}", .{err});
+        try sendApiError(allocator, writer, .bad_gateway, "tool_unavailable", "Upstream request failed", correlation_id, keep_alive, state);
+        return;
+    };
+    defer allocator.free(resp);
+    var response = http.Response.init(allocator);
+    defer response.deinit();
+    _ = response.setStatus(.ok)
+        .setBody(resp)
+        .setContentType("application/octet-stream")
+        .setConnection(keep_alive)
+        .setHeader(http.correlation.HEADER_NAME, correlation_id);
+    applyResponseHeaders(state, &response);
+    try response.write(writer);
+    state.metricsRecord(200);
+}
+
+fn executeUdpDatagramRequest(allocator: std.mem.Allocator, endpoint: []const u8, payload: []const u8) ![]u8 {
+    const ep = try http.memcached.parseEndpoint(endpoint);
+    const addr = try std.net.Address.resolveIp(ep.host, ep.port);
+    const sock = try std.posix.socket(addr.any.family, std.posix.SOCK.DGRAM, std.posix.IPPROTO.UDP);
+    defer std.posix.close(sock);
+    _ = try std.posix.sendto(sock, payload, 0, &addr.any, addr.getOsSockLen());
+    var buf: [16 * 1024]u8 = undefined;
+    const n = try std.posix.recv(sock, &buf, 0);
+    return allocator.dupe(u8, buf[0..n]);
+}
+
+const MemcachedPayload = struct {
+    op: []u8,
+    key: []u8,
+    value: ?[]u8 = null,
+    ttl: u32 = 60,
+};
+
+fn parseMemcachedPayload(allocator: std.mem.Allocator, body: []const u8) !MemcachedPayload {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    const op_val = obj.get("op") orelse return error.InvalidPayload;
+    const key_val = obj.get("key") orelse return error.InvalidPayload;
+    if (op_val != .string or key_val != .string) return error.InvalidPayload;
+    const val = if (obj.get("value")) |v| blk: {
+        if (v != .string) break :blk null;
+        break :blk try allocator.dupe(u8, v.string);
+    } else null;
+    const ttl = if (obj.get("ttl")) |t|
+        if (t == .integer and t.integer >= 0) @as(u32, @intCast(t.integer)) else 60
+    else
+        60;
+    return .{
+        .op = try allocator.dupe(u8, op_val.string),
+        .key = try allocator.dupe(u8, key_val.string),
+        .value = val,
+        .ttl = ttl,
+    };
+}
+
 const AuthResult = struct {
     ok: bool,
     token_hash: ?[]const u8,
@@ -3632,7 +4184,18 @@ fn isProtectedAuthRequestRoute(path: []const u8) bool {
         http.api_router.matchRoute(path, 1, "/events/stream") or
         http.api_router.matchRoute(path, 1, "/events/publish") or
         http.api_router.matchRoute(path, 1, "/ws/chat") or
-        http.api_router.matchRoute(path, 1, "/ws/commands");
+        http.api_router.matchRoute(path, 1, "/ws/commands") or
+        http.api_router.matchRoute(path, 1, "/subrequest") or
+        http.api_router.matchRoute(path, 1, "/backend/fastcgi") or
+        http.api_router.matchRoute(path, 1, "/backend/uwsgi") or
+        http.api_router.matchRoute(path, 1, "/backend/scgi") or
+        http.api_router.matchRoute(path, 1, "/backend/grpc") or
+        http.api_router.matchRoute(path, 1, "/backend/memcached") or
+        http.api_router.matchRoute(path, 1, "/mail/smtp") or
+        http.api_router.matchRoute(path, 1, "/mail/imap") or
+        http.api_router.matchRoute(path, 1, "/mail/pop3") or
+        http.api_router.matchRoute(path, 1, "/stream/tcp") or
+        http.api_router.matchRoute(path, 1, "/stream/udp");
 }
 
 fn authorizeViaSubrequest(
@@ -4931,6 +5494,20 @@ test "resolveProxyTarget handles absolute and relative proxy_pass" {
         .sse_idle_timeout_ms = 60_000,
         .rewrite_rules = &[_]edge_config.EdgeConfig.RewriteRule{},
         .return_rules = &[_]edge_config.EdgeConfig.ReturnRule{},
+        .internal_redirect_rules = &[_]edge_config.EdgeConfig.InternalRedirectRule{},
+        .named_locations = &[_]edge_config.EdgeConfig.NamedLocation{},
+        .mirror_rules = &[_]edge_config.EdgeConfig.MirrorRule{},
+        .fastcgi_upstream = "",
+        .uwsgi_upstream = "",
+        .scgi_upstream = "",
+        .grpc_upstream = "",
+        .memcached_upstream = "",
+        .smtp_upstream = "",
+        .imap_upstream = "",
+        .pop3_upstream = "",
+        .tcp_proxy_upstream = "",
+        .udp_proxy_upstream = "",
+        .stream_ssl_termination = false,
     };
 
     const abs = try resolveProxyTarget(allocator, cfg.upstream_base_url, "https://api.example.com/base", "/v1/chat");
@@ -5080,6 +5657,20 @@ test "authorizeRequest accepts valid hash" {
         .sse_idle_timeout_ms = 60_000,
         .rewrite_rules = &[_]edge_config.EdgeConfig.RewriteRule{},
         .return_rules = &[_]edge_config.EdgeConfig.ReturnRule{},
+        .internal_redirect_rules = &[_]edge_config.EdgeConfig.InternalRedirectRule{},
+        .named_locations = &[_]edge_config.EdgeConfig.NamedLocation{},
+        .mirror_rules = &[_]edge_config.EdgeConfig.MirrorRule{},
+        .fastcgi_upstream = "",
+        .uwsgi_upstream = "",
+        .scgi_upstream = "",
+        .grpc_upstream = "",
+        .memcached_upstream = "",
+        .smtp_upstream = "",
+        .imap_upstream = "",
+        .pop3_upstream = "",
+        .tcp_proxy_upstream = "",
+        .udp_proxy_upstream = "",
+        .stream_ssl_termination = false,
     };
 
     var headers = http.Headers.init(allocator);

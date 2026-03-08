@@ -1,7 +1,7 @@
 
 # Changelog
 
-## [0.28.0] - 2026-03-xx
+## [0.28.0] - 2026-03-07
 
 ### Added
 - Phase 5.1 proxy cache key + validity foundation (`src/edge_config.zig`, `src/edge_gateway.zig`):
@@ -18,8 +18,14 @@
   - Added auth subrequest checks (`TARDIGRADE_AUTH_REQUEST_URL`, `TARDIGRADE_AUTH_REQUEST_TIMEOUT_MS`) for protected API routes.
   - Added optional JWT HS256 bearer validation with issuer/audience constraints (`TARDIGRADE_JWT_SECRET`, `TARDIGRADE_JWT_ISSUER`, `TARDIGRADE_JWT_AUDIENCE`).
   - Added configurable `add_header` directive support via `TARDIGRADE_ADD_HEADERS` applied to all gateway responses.
+- Phase 7 TLS/SSL completion increment (`src/http/tls_termination.zig`, `src/edge_config.zig`, `src/edge_gateway.zig`):
+  - Added protocol and cipher controls (`TARDIGRADE_TLS_MIN_VERSION`, `TARDIGRADE_TLS_MAX_VERSION`, `TARDIGRADE_TLS_CIPHER_LIST`, `TARDIGRADE_TLS_CIPHER_SUITES`).
+  - Added SNI multi-certificate support (`TARDIGRADE_TLS_SNI_CERTS`) and optional ACME-style certificate directory discovery.
+  - Added session resumption controls (session cache and session tickets) and static OCSP stapling support.
+  - Added mTLS and chain/CRL verification controls (`TARDIGRADE_TLS_CLIENT_*`, `TARDIGRADE_TLS_CRL_*`).
+  - Added timer-driven dynamic TLS asset reload checks (`TARDIGRADE_TLS_DYNAMIC_RELOAD_INTERVAL_MS`).
 
-## [0.27.0] - 2026-03-xx
+## [0.27.0] - 2026-03-07
 
 ### Added
 - Phase 2.2 request pipelining boundary support (`src/edge_gateway.zig`):
@@ -129,14 +135,14 @@
   - Proxy request execution now uses `std.http.Client.connectUnix` when unix upstream endpoints are selected.
   - Active health probing and load-balanced endpoint selection now apply to unix socket backends for local IPC routing.
 
-## [0.26.0] - 2026-03-xx
+## [0.26.0] - 2026-03-07
 
 ### Added
 - Phase 2.4 request arena allocation (`src/edge_gateway.zig`):
   - Request processing now uses a request-scoped arena allocator instead of a per-request general-purpose allocator.
   - Per-request temporary allocations are reclaimed in one step at request completion.
 
-## [0.25.0] - 2026-03-xx
+## [0.25.0] - 2026-03-07
 
 ### Added
 - Phase 2.2 keep-alive connection reuse (`src/edge_gateway.zig`, `src/edge_config.zig`):
@@ -145,7 +151,7 @@
   - Added `TARDIGRADE_KEEP_ALIVE_TIMEOUT_MS` for idle keep-alive socket timeout.
   - Added `TARDIGRADE_MAX_REQUESTS_PER_CONNECTION` to bound requests served per connection.
 
-## [0.24.0] - 2026-03-xx
+## [0.24.0] - 2026-03-07
 
 ### Added
 - Socket timeout enforcement (`src/edge_gateway.zig`):
@@ -153,7 +159,7 @@
   - Upstream proxy sockets now apply configured send/receive timeout via `TARDIGRADE_UPSTREAM_TIMEOUT_MS`.
   - Timeout settings are applied with POSIX socket timeout options on both client and upstream paths.
 
-## [0.23.0] - 2026-03-xx
+## [0.23.0] - 2026-03-07
 
 ### Added
 - Phase 4.1 proxy_pass directive foundation (`src/edge_config.zig`, `src/edge_gateway.zig`):
@@ -162,7 +168,7 @@
   - Proxy target resolver supports absolute URL mode and relative-path mode (joined with `TARDIGRADE_UPSTREAM_BASE_URL`).
   - Added target resolution helper coverage for path joining and absolute/relative routing behavior.
 
-## [0.22.0] - 2026-03-xx
+## [0.22.0] - 2026-03-07
 
 ### Added
 - Phase 4.1 backend connection pooling (`src/edge_gateway.zig`):
@@ -170,7 +176,7 @@
   - Upstream proxy execution path now opens requests through the shared client with `keep_alive = true`.
   - Upstream connections can now be reused across requests via the client connection pool instead of one-client-per-request teardown.
 
-## [0.21.0] - 2026-03-xx
+## [0.21.0] - 2026-03-07
 
 ### Added
 - Phase 4.1 streaming proxy increment (`src/edge_gateway.zig`):
@@ -178,7 +184,7 @@
   - Shared streaming response header writer for propagated content-type/disposition, correlation ID, and security headers.
   - `/v1/chat` and `/v1/commands` now attempt streamed relay when idempotency replay storage is not required; non-200 responses still use buffered mapping path.
 
-## [0.20.0] - 2026-03-xx
+## [0.20.0] - 2026-03-07
 
 ### Added
 - Native HTTPS/TLS termination (`src/http/tls_termination.zig`, `src/edge_gateway.zig`, `build.zig`):
@@ -187,7 +193,7 @@
   - HTTP request parsing/response writing now supports both plain TCP streams and TLS-wrapped streams.
   - Build linked with `ssl`/`crypto` system libraries for executable and tests.
 
-## [0.19.0] - 2026-03-xx
+## [0.19.0] - 2026-03-07
 
 ### Added
 - Phase 2.2 per-IP connection limiting (`src/edge_gateway.zig`, `src/edge_config.zig`):
@@ -196,7 +202,7 @@
   - Connection slot lifecycle is tracked by fd and released on worker completion or queue submission failure.
   - Supports IPv4 and IPv6 client keying in the connection tracker.
 
-## [0.18.0] - 2026-03-xx
+## [0.18.0] - 2026-03-07
 
 ### Added
 - Phase 2.3 graceful worker draining (`src/http/worker_pool.zig`):
@@ -204,7 +210,7 @@
   - Added worker completion signaling for coordinated shutdown waits.
   - Added unit test verifying `shutdownAndJoin(true)` waits for in-flight work completion.
 
-## [0.17.0] - 2026-03-xx
+## [0.17.0] - 2026-03-07
 
 ### Added
 - Phase 4.1 reverse proxy header foundation (`src/edge_gateway.zig`):
@@ -213,7 +219,7 @@
   - `Host` header rewriting to upstream authority derived from `upstream_base_url`.
   - Helper coverage for forwarded-for composition and upstream host parsing.
 
-## [0.16.0] - 2026-03-xx
+## [0.16.0] - 2026-03-07
 
 ### Added
 - Phase 2.3 worker model foundation (`src/http/worker_pool.zig`, `src/edge_gateway.zig`):
@@ -223,7 +229,7 @@
   - Configurable worker settings via `TARDIGRADE_WORKER_THREADS` (default auto) and `TARDIGRADE_WORKER_QUEUE_SIZE` (default 1024).
   - Worker pool unit test covering queue submission/processing.
 
-## [0.15.0] - 2026-03-xx
+## [0.15.0] - 2026-03-07
 
 ### Added
 - Phase 2.1 async event loop foundation (`src/http/event_loop.zig`, `src/edge_gateway.zig`):

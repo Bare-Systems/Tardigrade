@@ -408,27 +408,40 @@ Resolved (incremental): added configurable `add_header` support through `TARDIGR
 ## PHASE 7: TLS / SSL
 
 ### 7.1 Basic TLS
-- [ ] TLS termination
-- [ ] Certificate and key loading
-- [ ] TLS 1.2 / 1.3 support
-- [ ] Cipher suite configuration
-- [ ] Protocol version selection
+- [x] TLS termination
+- [x] Certificate and key loading
+- [x] TLS 1.2 / 1.3 support
+- [x] Cipher suite configuration
+- [x] Protocol version selection
+
+Resolved (incremental): expanded OpenSSL TLS termination configuration with explicit min/max protocol controls (`TARDIGRADE_TLS_MIN_VERSION`, `TARDIGRADE_TLS_MAX_VERSION`) and certificate/key loading for default server identity.
+Resolved (incremental): added cipher controls for TLS <=1.2 and TLS 1.3 (`TARDIGRADE_TLS_CIPHER_LIST`, `TARDIGRADE_TLS_CIPHER_SUITES`).
 
 ### 7.2 Advanced TLS
-- [ ] SNI (Server Name Indication)
-- [ ] Multiple certificates per server
-- [ ] Session resumption (session cache)
-- [ ] Session tickets
-- [ ] OCSP stapling
+- [x] SNI (Server Name Indication)
+- [x] Multiple certificates per server
+- [x] Session resumption (session cache)
+- [x] Session tickets
+- [x] OCSP stapling
+
+Resolved (incremental): implemented SNI callback-based certificate selection with multi-cert mapping via `TARDIGRADE_TLS_SNI_CERTS`.
+Resolved (incremental): added TLS session cache and ticket controls (`TARDIGRADE_TLS_SESSION_CACHE`, `TARDIGRADE_TLS_SESSION_CACHE_SIZE`, `TARDIGRADE_TLS_SESSION_TIMEOUT_SECONDS`, `TARDIGRADE_TLS_SESSION_TICKETS`).
+Resolved (incremental): added static OCSP stapling response loading (`TARDIGRADE_TLS_OCSP_STAPLING`, `TARDIGRADE_TLS_OCSP_RESPONSE_PATH`) and handshake attachment.
 
 ### 7.3 Client Certificates
-- [ ] Client certificate verification
-- [ ] Certificate chain validation
-- [ ] CRL checking
+- [x] Client certificate verification
+- [x] Certificate chain validation
+- [x] CRL checking
+
+Resolved (incremental): added optional mTLS/client-cert verification with CA trust configuration (`TARDIGRADE_TLS_CLIENT_CA_PATH`, `TARDIGRADE_TLS_CLIENT_VERIFY`, `TARDIGRADE_TLS_CLIENT_VERIFY_DEPTH`) and OpenSSL chain verification behavior.
+Resolved (incremental): added CRL loading/checking (`TARDIGRADE_TLS_CRL_PATH`, `TARDIGRADE_TLS_CRL_CHECK`) via cert-store flags.
 
 ### 7.4 Certificate Management
-- [ ] Dynamic certificate loading
-- [ ] ACME/Let's Encrypt integration (optional)
+- [x] Dynamic certificate loading
+- [x] ACME/Let's Encrypt integration (optional)
+
+Resolved (incremental): event-loop TLS maintenance now supports periodic certificate/OCSP/CRL reload checks (`TARDIGRADE_TLS_DYNAMIC_RELOAD_INTERVAL_MS`).
+Resolved (incremental): optional ACME-style cert directory ingestion is supported through `TARDIGRADE_TLS_ACME_ENABLED` and `TARDIGRADE_TLS_ACME_CERT_DIR` for SNI certificate discovery.
 
 ## PHASE 8: HTTP/2 & HTTP/3
 

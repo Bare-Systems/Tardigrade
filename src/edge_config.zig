@@ -38,11 +38,35 @@ pub const EdgeConfig = struct {
         name: []const u8,
         value: []const u8,
     };
+    pub const TlsSniCert = struct {
+        server_name: []const u8,
+        cert_path: []const u8,
+        key_path: []const u8,
+    };
 
     listen_host: []const u8,
     listen_port: u16,
     tls_cert_path: []const u8,
     tls_key_path: []const u8,
+    tls_min_version: []const u8,
+    tls_max_version: []const u8,
+    tls_cipher_list: []const u8,
+    tls_cipher_suites: []const u8,
+    tls_sni_certs: []TlsSniCert,
+    tls_session_cache_enabled: bool,
+    tls_session_cache_size: u32,
+    tls_session_timeout_seconds: u32,
+    tls_session_tickets_enabled: bool,
+    tls_ocsp_stapling_enabled: bool,
+    tls_ocsp_response_path: []const u8,
+    tls_client_ca_path: []const u8,
+    tls_client_verify: bool,
+    tls_client_verify_depth: u32,
+    tls_crl_path: []const u8,
+    tls_crl_check: bool,
+    tls_dynamic_reload_interval_ms: u64,
+    tls_acme_enabled: bool,
+    tls_acme_cert_dir: []const u8,
     proxy_protocol_mode: ProxyProtocolMode,
     /// Gateway identity used in signed upstream trust headers.
     trust_gateway_id: []const u8,
@@ -176,6 +200,20 @@ pub const EdgeConfig = struct {
         allocator.free(self.listen_host);
         allocator.free(self.tls_cert_path);
         allocator.free(self.tls_key_path);
+        allocator.free(self.tls_min_version);
+        allocator.free(self.tls_max_version);
+        allocator.free(self.tls_cipher_list);
+        allocator.free(self.tls_cipher_suites);
+        for (self.tls_sni_certs) |sc| {
+            allocator.free(sc.server_name);
+            allocator.free(sc.cert_path);
+            allocator.free(sc.key_path);
+        }
+        allocator.free(self.tls_sni_certs);
+        allocator.free(self.tls_ocsp_response_path);
+        allocator.free(self.tls_client_ca_path);
+        allocator.free(self.tls_crl_path);
+        allocator.free(self.tls_acme_cert_dir);
         allocator.free(self.trust_gateway_id);
         allocator.free(self.trust_shared_secret);
         for (self.trusted_upstream_identities) |id| allocator.free(id);
@@ -235,6 +273,43 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
 
     const tls_key_path = envOrDefault(allocator, "TARDIGRADE_TLS_KEY_PATH", "") catch unreachable;
     errdefer allocator.free(tls_key_path);
+    const tls_min_version = envOrDefault(allocator, "TARDIGRADE_TLS_MIN_VERSION", "1.2") catch unreachable;
+    errdefer allocator.free(tls_min_version);
+    const tls_max_version = envOrDefault(allocator, "TARDIGRADE_TLS_MAX_VERSION", "1.3") catch unreachable;
+    errdefer allocator.free(tls_max_version);
+    const tls_cipher_list = envOrDefault(allocator, "TARDIGRADE_TLS_CIPHER_LIST", "") catch unreachable;
+    errdefer allocator.free(tls_cipher_list);
+    const tls_cipher_suites = envOrDefault(allocator, "TARDIGRADE_TLS_CIPHER_SUITES", "") catch unreachable;
+    errdefer allocator.free(tls_cipher_suites);
+    const tls_sni_certs_raw = envOrDefault(allocator, "TARDIGRADE_TLS_SNI_CERTS", "") catch unreachable;
+    defer allocator.free(tls_sni_certs_raw);
+    const tls_sni_certs = try parseTlsSniCerts(allocator, tls_sni_certs_raw);
+    errdefer {
+        for (tls_sni_certs) |sc| {
+            allocator.free(sc.server_name);
+            allocator.free(sc.cert_path);
+            allocator.free(sc.key_path);
+        }
+        allocator.free(tls_sni_certs);
+    }
+    const tls_session_cache_enabled = parseBoolEnv(allocator, "TARDIGRADE_TLS_SESSION_CACHE", true);
+    const tls_session_cache_size = parseIntEnv(u32, allocator, "TARDIGRADE_TLS_SESSION_CACHE_SIZE", 20_480);
+    const tls_session_timeout_seconds = parseIntEnv(u32, allocator, "TARDIGRADE_TLS_SESSION_TIMEOUT_SECONDS", 300);
+    const tls_session_tickets_enabled = parseBoolEnv(allocator, "TARDIGRADE_TLS_SESSION_TICKETS", true);
+    const tls_ocsp_stapling_enabled = parseBoolEnv(allocator, "TARDIGRADE_TLS_OCSP_STAPLING", false);
+    const tls_ocsp_response_path = envOrDefault(allocator, "TARDIGRADE_TLS_OCSP_RESPONSE_PATH", "") catch unreachable;
+    errdefer allocator.free(tls_ocsp_response_path);
+    const tls_client_ca_path = envOrDefault(allocator, "TARDIGRADE_TLS_CLIENT_CA_PATH", "") catch unreachable;
+    errdefer allocator.free(tls_client_ca_path);
+    const tls_client_verify = parseBoolEnv(allocator, "TARDIGRADE_TLS_CLIENT_VERIFY", false);
+    const tls_client_verify_depth = parseIntEnv(u32, allocator, "TARDIGRADE_TLS_CLIENT_VERIFY_DEPTH", 3);
+    const tls_crl_path = envOrDefault(allocator, "TARDIGRADE_TLS_CRL_PATH", "") catch unreachable;
+    errdefer allocator.free(tls_crl_path);
+    const tls_crl_check = parseBoolEnv(allocator, "TARDIGRADE_TLS_CRL_CHECK", false);
+    const tls_dynamic_reload_interval_ms = parseIntEnv(u64, allocator, "TARDIGRADE_TLS_DYNAMIC_RELOAD_INTERVAL_MS", 5000);
+    const tls_acme_enabled = parseBoolEnv(allocator, "TARDIGRADE_TLS_ACME_ENABLED", false);
+    const tls_acme_cert_dir = envOrDefault(allocator, "TARDIGRADE_TLS_ACME_CERT_DIR", "") catch unreachable;
+    errdefer allocator.free(tls_acme_cert_dir);
     const proxy_protocol_mode_str = envOrDefault(allocator, "TARDIGRADE_PROXY_PROTOCOL", "off") catch unreachable;
     defer allocator.free(proxy_protocol_mode_str);
     const proxy_protocol_mode = ProxyProtocolMode.parse(proxy_protocol_mode_str) orelse .off;
@@ -563,6 +638,25 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .listen_port = listen_port,
         .tls_cert_path = tls_cert_path,
         .tls_key_path = tls_key_path,
+        .tls_min_version = tls_min_version,
+        .tls_max_version = tls_max_version,
+        .tls_cipher_list = tls_cipher_list,
+        .tls_cipher_suites = tls_cipher_suites,
+        .tls_sni_certs = tls_sni_certs,
+        .tls_session_cache_enabled = tls_session_cache_enabled,
+        .tls_session_cache_size = tls_session_cache_size,
+        .tls_session_timeout_seconds = tls_session_timeout_seconds,
+        .tls_session_tickets_enabled = tls_session_tickets_enabled,
+        .tls_ocsp_stapling_enabled = tls_ocsp_stapling_enabled,
+        .tls_ocsp_response_path = tls_ocsp_response_path,
+        .tls_client_ca_path = tls_client_ca_path,
+        .tls_client_verify = tls_client_verify,
+        .tls_client_verify_depth = tls_client_verify_depth,
+        .tls_crl_path = tls_crl_path,
+        .tls_crl_check = tls_crl_check,
+        .tls_dynamic_reload_interval_ms = tls_dynamic_reload_interval_ms,
+        .tls_acme_enabled = tls_acme_enabled,
+        .tls_acme_cert_dir = tls_acme_cert_dir,
         .proxy_protocol_mode = proxy_protocol_mode,
         .trust_gateway_id = trust_gateway_id,
         .trust_shared_secret = trust_shared_secret,
@@ -645,6 +739,19 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
 
 fn envOrDefault(allocator: std.mem.Allocator, key: []const u8, default_value: []const u8) ![]u8 {
     return std.process.getEnvVarOwned(allocator, key) catch try allocator.dupe(u8, default_value);
+}
+
+fn parseBoolEnv(allocator: std.mem.Allocator, key: []const u8, default_value: bool) bool {
+    const raw = envOrDefault(allocator, key, if (default_value) "true" else "false") catch return default_value;
+    defer allocator.free(raw);
+    return std.mem.eql(u8, raw, "true") or std.mem.eql(u8, raw, "1");
+}
+
+fn parseIntEnv(comptime T: type, allocator: std.mem.Allocator, key: []const u8, default_value: T) T {
+    const raw = envOrDefault(allocator, key, "") catch return default_value;
+    defer allocator.free(raw);
+    if (raw.len == 0) return default_value;
+    return std.fmt.parseInt(T, raw, 10) catch default_value;
 }
 
 fn parseHashes(allocator: std.mem.Allocator, raw: []const u8) ![][]const u8 {
@@ -731,6 +838,39 @@ fn parseHeaderPairs(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeConfig
         const value = try allocator.dupe(u8, value_raw);
         errdefer allocator.free(value);
         try out.append(.{ .name = name, .value = value });
+    }
+    return out.toOwnedSlice();
+}
+
+fn parseTlsSniCerts(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeConfig.TlsSniCert {
+    var out = std.ArrayList(EdgeConfig.TlsSniCert).init(allocator);
+    errdefer {
+        for (out.items) |sc| {
+            allocator.free(sc.server_name);
+            allocator.free(sc.cert_path);
+            allocator.free(sc.key_path);
+        }
+        out.deinit();
+    }
+
+    var it = std.mem.splitScalar(u8, raw, '|');
+    while (it.next()) |part| {
+        const trimmed = std.mem.trim(u8, part, " \t\r\n");
+        if (trimmed.len == 0) continue;
+        var fields = std.mem.splitScalar(u8, trimmed, ':');
+        const host_raw = fields.next() orelse return error.InvalidTlsSniCertFormat;
+        const cert_raw = fields.next() orelse return error.InvalidTlsSniCertFormat;
+        const key_raw = fields.next() orelse return error.InvalidTlsSniCertFormat;
+        if (fields.next() != null) return error.InvalidTlsSniCertFormat;
+        const host = std.mem.trim(u8, host_raw, " \t\r\n");
+        const cert = std.mem.trim(u8, cert_raw, " \t\r\n");
+        const key = std.mem.trim(u8, key_raw, " \t\r\n");
+        if (host.len == 0 or cert.len == 0 or key.len == 0) return error.InvalidTlsSniCertFormat;
+        try out.append(.{
+            .server_name = try allocator.dupe(u8, host),
+            .cert_path = try allocator.dupe(u8, cert),
+            .key_path = try allocator.dupe(u8, key),
+        });
     }
     return out.toOwnedSlice();
 }

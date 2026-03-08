@@ -1032,7 +1032,34 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     var timer = http.event_loop.TimerManager.init(250);
     var tls_terminator: ?http.tls_termination.TlsTerminator = null;
     if (edge_config.hasTlsFiles(cfg)) {
-        tls_terminator = try http.tls_termination.TlsTerminator.init(cfg.tls_cert_path, cfg.tls_key_path);
+        var sni_specs = try state_allocator.alloc(http.tls_termination.SniCertSpec, cfg.tls_sni_certs.len);
+        defer state_allocator.free(sni_specs);
+        for (cfg.tls_sni_certs, 0..) |sc, i| {
+            sni_specs[i] = .{ .server_name = sc.server_name, .cert_path = sc.cert_path, .key_path = sc.key_path };
+        }
+        tls_terminator = try http.tls_termination.TlsTerminator.init(state_allocator, .{
+            .cert_path = cfg.tls_cert_path,
+            .key_path = cfg.tls_key_path,
+            .min_version = cfg.tls_min_version,
+            .max_version = cfg.tls_max_version,
+            .cipher_list = cfg.tls_cipher_list,
+            .cipher_suites = cfg.tls_cipher_suites,
+            .sni_certs = sni_specs,
+            .session_cache_enabled = cfg.tls_session_cache_enabled,
+            .session_cache_size = cfg.tls_session_cache_size,
+            .session_timeout_seconds = cfg.tls_session_timeout_seconds,
+            .session_tickets_enabled = cfg.tls_session_tickets_enabled,
+            .ocsp_stapling_enabled = cfg.tls_ocsp_stapling_enabled,
+            .ocsp_response_path = cfg.tls_ocsp_response_path,
+            .client_ca_path = cfg.tls_client_ca_path,
+            .client_verify = cfg.tls_client_verify,
+            .client_verify_depth = cfg.tls_client_verify_depth,
+            .crl_path = cfg.tls_crl_path,
+            .crl_check = cfg.tls_crl_check,
+            .dynamic_reload_interval_ms = cfg.tls_dynamic_reload_interval_ms,
+            .acme_enabled = cfg.tls_acme_enabled,
+            .acme_cert_dir = cfg.tls_acme_cert_dir,
+        });
     }
     defer if (tls_terminator) |*tls| tls.deinit();
     const worker_count: usize = blk: {
@@ -1226,6 +1253,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         if (timer.consumeTick(http.event_loop.monotonicMs())) {
             runActiveHealthChecks(cfg, &state);
             runProxyCacheMaintenance(cfg, &state);
+            if (tls_terminator) |*tls| tls.runMaintenance(http.event_loop.monotonicMs());
         }
     }
 
@@ -3951,6 +3979,25 @@ test "resolveProxyTarget handles absolute and relative proxy_pass" {
         .listen_port = 8069,
         .tls_cert_path = "",
         .tls_key_path = "",
+        .tls_min_version = "1.2",
+        .tls_max_version = "1.3",
+        .tls_cipher_list = "",
+        .tls_cipher_suites = "",
+        .tls_sni_certs = &[_]edge_config.EdgeConfig.TlsSniCert{},
+        .tls_session_cache_enabled = true,
+        .tls_session_cache_size = 20_480,
+        .tls_session_timeout_seconds = 300,
+        .tls_session_tickets_enabled = true,
+        .tls_ocsp_stapling_enabled = false,
+        .tls_ocsp_response_path = "",
+        .tls_client_ca_path = "",
+        .tls_client_verify = false,
+        .tls_client_verify_depth = 3,
+        .tls_crl_path = "",
+        .tls_crl_check = false,
+        .tls_dynamic_reload_interval_ms = 5000,
+        .tls_acme_enabled = false,
+        .tls_acme_cert_dir = "",
         .proxy_protocol_mode = .off,
         .trust_gateway_id = "tardigrade-edge",
         .trust_shared_secret = "",
@@ -4062,6 +4109,25 @@ test "authorizeRequest accepts valid hash" {
         .listen_port = 8069,
         .tls_cert_path = "",
         .tls_key_path = "",
+        .tls_min_version = "1.2",
+        .tls_max_version = "1.3",
+        .tls_cipher_list = "",
+        .tls_cipher_suites = "",
+        .tls_sni_certs = &[_]edge_config.EdgeConfig.TlsSniCert{},
+        .tls_session_cache_enabled = true,
+        .tls_session_cache_size = 20_480,
+        .tls_session_timeout_seconds = 300,
+        .tls_session_tickets_enabled = true,
+        .tls_ocsp_stapling_enabled = false,
+        .tls_ocsp_response_path = "",
+        .tls_client_ca_path = "",
+        .tls_client_verify = false,
+        .tls_client_verify_depth = 3,
+        .tls_crl_path = "",
+        .tls_crl_check = false,
+        .tls_dynamic_reload_interval_ms = 5000,
+        .tls_acme_enabled = false,
+        .tls_acme_cert_dir = "",
         .proxy_protocol_mode = .off,
         .trust_gateway_id = "tardigrade-edge",
         .trust_shared_secret = "",

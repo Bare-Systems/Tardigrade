@@ -6,6 +6,10 @@ const edge_config = @import("edge_config.zig");
 const MAX_REQUEST_SIZE: usize = 256 * 1024;
 const STREAM_RELAY_BUFFER_SIZE: usize = 16 * 1024;
 const JSON_CONTENT_TYPE = "application/json";
+const ProxyCacheLookup = struct {
+    cached: http.idempotency.CachedResponse,
+    is_stale: bool,
+};
 
 const UpstreamHealth = struct {
     fail_count: u32 = 0,
@@ -42,6 +46,8 @@ const GatewayState = struct {
     rate_limiter: ?http.rate_limiter.RateLimiter,
     idempotency_store: ?http.idempotency.IdempotencyStore,
     proxy_cache_store: ?http.idempotency.IdempotencyStore,
+    proxy_cache_path: []const u8,
+    proxy_cache_ttl_seconds: u32,
     security_headers: http.security_headers.SecurityHeaders,
     session_store: ?http.session.SessionStore,
     access_control: ?http.access_control.AccessControl,
@@ -61,8 +67,10 @@ const GatewayState = struct {
     upstream_backup_rr_index: usize,
     lb_random_state: u64,
     next_active_health_probe_ms: u64,
+    next_proxy_cache_maintenance_ms: u64,
     upstream_health: std.StringHashMap(UpstreamHealth),
     upstream_active_requests: std.StringHashMap(usize),
+    proxy_cache_locks: std.StringHashMap(u32),
     active_connections_by_ip: std.StringHashMap(u32),
     active_fds: std.AutoHashMap(std.posix.fd_t, void),
     fd_to_ip: std.AutoHashMap(std.posix.fd_t, []u8),
@@ -82,6 +90,9 @@ const GatewayState = struct {
         var upstream_active_it = self.upstream_active_requests.iterator();
         while (upstream_active_it.next()) |entry| self.allocator.free(entry.key_ptr.*);
         self.upstream_active_requests.deinit();
+        var cache_lock_it = self.proxy_cache_locks.iterator();
+        while (cache_lock_it.next()) |entry| self.allocator.free(entry.key_ptr.*);
+        self.proxy_cache_locks.deinit();
         var ip_it = self.active_connections_by_ip.iterator();
         while (ip_it.next()) |entry| self.allocator.free(entry.key_ptr.*);
         self.active_connections_by_ip.deinit();
@@ -221,31 +232,111 @@ const GatewayState = struct {
         }
     }
 
-    fn proxyCacheGetCopy(self: *GatewayState, allocator: std.mem.Allocator, key: []const u8) !?http.idempotency.CachedResponse {
+    fn proxyCacheGetCopyWithStale(self: *GatewayState, allocator: std.mem.Allocator, key: []const u8, stale_seconds: u32) !?ProxyCacheLookup {
         self.mutex.lock();
-        defer self.mutex.unlock();
+        var locked = true;
+        defer if (locked) self.mutex.unlock();
         if (self.proxy_cache_store) |*store| {
-            if (store.get(key)) |cached| {
-                const body = try allocator.dupe(u8, cached.body);
+            if (store.getWithStale(key, stale_seconds)) |lookup| {
+                const body = try allocator.dupe(u8, lookup.response.body);
                 errdefer allocator.free(body);
-                const ct = try allocator.dupe(u8, cached.content_type);
+                const ct = try allocator.dupe(u8, lookup.response.content_type);
+                locked = false;
+                self.mutex.unlock();
                 return .{
-                    .status = cached.status,
-                    .body = body,
-                    .content_type = ct,
-                    .created_ns = cached.created_ns,
+                    .cached = .{
+                        .status = lookup.response.status,
+                        .body = body,
+                        .content_type = ct,
+                        .created_ns = lookup.response.created_ns,
+                    },
+                    .is_stale = lookup.is_stale,
                 };
             }
         }
-        return null;
+        locked = false;
+        self.mutex.unlock();
+
+        if (self.proxy_cache_path.len == 0) return null;
+        const disk_lookup = try proxyCacheReadFromDisk(allocator, self.proxy_cache_path, key, self.proxy_cache_ttl_seconds, stale_seconds);
+        if (disk_lookup) |found| {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            if (self.proxy_cache_store) |*store| {
+                store.put(key, found.cached.status, found.cached.body, found.cached.content_type) catch {};
+            }
+        }
+        return disk_lookup;
     }
 
     fn proxyCachePut(self: *GatewayState, key: []const u8, status: u16, body: []const u8, content_type: []const u8) !void {
         self.mutex.lock();
-        defer self.mutex.unlock();
+        var locked = true;
+        defer if (locked) self.mutex.unlock();
         if (self.proxy_cache_store) |*store| {
             try store.put(key, status, body, content_type);
         }
+        locked = false;
+        self.mutex.unlock();
+        if (self.proxy_cache_path.len > 0) {
+            try proxyCacheWriteToDisk(self.proxy_cache_path, key, status, body, content_type);
+        }
+    }
+
+    fn proxyCacheDelete(self: *GatewayState, key: []const u8) bool {
+        self.mutex.lock();
+        var removed = false;
+        if (self.proxy_cache_store) |*store| {
+            removed = store.delete(key);
+        }
+        self.mutex.unlock();
+        if (self.proxy_cache_path.len > 0) {
+            removed = proxyCacheDeleteFromDisk(self.proxy_cache_path, key) or removed;
+        }
+        return removed;
+    }
+
+    fn proxyCachePurgeAll(self: *GatewayState) usize {
+        self.mutex.lock();
+        var removed: usize = 0;
+        if (self.proxy_cache_store) |*store| {
+            removed += store.clear();
+        }
+        self.mutex.unlock();
+        if (self.proxy_cache_path.len > 0) {
+            removed += proxyCachePurgeDisk(self.proxy_cache_path);
+        }
+        return removed;
+    }
+
+    fn proxyCacheTryLock(self: *GatewayState, key: []const u8) !bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.proxy_cache_locks.contains(key)) return false;
+        const owned = try self.allocator.dupe(u8, key);
+        errdefer self.allocator.free(owned);
+        try self.proxy_cache_locks.put(owned, 1);
+        return true;
+    }
+
+    fn proxyCacheUnlock(self: *GatewayState, key: []const u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.proxy_cache_locks.fetchRemove(key)) |removed| {
+            self.allocator.free(removed.key);
+        }
+    }
+
+    fn proxyCacheWaitForUnlock(self: *GatewayState, key: []const u8, timeout_ms: u32) bool {
+        const deadline = http.event_loop.monotonicMs() + timeout_ms;
+        while (http.event_loop.monotonicMs() < deadline) {
+            self.mutex.lock();
+            const locked = self.proxy_cache_locks.contains(key);
+            self.mutex.unlock();
+            if (!locked) return true;
+            std.time.sleep(10 * std.time.ns_per_ms);
+        }
+        return false;
     }
 
     fn createSession(self: *GatewayState, allocator: std.mem.Allocator, identity: []const u8, client_ip: []const u8, device_id: ?[]const u8) ![]const u8 {
@@ -880,6 +971,8 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
             http.idempotency.IdempotencyStore.init(state_allocator, cfg.proxy_cache_ttl_seconds)
         else
             null,
+        .proxy_cache_path = cfg.proxy_cache_path,
+        .proxy_cache_ttl_seconds = cfg.proxy_cache_ttl_seconds,
         .security_headers = if (cfg.security_headers_enabled)
             http.security_headers.SecurityHeaders.api
         else
@@ -914,8 +1007,10 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         .upstream_backup_rr_index = 0,
         .lb_random_state = 0x9e3779b97f4a7c15 ^ @as(u64, @intCast(http.event_loop.monotonicMs())),
         .next_active_health_probe_ms = 0,
+        .next_proxy_cache_maintenance_ms = 0,
         .upstream_health = std.StringHashMap(UpstreamHealth).init(state_allocator),
         .upstream_active_requests = std.StringHashMap(usize).init(state_allocator),
+        .proxy_cache_locks = std.StringHashMap(u32).init(state_allocator),
         .active_connections_by_ip = std.StringHashMap(u32).init(state_allocator),
         .active_fds = std.AutoHashMap(std.posix.fd_t, void).init(state_allocator),
         .fd_to_ip = std.AutoHashMap(std.posix.fd_t, []u8).init(state_allocator),
@@ -980,6 +1075,12 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     }
     if (state.proxy_cache_store != null) {
         state.logger.info(null, "Proxy cache enabled: TTL {d}s key_template={s}", .{ cfg.proxy_cache_ttl_seconds, cfg.proxy_cache_key_template });
+        if (cfg.proxy_cache_path.len > 0) {
+            std.fs.cwd().makePath(cfg.proxy_cache_path) catch |err| {
+                state.logger.warn(null, "failed to create proxy cache path {s}: {}", .{ cfg.proxy_cache_path, err });
+            };
+            state.logger.info(null, "Proxy cache disk path enabled: {s}", .{cfg.proxy_cache_path});
+        }
     }
     if (state.session_store != null) {
         state.logger.info(null, "Session management enabled: TTL {d}s, max {d}", .{ cfg.session_ttl_seconds, cfg.session_max });
@@ -1122,6 +1223,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
 
         if (timer.consumeTick(http.event_loop.monotonicMs())) {
             runActiveHealthChecks(cfg, &state);
+            runProxyCacheMaintenance(cfg, &state);
         }
     }
 
@@ -1236,6 +1338,21 @@ fn runActiveHealthChecks(cfg: *const edge_config.EdgeConfig, state: *GatewayStat
     }
     for (cfg.upstream_commands_backup_base_urls) |base_url| {
         probeSingleUpstream(cfg, state, &probe_client, base_url);
+    }
+}
+
+fn runProxyCacheMaintenance(cfg: *const edge_config.EdgeConfig, state: *GatewayState) void {
+    if (cfg.proxy_cache_ttl_seconds == 0) return;
+    const interval = cfg.proxy_cache_manager_interval_ms;
+    if (interval == 0) return;
+    const now_ms = http.event_loop.monotonicMs();
+    if (state.next_proxy_cache_maintenance_ms != 0 and now_ms < state.next_proxy_cache_maintenance_ms) return;
+    state.next_proxy_cache_maintenance_ms = now_ms + interval;
+
+    state.mutex.lock();
+    defer state.mutex.unlock();
+    if (state.proxy_cache_store) |*store| {
+        _ = store.cleanupExpired();
     }
 }
 
@@ -1876,6 +1993,51 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         return;
     }
 
+    // --- POST /v1/cache/purge ---
+    if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/cache/purge")) {
+        if (state.proxy_cache_store == null) {
+            try sendApiError(allocator, writer, .not_found, "invalid_request", "Proxy cache not enabled", correlation_id, keep_alive, state);
+            logAccess(&ctx, request.method.toString(), "/v1/cache/purge", 404, request.headers.get("user-agent") orelse "");
+            return;
+        }
+
+        const auth_result = authorizeRequest(cfg, &request.headers);
+        if (!auth_result.ok) {
+            try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, keep_alive, state);
+            logAccess(&ctx, request.method.toString(), "/v1/cache/purge", 401, request.headers.get("user-agent") orelse "");
+            return;
+        }
+        ctx.setIdentity(auth_result.token_hash orelse "-");
+
+        var purged: usize = 0;
+        if (request.body) |body| {
+            if (isJsonContentType(request.contentType())) {
+                if (parseCachePurgeKey(allocator, body)) |key| {
+                    defer allocator.free(key);
+                    purged = if (state.proxyCacheDelete(key)) 1 else 0;
+                } else |_| {
+                    purged = state.proxyCachePurgeAll();
+                }
+            } else {
+                purged = state.proxyCachePurgeAll();
+            }
+        } else {
+            purged = state.proxyCachePurgeAll();
+        }
+
+        const resp_body = try std.fmt.allocPrint(allocator, "{{\"purged\":{d}}}", .{purged});
+        defer allocator.free(resp_body);
+        var response = http.Response.json(allocator, resp_body);
+        defer response.deinit();
+        _ = response.setConnection(keep_alive)
+            .setHeader(http.correlation.HEADER_NAME, correlation_id);
+        state.security_headers.apply(&response);
+        try response.write(writer);
+        state.metricsRecord(200);
+        logAccess(&ctx, request.method.toString(), "/v1/cache/purge", 200, request.headers.get("user-agent") orelse "");
+        return;
+    }
+
     // --- POST /v1/commands (structured command routing) ---
     if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/commands")) {
         // --- Auth (bearer token or session token) ---
@@ -1965,35 +2127,77 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
             return;
         };
         defer allocator.free(envelope);
+        const upstream_path = cmd.command_type.upstreamPath();
 
-        const proxy_cache_key = if (cfg.proxy_cache_ttl_seconds > 0)
+        const proxy_cache_bypass = shouldBypassProxyCache(&request.headers) or effective_idem_key != null;
+        const proxy_cache_key = if (cfg.proxy_cache_ttl_seconds > 0 and !proxy_cache_bypass)
             try buildProxyCacheKey(allocator, cfg.proxy_cache_key_template, request.method.toString(), "/v1/commands", envelope, ctx.identity, ctx.api_version)
         else
             null;
         defer if (proxy_cache_key) |k| allocator.free(k);
+        var proxy_cache_locked = false;
+        defer if (proxy_cache_locked) {
+            if (proxy_cache_key) |cache_key| state.proxyCacheUnlock(cache_key);
+        };
         if (proxy_cache_key) |cache_key| {
-            if (try state.proxyCacheGetCopy(allocator, cache_key)) |cached| {
-                defer allocator.free(cached.body);
-                defer allocator.free(cached.content_type);
+            if (try state.proxyCacheGetCopyWithStale(allocator, cache_key, cfg.proxy_cache_stale_while_revalidate_seconds)) |lookup| {
+                defer allocator.free(lookup.cached.body);
+                defer allocator.free(lookup.cached.content_type);
 
                 var response = http.Response.init(allocator);
                 defer response.deinit();
-                _ = response.setStatus(@enumFromInt(cached.status))
-                    .setBody(cached.body)
-                    .setContentType(cached.content_type)
+                _ = response.setStatus(@enumFromInt(lookup.cached.status))
+                    .setBody(lookup.cached.body)
+                    .setContentType(lookup.cached.content_type)
                     .setConnection(keep_alive)
                     .setHeader(http.correlation.HEADER_NAME, correlation_id)
-                    .setHeader("X-Proxy-Cache", "HIT");
+                    .setHeader("X-Proxy-Cache", if (lookup.is_stale) "STALE" else "HIT");
                 state.security_headers.apply(&response);
                 try response.write(writer);
-                state.metricsRecord(cached.status);
-                logAccess(&ctx, request.method.toString(), "/v1/commands", cached.status, request.headers.get("user-agent") orelse "");
+                state.metricsRecord(lookup.cached.status);
+                logAccess(&ctx, request.method.toString(), "/v1/commands", lookup.cached.status, request.headers.get("user-agent") orelse "");
+                if (lookup.is_stale) {
+                    spawnProxyCacheRefresh(
+                        allocator,
+                        cfg,
+                        state,
+                        cache_key,
+                        .commands,
+                        cfg.proxy_pass_commands_prefix,
+                        upstream_path,
+                        envelope,
+                        client_ip,
+                        ctx.identity,
+                        ctx.api_version,
+                    );
+                }
                 return;
             }
+
+            if (!try state.proxyCacheTryLock(cache_key)) {
+                _ = state.proxyCacheWaitForUnlock(cache_key, cfg.proxy_cache_lock_timeout_ms);
+                if (try state.proxyCacheGetCopyWithStale(allocator, cache_key, 0)) |post_wait_lookup| {
+                    defer allocator.free(post_wait_lookup.cached.body);
+                    defer allocator.free(post_wait_lookup.cached.content_type);
+                    var response = http.Response.init(allocator);
+                    defer response.deinit();
+                    _ = response.setStatus(@enumFromInt(post_wait_lookup.cached.status))
+                        .setBody(post_wait_lookup.cached.body)
+                        .setContentType(post_wait_lookup.cached.content_type)
+                        .setConnection(keep_alive)
+                        .setHeader(http.correlation.HEADER_NAME, correlation_id)
+                        .setHeader("X-Proxy-Cache", "HIT");
+                    state.security_headers.apply(&response);
+                    try response.write(writer);
+                    state.metricsRecord(post_wait_lookup.cached.status);
+                    logAccess(&ctx, request.method.toString(), "/v1/commands", post_wait_lookup.cached.status, request.headers.get("user-agent") orelse "");
+                    return;
+                }
+            }
+            proxy_cache_locked = try state.proxyCacheTryLock(cache_key);
         }
 
         // --- Forward to upstream ---
-        const upstream_path = cmd.command_type.upstreamPath();
 
         // --- Circuit breaker check ---
         if (!state.circuitTryAcquire()) {
@@ -2218,30 +2422,72 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
             return;
         };
 
-        const proxy_cache_key = if (cfg.proxy_cache_ttl_seconds > 0)
+        const proxy_cache_bypass = shouldBypassProxyCache(&request.headers) or ctx.idempotency_key != null;
+        const proxy_cache_key = if (cfg.proxy_cache_ttl_seconds > 0 and !proxy_cache_bypass)
             try buildProxyCacheKey(allocator, cfg.proxy_cache_key_template, request.method.toString(), "/v1/chat", body, ctx.identity, ctx.api_version)
         else
             null;
         defer if (proxy_cache_key) |k| allocator.free(k);
+        var proxy_cache_locked = false;
+        defer if (proxy_cache_locked) {
+            if (proxy_cache_key) |cache_key| state.proxyCacheUnlock(cache_key);
+        };
         if (proxy_cache_key) |cache_key| {
-            if (try state.proxyCacheGetCopy(allocator, cache_key)) |cached| {
-                defer allocator.free(cached.body);
-                defer allocator.free(cached.content_type);
+            if (try state.proxyCacheGetCopyWithStale(allocator, cache_key, cfg.proxy_cache_stale_while_revalidate_seconds)) |lookup| {
+                defer allocator.free(lookup.cached.body);
+                defer allocator.free(lookup.cached.content_type);
 
                 var response = http.Response.init(allocator);
                 defer response.deinit();
-                _ = response.setStatus(@enumFromInt(cached.status))
-                    .setBody(cached.body)
-                    .setContentType(cached.content_type)
+                _ = response.setStatus(@enumFromInt(lookup.cached.status))
+                    .setBody(lookup.cached.body)
+                    .setContentType(lookup.cached.content_type)
                     .setConnection(keep_alive)
                     .setHeader(http.correlation.HEADER_NAME, correlation_id)
-                    .setHeader("X-Proxy-Cache", "HIT");
+                    .setHeader("X-Proxy-Cache", if (lookup.is_stale) "STALE" else "HIT");
                 state.security_headers.apply(&response);
                 try response.write(writer);
-                state.metricsRecord(cached.status);
-                logAccess(&ctx, request.method.toString(), "/v1/chat", cached.status, request.headers.get("user-agent") orelse "");
+                state.metricsRecord(lookup.cached.status);
+                logAccess(&ctx, request.method.toString(), "/v1/chat", lookup.cached.status, request.headers.get("user-agent") orelse "");
+                if (lookup.is_stale) {
+                    spawnProxyCacheRefresh(
+                        allocator,
+                        cfg,
+                        state,
+                        cache_key,
+                        .chat,
+                        cfg.proxy_pass_chat,
+                        null,
+                        body,
+                        client_ip,
+                        ctx.identity,
+                        ctx.api_version,
+                    );
+                }
                 return;
             }
+
+            if (!try state.proxyCacheTryLock(cache_key)) {
+                _ = state.proxyCacheWaitForUnlock(cache_key, cfg.proxy_cache_lock_timeout_ms);
+                if (try state.proxyCacheGetCopyWithStale(allocator, cache_key, 0)) |post_wait_lookup| {
+                    defer allocator.free(post_wait_lookup.cached.body);
+                    defer allocator.free(post_wait_lookup.cached.content_type);
+                    var response = http.Response.init(allocator);
+                    defer response.deinit();
+                    _ = response.setStatus(@enumFromInt(post_wait_lookup.cached.status))
+                        .setBody(post_wait_lookup.cached.body)
+                        .setContentType(post_wait_lookup.cached.content_type)
+                        .setConnection(keep_alive)
+                        .setHeader(http.correlation.HEADER_NAME, correlation_id)
+                        .setHeader("X-Proxy-Cache", "HIT");
+                    state.security_headers.apply(&response);
+                    try response.write(writer);
+                    state.metricsRecord(post_wait_lookup.cached.status);
+                    logAccess(&ctx, request.method.toString(), "/v1/chat", post_wait_lookup.cached.status, request.headers.get("user-agent") orelse "");
+                    return;
+                }
+            }
+            proxy_cache_locked = try state.proxyCacheTryLock(cache_key);
         }
 
         const message = parseChatMessage(allocator, body, cfg.max_message_chars) catch |err| {
@@ -2438,6 +2684,32 @@ fn isJsonContentType(content_type: ?[]const u8) bool {
     return std.mem.indexOf(u8, lower, JSON_CONTENT_TYPE) != null;
 }
 
+fn shouldBypassProxyCache(headers: *const http.Headers) bool {
+    if (headers.get("x-proxy-cache-bypass")) |raw| {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        if (std.ascii.eqlIgnoreCase(trimmed, "1") or std.ascii.eqlIgnoreCase(trimmed, "true") or std.ascii.eqlIgnoreCase(trimmed, "yes")) {
+            return true;
+        }
+    }
+
+    if (headers.get("pragma")) |pragma| {
+        if (std.ascii.indexOfIgnoreCase(pragma, "no-cache") != null) return true;
+    }
+
+    if (headers.get("cache-control")) |cache_control| {
+        var it = std.mem.splitScalar(u8, cache_control, ',');
+        while (it.next()) |part| {
+            const token = std.mem.trim(u8, part, " \t\r\n");
+            if (std.ascii.eqlIgnoreCase(token, "no-cache") or std.ascii.eqlIgnoreCase(token, "no-store")) return true;
+            if (std.ascii.startsWithIgnoreCase(token, "max-age=")) {
+                const val = std.mem.trim(u8, token["max-age=".len..], " \t\r\n");
+                if (std.mem.eql(u8, val, "0")) return true;
+            }
+        }
+    }
+    return false;
+}
+
 fn parseDeviceId(allocator: std.mem.Allocator, body: []const u8) ![]const u8 {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
     defer parsed.deinit();
@@ -2450,6 +2722,18 @@ fn parseDeviceId(allocator: std.mem.Allocator, body: []const u8) ![]const u8 {
     if (device_id.len == 0) return error.EmptyDeviceId;
     if (device_id.len > 256) return error.DeviceIdTooLong;
     return try allocator.dupe(u8, device_id);
+}
+
+fn parseCachePurgeKey(allocator: std.mem.Allocator, body: []const u8) ![]const u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+
+    const obj = parsed.value.object;
+    const key_val = obj.get("key") orelse return error.NoPurgeKey;
+    if (key_val != .string) return error.NoPurgeKey;
+    const key = std.mem.trim(u8, key_val.string, " \t\r\n");
+    if (key.len == 0) return error.NoPurgeKey;
+    return try allocator.dupe(u8, key);
 }
 
 fn parseChatMessage(allocator: std.mem.Allocator, body: []const u8, max_len: usize) ![]const u8 {
@@ -2521,6 +2805,108 @@ fn buildProxyCacheKey(
     return out.toOwnedSlice();
 }
 
+fn proxyCacheFilePath(allocator: std.mem.Allocator, cache_path: []const u8, key: []const u8) ![]u8 {
+    var key_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(key, &key_digest, .{});
+    var key_digest_hex: [64]u8 = undefined;
+    _ = std.fmt.bufPrint(&key_digest_hex, "{s}", .{std.fmt.fmtSliceHexLower(&key_digest)}) catch unreachable;
+    return std.fmt.allocPrint(allocator, "{s}/{s}.cache", .{ cache_path, key_digest_hex[0..] });
+}
+
+fn proxyCacheWriteToDisk(cache_path: []const u8, key: []const u8, status: u16, body: []const u8, content_type: []const u8) !void {
+    if (cache_path.len == 0) return;
+    std.fs.cwd().makePath(cache_path) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+
+    const allocator = std.heap.page_allocator;
+    const file_path = try proxyCacheFilePath(allocator, cache_path, key);
+    defer allocator.free(file_path);
+
+    const file = try std.fs.cwd().createFile(file_path, .{ .truncate = true, .read = true });
+    defer file.close();
+    var writer = file.writer();
+    try writer.print("{d}\n{d}\n{s}\n\n", .{ status, std.time.nanoTimestamp(), content_type });
+    try writer.writeAll(body);
+}
+
+fn proxyCacheReadFromDisk(
+    allocator: std.mem.Allocator,
+    cache_path: []const u8,
+    key: []const u8,
+    ttl_seconds: u32,
+    stale_seconds: u32,
+) !?ProxyCacheLookup {
+    if (cache_path.len == 0) return null;
+    const file_path = try proxyCacheFilePath(allocator, cache_path, key);
+    defer allocator.free(file_path);
+
+    const raw = std.fs.cwd().readFileAlloc(allocator, file_path, 16 * 1024 * 1024) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer allocator.free(raw);
+
+    const l1 = std.mem.indexOfScalar(u8, raw, '\n') orelse return null;
+    const l2 = std.mem.indexOfScalarPos(u8, raw, l1 + 1, '\n') orelse return null;
+    const l3 = std.mem.indexOfScalarPos(u8, raw, l2 + 1, '\n') orelse return null;
+    if (l3 + 1 >= raw.len or raw[l3 + 1] != '\n') return null;
+    const body_start = l3 + 2;
+
+    const status = std.fmt.parseInt(u16, std.mem.trim(u8, raw[0..l1], " \t\r\n"), 10) catch return null;
+    const created_ns = std.fmt.parseInt(i128, std.mem.trim(u8, raw[l1 + 1 .. l2], " \t\r\n"), 10) catch return null;
+    const ct_slice = std.mem.trim(u8, raw[l2 + 1 .. l3], " \t\r\n");
+    const now_ns = std.time.nanoTimestamp();
+    const age_ns = now_ns - created_ns;
+    const ttl_ns: i128 = @as(i128, ttl_seconds) * std.time.ns_per_s;
+    const stale_ns: i128 = @as(i128, stale_seconds) * std.time.ns_per_s;
+    if (age_ns > ttl_ns + stale_ns) {
+        _ = proxyCacheDeleteFromDisk(cache_path, key);
+        return null;
+    }
+
+    const body = try allocator.dupe(u8, raw[body_start..]);
+    errdefer allocator.free(body);
+    const ct = try allocator.dupe(u8, ct_slice);
+    return .{
+        .cached = .{
+            .status = status,
+            .body = body,
+            .content_type = ct,
+            .created_ns = created_ns,
+        },
+        .is_stale = age_ns > ttl_ns,
+    };
+}
+
+fn proxyCacheDeleteFromDisk(cache_path: []const u8, key: []const u8) bool {
+    if (cache_path.len == 0) return false;
+    const allocator = std.heap.page_allocator;
+    const file_path = proxyCacheFilePath(allocator, cache_path, key) catch return false;
+    defer allocator.free(file_path);
+    std.fs.cwd().deleteFile(file_path) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return false,
+    };
+    return true;
+}
+
+fn proxyCachePurgeDisk(cache_path: []const u8) usize {
+    if (cache_path.len == 0) return 0;
+    var dir = std.fs.cwd().openDir(cache_path, .{ .iterate = true }) catch return 0;
+    defer dir.close();
+
+    var removed: usize = 0;
+    var it = dir.iterate();
+    while (it.next() catch null) |entry| {
+        if (entry.kind != .file) continue;
+        dir.deleteFile(entry.name) catch continue;
+        removed += 1;
+    }
+    return removed;
+}
+
 const ProxyResult = struct {
     status: u16,
     body: []u8,
@@ -2532,6 +2918,142 @@ const ProxyExecution = union(enum) {
     streamed_status: u16,
     buffered: ProxyResult,
 };
+
+const ProxyCacheRefreshTask = struct {
+    allocator: std.mem.Allocator,
+    cfg: *const edge_config.EdgeConfig,
+    state: *GatewayState,
+    cache_key: []u8,
+    upstream_scope: UpstreamScope,
+    proxy_pass_target: []const u8,
+    suffix_path: ?[]u8,
+    payload: []u8,
+    client_ip: []u8,
+    identity: ?[]u8,
+    api_version: ?u32,
+};
+
+fn proxyCacheRefreshThread(task: *ProxyCacheRefreshTask) void {
+    defer {
+        task.allocator.free(task.cache_key);
+        if (task.suffix_path) |suffix| task.allocator.free(suffix);
+        task.allocator.free(task.payload);
+        task.allocator.free(task.client_ip);
+        if (task.identity) |id| task.allocator.free(id);
+        task.state.proxyCacheUnlock(task.cache_key);
+        task.allocator.destroy(task);
+    }
+
+    const exec = proxyJsonExecute(
+        task.allocator,
+        task.cfg,
+        task.upstream_scope,
+        task.proxy_pass_target,
+        task.suffix_path,
+        task.payload,
+        "proxy-cache-refresh",
+        task.client_ip,
+        task.identity,
+        task.api_version,
+        null,
+        null,
+        std.io.null_writer,
+        task.state,
+        false,
+    ) catch return;
+
+    switch (exec) {
+        .streamed_status => |_| {},
+        .buffered => |result| {
+            defer task.allocator.free(result.body);
+            defer task.allocator.free(result.content_type);
+            if (result.content_disposition) |cd| task.allocator.free(cd);
+            if (result.status == 200) {
+                task.state.proxyCachePut(task.cache_key, result.status, result.body, result.content_type) catch {};
+            }
+        },
+    }
+}
+
+fn spawnProxyCacheRefresh(
+    allocator: std.mem.Allocator,
+    cfg: *const edge_config.EdgeConfig,
+    state: *GatewayState,
+    cache_key: []const u8,
+    upstream_scope: UpstreamScope,
+    proxy_pass_target: []const u8,
+    suffix_path: ?[]const u8,
+    payload: []const u8,
+    client_ip: []const u8,
+    identity: ?[]const u8,
+    api_version: ?u32,
+) void {
+    if (!(state.proxyCacheTryLock(cache_key) catch false)) return;
+
+    const task = allocator.create(ProxyCacheRefreshTask) catch {
+        state.proxyCacheUnlock(cache_key);
+        return;
+    };
+    errdefer allocator.destroy(task);
+
+    const owned_key = allocator.dupe(u8, cache_key) catch {
+        state.proxyCacheUnlock(cache_key);
+        return;
+    };
+    errdefer allocator.free(owned_key);
+    const owned_payload = allocator.dupe(u8, payload) catch {
+        state.proxyCacheUnlock(cache_key);
+        return;
+    };
+    errdefer allocator.free(owned_payload);
+    const owned_ip = allocator.dupe(u8, client_ip) catch {
+        state.proxyCacheUnlock(cache_key);
+        return;
+    };
+    errdefer allocator.free(owned_ip);
+    const owned_suffix = if (suffix_path) |suffix|
+        allocator.dupe(u8, suffix) catch {
+            state.proxyCacheUnlock(cache_key);
+            return;
+        }
+    else
+        null;
+    errdefer if (owned_suffix) |s| allocator.free(s);
+    const owned_identity = if (identity) |id|
+        allocator.dupe(u8, id) catch {
+            state.proxyCacheUnlock(cache_key);
+            return;
+        }
+    else
+        null;
+    errdefer if (owned_identity) |id| allocator.free(id);
+
+    task.* = .{
+        .allocator = allocator,
+        .cfg = cfg,
+        .state = state,
+        .cache_key = owned_key,
+        .upstream_scope = upstream_scope,
+        .proxy_pass_target = proxy_pass_target,
+        .suffix_path = owned_suffix,
+        .payload = owned_payload,
+        .client_ip = owned_ip,
+        .identity = owned_identity,
+        .api_version = api_version,
+    };
+
+    const thread = std.Thread.spawn(.{}, proxyCacheRefreshThread, .{task}) catch {
+        state.proxyCacheUnlock(cache_key);
+        allocator.free(owned_key);
+        allocator.free(owned_payload);
+        allocator.free(owned_ip);
+        if (owned_suffix) |s| allocator.free(s);
+        if (owned_identity) |id| allocator.free(id);
+        allocator.destroy(task);
+        return;
+    };
+    thread.detach();
+}
 
 fn proxyJsonExecute(
     allocator: std.mem.Allocator,
@@ -3355,7 +3877,11 @@ test "resolveProxyTarget handles absolute and relative proxy_pass" {
         .security_headers_enabled = false,
         .idempotency_ttl_seconds = 0,
         .proxy_cache_ttl_seconds = 0,
+        .proxy_cache_path = "",
         .proxy_cache_key_template = "method:path:payload_sha256",
+        .proxy_cache_stale_while_revalidate_seconds = 0,
+        .proxy_cache_lock_timeout_ms = 250,
+        .proxy_cache_manager_interval_ms = 30_000,
         .session_ttl_seconds = 0,
         .session_max = 0,
         .access_control_rules = "",
@@ -3454,7 +3980,11 @@ test "authorizeRequest accepts valid hash" {
         .security_headers_enabled = false,
         .idempotency_ttl_seconds = 0,
         .proxy_cache_ttl_seconds = 0,
+        .proxy_cache_path = "",
         .proxy_cache_key_template = "method:path:payload_sha256",
+        .proxy_cache_stale_while_revalidate_seconds = 0,
+        .proxy_cache_lock_timeout_ms = 250,
+        .proxy_cache_manager_interval_ms = 30_000,
         .session_ttl_seconds = 0,
         .session_max = 0,
         .access_control_rules = "",

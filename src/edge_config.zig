@@ -76,9 +76,17 @@ pub const EdgeConfig = struct {
     idempotency_ttl_seconds: u32,
     /// Proxy response cache TTL in seconds (0 = disabled).
     proxy_cache_ttl_seconds: u32,
+    /// Optional proxy cache path for disk-backed/tiered caching.
+    proxy_cache_path: []const u8,
     /// Proxy cache key template, colon-separated tokens:
     /// method,path,payload_sha256,identity,api_version
     proxy_cache_key_template: []const u8,
+    /// Additional stale serving window after TTL expiry (seconds).
+    proxy_cache_stale_while_revalidate_seconds: u32,
+    /// Max time to wait for another request populating the same cache key.
+    proxy_cache_lock_timeout_ms: u32,
+    /// Proxy cache manager maintenance interval in milliseconds.
+    proxy_cache_manager_interval_ms: u64,
     /// Session idle TTL in seconds (0 = sessions disabled).
     session_ttl_seconds: u32,
     /// Maximum concurrent sessions (0 = unlimited).
@@ -172,6 +180,7 @@ pub const EdgeConfig = struct {
         for (self.auth_token_hashes) |h| allocator.free(h);
         allocator.free(self.auth_token_hashes);
         allocator.free(self.access_control_rules);
+        allocator.free(self.proxy_cache_path);
         allocator.free(self.proxy_cache_key_template);
         for (self.basic_auth_hashes) |h| allocator.free(h);
         allocator.free(self.basic_auth_hashes);
@@ -314,8 +323,19 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     const proxy_cache_ttl_str = envOrDefault(allocator, "TARDIGRADE_PROXY_CACHE_TTL_SECONDS", "0") catch unreachable;
     defer allocator.free(proxy_cache_ttl_str);
     const proxy_cache_ttl_seconds = std.fmt.parseInt(u32, proxy_cache_ttl_str, 10) catch 0;
+    const proxy_cache_path = envOrDefault(allocator, "TARDIGRADE_PROXY_CACHE_PATH", "") catch unreachable;
+    errdefer allocator.free(proxy_cache_path);
     const proxy_cache_key_template = envOrDefault(allocator, "TARDIGRADE_PROXY_CACHE_KEY_TEMPLATE", "method:path:payload_sha256") catch unreachable;
     errdefer allocator.free(proxy_cache_key_template);
+    const proxy_cache_stale_str = envOrDefault(allocator, "TARDIGRADE_PROXY_CACHE_STALE_WHILE_REVALIDATE_SECONDS", "0") catch unreachable;
+    defer allocator.free(proxy_cache_stale_str);
+    const proxy_cache_stale_while_revalidate_seconds = std.fmt.parseInt(u32, proxy_cache_stale_str, 10) catch 0;
+    const proxy_cache_lock_timeout_ms_str = envOrDefault(allocator, "TARDIGRADE_PROXY_CACHE_LOCK_TIMEOUT_MS", "250") catch unreachable;
+    defer allocator.free(proxy_cache_lock_timeout_ms_str);
+    const proxy_cache_lock_timeout_ms = std.fmt.parseInt(u32, proxy_cache_lock_timeout_ms_str, 10) catch 250;
+    const proxy_cache_manager_interval_ms_str = envOrDefault(allocator, "TARDIGRADE_PROXY_CACHE_MANAGER_INTERVAL_MS", "30000") catch unreachable;
+    defer allocator.free(proxy_cache_manager_interval_ms_str);
+    const proxy_cache_manager_interval_ms = std.fmt.parseInt(u64, proxy_cache_manager_interval_ms_str, 10) catch 30_000;
 
     const session_ttl_str = envOrDefault(allocator, "TARDIGRADE_SESSION_TTL", "3600") catch unreachable;
     defer allocator.free(session_ttl_str);
@@ -496,7 +516,11 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .security_headers_enabled = security_headers_enabled,
         .idempotency_ttl_seconds = idempotency_ttl_seconds,
         .proxy_cache_ttl_seconds = proxy_cache_ttl_seconds,
+        .proxy_cache_path = proxy_cache_path,
         .proxy_cache_key_template = proxy_cache_key_template,
+        .proxy_cache_stale_while_revalidate_seconds = proxy_cache_stale_while_revalidate_seconds,
+        .proxy_cache_lock_timeout_ms = proxy_cache_lock_timeout_ms,
+        .proxy_cache_manager_interval_ms = proxy_cache_manager_interval_ms,
         .session_ttl_seconds = session_ttl_seconds,
         .session_max = session_max,
         .access_control_rules = access_control_rules,

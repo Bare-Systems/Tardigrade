@@ -71,7 +71,11 @@ Environment variables:
 - `TARDIGRADE_PROXY_PASS_CHAT` (default `/v1/chat`; absolute URL or path target)
 - `TARDIGRADE_PROXY_PASS_COMMANDS_PREFIX` (default empty; absolute URL or path prefix used before command upstream subpaths)
 - `TARDIGRADE_PROXY_CACHE_TTL_SECONDS` (default `0`; in-memory proxy cache TTL in seconds; `0` disables proxy caching)
+- `TARDIGRADE_PROXY_CACHE_PATH` (default empty; optional disk cache directory used as a secondary proxy-cache tier)
 - `TARDIGRADE_PROXY_CACHE_KEY_TEMPLATE` (default `method:path:payload_sha256`; colon-delimited key token template; supported tokens: `method`, `path`, `payload_sha256`, `identity`, `api_version`)
+- `TARDIGRADE_PROXY_CACHE_STALE_WHILE_REVALIDATE_SECONDS` (default `0`; stale serving window after TTL expiry)
+- `TARDIGRADE_PROXY_CACHE_LOCK_TIMEOUT_MS` (default `250`; max wait for another in-flight request populating the same cache key)
+- `TARDIGRADE_PROXY_CACHE_MANAGER_INTERVAL_MS` (default `30000`; periodic cache-maintenance interval for in-memory expiration cleanup)
 - `TARDIGRADE_AUTH_TOKEN_HASHES` (comma-separated lowercase SHA-256 token hashes)
 - `TARDIGRADE_MAX_MESSAGE_CHARS` (default `4000`)
 - `TARDIGRADE_KEEP_ALIVE_TIMEOUT_MS` (default `5000`; idle timeout for keep-alive client connections)
@@ -92,6 +96,9 @@ Environment variables:
 - `TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_FAIL_THRESHOLD` (default `1`; consecutive active probe failures required before marking unhealthy)
 - `TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_SUCCESS_THRESHOLD` (default `1`; consecutive active probe successes required before clearing unhealthy state)
 - `TARDIGRADE_UPSTREAM_SLOW_START_MS` (default `0`; recovered-backend ramp window before full traffic share; `0` disables slow-start)
+
+Proxy cache management endpoint:
+- `POST /v1/cache/purge` (authenticated via bearer auth; optional JSON body `{ "key": "<cache-key>" }` for key-specific purge; no body purges all entries)
 
 ### Build for Production
 

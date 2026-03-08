@@ -8,6 +8,10 @@
   - Added `TARDIGRADE_PROXY_CACHE_TTL_SECONDS` and `TARDIGRADE_PROXY_CACHE_KEY_TEMPLATE`.
   - Added template-driven proxy cache key generation with token support for method/path/payload hash/identity/API version.
   - Added TTL-backed in-memory cache reads/writes for successful `/v1/chat` and `/v1/commands` proxy responses with `X-Proxy-Cache: HIT` on cache hits.
+- Phase 5 proxy cache completion (`src/edge_config.zig`, `src/edge_gateway.zig`, `src/http/idempotency.zig`):
+  - Added `TARDIGRADE_PROXY_CACHE_PATH` disk-backed cache tier, stale-serving controls, cache-lock timeout, and cache-manager interval configuration.
+  - Added cache bypass controls (`X-Proxy-Cache-Bypass`, cache-control pragma/no-cache directives) and authenticated cache purge endpoint `POST /v1/cache/purge`.
+  - Added stale cache responses (`X-Proxy-Cache: STALE`) with detached background refresh for chat/command routes plus periodic cache-manager expiration cleanup.
 
 ## [0.27.0] - 2026-03-xx
 

@@ -319,21 +319,29 @@ Resolved (incremental): upstream endpoint configuration now supports Unix domain
 ## PHASE 5: Caching
 
 ### 5.1 Proxy Cache
-- [ ] proxy_cache_path (disk-based)
+- [x] proxy_cache_path (disk-based)
 - [x] Cache key configuration
 - [x] Cache validity rules
-- [ ] Cache bypass conditions
-- [ ] Cache purging
+- [x] Cache bypass conditions
+- [x] Cache purging
 
 Resolved (incremental): added in-memory proxy cache controls via `TARDIGRADE_PROXY_CACHE_TTL_SECONDS` and `TARDIGRADE_PROXY_CACHE_KEY_TEMPLATE` with template-token key generation (`method`, `path`, `payload_sha256`, `identity`, `api_version`) and fallback defaults.
 Resolved (incremental): proxy gateway routes now apply TTL-based validity rules, serving cache hits with `X-Proxy-Cache: HIT` and storing successful (`200`) upstream responses for `/v1/chat` and `/v1/commands`.
+Resolved (incremental): added bypass controls via request headers (`X-Proxy-Cache-Bypass`, `Cache-Control: no-cache/no-store/max-age=0`, `Pragma: no-cache`) and admin purge endpoint `POST /v1/cache/purge` (authenticated; optional JSON `{ "key": "..." }` for key-specific purge).
+Resolved (incremental): added optional disk-backed cache path (`TARDIGRADE_PROXY_CACHE_PATH`) used as a secondary tier for proxy cache reads/writes and purge operations.
 
 ### 5.2 Advanced Caching
-- [ ] Stale content serving (stale-while-revalidate)
-- [ ] Cache locking (single request populates)
-- [ ] Background cache updates
-- [ ] Cache manager process
-- [ ] Memory + disk tiered caching
+- [x] Stale content serving (stale-while-revalidate)
+- [x] Cache locking (single request populates)
+- [x] Background cache updates
+- [x] Cache manager process
+- [x] Memory + disk tiered caching
+
+Resolved (incremental): added stale serving window via `TARDIGRADE_PROXY_CACHE_STALE_WHILE_REVALIDATE_SECONDS` with stale responses marked by `X-Proxy-Cache: STALE`.
+Resolved (incremental): added per-key proxy cache lock coordination with `TARDIGRADE_PROXY_CACHE_LOCK_TIMEOUT_MS` so concurrent misses wait briefly for an in-flight population.
+Resolved (incremental): stale hits now trigger detached background refresh attempts for chat/command proxy routes to repopulate cache asynchronously.
+Resolved (incremental): timer-loop cache manager maintenance (`TARDIGRADE_PROXY_CACHE_MANAGER_INTERVAL_MS`) now performs periodic in-memory proxy-cache expiration cleanup.
+Resolved (incremental): memory+disk tiering now checks memory first, falls back to disk cache path, and hydrates memory from disk hits.
 
 ### 5.3 Browser Caching
 - [x] Expires header

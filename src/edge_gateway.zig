@@ -10,13 +10,15 @@ const ADMIN_ROUTES_JSON =
     "{\"routes\":[" ++
     "\"/health\",\"/metrics\",\"/metrics/prometheus\"," ++
     "\"/admin/routes\",\"/admin/connections\",\"/admin/streams\",\"/admin/upstreams\",\"/admin/certs\",\"/admin/auth-registry\"," ++
-    "\"/v1/chat\",\"/v1/commands\",\"/v1/commands/status\",\"/v1/sessions\",\"/v1/cache/purge\"," ++
-    "\"/v1/ws/chat\",\"/v1/ws/commands\",\"/v1/events/stream\",\"/v1/events/publish\"," ++
+    "\"/v1/chat\",\"/v1/commands\",\"/v1/commands/status\",\"/v1/approvals/request\",\"/v1/approvals/respond\",\"/v1/approvals/status\",\"/v1/sessions\",\"/v1/cache/purge\"," ++
+    "\"/v1/ws/chat\",\"/v1/ws/commands\",\"/v1/ws/mux\",\"/v1/events/stream\",\"/v1/events/publish\"," ++
     "\"/v1/subrequest\",\"/v1/backend/fastcgi\",\"/v1/backend/uwsgi\",\"/v1/backend/scgi\",\"/v1/backend/grpc\",\"/v1/backend/memcached\"," ++
     "\"/v1/mail/smtp\",\"/v1/mail/imap\",\"/v1/mail/pop3\",\"/v1/stream/tcp\",\"/v1/stream/udp\"" ++
     "]}";
 const HTTP2_PREFACE = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 const HTTP2_MAX_FRAME_SIZE: usize = 16 * 1024;
+const WS_MUX_MAX_CHANNELS: usize = 32;
+const APPROVAL_TIMEOUT_MS: i64 = 60_000;
 const ProxyCacheLookup = struct {
     cached: http.idempotency.CachedResponse,
     is_stale: bool,
@@ -93,6 +95,82 @@ const CommandLifecycleEntry = struct {
     error_message: []u8,
 };
 
+const CommandLifecycleSnapshot = struct {
+    status: CommandLifecycleStatus,
+    response_status: u16,
+    response_body: []u8,
+    response_content_type: []u8,
+    error_message: []u8,
+
+    fn deinit(self: *CommandLifecycleSnapshot, allocator: std.mem.Allocator) void {
+        allocator.free(self.response_body);
+        allocator.free(self.response_content_type);
+        allocator.free(self.error_message);
+        self.* = undefined;
+    }
+};
+
+const ApprovalStatus = enum {
+    pending,
+    approved,
+    denied,
+    escalated,
+};
+
+const ApprovalDecision = enum {
+    approve,
+    deny,
+};
+
+const ApprovalValidation = enum {
+    approved,
+    pending,
+    denied,
+    escalated,
+    invalid,
+    missing,
+};
+
+const ApprovalEntry = struct {
+    method: []u8,
+    path: []u8,
+    identity: []u8,
+    command_id: []u8,
+    status: ApprovalStatus,
+    created_ms: i64,
+    expires_ms: i64,
+    decided_ms: i64,
+    decided_by: []u8,
+
+    fn deinit(self: *ApprovalEntry, allocator: std.mem.Allocator) void {
+        allocator.free(self.method);
+        allocator.free(self.path);
+        allocator.free(self.identity);
+        allocator.free(self.command_id);
+        allocator.free(self.decided_by);
+        self.* = undefined;
+    }
+};
+
+const ApprovalCreateResult = struct {
+    token: []u8,
+    expires_ms: i64,
+};
+
+const MuxChannelKind = enum {
+    events,
+    command,
+};
+
+const MuxChannel = struct {
+    name: []u8,
+    kind: MuxChannelKind,
+    topic: ?[]u8 = null,
+    last_event_id: u64 = 0,
+    command_id: ?[]u8 = null,
+    last_command_status: ?CommandLifecycleStatus = null,
+};
+
 /// Persistent gateway state shared across connections.
 const GatewayState = struct {
     allocator: std.mem.Allocator,
@@ -133,6 +211,7 @@ const GatewayState = struct {
     active_fds: std.AutoHashMap(std.posix.fd_t, void),
     fd_to_ip: std.AutoHashMap(std.posix.fd_t, []u8),
     command_lifecycle: std.StringHashMap(CommandLifecycleEntry),
+    approvals: std.StringHashMap(ApprovalEntry),
 
     fn deinit(self: *GatewayState) void {
         if (self.rate_limiter) |*rl| rl.deinit();
@@ -172,6 +251,12 @@ const GatewayState = struct {
             self.allocator.free(entry.value_ptr.error_message);
         }
         self.command_lifecycle.deinit();
+        var approval_it = self.approvals.iterator();
+        while (approval_it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            entry.value_ptr.deinit(self.allocator);
+        }
+        self.approvals.deinit();
     }
 
     fn tryAcquireConnectionSlot(self: *GatewayState, fd: std.posix.fd_t, ip_key: []const u8) !ConnectionSlotResult {
@@ -536,6 +621,113 @@ const GatewayState = struct {
             if (entry.response_body.len > 0 and (std.mem.startsWith(u8, entry.response_body, "{") or std.mem.startsWith(u8, entry.response_body, "["))) entry.response_body else "\"\"",
             entry.error_message,
         }) catch null;
+    }
+
+    fn commandLifecycleGet(self: *GatewayState, allocator: std.mem.Allocator, command_id: []const u8) ?CommandLifecycleSnapshot {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const entry = self.command_lifecycle.get(command_id) orelse return null;
+        const response_body = allocator.dupe(u8, entry.response_body) catch return null;
+        errdefer allocator.free(response_body);
+        const response_content_type = allocator.dupe(u8, entry.response_content_type) catch return null;
+        errdefer allocator.free(response_content_type);
+        const error_message = allocator.dupe(u8, entry.error_message) catch return null;
+        return .{
+            .status = entry.status,
+            .response_status = entry.response_status,
+            .response_body = response_body,
+            .response_content_type = response_content_type,
+            .error_message = error_message,
+        };
+    }
+
+    fn approvalCreate(self: *GatewayState, allocator: std.mem.Allocator, method: []const u8, path: []const u8, identity: []const u8, command_id: ?[]const u8) !ApprovalCreateResult {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var rnd: [16]u8 = undefined;
+        std.crypto.random.bytes(&rnd);
+        const token = try std.fmt.allocPrint(self.allocator, "apr-{d}-{s}", .{
+            std.time.milliTimestamp(),
+            std.fmt.fmtSliceHexLower(&rnd),
+        });
+        errdefer self.allocator.free(token);
+        const now = std.time.milliTimestamp();
+        const entry = ApprovalEntry{
+            .method = try self.allocator.dupe(u8, method),
+            .path = try self.allocator.dupe(u8, path),
+            .identity = try self.allocator.dupe(u8, identity),
+            .command_id = try self.allocator.dupe(u8, command_id orelse ""),
+            .status = .pending,
+            .created_ms = now,
+            .expires_ms = now + APPROVAL_TIMEOUT_MS,
+            .decided_ms = 0,
+            .decided_by = try self.allocator.dupe(u8, ""),
+        };
+        try self.approvals.put(token, entry);
+        return .{
+            .token = try allocator.dupe(u8, token),
+            .expires_ms = entry.expires_ms,
+        };
+    }
+
+    fn approvalRespond(self: *GatewayState, token: []const u8, decision: ApprovalDecision, actor: []const u8) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const entry = self.approvals.getPtr(token) orelse return false;
+        self.approvalEscalateIfExpiredLocked(entry);
+        if (entry.status != .pending) return false;
+        entry.status = if (decision == .approve) .approved else .denied;
+        entry.decided_ms = std.time.milliTimestamp();
+        self.allocator.free(entry.decided_by);
+        entry.decided_by = self.allocator.dupe(u8, actor) catch self.allocator.dupe(u8, "") catch return false;
+        return true;
+    }
+
+    fn approvalValidate(self: *GatewayState, token: []const u8, method: []const u8, path: []const u8, identity: ?[]const u8) ApprovalValidation {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const entry = self.approvals.getPtr(token) orelse return .missing;
+        self.approvalEscalateIfExpiredLocked(entry);
+        if (!http.rewrite.methodMatches(entry.method, method)) return .invalid;
+        if (!http.rewrite.regexMatches(entry.path, path)) return .invalid;
+        if (identity) |id| {
+            if (entry.identity.len > 0 and !std.mem.eql(u8, entry.identity, id)) return .invalid;
+        }
+        return switch (entry.status) {
+            .pending => .pending,
+            .approved => .approved,
+            .denied => .denied,
+            .escalated => .escalated,
+        };
+    }
+
+    fn approvalSnapshotJson(self: *GatewayState, allocator: std.mem.Allocator, token: []const u8) ?[]const u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const entry = self.approvals.getPtr(token) orelse return null;
+        self.approvalEscalateIfExpiredLocked(entry);
+        return std.fmt.allocPrint(allocator, "{{\"approval_token\":\"{s}\",\"status\":\"{s}\",\"method\":\"{s}\",\"path\":\"{s}\",\"identity\":\"{s}\",\"command_id\":{s},\"created_ms\":{d},\"expires_ms\":{d},\"decided_ms\":{d},\"decided_by\":{s}}}", .{
+            token,
+            @tagName(entry.status),
+            entry.method,
+            entry.path,
+            entry.identity,
+            if (entry.command_id.len > 0) std.json.fmt(entry.command_id, .{}) else "null",
+            entry.created_ms,
+            entry.expires_ms,
+            entry.decided_ms,
+            if (entry.decided_by.len > 0) std.json.fmt(entry.decided_by, .{}) else "null",
+        }) catch null;
+    }
+
+    fn approvalEscalateIfExpiredLocked(_: *GatewayState, entry: *ApprovalEntry) void {
+        if (entry.status != .pending) return;
+        const now = std.time.milliTimestamp();
+        if (now >= entry.expires_ms) {
+            entry.status = .escalated;
+            entry.decided_ms = now;
+        }
     }
 
     fn circuitTryAcquire(self: *GatewayState) bool {
@@ -1240,6 +1432,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         .active_fds = std.AutoHashMap(std.posix.fd_t, void).init(state_allocator),
         .fd_to_ip = std.AutoHashMap(std.posix.fd_t, []u8).init(state_allocator),
         .command_lifecycle = std.StringHashMap(CommandLifecycleEntry).init(state_allocator),
+        .approvals = std.StringHashMap(ApprovalEntry).init(state_allocator),
     };
     defer state.deinit();
     http.access_log.init(state_allocator, .{
@@ -2693,7 +2886,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
 
         const identity = try extractIdentityForPolicy(allocator, cfg, state, &request);
         defer if (identity) |id| allocator.free(id);
-        if (evaluatePolicy(cfg, request.method.toString(), request.uri.path, identity, request.headers.get("x-device-id"), &request.headers)) |reason| {
+        if (evaluatePolicy(state, cfg, request.method.toString(), request.uri.path, identity, request.headers.get("x-device-id"), &request.headers)) |reason| {
             try sendApiError(allocator, writer, .forbidden, "forbidden", reason, correlation_id, keep_alive, state);
             logAccess(&ctx, request.method.toString(), request.uri.path, 403, request.headers.get("user-agent") orelse "");
             return;
@@ -3100,6 +3293,80 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
     }
 
     // --- WebSocket proxy routes ---
+    if (request.method == .GET and http.api_router.matchRoute(request.uri.path, 1, "/ws/mux")) {
+        if (!cfg.websocket_enabled or !cfg.sse_enabled) {
+            try sendApiError(allocator, writer, .not_found, "invalid_request", "Not Found", correlation_id, false, state);
+            logAccess(&ctx, request.method.toString(), request.uri.path, 404, request.headers.get("user-agent") orelse "");
+            return;
+        }
+        if (!http.websocket.isUpgradeRequest(&request.headers)) {
+            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Expected websocket upgrade request", correlation_id, false, state);
+            logAccess(&ctx, request.method.toString(), request.uri.path, 400, request.headers.get("user-agent") orelse "");
+            return;
+        }
+        var authenticated = false;
+        const auth_result = authorizeRequest(cfg, &request.headers);
+        if (auth_result.ok) {
+            ctx.setIdentity(auth_result.token_hash orelse "-");
+            authenticated = true;
+        }
+        if (!authenticated) {
+            if (http.session.fromHeaders(&request.headers)) |session_token| {
+                if (state.validateSessionIdentity(allocator, session_token)) |identity| {
+                    defer allocator.free(identity);
+                    ctx.setIdentity(identity);
+                    authenticated = true;
+                }
+            }
+        }
+        if (!authenticated) {
+            try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, false, state);
+            logAccess(&ctx, request.method.toString(), request.uri.path, 401, request.headers.get("user-agent") orelse "");
+            return;
+        }
+        const device_id = request.headers.get("x-device-id") orelse {
+            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Missing X-Device-ID for multiplex stream", correlation_id, false, state);
+            logAccess(&ctx, request.method.toString(), request.uri.path, 400, request.headers.get("user-agent") orelse "");
+            return;
+        };
+        if (!isValidDeviceTopicSegment(device_id)) {
+            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Invalid device id", correlation_id, false, state);
+            logAccess(&ctx, request.method.toString(), request.uri.path, 400, request.headers.get("user-agent") orelse "");
+            return;
+        }
+
+        const ws_key = request.headers.get("sec-websocket-key") orelse {
+            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Missing Sec-WebSocket-Key", correlation_id, false, state);
+            logAccess(&ctx, request.method.toString(), request.uri.path, 400, request.headers.get("user-agent") orelse "");
+            return;
+        };
+        const accept_key = try http.websocket.acceptKey(allocator, ws_key);
+        defer allocator.free(accept_key);
+        try http.websocket.writeServerHandshake(writer, accept_key, request.headers.get("sec-websocket-protocol"));
+
+        state.streamCountAdjust(1, 1);
+        defer state.streamCountAdjust(-1, -1);
+        handleWebSocketMultiplexLoop(
+            conn,
+            allocator,
+            cfg,
+            state,
+            correlation_id,
+            client_ip,
+            ctx.identity,
+            ctx.api_version,
+            request.headers.get("host"),
+            request.headers.get("x-forwarded-for"),
+            device_id,
+        ) catch |err| {
+            state.logger.warn(correlation_id, "websocket multiplex loop ended: {}", .{err});
+        };
+        state.metricsRecord(101);
+        logAccess(&ctx, request.method.toString(), request.uri.path, 101, request.headers.get("user-agent") orelse "");
+        keep_alive = false;
+        return;
+    }
+
     if (request.method == .GET and (http.api_router.matchRoute(request.uri.path, 1, "/ws/chat") or http.api_router.matchRoute(request.uri.path, 1, "/ws/commands"))) {
         if (!cfg.websocket_enabled) {
             try sendApiError(allocator, writer, .not_found, "invalid_request", "Not Found", correlation_id, false, state);
@@ -3514,6 +3781,163 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         try response.write(writer);
         state.metricsRecord(200);
         logAccess(&ctx, request.method.toString(), "/v1/commands/status", 200, request.headers.get("user-agent") orelse "");
+        return;
+    }
+
+    // --- POST /v1/approvals/request ---
+    if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/approvals/request")) {
+        var authenticated = false;
+        const auth_result = authorizeRequest(cfg, &request.headers);
+        if (auth_result.ok) {
+            ctx.setIdentity(auth_result.token_hash orelse "-");
+            authenticated = true;
+        }
+        if (!authenticated) {
+            if (http.session.fromHeaders(&request.headers)) |session_token| {
+                if (state.validateSessionIdentity(allocator, session_token)) |identity| {
+                    defer allocator.free(identity);
+                    ctx.setIdentity(identity);
+                    authenticated = true;
+                }
+            }
+        }
+        if (!authenticated) {
+            try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, keep_alive, state);
+            logAccess(&ctx, request.method.toString(), "/v1/approvals/request", 401, request.headers.get("user-agent") orelse "");
+            return;
+        }
+        if (!isJsonContentType(request.contentType())) {
+            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Content-Type must be application/json", correlation_id, keep_alive, state);
+            logAccess(&ctx, request.method.toString(), "/v1/approvals/request", 400, request.headers.get("user-agent") orelse "");
+            return;
+        }
+        const body = request.body orelse {
+            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Missing request body", correlation_id, keep_alive, state);
+            logAccess(&ctx, request.method.toString(), "/v1/approvals/request", 400, request.headers.get("user-agent") orelse "");
+            return;
+        };
+        var approval_req = parseApprovalRequestBody(allocator, body) catch {
+            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Invalid approval request payload", correlation_id, keep_alive, state);
+            logAccess(&ctx, request.method.toString(), "/v1/approvals/request", 400, request.headers.get("user-agent") orelse "");
+            return;
+        };
+        defer approval_req.deinit(allocator);
+        if (!routeNeedsApproval(approval_req.method, approval_req.path, cfg.policy_approval_routes_raw) and
+            !routeRequiresApprovalRule(approval_req.method, approval_req.path, cfg.policy_rules_raw))
+        {
+            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Route does not require approval", correlation_id, keep_alive, state);
+            logAccess(&ctx, request.method.toString(), "/v1/approvals/request", 400, request.headers.get("user-agent") orelse "");
+            return;
+        }
+        const created = state.approvalCreate(allocator, approval_req.method, approval_req.path, ctx.identity orelse "-", approval_req.command_id) catch {
+            try sendApiError(allocator, writer, .internal_server_error, "internal_error", "Failed to create approval request", correlation_id, keep_alive, state);
+            logAccess(&ctx, request.method.toString(), "/v1/approvals/request", 500, request.headers.get("user-agent") orelse "");
+            return;
+        };
+        defer allocator.free(created.token);
+        _ = state.event_hub.publish("approvals.requests", body, http.event_loop.monotonicMs()) catch 0;
+        const response_body = try std.fmt.allocPrint(allocator, "{{\"approval_token\":\"{s}\",\"status\":\"pending\",\"expires_ms\":{d},\"status_url\":\"/v1/approvals/status?approval_token={s}\"}}", .{
+            created.token,
+            created.expires_ms,
+            created.token,
+        });
+        defer allocator.free(response_body);
+        var response = http.Response.json(allocator, response_body);
+        defer response.deinit();
+        _ = response.setStatus(.accepted).setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
+        applyResponseHeaders(state, &response);
+        try response.write(writer);
+        state.metricsRecord(202);
+        logAccess(&ctx, request.method.toString(), "/v1/approvals/request", 202, request.headers.get("user-agent") orelse "");
+        return;
+    }
+
+    // --- POST /v1/approvals/respond ---
+    if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/approvals/respond")) {
+        const auth_result = authorizeRequest(cfg, &request.headers);
+        if (!auth_result.ok) {
+            try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, keep_alive, state);
+            logAccess(&ctx, request.method.toString(), "/v1/approvals/respond", 401, request.headers.get("user-agent") orelse "");
+            return;
+        }
+        ctx.setIdentity(auth_result.token_hash orelse "-");
+        if (!isJsonContentType(request.contentType())) {
+            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Content-Type must be application/json", correlation_id, keep_alive, state);
+            logAccess(&ctx, request.method.toString(), "/v1/approvals/respond", 400, request.headers.get("user-agent") orelse "");
+            return;
+        }
+        const body = request.body orelse {
+            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Missing request body", correlation_id, keep_alive, state);
+            logAccess(&ctx, request.method.toString(), "/v1/approvals/respond", 400, request.headers.get("user-agent") orelse "");
+            return;
+        };
+        var approval_resp = parseApprovalResponseBody(allocator, body) catch {
+            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Invalid approval response payload", correlation_id, keep_alive, state);
+            logAccess(&ctx, request.method.toString(), "/v1/approvals/respond", 400, request.headers.get("user-agent") orelse "");
+            return;
+        };
+        defer approval_resp.deinit(allocator);
+        if (!state.approvalRespond(approval_resp.token, approval_resp.decision, ctx.identity orelse "-")) {
+            try sendApiError(allocator, writer, .conflict, "invalid_request", "Approval token not pending or not found", correlation_id, keep_alive, state);
+            logAccess(&ctx, request.method.toString(), "/v1/approvals/respond", 409, request.headers.get("user-agent") orelse "");
+            return;
+        }
+        _ = state.event_hub.publish("approvals.responses", body, http.event_loop.monotonicMs()) catch 0;
+        const response_body = try std.fmt.allocPrint(allocator, "{{\"approval_token\":\"{s}\",\"status\":\"{s}\"}}", .{
+            approval_resp.token,
+            if (approval_resp.decision == .approve) "approved" else "denied",
+        });
+        defer allocator.free(response_body);
+        var response = http.Response.json(allocator, response_body);
+        defer response.deinit();
+        _ = response.setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
+        applyResponseHeaders(state, &response);
+        try response.write(writer);
+        state.metricsRecord(200);
+        logAccess(&ctx, request.method.toString(), "/v1/approvals/respond", 200, request.headers.get("user-agent") orelse "");
+        return;
+    }
+
+    // --- GET /v1/approvals/status?approval_token=... ---
+    if (request.method == .GET and http.api_router.matchRoute(request.uri.path, 1, "/approvals/status")) {
+        var authenticated = false;
+        const auth_result = authorizeRequest(cfg, &request.headers);
+        if (auth_result.ok) {
+            ctx.setIdentity(auth_result.token_hash orelse "-");
+            authenticated = true;
+        }
+        if (!authenticated) {
+            if (http.session.fromHeaders(&request.headers)) |session_token| {
+                if (state.validateSessionIdentity(allocator, session_token)) |identity| {
+                    defer allocator.free(identity);
+                    ctx.setIdentity(identity);
+                    authenticated = true;
+                }
+            }
+        }
+        if (!authenticated) {
+            try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, keep_alive, state);
+            logAccess(&ctx, request.method.toString(), "/v1/approvals/status", 401, request.headers.get("user-agent") orelse "");
+            return;
+        }
+        const approval_token = parseQueryParam(request.uri.query orelse "", "approval_token") orelse {
+            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Missing approval_token", correlation_id, keep_alive, state);
+            logAccess(&ctx, request.method.toString(), "/v1/approvals/status", 400, request.headers.get("user-agent") orelse "");
+            return;
+        };
+        const snapshot = state.approvalSnapshotJson(allocator, approval_token) orelse {
+            try sendApiError(allocator, writer, .not_found, "invalid_request", "Unknown approval_token", correlation_id, keep_alive, state);
+            logAccess(&ctx, request.method.toString(), "/v1/approvals/status", 404, request.headers.get("user-agent") orelse "");
+            return;
+        };
+        defer allocator.free(snapshot);
+        var response = http.Response.json(allocator, snapshot);
+        defer response.deinit();
+        _ = response.setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
+        applyResponseHeaders(state, &response);
+        try response.write(writer);
+        state.metricsRecord(200);
+        logAccess(&ctx, request.method.toString(), "/v1/approvals/status", 200, request.headers.get("user-agent") orelse "");
         return;
     }
 
@@ -4291,6 +4715,353 @@ fn handleWebSocketProxyLoop(
     }
 }
 
+fn handleWebSocketMultiplexLoop(
+    conn: anytype,
+    allocator: std.mem.Allocator,
+    cfg: *const edge_config.EdgeConfig,
+    state: *GatewayState,
+    correlation_id: []const u8,
+    client_ip: []const u8,
+    identity: ?[]const u8,
+    api_version: ?u32,
+    incoming_host: ?[]const u8,
+    incoming_x_forwarded_for: ?[]const u8,
+    device_id: []const u8,
+) !void {
+    const writer = conn.writer();
+    var channels = std.ArrayList(MuxChannel).init(allocator);
+    defer {
+        for (channels.items) |*ch| deinitMuxChannel(allocator, ch);
+        channels.deinit();
+    }
+
+    var last_activity_ms = http.event_loop.monotonicMs();
+    var last_ping_ms = last_activity_ms;
+    while (!http.shutdown.isShutdownRequested()) {
+        const frame = http.websocket.readFrame(conn, allocator, cfg.websocket_max_frame_size) catch |err| switch (err) {
+            error.ConnectionClosed => return,
+            error.WouldBlock => {
+                try pollMuxChannels(writer, allocator, state, &channels);
+                const now_ms = http.event_loop.monotonicMs();
+                if (cfg.websocket_ping_interval_ms > 0 and now_ms - last_ping_ms >= cfg.websocket_ping_interval_ms) {
+                    try http.websocket.writeFrame(writer, .ping, "", true);
+                    last_ping_ms = now_ms;
+                }
+                if (cfg.websocket_idle_timeout_ms > 0 and now_ms - last_activity_ms >= cfg.websocket_idle_timeout_ms) return;
+                continue;
+            },
+            else => return err,
+        };
+        defer http.websocket.deinitFrame(allocator, &frame);
+        last_activity_ms = http.event_loop.monotonicMs();
+
+        switch (frame.opcode) {
+            .close => {
+                try http.websocket.writeFrame(writer, .close, "", true);
+                return;
+            },
+            .ping => {
+                try http.websocket.writeFrame(writer, .pong, frame.payload, true);
+                continue;
+            },
+            .pong, .binary, .continuation => continue,
+            .text => {},
+        }
+
+        const payload = std.mem.trim(u8, frame.payload, " \t\r\n");
+        if (payload.len == 0) continue;
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, payload, .{ .ignore_unknown_fields = true }) catch {
+            try http.websocket.writeFrame(writer, .text, "{\"type\":\"error\",\"message\":\"invalid json\"}", true);
+            continue;
+        };
+        defer parsed.deinit();
+        if (parsed.value != .object) {
+            try http.websocket.writeFrame(writer, .text, "{\"type\":\"error\",\"message\":\"invalid envelope\"}", true);
+            continue;
+        }
+        const obj = parsed.value.object;
+        const msg_type = parseMuxObjectFieldString(obj, "type") orelse {
+            try http.websocket.writeFrame(writer, .text, "{\"type\":\"error\",\"message\":\"missing type\"}", true);
+            continue;
+        };
+        const channel_name = parseMuxObjectFieldString(obj, "channel") orelse "default";
+
+        if (std.ascii.eqlIgnoreCase(msg_type, "subscribe")) {
+            const topic = parseMuxObjectFieldString(obj, "topic") orelse {
+                try http.websocket.writeFrame(writer, .text, "{\"type\":\"error\",\"message\":\"missing topic\"}", true);
+                continue;
+            };
+            if (!isValidDeviceTopicSegment(topic) or channels.items.len >= WS_MUX_MAX_CHANNELS) {
+                try http.websocket.writeFrame(writer, .text, "{\"type\":\"error\",\"message\":\"invalid or too many channels\"}", true);
+                continue;
+            }
+            const namespaced_topic = try std.fmt.allocPrint(allocator, "device/{s}/{s}", .{ device_id, topic });
+            defer allocator.free(namespaced_topic);
+            upsertMuxEventChannel(allocator, &channels, channel_name, namespaced_topic);
+            const ack = try std.fmt.allocPrint(allocator, "{{\"channel\":\"{s}\",\"type\":\"subscribed\",\"topic\":\"{s}\"}}", .{ channel_name, topic });
+            defer allocator.free(ack);
+            try http.websocket.writeFrame(writer, .text, ack, true);
+            continue;
+        }
+        if (std.ascii.eqlIgnoreCase(msg_type, "unsubscribe")) {
+            removeMuxChannel(allocator, &channels, channel_name);
+            const ack = try std.fmt.allocPrint(allocator, "{{\"channel\":\"{s}\",\"type\":\"unsubscribed\"}}", .{channel_name});
+            defer allocator.free(ack);
+            try http.websocket.writeFrame(writer, .text, ack, true);
+            continue;
+        }
+        if (std.ascii.eqlIgnoreCase(msg_type, "publish")) {
+            const topic = parseMuxObjectFieldString(obj, "topic") orelse {
+                try http.websocket.writeFrame(writer, .text, "{\"type\":\"error\",\"message\":\"missing topic\"}", true);
+                continue;
+            };
+            var payload_owned: ?[]u8 = null;
+            defer if (payload_owned) |owned| allocator.free(owned);
+            const msg = if (obj.get("payload")) |payload_value|
+                switch (payload_value) {
+                    .string => payload_value.string,
+                    else => blk: {
+                        const encoded = std.json.stringifyAlloc(allocator, payload_value, .{}) catch {
+                            try http.websocket.writeFrame(writer, .text, "{\"type\":\"error\",\"message\":\"invalid payload\"}", true);
+                            continue;
+                        };
+                        payload_owned = encoded;
+                        break :blk encoded;
+                    },
+                }
+            else
+                "";
+            if (!isValidDeviceTopicSegment(topic)) {
+                try http.websocket.writeFrame(writer, .text, "{\"type\":\"error\",\"message\":\"invalid topic\"}", true);
+                continue;
+            }
+            const namespaced_topic = try std.fmt.allocPrint(allocator, "device/{s}/{s}", .{ device_id, topic });
+            defer allocator.free(namespaced_topic);
+            const event_id = try state.event_hub.publish(namespaced_topic, msg, http.event_loop.monotonicMs());
+            const ack = try std.fmt.allocPrint(allocator, "{{\"channel\":\"{s}\",\"type\":\"published\",\"topic\":\"{s}\",\"id\":{d}}}", .{ channel_name, topic, event_id });
+            defer allocator.free(ack);
+            try http.websocket.writeFrame(writer, .text, ack, true);
+            continue;
+        }
+        if (std.ascii.eqlIgnoreCase(msg_type, "command")) {
+            var cmd = http.command.parseCommand(allocator, payload) catch {
+                try http.websocket.writeFrame(writer, .text, "{\"type\":\"error\",\"message\":\"invalid command envelope\"}", true);
+                continue;
+            };
+            defer cmd.deinit(allocator);
+            const command_id = if (cmd.command_id) |cid| try allocator.dupe(u8, cid) else try generateCommandId(allocator);
+            defer allocator.free(command_id);
+            const envelope = try http.command.buildUpstreamEnvelope(
+                allocator,
+                cmd.command_type,
+                cmd.params_raw,
+                command_id,
+                correlation_id,
+                identity orelse "-",
+                client_ip,
+                api_version,
+            );
+            defer allocator.free(envelope);
+
+            if (cmd.async_execute) {
+                state.commandLifecycleCreate(command_id, cmd.command_type.toString(), correlation_id, identity orelse "-") catch {};
+                spawnAsyncCommandExecution(
+                    allocator,
+                    cfg,
+                    state,
+                    command_id,
+                    cmd.command_type.toString(),
+                    cmd.command_type.upstreamPath(),
+                    envelope,
+                    correlation_id,
+                    client_ip,
+                    identity,
+                    api_version,
+                    incoming_host,
+                    incoming_x_forwarded_for,
+                );
+                upsertMuxCommandChannel(allocator, &channels, channel_name, command_id, .pending);
+                const ack = try std.fmt.allocPrint(allocator, "{{\"channel\":\"{s}\",\"type\":\"command.accepted\",\"command_id\":\"{s}\"}}", .{ channel_name, command_id });
+                defer allocator.free(ack);
+                try http.websocket.writeFrame(writer, .text, ack, true);
+                continue;
+            }
+
+            const exec = proxyJsonExecute(
+                allocator,
+                cfg,
+                .commands,
+                cfg.proxy_pass_commands_prefix,
+                cmd.command_type.upstreamPath(),
+                envelope,
+                correlation_id,
+                client_ip,
+                identity,
+                api_version,
+                incoming_host,
+                incoming_x_forwarded_for,
+                std.io.null_writer,
+                state,
+                false,
+            ) catch |err| {
+                const err_msg = try std.fmt.allocPrint(allocator, "{{\"channel\":\"{s}\",\"type\":\"command.error\",\"command_id\":\"{s}\",\"error\":\"{s}\"}}", .{ channel_name, command_id, @errorName(err) });
+                defer allocator.free(err_msg);
+                try http.websocket.writeFrame(writer, .text, err_msg, true);
+                continue;
+            };
+            switch (exec) {
+                .streamed_status => |status| {
+                    const msg = try std.fmt.allocPrint(allocator, "{{\"channel\":\"{s}\",\"type\":\"command.result\",\"command_id\":\"{s}\",\"status\":{d}}}", .{ channel_name, command_id, status });
+                    defer allocator.free(msg);
+                    try http.websocket.writeFrame(writer, .text, msg, true);
+                },
+                .buffered => |result| {
+                    defer allocator.free(result.body);
+                    defer allocator.free(result.content_type);
+                    if (result.content_disposition) |cd| allocator.free(cd);
+                    const body_is_json = std.mem.startsWith(u8, std.mem.trim(u8, result.body, " \t\r\n"), "{") or std.mem.startsWith(u8, std.mem.trim(u8, result.body, " \t\r\n"), "[");
+                    const msg = if (body_is_json)
+                        try std.fmt.allocPrint(allocator, "{{\"channel\":\"{s}\",\"type\":\"command.result\",\"command_id\":\"{s}\",\"status\":{d},\"body\":{s}}}", .{ channel_name, command_id, result.status, result.body })
+                    else
+                        try std.fmt.allocPrint(allocator, "{{\"channel\":\"{s}\",\"type\":\"command.result\",\"command_id\":\"{s}\",\"status\":{d},\"body\":{s}}}", .{ channel_name, command_id, result.status, std.json.fmt(result.body, .{}) });
+                    defer allocator.free(msg);
+                    try http.websocket.writeFrame(writer, .text, msg, true);
+                },
+            }
+            continue;
+        }
+
+        try http.websocket.writeFrame(writer, .text, "{\"type\":\"error\",\"message\":\"unknown type\"}", true);
+    }
+}
+
+fn deinitMuxChannel(allocator: std.mem.Allocator, ch: *MuxChannel) void {
+    allocator.free(ch.name);
+    if (ch.topic) |t| allocator.free(t);
+    if (ch.command_id) |id| allocator.free(id);
+    ch.* = undefined;
+}
+
+fn upsertMuxEventChannel(allocator: std.mem.Allocator, channels: *std.ArrayList(MuxChannel), channel_name: []const u8, topic: []const u8) void {
+    for (channels.items) |*ch| {
+        if (std.mem.eql(u8, ch.name, channel_name)) {
+            if (ch.topic) |old| allocator.free(old);
+            if (ch.command_id) |id| {
+                allocator.free(id);
+                ch.command_id = null;
+            }
+            ch.kind = .events;
+            ch.topic = allocator.dupe(u8, topic) catch null;
+            ch.last_event_id = 0;
+            ch.last_command_status = null;
+            return;
+        }
+    }
+    channels.append(.{
+        .name = allocator.dupe(u8, channel_name) catch return,
+        .kind = .events,
+        .topic = allocator.dupe(u8, topic) catch null,
+        .last_event_id = 0,
+        .command_id = null,
+        .last_command_status = null,
+    }) catch {};
+}
+
+fn upsertMuxCommandChannel(allocator: std.mem.Allocator, channels: *std.ArrayList(MuxChannel), channel_name: []const u8, command_id: []const u8, status: CommandLifecycleStatus) void {
+    for (channels.items) |*ch| {
+        if (std.mem.eql(u8, ch.name, channel_name)) {
+            if (ch.command_id) |old| allocator.free(old);
+            if (ch.topic) |old_topic| {
+                allocator.free(old_topic);
+                ch.topic = null;
+            }
+            ch.kind = .command;
+            ch.command_id = allocator.dupe(u8, command_id) catch null;
+            ch.last_command_status = status;
+            return;
+        }
+    }
+    channels.append(.{
+        .name = allocator.dupe(u8, channel_name) catch return,
+        .kind = .command,
+        .topic = null,
+        .last_event_id = 0,
+        .command_id = allocator.dupe(u8, command_id) catch null,
+        .last_command_status = status,
+    }) catch {};
+}
+
+fn removeMuxChannel(allocator: std.mem.Allocator, channels: *std.ArrayList(MuxChannel), channel_name: []const u8) void {
+    var i: usize = 0;
+    while (i < channels.items.len) : (i += 1) {
+        if (!std.mem.eql(u8, channels.items[i].name, channel_name)) continue;
+        var ch = channels.swapRemove(i);
+        deinitMuxChannel(allocator, &ch);
+        return;
+    }
+}
+
+fn pollMuxChannels(writer: anytype, allocator: std.mem.Allocator, state: *GatewayState, channels: *std.ArrayList(MuxChannel)) !void {
+    for (channels.items) |*ch| {
+        switch (ch.kind) {
+            .events => {
+                const topic = ch.topic orelse continue;
+                const events = state.event_hub.snapshotSince(allocator, topic, ch.last_event_id) catch continue;
+                defer http.event_hub.deinitSnapshot(allocator, events);
+                for (events) |event| {
+                    const msg = try std.fmt.allocPrint(allocator, "{{\"channel\":\"{s}\",\"type\":\"event\",\"topic\":{s},\"id\":{d},\"payload\":{s}}}", .{
+                        ch.name,
+                        std.json.fmt(topic, .{}),
+                        event.id,
+                        std.json.fmt(event.payload, .{}),
+                    });
+                    defer allocator.free(msg);
+                    try http.websocket.writeFrame(writer, .text, msg, true);
+                    ch.last_event_id = event.id;
+                }
+            },
+            .command => {
+                const command_id = ch.command_id orelse continue;
+                var snap = state.commandLifecycleGet(allocator, command_id) orelse continue;
+                defer snap.deinit(allocator);
+                if (ch.last_command_status != null and ch.last_command_status.? == snap.status) continue;
+                ch.last_command_status = snap.status;
+                const body_json = if (snap.response_body.len > 0 and (std.mem.startsWith(u8, std.mem.trim(u8, snap.response_body, " \t\r\n"), "{") or std.mem.startsWith(u8, std.mem.trim(u8, snap.response_body, " \t\r\n"), "[")))
+                    snap.response_body
+                else
+                    "\"\"";
+                const msg = try std.fmt.allocPrint(allocator, "{{\"channel\":\"{s}\",\"type\":\"command.update\",\"command_id\":\"{s}\",\"status\":\"{s}\",\"response_status\":{d},\"body\":{s},\"error\":{s}}}", .{
+                    ch.name,
+                    command_id,
+                    @tagName(snap.status),
+                    snap.response_status,
+                    body_json,
+                    std.json.fmt(snap.error_message, .{}),
+                });
+                defer allocator.free(msg);
+                try http.websocket.writeFrame(writer, .text, msg, true);
+            },
+        }
+    }
+}
+
+fn parseMuxObjectFieldString(obj: std.json.ObjectMap, field_name: []const u8) ?[]const u8 {
+    const v = obj.get(field_name) orelse return null;
+    if (v != .string) return null;
+    const trimmed = std.mem.trim(u8, v.string, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    return trimmed;
+}
+
+fn isValidDeviceTopicSegment(raw: []const u8) bool {
+    const s = std.mem.trim(u8, raw, " \t\r\n");
+    if (s.len == 0 or s.len > 128) return false;
+    for (s) |ch| {
+        if (!(std.ascii.isAlphanumeric(ch) or ch == '-' or ch == '_' or ch == '.')) return false;
+    }
+    return true;
+}
+
 fn serveTryFilesFallback(
     allocator: std.mem.Allocator,
     cfg: *const edge_config.EdgeConfig,
@@ -4928,6 +5699,9 @@ fn isGeoBlocked(blocked: []const []const u8, country: ?[]const u8) bool {
 fn isProtectedAuthRequestRoute(path: []const u8) bool {
     return http.api_router.matchRoute(path, 1, "/chat") or
         http.api_router.matchRoute(path, 1, "/commands") or
+        http.api_router.matchRoute(path, 1, "/approvals/request") or
+        http.api_router.matchRoute(path, 1, "/approvals/respond") or
+        http.api_router.matchRoute(path, 1, "/approvals/status") or
         http.api_router.matchRoute(path, 1, "/sessions") or
         http.api_router.matchRoute(path, 1, "/cache/purge") or
         http.api_router.matchRoute(path, 1, "/events/stream") or
@@ -4984,10 +5758,81 @@ fn matchHostPattern(pattern_raw: []const u8, host: []const u8) bool {
     return std.ascii.eqlIgnoreCase(pattern, host);
 }
 
+const ApprovalRequestBody = struct {
+    method: []u8,
+    path: []u8,
+    command_id: ?[]u8,
+
+    fn deinit(self: *ApprovalRequestBody, allocator: std.mem.Allocator) void {
+        allocator.free(self.method);
+        allocator.free(self.path);
+        if (self.command_id) |cid| allocator.free(cid);
+        self.* = undefined;
+    }
+};
+
+const ApprovalResponsePayload = struct {
+    token: []u8,
+    decision: ApprovalDecision,
+
+    fn deinit(self: *ApprovalResponsePayload, allocator: std.mem.Allocator) void {
+        allocator.free(self.token);
+        self.* = undefined;
+    }
+};
+
 const DeviceRegistration = struct {
     device_id: []const u8,
     public_key: []const u8,
 };
+
+fn parseApprovalRequestBody(allocator: std.mem.Allocator, body: []const u8) !ApprovalRequestBody {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidApprovalRequest;
+    const obj = parsed.value.object;
+    const method_val = obj.get("method") orelse return error.InvalidApprovalRequest;
+    const path_val = obj.get("path") orelse return error.InvalidApprovalRequest;
+    if (method_val != .string or path_val != .string) return error.InvalidApprovalRequest;
+    const method = std.mem.trim(u8, method_val.string, " \t\r\n");
+    const path = std.mem.trim(u8, path_val.string, " \t\r\n");
+    if (method.len == 0 or path.len == 0) return error.InvalidApprovalRequest;
+    var command_id: ?[]u8 = null;
+    if (obj.get("command_id")) |cid_val| {
+        if (cid_val == .string) {
+            const cid = std.mem.trim(u8, cid_val.string, " \t\r\n");
+            if (cid.len > 0) command_id = try allocator.dupe(u8, cid);
+        }
+    }
+    return .{
+        .method = try allocator.dupe(u8, method),
+        .path = try allocator.dupe(u8, path),
+        .command_id = command_id,
+    };
+}
+
+fn parseApprovalResponseBody(allocator: std.mem.Allocator, body: []const u8) !ApprovalResponsePayload {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidApprovalResponse;
+    const obj = parsed.value.object;
+    const token_val = obj.get("approval_token") orelse return error.InvalidApprovalResponse;
+    const decision_val = obj.get("decision") orelse return error.InvalidApprovalResponse;
+    if (token_val != .string or decision_val != .string) return error.InvalidApprovalResponse;
+    const token = std.mem.trim(u8, token_val.string, " \t\r\n");
+    const decision_raw = std.mem.trim(u8, decision_val.string, " \t\r\n");
+    if (token.len == 0 or decision_raw.len == 0) return error.InvalidApprovalResponse;
+    const decision = if (std.ascii.eqlIgnoreCase(decision_raw, "approve"))
+        ApprovalDecision.approve
+    else if (std.ascii.eqlIgnoreCase(decision_raw, "deny"))
+        ApprovalDecision.deny
+    else
+        return error.InvalidApprovalResponse;
+    return .{
+        .token = try allocator.dupe(u8, token),
+        .decision = decision,
+    };
+}
 
 fn parseDeviceRegistration(allocator: std.mem.Allocator, body: []const u8) !DeviceRegistration {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{ .ignore_unknown_fields = true });
@@ -5073,7 +5918,22 @@ fn extractIdentityForPolicy(
     return null;
 }
 
+fn approvalPolicyError(state: *GatewayState, method: []const u8, path: []const u8, identity: ?[]const u8, headers: *const http.Headers) ?[]const u8 {
+    const approval = headers.get("x-approval-token") orelse return "Approval required";
+    const token = std.mem.trim(u8, approval, " \t\r\n");
+    if (token.len == 0) return "Approval required";
+    return switch (state.approvalValidate(token, method, path, identity)) {
+        .approved => null,
+        .pending => "Approval pending",
+        .denied => "Approval denied",
+        .escalated => "Approval timed out and escalated",
+        .invalid => "Invalid approval token",
+        .missing => "Approval required",
+    };
+}
+
 fn evaluatePolicy(
+    state: *GatewayState,
     cfg: *const edge_config.EdgeConfig,
     method: []const u8,
     path: []const u8,
@@ -5081,9 +5941,14 @@ fn evaluatePolicy(
     device_id: ?[]const u8,
     headers: *const http.Headers,
 ) ?[]const u8 {
+    if (http.api_router.matchRoute(path, 1, "/approvals/request") or
+        http.api_router.matchRoute(path, 1, "/approvals/respond") or
+        http.api_router.matchRoute(path, 1, "/approvals/status"))
+    {
+        return null;
+    }
     if (cfg.policy_approval_routes_raw.len > 0 and routeNeedsApproval(method, path, cfg.policy_approval_routes_raw)) {
-        const approval = headers.get("x-approval-token") orelse return "Approval required";
-        if (std.mem.trim(u8, approval, " \t\r\n").len == 0) return "Approval required";
+        if (approvalPolicyError(state, method, path, identity, headers)) |reason| return reason;
     }
     if (cfg.policy_rules_raw.len == 0) return null;
     var rules = std.mem.splitScalar(u8, cfg.policy_rules_raw, ';');
@@ -5103,8 +5968,7 @@ fn evaluatePolicy(
 
         if (req_scope.len > 0 and !identityHasScope(cfg.policy_user_scopes_raw, identity, req_scope)) return "Missing required scope";
         if (std.ascii.eqlIgnoreCase(req_approval, "true")) {
-            const approval = headers.get("x-approval-token") orelse return "Approval required";
-            if (std.mem.trim(u8, approval, " \t\r\n").len == 0) return "Approval required";
+            if (approvalPolicyError(state, method, path, identity, headers)) |reason| return reason;
         }
         if (allowed_hours.len > 0 and !timeWindowAllows(allowed_hours)) return "Route not allowed at this time";
         if (device_pattern.len > 0) {
@@ -5113,6 +5977,25 @@ fn evaluatePolicy(
         }
     }
     return null;
+}
+
+fn routeRequiresApprovalRule(method: []const u8, path: []const u8, policy_rules_raw: []const u8) bool {
+    if (policy_rules_raw.len == 0) return false;
+    var rules = std.mem.splitScalar(u8, policy_rules_raw, ';');
+    while (rules.next()) |entry_raw| {
+        const entry = std.mem.trim(u8, entry_raw, " \t\r\n");
+        if (entry.len == 0) continue;
+        var parts = std.mem.splitScalar(u8, entry, '|');
+        const rule_method = std.mem.trim(u8, parts.next() orelse "", " \t");
+        const rule_pattern = std.mem.trim(u8, parts.next() orelse "", " \t");
+        _ = parts.next(); // scope
+        const req_approval = std.mem.trim(u8, parts.next() orelse "false", " \t");
+        if (rule_method.len == 0 or rule_pattern.len == 0) continue;
+        if (!http.rewrite.methodMatches(rule_method, method)) continue;
+        if (!http.rewrite.regexMatches(rule_pattern, path)) continue;
+        if (std.ascii.eqlIgnoreCase(req_approval, "true")) return true;
+    }
+    return false;
 }
 
 fn routeNeedsApproval(method: []const u8, path: []const u8, raw: []const u8) bool {
@@ -6772,4 +7655,45 @@ test "parseLastEventId handles invalid values" {
     try std.testing.expectEqual(@as(u64, 42), parseLastEventId("42"));
     try std.testing.expectEqual(@as(u64, 0), parseLastEventId("bad"));
     try std.testing.expectEqual(@as(u64, 0), parseLastEventId(null));
+}
+
+test "isValidDeviceTopicSegment accepts safe values" {
+    try std.testing.expect(isValidDeviceTopicSegment("device-1"));
+    try std.testing.expect(isValidDeviceTopicSegment("topic.alpha_2"));
+    try std.testing.expect(isValidDeviceTopicSegment("  status.update  "));
+}
+
+test "isValidDeviceTopicSegment rejects invalid values" {
+    try std.testing.expect(!isValidDeviceTopicSegment(""));
+    try std.testing.expect(!isValidDeviceTopicSegment("bad/topic"));
+    try std.testing.expect(!isValidDeviceTopicSegment("bad topic"));
+    try std.testing.expect(!isValidDeviceTopicSegment("..*"));
+}
+
+test "routeRequiresApprovalRule detects approval requirement" {
+    try std.testing.expect(routeRequiresApprovalRule("POST", "/v1/commands", "POST|/v1/commands|ops|true||"));
+    try std.testing.expect(!routeRequiresApprovalRule("POST", "/v1/chat", "POST|/v1/commands|ops|true||"));
+}
+
+test "parseApprovalResponseBody parses approve and deny" {
+    const allocator = std.testing.allocator;
+    var approve = try parseApprovalResponseBody(allocator, "{\"approval_token\":\"tok-1\",\"decision\":\"approve\"}");
+    defer approve.deinit(allocator);
+    try std.testing.expectEqualStrings("tok-1", approve.token);
+    try std.testing.expectEqual(ApprovalDecision.approve, approve.decision);
+
+    var deny = try parseApprovalResponseBody(allocator, "{\"approval_token\":\"tok-2\",\"decision\":\"deny\"}");
+    defer deny.deinit(allocator);
+    try std.testing.expectEqualStrings("tok-2", deny.token);
+    try std.testing.expectEqual(ApprovalDecision.deny, deny.decision);
+}
+
+test "parseApprovalRequestBody parses command scoped request" {
+    const allocator = std.testing.allocator;
+    var req = try parseApprovalRequestBody(allocator, "{\"method\":\"POST\",\"path\":\"/v1/commands\",\"command_id\":\"cmd-123\"}");
+    defer req.deinit(allocator);
+    try std.testing.expectEqualStrings("POST", req.method);
+    try std.testing.expectEqualStrings("/v1/commands", req.path);
+    try std.testing.expect(req.command_id != null);
+    try std.testing.expectEqualStrings("cmd-123", req.command_id.?);
 }

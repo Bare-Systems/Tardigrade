@@ -52,6 +52,17 @@
   - Added command envelope support for `command_id` and `async` mode.
   - Added in-memory command lifecycle tracking (`pending`, `running`, `completed`, `failed`) keyed by `command_id`.
   - Added async command submission (`POST /v1/commands` -> `202 Accepted`) and lifecycle polling endpoint (`GET /v1/commands/status?command_id=...`).
+- Phase 14.2 stream multiplexing completion increment (`src/edge_gateway.zig`):
+  - Added authenticated multiplexed WebSocket route `GET /v1/ws/mux` with channel-based envelopes (`subscribe`, `unsubscribe`, `publish`, `command`) over a single socket.
+  - Added multiplexed event and command channels, including async command lifecycle push updates (`command.update`) alongside event topic updates.
+  - Added per-device stream isolation for mux event channels by requiring `X-Device-ID` and namespacing topics as `device/<device_id>/<topic>`.
+- Phase 14.3 approval workflow completion increment (`src/edge_gateway.zig`):
+  - Added approval request routing endpoint `POST /v1/approvals/request` to mint route-bound approval tokens for approval-gated policy paths.
+  - Added approval response/status handling via `POST /v1/approvals/respond` and `GET /v1/approvals/status`, including explicit `approved|denied|pending` lifecycle states.
+  - Added timeout escalation behavior for pending approvals, with policy enforcement rejecting escalated or invalid approval tokens.
+- Phase 1.4 log rotation completion increment (`src/main.zig`):
+  - Added startup log rotation support for file-backed stderr logging configured by `TARDIGRADE_ERROR_LOG_PATH`.
+  - Added size and retention controls via `TARDIGRADE_LOG_ROTATE_MAX_BYTES` and `TARDIGRADE_LOG_ROTATE_MAX_FILES`.
 
 ## [0.28.0] - 2026-03-07
 

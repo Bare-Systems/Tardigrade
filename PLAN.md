@@ -145,9 +145,10 @@ Resolved: custom error pages implemented and samples added under `public/errors/
 - [x] Access log (combined format)
 - [x] Error log with severity levels
 - [x] Timestamps and request IDs
-- [ ] Log rotation support
+- [x] Log rotation support
 
 Resolved: Structured JSON logger implemented in `src/http/logger.zig`. Configurable severity levels (DEBUG/INFO/WARN/ERROR) via `TARDIGRADE_LOG_LEVEL` env var. JSON output to stderr with ISO 8601 timestamps, correlation IDs, and component names. Gateway uses structured logger for all startup and request-level logging.
+Resolved (incremental): startup log rotation support added in `src/main.zig` for file-backed stderr logging (`TARDIGRADE_ERROR_LOG_PATH`) with configurable size/file-count controls (`TARDIGRADE_LOG_ROTATE_MAX_BYTES`, `TARDIGRADE_LOG_ROTATE_MAX_FILES`).
 
 ## PHASE 2: Async I/O & Performance
 
@@ -692,14 +693,22 @@ Resolved (incremental): added in-memory command lifecycle tracking in `src/edge_
 Resolved (incremental): added asynchronous command execution mode for `POST /v1/commands` returning `202 Accepted` plus lifecycle polling endpoint `GET /v1/commands/status?command_id=...`.
 
 ### 14.2 Stream Multiplexing
-- [ ] multiplex multiple streams
-- [ ] command + event streams
-- [ ] per-device stream isolation
+- [x] multiplex multiple streams
+- [x] command + event streams
+- [x] per-device stream isolation
+
+Resolved (incremental): added authenticated multiplexed WebSocket route `GET /v1/ws/mux` in `src/edge_gateway.zig` with channel-based subscribe/unsubscribe/publish/command envelope handling over a single connection.
+Resolved (incremental): mux channels now support both event streams (topic subscriptions via event hub snapshots) and command streams (async lifecycle updates keyed by `command_id`), enabling mixed command+event traffic per socket.
+Resolved (incremental): mux event topics are now isolated per device by requiring `X-Device-ID` on mux connections and namespacing topics as `device/<device_id>/<topic>`.
 
 ### 14.3 Approval Workflows
-- [ ] approval request routing
-- [ ] approval response handling
-- [ ] timeout escalation
+- [x] approval request routing
+- [x] approval response handling
+- [x] timeout escalation
+
+Resolved (incremental): added authenticated approval request endpoint `POST /v1/approvals/request` in `src/edge_gateway.zig` to mint approval tokens bound to method/path/identity (and optional `command_id`) for routes gated by policy approval requirements.
+Resolved (incremental): added authenticated approval decision endpoint `POST /v1/approvals/respond` and status endpoint `GET /v1/approvals/status?approval_token=...` with explicit `approved|denied|pending` workflow state handling.
+Resolved (incremental): approval tokens now enforce timeout escalation; pending approvals auto-transition to `escalated` after timeout and policy checks reject escalated tokens with a stable authorization error.
 
 ## IMPLEMENTATION PRIORITY ORDER
 

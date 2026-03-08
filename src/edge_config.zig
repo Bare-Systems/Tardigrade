@@ -200,6 +200,24 @@ pub const EdgeConfig = struct {
     upstream_active_health_success_threshold: u32,
     /// Slow-start window (ms) for recovered upstreams before receiving full traffic (0 = disabled).
     upstream_slow_start_ms: u64,
+    /// Enable WebSocket upgrade routes.
+    websocket_enabled: bool,
+    /// Idle timeout for WebSocket connections in milliseconds.
+    websocket_idle_timeout_ms: u32,
+    /// Maximum payload size per WebSocket frame in bytes.
+    websocket_max_frame_size: usize,
+    /// Ping interval for WebSocket keepalive frames in milliseconds (0 = disabled).
+    websocket_ping_interval_ms: u32,
+    /// Enable SSE publish/stream routes.
+    sse_enabled: bool,
+    /// Maximum retained events per topic in the in-memory SSE hub.
+    sse_max_events_per_topic: usize,
+    /// SSE polling interval in milliseconds for long-lived stream loops.
+    sse_poll_interval_ms: u32,
+    /// Maximum tolerated replay backlog before forcing reconnect.
+    sse_max_backlog: usize,
+    /// Idle timeout for SSE streams in milliseconds (0 = disabled).
+    sse_idle_timeout_ms: u32,
 
     pub fn deinit(self: *EdgeConfig, allocator: std.mem.Allocator) void {
         allocator.free(self.listen_host);
@@ -642,6 +660,15 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     const slow_start_str = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_SLOW_START_MS", "0") catch unreachable;
     defer allocator.free(slow_start_str);
     const upstream_slow_start_ms = std.fmt.parseInt(u64, slow_start_str, 10) catch 0;
+    const websocket_enabled = parseBoolEnv(allocator, "TARDIGRADE_WEBSOCKET_ENABLED", true);
+    const websocket_idle_timeout_ms = parseIntEnv(u32, allocator, "TARDIGRADE_WEBSOCKET_IDLE_TIMEOUT_MS", 60_000);
+    const websocket_max_frame_size = parseIntEnv(usize, allocator, "TARDIGRADE_WEBSOCKET_MAX_FRAME_SIZE", 1024 * 1024);
+    const websocket_ping_interval_ms = parseIntEnv(u32, allocator, "TARDIGRADE_WEBSOCKET_PING_INTERVAL_MS", 15_000);
+    const sse_enabled = parseBoolEnv(allocator, "TARDIGRADE_SSE_ENABLED", true);
+    const sse_max_events_per_topic = parseIntEnv(usize, allocator, "TARDIGRADE_SSE_MAX_EVENTS_PER_TOPIC", 1024);
+    const sse_poll_interval_ms = parseIntEnv(u32, allocator, "TARDIGRADE_SSE_POLL_INTERVAL_MS", 250);
+    const sse_max_backlog = parseIntEnv(usize, allocator, "TARDIGRADE_SSE_MAX_BACKLOG", 1024);
+    const sse_idle_timeout_ms = parseIntEnv(u32, allocator, "TARDIGRADE_SSE_IDLE_TIMEOUT_MS", 60_000);
 
     return .{
         .listen_host = listen_host,
@@ -749,6 +776,15 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .upstream_active_health_fail_threshold = upstream_active_health_fail_threshold,
         .upstream_active_health_success_threshold = upstream_active_health_success_threshold,
         .upstream_slow_start_ms = upstream_slow_start_ms,
+        .websocket_enabled = websocket_enabled,
+        .websocket_idle_timeout_ms = websocket_idle_timeout_ms,
+        .websocket_max_frame_size = websocket_max_frame_size,
+        .websocket_ping_interval_ms = websocket_ping_interval_ms,
+        .sse_enabled = sse_enabled,
+        .sse_max_events_per_topic = sse_max_events_per_topic,
+        .sse_poll_interval_ms = sse_poll_interval_ms,
+        .sse_max_backlog = sse_max_backlog,
+        .sse_idle_timeout_ms = sse_idle_timeout_ms,
     };
 }
 

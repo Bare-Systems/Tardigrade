@@ -1,6 +1,16 @@
 
 # Changelog
 
+## [0.29.0] - 2026-03-08
+
+### Added
+- Phase 9 WebSocket + SSE/event-streaming foundation (`src/http/websocket.zig`, `src/http/event_hub.zig`, `src/edge_config.zig`, `src/edge_gateway.zig`, `src/http.zig`):
+  - Added authenticated WebSocket upgrade routes for `/v1/ws/chat` and `/v1/ws/commands` with in-house RFC6455 handshake/framing.
+  - Added WebSocket ping/pong handling, idle timeout, frame-size caps, and upstream proxy forwarding via existing load-balanced upstream execution.
+  - Added authenticated SSE publish/stream routes (`POST /v1/events/publish`, `GET /v1/events/stream`) with `Last-Event-ID` replay support.
+  - Added in-memory topic event hub buffering and slow-client backlog protection controls.
+  - Added new runtime config env vars: `TARDIGRADE_WEBSOCKET_*` and `TARDIGRADE_SSE_*`.
+
 ## [0.28.0] - 2026-03-07
 
 ### Added

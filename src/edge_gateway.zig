@@ -82,6 +82,7 @@ const GatewayState = struct {
     compression_config: http.compression.CompressionConfig,
     circuit_breaker: http.circuit_breaker.CircuitBreaker,
     upstream_client: std.http.Client,
+    event_hub: http.event_hub.EventHub,
     request_buffer_pool: http.buffer_pool.BufferPool,
     relay_buffer_pool: http.buffer_pool.BufferPool,
     max_connections_per_ip: u32,
@@ -108,6 +109,7 @@ const GatewayState = struct {
         if (self.session_store) |*ss| ss.deinit();
         if (self.access_control) |*acl| acl.deinit();
         self.upstream_client.deinit();
+        self.event_hub.deinit();
         self.request_buffer_pool.deinit();
         self.relay_buffer_pool.deinit();
         var upstream_it = self.upstream_health.iterator();
@@ -1023,6 +1025,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
             .timeout_ms = cfg.cb_timeout_ms,
         }),
         .upstream_client = .{ .allocator = state_allocator },
+        .event_hub = http.event_hub.EventHub.init(state_allocator, cfg.sse_max_events_per_topic),
         .request_buffer_pool = http.buffer_pool.BufferPool.init(state_allocator, MAX_REQUEST_SIZE, cfg.connection_pool_size),
         .relay_buffer_pool = http.buffer_pool.BufferPool.init(state_allocator, STREAM_RELAY_BUFFER_SIZE, cfg.connection_pool_size),
         .max_connections_per_ip = cfg.max_connections_per_ip,
@@ -1167,6 +1170,21 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     }
     if (cfg.trust_require_upstream_identity) {
         state.logger.info(null, "Strict upstream trust verification enabled", .{});
+    }
+    if (cfg.websocket_enabled) {
+        state.logger.info(null, "WebSocket routes enabled: idle_timeout={d}ms max_frame={d} ping_interval={d}ms", .{
+            cfg.websocket_idle_timeout_ms,
+            cfg.websocket_max_frame_size,
+            cfg.websocket_ping_interval_ms,
+        });
+    }
+    if (cfg.sse_enabled) {
+        state.logger.info(null, "SSE routes enabled: events/topic={d} poll={d}ms backlog={d} idle_timeout={d}ms", .{
+            cfg.sse_max_events_per_topic,
+            cfg.sse_poll_interval_ms,
+            cfg.sse_max_backlog,
+            cfg.sse_idle_timeout_ms,
+        });
     }
     {
         const limits = cfg.request_limits;
@@ -2343,6 +2361,143 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         }
     }
 
+    // --- WebSocket proxy routes ---
+    if (request.method == .GET and (http.api_router.matchRoute(request.uri.path, 1, "/ws/chat") or http.api_router.matchRoute(request.uri.path, 1, "/ws/commands"))) {
+        if (!cfg.websocket_enabled) {
+            try sendApiError(allocator, writer, .not_found, "invalid_request", "Not Found", correlation_id, false, state);
+            logAccess(&ctx, request.method.toString(), request.uri.path, 404, request.headers.get("user-agent") orelse "");
+            return;
+        }
+        if (!http.websocket.isUpgradeRequest(&request.headers)) {
+            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Expected websocket upgrade request", correlation_id, false, state);
+            logAccess(&ctx, request.method.toString(), request.uri.path, 400, request.headers.get("user-agent") orelse "");
+            return;
+        }
+
+        var authenticated = false;
+        const auth_result = authorizeRequest(cfg, &request.headers);
+        if (auth_result.ok) {
+            ctx.setIdentity(auth_result.token_hash orelse "-");
+            authenticated = true;
+        }
+        if (!authenticated) {
+            if (http.session.fromHeaders(&request.headers)) |session_token| {
+                if (state.validateSessionIdentity(allocator, session_token)) |identity| {
+                    defer allocator.free(identity);
+                    ctx.setIdentity(identity);
+                    authenticated = true;
+                }
+            }
+        }
+        if (!authenticated) {
+            try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, false, state);
+            logAccess(&ctx, request.method.toString(), request.uri.path, 401, request.headers.get("user-agent") orelse "");
+            return;
+        }
+
+        const ws_key = request.headers.get("sec-websocket-key") orelse {
+            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Missing Sec-WebSocket-Key", correlation_id, false, state);
+            logAccess(&ctx, request.method.toString(), request.uri.path, 400, request.headers.get("user-agent") orelse "");
+            return;
+        };
+        const accept_key = try http.websocket.acceptKey(allocator, ws_key);
+        defer allocator.free(accept_key);
+        try http.websocket.writeServerHandshake(writer, accept_key, request.headers.get("sec-websocket-protocol"));
+
+        const ws_scope: UpstreamScope = if (http.api_router.matchRoute(request.uri.path, 1, "/ws/chat")) .chat else .commands;
+        const ws_proxy_target = if (ws_scope == .chat) cfg.proxy_pass_chat else cfg.proxy_pass_commands_prefix;
+        handleWebSocketProxyLoop(
+            conn,
+            allocator,
+            cfg,
+            state,
+            correlation_id,
+            client_ip,
+            ctx.identity,
+            ctx.api_version,
+            request.headers.get("host"),
+            request.headers.get("x-forwarded-for"),
+            ws_scope,
+            ws_proxy_target,
+        ) catch |err| {
+            state.logger.warn(correlation_id, "websocket loop ended: {}", .{err});
+        };
+        state.metricsRecord(101);
+        logAccess(&ctx, request.method.toString(), request.uri.path, 101, request.headers.get("user-agent") orelse "");
+        keep_alive = false;
+        return;
+    }
+
+    // --- SSE stream route ---
+    if (request.method == .GET and http.api_router.matchRoute(request.uri.path, 1, "/events/stream")) {
+        if (!cfg.sse_enabled) {
+            try sendApiError(allocator, writer, .not_found, "invalid_request", "Not Found", correlation_id, false, state);
+            logAccess(&ctx, request.method.toString(), request.uri.path, 404, request.headers.get("user-agent") orelse "");
+            return;
+        }
+
+        var authenticated = false;
+        const auth_result = authorizeRequest(cfg, &request.headers);
+        if (auth_result.ok) {
+            ctx.setIdentity(auth_result.token_hash orelse "-");
+            authenticated = true;
+        }
+        if (!authenticated) {
+            if (http.session.fromHeaders(&request.headers)) |session_token| {
+                if (state.validateSessionIdentity(allocator, session_token)) |identity| {
+                    defer allocator.free(identity);
+                    ctx.setIdentity(identity);
+                    authenticated = true;
+                }
+            }
+        }
+        if (!authenticated) {
+            try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, false, state);
+            logAccess(&ctx, request.method.toString(), request.uri.path, 401, request.headers.get("user-agent") orelse "");
+            return;
+        }
+
+        const topic = parseQueryParam(request.uri.query, "topic") orelse "default";
+        const last_event_id = parseLastEventId(request.headers.get("last-event-id"));
+        try streamSseTopic(writer, allocator, cfg, state, topic, last_event_id, correlation_id);
+        state.metricsRecord(200);
+        logAccess(&ctx, request.method.toString(), request.uri.path, 200, request.headers.get("user-agent") orelse "");
+        keep_alive = false;
+        return;
+    }
+
+    // --- SSE publish route ---
+    if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/events/publish")) {
+        if (!cfg.sse_enabled) {
+            try sendApiError(allocator, writer, .not_found, "invalid_request", "Not Found", correlation_id, keep_alive, state);
+            logAccess(&ctx, request.method.toString(), request.uri.path, 404, request.headers.get("user-agent") orelse "");
+            return;
+        }
+        const auth_result = authorizeRequest(cfg, &request.headers);
+        if (!auth_result.ok) {
+            try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, keep_alive, state);
+            logAccess(&ctx, request.method.toString(), request.uri.path, 401, request.headers.get("user-agent") orelse "");
+            return;
+        }
+        ctx.setIdentity(auth_result.token_hash orelse "-");
+
+        const topic = parseQueryParam(request.uri.query, "topic") orelse "default";
+        const payload = request.body orelse "";
+        const event_id = try state.event_hub.publish(topic, payload, http.event_loop.monotonicMs());
+        const body = try std.fmt.allocPrint(allocator, "{{\"topic\":\"{s}\",\"id\":{d}}}", .{ topic, event_id });
+        defer allocator.free(body);
+        var response = http.Response.json(allocator, body);
+        defer response.deinit();
+        _ = response.setStatus(.accepted)
+            .setConnection(keep_alive)
+            .setHeader(http.correlation.HEADER_NAME, correlation_id);
+        applyResponseHeaders(state, &response);
+        try response.write(writer);
+        state.metricsRecord(202);
+        logAccess(&ctx, request.method.toString(), request.uri.path, 202, request.headers.get("user-agent") orelse "");
+        return;
+    }
+
     // --- POST /v1/sessions (create session) ---
     if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/sessions")) {
         if (state.session_store == null) {
@@ -3112,6 +3267,207 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
     logAccess(&ctx, request.method.toString(), request.uri.path, 404, request.headers.get("user-agent") orelse "");
 }
 
+fn handleWebSocketProxyLoop(
+    conn: anytype,
+    allocator: std.mem.Allocator,
+    cfg: *const edge_config.EdgeConfig,
+    state: *GatewayState,
+    correlation_id: []const u8,
+    client_ip: []const u8,
+    identity: ?[]const u8,
+    api_version: ?u32,
+    incoming_host: ?[]const u8,
+    incoming_x_forwarded_for: ?[]const u8,
+    scope: UpstreamScope,
+    proxy_target: []const u8,
+) !void {
+    const writer = conn.writer();
+    var last_activity_ms = http.event_loop.monotonicMs();
+    var last_ping_ms = last_activity_ms;
+
+    while (!http.shutdown.isShutdownRequested()) {
+        const frame = http.websocket.readFrame(conn, allocator, cfg.websocket_max_frame_size) catch |err| switch (err) {
+            error.ConnectionClosed => return,
+            error.WouldBlock => {
+                const now_ms = http.event_loop.monotonicMs();
+                if (cfg.websocket_ping_interval_ms > 0 and now_ms - last_ping_ms >= cfg.websocket_ping_interval_ms) {
+                    try http.websocket.writeFrame(writer, .ping, "", true);
+                    last_ping_ms = now_ms;
+                }
+                if (cfg.websocket_idle_timeout_ms > 0 and now_ms - last_activity_ms >= cfg.websocket_idle_timeout_ms) return;
+                continue;
+            },
+            else => return err,
+        };
+        defer http.websocket.deinitFrame(allocator, &frame);
+        last_activity_ms = http.event_loop.monotonicMs();
+
+        switch (frame.opcode) {
+            .close => {
+                try http.websocket.writeFrame(writer, .close, "", true);
+                return;
+            },
+            .ping => {
+                try http.websocket.writeFrame(writer, .pong, frame.payload, true);
+                continue;
+            },
+            .pong => continue,
+            .binary => continue,
+            .continuation => continue,
+            .text => {},
+        }
+
+        const payload = std.mem.trim(u8, frame.payload, " \t\r\n");
+        if (payload.len == 0) {
+            try http.websocket.writeFrame(writer, .text, "{\"code\":\"invalid_request\",\"message\":\"empty websocket message\"}", true);
+            continue;
+        }
+
+        const upstream_payload = if (scope == .chat)
+            try std.fmt.allocPrint(allocator, "{{\"message\":{s}}}", .{std.json.fmt(payload, .{})})
+        else
+            try allocator.dupe(u8, payload);
+        defer allocator.free(upstream_payload);
+
+        const exec = proxyJsonExecute(
+            allocator,
+            cfg,
+            scope,
+            proxy_target,
+            null,
+            upstream_payload,
+            correlation_id,
+            client_ip,
+            identity,
+            api_version,
+            incoming_host,
+            incoming_x_forwarded_for,
+            std.io.null_writer,
+            state,
+            false,
+        ) catch |err| {
+            const mapped = mapProxyExecutionError(err);
+            const err_json = try buildApiErrorJson(allocator, mapped.code, mapped.message, correlation_id);
+            defer allocator.free(err_json);
+            try http.websocket.writeFrame(writer, .text, err_json, true);
+            continue;
+        };
+
+        switch (exec) {
+            .streamed_status => |status| {
+                const mapped = mapUpstreamError(status);
+                const err_json = try buildApiErrorJson(allocator, mapped.code, mapped.message, correlation_id);
+                defer allocator.free(err_json);
+                try http.websocket.writeFrame(writer, .text, err_json, true);
+            },
+            .buffered => |result| {
+                defer allocator.free(result.body);
+                defer allocator.free(result.content_type);
+                if (result.content_disposition) |cd| allocator.free(cd);
+
+                if (result.status == 200) {
+                    if (scope == .chat) {
+                        try state.event_hub.publish("ws.chat.responses", result.body, http.event_loop.monotonicMs());
+                    } else {
+                        try state.event_hub.publish("ws.commands.responses", result.body, http.event_loop.monotonicMs());
+                    }
+                    try http.websocket.writeFrame(writer, .text, result.body, true);
+                } else {
+                    const mapped = mapUpstreamError(result.status);
+                    const err_json = try buildApiErrorJson(allocator, mapped.code, mapped.message, correlation_id);
+                    defer allocator.free(err_json);
+                    try http.websocket.writeFrame(writer, .text, err_json, true);
+                }
+            },
+        }
+    }
+}
+
+fn streamSseTopic(
+    writer: anytype,
+    allocator: std.mem.Allocator,
+    cfg: *const edge_config.EdgeConfig,
+    state: *GatewayState,
+    topic: []const u8,
+    last_event_id_start: u64,
+    correlation_id: []const u8,
+) !void {
+    try writer.writeAll("HTTP/1.1 200 OK\r\n");
+    try writer.print("Server: {s}/{s}\r\n", .{ http.SERVER_NAME, http.SERVER_VERSION });
+    try writer.writeAll("Connection: close\r\n");
+    try writer.writeAll("Cache-Control: no-cache\r\n");
+    try writer.writeAll("Content-Type: text/event-stream\r\n");
+    try writer.writeAll("X-Accel-Buffering: no\r\n");
+    try writer.print("{s}: {s}\r\n", .{ http.correlation.HEADER_NAME, correlation_id });
+    try writeSecurityHeaders(writer, &state.security_headers);
+    for (state.add_headers) |pair| {
+        try writer.print("{s}: {s}\r\n", .{ pair.name, pair.value });
+    }
+    try writer.writeAll("\r\n");
+
+    var last_event_id = last_event_id_start;
+    var last_send_ms = http.event_loop.monotonicMs();
+    var last_comment_ms = last_send_ms;
+    const poll_ms = @max(cfg.sse_poll_interval_ms, 10);
+
+    while (!http.shutdown.isShutdownRequested()) {
+        if (cfg.sse_max_backlog > 0 and last_event_id > 0) {
+            if (state.event_hub.oldestId(topic)) |oldest| {
+                if (last_event_id + cfg.sse_max_backlog < oldest) {
+                    try writeSseEvent(writer, oldest, "backlog_exceeded");
+                    return;
+                }
+            }
+        }
+
+        const events = try state.event_hub.snapshotSince(allocator, topic, last_event_id);
+        defer http.event_hub.deinitSnapshot(allocator, events);
+
+        if (events.len > 0) {
+            for (events) |event| {
+                try writeSseEvent(writer, event.id, event.payload);
+                last_event_id = event.id;
+            }
+            last_send_ms = http.event_loop.monotonicMs();
+        } else {
+            const now_ms = http.event_loop.monotonicMs();
+            if (now_ms - last_comment_ms >= 15_000) {
+                try writer.writeAll(": keepalive\n\n");
+                last_comment_ms = now_ms;
+            }
+            if (cfg.sse_idle_timeout_ms > 0 and now_ms - last_send_ms >= cfg.sse_idle_timeout_ms) return;
+        }
+
+        std.time.sleep(@as(u64, poll_ms) * std.time.ns_per_ms);
+    }
+}
+
+fn writeSseEvent(writer: anytype, id: u64, payload: []const u8) !void {
+    try writer.print("id: {d}\n", .{id});
+    var line_it = std.mem.splitScalar(u8, payload, '\n');
+    while (line_it.next()) |line| {
+        try writer.print("data: {s}\n", .{line});
+    }
+    try writer.writeAll("\n");
+}
+
+fn parseQueryParam(query: ?[]const u8, key: []const u8) ?[]const u8 {
+    const raw = query orelse return null;
+    var it = std.mem.splitScalar(u8, raw, '&');
+    while (it.next()) |part| {
+        const eq = std.mem.indexOfScalar(u8, part, '=') orelse continue;
+        const name = std.mem.trim(u8, part[0..eq], " \t\r\n");
+        if (!std.mem.eql(u8, name, key)) continue;
+        return std.mem.trim(u8, part[eq + 1 ..], " \t\r\n");
+    }
+    return null;
+}
+
+fn parseLastEventId(raw: ?[]const u8) u64 {
+    const value = raw orelse return 0;
+    return std.fmt.parseInt(u64, std.mem.trim(u8, value, " \t\r\n"), 10) catch 0;
+}
+
 const AuthResult = struct {
     ok: bool,
     token_hash: ?[]const u8,
@@ -3216,7 +3572,11 @@ fn isProtectedAuthRequestRoute(path: []const u8) bool {
     return http.api_router.matchRoute(path, 1, "/chat") or
         http.api_router.matchRoute(path, 1, "/commands") or
         http.api_router.matchRoute(path, 1, "/sessions") or
-        http.api_router.matchRoute(path, 1, "/cache/purge");
+        http.api_router.matchRoute(path, 1, "/cache/purge") or
+        http.api_router.matchRoute(path, 1, "/events/stream") or
+        http.api_router.matchRoute(path, 1, "/events/publish") or
+        http.api_router.matchRoute(path, 1, "/ws/chat") or
+        http.api_router.matchRoute(path, 1, "/ws/commands");
 }
 
 fn authorizeViaSubrequest(
@@ -4498,6 +4858,15 @@ test "resolveProxyTarget handles absolute and relative proxy_pass" {
         .upstream_active_health_fail_threshold = 1,
         .upstream_active_health_success_threshold = 1,
         .upstream_slow_start_ms = 0,
+        .websocket_enabled = true,
+        .websocket_idle_timeout_ms = 60_000,
+        .websocket_max_frame_size = 1024 * 1024,
+        .websocket_ping_interval_ms = 15_000,
+        .sse_enabled = true,
+        .sse_max_events_per_topic = 1024,
+        .sse_poll_interval_ms = 250,
+        .sse_max_backlog = 1024,
+        .sse_idle_timeout_ms = 60_000,
     };
 
     const abs = try resolveProxyTarget(allocator, cfg.upstream_base_url, "https://api.example.com/base", "/v1/chat");
@@ -4633,6 +5002,15 @@ test "authorizeRequest accepts valid hash" {
         .upstream_active_health_fail_threshold = 1,
         .upstream_active_health_success_threshold = 1,
         .upstream_slow_start_ms = 0,
+        .websocket_enabled = true,
+        .websocket_idle_timeout_ms = 60_000,
+        .websocket_max_frame_size = 1024 * 1024,
+        .websocket_ping_interval_ms = 15_000,
+        .sse_enabled = true,
+        .sse_max_events_per_topic = 1024,
+        .sse_poll_interval_ms = 250,
+        .sse_max_backlog = 1024,
+        .sse_idle_timeout_ms = 60_000,
     };
 
     var headers = http.Headers.init(allocator);
@@ -4701,4 +5079,17 @@ test "classifyErrorCategory maps statuses" {
     try std.testing.expectEqualStrings("upstream_unavailable", classifyErrorCategory(503));
     try std.testing.expectEqualStrings("upstream_timeout", classifyErrorCategory(504));
     try std.testing.expectEqualStrings("internal_error", classifyErrorCategory(500));
+}
+
+test "parseQueryParam extracts topic" {
+    const value = parseQueryParam("topic=alerts&foo=bar", "topic");
+    try std.testing.expect(value != null);
+    try std.testing.expectEqualStrings("alerts", value.?);
+    try std.testing.expect(parseQueryParam("foo=bar", "topic") == null);
+}
+
+test "parseLastEventId handles invalid values" {
+    try std.testing.expectEqual(@as(u64, 42), parseLastEventId("42"));
+    try std.testing.expectEqual(@as(u64, 0), parseLastEventId("bad"));
+    try std.testing.expectEqual(@as(u64, 0), parseLastEventId(null));
 }

@@ -473,26 +473,31 @@ Resolved (incremental): added in-house QPACK literal header block encoder/decode
 ## PHASE 9: WebSocket & Event Streaming
 
 ### 9.1 WebSocket Proxying
-- [ ] upgrade handling
-- [ ] bidirectional proxying
-- [ ] wss support
+- [x] upgrade handling
+- [x] bidirectional proxying
+- [x] wss support
 
 ### 9.2 WebSocket Runtime
-- [ ] ping/pong
-- [ ] idle timeout
-- [ ] load balancing
+- [x] ping/pong
+- [x] idle timeout
+- [x] load balancing
 
 ### 9.3 Server-Sent Events (NEW)
-- [ ] SSE protocol support
-- [ ] long-lived stream connections
-- [ ] reconnect tokens
-- [ ] stream backpressure
+- [x] SSE protocol support
+- [x] long-lived stream connections
+- [x] reconnect tokens
+- [x] stream backpressure
 
 ### 9.4 Event Fanout (NEW)
-- [ ] event broadcast to subscribers
-- [ ] topic-based subscriptions
-- [ ] event buffering
-- [ ] slow client protection
+- [x] event broadcast to subscribers
+- [x] topic-based subscriptions
+- [x] event buffering
+- [x] slow client protection
+
+Resolved (incremental): added in-house WebSocket framing and handshake utilities in `src/http/websocket.zig` and integrated authenticated WS upgrade routes (`GET /v1/ws/chat`, `GET /v1/ws/commands`) into the gateway request router.
+Resolved (incremental): WebSocket runtime loop now supports ping/pong handling, idle timeout enforcement (`TARDIGRADE_WEBSOCKET_IDLE_TIMEOUT_MS`), frame-size limits (`TARDIGRADE_WEBSOCKET_MAX_FRAME_SIZE`), and upstream load-balanced proxy execution via existing proxy engine.
+Resolved (incremental): added in-memory topic event hub (`src/http/event_hub.zig`) with per-topic buffering and replay snapshots, integrated into authenticated SSE routes (`GET /v1/events/stream`, `POST /v1/events/publish`).
+Resolved (incremental): SSE streams now support `Last-Event-ID` replay, long-lived polling delivery, and slow-client/backlog protection via configurable backlog window (`TARDIGRADE_SSE_MAX_BACKLOG`) and per-topic ring buffers (`TARDIGRADE_SSE_MAX_EVENTS_PER_TOPIC`).
 
 ## PHASE 10: Compression
 

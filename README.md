@@ -45,6 +45,8 @@ chmod +x tardigrade
 Tardigrade now supports an edge-gateway path for BearClaw:
 - `GET /health`
 - `POST /v1/chat` (Bearer auth required)
+- `GET /v1/ws/chat` and `GET /v1/ws/commands` (WebSocket upgrade, authenticated)
+- `GET /v1/events/stream` and `POST /v1/events/publish` (SSE topic stream/publish, authenticated)
 
 Environment variables:
 - `TARDIGRADE_LISTEN_HOST` (default `0.0.0.0`)
@@ -75,6 +77,15 @@ Environment variables:
 - `TARDIGRADE_HTTP3_ENABLE_0RTT` (default `false`; allow 0-RTT packet class handling in QUIC foundation logic)
 - `TARDIGRADE_HTTP3_CONNECTION_MIGRATION` (default `false`; allow connection migration updates for QUIC connection IDs)
 - `TARDIGRADE_HTTP3_MAX_DATAGRAM_SIZE` (default `1350`; target maximum QUIC datagram size for parser/runtime tuning)
+- `TARDIGRADE_WEBSOCKET_ENABLED` (default `true`; enable authenticated WebSocket routes)
+- `TARDIGRADE_WEBSOCKET_IDLE_TIMEOUT_MS` (default `60000`; idle timeout for active WebSocket connections)
+- `TARDIGRADE_WEBSOCKET_MAX_FRAME_SIZE` (default `1048576`; maximum accepted WebSocket frame payload bytes)
+- `TARDIGRADE_WEBSOCKET_PING_INTERVAL_MS` (default `15000`; ping interval for WebSocket keepalive)
+- `TARDIGRADE_SSE_ENABLED` (default `true`; enable authenticated SSE publish/stream routes)
+- `TARDIGRADE_SSE_MAX_EVENTS_PER_TOPIC` (default `1024`; in-memory retained events per topic)
+- `TARDIGRADE_SSE_POLL_INTERVAL_MS` (default `250`; SSE stream poll cadence)
+- `TARDIGRADE_SSE_MAX_BACKLOG` (default `1024`; max replay backlog gap before reconnect is required)
+- `TARDIGRADE_SSE_IDLE_TIMEOUT_MS` (default `60000`; idle timeout for SSE stream connections)
 - `TARDIGRADE_PROXY_PROTOCOL` (default `off`; supported: `off`, `auto`, `v1`, `v2`; applies to plaintext listeners for extracting client IP from PROXY headers)
 - `TARDIGRADE_TRUST_GATEWAY_ID` (default `tardigrade-edge`; gateway identity sent in trusted upstream headers)
 - `TARDIGRADE_TRUST_SHARED_SECRET` (default empty; shared secret enabling signed upstream trust headers)

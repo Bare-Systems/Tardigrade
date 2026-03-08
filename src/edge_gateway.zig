@@ -1204,7 +1204,8 @@ fn runActiveHealthChecks(cfg: *const edge_config.EdgeConfig, state: *GatewayStat
 }
 
 fn probeSingleUpstream(cfg: *const edge_config.EdgeConfig, state: *GatewayState, probe_client: *std.http.Client, base_url: []const u8) void {
-    const probe_url = buildHealthProbeUrl(state.allocator, base_url, cfg.upstream_active_health_path) catch |err| {
+    const probe_base = if (unixSocketPathFromEndpoint(base_url) != null) "http://localhost" else base_url;
+    const probe_url = buildHealthProbeUrl(state.allocator, probe_base, cfg.upstream_active_health_path) catch |err| {
         state.logger.warn(null, "active health probe url build failed for {s}: {}", .{ base_url, err });
         state.recordActiveProbeResult(cfg, base_url, false);
         return;
@@ -1218,8 +1219,17 @@ fn probeSingleUpstream(cfg: *const edge_config.EdgeConfig, state: *GatewayState,
     };
 
     var header_buf: [4 * 1024]u8 = undefined;
+    const unix_conn: ?*std.http.Client.Connection = if (unixSocketPathFromEndpoint(base_url)) |socket_path|
+        probe_client.connectUnix(socket_path) catch |err| {
+            state.logger.warn(null, "active health probe unix connect failed for {s}: {}", .{ base_url, err });
+            state.recordActiveProbeResult(cfg, base_url, false);
+            return;
+        }
+    else
+        null;
     var req = probe_client.open(.GET, uri, .{
         .server_header_buffer = &header_buf,
+        .connection = unix_conn,
         .keep_alive = false,
     }) catch |err| {
         state.logger.warn(null, "active health probe open failed for {s}: {}", .{ base_url, err });
@@ -2531,8 +2541,13 @@ fn proxyJsonExecuteSingleAttempt(
 
     var server_header_buffer: [16 * 1024]u8 = undefined;
     const uri = try std.Uri.parse(resolved_target.url);
+    const unix_conn: ?*std.http.Client.Connection = if (resolved_target.unix_socket_path) |socket_path|
+        try state.upstream_client.connectUnix(socket_path)
+    else
+        null;
     var req = try state.upstream_client.open(.POST, uri, .{
         .server_header_buffer = &server_header_buffer,
+        .connection = unix_conn,
         .headers = .{ .content_type = .{ .override = "application/json" } },
         .extra_headers = extra_headers.items,
         .keep_alive = true,
@@ -2755,6 +2770,7 @@ fn buildForwardedFor(allocator: std.mem.Allocator, incoming: ?[]const u8, client
 const ResolvedProxyTarget = struct {
     url: []u8,
     upstream_host: []const u8,
+    unix_socket_path: ?[]const u8 = null,
 };
 
 fn resolveProxyTarget(
@@ -2772,6 +2788,23 @@ fn resolveProxyTarget(
         return .{
             .url = combined_target,
             .upstream_host = parseUpstreamHost(combined_target) orelse "",
+            .unix_socket_path = null,
+        };
+    }
+
+    if (unixSocketPathFromEndpoint(upstream_base_url)) |socket_path| {
+        var normalized: []const u8 = combined_target;
+        if (!std.mem.startsWith(u8, normalized, "/")) {
+            const with_slash = try std.fmt.allocPrint(allocator, "/{s}", .{normalized});
+            allocator.free(combined_target);
+            normalized = with_slash;
+        }
+        const full_url = try std.fmt.allocPrint(allocator, "http://localhost{s}", .{normalized});
+        allocator.free(normalized);
+        return .{
+            .url = full_url,
+            .upstream_host = socket_path,
+            .unix_socket_path = socket_path,
         };
     }
 
@@ -2790,7 +2823,22 @@ fn resolveProxyTarget(
     return .{
         .url = full_url,
         .upstream_host = parseUpstreamHost(upstream_base_url) orelse "",
+        .unix_socket_path = null,
     };
+}
+
+fn unixSocketPathFromEndpoint(endpoint: []const u8) ?[]const u8 {
+    if (std.mem.startsWith(u8, endpoint, "unix://")) {
+        const path = endpoint["unix://".len..];
+        if (path.len == 0) return null;
+        return path;
+    }
+    if (std.mem.startsWith(u8, endpoint, "unix:")) {
+        const path = endpoint["unix:".len..];
+        if (path.len == 0) return null;
+        return path;
+    }
+    return null;
 }
 
 fn combineProxyTarget(allocator: std.mem.Allocator, target: []const u8, suffix_path: ?[]const u8) ![]u8 {
@@ -3189,6 +3237,16 @@ test "resolveProxyTarget handles absolute and relative proxy_pass" {
     defer allocator.free(rel.url);
     try std.testing.expectEqualStrings("http://127.0.0.1:8080/gateway/v1/tools", rel.url);
     try std.testing.expectEqualStrings("127.0.0.1:8080", rel.upstream_host);
+}
+
+test "resolveProxyTarget supports unix socket upstream base" {
+    const allocator = std.testing.allocator;
+    const resolved = try resolveProxyTarget(allocator, "unix:/tmp/tardigrade.sock", "/gateway", "/v1/chat");
+    defer allocator.free(resolved.url);
+    try std.testing.expectEqualStrings("http://localhost/gateway/v1/chat", resolved.url);
+    try std.testing.expectEqualStrings("/tmp/tardigrade.sock", resolved.upstream_host);
+    try std.testing.expect(resolved.unix_socket_path != null);
+    try std.testing.expectEqualStrings("/tmp/tardigrade.sock", resolved.unix_socket_path.?);
 }
 
 test "authorizeRequest accepts valid hash" {

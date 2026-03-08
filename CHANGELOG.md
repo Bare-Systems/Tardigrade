@@ -106,6 +106,10 @@
   - Added trusted-upstream configuration env vars for gateway identity, shared secret, strict trust enforcement, and trusted upstream identity allowlists.
   - Upstream proxy requests now include signed trust headers and forwarded auth context metadata.
   - Upstream target selection now enforces trusted identity matching when configured, with explicit `upstream_untrusted` error mapping.
+- Phase 4.7 unix socket upstream routing (`src/edge_gateway.zig`, `README.md`):
+  - Added unix upstream endpoint support via `unix:/path.sock` and `unix:///path.sock` syntax in configured upstream pools.
+  - Proxy request execution now uses `std.http.Client.connectUnix` when unix upstream endpoints are selected.
+  - Active health probing and load-balanced endpoint selection now apply to unix socket backends for local IPC routing.
 
 ## [0.26.0] - 2026-03-xx
 

@@ -58,6 +58,7 @@ Environment variables:
 - `TARDIGRADE_TRUST_REQUIRE_UPSTREAM_IDENTITY` (default `false`; when true, upstream identity must match trusted identities and trust secret must be configured)
 - `TARDIGRADE_UPSTREAM_BASE_URL` (default `http://127.0.0.1:8080`)
 - `TARDIGRADE_UPSTREAM_BASE_URLS` (default empty; optional comma-separated upstream base URLs used for proxy load balancing/failover)
+- Upstream endpoint values support TCP URLs (`http://host:port`) and Unix socket endpoints (`unix:/path/to/socket.sock` or `unix:///path/to/socket.sock`) for local IPC routing.
 - `TARDIGRADE_UPSTREAM_BASE_URL_WEIGHTS` (default empty; optional comma-separated positive integer weights aligned with `TARDIGRADE_UPSTREAM_BASE_URLS`)
 - `TARDIGRADE_UPSTREAM_BACKUP_BASE_URLS` (default empty; optional comma-separated backup upstream base URLs used when primaries are unavailable)
 - `TARDIGRADE_UPSTREAM_CHAT_BASE_URLS` (default empty; optional comma-separated upstream block for `/v1/chat`; falls back to global upstream pool when unset)

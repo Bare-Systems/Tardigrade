@@ -310,9 +310,11 @@ Resolved (incremental): added configurable PROXY protocol parsing (`TARDIGRADE_P
 Resolved (incremental): added trust model configuration (`TARDIGRADE_TRUST_GATEWAY_ID`, `TARDIGRADE_TRUST_SHARED_SECRET`, `TARDIGRADE_TRUSTED_UPSTREAM_IDENTITIES`, `TARDIGRADE_TRUST_REQUIRE_UPSTREAM_IDENTITY`), signed upstream request headers, auth-context forwarding headers, and trusted upstream identity enforcement against configured upstream identities.
 
 ### 4.7 Unix Socket Upstreams (NEW)
-- [ ] unix domain socket backends
-- [ ] local IPC routing
-- [ ] socket-based load balancing
+- [x] unix domain socket backends
+- [x] local IPC routing
+- [x] socket-based load balancing
+
+Resolved (incremental): upstream endpoint configuration now supports Unix domain socket backends (`unix:/path.sock` / `unix:///path.sock`) across global and route-scoped upstream pools, with existing load-balancing/health-check logic applying to socket endpoints for local IPC routing.
 
 ## PHASE 5: Caching
 

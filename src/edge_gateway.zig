@@ -1188,6 +1188,12 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
             cfg.sse_idle_timeout_ms,
         });
     }
+    if (cfg.rewrite_rules.len > 0) {
+        state.logger.info(null, "Rewrite rules enabled: {d}", .{cfg.rewrite_rules.len});
+    }
+    if (cfg.return_rules.len > 0) {
+        state.logger.info(null, "Return rules enabled: {d}", .{cfg.return_rules.len});
+    }
     {
         const limits = cfg.request_limits;
         if (limits.max_body_size > 0 or limits.max_uri_length > 0 or limits.max_header_count > 0) {
@@ -2237,6 +2243,43 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         "unknown";
     const client_ip = http.request_context.extractClientIp(&request, connection_ip);
     var ctx = http.request_context.RequestContext.init(allocator, correlation_id, client_ip);
+
+    // --- Rewrite / return directives ---
+    const rewrite_outcome = http.rewrite.evaluate(
+        request.method.toString(),
+        request.uri.path,
+        cfg.rewrite_rules,
+        cfg.return_rules,
+    );
+    switch (rewrite_outcome) {
+        .pass => |rewritten_path| {
+            request.uri.path = rewritten_path;
+        },
+        .redirect => |r| {
+            var response = http.Response.redirect(allocator, r.location, @enumFromInt(r.status));
+            defer response.deinit();
+            _ = response.setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
+            applyResponseHeaders(state, &response);
+            try response.write(writer);
+            state.metricsRecord(r.status);
+            logAccess(&ctx, request.method.toString(), request.uri.path, r.status, request.headers.get("user-agent") orelse "");
+            return;
+        },
+        .returned => |r| {
+            var response = http.Response.init(allocator);
+            defer response.deinit();
+            _ = response.setStatus(@enumFromInt(r.status))
+                .setBody(r.body)
+                .setContentType("text/plain; charset=utf-8")
+                .setConnection(keep_alive)
+                .setHeader(http.correlation.HEADER_NAME, correlation_id);
+            applyResponseHeaders(state, &response);
+            try response.write(writer);
+            state.metricsRecord(r.status);
+            logAccess(&ctx, request.method.toString(), request.uri.path, r.status, request.headers.get("user-agent") orelse "");
+            return;
+        },
+    }
 
     // --- Geo-based blocking (external country header) ---
     if (cfg.geo_blocked_countries.len > 0) {
@@ -4886,6 +4929,8 @@ test "resolveProxyTarget handles absolute and relative proxy_pass" {
         .sse_poll_interval_ms = 250,
         .sse_max_backlog = 1024,
         .sse_idle_timeout_ms = 60_000,
+        .rewrite_rules = &[_]edge_config.EdgeConfig.RewriteRule{},
+        .return_rules = &[_]edge_config.EdgeConfig.ReturnRule{},
     };
 
     const abs = try resolveProxyTarget(allocator, cfg.upstream_base_url, "https://api.example.com/base", "/v1/chat");
@@ -5033,6 +5078,8 @@ test "authorizeRequest accepts valid hash" {
         .sse_poll_interval_ms = 250,
         .sse_max_backlog = 1024,
         .sse_idle_timeout_ms = 60_000,
+        .rewrite_rules = &[_]edge_config.EdgeConfig.RewriteRule{},
+        .return_rules = &[_]edge_config.EdgeConfig.ReturnRule{},
     };
 
     var headers = http.Headers.init(allocator);

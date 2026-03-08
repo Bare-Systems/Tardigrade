@@ -43,6 +43,8 @@ pub const EdgeConfig = struct {
         cert_path: []const u8,
         key_path: []const u8,
     };
+    pub const RewriteRule = http.rewrite.RewriteRule;
+    pub const ReturnRule = http.rewrite.ReturnRule;
 
     listen_host: []const u8,
     listen_port: u16,
@@ -224,6 +226,10 @@ pub const EdgeConfig = struct {
     sse_max_backlog: usize,
     /// Idle timeout for SSE streams in milliseconds (0 = disabled).
     sse_idle_timeout_ms: u32,
+    /// Rewrite rules evaluated before route dispatch.
+    rewrite_rules: []RewriteRule,
+    /// Return rules evaluated after rewrites and before route dispatch.
+    return_rules: []ReturnRule,
 
     pub fn deinit(self: *EdgeConfig, allocator: std.mem.Allocator) void {
         allocator.free(self.listen_host);
@@ -285,6 +291,18 @@ pub const EdgeConfig = struct {
         for (self.basic_auth_hashes) |h| allocator.free(h);
         allocator.free(self.basic_auth_hashes);
         allocator.free(self.upstream_active_health_path);
+        for (self.rewrite_rules) |rule| {
+            allocator.free(rule.method);
+            allocator.free(rule.pattern);
+            allocator.free(rule.replacement);
+        }
+        allocator.free(self.rewrite_rules);
+        for (self.return_rules) |rule| {
+            allocator.free(rule.method);
+            allocator.free(rule.pattern);
+            allocator.free(rule.body);
+        }
+        allocator.free(self.return_rules);
         self.* = undefined;
     }
 };
@@ -684,6 +702,28 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     const sse_poll_interval_ms = parseIntEnv(u32, allocator, "TARDIGRADE_SSE_POLL_INTERVAL_MS", 250);
     const sse_max_backlog = parseIntEnv(usize, allocator, "TARDIGRADE_SSE_MAX_BACKLOG", 1024);
     const sse_idle_timeout_ms = parseIntEnv(u32, allocator, "TARDIGRADE_SSE_IDLE_TIMEOUT_MS", 60_000);
+    const rewrite_rules_raw = envOrDefault(allocator, "TARDIGRADE_REWRITE_RULES", "") catch unreachable;
+    defer allocator.free(rewrite_rules_raw);
+    const rewrite_rules = try parseRewriteRules(allocator, rewrite_rules_raw);
+    errdefer {
+        for (rewrite_rules) |rule| {
+            allocator.free(rule.method);
+            allocator.free(rule.pattern);
+            allocator.free(rule.replacement);
+        }
+        allocator.free(rewrite_rules);
+    }
+    const return_rules_raw = envOrDefault(allocator, "TARDIGRADE_RETURN_RULES", "") catch unreachable;
+    defer allocator.free(return_rules_raw);
+    const return_rules = try parseReturnRules(allocator, return_rules_raw);
+    errdefer {
+        for (return_rules) |rule| {
+            allocator.free(rule.method);
+            allocator.free(rule.pattern);
+            allocator.free(rule.body);
+        }
+        allocator.free(return_rules);
+    }
 
     return .{
         .listen_host = listen_host,
@@ -803,6 +843,8 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .sse_poll_interval_ms = sse_poll_interval_ms,
         .sse_max_backlog = sse_max_backlog,
         .sse_idle_timeout_ms = sse_idle_timeout_ms,
+        .rewrite_rules = rewrite_rules,
+        .return_rules = return_rules,
     };
 }
 
@@ -911,6 +953,100 @@ fn parseHeaderPairs(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeConfig
     return out.toOwnedSlice();
 }
 
+fn parseRewriteRules(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeConfig.RewriteRule {
+    var out = std.ArrayList(EdgeConfig.RewriteRule).init(allocator);
+    errdefer {
+        for (out.items) |rule| {
+            allocator.free(rule.method);
+            allocator.free(rule.pattern);
+            allocator.free(rule.replacement);
+        }
+        out.deinit();
+    }
+
+    var it = std.mem.splitScalar(u8, raw, ';');
+    while (it.next()) |entry| {
+        const trimmed = std.mem.trim(u8, entry, " \t\r\n");
+        if (trimmed.len == 0) continue;
+        var fields = std.mem.splitScalar(u8, trimmed, '|');
+        const method_raw = fields.next() orelse return error.InvalidRewriteRuleFormat;
+        const pattern_raw = fields.next() orelse return error.InvalidRewriteRuleFormat;
+        const replacement_raw = fields.next() orelse return error.InvalidRewriteRuleFormat;
+        const flag_raw = fields.next() orelse return error.InvalidRewriteRuleFormat;
+        if (fields.next() != null) return error.InvalidRewriteRuleFormat;
+
+        const method = std.mem.trim(u8, method_raw, " \t\r\n");
+        const pattern = std.mem.trim(u8, pattern_raw, " \t\r\n");
+        const replacement = std.mem.trim(u8, replacement_raw, " \t\r\n");
+        const flag_name = std.mem.trim(u8, flag_raw, " \t\r\n");
+        if (method.len == 0 or pattern.len == 0 or replacement.len == 0 or flag_name.len == 0) {
+            return error.InvalidRewriteRuleFormat;
+        }
+        const flag = http.rewrite.RewriteFlag.parse(flag_name) orelse return error.InvalidRewriteRuleFlag;
+
+        const owned_method = try allocator.dupe(u8, method);
+        errdefer allocator.free(owned_method);
+        const owned_pattern = try allocator.dupe(u8, pattern);
+        errdefer allocator.free(owned_pattern);
+        const owned_replacement = try allocator.dupe(u8, replacement);
+        errdefer allocator.free(owned_replacement);
+        try out.append(.{
+            .method = owned_method,
+            .pattern = owned_pattern,
+            .replacement = owned_replacement,
+            .flag = flag,
+        });
+    }
+    return out.toOwnedSlice();
+}
+
+fn parseReturnRules(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeConfig.ReturnRule {
+    var out = std.ArrayList(EdgeConfig.ReturnRule).init(allocator);
+    errdefer {
+        for (out.items) |rule| {
+            allocator.free(rule.method);
+            allocator.free(rule.pattern);
+            allocator.free(rule.body);
+        }
+        out.deinit();
+    }
+
+    var it = std.mem.splitScalar(u8, raw, ';');
+    while (it.next()) |entry| {
+        const trimmed = std.mem.trim(u8, entry, " \t\r\n");
+        if (trimmed.len == 0) continue;
+        var fields = std.mem.splitScalar(u8, trimmed, '|');
+        const method_raw = fields.next() orelse return error.InvalidReturnRuleFormat;
+        const pattern_raw = fields.next() orelse return error.InvalidReturnRuleFormat;
+        const status_raw = fields.next() orelse return error.InvalidReturnRuleFormat;
+        const body_raw = fields.next() orelse return error.InvalidReturnRuleFormat;
+        if (fields.next() != null) return error.InvalidReturnRuleFormat;
+
+        const method = std.mem.trim(u8, method_raw, " \t\r\n");
+        const pattern = std.mem.trim(u8, pattern_raw, " \t\r\n");
+        const status_str = std.mem.trim(u8, status_raw, " \t\r\n");
+        const body = std.mem.trim(u8, body_raw, " \t\r\n");
+        if (method.len == 0 or pattern.len == 0 or status_str.len == 0) {
+            return error.InvalidReturnRuleFormat;
+        }
+        const status = std.fmt.parseInt(u16, status_str, 10) catch return error.InvalidReturnRuleStatus;
+
+        const owned_method = try allocator.dupe(u8, method);
+        errdefer allocator.free(owned_method);
+        const owned_pattern = try allocator.dupe(u8, pattern);
+        errdefer allocator.free(owned_pattern);
+        const owned_body = try allocator.dupe(u8, body);
+        errdefer allocator.free(owned_body);
+        try out.append(.{
+            .method = owned_method,
+            .pattern = owned_pattern,
+            .status = status,
+            .body = owned_body,
+        });
+    }
+    return out.toOwnedSlice();
+}
+
 fn parseTlsSniCerts(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeConfig.TlsSniCert {
     var out = std.ArrayList(EdgeConfig.TlsSniCert).init(allocator);
     errdefer {
@@ -987,4 +1123,37 @@ test "parse proxy protocol mode aliases" {
     try std.testing.expectEqual(ProxyProtocolMode.v1, ProxyProtocolMode.parse("v1").?);
     try std.testing.expectEqual(ProxyProtocolMode.v2, ProxyProtocolMode.parse("v2").?);
     try std.testing.expect(ProxyProtocolMode.parse("unknown") == null);
+}
+
+test "parse rewrite rules csv" {
+    const allocator = std.testing.allocator;
+    const rules = try parseRewriteRules(allocator, "GET|^/old$|/new|last;*|^/foo$|/bar|redirect");
+    defer {
+        for (rules) |rule| {
+            allocator.free(rule.method);
+            allocator.free(rule.pattern);
+            allocator.free(rule.replacement);
+        }
+        allocator.free(rules);
+    }
+    try std.testing.expectEqual(@as(usize, 2), rules.len);
+    try std.testing.expectEqualStrings("GET", rules[0].method);
+    try std.testing.expectEqual(http.rewrite.RewriteFlag.last, rules[0].flag);
+    try std.testing.expectEqual(http.rewrite.RewriteFlag.redirect, rules[1].flag);
+}
+
+test "parse return rules csv" {
+    const allocator = std.testing.allocator;
+    const rules = try parseReturnRules(allocator, "GET|^/healthz$|204|;*|^/blocked$|403|blocked");
+    defer {
+        for (rules) |rule| {
+            allocator.free(rule.method);
+            allocator.free(rule.pattern);
+            allocator.free(rule.body);
+        }
+        allocator.free(rules);
+    }
+    try std.testing.expectEqual(@as(usize, 2), rules.len);
+    try std.testing.expectEqual(@as(u16, 204), rules[0].status);
+    try std.testing.expectEqualStrings("blocked", rules[1].body);
 }

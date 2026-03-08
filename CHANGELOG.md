@@ -15,6 +15,10 @@
   - Added runtime Brotli compression support via dynamic encoder library loading (`TARDIGRADE_COMPRESSION_BROTLI_ENABLED`, `TARDIGRADE_COMPRESSION_BROTLI_QUALITY`).
   - Added gzip_static-style passthrough for already-gzipped payloads to avoid redundant recompression.
   - Added upstream gunzip path by advertising `Accept-Encoding: gzip` on proxy requests (`TARDIGRADE_UPSTREAM_GUNZIP_ENABLED`) and reusing Zig client automatic decompression.
+- Phase 11.1 URL rewriting foundation (`src/http/rewrite.zig`, `src/edge_config.zig`, `src/edge_gateway.zig`):
+  - Added regex-based rewrite rule engine with support for `last`, `break`, `redirect`, and `permanent` flags.
+  - Added regex-based return directives for short-circuit responses before normal route dispatch.
+  - Added method-conditional rewrite/return matching (`METHOD` or `*`) and new env directives `TARDIGRADE_REWRITE_RULES` / `TARDIGRADE_RETURN_RULES`.
 
 ## [0.28.0] - 2026-03-07
 

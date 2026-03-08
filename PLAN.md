@@ -521,10 +521,14 @@ Resolved (incremental): upstream proxy requests now advertise `Accept-Encoding: 
 ## PHASE 11: Advanced Features
 
 ### 11.1 URL Rewriting
-- [ ] rewrite directive (regex-based)
-- [ ] Rewrite flags (last, break, redirect, permanent)
-- [ ] return directive
-- [ ] Conditional rewriting
+- [x] rewrite directive (regex-based)
+- [x] Rewrite flags (last, break, redirect, permanent)
+- [x] return directive
+- [x] Conditional rewriting
+
+Resolved (incremental): added regex-based rewrite engine module in `src/http/rewrite.zig` with rule evaluation and flag handling (`last`, `break`, `redirect`, `permanent`) using POSIX extended regex matching.
+Resolved (incremental): added pre-routing rewrite/return evaluation in gateway request flow (`src/edge_gateway.zig`) so request paths can be rewritten or short-circuited with configurable return/redirect responses before normal route dispatch.
+Resolved (incremental): added method-conditional rule support (`METHOD|...` with `*` wildcard) through env-driven directives.
 
 ### 11.2 Request Processing
 - [ ] Sub-requests

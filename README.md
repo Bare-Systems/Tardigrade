@@ -132,6 +132,8 @@ Environment variables:
 - `TARDIGRADE_COMPRESSION_BROTLI_ENABLED` (default `true`; enables Brotli response compression negotiation when runtime encoder library is available)
 - `TARDIGRADE_COMPRESSION_BROTLI_QUALITY` (default `5`; Brotli quality level in range `0..11`)
 - `TARDIGRADE_UPSTREAM_GUNZIP_ENABLED` (default `true`; proxy requests advertise `Accept-Encoding: gzip` and gateway gunzips upstream responses before downstream negotiation)
+- `TARDIGRADE_REWRITE_RULES` (default empty; semicolon-separated rewrite directives: `METHOD|REGEX|REPLACEMENT|FLAG`, where `METHOD` may be `*` and `FLAG` is `last|break|redirect|permanent`)
+- `TARDIGRADE_RETURN_RULES` (default empty; semicolon-separated return directives: `METHOD|REGEX|STATUS|BODY`, where `METHOD` may be `*`)
 - `TARDIGRADE_PROXY_STREAM_ALL_STATUSES` (default `false`; when enabled, streams non-200 upstream responses directly instead of mapping to gateway error envelopes)
 - `TARDIGRADE_UPSTREAM_RETRY_ATTEMPTS` (default `1`; number of upstream attempts per proxy request; when multiple upstream base URLs are configured, attempts rotate across them)
 - `TARDIGRADE_UPSTREAM_TIMEOUT_BUDGET_MS` (default `0`; total timeout budget across all upstream attempts; `0` disables budget enforcement)

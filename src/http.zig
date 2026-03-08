@@ -46,6 +46,7 @@ pub const qpack = @import("http/qpack.zig");
 pub const quic = @import("http/quic.zig");
 pub const websocket = @import("http/websocket.zig");
 pub const event_hub = @import("http/event_hub.zig");
+pub const rewrite = @import("http/rewrite.zig");
 
 // Re-export constants
 pub const MAX_HEADERS = headers.MAX_HEADERS;

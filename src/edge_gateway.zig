@@ -72,11 +72,13 @@ const GatewayState = struct {
         defer self.mutex.unlock();
 
         if (self.max_active_connections > 0 and self.active_connections_total >= self.max_active_connections) {
+            self.metrics.recordConnectionRejection();
             return .over_global_limit;
         }
         if (self.max_total_connection_memory_bytes > 0 and self.connection_memory_estimate_bytes > 0) {
             const projected: u128 = (@as(u128, self.active_connections_total) + 1) * @as(u128, self.connection_memory_estimate_bytes);
             if (projected > self.max_total_connection_memory_bytes) {
+                self.metrics.recordConnectionRejection();
                 return .over_global_memory_limit;
             }
         }
@@ -84,7 +86,10 @@ const GatewayState = struct {
         var ip_slot_acquired = false;
         if (self.max_connections_per_ip > 0) {
             const current = self.active_connections_by_ip.get(ip_key) orelse 0;
-            if (current >= self.max_connections_per_ip) return .over_ip_limit;
+            if (current >= self.max_connections_per_ip) {
+                self.metrics.recordConnectionRejection();
+                return .over_ip_limit;
+            }
 
             if (current == 0) {
                 const owned_key = try self.allocator.dupe(u8, ip_key);
@@ -127,6 +132,7 @@ const GatewayState = struct {
             return err;
         };
         self.active_connections_total += 1;
+        self.metrics.setActiveConnections(self.active_connections_total);
         return .accepted;
     }
 
@@ -136,6 +142,7 @@ const GatewayState = struct {
 
         if (self.active_fds.fetchRemove(fd) != null and self.active_connections_total > 0) {
             self.active_connections_total -= 1;
+            self.metrics.setActiveConnections(self.active_connections_total);
         }
         if (self.max_connections_per_ip == 0) return;
 
@@ -254,6 +261,12 @@ const GatewayState = struct {
         self.metrics.recordRequest(status);
     }
 
+    fn metricsRecordQueueRejection(self: *GatewayState) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.metrics.recordQueueRejection();
+    }
+
     fn metricsToJson(self: *GatewayState, allocator: std.mem.Allocator) ![]u8 {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -303,6 +316,7 @@ const GatewayState = struct {
                 health.fail_count = 0;
                 health.unhealthy_until_ms = http.event_loop.monotonicMs() + cfg.upstream_fail_timeout_ms;
             }
+            self.updateUpstreamHealthMetricLocked();
             return;
         }
 
@@ -318,6 +332,7 @@ const GatewayState = struct {
                 health.unhealthy_until_ms = http.event_loop.monotonicMs() + cfg.upstream_fail_timeout_ms;
             }
         }
+        self.updateUpstreamHealthMetricLocked();
     }
 
     fn recordUpstreamSuccess(self: *GatewayState, cfg: *const edge_config.EdgeConfig, upstream_base_url: []const u8) void {
@@ -329,6 +344,7 @@ const GatewayState = struct {
             health.fail_count = 0;
             health.unhealthy_until_ms = 0;
         }
+        self.updateUpstreamHealthMetricLocked();
     }
 
     fn isUpstreamHealthyLocked(self: *GatewayState, upstream_base_url: []const u8, now_ms: u64) bool {
@@ -337,11 +353,23 @@ const GatewayState = struct {
             if (now_ms >= health.unhealthy_until_ms) {
                 health.unhealthy_until_ms = 0;
                 health.fail_count = 0;
+                self.updateUpstreamHealthMetricLocked();
                 return true;
             }
             return false;
         }
         return true;
+    }
+
+    fn updateUpstreamHealthMetricLocked(self: *GatewayState) void {
+        const now_ms = http.event_loop.monotonicMs();
+        var unhealthy: usize = 0;
+        var it = self.upstream_health.iterator();
+        while (it.next()) |entry| {
+            const health = entry.value_ptr.*;
+            if (health.unhealthy_until_ms > now_ms) unhealthy += 1;
+        }
+        self.metrics.setUpstreamUnhealthyBackends(unhealthy);
     }
 };
 
@@ -661,6 +689,7 @@ fn acceptReadyConnections(listen_fd: std.posix.fd_t, worker_pool: *http.worker_p
 
         worker_pool.submit(client_fd) catch |err| {
             state.logger.warn(null, "worker queue submit failed: {}", .{err});
+            state.metricsRecordQueueRejection();
             state.releaseConnectionSlot(client_fd);
             rejectOverloadedClient(client_fd);
             continue;

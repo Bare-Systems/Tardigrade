@@ -495,12 +495,13 @@ Resolved: Gzip response compression implemented in `src/http/compression.zig`. O
 
 ### 12.2 Metrics
 - [x] Stub status endpoint
-- [ ] Connection statistics
+- [x] Connection statistics
 - [x] Request statistics
-- [ ] Upstream health status
+- [x] Upstream health status
 - [x] Prometheus metrics export (optional)
 
 Resolved: `GET /metrics` endpoint added to gateway. `Metrics` struct in `src/http/metrics.zig` tracks total requests and status class counts (2xx/3xx/4xx/5xx) with uptime. All gateway response paths record metrics automatically. `GET /metrics/prometheus` endpoint added returning Prometheus text exposition format (v0.0.4).
+Resolved (incremental): metrics now include active connection gauge, listener rejection counters (connection-slot and queue saturation), and current unhealthy upstream backend gauge.
 
 ### 12.3 Debugging
 - [x] Debug logging

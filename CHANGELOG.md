@@ -52,6 +52,10 @@
   - Added `TARDIGRADE_FD_SOFT_LIMIT` (best-effort RLIMIT_NOFILE soft-limit application on startup).
   - Added `TARDIGRADE_MAX_TOTAL_CONNECTION_MEMORY_BYTES` global estimated memory admission cap.
   - Listener admission now rejects new connections with 503 when projected active-connection memory budget would be exceeded.
+- Metrics observability expansion (`src/http/metrics.zig`, `src/edge_gateway.zig`):
+  - Added active connection gauge and listener rejection counters (connection-slot and queue saturation).
+  - Added upstream unhealthy backend gauge derived from passive health tracking state.
+  - Extended `/metrics` JSON and `/metrics/prometheus` output to include the new operational metrics.
 
 ## [0.26.0] - 2026-03-xx
 

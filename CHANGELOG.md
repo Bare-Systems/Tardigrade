@@ -29,6 +29,12 @@
   - Added in-house HTTP/2 frame parsing/serialization utilities (SETTINGS, PING, HEADERS, DATA, GOAWAY helpers).
   - Added ALPN `h2` negotiation support on TLS connections (`TARDIGRADE_HTTP2_ENABLED`).
   - Added HTTP/2 connection handling loop with stream-scoped request assembly and basic gateway response routing for health/metrics endpoints.
+- Phase 8 completion increment (`src/http/http2_frame.zig`, `src/edge_gateway.zig`, `src/http/quic.zig`, `src/http/qpack.zig`, `src/edge_config.zig`):
+  - Added HTTP/2 priority parsing/scheduling, flow-control window update handling, and server push helper support.
+  - Added HTTP/2 route translation for proxied gateway API streams (`/v1/chat`, `/v1/commands`) via existing upstream execution paths.
+  - Added in-house QUIC packet parsing and connection migration tracking foundations (`src/http/quic.zig`) with 0-RTT packet-type handling.
+  - Added in-house QPACK literal header block encoder/decoder foundations (`src/http/qpack.zig`).
+  - Added HTTP/3 foundation configuration flags (`TARDIGRADE_HTTP3_*`) for runtime behavior control.
 
 ## [0.27.0] - 2026-03-07
 

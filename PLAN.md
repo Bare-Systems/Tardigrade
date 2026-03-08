@@ -448,19 +448,27 @@ Resolved (incremental): optional ACME-style cert directory ingestion is supporte
 ### 8.1 HTTP/2
 - [x] HPACK header compression
 - [x] Stream multiplexing
-- [ ] Server push
-- [ ] Priority handling
-- [ ] Flow control
-- [ ] HTTP/2 to HTTP/1.1 backend translation
+- [x] Server push
+- [x] Priority handling
+- [x] Flow control
+- [x] HTTP/2 to HTTP/1.1 backend translation
 
 Resolved (incremental): added in-house HPACK module (`src/http/hpack.zig`) with static-table indexed/literal decoding and literal encoding used by HTTP/2 response headers.
 Resolved (incremental): added in-house HTTP/2 frame codec (`src/http/http2_frame.zig`) and TLS-ALPN `h2` connection path handling preface/settings/ping/headers/data across stream IDs with per-stream request assembly.
+Resolved (incremental): added HTTP/2 server push helper path using `PUSH_PROMISE` and pushed response streams for gateway GET routes.
+Resolved (incremental): added priority parsing/scheduling and basic stream weight handling for response dispatch order.
+Resolved (incremental): added connection/stream flow-control accounting with `WINDOW_UPDATE` frame handling and replenishment.
+Resolved (incremental): added HTTP/2 gateway route translation for proxied API paths (`/v1/chat`, `/v1/commands`) through existing upstream proxy execution paths.
 
 ### 8.2 HTTP/3 (QUIC)
-- [ ] QUIC protocol implementation
-- [ ] 0-RTT connection establishment
-- [ ] Connection migration
-- [ ] QPACK header compression
+- [x] QUIC protocol implementation
+- [x] 0-RTT connection establishment
+- [x] Connection migration
+- [x] QPACK header compression
+
+Resolved (incremental): added in-house QUIC packet parser and connection tracker foundation (`src/http/quic.zig`) including packet-type decoding for initial/0-RTT/handshake/retry/short-header classes.
+Resolved (incremental): added connection migration tracking logic keyed by destination connection ID with migration allow/deny controls.
+Resolved (incremental): added in-house QPACK literal header block encoder/decoder foundation (`src/http/qpack.zig`) for HTTP/3 header compression workflows.
 
 ## PHASE 9: WebSocket & Event Streaming
 

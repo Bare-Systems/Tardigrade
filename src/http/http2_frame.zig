@@ -16,6 +16,8 @@ pub const Type = enum(u8) {
 pub const Flags = struct {
     pub const END_STREAM: u8 = 0x1;
     pub const END_HEADERS: u8 = 0x4;
+    pub const PADDED: u8 = 0x8;
+    pub const PRIORITY: u8 = 0x20;
     pub const ACK: u8 = 0x1;
 };
 
@@ -91,6 +93,39 @@ pub fn writeGoaway(writer: anytype, last_stream: u31, err_code: u32) !void {
     std.mem.writeInt(u32, payload[0..4], @as(u32, last_stream), .big);
     std.mem.writeInt(u32, payload[4..8], err_code, .big);
     try writeFrame(writer, .goaway, 0, 0, payload[0..]);
+}
+
+pub fn writeWindowUpdate(writer: anytype, stream_id: u31, increment: u31) !void {
+    var payload: [4]u8 = undefined;
+    std.mem.writeInt(u32, payload[0..4], @as(u32, increment) & 0x7FFF_FFFF, .big);
+    try writeFrame(writer, .window_update, 0, stream_id, payload[0..]);
+}
+
+pub fn writePushPromise(writer: anytype, stream_id: u31, promised_stream_id: u31, header_block: []const u8, end_headers: bool) !void {
+    var payload = std.ArrayList(u8).init(std.heap.page_allocator);
+    defer payload.deinit();
+    var sid: [4]u8 = undefined;
+    std.mem.writeInt(u32, sid[0..4], @as(u32, promised_stream_id) & 0x7FFF_FFFF, .big);
+    try payload.appendSlice(sid[0..]);
+    try payload.appendSlice(header_block);
+    try writeFrame(writer, .push_promise, if (end_headers) Flags.END_HEADERS else 0, stream_id, payload.items);
+}
+
+pub fn parsePriority(payload: []const u8) !struct { dependency: u31, weight: u8, exclusive: bool } {
+    if (payload.len < 5) return error.InvalidPriorityFrame;
+    const dep_raw = std.mem.readInt(u32, payload[0..4], .big);
+    return .{
+        .dependency = @intCast(dep_raw & 0x7FFF_FFFF),
+        .weight = payload[4],
+        .exclusive = (dep_raw & 0x8000_0000) != 0,
+    };
+}
+
+pub fn parseWindowUpdateIncrement(payload: []const u8) !u31 {
+    if (payload.len != 4) return error.InvalidWindowUpdateFrame;
+    const raw = std.mem.readInt(u32, payload[0..4], .big) & 0x7FFF_FFFF;
+    if (raw == 0) return error.InvalidWindowUpdateFrame;
+    return @intCast(raw);
 }
 
 fn readExact(conn: anytype, out: []u8) !void {

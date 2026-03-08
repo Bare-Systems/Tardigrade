@@ -31,15 +31,21 @@ const ConnectionSlotResult = enum {
 const Http2PendingStream = struct {
     method: ?[]u8 = null,
     path: ?[]u8 = null,
+    headers: http.Headers,
     body: std.ArrayList(u8),
+    priority_weight: u8 = 16,
 
     fn init(allocator: std.mem.Allocator) Http2PendingStream {
-        return .{ .body = std.ArrayList(u8).init(allocator) };
+        return .{
+            .headers = http.Headers.init(allocator),
+            .body = std.ArrayList(u8).init(allocator),
+        };
     }
 
     fn deinit(self: *Http2PendingStream, allocator: std.mem.Allocator) void {
         if (self.method) |m| allocator.free(m);
         if (self.path) |p| allocator.free(p);
+        self.headers.deinit();
         self.body.deinit();
         self.* = undefined;
     }
@@ -1146,6 +1152,13 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
             state.logger.warn(null, "proxy protocol parsing currently applies only to plaintext listeners", .{});
         }
     }
+    if (cfg.http3_enabled) {
+        state.logger.info(null, "HTTP/3 foundation enabled: 0rtt={} migration={} max_datagram={d}", .{
+            cfg.http3_enable_0rtt,
+            cfg.http3_connection_migration,
+            cfg.http3_max_datagram_size,
+        });
+    }
     if (cfg.trust_shared_secret.len > 0) {
         state.logger.info(null, "Trusted upstream signing enabled (gateway_id={s})", .{cfg.trust_gateway_id});
     }
@@ -1752,6 +1765,14 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
     var pending = std.AutoHashMap(u31, Http2PendingStream).init(allocator);
+    var stream_windows = std.AutoHashMap(u31, i32).init(allocator);
+    defer stream_windows.deinit();
+    var stream_priorities = std.AutoHashMap(u31, u8).init(allocator);
+    defer stream_priorities.deinit();
+    var ready_streams = std.ArrayList(u31).init(allocator);
+    defer ready_streams.deinit();
+    var next_server_stream_id: u31 = 2;
+    var conn_send_window: i32 = 65_535;
     defer {
         var it = pending.iterator();
         while (it.next()) |entry| {
@@ -1777,10 +1798,17 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
             },
             .headers => {
                 if (frame.stream_id == 0) return error.InvalidHttp2StreamId;
-                var decoded = try http.hpack.decode(allocator, frame.payload);
+                var payload_offset: usize = 0;
+                if ((frame.flags & http.http2_frame.Flags.PRIORITY) != 0) {
+                    const pr = try http.http2_frame.parsePriority(frame.payload);
+                    try stream_priorities.put(frame.stream_id, pr.weight);
+                    payload_offset = 5;
+                }
+                var decoded = try http.hpack.decode(allocator, frame.payload[payload_offset..]);
                 defer http.hpack.deinitDecoded(allocator, &decoded);
 
                 var ps = pending.get(frame.stream_id) orelse Http2PendingStream.init(allocator);
+                ps.priority_weight = stream_priorities.get(frame.stream_id) orelse ps.priority_weight;
                 for (decoded.headers) |h| {
                     if (std.mem.eql(u8, h.name, ":method")) {
                         if (ps.method) |m| allocator.free(m);
@@ -1788,35 +1816,80 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                     } else if (std.mem.eql(u8, h.name, ":path")) {
                         if (ps.path) |p| allocator.free(p);
                         ps.path = try allocator.dupe(u8, h.value);
+                    } else if (h.name.len > 0 and h.name[0] != ':') {
+                        try ps.headers.append(h.name, h.value);
                     }
                 }
                 try pending.put(frame.stream_id, ps);
+                _ = try stream_windows.getOrPutValue(frame.stream_id, 65_535);
 
                 if ((frame.flags & http.http2_frame.Flags.END_STREAM) != 0) {
-                    try respondHttp2Stream(conn.writer(), allocator, state, cfg, frame.stream_id, &ps);
-                    if (pending.fetchRemove(frame.stream_id)) |removed| {
-                        var tmp = removed.value;
-                        tmp.deinit(allocator);
-                    }
+                    try ready_streams.append(frame.stream_id);
                 }
             },
             .data => {
                 if (frame.stream_id == 0) return error.InvalidHttp2StreamId;
+                if (stream_windows.getPtr(frame.stream_id)) |sw| sw.* -= @intCast(frame.payload.len);
+                conn_send_window -= @intCast(frame.payload.len);
                 if (pending.getPtr(frame.stream_id)) |ps| {
                     try ps.body.appendSlice(frame.payload);
+                    try http.http2_frame.writeWindowUpdate(conn.writer(), frame.stream_id, @intCast(frame.payload.len));
+                    try http.http2_frame.writeWindowUpdate(conn.writer(), 0, @intCast(frame.payload.len));
+                    if (stream_windows.getPtr(frame.stream_id)) |sw| sw.* += @intCast(frame.payload.len);
+                    conn_send_window += @intCast(frame.payload.len);
                     if ((frame.flags & http.http2_frame.Flags.END_STREAM) != 0) {
-                        try respondHttp2Stream(conn.writer(), allocator, state, cfg, frame.stream_id, ps);
-                        if (pending.fetchRemove(frame.stream_id)) |removed| {
-                            var tmp = removed.value;
-                            tmp.deinit(allocator);
-                        }
+                        try ready_streams.append(frame.stream_id);
                     }
                 } else {
                     try http.http2_frame.writeGoaway(conn.writer(), frame.stream_id, 1);
                     return;
                 }
             },
-            .window_update, .priority, .continuation, .rst_stream, .push_promise, .goaway => {},
+            .priority => {
+                const pr = try http.http2_frame.parsePriority(frame.payload);
+                try stream_priorities.put(frame.stream_id, pr.weight);
+                if (pending.getPtr(frame.stream_id)) |ps| ps.priority_weight = pr.weight;
+            },
+            .window_update => {
+                const inc = try http.http2_frame.parseWindowUpdateIncrement(frame.payload);
+                if (frame.stream_id == 0) {
+                    conn_send_window += @intCast(inc);
+                } else {
+                    const gop = try stream_windows.getOrPutValue(frame.stream_id, 65_535);
+                    gop.value_ptr.* += @intCast(inc);
+                }
+            },
+            .rst_stream => {
+                if (pending.fetchRemove(frame.stream_id)) |removed| {
+                    var tmp = removed.value;
+                    tmp.deinit(allocator);
+                }
+                _ = stream_windows.remove(frame.stream_id);
+                _ = stream_priorities.remove(frame.stream_id);
+            },
+            .continuation, .push_promise, .goaway => {},
+        }
+
+        while (ready_streams.items.len > 0) {
+            var best_idx: usize = 0;
+            var best_weight: u8 = 0;
+            for (ready_streams.items, 0..) |sid, idx| {
+                const w = stream_priorities.get(sid) orelse 16;
+                if (w >= best_weight) {
+                    best_weight = w;
+                    best_idx = idx;
+                }
+            }
+            const sid = ready_streams.swapRemove(best_idx);
+            if (pending.getPtr(sid)) |ps| {
+                try respondHttp2Stream(conn.writer(), allocator, state, cfg, sid, ps, &next_server_stream_id);
+            }
+            if (pending.fetchRemove(sid)) |removed| {
+                var tmp = removed.value;
+                tmp.deinit(allocator);
+            }
+            _ = stream_windows.remove(sid);
+            _ = stream_priorities.remove(sid);
         }
     }
 }
@@ -1828,8 +1901,8 @@ fn respondHttp2Stream(
     cfg: *const edge_config.EdgeConfig,
     stream_id: u31,
     ps: *const Http2PendingStream,
+    next_server_stream_id: *u31,
 ) !void {
-    _ = cfg;
     const method = ps.method orelse return error.InvalidHttp2Request;
     const path = ps.path orelse return error.InvalidHttp2Request;
     const correlation_id = try http.correlation.generate(allocator);
@@ -1840,6 +1913,124 @@ fn respondHttp2Stream(
     var body_alloc: ?[]u8 = null;
     defer if (body_alloc) |b| allocator.free(b);
     var content_type: []const u8 = JSON_CONTENT_TYPE;
+
+    if (std.mem.eql(u8, method, "POST") and http.api_router.matchRoute(path, 1, "/chat")) {
+        const auth_result = authorizeRequest(cfg, &ps.headers);
+        if (!auth_result.ok) {
+            status_code = 401;
+            body = "{\"error\":\"Unauthorized\"}";
+        } else {
+            const message = parseChatMessage(allocator, ps.body.items, cfg.max_message_chars) catch null;
+            if (message) |msg| {
+                defer allocator.free(msg);
+                const chat_request_body = try std.fmt.allocPrint(allocator, "{{\"message\":{s}}}", .{std.json.fmt(msg, .{})});
+                defer allocator.free(chat_request_body);
+                const exec = proxyJsonExecute(
+                    allocator,
+                    cfg,
+                    .chat,
+                    cfg.proxy_pass_chat,
+                    null,
+                    chat_request_body,
+                    correlation_id,
+                    "h2",
+                    auth_result.token_hash,
+                    null,
+                    null,
+                    null,
+                    writer,
+                    state,
+                    false,
+                ) catch null;
+                if (exec) |res| switch (res) {
+                    .buffered => |proxy_result| {
+                        defer allocator.free(proxy_result.body);
+                        status_code = proxy_result.status;
+                        body_alloc = try allocator.dupe(u8, proxy_result.body);
+                        body = body_alloc.?;
+                        content_type = proxy_result.content_type;
+                        if (proxy_result.content_disposition) |cd| allocator.free(cd);
+                        allocator.free(proxy_result.content_type);
+                    },
+                    .streamed_status => |st| {
+                        status_code = st;
+                        body = "";
+                    },
+                } else {
+                    status_code = 503;
+                    body = "{\"error\":\"Upstream unavailable\"}";
+                }
+            } else {
+                status_code = 400;
+                body = "{\"error\":\"invalid chat payload\"}";
+            }
+        }
+    } else if (std.mem.eql(u8, method, "POST") and http.api_router.matchRoute(path, 1, "/commands")) {
+        const auth_result = authorizeRequest(cfg, &ps.headers);
+        if (!auth_result.ok) {
+            status_code = 401;
+            body = "{\"error\":\"Unauthorized\"}";
+        } else {
+            var cmd = http.command.parseCommand(allocator, ps.body.items) catch null;
+            if (cmd) |*command| {
+                defer command.deinit(allocator);
+                const upstream_path = command.command_type.upstreamPath();
+                const envelope = http.command.buildUpstreamEnvelope(
+                    allocator,
+                    command.command_type,
+                    command.params_raw,
+                    correlation_id,
+                    auth_result.token_hash orelse "-",
+                    "h2",
+                    null,
+                ) catch null;
+                if (envelope) |env| {
+                    defer allocator.free(env);
+                    const exec = proxyJsonExecute(
+                        allocator,
+                        cfg,
+                        .commands,
+                        cfg.proxy_pass_commands_prefix,
+                        upstream_path,
+                        env,
+                        correlation_id,
+                        "h2",
+                        auth_result.token_hash,
+                        null,
+                        null,
+                        null,
+                        writer,
+                        state,
+                        false,
+                    ) catch null;
+                    if (exec) |res| switch (res) {
+                        .buffered => |proxy_result| {
+                            defer allocator.free(proxy_result.body);
+                            status_code = proxy_result.status;
+                            body_alloc = try allocator.dupe(u8, proxy_result.body);
+                            body = body_alloc.?;
+                            content_type = proxy_result.content_type;
+                            if (proxy_result.content_disposition) |cd| allocator.free(cd);
+                            allocator.free(proxy_result.content_type);
+                        },
+                        .streamed_status => |st| {
+                            status_code = st;
+                            body = "";
+                        },
+                    } else {
+                        status_code = 503;
+                        body = "{\"error\":\"Upstream unavailable\"}";
+                    }
+                } else {
+                    status_code = 500;
+                    body = "{\"error\":\"failed to build command envelope\"}";
+                }
+            } else {
+                status_code = 400;
+                body = "{\"error\":\"invalid command envelope\"}";
+            }
+        }
+    }
 
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/health")) {
         status_code = 200;
@@ -1890,6 +2081,11 @@ fn respondHttp2Stream(
         stream_id,
         header_block,
     );
+    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/health")) {
+        const promised_stream_id = next_server_stream_id.*;
+        next_server_stream_id.* += 2;
+        try pushHttp2Resource(writer, allocator, stream_id, promised_stream_id, "/metrics", "application/json", "{\"pushed\":true}");
+    }
     try http.http2_frame.writeFrame(
         writer,
         .data,
@@ -1899,6 +2095,35 @@ fn respondHttp2Stream(
     );
 
     state.metricsRecord(status_code);
+}
+
+fn pushHttp2Resource(
+    writer: anytype,
+    allocator: std.mem.Allocator,
+    parent_stream_id: u31,
+    promised_stream_id: u31,
+    path: []const u8,
+    content_type: []const u8,
+    body: []const u8,
+) !void {
+    const req_headers = [_]http.hpack.HeaderField{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":path", .value = path },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "localhost" },
+    };
+    const req_block = try http.hpack.encodeLiteralHeaderBlock(allocator, req_headers[0..]);
+    defer allocator.free(req_block);
+    try http.http2_frame.writePushPromise(writer, parent_stream_id, promised_stream_id, req_block, true);
+
+    const status_headers = [_]http.hpack.HeaderField{
+        .{ .name = ":status", .value = "200" },
+        .{ .name = "content-type", .value = content_type },
+    };
+    const status_block = try http.hpack.encodeLiteralHeaderBlock(allocator, status_headers[0..]);
+    defer allocator.free(status_block);
+    try http.http2_frame.writeFrame(writer, .headers, http.http2_frame.Flags.END_HEADERS, promised_stream_id, status_block);
+    try http.http2_frame.writeFrame(writer, .data, http.http2_frame.Flags.END_STREAM, promised_stream_id, body);
 }
 
 fn readExactConn(conn: anytype, out: []u8) !void {
@@ -4199,6 +4424,10 @@ test "resolveProxyTarget handles absolute and relative proxy_pass" {
         .tls_acme_enabled = false,
         .tls_acme_cert_dir = "",
         .http2_enabled = true,
+        .http3_enabled = false,
+        .http3_enable_0rtt = false,
+        .http3_connection_migration = false,
+        .http3_max_datagram_size = 1350,
         .proxy_protocol_mode = .off,
         .trust_gateway_id = "tardigrade-edge",
         .trust_shared_secret = "",
@@ -4330,6 +4559,10 @@ test "authorizeRequest accepts valid hash" {
         .tls_acme_enabled = false,
         .tls_acme_cert_dir = "",
         .http2_enabled = true,
+        .http3_enabled = false,
+        .http3_enable_0rtt = false,
+        .http3_connection_migration = false,
+        .http3_max_datagram_size = 1350,
         .proxy_protocol_mode = .off,
         .trust_gateway_id = "tardigrade-edge",
         .trust_shared_secret = "",

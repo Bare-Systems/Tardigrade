@@ -42,6 +42,8 @@ pub const buffer_pool = @import("http/buffer_pool.zig");
 pub const tls_termination = @import("http/tls_termination.zig");
 pub const hpack = @import("http/hpack.zig");
 pub const http2_frame = @import("http/http2_frame.zig");
+pub const qpack = @import("http/qpack.zig");
+pub const quic = @import("http/quic.zig");
 
 // Re-export constants
 pub const MAX_HEADERS = headers.MAX_HEADERS;

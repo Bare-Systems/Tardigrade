@@ -198,10 +198,8 @@ pub const SessionStore = struct {
         var it = self.sessions.iterator();
         while (it.next()) |entry| {
             const s = entry.value_ptr;
-            // Remove expired or revoked sessions older than 2x TTL
-            if (now - s.last_active_ns > self.ttl_ns) {
-                keys_to_remove.append(entry.key_ptr.*) catch continue;
-            } else if (s.revoked and now - s.last_active_ns > self.ttl_ns) {
+            // Remove expired sessions or revoked sessions (cleaned up at next cycle)
+            if (now - s.last_active_ns > self.ttl_ns or s.revoked) {
                 keys_to_remove.append(entry.key_ptr.*) catch continue;
             }
         }

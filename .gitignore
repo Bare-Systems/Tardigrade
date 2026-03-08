@@ -2,3 +2,13 @@ zig-out/
 .zig-cache/
 changes/
 CLAUDE.md
+
+# Secrets and environment files — never commit these
+.env
+.env.*
+*.secret
+secrets.txt
+*.pem
+*.key
+*.p12
+*.pfx

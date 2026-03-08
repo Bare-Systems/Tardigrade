@@ -81,7 +81,7 @@ pub fn verifyCredentials(creds: Credentials, allowed_hashes: []const []const u8)
     _ = std.fmt.bufPrint(&hex_buf, "{s}", .{std.fmt.fmtSliceHexLower(&digest)}) catch return false;
 
     for (allowed_hashes) |allowed| {
-        if (allowed.len == 64 and std.mem.eql(u8, allowed, hex_buf[0..])) {
+        if (allowed.len == 64 and std.crypto.utils.timingSafeEql([64]u8, allowed[0..64].*, hex_buf)) {
             return true;
         }
     }

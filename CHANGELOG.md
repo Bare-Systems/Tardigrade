@@ -1,6 +1,14 @@
 
 # Changelog
 
+## [0.28.0] - 2026-03-xx
+
+### Added
+- Phase 5.1 proxy cache key + validity foundation (`src/edge_config.zig`, `src/edge_gateway.zig`):
+  - Added `TARDIGRADE_PROXY_CACHE_TTL_SECONDS` and `TARDIGRADE_PROXY_CACHE_KEY_TEMPLATE`.
+  - Added template-driven proxy cache key generation with token support for method/path/payload hash/identity/API version.
+  - Added TTL-backed in-memory cache reads/writes for successful `/v1/chat` and `/v1/commands` proxy responses with `X-Proxy-Cache: HIT` on cache hits.
+
 ## [0.27.0] - 2026-03-xx
 
 ### Added

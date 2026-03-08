@@ -41,6 +41,7 @@ const GatewayState = struct {
     mutex: std.Thread.Mutex = .{},
     rate_limiter: ?http.rate_limiter.RateLimiter,
     idempotency_store: ?http.idempotency.IdempotencyStore,
+    proxy_cache_store: ?http.idempotency.IdempotencyStore,
     security_headers: http.security_headers.SecurityHeaders,
     session_store: ?http.session.SessionStore,
     access_control: ?http.access_control.AccessControl,
@@ -69,6 +70,7 @@ const GatewayState = struct {
     fn deinit(self: *GatewayState) void {
         if (self.rate_limiter) |*rl| rl.deinit();
         if (self.idempotency_store) |*is| is.deinit();
+        if (self.proxy_cache_store) |*pc| pc.deinit();
         if (self.session_store) |*ss| ss.deinit();
         if (self.access_control) |*acl| acl.deinit();
         self.upstream_client.deinit();
@@ -215,6 +217,33 @@ const GatewayState = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         if (self.idempotency_store) |*store| {
+            try store.put(key, status, body, content_type);
+        }
+    }
+
+    fn proxyCacheGetCopy(self: *GatewayState, allocator: std.mem.Allocator, key: []const u8) !?http.idempotency.CachedResponse {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.proxy_cache_store) |*store| {
+            if (store.get(key)) |cached| {
+                const body = try allocator.dupe(u8, cached.body);
+                errdefer allocator.free(body);
+                const ct = try allocator.dupe(u8, cached.content_type);
+                return .{
+                    .status = cached.status,
+                    .body = body,
+                    .content_type = ct,
+                    .created_ns = cached.created_ns,
+                };
+            }
+        }
+        return null;
+    }
+
+    fn proxyCachePut(self: *GatewayState, key: []const u8, status: u16, body: []const u8, content_type: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.proxy_cache_store) |*store| {
             try store.put(key, status, body, content_type);
         }
     }
@@ -847,6 +876,10 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
             http.idempotency.IdempotencyStore.init(state_allocator, cfg.idempotency_ttl_seconds)
         else
             null,
+        .proxy_cache_store = if (cfg.proxy_cache_ttl_seconds > 0)
+            http.idempotency.IdempotencyStore.init(state_allocator, cfg.proxy_cache_ttl_seconds)
+        else
+            null,
         .security_headers = if (cfg.security_headers_enabled)
             http.security_headers.SecurityHeaders.api
         else
@@ -944,6 +977,9 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     }
     if (state.idempotency_store != null) {
         state.logger.info(null, "Idempotency cache enabled: TTL {d}s", .{cfg.idempotency_ttl_seconds});
+    }
+    if (state.proxy_cache_store != null) {
+        state.logger.info(null, "Proxy cache enabled: TTL {d}s key_template={s}", .{ cfg.proxy_cache_ttl_seconds, cfg.proxy_cache_key_template });
     }
     if (state.session_store != null) {
         state.logger.info(null, "Session management enabled: TTL {d}s, max {d}", .{ cfg.session_ttl_seconds, cfg.session_max });
@@ -1930,6 +1966,32 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         };
         defer allocator.free(envelope);
 
+        const proxy_cache_key = if (cfg.proxy_cache_ttl_seconds > 0)
+            try buildProxyCacheKey(allocator, cfg.proxy_cache_key_template, request.method.toString(), "/v1/commands", envelope, ctx.identity, ctx.api_version)
+        else
+            null;
+        defer if (proxy_cache_key) |k| allocator.free(k);
+        if (proxy_cache_key) |cache_key| {
+            if (try state.proxyCacheGetCopy(allocator, cache_key)) |cached| {
+                defer allocator.free(cached.body);
+                defer allocator.free(cached.content_type);
+
+                var response = http.Response.init(allocator);
+                defer response.deinit();
+                _ = response.setStatus(@enumFromInt(cached.status))
+                    .setBody(cached.body)
+                    .setContentType(cached.content_type)
+                    .setConnection(keep_alive)
+                    .setHeader(http.correlation.HEADER_NAME, correlation_id)
+                    .setHeader("X-Proxy-Cache", "HIT");
+                state.security_headers.apply(&response);
+                try response.write(writer);
+                state.metricsRecord(cached.status);
+                logAccess(&ctx, request.method.toString(), "/v1/commands", cached.status, request.headers.get("user-agent") orelse "");
+                return;
+            }
+        }
+
         // --- Forward to upstream ---
         const upstream_path = cmd.command_type.upstreamPath();
 
@@ -2067,6 +2129,14 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         try response.write(writer);
         state.metricsRecord(cmd_final_status);
 
+        if (proxy_cache_key) |cache_key| {
+            if (cmd_final_status == 200) {
+                state.proxyCachePut(cache_key, cmd_final_status, cmd_final_body, cmd_final_content_type) catch |err| {
+                    std.log.warn("proxy cache store error: {}", .{err});
+                };
+            }
+        }
+
         // --- Store idempotency result ---
         if (effective_idem_key) |idem_key| {
             state.idempotencyPut(idem_key, cmd_final_status, cmd_final_body, JSON_CONTENT_TYPE) catch |err| {
@@ -2147,6 +2217,32 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
             logAccess(&ctx, request.method.toString(), "/v1/chat", 400, request.headers.get("user-agent") orelse "");
             return;
         };
+
+        const proxy_cache_key = if (cfg.proxy_cache_ttl_seconds > 0)
+            try buildProxyCacheKey(allocator, cfg.proxy_cache_key_template, request.method.toString(), "/v1/chat", body, ctx.identity, ctx.api_version)
+        else
+            null;
+        defer if (proxy_cache_key) |k| allocator.free(k);
+        if (proxy_cache_key) |cache_key| {
+            if (try state.proxyCacheGetCopy(allocator, cache_key)) |cached| {
+                defer allocator.free(cached.body);
+                defer allocator.free(cached.content_type);
+
+                var response = http.Response.init(allocator);
+                defer response.deinit();
+                _ = response.setStatus(@enumFromInt(cached.status))
+                    .setBody(cached.body)
+                    .setContentType(cached.content_type)
+                    .setConnection(keep_alive)
+                    .setHeader(http.correlation.HEADER_NAME, correlation_id)
+                    .setHeader("X-Proxy-Cache", "HIT");
+                state.security_headers.apply(&response);
+                try response.write(writer);
+                state.metricsRecord(cached.status);
+                logAccess(&ctx, request.method.toString(), "/v1/chat", cached.status, request.headers.get("user-agent") orelse "");
+                return;
+            }
+        }
 
         const message = parseChatMessage(allocator, body, cfg.max_message_chars) catch |err| {
             const msg = switch (err) {
@@ -2275,6 +2371,14 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         try response.write(writer);
         state.metricsRecord(final_status);
 
+        if (proxy_cache_key) |cache_key| {
+            if (final_status == 200) {
+                state.proxyCachePut(cache_key, final_status, final_body, final_content_type) catch |err| {
+                    std.log.warn("proxy cache store error: {}", .{err});
+                };
+            }
+        }
+
         // --- Store idempotency result ---
         if (ctx.idempotency_key) |idem_key| {
             state.idempotencyPut(idem_key, final_status, final_body, JSON_CONTENT_TYPE) catch |err| {
@@ -2360,6 +2464,61 @@ fn parseChatMessage(allocator: std.mem.Allocator, body: []const u8, max_len: usi
     if (message.len == 0) return error.EmptyMessage;
     if (message.len > max_len) return error.MessageTooLarge;
     return try allocator.dupe(u8, message);
+}
+
+fn buildProxyCacheKey(
+    allocator: std.mem.Allocator,
+    key_template: []const u8,
+    method: []const u8,
+    path: []const u8,
+    payload: []const u8,
+    identity: ?[]const u8,
+    api_version: ?u32,
+) ![]u8 {
+    var payload_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(payload, &payload_digest, .{});
+    var payload_digest_hex: [64]u8 = undefined;
+    _ = std.fmt.bufPrint(&payload_digest_hex, "{s}", .{std.fmt.fmtSliceHexLower(&payload_digest)}) catch unreachable;
+
+    const identity_value = identity orelse "-";
+    var api_version_buf: [20]u8 = undefined;
+    const api_version_value = if (api_version) |ver|
+        std.fmt.bufPrint(&api_version_buf, "{d}", .{ver}) catch "-"
+    else
+        "-";
+
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    var token_it = std.mem.splitScalar(u8, key_template, ':');
+    var wrote_any = false;
+    while (token_it.next()) |part| {
+        const token = std.mem.trim(u8, part, " \t\r\n");
+        if (token.len == 0) continue;
+        const value: []const u8 = if (std.mem.eql(u8, token, "method"))
+            method
+        else if (std.mem.eql(u8, token, "path"))
+            path
+        else if (std.mem.eql(u8, token, "payload_sha256"))
+            payload_digest_hex[0..]
+        else if (std.mem.eql(u8, token, "identity"))
+            identity_value
+        else if (std.mem.eql(u8, token, "api_version"))
+            api_version_value
+        else
+            continue;
+        if (wrote_any) try out.append(':');
+        try out.appendSlice(value);
+        wrote_any = true;
+    }
+
+    if (!wrote_any) {
+        try out.appendSlice(method);
+        try out.append(':');
+        try out.appendSlice(path);
+        try out.append(':');
+        try out.appendSlice(payload_digest_hex[0..]);
+    }
+    return out.toOwnedSlice();
 }
 
 const ProxyResult = struct {
@@ -3195,6 +3354,8 @@ test "resolveProxyTarget handles absolute and relative proxy_pass" {
         .rate_limit_burst = 0,
         .security_headers_enabled = false,
         .idempotency_ttl_seconds = 0,
+        .proxy_cache_ttl_seconds = 0,
+        .proxy_cache_key_template = "method:path:payload_sha256",
         .session_ttl_seconds = 0,
         .session_max = 0,
         .access_control_rules = "",
@@ -3292,6 +3453,8 @@ test "authorizeRequest accepts valid hash" {
         .rate_limit_burst = 0,
         .security_headers_enabled = false,
         .idempotency_ttl_seconds = 0,
+        .proxy_cache_ttl_seconds = 0,
+        .proxy_cache_key_template = "method:path:payload_sha256",
         .session_ttl_seconds = 0,
         .session_max = 0,
         .access_control_rules = "",
@@ -3339,6 +3502,42 @@ test "parseChatMessage validates payload" {
     try std.testing.expectEqualStrings("hello", message);
 
     try std.testing.expectError(error.MessageTooLarge, parseChatMessage(allocator, "{\"message\":\"hello\"}", 2));
+}
+
+test "buildProxyCacheKey supports template tokens" {
+    const allocator = std.testing.allocator;
+    const key = try buildProxyCacheKey(
+        allocator,
+        "method:path:identity:api_version",
+        "POST",
+        "/v1/chat",
+        "{\"message\":\"hello\"}",
+        "identity-1",
+        2,
+    );
+    defer allocator.free(key);
+    try std.testing.expectEqualStrings("POST:/v1/chat:identity-1:2", key);
+}
+
+test "buildProxyCacheKey falls back for unknown template tokens" {
+    const allocator = std.testing.allocator;
+    const payload = "{\"command\":\"list_tools\"}";
+    const key = try buildProxyCacheKey(
+        allocator,
+        "unknown:also_unknown",
+        "POST",
+        "/v1/commands",
+        payload,
+        null,
+        null,
+    );
+    defer allocator.free(key);
+
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(payload, &digest, .{});
+    const expected = try std.fmt.allocPrint(allocator, "POST:/v1/commands:{s}", .{std.fmt.fmtSliceHexLower(&digest)});
+    defer allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, key);
 }
 
 test "mapUpstreamError returns stable codes" {

@@ -320,10 +320,13 @@ Resolved (incremental): upstream endpoint configuration now supports Unix domain
 
 ### 5.1 Proxy Cache
 - [ ] proxy_cache_path (disk-based)
-- [ ] Cache key configuration
-- [ ] Cache validity rules
+- [x] Cache key configuration
+- [x] Cache validity rules
 - [ ] Cache bypass conditions
 - [ ] Cache purging
+
+Resolved (incremental): added in-memory proxy cache controls via `TARDIGRADE_PROXY_CACHE_TTL_SECONDS` and `TARDIGRADE_PROXY_CACHE_KEY_TEMPLATE` with template-token key generation (`method`, `path`, `payload_sha256`, `identity`, `api_version`) and fallback defaults.
+Resolved (incremental): proxy gateway routes now apply TTL-based validity rules, serving cache hits with `X-Proxy-Cache: HIT` and storing successful (`200`) upstream responses for `/v1/chat` and `/v1/commands`.
 
 ### 5.2 Advanced Caching
 - [ ] Stale content serving (stale-while-revalidate)

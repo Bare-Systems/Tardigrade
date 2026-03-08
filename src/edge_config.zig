@@ -74,6 +74,11 @@ pub const EdgeConfig = struct {
     security_headers_enabled: bool,
     /// Idempotency cache TTL in seconds (0 = disabled).
     idempotency_ttl_seconds: u32,
+    /// Proxy response cache TTL in seconds (0 = disabled).
+    proxy_cache_ttl_seconds: u32,
+    /// Proxy cache key template, colon-separated tokens:
+    /// method,path,payload_sha256,identity,api_version
+    proxy_cache_key_template: []const u8,
     /// Session idle TTL in seconds (0 = sessions disabled).
     session_ttl_seconds: u32,
     /// Maximum concurrent sessions (0 = unlimited).
@@ -167,6 +172,7 @@ pub const EdgeConfig = struct {
         for (self.auth_token_hashes) |h| allocator.free(h);
         allocator.free(self.auth_token_hashes);
         allocator.free(self.access_control_rules);
+        allocator.free(self.proxy_cache_key_template);
         for (self.basic_auth_hashes) |h| allocator.free(h);
         allocator.free(self.basic_auth_hashes);
         allocator.free(self.upstream_active_health_path);
@@ -305,6 +311,11 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     const idem_ttl_str = envOrDefault(allocator, "TARDIGRADE_IDEMPOTENCY_TTL", "300") catch unreachable;
     defer allocator.free(idem_ttl_str);
     const idempotency_ttl_seconds = std.fmt.parseInt(u32, idem_ttl_str, 10) catch 300;
+    const proxy_cache_ttl_str = envOrDefault(allocator, "TARDIGRADE_PROXY_CACHE_TTL_SECONDS", "0") catch unreachable;
+    defer allocator.free(proxy_cache_ttl_str);
+    const proxy_cache_ttl_seconds = std.fmt.parseInt(u32, proxy_cache_ttl_str, 10) catch 0;
+    const proxy_cache_key_template = envOrDefault(allocator, "TARDIGRADE_PROXY_CACHE_KEY_TEMPLATE", "method:path:payload_sha256") catch unreachable;
+    errdefer allocator.free(proxy_cache_key_template);
 
     const session_ttl_str = envOrDefault(allocator, "TARDIGRADE_SESSION_TTL", "3600") catch unreachable;
     defer allocator.free(session_ttl_str);
@@ -484,6 +495,8 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .rate_limit_burst = rate_limit_burst,
         .security_headers_enabled = security_headers_enabled,
         .idempotency_ttl_seconds = idempotency_ttl_seconds,
+        .proxy_cache_ttl_seconds = proxy_cache_ttl_seconds,
+        .proxy_cache_key_template = proxy_cache_key_template,
         .session_ttl_seconds = session_ttl_seconds,
         .session_max = session_max,
         .access_control_rules = access_control_rules,

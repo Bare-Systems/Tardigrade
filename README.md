@@ -70,6 +70,8 @@ Environment variables:
 - `TARDIGRADE_UPSTREAM_LB_ALGORITHM` (default `round_robin`; supported: `round_robin`, `least_connections`, `ip_hash`, `generic_hash`, `random_two_choices`)
 - `TARDIGRADE_PROXY_PASS_CHAT` (default `/v1/chat`; absolute URL or path target)
 - `TARDIGRADE_PROXY_PASS_COMMANDS_PREFIX` (default empty; absolute URL or path prefix used before command upstream subpaths)
+- `TARDIGRADE_PROXY_CACHE_TTL_SECONDS` (default `0`; in-memory proxy cache TTL in seconds; `0` disables proxy caching)
+- `TARDIGRADE_PROXY_CACHE_KEY_TEMPLATE` (default `method:path:payload_sha256`; colon-delimited key token template; supported tokens: `method`, `path`, `payload_sha256`, `identity`, `api_version`)
 - `TARDIGRADE_AUTH_TOKEN_HASHES` (comma-separated lowercase SHA-256 token hashes)
 - `TARDIGRADE_MAX_MESSAGE_CHARS` (default `4000`)
 - `TARDIGRADE_KEEP_ALIVE_TIMEOUT_MS` (default `5000`; idle timeout for keep-alive client connections)

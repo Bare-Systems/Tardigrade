@@ -12,6 +12,7 @@ const UpstreamHealth = struct {
     unhealthy_until_ms: u64 = 0,
     probe_fail_streak: u32 = 0,
     probe_success_streak: u32 = 0,
+    slow_start_until_ms: u64 = 0,
 };
 
 const ConnectionSlotResult = enum {
@@ -297,7 +298,18 @@ const GatewayState = struct {
         while (offset < cfg.upstream_base_urls.len) : (offset += 1) {
             const idx = (start + offset) % cfg.upstream_base_urls.len;
             const candidate = cfg.upstream_base_urls[idx];
-            if (self.isUpstreamHealthyLocked(candidate, now_ms)) {
+            if (self.isUpstreamHealthyLocked(cfg, candidate, now_ms) and self.slowStartAllowsTrafficLocked(cfg, candidate, now_ms, @intCast(idx))) {
+                self.upstream_rr_index = (idx + 1) % cfg.upstream_base_urls.len;
+                return candidate;
+            }
+        }
+
+        // Fallback pass: choose any healthy backend even if still in slow-start.
+        offset = 0;
+        while (offset < cfg.upstream_base_urls.len) : (offset += 1) {
+            const idx = (start + offset) % cfg.upstream_base_urls.len;
+            const candidate = cfg.upstream_base_urls[idx];
+            if (self.isUpstreamHealthyLocked(cfg, candidate, now_ms)) {
                 self.upstream_rr_index = (idx + 1) % cfg.upstream_base_urls.len;
                 return candidate;
             }
@@ -350,6 +362,7 @@ const GatewayState = struct {
             health.unhealthy_until_ms = 0;
             health.probe_fail_streak = 0;
             health.probe_success_streak = 0;
+            health.slow_start_until_ms = 0;
         }
         self.updateUpstreamHealthMetricLocked();
     }
@@ -376,6 +389,7 @@ const GatewayState = struct {
                 health.unhealthy_until_ms = 0;
                 health.fail_count = 0;
                 health.probe_success_streak = 0;
+                self.beginSlowStartLocked(cfg, health, http.event_loop.monotonicMs());
             }
         } else {
             health.probe_success_streak = 0;
@@ -383,23 +397,50 @@ const GatewayState = struct {
             if (health.probe_fail_streak >= cfg.upstream_active_health_fail_threshold) {
                 health.probe_fail_streak = 0;
                 health.unhealthy_until_ms = http.event_loop.monotonicMs() + cfg.upstream_fail_timeout_ms;
+                health.slow_start_until_ms = 0;
             }
         }
         self.updateUpstreamHealthMetricLocked();
     }
 
-    fn isUpstreamHealthyLocked(self: *GatewayState, upstream_base_url: []const u8, now_ms: u64) bool {
+    fn isUpstreamHealthyLocked(self: *GatewayState, cfg: *const edge_config.EdgeConfig, upstream_base_url: []const u8, now_ms: u64) bool {
         if (self.upstream_health.getPtr(upstream_base_url)) |health| {
             if (health.unhealthy_until_ms == 0) return true;
             if (now_ms >= health.unhealthy_until_ms) {
                 health.unhealthy_until_ms = 0;
                 health.fail_count = 0;
+                self.beginSlowStartLocked(cfg, health, now_ms);
                 self.updateUpstreamHealthMetricLocked();
                 return true;
             }
             return false;
         }
         return true;
+    }
+
+    fn slowStartAllowsTrafficLocked(self: *GatewayState, cfg: *const edge_config.EdgeConfig, upstream_base_url: []const u8, now_ms: u64, ticket: u64) bool {
+        if (cfg.upstream_slow_start_ms == 0) return true;
+        const health = self.upstream_health.getPtr(upstream_base_url) orelse return true;
+        if (health.slow_start_until_ms == 0) return true;
+        if (now_ms >= health.slow_start_until_ms) {
+            health.slow_start_until_ms = 0;
+            return true;
+        }
+
+        const remaining = health.slow_start_until_ms - now_ms;
+        if (remaining >= cfg.upstream_slow_start_ms) return false;
+        const elapsed = cfg.upstream_slow_start_ms - remaining;
+        const allowed_percent: u64 = @max(1, (elapsed * 100) / cfg.upstream_slow_start_ms);
+        return (ticket % 100) < allowed_percent;
+    }
+
+    fn beginSlowStartLocked(self: *GatewayState, cfg: *const edge_config.EdgeConfig, health: *UpstreamHealth, now_ms: u64) void {
+        _ = self;
+        if (cfg.upstream_slow_start_ms == 0) {
+            health.slow_start_until_ms = 0;
+            return;
+        }
+        health.slow_start_until_ms = now_ms + cfg.upstream_slow_start_ms;
     }
 
     fn updateUpstreamHealthMetricLocked(self: *GatewayState) void {
@@ -650,6 +691,9 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
             cfg.upstream_active_health_fail_threshold,
             cfg.upstream_active_health_success_threshold,
         });
+    }
+    if (cfg.upstream_slow_start_ms > 0) {
+        state.logger.info(null, "Upstream slow-start enabled: {d}ms", .{cfg.upstream_slow_start_ms});
     }
     if (cfg.max_connections_per_ip > 0) {
         state.logger.info(null, "Per-IP connection limit enabled: {d}", .{cfg.max_connections_per_ip});
@@ -2365,6 +2409,7 @@ test "resolveProxyTarget handles absolute and relative proxy_pass" {
         .upstream_active_health_timeout_ms = 2000,
         .upstream_active_health_fail_threshold = 1,
         .upstream_active_health_success_threshold = 1,
+        .upstream_slow_start_ms = 0,
     };
 
     const abs = try resolveProxyTarget(allocator, cfg.upstream_base_url, "https://api.example.com/base", "/v1/chat");
@@ -2437,6 +2482,7 @@ test "authorizeRequest accepts valid hash" {
         .upstream_active_health_timeout_ms = 2000,
         .upstream_active_health_fail_threshold = 1,
         .upstream_active_health_success_threshold = 1,
+        .upstream_slow_start_ms = 0,
     };
 
     var headers = http.Headers.init(allocator);

@@ -74,6 +74,7 @@ Environment variables:
 - `TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_TIMEOUT_MS` (default `2000`; per-probe timeout)
 - `TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_FAIL_THRESHOLD` (default `1`; consecutive active probe failures required before marking unhealthy)
 - `TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_SUCCESS_THRESHOLD` (default `1`; consecutive active probe successes required before clearing unhealthy state)
+- `TARDIGRADE_UPSTREAM_SLOW_START_MS` (default `0`; recovered-backend ramp window before full traffic share; `0` disables slow-start)
 
 ### Build for Production
 

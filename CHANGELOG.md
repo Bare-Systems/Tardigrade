@@ -63,6 +63,9 @@
 - Phase 4.4 configurable health thresholds (`src/edge_config.zig`, `src/edge_gateway.zig`):
   - Added `TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_FAIL_THRESHOLD` and `TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_SUCCESS_THRESHOLD`.
   - Active probe failures/successes now use configurable consecutive-threshold transitions for unhealthy/healthy state changes.
+- Phase 4.4 slow-start for recovered upstreams (`src/edge_config.zig`, `src/edge_gateway.zig`):
+  - Added `TARDIGRADE_UPSTREAM_SLOW_START_MS` for recovered-backend traffic ramp windows.
+  - Upstream selection now applies gradual eligibility during slow-start instead of immediate full-load routing after recovery.
 
 ## [0.26.0] - 2026-03-xx
 

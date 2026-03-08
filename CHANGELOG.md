@@ -10,6 +10,11 @@
   - Added authenticated SSE publish/stream routes (`POST /v1/events/publish`, `GET /v1/events/stream`) with `Last-Event-ID` replay support.
   - Added in-memory topic event hub buffering and slow-client backlog protection controls.
   - Added new runtime config env vars: `TARDIGRADE_WEBSOCKET_*` and `TARDIGRADE_SSE_*`.
+- Phase 10 compression completion increment (`src/http/compression.zig`, `src/edge_config.zig`, `src/edge_gateway.zig`):
+  - Added response encoding negotiation for `br` and `gzip` with Brotli-preferred selection when supported by clients.
+  - Added runtime Brotli compression support via dynamic encoder library loading (`TARDIGRADE_COMPRESSION_BROTLI_ENABLED`, `TARDIGRADE_COMPRESSION_BROTLI_QUALITY`).
+  - Added gzip_static-style passthrough for already-gzipped payloads to avoid redundant recompression.
+  - Added upstream gunzip path by advertising `Accept-Encoding: gzip` on proxy requests (`TARDIGRADE_UPSTREAM_GUNZIP_ENABLED`) and reusing Zig client automatic decompression.
 
 ## [0.28.0] - 2026-03-07
 

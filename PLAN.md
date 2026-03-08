@@ -503,16 +503,20 @@ Resolved (incremental): SSE streams now support `Last-Event-ID` replay, long-liv
 
 ### 10.1 Response Compression
 - [x] gzip compression
-- [ ] gzip_static (pre-compressed files)
-- [ ] Brotli compression
+- [x] gzip_static (pre-compressed files)
+- [x] Brotli compression
 - [x] Compression level configuration
 - [x] MIME type filtering
 - [x] Minimum size threshold
 
 Resolved: Gzip response compression implemented in `src/http/compression.zig`. One-shot compression with MIME-type filtering (text/*, JSON, XML, JS, SVG, WASM), configurable min size (default 256 bytes), and compression level. Applied to proxy response paths in the gateway. Configurable via `TARDIGRADE_COMPRESSION_ENABLED` and `TARDIGRADE_COMPRESSION_MIN_SIZE`.
+Resolved (incremental): compression negotiation now prefers Brotli (`br`) when accepted and runtime encoder library is available; otherwise falls back to gzip. Brotli controls added via `TARDIGRADE_COMPRESSION_BROTLI_ENABLED` and `TARDIGRADE_COMPRESSION_BROTLI_QUALITY`.
+Resolved (incremental): gzip_static-style passthrough now preserves already-gzipped payloads when client accepts gzip (avoids redundant recompression).
 
 ### 10.2 Decompression
-- [ ] gunzip for backends that don't support it
+- [x] gunzip for backends that don't support it
+
+Resolved (incremental): upstream proxy requests now advertise `Accept-Encoding: gzip` (configurable via `TARDIGRADE_UPSTREAM_GUNZIP_ENABLED`) and rely on Zig HTTP client automatic gunzip decompression before downstream re-encoding negotiation.
 
 ## PHASE 11: Advanced Features
 

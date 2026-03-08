@@ -1019,6 +1019,8 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         .compression_config = .{
             .enabled = cfg.compression_enabled,
             .min_size = cfg.compression_min_size,
+            .brotli_enabled = cfg.compression_brotli_enabled,
+            .brotli_quality = cfg.compression_brotli_quality,
         },
         .circuit_breaker = http.circuit_breaker.CircuitBreaker.init(.{
             .threshold = cfg.cb_threshold,
@@ -1193,7 +1195,14 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         }
     }
     if (cfg.compression_enabled) {
-        state.logger.info(null, "Gzip compression enabled (min size: {d} bytes)", .{cfg.compression_min_size});
+        state.logger.info(null, "Response compression enabled (min size: {d} bytes, brotli={}, br_quality={d})", .{
+            cfg.compression_min_size,
+            cfg.compression_brotli_enabled,
+            cfg.compression_brotli_quality,
+        });
+    }
+    if (cfg.upstream_gunzip_enabled) {
+        state.logger.info(null, "Upstream gunzip enabled (proxy requests advertise Accept-Encoding: gzip)", .{});
     }
     if (cfg.cb_threshold > 0) {
         state.logger.info(null, "Circuit breaker enabled: threshold={d} timeout={d}ms", .{ cfg.cb_threshold, cfg.cb_timeout_ms });
@@ -2955,7 +2964,9 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         if (cmd_final_content_disposition) |cd| {
             _ = response.setHeader("Content-Disposition", cd);
         }
-        if (cmd_comp.compressed) _ = response.setHeader("Content-Encoding", "gzip");
+        if (cmd_comp.compressed and cmd_comp.encoding != null) {
+            _ = response.setHeader("Content-Encoding", cmd_comp.encoding.?.headerValue());
+        }
         applyResponseHeaders(state, &response);
         try response.write(writer);
         state.metricsRecord(cmd_final_status);
@@ -3239,7 +3250,9 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         if (final_content_disposition) |cd| {
             _ = response.setHeader("Content-Disposition", cd);
         }
-        if (chat_comp.compressed) _ = response.setHeader("Content-Encoding", "gzip");
+        if (chat_comp.compressed and chat_comp.encoding != null) {
+            _ = response.setHeader("Content-Encoding", chat_comp.encoding.?.headerValue());
+        }
         applyResponseHeaders(state, &response);
         try response.write(writer);
         state.metricsRecord(final_status);
@@ -4110,6 +4123,9 @@ fn proxyJsonExecuteSingleAttempt(
     try extra_headers.append(.{ .name = "X-Forwarded-For", .value = forwarded_for });
     try extra_headers.append(.{ .name = "X-Real-IP", .value = client_ip });
     try extra_headers.append(.{ .name = "X-Forwarded-Proto", .value = forwarded_proto });
+    if (cfg.upstream_gunzip_enabled) {
+        try extra_headers.append(.{ .name = "Accept-Encoding", .value = "gzip, identity" });
+    }
     if (forwarded_host.len > 0) try extra_headers.append(.{ .name = "X-Forwarded-Host", .value = forwarded_host });
     if (upstream_host.len > 0) try extra_headers.append(.{ .name = "Host", .value = upstream_host });
     if (auth_identity) |identity| {
@@ -4835,6 +4851,9 @@ test "resolveProxyTarget handles absolute and relative proxy_pass" {
         .log_level = .info,
         .compression_enabled = false,
         .compression_min_size = 256,
+        .compression_brotli_enabled = true,
+        .compression_brotli_quality = 5,
+        .upstream_gunzip_enabled = true,
         .cb_threshold = 0,
         .cb_timeout_ms = 30_000,
         .worker_threads = 0,
@@ -4979,6 +4998,9 @@ test "authorizeRequest accepts valid hash" {
         .log_level = .info,
         .compression_enabled = false,
         .compression_min_size = 256,
+        .compression_brotli_enabled = true,
+        .compression_brotli_quality = 5,
+        .upstream_gunzip_enabled = true,
         .cb_threshold = 0,
         .cb_timeout_ms = 30_000,
         .worker_threads = 0,

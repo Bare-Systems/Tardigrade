@@ -154,6 +154,12 @@ pub const EdgeConfig = struct {
     compression_enabled: bool,
     /// Minimum response body size to compress (bytes).
     compression_min_size: usize,
+    /// Whether Brotli response compression is enabled.
+    compression_brotli_enabled: bool,
+    /// Brotli compression quality [0..11].
+    compression_brotli_quality: u32,
+    /// Whether to request gzip-compressed upstream responses and gunzip in gateway.
+    upstream_gunzip_enabled: bool,
     /// Circuit breaker failure threshold (0 = disabled).
     cb_threshold: u32,
     /// Circuit breaker open timeout in milliseconds before half-open probe.
@@ -562,6 +568,15 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     const comp_min_str = envOrDefault(allocator, "TARDIGRADE_COMPRESSION_MIN_SIZE", "256") catch unreachable;
     defer allocator.free(comp_min_str);
     const compression_min_size = std.fmt.parseInt(usize, comp_min_str, 10) catch 256;
+    const comp_br_enabled_str = envOrDefault(allocator, "TARDIGRADE_COMPRESSION_BROTLI_ENABLED", "true") catch unreachable;
+    defer allocator.free(comp_br_enabled_str);
+    const compression_brotli_enabled = std.mem.eql(u8, comp_br_enabled_str, "true") or std.mem.eql(u8, comp_br_enabled_str, "1");
+    const comp_br_quality_str = envOrDefault(allocator, "TARDIGRADE_COMPRESSION_BROTLI_QUALITY", "5") catch unreachable;
+    defer allocator.free(comp_br_quality_str);
+    const compression_brotli_quality = std.fmt.parseInt(u32, comp_br_quality_str, 10) catch 5;
+    const upstream_gunzip_enabled_str = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_GUNZIP_ENABLED", "true") catch unreachable;
+    defer allocator.free(upstream_gunzip_enabled_str);
+    const upstream_gunzip_enabled = std.mem.eql(u8, upstream_gunzip_enabled_str, "true") or std.mem.eql(u8, upstream_gunzip_enabled_str, "1");
 
     // Circuit breaker
     const cb_threshold_str = envOrDefault(allocator, "TARDIGRADE_CB_THRESHOLD", "0") catch unreachable;
@@ -753,6 +768,9 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .log_level = log_level,
         .compression_enabled = compression_enabled,
         .compression_min_size = compression_min_size,
+        .compression_brotli_enabled = compression_brotli_enabled,
+        .compression_brotli_quality = compression_brotli_quality,
+        .upstream_gunzip_enabled = upstream_gunzip_enabled,
         .cb_threshold = cb_threshold,
         .cb_timeout_ms = cb_timeout_ms,
         .worker_threads = worker_threads,

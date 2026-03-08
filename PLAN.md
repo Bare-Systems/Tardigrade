@@ -270,12 +270,13 @@ Resolved (incremental): passive-failure upstream controls added via `TARDIGRADE_
 
 ### 4.3 Load Balancing Algorithms
 - [x] Round-robin (default)
-- [ ] Least connections
+- [x] Least connections
 - [ ] IP hash (session persistence)
 - [ ] Generic hash
 - [ ] Random with two choices
 
 Resolved (incremental): proxy upstream base URL selection now uses round-robin rotation per request across configured upstream base URLs.
+Resolved (incremental): added least-connections upstream selection mode via `TARDIGRADE_UPSTREAM_LB_ALGORITHM=least_connections`, using current in-flight upstream attempt counts.
 
 ### 4.4 Health Checks
 - [x] Passive health checks (mark failed on errors)

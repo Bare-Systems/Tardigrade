@@ -46,6 +46,7 @@ const GatewayState = struct {
     upstream_rr_index: usize,
     next_active_health_probe_ms: u64,
     upstream_health: std.StringHashMap(UpstreamHealth),
+    upstream_active_requests: std.StringHashMap(usize),
     active_connections_by_ip: std.StringHashMap(u32),
     active_fds: std.AutoHashMap(std.posix.fd_t, void),
     fd_to_ip: std.AutoHashMap(std.posix.fd_t, []u8),
@@ -61,6 +62,9 @@ const GatewayState = struct {
         var upstream_it = self.upstream_health.iterator();
         while (upstream_it.next()) |entry| self.allocator.free(entry.key_ptr.*);
         self.upstream_health.deinit();
+        var upstream_active_it = self.upstream_active_requests.iterator();
+        while (upstream_active_it.next()) |entry| self.allocator.free(entry.key_ptr.*);
+        self.upstream_active_requests.deinit();
         var ip_it = self.active_connections_by_ip.iterator();
         while (ip_it.next()) |entry| self.allocator.free(entry.key_ptr.*);
         self.active_connections_by_ip.deinit();
@@ -292,12 +296,15 @@ const GatewayState = struct {
     fn nextUpstreamBaseUrl(self: *GatewayState, cfg: *const edge_config.EdgeConfig) []const u8 {
         self.mutex.lock();
         defer self.mutex.unlock();
-        if (cfg.upstream_max_fails == 0) {
-            return selectUpstreamBaseUrl(cfg.upstream_base_urls, cfg.upstream_base_url, &self.upstream_rr_index);
-        }
-
         if (cfg.upstream_base_urls.len == 0) return cfg.upstream_base_url;
         const now_ms = http.event_loop.monotonicMs();
+
+        if (cfg.upstream_lb_algorithm == .least_connections) {
+            if (self.selectLeastConnectionsUpstreamLocked(cfg, now_ms)) |selected| {
+                return selected;
+            }
+            return selectUpstreamBaseUrl(cfg.upstream_base_urls, cfg.upstream_base_url, &self.upstream_rr_index);
+        }
         const start = self.upstream_rr_index % cfg.upstream_base_urls.len;
 
         var offset: usize = 0;
@@ -323,6 +330,26 @@ const GatewayState = struct {
 
         // If all backends are currently unhealthy, still probe in round-robin order.
         return selectUpstreamBaseUrl(cfg.upstream_base_urls, cfg.upstream_base_url, &self.upstream_rr_index);
+    }
+
+    fn selectLeastConnectionsUpstreamLocked(self: *GatewayState, cfg: *const edge_config.EdgeConfig, now_ms: u64) ?[]const u8 {
+        var best_idx: ?usize = null;
+        var best_load: usize = std.math.maxInt(usize);
+        for (cfg.upstream_base_urls, 0..) |candidate, idx| {
+            if (!self.isUpstreamHealthyLocked(cfg, candidate, now_ms)) continue;
+            if (!self.slowStartAllowsTrafficLocked(cfg, candidate, now_ms, @intCast(idx))) continue;
+
+            const load = self.upstream_active_requests.get(candidate) orelse 0;
+            if (best_idx == null or load < best_load) {
+                best_idx = idx;
+                best_load = load;
+            }
+        }
+        if (best_idx) |idx| {
+            self.upstream_rr_index = (idx + 1) % cfg.upstream_base_urls.len;
+            return cfg.upstream_base_urls[idx];
+        }
+        return null;
     }
 
     fn recordUpstreamFailure(self: *GatewayState, cfg: *const edge_config.EdgeConfig, upstream_base_url: []const u8) void {
@@ -459,6 +486,34 @@ const GatewayState = struct {
         }
         self.metrics.setUpstreamUnhealthyBackends(unhealthy);
     }
+
+    fn recordUpstreamAttemptStart(self: *GatewayState, upstream_base_url: []const u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (self.upstream_active_requests.getPtr(upstream_base_url)) |count| {
+            count.* += 1;
+            return;
+        }
+        const owned = self.allocator.dupe(u8, upstream_base_url) catch return;
+        self.upstream_active_requests.put(owned, 1) catch {
+            self.allocator.free(owned);
+        };
+    }
+
+    fn recordUpstreamAttemptEnd(self: *GatewayState, upstream_base_url: []const u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.upstream_active_requests.getPtr(upstream_base_url)) |count| {
+            if (count.* > 1) {
+                count.* -= 1;
+            } else {
+                if (self.upstream_active_requests.fetchRemove(upstream_base_url)) |kv| {
+                    self.allocator.free(kv.key);
+                }
+            }
+        }
+    }
 };
 
 fn selectUpstreamBaseUrl(base_urls: []const []const u8, fallback: []const u8, rr_index: *usize) []const u8 {
@@ -576,6 +631,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         .upstream_rr_index = 0,
         .next_active_health_probe_ms = 0,
         .upstream_health = std.StringHashMap(UpstreamHealth).init(state_allocator),
+        .upstream_active_requests = std.StringHashMap(usize).init(state_allocator),
         .active_connections_by_ip = std.StringHashMap(u32).init(state_allocator),
         .active_fds = std.AutoHashMap(std.posix.fd_t, void).init(state_allocator),
         .fd_to_ip = std.AutoHashMap(std.posix.fd_t, []u8).init(state_allocator),
@@ -679,6 +735,9 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     }
     if (cfg.upstream_base_urls.len > 0) {
         state.logger.info(null, "Upstream round-robin enabled with {d} base URLs", .{cfg.upstream_base_urls.len});
+        if (cfg.upstream_lb_algorithm == .least_connections) {
+            state.logger.info(null, "Upstream load balancing algorithm: least_connections", .{});
+        }
     }
     if (cfg.upstream_retry_attempts > 1) {
         state.logger.info(null, "Upstream retry attempts configured: {d}", .{cfg.upstream_retry_attempts});
@@ -1868,31 +1927,34 @@ fn proxyJsonExecute(
         };
 
         const upstream_base_url = state.nextUpstreamBaseUrl(cfg);
-        const exec = proxyJsonExecuteSingleAttempt(
-            allocator,
-            cfg,
-            per_attempt_timeout_ms,
-            upstream_base_url,
-            proxy_pass_target,
-            suffix_path,
-            payload,
-            correlation_id,
-            client_ip,
-            incoming_host,
-            incoming_x_forwarded_for,
-            downstream_writer,
-            state,
-            enable_streaming_success,
-        ) catch |err| {
-            state.recordUpstreamFailure(cfg, upstream_base_url);
-            last_err = err;
-            if (attempt + 1 < max_attempts) {
-                state.logger.warn(correlation_id, "upstream attempt {d}/{d} failed: {}", .{ attempt + 1, max_attempts, err });
-                continue;
-            }
-            return err;
+        state.recordUpstreamAttemptStart(upstream_base_url);
+        const exec = blk: {
+            defer state.recordUpstreamAttemptEnd(upstream_base_url);
+            break :blk proxyJsonExecuteSingleAttempt(
+                allocator,
+                cfg,
+                per_attempt_timeout_ms,
+                upstream_base_url,
+                proxy_pass_target,
+                suffix_path,
+                payload,
+                correlation_id,
+                client_ip,
+                incoming_host,
+                incoming_x_forwarded_for,
+                downstream_writer,
+                state,
+                enable_streaming_success,
+            ) catch |err| {
+                state.recordUpstreamFailure(cfg, upstream_base_url);
+                last_err = err;
+                if (attempt + 1 < max_attempts) {
+                    state.logger.warn(correlation_id, "upstream attempt {d}/{d} failed: {}", .{ attempt + 1, max_attempts, err });
+                    continue;
+                }
+                return err;
+            };
         };
-
         switch (exec) {
             .streamed_status => |status| {
                 if (status >= 500) {
@@ -2401,6 +2463,7 @@ test "resolveProxyTarget handles absolute and relative proxy_pass" {
         .tls_key_path = "",
         .upstream_base_url = "http://127.0.0.1:8080",
         .upstream_base_urls = &[_][]const u8{},
+        .upstream_lb_algorithm = .round_robin,
         .proxy_pass_chat = "/v1/chat",
         .proxy_pass_commands_prefix = "",
         .auth_token_hashes = &[_][]const u8{},
@@ -2474,6 +2537,7 @@ test "authorizeRequest accepts valid hash" {
         .tls_key_path = "",
         .upstream_base_url = "http://127.0.0.1:8080",
         .upstream_base_urls = &[_][]const u8{},
+        .upstream_lb_algorithm = .round_robin,
         .proxy_pass_chat = "/v1/chat",
         .proxy_pass_commands_prefix = "",
         .auth_token_hashes = hashes,

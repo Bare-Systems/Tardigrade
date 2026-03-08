@@ -1,6 +1,17 @@
 const std = @import("std");
 const http = @import("http.zig");
 
+pub const UpstreamLbAlgorithm = enum {
+    round_robin,
+    least_connections,
+
+    pub fn parse(value: []const u8) ?UpstreamLbAlgorithm {
+        if (std.ascii.eqlIgnoreCase(value, "round_robin") or std.ascii.eqlIgnoreCase(value, "round-robin")) return .round_robin;
+        if (std.ascii.eqlIgnoreCase(value, "least_connections") or std.ascii.eqlIgnoreCase(value, "least-connections")) return .least_connections;
+        return null;
+    }
+};
+
 pub const EdgeConfig = struct {
     listen_host: []const u8,
     listen_port: u16,
@@ -8,6 +19,7 @@ pub const EdgeConfig = struct {
     tls_key_path: []const u8,
     upstream_base_url: []const u8,
     upstream_base_urls: [][]const u8,
+    upstream_lb_algorithm: UpstreamLbAlgorithm,
     /// Proxy target for /v1/chat. Supports absolute URL or path.
     proxy_pass_chat: []const u8,
     /// Proxy target prefix for /v1/commands upstream subpaths.
@@ -130,6 +142,9 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         for (upstream_base_urls) |u| allocator.free(u);
         allocator.free(upstream_base_urls);
     }
+    const lb_algo_str = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_LB_ALGORITHM", "round_robin") catch unreachable;
+    defer allocator.free(lb_algo_str);
+    const upstream_lb_algorithm = UpstreamLbAlgorithm.parse(lb_algo_str) orelse .round_robin;
     const proxy_pass_chat = envOrDefault(allocator, "TARDIGRADE_PROXY_PASS_CHAT", "/v1/chat") catch unreachable;
     errdefer allocator.free(proxy_pass_chat);
     const proxy_pass_commands_prefix = envOrDefault(allocator, "TARDIGRADE_PROXY_PASS_COMMANDS_PREFIX", "") catch unreachable;
@@ -318,6 +333,7 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .tls_key_path = tls_key_path,
         .upstream_base_url = upstream_base_url,
         .upstream_base_urls = upstream_base_urls,
+        .upstream_lb_algorithm = upstream_lb_algorithm,
         .proxy_pass_chat = proxy_pass_chat,
         .proxy_pass_commands_prefix = proxy_pass_commands_prefix,
         .auth_token_hashes = hashes,

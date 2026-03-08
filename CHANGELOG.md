@@ -70,6 +70,10 @@
   - Access logs now emit `error_category` for non-success outcomes.
   - Added category-level API error counters (invalid request, unauthorized, rate-limited, upstream timeout/unavailable, internal, overload).
   - Overload shedding and API error paths now increment categorized metrics for triage.
+- Phase 4.3 least-connections load balancing (`src/edge_config.zig`, `src/edge_gateway.zig`):
+  - Added `TARDIGRADE_UPSTREAM_LB_ALGORITHM` with `round_robin` and `least_connections` modes.
+  - Added per-upstream in-flight attempt tracking and least-loaded upstream selection.
+  - Least-connections selection is integrated with health/slow-start filters.
 
 ## [0.26.0] - 2026-03-xx
 

@@ -28,6 +28,10 @@
   - Added configurable access log formats (`json`, `plain`, `custom`) with template rendering and conditional status-based filtering.
   - Added access log buffering and optional syslog UDP forwarding.
   - Added authenticated admin API endpoints for routes, connections, streams, upstream health, loaded cert config, and auth/session registry visibility.
+- Phase 3.1/3.4 configuration parser + hot reload foundation (`src/http/config_file.zig`, `src/edge_config.zig`, `src/http/shutdown.zig`, `src/edge_gateway.zig`):
+  - Added nginx-style config-file parsing with `include`, `set $var`, interpolation, and directive-to-env normalization.
+  - Added `TARDIGRADE_CONFIG_PATH` support with env-overrides-file precedence.
+  - Added SIGHUP-triggered zero-downtime config hot reload with validate-before-apply semantics.
 
 ## [0.28.0] - 2026-03-07
 

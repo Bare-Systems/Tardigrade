@@ -51,6 +51,7 @@ pub const fastcgi = @import("http/fastcgi.zig");
 pub const uwsgi = @import("http/uwsgi.zig");
 pub const scgi = @import("http/scgi.zig");
 pub const memcached = @import("http/memcached.zig");
+pub const config_file = @import("http/config_file.zig");
 
 // Re-export constants
 pub const MAX_HEADERS = headers.MAX_HEADERS;

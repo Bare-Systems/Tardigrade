@@ -153,6 +153,20 @@ Environment variables:
 - `TARDIGRADE_ACCESS_LOG_MIN_STATUS` (default `0`; only emit access logs for status >= value, `0` logs all)
 - `TARDIGRADE_ACCESS_LOG_BUFFER_SIZE` (default `0`; access log buffer size in bytes before flush, `0` disables buffering)
 - `TARDIGRADE_ACCESS_LOG_SYSLOG_UDP` (default empty; optional syslog UDP endpoint `host:port`)
+- `TARDIGRADE_CONFIG_PATH` (default empty; optional nginx-style config file path loaded before env override resolution)
+
+Config file syntax (Phase 3.1 foundation):
+- Statements end with `;`
+- Basic directive: `listen_port 8069;` (maps to `TARDIGRADE_LISTEN_PORT`)
+- Explicit env-style directive: `TARDIGRADE_LOG_LEVEL debug;`
+- Variables: `set $base /etc/tardigrade;` and use `${base}` interpolation
+- Include: `include conf.d/*.conf;`
+- Environment variables still override config-file values.
+
+Hot reload (Phase 3.4 foundation):
+- Send `SIGHUP` to trigger zero-downtime config reload.
+- Reload validates and parses full config before apply.
+- On validation failure, running config remains unchanged.
 - `TARDIGRADE_PROXY_STREAM_ALL_STATUSES` (default `false`; when enabled, streams non-200 upstream responses directly instead of mapping to gateway error envelopes)
 - `TARDIGRADE_UPSTREAM_RETRY_ATTEMPTS` (default `1`; number of upstream attempts per proxy request; when multiple upstream base URLs are configured, attempts rotate across them)
 - `TARDIGRADE_UPSTREAM_TIMEOUT_BUDGET_MS` (default `0`; total timeout budget across all upstream attempts; `0` disables budget enforcement)

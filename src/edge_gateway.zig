@@ -977,10 +977,15 @@ fn ipHashIndex(client_ip: []const u8, len: usize) usize {
 }
 
 const WorkerContext = struct {
-    cfg: *const edge_config.EdgeConfig,
+    cfg_ptr: std.atomic.Value(usize),
     state: *GatewayState,
     tls: ?*http.tls_termination.TlsTerminator,
     session_pool: *ConnectionSessionPool,
+
+    fn currentCfg(self: *const WorkerContext) *const edge_config.EdgeConfig {
+        const ptr: *const edge_config.EdgeConfig = @ptrFromInt(self.cfg_ptr.load(.seq_cst));
+        return ptr;
+    }
 };
 
 const ConnectionSession = struct {
@@ -1172,7 +1177,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         break :blk @intCast(@max(configured, @as(u32, 1)));
     };
     var worker_ctx = WorkerContext{
-        .cfg = cfg,
+        .cfg_ptr = std.atomic.Value(usize).init(@intFromPtr(cfg)),
         .state = &state,
         .tls = if (tls_terminator) |*tls| tls else null,
         .session_pool = undefined,
@@ -1180,6 +1185,14 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     var session_pool = ConnectionSessionPool.init(state_allocator, cfg.connection_pool_size);
     defer session_pool.deinit();
     worker_ctx.session_pool = &session_pool;
+    var reloaded_cfgs = std.ArrayList(*edge_config.EdgeConfig).init(state_allocator);
+    defer {
+        for (reloaded_cfgs.items) |rcfg| {
+            rcfg.deinit(state_allocator);
+            state_allocator.destroy(rcfg);
+        }
+        reloaded_cfgs.deinit();
+    }
 
     var worker_pool: http.worker_pool.WorkerPool = undefined;
     try worker_pool.init(
@@ -1390,7 +1403,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
 
     // Install signal handlers for graceful shutdown
     http.shutdown.installSignalHandlers();
-    state.logger.info(null, "Signal handlers installed (SIGTERM/SIGINT for graceful shutdown)", .{});
+    state.logger.info(null, "Signal handlers installed (SIGTERM/SIGINT shutdown, SIGHUP reload)", .{});
 
     var ready_events: [64]http.event_loop.Event = undefined;
     while (!http.shutdown.isShutdownRequested()) {
@@ -1409,8 +1422,12 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         }
 
         if (timer.consumeTick(http.event_loop.monotonicMs())) {
-            runActiveHealthChecks(cfg, &state);
-            runProxyCacheMaintenance(cfg, &state);
+            if (http.shutdown.consumeReloadRequested()) {
+                hotReloadConfig(state_allocator, &worker_ctx, &state, &reloaded_cfgs);
+            }
+            const current_cfg = worker_ctx.currentCfg();
+            runActiveHealthChecks(current_cfg, &state);
+            runProxyCacheMaintenance(current_cfg, &state);
             if (tls_terminator) |*tls| tls.runMaintenance(http.event_loop.monotonicMs());
         }
     }
@@ -1479,6 +1496,64 @@ fn acceptReadyConnections(listen_fd: std.posix.fd_t, worker_pool: *http.worker_p
             continue;
         };
     }
+}
+
+fn hotReloadConfig(
+    allocator: std.mem.Allocator,
+    worker_ctx: *WorkerContext,
+    state: *GatewayState,
+    reloaded_cfgs: *std.ArrayList(*edge_config.EdgeConfig),
+) void {
+    const loaded = edge_config.loadFromEnv(allocator) catch |err| {
+        state.logger.warn(null, "config reload failed during validation: {}", .{err});
+        return;
+    };
+    const cfg_ptr = allocator.create(edge_config.EdgeConfig) catch {
+        state.logger.warn(null, "config reload allocation failed", .{});
+        return;
+    };
+    cfg_ptr.* = loaded;
+    reloaded_cfgs.append(cfg_ptr) catch {
+        cfg_ptr.deinit(allocator);
+        allocator.destroy(cfg_ptr);
+        state.logger.warn(null, "config reload bookkeeping failed", .{});
+        return;
+    };
+
+    applyReloadedRuntimeConfig(cfg_ptr, state);
+    worker_ctx.cfg_ptr.store(@intFromPtr(cfg_ptr), .seq_cst);
+    http.access_log.deinit();
+    http.access_log.init(allocator, .{
+        .format = cfg_ptr.access_log_format,
+        .custom_template = cfg_ptr.access_log_template,
+        .min_status = cfg_ptr.access_log_min_status,
+        .buffer_size_bytes = cfg_ptr.access_log_buffer_size,
+        .syslog_udp_endpoint = cfg_ptr.access_log_syslog_udp,
+    }) catch {};
+    state.logger.info(null, "configuration hot-reload applied", .{});
+}
+
+fn applyReloadedRuntimeConfig(cfg: *const edge_config.EdgeConfig, state: *GatewayState) void {
+    state.mutex.lock();
+    defer state.mutex.unlock();
+    state.add_headers = cfg.add_headers;
+    state.security_headers = if (cfg.security_headers_enabled)
+        http.security_headers.SecurityHeaders.api
+    else
+        http.security_headers.SecurityHeaders{ .x_frame_options = "", .x_content_type_options = "", .content_security_policy = "", .strict_transport_security = "", .referrer_policy = "", .permissions_policy = "", .x_xss_protection = "" };
+    state.max_connections_per_ip = cfg.max_connections_per_ip;
+    state.max_active_connections = cfg.max_active_connections;
+    state.max_total_connection_memory_bytes = cfg.max_total_connection_memory_bytes;
+    state.connection_memory_estimate_bytes = if (cfg.max_connection_memory_bytes > 0) cfg.max_connection_memory_bytes else MAX_REQUEST_SIZE;
+    state.proxy_cache_path = cfg.proxy_cache_path;
+    state.proxy_cache_ttl_seconds = cfg.proxy_cache_ttl_seconds;
+    state.compression_config = .{
+        .enabled = cfg.compression_enabled,
+        .min_size = cfg.compression_min_size,
+        .brotli_enabled = cfg.compression_brotli_enabled,
+        .brotli_quality = cfg.compression_brotli_quality,
+    };
+    state.logger.min_level = cfg.log_level;
 }
 
 fn rejectOverloadedClient(client_fd: std.posix.fd_t) void {
@@ -1651,10 +1726,11 @@ fn handleAcceptedClient(raw_ctx: *anyopaque, client_fd: std.posix.fd_t) void {
     }
     defer ctx.session_pool.release(session);
 
-    const idle_timeout_ms = if (ctx.cfg.keep_alive_timeout_ms > 0)
-        ctx.cfg.keep_alive_timeout_ms
+    const cfg = ctx.currentCfg();
+    const idle_timeout_ms = if (cfg.keep_alive_timeout_ms > 0)
+        cfg.keep_alive_timeout_ms
     else
-        ctx.cfg.request_limits.header_timeout_ms;
+        cfg.request_limits.header_timeout_ms;
     if (idle_timeout_ms > 0) {
         setSocketTimeoutMs(client_fd, idle_timeout_ms, idle_timeout_ms) catch |err| {
             ctx.state.logger.warn(null, "failed to set client socket timeout: {}", .{err});
@@ -1676,8 +1752,8 @@ fn handleAcceptedClient(raw_ctx: *anyopaque, client_fd: std.posix.fd_t) void {
         defer tls_conn.deinit();
         defer std.posix.close(client_fd);
 
-        if (tls_conn.negotiatedProtocol() == .http2 and ctx.cfg.http2_enabled) {
-            handleHttp2Connection(&tls_conn, session, ctx.cfg, ctx.state) catch |err| {
+        if (tls_conn.negotiatedProtocol() == .http2 and cfg.http2_enabled) {
+            handleHttp2Connection(&tls_conn, session, cfg, ctx.state) catch |err| {
                 ctx.state.logger.err(null, "http2 connection error: {}", .{err});
             };
             return;
@@ -1685,18 +1761,19 @@ fn handleAcceptedClient(raw_ctx: *anyopaque, client_fd: std.posix.fd_t) void {
 
         var served: u32 = 0;
         while (true) {
+            const live_cfg = ctx.currentCfg();
             var keep_alive = false;
-            handleConnection(&tls_conn, session, ctx.cfg, ctx.state, &keep_alive, false) catch |err| {
+            handleConnection(&tls_conn, session, live_cfg, ctx.state, &keep_alive, false) catch |err| {
                 ctx.state.logger.err(null, "edge connection error: {}", .{err});
                 break;
             };
             served += 1;
             if (http.shutdown.isShutdownRequested()) break;
             if (!keep_alive) break;
-            if (ctx.cfg.max_requests_per_connection > 0 and served >= ctx.cfg.max_requests_per_connection) break;
+            if (live_cfg.max_requests_per_connection > 0 and served >= live_cfg.max_requests_per_connection) break;
         }
-        if (served == ctx.cfg.max_requests_per_connection and ctx.cfg.max_requests_per_connection > 0) {
-            ctx.state.logger.debug(null, "closing connection after max requests per connection reached ({d})", .{ctx.cfg.max_requests_per_connection});
+        if (served == cfg.max_requests_per_connection and cfg.max_requests_per_connection > 0) {
+            ctx.state.logger.debug(null, "closing connection after max requests per connection reached ({d})", .{cfg.max_requests_per_connection});
         }
     } else {
         const stream = std.net.Stream{ .handle = client_fd };
@@ -1704,18 +1781,19 @@ fn handleAcceptedClient(raw_ctx: *anyopaque, client_fd: std.posix.fd_t) void {
 
         var served: u32 = 0;
         while (true) {
+            const live_cfg = ctx.currentCfg();
             var keep_alive = false;
-            handleConnection(stream, session, ctx.cfg, ctx.state, &keep_alive, true) catch |err| {
+            handleConnection(stream, session, live_cfg, ctx.state, &keep_alive, true) catch |err| {
                 ctx.state.logger.err(null, "edge connection error: {}", .{err});
                 break;
             };
             served += 1;
             if (http.shutdown.isShutdownRequested()) break;
             if (!keep_alive) break;
-            if (ctx.cfg.max_requests_per_connection > 0 and served >= ctx.cfg.max_requests_per_connection) break;
+            if (live_cfg.max_requests_per_connection > 0 and served >= live_cfg.max_requests_per_connection) break;
         }
-        if (served == ctx.cfg.max_requests_per_connection and ctx.cfg.max_requests_per_connection > 0) {
-            ctx.state.logger.debug(null, "closing connection after max requests per connection reached ({d})", .{ctx.cfg.max_requests_per_connection});
+        if (served == cfg.max_requests_per_connection and cfg.max_requests_per_connection > 0) {
+            ctx.state.logger.debug(null, "closing connection after max requests per connection reached ({d})", .{cfg.max_requests_per_connection});
         }
     }
 }

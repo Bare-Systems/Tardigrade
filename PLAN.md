@@ -199,10 +199,14 @@ Decision: zero-copy is applied where practical in current architecture by relayi
 
 ### 3.1 Configuration File Parser
 - [ ] keep-alive integration tests (low priority)
-- [ ] nginx-like syntax OR YAML/TOML
-- [ ] Include directive for modular configs
-- [ ] Variable interpolation
-- [ ] Syntax validation with helpful errors
+- [x] nginx-like syntax OR YAML/TOML
+- [x] Include directive for modular configs
+- [x] Variable interpolation
+- [x] Syntax validation with helpful errors
+
+Resolved (incremental): added nginx-style config parser foundation in `src/http/config_file.zig` with directive syntax (`key value;`, `set $name value;`, `include path;`) and environment-key normalization.
+Resolved (incremental): parser supports include expansion (including simple wildcard includes), variable interpolation (`${var}`), and strict syntax validation with file/line error logging.
+Decision: config-file values are treated as defaults and runtime environment variables remain higher precedence overrides.
 
 ### 3.2 Core Directives
 - [ ] worker_processes
@@ -222,9 +226,13 @@ Decision: zero-copy is applied where practical in current architecture by relayi
 - [ ] if conditionals (limited)
 
 ### 3.4 Hot Reload
-- [ ] SIGHUP configuration reload
-- [ ] Zero-downtime reload
-- [ ] Configuration validation before apply
+- [x] SIGHUP configuration reload
+- [x] Zero-downtime reload
+- [x] Configuration validation before apply
+
+Resolved (incremental): added SIGHUP handling in `src/http/shutdown.zig` and event-loop reload processing in `src/edge_gateway.zig`.
+Resolved (incremental): hot reload performs full config parse/validation before apply; invalid reloads are rejected without impacting current runtime.
+Resolved (incremental): reload applies atomically for new requests by swapping active config pointer without draining listener/worker pools.
 
 ### 3.5 Secret Management (NEW)
 - [ ] encrypted secret storage

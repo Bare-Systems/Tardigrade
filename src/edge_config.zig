@@ -1,6 +1,8 @@
 const std = @import("std");
 const http = @import("http.zig");
 
+var active_file_overrides: ?*const http.config_file.Overrides = null;
+
 pub const UpstreamLbAlgorithm = enum {
     round_robin,
     least_connections,
@@ -389,6 +391,11 @@ pub const EdgeConfig = struct {
 };
 
 pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
+    var file_overrides = try http.config_file.loadOverrides(allocator);
+    defer file_overrides.deinit(allocator);
+    active_file_overrides = &file_overrides;
+    defer active_file_overrides = null;
+
     const listen_host = envOrDefault(allocator, "TARDIGRADE_LISTEN_HOST", "0.0.0.0") catch unreachable;
     errdefer allocator.free(listen_host);
 
@@ -1011,7 +1018,16 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
 }
 
 fn envOrDefault(allocator: std.mem.Allocator, key: []const u8, default_value: []const u8) ![]u8 {
-    return std.process.getEnvVarOwned(allocator, key) catch try allocator.dupe(u8, default_value);
+    if (std.process.getEnvVarOwned(allocator, key)) |owned| {
+        return owned;
+    } else |_| {}
+
+    if (active_file_overrides) |ov| {
+        if (ov.map.get(key)) |value| {
+            return allocator.dupe(u8, value);
+        }
+    }
+    return allocator.dupe(u8, default_value);
 }
 
 fn parseBoolEnv(allocator: std.mem.Allocator, key: []const u8, default_value: bool) bool {

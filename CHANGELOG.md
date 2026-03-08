@@ -24,6 +24,11 @@
   - Added session resumption controls (session cache and session tickets) and static OCSP stapling support.
   - Added mTLS and chain/CRL verification controls (`TARDIGRADE_TLS_CLIENT_*`, `TARDIGRADE_TLS_CRL_*`).
   - Added timer-driven dynamic TLS asset reload checks (`TARDIGRADE_TLS_DYNAMIC_RELOAD_INTERVAL_MS`).
+- Phase 8 HTTP/2 foundation increment (`src/http/hpack.zig`, `src/http/http2_frame.zig`, `src/edge_gateway.zig`, `src/http/tls_termination.zig`):
+  - Added in-house HPACK encoder/decoder primitives for HTTP/2 header block handling.
+  - Added in-house HTTP/2 frame parsing/serialization utilities (SETTINGS, PING, HEADERS, DATA, GOAWAY helpers).
+  - Added ALPN `h2` negotiation support on TLS connections (`TARDIGRADE_HTTP2_ENABLED`).
+  - Added HTTP/2 connection handling loop with stream-scoped request assembly and basic gateway response routing for health/metrics endpoints.
 
 ## [0.27.0] - 2026-03-07
 

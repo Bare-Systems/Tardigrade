@@ -446,12 +446,15 @@ Resolved (incremental): optional ACME-style cert directory ingestion is supporte
 ## PHASE 8: HTTP/2 & HTTP/3
 
 ### 8.1 HTTP/2
-- [ ] HPACK header compression
-- [ ] Stream multiplexing
+- [x] HPACK header compression
+- [x] Stream multiplexing
 - [ ] Server push
 - [ ] Priority handling
 - [ ] Flow control
 - [ ] HTTP/2 to HTTP/1.1 backend translation
+
+Resolved (incremental): added in-house HPACK module (`src/http/hpack.zig`) with static-table indexed/literal decoding and literal encoding used by HTTP/2 response headers.
+Resolved (incremental): added in-house HTTP/2 frame codec (`src/http/http2_frame.zig`) and TLS-ALPN `h2` connection path handling preface/settings/ping/headers/data across stream IDs with per-stream request assembly.
 
 ### 8.2 HTTP/3 (QUIC)
 - [ ] QUIC protocol implementation

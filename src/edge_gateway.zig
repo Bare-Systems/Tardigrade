@@ -6,6 +6,8 @@ const edge_config = @import("edge_config.zig");
 const MAX_REQUEST_SIZE: usize = 256 * 1024;
 const STREAM_RELAY_BUFFER_SIZE: usize = 16 * 1024;
 const JSON_CONTENT_TYPE = "application/json";
+const HTTP2_PREFACE = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+const HTTP2_MAX_FRAME_SIZE: usize = 16 * 1024;
 const ProxyCacheLookup = struct {
     cached: http.idempotency.CachedResponse,
     is_stale: bool,
@@ -24,6 +26,23 @@ const ConnectionSlotResult = enum {
     over_ip_limit,
     over_global_limit,
     over_global_memory_limit,
+};
+
+const Http2PendingStream = struct {
+    method: ?[]u8 = null,
+    path: ?[]u8 = null,
+    body: std.ArrayList(u8),
+
+    fn init(allocator: std.mem.Allocator) Http2PendingStream {
+        return .{ .body = std.ArrayList(u8).init(allocator) };
+    }
+
+    fn deinit(self: *Http2PendingStream, allocator: std.mem.Allocator) void {
+        if (self.method) |m| allocator.free(m);
+        if (self.path) |p| allocator.free(p);
+        self.body.deinit();
+        self.* = undefined;
+    }
 };
 
 const UpstreamScope = enum {
@@ -1059,6 +1078,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
             .dynamic_reload_interval_ms = cfg.tls_dynamic_reload_interval_ms,
             .acme_enabled = cfg.tls_acme_enabled,
             .acme_cert_dir = cfg.tls_acme_cert_dir,
+            .http2_enabled = cfg.http2_enabled,
         });
     }
     defer if (tls_terminator) |*tls| tls.deinit();
@@ -1518,6 +1538,13 @@ fn handleAcceptedClient(raw_ctx: *anyopaque, client_fd: std.posix.fd_t) void {
         defer tls_conn.deinit();
         defer std.posix.close(client_fd);
 
+        if (tls_conn.negotiatedProtocol() == .http2 and ctx.cfg.http2_enabled) {
+            handleHttp2Connection(&tls_conn, session, ctx.cfg, ctx.state) catch |err| {
+                ctx.state.logger.err(null, "http2 connection error: {}", .{err});
+            };
+            return;
+        }
+
         var served: u32 = 0;
         while (true) {
             var keep_alive = false;
@@ -1707,6 +1734,179 @@ fn parseProxyHeaderV2(buf: []const u8, strict: bool, client_ip_buf: *[64]u8) Pro
             return .{ .parsed = .{ .consumed = total_len, .client_ip_len = printed.len } };
         },
         else => return .{ .parsed = .{ .consumed = total_len, .client_ip_len = 0 } },
+    }
+}
+
+fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const edge_config.EdgeConfig, state: *GatewayState) !void {
+    _ = session;
+    var preface: [HTTP2_PREFACE.len]u8 = undefined;
+    try readExactConn(conn, preface[0..]);
+    if (!std.mem.eql(u8, preface[0..], HTTP2_PREFACE)) return error.InvalidHttp2Preface;
+
+    try http.http2_frame.writeSettings(conn.writer(), &[_][2]u32{
+        .{ 0x3, 100 }, // max concurrent streams
+        .{ 0x4, 1024 * 1024 }, // initial window size
+    });
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+    var pending = std.AutoHashMap(u31, Http2PendingStream).init(allocator);
+    defer {
+        var it = pending.iterator();
+        while (it.next()) |entry| {
+            var ps = entry.value_ptr.*;
+            ps.deinit(allocator);
+        }
+        pending.deinit();
+    }
+
+    while (!http.shutdown.isShutdownRequested()) {
+        var frame = http.http2_frame.readFrame(conn, allocator, HTTP2_MAX_FRAME_SIZE) catch |err| switch (err) {
+            error.ConnectionClosed => return,
+            else => return err,
+        };
+        defer http.http2_frame.deinitFrame(allocator, &frame);
+
+        switch (frame.typ) {
+            .settings => {
+                if ((frame.flags & http.http2_frame.Flags.ACK) == 0) try http.http2_frame.writeSettingsAck(conn.writer());
+            },
+            .ping => {
+                if ((frame.flags & http.http2_frame.Flags.ACK) == 0) try http.http2_frame.writePingAck(conn.writer(), frame.payload);
+            },
+            .headers => {
+                if (frame.stream_id == 0) return error.InvalidHttp2StreamId;
+                var decoded = try http.hpack.decode(allocator, frame.payload);
+                defer http.hpack.deinitDecoded(allocator, &decoded);
+
+                var ps = pending.get(frame.stream_id) orelse Http2PendingStream.init(allocator);
+                for (decoded.headers) |h| {
+                    if (std.mem.eql(u8, h.name, ":method")) {
+                        if (ps.method) |m| allocator.free(m);
+                        ps.method = try allocator.dupe(u8, h.value);
+                    } else if (std.mem.eql(u8, h.name, ":path")) {
+                        if (ps.path) |p| allocator.free(p);
+                        ps.path = try allocator.dupe(u8, h.value);
+                    }
+                }
+                try pending.put(frame.stream_id, ps);
+
+                if ((frame.flags & http.http2_frame.Flags.END_STREAM) != 0) {
+                    try respondHttp2Stream(conn.writer(), allocator, state, cfg, frame.stream_id, &ps);
+                    if (pending.fetchRemove(frame.stream_id)) |removed| {
+                        var tmp = removed.value;
+                        tmp.deinit(allocator);
+                    }
+                }
+            },
+            .data => {
+                if (frame.stream_id == 0) return error.InvalidHttp2StreamId;
+                if (pending.getPtr(frame.stream_id)) |ps| {
+                    try ps.body.appendSlice(frame.payload);
+                    if ((frame.flags & http.http2_frame.Flags.END_STREAM) != 0) {
+                        try respondHttp2Stream(conn.writer(), allocator, state, cfg, frame.stream_id, ps);
+                        if (pending.fetchRemove(frame.stream_id)) |removed| {
+                            var tmp = removed.value;
+                            tmp.deinit(allocator);
+                        }
+                    }
+                } else {
+                    try http.http2_frame.writeGoaway(conn.writer(), frame.stream_id, 1);
+                    return;
+                }
+            },
+            .window_update, .priority, .continuation, .rst_stream, .push_promise, .goaway => {},
+        }
+    }
+}
+
+fn respondHttp2Stream(
+    writer: anytype,
+    allocator: std.mem.Allocator,
+    state: *GatewayState,
+    cfg: *const edge_config.EdgeConfig,
+    stream_id: u31,
+    ps: *const Http2PendingStream,
+) !void {
+    _ = cfg;
+    const method = ps.method orelse return error.InvalidHttp2Request;
+    const path = ps.path orelse return error.InvalidHttp2Request;
+    const correlation_id = try http.correlation.generate(allocator);
+    defer allocator.free(correlation_id);
+
+    var status_code: u16 = 404;
+    var body: []const u8 = "{\"error\":\"Not Found\"}";
+    var body_alloc: ?[]u8 = null;
+    defer if (body_alloc) |b| allocator.free(b);
+    var content_type: []const u8 = JSON_CONTENT_TYPE;
+
+    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/health")) {
+        status_code = 200;
+        body = "{\"status\":\"ok\",\"service\":\"tardigrade-edge\"}";
+    } else if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/metrics")) {
+        body_alloc = state.metricsToJson(allocator) catch null;
+        if (body_alloc) |b| {
+            status_code = 200;
+            body = b;
+        } else {
+            status_code = 500;
+            body = "{\"error\":\"internal_error\"}";
+        }
+    } else if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/metrics/prometheus")) {
+        body_alloc = state.metricsToPrometheus(allocator) catch null;
+        if (body_alloc) |b| {
+            status_code = 200;
+            body = b;
+            content_type = "text/plain; version=0.0.4; charset=utf-8";
+        } else {
+            status_code = 500;
+            body = "{\"error\":\"internal_error\"}";
+        }
+    }
+
+    const status_str = try std.fmt.allocPrint(allocator, "{d}", .{status_code});
+    defer allocator.free(status_str);
+    const len_str = try std.fmt.allocPrint(allocator, "{d}", .{body.len});
+    defer allocator.free(len_str);
+
+    var response_headers = std.ArrayList(http.hpack.HeaderField).init(allocator);
+    defer response_headers.deinit();
+    try response_headers.append(.{ .name = ":status", .value = status_str });
+    try response_headers.append(.{ .name = "content-type", .value = content_type });
+    try response_headers.append(.{ .name = "content-length", .value = len_str });
+    try response_headers.append(.{ .name = http.correlation.HEADER_NAME, .value = correlation_id });
+    for (state.add_headers) |h| {
+        try response_headers.append(.{ .name = h.name, .value = h.value });
+    }
+
+    const header_block = try http.hpack.encodeLiteralHeaderBlock(allocator, response_headers.items);
+    defer allocator.free(header_block);
+
+    try http.http2_frame.writeFrame(
+        writer,
+        .headers,
+        http.http2_frame.Flags.END_HEADERS,
+        stream_id,
+        header_block,
+    );
+    try http.http2_frame.writeFrame(
+        writer,
+        .data,
+        http.http2_frame.Flags.END_STREAM,
+        stream_id,
+        body,
+    );
+
+    state.metricsRecord(status_code);
+}
+
+fn readExactConn(conn: anytype, out: []u8) !void {
+    var off: usize = 0;
+    while (off < out.len) {
+        const n = try conn.read(out[off..]);
+        if (n == 0) return error.ConnectionClosed;
+        off += n;
     }
 }
 
@@ -3998,6 +4198,7 @@ test "resolveProxyTarget handles absolute and relative proxy_pass" {
         .tls_dynamic_reload_interval_ms = 5000,
         .tls_acme_enabled = false,
         .tls_acme_cert_dir = "",
+        .http2_enabled = true,
         .proxy_protocol_mode = .off,
         .trust_gateway_id = "tardigrade-edge",
         .trust_shared_secret = "",
@@ -4128,6 +4329,7 @@ test "authorizeRequest accepts valid hash" {
         .tls_dynamic_reload_interval_ms = 5000,
         .tls_acme_enabled = false,
         .tls_acme_cert_dir = "",
+        .http2_enabled = true,
         .proxy_protocol_mode = .off,
         .trust_gateway_id = "tardigrade-edge",
         .trust_shared_secret = "",

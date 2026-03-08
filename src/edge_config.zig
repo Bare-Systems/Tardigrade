@@ -67,6 +67,7 @@ pub const EdgeConfig = struct {
     tls_dynamic_reload_interval_ms: u64,
     tls_acme_enabled: bool,
     tls_acme_cert_dir: []const u8,
+    http2_enabled: bool,
     proxy_protocol_mode: ProxyProtocolMode,
     /// Gateway identity used in signed upstream trust headers.
     trust_gateway_id: []const u8,
@@ -310,6 +311,7 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     const tls_acme_enabled = parseBoolEnv(allocator, "TARDIGRADE_TLS_ACME_ENABLED", false);
     const tls_acme_cert_dir = envOrDefault(allocator, "TARDIGRADE_TLS_ACME_CERT_DIR", "") catch unreachable;
     errdefer allocator.free(tls_acme_cert_dir);
+    const http2_enabled = parseBoolEnv(allocator, "TARDIGRADE_HTTP2_ENABLED", true);
     const proxy_protocol_mode_str = envOrDefault(allocator, "TARDIGRADE_PROXY_PROTOCOL", "off") catch unreachable;
     defer allocator.free(proxy_protocol_mode_str);
     const proxy_protocol_mode = ProxyProtocolMode.parse(proxy_protocol_mode_str) orelse .off;
@@ -657,6 +659,7 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .tls_dynamic_reload_interval_ms = tls_dynamic_reload_interval_ms,
         .tls_acme_enabled = tls_acme_enabled,
         .tls_acme_cert_dir = tls_acme_cert_dir,
+        .http2_enabled = http2_enabled,
         .proxy_protocol_mode = proxy_protocol_mode,
         .trust_gateway_id = trust_gateway_id,
         .trust_shared_secret = trust_shared_secret,

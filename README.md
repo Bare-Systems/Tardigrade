@@ -70,6 +70,7 @@ Environment variables:
 - `TARDIGRADE_TLS_DYNAMIC_RELOAD_INTERVAL_MS` (default `5000`; periodic TLS asset reload check interval)
 - `TARDIGRADE_TLS_ACME_ENABLED` (default `false`; enable ACME-style cert directory discovery)
 - `TARDIGRADE_TLS_ACME_CERT_DIR` (default empty; directory containing `<host>.crt` and `<host>.key` files for SNI)
+- `TARDIGRADE_HTTP2_ENABLED` (default `true`; enables ALPN `h2` selection and HTTP/2 connection handling on TLS listeners)
 - `TARDIGRADE_PROXY_PROTOCOL` (default `off`; supported: `off`, `auto`, `v1`, `v2`; applies to plaintext listeners for extracting client IP from PROXY headers)
 - `TARDIGRADE_TRUST_GATEWAY_ID` (default `tardigrade-edge`; gateway identity sent in trusted upstream headers)
 - `TARDIGRADE_TRUST_SHARED_SECRET` (default empty; shared secret enabling signed upstream trust headers)

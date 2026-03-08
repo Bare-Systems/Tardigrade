@@ -55,6 +55,12 @@ pub const TlsOptions = struct {
     dynamic_reload_interval_ms: u64 = 5_000,
     acme_enabled: bool = false,
     acme_cert_dir: []const u8 = "",
+    http2_enabled: bool = true,
+};
+
+pub const NegotiatedProtocol = enum {
+    http1_1,
+    http2,
 };
 
 const ManagedSniCert = struct {
@@ -83,6 +89,7 @@ const State = struct {
     acme_cert_dir: []const u8,
     static_sni_specs: []const SniCertSpec,
     sni_certs: std.ArrayList(ManagedSniCert),
+    http2_enabled: bool,
 
     fn deinit(self: *State) void {
         if (self.ocsp_response) |resp| self.allocator.free(resp);
@@ -123,6 +130,7 @@ pub const TlsTerminator = struct {
             .acme_cert_dir = opts.acme_cert_dir,
             .static_sni_specs = opts.sni_certs,
             .sni_certs = std.ArrayList(ManagedSniCert).init(allocator),
+            .http2_enabled = opts.http2_enabled,
         };
         errdefer st.deinit();
 
@@ -138,6 +146,7 @@ pub const TlsTerminator = struct {
             _ = c.SSL_CTX_set_tlsext_servername_callback(ctx, sniCallback);
             _ = c.SSL_CTX_set_tlsext_servername_arg(ctx, st);
         }
+        _ = c.SSL_CTX_set_alpn_select_cb(ctx, alpnSelectCallback, st);
 
         return .{ .allocator = allocator, .ctx = ctx, .state = st };
     }
@@ -216,6 +225,14 @@ pub const TlsConnection = struct {
 
     pub fn writer(self: *TlsConnection) Writer {
         return .{ .context = self };
+    }
+
+    pub fn negotiatedProtocol(self: *const TlsConnection) NegotiatedProtocol {
+        var data: [*c]const u8 = null;
+        var len: c_uint = 0;
+        c.SSL_get0_alpn_selected(self.ssl, &data, &len);
+        if (data != null and len == 2 and std.mem.eql(u8, data[0..2], "h2")) return .http2;
+        return .http1_1;
     }
 
     fn writeFn(self: *TlsConnection, data: []const u8) TlsError!usize {
@@ -365,6 +382,23 @@ fn sniCallback(ssl: ?*c.SSL, alert: ?*c_int, arg: ?*anyopaque) callconv(.c) c_in
         return c.SSL_TLSEXT_ERR_OK;
     }
     return c.SSL_TLSEXT_ERR_NOACK;
+}
+
+fn alpnSelectCallback(
+    _ssl: ?*c.SSL,
+    out: [*c][*c]u8,
+    outlen: [*c]u8,
+    in: [*c]const u8,
+    inlen: c_uint,
+    arg: ?*anyopaque,
+) callconv(.c) c_int {
+    _ = _ssl;
+    const state: *State = @ptrCast(@alignCast(arg orelse return c.SSL_TLSEXT_ERR_NOACK));
+    const h2_and_http11 = "\x02h2\x08http/1.1";
+    const http11_only = "\x08http/1.1";
+    const server_protos = if (state.http2_enabled) h2_and_http11 else http11_only;
+    const rc = c.SSL_select_next_proto(out, outlen, server_protos.ptr, @intCast(server_protos.len), in, inlen);
+    return if (rc == c.OPENSSL_NPN_NEGOTIATED) c.SSL_TLSEXT_ERR_OK else c.SSL_TLSEXT_ERR_NOACK;
 }
 
 fn fileMtime(path: []const u8) !i128 {

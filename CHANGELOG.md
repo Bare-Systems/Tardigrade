@@ -66,6 +66,10 @@
 - Phase 4.4 slow-start for recovered upstreams (`src/edge_config.zig`, `src/edge_gateway.zig`):
   - Added `TARDIGRADE_UPSTREAM_SLOW_START_MS` for recovered-backend traffic ramp windows.
   - Upstream selection now applies gradual eligibility during slow-start instead of immediate full-load routing after recovery.
+- Error categorization telemetry (`src/http/metrics.zig`, `src/http/access_log.zig`, `src/edge_gateway.zig`):
+  - Access logs now emit `error_category` for non-success outcomes.
+  - Added category-level API error counters (invalid request, unauthorized, rate-limited, upstream timeout/unavailable, internal, overload).
+  - Overload shedding and API error paths now increment categorized metrics for triage.
 
 ## [0.26.0] - 2026-03-xx
 

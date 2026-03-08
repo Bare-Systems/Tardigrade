@@ -271,6 +271,12 @@ const GatewayState = struct {
         self.metrics.recordQueueRejection();
     }
 
+    fn metricsRecordErrorCode(self: *GatewayState, code: []const u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.metrics.recordErrorCode(code);
+    }
+
     fn metricsToJson(self: *GatewayState, allocator: std.mem.Allocator) ![]u8 {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -767,16 +773,19 @@ fn acceptReadyConnections(listen_fd: std.posix.fd_t, worker_pool: *http.worker_p
             .accepted => {},
             .over_ip_limit => {
                 state.logger.warn(null, "per-IP connection limit reached for {s}", .{ip_key});
+                state.metricsRecordErrorCode("overload");
                 rejectOverloadedClient(client_fd);
                 continue;
             },
             .over_global_limit => {
                 state.logger.warn(null, "global active connection limit reached", .{});
+                state.metricsRecordErrorCode("overload");
                 rejectOverloadedClient(client_fd);
                 continue;
             },
             .over_global_memory_limit => {
                 state.logger.warn(null, "global connection memory estimate limit reached", .{});
+                state.metricsRecordErrorCode("overload");
                 rejectOverloadedClient(client_fd);
                 continue;
             },
@@ -785,6 +794,7 @@ fn acceptReadyConnections(listen_fd: std.posix.fd_t, worker_pool: *http.worker_p
         worker_pool.submit(client_fd) catch |err| {
             state.logger.warn(null, "worker queue submit failed: {}", .{err});
             state.metricsRecordQueueRejection();
+            state.metricsRecordErrorCode("overload");
             state.releaseConnectionSlot(client_fd);
             rejectOverloadedClient(client_fd);
             continue;
@@ -2209,6 +2219,7 @@ fn sendApiError(allocator: std.mem.Allocator, writer: anytype, status: http.Stat
     state.security_headers.apply(&response);
     try response.write(writer);
     state.metricsRecord(@intFromEnum(status));
+    state.metricsRecordErrorCode(code);
 }
 
 /// Emit a structured JSON access log entry for a completed request.
@@ -2226,8 +2237,28 @@ fn logAccess(ctx: *const http.request_context.RequestContext, method: []const u8
         .identity = ctx.identity orelse "-",
         .user_agent = user_agent,
         .bytes_sent = 0,
+        .error_category = classifyErrorCategory(status),
     };
     entry.log();
+}
+
+fn classifyErrorCategory(status: u16) []const u8 {
+    return if (status < 400)
+        "-"
+    else if (status == 400 or status == 413 or status == 414)
+        "invalid_request"
+    else if (status == 401 or status == 403)
+        "authz"
+    else if (status == 429)
+        "rate_limited"
+    else if (status == 503)
+        "upstream_unavailable"
+    else if (status == 504)
+        "upstream_timeout"
+    else if (status >= 500)
+        "internal_error"
+    else
+        "client_error";
 }
 
 fn readHttpRequest(conn: anytype, buf: []u8, pending_len: *usize) !usize {
@@ -2505,4 +2536,14 @@ test "mapUpstreamError returns stable codes" {
     const mapped = mapUpstreamError(502);
     try std.testing.expectEqual(@as(u16, 503), mapped.status);
     try std.testing.expectEqualStrings("tool_unavailable", mapped.code);
+}
+
+test "classifyErrorCategory maps statuses" {
+    try std.testing.expectEqualStrings("-", classifyErrorCategory(200));
+    try std.testing.expectEqualStrings("invalid_request", classifyErrorCategory(400));
+    try std.testing.expectEqualStrings("authz", classifyErrorCategory(401));
+    try std.testing.expectEqualStrings("rate_limited", classifyErrorCategory(429));
+    try std.testing.expectEqualStrings("upstream_unavailable", classifyErrorCategory(503));
+    try std.testing.expectEqualStrings("upstream_timeout", classifyErrorCategory(504));
+    try std.testing.expectEqualStrings("internal_error", classifyErrorCategory(500));
 }

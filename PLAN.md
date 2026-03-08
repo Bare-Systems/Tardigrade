@@ -509,9 +509,10 @@ Resolved (incremental): metrics now include active connection gauge, listener re
 ### 12.3 Debugging
 - [x] Debug logging
 - [x] Request tracing
-- [ ] Error categorization
+- [x] Error categorization
 
 Resolved: Structured access log implemented in `src/http/access_log.zig`. `AccessLogEntry` emits a `"type":"access"` JSON line to stderr per completed request with method, path, status, latency, client IP, correlation ID, identity, and user agent fields. The `logAccess()` helper in the gateway replaces all 35 `ctx.auditLog()` key=value callsites with structured JSON output suitable for log aggregation.
+Resolved (incremental): access logs now include `error_category` classification and metrics now track category-level API error counters (invalid request, unauthorized, rate limited, upstream timeout/unavailable, internal, overload) for operational triage.
 
 ### 12.4 Admin API
 - [ ] route inspection

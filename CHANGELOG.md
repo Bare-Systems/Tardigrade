@@ -43,6 +43,11 @@
   - Added authenticated device identity registration (`POST /v1/devices/register`) backed by registry persistence.
   - Added device proof enforcement on protected routes (`X-Device-ID`, `X-Device-Timestamp`, `X-Device-Signature`) when enabled.
   - Added session token refresh route (`POST /v1/sessions/refresh`) and policy engine enforcement (`TARDIGRADE_POLICY_*`) for route scope/device/approval/time windows.
+- Phase 13.1/13.3 process and privilege hardening increment (`src/main.zig`, `src/http/shutdown.zig`, `src/edge_gateway.zig`, `src/edge_config.zig`, `src/http/config_file.zig`):
+  - Added master/worker process supervision mode with worker respawn (`TARDIGRADE_MASTER_PROCESS`, `TARDIGRADE_WORKER_PROCESSES`).
+  - Added SIGUSR2 binary-upgrade signaling and replacement-master spawn path (`TARDIGRADE_BINARY_UPGRADE`).
+  - Added worker recycle timer and Linux CPU affinity pinning controls (`TARDIGRADE_WORKER_RECYCLE_SECONDS`, `TARDIGRADE_WORKER_CPU_AFFINITY`).
+  - Added privilege hardening controls: strict unprivileged-mode enforcement and optional chroot after bind (`TARDIGRADE_REQUIRE_UNPRIVILEGED_USER`, `TARDIGRADE_CHROOT_DIR`).
 
 ## [0.28.0] - 2026-03-07
 

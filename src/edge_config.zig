@@ -191,6 +191,10 @@ pub const EdgeConfig = struct {
     run_user: []const u8,
     /// Optional target group for post-bind privilege drop.
     run_group: []const u8,
+    /// Optional chroot directory applied after bind.
+    chroot_dir: []const u8,
+    /// Require runtime to be unprivileged after startup.
+    require_unprivileged_user: bool,
     /// Optional accepted Host patterns for virtual-host matching.
     server_names: [][]const u8,
     /// Optional document root for try_files/static fallback handling.
@@ -223,6 +227,16 @@ pub const EdgeConfig = struct {
     cb_timeout_ms: u64,
     /// Number of worker threads for connection handling (0 = auto CPU count).
     worker_threads: u32,
+    /// Enable master process supervision mode.
+    master_process_enabled: bool,
+    /// Number of worker processes when master mode is enabled.
+    worker_processes: u32,
+    /// Enable binary upgrade signaling path (SIGUSR2).
+    binary_upgrade_enabled: bool,
+    /// Worker recycle interval in seconds (0 = disabled).
+    worker_recycle_seconds: u32,
+    /// Optional cpu affinity list (`0,1,2`) for worker role pinning.
+    worker_cpu_affinity: []const u8,
     /// Maximum queued accepted connections waiting for workers.
     worker_queue_size: usize,
     /// Desired soft file-descriptor limit (RLIMIT_NOFILE). 0 leaves OS default.
@@ -381,12 +395,14 @@ pub const EdgeConfig = struct {
         allocator.free(self.pid_file);
         allocator.free(self.run_user);
         allocator.free(self.run_group);
+        allocator.free(self.chroot_dir);
         for (self.server_names) |name| allocator.free(name);
         allocator.free(self.server_names);
         allocator.free(self.doc_root);
         allocator.free(self.try_files);
         allocator.free(self.access_log_template);
         allocator.free(self.access_log_syslog_udp);
+        allocator.free(self.worker_cpu_affinity);
         allocator.free(self.upstream_active_health_path);
         for (self.rewrite_rules) |rule| {
             allocator.free(rule.method);
@@ -730,6 +746,9 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     errdefer allocator.free(run_user);
     const run_group = envOrDefault(allocator, "TARDIGRADE_RUN_GROUP", "") catch unreachable;
     errdefer allocator.free(run_group);
+    const chroot_dir = envOrDefault(allocator, "TARDIGRADE_CHROOT_DIR", "") catch unreachable;
+    errdefer allocator.free(chroot_dir);
+    const require_unprivileged_user = parseBoolEnv(allocator, "TARDIGRADE_REQUIRE_UNPRIVILEGED_USER", false);
     const server_names_raw = envOrDefault(allocator, "TARDIGRADE_SERVER_NAMES", "") catch unreachable;
     defer allocator.free(server_names_raw);
     const server_names = try parseServerNames(allocator, server_names_raw);
@@ -782,6 +801,12 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     const worker_threads_str = envOrDefault(allocator, "TARDIGRADE_WORKER_THREADS", "0") catch unreachable;
     defer allocator.free(worker_threads_str);
     const worker_threads = std.fmt.parseInt(u32, worker_threads_str, 10) catch 0;
+    const master_process_enabled = parseBoolEnv(allocator, "TARDIGRADE_MASTER_PROCESS", false);
+    const worker_processes = parseIntEnv(u32, allocator, "TARDIGRADE_WORKER_PROCESSES", 1);
+    const binary_upgrade_enabled = parseBoolEnv(allocator, "TARDIGRADE_BINARY_UPGRADE", true);
+    const worker_recycle_seconds = parseIntEnv(u32, allocator, "TARDIGRADE_WORKER_RECYCLE_SECONDS", 0);
+    const worker_cpu_affinity = envOrDefault(allocator, "TARDIGRADE_WORKER_CPU_AFFINITY", "") catch unreachable;
+    errdefer allocator.free(worker_cpu_affinity);
 
     const worker_queue_str = envOrDefault(allocator, "TARDIGRADE_WORKER_QUEUE_SIZE", "1024") catch unreachable;
     defer allocator.free(worker_queue_str);
@@ -1043,6 +1068,8 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .pid_file = pid_file,
         .run_user = run_user,
         .run_group = run_group,
+        .chroot_dir = chroot_dir,
+        .require_unprivileged_user = require_unprivileged_user,
         .server_names = server_names,
         .doc_root = doc_root,
         .try_files = try_files,
@@ -1059,6 +1086,11 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .cb_threshold = cb_threshold,
         .cb_timeout_ms = cb_timeout_ms,
         .worker_threads = worker_threads,
+        .master_process_enabled = master_process_enabled,
+        .worker_processes = worker_processes,
+        .binary_upgrade_enabled = binary_upgrade_enabled,
+        .worker_recycle_seconds = worker_recycle_seconds,
+        .worker_cpu_affinity = worker_cpu_affinity,
         .worker_queue_size = worker_queue_size,
         .fd_soft_limit = fd_soft_limit,
         .max_connections_per_ip = max_connections_per_ip,

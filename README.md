@@ -157,6 +157,8 @@ Environment variables:
 - `TARDIGRADE_ERROR_LOG_PATH` (default empty; when set and not `stderr`, redirects stderr logging to this file)
 - `TARDIGRADE_PID_FILE` (default empty; writes/removes process pid file on startup/shutdown)
 - `TARDIGRADE_RUN_USER` / `TARDIGRADE_RUN_GROUP` (default empty; numeric uid/gid for post-bind privilege drop)
+- `TARDIGRADE_REQUIRE_UNPRIVILEGED_USER` (default `false`; when true, startup fails if process remains uid 0 after privilege/drop flow)
+- `TARDIGRADE_CHROOT_DIR` (default empty; optional chroot jail applied after listener bind and before uid/gid drop)
 - `TARDIGRADE_SERVER_NAMES` (default empty; comma/space-separated host patterns; supports exact, `*.suffix`, and `~regex`)
 - `TARDIGRADE_DOC_ROOT` (default empty; static fallback root used by try_files)
 - `TARDIGRADE_TRY_FILES` (default empty; comma-separated fallback candidates, supports `$uri`)
@@ -169,6 +171,11 @@ Environment variables:
 - `TARDIGRADE_POLICY_RULES` (default empty; semicolon-separated `METHOD|REGEX|required_scope|require_approval|hours|device_regex`)
 - `TARDIGRADE_POLICY_USER_SCOPES` (default empty; semicolon-separated identity scopes: `identity:scope1,scope2;...`)
 - `TARDIGRADE_POLICY_APPROVAL_ROUTES` (default empty; semicolon-separated approval routes `METHOD|REGEX`)
+- `TARDIGRADE_MASTER_PROCESS` (default `false`; enable master process supervising multiple worker processes)
+- `TARDIGRADE_WORKER_PROCESSES` (default `1`; worker process count when master mode is enabled, `0` = CPU count)
+- `TARDIGRADE_BINARY_UPGRADE` (default `true`; enables SIGUSR2-triggered replacement master spawn in master mode)
+- `TARDIGRADE_WORKER_RECYCLE_SECONDS` (default `0`; worker self-shutdown interval for recycling, `0` disables)
+- `TARDIGRADE_WORKER_CPU_AFFINITY` (default empty; Linux-only cpu list for worker pinning, e.g. `0,2,4`)
 
 Config file syntax (Phase 3.1 foundation):
 - Statements end with `;`
@@ -190,6 +197,7 @@ Hot reload (Phase 3.4 foundation):
 - Send `SIGHUP` to trigger zero-downtime config reload.
 - Reload validates and parses full config before apply.
 - On validation failure, running config remains unchanged.
+- Send `SIGUSR2` in master mode to trigger binary-upgrade handoff spawn.
 - `TARDIGRADE_PROXY_STREAM_ALL_STATUSES` (default `false`; when enabled, streams non-200 upstream responses directly instead of mapping to gateway error envelopes)
 - `TARDIGRADE_UPSTREAM_RETRY_ATTEMPTS` (default `1`; number of upstream attempts per proxy request; when multiple upstream base URLs are configured, attempts rotate across them)
 - `TARDIGRADE_UPSTREAM_TIMEOUT_BUDGET_MS` (default `0`; total timeout budget across all upstream attempts; `0` disables budget enforcement)

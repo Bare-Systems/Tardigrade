@@ -636,13 +636,16 @@ Resolved (incremental): added authenticated admin endpoints for route inspection
 ## PHASE 13: Production Hardening
 
 ### 13.1 Process Management
-- [ ] Master/worker process model
+- [x] Master/worker process model
 - [x] Graceful shutdown (SIGTERM/SIGQUIT)
-- [ ] Binary upgrade (SIGUSR2)
-- [ ] Worker process recycling
-- [ ] CPU affinity
+- [x] Binary upgrade (SIGUSR2)
+- [x] Worker process recycling
+- [x] CPU affinity
 
 Resolved: Graceful shutdown implemented in `src/http/shutdown.zig`. SIGTERM and SIGINT handlers set a global atomic flag. With the Phase 2.1 event loop, the listener no longer blocks indefinitely in `accept()`, so shutdown is serviced on the next event-loop tick even when the server is idle.
+Resolved (incremental): added optional master/worker process supervision in `src/main.zig` (`TARDIGRADE_MASTER_PROCESS`, `TARDIGRADE_WORKER_PROCESSES`) with automatic worker respawn on unexpected exit.
+Resolved (incremental): added SIGUSR2 upgrade signaling path (`src/http/shutdown.zig`) and master-mode binary handoff spawn behavior (`TARDIGRADE_BINARY_UPGRADE`).
+Resolved (incremental): added worker recycle timer controls (`TARDIGRADE_WORKER_RECYCLE_SECONDS`) and Linux best-effort process CPU affinity pinning (`TARDIGRADE_WORKER_CPU_AFFINITY`).
 
 ### 13.2 Resource Limits
 - [x] File descriptor limits
@@ -657,9 +660,12 @@ Resolved (incremental): global estimated active-connection memory capping added 
 Decision: total memory cap is estimated from active connections and configured per-connection memory budget to keep listener-side checks lock-free and low overhead.
 
 ### 13.3 Privilege Management
-- [ ] Run as unprivileged user
-- [ ] Privilege dropping after bind
-- [ ] Chroot support (optional)
+- [x] Run as unprivileged user
+- [x] Privilege dropping after bind
+- [x] Chroot support (optional)
+
+Resolved (incremental): added strict unprivileged-mode enforcement (`TARDIGRADE_REQUIRE_UNPRIVILEGED_USER`) and explicit post-bind privilege drop controls (`TARDIGRADE_RUN_USER`, `TARDIGRADE_RUN_GROUP`).
+Resolved (incremental): added optional chroot jail application after bind (`TARDIGRADE_CHROOT_DIR`) before uid/gid drop.
 
 ### 13.4 Resilience Features
 - [x] circuit breakers

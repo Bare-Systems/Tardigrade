@@ -1416,7 +1416,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
 
     // Install signal handlers for graceful shutdown
     http.shutdown.installSignalHandlers();
-    state.logger.info(null, "Signal handlers installed (SIGTERM/SIGINT shutdown, SIGHUP reload)", .{});
+    state.logger.info(null, "Signal handlers installed (SIGTERM/SIGINT shutdown, SIGHUP reload, SIGUSR2 upgrade)", .{});
 
     var ready_events: [64]http.event_loop.Event = undefined;
     while (!http.shutdown.isShutdownRequested()) {
@@ -1435,6 +1435,10 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         }
 
         if (timer.consumeTick(http.event_loop.monotonicMs())) {
+            if (http.shutdown.consumeUpgradeRequested()) {
+                state.logger.info(null, "Upgrade signal received; entering graceful shutdown", .{});
+                http.shutdown.requestShutdown();
+            }
             if (http.shutdown.consumeReloadRequested()) {
                 hotReloadConfig(state_allocator, &worker_ctx, &state, &reloaded_cfgs);
             }
@@ -1723,6 +1727,13 @@ fn applyFdSoftLimit(desired: u64) !?u64 {
 }
 
 fn applyRuntimeIdentity(cfg: *const edge_config.EdgeConfig, logger: *const http.logger.Logger) !void {
+    if (cfg.chroot_dir.len > 0) {
+        try std.posix.chdir(cfg.chroot_dir);
+        try std.posix.chroot(".");
+        try std.posix.chdir("/");
+        logger.info(null, "Applied chroot jail: {s}", .{cfg.chroot_dir});
+    }
+
     if (cfg.run_group.len > 0) {
         const gid = std.fmt.parseInt(u32, cfg.run_group, 10) catch {
             logger.warn(null, "run_group expects numeric gid; got '{s}'", .{cfg.run_group});
@@ -1738,6 +1749,10 @@ fn applyRuntimeIdentity(cfg: *const edge_config.EdgeConfig, logger: *const http.
         };
         try std.posix.setuid(uid);
         logger.info(null, "Applied runtime user: uid={d}", .{uid});
+    }
+
+    if (cfg.require_unprivileged_user and std.posix.getuid() == 0) {
+        return error.RunningAsRoot;
     }
 }
 
@@ -6104,6 +6119,8 @@ test "resolveProxyTarget handles absolute and relative proxy_pass" {
         .pid_file = "",
         .run_user = "",
         .run_group = "",
+        .chroot_dir = "",
+        .require_unprivileged_user = false,
         .server_names = &[_][]const u8{},
         .doc_root = "",
         .try_files = "",
@@ -6120,6 +6137,11 @@ test "resolveProxyTarget handles absolute and relative proxy_pass" {
         .cb_threshold = 0,
         .cb_timeout_ms = 30_000,
         .worker_threads = 0,
+        .master_process_enabled = false,
+        .worker_processes = 1,
+        .binary_upgrade_enabled = true,
+        .worker_recycle_seconds = 0,
+        .worker_cpu_affinity = "",
         .worker_queue_size = 1024,
         .fd_soft_limit = 0,
         .max_connections_per_ip = 0,
@@ -6286,6 +6308,8 @@ test "authorizeRequest accepts valid hash" {
         .pid_file = "",
         .run_user = "",
         .run_group = "",
+        .chroot_dir = "",
+        .require_unprivileged_user = false,
         .server_names = &[_][]const u8{},
         .doc_root = "",
         .try_files = "",
@@ -6302,6 +6326,11 @@ test "authorizeRequest accepts valid hash" {
         .cb_threshold = 0,
         .cb_timeout_ms = 30_000,
         .worker_threads = 0,
+        .master_process_enabled = false,
+        .worker_processes = 1,
+        .binary_upgrade_enabled = true,
+        .worker_recycle_seconds = 0,
+        .worker_cpu_affinity = "",
         .worker_queue_size = 1024,
         .fd_soft_limit = 0,
         .max_connections_per_ip = 0,

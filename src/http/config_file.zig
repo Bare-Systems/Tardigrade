@@ -128,7 +128,7 @@ fn parseStatement(
     // Core directive aliases (phase 3.2)
     if (std.ascii.eqlIgnoreCase(directive, "worker_processes")) {
         const mapped = if (std.ascii.eqlIgnoreCase(trimmed_value, "auto")) "0" else trimmed_value;
-        try putOverride(allocator, &overrides.map, "TARDIGRADE_WORKER_THREADS", mapped);
+        try putOverride(allocator, &overrides.map, "TARDIGRADE_WORKER_PROCESSES", mapped);
         return;
     }
     if (std.ascii.eqlIgnoreCase(directive, "worker_connections")) {

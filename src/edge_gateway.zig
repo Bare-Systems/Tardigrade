@@ -4861,7 +4861,7 @@ fn authorizeRequest(cfg: *const edge_config.EdgeConfig, headers: *const http.Hea
             _ = std.fmt.bufPrint(&digest_hex, "{s}", .{std.fmt.fmtSliceHexLower(&digest)}) catch return .{ .ok = false, .token_hash = null };
 
             for (cfg.auth_token_hashes) |allowed| {
-                if (std.mem.eql(u8, allowed, digest_hex[0..])) return .{ .ok = true, .token_hash = allowed };
+                if (allowed.len == 64 and std.crypto.utils.timingSafeEql([64]u8, allowed[0..64].*, digest_hex)) return .{ .ok = true, .token_hash = allowed };
             }
         } else |_| {}
     }

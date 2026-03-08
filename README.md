@@ -154,6 +154,21 @@ Environment variables:
 - `TARDIGRADE_ACCESS_LOG_BUFFER_SIZE` (default `0`; access log buffer size in bytes before flush, `0` disables buffering)
 - `TARDIGRADE_ACCESS_LOG_SYSLOG_UDP` (default empty; optional syslog UDP endpoint `host:port`)
 - `TARDIGRADE_CONFIG_PATH` (default empty; optional nginx-style config file path loaded before env override resolution)
+- `TARDIGRADE_ERROR_LOG_PATH` (default empty; when set and not `stderr`, redirects stderr logging to this file)
+- `TARDIGRADE_PID_FILE` (default empty; writes/removes process pid file on startup/shutdown)
+- `TARDIGRADE_RUN_USER` / `TARDIGRADE_RUN_GROUP` (default empty; numeric uid/gid for post-bind privilege drop)
+- `TARDIGRADE_SERVER_NAMES` (default empty; comma/space-separated host patterns; supports exact, `*.suffix`, and `~regex`)
+- `TARDIGRADE_DOC_ROOT` (default empty; static fallback root used by try_files)
+- `TARDIGRADE_TRY_FILES` (default empty; comma-separated fallback candidates, supports `$uri`)
+- `TARDIGRADE_SECRETS_PATH` (default empty; optional secret override file with `KEY=VALUE` or `KEY=ENC:<base64>` entries)
+- `TARDIGRADE_SECRET_KEYS` (default empty; comma-separated hex keys used to decrypt `ENC:` values, supports key rotation order)
+- `TARDIGRADE_DEVICE_REGISTRY_PATH` (default empty; path to device key registry file)
+- `TARDIGRADE_DEVICE_AUTH_REQUIRED` (default `false`; enforce device proof headers for protected routes)
+- `TARDIGRADE_ACCESS_TOKEN_TTL_SECONDS` (default `900`; informational ttl value returned by session refresh endpoint)
+- `TARDIGRADE_REFRESH_TOKEN_TTL_SECONDS` (default `86400`; informational refresh ttl value returned by session refresh endpoint)
+- `TARDIGRADE_POLICY_RULES` (default empty; semicolon-separated `METHOD|REGEX|required_scope|require_approval|hours|device_regex`)
+- `TARDIGRADE_POLICY_USER_SCOPES` (default empty; semicolon-separated identity scopes: `identity:scope1,scope2;...`)
+- `TARDIGRADE_POLICY_APPROVAL_ROUTES` (default empty; semicolon-separated approval routes `METHOD|REGEX`)
 
 Config file syntax (Phase 3.1 foundation):
 - Statements end with `;`
@@ -162,6 +177,14 @@ Config file syntax (Phase 3.1 foundation):
 - Variables: `set $base /etc/tardigrade;` and use `${base}` interpolation
 - Include: `include conf.d/*.conf;`
 - Environment variables still override config-file values.
+- Core directive aliases: `worker_processes`, `worker_connections`, `error_log`, `pid`, `user`
+- HTTP-style aliases: `listen`, `server_name`, `root`, `try_files`
+- Secret aliases: `secrets_file`, `secret_key`
+
+Device/Policy endpoints:
+- `POST /v1/devices/register` (authenticated; body `{ "device_id": "...", "public_key": "..." }`)
+- `POST /v1/sessions/refresh` (requires `X-Session-Token`; rotates session token and returns ttl metadata)
+- Device proof headers (when enabled): `X-Device-ID`, `X-Device-Timestamp`, `X-Device-Signature`
 
 Hot reload (Phase 3.4 foundation):
 - Send `SIGHUP` to trigger zero-downtime config reload.

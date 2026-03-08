@@ -32,6 +32,17 @@
   - Added nginx-style config-file parsing with `include`, `set $var`, interpolation, and directive-to-env normalization.
   - Added `TARDIGRADE_CONFIG_PATH` support with env-overrides-file precedence.
   - Added SIGHUP-triggered zero-downtime config hot reload with validate-before-apply semantics.
+- Phase 3.2/3.3 config directive expansion (`src/http/config_file.zig`, `src/edge_config.zig`, `src/main.zig`, `src/edge_gateway.zig`):
+  - Added core directive aliases for `worker_processes`, `worker_connections`, `error_log`, `pid`, and `user/group`.
+  - Added HTTP-style directive aliases for `listen`, `server_name`, `root`, and `try_files` with runtime host matching and static try-files fallback.
+  - Added pid-file lifecycle support, stderr log redirection, and numeric post-bind privilege dropping controls.
+- Phase 3.5 secret-management foundation (`src/http/secrets.zig`, `src/edge_config.zig`, `src/http.zig`):
+  - Added secret file override loading via `TARDIGRADE_SECRETS_PATH` and rotating key support via `TARDIGRADE_SECRET_KEYS`.
+  - Added encrypted secret envelope decoding (`ENC:<base64>` with keyed envelope validation) and preserved env-first override precedence.
+- Phase 0.1 and 6.6 identity/policy completion increment (`src/edge_config.zig`, `src/edge_gateway.zig`):
+  - Added authenticated device identity registration (`POST /v1/devices/register`) backed by registry persistence.
+  - Added device proof enforcement on protected routes (`X-Device-ID`, `X-Device-Timestamp`, `X-Device-Signature`) when enabled.
+  - Added session token refresh route (`POST /v1/sessions/refresh`) and policy engine enforcement (`TARDIGRADE_POLICY_*`) for route scope/device/approval/time windows.
 
 ## [0.28.0] - 2026-03-07
 

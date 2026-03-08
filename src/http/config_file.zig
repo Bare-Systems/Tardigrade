@@ -123,17 +123,99 @@ fn parseStatement(
         std.log.err("config syntax error at {s}:{d}: directive '{s}' missing value", .{ file_path, line_no, directive });
         return error.InvalidConfigSyntax;
     }
-    const value_interp = try interpolate(allocator, std.mem.trim(u8, value_raw, " \t\"'"), vars);
+    const trimmed_value = std.mem.trim(u8, value_raw, " \t\"'");
+
+    // Core directive aliases (phase 3.2)
+    if (std.ascii.eqlIgnoreCase(directive, "worker_processes")) {
+        const mapped = if (std.ascii.eqlIgnoreCase(trimmed_value, "auto")) "0" else trimmed_value;
+        try putOverride(allocator, &overrides.map, "TARDIGRADE_WORKER_THREADS", mapped);
+        return;
+    }
+    if (std.ascii.eqlIgnoreCase(directive, "worker_connections")) {
+        try putOverride(allocator, &overrides.map, "TARDIGRADE_MAX_ACTIVE_CONNECTIONS", trimmed_value);
+        return;
+    }
+    if (std.ascii.eqlIgnoreCase(directive, "pid")) {
+        try putOverride(allocator, &overrides.map, "TARDIGRADE_PID_FILE", trimmed_value);
+        return;
+    }
+    if (std.ascii.eqlIgnoreCase(directive, "user")) {
+        var toks = std.mem.tokenizeAny(u8, trimmed_value, " \t");
+        if (toks.next()) |user| try putOverride(allocator, &overrides.map, "TARDIGRADE_RUN_USER", user);
+        if (toks.next()) |group| try putOverride(allocator, &overrides.map, "TARDIGRADE_RUN_GROUP", group);
+        return;
+    }
+    if (std.ascii.eqlIgnoreCase(directive, "error_log")) {
+        var toks = std.mem.tokenizeAny(u8, trimmed_value, " \t");
+        if (toks.next()) |path| try putOverride(allocator, &overrides.map, "TARDIGRADE_ERROR_LOG_PATH", path);
+        if (toks.next()) |level| try putOverride(allocator, &overrides.map, "TARDIGRADE_LOG_LEVEL", level);
+        return;
+    }
+    if (std.ascii.eqlIgnoreCase(directive, "secrets_file")) {
+        try putOverride(allocator, &overrides.map, "TARDIGRADE_SECRETS_PATH", trimmed_value);
+        return;
+    }
+    if (std.ascii.eqlIgnoreCase(directive, "secret_key")) {
+        try putOverride(allocator, &overrides.map, "TARDIGRADE_SECRET_KEYS", trimmed_value);
+        return;
+    }
+
+    // HTTP-block style aliases (phase 3.3 foundation)
+    if (std.ascii.eqlIgnoreCase(directive, "listen")) {
+        try mapListenDirective(allocator, &overrides.map, trimmed_value);
+        return;
+    }
+    if (std.ascii.eqlIgnoreCase(directive, "server_name")) {
+        try putOverride(allocator, &overrides.map, "TARDIGRADE_SERVER_NAMES", trimmed_value);
+        return;
+    }
+    if (std.ascii.eqlIgnoreCase(directive, "root")) {
+        try putOverride(allocator, &overrides.map, "TARDIGRADE_DOC_ROOT", trimmed_value);
+        return;
+    }
+    if (std.ascii.eqlIgnoreCase(directive, "try_files")) {
+        try putOverride(allocator, &overrides.map, "TARDIGRADE_TRY_FILES", trimmed_value);
+        return;
+    }
+
+    const value_interp = try interpolate(allocator, trimmed_value, vars);
     defer allocator.free(value_interp);
     const env_key = try normalizeDirectiveToEnv(allocator, directive);
     defer allocator.free(env_key);
-    const key = try allocator.dupe(u8, env_key);
-    const val = try allocator.dupe(u8, value_interp);
-    if (overrides.map.fetchRemove(env_key)) |old| {
+    try putOverride(allocator, &overrides.map, env_key, value_interp);
+}
+
+fn putOverride(allocator: std.mem.Allocator, map: *std.StringHashMap([]const u8), key_raw: []const u8, value_raw: []const u8) !void {
+    const key = try allocator.dupe(u8, key_raw);
+    errdefer allocator.free(key);
+    const val = try allocator.dupe(u8, value_raw);
+    errdefer allocator.free(val);
+    if (map.fetchRemove(key_raw)) |old| {
         allocator.free(old.key);
         allocator.free(old.value);
     }
-    try overrides.map.put(key, val);
+    try map.put(key, val);
+}
+
+fn mapListenDirective(allocator: std.mem.Allocator, map: *std.StringHashMap([]const u8), raw: []const u8) !void {
+    var it = std.mem.tokenizeAny(u8, raw, " \t");
+    const addr = it.next() orelse return;
+    if (std.mem.indexOfScalar(u8, addr, ':')) |colon| {
+        const host = addr[0..colon];
+        const port = addr[colon + 1 ..];
+        if (host.len > 0) try putOverride(allocator, map, "TARDIGRADE_LISTEN_HOST", host);
+        if (port.len > 0) try putOverride(allocator, map, "TARDIGRADE_LISTEN_PORT", port);
+    } else {
+        const as_int = std.fmt.parseInt(u16, addr, 10) catch null;
+        if (as_int != null) {
+            try putOverride(allocator, map, "TARDIGRADE_LISTEN_PORT", addr);
+        } else {
+            try putOverride(allocator, map, "TARDIGRADE_LISTEN_HOST", addr);
+        }
+    }
+    while (it.next()) |flag| {
+        if (std.ascii.eqlIgnoreCase(flag, "http2")) try putOverride(allocator, map, "TARDIGRADE_HTTP2_ENABLED", "true");
+    }
 }
 
 fn parseInclude(
@@ -243,4 +325,22 @@ test "interpolate replaces known vars" {
     const out = try interpolate(allocator, "${base}/app", &vars);
     defer allocator.free(out);
     try std.testing.expectEqualStrings("/srv/app", out);
+}
+
+test "listen directive mapping" {
+    const allocator = std.testing.allocator;
+    var map = std.StringHashMap([]const u8).init(allocator);
+    defer {
+        var it = map.iterator();
+        while (it.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            allocator.free(entry.value_ptr.*);
+        }
+        map.deinit();
+    }
+
+    try mapListenDirective(allocator, &map, "127.0.0.1:9443 http2");
+    try std.testing.expectEqualStrings("127.0.0.1", map.get("TARDIGRADE_LISTEN_HOST").?);
+    try std.testing.expectEqualStrings("9443", map.get("TARDIGRADE_LISTEN_PORT").?);
+    try std.testing.expectEqualStrings("true", map.get("TARDIGRADE_HTTP2_ENABLED").?);
 }

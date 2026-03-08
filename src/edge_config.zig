@@ -2,6 +2,7 @@ const std = @import("std");
 const http = @import("http.zig");
 
 var active_file_overrides: ?*const http.config_file.Overrides = null;
+var active_secret_overrides: ?*const http.secrets.Overrides = null;
 
 pub const UpstreamLbAlgorithm = enum {
     round_robin,
@@ -155,10 +156,24 @@ pub const EdgeConfig = struct {
     jwt_audience: []const u8,
     /// Additional response headers from add_header directive.
     add_headers: []HeaderPair,
+    /// Policy engine route rules (`METHOD|REGEX|required_scope|require_approval|hours|device_regex`; semicolon-separated).
+    policy_rules_raw: []const u8,
+    /// Policy scope mapping (`identity:scope1,scope2;...`).
+    policy_user_scopes_raw: []const u8,
+    /// Routes requiring approval (`METHOD|REGEX;...`).
+    policy_approval_routes_raw: []const u8,
     /// Session idle TTL in seconds (0 = sessions disabled).
     session_ttl_seconds: u32,
     /// Maximum concurrent sessions (0 = unlimited).
     session_max: u32,
+    /// Device identity registry path (line format: `device_id|key`).
+    device_registry_path: []const u8,
+    /// Require registered device key proof headers for protected API routes.
+    device_auth_required: bool,
+    /// Access token ttl seconds for issued device tokens.
+    access_token_ttl_seconds: u32,
+    /// Refresh token ttl seconds for issued device tokens.
+    refresh_token_ttl_seconds: u32,
     /// IP access control rules (empty = disabled).
     /// Format: "allow 10.0.0.0/8, deny 0.0.0.0/0"
     access_control_rules: []const u8,
@@ -168,6 +183,20 @@ pub const EdgeConfig = struct {
     basic_auth_hashes: [][]const u8,
     /// Minimum log level (debug, info, warn, error).
     log_level: http.logger.Level,
+    /// Optional error log destination path (`stderr` keeps current behavior).
+    error_log_path: []const u8,
+    /// Optional pid file path.
+    pid_file: []const u8,
+    /// Optional target user for post-bind privilege drop.
+    run_user: []const u8,
+    /// Optional target group for post-bind privilege drop.
+    run_group: []const u8,
+    /// Optional accepted Host patterns for virtual-host matching.
+    server_names: [][]const u8,
+    /// Optional document root for try_files/static fallback handling.
+    doc_root: []const u8,
+    /// Optional `try_files` candidate list (comma-separated paths; supports `$uri`).
+    try_files: []const u8,
     /// Access log output format (json, plain, custom).
     access_log_format: http.access_log.Format,
     /// Access log custom template when format=custom.
@@ -342,8 +371,20 @@ pub const EdgeConfig = struct {
             allocator.free(h.value);
         }
         allocator.free(self.add_headers);
+        allocator.free(self.policy_rules_raw);
+        allocator.free(self.policy_user_scopes_raw);
+        allocator.free(self.policy_approval_routes_raw);
+        allocator.free(self.device_registry_path);
         for (self.basic_auth_hashes) |h| allocator.free(h);
         allocator.free(self.basic_auth_hashes);
+        allocator.free(self.error_log_path);
+        allocator.free(self.pid_file);
+        allocator.free(self.run_user);
+        allocator.free(self.run_group);
+        for (self.server_names) |name| allocator.free(name);
+        allocator.free(self.server_names);
+        allocator.free(self.doc_root);
+        allocator.free(self.try_files);
         allocator.free(self.access_log_template);
         allocator.free(self.access_log_syslog_udp);
         allocator.free(self.upstream_active_health_path);
@@ -391,6 +432,11 @@ pub const EdgeConfig = struct {
 };
 
 pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
+    var secret_overrides = try http.secrets.loadOverrides(allocator);
+    defer secret_overrides.deinit(allocator);
+    active_secret_overrides = &secret_overrides;
+    defer active_secret_overrides = null;
+
     var file_overrides = try http.config_file.loadOverrides(allocator);
     defer file_overrides.deinit(allocator);
     active_file_overrides = &file_overrides;
@@ -619,6 +665,12 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         }
         allocator.free(add_headers);
     }
+    const policy_rules_raw = envOrDefault(allocator, "TARDIGRADE_POLICY_RULES", "") catch unreachable;
+    errdefer allocator.free(policy_rules_raw);
+    const policy_user_scopes_raw = envOrDefault(allocator, "TARDIGRADE_POLICY_USER_SCOPES", "") catch unreachable;
+    errdefer allocator.free(policy_user_scopes_raw);
+    const policy_approval_routes_raw = envOrDefault(allocator, "TARDIGRADE_POLICY_APPROVAL_ROUTES", "") catch unreachable;
+    errdefer allocator.free(policy_approval_routes_raw);
 
     const session_ttl_str = envOrDefault(allocator, "TARDIGRADE_SESSION_TTL", "3600") catch unreachable;
     defer allocator.free(session_ttl_str);
@@ -627,6 +679,11 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     const session_max_str = envOrDefault(allocator, "TARDIGRADE_SESSION_MAX", "1000") catch unreachable;
     defer allocator.free(session_max_str);
     const session_max = std.fmt.parseInt(u32, session_max_str, 10) catch 1000;
+    const device_registry_path = envOrDefault(allocator, "TARDIGRADE_DEVICE_REGISTRY_PATH", "") catch unreachable;
+    errdefer allocator.free(device_registry_path);
+    const device_auth_required = parseBoolEnv(allocator, "TARDIGRADE_DEVICE_AUTH_REQUIRED", false);
+    const access_token_ttl_seconds = parseIntEnv(u32, allocator, "TARDIGRADE_ACCESS_TOKEN_TTL_SECONDS", 900);
+    const refresh_token_ttl_seconds = parseIntEnv(u32, allocator, "TARDIGRADE_REFRESH_TOKEN_TTL_SECONDS", 86_400);
 
     const access_control_rules = envOrDefault(allocator, "TARDIGRADE_ACCESS_CONTROL", "") catch unreachable;
     errdefer allocator.free(access_control_rules);
@@ -665,6 +722,25 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     const log_level_str = envOrDefault(allocator, "TARDIGRADE_LOG_LEVEL", "info") catch unreachable;
     defer allocator.free(log_level_str);
     const log_level = http.logger.Level.parse(log_level_str) orelse .info;
+    const error_log_path = envOrDefault(allocator, "TARDIGRADE_ERROR_LOG_PATH", "") catch unreachable;
+    errdefer allocator.free(error_log_path);
+    const pid_file = envOrDefault(allocator, "TARDIGRADE_PID_FILE", "") catch unreachable;
+    errdefer allocator.free(pid_file);
+    const run_user = envOrDefault(allocator, "TARDIGRADE_RUN_USER", "") catch unreachable;
+    errdefer allocator.free(run_user);
+    const run_group = envOrDefault(allocator, "TARDIGRADE_RUN_GROUP", "") catch unreachable;
+    errdefer allocator.free(run_group);
+    const server_names_raw = envOrDefault(allocator, "TARDIGRADE_SERVER_NAMES", "") catch unreachable;
+    defer allocator.free(server_names_raw);
+    const server_names = try parseServerNames(allocator, server_names_raw);
+    errdefer {
+        for (server_names) |name| allocator.free(name);
+        allocator.free(server_names);
+    }
+    const doc_root = envOrDefault(allocator, "TARDIGRADE_DOC_ROOT", "") catch unreachable;
+    errdefer allocator.free(doc_root);
+    const try_files = envOrDefault(allocator, "TARDIGRADE_TRY_FILES", "") catch unreachable;
+    errdefer allocator.free(try_files);
     const access_log_format_str = envOrDefault(allocator, "TARDIGRADE_ACCESS_LOG_FORMAT", "json") catch unreachable;
     defer allocator.free(access_log_format_str);
     const access_log_format = http.access_log.Format.parse(access_log_format_str) orelse .json;
@@ -943,8 +1019,15 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .jwt_issuer = jwt_issuer,
         .jwt_audience = jwt_audience,
         .add_headers = add_headers,
+        .policy_rules_raw = policy_rules_raw,
+        .policy_user_scopes_raw = policy_user_scopes_raw,
+        .policy_approval_routes_raw = policy_approval_routes_raw,
         .session_ttl_seconds = session_ttl_seconds,
         .session_max = session_max,
+        .device_registry_path = device_registry_path,
+        .device_auth_required = device_auth_required,
+        .access_token_ttl_seconds = access_token_ttl_seconds,
+        .refresh_token_ttl_seconds = refresh_token_ttl_seconds,
         .access_control_rules = access_control_rules,
         .request_limits = .{
             .max_body_size = max_body_size,
@@ -956,6 +1039,13 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         },
         .basic_auth_hashes = basic_auth_hashes,
         .log_level = log_level,
+        .error_log_path = error_log_path,
+        .pid_file = pid_file,
+        .run_user = run_user,
+        .run_group = run_group,
+        .server_names = server_names,
+        .doc_root = doc_root,
+        .try_files = try_files,
         .access_log_format = access_log_format,
         .access_log_template = access_log_template,
         .access_log_min_status = access_log_min_status,
@@ -1027,6 +1117,11 @@ fn envOrDefault(allocator: std.mem.Allocator, key: []const u8, default_value: []
             return allocator.dupe(u8, value);
         }
     }
+    if (active_secret_overrides) |ov| {
+        if (ov.map.get(key)) |value| {
+            return allocator.dupe(u8, value);
+        }
+    }
     return allocator.dupe(u8, default_value);
 }
 
@@ -1085,6 +1180,22 @@ fn parseCsvValues(allocator: std.mem.Allocator, raw: []const u8) ![][]const u8 {
         try out.append(duped);
     }
 
+    return out.toOwnedSlice();
+}
+
+fn parseServerNames(allocator: std.mem.Allocator, raw: []const u8) ![][]const u8 {
+    var out = std.ArrayList([]const u8).init(allocator);
+    errdefer {
+        for (out.items) |name| allocator.free(name);
+        out.deinit();
+    }
+
+    var it = std.mem.tokenizeAny(u8, raw, ", \t\r\n");
+    while (it.next()) |part| {
+        const trimmed = std.mem.trim(u8, part, " \t\r\n");
+        if (trimmed.len == 0) continue;
+        try out.append(try allocator.dupe(u8, trimmed));
+    }
     return out.toOwnedSlice();
 }
 
@@ -1470,4 +1581,15 @@ test "parse mirror rules csv" {
     }
     try std.testing.expectEqual(@as(usize, 1), rules.len);
     try std.testing.expectEqualStrings("POST", rules[0].method);
+}
+
+test "parse server names" {
+    const allocator = std.testing.allocator;
+    const names = try parseServerNames(allocator, "example.com, *.example.org api.internal");
+    defer {
+        for (names) |name| allocator.free(name);
+        allocator.free(names);
+    }
+    try std.testing.expectEqual(@as(usize, 3), names.len);
+    try std.testing.expectEqualStrings("*.example.org", names[1]);
 }

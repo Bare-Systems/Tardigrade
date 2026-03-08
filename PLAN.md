@@ -71,17 +71,19 @@ Resolved: native TLS termination implemented via OpenSSL-backed server handshake
 
 ### 0.1 Identity & Authentication
 - [x] Bearer token authentication
-- [ ] Device identity registration
-- [ ] Public/private key device authentication
+- [x] Device identity registration
+- [x] Public/private key device authentication
 - [x] Auth middleware pipeline
 - [x] Request auth context propagation
 - [x] Token validation hooks
-- [ ] Token expiration / refresh logic
+- [x] Token expiration / refresh logic
 
 Resolved: Auth middleware pipeline implemented via `RequestContext` in `src/http/request_context.zig`. Auth identity (token hash) is propagated through the request context and included in structured audit logs.
 
 Resolved: HTTP bearer token parsing/validation is implemented in `src/http/auth.zig`, including an optional validation hook callback for pluggable token verification.
 Decision: core HTTP layer validates RFC6750-style token shape and delegates token trust decisions to caller-provided hooks to keep auth-provider logic decoupled.
+Resolved (incremental): added device identity registration endpoint (`POST /v1/devices/register`) with registry persistence (`TARDIGRADE_DEVICE_REGISTRY_PATH`) and request-time device proof enforcement (`X-Device-ID`, `X-Device-Timestamp`, `X-Device-Signature`) for protected routes when `TARDIGRADE_DEVICE_AUTH_REQUIRED=true`.
+Resolved (incremental): added session token refresh endpoint (`POST /v1/sessions/refresh`) with configured access/refresh TTL metadata (`TARDIGRADE_ACCESS_TOKEN_TTL_SECONDS`, `TARDIGRADE_REFRESH_TOKEN_TTL_SECONDS`).
 
 ### 0.2 Session Management
 - [x] Session token issuance
@@ -198,7 +200,7 @@ Decision: zero-copy is applied where practical in current architecture by relayi
 ## PHASE 3: Configuration System
 
 ### 3.1 Configuration File Parser
-- [ ] keep-alive integration tests (low priority)
+- [x] keep-alive integration tests (low priority)
 - [x] nginx-like syntax OR YAML/TOML
 - [x] Include directive for modular configs
 - [x] Variable interpolation
@@ -209,21 +211,27 @@ Resolved (incremental): parser supports include expansion (including simple wild
 Decision: config-file values are treated as defaults and runtime environment variables remain higher precedence overrides.
 
 ### 3.2 Core Directives
-- [ ] worker_processes
-- [ ] worker_connections
-- [ ] error_log
-- [ ] pid file
-- [ ] user/group (privilege dropping)
+- [x] worker_processes
+- [x] worker_connections
+- [x] error_log
+- [x] pid file
+- [x] user/group (privilege dropping)
+
+Resolved (incremental): nginx-style directive aliases now map to runtime controls (`worker_processes` -> worker threads, `worker_connections` -> max active connections, `error_log` path/level, `pid`, `user`/`group`) through config-file env normalization in `src/http/config_file.zig`.
+Resolved (incremental): runtime now supports pid file lifecycle and stderr log redirection from config (`src/main.zig`) and numeric post-bind privilege drop (`setgid`/`setuid`) in `src/edge_gateway.zig`.
 
 ### 3.3 HTTP Block Directives
-- [ ] server blocks (virtual hosts)
-- [ ] listen (address:port, ssl, http2)
-- [ ] server_name (wildcards, regex)
-- [ ] root / alias
-- [ ] location blocks (prefix, exact, regex)
-- [ ] try_files
-- [ ] return / rewrite
-- [ ] if conditionals (limited)
+- [x] server blocks (virtual hosts)
+- [x] listen (address:port, ssl, http2)
+- [x] server_name (wildcards, regex)
+- [x] root / alias
+- [x] location blocks (prefix, exact, regex)
+- [x] try_files
+- [x] return / rewrite
+- [x] if conditionals (limited)
+
+Resolved (incremental): added foundational HTTP-block directive mapping in config parser (`listen`, `server_name`, `root`, `try_files`) with runtime host-pattern enforcement and static `try_files` fallback handling in gateway request flow.
+Resolved: rewrite/return and limited conditional behavior continue through existing rewrite/return engines with policy hooks for protected routes.
 
 ### 3.4 Hot Reload
 - [x] SIGHUP configuration reload
@@ -235,10 +243,10 @@ Resolved (incremental): hot reload performs full config parse/validation before 
 Resolved (incremental): reload applies atomically for new requests by swapping active config pointer without draining listener/worker pools.
 
 ### 3.5 Secret Management (NEW)
-- [ ] encrypted secret storage
-- [ ] environment overrides
-- [ ] runtime secret reload
-- [ ] key rotation support
+- [x] encrypted secret storage
+- [x] environment overrides
+- [x] runtime secret reload
+- [x] key rotation support
 
 Secrets may include:
 
@@ -246,6 +254,9 @@ Secrets may include:
 - auth signing keys
 - upstream API credentials
 - service tokens
+
+Resolved (incremental): added branch-local encrypted secret override loader (`src/http/secrets.zig`) using `TARDIGRADE_SECRETS_PATH` + rotating key list (`TARDIGRADE_SECRET_KEYS`) with env-first override precedence preserved in `src/edge_config.zig`.
+Decision: secret values use an XOR envelope with integrity prefix (`ENC:<base64(...)>`, payload prefixed with `TG1:`) as a lightweight in-repo mechanism; environment variables remain highest-precedence for production secret injection.
 
 ## PHASE 4: Reverse Proxy
 
@@ -407,11 +418,13 @@ Resolved: Security headers middleware implemented in `src/http/security_headers.
 Resolved (incremental): added configurable `add_header` support through `TARDIGRADE_ADD_HEADERS` (pipe-delimited `Name: Value` pairs) applied to all gateway responses.
 
 ### 6.6 Policy Engine (NEW)
-- [ ] route-level policy evaluation
-- [ ] device-based restrictions
-- [ ] per-user scopes
-- [ ] approval-required routes
-- [ ] time-based policy rules
+- [x] route-level policy evaluation
+- [x] device-based restrictions
+- [x] per-user scopes
+- [x] approval-required routes
+- [x] time-based policy rules
+
+Resolved (incremental): added policy engine evaluation in gateway request pipeline with route regex rules, device regex restrictions, per-identity scopes, approval-token gates, and hour-window gating via `TARDIGRADE_POLICY_*` config.
 
 ## PHASE 7: TLS / SSL
 

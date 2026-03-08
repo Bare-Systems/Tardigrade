@@ -413,6 +413,16 @@ const GatewayState = struct {
         return sessions.len;
     }
 
+    fn refreshSession(self: *GatewayState, allocator: std.mem.Allocator, token: []const u8, client_ip: []const u8) ![]const u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.session_store == null) return error.SessionsDisabled;
+        const existing = self.session_store.?.validate(token) orelse return error.InvalidSession;
+        const new_token = try self.session_store.?.create(existing.identity, client_ip, existing.device_id);
+        _ = self.session_store.?.revoke(token);
+        return try allocator.dupe(u8, new_token);
+    }
+
     fn circuitTryAcquire(self: *GatewayState) bool {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -1131,6 +1141,9 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     const listen_fd = server.stream.handle;
 
     try setNonBlocking(listen_fd, true);
+    applyRuntimeIdentity(cfg, &state.logger) catch |err| {
+        state.logger.warn(null, "privilege drop configuration failed: {}", .{err});
+    };
 
     var event_loop = try http.event_loop.EventLoop.init();
     defer event_loop.deinit();
@@ -1707,6 +1720,25 @@ fn applyFdSoftLimit(desired: u64) !?u64 {
     limits.cur = @intCast(target);
     try std.posix.setrlimit(std.posix.rlimit_resource.NOFILE, limits);
     return target;
+}
+
+fn applyRuntimeIdentity(cfg: *const edge_config.EdgeConfig, logger: *const http.logger.Logger) !void {
+    if (cfg.run_group.len > 0) {
+        const gid = std.fmt.parseInt(u32, cfg.run_group, 10) catch {
+            logger.warn(null, "run_group expects numeric gid; got '{s}'", .{cfg.run_group});
+            return error.InvalidRunGroup;
+        };
+        try std.posix.setgid(gid);
+        logger.info(null, "Applied runtime group: gid={d}", .{gid});
+    }
+    if (cfg.run_user.len > 0) {
+        const uid = std.fmt.parseInt(u32, cfg.run_user, 10) catch {
+            logger.warn(null, "run_user expects numeric uid; got '{s}'", .{cfg.run_user});
+            return error.InvalidRunUser;
+        };
+        try std.posix.setuid(uid);
+        logger.info(null, "Applied runtime user: uid={d}", .{uid});
+    }
 }
 
 fn handleAcceptedClient(raw_ctx: *anyopaque, client_fd: std.posix.fd_t) void {
@@ -2413,6 +2445,11 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         "unknown";
     const client_ip = http.request_context.extractClientIp(&request, connection_ip);
     var ctx = http.request_context.RequestContext.init(allocator, correlation_id, client_ip);
+    if (!hostMatchesServerNames(cfg, &request)) {
+        try sendApiError(allocator, writer, .not_found, "invalid_request", "Not Found", correlation_id, keep_alive, state);
+        logAccess(&ctx, request.method.toString(), request.uri.path, 404, request.headers.get("user-agent") orelse "");
+        return;
+    }
 
     // --- Rewrite / return directives ---
     const rewrite_outcome = http.rewrite.evaluate(
@@ -2514,6 +2551,22 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
     // --- Extract API version ---
     if (http.api_router.parseVersionedPath(request.uri.path)) |versioned| {
         ctx.setApiVersion(versioned.version);
+    }
+
+    if (ctx.api_version != null and isProtectedAuthRequestRoute(request.uri.path)) {
+        if (cfg.device_auth_required and !validateDeviceRequest(cfg, request.method.toString(), request.uri.path, &request.headers, request.body orelse "")) {
+            try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Device authentication failed", correlation_id, keep_alive, state);
+            logAccess(&ctx, request.method.toString(), request.uri.path, 401, request.headers.get("user-agent") orelse "");
+            return;
+        }
+
+        const identity = try extractIdentityForPolicy(allocator, cfg, state, &request);
+        defer if (identity) |id| allocator.free(id);
+        if (evaluatePolicy(cfg, request.method.toString(), request.uri.path, identity, request.headers.get("x-device-id"), &request.headers)) |reason| {
+            try sendApiError(allocator, writer, .forbidden, "forbidden", reason, correlation_id, keep_alive, state);
+            logAccess(&ctx, request.method.toString(), request.uri.path, 403, request.headers.get("user-agent") orelse "");
+            return;
+        }
     }
 
     // --- Extract idempotency key ---
@@ -3053,6 +3106,80 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         try response.write(writer);
         state.metricsRecord(202);
         logAccess(&ctx, request.method.toString(), request.uri.path, 202, request.headers.get("user-agent") orelse "");
+        return;
+    }
+
+    // --- POST /v1/devices/register (device identity registration) ---
+    if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/devices/register")) {
+        if (cfg.device_registry_path.len == 0) {
+            try sendApiError(allocator, writer, .not_implemented, "tool_unavailable", "Device registry not configured", correlation_id, keep_alive, state);
+            logAccess(&ctx, request.method.toString(), "/v1/devices/register", 501, request.headers.get("user-agent") orelse "");
+            return;
+        }
+        const auth_result = authorizeRequest(cfg, &request.headers);
+        if (!auth_result.ok) {
+            try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, keep_alive, state);
+            logAccess(&ctx, request.method.toString(), "/v1/devices/register", 401, request.headers.get("user-agent") orelse "");
+            return;
+        }
+        const body = request.body orelse "";
+        const reg = parseDeviceRegistration(allocator, body) catch {
+            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Invalid device registration payload", correlation_id, keep_alive, state);
+            logAccess(&ctx, request.method.toString(), "/v1/devices/register", 400, request.headers.get("user-agent") orelse "");
+            return;
+        };
+        defer {
+            allocator.free(reg.device_id);
+            allocator.free(reg.public_key);
+        }
+        registerDeviceIdentity(cfg.device_registry_path, reg.device_id, reg.public_key) catch {
+            try sendApiError(allocator, writer, .internal_server_error, "internal_error", "Failed to persist device identity", correlation_id, keep_alive, state);
+            logAccess(&ctx, request.method.toString(), "/v1/devices/register", 500, request.headers.get("user-agent") orelse "");
+            return;
+        };
+        var response = http.Response.created(allocator, "{\"registered\":true}", null);
+        defer response.deinit();
+        _ = response.setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
+        applyResponseHeaders(state, &response);
+        try response.write(writer);
+        state.metricsRecord(201);
+        logAccess(&ctx, request.method.toString(), "/v1/devices/register", 201, request.headers.get("user-agent") orelse "");
+        return;
+    }
+
+    // --- POST /v1/sessions/refresh ---
+    if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/sessions/refresh")) {
+        if (state.session_store == null) {
+            try sendApiError(allocator, writer, .not_found, "invalid_request", "Sessions not enabled", correlation_id, keep_alive, state);
+            logAccess(&ctx, request.method.toString(), "/v1/sessions/refresh", 404, request.headers.get("user-agent") orelse "");
+            return;
+        }
+        const session_token = http.session.fromHeaders(&request.headers) orelse {
+            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Missing or invalid X-Session-Token", correlation_id, keep_alive, state);
+            logAccess(&ctx, request.method.toString(), "/v1/sessions/refresh", 400, request.headers.get("user-agent") orelse "");
+            return;
+        };
+        const refreshed = state.refreshSession(allocator, session_token, client_ip) catch {
+            try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Invalid session token", correlation_id, keep_alive, state);
+            logAccess(&ctx, request.method.toString(), "/v1/sessions/refresh", 401, request.headers.get("user-agent") orelse "");
+            return;
+        };
+        defer allocator.free(refreshed);
+        const resp_body = try std.fmt.allocPrint(allocator, "{{\"session_token\":\"{s}\",\"access_ttl_seconds\":{d},\"refresh_ttl_seconds\":{d}}}", .{
+            refreshed,
+            cfg.access_token_ttl_seconds,
+            cfg.refresh_token_ttl_seconds,
+        });
+        defer allocator.free(resp_body);
+        var response = http.Response.ok(allocator, resp_body)
+            .setContentType(JSON_CONTENT_TYPE)
+            .setConnection(keep_alive)
+            .setHeader(http.correlation.HEADER_NAME, correlation_id)
+            .setHeader(http.session.SESSION_HEADER, refreshed);
+        applyResponseHeaders(state, &response);
+        try response.write(writer);
+        state.metricsRecord(200);
+        logAccess(&ctx, request.method.toString(), "/v1/sessions/refresh", 200, request.headers.get("user-agent") orelse "");
         return;
     }
 
@@ -3825,6 +3952,12 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         return;
     }
 
+    if (serveTryFilesFallback(allocator, cfg, request.method.toString(), request.uri.path, correlation_id, keep_alive, writer, state)) |status| {
+        state.metricsRecord(status);
+        logAccess(&ctx, request.method.toString(), request.uri.path, status, request.headers.get("user-agent") orelse "");
+        return;
+    } else |_| {}
+
     try sendApiError(allocator, writer, .not_found, "invalid_request", "Not Found", correlation_id, keep_alive, state);
     logAccess(&ctx, request.method.toString(), request.uri.path, 404, request.headers.get("user-agent") orelse "");
 }
@@ -3943,6 +4076,43 @@ fn handleWebSocketProxyLoop(
             },
         }
     }
+}
+
+fn serveTryFilesFallback(
+    allocator: std.mem.Allocator,
+    cfg: *const edge_config.EdgeConfig,
+    method: []const u8,
+    request_path: []const u8,
+    correlation_id: []const u8,
+    keep_alive: bool,
+    writer: anytype,
+    state: *GatewayState,
+) !u16 {
+    if (!(std.ascii.eqlIgnoreCase(method, "GET") or std.ascii.eqlIgnoreCase(method, "HEAD"))) return error.NoTryFiles;
+    if (cfg.doc_root.len == 0 or cfg.try_files.len == 0) return error.NoTryFiles;
+
+    var candidates = std.mem.splitScalar(u8, cfg.try_files, ',');
+    while (candidates.next()) |cand_raw| {
+        const cand = std.mem.trim(u8, cand_raw, " \t\r\n");
+        if (cand.len == 0) continue;
+        const rel = if (std.mem.eql(u8, cand, "$uri")) request_path else cand;
+        const safe_rel = std.mem.trimLeft(u8, rel, "/");
+        const full_path = try std.fs.path.join(allocator, &[_][]const u8{ cfg.doc_root, safe_rel });
+        defer allocator.free(full_path);
+        const file_data = std.fs.cwd().readFileAlloc(allocator, full_path, MAX_REQUEST_SIZE) catch continue;
+        defer allocator.free(file_data);
+
+        var response = http.Response.ok(allocator, if (std.ascii.eqlIgnoreCase(method, "HEAD")) "" else file_data);
+        defer response.deinit();
+        _ = response
+            .setContentType("application/octet-stream")
+            .setConnection(keep_alive)
+            .setHeader(http.correlation.HEADER_NAME, correlation_id);
+        applyResponseHeaders(state, &response);
+        try response.write(writer);
+        return 200;
+    }
+    return error.NoTryFiles;
 }
 
 fn streamSseTopic(
@@ -4446,6 +4616,214 @@ fn isProtectedAuthRequestRoute(path: []const u8) bool {
         http.api_router.matchRoute(path, 1, "/stream/tcp") or
         http.api_router.matchRoute(path, 1, "/stream/udp") or
         std.mem.startsWith(u8, path, "/admin/");
+}
+
+fn hostMatchesServerNames(cfg: *const edge_config.EdgeConfig, request: *const http.Request) bool {
+    if (cfg.server_names.len == 0) return true;
+    const raw_host = request.headers.get("host") orelse return false;
+    const host = stripHostPort(raw_host);
+    for (cfg.server_names) |pattern| {
+        if (matchHostPattern(pattern, host)) return true;
+    }
+    return false;
+}
+
+fn stripHostPort(raw_host: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, raw_host, " \t\r\n");
+    if (trimmed.len == 0) return trimmed;
+    if (trimmed[0] == '[') {
+        const end = std.mem.indexOfScalar(u8, trimmed, ']') orelse return trimmed;
+        return trimmed[1..end];
+    }
+    const colon = std.mem.lastIndexOfScalar(u8, trimmed, ':') orelse return trimmed;
+    const head = trimmed[0..colon];
+    if (std.mem.indexOfScalar(u8, head, ':') != null) return trimmed;
+    return head;
+}
+
+fn matchHostPattern(pattern_raw: []const u8, host: []const u8) bool {
+    const pattern = std.mem.trim(u8, pattern_raw, " \t");
+    if (pattern.len == 0) return false;
+    if (pattern[0] == '~') {
+        return http.rewrite.regexMatches(pattern[1..], host);
+    }
+    if (std.mem.startsWith(u8, pattern, "*.")) {
+        const suffix = pattern[1..];
+        return std.mem.endsWith(u8, host, suffix);
+    }
+    return std.ascii.eqlIgnoreCase(pattern, host);
+}
+
+const DeviceRegistration = struct {
+    device_id: []const u8,
+    public_key: []const u8,
+};
+
+fn parseDeviceRegistration(allocator: std.mem.Allocator, body: []const u8) !DeviceRegistration {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    const root = parsed.value;
+    if (root != .object) return error.InvalidDeviceRegistration;
+    const obj = root.object;
+    const did_val = obj.get("device_id") orelse return error.InvalidDeviceRegistration;
+    const pk_val = obj.get("public_key") orelse return error.InvalidDeviceRegistration;
+    if (did_val != .string or pk_val != .string) return error.InvalidDeviceRegistration;
+    const device_id = std.mem.trim(u8, did_val.string, " \t\r\n");
+    const public_key = std.mem.trim(u8, pk_val.string, " \t\r\n");
+    if (device_id.len == 0 or public_key.len == 0) return error.InvalidDeviceRegistration;
+    return .{
+        .device_id = try allocator.dupe(u8, device_id),
+        .public_key = try allocator.dupe(u8, public_key),
+    };
+}
+
+fn registerDeviceIdentity(path: []const u8, device_id: []const u8, public_key: []const u8) !void {
+    var file = std.fs.cwd().openFile(path, .{ .mode = .read_write }) catch try std.fs.cwd().createFile(path, .{ .truncate = false, .read = true });
+    defer file.close();
+    try file.seekFromEnd(0);
+    try file.writer().print("{s}|{s}\n", .{ device_id, public_key });
+}
+
+fn loadRegisteredDeviceKey(allocator: std.mem.Allocator, registry_path: []const u8, device_id: []const u8) ?[]const u8 {
+    const raw = std.fs.cwd().readFileAlloc(allocator, registry_path, 2 * 1024 * 1024) catch return null;
+    defer allocator.free(raw);
+    var lines = std.mem.splitScalar(u8, raw, '\n');
+    while (lines.next()) |line_raw| {
+        const line = std.mem.trim(u8, line_raw, " \t\r\n");
+        if (line.len == 0) continue;
+        const sep = std.mem.indexOfScalar(u8, line, '|') orelse continue;
+        const did = std.mem.trim(u8, line[0..sep], " \t");
+        const key = std.mem.trim(u8, line[sep + 1 ..], " \t");
+        if (std.mem.eql(u8, did, device_id)) return allocator.dupe(u8, key) catch null;
+    }
+    return null;
+}
+
+fn validateDeviceRequest(
+    cfg: *const edge_config.EdgeConfig,
+    method: []const u8,
+    path: []const u8,
+    headers: *const http.Headers,
+    body: []const u8,
+) bool {
+    if (cfg.device_registry_path.len == 0) return false;
+    const device_id = headers.get("x-device-id") orelse return false;
+    const ts_str = headers.get("x-device-timestamp") orelse return false;
+    const provided_sig = headers.get("x-device-signature") orelse return false;
+    const ts = std.fmt.parseInt(i64, ts_str, 10) catch return false;
+    const now = std.time.timestamp();
+    const delta = if (now > ts) now - ts else ts - now;
+    if (delta > 300) return false;
+
+    const allocator = std.heap.page_allocator;
+    const key = loadRegisteredDeviceKey(allocator, cfg.device_registry_path, device_id) orelse return false;
+    defer allocator.free(key);
+    const signed = std.fmt.allocPrint(allocator, "{s}\n{s}\n{s}\n{s}\n{s}", .{ key, method, path, ts_str, body }) catch return false;
+    defer allocator.free(signed);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(signed, &digest, .{});
+    var digest_hex: [64]u8 = undefined;
+    _ = std.fmt.bufPrint(&digest_hex, "{s}", .{std.fmt.fmtSliceHexLower(&digest)}) catch return false;
+    return std.ascii.eqlIgnoreCase(std.mem.trim(u8, provided_sig, " \t\r\n"), digest_hex[0..]);
+}
+
+fn extractIdentityForPolicy(
+    allocator: std.mem.Allocator,
+    cfg: *const edge_config.EdgeConfig,
+    state: *GatewayState,
+    request: *const http.Request,
+) !?[]const u8 {
+    const auth_res = authorizeRequest(cfg, &request.headers);
+    if (auth_res.ok and auth_res.token_hash != null) {
+        return allocator.dupe(u8, auth_res.token_hash.?);
+    }
+    if (http.session.fromHeaders(&request.headers)) |session_token| {
+        if (state.validateSessionIdentity(allocator, session_token)) |identity| return identity;
+    }
+    return null;
+}
+
+fn evaluatePolicy(
+    cfg: *const edge_config.EdgeConfig,
+    method: []const u8,
+    path: []const u8,
+    identity: ?[]const u8,
+    device_id: ?[]const u8,
+    headers: *const http.Headers,
+) ?[]const u8 {
+    if (cfg.policy_approval_routes_raw.len > 0 and routeNeedsApproval(method, path, cfg.policy_approval_routes_raw)) {
+        const approval = headers.get("x-approval-token") orelse return "Approval required";
+        if (std.mem.trim(u8, approval, " \t\r\n").len == 0) return "Approval required";
+    }
+    if (cfg.policy_rules_raw.len == 0) return null;
+    var rules = std.mem.splitScalar(u8, cfg.policy_rules_raw, ';');
+    while (rules.next()) |entry_raw| {
+        const entry = std.mem.trim(u8, entry_raw, " \t\r\n");
+        if (entry.len == 0) continue;
+        var parts = std.mem.splitScalar(u8, entry, '|');
+        const rule_method = std.mem.trim(u8, parts.next() orelse "", " \t");
+        const rule_pattern = std.mem.trim(u8, parts.next() orelse "", " \t");
+        const req_scope = std.mem.trim(u8, parts.next() orelse "", " \t");
+        const req_approval = std.mem.trim(u8, parts.next() orelse "false", " \t");
+        const allowed_hours = std.mem.trim(u8, parts.next() orelse "", " \t");
+        const device_pattern = std.mem.trim(u8, parts.next() orelse "", " \t");
+        if (rule_method.len == 0 or rule_pattern.len == 0) continue;
+        if (!http.rewrite.methodMatches(rule_method, method)) continue;
+        if (!http.rewrite.regexMatches(rule_pattern, path)) continue;
+
+        if (req_scope.len > 0 and !identityHasScope(cfg.policy_user_scopes_raw, identity, req_scope)) return "Missing required scope";
+        if (std.ascii.eqlIgnoreCase(req_approval, "true")) {
+            const approval = headers.get("x-approval-token") orelse return "Approval required";
+            if (std.mem.trim(u8, approval, " \t\r\n").len == 0) return "Approval required";
+        }
+        if (allowed_hours.len > 0 and !timeWindowAllows(allowed_hours)) return "Route not allowed at this time";
+        if (device_pattern.len > 0) {
+            const did = device_id orelse return "Device restriction denied";
+            if (!http.rewrite.regexMatches(device_pattern, did)) return "Device restriction denied";
+        }
+    }
+    return null;
+}
+
+fn routeNeedsApproval(method: []const u8, path: []const u8, raw: []const u8) bool {
+    var it = std.mem.splitScalar(u8, raw, ';');
+    while (it.next()) |entry_raw| {
+        const entry = std.mem.trim(u8, entry_raw, " \t\r\n");
+        if (entry.len == 0) continue;
+        var parts = std.mem.splitScalar(u8, entry, '|');
+        const rm = std.mem.trim(u8, parts.next() orelse "", " \t");
+        const rp = std.mem.trim(u8, parts.next() orelse "", " \t");
+        if (rm.len == 0 or rp.len == 0) continue;
+        if (http.rewrite.methodMatches(rm, method) and http.rewrite.regexMatches(rp, path)) return true;
+    }
+    return false;
+}
+
+fn identityHasScope(scopes_raw: []const u8, identity: ?[]const u8, required: []const u8) bool {
+    if (identity == null) return false;
+    var it = std.mem.splitScalar(u8, scopes_raw, ';');
+    while (it.next()) |entry_raw| {
+        const entry = std.mem.trim(u8, entry_raw, " \t\r\n");
+        if (entry.len == 0) continue;
+        const colon = std.mem.indexOfScalar(u8, entry, ':') orelse continue;
+        const id = std.mem.trim(u8, entry[0..colon], " \t");
+        if (!std.mem.eql(u8, id, identity.?)) continue;
+        var s_it = std.mem.splitScalar(u8, entry[colon + 1 ..], ',');
+        while (s_it.next()) |scope| {
+            if (std.mem.eql(u8, std.mem.trim(u8, scope, " \t"), required)) return true;
+        }
+    }
+    return false;
+}
+
+fn timeWindowAllows(raw: []const u8) bool {
+    const dash = std.mem.indexOfScalar(u8, raw, '-') orelse return true;
+    const start = std.fmt.parseInt(u8, std.mem.trim(u8, raw[0..dash], " \t"), 10) catch return true;
+    const stop = std.fmt.parseInt(u8, std.mem.trim(u8, raw[dash + 1 ..], " \t"), 10) catch return true;
+    const now = std.time.timestamp();
+    const hour = @as(u8, @intCast(@mod(@divFloor(now, 3600), 24)));
+    if (start <= stop) return hour >= start and hour < stop;
+    return hour >= start or hour < stop;
 }
 
 fn authorizeViaSubrequest(
@@ -5607,6 +5985,16 @@ test "firstRequestCompleteLen waits for complete body" {
     try std.testing.expectEqual(@as(usize, complete.len), firstRequestCompleteLen(complete).?);
 }
 
+test "firstRequestCompleteLen handles keep-alive pipelined requests" {
+    const reqs =
+        "GET /a HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n" ++
+        "GET /b HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    const first_len = firstRequestCompleteLen(reqs).?;
+    const first = reqs[0..first_len];
+    try std.testing.expect(std.mem.indexOf(u8, first, "GET /a") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "keep-alive") != null);
+}
+
 test "connection session pool reuses released sessions" {
     var pool = ConnectionSessionPool.init(std.testing.allocator, 4);
     defer pool.deinit();
@@ -5699,12 +6087,26 @@ test "resolveProxyTarget handles absolute and relative proxy_pass" {
         .jwt_issuer = "",
         .jwt_audience = "",
         .add_headers = &[_]edge_config.EdgeConfig.HeaderPair{},
+        .policy_rules_raw = "",
+        .policy_user_scopes_raw = "",
+        .policy_approval_routes_raw = "",
         .session_ttl_seconds = 0,
         .session_max = 0,
+        .device_registry_path = "",
+        .device_auth_required = false,
+        .access_token_ttl_seconds = 900,
+        .refresh_token_ttl_seconds = 86_400,
         .access_control_rules = "",
         .request_limits = http.request_limits.RequestLimits.default,
         .basic_auth_hashes = &[_][]const u8{},
         .log_level = .info,
+        .error_log_path = "",
+        .pid_file = "",
+        .run_user = "",
+        .run_group = "",
+        .server_names = &[_][]const u8{},
+        .doc_root = "",
+        .try_files = "",
         .access_log_format = .json,
         .access_log_template = "",
         .access_log_min_status = 0,
@@ -5867,12 +6269,26 @@ test "authorizeRequest accepts valid hash" {
         .jwt_issuer = "",
         .jwt_audience = "",
         .add_headers = &[_]edge_config.EdgeConfig.HeaderPair{},
+        .policy_rules_raw = "",
+        .policy_user_scopes_raw = "",
+        .policy_approval_routes_raw = "",
         .session_ttl_seconds = 0,
         .session_max = 0,
+        .device_registry_path = "",
+        .device_auth_required = false,
+        .access_token_ttl_seconds = 900,
+        .refresh_token_ttl_seconds = 86_400,
         .access_control_rules = "",
         .request_limits = http.request_limits.RequestLimits.default,
         .basic_auth_hashes = &[_][]const u8{},
         .log_level = .info,
+        .error_log_path = "",
+        .pid_file = "",
+        .run_user = "",
+        .run_group = "",
+        .server_names = &[_][]const u8{},
+        .doc_root = "",
+        .try_files = "",
         .access_log_format = .json,
         .access_log_template = "",
         .access_log_min_status = 0,

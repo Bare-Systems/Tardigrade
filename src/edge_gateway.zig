@@ -10,6 +10,8 @@ const JSON_CONTENT_TYPE = "application/json";
 const UpstreamHealth = struct {
     fail_count: u32 = 0,
     unhealthy_until_ms: u64 = 0,
+    probe_fail_streak: u32 = 0,
+    probe_success_streak: u32 = 0,
 };
 
 const ConnectionSlotResult = enum {
@@ -313,6 +315,7 @@ const GatewayState = struct {
 
         if (self.upstream_health.getPtr(upstream_base_url)) |health| {
             health.fail_count +|= 1;
+            health.probe_success_streak = 0;
             if (health.fail_count >= cfg.upstream_max_fails) {
                 health.fail_count = 0;
                 health.unhealthy_until_ms = http.event_loop.monotonicMs() + cfg.upstream_fail_timeout_ms;
@@ -328,6 +331,7 @@ const GatewayState = struct {
         };
         if (self.upstream_health.getPtr(owned)) |health| {
             health.fail_count = 1;
+            health.probe_success_streak = 0;
             if (health.fail_count >= cfg.upstream_max_fails) {
                 health.fail_count = 0;
                 health.unhealthy_until_ms = http.event_loop.monotonicMs() + cfg.upstream_fail_timeout_ms;
@@ -344,6 +348,42 @@ const GatewayState = struct {
         if (self.upstream_health.getPtr(upstream_base_url)) |health| {
             health.fail_count = 0;
             health.unhealthy_until_ms = 0;
+            health.probe_fail_streak = 0;
+            health.probe_success_streak = 0;
+        }
+        self.updateUpstreamHealthMetricLocked();
+    }
+
+    fn recordActiveProbeResult(self: *GatewayState, cfg: *const edge_config.EdgeConfig, upstream_base_url: []const u8, healthy: bool) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const health = if (self.upstream_health.getPtr(upstream_base_url)) |existing|
+            existing
+        else blk: {
+            const owned = self.allocator.dupe(u8, upstream_base_url) catch return;
+            self.upstream_health.put(owned, .{}) catch {
+                self.allocator.free(owned);
+                return;
+            };
+            break :blk self.upstream_health.getPtr(owned).?;
+        };
+
+        if (healthy) {
+            health.probe_fail_streak = 0;
+            health.probe_success_streak +|= 1;
+            if (health.probe_success_streak >= cfg.upstream_active_health_success_threshold) {
+                health.unhealthy_until_ms = 0;
+                health.fail_count = 0;
+                health.probe_success_streak = 0;
+            }
+        } else {
+            health.probe_success_streak = 0;
+            health.probe_fail_streak +|= 1;
+            if (health.probe_fail_streak >= cfg.upstream_active_health_fail_threshold) {
+                health.probe_fail_streak = 0;
+                health.unhealthy_until_ms = http.event_loop.monotonicMs() + cfg.upstream_fail_timeout_ms;
+            }
         }
         self.updateUpstreamHealthMetricLocked();
     }
@@ -603,7 +643,13 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         state.logger.info(null, "Passive upstream health enabled: max_fails={d} fail_timeout={d}ms", .{ cfg.upstream_max_fails, cfg.upstream_fail_timeout_ms });
     }
     if (cfg.upstream_active_health_interval_ms > 0) {
-        state.logger.info(null, "Active upstream health checks enabled: interval={d}ms path={s} timeout={d}ms", .{ cfg.upstream_active_health_interval_ms, cfg.upstream_active_health_path, cfg.upstream_active_health_timeout_ms });
+        state.logger.info(null, "Active upstream health checks enabled: interval={d}ms path={s} timeout={d}ms fail_threshold={d} success_threshold={d}", .{
+            cfg.upstream_active_health_interval_ms,
+            cfg.upstream_active_health_path,
+            cfg.upstream_active_health_timeout_ms,
+            cfg.upstream_active_health_fail_threshold,
+            cfg.upstream_active_health_success_threshold,
+        });
     }
     if (cfg.max_connections_per_ip > 0) {
         state.logger.info(null, "Per-IP connection limit enabled: {d}", .{cfg.max_connections_per_ip});
@@ -717,7 +763,6 @@ fn rejectOverloadedClient(client_fd: std.posix.fd_t) void {
 
 fn runActiveHealthChecks(cfg: *const edge_config.EdgeConfig, state: *GatewayState) void {
     if (cfg.upstream_active_health_interval_ms == 0) return;
-    if (cfg.upstream_max_fails == 0) return;
 
     const now_ms = http.event_loop.monotonicMs();
     if (state.next_active_health_probe_ms != 0 and now_ms < state.next_active_health_probe_ms) return;
@@ -738,14 +783,14 @@ fn runActiveHealthChecks(cfg: *const edge_config.EdgeConfig, state: *GatewayStat
 fn probeSingleUpstream(cfg: *const edge_config.EdgeConfig, state: *GatewayState, probe_client: *std.http.Client, base_url: []const u8) void {
     const probe_url = buildHealthProbeUrl(state.allocator, base_url, cfg.upstream_active_health_path) catch |err| {
         state.logger.warn(null, "active health probe url build failed for {s}: {}", .{ base_url, err });
-        state.recordUpstreamFailure(cfg, base_url);
+        state.recordActiveProbeResult(cfg, base_url, false);
         return;
     };
     defer state.allocator.free(probe_url);
 
     const uri = std.Uri.parse(probe_url) catch |err| {
         state.logger.warn(null, "active health probe uri parse failed for {s}: {}", .{ probe_url, err });
-        state.recordUpstreamFailure(cfg, base_url);
+        state.recordActiveProbeResult(cfg, base_url, false);
         return;
     };
 
@@ -755,7 +800,7 @@ fn probeSingleUpstream(cfg: *const edge_config.EdgeConfig, state: *GatewayState,
         .keep_alive = false,
     }) catch |err| {
         state.logger.warn(null, "active health probe open failed for {s}: {}", .{ base_url, err });
-        state.recordUpstreamFailure(cfg, base_url);
+        state.recordActiveProbeResult(cfg, base_url, false);
         return;
     };
     defer req.deinit();
@@ -768,25 +813,25 @@ fn probeSingleUpstream(cfg: *const edge_config.EdgeConfig, state: *GatewayState,
 
     req.send() catch |err| {
         state.logger.warn(null, "active health probe send failed for {s}: {}", .{ base_url, err });
-        state.recordUpstreamFailure(cfg, base_url);
+        state.recordActiveProbeResult(cfg, base_url, false);
         return;
     };
     req.finish() catch |err| {
         state.logger.warn(null, "active health probe finish failed for {s}: {}", .{ base_url, err });
-        state.recordUpstreamFailure(cfg, base_url);
+        state.recordActiveProbeResult(cfg, base_url, false);
         return;
     };
     req.wait() catch |err| {
         state.logger.warn(null, "active health probe wait failed for {s}: {}", .{ base_url, err });
-        state.recordUpstreamFailure(cfg, base_url);
+        state.recordActiveProbeResult(cfg, base_url, false);
         return;
     };
 
     const status_code: u16 = @intFromEnum(req.response.status);
     if (status_code >= 200 and status_code < 400) {
-        state.recordUpstreamSuccess(cfg, base_url);
+        state.recordActiveProbeResult(cfg, base_url, true);
     } else {
-        state.recordUpstreamFailure(cfg, base_url);
+        state.recordActiveProbeResult(cfg, base_url, false);
     }
 }
 
@@ -2318,6 +2363,8 @@ test "resolveProxyTarget handles absolute and relative proxy_pass" {
         .upstream_active_health_interval_ms = 0,
         .upstream_active_health_path = "/health",
         .upstream_active_health_timeout_ms = 2000,
+        .upstream_active_health_fail_threshold = 1,
+        .upstream_active_health_success_threshold = 1,
     };
 
     const abs = try resolveProxyTarget(allocator, cfg.upstream_base_url, "https://api.example.com/base", "/v1/chat");
@@ -2388,6 +2435,8 @@ test "authorizeRequest accepts valid hash" {
         .upstream_active_health_interval_ms = 0,
         .upstream_active_health_path = "/health",
         .upstream_active_health_timeout_ms = 2000,
+        .upstream_active_health_fail_threshold = 1,
+        .upstream_active_health_success_threshold = 1,
     };
 
     var headers = http.Headers.init(allocator);

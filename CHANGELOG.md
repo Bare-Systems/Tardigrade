@@ -60,6 +60,9 @@
   - Added periodic active probe controls: `TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_INTERVAL_MS`, `TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_PATH`, and `TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_TIMEOUT_MS`.
   - Event-loop timer ticks now run active health probes across configured upstreams.
   - Active probe outcomes now feed existing passive-health failover tracking.
+- Phase 4.4 configurable health thresholds (`src/edge_config.zig`, `src/edge_gateway.zig`):
+  - Added `TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_FAIL_THRESHOLD` and `TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_SUCCESS_THRESHOLD`.
+  - Active probe failures/successes now use configurable consecutive-threshold transitions for unhealthy/healthy state changes.
 
 ## [0.26.0] - 2026-03-xx
 

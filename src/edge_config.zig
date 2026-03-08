@@ -81,6 +81,10 @@ pub const EdgeConfig = struct {
     upstream_active_health_path: []const u8,
     /// Active health-check per-probe timeout in ms.
     upstream_active_health_timeout_ms: u32,
+    /// Consecutive active probe failures required before marking backend unhealthy.
+    upstream_active_health_fail_threshold: u32,
+    /// Consecutive active probe successes required before clearing unhealthy state.
+    upstream_active_health_success_threshold: u32,
 
     pub fn deinit(self: *EdgeConfig, allocator: std.mem.Allocator) void {
         allocator.free(self.listen_host);
@@ -293,6 +297,14 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     defer allocator.free(active_health_timeout_str);
     const upstream_active_health_timeout_ms = std.fmt.parseInt(u32, active_health_timeout_str, 10) catch 2000;
 
+    const active_health_fail_threshold_str = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_FAIL_THRESHOLD", "1") catch unreachable;
+    defer allocator.free(active_health_fail_threshold_str);
+    const upstream_active_health_fail_threshold = @max(std.fmt.parseInt(u32, active_health_fail_threshold_str, 10) catch 1, 1);
+
+    const active_health_success_threshold_str = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_SUCCESS_THRESHOLD", "1") catch unreachable;
+    defer allocator.free(active_health_success_threshold_str);
+    const upstream_active_health_success_threshold = @max(std.fmt.parseInt(u32, active_health_success_threshold_str, 10) catch 1, 1);
+
     return .{
         .listen_host = listen_host,
         .listen_port = listen_port,
@@ -344,6 +356,8 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .upstream_active_health_interval_ms = upstream_active_health_interval_ms,
         .upstream_active_health_path = upstream_active_health_path,
         .upstream_active_health_timeout_ms = upstream_active_health_timeout_ms,
+        .upstream_active_health_fail_threshold = upstream_active_health_fail_threshold,
+        .upstream_active_health_success_threshold = upstream_active_health_success_threshold,
     };
 }
 

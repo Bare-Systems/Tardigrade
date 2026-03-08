@@ -72,6 +72,8 @@ Environment variables:
 - `TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_INTERVAL_MS` (default `0`; periodic active probe interval; `0` disables active probes)
 - `TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_PATH` (default `/health`; path used for active health probes)
 - `TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_TIMEOUT_MS` (default `2000`; per-probe timeout)
+- `TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_FAIL_THRESHOLD` (default `1`; consecutive active probe failures required before marking unhealthy)
+- `TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_SUCCESS_THRESHOLD` (default `1`; consecutive active probe successes required before clearing unhealthy state)
 
 ### Build for Production
 

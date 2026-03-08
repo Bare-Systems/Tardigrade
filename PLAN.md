@@ -280,11 +280,12 @@ Resolved (incremental): proxy upstream base URL selection now uses round-robin r
 ### 4.4 Health Checks
 - [x] Passive health checks (mark failed on errors)
 - [x] Active health checks (periodic probes)
-- [ ] Configurable thresholds
+- [x] Configurable thresholds
 - [ ] Slow start for recovered servers
 
 Resolved (incremental): proxy path now tracks upstream failures and marks backends temporarily unhealthy after configured failure thresholds; round-robin selection skips unhealthy upstreams until fail-timeout expires.
 Resolved (incremental): timer-driven active upstream health probes now run at configurable intervals (`TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_INTERVAL_MS`) against a configurable path (`TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_PATH`) with probe timeout control.
+Resolved (incremental): active health transitions now support configurable fail/success thresholds (`TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_FAIL_THRESHOLD`, `TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_SUCCESS_THRESHOLD`) before marking unhealthy and before clearing unhealthy state.
 
 ### 4.5 Proxy Protocol Support
 - [ ] Protocol v1 and v2

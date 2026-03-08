@@ -45,6 +45,10 @@ chmod +x tardigrade
 Tardigrade now supports an edge-gateway path for BearClaw:
 - `GET /health`
 - `POST /v1/chat` (Bearer auth required)
+- `POST /v1/commands` (structured command envelope; supports async `202` mode with `command_id`)
+- `GET /v1/commands/status?command_id=...` (command lifecycle polling)
+- `GET /v1/ws/chat` and `GET /v1/ws/commands` (WebSocket upgrade, authenticated)
+- `GET /v1/events/stream` and `POST /v1/events/publish` (SSE topic stream/publish, authenticated)
 
 Environment variables:
 - `TARDIGRADE_LISTEN_HOST` (default `0.0.0.0`)
@@ -75,6 +79,15 @@ Environment variables:
 - `TARDIGRADE_HTTP3_ENABLE_0RTT` (default `false`; allow 0-RTT packet class handling in QUIC foundation logic)
 - `TARDIGRADE_HTTP3_CONNECTION_MIGRATION` (default `false`; allow connection migration updates for QUIC connection IDs)
 - `TARDIGRADE_HTTP3_MAX_DATAGRAM_SIZE` (default `1350`; target maximum QUIC datagram size for parser/runtime tuning)
+- `TARDIGRADE_WEBSOCKET_ENABLED` (default `true`; enable authenticated WebSocket routes)
+- `TARDIGRADE_WEBSOCKET_IDLE_TIMEOUT_MS` (default `60000`; idle timeout for active WebSocket connections)
+- `TARDIGRADE_WEBSOCKET_MAX_FRAME_SIZE` (default `1048576`; maximum accepted WebSocket frame payload bytes)
+- `TARDIGRADE_WEBSOCKET_PING_INTERVAL_MS` (default `15000`; ping interval for WebSocket keepalive)
+- `TARDIGRADE_SSE_ENABLED` (default `true`; enable authenticated SSE publish/stream routes)
+- `TARDIGRADE_SSE_MAX_EVENTS_PER_TOPIC` (default `1024`; in-memory retained events per topic)
+- `TARDIGRADE_SSE_POLL_INTERVAL_MS` (default `250`; SSE stream poll cadence)
+- `TARDIGRADE_SSE_MAX_BACKLOG` (default `1024`; max replay backlog gap before reconnect is required)
+- `TARDIGRADE_SSE_IDLE_TIMEOUT_MS` (default `60000`; idle timeout for SSE stream connections)
 - `TARDIGRADE_PROXY_PROTOCOL` (default `off`; supported: `off`, `auto`, `v1`, `v2`; applies to plaintext listeners for extracting client IP from PROXY headers)
 - `TARDIGRADE_TRUST_GATEWAY_ID` (default `tardigrade-edge`; gateway identity sent in trusted upstream headers)
 - `TARDIGRADE_TRUST_SHARED_SECRET` (default empty; shared secret enabling signed upstream trust headers)
@@ -118,6 +131,76 @@ Environment variables:
 - `TARDIGRADE_MAX_CONNECTION_MEMORY_BYTES` (default `2097152`; max memory retained per active connection for request/proxy buffering)
 - `TARDIGRADE_MAX_TOTAL_CONNECTION_MEMORY_BYTES` (default `0`; global estimated memory cap across active connections; `0` disables)
 - `TARDIGRADE_FD_SOFT_LIMIT` (default `0`; desired process soft file-descriptor limit; best-effort on supported Unix platforms)
+- `TARDIGRADE_COMPRESSION_BROTLI_ENABLED` (default `true`; enables Brotli response compression negotiation when runtime encoder library is available)
+- `TARDIGRADE_COMPRESSION_BROTLI_QUALITY` (default `5`; Brotli quality level in range `0..11`)
+- `TARDIGRADE_UPSTREAM_GUNZIP_ENABLED` (default `true`; proxy requests advertise `Accept-Encoding: gzip` and gateway gunzips upstream responses before downstream negotiation)
+- `TARDIGRADE_REWRITE_RULES` (default empty; semicolon-separated rewrite directives: `METHOD|REGEX|REPLACEMENT|FLAG`, where `METHOD` may be `*` and `FLAG` is `last|break|redirect|permanent`)
+- `TARDIGRADE_RETURN_RULES` (default empty; semicolon-separated return directives: `METHOD|REGEX|STATUS|BODY`, where `METHOD` may be `*`)
+- `TARDIGRADE_INTERNAL_REDIRECT_RULES` (default empty; semicolon-separated `METHOD|REGEX|TARGET` internal redirect directives, where target may be a named location like `@name`)
+- `TARDIGRADE_NAMED_LOCATIONS` (default empty; semicolon-separated named-location map entries: `name|/path`)
+- `TARDIGRADE_MIRROR_RULES` (default empty; semicolon-separated mirror dispatch rules: `METHOD|REGEX|TARGET_URL`)
+- `TARDIGRADE_FASTCGI_UPSTREAM` (default empty; FastCGI bridge endpoint `host:port`)
+- `TARDIGRADE_UWSGI_UPSTREAM` (default empty; uWSGI bridge endpoint `host:port`)
+- `TARDIGRADE_SCGI_UPSTREAM` (default empty; SCGI bridge endpoint `host:port`)
+- `TARDIGRADE_GRPC_UPSTREAM` (default empty; gRPC bridge URL, e.g. `http://127.0.0.1:9000/service.Method`)
+- `TARDIGRADE_MEMCACHED_UPSTREAM` (default empty; Memcached endpoint `host:port`)
+- `TARDIGRADE_SMTP_UPSTREAM` (default empty; SMTP proxy endpoint `host:port`)
+- `TARDIGRADE_IMAP_UPSTREAM` (default empty; IMAP proxy endpoint `host:port`)
+- `TARDIGRADE_POP3_UPSTREAM` (default empty; POP3 proxy endpoint `host:port`)
+- `TARDIGRADE_TCP_PROXY_UPSTREAM` (default empty; stream TCP proxy endpoint `host:port`)
+- `TARDIGRADE_UDP_PROXY_UPSTREAM` (default empty; stream UDP proxy endpoint `host:port`)
+- `TARDIGRADE_STREAM_SSL_TERMINATION` (default `false`; enables stream SSL-termination mode indicator for stream routes)
+- `TARDIGRADE_ACCESS_LOG_FORMAT` (default `json`; `json|plain|custom`)
+- `TARDIGRADE_ACCESS_LOG_TEMPLATE` (default empty; custom access log template with placeholders like `{method}`, `{path}`, `{status}`)
+- `TARDIGRADE_ACCESS_LOG_MIN_STATUS` (default `0`; only emit access logs for status >= value, `0` logs all)
+- `TARDIGRADE_ACCESS_LOG_BUFFER_SIZE` (default `0`; access log buffer size in bytes before flush, `0` disables buffering)
+- `TARDIGRADE_ACCESS_LOG_SYSLOG_UDP` (default empty; optional syslog UDP endpoint `host:port`)
+- `TARDIGRADE_CONFIG_PATH` (default empty; optional nginx-style config file path loaded before env override resolution)
+- `TARDIGRADE_ERROR_LOG_PATH` (default empty; when set and not `stderr`, redirects stderr logging to this file)
+- `TARDIGRADE_PID_FILE` (default empty; writes/removes process pid file on startup/shutdown)
+- `TARDIGRADE_RUN_USER` / `TARDIGRADE_RUN_GROUP` (default empty; numeric uid/gid for post-bind privilege drop)
+- `TARDIGRADE_REQUIRE_UNPRIVILEGED_USER` (default `false`; when true, startup fails if process remains uid 0 after privilege/drop flow)
+- `TARDIGRADE_CHROOT_DIR` (default empty; optional chroot jail applied after listener bind and before uid/gid drop)
+- `TARDIGRADE_SERVER_NAMES` (default empty; comma/space-separated host patterns; supports exact, `*.suffix`, and `~regex`)
+- `TARDIGRADE_DOC_ROOT` (default empty; static fallback root used by try_files)
+- `TARDIGRADE_TRY_FILES` (default empty; comma-separated fallback candidates, supports `$uri`)
+- `TARDIGRADE_SECRETS_PATH` (default empty; optional secret override file with `KEY=VALUE` or `KEY=ENC:<base64>` entries)
+- `TARDIGRADE_SECRET_KEYS` (default empty; comma-separated hex keys used to decrypt `ENC:` values, supports key rotation order)
+- `TARDIGRADE_DEVICE_REGISTRY_PATH` (default empty; path to device key registry file)
+- `TARDIGRADE_DEVICE_AUTH_REQUIRED` (default `false`; enforce device proof headers for protected routes)
+- `TARDIGRADE_ACCESS_TOKEN_TTL_SECONDS` (default `900`; informational ttl value returned by session refresh endpoint)
+- `TARDIGRADE_REFRESH_TOKEN_TTL_SECONDS` (default `86400`; informational refresh ttl value returned by session refresh endpoint)
+- `TARDIGRADE_POLICY_RULES` (default empty; semicolon-separated `METHOD|REGEX|required_scope|require_approval|hours|device_regex`)
+- `TARDIGRADE_POLICY_USER_SCOPES` (default empty; semicolon-separated identity scopes: `identity:scope1,scope2;...`)
+- `TARDIGRADE_POLICY_APPROVAL_ROUTES` (default empty; semicolon-separated approval routes `METHOD|REGEX`)
+- `TARDIGRADE_MASTER_PROCESS` (default `false`; enable master process supervising multiple worker processes)
+- `TARDIGRADE_WORKER_PROCESSES` (default `1`; worker process count when master mode is enabled, `0` = CPU count)
+- `TARDIGRADE_BINARY_UPGRADE` (default `true`; enables SIGUSR2-triggered replacement master spawn in master mode)
+- `TARDIGRADE_WORKER_RECYCLE_SECONDS` (default `0`; worker self-shutdown interval for recycling, `0` disables)
+- `TARDIGRADE_WORKER_CPU_AFFINITY` (default empty; Linux-only cpu list for worker pinning, e.g. `0,2,4`)
+
+Config file syntax (Phase 3.1 foundation):
+- Statements end with `;`
+- Basic directive: `listen_port 8069;` (maps to `TARDIGRADE_LISTEN_PORT`)
+- Explicit env-style directive: `TARDIGRADE_LOG_LEVEL debug;`
+- Variables: `set $base /etc/tardigrade;` and use `${base}` interpolation
+- Include: `include conf.d/*.conf;`
+- Environment variables still override config-file values.
+- Core directive aliases: `worker_processes`, `worker_connections`, `error_log`, `pid`, `user`
+- HTTP-style aliases: `listen`, `server_name`, `root`, `try_files`
+- Secret aliases: `secrets_file`, `secret_key`
+
+Device/Policy endpoints:
+- `POST /v1/devices/register` (authenticated; body `{ "device_id": "...", "public_key": "..." }`)
+- `POST /v1/sessions/refresh` (requires `X-Session-Token`; rotates session token and returns ttl metadata)
+- Device proof headers (when enabled): `X-Device-ID`, `X-Device-Timestamp`, `X-Device-Signature`
+- Async command payload extension: `{ \"command_id\": \"optional\", \"async\": true }`
+
+Hot reload (Phase 3.4 foundation):
+- Send `SIGHUP` to trigger zero-downtime config reload.
+- Reload validates and parses full config before apply.
+- On validation failure, running config remains unchanged.
+- Send `SIGUSR2` in master mode to trigger binary-upgrade handoff spawn.
 - `TARDIGRADE_PROXY_STREAM_ALL_STATUSES` (default `false`; when enabled, streams non-200 upstream responses directly instead of mapping to gateway error envelopes)
 - `TARDIGRADE_UPSTREAM_RETRY_ATTEMPTS` (default `1`; number of upstream attempts per proxy request; when multiple upstream base URLs are configured, attempts rotate across them)
 - `TARDIGRADE_UPSTREAM_TIMEOUT_BUDGET_MS` (default `0`; total timeout budget across all upstream attempts; `0` disables budget enforcement)

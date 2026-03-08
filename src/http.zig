@@ -44,6 +44,15 @@ pub const hpack = @import("http/hpack.zig");
 pub const http2_frame = @import("http/http2_frame.zig");
 pub const qpack = @import("http/qpack.zig");
 pub const quic = @import("http/quic.zig");
+pub const websocket = @import("http/websocket.zig");
+pub const event_hub = @import("http/event_hub.zig");
+pub const rewrite = @import("http/rewrite.zig");
+pub const fastcgi = @import("http/fastcgi.zig");
+pub const uwsgi = @import("http/uwsgi.zig");
+pub const scgi = @import("http/scgi.zig");
+pub const memcached = @import("http/memcached.zig");
+pub const config_file = @import("http/config_file.zig");
+pub const secrets = @import("http/secrets.zig");
 
 // Re-export constants
 pub const MAX_HEADERS = headers.MAX_HEADERS;

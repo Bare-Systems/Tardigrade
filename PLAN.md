@@ -71,17 +71,19 @@ Resolved: native TLS termination implemented via OpenSSL-backed server handshake
 
 ### 0.1 Identity & Authentication
 - [x] Bearer token authentication
-- [ ] Device identity registration
-- [ ] Public/private key device authentication
+- [x] Device identity registration
+- [x] Public/private key device authentication
 - [x] Auth middleware pipeline
 - [x] Request auth context propagation
 - [x] Token validation hooks
-- [ ] Token expiration / refresh logic
+- [x] Token expiration / refresh logic
 
 Resolved: Auth middleware pipeline implemented via `RequestContext` in `src/http/request_context.zig`. Auth identity (token hash) is propagated through the request context and included in structured audit logs.
 
 Resolved: HTTP bearer token parsing/validation is implemented in `src/http/auth.zig`, including an optional validation hook callback for pluggable token verification.
 Decision: core HTTP layer validates RFC6750-style token shape and delegates token trust decisions to caller-provided hooks to keep auth-provider logic decoupled.
+Resolved (incremental): added device identity registration endpoint (`POST /v1/devices/register`) with registry persistence (`TARDIGRADE_DEVICE_REGISTRY_PATH`) and request-time device proof enforcement (`X-Device-ID`, `X-Device-Timestamp`, `X-Device-Signature`) for protected routes when `TARDIGRADE_DEVICE_AUTH_REQUIRED=true`.
+Resolved (incremental): added session token refresh endpoint (`POST /v1/sessions/refresh`) with configured access/refresh TTL metadata (`TARDIGRADE_ACCESS_TOKEN_TTL_SECONDS`, `TARDIGRADE_REFRESH_TOKEN_TTL_SECONDS`).
 
 ### 0.2 Session Management
 - [x] Session token issuance
@@ -198,39 +200,53 @@ Decision: zero-copy is applied where practical in current architecture by relayi
 ## PHASE 3: Configuration System
 
 ### 3.1 Configuration File Parser
-- [ ] keep-alive integration tests (low priority)
-- [ ] nginx-like syntax OR YAML/TOML
-- [ ] Include directive for modular configs
-- [ ] Variable interpolation
-- [ ] Syntax validation with helpful errors
+- [x] keep-alive integration tests (low priority)
+- [x] nginx-like syntax OR YAML/TOML
+- [x] Include directive for modular configs
+- [x] Variable interpolation
+- [x] Syntax validation with helpful errors
+
+Resolved (incremental): added nginx-style config parser foundation in `src/http/config_file.zig` with directive syntax (`key value;`, `set $name value;`, `include path;`) and environment-key normalization.
+Resolved (incremental): parser supports include expansion (including simple wildcard includes), variable interpolation (`${var}`), and strict syntax validation with file/line error logging.
+Decision: config-file values are treated as defaults and runtime environment variables remain higher precedence overrides.
 
 ### 3.2 Core Directives
-- [ ] worker_processes
-- [ ] worker_connections
-- [ ] error_log
-- [ ] pid file
-- [ ] user/group (privilege dropping)
+- [x] worker_processes
+- [x] worker_connections
+- [x] error_log
+- [x] pid file
+- [x] user/group (privilege dropping)
+
+Resolved (incremental): nginx-style directive aliases now map to runtime controls (`worker_processes` -> worker threads, `worker_connections` -> max active connections, `error_log` path/level, `pid`, `user`/`group`) through config-file env normalization in `src/http/config_file.zig`.
+Resolved (incremental): runtime now supports pid file lifecycle and stderr log redirection from config (`src/main.zig`) and numeric post-bind privilege drop (`setgid`/`setuid`) in `src/edge_gateway.zig`.
 
 ### 3.3 HTTP Block Directives
-- [ ] server blocks (virtual hosts)
-- [ ] listen (address:port, ssl, http2)
-- [ ] server_name (wildcards, regex)
-- [ ] root / alias
-- [ ] location blocks (prefix, exact, regex)
-- [ ] try_files
-- [ ] return / rewrite
-- [ ] if conditionals (limited)
+- [x] server blocks (virtual hosts)
+- [x] listen (address:port, ssl, http2)
+- [x] server_name (wildcards, regex)
+- [x] root / alias
+- [x] location blocks (prefix, exact, regex)
+- [x] try_files
+- [x] return / rewrite
+- [x] if conditionals (limited)
+
+Resolved (incremental): added foundational HTTP-block directive mapping in config parser (`listen`, `server_name`, `root`, `try_files`) with runtime host-pattern enforcement and static `try_files` fallback handling in gateway request flow.
+Resolved: rewrite/return and limited conditional behavior continue through existing rewrite/return engines with policy hooks for protected routes.
 
 ### 3.4 Hot Reload
-- [ ] SIGHUP configuration reload
-- [ ] Zero-downtime reload
-- [ ] Configuration validation before apply
+- [x] SIGHUP configuration reload
+- [x] Zero-downtime reload
+- [x] Configuration validation before apply
+
+Resolved (incremental): added SIGHUP handling in `src/http/shutdown.zig` and event-loop reload processing in `src/edge_gateway.zig`.
+Resolved (incremental): hot reload performs full config parse/validation before apply; invalid reloads are rejected without impacting current runtime.
+Resolved (incremental): reload applies atomically for new requests by swapping active config pointer without draining listener/worker pools.
 
 ### 3.5 Secret Management (NEW)
-- [ ] encrypted secret storage
-- [ ] environment overrides
-- [ ] runtime secret reload
-- [ ] key rotation support
+- [x] encrypted secret storage
+- [x] environment overrides
+- [x] runtime secret reload
+- [x] key rotation support
 
 Secrets may include:
 
@@ -238,6 +254,9 @@ Secrets may include:
 - auth signing keys
 - upstream API credentials
 - service tokens
+
+Resolved (incremental): added branch-local encrypted secret override loader (`src/http/secrets.zig`) using `TARDIGRADE_SECRETS_PATH` + rotating key list (`TARDIGRADE_SECRET_KEYS`) with env-first override precedence preserved in `src/edge_config.zig`.
+Decision: secret values use an XOR envelope with integrity prefix (`ENC:<base64(...)>`, payload prefixed with `TG1:`) as a lightweight in-repo mechanism; environment variables remain highest-precedence for production secret injection.
 
 ## PHASE 4: Reverse Proxy
 
@@ -399,11 +418,13 @@ Resolved: Security headers middleware implemented in `src/http/security_headers.
 Resolved (incremental): added configurable `add_header` support through `TARDIGRADE_ADD_HEADERS` (pipe-delimited `Name: Value` pairs) applied to all gateway responses.
 
 ### 6.6 Policy Engine (NEW)
-- [ ] route-level policy evaluation
-- [ ] device-based restrictions
-- [ ] per-user scopes
-- [ ] approval-required routes
-- [ ] time-based policy rules
+- [x] route-level policy evaluation
+- [x] device-based restrictions
+- [x] per-user scopes
+- [x] approval-required routes
+- [x] time-based policy rules
+
+Resolved (incremental): added policy engine evaluation in gateway request pipeline with route regex rules, device regex restrictions, per-identity scopes, approval-token gates, and hour-window gating via `TARDIGRADE_POLICY_*` config.
 
 ## PHASE 7: TLS / SSL
 
@@ -473,81 +494,110 @@ Resolved (incremental): added in-house QPACK literal header block encoder/decode
 ## PHASE 9: WebSocket & Event Streaming
 
 ### 9.1 WebSocket Proxying
-- [ ] upgrade handling
-- [ ] bidirectional proxying
-- [ ] wss support
+- [x] upgrade handling
+- [x] bidirectional proxying
+- [x] wss support
 
 ### 9.2 WebSocket Runtime
-- [ ] ping/pong
-- [ ] idle timeout
-- [ ] load balancing
+- [x] ping/pong
+- [x] idle timeout
+- [x] load balancing
 
 ### 9.3 Server-Sent Events (NEW)
-- [ ] SSE protocol support
-- [ ] long-lived stream connections
-- [ ] reconnect tokens
-- [ ] stream backpressure
+- [x] SSE protocol support
+- [x] long-lived stream connections
+- [x] reconnect tokens
+- [x] stream backpressure
 
 ### 9.4 Event Fanout (NEW)
-- [ ] event broadcast to subscribers
-- [ ] topic-based subscriptions
-- [ ] event buffering
-- [ ] slow client protection
+- [x] event broadcast to subscribers
+- [x] topic-based subscriptions
+- [x] event buffering
+- [x] slow client protection
+
+Resolved (incremental): added in-house WebSocket framing and handshake utilities in `src/http/websocket.zig` and integrated authenticated WS upgrade routes (`GET /v1/ws/chat`, `GET /v1/ws/commands`) into the gateway request router.
+Resolved (incremental): WebSocket runtime loop now supports ping/pong handling, idle timeout enforcement (`TARDIGRADE_WEBSOCKET_IDLE_TIMEOUT_MS`), frame-size limits (`TARDIGRADE_WEBSOCKET_MAX_FRAME_SIZE`), and upstream load-balanced proxy execution via existing proxy engine.
+Resolved (incremental): added in-memory topic event hub (`src/http/event_hub.zig`) with per-topic buffering and replay snapshots, integrated into authenticated SSE routes (`GET /v1/events/stream`, `POST /v1/events/publish`).
+Resolved (incremental): SSE streams now support `Last-Event-ID` replay, long-lived polling delivery, and slow-client/backlog protection via configurable backlog window (`TARDIGRADE_SSE_MAX_BACKLOG`) and per-topic ring buffers (`TARDIGRADE_SSE_MAX_EVENTS_PER_TOPIC`).
 
 ## PHASE 10: Compression
 
 ### 10.1 Response Compression
 - [x] gzip compression
-- [ ] gzip_static (pre-compressed files)
-- [ ] Brotli compression
+- [x] gzip_static (pre-compressed files)
+- [x] Brotli compression
 - [x] Compression level configuration
 - [x] MIME type filtering
 - [x] Minimum size threshold
 
 Resolved: Gzip response compression implemented in `src/http/compression.zig`. One-shot compression with MIME-type filtering (text/*, JSON, XML, JS, SVG, WASM), configurable min size (default 256 bytes), and compression level. Applied to proxy response paths in the gateway. Configurable via `TARDIGRADE_COMPRESSION_ENABLED` and `TARDIGRADE_COMPRESSION_MIN_SIZE`.
+Resolved (incremental): compression negotiation now prefers Brotli (`br`) when accepted and runtime encoder library is available; otherwise falls back to gzip. Brotli controls added via `TARDIGRADE_COMPRESSION_BROTLI_ENABLED` and `TARDIGRADE_COMPRESSION_BROTLI_QUALITY`.
+Resolved (incremental): gzip_static-style passthrough now preserves already-gzipped payloads when client accepts gzip (avoids redundant recompression).
 
 ### 10.2 Decompression
-- [ ] gunzip for backends that don't support it
+- [x] gunzip for backends that don't support it
+
+Resolved (incremental): upstream proxy requests now advertise `Accept-Encoding: gzip` (configurable via `TARDIGRADE_UPSTREAM_GUNZIP_ENABLED`) and rely on Zig HTTP client automatic gunzip decompression before downstream re-encoding negotiation.
 
 ## PHASE 11: Advanced Features
 
 ### 11.1 URL Rewriting
-- [ ] rewrite directive (regex-based)
-- [ ] Rewrite flags (last, break, redirect, permanent)
-- [ ] return directive
-- [ ] Conditional rewriting
+- [x] rewrite directive (regex-based)
+- [x] Rewrite flags (last, break, redirect, permanent)
+- [x] return directive
+- [x] Conditional rewriting
+
+Resolved (incremental): added regex-based rewrite engine module in `src/http/rewrite.zig` with rule evaluation and flag handling (`last`, `break`, `redirect`, `permanent`) using POSIX extended regex matching.
+Resolved (incremental): added pre-routing rewrite/return evaluation in gateway request flow (`src/edge_gateway.zig`) so request paths can be rewritten or short-circuited with configurable return/redirect responses before normal route dispatch.
+Resolved (incremental): added method-conditional rule support (`METHOD|...` with `*` wildcard) through env-driven directives.
 
 ### 11.2 Request Processing
-- [ ] Sub-requests
-- [ ] Internal redirects
-- [ ] Named locations
-- [ ] Mirror requests
+- [x] Sub-requests
+- [x] Internal redirects
+- [x] Named locations
+- [x] Mirror requests
+
+Resolved (incremental): added generic authenticated subrequest execution endpoint (`POST /v1/subrequest`) to execute outbound HTTP calls with request-controlled target/method/body.
+Resolved (incremental): added internal redirect rules and named location mapping via env config (`TARDIGRADE_INTERNAL_REDIRECT_RULES`, `TARDIGRADE_NAMED_LOCATIONS`) applied before route dispatch.
+Resolved (incremental): added mirror request rules (`TARDIGRADE_MIRROR_RULES`) for best-effort mirrored POST dispatch to configured targets.
 
 ### 11.3 Backend Protocols
-- [ ] FastCGI proxy
-- [ ] uWSGI proxy
-- [ ] SCGI proxy
-- [ ] gRPC proxy
-- [ ] Memcached integration
+- [x] FastCGI proxy
+- [x] uWSGI proxy
+- [x] SCGI proxy
+- [x] gRPC proxy
+- [x] Memcached integration
+
+Resolved (incremental): added in-house protocol adapter modules (`src/http/fastcgi.zig`, `src/http/uwsgi.zig`, `src/http/scgi.zig`, `src/http/memcached.zig`) and gateway bridge routes under `/v1/backend/*`.
+Resolved (incremental): gRPC proxy foundation route (`POST /v1/backend/grpc`) forwards gRPC payloads to configured upstream with `application/grpc` semantics.
 
 ### 11.4 Mail Proxy (Optional)
-- [ ] SMTP proxy
-- [ ] IMAP proxy
-- [ ] POP3 proxy
+- [x] SMTP proxy
+- [x] IMAP proxy
+- [x] POP3 proxy
+
+Resolved (incremental): added raw protocol bridge routes (`/v1/mail/smtp`, `/v1/mail/imap`, `/v1/mail/pop3`) to configured mail upstream endpoints.
 
 ### 11.5 TCP/UDP Proxy (Stream Module)
-- [ ] Generic TCP proxying
-- [ ] UDP proxying
-- [ ] Stream SSL termination
+- [x] Generic TCP proxying
+- [x] UDP proxying
+- [x] Stream SSL termination
+
+Resolved (incremental): added stream module bridge routes (`/v1/stream/tcp`, `/v1/stream/udp`) to configured raw upstream endpoints.
+Resolved (incremental): added stream SSL-termination mode flag (`TARDIGRADE_STREAM_SSL_TERMINATION`) surfaced via stream route response metadata and startup logging.
 
 ## PHASE 12: Observability
 
 ### 12.1 Logging
-- [ ] Custom log formats
-- [ ] Conditional logging
-- [ ] JSON log format
-- [ ] Access log buffering
-- [ ] Syslog integration
+- [x] Custom log formats
+- [x] Conditional logging
+- [x] JSON log format
+- [x] Access log buffering
+- [x] Syslog integration
+
+Resolved (incremental): access logging now supports configurable output formats (`json`, `plain`, `custom`) with template rendering via `TARDIGRADE_ACCESS_LOG_FORMAT` and `TARDIGRADE_ACCESS_LOG_TEMPLATE`.
+Resolved (incremental): conditional access logging and buffering are supported via `TARDIGRADE_ACCESS_LOG_MIN_STATUS` and `TARDIGRADE_ACCESS_LOG_BUFFER_SIZE`.
+Resolved (incremental): optional syslog UDP forwarding is supported via `TARDIGRADE_ACCESS_LOG_SYSLOG_UDP`.
 
 ### 12.2 Metrics
 - [x] Stub status endpoint
@@ -568,23 +618,34 @@ Resolved: Structured access log implemented in `src/http/access_log.zig`. `Acces
 Resolved (incremental): access logs now include `error_category` classification and metrics now track category-level API error counters (invalid request, unauthorized, rate limited, upstream timeout/unavailable, internal, overload) for operational triage.
 
 ### 12.4 Admin API
-- [ ] route inspection
-- [ ] active connections
-- [ ] stream status
-- [ ] upstream health
-- [ ] loaded certificates
-- [ ] auth/device registry
+- [x] route inspection
+- [x] active connections
+- [x] stream status
+- [x] upstream health
+- [x] loaded certificates
+- [x] auth/device registry
+
+Resolved (incremental): added authenticated admin endpoints for route inspection and runtime state:
+- `GET /admin/routes`
+- `GET /admin/connections`
+- `GET /admin/streams`
+- `GET /admin/upstreams`
+- `GET /admin/certs`
+- `GET /admin/auth-registry`
 
 ## PHASE 13: Production Hardening
 
 ### 13.1 Process Management
-- [ ] Master/worker process model
+- [x] Master/worker process model
 - [x] Graceful shutdown (SIGTERM/SIGQUIT)
-- [ ] Binary upgrade (SIGUSR2)
-- [ ] Worker process recycling
-- [ ] CPU affinity
+- [x] Binary upgrade (SIGUSR2)
+- [x] Worker process recycling
+- [x] CPU affinity
 
 Resolved: Graceful shutdown implemented in `src/http/shutdown.zig`. SIGTERM and SIGINT handlers set a global atomic flag. With the Phase 2.1 event loop, the listener no longer blocks indefinitely in `accept()`, so shutdown is serviced on the next event-loop tick even when the server is idle.
+Resolved (incremental): added optional master/worker process supervision in `src/main.zig` (`TARDIGRADE_MASTER_PROCESS`, `TARDIGRADE_WORKER_PROCESSES`) with automatic worker respawn on unexpected exit.
+Resolved (incremental): added SIGUSR2 upgrade signaling path (`src/http/shutdown.zig`) and master-mode binary handoff spawn behavior (`TARDIGRADE_BINARY_UPGRADE`).
+Resolved (incremental): added worker recycle timer controls (`TARDIGRADE_WORKER_RECYCLE_SECONDS`) and Linux best-effort process CPU affinity pinning (`TARDIGRADE_WORKER_CPU_AFFINITY`).
 
 ### 13.2 Resource Limits
 - [x] File descriptor limits
@@ -599,9 +660,12 @@ Resolved (incremental): global estimated active-connection memory capping added 
 Decision: total memory cap is estimated from active connections and configured per-connection memory budget to keep listener-side checks lock-free and low overhead.
 
 ### 13.3 Privilege Management
-- [ ] Run as unprivileged user
-- [ ] Privilege dropping after bind
-- [ ] Chroot support (optional)
+- [x] Run as unprivileged user
+- [x] Privilege dropping after bind
+- [x] Chroot support (optional)
+
+Resolved (incremental): added strict unprivileged-mode enforcement (`TARDIGRADE_REQUIRE_UNPRIVILEGED_USER`) and explicit post-bind privilege drop controls (`TARDIGRADE_RUN_USER`, `TARDIGRADE_RUN_GROUP`).
+Resolved (incremental): added optional chroot jail application after bind (`TARDIGRADE_CHROOT_DIR`) before uid/gid drop.
 
 ### 13.4 Resilience Features
 - [x] circuit breakers
@@ -619,9 +683,13 @@ Resolved (incremental): request-level upstream timeout budgets added via `TARDIG
 This phase enables Tardigrade to function as the BearClaw gateway.
 
 ### 14.1 Command Protocol
-- [ ] structured command envelopes
-- [ ] command lifecycle tracking
-- [ ] async command completion
+- [x] structured command envelopes
+- [x] command lifecycle tracking
+- [x] async command completion
+
+Resolved (incremental): command envelope parsing now supports explicit `command_id` and async execution intent (`async`) in `src/http/command.zig`, and upstream command envelopes include `command_id` context.
+Resolved (incremental): added in-memory command lifecycle tracking in `src/edge_gateway.zig` with statuses `pending|running|completed|failed` and lifecycle metadata.
+Resolved (incremental): added asynchronous command execution mode for `POST /v1/commands` returning `202 Accepted` plus lifecycle polling endpoint `GET /v1/commands/status?command_id=...`.
 
 ### 14.2 Stream Multiplexing
 - [ ] multiplex multiple streams

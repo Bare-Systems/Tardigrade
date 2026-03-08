@@ -1,6 +1,58 @@
 
 # Changelog
 
+## [0.29.0] - 2026-03-08
+
+### Added
+- Phase 9 WebSocket + SSE/event-streaming foundation (`src/http/websocket.zig`, `src/http/event_hub.zig`, `src/edge_config.zig`, `src/edge_gateway.zig`, `src/http.zig`):
+  - Added authenticated WebSocket upgrade routes for `/v1/ws/chat` and `/v1/ws/commands` with in-house RFC6455 handshake/framing.
+  - Added WebSocket ping/pong handling, idle timeout, frame-size caps, and upstream proxy forwarding via existing load-balanced upstream execution.
+  - Added authenticated SSE publish/stream routes (`POST /v1/events/publish`, `GET /v1/events/stream`) with `Last-Event-ID` replay support.
+  - Added in-memory topic event hub buffering and slow-client backlog protection controls.
+  - Added new runtime config env vars: `TARDIGRADE_WEBSOCKET_*` and `TARDIGRADE_SSE_*`.
+- Phase 10 compression completion increment (`src/http/compression.zig`, `src/edge_config.zig`, `src/edge_gateway.zig`):
+  - Added response encoding negotiation for `br` and `gzip` with Brotli-preferred selection when supported by clients.
+  - Added runtime Brotli compression support via dynamic encoder library loading (`TARDIGRADE_COMPRESSION_BROTLI_ENABLED`, `TARDIGRADE_COMPRESSION_BROTLI_QUALITY`).
+  - Added gzip_static-style passthrough for already-gzipped payloads to avoid redundant recompression.
+  - Added upstream gunzip path by advertising `Accept-Encoding: gzip` on proxy requests (`TARDIGRADE_UPSTREAM_GUNZIP_ENABLED`) and reusing Zig client automatic decompression.
+- Phase 11.1 URL rewriting foundation (`src/http/rewrite.zig`, `src/edge_config.zig`, `src/edge_gateway.zig`):
+  - Added regex-based rewrite rule engine with support for `last`, `break`, `redirect`, and `permanent` flags.
+  - Added regex-based return directives for short-circuit responses before normal route dispatch.
+  - Added method-conditional rewrite/return matching (`METHOD` or `*`) and new env directives `TARDIGRADE_REWRITE_RULES` / `TARDIGRADE_RETURN_RULES`.
+- Phase 11 request-processing and protocol-bridge completion increment (`src/edge_config.zig`, `src/edge_gateway.zig`, `src/http/fastcgi.zig`, `src/http/uwsgi.zig`, `src/http/scgi.zig`, `src/http/memcached.zig`):
+  - Added subrequest endpoint (`POST /v1/subrequest`), internal redirect rules, named location mapping, and mirror request rules.
+  - Added backend bridge routes for FastCGI, uWSGI, SCGI, gRPC, and Memcached under `/v1/backend/*`.
+  - Added optional mail proxy bridge routes for SMTP/IMAP/POP3 under `/v1/mail/*`.
+  - Added stream-module bridge routes for TCP/UDP under `/v1/stream/*` and stream SSL-termination mode flag/config.
+- Phase 12 observability completion increment (`src/http/access_log.zig`, `src/edge_config.zig`, `src/edge_gateway.zig`):
+  - Added configurable access log formats (`json`, `plain`, `custom`) with template rendering and conditional status-based filtering.
+  - Added access log buffering and optional syslog UDP forwarding.
+  - Added authenticated admin API endpoints for routes, connections, streams, upstream health, loaded cert config, and auth/session registry visibility.
+- Phase 3.1/3.4 configuration parser + hot reload foundation (`src/http/config_file.zig`, `src/edge_config.zig`, `src/http/shutdown.zig`, `src/edge_gateway.zig`):
+  - Added nginx-style config-file parsing with `include`, `set $var`, interpolation, and directive-to-env normalization.
+  - Added `TARDIGRADE_CONFIG_PATH` support with env-overrides-file precedence.
+  - Added SIGHUP-triggered zero-downtime config hot reload with validate-before-apply semantics.
+- Phase 3.2/3.3 config directive expansion (`src/http/config_file.zig`, `src/edge_config.zig`, `src/main.zig`, `src/edge_gateway.zig`):
+  - Added core directive aliases for `worker_processes`, `worker_connections`, `error_log`, `pid`, and `user/group`.
+  - Added HTTP-style directive aliases for `listen`, `server_name`, `root`, and `try_files` with runtime host matching and static try-files fallback.
+  - Added pid-file lifecycle support, stderr log redirection, and numeric post-bind privilege dropping controls.
+- Phase 3.5 secret-management foundation (`src/http/secrets.zig`, `src/edge_config.zig`, `src/http.zig`):
+  - Added secret file override loading via `TARDIGRADE_SECRETS_PATH` and rotating key support via `TARDIGRADE_SECRET_KEYS`.
+  - Added encrypted secret envelope decoding (`ENC:<base64>` with keyed envelope validation) and preserved env-first override precedence.
+- Phase 0.1 and 6.6 identity/policy completion increment (`src/edge_config.zig`, `src/edge_gateway.zig`):
+  - Added authenticated device identity registration (`POST /v1/devices/register`) backed by registry persistence.
+  - Added device proof enforcement on protected routes (`X-Device-ID`, `X-Device-Timestamp`, `X-Device-Signature`) when enabled.
+  - Added session token refresh route (`POST /v1/sessions/refresh`) and policy engine enforcement (`TARDIGRADE_POLICY_*`) for route scope/device/approval/time windows.
+- Phase 13.1/13.3 process and privilege hardening increment (`src/main.zig`, `src/http/shutdown.zig`, `src/edge_gateway.zig`, `src/edge_config.zig`, `src/http/config_file.zig`):
+  - Added master/worker process supervision mode with worker respawn (`TARDIGRADE_MASTER_PROCESS`, `TARDIGRADE_WORKER_PROCESSES`).
+  - Added SIGUSR2 binary-upgrade signaling and replacement-master spawn path (`TARDIGRADE_BINARY_UPGRADE`).
+  - Added worker recycle timer and Linux CPU affinity pinning controls (`TARDIGRADE_WORKER_RECYCLE_SECONDS`, `TARDIGRADE_WORKER_CPU_AFFINITY`).
+  - Added privilege hardening controls: strict unprivileged-mode enforcement and optional chroot after bind (`TARDIGRADE_REQUIRE_UNPRIVILEGED_USER`, `TARDIGRADE_CHROOT_DIR`).
+- Phase 14.1 command protocol completion increment (`src/http/command.zig`, `src/edge_gateway.zig`):
+  - Added command envelope support for `command_id` and `async` mode.
+  - Added in-memory command lifecycle tracking (`pending`, `running`, `completed`, `failed`) keyed by `command_id`.
+  - Added async command submission (`POST /v1/commands` -> `202 Accepted`) and lifecycle polling endpoint (`GET /v1/commands/status?command_id=...`).
+
 ## [0.28.0] - 2026-03-07
 
 ### Added

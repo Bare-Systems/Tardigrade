@@ -3,7 +3,6 @@ const Response = @import("response.zig").Response;
 
 /// Standard security headers applied to all responses.
 ///
-/// Maps to PLAN Phase 6.5 (Security Headers):
 /// - X-Frame-Options
 /// - X-Content-Type-Options
 /// - Content-Security-Policy

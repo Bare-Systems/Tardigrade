@@ -425,9 +425,14 @@ Priority: MEDIUM
 
 ### 10.1 Log Rotation
 
-- [ ] `TARDIGRADE_LOG_FILE` env var to write logs to a file instead of stderr
-- [ ] On `SIGUSR1`: close and reopen log file (standard log rotation signal)
-- [ ] Max log file size + automatic rotation when size exceeded (configurable)
+Resolved: size-based log rotation implemented in `src/main.zig` (`rotateLogFiles`).
+`TARDIGRADE_ERROR_LOG_PATH`, `TARDIGRADE_LOG_ROTATE_MAX_BYTES`, and
+`TARDIGRADE_LOG_ROTATE_MAX_FILES` env vars control the behaviour.
+Generation shifting (`error.log` → `error.log.1` → ...) and trim are tested.
+
+- [x] Max log file size + automatic rotation when size exceeded (configurable)
+- [x] Generation retention control (`TARDIGRADE_LOG_ROTATE_MAX_FILES`)
+- [ ] On `SIGUSR1`: close and reopen log file (standard log rotation signal for external rotators like logrotate)
 
 ### 10.2 Virtual Hosts (Server Blocks)
 
@@ -476,6 +481,89 @@ implementation exists. This is a stub.
 
 ---
 
+## UPGRADE 12: Approval Workflow Hardening
+
+Priority: MEDIUM
+
+Current state: approval workflows (`POST /v1/approvals/request`, `POST /v1/approvals/respond`,
+`GET /v1/approvals/status`) were added in Phase 14 and are functional but in-memory only.
+Approval state is process-local and lost on restart or worker respawn.
+
+### 12.0 Persistent Approval Store
+
+- [ ] Persist approval entries to disk (JSON file or SQLite via `TARDIGRADE_APPROVAL_STORE_PATH`)
+- [ ] On startup, load existing pending/escalated approvals from store (resume across restarts)
+- [ ] Atomic write-on-change (write to `.tmp` then rename) to prevent corrupt state on crash
+- [ ] Worker processes in master-worker mode must share approval state via the master process
+      (IPC or shared file) — currently each worker has its own in-memory map
+
+### 12.1 Approval TTL & Escalation
+
+- [ ] Configurable default approval TTL (`TARDIGRADE_APPROVAL_TTL_MS`, default: 300000)
+- [ ] Escalation target: configurable webhook URL or SSE topic to notify on escalation
+      (`TARDIGRADE_APPROVAL_ESCALATION_WEBHOOK`)
+- [ ] Escalation fires an HTTP POST with the approval snapshot JSON to the webhook URL
+- [ ] Expired approvals are pruned from the store after a configurable retention window
+
+### 12.2 Security
+
+- [ ] Approval tokens must be single-use for `respond` — once decided, token is locked
+- [ ] Rate limit `POST /v1/approvals/request` per identity (prevent approval flood)
+- [ ] `actor` field in respond endpoint must be an authenticated identity, not free-form string
+
+### 12.3 Tests
+
+- [ ] Integration test: approval token created → responded → status reflects decision
+- [ ] Integration test: pending approval auto-escalates after TTL expires
+- [ ] Integration test: responding twice to the same token returns 409
+- [ ] Integration test: unauthenticated `POST /v1/approvals/respond` returns 401
+- [ ] Integration test: approval store survives process restart (persistent store)
+- [ ] Integration test: route gated by approval policy returns 202 with approval token,
+      then proceeds after approval is granted
+
+---
+
+## UPGRADE 13: WebSocket Multiplexing Hardening
+
+Priority: MEDIUM
+
+Current state: `/v1/ws/mux` was added in Phase 14. It supports named channels,
+event pub/sub, and async command push over a single WebSocket connection.
+Per-device topic namespacing is enforced. However, there are several production gaps.
+
+### 13.0 Backpressure & Flow Control
+
+- [ ] Detect slow mux clients: if the write buffer for a client grows beyond a configurable
+      threshold (`TARDIGRADE_MUX_WRITE_BUFFER_MAX`), drop the oldest frames and send
+      a `{"type":"overflow","dropped":N}` frame to the client
+- [ ] Per-channel subscription limit per device
+      (`TARDIGRADE_MUX_MAX_CHANNELS_PER_DEVICE`, default: 50)
+
+### 13.1 Reconnect & State Recovery
+
+- [ ] `Last-Event-ID`-style resume for mux channels: client can reconnect and receive
+      missed events since a given sequence ID (reuse `event_hub.zig` replay logic)
+- [ ] Channel state is preserved for a configurable grace period after disconnect
+      (`TARDIGRADE_MUX_RECONNECT_GRACE_MS`, default: 30000)
+
+### 13.2 Observability
+
+- [ ] Active mux connection count exposed in `GET /metrics`
+- [ ] Per-device channel subscription count exposed in `GET /metrics`
+- [ ] Mux frame errors (parse failures, oversized payloads) counted in metrics
+
+### 13.3 Tests
+
+- [ ] Integration test: client subscribes to a channel, event is published, frame received
+- [ ] Integration test: client sends command via mux channel, async update frame returned
+- [ ] Integration test: per-device topic isolation — device A cannot receive device B events
+- [ ] Integration test: unauthenticated connection to `/v1/ws/mux` returns 401
+- [ ] Integration test: missing `X-Device-ID` returns 400
+- [ ] Integration test: slow client overflow drops frames and sends overflow notice
+- [ ] Integration test: reconnecting client with sequence ID receives missed events
+
+---
+
 ## Upgrade Priority Summary
 
 | # | Upgrade | Priority | Effort |
@@ -491,6 +579,8 @@ implementation exists. This is a stub.
 | 9 | handleConnection() refactor + mutex split | MEDIUM | Medium |
 | 10 | Config system hardening | MEDIUM | Medium |
 | 11 | Mail proxy | LOW | High |
+| 12 | Approval workflow hardening (persistence, escalation webhook, security) | MEDIUM | Medium |
+| 13 | WebSocket mux hardening (backpressure, reconnect, observability) | MEDIUM | Medium |
 
 Recommended sequencing:
 1. UPGRADE 1 (tests) first — no new features without a regression net
@@ -499,4 +589,5 @@ Recommended sequencing:
 4. UPGRADE 4 (FastCGI/SCGI/uWSGI) once refactor is done
 5. UPGRADE 6 (location routing) enables 5 + 7 + 8 to work generically
 6. UPGRADE 3 (HTTP/3) as a standalone track after the above stabilise
-7. UPGRADE 10 + 11 last
+7. UPGRADE 12 + 13 once the test suite from UPGRADE 1 covers the approval and mux paths
+8. UPGRADE 10 + 11 last

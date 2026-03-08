@@ -6,6 +6,15 @@ const edge_config = @import("edge_config.zig");
 const MAX_REQUEST_SIZE: usize = 256 * 1024;
 const STREAM_RELAY_BUFFER_SIZE: usize = 16 * 1024;
 const JSON_CONTENT_TYPE = "application/json";
+const ADMIN_ROUTES_JSON =
+    "{\"routes\":[" ++
+    "\"/health\",\"/metrics\",\"/metrics/prometheus\"," ++
+    "\"/admin/routes\",\"/admin/connections\",\"/admin/streams\",\"/admin/upstreams\",\"/admin/certs\",\"/admin/auth-registry\"," ++
+    "\"/v1/chat\",\"/v1/commands\",\"/v1/sessions\",\"/v1/cache/purge\"," ++
+    "\"/v1/ws/chat\",\"/v1/ws/commands\",\"/v1/events/stream\",\"/v1/events/publish\"," ++
+    "\"/v1/subrequest\",\"/v1/backend/fastcgi\",\"/v1/backend/uwsgi\",\"/v1/backend/scgi\",\"/v1/backend/grpc\",\"/v1/backend/memcached\"," ++
+    "\"/v1/mail/smtp\",\"/v1/mail/imap\",\"/v1/mail/pop3\",\"/v1/stream/tcp\",\"/v1/stream/udp\"" ++
+    "]}";
 const HTTP2_PREFACE = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 const HTTP2_MAX_FRAME_SIZE: usize = 16 * 1024;
 const ProxyCacheLookup = struct {
@@ -88,6 +97,8 @@ const GatewayState = struct {
     max_connections_per_ip: u32,
     max_active_connections: u32,
     active_connections_total: usize,
+    active_ws_streams: usize,
+    active_sse_streams: usize,
     connection_memory_estimate_bytes: usize,
     max_total_connection_memory_bytes: usize,
     upstream_rr_index: usize,
@@ -840,6 +851,56 @@ const GatewayState = struct {
             }
         }
     }
+
+    fn streamCountAdjust(self: *GatewayState, ws_delta: i32, sse_delta: i32) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (ws_delta < 0) {
+            const dec: usize = @intCast(-ws_delta);
+            self.active_ws_streams = if (self.active_ws_streams > dec) self.active_ws_streams - dec else 0;
+        } else if (ws_delta > 0) {
+            self.active_ws_streams += @intCast(ws_delta);
+        }
+        if (sse_delta < 0) {
+            const dec: usize = @intCast(-sse_delta);
+            self.active_sse_streams = if (self.active_sse_streams > dec) self.active_sse_streams - dec else 0;
+        } else if (sse_delta > 0) {
+            self.active_sse_streams += @intCast(sse_delta);
+        }
+    }
+
+    fn streamCounts(self: *GatewayState) struct { ws: usize, sse: usize } {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return .{ .ws = self.active_ws_streams, .sse = self.active_sse_streams };
+    }
+
+    fn connectionCounts(self: *GatewayState) struct { active: usize, per_ip: usize } {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return .{ .active = self.active_connections_total, .per_ip = self.active_connections_by_ip.count() };
+    }
+
+    fn upstreamHealthJson(self: *GatewayState, allocator: std.mem.Allocator) ![]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var out = std.ArrayList(u8).init(allocator);
+        errdefer out.deinit();
+        try out.appendSlice("{\"upstreams\":[");
+        var first = true;
+        const now_ms = http.event_loop.monotonicMs();
+        var it = self.upstream_health.iterator();
+        while (it.next()) |entry| {
+            if (!first) try out.appendSlice(",");
+            first = false;
+            const url = entry.key_ptr.*;
+            const h = entry.value_ptr.*;
+            const healthy = h.unhealthy_until_ms == 0 or h.unhealthy_until_ms <= now_ms;
+            try out.writer().print("{{\"url\":\"{s}\",\"healthy\":{},\"unhealthy_until_ms\":{d}}}", .{ url, healthy, h.unhealthy_until_ms });
+        }
+        try out.appendSlice("]}");
+        return out.toOwnedSlice();
+    }
 };
 
 fn upstreamPoolForScope(cfg: *const edge_config.EdgeConfig, scope: UpstreamScope) UpstreamPoolView {
@@ -1033,6 +1094,8 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         .max_connections_per_ip = cfg.max_connections_per_ip,
         .max_active_connections = cfg.max_active_connections,
         .active_connections_total = 0,
+        .active_ws_streams = 0,
+        .active_sse_streams = 0,
         .connection_memory_estimate_bytes = if (cfg.max_connection_memory_bytes > 0) cfg.max_connection_memory_bytes else MAX_REQUEST_SIZE,
         .max_total_connection_memory_bytes = cfg.max_total_connection_memory_bytes,
         .upstream_rr_index = 0,
@@ -1048,6 +1111,14 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         .fd_to_ip = std.AutoHashMap(std.posix.fd_t, []u8).init(state_allocator),
     };
     defer state.deinit();
+    http.access_log.init(state_allocator, .{
+        .format = cfg.access_log_format,
+        .custom_template = cfg.access_log_template,
+        .min_status = cfg.access_log_min_status,
+        .buffer_size_bytes = cfg.access_log_buffer_size,
+        .syslog_udp_endpoint = cfg.access_log_syslog_udp,
+    }) catch {};
+    defer http.access_log.deinit();
 
     const address = try std.net.Address.parseIp(cfg.listen_host, cfg.listen_port);
     var server = try std.net.Address.listen(address, .{ .reuse_address = true });
@@ -1151,6 +1222,12 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     if (cfg.basic_auth_hashes.len > 0) {
         state.logger.info(null, "HTTP Basic Auth enabled with {d} credential(s)", .{cfg.basic_auth_hashes.len});
     }
+    state.logger.info(null, "Access log configured: format={s} min_status={d} buffer={d} syslog={s}", .{
+        @tagName(cfg.access_log_format),
+        cfg.access_log_min_status,
+        cfg.access_log_buffer_size,
+        if (cfg.access_log_syslog_udp.len > 0) cfg.access_log_syslog_udp else "off",
+    });
     if (cfg.proxy_protocol_mode != .off) {
         state.logger.info(null, "Proxy protocol enabled: {s}", .{@tagName(cfg.proxy_protocol_mode)});
         if (edge_config.hasTlsFiles(cfg)) {
@@ -2433,6 +2510,96 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         return;
     }
 
+    // --- Admin API ---
+    if (request.method == .GET and std.mem.startsWith(u8, request.uri.path, "/admin/")) {
+        const auth_result = authorizeRequest(cfg, &request.headers);
+        if (!auth_result.ok) {
+            try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, keep_alive, state);
+            logAccess(&ctx, request.method.toString(), request.uri.path, 401, request.headers.get("user-agent") orelse "");
+            return;
+        }
+        if (std.mem.eql(u8, request.uri.path, "/admin/routes")) {
+            var response = http.Response.json(allocator, ADMIN_ROUTES_JSON);
+            defer response.deinit();
+            _ = response.setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
+            applyResponseHeaders(state, &response);
+            try response.write(writer);
+            state.metricsRecord(200);
+            logAccess(&ctx, request.method.toString(), request.uri.path, 200, request.headers.get("user-agent") orelse "");
+            return;
+        }
+        if (std.mem.eql(u8, request.uri.path, "/admin/connections")) {
+            const counts = state.connectionCounts();
+            const body = try std.fmt.allocPrint(allocator, "{{\"active\":{d},\"tracked_ip_buckets\":{d}}}", .{ counts.active, counts.per_ip });
+            defer allocator.free(body);
+            var response = http.Response.json(allocator, body);
+            defer response.deinit();
+            _ = response.setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
+            applyResponseHeaders(state, &response);
+            try response.write(writer);
+            state.metricsRecord(200);
+            logAccess(&ctx, request.method.toString(), request.uri.path, 200, request.headers.get("user-agent") orelse "");
+            return;
+        }
+        if (std.mem.eql(u8, request.uri.path, "/admin/streams")) {
+            const counts = state.streamCounts();
+            const body = try std.fmt.allocPrint(allocator, "{{\"websocket_active\":{d},\"sse_active\":{d}}}", .{ counts.ws, counts.sse });
+            defer allocator.free(body);
+            var response = http.Response.json(allocator, body);
+            defer response.deinit();
+            _ = response.setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
+            applyResponseHeaders(state, &response);
+            try response.write(writer);
+            state.metricsRecord(200);
+            logAccess(&ctx, request.method.toString(), request.uri.path, 200, request.headers.get("user-agent") orelse "");
+            return;
+        }
+        if (std.mem.eql(u8, request.uri.path, "/admin/upstreams")) {
+            const body = state.upstreamHealthJson(allocator) catch try allocator.dupe(u8, "{\"upstreams\":[]}");
+            defer allocator.free(body);
+            var response = http.Response.json(allocator, body);
+            defer response.deinit();
+            _ = response.setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
+            applyResponseHeaders(state, &response);
+            try response.write(writer);
+            state.metricsRecord(200);
+            logAccess(&ctx, request.method.toString(), request.uri.path, 200, request.headers.get("user-agent") orelse "");
+            return;
+        }
+        if (std.mem.eql(u8, request.uri.path, "/admin/certs")) {
+            const body = try std.fmt.allocPrint(allocator, "{{\"default_cert\":\"{s}\",\"default_key\":\"{s}\",\"sni_count\":{d}}}", .{ cfg.tls_cert_path, cfg.tls_key_path, cfg.tls_sni_certs.len });
+            defer allocator.free(body);
+            var response = http.Response.json(allocator, body);
+            defer response.deinit();
+            _ = response.setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
+            applyResponseHeaders(state, &response);
+            try response.write(writer);
+            state.metricsRecord(200);
+            logAccess(&ctx, request.method.toString(), request.uri.path, 200, request.headers.get("user-agent") orelse "");
+            return;
+        }
+        if (std.mem.eql(u8, request.uri.path, "/admin/auth-registry")) {
+            const body = try std.fmt.allocPrint(allocator, "{{\"bearer_hashes\":{d},\"basic_auth_hashes\":{d},\"sessions_enabled\":{}}}", .{
+                cfg.auth_token_hashes.len,
+                cfg.basic_auth_hashes.len,
+                state.session_store != null,
+            });
+            defer allocator.free(body);
+            var response = http.Response.json(allocator, body);
+            defer response.deinit();
+            _ = response.setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
+            applyResponseHeaders(state, &response);
+            try response.write(writer);
+            state.metricsRecord(200);
+            logAccess(&ctx, request.method.toString(), request.uri.path, 200, request.headers.get("user-agent") orelse "");
+            return;
+        }
+
+        try sendApiError(allocator, writer, .not_found, "invalid_request", "Unknown admin route", correlation_id, keep_alive, state);
+        logAccess(&ctx, request.method.toString(), request.uri.path, 404, request.headers.get("user-agent") orelse "");
+        return;
+    }
+
     // --- Versioned API routing ---
     const versioned = http.api_router.parseVersionedPath(request.uri.path);
     if (versioned) |route| {
@@ -2715,6 +2882,8 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
 
         const ws_scope: UpstreamScope = if (http.api_router.matchRoute(request.uri.path, 1, "/ws/chat")) .chat else .commands;
         const ws_proxy_target = if (ws_scope == .chat) cfg.proxy_pass_chat else cfg.proxy_pass_commands_prefix;
+        state.streamCountAdjust(1, 0);
+        defer state.streamCountAdjust(-1, 0);
         handleWebSocketProxyLoop(
             conn,
             allocator,
@@ -2768,6 +2937,8 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
 
         const topic = parseQueryParam(request.uri.query, "topic") orelse "default";
         const last_event_id = parseLastEventId(request.headers.get("last-event-id"));
+        state.streamCountAdjust(0, 1);
+        defer state.streamCountAdjust(0, -1);
         try streamSseTopic(writer, allocator, cfg, state, topic, last_event_id, correlation_id);
         state.metricsRecord(200);
         logAccess(&ctx, request.method.toString(), request.uri.path, 200, request.headers.get("user-agent") orelse "");
@@ -4195,7 +4366,8 @@ fn isProtectedAuthRequestRoute(path: []const u8) bool {
         http.api_router.matchRoute(path, 1, "/mail/imap") or
         http.api_router.matchRoute(path, 1, "/mail/pop3") or
         http.api_router.matchRoute(path, 1, "/stream/tcp") or
-        http.api_router.matchRoute(path, 1, "/stream/udp");
+        http.api_router.matchRoute(path, 1, "/stream/udp") or
+        std.mem.startsWith(u8, path, "/admin/");
 }
 
 fn authorizeViaSubrequest(
@@ -5455,6 +5627,11 @@ test "resolveProxyTarget handles absolute and relative proxy_pass" {
         .request_limits = http.request_limits.RequestLimits.default,
         .basic_auth_hashes = &[_][]const u8{},
         .log_level = .info,
+        .access_log_format = .json,
+        .access_log_template = "",
+        .access_log_min_status = 0,
+        .access_log_buffer_size = 0,
+        .access_log_syslog_udp = "",
         .compression_enabled = false,
         .compression_min_size = 256,
         .compression_brotli_enabled = true,
@@ -5618,6 +5795,11 @@ test "authorizeRequest accepts valid hash" {
         .request_limits = http.request_limits.RequestLimits.default,
         .basic_auth_hashes = &[_][]const u8{},
         .log_level = .info,
+        .access_log_format = .json,
+        .access_log_template = "",
+        .access_log_min_status = 0,
+        .access_log_buffer_size = 0,
+        .access_log_syslog_udp = "",
         .compression_enabled = false,
         .compression_min_size = 256,
         .compression_brotli_enabled = true,

@@ -166,6 +166,16 @@ pub const EdgeConfig = struct {
     basic_auth_hashes: [][]const u8,
     /// Minimum log level (debug, info, warn, error).
     log_level: http.logger.Level,
+    /// Access log output format (json, plain, custom).
+    access_log_format: http.access_log.Format,
+    /// Access log custom template when format=custom.
+    access_log_template: []const u8,
+    /// Minimum status code required to emit access logs (0 = all).
+    access_log_min_status: u16,
+    /// Access log in-memory buffer size before flush (0 = no buffering).
+    access_log_buffer_size: usize,
+    /// Optional syslog UDP endpoint (host:port).
+    access_log_syslog_udp: []const u8,
     /// Whether response compression is enabled.
     compression_enabled: bool,
     /// Minimum response body size to compress (bytes).
@@ -332,6 +342,8 @@ pub const EdgeConfig = struct {
         allocator.free(self.add_headers);
         for (self.basic_auth_hashes) |h| allocator.free(h);
         allocator.free(self.basic_auth_hashes);
+        allocator.free(self.access_log_template);
+        allocator.free(self.access_log_syslog_udp);
         allocator.free(self.upstream_active_health_path);
         for (self.rewrite_rules) |rule| {
             allocator.free(rule.method);
@@ -646,6 +658,15 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     const log_level_str = envOrDefault(allocator, "TARDIGRADE_LOG_LEVEL", "info") catch unreachable;
     defer allocator.free(log_level_str);
     const log_level = http.logger.Level.parse(log_level_str) orelse .info;
+    const access_log_format_str = envOrDefault(allocator, "TARDIGRADE_ACCESS_LOG_FORMAT", "json") catch unreachable;
+    defer allocator.free(access_log_format_str);
+    const access_log_format = http.access_log.Format.parse(access_log_format_str) orelse .json;
+    const access_log_template = envOrDefault(allocator, "TARDIGRADE_ACCESS_LOG_TEMPLATE", "") catch unreachable;
+    errdefer allocator.free(access_log_template);
+    const access_log_min_status = parseIntEnv(u16, allocator, "TARDIGRADE_ACCESS_LOG_MIN_STATUS", 0);
+    const access_log_buffer_size = parseIntEnv(usize, allocator, "TARDIGRADE_ACCESS_LOG_BUFFER_SIZE", 0);
+    const access_log_syslog_udp = envOrDefault(allocator, "TARDIGRADE_ACCESS_LOG_SYSLOG_UDP", "") catch unreachable;
+    errdefer allocator.free(access_log_syslog_udp);
 
     // Compression
     const comp_enabled_str = envOrDefault(allocator, "TARDIGRADE_COMPRESSION_ENABLED", "true") catch unreachable;
@@ -928,6 +949,11 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         },
         .basic_auth_hashes = basic_auth_hashes,
         .log_level = log_level,
+        .access_log_format = access_log_format,
+        .access_log_template = access_log_template,
+        .access_log_min_status = access_log_min_status,
+        .access_log_buffer_size = access_log_buffer_size,
+        .access_log_syslog_udp = access_log_syslog_udp,
         .compression_enabled = compression_enabled,
         .compression_min_size = compression_min_size,
         .compression_brotli_enabled = compression_brotli_enabled,

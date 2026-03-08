@@ -24,6 +24,10 @@
   - Added backend bridge routes for FastCGI, uWSGI, SCGI, gRPC, and Memcached under `/v1/backend/*`.
   - Added optional mail proxy bridge routes for SMTP/IMAP/POP3 under `/v1/mail/*`.
   - Added stream-module bridge routes for TCP/UDP under `/v1/stream/*` and stream SSL-termination mode flag/config.
+- Phase 12 observability completion increment (`src/http/access_log.zig`, `src/edge_config.zig`, `src/edge_gateway.zig`):
+  - Added configurable access log formats (`json`, `plain`, `custom`) with template rendering and conditional status-based filtering.
+  - Added access log buffering and optional syslog UDP forwarding.
+  - Added authenticated admin API endpoints for routes, connections, streams, upstream health, loaded cert config, and auth/session registry visibility.
 
 ## [0.28.0] - 2026-03-07
 

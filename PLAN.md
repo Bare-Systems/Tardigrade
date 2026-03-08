@@ -568,11 +568,15 @@ Resolved (incremental): added stream SSL-termination mode flag (`TARDIGRADE_STRE
 ## PHASE 12: Observability
 
 ### 12.1 Logging
-- [ ] Custom log formats
-- [ ] Conditional logging
-- [ ] JSON log format
-- [ ] Access log buffering
-- [ ] Syslog integration
+- [x] Custom log formats
+- [x] Conditional logging
+- [x] JSON log format
+- [x] Access log buffering
+- [x] Syslog integration
+
+Resolved (incremental): access logging now supports configurable output formats (`json`, `plain`, `custom`) with template rendering via `TARDIGRADE_ACCESS_LOG_FORMAT` and `TARDIGRADE_ACCESS_LOG_TEMPLATE`.
+Resolved (incremental): conditional access logging and buffering are supported via `TARDIGRADE_ACCESS_LOG_MIN_STATUS` and `TARDIGRADE_ACCESS_LOG_BUFFER_SIZE`.
+Resolved (incremental): optional syslog UDP forwarding is supported via `TARDIGRADE_ACCESS_LOG_SYSLOG_UDP`.
 
 ### 12.2 Metrics
 - [x] Stub status endpoint
@@ -593,12 +597,20 @@ Resolved: Structured access log implemented in `src/http/access_log.zig`. `Acces
 Resolved (incremental): access logs now include `error_category` classification and metrics now track category-level API error counters (invalid request, unauthorized, rate limited, upstream timeout/unavailable, internal, overload) for operational triage.
 
 ### 12.4 Admin API
-- [ ] route inspection
-- [ ] active connections
-- [ ] stream status
-- [ ] upstream health
-- [ ] loaded certificates
-- [ ] auth/device registry
+- [x] route inspection
+- [x] active connections
+- [x] stream status
+- [x] upstream health
+- [x] loaded certificates
+- [x] auth/device registry
+
+Resolved (incremental): added authenticated admin endpoints for route inspection and runtime state:
+- `GET /admin/routes`
+- `GET /admin/connections`
+- `GET /admin/streams`
+- `GET /admin/upstreams`
+- `GET /admin/certs`
+- `GET /admin/auth-registry`
 
 ## PHASE 13: Production Hardening
 

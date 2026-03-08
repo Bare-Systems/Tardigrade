@@ -13,6 +13,11 @@ pub const CachedResponse = struct {
     created_ns: i128,
 };
 
+pub const LookupResult = struct {
+    response: CachedResponse,
+    is_stale: bool,
+};
+
 /// In-memory idempotency key store.
 ///
 /// Tracks previously-processed request keys and their responses so
@@ -43,20 +48,32 @@ pub const IdempotencyStore = struct {
     /// Look up a cached response for the given idempotency key.
     /// Returns null if not found or expired.
     pub fn get(self: *IdempotencyStore, key: []const u8) ?CachedResponse {
+        if (self.getWithStale(key, 0)) |lookup| return lookup.response;
+        return null;
+    }
+
+    /// Look up cached value and optionally permit stale values within `stale_seconds`.
+    pub fn getWithStale(self: *IdempotencyStore, key: []const u8, stale_seconds: u32) ?LookupResult {
         const entry = self.entries.get(key) orelse return null;
         const now = std.time.nanoTimestamp();
-        if (now - entry.created_ns > self.ttl_ns) {
-            // Expired - remove it
-            self.remove(key);
-            return null;
+        const age_ns = now - entry.created_ns;
+        if (age_ns <= self.ttl_ns) {
+            return .{ .response = entry, .is_stale = false };
         }
-        return entry;
+
+        const stale_ns: i128 = @as(i128, stale_seconds) * std.time.ns_per_s;
+        if (stale_seconds > 0 and age_ns <= self.ttl_ns + stale_ns) {
+            return .{ .response = entry, .is_stale = true };
+        }
+
+        _ = self.delete(key);
+        return null;
     }
 
     /// Store a response for an idempotency key.
     pub fn put(self: *IdempotencyStore, key: []const u8, status: u16, body: []const u8, content_type: []const u8) !void {
         // Periodic cleanup before adding new entries
-        self.cleanupExpired();
+        _ = self.cleanupExpired();
 
         const owned_key = try self.allocator.dupe(u8, key);
         errdefer self.allocator.free(owned_key);
@@ -82,15 +99,32 @@ pub const IdempotencyStore = struct {
         });
     }
 
-    fn remove(self: *IdempotencyStore, key: []const u8) void {
+    /// Delete a key from the store. Returns true when an entry was removed.
+    pub fn delete(self: *IdempotencyStore, key: []const u8) bool {
         if (self.entries.fetchRemove(key)) |old| {
             self.allocator.free(old.key);
             self.allocator.free(old.value.body);
             self.allocator.free(old.value.content_type);
+            return true;
         }
+        return false;
     }
 
-    fn cleanupExpired(self: *IdempotencyStore) void {
+    /// Clear all entries and return number of removed entries.
+    pub fn clear(self: *IdempotencyStore) usize {
+        var removed: usize = 0;
+        var it = self.entries.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.value_ptr.body);
+            self.allocator.free(entry.value_ptr.content_type);
+            removed += 1;
+        }
+        self.entries.clearAndFree();
+        return removed;
+    }
+
+    pub fn cleanupExpired(self: *IdempotencyStore) usize {
         const now = std.time.nanoTimestamp();
         var keys_to_remove = std.ArrayList([]const u8).init(self.allocator);
         defer keys_to_remove.deinit();
@@ -102,9 +136,11 @@ pub const IdempotencyStore = struct {
             }
         }
 
+        var removed: usize = 0;
         for (keys_to_remove.items) |key| {
-            self.remove(key);
+            if (self.delete(key)) removed += 1;
         }
+        return removed;
     }
 };
 

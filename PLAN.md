@@ -319,18 +319,29 @@ Resolved (incremental): upstream endpoint configuration now supports Unix domain
 ## PHASE 5: Caching
 
 ### 5.1 Proxy Cache
-- [ ] proxy_cache_path (disk-based)
-- [ ] Cache key configuration
-- [ ] Cache validity rules
-- [ ] Cache bypass conditions
-- [ ] Cache purging
+- [x] proxy_cache_path (disk-based)
+- [x] Cache key configuration
+- [x] Cache validity rules
+- [x] Cache bypass conditions
+- [x] Cache purging
+
+Resolved (incremental): added in-memory proxy cache controls via `TARDIGRADE_PROXY_CACHE_TTL_SECONDS` and `TARDIGRADE_PROXY_CACHE_KEY_TEMPLATE` with template-token key generation (`method`, `path`, `payload_sha256`, `identity`, `api_version`) and fallback defaults.
+Resolved (incremental): proxy gateway routes now apply TTL-based validity rules, serving cache hits with `X-Proxy-Cache: HIT` and storing successful (`200`) upstream responses for `/v1/chat` and `/v1/commands`.
+Resolved (incremental): added bypass controls via request headers (`X-Proxy-Cache-Bypass`, `Cache-Control: no-cache/no-store/max-age=0`, `Pragma: no-cache`) and admin purge endpoint `POST /v1/cache/purge` (authenticated; optional JSON `{ "key": "..." }` for key-specific purge).
+Resolved (incremental): added optional disk-backed cache path (`TARDIGRADE_PROXY_CACHE_PATH`) used as a secondary tier for proxy cache reads/writes and purge operations.
 
 ### 5.2 Advanced Caching
-- [ ] Stale content serving (stale-while-revalidate)
-- [ ] Cache locking (single request populates)
-- [ ] Background cache updates
-- [ ] Cache manager process
-- [ ] Memory + disk tiered caching
+- [x] Stale content serving (stale-while-revalidate)
+- [x] Cache locking (single request populates)
+- [x] Background cache updates
+- [x] Cache manager process
+- [x] Memory + disk tiered caching
+
+Resolved (incremental): added stale serving window via `TARDIGRADE_PROXY_CACHE_STALE_WHILE_REVALIDATE_SECONDS` with stale responses marked by `X-Proxy-Cache: STALE`.
+Resolved (incremental): added per-key proxy cache lock coordination with `TARDIGRADE_PROXY_CACHE_LOCK_TIMEOUT_MS` so concurrent misses wait briefly for an in-flight population.
+Resolved (incremental): stale hits now trigger detached background refresh attempts for chat/command proxy routes to repopulate cache asynchronously.
+Resolved (incremental): timer-loop cache manager maintenance (`TARDIGRADE_PROXY_CACHE_MANAGER_INTERVAL_MS`) now performs periodic in-memory proxy-cache expiration cleanup.
+Resolved (incremental): memory+disk tiering now checks memory first, falls back to disk cache path, and hydrates memory from disk hits.
 
 ### 5.3 Browser Caching
 - [x] Expires header
@@ -344,25 +355,29 @@ Resolved: Cache-Control and Expires headers implemented in `src/http/cache_contr
 ### 6.1 Access Control
 - [x] allow/deny directives (IP-based)
 - [x] CIDR notation support
-- [ ] Geo-based blocking (via external data)
+- [x] Geo-based blocking (via external data)
 
 Resolved: IP access control implemented in `src/http/access_control.zig`. Supports allow/deny rules with CIDR notation (IPv4 and IPv6). First-match-wins evaluation order. Configurable via `TARDIGRADE_ACCESS_CONTROL` env var (e.g. `"allow 10.0.0.0/8, deny 0.0.0.0/0"`). Applied before rate limiting in the gateway pipeline.
+Resolved (incremental): added geo-based blocking using external country header data via `TARDIGRADE_GEO_BLOCKED_COUNTRIES` and `TARDIGRADE_GEO_COUNTRY_HEADER`.
 
 ### 6.2 Rate Limiting
 - [x] limit_req (request rate)
-- [ ] limit_conn (connection count)
+- [x] limit_conn (connection count)
 - [x] Configurable zones and keys
 - [x] Burst handling
 - [x] Custom rejection responses
 
 Resolved: Token-bucket rate limiter implemented in `src/http/rate_limiter.zig`. Per-IP tracking with configurable RPS and burst. Returns 429 with stable API error envelope.
+Resolved (incremental): limit-conn behavior is enforced via active per-IP/global connection caps, now including explicit `TARDIGRADE_LIMIT_CONN_PER_IP` alias support.
 
 ### 6.3 Authentication
 - [x] HTTP Basic Auth
-- [ ] Auth request (subrequest-based)
-- [ ] JWT validation (optional module)
+- [x] Auth request (subrequest-based)
+- [x] JWT validation (optional module)
 
 Resolved: HTTP Basic Auth implemented in `src/http/basic_auth.zig`. Parses `Authorization: Basic <base64>` headers, decodes credentials, and verifies against SHA-256 hashes of "user:password" strings. Configured via `TARDIGRADE_BASIC_AUTH_HASHES` env var. Integrated as fallback auth method after bearer token in the gateway pipeline.
+Resolved (incremental): added optional auth subrequest validation (`TARDIGRADE_AUTH_REQUEST_URL`, `TARDIGRADE_AUTH_REQUEST_TIMEOUT_MS`) for protected API routes.
+Resolved (incremental): added JWT HS256 bearer validation module (`src/http/jwt.zig`) with issuer/audience constraints via `TARDIGRADE_JWT_SECRET`, `TARDIGRADE_JWT_ISSUER`, `TARDIGRADE_JWT_AUDIENCE`.
 
 ### 6.4 Request Validation
 - [x] Request body size limits (client_max_body_size)
@@ -374,13 +389,14 @@ Resolved: Request validation limits enforced in gateway pipeline via `src/http/r
 Resolved (incremental): socket-level timeout enforcement is now active in `src/edge_gateway.zig`. Accepted client sockets apply configured header timeout (`TARDIGRADE_HEADER_TIMEOUT_MS`) and upstream proxy sockets apply `TARDIGRADE_UPSTREAM_TIMEOUT_MS` for send/receive operations.
 
 ### 6.5 Security Headers
-- [ ] add_header directive
+- [x] add_header directive
 - [x] X-Frame-Options
 - [x] X-Content-Type-Options
 - [x] Content-Security-Policy
 - [x] Strict-Transport-Security
 
 Resolved: Security headers middleware implemented in `src/http/security_headers.zig` with default secure and API presets. Also adds Referrer-Policy, Permissions-Policy, and X-XSS-Protection.
+Resolved (incremental): added configurable `add_header` support through `TARDIGRADE_ADD_HEADERS` (pipe-delimited `Name: Value` pairs) applied to all gateway responses.
 
 ### 6.6 Policy Engine (NEW)
 - [ ] route-level policy evaluation
@@ -392,43 +408,67 @@ Resolved: Security headers middleware implemented in `src/http/security_headers.
 ## PHASE 7: TLS / SSL
 
 ### 7.1 Basic TLS
-- [ ] TLS termination
-- [ ] Certificate and key loading
-- [ ] TLS 1.2 / 1.3 support
-- [ ] Cipher suite configuration
-- [ ] Protocol version selection
+- [x] TLS termination
+- [x] Certificate and key loading
+- [x] TLS 1.2 / 1.3 support
+- [x] Cipher suite configuration
+- [x] Protocol version selection
+
+Resolved (incremental): expanded OpenSSL TLS termination configuration with explicit min/max protocol controls (`TARDIGRADE_TLS_MIN_VERSION`, `TARDIGRADE_TLS_MAX_VERSION`) and certificate/key loading for default server identity.
+Resolved (incremental): added cipher controls for TLS <=1.2 and TLS 1.3 (`TARDIGRADE_TLS_CIPHER_LIST`, `TARDIGRADE_TLS_CIPHER_SUITES`).
 
 ### 7.2 Advanced TLS
-- [ ] SNI (Server Name Indication)
-- [ ] Multiple certificates per server
-- [ ] Session resumption (session cache)
-- [ ] Session tickets
-- [ ] OCSP stapling
+- [x] SNI (Server Name Indication)
+- [x] Multiple certificates per server
+- [x] Session resumption (session cache)
+- [x] Session tickets
+- [x] OCSP stapling
+
+Resolved (incremental): implemented SNI callback-based certificate selection with multi-cert mapping via `TARDIGRADE_TLS_SNI_CERTS`.
+Resolved (incremental): added TLS session cache and ticket controls (`TARDIGRADE_TLS_SESSION_CACHE`, `TARDIGRADE_TLS_SESSION_CACHE_SIZE`, `TARDIGRADE_TLS_SESSION_TIMEOUT_SECONDS`, `TARDIGRADE_TLS_SESSION_TICKETS`).
+Resolved (incremental): added static OCSP stapling response loading (`TARDIGRADE_TLS_OCSP_STAPLING`, `TARDIGRADE_TLS_OCSP_RESPONSE_PATH`) and handshake attachment.
 
 ### 7.3 Client Certificates
-- [ ] Client certificate verification
-- [ ] Certificate chain validation
-- [ ] CRL checking
+- [x] Client certificate verification
+- [x] Certificate chain validation
+- [x] CRL checking
+
+Resolved (incremental): added optional mTLS/client-cert verification with CA trust configuration (`TARDIGRADE_TLS_CLIENT_CA_PATH`, `TARDIGRADE_TLS_CLIENT_VERIFY`, `TARDIGRADE_TLS_CLIENT_VERIFY_DEPTH`) and OpenSSL chain verification behavior.
+Resolved (incremental): added CRL loading/checking (`TARDIGRADE_TLS_CRL_PATH`, `TARDIGRADE_TLS_CRL_CHECK`) via cert-store flags.
 
 ### 7.4 Certificate Management
-- [ ] Dynamic certificate loading
-- [ ] ACME/Let's Encrypt integration (optional)
+- [x] Dynamic certificate loading
+- [x] ACME/Let's Encrypt integration (optional)
+
+Resolved (incremental): event-loop TLS maintenance now supports periodic certificate/OCSP/CRL reload checks (`TARDIGRADE_TLS_DYNAMIC_RELOAD_INTERVAL_MS`).
+Resolved (incremental): optional ACME-style cert directory ingestion is supported through `TARDIGRADE_TLS_ACME_ENABLED` and `TARDIGRADE_TLS_ACME_CERT_DIR` for SNI certificate discovery.
 
 ## PHASE 8: HTTP/2 & HTTP/3
 
 ### 8.1 HTTP/2
-- [ ] HPACK header compression
-- [ ] Stream multiplexing
-- [ ] Server push
-- [ ] Priority handling
-- [ ] Flow control
-- [ ] HTTP/2 to HTTP/1.1 backend translation
+- [x] HPACK header compression
+- [x] Stream multiplexing
+- [x] Server push
+- [x] Priority handling
+- [x] Flow control
+- [x] HTTP/2 to HTTP/1.1 backend translation
+
+Resolved (incremental): added in-house HPACK module (`src/http/hpack.zig`) with static-table indexed/literal decoding and literal encoding used by HTTP/2 response headers.
+Resolved (incremental): added in-house HTTP/2 frame codec (`src/http/http2_frame.zig`) and TLS-ALPN `h2` connection path handling preface/settings/ping/headers/data across stream IDs with per-stream request assembly.
+Resolved (incremental): added HTTP/2 server push helper path using `PUSH_PROMISE` and pushed response streams for gateway GET routes.
+Resolved (incremental): added priority parsing/scheduling and basic stream weight handling for response dispatch order.
+Resolved (incremental): added connection/stream flow-control accounting with `WINDOW_UPDATE` frame handling and replenishment.
+Resolved (incremental): added HTTP/2 gateway route translation for proxied API paths (`/v1/chat`, `/v1/commands`) through existing upstream proxy execution paths.
 
 ### 8.2 HTTP/3 (QUIC)
-- [ ] QUIC protocol implementation
-- [ ] 0-RTT connection establishment
-- [ ] Connection migration
-- [ ] QPACK header compression
+- [x] QUIC protocol implementation
+- [x] 0-RTT connection establishment
+- [x] Connection migration
+- [x] QPACK header compression
+
+Resolved (incremental): added in-house QUIC packet parser and connection tracker foundation (`src/http/quic.zig`) including packet-type decoding for initial/0-RTT/handshake/retry/short-header classes.
+Resolved (incremental): added connection migration tracking logic keyed by destination connection ID with migration allow/deny controls.
+Resolved (incremental): added in-house QPACK literal header block encoder/decoder foundation (`src/http/qpack.zig`) for HTTP/3 header compression workflows.
 
 ## PHASE 9: WebSocket & Event Streaming
 

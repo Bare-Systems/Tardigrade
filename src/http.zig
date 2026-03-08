@@ -28,6 +28,7 @@ pub const command = @import("http/command.zig");
 pub const access_control = @import("http/access_control.zig");
 pub const request_limits = @import("http/request_limits.zig");
 pub const basic_auth = @import("http/basic_auth.zig");
+pub const jwt = @import("http/jwt.zig");
 pub const logger = @import("http/logger.zig");
 pub const cache_control = @import("http/cache_control.zig");
 pub const compression = @import("http/compression.zig");
@@ -39,6 +40,10 @@ pub const event_loop = @import("http/event_loop.zig");
 pub const worker_pool = @import("http/worker_pool.zig");
 pub const buffer_pool = @import("http/buffer_pool.zig");
 pub const tls_termination = @import("http/tls_termination.zig");
+pub const hpack = @import("http/hpack.zig");
+pub const http2_frame = @import("http/http2_frame.zig");
+pub const qpack = @import("http/qpack.zig");
+pub const quic = @import("http/quic.zig");
 
 // Re-export constants
 pub const MAX_HEADERS = headers.MAX_HEADERS;

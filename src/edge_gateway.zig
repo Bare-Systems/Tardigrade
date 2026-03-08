@@ -49,6 +49,7 @@ const GatewayState = struct {
     proxy_cache_path: []const u8,
     proxy_cache_ttl_seconds: u32,
     security_headers: http.security_headers.SecurityHeaders,
+    add_headers: []const edge_config.EdgeConfig.HeaderPair,
     session_store: ?http.session.SessionStore,
     access_control: ?http.access_control.AccessControl,
     logger: http.logger.Logger,
@@ -977,6 +978,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
             http.security_headers.SecurityHeaders.api
         else
             http.security_headers.SecurityHeaders{ .x_frame_options = "", .x_content_type_options = "", .content_security_policy = "", .strict_transport_security = "", .referrer_policy = "", .permissions_policy = "", .x_xss_protection = "" },
+        .add_headers = cfg.add_headers,
         .session_store = if (cfg.session_ttl_seconds > 0)
             http.session.SessionStore.init(state_allocator, cfg.session_ttl_seconds, cfg.session_max)
         else
@@ -1756,6 +1758,16 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
     const client_ip = http.request_context.extractClientIp(&request, connection_ip);
     var ctx = http.request_context.RequestContext.init(allocator, correlation_id, client_ip);
 
+    // --- Geo-based blocking (external country header) ---
+    if (cfg.geo_blocked_countries.len > 0) {
+        const country = request.headers.get(cfg.geo_country_header);
+        if (isGeoBlocked(cfg.geo_blocked_countries, country)) {
+            try sendApiError(allocator, writer, .forbidden, "forbidden", "Geo access denied", correlation_id, keep_alive, state);
+            logAccess(&ctx, request.method.toString(), request.uri.path, 403, request.headers.get("user-agent") orelse "");
+            return;
+        }
+    }
+
     // --- Request validation (body size, URI length, header count) ---
     const limits = cfg.request_limits;
     const uri_check = http.request_limits.validateUriLength(request.uri.path.len, limits);
@@ -1815,7 +1827,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         var response = http.Response.json(allocator, "{\"status\":\"ok\",\"service\":\"tardigrade-edge\"}");
         defer response.deinit();
         _ = response.setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
-        state.security_headers.apply(&response);
+        applyResponseHeaders(state, &response);
         try response.write(writer);
         state.metricsRecord(200);
         logAccess(&ctx, request.method.toString(), "/health", 200, request.headers.get("user-agent") orelse "");
@@ -1833,7 +1845,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         var response = http.Response.json(allocator, metrics_json);
         defer response.deinit();
         _ = response.setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
-        state.security_headers.apply(&response);
+        applyResponseHeaders(state, &response);
         try response.write(writer);
         state.metricsRecord(200);
         logAccess(&ctx, request.method.toString(), "/metrics", 200, request.headers.get("user-agent") orelse "");
@@ -1854,7 +1866,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
             .setContentType("text/plain; version=0.0.4; charset=utf-8")
             .setConnection(keep_alive)
             .setHeader(http.correlation.HEADER_NAME, correlation_id);
-        state.security_headers.apply(&response);
+        applyResponseHeaders(state, &response);
         try response.write(writer);
         state.metricsRecord(200);
         logAccess(&ctx, request.method.toString(), "/metrics/prometheus", 200, request.headers.get("user-agent") orelse "");
@@ -1868,6 +1880,13 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
             try sendApiError(allocator, writer, .bad_request, "invalid_request", "Unsupported API version", correlation_id, keep_alive, state);
             logAccess(&ctx, request.method.toString(), request.uri.path, 400, request.headers.get("user-agent") orelse "");
             return;
+        }
+        if (cfg.auth_request_url.len > 0 and isProtectedAuthRequestRoute(request.uri.path)) {
+            if (!authorizeViaSubrequest(allocator, cfg, &request, correlation_id, client_ip)) {
+                try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, keep_alive, state);
+                logAccess(&ctx, request.method.toString(), request.uri.path, 401, request.headers.get("user-agent") orelse "");
+                return;
+            }
         }
     }
 
@@ -1918,7 +1937,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
             .setConnection(keep_alive)
             .setHeader(http.correlation.HEADER_NAME, correlation_id)
             .setHeader(http.session.SESSION_HEADER, session_token);
-        state.security_headers.apply(&response);
+        applyResponseHeaders(state, &response);
         try response.write(writer);
         state.metricsRecord(201);
         logAccess(&ctx, request.method.toString(), "/v1/sessions", 201, request.headers.get("user-agent") orelse "");
@@ -1949,7 +1968,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         defer response.deinit();
         _ = response.setConnection(keep_alive)
             .setHeader(http.correlation.HEADER_NAME, correlation_id);
-        state.security_headers.apply(&response);
+        applyResponseHeaders(state, &response);
         try response.write(writer);
         state.metricsRecord(200);
         logAccess(&ctx, request.method.toString(), "/v1/sessions", 200, request.headers.get("user-agent") orelse "");
@@ -1986,7 +2005,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         defer response.deinit();
         _ = response.setConnection(keep_alive)
             .setHeader(http.correlation.HEADER_NAME, correlation_id);
-        state.security_headers.apply(&response);
+        applyResponseHeaders(state, &response);
         try response.write(writer);
         state.metricsRecord(200);
         logAccess(&ctx, request.method.toString(), "/v1/sessions", 200, request.headers.get("user-agent") orelse "");
@@ -2031,7 +2050,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         defer response.deinit();
         _ = response.setConnection(keep_alive)
             .setHeader(http.correlation.HEADER_NAME, correlation_id);
-        state.security_headers.apply(&response);
+        applyResponseHeaders(state, &response);
         try response.write(writer);
         state.metricsRecord(200);
         logAccess(&ctx, request.method.toString(), "/v1/cache/purge", 200, request.headers.get("user-agent") orelse "");
@@ -2104,7 +2123,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
                     .setConnection(keep_alive)
                     .setHeader(http.correlation.HEADER_NAME, correlation_id)
                     .setHeader("X-Idempotent-Replayed", "true");
-                state.security_headers.apply(&response);
+                applyResponseHeaders(state, &response);
                 try response.write(writer);
                 state.metricsRecord(cached.status);
                 logAccess(&ctx, request.method.toString(), "/v1/commands", cached.status, request.headers.get("user-agent") orelse "");
@@ -2152,7 +2171,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
                     .setConnection(keep_alive)
                     .setHeader(http.correlation.HEADER_NAME, correlation_id)
                     .setHeader("X-Proxy-Cache", if (lookup.is_stale) "STALE" else "HIT");
-                state.security_headers.apply(&response);
+                applyResponseHeaders(state, &response);
                 try response.write(writer);
                 state.metricsRecord(lookup.cached.status);
                 logAccess(&ctx, request.method.toString(), "/v1/commands", lookup.cached.status, request.headers.get("user-agent") orelse "");
@@ -2187,7 +2206,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
                         .setConnection(keep_alive)
                         .setHeader(http.correlation.HEADER_NAME, correlation_id)
                         .setHeader("X-Proxy-Cache", "HIT");
-                    state.security_headers.apply(&response);
+                    applyResponseHeaders(state, &response);
                     try response.write(writer);
                     state.metricsRecord(post_wait_lookup.cached.status);
                     logAccess(&ctx, request.method.toString(), "/v1/commands", post_wait_lookup.cached.status, request.headers.get("user-agent") orelse "");
@@ -2329,7 +2348,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
             _ = response.setHeader("Content-Disposition", cd);
         }
         if (cmd_comp.compressed) _ = response.setHeader("Content-Encoding", "gzip");
-        state.security_headers.apply(&response);
+        applyResponseHeaders(state, &response);
         try response.write(writer);
         state.metricsRecord(cmd_final_status);
 
@@ -2376,7 +2395,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
                     .setConnection(keep_alive)
                     .setHeader(http.correlation.HEADER_NAME, correlation_id)
                     .setHeader("X-Idempotent-Replayed", "true");
-                state.security_headers.apply(&response);
+                applyResponseHeaders(state, &response);
                 try response.write(writer);
                 state.metricsRecord(cached.status);
                 logAccess(&ctx, request.method.toString(), "/v1/chat", cached.status, request.headers.get("user-agent") orelse "");
@@ -2445,7 +2464,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
                     .setConnection(keep_alive)
                     .setHeader(http.correlation.HEADER_NAME, correlation_id)
                     .setHeader("X-Proxy-Cache", if (lookup.is_stale) "STALE" else "HIT");
-                state.security_headers.apply(&response);
+                applyResponseHeaders(state, &response);
                 try response.write(writer);
                 state.metricsRecord(lookup.cached.status);
                 logAccess(&ctx, request.method.toString(), "/v1/chat", lookup.cached.status, request.headers.get("user-agent") orelse "");
@@ -2480,7 +2499,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
                         .setConnection(keep_alive)
                         .setHeader(http.correlation.HEADER_NAME, correlation_id)
                         .setHeader("X-Proxy-Cache", "HIT");
-                    state.security_headers.apply(&response);
+                    applyResponseHeaders(state, &response);
                     try response.write(writer);
                     state.metricsRecord(post_wait_lookup.cached.status);
                     logAccess(&ctx, request.method.toString(), "/v1/chat", post_wait_lookup.cached.status, request.headers.get("user-agent") orelse "");
@@ -2613,7 +2632,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
             _ = response.setHeader("Content-Disposition", cd);
         }
         if (chat_comp.compressed) _ = response.setHeader("Content-Encoding", "gzip");
-        state.security_headers.apply(&response);
+        applyResponseHeaders(state, &response);
         try response.write(writer);
         state.metricsRecord(final_status);
 
@@ -2645,7 +2664,27 @@ const AuthResult = struct {
     token_hash: ?[]const u8,
 };
 
+fn applyResponseHeaders(state: *GatewayState, response: *http.Response) void {
+    state.security_headers.apply(response);
+    for (state.add_headers) |pair| {
+        _ = response.setHeader(pair.name, pair.value);
+    }
+}
+
 fn authorizeRequest(cfg: *const edge_config.EdgeConfig, headers: *const http.Headers) AuthResult {
+    if (cfg.jwt_secret.len > 0) {
+        if (http.auth.authorize(headers, null)) |token| {
+            const claims = http.jwt.validateHs256(std.heap.page_allocator, token, .{
+                .secret = cfg.jwt_secret,
+                .required_issuer = if (cfg.jwt_issuer.len > 0) cfg.jwt_issuer else null,
+                .required_audience = if (cfg.jwt_audience.len > 0) cfg.jwt_audience else null,
+            }) catch null;
+            if (claims != null) {
+                return .{ .ok = true, .token_hash = "jwt" };
+            }
+        } else |_| {}
+    }
+
     // Try bearer token auth first
     if (cfg.auth_token_hashes.len > 0) {
         if (http.auth.authorize(headers, null)) |token| {
@@ -2708,6 +2747,67 @@ fn shouldBypassProxyCache(headers: *const http.Headers) bool {
         }
     }
     return false;
+}
+
+fn isGeoBlocked(blocked: []const []const u8, country: ?[]const u8) bool {
+    const code = country orelse return false;
+    const trimmed = std.mem.trim(u8, code, " \t\r\n");
+    if (trimmed.len == 0) return false;
+    for (blocked) |entry| {
+        if (std.ascii.eqlIgnoreCase(entry, trimmed)) return true;
+    }
+    return false;
+}
+
+fn isProtectedAuthRequestRoute(path: []const u8) bool {
+    return http.api_router.matchRoute(path, 1, "/chat") or
+        http.api_router.matchRoute(path, 1, "/commands") or
+        http.api_router.matchRoute(path, 1, "/sessions") or
+        http.api_router.matchRoute(path, 1, "/cache/purge");
+}
+
+fn authorizeViaSubrequest(
+    allocator: std.mem.Allocator,
+    cfg: *const edge_config.EdgeConfig,
+    request: *const http.Request,
+    correlation_id: []const u8,
+    client_ip: []const u8,
+) bool {
+    if (cfg.auth_request_url.len == 0) return true;
+    const uri = std.Uri.parse(cfg.auth_request_url) catch return false;
+    var client = std.http.Client{ .allocator = allocator };
+    defer client.deinit();
+
+    var header_buf: [4 * 1024]u8 = undefined;
+    var headers_buf: [8]std.http.Header = undefined;
+    var header_count: usize = 0;
+    headers_buf[header_count] = .{ .name = "X-Original-Method", .value = request.method.toString() };
+    header_count += 1;
+    headers_buf[header_count] = .{ .name = "X-Original-URI", .value = request.uri.path };
+    header_count += 1;
+    headers_buf[header_count] = .{ .name = "X-Client-IP", .value = client_ip };
+    header_count += 1;
+    headers_buf[header_count] = .{ .name = http.correlation.HEADER_NAME, .value = correlation_id };
+    header_count += 1;
+    if (request.headers.get("authorization")) |authz| {
+        headers_buf[header_count] = .{ .name = "Authorization", .value = authz };
+        header_count += 1;
+    }
+    if (request.headers.get(http.session.SESSION_HEADER)) |session_token| {
+        headers_buf[header_count] = .{ .name = http.session.SESSION_HEADER, .value = session_token };
+        header_count += 1;
+    }
+
+    var req = client.open(.GET, uri, .{
+        .server_header_buffer = &header_buf,
+        .extra_headers = headers_buf[0..header_count],
+    }) catch return false;
+    defer req.deinit();
+    req.send() catch return false;
+    req.finish() catch return false;
+    req.wait() catch return false;
+    const status = @intFromEnum(req.response.status);
+    return status >= 200 and status < 300;
 }
 
 fn parseDeviceId(allocator: std.mem.Allocator, body: []const u8) ![]const u8 {
@@ -3613,7 +3713,7 @@ fn sendApiError(allocator: std.mem.Allocator, writer: anytype, status: http.Stat
     if (request_id) |rid| {
         _ = response.setHeader(http.correlation.HEADER_NAME, rid);
     }
-    state.security_headers.apply(&response);
+    applyResponseHeaders(state, &response);
     try response.write(writer);
     state.metricsRecord(@intFromEnum(status));
     state.metricsRecordErrorCode(code);
@@ -3882,6 +3982,14 @@ test "resolveProxyTarget handles absolute and relative proxy_pass" {
         .proxy_cache_stale_while_revalidate_seconds = 0,
         .proxy_cache_lock_timeout_ms = 250,
         .proxy_cache_manager_interval_ms = 30_000,
+        .geo_blocked_countries = &[_][]const u8{},
+        .geo_country_header = "CF-IPCountry",
+        .auth_request_url = "",
+        .auth_request_timeout_ms = 2000,
+        .jwt_secret = "",
+        .jwt_issuer = "",
+        .jwt_audience = "",
+        .add_headers = &[_]edge_config.EdgeConfig.HeaderPair{},
         .session_ttl_seconds = 0,
         .session_max = 0,
         .access_control_rules = "",
@@ -3985,6 +4093,14 @@ test "authorizeRequest accepts valid hash" {
         .proxy_cache_stale_while_revalidate_seconds = 0,
         .proxy_cache_lock_timeout_ms = 250,
         .proxy_cache_manager_interval_ms = 30_000,
+        .geo_blocked_countries = &[_][]const u8{},
+        .geo_country_header = "CF-IPCountry",
+        .auth_request_url = "",
+        .auth_request_timeout_ms = 2000,
+        .jwt_secret = "",
+        .jwt_issuer = "",
+        .jwt_audience = "",
+        .add_headers = &[_]edge_config.EdgeConfig.HeaderPair{},
         .session_ttl_seconds = 0,
         .session_max = 0,
         .access_control_rules = "",

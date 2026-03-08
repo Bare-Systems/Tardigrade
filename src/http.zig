@@ -28,6 +28,7 @@ pub const command = @import("http/command.zig");
 pub const access_control = @import("http/access_control.zig");
 pub const request_limits = @import("http/request_limits.zig");
 pub const basic_auth = @import("http/basic_auth.zig");
+pub const jwt = @import("http/jwt.zig");
 pub const logger = @import("http/logger.zig");
 pub const cache_control = @import("http/cache_control.zig");
 pub const compression = @import("http/compression.zig");

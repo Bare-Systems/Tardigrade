@@ -34,6 +34,11 @@ pub const ProxyProtocolMode = enum {
 };
 
 pub const EdgeConfig = struct {
+    pub const HeaderPair = struct {
+        name: []const u8,
+        value: []const u8,
+    };
+
     listen_host: []const u8,
     listen_port: u16,
     tls_cert_path: []const u8,
@@ -87,6 +92,22 @@ pub const EdgeConfig = struct {
     proxy_cache_lock_timeout_ms: u32,
     /// Proxy cache manager maintenance interval in milliseconds.
     proxy_cache_manager_interval_ms: u64,
+    /// Optional comma-separated ISO country codes to block (requires external country header input).
+    geo_blocked_countries: [][]const u8,
+    /// Header containing country code provided by external edge/CDN.
+    geo_country_header: []const u8,
+    /// Optional auth subrequest URL; non-2xx denies protected routes.
+    auth_request_url: []const u8,
+    /// Timeout for auth subrequest in milliseconds.
+    auth_request_timeout_ms: u32,
+    /// Optional JWT shared secret for HS256 bearer validation.
+    jwt_secret: []const u8,
+    /// Optional JWT issuer constraint.
+    jwt_issuer: []const u8,
+    /// Optional JWT audience constraint.
+    jwt_audience: []const u8,
+    /// Additional response headers from add_header directive.
+    add_headers: []HeaderPair,
     /// Session idle TTL in seconds (0 = sessions disabled).
     session_ttl_seconds: u32,
     /// Maximum concurrent sessions (0 = unlimited).
@@ -182,6 +203,18 @@ pub const EdgeConfig = struct {
         allocator.free(self.access_control_rules);
         allocator.free(self.proxy_cache_path);
         allocator.free(self.proxy_cache_key_template);
+        for (self.geo_blocked_countries) |c| allocator.free(c);
+        allocator.free(self.geo_blocked_countries);
+        allocator.free(self.geo_country_header);
+        allocator.free(self.auth_request_url);
+        allocator.free(self.jwt_secret);
+        allocator.free(self.jwt_issuer);
+        allocator.free(self.jwt_audience);
+        for (self.add_headers) |h| {
+            allocator.free(h.name);
+            allocator.free(h.value);
+        }
+        allocator.free(self.add_headers);
         for (self.basic_auth_hashes) |h| allocator.free(h);
         allocator.free(self.basic_auth_hashes);
         allocator.free(self.upstream_active_health_path);
@@ -336,6 +369,41 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     const proxy_cache_manager_interval_ms_str = envOrDefault(allocator, "TARDIGRADE_PROXY_CACHE_MANAGER_INTERVAL_MS", "30000") catch unreachable;
     defer allocator.free(proxy_cache_manager_interval_ms_str);
     const proxy_cache_manager_interval_ms = std.fmt.parseInt(u64, proxy_cache_manager_interval_ms_str, 10) catch 30_000;
+    const geo_blocked_countries_raw = envOrDefault(allocator, "TARDIGRADE_GEO_BLOCKED_COUNTRIES", "") catch unreachable;
+    defer allocator.free(geo_blocked_countries_raw);
+    const geo_blocked_countries = try parseCsvValues(allocator, geo_blocked_countries_raw);
+    errdefer {
+        for (geo_blocked_countries) |c| allocator.free(c);
+        allocator.free(geo_blocked_countries);
+    }
+    for (geo_blocked_countries) |c| {
+        for (c) |ch| {
+            if (!std.ascii.isAlphabetic(ch)) return error.InvalidGeoCountryCode;
+        }
+    }
+    const geo_country_header = envOrDefault(allocator, "TARDIGRADE_GEO_COUNTRY_HEADER", "CF-IPCountry") catch unreachable;
+    errdefer allocator.free(geo_country_header);
+    const auth_request_url = envOrDefault(allocator, "TARDIGRADE_AUTH_REQUEST_URL", "") catch unreachable;
+    errdefer allocator.free(auth_request_url);
+    const auth_request_timeout_ms_str = envOrDefault(allocator, "TARDIGRADE_AUTH_REQUEST_TIMEOUT_MS", "2000") catch unreachable;
+    defer allocator.free(auth_request_timeout_ms_str);
+    const auth_request_timeout_ms = std.fmt.parseInt(u32, auth_request_timeout_ms_str, 10) catch 2000;
+    const jwt_secret = envOrDefault(allocator, "TARDIGRADE_JWT_SECRET", "") catch unreachable;
+    errdefer allocator.free(jwt_secret);
+    const jwt_issuer = envOrDefault(allocator, "TARDIGRADE_JWT_ISSUER", "") catch unreachable;
+    errdefer allocator.free(jwt_issuer);
+    const jwt_audience = envOrDefault(allocator, "TARDIGRADE_JWT_AUDIENCE", "") catch unreachable;
+    errdefer allocator.free(jwt_audience);
+    const add_headers_raw = envOrDefault(allocator, "TARDIGRADE_ADD_HEADERS", "") catch unreachable;
+    defer allocator.free(add_headers_raw);
+    const add_headers = try parseHeaderPairs(allocator, add_headers_raw);
+    errdefer {
+        for (add_headers) |h| {
+            allocator.free(h.name);
+            allocator.free(h.value);
+        }
+        allocator.free(add_headers);
+    }
 
     const session_ttl_str = envOrDefault(allocator, "TARDIGRADE_SESSION_TTL", "3600") catch unreachable;
     defer allocator.free(session_ttl_str);
@@ -416,7 +484,12 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
 
     const max_conn_ip_str = envOrDefault(allocator, "TARDIGRADE_MAX_CONNECTIONS_PER_IP", "0") catch unreachable;
     defer allocator.free(max_conn_ip_str);
-    const max_connections_per_ip = std.fmt.parseInt(u32, max_conn_ip_str, 10) catch 0;
+    const limit_conn_ip_str = envOrDefault(allocator, "TARDIGRADE_LIMIT_CONN_PER_IP", "") catch unreachable;
+    defer allocator.free(limit_conn_ip_str);
+    const max_connections_per_ip = if (limit_conn_ip_str.len > 0)
+        (std.fmt.parseInt(u32, limit_conn_ip_str, 10) catch 0)
+    else
+        (std.fmt.parseInt(u32, max_conn_ip_str, 10) catch 0);
 
     const max_active_conn_str = envOrDefault(allocator, "TARDIGRADE_MAX_ACTIVE_CONNECTIONS", "0") catch unreachable;
     defer allocator.free(max_active_conn_str);
@@ -521,6 +594,14 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .proxy_cache_stale_while_revalidate_seconds = proxy_cache_stale_while_revalidate_seconds,
         .proxy_cache_lock_timeout_ms = proxy_cache_lock_timeout_ms,
         .proxy_cache_manager_interval_ms = proxy_cache_manager_interval_ms,
+        .geo_blocked_countries = geo_blocked_countries,
+        .geo_country_header = geo_country_header,
+        .auth_request_url = auth_request_url,
+        .auth_request_timeout_ms = auth_request_timeout_ms,
+        .jwt_secret = jwt_secret,
+        .jwt_issuer = jwt_issuer,
+        .jwt_audience = jwt_audience,
+        .add_headers = add_headers,
         .session_ttl_seconds = session_ttl_seconds,
         .session_max = session_max,
         .access_control_rules = access_control_rules,
@@ -624,6 +705,33 @@ fn parseCsvU32Values(allocator: std.mem.Allocator, raw: []const u8) ![]u32 {
         try out.append(value);
     }
 
+    return out.toOwnedSlice();
+}
+
+fn parseHeaderPairs(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeConfig.HeaderPair {
+    var out = std.ArrayList(EdgeConfig.HeaderPair).init(allocator);
+    errdefer {
+        for (out.items) |pair| {
+            allocator.free(pair.name);
+            allocator.free(pair.value);
+        }
+        out.deinit();
+    }
+
+    var it = std.mem.splitScalar(u8, raw, '|');
+    while (it.next()) |part| {
+        const trimmed = std.mem.trim(u8, part, " \t\r\n");
+        if (trimmed.len == 0) continue;
+        const colon = std.mem.indexOfScalar(u8, trimmed, ':') orelse return error.InvalidAddHeaderFormat;
+        const name_raw = std.mem.trim(u8, trimmed[0..colon], " \t\r\n");
+        const value_raw = std.mem.trim(u8, trimmed[colon + 1 ..], " \t\r\n");
+        if (name_raw.len == 0) return error.InvalidAddHeaderFormat;
+        const name = try allocator.dupe(u8, name_raw);
+        errdefer allocator.free(name);
+        const value = try allocator.dupe(u8, value_raw);
+        errdefer allocator.free(value);
+        try out.append(.{ .name = name, .value = value });
+    }
     return out.toOwnedSlice();
 }
 

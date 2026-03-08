@@ -355,25 +355,29 @@ Resolved: Cache-Control and Expires headers implemented in `src/http/cache_contr
 ### 6.1 Access Control
 - [x] allow/deny directives (IP-based)
 - [x] CIDR notation support
-- [ ] Geo-based blocking (via external data)
+- [x] Geo-based blocking (via external data)
 
 Resolved: IP access control implemented in `src/http/access_control.zig`. Supports allow/deny rules with CIDR notation (IPv4 and IPv6). First-match-wins evaluation order. Configurable via `TARDIGRADE_ACCESS_CONTROL` env var (e.g. `"allow 10.0.0.0/8, deny 0.0.0.0/0"`). Applied before rate limiting in the gateway pipeline.
+Resolved (incremental): added geo-based blocking using external country header data via `TARDIGRADE_GEO_BLOCKED_COUNTRIES` and `TARDIGRADE_GEO_COUNTRY_HEADER`.
 
 ### 6.2 Rate Limiting
 - [x] limit_req (request rate)
-- [ ] limit_conn (connection count)
+- [x] limit_conn (connection count)
 - [x] Configurable zones and keys
 - [x] Burst handling
 - [x] Custom rejection responses
 
 Resolved: Token-bucket rate limiter implemented in `src/http/rate_limiter.zig`. Per-IP tracking with configurable RPS and burst. Returns 429 with stable API error envelope.
+Resolved (incremental): limit-conn behavior is enforced via active per-IP/global connection caps, now including explicit `TARDIGRADE_LIMIT_CONN_PER_IP` alias support.
 
 ### 6.3 Authentication
 - [x] HTTP Basic Auth
-- [ ] Auth request (subrequest-based)
-- [ ] JWT validation (optional module)
+- [x] Auth request (subrequest-based)
+- [x] JWT validation (optional module)
 
 Resolved: HTTP Basic Auth implemented in `src/http/basic_auth.zig`. Parses `Authorization: Basic <base64>` headers, decodes credentials, and verifies against SHA-256 hashes of "user:password" strings. Configured via `TARDIGRADE_BASIC_AUTH_HASHES` env var. Integrated as fallback auth method after bearer token in the gateway pipeline.
+Resolved (incremental): added optional auth subrequest validation (`TARDIGRADE_AUTH_REQUEST_URL`, `TARDIGRADE_AUTH_REQUEST_TIMEOUT_MS`) for protected API routes.
+Resolved (incremental): added JWT HS256 bearer validation module (`src/http/jwt.zig`) with issuer/audience constraints via `TARDIGRADE_JWT_SECRET`, `TARDIGRADE_JWT_ISSUER`, `TARDIGRADE_JWT_AUDIENCE`.
 
 ### 6.4 Request Validation
 - [x] Request body size limits (client_max_body_size)
@@ -385,13 +389,14 @@ Resolved: Request validation limits enforced in gateway pipeline via `src/http/r
 Resolved (incremental): socket-level timeout enforcement is now active in `src/edge_gateway.zig`. Accepted client sockets apply configured header timeout (`TARDIGRADE_HEADER_TIMEOUT_MS`) and upstream proxy sockets apply `TARDIGRADE_UPSTREAM_TIMEOUT_MS` for send/receive operations.
 
 ### 6.5 Security Headers
-- [ ] add_header directive
+- [x] add_header directive
 - [x] X-Frame-Options
 - [x] X-Content-Type-Options
 - [x] Content-Security-Policy
 - [x] Strict-Transport-Security
 
 Resolved: Security headers middleware implemented in `src/http/security_headers.zig` with default secure and API presets. Also adds Referrer-Policy, Permissions-Policy, and X-XSS-Protection.
+Resolved (incremental): added configurable `add_header` support through `TARDIGRADE_ADD_HEADERS` (pipe-delimited `Name: Value` pairs) applied to all gateway responses.
 
 ### 6.6 Policy Engine (NEW)
 - [ ] route-level policy evaluation

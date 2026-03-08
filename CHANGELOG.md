@@ -12,6 +12,12 @@
   - Added `TARDIGRADE_PROXY_CACHE_PATH` disk-backed cache tier, stale-serving controls, cache-lock timeout, and cache-manager interval configuration.
   - Added cache bypass controls (`X-Proxy-Cache-Bypass`, cache-control pragma/no-cache directives) and authenticated cache purge endpoint `POST /v1/cache/purge`.
   - Added stale cache responses (`X-Proxy-Cache: STALE`) with detached background refresh for chat/command routes plus periodic cache-manager expiration cleanup.
+- Phase 6 security completion increment (`src/edge_config.zig`, `src/edge_gateway.zig`, `src/http/jwt.zig`):
+  - Added geo blocking via external country header data (`TARDIGRADE_GEO_BLOCKED_COUNTRIES`, `TARDIGRADE_GEO_COUNTRY_HEADER`).
+  - Added explicit `limit_conn` alias env support (`TARDIGRADE_LIMIT_CONN_PER_IP`) on top of existing per-IP/global connection enforcement.
+  - Added auth subrequest checks (`TARDIGRADE_AUTH_REQUEST_URL`, `TARDIGRADE_AUTH_REQUEST_TIMEOUT_MS`) for protected API routes.
+  - Added optional JWT HS256 bearer validation with issuer/audience constraints (`TARDIGRADE_JWT_SECRET`, `TARDIGRADE_JWT_ISSUER`, `TARDIGRADE_JWT_AUDIENCE`).
+  - Added configurable `add_header` directive support via `TARDIGRADE_ADD_HEADERS` applied to all gateway responses.
 
 ## [0.27.0] - 2026-03-xx
 

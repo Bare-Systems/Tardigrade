@@ -45,6 +45,8 @@ chmod +x tardigrade
 Tardigrade now supports an edge-gateway path for BearClaw:
 - `GET /health`
 - `POST /v1/chat` (Bearer auth required)
+- `POST /v1/commands` (structured command envelope; supports async `202` mode with `command_id`)
+- `GET /v1/commands/status?command_id=...` (command lifecycle polling)
 - `GET /v1/ws/chat` and `GET /v1/ws/commands` (WebSocket upgrade, authenticated)
 - `GET /v1/events/stream` and `POST /v1/events/publish` (SSE topic stream/publish, authenticated)
 
@@ -192,6 +194,7 @@ Device/Policy endpoints:
 - `POST /v1/devices/register` (authenticated; body `{ "device_id": "...", "public_key": "..." }`)
 - `POST /v1/sessions/refresh` (requires `X-Session-Token`; rotates session token and returns ttl metadata)
 - Device proof headers (when enabled): `X-Device-ID`, `X-Device-Timestamp`, `X-Device-Signature`
+- Async command payload extension: `{ \"command_id\": \"optional\", \"async\": true }`
 
 Hot reload (Phase 3.4 foundation):
 - Send `SIGHUP` to trigger zero-downtime config reload.

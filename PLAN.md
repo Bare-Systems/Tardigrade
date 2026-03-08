@@ -683,9 +683,13 @@ Resolved (incremental): request-level upstream timeout budgets added via `TARDIG
 This phase enables Tardigrade to function as the BearClaw gateway.
 
 ### 14.1 Command Protocol
-- [ ] structured command envelopes
-- [ ] command lifecycle tracking
-- [ ] async command completion
+- [x] structured command envelopes
+- [x] command lifecycle tracking
+- [x] async command completion
+
+Resolved (incremental): command envelope parsing now supports explicit `command_id` and async execution intent (`async`) in `src/http/command.zig`, and upstream command envelopes include `command_id` context.
+Resolved (incremental): added in-memory command lifecycle tracking in `src/edge_gateway.zig` with statuses `pending|running|completed|failed` and lifecycle metadata.
+Resolved (incremental): added asynchronous command execution mode for `POST /v1/commands` returning `202 Accepted` plus lifecycle polling endpoint `GET /v1/commands/status?command_id=...`.
 
 ### 14.2 Stream Multiplexing
 - [ ] multiplex multiple streams

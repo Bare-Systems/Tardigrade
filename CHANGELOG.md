@@ -48,6 +48,10 @@
   - Added SIGUSR2 binary-upgrade signaling and replacement-master spawn path (`TARDIGRADE_BINARY_UPGRADE`).
   - Added worker recycle timer and Linux CPU affinity pinning controls (`TARDIGRADE_WORKER_RECYCLE_SECONDS`, `TARDIGRADE_WORKER_CPU_AFFINITY`).
   - Added privilege hardening controls: strict unprivileged-mode enforcement and optional chroot after bind (`TARDIGRADE_REQUIRE_UNPRIVILEGED_USER`, `TARDIGRADE_CHROOT_DIR`).
+- Phase 14.1 command protocol completion increment (`src/http/command.zig`, `src/edge_gateway.zig`):
+  - Added command envelope support for `command_id` and `async` mode.
+  - Added in-memory command lifecycle tracking (`pending`, `running`, `completed`, `failed`) keyed by `command_id`.
+  - Added async command submission (`POST /v1/commands` -> `202 Accepted`) and lifecycle polling endpoint (`GET /v1/commands/status?command_id=...`).
 
 ## [0.28.0] - 2026-03-07
 

@@ -45,10 +45,15 @@ pub const Command = struct {
     params_raw: []const u8,
     /// Caller-supplied idempotency key (inline in envelope).
     idempotency_key: ?[]const u8,
+    /// Optional caller-supplied command id for lifecycle tracking.
+    command_id: ?[]const u8,
+    /// Whether command should execute asynchronously.
+    async_execute: bool,
 
     pub fn deinit(self: *Command, allocator: Allocator) void {
         allocator.free(self.params_raw);
         if (self.idempotency_key) |k| allocator.free(k);
+        if (self.command_id) |id| allocator.free(id);
         self.* = undefined;
     }
 };
@@ -70,7 +75,9 @@ pub const MAX_PARAMS_SIZE: usize = 128 * 1024;
 /// {
 ///   "command": "chat",
 ///   "params": { ... },
-///   "idempotency_key": "optional-key"
+///   "idempotency_key": "optional-key",
+///   "command_id": "optional-id",
+///   "async": false
 /// }
 /// ```
 pub fn parseCommand(allocator: Allocator, body: []const u8) !Command {
@@ -108,10 +115,23 @@ pub fn parseCommand(allocator: Allocator, body: []const u8) !Command {
         }
     }
 
+    var command_id: ?[]const u8 = null;
+    if (obj.get("command_id")) |cid_val| {
+        if (cid_val == .string and cid_val.string.len > 0 and cid_val.string.len <= 128) {
+            command_id = try allocator.dupe(u8, cid_val.string);
+        }
+    }
+    const async_execute = if (obj.get("async")) |async_val|
+        (async_val == .bool and async_val.bool)
+    else
+        false;
+
     return .{
         .command_type = command_type,
         .params_raw = params_raw,
         .idempotency_key = idempotency_key,
+        .command_id = command_id,
+        .async_execute = async_execute,
     };
 }
 
@@ -121,6 +141,7 @@ pub fn buildUpstreamEnvelope(
     allocator: Allocator,
     command_type: CommandType,
     params_raw: []const u8,
+    command_id: []const u8,
     correlation_id: []const u8,
     identity: []const u8,
     client_ip: []const u8,
@@ -133,9 +154,10 @@ pub fn buildUpstreamEnvelope(
     defer allocator.free(version_str);
 
     return std.fmt.allocPrint(allocator,
-        \\{{"command":"{s}","params":{s},"context":{{"correlation_id":"{s}","identity":"{s}","client_ip":"{s}","api_version":{s},"timestamp":{d}}}}}
+        \\{{"command":"{s}","command_id":"{s}","params":{s},"context":{{"correlation_id":"{s}","identity":"{s}","client_ip":"{s}","api_version":{s},"timestamp":{d}}}}}
     , .{
         command_type.toString(),
+        command_id,
         params_raw,
         correlation_id,
         identity,
@@ -192,6 +214,8 @@ test "parseCommand valid chat" {
 
     try std.testing.expectEqual(CommandType.chat, cmd.command_type);
     try std.testing.expect(cmd.idempotency_key == null);
+    try std.testing.expect(cmd.command_id == null);
+    try std.testing.expect(!cmd.async_execute);
     // params_raw should contain the message
     try std.testing.expect(std.mem.indexOf(u8, cmd.params_raw, "hello") != null);
 }
@@ -203,6 +227,14 @@ test "parseCommand with idempotency key" {
 
     try std.testing.expectEqual(CommandType.tool_run, cmd.command_type);
     try std.testing.expectEqualStrings("abc-123", cmd.idempotency_key.?);
+}
+
+test "parseCommand with command_id and async flag" {
+    const allocator = std.testing.allocator;
+    var cmd = try parseCommand(allocator, "{\"command\":\"status\",\"params\":{},\"command_id\":\"cmd-1\",\"async\":true}");
+    defer cmd.deinit(allocator);
+    try std.testing.expectEqualStrings("cmd-1", cmd.command_id.?);
+    try std.testing.expect(cmd.async_execute);
 }
 
 test "parseCommand missing command field" {
@@ -236,6 +268,7 @@ test "buildUpstreamEnvelope produces valid JSON" {
         allocator,
         .chat,
         "{\"message\":\"hi\"}",
+        "cmd-123",
         "corr-123",
         "user-abc",
         "10.0.0.1",
@@ -249,6 +282,7 @@ test "buildUpstreamEnvelope produces valid JSON" {
 
     const obj = parsed.value.object;
     try std.testing.expectEqualStrings("chat", obj.get("command").?.string);
+    try std.testing.expectEqualStrings("cmd-123", obj.get("command_id").?.string);
 
     const ctx = obj.get("context").?.object;
     try std.testing.expectEqualStrings("corr-123", ctx.get("correlation_id").?.string);
@@ -263,6 +297,7 @@ test "buildUpstreamEnvelope null api_version" {
         allocator,
         .status,
         "{}",
+        "cmd-456",
         "corr-456",
         "anon",
         "127.0.0.1",

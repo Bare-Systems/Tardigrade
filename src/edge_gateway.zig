@@ -10,7 +10,7 @@ const ADMIN_ROUTES_JSON =
     "{\"routes\":[" ++
     "\"/health\",\"/metrics\",\"/metrics/prometheus\"," ++
     "\"/admin/routes\",\"/admin/connections\",\"/admin/streams\",\"/admin/upstreams\",\"/admin/certs\",\"/admin/auth-registry\"," ++
-    "\"/v1/chat\",\"/v1/commands\",\"/v1/sessions\",\"/v1/cache/purge\"," ++
+    "\"/v1/chat\",\"/v1/commands\",\"/v1/commands/status\",\"/v1/sessions\",\"/v1/cache/purge\"," ++
     "\"/v1/ws/chat\",\"/v1/ws/commands\",\"/v1/events/stream\",\"/v1/events/publish\"," ++
     "\"/v1/subrequest\",\"/v1/backend/fastcgi\",\"/v1/backend/uwsgi\",\"/v1/backend/scgi\",\"/v1/backend/grpc\",\"/v1/backend/memcached\"," ++
     "\"/v1/mail/smtp\",\"/v1/mail/imap\",\"/v1/mail/pop3\",\"/v1/stream/tcp\",\"/v1/stream/udp\"" ++
@@ -73,6 +73,26 @@ const UpstreamPoolView = struct {
     backup_urls: []const []const u8,
 };
 
+const CommandLifecycleStatus = enum {
+    pending,
+    running,
+    completed,
+    failed,
+};
+
+const CommandLifecycleEntry = struct {
+    status: CommandLifecycleStatus,
+    command_type: []u8,
+    correlation_id: []u8,
+    identity: []u8,
+    created_ms: i64,
+    updated_ms: i64,
+    response_status: u16,
+    response_body: []u8,
+    response_content_type: []u8,
+    error_message: []u8,
+};
+
 /// Persistent gateway state shared across connections.
 const GatewayState = struct {
     allocator: std.mem.Allocator,
@@ -112,6 +132,7 @@ const GatewayState = struct {
     active_connections_by_ip: std.StringHashMap(u32),
     active_fds: std.AutoHashMap(std.posix.fd_t, void),
     fd_to_ip: std.AutoHashMap(std.posix.fd_t, []u8),
+    command_lifecycle: std.StringHashMap(CommandLifecycleEntry),
 
     fn deinit(self: *GatewayState) void {
         if (self.rate_limiter) |*rl| rl.deinit();
@@ -140,6 +161,17 @@ const GatewayState = struct {
         var fd_it = self.fd_to_ip.iterator();
         while (fd_it.next()) |entry| self.allocator.free(entry.value_ptr.*);
         self.fd_to_ip.deinit();
+        var cmd_it = self.command_lifecycle.iterator();
+        while (cmd_it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.value_ptr.command_type);
+            self.allocator.free(entry.value_ptr.correlation_id);
+            self.allocator.free(entry.value_ptr.identity);
+            self.allocator.free(entry.value_ptr.response_body);
+            self.allocator.free(entry.value_ptr.response_content_type);
+            self.allocator.free(entry.value_ptr.error_message);
+        }
+        self.command_lifecycle.deinit();
     }
 
     fn tryAcquireConnectionSlot(self: *GatewayState, fd: std.posix.fd_t, ip_key: []const u8) !ConnectionSlotResult {
@@ -421,6 +453,89 @@ const GatewayState = struct {
         const new_token = try self.session_store.?.create(existing.identity, client_ip, existing.device_id);
         _ = self.session_store.?.revoke(token);
         return try allocator.dupe(u8, new_token);
+    }
+
+    fn commandLifecycleCreate(self: *GatewayState, command_id: []const u8, command_type: []const u8, correlation_id: []const u8, identity: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const now = std.time.milliTimestamp();
+        const owned_id = try self.allocator.dupe(u8, command_id);
+        errdefer self.allocator.free(owned_id);
+        const owned_cmd = try self.allocator.dupe(u8, command_type);
+        errdefer self.allocator.free(owned_cmd);
+        const owned_corr = try self.allocator.dupe(u8, correlation_id);
+        errdefer self.allocator.free(owned_corr);
+        const owned_ident = try self.allocator.dupe(u8, identity);
+        errdefer self.allocator.free(owned_ident);
+        const entry = CommandLifecycleEntry{
+            .status = .pending,
+            .command_type = owned_cmd,
+            .correlation_id = owned_corr,
+            .identity = owned_ident,
+            .created_ms = now,
+            .updated_ms = now,
+            .response_status = 0,
+            .response_body = try self.allocator.dupe(u8, ""),
+            .response_content_type = try self.allocator.dupe(u8, ""),
+            .error_message = try self.allocator.dupe(u8, ""),
+        };
+        try self.command_lifecycle.put(owned_id, entry);
+    }
+
+    fn commandLifecycleSetRunning(self: *GatewayState, command_id: []const u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.command_lifecycle.getPtr(command_id)) |entry| {
+            entry.status = .running;
+            entry.updated_ms = std.time.milliTimestamp();
+        }
+    }
+
+    fn commandLifecycleSetCompleted(self: *GatewayState, command_id: []const u8, status: u16, body: []const u8, content_type: []const u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.command_lifecycle.getPtr(command_id)) |entry| {
+            self.allocator.free(entry.response_body);
+            self.allocator.free(entry.response_content_type);
+            self.allocator.free(entry.error_message);
+            entry.status = .completed;
+            entry.updated_ms = std.time.milliTimestamp();
+            entry.response_status = status;
+            entry.response_body = self.allocator.dupe(u8, body) catch self.allocator.dupe(u8, "") catch return;
+            entry.response_content_type = self.allocator.dupe(u8, content_type) catch self.allocator.dupe(u8, "") catch return;
+            entry.error_message = self.allocator.dupe(u8, "") catch self.allocator.dupe(u8, "") catch return;
+        }
+    }
+
+    fn commandLifecycleSetFailed(self: *GatewayState, command_id: []const u8, message: []const u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.command_lifecycle.getPtr(command_id)) |entry| {
+            self.allocator.free(entry.error_message);
+            entry.status = .failed;
+            entry.updated_ms = std.time.milliTimestamp();
+            entry.error_message = self.allocator.dupe(u8, message) catch self.allocator.dupe(u8, "command_failed") catch return;
+        }
+    }
+
+    fn commandLifecycleSnapshotJson(self: *GatewayState, allocator: std.mem.Allocator, command_id: []const u8) ?[]const u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const entry = self.command_lifecycle.get(command_id) orelse return null;
+        const status_name = @tagName(entry.status);
+        return std.fmt.allocPrint(allocator, "{{\"command_id\":\"{s}\",\"status\":\"{s}\",\"command\":\"{s}\",\"correlation_id\":\"{s}\",\"identity\":\"{s}\",\"created_ms\":{d},\"updated_ms\":{d},\"response_status\":{d},\"response_content_type\":\"{s}\",\"response_body\":{s},\"error\":\"{s}\"}}", .{
+            command_id,
+            status_name,
+            entry.command_type,
+            entry.correlation_id,
+            entry.identity,
+            entry.created_ms,
+            entry.updated_ms,
+            entry.response_status,
+            entry.response_content_type,
+            if (entry.response_body.len > 0 and (std.mem.startsWith(u8, entry.response_body, "{") or std.mem.startsWith(u8, entry.response_body, "["))) entry.response_body else "\"\"",
+            entry.error_message,
+        }) catch null;
     }
 
     fn circuitTryAcquire(self: *GatewayState) bool {
@@ -1124,6 +1239,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         .active_connections_by_ip = std.StringHashMap(u32).init(state_allocator),
         .active_fds = std.AutoHashMap(std.posix.fd_t, void).init(state_allocator),
         .fd_to_ip = std.AutoHashMap(std.posix.fd_t, []u8).init(state_allocator),
+        .command_lifecycle = std.StringHashMap(CommandLifecycleEntry).init(state_allocator),
     };
     defer state.deinit();
     http.access_log.init(state_allocator, .{
@@ -3365,6 +3481,42 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         return;
     }
 
+    // --- GET /v1/commands/status?command_id=... ---
+    if (request.method == .GET and http.api_router.matchRoute(request.uri.path, 1, "/commands/status")) {
+        var authenticated = false;
+        const auth_result = authorizeRequest(cfg, &request.headers);
+        if (auth_result.ok) authenticated = true;
+        if (!authenticated) {
+            if (http.session.fromHeaders(&request.headers)) |session_token| {
+                if (state.validateSessionIdentity(allocator, session_token) != null) authenticated = true;
+            }
+        }
+        if (!authenticated) {
+            try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, keep_alive, state);
+            logAccess(&ctx, request.method.toString(), "/v1/commands/status", 401, request.headers.get("user-agent") orelse "");
+            return;
+        }
+        const cmd_id = parseQueryParam(request.uri.query orelse "", "command_id") orelse {
+            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Missing command_id", correlation_id, keep_alive, state);
+            logAccess(&ctx, request.method.toString(), "/v1/commands/status", 400, request.headers.get("user-agent") orelse "");
+            return;
+        };
+        const snapshot = state.commandLifecycleSnapshotJson(allocator, cmd_id) orelse {
+            try sendApiError(allocator, writer, .not_found, "invalid_request", "Unknown command_id", correlation_id, keep_alive, state);
+            logAccess(&ctx, request.method.toString(), "/v1/commands/status", 404, request.headers.get("user-agent") orelse "");
+            return;
+        };
+        defer allocator.free(snapshot);
+        var response = http.Response.json(allocator, snapshot);
+        defer response.deinit();
+        _ = response.setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
+        applyResponseHeaders(state, &response);
+        try response.write(writer);
+        state.metricsRecord(200);
+        logAccess(&ctx, request.method.toString(), "/v1/commands/status", 200, request.headers.get("user-agent") orelse "");
+        return;
+    }
+
     // --- POST /v1/commands (structured command routing) ---
     if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/commands")) {
         // --- Auth (bearer token or session token) ---
@@ -3415,6 +3567,11 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
             return;
         };
         defer cmd.deinit(allocator);
+        const command_id = if (cmd.command_id) |cid|
+            try allocator.dupe(u8, cid)
+        else
+            try generateCommandId(allocator);
+        defer allocator.free(command_id);
 
         // --- Idempotency (inline key overrides header) ---
         const effective_idem_key = cmd.idempotency_key orelse ctx.idempotency_key;
@@ -3444,6 +3601,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
             allocator,
             cmd.command_type,
             cmd.params_raw,
+            command_id,
             correlation_id,
             ctx.identity orelse "-",
             client_ip,
@@ -3455,6 +3613,42 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         };
         defer allocator.free(envelope);
         const upstream_path = cmd.command_type.upstreamPath();
+
+        if (cmd.async_execute) {
+            state.commandLifecycleCreate(command_id, cmd.command_type.toString(), correlation_id, ctx.identity orelse "-") catch {
+                try sendApiError(allocator, writer, .internal_server_error, "internal_error", "Failed to initialize command lifecycle", correlation_id, keep_alive, state);
+                logAccess(&ctx, request.method.toString(), "/v1/commands", 500, request.headers.get("user-agent") orelse "");
+                return;
+            };
+            spawnAsyncCommandExecution(
+                allocator,
+                cfg,
+                state,
+                command_id,
+                cmd.command_type.toString(),
+                upstream_path,
+                envelope,
+                correlation_id,
+                client_ip,
+                ctx.identity,
+                ctx.api_version,
+                request.headers.get("host"),
+                request.headers.get("x-forwarded-for"),
+            );
+            const accepted_body = try std.fmt.allocPrint(allocator, "{{\"command_id\":\"{s}\",\"status\":\"pending\",\"status_url\":\"/v1/commands/status?command_id={s}\"}}", .{ command_id, command_id });
+            defer allocator.free(accepted_body);
+            var accepted = http.Response.json(allocator, accepted_body);
+            defer accepted.deinit();
+            _ = accepted.setStatus(.accepted).setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
+            applyResponseHeaders(state, &accepted);
+            try accepted.write(writer);
+            state.metricsRecord(202);
+            logAccess(&ctx, request.method.toString(), "/v1/commands", 202, request.headers.get("user-agent") orelse "");
+            return;
+        }
+
+        state.commandLifecycleCreate(command_id, cmd.command_type.toString(), correlation_id, ctx.identity orelse "-") catch {};
+        state.commandLifecycleSetRunning(command_id);
 
         const proxy_cache_bypass = shouldBypassProxyCache(&request.headers) or effective_idem_key != null;
         const proxy_cache_key = if (cfg.proxy_cache_ttl_seconds > 0 and !proxy_cache_bypass)
@@ -3530,6 +3724,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         if (!state.circuitTryAcquire()) {
             state.logger.warn(null, "circuit breaker open, rejecting /v1/commands", .{});
             try sendApiError(allocator, writer, .service_unavailable, "upstream_unavailable", "Upstream unavailable", correlation_id, keep_alive, state);
+            state.commandLifecycleSetFailed(command_id, "upstream_unavailable");
             const cb_audit = http.command.CommandAudit{
                 .command = cmd.command_type.toString(),
                 .correlation_id = correlation_id,
@@ -3559,6 +3754,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
             effective_idem_key == null,
         ) catch |err| {
             state.circuitRecordFailure();
+            state.commandLifecycleSetFailed(command_id, @errorName(err));
             state.logger.warn(null, "circuit breaker: recorded failure, state={s}", .{state.circuitStateName()});
             const mapped = mapProxyExecutionError(err);
             try sendApiError(allocator, writer, mapped.status, mapped.code, mapped.message, correlation_id, keep_alive, state);
@@ -3590,6 +3786,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
                 } else {
                     state.circuitRecordSuccess();
                 }
+                state.commandLifecycleSetCompleted(command_id, status, "", JSON_CONTENT_TYPE);
                 state.metricsRecord(status);
 
                 const streamed_audit = http.command.CommandAudit{
@@ -3661,6 +3858,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         applyResponseHeaders(state, &response);
         try response.write(writer);
         state.metricsRecord(cmd_final_status);
+        state.commandLifecycleSetCompleted(command_id, cmd_final_status, cmd_final_body, cmd_final_content_type);
 
         if (proxy_cache_key) |cache_key| {
             if (cmd_final_status == 200) {
@@ -4208,6 +4406,123 @@ fn parseQueryParam(query: ?[]const u8, key: []const u8) ?[]const u8 {
         return std.mem.trim(u8, part[eq + 1 ..], " \t\r\n");
     }
     return null;
+}
+
+fn generateCommandId(allocator: std.mem.Allocator) ![]const u8 {
+    var rnd: [16]u8 = undefined;
+    std.crypto.random.bytes(&rnd);
+    return std.fmt.allocPrint(allocator, "cmd-{d}-{s}", .{
+        std.time.milliTimestamp(),
+        std.fmt.fmtSliceHexLower(&rnd),
+    });
+}
+
+const AsyncCommandJob = struct {
+    allocator: std.mem.Allocator,
+    cfg: *const edge_config.EdgeConfig,
+    state: *GatewayState,
+    command_id: []u8,
+    command_name: []u8,
+    upstream_path: []u8,
+    envelope: []u8,
+    correlation_id: []u8,
+    client_ip: []u8,
+    identity: ?[]u8,
+    incoming_host: ?[]u8,
+    incoming_x_forwarded_for: ?[]u8,
+    api_version: ?u32,
+};
+
+fn spawnAsyncCommandExecution(
+    allocator: std.mem.Allocator,
+    cfg: *const edge_config.EdgeConfig,
+    state: *GatewayState,
+    command_id: []const u8,
+    command_name: []const u8,
+    upstream_path: []const u8,
+    envelope: []const u8,
+    correlation_id: []const u8,
+    client_ip: []const u8,
+    identity: ?[]const u8,
+    api_version: ?u32,
+    incoming_host: ?[]const u8,
+    incoming_x_forwarded_for: ?[]const u8,
+) void {
+    const job = allocator.create(AsyncCommandJob) catch return;
+    job.* = .{
+        .allocator = allocator,
+        .cfg = cfg,
+        .state = state,
+        .command_id = dupeOrEmpty(allocator, command_id),
+        .command_name = dupeOrEmpty(allocator, command_name),
+        .upstream_path = dupeOrEmpty(allocator, upstream_path),
+        .envelope = dupeOrEmpty(allocator, envelope),
+        .correlation_id = dupeOrEmpty(allocator, correlation_id),
+        .client_ip = dupeOrEmpty(allocator, client_ip),
+        .identity = if (identity) |id| allocator.dupe(u8, id) catch null else null,
+        .incoming_host = if (incoming_host) |h| allocator.dupe(u8, h) catch null else null,
+        .incoming_x_forwarded_for = if (incoming_x_forwarded_for) |xff| allocator.dupe(u8, xff) catch null else null,
+        .api_version = api_version,
+    };
+    const t = std.Thread.spawn(.{}, runAsyncCommandJob, .{job}) catch {
+        state.commandLifecycleSetFailed(command_id, "async_spawn_failed");
+        return;
+    };
+    t.detach();
+}
+
+fn dupeOrEmpty(allocator: std.mem.Allocator, src: []const u8) []u8 {
+    return allocator.dupe(u8, src) catch allocator.alloc(u8, 0) catch unreachable;
+}
+
+fn runAsyncCommandJob(job: *AsyncCommandJob) void {
+    defer {
+        const alloc = job.allocator;
+        if (job.command_id.len > 0) alloc.free(job.command_id);
+        if (job.command_name.len > 0) alloc.free(job.command_name);
+        if (job.upstream_path.len > 0) alloc.free(job.upstream_path);
+        if (job.envelope.len > 0) alloc.free(job.envelope);
+        if (job.correlation_id.len > 0) alloc.free(job.correlation_id);
+        if (job.client_ip.len > 0) alloc.free(job.client_ip);
+        if (job.identity) |id| alloc.free(id);
+        if (job.incoming_host) |h| alloc.free(h);
+        if (job.incoming_x_forwarded_for) |xff| alloc.free(xff);
+        alloc.destroy(job);
+    }
+
+    job.state.commandLifecycleSetRunning(job.command_id);
+    const exec = proxyJsonExecute(
+        job.allocator,
+        job.cfg,
+        .commands,
+        job.cfg.proxy_pass_commands_prefix,
+        job.upstream_path,
+        job.envelope,
+        job.correlation_id,
+        job.client_ip,
+        job.identity,
+        job.api_version,
+        job.incoming_host,
+        job.incoming_x_forwarded_for,
+        std.io.null_writer,
+        job.state,
+        false,
+    ) catch |err| {
+        job.state.commandLifecycleSetFailed(job.command_id, @errorName(err));
+        return;
+    };
+
+    switch (exec) {
+        .streamed_status => |status| {
+            job.state.commandLifecycleSetCompleted(job.command_id, status, "", JSON_CONTENT_TYPE);
+        },
+        .buffered => |resp| {
+            defer job.allocator.free(resp.body);
+            defer job.allocator.free(resp.content_type);
+            if (resp.content_disposition) |cd| job.allocator.free(cd);
+            job.state.commandLifecycleSetCompleted(job.command_id, resp.status, resp.body, resp.content_type);
+        },
+    }
 }
 
 fn parseLastEventId(raw: ?[]const u8) u64 {

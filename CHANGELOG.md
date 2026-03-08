@@ -86,6 +86,10 @@
   - Extended `TARDIGRADE_UPSTREAM_LB_ALGORITHM` with `generic_hash` mode.
   - Added deterministic hash-based backend selection using a request hash key (payload when present, otherwise proxy target path).
   - Generic-hash selection is integrated with health/slow-start filters and fallback behavior.
+- Phase 4.2 backup upstream failover (`src/edge_config.zig`, `src/edge_gateway.zig`):
+  - Added `TARDIGRADE_UPSTREAM_BACKUP_BASE_URLS` for configuring backup backend pools.
+  - Upstream selection now falls back to backup servers only when primaries have no healthy/eligible candidate.
+  - Active health probes now include configured backup servers.
 
 ## [0.26.0] - 2026-03-xx
 

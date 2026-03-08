@@ -44,6 +44,7 @@ const GatewayState = struct {
     connection_memory_estimate_bytes: usize,
     max_total_connection_memory_bytes: usize,
     upstream_rr_index: usize,
+    upstream_backup_rr_index: usize,
     lb_random_state: u64,
     next_active_health_probe_ms: u64,
     upstream_health: std.StringHashMap(UpstreamHealth),
@@ -305,25 +306,25 @@ const GatewayState = struct {
                 if (self.selectLeastConnectionsUpstreamLocked(cfg, now_ms)) |selected| {
                     return selected;
                 }
-                return selectUpstreamBaseUrl(cfg.upstream_base_urls, cfg.upstream_base_url, &self.upstream_rr_index);
+                return self.selectPrimaryFallbackWithBackupsLocked(cfg, now_ms);
             },
             .ip_hash => {
                 if (self.selectIpHashUpstreamLocked(cfg, client_ip, now_ms)) |selected| {
                     return selected;
                 }
-                return selectUpstreamBaseUrl(cfg.upstream_base_urls, cfg.upstream_base_url, &self.upstream_rr_index);
+                return self.selectPrimaryFallbackWithBackupsLocked(cfg, now_ms);
             },
             .generic_hash => {
                 if (self.selectGenericHashUpstreamLocked(cfg, hash_key, now_ms)) |selected| {
                     return selected;
                 }
-                return selectUpstreamBaseUrl(cfg.upstream_base_urls, cfg.upstream_base_url, &self.upstream_rr_index);
+                return self.selectPrimaryFallbackWithBackupsLocked(cfg, now_ms);
             },
             .random_two_choices => {
                 if (self.selectRandomTwoChoicesUpstreamLocked(cfg, now_ms)) |selected| {
                     return selected;
                 }
-                return selectUpstreamBaseUrl(cfg.upstream_base_urls, cfg.upstream_base_url, &self.upstream_rr_index);
+                return self.selectPrimaryFallbackWithBackupsLocked(cfg, now_ms);
             },
             .round_robin => {},
         }
@@ -350,8 +351,7 @@ const GatewayState = struct {
             }
         }
 
-        // If all backends are currently unhealthy, still probe in round-robin order.
-        return selectUpstreamBaseUrl(cfg.upstream_base_urls, cfg.upstream_base_url, &self.upstream_rr_index);
+        return self.selectPrimaryFallbackWithBackupsLocked(cfg, now_ms);
     }
 
     fn selectLeastConnectionsUpstreamLocked(self: *GatewayState, cfg: *const edge_config.EdgeConfig, now_ms: u64) ?[]const u8 {
@@ -474,6 +474,40 @@ const GatewayState = struct {
         if (chosen_idx) |idx| {
             self.upstream_rr_index = (idx + 1) % cfg.upstream_base_urls.len;
             return cfg.upstream_base_urls[idx];
+        }
+        return null;
+    }
+
+    fn selectPrimaryFallbackWithBackupsLocked(self: *GatewayState, cfg: *const edge_config.EdgeConfig, now_ms: u64) []const u8 {
+        if (self.selectBackupUpstreamLocked(cfg, now_ms)) |backup| {
+            return backup;
+        }
+        // If all primary backends are currently unhealthy, still probe primaries in round-robin order.
+        return selectUpstreamBaseUrl(cfg.upstream_base_urls, cfg.upstream_base_url, &self.upstream_rr_index);
+    }
+
+    fn selectBackupUpstreamLocked(self: *GatewayState, cfg: *const edge_config.EdgeConfig, now_ms: u64) ?[]const u8 {
+        if (cfg.upstream_backup_base_urls.len == 0) return null;
+
+        const start = self.upstream_backup_rr_index % cfg.upstream_backup_base_urls.len;
+        var offset: usize = 0;
+        while (offset < cfg.upstream_backup_base_urls.len) : (offset += 1) {
+            const idx = (start + offset) % cfg.upstream_backup_base_urls.len;
+            const candidate = cfg.upstream_backup_base_urls[idx];
+            if (!self.isUpstreamHealthyLocked(cfg, candidate, now_ms)) continue;
+            if (!self.slowStartAllowsTrafficLocked(cfg, candidate, now_ms, @intCast(idx))) continue;
+            self.upstream_backup_rr_index = (idx + 1) % cfg.upstream_backup_base_urls.len;
+            return candidate;
+        }
+
+        offset = 0;
+        while (offset < cfg.upstream_backup_base_urls.len) : (offset += 1) {
+            const idx = (start + offset) % cfg.upstream_backup_base_urls.len;
+            const candidate = cfg.upstream_backup_base_urls[idx];
+            if (self.isUpstreamHealthyLocked(cfg, candidate, now_ms)) {
+                self.upstream_backup_rr_index = (idx + 1) % cfg.upstream_backup_base_urls.len;
+                return candidate;
+            }
         }
         return null;
     }
@@ -761,6 +795,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         .connection_memory_estimate_bytes = if (cfg.max_connection_memory_bytes > 0) cfg.max_connection_memory_bytes else MAX_REQUEST_SIZE,
         .max_total_connection_memory_bytes = cfg.max_total_connection_memory_bytes,
         .upstream_rr_index = 0,
+        .upstream_backup_rr_index = 0,
         .lb_random_state = 0x9e3779b97f4a7c15 ^ @as(u64, @intCast(http.event_loop.monotonicMs())),
         .next_active_health_probe_ms = 0,
         .upstream_health = std.StringHashMap(UpstreamHealth).init(state_allocator),
@@ -868,6 +903,9 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     }
     if (cfg.upstream_base_urls.len > 0) {
         state.logger.info(null, "Upstream round-robin enabled with {d} base URLs", .{cfg.upstream_base_urls.len});
+        if (cfg.upstream_backup_base_urls.len > 0) {
+            state.logger.info(null, "Upstream backup servers enabled with {d} base URLs", .{cfg.upstream_backup_base_urls.len});
+        }
         switch (cfg.upstream_lb_algorithm) {
             .least_connections => state.logger.info(null, "Upstream load balancing algorithm: least_connections", .{}),
             .ip_hash => state.logger.info(null, "Upstream load balancing algorithm: ip_hash", .{}),
@@ -1023,6 +1061,9 @@ fn runActiveHealthChecks(cfg: *const edge_config.EdgeConfig, state: *GatewayStat
 
     if (cfg.upstream_base_urls.len > 0) {
         for (cfg.upstream_base_urls) |base_url| {
+            probeSingleUpstream(cfg, state, &probe_client, base_url);
+        }
+        for (cfg.upstream_backup_base_urls) |base_url| {
             probeSingleUpstream(cfg, state, &probe_client, base_url);
         }
     } else {
@@ -2043,10 +2084,11 @@ fn proxyJsonExecute(
     enable_streaming_success: bool,
 ) !ProxyExecution {
     const configured_attempts: usize = @intCast(@max(cfg.upstream_retry_attempts, @as(u32, 1)));
-    const max_attempts = if (cfg.upstream_base_urls.len > 0)
-        @min(configured_attempts, cfg.upstream_base_urls.len)
+    const configured_upstream_count = if (cfg.upstream_base_urls.len > 0)
+        cfg.upstream_base_urls.len + cfg.upstream_backup_base_urls.len
     else
-        configured_attempts;
+        @as(usize, 1);
+    const max_attempts = @min(configured_attempts, configured_upstream_count);
     const start_ms = http.event_loop.monotonicMs();
     const upstream_hash_key = if (payload.len > 0) payload else (suffix_path orelse proxy_pass_target);
 
@@ -2601,6 +2643,7 @@ test "resolveProxyTarget handles absolute and relative proxy_pass" {
         .tls_key_path = "",
         .upstream_base_url = "http://127.0.0.1:8080",
         .upstream_base_urls = &[_][]const u8{},
+        .upstream_backup_base_urls = &[_][]const u8{},
         .upstream_lb_algorithm = .round_robin,
         .proxy_pass_chat = "/v1/chat",
         .proxy_pass_commands_prefix = "",
@@ -2675,6 +2718,7 @@ test "authorizeRequest accepts valid hash" {
         .tls_key_path = "",
         .upstream_base_url = "http://127.0.0.1:8080",
         .upstream_base_urls = &[_][]const u8{},
+        .upstream_backup_base_urls = &[_][]const u8{},
         .upstream_lb_algorithm = .round_robin,
         .proxy_pass_chat = "/v1/chat",
         .proxy_pass_commands_prefix = "",

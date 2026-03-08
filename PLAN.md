@@ -262,10 +262,11 @@ Decision: default behavior still maps non-200 upstream errors into stable gatewa
 - [ ] upstream blocks
 - [x] Multiple backend servers
 - [ ] Server weights
-- [ ] Backup servers
+- [x] Backup servers
 - [x] max_fails / fail_timeout
 
 Resolved (incremental): edge config now supports multiple upstream base URLs via `TARDIGRADE_UPSTREAM_BASE_URLS` (comma-separated), enabling multi-backend proxy target selection at runtime.
+Resolved (incremental): backup upstream pools now supported via `TARDIGRADE_UPSTREAM_BACKUP_BASE_URLS`; selection uses backups only when primary pools have no healthy/eligible candidate.
 Resolved (incremental): passive-failure upstream controls added via `TARDIGRADE_UPSTREAM_MAX_FAILS` and `TARDIGRADE_UPSTREAM_FAIL_TIMEOUT_MS`.
 
 ### 4.3 Load Balancing Algorithms

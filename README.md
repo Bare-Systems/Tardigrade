@@ -47,7 +47,9 @@ Tardigrade now supports an edge-gateway path for BearClaw:
 - `POST /v1/chat` (Bearer auth required)
 - `POST /v1/commands` (structured command envelope; supports async `202` mode with `command_id`)
 - `GET /v1/commands/status?command_id=...` (command lifecycle polling)
+- `POST /v1/approvals/request`, `POST /v1/approvals/respond`, `GET /v1/approvals/status?approval_token=...` (approval workflow for policy-gated routes)
 - `GET /v1/ws/chat` and `GET /v1/ws/commands` (WebSocket upgrade, authenticated)
+- `GET /v1/ws/mux` (multiplexed WebSocket channel stream for events + commands; requires `X-Device-ID`)
 - `GET /v1/events/stream` and `POST /v1/events/publish` (SSE topic stream/publish, authenticated)
 
 Environment variables:
@@ -157,6 +159,8 @@ Environment variables:
 - `TARDIGRADE_ACCESS_LOG_SYSLOG_UDP` (default empty; optional syslog UDP endpoint `host:port`)
 - `TARDIGRADE_CONFIG_PATH` (default empty; optional nginx-style config file path loaded before env override resolution)
 - `TARDIGRADE_ERROR_LOG_PATH` (default empty; when set and not `stderr`, redirects stderr logging to this file)
+- `TARDIGRADE_LOG_ROTATE_MAX_BYTES` (default `0`; rotate `TARDIGRADE_ERROR_LOG_PATH` at startup when file size exceeds this byte threshold, `0` disables rotation)
+- `TARDIGRADE_LOG_ROTATE_MAX_FILES` (default `5`; number of rotated generations to keep as `.1`..`.N`)
 - `TARDIGRADE_PID_FILE` (default empty; writes/removes process pid file on startup/shutdown)
 - `TARDIGRADE_RUN_USER` / `TARDIGRADE_RUN_GROUP` (default empty; numeric uid/gid for post-bind privilege drop)
 - `TARDIGRADE_REQUIRE_UNPRIVILEGED_USER` (default `false`; when true, startup fails if process remains uid 0 after privilege/drop flow)

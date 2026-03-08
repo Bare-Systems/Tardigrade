@@ -43,10 +43,46 @@ pub fn main() !void {
 
 fn configureErrorLog(cfg: *const edge_config.EdgeConfig) !void {
     if (cfg.error_log_path.len == 0 or std.ascii.eqlIgnoreCase(cfg.error_log_path, "stderr")) return;
+    const rotate_max_bytes = parseIntEnv(usize, "TARDIGRADE_LOG_ROTATE_MAX_BYTES", 0);
+    const rotate_max_files = parseIntEnv(usize, "TARDIGRADE_LOG_ROTATE_MAX_FILES", 5);
+    if (rotate_max_bytes > 0) {
+        const stat = std.fs.cwd().statFile(cfg.error_log_path) catch null;
+        if (stat != null and stat.?.size >= rotate_max_bytes) {
+            try rotateLogFiles(std.fs.cwd(), cfg.error_log_path, rotate_max_files);
+        }
+    }
     var file = try std.fs.cwd().createFile(cfg.error_log_path, .{ .truncate = false, .read = false });
     defer file.close();
     try file.seekFromEnd(0);
     try std.posix.dup2(file.handle, std.io.getStdErr().handle);
+}
+
+fn parseIntEnv(comptime T: type, key: []const u8, default: T) T {
+    const raw = std.process.getEnvVarOwned(std.heap.page_allocator, key) catch return default;
+    defer std.heap.page_allocator.free(raw);
+    return std.fmt.parseInt(T, std.mem.trim(u8, raw, " \t\r\n"), 10) catch default;
+}
+
+fn rotateLogFiles(dir: std.fs.Dir, path: []const u8, max_files: usize) !void {
+    if (max_files == 0) {
+        dir.deleteFile(path) catch {};
+        return;
+    }
+    const oldest = try std.fmt.allocPrint(std.heap.page_allocator, "{s}.{d}", .{ path, max_files });
+    defer std.heap.page_allocator.free(oldest);
+    dir.deleteFile(oldest) catch {};
+
+    var idx = max_files;
+    while (idx > 1) : (idx -= 1) {
+        const src = try std.fmt.allocPrint(std.heap.page_allocator, "{s}.{d}", .{ path, idx - 1 });
+        defer std.heap.page_allocator.free(src);
+        const dst = try std.fmt.allocPrint(std.heap.page_allocator, "{s}.{d}", .{ path, idx });
+        defer std.heap.page_allocator.free(dst);
+        dir.rename(src, dst) catch {};
+    }
+    const first = try std.fmt.allocPrint(std.heap.page_allocator, "{s}.1", .{path});
+    defer std.heap.page_allocator.free(first);
+    try dir.rename(path, first);
 }
 
 fn writePidFile(cfg: *const edge_config.EdgeConfig) !void {
@@ -188,4 +224,24 @@ test {
     _ = @import("http.zig");
     _ = @import("edge_config.zig");
     _ = @import("edge_gateway.zig");
+}
+
+test "rotateLogFiles shifts generations" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "error.log", .data = "latest" });
+    try tmp.dir.writeFile(.{ .sub_path = "error.log.1", .data = "older" });
+
+    try rotateLogFiles(tmp.dir, "error.log", 3);
+
+    _ = try tmp.dir.statFile("error.log.1");
+    _ = try tmp.dir.statFile("error.log.2");
+}
+
+test "rotateLogFiles deletes source when max_files is zero" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "error.log", .data = "latest" });
+    try rotateLogFiles(tmp.dir, "error.log", 0);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile("error.log"));
 }

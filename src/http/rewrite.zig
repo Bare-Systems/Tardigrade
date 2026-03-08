@@ -43,11 +43,22 @@ pub fn methodMatches(rule_method: []const u8, method: []const u8) bool {
 }
 
 pub fn regexMatches(pattern: []const u8, input: []const u8) bool {
+    const allocator = std.heap.page_allocator;
+    const pattern_z = allocator.alloc(u8, pattern.len + 1) catch return false;
+    defer allocator.free(pattern_z);
+    @memcpy(pattern_z[0..pattern.len], pattern);
+    pattern_z[pattern.len] = 0;
+
+    const input_z = allocator.alloc(u8, input.len + 1) catch return false;
+    defer allocator.free(input_z);
+    @memcpy(input_z[0..input.len], input);
+    input_z[input.len] = 0;
+
     var regex: c.regex_t = undefined;
-    const compile_rc = c.regcomp(&regex, pattern.ptr, c.REG_EXTENDED | c.REG_NOSUB);
+    const compile_rc = c.regcomp(&regex, pattern_z.ptr, c.REG_EXTENDED | c.REG_NOSUB);
     if (compile_rc != 0) return false;
     defer _ = c.regfree(&regex);
-    return c.regexec(&regex, input.ptr, 0, null, 0) == 0;
+    return c.regexec(&regex, input_z.ptr, 0, null, 0) == 0;
 }
 
 pub fn evaluate(

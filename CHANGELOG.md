@@ -1,6 +1,220 @@
 
 # Changelog
 
+## [0.27.0] - 2026-03-xx
+
+### Added
+- Phase 2.2 request pipelining boundary support (`src/edge_gateway.zig`):
+  - Added per-connection pending buffer/session state for keep-alive request loops.
+  - HTTP parser `bytes_consumed` is now used to preserve unread bytes for subsequent requests on the same socket.
+  - Added request-boundary helper tests for pipelined and body-length-delimited requests.
+- Phase 2.2 connection pooling + graceful draining completion (`src/edge_gateway.zig`, `src/edge_config.zig`):
+  - Added thread-safe `ConnectionSessionPool` used by workers to reuse connection session objects across accepted sockets.
+  - Added `TARDIGRADE_CONNECTION_POOL_SIZE` to bound cached connection-session objects.
+  - Gateway shutdown now explicitly drains active/queued connection work before worker join, and keep-alive responses switch to `Connection: close` during drain.
+  - Added unit coverage for connection-session pool reuse/reset behavior.
+- Phase 2.3 work stealing / load balancing (`src/http/worker_pool.zig`):
+  - Replaced the single shared queue with per-worker queues.
+  - Listener submit path now chooses the least-loaded worker queue.
+  - Workers now steal queued sockets from peer queues when local queues are empty.
+  - Added unit coverage for queue selection and stealing behavior.
+- Phase 2.4 memory management completion (`src/http/buffer_pool.zig`, `src/edge_gateway.zig`, `src/edge_config.zig`):
+  - Added thread-safe reusable fixed-size buffer pool module and integrated request + proxy relay buffer pools in gateway state.
+  - Added `TARDIGRADE_MAX_CONNECTION_MEMORY_BYTES` and enforced buffer/read caps on connection and buffered upstream paths.
+  - Request/session handling now acquires request buffers from a pool and releases them on connection teardown.
+  - Proxy non-200 mapped responses now drain upstream bodies without full buffering.
+- Phase 4.1 streaming proxy extension (`src/edge_gateway.zig`, `src/edge_config.zig`):
+  - Added `TARDIGRADE_PROXY_STREAM_ALL_STATUSES` to optionally stream non-200 upstream responses directly.
+  - Streamed-status circuit breaker accounting now treats 5xx responses as failures.
+- Phase 4.1 buffered proxy metadata preservation (`src/edge_gateway.zig`):
+  - Buffered success responses now retain upstream `Content-Type` and `Content-Disposition` values.
+  - Successful buffered proxy responses are no longer always forced to JSON content type.
+  - Reduced streamed vs buffered response mismatch for proxy paths when idempotency requires buffered handling.
+- Phase 4.2/4.3 upstream multi-backend round-robin foundation (`src/edge_config.zig`, `src/edge_gateway.zig`):
+  - Added `TARDIGRADE_UPSTREAM_BASE_URLS` (comma-separated) for configuring multiple upstream base URLs.
+  - Proxy target resolution now selects upstream base URLs via round-robin across configured backends.
+  - Added deterministic unit coverage for upstream base URL round-robin selection.
+- Phase 13.4 retry policy foundation (`src/edge_config.zig`, `src/edge_gateway.zig`):
+  - Added `TARDIGRADE_UPSTREAM_RETRY_ATTEMPTS` (minimum 1) for proxy upstream retries.
+  - Proxy execution now retries failed attempts and rotates upstream base URL selection between attempts.
+- Phase 4.2/4.4 passive upstream health tracking (`src/edge_config.zig`, `src/edge_gateway.zig`):
+  - Added `TARDIGRADE_UPSTREAM_MAX_FAILS` and `TARDIGRADE_UPSTREAM_FAIL_TIMEOUT_MS`.
+  - Backends are marked temporarily unhealthy after threshold failures and skipped by round-robin selection until cooldown expires.
+  - Retry + backend rotation now records upstream success/failure outcomes for passive failover decisions.
+- Phase 13.4 timeout budget foundation (`src/edge_config.zig`, `src/edge_gateway.zig`):
+  - Added `TARDIGRADE_UPSTREAM_TIMEOUT_BUDGET_MS` for total upstream retry-window timeout budgeting.
+  - Proxy retry attempts now enforce a shared per-request timeout budget, not only per-attempt socket timeouts.
+- Phase 13 overload protection + request queue management (`src/edge_config.zig`, `src/edge_gateway.zig`):
+  - Added `TARDIGRADE_MAX_ACTIVE_CONNECTIONS` global active-connection cap.
+  - Listener now sends explicit `503 Service Unavailable` load-shedding responses when over global/per-IP limits or when worker queue submission is full.
+  - Queue/connection rejections now use `Retry-After: 1` to signal transient overload.
+- Phase 13.2 resource limit controls (`src/edge_config.zig`, `src/edge_gateway.zig`):
+  - Added `TARDIGRADE_FD_SOFT_LIMIT` (best-effort RLIMIT_NOFILE soft-limit application on startup).
+  - Added `TARDIGRADE_MAX_TOTAL_CONNECTION_MEMORY_BYTES` global estimated memory admission cap.
+  - Listener admission now rejects new connections with 503 when projected active-connection memory budget would be exceeded.
+- Metrics observability expansion (`src/http/metrics.zig`, `src/edge_gateway.zig`):
+  - Added active connection gauge and listener rejection counters (connection-slot and queue saturation).
+  - Added upstream unhealthy backend gauge derived from passive health tracking state.
+  - Extended `/metrics` JSON and `/metrics/prometheus` output to include the new operational metrics.
+- Phase 4.4 active upstream health checks (`src/edge_config.zig`, `src/edge_gateway.zig`):
+  - Added periodic active probe controls: `TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_INTERVAL_MS`, `TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_PATH`, and `TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_TIMEOUT_MS`.
+  - Event-loop timer ticks now run active health probes across configured upstreams.
+  - Active probe outcomes now feed existing passive-health failover tracking.
+- Phase 4.4 configurable health thresholds (`src/edge_config.zig`, `src/edge_gateway.zig`):
+  - Added `TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_FAIL_THRESHOLD` and `TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_SUCCESS_THRESHOLD`.
+  - Active probe failures/successes now use configurable consecutive-threshold transitions for unhealthy/healthy state changes.
+- Phase 4.4 slow-start for recovered upstreams (`src/edge_config.zig`, `src/edge_gateway.zig`):
+  - Added `TARDIGRADE_UPSTREAM_SLOW_START_MS` for recovered-backend traffic ramp windows.
+  - Upstream selection now applies gradual eligibility during slow-start instead of immediate full-load routing after recovery.
+- Error categorization telemetry (`src/http/metrics.zig`, `src/http/access_log.zig`, `src/edge_gateway.zig`):
+  - Access logs now emit `error_category` for non-success outcomes.
+  - Added category-level API error counters (invalid request, unauthorized, rate-limited, upstream timeout/unavailable, internal, overload).
+  - Overload shedding and API error paths now increment categorized metrics for triage.
+- Phase 4.3 least-connections load balancing (`src/edge_config.zig`, `src/edge_gateway.zig`):
+  - Added `TARDIGRADE_UPSTREAM_LB_ALGORITHM` with `round_robin` and `least_connections` modes.
+  - Added per-upstream in-flight attempt tracking and least-loaded upstream selection.
+  - Least-connections selection is integrated with health/slow-start filters.
+- Phase 4.3 IP-hash load balancing (`src/edge_config.zig`, `src/edge_gateway.zig`):
+  - Extended `TARDIGRADE_UPSTREAM_LB_ALGORITHM` with `ip_hash` mode.
+  - Added client-IP hash upstream selection for stable backend affinity across requests.
+  - IP-hash selection is integrated with health/slow-start filters and falls back cleanly when candidates are unavailable.
+- Phase 4.3 random-two-choices load balancing (`src/edge_config.zig`, `src/edge_gateway.zig`):
+  - Extended `TARDIGRADE_UPSTREAM_LB_ALGORITHM` with `random_two_choices` mode.
+  - Added power-of-two-choices backend selection that samples two random backends and chooses the lower in-flight load.
+  - Random-two-choices selection is integrated with health/slow-start filters and fallback behavior.
+- Phase 4.3 generic-hash load balancing (`src/edge_config.zig`, `src/edge_gateway.zig`):
+  - Extended `TARDIGRADE_UPSTREAM_LB_ALGORITHM` with `generic_hash` mode.
+  - Added deterministic hash-based backend selection using a request hash key (payload when present, otherwise proxy target path).
+  - Generic-hash selection is integrated with health/slow-start filters and fallback behavior.
+- Phase 4.2 backup upstream failover (`src/edge_config.zig`, `src/edge_gateway.zig`):
+  - Added `TARDIGRADE_UPSTREAM_BACKUP_BASE_URLS` for configuring backup backend pools.
+  - Upstream selection now falls back to backup servers only when primaries have no healthy/eligible candidate.
+  - Active health probes now include configured backup servers.
+- Phase 4.2 weighted primary upstream selection (`src/edge_config.zig`, `src/edge_gateway.zig`):
+  - Added `TARDIGRADE_UPSTREAM_BASE_URL_WEIGHTS` for aligned positive integer primary-backend weights.
+  - Primary round-robin selection now supports weighted ticketing for uneven traffic distribution.
+  - Added validation for invalid weight configs and weighted-selection unit coverage.
+- Phase 4.2 route-scoped upstream blocks (`src/edge_config.zig`, `src/edge_gateway.zig`):
+  - Added dedicated chat/commands upstream block env settings for primary, weighted, and backup pools.
+  - Proxy execution now chooses upstream pools by route scope and falls back to global upstream pool when route-specific pools are unset.
+  - Active health probes now include configured route-scoped upstream block backends.
+- Phase 4.5 proxy protocol foundation (`src/edge_config.zig`, `src/edge_gateway.zig`):
+  - Added `TARDIGRADE_PROXY_PROTOCOL` (`off|auto|v1|v2`) for PROXY header parsing on plaintext listeners.
+  - Added v1/v2 PROXY header parsing and request-context client IP extraction from parsed source addresses.
+  - Added parser coverage for v1, v2, and auto-mode no-header behavior.
+- Phase 4.6 service trust model foundation (`src/edge_config.zig`, `src/edge_gateway.zig`):
+  - Added trusted-upstream configuration env vars for gateway identity, shared secret, strict trust enforcement, and trusted upstream identity allowlists.
+  - Upstream proxy requests now include signed trust headers and forwarded auth context metadata.
+  - Upstream target selection now enforces trusted identity matching when configured, with explicit `upstream_untrusted` error mapping.
+- Phase 4.7 unix socket upstream routing (`src/edge_gateway.zig`, `README.md`):
+  - Added unix upstream endpoint support via `unix:/path.sock` and `unix:///path.sock` syntax in configured upstream pools.
+  - Proxy request execution now uses `std.http.Client.connectUnix` when unix upstream endpoints are selected.
+  - Active health probing and load-balanced endpoint selection now apply to unix socket backends for local IPC routing.
+
+## [0.26.0] - 2026-03-xx
+
+### Added
+- Phase 2.4 request arena allocation (`src/edge_gateway.zig`):
+  - Request processing now uses a request-scoped arena allocator instead of a per-request general-purpose allocator.
+  - Per-request temporary allocations are reclaimed in one step at request completion.
+
+## [0.25.0] - 2026-03-xx
+
+### Added
+- Phase 2.2 keep-alive connection reuse (`src/edge_gateway.zig`, `src/edge_config.zig`):
+  - Worker connection handlers now support sequential multi-request processing per client socket.
+  - Responses now honor parsed request keep-alive behavior (`Connection: keep-alive`/`close`).
+  - Added `TARDIGRADE_KEEP_ALIVE_TIMEOUT_MS` for idle keep-alive socket timeout.
+  - Added `TARDIGRADE_MAX_REQUESTS_PER_CONNECTION` to bound requests served per connection.
+
+## [0.24.0] - 2026-03-xx
+
+### Added
+- Socket timeout enforcement (`src/edge_gateway.zig`):
+  - Accepted client sockets now apply configured request header timeout via `TARDIGRADE_HEADER_TIMEOUT_MS`.
+  - Upstream proxy sockets now apply configured send/receive timeout via `TARDIGRADE_UPSTREAM_TIMEOUT_MS`.
+  - Timeout settings are applied with POSIX socket timeout options on both client and upstream paths.
+
+## [0.23.0] - 2026-03-xx
+
+### Added
+- Phase 4.1 proxy_pass directive foundation (`src/edge_config.zig`, `src/edge_gateway.zig`):
+  - Added `TARDIGRADE_PROXY_PASS_CHAT` for `/v1/chat` upstream target selection.
+  - Added `TARDIGRADE_PROXY_PASS_COMMANDS_PREFIX` for `/v1/commands` command upstream path prefixing.
+  - Proxy target resolver supports absolute URL mode and relative-path mode (joined with `TARDIGRADE_UPSTREAM_BASE_URL`).
+  - Added target resolution helper coverage for path joining and absolute/relative routing behavior.
+
+## [0.22.0] - 2026-03-xx
+
+### Added
+- Phase 4.1 backend connection pooling (`src/edge_gateway.zig`):
+  - Gateway state now owns a shared upstream `std.http.Client`.
+  - Upstream proxy execution path now opens requests through the shared client with `keep_alive = true`.
+  - Upstream connections can now be reused across requests via the client connection pool instead of one-client-per-request teardown.
+
+## [0.21.0] - 2026-03-xx
+
+### Added
+- Phase 4.1 streaming proxy increment (`src/edge_gateway.zig`):
+  - New upstream execution path that can stream successful (200) upstream responses directly to downstream clients using chunked transfer encoding.
+  - Shared streaming response header writer for propagated content-type/disposition, correlation ID, and security headers.
+  - `/v1/chat` and `/v1/commands` now attempt streamed relay when idempotency replay storage is not required; non-200 responses still use buffered mapping path.
+
+## [0.20.0] - 2026-03-xx
+
+### Added
+- Native HTTPS/TLS termination (`src/http/tls_termination.zig`, `src/edge_gateway.zig`, `build.zig`):
+  - OpenSSL-backed TLS server context with certificate/private-key loading from configured PEM files.
+  - Worker connection path now performs TLS handshake (`SSL_accept`) when TLS cert/key are configured.
+  - HTTP request parsing/response writing now supports both plain TCP streams and TLS-wrapped streams.
+  - Build linked with `ssl`/`crypto` system libraries for executable and tests.
+
+## [0.19.0] - 2026-03-xx
+
+### Added
+- Phase 2.2 per-IP connection limiting (`src/edge_gateway.zig`, `src/edge_config.zig`):
+  - New `TARDIGRADE_MAX_CONNECTIONS_PER_IP` runtime setting (default disabled).
+  - Listener accept path now enforces active connection slots per client IP before queueing to workers.
+  - Connection slot lifecycle is tracked by fd and released on worker completion or queue submission failure.
+  - Supports IPv4 and IPv6 client keying in the connection tracker.
+
+## [0.18.0] - 2026-03-xx
+
+### Added
+- Phase 2.3 graceful worker draining (`src/http/worker_pool.zig`):
+  - Worker pool now tracks in-flight jobs and blocks shutdown until queued + active work drains when requested.
+  - Added worker completion signaling for coordinated shutdown waits.
+  - Added unit test verifying `shutdownAndJoin(true)` waits for in-flight work completion.
+
+## [0.17.0] - 2026-03-xx
+
+### Added
+- Phase 4.1 reverse proxy header foundation (`src/edge_gateway.zig`):
+  - Unified JSON proxy request path shared by `/v1/chat` and `/v1/commands`.
+  - Forwarded client headers added on upstream calls: `X-Forwarded-For`, `X-Real-IP`, `X-Forwarded-Proto`, `X-Forwarded-Host`.
+  - `Host` header rewriting to upstream authority derived from `upstream_base_url`.
+  - Helper coverage for forwarded-for composition and upstream host parsing.
+
+## [0.16.0] - 2026-03-xx
+
+### Added
+- Phase 2.3 worker model foundation (`src/http/worker_pool.zig`, `src/edge_gateway.zig`):
+  - Fixed-size worker thread pool for accepted connection handling with bounded queue backpressure.
+  - Event-loop accept path now dispatches sockets to worker threads instead of processing inline on the listener thread.
+  - Thread-safe shared gateway state access for rate limiting, sessions, idempotency, circuit breaker, and metrics via synchronized state helpers.
+  - Configurable worker settings via `TARDIGRADE_WORKER_THREADS` (default auto) and `TARDIGRADE_WORKER_QUEUE_SIZE` (default 1024).
+  - Worker pool unit test covering queue submission/processing.
+
+## [0.15.0] - 2026-03-xx
+
+### Added
+- Phase 2.1 async event loop foundation (`src/http/event_loop.zig`, `src/edge_gateway.zig`):
+  - Cross-platform event loop abstraction with `epoll` (Linux) and `kqueue` (macOS/BSD) backends.
+  - Non-blocking listening socket registration and event-driven accept handling in the gateway runtime.
+  - Timer manager for periodic event-loop ticks and responsive shutdown checks without blocking in `accept()`.
+  - Gateway startup now logs the selected event loop backend.
+  - Unit tests for backend selection and timer tick behavior.
+
 ## [0.14.0] - 2026-03-07
 
 ### Added

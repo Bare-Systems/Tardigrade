@@ -12,6 +12,22 @@ pub const Metrics = struct {
     status_3xx: u64,
     status_4xx: u64,
     status_5xx: u64,
+    /// Current active accepted client connections.
+    active_connections: u64,
+    /// Total listener rejections from connection slot limits.
+    connection_rejections: u64,
+    /// Total listener rejections due to worker queue saturation.
+    queue_rejections: u64,
+    /// Current number of upstream backends marked unhealthy.
+    upstream_unhealthy_backends: u64,
+    /// Error category counters.
+    err_invalid_request: u64,
+    err_unauthorized: u64,
+    err_rate_limited: u64,
+    err_upstream_timeout: u64,
+    err_upstream_unavailable: u64,
+    err_internal_error: u64,
+    err_overload: u64,
     /// Server start time (nanoseconds since boot).
     started_ns: i128,
 
@@ -22,6 +38,17 @@ pub const Metrics = struct {
             .status_3xx = 0,
             .status_4xx = 0,
             .status_5xx = 0,
+            .active_connections = 0,
+            .connection_rejections = 0,
+            .queue_rejections = 0,
+            .upstream_unhealthy_backends = 0,
+            .err_invalid_request = 0,
+            .err_unauthorized = 0,
+            .err_rate_limited = 0,
+            .err_upstream_timeout = 0,
+            .err_upstream_unavailable = 0,
+            .err_internal_error = 0,
+            .err_overload = 0,
             .started_ns = std.time.nanoTimestamp(),
         };
     }
@@ -37,6 +64,40 @@ pub const Metrics = struct {
             self.status_4xx += 1;
         } else if (status >= 500) {
             self.status_5xx += 1;
+        }
+    }
+
+    pub fn setActiveConnections(self: *Metrics, active: usize) void {
+        self.active_connections = @intCast(active);
+    }
+
+    pub fn recordConnectionRejection(self: *Metrics) void {
+        self.connection_rejections += 1;
+    }
+
+    pub fn recordQueueRejection(self: *Metrics) void {
+        self.queue_rejections += 1;
+    }
+
+    pub fn setUpstreamUnhealthyBackends(self: *Metrics, count: usize) void {
+        self.upstream_unhealthy_backends = @intCast(count);
+    }
+
+    pub fn recordErrorCode(self: *Metrics, code: []const u8) void {
+        if (std.mem.eql(u8, code, "invalid_request")) {
+            self.err_invalid_request += 1;
+        } else if (std.mem.eql(u8, code, "unauthorized")) {
+            self.err_unauthorized += 1;
+        } else if (std.mem.eql(u8, code, "rate_limited")) {
+            self.err_rate_limited += 1;
+        } else if (std.mem.eql(u8, code, "upstream_timeout")) {
+            self.err_upstream_timeout += 1;
+        } else if (std.mem.eql(u8, code, "upstream_unavailable")) {
+            self.err_upstream_unavailable += 1;
+        } else if (std.mem.eql(u8, code, "internal_error")) {
+            self.err_internal_error += 1;
+        } else if (std.mem.eql(u8, code, "overload")) {
+            self.err_overload += 1;
         }
     }
 
@@ -70,6 +131,39 @@ pub const Metrics = struct {
             \\# HELP tardigrade_uptime_seconds Server uptime in seconds
             \\# TYPE tardigrade_uptime_seconds gauge
             \\tardigrade_uptime_seconds {d}
+            \\# HELP tardigrade_active_connections Current active accepted client connections
+            \\# TYPE tardigrade_active_connections gauge
+            \\tardigrade_active_connections {d}
+            \\# HELP tardigrade_connection_rejections_total Total listener rejections from connection-slot limits
+            \\# TYPE tardigrade_connection_rejections_total counter
+            \\tardigrade_connection_rejections_total {d}
+            \\# HELP tardigrade_queue_rejections_total Total listener rejections due to worker queue saturation
+            \\# TYPE tardigrade_queue_rejections_total counter
+            \\tardigrade_queue_rejections_total {d}
+            \\# HELP tardigrade_upstream_unhealthy_backends Current upstream backends marked unhealthy
+            \\# TYPE tardigrade_upstream_unhealthy_backends gauge
+            \\tardigrade_upstream_unhealthy_backends {d}
+            \\# HELP tardigrade_error_invalid_request_total Total invalid_request API errors
+            \\# TYPE tardigrade_error_invalid_request_total counter
+            \\tardigrade_error_invalid_request_total {d}
+            \\# HELP tardigrade_error_unauthorized_total Total unauthorized API errors
+            \\# TYPE tardigrade_error_unauthorized_total counter
+            \\tardigrade_error_unauthorized_total {d}
+            \\# HELP tardigrade_error_rate_limited_total Total rate_limited API errors
+            \\# TYPE tardigrade_error_rate_limited_total counter
+            \\tardigrade_error_rate_limited_total {d}
+            \\# HELP tardigrade_error_upstream_timeout_total Total upstream_timeout API errors
+            \\# TYPE tardigrade_error_upstream_timeout_total counter
+            \\tardigrade_error_upstream_timeout_total {d}
+            \\# HELP tardigrade_error_upstream_unavailable_total Total upstream_unavailable API errors
+            \\# TYPE tardigrade_error_upstream_unavailable_total counter
+            \\tardigrade_error_upstream_unavailable_total {d}
+            \\# HELP tardigrade_error_internal_error_total Total internal_error API errors
+            \\# TYPE tardigrade_error_internal_error_total counter
+            \\tardigrade_error_internal_error_total {d}
+            \\# HELP tardigrade_error_overload_total Total overload API errors
+            \\# TYPE tardigrade_error_overload_total counter
+            \\tardigrade_error_overload_total {d}
             \\
         , .{
             self.total_requests,
@@ -78,6 +172,17 @@ pub const Metrics = struct {
             self.status_4xx,
             self.status_5xx,
             self.uptimeSeconds(),
+            self.active_connections,
+            self.connection_rejections,
+            self.queue_rejections,
+            self.upstream_unhealthy_backends,
+            self.err_invalid_request,
+            self.err_unauthorized,
+            self.err_rate_limited,
+            self.err_upstream_timeout,
+            self.err_upstream_unavailable,
+            self.err_internal_error,
+            self.err_overload,
         });
     }
 
@@ -85,7 +190,7 @@ pub const Metrics = struct {
     /// Caller owns the returned memory.
     pub fn toJson(self: *const Metrics, allocator: std.mem.Allocator) ![]u8 {
         return std.fmt.allocPrint(allocator,
-            \\{{"total_requests":{d},"status_2xx":{d},"status_3xx":{d},"status_4xx":{d},"status_5xx":{d},"uptime_seconds":{d}}}
+            \\{{"total_requests":{d},"status_2xx":{d},"status_3xx":{d},"status_4xx":{d},"status_5xx":{d},"uptime_seconds":{d},"active_connections":{d},"connection_rejections":{d},"queue_rejections":{d},"upstream_unhealthy_backends":{d},"error_invalid_request":{d},"error_unauthorized":{d},"error_rate_limited":{d},"error_upstream_timeout":{d},"error_upstream_unavailable":{d},"error_internal_error":{d},"error_overload":{d}}}
         , .{
             self.total_requests,
             self.status_2xx,
@@ -93,6 +198,17 @@ pub const Metrics = struct {
             self.status_4xx,
             self.status_5xx,
             self.uptimeSeconds(),
+            self.active_connections,
+            self.connection_rejections,
+            self.queue_rejections,
+            self.upstream_unhealthy_backends,
+            self.err_invalid_request,
+            self.err_unauthorized,
+            self.err_rate_limited,
+            self.err_upstream_timeout,
+            self.err_upstream_unavailable,
+            self.err_internal_error,
+            self.err_overload,
         });
     }
 };
@@ -104,6 +220,7 @@ test "Metrics init starts at zero" {
     try std.testing.expectEqual(@as(u64, 0), m.total_requests);
     try std.testing.expectEqual(@as(u64, 0), m.status_2xx);
     try std.testing.expectEqual(@as(u64, 0), m.status_4xx);
+    try std.testing.expectEqual(@as(u64, 0), m.active_connections);
 }
 
 test "Metrics recordRequest tracks status classes" {
@@ -127,6 +244,24 @@ test "Metrics uptimeSeconds is non-negative" {
     try std.testing.expect(m.uptimeSeconds() <= 1);
 }
 
+test "Metrics tracks active connections and rejections" {
+    var m = Metrics.init();
+    m.setActiveConnections(7);
+    m.recordConnectionRejection();
+    m.recordQueueRejection();
+    m.recordQueueRejection();
+
+    try std.testing.expectEqual(@as(u64, 7), m.active_connections);
+    try std.testing.expectEqual(@as(u64, 1), m.connection_rejections);
+    try std.testing.expectEqual(@as(u64, 2), m.queue_rejections);
+    m.setUpstreamUnhealthyBackends(3);
+    try std.testing.expectEqual(@as(u64, 3), m.upstream_unhealthy_backends);
+    m.recordErrorCode("invalid_request");
+    m.recordErrorCode("overload");
+    try std.testing.expectEqual(@as(u64, 1), m.err_invalid_request);
+    try std.testing.expectEqual(@as(u64, 1), m.err_overload);
+}
+
 test "Metrics toPrometheus produces valid Prometheus text" {
     const allocator = std.testing.allocator;
     var m = Metrics.init();
@@ -139,6 +274,11 @@ test "Metrics toPrometheus produces valid Prometheus text" {
     try std.testing.expect(std.mem.indexOf(u8, prom, "tardigrade_requests_total 2") != null);
     try std.testing.expect(std.mem.indexOf(u8, prom, "tardigrade_requests_2xx_total 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, prom, "tardigrade_requests_5xx_total 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prom, "tardigrade_active_connections") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prom, "tardigrade_connection_rejections_total") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prom, "tardigrade_queue_rejections_total") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prom, "tardigrade_upstream_unhealthy_backends") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prom, "tardigrade_error_invalid_request_total") != null);
     try std.testing.expect(std.mem.indexOf(u8, prom, "# TYPE tardigrade_requests_total counter") != null);
     try std.testing.expect(std.mem.indexOf(u8, prom, "# TYPE tardigrade_uptime_seconds gauge") != null);
 }
@@ -155,5 +295,10 @@ test "Metrics toJson produces valid JSON" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"total_requests\":2") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"status_2xx\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"status_4xx\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"active_connections\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"connection_rejections\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"queue_rejections\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"upstream_unhealthy_backends\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"error_invalid_request\":0") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"uptime_seconds\":") != null);
 }

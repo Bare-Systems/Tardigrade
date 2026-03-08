@@ -1,12 +1,68 @@
 const std = @import("std");
 const http = @import("http.zig");
 
+pub const UpstreamLbAlgorithm = enum {
+    round_robin,
+    least_connections,
+    ip_hash,
+    generic_hash,
+    random_two_choices,
+
+    pub fn parse(value: []const u8) ?UpstreamLbAlgorithm {
+        if (std.ascii.eqlIgnoreCase(value, "round_robin") or std.ascii.eqlIgnoreCase(value, "round-robin")) return .round_robin;
+        if (std.ascii.eqlIgnoreCase(value, "least_connections") or std.ascii.eqlIgnoreCase(value, "least-connections")) return .least_connections;
+        if (std.ascii.eqlIgnoreCase(value, "ip_hash") or std.ascii.eqlIgnoreCase(value, "ip-hash")) return .ip_hash;
+        if (std.ascii.eqlIgnoreCase(value, "generic_hash") or std.ascii.eqlIgnoreCase(value, "generic-hash")) return .generic_hash;
+        if (std.ascii.eqlIgnoreCase(value, "random_two_choices") or std.ascii.eqlIgnoreCase(value, "random-two-choices")) return .random_two_choices;
+        return null;
+    }
+};
+
+pub const ProxyProtocolMode = enum {
+    off,
+    auto,
+    v1,
+    v2,
+
+    pub fn parse(value: []const u8) ?ProxyProtocolMode {
+        if (std.ascii.eqlIgnoreCase(value, "off")) return .off;
+        if (std.ascii.eqlIgnoreCase(value, "auto")) return .auto;
+        if (std.ascii.eqlIgnoreCase(value, "v1")) return .v1;
+        if (std.ascii.eqlIgnoreCase(value, "v2")) return .v2;
+        return null;
+    }
+};
+
 pub const EdgeConfig = struct {
     listen_host: []const u8,
     listen_port: u16,
     tls_cert_path: []const u8,
     tls_key_path: []const u8,
+    proxy_protocol_mode: ProxyProtocolMode,
+    /// Gateway identity used in signed upstream trust headers.
+    trust_gateway_id: []const u8,
+    /// Shared secret used for upstream header signing/verification (empty = disabled).
+    trust_shared_secret: []const u8,
+    /// Trusted upstream identities accepted when signature verification is enabled.
+    trusted_upstream_identities: [][]const u8,
+    /// Whether to require signed upstream identity headers on responses.
+    trust_require_upstream_identity: bool,
     upstream_base_url: []const u8,
+    upstream_base_urls: [][]const u8,
+    upstream_base_url_weights: []u32,
+    upstream_backup_base_urls: [][]const u8,
+    upstream_chat_base_urls: [][]const u8,
+    upstream_chat_base_url_weights: []u32,
+    upstream_chat_backup_base_urls: [][]const u8,
+    upstream_commands_base_urls: [][]const u8,
+    upstream_commands_base_url_weights: []u32,
+    upstream_commands_backup_base_urls: [][]const u8,
+    upstream_lb_algorithm: UpstreamLbAlgorithm,
+    /// Proxy target for /v1/chat. Supports absolute URL or path.
+    proxy_pass_chat: []const u8,
+    /// Proxy target prefix for /v1/commands upstream subpaths.
+    /// Supports absolute URL prefix or path prefix.
+    proxy_pass_commands_prefix: []const u8,
     auth_token_hashes: [][]const u8,
     max_message_chars: usize,
     upstream_timeout_ms: u32,
@@ -39,17 +95,81 @@ pub const EdgeConfig = struct {
     cb_threshold: u32,
     /// Circuit breaker open timeout in milliseconds before half-open probe.
     cb_timeout_ms: u64,
+    /// Number of worker threads for connection handling (0 = auto CPU count).
+    worker_threads: u32,
+    /// Maximum queued accepted connections waiting for workers.
+    worker_queue_size: usize,
+    /// Desired soft file-descriptor limit (RLIMIT_NOFILE). 0 leaves OS default.
+    fd_soft_limit: u64,
+    /// Maximum active connections per client IP (0 = unlimited).
+    max_connections_per_ip: u32,
+    /// Maximum total active client connections across all IPs (0 = unlimited).
+    max_active_connections: u32,
+    /// Idle keep-alive timeout for client connections (ms, 0 = disabled).
+    keep_alive_timeout_ms: u32,
+    /// Maximum requests served per client connection (0 = unlimited).
+    max_requests_per_connection: u32,
+    /// Maximum idle connection sessions cached for reuse.
+    connection_pool_size: usize,
+    /// Maximum in-memory bytes retained per active connection (0 = unlimited).
+    max_connection_memory_bytes: usize,
+    /// Maximum estimated total connection memory across active clients (0 = unlimited).
+    max_total_connection_memory_bytes: usize,
+    /// Whether to stream all upstream statuses directly (including non-200) instead of mapping.
+    proxy_stream_all_statuses: bool,
+    /// Number of upstream attempt retries for proxy requests (minimum 1).
+    upstream_retry_attempts: u32,
+    /// Total timeout budget across all upstream attempts for a request (ms, 0 = disabled).
+    upstream_timeout_budget_ms: u64,
+    /// Passive health threshold: mark upstream as failed after this many failed attempts (0 = disabled).
+    upstream_max_fails: u32,
+    /// Passive health timeout (ms) for failed upstreams before retry eligibility.
+    upstream_fail_timeout_ms: u64,
+    /// Active health-check probe interval (ms, 0 = disabled).
+    upstream_active_health_interval_ms: u64,
+    /// Active health-check probe path.
+    upstream_active_health_path: []const u8,
+    /// Active health-check per-probe timeout in ms.
+    upstream_active_health_timeout_ms: u32,
+    /// Consecutive active probe failures required before marking backend unhealthy.
+    upstream_active_health_fail_threshold: u32,
+    /// Consecutive active probe successes required before clearing unhealthy state.
+    upstream_active_health_success_threshold: u32,
+    /// Slow-start window (ms) for recovered upstreams before receiving full traffic (0 = disabled).
+    upstream_slow_start_ms: u64,
 
     pub fn deinit(self: *EdgeConfig, allocator: std.mem.Allocator) void {
         allocator.free(self.listen_host);
         allocator.free(self.tls_cert_path);
         allocator.free(self.tls_key_path);
+        allocator.free(self.trust_gateway_id);
+        allocator.free(self.trust_shared_secret);
+        for (self.trusted_upstream_identities) |id| allocator.free(id);
+        allocator.free(self.trusted_upstream_identities);
         allocator.free(self.upstream_base_url);
+        for (self.upstream_base_urls) |u| allocator.free(u);
+        allocator.free(self.upstream_base_urls);
+        allocator.free(self.upstream_base_url_weights);
+        for (self.upstream_backup_base_urls) |u| allocator.free(u);
+        allocator.free(self.upstream_backup_base_urls);
+        for (self.upstream_chat_base_urls) |u| allocator.free(u);
+        allocator.free(self.upstream_chat_base_urls);
+        allocator.free(self.upstream_chat_base_url_weights);
+        for (self.upstream_chat_backup_base_urls) |u| allocator.free(u);
+        allocator.free(self.upstream_chat_backup_base_urls);
+        for (self.upstream_commands_base_urls) |u| allocator.free(u);
+        allocator.free(self.upstream_commands_base_urls);
+        allocator.free(self.upstream_commands_base_url_weights);
+        for (self.upstream_commands_backup_base_urls) |u| allocator.free(u);
+        allocator.free(self.upstream_commands_backup_base_urls);
+        allocator.free(self.proxy_pass_chat);
+        allocator.free(self.proxy_pass_commands_prefix);
         for (self.auth_token_hashes) |h| allocator.free(h);
         allocator.free(self.auth_token_hashes);
         allocator.free(self.access_control_rules);
         for (self.basic_auth_hashes) |h| allocator.free(h);
         allocator.free(self.basic_auth_hashes);
+        allocator.free(self.upstream_active_health_path);
         self.* = undefined;
     }
 };
@@ -67,9 +187,96 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
 
     const tls_key_path = envOrDefault(allocator, "TARDIGRADE_TLS_KEY_PATH", "") catch unreachable;
     errdefer allocator.free(tls_key_path);
+    const proxy_protocol_mode_str = envOrDefault(allocator, "TARDIGRADE_PROXY_PROTOCOL", "off") catch unreachable;
+    defer allocator.free(proxy_protocol_mode_str);
+    const proxy_protocol_mode = ProxyProtocolMode.parse(proxy_protocol_mode_str) orelse .off;
+    const trust_gateway_id = envOrDefault(allocator, "TARDIGRADE_TRUST_GATEWAY_ID", "tardigrade-edge") catch unreachable;
+    errdefer allocator.free(trust_gateway_id);
+    const trust_shared_secret = envOrDefault(allocator, "TARDIGRADE_TRUST_SHARED_SECRET", "") catch unreachable;
+    errdefer allocator.free(trust_shared_secret);
+    const trusted_upstream_identities_raw = envOrDefault(allocator, "TARDIGRADE_TRUSTED_UPSTREAM_IDENTITIES", "") catch unreachable;
+    defer allocator.free(trusted_upstream_identities_raw);
+    const trusted_upstream_identities = try parseCsvValues(allocator, trusted_upstream_identities_raw);
+    errdefer {
+        for (trusted_upstream_identities) |id| allocator.free(id);
+        allocator.free(trusted_upstream_identities);
+    }
+    const trust_require_upstream_identity_str = envOrDefault(allocator, "TARDIGRADE_TRUST_REQUIRE_UPSTREAM_IDENTITY", "false") catch unreachable;
+    defer allocator.free(trust_require_upstream_identity_str);
+    const trust_require_upstream_identity = std.mem.eql(u8, trust_require_upstream_identity_str, "true") or std.mem.eql(u8, trust_require_upstream_identity_str, "1");
 
     const upstream_base_url = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_BASE_URL", "http://127.0.0.1:8080") catch unreachable;
     errdefer allocator.free(upstream_base_url);
+    const upstream_base_urls_raw = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_BASE_URLS", "") catch unreachable;
+    defer allocator.free(upstream_base_urls_raw);
+    const upstream_base_urls = try parseCsvValues(allocator, upstream_base_urls_raw);
+    errdefer {
+        for (upstream_base_urls) |u| allocator.free(u);
+        allocator.free(upstream_base_urls);
+    }
+    const upstream_base_url_weights_raw = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_BASE_URL_WEIGHTS", "") catch unreachable;
+    defer allocator.free(upstream_base_url_weights_raw);
+    const upstream_base_url_weights = try parseCsvU32Values(allocator, upstream_base_url_weights_raw);
+    errdefer allocator.free(upstream_base_url_weights);
+    if (upstream_base_url_weights.len > 0 and upstream_base_url_weights.len != upstream_base_urls.len) {
+        return error.InvalidUpstreamBaseUrlWeightsCount;
+    }
+    const upstream_backup_base_urls_raw = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_BACKUP_BASE_URLS", "") catch unreachable;
+    defer allocator.free(upstream_backup_base_urls_raw);
+    const upstream_backup_base_urls = try parseCsvValues(allocator, upstream_backup_base_urls_raw);
+    errdefer {
+        for (upstream_backup_base_urls) |u| allocator.free(u);
+        allocator.free(upstream_backup_base_urls);
+    }
+    const upstream_chat_base_urls_raw = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_CHAT_BASE_URLS", "") catch unreachable;
+    defer allocator.free(upstream_chat_base_urls_raw);
+    const upstream_chat_base_urls = try parseCsvValues(allocator, upstream_chat_base_urls_raw);
+    errdefer {
+        for (upstream_chat_base_urls) |u| allocator.free(u);
+        allocator.free(upstream_chat_base_urls);
+    }
+    const upstream_chat_base_url_weights_raw = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_CHAT_BASE_URL_WEIGHTS", "") catch unreachable;
+    defer allocator.free(upstream_chat_base_url_weights_raw);
+    const upstream_chat_base_url_weights = try parseCsvU32Values(allocator, upstream_chat_base_url_weights_raw);
+    errdefer allocator.free(upstream_chat_base_url_weights);
+    if (upstream_chat_base_url_weights.len > 0 and upstream_chat_base_url_weights.len != upstream_chat_base_urls.len) {
+        return error.InvalidUpstreamChatBaseUrlWeightsCount;
+    }
+    const upstream_chat_backup_base_urls_raw = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_CHAT_BACKUP_BASE_URLS", "") catch unreachable;
+    defer allocator.free(upstream_chat_backup_base_urls_raw);
+    const upstream_chat_backup_base_urls = try parseCsvValues(allocator, upstream_chat_backup_base_urls_raw);
+    errdefer {
+        for (upstream_chat_backup_base_urls) |u| allocator.free(u);
+        allocator.free(upstream_chat_backup_base_urls);
+    }
+    const upstream_commands_base_urls_raw = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_COMMANDS_BASE_URLS", "") catch unreachable;
+    defer allocator.free(upstream_commands_base_urls_raw);
+    const upstream_commands_base_urls = try parseCsvValues(allocator, upstream_commands_base_urls_raw);
+    errdefer {
+        for (upstream_commands_base_urls) |u| allocator.free(u);
+        allocator.free(upstream_commands_base_urls);
+    }
+    const upstream_commands_base_url_weights_raw = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_COMMANDS_BASE_URL_WEIGHTS", "") catch unreachable;
+    defer allocator.free(upstream_commands_base_url_weights_raw);
+    const upstream_commands_base_url_weights = try parseCsvU32Values(allocator, upstream_commands_base_url_weights_raw);
+    errdefer allocator.free(upstream_commands_base_url_weights);
+    if (upstream_commands_base_url_weights.len > 0 and upstream_commands_base_url_weights.len != upstream_commands_base_urls.len) {
+        return error.InvalidUpstreamCommandsBaseUrlWeightsCount;
+    }
+    const upstream_commands_backup_base_urls_raw = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_COMMANDS_BACKUP_BASE_URLS", "") catch unreachable;
+    defer allocator.free(upstream_commands_backup_base_urls_raw);
+    const upstream_commands_backup_base_urls = try parseCsvValues(allocator, upstream_commands_backup_base_urls_raw);
+    errdefer {
+        for (upstream_commands_backup_base_urls) |u| allocator.free(u);
+        allocator.free(upstream_commands_backup_base_urls);
+    }
+    const lb_algo_str = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_LB_ALGORITHM", "round_robin") catch unreachable;
+    defer allocator.free(lb_algo_str);
+    const upstream_lb_algorithm = UpstreamLbAlgorithm.parse(lb_algo_str) orelse .round_robin;
+    const proxy_pass_chat = envOrDefault(allocator, "TARDIGRADE_PROXY_PASS_CHAT", "/v1/chat") catch unreachable;
+    errdefer allocator.free(proxy_pass_chat);
+    const proxy_pass_commands_prefix = envOrDefault(allocator, "TARDIGRADE_PROXY_PASS_COMMANDS_PREFIX", "") catch unreachable;
+    errdefer allocator.free(proxy_pass_commands_prefix);
 
     const max_message_chars_str = envOrDefault(allocator, "TARDIGRADE_MAX_MESSAGE_CHARS", "4000") catch unreachable;
     defer allocator.free(max_message_chars_str);
@@ -163,12 +370,113 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     defer allocator.free(cb_timeout_str);
     const cb_timeout_ms = std.fmt.parseInt(u64, cb_timeout_str, 10) catch 30_000;
 
+    // Worker pool
+    const worker_threads_str = envOrDefault(allocator, "TARDIGRADE_WORKER_THREADS", "0") catch unreachable;
+    defer allocator.free(worker_threads_str);
+    const worker_threads = std.fmt.parseInt(u32, worker_threads_str, 10) catch 0;
+
+    const worker_queue_str = envOrDefault(allocator, "TARDIGRADE_WORKER_QUEUE_SIZE", "1024") catch unreachable;
+    defer allocator.free(worker_queue_str);
+    const worker_queue_size = std.fmt.parseInt(usize, worker_queue_str, 10) catch 1024;
+
+    const fd_soft_limit_str = envOrDefault(allocator, "TARDIGRADE_FD_SOFT_LIMIT", "0") catch unreachable;
+    defer allocator.free(fd_soft_limit_str);
+    const fd_soft_limit = std.fmt.parseInt(u64, fd_soft_limit_str, 10) catch 0;
+
+    const max_conn_ip_str = envOrDefault(allocator, "TARDIGRADE_MAX_CONNECTIONS_PER_IP", "0") catch unreachable;
+    defer allocator.free(max_conn_ip_str);
+    const max_connections_per_ip = std.fmt.parseInt(u32, max_conn_ip_str, 10) catch 0;
+
+    const max_active_conn_str = envOrDefault(allocator, "TARDIGRADE_MAX_ACTIVE_CONNECTIONS", "0") catch unreachable;
+    defer allocator.free(max_active_conn_str);
+    const max_active_connections = std.fmt.parseInt(u32, max_active_conn_str, 10) catch 0;
+
+    const keep_alive_timeout_str = envOrDefault(allocator, "TARDIGRADE_KEEP_ALIVE_TIMEOUT_MS", "5000") catch unreachable;
+    defer allocator.free(keep_alive_timeout_str);
+    const keep_alive_timeout_ms = std.fmt.parseInt(u32, keep_alive_timeout_str, 10) catch 5000;
+
+    const max_req_conn_str = envOrDefault(allocator, "TARDIGRADE_MAX_REQUESTS_PER_CONNECTION", "100") catch unreachable;
+    defer allocator.free(max_req_conn_str);
+    const max_requests_per_connection = std.fmt.parseInt(u32, max_req_conn_str, 10) catch 100;
+
+    const conn_pool_size_str = envOrDefault(allocator, "TARDIGRADE_CONNECTION_POOL_SIZE", "256") catch unreachable;
+    defer allocator.free(conn_pool_size_str);
+    const connection_pool_size = std.fmt.parseInt(usize, conn_pool_size_str, 10) catch 256;
+
+    const max_conn_mem_str = envOrDefault(allocator, "TARDIGRADE_MAX_CONNECTION_MEMORY_BYTES", "2097152") catch unreachable;
+    defer allocator.free(max_conn_mem_str);
+    const max_connection_memory_bytes = std.fmt.parseInt(usize, max_conn_mem_str, 10) catch 2 * 1024 * 1024;
+
+    const max_total_conn_mem_str = envOrDefault(allocator, "TARDIGRADE_MAX_TOTAL_CONNECTION_MEMORY_BYTES", "0") catch unreachable;
+    defer allocator.free(max_total_conn_mem_str);
+    const max_total_connection_memory_bytes = std.fmt.parseInt(usize, max_total_conn_mem_str, 10) catch 0;
+
+    const stream_all_statuses_str = envOrDefault(allocator, "TARDIGRADE_PROXY_STREAM_ALL_STATUSES", "false") catch unreachable;
+    defer allocator.free(stream_all_statuses_str);
+    const proxy_stream_all_statuses = std.mem.eql(u8, stream_all_statuses_str, "true") or std.mem.eql(u8, stream_all_statuses_str, "1");
+
+    const retry_attempts_str = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_RETRY_ATTEMPTS", "1") catch unreachable;
+    defer allocator.free(retry_attempts_str);
+    const upstream_retry_attempts = @max(std.fmt.parseInt(u32, retry_attempts_str, 10) catch 1, 1);
+
+    const timeout_budget_str = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_TIMEOUT_BUDGET_MS", "0") catch unreachable;
+    defer allocator.free(timeout_budget_str);
+    const upstream_timeout_budget_ms = std.fmt.parseInt(u64, timeout_budget_str, 10) catch 0;
+
+    const max_fails_str = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_MAX_FAILS", "0") catch unreachable;
+    defer allocator.free(max_fails_str);
+    const upstream_max_fails = std.fmt.parseInt(u32, max_fails_str, 10) catch 0;
+
+    const fail_timeout_str = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_FAIL_TIMEOUT_MS", "10000") catch unreachable;
+    defer allocator.free(fail_timeout_str);
+    const upstream_fail_timeout_ms = std.fmt.parseInt(u64, fail_timeout_str, 10) catch 10_000;
+
+    const active_health_interval_str = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_INTERVAL_MS", "0") catch unreachable;
+    defer allocator.free(active_health_interval_str);
+    const upstream_active_health_interval_ms = std.fmt.parseInt(u64, active_health_interval_str, 10) catch 0;
+
+    const upstream_active_health_path = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_PATH", "/health") catch unreachable;
+    errdefer allocator.free(upstream_active_health_path);
+
+    const active_health_timeout_str = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_TIMEOUT_MS", "2000") catch unreachable;
+    defer allocator.free(active_health_timeout_str);
+    const upstream_active_health_timeout_ms = std.fmt.parseInt(u32, active_health_timeout_str, 10) catch 2000;
+
+    const active_health_fail_threshold_str = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_FAIL_THRESHOLD", "1") catch unreachable;
+    defer allocator.free(active_health_fail_threshold_str);
+    const upstream_active_health_fail_threshold = @max(std.fmt.parseInt(u32, active_health_fail_threshold_str, 10) catch 1, 1);
+
+    const active_health_success_threshold_str = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_SUCCESS_THRESHOLD", "1") catch unreachable;
+    defer allocator.free(active_health_success_threshold_str);
+    const upstream_active_health_success_threshold = @max(std.fmt.parseInt(u32, active_health_success_threshold_str, 10) catch 1, 1);
+
+    const slow_start_str = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_SLOW_START_MS", "0") catch unreachable;
+    defer allocator.free(slow_start_str);
+    const upstream_slow_start_ms = std.fmt.parseInt(u64, slow_start_str, 10) catch 0;
+
     return .{
         .listen_host = listen_host,
         .listen_port = listen_port,
         .tls_cert_path = tls_cert_path,
         .tls_key_path = tls_key_path,
+        .proxy_protocol_mode = proxy_protocol_mode,
+        .trust_gateway_id = trust_gateway_id,
+        .trust_shared_secret = trust_shared_secret,
+        .trusted_upstream_identities = trusted_upstream_identities,
+        .trust_require_upstream_identity = trust_require_upstream_identity,
         .upstream_base_url = upstream_base_url,
+        .upstream_base_urls = upstream_base_urls,
+        .upstream_base_url_weights = upstream_base_url_weights,
+        .upstream_backup_base_urls = upstream_backup_base_urls,
+        .upstream_chat_base_urls = upstream_chat_base_urls,
+        .upstream_chat_base_url_weights = upstream_chat_base_url_weights,
+        .upstream_chat_backup_base_urls = upstream_chat_backup_base_urls,
+        .upstream_commands_base_urls = upstream_commands_base_urls,
+        .upstream_commands_base_url_weights = upstream_commands_base_url_weights,
+        .upstream_commands_backup_base_urls = upstream_commands_backup_base_urls,
+        .upstream_lb_algorithm = upstream_lb_algorithm,
+        .proxy_pass_chat = proxy_pass_chat,
+        .proxy_pass_commands_prefix = proxy_pass_commands_prefix,
         .auth_token_hashes = hashes,
         .max_message_chars = max_message_chars,
         .upstream_timeout_ms = upstream_timeout_ms,
@@ -193,6 +501,27 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .compression_min_size = compression_min_size,
         .cb_threshold = cb_threshold,
         .cb_timeout_ms = cb_timeout_ms,
+        .worker_threads = worker_threads,
+        .worker_queue_size = worker_queue_size,
+        .fd_soft_limit = fd_soft_limit,
+        .max_connections_per_ip = max_connections_per_ip,
+        .max_active_connections = max_active_connections,
+        .keep_alive_timeout_ms = keep_alive_timeout_ms,
+        .max_requests_per_connection = max_requests_per_connection,
+        .connection_pool_size = connection_pool_size,
+        .max_connection_memory_bytes = max_connection_memory_bytes,
+        .max_total_connection_memory_bytes = max_total_connection_memory_bytes,
+        .proxy_stream_all_statuses = proxy_stream_all_statuses,
+        .upstream_retry_attempts = upstream_retry_attempts,
+        .upstream_timeout_budget_ms = upstream_timeout_budget_ms,
+        .upstream_max_fails = upstream_max_fails,
+        .upstream_fail_timeout_ms = upstream_fail_timeout_ms,
+        .upstream_active_health_interval_ms = upstream_active_health_interval_ms,
+        .upstream_active_health_path = upstream_active_health_path,
+        .upstream_active_health_timeout_ms = upstream_active_health_timeout_ms,
+        .upstream_active_health_fail_threshold = upstream_active_health_fail_threshold,
+        .upstream_active_health_success_threshold = upstream_active_health_success_threshold,
+        .upstream_slow_start_ms = upstream_slow_start_ms,
     };
 }
 
@@ -227,6 +556,40 @@ fn parseHashes(allocator: std.mem.Allocator, raw: []const u8) ![][]const u8 {
     return out.toOwnedSlice();
 }
 
+fn parseCsvValues(allocator: std.mem.Allocator, raw: []const u8) ![][]const u8 {
+    var out = std.ArrayList([]const u8).init(allocator);
+    errdefer {
+        for (out.items) |v| allocator.free(v);
+        out.deinit();
+    }
+
+    var it = std.mem.splitScalar(u8, raw, ',');
+    while (it.next()) |part| {
+        const trimmed = std.mem.trim(u8, part, " \t\r\n");
+        if (trimmed.len == 0) continue;
+        const duped = try allocator.dupe(u8, trimmed);
+        try out.append(duped);
+    }
+
+    return out.toOwnedSlice();
+}
+
+fn parseCsvU32Values(allocator: std.mem.Allocator, raw: []const u8) ![]u32 {
+    var out = std.ArrayList(u32).init(allocator);
+    errdefer out.deinit();
+
+    var it = std.mem.splitScalar(u8, raw, ',');
+    while (it.next()) |part| {
+        const trimmed = std.mem.trim(u8, part, " \t\r\n");
+        if (trimmed.len == 0) continue;
+        const value = try std.fmt.parseInt(u32, trimmed, 10);
+        if (value == 0) return error.InvalidUpstreamBaseUrlWeight;
+        try out.append(value);
+    }
+
+    return out.toOwnedSlice();
+}
+
 pub fn hasTlsFiles(cfg: *const EdgeConfig) bool {
     return cfg.tls_cert_path.len > 0 and cfg.tls_key_path.len > 0;
 }
@@ -241,4 +604,33 @@ test "parse token hashes from csv" {
 
     try std.testing.expectEqual(@as(usize, 2), hashes.len);
     try std.testing.expectEqualStrings("bb22bb22bb22bb22bb22bb22bb22bb22bb22bb22bb22bb22bb22bb22bb22bb22", hashes[1]);
+}
+
+test "parse upstream lb algorithm aliases" {
+    try std.testing.expectEqual(UpstreamLbAlgorithm.round_robin, UpstreamLbAlgorithm.parse("round_robin").?);
+    try std.testing.expectEqual(UpstreamLbAlgorithm.least_connections, UpstreamLbAlgorithm.parse("least-connections").?);
+    try std.testing.expectEqual(UpstreamLbAlgorithm.ip_hash, UpstreamLbAlgorithm.parse("ip-hash").?);
+    try std.testing.expectEqual(UpstreamLbAlgorithm.generic_hash, UpstreamLbAlgorithm.parse("generic-hash").?);
+    try std.testing.expectEqual(UpstreamLbAlgorithm.random_two_choices, UpstreamLbAlgorithm.parse("random_two_choices").?);
+    try std.testing.expect(UpstreamLbAlgorithm.parse("unknown") == null);
+}
+
+test "parse upstream base url weights csv" {
+    const allocator = std.testing.allocator;
+    const weights = try parseCsvU32Values(allocator, "3, 1,2");
+    defer allocator.free(weights);
+
+    try std.testing.expectEqual(@as(usize, 3), weights.len);
+    try std.testing.expectEqual(@as(u32, 3), weights[0]);
+    try std.testing.expectEqual(@as(u32, 1), weights[1]);
+    try std.testing.expectEqual(@as(u32, 2), weights[2]);
+    try std.testing.expectError(error.InvalidUpstreamBaseUrlWeight, parseCsvU32Values(allocator, "0"));
+}
+
+test "parse proxy protocol mode aliases" {
+    try std.testing.expectEqual(ProxyProtocolMode.off, ProxyProtocolMode.parse("off").?);
+    try std.testing.expectEqual(ProxyProtocolMode.auto, ProxyProtocolMode.parse("AUTO").?);
+    try std.testing.expectEqual(ProxyProtocolMode.v1, ProxyProtocolMode.parse("v1").?);
+    try std.testing.expectEqual(ProxyProtocolMode.v2, ProxyProtocolMode.parse("v2").?);
+    try std.testing.expect(ProxyProtocolMode.parse("unknown") == null);
 }

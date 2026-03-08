@@ -65,7 +65,9 @@ These features allow Tardigrade to become the Panda/BearClaw gateway early.
 - [x] structured audit logging (`route`, `status`, `auth_ok`, `correlation_id`, `latency_ms`)
 - [x] publish Linux binary artifact to GitHub Releases (`tardigrade-linux-x86_64.tar.gz`)
 - [x] document release download/install path in README (`releases/latest/download`)
-- [ ] native HTTPS socket termination in Zig runtime (deferred; cert/key config is in place)
+- [x] native HTTPS socket termination in Zig runtime
+
+Resolved: native TLS termination implemented via OpenSSL-backed server handshake in `src/http/tls_termination.zig` and integrated into worker connection handling in `src/edge_gateway.zig`. When `TARDIGRADE_TLS_CERT_PATH` and `TARDIGRADE_TLS_KEY_PATH` are set, accepted sockets perform TLS handshake before HTTP parsing.
 
 ### 0.1 Identity & Authentication
 - [x] Bearer token authentication
@@ -148,29 +150,50 @@ Resolved: Structured JSON logger implemented in `src/http/logger.zig`. Configura
 ## PHASE 2: Async I/O & Performance
 
 ### 2.1 Event Loop
-- [ ] epoll (Linux) / kqueue (macOS/BSD) abstraction
-- [ ] Non-blocking socket I/O
-- [ ] Event-driven connection handling
-- [ ] Timer management for timeouts
+- [x] epoll (Linux) / kqueue (macOS/BSD) abstraction
+- [x] Non-blocking socket I/O
+- [x] Event-driven connection handling
+- [x] Timer management for timeouts
+
+Resolved (incremental): Event loop foundation implemented in `src/http/event_loop.zig` with runtime backend selection (`epoll` on Linux, `kqueue` on macOS/BSD), readable-fd registration, and timeout-based waits. Gateway listener in `src/edge_gateway.zig` now runs non-blocking and accepts connections from event notifications rather than blocking `accept()`.
+Decision: for compatibility with current request parser/proxy path, accepted client sockets are switched back to blocking mode before `handleConnection`; full non-blocking per-connection read/write state machines are deferred to 2.2/2.3.
+Resolved: Timer manager (`TimerManager`) now drives periodic loop ticks for timeout/housekeeping hooks and keeps graceful shutdown responsive even when no new clients connect.
 
 ### 2.2 Connection Management
-- [ ] Connection pooling
-- [ ] Keep-alive with configurable timeout
-- [ ] Request pipelining
-- [ ] Connection limits per IP
-- [ ] Graceful connection draining
+- [x] Connection pooling
+- [x] Keep-alive with configurable timeout
+- [x] Request pipelining
+- [x] Connection limits per IP
+- [x] Graceful connection draining
+
+Resolved (incremental): worker connection handlers now borrow/release `ConnectionSession` state from a shared thread-safe session pool (`ConnectionSessionPool`) instead of stack-local one-off session state. Pool size is configurable via `TARDIGRADE_CONNECTION_POOL_SIZE`.
+Resolved (incremental): listener accept path now enforces active per-IP connection slots with fd-to-ip lifecycle tracking. Limit is configured via `TARDIGRADE_MAX_CONNECTIONS_PER_IP` (0 = disabled).
+Decision: connection limits are enforced before worker queue dispatch; rejected sockets are closed immediately to keep worker capacity available for accepted clients.
+Resolved (incremental): worker connection handlers now serve multiple sequential requests on the same client socket when `Connection: keep-alive` is allowed. Idle keep-alive timeout and max requests per connection are configurable via `TARDIGRADE_KEEP_ALIVE_TIMEOUT_MS` and `TARDIGRADE_MAX_REQUESTS_PER_CONNECTION`.
+Resolved (incremental): request pipelining boundary handling is now supported via per-connection pending-byte carry-over. Extra bytes beyond the first parsed request are preserved and consumed by subsequent request iterations on the same connection.
+Resolved: graceful connection draining is now explicit at shutdown: the listener stops accepting new sockets, the worker pool drains queued/in-flight connection work before join, and in-flight keep-alive responses switch to `Connection: close` once shutdown is requested.
 
 ### 2.3 Worker Model
-- [ ] Multi-threaded worker pool
-- [ ] Thread-safe shared state
-- [ ] Work stealing / load balancing between workers
-- [ ] Graceful shutdown with connection draining
+- [x] Multi-threaded worker pool
+- [x] Thread-safe shared state
+- [x] Work stealing / load balancing between workers
+- [x] Graceful shutdown with connection draining
+
+Resolved (incremental): Connection handling is now dispatched from the listener event loop into a fixed-size worker thread pool (`src/http/worker_pool.zig`). Accepted sockets are queued with bounded capacity and processed by workers so blocking upstream calls no longer stall the listener loop.
+Decision: shared mutable runtime components (rate limiter, idempotency cache, session store, circuit breaker, metrics) are synchronized behind gateway state locks to preserve existing behavior while enabling concurrent request execution.
+Resolved: worker queueing now uses per-worker queues with least-loaded submit selection and worker-side stealing when local queues are empty. This provides basic load balancing and reduces head-of-line blocking from single-queue dispatch contention.
+Resolved: worker shutdown now supports graceful draining; when drain mode is enabled, pool shutdown waits for queued and in-flight connection jobs to finish before joining worker threads.
 
 ### 2.4 Memory Management
-- [ ] Arena allocators for request scope
-- [ ] Buffer pooling
-- [ ] Zero-copy where possible
-- [ ] Memory limits per connection
+- [x] Arena allocators for request scope
+- [x] Buffer pooling
+- [x] Zero-copy where possible
+- [x] Memory limits per connection
+
+Resolved (incremental): request handling path now uses a request-scoped arena allocator in `src/edge_gateway.zig`, reducing allocator churn and centralizing per-request memory cleanup at end-of-request.
+Resolved: shared thread-safe byte buffer pools are now used for both request read buffers and proxy relay buffers (`src/http/buffer_pool.zig`, integrated in gateway state), reducing allocation churn on hot connection/proxy paths.
+Resolved: per-connection memory budgets are now enforced via `TARDIGRADE_MAX_CONNECTION_MEMORY_BYTES`; oversized request/proxy buffering paths are bounded to this cap.
+Decision: zero-copy is applied where practical in current architecture by relaying upstream stream chunks directly from pooled relay buffers to downstream writers without intermediate heap copies.
 
 ## PHASE 3: Configuration System
 
@@ -219,48 +242,79 @@ Secrets may include:
 ## PHASE 4: Reverse Proxy
 
 ### 4.1 Basic Proxying
-- [ ] proxy_pass directive
-- [ ] Backend connection pooling
-- [ ] Request/response streaming
-- [ ] Header manipulation (add, remove, modify)
-- [ ] X-Forwarded-For, X-Real-IP
-- [ ] X-Forwarded-Proto, X-Forwarded-Host
-- [ ] Host header rewriting
+- [x] proxy_pass directive
+- [x] Backend connection pooling
+- [x] Request/response streaming
+- [x] Header manipulation (add, remove, modify)
+- [x] X-Forwarded-For, X-Real-IP
+- [x] X-Forwarded-Proto, X-Forwarded-Host
+- [x] Host header rewriting
+
+Resolved (incremental): Gateway upstream proxy calls now flow through a shared proxy request helper that rewrites/augments forwarding headers (`X-Forwarded-*`, `X-Real-IP`) and rewrites `Host` to upstream authority.
+Resolved: basic proxy_pass-style routing now supports config-driven targets for `/v1/chat` and `/v1/commands` subpaths via `TARDIGRADE_PROXY_PASS_CHAT` and `TARDIGRADE_PROXY_PASS_COMMANDS_PREFIX` (absolute URL or path mode).
+Resolved (incremental): `/v1/chat` and `/v1/commands` now support streamed relay for successful upstream responses via chunked downstream writes, avoiding full buffering on the hot path.
+Resolved: upstream requests now use a shared `std.http.Client` in gateway state with keep-alive enabled, allowing backend connection reuse across requests.
+Resolved (incremental): added optional full-status streaming mode via `TARDIGRADE_PROXY_STREAM_ALL_STATUSES` to relay non-200 upstream responses directly when desired.
+Resolved (incremental): buffered proxy responses now preserve upstream `Content-Type` and `Content-Disposition` metadata for successful upstream responses, reducing streamed vs buffered response behavior drift.
+Decision: default behavior still maps non-200 upstream errors into stable gateway error envelopes; full-status passthrough streaming is opt-in to preserve compatibility.
 
 ### 4.2 Upstream Management
-- [ ] upstream blocks
-- [ ] Multiple backend servers
-- [ ] Server weights
-- [ ] Backup servers
-- [ ] max_fails / fail_timeout
+- [x] upstream blocks
+- [x] Multiple backend servers
+- [x] Server weights
+- [x] Backup servers
+- [x] max_fails / fail_timeout
+
+Resolved (incremental): added route-scoped upstream blocks for `/v1/chat` and `/v1/commands` via dedicated env-configured primary/weight/backup pools, with automatic fallback to the global upstream pool when block-specific pools are unset.
+Resolved (incremental): edge config now supports multiple upstream base URLs via `TARDIGRADE_UPSTREAM_BASE_URLS` (comma-separated), enabling multi-backend proxy target selection at runtime.
+Resolved (incremental): added weighted primary selection via `TARDIGRADE_UPSTREAM_BASE_URL_WEIGHTS` (aligned positive integer weights) for weighted round-robin distribution.
+Resolved (incremental): backup upstream pools now supported via `TARDIGRADE_UPSTREAM_BACKUP_BASE_URLS`; selection uses backups only when primary pools have no healthy/eligible candidate.
+Resolved (incremental): passive-failure upstream controls added via `TARDIGRADE_UPSTREAM_MAX_FAILS` and `TARDIGRADE_UPSTREAM_FAIL_TIMEOUT_MS`.
 
 ### 4.3 Load Balancing Algorithms
-- [ ] Round-robin (default)
-- [ ] Least connections
-- [ ] IP hash (session persistence)
-- [ ] Generic hash
-- [ ] Random with two choices
+- [x] Round-robin (default)
+- [x] Least connections
+- [x] IP hash (session persistence)
+- [x] Generic hash
+- [x] Random with two choices
+
+Resolved (incremental): proxy upstream base URL selection now uses round-robin rotation per request across configured upstream base URLs.
+Resolved (incremental): added least-connections upstream selection mode via `TARDIGRADE_UPSTREAM_LB_ALGORITHM=least_connections`, using current in-flight upstream attempt counts.
+Resolved (incremental): added IP-hash upstream selection mode via `TARDIGRADE_UPSTREAM_LB_ALGORITHM=ip_hash`, hashing client IP to a stable backend while respecting health and slow-start gating.
+Resolved (incremental): added generic-hash upstream selection mode via `TARDIGRADE_UPSTREAM_LB_ALGORITHM=generic_hash`, hashing a deterministic request key (payload when present, otherwise proxy target path) to keep request affinity while honoring health and slow-start gating.
+Resolved (incremental): added random-two-choices upstream selection mode via `TARDIGRADE_UPSTREAM_LB_ALGORITHM=random_two_choices`, sampling two backends and preferring the lower in-flight load while honoring health and slow-start gates.
 
 ### 4.4 Health Checks
-- [ ] Passive health checks (mark failed on errors)
-- [ ] Active health checks (periodic probes)
-- [ ] Configurable thresholds
-- [ ] Slow start for recovered servers
+- [x] Passive health checks (mark failed on errors)
+- [x] Active health checks (periodic probes)
+- [x] Configurable thresholds
+- [x] Slow start for recovered servers
+
+Resolved (incremental): proxy path now tracks upstream failures and marks backends temporarily unhealthy after configured failure thresholds; round-robin selection skips unhealthy upstreams until fail-timeout expires.
+Resolved (incremental): timer-driven active upstream health probes now run at configurable intervals (`TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_INTERVAL_MS`) against a configurable path (`TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_PATH`) with probe timeout control.
+Resolved (incremental): active health transitions now support configurable fail/success thresholds (`TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_FAIL_THRESHOLD`, `TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_SUCCESS_THRESHOLD`) before marking unhealthy and before clearing unhealthy state.
+Resolved (incremental): recovered upstreams now enter configurable slow-start windows (`TARDIGRADE_UPSTREAM_SLOW_START_MS`) with gradual traffic eligibility ramp before full load share.
 
 ### 4.5 Proxy Protocol Support
-- [ ] Protocol v1 and v2
-- [ ] Extracting real client IP
+- [x] Protocol v1 and v2
+- [x] Extracting real client IP
+
+Resolved (incremental): added configurable PROXY protocol parsing (`TARDIGRADE_PROXY_PROTOCOL=off|auto|v1|v2`) on plaintext listeners with v1/v2 support and request-context client IP extraction from parsed source addresses.
 
 ### 4.6 Service Trust Model (NEW)
-- [ ] trusted upstream configuration
-- [ ] signed upstream headers
-- [ ] auth context forwarding
-- [ ] upstream identity verification
+- [x] trusted upstream configuration
+- [x] signed upstream headers
+- [x] auth context forwarding
+- [x] upstream identity verification
+
+Resolved (incremental): added trust model configuration (`TARDIGRADE_TRUST_GATEWAY_ID`, `TARDIGRADE_TRUST_SHARED_SECRET`, `TARDIGRADE_TRUSTED_UPSTREAM_IDENTITIES`, `TARDIGRADE_TRUST_REQUIRE_UPSTREAM_IDENTITY`), signed upstream request headers, auth-context forwarding headers, and trusted upstream identity enforcement against configured upstream identities.
 
 ### 4.7 Unix Socket Upstreams (NEW)
-- [ ] unix domain socket backends
-- [ ] local IPC routing
-- [ ] socket-based load balancing
+- [x] unix domain socket backends
+- [x] local IPC routing
+- [x] socket-based load balancing
+
+Resolved (incremental): upstream endpoint configuration now supports Unix domain socket backends (`unix:/path.sock` / `unix:///path.sock`) across global and route-scoped upstream pools, with existing load-balancing/health-check logic applying to socket endpoints for local IPC routing.
 
 ## PHASE 5: Caching
 
@@ -314,9 +368,10 @@ Resolved: HTTP Basic Auth implemented in `src/http/basic_auth.zig`. Parses `Auth
 - [x] Request body size limits (client_max_body_size)
 - [x] Header count/size limits
 - [x] URI length limits
-- [ ] Timeout enforcement (client_body_timeout, etc.)
+- [x] Timeout enforcement (client_body_timeout, etc.)
 
-Resolved: Request validation limits enforced in gateway pipeline via `src/http/request_limits.zig`. Body size (413), URI length (414), and header count (400) validated after parsing. Configurable via env vars: `TARDIGRADE_MAX_BODY_SIZE`, `TARDIGRADE_MAX_URI_LENGTH`, `TARDIGRADE_MAX_HEADER_COUNT`, `TARDIGRADE_MAX_HEADER_SIZE`. Timeout env vars (`TARDIGRADE_BODY_TIMEOUT_MS`, `TARDIGRADE_HEADER_TIMEOUT_MS`) are configured but enforcement deferred to async I/O phase.
+Resolved: Request validation limits enforced in gateway pipeline via `src/http/request_limits.zig`. Body size (413), URI length (414), and header count (400) validated after parsing. Configurable via env vars: `TARDIGRADE_MAX_BODY_SIZE`, `TARDIGRADE_MAX_URI_LENGTH`, `TARDIGRADE_MAX_HEADER_COUNT`, `TARDIGRADE_MAX_HEADER_SIZE`.
+Resolved (incremental): socket-level timeout enforcement is now active in `src/edge_gateway.zig`. Accepted client sockets apply configured header timeout (`TARDIGRADE_HEADER_TIMEOUT_MS`) and upstream proxy sockets apply `TARDIGRADE_UPSTREAM_TIMEOUT_MS` for send/receive operations.
 
 ### 6.5 Security Headers
 - [ ] add_header directive
@@ -456,19 +511,21 @@ Resolved: Gzip response compression implemented in `src/http/compression.zig`. O
 
 ### 12.2 Metrics
 - [x] Stub status endpoint
-- [ ] Connection statistics
+- [x] Connection statistics
 - [x] Request statistics
-- [ ] Upstream health status
+- [x] Upstream health status
 - [x] Prometheus metrics export (optional)
 
 Resolved: `GET /metrics` endpoint added to gateway. `Metrics` struct in `src/http/metrics.zig` tracks total requests and status class counts (2xx/3xx/4xx/5xx) with uptime. All gateway response paths record metrics automatically. `GET /metrics/prometheus` endpoint added returning Prometheus text exposition format (v0.0.4).
+Resolved (incremental): metrics now include active connection gauge, listener rejection counters (connection-slot and queue saturation), and current unhealthy upstream backend gauge.
 
 ### 12.3 Debugging
 - [x] Debug logging
 - [x] Request tracing
-- [ ] Error categorization
+- [x] Error categorization
 
 Resolved: Structured access log implemented in `src/http/access_log.zig`. `AccessLogEntry` emits a `"type":"access"` JSON line to stderr per completed request with method, path, status, latency, client IP, correlation ID, identity, and user agent fields. The `logAccess()` helper in the gateway replaces all 35 `ctx.auditLog()` key=value callsites with structured JSON output suitable for log aggregation.
+Resolved (incremental): access logs now include `error_category` classification and metrics now track category-level API error counters (invalid request, unauthorized, rate limited, upstream timeout/unavailable, internal, overload) for operational triage.
 
 ### 12.4 Admin API
 - [ ] route inspection
@@ -487,13 +544,19 @@ Resolved: Structured access log implemented in `src/http/access_log.zig`. `Acces
 - [ ] Worker process recycling
 - [ ] CPU affinity
 
-Resolved: Graceful shutdown implemented in `src/http/shutdown.zig`. SIGTERM and SIGINT handlers set a global atomic flag. Gateway accept loop checks the flag before each accept and exits cleanly. Note: with the current single-threaded blocking accept, shutdown takes effect between connections; fully responsive shutdown during blocking accept will be improved when async I/O is added (Phase 2).
+Resolved: Graceful shutdown implemented in `src/http/shutdown.zig`. SIGTERM and SIGINT handlers set a global atomic flag. With the Phase 2.1 event loop, the listener no longer blocks indefinitely in `accept()`, so shutdown is serviced on the next event-loop tick even when the server is idle.
 
 ### 13.2 Resource Limits
-- [ ] File descriptor limits
-- [ ] Worker connection limits
-- [ ] Memory limits
-- [ ] Request queue limits
+- [x] File descriptor limits
+- [x] Worker connection limits
+- [x] Memory limits
+- [x] Request queue limits
+
+Resolved (incremental): global active worker connection cap added via `TARDIGRADE_MAX_ACTIVE_CONNECTIONS`. Listener now rejects excess connections with explicit 503 load-shedding responses.
+Resolved (incremental): worker queue saturation now triggers explicit 503 load-shedding responses (with `Retry-After`) instead of silent close.
+Resolved (incremental): startup can now apply best-effort process fd soft limits via `TARDIGRADE_FD_SOFT_LIMIT` (RLIMIT_NOFILE on supported Unix targets).
+Resolved (incremental): global estimated active-connection memory capping added via `TARDIGRADE_MAX_TOTAL_CONNECTION_MEMORY_BYTES`, enforced in listener admission control.
+Decision: total memory cap is estimated from active connections and configured per-connection memory budget to keep listener-side checks lock-free and low overhead.
 
 ### 13.3 Privilege Management
 - [ ] Run as unprivileged user
@@ -502,12 +565,14 @@ Resolved: Graceful shutdown implemented in `src/http/shutdown.zig`. SIGTERM and 
 
 ### 13.4 Resilience Features
 - [x] circuit breakers
-- [ ] retry policies
-- [ ] timeout budgets
-- [ ] overload protection
-- [ ] request queue management
+- [x] retry policies
+- [x] timeout budgets
+- [x] overload protection
+- [x] request queue management
 
 Resolved: Upstream circuit breaker implemented in `src/http/circuit_breaker.zig`. Three-state machine (closed/open/half-open) with configurable failure threshold (`TARDIGRADE_CB_THRESHOLD`, default 0 = disabled), recovery timeout (`TARDIGRADE_CB_TIMEOUT_MS`, default 30 s), and probe success count. Applied to `/v1/chat` and `/v1/commands` proxy calls; returns 503 `upstream_unavailable` when circuit is open. Circuit breaker state logged on failure and at startup.
+Resolved (incremental): upstream retry policy added for proxy requests. `TARDIGRADE_UPSTREAM_RETRY_ATTEMPTS` controls attempt count (minimum 1); with multiple configured upstream base URLs, retries rotate across upstream targets.
+Resolved (incremental): request-level upstream timeout budgets added via `TARDIGRADE_UPSTREAM_TIMEOUT_BUDGET_MS`; retry attempts now share a single total timeout budget to prevent runaway cumulative wait time.
 
 ## PHASE 14: Real-Time Messaging Gateway
 
@@ -543,7 +608,7 @@ Tier 1: Gateway MVP
 9. Request size limits
 10. Connection timeouts
 
-At this stage Panda -> Tardigrade -> BearClaw communication works.
+At this stage iOS -> Tardigrade -> BearClaw communication works.
 
 Tier 2: Production Gateway
 

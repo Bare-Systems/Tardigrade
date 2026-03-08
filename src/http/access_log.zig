@@ -21,6 +21,7 @@ pub const AccessLogEntry = struct {
     identity: []const u8,
     user_agent: []const u8,
     bytes_sent: usize,
+    error_category: []const u8,
 
     /// Emit the access log entry as a JSON line to stderr.
     pub fn log(self: AccessLogEntry) void {
@@ -29,7 +30,7 @@ pub const AccessLogEntry = struct {
 
         const stderr = std.io.getStdErr().writer();
         stderr.print(
-            "{{\"type\":\"access\",\"ts\":\"{s}\",\"method\":\"{s}\",\"path\":\"{s}\",\"status\":{d},\"latency_ms\":{d},\"client_ip\":\"{s}\",\"correlation_id\":\"{s}\",\"identity\":\"{s}\",\"user_agent\":\"{s}\",\"bytes_sent\":{d}}}\n",
+            "{{\"type\":\"access\",\"ts\":\"{s}\",\"method\":\"{s}\",\"path\":\"{s}\",\"status\":{d},\"latency_ms\":{d},\"client_ip\":\"{s}\",\"correlation_id\":\"{s}\",\"identity\":\"{s}\",\"user_agent\":\"{s}\",\"bytes_sent\":{d},\"error_category\":\"{s}\"}}\n",
             .{
                 ts,
                 self.method,
@@ -41,6 +42,7 @@ pub const AccessLogEntry = struct {
                 self.identity,
                 self.user_agent,
                 self.bytes_sent,
+                self.error_category,
             },
         ) catch return;
     }
@@ -59,6 +61,7 @@ test "AccessLogEntry fields are set correctly" {
         .identity = "token-abc",
         .user_agent = "curl/8.0",
         .bytes_sent = 256,
+        .error_category = "-",
     };
 
     try std.testing.expectEqualStrings("POST", entry.method);
@@ -85,6 +88,7 @@ test "AccessLogEntry log does not panic" {
         .identity = "-",
         .user_agent = "",
         .bytes_sent = 0,
+        .error_category = "-",
     };
     // Just ensure it doesn't panic
     entry.log();
@@ -101,6 +105,7 @@ test "AccessLogEntry handles special characters in path" {
         .identity = "-",
         .user_agent = "Mozilla/5.0",
         .bytes_sent = 128,
+        .error_category = "not_found",
     };
     try std.testing.expectEqualStrings("/v1/chat?foo=bar", entry.path);
     try std.testing.expectEqual(@as(u16, 404), entry.status);

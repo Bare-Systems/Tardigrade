@@ -32,6 +32,9 @@ pub fn build(b: *std.Build) void {
         .name = "tardigrade",
         .root_module = exe_mod,
     });
+    exe.linkLibC();
+    exe.linkSystemLibrary("ssl");
+    exe.linkSystemLibrary("crypto");
 
     // This declares intent for the executable to be installed into the
     // standard location when the user invokes the "install" step (the default
@@ -61,10 +64,12 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the app");
     run_step.dependOn(&run_cmd.step);
 
-
     const exe_unit_tests = b.addTest(.{
         .root_module = exe_mod,
     });
+    exe_unit_tests.linkLibC();
+    exe_unit_tests.linkSystemLibrary("ssl");
+    exe_unit_tests.linkSystemLibrary("crypto");
 
     const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);
 

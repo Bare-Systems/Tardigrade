@@ -259,12 +259,13 @@ Resolved (incremental): buffered proxy responses now preserve upstream `Content-
 Decision: default behavior still maps non-200 upstream errors into stable gateway error envelopes; full-status passthrough streaming is opt-in to preserve compatibility.
 
 ### 4.2 Upstream Management
-- [ ] upstream blocks
+- [x] upstream blocks
 - [x] Multiple backend servers
 - [x] Server weights
 - [x] Backup servers
 - [x] max_fails / fail_timeout
 
+Resolved (incremental): added route-scoped upstream blocks for `/v1/chat` and `/v1/commands` via dedicated env-configured primary/weight/backup pools, with automatic fallback to the global upstream pool when block-specific pools are unset.
 Resolved (incremental): edge config now supports multiple upstream base URLs via `TARDIGRADE_UPSTREAM_BASE_URLS` (comma-separated), enabling multi-backend proxy target selection at runtime.
 Resolved (incremental): added weighted primary selection via `TARDIGRADE_UPSTREAM_BASE_URL_WEIGHTS` (aligned positive integer weights) for weighted round-robin distribution.
 Resolved (incremental): backup upstream pools now supported via `TARDIGRADE_UPSTREAM_BACKUP_BASE_URLS`; selection uses backups only when primary pools have no healthy/eligible candidate.

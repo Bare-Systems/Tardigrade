@@ -27,6 +27,12 @@ pub const EdgeConfig = struct {
     upstream_base_urls: [][]const u8,
     upstream_base_url_weights: []u32,
     upstream_backup_base_urls: [][]const u8,
+    upstream_chat_base_urls: [][]const u8,
+    upstream_chat_base_url_weights: []u32,
+    upstream_chat_backup_base_urls: [][]const u8,
+    upstream_commands_base_urls: [][]const u8,
+    upstream_commands_base_url_weights: []u32,
+    upstream_commands_backup_base_urls: [][]const u8,
     upstream_lb_algorithm: UpstreamLbAlgorithm,
     /// Proxy target for /v1/chat. Supports absolute URL or path.
     proxy_pass_chat: []const u8,
@@ -118,6 +124,16 @@ pub const EdgeConfig = struct {
         allocator.free(self.upstream_base_url_weights);
         for (self.upstream_backup_base_urls) |u| allocator.free(u);
         allocator.free(self.upstream_backup_base_urls);
+        for (self.upstream_chat_base_urls) |u| allocator.free(u);
+        allocator.free(self.upstream_chat_base_urls);
+        allocator.free(self.upstream_chat_base_url_weights);
+        for (self.upstream_chat_backup_base_urls) |u| allocator.free(u);
+        allocator.free(self.upstream_chat_backup_base_urls);
+        for (self.upstream_commands_base_urls) |u| allocator.free(u);
+        allocator.free(self.upstream_commands_base_urls);
+        allocator.free(self.upstream_commands_base_url_weights);
+        for (self.upstream_commands_backup_base_urls) |u| allocator.free(u);
+        allocator.free(self.upstream_commands_backup_base_urls);
         allocator.free(self.proxy_pass_chat);
         allocator.free(self.proxy_pass_commands_prefix);
         for (self.auth_token_hashes) |h| allocator.free(h);
@@ -166,6 +182,48 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     errdefer {
         for (upstream_backup_base_urls) |u| allocator.free(u);
         allocator.free(upstream_backup_base_urls);
+    }
+    const upstream_chat_base_urls_raw = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_CHAT_BASE_URLS", "") catch unreachable;
+    defer allocator.free(upstream_chat_base_urls_raw);
+    const upstream_chat_base_urls = try parseCsvValues(allocator, upstream_chat_base_urls_raw);
+    errdefer {
+        for (upstream_chat_base_urls) |u| allocator.free(u);
+        allocator.free(upstream_chat_base_urls);
+    }
+    const upstream_chat_base_url_weights_raw = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_CHAT_BASE_URL_WEIGHTS", "") catch unreachable;
+    defer allocator.free(upstream_chat_base_url_weights_raw);
+    const upstream_chat_base_url_weights = try parseCsvU32Values(allocator, upstream_chat_base_url_weights_raw);
+    errdefer allocator.free(upstream_chat_base_url_weights);
+    if (upstream_chat_base_url_weights.len > 0 and upstream_chat_base_url_weights.len != upstream_chat_base_urls.len) {
+        return error.InvalidUpstreamChatBaseUrlWeightsCount;
+    }
+    const upstream_chat_backup_base_urls_raw = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_CHAT_BACKUP_BASE_URLS", "") catch unreachable;
+    defer allocator.free(upstream_chat_backup_base_urls_raw);
+    const upstream_chat_backup_base_urls = try parseCsvValues(allocator, upstream_chat_backup_base_urls_raw);
+    errdefer {
+        for (upstream_chat_backup_base_urls) |u| allocator.free(u);
+        allocator.free(upstream_chat_backup_base_urls);
+    }
+    const upstream_commands_base_urls_raw = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_COMMANDS_BASE_URLS", "") catch unreachable;
+    defer allocator.free(upstream_commands_base_urls_raw);
+    const upstream_commands_base_urls = try parseCsvValues(allocator, upstream_commands_base_urls_raw);
+    errdefer {
+        for (upstream_commands_base_urls) |u| allocator.free(u);
+        allocator.free(upstream_commands_base_urls);
+    }
+    const upstream_commands_base_url_weights_raw = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_COMMANDS_BASE_URL_WEIGHTS", "") catch unreachable;
+    defer allocator.free(upstream_commands_base_url_weights_raw);
+    const upstream_commands_base_url_weights = try parseCsvU32Values(allocator, upstream_commands_base_url_weights_raw);
+    errdefer allocator.free(upstream_commands_base_url_weights);
+    if (upstream_commands_base_url_weights.len > 0 and upstream_commands_base_url_weights.len != upstream_commands_base_urls.len) {
+        return error.InvalidUpstreamCommandsBaseUrlWeightsCount;
+    }
+    const upstream_commands_backup_base_urls_raw = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_COMMANDS_BACKUP_BASE_URLS", "") catch unreachable;
+    defer allocator.free(upstream_commands_backup_base_urls_raw);
+    const upstream_commands_backup_base_urls = try parseCsvValues(allocator, upstream_commands_backup_base_urls_raw);
+    errdefer {
+        for (upstream_commands_backup_base_urls) |u| allocator.free(u);
+        allocator.free(upstream_commands_backup_base_urls);
     }
     const lb_algo_str = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_LB_ALGORITHM", "round_robin") catch unreachable;
     defer allocator.free(lb_algo_str);
@@ -360,6 +418,12 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .upstream_base_urls = upstream_base_urls,
         .upstream_base_url_weights = upstream_base_url_weights,
         .upstream_backup_base_urls = upstream_backup_base_urls,
+        .upstream_chat_base_urls = upstream_chat_base_urls,
+        .upstream_chat_base_url_weights = upstream_chat_base_url_weights,
+        .upstream_chat_backup_base_urls = upstream_chat_backup_base_urls,
+        .upstream_commands_base_urls = upstream_commands_base_urls,
+        .upstream_commands_base_url_weights = upstream_commands_base_url_weights,
+        .upstream_commands_backup_base_urls = upstream_commands_backup_base_urls,
         .upstream_lb_algorithm = upstream_lb_algorithm,
         .proxy_pass_chat = proxy_pass_chat,
         .proxy_pass_commands_prefix = proxy_pass_commands_prefix,

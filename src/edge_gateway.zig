@@ -22,6 +22,19 @@ const ConnectionSlotResult = enum {
     over_global_memory_limit,
 };
 
+const UpstreamScope = enum {
+    global,
+    chat,
+    commands,
+};
+
+const UpstreamPoolView = struct {
+    fallback_url: []const u8,
+    primary_urls: []const []const u8,
+    primary_weights: []const u32,
+    backup_urls: []const []const u8,
+};
+
 /// Persistent gateway state shared across connections.
 const GatewayState = struct {
     allocator: std.mem.Allocator,
@@ -295,47 +308,49 @@ const GatewayState = struct {
         return self.metrics.toPrometheus(allocator);
     }
 
-    fn nextUpstreamBaseUrl(self: *GatewayState, cfg: *const edge_config.EdgeConfig, client_ip: []const u8, hash_key: []const u8) []const u8 {
+    fn nextUpstreamBaseUrl(self: *GatewayState, cfg: *const edge_config.EdgeConfig, pool: UpstreamPoolView, client_ip: []const u8, hash_key: []const u8) []const u8 {
         self.mutex.lock();
         defer self.mutex.unlock();
-        if (cfg.upstream_base_urls.len == 0) return cfg.upstream_base_url;
+        if (pool.primary_urls.len == 0) {
+            return self.selectPrimaryFallbackWithBackupsLocked(cfg, pool, http.event_loop.monotonicMs());
+        }
         const now_ms = http.event_loop.monotonicMs();
 
         switch (cfg.upstream_lb_algorithm) {
             .least_connections => {
-                if (self.selectLeastConnectionsUpstreamLocked(cfg, now_ms)) |selected| {
+                if (self.selectLeastConnectionsUpstreamLocked(cfg, pool, now_ms)) |selected| {
                     return selected;
                 }
-                return self.selectPrimaryFallbackWithBackupsLocked(cfg, now_ms);
+                return self.selectPrimaryFallbackWithBackupsLocked(cfg, pool, now_ms);
             },
             .ip_hash => {
-                if (self.selectIpHashUpstreamLocked(cfg, client_ip, now_ms)) |selected| {
+                if (self.selectIpHashUpstreamLocked(cfg, pool, client_ip, now_ms)) |selected| {
                     return selected;
                 }
-                return self.selectPrimaryFallbackWithBackupsLocked(cfg, now_ms);
+                return self.selectPrimaryFallbackWithBackupsLocked(cfg, pool, now_ms);
             },
             .generic_hash => {
-                if (self.selectGenericHashUpstreamLocked(cfg, hash_key, now_ms)) |selected| {
+                if (self.selectGenericHashUpstreamLocked(cfg, pool, hash_key, now_ms)) |selected| {
                     return selected;
                 }
-                return self.selectPrimaryFallbackWithBackupsLocked(cfg, now_ms);
+                return self.selectPrimaryFallbackWithBackupsLocked(cfg, pool, now_ms);
             },
             .random_two_choices => {
-                if (self.selectRandomTwoChoicesUpstreamLocked(cfg, now_ms)) |selected| {
+                if (self.selectRandomTwoChoicesUpstreamLocked(cfg, pool, now_ms)) |selected| {
                     return selected;
                 }
-                return self.selectPrimaryFallbackWithBackupsLocked(cfg, now_ms);
+                return self.selectPrimaryFallbackWithBackupsLocked(cfg, pool, now_ms);
             },
             .round_robin => {},
         }
-        const primary_slots = primaryWeightedSlotCount(cfg.upstream_base_urls, cfg.upstream_base_url_weights);
+        const primary_slots = primaryWeightedSlotCount(pool.primary_urls, pool.primary_weights);
         const start = self.upstream_rr_index % primary_slots;
 
         var offset: usize = 0;
         while (offset < primary_slots) : (offset += 1) {
             const ticket = (start + offset) % primary_slots;
-            const idx = weightedTicketToIndex(cfg.upstream_base_urls, cfg.upstream_base_url_weights, ticket);
-            const candidate = cfg.upstream_base_urls[idx];
+            const idx = weightedTicketToIndex(pool.primary_urls, pool.primary_weights, ticket);
+            const candidate = pool.primary_urls[idx];
             if (self.isUpstreamHealthyLocked(cfg, candidate, now_ms) and self.slowStartAllowsTrafficLocked(cfg, candidate, now_ms, @intCast(idx))) {
                 self.upstream_rr_index = (ticket + 1) % primary_slots;
                 return candidate;
@@ -346,21 +361,21 @@ const GatewayState = struct {
         offset = 0;
         while (offset < primary_slots) : (offset += 1) {
             const ticket = (start + offset) % primary_slots;
-            const idx = weightedTicketToIndex(cfg.upstream_base_urls, cfg.upstream_base_url_weights, ticket);
-            const candidate = cfg.upstream_base_urls[idx];
+            const idx = weightedTicketToIndex(pool.primary_urls, pool.primary_weights, ticket);
+            const candidate = pool.primary_urls[idx];
             if (self.isUpstreamHealthyLocked(cfg, candidate, now_ms)) {
                 self.upstream_rr_index = (ticket + 1) % primary_slots;
                 return candidate;
             }
         }
 
-        return self.selectPrimaryFallbackWithBackupsLocked(cfg, now_ms);
+        return self.selectPrimaryFallbackWithBackupsLocked(cfg, pool, now_ms);
     }
 
-    fn selectLeastConnectionsUpstreamLocked(self: *GatewayState, cfg: *const edge_config.EdgeConfig, now_ms: u64) ?[]const u8 {
+    fn selectLeastConnectionsUpstreamLocked(self: *GatewayState, cfg: *const edge_config.EdgeConfig, pool: UpstreamPoolView, now_ms: u64) ?[]const u8 {
         var best_idx: ?usize = null;
         var best_load: usize = std.math.maxInt(usize);
-        for (cfg.upstream_base_urls, 0..) |candidate, idx| {
+        for (pool.primary_urls, 0..) |candidate, idx| {
             if (!self.isUpstreamHealthyLocked(cfg, candidate, now_ms)) continue;
             if (!self.slowStartAllowsTrafficLocked(cfg, candidate, now_ms, @intCast(idx))) continue;
 
@@ -371,58 +386,58 @@ const GatewayState = struct {
             }
         }
         if (best_idx) |idx| {
-            self.upstream_rr_index = (idx + 1) % cfg.upstream_base_urls.len;
-            return cfg.upstream_base_urls[idx];
+            self.upstream_rr_index = (idx + 1) % pool.primary_urls.len;
+            return pool.primary_urls[idx];
         }
         return null;
     }
 
-    fn selectIpHashUpstreamLocked(self: *GatewayState, cfg: *const edge_config.EdgeConfig, client_ip: []const u8, now_ms: u64) ?[]const u8 {
-        if (cfg.upstream_base_urls.len == 0) return null;
-        const start = ipHashIndex(client_ip, cfg.upstream_base_urls.len);
+    fn selectIpHashUpstreamLocked(self: *GatewayState, cfg: *const edge_config.EdgeConfig, pool: UpstreamPoolView, client_ip: []const u8, now_ms: u64) ?[]const u8 {
+        if (pool.primary_urls.len == 0) return null;
+        const start = ipHashIndex(client_ip, pool.primary_urls.len);
 
         var offset: usize = 0;
-        while (offset < cfg.upstream_base_urls.len) : (offset += 1) {
-            const idx = (start + offset) % cfg.upstream_base_urls.len;
-            const candidate = cfg.upstream_base_urls[idx];
+        while (offset < pool.primary_urls.len) : (offset += 1) {
+            const idx = (start + offset) % pool.primary_urls.len;
+            const candidate = pool.primary_urls[idx];
             if (!self.isUpstreamHealthyLocked(cfg, candidate, now_ms)) continue;
             if (!self.slowStartAllowsTrafficLocked(cfg, candidate, now_ms, @intCast(idx))) continue;
-            self.upstream_rr_index = (idx + 1) % cfg.upstream_base_urls.len;
+            self.upstream_rr_index = (idx + 1) % pool.primary_urls.len;
             return candidate;
         }
 
         offset = 0;
-        while (offset < cfg.upstream_base_urls.len) : (offset += 1) {
-            const idx = (start + offset) % cfg.upstream_base_urls.len;
-            const candidate = cfg.upstream_base_urls[idx];
+        while (offset < pool.primary_urls.len) : (offset += 1) {
+            const idx = (start + offset) % pool.primary_urls.len;
+            const candidate = pool.primary_urls[idx];
             if (self.isUpstreamHealthyLocked(cfg, candidate, now_ms)) {
-                self.upstream_rr_index = (idx + 1) % cfg.upstream_base_urls.len;
+                self.upstream_rr_index = (idx + 1) % pool.primary_urls.len;
                 return candidate;
             }
         }
         return null;
     }
 
-    fn selectGenericHashUpstreamLocked(self: *GatewayState, cfg: *const edge_config.EdgeConfig, hash_key: []const u8, now_ms: u64) ?[]const u8 {
-        if (cfg.upstream_base_urls.len == 0) return null;
-        const start = ipHashIndex(hash_key, cfg.upstream_base_urls.len);
+    fn selectGenericHashUpstreamLocked(self: *GatewayState, cfg: *const edge_config.EdgeConfig, pool: UpstreamPoolView, hash_key: []const u8, now_ms: u64) ?[]const u8 {
+        if (pool.primary_urls.len == 0) return null;
+        const start = ipHashIndex(hash_key, pool.primary_urls.len);
 
         var offset: usize = 0;
-        while (offset < cfg.upstream_base_urls.len) : (offset += 1) {
-            const idx = (start + offset) % cfg.upstream_base_urls.len;
-            const candidate = cfg.upstream_base_urls[idx];
+        while (offset < pool.primary_urls.len) : (offset += 1) {
+            const idx = (start + offset) % pool.primary_urls.len;
+            const candidate = pool.primary_urls[idx];
             if (!self.isUpstreamHealthyLocked(cfg, candidate, now_ms)) continue;
             if (!self.slowStartAllowsTrafficLocked(cfg, candidate, now_ms, @intCast(idx))) continue;
-            self.upstream_rr_index = (idx + 1) % cfg.upstream_base_urls.len;
+            self.upstream_rr_index = (idx + 1) % pool.primary_urls.len;
             return candidate;
         }
 
         offset = 0;
-        while (offset < cfg.upstream_base_urls.len) : (offset += 1) {
-            const idx = (start + offset) % cfg.upstream_base_urls.len;
-            const candidate = cfg.upstream_base_urls[idx];
+        while (offset < pool.primary_urls.len) : (offset += 1) {
+            const idx = (start + offset) % pool.primary_urls.len;
+            const candidate = pool.primary_urls[idx];
             if (self.isUpstreamHealthyLocked(cfg, candidate, now_ms)) {
-                self.upstream_rr_index = (idx + 1) % cfg.upstream_base_urls.len;
+                self.upstream_rr_index = (idx + 1) % pool.primary_urls.len;
                 return candidate;
             }
         }
@@ -439,18 +454,18 @@ const GatewayState = struct {
         return @intCast(self.nextLbRandomLocked() % len);
     }
 
-    fn selectRandomTwoChoicesUpstreamLocked(self: *GatewayState, cfg: *const edge_config.EdgeConfig, now_ms: u64) ?[]const u8 {
-        if (cfg.upstream_base_urls.len == 0) return null;
+    fn selectRandomTwoChoicesUpstreamLocked(self: *GatewayState, cfg: *const edge_config.EdgeConfig, pool: UpstreamPoolView, now_ms: u64) ?[]const u8 {
+        if (pool.primary_urls.len == 0) return null;
 
-        const first_idx = self.nextRandomIndexLocked(cfg.upstream_base_urls.len);
+        const first_idx = self.nextRandomIndexLocked(pool.primary_urls.len);
         var second_idx = first_idx;
-        if (cfg.upstream_base_urls.len > 1) {
-            second_idx = self.nextRandomIndexLocked(cfg.upstream_base_urls.len - 1);
+        if (pool.primary_urls.len > 1) {
+            second_idx = self.nextRandomIndexLocked(pool.primary_urls.len - 1);
             if (second_idx >= first_idx) second_idx += 1;
         }
 
-        const first = cfg.upstream_base_urls[first_idx];
-        const second = cfg.upstream_base_urls[second_idx];
+        const first = pool.primary_urls[first_idx];
+        const second = pool.primary_urls[second_idx];
         const first_healthy = self.isUpstreamHealthyLocked(cfg, first, now_ms);
         const second_healthy = self.isUpstreamHealthyLocked(cfg, second, now_ms);
         const first_strict = first_healthy and self.slowStartAllowsTrafficLocked(cfg, first, now_ms, @intCast(first_idx));
@@ -475,40 +490,40 @@ const GatewayState = struct {
         };
 
         if (chosen_idx) |idx| {
-            self.upstream_rr_index = (idx + 1) % cfg.upstream_base_urls.len;
-            return cfg.upstream_base_urls[idx];
+            self.upstream_rr_index = (idx + 1) % pool.primary_urls.len;
+            return pool.primary_urls[idx];
         }
         return null;
     }
 
-    fn selectPrimaryFallbackWithBackupsLocked(self: *GatewayState, cfg: *const edge_config.EdgeConfig, now_ms: u64) []const u8 {
-        if (self.selectBackupUpstreamLocked(cfg, now_ms)) |backup| {
+    fn selectPrimaryFallbackWithBackupsLocked(self: *GatewayState, cfg: *const edge_config.EdgeConfig, pool: UpstreamPoolView, now_ms: u64) []const u8 {
+        if (self.selectBackupUpstreamLocked(cfg, pool, now_ms)) |backup| {
             return backup;
         }
         // If all primary backends are currently unhealthy, still probe primaries in round-robin order.
-        return selectUpstreamBaseUrlWeighted(cfg.upstream_base_urls, cfg.upstream_base_url_weights, cfg.upstream_base_url, &self.upstream_rr_index);
+        return selectUpstreamBaseUrlWeighted(pool.primary_urls, pool.primary_weights, pool.fallback_url, &self.upstream_rr_index);
     }
 
-    fn selectBackupUpstreamLocked(self: *GatewayState, cfg: *const edge_config.EdgeConfig, now_ms: u64) ?[]const u8 {
-        if (cfg.upstream_backup_base_urls.len == 0) return null;
+    fn selectBackupUpstreamLocked(self: *GatewayState, cfg: *const edge_config.EdgeConfig, pool: UpstreamPoolView, now_ms: u64) ?[]const u8 {
+        if (pool.backup_urls.len == 0) return null;
 
-        const start = self.upstream_backup_rr_index % cfg.upstream_backup_base_urls.len;
+        const start = self.upstream_backup_rr_index % pool.backup_urls.len;
         var offset: usize = 0;
-        while (offset < cfg.upstream_backup_base_urls.len) : (offset += 1) {
-            const idx = (start + offset) % cfg.upstream_backup_base_urls.len;
-            const candidate = cfg.upstream_backup_base_urls[idx];
+        while (offset < pool.backup_urls.len) : (offset += 1) {
+            const idx = (start + offset) % pool.backup_urls.len;
+            const candidate = pool.backup_urls[idx];
             if (!self.isUpstreamHealthyLocked(cfg, candidate, now_ms)) continue;
             if (!self.slowStartAllowsTrafficLocked(cfg, candidate, now_ms, @intCast(idx))) continue;
-            self.upstream_backup_rr_index = (idx + 1) % cfg.upstream_backup_base_urls.len;
+            self.upstream_backup_rr_index = (idx + 1) % pool.backup_urls.len;
             return candidate;
         }
 
         offset = 0;
-        while (offset < cfg.upstream_backup_base_urls.len) : (offset += 1) {
-            const idx = (start + offset) % cfg.upstream_backup_base_urls.len;
-            const candidate = cfg.upstream_backup_base_urls[idx];
+        while (offset < pool.backup_urls.len) : (offset += 1) {
+            const idx = (start + offset) % pool.backup_urls.len;
+            const candidate = pool.backup_urls[idx];
             if (self.isUpstreamHealthyLocked(cfg, candidate, now_ms)) {
-                self.upstream_backup_rr_index = (idx + 1) % cfg.upstream_backup_base_urls.len;
+                self.upstream_backup_rr_index = (idx + 1) % pool.backup_urls.len;
                 return candidate;
             }
         }
@@ -678,6 +693,35 @@ const GatewayState = struct {
         }
     }
 };
+
+fn upstreamPoolForScope(cfg: *const edge_config.EdgeConfig, scope: UpstreamScope) UpstreamPoolView {
+    return switch (scope) {
+        .chat => if (cfg.upstream_chat_base_urls.len > 0 or cfg.upstream_chat_backup_base_urls.len > 0)
+            .{
+                .fallback_url = cfg.upstream_base_url,
+                .primary_urls = cfg.upstream_chat_base_urls,
+                .primary_weights = cfg.upstream_chat_base_url_weights,
+                .backup_urls = cfg.upstream_chat_backup_base_urls,
+            }
+        else
+            upstreamPoolForScope(cfg, .global),
+        .commands => if (cfg.upstream_commands_base_urls.len > 0 or cfg.upstream_commands_backup_base_urls.len > 0)
+            .{
+                .fallback_url = cfg.upstream_base_url,
+                .primary_urls = cfg.upstream_commands_base_urls,
+                .primary_weights = cfg.upstream_commands_base_url_weights,
+                .backup_urls = cfg.upstream_commands_backup_base_urls,
+            }
+        else
+            upstreamPoolForScope(cfg, .global),
+        .global => .{
+            .fallback_url = cfg.upstream_base_url,
+            .primary_urls = cfg.upstream_base_urls,
+            .primary_weights = cfg.upstream_base_url_weights,
+            .backup_urls = cfg.upstream_backup_base_urls,
+        },
+    };
+}
 
 fn selectUpstreamBaseUrl(base_urls: []const []const u8, fallback: []const u8, rr_index: *usize) []const u8 {
     if (base_urls.len == 0) return fallback;
@@ -951,6 +995,24 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
             .round_robin => {},
         }
     }
+    if (cfg.upstream_chat_base_urls.len > 0 or cfg.upstream_chat_backup_base_urls.len > 0) {
+        state.logger.info(null, "Upstream block 'chat' enabled with {d} base URLs", .{cfg.upstream_chat_base_urls.len});
+        if (cfg.upstream_chat_base_url_weights.len > 0) {
+            state.logger.info(null, "Upstream block 'chat' weights enabled with {d} entries", .{cfg.upstream_chat_base_url_weights.len});
+        }
+        if (cfg.upstream_chat_backup_base_urls.len > 0) {
+            state.logger.info(null, "Upstream block 'chat' backups enabled with {d} base URLs", .{cfg.upstream_chat_backup_base_urls.len});
+        }
+    }
+    if (cfg.upstream_commands_base_urls.len > 0 or cfg.upstream_commands_backup_base_urls.len > 0) {
+        state.logger.info(null, "Upstream block 'commands' enabled with {d} base URLs", .{cfg.upstream_commands_base_urls.len});
+        if (cfg.upstream_commands_base_url_weights.len > 0) {
+            state.logger.info(null, "Upstream block 'commands' weights enabled with {d} entries", .{cfg.upstream_commands_base_url_weights.len});
+        }
+        if (cfg.upstream_commands_backup_base_urls.len > 0) {
+            state.logger.info(null, "Upstream block 'commands' backups enabled with {d} base URLs", .{cfg.upstream_commands_backup_base_urls.len});
+        }
+    }
     if (cfg.upstream_retry_attempts > 1) {
         state.logger.info(null, "Upstream retry attempts configured: {d}", .{cfg.upstream_retry_attempts});
     }
@@ -1105,6 +1167,19 @@ fn runActiveHealthChecks(cfg: *const edge_config.EdgeConfig, state: *GatewayStat
         }
     } else {
         probeSingleUpstream(cfg, state, &probe_client, cfg.upstream_base_url);
+    }
+
+    for (cfg.upstream_chat_base_urls) |base_url| {
+        probeSingleUpstream(cfg, state, &probe_client, base_url);
+    }
+    for (cfg.upstream_chat_backup_base_urls) |base_url| {
+        probeSingleUpstream(cfg, state, &probe_client, base_url);
+    }
+    for (cfg.upstream_commands_base_urls) |base_url| {
+        probeSingleUpstream(cfg, state, &probe_client, base_url);
+    }
+    for (cfg.upstream_commands_backup_base_urls) |base_url| {
+        probeSingleUpstream(cfg, state, &probe_client, base_url);
     }
 }
 
@@ -1691,6 +1766,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         const cmd_exec = proxyJsonExecute(
             allocator,
             cfg,
+            .commands,
             cfg.proxy_pass_commands_prefix,
             upstream_path,
             envelope,
@@ -1910,6 +1986,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         const chat_exec = proxyJsonExecute(
             allocator,
             cfg,
+            .chat,
             cfg.proxy_pass_chat,
             null,
             chat_request_body,
@@ -2109,6 +2186,7 @@ const ProxyExecution = union(enum) {
 fn proxyJsonExecute(
     allocator: std.mem.Allocator,
     cfg: *const edge_config.EdgeConfig,
+    upstream_scope: UpstreamScope,
     proxy_pass_target: []const u8,
     suffix_path: ?[]const u8,
     payload: []const u8,
@@ -2120,9 +2198,10 @@ fn proxyJsonExecute(
     state: *GatewayState,
     enable_streaming_success: bool,
 ) !ProxyExecution {
+    const upstream_pool = upstreamPoolForScope(cfg, upstream_scope);
     const configured_attempts: usize = @intCast(@max(cfg.upstream_retry_attempts, @as(u32, 1)));
-    const configured_upstream_count = if (cfg.upstream_base_urls.len > 0)
-        cfg.upstream_base_urls.len + cfg.upstream_backup_base_urls.len
+    const configured_upstream_count = if (upstream_pool.primary_urls.len > 0 or upstream_pool.backup_urls.len > 0)
+        upstream_pool.primary_urls.len + upstream_pool.backup_urls.len
     else
         @as(usize, 1);
     const max_attempts = @min(configured_attempts, configured_upstream_count);
@@ -2143,7 +2222,7 @@ fn proxyJsonExecute(
             break :blk @intCast(@min(@as(u64, cfg.upstream_timeout_ms), remaining));
         };
 
-        const upstream_base_url = state.nextUpstreamBaseUrl(cfg, client_ip, upstream_hash_key);
+        const upstream_base_url = state.nextUpstreamBaseUrl(cfg, upstream_pool, client_ip, upstream_hash_key);
         state.recordUpstreamAttemptStart(upstream_base_url);
         const exec = blk: {
             defer state.recordUpstreamAttemptEnd(upstream_base_url);
@@ -2700,6 +2779,12 @@ test "resolveProxyTarget handles absolute and relative proxy_pass" {
         .upstream_base_urls = &[_][]const u8{},
         .upstream_base_url_weights = &[_]u32{},
         .upstream_backup_base_urls = &[_][]const u8{},
+        .upstream_chat_base_urls = &[_][]const u8{},
+        .upstream_chat_base_url_weights = &[_]u32{},
+        .upstream_chat_backup_base_urls = &[_][]const u8{},
+        .upstream_commands_base_urls = &[_][]const u8{},
+        .upstream_commands_base_url_weights = &[_]u32{},
+        .upstream_commands_backup_base_urls = &[_][]const u8{},
         .upstream_lb_algorithm = .round_robin,
         .proxy_pass_chat = "/v1/chat",
         .proxy_pass_commands_prefix = "",
@@ -2776,6 +2861,12 @@ test "authorizeRequest accepts valid hash" {
         .upstream_base_urls = &[_][]const u8{},
         .upstream_base_url_weights = &[_]u32{},
         .upstream_backup_base_urls = &[_][]const u8{},
+        .upstream_chat_base_urls = &[_][]const u8{},
+        .upstream_chat_base_url_weights = &[_]u32{},
+        .upstream_chat_backup_base_urls = &[_][]const u8{},
+        .upstream_commands_base_urls = &[_][]const u8{},
+        .upstream_commands_base_url_weights = &[_]u32{},
+        .upstream_commands_backup_base_urls = &[_][]const u8{},
         .upstream_lb_algorithm = .round_robin,
         .proxy_pass_chat = "/v1/chat",
         .proxy_pass_commands_prefix = "",

@@ -94,6 +94,10 @@
   - Added `TARDIGRADE_UPSTREAM_BASE_URL_WEIGHTS` for aligned positive integer primary-backend weights.
   - Primary round-robin selection now supports weighted ticketing for uneven traffic distribution.
   - Added validation for invalid weight configs and weighted-selection unit coverage.
+- Phase 4.2 route-scoped upstream blocks (`src/edge_config.zig`, `src/edge_gateway.zig`):
+  - Added dedicated chat/commands upstream block env settings for primary, weighted, and backup pools.
+  - Proxy execution now chooses upstream pools by route scope and falls back to global upstream pool when route-specific pools are unset.
+  - Active health probes now include configured route-scoped upstream block backends.
 
 ## [0.26.0] - 2026-03-xx
 

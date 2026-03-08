@@ -4,10 +4,12 @@ const http = @import("http.zig");
 pub const UpstreamLbAlgorithm = enum {
     round_robin,
     least_connections,
+    ip_hash,
 
     pub fn parse(value: []const u8) ?UpstreamLbAlgorithm {
         if (std.ascii.eqlIgnoreCase(value, "round_robin") or std.ascii.eqlIgnoreCase(value, "round-robin")) return .round_robin;
         if (std.ascii.eqlIgnoreCase(value, "least_connections") or std.ascii.eqlIgnoreCase(value, "least-connections")) return .least_connections;
+        if (std.ascii.eqlIgnoreCase(value, "ip_hash") or std.ascii.eqlIgnoreCase(value, "ip-hash")) return .ip_hash;
         return null;
     }
 };

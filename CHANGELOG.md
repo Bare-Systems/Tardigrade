@@ -74,6 +74,10 @@
   - Added `TARDIGRADE_UPSTREAM_LB_ALGORITHM` with `round_robin` and `least_connections` modes.
   - Added per-upstream in-flight attempt tracking and least-loaded upstream selection.
   - Least-connections selection is integrated with health/slow-start filters.
+- Phase 4.3 IP-hash load balancing (`src/edge_config.zig`, `src/edge_gateway.zig`):
+  - Extended `TARDIGRADE_UPSTREAM_LB_ALGORITHM` with `ip_hash` mode.
+  - Added client-IP hash upstream selection for stable backend affinity across requests.
+  - IP-hash selection is integrated with health/slow-start filters and falls back cleanly when candidates are unavailable.
 
 ## [0.26.0] - 2026-03-xx
 

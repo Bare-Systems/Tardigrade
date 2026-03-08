@@ -293,17 +293,26 @@ const GatewayState = struct {
         return self.metrics.toPrometheus(allocator);
     }
 
-    fn nextUpstreamBaseUrl(self: *GatewayState, cfg: *const edge_config.EdgeConfig) []const u8 {
+    fn nextUpstreamBaseUrl(self: *GatewayState, cfg: *const edge_config.EdgeConfig, client_ip: []const u8) []const u8 {
         self.mutex.lock();
         defer self.mutex.unlock();
         if (cfg.upstream_base_urls.len == 0) return cfg.upstream_base_url;
         const now_ms = http.event_loop.monotonicMs();
 
-        if (cfg.upstream_lb_algorithm == .least_connections) {
-            if (self.selectLeastConnectionsUpstreamLocked(cfg, now_ms)) |selected| {
-                return selected;
-            }
-            return selectUpstreamBaseUrl(cfg.upstream_base_urls, cfg.upstream_base_url, &self.upstream_rr_index);
+        switch (cfg.upstream_lb_algorithm) {
+            .least_connections => {
+                if (self.selectLeastConnectionsUpstreamLocked(cfg, now_ms)) |selected| {
+                    return selected;
+                }
+                return selectUpstreamBaseUrl(cfg.upstream_base_urls, cfg.upstream_base_url, &self.upstream_rr_index);
+            },
+            .ip_hash => {
+                if (self.selectIpHashUpstreamLocked(cfg, client_ip, now_ms)) |selected| {
+                    return selected;
+                }
+                return selectUpstreamBaseUrl(cfg.upstream_base_urls, cfg.upstream_base_url, &self.upstream_rr_index);
+            },
+            .round_robin => {},
         }
         const start = self.upstream_rr_index % cfg.upstream_base_urls.len;
 
@@ -348,6 +357,32 @@ const GatewayState = struct {
         if (best_idx) |idx| {
             self.upstream_rr_index = (idx + 1) % cfg.upstream_base_urls.len;
             return cfg.upstream_base_urls[idx];
+        }
+        return null;
+    }
+
+    fn selectIpHashUpstreamLocked(self: *GatewayState, cfg: *const edge_config.EdgeConfig, client_ip: []const u8, now_ms: u64) ?[]const u8 {
+        if (cfg.upstream_base_urls.len == 0) return null;
+        const start = ipHashIndex(client_ip, cfg.upstream_base_urls.len);
+
+        var offset: usize = 0;
+        while (offset < cfg.upstream_base_urls.len) : (offset += 1) {
+            const idx = (start + offset) % cfg.upstream_base_urls.len;
+            const candidate = cfg.upstream_base_urls[idx];
+            if (!self.isUpstreamHealthyLocked(cfg, candidate, now_ms)) continue;
+            if (!self.slowStartAllowsTrafficLocked(cfg, candidate, now_ms, @intCast(idx))) continue;
+            self.upstream_rr_index = (idx + 1) % cfg.upstream_base_urls.len;
+            return candidate;
+        }
+
+        offset = 0;
+        while (offset < cfg.upstream_base_urls.len) : (offset += 1) {
+            const idx = (start + offset) % cfg.upstream_base_urls.len;
+            const candidate = cfg.upstream_base_urls[idx];
+            if (self.isUpstreamHealthyLocked(cfg, candidate, now_ms)) {
+                self.upstream_rr_index = (idx + 1) % cfg.upstream_base_urls.len;
+                return candidate;
+            }
         }
         return null;
     }
@@ -521,6 +556,12 @@ fn selectUpstreamBaseUrl(base_urls: []const []const u8, fallback: []const u8, rr
     const idx = rr_index.* % base_urls.len;
     rr_index.* = (idx + 1) % base_urls.len;
     return base_urls[idx];
+}
+
+fn ipHashIndex(client_ip: []const u8, len: usize) usize {
+    if (len == 0) return 0;
+    const hash = std.hash.Wyhash.hash(0, client_ip);
+    return @intCast(hash % len);
 }
 
 const WorkerContext = struct {
@@ -735,8 +776,10 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     }
     if (cfg.upstream_base_urls.len > 0) {
         state.logger.info(null, "Upstream round-robin enabled with {d} base URLs", .{cfg.upstream_base_urls.len});
-        if (cfg.upstream_lb_algorithm == .least_connections) {
-            state.logger.info(null, "Upstream load balancing algorithm: least_connections", .{});
+        switch (cfg.upstream_lb_algorithm) {
+            .least_connections => state.logger.info(null, "Upstream load balancing algorithm: least_connections", .{}),
+            .ip_hash => state.logger.info(null, "Upstream load balancing algorithm: ip_hash", .{}),
+            .round_robin => {},
         }
     }
     if (cfg.upstream_retry_attempts > 1) {
@@ -1926,7 +1969,7 @@ fn proxyJsonExecute(
             break :blk @intCast(@min(@as(u64, cfg.upstream_timeout_ms), remaining));
         };
 
-        const upstream_base_url = state.nextUpstreamBaseUrl(cfg);
+        const upstream_base_url = state.nextUpstreamBaseUrl(cfg, client_ip);
         state.recordUpstreamAttemptStart(upstream_base_url);
         const exec = blk: {
             defer state.recordUpstreamAttemptEnd(upstream_base_url);

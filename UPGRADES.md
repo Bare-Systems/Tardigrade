@@ -144,10 +144,10 @@ These files will be replaced by a proper C binding to ngtcp2 + nghttp3.
 
 ### 3.1 QUIC Transport
 
-- [~] TLS 1.3 crypto handshake via ngtcp2_crypto_openssl (reuse existing OpenSSL context)
+- [x] TLS 1.3 crypto handshake via ngtcp2_crypto_openssl (reuse existing OpenSSL context)
 - [x] UDP socket listener on configurable port (`TARDIGRADE_QUIC_PORT`, default: 443 UDP)
 - [~] Connection migration support (client IP change handling)
-- [ ] Streams: bidirectional request/response, server-initiated push
+- [~] Streams: bidirectional request/response, server-initiated push
 - [ ] Flow control: per-stream and connection-level credit management
 - [ ] Congestion control: cubic (ngtcp2 default) — no custom implementation needed
 - [ ] Loss detection and packet retransmission (handled by ngtcp2 internally)
@@ -156,8 +156,8 @@ These files will be replaced by a proper C binding to ngtcp2 + nghttp3.
 
 ### 3.2 HTTP/3 Layer (nghttp3)
 
-- [ ] QPACK header compression/decompression via nghttp3
-- [ ] HTTP/3 request framing (HEADERS, DATA frames)
+- [~] QPACK header compression/decompression via nghttp3
+- [~] HTTP/3 request framing (HEADERS, DATA frames)
 - [ ] Server push over HTTP/3 streams
 - [ ] `handleHttp3Connection()` function in `edge_gateway.zig` that mirrors
       the existing `handleHttp2Connection()` structure
@@ -170,7 +170,7 @@ These files will be replaced by a proper C binding to ngtcp2 + nghttp3.
 
 ### 3.4 Tests
 
-- [ ] Integration test: HTTP/3 GET request over loopback UDP completes successfully
+- [x] Integration test: HTTP/3 GET request over loopback UDP completes successfully
 - [ ] Integration test: concurrent HTTP/3 streams on one connection return independent responses
 - [x] Integration test: `Alt-Svc` header present on HTTP/1.1 response
 - [ ] Integration test: 0-RTT session resumption completes without full handshake round-trip

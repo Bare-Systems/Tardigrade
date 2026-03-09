@@ -71,13 +71,15 @@ pub fn parsePacket(datagram: []const u8) !ParsedPacket {
     const first = datagram[0];
     const long_header = (first & 0x80) != 0;
     if (!long_header) {
+        const short_dcid_len: usize = 16;
+        if (datagram.len < 1 + short_dcid_len) return error.InvalidQuicPacket;
         return .{
             .packet_type = .short,
             .version = 0,
-            .dcid = "",
+            .dcid = datagram[1 .. 1 + short_dcid_len],
             .scid = "",
             .token = "",
-            .payload = datagram[1..],
+            .payload = datagram[1 + short_dcid_len ..],
         };
     }
 
@@ -142,6 +144,18 @@ test "parse initial packet and detect 0-rtt" {
     };
     const z = try parsePacket(zero_rtt[0..]);
     try std.testing.expect(z.packet_type == .zero_rtt);
+
+    const short = [_]u8{
+        0x40,
+        0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+        0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+        0xaa, 0xbb,
+    };
+    const s = try parsePacket(short[0..]);
+    try std.testing.expect(s.packet_type == .short);
+    try std.testing.expectEqual(@as(usize, 16), s.dcid.len);
+    try std.testing.expectEqual(@as(u8, 0x10), s.dcid[0]);
+    try std.testing.expectEqual(@as(usize, 2), s.payload.len);
 }
 
 test "connection migration tracking" {

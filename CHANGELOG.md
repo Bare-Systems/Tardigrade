@@ -42,6 +42,14 @@
   - Added guarded QUIC packet output attempts via `ngtcp2_conn_write_pkt` after successful packet ingest, plus `/health` surfacing for emitted packet and byte counts.
   - Verified the opt-in HTTP/3 build path against installed `libngtcp2`, `libngtcp2_crypto_ossl`, and `libnghttp3` system packages.
   - Added per-connection nghttp3 session ownership in the ngtcp2 binding, including QUIC stream-data callbacks, stream-close cleanup, and `/health` surfacing for received HTTP/3 stream bytes and completed request assemblies.
+  - Added HTTP/3 runtime fixes for stable thread lifetime, correct nonblocking UDP setup, TLS 1.3 QUIC bootstrap, ALPN `h3` selection, Initial-packet acceptance gating, and timer-driven ngtcp2 expiry handling.
+  - Added HTTP/3 diagnostics surfacing for ngtcp2 error names on `/health` and in runtime logs while driving live `curl --http3-only` handshake probes.
+  - Added pending ngtcp2 write flushing after QUIC reads and expiry ticks so the runtime drains all immediately available handshake output instead of stopping after the first send attempt.
+  - Added live QUIC-handshake alignment with the upstream ngtcp2 server by passing the client packet SCID into `ngtcp2_conn_server_new`, seeding a real server transport-parameter set, enabling QUIC TLS early data, and using stricter `h3` ALPN selection.
+  - Added the first live HTTP/3 loopback integration test using Homebrew `curl --http3-only`, verifying `/health` completes successfully over QUIC.
+  - Added a gateway-owned HTTP/3 request-dispatch seam so ngtcp2/nghttp3 can hand completed requests back to edge logic instead of hardcoding the transport response in the binding layer.
+  - Added HTTP/3 response-body streaming via an nghttp3 data reader for gateway-owned responses, and extended the loopback QUIC integration test to assert the real `/health` JSON body.
+  - Added gateway-backed HTTP/3 dispatch for `/metrics`, `/metrics/json`, and `/metrics/prometheus`, plus live QUIC integration coverage for Prometheus metrics over HTTP/3.
 
 ### Fixed
 - Upgrade 1 integration hardening in the live gateway path:
@@ -60,6 +68,9 @@
   - Fixed the worker-pool own-queue pop path to preserve FIFO drain order under saturation instead of reversing requests with LIFO `pop()`.
   - Fixed active upstream health routing so a backend stays out of rotation until recovery probes succeed, instead of becoming eligible again solely because the passive fail-time window elapsed.
   - Fixed the TLS SNI maintenance path to own its static SNI spec slice instead of retaining a pointer to the caller's freed temporary allocation.
+  - Fixed the HTTP/3 server-connection bootstrap to use the correct peer CID semantics for `ngtcp2_conn_server_new`; live `curl --http3-only` probes now complete the local QUIC/TLS handshake instead of stalling after the first server Initial packet.
+  - Fixed the HTTP/3 post-handshake path to reuse existing native connections for repeated Initial packets and to submit a minimal live response over nghttp3/QUIC without freeing header buffers too early.
+  - Fixed the HTTP/3 response path to advance nghttp3 body write offsets correctly and widened QUIC curl timeouts in the integration harness so live `/health` probes stop flaking under the test runner.
 
 ## [0.29.0] - 2026-03-08
 

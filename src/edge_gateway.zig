@@ -1494,6 +1494,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     var timer = http.event_loop.TimerManager.init(250);
     var http3_runtime: ?http.http3_runtime.Runtime = null;
     var tls_terminator: ?http.tls_termination.TlsTerminator = null;
+    var http3_dispatch_ctx = Http3DispatchContext{ .cfg = cfg, .state = &state };
     if (edge_config.hasTlsFiles(cfg)) {
         var sni_specs = try state_allocator.alloc(http.tls_termination.SniCertSpec, cfg.tls_sni_certs.len);
         defer state_allocator.free(sni_specs);
@@ -1540,6 +1541,8 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
             .enable_0rtt = cfg.http3_enable_0rtt,
             .connection_migration = cfg.http3_connection_migration,
             .max_datagram_size = cfg.http3_max_datagram_size,
+            .request_handler = handleHttp3Request,
+            .request_handler_ctx = &http3_dispatch_ctx,
         }) catch |err| switch (err) {
             error.DependencyUnavailable => blk: {
                 state.logger.warn(null, "HTTP/3 requested but ngtcp2/nghttp3 integration is not enabled in this build", .{});
@@ -3028,37 +3031,9 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
 
     // --- Health endpoint ---
     if (request.method == .GET and std.mem.eql(u8, request.uri.path, "/health")) {
-        const unhealthy_backends = state.upstreamUnhealthyCount();
-        const http3_status = http.http3_handler.configurationStatus(cfg.http3_enabled, edge_config.hasTlsFiles(cfg));
-        const http3_health = http3HealthSnapshot(state, cfg);
-        const body = try std.fmt.allocPrint(
-            allocator,
-            "{{\"status\":\"ok\",\"service\":\"tardigrade-edge\",\"upstream_status\":\"{s}\",\"upstream_unhealthy_backends\":{d},\"http3_status\":\"{s}\",\"http3_quic_port\":{d},\"http3_handshake_state\":\"{s}\",\"http3_datagrams_seen\":{d},\"http3_tracked_connections\":{d},\"http3_native_connections\":{d},\"http3_native_reads_attempted\":{d},\"http3_handshakes_completed\":{d},\"http3_stream_bytes_received\":{d},\"http3_stream_chunks_received\":{d},\"http3_requests_completed\":{d},\"http3_packets_emitted\":{d},\"http3_bytes_emitted\":{d},\"http3_migration_events\":{d},\"http3_last_error_code\":{d}}}",
-            .{
-                if (unhealthy_backends > 0) "degraded" else "healthy",
-                unhealthy_backends,
-                http3_status,
-                if (cfg.http3_enabled) cfg.quic_port else 0,
-                http3_health.handshake_state,
-                http3_health.snapshot.datagrams_seen,
-                http3_health.snapshot.tracked_connections,
-                http3_health.snapshot.native_connections,
-                http3_health.snapshot.native_reads_attempted,
-                http3_health.snapshot.handshakes_completed,
-                http3_health.snapshot.stream_bytes_received,
-                http3_health.snapshot.stream_chunks_received,
-                http3_health.snapshot.requests_completed,
-                http3_health.snapshot.packets_emitted,
-                http3_health.snapshot.bytes_emitted,
-                http3_health.snapshot.migration_events,
-                http3_health.snapshot.last_error_code,
-            },
-        );
-        defer allocator.free(body);
-        var response = http.Response.json(allocator, body);
+        var response = http.Response.init(allocator);
         defer response.deinit();
-        _ = response.setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
-        applyResponseHeaders(state, &response);
+        try populateHealthResponse(allocator, &response, keep_alive, correlation_id, state, cfg, false);
         try response.write(writer);
         state.metricsRecord(200);
         logAccess(&ctx, request.method.toString(), "/health", 200, request.headers.get("user-agent") orelse "");
@@ -5768,6 +5743,11 @@ const Http3HealthSnapshot = struct {
     snapshot: http.http3_runtime.Snapshot,
 };
 
+const Http3DispatchContext = struct {
+    cfg: *const edge_config.EdgeConfig,
+    state: *GatewayState,
+};
+
 fn http3HandshakeState(state: *const GatewayState, cfg: *const edge_config.EdgeConfig, snapshot: http.http3_runtime.Snapshot) []const u8 {
     if (!cfg.http3_enabled) return "disabled";
     if (!edge_config.hasTlsFiles(cfg)) return "config_incomplete";
@@ -5781,6 +5761,129 @@ fn http3HealthSnapshot(state: *const GatewayState, cfg: *const edge_config.EdgeC
         .handshake_state = http3HandshakeState(state, cfg, snapshot),
         .snapshot = snapshot,
     };
+}
+
+fn populateHealthResponse(
+    allocator: std.mem.Allocator,
+    response: *http.Response,
+    keep_alive: ?bool,
+    correlation_id: []const u8,
+    state: *GatewayState,
+    cfg: *const edge_config.EdgeConfig,
+    http3_mode: bool,
+) !void {
+    const unhealthy_backends = state.upstreamUnhealthyCount();
+    const http3_status = http.http3_handler.configurationStatus(cfg.http3_enabled, edge_config.hasTlsFiles(cfg));
+    const http3_health = http3HealthSnapshot(state, cfg);
+    const http3_last_error_name = http.ngtcp2_binding.errorName(http3_health.snapshot.last_error_code) orelse "-";
+    const body = try std.fmt.allocPrint(
+        allocator,
+        "{{\"status\":\"ok\",\"service\":\"tardigrade-edge\",\"upstream_status\":\"{s}\",\"upstream_unhealthy_backends\":{d},\"http3_status\":\"{s}\",\"http3_quic_port\":{d},\"http3_handshake_state\":\"{s}\",\"http3_datagrams_seen\":{d},\"http3_tracked_connections\":{d},\"http3_native_connections\":{d},\"http3_native_reads_attempted\":{d},\"http3_native_read_calls\":{d},\"http3_handshakes_completed\":{d},\"http3_stream_bytes_received\":{d},\"http3_stream_chunks_received\":{d},\"http3_requests_completed\":{d},\"http3_packets_emitted\":{d},\"http3_bytes_emitted\":{d},\"http3_migration_events\":{d},\"http3_last_error_code\":{d},\"http3_last_error_name\":\"{s}\"}}",
+        .{
+            if (unhealthy_backends > 0) "degraded" else "healthy",
+            unhealthy_backends,
+            http3_status,
+            if (cfg.http3_enabled) cfg.quic_port else 0,
+            http3_health.handshake_state,
+            http3_health.snapshot.datagrams_seen,
+            http3_health.snapshot.tracked_connections,
+            http3_health.snapshot.native_connections,
+            http3_health.snapshot.native_reads_attempted,
+            http3_health.snapshot.native_read_calls,
+            http3_health.snapshot.handshakes_completed,
+            http3_health.snapshot.stream_bytes_received,
+            http3_health.snapshot.stream_chunks_received,
+            http3_health.snapshot.requests_completed,
+            http3_health.snapshot.packets_emitted,
+            http3_health.snapshot.bytes_emitted,
+            http3_health.snapshot.migration_events,
+            http3_health.snapshot.last_error_code,
+            http3_last_error_name,
+        },
+    );
+    _ = response
+        .setStatus(.ok)
+        .setBodyOwned(body)
+        .setContentType("application/json")
+        .setHeader(http.correlation.HEADER_NAME, correlation_id);
+    if (keep_alive) |value| _ = response.setConnection(value);
+    if (http3_mode) {
+        _ = response
+            .setHeader("server", http.SERVER_NAME ++ "/" ++ http.SERVER_VERSION)
+            .setContentLength(body.len);
+    }
+    applyResponseHeaders(state, response);
+}
+
+fn finalizeHttp3Response(response: *http.Response) void {
+    _ = response
+        .setHeader("server", http.SERVER_NAME ++ "/" ++ http.SERVER_VERSION)
+        .setContentLength(if (response.body) |body| body.len else 0);
+}
+
+fn handleHttp3Request(
+    allocator: std.mem.Allocator,
+    request: *const http.http3_session.StreamRequest,
+    response: *http.Response,
+    user_data: ?*anyopaque,
+) !void {
+    const ctx: *Http3DispatchContext = @ptrCast(@alignCast(user_data orelse return error.InvalidArgument));
+    const correlation_id = request.headers.get(http.correlation.HEADER_NAME) orelse "http3";
+
+    if (std.mem.eql(u8, request.method, "GET") and std.mem.eql(u8, request.path, "/health")) {
+        try populateHealthResponse(allocator, response, null, correlation_id, ctx.state, ctx.cfg, true);
+        ctx.state.metricsRecord(200);
+        return;
+    }
+
+    if (std.mem.eql(u8, request.method, "GET") and std.mem.eql(u8, request.path, "/metrics")) {
+        const prom_text = try ctx.state.metricsToPrometheus(allocator);
+        _ = response
+            .setStatus(.ok)
+            .setBodyOwned(prom_text)
+            .setContentType("text/plain; version=0.0.4; charset=utf-8")
+            .setHeader(http.correlation.HEADER_NAME, correlation_id);
+        finalizeHttp3Response(response);
+        applyResponseHeaders(ctx.state, response);
+        ctx.state.metricsRecord(200);
+        return;
+    }
+
+    if (std.mem.eql(u8, request.method, "GET") and std.mem.eql(u8, request.path, "/metrics/json")) {
+        const metrics_json = try ctx.state.metricsToJson(allocator);
+        _ = response
+            .setStatus(.ok)
+            .setBodyOwned(metrics_json)
+            .setContentType("application/json")
+            .setHeader(http.correlation.HEADER_NAME, correlation_id);
+        finalizeHttp3Response(response);
+        applyResponseHeaders(ctx.state, response);
+        ctx.state.metricsRecord(200);
+        return;
+    }
+
+    if (std.mem.eql(u8, request.method, "GET") and std.mem.eql(u8, request.path, "/metrics/prometheus")) {
+        const prom_text = try ctx.state.metricsToPrometheus(allocator);
+        _ = response
+            .setStatus(.ok)
+            .setBodyOwned(prom_text)
+            .setContentType("text/plain; version=0.0.4; charset=utf-8")
+            .setHeader(http.correlation.HEADER_NAME, correlation_id);
+        finalizeHttp3Response(response);
+        applyResponseHeaders(ctx.state, response);
+        ctx.state.metricsRecord(200);
+        return;
+    }
+
+    const payload = try buildApiErrorJson(allocator, "invalid_request", "Not Found", correlation_id);
+    _ = response
+        .setStatus(.not_found)
+        .setBodyOwned(payload)
+        .setContentType("application/json")
+        .setHeader(http.correlation.HEADER_NAME, correlation_id);
+    finalizeHttp3Response(response);
+    applyResponseHeaders(ctx.state, response);
+    ctx.state.metricsRecord(404);
 }
 
 fn authorizeRequest(cfg: *const edge_config.EdgeConfig, headers: *const http.Headers) AuthResult {

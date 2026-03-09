@@ -2,6 +2,8 @@ const std = @import("std");
 const build_options = @import("build_options");
 const http3_session = @import("http3_session.zig");
 const quic = @import("quic.zig");
+const response_mod = @import("response.zig");
+const status_mod = @import("status.zig");
 
 pub const enabled = build_options.enable_http3_ngtcp2;
 
@@ -26,6 +28,13 @@ pub const TransportConfig = struct {
     max_datagram_size: usize = 1350,
 };
 
+pub const RequestHandler = *const fn (
+    allocator: std.mem.Allocator,
+    request: *const http3_session.StreamRequest,
+    response: *response_mod.Response,
+    user_data: ?*anyopaque,
+) anyerror!void;
+
 pub const ServerBootstrap = struct {
     quic_port: u16,
     tls_cert_path: []const u8 = "",
@@ -35,6 +44,8 @@ pub const ServerBootstrap = struct {
     enable_0rtt: bool = false,
     connection_migration: bool = false,
     max_datagram_size: usize = 1350,
+    request_handler: ?RequestHandler = null,
+    request_handler_ctx: ?*anyopaque = null,
 };
 
 pub const ServerStats = struct {
@@ -56,6 +67,7 @@ pub const ServerSnapshot = struct {
     tracked_connections: usize = 0,
     native_connections: usize = 0,
     native_reads_attempted: usize = 0,
+    native_read_calls: usize = 0,
     handshakes_completed: usize = 0,
     stream_bytes_received: usize = 0,
     stream_chunks_received: usize = 0,
@@ -69,6 +81,13 @@ pub const DatagramResult = struct {
     bytes_to_send: usize = 0,
 };
 
+pub const TimerResult = struct {
+    bytes_to_send: usize = 0,
+    remote_addr: ?std.net.Address = null,
+};
+
+pub const WriteResult = TimerResult;
+
 pub const ConnectionState = struct {
     cid_hex: []u8,
     remote_ip: []u8,
@@ -80,6 +99,7 @@ pub const ConnectionState = struct {
     zero_rtt_seen: bool = false,
     native_connection_created: bool = false,
     native_read_attempted: bool = false,
+    native_read_calls: usize = 0,
     handshake_complete: bool = false,
     stream_bytes_received: usize = 0,
     stream_chunks_received: usize = 0,
@@ -109,6 +129,8 @@ pub const Binding = if (enabled) struct {
             requests_completed: usize,
             conn_ref: c.ngtcp2_crypto_conn_ref,
             path_storage: c.ngtcp2_path_storage,
+            local_addr: std.net.Address,
+            remote_addr: std.net.Address,
             scid: c.ngtcp2_cid,
             dcid: c.ngtcp2_cid,
         };
@@ -166,6 +188,13 @@ pub const Binding = if (enabled) struct {
         if (cfg.max_datagram_size == 0) return error.NotYetImplemented;
     }
 
+    pub fn errorName(code: i32) ?[]const u8 {
+        if (code == 0) return null;
+        const text = c.ngtcp2_strerror(@intCast(code));
+        if (text == null) return null;
+        return std.mem.span(text);
+    }
+
     pub fn snapshot(server: *const @This().Server) ServerSnapshot {
         var view = ServerSnapshot{
             .datagrams_seen = server.stats.datagrams_seen,
@@ -181,11 +210,20 @@ pub const Binding = if (enabled) struct {
         var it = server.connections.valueIterator();
         while (it.next()) |conn| {
             if (conn.native_read_attempted) view.native_reads_attempted += 1;
+            view.native_read_calls += conn.native_read_calls;
             if (conn.handshake_complete) view.handshakes_completed += 1;
             view.stream_bytes_received += conn.stream_bytes_received;
             view.stream_chunks_received += conn.stream_chunks_received;
             view.requests_completed += conn.requests_completed;
             if (conn.native_last_error_code != 0) view.last_error_code = conn.native_last_error_code;
+        }
+        if (view.handshakes_completed == 0) {
+            var native_it = server.native_connections.valueIterator();
+            while (native_it.next()) |native| {
+                if (c.ngtcp2_conn_get_handshake_completed(native.*.conn) != 0 or c.SSL_is_init_finished(native.*.ssl) == 1) {
+                    view.handshakes_completed += 1;
+                }
+            }
         }
         return view;
     }
@@ -223,8 +261,10 @@ pub const Binding = if (enabled) struct {
         }
         try upsertConnection(server, packet, datagram, remote_ip, remote_addr.getPort());
         if (packet.packet_type == .initial) {
-            if (c.ngtcp2_accept(null, datagram.ptr, datagram.len) != 0) return .{};
-            try ensureNativeConnection(server, packet, local_addr, remote_addr);
+            if (try findNativeConnection(server, packet) == null) {
+                if (c.ngtcp2_accept(null, datagram.ptr, datagram.len) != 0) return .{};
+                try ensureNativeConnection(server, packet, local_addr, remote_addr);
+            }
         }
         const native = try findNativeConnection(server, packet) orelse return .{};
         const read_rc = try readNativePacket(server, native, datagram, local_addr, remote_addr);
@@ -234,6 +274,37 @@ pub const Binding = if (enabled) struct {
             0;
         _ = c.ngtcp2_version(0);
         return .{ .bytes_to_send = bytes_to_send };
+    }
+
+    pub fn handleExpiry(server: *@This().Server, out_buf: []u8) Ngtcp2Error!TimerResult {
+        var it = server.native_connections.valueIterator();
+        while (it.next()) |native_ptr| {
+            const native = native_ptr.*;
+            const expiry = c.ngtcp2_conn_get_expiry(native.conn);
+            const now = timestampNow();
+            if (expiry > now) continue;
+            const rc = c.ngtcp2_conn_handle_expiry(native.conn, now);
+            const handshake_complete = c.ngtcp2_conn_get_handshake_completed(native.conn) != 0;
+            setConnectionStateFlags(server, native.dcid.data[0..native.dcid.datalen], true, true, handshake_complete, rc);
+            if (rc != 0) continue;
+            const bytes_to_send = try writeNativePacket(server, native, native.local_addr, native.remote_addr, out_buf);
+            if (bytes_to_send > 0) {
+                return .{ .bytes_to_send = bytes_to_send, .remote_addr = native.remote_addr };
+            }
+        }
+        return .{};
+    }
+
+    pub fn flushPendingWrites(server: *@This().Server, out_buf: []u8) Ngtcp2Error!WriteResult {
+        var it = server.native_connections.valueIterator();
+        while (it.next()) |native_ptr| {
+            const native = native_ptr.*;
+            const bytes_to_send = try writeNativePacket(server, native, native.local_addr, native.remote_addr, out_buf);
+            if (bytes_to_send > 0) {
+                return .{ .bytes_to_send = bytes_to_send, .remote_addr = native.remote_addr };
+            }
+        }
+        return .{};
     }
 
     fn upsertConnection(server: *@This().Server, packet: quic.ParsedPacket, datagram: []const u8, remote_ip: []const u8, remote_port: u16) !void {
@@ -277,6 +348,7 @@ pub const Binding = if (enabled) struct {
     fn ensureNativeConnection(server: *@This().Server, packet: quic.ParsedPacket, local_addr: std.net.Address, remote_addr: std.net.Address) !void {
         const original_dcid = packet.dcid;
         if (original_dcid.len == 0) return;
+        if (packet.scid.len == 0) return;
 
         const cid_hex = try std.fmt.allocPrint(server.allocator, "{s}", .{std.fmt.fmtSliceHexLower(original_dcid)});
         defer server.allocator.free(cid_hex);
@@ -306,6 +378,8 @@ pub const Binding = if (enabled) struct {
                 .user_data = null,
             },
             .path_storage = undefined,
+            .local_addr = local_addr,
+            .remote_addr = remote_addr,
             .scid = undefined,
             .dcid = undefined,
         };
@@ -318,24 +392,43 @@ pub const Binding = if (enabled) struct {
         callbacks.decrypt = c.ngtcp2_crypto_decrypt_cb;
         callbacks.hp_mask = c.ngtcp2_crypto_hp_mask_cb;
         callbacks.recv_stream_data = recvStreamDataCb;
+        callbacks.acked_stream_data_offset = ackedStreamDataOffsetCb;
         callbacks.stream_close = streamCloseCb;
         callbacks.rand = randCb;
         callbacks.get_new_connection_id = getNewConnectionIdCb;
         callbacks.update_key = c.ngtcp2_crypto_update_key_cb;
+        callbacks.extend_max_remote_streams_bidi = extendMaxRemoteStreamsBidiCb;
+        callbacks.extend_max_stream_data = extendMaxStreamDataCb;
         callbacks.delete_crypto_aead_ctx = c.ngtcp2_crypto_delete_crypto_aead_ctx_cb;
         callbacks.delete_crypto_cipher_ctx = c.ngtcp2_crypto_delete_crypto_cipher_ctx_cb;
         callbacks.get_path_challenge_data = c.ngtcp2_crypto_get_path_challenge_data_cb;
         callbacks.version_negotiation = c.ngtcp2_crypto_version_negotiation_cb;
+        callbacks.recv_tx_key = recvTxKeyCb;
 
         var settings: c.ngtcp2_settings = undefined;
         c.ngtcp2_settings_default(&settings);
+        settings.initial_ts = timestampNow();
+        settings.max_tx_udp_payload_size = @intCast(server.config.max_datagram_size);
 
         var params: c.ngtcp2_transport_params = undefined;
         c.ngtcp2_transport_params_default(&params);
+        params.initial_max_stream_data_bidi_local = 1 * 1024 * 1024;
+        params.initial_max_stream_data_bidi_remote = 1 * 1024 * 1024;
+        params.initial_max_stream_data_uni = 1 * 1024 * 1024;
+        params.initial_max_data = 4 * 1024 * 1024;
+        params.initial_max_streams_bidi = 32;
+        params.initial_max_streams_uni = 32;
+        params.max_idle_timeout = 30 * std.time.ns_per_s;
+        params.max_udp_payload_size = server.config.max_datagram_size;
+        params.active_connection_id_limit = 7;
+        params.disable_active_migration = if (server.config.connection_migration) 0 else 1;
+        params.grease_quic_bit = 1;
 
         c.ngtcp2_cid_init(&native.dcid, original_dcid.ptr, original_dcid.len);
         params.original_dcid = native.dcid;
         params.original_dcid_present = 1;
+        var client_scid: c.ngtcp2_cid = undefined;
+        c.ngtcp2_cid_init(&client_scid, packet.scid.ptr, packet.scid.len);
         var scid_bytes: [16]u8 = undefined;
         std.crypto.random.bytes(&scid_bytes);
         c.ngtcp2_cid_init(&native.scid, &scid_bytes, scid_bytes.len);
@@ -350,7 +443,7 @@ pub const Binding = if (enabled) struct {
 
         if (c.ngtcp2_conn_server_new(
             &native.conn,
-            &native.dcid,
+            &client_scid,
             &native.scid,
             &native.path_storage.path,
             packet.version,
@@ -367,6 +460,7 @@ pub const Binding = if (enabled) struct {
         c.ngtcp2_conn_set_tls_native_handle(native.conn, native.crypto_ctx);
         _ = c.SSL_set_app_data(native.ssl, &native.conn_ref);
         if (c.ngtcp2_crypto_ossl_configure_server_session(native.ssl) != 0) return error.TlsBootstrapFailed;
+        _ = c.SSL_set_quic_tls_early_data_enabled(native.ssl, 1);
 
         const key = try server.allocator.dupe(u8, cid_hex);
         errdefer server.allocator.free(key);
@@ -376,6 +470,8 @@ pub const Binding = if (enabled) struct {
     }
 
     fn readNativePacket(server: *@This().Server, native: *@This().Server.NativeConnection, datagram: []const u8, local_addr: std.net.Address, remote_addr: std.net.Address) !c_int {
+        native.local_addr = local_addr;
+        native.remote_addr = remote_addr;
         c.ngtcp2_path_storage_init(
             &native.path_storage,
             @ptrCast(&local_addr.any),
@@ -394,7 +490,21 @@ pub const Binding = if (enabled) struct {
             datagram.len,
             timestampNow(),
         );
-        if (c.SSL_is_init_finished(native.ssl) == 1) c.ngtcp2_conn_tls_handshake_completed(native.conn);
+        if (c.SSL_is_init_finished(native.ssl) == 1) {
+            c.ngtcp2_conn_tls_handshake_completed(native.conn);
+            if (native.session) |*session| {
+                if (!session.isActivated() and native.conn != null) {
+                    session.activate(@ptrCast(native.conn.?)) catch |err| {
+                        std.debug.print("http3 session activation failed: {any}\n", .{err});
+                    };
+                    if (session.isActivated()) std.debug.print("http3 session activated after tls finish\n", .{});
+                }
+            }
+        }
+        if (rc != 0 and native.conn != null) {
+            const ccerr = c.ngtcp2_conn_get_ccerr(native.conn.?);
+            std.debug.print("http3 read rc={d} ccerr_type={d} ccerr_code={d}\n", .{ rc, ccerr.*.type, ccerr.*.error_code });
+        }
         const handshake_complete = c.ngtcp2_conn_get_handshake_completed(native.conn) != 0;
         setConnectionStateFlags(server, native.dcid.data[0..native.dcid.datalen], true, true, handshake_complete, rc);
         return rc;
@@ -412,18 +522,99 @@ pub const Binding = if (enabled) struct {
         );
         var pkt_info = std.mem.zeroes(c.ngtcp2_pkt_info);
         pkt_info.ecn = c.NGTCP2_ECN_NOT_ECT;
-        const written = c.ngtcp2_conn_write_pkt(
-            native.conn,
-            &native.path_storage.path,
-            &pkt_info,
-            out_buf.ptr,
-            out_buf.len,
-            timestampNow(),
-        );
-        if (written <= 0) return 0;
+        const handshake_complete = c.ngtcp2_conn_get_handshake_completed(native.conn) != 0;
+        const written = if (native.session != null and native.session.?.isActivated() and handshake_complete)
+            try writeNativeHttp3Packet(native, &native.path_storage.path, &pkt_info, out_buf)
+        else
+            c.ngtcp2_conn_write_pkt(
+                native.conn,
+                &native.path_storage.path,
+                &pkt_info,
+                out_buf.ptr,
+                out_buf.len,
+                timestampNow(),
+            );
+        if (written < 0) {
+            setConnectionStateFlags(server, native.dcid.data[0..native.dcid.datalen], true, true, false, @intCast(written));
+            return 0;
+        }
+        if (written == 0) return 0;
         server.stats.packets_emitted += 1;
         server.stats.bytes_emitted += @intCast(written);
         return @intCast(written);
+    }
+
+    fn writeNativeHttp3Packet(native: *@This().Server.NativeConnection, path: *c.ngtcp2_path, pkt_info: *c.ngtcp2_pkt_info, out_buf: []u8) !c.ngtcp2_ssize {
+        const session = &(native.session.?);
+        const http3_conn: *c.nghttp3_conn = @ptrCast(@alignCast(session.rawConn()));
+        var vecs: [16]c.nghttp3_vec = undefined;
+
+        while (true) {
+            var stream_id: i64 = -1;
+            var fin: c_int = 0;
+            var stream_vec_count: c.nghttp3_ssize = 0;
+
+            if (c.ngtcp2_conn_get_max_data_left(native.conn) != 0) {
+                stream_vec_count = c.nghttp3_conn_writev_stream(http3_conn, &stream_id, &fin, &vecs, vecs.len);
+                if (stream_vec_count < 0) {
+                    std.debug.print("http3 writev_stream failed: {d}\n", .{stream_vec_count});
+                    return error.NotYetImplemented;
+                }
+            }
+            const vec_count: usize = @intCast(@max(stream_vec_count, 0));
+            const quic_vec_ptr: [*c]const c.ngtcp2_vec = if (vec_count == 0) null else @as([*c]const c.ngtcp2_vec, @ptrCast(vecs[0..vec_count].ptr));
+
+            var data_written: c.ngtcp2_ssize = -1;
+            var flags: u32 = c.NGTCP2_WRITE_STREAM_FLAG_MORE | c.NGTCP2_WRITE_STREAM_FLAG_PADDING;
+            if (fin != 0) flags |= c.NGTCP2_WRITE_STREAM_FLAG_FIN;
+
+            const packet_written = c.ngtcp2_conn_writev_stream(
+                native.conn,
+                path,
+                pkt_info,
+                out_buf.ptr,
+                out_buf.len,
+                &data_written,
+                flags,
+                stream_id,
+                quic_vec_ptr,
+                vec_count,
+                timestampNow(),
+            );
+            if (packet_written < 0) {
+                switch (packet_written) {
+                    c.NGTCP2_ERR_STREAM_DATA_BLOCKED => {
+                        std.debug.print("http3 stream data blocked: stream_id={d}\n", .{stream_id});
+                        if (stream_id >= 0) _ = c.nghttp3_conn_block_stream(http3_conn, stream_id);
+                        continue;
+                    },
+                    c.NGTCP2_ERR_STREAM_SHUT_WR => {
+                        std.debug.print("http3 stream shutdown write: stream_id={d}\n", .{stream_id});
+                        if (stream_id >= 0) _ = c.nghttp3_conn_shutdown_stream_write(http3_conn, stream_id);
+                        continue;
+                    },
+                    c.NGTCP2_ERR_WRITE_MORE => {
+                        std.debug.print("http3 write more: stream_id={d} data_written={d}\n", .{ stream_id, data_written });
+                        if (stream_id >= 0 and data_written >= 0) {
+                            _ = c.nghttp3_conn_add_write_offset(http3_conn, stream_id, @intCast(data_written));
+                            session.addWriteOffset(stream_id, @intCast(data_written));
+                        }
+                        continue;
+                    },
+                    else => {
+                        std.debug.print("http3 ngtcp2 writev_stream failed: {d}\n", .{packet_written});
+                        return packet_written;
+                    },
+                }
+            }
+
+            if (stream_id >= 0 and data_written >= 0) {
+                std.debug.print("http3 wrote stream data: stream_id={d} data_written={d} packet_written={d} fin={d}\n", .{ stream_id, data_written, packet_written, fin });
+                _ = c.nghttp3_conn_add_write_offset(http3_conn, stream_id, @intCast(data_written));
+                session.addWriteOffset(stream_id, @intCast(data_written));
+            }
+            return packet_written;
+        }
     }
 
     fn findNativeConnection(server: *@This().Server, packet: quic.ParsedPacket) !?*@This().Server.NativeConnection {
@@ -466,6 +657,7 @@ pub const Binding = if (enabled) struct {
         if (server.connections.getPtr(cid_hex)) |conn| {
             conn.native_connection_created = conn.native_connection_created or native_created;
             conn.native_read_attempted = conn.native_read_attempted or read_attempted;
+            if (read_attempted) conn.native_read_calls += 1;
             conn.handshake_complete = conn.handshake_complete or handshake_complete;
             conn.native_last_error_code = last_error_code;
         }
@@ -499,12 +691,20 @@ pub const Binding = if (enabled) struct {
         return 0;
     }
 
-    fn recvStreamDataCb(_: ?*c.ngtcp2_conn, flags: u32, stream_id: i64, _: u64, data: [*c]const u8, datalen: usize, user_data: ?*anyopaque, _: ?*anyopaque) callconv(.c) c_int {
+    fn recvStreamDataCb(conn: ?*c.ngtcp2_conn, flags: u32, stream_id: i64, _: u64, data: [*c]const u8, datalen: usize, user_data: ?*anyopaque, _: ?*anyopaque) callconv(.c) c_int {
         const native: *@This().Server.NativeConnection = @ptrCast(@alignCast(user_data orelse return c.NGTCP2_ERR_CALLBACK_FAILURE));
         const server: *@This().Server = @ptrCast(@alignCast(native.server_ptr));
         const fin = (flags & c.NGTCP2_STREAM_DATA_FLAG_FIN) != 0;
         if (native.session) |*session| {
-            _ = session.ingestRequestBytes(stream_id, data[0..datalen], fin) catch return c.NGTCP2_ERR_CALLBACK_FAILURE;
+            const consumed = session.ingestRequestBytes(stream_id, data[0..datalen], fin) catch |err| {
+                std.debug.print("http3 ingest request bytes failed: stream_id={d} datalen={d} fin={} err={any}\n", .{ stream_id, datalen, fin, err });
+                return c.NGTCP2_ERR_CALLBACK_FAILURE;
+            };
+            std.debug.print("http3 recv stream data: stream_id={d} datalen={d} consumed={d} fin={}\n", .{ stream_id, datalen, consumed, fin });
+            if (conn) |quic_conn| {
+                _ = c.ngtcp2_conn_extend_max_stream_offset(quic_conn, stream_id, consumed);
+                c.ngtcp2_conn_extend_max_offset(quic_conn, consumed);
+            }
             native.stream_bytes_received += datalen;
             native.stream_chunks_received += 1;
             var completed = false;
@@ -512,9 +712,33 @@ pub const Binding = if (enabled) struct {
                 completed = true;
                 native.requests_completed += 1;
                 var owned_request = request;
+                var response = response_mod.Response.init(server.allocator);
+                defer response.deinit();
+                if (server.config.request_handler) |handler| {
+                    handler(server.allocator, &owned_request, &response, server.config.request_handler_ctx) catch |err| {
+                        std.debug.print("http3 request handler failed: stream_id={d} err={any}\n", .{ stream_id, err });
+                        owned_request.deinit();
+                        return c.NGTCP2_ERR_CALLBACK_FAILURE;
+                    };
+                } else {
+                    populateFallbackResponse(&response, &owned_request);
+                }
+                session.submitResponse(server.allocator, stream_id, &response) catch |err| {
+                    std.debug.print("http3 submit response failed: stream_id={d} err={any}\n", .{ stream_id, err });
+                    owned_request.deinit();
+                    return c.NGTCP2_ERR_CALLBACK_FAILURE;
+                };
                 owned_request.deinit();
             }
             noteStreamData(server, native.dcid.data[0..native.dcid.datalen], datalen, completed);
+        }
+        return 0;
+    }
+
+    fn ackedStreamDataOffsetCb(_: ?*c.ngtcp2_conn, stream_id: i64, _: u64, datalen: u64, user_data: ?*anyopaque, _: ?*anyopaque) callconv(.c) c_int {
+        const native: *@This().Server.NativeConnection = @ptrCast(@alignCast(user_data orelse return c.NGTCP2_ERR_CALLBACK_FAILURE));
+        if (native.session) |*session| {
+            session.addAckOffset(stream_id, datalen) catch return c.NGTCP2_ERR_CALLBACK_FAILURE;
         }
         return 0;
     }
@@ -535,6 +759,54 @@ pub const Binding = if (enabled) struct {
         c.ngtcp2_cid_init(cid, &cid_bytes, cidlen);
         std.crypto.random.bytes(token[0..c.NGTCP2_STATELESS_RESET_TOKENLEN]);
         return 0;
+    }
+
+    fn extendMaxRemoteStreamsBidiCb(_: ?*c.ngtcp2_conn, max_streams: u64, user_data: ?*anyopaque) callconv(.c) c_int {
+        const native: *@This().Server.NativeConnection = @ptrCast(@alignCast(user_data orelse return c.NGTCP2_ERR_CALLBACK_FAILURE));
+        if (native.session) |*session| {
+            session.setMaxClientStreamsBidi(max_streams);
+        }
+        return 0;
+    }
+
+    fn extendMaxStreamDataCb(_: ?*c.ngtcp2_conn, stream_id: i64, _: u64, user_data: ?*anyopaque, _: ?*anyopaque) callconv(.c) c_int {
+        const native: *@This().Server.NativeConnection = @ptrCast(@alignCast(user_data orelse return c.NGTCP2_ERR_CALLBACK_FAILURE));
+        if (native.session) |*session| {
+            session.unblockStream(stream_id) catch return c.NGTCP2_ERR_CALLBACK_FAILURE;
+        }
+        return 0;
+    }
+
+    fn recvTxKeyCb(conn: ?*c.ngtcp2_conn, level: c.ngtcp2_encryption_level, user_data: ?*anyopaque) callconv(.c) c_int {
+        std.debug.print("http3 recv_tx_key level={d} has_conn={} has_user_data={}\n", .{ level, conn != null, user_data != null });
+        if (level != c.NGTCP2_ENCRYPTION_LEVEL_1RTT) return 0;
+        if (conn == null or user_data == null) return 0;
+        const native: *@This().Server.NativeConnection = @ptrCast(@alignCast(user_data.?));
+        if (native.session) |*session| {
+            if (!session.isActivated()) {
+                session.activate(@ptrCast(conn.?)) catch |err| {
+                    std.debug.print("http3 recv_tx_key activation failed: {any}\n", .{err});
+                };
+                std.debug.print("http3 recv_tx_key activation state={}\n", .{session.isActivated()});
+            }
+        }
+        return 0;
+    }
+
+    fn populateFallbackResponse(response: *response_mod.Response, request: *const http3_session.StreamRequest) void {
+        if (std.mem.eql(u8, request.method, "GET") and std.mem.eql(u8, request.path, "/health")) {
+            _ = response
+                .setStatus(.ok)
+                .setHeader("content-type", "application/json")
+                .setHeader("server", "tardigrade/http3")
+                .setContentLength(0);
+            return;
+        }
+        _ = response
+            .setStatus(.not_found)
+            .setHeader("content-type", "text/plain")
+            .setHeader("server", "tardigrade/http3")
+            .setContentLength(0);
     }
 
     fn createQuicServerTlsContext(cfg: ServerBootstrap) Ngtcp2Error!*c.SSL_CTX {
@@ -559,16 +831,32 @@ pub const Binding = if (enabled) struct {
         return ctx;
     }
 
-    fn selectAlpnCb(_: ?*c.SSL, out: [*c][*c]const u8, outlen: [*c]u8, in: [*c]const u8, inlen: c_uint, _: ?*anyopaque) callconv(.c) c_int {
-        const h3 = c.NGHTTP3_ALPN_H3;
-        var selected: [*c]u8 = null;
-        var selected_len: u8 = 0;
-        if (c.SSL_select_next_proto(&selected, &selected_len, h3, 3, in, inlen) != c.OPENSSL_NPN_NEGOTIATED) {
-            return c.SSL_TLSEXT_ERR_NOACK;
+    fn selectAlpnCb(ssl: ?*c.SSL, out: [*c][*c]const u8, outlen: [*c]u8, in: [*c]const u8, inlen: c_uint, _: ?*anyopaque) callconv(.c) c_int {
+        const conn_ref = c.SSL_get_app_data(ssl) orelse return c.SSL_TLSEXT_ERR_ALERT_FATAL;
+        const typed_ref: *c.ngtcp2_crypto_conn_ref = @ptrCast(@alignCast(conn_ref));
+        const get_conn = typed_ref.get_conn orelse return c.SSL_TLSEXT_ERR_ALERT_FATAL;
+        const conn = get_conn(typed_ref) orelse return c.SSL_TLSEXT_ERR_ALERT_FATAL;
+        const version = c.ngtcp2_conn_get_client_chosen_version(conn);
+        switch (version) {
+            c.NGTCP2_PROTO_VER_V1, c.NGTCP2_PROTO_VER_V2 => {},
+            else => return c.SSL_TLSEXT_ERR_ALERT_FATAL,
         }
-        out.* = selected;
-        outlen.* = selected_len;
-        return c.SSL_TLSEXT_ERR_OK;
+
+        const protocols = in[0..inlen];
+        const h3 = c.NGHTTP3_ALPN_H3[0..3];
+        var offset: usize = 0;
+        while (offset < protocols.len) {
+            const proto_len = protocols[offset];
+            offset += 1;
+            if (offset + proto_len > protocols.len) break;
+            if (proto_len == h3[0] and std.mem.eql(u8, protocols[offset - 1 .. offset + proto_len], h3)) {
+                out.* = @ptrCast(&in[offset]);
+                outlen.* = @intCast(proto_len);
+                return c.SSL_TLSEXT_ERR_OK;
+            }
+            offset += proto_len;
+        }
+        return c.SSL_TLSEXT_ERR_ALERT_FATAL;
     }
 } else struct {
     pub const Server = struct {
@@ -592,6 +880,10 @@ pub const Binding = if (enabled) struct {
         return error.DependencyUnavailable;
     }
 
+    pub fn errorName(_: i32) ?[]const u8 {
+        return null;
+    }
+
     pub fn snapshot(_: *const @This().Server) ServerSnapshot {
         return .{};
     }
@@ -602,6 +894,14 @@ pub const Binding = if (enabled) struct {
     }
 
     pub fn handleDatagram(_: *@This().Server, _: quic.ParsedPacket, _: []const u8, _: []const u8, _: std.net.Address, _: std.net.Address, _: []u8) Ngtcp2Error!DatagramResult {
+        return error.DependencyUnavailable;
+    }
+
+    pub fn handleExpiry(_: *@This().Server, _: []u8) Ngtcp2Error!TimerResult {
+        return error.DependencyUnavailable;
+    }
+
+    pub fn flushPendingWrites(_: *@This().Server, _: []u8) Ngtcp2Error!WriteResult {
         return error.DependencyUnavailable;
     }
 };
@@ -616,6 +916,10 @@ pub fn validateConfig(cfg: TransportConfig) Ngtcp2Error!void {
     return Binding.validateConfig(cfg);
 }
 
+pub fn errorName(code: i32) ?[]const u8 {
+    return Binding.errorName(code);
+}
+
 pub fn snapshot(server: *const Server) ServerSnapshot {
     return Binding.snapshot(server);
 }
@@ -626,6 +930,14 @@ pub fn bootstrapServer(allocator: std.mem.Allocator, cfg: ServerBootstrap) Ngtcp
 
 pub fn handleDatagram(server: *Server, packet: quic.ParsedPacket, datagram: []const u8, remote_ip: []const u8, local_addr: std.net.Address, remote_addr: std.net.Address, out_buf: []u8) Ngtcp2Error!DatagramResult {
     return Binding.handleDatagram(server, packet, datagram, remote_ip, local_addr, remote_addr, out_buf);
+}
+
+pub fn handleExpiry(server: *Server, out_buf: []u8) Ngtcp2Error!TimerResult {
+    return Binding.handleExpiry(server, out_buf);
+}
+
+pub fn flushPendingWrites(server: *Server, out_buf: []u8) Ngtcp2Error!WriteResult {
+    return Binding.flushPendingWrites(server, out_buf);
 }
 
 test "runtime support reports disabled when ngtcp2 integration is off" {
@@ -650,7 +962,7 @@ test "runtime support reports disabled when ngtcp2 integration is off" {
     try std.testing.expectError(error.DependencyUnavailable, handleDatagram(&server, packet, "hello", "127.0.0.1", local_addr, remote_addr, &out_buf));
 }
 
-test "enabled binding records native packet read state" {
+test "enabled binding ignores malformed initial packets before native bootstrap" {
     if (!enabled) return;
 
     const allocator = std.testing.allocator;
@@ -663,8 +975,8 @@ test "enabled binding records native packet read state" {
 
     const datagram = [_]u8{
         0xC0, 0x00, 0x00, 0x00, 0x01,
-        0x04, 0xde, 0xad, 0xbe, 0xef,
-        0x04, 0xca, 0xfe, 0xba, 0xbe,
+        0x08, 0xde, 0xad, 0xbe, 0xef, 0x10, 0x20, 0x30, 0x40,
+        0x08, 0xca, 0xfe, 0xba, 0xbe, 0x50, 0x60, 0x70, 0x80,
         0x01, 0x42, 0xaa, 0xbb,
     };
     const packet = try quic.parsePacket(&datagram);
@@ -677,7 +989,7 @@ test "enabled binding records native packet read state" {
     const view = snapshot(&server);
     try std.testing.expectEqual(@as(usize, 1), view.datagrams_seen);
     try std.testing.expectEqual(@as(usize, 1), view.tracked_connections);
-    try std.testing.expectEqual(@as(usize, 1), view.native_connections);
-    try std.testing.expectEqual(@as(usize, 1), view.native_reads_attempted);
-    try std.testing.expect(result.bytes_to_send >= 0);
+    try std.testing.expectEqual(@as(usize, 0), view.native_connections);
+    try std.testing.expectEqual(@as(usize, 0), view.native_reads_attempted);
+    try std.testing.expectEqual(@as(usize, 0), result.bytes_to_send);
 }

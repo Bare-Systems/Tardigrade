@@ -22,6 +22,8 @@ pub const Config = struct {
     enable_0rtt: bool = false,
     connection_migration: bool = false,
     max_datagram_size: usize = 1350,
+    request_handler: ?ngtcp2_binding.RequestHandler = null,
+    request_handler_ctx: ?*anyopaque = null,
 };
 
 pub const Snapshot = struct {
@@ -32,6 +34,7 @@ pub const Snapshot = struct {
     tracked_connections: usize = 0,
     native_connections: usize = 0,
     native_reads_attempted: usize = 0,
+    native_read_calls: usize = 0,
     handshakes_completed: usize = 0,
     stream_bytes_received: usize = 0,
     stream_chunks_received: usize = 0,
@@ -69,6 +72,7 @@ pub const Runtime = struct {
     snapshot_state: Snapshot,
     server: ?ngtcp2_binding.Server,
     stopping: std.atomic.Value(bool),
+    last_logged_error_code: i32,
 
     pub fn init(allocator: std.mem.Allocator, logger: *logger_mod.Logger, cfg: Config) Http3RuntimeError!Runtime {
         ngtcp2_binding.validateConfig(.{
@@ -104,6 +108,7 @@ pub const Runtime = struct {
             .snapshot_state = .{ .quic_port = cfg.quic_port },
             .server = null,
             .stopping = std.atomic.Value(bool).init(false),
+            .last_logged_error_code = 0,
         };
         if (cfg.tls_cert_path.len > 0 and cfg.tls_key_path.len > 0) {
             runtime.server = ngtcp2_binding.bootstrapServer(allocator, .{
@@ -115,6 +120,8 @@ pub const Runtime = struct {
                 .enable_0rtt = cfg.enable_0rtt,
                 .connection_migration = cfg.connection_migration,
                 .max_datagram_size = cfg.max_datagram_size,
+                .request_handler = cfg.request_handler,
+                .request_handler_ctx = cfg.request_handler_ctx,
             }) catch |err| switch (err) {
                 error.NotYetImplemented => null,
                 else => return err,
@@ -156,6 +163,7 @@ pub const Runtime = struct {
         while (!self.stopping.load(.acquire) and !shutdown.isShutdownRequested()) {
             const received = std.posix.recvfrom(self.socket_fd, buf, 0, &from.any, &from_len) catch |err| switch (err) {
                 error.WouldBlock => {
+                    pumpExpiry(self, out_buf) catch {};
                     std.time.sleep(25 * std.time.ns_per_ms);
                     continue;
                 },
@@ -173,6 +181,7 @@ pub const Runtime = struct {
     }
 
     fn refreshSnapshot(self: *Runtime) void {
+        const previous_error_code = self.snapshot_state.last_error_code;
         var next = Snapshot{
             .quic_port = self.quic_port,
             .server_bootstrapped = self.server != null,
@@ -185,6 +194,7 @@ pub const Runtime = struct {
             next.tracked_connections = server_view.tracked_connections;
             next.native_connections = server_view.native_connections;
             next.native_reads_attempted = server_view.native_reads_attempted;
+            next.native_read_calls = server_view.native_read_calls;
             next.handshakes_completed = server_view.handshakes_completed;
             next.stream_bytes_received = server_view.stream_bytes_received;
             next.stream_chunks_received = server_view.stream_chunks_received;
@@ -197,6 +207,14 @@ pub const Runtime = struct {
         defer self.snapshot_mutex.unlock();
         next.migration_events = self.snapshot_state.migration_events;
         self.snapshot_state = next;
+        if (next.last_error_code != 0 and next.last_error_code != previous_error_code and next.last_error_code != self.last_logged_error_code) {
+            if (ngtcp2_binding.errorName(next.last_error_code)) |name| {
+                self.logger.warn(null, "http3 ngtcp2 error: code={d} name={s}", .{ next.last_error_code, name });
+            } else {
+                self.logger.warn(null, "http3 ngtcp2 error: code={d}", .{next.last_error_code});
+            }
+            self.last_logged_error_code = next.last_error_code;
+        }
     }
 
     fn noteMigration(self: *Runtime) void {
@@ -223,10 +241,64 @@ fn ingestDatagram(self: *Runtime, datagram: []const u8, from: std.net.Address, o
             return;
         };
         if (result.bytes_to_send > 0) {
+            logOutgoingPacket(self, out_buf[0..result.bytes_to_send]);
             _ = std.posix.sendto(self.socket_fd, out_buf[0..result.bytes_to_send], 0, &from.any, from.getOsSockLen()) catch {};
         }
+        flushPendingWrites(self, out_buf) catch {};
     }
     self.refreshSnapshot();
+}
+
+fn pumpExpiry(self: *Runtime, out_buf: []u8) !void {
+    if (self.server) |*server| {
+        const result = ngtcp2_binding.handleExpiry(server, out_buf) catch |err| {
+            self.logger.warn(null, "http3 ngtcp2 expiry handling failed: {}", .{err});
+            self.refreshSnapshot();
+            return;
+        };
+        if (result.bytes_to_send > 0) {
+            if (result.remote_addr) |remote_addr| {
+                logOutgoingPacket(self, out_buf[0..result.bytes_to_send]);
+                _ = std.posix.sendto(self.socket_fd, out_buf[0..result.bytes_to_send], 0, &remote_addr.any, remote_addr.getOsSockLen()) catch {};
+            }
+        }
+        flushPendingWrites(self, out_buf) catch {};
+        self.refreshSnapshot();
+    }
+}
+
+fn flushPendingWrites(self: *Runtime, out_buf: []u8) !void {
+    if (self.server) |*server| {
+        while (true) {
+            const result = ngtcp2_binding.flushPendingWrites(server, out_buf) catch |err| {
+                self.logger.warn(null, "http3 ngtcp2 flush failed: {}", .{err});
+                return;
+            };
+            if (result.bytes_to_send == 0) break;
+            if (result.remote_addr) |remote_addr| {
+                logOutgoingPacket(self, out_buf[0..result.bytes_to_send]);
+                _ = std.posix.sendto(self.socket_fd, out_buf[0..result.bytes_to_send], 0, &remote_addr.any, remote_addr.getOsSockLen()) catch {};
+            } else break;
+        }
+    }
+}
+
+fn logOutgoingPacket(self: *Runtime, packet: []const u8) void {
+    const first = if (packet.len > 0) packet[0] else 0;
+    if (quic.parsePacket(packet)) |parsed| {
+        self.logger.info(null, "http3 outgoing packet: type={s} len={d} dcid_len={d} scid_len={d} first=0x{x}", .{
+            @tagName(parsed.packet_type),
+            packet.len,
+            parsed.dcid.len,
+            parsed.scid.len,
+            first,
+        });
+    } else |_| {
+        self.logger.info(null, "http3 outgoing packet: type=unparsed len={d} first=0x{x}", .{
+            packet.len,
+            first,
+        });
+    }
 }
 
 fn formatAddressIp(address: std.net.Address) ?[]u8 {

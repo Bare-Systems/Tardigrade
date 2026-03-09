@@ -104,15 +104,19 @@ pub const StreamAssembler = struct {
 
 pub const ServerSession = if (nghttp3_enabled) struct {
     const c = @cImport({
+        @cInclude("ngtcp2/ngtcp2.h");
         @cInclude("nghttp3/nghttp3.h");
     });
 
     const StreamEntry = struct {
         assembler: StreamAssembler,
         complete_request: ?StreamRequest = null,
+        response_body: ?[]u8 = null,
+        response_sent: usize = 0,
 
         fn deinit(self: *StreamEntry) void {
             if (self.complete_request) |*req| req.deinit();
+            if (self.response_body) |body| self.assembler.allocator.free(body);
             self.assembler.deinit();
             self.* = undefined;
         }
@@ -121,6 +125,7 @@ pub const ServerSession = if (nghttp3_enabled) struct {
     const SessionState = struct {
         allocator: std.mem.Allocator,
         streams: std.AutoHashMap(i64, StreamEntry),
+        quic_conn_ptr: ?*anyopaque = null,
 
         fn init(allocator: std.mem.Allocator) SessionState {
             return .{
@@ -140,18 +145,27 @@ pub const ServerSession = if (nghttp3_enabled) struct {
     allocator: std.mem.Allocator,
     conn: *c.nghttp3_conn,
     state: *SessionState,
+    activated: bool = false,
 
     pub fn init(allocator: std.mem.Allocator) !@This() {
         var callbacks = std.mem.zeroes(c.nghttp3_callbacks);
+        callbacks.acked_stream_data = ackedStreamDataCb;
+        callbacks.deferred_consume = deferredConsumeCb;
         callbacks.begin_headers = beginHeadersCb;
         callbacks.recv_header = recvHeaderCb;
         callbacks.end_headers = endHeadersCb;
         callbacks.recv_data = recvDataCb;
+        callbacks.stop_sending = stopSendingCb;
         callbacks.end_stream = endStreamCb;
+        callbacks.reset_stream = resetStreamCb;
+        callbacks.rand = randCb;
+        callbacks.recv_settings2 = recvSettingsCb;
         callbacks.stream_close = streamCloseCb;
 
         var settings: c.nghttp3_settings = undefined;
         c.nghttp3_settings_default(&settings);
+        settings.qpack_max_dtable_capacity = 4096;
+        settings.qpack_blocked_streams = 100;
 
         const state = try allocator.create(SessionState);
         errdefer allocator.destroy(state);
@@ -163,9 +177,6 @@ pub const ServerSession = if (nghttp3_enabled) struct {
             return error.DependencyUnavailable;
         }
         errdefer c.nghttp3_conn_del(conn);
-
-        if (c.nghttp3_conn_bind_control_stream(conn, 3) != 0) return error.DependencyUnavailable;
-        if (c.nghttp3_conn_bind_qpack_streams(conn, 7, 11) != 0) return error.DependencyUnavailable;
 
         return .{
             .allocator = allocator,
@@ -181,6 +192,31 @@ pub const ServerSession = if (nghttp3_enabled) struct {
         self.* = undefined;
     }
 
+    pub fn activate(self: *@This(), quic_conn_ptr: *anyopaque) !void {
+        if (self.activated) return;
+        self.state.quic_conn_ptr = quic_conn_ptr;
+        const quic_conn: *c.ngtcp2_conn = @ptrCast(@alignCast(quic_conn_ptr));
+
+        const params = c.ngtcp2_conn_get_local_transport_params(quic_conn);
+        c.nghttp3_conn_set_max_client_streams_bidi(self.conn, params.*.initial_max_streams_bidi);
+
+        var control_stream_id: i64 = 0;
+        if (c.ngtcp2_conn_open_uni_stream(quic_conn, &control_stream_id, null) != 0) return error.NotYetImplemented;
+        if (c.nghttp3_conn_bind_control_stream(self.conn, control_stream_id) != 0) return error.NotYetImplemented;
+
+        var qpack_encoder_stream_id: i64 = 0;
+        if (c.ngtcp2_conn_open_uni_stream(quic_conn, &qpack_encoder_stream_id, null) != 0) return error.NotYetImplemented;
+
+        var qpack_decoder_stream_id: i64 = 0;
+        if (c.ngtcp2_conn_open_uni_stream(quic_conn, &qpack_decoder_stream_id, null) != 0) return error.NotYetImplemented;
+
+        if (c.nghttp3_conn_bind_qpack_streams(self.conn, qpack_encoder_stream_id, qpack_decoder_stream_id) != 0) {
+            return error.NotYetImplemented;
+        }
+
+        self.activated = true;
+    }
+
     pub fn ingestRequestBytes(self: *@This(), stream_id: i64, src: []const u8, fin: bool) !usize {
         const consumed = c.nghttp3_conn_read_stream2(
             self.conn,
@@ -192,6 +228,26 @@ pub const ServerSession = if (nghttp3_enabled) struct {
         );
         if (consumed < 0) return error.NotYetImplemented;
         return @intCast(consumed);
+    }
+
+    pub fn addAckOffset(self: *@This(), stream_id: i64, datalen: usize) !void {
+        if (c.nghttp3_conn_add_ack_offset(self.conn, stream_id, datalen) != 0) return error.NotYetImplemented;
+    }
+
+    pub fn unblockStream(self: *@This(), stream_id: i64) !void {
+        if (c.nghttp3_conn_unblock_stream(self.conn, stream_id) != 0) return error.NotYetImplemented;
+    }
+
+    pub fn setMaxClientStreamsBidi(self: *@This(), max_streams: u64) void {
+        c.nghttp3_conn_set_max_client_streams_bidi(self.conn, max_streams);
+    }
+
+    pub fn isActivated(self: *const @This()) bool {
+        return self.activated;
+    }
+
+    pub fn rawConn(self: *const @This()) *anyopaque {
+        return @ptrCast(self.conn);
     }
 
     pub fn takeCompletedRequest(self: *@This(), stream_id: i64) ?StreamRequest {
@@ -206,38 +262,43 @@ pub const ServerSession = if (nghttp3_enabled) struct {
     }
 
     pub fn closeStream(self: *@This(), stream_id: i64) void {
+        _ = c.nghttp3_conn_close_stream(self.conn, stream_id, 0);
         if (self.state.streams.fetchRemove(stream_id)) |entry| {
             var removed = entry.value;
             removed.deinit();
         }
     }
 
-    pub fn submitResponse(self: *@This(), allocator: std.mem.Allocator, stream_id: i64, response: *const Response) ![]u8 {
+    pub fn addWriteOffset(self: *@This(), stream_id: i64, datalen: usize) void {
+        if (self.state.streams.getPtr(stream_id)) |entry| {
+            if (entry.response_body != null) {
+                entry.response_sent = @min(entry.response_sent + datalen, entry.response_body.?.len);
+            }
+        }
+    }
+
+    pub fn submitResponse(self: *@This(), allocator: std.mem.Allocator, stream_id: i64, response: *const Response) !void {
+        if (!self.activated) return error.NotYetImplemented;
+        const entry = getOrCreateStreamFromState(self.state, stream_id) catch return error.NotYetImplemented;
+        if (entry.response_body) |body| allocator.free(body);
+        entry.response_body = null;
+        entry.response_sent = 0;
+
         var owned_nva = try allocNghttp3Nva(allocator, response);
         defer owned_nva.deinit(allocator);
 
-        if (c.nghttp3_conn_submit_response(self.conn, stream_id, owned_nva.nva.ptr, owned_nva.nva.len, null) != 0) {
+        var data_reader = c.nghttp3_data_reader{ .read_data = readDataCb };
+        const reader_ptr = if (response.body) |body|
+            blk: {
+                entry.response_body = try allocator.dupe(u8, body);
+                break :blk if (body.len > 0) &data_reader else null;
+            }
+        else
+            null;
+
+        if (c.nghttp3_conn_submit_response(self.conn, stream_id, owned_nva.nva.ptr, owned_nva.nva.len, reader_ptr) != 0) {
             return error.NotYetImplemented;
         }
-
-        var out = std.ArrayList(u8).init(allocator);
-        errdefer out.deinit();
-        var vecs: [8]c.nghttp3_vec = undefined;
-        while (true) {
-            var out_stream_id: i64 = -1;
-            var fin: c_int = 0;
-            const nvec = c.nghttp3_conn_writev_stream(self.conn, &out_stream_id, &fin, &vecs, vecs.len);
-            if (nvec < 0) return error.NotYetImplemented;
-            if (nvec == 0) break;
-            var accepted: usize = 0;
-            for (vecs[0..@intCast(nvec)]) |vec| {
-                try out.appendSlice(vec.base[0..vec.len]);
-                accepted += vec.len;
-            }
-            _ = c.nghttp3_conn_add_write_offset(self.conn, out_stream_id, accepted);
-            if (fin != 0) _ = c.nghttp3_conn_add_write_offset(self.conn, out_stream_id, 0);
-        }
-        return out.toOwnedSlice();
     }
 
     fn getSelf(conn_user_data: ?*anyopaque) *SessionState {
@@ -279,6 +340,14 @@ pub const ServerSession = if (nghttp3_enabled) struct {
         return 0;
     }
 
+    fn ackedStreamDataCb(_: ?*c.nghttp3_conn, _: i64, _: u64, _: ?*anyopaque, _: ?*anyopaque) callconv(.c) c_int {
+        return 0;
+    }
+
+    fn deferredConsumeCb(_: ?*c.nghttp3_conn, _: i64, _: usize, _: ?*anyopaque, _: ?*anyopaque) callconv(.c) c_int {
+        return 0;
+    }
+
     fn endStreamCb(_: ?*c.nghttp3_conn, stream_id: i64, conn_user_data: ?*anyopaque, _: ?*anyopaque) callconv(.c) c_int {
         const state = getSelf(conn_user_data);
         const entry = getOrCreateStreamFromState(state, stream_id) catch return c.NGHTTP3_ERR_CALLBACK_FAILURE;
@@ -295,6 +364,50 @@ pub const ServerSession = if (nghttp3_enabled) struct {
             removed.deinit();
         }
         return 0;
+    }
+
+    fn stopSendingCb(_: ?*c.nghttp3_conn, stream_id: i64, app_error_code: u64, conn_user_data: ?*anyopaque, _: ?*anyopaque) callconv(.c) c_int {
+        const state = getSelf(conn_user_data);
+        const quic_conn_ptr = state.quic_conn_ptr orelse return 0;
+        const quic_conn: *c.ngtcp2_conn = @ptrCast(@alignCast(quic_conn_ptr));
+        if (c.ngtcp2_conn_shutdown_stream_read(quic_conn, 0, stream_id, app_error_code) != 0) return c.NGHTTP3_ERR_CALLBACK_FAILURE;
+        return 0;
+    }
+
+    fn resetStreamCb(_: ?*c.nghttp3_conn, stream_id: i64, app_error_code: u64, conn_user_data: ?*anyopaque, _: ?*anyopaque) callconv(.c) c_int {
+        const state = getSelf(conn_user_data);
+        const quic_conn_ptr = state.quic_conn_ptr orelse return 0;
+        const quic_conn: *c.ngtcp2_conn = @ptrCast(@alignCast(quic_conn_ptr));
+        if (c.ngtcp2_conn_shutdown_stream_write(quic_conn, 0, stream_id, app_error_code) != 0) return c.NGHTTP3_ERR_CALLBACK_FAILURE;
+        return 0;
+    }
+
+    fn randCb(dest: [*c]u8, destlen: usize) callconv(.c) void {
+        std.crypto.random.bytes(dest[0..destlen]);
+    }
+
+    fn recvSettingsCb(_: ?*c.nghttp3_conn, _: ?*const c.nghttp3_proto_settings, _: ?*anyopaque) callconv(.c) c_int {
+        return 0;
+    }
+
+    fn readDataCb(_: ?*c.nghttp3_conn, stream_id: i64, vec: [*c]c.nghttp3_vec, veccnt: usize, pflags: [*c]u32, conn_user_data: ?*anyopaque, _: ?*anyopaque) callconv(.c) c.nghttp3_ssize {
+        const state = getSelf(conn_user_data);
+        const entry = state.streams.getPtr(stream_id) orelse return c.NGHTTP3_ERR_CALLBACK_FAILURE;
+        const body = entry.response_body orelse {
+            pflags.* = c.NGHTTP3_DATA_FLAG_EOF;
+            return 0;
+        };
+        if (entry.response_sent >= body.len) {
+            pflags.* = c.NGHTTP3_DATA_FLAG_EOF;
+            return 0;
+        }
+        if (veccnt == 0) return c.NGHTTP3_ERR_CALLBACK_FAILURE;
+
+        const remaining = body[entry.response_sent..];
+        vec[0].base = remaining.ptr;
+        vec[0].len = remaining.len;
+        pflags.* = c.NGHTTP3_DATA_FLAG_EOF;
+        return 1;
     }
 
     const OwnedNva = struct {
@@ -319,7 +432,7 @@ pub const ServerSession = if (nghttp3_enabled) struct {
             .value = status_buf.ptr,
             .namelen = 7,
             .valuelen = status_text.len,
-            .flags = c.NGHTTP3_NV_FLAG_NO_COPY_NAME | c.NGHTTP3_NV_FLAG_NO_COPY_VALUE,
+            .flags = 0,
         };
         var i: usize = 1;
         for (response.headers.iterator()) |header| {
@@ -328,7 +441,7 @@ pub const ServerSession = if (nghttp3_enabled) struct {
                 .value = header.value.ptr,
                 .namelen = header.name.len,
                 .valuelen = header.value.len,
-                .flags = c.NGHTTP3_NV_FLAG_NO_COPY_NAME | c.NGHTTP3_NV_FLAG_NO_COPY_VALUE,
+                .flags = 0,
             };
             i += 1;
         }
@@ -353,7 +466,7 @@ pub const ServerSession = if (nghttp3_enabled) struct {
 
     pub fn closeStream(_: *@This(), _: i64) void {}
 
-    pub fn submitResponse(_: *@This(), _: std.mem.Allocator, _: i64, _: *const Response) ![]u8 {
+    pub fn submitResponse(_: *@This(), _: std.mem.Allocator, _: i64, _: *const Response) !void {
         return error.DependencyUnavailable;
     }
 };

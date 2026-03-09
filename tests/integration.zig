@@ -1,9 +1,12 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const integration_options = @import("integration_options");
 
 const test_host = "127.0.0.1";
 const valid_bearer_token = "integration-token";
 const valid_bearer_hash = "521bc8ca01307d0189b55a19da738e39c7204f7077e0076e803026e32b2f9383";
+const http3_curl_path = "/opt/homebrew/opt/curl/bin/curl";
+const expected_server_header = "tardigrade/0.4.1";
 
 const EnvPair = struct {
     name: []const u8,
@@ -586,18 +589,24 @@ const CurlRequestSpec = struct {
     insecure: bool = false,
     cert: ?[]const u8 = null,
     key: ?[]const u8 = null,
+    binary_path: ?[]const u8 = null,
+    http3_only: bool = false,
 };
 
 fn runCurl(allocator: std.mem.Allocator, port: u16, spec: CurlRequestSpec) !CurlRunResult {
     var argv = std.ArrayList([]const u8).init(allocator);
     defer argv.deinit();
-    try argv.append("curl");
+    try argv.append(spec.binary_path orelse "curl");
     try argv.append("-sS");
-    try argv.append("--http1.1");
+    if (spec.http3_only) {
+        try argv.append("--http3-only");
+    } else {
+        try argv.append("--http1.1");
+    }
     try argv.append("--connect-timeout");
-    try argv.append("2");
+    try argv.append(if (spec.http3_only) "5" else "2");
     try argv.append("--max-time");
-    try argv.append("5");
+    try argv.append(if (spec.http3_only) "8" else "5");
     try argv.append("-X");
     try argv.append(spec.method);
     try argv.append("-D");
@@ -647,13 +656,17 @@ fn spawnCurlProcess(allocator: std.mem.Allocator, port: u16, spec: CurlRequestSp
         owned_args.deinit();
     }
 
-    try argv.append("curl");
+    try argv.append(spec.binary_path orelse "curl");
     try argv.append("-sS");
-    try argv.append("--http1.1");
+    if (spec.http3_only) {
+        try argv.append("--http3-only");
+    } else {
+        try argv.append("--http1.1");
+    }
     try argv.append("--connect-timeout");
-    try argv.append("2");
+    try argv.append(if (spec.http3_only) "5" else "2");
     try argv.append("--max-time");
-    try argv.append("5");
+    try argv.append(if (spec.http3_only) "8" else "5");
     try argv.append("-X");
     try argv.append(spec.method);
     try argv.append("-D");
@@ -1898,6 +1911,109 @@ test "http3 configured gateway advertises alt-svc on http health responses" {
     try assertContains(response.body, "\"http3_handshake_state\":\"config_incomplete\"");
     try assertContains(response.body, "\"http3_stream_bytes_received\":0");
     try assertContains(response.body, "\"http3_requests_completed\":0");
+    try assertContains(response.body, "\"http3_native_read_calls\":0");
+    try assertContains(response.body, "\"http3_last_error_name\":\"-\"");
+}
+
+test "http3 integration serves health over quic" {
+    if (!build_options.enable_http3_ngtcp2) return error.SkipZigTest;
+    std.fs.accessAbsolute(http3_curl_path, .{}) catch return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const quic_port = try findFreePort();
+    const quic_port_str = try std.fmt.allocPrint(allocator, "{d}", .{quic_port});
+    defer allocator.free(quic_port_str);
+
+    const opts = TardigradeOptions{
+        .upstream_port = null,
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_HTTP3_ENABLED", .value = "true" },
+            .{ .name = "TARDIGRADE_QUIC_PORT", .value = quic_port_str },
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = "tests/fixtures/tls/server.crt" },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = "tests/fixtures/tls/server.key" },
+        },
+        .ready_https_insecure = true,
+    };
+    var tardigrade = try TardigradeProcess.start(allocator, opts);
+    defer tardigrade.stop();
+
+    const curl_spec = CurlRequestSpec{
+        .scheme = "https",
+        .path = "/health",
+        .insecure = true,
+        .binary_path = http3_curl_path,
+        .http3_only = true,
+    };
+    var last_err: ?anyerror = null;
+    var response: HttpResponse = undefined;
+    var ok = false;
+    for (0..5) |_| {
+        response = sendCurlRequest(allocator, quic_port, curl_spec) catch |err| {
+            last_err = err;
+            std.time.sleep(100 * std.time.ns_per_ms);
+            continue;
+        };
+        ok = true;
+        break;
+    }
+    if (!ok) return last_err orelse error.CurlFailed;
+    defer response.deinit();
+
+    try std.testing.expectEqual(@as(u16, 200), response.status_code);
+    try std.testing.expectEqualStrings(expected_server_header, response.header("server").?);
+    const content_length = try std.fmt.parseInt(usize, response.header("content-length").?, 10);
+    try std.testing.expect(content_length > 0);
+    try assertContains(response.body, "\"status\":\"ok\"");
+    try assertContains(response.body, "\"service\":\"tardigrade-edge\"");
+}
+
+test "http3 integration serves prometheus metrics over quic" {
+    if (!build_options.enable_http3_ngtcp2) return error.SkipZigTest;
+    std.fs.accessAbsolute(http3_curl_path, .{}) catch return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const quic_port = try findFreePort();
+    const quic_port_str = try std.fmt.allocPrint(allocator, "{d}", .{quic_port});
+    defer allocator.free(quic_port_str);
+
+    const opts = TardigradeOptions{
+        .upstream_port = null,
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_HTTP3_ENABLED", .value = "true" },
+            .{ .name = "TARDIGRADE_QUIC_PORT", .value = quic_port_str },
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = "tests/fixtures/tls/server.crt" },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = "tests/fixtures/tls/server.key" },
+        },
+        .ready_https_insecure = true,
+    };
+    var tardigrade = try TardigradeProcess.start(allocator, opts);
+    defer tardigrade.stop();
+
+    const curl_spec = CurlRequestSpec{
+        .scheme = "https",
+        .path = "/metrics",
+        .insecure = true,
+        .binary_path = http3_curl_path,
+        .http3_only = true,
+    };
+    var last_err: ?anyerror = null;
+    var response: HttpResponse = undefined;
+    var ok = false;
+    for (0..5) |_| {
+        response = sendCurlRequest(allocator, quic_port, curl_spec) catch |err| {
+            last_err = err;
+            std.time.sleep(100 * std.time.ns_per_ms);
+            continue;
+        };
+        ok = true;
+        break;
+    }
+    if (!ok) return last_err orelse error.CurlFailed;
+    defer response.deinit();
+
+    try std.testing.expectEqual(@as(u16, 200), response.status_code);
+    try std.testing.expectEqualStrings("text/plain; version=0.0.4; charset=utf-8", response.header("content-type").?);
+    try assertContains(response.body, "tardigrade_requests_total");
 }
 
 test "tls integration rejects client signed by unrecognized ca" {

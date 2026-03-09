@@ -135,24 +135,24 @@ These files will be replaced by a proper C binding to ngtcp2 + nghttp3.
 
 ### 3.0 ngtcp2 C Library Integration
 
-- [ ] Add ngtcp2 and nghttp3 as build dependencies (system libs or vendored under `vendor/`)
-- [ ] Add linker flags for `libngtcp2`, `libngtcp2_crypto_openssl`, `libnghttp3` in `build.zig`
-- [ ] Create `src/http/ngtcp2_binding.zig` — thin Zig wrapper over the ngtcp2 C API
+- [x] Add ngtcp2 and nghttp3 as build dependencies (system libs or vendored under `vendor/`)
+- [x] Add linker flags for `libngtcp2`, `libngtcp2_crypto_openssl`, `libnghttp3` in `build.zig`
+- [x] Create `src/http/ngtcp2_binding.zig` — thin Zig wrapper over the ngtcp2 C API
       covering: connection creation, packet read/write, stream open/close, crypto init
-- [ ] Create `src/http/http3_handler.zig` — maps HTTP/3 stream events to Tardigrade
+- [x] Create `src/http/http3_handler.zig` — maps HTTP/3 stream events to Tardigrade
       `Request`/`Response` types (reusing existing structs)
 
 ### 3.1 QUIC Transport
 
-- [ ] TLS 1.3 crypto handshake via ngtcp2_crypto_openssl (reuse existing OpenSSL context)
-- [ ] UDP socket listener on configurable port (`TARDIGRADE_QUIC_PORT`, default: 443 UDP)
-- [ ] Connection migration support (client IP change handling)
+- [~] TLS 1.3 crypto handshake via ngtcp2_crypto_openssl (reuse existing OpenSSL context)
+- [x] UDP socket listener on configurable port (`TARDIGRADE_QUIC_PORT`, default: 443 UDP)
+- [~] Connection migration support (client IP change handling)
 - [ ] Streams: bidirectional request/response, server-initiated push
 - [ ] Flow control: per-stream and connection-level credit management
 - [ ] Congestion control: cubic (ngtcp2 default) — no custom implementation needed
 - [ ] Loss detection and packet retransmission (handled by ngtcp2 internally)
 - [ ] 0-RTT early data for repeat clients
-- [ ] `Alt-Svc: h3=":443"` header injected on HTTP/1.1 and HTTP/2 responses to advertise QUIC
+- [x] `Alt-Svc: h3=":443"` header injected on HTTP/1.1 and HTTP/2 responses to advertise QUIC
 
 ### 3.2 HTTP/3 Layer (nghttp3)
 
@@ -172,7 +172,7 @@ These files will be replaced by a proper C binding to ngtcp2 + nghttp3.
 
 - [ ] Integration test: HTTP/3 GET request over loopback UDP completes successfully
 - [ ] Integration test: concurrent HTTP/3 streams on one connection return independent responses
-- [ ] Integration test: `Alt-Svc` header present on HTTP/1.1 response
+- [x] Integration test: `Alt-Svc` header present on HTTP/1.1 response
 - [ ] Integration test: 0-RTT session resumption completes without full handshake round-trip
 
 ---

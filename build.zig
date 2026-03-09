@@ -42,7 +42,7 @@ pub fn build(b: *std.Build) void {
     exe.linkSystemLibrary("crypto");
     if (enable_http3_ngtcp2) {
         exe.linkSystemLibrary("ngtcp2");
-        exe.linkSystemLibrary("ngtcp2_crypto_openssl");
+        exe.linkSystemLibrary("ngtcp2_crypto_ossl");
         exe.linkSystemLibrary("nghttp3");
     }
 
@@ -82,7 +82,7 @@ pub fn build(b: *std.Build) void {
     exe_unit_tests.linkSystemLibrary("crypto");
     if (enable_http3_ngtcp2) {
         exe_unit_tests.linkSystemLibrary("ngtcp2");
-        exe_unit_tests.linkSystemLibrary("ngtcp2_crypto_openssl");
+        exe_unit_tests.linkSystemLibrary("ngtcp2_crypto_ossl");
         exe_unit_tests.linkSystemLibrary("nghttp3");
     }
 

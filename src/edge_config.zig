@@ -100,6 +100,7 @@ pub const EdgeConfig = struct {
     tls_acme_cert_dir: []const u8,
     http2_enabled: bool,
     http3_enabled: bool,
+    quic_port: u16,
     http3_enable_0rtt: bool,
     http3_connection_migration: bool,
     http3_max_datagram_size: usize,
@@ -529,6 +530,9 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     errdefer allocator.free(tls_acme_cert_dir);
     const http2_enabled = parseBoolEnv(allocator, "TARDIGRADE_HTTP2_ENABLED", true);
     const http3_enabled = parseBoolEnv(allocator, "TARDIGRADE_HTTP3_ENABLED", false);
+    const quic_port_str = envOrDefault(allocator, "TARDIGRADE_QUIC_PORT", "443") catch unreachable;
+    defer allocator.free(quic_port_str);
+    const quic_port = std.fmt.parseInt(u16, quic_port_str, 10) catch 443;
     const http3_enable_0rtt = parseBoolEnv(allocator, "TARDIGRADE_HTTP3_ENABLE_0RTT", false);
     const http3_connection_migration = parseBoolEnv(allocator, "TARDIGRADE_HTTP3_CONNECTION_MIGRATION", false);
     const http3_max_datagram_size = parseIntEnv(usize, allocator, "TARDIGRADE_HTTP3_MAX_DATAGRAM_SIZE", 1350);
@@ -1069,6 +1073,7 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .tls_acme_cert_dir = tls_acme_cert_dir,
         .http2_enabled = http2_enabled,
         .http3_enabled = http3_enabled,
+        .quic_port = quic_port,
         .http3_enable_0rtt = http3_enable_0rtt,
         .http3_connection_migration = http3_connection_migration,
         .http3_max_datagram_size = http3_max_datagram_size,

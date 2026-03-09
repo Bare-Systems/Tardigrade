@@ -1863,6 +1863,43 @@ test "tls integration serves health over https with self-signed certificate" {
     try assertContains(response.body, "\"status\":\"ok\"");
 }
 
+test "http3 configured gateway advertises alt-svc on http health responses" {
+    const allocator = std.testing.allocator;
+    const quic_port = try findFreePort();
+    const quic_port_str = try std.fmt.allocPrint(allocator, "{d}", .{quic_port});
+    defer allocator.free(quic_port_str);
+
+    const opts = TardigradeOptions{
+        .upstream_port = null,
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_HTTP3_ENABLED", .value = "true" },
+            .{ .name = "TARDIGRADE_QUIC_PORT", .value = quic_port_str },
+        },
+    };
+    var tardigrade = try TardigradeProcess.start(allocator, opts);
+    defer tardigrade.stop();
+
+    var response = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/health",
+        .body = null,
+        .headers = &.{},
+    });
+    defer response.deinit();
+
+    try std.testing.expectEqual(@as(u16, 200), response.status_code);
+    const expected_alt_svc = try std.fmt.allocPrint(allocator, "h3=\":{d}\"", .{quic_port});
+    defer allocator.free(expected_alt_svc);
+    try std.testing.expectEqualStrings(expected_alt_svc, response.header("Alt-Svc").?);
+    try assertContains(response.body, "\"http3_status\":\"config_incomplete\"");
+    const expected_quic_port = try std.fmt.allocPrint(allocator, "\"http3_quic_port\":{d}", .{quic_port});
+    defer allocator.free(expected_quic_port);
+    try assertContains(response.body, expected_quic_port);
+    try assertContains(response.body, "\"http3_handshake_state\":\"config_incomplete\"");
+    try assertContains(response.body, "\"http3_stream_bytes_received\":0");
+    try assertContains(response.body, "\"http3_requests_completed\":0");
+}
+
 test "tls integration rejects client signed by unrecognized ca" {
     const allocator = std.testing.allocator;
 

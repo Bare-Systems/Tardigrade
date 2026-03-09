@@ -96,12 +96,13 @@ const State = struct {
     crl_check: bool,
     acme_enabled: bool,
     acme_cert_dir: []const u8,
-    static_sni_specs: []const SniCertSpec,
+    static_sni_specs: []SniCertSpec,
     sni_certs: std.ArrayList(ManagedSniCert),
     http2_enabled: bool,
 
     fn deinit(self: *State) void {
         if (self.ocsp_response) |resp| self.allocator.free(resp);
+        self.allocator.free(self.static_sni_specs);
         for (self.sni_certs.items) |sc| {
             self.allocator.free(sc.host_lc);
             std.heap.c_allocator.free(sc.cert_path_z);
@@ -122,6 +123,9 @@ pub const TlsTerminator = struct {
         const method = c.TLS_server_method() orelse return error.ContextInitFailed;
         const ctx = c.SSL_CTX_new(method) orelse return error.ContextInitFailed;
         errdefer c.SSL_CTX_free(ctx);
+        const owned_sni_specs = try allocator.alloc(SniCertSpec, opts.sni_certs.len);
+        errdefer allocator.free(owned_sni_specs);
+        @memcpy(owned_sni_specs, opts.sni_certs);
 
         var st = try allocator.create(State);
         errdefer allocator.destroy(st);
@@ -137,7 +141,7 @@ pub const TlsTerminator = struct {
             .crl_check = opts.crl_check,
             .acme_enabled = opts.acme_enabled,
             .acme_cert_dir = opts.acme_cert_dir,
-            .static_sni_specs = opts.sni_certs,
+            .static_sni_specs = owned_sni_specs,
             .sni_certs = std.ArrayList(ManagedSniCert).init(allocator),
             .http2_enabled = opts.http2_enabled,
         };
@@ -428,4 +432,27 @@ fn fileMtime(path: []const u8) !i128 {
 
 test "openssl init" {
     try std.testing.expect(c.OPENSSL_init_ssl(0, null) == 1);
+}
+
+test "tls terminator copies sni specs for maintenance reload" {
+    const allocator = std.testing.allocator;
+    var specs = try allocator.alloc(SniCertSpec, 1);
+    specs[0] = .{
+        .server_name = "sni.integration.test",
+        .cert_path = "tests/fixtures/tls/alt_server.crt",
+        .key_path = "tests/fixtures/tls/alt_server.key",
+    };
+
+    var tls = try TlsTerminator.init(allocator, .{
+        .cert_path = "tests/fixtures/tls/server.crt",
+        .key_path = "tests/fixtures/tls/server.key",
+        .sni_certs = specs,
+        .dynamic_reload_interval_ms = 1,
+    });
+    defer tls.deinit();
+
+    allocator.free(specs);
+
+    tls.runMaintenance(1);
+    tls.runMaintenance(2);
 }

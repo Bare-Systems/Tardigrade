@@ -24,6 +24,24 @@
   - Added integration coverage for active probe down detection, rerouting away from failed upstreams, recovery after probe successes, and degraded `/health` reporting.
   - Added Upgrade 2 env aliases (`TARDIGRADE_UPSTREAM_HEALTH_*`) on top of the existing active-health settings.
   - Added active probe success-status config with a default range plus exact upstream URL overrides for non-2xx health endpoints.
+- Upgrade 3 HTTP/3 ngtcp2/nghttp3 foundation:
+  - Added opt-in build wiring for `ngtcp2`, `ngtcp2_crypto_ossl`, and `nghttp3` via `-Denable-http3-ngtcp2=true`.
+  - Added `src/http/ngtcp2_binding.zig` as a compile-safe ngtcp2/nghttp3 wrapper seam gated by build options.
+  - Added `src/http/http3_handler.zig` with initial `Alt-Svc` formatting and pseudo-header-to-request mapping helpers.
+  - Added HTTP/3 stream-assembly helpers in `src/http/http3_session.zig` for split HEADERS/DATA accumulation and response header-block encoding.
+  - Added a compile-safe nghttp3 server-session wrapper in `src/http/http3_session.zig` with control/QPACK stream binding and response-submission plumbing.
+  - Added `TARDIGRADE_QUIC_PORT` config support and `src/http/http3_runtime.zig` as the first UDP listener/bootstrap path for future ngtcp2 packet handling.
+  - Added HTTP/1.1 `Alt-Svc` advertisement for configured HTTP/3 endpoints and integration coverage for that header on `/health`.
+  - Added initial QUIC datagram parsing and connection-ID tracking in the HTTP/3 runtime as groundwork for real migration handling.
+  - Added TLS cert/key/version plumbing from gateway config into the HTTP/3 bootstrap seam, plus a warning when HTTP/3 is enabled without TLS material.
+  - Added one-time QUIC bootstrap server state in the HTTP/3 runtime so datagrams are handled against persistent bootstrap state instead of reinitializing per packet.
+  - Added a first QUIC-specific OpenSSL TLS context setup path in the ngtcp2 binding seam, including TLS 1.3 enforcement and cert/key loading.
+  - Added `/health` reporting for HTTP/3 configuration state and QUIC port, plus integration coverage for the incomplete-TLS QUIC configuration case.
+  - Added native ngtcp2 server-connection creation for Initial packets, real `ngtcp2_conn_read_pkt` processing, and HTTP/3 runtime snapshot surfacing for handshake/read state on `/health`.
+  - Added HTTP/3-enabled unit coverage for native packet-read state tracking in `src/http/ngtcp2_binding.zig`.
+  - Added guarded QUIC packet output attempts via `ngtcp2_conn_write_pkt` after successful packet ingest, plus `/health` surfacing for emitted packet and byte counts.
+  - Verified the opt-in HTTP/3 build path against installed `libngtcp2`, `libngtcp2_crypto_ossl`, and `libnghttp3` system packages.
+  - Added per-connection nghttp3 session ownership in the ngtcp2 binding, including QUIC stream-data callbacks, stream-close cleanup, and `/health` surfacing for received HTTP/3 stream bytes and completed request assemblies.
 
 ### Fixed
 - Upgrade 1 integration hardening in the live gateway path:
@@ -41,6 +59,7 @@
   - Fixed the contention test harness to use bounded socket timeouts instead of concurrent `curl` subprocess fan-out, which was unstable on macOS under threaded Zig tests.
   - Fixed the worker-pool own-queue pop path to preserve FIFO drain order under saturation instead of reversing requests with LIFO `pop()`.
   - Fixed active upstream health routing so a backend stays out of rotation until recovery probes succeed, instead of becoming eligible again solely because the passive fail-time window elapsed.
+  - Fixed the TLS SNI maintenance path to own its static SNI spec slice instead of retaining a pointer to the caller's freed temporary allocation.
 
 ## [0.29.0] - 2026-03-08
 

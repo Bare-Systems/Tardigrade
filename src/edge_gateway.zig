@@ -181,6 +181,8 @@ const GatewayState = struct {
     proxy_cache_ttl_seconds: u32,
     security_headers: http.security_headers.SecurityHeaders,
     add_headers: []const edge_config.EdgeConfig.HeaderPair,
+    http3_alt_svc: ?[]u8,
+    http3_runtime: ?*http.http3_runtime.Runtime,
     session_store: ?http.session.SessionStore,
     access_control: ?http.access_control.AccessControl,
     logger: http.logger.Logger,
@@ -222,6 +224,7 @@ const GatewayState = struct {
         self.event_hub.deinit();
         self.request_buffer_pool.deinit();
         self.relay_buffer_pool.deinit();
+        if (self.http3_alt_svc) |value| self.allocator.free(value);
         var upstream_it = self.upstream_health.iterator();
         while (upstream_it.next()) |entry| self.allocator.free(entry.key_ptr.*);
         self.upstream_health.deinit();
@@ -1418,6 +1421,8 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         else
             http.security_headers.SecurityHeaders{ .x_frame_options = "", .x_content_type_options = "", .content_security_policy = "", .strict_transport_security = "", .referrer_policy = "", .permissions_policy = "", .x_xss_protection = "" },
         .add_headers = cfg.add_headers,
+        .http3_alt_svc = if (cfg.http3_enabled) http.http3_handler.formatAltSvc(state_allocator, cfg.quic_port) catch null else null,
+        .http3_runtime = null,
         .session_store = if (cfg.session_ttl_seconds > 0)
             http.session.SessionStore.init(state_allocator, cfg.session_ttl_seconds, cfg.session_max)
         else
@@ -1487,6 +1492,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     defer event_loop.deinit();
     try event_loop.addReadFd(listen_fd);
     var timer = http.event_loop.TimerManager.init(250);
+    var http3_runtime: ?http.http3_runtime.Runtime = null;
     var tls_terminator: ?http.tls_termination.TlsTerminator = null;
     if (edge_config.hasTlsFiles(cfg)) {
         var sni_specs = try state_allocator.alloc(http.tls_termination.SniCertSpec, cfg.tls_sni_certs.len);
@@ -1520,6 +1526,31 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         });
     }
     defer if (tls_terminator) |*tls| tls.deinit();
+    if (cfg.http3_enabled) {
+        if (!edge_config.hasTlsFiles(cfg)) {
+            state.logger.warn(null, "HTTP/3 requested without TLS cert/key; QUIC bootstrap will remain incomplete", .{});
+        }
+        http3_runtime = http.http3_runtime.Runtime.init(state_allocator, &state.logger, .{
+            .listen_host = cfg.listen_host,
+            .quic_port = cfg.quic_port,
+            .tls_cert_path = cfg.tls_cert_path,
+            .tls_key_path = cfg.tls_key_path,
+            .tls_min_version = "1.3",
+            .tls_max_version = "1.3",
+            .enable_0rtt = cfg.http3_enable_0rtt,
+            .connection_migration = cfg.http3_connection_migration,
+            .max_datagram_size = cfg.http3_max_datagram_size,
+        }) catch |err| switch (err) {
+            error.DependencyUnavailable => blk: {
+                state.logger.warn(null, "HTTP/3 requested but ngtcp2/nghttp3 integration is not enabled in this build", .{});
+                break :blk null;
+            },
+            else => return err,
+        };
+        if (http3_runtime) |*runtime| runtime.start();
+    }
+    state.http3_runtime = if (http3_runtime) |*runtime| runtime else null;
+    defer if (http3_runtime) |*runtime| runtime.deinit();
     const worker_count: usize = blk: {
         const configured = if (cfg.worker_threads == 0)
             (std.Thread.getCpuCount() catch 1)
@@ -1599,7 +1630,8 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         }
     }
     if (cfg.http3_enabled) {
-        state.logger.info(null, "HTTP/3 foundation enabled: 0rtt={} migration={} max_datagram={d}", .{
+        state.logger.info(null, "HTTP/3 foundation enabled: quic_port={d} 0rtt={} migration={} max_datagram={d}", .{
+            cfg.quic_port,
             cfg.http3_enable_0rtt,
             cfg.http3_connection_migration,
             cfg.http3_max_datagram_size,
@@ -1902,6 +1934,8 @@ fn applyReloadedRuntimeConfig(cfg: *const edge_config.EdgeConfig, state: *Gatewa
     else
         null;
     state.add_headers = cfg.add_headers;
+    if (state.http3_alt_svc) |value| state.allocator.free(value);
+    state.http3_alt_svc = if (cfg.http3_enabled) http.http3_handler.formatAltSvc(state.allocator, cfg.quic_port) catch null else null;
     state.security_headers = if (cfg.security_headers_enabled)
         http.security_headers.SecurityHeaders.api
     else
@@ -2995,12 +3029,29 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
     // --- Health endpoint ---
     if (request.method == .GET and std.mem.eql(u8, request.uri.path, "/health")) {
         const unhealthy_backends = state.upstreamUnhealthyCount();
+        const http3_status = http.http3_handler.configurationStatus(cfg.http3_enabled, edge_config.hasTlsFiles(cfg));
+        const http3_health = http3HealthSnapshot(state, cfg);
         const body = try std.fmt.allocPrint(
             allocator,
-            "{{\"status\":\"ok\",\"service\":\"tardigrade-edge\",\"upstream_status\":\"{s}\",\"upstream_unhealthy_backends\":{d}}}",
+            "{{\"status\":\"ok\",\"service\":\"tardigrade-edge\",\"upstream_status\":\"{s}\",\"upstream_unhealthy_backends\":{d},\"http3_status\":\"{s}\",\"http3_quic_port\":{d},\"http3_handshake_state\":\"{s}\",\"http3_datagrams_seen\":{d},\"http3_tracked_connections\":{d},\"http3_native_connections\":{d},\"http3_native_reads_attempted\":{d},\"http3_handshakes_completed\":{d},\"http3_stream_bytes_received\":{d},\"http3_stream_chunks_received\":{d},\"http3_requests_completed\":{d},\"http3_packets_emitted\":{d},\"http3_bytes_emitted\":{d},\"http3_migration_events\":{d},\"http3_last_error_code\":{d}}}",
             .{
                 if (unhealthy_backends > 0) "degraded" else "healthy",
                 unhealthy_backends,
+                http3_status,
+                if (cfg.http3_enabled) cfg.quic_port else 0,
+                http3_health.handshake_state,
+                http3_health.snapshot.datagrams_seen,
+                http3_health.snapshot.tracked_connections,
+                http3_health.snapshot.native_connections,
+                http3_health.snapshot.native_reads_attempted,
+                http3_health.snapshot.handshakes_completed,
+                http3_health.snapshot.stream_bytes_received,
+                http3_health.snapshot.stream_chunks_received,
+                http3_health.snapshot.requests_completed,
+                http3_health.snapshot.packets_emitted,
+                http3_health.snapshot.bytes_emitted,
+                http3_health.snapshot.migration_events,
+                http3_health.snapshot.last_error_code,
             },
         );
         defer allocator.free(body);
@@ -5707,6 +5758,29 @@ fn applyResponseHeaders(state: *GatewayState, response: *http.Response) void {
     for (state.add_headers) |pair| {
         _ = response.setHeader(pair.name, pair.value);
     }
+    if (state.http3_alt_svc) |value| {
+        _ = response.setHeader("Alt-Svc", value);
+    }
+}
+
+const Http3HealthSnapshot = struct {
+    handshake_state: []const u8,
+    snapshot: http.http3_runtime.Snapshot,
+};
+
+fn http3HandshakeState(state: *const GatewayState, cfg: *const edge_config.EdgeConfig, snapshot: http.http3_runtime.Snapshot) []const u8 {
+    if (!cfg.http3_enabled) return "disabled";
+    if (!edge_config.hasTlsFiles(cfg)) return "config_incomplete";
+    if (state.http3_runtime == null) return "unavailable";
+    return snapshot.handshakeState();
+}
+
+fn http3HealthSnapshot(state: *const GatewayState, cfg: *const edge_config.EdgeConfig) Http3HealthSnapshot {
+    const snapshot = if (state.http3_runtime) |runtime| runtime.snapshot() else http.http3_runtime.Snapshot{ .quic_port = if (cfg.http3_enabled) cfg.quic_port else 0 };
+    return .{
+        .handshake_state = http3HandshakeState(state, cfg, snapshot),
+        .snapshot = snapshot,
+    };
 }
 
 fn authorizeRequest(cfg: *const edge_config.EdgeConfig, headers: *const http.Headers) AuthResult {
@@ -7416,6 +7490,7 @@ test "resolveProxyTarget handles absolute and relative proxy_pass" {
         .tls_acme_cert_dir = "",
         .http2_enabled = true,
         .http3_enabled = false,
+        .quic_port = 443,
         .http3_enable_0rtt = false,
         .http3_connection_migration = false,
         .http3_max_datagram_size = 1350,
@@ -7607,6 +7682,7 @@ test "authorizeRequest accepts valid hash" {
         .tls_acme_cert_dir = "",
         .http2_enabled = true,
         .http3_enabled = false,
+        .quic_port = 443,
         .http3_enable_0rtt = false,
         .http3_connection_migration = false,
         .http3_max_datagram_size = 1350,

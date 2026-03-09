@@ -1,7 +1,7 @@
 
-Your purpose is to create, maintain, and implement the instructions of a `PLAN.md` file in a **target repository**.
+Your purpose is to create, maintain, and implement the instructions of a `UPGRADES.md` file in a **target repository**.
 
-You should always refer to the `PLAN.md` file for guidance on how to proceed with tasks, the order to progress, and any other specific instructions provided.
+You should always refer to the `UPGRADES.md` file for guidance on how to proceed with tasks, the order to progress, and any other specific instructions provided. You can refer to the `PLAN.md` for what was done in the past if you need to know.
 
 Work incrementally. Implement features one at a time and create a short reference document for each feature under the `changes/` folder (for example `changes/feature-autoindex.md`). Each `changes/*` file should summarize the scope, what was added, tests added/changed, and the status (in-progress / done).
 
@@ -16,10 +16,10 @@ Practical checklist for each feature branch
 - Create `changes/feature-xyz.md` describing scope, files changed, tests, and acceptance criteria.
 - Implement code and unit tests; keep commits small and focused.
 - Update the `changes/feature-xyz.md` with progress notes and mark done when finished.
-- Update `PLAN.md` if the work changes project priorities or next steps.
+- Update `UPGRADES.md` if the work changes project priorities or next steps.
 - Run the full test suite locally (`zig build test`) and fix failures before merging.
 - When merging: update the `CHANGELOG.md` date, squash or clean commits if desired, and push to `main`.
 
-If `PLAN.md` is missing or incomplete, create or update it based on the repository state and the small-feature workflow above. Always record decisions (why a heuristic ETag was chosen, why a streaming vs in-memory path was used, etc.) so future contributors can follow the rationale.
+If `UPGRADES.md` is missing or incomplete, create or update it based on the repository state and the small-feature workflow above. Always record decisions (why a heuristic ETag was chosen, why a streaming vs in-memory path was used, etc.) so future contributors can follow the rationale.
 
 This file documents the collaboration expectations: keep changelog and change-reference files updated continuously, and add a semantic-versioned changelog entry for every branch so release notes are never lost.

@@ -37,6 +37,18 @@ pub const ProxyProtocolMode = enum {
 };
 
 pub const EdgeConfig = struct {
+    pub const HealthStatusRange = struct {
+        min: u16,
+        max: u16,
+
+        pub fn contains(self: HealthStatusRange, status_code: u16) bool {
+            return status_code >= self.min and status_code <= self.max;
+        }
+    };
+    pub const UpstreamHealthSuccessStatusOverride = struct {
+        upstream_base_url: []const u8,
+        range: HealthStatusRange,
+    };
     pub const HeaderPair = struct {
         name: []const u8,
         value: []const u8,
@@ -275,6 +287,10 @@ pub const EdgeConfig = struct {
     upstream_active_health_fail_threshold: u32,
     /// Consecutive active probe successes required before clearing unhealthy state.
     upstream_active_health_success_threshold: u32,
+    /// Default success-status range used by active health probes.
+    upstream_active_health_success_status: HealthStatusRange,
+    /// Exact upstream URL overrides for active health probe success-status matching.
+    upstream_active_health_success_status_overrides: []UpstreamHealthSuccessStatusOverride,
     /// Slow-start window (ms) for recovered upstreams before receiving full traffic (0 = disabled).
     upstream_slow_start_ms: u64,
     /// Enable WebSocket upgrade routes.
@@ -404,6 +420,10 @@ pub const EdgeConfig = struct {
         allocator.free(self.access_log_syslog_udp);
         allocator.free(self.worker_cpu_affinity);
         allocator.free(self.upstream_active_health_path);
+        for (self.upstream_active_health_success_status_overrides) |entry| {
+            allocator.free(entry.upstream_base_url);
+        }
+        allocator.free(self.upstream_active_health_success_status_overrides);
         for (self.rewrite_rules) |rule| {
             allocator.free(rule.method);
             allocator.free(rule.pattern);
@@ -869,24 +889,71 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     defer allocator.free(fail_timeout_str);
     const upstream_fail_timeout_ms = std.fmt.parseInt(u64, fail_timeout_str, 10) catch 10_000;
 
-    const active_health_interval_str = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_INTERVAL_MS", "0") catch unreachable;
+    const active_health_interval_str = envOrDefaultAlias(
+        allocator,
+        "TARDIGRADE_UPSTREAM_HEALTH_INTERVAL_MS",
+        "TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_INTERVAL_MS",
+        "0",
+    ) catch unreachable;
     defer allocator.free(active_health_interval_str);
     const upstream_active_health_interval_ms = std.fmt.parseInt(u64, active_health_interval_str, 10) catch 0;
 
-    const upstream_active_health_path = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_PATH", "/health") catch unreachable;
+    const upstream_active_health_path = envOrDefaultAlias(
+        allocator,
+        "TARDIGRADE_UPSTREAM_HEALTH_PATH",
+        "TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_PATH",
+        "/health",
+    ) catch unreachable;
     errdefer allocator.free(upstream_active_health_path);
 
-    const active_health_timeout_str = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_TIMEOUT_MS", "2000") catch unreachable;
+    const active_health_timeout_str = envOrDefaultAlias(
+        allocator,
+        "TARDIGRADE_UPSTREAM_HEALTH_TIMEOUT_MS",
+        "TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_TIMEOUT_MS",
+        "2000",
+    ) catch unreachable;
     defer allocator.free(active_health_timeout_str);
     const upstream_active_health_timeout_ms = std.fmt.parseInt(u32, active_health_timeout_str, 10) catch 2000;
 
-    const active_health_fail_threshold_str = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_FAIL_THRESHOLD", "1") catch unreachable;
+    const active_health_fail_threshold_str = envOrDefaultAlias(
+        allocator,
+        "TARDIGRADE_UPSTREAM_HEALTH_THRESHOLD",
+        "TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_FAIL_THRESHOLD",
+        "1",
+    ) catch unreachable;
     defer allocator.free(active_health_fail_threshold_str);
     const upstream_active_health_fail_threshold = @max(std.fmt.parseInt(u32, active_health_fail_threshold_str, 10) catch 1, 1);
 
     const active_health_success_threshold_str = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_SUCCESS_THRESHOLD", "1") catch unreachable;
     defer allocator.free(active_health_success_threshold_str);
     const upstream_active_health_success_threshold = @max(std.fmt.parseInt(u32, active_health_success_threshold_str, 10) catch 1, 1);
+
+    const active_health_success_status_str = envOrDefaultAlias(
+        allocator,
+        "TARDIGRADE_UPSTREAM_HEALTH_SUCCESS_STATUS",
+        "TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_SUCCESS_STATUS",
+        "200-299",
+    ) catch unreachable;
+    defer allocator.free(active_health_success_status_str);
+    const upstream_active_health_success_status = parseHealthStatusRange(active_health_success_status_str) catch EdgeConfig.HealthStatusRange{ .min = 200, .max = 299 };
+
+    const active_health_success_status_overrides_raw = envOrDefaultAlias(
+        allocator,
+        "TARDIGRADE_UPSTREAM_HEALTH_SUCCESS_STATUS_OVERRIDES",
+        "TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_SUCCESS_STATUS_OVERRIDES",
+        "",
+    ) catch unreachable;
+    defer allocator.free(active_health_success_status_overrides_raw);
+    const upstream_active_health_success_status_overrides = try parseUpstreamHealthSuccessStatusOverrides(
+        allocator,
+        active_health_success_status_overrides_raw,
+    );
+    errdefer {
+        for (upstream_active_health_success_status_overrides) |entry| {
+            allocator.free(entry.upstream_base_url);
+        }
+        allocator.free(upstream_active_health_success_status_overrides);
+    }
 
     const slow_start_str = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_SLOW_START_MS", "0") catch unreachable;
     defer allocator.free(slow_start_str);
@@ -1110,6 +1177,8 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .upstream_active_health_timeout_ms = upstream_active_health_timeout_ms,
         .upstream_active_health_fail_threshold = upstream_active_health_fail_threshold,
         .upstream_active_health_success_threshold = upstream_active_health_success_threshold,
+        .upstream_active_health_success_status = upstream_active_health_success_status,
+        .upstream_active_health_success_status_overrides = upstream_active_health_success_status_overrides,
         .upstream_slow_start_ms = upstream_slow_start_ms,
         .websocket_enabled = websocket_enabled,
         .websocket_idle_timeout_ms = websocket_idle_timeout_ms,
@@ -1155,6 +1224,14 @@ fn envOrDefault(allocator: std.mem.Allocator, key: []const u8, default_value: []
         }
     }
     return allocator.dupe(u8, default_value);
+}
+
+fn envOrDefaultAlias(allocator: std.mem.Allocator, primary_key: []const u8, fallback_key: []const u8, default_value: []const u8) ![]u8 {
+    if (std.process.getEnvVarOwned(allocator, primary_key)) |owned| {
+        return owned;
+    } else |_| {}
+
+    return envOrDefault(allocator, fallback_key, default_value);
 }
 
 fn parseBoolEnv(allocator: std.mem.Allocator, key: []const u8, default_value: bool) bool {
@@ -1244,6 +1321,47 @@ fn parseCsvU32Values(allocator: std.mem.Allocator, raw: []const u8) ![]u32 {
         try out.append(value);
     }
 
+    return out.toOwnedSlice();
+}
+
+fn parseHealthStatusRange(raw: []const u8) !EdgeConfig.HealthStatusRange {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return error.InvalidHealthStatusRange;
+    if (std.mem.indexOfScalar(u8, trimmed, '-')) |dash| {
+        const min_raw = std.mem.trim(u8, trimmed[0..dash], " \t\r\n");
+        const max_raw = std.mem.trim(u8, trimmed[dash + 1 ..], " \t\r\n");
+        const min = std.fmt.parseInt(u16, min_raw, 10) catch return error.InvalidHealthStatusRange;
+        const max = std.fmt.parseInt(u16, max_raw, 10) catch return error.InvalidHealthStatusRange;
+        if (min > max) return error.InvalidHealthStatusRange;
+        return .{ .min = min, .max = max };
+    }
+    const code = std.fmt.parseInt(u16, trimmed, 10) catch return error.InvalidHealthStatusRange;
+    return .{ .min = code, .max = code };
+}
+
+fn parseUpstreamHealthSuccessStatusOverrides(
+    allocator: std.mem.Allocator,
+    raw: []const u8,
+) ![]EdgeConfig.UpstreamHealthSuccessStatusOverride {
+    var out = std.ArrayList(EdgeConfig.UpstreamHealthSuccessStatusOverride).init(allocator);
+    errdefer {
+        for (out.items) |entry| allocator.free(entry.upstream_base_url);
+        out.deinit();
+    }
+
+    var it = std.mem.splitScalar(u8, raw, ';');
+    while (it.next()) |entry_raw| {
+        const entry = std.mem.trim(u8, entry_raw, " \t\r\n");
+        if (entry.len == 0) continue;
+        const sep = std.mem.lastIndexOfScalar(u8, entry, '|') orelse return error.InvalidHealthStatusOverride;
+        const upstream_base_url = std.mem.trim(u8, entry[0..sep], " \t\r\n");
+        const status_raw = std.mem.trim(u8, entry[sep + 1 ..], " \t\r\n");
+        if (upstream_base_url.len == 0 or status_raw.len == 0) return error.InvalidHealthStatusOverride;
+        try out.append(.{
+            .upstream_base_url = try allocator.dupe(u8, upstream_base_url),
+            .range = try parseHealthStatusRange(status_raw),
+        });
+    }
     return out.toOwnedSlice();
 }
 
@@ -1536,6 +1654,35 @@ test "parse proxy protocol mode aliases" {
     try std.testing.expectEqual(ProxyProtocolMode.v1, ProxyProtocolMode.parse("v1").?);
     try std.testing.expectEqual(ProxyProtocolMode.v2, ProxyProtocolMode.parse("v2").?);
     try std.testing.expect(ProxyProtocolMode.parse("unknown") == null);
+}
+
+test "parse health status range" {
+    try std.testing.expectEqualDeep(
+        EdgeConfig.HealthStatusRange{ .min = 200, .max = 299 },
+        try parseHealthStatusRange("200-299"),
+    );
+    try std.testing.expectEqualDeep(
+        EdgeConfig.HealthStatusRange{ .min = 304, .max = 304 },
+        try parseHealthStatusRange("304"),
+    );
+    try std.testing.expectError(error.InvalidHealthStatusRange, parseHealthStatusRange("500-200"));
+}
+
+test "parse upstream health success status overrides" {
+    const allocator = std.testing.allocator;
+    const overrides = try parseUpstreamHealthSuccessStatusOverrides(
+        allocator,
+        "http://127.0.0.1:8080|304;http://127.0.0.1:8081|200-204",
+    );
+    defer {
+        for (overrides) |entry| allocator.free(entry.upstream_base_url);
+        allocator.free(overrides);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), overrides.len);
+    try std.testing.expectEqualStrings("http://127.0.0.1:8080", overrides[0].upstream_base_url);
+    try std.testing.expectEqualDeep(EdgeConfig.HealthStatusRange{ .min = 304, .max = 304 }, overrides[0].range);
+    try std.testing.expectEqualDeep(EdgeConfig.HealthStatusRange{ .min = 200, .max = 204 }, overrides[1].range);
 }
 
 test "parse rewrite rules csv" {

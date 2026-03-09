@@ -56,18 +56,10 @@ pub fn installSignalHandlers() void {
         .flags = 0,
     };
 
-    std.posix.sigaction(std.posix.SIG.TERM, &handler, null) catch |err| {
-        std.log.warn("Failed to install SIGTERM handler: {}", .{err});
-    };
-    std.posix.sigaction(std.posix.SIG.INT, &handler, null) catch |err| {
-        std.log.warn("Failed to install SIGINT handler: {}", .{err});
-    };
-    std.posix.sigaction(std.posix.SIG.HUP, &handler, null) catch |err| {
-        std.log.warn("Failed to install SIGHUP handler: {}", .{err});
-    };
-    std.posix.sigaction(std.posix.SIG.USR2, &handler, null) catch |err| {
-        std.log.warn("Failed to install SIGUSR2 handler: {}", .{err});
-    };
+    std.posix.sigaction(std.posix.SIG.TERM, &handler, null);
+    std.posix.sigaction(std.posix.SIG.INT, &handler, null);
+    std.posix.sigaction(std.posix.SIG.HUP, &handler, null);
+    std.posix.sigaction(std.posix.SIG.USR2, &handler, null);
 }
 
 fn handleSignal(sig: c_int) callconv(.c) void {

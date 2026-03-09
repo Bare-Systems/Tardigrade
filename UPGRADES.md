@@ -21,71 +21,71 @@ Every feature added without integration tests creates undetectable regression ri
 
 ### 1.0 Test Harness
 
-- [ ] Create a `tests/` integration test runner that boots a real Tardigrade process
+- [x] Create a `tests/` integration test runner that boots a real Tardigrade process
       with a test config, sends real HTTP requests, and asserts responses
-- [ ] Use a loopback upstream (tiny Zig or shell HTTP echo server) to validate proxy paths
-- [ ] Add a `build.zig` step `zig build test-integration` that runs the full suite
-- [ ] Add a CI workflow (GitHub Actions) that runs unit + integration tests on every push
+- [x] Use a loopback upstream (tiny Zig or shell HTTP echo server) to validate proxy paths
+- [x] Add a `build.zig` step `zig build test-integration` that runs the full suite
+- [x] Add a CI workflow (GitHub Actions) that runs unit + integration tests on every push
 
 ### 1.1 Core Gateway Integration Tests
 
-- [ ] `GET /health` returns `200` with valid JSON body
-- [ ] `POST /v1/chat` without auth returns `401` stable error envelope
-- [ ] `POST /v1/chat` with valid bearer token proxies to upstream and returns response
-- [ ] `POST /v1/chat` with invalid JSON body returns `400` stable error envelope
-- [ ] `X-Correlation-ID` from request is echoed in response headers
-- [ ] `X-Correlation-ID` is generated when absent from request
-- [ ] `GET /metrics` returns Prometheus-format text output
+- [x] `GET /health` returns `200` with valid JSON body
+- [x] `POST /v1/chat` without auth returns `401` stable error envelope
+- [x] `POST /v1/chat` with valid bearer token proxies to upstream and returns response
+- [x] `POST /v1/chat` with invalid JSON body returns `400` stable error envelope
+- [x] `X-Correlation-ID` from request is echoed in response headers
+- [x] `X-Correlation-ID` is generated when absent from request
+- [x] `GET /metrics` returns Prometheus-format text output
 
 ### 1.2 Auth Pipeline Integration Tests
 
-- [ ] Bearer token SHA-256 hash is checked against allowlist; mismatched token → 401
-- [ ] JWT RS256/HS256 token validation succeeds with valid signature
-- [ ] JWT with expired `exp` claim returns `401`
-- [ ] JWT with wrong `iss` claim returns `401`
-- [ ] Device auth (`X-Device-ID` + `X-Device-Signature`) validates against registered device
-- [ ] Session token created via `POST /v1/sessions` is accepted on subsequent `POST /v1/chat`
-- [ ] Revoked session token is rejected (`DELETE /v1/sessions` then `POST /v1/chat`)
+- [x] Bearer token SHA-256 hash is checked against allowlist; mismatched token → 401
+- [x] JWT RS256/HS256 token validation succeeds with valid signature
+- [x] JWT with expired `exp` claim returns `401`
+- [x] JWT with wrong `iss` claim returns `401`
+- [x] Device auth (`X-Device-ID` + `X-Device-Signature`) validates against registered device
+- [x] Session token created via `POST /v1/sessions` is accepted on subsequent `POST /v1/chat`
+- [x] Revoked session token is rejected (`DELETE /v1/sessions` then `POST /v1/chat`)
 
 ### 1.3 Rate Limiter Integration Tests
 
-- [ ] Burst beyond configured limit returns `429` with `Retry-After` header
-- [ ] Rate limit resets after token-bucket refill window
-- [ ] Per-IP limit does not bleed across different source IPs
+- [x] Burst beyond configured limit returns `429` with `Retry-After` header
+- [x] Rate limit resets after token-bucket refill window
+- [x] Per-IP limit does not bleed across different source IPs
 
 ### 1.4 Proxy & Cache Integration Tests
 
-- [ ] Reverse proxy forwards headers and body to upstream correctly
-- [ ] `Cache-Control: no-store` upstream response is not cached
-- [ ] Cacheable response is replayed from cache on second request (no upstream hit)
-- [ ] `stale-while-revalidate` serves stale + triggers background revalidation
-- [ ] Proxy correctly follows a single upstream redirect and returns final response
-- [ ] Upstream 5xx triggers retry up to configured `proxy_next_upstream_tries`
+- [x] Reverse proxy forwards headers and body to upstream correctly
+- [x] `Cache-Control: no-store` upstream response is not cached
+- [x] Cacheable response is replayed from cache on second request (no upstream hit)
+- [x] `stale-while-revalidate` serves stale + triggers background revalidation
+- [x] Proxy correctly follows a single upstream redirect and returns final response
+- [x] Upstream 5xx triggers retry up to configured `proxy_next_upstream_tries`
 
 ### 1.5 TLS Integration Tests
 
-- [ ] TLS handshake completes with test self-signed cert
-- [ ] SNI routing selects correct certificate for multi-cert configurations
-- [ ] mTLS rejects client with unrecognised CA
-- [ ] `Connection: close` is sent on TLS shutdown when graceful drain is active
+- [x] TLS handshake completes with test self-signed cert
+- [x] SNI routing selects correct certificate for multi-cert configurations
+- [x] mTLS rejects client with unrecognised CA
+- [x] `Connection: close` is sent on TLS shutdown when graceful drain is active
 
 ### 1.6 Config Hot-Reload Tests
 
-- [ ] Sending SIGHUP while under load does not drop in-flight requests
-- [ ] After SIGHUP, new upstream pool URL takes effect for subsequent requests
-- [ ] After SIGHUP, new rate limit value is enforced
+- [x] Sending SIGHUP while under load does not drop in-flight requests
+- [x] After SIGHUP, new upstream pool URL takes effect for subsequent requests
+- [x] After SIGHUP, new rate limit value is enforced
 
 ### 1.7 Graceful Shutdown Tests
 
-- [ ] In-flight request completes before worker exits
-- [ ] Keep-alive connections receive `Connection: close` before shutdown
-- [ ] Server exits cleanly within configured drain timeout with no open fd leaks
+- [x] In-flight request completes before worker exits
+- [x] Keep-alive connections receive `Connection: close` before shutdown
+- [x] Server exits cleanly within configured drain timeout with no open fd leaks
 
 ### 1.8 Concurrency / Load Tests
 
-- [ ] 100 concurrent connections all receive correct responses with no data corruption
-- [ ] Worker pool under saturation queues and processes connections in order
-- [ ] GatewayState mutex contention does not cause deadlock under concurrent auth + rate check
+- [x] 100 concurrent connections all receive correct responses with no data corruption
+- [x] Worker pool under saturation queues and processes connections in order
+- [x] GatewayState mutex contention does not cause deadlock under concurrent auth + rate check
 
 ---
 
@@ -99,29 +99,29 @@ discover it until live traffic starts failing.
 
 ### 2.0 Active Health Check Engine
 
-- [ ] Add `HealthChecker` struct to `src/http/health_checker.zig`
-- [ ] Configurable per-upstream: `health_check_path`, `health_check_interval_ms`,
+- [x] Add `HealthChecker` struct to `src/http/health_checker.zig`
+- [x] Configurable per-upstream: `health_check_path`, `health_check_interval_ms`,
       `health_check_timeout_ms`, `health_check_success_status` (default: 200–299)
-- [ ] Dedicated timer-driven goroutine/thread (or reuse `TimerManager`) probes each upstream
-- [ ] On consecutive failures (configurable `health_check_threshold`): mark upstream `down`
+- [x] Dedicated timer-driven goroutine/thread (or reuse `TimerManager`) probes each upstream
+- [x] On consecutive failures (configurable `health_check_threshold`): mark upstream `down`
       and stop routing traffic to it immediately
-- [ ] On consecutive successes after being `down`: mark `up` and re-enable routing
-- [ ] Active health state is reflected in `GET /metrics` and `GET /health` responses
+- [x] On consecutive successes after being `down`: mark `up` and re-enable routing
+- [x] Active health state is reflected in `GET /metrics` and `GET /health` responses
 
 ### 2.1 Config Integration
 
-- [ ] `TARDIGRADE_UPSTREAM_HEALTH_PATH` — path to probe (default: `/health`)
-- [ ] `TARDIGRADE_UPSTREAM_HEALTH_INTERVAL_MS` — probe period (default: 10000)
-- [ ] `TARDIGRADE_UPSTREAM_HEALTH_TIMEOUT_MS` — per-probe timeout (default: 2000)
-- [ ] `TARDIGRADE_UPSTREAM_HEALTH_THRESHOLD` — failures before marking down (default: 3)
-- [ ] Hot-reload (SIGHUP) picks up changed health check config without restart
+- [x] `TARDIGRADE_UPSTREAM_HEALTH_PATH` — path to probe (default: `/health`)
+- [x] `TARDIGRADE_UPSTREAM_HEALTH_INTERVAL_MS` — probe period (default: 10000)
+- [x] `TARDIGRADE_UPSTREAM_HEALTH_TIMEOUT_MS` — per-probe timeout (default: 2000)
+- [x] `TARDIGRADE_UPSTREAM_HEALTH_THRESHOLD` — failures before marking down (default: 3)
+- [x] Hot-reload (SIGHUP) picks up changed health check config without restart
 
 ### 2.2 Tests
 
-- [ ] Integration test: upstream that returns 503 is marked down after threshold failures
-- [ ] Integration test: traffic is not routed to downed upstream
-- [ ] Integration test: upstream recovery marks it back up after threshold successes
-- [ ] Unit test: `HealthChecker` state machine transitions (up → down → half-open → up)
+- [x] Integration test: upstream that returns 503 is marked down after threshold failures
+- [x] Integration test: traffic is not routed to downed upstream
+- [x] Integration test: upstream recovery marks it back up after threshold successes
+- [x] Unit test: `HealthChecker` state machine transitions (up → down → half-open → up)
 
 ---
 

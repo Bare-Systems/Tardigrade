@@ -8,7 +8,7 @@ const STREAM_RELAY_BUFFER_SIZE: usize = 16 * 1024;
 const JSON_CONTENT_TYPE = "application/json";
 const ADMIN_ROUTES_JSON =
     "{\"routes\":[" ++
-    "\"/health\",\"/metrics\",\"/metrics/prometheus\"," ++
+    "\"/health\",\"/metrics\",\"/metrics/json\",\"/metrics/prometheus\"," ++
     "\"/admin/routes\",\"/admin/connections\",\"/admin/streams\",\"/admin/upstreams\",\"/admin/certs\",\"/admin/auth-registry\"," ++
     "\"/v1/chat\",\"/v1/commands\",\"/v1/commands/status\",\"/v1/approvals/request\",\"/v1/approvals/respond\",\"/v1/approvals/status\",\"/v1/sessions\",\"/v1/cache/purge\"," ++
     "\"/v1/ws/chat\",\"/v1/ws/commands\",\"/v1/ws/mux\",\"/v1/events/stream\",\"/v1/events/publish\"," ++
@@ -27,8 +27,7 @@ const ProxyCacheLookup = struct {
 const UpstreamHealth = struct {
     fail_count: u32 = 0,
     unhealthy_until_ms: u64 = 0,
-    probe_fail_streak: u32 = 0,
-    probe_success_streak: u32 = 0,
+    probe: http.health_checker.State = .{},
     slow_start_until_ms: u64 = 0,
 };
 
@@ -707,17 +706,27 @@ const GatewayState = struct {
         defer self.mutex.unlock();
         const entry = self.approvals.getPtr(token) orelse return null;
         self.approvalEscalateIfExpiredLocked(entry);
+        const command_id_json = if (entry.command_id.len > 0)
+            std.fmt.allocPrint(allocator, "\"{s}\"", .{entry.command_id}) catch return null
+        else
+            allocator.dupe(u8, "null") catch return null;
+        defer allocator.free(command_id_json);
+        const decided_by_json = if (entry.decided_by.len > 0)
+            std.fmt.allocPrint(allocator, "\"{s}\"", .{entry.decided_by}) catch return null
+        else
+            allocator.dupe(u8, "null") catch return null;
+        defer allocator.free(decided_by_json);
         return std.fmt.allocPrint(allocator, "{{\"approval_token\":\"{s}\",\"status\":\"{s}\",\"method\":\"{s}\",\"path\":\"{s}\",\"identity\":\"{s}\",\"command_id\":{s},\"created_ms\":{d},\"expires_ms\":{d},\"decided_ms\":{d},\"decided_by\":{s}}}", .{
             token,
             @tagName(entry.status),
             entry.method,
             entry.path,
             entry.identity,
-            if (entry.command_id.len > 0) std.json.fmt(entry.command_id, .{}) else "null",
+            command_id_json,
             entry.created_ms,
             entry.expires_ms,
             entry.decided_ms,
-            if (entry.decided_by.len > 0) std.json.fmt(entry.decided_by, .{}) else "null",
+            decided_by_json,
         }) catch null;
     }
 
@@ -1014,7 +1023,6 @@ const GatewayState = struct {
 
         if (self.upstream_health.getPtr(upstream_base_url)) |health| {
             health.fail_count +|= 1;
-            health.probe_success_streak = 0;
             if (health.fail_count >= cfg.upstream_max_fails) {
                 health.fail_count = 0;
                 health.unhealthy_until_ms = http.event_loop.monotonicMs() + cfg.upstream_fail_timeout_ms;
@@ -1030,7 +1038,6 @@ const GatewayState = struct {
         };
         if (self.upstream_health.getPtr(owned)) |health| {
             health.fail_count = 1;
-            health.probe_success_streak = 0;
             if (health.fail_count >= cfg.upstream_max_fails) {
                 health.fail_count = 0;
                 health.unhealthy_until_ms = http.event_loop.monotonicMs() + cfg.upstream_fail_timeout_ms;
@@ -1047,8 +1054,6 @@ const GatewayState = struct {
         if (self.upstream_health.getPtr(upstream_base_url)) |health| {
             health.fail_count = 0;
             health.unhealthy_until_ms = 0;
-            health.probe_fail_streak = 0;
-            health.probe_success_streak = 0;
             health.slow_start_until_ms = 0;
         }
         self.updateUpstreamHealthMetricLocked();
@@ -1069,38 +1074,38 @@ const GatewayState = struct {
             break :blk self.upstream_health.getPtr(owned).?;
         };
 
-        if (healthy) {
-            health.probe_fail_streak = 0;
-            health.probe_success_streak +|= 1;
-            if (health.probe_success_streak >= cfg.upstream_active_health_success_threshold) {
+        const health_cfg = activeHealthConfig(cfg, upstream_base_url);
+        const transition = if (healthy)
+            health.probe.recordSuccess(health_cfg)
+        else
+            health.probe.recordFailure(health_cfg);
+
+        switch (transition) {
+            .marked_up => {
                 health.unhealthy_until_ms = 0;
                 health.fail_count = 0;
-                health.probe_success_streak = 0;
                 self.beginSlowStartLocked(cfg, health, http.event_loop.monotonicMs());
-            }
-        } else {
-            health.probe_success_streak = 0;
-            health.probe_fail_streak +|= 1;
-            if (health.probe_fail_streak >= cfg.upstream_active_health_fail_threshold) {
-                health.probe_fail_streak = 0;
+            },
+            .marked_down => {
                 health.unhealthy_until_ms = http.event_loop.monotonicMs() + cfg.upstream_fail_timeout_ms;
                 health.slow_start_until_ms = 0;
-            }
+            },
+            else => {},
         }
         self.updateUpstreamHealthMetricLocked();
     }
 
     fn isUpstreamHealthyLocked(self: *GatewayState, cfg: *const edge_config.EdgeConfig, upstream_base_url: []const u8, now_ms: u64) bool {
         if (self.upstream_health.getPtr(upstream_base_url)) |health| {
-            if (health.unhealthy_until_ms == 0) return true;
-            if (now_ms >= health.unhealthy_until_ms) {
+            if (health.unhealthy_until_ms != 0 and now_ms >= health.unhealthy_until_ms) {
                 health.unhealthy_until_ms = 0;
                 health.fail_count = 0;
                 self.beginSlowStartLocked(cfg, health, now_ms);
                 self.updateUpstreamHealthMetricLocked();
-                return true;
             }
-            return false;
+            if (health.unhealthy_until_ms != 0 and now_ms < health.unhealthy_until_ms) return false;
+            if (cfg.upstream_active_health_interval_ms > 0 and !health.probe.isRoutable()) return false;
+            return true;
         }
         return true;
     }
@@ -1136,9 +1141,22 @@ const GatewayState = struct {
         var it = self.upstream_health.iterator();
         while (it.next()) |entry| {
             const health = entry.value_ptr.*;
-            if (health.unhealthy_until_ms > now_ms) unhealthy += 1;
+            if (health.unhealthy_until_ms > now_ms or !health.probe.isRoutable()) unhealthy += 1;
         }
         self.metrics.setUpstreamUnhealthyBackends(unhealthy);
+    }
+
+    fn upstreamUnhealthyCount(self: *GatewayState) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const now_ms = http.event_loop.monotonicMs();
+        var unhealthy: usize = 0;
+        var it = self.upstream_health.iterator();
+        while (it.next()) |entry| {
+            const health = entry.value_ptr.*;
+            if (health.unhealthy_until_ms > now_ms or !health.probe.isRoutable()) unhealthy += 1;
+        }
+        return unhealthy;
     }
 
     fn recordUpstreamAttemptStart(self: *GatewayState, upstream_base_url: []const u8) void {
@@ -1212,8 +1230,11 @@ const GatewayState = struct {
             first = false;
             const url = entry.key_ptr.*;
             const h = entry.value_ptr.*;
-            const healthy = h.unhealthy_until_ms == 0 or h.unhealthy_until_ms <= now_ms;
-            try out.writer().print("{{\"url\":\"{s}\",\"healthy\":{},\"unhealthy_until_ms\":{d}}}", .{ url, healthy, h.unhealthy_until_ms });
+            const healthy = (h.unhealthy_until_ms == 0 or h.unhealthy_until_ms <= now_ms) and h.probe.isRoutable();
+            try out.writer().print(
+                "{{\"url\":\"{s}\",\"healthy\":{},\"unhealthy_until_ms\":{d},\"active_status\":\"{s}\"}}",
+                .{ url, healthy, h.unhealthy_until_ms, h.probe.status.asString() },
+            );
         }
         try out.appendSlice("]}");
         return out.toOwnedSlice();
@@ -1315,13 +1336,15 @@ const ConnectionSession = struct {
 
 const ConnectionSessionPool = struct {
     allocator: std.mem.Allocator,
+    buffer_pool: *http.buffer_pool.BufferPool,
     mutex: std.Thread.Mutex = .{},
     free_list: std.ArrayList(*ConnectionSession),
     max_cached: usize,
 
-    fn init(allocator: std.mem.Allocator, max_cached: usize) ConnectionSessionPool {
+    fn init(allocator: std.mem.Allocator, buffer_pool: *http.buffer_pool.BufferPool, max_cached: usize) ConnectionSessionPool {
         return .{
             .allocator = allocator,
+            .buffer_pool = buffer_pool,
             .free_list = std.ArrayList(*ConnectionSession).init(allocator),
             .max_cached = max_cached,
         };
@@ -1329,6 +1352,7 @@ const ConnectionSessionPool = struct {
 
     fn deinit(self: *ConnectionSessionPool) void {
         for (self.free_list.items) |session| {
+            if (session.pending_buf) |buf| self.buffer_pool.release(buf);
             self.allocator.destroy(session);
         }
         self.free_list.deinit();
@@ -1339,12 +1363,17 @@ const ConnectionSessionPool = struct {
         defer self.mutex.unlock();
 
         if (self.free_list.items.len > 0) {
-            return self.free_list.pop().?;
+            const session = self.free_list.pop().?;
+            session.* = .{};
+            return session;
         }
-        return try self.allocator.create(ConnectionSession);
+        const session = try self.allocator.create(ConnectionSession);
+        session.* = .{};
+        return session;
     }
 
     fn release(self: *ConnectionSessionPool, session: *ConnectionSession) void {
+        if (session.pending_buf) |buf| self.buffer_pool.release(buf);
         session.pending_len = 0;
         session.pending_buf = null;
         session.proxy_protocol_checked = false;
@@ -1504,7 +1533,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         .tls = if (tls_terminator) |*tls| tls else null,
         .session_pool = undefined,
     };
-    var session_pool = ConnectionSessionPool.init(state_allocator, cfg.connection_pool_size);
+    var session_pool = ConnectionSessionPool.init(state_allocator, &state.request_buffer_pool, cfg.connection_pool_size);
     defer session_pool.deinit();
     worker_ctx.session_pool = &session_pool;
     var reloaded_cfgs = std.ArrayList(*edge_config.EdgeConfig).init(state_allocator);
@@ -1862,6 +1891,16 @@ fn hotReloadConfig(
 fn applyReloadedRuntimeConfig(cfg: *const edge_config.EdgeConfig, state: *GatewayState) void {
     state.mutex.lock();
     defer state.mutex.unlock();
+    if (state.rate_limiter) |*rl| rl.deinit();
+    state.rate_limiter = if (cfg.rate_limit_rps > 0)
+        http.rate_limiter.RateLimiter.init(state.allocator, cfg.rate_limit_rps, cfg.rate_limit_burst)
+    else
+        null;
+    if (state.proxy_cache_store) |*pc| pc.deinit();
+    state.proxy_cache_store = if (cfg.proxy_cache_ttl_seconds > 0)
+        http.idempotency.IdempotencyStore.init(state.allocator, cfg.proxy_cache_ttl_seconds)
+    else
+        null;
     state.add_headers = cfg.add_headers;
     state.security_headers = if (cfg.security_headers_enabled)
         http.security_headers.SecurityHeaders.api
@@ -1930,6 +1969,25 @@ fn runActiveHealthChecks(cfg: *const edge_config.EdgeConfig, state: *GatewayStat
     }
 }
 
+fn activeHealthConfig(cfg: *const edge_config.EdgeConfig, upstream_base_url: []const u8) http.health_checker.Config {
+    var success_status = cfg.upstream_active_health_success_status;
+    for (cfg.upstream_active_health_success_status_overrides) |entry| {
+        if (std.mem.eql(u8, upstream_base_url, entry.upstream_base_url)) {
+            success_status = entry.range;
+            break;
+        }
+    }
+    return .{
+        .path = cfg.upstream_active_health_path,
+        .interval_ms = cfg.upstream_active_health_interval_ms,
+        .timeout_ms = cfg.upstream_active_health_timeout_ms,
+        .fail_threshold = cfg.upstream_active_health_fail_threshold,
+        .success_threshold = cfg.upstream_active_health_success_threshold,
+        .success_status_min = success_status.min,
+        .success_status_max = success_status.max,
+    };
+}
+
 fn runProxyCacheMaintenance(cfg: *const edge_config.EdgeConfig, state: *GatewayState) void {
     if (cfg.proxy_cache_ttl_seconds == 0) return;
     const interval = cfg.proxy_cache_manager_interval_ms;
@@ -1946,8 +2004,9 @@ fn runProxyCacheMaintenance(cfg: *const edge_config.EdgeConfig, state: *GatewayS
 }
 
 fn probeSingleUpstream(cfg: *const edge_config.EdgeConfig, state: *GatewayState, probe_client: *std.http.Client, base_url: []const u8) void {
+    const health_cfg = activeHealthConfig(cfg, base_url);
     const probe_base = if (unixSocketPathFromEndpoint(base_url) != null) "http://localhost" else base_url;
-    const probe_url = buildHealthProbeUrl(state.allocator, probe_base, cfg.upstream_active_health_path) catch |err| {
+    const probe_url = http.health_checker.buildProbeUrl(state.allocator, probe_base, health_cfg.path) catch |err| {
         state.logger.warn(null, "active health probe url build failed for {s}: {}", .{ base_url, err });
         state.recordActiveProbeResult(cfg, base_url, false);
         return;
@@ -2003,18 +2062,11 @@ fn probeSingleUpstream(cfg: *const edge_config.EdgeConfig, state: *GatewayState,
     };
 
     const status_code: u16 = @intFromEnum(req.response.status);
-    if (status_code >= 200 and status_code < 400) {
+    if (health_cfg.statusIsHealthy(status_code)) {
         state.recordActiveProbeResult(cfg, base_url, true);
     } else {
         state.recordActiveProbeResult(cfg, base_url, false);
     }
-}
-
-fn buildHealthProbeUrl(allocator: std.mem.Allocator, base_url: []const u8, probe_path: []const u8) ![]u8 {
-    const base_trimmed = std.mem.trimRight(u8, base_url, "/");
-    const path_trimmed = std.mem.trimLeft(u8, probe_path, "/");
-    if (path_trimmed.len == 0) return std.fmt.allocPrint(allocator, "{s}/", .{base_trimmed});
-    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ base_trimmed, path_trimmed });
 }
 
 fn applyFdSoftLimit(desired: u64) !?u64 {
@@ -2036,9 +2088,12 @@ fn applyFdSoftLimit(desired: u64) !?u64 {
 }
 
 fn applyRuntimeIdentity(cfg: *const edge_config.EdgeConfig, logger: *const http.logger.Logger) !void {
+    const c = @cImport({
+        @cInclude("unistd.h");
+    });
     if (cfg.chroot_dir.len > 0) {
         try std.posix.chdir(cfg.chroot_dir);
-        try std.posix.chroot(".");
+        if (c.chroot(".") != 0) return error.ChrootFailed;
         try std.posix.chdir("/");
         logger.info(null, "Applied chroot jail: {s}", .{cfg.chroot_dir});
     }
@@ -2060,7 +2115,7 @@ fn applyRuntimeIdentity(cfg: *const edge_config.EdgeConfig, logger: *const http.
         logger.info(null, "Applied runtime user: uid={d}", .{uid});
     }
 
-    if (cfg.require_unprivileged_user and std.posix.getuid() == 0) {
+    if (cfg.require_unprivileged_user and c.getuid() == 0) {
         return error.RunningAsRoot;
     }
 }
@@ -2167,7 +2222,7 @@ fn clientIpKeyFromAddress(allocator: std.mem.Allocator, address: std.net.Address
 
 fn setNonBlocking(fd: std.posix.fd_t, enabled: bool) !void {
     var flags = try std.posix.fcntl(fd, std.posix.F.GETFL, 0);
-    const nonblock_mask = @as(i32, 1 << @bitOffsetOf(std.posix.O, "NONBLOCK"));
+    const nonblock_mask = @as(usize, 1) << @bitOffsetOf(std.posix.O, "NONBLOCK");
     if (enabled) {
         flags |= nonblock_mask;
     } else {
@@ -2539,6 +2594,7 @@ fn respondHttp2Stream(
                     command.command_type,
                     command.params_raw,
                     correlation_id,
+                    correlation_id,
                     auth_result.token_hash orelse "-",
                     "h2",
                     null,
@@ -2595,6 +2651,16 @@ fn respondHttp2Stream(
         status_code = 200;
         body = "{\"status\":\"ok\",\"service\":\"tardigrade-edge\"}";
     } else if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/metrics")) {
+        body_alloc = state.metricsToPrometheus(allocator) catch null;
+        if (body_alloc) |b| {
+            status_code = 200;
+            body = b;
+            content_type = "text/plain; version=0.0.4; charset=utf-8";
+        } else {
+            status_code = 500;
+            body = "{\"error\":\"internal_error\"}";
+        }
+    } else if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/metrics/json")) {
         body_alloc = state.metricsToJson(allocator) catch null;
         if (body_alloc) |b| {
             status_code = 200;
@@ -2643,7 +2709,7 @@ fn respondHttp2Stream(
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/health")) {
         const promised_stream_id = next_server_stream_id.*;
         next_server_stream_id.* += 2;
-        try pushHttp2Resource(writer, allocator, stream_id, promised_stream_id, "/metrics", "application/json", "{\"pushed\":true}");
+        try pushHttp2Resource(writer, allocator, stream_id, promised_stream_id, "/metrics/json", "application/json", "{\"pushed\":true}");
     }
     try http.http2_frame.writeFrame(
         writer,
@@ -2909,14 +2975,36 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
 
     // --- Rate Limiting ---
     if (!state.rateLimitAllow(client_ip)) {
-        try sendApiError(allocator, writer, .too_many_requests, "rate_limited", "Rate limit exceeded", correlation_id, keep_alive, state);
+        const payload = try buildApiErrorJson(allocator, "rate_limited", "Rate limit exceeded", correlation_id);
+        defer allocator.free(payload);
+        var response = http.Response.json(allocator, payload);
+        defer response.deinit();
+        _ = response
+            .setStatus(.too_many_requests)
+            .setConnection(keep_alive)
+            .setHeader("Retry-After", "1")
+            .setHeader(http.correlation.HEADER_NAME, correlation_id);
+        applyResponseHeaders(state, &response);
+        try response.write(writer);
+        state.metricsRecord(429);
+        state.metricsRecordErrorCode("rate_limited");
         logAccess(&ctx, request.method.toString(), request.uri.path, 429, request.headers.get("user-agent") orelse "");
         return;
     }
 
     // --- Health endpoint ---
     if (request.method == .GET and std.mem.eql(u8, request.uri.path, "/health")) {
-        var response = http.Response.json(allocator, "{\"status\":\"ok\",\"service\":\"tardigrade-edge\"}");
+        const unhealthy_backends = state.upstreamUnhealthyCount();
+        const body = try std.fmt.allocPrint(
+            allocator,
+            "{{\"status\":\"ok\",\"service\":\"tardigrade-edge\",\"upstream_status\":\"{s}\",\"upstream_unhealthy_backends\":{d}}}",
+            .{
+                if (unhealthy_backends > 0) "degraded" else "healthy",
+                unhealthy_backends,
+            },
+        );
+        defer allocator.free(body);
+        var response = http.Response.json(allocator, body);
         defer response.deinit();
         _ = response.setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
         applyResponseHeaders(state, &response);
@@ -2928,6 +3016,27 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
 
     // --- Metrics endpoint ---
     if (request.method == .GET and std.mem.eql(u8, request.uri.path, "/metrics")) {
+        const prom_text = state.metricsToPrometheus(allocator) catch {
+            try sendApiError(allocator, writer, .internal_server_error, "internal_error", "Failed to generate metrics", correlation_id, keep_alive, state);
+            return;
+        };
+        defer allocator.free(prom_text);
+
+        var response = http.Response.init(allocator);
+        defer response.deinit();
+        _ = response.setBody(prom_text)
+            .setContentType("text/plain; version=0.0.4; charset=utf-8")
+            .setConnection(keep_alive)
+            .setHeader(http.correlation.HEADER_NAME, correlation_id);
+        applyResponseHeaders(state, &response);
+        try response.write(writer);
+        state.metricsRecord(200);
+        logAccess(&ctx, request.method.toString(), "/metrics", 200, request.headers.get("user-agent") orelse "");
+        return;
+    }
+
+    // --- JSON metrics endpoint ---
+    if (request.method == .GET and std.mem.eql(u8, request.uri.path, "/metrics/json")) {
         const metrics_json = state.metricsToJson(allocator) catch {
             try sendApiError(allocator, writer, .internal_server_error, "internal_error", "Failed to generate metrics", correlation_id, keep_alive, state);
             return;
@@ -2940,7 +3049,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         applyResponseHeaders(state, &response);
         try response.write(writer);
         state.metricsRecord(200);
-        logAccess(&ctx, request.method.toString(), "/metrics", 200, request.headers.get("user-agent") orelse "");
+        logAccess(&ctx, request.method.toString(), "/metrics/json", 200, request.headers.get("user-agent") orelse "");
         return;
     }
 
@@ -3354,7 +3463,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
             correlation_id,
             client_ip,
             ctx.identity,
-            ctx.api_version,
+            if (ctx.api_version) |version| @as(u32, version) else null,
             request.headers.get("host"),
             request.headers.get("x-forwarded-for"),
             device_id,
@@ -3421,7 +3530,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
             correlation_id,
             client_ip,
             ctx.identity,
-            ctx.api_version,
+            if (ctx.api_version) |version| @as(u32, version) else null,
             request.headers.get("host"),
             request.headers.get("x-forwarded-for"),
             ws_scope,
@@ -3569,8 +3678,8 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
             cfg.refresh_token_ttl_seconds,
         });
         defer allocator.free(resp_body);
-        var response = http.Response.ok(allocator, resp_body)
-            .setContentType(JSON_CONTENT_TYPE)
+        var response = http.Response.ok(allocator, resp_body, JSON_CONTENT_TYPE);
+        _ = response
             .setConnection(keep_alive)
             .setHeader(http.correlation.HEADER_NAME, correlation_id)
             .setHeader(http.session.SESSION_HEADER, refreshed);
@@ -4055,7 +4164,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
                 correlation_id,
                 client_ip,
                 ctx.identity,
-                ctx.api_version,
+                if (ctx.api_version) |version| @as(u32, version) else null,
                 request.headers.get("host"),
                 request.headers.get("x-forwarded-for"),
             );
@@ -4076,7 +4185,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
 
         const proxy_cache_bypass = shouldBypassProxyCache(&request.headers) or effective_idem_key != null;
         const proxy_cache_key = if (cfg.proxy_cache_ttl_seconds > 0 and !proxy_cache_bypass)
-            try buildProxyCacheKey(allocator, cfg.proxy_cache_key_template, request.method.toString(), "/v1/commands", envelope, ctx.identity, ctx.api_version)
+            try buildProxyCacheKey(allocator, cfg.proxy_cache_key_template, request.method.toString(), "/v1/commands", envelope, ctx.identity, if (ctx.api_version) |version| @as(u32, version) else null)
         else
             null;
         defer if (proxy_cache_key) |k| allocator.free(k);
@@ -4113,13 +4222,14 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
                         envelope,
                         client_ip,
                         ctx.identity,
-                        ctx.api_version,
+                        if (ctx.api_version) |version| @as(u32, version) else null,
                     );
                 }
                 return;
             }
 
-            if (!try state.proxyCacheTryLock(cache_key)) {
+            proxy_cache_locked = try state.proxyCacheTryLock(cache_key);
+            if (!proxy_cache_locked) {
                 _ = state.proxyCacheWaitForUnlock(cache_key, cfg.proxy_cache_lock_timeout_ms);
                 if (try state.proxyCacheGetCopyWithStale(allocator, cache_key, 0)) |post_wait_lookup| {
                     defer allocator.free(post_wait_lookup.cached.body);
@@ -4139,7 +4249,6 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
                     return;
                 }
             }
-            proxy_cache_locked = try state.proxyCacheTryLock(cache_key);
         }
 
         // --- Forward to upstream ---
@@ -4170,12 +4279,12 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
             correlation_id,
             client_ip,
             ctx.identity,
-            ctx.api_version,
+            if (ctx.api_version) |version| @as(u32, version) else null,
             request.headers.get("host"),
             request.headers.get("x-forwarded-for"),
             writer,
             state,
-            effective_idem_key == null,
+            effective_idem_key == null and proxy_cache_key == null,
         ) catch |err| {
             state.circuitRecordFailure();
             state.commandLifecycleSetFailed(command_id, @errorName(err));
@@ -4197,9 +4306,12 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         var cmd_final_body: []const u8 = "";
         var cmd_final_content_type: []const u8 = JSON_CONTENT_TYPE;
         var cmd_final_content_disposition: ?[]const u8 = null;
+        var cmd_final_body_alloc: ?[]u8 = null;
         var cmd_final_content_type_alloc: ?[]u8 = null;
         var cmd_final_content_disposition_alloc: ?[]u8 = null;
         var cmd_error_body: ?[]const u8 = null;
+        var cmd_cacheable = false;
+        defer if (cmd_final_body_alloc) |owned_body| allocator.free(owned_body);
         defer if (cmd_final_content_type_alloc) |ct| allocator.free(ct);
         defer if (cmd_final_content_disposition_alloc) |cd| allocator.free(cd);
         switch (cmd_exec) {
@@ -4225,8 +4337,6 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
                 return;
             },
             .buffered => |proxy_result| {
-                defer allocator.free(proxy_result.body);
-
                 if (proxy_result.status >= 500) {
                     state.circuitRecordFailure();
                 } else {
@@ -4234,10 +4344,16 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
                 }
 
                 cmd_final_status = proxy_result.status;
+                cmd_final_body_alloc = proxy_result.body;
                 cmd_final_body = proxy_result.body;
+                cmd_cacheable = proxy_result.cacheable;
                 if (proxy_result.status != 200) {
                     allocator.free(proxy_result.content_type);
                     if (proxy_result.content_disposition) |cd| allocator.free(cd);
+                    if (cmd_final_body_alloc) |owned_body| {
+                        allocator.free(owned_body);
+                        cmd_final_body_alloc = null;
+                    }
                     const mapped = mapUpstreamError(proxy_result.status);
                     cmd_final_status = mapped.status;
                     cmd_final_body = try buildApiErrorJson(allocator, mapped.code, mapped.message, correlation_id);
@@ -4285,7 +4401,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         state.commandLifecycleSetCompleted(command_id, cmd_final_status, cmd_final_body, cmd_final_content_type);
 
         if (proxy_cache_key) |cache_key| {
-            if (cmd_final_status == 200) {
+            if (cmd_final_status == 200 and cmd_cacheable) {
                 state.proxyCachePut(cache_key, cmd_final_status, cmd_final_body, cmd_final_content_type) catch |err| {
                     std.log.warn("proxy cache store error: {}", .{err});
                 };
@@ -4375,7 +4491,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
 
         const proxy_cache_bypass = shouldBypassProxyCache(&request.headers) or ctx.idempotency_key != null;
         const proxy_cache_key = if (cfg.proxy_cache_ttl_seconds > 0 and !proxy_cache_bypass)
-            try buildProxyCacheKey(allocator, cfg.proxy_cache_key_template, request.method.toString(), "/v1/chat", body, ctx.identity, ctx.api_version)
+            try buildProxyCacheKey(allocator, cfg.proxy_cache_key_template, request.method.toString(), "/v1/chat", body, ctx.identity, if (ctx.api_version) |version| @as(u32, version) else null)
         else
             null;
         defer if (proxy_cache_key) |k| allocator.free(k);
@@ -4412,13 +4528,14 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
                         body,
                         client_ip,
                         ctx.identity,
-                        ctx.api_version,
+                        if (ctx.api_version) |version| @as(u32, version) else null,
                     );
                 }
                 return;
             }
 
-            if (!try state.proxyCacheTryLock(cache_key)) {
+            proxy_cache_locked = try state.proxyCacheTryLock(cache_key);
+            if (!proxy_cache_locked) {
                 _ = state.proxyCacheWaitForUnlock(cache_key, cfg.proxy_cache_lock_timeout_ms);
                 if (try state.proxyCacheGetCopyWithStale(allocator, cache_key, 0)) |post_wait_lookup| {
                     defer allocator.free(post_wait_lookup.cached.body);
@@ -4438,7 +4555,6 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
                     return;
                 }
             }
-            proxy_cache_locked = try state.proxyCacheTryLock(cache_key);
         }
 
         const message = parseChatMessage(allocator, body, cfg.max_message_chars) catch |err| {
@@ -4474,12 +4590,12 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
             correlation_id,
             client_ip,
             ctx.identity,
-            ctx.api_version,
+            if (ctx.api_version) |version| @as(u32, version) else null,
             request.headers.get("host"),
             request.headers.get("x-forwarded-for"),
             writer,
             state,
-            ctx.idempotency_key == null,
+            ctx.idempotency_key == null and proxy_cache_key == null,
         ) catch |err| {
             state.circuitRecordFailure();
             state.logger.warn(null, "circuit breaker: recorded failure, state={s}", .{state.circuitStateName()});
@@ -4494,9 +4610,12 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         var final_body: []const u8 = "";
         var final_content_type: []const u8 = JSON_CONTENT_TYPE;
         var final_content_disposition: ?[]const u8 = null;
+        var final_body_alloc: ?[]u8 = null;
         var final_content_type_alloc: ?[]u8 = null;
         var final_content_disposition_alloc: ?[]u8 = null;
         var error_body_to_free: ?[]const u8 = null;
+        var final_cacheable = false;
+        defer if (final_body_alloc) |owned_body| allocator.free(owned_body);
         defer if (final_content_type_alloc) |ct| allocator.free(ct);
         defer if (final_content_disposition_alloc) |cd| allocator.free(cd);
         switch (chat_exec) {
@@ -4512,8 +4631,6 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
                 return;
             },
             .buffered => |proxy_result| {
-                defer allocator.free(proxy_result.body);
-
                 if (proxy_result.status >= 500) {
                     state.circuitRecordFailure();
                 } else {
@@ -4521,10 +4638,16 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
                 }
 
                 final_status = proxy_result.status;
+                final_body_alloc = proxy_result.body;
                 final_body = proxy_result.body;
+                final_cacheable = proxy_result.cacheable;
                 if (proxy_result.status != 200) {
                     allocator.free(proxy_result.content_type);
                     if (proxy_result.content_disposition) |cd| allocator.free(cd);
+                    if (final_body_alloc) |owned_body| {
+                        allocator.free(owned_body);
+                        final_body_alloc = null;
+                    }
                     const mapped = mapUpstreamError(proxy_result.status);
                     final_status = mapped.status;
                     final_body = try buildApiErrorJson(allocator, mapped.code, mapped.message, correlation_id);
@@ -4571,7 +4694,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         state.metricsRecord(final_status);
 
         if (proxy_cache_key) |cache_key| {
-            if (final_status == 200) {
+            if (final_status == 200 and final_cacheable) {
                 state.proxyCachePut(cache_key, final_status, final_body, final_content_type) catch |err| {
                     std.log.warn("proxy cache store error: {}", .{err});
                 };
@@ -4615,20 +4738,10 @@ fn handleWebSocketProxyLoop(
 ) !void {
     const writer = conn.writer();
     var last_activity_ms = http.event_loop.monotonicMs();
-    var last_ping_ms = last_activity_ms;
 
     while (!http.shutdown.isShutdownRequested()) {
-        const frame = http.websocket.readFrame(conn, allocator, cfg.websocket_max_frame_size) catch |err| switch (err) {
+        var frame = http.websocket.readFrame(conn, allocator, cfg.websocket_max_frame_size) catch |err| switch (err) {
             error.ConnectionClosed => return,
-            error.WouldBlock => {
-                const now_ms = http.event_loop.monotonicMs();
-                if (cfg.websocket_ping_interval_ms > 0 and now_ms - last_ping_ms >= cfg.websocket_ping_interval_ms) {
-                    try http.websocket.writeFrame(writer, .ping, "", true);
-                    last_ping_ms = now_ms;
-                }
-                if (cfg.websocket_idle_timeout_ms > 0 and now_ms - last_activity_ms >= cfg.websocket_idle_timeout_ms) return;
-                continue;
-            },
             else => return err,
         };
         defer http.websocket.deinitFrame(allocator, &frame);
@@ -4699,9 +4812,9 @@ fn handleWebSocketProxyLoop(
 
                 if (result.status == 200) {
                     if (scope == .chat) {
-                        try state.event_hub.publish("ws.chat.responses", result.body, http.event_loop.monotonicMs());
+                        _ = try state.event_hub.publish("ws.chat.responses", result.body, http.event_loop.monotonicMs());
                     } else {
-                        try state.event_hub.publish("ws.commands.responses", result.body, http.event_loop.monotonicMs());
+                        _ = try state.event_hub.publish("ws.commands.responses", result.body, http.event_loop.monotonicMs());
                     }
                     try http.websocket.writeFrame(writer, .text, result.body, true);
                 } else {
@@ -4736,20 +4849,9 @@ fn handleWebSocketMultiplexLoop(
     }
 
     var last_activity_ms = http.event_loop.monotonicMs();
-    var last_ping_ms = last_activity_ms;
     while (!http.shutdown.isShutdownRequested()) {
-        const frame = http.websocket.readFrame(conn, allocator, cfg.websocket_max_frame_size) catch |err| switch (err) {
+        var frame = http.websocket.readFrame(conn, allocator, cfg.websocket_max_frame_size) catch |err| switch (err) {
             error.ConnectionClosed => return,
-            error.WouldBlock => {
-                try pollMuxChannels(writer, allocator, state, &channels);
-                const now_ms = http.event_loop.monotonicMs();
-                if (cfg.websocket_ping_interval_ms > 0 and now_ms - last_ping_ms >= cfg.websocket_ping_interval_ms) {
-                    try http.websocket.writeFrame(writer, .ping, "", true);
-                    last_ping_ms = now_ms;
-                }
-                if (cfg.websocket_idle_timeout_ms > 0 and now_ms - last_activity_ms >= cfg.websocket_idle_timeout_ms) return;
-                continue;
-            },
             else => return err,
         };
         defer http.websocket.deinitFrame(allocator, &frame);
@@ -4859,7 +4961,7 @@ fn handleWebSocketMultiplexLoop(
                 correlation_id,
                 identity orelse "-",
                 client_ip,
-                api_version,
+                if (api_version) |version| @as(u16, @intCast(version)) else null,
             );
             defer allocator.free(envelope);
 
@@ -5086,10 +5188,9 @@ fn serveTryFilesFallback(
         const file_data = std.fs.cwd().readFileAlloc(allocator, full_path, MAX_REQUEST_SIZE) catch continue;
         defer allocator.free(file_data);
 
-        var response = http.Response.ok(allocator, if (std.ascii.eqlIgnoreCase(method, "HEAD")) "" else file_data);
+        var response = http.Response.ok(allocator, if (std.ascii.eqlIgnoreCase(method, "HEAD")) "" else file_data, "application/octet-stream");
         defer response.deinit();
         _ = response
-            .setContentType("application/octet-stream")
             .setConnection(keep_alive)
             .setHeader(http.correlation.HEADER_NAME, correlation_id);
         applyResponseHeaders(state, &response);
@@ -5910,7 +6011,8 @@ fn extractIdentityForPolicy(
 ) !?[]const u8 {
     const auth_res = authorizeRequest(cfg, &request.headers);
     if (auth_res.ok and auth_res.token_hash != null) {
-        return allocator.dupe(u8, auth_res.token_hash.?);
+        const identity = try allocator.dupe(u8, auth_res.token_hash.?);
+        return identity;
     }
     if (http.session.fromHeaders(&request.headers)) |session_token| {
         if (state.validateSessionIdentity(allocator, session_token)) |identity| return identity;
@@ -6285,6 +6387,7 @@ const ProxyResult = struct {
     body: []u8,
     content_type: []u8,
     content_disposition: ?[]u8,
+    cacheable: bool,
 };
 
 const ProxyExecution = union(enum) {
@@ -6308,12 +6411,12 @@ const ProxyCacheRefreshTask = struct {
 
 fn proxyCacheRefreshThread(task: *ProxyCacheRefreshTask) void {
     defer {
+        task.state.proxyCacheUnlock(task.cache_key);
         task.allocator.free(task.cache_key);
         if (task.suffix_path) |suffix| task.allocator.free(suffix);
         task.allocator.free(task.payload);
         task.allocator.free(task.client_ip);
         if (task.identity) |id| task.allocator.free(id);
-        task.state.proxyCacheUnlock(task.cache_key);
         task.allocator.destroy(task);
     }
 
@@ -6349,7 +6452,7 @@ fn proxyCacheRefreshThread(task: *ProxyCacheRefreshTask) void {
 }
 
 fn spawnProxyCacheRefresh(
-    allocator: std.mem.Allocator,
+    _: std.mem.Allocator,
     cfg: *const edge_config.EdgeConfig,
     state: *GatewayState,
     cache_key: []const u8,
@@ -6361,48 +6464,49 @@ fn spawnProxyCacheRefresh(
     identity: ?[]const u8,
     api_version: ?u32,
 ) void {
+    const task_allocator = state.allocator;
     if (!(state.proxyCacheTryLock(cache_key) catch false)) return;
 
-    const task = allocator.create(ProxyCacheRefreshTask) catch {
+    const task = task_allocator.create(ProxyCacheRefreshTask) catch {
         state.proxyCacheUnlock(cache_key);
         return;
     };
-    errdefer allocator.destroy(task);
+    errdefer task_allocator.destroy(task);
 
-    const owned_key = allocator.dupe(u8, cache_key) catch {
+    const owned_key = task_allocator.dupe(u8, cache_key) catch {
         state.proxyCacheUnlock(cache_key);
         return;
     };
-    errdefer allocator.free(owned_key);
-    const owned_payload = allocator.dupe(u8, payload) catch {
+    errdefer task_allocator.free(owned_key);
+    const owned_payload = task_allocator.dupe(u8, payload) catch {
         state.proxyCacheUnlock(cache_key);
         return;
     };
-    errdefer allocator.free(owned_payload);
-    const owned_ip = allocator.dupe(u8, client_ip) catch {
+    errdefer task_allocator.free(owned_payload);
+    const owned_ip = task_allocator.dupe(u8, client_ip) catch {
         state.proxyCacheUnlock(cache_key);
         return;
     };
-    errdefer allocator.free(owned_ip);
+    errdefer task_allocator.free(owned_ip);
     const owned_suffix = if (suffix_path) |suffix|
-        allocator.dupe(u8, suffix) catch {
+        task_allocator.dupe(u8, suffix) catch {
             state.proxyCacheUnlock(cache_key);
             return;
         }
     else
         null;
-    errdefer if (owned_suffix) |s| allocator.free(s);
+    errdefer if (owned_suffix) |s| task_allocator.free(s);
     const owned_identity = if (identity) |id|
-        allocator.dupe(u8, id) catch {
+        task_allocator.dupe(u8, id) catch {
             state.proxyCacheUnlock(cache_key);
             return;
         }
     else
         null;
-    errdefer if (owned_identity) |id| allocator.free(id);
+    errdefer if (owned_identity) |id| task_allocator.free(id);
 
     task.* = .{
-        .allocator = allocator,
+        .allocator = task_allocator,
         .cfg = cfg,
         .state = state,
         .cache_key = owned_key,
@@ -6417,12 +6521,12 @@ fn spawnProxyCacheRefresh(
 
     const thread = std.Thread.spawn(.{}, proxyCacheRefreshThread, .{task}) catch {
         state.proxyCacheUnlock(cache_key);
-        allocator.free(owned_key);
-        allocator.free(owned_payload);
-        allocator.free(owned_ip);
-        if (owned_suffix) |s| allocator.free(s);
-        if (owned_identity) |id| allocator.free(id);
-        allocator.destroy(task);
+        task_allocator.free(owned_key);
+        task_allocator.free(owned_payload);
+        task_allocator.free(owned_ip);
+        if (owned_suffix) |s| task_allocator.free(s);
+        if (owned_identity) |id| task_allocator.free(id);
+        task_allocator.destroy(task);
         return;
     };
     thread.detach();
@@ -6447,11 +6551,7 @@ fn proxyJsonExecute(
 ) !ProxyExecution {
     const upstream_pool = upstreamPoolForScope(cfg, upstream_scope);
     const configured_attempts: usize = @intCast(@max(cfg.upstream_retry_attempts, @as(u32, 1)));
-    const configured_upstream_count = if (upstream_pool.primary_urls.len > 0 or upstream_pool.backup_urls.len > 0)
-        upstream_pool.primary_urls.len + upstream_pool.backup_urls.len
-    else
-        @as(usize, 1);
-    const max_attempts = @min(configured_attempts, configured_upstream_count);
+    const max_attempts = configured_attempts;
     const start_ms = http.event_loop.monotonicMs();
     const upstream_hash_key = if (payload.len > 0) payload else (suffix_path orelse proxy_pass_target);
 
@@ -6548,7 +6648,10 @@ fn proxyJsonExecuteSingleAttempt(
     enable_streaming_success: bool,
 ) !ProxyExecution {
     const resolved_target = try resolveProxyTarget(allocator, upstream_base_url, proxy_pass_target, suffix_path);
-    defer allocator.free(resolved_target.url);
+    var current_url = resolved_target.url;
+    defer allocator.free(current_url);
+    var current_unix_socket_path = resolved_target.unix_socket_path;
+    var redirects_followed: u8 = 0;
 
     const forwarded_for = try buildForwardedFor(allocator, incoming_x_forwarded_for, client_ip);
     defer allocator.free(forwarded_for);
@@ -6596,62 +6699,114 @@ fn proxyJsonExecuteSingleAttempt(
         payload,
     );
 
-    var server_header_buffer: [16 * 1024]u8 = undefined;
-    const uri = try std.Uri.parse(resolved_target.url);
-    const unix_conn: ?*std.http.Client.Connection = if (resolved_target.unix_socket_path) |socket_path|
-        try state.upstream_client.connectUnix(socket_path)
-    else
-        null;
-    var req = try state.upstream_client.open(.POST, uri, .{
-        .server_header_buffer = &server_header_buffer,
-        .connection = unix_conn,
-        .headers = .{ .content_type = .{ .override = "application/json" } },
-        .extra_headers = extra_headers.items,
-        .keep_alive = true,
-    });
-    defer req.deinit();
+    while (true) {
+        var server_header_buffer: [16 * 1024]u8 = undefined;
+        const uri = try std.Uri.parse(current_url);
+        const unix_conn: ?*std.http.Client.Connection = if (current_unix_socket_path) |socket_path|
+            try state.upstream_client.connectUnix(socket_path)
+        else
+            null;
+        var req = try state.upstream_client.open(.POST, uri, .{
+            .server_header_buffer = &server_header_buffer,
+            .connection = unix_conn,
+            .headers = .{ .content_type = .{ .override = "application/json" } },
+            .extra_headers = extra_headers.items,
+            .keep_alive = true,
+            .redirect_behavior = .unhandled,
+        });
+        defer req.deinit();
 
-    if (attempt_timeout_ms > 0) {
-        if (req.connection) |conn| {
-            setSocketTimeoutMs(conn.stream.handle, attempt_timeout_ms, attempt_timeout_ms) catch |err| {
-                state.logger.warn(null, "failed to set upstream socket timeout: {}", .{err});
+        if (attempt_timeout_ms > 0) {
+            if (req.connection) |conn| {
+                setSocketTimeoutMs(conn.stream.handle, attempt_timeout_ms, attempt_timeout_ms) catch |err| {
+                    state.logger.warn(null, "failed to set upstream socket timeout: {}", .{err});
+                };
+            }
+        }
+
+        req.transfer_encoding = .{ .content_length = payload.len };
+        try req.send();
+        try req.writeAll(payload);
+        try req.finish();
+        try req.wait();
+
+        const status_code: u16 = @intFromEnum(req.response.status);
+        if (redirects_followed == 0 and isRedirectStatusCode(status_code)) {
+            if (req.response.location) |location| {
+                const drain_buf = try state.relay_buffer_pool.acquire();
+                defer state.relay_buffer_pool.release(drain_buf);
+                while (true) {
+                    const n = try req.reader().read(drain_buf);
+                    if (n == 0) break;
+                }
+                const next_url = try resolveRedirectTargetUrl(allocator, current_url, location);
+                allocator.free(current_url);
+                current_url = next_url;
+                current_unix_socket_path = null;
+                redirects_followed += 1;
+                continue;
+            }
+        }
+
+        const upstream_content_type = req.response.content_type orelse JSON_CONTENT_TYPE;
+        const upstream_content_disposition = req.response.content_disposition;
+        const cacheable = !upstreamResponseHasNoStore(req.response);
+        const stream_status = enable_streaming_success and (status_code == 200 or cfg.proxy_stream_all_statuses);
+        if (stream_status) {
+            try writeStreamedUpstreamResponse(
+                downstream_writer,
+                status_code,
+                req.response.reason,
+                upstream_content_type,
+                upstream_content_disposition,
+                correlation_id,
+                &state.security_headers,
+            );
+
+            const read_buf = try state.relay_buffer_pool.acquire();
+            defer state.relay_buffer_pool.release(read_buf);
+            while (true) {
+                const n = try req.reader().read(read_buf);
+                if (n == 0) break;
+                try writeChunk(downstream_writer, read_buf[0..n]);
+            }
+            try downstream_writer.writeAll("0\r\n\r\n");
+            return .{ .streamed_status = status_code };
+        }
+
+        if (status_code != 200) {
+            const buffered_content_type = try allocator.dupe(u8, upstream_content_type);
+            errdefer allocator.free(buffered_content_type);
+            const buffered_content_disposition = if (upstream_content_disposition) |cd|
+                try allocator.dupe(u8, cd)
+            else
+                null;
+            errdefer if (buffered_content_disposition) |cd| allocator.free(cd);
+
+            const drain_buf = try state.relay_buffer_pool.acquire();
+            defer state.relay_buffer_pool.release(drain_buf);
+            while (true) {
+                const n = try req.reader().read(drain_buf);
+                if (n == 0) break;
+            }
+            return .{
+                .buffered = .{
+                    .status = status_code,
+                    .body = try allocator.alloc(u8, 0),
+                    .content_type = buffered_content_type,
+                    .content_disposition = buffered_content_disposition,
+                    .cacheable = false,
+                },
             };
         }
-    }
 
-    req.transfer_encoding = .{ .content_length = payload.len };
-    try req.send();
-    try req.writeAll(payload);
-    try req.finish();
-    try req.wait();
-
-    const status_code: u16 = @intFromEnum(req.response.status);
-    const upstream_content_type = req.response.content_type orelse JSON_CONTENT_TYPE;
-    const upstream_content_disposition = req.response.content_disposition;
-    const stream_status = enable_streaming_success and (status_code == 200 or cfg.proxy_stream_all_statuses);
-    if (stream_status) {
-        try writeStreamedUpstreamResponse(
-            downstream_writer,
-            status_code,
-            req.response.reason,
-            upstream_content_type,
-            upstream_content_disposition,
-            correlation_id,
-            &state.security_headers,
-        );
-
-        const read_buf = try state.relay_buffer_pool.acquire();
-        defer state.relay_buffer_pool.release(read_buf);
-        while (true) {
-            const n = try req.reader().read(read_buf);
-            if (n == 0) break;
-            try writeChunk(downstream_writer, read_buf[0..n]);
-        }
-        try downstream_writer.writeAll("0\r\n\r\n");
-        return .{ .streamed_status = status_code };
-    }
-
-    if (status_code != 200) {
+        const max_buffered = if (cfg.max_connection_memory_bytes > 0)
+            cfg.max_connection_memory_bytes
+        else
+            2 * 1024 * 1024;
+        var body = std.ArrayList(u8).init(allocator);
+        errdefer body.deinit();
+        try req.reader().readAllArrayList(&body, max_buffered);
         const buffered_content_type = try allocator.dupe(u8, upstream_content_type);
         errdefer allocator.free(buffered_content_type);
         const buffered_content_disposition = if (upstream_content_disposition) |cd|
@@ -6659,45 +6814,16 @@ fn proxyJsonExecuteSingleAttempt(
         else
             null;
         errdefer if (buffered_content_disposition) |cd| allocator.free(cd);
-
-        const drain_buf = try state.relay_buffer_pool.acquire();
-        defer state.relay_buffer_pool.release(drain_buf);
-        while (true) {
-            const n = try req.reader().read(drain_buf);
-            if (n == 0) break;
-        }
         return .{
             .buffered = .{
                 .status = status_code,
-                .body = try allocator.alloc(u8, 0),
+                .body = try body.toOwnedSlice(),
                 .content_type = buffered_content_type,
                 .content_disposition = buffered_content_disposition,
+                .cacheable = cacheable,
             },
         };
     }
-
-    const max_buffered = if (cfg.max_connection_memory_bytes > 0)
-        cfg.max_connection_memory_bytes
-    else
-        2 * 1024 * 1024;
-    var body = std.ArrayList(u8).init(allocator);
-    errdefer body.deinit();
-    try req.reader().readAllArrayList(&body, max_buffered);
-    const buffered_content_type = try allocator.dupe(u8, upstream_content_type);
-    errdefer allocator.free(buffered_content_type);
-    const buffered_content_disposition = if (upstream_content_disposition) |cd|
-        try allocator.dupe(u8, cd)
-    else
-        null;
-    errdefer if (buffered_content_disposition) |cd| allocator.free(cd);
-    return .{
-        .buffered = .{
-            .status = status_code,
-            .body = try body.toOwnedSlice(),
-            .content_type = buffered_content_type,
-            .content_disposition = buffered_content_disposition,
-        },
-    };
 }
 
 fn writeStreamedUpstreamResponse(
@@ -6824,11 +6950,31 @@ fn buildForwardedFor(allocator: std.mem.Allocator, incoming: ?[]const u8, client
     return allocator.dupe(u8, client_ip);
 }
 
+fn upstreamResponseHasNoStore(response: std.http.Client.Response) bool {
+    var it = response.iterateHeaders();
+    while (it.next()) |header| {
+        if (!std.ascii.eqlIgnoreCase(header.name, "cache-control")) continue;
+        var tokens = std.mem.splitScalar(u8, header.value, ',');
+        while (tokens.next()) |token_raw| {
+            const token = std.mem.trim(u8, token_raw, " \t\r\n");
+            if (std.ascii.eqlIgnoreCase(token, "no-store")) return true;
+        }
+    }
+    return false;
+}
+
 const ResolvedProxyTarget = struct {
     url: []u8,
     upstream_host: []const u8,
     unix_socket_path: ?[]const u8 = null,
 };
+
+fn isRedirectStatusCode(status_code: u16) bool {
+    return switch (status_code) {
+        301, 302, 303, 307, 308 => true,
+        else => false,
+    };
+}
 
 fn resolveProxyTarget(
     allocator: std.mem.Allocator,
@@ -6884,6 +7030,19 @@ fn resolveProxyTarget(
     };
 }
 
+fn resolveRedirectTargetUrl(allocator: std.mem.Allocator, current_url: []const u8, location: []const u8) ![]u8 {
+    if (isAbsoluteHttpUrl(location)) return allocator.dupe(u8, location);
+    if (!std.mem.startsWith(u8, location, "/")) return error.HttpRedirectLocationInvalid;
+
+    const current_uri = try std.Uri.parse(current_url);
+    const scheme = current_uri.scheme;
+    const host = (current_uri.host orelse return error.HttpRedirectLocationInvalid).raw;
+    if (current_uri.port) |port| {
+        return std.fmt.allocPrint(allocator, "{s}://{s}:{d}{s}", .{ scheme, host, port, location });
+    }
+    return std.fmt.allocPrint(allocator, "{s}://{s}{s}", .{ scheme, host, location });
+}
+
 fn unixSocketPathFromEndpoint(endpoint: []const u8) ?[]const u8 {
     if (std.mem.startsWith(u8, endpoint, "unix://")) {
         const path = endpoint["unix://".len..];
@@ -6937,7 +7096,7 @@ const UpstreamMappedError = struct {
 };
 
 const ProxyExecMappedError = struct {
-    status: http.status.StatusCode,
+    status: http.Status,
     code: []const u8,
     message: []const u8,
 };
@@ -7044,10 +7203,7 @@ fn readHttpRequest(conn: anytype, buf: []u8, pending_len: *usize) !usize {
         }
         if (total_read == buf.len) break;
 
-        const n = conn.read(buf[total_read..]) catch |err| switch (err) {
-            error.WouldBlock => return 0,
-            else => return err,
-        };
+        const n = conn.read(buf[total_read..]) catch |err| return err;
         if (n == 0) break;
         total_read += n;
     }
@@ -7108,7 +7264,7 @@ test "parseUpstreamHost extracts authority" {
 
 test "buildHealthProbeUrl joins base and probe path" {
     const allocator = std.testing.allocator;
-    const url = try buildHealthProbeUrl(allocator, "http://127.0.0.1:8080/", "/health");
+    const url = try http.health_checker.buildProbeUrl(allocator, "http://127.0.0.1:8080/", "/health");
     defer allocator.free(url);
     try std.testing.expectEqualStrings("http://127.0.0.1:8080/health", url);
 }
@@ -7209,7 +7365,9 @@ test "firstRequestCompleteLen handles keep-alive pipelined requests" {
 }
 
 test "connection session pool reuses released sessions" {
-    var pool = ConnectionSessionPool.init(std.testing.allocator, 4);
+    var buffer_pool = http.buffer_pool.BufferPool.init(std.testing.allocator, 1024, 4);
+    defer buffer_pool.deinit();
+    var pool = ConnectionSessionPool.init(std.testing.allocator, &buffer_pool, 4);
     defer pool.deinit();
 
     const first = try pool.acquire();
@@ -7359,6 +7517,8 @@ test "resolveProxyTarget handles absolute and relative proxy_pass" {
         .upstream_active_health_timeout_ms = 2000,
         .upstream_active_health_fail_threshold = 1,
         .upstream_active_health_success_threshold = 1,
+        .upstream_active_health_success_status = .{ .min = 200, .max = 299 },
+        .upstream_active_health_success_status_overrides = &[_]edge_config.EdgeConfig.UpstreamHealthSuccessStatusOverride{},
         .upstream_slow_start_ms = 0,
         .websocket_enabled = true,
         .websocket_idle_timeout_ms = 60_000,
@@ -7548,6 +7708,8 @@ test "authorizeRequest accepts valid hash" {
         .upstream_active_health_timeout_ms = 2000,
         .upstream_active_health_fail_threshold = 1,
         .upstream_active_health_success_threshold = 1,
+        .upstream_active_health_success_status = .{ .min = 200, .max = 299 },
+        .upstream_active_health_success_status_overrides = &[_]edge_config.EdgeConfig.UpstreamHealthSuccessStatusOverride{},
         .upstream_slow_start_ms = 0,
         .websocket_enabled = true,
         .websocket_idle_timeout_ms = 60_000,

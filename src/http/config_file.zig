@@ -53,7 +53,7 @@ fn parseFile(
     overrides: *Overrides,
     vars: *std.StringHashMap([]const u8),
     visited: *std.StringHashMap(void),
-) !void {
+) anyerror!void {
     const normalized = try normalizePath(allocator, path);
     defer allocator.free(normalized);
     if (visited.contains(normalized)) return;
@@ -87,7 +87,7 @@ fn parseStatement(
     vars: *std.StringHashMap([]const u8),
     visited: *std.StringHashMap(void),
     line_no: usize,
-) !void {
+) anyerror!void {
     var it = std.mem.tokenizeAny(u8, stmt, " \t");
     const directive = it.next() orelse return;
 
@@ -225,7 +225,7 @@ fn parseInclude(
     overrides: *Overrides,
     vars: *std.StringHashMap([]const u8),
     visited: *std.StringHashMap(void),
-) !void {
+) anyerror!void {
     const resolved = try resolveIncludePath(allocator, current_file_path, include_path);
     defer allocator.free(resolved);
 

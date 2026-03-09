@@ -1,6 +1,47 @@
 
 # Changelog
 
+## [0.30.0] - 2026-03-xx
+
+### Added
+- Upgrade 1 integration-test harness foundation:
+  - Added a live-process `tests/integration.zig` suite that boots Tardigrade with deterministic env config.
+  - Added a loopback upstream test server to exercise real proxy requests over TCP.
+  - Added `zig build test-integration` and CI coverage for unit + integration test runs.
+  - Added coverage for `/metrics` Prometheus output and moved JSON metrics output to `/metrics/json` while preserving `/metrics/prometheus`.
+  - Added integration coverage for JWT, device auth, session lifecycle, rate limiting, proxy cache stale refresh, hot reload, and graceful shutdown flows.
+  - Added integration coverage for proxy forwarding fidelity, upstream `Cache-Control: no-store` cache bypass, and upstream 5xx retry handling.
+  - Added integration coverage for single-hop upstream redirect following and `Connection: close` on keep-alive responses during graceful shutdown.
+  - Added TLS integration coverage for self-signed HTTPS health checks and mTLS rejection of clients signed by an untrusted CA.
+  - Added TLS graceful-drain coverage that verifies in-flight HTTPS responses switch to `Connection: close` during shutdown.
+  - Added SNI integration coverage that verifies `sni.integration.test` presents the configured alternate certificate while unknown hostnames keep the default certificate.
+  - Added concurrency integration coverage for 100 parallel chat requests and worker-queue saturation with queue-rejection metrics.
+  - Added concurrent mixed bearer-auth and session-auth chat coverage to prove auth-plus-rate-limit contention does not deadlock the shared gateway state path.
+  - Added graceful-shutdown exit coverage that verifies the gateway process exits promptly after drain, closes the listener, and logs shutdown completion.
+  - Added saturation-ordering coverage that verifies a single-worker queue drains accepted `/v1/chat` requests in the same order they were admitted.
+- Upgrade 2 active upstream health-check foundation:
+  - Added `src/http/health_checker.zig` with explicit up/down/half-open transition logic and unit coverage.
+  - Added integration coverage for active probe down detection, rerouting away from failed upstreams, recovery after probe successes, and degraded `/health` reporting.
+  - Added Upgrade 2 env aliases (`TARDIGRADE_UPSTREAM_HEALTH_*`) on top of the existing active-health settings.
+  - Added active probe success-status config with a default range plus exact upstream URL overrides for non-2xx health endpoints.
+
+### Fixed
+- Upgrade 1 integration hardening in the live gateway path:
+  - Rebuilt rate limiter and proxy cache runtime state during SIGHUP reload so new limits apply immediately.
+  - Buffered cacheable upstream success responses so `/v1/chat` and `/v1/commands` can be cached and revalidated correctly.
+  - Fixed proxy cache lock handling, response body ownership, and detached refresh-thread lifetime issues uncovered by the integration suite.
+  - Fixed single-upstream retry budgeting so configured retry attempts are honored even without multiple upstream URLs.
+  - Fixed proxy cache writes to respect upstream `Cache-Control: no-store`.
+  - Fixed the integration request builder so explicit `Host` headers are preserved in end-to-end proxy tests.
+  - Fixed proxied upstream requests to follow a single redirect deterministically instead of timing out in the client path.
+  - Fixed the TLS integration probe path to force HTTP/1.1 so TLS tests are not blocked by the separate HTTP/2 Huffman decoder gap.
+  - Fixed the TLS drain harness to use an asynchronously spawned `curl` subprocess from the main test thread, avoiding the Zig/macOS threaded child-process crash.
+  - Restored OpenSSL SNI callback registration through `SSL_CTX_callback_ctrl`/`SSL_CTX_ctrl` and fixed a TLS handshake deadlock by not holding the TLS state mutex across `SSL_accept()`.
+  - Fixed connection-session cleanup to release request buffers back to the pool during shutdown and zero-initialize reused sessions.
+  - Fixed the contention test harness to use bounded socket timeouts instead of concurrent `curl` subprocess fan-out, which was unstable on macOS under threaded Zig tests.
+  - Fixed the worker-pool own-queue pop path to preserve FIFO drain order under saturation instead of reversing requests with LIFO `pop()`.
+  - Fixed active upstream health routing so a backend stays out of rotation until recovery probes succeed, instead of becoming eligible again solely because the passive fail-time window elapsed.
+
 ## [0.29.0] - 2026-03-08
 
 ### Added

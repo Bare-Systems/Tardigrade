@@ -190,7 +190,7 @@ pub const WorkerPool = struct {
             var own = &self.worker_queues[worker_index].items;
             if (own.items.len > 0) {
                 self.queued_jobs -= 1;
-                return own.pop().?;
+                return own.orderedRemove(0);
             }
         }
 

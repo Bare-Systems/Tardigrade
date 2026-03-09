@@ -14,6 +14,10 @@ pub fn build(b: *std.Build) void {
     // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall. Here we do not
     // set a preferred release mode, allowing the user to decide how to optimize.
     const optimize = b.standardOptimizeOption(.{});
+    const enable_http3_ngtcp2 = b.option(bool, "enable-http3-ngtcp2", "Enable experimental HTTP/3 ngtcp2/nghttp3 system-library integration") orelse false;
+
+    const build_options = b.addOptions();
+    build_options.addOption(bool, "enable_http3_ngtcp2", enable_http3_ngtcp2);
 
     // We will also create a module for our other entry point, 'main.zig'.
     const exe_mod = b.createModule(.{
@@ -25,6 +29,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    exe_mod.addImport("build_options", build_options.createModule());
 
     // This creates another `std.Build.Step.Compile`, but this one builds an executable
     // rather than a static library.
@@ -35,6 +40,11 @@ pub fn build(b: *std.Build) void {
     exe.linkLibC();
     exe.linkSystemLibrary("ssl");
     exe.linkSystemLibrary("crypto");
+    if (enable_http3_ngtcp2) {
+        exe.linkSystemLibrary("ngtcp2");
+        exe.linkSystemLibrary("ngtcp2_crypto_openssl");
+        exe.linkSystemLibrary("nghttp3");
+    }
 
     // This declares intent for the executable to be installed into the
     // standard location when the user invokes the "install" step (the default
@@ -70,6 +80,11 @@ pub fn build(b: *std.Build) void {
     exe_unit_tests.linkLibC();
     exe_unit_tests.linkSystemLibrary("ssl");
     exe_unit_tests.linkSystemLibrary("crypto");
+    if (enable_http3_ngtcp2) {
+        exe_unit_tests.linkSystemLibrary("ngtcp2");
+        exe_unit_tests.linkSystemLibrary("ngtcp2_crypto_openssl");
+        exe_unit_tests.linkSystemLibrary("nghttp3");
+    }
 
     const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);
 
@@ -78,4 +93,24 @@ pub fn build(b: *std.Build) void {
     // running the unit tests.
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_exe_unit_tests.step);
+
+    const integration_options = b.addOptions();
+    integration_options.addOption([]const u8, "tardigrade_bin_path", b.getInstallPath(.bin, "tardigrade"));
+
+    const integration_mod = b.createModule(.{
+        .root_source_file = b.path("tests/integration.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    integration_mod.addImport("integration_options", integration_options.createModule());
+    integration_mod.addImport("build_options", build_options.createModule());
+
+    const integration_tests = b.addTest(.{
+        .root_module = integration_mod,
+    });
+    const run_integration_tests = b.addRunArtifact(integration_tests);
+    run_integration_tests.step.dependOn(b.getInstallStep());
+
+    const integration_step = b.step("test-integration", "Run live-process integration tests");
+    integration_step.dependOn(&run_integration_tests.step);
 }

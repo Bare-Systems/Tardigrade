@@ -89,7 +89,7 @@ fn writePidFile(cfg: *const edge_config.EdgeConfig) !void {
     if (cfg.pid_file.len == 0) return;
     var file = try std.fs.cwd().createFile(cfg.pid_file, .{ .truncate = true, .read = false });
     defer file.close();
-    try file.writer().print("{d}\n", .{std.posix.getpid()});
+    try file.writer().print("{d}\n", .{std.c.getpid()});
 }
 
 fn removePidFile(cfg: *const edge_config.EdgeConfig) void {
@@ -151,11 +151,10 @@ fn runMaster(allocator: std.mem.Allocator, cfg: *const edge_config.EdgeConfig) !
         }
 
         for (0..worker_count) |i| {
-            if (children[i].tryWait()) |status_opt| {
-                if (status_opt != null and !http.shutdown.isShutdownRequested()) {
-                    children[i] = try spawnWorker(allocator, exe_path, i);
-                }
-            } else |_| {}
+            const wait_result = std.posix.waitpid(children[i].id, std.posix.W.NOHANG);
+            if (wait_result.pid == children[i].id and !http.shutdown.isShutdownRequested()) {
+                children[i] = try spawnWorker(allocator, exe_path, i);
+            }
         }
         std.time.sleep(250 * std.time.ns_per_ms);
     }

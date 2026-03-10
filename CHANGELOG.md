@@ -50,6 +50,15 @@
   - Added a gateway-owned HTTP/3 request-dispatch seam so ngtcp2/nghttp3 can hand completed requests back to edge logic instead of hardcoding the transport response in the binding layer.
   - Added HTTP/3 response-body streaming via an nghttp3 data reader for gateway-owned responses, and extended the loopback QUIC integration test to assert the real `/health` JSON body.
   - Added gateway-backed HTTP/3 dispatch for `/metrics`, `/metrics/json`, and `/metrics/prometheus`, plus live QUIC integration coverage for Prometheus metrics over HTTP/3.
+  - Added HTTP/3 concurrent-stream integration coverage proving one QUIC connection can serve independent `/health` and `/metrics/json` responses in parallel.
+  - Added authenticated `/admin/routes` coverage over HTTP/3, exercising header propagation and bearer-token authorization on the gateway-backed QUIC path.
+  - Added dynamic `/admin/connections` coverage over HTTP/3 so the gateway-backed QUIC path now serves live admin state in addition to static admin metadata.
+  - Added `/admin/upstreams` coverage over HTTP/3 so the gateway-backed QUIC path can serve dynamic upstream-state JSON on authenticated admin routes.
+  - Added a dedicated `handleHttp3Connection()` gateway entry point so HTTP/3 route dispatch now lives behind a stable edge-gateway function instead of directly inside the ngtcp2 callback adapter.
+  - Added gateway-backed `/v1/chat` handling over HTTP/3, with live QUIC coverage for both unauthorized and successful proxied chat requests.
+  - Added gateway-backed `/v1/commands` handling over HTTP/3, with live QUIC coverage for both unauthorized and successful proxied command requests.
+  - Added gateway-backed `/v1/commands/status` handling over HTTP/3, with live QUIC coverage for authenticated lifecycle snapshot reads after command execution.
+  - Added gateway-backed approvals workflow handling over HTTP/3, with live QUIC coverage for request, respond, and status operations.
 
 ### Fixed
 - Upgrade 1 integration hardening in the live gateway path:
@@ -71,6 +80,13 @@
   - Fixed the HTTP/3 server-connection bootstrap to use the correct peer CID semantics for `ngtcp2_conn_server_new`; live `curl --http3-only` probes now complete the local QUIC/TLS handshake instead of stalling after the first server Initial packet.
   - Fixed the HTTP/3 post-handshake path to reuse existing native connections for repeated Initial packets and to submit a minimal live response over nghttp3/QUIC without freeing header buffers too early.
   - Fixed the HTTP/3 response path to advance nghttp3 body write offsets correctly and widened QUIC curl timeouts in the integration harness so live `/health` probes stop flaking under the test runner.
+  - Fixed the integration curl helper to retain generated header arguments until `Child.run()` completes; the previous lifetime bug could crash tests that passed custom headers to curl.
+  - Fixed several integration-suite stability issues uncovered while expanding HTTP/3 coverage:
+    - added explicit HTTPS-side `http3_status=configured` readiness checks before QUIC probes,
+    - widened HTTP/3 curl retry timing in the live QUIC tests,
+    - refreshed device-auth timestamps/signatures per request in the device/session integration test,
+    - reduced the mixed auth/rate contention fan-out and widened its timeout to avoid scheduler-noise failures in the full suite.
+  - Fixed QUIC TLS bootstrap to advertise explicit early-data capacity and surfaced `http3_zero_rtt_packets_seen` in `/health` for future 0-RTT diagnostics, even though the available local HTTP/3 client backends still do not provide a usable end-to-end early-data probe.
 
 ## [0.29.0] - 2026-03-08
 

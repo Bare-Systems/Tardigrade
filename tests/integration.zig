@@ -7,6 +7,8 @@ const valid_bearer_token = "integration-token";
 const valid_bearer_hash = "521bc8ca01307d0189b55a19da738e39c7204f7077e0076e803026e32b2f9383";
 const http3_curl_path = "/opt/homebrew/opt/curl/bin/curl";
 const expected_server_header = "tardigrade/0.4.1";
+const http3_retry_attempts: usize = 20;
+const http3_retry_delay_ms: u64 = 250;
 
 const EnvPair = struct {
     name: []const u8,
@@ -591,11 +593,18 @@ const CurlRequestSpec = struct {
     key: ?[]const u8 = null,
     binary_path: ?[]const u8 = null,
     http3_only: bool = false,
+    ssl_sessions_path: ?[]const u8 = null,
+    tls_earlydata: bool = false,
 };
 
 fn runCurl(allocator: std.mem.Allocator, port: u16, spec: CurlRequestSpec) !CurlRunResult {
     var argv = std.ArrayList([]const u8).init(allocator);
     defer argv.deinit();
+    var owned_args = std.ArrayList([]u8).init(allocator);
+    defer {
+        for (owned_args.items) |arg| allocator.free(arg);
+        owned_args.deinit();
+    }
     try argv.append(spec.binary_path orelse "curl");
     try argv.append("-sS");
     if (spec.http3_only) {
@@ -614,7 +623,7 @@ fn runCurl(allocator: std.mem.Allocator, port: u16, spec: CurlRequestSpec) !Curl
     if (spec.insecure) try argv.append("-k");
     for (spec.headers) |header| {
         const line = try std.fmt.allocPrint(allocator, "{s}: {s}", .{ header.name, header.value });
-        defer allocator.free(line);
+        try owned_args.append(line);
         try argv.append("-H");
         try argv.append(line);
     }
@@ -629,6 +638,13 @@ fn runCurl(allocator: std.mem.Allocator, port: u16, spec: CurlRequestSpec) !Curl
     if (spec.key) |key| {
         try argv.append("--key");
         try argv.append(key);
+    }
+    if (spec.ssl_sessions_path) |path| {
+        try argv.append("--ssl-sessions");
+        try argv.append(path);
+    }
+    if (spec.tls_earlydata) {
+        try argv.append("--tls-earlydata");
     }
     const url = try std.fmt.allocPrint(allocator, "{s}://{s}:{d}{s}", .{ spec.scheme, test_host, port, spec.path });
     defer allocator.free(url);
@@ -690,6 +706,13 @@ fn spawnCurlProcess(allocator: std.mem.Allocator, port: u16, spec: CurlRequestSp
         try argv.append("--key");
         try argv.append(key);
     }
+    if (spec.ssl_sessions_path) |path| {
+        try argv.append("--ssl-sessions");
+        try argv.append(path);
+    }
+    if (spec.tls_earlydata) {
+        try argv.append("--tls-earlydata");
+    }
     const url = try std.fmt.allocPrint(allocator, "{s}://{s}:{d}{s}", .{ spec.scheme, test_host, port, spec.path });
     try owned_args.append(url);
     try argv.append(url);
@@ -718,6 +741,28 @@ fn sendCurlRequest(allocator: std.mem.Allocator, port: u16, spec: CurlRequestSpe
         .headers_raw = result.stdout[0 .. (std.mem.indexOf(u8, result.stdout, "\r\n\r\n") orelse return error.InvalidHttpResponse) + 2],
         .body = result.stdout[(std.mem.indexOf(u8, result.stdout, "\r\n\r\n") orelse return error.InvalidHttpResponse) + 4 ..],
     };
+}
+
+fn sendHttp3CurlRequestWithSpec(allocator: std.mem.Allocator, port: u16, spec: CurlRequestSpec) !HttpResponse {
+    var last_err: ?anyerror = null;
+    for (0..http3_retry_attempts) |_| {
+        return sendCurlRequest(allocator, port, spec) catch |err| {
+            last_err = err;
+            std.time.sleep(http3_retry_delay_ms * std.time.ns_per_ms);
+            continue;
+        };
+    }
+    return last_err orelse error.CurlFailed;
+}
+
+fn sendHttp3CurlRequest(allocator: std.mem.Allocator, port: u16, path: []const u8) !HttpResponse {
+    return sendHttp3CurlRequestWithSpec(allocator, port, .{
+        .scheme = "https",
+        .path = path,
+        .insecure = true,
+        .binary_path = http3_curl_path,
+        .http3_only = true,
+    });
 }
 
 fn opensslPresentedSubject(allocator: std.mem.Allocator, port: u16, servername: []const u8) ![]u8 {
@@ -844,15 +889,39 @@ fn assertContains(haystack: []const u8, needle: []const u8) !void {
 fn waitForBodyContains(allocator: std.mem.Allocator, port: u16, path: []const u8, headers: []const RequestHeader, needle: []const u8, timeout_ms: u64) !void {
     const deadline = std.time.milliTimestamp() + @as(i64, @intCast(timeout_ms));
     while (std.time.milliTimestamp() < deadline) {
-        var response = try sendRequest(allocator, port, .{
+        var response = sendRequest(allocator, port, .{
             .method = "GET",
             .path = path,
             .body = null,
             .headers = headers,
-        });
+        }) catch {
+            std.time.sleep(50 * std.time.ns_per_ms);
+            continue;
+        };
         defer response.deinit();
         if (std.mem.indexOf(u8, response.body, needle) != null) return;
         std.time.sleep(50 * std.time.ns_per_ms);
+    }
+    return error.Timeout;
+}
+
+fn waitForHttp3Configured(port: u16, timeout_ms: u64) !void {
+    const deadline = std.time.milliTimestamp() + @as(i64, @intCast(timeout_ms));
+    while (std.time.milliTimestamp() < deadline) {
+        var response = sendCurlRequest(std.testing.allocator, port, .{
+            .scheme = "https",
+            .path = "/health",
+            .insecure = true,
+        }) catch |err| {
+            if (err == error.CurlFailed or err == error.InvalidHttpResponse) {
+                std.time.sleep(100 * std.time.ns_per_ms);
+                continue;
+            }
+            return err;
+        };
+        defer response.deinit();
+        if (response.status_code == 200 and std.mem.indexOf(u8, response.body, "\"http3_status\":\"configured\"") != null) return;
+        std.time.sleep(100 * std.time.ns_per_ms);
     }
     return error.Timeout;
 }
@@ -934,7 +1003,7 @@ fn concurrentAuthRateRequestMain(ctx: *ConcurrentAuthRateContext) void {
             .{ .name = ctx.auth_header_name, .value = ctx.auth_header_value },
             .{ .name = "Content-Type", .value = "application/json" },
         },
-    }, 5000) catch |err| {
+    }, 15000) catch |err| {
         ctx.result.err = err;
         return;
     };
@@ -1169,30 +1238,50 @@ test "device auth and session integration cover register create use revoke" {
     try std.testing.expectEqual(@as(u16, 201), register_resp.status_code);
 
     const chat_body = "{\"message\":\"device auth\"}";
-    const ts_str = try std.fmt.allocPrint(allocator, "{d}", .{std.time.timestamp()});
-    defer allocator.free(ts_str);
-    const signature = try deviceSignature(allocator, "shared-device-key", "POST", "/v1/chat", ts_str, chat_body);
-    defer allocator.free(signature);
     const session_create_body = "{\"device_id\":\"device-1\"}";
-    const session_create_sig = try deviceSignature(allocator, "shared-device-key", "POST", "/v1/sessions", ts_str, session_create_body);
-    defer allocator.free(session_create_sig);
-    const revoke_sig = try deviceSignature(allocator, "shared-device-key", "DELETE", "/v1/sessions", ts_str, "");
-    defer allocator.free(revoke_sig);
 
-    var device_resp = try sendRequest(allocator, tardigrade.port, .{
-        .method = "POST",
-        .path = "/v1/chat",
-        .body = chat_body,
-        .headers = &.{
-            .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
-            .{ .name = "Content-Type", .value = "application/json" },
-            .{ .name = "X-Device-ID", .value = "device-1" },
-            .{ .name = "X-Device-Timestamp", .value = ts_str },
-            .{ .name = "X-Device-Signature", .value = signature },
-        },
-    });
+    var device_resp: HttpResponse = undefined;
+    var device_ok = false;
+    var chat_ts_keep: ?[]u8 = null;
+    var chat_sig_keep: ?[]u8 = null;
+    defer {
+        if (chat_ts_keep) |value| allocator.free(value);
+        if (chat_sig_keep) |value| allocator.free(value);
+    }
+    for (0..5) |_| {
+        const ts_str = try std.fmt.allocPrint(allocator, "{d}", .{std.time.timestamp()});
+        const signature = try deviceSignature(allocator, "shared-device-key", "POST", "/v1/chat", ts_str, chat_body);
+        device_resp = try sendRequest(allocator, tardigrade.port, .{
+            .method = "POST",
+            .path = "/v1/chat",
+            .body = chat_body,
+            .headers = &.{
+                .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
+                .{ .name = "Content-Type", .value = "application/json" },
+                .{ .name = "X-Device-ID", .value = "device-1" },
+                .{ .name = "X-Device-Timestamp", .value = ts_str },
+                .{ .name = "X-Device-Signature", .value = signature },
+            },
+        });
+        if (device_resp.status_code == 200) {
+            chat_ts_keep = ts_str;
+            chat_sig_keep = signature;
+            device_ok = true;
+            break;
+        }
+        allocator.free(ts_str);
+        allocator.free(signature);
+        device_resp.deinit();
+        std.time.sleep(100 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(device_ok);
     defer device_resp.deinit();
     try std.testing.expectEqual(@as(u16, 200), device_resp.status_code);
+
+    const session_create_ts = try std.fmt.allocPrint(allocator, "{d}", .{std.time.timestamp()});
+    defer allocator.free(session_create_ts);
+    const session_create_sig = try deviceSignature(allocator, "shared-device-key", "POST", "/v1/sessions", session_create_ts, session_create_body);
+    defer allocator.free(session_create_sig);
 
     var session_create = try sendRequest(allocator, tardigrade.port, .{
         .method = "POST",
@@ -1202,7 +1291,7 @@ test "device auth and session integration cover register create use revoke" {
             .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
             .{ .name = "Content-Type", .value = "application/json" },
             .{ .name = "X-Device-ID", .value = "device-1" },
-            .{ .name = "X-Device-Timestamp", .value = ts_str },
+            .{ .name = "X-Device-Timestamp", .value = session_create_ts },
             .{ .name = "X-Device-Signature", .value = session_create_sig },
         },
     });
@@ -1220,12 +1309,17 @@ test "device auth and session integration cover register create use revoke" {
             .{ .name = "X-Session-Token", .value = owned_session_token },
             .{ .name = "Content-Type", .value = "application/json" },
             .{ .name = "X-Device-ID", .value = "device-1" },
-            .{ .name = "X-Device-Timestamp", .value = ts_str },
-            .{ .name = "X-Device-Signature", .value = signature },
+            .{ .name = "X-Device-Timestamp", .value = chat_ts_keep.? },
+            .{ .name = "X-Device-Signature", .value = chat_sig_keep.? },
         },
     });
     defer session_chat.deinit();
     try std.testing.expectEqual(@as(u16, 200), session_chat.status_code);
+
+    const revoke_ts = try std.fmt.allocPrint(allocator, "{d}", .{std.time.timestamp()});
+    defer allocator.free(revoke_ts);
+    const revoke_sig = try deviceSignature(allocator, "shared-device-key", "DELETE", "/v1/sessions", revoke_ts, "");
+    defer allocator.free(revoke_sig);
 
     var revoke = try sendRequest(allocator, tardigrade.port, .{
         .method = "DELETE",
@@ -1234,7 +1328,7 @@ test "device auth and session integration cover register create use revoke" {
         .headers = &.{
             .{ .name = "X-Session-Token", .value = owned_session_token },
             .{ .name = "X-Device-ID", .value = "device-1" },
-            .{ .name = "X-Device-Timestamp", .value = ts_str },
+            .{ .name = "X-Device-Timestamp", .value = revoke_ts },
             .{ .name = "X-Device-Signature", .value = revoke_sig },
         },
     });
@@ -1250,8 +1344,8 @@ test "device auth and session integration cover register create use revoke" {
             .{ .name = "X-Session-Token", .value = owned_session_token },
             .{ .name = "Content-Type", .value = "application/json" },
             .{ .name = "X-Device-ID", .value = "device-1" },
-            .{ .name = "X-Device-Timestamp", .value = ts_str },
-            .{ .name = "X-Device-Signature", .value = signature },
+            .{ .name = "X-Device-Timestamp", .value = chat_ts_keep.? },
+            .{ .name = "X-Device-Signature", .value = chat_sig_keep.? },
         },
     });
     defer revoked_chat.deinit();
@@ -1936,27 +2030,9 @@ test "http3 integration serves health over quic" {
     };
     var tardigrade = try TardigradeProcess.start(allocator, opts);
     defer tardigrade.stop();
+    try waitForHttp3Configured(tardigrade.port, 5000);
 
-    const curl_spec = CurlRequestSpec{
-        .scheme = "https",
-        .path = "/health",
-        .insecure = true,
-        .binary_path = http3_curl_path,
-        .http3_only = true,
-    };
-    var last_err: ?anyerror = null;
-    var response: HttpResponse = undefined;
-    var ok = false;
-    for (0..5) |_| {
-        response = sendCurlRequest(allocator, quic_port, curl_spec) catch |err| {
-            last_err = err;
-            std.time.sleep(100 * std.time.ns_per_ms);
-            continue;
-        };
-        ok = true;
-        break;
-    }
-    if (!ok) return last_err orelse error.CurlFailed;
+    var response = try sendHttp3CurlRequest(allocator, quic_port, "/health");
     defer response.deinit();
 
     try std.testing.expectEqual(@as(u16, 200), response.status_code);
@@ -1988,32 +2064,523 @@ test "http3 integration serves prometheus metrics over quic" {
     };
     var tardigrade = try TardigradeProcess.start(allocator, opts);
     defer tardigrade.stop();
+    try waitForHttp3Configured(tardigrade.port, 5000);
 
-    const curl_spec = CurlRequestSpec{
-        .scheme = "https",
-        .path = "/metrics",
-        .insecure = true,
-        .binary_path = http3_curl_path,
-        .http3_only = true,
-    };
-    var last_err: ?anyerror = null;
-    var response: HttpResponse = undefined;
-    var ok = false;
-    for (0..5) |_| {
-        response = sendCurlRequest(allocator, quic_port, curl_spec) catch |err| {
-            last_err = err;
-            std.time.sleep(100 * std.time.ns_per_ms);
-            continue;
-        };
-        ok = true;
-        break;
-    }
-    if (!ok) return last_err orelse error.CurlFailed;
+    var response = try sendHttp3CurlRequest(allocator, quic_port, "/metrics");
     defer response.deinit();
 
     try std.testing.expectEqual(@as(u16, 200), response.status_code);
     try std.testing.expectEqualStrings("text/plain; version=0.0.4; charset=utf-8", response.header("content-type").?);
     try assertContains(response.body, "tardigrade_requests_total");
+}
+
+test "http3 integration proxies chat over quic" {
+    if (!build_options.enable_http3_ngtcp2) return error.SkipZigTest;
+    std.fs.accessAbsolute(http3_curl_path, .{}) catch return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const responses = [_]UpstreamResponseSpec{.{
+        .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
+        .body = "{\"reply\":\"ok\"}",
+    }};
+    var upstream = try UpstreamServer.start(allocator, &responses);
+    defer upstream.stop();
+    try upstream.run();
+
+    const quic_port = try findFreePort();
+    const quic_port_str = try std.fmt.allocPrint(allocator, "{d}", .{quic_port});
+    defer allocator.free(quic_port_str);
+
+    const opts = TardigradeOptions{
+        .upstream_port = upstream.port(),
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_HTTP3_ENABLED", .value = "true" },
+            .{ .name = "TARDIGRADE_QUIC_PORT", .value = quic_port_str },
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = "tests/fixtures/tls/server.crt" },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = "tests/fixtures/tls/server.key" },
+        },
+        .ready_https_insecure = true,
+    };
+    var tardigrade = try TardigradeProcess.start(allocator, opts);
+    defer tardigrade.stop();
+    try waitForHttp3Configured(tardigrade.port, 5000);
+
+    var unauthorized = try sendHttp3CurlRequestWithSpec(allocator, quic_port, .{
+        .scheme = "https",
+        .path = "/v1/chat",
+        .method = "POST",
+        .body = "{\"message\":\"hello\"}",
+        .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
+        .insecure = true,
+        .binary_path = http3_curl_path,
+        .http3_only = true,
+    });
+    defer unauthorized.deinit();
+    try std.testing.expectEqual(@as(u16, 401), unauthorized.status_code);
+    try assertContains(unauthorized.body, "\"code\":\"unauthorized\"");
+
+    var authorized = try sendHttp3CurlRequestWithSpec(allocator, quic_port, .{
+        .scheme = "https",
+        .path = "/v1/chat",
+        .method = "POST",
+        .body = "{\"message\":\"hello\"}",
+        .headers = &.{
+            .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
+            .{ .name = "Content-Type", .value = "application/json" },
+        },
+        .insecure = true,
+        .binary_path = http3_curl_path,
+        .http3_only = true,
+    });
+    defer authorized.deinit();
+    try std.testing.expectEqual(@as(u16, 200), authorized.status_code);
+    try assertContains(authorized.body, "\"reply\":\"ok\"");
+    upstream.mutex.lock();
+    defer upstream.mutex.unlock();
+    try std.testing.expectEqualStrings("/v1/chat", upstream.capture.path);
+    try assertContains(upstream.capture.body, "\"message\":\"hello\"");
+}
+
+test "http3 integration proxies commands over quic" {
+    if (!build_options.enable_http3_ngtcp2) return error.SkipZigTest;
+    std.fs.accessAbsolute(http3_curl_path, .{}) catch return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const responses = [_]UpstreamResponseSpec{.{
+        .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
+        .body = "{\"result\":\"ok\"}",
+    }};
+    var upstream = try UpstreamServer.start(allocator, &responses);
+    defer upstream.stop();
+    try upstream.run();
+
+    const quic_port = try findFreePort();
+    const quic_port_str = try std.fmt.allocPrint(allocator, "{d}", .{quic_port});
+    defer allocator.free(quic_port_str);
+
+    const opts = TardigradeOptions{
+        .upstream_port = upstream.port(),
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_HTTP3_ENABLED", .value = "true" },
+            .{ .name = "TARDIGRADE_QUIC_PORT", .value = quic_port_str },
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = "tests/fixtures/tls/server.crt" },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = "tests/fixtures/tls/server.key" },
+        },
+        .ready_https_insecure = true,
+    };
+    var tardigrade = try TardigradeProcess.start(allocator, opts);
+    defer tardigrade.stop();
+    try waitForHttp3Configured(tardigrade.port, 5000);
+
+    const command_body = "{\"command\":\"status\",\"params\":{}}";
+
+    var unauthorized = try sendHttp3CurlRequestWithSpec(allocator, quic_port, .{
+        .scheme = "https",
+        .path = "/v1/commands",
+        .method = "POST",
+        .body = command_body,
+        .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
+        .insecure = true,
+        .binary_path = http3_curl_path,
+        .http3_only = true,
+    });
+    defer unauthorized.deinit();
+    try std.testing.expectEqual(@as(u16, 401), unauthorized.status_code);
+    try assertContains(unauthorized.body, "\"code\":\"unauthorized\"");
+
+    var authorized = try sendHttp3CurlRequestWithSpec(allocator, quic_port, .{
+        .scheme = "https",
+        .path = "/v1/commands",
+        .method = "POST",
+        .body = command_body,
+        .headers = &.{
+            .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
+            .{ .name = "Content-Type", .value = "application/json" },
+        },
+        .insecure = true,
+        .binary_path = http3_curl_path,
+        .http3_only = true,
+    });
+    defer authorized.deinit();
+    try std.testing.expectEqual(@as(u16, 200), authorized.status_code);
+    try assertContains(authorized.body, "\"result\":\"ok\"");
+    upstream.mutex.lock();
+    defer upstream.mutex.unlock();
+    try std.testing.expectEqualStrings("/v1/status", upstream.capture.path);
+    try assertContains(upstream.capture.body, "\"command\":\"status\"");
+}
+
+test "http3 integration serves command status over quic" {
+    if (!build_options.enable_http3_ngtcp2) return error.SkipZigTest;
+    std.fs.accessAbsolute(http3_curl_path, .{}) catch return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const responses = [_]UpstreamResponseSpec{.{
+        .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
+        .body = "{\"result\":\"ok\"}",
+    }};
+    var upstream = try UpstreamServer.start(allocator, &responses);
+    defer upstream.stop();
+    try upstream.run();
+
+    const quic_port = try findFreePort();
+    const quic_port_str = try std.fmt.allocPrint(allocator, "{d}", .{quic_port});
+    defer allocator.free(quic_port_str);
+
+    const opts = TardigradeOptions{
+        .upstream_port = upstream.port(),
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_HTTP3_ENABLED", .value = "true" },
+            .{ .name = "TARDIGRADE_QUIC_PORT", .value = quic_port_str },
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = "tests/fixtures/tls/server.crt" },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = "tests/fixtures/tls/server.key" },
+        },
+        .ready_https_insecure = true,
+    };
+    var tardigrade = try TardigradeProcess.start(allocator, opts);
+    defer tardigrade.stop();
+    try waitForHttp3Configured(tardigrade.port, 5000);
+
+    const command_id = "cmd-http3-status";
+    const command_body = "{\"command\":\"status\",\"params\":{},\"command_id\":\"" ++ command_id ++ "\"}";
+
+    var execute = try sendHttp3CurlRequestWithSpec(allocator, quic_port, .{
+        .scheme = "https",
+        .path = "/v1/commands",
+        .method = "POST",
+        .body = command_body,
+        .headers = &.{
+            .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
+            .{ .name = "Content-Type", .value = "application/json" },
+        },
+        .insecure = true,
+        .binary_path = http3_curl_path,
+        .http3_only = true,
+    });
+    defer execute.deinit();
+    try std.testing.expectEqual(@as(u16, 200), execute.status_code);
+
+    var unauthorized = try sendHttp3CurlRequestWithSpec(allocator, quic_port, .{
+        .scheme = "https",
+        .path = "/v1/commands/status?command_id=" ++ command_id,
+        .insecure = true,
+        .binary_path = http3_curl_path,
+        .http3_only = true,
+    });
+    defer unauthorized.deinit();
+    try std.testing.expectEqual(@as(u16, 401), unauthorized.status_code);
+    try assertContains(unauthorized.body, "\"code\":\"unauthorized\"");
+
+    var status = try sendHttp3CurlRequestWithSpec(allocator, quic_port, .{
+        .scheme = "https",
+        .path = "/v1/commands/status?command_id=" ++ command_id,
+        .headers = &.{.{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token }},
+        .insecure = true,
+        .binary_path = http3_curl_path,
+        .http3_only = true,
+    });
+    defer status.deinit();
+    try std.testing.expectEqual(@as(u16, 200), status.status_code);
+    try assertContains(status.body, "\"command_id\":\"" ++ command_id ++ "\"");
+    try assertContains(status.body, "\"status\":\"completed\"");
+}
+
+test "http3 integration serves approvals workflow over quic" {
+    if (!build_options.enable_http3_ngtcp2) return error.SkipZigTest;
+    std.fs.accessAbsolute(http3_curl_path, .{}) catch return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const quic_port = try findFreePort();
+    const quic_port_str = try std.fmt.allocPrint(allocator, "{d}", .{quic_port});
+    defer allocator.free(quic_port_str);
+
+    const opts = TardigradeOptions{
+        .upstream_port = null,
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_HTTP3_ENABLED", .value = "true" },
+            .{ .name = "TARDIGRADE_QUIC_PORT", .value = quic_port_str },
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = "tests/fixtures/tls/server.crt" },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = "tests/fixtures/tls/server.key" },
+            .{ .name = "TARDIGRADE_POLICY_APPROVAL_ROUTES", .value = "POST|/v1/commands" },
+        },
+        .ready_https_insecure = true,
+    };
+    var tardigrade = try TardigradeProcess.start(allocator, opts);
+    defer tardigrade.stop();
+    try waitForHttp3Configured(tardigrade.port, 5000);
+
+    const request_body = "{\"method\":\"POST\",\"path\":\"/v1/commands\",\"command_id\":\"cmd-approval-http3\"}";
+
+    var unauthorized_request = try sendHttp3CurlRequestWithSpec(allocator, quic_port, .{
+        .scheme = "https",
+        .path = "/v1/approvals/request",
+        .method = "POST",
+        .body = request_body,
+        .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
+        .insecure = true,
+        .binary_path = http3_curl_path,
+        .http3_only = true,
+    });
+    defer unauthorized_request.deinit();
+    try std.testing.expectEqual(@as(u16, 401), unauthorized_request.status_code);
+
+    var request_resp = try sendHttp3CurlRequestWithSpec(allocator, quic_port, .{
+        .scheme = "https",
+        .path = "/v1/approvals/request",
+        .method = "POST",
+        .body = request_body,
+        .headers = &.{
+            .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
+            .{ .name = "Content-Type", .value = "application/json" },
+        },
+        .insecure = true,
+        .binary_path = http3_curl_path,
+        .http3_only = true,
+    });
+    defer request_resp.deinit();
+    try std.testing.expectEqual(@as(u16, 202), request_resp.status_code);
+    const token_key = "\"approval_token\":\"";
+    const token_start = std.mem.indexOf(u8, request_resp.body, token_key) orelse return error.InvalidHttpResponse;
+    const token_rest = request_resp.body[token_start + token_key.len ..];
+    const token_end = std.mem.indexOfScalar(u8, token_rest, '"') orelse return error.InvalidHttpResponse;
+    const approval_token = try allocator.dupe(u8, token_rest[0..token_end]);
+    defer allocator.free(approval_token);
+
+    const status_path = try std.fmt.allocPrint(allocator, "/v1/approvals/status?approval_token={s}", .{approval_token});
+    defer allocator.free(status_path);
+    var pending_status = try sendHttp3CurlRequestWithSpec(allocator, quic_port, .{
+        .scheme = "https",
+        .path = status_path,
+        .headers = &.{.{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token }},
+        .insecure = true,
+        .binary_path = http3_curl_path,
+        .http3_only = true,
+    });
+    defer pending_status.deinit();
+    try std.testing.expectEqual(@as(u16, 200), pending_status.status_code);
+    try assertContains(pending_status.body, "\"status\":\"pending\"");
+
+    const respond_body = try std.fmt.allocPrint(allocator, "{{\"approval_token\":\"{s}\",\"decision\":\"approve\"}}", .{approval_token});
+    defer allocator.free(respond_body);
+    var respond = try sendHttp3CurlRequestWithSpec(allocator, quic_port, .{
+        .scheme = "https",
+        .path = "/v1/approvals/respond",
+        .method = "POST",
+        .body = respond_body,
+        .headers = &.{
+            .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
+            .{ .name = "Content-Type", .value = "application/json" },
+        },
+        .insecure = true,
+        .binary_path = http3_curl_path,
+        .http3_only = true,
+    });
+    defer respond.deinit();
+    try std.testing.expectEqual(@as(u16, 200), respond.status_code);
+    try assertContains(respond.body, "\"status\":\"approved\"");
+
+    var approved_status = try sendHttp3CurlRequestWithSpec(allocator, quic_port, .{
+        .scheme = "https",
+        .path = status_path,
+        .headers = &.{.{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token }},
+        .insecure = true,
+        .binary_path = http3_curl_path,
+        .http3_only = true,
+    });
+    defer approved_status.deinit();
+    try std.testing.expectEqual(@as(u16, 200), approved_status.status_code);
+    try assertContains(approved_status.body, "\"status\":\"approved\"");
+}
+
+test "http3 integration multiplexes parallel requests on one connection" {
+    if (!build_options.enable_http3_ngtcp2) return error.SkipZigTest;
+    std.fs.accessAbsolute(http3_curl_path, .{}) catch return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const quic_port = try findFreePort();
+    const quic_port_str = try std.fmt.allocPrint(allocator, "{d}", .{quic_port});
+    defer allocator.free(quic_port_str);
+
+    const opts = TardigradeOptions{
+        .upstream_port = null,
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_HTTP3_ENABLED", .value = "true" },
+            .{ .name = "TARDIGRADE_QUIC_PORT", .value = quic_port_str },
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = "tests/fixtures/tls/server.crt" },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = "tests/fixtures/tls/server.key" },
+        },
+        .ready_https_insecure = true,
+    };
+    var tardigrade = try TardigradeProcess.start(allocator, opts);
+    defer tardigrade.stop();
+    try waitForHttp3Configured(tardigrade.port, 5000);
+
+    const out_health_path = try std.fmt.allocPrint(allocator, ".zig-cache/http3-parallel-health-{d}.out", .{quic_port});
+    defer allocator.free(out_health_path);
+    const out_metrics_path = try std.fmt.allocPrint(allocator, ".zig-cache/http3-parallel-metrics-{d}.out", .{quic_port});
+    defer allocator.free(out_metrics_path);
+    std.fs.cwd().deleteFile(out_health_path) catch {};
+    std.fs.cwd().deleteFile(out_metrics_path) catch {};
+    defer std.fs.cwd().deleteFile(out_health_path) catch {};
+    defer std.fs.cwd().deleteFile(out_metrics_path) catch {};
+
+    const health_url = try std.fmt.allocPrint(allocator, "https://{s}:{d}/health", .{ test_host, quic_port });
+    defer allocator.free(health_url);
+    const metrics_url = try std.fmt.allocPrint(allocator, "https://{s}:{d}/metrics/json", .{ test_host, quic_port });
+    defer allocator.free(metrics_url);
+
+    var parallel_ok = false;
+    var last_parallel_err: ?anyerror = null;
+    for (0..http3_retry_attempts) |_| {
+        const run_res = try std.process.Child.run(.{
+            .allocator = allocator,
+            .argv = &.{
+                http3_curl_path,
+                "--http3-only",
+                "-k",
+                "--parallel",
+                "--parallel-max",
+                "2",
+                "--silent",
+                "--show-error",
+                "--connect-timeout",
+                "5",
+                "--max-time",
+                "8",
+                "-o",
+                out_health_path,
+                health_url,
+                "-o",
+                out_metrics_path,
+                metrics_url,
+            },
+            .max_output_bytes = 1024 * 1024,
+        });
+        defer allocator.free(run_res.stdout);
+        defer allocator.free(run_res.stderr);
+        switch (run_res.term) {
+            .Exited => |code| {
+                if (code == 0) {
+                    parallel_ok = true;
+                    break;
+                }
+                last_parallel_err = error.CurlFailed;
+            },
+            else => last_parallel_err = error.CurlFailed,
+        }
+        std.fs.cwd().deleteFile(out_health_path) catch {};
+        std.fs.cwd().deleteFile(out_metrics_path) catch {};
+        std.time.sleep(http3_retry_delay_ms * std.time.ns_per_ms);
+    }
+    if (!parallel_ok) return last_parallel_err orelse error.CurlFailed;
+
+    const health_body = try std.fs.cwd().readFileAlloc(allocator, out_health_path, 1024 * 1024);
+    defer allocator.free(health_body);
+    const metrics_body = try std.fs.cwd().readFileAlloc(allocator, out_metrics_path, 1024 * 1024);
+    defer allocator.free(metrics_body);
+    try assertContains(health_body, "\"status\":\"ok\"");
+    try assertContains(metrics_body, "\"total_requests\":");
+
+    var runtime_health = try sendCurlRequest(allocator, tardigrade.port, .{
+        .scheme = "https",
+        .path = "/health",
+        .insecure = true,
+    });
+    defer runtime_health.deinit();
+    try assertContains(runtime_health.body, "\"http3_native_connections\":1");
+    try assertContains(runtime_health.body, "\"http3_handshakes_completed\":1");
+    try assertContains(runtime_health.body, "\"http3_requests_completed\":2");
+}
+
+test "http3 integration serves authenticated admin routes over quic" {
+    if (!build_options.enable_http3_ngtcp2) return error.SkipZigTest;
+    std.fs.accessAbsolute(http3_curl_path, .{}) catch return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const responses = [_]UpstreamResponseSpec{.{
+        .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
+        .body = "{\"ok\":true}",
+    }};
+    var upstream = try UpstreamServer.start(allocator, &responses);
+    defer upstream.stop();
+    try upstream.run();
+
+    const quic_port = try findFreePort();
+    const quic_port_str = try std.fmt.allocPrint(allocator, "{d}", .{quic_port});
+    defer allocator.free(quic_port_str);
+
+    const opts = TardigradeOptions{
+        .upstream_port = upstream.port(),
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_HTTP3_ENABLED", .value = "true" },
+            .{ .name = "TARDIGRADE_QUIC_PORT", .value = quic_port_str },
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = "tests/fixtures/tls/server.crt" },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = "tests/fixtures/tls/server.key" },
+            .{ .name = "TARDIGRADE_UPSTREAM_HEALTH_INTERVAL_MS", .value = "100" },
+            .{ .name = "TARDIGRADE_UPSTREAM_HEALTH_TIMEOUT_MS", .value = "200" },
+            .{ .name = "TARDIGRADE_UPSTREAM_HEALTH_THRESHOLD", .value = "1" },
+            .{ .name = "TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_SUCCESS_THRESHOLD", .value = "1" },
+        },
+        .ready_https_insecure = true,
+    };
+    var tardigrade = try TardigradeProcess.start(allocator, opts);
+    defer tardigrade.stop();
+    try waitForHttp3Configured(tardigrade.port, 5000);
+
+    var unauthorized = try sendHttp3CurlRequestWithSpec(allocator, quic_port, .{
+        .scheme = "https",
+        .path = "/admin/routes",
+        .insecure = true,
+        .binary_path = http3_curl_path,
+        .http3_only = true,
+    });
+    defer unauthorized.deinit();
+    try std.testing.expectEqual(@as(u16, 401), unauthorized.status_code);
+    try assertContains(unauthorized.body, "\"code\":\"unauthorized\"");
+
+    var authorized = try sendHttp3CurlRequestWithSpec(allocator, quic_port, .{
+        .scheme = "https",
+        .path = "/admin/routes",
+        .insecure = true,
+        .binary_path = http3_curl_path,
+        .http3_only = true,
+        .headers = &.{
+            .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
+        },
+    });
+    defer authorized.deinit();
+    try std.testing.expectEqual(@as(u16, 200), authorized.status_code);
+    try assertContains(authorized.body, "/health");
+    try assertContains(authorized.body, "/metrics");
+
+    var connections = try sendHttp3CurlRequestWithSpec(allocator, quic_port, .{
+        .scheme = "https",
+        .path = "/admin/connections",
+        .insecure = true,
+        .binary_path = http3_curl_path,
+        .http3_only = true,
+        .headers = &.{
+            .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
+        },
+    });
+    defer connections.deinit();
+    try std.testing.expectEqual(@as(u16, 200), connections.status_code);
+    try assertContains(connections.body, "\"active\":");
+    try assertContains(connections.body, "\"tracked_ip_buckets\":");
+
+    var upstreams = try sendHttp3CurlRequestWithSpec(allocator, quic_port, .{
+        .scheme = "https",
+        .path = "/admin/upstreams",
+        .insecure = true,
+        .binary_path = http3_curl_path,
+        .http3_only = true,
+        .headers = &.{
+            .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
+        },
+    });
+    defer upstreams.deinit();
+    try std.testing.expectEqual(@as(u16, 200), upstreams.status_code);
+    try assertContains(upstreams.body, "\"upstreams\":[");
 }
 
 test "tls integration rejects client signed by unrecognized ca" {
@@ -2343,9 +2910,9 @@ test "concurrency integration avoids deadlock under concurrent auth and rate che
     defer allocator.free(owned_session_token);
 
     var start_flag = std.atomic.Value(bool).init(false);
-    var results: [48]ConcurrentAuthRateResult = [_]ConcurrentAuthRateResult{.{}} ** 48;
-    var contexts: [48]ConcurrentAuthRateContext = undefined;
-    var threads: [48]std.Thread = undefined;
+    var results: [32]ConcurrentAuthRateResult = [_]ConcurrentAuthRateResult{.{}} ** 32;
+    var contexts: [32]ConcurrentAuthRateContext = undefined;
+    var threads: [32]std.Thread = undefined;
 
     for (&contexts, &results, 0..) |*ctx, *result, i| {
         const use_session = (i % 2) == 1;

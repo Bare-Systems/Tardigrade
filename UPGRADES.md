@@ -159,7 +159,7 @@ These files will be replaced by a proper C binding to ngtcp2 + nghttp3.
 - [~] QPACK header compression/decompression via nghttp3
 - [~] HTTP/3 request framing (HEADERS, DATA frames)
 - [ ] Server push over HTTP/3 streams
-- [ ] `handleHttp3Connection()` function in `edge_gateway.zig` that mirrors
+- [x] `handleHttp3Connection()` function in `edge_gateway.zig` that mirrors
       the existing `handleHttp2Connection()` structure
 
 ### 3.3 Remove / Archive Old Stubs
@@ -171,7 +171,7 @@ These files will be replaced by a proper C binding to ngtcp2 + nghttp3.
 ### 3.4 Tests
 
 - [x] Integration test: HTTP/3 GET request over loopback UDP completes successfully
-- [ ] Integration test: concurrent HTTP/3 streams on one connection return independent responses
+- [x] Integration test: concurrent HTTP/3 streams on one connection return independent responses
 - [x] Integration test: `Alt-Svc` header present on HTTP/1.1 response
 - [ ] Integration test: 0-RTT session resumption completes without full handshake round-trip
 

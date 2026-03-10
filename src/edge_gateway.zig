@@ -5778,7 +5778,7 @@ fn populateHealthResponse(
     const http3_last_error_name = http.ngtcp2_binding.errorName(http3_health.snapshot.last_error_code) orelse "-";
     const body = try std.fmt.allocPrint(
         allocator,
-        "{{\"status\":\"ok\",\"service\":\"tardigrade-edge\",\"upstream_status\":\"{s}\",\"upstream_unhealthy_backends\":{d},\"http3_status\":\"{s}\",\"http3_quic_port\":{d},\"http3_handshake_state\":\"{s}\",\"http3_datagrams_seen\":{d},\"http3_tracked_connections\":{d},\"http3_native_connections\":{d},\"http3_native_reads_attempted\":{d},\"http3_native_read_calls\":{d},\"http3_handshakes_completed\":{d},\"http3_stream_bytes_received\":{d},\"http3_stream_chunks_received\":{d},\"http3_requests_completed\":{d},\"http3_packets_emitted\":{d},\"http3_bytes_emitted\":{d},\"http3_migration_events\":{d},\"http3_last_error_code\":{d},\"http3_last_error_name\":\"{s}\"}}",
+        "{{\"status\":\"ok\",\"service\":\"tardigrade-edge\",\"upstream_status\":\"{s}\",\"upstream_unhealthy_backends\":{d},\"http3_status\":\"{s}\",\"http3_quic_port\":{d},\"http3_handshake_state\":\"{s}\",\"http3_datagrams_seen\":{d},\"http3_zero_rtt_packets_seen\":{d},\"http3_tracked_connections\":{d},\"http3_native_connections\":{d},\"http3_native_reads_attempted\":{d},\"http3_native_read_calls\":{d},\"http3_handshakes_completed\":{d},\"http3_stream_bytes_received\":{d},\"http3_stream_chunks_received\":{d},\"http3_requests_completed\":{d},\"http3_packets_emitted\":{d},\"http3_bytes_emitted\":{d},\"http3_migration_events\":{d},\"http3_last_error_code\":{d},\"http3_last_error_name\":\"{s}\"}}",
         .{
             if (unhealthy_backends > 0) "degraded" else "healthy",
             unhealthy_backends,
@@ -5786,6 +5786,7 @@ fn populateHealthResponse(
             if (cfg.http3_enabled) cfg.quic_port else 0,
             http3_health.handshake_state,
             http3_health.snapshot.datagrams_seen,
+            http3_health.snapshot.zero_rtt_packets_seen,
             http3_health.snapshot.tracked_connections,
             http3_health.snapshot.native_connections,
             http3_health.snapshot.native_reads_attempted,
@@ -5821,22 +5822,22 @@ fn finalizeHttp3Response(response: *http.Response) void {
         .setContentLength(if (response.body) |body| body.len else 0);
 }
 
-fn handleHttp3Request(
+fn handleHttp3Connection(
     allocator: std.mem.Allocator,
     request: *const http.http3_session.StreamRequest,
     response: *http.Response,
-    user_data: ?*anyopaque,
+    ctx: *Http3DispatchContext,
 ) !void {
-    const ctx: *Http3DispatchContext = @ptrCast(@alignCast(user_data orelse return error.InvalidArgument));
     const correlation_id = request.headers.get(http.correlation.HEADER_NAME) orelse "http3";
+    const http3_path, const http3_query = splitHttp3PathAndQuery(request.path);
 
-    if (std.mem.eql(u8, request.method, "GET") and std.mem.eql(u8, request.path, "/health")) {
+    if (std.mem.eql(u8, request.method, "GET") and std.mem.eql(u8, http3_path, "/health")) {
         try populateHealthResponse(allocator, response, null, correlation_id, ctx.state, ctx.cfg, true);
         ctx.state.metricsRecord(200);
         return;
     }
 
-    if (std.mem.eql(u8, request.method, "GET") and std.mem.eql(u8, request.path, "/metrics")) {
+    if (std.mem.eql(u8, request.method, "GET") and std.mem.eql(u8, http3_path, "/metrics")) {
         const prom_text = try ctx.state.metricsToPrometheus(allocator);
         _ = response
             .setStatus(.ok)
@@ -5849,7 +5850,7 @@ fn handleHttp3Request(
         return;
     }
 
-    if (std.mem.eql(u8, request.method, "GET") and std.mem.eql(u8, request.path, "/metrics/json")) {
+    if (std.mem.eql(u8, request.method, "GET") and std.mem.eql(u8, http3_path, "/metrics/json")) {
         const metrics_json = try ctx.state.metricsToJson(allocator);
         _ = response
             .setStatus(.ok)
@@ -5862,12 +5863,648 @@ fn handleHttp3Request(
         return;
     }
 
-    if (std.mem.eql(u8, request.method, "GET") and std.mem.eql(u8, request.path, "/metrics/prometheus")) {
+    if (std.mem.eql(u8, request.method, "GET") and std.mem.eql(u8, http3_path, "/metrics/prometheus")) {
         const prom_text = try ctx.state.metricsToPrometheus(allocator);
         _ = response
             .setStatus(.ok)
             .setBodyOwned(prom_text)
             .setContentType("text/plain; version=0.0.4; charset=utf-8")
+            .setHeader(http.correlation.HEADER_NAME, correlation_id);
+        finalizeHttp3Response(response);
+        applyResponseHeaders(ctx.state, response);
+        ctx.state.metricsRecord(200);
+        return;
+    }
+
+    if (std.mem.eql(u8, request.method, "GET") and std.mem.eql(u8, http3_path, "/admin/routes")) {
+        const auth_result = authorizeRequest(ctx.cfg, &request.headers);
+        if (!auth_result.ok) {
+            const payload = try buildApiErrorJson(allocator, "unauthorized", "Unauthorized", correlation_id);
+            _ = response
+                .setStatus(.unauthorized)
+                .setBodyOwned(payload)
+                .setContentType("application/json")
+                .setHeader(http.correlation.HEADER_NAME, correlation_id);
+            finalizeHttp3Response(response);
+            applyResponseHeaders(ctx.state, response);
+            ctx.state.metricsRecord(401);
+            return;
+        }
+
+        _ = response
+            .setStatus(.ok)
+            .setBody(ADMIN_ROUTES_JSON)
+            .setContentType("application/json")
+            .setHeader(http.correlation.HEADER_NAME, correlation_id);
+        finalizeHttp3Response(response);
+        applyResponseHeaders(ctx.state, response);
+        ctx.state.metricsRecord(200);
+        return;
+    }
+
+    if (std.mem.eql(u8, request.method, "GET") and std.mem.eql(u8, http3_path, "/admin/connections")) {
+        const auth_result = authorizeRequest(ctx.cfg, &request.headers);
+        if (!auth_result.ok) {
+            const payload = try buildApiErrorJson(allocator, "unauthorized", "Unauthorized", correlation_id);
+            _ = response
+                .setStatus(.unauthorized)
+                .setBodyOwned(payload)
+                .setContentType("application/json")
+                .setHeader(http.correlation.HEADER_NAME, correlation_id);
+            finalizeHttp3Response(response);
+            applyResponseHeaders(ctx.state, response);
+            ctx.state.metricsRecord(401);
+            return;
+        }
+
+        const counts = ctx.state.connectionCounts();
+        const body = try std.fmt.allocPrint(allocator, "{{\"active\":{d},\"tracked_ip_buckets\":{d}}}", .{ counts.active, counts.per_ip });
+        _ = response
+            .setStatus(.ok)
+            .setBodyOwned(body)
+            .setContentType("application/json")
+            .setHeader(http.correlation.HEADER_NAME, correlation_id);
+        finalizeHttp3Response(response);
+        applyResponseHeaders(ctx.state, response);
+        ctx.state.metricsRecord(200);
+        return;
+    }
+
+    if (std.mem.eql(u8, request.method, "GET") and std.mem.eql(u8, http3_path, "/admin/upstreams")) {
+        const auth_result = authorizeRequest(ctx.cfg, &request.headers);
+        if (!auth_result.ok) {
+            const payload = try buildApiErrorJson(allocator, "unauthorized", "Unauthorized", correlation_id);
+            _ = response
+                .setStatus(.unauthorized)
+                .setBodyOwned(payload)
+                .setContentType("application/json")
+                .setHeader(http.correlation.HEADER_NAME, correlation_id);
+            finalizeHttp3Response(response);
+            applyResponseHeaders(ctx.state, response);
+            ctx.state.metricsRecord(401);
+            return;
+        }
+
+        const body = ctx.state.upstreamHealthJson(allocator) catch try allocator.dupe(u8, "{\"upstreams\":[]}");
+        _ = response
+            .setStatus(.ok)
+            .setBodyOwned(body)
+            .setContentType("application/json")
+            .setHeader(http.correlation.HEADER_NAME, correlation_id);
+        finalizeHttp3Response(response);
+        applyResponseHeaders(ctx.state, response);
+        ctx.state.metricsRecord(200);
+        return;
+    }
+
+    if (std.mem.eql(u8, request.method, "POST") and http.api_router.matchRoute(http3_path, 1, "/chat")) {
+        const auth_result = authorizeRequest(ctx.cfg, &request.headers);
+        if (!auth_result.ok) {
+            const payload = try buildApiErrorJson(allocator, "unauthorized", "Unauthorized", correlation_id);
+            _ = response
+                .setStatus(.unauthorized)
+                .setBodyOwned(payload)
+                .setContentType("application/json")
+                .setHeader(http.correlation.HEADER_NAME, correlation_id);
+            finalizeHttp3Response(response);
+            applyResponseHeaders(ctx.state, response);
+            ctx.state.metricsRecord(401);
+            return;
+        }
+
+        if (!isJsonContentType(request.headers.get("content-type"))) {
+            const payload = try buildApiErrorJson(allocator, "invalid_request", "Content-Type must be application/json", correlation_id);
+            _ = response
+                .setStatus(.bad_request)
+                .setBodyOwned(payload)
+                .setContentType("application/json")
+                .setHeader(http.correlation.HEADER_NAME, correlation_id);
+            finalizeHttp3Response(response);
+            applyResponseHeaders(ctx.state, response);
+            ctx.state.metricsRecord(400);
+            return;
+        }
+
+        const message = parseChatMessage(allocator, request.body, ctx.cfg.max_message_chars) catch |err| {
+            const msg = switch (err) {
+                error.EmptyMessage => "message must not be empty",
+                error.MessageTooLarge => "message too long",
+                else => "invalid chat payload",
+            };
+            const payload = try buildApiErrorJson(allocator, "invalid_request", msg, correlation_id);
+            _ = response
+                .setStatus(.bad_request)
+                .setBodyOwned(payload)
+                .setContentType("application/json")
+                .setHeader(http.correlation.HEADER_NAME, correlation_id);
+            finalizeHttp3Response(response);
+            applyResponseHeaders(ctx.state, response);
+            ctx.state.metricsRecord(400);
+            return;
+        };
+        defer allocator.free(message);
+
+        const upstream_body = try std.fmt.allocPrint(allocator, "{{\"message\":{s}}}", .{std.json.fmt(message, .{})});
+        defer allocator.free(upstream_body);
+
+        const exec = proxyJsonExecute(
+            allocator,
+            ctx.cfg,
+            .chat,
+            ctx.cfg.proxy_pass_chat,
+            null,
+            upstream_body,
+            correlation_id,
+            "h3",
+            auth_result.token_hash,
+            null,
+            request.headers.get("host"),
+            request.headers.get("x-forwarded-for"),
+            std.io.null_writer,
+            ctx.state,
+            false,
+        ) catch |err| {
+            const mapped = mapProxyExecutionError(err);
+            const payload = try buildApiErrorJson(allocator, mapped.code, mapped.message, correlation_id);
+            _ = response
+                .setStatus(mapped.status)
+                .setBodyOwned(payload)
+                .setContentType("application/json")
+                .setHeader(http.correlation.HEADER_NAME, correlation_id);
+            finalizeHttp3Response(response);
+            applyResponseHeaders(ctx.state, response);
+            ctx.state.metricsRecord(@intFromEnum(mapped.status));
+            return;
+        };
+
+        switch (exec) {
+            .streamed_status => |status| {
+                _ = response
+                    .setStatus(@enumFromInt(status))
+                    .setBody("")
+                    .setContentType("application/json")
+                    .setHeader(http.correlation.HEADER_NAME, correlation_id);
+                finalizeHttp3Response(response);
+                applyResponseHeaders(ctx.state, response);
+                ctx.state.metricsRecord(status);
+                return;
+            },
+            .buffered => |proxy_result| {
+                defer allocator.free(proxy_result.body);
+                defer allocator.free(proxy_result.content_type);
+                if (proxy_result.content_disposition) |cd| allocator.free(cd);
+
+                if (proxy_result.status != 200) {
+                    const mapped = mapUpstreamError(proxy_result.status);
+                    const payload = try buildApiErrorJson(allocator, mapped.code, mapped.message, correlation_id);
+                    _ = response
+                        .setStatus(@enumFromInt(mapped.status))
+                        .setBodyOwned(payload)
+                        .setContentType("application/json")
+                        .setHeader(http.correlation.HEADER_NAME, correlation_id);
+                    finalizeHttp3Response(response);
+                    applyResponseHeaders(ctx.state, response);
+                    ctx.state.metricsRecord(mapped.status);
+                    return;
+                }
+
+                const body_owned = try allocator.dupe(u8, proxy_result.body);
+                _ = response
+                    .setStatus(.ok)
+                    .setBodyOwned(body_owned)
+                    .setContentType(proxy_result.content_type)
+                    .setHeader(http.correlation.HEADER_NAME, correlation_id);
+                finalizeHttp3Response(response);
+                applyResponseHeaders(ctx.state, response);
+                ctx.state.metricsRecord(200);
+                return;
+            },
+        }
+    }
+
+    if (std.mem.eql(u8, request.method, "POST") and http.api_router.matchRoute(http3_path, 1, "/commands")) {
+        const auth_result = authorizeRequest(ctx.cfg, &request.headers);
+        if (!auth_result.ok) {
+            const payload = try buildApiErrorJson(allocator, "unauthorized", "Unauthorized", correlation_id);
+            _ = response
+                .setStatus(.unauthorized)
+                .setBodyOwned(payload)
+                .setContentType("application/json")
+                .setHeader(http.correlation.HEADER_NAME, correlation_id);
+            finalizeHttp3Response(response);
+            applyResponseHeaders(ctx.state, response);
+            ctx.state.metricsRecord(401);
+            return;
+        }
+
+        if (!isJsonContentType(request.headers.get("content-type"))) {
+            const payload = try buildApiErrorJson(allocator, "invalid_request", "Content-Type must be application/json", correlation_id);
+            _ = response
+                .setStatus(.bad_request)
+                .setBodyOwned(payload)
+                .setContentType("application/json")
+                .setHeader(http.correlation.HEADER_NAME, correlation_id);
+            finalizeHttp3Response(response);
+            applyResponseHeaders(ctx.state, response);
+            ctx.state.metricsRecord(400);
+            return;
+        }
+
+        var cmd = http.command.parseCommand(allocator, request.body) catch |err| {
+            const msg = switch (err) {
+                http.command.ParseError.MissingCommand => "Missing 'command' field",
+                http.command.ParseError.UnknownCommand => "Unknown command type",
+                http.command.ParseError.InvalidParams => "Invalid or missing 'params' object",
+                else => "Invalid command envelope",
+            };
+            const payload = try buildApiErrorJson(allocator, "invalid_request", msg, correlation_id);
+            _ = response
+                .setStatus(.bad_request)
+                .setBodyOwned(payload)
+                .setContentType("application/json")
+                .setHeader(http.correlation.HEADER_NAME, correlation_id);
+            finalizeHttp3Response(response);
+            applyResponseHeaders(ctx.state, response);
+            ctx.state.metricsRecord(400);
+            return;
+        };
+        defer cmd.deinit(allocator);
+        const command_id = if (cmd.command_id) |cid|
+            try allocator.dupe(u8, cid)
+        else
+            try generateCommandId(allocator);
+        defer allocator.free(command_id);
+
+        ctx.state.commandLifecycleCreate(command_id, cmd.command_type.toString(), correlation_id, auth_result.token_hash orelse "-") catch {};
+        ctx.state.commandLifecycleSetRunning(command_id);
+
+        const envelope = http.command.buildUpstreamEnvelope(
+            allocator,
+            cmd.command_type,
+            cmd.params_raw,
+            command_id,
+            correlation_id,
+            auth_result.token_hash orelse "-",
+            "h3",
+            null,
+        ) catch {
+            ctx.state.commandLifecycleSetFailed(command_id, "build_upstream_failed");
+            const payload = try buildApiErrorJson(allocator, "internal_error", "Failed to build upstream request", correlation_id);
+            _ = response
+                .setStatus(.internal_server_error)
+                .setBodyOwned(payload)
+                .setContentType("application/json")
+                .setHeader(http.correlation.HEADER_NAME, correlation_id);
+            finalizeHttp3Response(response);
+            applyResponseHeaders(ctx.state, response);
+            ctx.state.metricsRecord(500);
+            return;
+        };
+        defer allocator.free(envelope);
+
+        const exec = proxyJsonExecute(
+            allocator,
+            ctx.cfg,
+            .commands,
+            ctx.cfg.proxy_pass_commands_prefix,
+            cmd.command_type.upstreamPath(),
+            envelope,
+            correlation_id,
+            "h3",
+            auth_result.token_hash,
+            null,
+            request.headers.get("host"),
+            request.headers.get("x-forwarded-for"),
+            std.io.null_writer,
+            ctx.state,
+            false,
+        ) catch |err| {
+            ctx.state.commandLifecycleSetFailed(command_id, @errorName(err));
+            const mapped = mapProxyExecutionError(err);
+            const payload = try buildApiErrorJson(allocator, mapped.code, mapped.message, correlation_id);
+            _ = response
+                .setStatus(mapped.status)
+                .setBodyOwned(payload)
+                .setContentType("application/json")
+                .setHeader(http.correlation.HEADER_NAME, correlation_id);
+            finalizeHttp3Response(response);
+            applyResponseHeaders(ctx.state, response);
+            ctx.state.metricsRecord(@intFromEnum(mapped.status));
+            return;
+        };
+
+        switch (exec) {
+            .streamed_status => |status| {
+                ctx.state.commandLifecycleSetCompleted(command_id, status, "", JSON_CONTENT_TYPE);
+                _ = response
+                    .setStatus(@enumFromInt(status))
+                    .setBody("")
+                    .setContentType("application/json")
+                    .setHeader(http.correlation.HEADER_NAME, correlation_id);
+                finalizeHttp3Response(response);
+                applyResponseHeaders(ctx.state, response);
+                ctx.state.metricsRecord(status);
+                return;
+            },
+            .buffered => |proxy_result| {
+                defer allocator.free(proxy_result.body);
+                defer allocator.free(proxy_result.content_type);
+                if (proxy_result.content_disposition) |cd| allocator.free(cd);
+
+                if (proxy_result.status != 200) {
+                    const mapped = mapUpstreamError(proxy_result.status);
+                    ctx.state.commandLifecycleSetCompleted(command_id, mapped.status, "", JSON_CONTENT_TYPE);
+                    const payload = try buildApiErrorJson(allocator, mapped.code, mapped.message, correlation_id);
+                    _ = response
+                        .setStatus(@enumFromInt(mapped.status))
+                        .setBodyOwned(payload)
+                        .setContentType("application/json")
+                        .setHeader(http.correlation.HEADER_NAME, correlation_id);
+                    finalizeHttp3Response(response);
+                    applyResponseHeaders(ctx.state, response);
+                    ctx.state.metricsRecord(mapped.status);
+                    return;
+                }
+
+                const body_owned = try allocator.dupe(u8, proxy_result.body);
+                ctx.state.commandLifecycleSetCompleted(command_id, 200, proxy_result.body, proxy_result.content_type);
+                _ = response
+                    .setStatus(.ok)
+                    .setBodyOwned(body_owned)
+                    .setContentType(proxy_result.content_type)
+                    .setHeader(http.correlation.HEADER_NAME, correlation_id);
+                finalizeHttp3Response(response);
+                applyResponseHeaders(ctx.state, response);
+                ctx.state.metricsRecord(200);
+                return;
+            },
+        }
+    }
+
+    if (std.mem.eql(u8, request.method, "GET") and http.api_router.matchRoute(http3_path, 1, "/commands/status")) {
+        var authenticated = false;
+        const auth_result = authorizeRequest(ctx.cfg, &request.headers);
+        if (auth_result.ok) authenticated = true;
+        if (!authenticated) {
+            if (http.session.fromHeaders(&request.headers)) |session_token| {
+                if (ctx.state.validateSessionIdentity(allocator, session_token) != null) authenticated = true;
+            }
+        }
+        if (!authenticated) {
+            const payload = try buildApiErrorJson(allocator, "unauthorized", "Unauthorized", correlation_id);
+            _ = response
+                .setStatus(.unauthorized)
+                .setBodyOwned(payload)
+                .setContentType("application/json")
+                .setHeader(http.correlation.HEADER_NAME, correlation_id);
+            finalizeHttp3Response(response);
+            applyResponseHeaders(ctx.state, response);
+            ctx.state.metricsRecord(401);
+            return;
+        }
+
+        const command_id = parseQueryParam(http3_query orelse "", "command_id") orelse {
+            const payload = try buildApiErrorJson(allocator, "invalid_request", "Missing command_id", correlation_id);
+            _ = response
+                .setStatus(.bad_request)
+                .setBodyOwned(payload)
+                .setContentType("application/json")
+                .setHeader(http.correlation.HEADER_NAME, correlation_id);
+            finalizeHttp3Response(response);
+            applyResponseHeaders(ctx.state, response);
+            ctx.state.metricsRecord(400);
+            return;
+        };
+        const snapshot = ctx.state.commandLifecycleSnapshotJson(allocator, command_id) orelse {
+            const payload = try buildApiErrorJson(allocator, "invalid_request", "Unknown command_id", correlation_id);
+            _ = response
+                .setStatus(.not_found)
+                .setBodyOwned(payload)
+                .setContentType("application/json")
+                .setHeader(http.correlation.HEADER_NAME, correlation_id);
+            finalizeHttp3Response(response);
+            applyResponseHeaders(ctx.state, response);
+            ctx.state.metricsRecord(404);
+            return;
+        };
+
+        _ = response
+            .setStatus(.ok)
+            .setBodyOwned(snapshot)
+            .setContentType("application/json")
+            .setHeader(http.correlation.HEADER_NAME, correlation_id);
+        finalizeHttp3Response(response);
+        applyResponseHeaders(ctx.state, response);
+        ctx.state.metricsRecord(200);
+        return;
+    }
+
+    if (std.mem.eql(u8, request.method, "POST") and http.api_router.matchRoute(http3_path, 1, "/approvals/request")) {
+        var authenticated = false;
+        const auth_result = authorizeRequest(ctx.cfg, &request.headers);
+        if (auth_result.ok) authenticated = true;
+        if (!authenticated) {
+            if (http.session.fromHeaders(&request.headers)) |session_token| {
+                if (ctx.state.validateSessionIdentity(allocator, session_token) != null) authenticated = true;
+            }
+        }
+        if (!authenticated) {
+            const payload = try buildApiErrorJson(allocator, "unauthorized", "Unauthorized", correlation_id);
+            _ = response
+                .setStatus(.unauthorized)
+                .setBodyOwned(payload)
+                .setContentType("application/json")
+                .setHeader(http.correlation.HEADER_NAME, correlation_id);
+            finalizeHttp3Response(response);
+            applyResponseHeaders(ctx.state, response);
+            ctx.state.metricsRecord(401);
+            return;
+        }
+        if (!isJsonContentType(request.headers.get("content-type"))) {
+            const payload = try buildApiErrorJson(allocator, "invalid_request", "Content-Type must be application/json", correlation_id);
+            _ = response
+                .setStatus(.bad_request)
+                .setBodyOwned(payload)
+                .setContentType("application/json")
+                .setHeader(http.correlation.HEADER_NAME, correlation_id);
+            finalizeHttp3Response(response);
+            applyResponseHeaders(ctx.state, response);
+            ctx.state.metricsRecord(400);
+            return;
+        }
+        var approval_req = parseApprovalRequestBody(allocator, request.body) catch {
+            const payload = try buildApiErrorJson(allocator, "invalid_request", "Invalid approval request payload", correlation_id);
+            _ = response
+                .setStatus(.bad_request)
+                .setBodyOwned(payload)
+                .setContentType("application/json")
+                .setHeader(http.correlation.HEADER_NAME, correlation_id);
+            finalizeHttp3Response(response);
+            applyResponseHeaders(ctx.state, response);
+            ctx.state.metricsRecord(400);
+            return;
+        };
+        defer approval_req.deinit(allocator);
+        if (!routeNeedsApproval(approval_req.method, approval_req.path, ctx.cfg.policy_approval_routes_raw) and
+            !routeRequiresApprovalRule(approval_req.method, approval_req.path, ctx.cfg.policy_rules_raw))
+        {
+            const payload = try buildApiErrorJson(allocator, "invalid_request", "Route does not require approval", correlation_id);
+            _ = response
+                .setStatus(.bad_request)
+                .setBodyOwned(payload)
+                .setContentType("application/json")
+                .setHeader(http.correlation.HEADER_NAME, correlation_id);
+            finalizeHttp3Response(response);
+            applyResponseHeaders(ctx.state, response);
+            ctx.state.metricsRecord(400);
+            return;
+        }
+        const created = ctx.state.approvalCreate(allocator, approval_req.method, approval_req.path, auth_result.token_hash orelse "-", approval_req.command_id) catch {
+            const payload = try buildApiErrorJson(allocator, "internal_error", "Failed to create approval request", correlation_id);
+            _ = response
+                .setStatus(.internal_server_error)
+                .setBodyOwned(payload)
+                .setContentType("application/json")
+                .setHeader(http.correlation.HEADER_NAME, correlation_id);
+            finalizeHttp3Response(response);
+            applyResponseHeaders(ctx.state, response);
+            ctx.state.metricsRecord(500);
+            return;
+        };
+        defer allocator.free(created.token);
+        _ = ctx.state.event_hub.publish("approvals.requests", request.body, http.event_loop.monotonicMs()) catch 0;
+        const body = try std.fmt.allocPrint(allocator, "{{\"approval_token\":\"{s}\",\"status\":\"pending\",\"expires_ms\":{d},\"status_url\":\"/v1/approvals/status?approval_token={s}\"}}", .{
+            created.token,
+            created.expires_ms,
+            created.token,
+        });
+        _ = response
+            .setStatus(.accepted)
+            .setBodyOwned(body)
+            .setContentType("application/json")
+            .setHeader(http.correlation.HEADER_NAME, correlation_id);
+        finalizeHttp3Response(response);
+        applyResponseHeaders(ctx.state, response);
+        ctx.state.metricsRecord(202);
+        return;
+    }
+
+    if (std.mem.eql(u8, request.method, "POST") and http.api_router.matchRoute(http3_path, 1, "/approvals/respond")) {
+        const auth_result = authorizeRequest(ctx.cfg, &request.headers);
+        if (!auth_result.ok) {
+            const payload = try buildApiErrorJson(allocator, "unauthorized", "Unauthorized", correlation_id);
+            _ = response
+                .setStatus(.unauthorized)
+                .setBodyOwned(payload)
+                .setContentType("application/json")
+                .setHeader(http.correlation.HEADER_NAME, correlation_id);
+            finalizeHttp3Response(response);
+            applyResponseHeaders(ctx.state, response);
+            ctx.state.metricsRecord(401);
+            return;
+        }
+        if (!isJsonContentType(request.headers.get("content-type"))) {
+            const payload = try buildApiErrorJson(allocator, "invalid_request", "Content-Type must be application/json", correlation_id);
+            _ = response
+                .setStatus(.bad_request)
+                .setBodyOwned(payload)
+                .setContentType("application/json")
+                .setHeader(http.correlation.HEADER_NAME, correlation_id);
+            finalizeHttp3Response(response);
+            applyResponseHeaders(ctx.state, response);
+            ctx.state.metricsRecord(400);
+            return;
+        }
+        var approval_resp = parseApprovalResponseBody(allocator, request.body) catch {
+            const payload = try buildApiErrorJson(allocator, "invalid_request", "Invalid approval response payload", correlation_id);
+            _ = response
+                .setStatus(.bad_request)
+                .setBodyOwned(payload)
+                .setContentType("application/json")
+                .setHeader(http.correlation.HEADER_NAME, correlation_id);
+            finalizeHttp3Response(response);
+            applyResponseHeaders(ctx.state, response);
+            ctx.state.metricsRecord(400);
+            return;
+        };
+        defer approval_resp.deinit(allocator);
+        if (!ctx.state.approvalRespond(approval_resp.token, approval_resp.decision, auth_result.token_hash orelse "-")) {
+            const payload = try buildApiErrorJson(allocator, "invalid_request", "Approval token not pending or not found", correlation_id);
+            _ = response
+                .setStatus(.conflict)
+                .setBodyOwned(payload)
+                .setContentType("application/json")
+                .setHeader(http.correlation.HEADER_NAME, correlation_id);
+            finalizeHttp3Response(response);
+            applyResponseHeaders(ctx.state, response);
+            ctx.state.metricsRecord(409);
+            return;
+        }
+        _ = ctx.state.event_hub.publish("approvals.responses", request.body, http.event_loop.monotonicMs()) catch 0;
+        const body = try std.fmt.allocPrint(allocator, "{{\"approval_token\":\"{s}\",\"status\":\"{s}\"}}", .{
+            approval_resp.token,
+            if (approval_resp.decision == .approve) "approved" else "denied",
+        });
+        _ = response
+            .setStatus(.ok)
+            .setBodyOwned(body)
+            .setContentType("application/json")
+            .setHeader(http.correlation.HEADER_NAME, correlation_id);
+        finalizeHttp3Response(response);
+        applyResponseHeaders(ctx.state, response);
+        ctx.state.metricsRecord(200);
+        return;
+    }
+
+    if (std.mem.eql(u8, request.method, "GET") and http.api_router.matchRoute(http3_path, 1, "/approvals/status")) {
+        var authenticated = false;
+        const auth_result = authorizeRequest(ctx.cfg, &request.headers);
+        if (auth_result.ok) authenticated = true;
+        if (!authenticated) {
+            if (http.session.fromHeaders(&request.headers)) |session_token| {
+                if (ctx.state.validateSessionIdentity(allocator, session_token) != null) authenticated = true;
+            }
+        }
+        if (!authenticated) {
+            const payload = try buildApiErrorJson(allocator, "unauthorized", "Unauthorized", correlation_id);
+            _ = response
+                .setStatus(.unauthorized)
+                .setBodyOwned(payload)
+                .setContentType("application/json")
+                .setHeader(http.correlation.HEADER_NAME, correlation_id);
+            finalizeHttp3Response(response);
+            applyResponseHeaders(ctx.state, response);
+            ctx.state.metricsRecord(401);
+            return;
+        }
+        const approval_token = parseQueryParam(http3_query orelse "", "approval_token") orelse {
+            const payload = try buildApiErrorJson(allocator, "invalid_request", "Missing approval_token", correlation_id);
+            _ = response
+                .setStatus(.bad_request)
+                .setBodyOwned(payload)
+                .setContentType("application/json")
+                .setHeader(http.correlation.HEADER_NAME, correlation_id);
+            finalizeHttp3Response(response);
+            applyResponseHeaders(ctx.state, response);
+            ctx.state.metricsRecord(400);
+            return;
+        };
+        const snapshot = ctx.state.approvalSnapshotJson(allocator, approval_token) orelse {
+            const payload = try buildApiErrorJson(allocator, "invalid_request", "Unknown approval_token", correlation_id);
+            _ = response
+                .setStatus(.not_found)
+                .setBodyOwned(payload)
+                .setContentType("application/json")
+                .setHeader(http.correlation.HEADER_NAME, correlation_id);
+            finalizeHttp3Response(response);
+            applyResponseHeaders(ctx.state, response);
+            ctx.state.metricsRecord(404);
+            return;
+        };
+        _ = response
+            .setStatus(.ok)
+            .setBodyOwned(snapshot)
+            .setContentType("application/json")
             .setHeader(http.correlation.HEADER_NAME, correlation_id);
         finalizeHttp3Response(response);
         applyResponseHeaders(ctx.state, response);
@@ -5884,6 +6521,23 @@ fn handleHttp3Request(
     finalizeHttp3Response(response);
     applyResponseHeaders(ctx.state, response);
     ctx.state.metricsRecord(404);
+}
+
+fn splitHttp3PathAndQuery(path: []const u8) struct { []const u8, ?[]const u8 } {
+    if (std.mem.indexOfScalar(u8, path, '?')) |idx| {
+        return .{ path[0..idx], path[idx + 1 ..] };
+    }
+    return .{ path, null };
+}
+
+fn handleHttp3Request(
+    allocator: std.mem.Allocator,
+    request: *const http.http3_session.StreamRequest,
+    response: *http.Response,
+    user_data: ?*anyopaque,
+) !void {
+    const ctx: *Http3DispatchContext = @ptrCast(@alignCast(user_data orelse return error.InvalidArgument));
+    try handleHttp3Connection(allocator, request, response, ctx);
 }
 
 fn authorizeRequest(cfg: *const edge_config.EdgeConfig, headers: *const http.Headers) AuthResult {

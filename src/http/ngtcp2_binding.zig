@@ -64,6 +64,7 @@ pub const ServerStats = struct {
 pub const ServerSnapshot = struct {
     datagrams_seen: usize = 0,
     bytes_seen: usize = 0,
+    zero_rtt_packets_seen: usize = 0,
     tracked_connections: usize = 0,
     native_connections: usize = 0,
     native_reads_attempted: usize = 0,
@@ -199,6 +200,7 @@ pub const Binding = if (enabled) struct {
         var view = ServerSnapshot{
             .datagrams_seen = server.stats.datagrams_seen,
             .bytes_seen = server.stats.bytes_seen,
+            .zero_rtt_packets_seen = server.stats.zero_rtt_packets_seen,
             .tracked_connections = server.connections.count(),
             .native_connections = server.native_connections.count(),
             .stream_bytes_received = 0,
@@ -827,6 +829,13 @@ pub const Binding = if (enabled) struct {
         if (c.SSL_CTX_use_certificate_file(ctx, cert_path_z.ptr, c.SSL_FILETYPE_PEM) != 1) return error.TlsBootstrapFailed;
         if (c.SSL_CTX_use_PrivateKey_file(ctx, key_path_z.ptr, c.SSL_FILETYPE_PEM) != 1) return error.TlsBootstrapFailed;
         if (c.SSL_CTX_check_private_key(ctx) != 1) return error.TlsBootstrapFailed;
+        _ = c.SSL_CTX_set_session_cache_mode(ctx, c.SSL_SESS_CACHE_SERVER);
+        _ = c.SSL_CTX_set_timeout(ctx, 60 * 60);
+        if (cfg.enable_0rtt) {
+            _ = c.SSL_CTX_set_max_early_data(ctx, 16 * 1024);
+        } else {
+            _ = c.SSL_CTX_set_max_early_data(ctx, 0);
+        }
 
         return ctx;
     }

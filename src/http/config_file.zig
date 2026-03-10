@@ -47,6 +47,45 @@ pub fn loadOverrides(allocator: std.mem.Allocator) !Overrides {
     return overrides;
 }
 
+const BlockContext = union(enum) {
+    passthrough,
+    location: LocationBlockBuilder,
+};
+
+const LocationBlockBuilder = struct {
+    match_type: []u8,
+    pattern: []u8,
+    proxy_pass: ?[]u8 = null,
+    fastcgi_pass: ?[]u8 = null,
+    scgi_pass: ?[]u8 = null,
+    uwsgi_pass: ?[]u8 = null,
+    root: ?[]u8 = null,
+    alias: ?[]u8 = null,
+    index: ?[]u8 = null,
+    try_files: ?[]u8 = null,
+    return_status: ?u16 = null,
+    return_body: ?[]u8 = null,
+    rewrite_replacement: ?[]u8 = null,
+    rewrite_flag: ?[]u8 = null,
+
+    fn deinit(self: *LocationBlockBuilder, allocator: std.mem.Allocator) void {
+        allocator.free(self.match_type);
+        allocator.free(self.pattern);
+        if (self.proxy_pass) |value| allocator.free(value);
+        if (self.fastcgi_pass) |value| allocator.free(value);
+        if (self.scgi_pass) |value| allocator.free(value);
+        if (self.uwsgi_pass) |value| allocator.free(value);
+        if (self.root) |value| allocator.free(value);
+        if (self.alias) |value| allocator.free(value);
+        if (self.index) |value| allocator.free(value);
+        if (self.try_files) |value| allocator.free(value);
+        if (self.return_body) |value| allocator.free(value);
+        if (self.rewrite_replacement) |value| allocator.free(value);
+        if (self.rewrite_flag) |value| allocator.free(value);
+        self.* = undefined;
+    }
+};
+
 fn parseFile(
     allocator: std.mem.Allocator,
     path: []const u8,
@@ -64,18 +103,66 @@ fn parseFile(
     defer allocator.free(raw);
 
     var line_no: usize = 0;
+    var blocks = std.ArrayList(BlockContext).init(allocator);
+    defer {
+        for (blocks.items) |*block| {
+            switch (block.*) {
+                .passthrough => {},
+                .location => |*builder| builder.deinit(allocator),
+            }
+        }
+        blocks.deinit();
+    }
     var lines = std.mem.splitScalar(u8, raw, '\n');
     while (lines.next()) |line_raw| {
         line_no += 1;
         const comment_idx = std.mem.indexOfScalar(u8, line_raw, '#') orelse line_raw.len;
         const line = std.mem.trim(u8, line_raw[0..comment_idx], " \t\r\n");
         if (line.len == 0) continue;
+        if (std.mem.eql(u8, line, "}")) {
+            if (blocks.items.len == 0) {
+                std.log.err("config syntax error at {s}:{d}: unexpected '}}'", .{ normalized, line_no });
+                return error.InvalidConfigSyntax;
+            }
+            const block = blocks.pop().?;
+            switch (block) {
+                .passthrough => {},
+                .location => |builder| {
+                    var owned_builder = builder;
+                    defer owned_builder.deinit(allocator);
+                    try flushLocationBlock(allocator, overrides, &owned_builder);
+                },
+            }
+            continue;
+        }
+        if (line[line.len - 1] == '{') {
+            const header = std.mem.trimRight(u8, line[0 .. line.len - 1], " \t\r\n");
+            if (std.mem.startsWith(u8, header, "location")) {
+                const builder = try parseLocationHeader(allocator, normalized, header, line_no);
+                try blocks.append(.{ .location = builder });
+            } else {
+                try blocks.append(.passthrough);
+            }
+            continue;
+        }
         if (line[line.len - 1] != ';') {
             std.log.err("config syntax error at {s}:{d}: missing ';'", .{ normalized, line_no });
             return error.InvalidConfigSyntax;
         }
         const stmt = std.mem.trimRight(u8, line[0 .. line.len - 1], " \t\r\n");
-        try parseStatement(allocator, normalized, stmt, overrides, vars, visited, line_no);
+        if (blocks.items.len > 0) {
+            switch (blocks.items[blocks.items.len - 1]) {
+                .passthrough => try parseStatement(allocator, normalized, stmt, overrides, vars, visited, line_no),
+                .location => |*builder| try parseLocationStatement(allocator, normalized, stmt, builder, vars, line_no),
+            }
+        } else {
+            try parseStatement(allocator, normalized, stmt, overrides, vars, visited, line_no);
+        }
+    }
+
+    if (blocks.items.len != 0) {
+        std.log.err("config syntax error at {s}:{d}: unterminated block", .{ normalized, line_no });
+        return error.InvalidConfigSyntax;
     }
 }
 
@@ -384,6 +471,169 @@ fn appendOverride(
     try putOverride(allocator, map, key_raw, value_raw);
 }
 
+fn parseLocationHeader(
+    allocator: std.mem.Allocator,
+    file_path: []const u8,
+    header: []const u8,
+    line_no: usize,
+) !LocationBlockBuilder {
+    const rest = std.mem.trim(u8, header["location".len..], " \t");
+    if (rest.len == 0) {
+        std.log.err("config syntax error at {s}:{d}: location requires matcher", .{ file_path, line_no });
+        return error.InvalidConfigSyntax;
+    }
+
+    var match_type: []const u8 = "prefix";
+    var pattern: []const u8 = rest;
+    if (std.mem.startsWith(u8, rest, "= ")) {
+        match_type = "exact";
+        pattern = std.mem.trim(u8, rest[2..], " \t");
+    } else if (std.mem.startsWith(u8, rest, "^~ ")) {
+        match_type = "prefix_priority";
+        pattern = std.mem.trim(u8, rest[3..], " \t");
+    } else if (std.mem.startsWith(u8, rest, "~* ")) {
+        match_type = "regex_case_insensitive";
+        pattern = std.mem.trim(u8, rest[3..], " \t");
+    } else if (std.mem.startsWith(u8, rest, "~ ")) {
+        match_type = "regex";
+        pattern = std.mem.trim(u8, rest[2..], " \t");
+    }
+
+    if (pattern.len == 0) {
+        std.log.err("config syntax error at {s}:{d}: location requires pattern", .{ file_path, line_no });
+        return error.InvalidConfigSyntax;
+    }
+
+    return .{
+        .match_type = try allocator.dupe(u8, match_type),
+        .pattern = try allocator.dupe(u8, pattern),
+    };
+}
+
+fn parseLocationStatement(
+    allocator: std.mem.Allocator,
+    file_path: []const u8,
+    stmt: []const u8,
+    builder: *LocationBlockBuilder,
+    vars: *std.StringHashMap([]const u8),
+    line_no: usize,
+) !void {
+    var it = std.mem.tokenizeAny(u8, stmt, " \t");
+    const directive = it.next() orelse return;
+    const value_raw = std.mem.trim(u8, it.rest(), " \t");
+    if (value_raw.len == 0) {
+        std.log.err("config syntax error at {s}:{d}: directive '{s}' missing value", .{ file_path, line_no, directive });
+        return error.InvalidConfigSyntax;
+    }
+    const trimmed_value = std.mem.trim(u8, value_raw, " \t\"'");
+    const value_interp = try interpolate(allocator, trimmed_value, vars);
+    defer allocator.free(value_interp);
+
+    if (std.ascii.eqlIgnoreCase(directive, "proxy_pass")) {
+        try replaceOptionalOwned(allocator, &builder.proxy_pass, value_interp);
+        return;
+    }
+    if (std.ascii.eqlIgnoreCase(directive, "fastcgi_pass")) {
+        try replaceOptionalOwned(allocator, &builder.fastcgi_pass, value_interp);
+        return;
+    }
+    if (std.ascii.eqlIgnoreCase(directive, "scgi_pass")) {
+        try replaceOptionalOwned(allocator, &builder.scgi_pass, value_interp);
+        return;
+    }
+    if (std.ascii.eqlIgnoreCase(directive, "uwsgi_pass")) {
+        try replaceOptionalOwned(allocator, &builder.uwsgi_pass, value_interp);
+        return;
+    }
+    if (std.ascii.eqlIgnoreCase(directive, "root")) {
+        try replaceOptionalOwned(allocator, &builder.root, value_interp);
+        return;
+    }
+    if (std.ascii.eqlIgnoreCase(directive, "alias")) {
+        try replaceOptionalOwned(allocator, &builder.alias, value_interp);
+        return;
+    }
+    if (std.ascii.eqlIgnoreCase(directive, "index")) {
+        try replaceOptionalOwned(allocator, &builder.index, value_interp);
+        return;
+    }
+    if (std.ascii.eqlIgnoreCase(directive, "try_files")) {
+        try replaceOptionalOwned(allocator, &builder.try_files, value_interp);
+        return;
+    }
+    if (std.ascii.eqlIgnoreCase(directive, "return")) {
+        var toks = std.mem.tokenizeAny(u8, value_raw, " \t");
+        const status_raw = toks.next() orelse return error.InvalidConfigSyntax;
+        const body_raw = std.mem.trim(u8, toks.rest(), " \t");
+        builder.return_status = std.fmt.parseInt(u16, status_raw, 10) catch {
+            std.log.err("config syntax error at {s}:{d}: invalid return status '{s}'", .{ file_path, line_no, status_raw });
+            return error.InvalidConfigSyntax;
+        };
+        const body_interp = if (body_raw.len > 0)
+            try interpolate(allocator, std.mem.trim(u8, body_raw, "\"'"), vars)
+        else
+            try allocator.dupe(u8, "");
+        defer allocator.free(body_interp);
+        try replaceOptionalOwned(allocator, &builder.return_body, body_interp);
+        return;
+    }
+    if (std.ascii.eqlIgnoreCase(directive, "rewrite")) {
+        var toks = std.mem.tokenizeAny(u8, value_raw, " \t");
+        _ = toks.next() orelse return error.InvalidConfigSyntax;
+        const replacement_raw = toks.next() orelse return error.InvalidConfigSyntax;
+        const flag_raw = toks.next() orelse "last";
+        if (toks.next() != null) return error.InvalidConfigSyntax;
+        const replacement_interp = try interpolate(allocator, std.mem.trim(u8, replacement_raw, "\"'"), vars);
+        defer allocator.free(replacement_interp);
+        try replaceOptionalOwned(allocator, &builder.rewrite_replacement, replacement_interp);
+        try replaceOptionalOwned(allocator, &builder.rewrite_flag, flag_raw);
+        return;
+    }
+}
+
+fn flushLocationBlock(allocator: std.mem.Allocator, overrides: *Overrides, builder: *LocationBlockBuilder) !void {
+    const entry = if (builder.proxy_pass) |target|
+        try std.fmt.allocPrint(allocator, "{s}|{s}|proxy_pass|{s}", .{ builder.match_type, builder.pattern, target })
+    else if (builder.fastcgi_pass) |target|
+        try std.fmt.allocPrint(allocator, "{s}|{s}|fastcgi_pass|{s}", .{ builder.match_type, builder.pattern, target })
+    else if (builder.scgi_pass) |target|
+        try std.fmt.allocPrint(allocator, "{s}|{s}|proxy_pass|scgi:{s}", .{ builder.match_type, builder.pattern, target })
+    else if (builder.uwsgi_pass) |target|
+        try std.fmt.allocPrint(allocator, "{s}|{s}|proxy_pass|uwsgi:{s}", .{ builder.match_type, builder.pattern, target })
+    else if (builder.return_status) |status|
+        try std.fmt.allocPrint(allocator, "{s}|{s}|return|{d}|{s}", .{ builder.match_type, builder.pattern, status, builder.return_body orelse "" })
+    else if (builder.root != null or builder.alias != null or builder.index != null or builder.try_files != null)
+        try std.fmt.allocPrint(
+            allocator,
+            "{s}|{s}|static_root|{s}|{s}|{s}|{s}",
+            .{
+                builder.match_type,
+                builder.pattern,
+                builder.alias orelse builder.root orelse "",
+                if (builder.alias != null) "on" else "off",
+                builder.index orelse "",
+                builder.try_files orelse "",
+            },
+        )
+    else if (builder.rewrite_replacement) |replacement|
+        try std.fmt.allocPrint(allocator, "{s}|{s}|rewrite|{s}|{s}", .{
+            builder.match_type,
+            builder.pattern,
+            replacement,
+            builder.rewrite_flag orelse "last",
+        })
+    else
+        return;
+    defer allocator.free(entry);
+
+    try appendOverride(allocator, &overrides.map, "TARDIGRADE_LOCATION_BLOCKS", entry, ";");
+}
+
+fn replaceOptionalOwned(allocator: std.mem.Allocator, target: *?[]u8, value: []const u8) !void {
+    if (target.*) |existing| allocator.free(existing);
+    target.* = try allocator.dupe(u8, value);
+}
+
 fn mapListenDirective(allocator: std.mem.Allocator, map: *std.StringHashMap([]const u8), raw: []const u8) !void {
     var it = std.mem.tokenizeAny(u8, raw, " \t");
     const addr = it.next() orelse return;
@@ -539,7 +789,11 @@ test "backend protocol directives map to explicit upstream env keys" {
     var vars = std.StringHashMap([]const u8).init(allocator);
     defer vars.deinit();
     var visited = std.StringHashMap(void).init(allocator);
-    defer visited.deinit();
+    defer {
+        var it = visited.iterator();
+        while (it.next()) |entry| allocator.free(entry.key_ptr.*);
+        visited.deinit();
+    }
 
     try parseStatement(allocator, "test.conf", "fastcgi_pass unix:/tmp/php-fpm.sock", &overrides, &vars, &visited, 1);
     try parseStatement(allocator, "test.conf", "scgi_pass 127.0.0.1:4100", &overrides, &vars, &visited, 2);
@@ -566,7 +820,11 @@ test "fastcgi_param directives accumulate into fastcgi params env" {
         vars.deinit();
     }
     var visited = std.StringHashMap(void).init(allocator);
-    defer visited.deinit();
+    defer {
+        var it = visited.iterator();
+        while (it.next()) |entry| allocator.free(entry.key_ptr.*);
+        visited.deinit();
+    }
     try vars.put(try allocator.dupe(u8, "app_env"), try allocator.dupe(u8, "staging"));
 
     try parseStatement(allocator, "test.conf", "fastcgi_param APP_ENV ${app_env}", &overrides, &vars, &visited, 1);
@@ -582,7 +840,11 @@ test "rewrite directives accumulate into rewrite rules env" {
     var vars = std.StringHashMap([]const u8).init(allocator);
     defer vars.deinit();
     var visited = std.StringHashMap(void).init(allocator);
-    defer visited.deinit();
+    defer {
+        var it = visited.iterator();
+        while (it.next()) |entry| allocator.free(entry.key_ptr.*);
+        visited.deinit();
+    }
 
     try parseStatement(allocator, "test.conf", "rewrite ^/old/(.*)$ /$1 last", &overrides, &vars, &visited, 1);
     try parseStatement(allocator, "test.conf", "rewrite ^/temp$ /redirect redirect", &overrides, &vars, &visited, 2);
@@ -600,7 +862,11 @@ test "return directives accumulate into return rules env" {
     var vars = std.StringHashMap([]const u8).init(allocator);
     defer vars.deinit();
     var visited = std.StringHashMap(void).init(allocator);
-    defer visited.deinit();
+    defer {
+        var it = visited.iterator();
+        while (it.next()) |entry| allocator.free(entry.key_ptr.*);
+        visited.deinit();
+    }
 
     try parseStatement(allocator, "test.conf", "return 301 https://example.com$request_uri", &overrides, &vars, &visited, 1);
     try parseStatement(allocator, "test.conf", "return 204", &overrides, &vars, &visited, 2);
@@ -618,7 +884,11 @@ test "if directives accumulate into conditional rules env" {
     var vars = std.StringHashMap([]const u8).init(allocator);
     defer vars.deinit();
     var visited = std.StringHashMap(void).init(allocator);
-    defer visited.deinit();
+    defer {
+        var it = visited.iterator();
+        while (it.next()) |entry| allocator.free(entry.key_ptr.*);
+        visited.deinit();
+    }
 
     try parseStatement(allocator, "test.conf", "if ($request_uri ~* ^/legacy/(.*)$) rewrite /$1 last", &overrides, &vars, &visited, 1);
     try parseStatement(allocator, "test.conf", "if ($http_host ~* ^admin\\.example\\.com$) return 301 https://example.com$request_uri", &overrides, &vars, &visited, 2);
@@ -626,5 +896,91 @@ test "if directives accumulate into conditional rules env" {
     try std.testing.expectEqualStrings(
         "request_uri|ci|^/legacy/(.*)$|rewrite|/$1|last;http_host|ci|^admin\\.example\\.com$|return|301|https://example.com$request_uri",
         overrides.map.get("TARDIGRADE_CONDITIONAL_RULES").?,
+    );
+}
+
+test "location blocks accumulate into location block env" {
+    const allocator = std.testing.allocator;
+    var cfg_dir = std.testing.tmpDir(.{});
+    defer cfg_dir.cleanup();
+
+    try cfg_dir.dir.writeFile(.{
+        .sub_path = "location.conf",
+        .data =
+        \\location = /health {
+        \\    return 200 ok;
+        \\}
+        \\location ^~ /api/private/ {
+        \\    proxy_pass http://127.0.0.1:9001;
+        \\}
+        \\location ~* ^/assets/.*$ {
+        \\    root /srv/www;
+        \\    index index.html;
+        \\    try_files $uri /index.html;
+        \\}
+        ,
+    });
+
+    const cwd = std.fs.cwd();
+    const absolute = try cfg_dir.dir.realpathAlloc(allocator, "location.conf");
+    defer allocator.free(absolute);
+
+    var overrides = Overrides.init(allocator);
+    defer overrides.deinit(allocator);
+    var vars = std.StringHashMap([]const u8).init(allocator);
+    defer vars.deinit();
+    var visited = std.StringHashMap(void).init(allocator);
+    defer {
+        var it = visited.iterator();
+        while (it.next()) |entry| allocator.free(entry.key_ptr.*);
+        visited.deinit();
+    }
+
+    _ = cwd;
+    try parseFile(allocator, absolute, &overrides, &vars, &visited);
+
+    try std.testing.expectEqualStrings(
+        "exact|/health|return|200|ok;prefix_priority|/api/private/|proxy_pass|http://127.0.0.1:9001;regex_case_insensitive|^/assets/.*$|static_root|/srv/www|off|index.html|$uri /index.html",
+        overrides.map.get("TARDIGRADE_LOCATION_BLOCKS").?,
+    );
+}
+
+test "location block supports alias and fastcgi pass serialization" {
+    const allocator = std.testing.allocator;
+    var cfg_dir = std.testing.tmpDir(.{});
+    defer cfg_dir.cleanup();
+
+    try cfg_dir.dir.writeFile(.{
+        .sub_path = "location-fastcgi.conf",
+        .data =
+        \\location /php/ {
+        \\    fastcgi_pass unix:/tmp/php-fpm.sock;
+        \\}
+        \\location /images/ {
+        \\    alias /srv/images;
+        \\    index home.html;
+        \\}
+        ,
+    });
+
+    const absolute = try cfg_dir.dir.realpathAlloc(allocator, "location-fastcgi.conf");
+    defer allocator.free(absolute);
+
+    var overrides = Overrides.init(allocator);
+    defer overrides.deinit(allocator);
+    var vars = std.StringHashMap([]const u8).init(allocator);
+    defer vars.deinit();
+    var visited = std.StringHashMap(void).init(allocator);
+    defer {
+        var it = visited.iterator();
+        while (it.next()) |entry| allocator.free(entry.key_ptr.*);
+        visited.deinit();
+    }
+
+    try parseFile(allocator, absolute, &overrides, &vars, &visited);
+
+    try std.testing.expectEqualStrings(
+        "prefix|/php/|fastcgi_pass|unix:/tmp/php-fpm.sock;prefix|/images/|static_root|/srv/images|on|home.html|",
+        overrides.map.get("TARDIGRADE_LOCATION_BLOCKS").?,
     );
 }

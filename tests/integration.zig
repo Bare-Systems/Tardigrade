@@ -3349,6 +3349,54 @@ test "http3 integration serves prometheus metrics over quic" {
     try assertContains(response.body, "tardigrade_requests_total");
 }
 
+test "http3 integration routes configured location blocks over quic" {
+    if (!build_options.enable_http3_ngtcp2) return error.SkipZigTest;
+    std.fs.accessAbsolute(http3_curl_path, .{}) catch return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const responses = [_]UpstreamResponseSpec{.{ .body = "http3-location-upstream" }};
+    var upstream = try UpstreamServer.start(allocator, &responses);
+    defer upstream.stop();
+    try upstream.run();
+
+    const quic_port = try findFreePort();
+    const quic_port_str = try std.fmt.allocPrint(allocator, "{d}", .{quic_port});
+    defer allocator.free(quic_port_str);
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location = /quic-location {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+    , .{ test_host, upstream.port() });
+    defer allocator.free(config_text);
+
+    const opts = TardigradeOptions{
+        .upstream_port = null,
+        .config_text = config_text,
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_HTTP3_ENABLED", .value = "true" },
+            .{ .name = "TARDIGRADE_QUIC_PORT", .value = quic_port_str },
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = "tests/fixtures/tls/server.crt" },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = "tests/fixtures/tls/server.key" },
+        },
+        .ready_https_insecure = true,
+    };
+    var tardigrade = try TardigradeProcess.start(allocator, opts);
+    defer tardigrade.stop();
+    try waitForHttp3Configured(tardigrade.port, 5000);
+
+    var response = try sendHttp3CurlRequest(allocator, quic_port, "/quic-location");
+    defer response.deinit();
+
+    try std.testing.expectEqual(@as(u16, 200), response.status_code);
+    try std.testing.expectEqualStrings("http3-location-upstream", response.body);
+
+    upstream.mutex.lock();
+    defer upstream.mutex.unlock();
+    try std.testing.expectEqual(@as(u32, 1), upstream.capture.request_count);
+    try std.testing.expectEqualStrings("/quic-location", upstream.capture.path);
+}
+
 test "http3 integration proxies chat over quic" {
     if (!build_options.enable_http3_ngtcp2) return error.SkipZigTest;
     std.fs.accessAbsolute(http3_curl_path, .{}) catch return error.SkipZigTest;
@@ -4748,4 +4796,143 @@ test "graceful shutdown integration exits promptly after drain completes" {
     const log_data = try std.fs.cwd().readFileAlloc(allocator, tardigrade.log_path, 256 * 1024);
     defer allocator.free(log_data);
     try assertContains(log_data, "Graceful shutdown complete");
+}
+
+test "location blocks integration routes requests to matching upstreams" {
+    const allocator = std.testing.allocator;
+
+    const exact_responses = [_]UpstreamResponseSpec{.{ .body = "exact-upstream" }};
+    const prefix_responses = [_]UpstreamResponseSpec{.{ .body = "prefix-upstream" }};
+    const regex_responses = [_]UpstreamResponseSpec{.{ .body = "regex-upstream" }};
+
+    var exact_upstream = try UpstreamServer.start(allocator, &exact_responses);
+    defer exact_upstream.stop();
+    try exact_upstream.run();
+
+    var prefix_upstream = try UpstreamServer.start(allocator, &prefix_responses);
+    defer prefix_upstream.stop();
+    try prefix_upstream.run();
+
+    var regex_upstream = try UpstreamServer.start(allocator, &regex_responses);
+    defer regex_upstream.stop();
+    try regex_upstream.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location = /exact {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+        \\location ^~ /prefix/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+        \\location ~ ^/re/(.*)$ {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+    , .{
+        test_host, exact_upstream.port(),
+        test_host, prefix_upstream.port(),
+        test_host, regex_upstream.port(),
+    });
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .upstream_port = null,
+        .auth_token_hashes = null,
+        .config_text = config_text,
+    });
+    defer tardigrade.stop();
+
+    var exact_response = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/exact",
+        .body = null,
+        .headers = &.{},
+    });
+    defer exact_response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), exact_response.status_code);
+    try std.testing.expectEqualStrings("exact-upstream", exact_response.body);
+
+    var prefix_response = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/prefix/item",
+        .body = null,
+        .headers = &.{},
+    });
+    defer prefix_response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), prefix_response.status_code);
+    try std.testing.expectEqualStrings("prefix-upstream", prefix_response.body);
+
+    var regex_response = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/re/value",
+        .body = null,
+        .headers = &.{},
+    });
+    defer regex_response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), regex_response.status_code);
+    try std.testing.expectEqualStrings("regex-upstream", regex_response.body);
+
+    try std.testing.expectEqual(@as(u32, 1), exact_upstream.capture.request_count);
+    try std.testing.expectEqual(@as(u32, 1), prefix_upstream.capture.request_count);
+    try std.testing.expectEqual(@as(u32, 1), regex_upstream.capture.request_count);
+}
+
+test "location block reload takes effect for new requests after sighup" {
+    const allocator = std.testing.allocator;
+
+    const first_responses = [_]UpstreamResponseSpec{.{ .body = "first-location" }};
+    const second_responses = [_]UpstreamResponseSpec{.{ .body = "second-location" }};
+
+    var first_upstream = try UpstreamServer.start(allocator, &first_responses);
+    defer first_upstream.stop();
+    try first_upstream.run();
+
+    var second_upstream = try UpstreamServer.start(allocator, &second_responses);
+    defer second_upstream.stop();
+    try second_upstream.run();
+
+    const initial_config = try std.fmt.allocPrint(allocator,
+        \\location /dynamic/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+    , .{ test_host, first_upstream.port() });
+    defer allocator.free(initial_config);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .upstream_port = null,
+        .auth_token_hashes = null,
+        .config_text = initial_config,
+    });
+    defer tardigrade.stop();
+
+    var first_response = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/dynamic/test",
+        .body = null,
+        .headers = &.{},
+    });
+    defer first_response.deinit();
+    try std.testing.expectEqualStrings("first-location", first_response.body);
+
+    const updated_config = try std.fmt.allocPrint(allocator,
+        \\location /dynamic/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+    , .{ test_host, second_upstream.port() });
+    defer allocator.free(updated_config);
+
+    try tardigrade.rewriteConfig(updated_config);
+    tardigrade.sendSignal(std.posix.SIG.HUP);
+    std.time.sleep(300 * std.time.ns_per_ms);
+
+    var second_response = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/dynamic/test",
+        .body = null,
+        .headers = &.{},
+    });
+    defer second_response.deinit();
+    try std.testing.expectEqualStrings("second-location", second_response.body);
+
+    try std.testing.expectEqual(@as(u32, 1), first_upstream.capture.request_count);
+    try std.testing.expectEqual(@as(u32, 1), second_upstream.capture.request_count);
 }

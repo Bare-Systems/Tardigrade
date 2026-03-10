@@ -274,34 +274,47 @@ This makes Tardigrade useful only as the Bare Labs gateway, not as a general ngi
 
 ### 6.0 Location Block Data Model
 
-- [ ] `LocationBlock` struct: match type (prefix, exact, regex, case-insensitive regex),
+- [x] `LocationBlock` struct: match type (prefix, exact, regex, case-insensitive regex),
       pattern, priority, and action (proxy_pass, fastcgi_pass, return, rewrite, static root)
-- [ ] Location match precedence following nginx rules:
+- [x] Location match precedence following nginx rules:
       exact (`=`) > longest prefix (`^~`) > regex (first match) > prefix (longest match)
-- [ ] Location blocks loaded from config file at startup and on SIGHUP
+- [~] Location blocks loaded from config file at startup and on SIGHUP
+      Current state: `EdgeConfig` now loads serialized location blocks from
+      `TARDIGRADE_LOCATION_BLOCKS`; nginx-style `location { ... }` config-file parsing is still open in 6.1.
 
 ### 6.1 Config File Integration
 
-- [ ] `location` block parsing in `config_file.zig`
-- [ ] `proxy_pass` directive inside location blocks
-- [ ] `root`, `alias` directives for static file roots
-- [ ] `index` directive (directory index files)
-- [ ] `try_files` directive
+- [x] `location` block parsing in `config_file.zig`
+- [x] `proxy_pass` directive inside location blocks
+- [x] `root`, `alias` directives for static file roots
+- [x] `index` directive (directory index files)
+- [x] `try_files` directive
+      Current state: parser/runtime wiring is complete and serializes to `TARDIGRADE_LOCATION_BLOCKS`;
+      gateway dispatch still uses the existing hardcoded route chain until 6.2.
 
 ### 6.2 Router Integration in edge_gateway.zig
 
-- [ ] Replace hardcoded route chains in `handleConnection()` with a lookup into the
+- [~] Replace hardcoded route chains in `handleConnection()` with a lookup into the
       loaded `LocationBlock` table
-- [ ] Preserve existing `/v1/chat`, `/v1/commands` etc. as default location blocks
+      Current state: configured location blocks are dispatched first; simple built-in
+      routes (health, metrics, admin metadata, device/session/cache endpoints,
+      command status, approvals endpoints) now execute directly from the matcher,
+      while the remaining API routes still fall back to the legacy hardcoded chain.
+- [x] Preserve existing `/v1/chat`, `/v1/commands` etc. as default location blocks
       auto-injected when gateway-mode env vars are present
-- [ ] `matchLocation(request_uri) LocationBlock` function — testable in isolation
+      Current state: core built-in routes are now synthesized into the location matcher;
+      simple built-ins, device/session/cache endpoints, command status, and approvals
+      endpoints execute directly there, while the remaining API routes still intentionally
+      fall through until the migration is complete.
+- [x] `matchLocation(request_uri) LocationBlock` function — testable in isolation
 
 ### 6.3 Tests
 
-- [ ] Unit test: exact match `= /health` takes priority over prefix match `/heal`
-- [ ] Unit test: regex match `/api/(.*)` routes correctly
-- [ ] Integration test: config with three location blocks routes requests to correct upstreams
-- [ ] Integration test: SIGHUP with updated location blocks takes effect for new requests
+- [x] Unit test: exact match `= /health` takes priority over prefix match `/heal`
+- [x] Unit test: regex match `/api/(.*)` routes correctly
+- [x] Integration test: config with three location blocks routes requests to correct upstreams
+- [x] Integration test: SIGHUP with updated location blocks takes effect for new requests
+- [x] Integration test: HTTP/3 request honors configured location-block routing
 
 ---
 

@@ -61,6 +61,7 @@ pub const EdgeConfig = struct {
     pub const RewriteRule = http.rewrite.RewriteRule;
     pub const ReturnRule = http.rewrite.ReturnRule;
     pub const ConditionalRule = http.rewrite.ConditionalRule;
+    pub const LocationBlock = http.location_router.LocationBlock;
     pub const InternalRedirectRule = struct {
         method: []const u8,
         pattern: []const u8,
@@ -319,6 +320,8 @@ pub const EdgeConfig = struct {
     return_rules: []ReturnRule,
     /// Conditional inline `if (...) return|rewrite` rules.
     conditional_rules: []ConditionalRule,
+    /// Location blocks loaded from env/config for nginx-style route matching.
+    location_blocks: []LocationBlock,
     /// Internal redirect rules evaluated before route dispatch.
     internal_redirect_rules: []InternalRedirectRule,
     /// Named location map for redirect targets prefixed with '@'.
@@ -452,6 +455,10 @@ pub const EdgeConfig = struct {
             }
         }
         allocator.free(self.conditional_rules);
+        for (self.location_blocks) |*block| {
+            block.deinit(allocator);
+        }
+        allocator.free(self.location_blocks);
         for (self.internal_redirect_rules) |rule| {
             allocator.free(rule.method);
             allocator.free(rule.pattern);
@@ -1027,6 +1034,15 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         }
         allocator.free(conditional_rules);
     }
+    const location_blocks_raw = envOrDefault(allocator, "TARDIGRADE_LOCATION_BLOCKS", "") catch unreachable;
+    defer allocator.free(location_blocks_raw);
+    const location_blocks = try parseLocationBlocks(allocator, location_blocks_raw);
+    errdefer {
+        for (location_blocks) |*block| {
+            block.deinit(allocator);
+        }
+        allocator.free(location_blocks);
+    }
     const internal_redirects_raw = envOrDefault(allocator, "TARDIGRADE_INTERNAL_REDIRECT_RULES", "") catch unreachable;
     defer allocator.free(internal_redirects_raw);
     const internal_redirect_rules = try parseInternalRedirectRules(allocator, internal_redirects_raw);
@@ -1243,6 +1259,7 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .rewrite_rules = rewrite_rules,
         .return_rules = return_rules,
         .conditional_rules = conditional_rules,
+        .location_blocks = location_blocks,
         .internal_redirect_rules = internal_redirect_rules,
         .named_locations = named_locations,
         .mirror_rules = mirror_rules,
@@ -1657,6 +1674,100 @@ fn parseConditionalRules(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeC
     return out.toOwnedSlice();
 }
 
+fn parseLocationBlocks(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeConfig.LocationBlock {
+    var out = std.ArrayList(EdgeConfig.LocationBlock).init(allocator);
+    errdefer {
+        for (out.items) |*block| {
+            block.deinit(allocator);
+        }
+        out.deinit();
+    }
+
+    var it = std.mem.splitScalar(u8, raw, ';');
+    var priority: usize = 0;
+    while (it.next()) |entry_raw| : (priority += 1) {
+        const entry = std.mem.trim(u8, entry_raw, " \t\r\n");
+        if (entry.len == 0) continue;
+
+        var fields = std.mem.splitScalar(u8, entry, '|');
+        const match_type_raw = fields.next() orelse return error.InvalidLocationBlockFormat;
+        const pattern_raw = fields.next() orelse return error.InvalidLocationBlockFormat;
+        const action_kind_raw = fields.next() orelse return error.InvalidLocationBlockFormat;
+
+        const match_type = http.location_router.MatchType.parse(std.mem.trim(u8, match_type_raw, " \t\r\n")) orelse return error.InvalidLocationBlockFormat;
+        const pattern = std.mem.trim(u8, pattern_raw, " \t\r\n");
+        const action_kind = std.mem.trim(u8, action_kind_raw, " \t\r\n");
+        if (pattern.len == 0 or action_kind.len == 0) return error.InvalidLocationBlockFormat;
+
+        var action: http.location_router.Action = undefined;
+        if (std.ascii.eqlIgnoreCase(action_kind, "proxy_pass")) {
+            const target_raw = fields.next() orelse return error.InvalidLocationBlockFormat;
+            if (fields.next() != null) return error.InvalidLocationBlockFormat;
+            const target = std.mem.trim(u8, target_raw, " \t\r\n");
+            if (target.len == 0) return error.InvalidLocationBlockFormat;
+            action = .{ .proxy_pass = try allocator.dupe(u8, target) };
+        } else if (std.ascii.eqlIgnoreCase(action_kind, "fastcgi_pass")) {
+            const target_raw = fields.next() orelse return error.InvalidLocationBlockFormat;
+            if (fields.next() != null) return error.InvalidLocationBlockFormat;
+            const target = std.mem.trim(u8, target_raw, " \t\r\n");
+            if (target.len == 0) return error.InvalidLocationBlockFormat;
+            action = .{ .fastcgi_pass = try allocator.dupe(u8, target) };
+        } else if (std.ascii.eqlIgnoreCase(action_kind, "return")) {
+            const status_raw = fields.next() orelse return error.InvalidLocationBlockFormat;
+            const body_raw = fields.next() orelse return error.InvalidLocationBlockFormat;
+            if (fields.next() != null) return error.InvalidLocationBlockFormat;
+            const status = std.fmt.parseInt(u16, std.mem.trim(u8, status_raw, " \t\r\n"), 10) catch return error.InvalidLocationBlockFormat;
+            action = .{ .return_response = .{
+                .status = status,
+                .body = try allocator.dupe(u8, std.mem.trim(u8, body_raw, " \t\r\n")),
+            } };
+        } else if (std.ascii.eqlIgnoreCase(action_kind, "rewrite")) {
+            const replacement_raw = fields.next() orelse return error.InvalidLocationBlockFormat;
+            const flag_raw = fields.next() orelse return error.InvalidLocationBlockFormat;
+            if (fields.next() != null) return error.InvalidLocationBlockFormat;
+            const replacement = std.mem.trim(u8, replacement_raw, " \t\r\n");
+            const flag = http.rewrite.RewriteFlag.parse(std.mem.trim(u8, flag_raw, " \t\r\n")) orelse return error.InvalidLocationBlockFormat;
+            if (replacement.len == 0) return error.InvalidLocationBlockFormat;
+            action = .{ .rewrite = .{
+                .replacement = try allocator.dupe(u8, replacement),
+                .flag = flag,
+            } };
+        } else if (std.ascii.eqlIgnoreCase(action_kind, "static_root")) {
+            const root_raw = fields.next() orelse return error.InvalidLocationBlockFormat;
+            const alias_raw = fields.next() orelse return error.InvalidLocationBlockFormat;
+            const index_raw = fields.next() orelse return error.InvalidLocationBlockFormat;
+            const try_files_raw = fields.next() orelse return error.InvalidLocationBlockFormat;
+            if (fields.next() != null) return error.InvalidLocationBlockFormat;
+            const root = std.mem.trim(u8, root_raw, " \t\r\n");
+            if (root.len == 0) return error.InvalidLocationBlockFormat;
+            const alias = parseBoolish(std.mem.trim(u8, alias_raw, " \t\r\n")) orelse return error.InvalidLocationBlockFormat;
+            action = .{ .static_root = .{
+                .root = try allocator.dupe(u8, root),
+                .alias = alias,
+                .index = try allocator.dupe(u8, std.mem.trim(u8, index_raw, " \t\r\n")),
+                .try_files = try allocator.dupe(u8, std.mem.trim(u8, try_files_raw, " \t\r\n")),
+            } };
+        } else {
+            return error.InvalidLocationBlockFormat;
+        }
+
+        try out.append(.{
+            .match_type = match_type,
+            .pattern = try allocator.dupe(u8, pattern),
+            .priority = priority,
+            .action = action,
+        });
+    }
+
+    return out.toOwnedSlice();
+}
+
+fn parseBoolish(raw: []const u8) ?bool {
+    if (std.ascii.eqlIgnoreCase(raw, "1") or std.ascii.eqlIgnoreCase(raw, "true") or std.ascii.eqlIgnoreCase(raw, "on") or std.ascii.eqlIgnoreCase(raw, "yes")) return true;
+    if (std.ascii.eqlIgnoreCase(raw, "0") or std.ascii.eqlIgnoreCase(raw, "false") or std.ascii.eqlIgnoreCase(raw, "off") or std.ascii.eqlIgnoreCase(raw, "no")) return false;
+    return null;
+}
+
 fn parseInternalRedirectRules(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeConfig.InternalRedirectRule {
     var out = std.ArrayList(EdgeConfig.InternalRedirectRule).init(allocator);
     errdefer {
@@ -1916,6 +2027,35 @@ test "parse conditional rules csv" {
     try std.testing.expectEqual(http.rewrite.ConditionalVariable.http_host, rules[1].variable);
     switch (rules[1].action) {
         .returned => |ret| try std.testing.expectEqual(@as(u16, 301), ret.status),
+        else => return error.UnexpectedTestResult,
+    }
+}
+
+test "parse location blocks csv" {
+    const allocator = std.testing.allocator;
+    const blocks = try parseLocationBlocks(
+        allocator,
+        "exact|/health|return|200|ok;prefix_priority|/api/private/|proxy_pass|http://127.0.0.1:9001;regex_case_insensitive|^/assets/.*$|static_root|/srv/www|on|index.html|$uri",
+    );
+    defer {
+        for (blocks) |*block| {
+            block.deinit(allocator);
+        }
+        allocator.free(blocks);
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), blocks.len);
+    try std.testing.expectEqual(http.location_router.MatchType.exact, blocks[0].match_type);
+    try std.testing.expectEqual(@as(usize, 1), blocks[1].priority);
+    switch (blocks[0].action) {
+        .return_response => |response| try std.testing.expectEqual(@as(u16, 200), response.status),
+        else => return error.UnexpectedTestResult,
+    }
+    switch (blocks[2].action) {
+        .static_root => |root| {
+            try std.testing.expect(root.alias);
+            try std.testing.expectEqualStrings("index.html", root.index);
+        },
         else => return error.UnexpectedTestResult,
     }
 }

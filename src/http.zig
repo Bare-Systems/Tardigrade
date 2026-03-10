@@ -51,6 +51,7 @@ pub const quic_stub = @import("http/quic_stub.zig");
 pub const websocket = @import("http/websocket.zig");
 pub const event_hub = @import("http/event_hub.zig");
 pub const rewrite = @import("http/rewrite.zig");
+pub const location_router = @import("http/location_router.zig");
 pub const fastcgi = @import("http/fastcgi.zig");
 pub const uwsgi = @import("http/uwsgi.zig");
 pub const scgi = @import("http/scgi.zig");

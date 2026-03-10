@@ -79,6 +79,14 @@
   - Added `return` directive parsing and redirect semantics, including `$request_uri` expansion and config-driven integration coverage for `return 301 https://example.com$request_uri`.
   - Added named capture substitution support in rewrite patterns, translating `(?P<name>...)` groups into POSIX-regex captures internally and expanding `$name` in replacements.
   - Added the first conditional rewrite/return support for inline `if (...)` directives with `$http_host`, `$request_uri`, and `$args` matching, including case-insensitive `~*` conditions.
+  - Added the Upgrade 6 location-router foundation with a standalone nginx-style location matcher, `LocationBlock` runtime data model, serialized `TARDIGRADE_LOCATION_BLOCKS` loading, and unit coverage for exact/prefix/regex precedence.
+  - Added `location { ... }` block parsing in `src/http/config_file.zig`, including `proxy_pass`, `fastcgi_pass`, `root`, `alias`, `index`, `try_files`, `return`, and `rewrite` serialization into the new location-table config path.
+  - Added the first live location-dispatch hook in `src/edge_gateway.zig`, routing configured `location` blocks before the legacy hardcoded chain and adding integration coverage for three-block routing plus SIGHUP location reload.
+  - Added synthesized built-in location blocks for the core gateway routes (`/health`, metrics, admin metadata, `/v1/chat`, `/v1/commands`, `/v1/commands/status`) so configured and built-in routes now share the same matcher table during the Upgrade 6 migration.
+  - Added direct matcher-backed execution for simple built-in HTTP/1 routes (health, metrics, and admin metadata) plus an HTTP/3 location-matcher entry point with live QUIC coverage for configured `location`-block proxy routing.
+  - Added shared matcher-backed dispatch for `/v1/devices/register`, `/v1/sessions`, `/v1/sessions/refresh`, and `/v1/cache/purge` so those endpoints now execute through the same built-in location table on both HTTP/1 and HTTP/3.
+  - Added shared matcher-backed dispatch for `/v1/commands/status` and the approvals routes (`/v1/approvals/request`, `/v1/approvals/respond`, `/v1/approvals/status`) so those endpoints now execute through the same built-in location table on both HTTP/1 and HTTP/3.
+  - Added shared bearer-or-session identity resolution for `/v1/chat` and `/v1/commands`, so the remaining HTTP/1 and HTTP/3 route splits now differ mainly in execution behavior instead of auth/control-flow logic.
 
 ### Fixed
 - Upgrade 1 integration hardening in the live gateway path:

@@ -3194,6 +3194,11 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         return;
     }
 
+    if (try routeConfiguredLocation(allocator, writer, cfg, state, &ctx, &request, correlation_id, keep_alive, client_ip)) |status| {
+        logAccess(&ctx, request.method.toString(), request.uri.path, status, request.headers.get("user-agent") orelse "");
+        return;
+    }
+
     // --- Health endpoint ---
     if (request.method == .GET and std.mem.eql(u8, request.uri.path, "/health")) {
         var response = http.Response.init(allocator);
@@ -4241,26 +4246,13 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
     // --- POST /v1/commands (structured command routing) ---
     if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/commands")) {
         // --- Auth (bearer token or session token) ---
-        var cmd_authenticated = false;
-        const cmd_auth_result = authorizeRequest(cfg, &request.headers);
-        if (cmd_auth_result.ok) {
-            ctx.setIdentity(cmd_auth_result.token_hash orelse "-");
-            cmd_authenticated = true;
-        }
-        if (!cmd_authenticated) {
-            if (http.session.fromHeaders(&request.headers)) |session_token| {
-                if (state.validateSessionIdentity(allocator, session_token)) |identity| {
-                    defer allocator.free(identity);
-                    ctx.setIdentity(identity);
-                    cmd_authenticated = true;
-                }
-            }
-        }
-        if (!cmd_authenticated) {
+        var resolved_identity = resolveRequestIdentity(allocator, cfg, state, &request.headers) orelse {
             try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, keep_alive, state);
             logAccess(&ctx, request.method.toString(), "/v1/commands", 401, request.headers.get("user-agent") orelse "");
             return;
-        }
+        };
+        defer resolved_identity.deinit(allocator);
+        ctx.setIdentity(resolved_identity.value);
 
         // --- Content-Type validation ---
         if (!isJsonContentType(request.contentType())) {
@@ -4640,28 +4632,13 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         }
 
         // --- Auth (bearer token or session token) ---
-        var authenticated = false;
-        // Try bearer token first
-        const auth_result = authorizeRequest(cfg, &request.headers);
-        if (auth_result.ok) {
-            ctx.setIdentity(auth_result.token_hash orelse "-");
-            authenticated = true;
-        }
-        // Fall back to session token
-        if (!authenticated) {
-            if (http.session.fromHeaders(&request.headers)) |session_token| {
-                if (state.validateSessionIdentity(allocator, session_token)) |identity| {
-                    defer allocator.free(identity);
-                    ctx.setIdentity(identity);
-                    authenticated = true;
-                }
-            }
-        }
-        if (!authenticated) {
+        var resolved_identity = resolveRequestIdentity(allocator, cfg, state, &request.headers) orelse {
             try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, keep_alive, state);
             logAccess(&ctx, request.method.toString(), "/v1/chat", 401, request.headers.get("user-agent") orelse "");
             return;
-        }
+        };
+        defer resolved_identity.deinit(allocator);
+        ctx.setIdentity(resolved_identity.value);
 
         // --- Content-Type validation ---
         if (!isJsonContentType(request.contentType())) {
@@ -4908,6 +4885,1033 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
 
     try sendApiError(allocator, writer, .not_found, "invalid_request", "Not Found", correlation_id, keep_alive, state);
     logAccess(&ctx, request.method.toString(), request.uri.path, 404, request.headers.get("user-agent") orelse "");
+}
+
+fn routeConfiguredLocation(
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    cfg: *const edge_config.EdgeConfig,
+    state: *GatewayState,
+    ctx: *http.request_context.RequestContext,
+    request: *http.Request,
+    correlation_id: []const u8,
+    keep_alive: bool,
+    client_ip: []const u8,
+) !?u16 {
+    const matched = matchEffectiveLocation(cfg, request.uri.path) orelse return null;
+
+    switch (matched.block.action) {
+        .builtin_route => |route| {
+            return try dispatchBuiltinRouteHttp1(allocator, writer, cfg, state, ctx, request, correlation_id, keep_alive, client_ip, route);
+        },
+        .proxy_pass => |target| {
+            return try handleLocationProxyPass(allocator, writer, cfg, state, request, target, correlation_id, keep_alive, client_ip, ctx.identity);
+        },
+        .fastcgi_pass => |upstream| {
+            return try handleFastcgiRoute(allocator, writer, cfg, upstream, request, client_ip, correlation_id, keep_alive, state);
+        },
+        .return_response => |ret| {
+            if (ret.status >= 300 and ret.status < 400 and ret.body.len > 0) {
+                var response = http.Response.redirect(allocator, ret.body, @enumFromInt(ret.status));
+                defer response.deinit();
+                _ = response.setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
+                applyResponseHeaders(state, &response);
+                try response.write(writer);
+            } else {
+                var response = http.Response.init(allocator);
+                defer response.deinit();
+                _ = response.setStatus(@enumFromInt(ret.status))
+                    .setBody(ret.body)
+                    .setContentType("text/plain; charset=utf-8")
+                    .setConnection(keep_alive)
+                    .setHeader(http.correlation.HEADER_NAME, correlation_id);
+                applyResponseHeaders(state, &response);
+                try response.write(writer);
+            }
+            state.metricsRecord(ret.status);
+            return ret.status;
+        },
+        .rewrite => |rw| {
+            request.uri.path = rw.replacement;
+            return null;
+        },
+        .static_root => |root_cfg| {
+            return try handleStaticLocation(allocator, writer, request, matched, root_cfg, correlation_id, keep_alive, state);
+        },
+    }
+}
+
+fn matchEffectiveLocation(cfg: *const edge_config.EdgeConfig, path: []const u8) ?http.location_router.MatchResult {
+    var builtin_blocks = buildBuiltinLocationBlocks(cfg);
+    return http.location_router.matchLocation(path, cfg.location_blocks) orelse
+        http.location_router.matchLocation(path, builtin_blocks[0..]);
+}
+
+fn buildBuiltinLocationBlocks(cfg: *const edge_config.EdgeConfig) [20]http.location_router.LocationBlock {
+    return .{
+        .{ .match_type = .exact, .pattern = "/health", .priority = 0, .action = .{ .builtin_route = .health } },
+        .{ .match_type = .exact, .pattern = "/metrics", .priority = 1, .action = .{ .builtin_route = .metrics } },
+        .{ .match_type = .exact, .pattern = "/metrics/json", .priority = 2, .action = .{ .builtin_route = .metrics_json } },
+        .{ .match_type = .exact, .pattern = "/metrics/prometheus", .priority = 3, .action = .{ .builtin_route = .metrics_prometheus } },
+        .{ .match_type = .exact, .pattern = "/admin/routes", .priority = 4, .action = .{ .builtin_route = .admin_routes } },
+        .{ .match_type = .exact, .pattern = "/admin/connections", .priority = 5, .action = .{ .builtin_route = .admin_connections } },
+        .{ .match_type = .exact, .pattern = "/admin/streams", .priority = 6, .action = .{ .builtin_route = .admin_streams } },
+        .{ .match_type = .exact, .pattern = "/admin/upstreams", .priority = 7, .action = .{ .builtin_route = .admin_upstreams } },
+        .{ .match_type = .exact, .pattern = "/admin/certs", .priority = 8, .action = .{ .builtin_route = .admin_certs } },
+        .{ .match_type = .exact, .pattern = "/admin/auth-registry", .priority = 9, .action = .{ .builtin_route = .admin_auth_registry } },
+        .{ .match_type = .exact, .pattern = cfg.proxy_pass_chat, .priority = 10, .action = .{ .builtin_route = .v1_chat } },
+        .{ .match_type = .exact, .pattern = "/v1/commands", .priority = 11, .action = .{ .builtin_route = .v1_commands } },
+        .{ .match_type = .exact, .pattern = "/v1/commands/status", .priority = 12, .action = .{ .builtin_route = .v1_commands_status } },
+        .{ .match_type = .exact, .pattern = "/v1/approvals/request", .priority = 13, .action = .{ .builtin_route = .v1_approvals_request } },
+        .{ .match_type = .exact, .pattern = "/v1/approvals/respond", .priority = 14, .action = .{ .builtin_route = .v1_approvals_respond } },
+        .{ .match_type = .exact, .pattern = "/v1/approvals/status", .priority = 15, .action = .{ .builtin_route = .v1_approvals_status } },
+        .{ .match_type = .exact, .pattern = "/v1/devices/register", .priority = 16, .action = .{ .builtin_route = .v1_devices_register } },
+        .{ .match_type = .exact, .pattern = "/v1/sessions/refresh", .priority = 17, .action = .{ .builtin_route = .v1_sessions_refresh } },
+        .{ .match_type = .exact, .pattern = "/v1/sessions", .priority = 18, .action = .{ .builtin_route = .v1_sessions } },
+        .{ .match_type = .exact, .pattern = "/v1/cache/purge", .priority = 19, .action = .{ .builtin_route = .v1_cache_purge } },
+    };
+}
+
+const BuiltinJsonReply = struct {
+    status: http.Status,
+    body: ?[]const u8,
+    session_header: ?[]const u8 = null,
+    identity: ?[]const u8 = null,
+
+    fn deinit(self: *BuiltinJsonReply, allocator: std.mem.Allocator) void {
+        if (self.body) |body| allocator.free(body);
+        if (self.session_header) |header| allocator.free(header);
+        self.* = undefined;
+    }
+
+    fn takeBody(self: *BuiltinJsonReply) []const u8 {
+        const body = self.body.?;
+        self.body = null;
+        return body;
+    }
+};
+
+const ResolvedIdentity = struct {
+    value: []const u8,
+    owned: bool = false,
+
+    fn deinit(self: *ResolvedIdentity, allocator: std.mem.Allocator) void {
+        if (self.owned) allocator.free(self.value);
+        self.* = undefined;
+    }
+};
+
+fn handleDeviceRegisterBuiltin(
+    allocator: std.mem.Allocator,
+    cfg: *const edge_config.EdgeConfig,
+    state: *GatewayState,
+    headers: *const http.Headers,
+    body: []const u8,
+    correlation_id: []const u8,
+) !BuiltinJsonReply {
+    _ = state;
+    if (cfg.device_registry_path.len == 0) {
+        return .{
+            .status = .not_implemented,
+            .body = try buildApiErrorJson(allocator, "tool_unavailable", "Device registry not configured", correlation_id),
+        };
+    }
+    const auth_result = authorizeRequest(cfg, headers);
+    if (!auth_result.ok) {
+        return .{
+            .status = .unauthorized,
+            .body = try buildApiErrorJson(allocator, "unauthorized", "Unauthorized", correlation_id),
+        };
+    }
+    const reg = parseDeviceRegistration(allocator, body) catch {
+        return .{
+            .status = .bad_request,
+            .body = try buildApiErrorJson(allocator, "invalid_request", "Invalid device registration payload", correlation_id),
+        };
+    };
+    defer {
+        allocator.free(reg.device_id);
+        allocator.free(reg.public_key);
+    }
+    registerDeviceIdentity(cfg.device_registry_path, reg.device_id, reg.public_key) catch {
+        return .{
+            .status = .internal_server_error,
+            .body = try buildApiErrorJson(allocator, "internal_error", "Failed to persist device identity", correlation_id),
+        };
+    };
+    return .{
+        .status = .created,
+        .body = try allocator.dupe(u8, "{\"registered\":true}"),
+        .identity = auth_result.token_hash,
+    };
+}
+
+fn handleSessionsBuiltin(
+    allocator: std.mem.Allocator,
+    cfg: *const edge_config.EdgeConfig,
+    state: *GatewayState,
+    method: []const u8,
+    headers: *const http.Headers,
+    body: []const u8,
+    client_label: []const u8,
+    correlation_id: []const u8,
+) !BuiltinJsonReply {
+    if (state.session_store == null) {
+        return .{
+            .status = .not_found,
+            .body = try buildApiErrorJson(allocator, "invalid_request", "Sessions not enabled", correlation_id),
+        };
+    }
+
+    if (std.mem.eql(u8, method, "POST")) {
+        const auth_result = authorizeRequest(cfg, headers);
+        if (!auth_result.ok) {
+            return .{
+                .status = .unauthorized,
+                .body = try buildApiErrorJson(allocator, "unauthorized", "Unauthorized", correlation_id),
+            };
+        }
+
+        var device_id: ?[]const u8 = null;
+        if (body.len > 0 and isJsonContentType(headers.get("content-type"))) {
+            device_id = parseDeviceId(allocator, body) catch null;
+        }
+        defer if (device_id) |value| allocator.free(value);
+
+        const session_token = state.createSession(allocator, auth_result.token_hash orelse "-", client_label, device_id) catch |err| {
+            const msg = switch (err) {
+                error.TooManySessions => "Too many active sessions",
+                else => "Session creation failed",
+            };
+            return .{
+                .status = .too_many_requests,
+                .body = try buildApiErrorJson(allocator, "rate_limited", msg, correlation_id),
+                .identity = auth_result.token_hash,
+            };
+        };
+        errdefer allocator.free(session_token);
+
+        return .{
+            .status = .created,
+            .body = try std.fmt.allocPrint(allocator, "{{\"session_token\":\"{s}\"}}", .{session_token}),
+            .session_header = session_token,
+            .identity = auth_result.token_hash,
+        };
+    }
+
+    if (std.mem.eql(u8, method, "DELETE")) {
+        const session_token = http.session.fromHeaders(headers) orelse {
+            return .{
+                .status = .bad_request,
+                .body = try buildApiErrorJson(allocator, "invalid_request", "Missing or invalid X-Session-Token", correlation_id),
+            };
+        };
+        const revoked = state.revokeSession(session_token);
+        return .{
+            .status = .ok,
+            .body = try allocator.dupe(u8, if (revoked) "{\"revoked\":true}" else "{\"revoked\":false}"),
+        };
+    }
+
+    if (std.mem.eql(u8, method, "GET")) {
+        const auth_result = authorizeRequest(cfg, headers);
+        if (!auth_result.ok) {
+            return .{
+                .status = .unauthorized,
+                .body = try buildApiErrorJson(allocator, "unauthorized", "Unauthorized", correlation_id),
+            };
+        }
+        const active_sessions = state.countSessionsByIdentity(allocator, auth_result.token_hash orelse "-") catch {
+            return .{
+                .status = .internal_server_error,
+                .body = try buildApiErrorJson(allocator, "internal_error", "Failed to list sessions", correlation_id),
+                .identity = auth_result.token_hash,
+            };
+        };
+        return .{
+            .status = .ok,
+            .body = try std.fmt.allocPrint(allocator, "{{\"active_sessions\":{d}}}", .{active_sessions}),
+            .identity = auth_result.token_hash,
+        };
+    }
+
+    return .{
+        .status = .not_found,
+        .body = try buildApiErrorJson(allocator, "invalid_request", "Not Found", correlation_id),
+    };
+}
+
+fn handleSessionRefreshBuiltin(
+    allocator: std.mem.Allocator,
+    cfg: *const edge_config.EdgeConfig,
+    state: *GatewayState,
+    headers: *const http.Headers,
+    client_label: []const u8,
+    correlation_id: []const u8,
+) !BuiltinJsonReply {
+    if (state.session_store == null) {
+        return .{
+            .status = .not_found,
+            .body = try buildApiErrorJson(allocator, "invalid_request", "Sessions not enabled", correlation_id),
+        };
+    }
+    const session_token = http.session.fromHeaders(headers) orelse {
+        return .{
+            .status = .bad_request,
+            .body = try buildApiErrorJson(allocator, "invalid_request", "Missing or invalid X-Session-Token", correlation_id),
+        };
+    };
+    const refreshed = state.refreshSession(allocator, session_token, client_label) catch {
+        return .{
+            .status = .unauthorized,
+            .body = try buildApiErrorJson(allocator, "unauthorized", "Invalid session token", correlation_id),
+        };
+    };
+    errdefer allocator.free(refreshed);
+    return .{
+        .status = .ok,
+        .body = try std.fmt.allocPrint(allocator, "{{\"session_token\":\"{s}\",\"access_ttl_seconds\":{d},\"refresh_ttl_seconds\":{d}}}", .{
+            refreshed,
+            cfg.access_token_ttl_seconds,
+            cfg.refresh_token_ttl_seconds,
+        }),
+        .session_header = refreshed,
+    };
+}
+
+fn handleCachePurgeBuiltin(
+    allocator: std.mem.Allocator,
+    cfg: *const edge_config.EdgeConfig,
+    state: *GatewayState,
+    headers: *const http.Headers,
+    body: []const u8,
+    correlation_id: []const u8,
+) !BuiltinJsonReply {
+    if (state.proxy_cache_store == null) {
+        return .{
+            .status = .not_found,
+            .body = try buildApiErrorJson(allocator, "invalid_request", "Proxy cache not enabled", correlation_id),
+        };
+    }
+    const auth_result = authorizeRequest(cfg, headers);
+    if (!auth_result.ok) {
+        return .{
+            .status = .unauthorized,
+            .body = try buildApiErrorJson(allocator, "unauthorized", "Unauthorized", correlation_id),
+        };
+    }
+
+    var purged: usize = 0;
+    if (body.len > 0) {
+        if (isJsonContentType(headers.get("content-type"))) {
+            if (parseCachePurgeKey(allocator, body)) |key| {
+                defer allocator.free(key);
+                purged = if (state.proxyCacheDelete(key)) 1 else 0;
+            } else |_| {
+                purged = state.proxyCachePurgeAll();
+            }
+        } else {
+            purged = state.proxyCachePurgeAll();
+        }
+    } else {
+        purged = state.proxyCachePurgeAll();
+    }
+
+    return .{
+        .status = .ok,
+        .body = try std.fmt.allocPrint(allocator, "{{\"purged\":{d}}}", .{purged}),
+        .identity = auth_result.token_hash,
+    };
+}
+
+fn resolveApprovalIdentity(
+    allocator: std.mem.Allocator,
+    cfg: *const edge_config.EdgeConfig,
+    state: *GatewayState,
+    headers: *const http.Headers,
+) !?[]const u8 {
+    const auth_result = authorizeRequest(cfg, headers);
+    if (auth_result.ok) return auth_result.token_hash orelse "-";
+    if (http.session.fromHeaders(headers)) |session_token| {
+        if (state.validateSessionIdentity(allocator, session_token)) |identity| {
+            defer allocator.free(identity);
+            return try allocator.dupe(u8, identity);
+        }
+    }
+    return null;
+}
+
+fn resolveRequestIdentity(
+    allocator: std.mem.Allocator,
+    cfg: *const edge_config.EdgeConfig,
+    state: *GatewayState,
+    headers: *const http.Headers,
+) ?ResolvedIdentity {
+    const auth_result = authorizeRequest(cfg, headers);
+    if (auth_result.ok) {
+        return .{ .value = auth_result.token_hash orelse "-" };
+    }
+    if (http.session.fromHeaders(headers)) |session_token| {
+        if (state.validateSessionIdentity(allocator, session_token)) |identity| {
+            return .{ .value = identity, .owned = true };
+        }
+    }
+    return null;
+}
+
+fn handleCommandStatusBuiltin(
+    allocator: std.mem.Allocator,
+    cfg: *const edge_config.EdgeConfig,
+    state: *GatewayState,
+    headers: *const http.Headers,
+    query: ?[]const u8,
+    correlation_id: []const u8,
+) !BuiltinJsonReply {
+    var authenticated = false;
+    const auth_result = authorizeRequest(cfg, headers);
+    if (auth_result.ok) authenticated = true;
+    if (!authenticated) {
+        if (http.session.fromHeaders(headers)) |session_token| {
+            if (state.validateSessionIdentity(allocator, session_token) != null) authenticated = true;
+        }
+    }
+    if (!authenticated) {
+        return .{
+            .status = .unauthorized,
+            .body = try buildApiErrorJson(allocator, "unauthorized", "Unauthorized", correlation_id),
+        };
+    }
+    const command_id = parseQueryParam(query orelse "", "command_id") orelse {
+        return .{
+            .status = .bad_request,
+            .body = try buildApiErrorJson(allocator, "invalid_request", "Missing command_id", correlation_id),
+        };
+    };
+    const snapshot = state.commandLifecycleSnapshotJson(allocator, command_id) orelse {
+        return .{
+            .status = .not_found,
+            .body = try buildApiErrorJson(allocator, "invalid_request", "Unknown command_id", correlation_id),
+        };
+    };
+    return .{
+        .status = .ok,
+        .body = @constCast(snapshot),
+    };
+}
+
+fn handleApprovalsRequestBuiltin(
+    allocator: std.mem.Allocator,
+    cfg: *const edge_config.EdgeConfig,
+    state: *GatewayState,
+    headers: *const http.Headers,
+    body: []const u8,
+    correlation_id: []const u8,
+) !BuiltinJsonReply {
+    const identity = (try resolveApprovalIdentity(allocator, cfg, state, headers)) orelse {
+        return .{
+            .status = .unauthorized,
+            .body = try buildApiErrorJson(allocator, "unauthorized", "Unauthorized", correlation_id),
+        };
+    };
+    defer if (!authorizeRequest(cfg, headers).ok) allocator.free(identity);
+    if (!isJsonContentType(headers.get("content-type"))) {
+        return .{
+            .status = .bad_request,
+            .body = try buildApiErrorJson(allocator, "invalid_request", "Content-Type must be application/json", correlation_id),
+        };
+    }
+    if (body.len == 0) {
+        return .{
+            .status = .bad_request,
+            .body = try buildApiErrorJson(allocator, "invalid_request", "Missing request body", correlation_id),
+            .identity = identity,
+        };
+    }
+    var approval_req = parseApprovalRequestBody(allocator, body) catch {
+        return .{
+            .status = .bad_request,
+            .body = try buildApiErrorJson(allocator, "invalid_request", "Invalid approval request payload", correlation_id),
+            .identity = identity,
+        };
+    };
+    defer approval_req.deinit(allocator);
+    if (!routeNeedsApproval(approval_req.method, approval_req.path, cfg.policy_approval_routes_raw) and
+        !routeRequiresApprovalRule(approval_req.method, approval_req.path, cfg.policy_rules_raw))
+    {
+        return .{
+            .status = .bad_request,
+            .body = try buildApiErrorJson(allocator, "invalid_request", "Route does not require approval", correlation_id),
+            .identity = identity,
+        };
+    }
+    const created = state.approvalCreate(allocator, approval_req.method, approval_req.path, identity, approval_req.command_id) catch {
+        return .{
+            .status = .internal_server_error,
+            .body = try buildApiErrorJson(allocator, "internal_error", "Failed to create approval request", correlation_id),
+            .identity = identity,
+        };
+    };
+    defer allocator.free(created.token);
+    _ = state.event_hub.publish("approvals.requests", body, http.event_loop.monotonicMs()) catch 0;
+    return .{
+        .status = .accepted,
+        .body = try std.fmt.allocPrint(allocator, "{{\"approval_token\":\"{s}\",\"status\":\"pending\",\"expires_ms\":{d},\"status_url\":\"/v1/approvals/status?approval_token={s}\"}}", .{
+            created.token,
+            created.expires_ms,
+            created.token,
+        }),
+        .identity = identity,
+    };
+}
+
+fn handleApprovalsRespondBuiltin(
+    allocator: std.mem.Allocator,
+    cfg: *const edge_config.EdgeConfig,
+    state: *GatewayState,
+    headers: *const http.Headers,
+    body: []const u8,
+    correlation_id: []const u8,
+) !BuiltinJsonReply {
+    const auth_result = authorizeRequest(cfg, headers);
+    if (!auth_result.ok) {
+        return .{
+            .status = .unauthorized,
+            .body = try buildApiErrorJson(allocator, "unauthorized", "Unauthorized", correlation_id),
+        };
+    }
+    if (!isJsonContentType(headers.get("content-type"))) {
+        return .{
+            .status = .bad_request,
+            .body = try buildApiErrorJson(allocator, "invalid_request", "Content-Type must be application/json", correlation_id),
+            .identity = auth_result.token_hash,
+        };
+    }
+    if (body.len == 0) {
+        return .{
+            .status = .bad_request,
+            .body = try buildApiErrorJson(allocator, "invalid_request", "Missing request body", correlation_id),
+            .identity = auth_result.token_hash,
+        };
+    }
+    var approval_resp = parseApprovalResponseBody(allocator, body) catch {
+        return .{
+            .status = .bad_request,
+            .body = try buildApiErrorJson(allocator, "invalid_request", "Invalid approval response payload", correlation_id),
+            .identity = auth_result.token_hash,
+        };
+    };
+    defer approval_resp.deinit(allocator);
+    if (!state.approvalRespond(approval_resp.token, approval_resp.decision, auth_result.token_hash orelse "-")) {
+        return .{
+            .status = .conflict,
+            .body = try buildApiErrorJson(allocator, "invalid_request", "Approval token not pending or not found", correlation_id),
+            .identity = auth_result.token_hash,
+        };
+    }
+    _ = state.event_hub.publish("approvals.responses", body, http.event_loop.monotonicMs()) catch 0;
+    return .{
+        .status = .ok,
+        .body = try std.fmt.allocPrint(allocator, "{{\"approval_token\":\"{s}\",\"status\":\"{s}\"}}", .{
+            approval_resp.token,
+            if (approval_resp.decision == .approve) "approved" else "denied",
+        }),
+        .identity = auth_result.token_hash,
+    };
+}
+
+fn handleApprovalsStatusBuiltin(
+    allocator: std.mem.Allocator,
+    cfg: *const edge_config.EdgeConfig,
+    state: *GatewayState,
+    headers: *const http.Headers,
+    query: ?[]const u8,
+    correlation_id: []const u8,
+) !BuiltinJsonReply {
+    const identity = (try resolveApprovalIdentity(allocator, cfg, state, headers)) orelse {
+        return .{
+            .status = .unauthorized,
+            .body = try buildApiErrorJson(allocator, "unauthorized", "Unauthorized", correlation_id),
+        };
+    };
+    defer if (!authorizeRequest(cfg, headers).ok) allocator.free(identity);
+    const approval_token = parseQueryParam(query orelse "", "approval_token") orelse {
+        return .{
+            .status = .bad_request,
+            .body = try buildApiErrorJson(allocator, "invalid_request", "Missing approval_token", correlation_id),
+            .identity = identity,
+        };
+    };
+    const snapshot = state.approvalSnapshotJson(allocator, approval_token) orelse {
+        return .{
+            .status = .not_found,
+            .body = try buildApiErrorJson(allocator, "invalid_request", "Unknown approval_token", correlation_id),
+            .identity = identity,
+        };
+    };
+    return .{
+        .status = .ok,
+        .body = @constCast(snapshot),
+        .identity = identity,
+    };
+}
+
+fn dispatchBuiltinRouteHttp1(
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    cfg: *const edge_config.EdgeConfig,
+    state: *GatewayState,
+    ctx: *http.request_context.RequestContext,
+    request: *const http.Request,
+    correlation_id: []const u8,
+    keep_alive: bool,
+    client_ip: []const u8,
+    route: http.location_router.BuiltinRoute,
+) !?u16 {
+    switch (route) {
+        .health => {
+            if (request.method != .GET) return null;
+            var response = http.Response.init(allocator);
+            defer response.deinit();
+            try populateHealthResponse(allocator, &response, keep_alive, correlation_id, state, cfg, false);
+            try response.write(writer);
+            state.metricsRecord(200);
+            return 200;
+        },
+        .metrics, .metrics_prometheus => {
+            if (request.method != .GET) return null;
+            const prom_text = state.metricsToPrometheus(allocator) catch {
+                try sendApiError(allocator, writer, .internal_server_error, "internal_error", "Failed to generate metrics", correlation_id, keep_alive, state);
+                return 500;
+            };
+            defer allocator.free(prom_text);
+            var response = http.Response.init(allocator);
+            defer response.deinit();
+            _ = response.setBody(prom_text)
+                .setContentType("text/plain; version=0.0.4; charset=utf-8")
+                .setConnection(keep_alive)
+                .setHeader(http.correlation.HEADER_NAME, correlation_id);
+            applyResponseHeaders(state, &response);
+            try response.write(writer);
+            state.metricsRecord(200);
+            return 200;
+        },
+        .metrics_json => {
+            if (request.method != .GET) return null;
+            const metrics_json = state.metricsToJson(allocator) catch {
+                try sendApiError(allocator, writer, .internal_server_error, "internal_error", "Failed to generate metrics", correlation_id, keep_alive, state);
+                return 500;
+            };
+            defer allocator.free(metrics_json);
+            var response = http.Response.json(allocator, metrics_json);
+            defer response.deinit();
+            _ = response.setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
+            applyResponseHeaders(state, &response);
+            try response.write(writer);
+            state.metricsRecord(200);
+            return 200;
+        },
+        .admin_routes,
+        .admin_connections,
+        .admin_streams,
+        .admin_upstreams,
+        .admin_certs,
+        .admin_auth_registry,
+        => {
+            if (request.method != .GET) return null;
+            const auth_result = authorizeRequest(cfg, &request.headers);
+            if (!auth_result.ok) {
+                try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, keep_alive, state);
+                return 401;
+            }
+            var response = http.Response.init(allocator);
+            defer response.deinit();
+            switch (route) {
+                .admin_routes => {
+                    _ = response.setStatus(.ok)
+                        .setBody(ADMIN_ROUTES_JSON)
+                        .setContentType("application/json");
+                },
+                .admin_connections => {
+                    const counts = state.connectionCounts();
+                    const body = try std.fmt.allocPrint(allocator, "{{\"active\":{d},\"tracked_ip_buckets\":{d}}}", .{ counts.active, counts.per_ip });
+                    _ = response.setStatus(.ok)
+                        .setBodyOwned(body)
+                        .setContentType("application/json");
+                },
+                .admin_streams => {
+                    const counts = state.streamCounts();
+                    const body = try std.fmt.allocPrint(allocator, "{{\"websocket_active\":{d},\"sse_active\":{d}}}", .{ counts.ws, counts.sse });
+                    _ = response.setStatus(.ok)
+                        .setBodyOwned(body)
+                        .setContentType("application/json");
+                },
+                .admin_upstreams => {
+                    const body = state.upstreamHealthJson(allocator) catch try allocator.dupe(u8, "{\"upstreams\":[]}");
+                    _ = response.setStatus(.ok)
+                        .setBodyOwned(body)
+                        .setContentType("application/json");
+                },
+                .admin_certs => {
+                    const body = try std.fmt.allocPrint(allocator, "{{\"default_cert\":\"{s}\",\"default_key\":\"{s}\",\"sni_count\":{d}}}", .{ cfg.tls_cert_path, cfg.tls_key_path, cfg.tls_sni_certs.len });
+                    _ = response.setStatus(.ok)
+                        .setBodyOwned(body)
+                        .setContentType("application/json");
+                },
+                .admin_auth_registry => {
+                    const body = try std.fmt.allocPrint(allocator, "{{\"bearer_hashes\":{d},\"basic_auth_hashes\":{d},\"sessions_enabled\":{}}}", .{
+                        cfg.auth_token_hashes.len,
+                        cfg.basic_auth_hashes.len,
+                        state.session_store != null,
+                    });
+                    _ = response.setStatus(.ok)
+                        .setBodyOwned(body)
+                        .setContentType("application/json");
+                },
+                else => unreachable,
+            }
+            _ = response.setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
+            applyResponseHeaders(state, &response);
+            try response.write(writer);
+            state.metricsRecord(200);
+            return 200;
+        },
+        .v1_chat,
+        .v1_commands,
+        => return null,
+        .v1_commands_status => {
+            if (request.method != .GET) return null;
+            var reply = try handleCommandStatusBuiltin(allocator, cfg, state, &request.headers, request.uri.query, correlation_id);
+            defer reply.deinit(allocator);
+            var response = http.Response.init(allocator);
+            defer response.deinit();
+            _ = response.setStatus(reply.status)
+                .setBody(reply.body.?)
+                .setContentType(JSON_CONTENT_TYPE)
+                .setConnection(keep_alive)
+                .setHeader(http.correlation.HEADER_NAME, correlation_id);
+            applyResponseHeaders(state, &response);
+            try response.write(writer);
+            const status_code = @intFromEnum(reply.status);
+            state.metricsRecord(status_code);
+            return status_code;
+        },
+        .v1_approvals_request => {
+            if (request.method != .POST) return null;
+            var reply = try handleApprovalsRequestBuiltin(allocator, cfg, state, &request.headers, request.body orelse "", correlation_id);
+            defer reply.deinit(allocator);
+            if (reply.identity) |identity| ctx.setIdentity(identity);
+            var response = http.Response.init(allocator);
+            defer response.deinit();
+            _ = response.setStatus(reply.status)
+                .setBody(reply.body.?)
+                .setContentType(JSON_CONTENT_TYPE)
+                .setConnection(keep_alive)
+                .setHeader(http.correlation.HEADER_NAME, correlation_id);
+            applyResponseHeaders(state, &response);
+            try response.write(writer);
+            const status_code = @intFromEnum(reply.status);
+            state.metricsRecord(status_code);
+            return status_code;
+        },
+        .v1_approvals_respond => {
+            if (request.method != .POST) return null;
+            var reply = try handleApprovalsRespondBuiltin(allocator, cfg, state, &request.headers, request.body orelse "", correlation_id);
+            defer reply.deinit(allocator);
+            if (reply.identity) |identity| ctx.setIdentity(identity);
+            var response = http.Response.init(allocator);
+            defer response.deinit();
+            _ = response.setStatus(reply.status)
+                .setBody(reply.body.?)
+                .setContentType(JSON_CONTENT_TYPE)
+                .setConnection(keep_alive)
+                .setHeader(http.correlation.HEADER_NAME, correlation_id);
+            applyResponseHeaders(state, &response);
+            try response.write(writer);
+            const status_code = @intFromEnum(reply.status);
+            state.metricsRecord(status_code);
+            return status_code;
+        },
+        .v1_approvals_status => {
+            if (request.method != .GET) return null;
+            var reply = try handleApprovalsStatusBuiltin(allocator, cfg, state, &request.headers, request.uri.query, correlation_id);
+            defer reply.deinit(allocator);
+            if (reply.identity) |identity| ctx.setIdentity(identity);
+            var response = http.Response.init(allocator);
+            defer response.deinit();
+            _ = response.setStatus(reply.status)
+                .setBody(reply.body.?)
+                .setContentType(JSON_CONTENT_TYPE)
+                .setConnection(keep_alive)
+                .setHeader(http.correlation.HEADER_NAME, correlation_id);
+            applyResponseHeaders(state, &response);
+            try response.write(writer);
+            const status_code = @intFromEnum(reply.status);
+            state.metricsRecord(status_code);
+            return status_code;
+        },
+        .v1_devices_register => {
+            if (request.method != .POST) return null;
+            var reply = try handleDeviceRegisterBuiltin(allocator, cfg, state, &request.headers, request.body orelse "", correlation_id);
+            defer reply.deinit(allocator);
+            if (reply.identity) |identity| ctx.setIdentity(identity);
+            var response = http.Response.init(allocator);
+            defer response.deinit();
+            _ = response.setStatus(reply.status)
+                .setBody(reply.body.?)
+                .setContentType(JSON_CONTENT_TYPE)
+                .setConnection(keep_alive)
+                .setHeader(http.correlation.HEADER_NAME, correlation_id);
+            if (reply.session_header) |session_header| {
+                _ = response.setHeader(http.session.SESSION_HEADER, session_header);
+            }
+            applyResponseHeaders(state, &response);
+            try response.write(writer);
+            const status_code = @intFromEnum(reply.status);
+            state.metricsRecord(status_code);
+            return status_code;
+        },
+        .v1_sessions_refresh => {
+            if (request.method != .POST) return null;
+            var reply = try handleSessionRefreshBuiltin(allocator, cfg, state, &request.headers, client_ip, correlation_id);
+            defer reply.deinit(allocator);
+            var response = http.Response.init(allocator);
+            defer response.deinit();
+            _ = response.setStatus(reply.status)
+                .setBody(reply.body.?)
+                .setContentType(JSON_CONTENT_TYPE)
+                .setConnection(keep_alive)
+                .setHeader(http.correlation.HEADER_NAME, correlation_id);
+            if (reply.session_header) |session_header| {
+                _ = response.setHeader(http.session.SESSION_HEADER, session_header);
+            }
+            applyResponseHeaders(state, &response);
+            try response.write(writer);
+            const status_code = @intFromEnum(reply.status);
+            state.metricsRecord(status_code);
+            return status_code;
+        },
+        .v1_sessions => {
+            var reply = try handleSessionsBuiltin(allocator, cfg, state, request.method.toString(), &request.headers, request.body orelse "", client_ip, correlation_id);
+            defer reply.deinit(allocator);
+            if (reply.identity) |identity| ctx.setIdentity(identity);
+            var response = http.Response.init(allocator);
+            defer response.deinit();
+            _ = response.setStatus(reply.status)
+                .setBody(reply.body.?)
+                .setContentType(JSON_CONTENT_TYPE)
+                .setConnection(keep_alive)
+                .setHeader(http.correlation.HEADER_NAME, correlation_id);
+            if (reply.session_header) |session_header| {
+                _ = response.setHeader(http.session.SESSION_HEADER, session_header);
+            }
+            applyResponseHeaders(state, &response);
+            try response.write(writer);
+            const status_code = @intFromEnum(reply.status);
+            state.metricsRecord(status_code);
+            return status_code;
+        },
+        .v1_cache_purge => {
+            if (request.method != .POST) return null;
+            var reply = try handleCachePurgeBuiltin(allocator, cfg, state, &request.headers, request.body orelse "", correlation_id);
+            defer reply.deinit(allocator);
+            if (reply.identity) |identity| ctx.setIdentity(identity);
+            var response = http.Response.init(allocator);
+            defer response.deinit();
+            _ = response.setStatus(reply.status)
+                .setBody(reply.body.?)
+                .setContentType(JSON_CONTENT_TYPE)
+                .setConnection(keep_alive)
+                .setHeader(http.correlation.HEADER_NAME, correlation_id);
+            applyResponseHeaders(state, &response);
+            try response.write(writer);
+            const status_code = @intFromEnum(reply.status);
+            state.metricsRecord(status_code);
+            return status_code;
+        },
+    }
+}
+
+fn handleLocationProxyPass(
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    cfg: *const edge_config.EdgeConfig,
+    state: *GatewayState,
+    request: *const http.Request,
+    target: []const u8,
+    correlation_id: []const u8,
+    keep_alive: bool,
+    _: []const u8,
+    _: ?[]const u8,
+) !u16 {
+    const resolved = try resolveProxyTarget(allocator, cfg.upstream_base_url, target, request.uri.path);
+    defer allocator.free(resolved.url);
+    const body = request.body orelse "";
+    var upstream_response = try executeRawHttpProxyRequest(allocator, resolved.url, request.method.toString(), request.contentType(), body, correlation_id);
+    defer upstream_response.deinit(allocator);
+
+    var response = http.Response.init(allocator);
+    defer response.deinit();
+    _ = response.setStatus(@enumFromInt(upstream_response.status_code))
+        .setBody(upstream_response.body)
+        .setContentType(upstream_response.content_type)
+        .setConnection(keep_alive)
+        .setHeader(http.correlation.HEADER_NAME, correlation_id);
+    applyResponseHeaders(state, &response);
+    try response.write(writer);
+    const status_code = upstream_response.status_code;
+    state.metricsRecord(status_code);
+    return status_code;
+}
+
+const RawUpstreamResponse = struct {
+    status_code: u16,
+    content_type: []u8,
+    body: []u8,
+
+    fn deinit(self: *RawUpstreamResponse, allocator: std.mem.Allocator) void {
+        allocator.free(self.content_type);
+        allocator.free(self.body);
+        self.* = undefined;
+    }
+};
+
+fn executeRawHttpProxyRequest(
+    allocator: std.mem.Allocator,
+    url: []const u8,
+    method: []const u8,
+    content_type: ?[]const u8,
+    body: []const u8,
+    correlation_id: []const u8,
+) !RawUpstreamResponse {
+    const parsed = try parseAbsoluteHttpUrl(url);
+    const stream = try std.net.tcpConnectToHost(allocator, parsed.host, parsed.port);
+    defer stream.close();
+
+    const ct = content_type orelse "application/octet-stream";
+    try stream.writer().print(
+        "{s} {s} HTTP/1.1\r\nHost: {s}\r\nContent-Length: {d}\r\nContent-Type: {s}\r\n{s}: {s}\r\nConnection: close\r\n\r\n",
+        .{ method, parsed.path, parsed.authority, body.len, ct, http.correlation.HEADER_NAME, correlation_id },
+    );
+    if (body.len > 0) try stream.writer().writeAll(body);
+
+    var raw = std.ArrayList(u8).init(allocator);
+    defer raw.deinit();
+    try readAllHttpMessage(allocator, stream, &raw, MAX_REQUEST_SIZE);
+
+    const response = raw.items;
+    const header_end = std.mem.indexOf(u8, response, "\r\n\r\n") orelse return error.InvalidHttpResponse;
+    const status_end = std.mem.indexOf(u8, response, "\r\n") orelse return error.InvalidHttpResponse;
+    const status_line = response[0..status_end];
+    const status_code = parseStatusCode(status_line) orelse return error.InvalidHttpResponse;
+    const header_blob = response[status_end + 2 .. header_end];
+    const body_slice = response[header_end + 4 ..];
+
+    return .{
+        .status_code = status_code,
+        .content_type = try allocator.dupe(u8, headerValue(header_blob, "Content-Type") orelse "application/octet-stream"),
+        .body = try allocator.dupe(u8, body_slice),
+    };
+}
+
+const ParsedAbsoluteUrl = struct {
+    authority: []const u8,
+    host: []const u8,
+    port: u16,
+    path: []const u8,
+};
+
+fn parseAbsoluteHttpUrl(url: []const u8) !ParsedAbsoluteUrl {
+    const scheme_end = std.mem.indexOf(u8, url, "://") orelse return error.InvalidUrl;
+    const scheme = url[0..scheme_end];
+    const authority_start = scheme_end + 3;
+    const path_start = std.mem.indexOfScalarPos(u8, url, authority_start, '/') orelse url.len;
+    const authority = url[authority_start..path_start];
+    if (authority.len == 0) return error.InvalidUrl;
+    return .{
+        .authority = authority,
+        .host = stripHostPort(authority),
+        .port = hostPort(authority) orelse if (std.ascii.eqlIgnoreCase(scheme, "https")) 443 else 80,
+        .path = if (path_start < url.len) url[path_start..] else "/",
+    };
+}
+
+fn readAllHttpMessage(
+    _: std.mem.Allocator,
+    stream: std.net.Stream,
+    out: *std.ArrayList(u8),
+    max_bytes: usize,
+) !void {
+    var buf: [4096]u8 = undefined;
+    var header_end: ?usize = null;
+    var content_length: usize = 0;
+
+    while (true) {
+        const n = try stream.read(&buf);
+        if (n == 0) break;
+        try out.appendSlice(buf[0..n]);
+        if (out.items.len > max_bytes) return error.MessageTooLarge;
+        if (header_end == null) {
+            if (std.mem.indexOf(u8, out.items, "\r\n\r\n")) |idx| {
+                header_end = idx + 4;
+                content_length = parseContentLength(out.items[0..idx]) orelse 0;
+            }
+        }
+        if (header_end) |headers_len| {
+            if (out.items.len >= headers_len + content_length) return;
+        }
+    }
+}
+
+fn parseStatusCode(status_line: []const u8) ?u16 {
+    var parts = std.mem.tokenizeAny(u8, status_line, " ");
+    _ = parts.next() orelse return null;
+    const code = parts.next() orelse return null;
+    return std.fmt.parseInt(u16, code, 10) catch null;
+}
+
+fn headerValue(headers_raw: []const u8, name: []const u8) ?[]const u8 {
+    var lines = std.mem.tokenizeAny(u8, headers_raw, "\r\n");
+    while (lines.next()) |line| {
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const header_name = std.mem.trim(u8, line[0..colon], " \t");
+        if (!std.ascii.eqlIgnoreCase(header_name, name)) continue;
+        return std.mem.trim(u8, line[colon + 1 ..], " \t");
+    }
+    return null;
+}
+
+fn handleStaticLocation(
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    request: *const http.Request,
+    matched: http.location_router.MatchResult,
+    root_cfg: anytype,
+    correlation_id: []const u8,
+    keep_alive: bool,
+    state: *GatewayState,
+) !?u16 {
+    if (!(request.method == .GET or request.method == .HEAD)) return null;
+
+    const rel_path = if (root_cfg.alias)
+        std.mem.trimLeft(u8, request.uri.path[matched.block.pattern.len..], "/")
+    else
+        std.mem.trimLeft(u8, request.uri.path, "/");
+    const suffix = if (rel_path.len == 0 or std.mem.endsWith(u8, request.uri.path, "/")) root_cfg.index else rel_path;
+    const full_path = try std.fs.path.join(allocator, &[_][]const u8{ root_cfg.root, suffix });
+    defer allocator.free(full_path);
+
+    const file_data = std.fs.cwd().readFileAlloc(allocator, full_path, MAX_REQUEST_SIZE) catch {
+        return null;
+    };
+    defer allocator.free(file_data);
+
+    var response = http.Response.ok(allocator, if (request.method == .HEAD) "" else file_data, "application/octet-stream");
+    defer response.deinit();
+    _ = response.setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
+    applyResponseHeaders(state, &response);
+    try response.write(writer);
+    state.metricsRecord(200);
+    return 200;
 }
 
 fn handleWebSocketProxyLoop(
@@ -6247,6 +7251,15 @@ const Http3DispatchContext = struct {
     state: *GatewayState,
 };
 
+const Http3LocationOutcome = union(enum) {
+    not_handled,
+    handled,
+    rewritten: struct {
+        path: []const u8,
+        query: ?[]const u8,
+    },
+};
+
 fn http3HandshakeState(state: *const GatewayState, cfg: *const edge_config.EdgeConfig, snapshot: http.http3_runtime.Snapshot) []const u8 {
     if (!cfg.http3_enabled) return "disabled";
     if (!edge_config.hasTlsFiles(cfg)) return "config_incomplete";
@@ -6321,6 +7334,370 @@ fn finalizeHttp3Response(response: *http.Response) void {
         .setContentLength(if (response.body) |body| body.len else 0);
 }
 
+fn dispatchBuiltinRouteHttp3(
+    allocator: std.mem.Allocator,
+    request: *const http.http3_session.StreamRequest,
+    response: *http.Response,
+    ctx: *Http3DispatchContext,
+    correlation_id: []const u8,
+    route: http.location_router.BuiltinRoute,
+) !bool {
+    switch (route) {
+        .health => {
+            if (!std.mem.eql(u8, request.method, "GET")) return false;
+            try populateHealthResponse(allocator, response, null, correlation_id, ctx.state, ctx.cfg, true);
+            ctx.state.metricsRecord(200);
+            return true;
+        },
+        .metrics, .metrics_prometheus => {
+            if (!std.mem.eql(u8, request.method, "GET")) return false;
+            const prom_text = try ctx.state.metricsToPrometheus(allocator);
+            _ = response
+                .setStatus(.ok)
+                .setBodyOwned(prom_text)
+                .setContentType("text/plain; version=0.0.4; charset=utf-8")
+                .setHeader(http.correlation.HEADER_NAME, correlation_id);
+            finalizeHttp3Response(response);
+            applyResponseHeaders(ctx.state, response);
+            ctx.state.metricsRecord(200);
+            return true;
+        },
+        .metrics_json => {
+            if (!std.mem.eql(u8, request.method, "GET")) return false;
+            const metrics_json = try ctx.state.metricsToJson(allocator);
+            _ = response
+                .setStatus(.ok)
+                .setBodyOwned(metrics_json)
+                .setContentType("application/json")
+                .setHeader(http.correlation.HEADER_NAME, correlation_id);
+            finalizeHttp3Response(response);
+            applyResponseHeaders(ctx.state, response);
+            ctx.state.metricsRecord(200);
+            return true;
+        },
+        .admin_routes,
+        .admin_connections,
+        .admin_streams,
+        .admin_upstreams,
+        .admin_certs,
+        .admin_auth_registry,
+        => {
+            if (!std.mem.eql(u8, request.method, "GET")) return false;
+            const auth_result = authorizeRequest(ctx.cfg, &request.headers);
+            if (!auth_result.ok) {
+                const payload = try buildApiErrorJson(allocator, "unauthorized", "Unauthorized", correlation_id);
+                _ = response
+                    .setStatus(.unauthorized)
+                    .setBodyOwned(payload)
+                    .setContentType("application/json")
+                    .setHeader(http.correlation.HEADER_NAME, correlation_id);
+                finalizeHttp3Response(response);
+                applyResponseHeaders(ctx.state, response);
+                ctx.state.metricsRecord(401);
+                return true;
+            }
+            switch (route) {
+                .admin_routes => {
+                    _ = response
+                        .setStatus(.ok)
+                        .setBody(ADMIN_ROUTES_JSON)
+                        .setContentType("application/json")
+                        .setHeader(http.correlation.HEADER_NAME, correlation_id);
+                },
+                .admin_connections => {
+                    const counts = ctx.state.connectionCounts();
+                    const body = try std.fmt.allocPrint(allocator, "{{\"active\":{d},\"tracked_ip_buckets\":{d}}}", .{ counts.active, counts.per_ip });
+                    _ = response
+                        .setStatus(.ok)
+                        .setBodyOwned(body)
+                        .setContentType("application/json")
+                        .setHeader(http.correlation.HEADER_NAME, correlation_id);
+                },
+                .admin_streams => {
+                    const counts = ctx.state.streamCounts();
+                    const body = try std.fmt.allocPrint(allocator, "{{\"websocket_active\":{d},\"sse_active\":{d}}}", .{ counts.ws, counts.sse });
+                    _ = response
+                        .setStatus(.ok)
+                        .setBodyOwned(body)
+                        .setContentType("application/json")
+                        .setHeader(http.correlation.HEADER_NAME, correlation_id);
+                },
+                .admin_upstreams => {
+                    const body = ctx.state.upstreamHealthJson(allocator) catch try allocator.dupe(u8, "{\"upstreams\":[]}");
+                    _ = response
+                        .setStatus(.ok)
+                        .setBodyOwned(body)
+                        .setContentType("application/json")
+                        .setHeader(http.correlation.HEADER_NAME, correlation_id);
+                },
+                .admin_certs => {
+                    const body = try std.fmt.allocPrint(allocator, "{{\"default_cert\":\"{s}\",\"default_key\":\"{s}\",\"sni_count\":{d}}}", .{ ctx.cfg.tls_cert_path, ctx.cfg.tls_key_path, ctx.cfg.tls_sni_certs.len });
+                    _ = response
+                        .setStatus(.ok)
+                        .setBodyOwned(body)
+                        .setContentType("application/json")
+                        .setHeader(http.correlation.HEADER_NAME, correlation_id);
+                },
+                .admin_auth_registry => {
+                    const body = try std.fmt.allocPrint(allocator, "{{\"bearer_hashes\":{d},\"basic_auth_hashes\":{d},\"sessions_enabled\":{}}}", .{
+                        ctx.cfg.auth_token_hashes.len,
+                        ctx.cfg.basic_auth_hashes.len,
+                        ctx.state.session_store != null,
+                    });
+                    _ = response
+                        .setStatus(.ok)
+                        .setBodyOwned(body)
+                        .setContentType("application/json")
+                        .setHeader(http.correlation.HEADER_NAME, correlation_id);
+                },
+                else => unreachable,
+            }
+            finalizeHttp3Response(response);
+            applyResponseHeaders(ctx.state, response);
+            ctx.state.metricsRecord(200);
+            return true;
+        },
+        .v1_chat,
+        .v1_commands,
+        => return false,
+        .v1_commands_status => {
+            if (!std.mem.eql(u8, request.method, "GET")) return false;
+            var reply = try handleCommandStatusBuiltin(allocator, ctx.cfg, ctx.state, &request.headers, splitHttp3PathAndQuery(request.path)[1], correlation_id);
+            defer reply.deinit(allocator);
+            _ = response
+                .setStatus(reply.status)
+                .setBodyOwned(reply.takeBody())
+                .setContentType(JSON_CONTENT_TYPE)
+                .setHeader(http.correlation.HEADER_NAME, correlation_id);
+            finalizeHttp3Response(response);
+            applyResponseHeaders(ctx.state, response);
+            ctx.state.metricsRecord(@intFromEnum(reply.status));
+            return true;
+        },
+        .v1_approvals_request => {
+            if (!std.mem.eql(u8, request.method, "POST")) return false;
+            var reply = try handleApprovalsRequestBuiltin(allocator, ctx.cfg, ctx.state, &request.headers, request.body, correlation_id);
+            defer reply.deinit(allocator);
+            _ = response
+                .setStatus(reply.status)
+                .setBodyOwned(reply.takeBody())
+                .setContentType(JSON_CONTENT_TYPE)
+                .setHeader(http.correlation.HEADER_NAME, correlation_id);
+            finalizeHttp3Response(response);
+            applyResponseHeaders(ctx.state, response);
+            ctx.state.metricsRecord(@intFromEnum(reply.status));
+            return true;
+        },
+        .v1_approvals_respond => {
+            if (!std.mem.eql(u8, request.method, "POST")) return false;
+            var reply = try handleApprovalsRespondBuiltin(allocator, ctx.cfg, ctx.state, &request.headers, request.body, correlation_id);
+            defer reply.deinit(allocator);
+            _ = response
+                .setStatus(reply.status)
+                .setBodyOwned(reply.takeBody())
+                .setContentType(JSON_CONTENT_TYPE)
+                .setHeader(http.correlation.HEADER_NAME, correlation_id);
+            finalizeHttp3Response(response);
+            applyResponseHeaders(ctx.state, response);
+            ctx.state.metricsRecord(@intFromEnum(reply.status));
+            return true;
+        },
+        .v1_approvals_status => {
+            if (!std.mem.eql(u8, request.method, "GET")) return false;
+            var reply = try handleApprovalsStatusBuiltin(allocator, ctx.cfg, ctx.state, &request.headers, splitHttp3PathAndQuery(request.path)[1], correlation_id);
+            defer reply.deinit(allocator);
+            _ = response
+                .setStatus(reply.status)
+                .setBodyOwned(reply.takeBody())
+                .setContentType(JSON_CONTENT_TYPE)
+                .setHeader(http.correlation.HEADER_NAME, correlation_id);
+            finalizeHttp3Response(response);
+            applyResponseHeaders(ctx.state, response);
+            ctx.state.metricsRecord(@intFromEnum(reply.status));
+            return true;
+        },
+        .v1_devices_register => {
+            if (!std.mem.eql(u8, request.method, "POST")) return false;
+            var reply = try handleDeviceRegisterBuiltin(allocator, ctx.cfg, ctx.state, &request.headers, request.body, correlation_id);
+            defer reply.deinit(allocator);
+            _ = response
+                .setStatus(reply.status)
+                .setBodyOwned(reply.takeBody())
+                .setContentType(JSON_CONTENT_TYPE)
+                .setHeader(http.correlation.HEADER_NAME, correlation_id);
+            finalizeHttp3Response(response);
+            applyResponseHeaders(ctx.state, response);
+            ctx.state.metricsRecord(@intFromEnum(reply.status));
+            return true;
+        },
+        .v1_sessions_refresh => {
+            if (!std.mem.eql(u8, request.method, "POST")) return false;
+            var reply = try handleSessionRefreshBuiltin(allocator, ctx.cfg, ctx.state, &request.headers, "h3", correlation_id);
+            defer reply.deinit(allocator);
+            _ = response
+                .setStatus(reply.status)
+                .setBodyOwned(reply.takeBody())
+                .setContentType(JSON_CONTENT_TYPE)
+                .setHeader(http.correlation.HEADER_NAME, correlation_id);
+            if (reply.session_header) |session_header| {
+                _ = response.setHeader(http.session.SESSION_HEADER, session_header);
+            }
+            finalizeHttp3Response(response);
+            applyResponseHeaders(ctx.state, response);
+            ctx.state.metricsRecord(@intFromEnum(reply.status));
+            return true;
+        },
+        .v1_sessions => {
+            var reply = try handleSessionsBuiltin(allocator, ctx.cfg, ctx.state, request.method, &request.headers, request.body, "h3", correlation_id);
+            defer reply.deinit(allocator);
+            _ = response
+                .setStatus(reply.status)
+                .setBodyOwned(reply.takeBody())
+                .setContentType(JSON_CONTENT_TYPE)
+                .setHeader(http.correlation.HEADER_NAME, correlation_id);
+            if (reply.session_header) |session_header| {
+                _ = response.setHeader(http.session.SESSION_HEADER, session_header);
+            }
+            finalizeHttp3Response(response);
+            applyResponseHeaders(ctx.state, response);
+            ctx.state.metricsRecord(@intFromEnum(reply.status));
+            return true;
+        },
+        .v1_cache_purge => {
+            if (!std.mem.eql(u8, request.method, "POST")) return false;
+            var reply = try handleCachePurgeBuiltin(allocator, ctx.cfg, ctx.state, &request.headers, request.body, correlation_id);
+            defer reply.deinit(allocator);
+            _ = response
+                .setStatus(reply.status)
+                .setBodyOwned(reply.takeBody())
+                .setContentType(JSON_CONTENT_TYPE)
+                .setHeader(http.correlation.HEADER_NAME, correlation_id);
+            finalizeHttp3Response(response);
+            applyResponseHeaders(ctx.state, response);
+            ctx.state.metricsRecord(@intFromEnum(reply.status));
+            return true;
+        },
+    }
+}
+
+fn handleHttp3LocationProxyPass(
+    allocator: std.mem.Allocator,
+    request: *const http.http3_session.StreamRequest,
+    response: *http.Response,
+    ctx: *Http3DispatchContext,
+    request_path: []const u8,
+    target: []const u8,
+    correlation_id: []const u8,
+) !void {
+    const resolved = try resolveProxyTarget(allocator, ctx.cfg.upstream_base_url, target, request_path);
+    defer allocator.free(resolved.url);
+
+    var upstream_response = try executeRawHttpProxyRequest(
+        allocator,
+        resolved.url,
+        request.method,
+        request.headers.get("content-type"),
+        request.body,
+        correlation_id,
+    );
+    defer upstream_response.deinit(allocator);
+
+    _ = response
+        .setStatus(@enumFromInt(upstream_response.status_code))
+        .setBodyOwned(try allocator.dupe(u8, upstream_response.body))
+        .setContentType(upstream_response.content_type)
+        .setHeader(http.correlation.HEADER_NAME, correlation_id);
+    finalizeHttp3Response(response);
+    applyResponseHeaders(ctx.state, response);
+    ctx.state.metricsRecord(upstream_response.status_code);
+}
+
+fn handleHttp3StaticLocation(
+    allocator: std.mem.Allocator,
+    request: *const http.http3_session.StreamRequest,
+    response: *http.Response,
+    matched: http.location_router.MatchResult,
+    root_cfg: anytype,
+    correlation_id: []const u8,
+    ctx: *Http3DispatchContext,
+    request_path: []const u8,
+) !bool {
+    if (!(std.mem.eql(u8, request.method, "GET") or std.mem.eql(u8, request.method, "HEAD"))) return false;
+
+    const rel_path = if (root_cfg.alias)
+        std.mem.trimLeft(u8, request_path[matched.block.pattern.len..], "/")
+    else
+        std.mem.trimLeft(u8, request_path, "/");
+    const suffix = if (rel_path.len == 0 or std.mem.endsWith(u8, request_path, "/")) root_cfg.index else rel_path;
+    const full_path = try std.fs.path.join(allocator, &[_][]const u8{ root_cfg.root, suffix });
+    defer allocator.free(full_path);
+
+    const file_data = std.fs.cwd().readFileAlloc(allocator, full_path, MAX_REQUEST_SIZE) catch {
+        return false;
+    };
+
+    _ = response
+        .setStatus(.ok)
+        .setBodyOwned(if (std.mem.eql(u8, request.method, "HEAD")) blk: {
+            allocator.free(file_data);
+            break :blk try allocator.dupe(u8, "");
+        } else file_data)
+        .setContentType("application/octet-stream")
+        .setHeader(http.correlation.HEADER_NAME, correlation_id);
+    finalizeHttp3Response(response);
+    applyResponseHeaders(ctx.state, response);
+    ctx.state.metricsRecord(200);
+    return true;
+}
+
+fn routeHttp3Location(
+    allocator: std.mem.Allocator,
+    request: *const http.http3_session.StreamRequest,
+    response: *http.Response,
+    ctx: *Http3DispatchContext,
+    request_path: []const u8,
+    correlation_id: []const u8,
+) !Http3LocationOutcome {
+    const matched = matchEffectiveLocation(ctx.cfg, request_path) orelse return .not_handled;
+    switch (matched.block.action) {
+        .builtin_route => |route| {
+            if (try dispatchBuiltinRouteHttp3(allocator, request, response, ctx, correlation_id, route)) {
+                return .handled;
+            }
+            return .not_handled;
+        },
+        .proxy_pass => |target| {
+            try handleHttp3LocationProxyPass(allocator, request, response, ctx, request_path, target, correlation_id);
+            return .handled;
+        },
+        .return_response => |ret| {
+            _ = response
+                .setStatus(@enumFromInt(ret.status))
+                .setBody(ret.body)
+                .setContentType(if (ret.status >= 300 and ret.status < 400) "text/plain; charset=utf-8" else "text/plain; charset=utf-8")
+                .setHeader(http.correlation.HEADER_NAME, correlation_id);
+            if (ret.status >= 300 and ret.status < 400 and ret.body.len > 0) {
+                _ = response.setHeader("location", ret.body);
+            }
+            finalizeHttp3Response(response);
+            applyResponseHeaders(ctx.state, response);
+            ctx.state.metricsRecord(ret.status);
+            return .handled;
+        },
+        .rewrite => |rw| {
+            const rewritten_path, const rewritten_query = splitHttp3PathAndQuery(rw.replacement);
+            return .{ .rewritten = .{ .path = rewritten_path, .query = rewritten_query } };
+        },
+        .static_root => |root_cfg| {
+            if (try handleHttp3StaticLocation(allocator, request, response, matched, root_cfg, correlation_id, ctx, request_path)) {
+                return .handled;
+            }
+            return .not_handled;
+        },
+        .fastcgi_pass => return .not_handled,
+    }
+}
+
 fn handleHttp3Connection(
     allocator: std.mem.Allocator,
     request: *const http.http3_session.StreamRequest,
@@ -6328,7 +7705,18 @@ fn handleHttp3Connection(
     ctx: *Http3DispatchContext,
 ) !void {
     const correlation_id = request.headers.get(http.correlation.HEADER_NAME) orelse "http3";
-    const http3_path, const http3_query = splitHttp3PathAndQuery(request.path);
+    var http3_path, var http3_query = splitHttp3PathAndQuery(request.path);
+    var rewrite_budget: usize = 0;
+    while (rewrite_budget < 4) : (rewrite_budget += 1) {
+        switch (try routeHttp3Location(allocator, request, response, ctx, http3_path, correlation_id)) {
+            .handled => return,
+            .not_handled => break,
+            .rewritten => |rewrite_result| {
+                http3_path = rewrite_result.path;
+                http3_query = rewrite_result.query;
+            },
+        }
+    }
 
     if (std.mem.eql(u8, request.method, "GET") and std.mem.eql(u8, http3_path, "/health")) {
         try populateHealthResponse(allocator, response, null, correlation_id, ctx.state, ctx.cfg, true);
@@ -6457,8 +7845,7 @@ fn handleHttp3Connection(
     }
 
     if (std.mem.eql(u8, request.method, "POST") and http.api_router.matchRoute(http3_path, 1, "/chat")) {
-        const auth_result = authorizeRequest(ctx.cfg, &request.headers);
-        if (!auth_result.ok) {
+        var resolved_identity = resolveRequestIdentity(allocator, ctx.cfg, ctx.state, &request.headers) orelse {
             const payload = try buildApiErrorJson(allocator, "unauthorized", "Unauthorized", correlation_id);
             _ = response
                 .setStatus(.unauthorized)
@@ -6469,7 +7856,8 @@ fn handleHttp3Connection(
             applyResponseHeaders(ctx.state, response);
             ctx.state.metricsRecord(401);
             return;
-        }
+        };
+        defer resolved_identity.deinit(allocator);
 
         if (!isJsonContentType(request.headers.get("content-type"))) {
             const payload = try buildApiErrorJson(allocator, "invalid_request", "Content-Type must be application/json", correlation_id);
@@ -6515,7 +7903,7 @@ fn handleHttp3Connection(
             upstream_body,
             correlation_id,
             "h3",
-            auth_result.token_hash,
+            resolved_identity.value,
             null,
             request.headers.get("host"),
             request.headers.get("x-forwarded-for"),
@@ -6582,8 +7970,7 @@ fn handleHttp3Connection(
     }
 
     if (std.mem.eql(u8, request.method, "POST") and http.api_router.matchRoute(http3_path, 1, "/commands")) {
-        const auth_result = authorizeRequest(ctx.cfg, &request.headers);
-        if (!auth_result.ok) {
+        var resolved_identity = resolveRequestIdentity(allocator, ctx.cfg, ctx.state, &request.headers) orelse {
             const payload = try buildApiErrorJson(allocator, "unauthorized", "Unauthorized", correlation_id);
             _ = response
                 .setStatus(.unauthorized)
@@ -6594,7 +7981,8 @@ fn handleHttp3Connection(
             applyResponseHeaders(ctx.state, response);
             ctx.state.metricsRecord(401);
             return;
-        }
+        };
+        defer resolved_identity.deinit(allocator);
 
         if (!isJsonContentType(request.headers.get("content-type"))) {
             const payload = try buildApiErrorJson(allocator, "invalid_request", "Content-Type must be application/json", correlation_id);
@@ -6634,7 +8022,7 @@ fn handleHttp3Connection(
             try generateCommandId(allocator);
         defer allocator.free(command_id);
 
-        ctx.state.commandLifecycleCreate(command_id, cmd.command_type.toString(), correlation_id, auth_result.token_hash orelse "-") catch {};
+        ctx.state.commandLifecycleCreate(command_id, cmd.command_type.toString(), correlation_id, resolved_identity.value) catch {};
         ctx.state.commandLifecycleSetRunning(command_id);
 
         const envelope = http.command.buildUpstreamEnvelope(
@@ -6643,7 +8031,7 @@ fn handleHttp3Connection(
             cmd.params_raw,
             command_id,
             correlation_id,
-            auth_result.token_hash orelse "-",
+            resolved_identity.value,
             "h3",
             null,
         ) catch {
@@ -6670,7 +8058,7 @@ fn handleHttp3Connection(
             envelope,
             correlation_id,
             "h3",
-            auth_result.token_hash,
+            resolved_identity.value,
             null,
             request.headers.get("host"),
             request.headers.get("x-forwarded-for"),
@@ -9224,6 +10612,7 @@ test "resolveProxyTarget handles absolute and relative proxy_pass" {
         .rewrite_rules = &[_]edge_config.EdgeConfig.RewriteRule{},
         .return_rules = &[_]edge_config.EdgeConfig.ReturnRule{},
         .conditional_rules = &[_]edge_config.EdgeConfig.ConditionalRule{},
+        .location_blocks = &[_]edge_config.EdgeConfig.LocationBlock{},
         .internal_redirect_rules = &[_]edge_config.EdgeConfig.InternalRedirectRule{},
         .named_locations = &[_]edge_config.EdgeConfig.NamedLocation{},
         .mirror_rules = &[_]edge_config.EdgeConfig.MirrorRule{},
@@ -9251,6 +10640,181 @@ test "resolveProxyTarget handles absolute and relative proxy_pass" {
     defer allocator.free(rel.url);
     try std.testing.expectEqualStrings("http://127.0.0.1:8080/gateway/v1/tools", rel.url);
     try std.testing.expectEqualStrings("127.0.0.1:8080", rel.upstream_host);
+}
+
+test "builtin location blocks cover core routes" {
+    const blocks = buildBuiltinLocationBlocks(&edge_config.EdgeConfig{
+        .listen_host = "0.0.0.0",
+        .listen_port = 8069,
+        .tls_cert_path = "",
+        .tls_key_path = "",
+        .tls_min_version = "1.2",
+        .tls_max_version = "1.3",
+        .tls_cipher_list = "",
+        .tls_cipher_suites = "",
+        .tls_sni_certs = &[_]edge_config.EdgeConfig.TlsSniCert{},
+        .tls_session_cache_enabled = true,
+        .tls_session_cache_size = 20_480,
+        .tls_session_timeout_seconds = 300,
+        .tls_session_tickets_enabled = true,
+        .tls_ocsp_stapling_enabled = false,
+        .tls_ocsp_response_path = "",
+        .tls_client_ca_path = "",
+        .tls_client_verify = false,
+        .tls_client_verify_depth = 3,
+        .tls_crl_path = "",
+        .tls_crl_check = false,
+        .tls_dynamic_reload_interval_ms = 5000,
+        .tls_acme_enabled = false,
+        .tls_acme_cert_dir = "",
+        .http2_enabled = true,
+        .http3_enabled = false,
+        .quic_port = 443,
+        .http3_enable_0rtt = false,
+        .http3_connection_migration = false,
+        .http3_max_datagram_size = 1350,
+        .proxy_protocol_mode = .off,
+        .trust_gateway_id = "tardigrade-edge",
+        .trust_shared_secret = "",
+        .trusted_upstream_identities = &[_][]const u8{},
+        .trust_require_upstream_identity = false,
+        .upstream_base_url = "http://127.0.0.1:8080",
+        .upstream_base_urls = &[_][]const u8{},
+        .upstream_base_url_weights = &[_]u32{},
+        .upstream_backup_base_urls = &[_][]const u8{},
+        .upstream_chat_base_urls = &[_][]const u8{},
+        .upstream_chat_base_url_weights = &[_]u32{},
+        .upstream_chat_backup_base_urls = &[_][]const u8{},
+        .upstream_commands_base_urls = &[_][]const u8{},
+        .upstream_commands_base_url_weights = &[_]u32{},
+        .upstream_commands_backup_base_urls = &[_][]const u8{},
+        .upstream_lb_algorithm = .round_robin,
+        .proxy_pass_chat = "/v1/chat",
+        .proxy_pass_commands_prefix = "",
+        .auth_token_hashes = &[_][]const u8{},
+        .max_message_chars = 4000,
+        .upstream_timeout_ms = 10000,
+        .rate_limit_rps = 0,
+        .rate_limit_burst = 0,
+        .security_headers_enabled = false,
+        .idempotency_ttl_seconds = 0,
+        .proxy_cache_ttl_seconds = 0,
+        .proxy_cache_path = "",
+        .proxy_cache_key_template = "method:path:payload_sha256",
+        .proxy_cache_stale_while_revalidate_seconds = 0,
+        .proxy_cache_lock_timeout_ms = 250,
+        .proxy_cache_manager_interval_ms = 30_000,
+        .geo_blocked_countries = &[_][]const u8{},
+        .geo_country_header = "CF-IPCountry",
+        .auth_request_url = "",
+        .auth_request_timeout_ms = 2000,
+        .jwt_secret = "",
+        .jwt_issuer = "",
+        .jwt_audience = "",
+        .add_headers = &[_]edge_config.EdgeConfig.HeaderPair{},
+        .policy_rules_raw = "",
+        .policy_user_scopes_raw = "",
+        .policy_approval_routes_raw = "",
+        .session_ttl_seconds = 0,
+        .session_max = 0,
+        .device_registry_path = "",
+        .device_auth_required = false,
+        .access_token_ttl_seconds = 900,
+        .refresh_token_ttl_seconds = 86_400,
+        .access_control_rules = "",
+        .request_limits = http.request_limits.RequestLimits.default,
+        .basic_auth_hashes = &[_][]const u8{},
+        .log_level = .info,
+        .error_log_path = "",
+        .pid_file = "",
+        .run_user = "",
+        .run_group = "",
+        .chroot_dir = "",
+        .require_unprivileged_user = false,
+        .server_names = &[_][]const u8{},
+        .doc_root = "",
+        .try_files = "",
+        .access_log_format = .json,
+        .access_log_template = "",
+        .access_log_min_status = 0,
+        .access_log_buffer_size = 0,
+        .access_log_syslog_udp = "",
+        .compression_enabled = false,
+        .compression_min_size = 256,
+        .compression_brotli_enabled = true,
+        .compression_brotli_quality = 5,
+        .upstream_gunzip_enabled = true,
+        .cb_threshold = 0,
+        .cb_timeout_ms = 30_000,
+        .worker_threads = 0,
+        .master_process_enabled = false,
+        .worker_processes = 1,
+        .binary_upgrade_enabled = true,
+        .worker_recycle_seconds = 0,
+        .worker_cpu_affinity = "",
+        .worker_queue_size = 1024,
+        .fd_soft_limit = 0,
+        .max_connections_per_ip = 0,
+        .max_active_connections = 0,
+        .keep_alive_timeout_ms = 5000,
+        .max_requests_per_connection = 100,
+        .connection_pool_size = 256,
+        .max_connection_memory_bytes = 2 * 1024 * 1024,
+        .max_total_connection_memory_bytes = 0,
+        .proxy_stream_all_statuses = false,
+        .upstream_retry_attempts = 1,
+        .upstream_timeout_budget_ms = 0,
+        .upstream_max_fails = 0,
+        .upstream_fail_timeout_ms = 10_000,
+        .upstream_active_health_interval_ms = 0,
+        .upstream_active_health_path = "/health",
+        .upstream_active_health_timeout_ms = 2000,
+        .upstream_active_health_fail_threshold = 1,
+        .upstream_active_health_success_threshold = 1,
+        .upstream_active_health_success_status = .{ .min = 200, .max = 299 },
+        .upstream_active_health_success_status_overrides = &[_]edge_config.EdgeConfig.UpstreamHealthSuccessStatusOverride{},
+        .upstream_slow_start_ms = 0,
+        .websocket_enabled = true,
+        .websocket_idle_timeout_ms = 60_000,
+        .websocket_max_frame_size = 1024 * 1024,
+        .websocket_ping_interval_ms = 15_000,
+        .sse_enabled = true,
+        .sse_max_events_per_topic = 1024,
+        .sse_poll_interval_ms = 250,
+        .sse_max_backlog = 1024,
+        .sse_idle_timeout_ms = 60_000,
+        .rewrite_rules = &[_]edge_config.EdgeConfig.RewriteRule{},
+        .return_rules = &[_]edge_config.EdgeConfig.ReturnRule{},
+        .conditional_rules = &[_]edge_config.EdgeConfig.ConditionalRule{},
+        .location_blocks = &[_]edge_config.EdgeConfig.LocationBlock{},
+        .internal_redirect_rules = &[_]edge_config.EdgeConfig.InternalRedirectRule{},
+        .named_locations = &[_]edge_config.EdgeConfig.NamedLocation{},
+        .mirror_rules = &[_]edge_config.EdgeConfig.MirrorRule{},
+        .fastcgi_upstream = "",
+        .fastcgi_params = &[_]edge_config.EdgeConfig.HeaderPair{},
+        .fastcgi_index = "index.php",
+        .uwsgi_upstream = "",
+        .scgi_upstream = "",
+        .grpc_upstream = "",
+        .memcached_upstream = "",
+        .smtp_upstream = "",
+        .imap_upstream = "",
+        .pop3_upstream = "",
+        .tcp_proxy_upstream = "",
+        .udp_proxy_upstream = "",
+        .stream_ssl_termination = false,
+    });
+
+    const health = http.location_router.matchLocation("/health", blocks[0..]).?;
+    const chat = http.location_router.matchLocation("/v1/chat", blocks[0..]).?;
+    switch (health.block.action) {
+        .builtin_route => |route| try std.testing.expectEqual(http.location_router.BuiltinRoute.health, route),
+        else => return error.UnexpectedTestResult,
+    }
+    switch (chat.block.action) {
+        .builtin_route => |route| try std.testing.expectEqual(http.location_router.BuiltinRoute.v1_chat, route),
+        else => return error.UnexpectedTestResult,
+    }
 }
 
 test "resolveProxyTarget supports unix socket upstream base" {
@@ -9419,6 +10983,7 @@ test "authorizeRequest accepts valid hash" {
         .rewrite_rules = &[_]edge_config.EdgeConfig.RewriteRule{},
         .return_rules = &[_]edge_config.EdgeConfig.ReturnRule{},
         .conditional_rules = &[_]edge_config.EdgeConfig.ConditionalRule{},
+        .location_blocks = &[_]edge_config.EdgeConfig.LocationBlock{},
         .internal_redirect_rules = &[_]edge_config.EdgeConfig.InternalRedirectRule{},
         .named_locations = &[_]edge_config.EdgeConfig.NamedLocation{},
         .mirror_rules = &[_]edge_config.EdgeConfig.MirrorRule{},

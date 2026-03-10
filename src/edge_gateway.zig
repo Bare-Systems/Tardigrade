@@ -6512,6 +6512,353 @@ fn handleHttp3Connection(
         return;
     }
 
+    if (std.mem.eql(u8, request.method, "POST") and http.api_router.matchRoute(http3_path, 1, "/devices/register")) {
+        if (ctx.cfg.device_registry_path.len == 0) {
+            const payload = try buildApiErrorJson(allocator, "tool_unavailable", "Device registry not configured", correlation_id);
+            _ = response
+                .setStatus(.not_implemented)
+                .setBodyOwned(payload)
+                .setContentType("application/json")
+                .setHeader(http.correlation.HEADER_NAME, correlation_id);
+            finalizeHttp3Response(response);
+            applyResponseHeaders(ctx.state, response);
+            ctx.state.metricsRecord(501);
+            return;
+        }
+
+        const auth_result = authorizeRequest(ctx.cfg, &request.headers);
+        if (!auth_result.ok) {
+            const payload = try buildApiErrorJson(allocator, "unauthorized", "Unauthorized", correlation_id);
+            _ = response
+                .setStatus(.unauthorized)
+                .setBodyOwned(payload)
+                .setContentType("application/json")
+                .setHeader(http.correlation.HEADER_NAME, correlation_id);
+            finalizeHttp3Response(response);
+            applyResponseHeaders(ctx.state, response);
+            ctx.state.metricsRecord(401);
+            return;
+        }
+
+        const reg = parseDeviceRegistration(allocator, request.body) catch {
+            const payload = try buildApiErrorJson(allocator, "invalid_request", "Invalid device registration payload", correlation_id);
+            _ = response
+                .setStatus(.bad_request)
+                .setBodyOwned(payload)
+                .setContentType("application/json")
+                .setHeader(http.correlation.HEADER_NAME, correlation_id);
+            finalizeHttp3Response(response);
+            applyResponseHeaders(ctx.state, response);
+            ctx.state.metricsRecord(400);
+            return;
+        };
+        defer {
+            allocator.free(reg.device_id);
+            allocator.free(reg.public_key);
+        }
+
+        registerDeviceIdentity(ctx.cfg.device_registry_path, reg.device_id, reg.public_key) catch {
+            const payload = try buildApiErrorJson(allocator, "internal_error", "Failed to persist device identity", correlation_id);
+            _ = response
+                .setStatus(.internal_server_error)
+                .setBodyOwned(payload)
+                .setContentType("application/json")
+                .setHeader(http.correlation.HEADER_NAME, correlation_id);
+            finalizeHttp3Response(response);
+            applyResponseHeaders(ctx.state, response);
+            ctx.state.metricsRecord(500);
+            return;
+        };
+
+        const body = try allocator.dupe(u8, "{\"registered\":true}");
+        _ = response
+            .setStatus(.created)
+            .setBodyOwned(body)
+            .setContentType("application/json")
+            .setHeader(http.correlation.HEADER_NAME, correlation_id);
+        finalizeHttp3Response(response);
+        applyResponseHeaders(ctx.state, response);
+        ctx.state.metricsRecord(201);
+        return;
+    }
+
+    if (std.mem.eql(u8, request.method, "POST") and http.api_router.matchRoute(http3_path, 1, "/sessions/refresh")) {
+        if (ctx.state.session_store == null) {
+            const payload = try buildApiErrorJson(allocator, "invalid_request", "Sessions not enabled", correlation_id);
+            _ = response
+                .setStatus(.not_found)
+                .setBodyOwned(payload)
+                .setContentType("application/json")
+                .setHeader(http.correlation.HEADER_NAME, correlation_id);
+            finalizeHttp3Response(response);
+            applyResponseHeaders(ctx.state, response);
+            ctx.state.metricsRecord(404);
+            return;
+        }
+
+        const session_token = http.session.fromHeaders(&request.headers) orelse {
+            const payload = try buildApiErrorJson(allocator, "invalid_request", "Missing or invalid X-Session-Token", correlation_id);
+            _ = response
+                .setStatus(.bad_request)
+                .setBodyOwned(payload)
+                .setContentType("application/json")
+                .setHeader(http.correlation.HEADER_NAME, correlation_id);
+            finalizeHttp3Response(response);
+            applyResponseHeaders(ctx.state, response);
+            ctx.state.metricsRecord(400);
+            return;
+        };
+
+        const refreshed = ctx.state.refreshSession(allocator, session_token, "h3") catch {
+            const payload = try buildApiErrorJson(allocator, "unauthorized", "Invalid session token", correlation_id);
+            _ = response
+                .setStatus(.unauthorized)
+                .setBodyOwned(payload)
+                .setContentType("application/json")
+                .setHeader(http.correlation.HEADER_NAME, correlation_id);
+            finalizeHttp3Response(response);
+            applyResponseHeaders(ctx.state, response);
+            ctx.state.metricsRecord(401);
+            return;
+        };
+        defer allocator.free(refreshed);
+
+        const body = try std.fmt.allocPrint(allocator, "{{\"session_token\":\"{s}\",\"access_ttl_seconds\":{d},\"refresh_ttl_seconds\":{d}}}", .{
+            refreshed,
+            ctx.cfg.access_token_ttl_seconds,
+            ctx.cfg.refresh_token_ttl_seconds,
+        });
+        _ = response
+            .setStatus(.ok)
+            .setBodyOwned(body)
+            .setContentType("application/json")
+            .setHeader(http.correlation.HEADER_NAME, correlation_id)
+            .setHeader(http.session.SESSION_HEADER, refreshed);
+        finalizeHttp3Response(response);
+        applyResponseHeaders(ctx.state, response);
+        ctx.state.metricsRecord(200);
+        return;
+    }
+
+    if (std.mem.eql(u8, request.method, "POST") and http.api_router.matchRoute(http3_path, 1, "/sessions")) {
+        if (ctx.state.session_store == null) {
+            const payload = try buildApiErrorJson(allocator, "invalid_request", "Sessions not enabled", correlation_id);
+            _ = response
+                .setStatus(.not_found)
+                .setBodyOwned(payload)
+                .setContentType("application/json")
+                .setHeader(http.correlation.HEADER_NAME, correlation_id);
+            finalizeHttp3Response(response);
+            applyResponseHeaders(ctx.state, response);
+            ctx.state.metricsRecord(404);
+            return;
+        }
+
+        const auth_result = authorizeRequest(ctx.cfg, &request.headers);
+        if (!auth_result.ok) {
+            const payload = try buildApiErrorJson(allocator, "unauthorized", "Unauthorized", correlation_id);
+            _ = response
+                .setStatus(.unauthorized)
+                .setBodyOwned(payload)
+                .setContentType("application/json")
+                .setHeader(http.correlation.HEADER_NAME, correlation_id);
+            finalizeHttp3Response(response);
+            applyResponseHeaders(ctx.state, response);
+            ctx.state.metricsRecord(401);
+            return;
+        }
+
+        const identity = auth_result.token_hash orelse "-";
+        var device_id: ?[]const u8 = null;
+        if (request.body.len > 0 and isJsonContentType(request.headers.get("content-type"))) {
+            device_id = parseDeviceId(allocator, request.body) catch null;
+        }
+        defer if (device_id) |value| allocator.free(value);
+
+        const session_token = ctx.state.createSession(allocator, identity, "h3", device_id) catch |err| {
+            const msg = switch (err) {
+                error.TooManySessions => "Too many active sessions",
+                else => "Session creation failed",
+            };
+            const payload = try buildApiErrorJson(allocator, "rate_limited", msg, correlation_id);
+            _ = response
+                .setStatus(.too_many_requests)
+                .setBodyOwned(payload)
+                .setContentType("application/json")
+                .setHeader(http.correlation.HEADER_NAME, correlation_id);
+            finalizeHttp3Response(response);
+            applyResponseHeaders(ctx.state, response);
+            ctx.state.metricsRecord(429);
+            return;
+        };
+        defer allocator.free(session_token);
+
+        const body = try std.fmt.allocPrint(allocator, "{{\"session_token\":\"{s}\"}}", .{session_token});
+        _ = response
+            .setStatus(.created)
+            .setBodyOwned(body)
+            .setContentType("application/json")
+            .setHeader(http.correlation.HEADER_NAME, correlation_id)
+            .setHeader(http.session.SESSION_HEADER, session_token);
+        finalizeHttp3Response(response);
+        applyResponseHeaders(ctx.state, response);
+        ctx.state.metricsRecord(201);
+        return;
+    }
+
+    if (std.mem.eql(u8, request.method, "DELETE") and http.api_router.matchRoute(http3_path, 1, "/sessions")) {
+        if (ctx.state.session_store == null) {
+            const payload = try buildApiErrorJson(allocator, "invalid_request", "Sessions not enabled", correlation_id);
+            _ = response
+                .setStatus(.not_found)
+                .setBodyOwned(payload)
+                .setContentType("application/json")
+                .setHeader(http.correlation.HEADER_NAME, correlation_id);
+            finalizeHttp3Response(response);
+            applyResponseHeaders(ctx.state, response);
+            ctx.state.metricsRecord(404);
+            return;
+        }
+
+        const session_token = http.session.fromHeaders(&request.headers) orelse {
+            const payload = try buildApiErrorJson(allocator, "invalid_request", "Missing or invalid X-Session-Token", correlation_id);
+            _ = response
+                .setStatus(.bad_request)
+                .setBodyOwned(payload)
+                .setContentType("application/json")
+                .setHeader(http.correlation.HEADER_NAME, correlation_id);
+            finalizeHttp3Response(response);
+            applyResponseHeaders(ctx.state, response);
+            ctx.state.metricsRecord(400);
+            return;
+        };
+
+        const revoked = ctx.state.revokeSession(session_token);
+        const body = if (revoked)
+            try allocator.dupe(u8, "{\"revoked\":true}")
+        else
+            try allocator.dupe(u8, "{\"revoked\":false}");
+        _ = response
+            .setStatus(.ok)
+            .setBodyOwned(body)
+            .setContentType("application/json")
+            .setHeader(http.correlation.HEADER_NAME, correlation_id);
+        finalizeHttp3Response(response);
+        applyResponseHeaders(ctx.state, response);
+        ctx.state.metricsRecord(200);
+        return;
+    }
+
+    if (std.mem.eql(u8, request.method, "GET") and http.api_router.matchRoute(http3_path, 1, "/sessions")) {
+        if (ctx.state.session_store == null) {
+            const payload = try buildApiErrorJson(allocator, "invalid_request", "Sessions not enabled", correlation_id);
+            _ = response
+                .setStatus(.not_found)
+                .setBodyOwned(payload)
+                .setContentType("application/json")
+                .setHeader(http.correlation.HEADER_NAME, correlation_id);
+            finalizeHttp3Response(response);
+            applyResponseHeaders(ctx.state, response);
+            ctx.state.metricsRecord(404);
+            return;
+        }
+
+        const auth_result = authorizeRequest(ctx.cfg, &request.headers);
+        if (!auth_result.ok) {
+            const payload = try buildApiErrorJson(allocator, "unauthorized", "Unauthorized", correlation_id);
+            _ = response
+                .setStatus(.unauthorized)
+                .setBodyOwned(payload)
+                .setContentType("application/json")
+                .setHeader(http.correlation.HEADER_NAME, correlation_id);
+            finalizeHttp3Response(response);
+            applyResponseHeaders(ctx.state, response);
+            ctx.state.metricsRecord(401);
+            return;
+        }
+
+        const identity = auth_result.token_hash orelse "-";
+        const active_sessions = ctx.state.countSessionsByIdentity(allocator, identity) catch {
+            const payload = try buildApiErrorJson(allocator, "internal_error", "Failed to list sessions", correlation_id);
+            _ = response
+                .setStatus(.internal_server_error)
+                .setBodyOwned(payload)
+                .setContentType("application/json")
+                .setHeader(http.correlation.HEADER_NAME, correlation_id);
+            finalizeHttp3Response(response);
+            applyResponseHeaders(ctx.state, response);
+            ctx.state.metricsRecord(500);
+            return;
+        };
+
+        const body = try std.fmt.allocPrint(allocator, "{{\"active_sessions\":{d}}}", .{active_sessions});
+        _ = response
+            .setStatus(.ok)
+            .setBodyOwned(body)
+            .setContentType("application/json")
+            .setHeader(http.correlation.HEADER_NAME, correlation_id);
+        finalizeHttp3Response(response);
+        applyResponseHeaders(ctx.state, response);
+        ctx.state.metricsRecord(200);
+        return;
+    }
+
+    if (std.mem.eql(u8, request.method, "POST") and http.api_router.matchRoute(http3_path, 1, "/cache/purge")) {
+        if (ctx.state.proxy_cache_store == null) {
+            const payload = try buildApiErrorJson(allocator, "invalid_request", "Proxy cache not enabled", correlation_id);
+            _ = response
+                .setStatus(.not_found)
+                .setBodyOwned(payload)
+                .setContentType("application/json")
+                .setHeader(http.correlation.HEADER_NAME, correlation_id);
+            finalizeHttp3Response(response);
+            applyResponseHeaders(ctx.state, response);
+            ctx.state.metricsRecord(404);
+            return;
+        }
+
+        const auth_result = authorizeRequest(ctx.cfg, &request.headers);
+        if (!auth_result.ok) {
+            const payload = try buildApiErrorJson(allocator, "unauthorized", "Unauthorized", correlation_id);
+            _ = response
+                .setStatus(.unauthorized)
+                .setBodyOwned(payload)
+                .setContentType("application/json")
+                .setHeader(http.correlation.HEADER_NAME, correlation_id);
+            finalizeHttp3Response(response);
+            applyResponseHeaders(ctx.state, response);
+            ctx.state.metricsRecord(401);
+            return;
+        }
+
+        var purged: usize = 0;
+        if (request.body.len > 0) {
+            if (isJsonContentType(request.headers.get("content-type"))) {
+                if (parseCachePurgeKey(allocator, request.body)) |key| {
+                    defer allocator.free(key);
+                    purged = if (ctx.state.proxyCacheDelete(key)) 1 else 0;
+                } else |_| {
+                    purged = ctx.state.proxyCachePurgeAll();
+                }
+            } else {
+                purged = ctx.state.proxyCachePurgeAll();
+            }
+        } else {
+            purged = ctx.state.proxyCachePurgeAll();
+        }
+
+        const body = try std.fmt.allocPrint(allocator, "{{\"purged\":{d}}}", .{purged});
+        _ = response
+            .setStatus(.ok)
+            .setBodyOwned(body)
+            .setContentType("application/json")
+            .setHeader(http.correlation.HEADER_NAME, correlation_id);
+        finalizeHttp3Response(response);
+        applyResponseHeaders(ctx.state, response);
+        ctx.state.metricsRecord(200);
+        return;
+    }
+
     const payload = try buildApiErrorJson(allocator, "invalid_request", "Not Found", correlation_id);
     _ = response
         .setStatus(.not_found)

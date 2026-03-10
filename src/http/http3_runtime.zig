@@ -1,7 +1,7 @@
 const std = @import("std");
 const ngtcp2_binding = @import("ngtcp2_binding.zig");
 const logger_mod = @import("logger.zig");
-const quic = @import("quic.zig");
+const quic = @import("quic_stub.zig");
 const shutdown = @import("shutdown.zig");
 
 pub const Http3RuntimeError = error{

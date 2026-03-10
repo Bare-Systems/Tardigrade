@@ -164,9 +164,9 @@ These files will be replaced by a proper C binding to ngtcp2 + nghttp3.
 
 ### 3.3 Remove / Archive Old Stubs
 
-- [ ] Archive `src/http/quic.zig` → `src/http/quic_stub.zig` with a comment
+- [x] Archive `src/http/quic.zig` → `src/http/quic_stub.zig` with a comment
       explaining it was superseded by ngtcp2 binding
-- [ ] Remove `src/http/qpack.zig` (nghttp3 owns QPACK now)
+- [x] Remove `src/http/qpack.zig` (nghttp3 owns QPACK now)
 
 ### 3.4 Tests
 

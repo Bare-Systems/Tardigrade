@@ -1,7 +1,7 @@
 const std = @import("std");
 const build_options = @import("build_options");
 const http3_session = @import("http3_session.zig");
-const quic = @import("quic.zig");
+const quic = @import("quic_stub.zig");
 const response_mod = @import("response.zig");
 const status_mod = @import("status.zig");
 

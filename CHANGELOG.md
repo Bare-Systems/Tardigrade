@@ -59,6 +59,12 @@
   - Added gateway-backed `/v1/commands` handling over HTTP/3, with live QUIC coverage for both unauthorized and successful proxied command requests.
   - Added gateway-backed `/v1/commands/status` handling over HTTP/3, with live QUIC coverage for authenticated lifecycle snapshot reads after command execution.
   - Added gateway-backed approvals workflow handling over HTTP/3, with live QUIC coverage for request, respond, and status operations.
+  - Added gateway-backed `/v1/sessions` handling over HTTP/3, with live QUIC coverage for session creation, listing, and revocation.
+  - Added gateway-backed `/v1/cache/purge` handling over HTTP/3, with live QUIC coverage that purges an existing proxy-cache entry and forces the next upstream fetch to miss.
+  - Added gateway-backed `/v1/devices/register` handling over HTTP/3, with live QUIC coverage for authenticated device registration.
+  - Added gateway-backed `/v1/sessions/refresh` handling over HTTP/3, with live QUIC coverage for session-token refresh and rotated token headers.
+  - Archived the old QUIC parser/tracker stub as `src/http/quic_stub.zig` and repointed live HTTP/3 imports at that explicit stub name now that real transport ownership lives in `ngtcp2_binding.zig`.
+  - Removed the old standalone `src/http/qpack.zig` stub by inlining the remaining literal header-block helper into `src/http/http3_session.zig` and repointing HTTP/3 handler code at the session-layer types.
 
 ### Fixed
 - Upgrade 1 integration hardening in the live gateway path:

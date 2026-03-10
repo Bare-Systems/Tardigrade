@@ -1,7 +1,6 @@
 const std = @import("std");
 const build_options = @import("build_options");
 const Headers = @import("headers.zig").Headers;
-const qpack = @import("qpack.zig");
 const Response = @import("response.zig").Response;
 
 const nghttp3_enabled = build_options.enable_http3_ngtcp2;
@@ -10,6 +9,17 @@ pub const Http3SessionError = error{
     DependencyUnavailable,
     NotYetImplemented,
     InvalidStreamHeaders,
+};
+
+pub const HeaderField = struct {
+    name: []const u8,
+    value: []const u8,
+};
+
+pub const EncodedHeaderBlock = struct {
+    data: []u8,
+    required_insert_count: u64,
+    base: u64,
 };
 
 pub const StreamRequest = struct {
@@ -55,7 +65,7 @@ pub const StreamAssembler = struct {
         self.* = undefined;
     }
 
-    pub fn appendHeaderBlock(self: *StreamAssembler, fields: []const qpack.HeaderField) !void {
+    pub fn appendHeaderBlock(self: *StreamAssembler, fields: []const HeaderField) !void {
         for (fields) |field| {
             if (std.mem.eql(u8, field.name, ":method")) {
                 try replaceOwnedString(self.allocator, &self.method, field.value);
@@ -471,8 +481,8 @@ pub const ServerSession = if (nghttp3_enabled) struct {
     }
 };
 
-pub fn encodeResponseHeaderBlock(allocator: std.mem.Allocator, response: *const Response) !qpack.Encoded {
-    var fields = std.ArrayList(qpack.HeaderField).init(allocator);
+pub fn encodeResponseHeaderBlock(allocator: std.mem.Allocator, response: *const Response) !EncodedHeaderBlock {
+    var fields = std.ArrayList(HeaderField).init(allocator);
     defer fields.deinit();
 
     var status_buf: [3]u8 = undefined;
@@ -481,7 +491,7 @@ pub fn encodeResponseHeaderBlock(allocator: std.mem.Allocator, response: *const 
     for (response.headers.iterator()) |header| {
         try fields.append(.{ .name = header.name, .value = header.value });
     }
-    return qpack.encodeLiteralHeaderBlock(allocator, fields.items);
+    return encodeLiteralHeaderBlock(allocator, fields.items);
 }
 
 fn replaceOwnedString(allocator: std.mem.Allocator, slot: *?[]u8, value: []const u8) !void {
@@ -507,6 +517,73 @@ fn appendQuicVarInt(out: *std.ArrayList(u8), value: usize) !void {
         return;
     }
     return error.NotYetImplemented;
+}
+
+pub fn encodeLiteralHeaderBlock(allocator: std.mem.Allocator, headers: []const HeaderField) !EncodedHeaderBlock {
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+
+    try out.append(0x00);
+    try out.append(0x00);
+
+    for (headers) |h| {
+        try out.append(0x20);
+        try encodeHeaderString(&out, h.name);
+        try encodeHeaderString(&out, h.value);
+    }
+    return .{
+        .data = try out.toOwnedSlice(),
+        .required_insert_count = 0,
+        .base = 0,
+    };
+}
+
+pub fn decodeLiteralHeaderBlock(allocator: std.mem.Allocator, block: []const u8) ![]HeaderField {
+    if (block.len < 2) return error.InvalidQpackBlock;
+    var i: usize = 2;
+    var out = std.ArrayList(HeaderField).init(allocator);
+    errdefer {
+        for (out.items) |h| {
+            allocator.free(h.name);
+            allocator.free(h.value);
+        }
+        out.deinit();
+    }
+    while (i < block.len) {
+        const prefix = block[i];
+        if ((prefix & 0xE0) != 0x20) return error.UnsupportedQpackRepresentation;
+        i += 1;
+        const name = try decodeHeaderStringAlloc(allocator, block, &i);
+        errdefer allocator.free(name);
+        const value = try decodeHeaderStringAlloc(allocator, block, &i);
+        errdefer allocator.free(value);
+        try out.append(.{ .name = name, .value = value });
+    }
+    return out.toOwnedSlice();
+}
+
+pub fn deinitDecodedHeaderBlock(allocator: std.mem.Allocator, headers: []HeaderField) void {
+    for (headers) |h| {
+        allocator.free(h.name);
+        allocator.free(h.value);
+    }
+    allocator.free(headers);
+}
+
+fn encodeHeaderString(out: *std.ArrayList(u8), value: []const u8) !void {
+    if (value.len > 127) return error.QpackStringTooLarge;
+    try out.append(@as(u8, @intCast(value.len)));
+    try out.appendSlice(value);
+}
+
+fn decodeHeaderStringAlloc(allocator: std.mem.Allocator, block: []const u8, idx: *usize) ![]u8 {
+    if (idx.* >= block.len) return error.InvalidQpackBlock;
+    const len = block[idx.*] & 0x7F;
+    idx.* += 1;
+    if (idx.* + len > block.len) return error.InvalidQpackBlock;
+    const out = try allocator.dupe(u8, block[idx.* .. idx.* + len]);
+    idx.* += len;
+    return out;
 }
 
 test "http3 stream assembler builds request parts from split header and body frames" {
@@ -544,8 +621,8 @@ test "http3 response header encoding includes status pseudo header" {
 
     const encoded = try encodeResponseHeaderBlock(allocator, &response);
     defer allocator.free(encoded.data);
-    const decoded = try qpack.decodeLiteralHeaderBlock(allocator, encoded.data);
-    defer qpack.deinitDecoded(allocator, decoded);
+    const decoded = try decodeLiteralHeaderBlock(allocator, encoded.data);
+    defer deinitDecodedHeaderBlock(allocator, decoded);
 
     try std.testing.expectEqual(@as(usize, 2), decoded.len);
     try std.testing.expectEqualStrings(":status", decoded[0].name);

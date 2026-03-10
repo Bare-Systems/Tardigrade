@@ -2392,6 +2392,316 @@ test "http3 integration serves approvals workflow over quic" {
     try assertContains(approved_status.body, "\"status\":\"approved\"");
 }
 
+test "http3 integration manages sessions over quic" {
+    if (!build_options.enable_http3_ngtcp2) return error.SkipZigTest;
+    std.fs.accessAbsolute(http3_curl_path, .{}) catch return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const quic_port = try findFreePort();
+    const quic_port_str = try std.fmt.allocPrint(allocator, "{d}", .{quic_port});
+    defer allocator.free(quic_port_str);
+
+    const opts = TardigradeOptions{
+        .upstream_port = null,
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_HTTP3_ENABLED", .value = "true" },
+            .{ .name = "TARDIGRADE_QUIC_PORT", .value = quic_port_str },
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = "tests/fixtures/tls/server.crt" },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = "tests/fixtures/tls/server.key" },
+            .{ .name = "TARDIGRADE_SESSION_TTL", .value = "3600" },
+            .{ .name = "TARDIGRADE_SESSION_MAX", .value = "16" },
+        },
+        .ready_https_insecure = true,
+    };
+    var tardigrade = try TardigradeProcess.start(allocator, opts);
+    defer tardigrade.stop();
+    try waitForHttp3Configured(tardigrade.port, 5000);
+
+    var unauthorized_create = try sendHttp3CurlRequestWithSpec(allocator, quic_port, .{
+        .scheme = "https",
+        .path = "/v1/sessions",
+        .method = "POST",
+        .body = "{\"device_id\":\"http3-device\"}",
+        .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
+        .insecure = true,
+        .binary_path = http3_curl_path,
+        .http3_only = true,
+    });
+    defer unauthorized_create.deinit();
+    try std.testing.expectEqual(@as(u16, 401), unauthorized_create.status_code);
+
+    var create = try sendHttp3CurlRequestWithSpec(allocator, quic_port, .{
+        .scheme = "https",
+        .path = "/v1/sessions",
+        .method = "POST",
+        .body = "{\"device_id\":\"http3-device\"}",
+        .headers = &.{
+            .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
+            .{ .name = "Content-Type", .value = "application/json" },
+        },
+        .insecure = true,
+        .binary_path = http3_curl_path,
+        .http3_only = true,
+    });
+    defer create.deinit();
+    try std.testing.expectEqual(@as(u16, 201), create.status_code);
+    const session_token = create.header("x-session-token") orelse return error.MissingSessionToken;
+    const owned_session_token = try allocator.dupe(u8, session_token);
+    defer allocator.free(owned_session_token);
+    try assertContains(create.body, "\"session_token\":\"");
+
+    var list = try sendHttp3CurlRequestWithSpec(allocator, quic_port, .{
+        .scheme = "https",
+        .path = "/v1/sessions",
+        .headers = &.{.{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token }},
+        .insecure = true,
+        .binary_path = http3_curl_path,
+        .http3_only = true,
+    });
+    defer list.deinit();
+    try std.testing.expectEqual(@as(u16, 200), list.status_code);
+    try assertContains(list.body, "\"active_sessions\":1");
+
+    var revoke = try sendHttp3CurlRequestWithSpec(allocator, quic_port, .{
+        .scheme = "https",
+        .path = "/v1/sessions",
+        .method = "DELETE",
+        .headers = &.{.{ .name = "X-Session-Token", .value = owned_session_token }},
+        .insecure = true,
+        .binary_path = http3_curl_path,
+        .http3_only = true,
+    });
+    defer revoke.deinit();
+    try std.testing.expectEqual(@as(u16, 200), revoke.status_code);
+    try assertContains(revoke.body, "\"revoked\":true");
+
+    var list_after = try sendHttp3CurlRequestWithSpec(allocator, quic_port, .{
+        .scheme = "https",
+        .path = "/v1/sessions",
+        .headers = &.{.{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token }},
+        .insecure = true,
+        .binary_path = http3_curl_path,
+        .http3_only = true,
+    });
+    defer list_after.deinit();
+    try std.testing.expectEqual(@as(u16, 200), list_after.status_code);
+    try assertContains(list_after.body, "\"active_sessions\":0");
+}
+
+test "http3 integration registers devices and refreshes sessions over quic" {
+    if (!build_options.enable_http3_ngtcp2) return error.SkipZigTest;
+    std.fs.accessAbsolute(http3_curl_path, .{}) catch return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const registry_path = try std.fmt.allocPrint(allocator, ".zig-cache/http3-device-registry-{d}.txt", .{std.time.nanoTimestamp()});
+    defer allocator.free(registry_path);
+
+    const quic_port = try findFreePort();
+    const quic_port_str = try std.fmt.allocPrint(allocator, "{d}", .{quic_port});
+    defer allocator.free(quic_port_str);
+
+    const opts = TardigradeOptions{
+        .upstream_port = null,
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_HTTP3_ENABLED", .value = "true" },
+            .{ .name = "TARDIGRADE_QUIC_PORT", .value = quic_port_str },
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = "tests/fixtures/tls/server.crt" },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = "tests/fixtures/tls/server.key" },
+            .{ .name = "TARDIGRADE_DEVICE_REGISTRY_PATH", .value = registry_path },
+            .{ .name = "TARDIGRADE_SESSION_TTL", .value = "3600" },
+            .{ .name = "TARDIGRADE_SESSION_MAX", .value = "16" },
+        },
+        .ready_https_insecure = true,
+    };
+    var tardigrade = try TardigradeProcess.start(allocator, opts);
+    defer tardigrade.stop();
+    try waitForHttp3Configured(tardigrade.port, 5000);
+
+    var unauthorized_register = try sendHttp3CurlRequestWithSpec(allocator, quic_port, .{
+        .scheme = "https",
+        .path = "/v1/devices/register",
+        .method = "POST",
+        .body = "{\"device_id\":\"device-h3\",\"public_key\":\"pub-h3\"}",
+        .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
+        .insecure = true,
+        .binary_path = http3_curl_path,
+        .http3_only = true,
+    });
+    defer unauthorized_register.deinit();
+    try std.testing.expectEqual(@as(u16, 401), unauthorized_register.status_code);
+
+    var register = try sendHttp3CurlRequestWithSpec(allocator, quic_port, .{
+        .scheme = "https",
+        .path = "/v1/devices/register",
+        .method = "POST",
+        .body = "{\"device_id\":\"device-h3\",\"public_key\":\"pub-h3\"}",
+        .headers = &.{
+            .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
+            .{ .name = "Content-Type", .value = "application/json" },
+        },
+        .insecure = true,
+        .binary_path = http3_curl_path,
+        .http3_only = true,
+    });
+    defer register.deinit();
+    try std.testing.expectEqual(@as(u16, 201), register.status_code);
+    try assertContains(register.body, "\"registered\":true");
+
+    var create = try sendHttp3CurlRequestWithSpec(allocator, quic_port, .{
+        .scheme = "https",
+        .path = "/v1/sessions",
+        .method = "POST",
+        .body = "{\"device_id\":\"device-h3\"}",
+        .headers = &.{
+            .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
+            .{ .name = "Content-Type", .value = "application/json" },
+        },
+        .insecure = true,
+        .binary_path = http3_curl_path,
+        .http3_only = true,
+    });
+    defer create.deinit();
+    try std.testing.expectEqual(@as(u16, 201), create.status_code);
+    const session_token = create.header("x-session-token") orelse return error.MissingSessionToken;
+    const owned_session_token = try allocator.dupe(u8, session_token);
+    defer allocator.free(owned_session_token);
+
+    var missing_refresh = try sendHttp3CurlRequestWithSpec(allocator, quic_port, .{
+        .scheme = "https",
+        .path = "/v1/sessions/refresh",
+        .method = "POST",
+        .insecure = true,
+        .binary_path = http3_curl_path,
+        .http3_only = true,
+    });
+    defer missing_refresh.deinit();
+    try std.testing.expectEqual(@as(u16, 400), missing_refresh.status_code);
+
+    var refresh = try sendHttp3CurlRequestWithSpec(allocator, quic_port, .{
+        .scheme = "https",
+        .path = "/v1/sessions/refresh",
+        .method = "POST",
+        .headers = &.{.{ .name = "X-Session-Token", .value = owned_session_token }},
+        .insecure = true,
+        .binary_path = http3_curl_path,
+        .http3_only = true,
+    });
+    defer refresh.deinit();
+    try std.testing.expectEqual(@as(u16, 200), refresh.status_code);
+    try assertContains(refresh.body, "\"session_token\":\"");
+    try assertContains(refresh.body, "\"access_ttl_seconds\":");
+    try assertContains(refresh.body, "\"refresh_ttl_seconds\":");
+    const refreshed_token = refresh.header("x-session-token") orelse return error.MissingSessionToken;
+    try std.testing.expect(refreshed_token.len > 0);
+}
+
+test "http3 integration purges proxy cache over quic" {
+    if (!build_options.enable_http3_ngtcp2) return error.SkipZigTest;
+    std.fs.accessAbsolute(http3_curl_path, .{}) catch return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const responses = [_]UpstreamResponseSpec{
+        .{ .headers = &.{.{ .name = "Content-Type", .value = "application/json" }}, .body = "{\"version\":1}" },
+        .{ .headers = &.{.{ .name = "Content-Type", .value = "application/json" }}, .body = "{\"version\":2}" },
+    };
+    var upstream = try UpstreamServer.start(allocator, &responses);
+    defer upstream.stop();
+    try upstream.run();
+
+    const quic_port = try findFreePort();
+    const quic_port_str = try std.fmt.allocPrint(allocator, "{d}", .{quic_port});
+    defer allocator.free(quic_port_str);
+
+    const opts = TardigradeOptions{
+        .upstream_port = upstream.port(),
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_HTTP3_ENABLED", .value = "true" },
+            .{ .name = "TARDIGRADE_QUIC_PORT", .value = quic_port_str },
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = "tests/fixtures/tls/server.crt" },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = "tests/fixtures/tls/server.key" },
+            .{ .name = "TARDIGRADE_PROXY_CACHE_TTL_SECONDS", .value = "30" },
+            .{ .name = "TARDIGRADE_PROXY_CACHE_STALE_WHILE_REVALIDATE_SECONDS", .value = "30" },
+        },
+        .ready_https_insecure = true,
+    };
+    var tardigrade = try TardigradeProcess.start(allocator, opts);
+    defer tardigrade.stop();
+    try waitForHttp3Configured(tardigrade.port, 5000);
+
+    const chat_body = "{\"message\":\"purge http3 cache\"}";
+
+    var first = try sendCurlRequest(allocator, tardigrade.port, .{
+        .scheme = "https",
+        .path = "/v1/chat",
+        .method = "POST",
+        .body = chat_body,
+        .headers = &.{
+            .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
+            .{ .name = "Content-Type", .value = "application/json" },
+        },
+        .insecure = true,
+    });
+    defer first.deinit();
+    try std.testing.expectEqual(@as(u16, 200), first.status_code);
+    try assertContains(first.body, "\"version\":1");
+
+    var hit = try sendCurlRequest(allocator, tardigrade.port, .{
+        .scheme = "https",
+        .path = "/v1/chat",
+        .method = "POST",
+        .body = chat_body,
+        .headers = &.{
+            .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
+            .{ .name = "Content-Type", .value = "application/json" },
+        },
+        .insecure = true,
+    });
+    defer hit.deinit();
+    try std.testing.expectEqual(@as(u16, 200), hit.status_code);
+    try assertContains(hit.body, "\"version\":1");
+    try std.testing.expectEqual(@as(u32, 1), upstream.requestCount());
+
+    var unauthorized_purge = try sendHttp3CurlRequestWithSpec(allocator, quic_port, .{
+        .scheme = "https",
+        .path = "/v1/cache/purge",
+        .method = "POST",
+        .insecure = true,
+        .binary_path = http3_curl_path,
+        .http3_only = true,
+    });
+    defer unauthorized_purge.deinit();
+    try std.testing.expectEqual(@as(u16, 401), unauthorized_purge.status_code);
+
+    var purge = try sendHttp3CurlRequestWithSpec(allocator, quic_port, .{
+        .scheme = "https",
+        .path = "/v1/cache/purge",
+        .method = "POST",
+        .headers = &.{.{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token }},
+        .insecure = true,
+        .binary_path = http3_curl_path,
+        .http3_only = true,
+    });
+    defer purge.deinit();
+    try std.testing.expectEqual(@as(u16, 200), purge.status_code);
+    try assertContains(purge.body, "\"purged\":1");
+
+    var after_purge = try sendCurlRequest(allocator, tardigrade.port, .{
+        .scheme = "https",
+        .path = "/v1/chat",
+        .method = "POST",
+        .body = chat_body,
+        .headers = &.{
+            .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
+            .{ .name = "Content-Type", .value = "application/json" },
+        },
+        .insecure = true,
+    });
+    defer after_purge.deinit();
+    try std.testing.expectEqual(@as(u16, 200), after_purge.status_code);
+    try assertContains(after_purge.body, "\"version\":2");
+    try std.testing.expectEqual(@as(u32, 2), upstream.requestCount());
+}
+
 test "http3 integration multiplexes parallel requests on one connection" {
     if (!build_options.enable_http3_ngtcp2) return error.SkipZigTest;
     std.fs.accessAbsolute(http3_curl_path, .{}) catch return error.SkipZigTest;

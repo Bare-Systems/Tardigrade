@@ -1,5 +1,9 @@
 const std = @import("std");
 
+// Archived QUIC parser/tracker stub kept only as local helper glue around the
+// live ngtcp2-backed HTTP/3 transport. Real QUIC handshake, packet crypto, and
+// stream lifecycle ownership now live in `ngtcp2_binding.zig`.
+
 pub const PacketType = enum {
     initial,
     zero_rtt,

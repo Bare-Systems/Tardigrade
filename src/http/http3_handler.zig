@@ -1,7 +1,6 @@
 const std = @import("std");
 const ngtcp2_binding = @import("ngtcp2_binding.zig");
 const Headers = @import("headers.zig").Headers;
-const qpack = @import("qpack.zig");
 const http3_session = @import("http3_session.zig");
 const Response = @import("response.zig").Response;
 
@@ -46,7 +45,7 @@ pub const Handler = struct {
         method: []const u8,
         path: []const u8,
         authority: ?[]const u8,
-        header_fields: []const qpack.HeaderField,
+        header_fields: []const http3_session.HeaderField,
         body: []const u8,
     ) !struct { headers: Headers, body_copy: []u8 } {
         var headers = Headers.init(allocator);
@@ -66,7 +65,7 @@ pub const Handler = struct {
         };
     }
 
-    pub fn encodeResponseHeaders(self: *const Handler, allocator: std.mem.Allocator, response: *const Response) !qpack.Encoded {
+    pub fn encodeResponseHeaders(self: *const Handler, allocator: std.mem.Allocator, response: *const Response) !http3_session.EncodedHeaderBlock {
         _ = self;
         return http3_session.encodeResponseHeaderBlock(allocator, response);
     }

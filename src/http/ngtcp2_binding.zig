@@ -254,13 +254,11 @@ pub const Binding = if (enabled) struct {
         if (datagram.len == 0) return .{};
         server.stats.datagrams_seen += 1;
         server.stats.bytes_seen += datagram.len;
-        switch (packet.packet_type) {
-            .initial => server.stats.initial_packets_seen += 1,
-            .handshake => server.stats.handshake_packets_seen += 1,
-            .zero_rtt => server.stats.zero_rtt_packets_seen += 1,
-            .retry => server.stats.retry_packets_seen += 1,
-            .short => server.stats.short_packets_seen += 1,
-        }
+        server.stats.initial_packets_seen += packet.counts.initial;
+        server.stats.handshake_packets_seen += packet.counts.handshake;
+        server.stats.zero_rtt_packets_seen += packet.counts.zero_rtt;
+        server.stats.retry_packets_seen += packet.counts.retry;
+        server.stats.short_packets_seen += packet.counts.short;
         try upsertConnection(server, packet, datagram, remote_ip, remote_addr.getPort());
         if (packet.packet_type == .initial) {
             if (try findNativeConnection(server, packet) == null) {
@@ -812,32 +810,98 @@ pub const Binding = if (enabled) struct {
     }
 
     fn createQuicServerTlsContext(cfg: ServerBootstrap) Ngtcp2Error!*c.SSL_CTX {
+        const default_ciphersuites = "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_CCM_SHA256";
+        const default_groups = "X25519:P-256:P-384:P-521";
         if (c.OPENSSL_init_ssl(0, null) != 1) return error.TlsBootstrapFailed;
-        const method = c.TLS_method() orelse return error.TlsBootstrapFailed;
+        const method = c.TLS_server_method() orelse return error.TlsBootstrapFailed;
         const ctx = c.SSL_CTX_new(method) orelse return error.TlsBootstrapFailed;
         errdefer c.SSL_CTX_free(ctx);
+        const sid_ctx = "ngtcp2 server";
 
         if (c.SSL_CTX_set_min_proto_version(ctx, c.TLS1_3_VERSION) != 1) return error.TlsBootstrapFailed;
         if (c.SSL_CTX_set_max_proto_version(ctx, c.TLS1_3_VERSION) != 1) return error.TlsBootstrapFailed;
+        if (c.SSL_CTX_set_ciphersuites(ctx, default_ciphersuites.ptr) != 1) return error.TlsBootstrapFailed;
+        if (c.SSL_CTX_set1_groups_list(ctx, default_groups.ptr) != 1) return error.TlsBootstrapFailed;
+        _ = c.SSL_CTX_set_mode(ctx, c.SSL_MODE_RELEASE_BUFFERS);
+        _ = c.SSL_CTX_set_default_verify_paths(ctx);
         c.SSL_CTX_set_alpn_select_cb(ctx, selectAlpnCb, null);
+        _ = c.SSL_CTX_set_options(ctx, @as(c_ulong, 1) << 24);
 
         const cert_path_z = std.heap.c_allocator.dupeZ(u8, cfg.tls_cert_path) catch return error.TlsBootstrapFailed;
         defer std.heap.c_allocator.free(cert_path_z);
         const key_path_z = std.heap.c_allocator.dupeZ(u8, cfg.tls_key_path) catch return error.TlsBootstrapFailed;
         defer std.heap.c_allocator.free(key_path_z);
 
-        if (c.SSL_CTX_use_certificate_file(ctx, cert_path_z.ptr, c.SSL_FILETYPE_PEM) != 1) return error.TlsBootstrapFailed;
+        if (c.SSL_CTX_use_certificate_chain_file(ctx, cert_path_z.ptr) != 1) return error.TlsBootstrapFailed;
         if (c.SSL_CTX_use_PrivateKey_file(ctx, key_path_z.ptr, c.SSL_FILETYPE_PEM) != 1) return error.TlsBootstrapFailed;
         if (c.SSL_CTX_check_private_key(ctx) != 1) return error.TlsBootstrapFailed;
+        if (c.SSL_CTX_set_session_id_context(ctx, sid_ctx.ptr, sid_ctx.len) != 1) return error.TlsBootstrapFailed;
         _ = c.SSL_CTX_set_session_cache_mode(ctx, c.SSL_SESS_CACHE_SERVER);
         _ = c.SSL_CTX_set_timeout(ctx, 60 * 60);
         if (cfg.enable_0rtt) {
-            _ = c.SSL_CTX_set_max_early_data(ctx, 16 * 1024);
+            _ = c.SSL_CTX_set_max_early_data(ctx, 0xffff_ffff);
         } else {
             _ = c.SSL_CTX_set_max_early_data(ctx, 0);
         }
+        if (c.SSL_CTX_set_session_ticket_cb(ctx, genTicketCb, decryptTicketCb, null) != 1) return error.TlsBootstrapFailed;
 
         return ctx;
+    }
+
+    fn genTicketCb(ssl: ?*c.SSL, _: ?*anyopaque) callconv(.c) c_int {
+        if (ssl == null) return 0;
+        const conn_ref = c.SSL_get_app_data(ssl) orelse return 0;
+        const typed_ref: *c.ngtcp2_crypto_conn_ref = @ptrCast(@alignCast(conn_ref));
+        const get_conn = typed_ref.get_conn orelse return 0;
+        const conn = get_conn(typed_ref) orelse return 0;
+        const version = c.ngtcp2_conn_get_negotiated_version(conn);
+        var version_be = std.mem.nativeToBig(u32, @bitCast(version));
+        if (c.SSL_SESSION_set1_ticket_appdata(c.SSL_get0_session(ssl), &version_be, @sizeOf(u32)) != 1) return 0;
+        return 1;
+    }
+
+    fn decryptTicketCb(
+        ssl: ?*c.SSL,
+        session: ?*c.SSL_SESSION,
+        _: [*c]const u8,
+        _: usize,
+        status: c.SSL_TICKET_STATUS,
+        _: ?*anyopaque,
+    ) callconv(.c) c.SSL_TICKET_RETURN {
+        if (ssl == null or session == null) return c.SSL_TICKET_RETURN_IGNORE_RENEW;
+        switch (status) {
+            c.SSL_TICKET_EMPTY, c.SSL_TICKET_NO_DECRYPT => return c.SSL_TICKET_RETURN_IGNORE_RENEW,
+            else => {},
+        }
+
+        var pdata: ?*anyopaque = null;
+        var datalen: usize = 0;
+        if (c.SSL_SESSION_get0_ticket_appdata(session, &pdata, &datalen) != 1 or datalen != @sizeOf(u32) or pdata == null) {
+            return switch (status) {
+                c.SSL_TICKET_SUCCESS => c.SSL_TICKET_RETURN_IGNORE,
+                else => c.SSL_TICKET_RETURN_IGNORE_RENEW,
+            };
+        }
+
+        const stored_version_be: *const u32 = @ptrCast(@alignCast(pdata.?));
+        const stored_version = std.mem.bigToNative(u32, stored_version_be.*);
+
+        const conn_ref = c.SSL_get_app_data(ssl) orelse return c.SSL_TICKET_RETURN_IGNORE_RENEW;
+        const typed_ref: *c.ngtcp2_crypto_conn_ref = @ptrCast(@alignCast(conn_ref));
+        const get_conn = typed_ref.get_conn orelse return c.SSL_TICKET_RETURN_IGNORE_RENEW;
+        const conn = get_conn(typed_ref) orelse return c.SSL_TICKET_RETURN_IGNORE_RENEW;
+        const chosen_version: u32 = @bitCast(c.ngtcp2_conn_get_client_chosen_version(conn));
+        if (chosen_version != stored_version) {
+            return switch (status) {
+                c.SSL_TICKET_SUCCESS => c.SSL_TICKET_RETURN_IGNORE,
+                else => c.SSL_TICKET_RETURN_IGNORE_RENEW,
+            };
+        }
+
+        return switch (status) {
+            c.SSL_TICKET_SUCCESS => c.SSL_TICKET_RETURN_USE,
+            else => c.SSL_TICKET_RETURN_USE_RENEW,
+        };
     }
 
     fn selectAlpnCb(ssl: ?*c.SSL, out: [*c][*c]const u8, outlen: [*c]u8, in: [*c]const u8, inlen: c_uint, _: ?*anyopaque) callconv(.c) c_int {
@@ -986,7 +1050,7 @@ test "enabled binding ignores malformed initial packets before native bootstrap"
         0xC0, 0x00, 0x00, 0x00, 0x01,
         0x08, 0xde, 0xad, 0xbe, 0xef, 0x10, 0x20, 0x30, 0x40,
         0x08, 0xca, 0xfe, 0xba, 0xbe, 0x50, 0x60, 0x70, 0x80,
-        0x01, 0x42, 0xaa, 0xbb,
+        0x00, 0x02, 0x01, 0xaa,
     };
     const packet = try quic.parsePacket(&datagram);
     const local_addr = try std.net.Address.parseIp("127.0.0.1", 9444);

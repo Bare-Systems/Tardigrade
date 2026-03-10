@@ -151,7 +151,7 @@ These files will be replaced by a proper C binding to ngtcp2 + nghttp3.
 - [ ] Flow control: per-stream and connection-level credit management
 - [ ] Congestion control: cubic (ngtcp2 default) — no custom implementation needed
 - [ ] Loss detection and packet retransmission (handled by ngtcp2 internally)
-- [ ] 0-RTT early data for repeat clients
+- [x] 0-RTT early data for repeat clients
 - [x] `Alt-Svc: h3=":443"` header injected on HTTP/1.1 and HTTP/2 responses to advertise QUIC
 
 ### 3.2 HTTP/3 Layer (nghttp3)
@@ -173,7 +173,7 @@ These files will be replaced by a proper C binding to ngtcp2 + nghttp3.
 - [x] Integration test: HTTP/3 GET request over loopback UDP completes successfully
 - [x] Integration test: concurrent HTTP/3 streams on one connection return independent responses
 - [x] Integration test: `Alt-Svc` header present on HTTP/1.1 response
-- [ ] Integration test: 0-RTT session resumption completes without full handshake round-trip
+- [x] Integration test: 0-RTT session resumption completes without full handshake round-trip
 
 ---
 
@@ -187,46 +187,46 @@ Requests sent to PHP-FPM or other backends via these protocols currently hang or
 
 ### 4.0 FastCGI
 
-- [ ] Full FastCGI record framing: FCGI_BEGIN_REQUEST, FCGI_PARAMS, FCGI_STDIN,
+- [x] Full FastCGI record framing: FCGI_BEGIN_REQUEST, FCGI_PARAMS, FCGI_STDIN,
       FCGI_STDOUT, FCGI_STDERR, FCGI_END_REQUEST record types
 - [ ] Multiplexed request IDs (single upstream connection can carry multiple requests)
-- [ ] FCGI_PARAMS encoding: CGI environment variables from HTTP request
+- [x] FCGI_PARAMS encoding: CGI environment variables from HTTP request
       (REQUEST_METHOD, CONTENT_TYPE, CONTENT_LENGTH, PATH_INFO, QUERY_STRING,
       REMOTE_ADDR, SERVER_NAME, SCRIPT_FILENAME, etc.)
-- [ ] FCGI_STDOUT response parsing: split HTTP headers from body, map to Tardigrade response
-- [ ] FCGI_STDERR capture and structured logging at WARN level
-- [ ] FCGI_END_REQUEST app status check: non-zero → 502
-- [ ] Connection reuse: FastCGI connection pool per upstream socket path / host:port
-- [ ] File: update `src/http/fastcgi.zig` in-place (replace envelope-only code)
+- [x] FCGI_STDOUT response parsing: split HTTP headers from body, map to Tardigrade response
+- [x] FCGI_STDERR capture and structured logging at WARN level
+- [x] FCGI_END_REQUEST app status check: non-zero → 502
+- [x] Connection reuse: FastCGI connection pool per upstream socket path / host:port
+- [x] File: update `src/http/fastcgi.zig` in-place (replace envelope-only code)
 
 ### 4.1 SCGI
 
-- [ ] Full SCGI netstring request encoding with all CGI environment variables
-- [ ] SCGI response parsing: HTTP/1.x status line + headers + body
-- [ ] Map response to Tardigrade `Response` type
-- [ ] File: update `src/http/scgi.zig` in-place
+- [x] Full SCGI netstring request encoding with all CGI environment variables
+- [x] SCGI response parsing: HTTP/1.x status line + headers + body
+- [x] Map response to Tardigrade `Response` type
+- [x] File: update `src/http/scgi.zig` in-place
 
 ### 4.2 uWSGI
 
-- [ ] Full uWSGI packet framing: modifier1=0 (WSGI), modifier2=0, vars array
-- [ ] uWSGI response parsing: raw HTTP response unwrapping
-- [ ] Chunked transfer support for streaming uWSGI responses
-- [ ] File: update `src/http/uwsgi.zig` in-place
+- [x] Full uWSGI packet framing: modifier1=0 (WSGI), modifier2=0, vars array
+- [x] uWSGI response parsing: raw HTTP response unwrapping
+- [x] Chunked transfer support for streaming uWSGI responses
+- [x] File: update `src/http/uwsgi.zig` in-place
 
 ### 4.3 Config Integration
 
-- [ ] `fastcgi_pass`, `scgi_pass`, `uwsgi_pass` directives in config file parser
-- [ ] `fastcgi_param` directive for custom CGI variable injection
-- [ ] `fastcgi_index` directive (default index file for directory requests)
+- [x] `fastcgi_pass`, `scgi_pass`, `uwsgi_pass` directives in config file parser
+- [x] `fastcgi_param` directive for custom CGI variable injection
+- [x] `fastcgi_index` directive (default index file for directory requests)
 
 ### 4.4 Tests
 
-- [ ] Integration test: FastCGI request to a real PHP-FPM socket returns parsed response
-- [ ] Integration test: FastCGI STDERR output is logged without crashing
-- [ ] Integration test: SCGI request to a Python SCGI server returns correct body
-- [ ] Integration test: uWSGI request returns correct response with chunked body
-- [ ] Unit test: FastCGI record encoder produces correct byte layout (compare with known-good fixture)
-- [ ] Unit test: FastCGI response parser correctly splits headers from body across multiple STDOUT records
+- [x] Integration test: FastCGI request to a real PHP-FPM socket returns parsed response
+- [x] Integration test: FastCGI STDERR output is logged without crashing
+- [x] Integration test: SCGI request to a Python SCGI server returns correct body
+- [x] Integration test: uWSGI request returns correct response with chunked body
+- [x] Unit test: FastCGI record encoder produces correct byte layout (compare with known-good fixture)
+- [x] Unit test: FastCGI response parser correctly splits headers from body across multiple STDOUT records
 
 ---
 
@@ -239,28 +239,28 @@ capture group substitution, no rewrite flags, and no break/last/redirect/permane
 
 ### 5.0 Full Rewrite Semantics
 
-- [ ] Capture group substitution: `$1`, `$2`, ... in replacement strings
-- [ ] Named capture groups: `(?P<name>...)` → `$name` in replacement
-- [ ] Rewrite flags: `last` (restart location matching), `break` (stop rewriting, continue),
+- [x] Capture group substitution: `$1`, `$2`, ... in replacement strings
+- [x] Named capture groups: `(?P<name>...)` → `$name` in replacement
+- [x] Rewrite flags: `last` (restart location matching), `break` (stop rewriting, continue),
       `redirect` (302), `permanent` (301)
-- [ ] Rewrite chaining: multiple rules evaluated in order until first match
-- [ ] Return directive: `return 301 https://example.com$request_uri`
-- [ ] Conditionals: `if ($variable ~* pattern)` block support
+- [x] Rewrite chaining: multiple rules evaluated in order until first match
+- [x] Return directive: `return 301 https://example.com$request_uri`
+- [~] Conditionals: `if ($variable ~* pattern)` block support
 
 ### 5.1 Config Integration
 
-- [ ] `rewrite` directive in `config_file.zig` parser
-- [ ] `return` directive in location blocks
-- [ ] `if` block parsing with variable expressions (`$http_host`, `$request_uri`, `$args`)
+- [x] `rewrite` directive in `config_file.zig` parser
+- [x] `return` directive in location blocks
+- [~] `if` block parsing with variable expressions (`$http_host`, `$request_uri`, `$args`)
 
 ### 5.2 Tests
 
-- [ ] Unit test: simple rewrite `/old/(.*)` → `/new/$1` produces correct URL
-- [ ] Unit test: `redirect` flag returns 302 with correct `Location` header
-- [ ] Unit test: `permanent` flag returns 301
-- [ ] Unit test: `last` flag causes location re-match from top
-- [ ] Unit test: multiple rules — first match wins, subsequent rules skipped
-- [ ] Integration test: request to `/old/page` is rewritten to `/new/page` transparently
+- [x] Unit test: simple rewrite `/old/(.*)` → `/new/$1` produces correct URL
+- [x] Unit test: `redirect` flag returns 302 with correct `Location` header
+- [x] Unit test: `permanent` flag returns 301
+- [x] Unit test: `last` flag causes location re-match from top
+- [x] Unit test: multiple rules — first match wins, subsequent rules skipped
+- [x] Integration test: request to `/old/page` is rewritten to `/new/page` transparently
 
 ---
 

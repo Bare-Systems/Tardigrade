@@ -207,6 +207,8 @@ const GatewayState = struct {
     next_proxy_cache_maintenance_ms: u64,
     upstream_health: std.StringHashMap(UpstreamHealth),
     upstream_active_requests: std.StringHashMap(usize),
+    fastcgi_pool: std.StringHashMap(std.ArrayList(std.net.Stream)),
+    fastcgi_next_request_id: std.StringHashMap(u16),
     proxy_cache_locks: std.StringHashMap(u32),
     active_connections_by_ip: std.StringHashMap(u32),
     active_fds: std.AutoHashMap(std.posix.fd_t, void),
@@ -231,6 +233,19 @@ const GatewayState = struct {
         var upstream_active_it = self.upstream_active_requests.iterator();
         while (upstream_active_it.next()) |entry| self.allocator.free(entry.key_ptr.*);
         self.upstream_active_requests.deinit();
+        var fastcgi_it = self.fastcgi_pool.iterator();
+        while (fastcgi_it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            for (entry.value_ptr.items) |stream| {
+                var owned = stream;
+                owned.close();
+            }
+            entry.value_ptr.deinit();
+        }
+        self.fastcgi_pool.deinit();
+        var fastcgi_id_it = self.fastcgi_next_request_id.iterator();
+        while (fastcgi_id_it.next()) |entry| self.allocator.free(entry.key_ptr.*);
+        self.fastcgi_next_request_id.deinit();
         var cache_lock_it = self.proxy_cache_locks.iterator();
         while (cache_lock_it.next()) |entry| self.allocator.free(entry.key_ptr.*);
         self.proxy_cache_locks.deinit();
@@ -259,6 +274,82 @@ const GatewayState = struct {
             entry.value_ptr.deinit(self.allocator);
         }
         self.approvals.deinit();
+    }
+
+    fn acquireFastcgiStream(self: *GatewayState, endpoint: []const u8) !struct { stream: std.net.Stream, reused: bool } {
+        self.mutex.lock();
+        if (self.fastcgi_pool.getPtr(endpoint)) |pool| {
+            if (pool.items.len > 0) {
+                const stream = pool.pop().?;
+                self.mutex.unlock();
+                return .{ .stream = stream, .reused = true };
+            }
+        }
+        self.mutex.unlock();
+        return .{ .stream = try http.fastcgi.connect(self.allocator, endpoint), .reused = false };
+    }
+
+    fn releaseFastcgiStream(self: *GatewayState, endpoint: []const u8, stream: std.net.Stream, allow_reuse: bool) void {
+        if (!allow_reuse) {
+            var owned = stream;
+            owned.close();
+            return;
+        }
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (self.fastcgi_pool.getPtr(endpoint)) |pool| {
+            if (pool.items.len >= 4) {
+                var owned = stream;
+                owned.close();
+                return;
+            }
+            pool.append(stream) catch {
+                var owned = stream;
+                owned.close();
+            };
+            return;
+        }
+
+        const owned_key = self.allocator.dupe(u8, endpoint) catch {
+            var owned = stream;
+            owned.close();
+            return;
+        };
+        var pool = std.ArrayList(std.net.Stream).init(self.allocator);
+        pool.append(stream) catch {
+            self.allocator.free(owned_key);
+            var owned = stream;
+            owned.close();
+            return;
+        };
+        self.fastcgi_pool.put(owned_key, pool) catch {
+            for (pool.items) |item| {
+                var owned = item;
+                owned.close();
+            }
+            pool.deinit();
+            self.allocator.free(owned_key);
+        };
+    }
+
+    fn nextFastcgiRequestId(self: *GatewayState, endpoint: []const u8) u16 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (self.fastcgi_next_request_id.getPtr(endpoint)) |value| {
+            const next = value.*;
+            value.* = if (next == std.math.maxInt(u16)) 1 else next + 1;
+            return next;
+        }
+
+        const owned_key = self.allocator.dupe(u8, endpoint) catch return 1;
+        self.fastcgi_next_request_id.put(owned_key, 2) catch {
+            self.allocator.free(owned_key);
+            return 1;
+        };
+        return 1;
     }
 
     fn tryAcquireConnectionSlot(self: *GatewayState, fd: std.posix.fd_t, ip_key: []const u8) !ConnectionSlotResult {
@@ -1461,6 +1552,8 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         .next_proxy_cache_maintenance_ms = 0,
         .upstream_health = std.StringHashMap(UpstreamHealth).init(state_allocator),
         .upstream_active_requests = std.StringHashMap(usize).init(state_allocator),
+        .fastcgi_pool = std.StringHashMap(std.ArrayList(std.net.Stream)).init(state_allocator),
+        .fastcgi_next_request_id = std.StringHashMap(u16).init(state_allocator),
         .proxy_cache_locks = std.StringHashMap(u32).init(state_allocator),
         .active_connections_by_ip = std.StringHashMap(u32).init(state_allocator),
         .active_fds = std.AutoHashMap(std.posix.fd_t, void).init(state_allocator),
@@ -2879,12 +2972,74 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
     }
 
     // --- Rewrite / return directives ---
-    const rewrite_outcome = http.rewrite.evaluate(
+    var request_uri_buf = std.ArrayList(u8).init(allocator);
+    defer request_uri_buf.deinit();
+    try request_uri_buf.appendSlice(request.uri.path);
+    if (request.uri.query) |query| {
+        try request_uri_buf.append('?');
+        try request_uri_buf.appendSlice(query);
+    }
+
+    var conditional_outcome = try evaluateConditionalRules(
+        allocator,
+        cfg.conditional_rules,
+        request.uri.path,
+        request_uri_buf.items,
+        request.headers.get("host") orelse "",
+        request.uri.query orelse "",
+    );
+    defer if (conditional_outcome) |*outcome| outcome.deinit(allocator);
+    if (conditional_outcome) |outcome| {
+        switch (outcome) {
+            .pass => |rewritten_path| {
+                request.uri.path = rewritten_path;
+            },
+            .redirect => |r| {
+                var response = http.Response.redirect(allocator, r.location, @enumFromInt(r.status));
+                defer response.deinit();
+                _ = response.setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
+                applyResponseHeaders(state, &response);
+                try response.write(writer);
+                state.metricsRecord(r.status);
+                logAccess(&ctx, request.method.toString(), request.uri.path, r.status, request.headers.get("user-agent") orelse "");
+                return;
+            },
+            .returned => |r| {
+                if (r.status >= 300 and r.status < 400 and r.body.len > 0) {
+                    var response = http.Response.redirect(allocator, r.body, @enumFromInt(r.status));
+                    defer response.deinit();
+                    _ = response.setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
+                    applyResponseHeaders(state, &response);
+                    try response.write(writer);
+                    state.metricsRecord(r.status);
+                    logAccess(&ctx, request.method.toString(), request.uri.path, r.status, request.headers.get("user-agent") orelse "");
+                    return;
+                }
+                var response = http.Response.init(allocator);
+                defer response.deinit();
+                _ = response.setStatus(@enumFromInt(r.status))
+                    .setBody(r.body)
+                    .setContentType("text/plain; charset=utf-8")
+                    .setConnection(keep_alive)
+                    .setHeader(http.correlation.HEADER_NAME, correlation_id);
+                applyResponseHeaders(state, &response);
+                try response.write(writer);
+                state.metricsRecord(r.status);
+                logAccess(&ctx, request.method.toString(), request.uri.path, r.status, request.headers.get("user-agent") orelse "");
+                return;
+            },
+        }
+    }
+
+    var rewrite_outcome = try http.rewrite.evaluate(
+        allocator,
         request.method.toString(),
         request.uri.path,
+        request_uri_buf.items,
         cfg.rewrite_rules,
         cfg.return_rules,
     );
+    defer rewrite_outcome.deinit(allocator);
     switch (rewrite_outcome) {
         .pass => |rewritten_path| {
             request.uri.path = rewritten_path;
@@ -2900,6 +3055,16 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
             return;
         },
         .returned => |r| {
+            if (r.status >= 300 and r.status < 400 and r.body.len > 0) {
+                var response = http.Response.redirect(allocator, r.body, @enumFromInt(r.status));
+                defer response.deinit();
+                _ = response.setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
+                applyResponseHeaders(state, &response);
+                try response.write(writer);
+                state.metricsRecord(r.status);
+                logAccess(&ctx, request.method.toString(), request.uri.path, r.status, request.headers.get("user-agent") orelse "");
+                return;
+            }
             var response = http.Response.init(allocator);
             defer response.deinit();
             _ = response.setStatus(@enumFromInt(r.status))
@@ -3249,51 +3414,48 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
 
     // --- Backend protocol bridges (Phase 11.3) ---
     if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/backend/fastcgi")) {
-        try handleBackendProtocolRoute(
+        const status = try handleFastcgiRoute(
             allocator,
             writer,
+            cfg,
             cfg.fastcgi_upstream,
-            request.method.toString(),
-            request.uri.path,
-            request.body orelse "",
+            &request,
+            client_ip,
             correlation_id,
             keep_alive,
             state,
-            .fastcgi,
         );
-        logAccess(&ctx, request.method.toString(), "/v1/backend/fastcgi", 200, request.headers.get("user-agent") orelse "");
+        logAccess(&ctx, request.method.toString(), "/v1/backend/fastcgi", status, request.headers.get("user-agent") orelse "");
         return;
     }
     if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/backend/uwsgi")) {
-        try handleBackendProtocolRoute(
+        const status = try handleUwsgiRoute(
             allocator,
             writer,
+            cfg,
             cfg.uwsgi_upstream,
-            request.method.toString(),
-            request.uri.path,
-            request.body orelse "",
+            &request,
+            client_ip,
             correlation_id,
             keep_alive,
             state,
-            .uwsgi,
         );
-        logAccess(&ctx, request.method.toString(), "/v1/backend/uwsgi", 200, request.headers.get("user-agent") orelse "");
+        logAccess(&ctx, request.method.toString(), "/v1/backend/uwsgi", status, request.headers.get("user-agent") orelse "");
         return;
     }
     if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/backend/scgi")) {
-        try handleBackendProtocolRoute(
+        const status = try handleScgiRoute(
             allocator,
             writer,
+            cfg,
             cfg.scgi_upstream,
-            request.method.toString(),
-            request.uri.path,
-            request.body orelse "",
+            &request,
+            client_ip,
             correlation_id,
             keep_alive,
             state,
-            .scgi,
         );
-        logAccess(&ctx, request.method.toString(), "/v1/backend/scgi", 200, request.headers.get("user-agent") orelse "");
+        logAccess(&ctx, request.method.toString(), "/v1/backend/scgi", status, request.headers.get("user-agent") orelse "");
         return;
     }
     if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/backend/grpc")) {
@@ -5458,6 +5620,54 @@ fn applyInternalRedirectRules(
     return current;
 }
 
+fn evaluateConditionalRules(
+    allocator: std.mem.Allocator,
+    rules: []const edge_config.EdgeConfig.ConditionalRule,
+    path: []const u8,
+    request_uri: []const u8,
+    host: []const u8,
+    args: []const u8,
+) !?http.rewrite.Outcome {
+    for (rules) |rule| {
+        const input = switch (rule.variable) {
+            .request_uri => request_uri,
+            .http_host => host,
+            .args => args,
+        };
+
+        switch (rule.action) {
+            .rewrite => |rw| {
+                const replacement = try http.rewrite.substitutePattern(
+                    allocator,
+                    rule.pattern,
+                    input,
+                    request_uri,
+                    rw.replacement,
+                    rule.case_insensitive,
+                ) orelse continue;
+                switch (rw.flag) {
+                    .redirect => return .{ .redirect = .{ .status = 302, .location = replacement } },
+                    .permanent => return .{ .redirect = .{ .status = 301, .location = replacement } },
+                    .@"break", .last => return .{ .pass = replacement },
+                }
+            },
+            .returned => |ret| {
+                const body = try http.rewrite.substitutePattern(
+                    allocator,
+                    rule.pattern,
+                    input,
+                    request_uri,
+                    ret.body,
+                    rule.case_insensitive,
+                ) orelse continue;
+                return .{ .returned = .{ .status = ret.status, .body = body } };
+            },
+        }
+    }
+    _ = path;
+    return null;
+}
+
 fn resolveNamedLocation(name: []const u8, named_locations: []const edge_config.EdgeConfig.NamedLocation) ?[]const u8 {
     for (named_locations) |entry| {
         if (std.mem.eql(u8, entry.name, name)) return entry.path;
@@ -5559,65 +5769,341 @@ fn executeSubrequest(allocator: std.mem.Allocator, url: []const u8, method: std.
     };
 }
 
-const BackendProtocol = enum {
-    fastcgi,
-    uwsgi,
-    scgi,
-};
-
-fn handleBackendProtocolRoute(
+fn handleFastcgiRoute(
     allocator: std.mem.Allocator,
     writer: anytype,
+    cfg: *const edge_config.EdgeConfig,
     upstream: []const u8,
-    method: []const u8,
-    path: []const u8,
-    body: []const u8,
+    request: *const http.Request,
+    client_ip: []const u8,
     correlation_id: []const u8,
     keep_alive: bool,
     state: *GatewayState,
-    kind: BackendProtocol,
-) !void {
+) !u16 {
     const endpoint = std.mem.trim(u8, upstream, " \t\r\n");
     if (endpoint.len == 0) {
-        try sendApiError(allocator, writer, .not_implemented, "tool_unavailable", "Backend upstream not configured", correlation_id, keep_alive, state);
-        return;
+        try sendApiError(allocator, writer, .not_implemented, "tool_unavailable", "FastCGI upstream not configured", correlation_id, keep_alive, state);
+        return 501;
     }
-    const wire = switch (kind) {
-        .fastcgi => try http.fastcgi.buildRequest(allocator, method, "/index.php", path, body),
-        .uwsgi => try http.uwsgi.buildPacket(allocator, method, path, body),
-        .scgi => try http.scgi.buildRequest(allocator, method, path, body),
+
+    const configured_doc_root = std.mem.trim(u8, cfg.doc_root, " \t\r\n");
+    const document_root = request.headers.get("x-fastcgi-document-root") orelse configured_doc_root;
+    const path_info = request.headers.get("x-fastcgi-path-info") orelse request.uri.path;
+    const fastcgi_index = if (cfg.fastcgi_index.len > 0) cfg.fastcgi_index else "index.php";
+    const default_script_path = defaultFastcgiScriptPath(allocator, document_root, path_info, fastcgi_index) catch null;
+    defer if (default_script_path) |path| allocator.free(path);
+    const script_filename = request.headers.get("x-fastcgi-script-filename") orelse (default_script_path orelse "/index.php");
+    const default_script_name = if (std.mem.endsWith(u8, path_info, "/"))
+        std.fmt.allocPrint(allocator, "{s}{s}", .{ path_info, fastcgi_index }) catch null
+    else
+        null;
+    defer if (default_script_name) |path| allocator.free(path);
+    const script_name = request.headers.get("x-fastcgi-script-name") orelse (default_script_name orelse path_info);
+    const host = request.headers.get("host") orelse "";
+    const server_name = stripHostPort(host);
+
+    var port_buf: [16]u8 = undefined;
+    const server_port = if (hostPort(host)) |port|
+        std.fmt.bufPrint(&port_buf, "{d}", .{port}) catch "80"
+    else if (cfg.listen_port > 0)
+        std.fmt.bufPrint(&port_buf, "{d}", .{cfg.listen_port}) catch "80"
+    else
+        "80";
+
+    var remote_port_buf: [8]u8 = undefined;
+    const remote_port = request.headers.get("x-forwarded-port") orelse request.headers.get("x-real-port") orelse
+        (std.fmt.bufPrint(&remote_port_buf, "{d}", .{0}) catch "0");
+
+    var request_uri = std.ArrayList(u8).init(allocator);
+    defer request_uri.deinit();
+    try request_uri.appendSlice(request.uri.path);
+    if (request.uri.query) |query| {
+        try request_uri.append('?');
+        try request_uri.appendSlice(query);
+    }
+
+    var extra_env = std.ArrayList(http.fastcgi.EnvPair).init(allocator);
+    defer extra_env.deinit();
+    for (cfg.fastcgi_params) |pair| {
+        try extra_env.append(.{ .name = pair.name, .value = pair.value });
+    }
+    try extra_env.append(.{ .name = "TARDIGRADE_CORRELATION_ID", .value = correlation_id });
+
+    var leased = state.acquireFastcgiStream(endpoint) catch |err| {
+        state.logger.warn(correlation_id, "fastcgi connect failed for {s}: {}", .{ endpoint, err });
+        try sendApiError(allocator, writer, .bad_gateway, "tool_unavailable", "FastCGI request failed", correlation_id, keep_alive, state);
+        return 502;
     };
-    defer allocator.free(wire);
-    const resp = executeRawProtocolRequest(allocator, endpoint, wire) catch |err| {
-        std.log.warn("backend protocol request failed: {}", .{err});
-        try sendApiError(allocator, writer, .bad_gateway, "tool_unavailable", "Backend protocol request failed", correlation_id, keep_alive, state);
-        return;
+    errdefer {
+        var owned = leased.stream;
+        owned.close();
+    }
+
+    var fcgi = http.fastcgi.exchange(allocator, &leased.stream, .{
+        .request_id = state.nextFastcgiRequestId(endpoint),
+        .keep_conn = true,
+        .method = request.method.toString(),
+        .script_filename = script_filename,
+        .request_uri = request_uri.items,
+        .query_string = request.uri.query orelse "",
+        .path_info = path_info,
+        .script_name = script_name,
+        .document_root = document_root,
+        .content_type = request.contentType(),
+        .remote_addr = client_ip,
+        .remote_port = remote_port,
+        .server_name = if (server_name.len > 0) server_name else "localhost",
+        .server_port = server_port,
+        .server_protocol = request.version.toString(),
+        .request_scheme = if (cfg.tls_cert_path.len > 0 and cfg.tls_key_path.len > 0) "https" else "http",
+        .https = cfg.tls_cert_path.len > 0 and cfg.tls_key_path.len > 0,
+        .headers = &request.headers,
+        .extra_env = extra_env.items,
+    }, request.body orelse "") catch |err| {
+        state.logger.warn(correlation_id, "fastcgi request failed for {s}: {}", .{ endpoint, err });
+        var owned = leased.stream;
+        owned.close();
+        try sendApiError(allocator, writer, .bad_gateway, "tool_unavailable", "FastCGI request failed", correlation_id, keep_alive, state);
+        return 502;
     };
-    defer allocator.free(resp);
+    defer fcgi.deinit();
+
+    if (fcgi.stderr.len > 0) {
+        state.logger.warn(correlation_id, "fastcgi stderr from {s}: {s}", .{ endpoint, fcgi.stderr });
+    }
+
+    if (fcgi.protocol_status != http.fastcgi.request_complete or fcgi.app_status != 0) {
+        state.logger.warn(correlation_id, "fastcgi end_request failure from {s}: app_status={d} protocol_status={d}", .{ endpoint, fcgi.app_status, fcgi.protocol_status });
+        var owned = leased.stream;
+        owned.close();
+        try sendApiError(allocator, writer, .bad_gateway, "tool_unavailable", "FastCGI upstream failed", correlation_id, keep_alive, state);
+        return 502;
+    }
+
     var response = http.Response.init(allocator);
     defer response.deinit();
-    _ = response.setStatus(.ok)
-        .setBody(resp)
-        .setContentType("application/octet-stream")
+    _ = response.setStatus(@enumFromInt(fcgi.status))
+        .setBody(fcgi.body)
+        .setContentType(fcgi.contentType())
         .setConnection(keep_alive)
         .setHeader(http.correlation.HEADER_NAME, correlation_id);
+
+    for (fcgi.headers.iterator()) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, "status") or
+            std.ascii.eqlIgnoreCase(header.name, "content-type") or
+            std.ascii.eqlIgnoreCase(header.name, "content-length") or
+            std.ascii.eqlIgnoreCase(header.name, "connection"))
+        {
+            continue;
+        }
+        _ = response.setHeader(header.name, header.value);
+    }
+
     applyResponseHeaders(state, &response);
     try response.write(writer);
-    state.metricsRecord(200);
+    state.metricsRecord(fcgi.status);
+    state.releaseFastcgiStream(endpoint, leased.stream, true);
+    return fcgi.status;
 }
 
-fn executeRawProtocolRequest(allocator: std.mem.Allocator, endpoint: []const u8, payload: []const u8) ![]u8 {
-    const ep = try http.memcached.parseEndpoint(endpoint);
-    const stream = try std.net.tcpConnectToHost(allocator, ep.host, ep.port);
-    defer stream.close();
-    try stream.writer().writeAll(payload);
-    var out = std.ArrayList(u8).init(allocator);
-    errdefer out.deinit();
-    var buf: [16 * 1024]u8 = undefined;
-    const n = try stream.read(&buf);
-    if (n > 0) try out.appendSlice(buf[0..n]);
-    return out.toOwnedSlice();
+fn defaultFastcgiScriptPath(
+    allocator: std.mem.Allocator,
+    document_root: []const u8,
+    path_info: []const u8,
+    fastcgi_index: []const u8,
+) ![]u8 {
+    if (document_root.len == 0) {
+        return allocator.dupe(u8, if (std.mem.endsWith(u8, path_info, "/")) fastcgi_index else path_info);
+    }
+    if (std.mem.endsWith(u8, path_info, "/")) {
+        return std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ document_root, path_info, fastcgi_index });
+    }
+    return std.fmt.allocPrint(allocator, "{s}{s}", .{ document_root, path_info });
 }
+
+fn handleScgiRoute(
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    cfg: *const edge_config.EdgeConfig,
+    upstream: []const u8,
+    request: *const http.Request,
+    client_ip: []const u8,
+    correlation_id: []const u8,
+    keep_alive: bool,
+    state: *GatewayState,
+) !u16 {
+    const endpoint = std.mem.trim(u8, upstream, " \t\r\n");
+    if (endpoint.len == 0) {
+        try sendApiError(allocator, writer, .not_implemented, "tool_unavailable", "SCGI upstream not configured", correlation_id, keep_alive, state);
+        return 501;
+    }
+
+    const path_info = request.headers.get("x-scgi-path-info") orelse request.uri.path;
+    const script_name = request.headers.get("x-scgi-script-name") orelse path_info;
+    const document_root = request.headers.get("x-scgi-document-root") orelse "";
+    const host = request.headers.get("host") orelse "";
+    const server_name = stripHostPort(host);
+    var port_buf: [16]u8 = undefined;
+    const server_port = if (hostPort(host)) |port|
+        std.fmt.bufPrint(&port_buf, "{d}", .{port}) catch "80"
+    else if (cfg.listen_port > 0)
+        std.fmt.bufPrint(&port_buf, "{d}", .{cfg.listen_port}) catch "80"
+    else
+        "80";
+
+    var remote_port_buf: [8]u8 = undefined;
+    const remote_port = request.headers.get("x-forwarded-port") orelse request.headers.get("x-real-port") orelse
+        (std.fmt.bufPrint(&remote_port_buf, "{d}", .{0}) catch "0");
+
+    var request_uri = std.ArrayList(u8).init(allocator);
+    defer request_uri.deinit();
+    try request_uri.appendSlice(request.uri.path);
+    if (request.uri.query) |query| {
+        try request_uri.append('?');
+        try request_uri.appendSlice(query);
+    }
+
+    var scgi = http.scgi.execute(allocator, endpoint, .{
+        .method = request.method.toString(),
+        .request_uri = request_uri.items,
+        .query_string = request.uri.query orelse "",
+        .path_info = path_info,
+        .script_name = script_name,
+        .document_root = document_root,
+        .content_type = request.contentType(),
+        .remote_addr = client_ip,
+        .remote_port = remote_port,
+        .server_name = if (server_name.len > 0) server_name else "localhost",
+        .server_port = server_port,
+        .server_protocol = request.version.toString(),
+        .request_scheme = if (cfg.tls_cert_path.len > 0 and cfg.tls_key_path.len > 0) "https" else "http",
+        .https = cfg.tls_cert_path.len > 0 and cfg.tls_key_path.len > 0,
+        .headers = &request.headers,
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_CORRELATION_ID", .value = correlation_id },
+        },
+    }, request.body orelse "") catch |err| {
+        state.logger.warn(correlation_id, "scgi request failed for {s}: {}", .{ endpoint, err });
+        try sendApiError(allocator, writer, .bad_gateway, "tool_unavailable", "SCGI request failed", correlation_id, keep_alive, state);
+        return 502;
+    };
+    defer scgi.deinit();
+
+    var response = http.Response.init(allocator);
+    defer response.deinit();
+    _ = response.setStatus(@enumFromInt(scgi.status))
+        .setBody(scgi.body)
+        .setContentType(scgi.contentType())
+        .setConnection(keep_alive)
+        .setHeader(http.correlation.HEADER_NAME, correlation_id);
+    for (scgi.headers.iterator()) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, "status") or
+            std.ascii.eqlIgnoreCase(header.name, "content-type") or
+            std.ascii.eqlIgnoreCase(header.name, "content-length") or
+            std.ascii.eqlIgnoreCase(header.name, "connection"))
+        {
+            continue;
+        }
+        _ = response.setHeader(header.name, header.value);
+    }
+    applyResponseHeaders(state, &response);
+    try response.write(writer);
+    state.metricsRecord(scgi.status);
+    return scgi.status;
+}
+
+fn handleUwsgiRoute(
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    cfg: *const edge_config.EdgeConfig,
+    upstream: []const u8,
+    request: *const http.Request,
+    client_ip: []const u8,
+    correlation_id: []const u8,
+    keep_alive: bool,
+    state: *GatewayState,
+) !u16 {
+    const endpoint = std.mem.trim(u8, upstream, " \t\r\n");
+    if (endpoint.len == 0) {
+        try sendApiError(allocator, writer, .not_implemented, "tool_unavailable", "uWSGI upstream not configured", correlation_id, keep_alive, state);
+        return 501;
+    }
+
+    const path_info = request.headers.get("x-uwsgi-path-info") orelse request.uri.path;
+    const script_name = request.headers.get("x-uwsgi-script-name") orelse path_info;
+    const document_root = request.headers.get("x-uwsgi-document-root") orelse "";
+    const host = request.headers.get("host") orelse "";
+    const server_name = stripHostPort(host);
+    var port_buf: [16]u8 = undefined;
+    const server_port = if (hostPort(host)) |port|
+        std.fmt.bufPrint(&port_buf, "{d}", .{port}) catch "80"
+    else if (cfg.listen_port > 0)
+        std.fmt.bufPrint(&port_buf, "{d}", .{cfg.listen_port}) catch "80"
+    else
+        "80";
+
+    var remote_port_buf: [8]u8 = undefined;
+    const remote_port = request.headers.get("x-forwarded-port") orelse request.headers.get("x-real-port") orelse
+        (std.fmt.bufPrint(&remote_port_buf, "{d}", .{0}) catch "0");
+
+    var request_uri = std.ArrayList(u8).init(allocator);
+    defer request_uri.deinit();
+    try request_uri.appendSlice(request.uri.path);
+    if (request.uri.query) |query| {
+        try request_uri.append('?');
+        try request_uri.appendSlice(query);
+    }
+
+    var uwsgi = http.uwsgi.execute(allocator, endpoint, .{
+        .method = request.method.toString(),
+        .request_uri = request_uri.items,
+        .query_string = request.uri.query orelse "",
+        .path_info = path_info,
+        .script_name = script_name,
+        .document_root = document_root,
+        .content_type = request.contentType(),
+        .remote_addr = client_ip,
+        .remote_port = remote_port,
+        .server_name = if (server_name.len > 0) server_name else "localhost",
+        .server_port = server_port,
+        .server_protocol = request.version.toString(),
+        .request_scheme = if (cfg.tls_cert_path.len > 0 and cfg.tls_key_path.len > 0) "https" else "http",
+        .https = cfg.tls_cert_path.len > 0 and cfg.tls_key_path.len > 0,
+        .headers = &request.headers,
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_CORRELATION_ID", .value = correlation_id },
+        },
+    }, request.body orelse "") catch |err| {
+        state.logger.warn(correlation_id, "uwsgi request failed for {s}: {}", .{ endpoint, err });
+        try sendApiError(allocator, writer, .bad_gateway, "tool_unavailable", "uWSGI request failed", correlation_id, keep_alive, state);
+        return 502;
+    };
+    defer uwsgi.deinit();
+
+    var response = http.Response.init(allocator);
+    defer response.deinit();
+    _ = response.setStatus(@enumFromInt(uwsgi.status))
+        .setBody(uwsgi.body)
+        .setContentType(uwsgi.contentType())
+        .setConnection(keep_alive)
+        .setHeader(http.correlation.HEADER_NAME, correlation_id);
+    for (uwsgi.headers.iterator()) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, "status") or
+            std.ascii.eqlIgnoreCase(header.name, "content-type") or
+            std.ascii.eqlIgnoreCase(header.name, "content-length") or
+            std.ascii.eqlIgnoreCase(header.name, "connection") or
+            std.ascii.eqlIgnoreCase(header.name, "transfer-encoding"))
+        {
+            continue;
+        }
+        _ = response.setHeader(header.name, header.value);
+    }
+    applyResponseHeaders(state, &response);
+    try response.write(writer);
+    state.metricsRecord(uwsgi.status);
+    return uwsgi.status;
+}
+
 
 fn proxyGrpcExecute(
     allocator: std.mem.Allocator,
@@ -5680,6 +6166,19 @@ fn handleMailProxyRoute(
     applyResponseHeaders(state, &response);
     try response.write(writer);
     state.metricsRecord(200);
+}
+
+fn executeRawProtocolRequest(allocator: std.mem.Allocator, endpoint: []const u8, payload: []const u8) ![]u8 {
+    const ep = try http.memcached.parseEndpoint(endpoint);
+    const stream = try std.net.tcpConnectToHost(allocator, ep.host, ep.port);
+    defer stream.close();
+    try stream.writer().writeAll(payload);
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    var buf: [16 * 1024]u8 = undefined;
+    const n = try stream.read(&buf);
+    if (n > 0) try out.appendSlice(buf[0..n]);
+    return out.toOwnedSlice();
 }
 
 fn executeUdpDatagramRequest(allocator: std.mem.Allocator, endpoint: []const u8, payload: []const u8) ![]u8 {
@@ -7022,6 +7521,20 @@ fn stripHostPort(raw_host: []const u8) []const u8 {
     const head = trimmed[0..colon];
     if (std.mem.indexOfScalar(u8, head, ':') != null) return trimmed;
     return head;
+}
+
+fn hostPort(raw_host: []const u8) ?u16 {
+    const trimmed = std.mem.trim(u8, raw_host, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    if (trimmed[0] == '[') {
+        const end = std.mem.indexOfScalar(u8, trimmed, ']') orelse return null;
+        if (end + 1 >= trimmed.len or trimmed[end + 1] != ':') return null;
+        return std.fmt.parseInt(u16, trimmed[end + 2 ..], 10) catch null;
+    }
+    const colon = std.mem.lastIndexOfScalar(u8, trimmed, ':') orelse return null;
+    const head = trimmed[0..colon];
+    if (std.mem.indexOfScalar(u8, head, ':') != null) return null;
+    return std.fmt.parseInt(u16, trimmed[colon + 1 ..], 10) catch null;
 }
 
 fn matchHostPattern(pattern_raw: []const u8, host: []const u8) bool {
@@ -8710,10 +9223,13 @@ test "resolveProxyTarget handles absolute and relative proxy_pass" {
         .sse_idle_timeout_ms = 60_000,
         .rewrite_rules = &[_]edge_config.EdgeConfig.RewriteRule{},
         .return_rules = &[_]edge_config.EdgeConfig.ReturnRule{},
+        .conditional_rules = &[_]edge_config.EdgeConfig.ConditionalRule{},
         .internal_redirect_rules = &[_]edge_config.EdgeConfig.InternalRedirectRule{},
         .named_locations = &[_]edge_config.EdgeConfig.NamedLocation{},
         .mirror_rules = &[_]edge_config.EdgeConfig.MirrorRule{},
         .fastcgi_upstream = "",
+        .fastcgi_params = &[_]edge_config.EdgeConfig.HeaderPair{},
+        .fastcgi_index = "index.php",
         .uwsgi_upstream = "",
         .scgi_upstream = "",
         .grpc_upstream = "",
@@ -8902,10 +9418,13 @@ test "authorizeRequest accepts valid hash" {
         .sse_idle_timeout_ms = 60_000,
         .rewrite_rules = &[_]edge_config.EdgeConfig.RewriteRule{},
         .return_rules = &[_]edge_config.EdgeConfig.ReturnRule{},
+        .conditional_rules = &[_]edge_config.EdgeConfig.ConditionalRule{},
         .internal_redirect_rules = &[_]edge_config.EdgeConfig.InternalRedirectRule{},
         .named_locations = &[_]edge_config.EdgeConfig.NamedLocation{},
         .mirror_rules = &[_]edge_config.EdgeConfig.MirrorRule{},
         .fastcgi_upstream = "",
+        .fastcgi_params = &[_]edge_config.EdgeConfig.HeaderPair{},
+        .fastcgi_index = "index.php",
         .uwsgi_upstream = "",
         .scgi_upstream = "",
         .grpc_upstream = "",

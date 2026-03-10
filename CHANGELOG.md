@@ -65,6 +65,20 @@
   - Added gateway-backed `/v1/sessions/refresh` handling over HTTP/3, with live QUIC coverage for session-token refresh and rotated token headers.
   - Archived the old QUIC parser/tracker stub as `src/http/quic_stub.zig` and repointed live HTTP/3 imports at that explicit stub name now that real transport ownership lives in `ngtcp2_binding.zig`.
   - Removed the old standalone `src/http/qpack.zig` stub by inlining the remaining literal header-block helper into `src/http/http3_session.zig` and repointing HTTP/3 handler code at the session-layer types.
+  - Added a dedicated HTTP/3 resumption harness (`tests/http3_resumption_client.zig`) that drives the upstream ngtcp2/OpenSSL `osslclient` with TLS session and QUIC transport-parameter reuse to prove 0-RTT over the live Tardigrade QUIC listener.
+  - Started Upgrade 4 FastCGI protocol implementation by replacing the envelope-only FastCGI bridge with full record framing, CGI env construction, response parsing, and end-to-end integration coverage against an in-repo FastCGI mock server.
+  - Added FastCGI upstream connection reuse with a per-endpoint keep-conn socket pool and integration coverage proving sequential requests reuse the same backend connection.
+  - Added FastCGI request-ID tracking on reused backend sockets, including target-request response parsing and integration coverage that verifies request IDs advance across a reused FastCGI connection.
+  - Completed Upgrade 4.1 SCGI by replacing the request-only stub with full SCGI CGI-env encoding, parsed response handling, and end-to-end integration coverage against an in-repo SCGI mock server.
+  - Started Upgrade 4.2 uWSGI by replacing the request-only stub with full variable-packet encoding, parsed response handling, and end-to-end integration coverage against an in-repo uWSGI mock server.
+  - Completed the remaining Upgrade 4.2 chunked uWSGI response path by decoding upstream `Transfer-Encoding: chunked` bodies before mapping them back into normal gateway responses, with live integration coverage.
+  - Completed Upgrade 4.3 backend protocol config integration by wiring `fastcgi_pass`, `scgi_pass`, `uwsgi_pass`, `fastcgi_param`, and `fastcgi_index` through the config-file parser, runtime config, and FastCGI execution path.
+  - Added a real PHP-FPM integration test that boots a private `php-fpm` instance on a Unix socket and proves `/v1/backend/fastcgi` returns a parsed live FastCGI response.
+  - Added capture-substitution rewrite support (`$1`, `$2`, ...) plus rewrite unit/integration coverage for `last`, `break`, `redirect`, `permanent`, and transparent path rewrites.
+  - Added `rewrite` directive parsing in `src/http/config_file.zig`, with config-driven integration coverage for transparent rewrites.
+  - Added `return` directive parsing and redirect semantics, including `$request_uri` expansion and config-driven integration coverage for `return 301 https://example.com$request_uri`.
+  - Added named capture substitution support in rewrite patterns, translating `(?P<name>...)` groups into POSIX-regex captures internally and expanding `$name` in replacements.
+  - Added the first conditional rewrite/return support for inline `if (...)` directives with `$http_host`, `$request_uri`, and `$args` matching, including case-insensitive `~*` conditions.
 
 ### Fixed
 - Upgrade 1 integration hardening in the live gateway path:
@@ -92,7 +106,13 @@
     - widened HTTP/3 curl retry timing in the live QUIC tests,
     - refreshed device-auth timestamps/signatures per request in the device/session integration test,
     - reduced the mixed auth/rate contention fan-out and widened its timeout to avoid scheduler-noise failures in the full suite.
-  - Fixed QUIC TLS bootstrap to advertise explicit early-data capacity and surfaced `http3_zero_rtt_packets_seen` in `/health` for future 0-RTT diagnostics, even though the available local HTTP/3 client backends still do not provide a usable end-to-end early-data probe.
+  - Fixed QUIC TLS bootstrap to align more closely with the upstream ngtcp2/OpenSSL server defaults for TLS 1.3 early data, including server-only TLS context creation, certificate-chain loading, explicit TLS 1.3 ciphersuite/group defaults, and session-ticket reuse.
+  - Fixed HTTP/3 resumption observability by replacing the dead libcurl-based 0-RTT probe with the real ngtcp2/OpenSSL client path and by counting coalesced Initial + 0-RTT packets correctly in `src/http/quic_stub.zig`.
+  - Fixed `/v1/backend/fastcgi` to return parsed FastCGI responses instead of raw protocol bytes, log FastCGI `STDERR` at WARN level, and map non-zero `FCGI_END_REQUEST` app status to `502`.
+  - Fixed the FastCGI backend route to honor configured `root`, `fastcgi_param`, and `fastcgi_index` defaults while still allowing request-header overrides for script metadata during targeted protocol tests.
+  - Fixed the integration HTTP response reader to stop waiting for EOF when a `Content-Length` header is present, which removed a graceful-shutdown suite failure under the longer backend/rewrite test matrix.
+  - Fixed integration startup readiness to allow tests to declare a non-200 ready status, which is required for full-gateway redirect configurations such as top-level `return 301`.
+  - Fixed the integration shutdown response reader to tolerate peer resets after partial response bytes and added failure-safe child cleanup in the inflight shutdown tests.
 
 ## [0.29.0] - 2026-03-08
 

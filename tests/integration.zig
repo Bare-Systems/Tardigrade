@@ -6,6 +6,8 @@ const test_host = "127.0.0.1";
 const valid_bearer_token = "integration-token";
 const valid_bearer_hash = "521bc8ca01307d0189b55a19da738e39c7204f7077e0076e803026e32b2f9383";
 const http3_curl_path = "/opt/homebrew/opt/curl/bin/curl";
+const http3_resumption_client_bin_path = integration_options.http3_resumption_client_bin_path;
+const http3_osslclient_bin_path = integration_options.http3_osslclient_bin_path;
 const expected_server_header = "tardigrade/0.4.1";
 const http3_retry_attempts: usize = 20;
 const http3_retry_delay_ms: u64 = 250;
@@ -41,6 +43,29 @@ const UpstreamResponseSpec = struct {
     delay_ms: u32 = 0,
 };
 
+const FastCgiResponseSpec = struct {
+    status_code: u16 = 200,
+    headers: []const ResponseHeader = &.{.{ .name = "Content-Type", .value = "text/plain" }},
+    body: []const u8 = "ok",
+    stderr: []const u8 = "",
+    app_status: u32 = 0,
+    protocol_status: u8 = 0,
+};
+
+const ScgiResponseSpec = struct {
+    status_code: u16 = 200,
+    headers: []const ResponseHeader = &.{.{ .name = "Content-Type", .value = "text/plain" }},
+    body: []const u8 = "ok",
+    http_status_line: bool = true,
+};
+
+const UwsgiResponseSpec = struct {
+    status_code: u16 = 200,
+    headers: []const ResponseHeader = &.{.{ .name = "Content-Type", .value = "text/plain" }},
+    body: []const u8 = "ok",
+    http_status_line: bool = true,
+};
+
 const TardigradeOptions = struct {
     upstream_port: ?u16 = null,
     auth_token_hashes: ?[]const u8 = valid_bearer_hash,
@@ -52,6 +77,7 @@ const TardigradeOptions = struct {
     ready_https_insecure: bool = false,
     ready_client_cert: ?[]const u8 = null,
     ready_client_key: ?[]const u8 = null,
+    ready_status_code: u16 = 200,
 };
 
 const HttpResponse = struct {
@@ -159,6 +185,91 @@ const RequestCapture = struct {
     }
 };
 
+const FastCgiCapture = struct {
+    allocator: std.mem.Allocator,
+    raw: []u8,
+    request_count: u32,
+    last_request_id: u16,
+
+    fn init(allocator: std.mem.Allocator) !FastCgiCapture {
+        return .{
+            .allocator = allocator,
+            .raw = try allocator.dupe(u8, ""),
+            .request_count = 0,
+            .last_request_id = 0,
+        };
+    }
+
+    fn deinit(self: *FastCgiCapture) void {
+        self.allocator.free(self.raw);
+        self.* = undefined;
+    }
+
+    fn reset(self: *FastCgiCapture) !void {
+        self.allocator.free(self.raw);
+        self.raw = try self.allocator.dupe(u8, "");
+        self.request_count = 0;
+        self.last_request_id = 0;
+    }
+
+    fn record(self: *FastCgiCapture, raw: []const u8) !void {
+        self.allocator.free(self.raw);
+        self.raw = try self.allocator.dupe(u8, raw);
+        self.request_count += 1;
+        self.last_request_id = if (raw.len >= 4) std.mem.readInt(u16, raw[2..4], .big) else 0;
+    }
+};
+
+const ScgiCapture = struct {
+    allocator: std.mem.Allocator,
+    raw: []u8,
+    request_count: u32,
+
+    fn init(allocator: std.mem.Allocator) !ScgiCapture {
+        return .{
+            .allocator = allocator,
+            .raw = try allocator.dupe(u8, ""),
+            .request_count = 0,
+        };
+    }
+
+    fn deinit(self: *ScgiCapture) void {
+        self.allocator.free(self.raw);
+        self.* = undefined;
+    }
+
+    fn record(self: *ScgiCapture, raw: []const u8) !void {
+        self.allocator.free(self.raw);
+        self.raw = try self.allocator.dupe(u8, raw);
+        self.request_count += 1;
+    }
+};
+
+const UwsgiCapture = struct {
+    allocator: std.mem.Allocator,
+    raw: []u8,
+    request_count: u32,
+
+    fn init(allocator: std.mem.Allocator) !UwsgiCapture {
+        return .{
+            .allocator = allocator,
+            .raw = try allocator.dupe(u8, ""),
+            .request_count = 0,
+        };
+    }
+
+    fn deinit(self: *UwsgiCapture) void {
+        self.allocator.free(self.raw);
+        self.* = undefined;
+    }
+
+    fn record(self: *UwsgiCapture, raw: []const u8) !void {
+        self.allocator.free(self.raw);
+        self.raw = try self.allocator.dupe(u8, raw);
+        self.request_count += 1;
+    }
+};
+
 const UpstreamServer = struct {
     allocator: std.mem.Allocator,
     server: std.net.Server,
@@ -223,6 +334,134 @@ const UpstreamServer = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         return headerValue(self.capture.headers_raw, name);
+    }
+};
+
+const FastCgiServer = struct {
+    allocator: std.mem.Allocator,
+    server: std.net.Server,
+    thread: ?std.Thread,
+    stop_flag: std.atomic.Value(bool),
+    mutex: std.Thread.Mutex = .{},
+    capture: FastCgiCapture,
+    responses: []const FastCgiResponseSpec,
+    next_response_index: usize,
+    accepted_connections: u32,
+
+    fn start(allocator: std.mem.Allocator, responses: []const FastCgiResponseSpec) !FastCgiServer {
+        const address = try std.net.Address.parseIp(test_host, 0);
+        const server = try std.net.Address.listen(address, .{ .reuse_address = true });
+        return .{
+            .allocator = allocator,
+            .server = server,
+            .thread = null,
+            .stop_flag = std.atomic.Value(bool).init(false),
+            .capture = try FastCgiCapture.init(allocator),
+            .responses = responses,
+            .next_response_index = 0,
+            .accepted_connections = 0,
+        };
+    }
+
+    fn port(self: *const FastCgiServer) u16 {
+        return self.server.listen_address.getPort();
+    }
+
+    fn run(self: *FastCgiServer) !void {
+        self.thread = try std.Thread.spawn(.{}, fastCgiThreadMain, .{self});
+    }
+
+    fn stop(self: *FastCgiServer) void {
+        self.stop_flag.store(true, .seq_cst);
+        wakeListener(self.port());
+        if (self.thread) |thread| thread.join();
+        self.server.deinit();
+        self.capture.deinit();
+        self.* = undefined;
+    }
+};
+
+const ScgiServer = struct {
+    allocator: std.mem.Allocator,
+    server: std.net.Server,
+    thread: ?std.Thread,
+    stop_flag: std.atomic.Value(bool),
+    mutex: std.Thread.Mutex = .{},
+    capture: ScgiCapture,
+    responses: []const ScgiResponseSpec,
+    next_response_index: usize,
+
+    fn start(allocator: std.mem.Allocator, responses: []const ScgiResponseSpec) !ScgiServer {
+        const address = try std.net.Address.parseIp(test_host, 0);
+        const server = try std.net.Address.listen(address, .{ .reuse_address = true });
+        return .{
+            .allocator = allocator,
+            .server = server,
+            .thread = null,
+            .stop_flag = std.atomic.Value(bool).init(false),
+            .capture = try ScgiCapture.init(allocator),
+            .responses = responses,
+            .next_response_index = 0,
+        };
+    }
+
+    fn port(self: *const ScgiServer) u16 {
+        return self.server.listen_address.getPort();
+    }
+
+    fn run(self: *ScgiServer) !void {
+        self.thread = try std.Thread.spawn(.{}, scgiThreadMain, .{self});
+    }
+
+    fn stop(self: *ScgiServer) void {
+        self.stop_flag.store(true, .seq_cst);
+        wakeListener(self.port());
+        if (self.thread) |thread| thread.join();
+        self.server.deinit();
+        self.capture.deinit();
+        self.* = undefined;
+    }
+};
+
+const UwsgiServer = struct {
+    allocator: std.mem.Allocator,
+    server: std.net.Server,
+    thread: ?std.Thread,
+    stop_flag: std.atomic.Value(bool),
+    mutex: std.Thread.Mutex = .{},
+    capture: UwsgiCapture,
+    responses: []const UwsgiResponseSpec,
+    next_response_index: usize,
+
+    fn start(allocator: std.mem.Allocator, responses: []const UwsgiResponseSpec) !UwsgiServer {
+        const address = try std.net.Address.parseIp(test_host, 0);
+        const server = try std.net.Address.listen(address, .{ .reuse_address = true });
+        return .{
+            .allocator = allocator,
+            .server = server,
+            .thread = null,
+            .stop_flag = std.atomic.Value(bool).init(false),
+            .capture = try UwsgiCapture.init(allocator),
+            .responses = responses,
+            .next_response_index = 0,
+        };
+    }
+
+    fn port(self: *const UwsgiServer) u16 {
+        return self.server.listen_address.getPort();
+    }
+
+    fn run(self: *UwsgiServer) !void {
+        self.thread = try std.Thread.spawn(.{}, uwsgiThreadMain, .{self});
+    }
+
+    fn stop(self: *UwsgiServer) void {
+        self.stop_flag.store(true, .seq_cst);
+        wakeListener(self.port());
+        if (self.thread) |thread| thread.join();
+        self.server.deinit();
+        self.capture.deinit();
+        self.* = undefined;
     }
 };
 
@@ -315,6 +554,135 @@ const TardigradeProcess = struct {
     }
 };
 
+const PhpFpmProcess = struct {
+    allocator: std.mem.Allocator,
+    child: std.process.Child,
+    dir_rel: []u8,
+    socket_path: []u8,
+    script_path: []u8,
+    log_path: []u8,
+    config_path: []u8,
+
+    fn start(allocator: std.mem.Allocator) !PhpFpmProcess {
+        const binary = findPhpFpmBinary() orelse return error.SkipZigTest;
+        const cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+        defer allocator.free(cwd);
+
+        const unique = std.time.nanoTimestamp();
+        const dir_rel = try std.fmt.allocPrint(allocator, ".zig-cache/php-fpm-{d}", .{unique});
+        errdefer allocator.free(dir_rel);
+        try std.fs.cwd().makePath(dir_rel);
+
+        const dir_abs = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ cwd, dir_rel });
+        defer allocator.free(dir_abs);
+
+        const socket_path = try std.fmt.allocPrint(allocator, "{s}/php-fpm.sock", .{dir_abs});
+        errdefer allocator.free(socket_path);
+        const log_path = try std.fmt.allocPrint(allocator, "{s}/php-fpm.log", .{dir_abs});
+        errdefer allocator.free(log_path);
+        const config_path = try std.fmt.allocPrint(allocator, "{s}/php-fpm.conf", .{dir_abs});
+        errdefer allocator.free(config_path);
+        const script_path = try std.fmt.allocPrint(allocator, "{s}/index.php", .{dir_abs});
+        errdefer allocator.free(script_path);
+        const config_rel = try std.fmt.allocPrint(allocator, "{s}/php-fpm.conf", .{dir_rel});
+        defer allocator.free(config_rel);
+        const script_rel = try std.fmt.allocPrint(allocator, "{s}/index.php", .{dir_rel});
+        defer allocator.free(script_rel);
+
+        try std.fs.cwd().writeFile(.{
+            .sub_path = script_rel,
+            .data =
+            \\<?php
+            \\header("Content-Type: application/json");
+            \\echo json_encode([
+            \\  "method" => $_SERVER["REQUEST_METHOD"] ?? "",
+            \\  "script" => $_SERVER["SCRIPT_FILENAME"] ?? "",
+            \\  "query" => $_SERVER["QUERY_STRING"] ?? "",
+            \\  "body" => file_get_contents("php://input"),
+            \\], JSON_UNESCAPED_SLASHES);
+            ,
+        });
+
+        const config_text = try std.fmt.allocPrint(
+            allocator,
+            \\[global]
+            \\daemonize = no
+            \\error_log = {s}
+            \\pid = {s}/php-fpm.pid
+            \\
+            \\[www]
+            \\listen = {s}
+            \\listen.mode = 0666
+            \\pm = static
+            \\pm.max_children = 1
+            \\clear_env = no
+            \\catch_workers_output = yes
+            \\chdir = {s}
+            ,
+            .{ log_path, dir_abs, socket_path, dir_abs },
+        );
+        defer allocator.free(config_text);
+        try std.fs.cwd().writeFile(.{ .sub_path = config_rel, .data = config_text });
+
+        var argv = [_][]const u8{ binary, "--nodaemonize", "--fpm-config", config_path };
+        var child = std.process.Child.init(&argv, allocator);
+        child.stdin_behavior = .Ignore;
+        child.stdout_behavior = .Ignore;
+        child.stderr_behavior = .Ignore;
+        try child.spawn();
+
+        var proc = PhpFpmProcess{
+            .allocator = allocator,
+            .child = child,
+            .dir_rel = dir_rel,
+            .socket_path = socket_path,
+            .script_path = script_path,
+            .log_path = log_path,
+            .config_path = config_path,
+        };
+        errdefer proc.stop();
+        try waitUntilUnixSocketReady(socket_path, log_path);
+        return proc;
+    }
+
+    fn stop(self: *PhpFpmProcess) void {
+        _ = self.child.kill() catch {};
+        _ = self.child.wait() catch {};
+        std.fs.cwd().deleteTree(self.dir_rel) catch {};
+        self.allocator.free(self.dir_rel);
+        self.allocator.free(self.socket_path);
+        self.allocator.free(self.script_path);
+        self.allocator.free(self.log_path);
+        self.allocator.free(self.config_path);
+        self.* = undefined;
+    }
+};
+
+fn findPhpFpmBinary() ?[]const u8 {
+    const candidates = [_][]const u8{
+        "/opt/homebrew/opt/php/sbin/php-fpm",
+        "/opt/homebrew/sbin/php-fpm",
+        "/usr/local/opt/php/sbin/php-fpm",
+        "/usr/local/sbin/php-fpm",
+        "/opt/homebrew/opt/php@8.5/sbin/php-fpm",
+    };
+    for (candidates) |candidate| {
+        std.fs.accessAbsolute(candidate, .{}) catch continue;
+        return candidate;
+    }
+    return null;
+}
+
+fn waitUntilUnixSocketReady(socket_path: []const u8, log_path: []const u8) !void {
+    var attempts: usize = 0;
+    while (attempts < 100) : (attempts += 1) {
+        if (std.fs.accessAbsolute(socket_path, .{})) |_| return else |_| {}
+        std.time.sleep(100 * std.time.ns_per_ms);
+    }
+    _ = log_path;
+    return error.Timeout;
+}
+
 const RawHttpMessage = struct {
     raw: []u8,
     request_line: []const u8,
@@ -331,6 +699,51 @@ fn upstreamThreadMain(server: *UpstreamServer) void {
         };
         handleUpstreamConnection(server, conn) catch |err| {
             std.debug.print("upstream handler failed: {}\n", .{err});
+        };
+        if (server.stop_flag.load(.seq_cst)) return;
+    }
+}
+
+fn fastCgiThreadMain(server: *FastCgiServer) void {
+    while (true) {
+        const conn = server.server.accept() catch |err| {
+            if (server.stop_flag.load(.seq_cst)) return;
+            std.debug.print("fastcgi accept failed: {}\n", .{err});
+            return;
+        };
+        server.mutex.lock();
+        server.accepted_connections += 1;
+        server.mutex.unlock();
+        handleFastCgiConnection(server, conn) catch |err| {
+            std.debug.print("fastcgi handler failed: {}\n", .{err});
+        };
+        if (server.stop_flag.load(.seq_cst)) return;
+    }
+}
+
+fn scgiThreadMain(server: *ScgiServer) void {
+    while (true) {
+        const conn = server.server.accept() catch |err| {
+            if (server.stop_flag.load(.seq_cst)) return;
+            std.debug.print("scgi accept failed: {}\n", .{err});
+            return;
+        };
+        handleScgiConnection(server, conn) catch |err| {
+            std.debug.print("scgi handler failed: {}\n", .{err});
+        };
+        if (server.stop_flag.load(.seq_cst)) return;
+    }
+}
+
+fn uwsgiThreadMain(server: *UwsgiServer) void {
+    while (true) {
+        const conn = server.server.accept() catch |err| {
+            if (server.stop_flag.load(.seq_cst)) return;
+            std.debug.print("uwsgi accept failed: {}\n", .{err});
+            return;
+        };
+        handleUwsgiConnection(server, conn) catch |err| {
+            std.debug.print("uwsgi handler failed: {}\n", .{err});
         };
         if (server.stop_flag.load(.seq_cst)) return;
     }
@@ -388,6 +801,94 @@ fn handleUpstreamConnection(server: *UpstreamServer, conn: std.net.Server.Connec
     try conn.stream.writer().print("\r\n{s}", .{response_spec.body});
 }
 
+fn handleFastCgiConnection(server: *FastCgiServer, conn: std.net.Server.Connection) !void {
+    defer conn.stream.close();
+    while (true) {
+        const maybe_req = try readFastCgiRequest(server.allocator, conn.stream, 1024 * 1024);
+        const req = maybe_req orelse return;
+        defer server.allocator.free(req);
+        const request_id = fastCgiRequestId(req) orelse 1;
+
+        server.mutex.lock();
+        defer server.mutex.unlock();
+        try server.capture.record(req);
+
+        const response_spec = if (server.responses.len == 0)
+            FastCgiResponseSpec{}
+        else blk: {
+            const idx = if (server.next_response_index < server.responses.len) server.next_response_index else server.responses.len - 1;
+            if (server.next_response_index < server.responses.len) server.next_response_index += 1;
+            break :blk server.responses[idx];
+        };
+
+        const stdout_payload = try buildFastCgiStdoutPayload(server.allocator, response_spec);
+        defer server.allocator.free(stdout_payload);
+
+        if (response_spec.stderr.len > 0) {
+            try writeFastCgiRecord(conn.stream.writer(), 7, request_id, response_spec.stderr);
+        }
+        try writeFastCgiRecord(conn.stream.writer(), 6, request_id, stdout_payload);
+        try writeFastCgiRecord(conn.stream.writer(), 6, request_id, "");
+        try writeFastCgiEndRequest(conn.stream.writer(), request_id, response_spec.app_status, response_spec.protocol_status);
+    }
+}
+
+fn handleScgiConnection(server: *ScgiServer, conn: std.net.Server.Connection) !void {
+    defer conn.stream.close();
+    const req = try readScgiRequest(server.allocator, conn.stream, 1024 * 1024);
+    defer server.allocator.free(req);
+
+    server.mutex.lock();
+    defer server.mutex.unlock();
+    try server.capture.record(req);
+
+    const response_spec = if (server.responses.len == 0)
+        ScgiResponseSpec{}
+    else blk: {
+        const idx = if (server.next_response_index < server.responses.len) server.next_response_index else server.responses.len - 1;
+        if (server.next_response_index < server.responses.len) server.next_response_index += 1;
+        break :blk server.responses[idx];
+    };
+
+    if (response_spec.http_status_line) {
+        try conn.stream.writer().print("HTTP/1.1 {d} {s}\r\n", .{ response_spec.status_code, httpReason(response_spec.status_code) });
+    } else {
+        try conn.stream.writer().print("Status: {d} {s}\r\n", .{ response_spec.status_code, httpReason(response_spec.status_code) });
+    }
+    for (response_spec.headers) |header| {
+        try conn.stream.writer().print("{s}: {s}\r\n", .{ header.name, header.value });
+    }
+    try conn.stream.writer().print("\r\n{s}", .{response_spec.body});
+}
+
+fn handleUwsgiConnection(server: *UwsgiServer, conn: std.net.Server.Connection) !void {
+    defer conn.stream.close();
+    const req = try readUwsgiRequest(server.allocator, conn.stream, 1024 * 1024);
+    defer server.allocator.free(req);
+
+    server.mutex.lock();
+    defer server.mutex.unlock();
+    try server.capture.record(req);
+
+    const response_spec = if (server.responses.len == 0)
+        UwsgiResponseSpec{}
+    else blk: {
+        const idx = if (server.next_response_index < server.responses.len) server.next_response_index else server.responses.len - 1;
+        if (server.next_response_index < server.responses.len) server.next_response_index += 1;
+        break :blk server.responses[idx];
+    };
+
+    if (response_spec.http_status_line) {
+        try conn.stream.writer().print("HTTP/1.1 {d} {s}\r\n", .{ response_spec.status_code, httpReason(response_spec.status_code) });
+    } else {
+        try conn.stream.writer().print("Status: {d} {s}\r\n", .{ response_spec.status_code, httpReason(response_spec.status_code) });
+    }
+    for (response_spec.headers) |header| {
+        try conn.stream.writer().print("{s}: {s}\r\n", .{ header.name, header.value });
+    }
+    try conn.stream.writer().print("\r\n{s}", .{response_spec.body});
+}
+
 fn readHttpMessage(allocator: std.mem.Allocator, stream: std.net.Stream, max_bytes: usize) !RawHttpMessage {
     var buf = std.ArrayList(u8).init(allocator);
     errdefer buf.deinit();
@@ -422,6 +923,174 @@ fn readHttpMessage(allocator: std.mem.Allocator, stream: std.net.Stream, max_byt
         .request_line = raw[0..request_line_end],
         .headers_raw = headers_raw,
         .body = raw[body_start..],
+    };
+}
+
+fn readFastCgiRequest(allocator: std.mem.Allocator, stream: std.net.Stream, max_bytes: usize) !?[]u8 {
+    var buf = std.ArrayList(u8).init(allocator);
+    errdefer buf.deinit();
+    var tmp: [4096]u8 = undefined;
+
+    while (true) {
+        const read_n = try stream.read(&tmp);
+        if (read_n == 0) {
+            if (buf.items.len == 0) return null;
+            break;
+        }
+        try buf.appendSlice(tmp[0..read_n]);
+        if (buf.items.len > max_bytes) return error.MessageTooLarge;
+        if (fastCgiRequestComplete(buf.items)) break;
+    }
+
+    if (buf.items.len == 0) return null;
+    const owned = try buf.toOwnedSlice();
+    return owned;
+}
+
+fn readScgiRequest(allocator: std.mem.Allocator, stream: std.net.Stream, max_bytes: usize) ![]u8 {
+    var buf = std.ArrayList(u8).init(allocator);
+    errdefer buf.deinit();
+    var tmp: [4096]u8 = undefined;
+    while (true) {
+        const read_n = try stream.read(&tmp);
+        if (read_n == 0) break;
+        try buf.appendSlice(tmp[0..read_n]);
+        if (buf.items.len > max_bytes) return error.MessageTooLarge;
+        if (scgiRequestComplete(buf.items)) break;
+    }
+    return try buf.toOwnedSlice();
+}
+
+fn readUwsgiRequest(allocator: std.mem.Allocator, stream: std.net.Stream, max_bytes: usize) ![]u8 {
+    var header: [4]u8 = undefined;
+    try stream.reader().readNoEof(&header);
+    const vars_len = @as(usize, header[1]) | (@as(usize, header[2]) << 8);
+    const vars = try allocator.alloc(u8, vars_len);
+    defer allocator.free(vars);
+    try stream.reader().readNoEof(vars);
+    const content_length = uwsgiContentLength(vars);
+    const body = try allocator.alloc(u8, content_length);
+    defer allocator.free(body);
+    try stream.reader().readNoEof(body);
+
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    try out.appendSlice(&header);
+    try out.appendSlice(vars);
+    try out.appendSlice(body);
+    if (out.items.len > max_bytes) return error.MessageTooLarge;
+    return try out.toOwnedSlice();
+}
+
+fn uwsgiContentLength(vars: []const u8) usize {
+    var i: usize = 0;
+    while (i + 4 <= vars.len) {
+        const key_len = @as(usize, vars[i]) | (@as(usize, vars[i + 1]) << 8);
+        const value_len = @as(usize, vars[i + 2]) | (@as(usize, vars[i + 3]) << 8);
+        const key_start = i + 4;
+        const key_end = key_start + key_len;
+        const value_end = key_end + value_len;
+        if (value_end > vars.len) break;
+        const key = vars[key_start..key_end];
+        const value = vars[key_end..value_end];
+        if (std.mem.eql(u8, key, "CONTENT_LENGTH")) {
+            return std.fmt.parseInt(usize, value, 10) catch 0;
+        }
+        i = value_end;
+    }
+    return 0;
+}
+
+fn scgiRequestComplete(data: []const u8) bool {
+    const colon = std.mem.indexOfScalar(u8, data, ':') orelse return false;
+    const net_len = std.fmt.parseInt(usize, data[0..colon], 10) catch return false;
+    const headers_end = colon + 1 + net_len;
+    if (headers_end >= data.len or data[headers_end] != ',') return false;
+    const header_blob = data[colon + 1 .. headers_end];
+    const content_length = scgiContentLength(header_blob);
+    return data.len >= headers_end + 1 + content_length;
+}
+
+fn scgiContentLength(header_blob: []const u8) usize {
+    var i: usize = 0;
+    while (i < header_blob.len) {
+        const key_end_rel = std.mem.indexOfScalarPos(u8, header_blob, i, 0) orelse break;
+        const key = header_blob[i..key_end_rel];
+        const value_start = key_end_rel + 1;
+        const value_end_rel = std.mem.indexOfScalarPos(u8, header_blob, value_start, 0) orelse break;
+        const value = header_blob[value_start..value_end_rel];
+        if (std.mem.eql(u8, key, "CONTENT_LENGTH")) {
+            return std.fmt.parseInt(usize, value, 10) catch 0;
+        }
+        i = value_end_rel + 1;
+    }
+    return 0;
+}
+
+fn fastCgiRequestComplete(data: []const u8) bool {
+    var pos: usize = 0;
+    while (pos + 8 <= data.len) {
+        if (data[pos] != 1) return false;
+        const record_type = data[pos + 1];
+        const content_len = std.mem.readInt(u16, data[pos + 4 ..][0..2], .big);
+        const padding_len = data[pos + 6];
+        const record_len = 8 + content_len + padding_len;
+        if (record_len > data.len - pos) return false;
+        if (record_type == 5 and content_len == 0) return true;
+        pos += record_len;
+    }
+    return false;
+}
+
+fn fastCgiRequestId(data: []const u8) ?u16 {
+    if (data.len < 4 or data[0] != 1) return null;
+    return std.mem.readInt(u16, data[2..4], .big);
+}
+
+fn buildFastCgiStdoutPayload(allocator: std.mem.Allocator, spec: FastCgiResponseSpec) ![]u8 {
+    var payload = std.ArrayList(u8).init(allocator);
+    errdefer payload.deinit();
+    try payload.writer().print("Status: {d} {s}\r\n", .{ spec.status_code, httpReason(spec.status_code) });
+    for (spec.headers) |header| {
+        try payload.writer().print("{s}: {s}\r\n", .{ header.name, header.value });
+    }
+    try payload.appendSlice("\r\n");
+    try payload.appendSlice(spec.body);
+    return payload.toOwnedSlice();
+}
+
+fn writeFastCgiRecord(writer: anytype, record_type: u8, request_id: u16, payload: []const u8) !void {
+    try writer.writeByte(1);
+    try writer.writeByte(record_type);
+    try writer.writeByte(@intCast((request_id >> 8) & 0xff));
+    try writer.writeByte(@intCast(request_id & 0xff));
+    try writer.writeByte(@intCast((payload.len >> 8) & 0xff));
+    try writer.writeByte(@intCast(payload.len & 0xff));
+    try writer.writeByte(0);
+    try writer.writeByte(0);
+    try writer.writeAll(payload);
+}
+
+fn writeFastCgiEndRequest(writer: anytype, request_id: u16, app_status: u32, protocol_status: u8) !void {
+    var body: [8]u8 = .{ 0, 0, 0, 0, protocol_status, 0, 0, 0 };
+    std.mem.writeInt(u32, body[0..4], app_status, .big);
+    try writeFastCgiRecord(writer, 3, request_id, &body);
+}
+
+fn httpReason(status_code: u16) []const u8 {
+    return switch (status_code) {
+        200 => "OK",
+        201 => "Created",
+        202 => "Accepted",
+        204 => "No Content",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        429 => "Too Many Requests",
+        500 => "Internal Server Error",
+        502 => "Bad Gateway",
+        else => "OK",
     };
 }
 
@@ -517,9 +1186,41 @@ fn setStreamTimeouts(stream: *std.net.Stream, timeout_ms: u64) !void {
 }
 
 fn readHttpResponse(allocator: std.mem.Allocator, stream: std.net.Stream) !HttpResponse {
-    const raw = try stream.reader().readAllAlloc(allocator, 1024 * 1024);
+    var raw_buf = std.ArrayList(u8).init(allocator);
+    errdefer raw_buf.deinit();
+    var tmp: [4096]u8 = undefined;
+    var header_end: ?usize = null;
+    var target_len: ?usize = null;
+
+    while (true) {
+        if (target_len) |needed| {
+            if (raw_buf.items.len >= needed) break;
+        }
+        const n = stream.read(&tmp) catch |err| switch (err) {
+            error.ConnectionResetByPeer => {
+                if (raw_buf.items.len > 0) break;
+                return err;
+            },
+            else => return err,
+        };
+        if (n == 0) break;
+        try raw_buf.appendSlice(tmp[0..n]);
+
+        if (header_end == null) {
+            if (std.mem.indexOf(u8, raw_buf.items, "\r\n\r\n")) |idx| {
+                header_end = idx;
+                const headers_raw = raw_buf.items[0 .. idx + 2];
+                if (headerValue(headers_raw, "Content-Length")) |content_length_raw| {
+                    const content_length = std.fmt.parseInt(usize, content_length_raw, 10) catch return error.InvalidHttpResponse;
+                    target_len = idx + 4 + content_length;
+                }
+            }
+        }
+    }
+
+    const raw = try raw_buf.toOwnedSlice();
     errdefer allocator.free(raw);
-    const header_end = std.mem.indexOf(u8, raw, "\r\n\r\n") orelse return error.InvalidHttpResponse;
+    const final_header_end = header_end orelse std.mem.indexOf(u8, raw, "\r\n\r\n") orelse return error.InvalidHttpResponse;
     const status_end = std.mem.indexOf(u8, raw, "\r\n") orelse return error.InvalidHttpResponse;
     const status_line = raw[0..status_end];
     var parts = std.mem.splitScalar(u8, status_line, ' ');
@@ -530,8 +1231,8 @@ fn readHttpResponse(allocator: std.mem.Allocator, stream: std.net.Stream) !HttpR
         .allocator = allocator,
         .raw = raw,
         .status_code = status_code,
-        .headers_raw = raw[0 .. header_end + 2],
-        .body = raw[header_end + 4 ..],
+        .headers_raw = raw[0 .. final_header_end + 2],
+        .body = raw[final_header_end + 4 ..],
     };
 }
 
@@ -556,7 +1257,7 @@ fn waitUntilReady(port: u16, log_path: []const u8, options: TardigradeOptions) !
                 continue;
             };
             defer resp.deinit();
-            if (resp.status_code == 200) return;
+            if (resp.status_code == options.ready_status_code) return;
         } else {
             var resp = sendRequest(std.testing.allocator, port, .{
                 .method = "GET",
@@ -575,7 +1276,7 @@ fn waitUntilReady(port: u16, log_path: []const u8, options: TardigradeOptions) !
                 continue;
             };
             defer resp.deinit();
-            if (resp.status_code == 200) return;
+            if (resp.status_code == options.ready_status_code) return;
         }
         std.time.sleep(50 * std.time.ns_per_ms);
     }
@@ -880,6 +1581,17 @@ fn jsonStringField(allocator: std.mem.Allocator, body: []const u8, key: []const 
     const value = parsed.value.object.get(key) orelse return null;
     if (value != .string) return null;
     return try allocator.dupe(u8, value.string);
+}
+
+fn jsonU64Field(allocator: std.mem.Allocator, body: []const u8, key: []const u8) !?u64 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const value = parsed.value.object.get(key) orelse return null;
+    return switch (value) {
+        .integer => |n| if (n < 0) null else @as(u64, @intCast(n)),
+        else => null,
+    };
 }
 
 fn assertContains(haystack: []const u8, needle: []const u8) !void {
@@ -1946,6 +2658,517 @@ test "proxy integration follows a single upstream redirect" {
     try std.testing.expectEqualStrings("/v1/chat/final", upstream.capture.path);
 }
 
+test "fastcgi integration returns parsed response and forwards cgi env" {
+    const allocator = std.testing.allocator;
+
+    const responses = [_]FastCgiResponseSpec{
+        .{
+            .status_code = 201,
+            .headers = &.{
+                .{ .name = "Content-Type", .value = "text/plain; charset=utf-8" },
+                .{ .name = "X-FastCGI-Reply", .value = "ok" },
+            },
+            .body = "hello-fastcgi",
+        },
+    };
+    var fcgi = try FastCgiServer.start(allocator, &responses);
+    defer fcgi.stop();
+    try fcgi.run();
+
+    const upstream = try std.fmt.allocPrint(allocator, "{s}:{d}", .{ test_host, fcgi.port() });
+    defer allocator.free(upstream);
+    const opts = TardigradeOptions{
+        .upstream_port = null,
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_FASTCGI_UPSTREAM", .value = upstream },
+        },
+    };
+    var tardigrade = try TardigradeProcess.start(allocator, opts);
+    defer tardigrade.stop();
+
+    var response = try sendRequest(allocator, tardigrade.port, .{
+        .method = "POST",
+        .path = "/v1/backend/fastcgi?name=tardi",
+        .body = "{\"hello\":true}",
+        .headers = &.{
+            .{ .name = "Host", .value = "gateway.integration.test:9000" },
+            .{ .name = "Content-Type", .value = "application/json" },
+            .{ .name = "X-Real-IP", .value = "127.0.0.1" },
+            .{ .name = "X-FastCGI-Script-Filename", .value = "/srv/app.php" },
+            .{ .name = "X-FastCGI-Path-Info", .value = "/index.php" },
+            .{ .name = "X-Correlation-ID", .value = "fcgi-req-123" },
+        },
+    });
+    defer response.deinit();
+
+    try std.testing.expectEqual(@as(u16, 201), response.status_code);
+    try std.testing.expectEqualStrings("text/plain; charset=utf-8", response.header("Content-Type").?);
+    try std.testing.expectEqualStrings("ok", response.header("X-FastCGI-Reply").?);
+    try assertContains(response.body, "hello-fastcgi");
+
+    fcgi.mutex.lock();
+    defer fcgi.mutex.unlock();
+    try assertContains(fcgi.capture.raw, "REQUEST_METHODPOST");
+    try assertContains(fcgi.capture.raw, "SCRIPT_FILENAME/srv/app.php");
+    try assertContains(fcgi.capture.raw, "QUERY_STRINGname=tardi");
+    try assertContains(fcgi.capture.raw, "CONTENT_TYPEapplication/json");
+    try assertContains(fcgi.capture.raw, "REMOTE_ADDR127.0.0.1");
+    try assertContains(fcgi.capture.raw, "SERVER_NAMEgateway.integration.test");
+    try assertContains(fcgi.capture.raw, "HTTP_X_CORRELATION_IDfcgi-req-123");
+}
+
+test "fastcgi integration logs stderr and maps non-zero end_request to 502" {
+    const allocator = std.testing.allocator;
+
+    const responses = [_]FastCgiResponseSpec{
+        .{
+            .status_code = 200,
+            .headers = &.{.{ .name = "Content-Type", .value = "text/plain" }},
+            .body = "ignored",
+            .stderr = "php warning: boom",
+            .app_status = 1,
+        },
+    };
+    var fcgi = try FastCgiServer.start(allocator, &responses);
+    defer fcgi.stop();
+    try fcgi.run();
+
+    const upstream = try std.fmt.allocPrint(allocator, "{s}:{d}", .{ test_host, fcgi.port() });
+    defer allocator.free(upstream);
+    const opts = TardigradeOptions{
+        .upstream_port = null,
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_FASTCGI_UPSTREAM", .value = upstream },
+        },
+    };
+    var tardigrade = try TardigradeProcess.start(allocator, opts);
+    defer tardigrade.stop();
+
+    var response = try sendRequest(allocator, tardigrade.port, .{
+        .method = "POST",
+        .path = "/v1/backend/fastcgi",
+        .body = "{}",
+        .headers = &.{
+            .{ .name = "Content-Type", .value = "application/json" },
+        },
+    });
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 502), response.status_code);
+
+    std.time.sleep(100 * std.time.ns_per_ms);
+    const log_data = try std.fs.cwd().readFileAlloc(allocator, tardigrade.log_path, 256 * 1024);
+    defer allocator.free(log_data);
+    try assertContains(log_data, "fastcgi stderr");
+    try assertContains(log_data, "php warning: boom");
+    try assertContains(log_data, "fastcgi end_request failure");
+}
+
+test "fastcgi integration reuses upstream connection across sequential requests" {
+    const allocator = std.testing.allocator;
+
+    const responses = [_]FastCgiResponseSpec{
+        .{ .body = "first" },
+        .{ .body = "second" },
+    };
+    var fcgi = try FastCgiServer.start(allocator, &responses);
+    defer fcgi.stop();
+    try fcgi.run();
+
+    const upstream = try std.fmt.allocPrint(allocator, "{s}:{d}", .{ test_host, fcgi.port() });
+    defer allocator.free(upstream);
+    const opts = TardigradeOptions{
+        .upstream_port = null,
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_FASTCGI_UPSTREAM", .value = upstream },
+        },
+    };
+    var tardigrade = try TardigradeProcess.start(allocator, opts);
+    defer tardigrade.stop();
+
+    var first = try sendRequest(allocator, tardigrade.port, .{
+        .method = "POST",
+        .path = "/v1/backend/fastcgi",
+        .body = "one",
+        .headers = &.{.{ .name = "Content-Type", .value = "text/plain" }},
+    });
+    defer first.deinit();
+    try std.testing.expectEqual(@as(u16, 200), first.status_code);
+    try assertContains(first.body, "first");
+
+    var second = try sendRequest(allocator, tardigrade.port, .{
+        .method = "POST",
+        .path = "/v1/backend/fastcgi",
+        .body = "two",
+        .headers = &.{.{ .name = "Content-Type", .value = "text/plain" }},
+    });
+    defer second.deinit();
+    try std.testing.expectEqual(@as(u16, 200), second.status_code);
+    try assertContains(second.body, "second");
+
+    fcgi.mutex.lock();
+    defer fcgi.mutex.unlock();
+    try std.testing.expectEqual(@as(u32, 2), fcgi.capture.request_count);
+    try std.testing.expectEqual(@as(u32, 1), fcgi.accepted_connections);
+    try std.testing.expectEqual(@as(u16, 2), fcgi.capture.last_request_id);
+}
+
+test "fastcgi config directives drive upstream params and index defaults" {
+    const allocator = std.testing.allocator;
+
+    const responses = [_]FastCgiResponseSpec{
+        .{ .body = "config-fastcgi" },
+    };
+    var fcgi = try FastCgiServer.start(allocator, &responses);
+    defer fcgi.stop();
+    try fcgi.run();
+
+    const upstream = try std.fmt.allocPrint(allocator, "{s}:{d}", .{ test_host, fcgi.port() });
+    defer allocator.free(upstream);
+    const config_text = try std.fmt.allocPrint(
+        allocator,
+        \\root /srv/www;
+        \\fastcgi_pass {s};
+        \\fastcgi_param APP_ENV production;
+        \\fastcgi_param APP_ROLE api;
+        \\fastcgi_index home.php;
+        \\scgi_pass 127.0.0.1:4100;
+        \\uwsgi_pass 127.0.0.1:4200;
+    ,
+        .{upstream},
+    );
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .upstream_port = null,
+        .config_text = config_text,
+    });
+    defer tardigrade.stop();
+
+    var response = try sendRequest(allocator, tardigrade.port, .{
+        .method = "POST",
+        .path = "/v1/backend/fastcgi?name=config",
+        .body = "{\"cfg\":true}",
+        .headers = &.{
+            .{ .name = "Host", .value = "gateway.integration.test" },
+            .{ .name = "Content-Type", .value = "application/json" },
+            .{ .name = "X-FastCGI-Path-Info", .value = "/app/" },
+        },
+    });
+    defer response.deinit();
+
+    try std.testing.expectEqual(@as(u16, 200), response.status_code);
+    try assertContains(response.body, "config-fastcgi");
+
+    fcgi.mutex.lock();
+    defer fcgi.mutex.unlock();
+    try assertContains(fcgi.capture.raw, "SCRIPT_FILENAME/srv/www/app/home.php");
+    try assertContains(fcgi.capture.raw, "DOCUMENT_ROOT/srv/www");
+    try assertContains(fcgi.capture.raw, "APP_ENVproduction");
+    try assertContains(fcgi.capture.raw, "APP_ROLEapi");
+}
+
+test "fastcgi integration with real php-fpm socket returns parsed response" {
+    var php_fpm = try PhpFpmProcess.start(std.testing.allocator);
+    defer php_fpm.stop();
+
+    const upstream = try std.fmt.allocPrint(std.testing.allocator, "unix:{s}", .{php_fpm.socket_path});
+    defer std.testing.allocator.free(upstream);
+
+    var tardigrade = try TardigradeProcess.start(std.testing.allocator, .{
+        .upstream_port = null,
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_FASTCGI_UPSTREAM", .value = upstream },
+        },
+    });
+    defer tardigrade.stop();
+
+    var response = try sendRequest(std.testing.allocator, tardigrade.port, .{
+        .method = "POST",
+        .path = "/v1/backend/fastcgi?name=real",
+        .body = "hello=php",
+        .headers = &.{
+            .{ .name = "Content-Type", .value = "application/x-www-form-urlencoded" },
+            .{ .name = "X-FastCGI-Script-Filename", .value = php_fpm.script_path },
+            .{ .name = "X-FastCGI-Script-Name", .value = "/index.php" },
+            .{ .name = "X-FastCGI-Path-Info", .value = "/index.php" },
+        },
+    });
+    defer response.deinit();
+
+    try std.testing.expectEqual(@as(u16, 200), response.status_code);
+    try std.testing.expectEqualStrings("application/json", response.header("Content-Type").?);
+    try assertContains(response.body, "\"method\":\"POST\"");
+    try assertContains(response.body, "\"script\":\"");
+    try assertContains(response.body, "\"query\":\"name=real\"");
+    try assertContains(response.body, "\"body\":\"hello=php\"");
+}
+
+test "rewrite integration transparently rewrites captured path to health" {
+    const allocator = std.testing.allocator;
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .upstream_port = null,
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_REWRITE_RULES", .value = "GET|^/old/(.*)$|/$1|last" },
+        },
+    });
+    defer tardigrade.stop();
+
+    var response = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/old/health",
+        .body = null,
+        .headers = &.{},
+    });
+    defer response.deinit();
+
+    try std.testing.expectEqual(@as(u16, 200), response.status_code);
+    try std.testing.expectEqualStrings("application/json", response.header("Content-Type").?);
+    try assertContains(response.body, "\"status\":\"ok\"");
+}
+
+test "rewrite config directive rewrites captured path to health" {
+    const allocator = std.testing.allocator;
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .upstream_port = null,
+        .config_text = "rewrite ^/legacy/(.*)$ /$1 last;",
+    });
+    defer tardigrade.stop();
+
+    var response = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/legacy/health",
+        .body = null,
+        .headers = &.{},
+    });
+    defer response.deinit();
+
+    try std.testing.expectEqual(@as(u16, 200), response.status_code);
+    try assertContains(response.body, "\"status\":\"ok\"");
+}
+
+test "return config directive issues redirect with request_uri expansion" {
+    const allocator = std.testing.allocator;
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .upstream_port = null,
+        .config_text = "return 301 https://example.com$request_uri;",
+        .ready_status_code = 301,
+    });
+    defer tardigrade.stop();
+
+    var response = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/legacy/path?x=1",
+        .body = null,
+        .headers = &.{},
+    });
+    defer response.deinit();
+
+    try std.testing.expectEqual(@as(u16, 301), response.status_code);
+    try std.testing.expectEqualStrings("https://example.com/legacy/path?x=1", response.header("Location").?);
+}
+
+test "if rewrite directive rewrites request_uri match transparently" {
+    const allocator = std.testing.allocator;
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .upstream_port = null,
+        .config_text = "if ($request_uri ~* ^/legacy/(.*)$) rewrite /$1 last;",
+    });
+    defer tardigrade.stop();
+
+    var response = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/legacy/health",
+        .body = null,
+        .headers = &.{},
+    });
+    defer response.deinit();
+
+    try std.testing.expectEqual(@as(u16, 200), response.status_code);
+    try assertContains(response.body, "\"status\":\"ok\"");
+}
+
+test "if return directive redirects on host match" {
+    const allocator = std.testing.allocator;
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .upstream_port = null,
+        .config_text = "if ($http_host ~* ^admin\\.example\\.com$) return 301 https://example.com$request_uri;",
+    });
+    defer tardigrade.stop();
+
+    var response = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/health?x=1",
+        .body = null,
+        .headers = &.{.{ .name = "Host", .value = "Admin.Example.Com" }},
+    });
+    defer response.deinit();
+
+    try std.testing.expectEqual(@as(u16, 301), response.status_code);
+    try std.testing.expectEqualStrings("https://example.com/health?x=1", response.header("Location").?);
+}
+
+test "scgi integration returns parsed response and forwards cgi env" {
+    const allocator = std.testing.allocator;
+
+    const responses = [_]ScgiResponseSpec{
+        .{
+            .status_code = 202,
+            .headers = &.{
+                .{ .name = "Content-Type", .value = "application/json" },
+                .{ .name = "X-SCGI-Reply", .value = "ok" },
+            },
+            .body = "{\"scgi\":true}",
+            .http_status_line = true,
+        },
+    };
+    var scgi = try ScgiServer.start(allocator, &responses);
+    defer scgi.stop();
+    try scgi.run();
+
+    const upstream = try std.fmt.allocPrint(allocator, "{s}:{d}", .{ test_host, scgi.port() });
+    defer allocator.free(upstream);
+    const opts = TardigradeOptions{
+        .upstream_port = null,
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_SCGI_UPSTREAM", .value = upstream },
+        },
+    };
+    var tardigrade = try TardigradeProcess.start(allocator, opts);
+    defer tardigrade.stop();
+
+    var response = try sendRequest(allocator, tardigrade.port, .{
+        .method = "POST",
+        .path = "/v1/backend/scgi?name=tardi",
+        .body = "{\"hello\":true}",
+        .headers = &.{
+            .{ .name = "Host", .value = "gateway.integration.test:9001" },
+            .{ .name = "Content-Type", .value = "application/json" },
+            .{ .name = "X-Real-IP", .value = "127.0.0.1" },
+            .{ .name = "X-SCGI-Path-Info", .value = "/app" },
+            .{ .name = "X-SCGI-Script-Name", .value = "/app" },
+            .{ .name = "X-Correlation-ID", .value = "scgi-req-123" },
+        },
+    });
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 202), response.status_code);
+    try std.testing.expectEqualStrings("application/json", response.header("Content-Type").?);
+    try std.testing.expectEqualStrings("ok", response.header("X-SCGI-Reply").?);
+    try assertContains(response.body, "\"scgi\":true");
+
+    scgi.mutex.lock();
+    defer scgi.mutex.unlock();
+    try assertContains(scgi.capture.raw, "REQUEST_METHOD\x00POST\x00");
+    try assertContains(scgi.capture.raw, "QUERY_STRING\x00name=tardi\x00");
+    try assertContains(scgi.capture.raw, "CONTENT_TYPE\x00application/json\x00");
+    try assertContains(scgi.capture.raw, "REMOTE_ADDR\x00127.0.0.1\x00");
+    try assertContains(scgi.capture.raw, "SERVER_NAME\x00gateway.integration.test\x00");
+    try assertContains(scgi.capture.raw, "HTTP_X_CORRELATION_ID\x00scgi-req-123\x00");
+}
+
+test "uwsgi integration returns parsed response and forwards vars" {
+    const allocator = std.testing.allocator;
+
+    const responses = [_]UwsgiResponseSpec{
+        .{
+            .status_code = 201,
+            .headers = &.{
+                .{ .name = "Content-Type", .value = "application/json" },
+                .{ .name = "X-uWSGI-Reply", .value = "ok" },
+            },
+            .body = "{\"uwsgi\":true}",
+            .http_status_line = true,
+        },
+    };
+    var uwsgi = try UwsgiServer.start(allocator, &responses);
+    defer uwsgi.stop();
+    try uwsgi.run();
+
+    const upstream = try std.fmt.allocPrint(allocator, "{s}:{d}", .{ test_host, uwsgi.port() });
+    defer allocator.free(upstream);
+    const opts = TardigradeOptions{
+        .upstream_port = null,
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_UWSGI_UPSTREAM", .value = upstream },
+        },
+    };
+    var tardigrade = try TardigradeProcess.start(allocator, opts);
+    defer tardigrade.stop();
+
+    var response = try sendRequest(allocator, tardigrade.port, .{
+        .method = "POST",
+        .path = "/v1/backend/uwsgi?name=tardi",
+        .body = "{\"hello\":true}",
+        .headers = &.{
+            .{ .name = "Host", .value = "gateway.integration.test:9002" },
+            .{ .name = "Content-Type", .value = "application/json" },
+            .{ .name = "X-Real-IP", .value = "127.0.0.1" },
+            .{ .name = "X-uWSGI-Path-Info", .value = "/app" },
+            .{ .name = "X-uWSGI-Script-Name", .value = "/app" },
+            .{ .name = "X-Correlation-ID", .value = "uwsgi-req-123" },
+        },
+    });
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 201), response.status_code);
+    try std.testing.expectEqualStrings("application/json", response.header("Content-Type").?);
+    try std.testing.expectEqualStrings("ok", response.header("X-uWSGI-Reply").?);
+    try assertContains(response.body, "\"uwsgi\":true");
+
+    uwsgi.mutex.lock();
+    defer uwsgi.mutex.unlock();
+    try assertContains(uwsgi.capture.raw, "REQUEST_METHODPOST");
+    try assertContains(uwsgi.capture.raw, "QUERY_STRINGname=tardi");
+    try assertContains(uwsgi.capture.raw, "CONTENT_TYPEapplication/json");
+    try assertContains(uwsgi.capture.raw, "REMOTE_ADDR127.0.0.1");
+    try assertContains(uwsgi.capture.raw, "SERVER_NAMEgateway.integration.test");
+    try assertContains(uwsgi.capture.raw, "HTTP_X_CORRELATION_IDuwsgi-req-123");
+}
+
+test "uwsgi integration decodes chunked upstream body" {
+    const allocator = std.testing.allocator;
+
+    const responses = [_]UwsgiResponseSpec{
+        .{
+            .status_code = 200,
+            .headers = &.{
+                .{ .name = "Transfer-Encoding", .value = "chunked" },
+                .{ .name = "Content-Type", .value = "text/plain" },
+            },
+            .body = "5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n",
+            .http_status_line = true,
+        },
+    };
+    var uwsgi = try UwsgiServer.start(allocator, &responses);
+    defer uwsgi.stop();
+    try uwsgi.run();
+
+    const upstream = try std.fmt.allocPrint(allocator, "{s}:{d}", .{ test_host, uwsgi.port() });
+    defer allocator.free(upstream);
+    const opts = TardigradeOptions{
+        .upstream_port = null,
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_UWSGI_UPSTREAM", .value = upstream },
+        },
+    };
+    var tardigrade = try TardigradeProcess.start(allocator, opts);
+    defer tardigrade.stop();
+
+    var response = try sendRequest(allocator, tardigrade.port, .{
+        .method = "POST",
+        .path = "/v1/backend/uwsgi",
+        .body = "",
+        .headers = &.{},
+    });
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status_code);
+    try std.testing.expect(response.header("Transfer-Encoding") == null);
+    try std.testing.expectEqualStrings("hello world", response.body);
+}
+
 test "tls integration serves health over https with self-signed certificate" {
     const allocator = std.testing.allocator;
 
@@ -2022,6 +3245,7 @@ test "http3 integration serves health over quic" {
         .upstream_port = null,
         .extra_env = &.{
             .{ .name = "TARDIGRADE_HTTP3_ENABLED", .value = "true" },
+            .{ .name = "TARDIGRADE_HTTP3_ENABLE_0RTT", .value = "true" },
             .{ .name = "TARDIGRADE_QUIC_PORT", .value = quic_port_str },
             .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = "tests/fixtures/tls/server.crt" },
             .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = "tests/fixtures/tls/server.key" },
@@ -2041,6 +3265,57 @@ test "http3 integration serves health over quic" {
     try std.testing.expect(content_length > 0);
     try assertContains(response.body, "\"status\":\"ok\"");
     try assertContains(response.body, "\"service\":\"tardigrade-edge\"");
+}
+
+test "http3 integration resumes session with 0-rtt over quic" {
+    if (!build_options.enable_http3_ngtcp2) return error.SkipZigTest;
+    if (http3_resumption_client_bin_path.len == 0) return error.SkipZigTest;
+    if (http3_osslclient_bin_path.len == 0) return error.SkipZigTest;
+    std.fs.accessAbsolute(http3_resumption_client_bin_path, .{}) catch return error.SkipZigTest;
+    std.fs.accessAbsolute(http3_osslclient_bin_path, .{}) catch return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const quic_port = try findFreePort();
+    const quic_port_str = try std.fmt.allocPrint(allocator, "{d}", .{quic_port});
+    defer allocator.free(quic_port_str);
+
+    const opts = TardigradeOptions{
+        .upstream_port = null,
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_HTTP3_ENABLED", .value = "true" },
+            .{ .name = "TARDIGRADE_HTTP3_ENABLE_0RTT", .value = "true" },
+            .{ .name = "TARDIGRADE_QUIC_PORT", .value = quic_port_str },
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = "tests/fixtures/tls/server.crt" },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = "tests/fixtures/tls/server.key" },
+        },
+        .ready_https_insecure = true,
+    };
+    var tardigrade = try TardigradeProcess.start(allocator, opts);
+    defer tardigrade.stop();
+    try waitForHttp3Configured(tardigrade.port, 5000);
+
+    const request_url = try std.fmt.allocPrint(allocator, "https://{s}:{d}/health", .{ test_host, quic_port });
+    defer allocator.free(request_url);
+
+    const result = try std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{
+            http3_resumption_client_bin_path,
+            http3_osslclient_bin_path,
+            request_url,
+            "200",
+        },
+        .max_output_bytes = 256 * 1024,
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    switch (result.term) {
+        .Exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
+        else => return error.UnexpectedTermination,
+    }
+    try assertContains(result.stdout, "\"warm_status\":200");
+    try assertContains(result.stdout, "\"resumed_status\":200");
+    try assertContains(result.stdout, "\"resumed_zero_rtt_count\":");
 }
 
 test "http3 integration serves prometheus metrics over quic" {
@@ -3350,6 +4625,15 @@ test "graceful shutdown integration lets inflight request finish before exit" {
     try upstream.run();
 
     var tardigrade = try TardigradeProcess.start(allocator, baseOptions(upstream.port()));
+    var child_reaped = false;
+    defer {
+        if (!child_reaped) {
+            _ = tardigrade.child.kill() catch {};
+            _ = tardigrade.child.wait() catch {};
+        }
+        tardigrade.allocator.free(tardigrade.log_path);
+        if (tardigrade.config_path) |path| tardigrade.allocator.free(path);
+    }
 
     var stream = try openRequestStream(allocator, tardigrade.port, .{
         .method = "POST",
@@ -3368,8 +4652,7 @@ test "graceful shutdown integration lets inflight request finish before exit" {
     try assertContains(response.body, "\"shutdown\":true");
 
     _ = tardigrade.child.wait() catch {};
-    tardigrade.allocator.free(tardigrade.log_path);
-    if (tardigrade.config_path) |path| tardigrade.allocator.free(path);
+    child_reaped = true;
 }
 
 test "graceful shutdown integration sends connection close on keep-alive inflight response" {
@@ -3385,6 +4668,15 @@ test "graceful shutdown integration sends connection close on keep-alive infligh
     try upstream.run();
 
     var tardigrade = try TardigradeProcess.start(allocator, baseOptions(upstream.port()));
+    var child_reaped = false;
+    defer {
+        if (!child_reaped) {
+            _ = tardigrade.child.kill() catch {};
+            _ = tardigrade.child.wait() catch {};
+        }
+        tardigrade.allocator.free(tardigrade.log_path);
+        if (tardigrade.config_path) |path| tardigrade.allocator.free(path);
+    }
 
     var stream = try openRequestStream(allocator, tardigrade.port, .{
         .method = "POST",
@@ -3406,8 +4698,7 @@ test "graceful shutdown integration sends connection close on keep-alive infligh
     try std.testing.expectEqualStrings("close", response.header("Connection").?);
 
     _ = tardigrade.child.wait() catch {};
-    tardigrade.allocator.free(tardigrade.log_path);
-    if (tardigrade.config_path) |path| tardigrade.allocator.free(path);
+    child_reaped = true;
 }
 
 test "graceful shutdown integration exits promptly after drain completes" {

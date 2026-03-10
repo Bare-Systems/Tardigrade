@@ -60,6 +60,7 @@ pub const EdgeConfig = struct {
     };
     pub const RewriteRule = http.rewrite.RewriteRule;
     pub const ReturnRule = http.rewrite.ReturnRule;
+    pub const ConditionalRule = http.rewrite.ConditionalRule;
     pub const InternalRedirectRule = struct {
         method: []const u8,
         pattern: []const u8,
@@ -316,6 +317,8 @@ pub const EdgeConfig = struct {
     rewrite_rules: []RewriteRule,
     /// Return rules evaluated after rewrites and before route dispatch.
     return_rules: []ReturnRule,
+    /// Conditional inline `if (...) return|rewrite` rules.
+    conditional_rules: []ConditionalRule,
     /// Internal redirect rules evaluated before route dispatch.
     internal_redirect_rules: []InternalRedirectRule,
     /// Named location map for redirect targets prefixed with '@'.
@@ -324,6 +327,10 @@ pub const EdgeConfig = struct {
     mirror_rules: []MirrorRule,
     /// FastCGI upstream endpoint (`host:port`).
     fastcgi_upstream: []const u8,
+    /// Additional `fastcgi_param` CGI variables injected into FastCGI requests.
+    fastcgi_params: []HeaderPair,
+    /// Default index script for directory-style FastCGI requests.
+    fastcgi_index: []const u8,
     /// uWSGI upstream endpoint (`host:port`).
     uwsgi_upstream: []const u8,
     /// SCGI upstream endpoint (`host:port`).
@@ -437,6 +444,14 @@ pub const EdgeConfig = struct {
             allocator.free(rule.body);
         }
         allocator.free(self.return_rules);
+        for (self.conditional_rules) |rule| {
+            allocator.free(rule.pattern);
+            switch (rule.action) {
+                .rewrite => |rw| allocator.free(rw.replacement),
+                .returned => |ret| allocator.free(ret.body),
+            }
+        }
+        allocator.free(self.conditional_rules);
         for (self.internal_redirect_rules) |rule| {
             allocator.free(rule.method);
             allocator.free(rule.pattern);
@@ -455,6 +470,12 @@ pub const EdgeConfig = struct {
         }
         allocator.free(self.mirror_rules);
         allocator.free(self.fastcgi_upstream);
+        for (self.fastcgi_params) |pair| {
+            allocator.free(pair.name);
+            allocator.free(pair.value);
+        }
+        allocator.free(self.fastcgi_params);
+        allocator.free(self.fastcgi_index);
         allocator.free(self.uwsgi_upstream);
         allocator.free(self.scgi_upstream);
         allocator.free(self.grpc_upstream);
@@ -993,6 +1014,19 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         }
         allocator.free(return_rules);
     }
+    const conditional_rules_raw = envOrDefault(allocator, "TARDIGRADE_CONDITIONAL_RULES", "") catch unreachable;
+    defer allocator.free(conditional_rules_raw);
+    const conditional_rules = try parseConditionalRules(allocator, conditional_rules_raw);
+    errdefer {
+        for (conditional_rules) |rule| {
+            allocator.free(rule.pattern);
+            switch (rule.action) {
+                .rewrite => |rw| allocator.free(rw.replacement),
+                .returned => |ret| allocator.free(ret.body),
+            }
+        }
+        allocator.free(conditional_rules);
+    }
     const internal_redirects_raw = envOrDefault(allocator, "TARDIGRADE_INTERNAL_REDIRECT_RULES", "") catch unreachable;
     defer allocator.free(internal_redirects_raw);
     const internal_redirect_rules = try parseInternalRedirectRules(allocator, internal_redirects_raw);
@@ -1027,6 +1061,18 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     }
     const fastcgi_upstream = envOrDefault(allocator, "TARDIGRADE_FASTCGI_UPSTREAM", "") catch unreachable;
     errdefer allocator.free(fastcgi_upstream);
+    const fastcgi_params_raw = envOrDefault(allocator, "TARDIGRADE_FASTCGI_PARAMS", "") catch unreachable;
+    defer allocator.free(fastcgi_params_raw);
+    const fastcgi_params = try parseFastcgiParams(allocator, fastcgi_params_raw);
+    errdefer {
+        for (fastcgi_params) |pair| {
+            allocator.free(pair.name);
+            allocator.free(pair.value);
+        }
+        allocator.free(fastcgi_params);
+    }
+    const fastcgi_index = envOrDefault(allocator, "TARDIGRADE_FASTCGI_INDEX", "index.php") catch unreachable;
+    errdefer allocator.free(fastcgi_index);
     const uwsgi_upstream = envOrDefault(allocator, "TARDIGRADE_UWSGI_UPSTREAM", "") catch unreachable;
     errdefer allocator.free(uwsgi_upstream);
     const scgi_upstream = envOrDefault(allocator, "TARDIGRADE_SCGI_UPSTREAM", "") catch unreachable;
@@ -1196,10 +1242,13 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .sse_idle_timeout_ms = sse_idle_timeout_ms,
         .rewrite_rules = rewrite_rules,
         .return_rules = return_rules,
+        .conditional_rules = conditional_rules,
         .internal_redirect_rules = internal_redirect_rules,
         .named_locations = named_locations,
         .mirror_rules = mirror_rules,
         .fastcgi_upstream = fastcgi_upstream,
+        .fastcgi_params = fastcgi_params,
+        .fastcgi_index = fastcgi_index,
         .uwsgi_upstream = uwsgi_upstream,
         .scgi_upstream = scgi_upstream,
         .grpc_upstream = grpc_upstream,
@@ -1397,6 +1446,32 @@ fn parseHeaderPairs(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeConfig
     return out.toOwnedSlice();
 }
 
+fn parseFastcgiParams(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeConfig.HeaderPair {
+    var out = std.ArrayList(EdgeConfig.HeaderPair).init(allocator);
+    errdefer {
+        for (out.items) |pair| {
+            allocator.free(pair.name);
+            allocator.free(pair.value);
+        }
+        out.deinit();
+    }
+
+    var it = std.mem.splitScalar(u8, raw, '|');
+    while (it.next()) |entry| {
+        const trimmed = std.mem.trim(u8, entry, " \t\r\n");
+        if (trimmed.len == 0) continue;
+        const eq = std.mem.indexOfScalar(u8, trimmed, '=') orelse return error.InvalidFastcgiParamFormat;
+        const name = std.mem.trim(u8, trimmed[0..eq], " \t\r\n");
+        const value = std.mem.trim(u8, trimmed[eq + 1 ..], " \t\r\n");
+        if (name.len == 0) return error.InvalidFastcgiParamFormat;
+        try out.append(.{
+            .name = try allocator.dupe(u8, name),
+            .value = try allocator.dupe(u8, value),
+        });
+    }
+    return out.toOwnedSlice();
+}
+
 fn parseRewriteRules(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeConfig.RewriteRule {
     var out = std.ArrayList(EdgeConfig.RewriteRule).init(allocator);
     errdefer {
@@ -1487,6 +1562,97 @@ fn parseReturnRules(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeConfig
             .status = status,
             .body = owned_body,
         });
+    }
+    return out.toOwnedSlice();
+}
+
+fn parseConditionalRules(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeConfig.ConditionalRule {
+    var out = std.ArrayList(EdgeConfig.ConditionalRule).init(allocator);
+    errdefer {
+        for (out.items) |rule| {
+            allocator.free(rule.pattern);
+            switch (rule.action) {
+                .rewrite => |rw| allocator.free(rw.replacement),
+                .returned => |ret| allocator.free(ret.body),
+            }
+        }
+        out.deinit();
+    }
+
+    var it = std.mem.splitScalar(u8, raw, ';');
+    while (it.next()) |entry| {
+        const trimmed = std.mem.trim(u8, entry, " \t\r\n");
+        if (trimmed.len == 0) continue;
+        var fields = std.mem.splitScalar(u8, trimmed, '|');
+        const variable_raw = fields.next() orelse return error.InvalidConditionalRuleFormat;
+        const sensitivity_raw = fields.next() orelse return error.InvalidConditionalRuleFormat;
+        const pattern_raw = fields.next() orelse return error.InvalidConditionalRuleFormat;
+        const action_raw = fields.next() orelse return error.InvalidConditionalRuleFormat;
+
+        const variable_name = std.mem.trim(u8, variable_raw, " \t\r\n");
+        const sensitivity_name = std.mem.trim(u8, sensitivity_raw, " \t\r\n");
+        const pattern = std.mem.trim(u8, pattern_raw, " \t\r\n");
+        const action_name = std.mem.trim(u8, action_raw, " \t\r\n");
+        if (variable_name.len == 0 or sensitivity_name.len == 0 or pattern.len == 0 or action_name.len == 0) {
+            return error.InvalidConditionalRuleFormat;
+        }
+
+        const variable = http.rewrite.ConditionalVariable.parse(variable_name) orelse return error.InvalidConditionalVariable;
+        const case_insensitive = if (std.ascii.eqlIgnoreCase(sensitivity_name, "ci"))
+            true
+        else if (std.ascii.eqlIgnoreCase(sensitivity_name, "cs"))
+            false
+        else
+            return error.InvalidConditionalRuleFormat;
+
+        const owned_pattern = try allocator.dupe(u8, pattern);
+        errdefer allocator.free(owned_pattern);
+
+        if (std.ascii.eqlIgnoreCase(action_name, "rewrite")) {
+            const replacement_raw = fields.next() orelse return error.InvalidConditionalRuleFormat;
+            const flag_raw = fields.next() orelse return error.InvalidConditionalRuleFormat;
+            if (fields.next() != null) return error.InvalidConditionalRuleFormat;
+            const replacement = std.mem.trim(u8, replacement_raw, " \t\r\n");
+            const flag_name = std.mem.trim(u8, flag_raw, " \t\r\n");
+            if (replacement.len == 0 or flag_name.len == 0) return error.InvalidConditionalRuleFormat;
+            const flag = http.rewrite.RewriteFlag.parse(flag_name) orelse return error.InvalidRewriteRuleFlag;
+            const owned_replacement = try allocator.dupe(u8, replacement);
+            errdefer allocator.free(owned_replacement);
+            try out.append(.{
+                .variable = variable,
+                .case_insensitive = case_insensitive,
+                .pattern = owned_pattern,
+                .action = .{ .rewrite = .{
+                    .replacement = owned_replacement,
+                    .flag = flag,
+                } },
+            });
+            continue;
+        }
+
+        if (std.ascii.eqlIgnoreCase(action_name, "return")) {
+            const status_raw = fields.next() orelse return error.InvalidConditionalRuleFormat;
+            const body_raw = fields.next() orelse return error.InvalidConditionalRuleFormat;
+            if (fields.next() != null) return error.InvalidConditionalRuleFormat;
+            const status_str = std.mem.trim(u8, status_raw, " \t\r\n");
+            const body = std.mem.trim(u8, body_raw, " \t\r\n");
+            if (status_str.len == 0) return error.InvalidConditionalRuleFormat;
+            const status = std.fmt.parseInt(u16, status_str, 10) catch return error.InvalidReturnRuleStatus;
+            const owned_body = try allocator.dupe(u8, body);
+            errdefer allocator.free(owned_body);
+            try out.append(.{
+                .variable = variable,
+                .case_insensitive = case_insensitive,
+                .pattern = owned_pattern,
+                .action = .{ .returned = .{
+                    .status = status,
+                    .body = owned_body,
+                } },
+            });
+            continue;
+        }
+
+        return error.InvalidConditionalRuleFormat;
     }
     return out.toOwnedSlice();
 }
@@ -1723,6 +1889,37 @@ test "parse return rules csv" {
     try std.testing.expectEqualStrings("blocked", rules[1].body);
 }
 
+test "parse conditional rules csv" {
+    const allocator = std.testing.allocator;
+    const rules = try parseConditionalRules(
+        allocator,
+        "request_uri|ci|^/legacy/(.*)$|rewrite|/$1|last;http_host|ci|^admin\\.example\\.com$|return|301|https://example.com$request_uri",
+    );
+    defer {
+        for (rules) |rule| {
+            allocator.free(rule.pattern);
+            switch (rule.action) {
+                .rewrite => |rw| allocator.free(rw.replacement),
+                .returned => |ret| allocator.free(ret.body),
+            }
+        }
+        allocator.free(rules);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), rules.len);
+    try std.testing.expectEqual(http.rewrite.ConditionalVariable.request_uri, rules[0].variable);
+    try std.testing.expect(rules[0].case_insensitive);
+    switch (rules[0].action) {
+        .rewrite => |rw| try std.testing.expectEqual(http.rewrite.RewriteFlag.last, rw.flag),
+        else => return error.UnexpectedTestResult,
+    }
+    try std.testing.expectEqual(http.rewrite.ConditionalVariable.http_host, rules[1].variable);
+    switch (rules[1].action) {
+        .returned => |ret| try std.testing.expectEqual(@as(u16, 301), ret.status),
+        else => return error.UnexpectedTestResult,
+    }
+}
+
 test "parse internal redirect rules csv" {
     const allocator = std.testing.allocator;
     const rules = try parseInternalRedirectRules(allocator, "GET|^/a$|/b;*|^/x$|@named");
@@ -1776,4 +1973,22 @@ test "parse server names" {
     }
     try std.testing.expectEqual(@as(usize, 3), names.len);
     try std.testing.expectEqualStrings("*.example.org", names[1]);
+}
+
+test "parse fastcgi params" {
+    const allocator = std.testing.allocator;
+    const params = try parseFastcgiParams(allocator, "APP_ENV=prod|APP_ROLE=api");
+    defer {
+        for (params) |pair| {
+            allocator.free(pair.name);
+            allocator.free(pair.value);
+        }
+        allocator.free(params);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), params.len);
+    try std.testing.expectEqualStrings("APP_ENV", params[0].name);
+    try std.testing.expectEqualStrings("prod", params[0].value);
+    try std.testing.expectEqualStrings("APP_ROLE", params[1].name);
+    try std.testing.expectEqualStrings("api", params[1].value);
 }

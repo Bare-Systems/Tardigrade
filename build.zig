@@ -15,6 +15,8 @@ pub fn build(b: *std.Build) void {
     // set a preferred release mode, allowing the user to decide how to optimize.
     const optimize = b.standardOptimizeOption(.{});
     const enable_http3_ngtcp2 = b.option(bool, "enable-http3-ngtcp2", "Enable experimental HTTP/3 ngtcp2/nghttp3 system-library integration") orelse false;
+    const osslclient_default_path = "/tmp/ngtcp2-upstream/build/examples/osslclient";
+    const http3_osslclient_path = b.option([]const u8, "http3-osslclient-path", "Path to the ngtcp2 OpenSSL HTTP/3 example client used by 0-RTT integration tests") orelse if (pathExists(osslclient_default_path)) osslclient_default_path else "";
 
     const build_options = b.addOptions();
     build_options.addOption(bool, "enable_http3_ngtcp2", enable_http3_ngtcp2);
@@ -96,6 +98,18 @@ pub fn build(b: *std.Build) void {
 
     const integration_options = b.addOptions();
     integration_options.addOption([]const u8, "tardigrade_bin_path", b.getInstallPath(.bin, "tardigrade"));
+    integration_options.addOption([]const u8, "http3_resumption_client_bin_path", if (enable_http3_ngtcp2) b.getInstallPath(.bin, "http3_resumption_client") else "");
+    integration_options.addOption([]const u8, "http3_osslclient_bin_path", http3_osslclient_path);
+
+    if (enable_http3_ngtcp2) {
+        const resumption_client = b.addExecutable(.{
+            .name = "http3_resumption_client",
+            .root_source_file = b.path("tests/http3_resumption_client.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        b.installArtifact(resumption_client);
+    }
 
     const integration_mod = b.createModule(.{
         .root_source_file = b.path("tests/integration.zig"),
@@ -113,4 +127,9 @@ pub fn build(b: *std.Build) void {
 
     const integration_step = b.step("test-integration", "Run live-process integration tests");
     integration_step.dependOn(&run_integration_tests.step);
+}
+
+fn pathExists(path: []const u8) bool {
+    std.fs.accessAbsolute(path, .{}) catch return false;
+    return true;
 }

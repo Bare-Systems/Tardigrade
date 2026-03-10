@@ -1,6 +1,6 @@
 # Tardigrade
 
-A high-performance HTTP server written in Zig, designed as a modern replacement for nginx.
+A high-performance HTTP server written in Zig.
 
 ## Features
 
@@ -310,7 +310,6 @@ All responses include:
 This project is under active development. See [CHANGELOG.md](CHANGELOG.md) for recent changes.
 
 ### Roadmap
-
 
 Note: See [PLAN.md](PLAN.md) for the full roadmap and prioritized work.
 

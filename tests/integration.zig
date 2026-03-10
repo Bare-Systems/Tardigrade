@@ -618,7 +618,7 @@ const PhpFpmProcess = struct {
             \\clear_env = no
             \\catch_workers_output = yes
             \\chdir = {s}
-            ,
+        ,
             .{ log_path, dir_abs, socket_path, dir_abs },
         );
         defer allocator.free(config_text);
@@ -762,7 +762,7 @@ fn handleUpstreamConnection(server: *UpstreamServer, conn: std.net.Server.Connec
     const response_spec = if (server.responses.len == 0)
         UpstreamResponseSpec{
             .status_code = 200,
-            .headers = &.{ .{ .name = "Content-Type", .value = "application/json" } },
+            .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
             .body = "{\"ok\":true}",
         }
     else blk: {
@@ -2385,7 +2385,7 @@ test "proxy cache integration covers hit and stale revalidation" {
     const allocator = std.testing.allocator;
 
     const cache_headers = [_]ResponseHeader{.{ .name = "Content-Type", .value = "application/json" }};
-    const first_plan = [_]UpstreamResponseSpec{.{ .headers = &cache_headers, .body = "{\"version\":1}" }, .{ .headers = &cache_headers, .body = "{\"version\":2}" }};
+    const first_plan = [_]UpstreamResponseSpec{ .{ .headers = &cache_headers, .body = "{\"version\":1}" }, .{ .headers = &cache_headers, .body = "{\"version\":2}" } };
     var upstream = try UpstreamServer.start(allocator, &first_plan);
     defer upstream.stop();
     try upstream.run();
@@ -4589,7 +4589,8 @@ test "config reload integration updates upstream and rate limit without dropping
     defer upstream2.stop();
     try upstream2.run();
 
-    const initial_config = try std.fmt.allocPrint(allocator,
+    const initial_config = try std.fmt.allocPrint(
+        allocator,
         "upstream_base_url http://{s}:{d};\nrate_limit_rps 1000;\nrate_limit_burst 1000;\n",
         .{ test_host, upstream1.port() },
     );
@@ -4619,7 +4620,8 @@ test "config reload integration updates upstream and rate limit without dropping
     });
     defer in_flight_stream.close();
 
-    const reloaded_config = try std.fmt.allocPrint(allocator,
+    const reloaded_config = try std.fmt.allocPrint(
+        allocator,
         "upstream_base_url http://{s}:{d};\nrate_limit_rps 1;\nrate_limit_burst 1;\n",
         .{ test_host, upstream2.port() },
     );
@@ -4874,6 +4876,256 @@ test "location blocks integration routes requests to matching upstreams" {
     try std.testing.expectEqual(@as(u32, 1), exact_upstream.capture.request_count);
     try std.testing.expectEqual(@as(u32, 1), prefix_upstream.capture.request_count);
     try std.testing.expectEqual(@as(u32, 1), regex_upstream.capture.request_count);
+}
+
+test "static file integration serves configured index html" {
+    const allocator = std.testing.allocator;
+
+    var site_dir = std.testing.tmpDir(.{});
+    defer site_dir.cleanup();
+    try site_dir.dir.writeFile(.{
+        .sub_path = "index.html",
+        .data = "<!doctype html><h1>static-ok</h1>",
+    });
+    const site_root = try site_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(site_root);
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location / {{
+        \\    root {s};
+        \\    index index.html;
+        \\}}
+    , .{site_root});
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .upstream_port = null,
+        .auth_token_hashes = null,
+        .config_text = config_text,
+    });
+    defer tardigrade.stop();
+
+    var response = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/index.html",
+        .body = null,
+        .headers = &.{},
+    });
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status_code);
+    try assertContains(response.body, "static-ok");
+    try std.testing.expectEqualStrings("text/html; charset=utf-8", response.header("Content-Type").?);
+    try std.testing.expectEqualStrings("bytes", response.header("Accept-Ranges").?);
+    try std.testing.expect(response.header("ETag") != null);
+    try std.testing.expect(response.header("Last-Modified") != null);
+}
+
+test "static file integration returns 304 for matching If-Modified-Since" {
+    const allocator = std.testing.allocator;
+
+    var site_dir = std.testing.tmpDir(.{});
+    defer site_dir.cleanup();
+    try site_dir.dir.writeFile(.{
+        .sub_path = "index.html",
+        .data = "<!doctype html><h1>cached</h1>",
+    });
+    const site_root = try site_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(site_root);
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location / {{
+        \\    root {s};
+        \\    index index.html;
+        \\}}
+    , .{site_root});
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .upstream_port = null,
+        .auth_token_hashes = null,
+        .config_text = config_text,
+    });
+    defer tardigrade.stop();
+
+    var initial = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/index.html",
+        .body = null,
+        .headers = &.{},
+    });
+    defer initial.deinit();
+    const last_modified = initial.header("Last-Modified").?;
+
+    var cached = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/index.html",
+        .body = null,
+        .headers = &.{.{ .name = "If-Modified-Since", .value = last_modified }},
+    });
+    defer cached.deinit();
+    try std.testing.expectEqual(@as(u16, 304), cached.status_code);
+    try std.testing.expectEqual(@as(usize, 0), cached.body.len);
+}
+
+test "static file integration returns partial content for range request" {
+    const allocator = std.testing.allocator;
+
+    var site_dir = std.testing.tmpDir(.{});
+    defer site_dir.cleanup();
+    try site_dir.dir.writeFile(.{
+        .sub_path = "data.txt",
+        .data = "0123456789abcdef",
+    });
+    const site_root = try site_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(site_root);
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location / {{
+        \\    root {s};
+        \\    index index.html;
+        \\}}
+    , .{site_root});
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .upstream_port = null,
+        .auth_token_hashes = null,
+        .config_text = config_text,
+    });
+    defer tardigrade.stop();
+
+    var response = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/data.txt",
+        .body = null,
+        .headers = &.{.{ .name = "Range", .value = "bytes=0-3" }},
+    });
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 206), response.status_code);
+    try std.testing.expectEqualStrings("0123", response.body);
+    try std.testing.expectEqualStrings("bytes 0-3/16", response.header("Content-Range").?);
+}
+
+test "static file integration returns autoindex listing when enabled" {
+    const allocator = std.testing.allocator;
+
+    var site_dir = std.testing.tmpDir(.{});
+    defer site_dir.cleanup();
+    try site_dir.dir.writeFile(.{
+        .sub_path = "hello.txt",
+        .data = "hello",
+    });
+    const site_root = try site_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(site_root);
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location / {{
+        \\    root {s};
+        \\    autoindex on;
+        \\}}
+    , .{site_root});
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .upstream_port = null,
+        .auth_token_hashes = null,
+        .config_text = config_text,
+    });
+    defer tardigrade.stop();
+
+    var response = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/",
+        .body = null,
+        .headers = &.{},
+    });
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status_code);
+    try std.testing.expectEqualStrings("text/html; charset=utf-8", response.header("Content-Type").?);
+    try assertContains(response.body, "Index of /");
+    try assertContains(response.body, "hello.txt");
+}
+
+test "static file integration serves configured custom 404 error page" {
+    const allocator = std.testing.allocator;
+
+    var site_dir = std.testing.tmpDir(.{});
+    defer site_dir.cleanup();
+    try site_dir.dir.makePath("errors");
+    try site_dir.dir.writeFile(.{
+        .sub_path = "errors/404.html",
+        .data = "<!doctype html><h1>custom missing</h1>",
+    });
+    const site_root = try site_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(site_root);
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location / {{
+        \\    root {s};
+        \\    index index.html;
+        \\    error_page 404 /errors/404.html;
+        \\}}
+    , .{site_root});
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .upstream_port = null,
+        .auth_token_hashes = null,
+        .config_text = config_text,
+    });
+    defer tardigrade.stop();
+
+    var response = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/missing.html",
+        .body = null,
+        .headers = &.{.{ .name = "Accept", .value = "text/html" }},
+    });
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 404), response.status_code);
+    try std.testing.expectEqualStrings("text/html; charset=utf-8", response.header("Content-Type").?);
+    try assertContains(response.body, "custom missing");
+}
+
+test "api route 404 still returns json even with error_page set" {
+    const allocator = std.testing.allocator;
+
+    var site_dir = std.testing.tmpDir(.{});
+    defer site_dir.cleanup();
+    try site_dir.dir.makePath("errors");
+    try site_dir.dir.writeFile(.{
+        .sub_path = "errors/404.html",
+        .data = "<!doctype html><h1>custom missing</h1>",
+    });
+    const site_root = try site_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(site_root);
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location / {{
+        \\    root {s};
+        \\    error_page 404 /errors/404.html;
+        \\}}
+    , .{site_root});
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .upstream_port = null,
+        .auth_token_hashes = null,
+        .config_text = config_text,
+    });
+    defer tardigrade.stop();
+
+    var response = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/v1/unknown",
+        .body = null,
+        .headers = &.{.{ .name = "Accept", .value = "text/html" }},
+    });
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 404), response.status_code);
+    try std.testing.expectEqualStrings("application/json", response.header("Content-Type").?);
+    try assertContains(response.body, "\"code\":\"invalid_request\"");
+    try assertContains(response.body, "\"message\":\"Not Found\"");
 }
 
 test "location block reload takes effect for new requests after sighup" {

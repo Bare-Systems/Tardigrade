@@ -1043,6 +1043,9 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         }
         allocator.free(location_blocks);
     }
+    const location_error_pages_raw = envOrDefault(allocator, "TARDIGRADE_LOCATION_ERROR_PAGES", "") catch unreachable;
+    defer allocator.free(location_error_pages_raw);
+    try applyLocationErrorPages(allocator, location_blocks, location_error_pages_raw);
     const internal_redirects_raw = envOrDefault(allocator, "TARDIGRADE_INTERNAL_REDIRECT_RULES", "") catch unreachable;
     defer allocator.free(internal_redirects_raw);
     const internal_redirect_rules = try parseInternalRedirectRules(allocator, internal_redirects_raw);
@@ -1735,15 +1738,18 @@ fn parseLocationBlocks(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeCon
         } else if (std.ascii.eqlIgnoreCase(action_kind, "static_root")) {
             const root_raw = fields.next() orelse return error.InvalidLocationBlockFormat;
             const alias_raw = fields.next() orelse return error.InvalidLocationBlockFormat;
+            const autoindex_raw = fields.next() orelse return error.InvalidLocationBlockFormat;
             const index_raw = fields.next() orelse return error.InvalidLocationBlockFormat;
             const try_files_raw = fields.next() orelse return error.InvalidLocationBlockFormat;
             if (fields.next() != null) return error.InvalidLocationBlockFormat;
             const root = std.mem.trim(u8, root_raw, " \t\r\n");
             if (root.len == 0) return error.InvalidLocationBlockFormat;
             const alias = parseBoolish(std.mem.trim(u8, alias_raw, " \t\r\n")) orelse return error.InvalidLocationBlockFormat;
+            const autoindex = parseBoolish(std.mem.trim(u8, autoindex_raw, " \t\r\n")) orelse return error.InvalidLocationBlockFormat;
             action = .{ .static_root = .{
                 .root = try allocator.dupe(u8, root),
                 .alias = alias,
+                .autoindex = autoindex,
                 .index = try allocator.dupe(u8, std.mem.trim(u8, index_raw, " \t\r\n")),
                 .try_files = try allocator.dupe(u8, std.mem.trim(u8, try_files_raw, " \t\r\n")),
             } };
@@ -1756,10 +1762,59 @@ fn parseLocationBlocks(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeCon
             .pattern = try allocator.dupe(u8, pattern),
             .priority = priority,
             .action = action,
+            .error_pages = &.{},
         });
     }
 
     return out.toOwnedSlice();
+}
+
+fn applyLocationErrorPages(allocator: std.mem.Allocator, blocks: []EdgeConfig.LocationBlock, raw: []const u8) !void {
+    var it = std.mem.splitScalar(u8, raw, ';');
+    while (it.next()) |entry_raw| {
+        const entry = std.mem.trim(u8, entry_raw, " \t\r\n");
+        if (entry.len == 0) continue;
+
+        var fields = std.mem.splitScalar(u8, entry, '|');
+        const match_type_raw = fields.next() orelse return error.InvalidLocationBlockFormat;
+        const pattern_raw = fields.next() orelse return error.InvalidLocationBlockFormat;
+        const status_codes_raw = fields.next() orelse return error.InvalidLocationBlockFormat;
+        const target_raw = fields.next() orelse return error.InvalidLocationBlockFormat;
+        if (fields.next() != null) return error.InvalidLocationBlockFormat;
+
+        const match_type = http.location_router.MatchType.parse(std.mem.trim(u8, match_type_raw, " \t\r\n")) orelse return error.InvalidLocationBlockFormat;
+        const pattern = std.mem.trim(u8, pattern_raw, " \t\r\n");
+        const target = std.mem.trim(u8, target_raw, " \t\r\n");
+        if (pattern.len == 0 or target.len == 0) return error.InvalidLocationBlockFormat;
+
+        var code_tokens = std.mem.splitScalar(u8, status_codes_raw, ',');
+        var status_codes = std.ArrayList(u16).init(allocator);
+        defer status_codes.deinit();
+        while (code_tokens.next()) |code_raw| {
+            const code = std.fmt.parseInt(u16, std.mem.trim(u8, code_raw, " \t\r\n"), 10) catch return error.InvalidLocationBlockFormat;
+            try status_codes.append(code);
+        }
+        if (status_codes.items.len == 0) return error.InvalidLocationBlockFormat;
+
+        var matched_block: ?*EdgeConfig.LocationBlock = null;
+        for (blocks) |*block| {
+            if (block.match_type == match_type and std.mem.eql(u8, block.pattern, pattern)) {
+                matched_block = block;
+                break;
+            }
+        }
+        const block = matched_block orelse return error.InvalidLocationBlockFormat;
+
+        const existing_len = block.error_pages.len;
+        const merged = try allocator.alloc(http.location_router.ErrorPageRule, existing_len + 1);
+        for (block.error_pages, 0..) |existing, idx| merged[idx] = existing;
+        merged[existing_len] = .{
+            .status_codes = try allocator.dupe(u16, status_codes.items),
+            .target = try allocator.dupe(u8, target),
+        };
+        if (existing_len > 0) allocator.free(block.error_pages);
+        block.error_pages = merged;
+    }
 }
 
 fn parseBoolish(raw: []const u8) ?bool {
@@ -2035,7 +2090,7 @@ test "parse location blocks csv" {
     const allocator = std.testing.allocator;
     const blocks = try parseLocationBlocks(
         allocator,
-        "exact|/health|return|200|ok;prefix_priority|/api/private/|proxy_pass|http://127.0.0.1:9001;regex_case_insensitive|^/assets/.*$|static_root|/srv/www|on|index.html|$uri",
+        "exact|/health|return|200|ok;prefix_priority|/api/private/|proxy_pass|http://127.0.0.1:9001;regex_case_insensitive|^/assets/.*$|static_root|/srv/www|on|on|index.html|$uri",
     );
     defer {
         for (blocks) |*block| {
@@ -2054,10 +2109,31 @@ test "parse location blocks csv" {
     switch (blocks[2].action) {
         .static_root => |root| {
             try std.testing.expect(root.alias);
+            try std.testing.expect(root.autoindex);
             try std.testing.expectEqualStrings("index.html", root.index);
         },
         else => return error.UnexpectedTestResult,
     }
+}
+
+test "apply location error pages csv" {
+    const allocator = std.testing.allocator;
+    const blocks = try parseLocationBlocks(
+        allocator,
+        "prefix|/|static_root|/srv/www|off|off|index.html|;exact|/health|return|200|ok",
+    );
+    defer {
+        for (blocks) |*block| block.deinit(allocator);
+        allocator.free(blocks);
+    }
+
+    try applyLocationErrorPages(allocator, blocks, "prefix|/|404|/errors/404.html;prefix|/|500,502,503,504|https://example.com/50x");
+
+    try std.testing.expectEqual(@as(usize, 2), blocks[0].error_pages.len);
+    try std.testing.expectEqual(@as(u16, 404), blocks[0].error_pages[0].status_codes[0]);
+    try std.testing.expectEqualStrings("/errors/404.html", blocks[0].error_pages[0].target);
+    try std.testing.expectEqual(@as(usize, 4), blocks[0].error_pages[1].status_codes.len);
+    try std.testing.expectEqualStrings("https://example.com/50x", blocks[0].error_pages[1].target);
 }
 
 test "parse internal redirect rules csv" {

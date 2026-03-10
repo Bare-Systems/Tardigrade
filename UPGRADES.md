@@ -296,16 +296,17 @@ This makes Tardigrade useful only as the Bare Labs gateway, not as a general ngi
 
 - [~] Replace hardcoded route chains in `handleConnection()` with a lookup into the
       loaded `LocationBlock` table
-      Current state: configured location blocks are dispatched first; simple built-in
+      Current state: configured location blocks are dispatched first; built-in
       routes (health, metrics, admin metadata, device/session/cache endpoints,
-      command status, approvals endpoints) now execute directly from the matcher,
-      while the remaining API routes still fall back to the legacy hardcoded chain.
+      command status, approvals, chat, and commands) now execute directly from
+      the matcher on both HTTP/1 and HTTP/3, while the legacy hardcoded chain
+      still remains as fallback during the migration.
 - [x] Preserve existing `/v1/chat`, `/v1/commands` etc. as default location blocks
       auto-injected when gateway-mode env vars are present
       Current state: core built-in routes are now synthesized into the location matcher;
-      simple built-ins, device/session/cache endpoints, command status, and approvals
-      endpoints execute directly there, while the remaining API routes still intentionally
-      fall through until the migration is complete.
+      simple built-ins, device/session/cache endpoints, command status, approvals,
+      chat, and commands execute directly there, while the legacy hardcoded chain
+      still intentionally remains available as fallback until the migration is complete.
 - [x] `matchLocation(request_uri) LocationBlock` function — testable in isolation
 
 ### 6.3 Tests
@@ -328,30 +329,36 @@ The main connection handler proxies everything — it cannot serve local files.
 
 ### 7.0 Static File Handler
 
-- [ ] `serveStaticFile(allocator, root, uri_path, request, response)` function in
+- [~] `serveStaticFile(allocator, root, uri_path, request, response)` function in
       `src/http/static_file.zig`
-- [ ] MIME type detection (reuse existing table)
-- [ ] `Last-Modified` and `If-Modified-Since` conditional GET (304)
-- [ ] `ETag` generation and `If-None-Match` check (304)
-- [ ] Range request support (reuse `src/http/range.zig`)
-- [ ] Directory index: check for `index.html` / `index.htm` before directory listing
-- [ ] `autoindex on/off` config toggle
+      Current state: shared static serving now lives in `src/http/static_file.zig`
+      and is wired into both HTTP/1 and HTTP/3 static-location handlers, but
+      autoindex and zero-copy/sendfile are still open.
+- [x] MIME type detection (reuse existing table)
+- [x] `Last-Modified` and `If-Modified-Since` conditional GET (304)
+- [x] `ETag` generation and `If-None-Match` check (304)
+- [x] Range request support (reuse `src/http/range.zig`)
+- [x] Directory index: check for `index.html` / `index.htm` before directory listing
+- [x] `autoindex on/off` config toggle
 - [ ] Sendfile-style zero-copy on Linux (`sendfile(2)`) for large files
-- [ ] Path traversal sanitisation: reject any resolved path that escapes `root`
+- [x] Path traversal sanitisation: reject any resolved path that escapes `root`
 
 ### 7.1 Integration into handleConnection()
 
-- [ ] When a `LocationBlock` has `root` set, dispatch to `serveStaticFile()`
-- [ ] Correct `Content-Type`, `Content-Length`, `Accept-Ranges` headers
+- [x] When a `LocationBlock` has `root` set, dispatch to `serveStaticFile()`
+- [~] Correct `Content-Type`, `Content-Length`, `Accept-Ranges` headers
+      Current state: GET responses are correct for static routes, including MIME,
+      validators, and range headers; HEAD/content-length parity on the HTTP/3 path
+      still needs cleanup.
 
 ### 7.2 Tests
 
-- [ ] Unit test: path traversal `/../../../etc/passwd` is rejected with 403
-- [ ] Unit test: MIME type for `.wasm` file is `application/wasm`
-- [ ] Integration test: `GET /index.html` serves correct file contents
-- [ ] Integration test: `GET /` with no index file and `autoindex on` returns directory listing
-- [ ] Integration test: `If-Modified-Since` matching file mtime returns 304
-- [ ] Integration test: `Range: bytes=0-999` returns correct partial content with 206
+- [x] Unit test: path traversal `/../../../etc/passwd` is rejected with 403
+- [x] Unit test: MIME type for `.wasm` file is `application/wasm`
+- [x] Integration test: `GET /index.html` serves correct file contents
+- [x] Integration test: `GET /` with no index file and `autoindex on` returns directory listing
+- [x] Integration test: `If-Modified-Since` matching file mtime returns 304
+- [x] Integration test: `Range: bytes=0-999` returns correct partial content with 206
 
 ---
 
@@ -364,19 +371,19 @@ serve a custom HTML error page configured in the location block.
 
 ### 8.0 Error Page Handler
 
-- [ ] `error_page` directive in config file: `error_page 404 /errors/404.html`
-- [ ] Support multiple status codes per directive: `error_page 500 502 503 504 /50x.html`
-- [ ] `error_page` can redirect to an absolute URI: `error_page 404 https://example.com/missing`
-- [ ] Internally, error page is served via `serveStaticFile()` — reuses MIME type and
+- [x] `error_page` directive in config file: `error_page 404 /errors/404.html`
+- [x] Support multiple status codes per directive: `error_page 500 502 503 504 /50x.html`
+- [x] `error_page` can redirect to an absolute URI: `error_page 404 https://example.com/missing`
+- [x] Internally, error page is served via `serveStaticFile()` — reuses MIME type and
       caching headers
-- [ ] Error page overrides JSON envelope for non-API routes (detected by `Accept` header)
-- [ ] API routes (`/v1/...`) always use JSON error envelope regardless of `error_page` config
+- [x] Error page overrides JSON envelope for non-API routes (detected by `Accept` header)
+- [x] API routes (`/v1/...`) always use JSON error envelope regardless of `error_page` config
 
 ### 8.1 Tests
 
-- [ ] Integration test: 404 on a static root with `error_page 404 /errors/404.html`
+- [x] Integration test: 404 on a static root with `error_page 404 /errors/404.html`
       returns the HTML file with status 404
-- [ ] Integration test: API route 404 still returns JSON envelope even with `error_page` set
+- [x] Integration test: API route 404 still returns JSON envelope even with `error_page` set
 
 ---
 
@@ -390,11 +397,11 @@ stubs in a single function. This is a maintenance and correctness risk.
 
 ### 9.0 Split into Focused Handlers
 
-- [ ] Extract `runMiddlewarePipeline(ctx)` — auth, rate limit, request limits, policy eval
-- [ ] Extract `routeRequest(ctx, location)` — dispatches to correct backend handler
-- [ ] Extract `handleProxyRequest(ctx, upstream)` — HTTP proxy with retry and caching
-- [ ] Extract `handleWebSocketUpgrade(ctx)` — WebSocket handshake and proxy loop
-- [ ] Extract `handleSseStream(ctx)` — SSE connection lifecycle
+- [x] Extract `runMiddlewarePipeline(ctx)` — auth, rate limit, request limits, policy eval
+- [x] Extract `routeRequest(ctx, location)` — dispatches to correct backend handler
+- [x] Extract `handleProxyRequest(ctx, upstream)` — HTTP proxy with retry and caching
+- [x] Extract `handleWebSocketUpgrade(ctx)` — WebSocket handshake and proxy loop
+- [x] Extract `handleSseStream(ctx)` — SSE connection lifecycle
 - [ ] Extract `handleStaticFile(ctx, root)` — delegates to `serveStaticFile()`
 - [ ] `handleConnection()` becomes: parse request → run middleware → match location → route
 

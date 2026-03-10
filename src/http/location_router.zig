@@ -33,6 +33,7 @@ pub const Action = union(enum) {
     static_root: struct {
         root: []const u8,
         alias: bool,
+        autoindex: bool,
         index: []const u8,
         try_files: []const u8,
     },
@@ -50,6 +51,17 @@ pub const Action = union(enum) {
                 allocator.free(root.try_files);
             },
         }
+        self.* = undefined;
+    }
+};
+
+pub const ErrorPageRule = struct {
+    status_codes: []u16,
+    target: []const u8,
+
+    pub fn deinit(self: *ErrorPageRule, allocator: std.mem.Allocator) void {
+        allocator.free(self.status_codes);
+        allocator.free(self.target);
         self.* = undefined;
     }
 };
@@ -82,10 +94,13 @@ pub const LocationBlock = struct {
     pattern: []const u8,
     priority: usize,
     action: Action,
+    error_pages: []ErrorPageRule = &.{},
 
     pub fn deinit(self: *LocationBlock, allocator: std.mem.Allocator) void {
         allocator.free(self.pattern);
         self.action.deinit(allocator);
+        for (self.error_pages) |*rule| rule.deinit(allocator);
+        if (self.error_pages.len > 0) allocator.free(self.error_pages);
         self.* = undefined;
     }
 };
@@ -236,6 +251,7 @@ test "case insensitive regex matches request path without query" {
             .action = .{ .static_root = .{
                 .root = "/srv/www",
                 .alias = false,
+                .autoindex = false,
                 .index = "index.html",
                 .try_files = "$uri",
             } },
@@ -256,6 +272,7 @@ test "longest plain prefix wins when no exact priority or regex matches" {
             .action = .{ .static_root = .{
                 .root = "/srv/www",
                 .alias = false,
+                .autoindex = false,
                 .index = "index.html",
                 .try_files = "",
             } },
@@ -267,6 +284,7 @@ test "longest plain prefix wins when no exact priority or regex matches" {
             .action = .{ .static_root = .{
                 .root = "/srv/images",
                 .alias = true,
+                .autoindex = false,
                 .index = "",
                 .try_files = "",
             } },

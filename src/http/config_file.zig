@@ -53,6 +53,11 @@ const BlockContext = union(enum) {
 };
 
 const LocationBlockBuilder = struct {
+    const ErrorPageBuilder = struct {
+        status_codes_csv: []u8,
+        target: []u8,
+    };
+
     match_type: []u8,
     pattern: []u8,
     proxy_pass: ?[]u8 = null,
@@ -61,12 +66,14 @@ const LocationBlockBuilder = struct {
     uwsgi_pass: ?[]u8 = null,
     root: ?[]u8 = null,
     alias: ?[]u8 = null,
+    autoindex: ?bool = null,
     index: ?[]u8 = null,
     try_files: ?[]u8 = null,
     return_status: ?u16 = null,
     return_body: ?[]u8 = null,
     rewrite_replacement: ?[]u8 = null,
     rewrite_flag: ?[]u8 = null,
+    error_pages: std.ArrayListUnmanaged(ErrorPageBuilder) = .{},
 
     fn deinit(self: *LocationBlockBuilder, allocator: std.mem.Allocator) void {
         allocator.free(self.match_type);
@@ -82,6 +89,11 @@ const LocationBlockBuilder = struct {
         if (self.return_body) |value| allocator.free(value);
         if (self.rewrite_replacement) |value| allocator.free(value);
         if (self.rewrite_flag) |value| allocator.free(value);
+        for (self.error_pages.items) |entry| {
+            allocator.free(entry.status_codes_csv);
+            allocator.free(entry.target);
+        }
+        self.error_pages.deinit(allocator);
         self.* = undefined;
     }
 };
@@ -557,8 +569,40 @@ fn parseLocationStatement(
         try replaceOptionalOwned(allocator, &builder.index, value_interp);
         return;
     }
+    if (std.ascii.eqlIgnoreCase(directive, "autoindex")) {
+        builder.autoindex = parseOnOffBool(value_interp) orelse return error.InvalidConfigSyntax;
+        return;
+    }
     if (std.ascii.eqlIgnoreCase(directive, "try_files")) {
         try replaceOptionalOwned(allocator, &builder.try_files, value_interp);
+        return;
+    }
+    if (std.ascii.eqlIgnoreCase(directive, "error_page")) {
+        var toks = std.mem.tokenizeAny(u8, value_raw, " \t");
+        var status_codes = std.ArrayList([]const u8).init(allocator);
+        defer status_codes.deinit();
+        var target_raw: ?[]const u8 = null;
+        while (toks.next()) |token| {
+            if (std.mem.startsWith(u8, token, "/") or std.mem.startsWith(u8, token, "http://") or std.mem.startsWith(u8, token, "https://")) {
+                target_raw = token;
+                break;
+            }
+            _ = std.fmt.parseInt(u16, token, 10) catch return error.InvalidConfigSyntax;
+            try status_codes.append(token);
+        }
+        const target_token = target_raw orelse return error.InvalidConfigSyntax;
+        if (status_codes.items.len == 0) return error.InvalidConfigSyntax;
+        if (toks.next() != null) return error.InvalidConfigSyntax;
+
+        const target_interp = try interpolate(allocator, std.mem.trim(u8, target_token, "\"'"), vars);
+        defer allocator.free(target_interp);
+
+        const codes_csv = try std.mem.join(allocator, ",", status_codes.items);
+        errdefer allocator.free(codes_csv);
+        try builder.error_pages.append(allocator, .{
+            .status_codes_csv = codes_csv,
+            .target = try allocator.dupe(u8, target_interp),
+        });
         return;
     }
     if (std.ascii.eqlIgnoreCase(directive, "return")) {
@@ -602,15 +646,16 @@ fn flushLocationBlock(allocator: std.mem.Allocator, overrides: *Overrides, build
         try std.fmt.allocPrint(allocator, "{s}|{s}|proxy_pass|uwsgi:{s}", .{ builder.match_type, builder.pattern, target })
     else if (builder.return_status) |status|
         try std.fmt.allocPrint(allocator, "{s}|{s}|return|{d}|{s}", .{ builder.match_type, builder.pattern, status, builder.return_body orelse "" })
-    else if (builder.root != null or builder.alias != null or builder.index != null or builder.try_files != null)
+    else if (builder.root != null or builder.alias != null or builder.index != null or builder.try_files != null or builder.autoindex != null)
         try std.fmt.allocPrint(
             allocator,
-            "{s}|{s}|static_root|{s}|{s}|{s}|{s}",
+            "{s}|{s}|static_root|{s}|{s}|{s}|{s}|{s}",
             .{
                 builder.match_type,
                 builder.pattern,
                 builder.alias orelse builder.root orelse "",
                 if (builder.alias != null) "on" else "off",
+                if (builder.autoindex orelse false) "on" else "off",
                 builder.index orelse "",
                 builder.try_files orelse "",
             },
@@ -627,11 +672,30 @@ fn flushLocationBlock(allocator: std.mem.Allocator, overrides: *Overrides, build
     defer allocator.free(entry);
 
     try appendOverride(allocator, &overrides.map, "TARDIGRADE_LOCATION_BLOCKS", entry, ";");
+
+    for (builder.error_pages.items) |rule| {
+        const error_entry = try std.fmt.allocPrint(allocator, "{s}|{s}|{s}|{s}", .{
+            builder.match_type,
+            builder.pattern,
+            rule.status_codes_csv,
+            rule.target,
+        });
+        defer allocator.free(error_entry);
+        try appendOverride(allocator, &overrides.map, "TARDIGRADE_LOCATION_ERROR_PAGES", error_entry, ";");
+    }
 }
 
 fn replaceOptionalOwned(allocator: std.mem.Allocator, target: *?[]u8, value: []const u8) !void {
     if (target.*) |existing| allocator.free(existing);
     target.* = try allocator.dupe(u8, value);
+}
+
+fn parseOnOffBool(raw: []const u8) ?bool {
+    if (std.ascii.eqlIgnoreCase(raw, "on")) return true;
+    if (std.ascii.eqlIgnoreCase(raw, "off")) return false;
+    if (std.ascii.eqlIgnoreCase(raw, "true")) return true;
+    if (std.ascii.eqlIgnoreCase(raw, "false")) return false;
+    return null;
 }
 
 fn mapListenDirective(allocator: std.mem.Allocator, map: *std.StringHashMap([]const u8), raw: []const u8) !void {
@@ -940,7 +1004,7 @@ test "location blocks accumulate into location block env" {
     try parseFile(allocator, absolute, &overrides, &vars, &visited);
 
     try std.testing.expectEqualStrings(
-        "exact|/health|return|200|ok;prefix_priority|/api/private/|proxy_pass|http://127.0.0.1:9001;regex_case_insensitive|^/assets/.*$|static_root|/srv/www|off|index.html|$uri /index.html",
+        "exact|/health|return|200|ok;prefix_priority|/api/private/|proxy_pass|http://127.0.0.1:9001;regex_case_insensitive|^/assets/.*$|static_root|/srv/www|off|off|index.html|$uri /index.html",
         overrides.map.get("TARDIGRADE_LOCATION_BLOCKS").?,
     );
 }
@@ -980,7 +1044,45 @@ test "location block supports alias and fastcgi pass serialization" {
     try parseFile(allocator, absolute, &overrides, &vars, &visited);
 
     try std.testing.expectEqualStrings(
-        "prefix|/php/|fastcgi_pass|unix:/tmp/php-fpm.sock;prefix|/images/|static_root|/srv/images|on|home.html|",
+        "prefix|/php/|fastcgi_pass|unix:/tmp/php-fpm.sock;prefix|/images/|static_root|/srv/images|on|off|home.html|",
         overrides.map.get("TARDIGRADE_LOCATION_BLOCKS").?,
+    );
+}
+
+test "location block supports error_page serialization" {
+    const allocator = std.testing.allocator;
+    var cfg_dir = std.testing.tmpDir(.{});
+    defer cfg_dir.cleanup();
+
+    try cfg_dir.dir.writeFile(.{
+        .sub_path = "location-error-page.conf",
+        .data =
+        \\location / {
+        \\    root /srv/www;
+        \\    error_page 404 /errors/404.html;
+        \\    error_page 500 502 503 504 https://example.com/50x;
+        \\}
+        ,
+    });
+
+    const absolute = try cfg_dir.dir.realpathAlloc(allocator, "location-error-page.conf");
+    defer allocator.free(absolute);
+
+    var overrides = Overrides.init(allocator);
+    defer overrides.deinit(allocator);
+    var vars = std.StringHashMap([]const u8).init(allocator);
+    defer vars.deinit();
+    var visited = std.StringHashMap(void).init(allocator);
+    defer {
+        var it = visited.iterator();
+        while (it.next()) |entry| allocator.free(entry.key_ptr.*);
+        visited.deinit();
+    }
+
+    try parseFile(allocator, absolute, &overrides, &vars, &visited);
+
+    try std.testing.expectEqualStrings(
+        "prefix|/|404|/errors/404.html;prefix|/|500,502,503,504|https://example.com/50x",
+        overrides.map.get("TARDIGRADE_LOCATION_ERROR_PAGES").?,
     );
 }

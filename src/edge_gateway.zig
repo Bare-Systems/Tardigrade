@@ -3102,261 +3102,12 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         );
     }
 
-    // --- Geo-based blocking (external country header) ---
-    if (cfg.geo_blocked_countries.len > 0) {
-        const country = request.headers.get(cfg.geo_country_header);
-        if (isGeoBlocked(cfg.geo_blocked_countries, country)) {
-            try sendApiError(allocator, writer, .forbidden, "forbidden", "Geo access denied", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), request.uri.path, 403, request.headers.get("user-agent") orelse "");
-            return;
-        }
-    }
-
-    // --- Request validation (body size, URI length, header count) ---
-    const limits = cfg.request_limits;
-    const uri_check = http.request_limits.validateUriLength(request.uri.path.len, limits);
-    if (uri_check != .ok) {
-        var msg_buf: [256]u8 = undefined;
-        const msg = http.request_limits.rejectionMessage(uri_check, &msg_buf);
-        try sendApiError(allocator, writer, .uri_too_long, "invalid_request", msg, correlation_id, keep_alive, state);
-        state.logger.warn(correlation_id, "URI too long: {d} bytes", .{request.uri.path.len});
-        logAccess(&ctx, request.method.toString(), request.uri.path, 414, request.headers.get("user-agent") orelse "");
-        return;
-    }
-    const header_count_check = http.request_limits.validateHeaderCount(request.headers.count(), limits);
-    if (header_count_check != .ok) {
-        try sendApiError(allocator, writer, .bad_request, "invalid_request", "Too many headers", correlation_id, keep_alive, state);
-        state.logger.warn(correlation_id, "Too many headers: {d}", .{request.headers.count()});
-        logAccess(&ctx, request.method.toString(), request.uri.path, 400, request.headers.get("user-agent") orelse "");
-        return;
-    }
-    if (request.body) |body| {
-        const body_check = http.request_limits.validateBodySize(body.len, limits);
-        if (body_check != .ok) {
-            try sendApiError(allocator, writer, .payload_too_large, "invalid_request", "Request body too large", correlation_id, keep_alive, state);
-            state.logger.warn(correlation_id, "Body too large: {d} bytes", .{body.len});
-            logAccess(&ctx, request.method.toString(), request.uri.path, 413, request.headers.get("user-agent") orelse "");
-            return;
-        }
-    }
-
-    // --- Extract API version ---
-    if (http.api_router.parseVersionedPath(request.uri.path)) |versioned| {
-        ctx.setApiVersion(versioned.version);
-    }
-
-    if (ctx.api_version != null and isProtectedAuthRequestRoute(request.uri.path)) {
-        if (cfg.device_auth_required and !validateDeviceRequest(cfg, request.method.toString(), request.uri.path, &request.headers, request.body orelse "")) {
-            try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Device authentication failed", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), request.uri.path, 401, request.headers.get("user-agent") orelse "");
-            return;
-        }
-
-        const identity = try extractIdentityForPolicy(allocator, cfg, state, &request);
-        defer if (identity) |id| allocator.free(id);
-        if (evaluatePolicy(state, cfg, request.method.toString(), request.uri.path, identity, request.headers.get("x-device-id"), &request.headers)) |reason| {
-            try sendApiError(allocator, writer, .forbidden, "forbidden", reason, correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), request.uri.path, 403, request.headers.get("user-agent") orelse "");
-            return;
-        }
-    }
-
-    // --- Extract idempotency key ---
-    if (http.idempotency.fromHeaders(&request.headers)) |idem_key| {
-        ctx.setIdempotencyKey(idem_key);
-    }
-
-    // --- IP Access Control ---
-    if (state.access_control) |*acl| {
-        if (acl.check(client_ip) == .denied) {
-            try sendApiError(allocator, writer, .forbidden, "forbidden", "Access denied", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), request.uri.path, 403, request.headers.get("user-agent") orelse "");
-            return;
-        }
-    }
-
-    // --- Rate Limiting ---
-    if (!state.rateLimitAllow(client_ip)) {
-        const payload = try buildApiErrorJson(allocator, "rate_limited", "Rate limit exceeded", correlation_id);
-        defer allocator.free(payload);
-        var response = http.Response.json(allocator, payload);
-        defer response.deinit();
-        _ = response
-            .setStatus(.too_many_requests)
-            .setConnection(keep_alive)
-            .setHeader("Retry-After", "1")
-            .setHeader(http.correlation.HEADER_NAME, correlation_id);
-        applyResponseHeaders(state, &response);
-        try response.write(writer);
-        state.metricsRecord(429);
-        state.metricsRecordErrorCode("rate_limited");
-        logAccess(&ctx, request.method.toString(), request.uri.path, 429, request.headers.get("user-agent") orelse "");
+    if (try runMiddlewarePipeline(allocator, writer, cfg, state, &ctx, &request, correlation_id, keep_alive)) {
         return;
     }
 
-    if (try routeConfiguredLocation(allocator, writer, cfg, state, &ctx, &request, correlation_id, keep_alive, client_ip)) |status| {
+    if (try routeRequest(allocator, writer, cfg, state, &ctx, &request, correlation_id, keep_alive, client_ip)) |status| {
         logAccess(&ctx, request.method.toString(), request.uri.path, status, request.headers.get("user-agent") orelse "");
-        return;
-    }
-
-    // --- Health endpoint ---
-    if (request.method == .GET and std.mem.eql(u8, request.uri.path, "/health")) {
-        var response = http.Response.init(allocator);
-        defer response.deinit();
-        try populateHealthResponse(allocator, &response, keep_alive, correlation_id, state, cfg, false);
-        try response.write(writer);
-        state.metricsRecord(200);
-        logAccess(&ctx, request.method.toString(), "/health", 200, request.headers.get("user-agent") orelse "");
-        return;
-    }
-
-    // --- Metrics endpoint ---
-    if (request.method == .GET and std.mem.eql(u8, request.uri.path, "/metrics")) {
-        const prom_text = state.metricsToPrometheus(allocator) catch {
-            try sendApiError(allocator, writer, .internal_server_error, "internal_error", "Failed to generate metrics", correlation_id, keep_alive, state);
-            return;
-        };
-        defer allocator.free(prom_text);
-
-        var response = http.Response.init(allocator);
-        defer response.deinit();
-        _ = response.setBody(prom_text)
-            .setContentType("text/plain; version=0.0.4; charset=utf-8")
-            .setConnection(keep_alive)
-            .setHeader(http.correlation.HEADER_NAME, correlation_id);
-        applyResponseHeaders(state, &response);
-        try response.write(writer);
-        state.metricsRecord(200);
-        logAccess(&ctx, request.method.toString(), "/metrics", 200, request.headers.get("user-agent") orelse "");
-        return;
-    }
-
-    // --- JSON metrics endpoint ---
-    if (request.method == .GET and std.mem.eql(u8, request.uri.path, "/metrics/json")) {
-        const metrics_json = state.metricsToJson(allocator) catch {
-            try sendApiError(allocator, writer, .internal_server_error, "internal_error", "Failed to generate metrics", correlation_id, keep_alive, state);
-            return;
-        };
-        defer allocator.free(metrics_json);
-
-        var response = http.Response.json(allocator, metrics_json);
-        defer response.deinit();
-        _ = response.setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
-        applyResponseHeaders(state, &response);
-        try response.write(writer);
-        state.metricsRecord(200);
-        logAccess(&ctx, request.method.toString(), "/metrics/json", 200, request.headers.get("user-agent") orelse "");
-        return;
-    }
-
-    // --- Prometheus metrics endpoint ---
-    if (request.method == .GET and std.mem.eql(u8, request.uri.path, "/metrics/prometheus")) {
-        const prom_text = state.metricsToPrometheus(allocator) catch {
-            try sendApiError(allocator, writer, .internal_server_error, "internal_error", "Failed to generate metrics", correlation_id, keep_alive, state);
-            return;
-        };
-        defer allocator.free(prom_text);
-
-        var response = http.Response.init(allocator);
-        defer response.deinit();
-        _ = response.setBody(prom_text)
-            .setContentType("text/plain; version=0.0.4; charset=utf-8")
-            .setConnection(keep_alive)
-            .setHeader(http.correlation.HEADER_NAME, correlation_id);
-        applyResponseHeaders(state, &response);
-        try response.write(writer);
-        state.metricsRecord(200);
-        logAccess(&ctx, request.method.toString(), "/metrics/prometheus", 200, request.headers.get("user-agent") orelse "");
-        return;
-    }
-
-    // --- Admin API ---
-    if (request.method == .GET and std.mem.startsWith(u8, request.uri.path, "/admin/")) {
-        const auth_result = authorizeRequest(cfg, &request.headers);
-        if (!auth_result.ok) {
-            try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), request.uri.path, 401, request.headers.get("user-agent") orelse "");
-            return;
-        }
-        if (std.mem.eql(u8, request.uri.path, "/admin/routes")) {
-            var response = http.Response.json(allocator, ADMIN_ROUTES_JSON);
-            defer response.deinit();
-            _ = response.setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
-            applyResponseHeaders(state, &response);
-            try response.write(writer);
-            state.metricsRecord(200);
-            logAccess(&ctx, request.method.toString(), request.uri.path, 200, request.headers.get("user-agent") orelse "");
-            return;
-        }
-        if (std.mem.eql(u8, request.uri.path, "/admin/connections")) {
-            const counts = state.connectionCounts();
-            const body = try std.fmt.allocPrint(allocator, "{{\"active\":{d},\"tracked_ip_buckets\":{d}}}", .{ counts.active, counts.per_ip });
-            defer allocator.free(body);
-            var response = http.Response.json(allocator, body);
-            defer response.deinit();
-            _ = response.setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
-            applyResponseHeaders(state, &response);
-            try response.write(writer);
-            state.metricsRecord(200);
-            logAccess(&ctx, request.method.toString(), request.uri.path, 200, request.headers.get("user-agent") orelse "");
-            return;
-        }
-        if (std.mem.eql(u8, request.uri.path, "/admin/streams")) {
-            const counts = state.streamCounts();
-            const body = try std.fmt.allocPrint(allocator, "{{\"websocket_active\":{d},\"sse_active\":{d}}}", .{ counts.ws, counts.sse });
-            defer allocator.free(body);
-            var response = http.Response.json(allocator, body);
-            defer response.deinit();
-            _ = response.setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
-            applyResponseHeaders(state, &response);
-            try response.write(writer);
-            state.metricsRecord(200);
-            logAccess(&ctx, request.method.toString(), request.uri.path, 200, request.headers.get("user-agent") orelse "");
-            return;
-        }
-        if (std.mem.eql(u8, request.uri.path, "/admin/upstreams")) {
-            const body = state.upstreamHealthJson(allocator) catch try allocator.dupe(u8, "{\"upstreams\":[]}");
-            defer allocator.free(body);
-            var response = http.Response.json(allocator, body);
-            defer response.deinit();
-            _ = response.setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
-            applyResponseHeaders(state, &response);
-            try response.write(writer);
-            state.metricsRecord(200);
-            logAccess(&ctx, request.method.toString(), request.uri.path, 200, request.headers.get("user-agent") orelse "");
-            return;
-        }
-        if (std.mem.eql(u8, request.uri.path, "/admin/certs")) {
-            const body = try std.fmt.allocPrint(allocator, "{{\"default_cert\":\"{s}\",\"default_key\":\"{s}\",\"sni_count\":{d}}}", .{ cfg.tls_cert_path, cfg.tls_key_path, cfg.tls_sni_certs.len });
-            defer allocator.free(body);
-            var response = http.Response.json(allocator, body);
-            defer response.deinit();
-            _ = response.setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
-            applyResponseHeaders(state, &response);
-            try response.write(writer);
-            state.metricsRecord(200);
-            logAccess(&ctx, request.method.toString(), request.uri.path, 200, request.headers.get("user-agent") orelse "");
-            return;
-        }
-        if (std.mem.eql(u8, request.uri.path, "/admin/auth-registry")) {
-            const body = try std.fmt.allocPrint(allocator, "{{\"bearer_hashes\":{d},\"basic_auth_hashes\":{d},\"sessions_enabled\":{}}}", .{
-                cfg.auth_token_hashes.len,
-                cfg.basic_auth_hashes.len,
-                state.session_store != null,
-            });
-            defer allocator.free(body);
-            var response = http.Response.json(allocator, body);
-            defer response.deinit();
-            _ = response.setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
-            applyResponseHeaders(state, &response);
-            try response.write(writer);
-            state.metricsRecord(200);
-            logAccess(&ctx, request.method.toString(), request.uri.path, 200, request.headers.get("user-agent") orelse "");
-            return;
-        }
-
-        try sendApiError(allocator, writer, .not_found, "invalid_request", "Unknown admin route", correlation_id, keep_alive, state);
-        logAccess(&ctx, request.method.toString(), request.uri.path, 404, request.headers.get("user-agent") orelse "");
         return;
     }
 
@@ -3377,1503 +3128,33 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         }
     }
 
-    // --- POST /v1/subrequest ---
-    if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/subrequest")) {
-        const auth_result = authorizeRequest(cfg, &request.headers);
-        if (!auth_result.ok) {
-            try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/subrequest", 401, request.headers.get("user-agent") orelse "");
-            return;
-        }
-        ctx.setIdentity(auth_result.token_hash orelse "-");
-        const body = request.body orelse "";
-        const sub = parseSubrequestPayload(allocator, body) catch {
-            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Invalid subrequest payload", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/subrequest", 400, request.headers.get("user-agent") orelse "");
-            return;
-        };
-        defer {
-            allocator.free(sub.url);
-            if (sub.body) |b| allocator.free(b);
-        }
-        const out = executeSubrequest(allocator, sub.url, sub.method, sub.body) catch |err| {
-            state.logger.warn(correlation_id, "subrequest failed: {}", .{err});
-            try sendApiError(allocator, writer, .bad_gateway, "tool_unavailable", "Subrequest failed", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/subrequest", 502, request.headers.get("user-agent") orelse "");
-            return;
-        };
-        defer allocator.free(out.body);
-        var response = http.Response.init(allocator);
-        defer response.deinit();
-        _ = response.setStatus(@enumFromInt(out.status))
-            .setBody(out.body)
-            .setContentType(out.content_type)
-            .setConnection(keep_alive)
-            .setHeader(http.correlation.HEADER_NAME, correlation_id);
-        applyResponseHeaders(state, &response);
-        try response.write(writer);
-        state.metricsRecord(out.status);
-        logAccess(&ctx, request.method.toString(), "/v1/subrequest", out.status, request.headers.get("user-agent") orelse "");
+    if (try handleBackendProtocolTail(conn, allocator, cfg, state, &ctx, &request, correlation_id, client_ip, keep_alive)) |status| {
+        logAccess(&ctx, request.method.toString(), request.uri.path, status, request.headers.get("user-agent") orelse "");
         return;
     }
 
-    // --- Backend protocol bridges (Phase 11.3) ---
-    if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/backend/fastcgi")) {
-        const status = try handleFastcgiRoute(
-            allocator,
-            writer,
-            cfg,
-            cfg.fastcgi_upstream,
-            &request,
-            client_ip,
-            correlation_id,
-            keep_alive,
-            state,
-        );
-        logAccess(&ctx, request.method.toString(), "/v1/backend/fastcgi", status, request.headers.get("user-agent") orelse "");
-        return;
-    }
-    if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/backend/uwsgi")) {
-        const status = try handleUwsgiRoute(
-            allocator,
-            writer,
-            cfg,
-            cfg.uwsgi_upstream,
-            &request,
-            client_ip,
-            correlation_id,
-            keep_alive,
-            state,
-        );
-        logAccess(&ctx, request.method.toString(), "/v1/backend/uwsgi", status, request.headers.get("user-agent") orelse "");
-        return;
-    }
-    if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/backend/scgi")) {
-        const status = try handleScgiRoute(
-            allocator,
-            writer,
-            cfg,
-            cfg.scgi_upstream,
-            &request,
-            client_ip,
-            correlation_id,
-            keep_alive,
-            state,
-        );
-        logAccess(&ctx, request.method.toString(), "/v1/backend/scgi", status, request.headers.get("user-agent") orelse "");
-        return;
-    }
-    if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/backend/grpc")) {
-        const upstream = std.mem.trim(u8, cfg.grpc_upstream, " \t\r\n");
-        if (upstream.len == 0) {
-            try sendApiError(allocator, writer, .not_implemented, "tool_unavailable", "gRPC upstream not configured", correlation_id, keep_alive, state);
-            return;
-        }
-        const body = request.body orelse "";
-        const grpc_resp = proxyGrpcExecute(
-            allocator,
-            upstream,
-            body,
-            correlation_id,
-            state,
-        ) catch |err| {
-            state.logger.warn(correlation_id, "grpc proxy failed: {}", .{err});
-            try sendApiError(allocator, writer, .bad_gateway, "tool_unavailable", "gRPC proxy failed", correlation_id, keep_alive, state);
-            return;
-        };
-        defer allocator.free(grpc_resp);
-        var response = http.Response.init(allocator);
-        defer response.deinit();
-        _ = response.setStatus(.ok)
-            .setBody(grpc_resp)
-            .setContentType("application/grpc")
-            .setConnection(keep_alive)
-            .setHeader(http.correlation.HEADER_NAME, correlation_id);
-        applyResponseHeaders(state, &response);
-        try response.write(writer);
-        state.metricsRecord(200);
-        logAccess(&ctx, request.method.toString(), "/v1/backend/grpc", 200, request.headers.get("user-agent") orelse "");
-        return;
-    }
-    if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/backend/memcached")) {
-        const ep = std.mem.trim(u8, cfg.memcached_upstream, " \t\r\n");
-        if (ep.len == 0) {
-            try sendApiError(allocator, writer, .not_implemented, "tool_unavailable", "Memcached upstream not configured", correlation_id, keep_alive, state);
-            return;
-        }
-        const payload = request.body orelse "";
-        const parsed = parseMemcachedPayload(allocator, payload) catch {
-            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Invalid memcached payload", correlation_id, keep_alive, state);
-            return;
-        };
-        defer {
-            allocator.free(parsed.op);
-            allocator.free(parsed.key);
-            if (parsed.value) |v| allocator.free(v);
-        }
-        if (std.ascii.eqlIgnoreCase(parsed.op, "get")) {
-            const value = http.memcached.get(allocator, ep, parsed.key) catch null;
-            defer if (value) |v| allocator.free(v);
-            const body = if (value) |v|
-                try std.fmt.allocPrint(allocator, "{{\"value\":{s}}}", .{std.json.fmt(v, .{})})
-            else
-                try allocator.dupe(u8, "{\"value\":null}");
-            defer allocator.free(body);
-            var response = http.Response.json(allocator, body);
-            defer response.deinit();
-            _ = response.setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
-            applyResponseHeaders(state, &response);
-            try response.write(writer);
-            state.metricsRecord(200);
-            logAccess(&ctx, request.method.toString(), "/v1/backend/memcached", 200, request.headers.get("user-agent") orelse "");
-            return;
-        }
-        if (std.ascii.eqlIgnoreCase(parsed.op, "set")) {
-            const stored = http.memcached.set(allocator, ep, parsed.key, parsed.value orelse "", parsed.ttl) catch false;
-            const body = if (stored) "{\"stored\":true}" else "{\"stored\":false}";
-            var response = http.Response.json(allocator, body);
-            defer response.deinit();
-            _ = response.setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
-            applyResponseHeaders(state, &response);
-            try response.write(writer);
-            state.metricsRecord(200);
-            logAccess(&ctx, request.method.toString(), "/v1/backend/memcached", 200, request.headers.get("user-agent") orelse "");
-            return;
-        }
-        try sendApiError(allocator, writer, .bad_request, "invalid_request", "Unsupported memcached operation", correlation_id, keep_alive, state);
+    if (try handleWebSocketUpgrade(conn, allocator, cfg, state, &ctx, &request, correlation_id, client_ip, &keep_alive)) |status| {
+        logAccess(&ctx, request.method.toString(), request.uri.path, status, request.headers.get("user-agent") orelse "");
         return;
     }
 
-    // --- Mail proxy routes (Phase 11.4 optional) ---
-    if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/mail/smtp")) {
-        try handleMailProxyRoute(allocator, writer, cfg.smtp_upstream, request.body orelse "", correlation_id, keep_alive, state);
-        logAccess(&ctx, request.method.toString(), "/v1/mail/smtp", 200, request.headers.get("user-agent") orelse "");
-        return;
-    }
-    if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/mail/imap")) {
-        try handleMailProxyRoute(allocator, writer, cfg.imap_upstream, request.body orelse "", correlation_id, keep_alive, state);
-        logAccess(&ctx, request.method.toString(), "/v1/mail/imap", 200, request.headers.get("user-agent") orelse "");
-        return;
-    }
-    if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/mail/pop3")) {
-        try handleMailProxyRoute(allocator, writer, cfg.pop3_upstream, request.body orelse "", correlation_id, keep_alive, state);
-        logAccess(&ctx, request.method.toString(), "/v1/mail/pop3", 200, request.headers.get("user-agent") orelse "");
+    if (try handleSseStream(writer, allocator, cfg, state, &ctx, &request, correlation_id, &keep_alive)) |status| {
+        logAccess(&ctx, request.method.toString(), request.uri.path, status, request.headers.get("user-agent") orelse "");
         return;
     }
 
-    // --- Stream module routes (Phase 11.5) ---
-    if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/stream/tcp")) {
-        try handleMailProxyRoute(allocator, writer, cfg.tcp_proxy_upstream, request.body orelse "", correlation_id, keep_alive, state);
-        logAccess(&ctx, request.method.toString(), "/v1/stream/tcp", 200, request.headers.get("user-agent") orelse "");
-        return;
-    }
-    if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/stream/udp")) {
-        const upstream = std.mem.trim(u8, cfg.udp_proxy_upstream, " \t\r\n");
-        if (upstream.len == 0) {
-            try sendApiError(allocator, writer, .not_implemented, "tool_unavailable", "UDP upstream not configured", correlation_id, keep_alive, state);
-            return;
-        }
-        const udp_resp = executeUdpDatagramRequest(allocator, upstream, request.body orelse "") catch |err| {
-            state.logger.warn(correlation_id, "udp stream proxy failed: {}", .{err});
-            try sendApiError(allocator, writer, .bad_gateway, "tool_unavailable", "UDP proxy failed", correlation_id, keep_alive, state);
-            return;
-        };
-        defer allocator.free(udp_resp);
-        var response = http.Response.init(allocator);
-        defer response.deinit();
-        _ = response.setStatus(.ok)
-            .setBody(udp_resp)
-            .setContentType("application/octet-stream")
-            .setConnection(keep_alive)
-            .setHeader(http.correlation.HEADER_NAME, correlation_id)
-            .setHeader("X-Stream-SSL-Termination", if (cfg.stream_ssl_termination) "enabled" else "disabled");
-        applyResponseHeaders(state, &response);
-        try response.write(writer);
-        state.metricsRecord(200);
-        logAccess(&ctx, request.method.toString(), "/v1/stream/udp", 200, request.headers.get("user-agent") orelse "");
+    if (try handleSsePublish(writer, allocator, cfg, state, &ctx, &request, correlation_id, keep_alive)) |status| {
+        logAccess(&ctx, request.method.toString(), request.uri.path, status, request.headers.get("user-agent") orelse "");
         return;
     }
 
-    // --- WebSocket proxy routes ---
-    if (request.method == .GET and http.api_router.matchRoute(request.uri.path, 1, "/ws/mux")) {
-        if (!cfg.websocket_enabled or !cfg.sse_enabled) {
-            try sendApiError(allocator, writer, .not_found, "invalid_request", "Not Found", correlation_id, false, state);
-            logAccess(&ctx, request.method.toString(), request.uri.path, 404, request.headers.get("user-agent") orelse "");
-            return;
-        }
-        if (!http.websocket.isUpgradeRequest(&request.headers)) {
-            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Expected websocket upgrade request", correlation_id, false, state);
-            logAccess(&ctx, request.method.toString(), request.uri.path, 400, request.headers.get("user-agent") orelse "");
-            return;
-        }
-        var authenticated = false;
-        const auth_result = authorizeRequest(cfg, &request.headers);
-        if (auth_result.ok) {
-            ctx.setIdentity(auth_result.token_hash orelse "-");
-            authenticated = true;
-        }
-        if (!authenticated) {
-            if (http.session.fromHeaders(&request.headers)) |session_token| {
-                if (state.validateSessionIdentity(allocator, session_token)) |identity| {
-                    defer allocator.free(identity);
-                    ctx.setIdentity(identity);
-                    authenticated = true;
-                }
-            }
-        }
-        if (!authenticated) {
-            try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, false, state);
-            logAccess(&ctx, request.method.toString(), request.uri.path, 401, request.headers.get("user-agent") orelse "");
-            return;
-        }
-        const device_id = request.headers.get("x-device-id") orelse {
-            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Missing X-Device-ID for multiplex stream", correlation_id, false, state);
-            logAccess(&ctx, request.method.toString(), request.uri.path, 400, request.headers.get("user-agent") orelse "");
-            return;
-        };
-        if (!isValidDeviceTopicSegment(device_id)) {
-            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Invalid device id", correlation_id, false, state);
-            logAccess(&ctx, request.method.toString(), request.uri.path, 400, request.headers.get("user-agent") orelse "");
-            return;
-        }
-
-        const ws_key = request.headers.get("sec-websocket-key") orelse {
-            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Missing Sec-WebSocket-Key", correlation_id, false, state);
-            logAccess(&ctx, request.method.toString(), request.uri.path, 400, request.headers.get("user-agent") orelse "");
-            return;
-        };
-        const accept_key = try http.websocket.acceptKey(allocator, ws_key);
-        defer allocator.free(accept_key);
-        try http.websocket.writeServerHandshake(writer, accept_key, request.headers.get("sec-websocket-protocol"));
-
-        state.streamCountAdjust(1, 1);
-        defer state.streamCountAdjust(-1, -1);
-        handleWebSocketMultiplexLoop(
-            conn,
-            allocator,
-            cfg,
-            state,
-            correlation_id,
-            client_ip,
-            ctx.identity,
-            if (ctx.api_version) |version| @as(u32, version) else null,
-            request.headers.get("host"),
-            request.headers.get("x-forwarded-for"),
-            device_id,
-        ) catch |err| {
-            state.logger.warn(correlation_id, "websocket multiplex loop ended: {}", .{err});
-        };
-        state.metricsRecord(101);
-        logAccess(&ctx, request.method.toString(), request.uri.path, 101, request.headers.get("user-agent") orelse "");
-        keep_alive = false;
+    if (try handleBuiltinApiTailHttp1(allocator, writer, cfg, state, &ctx, &request, correlation_id, keep_alive, client_ip)) |status| {
+        logAccess(&ctx, request.method.toString(), request.uri.path, status, request.headers.get("user-agent") orelse "");
         return;
     }
 
-    if (request.method == .GET and (http.api_router.matchRoute(request.uri.path, 1, "/ws/chat") or http.api_router.matchRoute(request.uri.path, 1, "/ws/commands"))) {
-        if (!cfg.websocket_enabled) {
-            try sendApiError(allocator, writer, .not_found, "invalid_request", "Not Found", correlation_id, false, state);
-            logAccess(&ctx, request.method.toString(), request.uri.path, 404, request.headers.get("user-agent") orelse "");
-            return;
-        }
-        if (!http.websocket.isUpgradeRequest(&request.headers)) {
-            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Expected websocket upgrade request", correlation_id, false, state);
-            logAccess(&ctx, request.method.toString(), request.uri.path, 400, request.headers.get("user-agent") orelse "");
-            return;
-        }
-
-        var authenticated = false;
-        const auth_result = authorizeRequest(cfg, &request.headers);
-        if (auth_result.ok) {
-            ctx.setIdentity(auth_result.token_hash orelse "-");
-            authenticated = true;
-        }
-        if (!authenticated) {
-            if (http.session.fromHeaders(&request.headers)) |session_token| {
-                if (state.validateSessionIdentity(allocator, session_token)) |identity| {
-                    defer allocator.free(identity);
-                    ctx.setIdentity(identity);
-                    authenticated = true;
-                }
-            }
-        }
-        if (!authenticated) {
-            try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, false, state);
-            logAccess(&ctx, request.method.toString(), request.uri.path, 401, request.headers.get("user-agent") orelse "");
-            return;
-        }
-
-        const ws_key = request.headers.get("sec-websocket-key") orelse {
-            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Missing Sec-WebSocket-Key", correlation_id, false, state);
-            logAccess(&ctx, request.method.toString(), request.uri.path, 400, request.headers.get("user-agent") orelse "");
-            return;
-        };
-        const accept_key = try http.websocket.acceptKey(allocator, ws_key);
-        defer allocator.free(accept_key);
-        try http.websocket.writeServerHandshake(writer, accept_key, request.headers.get("sec-websocket-protocol"));
-
-        const ws_scope: UpstreamScope = if (http.api_router.matchRoute(request.uri.path, 1, "/ws/chat")) .chat else .commands;
-        const ws_proxy_target = if (ws_scope == .chat) cfg.proxy_pass_chat else cfg.proxy_pass_commands_prefix;
-        state.streamCountAdjust(1, 0);
-        defer state.streamCountAdjust(-1, 0);
-        handleWebSocketProxyLoop(
-            conn,
-            allocator,
-            cfg,
-            state,
-            correlation_id,
-            client_ip,
-            ctx.identity,
-            if (ctx.api_version) |version| @as(u32, version) else null,
-            request.headers.get("host"),
-            request.headers.get("x-forwarded-for"),
-            ws_scope,
-            ws_proxy_target,
-        ) catch |err| {
-            state.logger.warn(correlation_id, "websocket loop ended: {}", .{err});
-        };
-        state.metricsRecord(101);
-        logAccess(&ctx, request.method.toString(), request.uri.path, 101, request.headers.get("user-agent") orelse "");
-        keep_alive = false;
-        return;
-    }
-
-    // --- SSE stream route ---
-    if (request.method == .GET and http.api_router.matchRoute(request.uri.path, 1, "/events/stream")) {
-        if (!cfg.sse_enabled) {
-            try sendApiError(allocator, writer, .not_found, "invalid_request", "Not Found", correlation_id, false, state);
-            logAccess(&ctx, request.method.toString(), request.uri.path, 404, request.headers.get("user-agent") orelse "");
-            return;
-        }
-
-        var authenticated = false;
-        const auth_result = authorizeRequest(cfg, &request.headers);
-        if (auth_result.ok) {
-            ctx.setIdentity(auth_result.token_hash orelse "-");
-            authenticated = true;
-        }
-        if (!authenticated) {
-            if (http.session.fromHeaders(&request.headers)) |session_token| {
-                if (state.validateSessionIdentity(allocator, session_token)) |identity| {
-                    defer allocator.free(identity);
-                    ctx.setIdentity(identity);
-                    authenticated = true;
-                }
-            }
-        }
-        if (!authenticated) {
-            try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, false, state);
-            logAccess(&ctx, request.method.toString(), request.uri.path, 401, request.headers.get("user-agent") orelse "");
-            return;
-        }
-
-        const topic = parseQueryParam(request.uri.query, "topic") orelse "default";
-        const last_event_id = parseLastEventId(request.headers.get("last-event-id"));
-        state.streamCountAdjust(0, 1);
-        defer state.streamCountAdjust(0, -1);
-        try streamSseTopic(writer, allocator, cfg, state, topic, last_event_id, correlation_id);
-        state.metricsRecord(200);
-        logAccess(&ctx, request.method.toString(), request.uri.path, 200, request.headers.get("user-agent") orelse "");
-        keep_alive = false;
-        return;
-    }
-
-    // --- SSE publish route ---
-    if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/events/publish")) {
-        if (!cfg.sse_enabled) {
-            try sendApiError(allocator, writer, .not_found, "invalid_request", "Not Found", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), request.uri.path, 404, request.headers.get("user-agent") orelse "");
-            return;
-        }
-        const auth_result = authorizeRequest(cfg, &request.headers);
-        if (!auth_result.ok) {
-            try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), request.uri.path, 401, request.headers.get("user-agent") orelse "");
-            return;
-        }
-        ctx.setIdentity(auth_result.token_hash orelse "-");
-
-        const topic = parseQueryParam(request.uri.query, "topic") orelse "default";
-        const payload = request.body orelse "";
-        const event_id = try state.event_hub.publish(topic, payload, http.event_loop.monotonicMs());
-        const body = try std.fmt.allocPrint(allocator, "{{\"topic\":\"{s}\",\"id\":{d}}}", .{ topic, event_id });
-        defer allocator.free(body);
-        var response = http.Response.json(allocator, body);
-        defer response.deinit();
-        _ = response.setStatus(.accepted)
-            .setConnection(keep_alive)
-            .setHeader(http.correlation.HEADER_NAME, correlation_id);
-        applyResponseHeaders(state, &response);
-        try response.write(writer);
-        state.metricsRecord(202);
-        logAccess(&ctx, request.method.toString(), request.uri.path, 202, request.headers.get("user-agent") orelse "");
-        return;
-    }
-
-    // --- POST /v1/devices/register (device identity registration) ---
-    if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/devices/register")) {
-        if (cfg.device_registry_path.len == 0) {
-            try sendApiError(allocator, writer, .not_implemented, "tool_unavailable", "Device registry not configured", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/devices/register", 501, request.headers.get("user-agent") orelse "");
-            return;
-        }
-        const auth_result = authorizeRequest(cfg, &request.headers);
-        if (!auth_result.ok) {
-            try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/devices/register", 401, request.headers.get("user-agent") orelse "");
-            return;
-        }
-        const body = request.body orelse "";
-        const reg = parseDeviceRegistration(allocator, body) catch {
-            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Invalid device registration payload", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/devices/register", 400, request.headers.get("user-agent") orelse "");
-            return;
-        };
-        defer {
-            allocator.free(reg.device_id);
-            allocator.free(reg.public_key);
-        }
-        registerDeviceIdentity(cfg.device_registry_path, reg.device_id, reg.public_key) catch {
-            try sendApiError(allocator, writer, .internal_server_error, "internal_error", "Failed to persist device identity", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/devices/register", 500, request.headers.get("user-agent") orelse "");
-            return;
-        };
-        var response = http.Response.created(allocator, "{\"registered\":true}", null);
-        defer response.deinit();
-        _ = response.setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
-        applyResponseHeaders(state, &response);
-        try response.write(writer);
-        state.metricsRecord(201);
-        logAccess(&ctx, request.method.toString(), "/v1/devices/register", 201, request.headers.get("user-agent") orelse "");
-        return;
-    }
-
-    // --- POST /v1/sessions/refresh ---
-    if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/sessions/refresh")) {
-        if (state.session_store == null) {
-            try sendApiError(allocator, writer, .not_found, "invalid_request", "Sessions not enabled", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/sessions/refresh", 404, request.headers.get("user-agent") orelse "");
-            return;
-        }
-        const session_token = http.session.fromHeaders(&request.headers) orelse {
-            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Missing or invalid X-Session-Token", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/sessions/refresh", 400, request.headers.get("user-agent") orelse "");
-            return;
-        };
-        const refreshed = state.refreshSession(allocator, session_token, client_ip) catch {
-            try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Invalid session token", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/sessions/refresh", 401, request.headers.get("user-agent") orelse "");
-            return;
-        };
-        defer allocator.free(refreshed);
-        const resp_body = try std.fmt.allocPrint(allocator, "{{\"session_token\":\"{s}\",\"access_ttl_seconds\":{d},\"refresh_ttl_seconds\":{d}}}", .{
-            refreshed,
-            cfg.access_token_ttl_seconds,
-            cfg.refresh_token_ttl_seconds,
-        });
-        defer allocator.free(resp_body);
-        var response = http.Response.ok(allocator, resp_body, JSON_CONTENT_TYPE);
-        _ = response
-            .setConnection(keep_alive)
-            .setHeader(http.correlation.HEADER_NAME, correlation_id)
-            .setHeader(http.session.SESSION_HEADER, refreshed);
-        applyResponseHeaders(state, &response);
-        try response.write(writer);
-        state.metricsRecord(200);
-        logAccess(&ctx, request.method.toString(), "/v1/sessions/refresh", 200, request.headers.get("user-agent") orelse "");
-        return;
-    }
-
-    // --- POST /v1/sessions (create session) ---
-    if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/sessions")) {
-        if (state.session_store == null) {
-            try sendApiError(allocator, writer, .not_found, "invalid_request", "Sessions not enabled", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/sessions", 404, request.headers.get("user-agent") orelse "");
-            return;
-        }
-
-        // Requires bearer auth to create a session
-        const auth_result = authorizeRequest(cfg, &request.headers);
-        if (!auth_result.ok) {
-            try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/sessions", 401, request.headers.get("user-agent") orelse "");
-            return;
-        }
-        const identity = auth_result.token_hash orelse "-";
-        ctx.setIdentity(identity);
-
-        // Optional device_id from JSON body
-        var device_id: ?[]const u8 = null;
-        if (request.body) |body| {
-            if (isJsonContentType(request.contentType())) {
-                device_id = parseDeviceId(allocator, body) catch null;
-            }
-        }
-        defer if (device_id) |d| allocator.free(d);
-
-        const session_token = state.createSession(allocator, identity, client_ip, device_id) catch |err| {
-            const msg = switch (err) {
-                error.TooManySessions => "Too many active sessions",
-                else => "Session creation failed",
-            };
-            try sendApiError(allocator, writer, .too_many_requests, "rate_limited", msg, correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/sessions", 429, request.headers.get("user-agent") orelse "");
-            return;
-        };
-        defer allocator.free(session_token);
-
-        const resp_body = try std.fmt.allocPrint(allocator, "{{\"session_token\":\"{s}\"}}", .{session_token});
-        defer allocator.free(resp_body);
-
-        var response = http.Response.json(allocator, resp_body);
-        defer response.deinit();
-        _ = response.setStatus(.created)
-            .setConnection(keep_alive)
-            .setHeader(http.correlation.HEADER_NAME, correlation_id)
-            .setHeader(http.session.SESSION_HEADER, session_token);
-        applyResponseHeaders(state, &response);
-        try response.write(writer);
-        state.metricsRecord(201);
-        logAccess(&ctx, request.method.toString(), "/v1/sessions", 201, request.headers.get("user-agent") orelse "");
-        return;
-    }
-
-    // --- DELETE /v1/sessions (revoke session) ---
-    if (request.method == .DELETE and http.api_router.matchRoute(request.uri.path, 1, "/sessions")) {
-        if (state.session_store == null) {
-            try sendApiError(allocator, writer, .not_found, "invalid_request", "Sessions not enabled", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/sessions", 404, request.headers.get("user-agent") orelse "");
-            return;
-        }
-
-        const session_token = http.session.fromHeaders(&request.headers) orelse {
-            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Missing or invalid X-Session-Token", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/sessions", 400, request.headers.get("user-agent") orelse "");
-            return;
-        };
-
-        const revoked = state.revokeSession(session_token);
-        const resp_body = if (revoked)
-            "{\"revoked\":true}"
-        else
-            "{\"revoked\":false}";
-
-        var response = http.Response.json(allocator, resp_body);
-        defer response.deinit();
-        _ = response.setConnection(keep_alive)
-            .setHeader(http.correlation.HEADER_NAME, correlation_id);
-        applyResponseHeaders(state, &response);
-        try response.write(writer);
-        state.metricsRecord(200);
-        logAccess(&ctx, request.method.toString(), "/v1/sessions", 200, request.headers.get("user-agent") orelse "");
-        return;
-    }
-
-    // --- GET /v1/sessions (list sessions for identity) ---
-    if (request.method == .GET and http.api_router.matchRoute(request.uri.path, 1, "/sessions")) {
-        if (state.session_store == null) {
-            try sendApiError(allocator, writer, .not_found, "invalid_request", "Sessions not enabled", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/sessions", 404, request.headers.get("user-agent") orelse "");
-            return;
-        }
-
-        // Requires bearer auth
-        const auth_result = authorizeRequest(cfg, &request.headers);
-        if (!auth_result.ok) {
-            try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/sessions", 401, request.headers.get("user-agent") orelse "");
-            return;
-        }
-        const identity = auth_result.token_hash orelse "-";
-
-        const active_sessions = state.countSessionsByIdentity(allocator, identity) catch {
-            try sendApiError(allocator, writer, .internal_server_error, "internal_error", "Failed to list sessions", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/sessions", 500, request.headers.get("user-agent") orelse "");
-            return;
-        };
-
-        const resp_body = try std.fmt.allocPrint(allocator, "{{\"active_sessions\":{d}}}", .{active_sessions});
-        defer allocator.free(resp_body);
-
-        var response = http.Response.json(allocator, resp_body);
-        defer response.deinit();
-        _ = response.setConnection(keep_alive)
-            .setHeader(http.correlation.HEADER_NAME, correlation_id);
-        applyResponseHeaders(state, &response);
-        try response.write(writer);
-        state.metricsRecord(200);
-        logAccess(&ctx, request.method.toString(), "/v1/sessions", 200, request.headers.get("user-agent") orelse "");
-        return;
-    }
-
-    // --- POST /v1/cache/purge ---
-    if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/cache/purge")) {
-        if (state.proxy_cache_store == null) {
-            try sendApiError(allocator, writer, .not_found, "invalid_request", "Proxy cache not enabled", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/cache/purge", 404, request.headers.get("user-agent") orelse "");
-            return;
-        }
-
-        const auth_result = authorizeRequest(cfg, &request.headers);
-        if (!auth_result.ok) {
-            try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/cache/purge", 401, request.headers.get("user-agent") orelse "");
-            return;
-        }
-        ctx.setIdentity(auth_result.token_hash orelse "-");
-
-        var purged: usize = 0;
-        if (request.body) |body| {
-            if (isJsonContentType(request.contentType())) {
-                if (parseCachePurgeKey(allocator, body)) |key| {
-                    defer allocator.free(key);
-                    purged = if (state.proxyCacheDelete(key)) 1 else 0;
-                } else |_| {
-                    purged = state.proxyCachePurgeAll();
-                }
-            } else {
-                purged = state.proxyCachePurgeAll();
-            }
-        } else {
-            purged = state.proxyCachePurgeAll();
-        }
-
-        const resp_body = try std.fmt.allocPrint(allocator, "{{\"purged\":{d}}}", .{purged});
-        defer allocator.free(resp_body);
-        var response = http.Response.json(allocator, resp_body);
-        defer response.deinit();
-        _ = response.setConnection(keep_alive)
-            .setHeader(http.correlation.HEADER_NAME, correlation_id);
-        applyResponseHeaders(state, &response);
-        try response.write(writer);
-        state.metricsRecord(200);
-        logAccess(&ctx, request.method.toString(), "/v1/cache/purge", 200, request.headers.get("user-agent") orelse "");
-        return;
-    }
-
-    // --- GET /v1/commands/status?command_id=... ---
-    if (request.method == .GET and http.api_router.matchRoute(request.uri.path, 1, "/commands/status")) {
-        var authenticated = false;
-        const auth_result = authorizeRequest(cfg, &request.headers);
-        if (auth_result.ok) authenticated = true;
-        if (!authenticated) {
-            if (http.session.fromHeaders(&request.headers)) |session_token| {
-                if (state.validateSessionIdentity(allocator, session_token) != null) authenticated = true;
-            }
-        }
-        if (!authenticated) {
-            try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/commands/status", 401, request.headers.get("user-agent") orelse "");
-            return;
-        }
-        const cmd_id = parseQueryParam(request.uri.query orelse "", "command_id") orelse {
-            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Missing command_id", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/commands/status", 400, request.headers.get("user-agent") orelse "");
-            return;
-        };
-        const snapshot = state.commandLifecycleSnapshotJson(allocator, cmd_id) orelse {
-            try sendApiError(allocator, writer, .not_found, "invalid_request", "Unknown command_id", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/commands/status", 404, request.headers.get("user-agent") orelse "");
-            return;
-        };
-        defer allocator.free(snapshot);
-        var response = http.Response.json(allocator, snapshot);
-        defer response.deinit();
-        _ = response.setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
-        applyResponseHeaders(state, &response);
-        try response.write(writer);
-        state.metricsRecord(200);
-        logAccess(&ctx, request.method.toString(), "/v1/commands/status", 200, request.headers.get("user-agent") orelse "");
-        return;
-    }
-
-    // --- POST /v1/approvals/request ---
-    if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/approvals/request")) {
-        var authenticated = false;
-        const auth_result = authorizeRequest(cfg, &request.headers);
-        if (auth_result.ok) {
-            ctx.setIdentity(auth_result.token_hash orelse "-");
-            authenticated = true;
-        }
-        if (!authenticated) {
-            if (http.session.fromHeaders(&request.headers)) |session_token| {
-                if (state.validateSessionIdentity(allocator, session_token)) |identity| {
-                    defer allocator.free(identity);
-                    ctx.setIdentity(identity);
-                    authenticated = true;
-                }
-            }
-        }
-        if (!authenticated) {
-            try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/approvals/request", 401, request.headers.get("user-agent") orelse "");
-            return;
-        }
-        if (!isJsonContentType(request.contentType())) {
-            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Content-Type must be application/json", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/approvals/request", 400, request.headers.get("user-agent") orelse "");
-            return;
-        }
-        const body = request.body orelse {
-            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Missing request body", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/approvals/request", 400, request.headers.get("user-agent") orelse "");
-            return;
-        };
-        var approval_req = parseApprovalRequestBody(allocator, body) catch {
-            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Invalid approval request payload", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/approvals/request", 400, request.headers.get("user-agent") orelse "");
-            return;
-        };
-        defer approval_req.deinit(allocator);
-        if (!routeNeedsApproval(approval_req.method, approval_req.path, cfg.policy_approval_routes_raw) and
-            !routeRequiresApprovalRule(approval_req.method, approval_req.path, cfg.policy_rules_raw))
-        {
-            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Route does not require approval", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/approvals/request", 400, request.headers.get("user-agent") orelse "");
-            return;
-        }
-        const created = state.approvalCreate(allocator, approval_req.method, approval_req.path, ctx.identity orelse "-", approval_req.command_id) catch {
-            try sendApiError(allocator, writer, .internal_server_error, "internal_error", "Failed to create approval request", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/approvals/request", 500, request.headers.get("user-agent") orelse "");
-            return;
-        };
-        defer allocator.free(created.token);
-        _ = state.event_hub.publish("approvals.requests", body, http.event_loop.monotonicMs()) catch 0;
-        const response_body = try std.fmt.allocPrint(allocator, "{{\"approval_token\":\"{s}\",\"status\":\"pending\",\"expires_ms\":{d},\"status_url\":\"/v1/approvals/status?approval_token={s}\"}}", .{
-            created.token,
-            created.expires_ms,
-            created.token,
-        });
-        defer allocator.free(response_body);
-        var response = http.Response.json(allocator, response_body);
-        defer response.deinit();
-        _ = response.setStatus(.accepted).setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
-        applyResponseHeaders(state, &response);
-        try response.write(writer);
-        state.metricsRecord(202);
-        logAccess(&ctx, request.method.toString(), "/v1/approvals/request", 202, request.headers.get("user-agent") orelse "");
-        return;
-    }
-
-    // --- POST /v1/approvals/respond ---
-    if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/approvals/respond")) {
-        const auth_result = authorizeRequest(cfg, &request.headers);
-        if (!auth_result.ok) {
-            try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/approvals/respond", 401, request.headers.get("user-agent") orelse "");
-            return;
-        }
-        ctx.setIdentity(auth_result.token_hash orelse "-");
-        if (!isJsonContentType(request.contentType())) {
-            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Content-Type must be application/json", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/approvals/respond", 400, request.headers.get("user-agent") orelse "");
-            return;
-        }
-        const body = request.body orelse {
-            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Missing request body", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/approvals/respond", 400, request.headers.get("user-agent") orelse "");
-            return;
-        };
-        var approval_resp = parseApprovalResponseBody(allocator, body) catch {
-            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Invalid approval response payload", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/approvals/respond", 400, request.headers.get("user-agent") orelse "");
-            return;
-        };
-        defer approval_resp.deinit(allocator);
-        if (!state.approvalRespond(approval_resp.token, approval_resp.decision, ctx.identity orelse "-")) {
-            try sendApiError(allocator, writer, .conflict, "invalid_request", "Approval token not pending or not found", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/approvals/respond", 409, request.headers.get("user-agent") orelse "");
-            return;
-        }
-        _ = state.event_hub.publish("approvals.responses", body, http.event_loop.monotonicMs()) catch 0;
-        const response_body = try std.fmt.allocPrint(allocator, "{{\"approval_token\":\"{s}\",\"status\":\"{s}\"}}", .{
-            approval_resp.token,
-            if (approval_resp.decision == .approve) "approved" else "denied",
-        });
-        defer allocator.free(response_body);
-        var response = http.Response.json(allocator, response_body);
-        defer response.deinit();
-        _ = response.setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
-        applyResponseHeaders(state, &response);
-        try response.write(writer);
-        state.metricsRecord(200);
-        logAccess(&ctx, request.method.toString(), "/v1/approvals/respond", 200, request.headers.get("user-agent") orelse "");
-        return;
-    }
-
-    // --- GET /v1/approvals/status?approval_token=... ---
-    if (request.method == .GET and http.api_router.matchRoute(request.uri.path, 1, "/approvals/status")) {
-        var authenticated = false;
-        const auth_result = authorizeRequest(cfg, &request.headers);
-        if (auth_result.ok) {
-            ctx.setIdentity(auth_result.token_hash orelse "-");
-            authenticated = true;
-        }
-        if (!authenticated) {
-            if (http.session.fromHeaders(&request.headers)) |session_token| {
-                if (state.validateSessionIdentity(allocator, session_token)) |identity| {
-                    defer allocator.free(identity);
-                    ctx.setIdentity(identity);
-                    authenticated = true;
-                }
-            }
-        }
-        if (!authenticated) {
-            try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/approvals/status", 401, request.headers.get("user-agent") orelse "");
-            return;
-        }
-        const approval_token = parseQueryParam(request.uri.query orelse "", "approval_token") orelse {
-            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Missing approval_token", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/approvals/status", 400, request.headers.get("user-agent") orelse "");
-            return;
-        };
-        const snapshot = state.approvalSnapshotJson(allocator, approval_token) orelse {
-            try sendApiError(allocator, writer, .not_found, "invalid_request", "Unknown approval_token", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/approvals/status", 404, request.headers.get("user-agent") orelse "");
-            return;
-        };
-        defer allocator.free(snapshot);
-        var response = http.Response.json(allocator, snapshot);
-        defer response.deinit();
-        _ = response.setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
-        applyResponseHeaders(state, &response);
-        try response.write(writer);
-        state.metricsRecord(200);
-        logAccess(&ctx, request.method.toString(), "/v1/approvals/status", 200, request.headers.get("user-agent") orelse "");
-        return;
-    }
-
-    // --- POST /v1/commands (structured command routing) ---
-    if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/commands")) {
-        // --- Auth (bearer token or session token) ---
-        var resolved_identity = resolveRequestIdentity(allocator, cfg, state, &request.headers) orelse {
-            try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/commands", 401, request.headers.get("user-agent") orelse "");
-            return;
-        };
-        defer resolved_identity.deinit(allocator);
-        ctx.setIdentity(resolved_identity.value);
-
-        // --- Content-Type validation ---
-        if (!isJsonContentType(request.contentType())) {
-            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Content-Type must be application/json", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/commands", 400, request.headers.get("user-agent") orelse "");
-            return;
-        }
-
-        // --- Body parsing ---
-        const cmd_body = request.body orelse {
-            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Missing request body", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/commands", 400, request.headers.get("user-agent") orelse "");
-            return;
-        };
-
-        var cmd = http.command.parseCommand(allocator, cmd_body) catch |err| {
-            const msg = switch (err) {
-                http.command.ParseError.MissingCommand => "Missing 'command' field",
-                http.command.ParseError.UnknownCommand => "Unknown command type",
-                http.command.ParseError.InvalidParams => "Invalid or missing 'params' object",
-                else => "Invalid command envelope",
-            };
-            try sendApiError(allocator, writer, .bad_request, "invalid_request", msg, correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/commands", 400, request.headers.get("user-agent") orelse "");
-            return;
-        };
-        defer cmd.deinit(allocator);
-        const command_id = if (cmd.command_id) |cid|
-            try allocator.dupe(u8, cid)
-        else
-            try generateCommandId(allocator);
-        defer allocator.free(command_id);
-
-        // --- Idempotency (inline key overrides header) ---
-        const effective_idem_key = cmd.idempotency_key orelse ctx.idempotency_key;
-        if (effective_idem_key) |idem_key| {
-            if (try state.idempotencyGetCopy(allocator, idem_key)) |cached| {
-                defer allocator.free(cached.body);
-                defer allocator.free(cached.content_type);
-
-                var response = http.Response.init(allocator);
-                defer response.deinit();
-                _ = response.setStatus(@enumFromInt(cached.status))
-                    .setBody(cached.body)
-                    .setContentType(cached.content_type)
-                    .setConnection(keep_alive)
-                    .setHeader(http.correlation.HEADER_NAME, correlation_id)
-                    .setHeader("X-Idempotent-Replayed", "true");
-                applyResponseHeaders(state, &response);
-                try response.write(writer);
-                state.metricsRecord(cached.status);
-                logAccess(&ctx, request.method.toString(), "/v1/commands", cached.status, request.headers.get("user-agent") orelse "");
-                return;
-            }
-        }
-
-        // --- Build upstream envelope with context ---
-        const envelope = http.command.buildUpstreamEnvelope(
-            allocator,
-            cmd.command_type,
-            cmd.params_raw,
-            command_id,
-            correlation_id,
-            ctx.identity orelse "-",
-            client_ip,
-            ctx.api_version,
-        ) catch {
-            try sendApiError(allocator, writer, .internal_server_error, "internal_error", "Failed to build upstream request", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/commands", 500, request.headers.get("user-agent") orelse "");
-            return;
-        };
-        defer allocator.free(envelope);
-        const upstream_path = cmd.command_type.upstreamPath();
-
-        if (cmd.async_execute) {
-            state.commandLifecycleCreate(command_id, cmd.command_type.toString(), correlation_id, ctx.identity orelse "-") catch {
-                try sendApiError(allocator, writer, .internal_server_error, "internal_error", "Failed to initialize command lifecycle", correlation_id, keep_alive, state);
-                logAccess(&ctx, request.method.toString(), "/v1/commands", 500, request.headers.get("user-agent") orelse "");
-                return;
-            };
-            spawnAsyncCommandExecution(
-                allocator,
-                cfg,
-                state,
-                command_id,
-                cmd.command_type.toString(),
-                upstream_path,
-                envelope,
-                correlation_id,
-                client_ip,
-                ctx.identity,
-                if (ctx.api_version) |version| @as(u32, version) else null,
-                request.headers.get("host"),
-                request.headers.get("x-forwarded-for"),
-            );
-            const accepted_body = try std.fmt.allocPrint(allocator, "{{\"command_id\":\"{s}\",\"status\":\"pending\",\"status_url\":\"/v1/commands/status?command_id={s}\"}}", .{ command_id, command_id });
-            defer allocator.free(accepted_body);
-            var accepted = http.Response.json(allocator, accepted_body);
-            defer accepted.deinit();
-            _ = accepted.setStatus(.accepted).setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
-            applyResponseHeaders(state, &accepted);
-            try accepted.write(writer);
-            state.metricsRecord(202);
-            logAccess(&ctx, request.method.toString(), "/v1/commands", 202, request.headers.get("user-agent") orelse "");
-            return;
-        }
-
-        state.commandLifecycleCreate(command_id, cmd.command_type.toString(), correlation_id, ctx.identity orelse "-") catch {};
-        state.commandLifecycleSetRunning(command_id);
-
-        const proxy_cache_bypass = shouldBypassProxyCache(&request.headers) or effective_idem_key != null;
-        const proxy_cache_key = if (cfg.proxy_cache_ttl_seconds > 0 and !proxy_cache_bypass)
-            try buildProxyCacheKey(allocator, cfg.proxy_cache_key_template, request.method.toString(), "/v1/commands", envelope, ctx.identity, if (ctx.api_version) |version| @as(u32, version) else null)
-        else
-            null;
-        defer if (proxy_cache_key) |k| allocator.free(k);
-        var proxy_cache_locked = false;
-        defer if (proxy_cache_locked) {
-            if (proxy_cache_key) |cache_key| state.proxyCacheUnlock(cache_key);
-        };
-        if (proxy_cache_key) |cache_key| {
-            if (try state.proxyCacheGetCopyWithStale(allocator, cache_key, cfg.proxy_cache_stale_while_revalidate_seconds)) |lookup| {
-                defer allocator.free(lookup.cached.body);
-                defer allocator.free(lookup.cached.content_type);
-
-                var response = http.Response.init(allocator);
-                defer response.deinit();
-                _ = response.setStatus(@enumFromInt(lookup.cached.status))
-                    .setBody(lookup.cached.body)
-                    .setContentType(lookup.cached.content_type)
-                    .setConnection(keep_alive)
-                    .setHeader(http.correlation.HEADER_NAME, correlation_id)
-                    .setHeader("X-Proxy-Cache", if (lookup.is_stale) "STALE" else "HIT");
-                applyResponseHeaders(state, &response);
-                try response.write(writer);
-                state.metricsRecord(lookup.cached.status);
-                logAccess(&ctx, request.method.toString(), "/v1/commands", lookup.cached.status, request.headers.get("user-agent") orelse "");
-                if (lookup.is_stale) {
-                    spawnProxyCacheRefresh(
-                        allocator,
-                        cfg,
-                        state,
-                        cache_key,
-                        .commands,
-                        cfg.proxy_pass_commands_prefix,
-                        upstream_path,
-                        envelope,
-                        client_ip,
-                        ctx.identity,
-                        if (ctx.api_version) |version| @as(u32, version) else null,
-                    );
-                }
-                return;
-            }
-
-            proxy_cache_locked = try state.proxyCacheTryLock(cache_key);
-            if (!proxy_cache_locked) {
-                _ = state.proxyCacheWaitForUnlock(cache_key, cfg.proxy_cache_lock_timeout_ms);
-                if (try state.proxyCacheGetCopyWithStale(allocator, cache_key, 0)) |post_wait_lookup| {
-                    defer allocator.free(post_wait_lookup.cached.body);
-                    defer allocator.free(post_wait_lookup.cached.content_type);
-                    var response = http.Response.init(allocator);
-                    defer response.deinit();
-                    _ = response.setStatus(@enumFromInt(post_wait_lookup.cached.status))
-                        .setBody(post_wait_lookup.cached.body)
-                        .setContentType(post_wait_lookup.cached.content_type)
-                        .setConnection(keep_alive)
-                        .setHeader(http.correlation.HEADER_NAME, correlation_id)
-                        .setHeader("X-Proxy-Cache", "HIT");
-                    applyResponseHeaders(state, &response);
-                    try response.write(writer);
-                    state.metricsRecord(post_wait_lookup.cached.status);
-                    logAccess(&ctx, request.method.toString(), "/v1/commands", post_wait_lookup.cached.status, request.headers.get("user-agent") orelse "");
-                    return;
-                }
-            }
-        }
-
-        // --- Forward to upstream ---
-
-        // --- Circuit breaker check ---
-        if (!state.circuitTryAcquire()) {
-            state.logger.warn(null, "circuit breaker open, rejecting /v1/commands", .{});
-            try sendApiError(allocator, writer, .service_unavailable, "upstream_unavailable", "Upstream unavailable", correlation_id, keep_alive, state);
-            state.commandLifecycleSetFailed(command_id, "upstream_unavailable");
-            const cb_audit = http.command.CommandAudit{
-                .command = cmd.command_type.toString(),
-                .correlation_id = correlation_id,
-                .identity = ctx.identity orelse "-",
-                .status = 503,
-                .latency_ms = ctx.elapsedMs(),
-            };
-            cb_audit.log();
-            return;
-        }
-
-        const cmd_exec = proxyJsonExecute(
-            allocator,
-            cfg,
-            .commands,
-            cfg.proxy_pass_commands_prefix,
-            upstream_path,
-            envelope,
-            correlation_id,
-            client_ip,
-            ctx.identity,
-            if (ctx.api_version) |version| @as(u32, version) else null,
-            request.headers.get("host"),
-            request.headers.get("x-forwarded-for"),
-            writer,
-            state,
-            effective_idem_key == null and proxy_cache_key == null,
-        ) catch |err| {
-            state.circuitRecordFailure();
-            state.commandLifecycleSetFailed(command_id, @errorName(err));
-            state.logger.warn(null, "circuit breaker: recorded failure, state={s}", .{state.circuitStateName()});
-            const mapped = mapProxyExecutionError(err);
-            try sendApiError(allocator, writer, mapped.status, mapped.code, mapped.message, correlation_id, keep_alive, state);
-            // Audit
-            const cmd_audit = http.command.CommandAudit{
-                .command = cmd.command_type.toString(),
-                .correlation_id = correlation_id,
-                .identity = ctx.identity orelse "-",
-                .status = @intFromEnum(mapped.status),
-                .latency_ms = ctx.elapsedMs(),
-            };
-            cmd_audit.log();
-            return;
-        };
-        var cmd_final_status: u16 = undefined;
-        var cmd_final_body: []const u8 = "";
-        var cmd_final_content_type: []const u8 = JSON_CONTENT_TYPE;
-        var cmd_final_content_disposition: ?[]const u8 = null;
-        var cmd_final_body_alloc: ?[]u8 = null;
-        var cmd_final_content_type_alloc: ?[]u8 = null;
-        var cmd_final_content_disposition_alloc: ?[]u8 = null;
-        var cmd_error_body: ?[]const u8 = null;
-        var cmd_cacheable = false;
-        defer if (cmd_final_body_alloc) |owned_body| allocator.free(owned_body);
-        defer if (cmd_final_content_type_alloc) |ct| allocator.free(ct);
-        defer if (cmd_final_content_disposition_alloc) |cd| allocator.free(cd);
-        switch (cmd_exec) {
-            .streamed_status => |status| {
-                cmd_final_status = status;
-                if (status >= 500) {
-                    state.circuitRecordFailure();
-                } else {
-                    state.circuitRecordSuccess();
-                }
-                state.commandLifecycleSetCompleted(command_id, status, "", JSON_CONTENT_TYPE);
-                state.metricsRecord(status);
-
-                const streamed_audit = http.command.CommandAudit{
-                    .command = cmd.command_type.toString(),
-                    .correlation_id = correlation_id,
-                    .identity = ctx.identity orelse "-",
-                    .status = status,
-                    .latency_ms = ctx.elapsedMs(),
-                };
-                streamed_audit.log();
-                logAccess(&ctx, request.method.toString(), "/v1/commands", status, request.headers.get("user-agent") orelse "");
-                return;
-            },
-            .buffered => |proxy_result| {
-                if (proxy_result.status >= 500) {
-                    state.circuitRecordFailure();
-                } else {
-                    state.circuitRecordSuccess();
-                }
-
-                cmd_final_status = proxy_result.status;
-                cmd_final_body_alloc = proxy_result.body;
-                cmd_final_body = proxy_result.body;
-                cmd_cacheable = proxy_result.cacheable;
-                if (proxy_result.status != 200) {
-                    allocator.free(proxy_result.content_type);
-                    if (proxy_result.content_disposition) |cd| allocator.free(cd);
-                    if (cmd_final_body_alloc) |owned_body| {
-                        allocator.free(owned_body);
-                        cmd_final_body_alloc = null;
-                    }
-                    const mapped = mapUpstreamError(proxy_result.status);
-                    cmd_final_status = mapped.status;
-                    cmd_final_body = try buildApiErrorJson(allocator, mapped.code, mapped.message, correlation_id);
-                    cmd_final_content_type = JSON_CONTENT_TYPE;
-                    cmd_final_content_disposition = null;
-                    cmd_error_body = cmd_final_body;
-                } else {
-                    cmd_final_content_type_alloc = proxy_result.content_type;
-                    cmd_final_content_type = proxy_result.content_type;
-                    if (proxy_result.content_disposition) |cd| {
-                        cmd_final_content_disposition_alloc = cd;
-                        cmd_final_content_disposition = cd;
-                    } else {
-                        cmd_final_content_disposition = null;
-                    }
-                }
-            },
-        }
-        defer {
-            if (cmd_error_body) |eb| allocator.free(eb);
-        }
-
-        // --- Compress and send ---
-        const cmd_accept_encoding = request.headers.get("Accept-Encoding");
-        const cmd_comp = http.compression.compressResponse(allocator, cmd_final_body, cmd_final_content_type, cmd_accept_encoding, state.compression_config);
-        defer if (cmd_comp.body) |cb| allocator.free(cb);
-        const cmd_resp_body = if (cmd_comp.body) |cb| cb else cmd_final_body;
-        var response = http.Response.init(allocator);
-        defer response.deinit();
-        _ = response
-            .setStatus(@enumFromInt(cmd_final_status))
-            .setBody(cmd_resp_body)
-            .setContentType(cmd_final_content_type)
-            .setConnection(keep_alive)
-            .setHeader(http.correlation.HEADER_NAME, correlation_id);
-        if (cmd_final_content_disposition) |cd| {
-            _ = response.setHeader("Content-Disposition", cd);
-        }
-        if (cmd_comp.compressed and cmd_comp.encoding != null) {
-            _ = response.setHeader("Content-Encoding", cmd_comp.encoding.?.headerValue());
-        }
-        applyResponseHeaders(state, &response);
-        try response.write(writer);
-        state.metricsRecord(cmd_final_status);
-        state.commandLifecycleSetCompleted(command_id, cmd_final_status, cmd_final_body, cmd_final_content_type);
-
-        if (proxy_cache_key) |cache_key| {
-            if (cmd_final_status == 200 and cmd_cacheable) {
-                state.proxyCachePut(cache_key, cmd_final_status, cmd_final_body, cmd_final_content_type) catch |err| {
-                    std.log.warn("proxy cache store error: {}", .{err});
-                };
-            }
-        }
-
-        // --- Store idempotency result ---
-        if (effective_idem_key) |idem_key| {
-            state.idempotencyPut(idem_key, cmd_final_status, cmd_final_body, JSON_CONTENT_TYPE) catch |err| {
-                std.log.warn("idempotency store error: {}", .{err});
-            };
-        }
-
-        // --- Structured command audit ---
-        const audit = http.command.CommandAudit{
-            .command = cmd.command_type.toString(),
-            .correlation_id = correlation_id,
-            .identity = ctx.identity orelse "-",
-            .status = cmd_final_status,
-            .latency_ms = ctx.elapsedMs(),
-        };
-        audit.log();
-        return;
-    }
-
-    // --- POST /v1/chat ---
-    if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/chat")) {
-        // --- Idempotency check ---
-        if (ctx.idempotency_key) |idem_key| {
-            if (try state.idempotencyGetCopy(allocator, idem_key)) |cached| {
-                defer allocator.free(cached.body);
-                defer allocator.free(cached.content_type);
-
-                var response = http.Response.init(allocator);
-                defer response.deinit();
-                _ = response.setStatus(@enumFromInt(cached.status))
-                    .setBody(cached.body)
-                    .setContentType(cached.content_type)
-                    .setConnection(keep_alive)
-                    .setHeader(http.correlation.HEADER_NAME, correlation_id)
-                    .setHeader("X-Idempotent-Replayed", "true");
-                applyResponseHeaders(state, &response);
-                try response.write(writer);
-                state.metricsRecord(cached.status);
-                logAccess(&ctx, request.method.toString(), "/v1/chat", cached.status, request.headers.get("user-agent") orelse "");
-                return;
-            }
-        }
-
-        // --- Auth (bearer token or session token) ---
-        var resolved_identity = resolveRequestIdentity(allocator, cfg, state, &request.headers) orelse {
-            try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/chat", 401, request.headers.get("user-agent") orelse "");
-            return;
-        };
-        defer resolved_identity.deinit(allocator);
-        ctx.setIdentity(resolved_identity.value);
-
-        // --- Content-Type validation ---
-        if (!isJsonContentType(request.contentType())) {
-            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Content-Type must be application/json", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/chat", 400, request.headers.get("user-agent") orelse "");
-            return;
-        }
-
-        // --- Body validation ---
-        const body = request.body orelse {
-            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Missing request body", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/chat", 400, request.headers.get("user-agent") orelse "");
-            return;
-        };
-
-        const proxy_cache_bypass = shouldBypassProxyCache(&request.headers) or ctx.idempotency_key != null;
-        const proxy_cache_key = if (cfg.proxy_cache_ttl_seconds > 0 and !proxy_cache_bypass)
-            try buildProxyCacheKey(allocator, cfg.proxy_cache_key_template, request.method.toString(), "/v1/chat", body, ctx.identity, if (ctx.api_version) |version| @as(u32, version) else null)
-        else
-            null;
-        defer if (proxy_cache_key) |k| allocator.free(k);
-        var proxy_cache_locked = false;
-        defer if (proxy_cache_locked) {
-            if (proxy_cache_key) |cache_key| state.proxyCacheUnlock(cache_key);
-        };
-        if (proxy_cache_key) |cache_key| {
-            if (try state.proxyCacheGetCopyWithStale(allocator, cache_key, cfg.proxy_cache_stale_while_revalidate_seconds)) |lookup| {
-                defer allocator.free(lookup.cached.body);
-                defer allocator.free(lookup.cached.content_type);
-
-                var response = http.Response.init(allocator);
-                defer response.deinit();
-                _ = response.setStatus(@enumFromInt(lookup.cached.status))
-                    .setBody(lookup.cached.body)
-                    .setContentType(lookup.cached.content_type)
-                    .setConnection(keep_alive)
-                    .setHeader(http.correlation.HEADER_NAME, correlation_id)
-                    .setHeader("X-Proxy-Cache", if (lookup.is_stale) "STALE" else "HIT");
-                applyResponseHeaders(state, &response);
-                try response.write(writer);
-                state.metricsRecord(lookup.cached.status);
-                logAccess(&ctx, request.method.toString(), "/v1/chat", lookup.cached.status, request.headers.get("user-agent") orelse "");
-                if (lookup.is_stale) {
-                    spawnProxyCacheRefresh(
-                        allocator,
-                        cfg,
-                        state,
-                        cache_key,
-                        .chat,
-                        cfg.proxy_pass_chat,
-                        null,
-                        body,
-                        client_ip,
-                        ctx.identity,
-                        if (ctx.api_version) |version| @as(u32, version) else null,
-                    );
-                }
-                return;
-            }
-
-            proxy_cache_locked = try state.proxyCacheTryLock(cache_key);
-            if (!proxy_cache_locked) {
-                _ = state.proxyCacheWaitForUnlock(cache_key, cfg.proxy_cache_lock_timeout_ms);
-                if (try state.proxyCacheGetCopyWithStale(allocator, cache_key, 0)) |post_wait_lookup| {
-                    defer allocator.free(post_wait_lookup.cached.body);
-                    defer allocator.free(post_wait_lookup.cached.content_type);
-                    var response = http.Response.init(allocator);
-                    defer response.deinit();
-                    _ = response.setStatus(@enumFromInt(post_wait_lookup.cached.status))
-                        .setBody(post_wait_lookup.cached.body)
-                        .setContentType(post_wait_lookup.cached.content_type)
-                        .setConnection(keep_alive)
-                        .setHeader(http.correlation.HEADER_NAME, correlation_id)
-                        .setHeader("X-Proxy-Cache", "HIT");
-                    applyResponseHeaders(state, &response);
-                    try response.write(writer);
-                    state.metricsRecord(post_wait_lookup.cached.status);
-                    logAccess(&ctx, request.method.toString(), "/v1/chat", post_wait_lookup.cached.status, request.headers.get("user-agent") orelse "");
-                    return;
-                }
-            }
-        }
-
-        const message = parseChatMessage(allocator, body, cfg.max_message_chars) catch |err| {
-            const msg = switch (err) {
-                error.EmptyMessage => "message must not be empty",
-                error.MessageTooLarge => "message too long",
-                else => "invalid chat payload",
-            };
-            try sendApiError(allocator, writer, .bad_request, "invalid_request", msg, correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/chat", 400, request.headers.get("user-agent") orelse "");
-            return;
-        };
-
-        // --- Circuit breaker check ---
-        if (!state.circuitTryAcquire()) {
-            state.logger.warn(null, "circuit breaker open, rejecting /v1/chat", .{});
-            try sendApiError(allocator, writer, .service_unavailable, "upstream_unavailable", "Upstream unavailable", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/chat", 503, request.headers.get("user-agent") orelse "");
-            return;
-        }
-
-        // --- Upstream proxy ---
-        const chat_request_body = try std.fmt.allocPrint(allocator, "{{\"message\":{s}}}", .{std.json.fmt(message, .{})});
-        defer allocator.free(chat_request_body);
-
-        const chat_exec = proxyJsonExecute(
-            allocator,
-            cfg,
-            .chat,
-            cfg.proxy_pass_chat,
-            null,
-            chat_request_body,
-            correlation_id,
-            client_ip,
-            ctx.identity,
-            if (ctx.api_version) |version| @as(u32, version) else null,
-            request.headers.get("host"),
-            request.headers.get("x-forwarded-for"),
-            writer,
-            state,
-            ctx.idempotency_key == null and proxy_cache_key == null,
-        ) catch |err| {
-            state.circuitRecordFailure();
-            state.logger.warn(null, "circuit breaker: recorded failure, state={s}", .{state.circuitStateName()});
-            const mapped = mapProxyExecutionError(err);
-            try sendApiError(allocator, writer, mapped.status, mapped.code, mapped.message, correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/chat", @intFromEnum(mapped.status), request.headers.get("user-agent") orelse "");
-            return;
-        };
-        defer allocator.free(message);
-
-        var final_status: u16 = undefined;
-        var final_body: []const u8 = "";
-        var final_content_type: []const u8 = JSON_CONTENT_TYPE;
-        var final_content_disposition: ?[]const u8 = null;
-        var final_body_alloc: ?[]u8 = null;
-        var final_content_type_alloc: ?[]u8 = null;
-        var final_content_disposition_alloc: ?[]u8 = null;
-        var error_body_to_free: ?[]const u8 = null;
-        var final_cacheable = false;
-        defer if (final_body_alloc) |owned_body| allocator.free(owned_body);
-        defer if (final_content_type_alloc) |ct| allocator.free(ct);
-        defer if (final_content_disposition_alloc) |cd| allocator.free(cd);
-        switch (chat_exec) {
-            .streamed_status => |status| {
-                final_status = status;
-                if (status >= 500) {
-                    state.circuitRecordFailure();
-                } else {
-                    state.circuitRecordSuccess();
-                }
-                state.metricsRecord(status);
-                logAccess(&ctx, request.method.toString(), "/v1/chat", status, request.headers.get("user-agent") orelse "");
-                return;
-            },
-            .buffered => |proxy_result| {
-                if (proxy_result.status >= 500) {
-                    state.circuitRecordFailure();
-                } else {
-                    state.circuitRecordSuccess();
-                }
-
-                final_status = proxy_result.status;
-                final_body_alloc = proxy_result.body;
-                final_body = proxy_result.body;
-                final_cacheable = proxy_result.cacheable;
-                if (proxy_result.status != 200) {
-                    allocator.free(proxy_result.content_type);
-                    if (proxy_result.content_disposition) |cd| allocator.free(cd);
-                    if (final_body_alloc) |owned_body| {
-                        allocator.free(owned_body);
-                        final_body_alloc = null;
-                    }
-                    const mapped = mapUpstreamError(proxy_result.status);
-                    final_status = mapped.status;
-                    final_body = try buildApiErrorJson(allocator, mapped.code, mapped.message, correlation_id);
-                    final_content_type = JSON_CONTENT_TYPE;
-                    final_content_disposition = null;
-                    error_body_to_free = final_body;
-                } else {
-                    final_content_type_alloc = proxy_result.content_type;
-                    final_content_type = proxy_result.content_type;
-                    if (proxy_result.content_disposition) |cd| {
-                        final_content_disposition_alloc = cd;
-                        final_content_disposition = cd;
-                    } else {
-                        final_content_disposition = null;
-                    }
-                }
-            },
-        }
-        defer {
-            if (error_body_to_free) |eb| allocator.free(eb);
-        }
-
-        // --- Compress and send ---
-        const chat_accept_encoding = request.headers.get("Accept-Encoding");
-        const chat_comp = http.compression.compressResponse(allocator, final_body, final_content_type, chat_accept_encoding, state.compression_config);
-        defer if (chat_comp.body) |cb| allocator.free(cb);
-        const chat_resp_body = if (chat_comp.body) |cb| cb else final_body;
-        var response = http.Response.init(allocator);
-        defer response.deinit();
-        _ = response
-            .setStatus(@enumFromInt(final_status))
-            .setBody(chat_resp_body)
-            .setContentType(final_content_type)
-            .setConnection(keep_alive)
-            .setHeader(http.correlation.HEADER_NAME, correlation_id);
-        if (final_content_disposition) |cd| {
-            _ = response.setHeader("Content-Disposition", cd);
-        }
-        if (chat_comp.compressed and chat_comp.encoding != null) {
-            _ = response.setHeader("Content-Encoding", chat_comp.encoding.?.headerValue());
-        }
-        applyResponseHeaders(state, &response);
-        try response.write(writer);
-        state.metricsRecord(final_status);
-
-        if (proxy_cache_key) |cache_key| {
-            if (final_status == 200 and final_cacheable) {
-                state.proxyCachePut(cache_key, final_status, final_body, final_content_type) catch |err| {
-                    std.log.warn("proxy cache store error: {}", .{err});
-                };
-            }
-        }
-
-        // --- Store idempotency result ---
-        if (ctx.idempotency_key) |idem_key| {
-            state.idempotencyPut(idem_key, final_status, final_body, JSON_CONTENT_TYPE) catch |err| {
-                std.log.warn("idempotency store error: {}", .{err});
-            };
-        }
-
-        logAccess(&ctx, request.method.toString(), "/v1/chat", final_status, request.headers.get("user-agent") orelse "");
+    if (try handlePrimaryApiTailHttp1(allocator, writer, cfg, state, &ctx, &request, correlation_id, keep_alive, client_ip)) |status| {
+        logAccess(&ctx, request.method.toString(), request.uri.path, status, request.headers.get("user-agent") orelse "");
         return;
     }
 
@@ -4887,7 +3168,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
     logAccess(&ctx, request.method.toString(), request.uri.path, 404, request.headers.get("user-agent") orelse "");
 }
 
-fn routeConfiguredLocation(
+fn routeRequest(
     allocator: std.mem.Allocator,
     writer: anytype,
     cfg: *const edge_config.EdgeConfig,
@@ -4898,7 +3179,66 @@ fn routeConfiguredLocation(
     keep_alive: bool,
     client_ip: []const u8,
 ) !?u16 {
-    const matched = matchEffectiveLocation(cfg, request.uri.path) orelse return null;
+    if (http.location_router.matchLocation(request.uri.path, cfg.location_blocks)) |matched| {
+        switch (matched.block.action) {
+            .builtin_route => |route| {
+                if (try dispatchBuiltinRouteHttp1(allocator, writer, cfg, state, ctx, request, correlation_id, keep_alive, client_ip, route)) |status| {
+                    return status;
+                }
+            },
+            .proxy_pass => |target| {
+                return try handleLocationProxyPass(allocator, writer, cfg, state, request, target, correlation_id, keep_alive, client_ip, ctx.identity);
+            },
+            .fastcgi_pass => |upstream| {
+                return try handleFastcgiRoute(allocator, writer, cfg, upstream, request, client_ip, correlation_id, keep_alive, state);
+            },
+            .return_response => |ret| {
+                if (ret.status >= 300 and ret.status < 400 and ret.body.len > 0) {
+                    var response = http.Response.redirect(allocator, ret.body, @enumFromInt(ret.status));
+                    defer response.deinit();
+                    _ = response.setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
+                    applyResponseHeaders(state, &response);
+                    try response.write(writer);
+                } else {
+                    var response = http.Response.init(allocator);
+                    defer response.deinit();
+                    _ = response.setStatus(@enumFromInt(ret.status))
+                        .setBody(ret.body)
+                        .setContentType("text/plain; charset=utf-8")
+                        .setConnection(keep_alive)
+                        .setHeader(http.correlation.HEADER_NAME, correlation_id);
+                    applyResponseHeaders(state, &response);
+                    try response.write(writer);
+                }
+                state.metricsRecord(ret.status);
+                return ret.status;
+            },
+            .rewrite => |rw| {
+                request.uri.path = rw.replacement;
+            },
+            .static_root => |root_cfg| {
+                if (try handleStaticLocation(allocator, writer, request, matched, root_cfg, correlation_id, keep_alive, state)) |status| {
+                    return status;
+                }
+            },
+        }
+    }
+
+    const builtin_blocks = buildBuiltinLocationBlocks(cfg);
+    const matched = http.location_router.matchLocation(request.uri.path, builtin_blocks[0..]) orelse {
+        if (request.method == .GET and std.mem.startsWith(u8, request.uri.path, "/admin/")) {
+            const auth_result = authorizeRequest(cfg, &request.headers);
+            if (!auth_result.ok) {
+                try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, keep_alive, state);
+                state.metricsRecord(401);
+                return 401;
+            }
+            try sendApiError(allocator, writer, .not_found, "invalid_request", "Unknown admin route", correlation_id, keep_alive, state);
+            state.metricsRecord(404);
+            return 404;
+        }
+        return null;
+    };
 
     switch (matched.block.action) {
         .builtin_route => |route| {
@@ -5000,6 +3340,122 @@ const ResolvedIdentity = struct {
         self.* = undefined;
     }
 };
+
+const ChatRequestPrep = struct {
+    identity: ResolvedIdentity,
+    message: []const u8,
+    upstream_body: []u8,
+
+    fn deinit(self: *ChatRequestPrep, allocator: std.mem.Allocator) void {
+        self.identity.deinit(allocator);
+        allocator.free(self.message);
+        allocator.free(self.upstream_body);
+        self.* = undefined;
+    }
+};
+
+const CommandRequestPrep = struct {
+    identity: ResolvedIdentity,
+    command: http.command.Command,
+    command_id: []const u8,
+    upstream_body: []u8,
+    upstream_path: []const u8,
+    effective_idempotency_key: ?[]const u8,
+
+    fn deinit(self: *CommandRequestPrep, allocator: std.mem.Allocator) void {
+        self.identity.deinit(allocator);
+        self.command.deinit(allocator);
+        allocator.free(self.command_id);
+        allocator.free(self.upstream_body);
+        self.* = undefined;
+    }
+};
+
+const RequestPrepError = struct {
+    status: http.Status,
+    code: []const u8,
+    message: []const u8,
+};
+
+const NormalizedProxyReply = struct {
+    status: u16,
+    body: []u8,
+    content_type: []const u8,
+    content_disposition: ?[]const u8 = null,
+    cacheable: bool = false,
+
+    fn deinit(self: *NormalizedProxyReply, allocator: std.mem.Allocator) void {
+        allocator.free(self.body);
+        if (self.content_disposition) |cd| allocator.free(cd);
+        self.* = undefined;
+    }
+};
+
+const ProxyRequestSpec = struct {
+    scope: UpstreamScope,
+    proxy_target: []const u8,
+    upstream_path: ?[]const u8,
+    upstream_body: []const u8,
+    correlation_id: []const u8,
+    client_ip: []const u8,
+    identity: ?[]const u8,
+    api_version: ?u32,
+    host: ?[]const u8,
+    x_forwarded_for: ?[]const u8,
+    allow_streaming: bool,
+};
+
+const ProxyRequestResult = union(enum) {
+    streamed_status: u16,
+    buffered: NormalizedProxyReply,
+
+    fn deinit(self: *ProxyRequestResult, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .streamed_status => {},
+            .buffered => |*reply| reply.deinit(allocator),
+        }
+        self.* = undefined;
+    }
+};
+
+fn handleProxyRequest(
+    allocator: std.mem.Allocator,
+    cfg: *const edge_config.EdgeConfig,
+    state: *GatewayState,
+    writer: anytype,
+    spec: ProxyRequestSpec,
+) (error{CircuitOpen} || anyerror)!ProxyRequestResult {
+    if (!state.circuitTryAcquire()) return error.CircuitOpen;
+
+    const exec = try proxyJsonExecute(
+        allocator,
+        cfg,
+        spec.scope,
+        spec.proxy_target,
+        spec.upstream_path,
+        spec.upstream_body,
+        spec.correlation_id,
+        spec.client_ip,
+        spec.identity,
+        spec.api_version,
+        spec.host,
+        spec.x_forwarded_for,
+        writer,
+        state,
+        spec.allow_streaming,
+    );
+
+    return switch (exec) {
+        .streamed_status => |status| blk: {
+            if (status >= 500) state.circuitRecordFailure() else state.circuitRecordSuccess();
+            break :blk .{ .streamed_status = status };
+        },
+        .buffered => |proxy_result| blk: {
+            if (proxy_result.status >= 500) state.circuitRecordFailure() else state.circuitRecordSuccess();
+            break :blk .{ .buffered = try normalizeBufferedProxyResult(allocator, spec.correlation_id, proxy_result) };
+        },
+    };
+}
 
 fn handleDeviceRegisterBuiltin(
     allocator: std.mem.Allocator,
@@ -5257,6 +3713,161 @@ fn resolveRequestIdentity(
         }
     }
     return null;
+}
+
+fn describeChatPrepError(err: anyerror) RequestPrepError {
+    return .{
+        .status = if (err == error.Unauthorized) .unauthorized else .bad_request,
+        .code = if (err == error.Unauthorized) "unauthorized" else "invalid_request",
+        .message = switch (err) {
+            error.Unauthorized => "Unauthorized",
+            error.InvalidContentType => "Content-Type must be application/json",
+            error.MissingBody => "Missing request body",
+            error.EmptyMessage => "message must not be empty",
+            error.MessageTooLarge => "message too long",
+            else => "invalid chat payload",
+        },
+    };
+}
+
+fn describeCommandPrepError(err: anyerror) RequestPrepError {
+    return .{
+        .status = switch (err) {
+            error.Unauthorized => .unauthorized,
+            error.BuildUpstreamFailed => .internal_server_error,
+            else => .bad_request,
+        },
+        .code = switch (err) {
+            error.Unauthorized => "unauthorized",
+            error.BuildUpstreamFailed => "internal_error",
+            else => "invalid_request",
+        },
+        .message = switch (err) {
+            error.Unauthorized => "Unauthorized",
+            error.InvalidContentType => "Content-Type must be application/json",
+            error.MissingBody => "Missing request body",
+            error.MissingCommand => "Missing 'command' field",
+            error.UnknownCommand => "Unknown command type",
+            error.InvalidParams => "Invalid or missing 'params' object",
+            error.BuildUpstreamFailed => "Failed to build upstream request",
+            else => "Invalid command envelope",
+        },
+    };
+}
+
+fn prepareChatRequest(
+    allocator: std.mem.Allocator,
+    cfg: *const edge_config.EdgeConfig,
+    state: *GatewayState,
+    headers: *const http.Headers,
+    body: ?[]const u8,
+) !ChatRequestPrep {
+    var identity = resolveRequestIdentity(allocator, cfg, state, headers) orelse {
+        return error.Unauthorized;
+    };
+    errdefer identity.deinit(allocator);
+
+    if (!isJsonContentType(headers.get("content-type"))) {
+        return error.InvalidContentType;
+    }
+
+    const raw_body = body orelse return error.MissingBody;
+    const message = parseChatMessage(allocator, raw_body, cfg.max_message_chars) catch |err| switch (err) {
+        error.EmptyMessage => return error.EmptyMessage,
+        error.MessageTooLarge => return error.MessageTooLarge,
+        else => return error.InvalidPayload,
+    };
+    errdefer allocator.free(message);
+
+    const upstream_body = try std.fmt.allocPrint(allocator, "{{\"message\":{s}}}", .{std.json.fmt(message, .{})});
+    return .{
+        .identity = identity,
+        .message = message,
+        .upstream_body = upstream_body,
+    };
+}
+
+fn prepareCommandRequest(
+    allocator: std.mem.Allocator,
+    cfg: *const edge_config.EdgeConfig,
+    state: *GatewayState,
+    headers: *const http.Headers,
+    body: ?[]const u8,
+    correlation_id: []const u8,
+    client_label: []const u8,
+    api_version: ?u16,
+    request_idempotency_key: ?[]const u8,
+) !CommandRequestPrep {
+    var identity = resolveRequestIdentity(allocator, cfg, state, headers) orelse {
+        return error.Unauthorized;
+    };
+    errdefer identity.deinit(allocator);
+
+    if (!isJsonContentType(headers.get("content-type"))) {
+        return error.InvalidContentType;
+    }
+
+    const raw_body = body orelse return error.MissingBody;
+    var command = http.command.parseCommand(allocator, raw_body) catch |err| switch (err) {
+        http.command.ParseError.MissingCommand => return error.MissingCommand,
+        http.command.ParseError.UnknownCommand => return error.UnknownCommand,
+        http.command.ParseError.InvalidParams => return error.InvalidParams,
+        else => return error.InvalidPayload,
+    };
+    errdefer command.deinit(allocator);
+
+    const command_id = if (command.command_id) |cid|
+        try allocator.dupe(u8, cid)
+    else
+        try generateCommandId(allocator);
+    errdefer allocator.free(command_id);
+
+    const upstream_body = http.command.buildUpstreamEnvelope(
+        allocator,
+        command.command_type,
+        command.params_raw,
+        command_id,
+        correlation_id,
+        identity.value,
+        client_label,
+        api_version,
+    ) catch return error.BuildUpstreamFailed;
+
+    return .{
+        .identity = identity,
+        .command = command,
+        .command_id = command_id,
+        .upstream_body = upstream_body,
+        .upstream_path = command.command_type.upstreamPath(),
+        .effective_idempotency_key = command.idempotency_key orelse request_idempotency_key,
+    };
+}
+
+fn normalizeBufferedProxyResult(
+    allocator: std.mem.Allocator,
+    correlation_id: []const u8,
+    proxy_result: ProxyResult,
+) !NormalizedProxyReply {
+    if (proxy_result.status == 200) {
+        return .{
+            .status = proxy_result.status,
+            .body = proxy_result.body,
+            .content_type = proxy_result.content_type,
+            .content_disposition = proxy_result.content_disposition,
+            .cacheable = proxy_result.cacheable,
+        };
+    }
+
+    allocator.free(proxy_result.content_type);
+    if (proxy_result.content_disposition) |cd| allocator.free(cd);
+    allocator.free(proxy_result.body);
+
+    const mapped = mapUpstreamError(proxy_result.status);
+    return .{
+        .status = mapped.status,
+        .body = try buildApiErrorJson(allocator, mapped.code, mapped.message, correlation_id),
+        .content_type = JSON_CONTENT_TYPE,
+    };
 }
 
 fn handleCommandStatusBuiltin(
@@ -5575,9 +4186,426 @@ fn dispatchBuiltinRouteHttp1(
             state.metricsRecord(200);
             return 200;
         },
-        .v1_chat,
-        .v1_commands,
-        => return null,
+        .v1_chat => {
+            if (request.method != .POST) return null;
+
+            if (ctx.idempotency_key) |idem_key| {
+                if (try state.idempotencyGetCopy(allocator, idem_key)) |cached| {
+                    defer allocator.free(cached.body);
+                    defer allocator.free(cached.content_type);
+
+                    var response = http.Response.init(allocator);
+                    defer response.deinit();
+                    _ = response.setStatus(@enumFromInt(cached.status))
+                        .setBody(cached.body)
+                        .setContentType(cached.content_type)
+                        .setConnection(keep_alive)
+                        .setHeader(http.correlation.HEADER_NAME, correlation_id)
+                        .setHeader("X-Idempotent-Replayed", "true");
+                    applyResponseHeaders(state, &response);
+                    try response.write(writer);
+                    state.metricsRecord(cached.status);
+                    return cached.status;
+                }
+            }
+
+            var prep = prepareChatRequest(allocator, cfg, state, &request.headers, request.body) catch |err| {
+                const desc = describeChatPrepError(err);
+                try sendApiError(allocator, writer, desc.status, desc.code, desc.message, correlation_id, keep_alive, state);
+                return @intFromEnum(desc.status);
+            };
+            defer prep.deinit(allocator);
+            ctx.setIdentity(prep.identity.value);
+
+            const proxy_cache_bypass = shouldBypassProxyCache(&request.headers) or ctx.idempotency_key != null;
+            const proxy_cache_key = if (cfg.proxy_cache_ttl_seconds > 0 and !proxy_cache_bypass)
+                try buildProxyCacheKey(allocator, cfg.proxy_cache_key_template, request.method.toString(), "/v1/chat", prep.message, ctx.identity, if (ctx.api_version) |version| @as(u32, version) else null)
+            else
+                null;
+            defer if (proxy_cache_key) |k| allocator.free(k);
+            var proxy_cache_locked = false;
+            defer if (proxy_cache_locked) {
+                if (proxy_cache_key) |cache_key| state.proxyCacheUnlock(cache_key);
+            };
+            if (proxy_cache_key) |cache_key| {
+                if (try state.proxyCacheGetCopyWithStale(allocator, cache_key, cfg.proxy_cache_stale_while_revalidate_seconds)) |lookup| {
+                    defer allocator.free(lookup.cached.body);
+                    defer allocator.free(lookup.cached.content_type);
+
+                    var response = http.Response.init(allocator);
+                    defer response.deinit();
+                    _ = response.setStatus(@enumFromInt(lookup.cached.status))
+                        .setBody(lookup.cached.body)
+                        .setContentType(lookup.cached.content_type)
+                        .setConnection(keep_alive)
+                        .setHeader(http.correlation.HEADER_NAME, correlation_id)
+                        .setHeader("X-Proxy-Cache", if (lookup.is_stale) "STALE" else "HIT");
+                    applyResponseHeaders(state, &response);
+                    try response.write(writer);
+                    state.metricsRecord(lookup.cached.status);
+                    if (lookup.is_stale) {
+                        spawnProxyCacheRefresh(
+                            allocator,
+                            cfg,
+                            state,
+                            cache_key,
+                            .chat,
+                            cfg.proxy_pass_chat,
+                            null,
+                            prep.message,
+                            client_ip,
+                            ctx.identity,
+                            if (ctx.api_version) |version| @as(u32, version) else null,
+                        );
+                    }
+                    return lookup.cached.status;
+                }
+
+                proxy_cache_locked = try state.proxyCacheTryLock(cache_key);
+                if (!proxy_cache_locked) {
+                    _ = state.proxyCacheWaitForUnlock(cache_key, cfg.proxy_cache_lock_timeout_ms);
+                    if (try state.proxyCacheGetCopyWithStale(allocator, cache_key, 0)) |post_wait_lookup| {
+                        defer allocator.free(post_wait_lookup.cached.body);
+                        defer allocator.free(post_wait_lookup.cached.content_type);
+                        var response = http.Response.init(allocator);
+                        defer response.deinit();
+                        _ = response.setStatus(@enumFromInt(post_wait_lookup.cached.status))
+                            .setBody(post_wait_lookup.cached.body)
+                            .setContentType(post_wait_lookup.cached.content_type)
+                            .setConnection(keep_alive)
+                            .setHeader(http.correlation.HEADER_NAME, correlation_id)
+                            .setHeader("X-Proxy-Cache", "HIT");
+                        applyResponseHeaders(state, &response);
+                        try response.write(writer);
+                        state.metricsRecord(post_wait_lookup.cached.status);
+                        return post_wait_lookup.cached.status;
+                    }
+                }
+            }
+
+            var proxy_result = handleProxyRequest(allocator, cfg, state, writer, .{
+                .scope = .chat,
+                .proxy_target = cfg.proxy_pass_chat,
+                .upstream_path = null,
+                .upstream_body = prep.upstream_body,
+                .correlation_id = correlation_id,
+                .client_ip = client_ip,
+                .identity = ctx.identity,
+                .api_version = if (ctx.api_version) |version| @as(u32, version) else null,
+                .host = request.headers.get("host"),
+                .x_forwarded_for = request.headers.get("x-forwarded-for"),
+                .allow_streaming = ctx.idempotency_key == null and proxy_cache_key == null,
+            }) catch |err| switch (err) {
+                error.CircuitOpen => {
+                    state.logger.warn(null, "circuit breaker open, rejecting /v1/chat", .{});
+                    try sendApiError(allocator, writer, .service_unavailable, "upstream_unavailable", "Upstream unavailable", correlation_id, keep_alive, state);
+                    return 503;
+                },
+                else => {
+                    state.circuitRecordFailure();
+                    state.logger.warn(null, "circuit breaker: recorded failure, state={s}", .{state.circuitStateName()});
+                    const mapped = mapProxyExecutionError(err);
+                    try sendApiError(allocator, writer, mapped.status, mapped.code, mapped.message, correlation_id, keep_alive, state);
+                    return @intFromEnum(mapped.status);
+                },
+            };
+            defer proxy_result.deinit(allocator);
+
+            switch (proxy_result) {
+                .streamed_status => |status| {
+                    state.metricsRecord(status);
+                    return status;
+                },
+                .buffered => |normalized| {
+                    const comp = http.compression.compressResponse(allocator, normalized.body, normalized.content_type, request.headers.get("Accept-Encoding"), state.compression_config);
+                    defer if (comp.body) |cb| allocator.free(cb);
+                    const response_body = if (comp.body) |cb| cb else normalized.body;
+
+                    var response = http.Response.init(allocator);
+                    defer response.deinit();
+                    _ = response
+                        .setStatus(@enumFromInt(normalized.status))
+                        .setBody(response_body)
+                        .setContentType(normalized.content_type)
+                        .setConnection(keep_alive)
+                        .setHeader(http.correlation.HEADER_NAME, correlation_id);
+                    if (normalized.content_disposition) |cd| {
+                        _ = response.setHeader("Content-Disposition", cd);
+                    }
+                    if (comp.compressed and comp.encoding != null) {
+                        _ = response.setHeader("Content-Encoding", comp.encoding.?.headerValue());
+                    }
+                    applyResponseHeaders(state, &response);
+                    try response.write(writer);
+                    state.metricsRecord(normalized.status);
+
+                    if (proxy_cache_key) |cache_key| {
+                        if (normalized.status == 200 and normalized.cacheable) {
+                            state.proxyCachePut(cache_key, normalized.status, normalized.body, normalized.content_type) catch |err| {
+                                std.log.warn("proxy cache store error: {}", .{err});
+                            };
+                        }
+                    }
+                    if (ctx.idempotency_key) |idem_key| {
+                        state.idempotencyPut(idem_key, normalized.status, normalized.body, JSON_CONTENT_TYPE) catch |err| {
+                            std.log.warn("idempotency store error: {}", .{err});
+                        };
+                    }
+                    return normalized.status;
+                },
+            }
+        },
+        .v1_commands => {
+            if (request.method != .POST) return null;
+
+            var prep = prepareCommandRequest(
+                allocator,
+                cfg,
+                state,
+                &request.headers,
+                request.body,
+                correlation_id,
+                client_ip,
+                ctx.api_version,
+                ctx.idempotency_key,
+            ) catch |err| {
+                const desc = describeCommandPrepError(err);
+                try sendApiError(allocator, writer, desc.status, desc.code, desc.message, correlation_id, keep_alive, state);
+                return @intFromEnum(desc.status);
+            };
+            defer prep.deinit(allocator);
+            ctx.setIdentity(prep.identity.value);
+
+            const effective_idem_key = prep.effective_idempotency_key;
+            if (effective_idem_key) |idem_key| {
+                if (try state.idempotencyGetCopy(allocator, idem_key)) |cached| {
+                    defer allocator.free(cached.body);
+                    defer allocator.free(cached.content_type);
+
+                    var response = http.Response.init(allocator);
+                    defer response.deinit();
+                    _ = response.setStatus(@enumFromInt(cached.status))
+                        .setBody(cached.body)
+                        .setContentType(cached.content_type)
+                        .setConnection(keep_alive)
+                        .setHeader(http.correlation.HEADER_NAME, correlation_id)
+                        .setHeader("X-Idempotent-Replayed", "true");
+                    applyResponseHeaders(state, &response);
+                    try response.write(writer);
+                    state.metricsRecord(cached.status);
+                    return cached.status;
+                }
+            }
+
+            if (prep.command.async_execute) {
+                state.commandLifecycleCreate(prep.command_id, prep.command.command_type.toString(), correlation_id, ctx.identity orelse "-") catch {
+                    try sendApiError(allocator, writer, .internal_server_error, "internal_error", "Failed to initialize command lifecycle", correlation_id, keep_alive, state);
+                    return 500;
+                };
+                spawnAsyncCommandExecution(
+                    allocator,
+                    cfg,
+                    state,
+                    prep.command_id,
+                    prep.command.command_type.toString(),
+                    prep.upstream_path,
+                    prep.upstream_body,
+                    correlation_id,
+                    client_ip,
+                    ctx.identity,
+                    if (ctx.api_version) |version| @as(u32, version) else null,
+                    request.headers.get("host"),
+                    request.headers.get("x-forwarded-for"),
+                );
+                const accepted_body = try std.fmt.allocPrint(allocator, "{{\"command_id\":\"{s}\",\"status\":\"pending\",\"status_url\":\"/v1/commands/status?command_id={s}\"}}", .{ prep.command_id, prep.command_id });
+                defer allocator.free(accepted_body);
+                var accepted = http.Response.json(allocator, accepted_body);
+                defer accepted.deinit();
+                _ = accepted.setStatus(.accepted).setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
+                applyResponseHeaders(state, &accepted);
+                try accepted.write(writer);
+                state.metricsRecord(202);
+                return 202;
+            }
+
+            state.commandLifecycleCreate(prep.command_id, prep.command.command_type.toString(), correlation_id, ctx.identity orelse "-") catch {};
+            state.commandLifecycleSetRunning(prep.command_id);
+
+            const proxy_cache_bypass = shouldBypassProxyCache(&request.headers) or effective_idem_key != null;
+            const proxy_cache_key = if (cfg.proxy_cache_ttl_seconds > 0 and !proxy_cache_bypass)
+                try buildProxyCacheKey(allocator, cfg.proxy_cache_key_template, request.method.toString(), "/v1/commands", prep.upstream_body, ctx.identity, if (ctx.api_version) |version| @as(u32, version) else null)
+            else
+                null;
+            defer if (proxy_cache_key) |k| allocator.free(k);
+            var proxy_cache_locked = false;
+            defer if (proxy_cache_locked) {
+                if (proxy_cache_key) |cache_key| state.proxyCacheUnlock(cache_key);
+            };
+            if (proxy_cache_key) |cache_key| {
+                if (try state.proxyCacheGetCopyWithStale(allocator, cache_key, cfg.proxy_cache_stale_while_revalidate_seconds)) |lookup| {
+                    defer allocator.free(lookup.cached.body);
+                    defer allocator.free(lookup.cached.content_type);
+
+                    var response = http.Response.init(allocator);
+                    defer response.deinit();
+                    _ = response.setStatus(@enumFromInt(lookup.cached.status))
+                        .setBody(lookup.cached.body)
+                        .setContentType(lookup.cached.content_type)
+                        .setConnection(keep_alive)
+                        .setHeader(http.correlation.HEADER_NAME, correlation_id)
+                        .setHeader("X-Proxy-Cache", if (lookup.is_stale) "STALE" else "HIT");
+                    applyResponseHeaders(state, &response);
+                    try response.write(writer);
+                    state.metricsRecord(lookup.cached.status);
+                    if (lookup.is_stale) {
+                        spawnProxyCacheRefresh(
+                            allocator,
+                            cfg,
+                            state,
+                            cache_key,
+                            .commands,
+                            cfg.proxy_pass_commands_prefix,
+                            prep.upstream_path,
+                            prep.upstream_body,
+                            client_ip,
+                            ctx.identity,
+                            if (ctx.api_version) |version| @as(u32, version) else null,
+                        );
+                    }
+                    return lookup.cached.status;
+                }
+
+                proxy_cache_locked = try state.proxyCacheTryLock(cache_key);
+                if (!proxy_cache_locked) {
+                    _ = state.proxyCacheWaitForUnlock(cache_key, cfg.proxy_cache_lock_timeout_ms);
+                    if (try state.proxyCacheGetCopyWithStale(allocator, cache_key, 0)) |post_wait_lookup| {
+                        defer allocator.free(post_wait_lookup.cached.body);
+                        defer allocator.free(post_wait_lookup.cached.content_type);
+                        var response = http.Response.init(allocator);
+                        defer response.deinit();
+                        _ = response.setStatus(@enumFromInt(post_wait_lookup.cached.status))
+                            .setBody(post_wait_lookup.cached.body)
+                            .setContentType(post_wait_lookup.cached.content_type)
+                            .setConnection(keep_alive)
+                            .setHeader(http.correlation.HEADER_NAME, correlation_id)
+                            .setHeader("X-Proxy-Cache", "HIT");
+                        applyResponseHeaders(state, &response);
+                        try response.write(writer);
+                        state.metricsRecord(post_wait_lookup.cached.status);
+                        return post_wait_lookup.cached.status;
+                    }
+                }
+            }
+
+            var proxy_result = handleProxyRequest(allocator, cfg, state, writer, .{
+                .scope = .commands,
+                .proxy_target = cfg.proxy_pass_commands_prefix,
+                .upstream_path = prep.upstream_path,
+                .upstream_body = prep.upstream_body,
+                .correlation_id = correlation_id,
+                .client_ip = client_ip,
+                .identity = ctx.identity,
+                .api_version = if (ctx.api_version) |version| @as(u32, version) else null,
+                .host = request.headers.get("host"),
+                .x_forwarded_for = request.headers.get("x-forwarded-for"),
+                .allow_streaming = effective_idem_key == null and proxy_cache_key == null,
+            }) catch |err| switch (err) {
+                error.CircuitOpen => {
+                    state.logger.warn(null, "circuit breaker open, rejecting /v1/commands", .{});
+                    try sendApiError(allocator, writer, .service_unavailable, "upstream_unavailable", "Upstream unavailable", correlation_id, keep_alive, state);
+                    state.commandLifecycleSetFailed(prep.command_id, "upstream_unavailable");
+                    const cb_audit = http.command.CommandAudit{
+                        .command = prep.command.command_type.toString(),
+                        .correlation_id = correlation_id,
+                        .identity = ctx.identity orelse "-",
+                        .status = 503,
+                        .latency_ms = ctx.elapsedMs(),
+                    };
+                    cb_audit.log();
+                    return 503;
+                },
+                else => {
+                    state.circuitRecordFailure();
+                    state.commandLifecycleSetFailed(prep.command_id, @errorName(err));
+                    state.logger.warn(null, "circuit breaker: recorded failure, state={s}", .{state.circuitStateName()});
+                    const mapped = mapProxyExecutionError(err);
+                    try sendApiError(allocator, writer, mapped.status, mapped.code, mapped.message, correlation_id, keep_alive, state);
+                    const cmd_audit = http.command.CommandAudit{
+                        .command = prep.command.command_type.toString(),
+                        .correlation_id = correlation_id,
+                        .identity = ctx.identity orelse "-",
+                        .status = @intFromEnum(mapped.status),
+                        .latency_ms = ctx.elapsedMs(),
+                    };
+                    cmd_audit.log();
+                    return @intFromEnum(mapped.status);
+                },
+            };
+            defer proxy_result.deinit(allocator);
+
+            switch (proxy_result) {
+                .streamed_status => |status| {
+                    state.commandLifecycleSetCompleted(prep.command_id, status, "", JSON_CONTENT_TYPE);
+                    state.metricsRecord(status);
+                    const streamed_audit = http.command.CommandAudit{
+                        .command = prep.command.command_type.toString(),
+                        .correlation_id = correlation_id,
+                        .identity = ctx.identity orelse "-",
+                        .status = status,
+                        .latency_ms = ctx.elapsedMs(),
+                    };
+                    streamed_audit.log();
+                    return status;
+                },
+                .buffered => |normalized| {
+                    const comp = http.compression.compressResponse(allocator, normalized.body, normalized.content_type, request.headers.get("Accept-Encoding"), state.compression_config);
+                    defer if (comp.body) |cb| allocator.free(cb);
+                    const response_body = if (comp.body) |cb| cb else normalized.body;
+
+                    var response = http.Response.init(allocator);
+                    defer response.deinit();
+                    _ = response
+                        .setStatus(@enumFromInt(normalized.status))
+                        .setBody(response_body)
+                        .setContentType(normalized.content_type)
+                        .setConnection(keep_alive)
+                        .setHeader(http.correlation.HEADER_NAME, correlation_id);
+                    if (normalized.content_disposition) |cd| {
+                        _ = response.setHeader("Content-Disposition", cd);
+                    }
+                    if (comp.compressed and comp.encoding != null) {
+                        _ = response.setHeader("Content-Encoding", comp.encoding.?.headerValue());
+                    }
+                    applyResponseHeaders(state, &response);
+                    try response.write(writer);
+                    state.metricsRecord(normalized.status);
+                    state.commandLifecycleSetCompleted(prep.command_id, normalized.status, normalized.body, normalized.content_type);
+
+                    if (proxy_cache_key) |cache_key| {
+                        if (normalized.status == 200 and normalized.cacheable) {
+                            state.proxyCachePut(cache_key, normalized.status, normalized.body, normalized.content_type) catch |err| {
+                                std.log.warn("proxy cache store error: {}", .{err});
+                            };
+                        }
+                    }
+                    if (effective_idem_key) |idem_key| {
+                        state.idempotencyPut(idem_key, normalized.status, normalized.body, JSON_CONTENT_TYPE) catch |err| {
+                            std.log.warn("idempotency store error: {}", .{err});
+                        };
+                    }
+
+                    const audit = http.command.CommandAudit{
+                        .command = prep.command.command_type.toString(),
+                        .correlation_id = correlation_id,
+                        .identity = ctx.identity orelse "-",
+                        .status = normalized.status,
+                        .latency_ms = ctx.elapsedMs(),
+                    };
+                    audit.log();
+                    return normalized.status;
+                },
+            }
+        },
         .v1_commands_status => {
             if (request.method != .GET) return null;
             var reply = try handleCommandStatusBuiltin(allocator, cfg, state, &request.headers, request.uri.query, correlation_id);
@@ -5880,6 +4908,166 @@ fn headerValue(headers_raw: []const u8, name: []const u8) ?[]const u8 {
     return null;
 }
 
+const StaticErrorPageResult = union(enum) {
+    served: http.static_file.Result,
+    redirect: []u8,
+
+    fn deinit(self: *StaticErrorPageResult, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .served => |*served| served.deinit(allocator),
+            .redirect => |target| allocator.free(target),
+        }
+        self.* = undefined;
+    }
+};
+
+fn wantsHtmlErrorPage(request_path: []const u8, headers: *const http.Headers) bool {
+    if (std.mem.startsWith(u8, request_path, "/v1/")) return false;
+    const accept = headers.get("accept") orelse return false;
+    if (std.mem.indexOf(u8, accept, "text/html") != null) return true;
+    if (std.mem.indexOf(u8, accept, "*/*") != null) return true;
+    if (std.mem.indexOf(u8, accept, "application/json") != null) return false;
+    return false;
+}
+
+fn findErrorPageTarget(block: *const http.location_router.LocationBlock, status_code: u16) ?[]const u8 {
+    for (block.error_pages) |rule| {
+        for (rule.status_codes) |candidate| {
+            if (candidate == status_code) return rule.target;
+        }
+    }
+    return null;
+}
+
+fn maybeResolveStaticErrorPage(
+    allocator: std.mem.Allocator,
+    matched: http.location_router.MatchResult,
+    root_cfg: anytype,
+    request_path: []const u8,
+    headers: *const http.Headers,
+    status_code: u16,
+) !?StaticErrorPageResult {
+    if (!wantsHtmlErrorPage(request_path, headers)) return null;
+    const target = findErrorPageTarget(matched.block, status_code) orelse return null;
+    if (std.mem.startsWith(u8, target, "http://") or std.mem.startsWith(u8, target, "https://")) {
+        return .{ .redirect = try allocator.dupe(u8, target) };
+    }
+    var served = (try http.static_file.serve(allocator, .{
+        .root = root_cfg.root,
+        .request_path = target,
+        .matched_pattern = "/",
+        .alias = false,
+        .index = root_cfg.index,
+        .try_files = "",
+        .autoindex = false,
+        .headers = headers,
+        .max_bytes = MAX_REQUEST_SIZE,
+    })) orelse return null;
+    served.status_code = @enumFromInt(status_code);
+    return .{ .served = served };
+}
+
+fn runMiddlewarePipeline(
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    cfg: *const edge_config.EdgeConfig,
+    state: *GatewayState,
+    ctx: *http.request_context.RequestContext,
+    request: *const http.Request,
+    correlation_id: []const u8,
+    keep_alive: bool,
+) !bool {
+    const client_ip = ctx.client_ip;
+
+    if (cfg.geo_blocked_countries.len > 0) {
+        const country = request.headers.get(cfg.geo_country_header);
+        if (isGeoBlocked(cfg.geo_blocked_countries, country)) {
+            try sendApiError(allocator, writer, .forbidden, "forbidden", "Geo access denied", correlation_id, keep_alive, state);
+            logAccess(ctx, request.method.toString(), request.uri.path, 403, request.headers.get("user-agent") orelse "");
+            return true;
+        }
+    }
+
+    const limits = cfg.request_limits;
+    const uri_check = http.request_limits.validateUriLength(request.uri.path.len, limits);
+    if (uri_check != .ok) {
+        var msg_buf: [256]u8 = undefined;
+        const msg = http.request_limits.rejectionMessage(uri_check, &msg_buf);
+        try sendApiError(allocator, writer, .uri_too_long, "invalid_request", msg, correlation_id, keep_alive, state);
+        state.logger.warn(correlation_id, "URI too long: {d} bytes", .{request.uri.path.len});
+        logAccess(ctx, request.method.toString(), request.uri.path, 414, request.headers.get("user-agent") orelse "");
+        return true;
+    }
+    const header_count_check = http.request_limits.validateHeaderCount(request.headers.count(), limits);
+    if (header_count_check != .ok) {
+        try sendApiError(allocator, writer, .bad_request, "invalid_request", "Too many headers", correlation_id, keep_alive, state);
+        state.logger.warn(correlation_id, "Too many headers: {d}", .{request.headers.count()});
+        logAccess(ctx, request.method.toString(), request.uri.path, 400, request.headers.get("user-agent") orelse "");
+        return true;
+    }
+    if (request.body) |body| {
+        const body_check = http.request_limits.validateBodySize(body.len, limits);
+        if (body_check != .ok) {
+            try sendApiError(allocator, writer, .payload_too_large, "invalid_request", "Request body too large", correlation_id, keep_alive, state);
+            state.logger.warn(correlation_id, "Body too large: {d} bytes", .{body.len});
+            logAccess(ctx, request.method.toString(), request.uri.path, 413, request.headers.get("user-agent") orelse "");
+            return true;
+        }
+    }
+
+    if (http.api_router.parseVersionedPath(request.uri.path)) |versioned| {
+        ctx.setApiVersion(versioned.version);
+    }
+
+    if (ctx.api_version != null and isProtectedAuthRequestRoute(request.uri.path)) {
+        if (cfg.device_auth_required and !validateDeviceRequest(cfg, request.method.toString(), request.uri.path, &request.headers, request.body orelse "")) {
+            try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Device authentication failed", correlation_id, keep_alive, state);
+            logAccess(ctx, request.method.toString(), request.uri.path, 401, request.headers.get("user-agent") orelse "");
+            return true;
+        }
+
+        const identity = try extractIdentityForPolicy(allocator, cfg, state, request);
+        defer if (identity) |id| allocator.free(id);
+        if (evaluatePolicy(state, cfg, request.method.toString(), request.uri.path, identity, request.headers.get("x-device-id"), &request.headers)) |reason| {
+            try sendApiError(allocator, writer, .forbidden, "forbidden", reason, correlation_id, keep_alive, state);
+            logAccess(ctx, request.method.toString(), request.uri.path, 403, request.headers.get("user-agent") orelse "");
+            return true;
+        }
+    }
+
+    if (http.idempotency.fromHeaders(&request.headers)) |idem_key| {
+        ctx.setIdempotencyKey(idem_key);
+    }
+
+    if (state.access_control) |*acl| {
+        if (acl.check(client_ip) == .denied) {
+            try sendApiError(allocator, writer, .forbidden, "forbidden", "Access denied", correlation_id, keep_alive, state);
+            logAccess(ctx, request.method.toString(), request.uri.path, 403, request.headers.get("user-agent") orelse "");
+            return true;
+        }
+    }
+
+    if (!state.rateLimitAllow(client_ip)) {
+        const payload = try buildApiErrorJson(allocator, "rate_limited", "Rate limit exceeded", correlation_id);
+        defer allocator.free(payload);
+        var response = http.Response.json(allocator, payload);
+        defer response.deinit();
+        _ = response
+            .setStatus(.too_many_requests)
+            .setConnection(keep_alive)
+            .setHeader("Retry-After", "1")
+            .setHeader(http.correlation.HEADER_NAME, correlation_id);
+        applyResponseHeaders(state, &response);
+        try response.write(writer);
+        state.metricsRecord(429);
+        state.metricsRecordErrorCode("rate_limited");
+        logAccess(ctx, request.method.toString(), request.uri.path, 429, request.headers.get("user-agent") orelse "");
+        return true;
+    }
+
+    return false;
+}
+
 fn handleStaticLocation(
     allocator: std.mem.Allocator,
     writer: anytype,
@@ -5891,27 +5079,555 @@ fn handleStaticLocation(
     state: *GatewayState,
 ) !?u16 {
     if (!(request.method == .GET or request.method == .HEAD)) return null;
-
-    const rel_path = if (root_cfg.alias)
-        std.mem.trimLeft(u8, request.uri.path[matched.block.pattern.len..], "/")
-    else
-        std.mem.trimLeft(u8, request.uri.path, "/");
-    const suffix = if (rel_path.len == 0 or std.mem.endsWith(u8, request.uri.path, "/")) root_cfg.index else rel_path;
-    const full_path = try std.fs.path.join(allocator, &[_][]const u8{ root_cfg.root, suffix });
-    defer allocator.free(full_path);
-
-    const file_data = std.fs.cwd().readFileAlloc(allocator, full_path, MAX_REQUEST_SIZE) catch {
-        return null;
+    var served = (try http.static_file.serve(allocator, .{
+        .root = root_cfg.root,
+        .request_path = request.uri.path,
+        .matched_pattern = matched.block.pattern,
+        .alias = root_cfg.alias,
+        .index = root_cfg.index,
+        .try_files = root_cfg.try_files,
+        .autoindex = root_cfg.autoindex,
+        .headers = &request.headers,
+        .max_bytes = MAX_REQUEST_SIZE,
+    })) orelse blk: {
+        var error_page = (try maybeResolveStaticErrorPage(allocator, matched, root_cfg, request.uri.path, &request.headers, 404)) orelse return null;
+        switch (error_page) {
+            .redirect => |target| {
+                defer allocator.free(target);
+                var response = http.Response.init(allocator);
+                defer response.deinit();
+                _ = response
+                    .setStatus(.found)
+                    .setBody("")
+                    .setContentType("text/plain; charset=utf-8")
+                    .setConnection(keep_alive)
+                    .setHeader("Location", target)
+                    .setHeader(http.correlation.HEADER_NAME, correlation_id);
+                applyResponseHeaders(state, &response);
+                if (request.method == .HEAD) {
+                    try response.writeHead(writer);
+                } else {
+                    try response.write(writer);
+                }
+                state.metricsRecord(302);
+                return 302;
+            },
+            .served => |*resolved| break :blk resolved.*,
+        }
     };
-    defer allocator.free(file_data);
+    defer served.deinit(allocator);
 
-    var response = http.Response.ok(allocator, if (request.method == .HEAD) "" else file_data, "application/octet-stream");
+    if (@intFromEnum(served.status_code) >= 400) {
+        if (try maybeResolveStaticErrorPage(allocator, matched, root_cfg, request.uri.path, &request.headers, @intFromEnum(served.status_code))) |error_page| {
+            switch (error_page) {
+                .redirect => |target| {
+                    defer allocator.free(target);
+                    var response = http.Response.init(allocator);
+                    defer response.deinit();
+                    _ = response
+                        .setStatus(.found)
+                        .setBody("")
+                        .setContentType("text/plain; charset=utf-8")
+                        .setConnection(keep_alive)
+                        .setHeader("Location", target)
+                        .setHeader(http.correlation.HEADER_NAME, correlation_id);
+                    applyResponseHeaders(state, &response);
+                    if (request.method == .HEAD) {
+                        try response.writeHead(writer);
+                    } else {
+                        try response.write(writer);
+                    }
+                    state.metricsRecord(302);
+                    return 302;
+                },
+                .served => |replacement| {
+                    served.deinit(allocator);
+                    served = replacement;
+                },
+            }
+        }
+    }
+
+    var response = http.Response.init(allocator);
     defer response.deinit();
-    _ = response.setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
+    _ = response
+        .setStatus(served.status_code)
+        .setBody(served.body)
+        .setContentType(served.content_type)
+        .setConnection(keep_alive)
+        .setHeader(http.correlation.HEADER_NAME, correlation_id);
+    if (served.etag_value) |etag_value| _ = response.setHeader("ETag", etag_value);
+    if (served.last_modified_value) |last_modified| _ = response.setHeader("Last-Modified", last_modified);
+    if (served.content_range_value) |content_range| _ = response.setHeader("Content-Range", content_range);
+    if (served.accept_ranges) _ = response.setHeader("Accept-Ranges", "bytes");
+    applyResponseHeaders(state, &response);
+    if (request.method == .HEAD) {
+        try response.writeHead(writer);
+    } else {
+        try response.write(writer);
+    }
+    const status_code = @intFromEnum(served.status_code);
+    state.metricsRecord(status_code);
+    return status_code;
+}
+
+fn authenticateRealtimeRequest(
+    allocator: std.mem.Allocator,
+    cfg: *const edge_config.EdgeConfig,
+    state: *GatewayState,
+    ctx: *http.request_context.RequestContext,
+    headers: *const http.Headers,
+) !bool {
+    const auth_result = authorizeRequest(cfg, headers);
+    if (auth_result.ok) {
+        ctx.setIdentity(auth_result.token_hash orelse "-");
+        return true;
+    }
+    if (http.session.fromHeaders(headers)) |session_token| {
+        if (state.validateSessionIdentity(allocator, session_token)) |identity| {
+            defer allocator.free(identity);
+            ctx.setIdentity(identity);
+            return true;
+        }
+    }
+    return false;
+}
+
+fn handleWebSocketUpgrade(
+    conn: anytype,
+    allocator: std.mem.Allocator,
+    cfg: *const edge_config.EdgeConfig,
+    state: *GatewayState,
+    ctx: *http.request_context.RequestContext,
+    request: *const http.Request,
+    correlation_id: []const u8,
+    client_ip: []const u8,
+    keep_alive: *bool,
+) !?u16 {
+    if (request.method != .GET) return null;
+    const writer = conn.writer();
+
+    if (http.api_router.matchRoute(request.uri.path, 1, "/ws/mux")) {
+        if (!cfg.websocket_enabled or !cfg.sse_enabled) {
+            try sendApiError(allocator, writer, .not_found, "invalid_request", "Not Found", correlation_id, false, state);
+            state.metricsRecord(404);
+            return 404;
+        }
+        if (!http.websocket.isUpgradeRequest(&request.headers)) {
+            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Expected websocket upgrade request", correlation_id, false, state);
+            state.metricsRecord(400);
+            return 400;
+        }
+        if (!try authenticateRealtimeRequest(allocator, cfg, state, ctx, &request.headers)) {
+            try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, false, state);
+            state.metricsRecord(401);
+            return 401;
+        }
+        const device_id = request.headers.get("x-device-id") orelse {
+            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Missing X-Device-ID for multiplex stream", correlation_id, false, state);
+            state.metricsRecord(400);
+            return 400;
+        };
+        if (!isValidDeviceTopicSegment(device_id)) {
+            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Invalid device id", correlation_id, false, state);
+            state.metricsRecord(400);
+            return 400;
+        }
+        const ws_key = request.headers.get("sec-websocket-key") orelse {
+            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Missing Sec-WebSocket-Key", correlation_id, false, state);
+            state.metricsRecord(400);
+            return 400;
+        };
+        const accept_key = try http.websocket.acceptKey(allocator, ws_key);
+        defer allocator.free(accept_key);
+        try http.websocket.writeServerHandshake(writer, accept_key, request.headers.get("sec-websocket-protocol"));
+
+        state.streamCountAdjust(1, 1);
+        defer state.streamCountAdjust(-1, -1);
+        handleWebSocketMultiplexLoop(
+            conn,
+            allocator,
+            cfg,
+            state,
+            correlation_id,
+            client_ip,
+            ctx.identity,
+            if (ctx.api_version) |version| @as(u32, version) else null,
+            request.headers.get("host"),
+            request.headers.get("x-forwarded-for"),
+            device_id,
+        ) catch |err| {
+            state.logger.warn(correlation_id, "websocket multiplex loop ended: {}", .{err});
+        };
+        state.metricsRecord(101);
+        keep_alive.* = false;
+        return 101;
+    }
+
+    if (http.api_router.matchRoute(request.uri.path, 1, "/ws/chat") or http.api_router.matchRoute(request.uri.path, 1, "/ws/commands")) {
+        if (!cfg.websocket_enabled) {
+            try sendApiError(allocator, writer, .not_found, "invalid_request", "Not Found", correlation_id, false, state);
+            state.metricsRecord(404);
+            return 404;
+        }
+        if (!http.websocket.isUpgradeRequest(&request.headers)) {
+            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Expected websocket upgrade request", correlation_id, false, state);
+            state.metricsRecord(400);
+            return 400;
+        }
+        if (!try authenticateRealtimeRequest(allocator, cfg, state, ctx, &request.headers)) {
+            try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, false, state);
+            state.metricsRecord(401);
+            return 401;
+        }
+        const ws_key = request.headers.get("sec-websocket-key") orelse {
+            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Missing Sec-WebSocket-Key", correlation_id, false, state);
+            state.metricsRecord(400);
+            return 400;
+        };
+        const accept_key = try http.websocket.acceptKey(allocator, ws_key);
+        defer allocator.free(accept_key);
+        try http.websocket.writeServerHandshake(writer, accept_key, request.headers.get("sec-websocket-protocol"));
+
+        const ws_scope: UpstreamScope = if (http.api_router.matchRoute(request.uri.path, 1, "/ws/chat")) .chat else .commands;
+        const ws_proxy_target = if (ws_scope == .chat) cfg.proxy_pass_chat else cfg.proxy_pass_commands_prefix;
+        state.streamCountAdjust(1, 0);
+        defer state.streamCountAdjust(-1, 0);
+        handleWebSocketProxyLoop(
+            conn,
+            allocator,
+            cfg,
+            state,
+            correlation_id,
+            client_ip,
+            ctx.identity,
+            if (ctx.api_version) |version| @as(u32, version) else null,
+            request.headers.get("host"),
+            request.headers.get("x-forwarded-for"),
+            ws_scope,
+            ws_proxy_target,
+        ) catch |err| {
+            state.logger.warn(correlation_id, "websocket loop ended: {}", .{err});
+        };
+        state.metricsRecord(101);
+        keep_alive.* = false;
+        return 101;
+    }
+
+    return null;
+}
+
+fn handleSseStream(
+    writer: anytype,
+    allocator: std.mem.Allocator,
+    cfg: *const edge_config.EdgeConfig,
+    state: *GatewayState,
+    ctx: *http.request_context.RequestContext,
+    request: *const http.Request,
+    correlation_id: []const u8,
+    keep_alive: *bool,
+) !?u16 {
+    if (request.method != .GET) return null;
+    if (!http.api_router.matchRoute(request.uri.path, 1, "/events/stream")) return null;
+
+    if (!cfg.sse_enabled) {
+        try sendApiError(allocator, writer, .not_found, "invalid_request", "Not Found", correlation_id, false, state);
+        state.metricsRecord(404);
+        return 404;
+    }
+    if (!try authenticateRealtimeRequest(allocator, cfg, state, ctx, &request.headers)) {
+        try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, false, state);
+        state.metricsRecord(401);
+        return 401;
+    }
+
+    const topic = parseQueryParam(request.uri.query, "topic") orelse "default";
+    const last_event_id = parseLastEventId(request.headers.get("last-event-id"));
+    state.streamCountAdjust(0, 1);
+    defer state.streamCountAdjust(0, -1);
+    try streamSseTopic(writer, allocator, cfg, state, topic, last_event_id, correlation_id);
+    state.metricsRecord(200);
+    keep_alive.* = false;
+    return 200;
+}
+
+fn handleSsePublish(
+    writer: anytype,
+    allocator: std.mem.Allocator,
+    cfg: *const edge_config.EdgeConfig,
+    state: *GatewayState,
+    ctx: *http.request_context.RequestContext,
+    request: *const http.Request,
+    correlation_id: []const u8,
+    keep_alive: bool,
+) !?u16 {
+    if (request.method != .POST) return null;
+    if (!http.api_router.matchRoute(request.uri.path, 1, "/events/publish")) return null;
+
+    if (!cfg.sse_enabled) {
+        try sendApiError(allocator, writer, .not_found, "invalid_request", "Not Found", correlation_id, keep_alive, state);
+        state.metricsRecord(404);
+        return 404;
+    }
+    const auth_result = authorizeRequest(cfg, &request.headers);
+    if (!auth_result.ok) {
+        try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, keep_alive, state);
+        state.metricsRecord(401);
+        return 401;
+    }
+    ctx.setIdentity(auth_result.token_hash orelse "-");
+
+    const topic = parseQueryParam(request.uri.query, "topic") orelse "default";
+    const payload = request.body orelse "";
+    const event_id = try state.event_hub.publish(topic, payload, http.event_loop.monotonicMs());
+    const body = try std.fmt.allocPrint(allocator, "{{\"topic\":\"{s}\",\"id\":{d}}}", .{ topic, event_id });
+    defer allocator.free(body);
+    var response = http.Response.json(allocator, body);
+    defer response.deinit();
+    _ = response.setStatus(.accepted)
+        .setConnection(keep_alive)
+        .setHeader(http.correlation.HEADER_NAME, correlation_id);
     applyResponseHeaders(state, &response);
     try response.write(writer);
-    state.metricsRecord(200);
-    return 200;
+    state.metricsRecord(202);
+    return 202;
+}
+
+fn handleBuiltinApiTailHttp1(
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    cfg: *const edge_config.EdgeConfig,
+    state: *GatewayState,
+    ctx: *http.request_context.RequestContext,
+    request: *const http.Request,
+    correlation_id: []const u8,
+    keep_alive: bool,
+    client_ip: []const u8,
+) !?u16 {
+    const matched_route: ?http.location_router.BuiltinRoute =
+        if (http.api_router.matchRoute(request.uri.path, 1, "/devices/register"))
+            .v1_devices_register
+        else if (http.api_router.matchRoute(request.uri.path, 1, "/sessions/refresh"))
+            .v1_sessions_refresh
+        else if (http.api_router.matchRoute(request.uri.path, 1, "/sessions"))
+            .v1_sessions
+        else if (http.api_router.matchRoute(request.uri.path, 1, "/cache/purge"))
+            .v1_cache_purge
+        else if (http.api_router.matchRoute(request.uri.path, 1, "/commands/status"))
+            .v1_commands_status
+        else if (http.api_router.matchRoute(request.uri.path, 1, "/approvals/request"))
+            .v1_approvals_request
+        else if (http.api_router.matchRoute(request.uri.path, 1, "/approvals/respond"))
+            .v1_approvals_respond
+        else if (http.api_router.matchRoute(request.uri.path, 1, "/approvals/status"))
+            .v1_approvals_status
+        else
+            null;
+
+    if (matched_route) |route| {
+        return try dispatchBuiltinRouteHttp1(allocator, writer, cfg, state, ctx, request, correlation_id, keep_alive, client_ip, route);
+    }
+    return null;
+}
+
+fn handleBackendProtocolTail(
+    conn: anytype,
+    allocator: std.mem.Allocator,
+    cfg: *const edge_config.EdgeConfig,
+    state: *GatewayState,
+    ctx: *http.request_context.RequestContext,
+    request: *const http.Request,
+    correlation_id: []const u8,
+    client_ip: []const u8,
+    keep_alive: bool,
+) !?u16 {
+    const writer = conn.writer();
+
+    if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/subrequest")) {
+        const auth_result = authorizeRequest(cfg, &request.headers);
+        if (!auth_result.ok) {
+            try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, keep_alive, state);
+            return 401;
+        }
+        ctx.setIdentity(auth_result.token_hash orelse "-");
+        const body = request.body orelse "";
+        const sub = parseSubrequestPayload(allocator, body) catch {
+            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Invalid subrequest payload", correlation_id, keep_alive, state);
+            return 400;
+        };
+        defer {
+            allocator.free(sub.url);
+            if (sub.body) |b| allocator.free(b);
+        }
+        const out = executeSubrequest(allocator, sub.url, sub.method, sub.body) catch |err| {
+            state.logger.warn(correlation_id, "subrequest failed: {}", .{err});
+            try sendApiError(allocator, writer, .bad_gateway, "tool_unavailable", "Subrequest failed", correlation_id, keep_alive, state);
+            return 502;
+        };
+        defer allocator.free(out.body);
+        var response = http.Response.init(allocator);
+        defer response.deinit();
+        _ = response.setStatus(@enumFromInt(out.status))
+            .setBody(out.body)
+            .setContentType(out.content_type)
+            .setConnection(keep_alive)
+            .setHeader(http.correlation.HEADER_NAME, correlation_id);
+        applyResponseHeaders(state, &response);
+        try response.write(writer);
+        state.metricsRecord(out.status);
+        return out.status;
+    }
+
+    if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/backend/fastcgi")) {
+        return try handleFastcgiRoute(allocator, writer, cfg, cfg.fastcgi_upstream, request, client_ip, correlation_id, keep_alive, state);
+    }
+    if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/backend/uwsgi")) {
+        return try handleUwsgiRoute(allocator, writer, cfg, cfg.uwsgi_upstream, request, client_ip, correlation_id, keep_alive, state);
+    }
+    if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/backend/scgi")) {
+        return try handleScgiRoute(allocator, writer, cfg, cfg.scgi_upstream, request, client_ip, correlation_id, keep_alive, state);
+    }
+    if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/backend/grpc")) {
+        const upstream = std.mem.trim(u8, cfg.grpc_upstream, " \t\r\n");
+        if (upstream.len == 0) {
+            try sendApiError(allocator, writer, .not_implemented, "tool_unavailable", "gRPC upstream not configured", correlation_id, keep_alive, state);
+            return 501;
+        }
+        const body = request.body orelse "";
+        const grpc_resp = proxyGrpcExecute(allocator, upstream, body, correlation_id, state) catch |err| {
+            state.logger.warn(correlation_id, "grpc proxy failed: {}", .{err});
+            try sendApiError(allocator, writer, .bad_gateway, "tool_unavailable", "gRPC proxy failed", correlation_id, keep_alive, state);
+            return 502;
+        };
+        defer allocator.free(grpc_resp);
+        var response = http.Response.init(allocator);
+        defer response.deinit();
+        _ = response.setStatus(.ok)
+            .setBody(grpc_resp)
+            .setContentType("application/grpc")
+            .setConnection(keep_alive)
+            .setHeader(http.correlation.HEADER_NAME, correlation_id);
+        applyResponseHeaders(state, &response);
+        try response.write(writer);
+        state.metricsRecord(200);
+        return 200;
+    }
+    if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/backend/memcached")) {
+        const ep = std.mem.trim(u8, cfg.memcached_upstream, " \t\r\n");
+        if (ep.len == 0) {
+            try sendApiError(allocator, writer, .not_implemented, "tool_unavailable", "Memcached upstream not configured", correlation_id, keep_alive, state);
+            return 501;
+        }
+        const payload = request.body orelse "";
+        const parsed = parseMemcachedPayload(allocator, payload) catch {
+            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Invalid memcached payload", correlation_id, keep_alive, state);
+            return 400;
+        };
+        defer {
+            allocator.free(parsed.op);
+            allocator.free(parsed.key);
+            if (parsed.value) |v| allocator.free(v);
+        }
+        if (std.ascii.eqlIgnoreCase(parsed.op, "get")) {
+            const body = blk: {
+                const value = http.memcached.get(allocator, ep, parsed.key) catch null;
+                defer if (value) |v| allocator.free(v);
+                break :blk if (value) |v|
+                    try std.fmt.allocPrint(allocator, "{{\"value\":{s}}}", .{std.json.fmt(v, .{})})
+                else
+                    try allocator.dupe(u8, "{\"value\":null}");
+            };
+            defer allocator.free(body);
+            var response = http.Response.json(allocator, body);
+            defer response.deinit();
+            _ = response.setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
+            applyResponseHeaders(state, &response);
+            try response.write(writer);
+            state.metricsRecord(200);
+            return 200;
+        }
+        if (std.ascii.eqlIgnoreCase(parsed.op, "set")) {
+            const stored = http.memcached.set(allocator, ep, parsed.key, parsed.value orelse "", parsed.ttl) catch false;
+            var response = http.Response.json(allocator, if (stored) "{\"stored\":true}" else "{\"stored\":false}");
+            defer response.deinit();
+            _ = response.setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
+            applyResponseHeaders(state, &response);
+            try response.write(writer);
+            state.metricsRecord(200);
+            return 200;
+        }
+        try sendApiError(allocator, writer, .bad_request, "invalid_request", "Unsupported memcached operation", correlation_id, keep_alive, state);
+        return 400;
+    }
+
+    if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/mail/smtp")) {
+        try handleMailProxyRoute(allocator, writer, cfg.smtp_upstream, request.body orelse "", correlation_id, keep_alive, state);
+        return 200;
+    }
+    if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/mail/imap")) {
+        try handleMailProxyRoute(allocator, writer, cfg.imap_upstream, request.body orelse "", correlation_id, keep_alive, state);
+        return 200;
+    }
+    if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/mail/pop3")) {
+        try handleMailProxyRoute(allocator, writer, cfg.pop3_upstream, request.body orelse "", correlation_id, keep_alive, state);
+        return 200;
+    }
+    if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/stream/tcp")) {
+        try handleMailProxyRoute(allocator, writer, cfg.tcp_proxy_upstream, request.body orelse "", correlation_id, keep_alive, state);
+        return 200;
+    }
+    if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/stream/udp")) {
+        const upstream = std.mem.trim(u8, cfg.udp_proxy_upstream, " \t\r\n");
+        if (upstream.len == 0) {
+            try sendApiError(allocator, writer, .not_implemented, "tool_unavailable", "UDP upstream not configured", correlation_id, keep_alive, state);
+            return 501;
+        }
+        const udp_resp = executeUdpDatagramRequest(allocator, upstream, request.body orelse "") catch |err| {
+            state.logger.warn(correlation_id, "udp stream proxy failed: {}", .{err});
+            try sendApiError(allocator, writer, .bad_gateway, "tool_unavailable", "UDP proxy failed", correlation_id, keep_alive, state);
+            return 502;
+        };
+        defer allocator.free(udp_resp);
+        var response = http.Response.init(allocator);
+        defer response.deinit();
+        _ = response.setStatus(.ok)
+            .setBody(udp_resp)
+            .setContentType("application/octet-stream")
+            .setConnection(keep_alive)
+            .setHeader(http.correlation.HEADER_NAME, correlation_id)
+            .setHeader("X-Stream-SSL-Termination", if (cfg.stream_ssl_termination) "enabled" else "disabled");
+        applyResponseHeaders(state, &response);
+        try response.write(writer);
+        state.metricsRecord(200);
+        return 200;
+    }
+
+    return null;
+}
+
+fn handlePrimaryApiTailHttp1(
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    cfg: *const edge_config.EdgeConfig,
+    state: *GatewayState,
+    ctx: *http.request_context.RequestContext,
+    request: *const http.Request,
+    correlation_id: []const u8,
+    keep_alive: bool,
+    client_ip: []const u8,
+) !?u16 {
+    const matched_route: ?http.location_router.BuiltinRoute =
+        if (http.api_router.matchRoute(request.uri.path, 1, "/commands"))
+            .v1_commands
+        else if (http.api_router.matchRoute(request.uri.path, 1, "/chat"))
+            .v1_chat
+        else
+            null;
+
+    if (matched_route) |route| {
+        return try dispatchBuiltinRouteHttp1(allocator, writer, cfg, state, ctx, request, correlation_id, keep_alive, client_ip, route);
+    }
+    return null;
 }
 
 fn handleWebSocketProxyLoop(
@@ -7108,7 +6824,6 @@ fn handleUwsgiRoute(
     return uwsgi.status;
 }
 
-
 fn proxyGrpcExecute(
     allocator: std.mem.Allocator,
     upstream_url: []const u8,
@@ -7457,9 +7172,166 @@ fn dispatchBuiltinRouteHttp3(
             ctx.state.metricsRecord(200);
             return true;
         },
-        .v1_chat,
-        .v1_commands,
-        => return false,
+        .v1_chat => {
+            if (!std.mem.eql(u8, request.method, "POST")) return false;
+            var prep = prepareChatRequest(allocator, ctx.cfg, ctx.state, &request.headers, request.body) catch |err| {
+                const desc = describeChatPrepError(err);
+                const payload = try buildApiErrorJson(allocator, desc.code, desc.message, correlation_id);
+                _ = response
+                    .setStatus(desc.status)
+                    .setBodyOwned(payload)
+                    .setContentType("application/json")
+                    .setHeader(http.correlation.HEADER_NAME, correlation_id);
+                finalizeHttp3Response(response);
+                applyResponseHeaders(ctx.state, response);
+                ctx.state.metricsRecord(@intFromEnum(desc.status));
+                return true;
+            };
+            defer prep.deinit(allocator);
+
+            const exec = proxyJsonExecute(
+                allocator,
+                ctx.cfg,
+                .chat,
+                ctx.cfg.proxy_pass_chat,
+                null,
+                prep.upstream_body,
+                correlation_id,
+                "h3",
+                prep.identity.value,
+                null,
+                request.headers.get("host"),
+                request.headers.get("x-forwarded-for"),
+                std.io.null_writer,
+                ctx.state,
+                false,
+            ) catch |err| {
+                const mapped = mapProxyExecutionError(err);
+                const payload = try buildApiErrorJson(allocator, mapped.code, mapped.message, correlation_id);
+                _ = response
+                    .setStatus(mapped.status)
+                    .setBodyOwned(payload)
+                    .setContentType("application/json")
+                    .setHeader(http.correlation.HEADER_NAME, correlation_id);
+                finalizeHttp3Response(response);
+                applyResponseHeaders(ctx.state, response);
+                ctx.state.metricsRecord(@intFromEnum(mapped.status));
+                return true;
+            };
+
+            switch (exec) {
+                .streamed_status => |status| {
+                    _ = response
+                        .setStatus(@enumFromInt(status))
+                        .setBody("")
+                        .setContentType("application/json")
+                        .setHeader(http.correlation.HEADER_NAME, correlation_id);
+                    finalizeHttp3Response(response);
+                    applyResponseHeaders(ctx.state, response);
+                    ctx.state.metricsRecord(status);
+                    return true;
+                },
+                .buffered => |proxy_result| {
+                    var normalized = try normalizeBufferedProxyResult(allocator, correlation_id, proxy_result);
+                    defer normalized.deinit(allocator);
+                    _ = response
+                        .setStatus(@enumFromInt(normalized.status))
+                        .setBodyOwned(try allocator.dupe(u8, normalized.body))
+                        .setContentType(normalized.content_type)
+                        .setHeader(http.correlation.HEADER_NAME, correlation_id);
+                    if (normalized.content_disposition) |cd| {
+                        _ = response.setHeader("Content-Disposition", cd);
+                    }
+                    finalizeHttp3Response(response);
+                    applyResponseHeaders(ctx.state, response);
+                    ctx.state.metricsRecord(normalized.status);
+                    return true;
+                },
+            }
+        },
+        .v1_commands => {
+            if (!std.mem.eql(u8, request.method, "POST")) return false;
+            var prep = prepareCommandRequest(allocator, ctx.cfg, ctx.state, &request.headers, request.body, correlation_id, "h3", null, null) catch |err| {
+                const desc = describeCommandPrepError(err);
+                const payload = try buildApiErrorJson(allocator, desc.code, desc.message, correlation_id);
+                _ = response
+                    .setStatus(desc.status)
+                    .setBodyOwned(payload)
+                    .setContentType("application/json")
+                    .setHeader(http.correlation.HEADER_NAME, correlation_id);
+                finalizeHttp3Response(response);
+                applyResponseHeaders(ctx.state, response);
+                ctx.state.metricsRecord(@intFromEnum(desc.status));
+                return true;
+            };
+            defer prep.deinit(allocator);
+
+            ctx.state.commandLifecycleCreate(prep.command_id, prep.command.command_type.toString(), correlation_id, prep.identity.value) catch {};
+            ctx.state.commandLifecycleSetRunning(prep.command_id);
+
+            const exec = proxyJsonExecute(
+                allocator,
+                ctx.cfg,
+                .commands,
+                ctx.cfg.proxy_pass_commands_prefix,
+                prep.upstream_path,
+                prep.upstream_body,
+                correlation_id,
+                "h3",
+                prep.identity.value,
+                null,
+                request.headers.get("host"),
+                request.headers.get("x-forwarded-for"),
+                std.io.null_writer,
+                ctx.state,
+                false,
+            ) catch |err| {
+                ctx.state.commandLifecycleSetFailed(prep.command_id, @errorName(err));
+                const mapped = mapProxyExecutionError(err);
+                const payload = try buildApiErrorJson(allocator, mapped.code, mapped.message, correlation_id);
+                _ = response
+                    .setStatus(mapped.status)
+                    .setBodyOwned(payload)
+                    .setContentType("application/json")
+                    .setHeader(http.correlation.HEADER_NAME, correlation_id);
+                finalizeHttp3Response(response);
+                applyResponseHeaders(ctx.state, response);
+                ctx.state.metricsRecord(@intFromEnum(mapped.status));
+                return true;
+            };
+
+            switch (exec) {
+                .streamed_status => |status| {
+                    ctx.state.commandLifecycleSetCompleted(prep.command_id, status, "", JSON_CONTENT_TYPE);
+                    _ = response
+                        .setStatus(@enumFromInt(status))
+                        .setBody("")
+                        .setContentType("application/json")
+                        .setHeader(http.correlation.HEADER_NAME, correlation_id);
+                    finalizeHttp3Response(response);
+                    applyResponseHeaders(ctx.state, response);
+                    ctx.state.metricsRecord(status);
+                    return true;
+                },
+                .buffered => |proxy_result| {
+                    var normalized = try normalizeBufferedProxyResult(allocator, correlation_id, proxy_result);
+                    defer normalized.deinit(allocator);
+                    ctx.state.commandLifecycleSetCompleted(prep.command_id, normalized.status, normalized.body, normalized.content_type);
+                    _ = response
+                        .setStatus(@enumFromInt(normalized.status))
+                        .setBodyOwned(try allocator.dupe(u8, normalized.body))
+                        .setContentType(normalized.content_type)
+                        .setHeader(http.correlation.HEADER_NAME, correlation_id);
+                    if (normalized.content_disposition) |cd| {
+                        _ = response.setHeader("Content-Disposition", cd);
+                    }
+                    finalizeHttp3Response(response);
+                    applyResponseHeaders(ctx.state, response);
+                    ctx.state.metricsRecord(normalized.status);
+                    return true;
+                },
+            }
+        },
         .v1_commands_status => {
             if (!std.mem.eql(u8, request.method, "GET")) return false;
             var reply = try handleCommandStatusBuiltin(allocator, ctx.cfg, ctx.state, &request.headers, splitHttp3PathAndQuery(request.path)[1], correlation_id);
@@ -7624,29 +7496,75 @@ fn handleHttp3StaticLocation(
 ) !bool {
     if (!(std.mem.eql(u8, request.method, "GET") or std.mem.eql(u8, request.method, "HEAD"))) return false;
 
-    const rel_path = if (root_cfg.alias)
-        std.mem.trimLeft(u8, request_path[matched.block.pattern.len..], "/")
-    else
-        std.mem.trimLeft(u8, request_path, "/");
-    const suffix = if (rel_path.len == 0 or std.mem.endsWith(u8, request_path, "/")) root_cfg.index else rel_path;
-    const full_path = try std.fs.path.join(allocator, &[_][]const u8{ root_cfg.root, suffix });
-    defer allocator.free(full_path);
-
-    const file_data = std.fs.cwd().readFileAlloc(allocator, full_path, MAX_REQUEST_SIZE) catch {
-        return false;
+    var served = (try http.static_file.serve(allocator, .{
+        .root = root_cfg.root,
+        .request_path = request_path,
+        .matched_pattern = matched.block.pattern,
+        .alias = root_cfg.alias,
+        .index = root_cfg.index,
+        .try_files = root_cfg.try_files,
+        .autoindex = root_cfg.autoindex,
+        .headers = &request.headers,
+        .max_bytes = MAX_REQUEST_SIZE,
+    })) orelse blk: {
+        var error_page = (try maybeResolveStaticErrorPage(allocator, matched, root_cfg, request_path, &request.headers, 404)) orelse return false;
+        switch (error_page) {
+            .redirect => |target| {
+                defer allocator.free(target);
+                _ = response
+                    .setStatus(.found)
+                    .setBody("")
+                    .setContentType("text/plain; charset=utf-8")
+                    .setHeader("Location", target)
+                    .setHeader(http.correlation.HEADER_NAME, correlation_id);
+                finalizeHttp3Response(response);
+                applyResponseHeaders(ctx.state, response);
+                ctx.state.metricsRecord(302);
+                return true;
+            },
+            .served => |*resolved| break :blk resolved.*,
+        }
     };
+    defer served.deinit(allocator);
+
+    if (@intFromEnum(served.status_code) >= 400) {
+        if (try maybeResolveStaticErrorPage(allocator, matched, root_cfg, request_path, &request.headers, @intFromEnum(served.status_code))) |error_page| {
+            switch (error_page) {
+                .redirect => |target| {
+                    defer allocator.free(target);
+                    _ = response
+                        .setStatus(.found)
+                        .setBody("")
+                        .setContentType("text/plain; charset=utf-8")
+                        .setHeader("Location", target)
+                        .setHeader(http.correlation.HEADER_NAME, correlation_id);
+                    finalizeHttp3Response(response);
+                    applyResponseHeaders(ctx.state, response);
+                    ctx.state.metricsRecord(302);
+                    return true;
+                },
+                .served => |replacement| {
+                    served.deinit(allocator);
+                    served = replacement;
+                },
+            }
+        }
+    }
 
     _ = response
-        .setStatus(.ok)
-        .setBodyOwned(if (std.mem.eql(u8, request.method, "HEAD")) blk: {
-            allocator.free(file_data);
-            break :blk try allocator.dupe(u8, "");
-        } else file_data)
-        .setContentType("application/octet-stream")
+        .setStatus(served.status_code)
+        .setBodyOwned(if (std.mem.eql(u8, request.method, "HEAD")) try allocator.dupe(u8, "") else try allocator.dupe(u8, served.body))
+        .setContentType(served.content_type)
         .setHeader(http.correlation.HEADER_NAME, correlation_id);
-    finalizeHttp3Response(response);
+    if (served.etag_value) |etag_value| _ = response.setHeader("ETag", etag_value);
+    if (served.last_modified_value) |last_modified| _ = response.setHeader("Last-Modified", last_modified);
+    if (served.content_range_value) |content_range| _ = response.setHeader("Content-Range", content_range);
+    if (served.accept_ranges) _ = response.setHeader("Accept-Ranges", "bytes");
+    _ = response
+        .setHeader("server", http.SERVER_NAME ++ "/" ++ http.SERVER_VERSION)
+        .setContentLength(served.content_length);
     applyResponseHeaders(ctx.state, response);
-    ctx.state.metricsRecord(200);
+    ctx.state.metricsRecord(@intFromEnum(served.status_code));
     return true;
 }
 
@@ -7845,54 +7763,38 @@ fn handleHttp3Connection(
     }
 
     if (std.mem.eql(u8, request.method, "POST") and http.api_router.matchRoute(http3_path, 1, "/chat")) {
-        var resolved_identity = resolveRequestIdentity(allocator, ctx.cfg, ctx.state, &request.headers) orelse {
-            const payload = try buildApiErrorJson(allocator, "unauthorized", "Unauthorized", correlation_id);
-            _ = response
-                .setStatus(.unauthorized)
-                .setBodyOwned(payload)
-                .setContentType("application/json")
-                .setHeader(http.correlation.HEADER_NAME, correlation_id);
-            finalizeHttp3Response(response);
-            applyResponseHeaders(ctx.state, response);
-            ctx.state.metricsRecord(401);
-            return;
-        };
-        defer resolved_identity.deinit(allocator);
-
-        if (!isJsonContentType(request.headers.get("content-type"))) {
-            const payload = try buildApiErrorJson(allocator, "invalid_request", "Content-Type must be application/json", correlation_id);
-            _ = response
-                .setStatus(.bad_request)
-                .setBodyOwned(payload)
-                .setContentType("application/json")
-                .setHeader(http.correlation.HEADER_NAME, correlation_id);
-            finalizeHttp3Response(response);
-            applyResponseHeaders(ctx.state, response);
-            ctx.state.metricsRecord(400);
-            return;
-        }
-
-        const message = parseChatMessage(allocator, request.body, ctx.cfg.max_message_chars) catch |err| {
-            const msg = switch (err) {
-                error.EmptyMessage => "message must not be empty",
-                error.MessageTooLarge => "message too long",
-                else => "invalid chat payload",
+        var prep = prepareChatRequest(allocator, ctx.cfg, ctx.state, &request.headers, request.body) catch |err| {
+            const payload = try buildApiErrorJson(
+                allocator,
+                switch (err) {
+                    error.Unauthorized => "unauthorized",
+                    else => "invalid_request",
+                },
+                switch (err) {
+                    error.Unauthorized => "Unauthorized",
+                    error.InvalidContentType => "Content-Type must be application/json",
+                    error.MissingBody => "Missing request body",
+                    error.EmptyMessage => "message must not be empty",
+                    error.MessageTooLarge => "message too long",
+                    else => "invalid chat payload",
+                },
+                correlation_id,
+            );
+            const status: http.Status = switch (err) {
+                error.Unauthorized => .unauthorized,
+                else => .bad_request,
             };
-            const payload = try buildApiErrorJson(allocator, "invalid_request", msg, correlation_id);
             _ = response
-                .setStatus(.bad_request)
+                .setStatus(status)
                 .setBodyOwned(payload)
                 .setContentType("application/json")
                 .setHeader(http.correlation.HEADER_NAME, correlation_id);
             finalizeHttp3Response(response);
             applyResponseHeaders(ctx.state, response);
-            ctx.state.metricsRecord(400);
+            ctx.state.metricsRecord(@intFromEnum(status));
             return;
         };
-        defer allocator.free(message);
-
-        const upstream_body = try std.fmt.allocPrint(allocator, "{{\"message\":{s}}}", .{std.json.fmt(message, .{})});
-        defer allocator.free(upstream_body);
+        defer prep.deinit(allocator);
 
         const exec = proxyJsonExecute(
             allocator,
@@ -7900,10 +7802,10 @@ fn handleHttp3Connection(
             .chat,
             ctx.cfg.proxy_pass_chat,
             null,
-            upstream_body,
+            prep.upstream_body,
             correlation_id,
             "h3",
-            resolved_identity.value,
+            prep.identity.value,
             null,
             request.headers.get("host"),
             request.headers.get("x-forwarded-for"),
@@ -7970,95 +7872,56 @@ fn handleHttp3Connection(
     }
 
     if (std.mem.eql(u8, request.method, "POST") and http.api_router.matchRoute(http3_path, 1, "/commands")) {
-        var resolved_identity = resolveRequestIdentity(allocator, ctx.cfg, ctx.state, &request.headers) orelse {
-            const payload = try buildApiErrorJson(allocator, "unauthorized", "Unauthorized", correlation_id);
-            _ = response
-                .setStatus(.unauthorized)
-                .setBodyOwned(payload)
-                .setContentType("application/json")
-                .setHeader(http.correlation.HEADER_NAME, correlation_id);
-            finalizeHttp3Response(response);
-            applyResponseHeaders(ctx.state, response);
-            ctx.state.metricsRecord(401);
-            return;
-        };
-        defer resolved_identity.deinit(allocator);
-
-        if (!isJsonContentType(request.headers.get("content-type"))) {
-            const payload = try buildApiErrorJson(allocator, "invalid_request", "Content-Type must be application/json", correlation_id);
-            _ = response
-                .setStatus(.bad_request)
-                .setBodyOwned(payload)
-                .setContentType("application/json")
-                .setHeader(http.correlation.HEADER_NAME, correlation_id);
-            finalizeHttp3Response(response);
-            applyResponseHeaders(ctx.state, response);
-            ctx.state.metricsRecord(400);
-            return;
-        }
-
-        var cmd = http.command.parseCommand(allocator, request.body) catch |err| {
-            const msg = switch (err) {
-                http.command.ParseError.MissingCommand => "Missing 'command' field",
-                http.command.ParseError.UnknownCommand => "Unknown command type",
-                http.command.ParseError.InvalidParams => "Invalid or missing 'params' object",
-                else => "Invalid command envelope",
+        var prep = prepareCommandRequest(allocator, ctx.cfg, ctx.state, &request.headers, request.body, correlation_id, "h3", null, null) catch |err| {
+            const payload = try buildApiErrorJson(
+                allocator,
+                switch (err) {
+                    error.Unauthorized => "unauthorized",
+                    error.BuildUpstreamFailed => "internal_error",
+                    else => "invalid_request",
+                },
+                switch (err) {
+                    error.Unauthorized => "Unauthorized",
+                    error.InvalidContentType => "Content-Type must be application/json",
+                    error.MissingBody => "Missing request body",
+                    error.MissingCommand => "Missing 'command' field",
+                    error.UnknownCommand => "Unknown command type",
+                    error.InvalidParams => "Invalid or missing 'params' object",
+                    error.BuildUpstreamFailed => "Failed to build upstream request",
+                    else => "Invalid command envelope",
+                },
+                correlation_id,
+            );
+            const status: http.Status = switch (err) {
+                error.Unauthorized => .unauthorized,
+                error.BuildUpstreamFailed => .internal_server_error,
+                else => .bad_request,
             };
-            const payload = try buildApiErrorJson(allocator, "invalid_request", msg, correlation_id);
             _ = response
-                .setStatus(.bad_request)
+                .setStatus(status)
                 .setBodyOwned(payload)
                 .setContentType("application/json")
                 .setHeader(http.correlation.HEADER_NAME, correlation_id);
             finalizeHttp3Response(response);
             applyResponseHeaders(ctx.state, response);
-            ctx.state.metricsRecord(400);
+            ctx.state.metricsRecord(@intFromEnum(status));
             return;
         };
-        defer cmd.deinit(allocator);
-        const command_id = if (cmd.command_id) |cid|
-            try allocator.dupe(u8, cid)
-        else
-            try generateCommandId(allocator);
-        defer allocator.free(command_id);
+        defer prep.deinit(allocator);
 
-        ctx.state.commandLifecycleCreate(command_id, cmd.command_type.toString(), correlation_id, resolved_identity.value) catch {};
-        ctx.state.commandLifecycleSetRunning(command_id);
-
-        const envelope = http.command.buildUpstreamEnvelope(
-            allocator,
-            cmd.command_type,
-            cmd.params_raw,
-            command_id,
-            correlation_id,
-            resolved_identity.value,
-            "h3",
-            null,
-        ) catch {
-            ctx.state.commandLifecycleSetFailed(command_id, "build_upstream_failed");
-            const payload = try buildApiErrorJson(allocator, "internal_error", "Failed to build upstream request", correlation_id);
-            _ = response
-                .setStatus(.internal_server_error)
-                .setBodyOwned(payload)
-                .setContentType("application/json")
-                .setHeader(http.correlation.HEADER_NAME, correlation_id);
-            finalizeHttp3Response(response);
-            applyResponseHeaders(ctx.state, response);
-            ctx.state.metricsRecord(500);
-            return;
-        };
-        defer allocator.free(envelope);
+        ctx.state.commandLifecycleCreate(prep.command_id, prep.command.command_type.toString(), correlation_id, prep.identity.value) catch {};
+        ctx.state.commandLifecycleSetRunning(prep.command_id);
 
         const exec = proxyJsonExecute(
             allocator,
             ctx.cfg,
             .commands,
             ctx.cfg.proxy_pass_commands_prefix,
-            cmd.command_type.upstreamPath(),
-            envelope,
+            prep.upstream_path,
+            prep.upstream_body,
             correlation_id,
             "h3",
-            resolved_identity.value,
+            prep.identity.value,
             null,
             request.headers.get("host"),
             request.headers.get("x-forwarded-for"),
@@ -8066,7 +7929,7 @@ fn handleHttp3Connection(
             ctx.state,
             false,
         ) catch |err| {
-            ctx.state.commandLifecycleSetFailed(command_id, @errorName(err));
+            ctx.state.commandLifecycleSetFailed(prep.command_id, @errorName(err));
             const mapped = mapProxyExecutionError(err);
             const payload = try buildApiErrorJson(allocator, mapped.code, mapped.message, correlation_id);
             _ = response
@@ -8082,7 +7945,7 @@ fn handleHttp3Connection(
 
         switch (exec) {
             .streamed_status => |status| {
-                ctx.state.commandLifecycleSetCompleted(command_id, status, "", JSON_CONTENT_TYPE);
+                ctx.state.commandLifecycleSetCompleted(prep.command_id, status, "", JSON_CONTENT_TYPE);
                 _ = response
                     .setStatus(@enumFromInt(status))
                     .setBody("")
@@ -8100,7 +7963,7 @@ fn handleHttp3Connection(
 
                 if (proxy_result.status != 200) {
                     const mapped = mapUpstreamError(proxy_result.status);
-                    ctx.state.commandLifecycleSetCompleted(command_id, mapped.status, "", JSON_CONTENT_TYPE);
+                    ctx.state.commandLifecycleSetCompleted(prep.command_id, mapped.status, "", JSON_CONTENT_TYPE);
                     const payload = try buildApiErrorJson(allocator, mapped.code, mapped.message, correlation_id);
                     _ = response
                         .setStatus(@enumFromInt(mapped.status))
@@ -8114,7 +7977,7 @@ fn handleHttp3Connection(
                 }
 
                 const body_owned = try allocator.dupe(u8, proxy_result.body);
-                ctx.state.commandLifecycleSetCompleted(command_id, 200, proxy_result.body, proxy_result.content_type);
+                ctx.state.commandLifecycleSetCompleted(prep.command_id, 200, proxy_result.body, proxy_result.content_type);
                 _ = response
                     .setStatus(.ok)
                     .setBodyOwned(body_owned)

@@ -6135,3 +6135,201 @@ test "location block reload takes effect for new requests after sighup" {
     try std.testing.expectEqual(@as(u32, 1), first_upstream.capture.request_count);
     try std.testing.expectEqual(@as(u32, 1), second_upstream.capture.request_count);
 }
+
+// ---------------------------------------------------------------------------
+// Upgrade 12: approval workflow hardening tests
+// ---------------------------------------------------------------------------
+
+test "approval workflow covers request respond status and conflict on double-respond" {
+    const allocator = std.testing.allocator;
+
+    const opts = TardigradeOptions{
+        .upstream_port = null,
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_POLICY_APPROVAL_ROUTES", .value = "POST|/v1/commands" },
+        },
+    };
+    var tardigrade = try TardigradeProcess.start(allocator, opts);
+    defer tardigrade.stop();
+
+    // Unauthenticated request → 401
+    var unauth = try sendRequest(allocator, tardigrade.port, .{
+        .method = "POST",
+        .path = "/v1/approvals/request",
+        .body = "{\"method\":\"POST\",\"path\":\"/v1/commands\"}",
+        .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
+    });
+    defer unauth.deinit();
+    try std.testing.expectEqual(@as(u16, 401), unauth.status_code);
+
+    // Authenticated request → 202 + approval_token
+    var req = try sendRequest(allocator, tardigrade.port, .{
+        .method = "POST",
+        .path = "/v1/approvals/request",
+        .body = "{\"method\":\"POST\",\"path\":\"/v1/commands\",\"command_id\":\"cmd-test-1\"}",
+        .headers = &.{
+            .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
+            .{ .name = "Content-Type", .value = "application/json" },
+        },
+    });
+    defer req.deinit();
+    try std.testing.expectEqual(@as(u16, 202), req.status_code);
+    const token_key = "\"approval_token\":\"";
+    const token_start = std.mem.indexOf(u8, req.body, token_key) orelse return error.MissingApprovalToken;
+    const token_rest = req.body[token_start + token_key.len ..];
+    const token_end = std.mem.indexOfScalar(u8, token_rest, '"') orelse return error.MissingApprovalToken;
+    const approval_token = try allocator.dupe(u8, token_rest[0..token_end]);
+    defer allocator.free(approval_token);
+    try std.testing.expect(approval_token.len > 0);
+
+    // Status check → pending
+    const status_path = try std.fmt.allocPrint(allocator, "/v1/approvals/status?approval_token={s}", .{approval_token});
+    defer allocator.free(status_path);
+    var pending = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = status_path,
+        .body = null,
+        .headers = &.{.{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token }},
+    });
+    defer pending.deinit();
+    try std.testing.expectEqual(@as(u16, 200), pending.status_code);
+    try assertContains(pending.body, "\"status\":\"pending\"");
+
+    // Approve → 200
+    const respond_body = try std.fmt.allocPrint(allocator, "{{\"approval_token\":\"{s}\",\"decision\":\"approve\"}}", .{approval_token});
+    defer allocator.free(respond_body);
+    var respond = try sendRequest(allocator, tardigrade.port, .{
+        .method = "POST",
+        .path = "/v1/approvals/respond",
+        .body = respond_body,
+        .headers = &.{
+            .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
+            .{ .name = "Content-Type", .value = "application/json" },
+        },
+    });
+    defer respond.deinit();
+    try std.testing.expectEqual(@as(u16, 200), respond.status_code);
+    try assertContains(respond.body, "\"status\":\"approved\"");
+
+    // Status check → approved
+    var approved = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = status_path,
+        .body = null,
+        .headers = &.{.{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token }},
+    });
+    defer approved.deinit();
+    try std.testing.expectEqual(@as(u16, 200), approved.status_code);
+    try assertContains(approved.body, "\"status\":\"approved\"");
+
+    // Double-respond → 409 conflict
+    var double_respond = try sendRequest(allocator, tardigrade.port, .{
+        .method = "POST",
+        .path = "/v1/approvals/respond",
+        .body = respond_body,
+        .headers = &.{
+            .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
+            .{ .name = "Content-Type", .value = "application/json" },
+        },
+    });
+    defer double_respond.deinit();
+    try std.testing.expectEqual(@as(u16, 409), double_respond.status_code);
+}
+
+test "approval rate limit returns 429 after max pending for identity" {
+    const allocator = std.testing.allocator;
+
+    const opts = TardigradeOptions{
+        .upstream_port = null,
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_POLICY_APPROVAL_ROUTES", .value = "POST|/v1/commands" },
+            .{ .name = "TARDIGRADE_APPROVAL_MAX_PENDING_PER_IDENTITY", .value = "2" },
+        },
+    };
+    var tardigrade = try TardigradeProcess.start(allocator, opts);
+    defer tardigrade.stop();
+
+    const req_body = "{\"method\":\"POST\",\"path\":\"/v1/commands\"}";
+    const auth_header = RequestHeader{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token };
+    const ct_header = RequestHeader{ .name = "Content-Type", .value = "application/json" };
+
+    // First two approvals succeed
+    var r1 = try sendRequest(allocator, tardigrade.port, .{
+        .method = "POST", .path = "/v1/approvals/request", .body = req_body,
+        .headers = &.{ auth_header, ct_header },
+    });
+    defer r1.deinit();
+    try std.testing.expectEqual(@as(u16, 202), r1.status_code);
+
+    var r2 = try sendRequest(allocator, tardigrade.port, .{
+        .method = "POST", .path = "/v1/approvals/request", .body = req_body,
+        .headers = &.{ auth_header, ct_header },
+    });
+    defer r2.deinit();
+    try std.testing.expectEqual(@as(u16, 202), r2.status_code);
+
+    // Third approval for same identity → 429
+    var r3 = try sendRequest(allocator, tardigrade.port, .{
+        .method = "POST", .path = "/v1/approvals/request", .body = req_body,
+        .headers = &.{ auth_header, ct_header },
+    });
+    defer r3.deinit();
+    try std.testing.expectEqual(@as(u16, 429), r3.status_code);
+    try assertContains(r3.body, "\"code\":\"too_many_requests\"");
+}
+
+test "approval store persists pending entries across server restart" {
+    const allocator = std.testing.allocator;
+
+    // Use a temp file path keyed to this test run.
+    const store_path = try std.fmt.allocPrint(allocator, "/tmp/tardigrade-approval-test-{d}.json", .{std.time.milliTimestamp()});
+    defer allocator.free(store_path);
+    defer std.fs.deleteFileAbsolute(store_path) catch {};
+
+    // First server instance: create an approval.
+    const opts = TardigradeOptions{
+        .upstream_port = null,
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_POLICY_APPROVAL_ROUTES", .value = "POST|/v1/commands" },
+            .{ .name = "TARDIGRADE_APPROVAL_STORE_PATH", .value = store_path },
+        },
+    };
+    var first = try TardigradeProcess.start(allocator, opts);
+
+    var req = try sendRequest(allocator, first.port, .{
+        .method = "POST",
+        .path = "/v1/approvals/request",
+        .body = "{\"method\":\"POST\",\"path\":\"/v1/commands\",\"command_id\":\"persist-cmd\"}",
+        .headers = &.{
+            .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
+            .{ .name = "Content-Type", .value = "application/json" },
+        },
+    });
+    defer req.deinit();
+    try std.testing.expectEqual(@as(u16, 202), req.status_code);
+    const token_key = "\"approval_token\":\"";
+    const token_start = std.mem.indexOf(u8, req.body, token_key) orelse return error.MissingApprovalToken;
+    const token_rest = req.body[token_start + token_key.len ..];
+    const token_end = std.mem.indexOfScalar(u8, token_rest, '"') orelse return error.MissingApprovalToken;
+    const approval_token = try allocator.dupe(u8, token_rest[0..token_end]);
+    defer allocator.free(approval_token);
+
+    // Stop first instance; store file should now exist.
+    first.stop();
+
+    // Second server instance: load store, status should be pending.
+    var second = try TardigradeProcess.start(allocator, opts);
+    defer second.stop();
+
+    const status_path = try std.fmt.allocPrint(allocator, "/v1/approvals/status?approval_token={s}", .{approval_token});
+    defer allocator.free(status_path);
+    var status = try sendRequest(allocator, second.port, .{
+        .method = "GET",
+        .path = status_path,
+        .body = null,
+        .headers = &.{.{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token }},
+    });
+    defer status.deinit();
+    try std.testing.expectEqual(@as(u16, 200), status.status_code);
+    try assertContains(status.body, "\"status\":\"pending\"");
+}

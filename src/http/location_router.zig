@@ -155,19 +155,19 @@ test "exact match beats prefix match" {
     const blocks = [_]LocationBlock{
         .{
             .match_type = .prefix,
-            .pattern = "/heal",
+            .pattern = "/stat",
             .priority = 0,
             .action = .{ .proxy_pass = "" },
         },
         .{
             .match_type = .exact,
-            .pattern = "/health",
+            .pattern = "/status",
             .priority = 1,
             .action = .{ .return_response = .{ .status = 200, .body = "" } },
         },
     };
 
-    const matched = matchLocation("/health", &blocks).?;
+    const matched = matchLocation("/status", &blocks).?;
     try std.testing.expectEqual(@as(usize, 1), matched.index);
 }
 

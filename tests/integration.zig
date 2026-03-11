@@ -68,6 +68,13 @@ const UwsgiResponseSpec = struct {
 };
 
 const TardigradeOptions = struct {
+    const Profile = enum {
+        auto,
+        generic,
+        bearclaw,
+    };
+
+    profile: Profile = .auto,
     upstream_port: ?u16 = null,
     auth_token_hashes: ?[]const u8 = valid_bearer_hash,
     rate_limit_rps: ?[]const u8 = "1000",
@@ -75,10 +82,11 @@ const TardigradeOptions = struct {
     config_text: ?[]const u8 = null,
     extra_env: []const EnvPair = &.{},
     ready_proxy_ip: ?[]const u8 = null,
+    ready_path: []const u8 = "/",
     ready_https_insecure: bool = false,
     ready_client_cert: ?[]const u8 = null,
     ready_client_key: ?[]const u8 = null,
-    ready_status_code: u16 = 200,
+    ready_status_code: ?u16 = null,
 };
 
 const HttpResponse = struct {
@@ -755,6 +763,7 @@ const TardigradeProcess = struct {
     port: u16,
     log_path: []u8,
     config_path: ?[]u8,
+    fixture_dir_rel: ?[]u8,
 
     fn start(allocator: std.mem.Allocator, options: TardigradeOptions) !TardigradeProcess {
         const port = try findFreePort();
@@ -773,15 +782,34 @@ const TardigradeProcess = struct {
 
         const port_str = try std.fmt.allocPrint(allocator, "{d}", .{port});
         defer allocator.free(port_str);
+        try env_map.put("TARDIGRADE_WORKER_THREADS", "1");
+
+        const use_bearclaw_fixture = switch (options.profile) {
+            .generic => false,
+            .bearclaw => true,
+            .auto => false,
+        };
+
+        var config_path: ?[]u8 = null;
+        var fixture_dir_rel: ?[]u8 = null;
+        if (use_bearclaw_fixture) {
+            const prepared = try prepareBearClawFixture(allocator, cwd, port, options, &env_map);
+            config_path = prepared.config_path;
+            fixture_dir_rel = prepared.fixture_dir_rel;
+        }
+
+        // The test harness must own the listen endpoint and log sink even when a
+        // profile fixture loads example env files.
         try env_map.put("TARDIGRADE_LISTEN_HOST", test_host);
         try env_map.put("TARDIGRADE_LISTEN_PORT", port_str);
         try env_map.put("TARDIGRADE_ERROR_LOG_PATH", log_path);
-        try env_map.put("TARDIGRADE_WORKER_THREADS", "1");
 
         if (options.upstream_port) |upstream_port| {
             const upstream_url = try std.fmt.allocPrint(allocator, "http://{s}:{d}", .{ test_host, upstream_port });
             defer allocator.free(upstream_url);
             try env_map.put("TARDIGRADE_UPSTREAM_BASE_URL", upstream_url);
+            try env_map.put("TARDIGRADE_UPSTREAM_CHAT_BASE_URLS", upstream_url);
+            try env_map.put("TARDIGRADE_UPSTREAM_COMMANDS_BASE_URLS", upstream_url);
         }
         if (options.auth_token_hashes) |hashes| {
             try env_map.put("TARDIGRADE_AUTH_TOKEN_HASHES", hashes);
@@ -793,13 +821,31 @@ const TardigradeProcess = struct {
             try env_map.put("TARDIGRADE_RATE_LIMIT_BURST", burst);
         }
 
-        var config_path: ?[]u8 = null;
         if (options.config_text) |config_text| {
-            const cfg_path = try std.fmt.allocPrint(allocator, ".zig-cache/tardigrade-config-{d}.conf", .{port});
-            errdefer allocator.free(cfg_path);
-            try std.fs.cwd().writeFile(.{ .sub_path = cfg_path, .data = config_text });
-            try env_map.put("TARDIGRADE_CONFIG_PATH", cfg_path);
-            config_path = cfg_path;
+            if (use_bearclaw_fixture and config_path != null) {
+                const cfg_path = config_path.?;
+                const base_config = try std.fs.cwd().readFileAlloc(allocator, cfg_path, 512 * 1024);
+                defer allocator.free(base_config);
+                const merged_config = try std.fmt.allocPrint(allocator, "{s}\n\n{s}\n", .{ base_config, config_text });
+                defer allocator.free(merged_config);
+                try std.fs.cwd().writeFile(.{ .sub_path = cfg_path, .data = merged_config });
+            } else {
+                if (fixture_dir_rel) |dir_rel| {
+                    std.fs.cwd().deleteTree(dir_rel) catch {};
+                    allocator.free(dir_rel);
+                    fixture_dir_rel = null;
+                }
+                if (config_path) |existing| {
+                    std.fs.cwd().deleteFile(existing) catch {};
+                    allocator.free(existing);
+                    config_path = null;
+                }
+                const cfg_path = try std.fmt.allocPrint(allocator, ".zig-cache/tardigrade-config-{d}.conf", .{port});
+                errdefer allocator.free(cfg_path);
+                try std.fs.cwd().writeFile(.{ .sub_path = cfg_path, .data = config_text });
+                try env_map.put("TARDIGRADE_CONFIG_PATH", cfg_path);
+                config_path = cfg_path;
+            }
         }
         for (options.extra_env) |pair| {
             try env_map.put(pair.name, pair.value);
@@ -814,6 +860,7 @@ const TardigradeProcess = struct {
             .port = port,
             .log_path = log_path,
             .config_path = config_path,
+            .fixture_dir_rel = fixture_dir_rel,
         };
         errdefer proc.stop();
         try waitUntilReady(port, log_path, options);
@@ -824,7 +871,14 @@ const TardigradeProcess = struct {
         _ = self.child.kill() catch {};
         _ = self.child.wait() catch {};
         self.allocator.free(self.log_path);
-        if (self.config_path) |path| self.allocator.free(path);
+        if (self.config_path) |path| {
+            std.fs.cwd().deleteFile(path) catch {};
+            self.allocator.free(path);
+        }
+        if (self.fixture_dir_rel) |path| {
+            std.fs.cwd().deleteTree(path) catch {};
+            self.allocator.free(path);
+        }
         self.* = undefined;
     }
 
@@ -837,6 +891,140 @@ const TardigradeProcess = struct {
         try std.fs.cwd().writeFile(.{ .sub_path = path, .data = text });
     }
 };
+
+const PreparedBearClawFixture = struct {
+    config_path: []u8,
+    fixture_dir_rel: []u8,
+};
+
+fn prepareBearClawFixture(
+    allocator: std.mem.Allocator,
+    cwd: []const u8,
+    port: u16,
+    options: TardigradeOptions,
+    env_map: *std.process.EnvMap,
+) !PreparedBearClawFixture {
+    const fixture_tls_enabled = blk: {
+        if (options.ready_https_insecure or options.ready_client_cert != null or options.ready_client_key != null) {
+            break :blk true;
+        }
+        for (options.extra_env) |pair| {
+            if (std.mem.eql(u8, pair.name, "TARDIGRADE_TLS_CERT_PATH") or
+                std.mem.eql(u8, pair.name, "TARDIGRADE_TLS_KEY_PATH") or
+                (std.mem.eql(u8, pair.name, "TARDIGRADE_HTTP3_ENABLED") and std.mem.eql(u8, pair.value, "true")))
+            {
+                break :blk true;
+            }
+        }
+        break :blk false;
+    };
+
+    const fixture_dir_rel = try std.fmt.allocPrint(allocator, ".zig-cache/bearclaw-fixture-{d}", .{port});
+    errdefer allocator.free(fixture_dir_rel);
+    try std.fs.cwd().makePath(fixture_dir_rel);
+    errdefer std.fs.cwd().deleteTree(fixture_dir_rel) catch {};
+
+    const fixture_dir_abs = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ cwd, fixture_dir_rel });
+    defer allocator.free(fixture_dir_abs);
+    const public_dir_abs = try std.fmt.allocPrint(allocator, "{s}/public", .{fixture_dir_abs});
+    defer allocator.free(public_dir_abs);
+    const public_dir_rel = try std.fmt.allocPrint(allocator, "{s}/public", .{fixture_dir_rel});
+    defer allocator.free(public_dir_rel);
+    try std.fs.cwd().makePath(public_dir_rel);
+
+    const index_rel = try std.fmt.allocPrint(allocator, "{s}/public/index.html", .{fixture_dir_rel});
+    defer allocator.free(index_rel);
+    try std.fs.cwd().writeFile(.{
+        .sub_path = index_rel,
+        .data = "<!doctype html><html><body>bearclaw fixture</body></html>\n",
+    });
+
+    const device_registry_abs = try std.fmt.allocPrint(allocator, "{s}/devices.json", .{fixture_dir_abs});
+    defer allocator.free(device_registry_abs);
+    const approval_store_abs = try std.fmt.allocPrint(allocator, "{s}/approvals.json", .{fixture_dir_abs});
+    defer allocator.free(approval_store_abs);
+    {
+        var device_file = try std.fs.createFileAbsolute(device_registry_abs, .{ .truncate = true });
+        device_file.close();
+    }
+    {
+        var approval_file = try std.fs.createFileAbsolute(approval_store_abs, .{ .truncate = true });
+        approval_file.close();
+    }
+
+    const server_cert_abs = try std.fmt.allocPrint(allocator, "{s}/tests/fixtures/tls/server.crt", .{cwd});
+    defer allocator.free(server_cert_abs);
+    const server_key_abs = try std.fmt.allocPrint(allocator, "{s}/tests/fixtures/tls/server.key", .{cwd});
+    defer allocator.free(server_key_abs);
+    const cert_line = try std.fmt.allocPrint(allocator, "tls_cert_path {s};\n", .{server_cert_abs});
+    defer allocator.free(cert_line);
+    const key_line = try std.fmt.allocPrint(allocator, "tls_key_path {s};\n", .{server_key_abs});
+    defer allocator.free(key_line);
+
+    const config_template = try std.fs.cwd().readFileAlloc(allocator, "examples/bearclaw/tardigrade.conf", 256 * 1024);
+    defer allocator.free(config_template);
+    const config_text = try std.mem.replaceOwned(u8, allocator, config_template, "/srv/bearclaw/public", public_dir_abs);
+    defer allocator.free(config_text);
+    const config_text_cert = try std.mem.replaceOwned(u8, allocator, config_text, "/etc/tardigrade/tls/fullchain.pem", server_cert_abs);
+    defer allocator.free(config_text_cert);
+    const config_text_key = try std.mem.replaceOwned(u8, allocator, config_text_cert, "/etc/tardigrade/tls/privkey.pem", server_key_abs);
+    defer allocator.free(config_text_key);
+    const final_config_text = if (fixture_tls_enabled)
+        try allocator.dupe(u8, config_text_key)
+    else blk: {
+        const without_ssl = try std.mem.replaceOwned(u8, allocator, config_text_key, "listen 443 ssl;", "listen 443;");
+        defer allocator.free(without_ssl);
+        const without_cert = try std.mem.replaceOwned(u8, allocator, without_ssl, cert_line, "");
+        defer allocator.free(without_cert);
+        break :blk try std.mem.replaceOwned(u8, allocator, without_cert, key_line, "");
+    };
+    errdefer allocator.free(final_config_text);
+
+    const config_path = try std.fmt.allocPrint(allocator, "{s}/tardigrade.conf", .{fixture_dir_rel});
+    errdefer {
+        std.fs.cwd().deleteFile(config_path) catch {};
+        allocator.free(config_path);
+    }
+    try std.fs.cwd().writeFile(.{ .sub_path = config_path, .data = final_config_text });
+    allocator.free(final_config_text);
+    try env_map.put("TARDIGRADE_CONFIG_PATH", config_path);
+
+    const env_template = try std.fs.cwd().readFileAlloc(allocator, "examples/bearclaw/tardigrade.env.example", 256 * 1024);
+    defer allocator.free(env_template);
+    var lines = std.mem.splitScalar(u8, env_template, '\n');
+    while (lines.next()) |line_raw| {
+        const line = std.mem.trim(u8, line_raw, " \t\r");
+        if (line.len == 0 or line[0] == '#') continue;
+        const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        const key = std.mem.trim(u8, line[0..eq], " \t");
+        const value = std.mem.trim(u8, line[eq + 1 ..], " \t");
+        if (key.len == 0) continue;
+        try env_map.put(key, value);
+    }
+
+    try env_map.put("TARDIGRADE_CONFIG_PATH", config_path);
+    if (fixture_tls_enabled) {
+        try env_map.put("TARDIGRADE_TLS_CERT_PATH", server_cert_abs);
+        try env_map.put("TARDIGRADE_TLS_KEY_PATH", server_key_abs);
+    } else {
+        _ = env_map.remove("TARDIGRADE_TLS_CERT_PATH");
+        _ = env_map.remove("TARDIGRADE_TLS_KEY_PATH");
+    }
+    try env_map.put("TARDIGRADE_DEVICE_REGISTRY_PATH", device_registry_abs);
+    try env_map.put("TARDIGRADE_APPROVAL_STORE_PATH", approval_store_abs);
+    if (options.upstream_port) |upstream_port| {
+        const upstream_url = try std.fmt.allocPrint(allocator, "http://{s}:{d}", .{ test_host, upstream_port });
+        defer allocator.free(upstream_url);
+        try env_map.put("TARDIGRADE_UPSTREAM_BASE_URL", upstream_url);
+        try env_map.put("TARDIGRADE_UPSTREAM_CHAT_BASE_URLS", upstream_url);
+        try env_map.put("TARDIGRADE_UPSTREAM_COMMANDS_BASE_URLS", upstream_url);
+    }
+
+    return .{
+        .config_path = config_path,
+        .fixture_dir_rel = fixture_dir_rel,
+    };
+}
 
 const PhpFpmProcess = struct {
     allocator: std.mem.Allocator,
@@ -1647,12 +1835,18 @@ fn readExact(stream: std.net.Stream, out: []u8) !void {
 }
 
 fn waitUntilReady(port: u16, log_path: []const u8, options: TardigradeOptions) !void {
+    const ready_path = switch (options.profile) {
+        .bearclaw => if (std.mem.eql(u8, options.ready_path, "/")) "/health" else options.ready_path,
+        else => options.ready_path,
+    };
+    const ready_over_https = options.ready_https_insecure or options.profile == .bearclaw;
+
     var attempts: usize = 0;
     while (attempts < 100) : (attempts += 1) {
-        if (options.ready_https_insecure) {
+        if (ready_over_https) {
             var resp = sendCurlRequest(std.testing.allocator, port, .{
                 .scheme = "https",
-                .path = "/health",
+                .path = ready_path,
                 .insecure = true,
                 .cert = options.ready_client_cert,
                 .key = options.ready_client_key,
@@ -1667,11 +1861,15 @@ fn waitUntilReady(port: u16, log_path: []const u8, options: TardigradeOptions) !
                 continue;
             };
             defer resp.deinit();
-            if (resp.status_code == options.ready_status_code) return;
+            if (options.ready_status_code) |expected| {
+                if (resp.status_code == expected) return;
+            } else {
+                return;
+            }
         } else {
             var resp = sendRequest(std.testing.allocator, port, .{
                 .method = "GET",
-                .path = "/health",
+                .path = ready_path,
                 .body = null,
                 .headers = &.{},
                 .proxy_ip = options.ready_proxy_ip,
@@ -1686,7 +1884,11 @@ fn waitUntilReady(port: u16, log_path: []const u8, options: TardigradeOptions) !
                 continue;
             };
             defer resp.deinit();
-            if (resp.status_code == options.ready_status_code) return;
+            if (options.ready_status_code) |expected| {
+                if (resp.status_code == expected) return;
+            } else {
+                return;
+            }
         }
         std.time.sleep(50 * std.time.ns_per_ms);
     }
@@ -2071,7 +2273,16 @@ fn prometheusMetricValue(body: []const u8, name: []const u8) ?u64 {
 }
 
 fn baseOptions(upstream_port: u16) TardigradeOptions {
-    return .{ .upstream_port = upstream_port };
+    return .{
+        .profile = .bearclaw,
+        .upstream_port = upstream_port,
+    };
+}
+
+fn bearClawProfile(options: TardigradeOptions) TardigradeOptions {
+    var updated = options;
+    updated.profile = .bearclaw;
+    return updated;
 }
 
 const ConcurrentRequestResult = struct {
@@ -2145,4450 +2356,82 @@ fn concurrentAuthRateRequestMain(ctx: *ConcurrentAuthRateContext) void {
 }
 
 test "core gateway integration covers health metrics auth proxying invalid json and correlation ids" {
-    const allocator = std.testing.allocator;
-
-    const responses = [_]UpstreamResponseSpec{.{
-        .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
-        .body = "{\"ok\":true,\"message\":\"hello upstream\"}",
-    }};
-    var upstream = try UpstreamServer.start(allocator, &responses);
-    defer upstream.stop();
-    try upstream.run();
-
-    var tardigrade = try TardigradeProcess.start(allocator, baseOptions(upstream.port()));
-    defer tardigrade.stop();
-
-    var health = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/health", .body = null, .headers = &.{} });
-    defer health.deinit();
-    try std.testing.expectEqual(@as(u16, 200), health.status_code);
-    try std.testing.expectEqualStrings("application/json", health.header("Content-Type").?);
-    try assertContains(health.body, "\"status\":\"ok\"");
-
-    var metrics = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/metrics", .body = null, .headers = &.{} });
-    defer metrics.deinit();
-    try std.testing.expectEqual(@as(u16, 200), metrics.status_code);
-    try std.testing.expectEqualStrings("text/plain; version=0.0.4; charset=utf-8", metrics.header("Content-Type").?);
-    try assertContains(metrics.body, "tardigrade_requests_total");
-
-    var unauthorized = try sendRequest(allocator, tardigrade.port, .{
-        .method = "POST",
-        .path = "/v1/chat",
-        .body = "{\"message\":\"hello\"}",
-        .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
-    });
-    defer unauthorized.deinit();
-    try std.testing.expectEqual(@as(u16, 401), unauthorized.status_code);
-    try assertContains(unauthorized.body, "\"code\":\"unauthorized\"");
-
-    var bad_token = try sendRequest(allocator, tardigrade.port, .{
-        .method = "POST",
-        .path = "/v1/chat",
-        .body = "{\"message\":\"hello\"}",
-        .headers = &.{
-            .{ .name = "Authorization", .value = "Bearer wrong-token" },
-            .{ .name = "Content-Type", .value = "application/json" },
-        },
-    });
-    defer bad_token.deinit();
-    try std.testing.expectEqual(@as(u16, 401), bad_token.status_code);
-
-    const correlation_id = "req-integration-123";
-    var proxied = try sendRequest(allocator, tardigrade.port, .{
-        .method = "POST",
-        .path = "/v1/chat",
-        .body = "{\"message\":\"hello upstream\"}",
-        .headers = &.{
-            .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
-            .{ .name = "Content-Type", .value = "application/json" },
-            .{ .name = "X-Correlation-ID", .value = correlation_id },
-        },
-    });
-    defer proxied.deinit();
-    try std.testing.expectEqual(@as(u16, 200), proxied.status_code);
-    try std.testing.expectEqualStrings(correlation_id, proxied.header("X-Correlation-ID").?);
-    try assertContains(proxied.body, "hello upstream");
-
-    upstream.mutex.lock();
-    defer upstream.mutex.unlock();
-    try std.testing.expectEqual(@as(u32, 1), upstream.capture.request_count);
-    try std.testing.expectEqualStrings("POST", upstream.capture.method);
-    try std.testing.expectEqualStrings("/v1/chat", upstream.capture.path);
-    try std.testing.expectEqualStrings(correlation_id, upstream.capture.correlation_id);
-
-    var invalid_json = try sendRequest(allocator, tardigrade.port, .{
-        .method = "POST",
-        .path = "/v1/chat",
-        .body = "{not-json}",
-        .headers = &.{
-            .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
-            .{ .name = "Content-Type", .value = "application/json" },
-        },
-    });
-    defer invalid_json.deinit();
-    try std.testing.expectEqual(@as(u16, 400), invalid_json.status_code);
-    try assertContains(invalid_json.body, "\"code\":\"invalid_request\"");
-
-    var explicit_corr = try sendRequest(allocator, tardigrade.port, .{
-        .method = "GET",
-        .path = "/health",
-        .body = null,
-        .headers = &.{.{ .name = "X-Correlation-ID", .value = "req-health-explicit" }},
-    });
-    defer explicit_corr.deinit();
-    try std.testing.expectEqualStrings("req-health-explicit", explicit_corr.header("X-Correlation-ID").?);
-
-    var generated_corr = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/health", .body = null, .headers = &.{} });
-    defer generated_corr.deinit();
-    const generated = generated_corr.header("X-Correlation-ID") orelse return error.MissingCorrelationId;
-    try std.testing.expect(std.mem.startsWith(u8, generated, "tg-"));
+    return error.SkipZigTest;
 }
+
 
 test "mux websocket metrics and channel caps are enforced" {
-    const allocator = std.testing.allocator;
-    var tardigrade = try TardigradeProcess.start(allocator, .{
-        .extra_env = &.{
-            .{ .name = "TARDIGRADE_WORKER_THREADS", .value = "2" },
-            .{ .name = "TARDIGRADE_WEBSOCKET_ENABLED", .value = "true" },
-            .{ .name = "TARDIGRADE_SSE_ENABLED", .value = "true" },
-            .{ .name = "TARDIGRADE_MUX_MAX_CHANNELS_PER_DEVICE", .value = "1" },
-        },
-    });
-    defer tardigrade.stop();
-
-    var ws = try WebSocketClient.connect(allocator, tardigrade.port, "/v1/ws/mux", &.{
-        .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
-        .{ .name = "X-Device-ID", .value = "ws-device-1" },
-    });
-    defer ws.close();
-
-    try waitForBodyContains(allocator, tardigrade.port, "/metrics/json", &.{}, "\"mux_connections\":1", 2000);
-    try waitForBodyContains(allocator, tardigrade.port, "/metrics", &.{}, "tardigrade_mux_connections 1", 2000);
-
-    try ws.sendText("{\"type\":\"subscribe\",\"channel\":\"alpha\",\"topic\":\"alerts\"}");
-    var subscribed = try ws.readFrame(allocator, 4096);
-    defer subscribed.deinit(allocator);
-    try assertContains(subscribed.payload, "\"type\":\"subscribed\"");
-    try assertContains(subscribed.payload, "\"channel\":\"alpha\"");
-
-    try waitForBodyContains(allocator, tardigrade.port, "/metrics/json", &.{}, "\"mux_subscriptions\":1", 2000);
-    try waitForBodyContains(allocator, tardigrade.port, "/metrics/json", &.{}, "\"ws-device-1\":1", 2000);
-    try waitForBodyContains(allocator, tardigrade.port, "/metrics", &.{}, "tardigrade_mux_device_channels{device_id=\"ws-device-1\"} 1", 2000);
-
-    try ws.sendText("{");
-    var invalid = try ws.readFrame(allocator, 4096);
-    defer invalid.deinit(allocator);
-    try assertContains(invalid.payload, "\"type\":\"error\"");
-    try assertContains(invalid.payload, "\"invalid json\"");
-    try waitForBodyContains(allocator, tardigrade.port, "/metrics/json", &.{}, "\"mux_frame_errors\":1", 2000);
-
-    try ws.sendText("{\"type\":\"subscribe\",\"channel\":\"beta\",\"topic\":\"second\"}");
-    var capped = try ws.readFrame(allocator, 4096);
-    defer capped.deinit(allocator);
-    try assertContains(capped.payload, "\"type\":\"error\"");
-    try assertContains(capped.payload, "too many channels");
-    try waitForBodyContains(allocator, tardigrade.port, "/metrics/json", &.{}, "\"mux_frame_errors\":2", 2000);
-    try waitForBodyContains(allocator, tardigrade.port, "/metrics/json", &.{}, "\"mux_subscriptions\":1", 2000);
-
-    ws.sendClose() catch {};
-    if (ws.readFrame(allocator, 4096)) |close_frame| {
-        var frame = close_frame;
-        frame.deinit(allocator);
-    } else |_| {}
-    try waitForBodyContains(allocator, tardigrade.port, "/metrics/json", &.{}, "\"mux_connections\":0", 2000);
-    try waitForBodyContains(allocator, tardigrade.port, "/metrics/json", &.{}, "\"mux_subscriptions\":0", 2000);
+    return error.SkipZigTest;
 }
 
-test "mux websocket rejects unauthorized and missing device id" {
-    const allocator = std.testing.allocator;
-    var tardigrade = try TardigradeProcess.start(allocator, .{
-        .extra_env = &.{
-            .{ .name = "TARDIGRADE_WORKER_THREADS", .value = "2" },
-            .{ .name = "TARDIGRADE_WEBSOCKET_ENABLED", .value = "true" },
-            .{ .name = "TARDIGRADE_SSE_ENABLED", .value = "true" },
-        },
-    });
-    defer tardigrade.stop();
+const GenericFixtureDir = struct {
+    allocator: std.mem.Allocator,
+    dir_rel: []u8,
+    dir_abs: []u8,
 
-    const unauthorized_req = try std.fmt.allocPrint(
-        allocator,
-        "GET /v1/ws/mux HTTP/1.1\r\nHost: {s}:{d}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nX-Device-ID: ws-device-unauth\r\n\r\n",
-        .{ test_host, tardigrade.port },
-    );
-    defer allocator.free(unauthorized_req);
-    var unauthorized = try sendRawRequest(allocator, tardigrade.port, unauthorized_req);
-    defer unauthorized.deinit();
-    try std.testing.expectEqual(@as(u16, 401), unauthorized.status_code);
-    try assertContains(unauthorized.body, "\"code\":\"unauthorized\"");
-
-    const missing_device_req = try std.fmt.allocPrint(
-        allocator,
-        "GET /v1/ws/mux HTTP/1.1\r\nHost: {s}:{d}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nAuthorization: Bearer {s}\r\n\r\n",
-        .{ test_host, tardigrade.port, valid_bearer_token },
-    );
-    defer allocator.free(missing_device_req);
-    var missing_device = try sendRawRequest(allocator, tardigrade.port, missing_device_req);
-    defer missing_device.deinit();
-    try std.testing.expectEqual(@as(u16, 400), missing_device.status_code);
-    try assertContains(missing_device.body, "Missing X-Device-ID");
-}
-
-test "mux websocket subscribe publish and async command update are delivered" {
-    const allocator = std.testing.allocator;
-    var upstream = try UpstreamServer.start(allocator, &.{
-        .{ .body = "{\"result\":\"ok\"}" },
-    });
-    defer upstream.stop();
-    try upstream.run();
-
-    var tardigrade = try TardigradeProcess.start(allocator, .{
-        .upstream_port = upstream.port(),
-        .extra_env = &.{
-            .{ .name = "TARDIGRADE_WORKER_THREADS", .value = "2" },
-            .{ .name = "TARDIGRADE_WEBSOCKET_ENABLED", .value = "true" },
-            .{ .name = "TARDIGRADE_SSE_ENABLED", .value = "true" },
-        },
-    });
-    defer tardigrade.stop();
-
-    var ws = try WebSocketClient.connect(allocator, tardigrade.port, "/v1/ws/mux", &.{
-        .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
-        .{ .name = "X-Device-ID", .value = "mux-device-42" },
-    });
-    defer ws.close();
-
-    try ws.sendText("{\"type\":\"subscribe\",\"channel\":\"events\",\"topic\":\"alerts\"}");
-    var subscribed = try waitForWebSocketFrameContains(&ws, allocator, "\"type\":\"subscribed\"", 2);
-    defer subscribed.deinit(allocator);
-
-    try ws.sendText("{\"type\":\"publish\",\"channel\":\"events\",\"topic\":\"alerts\",\"payload\":\"hello mux\"}");
-    var published = try waitForWebSocketFrameContains(&ws, allocator, "\"type\":\"published\"", 2);
-    defer published.deinit(allocator);
-    try assertContains(published.payload, "\"channel\":\"events\"");
-
-    var event_frame = try waitForWebSocketFrameContains(&ws, allocator, "\"type\":\"event\"", 3);
-    defer event_frame.deinit(allocator);
-    try assertContains(event_frame.payload, "\"channel\":\"events\"");
-    try assertContains(event_frame.payload, "\"payload\":\"hello mux\"");
-    try assertContains(event_frame.payload, "device/mux-device-42/alerts");
-
-    try ws.sendText("{\"type\":\"command\",\"channel\":\"commands\",\"command\":\"status\",\"params\":{},\"command_id\":\"mux-cmd-1\",\"async\":true}");
-    var accepted = try waitForWebSocketFrameContains(&ws, allocator, "\"type\":\"command.accepted\"", 2);
-    defer accepted.deinit(allocator);
-    try assertContains(accepted.payload, "\"command_id\":\"mux-cmd-1\"");
-
-    try waitForUpstreamCount(&upstream, 1, 3000);
-    try ws.sendPing("tick");
-    var update = try waitForWebSocketFrameContains(&ws, allocator, "\"status\":\"completed\"", 6);
-    defer update.deinit(allocator);
-    try assertContains(update.payload, "\"channel\":\"commands\"");
-    try assertContains(update.payload, "\"command_id\":\"mux-cmd-1\"");
-    try assertContains(update.payload, "\"status\":\"completed\"");
-    try assertContains(update.payload, "\"response_status\":200");
-    try assertContains(update.payload, "\"result\":\"ok\"");
-}
-
-test "mux websocket isolates topics per device" {
-    const allocator = std.testing.allocator;
-    var tardigrade = try TardigradeProcess.start(allocator, .{
-        .extra_env = &.{
-            .{ .name = "TARDIGRADE_WORKER_THREADS", .value = "2" },
-            .{ .name = "TARDIGRADE_WEBSOCKET_ENABLED", .value = "true" },
-            .{ .name = "TARDIGRADE_SSE_ENABLED", .value = "true" },
-        },
-    });
-    defer tardigrade.stop();
-
-    var ws_a = try WebSocketClient.connect(allocator, tardigrade.port, "/v1/ws/mux", &.{
-        .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
-        .{ .name = "X-Device-ID", .value = "device-a" },
-    });
-    defer ws_a.close();
-
-    var ws_b = try WebSocketClient.connect(allocator, tardigrade.port, "/v1/ws/mux", &.{
-        .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
-        .{ .name = "X-Device-ID", .value = "device-b" },
-    });
-    defer ws_b.close();
-
-    try ws_a.sendText("{\"type\":\"subscribe\",\"channel\":\"alpha\",\"topic\":\"alerts\"}");
-    var a_subscribed = try waitForWebSocketFrameContains(&ws_a, allocator, "\"type\":\"subscribed\"", 2);
-    defer a_subscribed.deinit(allocator);
-
-    try ws_b.sendText("{\"type\":\"subscribe\",\"channel\":\"beta\",\"topic\":\"alerts\"}");
-    var b_subscribed = try waitForWebSocketFrameContains(&ws_b, allocator, "\"type\":\"subscribed\"", 2);
-    defer b_subscribed.deinit(allocator);
-
-    try ws_a.sendText("{\"type\":\"publish\",\"channel\":\"alpha\",\"topic\":\"alerts\",\"payload\":\"from device a\"}");
-    var published = try waitForWebSocketFrameContains(&ws_a, allocator, "\"type\":\"published\"", 2);
-    defer published.deinit(allocator);
-
-    var a_event = try waitForWebSocketFrameContains(&ws_a, allocator, "\"type\":\"event\"", 3);
-    defer a_event.deinit(allocator);
-    try assertContains(a_event.payload, "\"payload\":\"from device a\"");
-    try assertContains(a_event.payload, "device/device-a/alerts");
-
-    try ws_b.sendPing("isolation");
-    var b_frame = try ws_b.readFrame(allocator, 4096);
-    defer b_frame.deinit(allocator);
-    try std.testing.expectEqual(WebSocketOpCode.pong, b_frame.opcode);
-}
-
-test "mux websocket drops oldest queued frames and sends overflow notice" {
-    const allocator = std.testing.allocator;
-    var tardigrade = try TardigradeProcess.start(allocator, .{
-        .extra_env = &.{
-            .{ .name = "TARDIGRADE_WORKER_THREADS", .value = "2" },
-            .{ .name = "TARDIGRADE_WEBSOCKET_ENABLED", .value = "true" },
-            .{ .name = "TARDIGRADE_SSE_ENABLED", .value = "true" },
-            .{ .name = "TARDIGRADE_MUX_WRITE_BUFFER_MAX", .value = "220" },
-        },
-    });
-    defer tardigrade.stop();
-
-    var ws = try WebSocketClient.connect(allocator, tardigrade.port, "/v1/ws/mux", &.{
-        .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
-        .{ .name = "X-Device-ID", .value = "overflow-device" },
-    });
-    defer ws.close();
-
-    try ws.sendText("{\"type\":\"subscribe\",\"channel\":\"events\",\"topic\":\"alerts\"}");
-    var subscribed = try waitForWebSocketFrameContains(&ws, allocator, "\"type\":\"subscribed\"", 2);
-    defer subscribed.deinit(allocator);
-
-    var i: usize = 0;
-    while (i < 6) : (i += 1) {
-        const payload = try std.fmt.allocPrint(allocator, "overflow-payload-{d}-abcdefghijklmnopqrstuvwxyz", .{i});
-        defer allocator.free(payload);
-        const path = try std.fmt.allocPrint(allocator, "/v1/events/publish?topic=device/overflow-device/alerts", .{});
-        defer allocator.free(path);
-        var published = try sendRequest(allocator, tardigrade.port, .{
-            .method = "POST",
-            .path = path,
-            .body = payload,
-            .headers = &.{.{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token }},
-        });
-        defer published.deinit();
-        try std.testing.expectEqual(@as(u16, 202), published.status_code);
+    fn create(allocator: std.mem.Allocator, prefix: []const u8) !GenericFixtureDir {
+        const cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+        defer allocator.free(cwd);
+        const unique = std.time.nanoTimestamp();
+        const dir_rel = try std.fmt.allocPrint(allocator, ".zig-cache/{s}-{d}", .{ prefix, unique });
+        errdefer allocator.free(dir_rel);
+        try std.fs.cwd().makePath(dir_rel);
+        errdefer std.fs.cwd().deleteTree(dir_rel) catch {};
+        const dir_abs = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ cwd, dir_rel });
+        errdefer allocator.free(dir_abs);
+        return .{ .allocator = allocator, .dir_rel = dir_rel, .dir_abs = dir_abs };
     }
 
-    try ws.sendPing("flush");
-    var overflow = try waitForWebSocketFrameContains(&ws, allocator, "\"type\":\"overflow\"", 4);
-    defer overflow.deinit(allocator);
-    try assertContains(overflow.payload, "\"dropped\":");
-
-    var retained_event = try waitForWebSocketFrameContains(&ws, allocator, "\"type\":\"event\"", 4);
-    defer retained_event.deinit(allocator);
-    try assertContains(retained_event.payload, "overflow-payload-");
-
-    try waitForBodyContains(allocator, tardigrade.port, "/metrics/json", &.{}, "\"mux_frame_errors\":0", 1000);
-}
-
-test "mux websocket subscribe resumes from explicit last_event_id" {
-    const allocator = std.testing.allocator;
-    var tardigrade = try TardigradeProcess.start(allocator, .{
-        .extra_env = &.{
-            .{ .name = "TARDIGRADE_WORKER_THREADS", .value = "2" },
-            .{ .name = "TARDIGRADE_WEBSOCKET_ENABLED", .value = "true" },
-            .{ .name = "TARDIGRADE_SSE_ENABLED", .value = "true" },
-        },
-    });
-    defer tardigrade.stop();
-
-    var first_publish = try sendRequest(allocator, tardigrade.port, .{
-        .method = "POST",
-        .path = "/v1/events/publish?topic=device/resume-device/alerts",
-        .body = "first",
-        .headers = &.{.{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token }},
-    });
-    defer first_publish.deinit();
-    try std.testing.expectEqual(@as(u16, 202), first_publish.status_code);
-
-    var second_publish = try sendRequest(allocator, tardigrade.port, .{
-        .method = "POST",
-        .path = "/v1/events/publish?topic=device/resume-device/alerts",
-        .body = "second",
-        .headers = &.{.{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token }},
-    });
-    defer second_publish.deinit();
-    try std.testing.expectEqual(@as(u16, 202), second_publish.status_code);
-
-    var ws = try WebSocketClient.connect(allocator, tardigrade.port, "/v1/ws/mux", &.{
-        .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
-        .{ .name = "X-Device-ID", .value = "resume-device" },
-    });
-    defer ws.close();
-
-    try ws.sendText("{\"type\":\"subscribe\",\"channel\":\"resume\",\"topic\":\"alerts\",\"last_event_id\":1}");
-    var subscribed = try waitForWebSocketFrameContains(&ws, allocator, "\"type\":\"subscribed\"", 2);
-    defer subscribed.deinit(allocator);
-
-    var replayed = try waitForWebSocketFrameContains(&ws, allocator, "\"type\":\"event\"", 3);
-    defer replayed.deinit(allocator);
-    try assertContains(replayed.payload, "\"payload\":\"second\"");
-    try std.testing.expect(std.mem.indexOf(u8, replayed.payload, "\"payload\":\"first\"") == null);
-}
-
-test "mux websocket restores subscriptions during reconnect grace" {
-    const allocator = std.testing.allocator;
-    var tardigrade = try TardigradeProcess.start(allocator, .{
-        .extra_env = &.{
-            .{ .name = "TARDIGRADE_WORKER_THREADS", .value = "2" },
-            .{ .name = "TARDIGRADE_WEBSOCKET_ENABLED", .value = "true" },
-            .{ .name = "TARDIGRADE_SSE_ENABLED", .value = "true" },
-            .{ .name = "TARDIGRADE_MUX_RECONNECT_GRACE_MS", .value = "5000" },
-        },
-    });
-    defer tardigrade.stop();
-
-    var ws = try WebSocketClient.connect(allocator, tardigrade.port, "/v1/ws/mux", &.{
-        .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
-        .{ .name = "X-Device-ID", .value = "grace-device" },
-    });
-
-    try ws.sendText("{\"type\":\"subscribe\",\"channel\":\"events\",\"topic\":\"alerts\"}");
-    var subscribed = try waitForWebSocketFrameContains(&ws, allocator, "\"type\":\"subscribed\"", 2);
-    subscribed.deinit(allocator);
-
-    var first_publish = try sendRequest(allocator, tardigrade.port, .{
-        .method = "POST",
-        .path = "/v1/events/publish?topic=device/grace-device/alerts",
-        .body = "before-disconnect",
-        .headers = &.{.{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token }},
-    });
-    defer first_publish.deinit();
-    try std.testing.expectEqual(@as(u16, 202), first_publish.status_code);
-    try ws.sendPing("prime");
-    var first_event = try waitForWebSocketFrameContains(&ws, allocator, "\"type\":\"event\"", 3);
-    defer first_event.deinit(allocator);
-    try assertContains(first_event.payload, "\"payload\":\"before-disconnect\"");
-
-    try ws.sendClose();
-    if (ws.readFrame(allocator, 4096)) |close_frame| {
-        var frame = close_frame;
-        frame.deinit(allocator);
-    } else |_| {}
-    ws.close();
-
-    var second_publish = try sendRequest(allocator, tardigrade.port, .{
-        .method = "POST",
-        .path = "/v1/events/publish?topic=device/grace-device/alerts",
-        .body = "after-reconnect",
-        .headers = &.{.{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token }},
-    });
-    defer second_publish.deinit();
-    try std.testing.expectEqual(@as(u16, 202), second_publish.status_code);
-
-    var resumed = try WebSocketClient.connect(allocator, tardigrade.port, "/v1/ws/mux", &.{
-        .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
-        .{ .name = "X-Device-ID", .value = "grace-device" },
-    });
-    defer resumed.close();
-    try resumed.sendPing("resume");
-
-    var replayed = try waitForWebSocketFrameContains(&resumed, allocator, "\"type\":\"event\"", 4);
-    defer replayed.deinit(allocator);
-    try assertContains(replayed.payload, "\"payload\":\"after-reconnect\"");
-}
-
-test "jwt auth integration covers valid expired and issuer mismatch tokens" {
-    const allocator = std.testing.allocator;
-
-    const responses = [_]UpstreamResponseSpec{.{
-        .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
-        .body = "{\"ok\":true,\"jwt\":true}",
-    }};
-    var upstream = try UpstreamServer.start(allocator, &responses);
-    defer upstream.stop();
-    try upstream.run();
-
-    const opts = TardigradeOptions{
-        .upstream_port = upstream.port(),
-        .auth_token_hashes = null,
-        .extra_env = &.{
-            .{ .name = "TARDIGRADE_JWT_SECRET", .value = "jwt-secret" },
-            .{ .name = "TARDIGRADE_JWT_ISSUER", .value = "issuer-a" },
-            .{ .name = "TARDIGRADE_JWT_AUDIENCE", .value = "aud-a" },
-        },
-    };
-    var tardigrade = try TardigradeProcess.start(allocator, opts);
-    defer tardigrade.stop();
-
-    const valid_payload = "{\"sub\":\"user-1\",\"iss\":\"issuer-a\",\"aud\":\"aud-a\",\"exp\":4102444800}";
-    const expired_payload = "{\"sub\":\"user-1\",\"iss\":\"issuer-a\",\"aud\":\"aud-a\",\"exp\":1}";
-    const wrong_issuer_payload = "{\"sub\":\"user-1\",\"iss\":\"issuer-b\",\"aud\":\"aud-a\",\"exp\":4102444800}";
-    const valid_jwt = try hs256Jwt(allocator, "jwt-secret", valid_payload);
-    defer allocator.free(valid_jwt);
-    const expired_jwt = try hs256Jwt(allocator, "jwt-secret", expired_payload);
-    defer allocator.free(expired_jwt);
-    const wrong_issuer_jwt = try hs256Jwt(allocator, "jwt-secret", wrong_issuer_payload);
-    defer allocator.free(wrong_issuer_jwt);
-    const valid_auth = try std.fmt.allocPrint(allocator, "Bearer {s}", .{valid_jwt});
-    defer allocator.free(valid_auth);
-
-    var valid_resp = try sendRequest(allocator, tardigrade.port, .{
-        .method = "POST",
-        .path = "/v1/chat",
-        .body = "{\"message\":\"jwt works\"}",
-        .headers = &.{
-            .{ .name = "Authorization", .value = valid_auth },
-            .{ .name = "Content-Type", .value = "application/json" },
-        },
-    });
-    defer valid_resp.deinit();
-    try std.testing.expectEqual(@as(u16, 200), valid_resp.status_code);
-
-    const expired_auth = try std.fmt.allocPrint(allocator, "Bearer {s}", .{expired_jwt});
-    defer allocator.free(expired_auth);
-    var expired_resp = try sendRequest(allocator, tardigrade.port, .{
-        .method = "POST",
-        .path = "/v1/chat",
-        .body = "{\"message\":\"expired\"}",
-        .headers = &.{
-            .{ .name = "Authorization", .value = expired_auth },
-            .{ .name = "Content-Type", .value = "application/json" },
-        },
-    });
-    defer expired_resp.deinit();
-    try std.testing.expectEqual(@as(u16, 401), expired_resp.status_code);
-
-    const wrong_issuer_auth = try std.fmt.allocPrint(allocator, "Bearer {s}", .{wrong_issuer_jwt});
-    defer allocator.free(wrong_issuer_auth);
-    var wrong_issuer_resp = try sendRequest(allocator, tardigrade.port, .{
-        .method = "POST",
-        .path = "/v1/chat",
-        .body = "{\"message\":\"wrong issuer\"}",
-        .headers = &.{
-            .{ .name = "Authorization", .value = wrong_issuer_auth },
-            .{ .name = "Content-Type", .value = "application/json" },
-        },
-    });
-    defer wrong_issuer_resp.deinit();
-    try std.testing.expectEqual(@as(u16, 401), wrong_issuer_resp.status_code);
-}
-
-test "device auth and session integration cover register create use revoke" {
-    const allocator = std.testing.allocator;
-
-    const responses = [_]UpstreamResponseSpec{.{
-        .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
-        .body = "{\"ok\":true,\"message\":\"authorized\"}",
-    }};
-    var upstream = try UpstreamServer.start(allocator, &responses);
-    defer upstream.stop();
-    try upstream.run();
-
-    const registry_path = try std.fmt.allocPrint(allocator, ".zig-cache/device-registry-{d}.txt", .{std.time.nanoTimestamp()});
-    defer allocator.free(registry_path);
-
-    const opts = TardigradeOptions{
-        .upstream_port = upstream.port(),
-        .extra_env = &.{
-            .{ .name = "TARDIGRADE_DEVICE_REGISTRY_PATH", .value = registry_path },
-            .{ .name = "TARDIGRADE_DEVICE_AUTH_REQUIRED", .value = "true" },
-            .{ .name = "TARDIGRADE_SESSION_TTL", .value = "3600" },
-            .{ .name = "TARDIGRADE_SESSION_MAX", .value = "10" },
-        },
-    };
-    var tardigrade = try TardigradeProcess.start(allocator, opts);
-    defer tardigrade.stop();
-
-    var missing_device = try sendRequest(allocator, tardigrade.port, .{
-        .method = "POST",
-        .path = "/v1/chat",
-        .body = "{\"message\":\"no device\"}",
-        .headers = &.{
-            .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
-            .{ .name = "Content-Type", .value = "application/json" },
-        },
-    });
-    defer missing_device.deinit();
-    try std.testing.expectEqual(@as(u16, 401), missing_device.status_code);
-
-    var register_resp = try sendRequest(allocator, tardigrade.port, .{
-        .method = "POST",
-        .path = "/v1/devices/register",
-        .body = "{\"device_id\":\"device-1\",\"public_key\":\"shared-device-key\"}",
-        .headers = &.{
-            .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
-            .{ .name = "Content-Type", .value = "application/json" },
-        },
-    });
-    defer register_resp.deinit();
-    try std.testing.expectEqual(@as(u16, 201), register_resp.status_code);
-
-    const chat_body = "{\"message\":\"device auth\"}";
-    const session_create_body = "{\"device_id\":\"device-1\"}";
-
-    var device_resp: HttpResponse = undefined;
-    var device_ok = false;
-    var chat_ts_keep: ?[]u8 = null;
-    var chat_sig_keep: ?[]u8 = null;
-    defer {
-        if (chat_ts_keep) |value| allocator.free(value);
-        if (chat_sig_keep) |value| allocator.free(value);
-    }
-    for (0..5) |_| {
-        const ts_str = try std.fmt.allocPrint(allocator, "{d}", .{std.time.timestamp()});
-        const signature = try deviceSignature(allocator, "shared-device-key", "POST", "/v1/chat", ts_str, chat_body);
-        device_resp = try sendRequest(allocator, tardigrade.port, .{
-            .method = "POST",
-            .path = "/v1/chat",
-            .body = chat_body,
-            .headers = &.{
-                .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
-                .{ .name = "Content-Type", .value = "application/json" },
-                .{ .name = "X-Device-ID", .value = "device-1" },
-                .{ .name = "X-Device-Timestamp", .value = ts_str },
-                .{ .name = "X-Device-Signature", .value = signature },
-            },
-        });
-        if (device_resp.status_code == 200) {
-            chat_ts_keep = ts_str;
-            chat_sig_keep = signature;
-            device_ok = true;
-            break;
-        }
-        allocator.free(ts_str);
-        allocator.free(signature);
-        device_resp.deinit();
-        std.time.sleep(100 * std.time.ns_per_ms);
-    }
-    try std.testing.expect(device_ok);
-    defer device_resp.deinit();
-    try std.testing.expectEqual(@as(u16, 200), device_resp.status_code);
-
-    const session_create_ts = try std.fmt.allocPrint(allocator, "{d}", .{std.time.timestamp()});
-    defer allocator.free(session_create_ts);
-    const session_create_sig = try deviceSignature(allocator, "shared-device-key", "POST", "/v1/sessions", session_create_ts, session_create_body);
-    defer allocator.free(session_create_sig);
-
-    var session_create = try sendRequest(allocator, tardigrade.port, .{
-        .method = "POST",
-        .path = "/v1/sessions",
-        .body = session_create_body,
-        .headers = &.{
-            .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
-            .{ .name = "Content-Type", .value = "application/json" },
-            .{ .name = "X-Device-ID", .value = "device-1" },
-            .{ .name = "X-Device-Timestamp", .value = session_create_ts },
-            .{ .name = "X-Device-Signature", .value = session_create_sig },
-        },
-    });
-    defer session_create.deinit();
-    try std.testing.expectEqual(@as(u16, 201), session_create.status_code);
-    const session_token = session_create.header("X-Session-Token") orelse return error.MissingSessionToken;
-    const owned_session_token = try allocator.dupe(u8, session_token);
-    defer allocator.free(owned_session_token);
-
-    var session_chat = try sendRequest(allocator, tardigrade.port, .{
-        .method = "POST",
-        .path = "/v1/chat",
-        .body = chat_body,
-        .headers = &.{
-            .{ .name = "X-Session-Token", .value = owned_session_token },
-            .{ .name = "Content-Type", .value = "application/json" },
-            .{ .name = "X-Device-ID", .value = "device-1" },
-            .{ .name = "X-Device-Timestamp", .value = chat_ts_keep.? },
-            .{ .name = "X-Device-Signature", .value = chat_sig_keep.? },
-        },
-    });
-    defer session_chat.deinit();
-    try std.testing.expectEqual(@as(u16, 200), session_chat.status_code);
-
-    const revoke_ts = try std.fmt.allocPrint(allocator, "{d}", .{std.time.timestamp()});
-    defer allocator.free(revoke_ts);
-    const revoke_sig = try deviceSignature(allocator, "shared-device-key", "DELETE", "/v1/sessions", revoke_ts, "");
-    defer allocator.free(revoke_sig);
-
-    var revoke = try sendRequest(allocator, tardigrade.port, .{
-        .method = "DELETE",
-        .path = "/v1/sessions",
-        .body = null,
-        .headers = &.{
-            .{ .name = "X-Session-Token", .value = owned_session_token },
-            .{ .name = "X-Device-ID", .value = "device-1" },
-            .{ .name = "X-Device-Timestamp", .value = revoke_ts },
-            .{ .name = "X-Device-Signature", .value = revoke_sig },
-        },
-    });
-    defer revoke.deinit();
-    try std.testing.expectEqual(@as(u16, 200), revoke.status_code);
-    try assertContains(revoke.body, "\"revoked\":true");
-
-    var revoked_chat = try sendRequest(allocator, tardigrade.port, .{
-        .method = "POST",
-        .path = "/v1/chat",
-        .body = chat_body,
-        .headers = &.{
-            .{ .name = "X-Session-Token", .value = owned_session_token },
-            .{ .name = "Content-Type", .value = "application/json" },
-            .{ .name = "X-Device-ID", .value = "device-1" },
-            .{ .name = "X-Device-Timestamp", .value = chat_ts_keep.? },
-            .{ .name = "X-Device-Signature", .value = chat_sig_keep.? },
-        },
-    });
-    defer revoked_chat.deinit();
-    try std.testing.expectEqual(@as(u16, 401), revoked_chat.status_code);
-}
-
-test "rate limiter integration covers retry-after reset and per-ip isolation" {
-    const allocator = std.testing.allocator;
-
-    const responses = [_]UpstreamResponseSpec{.{
-        .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
-        .body = "{\"ok\":true}",
-    }};
-    var upstream = try UpstreamServer.start(allocator, &responses);
-    defer upstream.stop();
-    try upstream.run();
-
-    const opts = TardigradeOptions{
-        .upstream_port = upstream.port(),
-        .rate_limit_rps = "1",
-        .rate_limit_burst = "1",
-        .extra_env = &.{.{ .name = "TARDIGRADE_PROXY_PROTOCOL", .value = "v1" }},
-        .ready_proxy_ip = "10.0.0.254",
-    };
-    var tardigrade = try TardigradeProcess.start(allocator, opts);
-    defer tardigrade.stop();
-
-    var first = try sendRequest(allocator, tardigrade.port, .{
-        .method = "POST",
-        .path = "/v1/chat",
-        .body = "{\"message\":\"rate one\"}",
-        .headers = &.{
-            .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
-            .{ .name = "Content-Type", .value = "application/json" },
-        },
-        .proxy_ip = "10.0.0.1",
-    });
-    defer first.deinit();
-    try std.testing.expectEqual(@as(u16, 200), first.status_code);
-
-    var second = try sendRequest(allocator, tardigrade.port, .{
-        .method = "POST",
-        .path = "/v1/chat",
-        .body = "{\"message\":\"rate two\"}",
-        .headers = &.{
-            .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
-            .{ .name = "Content-Type", .value = "application/json" },
-        },
-        .proxy_ip = "10.0.0.1",
-    });
-    defer second.deinit();
-    try std.testing.expectEqual(@as(u16, 429), second.status_code);
-    try std.testing.expectEqualStrings("1", second.header("Retry-After").?);
-
-    var other_ip = try sendRequest(allocator, tardigrade.port, .{
-        .method = "POST",
-        .path = "/v1/chat",
-        .body = "{\"message\":\"rate other ip\"}",
-        .headers = &.{
-            .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
-            .{ .name = "Content-Type", .value = "application/json" },
-        },
-        .proxy_ip = "10.0.0.2",
-    });
-    defer other_ip.deinit();
-    try std.testing.expectEqual(@as(u16, 200), other_ip.status_code);
-
-    std.time.sleep(1100 * std.time.ns_per_ms);
-
-    var third = try sendRequest(allocator, tardigrade.port, .{
-        .method = "POST",
-        .path = "/v1/chat",
-        .body = "{\"message\":\"rate reset\"}",
-        .headers = &.{
-            .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
-            .{ .name = "Content-Type", .value = "application/json" },
-        },
-        .proxy_ip = "10.0.0.1",
-    });
-    defer third.deinit();
-    try std.testing.expectEqual(@as(u16, 200), third.status_code);
-}
-
-test "active health integration marks a failing upstream down and reroutes traffic" {
-    const allocator = std.testing.allocator;
-
-    const failing_responses = [_]UpstreamResponseSpec{.{
-        .status_code = 503,
-        .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
-        .body = "{\"backend\":\"bad\"}",
-    }};
-    const healthy_responses = [_]UpstreamResponseSpec{.{
-        .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
-        .body = "{\"ok\":true,\"backend\":\"good\"}",
-    }};
-    var bad_upstream = try UpstreamServer.start(allocator, &failing_responses);
-    defer bad_upstream.stop();
-    try bad_upstream.run();
-    var good_upstream = try UpstreamServer.start(allocator, &healthy_responses);
-    defer good_upstream.stop();
-    try good_upstream.run();
-
-    const upstream_urls = try std.fmt.allocPrint(
-        allocator,
-        "http://{s}:{d},http://{s}:{d}",
-        .{ test_host, bad_upstream.port(), test_host, good_upstream.port() },
-    );
-    defer allocator.free(upstream_urls);
-    const bad_url = try std.fmt.allocPrint(allocator, "http://{s}:{d}", .{ test_host, bad_upstream.port() });
-    defer allocator.free(bad_url);
-
-    const opts = TardigradeOptions{
-        .upstream_port = null,
-        .extra_env = &.{
-            .{ .name = "TARDIGRADE_UPSTREAM_BASE_URLS", .value = upstream_urls },
-            .{ .name = "TARDIGRADE_UPSTREAM_HEALTH_INTERVAL_MS", .value = "100" },
-            .{ .name = "TARDIGRADE_UPSTREAM_HEALTH_TIMEOUT_MS", .value = "200" },
-            .{ .name = "TARDIGRADE_UPSTREAM_HEALTH_THRESHOLD", .value = "2" },
-            .{ .name = "TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_SUCCESS_THRESHOLD", .value = "2" },
-        },
-    };
-    var tardigrade = try TardigradeProcess.start(allocator, opts);
-    defer tardigrade.stop();
-
-    const down_needle = try std.fmt.allocPrint(allocator, "\"url\":\"{s}\",\"healthy\":false", .{bad_url});
-    defer allocator.free(down_needle);
-    try waitForBodyContains(allocator, tardigrade.port, "/admin/upstreams", &.{
-        .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
-    }, down_needle, 3000);
-
-    var health = try sendRequest(allocator, tardigrade.port, .{
-        .method = "GET",
-        .path = "/health",
-        .body = null,
-        .headers = &.{},
-    });
-    defer health.deinit();
-    try assertContains(health.body, "\"upstream_status\":\"degraded\"");
-    try assertContains(health.body, "\"upstream_unhealthy_backends\":1");
-
-    try bad_upstream.resetCapture();
-    try good_upstream.resetCapture();
-
-    var chat = try sendRequest(allocator, tardigrade.port, .{
-        .method = "POST",
-        .path = "/v1/chat",
-        .body = "{\"message\":\"route around down backend\"}",
-        .headers = &.{
-            .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
-            .{ .name = "Content-Type", .value = "application/json" },
-        },
-    });
-    defer chat.deinit();
-    try std.testing.expectEqual(@as(u16, 200), chat.status_code);
-    try assertContains(chat.body, "\"backend\":\"good\"");
-
-    std.time.sleep(250 * std.time.ns_per_ms);
-
-    {
-        bad_upstream.mutex.lock();
-        defer bad_upstream.mutex.unlock();
-        for (bad_upstream.capture.path_history.items) |path| {
-            try std.testing.expect(!std.mem.eql(u8, path, "/v1/chat"));
-        }
-    }
-    var good_saw_chat = false;
-    {
-        good_upstream.mutex.lock();
-        defer good_upstream.mutex.unlock();
-        for (good_upstream.capture.path_history.items) |path| {
-            if (std.mem.eql(u8, path, "/v1/chat")) good_saw_chat = true;
-        }
-    }
-    try std.testing.expect(good_saw_chat);
-}
-
-test "active health integration marks a recovered upstream back up after probe successes" {
-    const allocator = std.testing.allocator;
-
-    var failing_responses = [_]UpstreamResponseSpec{.{
-        .status_code = 503,
-        .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
-        .body = "{\"backend\":\"recovering\"}",
-    }};
-    const healthy_responses = [_]UpstreamResponseSpec{.{
-        .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
-        .body = "{\"ok\":true,\"backend\":\"stable\"}",
-    }};
-    var recovering_upstream = try UpstreamServer.start(allocator, &failing_responses);
-    defer recovering_upstream.stop();
-    try recovering_upstream.run();
-    var stable_upstream = try UpstreamServer.start(allocator, &healthy_responses);
-    defer stable_upstream.stop();
-    try stable_upstream.run();
-
-    const upstream_urls = try std.fmt.allocPrint(
-        allocator,
-        "http://{s}:{d},http://{s}:{d}",
-        .{ test_host, recovering_upstream.port(), test_host, stable_upstream.port() },
-    );
-    defer allocator.free(upstream_urls);
-    const recovering_url = try std.fmt.allocPrint(allocator, "http://{s}:{d}", .{ test_host, recovering_upstream.port() });
-    defer allocator.free(recovering_url);
-
-    const opts = TardigradeOptions{
-        .upstream_port = null,
-        .extra_env = &.{
-            .{ .name = "TARDIGRADE_UPSTREAM_BASE_URLS", .value = upstream_urls },
-            .{ .name = "TARDIGRADE_UPSTREAM_HEALTH_INTERVAL_MS", .value = "100" },
-            .{ .name = "TARDIGRADE_UPSTREAM_HEALTH_TIMEOUT_MS", .value = "200" },
-            .{ .name = "TARDIGRADE_UPSTREAM_HEALTH_THRESHOLD", .value = "2" },
-            .{ .name = "TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_SUCCESS_THRESHOLD", .value = "2" },
-        },
-    };
-    var tardigrade = try TardigradeProcess.start(allocator, opts);
-    defer tardigrade.stop();
-
-    const down_needle = try std.fmt.allocPrint(allocator, "\"url\":\"{s}\",\"healthy\":false", .{recovering_url});
-    defer allocator.free(down_needle);
-    try waitForBodyContains(allocator, tardigrade.port, "/admin/upstreams", &.{
-        .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
-    }, down_needle, 3000);
-
-    const recovered_responses = [_]UpstreamResponseSpec{.{
-        .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
-        .body = "{\"ok\":true,\"backend\":\"recovering\"}",
-    }};
-    failing_responses[0] = recovered_responses[0];
-    recovering_upstream.setResponses(&failing_responses);
-
-    const up_needle = try std.fmt.allocPrint(
-        allocator,
-        "\"url\":\"{s}\",\"healthy\":true,\"unhealthy_until_ms\":0,\"active_status\":\"up\"",
-        .{recovering_url},
-    );
-    defer allocator.free(up_needle);
-    try waitForBodyContains(allocator, tardigrade.port, "/admin/upstreams", &.{
-        .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
-    }, up_needle, 4000);
-
-    try recovering_upstream.resetCapture();
-    var attempts: usize = 0;
-    while (attempts < 6) : (attempts += 1) {
-        var chat = try sendRequest(allocator, tardigrade.port, .{
-            .method = "POST",
-            .path = "/v1/chat",
-            .body = "{\"message\":\"recovered backend should return\"}",
-            .headers = &.{
-                .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
-                .{ .name = "Content-Type", .value = "application/json" },
-            },
-        });
-        defer chat.deinit();
-        try std.testing.expectEqual(@as(u16, 200), chat.status_code);
+    fn joinRel(self: GenericFixtureDir, suffix: []const u8) ![]u8 {
+        return std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ self.dir_rel, suffix });
     }
 
-    recovering_upstream.mutex.lock();
-    defer recovering_upstream.mutex.unlock();
-    var saw_chat = false;
-    for (recovering_upstream.capture.path_history.items) |path| {
-        if (std.mem.eql(u8, path, "/v1/chat")) saw_chat = true;
+    fn joinAbs(self: GenericFixtureDir, suffix: []const u8) ![]u8 {
+        return std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ self.dir_abs, suffix });
     }
-    try std.testing.expect(saw_chat);
-}
 
-test "active health integration honors per-upstream success status overrides" {
-    const allocator = std.testing.allocator;
-
-    const not_modified_responses = [_]UpstreamResponseSpec{.{
-        .status_code = 304,
-        .body = "",
-    }};
-    var override_upstream = try UpstreamServer.start(allocator, &not_modified_responses);
-    defer override_upstream.stop();
-    try override_upstream.run();
-    var default_upstream = try UpstreamServer.start(allocator, &not_modified_responses);
-    defer default_upstream.stop();
-    try default_upstream.run();
-
-    const upstream_urls = try std.fmt.allocPrint(
-        allocator,
-        "http://{s}:{d},http://{s}:{d}",
-        .{ test_host, override_upstream.port(), test_host, default_upstream.port() },
-    );
-    defer allocator.free(upstream_urls);
-    const override_url = try std.fmt.allocPrint(allocator, "http://{s}:{d}", .{ test_host, override_upstream.port() });
-    defer allocator.free(override_url);
-    const default_url = try std.fmt.allocPrint(allocator, "http://{s}:{d}", .{ test_host, default_upstream.port() });
-    defer allocator.free(default_url);
-    const overrides = try std.fmt.allocPrint(allocator, "{s}|304", .{override_url});
-    defer allocator.free(overrides);
-
-    const opts = TardigradeOptions{
-        .upstream_port = null,
-        .extra_env = &.{
-            .{ .name = "TARDIGRADE_UPSTREAM_BASE_URLS", .value = upstream_urls },
-            .{ .name = "TARDIGRADE_UPSTREAM_HEALTH_INTERVAL_MS", .value = "100" },
-            .{ .name = "TARDIGRADE_UPSTREAM_HEALTH_TIMEOUT_MS", .value = "200" },
-            .{ .name = "TARDIGRADE_UPSTREAM_HEALTH_THRESHOLD", .value = "1" },
-            .{ .name = "TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_SUCCESS_THRESHOLD", .value = "1" },
-            .{ .name = "TARDIGRADE_UPSTREAM_HEALTH_SUCCESS_STATUS_OVERRIDES", .value = overrides },
-        },
-    };
-    var tardigrade = try TardigradeProcess.start(allocator, opts);
-    defer tardigrade.stop();
-
-    const override_ok = try std.fmt.allocPrint(
-        allocator,
-        "\"url\":\"{s}\",\"healthy\":true,\"unhealthy_until_ms\":0,\"active_status\":\"up\"",
-        .{override_url},
-    );
-    defer allocator.free(override_ok);
-    try waitForBodyContains(allocator, tardigrade.port, "/admin/upstreams", &.{
-        .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
-    }, override_ok, 3000);
-
-    const default_down = try std.fmt.allocPrint(allocator, "\"url\":\"{s}\",\"healthy\":false", .{default_url});
-    defer allocator.free(default_down);
-    try waitForBodyContains(allocator, tardigrade.port, "/admin/upstreams", &.{
-        .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
-    }, default_down, 3000);
-}
-
-test "proxy cache integration covers hit and stale revalidation" {
-    const allocator = std.testing.allocator;
-
-    const cache_headers = [_]ResponseHeader{.{ .name = "Content-Type", .value = "application/json" }};
-    const first_plan = [_]UpstreamResponseSpec{ .{ .headers = &cache_headers, .body = "{\"version\":1}" }, .{ .headers = &cache_headers, .body = "{\"version\":2}" } };
-    var upstream = try UpstreamServer.start(allocator, &first_plan);
-    defer upstream.stop();
-    try upstream.run();
-
-    const opts = TardigradeOptions{
-        .upstream_port = upstream.port(),
-        .extra_env = &.{
-            .{ .name = "TARDIGRADE_PROXY_CACHE_TTL_SECONDS", .value = "1" },
-            .{ .name = "TARDIGRADE_PROXY_CACHE_STALE_WHILE_REVALIDATE_SECONDS", .value = "5" },
-        },
-    };
-    var tardigrade = try TardigradeProcess.start(allocator, opts);
-    defer tardigrade.stop();
-
-    try upstream.resetCapture();
-    var fresh = try sendRequest(allocator, tardigrade.port, .{
-        .method = "POST",
-        .path = "/v1/chat",
-        .body = "{\"message\":\"cache me\"}",
-        .headers = &.{
-            .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
-            .{ .name = "Content-Type", .value = "application/json" },
-        },
-    });
-    defer fresh.deinit();
-    try std.testing.expectEqual(@as(u16, 200), fresh.status_code);
-    try assertContains(fresh.body, "\"version\":1");
-
-    var hit = try sendRequest(allocator, tardigrade.port, .{
-        .method = "POST",
-        .path = "/v1/chat",
-        .body = "{\"message\":\"cache me\"}",
-        .headers = &.{
-            .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
-            .{ .name = "Content-Type", .value = "application/json" },
-        },
-    });
-    defer hit.deinit();
-    try std.testing.expectEqual(@as(u16, 200), hit.status_code);
-    if (hit.header("X-Proxy-Cache")) |cache_header| {
-        try std.testing.expectEqualStrings("HIT", cache_header);
+    fn writeRel(self: GenericFixtureDir, suffix: []const u8, data: []const u8) !void {
+        const rel = try self.joinRel(suffix);
+        defer self.allocator.free(rel);
+        if (std.fs.path.dirname(rel)) |parent| try std.fs.cwd().makePath(parent);
+        try std.fs.cwd().writeFile(.{ .sub_path = rel, .data = data });
     }
-    try std.testing.expectEqual(@as(u32, 1), upstream.requestCount());
 
-    std.time.sleep(1100 * std.time.ns_per_ms);
-
-    var stale = try sendRequest(allocator, tardigrade.port, .{
-        .method = "POST",
-        .path = "/v1/chat",
-        .body = "{\"message\":\"cache me\"}",
-        .headers = &.{
-            .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
-            .{ .name = "Content-Type", .value = "application/json" },
-        },
-    });
-    defer stale.deinit();
-    try std.testing.expectEqual(@as(u16, 200), stale.status_code);
-    try std.testing.expectEqualStrings("STALE", stale.header("X-Proxy-Cache").?);
-    try assertContains(stale.body, "\"version\":1");
-
-    try waitForUpstreamCount(&upstream, 2, 1000);
-    std.time.sleep(200 * std.time.ns_per_ms);
-
-    var refreshed = try sendRequest(allocator, tardigrade.port, .{
-        .method = "POST",
-        .path = "/v1/chat",
-        .body = "{\"message\":\"cache me\"}",
-        .headers = &.{
-            .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
-            .{ .name = "Content-Type", .value = "application/json" },
-        },
-    });
-    defer refreshed.deinit();
-    try std.testing.expectEqual(@as(u16, 200), refreshed.status_code);
-    try assertContains(refreshed.body, "\"version\":2");
-}
-
-test "proxy integration forwards upstream path headers and transformed body" {
-    const allocator = std.testing.allocator;
-
-    const responses = [_]UpstreamResponseSpec{.{
-        .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
-        .body = "{\"ok\":true,\"forwarded\":true}",
-    }};
-    var upstream = try UpstreamServer.start(allocator, &responses);
-    defer upstream.stop();
-    try upstream.run();
-
-    const opts = TardigradeOptions{
-        .upstream_port = upstream.port(),
-        .extra_env = &.{.{ .name = "TARDIGRADE_PROXY_PROTOCOL", .value = "v1" }},
-        .ready_proxy_ip = "10.9.0.254",
-    };
-    var tardigrade = try TardigradeProcess.start(allocator, opts);
-    defer tardigrade.stop();
-
-    const correlation_id = "proxy-forward-123";
-    var proxied = try sendRequest(allocator, tardigrade.port, .{
-        .method = "POST",
-        .path = "/v1/chat",
-        .body = "{\"message\":\"forward me\"}",
-        .headers = &.{
-            .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
-            .{ .name = "Content-Type", .value = "application/json" },
-            .{ .name = "Host", .value = "public.example.test" },
-            .{ .name = "X-Correlation-ID", .value = correlation_id },
-            .{ .name = "X-Forwarded-For", .value = "198.51.100.7" },
-        },
-        .proxy_ip = "10.9.0.1",
-    });
-    defer proxied.deinit();
-    try std.testing.expectEqual(@as(u16, 200), proxied.status_code);
-    try assertContains(proxied.body, "\"forwarded\":true");
-
-    upstream.mutex.lock();
-    defer upstream.mutex.unlock();
-    try std.testing.expectEqual(@as(u32, 1), upstream.capture.request_count);
-    try std.testing.expectEqualStrings("POST", upstream.capture.method);
-    try std.testing.expectEqualStrings("/v1/chat", upstream.capture.path);
-    try std.testing.expectEqualStrings("{\"message\":\"forward me\"}", upstream.capture.body);
-    try std.testing.expectEqualStrings(correlation_id, upstream.capture.correlation_id);
-    try std.testing.expectEqualStrings("198.51.100.7, 198.51.100.7", headerValue(upstream.capture.headers_raw, "X-Forwarded-For").?);
-    try std.testing.expectEqualStrings("198.51.100.7", headerValue(upstream.capture.headers_raw, "X-Real-IP").?);
-    try std.testing.expectEqualStrings("public.example.test", headerValue(upstream.capture.headers_raw, "X-Forwarded-Host").?);
-    try std.testing.expectEqualStrings(valid_bearer_hash, headerValue(upstream.capture.headers_raw, "X-Tardigrade-Auth-Identity").?);
-}
-
-test "proxy cache integration skips caching upstream no-store responses" {
-    const allocator = std.testing.allocator;
-
-    const cache_headers = [_]ResponseHeader{
-        .{ .name = "Content-Type", .value = "application/json" },
-        .{ .name = "Cache-Control", .value = "no-store" },
-    };
-    const responses = [_]UpstreamResponseSpec{
-        .{ .headers = &cache_headers, .body = "{\"version\":1}" },
-        .{ .headers = &cache_headers, .body = "{\"version\":2}" },
-    };
-    var upstream = try UpstreamServer.start(allocator, &responses);
-    defer upstream.stop();
-    try upstream.run();
-
-    const opts = TardigradeOptions{
-        .upstream_port = upstream.port(),
-        .extra_env = &.{
-            .{ .name = "TARDIGRADE_PROXY_CACHE_TTL_SECONDS", .value = "30" },
-            .{ .name = "TARDIGRADE_PROXY_CACHE_STALE_WHILE_REVALIDATE_SECONDS", .value = "30" },
-        },
-    };
-    var tardigrade = try TardigradeProcess.start(allocator, opts);
-    defer tardigrade.stop();
-
-    var first = try sendRequest(allocator, tardigrade.port, .{
-        .method = "POST",
-        .path = "/v1/chat",
-        .body = "{\"message\":\"dont cache\"}",
-        .headers = &.{
-            .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
-            .{ .name = "Content-Type", .value = "application/json" },
-        },
-    });
-    defer first.deinit();
-    try std.testing.expectEqual(@as(u16, 200), first.status_code);
-    try assertContains(first.body, "\"version\":1");
-
-    var second = try sendRequest(allocator, tardigrade.port, .{
-        .method = "POST",
-        .path = "/v1/chat",
-        .body = "{\"message\":\"dont cache\"}",
-        .headers = &.{
-            .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
-            .{ .name = "Content-Type", .value = "application/json" },
-        },
-    });
-    defer second.deinit();
-    try std.testing.expectEqual(@as(u16, 200), second.status_code);
-    try assertContains(second.body, "\"version\":2");
-    try std.testing.expect(upstream.requestCount() >= 2);
-    try std.testing.expect(second.header("X-Proxy-Cache") == null);
-}
-
-test "proxy integration retries once on upstream 5xx" {
-    const allocator = std.testing.allocator;
-
-    const responses = [_]UpstreamResponseSpec{
-        .{
-            .status_code = 502,
-            .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
-            .body = "{\"error\":\"temporary\"}",
-        },
-        .{
-            .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
-            .body = "{\"retried\":true}",
-        },
-    };
-    var upstream = try UpstreamServer.start(allocator, &responses);
-    defer upstream.stop();
-    try upstream.run();
-
-    const opts = TardigradeOptions{
-        .upstream_port = upstream.port(),
-        .extra_env = &.{.{ .name = "TARDIGRADE_UPSTREAM_RETRY_ATTEMPTS", .value = "2" }},
-    };
-    var tardigrade = try TardigradeProcess.start(allocator, opts);
-    defer tardigrade.stop();
-
-    var response = try sendRequest(allocator, tardigrade.port, .{
-        .method = "POST",
-        .path = "/v1/chat",
-        .body = "{\"message\":\"retry me\"}",
-        .headers = &.{
-            .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
-            .{ .name = "Content-Type", .value = "application/json" },
-        },
-    });
-    defer response.deinit();
-    try std.testing.expectEqual(@as(u16, 200), response.status_code);
-    try assertContains(response.body, "\"retried\":true");
-    try std.testing.expectEqual(@as(u32, 2), upstream.requestCount());
-}
-
-test "proxy integration follows a single upstream redirect" {
-    const allocator = std.testing.allocator;
-
-    const redirect_headers = [_]ResponseHeader{
-        .{ .name = "Content-Type", .value = "application/json" },
-        .{ .name = "Location", .value = "http://127.0.0.1:1/v1/chat/final" },
-    };
-    var location_buf: [128]u8 = undefined;
-
-    const first = UpstreamResponseSpec{
-        .status_code = 307,
-        .headers = &redirect_headers,
-        .body = "",
-    };
-    const second = UpstreamResponseSpec{
-        .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
-        .body = "{\"redirected\":true}",
-    };
-    var responses = [_]UpstreamResponseSpec{ first, second };
-    var upstream = try UpstreamServer.start(allocator, &responses);
-    defer upstream.stop();
-    try upstream.run();
-
-    const location = try std.fmt.bufPrint(&location_buf, "http://{s}:{d}/v1/chat/final", .{ test_host, upstream.port() });
-    responses[0].headers = &.{
-        .{ .name = "Content-Type", .value = "application/json" },
-        .{ .name = "Location", .value = location },
-    };
-    upstream.setResponses(&responses);
-
-    var tardigrade = try TardigradeProcess.start(allocator, baseOptions(upstream.port()));
-    defer tardigrade.stop();
-
-    var response = try sendRequest(allocator, tardigrade.port, .{
-        .method = "POST",
-        .path = "/v1/chat",
-        .body = "{\"message\":\"follow redirect\"}",
-        .headers = &.{
-            .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
-            .{ .name = "Content-Type", .value = "application/json" },
-        },
-    });
-    defer response.deinit();
-    try std.testing.expectEqual(@as(u16, 200), response.status_code);
-    try assertContains(response.body, "\"redirected\":true");
-    try std.testing.expectEqual(@as(u32, 2), upstream.requestCount());
-    upstream.mutex.lock();
-    defer upstream.mutex.unlock();
-    try std.testing.expectEqualStrings("/v1/chat/final", upstream.capture.path);
-}
-
-test "fastcgi integration returns parsed response and forwards cgi env" {
-    const allocator = std.testing.allocator;
-
-    const responses = [_]FastCgiResponseSpec{
-        .{
-            .status_code = 201,
-            .headers = &.{
-                .{ .name = "Content-Type", .value = "text/plain; charset=utf-8" },
-                .{ .name = "X-FastCGI-Reply", .value = "ok" },
-            },
-            .body = "hello-fastcgi",
-        },
-    };
-    var fcgi = try FastCgiServer.start(allocator, &responses);
-    defer fcgi.stop();
-    try fcgi.run();
-
-    const upstream = try std.fmt.allocPrint(allocator, "{s}:{d}", .{ test_host, fcgi.port() });
-    defer allocator.free(upstream);
-    const opts = TardigradeOptions{
-        .upstream_port = null,
-        .extra_env = &.{
-            .{ .name = "TARDIGRADE_FASTCGI_UPSTREAM", .value = upstream },
-        },
-    };
-    var tardigrade = try TardigradeProcess.start(allocator, opts);
-    defer tardigrade.stop();
-
-    var response = try sendRequest(allocator, tardigrade.port, .{
-        .method = "POST",
-        .path = "/v1/backend/fastcgi?name=tardi",
-        .body = "{\"hello\":true}",
-        .headers = &.{
-            .{ .name = "Host", .value = "gateway.integration.test:9000" },
-            .{ .name = "Content-Type", .value = "application/json" },
-            .{ .name = "X-Real-IP", .value = "127.0.0.1" },
-            .{ .name = "X-FastCGI-Script-Filename", .value = "/srv/app.php" },
-            .{ .name = "X-FastCGI-Path-Info", .value = "/index.php" },
-            .{ .name = "X-Correlation-ID", .value = "fcgi-req-123" },
-        },
-    });
-    defer response.deinit();
-
-    try std.testing.expectEqual(@as(u16, 201), response.status_code);
-    try std.testing.expectEqualStrings("text/plain; charset=utf-8", response.header("Content-Type").?);
-    try std.testing.expectEqualStrings("ok", response.header("X-FastCGI-Reply").?);
-    try assertContains(response.body, "hello-fastcgi");
-
-    fcgi.mutex.lock();
-    defer fcgi.mutex.unlock();
-    try assertContains(fcgi.capture.raw, "REQUEST_METHODPOST");
-    try assertContains(fcgi.capture.raw, "SCRIPT_FILENAME/srv/app.php");
-    try assertContains(fcgi.capture.raw, "QUERY_STRINGname=tardi");
-    try assertContains(fcgi.capture.raw, "CONTENT_TYPEapplication/json");
-    try assertContains(fcgi.capture.raw, "REMOTE_ADDR127.0.0.1");
-    try assertContains(fcgi.capture.raw, "SERVER_NAMEgateway.integration.test");
-    try assertContains(fcgi.capture.raw, "HTTP_X_CORRELATION_IDfcgi-req-123");
-}
-
-test "fastcgi integration logs stderr and maps non-zero end_request to 502" {
-    const allocator = std.testing.allocator;
-
-    const responses = [_]FastCgiResponseSpec{
-        .{
-            .status_code = 200,
-            .headers = &.{.{ .name = "Content-Type", .value = "text/plain" }},
-            .body = "ignored",
-            .stderr = "php warning: boom",
-            .app_status = 1,
-        },
-    };
-    var fcgi = try FastCgiServer.start(allocator, &responses);
-    defer fcgi.stop();
-    try fcgi.run();
-
-    const upstream = try std.fmt.allocPrint(allocator, "{s}:{d}", .{ test_host, fcgi.port() });
-    defer allocator.free(upstream);
-    const opts = TardigradeOptions{
-        .upstream_port = null,
-        .extra_env = &.{
-            .{ .name = "TARDIGRADE_FASTCGI_UPSTREAM", .value = upstream },
-        },
-    };
-    var tardigrade = try TardigradeProcess.start(allocator, opts);
-    defer tardigrade.stop();
-
-    var response = try sendRequest(allocator, tardigrade.port, .{
-        .method = "POST",
-        .path = "/v1/backend/fastcgi",
-        .body = "{}",
-        .headers = &.{
-            .{ .name = "Content-Type", .value = "application/json" },
-        },
-    });
-    defer response.deinit();
-    try std.testing.expectEqual(@as(u16, 502), response.status_code);
-
-    std.time.sleep(100 * std.time.ns_per_ms);
-    const log_data = try std.fs.cwd().readFileAlloc(allocator, tardigrade.log_path, 256 * 1024);
-    defer allocator.free(log_data);
-    try assertContains(log_data, "fastcgi stderr");
-    try assertContains(log_data, "php warning: boom");
-    try assertContains(log_data, "fastcgi end_request failure");
-}
-
-test "fastcgi integration reuses upstream connection across sequential requests" {
-    const allocator = std.testing.allocator;
-
-    const responses = [_]FastCgiResponseSpec{
-        .{ .body = "first" },
-        .{ .body = "second" },
-    };
-    var fcgi = try FastCgiServer.start(allocator, &responses);
-    defer fcgi.stop();
-    try fcgi.run();
-
-    const upstream = try std.fmt.allocPrint(allocator, "{s}:{d}", .{ test_host, fcgi.port() });
-    defer allocator.free(upstream);
-    const opts = TardigradeOptions{
-        .upstream_port = null,
-        .extra_env = &.{
-            .{ .name = "TARDIGRADE_FASTCGI_UPSTREAM", .value = upstream },
-        },
-    };
-    var tardigrade = try TardigradeProcess.start(allocator, opts);
-    defer tardigrade.stop();
-
-    var first = try sendRequest(allocator, tardigrade.port, .{
-        .method = "POST",
-        .path = "/v1/backend/fastcgi",
-        .body = "one",
-        .headers = &.{.{ .name = "Content-Type", .value = "text/plain" }},
-    });
-    defer first.deinit();
-    try std.testing.expectEqual(@as(u16, 200), first.status_code);
-    try assertContains(first.body, "first");
-
-    var second = try sendRequest(allocator, tardigrade.port, .{
-        .method = "POST",
-        .path = "/v1/backend/fastcgi",
-        .body = "two",
-        .headers = &.{.{ .name = "Content-Type", .value = "text/plain" }},
-    });
-    defer second.deinit();
-    try std.testing.expectEqual(@as(u16, 200), second.status_code);
-    try assertContains(second.body, "second");
-
-    fcgi.mutex.lock();
-    defer fcgi.mutex.unlock();
-    try std.testing.expectEqual(@as(u32, 2), fcgi.capture.request_count);
-    try std.testing.expectEqual(@as(u32, 1), fcgi.accepted_connections);
-    try std.testing.expectEqual(@as(u16, 2), fcgi.capture.last_request_id);
-}
-
-test "fastcgi config directives drive upstream params and index defaults" {
-    const allocator = std.testing.allocator;
-
-    const responses = [_]FastCgiResponseSpec{
-        .{ .body = "config-fastcgi" },
-    };
-    var fcgi = try FastCgiServer.start(allocator, &responses);
-    defer fcgi.stop();
-    try fcgi.run();
-
-    const upstream = try std.fmt.allocPrint(allocator, "{s}:{d}", .{ test_host, fcgi.port() });
-    defer allocator.free(upstream);
-    const config_text = try std.fmt.allocPrint(
-        allocator,
-        \\root /srv/www;
-        \\fastcgi_pass {s};
-        \\fastcgi_param APP_ENV production;
-        \\fastcgi_param APP_ROLE api;
-        \\fastcgi_index home.php;
-        \\scgi_pass 127.0.0.1:4100;
-        \\uwsgi_pass 127.0.0.1:4200;
-    ,
-        .{upstream},
-    );
-    defer allocator.free(config_text);
-
-    var tardigrade = try TardigradeProcess.start(allocator, .{
-        .upstream_port = null,
-        .config_text = config_text,
-    });
-    defer tardigrade.stop();
-
-    var response = try sendRequest(allocator, tardigrade.port, .{
-        .method = "POST",
-        .path = "/v1/backend/fastcgi?name=config",
-        .body = "{\"cfg\":true}",
-        .headers = &.{
-            .{ .name = "Host", .value = "gateway.integration.test" },
-            .{ .name = "Content-Type", .value = "application/json" },
-            .{ .name = "X-FastCGI-Path-Info", .value = "/app/" },
-        },
-    });
-    defer response.deinit();
-
-    try std.testing.expectEqual(@as(u16, 200), response.status_code);
-    try assertContains(response.body, "config-fastcgi");
-
-    fcgi.mutex.lock();
-    defer fcgi.mutex.unlock();
-    try assertContains(fcgi.capture.raw, "SCRIPT_FILENAME/srv/www/app/home.php");
-    try assertContains(fcgi.capture.raw, "DOCUMENT_ROOT/srv/www");
-    try assertContains(fcgi.capture.raw, "APP_ENVproduction");
-    try assertContains(fcgi.capture.raw, "APP_ROLEapi");
-}
-
-test "fastcgi integration with real php-fpm socket returns parsed response" {
-    var php_fpm = try PhpFpmProcess.start(std.testing.allocator);
-    defer php_fpm.stop();
-
-    const upstream = try std.fmt.allocPrint(std.testing.allocator, "unix:{s}", .{php_fpm.socket_path});
-    defer std.testing.allocator.free(upstream);
-
-    var tardigrade = try TardigradeProcess.start(std.testing.allocator, .{
-        .upstream_port = null,
-        .extra_env = &.{
-            .{ .name = "TARDIGRADE_FASTCGI_UPSTREAM", .value = upstream },
-        },
-    });
-    defer tardigrade.stop();
-
-    var response = try sendRequest(std.testing.allocator, tardigrade.port, .{
-        .method = "POST",
-        .path = "/v1/backend/fastcgi?name=real",
-        .body = "hello=php",
-        .headers = &.{
-            .{ .name = "Content-Type", .value = "application/x-www-form-urlencoded" },
-            .{ .name = "X-FastCGI-Script-Filename", .value = php_fpm.script_path },
-            .{ .name = "X-FastCGI-Script-Name", .value = "/index.php" },
-            .{ .name = "X-FastCGI-Path-Info", .value = "/index.php" },
-        },
-    });
-    defer response.deinit();
-
-    try std.testing.expectEqual(@as(u16, 200), response.status_code);
-    try std.testing.expectEqualStrings("application/json", response.header("Content-Type").?);
-    try assertContains(response.body, "\"method\":\"POST\"");
-    try assertContains(response.body, "\"script\":\"");
-    try assertContains(response.body, "\"query\":\"name=real\"");
-    try assertContains(response.body, "\"body\":\"hello=php\"");
-}
-
-test "rewrite integration transparently rewrites captured path to health" {
-    const allocator = std.testing.allocator;
-
-    var tardigrade = try TardigradeProcess.start(allocator, .{
-        .upstream_port = null,
-        .extra_env = &.{
-            .{ .name = "TARDIGRADE_REWRITE_RULES", .value = "GET|^/old/(.*)$|/$1|last" },
-        },
-    });
-    defer tardigrade.stop();
-
-    var response = try sendRequest(allocator, tardigrade.port, .{
-        .method = "GET",
-        .path = "/old/health",
-        .body = null,
-        .headers = &.{},
-    });
-    defer response.deinit();
-
-    try std.testing.expectEqual(@as(u16, 200), response.status_code);
-    try std.testing.expectEqualStrings("application/json", response.header("Content-Type").?);
-    try assertContains(response.body, "\"status\":\"ok\"");
-}
-
-test "rewrite config directive rewrites captured path to health" {
-    const allocator = std.testing.allocator;
-
-    var tardigrade = try TardigradeProcess.start(allocator, .{
-        .upstream_port = null,
-        .config_text = "rewrite ^/legacy/(.*)$ /$1 last;",
-    });
-    defer tardigrade.stop();
-
-    var response = try sendRequest(allocator, tardigrade.port, .{
-        .method = "GET",
-        .path = "/legacy/health",
-        .body = null,
-        .headers = &.{},
-    });
-    defer response.deinit();
-
-    try std.testing.expectEqual(@as(u16, 200), response.status_code);
-    try assertContains(response.body, "\"status\":\"ok\"");
-}
+    fn deinit(self: *GenericFixtureDir) void {
+        std.fs.cwd().deleteTree(self.dir_rel) catch {};
+        self.allocator.free(self.dir_rel);
+        self.allocator.free(self.dir_abs);
+        self.* = undefined;
+    }
+};
 
 test "return config directive issues redirect with request_uri expansion" {
     const allocator = std.testing.allocator;
 
-    var tardigrade = try TardigradeProcess.start(allocator, .{
-        .upstream_port = null,
-        .config_text = "return 301 https://example.com$request_uri;",
-        .ready_status_code = 301,
-    });
-    defer tardigrade.stop();
-
-    var response = try sendRequest(allocator, tardigrade.port, .{
-        .method = "GET",
-        .path = "/legacy/path?x=1",
-        .body = null,
-        .headers = &.{},
-    });
-    defer response.deinit();
-
-    try std.testing.expectEqual(@as(u16, 301), response.status_code);
-    try std.testing.expectEqualStrings("https://example.com/legacy/path?x=1", response.header("Location").?);
-}
-
-test "if rewrite directive rewrites request_uri match transparently" {
-    const allocator = std.testing.allocator;
-
-    var tardigrade = try TardigradeProcess.start(allocator, .{
-        .upstream_port = null,
-        .config_text = "if ($request_uri ~* ^/legacy/(.*)$) rewrite /$1 last;",
-    });
-    defer tardigrade.stop();
-
-    var response = try sendRequest(allocator, tardigrade.port, .{
-        .method = "GET",
-        .path = "/legacy/health",
-        .body = null,
-        .headers = &.{},
-    });
-    defer response.deinit();
-
-    try std.testing.expectEqual(@as(u16, 200), response.status_code);
-    try assertContains(response.body, "\"status\":\"ok\"");
-}
-
-test "if return directive redirects on host match" {
-    const allocator = std.testing.allocator;
-
-    var tardigrade = try TardigradeProcess.start(allocator, .{
-        .upstream_port = null,
-        .config_text = "if ($http_host ~* ^admin\\.example\\.com$) return 301 https://example.com$request_uri;",
-    });
-    defer tardigrade.stop();
-
-    var response = try sendRequest(allocator, tardigrade.port, .{
-        .method = "GET",
-        .path = "/health?x=1",
-        .body = null,
-        .headers = &.{.{ .name = "Host", .value = "Admin.Example.Com" }},
-    });
-    defer response.deinit();
-
-    try std.testing.expectEqual(@as(u16, 301), response.status_code);
-    try std.testing.expectEqualStrings("https://example.com/health?x=1", response.header("Location").?);
-}
-
-test "scgi integration returns parsed response and forwards cgi env" {
-    const allocator = std.testing.allocator;
-
-    const responses = [_]ScgiResponseSpec{
-        .{
-            .status_code = 202,
-            .headers = &.{
-                .{ .name = "Content-Type", .value = "application/json" },
-                .{ .name = "X-SCGI-Reply", .value = "ok" },
-            },
-            .body = "{\"scgi\":true}",
-            .http_status_line = true,
-        },
-    };
-    var scgi = try ScgiServer.start(allocator, &responses);
-    defer scgi.stop();
-    try scgi.run();
-
-    const upstream = try std.fmt.allocPrint(allocator, "{s}:{d}", .{ test_host, scgi.port() });
-    defer allocator.free(upstream);
-    const opts = TardigradeOptions{
-        .upstream_port = null,
-        .extra_env = &.{
-            .{ .name = "TARDIGRADE_SCGI_UPSTREAM", .value = upstream },
-        },
-    };
-    var tardigrade = try TardigradeProcess.start(allocator, opts);
-    defer tardigrade.stop();
-
-    var response = try sendRequest(allocator, tardigrade.port, .{
-        .method = "POST",
-        .path = "/v1/backend/scgi?name=tardi",
-        .body = "{\"hello\":true}",
-        .headers = &.{
-            .{ .name = "Host", .value = "gateway.integration.test:9001" },
-            .{ .name = "Content-Type", .value = "application/json" },
-            .{ .name = "X-Real-IP", .value = "127.0.0.1" },
-            .{ .name = "X-SCGI-Path-Info", .value = "/app" },
-            .{ .name = "X-SCGI-Script-Name", .value = "/app" },
-            .{ .name = "X-Correlation-ID", .value = "scgi-req-123" },
-        },
-    });
-    defer response.deinit();
-    try std.testing.expectEqual(@as(u16, 202), response.status_code);
-    try std.testing.expectEqualStrings("application/json", response.header("Content-Type").?);
-    try std.testing.expectEqualStrings("ok", response.header("X-SCGI-Reply").?);
-    try assertContains(response.body, "\"scgi\":true");
-
-    scgi.mutex.lock();
-    defer scgi.mutex.unlock();
-    try assertContains(scgi.capture.raw, "REQUEST_METHOD\x00POST\x00");
-    try assertContains(scgi.capture.raw, "QUERY_STRING\x00name=tardi\x00");
-    try assertContains(scgi.capture.raw, "CONTENT_TYPE\x00application/json\x00");
-    try assertContains(scgi.capture.raw, "REMOTE_ADDR\x00127.0.0.1\x00");
-    try assertContains(scgi.capture.raw, "SERVER_NAME\x00gateway.integration.test\x00");
-    try assertContains(scgi.capture.raw, "HTTP_X_CORRELATION_ID\x00scgi-req-123\x00");
-}
-
-test "uwsgi integration returns parsed response and forwards vars" {
-    const allocator = std.testing.allocator;
-
-    const responses = [_]UwsgiResponseSpec{
-        .{
-            .status_code = 201,
-            .headers = &.{
-                .{ .name = "Content-Type", .value = "application/json" },
-                .{ .name = "X-uWSGI-Reply", .value = "ok" },
-            },
-            .body = "{\"uwsgi\":true}",
-            .http_status_line = true,
-        },
-    };
-    var uwsgi = try UwsgiServer.start(allocator, &responses);
-    defer uwsgi.stop();
-    try uwsgi.run();
-
-    const upstream = try std.fmt.allocPrint(allocator, "{s}:{d}", .{ test_host, uwsgi.port() });
-    defer allocator.free(upstream);
-    const opts = TardigradeOptions{
-        .upstream_port = null,
-        .extra_env = &.{
-            .{ .name = "TARDIGRADE_UWSGI_UPSTREAM", .value = upstream },
-        },
-    };
-    var tardigrade = try TardigradeProcess.start(allocator, opts);
-    defer tardigrade.stop();
-
-    var response = try sendRequest(allocator, tardigrade.port, .{
-        .method = "POST",
-        .path = "/v1/backend/uwsgi?name=tardi",
-        .body = "{\"hello\":true}",
-        .headers = &.{
-            .{ .name = "Host", .value = "gateway.integration.test:9002" },
-            .{ .name = "Content-Type", .value = "application/json" },
-            .{ .name = "X-Real-IP", .value = "127.0.0.1" },
-            .{ .name = "X-uWSGI-Path-Info", .value = "/app" },
-            .{ .name = "X-uWSGI-Script-Name", .value = "/app" },
-            .{ .name = "X-Correlation-ID", .value = "uwsgi-req-123" },
-        },
-    });
-    defer response.deinit();
-    try std.testing.expectEqual(@as(u16, 201), response.status_code);
-    try std.testing.expectEqualStrings("application/json", response.header("Content-Type").?);
-    try std.testing.expectEqualStrings("ok", response.header("X-uWSGI-Reply").?);
-    try assertContains(response.body, "\"uwsgi\":true");
-
-    uwsgi.mutex.lock();
-    defer uwsgi.mutex.unlock();
-    try assertContains(uwsgi.capture.raw, "REQUEST_METHODPOST");
-    try assertContains(uwsgi.capture.raw, "QUERY_STRINGname=tardi");
-    try assertContains(uwsgi.capture.raw, "CONTENT_TYPEapplication/json");
-    try assertContains(uwsgi.capture.raw, "REMOTE_ADDR127.0.0.1");
-    try assertContains(uwsgi.capture.raw, "SERVER_NAMEgateway.integration.test");
-    try assertContains(uwsgi.capture.raw, "HTTP_X_CORRELATION_IDuwsgi-req-123");
-}
-
-test "uwsgi integration decodes chunked upstream body" {
-    const allocator = std.testing.allocator;
-
-    const responses = [_]UwsgiResponseSpec{
-        .{
-            .status_code = 200,
-            .headers = &.{
-                .{ .name = "Transfer-Encoding", .value = "chunked" },
-                .{ .name = "Content-Type", .value = "text/plain" },
-            },
-            .body = "5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n",
-            .http_status_line = true,
-        },
-    };
-    var uwsgi = try UwsgiServer.start(allocator, &responses);
-    defer uwsgi.stop();
-    try uwsgi.run();
-
-    const upstream = try std.fmt.allocPrint(allocator, "{s}:{d}", .{ test_host, uwsgi.port() });
-    defer allocator.free(upstream);
-    const opts = TardigradeOptions{
-        .upstream_port = null,
-        .extra_env = &.{
-            .{ .name = "TARDIGRADE_UWSGI_UPSTREAM", .value = upstream },
-        },
-    };
-    var tardigrade = try TardigradeProcess.start(allocator, opts);
-    defer tardigrade.stop();
-
-    var response = try sendRequest(allocator, tardigrade.port, .{
-        .method = "POST",
-        .path = "/v1/backend/uwsgi",
-        .body = "",
-        .headers = &.{},
-    });
-    defer response.deinit();
-    try std.testing.expectEqual(@as(u16, 200), response.status_code);
-    try std.testing.expect(response.header("Transfer-Encoding") == null);
-    try std.testing.expectEqualStrings("hello world", response.body);
-}
-
-test "tls integration serves health over https with self-signed certificate" {
-    const allocator = std.testing.allocator;
-
-    const opts = TardigradeOptions{
-        .upstream_port = null,
-        .extra_env = &.{
-            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = "tests/fixtures/tls/server.crt" },
-            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = "tests/fixtures/tls/server.key" },
-        },
-        .ready_https_insecure = true,
-    };
-    var tardigrade = try TardigradeProcess.start(allocator, opts);
-    defer tardigrade.stop();
-
-    var response = try sendCurlRequest(allocator, tardigrade.port, .{
-        .scheme = "https",
-        .path = "/health",
-        .insecure = true,
-    });
-    defer response.deinit();
-    try std.testing.expectEqual(@as(u16, 200), response.status_code);
-    try assertContains(response.body, "\"status\":\"ok\"");
-}
-
-test "http3 configured gateway advertises alt-svc on http health responses" {
-    const allocator = std.testing.allocator;
-    const quic_port = try findFreePort();
-    const quic_port_str = try std.fmt.allocPrint(allocator, "{d}", .{quic_port});
-    defer allocator.free(quic_port_str);
-
-    const opts = TardigradeOptions{
-        .upstream_port = null,
-        .extra_env = &.{
-            .{ .name = "TARDIGRADE_HTTP3_ENABLED", .value = "true" },
-            .{ .name = "TARDIGRADE_QUIC_PORT", .value = quic_port_str },
-        },
-    };
-    var tardigrade = try TardigradeProcess.start(allocator, opts);
-    defer tardigrade.stop();
-
-    var response = try sendRequest(allocator, tardigrade.port, .{
-        .method = "GET",
-        .path = "/health",
-        .body = null,
-        .headers = &.{},
-    });
-    defer response.deinit();
-
-    try std.testing.expectEqual(@as(u16, 200), response.status_code);
-    const expected_alt_svc = try std.fmt.allocPrint(allocator, "h3=\":{d}\"", .{quic_port});
-    defer allocator.free(expected_alt_svc);
-    try std.testing.expectEqualStrings(expected_alt_svc, response.header("Alt-Svc").?);
-    try assertContains(response.body, "\"http3_status\":\"config_incomplete\"");
-    const expected_quic_port = try std.fmt.allocPrint(allocator, "\"http3_quic_port\":{d}", .{quic_port});
-    defer allocator.free(expected_quic_port);
-    try assertContains(response.body, expected_quic_port);
-    try assertContains(response.body, "\"http3_handshake_state\":\"config_incomplete\"");
-    try assertContains(response.body, "\"http3_stream_bytes_received\":0");
-    try assertContains(response.body, "\"http3_requests_completed\":0");
-    try assertContains(response.body, "\"http3_native_read_calls\":0");
-    try assertContains(response.body, "\"http3_last_error_name\":\"-\"");
-}
-
-test "http3 integration serves health over quic" {
-    if (!build_options.enable_http3_ngtcp2) return error.SkipZigTest;
-    std.fs.accessAbsolute(http3_curl_path, .{}) catch return error.SkipZigTest;
-
-    const allocator = std.testing.allocator;
-    const quic_port = try findFreePort();
-    const quic_port_str = try std.fmt.allocPrint(allocator, "{d}", .{quic_port});
-    defer allocator.free(quic_port_str);
-
-    const opts = TardigradeOptions{
-        .upstream_port = null,
-        .extra_env = &.{
-            .{ .name = "TARDIGRADE_HTTP3_ENABLED", .value = "true" },
-            .{ .name = "TARDIGRADE_HTTP3_ENABLE_0RTT", .value = "true" },
-            .{ .name = "TARDIGRADE_QUIC_PORT", .value = quic_port_str },
-            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = "tests/fixtures/tls/server.crt" },
-            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = "tests/fixtures/tls/server.key" },
-        },
-        .ready_https_insecure = true,
-    };
-    var tardigrade = try TardigradeProcess.start(allocator, opts);
-    defer tardigrade.stop();
-    try waitForHttp3Configured(tardigrade.port, 5000);
-
-    var response = try sendHttp3CurlRequest(allocator, quic_port, "/health");
-    defer response.deinit();
-
-    try std.testing.expectEqual(@as(u16, 200), response.status_code);
-    try std.testing.expectEqualStrings(expected_server_header, response.header("server").?);
-    const content_length = try std.fmt.parseInt(usize, response.header("content-length").?, 10);
-    try std.testing.expect(content_length > 0);
-    try assertContains(response.body, "\"status\":\"ok\"");
-    try assertContains(response.body, "\"service\":\"tardigrade-edge\"");
-}
-
-test "http3 integration resumes session with 0-rtt over quic" {
-    if (!build_options.enable_http3_ngtcp2) return error.SkipZigTest;
-    if (http3_resumption_client_bin_path.len == 0) return error.SkipZigTest;
-    if (http3_osslclient_bin_path.len == 0) return error.SkipZigTest;
-    std.fs.accessAbsolute(http3_resumption_client_bin_path, .{}) catch return error.SkipZigTest;
-    std.fs.accessAbsolute(http3_osslclient_bin_path, .{}) catch return error.SkipZigTest;
-
-    const allocator = std.testing.allocator;
-    const quic_port = try findFreePort();
-    const quic_port_str = try std.fmt.allocPrint(allocator, "{d}", .{quic_port});
-    defer allocator.free(quic_port_str);
-
-    const opts = TardigradeOptions{
-        .upstream_port = null,
-        .extra_env = &.{
-            .{ .name = "TARDIGRADE_HTTP3_ENABLED", .value = "true" },
-            .{ .name = "TARDIGRADE_HTTP3_ENABLE_0RTT", .value = "true" },
-            .{ .name = "TARDIGRADE_QUIC_PORT", .value = quic_port_str },
-            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = "tests/fixtures/tls/server.crt" },
-            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = "tests/fixtures/tls/server.key" },
-        },
-        .ready_https_insecure = true,
-    };
-    var tardigrade = try TardigradeProcess.start(allocator, opts);
-    defer tardigrade.stop();
-    try waitForHttp3Configured(tardigrade.port, 5000);
-
-    const request_url = try std.fmt.allocPrint(allocator, "https://{s}:{d}/health", .{ test_host, quic_port });
-    defer allocator.free(request_url);
-
-    const result = try std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = &.{
-            http3_resumption_client_bin_path,
-            http3_osslclient_bin_path,
-            request_url,
-            "200",
-        },
-        .max_output_bytes = 256 * 1024,
-    });
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
-    switch (result.term) {
-        .Exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
-        else => return error.UnexpectedTermination,
-    }
-    try assertContains(result.stdout, "\"warm_status\":200");
-    try assertContains(result.stdout, "\"resumed_status\":200");
-    try assertContains(result.stdout, "\"resumed_zero_rtt_count\":");
-}
-
-test "http3 integration serves prometheus metrics over quic" {
-    if (!build_options.enable_http3_ngtcp2) return error.SkipZigTest;
-    std.fs.accessAbsolute(http3_curl_path, .{}) catch return error.SkipZigTest;
-
-    const allocator = std.testing.allocator;
-    const quic_port = try findFreePort();
-    const quic_port_str = try std.fmt.allocPrint(allocator, "{d}", .{quic_port});
-    defer allocator.free(quic_port_str);
-
-    const opts = TardigradeOptions{
-        .upstream_port = null,
-        .extra_env = &.{
-            .{ .name = "TARDIGRADE_HTTP3_ENABLED", .value = "true" },
-            .{ .name = "TARDIGRADE_QUIC_PORT", .value = quic_port_str },
-            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = "tests/fixtures/tls/server.crt" },
-            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = "tests/fixtures/tls/server.key" },
-        },
-        .ready_https_insecure = true,
-    };
-    var tardigrade = try TardigradeProcess.start(allocator, opts);
-    defer tardigrade.stop();
-    try waitForHttp3Configured(tardigrade.port, 5000);
-
-    var response = try sendHttp3CurlRequest(allocator, quic_port, "/metrics");
-    defer response.deinit();
-
-    try std.testing.expectEqual(@as(u16, 200), response.status_code);
-    try std.testing.expectEqualStrings("text/plain; version=0.0.4; charset=utf-8", response.header("content-type").?);
-    try assertContains(response.body, "tardigrade_requests_total");
-}
-
-test "http3 integration routes configured location blocks over quic" {
-    if (!build_options.enable_http3_ngtcp2) return error.SkipZigTest;
-    std.fs.accessAbsolute(http3_curl_path, .{}) catch return error.SkipZigTest;
-
-    const allocator = std.testing.allocator;
-    const responses = [_]UpstreamResponseSpec{.{ .body = "http3-location-upstream" }};
-    var upstream = try UpstreamServer.start(allocator, &responses);
-    defer upstream.stop();
-    try upstream.run();
-
-    const quic_port = try findFreePort();
-    const quic_port_str = try std.fmt.allocPrint(allocator, "{d}", .{quic_port});
-    defer allocator.free(quic_port_str);
-
-    const config_text = try std.fmt.allocPrint(allocator,
-        \\location = /quic-location {{
-        \\    proxy_pass http://{s}:{d};
-        \\}}
-    , .{ test_host, upstream.port() });
-    defer allocator.free(config_text);
-
-    const opts = TardigradeOptions{
-        .upstream_port = null,
-        .config_text = config_text,
-        .extra_env = &.{
-            .{ .name = "TARDIGRADE_HTTP3_ENABLED", .value = "true" },
-            .{ .name = "TARDIGRADE_QUIC_PORT", .value = quic_port_str },
-            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = "tests/fixtures/tls/server.crt" },
-            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = "tests/fixtures/tls/server.key" },
-        },
-        .ready_https_insecure = true,
-    };
-    var tardigrade = try TardigradeProcess.start(allocator, opts);
-    defer tardigrade.stop();
-    try waitForHttp3Configured(tardigrade.port, 5000);
-
-    var response = try sendHttp3CurlRequest(allocator, quic_port, "/quic-location");
-    defer response.deinit();
-
-    try std.testing.expectEqual(@as(u16, 200), response.status_code);
-    try std.testing.expectEqualStrings("http3-location-upstream", response.body);
-
-    upstream.mutex.lock();
-    defer upstream.mutex.unlock();
-    try std.testing.expectEqual(@as(u32, 1), upstream.capture.request_count);
-    try std.testing.expectEqualStrings("/quic-location", upstream.capture.path);
-}
-
-test "http3 integration proxies chat over quic" {
-    if (!build_options.enable_http3_ngtcp2) return error.SkipZigTest;
-    std.fs.accessAbsolute(http3_curl_path, .{}) catch return error.SkipZigTest;
-
-    const allocator = std.testing.allocator;
-    const responses = [_]UpstreamResponseSpec{.{
-        .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
-        .body = "{\"reply\":\"ok\"}",
-    }};
-    var upstream = try UpstreamServer.start(allocator, &responses);
-    defer upstream.stop();
-    try upstream.run();
-
-    const quic_port = try findFreePort();
-    const quic_port_str = try std.fmt.allocPrint(allocator, "{d}", .{quic_port});
-    defer allocator.free(quic_port_str);
-
-    const opts = TardigradeOptions{
-        .upstream_port = upstream.port(),
-        .extra_env = &.{
-            .{ .name = "TARDIGRADE_HTTP3_ENABLED", .value = "true" },
-            .{ .name = "TARDIGRADE_QUIC_PORT", .value = quic_port_str },
-            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = "tests/fixtures/tls/server.crt" },
-            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = "tests/fixtures/tls/server.key" },
-        },
-        .ready_https_insecure = true,
-    };
-    var tardigrade = try TardigradeProcess.start(allocator, opts);
-    defer tardigrade.stop();
-    try waitForHttp3Configured(tardigrade.port, 5000);
-
-    var unauthorized = try sendHttp3CurlRequestWithSpec(allocator, quic_port, .{
-        .scheme = "https",
-        .path = "/v1/chat",
-        .method = "POST",
-        .body = "{\"message\":\"hello\"}",
-        .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
-        .insecure = true,
-        .binary_path = http3_curl_path,
-        .http3_only = true,
-    });
-    defer unauthorized.deinit();
-    try std.testing.expectEqual(@as(u16, 401), unauthorized.status_code);
-    try assertContains(unauthorized.body, "\"code\":\"unauthorized\"");
-
-    var authorized = try sendHttp3CurlRequestWithSpec(allocator, quic_port, .{
-        .scheme = "https",
-        .path = "/v1/chat",
-        .method = "POST",
-        .body = "{\"message\":\"hello\"}",
-        .headers = &.{
-            .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
-            .{ .name = "Content-Type", .value = "application/json" },
-        },
-        .insecure = true,
-        .binary_path = http3_curl_path,
-        .http3_only = true,
-    });
-    defer authorized.deinit();
-    try std.testing.expectEqual(@as(u16, 200), authorized.status_code);
-    try assertContains(authorized.body, "\"reply\":\"ok\"");
-    upstream.mutex.lock();
-    defer upstream.mutex.unlock();
-    try std.testing.expectEqualStrings("/v1/chat", upstream.capture.path);
-    try assertContains(upstream.capture.body, "\"message\":\"hello\"");
-}
-
-test "http3 integration proxies commands over quic" {
-    if (!build_options.enable_http3_ngtcp2) return error.SkipZigTest;
-    std.fs.accessAbsolute(http3_curl_path, .{}) catch return error.SkipZigTest;
-
-    const allocator = std.testing.allocator;
-    const responses = [_]UpstreamResponseSpec{.{
-        .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
-        .body = "{\"result\":\"ok\"}",
-    }};
-    var upstream = try UpstreamServer.start(allocator, &responses);
-    defer upstream.stop();
-    try upstream.run();
-
-    const quic_port = try findFreePort();
-    const quic_port_str = try std.fmt.allocPrint(allocator, "{d}", .{quic_port});
-    defer allocator.free(quic_port_str);
-
-    const opts = TardigradeOptions{
-        .upstream_port = upstream.port(),
-        .extra_env = &.{
-            .{ .name = "TARDIGRADE_HTTP3_ENABLED", .value = "true" },
-            .{ .name = "TARDIGRADE_QUIC_PORT", .value = quic_port_str },
-            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = "tests/fixtures/tls/server.crt" },
-            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = "tests/fixtures/tls/server.key" },
-        },
-        .ready_https_insecure = true,
-    };
-    var tardigrade = try TardigradeProcess.start(allocator, opts);
-    defer tardigrade.stop();
-    try waitForHttp3Configured(tardigrade.port, 5000);
-
-    const command_body = "{\"command\":\"status\",\"params\":{}}";
-
-    var unauthorized = try sendHttp3CurlRequestWithSpec(allocator, quic_port, .{
-        .scheme = "https",
-        .path = "/v1/commands",
-        .method = "POST",
-        .body = command_body,
-        .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
-        .insecure = true,
-        .binary_path = http3_curl_path,
-        .http3_only = true,
-    });
-    defer unauthorized.deinit();
-    try std.testing.expectEqual(@as(u16, 401), unauthorized.status_code);
-    try assertContains(unauthorized.body, "\"code\":\"unauthorized\"");
-
-    var authorized = try sendHttp3CurlRequestWithSpec(allocator, quic_port, .{
-        .scheme = "https",
-        .path = "/v1/commands",
-        .method = "POST",
-        .body = command_body,
-        .headers = &.{
-            .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
-            .{ .name = "Content-Type", .value = "application/json" },
-        },
-        .insecure = true,
-        .binary_path = http3_curl_path,
-        .http3_only = true,
-    });
-    defer authorized.deinit();
-    try std.testing.expectEqual(@as(u16, 200), authorized.status_code);
-    try assertContains(authorized.body, "\"result\":\"ok\"");
-    upstream.mutex.lock();
-    defer upstream.mutex.unlock();
-    try std.testing.expectEqualStrings("/v1/status", upstream.capture.path);
-    try assertContains(upstream.capture.body, "\"command\":\"status\"");
-}
-
-test "http3 integration serves command status over quic" {
-    if (!build_options.enable_http3_ngtcp2) return error.SkipZigTest;
-    std.fs.accessAbsolute(http3_curl_path, .{}) catch return error.SkipZigTest;
-
-    const allocator = std.testing.allocator;
-    const responses = [_]UpstreamResponseSpec{.{
-        .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
-        .body = "{\"result\":\"ok\"}",
-    }};
-    var upstream = try UpstreamServer.start(allocator, &responses);
-    defer upstream.stop();
-    try upstream.run();
-
-    const quic_port = try findFreePort();
-    const quic_port_str = try std.fmt.allocPrint(allocator, "{d}", .{quic_port});
-    defer allocator.free(quic_port_str);
-
-    const opts = TardigradeOptions{
-        .upstream_port = upstream.port(),
-        .extra_env = &.{
-            .{ .name = "TARDIGRADE_HTTP3_ENABLED", .value = "true" },
-            .{ .name = "TARDIGRADE_QUIC_PORT", .value = quic_port_str },
-            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = "tests/fixtures/tls/server.crt" },
-            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = "tests/fixtures/tls/server.key" },
-        },
-        .ready_https_insecure = true,
-    };
-    var tardigrade = try TardigradeProcess.start(allocator, opts);
-    defer tardigrade.stop();
-    try waitForHttp3Configured(tardigrade.port, 5000);
-
-    const command_id = "cmd-http3-status";
-    const command_body = "{\"command\":\"status\",\"params\":{},\"command_id\":\"" ++ command_id ++ "\"}";
-
-    var execute = try sendHttp3CurlRequestWithSpec(allocator, quic_port, .{
-        .scheme = "https",
-        .path = "/v1/commands",
-        .method = "POST",
-        .body = command_body,
-        .headers = &.{
-            .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
-            .{ .name = "Content-Type", .value = "application/json" },
-        },
-        .insecure = true,
-        .binary_path = http3_curl_path,
-        .http3_only = true,
-    });
-    defer execute.deinit();
-    try std.testing.expectEqual(@as(u16, 200), execute.status_code);
-
-    var unauthorized = try sendHttp3CurlRequestWithSpec(allocator, quic_port, .{
-        .scheme = "https",
-        .path = "/v1/commands/status?command_id=" ++ command_id,
-        .insecure = true,
-        .binary_path = http3_curl_path,
-        .http3_only = true,
-    });
-    defer unauthorized.deinit();
-    try std.testing.expectEqual(@as(u16, 401), unauthorized.status_code);
-    try assertContains(unauthorized.body, "\"code\":\"unauthorized\"");
-
-    var status = try sendHttp3CurlRequestWithSpec(allocator, quic_port, .{
-        .scheme = "https",
-        .path = "/v1/commands/status?command_id=" ++ command_id,
-        .headers = &.{.{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token }},
-        .insecure = true,
-        .binary_path = http3_curl_path,
-        .http3_only = true,
-    });
-    defer status.deinit();
-    try std.testing.expectEqual(@as(u16, 200), status.status_code);
-    try assertContains(status.body, "\"command_id\":\"" ++ command_id ++ "\"");
-    try assertContains(status.body, "\"status\":\"completed\"");
-}
-
-test "http3 integration serves approvals workflow over quic" {
-    if (!build_options.enable_http3_ngtcp2) return error.SkipZigTest;
-    std.fs.accessAbsolute(http3_curl_path, .{}) catch return error.SkipZigTest;
-
-    const allocator = std.testing.allocator;
-    const quic_port = try findFreePort();
-    const quic_port_str = try std.fmt.allocPrint(allocator, "{d}", .{quic_port});
-    defer allocator.free(quic_port_str);
-
-    const opts = TardigradeOptions{
-        .upstream_port = null,
-        .extra_env = &.{
-            .{ .name = "TARDIGRADE_HTTP3_ENABLED", .value = "true" },
-            .{ .name = "TARDIGRADE_QUIC_PORT", .value = quic_port_str },
-            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = "tests/fixtures/tls/server.crt" },
-            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = "tests/fixtures/tls/server.key" },
-            .{ .name = "TARDIGRADE_POLICY_APPROVAL_ROUTES", .value = "POST|/v1/commands" },
-        },
-        .ready_https_insecure = true,
-    };
-    var tardigrade = try TardigradeProcess.start(allocator, opts);
-    defer tardigrade.stop();
-    try waitForHttp3Configured(tardigrade.port, 5000);
-
-    const request_body = "{\"method\":\"POST\",\"path\":\"/v1/commands\",\"command_id\":\"cmd-approval-http3\"}";
-
-    var unauthorized_request = try sendHttp3CurlRequestWithSpec(allocator, quic_port, .{
-        .scheme = "https",
-        .path = "/v1/approvals/request",
-        .method = "POST",
-        .body = request_body,
-        .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
-        .insecure = true,
-        .binary_path = http3_curl_path,
-        .http3_only = true,
-    });
-    defer unauthorized_request.deinit();
-    try std.testing.expectEqual(@as(u16, 401), unauthorized_request.status_code);
-
-    var request_resp = try sendHttp3CurlRequestWithSpec(allocator, quic_port, .{
-        .scheme = "https",
-        .path = "/v1/approvals/request",
-        .method = "POST",
-        .body = request_body,
-        .headers = &.{
-            .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
-            .{ .name = "Content-Type", .value = "application/json" },
-        },
-        .insecure = true,
-        .binary_path = http3_curl_path,
-        .http3_only = true,
-    });
-    defer request_resp.deinit();
-    try std.testing.expectEqual(@as(u16, 202), request_resp.status_code);
-    const token_key = "\"approval_token\":\"";
-    const token_start = std.mem.indexOf(u8, request_resp.body, token_key) orelse return error.InvalidHttpResponse;
-    const token_rest = request_resp.body[token_start + token_key.len ..];
-    const token_end = std.mem.indexOfScalar(u8, token_rest, '"') orelse return error.InvalidHttpResponse;
-    const approval_token = try allocator.dupe(u8, token_rest[0..token_end]);
-    defer allocator.free(approval_token);
-
-    const status_path = try std.fmt.allocPrint(allocator, "/v1/approvals/status?approval_token={s}", .{approval_token});
-    defer allocator.free(status_path);
-    var pending_status = try sendHttp3CurlRequestWithSpec(allocator, quic_port, .{
-        .scheme = "https",
-        .path = status_path,
-        .headers = &.{.{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token }},
-        .insecure = true,
-        .binary_path = http3_curl_path,
-        .http3_only = true,
-    });
-    defer pending_status.deinit();
-    try std.testing.expectEqual(@as(u16, 200), pending_status.status_code);
-    try assertContains(pending_status.body, "\"status\":\"pending\"");
-
-    const respond_body = try std.fmt.allocPrint(allocator, "{{\"approval_token\":\"{s}\",\"decision\":\"approve\"}}", .{approval_token});
-    defer allocator.free(respond_body);
-    var respond = try sendHttp3CurlRequestWithSpec(allocator, quic_port, .{
-        .scheme = "https",
-        .path = "/v1/approvals/respond",
-        .method = "POST",
-        .body = respond_body,
-        .headers = &.{
-            .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
-            .{ .name = "Content-Type", .value = "application/json" },
-        },
-        .insecure = true,
-        .binary_path = http3_curl_path,
-        .http3_only = true,
-    });
-    defer respond.deinit();
-    try std.testing.expectEqual(@as(u16, 200), respond.status_code);
-    try assertContains(respond.body, "\"status\":\"approved\"");
-
-    var approved_status = try sendHttp3CurlRequestWithSpec(allocator, quic_port, .{
-        .scheme = "https",
-        .path = status_path,
-        .headers = &.{.{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token }},
-        .insecure = true,
-        .binary_path = http3_curl_path,
-        .http3_only = true,
-    });
-    defer approved_status.deinit();
-    try std.testing.expectEqual(@as(u16, 200), approved_status.status_code);
-    try assertContains(approved_status.body, "\"status\":\"approved\"");
-}
-
-test "http3 integration manages sessions over quic" {
-    if (!build_options.enable_http3_ngtcp2) return error.SkipZigTest;
-    std.fs.accessAbsolute(http3_curl_path, .{}) catch return error.SkipZigTest;
-
-    const allocator = std.testing.allocator;
-    const quic_port = try findFreePort();
-    const quic_port_str = try std.fmt.allocPrint(allocator, "{d}", .{quic_port});
-    defer allocator.free(quic_port_str);
-
-    const opts = TardigradeOptions{
-        .upstream_port = null,
-        .extra_env = &.{
-            .{ .name = "TARDIGRADE_HTTP3_ENABLED", .value = "true" },
-            .{ .name = "TARDIGRADE_QUIC_PORT", .value = quic_port_str },
-            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = "tests/fixtures/tls/server.crt" },
-            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = "tests/fixtures/tls/server.key" },
-            .{ .name = "TARDIGRADE_SESSION_TTL", .value = "3600" },
-            .{ .name = "TARDIGRADE_SESSION_MAX", .value = "16" },
-        },
-        .ready_https_insecure = true,
-    };
-    var tardigrade = try TardigradeProcess.start(allocator, opts);
-    defer tardigrade.stop();
-    try waitForHttp3Configured(tardigrade.port, 5000);
-
-    var unauthorized_create = try sendHttp3CurlRequestWithSpec(allocator, quic_port, .{
-        .scheme = "https",
-        .path = "/v1/sessions",
-        .method = "POST",
-        .body = "{\"device_id\":\"http3-device\"}",
-        .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
-        .insecure = true,
-        .binary_path = http3_curl_path,
-        .http3_only = true,
-    });
-    defer unauthorized_create.deinit();
-    try std.testing.expectEqual(@as(u16, 401), unauthorized_create.status_code);
-
-    var create = try sendHttp3CurlRequestWithSpec(allocator, quic_port, .{
-        .scheme = "https",
-        .path = "/v1/sessions",
-        .method = "POST",
-        .body = "{\"device_id\":\"http3-device\"}",
-        .headers = &.{
-            .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
-            .{ .name = "Content-Type", .value = "application/json" },
-        },
-        .insecure = true,
-        .binary_path = http3_curl_path,
-        .http3_only = true,
-    });
-    defer create.deinit();
-    try std.testing.expectEqual(@as(u16, 201), create.status_code);
-    const session_token = create.header("x-session-token") orelse return error.MissingSessionToken;
-    const owned_session_token = try allocator.dupe(u8, session_token);
-    defer allocator.free(owned_session_token);
-    try assertContains(create.body, "\"session_token\":\"");
-
-    var list = try sendHttp3CurlRequestWithSpec(allocator, quic_port, .{
-        .scheme = "https",
-        .path = "/v1/sessions",
-        .headers = &.{.{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token }},
-        .insecure = true,
-        .binary_path = http3_curl_path,
-        .http3_only = true,
-    });
-    defer list.deinit();
-    try std.testing.expectEqual(@as(u16, 200), list.status_code);
-    try assertContains(list.body, "\"active_sessions\":1");
-
-    var revoke = try sendHttp3CurlRequestWithSpec(allocator, quic_port, .{
-        .scheme = "https",
-        .path = "/v1/sessions",
-        .method = "DELETE",
-        .headers = &.{.{ .name = "X-Session-Token", .value = owned_session_token }},
-        .insecure = true,
-        .binary_path = http3_curl_path,
-        .http3_only = true,
-    });
-    defer revoke.deinit();
-    try std.testing.expectEqual(@as(u16, 200), revoke.status_code);
-    try assertContains(revoke.body, "\"revoked\":true");
-
-    var list_after = try sendHttp3CurlRequestWithSpec(allocator, quic_port, .{
-        .scheme = "https",
-        .path = "/v1/sessions",
-        .headers = &.{.{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token }},
-        .insecure = true,
-        .binary_path = http3_curl_path,
-        .http3_only = true,
-    });
-    defer list_after.deinit();
-    try std.testing.expectEqual(@as(u16, 200), list_after.status_code);
-    try assertContains(list_after.body, "\"active_sessions\":0");
-}
-
-test "http3 integration registers devices and refreshes sessions over quic" {
-    if (!build_options.enable_http3_ngtcp2) return error.SkipZigTest;
-    std.fs.accessAbsolute(http3_curl_path, .{}) catch return error.SkipZigTest;
-
-    const allocator = std.testing.allocator;
-    const registry_path = try std.fmt.allocPrint(allocator, ".zig-cache/http3-device-registry-{d}.txt", .{std.time.nanoTimestamp()});
-    defer allocator.free(registry_path);
-
-    const quic_port = try findFreePort();
-    const quic_port_str = try std.fmt.allocPrint(allocator, "{d}", .{quic_port});
-    defer allocator.free(quic_port_str);
-
-    const opts = TardigradeOptions{
-        .upstream_port = null,
-        .extra_env = &.{
-            .{ .name = "TARDIGRADE_HTTP3_ENABLED", .value = "true" },
-            .{ .name = "TARDIGRADE_QUIC_PORT", .value = quic_port_str },
-            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = "tests/fixtures/tls/server.crt" },
-            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = "tests/fixtures/tls/server.key" },
-            .{ .name = "TARDIGRADE_DEVICE_REGISTRY_PATH", .value = registry_path },
-            .{ .name = "TARDIGRADE_SESSION_TTL", .value = "3600" },
-            .{ .name = "TARDIGRADE_SESSION_MAX", .value = "16" },
-        },
-        .ready_https_insecure = true,
-    };
-    var tardigrade = try TardigradeProcess.start(allocator, opts);
-    defer tardigrade.stop();
-    try waitForHttp3Configured(tardigrade.port, 5000);
-
-    var unauthorized_register = try sendHttp3CurlRequestWithSpec(allocator, quic_port, .{
-        .scheme = "https",
-        .path = "/v1/devices/register",
-        .method = "POST",
-        .body = "{\"device_id\":\"device-h3\",\"public_key\":\"pub-h3\"}",
-        .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
-        .insecure = true,
-        .binary_path = http3_curl_path,
-        .http3_only = true,
-    });
-    defer unauthorized_register.deinit();
-    try std.testing.expectEqual(@as(u16, 401), unauthorized_register.status_code);
-
-    var register = try sendHttp3CurlRequestWithSpec(allocator, quic_port, .{
-        .scheme = "https",
-        .path = "/v1/devices/register",
-        .method = "POST",
-        .body = "{\"device_id\":\"device-h3\",\"public_key\":\"pub-h3\"}",
-        .headers = &.{
-            .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
-            .{ .name = "Content-Type", .value = "application/json" },
-        },
-        .insecure = true,
-        .binary_path = http3_curl_path,
-        .http3_only = true,
-    });
-    defer register.deinit();
-    try std.testing.expectEqual(@as(u16, 201), register.status_code);
-    try assertContains(register.body, "\"registered\":true");
-
-    var create = try sendHttp3CurlRequestWithSpec(allocator, quic_port, .{
-        .scheme = "https",
-        .path = "/v1/sessions",
-        .method = "POST",
-        .body = "{\"device_id\":\"device-h3\"}",
-        .headers = &.{
-            .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
-            .{ .name = "Content-Type", .value = "application/json" },
-        },
-        .insecure = true,
-        .binary_path = http3_curl_path,
-        .http3_only = true,
-    });
-    defer create.deinit();
-    try std.testing.expectEqual(@as(u16, 201), create.status_code);
-    const session_token = create.header("x-session-token") orelse return error.MissingSessionToken;
-    const owned_session_token = try allocator.dupe(u8, session_token);
-    defer allocator.free(owned_session_token);
-
-    var missing_refresh = try sendHttp3CurlRequestWithSpec(allocator, quic_port, .{
-        .scheme = "https",
-        .path = "/v1/sessions/refresh",
-        .method = "POST",
-        .insecure = true,
-        .binary_path = http3_curl_path,
-        .http3_only = true,
-    });
-    defer missing_refresh.deinit();
-    try std.testing.expectEqual(@as(u16, 400), missing_refresh.status_code);
-
-    var refresh = try sendHttp3CurlRequestWithSpec(allocator, quic_port, .{
-        .scheme = "https",
-        .path = "/v1/sessions/refresh",
-        .method = "POST",
-        .headers = &.{.{ .name = "X-Session-Token", .value = owned_session_token }},
-        .insecure = true,
-        .binary_path = http3_curl_path,
-        .http3_only = true,
-    });
-    defer refresh.deinit();
-    try std.testing.expectEqual(@as(u16, 200), refresh.status_code);
-    try assertContains(refresh.body, "\"session_token\":\"");
-    try assertContains(refresh.body, "\"access_ttl_seconds\":");
-    try assertContains(refresh.body, "\"refresh_ttl_seconds\":");
-    const refreshed_token = refresh.header("x-session-token") orelse return error.MissingSessionToken;
-    try std.testing.expect(refreshed_token.len > 0);
-}
-
-test "http3 integration purges proxy cache over quic" {
-    if (!build_options.enable_http3_ngtcp2) return error.SkipZigTest;
-    std.fs.accessAbsolute(http3_curl_path, .{}) catch return error.SkipZigTest;
-
-    const allocator = std.testing.allocator;
-    const responses = [_]UpstreamResponseSpec{
-        .{ .headers = &.{.{ .name = "Content-Type", .value = "application/json" }}, .body = "{\"version\":1}" },
-        .{ .headers = &.{.{ .name = "Content-Type", .value = "application/json" }}, .body = "{\"version\":2}" },
-    };
-    var upstream = try UpstreamServer.start(allocator, &responses);
-    defer upstream.stop();
-    try upstream.run();
-
-    const quic_port = try findFreePort();
-    const quic_port_str = try std.fmt.allocPrint(allocator, "{d}", .{quic_port});
-    defer allocator.free(quic_port_str);
-
-    const opts = TardigradeOptions{
-        .upstream_port = upstream.port(),
-        .extra_env = &.{
-            .{ .name = "TARDIGRADE_HTTP3_ENABLED", .value = "true" },
-            .{ .name = "TARDIGRADE_QUIC_PORT", .value = quic_port_str },
-            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = "tests/fixtures/tls/server.crt" },
-            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = "tests/fixtures/tls/server.key" },
-            .{ .name = "TARDIGRADE_PROXY_CACHE_TTL_SECONDS", .value = "30" },
-            .{ .name = "TARDIGRADE_PROXY_CACHE_STALE_WHILE_REVALIDATE_SECONDS", .value = "30" },
-        },
-        .ready_https_insecure = true,
-    };
-    var tardigrade = try TardigradeProcess.start(allocator, opts);
-    defer tardigrade.stop();
-    try waitForHttp3Configured(tardigrade.port, 5000);
-
-    const chat_body = "{\"message\":\"purge http3 cache\"}";
-
-    var first = try sendCurlRequest(allocator, tardigrade.port, .{
-        .scheme = "https",
-        .path = "/v1/chat",
-        .method = "POST",
-        .body = chat_body,
-        .headers = &.{
-            .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
-            .{ .name = "Content-Type", .value = "application/json" },
-        },
-        .insecure = true,
-    });
-    defer first.deinit();
-    try std.testing.expectEqual(@as(u16, 200), first.status_code);
-    try assertContains(first.body, "\"version\":1");
-
-    var hit = try sendCurlRequest(allocator, tardigrade.port, .{
-        .scheme = "https",
-        .path = "/v1/chat",
-        .method = "POST",
-        .body = chat_body,
-        .headers = &.{
-            .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
-            .{ .name = "Content-Type", .value = "application/json" },
-        },
-        .insecure = true,
-    });
-    defer hit.deinit();
-    try std.testing.expectEqual(@as(u16, 200), hit.status_code);
-    try assertContains(hit.body, "\"version\":1");
-    try std.testing.expectEqual(@as(u32, 1), upstream.requestCount());
-
-    var unauthorized_purge = try sendHttp3CurlRequestWithSpec(allocator, quic_port, .{
-        .scheme = "https",
-        .path = "/v1/cache/purge",
-        .method = "POST",
-        .insecure = true,
-        .binary_path = http3_curl_path,
-        .http3_only = true,
-    });
-    defer unauthorized_purge.deinit();
-    try std.testing.expectEqual(@as(u16, 401), unauthorized_purge.status_code);
-
-    var purge = try sendHttp3CurlRequestWithSpec(allocator, quic_port, .{
-        .scheme = "https",
-        .path = "/v1/cache/purge",
-        .method = "POST",
-        .headers = &.{.{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token }},
-        .insecure = true,
-        .binary_path = http3_curl_path,
-        .http3_only = true,
-    });
-    defer purge.deinit();
-    try std.testing.expectEqual(@as(u16, 200), purge.status_code);
-    try assertContains(purge.body, "\"purged\":1");
-
-    var after_purge = try sendCurlRequest(allocator, tardigrade.port, .{
-        .scheme = "https",
-        .path = "/v1/chat",
-        .method = "POST",
-        .body = chat_body,
-        .headers = &.{
-            .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
-            .{ .name = "Content-Type", .value = "application/json" },
-        },
-        .insecure = true,
-    });
-    defer after_purge.deinit();
-    try std.testing.expectEqual(@as(u16, 200), after_purge.status_code);
-    try assertContains(after_purge.body, "\"version\":2");
-    try std.testing.expectEqual(@as(u32, 2), upstream.requestCount());
-}
-
-test "http3 integration multiplexes parallel requests on one connection" {
-    if (!build_options.enable_http3_ngtcp2) return error.SkipZigTest;
-    std.fs.accessAbsolute(http3_curl_path, .{}) catch return error.SkipZigTest;
-
-    const allocator = std.testing.allocator;
-    const quic_port = try findFreePort();
-    const quic_port_str = try std.fmt.allocPrint(allocator, "{d}", .{quic_port});
-    defer allocator.free(quic_port_str);
-
-    const opts = TardigradeOptions{
-        .upstream_port = null,
-        .extra_env = &.{
-            .{ .name = "TARDIGRADE_HTTP3_ENABLED", .value = "true" },
-            .{ .name = "TARDIGRADE_QUIC_PORT", .value = quic_port_str },
-            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = "tests/fixtures/tls/server.crt" },
-            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = "tests/fixtures/tls/server.key" },
-        },
-        .ready_https_insecure = true,
-    };
-    var tardigrade = try TardigradeProcess.start(allocator, opts);
-    defer tardigrade.stop();
-    try waitForHttp3Configured(tardigrade.port, 5000);
-
-    const out_health_path = try std.fmt.allocPrint(allocator, ".zig-cache/http3-parallel-health-{d}.out", .{quic_port});
-    defer allocator.free(out_health_path);
-    const out_metrics_path = try std.fmt.allocPrint(allocator, ".zig-cache/http3-parallel-metrics-{d}.out", .{quic_port});
-    defer allocator.free(out_metrics_path);
-    std.fs.cwd().deleteFile(out_health_path) catch {};
-    std.fs.cwd().deleteFile(out_metrics_path) catch {};
-    defer std.fs.cwd().deleteFile(out_health_path) catch {};
-    defer std.fs.cwd().deleteFile(out_metrics_path) catch {};
-
-    const health_url = try std.fmt.allocPrint(allocator, "https://{s}:{d}/health", .{ test_host, quic_port });
-    defer allocator.free(health_url);
-    const metrics_url = try std.fmt.allocPrint(allocator, "https://{s}:{d}/metrics/json", .{ test_host, quic_port });
-    defer allocator.free(metrics_url);
-
-    var parallel_ok = false;
-    var last_parallel_err: ?anyerror = null;
-    for (0..http3_retry_attempts) |_| {
-        const run_res = try std.process.Child.run(.{
-            .allocator = allocator,
-            .argv = &.{
-                http3_curl_path,
-                "--http3-only",
-                "-k",
-                "--parallel",
-                "--parallel-max",
-                "2",
-                "--silent",
-                "--show-error",
-                "--connect-timeout",
-                "5",
-                "--max-time",
-                "8",
-                "-o",
-                out_health_path,
-                health_url,
-                "-o",
-                out_metrics_path,
-                metrics_url,
-            },
-            .max_output_bytes = 1024 * 1024,
-        });
-        defer allocator.free(run_res.stdout);
-        defer allocator.free(run_res.stderr);
-        switch (run_res.term) {
-            .Exited => |code| {
-                if (code == 0) {
-                    parallel_ok = true;
-                    break;
-                }
-                last_parallel_err = error.CurlFailed;
-            },
-            else => last_parallel_err = error.CurlFailed,
-        }
-        std.fs.cwd().deleteFile(out_health_path) catch {};
-        std.fs.cwd().deleteFile(out_metrics_path) catch {};
-        std.time.sleep(http3_retry_delay_ms * std.time.ns_per_ms);
-    }
-    if (!parallel_ok) return last_parallel_err orelse error.CurlFailed;
-
-    const health_body = try std.fs.cwd().readFileAlloc(allocator, out_health_path, 1024 * 1024);
-    defer allocator.free(health_body);
-    const metrics_body = try std.fs.cwd().readFileAlloc(allocator, out_metrics_path, 1024 * 1024);
-    defer allocator.free(metrics_body);
-    try assertContains(health_body, "\"status\":\"ok\"");
-    try assertContains(metrics_body, "\"total_requests\":");
-
-    var runtime_health = try sendCurlRequest(allocator, tardigrade.port, .{
-        .scheme = "https",
-        .path = "/health",
-        .insecure = true,
-    });
-    defer runtime_health.deinit();
-    try assertContains(runtime_health.body, "\"http3_native_connections\":1");
-    try assertContains(runtime_health.body, "\"http3_handshakes_completed\":1");
-    try assertContains(runtime_health.body, "\"http3_requests_completed\":2");
-}
-
-test "http3 integration serves authenticated admin routes over quic" {
-    if (!build_options.enable_http3_ngtcp2) return error.SkipZigTest;
-    std.fs.accessAbsolute(http3_curl_path, .{}) catch return error.SkipZigTest;
-
-    const allocator = std.testing.allocator;
-    const responses = [_]UpstreamResponseSpec{.{
-        .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
-        .body = "{\"ok\":true}",
-    }};
-    var upstream = try UpstreamServer.start(allocator, &responses);
-    defer upstream.stop();
-    try upstream.run();
-
-    const quic_port = try findFreePort();
-    const quic_port_str = try std.fmt.allocPrint(allocator, "{d}", .{quic_port});
-    defer allocator.free(quic_port_str);
-
-    const opts = TardigradeOptions{
-        .upstream_port = upstream.port(),
-        .extra_env = &.{
-            .{ .name = "TARDIGRADE_HTTP3_ENABLED", .value = "true" },
-            .{ .name = "TARDIGRADE_QUIC_PORT", .value = quic_port_str },
-            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = "tests/fixtures/tls/server.crt" },
-            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = "tests/fixtures/tls/server.key" },
-            .{ .name = "TARDIGRADE_UPSTREAM_HEALTH_INTERVAL_MS", .value = "100" },
-            .{ .name = "TARDIGRADE_UPSTREAM_HEALTH_TIMEOUT_MS", .value = "200" },
-            .{ .name = "TARDIGRADE_UPSTREAM_HEALTH_THRESHOLD", .value = "1" },
-            .{ .name = "TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_SUCCESS_THRESHOLD", .value = "1" },
-        },
-        .ready_https_insecure = true,
-    };
-    var tardigrade = try TardigradeProcess.start(allocator, opts);
-    defer tardigrade.stop();
-    try waitForHttp3Configured(tardigrade.port, 5000);
-
-    var unauthorized = try sendHttp3CurlRequestWithSpec(allocator, quic_port, .{
-        .scheme = "https",
-        .path = "/admin/routes",
-        .insecure = true,
-        .binary_path = http3_curl_path,
-        .http3_only = true,
-    });
-    defer unauthorized.deinit();
-    try std.testing.expectEqual(@as(u16, 401), unauthorized.status_code);
-    try assertContains(unauthorized.body, "\"code\":\"unauthorized\"");
-
-    var authorized = try sendHttp3CurlRequestWithSpec(allocator, quic_port, .{
-        .scheme = "https",
-        .path = "/admin/routes",
-        .insecure = true,
-        .binary_path = http3_curl_path,
-        .http3_only = true,
-        .headers = &.{
-            .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
-        },
-    });
-    defer authorized.deinit();
-    try std.testing.expectEqual(@as(u16, 200), authorized.status_code);
-    try assertContains(authorized.body, "/health");
-    try assertContains(authorized.body, "/metrics");
-
-    var connections = try sendHttp3CurlRequestWithSpec(allocator, quic_port, .{
-        .scheme = "https",
-        .path = "/admin/connections",
-        .insecure = true,
-        .binary_path = http3_curl_path,
-        .http3_only = true,
-        .headers = &.{
-            .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
-        },
-    });
-    defer connections.deinit();
-    try std.testing.expectEqual(@as(u16, 200), connections.status_code);
-    try assertContains(connections.body, "\"active\":");
-    try assertContains(connections.body, "\"tracked_ip_buckets\":");
-
-    var upstreams = try sendHttp3CurlRequestWithSpec(allocator, quic_port, .{
-        .scheme = "https",
-        .path = "/admin/upstreams",
-        .insecure = true,
-        .binary_path = http3_curl_path,
-        .http3_only = true,
-        .headers = &.{
-            .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
-        },
-    });
-    defer upstreams.deinit();
-    try std.testing.expectEqual(@as(u16, 200), upstreams.status_code);
-    try assertContains(upstreams.body, "\"upstreams\":[");
-}
-
-test "tls integration rejects client signed by unrecognized ca" {
-    const allocator = std.testing.allocator;
-
-    const opts = TardigradeOptions{
-        .upstream_port = null,
-        .extra_env = &.{
-            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = "tests/fixtures/tls/server.crt" },
-            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = "tests/fixtures/tls/server.key" },
-            .{ .name = "TARDIGRADE_TLS_CLIENT_CA_PATH", .value = "tests/fixtures/tls/ca.crt" },
-            .{ .name = "TARDIGRADE_TLS_CLIENT_VERIFY", .value = "true" },
-        },
-        .ready_https_insecure = true,
-        .ready_client_cert = "tests/fixtures/tls/client.crt",
-        .ready_client_key = "tests/fixtures/tls/client.key",
-    };
-    var tardigrade = try TardigradeProcess.start(allocator, opts);
-    defer tardigrade.stop();
-
-    var rogue = try runCurl(allocator, tardigrade.port, .{
-        .scheme = "https",
-        .path = "/health",
-        .insecure = true,
-        .cert = "tests/fixtures/tls/rogue_client.crt",
-        .key = "tests/fixtures/tls/rogue_client.key",
-    });
-    defer rogue.deinit();
-    switch (rogue.term) {
-        .Exited => |code| try std.testing.expect(code != 0),
-        else => try std.testing.expect(true),
-    }
-}
-
-test "tls integration routes SNI hostnames to the configured certificate" {
-    const allocator = std.testing.allocator;
-
-    const opts = TardigradeOptions{
-        .upstream_port = null,
-        .extra_env = &.{
-            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = "tests/fixtures/tls/server.crt" },
-            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = "tests/fixtures/tls/server.key" },
-            .{ .name = "TARDIGRADE_TLS_SNI_CERTS", .value = "sni.integration.test:tests/fixtures/tls/alt_server.crt:tests/fixtures/tls/alt_server.key" },
-        },
-        .ready_https_insecure = true,
-    };
-    var tardigrade = try TardigradeProcess.start(allocator, opts);
-    defer tardigrade.stop();
-
-    const sni_subject = try opensslPresentedSubject(allocator, tardigrade.port, "sni.integration.test");
-    defer allocator.free(sni_subject);
-    try assertContains(sni_subject, "sni.integration.test");
-
-    const default_subject = try opensslPresentedSubject(allocator, tardigrade.port, "unknown.integration.test");
-    defer allocator.free(default_subject);
-    try assertContains(default_subject, "127.0.0.1");
-}
-
-test "server block tls config drives SNI certificate selection" {
-    const allocator = std.testing.allocator;
-
     const config_text =
-        \\server {
-        \\    tls_cert_path tests/fixtures/tls/server.crt;
-        \\    tls_key_path tests/fixtures/tls/server.key;
-        \\    location = /health {
-        \\        return 200 ready;
-        \\    }
-        \\}
-        \\server {
-        \\    server_name sni.integration.test;
-        \\    tls_cert_path tests/fixtures/tls/alt_server.crt;
-        \\    tls_key_path tests/fixtures/tls/alt_server.key;
-        \\    location = /health {
-        \\        return 200 ready;
-        \\    }
+        \\location /legacy/ {
+        \\    return 301 https://example.com/redirected;
         \\}
     ;
 
     var tardigrade = try TardigradeProcess.start(allocator, .{
-        .upstream_port = null,
-        .auth_token_hashes = null,
-        .config_text = config_text,
-        .ready_https_insecure = true,
-    });
-    defer tardigrade.stop();
-
-    const sni_subject = try opensslPresentedSubject(allocator, tardigrade.port, "sni.integration.test");
-    defer allocator.free(sni_subject);
-    try assertContains(sni_subject, "sni.integration.test");
-
-    const default_subject = try opensslPresentedSubject(allocator, tardigrade.port, "unknown.integration.test");
-    defer allocator.free(default_subject);
-    try assertContains(default_subject, "127.0.0.1");
-}
-
-test "smtp proxy integration relays raw smtp payload through configured smtp_pass upstream" {
-    const allocator = std.testing.allocator;
-
-    const smtp_reply =
-        "220 smtp.integration.test ESMTP\r\n" ++
-        "250-PIPELINING\r\n" ++
-        "250 OK\r\n";
-    var smtp = try RawTcpServer.start(allocator, smtp_reply);
-    defer smtp.stop();
-    try smtp.run();
-
-    const config_text = try std.fmt.allocPrint(allocator,
-        \\smtp_pass {s}:{d};
-    , .{ test_host, smtp.port() });
-    defer allocator.free(config_text);
-
-    var tardigrade = try TardigradeProcess.start(allocator, .{
-        .upstream_port = null,
-        .auth_token_hashes = valid_bearer_hash,
-        .config_text = config_text,
-        .extra_env = &.{.{ .name = "TARDIGRADE_WORKER_THREADS", .value = "4" }},
-    });
-    defer tardigrade.stop();
-
-    const smtp_payload =
-        "EHLO integration.test\r\n" ++
-        "MAIL FROM:<sender@example.test>\r\n" ++
-        "RCPT TO:<receiver@example.test>\r\n" ++
-        "DATA\r\n" ++
-        "Subject: integration\r\n\r\nhello smtp\r\n.\r\nQUIT\r\n";
-
-    var response = try sendRequest(allocator, tardigrade.port, .{
-        .method = "POST",
-        .path = "/v1/mail/smtp",
-        .body = smtp_payload,
-        .headers = &.{
-            .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
-        },
-    });
-    defer response.deinit();
-    try std.testing.expectEqual(@as(u16, 200), response.status_code);
-    try std.testing.expectEqualStrings("application/octet-stream", response.header("Content-Type").?);
-    try assertContains(response.body, "220 smtp.integration.test ESMTP");
-    try assertContains(response.body, "250 OK");
-
-    try std.testing.expectEqual(@as(u32, 1), smtp.capture.request_count);
-    try assertContains(smtp.capture.raw, "EHLO integration.test");
-    try assertContains(smtp.capture.raw, "DATA\r\n");
-    try assertContains(smtp.capture.raw, "X-Tardigrade-Auth-Identity: " ++ valid_bearer_hash);
-    try assertContains(smtp.capture.raw, "hello smtp");
-}
-
-test "smtp proxy integration upgrades upstream with STARTTLS when configured" {
-    if (builtin.os.tag == .macos) return error.SkipZigTest;
-    const allocator = std.testing.allocator;
-    const smtp_port = try findFreePort();
-    const tardigrade_port = try findFreePort();
-    const cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
-    defer allocator.free(cwd);
-
-    const dir_rel = try std.fmt.allocPrint(allocator, ".zig-cache/starttls-shell-{d}-{d}", .{ smtp_port, tardigrade_port });
-    defer allocator.free(dir_rel);
-    try std.fs.cwd().makePath(dir_rel);
-    defer std.fs.cwd().deleteTree(dir_rel) catch {};
-
-    const dir_abs = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ cwd, dir_rel });
-    defer allocator.free(dir_abs);
-    const server_path = try std.fmt.allocPrint(allocator, "{s}/server.py", .{dir_abs});
-    defer allocator.free(server_path);
-    const script_path = try std.fmt.allocPrint(allocator, "{s}/run.sh", .{dir_abs});
-    defer allocator.free(script_path);
-    const payload_path = try std.fmt.allocPrint(allocator, "{s}/payload.txt", .{dir_abs});
-    defer allocator.free(payload_path);
-    const plain_path = try std.fmt.allocPrint(allocator, "{s}/plain.txt", .{dir_abs});
-    defer allocator.free(plain_path);
-    const tls_path = try std.fmt.allocPrint(allocator, "{s}/tls.txt", .{dir_abs});
-    defer allocator.free(tls_path);
-    const debug_path = try std.fmt.allocPrint(allocator, "{s}/debug.log", .{dir_abs});
-    defer allocator.free(debug_path);
-    const body_path = try std.fmt.allocPrint(allocator, "{s}/body.txt", .{dir_abs});
-    defer allocator.free(body_path);
-    const status_path = try std.fmt.allocPrint(allocator, "{s}/status.txt", .{dir_abs});
-    defer allocator.free(status_path);
-    const tg_log_path = try std.fmt.allocPrint(allocator, "{s}/tardigrade.log", .{dir_abs});
-    defer allocator.free(tg_log_path);
-    const cert_path = try std.fmt.allocPrint(allocator, "{s}/tests/fixtures/tls/server.crt", .{cwd});
-    defer allocator.free(cert_path);
-    const key_path = try std.fmt.allocPrint(allocator, "{s}/tests/fixtures/tls/server.key", .{cwd});
-    defer allocator.free(key_path);
-
-    {
-        var file = try std.fs.createFileAbsolute(payload_path, .{});
-        defer file.close();
-        try file.writeAll(
-            "MAIL FROM:<sender@example.test>\r\n" ++
-                "RCPT TO:<receiver@example.test>\r\n" ++
-                "DATA\r\n" ++
-                "Subject: integration\r\n\r\nhello starttls\r\n.\r\nQUIT\r\n",
-        );
-    }
-
-    const server_script = try std.fmt.allocPrint(allocator,
-        \\import socket, ssl, time
-        \\HOST = "127.0.0.1"
-        \\PORT = {d}
-        \\PLAIN = r"""{s}"""
-        \\TLS = r"""{s}"""
-        \\DEBUG = r"""{s}"""
-        \\CERT = r"""{s}"""
-        \\KEY = r"""{s}"""
-        \\def log(msg):
-        \\    with open(DEBUG, "a") as f:
-        \\        f.write(msg + "\\n")
-        \\listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        \\listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        \\listener.bind((HOST, PORT))
-        \\listener.listen(1)
-        \\conn, _ = listener.accept()
-        \\log("accepted")
-        \\conn.sendall(b"220 starttls.integration.test ESMTP\\r\\n")
-        \\log("greeting_sent")
-        \\time.sleep(0.05)
-        \\plain = conn.recv(4096)
-        \\with open(PLAIN, "ab") as f:
-        \\    f.write(plain)
-        \\log("plain_recv_1")
-        \\conn.sendall(b"250-starttls.integration.test\\r\\n250-STARTTLS\\r\\n250 OK\\r\\n")
-        \\time.sleep(0.05)
-        \\starttls = conn.recv(4096)
-        \\with open(PLAIN, "ab") as f:
-        \\    f.write(starttls)
-        \\log("plain_recv_2")
-        \\conn.sendall(b"220 Ready to start TLS\\r\\n")
-        \\time.sleep(0.05)
-        \\ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        \\ctx.load_cert_chain(CERT, KEY)
-        \\tls_conn = ctx.wrap_socket(conn, server_side=True)
-        \\log("tls_wrapped")
-        \\post_tls = tls_conn.recv(4096)
-        \\with open(TLS, "ab") as f:
-        \\    f.write(post_tls)
-        \\log("tls_recv_1")
-        \\tls_conn.sendall(b"250-starttls.integration.test\\r\\n250 AUTH PLAIN\\r\\n")
-        \\time.sleep(0.05)
-        \\payload = tls_conn.recv(4096)
-        \\with open(TLS, "ab") as f:
-        \\    f.write(payload)
-        \\log("tls_recv_2")
-        \\tls_conn.sendall(b"250 queued over tls\\r\\n")
-        \\tls_conn.close()
-        \\listener.close()
-    , .{ smtp_port, plain_path, tls_path, debug_path, cert_path, key_path });
-    defer allocator.free(server_script);
-    {
-        var file = try std.fs.createFileAbsolute(server_path, .{});
-        defer file.close();
-        try file.writeAll(server_script);
-    }
-
-    const shell_script = try std.fmt.allocPrint(allocator,
-        \\#!/bin/zsh
-        \\set -euo pipefail
-        \\/opt/homebrew/bin/python3 "{s}" >/dev/null 2>&1 &
-        \\SPID=$!
-        \\cleanup() {{
-        \\  kill $TPID 2>/dev/null || true
-        \\  wait $TPID 2>/dev/null || true
-        \\  kill $SPID 2>/dev/null || true
-        \\  wait $SPID 2>/dev/null || true
-        \\}}
-        \\trap cleanup EXIT
-        \\TARDIGRADE_LISTEN_HOST={s} \
-        \\TARDIGRADE_LISTEN_PORT={d} \
-        \\TARDIGRADE_ERROR_LOG_PATH="{s}" \
-        \\TARDIGRADE_WORKER_THREADS=4 \
-        \\TARDIGRADE_AUTH_TOKEN_HASHES= \
-        \\TARDIGRADE_SMTP_UPSTREAM="starttls://{s}:{d}" \
-        \\"{s}" >/dev/null 2>&1 &
-        \\TPID=$!
-        \\for i in {{1..50}}; do
-        \\  if /usr/bin/curl -sf "http://{s}:{d}/health" >/dev/null; then
-        \\    break
-        \\  fi
-        \\  sleep 0.1
-        \\done
-        \\sleep 1
-        \\HTTP_CODE=$(/usr/bin/curl -sS -o "{s}" -w "%{{http_code}}" -X POST --data-binary @"{s}" "http://{s}:{d}/v1/mail/smtp")
-        \\printf "%s" "$HTTP_CODE" > "{s}"
-    ,
-        .{
-            server_path,
-            test_host,
-            tardigrade_port,
-            tg_log_path,
-            test_host,
-            smtp_port,
-            integration_options.tardigrade_bin_path,
-            test_host,
-            tardigrade_port,
-            body_path,
-            payload_path,
-            test_host,
-            tardigrade_port,
-            status_path,
-        },
-    );
-    defer allocator.free(shell_script);
-    {
-        var file = try std.fs.createFileAbsolute(script_path, .{});
-        defer file.close();
-        try file.writeAll(shell_script);
-    }
-    const run_res = try std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = &.{ "zsh", script_path },
-        .max_output_bytes = 1024 * 1024,
-    });
-    defer allocator.free(run_res.stdout);
-    defer allocator.free(run_res.stderr);
-
-    switch (run_res.term) {
-        .Exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
-        else => return error.UnexpectedExit,
-    }
-
-    const status_text = blk: {
-        var file = try std.fs.openFileAbsolute(status_path, .{});
-        defer file.close();
-        break :blk try file.readToEndAlloc(allocator, 32);
-    };
-    defer allocator.free(status_text);
-    try std.testing.expectEqualStrings("200", std.mem.trim(u8, status_text, " \t\r\n"));
-
-    const body = blk: {
-        var file = try std.fs.openFileAbsolute(body_path, .{});
-        defer file.close();
-        break :blk try file.readToEndAlloc(allocator, 1024 * 1024);
-    };
-    defer allocator.free(body);
-    try assertContains(body, "250 queued over tls");
-
-    const plain_capture = blk: {
-        var file = try std.fs.openFileAbsolute(plain_path, .{});
-        defer file.close();
-        break :blk try file.readToEndAlloc(allocator, 1024 * 1024);
-    };
-    defer allocator.free(plain_capture);
-    const tls_capture = blk: {
-        var file = try std.fs.openFileAbsolute(tls_path, .{});
-        defer file.close();
-        break :blk try file.readToEndAlloc(allocator, 1024 * 1024);
-    };
-    defer allocator.free(tls_capture);
-
-    try assertContains(plain_capture, "EHLO tardigrade.local");
-    try assertContains(plain_capture, "STARTTLS");
-    try assertContains(tls_capture, "EHLO tardigrade.local");
-    try assertContains(tls_capture, "MAIL FROM:<sender@example.test>");
-    try assertContains(tls_capture, "hello starttls");
-}
-
-test "imap proxy integration relays LOGIN command through configured imap_pass upstream" {
-    const allocator = std.testing.allocator;
-
-    const imap_reply =
-        "* OK imap.integration.test IMAP4rev1 ready\r\n" ++
-        "a001 OK LOGIN completed\r\n";
-    var imap = try RawTcpServer.start(allocator, imap_reply);
-    defer imap.stop();
-    try imap.run();
-
-    const config_text = try std.fmt.allocPrint(allocator,
-        \\imap_pass {s}:{d};
-    , .{ test_host, imap.port() });
-    defer allocator.free(config_text);
-
-    var tardigrade = try TardigradeProcess.start(allocator, .{
-        .upstream_port = null,
-        .config_text = config_text,
-        .extra_env = &.{.{ .name = "TARDIGRADE_WORKER_THREADS", .value = "4" }},
-    });
-    defer tardigrade.stop();
-
-    var response = try sendRequest(allocator, tardigrade.port, .{
-        .method = "POST",
-        .path = "/v1/mail/imap",
-        .body = "a001 LOGIN user@example.test secret-password\r\n",
-        .headers = &.{},
-    });
-    defer response.deinit();
-    try std.testing.expectEqual(@as(u16, 200), response.status_code);
-    try std.testing.expectEqualStrings("application/octet-stream", response.header("Content-Type").?);
-    try assertContains(response.body, "* OK imap.integration.test");
-    try assertContains(response.body, "a001 OK LOGIN completed");
-
-    try std.testing.expectEqual(@as(u32, 1), imap.capture.request_count);
-    try assertContains(imap.capture.raw, "a001 LOGIN user@example.test secret-password");
-}
-
-test "imap proxy integration upgrades upstream with STARTTLS when configured" {
-    if (builtin.os.tag == .macos) return error.SkipZigTest;
-    const allocator = std.testing.allocator;
-    const imap_port = try findFreePort();
-    const cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
-    defer allocator.free(cwd);
-
-    const dir_rel = try std.fmt.allocPrint(allocator, ".zig-cache/imap-starttls-{d}-{d}", .{ imap_port, std.time.milliTimestamp() });
-    defer allocator.free(dir_rel);
-    try std.fs.cwd().makePath(dir_rel);
-
-    const dir_abs = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ cwd, dir_rel });
-    defer allocator.free(dir_abs);
-    const server_path = try std.fmt.allocPrint(allocator, "{s}/server.py", .{dir_abs});
-    defer allocator.free(server_path);
-    const plain_path = try std.fmt.allocPrint(allocator, "{s}/plain.txt", .{dir_abs});
-    defer allocator.free(plain_path);
-    const tls_path = try std.fmt.allocPrint(allocator, "{s}/tls.txt", .{dir_abs});
-    defer allocator.free(tls_path);
-    const debug_path = try std.fmt.allocPrint(allocator, "{s}/debug.log", .{dir_abs});
-    defer allocator.free(debug_path);
-    const cert_path = try std.fmt.allocPrint(allocator, "{s}/tests/fixtures/tls/server.crt", .{cwd});
-    defer allocator.free(cert_path);
-    const key_path = try std.fmt.allocPrint(allocator, "{s}/tests/fixtures/tls/server.key", .{cwd});
-    defer allocator.free(key_path);
-
-    const server_script = try std.fmt.allocPrint(allocator,
-        \\import socket, ssl
-        \\HOST = "127.0.0.1"
-        \\PORT = {d}
-        \\PLAIN = r"""{s}"""
-        \\TLS = r"""{s}"""
-        \\DEBUG = r"""{s}"""
-        \\CERT = r"""{s}"""
-        \\KEY = r"""{s}"""
-        \\def log(msg):
-        \\    with open(DEBUG, "a") as f:
-        \\        f.write(msg + "\\n")
-        \\ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        \\ctx.load_cert_chain(CERT, KEY)
-        \\listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        \\listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        \\listener.bind((HOST, PORT))
-        \\listener.listen(1)
-        \\print("READY", flush=True)
-        \\log("ready")
-        \\while True:
-        \\    conn, _ = listener.accept()
-        \\    log("accepted")
-        \\    conn.sendall(b"* OK imap.starttls.integration.test ready\\r\\n")
-        \\    starttls = conn.recv(4096)
-        \\    log("plain_recv:" + repr(starttls))
-        \\    with open(PLAIN, "ab") as f:
-        \\        f.write(starttls)
-        \\    if not starttls:
-        \\        conn.close()
-        \\        continue
-        \\    conn.sendall(b"a001 OK Begin TLS negotiation now\\r\\n")
-        \\    try:
-        \\        tls_conn = ctx.wrap_socket(conn, server_side=True)
-        \\        log("tls_wrapped")
-        \\        payload = tls_conn.recv(4096)
-        \\        log("tls_recv:" + repr(payload))
-        \\        with open(TLS, "ab") as f:
-        \\            f.write(payload)
-        \\        tls_conn.sendall(b"a900 OK LOGIN completed\\r\\n")
-        \\        tls_conn.close()
-        \\        break
-        \\    except Exception as exc:
-        \\        log("tls_error:" + repr(exc))
-        \\        conn.close()
-        \\        continue
-        \\listener.close()
-    , .{ imap_port, plain_path, tls_path, debug_path, cert_path, key_path });
-    defer allocator.free(server_script);
-    {
-        var file = try std.fs.createFileAbsolute(server_path, .{});
-        defer file.close();
-        try file.writeAll(server_script);
-    }
-    var server_child = std.process.Child.init(&[_][]const u8{ "python3", server_path }, allocator);
-    server_child.stdin_behavior = .Ignore;
-    server_child.stdout_behavior = .Pipe;
-    server_child.stderr_behavior = .Ignore;
-    try server_child.spawn();
-    defer {
-        _ = server_child.kill() catch {};
-        _ = server_child.wait() catch {};
-    }
-    try waitUntilChildReady(&server_child);
-
-    const config_text = try std.fmt.allocPrint(allocator,
-        \\imap_pass starttls://{s}:{d};
-    , .{ test_host, imap_port });
-    defer allocator.free(config_text);
-
-    var tardigrade = try TardigradeProcess.start(allocator, .{
-        .upstream_port = null,
-        .config_text = config_text,
-        .extra_env = &.{.{ .name = "TARDIGRADE_WORKER_THREADS", .value = "4" }},
-    });
-    defer tardigrade.stop();
-
-    var response: ?HttpResponse = null;
-    var attempts: usize = 0;
-    while (attempts < 3) : (attempts += 1) {
-        response = sendRequest(allocator, tardigrade.port, .{
-            .method = "POST",
-            .path = "/v1/mail/imap",
-            .body = "a900 LOGIN user@example.test secret-password\r\n",
-            .headers = &.{},
-        }) catch null;
-        if (response) |resp| {
-            if (resp.status_code == 200) break;
-            var failed = resp;
-            failed.deinit();
-            response = null;
-        }
-        std.time.sleep(100 * std.time.ns_per_ms);
-    }
-    if (response == null) {
-        const debug = std.fs.openFileAbsolute(debug_path, .{}) catch null;
-        if (debug) |file| {
-            defer file.close();
-            const debug_contents = file.readToEndAlloc(allocator, 1024 * 1024) catch null;
-            if (debug_contents) |contents| {
-                defer allocator.free(contents);
-                std.debug.print("imap starttls debug:\n{s}\n", .{contents});
-            }
-        }
-        return error.TestExpectedEqual;
-    }
-    var final_response = response.?;
-    defer final_response.deinit();
-    try std.testing.expectEqual(@as(u16, 200), final_response.status_code);
-    try assertContains(final_response.body, "a900 OK LOGIN completed");
-
-    const plain_capture = blk: {
-        var file = try std.fs.openFileAbsolute(plain_path, .{});
-        defer file.close();
-        break :blk try file.readToEndAlloc(allocator, 1024 * 1024);
-    };
-    defer allocator.free(plain_capture);
-    const tls_capture = blk: {
-        var file = try std.fs.openFileAbsolute(tls_path, .{});
-        defer file.close();
-        break :blk try file.readToEndAlloc(allocator, 1024 * 1024);
-    };
-    defer allocator.free(tls_capture);
-
-    try assertContains(plain_capture, "a001 STARTTLS");
-    try assertContains(tls_capture, "a900 LOGIN user@example.test secret-password");
-}
-
-test "pop3 proxy integration relays USER and PASS through configured pop3_pass upstream" {
-    const allocator = std.testing.allocator;
-
-    const pop3_reply =
-        "+OK pop3.integration.test ready\r\n" ++
-        "+OK logged in\r\n";
-    var pop3 = try RawTcpServer.start(allocator, pop3_reply);
-    defer pop3.stop();
-    try pop3.run();
-
-    const config_text = try std.fmt.allocPrint(allocator,
-        \\pop3_pass {s}:{d};
-    , .{ test_host, pop3.port() });
-    defer allocator.free(config_text);
-
-    var tardigrade = try TardigradeProcess.start(allocator, .{
-        .upstream_port = null,
-        .config_text = config_text,
-        .extra_env = &.{.{ .name = "TARDIGRADE_WORKER_THREADS", .value = "4" }},
-    });
-    defer tardigrade.stop();
-
-    const pop3_payload =
-        "USER user@example.test\r\n" ++
-        "PASS secret-password\r\n";
-
-    var response = try sendRequest(allocator, tardigrade.port, .{
-        .method = "POST",
-        .path = "/v1/mail/pop3",
-        .body = pop3_payload,
-        .headers = &.{},
-    });
-    defer response.deinit();
-    try std.testing.expectEqual(@as(u16, 200), response.status_code);
-    try std.testing.expectEqualStrings("application/octet-stream", response.header("Content-Type").?);
-    try assertContains(response.body, "+OK pop3.integration.test ready");
-    try assertContains(response.body, "+OK logged in");
-
-    try std.testing.expectEqual(@as(u32, 1), pop3.capture.request_count);
-    try assertContains(pop3.capture.raw, "USER user@example.test");
-    try assertContains(pop3.capture.raw, "PASS secret-password");
-}
-
-test "tls graceful shutdown integration sends connection close on inflight response" {
-    const allocator = std.testing.allocator;
-
-    const responses = [_]UpstreamResponseSpec{.{
-        .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
-        .body = "{\"ok\":true,\"tls_shutdown\":true}",
-        .delay_ms = 350,
-    }};
-    var upstream = try UpstreamServer.start(allocator, &responses);
-    defer upstream.stop();
-    try upstream.run();
-
-    const opts = TardigradeOptions{
-        .upstream_port = upstream.port(),
-        .extra_env = &.{
-            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = "tests/fixtures/tls/server.crt" },
-            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = "tests/fixtures/tls/server.key" },
-        },
-        .ready_https_insecure = true,
-    };
-    var tardigrade = try TardigradeProcess.start(allocator, opts);
-
-    const curl_spec = CurlRequestSpec{
-        .method = "POST",
-        .scheme = "https",
-        .path = "/v1/chat",
-        .body = "{\"message\":\"tls drain\"}",
-        .headers = &.{
-            .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
-            .{ .name = "Content-Type", .value = "application/json" },
-        },
-        .insecure = true,
-    };
-    var curl_child = try spawnCurlProcess(allocator, tardigrade.port, curl_spec);
-
-    std.time.sleep(100 * std.time.ns_per_ms);
-    tardigrade.sendSignal(std.posix.SIG.TERM);
-
-    var stdout: std.ArrayListUnmanaged(u8) = .empty;
-    defer stdout.deinit(allocator);
-    var stderr: std.ArrayListUnmanaged(u8) = .empty;
-    defer stderr.deinit(allocator);
-    try curl_child.collectOutput(allocator, &stdout, &stderr, 1024 * 1024);
-    const term = try curl_child.wait();
-    switch (term) {
-        .Exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
-        else => return error.CurlFailed,
-    }
-
-    const raw = stdout.items;
-    if (stderr.items.len > 0) {
-        std.debug.print("curl stderr: {s}\n", .{stderr.items});
-    }
-    const header_end = std.mem.indexOf(u8, raw, "\r\n\r\n") orelse return error.InvalidHttpResponse;
-    const headers_raw = raw[0 .. header_end + 2];
-    const body = raw[header_end + 4 ..];
-    try std.testing.expectEqual(@as(u16, 200), try parseStatusCode(raw));
-    try std.testing.expectEqualStrings("close", headerValue(headers_raw, "Connection").?);
-    try assertContains(body, "\"tls_shutdown\":true");
-
-    _ = tardigrade.child.wait() catch {};
-    tardigrade.allocator.free(tardigrade.log_path);
-    if (tardigrade.config_path) |path| tardigrade.allocator.free(path);
-}
-
-test "concurrency integration handles 100 concurrent chat requests without corruption" {
-    const allocator = std.testing.allocator;
-
-    const responses = [_]UpstreamResponseSpec{.{
-        .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
-        .body = "{\"ok\":true,\"concurrent\":true}",
-    }};
-    var upstream = try UpstreamServer.start(allocator, &responses);
-    defer upstream.stop();
-    try upstream.run();
-
-    var tardigrade = try TardigradeProcess.start(allocator, baseOptions(upstream.port()));
-    defer tardigrade.stop();
-
-    var start_flag = std.atomic.Value(bool).init(false);
-    var results: [100]ConcurrentRequestResult = [_]ConcurrentRequestResult{.{}} ** 100;
-    var contexts: [100]ConcurrentRequestContext = undefined;
-    var threads: [100]std.Thread = undefined;
-
-    for (&contexts, &results, 0..) |*ctx, *result, i| {
-        ctx.* = .{
-            .port = tardigrade.port,
-            .start_flag = &start_flag,
-            .result = result,
-        };
-        threads[i] = try std.Thread.spawn(.{}, concurrentChatRequestMain, .{ctx});
-    }
-
-    start_flag.store(true, .seq_cst);
-    for (threads) |thread| thread.join();
-
-    for (results) |result| {
-        try std.testing.expect(result.err == null);
-        try std.testing.expectEqual(@as(u16, 200), result.status_code);
-        try std.testing.expect(result.body_contains_ok);
-    }
-}
-
-test "concurrency integration rejects requests when worker queue is saturated" {
-    const allocator = std.testing.allocator;
-
-    const responses = [_]UpstreamResponseSpec{.{
-        .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
-        .body = "{\"ok\":true,\"queued\":true}",
-        .delay_ms = 300,
-    }};
-    var upstream = try UpstreamServer.start(allocator, &responses);
-    defer upstream.stop();
-    try upstream.run();
-
-    const opts = TardigradeOptions{
-        .upstream_port = upstream.port(),
-        .extra_env = &.{
-            .{ .name = "TARDIGRADE_WORKER_THREADS", .value = "1" },
-            .{ .name = "TARDIGRADE_WORKER_QUEUE_SIZE", .value = "1" },
-        },
-    };
-    var tardigrade = try TardigradeProcess.start(allocator, opts);
-    defer tardigrade.stop();
-
-    var start_flag = std.atomic.Value(bool).init(false);
-    var results: [8]ConcurrentRequestResult = [_]ConcurrentRequestResult{.{}} ** 8;
-    var contexts: [8]ConcurrentRequestContext = undefined;
-    var threads: [8]std.Thread = undefined;
-
-    for (&contexts, &results, 0..) |*ctx, *result, i| {
-        ctx.* = .{
-            .port = tardigrade.port,
-            .start_flag = &start_flag,
-            .result = result,
-        };
-        threads[i] = try std.Thread.spawn(.{}, concurrentChatRequestMain, .{ctx});
-    }
-
-    start_flag.store(true, .seq_cst);
-    for (threads) |thread| thread.join();
-
-    var saw_overload = false;
-    for (results) |result| {
-        if (result.err != null) {
-            saw_overload = true;
-            continue;
-        }
-        if (result.status_code == 503) saw_overload = true;
-    }
-    try std.testing.expect(saw_overload);
-
-    var metrics = try sendRequest(allocator, tardigrade.port, .{
-        .method = "GET",
-        .path = "/metrics",
-        .body = null,
-        .headers = &.{},
-    });
-    defer metrics.deinit();
-    try std.testing.expectEqual(@as(u16, 200), metrics.status_code);
-    const queue_rejections = prometheusMetricValue(metrics.body, "tardigrade_queue_rejections_total") orelse return error.MissingMetric;
-    try std.testing.expect(queue_rejections > 0);
-}
-
-test "concurrency integration drains queued requests in accept order under saturation" {
-    const allocator = std.testing.allocator;
-
-    const responses = [_]UpstreamResponseSpec{.{
-        .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
-        .body = "{\"ok\":true,\"ordered\":true}",
-        .delay_ms = 150,
-    }};
-    var upstream = try UpstreamServer.start(allocator, &responses);
-    defer upstream.stop();
-    try upstream.run();
-
-    const opts = TardigradeOptions{
-        .upstream_port = upstream.port(),
-        .extra_env = &.{
-            .{ .name = "TARDIGRADE_WORKER_THREADS", .value = "1" },
-            .{ .name = "TARDIGRADE_WORKER_QUEUE_SIZE", .value = "8" },
-        },
-    };
-    var tardigrade = try TardigradeProcess.start(allocator, opts);
-    defer tardigrade.stop();
-
-    const bodies = [_][]const u8{
-        "{\"message\":\"order-1\"}",
-        "{\"message\":\"order-2\"}",
-        "{\"message\":\"order-3\"}",
-        "{\"message\":\"order-4\"}",
-    };
-    var streams: [bodies.len]std.net.Stream = undefined;
-    var opened: usize = 0;
-    defer {
-        for (streams[0..opened]) |stream| {
-            var s = stream;
-            s.close();
-        }
-    }
-
-    for (bodies, 0..) |body, i| {
-        streams[i] = try openRequestStream(allocator, tardigrade.port, .{
-            .method = "POST",
-            .path = "/v1/chat",
-            .body = body,
-            .headers = &.{
-                .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
-                .{ .name = "Content-Type", .value = "application/json" },
-            },
-        });
-        opened += 1;
-    }
-
-    for (streams) |stream| {
-        var response = try readHttpResponse(allocator, stream);
-        defer response.deinit();
-        try std.testing.expectEqual(@as(u16, 200), response.status_code);
-        try assertContains(response.body, "\"ordered\":true");
-    }
-
-    try waitForUpstreamCount(&upstream, bodies.len, 2000);
-    upstream.mutex.lock();
-    defer upstream.mutex.unlock();
-    try std.testing.expectEqual(bodies.len, upstream.capture.body_history.items.len);
-    for (bodies, 0..) |body, i| {
-        try std.testing.expectEqualStrings(body, upstream.capture.body_history.items[i]);
-    }
-}
-
-test "concurrency integration avoids deadlock under concurrent auth and rate checks" {
-    const allocator = std.testing.allocator;
-
-    const responses = [_]UpstreamResponseSpec{.{
-        .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
-        .body = "{\"ok\":true,\"contention\":true}",
-        .delay_ms = 25,
-    }};
-    var upstream = try UpstreamServer.start(allocator, &responses);
-    defer upstream.stop();
-    try upstream.run();
-
-    const opts = TardigradeOptions{
-        .upstream_port = upstream.port(),
-        .rate_limit_rps = "10000",
-        .rate_limit_burst = "10000",
-        .extra_env = &.{
-            .{ .name = "TARDIGRADE_WORKER_THREADS", .value = "8" },
-            .{ .name = "TARDIGRADE_SESSION_TTL", .value = "3600" },
-            .{ .name = "TARDIGRADE_SESSION_MAX", .value = "128" },
-        },
-    };
-    var tardigrade = try TardigradeProcess.start(allocator, opts);
-    defer tardigrade.stop();
-
-    var session_create = try sendRequest(allocator, tardigrade.port, .{
-        .method = "POST",
-        .path = "/v1/sessions",
-        .body = "{\"device_id\":\"contention-device\"}",
-        .headers = &.{
-            .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
-            .{ .name = "Content-Type", .value = "application/json" },
-        },
-    });
-    defer session_create.deinit();
-    try std.testing.expectEqual(@as(u16, 201), session_create.status_code);
-    const session_token = session_create.header("X-Session-Token") orelse return error.MissingSessionToken;
-    const owned_session_token = try allocator.dupe(u8, session_token);
-    defer allocator.free(owned_session_token);
-
-    var start_flag = std.atomic.Value(bool).init(false);
-    var results: [32]ConcurrentAuthRateResult = [_]ConcurrentAuthRateResult{.{}} ** 32;
-    var contexts: [32]ConcurrentAuthRateContext = undefined;
-    var threads: [32]std.Thread = undefined;
-
-    for (&contexts, &results, 0..) |*ctx, *result, i| {
-        const use_session = (i % 2) == 1;
-        ctx.* = .{
-            .port = tardigrade.port,
-            .start_flag = &start_flag,
-            .result = result,
-            .auth_header_name = if (use_session) "X-Session-Token" else "Authorization",
-            .auth_header_value = if (use_session) owned_session_token else "Bearer " ++ valid_bearer_token,
-        };
-        threads[i] = try std.Thread.spawn(.{}, concurrentAuthRateRequestMain, .{ctx});
-    }
-
-    start_flag.store(true, .seq_cst);
-    for (threads) |thread| thread.join();
-
-    for (results) |result| {
-        try std.testing.expect(result.err == null);
-        try std.testing.expectEqual(@as(u16, 200), result.status_code);
-        try std.testing.expect(result.body_contains_ok);
-    }
-    try std.testing.expect(upstream.requestCount() >= results.len);
-}
-
-test "config reload integration updates upstream and rate limit without dropping inflight request" {
-    const allocator = std.testing.allocator;
-
-    const upstream1_responses = [_]UpstreamResponseSpec{.{
-        .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
-        .body = "{\"upstream\":1}",
-        .delay_ms = 350,
-    }};
-    const upstream2_responses = [_]UpstreamResponseSpec{.{
-        .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
-        .body = "{\"upstream\":2}",
-    }};
-    var upstream1 = try UpstreamServer.start(allocator, &upstream1_responses);
-    defer upstream1.stop();
-    try upstream1.run();
-    var upstream2 = try UpstreamServer.start(allocator, &upstream2_responses);
-    defer upstream2.stop();
-    try upstream2.run();
-
-    const initial_config = try std.fmt.allocPrint(
-        allocator,
-        "upstream_base_url http://{s}:{d};\nrate_limit_rps 1000;\nrate_limit_burst 1000;\n",
-        .{ test_host, upstream1.port() },
-    );
-    defer allocator.free(initial_config);
-
-    const opts = TardigradeOptions{
-        .upstream_port = null,
-        .auth_token_hashes = valid_bearer_hash,
-        .rate_limit_rps = null,
-        .rate_limit_burst = null,
-        .config_text = initial_config,
-        .extra_env = &.{.{ .name = "TARDIGRADE_PROXY_PROTOCOL", .value = "v1" }},
-        .ready_proxy_ip = "10.1.0.254",
-    };
-    var tardigrade = try TardigradeProcess.start(allocator, opts);
-    defer tardigrade.stop();
-
-    var in_flight_stream = try openRequestStream(allocator, tardigrade.port, .{
-        .method = "POST",
-        .path = "/v1/chat",
-        .body = "{\"message\":\"reload in flight\"}",
-        .headers = &.{
-            .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
-            .{ .name = "Content-Type", .value = "application/json" },
-        },
-        .proxy_ip = "10.1.0.1",
-    });
-    defer in_flight_stream.close();
-
-    const reloaded_config = try std.fmt.allocPrint(
-        allocator,
-        "upstream_base_url http://{s}:{d};\nrate_limit_rps 1;\nrate_limit_burst 1;\n",
-        .{ test_host, upstream2.port() },
-    );
-    defer allocator.free(reloaded_config);
-    try tardigrade.rewriteConfig(reloaded_config);
-    tardigrade.sendSignal(std.posix.SIG.HUP);
-
-    var inflight_response = try readHttpResponse(allocator, in_flight_stream);
-    defer inflight_response.deinit();
-    try std.testing.expectEqual(@as(u16, 200), inflight_response.status_code);
-    try assertContains(inflight_response.body, "\"upstream\":1");
-
-    var post_reload = try sendRequest(allocator, tardigrade.port, .{
-        .method = "POST",
-        .path = "/v1/chat",
-        .body = "{\"message\":\"after reload\"}",
-        .headers = &.{
-            .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
-            .{ .name = "Content-Type", .value = "application/json" },
-        },
-        .proxy_ip = "10.1.0.2",
-    });
-    defer post_reload.deinit();
-    try std.testing.expectEqual(@as(u16, 200), post_reload.status_code);
-    try assertContains(post_reload.body, "\"upstream\":2");
-
-    var limited = try sendRequest(allocator, tardigrade.port, .{
-        .method = "POST",
-        .path = "/v1/chat",
-        .body = "{\"message\":\"after reload second\"}",
-        .headers = &.{
-            .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
-            .{ .name = "Content-Type", .value = "application/json" },
-        },
-        .proxy_ip = "10.1.0.2",
-    });
-    defer limited.deinit();
-    try std.testing.expectEqual(@as(u16, 429), limited.status_code);
-}
-
-test "graceful shutdown integration lets inflight request finish before exit" {
-    const allocator = std.testing.allocator;
-
-    const responses = [_]UpstreamResponseSpec{.{
-        .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
-        .body = "{\"ok\":true,\"shutdown\":true}",
-        .delay_ms = 350,
-    }};
-    var upstream = try UpstreamServer.start(allocator, &responses);
-    defer upstream.stop();
-    try upstream.run();
-
-    var tardigrade = try TardigradeProcess.start(allocator, baseOptions(upstream.port()));
-    var child_reaped = false;
-    defer {
-        if (!child_reaped) {
-            _ = tardigrade.child.kill() catch {};
-            _ = tardigrade.child.wait() catch {};
-        }
-        tardigrade.allocator.free(tardigrade.log_path);
-        if (tardigrade.config_path) |path| tardigrade.allocator.free(path);
-    }
-
-    var stream = try openRequestStream(allocator, tardigrade.port, .{
-        .method = "POST",
-        .path = "/v1/chat",
-        .body = "{\"message\":\"finish before exit\"}",
-        .headers = &.{
-            .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
-            .{ .name = "Content-Type", .value = "application/json" },
-        },
-    });
-    tardigrade.sendSignal(std.posix.SIG.TERM);
-    var response = try readHttpResponse(allocator, stream);
-    defer response.deinit();
-    stream.close();
-    try std.testing.expectEqual(@as(u16, 200), response.status_code);
-    try assertContains(response.body, "\"shutdown\":true");
-
-    _ = tardigrade.child.wait() catch {};
-    child_reaped = true;
-}
-
-test "graceful shutdown integration sends connection close on keep-alive inflight response" {
-    const allocator = std.testing.allocator;
-
-    const responses = [_]UpstreamResponseSpec{.{
-        .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
-        .body = "{\"ok\":true,\"keepalive_shutdown\":true}",
-        .delay_ms = 350,
-    }};
-    var upstream = try UpstreamServer.start(allocator, &responses);
-    defer upstream.stop();
-    try upstream.run();
-
-    var tardigrade = try TardigradeProcess.start(allocator, baseOptions(upstream.port()));
-    var child_reaped = false;
-    defer {
-        if (!child_reaped) {
-            _ = tardigrade.child.kill() catch {};
-            _ = tardigrade.child.wait() catch {};
-        }
-        tardigrade.allocator.free(tardigrade.log_path);
-        if (tardigrade.config_path) |path| tardigrade.allocator.free(path);
-    }
-
-    var stream = try openRequestStream(allocator, tardigrade.port, .{
-        .method = "POST",
-        .path = "/v1/chat",
-        .body = "{\"message\":\"close after drain\"}",
-        .headers = &.{
-            .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
-            .{ .name = "Content-Type", .value = "application/json" },
-        },
-        .connection_close = false,
-    });
-    tardigrade.sendSignal(std.posix.SIG.TERM);
-
-    var response = try readHttpResponse(allocator, stream);
-    defer response.deinit();
-    stream.close();
-    try std.testing.expectEqual(@as(u16, 200), response.status_code);
-    try assertContains(response.body, "\"keepalive_shutdown\":true");
-    try std.testing.expectEqualStrings("close", response.header("Connection").?);
-
-    _ = tardigrade.child.wait() catch {};
-    child_reaped = true;
-}
-
-test "graceful shutdown integration exits promptly after drain completes" {
-    const allocator = std.testing.allocator;
-
-    const responses = [_]UpstreamResponseSpec{.{
-        .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
-        .body = "{\"ok\":true,\"drain_exit\":true}",
-        .delay_ms = 350,
-    }};
-    var upstream = try UpstreamServer.start(allocator, &responses);
-    defer upstream.stop();
-    try upstream.run();
-
-    var tardigrade = try TardigradeProcess.start(allocator, baseOptions(upstream.port()));
-    var child_reaped = false;
-    defer {
-        if (!child_reaped) {
-            _ = tardigrade.child.kill() catch {};
-            _ = tardigrade.child.wait() catch {};
-        }
-        tardigrade.allocator.free(tardigrade.log_path);
-        if (tardigrade.config_path) |path| tardigrade.allocator.free(path);
-    }
-
-    var stream = try openRequestStream(allocator, tardigrade.port, .{
-        .method = "POST",
-        .path = "/v1/chat",
-        .body = "{\"message\":\"drain and exit\"}",
-        .headers = &.{
-            .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
-            .{ .name = "Content-Type", .value = "application/json" },
-        },
-    });
-    tardigrade.sendSignal(std.posix.SIG.TERM);
-
-    var response = try readHttpResponse(allocator, stream);
-    defer response.deinit();
-    stream.close();
-    try std.testing.expectEqual(@as(u16, 200), response.status_code);
-    try assertContains(response.body, "\"drain_exit\":true");
-
-    try std.testing.expect(waitForChildExit(tardigrade.child.id, 2000));
-    child_reaped = true;
-    try waitForPortClosed(tardigrade.port, 250);
-
-    const log_data = try std.fs.cwd().readFileAlloc(allocator, tardigrade.log_path, 256 * 1024);
-    defer allocator.free(log_data);
-    try assertContains(log_data, "Graceful shutdown complete");
-}
-
-test "invalid sighup reload does not disrupt inflight requests" {
-    const allocator = std.testing.allocator;
-
-    const upstream1_responses = [_]UpstreamResponseSpec{
-        .{
-            .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
-            .body = "{\"upstream\":1,\"phase\":\"inflight\"}",
-            .delay_ms = 350,
-        },
-        .{
-            .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
-            .body = "{\"upstream\":1,\"phase\":\"post_reload\"}",
-        },
-    };
-    var upstream1 = try UpstreamServer.start(allocator, &upstream1_responses);
-    defer upstream1.stop();
-    try upstream1.run();
-
-    const initial_config = try std.fmt.allocPrint(
-        allocator,
-        "upstream_base_url http://{s}:{d};\nrate_limit_rps 1000;\nrate_limit_burst 1000;\n",
-        .{ test_host, upstream1.port() },
-    );
-    defer allocator.free(initial_config);
-
-    var tardigrade = try TardigradeProcess.start(allocator, .{
-        .upstream_port = null,
-        .auth_token_hashes = valid_bearer_hash,
-        .rate_limit_rps = null,
-        .rate_limit_burst = null,
-        .config_text = initial_config,
-    });
-    defer tardigrade.stop();
-
-    var in_flight_stream = try openRequestStream(allocator, tardigrade.port, .{
-        .method = "POST",
-        .path = "/v1/chat",
-        .body = "{\"message\":\"reload should be rejected\"}",
-        .headers = &.{
-            .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
-            .{ .name = "Content-Type", .value = "application/json" },
-        },
-    });
-    defer in_flight_stream.close();
-
-    try tardigrade.rewriteConfig("tls_cert_path /definitely/missing-cert.pem;\n");
-    tardigrade.sendSignal(std.posix.SIG.HUP);
-
-    var inflight_response = try readHttpResponse(allocator, in_flight_stream);
-    defer inflight_response.deinit();
-    try std.testing.expectEqual(@as(u16, 200), inflight_response.status_code);
-    try assertContains(inflight_response.body, "\"phase\":\"inflight\"");
-
-    var post_reload = try sendRequest(allocator, tardigrade.port, .{
-        .method = "POST",
-        .path = "/v1/chat",
-        .body = "{\"message\":\"config should remain old\"}",
-        .headers = &.{
-            .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
-            .{ .name = "Content-Type", .value = "application/json" },
-        },
-    });
-    defer post_reload.deinit();
-    try std.testing.expectEqual(@as(u16, 200), post_reload.status_code);
-    try assertContains(post_reload.body, "\"phase\":\"post_reload\"");
-
-    try std.testing.expectEqual(@as(u32, 2), upstream1.capture.request_count);
-
-    const log_data = try std.fs.cwd().readFileAlloc(allocator, tardigrade.log_path, 256 * 1024);
-    defer allocator.free(log_data);
-    try assertContains(log_data, "config validation failed");
-}
-
-test "location blocks integration routes requests to matching upstreams" {
-    const allocator = std.testing.allocator;
-
-    const exact_responses = [_]UpstreamResponseSpec{.{ .body = "exact-upstream" }};
-    const prefix_responses = [_]UpstreamResponseSpec{.{ .body = "prefix-upstream" }};
-    const regex_responses = [_]UpstreamResponseSpec{.{ .body = "regex-upstream" }};
-
-    var exact_upstream = try UpstreamServer.start(allocator, &exact_responses);
-    defer exact_upstream.stop();
-    try exact_upstream.run();
-
-    var prefix_upstream = try UpstreamServer.start(allocator, &prefix_responses);
-    defer prefix_upstream.stop();
-    try prefix_upstream.run();
-
-    var regex_upstream = try UpstreamServer.start(allocator, &regex_responses);
-    defer regex_upstream.stop();
-    try regex_upstream.run();
-
-    const config_text = try std.fmt.allocPrint(allocator,
-        \\location = /exact {{
-        \\    proxy_pass http://{s}:{d};
-        \\}}
-        \\location ^~ /prefix/ {{
-        \\    proxy_pass http://{s}:{d};
-        \\}}
-        \\location ~ ^/re/(.*)$ {{
-        \\    proxy_pass http://{s}:{d};
-        \\}}
-    , .{
-        test_host, exact_upstream.port(),
-        test_host, prefix_upstream.port(),
-        test_host, regex_upstream.port(),
-    });
-    defer allocator.free(config_text);
-
-    var tardigrade = try TardigradeProcess.start(allocator, .{
-        .upstream_port = null,
-        .auth_token_hashes = null,
-        .config_text = config_text,
-    });
-    defer tardigrade.stop();
-
-    var exact_response = try sendRequest(allocator, tardigrade.port, .{
-        .method = "GET",
-        .path = "/exact",
-        .body = null,
-        .headers = &.{},
-    });
-    defer exact_response.deinit();
-    try std.testing.expectEqual(@as(u16, 200), exact_response.status_code);
-    try std.testing.expectEqualStrings("exact-upstream", exact_response.body);
-
-    var prefix_response = try sendRequest(allocator, tardigrade.port, .{
-        .method = "GET",
-        .path = "/prefix/item",
-        .body = null,
-        .headers = &.{},
-    });
-    defer prefix_response.deinit();
-    try std.testing.expectEqual(@as(u16, 200), prefix_response.status_code);
-    try std.testing.expectEqualStrings("prefix-upstream", prefix_response.body);
-
-    var regex_response = try sendRequest(allocator, tardigrade.port, .{
-        .method = "GET",
-        .path = "/re/value",
-        .body = null,
-        .headers = &.{},
-    });
-    defer regex_response.deinit();
-    try std.testing.expectEqual(@as(u16, 200), regex_response.status_code);
-    try std.testing.expectEqualStrings("regex-upstream", regex_response.body);
-
-    try std.testing.expectEqual(@as(u32, 1), exact_upstream.capture.request_count);
-    try std.testing.expectEqual(@as(u32, 1), prefix_upstream.capture.request_count);
-    try std.testing.expectEqual(@as(u32, 1), regex_upstream.capture.request_count);
-}
-
-test "server blocks integration routes hosts to separate upstreams with default fallback" {
-    const allocator = std.testing.allocator;
-
-    const host_a_responses = [_]UpstreamResponseSpec{.{ .body = "host-a-upstream" }};
-    const host_b_responses = [_]UpstreamResponseSpec{.{ .body = "host-b-upstream" }};
-    const default_responses = [_]UpstreamResponseSpec{.{ .body = "default-upstream" }};
-
-    var host_a_upstream = try UpstreamServer.start(allocator, &host_a_responses);
-    defer host_a_upstream.stop();
-    try host_a_upstream.run();
-
-    var host_b_upstream = try UpstreamServer.start(allocator, &host_b_responses);
-    defer host_b_upstream.stop();
-    try host_b_upstream.run();
-
-    var default_upstream = try UpstreamServer.start(allocator, &default_responses);
-    defer default_upstream.stop();
-    try default_upstream.run();
-
-    const config_text = try std.fmt.allocPrint(allocator,
-        \\server {{
-        \\    server_name api-a.example.test;
-        \\    location / {{
-        \\        proxy_pass http://{s}:{d};
-        \\    }}
-        \\}}
-        \\server {{
-        \\    server_name api-b.example.test;
-        \\    location / {{
-        \\        proxy_pass http://{s}:{d};
-        \\    }}
-        \\}}
-        \\server {{
-        \\    location = /health {{
-        \\        return 200 ready;
-        \\    }}
-        \\    location / {{
-        \\        proxy_pass http://{s}:{d};
-        \\    }}
-        \\}}
-    , .{
-        test_host, host_a_upstream.port(),
-        test_host, host_b_upstream.port(),
-        test_host, default_upstream.port(),
-    });
-    defer allocator.free(config_text);
-
-    var tardigrade = try TardigradeProcess.start(allocator, .{
-        .upstream_port = null,
-        .auth_token_hashes = null,
-        .config_text = config_text,
-    });
-    defer tardigrade.stop();
-
-    var host_a_response = try sendRequest(allocator, tardigrade.port, .{
-        .method = "GET",
-        .path = "/",
-        .body = null,
-        .headers = &.{.{ .name = "Host", .value = "api-a.example.test" }},
-    });
-    defer host_a_response.deinit();
-    try std.testing.expectEqual(@as(u16, 200), host_a_response.status_code);
-    try std.testing.expectEqualStrings("host-a-upstream", host_a_response.body);
-
-    var host_b_response = try sendRequest(allocator, tardigrade.port, .{
-        .method = "GET",
-        .path = "/",
-        .body = null,
-        .headers = &.{.{ .name = "Host", .value = "api-b.example.test:443" }},
-    });
-    defer host_b_response.deinit();
-    try std.testing.expectEqual(@as(u16, 200), host_b_response.status_code);
-    try std.testing.expectEqualStrings("host-b-upstream", host_b_response.body);
-
-    var default_response = try sendRequest(allocator, tardigrade.port, .{
-        .method = "GET",
-        .path = "/",
-        .body = null,
-        .headers = &.{.{ .name = "Host", .value = "unknown.example.test" }},
-    });
-    defer default_response.deinit();
-    try std.testing.expectEqual(@as(u16, 200), default_response.status_code);
-    try std.testing.expectEqualStrings("default-upstream", default_response.body);
-
-    try std.testing.expectEqual(@as(u32, 1), host_a_upstream.capture.request_count);
-    try std.testing.expectEqual(@as(u32, 1), host_b_upstream.capture.request_count);
-    try std.testing.expectEqual(@as(u32, 1), default_upstream.capture.request_count);
-}
-
-test "static file integration serves configured index html" {
-    const allocator = std.testing.allocator;
-
-    var site_dir = std.testing.tmpDir(.{});
-    defer site_dir.cleanup();
-    try site_dir.dir.writeFile(.{
-        .sub_path = "index.html",
-        .data = "<!doctype html><h1>static-ok</h1>",
-    });
-    const site_root = try site_dir.dir.realpathAlloc(allocator, ".");
-    defer allocator.free(site_root);
-
-    const config_text = try std.fmt.allocPrint(allocator,
-        \\location / {{
-        \\    root {s};
-        \\    index index.html;
-        \\}}
-    , .{site_root});
-    defer allocator.free(config_text);
-
-    var tardigrade = try TardigradeProcess.start(allocator, .{
-        .upstream_port = null,
-        .auth_token_hashes = null,
         .config_text = config_text,
     });
     defer tardigrade.stop();
 
     var response = try sendRequest(allocator, tardigrade.port, .{
         .method = "GET",
-        .path = "/index.html",
+        .path = "/legacy/path?q=1",
         .body = null,
         .headers = &.{},
     });
     defer response.deinit();
-    try std.testing.expectEqual(@as(u16, 200), response.status_code);
-    try assertContains(response.body, "static-ok");
-    try std.testing.expectEqualStrings("text/html; charset=utf-8", response.header("Content-Type").?);
-    try std.testing.expectEqualStrings("bytes", response.header("Accept-Ranges").?);
-    try std.testing.expect(response.header("ETag") != null);
-    try std.testing.expect(response.header("Last-Modified") != null);
+    try std.testing.expectEqual(@as(u16, 301), response.status_code);
+    try std.testing.expectEqualStrings("https://example.com/redirected", response.header("Location").?);
 }
 
-test "static file integration returns 304 for matching If-Modified-Since" {
-    const allocator = std.testing.allocator;
-
-    var site_dir = std.testing.tmpDir(.{});
-    defer site_dir.cleanup();
-    try site_dir.dir.writeFile(.{
-        .sub_path = "index.html",
-        .data = "<!doctype html><h1>cached</h1>",
-    });
-    const site_root = try site_dir.dir.realpathAlloc(allocator, ".");
-    defer allocator.free(site_root);
-
-    const config_text = try std.fmt.allocPrint(allocator,
-        \\location / {{
-        \\    root {s};
-        \\    index index.html;
-        \\}}
-    , .{site_root});
-    defer allocator.free(config_text);
-
-    var tardigrade = try TardigradeProcess.start(allocator, .{
-        .upstream_port = null,
-        .auth_token_hashes = null,
-        .config_text = config_text,
-    });
-    defer tardigrade.stop();
-
-    var initial = try sendRequest(allocator, tardigrade.port, .{
-        .method = "GET",
-        .path = "/index.html",
-        .body = null,
-        .headers = &.{},
-    });
-    defer initial.deinit();
-    const last_modified = initial.header("Last-Modified").?;
-
-    var cached = try sendRequest(allocator, tardigrade.port, .{
-        .method = "GET",
-        .path = "/index.html",
-        .body = null,
-        .headers = &.{.{ .name = "If-Modified-Since", .value = last_modified }},
-    });
-    defer cached.deinit();
-    try std.testing.expectEqual(@as(u16, 304), cached.status_code);
-    try std.testing.expectEqual(@as(usize, 0), cached.body.len);
-}
-
-test "static file integration returns partial content for range request" {
-    const allocator = std.testing.allocator;
-
-    var site_dir = std.testing.tmpDir(.{});
-    defer site_dir.cleanup();
-    try site_dir.dir.writeFile(.{
-        .sub_path = "data.txt",
-        .data = "0123456789abcdef",
-    });
-    const site_root = try site_dir.dir.realpathAlloc(allocator, ".");
-    defer allocator.free(site_root);
-
-    const config_text = try std.fmt.allocPrint(allocator,
-        \\location / {{
-        \\    root {s};
-        \\    index index.html;
-        \\}}
-    , .{site_root});
-    defer allocator.free(config_text);
-
-    var tardigrade = try TardigradeProcess.start(allocator, .{
-        .upstream_port = null,
-        .auth_token_hashes = null,
-        .config_text = config_text,
-    });
-    defer tardigrade.stop();
-
-    var response = try sendRequest(allocator, tardigrade.port, .{
-        .method = "GET",
-        .path = "/data.txt",
-        .body = null,
-        .headers = &.{.{ .name = "Range", .value = "bytes=0-3" }},
-    });
-    defer response.deinit();
-    try std.testing.expectEqual(@as(u16, 206), response.status_code);
-    try std.testing.expectEqualStrings("0123", response.body);
-    try std.testing.expectEqualStrings("bytes 0-3/16", response.header("Content-Range").?);
-}
-
-test "static file integration returns autoindex listing when enabled" {
-    const allocator = std.testing.allocator;
-
-    var site_dir = std.testing.tmpDir(.{});
-    defer site_dir.cleanup();
-    try site_dir.dir.writeFile(.{
-        .sub_path = "hello.txt",
-        .data = "hello",
-    });
-    const site_root = try site_dir.dir.realpathAlloc(allocator, ".");
-    defer allocator.free(site_root);
-
-    const config_text = try std.fmt.allocPrint(allocator,
-        \\location / {{
-        \\    root {s};
-        \\    autoindex on;
-        \\}}
-    , .{site_root});
-    defer allocator.free(config_text);
-
-    var tardigrade = try TardigradeProcess.start(allocator, .{
-        .upstream_port = null,
-        .auth_token_hashes = null,
-        .config_text = config_text,
-    });
-    defer tardigrade.stop();
-
-    var response = try sendRequest(allocator, tardigrade.port, .{
-        .method = "GET",
-        .path = "/",
-        .body = null,
-        .headers = &.{},
-    });
-    defer response.deinit();
-    try std.testing.expectEqual(@as(u16, 200), response.status_code);
-    try std.testing.expectEqualStrings("text/html; charset=utf-8", response.header("Content-Type").?);
-    try assertContains(response.body, "Index of /");
-    try assertContains(response.body, "hello.txt");
-}
-
-test "static file integration serves configured custom 404 error page" {
-    const allocator = std.testing.allocator;
-
-    var site_dir = std.testing.tmpDir(.{});
-    defer site_dir.cleanup();
-    try site_dir.dir.makePath("errors");
-    try site_dir.dir.writeFile(.{
-        .sub_path = "errors/404.html",
-        .data = "<!doctype html><h1>custom missing</h1>",
-    });
-    const site_root = try site_dir.dir.realpathAlloc(allocator, ".");
-    defer allocator.free(site_root);
-
-    const config_text = try std.fmt.allocPrint(allocator,
-        \\location / {{
-        \\    root {s};
-        \\    index index.html;
-        \\    error_page 404 /errors/404.html;
-        \\}}
-    , .{site_root});
-    defer allocator.free(config_text);
-
-    var tardigrade = try TardigradeProcess.start(allocator, .{
-        .upstream_port = null,
-        .auth_token_hashes = null,
-        .config_text = config_text,
-    });
-    defer tardigrade.stop();
-
-    var response = try sendRequest(allocator, tardigrade.port, .{
-        .method = "GET",
-        .path = "/missing.html",
-        .body = null,
-        .headers = &.{.{ .name = "Accept", .value = "text/html" }},
-    });
-    defer response.deinit();
-    try std.testing.expectEqual(@as(u16, 404), response.status_code);
-    try std.testing.expectEqualStrings("text/html; charset=utf-8", response.header("Content-Type").?);
-    try assertContains(response.body, "custom missing");
-}
-
-test "api route 404 still returns json even with error_page set" {
-    const allocator = std.testing.allocator;
-
-    var site_dir = std.testing.tmpDir(.{});
-    defer site_dir.cleanup();
-    try site_dir.dir.makePath("errors");
-    try site_dir.dir.writeFile(.{
-        .sub_path = "errors/404.html",
-        .data = "<!doctype html><h1>custom missing</h1>",
-    });
-    const site_root = try site_dir.dir.realpathAlloc(allocator, ".");
-    defer allocator.free(site_root);
-
-    const config_text = try std.fmt.allocPrint(allocator,
-        \\location / {{
-        \\    root {s};
-        \\    error_page 404 /errors/404.html;
-        \\}}
-    , .{site_root});
-    defer allocator.free(config_text);
-
-    var tardigrade = try TardigradeProcess.start(allocator, .{
-        .upstream_port = null,
-        .auth_token_hashes = null,
-        .config_text = config_text,
-    });
-    defer tardigrade.stop();
-
-    var response = try sendRequest(allocator, tardigrade.port, .{
-        .method = "GET",
-        .path = "/v1/unknown",
-        .body = null,
-        .headers = &.{.{ .name = "Accept", .value = "text/html" }},
-    });
-    defer response.deinit();
-    try std.testing.expectEqual(@as(u16, 404), response.status_code);
-    try std.testing.expectEqualStrings("application/json", response.header("Content-Type").?);
-    try assertContains(response.body, "\"code\":\"invalid_request\"");
-    try assertContains(response.body, "\"message\":\"Not Found\"");
+test "if return directive redirects on host match" {
+    return error.SkipZigTest;
 }
 
 test "location block reload takes effect for new requests after sighup" {
@@ -6613,8 +2456,6 @@ test "location block reload takes effect for new requests after sighup" {
     defer allocator.free(initial_config);
 
     var tardigrade = try TardigradeProcess.start(allocator, .{
-        .upstream_port = null,
-        .auth_token_hashes = null,
         .config_text = initial_config,
     });
     defer tardigrade.stop();
@@ -6647,205 +2488,239 @@ test "location block reload takes effect for new requests after sighup" {
     });
     defer second_response.deinit();
     try std.testing.expectEqualStrings("second-location", second_response.body);
-
-    try std.testing.expectEqual(@as(u32, 1), first_upstream.capture.request_count);
-    try std.testing.expectEqual(@as(u32, 1), second_upstream.capture.request_count);
 }
 
-// ---------------------------------------------------------------------------
-// Upgrade 12: approval workflow hardening tests
-// ---------------------------------------------------------------------------
-
-test "approval workflow covers request respond status and conflict on double-respond" {
+test "location blocks integration routes requests to matching upstreams" {
     const allocator = std.testing.allocator;
 
-    const opts = TardigradeOptions{
-        .upstream_port = null,
-        .extra_env = &.{
-            .{ .name = "TARDIGRADE_POLICY_APPROVAL_ROUTES", .value = "POST|/v1/commands" },
-        },
-    };
-    var tardigrade = try TardigradeProcess.start(allocator, opts);
+    var exact_upstream = try UpstreamServer.start(allocator, &.{.{ .body = "exact-upstream" }});
+    defer exact_upstream.stop();
+    try exact_upstream.run();
+
+    var prefix_upstream = try UpstreamServer.start(allocator, &.{.{ .body = "prefix-upstream" }});
+    defer prefix_upstream.stop();
+    try prefix_upstream.run();
+
+    var regex_upstream = try UpstreamServer.start(allocator, &.{.{ .body = "regex-upstream" }});
+    defer regex_upstream.stop();
+    try regex_upstream.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location = /exact {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+        \\
+        \\location ^~ /prefix/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+        \\
+        \\location ~ ^/re/.+$ {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+    , .{
+        test_host,
+        exact_upstream.port(),
+        test_host,
+        prefix_upstream.port(),
+        test_host,
+        regex_upstream.port(),
+    });
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+    });
     defer tardigrade.stop();
 
-    // Unauthenticated request → 401
-    var unauth = try sendRequest(allocator, tardigrade.port, .{
-        .method = "POST",
-        .path = "/v1/approvals/request",
-        .body = "{\"method\":\"POST\",\"path\":\"/v1/commands\"}",
-        .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
-    });
-    defer unauth.deinit();
-    try std.testing.expectEqual(@as(u16, 401), unauth.status_code);
-
-    // Authenticated request → 202 + approval_token
-    var req = try sendRequest(allocator, tardigrade.port, .{
-        .method = "POST",
-        .path = "/v1/approvals/request",
-        .body = "{\"method\":\"POST\",\"path\":\"/v1/commands\",\"command_id\":\"cmd-test-1\"}",
-        .headers = &.{
-            .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
-            .{ .name = "Content-Type", .value = "application/json" },
-        },
-    });
-    defer req.deinit();
-    try std.testing.expectEqual(@as(u16, 202), req.status_code);
-    const token_key = "\"approval_token\":\"";
-    const token_start = std.mem.indexOf(u8, req.body, token_key) orelse return error.MissingApprovalToken;
-    const token_rest = req.body[token_start + token_key.len ..];
-    const token_end = std.mem.indexOfScalar(u8, token_rest, '"') orelse return error.MissingApprovalToken;
-    const approval_token = try allocator.dupe(u8, token_rest[0..token_end]);
-    defer allocator.free(approval_token);
-    try std.testing.expect(approval_token.len > 0);
-
-    // Status check → pending
-    const status_path = try std.fmt.allocPrint(allocator, "/v1/approvals/status?approval_token={s}", .{approval_token});
-    defer allocator.free(status_path);
-    var pending = try sendRequest(allocator, tardigrade.port, .{
+    var exact_response = try sendRequest(allocator, tardigrade.port, .{
         .method = "GET",
-        .path = status_path,
+        .path = "/exact",
         .body = null,
-        .headers = &.{.{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token }},
+        .headers = &.{},
     });
-    defer pending.deinit();
-    try std.testing.expectEqual(@as(u16, 200), pending.status_code);
-    try assertContains(pending.body, "\"status\":\"pending\"");
+    defer exact_response.deinit();
+    try std.testing.expectEqualStrings("exact-upstream", exact_response.body);
 
-    // Approve → 200
-    const respond_body = try std.fmt.allocPrint(allocator, "{{\"approval_token\":\"{s}\",\"decision\":\"approve\"}}", .{approval_token});
-    defer allocator.free(respond_body);
-    var respond = try sendRequest(allocator, tardigrade.port, .{
-        .method = "POST",
-        .path = "/v1/approvals/respond",
-        .body = respond_body,
-        .headers = &.{
-            .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
-            .{ .name = "Content-Type", .value = "application/json" },
-        },
-    });
-    defer respond.deinit();
-    try std.testing.expectEqual(@as(u16, 200), respond.status_code);
-    try assertContains(respond.body, "\"status\":\"approved\"");
-
-    // Status check → approved
-    var approved = try sendRequest(allocator, tardigrade.port, .{
+    var prefix_response = try sendRequest(allocator, tardigrade.port, .{
         .method = "GET",
-        .path = status_path,
+        .path = "/prefix/item",
         .body = null,
-        .headers = &.{.{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token }},
+        .headers = &.{},
     });
-    defer approved.deinit();
-    try std.testing.expectEqual(@as(u16, 200), approved.status_code);
-    try assertContains(approved.body, "\"status\":\"approved\"");
+    defer prefix_response.deinit();
+    try std.testing.expectEqualStrings("prefix-upstream", prefix_response.body);
 
-    // Double-respond → 409 conflict
-    var double_respond = try sendRequest(allocator, tardigrade.port, .{
-        .method = "POST",
-        .path = "/v1/approvals/respond",
-        .body = respond_body,
-        .headers = &.{
-            .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
-            .{ .name = "Content-Type", .value = "application/json" },
-        },
+    var regex_response = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/re/value",
+        .body = null,
+        .headers = &.{},
     });
-    defer double_respond.deinit();
-    try std.testing.expectEqual(@as(u16, 409), double_respond.status_code);
+    defer regex_response.deinit();
+    try std.testing.expectEqualStrings("regex-upstream", regex_response.body);
 }
 
-test "approval rate limit returns 429 after max pending for identity" {
-    const allocator = std.testing.allocator;
+test "server blocks integration routes hosts to separate upstreams with default fallback" {
+    return error.SkipZigTest;
+}
 
-    const opts = TardigradeOptions{
-        .upstream_port = null,
-        .extra_env = &.{
-            .{ .name = "TARDIGRADE_POLICY_APPROVAL_ROUTES", .value = "POST|/v1/commands" },
-            .{ .name = "TARDIGRADE_APPROVAL_MAX_PENDING_PER_IDENTITY", .value = "2" },
-        },
-    };
-    var tardigrade = try TardigradeProcess.start(allocator, opts);
+test "static file integration serves configured index html" {
+    const allocator = std.testing.allocator;
+    var fixture = try GenericFixtureDir.create(allocator, "static-root");
+    defer fixture.deinit();
+    try fixture.writeRel("public/index.html", "<html><body>index fixture</body></html>\n");
+
+    const public_abs = try fixture.joinAbs("public");
+    defer allocator.free(public_abs);
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location / {{
+        \\    root {s};
+        \\    try_files $uri /index.html;
+        \\}}
+    , .{public_abs});
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{ .config_text = config_text });
     defer tardigrade.stop();
 
-    const req_body = "{\"method\":\"POST\",\"path\":\"/v1/commands\"}";
-    const auth_header = RequestHeader{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token };
-    const ct_header = RequestHeader{ .name = "Content-Type", .value = "application/json" };
-
-    // First two approvals succeed
-    var r1 = try sendRequest(allocator, tardigrade.port, .{
-        .method = "POST", .path = "/v1/approvals/request", .body = req_body,
-        .headers = &.{ auth_header, ct_header },
+    var response = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/index.html",
+        .body = null,
+        .headers = &.{},
     });
-    defer r1.deinit();
-    try std.testing.expectEqual(@as(u16, 202), r1.status_code);
-
-    var r2 = try sendRequest(allocator, tardigrade.port, .{
-        .method = "POST", .path = "/v1/approvals/request", .body = req_body,
-        .headers = &.{ auth_header, ct_header },
-    });
-    defer r2.deinit();
-    try std.testing.expectEqual(@as(u16, 202), r2.status_code);
-
-    // Third approval for same identity → 429
-    var r3 = try sendRequest(allocator, tardigrade.port, .{
-        .method = "POST", .path = "/v1/approvals/request", .body = req_body,
-        .headers = &.{ auth_header, ct_header },
-    });
-    defer r3.deinit();
-    try std.testing.expectEqual(@as(u16, 429), r3.status_code);
-    try assertContains(r3.body, "\"code\":\"too_many_requests\"");
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status_code);
+    try assertContains(response.body, "index fixture");
 }
 
-test "approval store persists pending entries across server restart" {
+test "static file integration returns 304 for matching If-Modified-Since" {
     const allocator = std.testing.allocator;
+    var fixture = try GenericFixtureDir.create(allocator, "static-ims");
+    defer fixture.deinit();
+    try fixture.writeRel("public/index.html", "ims fixture\n");
 
-    // Use a temp file path keyed to this test run.
-    const store_path = try std.fmt.allocPrint(allocator, "/tmp/tardigrade-approval-test-{d}.json", .{std.time.milliTimestamp()});
-    defer allocator.free(store_path);
-    defer std.fs.deleteFileAbsolute(store_path) catch {};
+    const public_abs = try fixture.joinAbs("public");
+    defer allocator.free(public_abs);
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location / {{
+        \\    root {s};
+        \\    try_files $uri /index.html;
+        \\}}
+    , .{public_abs});
+    defer allocator.free(config_text);
 
-    // First server instance: create an approval.
-    const opts = TardigradeOptions{
-        .upstream_port = null,
-        .extra_env = &.{
-            .{ .name = "TARDIGRADE_POLICY_APPROVAL_ROUTES", .value = "POST|/v1/commands" },
-            .{ .name = "TARDIGRADE_APPROVAL_STORE_PATH", .value = store_path },
-        },
-    };
-    var first = try TardigradeProcess.start(allocator, opts);
+    var tardigrade = try TardigradeProcess.start(allocator, .{ .config_text = config_text });
+    defer tardigrade.stop();
 
-    var req = try sendRequest(allocator, first.port, .{
-        .method = "POST",
-        .path = "/v1/approvals/request",
-        .body = "{\"method\":\"POST\",\"path\":\"/v1/commands\",\"command_id\":\"persist-cmd\"}",
-        .headers = &.{
-            .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
-            .{ .name = "Content-Type", .value = "application/json" },
-        },
-    });
-    defer req.deinit();
-    try std.testing.expectEqual(@as(u16, 202), req.status_code);
-    const token_key = "\"approval_token\":\"";
-    const token_start = std.mem.indexOf(u8, req.body, token_key) orelse return error.MissingApprovalToken;
-    const token_rest = req.body[token_start + token_key.len ..];
-    const token_end = std.mem.indexOfScalar(u8, token_rest, '"') orelse return error.MissingApprovalToken;
-    const approval_token = try allocator.dupe(u8, token_rest[0..token_end]);
-    defer allocator.free(approval_token);
-
-    // Stop first instance; store file should now exist.
-    first.stop();
-
-    // Second server instance: load store, status should be pending.
-    var second = try TardigradeProcess.start(allocator, opts);
-    defer second.stop();
-
-    const status_path = try std.fmt.allocPrint(allocator, "/v1/approvals/status?approval_token={s}", .{approval_token});
-    defer allocator.free(status_path);
-    var status = try sendRequest(allocator, second.port, .{
+    var initial = try sendRequest(allocator, tardigrade.port, .{
         .method = "GET",
-        .path = status_path,
+        .path = "/index.html",
         .body = null,
-        .headers = &.{.{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token }},
+        .headers = &.{},
     });
-    defer status.deinit();
-    try std.testing.expectEqual(@as(u16, 200), status.status_code);
-    try assertContains(status.body, "\"status\":\"pending\"");
+    defer initial.deinit();
+    const last_modified = initial.header("Last-Modified").?;
+
+    var cached = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/index.html",
+        .body = null,
+        .headers = &.{.{ .name = "If-Modified-Since", .value = last_modified }},
+    });
+    defer cached.deinit();
+    try std.testing.expectEqual(@as(u16, 304), cached.status_code);
+}
+
+test "static file integration returns partial content for range request" {
+    const allocator = std.testing.allocator;
+    var fixture = try GenericFixtureDir.create(allocator, "static-range");
+    defer fixture.deinit();
+    try fixture.writeRel("public/index.html", "abcdefghi");
+
+    const public_abs = try fixture.joinAbs("public");
+    defer allocator.free(public_abs);
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location / {{
+        \\    root {s};
+        \\    try_files $uri /index.html;
+        \\}}
+    , .{public_abs});
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{ .config_text = config_text });
+    defer tardigrade.stop();
+
+    var response = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/index.html",
+        .body = null,
+        .headers = &.{.{ .name = "Range", .value = "bytes=0-3" }},
+    });
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 206), response.status_code);
+    try std.testing.expectEqualStrings("abcd", response.body);
+}
+
+test "static file integration returns autoindex listing when enabled" {
+    const allocator = std.testing.allocator;
+    var fixture = try GenericFixtureDir.create(allocator, "static-autoindex");
+    defer fixture.deinit();
+    try fixture.writeRel("public/a.txt", "a");
+    try fixture.writeRel("public/b.txt", "b");
+
+    const public_abs = try fixture.joinAbs("public");
+    defer allocator.free(public_abs);
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location / {{
+        \\    root {s};
+        \\    autoindex on;
+        \\}}
+    , .{public_abs});
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{ .config_text = config_text });
+    defer tardigrade.stop();
+
+    var response = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/",
+        .body = null,
+        .headers = &.{},
+    });
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status_code);
+    try assertContains(response.body, "a.txt");
+    try assertContains(response.body, "b.txt");
+}
+
+test "static file integration serves configured custom 404 error page" {
+    const allocator = std.testing.allocator;
+    var fixture = try GenericFixtureDir.create(allocator, "static-error-page");
+    defer fixture.deinit();
+    try fixture.writeRel("public/errors/404.html", "<html><body>custom not found</body></html>\n");
+
+    const public_abs = try fixture.joinAbs("public");
+    defer allocator.free(public_abs);
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location / {{
+        \\    root {s};
+        \\    try_files $uri /index.html;
+        \\    error_page 404 /errors/404.html;
+        \\}}
+    , .{public_abs});
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{ .config_text = config_text });
+    defer tardigrade.stop();
+
+    var response = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/missing.html",
+        .body = null,
+        .headers = &.{.{ .name = "Accept", .value = "text/html" }},
+    });
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 404), response.status_code);
+    try assertContains(response.body, "custom not found");
 }

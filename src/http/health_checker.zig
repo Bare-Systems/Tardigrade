@@ -15,7 +15,7 @@ pub const ProbeStatus = enum {
 };
 
 pub const Config = struct {
-    path: []const u8 = "/health",
+    path: []const u8 = "/",
     interval_ms: u64 = 10_000,
     timeout_ms: u32 = 2_000,
     fail_threshold: u32 = 3,
@@ -153,7 +153,7 @@ test "config healthy status defaults to 2xx" {
 
 test "buildProbeUrl joins base and path" {
     const allocator = std.testing.allocator;
-    const url = try buildProbeUrl(allocator, "http://127.0.0.1:8080/", "/health");
+    const url = try buildProbeUrl(allocator, "http://127.0.0.1:8080/", "/");
     defer allocator.free(url);
-    try std.testing.expectEqualStrings("http://127.0.0.1:8080/health", url);
+    try std.testing.expectEqualStrings("http://127.0.0.1:8080/", url);
 }

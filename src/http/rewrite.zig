@@ -343,8 +343,8 @@ test "parse rewrite flag aliases" {
 }
 
 test "regexMatches supports simple pattern" {
-    try std.testing.expect(regexMatches("^/v1/chat$", "/v1/chat"));
-    try std.testing.expect(!regexMatches("^/v1/chat$", "/v1/commands"));
+    try std.testing.expect(regexMatches("^/api/messages$", "/api/messages"));
+    try std.testing.expect(!regexMatches("^/api/messages$", "/api/tasks"));
 }
 
 test "regexMatchesOptions supports case-insensitive matches" {

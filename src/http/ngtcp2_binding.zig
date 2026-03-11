@@ -794,14 +794,7 @@ pub const Binding = if (enabled) struct {
     }
 
     fn populateFallbackResponse(response: *response_mod.Response, request: *const http3_session.StreamRequest) void {
-        if (std.mem.eql(u8, request.method, "GET") and std.mem.eql(u8, request.path, "/health")) {
-            _ = response
-                .setStatus(.ok)
-                .setHeader("content-type", "application/json")
-                .setHeader("server", "tardigrade/http3")
-                .setContentLength(0);
-            return;
-        }
+        _ = request;
         _ = response
             .setStatus(.not_found)
             .setHeader("content-type", "text/plain")

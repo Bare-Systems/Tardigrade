@@ -152,14 +152,8 @@ pub const EdgeConfig = struct {
     upstream_commands_base_url_weights: []u32,
     upstream_commands_backup_base_urls: [][]const u8,
     upstream_lb_algorithm: UpstreamLbAlgorithm,
-    /// Proxy target for /v1/chat. Supports absolute URL or path.
-    proxy_pass_chat: []const u8,
-    /// Proxy target prefix for /v1/commands upstream subpaths.
-    /// Supports absolute URL prefix or path prefix.
-    proxy_pass_commands_prefix: []const u8,
-    auth_token_hashes: [][]const u8,
-    max_message_chars: usize,
     upstream_timeout_ms: u32,
+    auth_request_url: []const u8,
     /// Requests per second per client IP (0 = disabled).
     rate_limit_rps: f64,
     /// Burst capacity for rate limiter.
@@ -185,36 +179,8 @@ pub const EdgeConfig = struct {
     geo_blocked_countries: [][]const u8,
     /// Header containing country code provided by external edge/CDN.
     geo_country_header: []const u8,
-    /// Optional auth subrequest URL; non-2xx denies protected routes.
-    auth_request_url: []const u8,
-    /// Timeout for auth subrequest in milliseconds.
-    auth_request_timeout_ms: u32,
-    /// Optional JWT shared secret for HS256 bearer validation.
-    jwt_secret: []const u8,
-    /// Optional JWT issuer constraint.
-    jwt_issuer: []const u8,
-    /// Optional JWT audience constraint.
-    jwt_audience: []const u8,
     /// Additional response headers from add_header directive.
     add_headers: []HeaderPair,
-    /// Policy engine route rules (`METHOD|REGEX|required_scope|require_approval|hours|device_regex`; semicolon-separated).
-    policy_rules_raw: []const u8,
-    /// Policy scope mapping (`identity:scope1,scope2;...`).
-    policy_user_scopes_raw: []const u8,
-    /// Routes requiring approval (`METHOD|REGEX;...`).
-    policy_approval_routes_raw: []const u8,
-    /// Session idle TTL in seconds (0 = sessions disabled).
-    session_ttl_seconds: u32,
-    /// Maximum concurrent sessions (0 = unlimited).
-    session_max: u32,
-    /// Device identity registry path (line format: `device_id|key`).
-    device_registry_path: []const u8,
-    /// Require registered device key proof headers for protected API routes.
-    device_auth_required: bool,
-    /// Access token ttl seconds for issued device tokens.
-    access_token_ttl_seconds: u32,
-    /// Refresh token ttl seconds for issued device tokens.
-    refresh_token_ttl_seconds: u32,
     /// IP access control rules (empty = disabled).
     /// Format: "allow 10.0.0.0/8, deny 0.0.0.0/0"
     access_control_rules: []const u8,
@@ -222,6 +188,12 @@ pub const EdgeConfig = struct {
     request_limits: http.request_limits.RequestLimits,
     /// Basic auth credential hashes (SHA-256 of "user:password", empty = disabled).
     basic_auth_hashes: [][]const u8,
+    session_ttl_seconds: u32,
+    session_max: u32,
+    device_registry_path: []const u8,
+    policy_rules_raw: []const u8,
+    policy_user_scopes_raw: []const u8,
+    policy_approval_routes_raw: []const u8,
     /// Minimum log level (debug, info, warn, error).
     log_level: http.logger.Level,
     /// Optional error log destination path (`stderr` keeps current behavior).
@@ -324,30 +296,6 @@ pub const EdgeConfig = struct {
     upstream_active_health_success_status_overrides: []UpstreamHealthSuccessStatusOverride,
     /// Slow-start window (ms) for recovered upstreams before receiving full traffic (0 = disabled).
     upstream_slow_start_ms: u64,
-    /// Enable WebSocket upgrade routes.
-    websocket_enabled: bool,
-    /// Idle timeout for WebSocket connections in milliseconds.
-    websocket_idle_timeout_ms: u32,
-    /// Maximum payload size per WebSocket frame in bytes.
-    websocket_max_frame_size: usize,
-    /// Maximum queued outbound mux payload bytes before oldest frames are dropped.
-    mux_write_buffer_max: usize,
-    /// Maximum active mux channels per device across websocket mux connections.
-    mux_max_channels_per_device: usize,
-    /// Grace window in milliseconds for restoring mux channel state after disconnect.
-    mux_reconnect_grace_ms: u32,
-    /// Ping interval for WebSocket keepalive frames in milliseconds (0 = disabled).
-    websocket_ping_interval_ms: u32,
-    /// Enable SSE publish/stream routes.
-    sse_enabled: bool,
-    /// Maximum retained events per topic in the in-memory SSE hub.
-    sse_max_events_per_topic: usize,
-    /// SSE polling interval in milliseconds for long-lived stream loops.
-    sse_poll_interval_ms: u32,
-    /// Maximum tolerated replay backlog before forcing reconnect.
-    sse_max_backlog: usize,
-    /// Idle timeout for SSE streams in milliseconds (0 = disabled).
-    sse_idle_timeout_ms: u32,
     /// Rewrite rules evaluated before route dispatch.
     rewrite_rules: []RewriteRule,
     /// Return rules evaluated after rewrites and before route dispatch.
@@ -362,6 +310,8 @@ pub const EdgeConfig = struct {
     named_locations: []NamedLocation,
     /// Mirror request rules (best-effort asynchronous copies).
     mirror_rules: []MirrorRule,
+    proxy_pass_chat: []const u8,
+    proxy_pass_commands_prefix: []const u8,
     /// FastCGI upstream endpoint (`host:port`).
     fastcgi_upstream: []const u8,
     /// Additional `fastcgi_param` CGI variables injected into FastCGI requests.
@@ -388,13 +338,18 @@ pub const EdgeConfig = struct {
     udp_proxy_upstream: []const u8,
     /// Enable stream-module SSL termination mode for stream proxy routes.
     stream_ssl_termination: bool,
-    /// Path for persistent approval store file (empty = in-memory only).
+    websocket_enabled: bool,
+    websocket_idle_timeout_ms: u32,
+    websocket_max_frame_size: usize,
+    websocket_ping_interval_ms: u32,
+    sse_enabled: bool,
+    sse_max_events_per_topic: usize,
+    sse_poll_interval_ms: u32,
+    sse_max_backlog: u32,
+    sse_idle_timeout_ms: u32,
     approval_store_path: []const u8,
-    /// Approval request TTL in milliseconds (default 300000 = 5 minutes).
-    approval_ttl_ms: i64,
-    /// Webhook URL for escalation notifications (empty = disabled).
     approval_escalation_webhook: []const u8,
-    /// Max concurrent pending approval requests per identity (0 = unlimited).
+    approval_ttl_ms: i64,
     approval_max_pending_per_identity: u32,
 
     pub fn deinit(self: *EdgeConfig, allocator: std.mem.Allocator) void {
@@ -435,31 +390,24 @@ pub const EdgeConfig = struct {
         allocator.free(self.upstream_commands_base_url_weights);
         for (self.upstream_commands_backup_base_urls) |u| allocator.free(u);
         allocator.free(self.upstream_commands_backup_base_urls);
-        allocator.free(self.proxy_pass_chat);
-        allocator.free(self.proxy_pass_commands_prefix);
-        for (self.auth_token_hashes) |h| allocator.free(h);
-        allocator.free(self.auth_token_hashes);
+        allocator.free(self.auth_request_url);
         allocator.free(self.access_control_rules);
         allocator.free(self.proxy_cache_path);
         allocator.free(self.proxy_cache_key_template);
         for (self.geo_blocked_countries) |c| allocator.free(c);
         allocator.free(self.geo_blocked_countries);
         allocator.free(self.geo_country_header);
-        allocator.free(self.auth_request_url);
-        allocator.free(self.jwt_secret);
-        allocator.free(self.jwt_issuer);
-        allocator.free(self.jwt_audience);
         for (self.add_headers) |h| {
             allocator.free(h.name);
             allocator.free(h.value);
         }
         allocator.free(self.add_headers);
+        for (self.basic_auth_hashes) |h| allocator.free(h);
+        allocator.free(self.basic_auth_hashes);
+        allocator.free(self.device_registry_path);
         allocator.free(self.policy_rules_raw);
         allocator.free(self.policy_user_scopes_raw);
         allocator.free(self.policy_approval_routes_raw);
-        allocator.free(self.device_registry_path);
-        for (self.basic_auth_hashes) |h| allocator.free(h);
-        allocator.free(self.basic_auth_hashes);
         allocator.free(self.error_log_path);
         allocator.free(self.pid_file);
         allocator.free(self.run_user);
@@ -520,6 +468,8 @@ pub const EdgeConfig = struct {
             allocator.free(rule.target_url);
         }
         allocator.free(self.mirror_rules);
+        allocator.free(self.proxy_pass_chat);
+        allocator.free(self.proxy_pass_commands_prefix);
         allocator.free(self.fastcgi_upstream);
         for (self.fastcgi_params) |pair| {
             allocator.free(pair.name);
@@ -663,7 +613,7 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     const upstream_chat_base_url_weights = try parseCsvU32Values(allocator, upstream_chat_base_url_weights_raw);
     errdefer allocator.free(upstream_chat_base_url_weights);
     if (upstream_chat_base_url_weights.len > 0 and upstream_chat_base_url_weights.len != upstream_chat_base_urls.len) {
-        return error.InvalidUpstreamChatBaseUrlWeightsCount;
+        return error.InvalidUpstreamBaseUrlWeightsCount;
     }
     const upstream_chat_backup_base_urls_raw = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_CHAT_BACKUP_BASE_URLS", "") catch unreachable;
     defer allocator.free(upstream_chat_backup_base_urls_raw);
@@ -684,7 +634,7 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     const upstream_commands_base_url_weights = try parseCsvU32Values(allocator, upstream_commands_base_url_weights_raw);
     errdefer allocator.free(upstream_commands_base_url_weights);
     if (upstream_commands_base_url_weights.len > 0 and upstream_commands_base_url_weights.len != upstream_commands_base_urls.len) {
-        return error.InvalidUpstreamCommandsBaseUrlWeightsCount;
+        return error.InvalidUpstreamBaseUrlWeightsCount;
     }
     const upstream_commands_backup_base_urls_raw = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_COMMANDS_BACKUP_BASE_URLS", "") catch unreachable;
     defer allocator.free(upstream_commands_backup_base_urls_raw);
@@ -696,22 +646,12 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     const lb_algo_str = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_LB_ALGORITHM", "round_robin") catch unreachable;
     defer allocator.free(lb_algo_str);
     const upstream_lb_algorithm = UpstreamLbAlgorithm.parse(lb_algo_str) orelse .round_robin;
-    const proxy_pass_chat = envOrDefault(allocator, "TARDIGRADE_PROXY_PASS_CHAT", "/v1/chat") catch unreachable;
-    errdefer allocator.free(proxy_pass_chat);
-    const proxy_pass_commands_prefix = envOrDefault(allocator, "TARDIGRADE_PROXY_PASS_COMMANDS_PREFIX", "") catch unreachable;
-    errdefer allocator.free(proxy_pass_commands_prefix);
-
-    const max_message_chars_str = envOrDefault(allocator, "TARDIGRADE_MAX_MESSAGE_CHARS", "4000") catch unreachable;
-    defer allocator.free(max_message_chars_str);
-    const max_message_chars = std.fmt.parseInt(usize, max_message_chars_str, 10) catch 4000;
 
     const timeout_str = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_TIMEOUT_MS", "10000") catch unreachable;
     defer allocator.free(timeout_str);
     const upstream_timeout_ms = std.fmt.parseInt(u32, timeout_str, 10) catch 10000;
-
-    const raw_hashes = envOrDefault(allocator, "TARDIGRADE_AUTH_TOKEN_HASHES", "") catch unreachable;
-    defer allocator.free(raw_hashes);
-    const hashes = try parseHashes(allocator, raw_hashes);
+    const auth_request_url = envOrDefault(allocator, "TARDIGRADE_AUTH_REQUEST_URL", "") catch unreachable;
+    errdefer allocator.free(auth_request_url);
 
     const rate_rps_str = envOrDefault(allocator, "TARDIGRADE_RATE_LIMIT_RPS", "10") catch unreachable;
     defer allocator.free(rate_rps_str);
@@ -758,17 +698,6 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     }
     const geo_country_header = envOrDefault(allocator, "TARDIGRADE_GEO_COUNTRY_HEADER", "CF-IPCountry") catch unreachable;
     errdefer allocator.free(geo_country_header);
-    const auth_request_url = envOrDefault(allocator, "TARDIGRADE_AUTH_REQUEST_URL", "") catch unreachable;
-    errdefer allocator.free(auth_request_url);
-    const auth_request_timeout_ms_str = envOrDefault(allocator, "TARDIGRADE_AUTH_REQUEST_TIMEOUT_MS", "2000") catch unreachable;
-    defer allocator.free(auth_request_timeout_ms_str);
-    const auth_request_timeout_ms = std.fmt.parseInt(u32, auth_request_timeout_ms_str, 10) catch 2000;
-    const jwt_secret = envOrDefault(allocator, "TARDIGRADE_JWT_SECRET", "") catch unreachable;
-    errdefer allocator.free(jwt_secret);
-    const jwt_issuer = envOrDefault(allocator, "TARDIGRADE_JWT_ISSUER", "") catch unreachable;
-    errdefer allocator.free(jwt_issuer);
-    const jwt_audience = envOrDefault(allocator, "TARDIGRADE_JWT_AUDIENCE", "") catch unreachable;
-    errdefer allocator.free(jwt_audience);
     const add_headers_raw = envOrDefault(allocator, "TARDIGRADE_ADD_HEADERS", "") catch unreachable;
     defer allocator.free(add_headers_raw);
     const add_headers = try parseHeaderPairs(allocator, add_headers_raw);
@@ -779,26 +708,6 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         }
         allocator.free(add_headers);
     }
-    const policy_rules_raw = envOrDefault(allocator, "TARDIGRADE_POLICY_RULES", "") catch unreachable;
-    errdefer allocator.free(policy_rules_raw);
-    const policy_user_scopes_raw = envOrDefault(allocator, "TARDIGRADE_POLICY_USER_SCOPES", "") catch unreachable;
-    errdefer allocator.free(policy_user_scopes_raw);
-    const policy_approval_routes_raw = envOrDefault(allocator, "TARDIGRADE_POLICY_APPROVAL_ROUTES", "") catch unreachable;
-    errdefer allocator.free(policy_approval_routes_raw);
-
-    const session_ttl_str = envOrDefault(allocator, "TARDIGRADE_SESSION_TTL", "3600") catch unreachable;
-    defer allocator.free(session_ttl_str);
-    const session_ttl_seconds = std.fmt.parseInt(u32, session_ttl_str, 10) catch 3600;
-
-    const session_max_str = envOrDefault(allocator, "TARDIGRADE_SESSION_MAX", "1000") catch unreachable;
-    defer allocator.free(session_max_str);
-    const session_max = std.fmt.parseInt(u32, session_max_str, 10) catch 1000;
-    const device_registry_path = envOrDefault(allocator, "TARDIGRADE_DEVICE_REGISTRY_PATH", "") catch unreachable;
-    errdefer allocator.free(device_registry_path);
-    const device_auth_required = parseBoolEnv(allocator, "TARDIGRADE_DEVICE_AUTH_REQUIRED", false);
-    const access_token_ttl_seconds = parseIntEnv(u32, allocator, "TARDIGRADE_ACCESS_TOKEN_TTL_SECONDS", 900);
-    const refresh_token_ttl_seconds = parseIntEnv(u32, allocator, "TARDIGRADE_REFRESH_TOKEN_TTL_SECONDS", 86_400);
-
     const access_control_rules = envOrDefault(allocator, "TARDIGRADE_ACCESS_CONTROL", "") catch unreachable;
     errdefer allocator.free(access_control_rules);
 
@@ -831,6 +740,16 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     const raw_basic_hashes = envOrDefault(allocator, "TARDIGRADE_BASIC_AUTH_HASHES", "") catch unreachable;
     defer allocator.free(raw_basic_hashes);
     const basic_auth_hashes = try parseHashes(allocator, raw_basic_hashes);
+    const session_ttl_seconds = parseIntEnv(u32, allocator, "TARDIGRADE_SESSION_TTL_SECONDS", 3600);
+    const session_max = parseIntEnv(u32, allocator, "TARDIGRADE_SESSION_MAX", 128);
+    const device_registry_path = envOrDefault(allocator, "TARDIGRADE_DEVICE_REGISTRY_PATH", "") catch unreachable;
+    errdefer allocator.free(device_registry_path);
+    const policy_rules_raw = envOrDefault(allocator, "TARDIGRADE_POLICY_RULES", "") catch unreachable;
+    errdefer allocator.free(policy_rules_raw);
+    const policy_user_scopes_raw = envOrDefault(allocator, "TARDIGRADE_POLICY_USER_SCOPES", "") catch unreachable;
+    errdefer allocator.free(policy_user_scopes_raw);
+    const policy_approval_routes_raw = envOrDefault(allocator, "TARDIGRADE_POLICY_APPROVAL_ROUTES", "") catch unreachable;
+    errdefer allocator.free(policy_approval_routes_raw);
 
     // Log level
     const log_level_str = envOrDefault(allocator, "TARDIGRADE_LOG_LEVEL", "info") catch unreachable;
@@ -917,6 +836,21 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     const worker_queue_str = envOrDefault(allocator, "TARDIGRADE_WORKER_QUEUE_SIZE", "1024") catch unreachable;
     defer allocator.free(worker_queue_str);
     const worker_queue_size = std.fmt.parseInt(usize, worker_queue_str, 10) catch 1024;
+    const websocket_enabled = parseBoolEnv(allocator, "TARDIGRADE_WEBSOCKET_ENABLED", false);
+    const websocket_idle_timeout_ms = parseIntEnv(u32, allocator, "TARDIGRADE_WEBSOCKET_IDLE_TIMEOUT_MS", 30_000);
+    const websocket_max_frame_size = parseIntEnv(usize, allocator, "TARDIGRADE_WEBSOCKET_MAX_FRAME_SIZE", 64 * 1024);
+    const websocket_ping_interval_ms = parseIntEnv(u32, allocator, "TARDIGRADE_WEBSOCKET_PING_INTERVAL_MS", 15_000);
+    const sse_enabled = parseBoolEnv(allocator, "TARDIGRADE_SSE_ENABLED", false);
+    const sse_max_events_per_topic = parseIntEnv(usize, allocator, "TARDIGRADE_SSE_MAX_EVENTS_PER_TOPIC", 128);
+    const sse_poll_interval_ms = parseIntEnv(u32, allocator, "TARDIGRADE_SSE_POLL_INTERVAL_MS", 250);
+    const sse_max_backlog = parseIntEnv(u32, allocator, "TARDIGRADE_SSE_MAX_BACKLOG", 128);
+    const sse_idle_timeout_ms = parseIntEnv(u32, allocator, "TARDIGRADE_SSE_IDLE_TIMEOUT_MS", 30_000);
+    const approval_store_path = envOrDefault(allocator, "TARDIGRADE_APPROVAL_STORE_PATH", "") catch unreachable;
+    errdefer allocator.free(approval_store_path);
+    const approval_escalation_webhook = envOrDefault(allocator, "TARDIGRADE_APPROVAL_ESCALATION_WEBHOOK", "") catch unreachable;
+    errdefer allocator.free(approval_escalation_webhook);
+    const approval_ttl_ms = parseIntEnv(i64, allocator, "TARDIGRADE_APPROVAL_TTL_MS", 300_000);
+    const approval_max_pending_per_identity = parseIntEnv(u32, allocator, "TARDIGRADE_APPROVAL_MAX_PENDING_PER_IDENTITY", 0);
 
     const fd_soft_limit_str = envOrDefault(allocator, "TARDIGRADE_FD_SOFT_LIMIT", "0") catch unreachable;
     defer allocator.free(fd_soft_limit_str);
@@ -977,8 +911,8 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
 
     const active_health_interval_str = envOrDefaultAlias(
         allocator,
-        "TARDIGRADE_UPSTREAM_HEALTH_INTERVAL_MS",
-        "TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_INTERVAL_MS",
+        "TARDIGRADE_UPSTREAM_PROBE_INTERVAL_MS",
+        "TARDIGRADE_UPSTREAM_ACTIVE_PROBE_INTERVAL_MS",
         "0",
     ) catch unreachable;
     defer allocator.free(active_health_interval_str);
@@ -986,16 +920,16 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
 
     const upstream_active_health_path = envOrDefaultAlias(
         allocator,
-        "TARDIGRADE_UPSTREAM_HEALTH_PATH",
-        "TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_PATH",
-        "/health",
+        "TARDIGRADE_UPSTREAM_PROBE_PATH",
+        "TARDIGRADE_UPSTREAM_ACTIVE_PROBE_PATH",
+        "/",
     ) catch unreachable;
     errdefer allocator.free(upstream_active_health_path);
 
     const active_health_timeout_str = envOrDefaultAlias(
         allocator,
-        "TARDIGRADE_UPSTREAM_HEALTH_TIMEOUT_MS",
-        "TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_TIMEOUT_MS",
+        "TARDIGRADE_UPSTREAM_PROBE_TIMEOUT_MS",
+        "TARDIGRADE_UPSTREAM_ACTIVE_PROBE_TIMEOUT_MS",
         "2000",
     ) catch unreachable;
     defer allocator.free(active_health_timeout_str);
@@ -1003,21 +937,21 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
 
     const active_health_fail_threshold_str = envOrDefaultAlias(
         allocator,
-        "TARDIGRADE_UPSTREAM_HEALTH_THRESHOLD",
-        "TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_FAIL_THRESHOLD",
+        "TARDIGRADE_UPSTREAM_PROBE_FAIL_THRESHOLD",
+        "TARDIGRADE_UPSTREAM_ACTIVE_PROBE_FAIL_THRESHOLD",
         "1",
     ) catch unreachable;
     defer allocator.free(active_health_fail_threshold_str);
     const upstream_active_health_fail_threshold = @max(std.fmt.parseInt(u32, active_health_fail_threshold_str, 10) catch 1, 1);
 
-    const active_health_success_threshold_str = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_SUCCESS_THRESHOLD", "1") catch unreachable;
+    const active_health_success_threshold_str = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_ACTIVE_PROBE_SUCCESS_THRESHOLD", "1") catch unreachable;
     defer allocator.free(active_health_success_threshold_str);
     const upstream_active_health_success_threshold = @max(std.fmt.parseInt(u32, active_health_success_threshold_str, 10) catch 1, 1);
 
     const active_health_success_status_str = envOrDefaultAlias(
         allocator,
-        "TARDIGRADE_UPSTREAM_HEALTH_SUCCESS_STATUS",
-        "TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_SUCCESS_STATUS",
+        "TARDIGRADE_UPSTREAM_PROBE_SUCCESS_STATUS",
+        "TARDIGRADE_UPSTREAM_ACTIVE_PROBE_SUCCESS_STATUS",
         "200-299",
     ) catch unreachable;
     defer allocator.free(active_health_success_status_str);
@@ -1025,8 +959,8 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
 
     const active_health_success_status_overrides_raw = envOrDefaultAlias(
         allocator,
-        "TARDIGRADE_UPSTREAM_HEALTH_SUCCESS_STATUS_OVERRIDES",
-        "TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_SUCCESS_STATUS_OVERRIDES",
+        "TARDIGRADE_UPSTREAM_PROBE_SUCCESS_STATUS_OVERRIDES",
+        "TARDIGRADE_UPSTREAM_ACTIVE_PROBE_SUCCESS_STATUS_OVERRIDES",
         "",
     ) catch unreachable;
     defer allocator.free(active_health_success_status_overrides_raw);
@@ -1044,18 +978,6 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     const slow_start_str = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_SLOW_START_MS", "0") catch unreachable;
     defer allocator.free(slow_start_str);
     const upstream_slow_start_ms = std.fmt.parseInt(u64, slow_start_str, 10) catch 0;
-    const websocket_enabled = parseBoolEnv(allocator, "TARDIGRADE_WEBSOCKET_ENABLED", true);
-    const websocket_idle_timeout_ms = parseIntEnv(u32, allocator, "TARDIGRADE_WEBSOCKET_IDLE_TIMEOUT_MS", 60_000);
-    const websocket_max_frame_size = parseIntEnv(usize, allocator, "TARDIGRADE_WEBSOCKET_MAX_FRAME_SIZE", 1024 * 1024);
-    const mux_write_buffer_max = parseIntEnv(usize, allocator, "TARDIGRADE_MUX_WRITE_BUFFER_MAX", 256 * 1024);
-    const mux_max_channels_per_device = parseIntEnv(usize, allocator, "TARDIGRADE_MUX_MAX_CHANNELS_PER_DEVICE", 50);
-    const mux_reconnect_grace_ms = parseIntEnv(u32, allocator, "TARDIGRADE_MUX_RECONNECT_GRACE_MS", 30_000);
-    const websocket_ping_interval_ms = parseIntEnv(u32, allocator, "TARDIGRADE_WEBSOCKET_PING_INTERVAL_MS", 15_000);
-    const sse_enabled = parseBoolEnv(allocator, "TARDIGRADE_SSE_ENABLED", true);
-    const sse_max_events_per_topic = parseIntEnv(usize, allocator, "TARDIGRADE_SSE_MAX_EVENTS_PER_TOPIC", 1024);
-    const sse_poll_interval_ms = parseIntEnv(u32, allocator, "TARDIGRADE_SSE_POLL_INTERVAL_MS", 250);
-    const sse_max_backlog = parseIntEnv(usize, allocator, "TARDIGRADE_SSE_MAX_BACKLOG", 1024);
-    const sse_idle_timeout_ms = parseIntEnv(u32, allocator, "TARDIGRADE_SSE_IDLE_TIMEOUT_MS", 60_000);
     const rewrite_rules_raw = envOrDefault(allocator, "TARDIGRADE_REWRITE_RULES", "") catch unreachable;
     defer allocator.free(rewrite_rules_raw);
     const rewrite_rules = try parseRewriteRules(allocator, rewrite_rules_raw);
@@ -1135,6 +1057,10 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         }
         allocator.free(mirror_rules);
     }
+    const proxy_pass_chat = envOrDefault(allocator, "TARDIGRADE_PROXY_PASS_CHAT", "") catch unreachable;
+    errdefer allocator.free(proxy_pass_chat);
+    const proxy_pass_commands_prefix = envOrDefault(allocator, "TARDIGRADE_PROXY_PASS_COMMANDS_PREFIX", "") catch unreachable;
+    errdefer allocator.free(proxy_pass_commands_prefix);
     const fastcgi_upstream = envOrDefault(allocator, "TARDIGRADE_FASTCGI_UPSTREAM", "") catch unreachable;
     errdefer allocator.free(fastcgi_upstream);
     const fastcgi_params_raw = envOrDefault(allocator, "TARDIGRADE_FASTCGI_PARAMS", "") catch unreachable;
@@ -1168,13 +1094,6 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     const udp_proxy_upstream = envOrDefault(allocator, "TARDIGRADE_UDP_PROXY_UPSTREAM", "") catch unreachable;
     errdefer allocator.free(udp_proxy_upstream);
     const stream_ssl_termination = parseBoolEnv(allocator, "TARDIGRADE_STREAM_SSL_TERMINATION", false);
-
-    const approval_store_path = envOrDefault(allocator, "TARDIGRADE_APPROVAL_STORE_PATH", "") catch unreachable;
-    errdefer allocator.free(approval_store_path);
-    const approval_ttl_ms = parseIntEnv(i64, allocator, "TARDIGRADE_APPROVAL_TTL_MS", 300_000);
-    const approval_escalation_webhook = envOrDefault(allocator, "TARDIGRADE_APPROVAL_ESCALATION_WEBHOOK", "") catch unreachable;
-    errdefer allocator.free(approval_escalation_webhook);
-    const approval_max_pending_per_identity = parseIntEnv(u32, allocator, "TARDIGRADE_APPROVAL_MAX_PENDING_PER_IDENTITY", 10);
 
     return .{
         .listen_host = listen_host,
@@ -1222,11 +1141,8 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .upstream_commands_base_url_weights = upstream_commands_base_url_weights,
         .upstream_commands_backup_base_urls = upstream_commands_backup_base_urls,
         .upstream_lb_algorithm = upstream_lb_algorithm,
-        .proxy_pass_chat = proxy_pass_chat,
-        .proxy_pass_commands_prefix = proxy_pass_commands_prefix,
-        .auth_token_hashes = hashes,
-        .max_message_chars = max_message_chars,
         .upstream_timeout_ms = upstream_timeout_ms,
+        .auth_request_url = auth_request_url,
         .rate_limit_rps = rate_limit_rps,
         .rate_limit_burst = rate_limit_burst,
         .security_headers_enabled = security_headers_enabled,
@@ -1239,21 +1155,7 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .proxy_cache_manager_interval_ms = proxy_cache_manager_interval_ms,
         .geo_blocked_countries = geo_blocked_countries,
         .geo_country_header = geo_country_header,
-        .auth_request_url = auth_request_url,
-        .auth_request_timeout_ms = auth_request_timeout_ms,
-        .jwt_secret = jwt_secret,
-        .jwt_issuer = jwt_issuer,
-        .jwt_audience = jwt_audience,
         .add_headers = add_headers,
-        .policy_rules_raw = policy_rules_raw,
-        .policy_user_scopes_raw = policy_user_scopes_raw,
-        .policy_approval_routes_raw = policy_approval_routes_raw,
-        .session_ttl_seconds = session_ttl_seconds,
-        .session_max = session_max,
-        .device_registry_path = device_registry_path,
-        .device_auth_required = device_auth_required,
-        .access_token_ttl_seconds = access_token_ttl_seconds,
-        .refresh_token_ttl_seconds = refresh_token_ttl_seconds,
         .access_control_rules = access_control_rules,
         .request_limits = .{
             .max_body_size = max_body_size,
@@ -1264,6 +1166,12 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
             .header_timeout_ms = header_timeout_ms,
         },
         .basic_auth_hashes = basic_auth_hashes,
+        .session_ttl_seconds = session_ttl_seconds,
+        .session_max = session_max,
+        .device_registry_path = device_registry_path,
+        .policy_rules_raw = policy_rules_raw,
+        .policy_user_scopes_raw = policy_user_scopes_raw,
+        .policy_approval_routes_raw = policy_approval_routes_raw,
         .log_level = log_level,
         .error_log_path = error_log_path,
         .pid_file = pid_file,
@@ -1315,18 +1223,6 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .upstream_active_health_success_status = upstream_active_health_success_status,
         .upstream_active_health_success_status_overrides = upstream_active_health_success_status_overrides,
         .upstream_slow_start_ms = upstream_slow_start_ms,
-        .websocket_enabled = websocket_enabled,
-        .websocket_idle_timeout_ms = websocket_idle_timeout_ms,
-        .websocket_max_frame_size = websocket_max_frame_size,
-        .mux_write_buffer_max = mux_write_buffer_max,
-        .mux_max_channels_per_device = mux_max_channels_per_device,
-        .mux_reconnect_grace_ms = mux_reconnect_grace_ms,
-        .websocket_ping_interval_ms = websocket_ping_interval_ms,
-        .sse_enabled = sse_enabled,
-        .sse_max_events_per_topic = sse_max_events_per_topic,
-        .sse_poll_interval_ms = sse_poll_interval_ms,
-        .sse_max_backlog = sse_max_backlog,
-        .sse_idle_timeout_ms = sse_idle_timeout_ms,
         .rewrite_rules = rewrite_rules,
         .return_rules = return_rules,
         .conditional_rules = conditional_rules,
@@ -1334,6 +1230,8 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .internal_redirect_rules = internal_redirect_rules,
         .named_locations = named_locations,
         .mirror_rules = mirror_rules,
+        .proxy_pass_chat = proxy_pass_chat,
+        .proxy_pass_commands_prefix = proxy_pass_commands_prefix,
         .fastcgi_upstream = fastcgi_upstream,
         .fastcgi_params = fastcgi_params,
         .fastcgi_index = fastcgi_index,
@@ -1347,9 +1245,18 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .tcp_proxy_upstream = tcp_proxy_upstream,
         .udp_proxy_upstream = udp_proxy_upstream,
         .stream_ssl_termination = stream_ssl_termination,
+        .websocket_enabled = websocket_enabled,
+        .websocket_idle_timeout_ms = websocket_idle_timeout_ms,
+        .websocket_max_frame_size = websocket_max_frame_size,
+        .websocket_ping_interval_ms = websocket_ping_interval_ms,
+        .sse_enabled = sse_enabled,
+        .sse_max_events_per_topic = sse_max_events_per_topic,
+        .sse_poll_interval_ms = sse_poll_interval_ms,
+        .sse_max_backlog = sse_max_backlog,
+        .sse_idle_timeout_ms = sse_idle_timeout_ms,
         .approval_store_path = approval_store_path,
-        .approval_ttl_ms = approval_ttl_ms,
         .approval_escalation_webhook = approval_escalation_webhook,
+        .approval_ttl_ms = approval_ttl_ms,
         .approval_max_pending_per_identity = approval_max_pending_per_identity,
     };
 }
@@ -1374,9 +1281,9 @@ fn parseServerBlocks(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeConfi
         const tls_cert_path = fields.next() orelse return error.InvalidServerBlockFormat;
         const tls_key_path = fields.next() orelse return error.InvalidServerBlockFormat;
         const upstream_base_url = fields.next() orelse return error.InvalidServerBlockFormat;
-        const proxy_pass_chat = fields.next() orelse return error.InvalidServerBlockFormat;
-        const proxy_pass_commands_prefix = fields.next() orelse return error.InvalidServerBlockFormat;
         const location_blocks_raw = fields.next() orelse return error.InvalidServerBlockFormat;
+        const proxy_pass_chat = fields.next() orelse "";
+        const proxy_pass_commands_prefix = fields.next() orelse "";
         if (fields.next() != null) return error.InvalidServerBlockFormat;
 
         const names = try parseServerNames(allocator, names_raw);
@@ -2187,16 +2094,8 @@ pub fn validate(cfg: *const EdgeConfig) !void {
     try validateOptionalUpstreamBaseUrl(cfg.upstream_base_url, "upstream_base_url");
     try validateUpstreamBaseUrlList(cfg.upstream_base_urls, "upstream_base_urls");
     try validateUpstreamBaseUrlList(cfg.upstream_backup_base_urls, "upstream_backup_base_urls");
-    try validateUpstreamBaseUrlList(cfg.upstream_chat_base_urls, "upstream_chat_base_urls");
-    try validateUpstreamBaseUrlList(cfg.upstream_chat_backup_base_urls, "upstream_chat_backup_base_urls");
-    try validateUpstreamBaseUrlList(cfg.upstream_commands_base_urls, "upstream_commands_base_urls");
-    try validateUpstreamBaseUrlList(cfg.upstream_commands_backup_base_urls, "upstream_commands_backup_base_urls");
-    try validateOptionalAbsoluteUrl(cfg.auth_request_url, "auth_request_url");
     try validateOptionalAbsoluteUrl(cfg.grpc_upstream, "grpc_upstream");
     for (cfg.mirror_rules) |rule| try validateOptionalAbsoluteUrl(rule.target_url, "mirror_rule.target_url");
-
-    if (isAbsoluteHttpUrl(cfg.proxy_pass_chat)) try validateOptionalAbsoluteUrl(cfg.proxy_pass_chat, "proxy_pass_chat");
-    if (isAbsoluteHttpUrl(cfg.proxy_pass_commands_prefix)) try validateOptionalAbsoluteUrl(cfg.proxy_pass_commands_prefix, "proxy_pass_commands_prefix");
     for (cfg.location_blocks) |block| {
         switch (block.action) {
             .proxy_pass => |target| if (isAbsoluteHttpUrl(target) or isUnixEndpoint(target)) try validateOptionalUpstreamBaseUrl(target, "location.proxy_pass"),
@@ -2454,7 +2353,7 @@ test "missing tls cert path helper returns InvalidConfigPath" {
 test "parse server blocks" {
     const allocator = std.testing.allocator;
     const raw =
-        "api.example.test" ++ "\x1f" ++ "/srv/api" ++ "\x1f" ++ "$uri /index.html" ++ "\x1f" ++ "/certs/api.crt" ++ "\x1f" ++ "/certs/api.key" ++ "\x1f" ++ "http://127.0.0.1:9101" ++ "\x1f" ++ "" ++ "\x1f" ++ "" ++ "\x1f" ++ "prefix|/|proxy_pass|http://127.0.0.1:9101";
+        "api.example.test" ++ "\x1f" ++ "/srv/api" ++ "\x1f" ++ "$uri /index.html" ++ "\x1f" ++ "/certs/api.crt" ++ "\x1f" ++ "/certs/api.key" ++ "\x1f" ++ "http://127.0.0.1:9101" ++ "\x1f" ++ "prefix|/|proxy_pass|http://127.0.0.1:9101";
     const blocks = try parseServerBlocks(allocator, raw);
     defer {
         for (blocks) |*block| block.deinit(allocator);
@@ -2635,7 +2534,7 @@ test "parse internal redirect rules csv" {
 
 test "parse named locations csv" {
     const allocator = std.testing.allocator;
-    const entries = try parseNamedLocations(allocator, "admin|/v1/chat;metrics|/metrics");
+    const entries = try parseNamedLocations(allocator, "admin|/api/messages;metrics|/status/metrics");
     defer {
         for (entries) |entry| {
             allocator.free(entry.name);
@@ -2649,7 +2548,7 @@ test "parse named locations csv" {
 
 test "parse mirror rules csv" {
     const allocator = std.testing.allocator;
-    const rules = try parseMirrorRules(allocator, "POST|^/v1/chat$|http://127.0.0.1:9000/mirror");
+    const rules = try parseMirrorRules(allocator, "POST|^/api/messages$|http://127.0.0.1:9000/mirror");
     defer {
         for (rules) |rule| {
             allocator.free(rule.method);

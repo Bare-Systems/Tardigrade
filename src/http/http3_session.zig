@@ -593,7 +593,7 @@ test "http3 stream assembler builds request parts from split header and body fra
 
     try assembler.appendHeaderBlock(&.{
         .{ .name = ":method", .value = "POST" },
-        .{ .name = ":path", .value = "/v1/chat?mode=test" },
+        .{ .name = ":path", .value = "/api/messages?mode=test" },
     });
     try assembler.appendHeaderBlock(&.{
         .{ .name = ":authority", .value = "example.com" },
@@ -606,7 +606,7 @@ test "http3 stream assembler builds request parts from split header and body fra
     defer request.deinit();
 
     try std.testing.expectEqualStrings("POST", request.method);
-    try std.testing.expectEqualStrings("/v1/chat?mode=test", request.path);
+    try std.testing.expectEqualStrings("/api/messages?mode=test", request.path);
     try std.testing.expectEqualStrings("example.com", request.authority.?);
     try std.testing.expectEqualStrings("example.com", request.headers.get("Host").?);
     try std.testing.expectEqualStrings("application/json", request.headers.get("content-type").?);

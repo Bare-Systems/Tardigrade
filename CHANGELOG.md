@@ -4,6 +4,12 @@
 ## [0.31.0] - 2026-03-xx
 
 ### Added
+- Integration harness cleanup:
+  - Split `tests/integration.zig` into explicit generic-server boots and optional BearClaw-profile boots sourced from `examples/bearclaw/`.
+  - Added fixture generation from the BearClaw example config/env, layered config support, and deterministic harness-owned port/log overrides.
+  - BearClaw-profile boots now default to HTTP for generic app-fixture tests and only enable fixture TLS when a test explicitly requests TLS/HTTP3 behavior.
+  - Removed the deleted built-in application-surface assumptions from the live integration target by trimming the suite down to generic config-defined routing, reload, and static-file cases; removed product-surface tests are now skipped instead of failing against the generic core.
+  - `zig build test` and `zig build test-integration` are green again after the harness split.
 - Documentation refresh:
   - Reworked the top of `README.md` into a centered project header with navigation links, badges,
     and a clearer summary of Tardigrade’s server and gateway roles.
@@ -75,7 +81,7 @@
 - Upgrade 2 active upstream health-check foundation:
   - Added `src/http/health_checker.zig` with explicit up/down/half-open transition logic and unit coverage.
   - Added integration coverage for active probe down detection, rerouting away from failed upstreams, recovery after probe successes, and degraded `/health` reporting.
-  - Added Upgrade 2 env aliases (`TARDIGRADE_UPSTREAM_HEALTH_*`) on top of the existing active-health settings.
+  - Added Upgrade 2 env aliases for upstream probe settings on top of the existing active-probe settings.
   - Added active probe success-status config with a default range plus exact upstream URL overrides for non-2xx health endpoints.
 - Upgrade 3 HTTP/3 ngtcp2/nghttp3 foundation:
   - Added opt-in build wiring for `ngtcp2`, `ngtcp2_crypto_ossl`, and `nghttp3` via `-Denable-http3-ngtcp2=true`.
@@ -358,11 +364,11 @@
   - Added upstream unhealthy backend gauge derived from passive health tracking state.
   - Extended `/metrics` JSON and `/metrics/prometheus` output to include the new operational metrics.
 - Phase 4.4 active upstream health checks (`src/edge_config.zig`, `src/edge_gateway.zig`):
-  - Added periodic active probe controls: `TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_INTERVAL_MS`, `TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_PATH`, and `TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_TIMEOUT_MS`.
+  - Added periodic active probe controls: `TARDIGRADE_UPSTREAM_ACTIVE_PROBE_INTERVAL_MS`, `TARDIGRADE_UPSTREAM_ACTIVE_PROBE_PATH`, and `TARDIGRADE_UPSTREAM_ACTIVE_PROBE_TIMEOUT_MS`.
   - Event-loop timer ticks now run active health probes across configured upstreams.
   - Active probe outcomes now feed existing passive-health failover tracking.
 - Phase 4.4 configurable health thresholds (`src/edge_config.zig`, `src/edge_gateway.zig`):
-  - Added `TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_FAIL_THRESHOLD` and `TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_SUCCESS_THRESHOLD`.
+  - Added `TARDIGRADE_UPSTREAM_ACTIVE_PROBE_FAIL_THRESHOLD` and `TARDIGRADE_UPSTREAM_ACTIVE_PROBE_SUCCESS_THRESHOLD`.
   - Active probe failures/successes now use configurable consecutive-threshold transitions for unhealthy/healthy state changes.
 - Phase 4.4 slow-start for recovered upstreams (`src/edge_config.zig`, `src/edge_gateway.zig`):
   - Added `TARDIGRADE_UPSTREAM_SLOW_START_MS` for recovered-backend traffic ramp windows.

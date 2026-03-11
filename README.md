@@ -138,34 +138,26 @@ Config file notes:
 | `TARDIGRADE_UPSTREAM_BASE_URLS` | Comma-separated primary upstream URLs | empty |
 | `TARDIGRADE_UPSTREAM_BASE_URL_WEIGHTS` | Weights aligned with `TARDIGRADE_UPSTREAM_BASE_URLS` | empty |
 | `TARDIGRADE_UPSTREAM_BACKUP_BASE_URLS` | Backup upstream base URLs | empty |
-| `TARDIGRADE_UPSTREAM_CHAT_BASE_URLS` | Dedicated upstream pool for chat routes | empty |
-| `TARDIGRADE_UPSTREAM_CHAT_BASE_URL_WEIGHTS` | Weights aligned with chat upstream pool | empty |
-| `TARDIGRADE_UPSTREAM_CHAT_BACKUP_BASE_URLS` | Backup chat upstreams | empty |
-| `TARDIGRADE_UPSTREAM_COMMANDS_BASE_URLS` | Dedicated upstream pool for command routes | empty |
-| `TARDIGRADE_UPSTREAM_COMMANDS_BASE_URL_WEIGHTS` | Weights aligned with command upstream pool | empty |
-| `TARDIGRADE_UPSTREAM_COMMANDS_BACKUP_BASE_URLS` | Backup command upstreams | empty |
 | `TARDIGRADE_UPSTREAM_LB_ALGORITHM` | Upstream load-balancing algorithm | `round_robin` |
-| `TARDIGRADE_PROXY_PASS_CHAT` | Proxy target for chat route | `/v1/chat` |
-| `TARDIGRADE_PROXY_PASS_COMMANDS_PREFIX` | Proxy target prefix for command subpaths | empty |
 | `TARDIGRADE_UPSTREAM_TIMEOUT_MS` | Per-attempt upstream timeout | `10000` |
 | `TARDIGRADE_PROXY_STREAM_ALL_STATUSES` | Stream non-200 upstream responses directly | `false` |
 | `TARDIGRADE_UPSTREAM_RETRY_ATTEMPTS` | Upstream attempts per request | `1` |
 | `TARDIGRADE_UPSTREAM_TIMEOUT_BUDGET_MS` | Total timeout budget across retries | `0` |
 | `TARDIGRADE_UPSTREAM_MAX_FAILS` | Passive unhealthy threshold | `0` |
 | `TARDIGRADE_UPSTREAM_FAIL_TIMEOUT_MS` | Passive failure cooldown window | `10000` |
-| `TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_INTERVAL_MS` | Active probe interval | `0` |
-| `TARDIGRADE_UPSTREAM_HEALTH_INTERVAL_MS` | Alias for active probe interval | `0` |
-| `TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_PATH` | Active probe path | `/health` |
-| `TARDIGRADE_UPSTREAM_HEALTH_PATH` | Alias for active probe path | `/health` |
-| `TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_TIMEOUT_MS` | Active probe timeout | `2000` |
-| `TARDIGRADE_UPSTREAM_HEALTH_TIMEOUT_MS` | Alias for active probe timeout | `2000` |
-| `TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_FAIL_THRESHOLD` | Consecutive active probe failures before unhealthy | `1` |
-| `TARDIGRADE_UPSTREAM_HEALTH_THRESHOLD` | Alias for active probe failure threshold | `1` |
-| `TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_SUCCESS_THRESHOLD` | Consecutive active probe successes before healthy | `1` |
-| `TARDIGRADE_UPSTREAM_HEALTH_SUCCESS_STATUS` | Accepted active health-check status range | `200-299` |
-| `TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_SUCCESS_STATUS` | Legacy alias for accepted active health-check status range | `200-299` |
-| `TARDIGRADE_UPSTREAM_HEALTH_SUCCESS_STATUS_OVERRIDES` | Per-upstream active health-check success-status overrides | empty |
-| `TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_SUCCESS_STATUS_OVERRIDES` | Legacy alias for per-upstream active health-check success-status overrides | empty |
+| `TARDIGRADE_UPSTREAM_PROBE_INTERVAL_MS` | Active upstream probe interval | `0` |
+| `TARDIGRADE_UPSTREAM_ACTIVE_PROBE_INTERVAL_MS` | Legacy alias for active upstream probe interval | `0` |
+| `TARDIGRADE_UPSTREAM_PROBE_PATH` | Active upstream probe path | `/` |
+| `TARDIGRADE_UPSTREAM_ACTIVE_PROBE_PATH` | Legacy alias for active upstream probe path | `/` |
+| `TARDIGRADE_UPSTREAM_PROBE_TIMEOUT_MS` | Active upstream probe timeout | `2000` |
+| `TARDIGRADE_UPSTREAM_ACTIVE_PROBE_TIMEOUT_MS` | Legacy alias for active upstream probe timeout | `2000` |
+| `TARDIGRADE_UPSTREAM_PROBE_FAIL_THRESHOLD` | Consecutive active probe failures before unhealthy | `1` |
+| `TARDIGRADE_UPSTREAM_ACTIVE_PROBE_FAIL_THRESHOLD` | Legacy alias for active upstream probe failure threshold | `1` |
+| `TARDIGRADE_UPSTREAM_ACTIVE_PROBE_SUCCESS_THRESHOLD` | Consecutive active probe successes before healthy | `1` |
+| `TARDIGRADE_UPSTREAM_PROBE_SUCCESS_STATUS` | Accepted active probe status range | `200-299` |
+| `TARDIGRADE_UPSTREAM_ACTIVE_PROBE_SUCCESS_STATUS` | Legacy alias for accepted active probe status range | `200-299` |
+| `TARDIGRADE_UPSTREAM_PROBE_SUCCESS_STATUS_OVERRIDES` | Per-upstream active probe success-status overrides | empty |
+| `TARDIGRADE_UPSTREAM_ACTIVE_PROBE_SUCCESS_STATUS_OVERRIDES` | Legacy alias for per-upstream active probe success-status overrides | empty |
 | `TARDIGRADE_UPSTREAM_SLOW_START_MS` | Recovered-backend ramp window | `0` |
 | `TARDIGRADE_CB_THRESHOLD` | Circuit-breaker trip threshold | `0` |
 | `TARDIGRADE_CB_TIMEOUT_MS` | Circuit-breaker open timeout | `30000` |
@@ -178,36 +170,16 @@ Config file notes:
 | `TARDIGRADE_UPSTREAM_GUNZIP_ENABLED` | Gunzip upstream gzip responses before downstream negotiation | `true` |
 | `TARDIGRADE_MIRROR_RULES` | Semicolon-separated mirror dispatch rules | empty |
 
-#### Authentication, Sessions, Devices, and Policy
+#### Authentication and Access Control
 
 | Name | Description | Default |
 |---|---|---|
-| `TARDIGRADE_AUTH_REQUEST_URL` | Optional auth subrequest URL | empty |
-| `TARDIGRADE_AUTH_REQUEST_TIMEOUT_MS` | Auth subrequest timeout | `2000` |
-| `TARDIGRADE_JWT_SECRET` | HS256 bearer JWT secret | empty |
-| `TARDIGRADE_JWT_ISSUER` | Required JWT issuer | empty |
-| `TARDIGRADE_JWT_AUDIENCE` | Required JWT audience | empty |
-| `TARDIGRADE_AUTH_TOKEN_HASHES` | Lowercase SHA-256 bearer token hashes | empty |
 | `TARDIGRADE_BASIC_AUTH_HASHES` | Lowercase SHA-256 hashes of `user:password` | empty |
-| `TARDIGRADE_SESSION_TTL` | Session idle TTL in seconds | `3600` |
-| `TARDIGRADE_SESSION_MAX` | Maximum concurrent sessions | `1000` |
-| `TARDIGRADE_DEVICE_REGISTRY_PATH` | Device key registry file path | empty |
-| `TARDIGRADE_DEVICE_AUTH_REQUIRED` | Require device proof headers for protected routes | `false` |
-| `TARDIGRADE_ACCESS_TOKEN_TTL_SECONDS` | Access token TTL metadata returned by session refresh | `900` |
-| `TARDIGRADE_REFRESH_TOKEN_TTL_SECONDS` | Refresh token TTL metadata returned by session refresh | `86400` |
-| `TARDIGRADE_POLICY_RULES` | Policy rules in `METHOD|REGEX|required_scope|require_approval|hours|device_regex` format | empty |
-| `TARDIGRADE_POLICY_USER_SCOPES` | Identity-to-scope map | empty |
-| `TARDIGRADE_POLICY_APPROVAL_ROUTES` | Explicit approval routes | empty |
-| `TARDIGRADE_APPROVAL_STORE_PATH` | Persistent approval store path | empty |
-| `TARDIGRADE_APPROVAL_TTL_MS` | Approval TTL in milliseconds | `300000` |
-| `TARDIGRADE_APPROVAL_ESCALATION_WEBHOOK` | Best-effort approval escalation webhook | empty |
-| `TARDIGRADE_APPROVAL_MAX_PENDING_PER_IDENTITY` | Max pending approvals per identity | `10` |
 
 #### Request Handling, Limits, and Connection Management
 
 | Name | Description | Default |
 |---|---|---|
-| `TARDIGRADE_MAX_MESSAGE_CHARS` | Max logical message length for API payload validation | `4000` |
 | `TARDIGRADE_RATE_LIMIT_RPS` | Per-IP rate limit requests per second | `10` |
 | `TARDIGRADE_RATE_LIMIT_BURST` | Rate limiter burst capacity | `20` |
 | `TARDIGRADE_SECURITY_HEADERS` | Enable default security headers | `true` |
@@ -230,23 +202,6 @@ Config file notes:
 | `TARDIGRADE_CONNECTION_POOL_SIZE` | Cached connection-session pool size | `256` |
 | `TARDIGRADE_MAX_CONNECTION_MEMORY_BYTES` | Max retained memory per active connection | `2097152` |
 | `TARDIGRADE_MAX_TOTAL_CONNECTION_MEMORY_BYTES` | Global estimated connection memory cap | `0` |
-
-#### Realtime, WebSocket, SSE, and Mux
-
-| Name | Description | Default |
-|---|---|---|
-| `TARDIGRADE_WEBSOCKET_ENABLED` | Enable authenticated WebSocket routes | `true` |
-| `TARDIGRADE_WEBSOCKET_IDLE_TIMEOUT_MS` | WebSocket idle timeout | `60000` |
-| `TARDIGRADE_WEBSOCKET_MAX_FRAME_SIZE` | Maximum WebSocket frame payload size | `1048576` |
-| `TARDIGRADE_WEBSOCKET_PING_INTERVAL_MS` | WebSocket ping interval | `15000` |
-| `TARDIGRADE_MUX_WRITE_BUFFER_MAX` | Max queued mux frame bytes per socket | `262144` |
-| `TARDIGRADE_MUX_MAX_CHANNELS_PER_DEVICE` | Max mux subscriptions per device | `50` |
-| `TARDIGRADE_MUX_RECONNECT_GRACE_MS` | Mux reconnect grace window | `30000` |
-| `TARDIGRADE_SSE_ENABLED` | Enable authenticated SSE routes | `true` |
-| `TARDIGRADE_SSE_MAX_EVENTS_PER_TOPIC` | Retained in-memory SSE events per topic | `1024` |
-| `TARDIGRADE_SSE_POLL_INTERVAL_MS` | SSE poll cadence | `250` |
-| `TARDIGRADE_SSE_MAX_BACKLOG` | Maximum SSE replay backlog gap | `1024` |
-| `TARDIGRADE_SSE_IDLE_TIMEOUT_MS` | SSE idle timeout | `60000` |
 
 #### Routing, Config, Static, and Secrets
 
@@ -316,30 +271,6 @@ Config file notes:
 | `TARDIGRADE_BINARY_UPGRADE` | Enable `SIGUSR2` binary upgrade handoff | `true` |
 | `TARDIGRADE_WORKER_RECYCLE_SECONDS` | Worker recycle interval | `0` |
 | `TARDIGRADE_WORKER_CPU_AFFINITY` | Linux CPU affinity list for workers | empty |
-
-### Built-In API And Realtime Endpoints
-
-- `GET /health`
-- `GET /metrics`
-- `GET /metrics/json`
-- `GET /metrics/prometheus`
-- `POST /v1/chat`
-- `POST /v1/commands`
-- `GET /v1/commands/status?command_id=...`
-- `POST /v1/approvals/request`
-- `POST /v1/approvals/respond`
-- `GET /v1/approvals/status?approval_token=...`
-- `POST /v1/devices/register`
-- `POST /v1/sessions`
-- `GET /v1/sessions`
-- `DELETE /v1/sessions`
-- `POST /v1/sessions/refresh`
-- `POST /v1/cache/purge`
-- `GET /v1/ws/chat`
-- `GET /v1/ws/commands`
-- `GET /v1/ws/mux`
-- `GET /v1/events/stream`
-- `POST /v1/events/publish`
 
 ## Examples
 

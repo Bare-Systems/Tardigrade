@@ -30,7 +30,7 @@ pub const CommandType = enum {
     /// Returns the upstream path suffix for this command type.
     pub fn upstreamPath(self: CommandType) []const u8 {
         return switch (self) {
-            .chat => "/v1/chat",
+            .chat => "/api/messages",
             .tool_list => "/v1/tools",
             .tool_run => "/v1/tools/run",
             .status => "/v1/status",
@@ -201,7 +201,7 @@ test "CommandType fromString unknown" {
 }
 
 test "CommandType upstreamPath" {
-    try std.testing.expectEqualStrings("/v1/chat", CommandType.chat.upstreamPath());
+    try std.testing.expectEqualStrings("/api/messages", CommandType.chat.upstreamPath());
     try std.testing.expectEqualStrings("/v1/tools", CommandType.tool_list.upstreamPath());
     try std.testing.expectEqualStrings("/v1/tools/run", CommandType.tool_run.upstreamPath());
     try std.testing.expectEqualStrings("/v1/status", CommandType.status.upstreamPath());

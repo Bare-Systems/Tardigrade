@@ -194,7 +194,7 @@ fn sendSyslogUdp(endpoint: []const u8, msg: []const u8) void {
 test "AccessLogEntry fields are set correctly" {
     const entry = AccessLogEntry{
         .method = "POST",
-        .path = "/v1/chat",
+        .path = "/api/messages",
         .status = 200,
         .latency_ms = 42,
         .client_ip = "1.2.3.4",
@@ -206,7 +206,7 @@ test "AccessLogEntry fields are set correctly" {
     };
 
     try std.testing.expectEqualStrings("POST", entry.method);
-    try std.testing.expectEqualStrings("/v1/chat", entry.path);
+    try std.testing.expectEqualStrings("/api/messages", entry.path);
     try std.testing.expectEqual(@as(u16, 200), entry.status);
     try std.testing.expectEqual(@as(i64, 42), entry.latency_ms);
 }
@@ -220,7 +220,7 @@ test "AccessLog format parse" {
 test "AccessLogEntry log does not panic" {
     const entry = AccessLogEntry{
         .method = "GET",
-        .path = "/metrics",
+        .path = "/status/metrics",
         .status = 200,
         .latency_ms = 0,
         .client_ip = "127.0.0.1",

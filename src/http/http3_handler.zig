@@ -95,9 +95,9 @@ test "http3 handler configuration status reports expected states" {
 
 test "http3 handler header mapping skips pseudo headers" {
     const allocator = std.testing.allocator;
-    var mapped = try Handler.mapPseudoHeadersToRequest(allocator, "GET", "/health", "example.com", &.{
+    var mapped = try Handler.mapPseudoHeadersToRequest(allocator, "GET", "/status", "example.com", &.{
         .{ .name = ":method", .value = "GET" },
-        .{ .name = ":path", .value = "/health" },
+        .{ .name = ":path", .value = "/status" },
         .{ .name = "accept", .value = "application/json" },
     }, "");
     defer mapped.headers.deinit();

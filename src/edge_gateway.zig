@@ -4189,12 +4189,17 @@ fn handleApprovalsRequestBuiltin(
             .identity = identity,
         };
     }
-    const created = state.approvalCreate(allocator, approval_req.method, approval_req.path, identity, approval_req.command_id) catch {
-        return .{
+    const created = state.approvalCreate(allocator, approval_req.method, approval_req.path, identity, approval_req.command_id) catch |err| switch (err) {
+        error.TooManyPendingApprovals => return .{
+            .status = .too_many_requests,
+            .body = try buildApiErrorJson(allocator, "too_many_requests", "Too many pending approvals for this identity", correlation_id),
+            .identity = identity,
+        },
+        else => return .{
             .status = .internal_server_error,
             .body = try buildApiErrorJson(allocator, "internal_error", "Failed to create approval request", correlation_id),
             .identity = identity,
-        };
+        },
     };
     defer allocator.free(created.token);
     _ = state.event_hub.publish("approvals.requests", body, http.event_loop.monotonicMs()) catch 0;
@@ -8867,16 +8872,21 @@ fn handleHttp3Connection(
             ctx.state.metricsRecord(400);
             return;
         }
-        const created = ctx.state.approvalCreate(allocator, approval_req.method, approval_req.path, auth_result.token_hash orelse "-", approval_req.command_id) catch {
-            const payload = try buildApiErrorJson(allocator, "internal_error", "Failed to create approval request", correlation_id);
+        const created = ctx.state.approvalCreate(allocator, approval_req.method, approval_req.path, auth_result.token_hash orelse "-", approval_req.command_id) catch |err| {
+            const is_rate_limit = (err == error.TooManyPendingApprovals);
+            const payload = if (is_rate_limit)
+                try buildApiErrorJson(allocator, "too_many_requests", "Too many pending approvals for this identity", correlation_id)
+            else
+                try buildApiErrorJson(allocator, "internal_error", "Failed to create approval request", correlation_id);
+            const status_code: http.Status = if (is_rate_limit) .too_many_requests else .internal_server_error;
             _ = response
-                .setStatus(.internal_server_error)
+                .setStatus(status_code)
                 .setBodyOwned(payload)
                 .setContentType("application/json")
                 .setHeader(http.correlation.HEADER_NAME, correlation_id);
             finalizeHttp3Response(response);
             applyResponseHeaders(ctx.state, response);
-            ctx.state.metricsRecord(500);
+            ctx.state.metricsRecord(if (is_rate_limit) 429 else 500);
             return;
         };
         defer allocator.free(created.token);
@@ -11313,6 +11323,10 @@ test "resolveProxyTarget handles absolute and relative proxy_pass" {
         .tcp_proxy_upstream = "",
         .udp_proxy_upstream = "",
         .stream_ssl_termination = false,
+        .approval_store_path = "",
+        .approval_ttl_ms = 300_000,
+        .approval_escalation_webhook = "",
+        .approval_max_pending_per_identity = 10,
     };
 
     const abs = try resolveProxyTarget(allocator, cfg.upstream_base_url, "https://api.example.com/base", "/v1/chat");
@@ -11487,6 +11501,10 @@ test "builtin location blocks cover core routes" {
         .tcp_proxy_upstream = "",
         .udp_proxy_upstream = "",
         .stream_ssl_termination = false,
+        .approval_store_path = "",
+        .approval_ttl_ms = 300_000,
+        .approval_escalation_webhook = "",
+        .approval_max_pending_per_identity = 10,
     });
 
     const health = http.location_router.matchLocation("/health", blocks[0..]).?;
@@ -11684,6 +11702,10 @@ test "authorizeRequest accepts valid hash" {
         .tcp_proxy_upstream = "",
         .udp_proxy_upstream = "",
         .stream_ssl_termination = false,
+        .approval_store_path = "",
+        .approval_ttl_ms = 300_000,
+        .approval_escalation_webhook = "",
+        .approval_max_pending_per_identity = 10,
     };
 
     var headers = http.Headers.init(allocator);

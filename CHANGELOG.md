@@ -1,6 +1,24 @@
 
 # Changelog
 
+## [0.31.0] - 2026-03-xx
+
+### Added
+- Upgrade 12 approval workflow hardening:
+  - Added `src/http/approval_store.zig` with atomic JSON-file persistence (`persist` + `load`)
+    and a best-effort escalation webhook (`fireWebhook` via `std.http.Client`).
+  - Added four new env-driven config fields: `TARDIGRADE_APPROVAL_STORE_PATH`,
+    `TARDIGRADE_APPROVAL_TTL_MS`, `TARDIGRADE_APPROVAL_ESCALATION_WEBHOOK`, and
+    `TARDIGRADE_APPROVAL_MAX_PENDING_PER_IDENTITY`.
+  - Pending approvals are now persisted on create/decide and reloaded on startup; decided
+    entries older than one hour are pruned on load.
+  - Added per-identity pending-approval rate limiting: exceeding the configured cap returns
+    429 Too Many Requests on both HTTP/1.1 and HTTP/3 paths.
+  - Expired approvals auto-escalate to `"escalated"` status; escalation webhook fires
+    outside the approval mutex for best-effort delivery.
+  - Added integration tests covering the full approval round-trip, double-respond conflict
+    (409), per-identity rate limiting (429), and store persistence across server restart.
+
 ## [0.30.0] - 2026-03-xx
 
 ### Added

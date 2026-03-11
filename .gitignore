@@ -2,6 +2,7 @@ zig-out/
 .zig-cache/
 changes/
 CLAUDE.md
+.claude/worktrees/
 
 # Secrets and environment files — never commit these
 .env

@@ -5992,7 +5992,6 @@ fn handleWebSocketMultiplexLoop(
             }
             continue;
         }
-
         try http.websocket.writeFrame(writer, .text, "{\"type\":\"error\",\"message\":\"unknown type\"}", true);
     }
 }

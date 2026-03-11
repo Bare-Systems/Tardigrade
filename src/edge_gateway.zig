@@ -173,6 +173,65 @@ const MuxChannel = struct {
     last_command_status: ?CommandLifecycleStatus = null,
 };
 
+const MuxPendingFrame = struct {
+    payload: []u8,
+};
+
+const MuxResumeState = struct {
+    channels: []MuxChannel,
+    expires_ms: i64,
+};
+
+const MuxDeviceCount = struct {
+    device_id: []u8,
+    count: usize,
+};
+
+const MuxMetricsSnapshot = struct {
+    device_counts: []MuxDeviceCount,
+};
+
+fn deinitMuxMetricsSnapshot(allocator: std.mem.Allocator, device_counts: []MuxDeviceCount) void {
+    for (device_counts) |entry| allocator.free(entry.device_id);
+    allocator.free(device_counts);
+}
+
+fn deinitMuxPendingFrames(allocator: std.mem.Allocator, pending: *std.ArrayList(MuxPendingFrame)) void {
+    for (pending.items) |frame| allocator.free(frame.payload);
+    pending.deinit();
+}
+
+fn cloneMuxChannel(allocator: std.mem.Allocator, ch: *const MuxChannel) !MuxChannel {
+    return .{
+        .name = try allocator.dupe(u8, ch.name),
+        .kind = ch.kind,
+        .topic = if (ch.topic) |topic| try allocator.dupe(u8, topic) else null,
+        .last_event_id = ch.last_event_id,
+        .command_id = if (ch.command_id) |command_id| try allocator.dupe(u8, command_id) else null,
+        .last_command_status = ch.last_command_status,
+    };
+}
+
+fn cloneMuxChannels(allocator: std.mem.Allocator, channels: []const MuxChannel) ![]MuxChannel {
+    var out = try allocator.alloc(MuxChannel, channels.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |*ch| deinitMuxChannel(allocator, ch);
+        allocator.free(out);
+    }
+    for (channels, 0..) |ch, idx| {
+        out[idx] = try cloneMuxChannel(allocator, &ch);
+        initialized += 1;
+    }
+    return out;
+}
+
+fn deinitMuxResumeState(allocator: std.mem.Allocator, saved_state: *MuxResumeState) void {
+    for (saved_state.channels) |*ch| deinitMuxChannel(allocator, ch);
+    allocator.free(saved_state.channels);
+    saved_state.* = undefined;
+}
+
 /// Persistent gateway state shared across connections.
 const GatewayState = struct {
     allocator: std.mem.Allocator,
@@ -211,6 +270,8 @@ const GatewayState = struct {
     active_connections_total: usize,
     active_ws_streams: usize,
     active_sse_streams: usize,
+    active_mux_connections: usize,
+    active_mux_subscriptions: usize,
     connection_memory_estimate_bytes: usize,
     max_total_connection_memory_bytes: usize,
     upstream_rr_index: usize,
@@ -228,6 +289,8 @@ const GatewayState = struct {
     fd_to_ip: std.AutoHashMap(std.posix.fd_t, []u8),
     command_lifecycle: std.StringHashMap(CommandLifecycleEntry),
     approvals: std.StringHashMap(ApprovalEntry),
+    mux_subscriptions_by_device: std.StringHashMap(usize),
+    mux_resume_state: std.StringHashMap(MuxResumeState),
     /// Path to persistent approval store file (empty = in-memory only).
     approval_store_path: []const u8,
     /// Webhook URL for escalation notifications (empty = disabled).
@@ -295,6 +358,15 @@ const GatewayState = struct {
             entry.value_ptr.deinit(self.allocator);
         }
         self.approvals.deinit();
+        var mux_sub_it = self.mux_subscriptions_by_device.iterator();
+        while (mux_sub_it.next()) |entry| self.allocator.free(entry.key_ptr.*);
+        self.mux_subscriptions_by_device.deinit();
+        var mux_resume_it = self.mux_resume_state.iterator();
+        while (mux_resume_it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            deinitMuxResumeState(self.allocator, entry.value_ptr);
+        }
+        self.mux_resume_state.deinit();
     }
 
     fn acquireFastcgiStream(self: *GatewayState, endpoint: []const u8) !struct { stream: std.net.Stream, reused: bool } {
@@ -1036,6 +1108,12 @@ const GatewayState = struct {
         self.metrics.recordQueueRejection();
     }
 
+    fn metricsRecordMuxFrameError(self: *GatewayState) void {
+        self.metrics_mutex.lock();
+        defer self.metrics_mutex.unlock();
+        self.metrics.recordMuxFrameError();
+    }
+
     fn metricsRecordErrorCode(self: *GatewayState, code: []const u8) void {
         self.metrics_mutex.lock();
         defer self.metrics_mutex.unlock();
@@ -1043,15 +1121,76 @@ const GatewayState = struct {
     }
 
     fn metricsToJson(self: *GatewayState, allocator: std.mem.Allocator) ![]u8 {
+        const mux_snapshot = try self.muxMetricsSnapshot(allocator);
+        defer deinitMuxMetricsSnapshot(allocator, mux_snapshot.device_counts);
+
         self.metrics_mutex.lock();
-        defer self.metrics_mutex.unlock();
-        return self.metrics.toJson(allocator);
+        const metrics_snapshot = self.metrics;
+        self.metrics_mutex.unlock();
+
+        var device_json = std.ArrayList(u8).init(allocator);
+        errdefer device_json.deinit();
+        try device_json.append('{');
+        for (mux_snapshot.device_counts, 0..) |entry, idx| {
+            if (idx > 0) try device_json.append(',');
+            try device_json.writer().print("{s}:{d}", .{ std.json.fmt(entry.device_id, .{}), entry.count });
+        }
+        try device_json.append('}');
+        const device_json_owned = try device_json.toOwnedSlice();
+        defer allocator.free(device_json_owned);
+
+        return std.fmt.allocPrint(allocator,
+            \\{{"total_requests":{d},"status_2xx":{d},"status_3xx":{d},"status_4xx":{d},"status_5xx":{d},"uptime_seconds":{d},"active_connections":{d},"mux_connections":{d},"mux_subscriptions":{d},"mux_subscriptions_by_device":{s},"connection_rejections":{d},"queue_rejections":{d},"upstream_unhealthy_backends":{d},"error_invalid_request":{d},"error_unauthorized":{d},"error_rate_limited":{d},"error_upstream_timeout":{d},"error_upstream_unavailable":{d},"error_internal_error":{d},"error_overload":{d},"mux_frame_errors":{d}}}
+        , .{
+            metrics_snapshot.total_requests,
+            metrics_snapshot.status_2xx,
+            metrics_snapshot.status_3xx,
+            metrics_snapshot.status_4xx,
+            metrics_snapshot.status_5xx,
+            metrics_snapshot.uptimeSeconds(),
+            metrics_snapshot.active_connections,
+            metrics_snapshot.mux_connections,
+            metrics_snapshot.mux_subscriptions,
+            device_json_owned,
+            metrics_snapshot.connection_rejections,
+            metrics_snapshot.queue_rejections,
+            metrics_snapshot.upstream_unhealthy_backends,
+            metrics_snapshot.err_invalid_request,
+            metrics_snapshot.err_unauthorized,
+            metrics_snapshot.err_rate_limited,
+            metrics_snapshot.err_upstream_timeout,
+            metrics_snapshot.err_upstream_unavailable,
+            metrics_snapshot.err_internal_error,
+            metrics_snapshot.err_overload,
+            metrics_snapshot.mux_frame_errors,
+        });
     }
 
     fn metricsToPrometheus(self: *GatewayState, allocator: std.mem.Allocator) ![]u8 {
+        const mux_snapshot = try self.muxMetricsSnapshot(allocator);
+        defer deinitMuxMetricsSnapshot(allocator, mux_snapshot.device_counts);
+
         self.metrics_mutex.lock();
-        defer self.metrics_mutex.unlock();
-        return self.metrics.toPrometheus(allocator);
+        const metrics_snapshot = self.metrics;
+        self.metrics_mutex.unlock();
+
+        const base = try metrics_snapshot.toPrometheus(allocator);
+        defer allocator.free(base);
+
+        var combined = std.ArrayList(u8).init(allocator);
+        errdefer combined.deinit();
+        try combined.appendSlice(base);
+        if (mux_snapshot.device_counts.len > 0) {
+            try combined.appendSlice(
+                \\# HELP tardigrade_mux_device_channels Current active mux channels by device
+                \\# TYPE tardigrade_mux_device_channels gauge
+                \\
+            );
+            for (mux_snapshot.device_counts) |entry| {
+                try combined.writer().print("tardigrade_mux_device_channels{{device_id=\"{s}\"}} {d}\n", .{ entry.device_id, entry.count });
+            }
+        }
+        return combined.toOwnedSlice();
     }
 
     fn nextUpstreamBaseUrl(self: *GatewayState, cfg: *const edge_config.EdgeConfig, pool: UpstreamPoolView, client_ip: []const u8, hash_key: []const u8) []const u8 {
@@ -1473,6 +1612,123 @@ const GatewayState = struct {
         return .{ .ws = self.active_ws_streams, .sse = self.active_sse_streams };
     }
 
+    fn muxConnectionAdjust(self: *GatewayState, delta: i32) void {
+        self.connection_mutex.lock();
+        if (delta < 0) {
+            const dec: usize = @intCast(-delta);
+            self.active_mux_connections = if (self.active_mux_connections > dec) self.active_mux_connections - dec else 0;
+        } else if (delta > 0) {
+            self.active_mux_connections += @intCast(delta);
+        }
+        const active = self.active_mux_connections;
+        self.connection_mutex.unlock();
+
+        self.metrics_mutex.lock();
+        defer self.metrics_mutex.unlock();
+        self.metrics.setMuxConnections(active);
+    }
+
+    fn muxSubscriptionCount(self: *GatewayState, device_id: []const u8) usize {
+        self.connection_mutex.lock();
+        defer self.connection_mutex.unlock();
+        return self.mux_subscriptions_by_device.get(device_id) orelse 0;
+    }
+
+    fn muxSubscriptionAdjust(self: *GatewayState, device_id: []const u8, delta: i32) void {
+        self.connection_mutex.lock();
+        if (delta < 0) {
+            const dec: usize = @intCast(-delta);
+            self.active_mux_subscriptions = if (self.active_mux_subscriptions > dec) self.active_mux_subscriptions - dec else 0;
+            if (self.mux_subscriptions_by_device.getPtr(device_id)) |count_ptr| {
+                count_ptr.* = if (count_ptr.* > dec) count_ptr.* - dec else 0;
+                if (count_ptr.* == 0) {
+                    if (self.mux_subscriptions_by_device.fetchRemove(device_id)) |removed| {
+                        self.allocator.free(removed.key);
+                    }
+                }
+            }
+        } else if (delta > 0) {
+            const inc: usize = @intCast(delta);
+            self.active_mux_subscriptions += inc;
+            if (self.mux_subscriptions_by_device.getPtr(device_id)) |count_ptr| {
+                count_ptr.* += inc;
+            } else {
+                const owned = self.allocator.dupe(u8, device_id) catch {
+                    self.connection_mutex.unlock();
+                    return;
+                };
+                self.mux_subscriptions_by_device.put(owned, inc) catch {
+                    self.allocator.free(owned);
+                    self.connection_mutex.unlock();
+                    return;
+                };
+            }
+        }
+        const active = self.active_mux_subscriptions;
+        self.connection_mutex.unlock();
+
+        self.metrics_mutex.lock();
+        defer self.metrics_mutex.unlock();
+        self.metrics.setMuxSubscriptions(active);
+    }
+
+    fn muxMetricsSnapshot(self: *GatewayState, allocator: std.mem.Allocator) !MuxMetricsSnapshot {
+        self.connection_mutex.lock();
+        defer self.connection_mutex.unlock();
+
+        var device_counts = std.ArrayList(MuxDeviceCount).init(allocator);
+        errdefer {
+            for (device_counts.items) |entry| allocator.free(entry.device_id);
+            device_counts.deinit();
+        }
+        var it = self.mux_subscriptions_by_device.iterator();
+        while (it.next()) |entry| {
+            try device_counts.append(.{
+                .device_id = try allocator.dupe(u8, entry.key_ptr.*),
+                .count = entry.value_ptr.*,
+            });
+        }
+        return .{ .device_counts = try device_counts.toOwnedSlice() };
+    }
+
+    fn saveMuxResumeState(self: *GatewayState, device_id: []const u8, channels: []const MuxChannel, grace_ms: u32) void {
+        self.runtime_mutex.lock();
+        defer self.runtime_mutex.unlock();
+
+        if (self.mux_resume_state.fetchRemove(device_id)) |removed| {
+            self.allocator.free(removed.key);
+            var value = removed.value;
+            deinitMuxResumeState(self.allocator, &value);
+        }
+        if (grace_ms == 0 or channels.len == 0) return;
+
+        const owned_key = self.allocator.dupe(u8, device_id) catch return;
+        const owned_channels = cloneMuxChannels(self.allocator, channels) catch {
+            self.allocator.free(owned_key);
+            return;
+        };
+        self.mux_resume_state.put(owned_key, .{
+            .channels = owned_channels,
+            .expires_ms = std.time.milliTimestamp() + @as(i64, grace_ms),
+        }) catch {
+            var saved_state = MuxResumeState{ .channels = owned_channels, .expires_ms = 0 };
+            deinitMuxResumeState(self.allocator, &saved_state);
+            self.allocator.free(owned_key);
+        };
+    }
+
+    fn takeMuxResumeState(self: *GatewayState, allocator: std.mem.Allocator, device_id: []const u8) ?[]MuxChannel {
+        self.runtime_mutex.lock();
+        defer self.runtime_mutex.unlock();
+
+        const removed = self.mux_resume_state.fetchRemove(device_id) orelse return null;
+        defer self.allocator.free(removed.key);
+        var saved = removed.value;
+        defer deinitMuxResumeState(self.allocator, &saved);
+        if (saved.expires_ms < std.time.milliTimestamp()) return null;
+        return cloneMuxChannels(allocator, saved.channels) catch null;
+    }
+
     fn connectionCounts(self: *GatewayState) struct { active: usize, per_ip: usize } {
         self.connection_mutex.lock();
         defer self.connection_mutex.unlock();
@@ -1744,6 +2000,8 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         .active_connections_total = 0,
         .active_ws_streams = 0,
         .active_sse_streams = 0,
+        .active_mux_connections = 0,
+        .active_mux_subscriptions = 0,
         .connection_memory_estimate_bytes = if (cfg.max_connection_memory_bytes > 0) cfg.max_connection_memory_bytes else MAX_REQUEST_SIZE,
         .max_total_connection_memory_bytes = cfg.max_total_connection_memory_bytes,
         .upstream_rr_index = 0,
@@ -1761,6 +2019,8 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         .fd_to_ip = std.AutoHashMap(std.posix.fd_t, []u8).init(state_allocator),
         .command_lifecycle = std.StringHashMap(CommandLifecycleEntry).init(state_allocator),
         .approvals = std.StringHashMap(ApprovalEntry).init(state_allocator),
+        .mux_subscriptions_by_device = std.StringHashMap(usize).init(state_allocator),
+        .mux_resume_state = std.StringHashMap(MuxResumeState).init(state_allocator),
         .approval_store_path = cfg.approval_store_path,
         .approval_escalation_webhook = cfg.approval_escalation_webhook,
         .approval_ttl_ms = if (cfg.approval_ttl_ms > 0) cfg.approval_ttl_ms else APPROVAL_TIMEOUT_MS_DEFAULT,
@@ -5482,6 +5742,8 @@ fn handleWebSocketUpgrade(
 
         state.streamCountAdjust(1, 1);
         defer state.streamCountAdjust(-1, -1);
+        state.muxConnectionAdjust(1);
+        defer state.muxConnectionAdjust(-1);
         handleWebSocketMultiplexLoop(
             conn,
             allocator,
@@ -6000,9 +6262,19 @@ fn handleWebSocketMultiplexLoop(
 ) !void {
     const writer = conn.writer();
     var channels = std.ArrayList(MuxChannel).init(allocator);
+    var pending_frames = std.ArrayList(MuxPendingFrame).init(allocator);
+    var pending_bytes: usize = 0;
+    if (state.takeMuxResumeState(allocator, device_id)) |restored| {
+        defer allocator.free(restored);
+        try channels.appendSlice(restored);
+        if (restored.len > 0) state.muxSubscriptionAdjust(device_id, @intCast(restored.len));
+    }
     defer {
+        state.saveMuxResumeState(device_id, channels.items, cfg.mux_reconnect_grace_ms);
+        if (channels.items.len > 0) state.muxSubscriptionAdjust(device_id, -@as(i32, @intCast(channels.items.len)));
         for (channels.items) |*ch| deinitMuxChannel(allocator, ch);
         channels.deinit();
+        deinitMuxPendingFrames(allocator, &pending_frames);
     }
 
     var last_activity_ms = http.event_loop.monotonicMs();
@@ -6020,26 +6292,38 @@ fn handleWebSocketMultiplexLoop(
                 return;
             },
             .ping => {
+                try pollMuxChannels(allocator, state, &channels, &pending_frames, &pending_bytes, cfg.mux_write_buffer_max);
+                try flushMuxPendingFrames(writer, allocator, &pending_frames, &pending_bytes);
                 try http.websocket.writeFrame(writer, .pong, frame.payload, true);
                 continue;
             },
-            .pong, .binary, .continuation => continue,
+            .pong, .binary, .continuation => {
+                try pollMuxChannels(allocator, state, &channels, &pending_frames, &pending_bytes, cfg.mux_write_buffer_max);
+                try flushMuxPendingFrames(writer, allocator, &pending_frames, &pending_bytes);
+                continue;
+            },
             .text => {},
         }
 
         const payload = std.mem.trim(u8, frame.payload, " \t\r\n");
-        if (payload.len == 0) continue;
+        if (payload.len == 0) {
+            state.metricsRecordMuxFrameError();
+            continue;
+        }
         var parsed = std.json.parseFromSlice(std.json.Value, allocator, payload, .{ .ignore_unknown_fields = true }) catch {
+            state.metricsRecordMuxFrameError();
             try http.websocket.writeFrame(writer, .text, "{\"type\":\"error\",\"message\":\"invalid json\"}", true);
             continue;
         };
         defer parsed.deinit();
         if (parsed.value != .object) {
+            state.metricsRecordMuxFrameError();
             try http.websocket.writeFrame(writer, .text, "{\"type\":\"error\",\"message\":\"invalid envelope\"}", true);
             continue;
         }
         const obj = parsed.value.object;
         const msg_type = parseMuxObjectFieldString(obj, "type") orelse {
+            state.metricsRecordMuxFrameError();
             try http.websocket.writeFrame(writer, .text, "{\"type\":\"error\",\"message\":\"missing type\"}", true);
             continue;
         };
@@ -6047,30 +6331,44 @@ fn handleWebSocketMultiplexLoop(
 
         if (std.ascii.eqlIgnoreCase(msg_type, "subscribe")) {
             const topic = parseMuxObjectFieldString(obj, "topic") orelse {
+                state.metricsRecordMuxFrameError();
                 try http.websocket.writeFrame(writer, .text, "{\"type\":\"error\",\"message\":\"missing topic\"}", true);
                 continue;
             };
-            if (!isValidDeviceTopicSegment(topic) or channels.items.len >= WS_MUX_MAX_CHANNELS) {
+            if (!isValidDeviceTopicSegment(topic)) {
+                state.metricsRecordMuxFrameError();
                 try http.websocket.writeFrame(writer, .text, "{\"type\":\"error\",\"message\":\"invalid or too many channels\"}", true);
                 continue;
             }
+            const is_new_channel = !muxChannelExists(channels.items, channel_name);
+            if (is_new_channel and (channels.items.len >= WS_MUX_MAX_CHANNELS or state.muxSubscriptionCount(device_id) >= cfg.mux_max_channels_per_device)) {
+                state.metricsRecordMuxFrameError();
+                try http.websocket.writeFrame(writer, .text, "{\"type\":\"error\",\"message\":\"invalid or too many channels\"}", true);
+                continue;
+            }
+            const last_event_id = parseMuxObjectFieldU64(obj, "last_event_id") orelse 0;
             const namespaced_topic = try std.fmt.allocPrint(allocator, "device/{s}/{s}", .{ device_id, topic });
             defer allocator.free(namespaced_topic);
-            upsertMuxEventChannel(allocator, &channels, channel_name, namespaced_topic);
+            if (upsertMuxEventChannel(allocator, &channels, channel_name, namespaced_topic, last_event_id)) state.muxSubscriptionAdjust(device_id, 1);
             const ack = try std.fmt.allocPrint(allocator, "{{\"channel\":\"{s}\",\"type\":\"subscribed\",\"topic\":\"{s}\"}}", .{ channel_name, topic });
             defer allocator.free(ack);
             try http.websocket.writeFrame(writer, .text, ack, true);
+            try pollMuxChannels(allocator, state, &channels, &pending_frames, &pending_bytes, cfg.mux_write_buffer_max);
+            try flushMuxPendingFrames(writer, allocator, &pending_frames, &pending_bytes);
             continue;
         }
         if (std.ascii.eqlIgnoreCase(msg_type, "unsubscribe")) {
-            removeMuxChannel(allocator, &channels, channel_name);
+            if (removeMuxChannel(allocator, &channels, channel_name)) state.muxSubscriptionAdjust(device_id, -1);
             const ack = try std.fmt.allocPrint(allocator, "{{\"channel\":\"{s}\",\"type\":\"unsubscribed\"}}", .{channel_name});
             defer allocator.free(ack);
             try http.websocket.writeFrame(writer, .text, ack, true);
+            try pollMuxChannels(allocator, state, &channels, &pending_frames, &pending_bytes, cfg.mux_write_buffer_max);
+            try flushMuxPendingFrames(writer, allocator, &pending_frames, &pending_bytes);
             continue;
         }
         if (std.ascii.eqlIgnoreCase(msg_type, "publish")) {
             const topic = parseMuxObjectFieldString(obj, "topic") orelse {
+                state.metricsRecordMuxFrameError();
                 try http.websocket.writeFrame(writer, .text, "{\"type\":\"error\",\"message\":\"missing topic\"}", true);
                 continue;
             };
@@ -6081,6 +6379,7 @@ fn handleWebSocketMultiplexLoop(
                     .string => payload_value.string,
                     else => blk: {
                         const encoded = std.json.stringifyAlloc(allocator, payload_value, .{}) catch {
+                            state.metricsRecordMuxFrameError();
                             try http.websocket.writeFrame(writer, .text, "{\"type\":\"error\",\"message\":\"invalid payload\"}", true);
                             continue;
                         };
@@ -6091,6 +6390,7 @@ fn handleWebSocketMultiplexLoop(
             else
                 "";
             if (!isValidDeviceTopicSegment(topic)) {
+                state.metricsRecordMuxFrameError();
                 try http.websocket.writeFrame(writer, .text, "{\"type\":\"error\",\"message\":\"invalid topic\"}", true);
                 continue;
             }
@@ -6100,10 +6400,13 @@ fn handleWebSocketMultiplexLoop(
             const ack = try std.fmt.allocPrint(allocator, "{{\"channel\":\"{s}\",\"type\":\"published\",\"topic\":\"{s}\",\"id\":{d}}}", .{ channel_name, topic, event_id });
             defer allocator.free(ack);
             try http.websocket.writeFrame(writer, .text, ack, true);
+            try pollMuxChannels(allocator, state, &channels, &pending_frames, &pending_bytes, cfg.mux_write_buffer_max);
+            try flushMuxPendingFrames(writer, allocator, &pending_frames, &pending_bytes);
             continue;
         }
         if (std.ascii.eqlIgnoreCase(msg_type, "command")) {
             var cmd = http.command.parseCommand(allocator, payload) catch {
+                state.metricsRecordMuxFrameError();
                 try http.websocket.writeFrame(writer, .text, "{\"type\":\"error\",\"message\":\"invalid command envelope\"}", true);
                 continue;
             };
@@ -6123,6 +6426,12 @@ fn handleWebSocketMultiplexLoop(
             defer allocator.free(envelope);
 
             if (cmd.async_execute) {
+                const is_new_channel = !muxChannelExists(channels.items, channel_name);
+                if (is_new_channel and (channels.items.len >= WS_MUX_MAX_CHANNELS or state.muxSubscriptionCount(device_id) >= cfg.mux_max_channels_per_device)) {
+                    state.metricsRecordMuxFrameError();
+                    try http.websocket.writeFrame(writer, .text, "{\"type\":\"error\",\"message\":\"invalid or too many channels\"}", true);
+                    continue;
+                }
                 state.commandLifecycleCreate(command_id, cmd.command_type.toString(), correlation_id, identity orelse "-") catch {};
                 spawnAsyncCommandExecution(
                     cfg,
@@ -6138,10 +6447,12 @@ fn handleWebSocketMultiplexLoop(
                     incoming_host,
                     incoming_x_forwarded_for,
                 );
-                upsertMuxCommandChannel(allocator, &channels, channel_name, command_id, .pending);
+                if (upsertMuxCommandChannel(allocator, &channels, channel_name, command_id, .pending)) state.muxSubscriptionAdjust(device_id, 1);
                 const ack = try std.fmt.allocPrint(allocator, "{{\"channel\":\"{s}\",\"type\":\"command.accepted\",\"command_id\":\"{s}\"}}", .{ channel_name, command_id });
                 defer allocator.free(ack);
                 try http.websocket.writeFrame(writer, .text, ack, true);
+                try pollMuxChannels(allocator, state, &channels, &pending_frames, &pending_bytes, cfg.mux_write_buffer_max);
+                try flushMuxPendingFrames(writer, allocator, &pending_frames, &pending_bytes);
                 continue;
             }
 
@@ -6186,9 +6497,14 @@ fn handleWebSocketMultiplexLoop(
                     try http.websocket.writeFrame(writer, .text, msg, true);
                 },
             }
+            try pollMuxChannels(allocator, state, &channels, &pending_frames, &pending_bytes, cfg.mux_write_buffer_max);
+            try flushMuxPendingFrames(writer, allocator, &pending_frames, &pending_bytes);
             continue;
         }
+        state.metricsRecordMuxFrameError();
         try http.websocket.writeFrame(writer, .text, "{\"type\":\"error\",\"message\":\"unknown type\"}", true);
+        try pollMuxChannels(allocator, state, &channels, &pending_frames, &pending_bytes, cfg.mux_write_buffer_max);
+        try flushMuxPendingFrames(writer, allocator, &pending_frames, &pending_bytes);
     }
 }
 
@@ -6199,7 +6515,14 @@ fn deinitMuxChannel(allocator: std.mem.Allocator, ch: *MuxChannel) void {
     ch.* = undefined;
 }
 
-fn upsertMuxEventChannel(allocator: std.mem.Allocator, channels: *std.ArrayList(MuxChannel), channel_name: []const u8, topic: []const u8) void {
+fn muxChannelExists(channels: []const MuxChannel, channel_name: []const u8) bool {
+    for (channels) |ch| {
+        if (std.mem.eql(u8, ch.name, channel_name)) return true;
+    }
+    return false;
+}
+
+fn upsertMuxEventChannel(allocator: std.mem.Allocator, channels: *std.ArrayList(MuxChannel), channel_name: []const u8, topic: []const u8, last_event_id: u64) bool {
     for (channels.items) |*ch| {
         if (std.mem.eql(u8, ch.name, channel_name)) {
             if (ch.topic) |old| allocator.free(old);
@@ -6209,22 +6532,26 @@ fn upsertMuxEventChannel(allocator: std.mem.Allocator, channels: *std.ArrayList(
             }
             ch.kind = .events;
             ch.topic = allocator.dupe(u8, topic) catch null;
-            ch.last_event_id = 0;
+            ch.last_event_id = last_event_id;
             ch.last_command_status = null;
-            return;
+            return false;
         }
     }
+    const owned_name = allocator.dupe(u8, channel_name) catch return false;
+    errdefer allocator.free(owned_name);
+    const owned_topic = allocator.dupe(u8, topic) catch null;
     channels.append(.{
-        .name = allocator.dupe(u8, channel_name) catch return,
+        .name = owned_name,
         .kind = .events,
-        .topic = allocator.dupe(u8, topic) catch null,
-        .last_event_id = 0,
+        .topic = owned_topic,
+        .last_event_id = last_event_id,
         .command_id = null,
         .last_command_status = null,
-    }) catch {};
+    }) catch return false;
+    return true;
 }
 
-fn upsertMuxCommandChannel(allocator: std.mem.Allocator, channels: *std.ArrayList(MuxChannel), channel_name: []const u8, command_id: []const u8, status: CommandLifecycleStatus) void {
+fn upsertMuxCommandChannel(allocator: std.mem.Allocator, channels: *std.ArrayList(MuxChannel), channel_name: []const u8, command_id: []const u8, status: CommandLifecycleStatus) bool {
     for (channels.items) |*ch| {
         if (std.mem.eql(u8, ch.name, channel_name)) {
             if (ch.command_id) |old| allocator.free(old);
@@ -6235,30 +6562,90 @@ fn upsertMuxCommandChannel(allocator: std.mem.Allocator, channels: *std.ArrayLis
             ch.kind = .command;
             ch.command_id = allocator.dupe(u8, command_id) catch null;
             ch.last_command_status = status;
-            return;
+            return false;
         }
     }
+    const owned_name = allocator.dupe(u8, channel_name) catch return false;
+    errdefer allocator.free(owned_name);
+    const owned_command_id = allocator.dupe(u8, command_id) catch null;
     channels.append(.{
-        .name = allocator.dupe(u8, channel_name) catch return,
+        .name = owned_name,
         .kind = .command,
         .topic = null,
         .last_event_id = 0,
-        .command_id = allocator.dupe(u8, command_id) catch null,
+        .command_id = owned_command_id,
         .last_command_status = status,
-    }) catch {};
+    }) catch return false;
+    return true;
 }
 
-fn removeMuxChannel(allocator: std.mem.Allocator, channels: *std.ArrayList(MuxChannel), channel_name: []const u8) void {
+fn removeMuxChannel(allocator: std.mem.Allocator, channels: *std.ArrayList(MuxChannel), channel_name: []const u8) bool {
     var i: usize = 0;
     while (i < channels.items.len) : (i += 1) {
         if (!std.mem.eql(u8, channels.items[i].name, channel_name)) continue;
         var ch = channels.swapRemove(i);
         deinitMuxChannel(allocator, &ch);
-        return;
+        return true;
+    }
+    return false;
+}
+
+fn queueMuxPendingFrame(
+    allocator: std.mem.Allocator,
+    pending: *std.ArrayList(MuxPendingFrame),
+    pending_bytes: *usize,
+    max_bytes: usize,
+    payload: []const u8,
+) !void {
+    const owned = try allocator.dupe(u8, payload);
+    errdefer allocator.free(owned);
+    try pending.append(.{ .payload = owned });
+    pending_bytes.* += owned.len;
+
+    if (max_bytes == 0) return;
+
+    var dropped: usize = 0;
+    while (pending_bytes.* > max_bytes and pending.items.len > 0) {
+        const dropped_frame = pending.orderedRemove(0);
+        pending_bytes.* -= dropped_frame.payload.len;
+        allocator.free(dropped_frame.payload);
+        dropped += 1;
+    }
+
+    if (dropped == 0) return;
+
+    const overflow_msg = try std.fmt.allocPrint(allocator, "{{\"type\":\"overflow\",\"dropped\":{d}}}", .{dropped});
+    defer allocator.free(overflow_msg);
+
+    while (pending_bytes.* + overflow_msg.len > max_bytes and pending.items.len > 0) {
+        const dropped_frame = pending.orderedRemove(0);
+        pending_bytes.* -= dropped_frame.payload.len;
+        allocator.free(dropped_frame.payload);
+    }
+
+    const overflow_owned = try allocator.dupe(u8, overflow_msg);
+    errdefer allocator.free(overflow_owned);
+    try pending.append(.{ .payload = overflow_owned });
+    pending_bytes.* += overflow_owned.len;
+}
+
+fn flushMuxPendingFrames(writer: anytype, allocator: std.mem.Allocator, pending: *std.ArrayList(MuxPendingFrame), pending_bytes: *usize) !void {
+    while (pending.items.len > 0) {
+        const frame = pending.orderedRemove(0);
+        defer allocator.free(frame.payload);
+        pending_bytes.* -= frame.payload.len;
+        try http.websocket.writeFrame(writer, .text, frame.payload, true);
     }
 }
 
-fn pollMuxChannels(writer: anytype, allocator: std.mem.Allocator, state: *GatewayState, channels: *std.ArrayList(MuxChannel)) !void {
+fn pollMuxChannels(
+    allocator: std.mem.Allocator,
+    state: *GatewayState,
+    channels: *std.ArrayList(MuxChannel),
+    pending: *std.ArrayList(MuxPendingFrame),
+    pending_bytes: *usize,
+    max_pending_bytes: usize,
+) !void {
     for (channels.items) |*ch| {
         switch (ch.kind) {
             .events => {
@@ -6273,7 +6660,7 @@ fn pollMuxChannels(writer: anytype, allocator: std.mem.Allocator, state: *Gatewa
                         std.json.fmt(event.payload, .{}),
                     });
                     defer allocator.free(msg);
-                    try http.websocket.writeFrame(writer, .text, msg, true);
+                    try queueMuxPendingFrame(allocator, pending, pending_bytes, max_pending_bytes, msg);
                     ch.last_event_id = event.id;
                 }
             },
@@ -6296,7 +6683,7 @@ fn pollMuxChannels(writer: anytype, allocator: std.mem.Allocator, state: *Gatewa
                     std.json.fmt(snap.error_message, .{}),
                 });
                 defer allocator.free(msg);
-                try http.websocket.writeFrame(writer, .text, msg, true);
+                try queueMuxPendingFrame(allocator, pending, pending_bytes, max_pending_bytes, msg);
             },
         }
     }
@@ -6308,6 +6695,14 @@ fn parseMuxObjectFieldString(obj: std.json.ObjectMap, field_name: []const u8) ?[
     const trimmed = std.mem.trim(u8, v.string, " \t\r\n");
     if (trimmed.len == 0) return null;
     return trimmed;
+}
+
+fn parseMuxObjectFieldU64(obj: std.json.ObjectMap, field_name: []const u8) ?u64 {
+    const value = obj.get(field_name) orelse return null;
+    return switch (value) {
+        .integer => |n| if (n < 0) null else @as(u64, @intCast(n)),
+        else => null,
+    };
 }
 
 fn isValidDeviceTopicSegment(raw: []const u8) bool {
@@ -11326,6 +11721,9 @@ test "resolveProxyTarget handles absolute and relative proxy_pass" {
         .approval_ttl_ms = 300_000,
         .approval_escalation_webhook = "",
         .approval_max_pending_per_identity = 10,
+        .mux_write_buffer_max = 256 * 1024,
+        .mux_max_channels_per_device = 50,
+        .mux_reconnect_grace_ms = 30_000,
     };
 
     const abs = try resolveProxyTarget(allocator, cfg.upstream_base_url, "https://api.example.com/base", "/v1/chat");
@@ -11504,6 +11902,9 @@ test "builtin location blocks cover core routes" {
         .approval_ttl_ms = 300_000,
         .approval_escalation_webhook = "",
         .approval_max_pending_per_identity = 10,
+        .mux_write_buffer_max = 256 * 1024,
+        .mux_max_channels_per_device = 50,
+        .mux_reconnect_grace_ms = 30_000,
     });
 
     const health = http.location_router.matchLocation("/health", blocks[0..]).?;
@@ -11705,6 +12106,9 @@ test "authorizeRequest accepts valid hash" {
         .approval_ttl_ms = 300_000,
         .approval_escalation_webhook = "",
         .approval_max_pending_per_identity = 10,
+        .mux_write_buffer_max = 256 * 1024,
+        .mux_max_channels_per_device = 50,
+        .mux_reconnect_grace_ms = 30_000,
     };
 
     var headers = http.Headers.init(allocator);

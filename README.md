@@ -1,15 +1,49 @@
-# Tardigrade
+<p align="center">
+  <a href="./README.md"><strong>README</strong></a>
+  &nbsp;&nbsp;|&nbsp;&nbsp;
+  <a href="./CONTRIBUTING.md"><strong>Contributing</strong></a>
+  &nbsp;&nbsp;|&nbsp;&nbsp;
+  <a href="./LICENSE"><strong>Apache-2.0 License</strong></a>
+</p>
 
-A high-performance HTTP server written in Zig.
+<h1 align="center">Tardigrade</h1>
+
+<p align="center">
+  High-performance Zig edge gateway and HTTP server for static delivery, reverse proxying,
+  protocol bridging, and realtime event transport.
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/zig-0.14.1%2B-f7a41d?style=flat-square" alt="Zig 0.14.1+">
+  <img src="https://img.shields.io/badge/license-Apache%202.0-7cb518?style=flat-square" alt="Apache 2.0">
+  <img src="https://img.shields.io/badge/protocols-HTTP%2F1.1%20%2B%20HTTP%2F2%20%2B%20HTTP%2F3-6c5ce7?style=flat-square" alt="HTTP protocols">
+  <img src="https://img.shields.io/badge/interfaces-REST%20%2B%20WebSocket%20%2B%20SSE-118ab2?style=flat-square" alt="Interfaces">
+</p>
+
+---
+
+Tardigrade is a Zig service runtime with two primary roles:
+
+- **HTTP server** for static assets, conditional requests, range responses, location routing, custom error pages, and TLS termination.
+- **Edge gateway** for authenticated BearClaw traffic, upstream health checks, HTTP/3, protocol bridges (FastCGI, SCGI, uWSGI, gRPC, memcached), mail relays, and realtime mux/SSE streams.
+
+The current codebase includes:
+
+- HTTP/1.1, HTTP/2, and opt-in HTTP/3 via `ngtcp2`/`nghttp3`
+- reverse proxying with retries, cache, health checks, and hot reload
+- WebSocket chat/command paths plus multiplexed mux channels with replay and backpressure handling
+- approval workflows, session/device auth, and policy-gated command execution
+- FastCGI, SCGI, uWSGI, SMTP, IMAP, and POP3 relay support
+
+Breaking behavior is tracked in [CHANGELOG.md](./CHANGELOG.md). Work history and implementation notes live under `changes/`.
 
 ## Features
 
-- **Fast**: Built with Zig for predictable performance and low memory usage
-- **Static File Serving**: Serves files from a configurable directory with proper MIME types
-- **HTTP/1.1 Compliant**: Full request parsing with header support
-- **Keep-Alive Connections**: Persistent connections for improved performance
-- **30+ MIME Types**: Automatic content-type detection for common file extensions
-- **Security**: Path traversal protection, request size limits
+- **Zig-first runtime**: Built on Zig 0.14.1 with predictable memory ownership and low overhead
+- **Gateway routing**: Health, metrics, chat, commands, approvals, sessions, cache purge, and admin routes
+- **Protocol breadth**: Static files, reverse proxy, HTTP/2, HTTP/3, WebSocket, SSE, FastCGI, SCGI, uWSGI, and mail relay paths
+- **Operational controls**: Hot reload, active upstream health checks, TLS/SNI, config validation, access logging, and graceful shutdown
+- **Realtime delivery**: Multiplexed WebSocket channels with device scoping, overflow protection, and replay support
 
 ## Quick Start
 

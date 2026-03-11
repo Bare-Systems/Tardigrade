@@ -553,34 +553,36 @@ Per-device topic namespacing is enforced. However, there are several production 
 
 ### 13.0 Backpressure & Flow Control
 
-- [ ] Detect slow mux clients: if the write buffer for a client grows beyond a configurable
+- [x] Detect slow mux clients: if the write buffer for a client grows beyond a configurable
       threshold (`TARDIGRADE_MUX_WRITE_BUFFER_MAX`), drop the oldest frames and send
       a `{"type":"overflow","dropped":N}` frame to the client
-- [ ] Per-channel subscription limit per device
+- [x] Per-channel subscription limit per device
       (`TARDIGRADE_MUX_MAX_CHANNELS_PER_DEVICE`, default: 50)
 
 ### 13.1 Reconnect & State Recovery
 
-- [ ] `Last-Event-ID`-style resume for mux channels: client can reconnect and receive
+- [x] `Last-Event-ID`-style resume for mux channels: client can reconnect and receive
       missed events since a given sequence ID (reuse `event_hub.zig` replay logic)
-- [ ] Channel state is preserved for a configurable grace period after disconnect
+- [x] Channel state is preserved for a configurable grace period after disconnect
       (`TARDIGRADE_MUX_RECONNECT_GRACE_MS`, default: 30000)
 
 ### 13.2 Observability
 
-- [ ] Active mux connection count exposed in `GET /metrics`
-- [ ] Per-device channel subscription count exposed in `GET /metrics`
-- [ ] Mux frame errors (parse failures, oversized payloads) counted in metrics
+- [x] Active mux connection count exposed in `GET /metrics`
+- [x] Per-device channel subscription count exposed in `GET /metrics`
+- [x] Mux frame errors (parse failures, oversized payloads) counted in metrics
 
 ### 13.3 Tests
 
-- [ ] Integration test: client subscribes to a channel, event is published, frame received
-- [ ] Integration test: client sends command via mux channel, async update frame returned
-- [ ] Integration test: per-device topic isolation — device A cannot receive device B events
-- [ ] Integration test: unauthenticated connection to `/v1/ws/mux` returns 401
-- [ ] Integration test: missing `X-Device-ID` returns 400
-- [ ] Integration test: slow client overflow drops frames and sends overflow notice
-- [ ] Integration test: reconnecting client with sequence ID receives missed events
+- [x] Integration test: mux connection metrics, per-device subscription metrics, and per-device
+      channel-cap rejection are exercised end to end
+- [x] Integration test: client subscribes to a channel, event is published, frame received
+- [x] Integration test: client sends command via mux channel, async update frame returned
+- [x] Integration test: per-device topic isolation — device A cannot receive device B events
+- [x] Integration test: unauthenticated connection to `/v1/ws/mux` returns 401
+- [x] Integration test: missing `X-Device-ID` returns 400
+- [x] Integration test: slow client overflow drops frames and sends overflow notice
+- [x] Integration test: reconnecting client with sequence ID receives missed events
 
 ---
 

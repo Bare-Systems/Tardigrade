@@ -330,6 +330,12 @@ pub const EdgeConfig = struct {
     websocket_idle_timeout_ms: u32,
     /// Maximum payload size per WebSocket frame in bytes.
     websocket_max_frame_size: usize,
+    /// Maximum queued outbound mux payload bytes before oldest frames are dropped.
+    mux_write_buffer_max: usize,
+    /// Maximum active mux channels per device across websocket mux connections.
+    mux_max_channels_per_device: usize,
+    /// Grace window in milliseconds for restoring mux channel state after disconnect.
+    mux_reconnect_grace_ms: u32,
     /// Ping interval for WebSocket keepalive frames in milliseconds (0 = disabled).
     websocket_ping_interval_ms: u32,
     /// Enable SSE publish/stream routes.
@@ -1041,6 +1047,9 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     const websocket_enabled = parseBoolEnv(allocator, "TARDIGRADE_WEBSOCKET_ENABLED", true);
     const websocket_idle_timeout_ms = parseIntEnv(u32, allocator, "TARDIGRADE_WEBSOCKET_IDLE_TIMEOUT_MS", 60_000);
     const websocket_max_frame_size = parseIntEnv(usize, allocator, "TARDIGRADE_WEBSOCKET_MAX_FRAME_SIZE", 1024 * 1024);
+    const mux_write_buffer_max = parseIntEnv(usize, allocator, "TARDIGRADE_MUX_WRITE_BUFFER_MAX", 256 * 1024);
+    const mux_max_channels_per_device = parseIntEnv(usize, allocator, "TARDIGRADE_MUX_MAX_CHANNELS_PER_DEVICE", 50);
+    const mux_reconnect_grace_ms = parseIntEnv(u32, allocator, "TARDIGRADE_MUX_RECONNECT_GRACE_MS", 30_000);
     const websocket_ping_interval_ms = parseIntEnv(u32, allocator, "TARDIGRADE_WEBSOCKET_PING_INTERVAL_MS", 15_000);
     const sse_enabled = parseBoolEnv(allocator, "TARDIGRADE_SSE_ENABLED", true);
     const sse_max_events_per_topic = parseIntEnv(usize, allocator, "TARDIGRADE_SSE_MAX_EVENTS_PER_TOPIC", 1024);
@@ -1309,6 +1318,9 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .websocket_enabled = websocket_enabled,
         .websocket_idle_timeout_ms = websocket_idle_timeout_ms,
         .websocket_max_frame_size = websocket_max_frame_size,
+        .mux_write_buffer_max = mux_write_buffer_max,
+        .mux_max_channels_per_device = mux_max_channels_per_device,
+        .mux_reconnect_grace_ms = mux_reconnect_grace_ms,
         .websocket_ping_interval_ms = websocket_ping_interval_ms,
         .sse_enabled = sse_enabled,
         .sse_max_events_per_topic = sse_max_events_per_topic,

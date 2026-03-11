@@ -98,6 +98,77 @@ const HttpResponse = struct {
     }
 };
 
+const WebSocketOpCode = enum(u4) {
+    continuation = 0x0,
+    text = 0x1,
+    binary = 0x2,
+    close = 0x8,
+    ping = 0x9,
+    pong = 0xA,
+};
+
+const WebSocketFrame = struct {
+    fin: bool,
+    opcode: WebSocketOpCode,
+    payload: []u8,
+
+    fn deinit(self: *WebSocketFrame, allocator: std.mem.Allocator) void {
+        allocator.free(self.payload);
+        self.* = undefined;
+    }
+};
+
+const WebSocketClient = struct {
+    stream: std.net.Stream,
+
+    fn connect(allocator: std.mem.Allocator, port: u16, path: []const u8, headers: []const RequestHeader) !WebSocketClient {
+        const address = try std.net.Address.parseIp(test_host, port);
+        var stream = try std.net.tcpConnectToAddress(address);
+        errdefer stream.close();
+        try setStreamTimeouts(&stream, 5_000);
+
+        var request = std.ArrayList(u8).init(allocator);
+        defer request.deinit();
+        try request.writer().print(
+            "GET {s} HTTP/1.1\r\nHost: {s}:{d}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n",
+            .{ path, test_host, port },
+        );
+        for (headers) |header| {
+            try request.writer().print("{s}: {s}\r\n", .{ header.name, header.value });
+        }
+        try request.appendSlice("\r\n");
+        try stream.writeAll(request.items);
+
+        const handshake = try readHttpHeadersOnly(allocator, stream);
+        defer allocator.free(handshake);
+        const status = try parseStatusCode(handshake);
+        if (status != 101) return error.WebSocketHandshakeFailed;
+
+        return .{ .stream = stream };
+    }
+
+    fn close(self: *WebSocketClient) void {
+        self.stream.close();
+        self.* = undefined;
+    }
+
+    fn sendText(self: *WebSocketClient, payload: []const u8) !void {
+        try writeMaskedWebSocketFrame(self.stream.writer(), .text, payload, true);
+    }
+
+    fn sendClose(self: *WebSocketClient) !void {
+        try writeMaskedWebSocketFrame(self.stream.writer(), .close, "", true);
+    }
+
+    fn sendPing(self: *WebSocketClient, payload: []const u8) !void {
+        try writeMaskedWebSocketFrame(self.stream.writer(), .ping, payload, true);
+    }
+
+    fn readFrame(self: *WebSocketClient, allocator: std.mem.Allocator, max_payload: usize) !WebSocketFrame {
+        return readWebSocketFrame(self.stream, allocator, max_payload);
+    }
+};
+
 const CurlRunResult = struct {
     allocator: std.mem.Allocator,
     stdout: []u8,
@@ -1376,6 +1447,15 @@ fn sendRequestWithTimeout(allocator: std.mem.Allocator, port: u16, spec: Request
     return readHttpResponse(allocator, stream);
 }
 
+fn sendRawRequest(allocator: std.mem.Allocator, port: u16, raw_request: []const u8) !HttpResponse {
+    const address = try std.net.Address.parseIp(test_host, port);
+    var stream = try std.net.tcpConnectToAddress(address);
+    defer stream.close();
+    try setStreamTimeouts(&stream, 5_000);
+    try stream.writeAll(raw_request);
+    return readHttpResponse(allocator, stream);
+}
+
 fn openRequestStream(allocator: std.mem.Allocator, port: u16, spec: RequestSpec) !std.net.Stream {
     const address = try std.net.Address.parseIp(test_host, port);
     var stream = try std.net.tcpConnectToAddress(address);
@@ -1485,6 +1565,85 @@ fn readHttpResponse(allocator: std.mem.Allocator, stream: std.net.Stream) !HttpR
         .headers_raw = raw[0 .. final_header_end + 2],
         .body = raw[final_header_end + 4 ..],
     };
+}
+
+fn readHttpHeadersOnly(allocator: std.mem.Allocator, stream: std.net.Stream) ![]u8 {
+    var raw_buf = std.ArrayList(u8).init(allocator);
+    errdefer raw_buf.deinit();
+    var tmp: [1024]u8 = undefined;
+
+    while (true) {
+        const n = try stream.read(&tmp);
+        if (n == 0) return error.InvalidHttpResponse;
+        try raw_buf.appendSlice(tmp[0..n]);
+        if (std.mem.indexOf(u8, raw_buf.items, "\r\n\r\n") != null) break;
+    }
+    return raw_buf.toOwnedSlice();
+}
+
+fn writeMaskedWebSocketFrame(writer: anytype, opcode: WebSocketOpCode, payload: []const u8, fin: bool) !void {
+    var first: u8 = @intFromEnum(opcode);
+    if (fin) first |= 0x80;
+    try writer.writeByte(first);
+
+    const mask_key = [_]u8{ 0x12, 0x34, 0x56, 0x78 };
+    if (payload.len < 126) {
+        try writer.writeByte(0x80 | @as(u8, @intCast(payload.len)));
+    } else if (payload.len <= std.math.maxInt(u16)) {
+        try writer.writeByte(0x80 | 126);
+        var ext: [2]u8 = undefined;
+        std.mem.writeInt(u16, ext[0..2], @intCast(payload.len), .big);
+        try writer.writeAll(ext[0..]);
+    } else {
+        try writer.writeByte(0x80 | 127);
+        var ext: [8]u8 = undefined;
+        std.mem.writeInt(u64, ext[0..8], payload.len, .big);
+        try writer.writeAll(ext[0..]);
+    }
+    try writer.writeAll(mask_key[0..]);
+    for (payload, 0..) |byte, i| {
+        try writer.writeByte(byte ^ mask_key[i % mask_key.len]);
+    }
+}
+
+fn readWebSocketFrame(stream: std.net.Stream, allocator: std.mem.Allocator, max_payload: usize) !WebSocketFrame {
+    var hdr: [2]u8 = undefined;
+    try readExact(stream, hdr[0..]);
+    const fin = (hdr[0] & 0x80) != 0;
+    const opcode: WebSocketOpCode = @enumFromInt(@as(u4, @truncate(hdr[0])));
+    const masked = (hdr[1] & 0x80) != 0;
+    var len: usize = hdr[1] & 0x7F;
+
+    if (len == 126) {
+        var ext: [2]u8 = undefined;
+        try readExact(stream, ext[0..]);
+        len = std.mem.readInt(u16, ext[0..2], .big);
+    } else if (len == 127) {
+        var ext: [8]u8 = undefined;
+        try readExact(stream, ext[0..]);
+        len = @intCast(std.mem.readInt(u64, ext[0..8], .big));
+    }
+    if (len > max_payload) return error.FrameTooLarge;
+
+    var mask_key: [4]u8 = .{ 0, 0, 0, 0 };
+    if (masked) try readExact(stream, mask_key[0..]);
+
+    const payload = try allocator.alloc(u8, len);
+    errdefer allocator.free(payload);
+    try readExact(stream, payload);
+    if (masked) {
+        for (payload, 0..) |*byte, i| byte.* ^= mask_key[i % mask_key.len];
+    }
+    return .{ .fin = fin, .opcode = opcode, .payload = payload };
+}
+
+fn readExact(stream: std.net.Stream, out: []u8) !void {
+    var off: usize = 0;
+    while (off < out.len) {
+        const n = try stream.read(out[off..]);
+        if (n == 0) return error.ConnectionClosed;
+        off += n;
+    }
 }
 
 fn waitUntilReady(port: u16, log_path: []const u8, options: TardigradeOptions) !void {
@@ -1868,6 +2027,16 @@ fn waitForBodyContains(allocator: std.mem.Allocator, port: u16, path: []const u8
     return error.Timeout;
 }
 
+fn waitForWebSocketFrameContains(ws: *WebSocketClient, allocator: std.mem.Allocator, needle: []const u8, attempts: usize) !WebSocketFrame {
+    var remaining = attempts;
+    while (remaining > 0) : (remaining -= 1) {
+        var frame = try ws.readFrame(allocator, 8192);
+        if (std.mem.indexOf(u8, frame.payload, needle) != null) return frame;
+        frame.deinit(allocator);
+    }
+    return error.Timeout;
+}
+
 fn waitForHttp3Configured(port: u16, timeout_ms: u64) !void {
     const deadline = std.time.milliTimestamp() + @as(i64, @intCast(timeout_ms));
     while (std.time.milliTimestamp() < deadline) {
@@ -2072,6 +2241,353 @@ test "core gateway integration covers health metrics auth proxying invalid json 
     defer generated_corr.deinit();
     const generated = generated_corr.header("X-Correlation-ID") orelse return error.MissingCorrelationId;
     try std.testing.expect(std.mem.startsWith(u8, generated, "tg-"));
+}
+
+test "mux websocket metrics and channel caps are enforced" {
+    const allocator = std.testing.allocator;
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_WORKER_THREADS", .value = "2" },
+            .{ .name = "TARDIGRADE_WEBSOCKET_ENABLED", .value = "true" },
+            .{ .name = "TARDIGRADE_SSE_ENABLED", .value = "true" },
+            .{ .name = "TARDIGRADE_MUX_MAX_CHANNELS_PER_DEVICE", .value = "1" },
+        },
+    });
+    defer tardigrade.stop();
+
+    var ws = try WebSocketClient.connect(allocator, tardigrade.port, "/v1/ws/mux", &.{
+        .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
+        .{ .name = "X-Device-ID", .value = "ws-device-1" },
+    });
+    defer ws.close();
+
+    try waitForBodyContains(allocator, tardigrade.port, "/metrics/json", &.{}, "\"mux_connections\":1", 2000);
+    try waitForBodyContains(allocator, tardigrade.port, "/metrics", &.{}, "tardigrade_mux_connections 1", 2000);
+
+    try ws.sendText("{\"type\":\"subscribe\",\"channel\":\"alpha\",\"topic\":\"alerts\"}");
+    var subscribed = try ws.readFrame(allocator, 4096);
+    defer subscribed.deinit(allocator);
+    try assertContains(subscribed.payload, "\"type\":\"subscribed\"");
+    try assertContains(subscribed.payload, "\"channel\":\"alpha\"");
+
+    try waitForBodyContains(allocator, tardigrade.port, "/metrics/json", &.{}, "\"mux_subscriptions\":1", 2000);
+    try waitForBodyContains(allocator, tardigrade.port, "/metrics/json", &.{}, "\"ws-device-1\":1", 2000);
+    try waitForBodyContains(allocator, tardigrade.port, "/metrics", &.{}, "tardigrade_mux_device_channels{device_id=\"ws-device-1\"} 1", 2000);
+
+    try ws.sendText("{");
+    var invalid = try ws.readFrame(allocator, 4096);
+    defer invalid.deinit(allocator);
+    try assertContains(invalid.payload, "\"type\":\"error\"");
+    try assertContains(invalid.payload, "\"invalid json\"");
+    try waitForBodyContains(allocator, tardigrade.port, "/metrics/json", &.{}, "\"mux_frame_errors\":1", 2000);
+
+    try ws.sendText("{\"type\":\"subscribe\",\"channel\":\"beta\",\"topic\":\"second\"}");
+    var capped = try ws.readFrame(allocator, 4096);
+    defer capped.deinit(allocator);
+    try assertContains(capped.payload, "\"type\":\"error\"");
+    try assertContains(capped.payload, "too many channels");
+    try waitForBodyContains(allocator, tardigrade.port, "/metrics/json", &.{}, "\"mux_frame_errors\":2", 2000);
+    try waitForBodyContains(allocator, tardigrade.port, "/metrics/json", &.{}, "\"mux_subscriptions\":1", 2000);
+
+    ws.sendClose() catch {};
+    if (ws.readFrame(allocator, 4096)) |close_frame| {
+        var frame = close_frame;
+        frame.deinit(allocator);
+    } else |_| {}
+    try waitForBodyContains(allocator, tardigrade.port, "/metrics/json", &.{}, "\"mux_connections\":0", 2000);
+    try waitForBodyContains(allocator, tardigrade.port, "/metrics/json", &.{}, "\"mux_subscriptions\":0", 2000);
+}
+
+test "mux websocket rejects unauthorized and missing device id" {
+    const allocator = std.testing.allocator;
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_WORKER_THREADS", .value = "2" },
+            .{ .name = "TARDIGRADE_WEBSOCKET_ENABLED", .value = "true" },
+            .{ .name = "TARDIGRADE_SSE_ENABLED", .value = "true" },
+        },
+    });
+    defer tardigrade.stop();
+
+    const unauthorized_req = try std.fmt.allocPrint(
+        allocator,
+        "GET /v1/ws/mux HTTP/1.1\r\nHost: {s}:{d}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nX-Device-ID: ws-device-unauth\r\n\r\n",
+        .{ test_host, tardigrade.port },
+    );
+    defer allocator.free(unauthorized_req);
+    var unauthorized = try sendRawRequest(allocator, tardigrade.port, unauthorized_req);
+    defer unauthorized.deinit();
+    try std.testing.expectEqual(@as(u16, 401), unauthorized.status_code);
+    try assertContains(unauthorized.body, "\"code\":\"unauthorized\"");
+
+    const missing_device_req = try std.fmt.allocPrint(
+        allocator,
+        "GET /v1/ws/mux HTTP/1.1\r\nHost: {s}:{d}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nAuthorization: Bearer {s}\r\n\r\n",
+        .{ test_host, tardigrade.port, valid_bearer_token },
+    );
+    defer allocator.free(missing_device_req);
+    var missing_device = try sendRawRequest(allocator, tardigrade.port, missing_device_req);
+    defer missing_device.deinit();
+    try std.testing.expectEqual(@as(u16, 400), missing_device.status_code);
+    try assertContains(missing_device.body, "Missing X-Device-ID");
+}
+
+test "mux websocket subscribe publish and async command update are delivered" {
+    const allocator = std.testing.allocator;
+    var upstream = try UpstreamServer.start(allocator, &.{
+        .{ .body = "{\"result\":\"ok\"}" },
+    });
+    defer upstream.stop();
+    try upstream.run();
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .upstream_port = upstream.port(),
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_WORKER_THREADS", .value = "2" },
+            .{ .name = "TARDIGRADE_WEBSOCKET_ENABLED", .value = "true" },
+            .{ .name = "TARDIGRADE_SSE_ENABLED", .value = "true" },
+        },
+    });
+    defer tardigrade.stop();
+
+    var ws = try WebSocketClient.connect(allocator, tardigrade.port, "/v1/ws/mux", &.{
+        .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
+        .{ .name = "X-Device-ID", .value = "mux-device-42" },
+    });
+    defer ws.close();
+
+    try ws.sendText("{\"type\":\"subscribe\",\"channel\":\"events\",\"topic\":\"alerts\"}");
+    var subscribed = try waitForWebSocketFrameContains(&ws, allocator, "\"type\":\"subscribed\"", 2);
+    defer subscribed.deinit(allocator);
+
+    try ws.sendText("{\"type\":\"publish\",\"channel\":\"events\",\"topic\":\"alerts\",\"payload\":\"hello mux\"}");
+    var published = try waitForWebSocketFrameContains(&ws, allocator, "\"type\":\"published\"", 2);
+    defer published.deinit(allocator);
+    try assertContains(published.payload, "\"channel\":\"events\"");
+
+    var event_frame = try waitForWebSocketFrameContains(&ws, allocator, "\"type\":\"event\"", 3);
+    defer event_frame.deinit(allocator);
+    try assertContains(event_frame.payload, "\"channel\":\"events\"");
+    try assertContains(event_frame.payload, "\"payload\":\"hello mux\"");
+    try assertContains(event_frame.payload, "device/mux-device-42/alerts");
+
+    try ws.sendText("{\"type\":\"command\",\"channel\":\"commands\",\"command\":\"status\",\"params\":{},\"command_id\":\"mux-cmd-1\",\"async\":true}");
+    var accepted = try waitForWebSocketFrameContains(&ws, allocator, "\"type\":\"command.accepted\"", 2);
+    defer accepted.deinit(allocator);
+    try assertContains(accepted.payload, "\"command_id\":\"mux-cmd-1\"");
+
+    try waitForUpstreamCount(&upstream, 1, 3000);
+    try ws.sendPing("tick");
+    var update = try waitForWebSocketFrameContains(&ws, allocator, "\"status\":\"completed\"", 6);
+    defer update.deinit(allocator);
+    try assertContains(update.payload, "\"channel\":\"commands\"");
+    try assertContains(update.payload, "\"command_id\":\"mux-cmd-1\"");
+    try assertContains(update.payload, "\"status\":\"completed\"");
+    try assertContains(update.payload, "\"response_status\":200");
+    try assertContains(update.payload, "\"result\":\"ok\"");
+}
+
+test "mux websocket isolates topics per device" {
+    const allocator = std.testing.allocator;
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_WORKER_THREADS", .value = "2" },
+            .{ .name = "TARDIGRADE_WEBSOCKET_ENABLED", .value = "true" },
+            .{ .name = "TARDIGRADE_SSE_ENABLED", .value = "true" },
+        },
+    });
+    defer tardigrade.stop();
+
+    var ws_a = try WebSocketClient.connect(allocator, tardigrade.port, "/v1/ws/mux", &.{
+        .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
+        .{ .name = "X-Device-ID", .value = "device-a" },
+    });
+    defer ws_a.close();
+
+    var ws_b = try WebSocketClient.connect(allocator, tardigrade.port, "/v1/ws/mux", &.{
+        .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
+        .{ .name = "X-Device-ID", .value = "device-b" },
+    });
+    defer ws_b.close();
+
+    try ws_a.sendText("{\"type\":\"subscribe\",\"channel\":\"alpha\",\"topic\":\"alerts\"}");
+    var a_subscribed = try waitForWebSocketFrameContains(&ws_a, allocator, "\"type\":\"subscribed\"", 2);
+    defer a_subscribed.deinit(allocator);
+
+    try ws_b.sendText("{\"type\":\"subscribe\",\"channel\":\"beta\",\"topic\":\"alerts\"}");
+    var b_subscribed = try waitForWebSocketFrameContains(&ws_b, allocator, "\"type\":\"subscribed\"", 2);
+    defer b_subscribed.deinit(allocator);
+
+    try ws_a.sendText("{\"type\":\"publish\",\"channel\":\"alpha\",\"topic\":\"alerts\",\"payload\":\"from device a\"}");
+    var published = try waitForWebSocketFrameContains(&ws_a, allocator, "\"type\":\"published\"", 2);
+    defer published.deinit(allocator);
+
+    var a_event = try waitForWebSocketFrameContains(&ws_a, allocator, "\"type\":\"event\"", 3);
+    defer a_event.deinit(allocator);
+    try assertContains(a_event.payload, "\"payload\":\"from device a\"");
+    try assertContains(a_event.payload, "device/device-a/alerts");
+
+    try ws_b.sendPing("isolation");
+    var b_frame = try ws_b.readFrame(allocator, 4096);
+    defer b_frame.deinit(allocator);
+    try std.testing.expectEqual(WebSocketOpCode.pong, b_frame.opcode);
+}
+
+test "mux websocket drops oldest queued frames and sends overflow notice" {
+    const allocator = std.testing.allocator;
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_WORKER_THREADS", .value = "2" },
+            .{ .name = "TARDIGRADE_WEBSOCKET_ENABLED", .value = "true" },
+            .{ .name = "TARDIGRADE_SSE_ENABLED", .value = "true" },
+            .{ .name = "TARDIGRADE_MUX_WRITE_BUFFER_MAX", .value = "220" },
+        },
+    });
+    defer tardigrade.stop();
+
+    var ws = try WebSocketClient.connect(allocator, tardigrade.port, "/v1/ws/mux", &.{
+        .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
+        .{ .name = "X-Device-ID", .value = "overflow-device" },
+    });
+    defer ws.close();
+
+    try ws.sendText("{\"type\":\"subscribe\",\"channel\":\"events\",\"topic\":\"alerts\"}");
+    var subscribed = try waitForWebSocketFrameContains(&ws, allocator, "\"type\":\"subscribed\"", 2);
+    defer subscribed.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < 6) : (i += 1) {
+        const payload = try std.fmt.allocPrint(allocator, "overflow-payload-{d}-abcdefghijklmnopqrstuvwxyz", .{i});
+        defer allocator.free(payload);
+        const path = try std.fmt.allocPrint(allocator, "/v1/events/publish?topic=device/overflow-device/alerts", .{});
+        defer allocator.free(path);
+        var published = try sendRequest(allocator, tardigrade.port, .{
+            .method = "POST",
+            .path = path,
+            .body = payload,
+            .headers = &.{.{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token }},
+        });
+        defer published.deinit();
+        try std.testing.expectEqual(@as(u16, 202), published.status_code);
+    }
+
+    try ws.sendPing("flush");
+    var overflow = try waitForWebSocketFrameContains(&ws, allocator, "\"type\":\"overflow\"", 4);
+    defer overflow.deinit(allocator);
+    try assertContains(overflow.payload, "\"dropped\":");
+
+    var retained_event = try waitForWebSocketFrameContains(&ws, allocator, "\"type\":\"event\"", 4);
+    defer retained_event.deinit(allocator);
+    try assertContains(retained_event.payload, "overflow-payload-");
+
+    try waitForBodyContains(allocator, tardigrade.port, "/metrics/json", &.{}, "\"mux_frame_errors\":0", 1000);
+}
+
+test "mux websocket subscribe resumes from explicit last_event_id" {
+    const allocator = std.testing.allocator;
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_WORKER_THREADS", .value = "2" },
+            .{ .name = "TARDIGRADE_WEBSOCKET_ENABLED", .value = "true" },
+            .{ .name = "TARDIGRADE_SSE_ENABLED", .value = "true" },
+        },
+    });
+    defer tardigrade.stop();
+
+    var first_publish = try sendRequest(allocator, tardigrade.port, .{
+        .method = "POST",
+        .path = "/v1/events/publish?topic=device/resume-device/alerts",
+        .body = "first",
+        .headers = &.{.{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token }},
+    });
+    defer first_publish.deinit();
+    try std.testing.expectEqual(@as(u16, 202), first_publish.status_code);
+
+    var second_publish = try sendRequest(allocator, tardigrade.port, .{
+        .method = "POST",
+        .path = "/v1/events/publish?topic=device/resume-device/alerts",
+        .body = "second",
+        .headers = &.{.{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token }},
+    });
+    defer second_publish.deinit();
+    try std.testing.expectEqual(@as(u16, 202), second_publish.status_code);
+
+    var ws = try WebSocketClient.connect(allocator, tardigrade.port, "/v1/ws/mux", &.{
+        .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
+        .{ .name = "X-Device-ID", .value = "resume-device" },
+    });
+    defer ws.close();
+
+    try ws.sendText("{\"type\":\"subscribe\",\"channel\":\"resume\",\"topic\":\"alerts\",\"last_event_id\":1}");
+    var subscribed = try waitForWebSocketFrameContains(&ws, allocator, "\"type\":\"subscribed\"", 2);
+    defer subscribed.deinit(allocator);
+
+    var replayed = try waitForWebSocketFrameContains(&ws, allocator, "\"type\":\"event\"", 3);
+    defer replayed.deinit(allocator);
+    try assertContains(replayed.payload, "\"payload\":\"second\"");
+    try std.testing.expect(std.mem.indexOf(u8, replayed.payload, "\"payload\":\"first\"") == null);
+}
+
+test "mux websocket restores subscriptions during reconnect grace" {
+    const allocator = std.testing.allocator;
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_WORKER_THREADS", .value = "2" },
+            .{ .name = "TARDIGRADE_WEBSOCKET_ENABLED", .value = "true" },
+            .{ .name = "TARDIGRADE_SSE_ENABLED", .value = "true" },
+            .{ .name = "TARDIGRADE_MUX_RECONNECT_GRACE_MS", .value = "5000" },
+        },
+    });
+    defer tardigrade.stop();
+
+    var ws = try WebSocketClient.connect(allocator, tardigrade.port, "/v1/ws/mux", &.{
+        .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
+        .{ .name = "X-Device-ID", .value = "grace-device" },
+    });
+
+    try ws.sendText("{\"type\":\"subscribe\",\"channel\":\"events\",\"topic\":\"alerts\"}");
+    var subscribed = try waitForWebSocketFrameContains(&ws, allocator, "\"type\":\"subscribed\"", 2);
+    subscribed.deinit(allocator);
+
+    var first_publish = try sendRequest(allocator, tardigrade.port, .{
+        .method = "POST",
+        .path = "/v1/events/publish?topic=device/grace-device/alerts",
+        .body = "before-disconnect",
+        .headers = &.{.{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token }},
+    });
+    defer first_publish.deinit();
+    try std.testing.expectEqual(@as(u16, 202), first_publish.status_code);
+    try ws.sendPing("prime");
+    var first_event = try waitForWebSocketFrameContains(&ws, allocator, "\"type\":\"event\"", 3);
+    defer first_event.deinit(allocator);
+    try assertContains(first_event.payload, "\"payload\":\"before-disconnect\"");
+
+    try ws.sendClose();
+    if (ws.readFrame(allocator, 4096)) |close_frame| {
+        var frame = close_frame;
+        frame.deinit(allocator);
+    } else |_| {}
+    ws.close();
+
+    var second_publish = try sendRequest(allocator, tardigrade.port, .{
+        .method = "POST",
+        .path = "/v1/events/publish?topic=device/grace-device/alerts",
+        .body = "after-reconnect",
+        .headers = &.{.{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token }},
+    });
+    defer second_publish.deinit();
+    try std.testing.expectEqual(@as(u16, 202), second_publish.status_code);
+
+    var resumed = try WebSocketClient.connect(allocator, tardigrade.port, "/v1/ws/mux", &.{
+        .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
+        .{ .name = "X-Device-ID", .value = "grace-device" },
+    });
+    defer resumed.close();
+    try resumed.sendPing("resume");
+
+    var replayed = try waitForWebSocketFrameContains(&resumed, allocator, "\"type\":\"event\"", 4);
+    defer replayed.deinit(allocator);
+    try assertContains(replayed.payload, "\"payload\":\"after-reconnect\"");
 }
 
 test "jwt auth integration covers valid expired and issuer mismatch tokens" {

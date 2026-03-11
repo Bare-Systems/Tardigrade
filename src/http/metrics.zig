@@ -14,6 +14,10 @@ pub const Metrics = struct {
     status_5xx: u64,
     /// Current active accepted client connections.
     active_connections: u64,
+    /// Current active mux websocket connections.
+    mux_connections: u64,
+    /// Current active mux channels across all connected clients.
+    mux_subscriptions: u64,
     /// Total listener rejections from connection slot limits.
     connection_rejections: u64,
     /// Total listener rejections due to worker queue saturation.
@@ -28,6 +32,7 @@ pub const Metrics = struct {
     err_upstream_unavailable: u64,
     err_internal_error: u64,
     err_overload: u64,
+    mux_frame_errors: u64,
     /// Server start time (nanoseconds since boot).
     started_ns: i128,
 
@@ -39,6 +44,8 @@ pub const Metrics = struct {
             .status_4xx = 0,
             .status_5xx = 0,
             .active_connections = 0,
+            .mux_connections = 0,
+            .mux_subscriptions = 0,
             .connection_rejections = 0,
             .queue_rejections = 0,
             .upstream_unhealthy_backends = 0,
@@ -49,6 +56,7 @@ pub const Metrics = struct {
             .err_upstream_unavailable = 0,
             .err_internal_error = 0,
             .err_overload = 0,
+            .mux_frame_errors = 0,
             .started_ns = std.time.nanoTimestamp(),
         };
     }
@@ -71,12 +79,24 @@ pub const Metrics = struct {
         self.active_connections = @intCast(active);
     }
 
+    pub fn setMuxConnections(self: *Metrics, active: usize) void {
+        self.mux_connections = @intCast(active);
+    }
+
+    pub fn setMuxSubscriptions(self: *Metrics, active: usize) void {
+        self.mux_subscriptions = @intCast(active);
+    }
+
     pub fn recordConnectionRejection(self: *Metrics) void {
         self.connection_rejections += 1;
     }
 
     pub fn recordQueueRejection(self: *Metrics) void {
         self.queue_rejections += 1;
+    }
+
+    pub fn recordMuxFrameError(self: *Metrics) void {
+        self.mux_frame_errors += 1;
     }
 
     pub fn setUpstreamUnhealthyBackends(self: *Metrics, count: usize) void {
@@ -134,6 +154,12 @@ pub const Metrics = struct {
             \\# HELP tardigrade_active_connections Current active accepted client connections
             \\# TYPE tardigrade_active_connections gauge
             \\tardigrade_active_connections {d}
+            \\# HELP tardigrade_mux_connections Current active mux websocket connections
+            \\# TYPE tardigrade_mux_connections gauge
+            \\tardigrade_mux_connections {d}
+            \\# HELP tardigrade_mux_subscriptions Current active mux channels across all connected clients
+            \\# TYPE tardigrade_mux_subscriptions gauge
+            \\tardigrade_mux_subscriptions {d}
             \\# HELP tardigrade_connection_rejections_total Total listener rejections from connection-slot limits
             \\# TYPE tardigrade_connection_rejections_total counter
             \\tardigrade_connection_rejections_total {d}
@@ -164,6 +190,9 @@ pub const Metrics = struct {
             \\# HELP tardigrade_error_overload_total Total overload API errors
             \\# TYPE tardigrade_error_overload_total counter
             \\tardigrade_error_overload_total {d}
+            \\# HELP tardigrade_mux_frame_errors_total Total mux frame parse or validation errors
+            \\# TYPE tardigrade_mux_frame_errors_total counter
+            \\tardigrade_mux_frame_errors_total {d}
             \\
         , .{
             self.total_requests,
@@ -173,6 +202,8 @@ pub const Metrics = struct {
             self.status_5xx,
             self.uptimeSeconds(),
             self.active_connections,
+            self.mux_connections,
+            self.mux_subscriptions,
             self.connection_rejections,
             self.queue_rejections,
             self.upstream_unhealthy_backends,
@@ -183,6 +214,7 @@ pub const Metrics = struct {
             self.err_upstream_unavailable,
             self.err_internal_error,
             self.err_overload,
+            self.mux_frame_errors,
         });
     }
 
@@ -190,7 +222,7 @@ pub const Metrics = struct {
     /// Caller owns the returned memory.
     pub fn toJson(self: *const Metrics, allocator: std.mem.Allocator) ![]u8 {
         return std.fmt.allocPrint(allocator,
-            \\{{"total_requests":{d},"status_2xx":{d},"status_3xx":{d},"status_4xx":{d},"status_5xx":{d},"uptime_seconds":{d},"active_connections":{d},"connection_rejections":{d},"queue_rejections":{d},"upstream_unhealthy_backends":{d},"error_invalid_request":{d},"error_unauthorized":{d},"error_rate_limited":{d},"error_upstream_timeout":{d},"error_upstream_unavailable":{d},"error_internal_error":{d},"error_overload":{d}}}
+            \\{{"total_requests":{d},"status_2xx":{d},"status_3xx":{d},"status_4xx":{d},"status_5xx":{d},"uptime_seconds":{d},"active_connections":{d},"mux_connections":{d},"mux_subscriptions":{d},"connection_rejections":{d},"queue_rejections":{d},"upstream_unhealthy_backends":{d},"error_invalid_request":{d},"error_unauthorized":{d},"error_rate_limited":{d},"error_upstream_timeout":{d},"error_upstream_unavailable":{d},"error_internal_error":{d},"error_overload":{d},"mux_frame_errors":{d}}}
         , .{
             self.total_requests,
             self.status_2xx,
@@ -199,6 +231,8 @@ pub const Metrics = struct {
             self.status_5xx,
             self.uptimeSeconds(),
             self.active_connections,
+            self.mux_connections,
+            self.mux_subscriptions,
             self.connection_rejections,
             self.queue_rejections,
             self.upstream_unhealthy_backends,
@@ -209,6 +243,7 @@ pub const Metrics = struct {
             self.err_upstream_unavailable,
             self.err_internal_error,
             self.err_overload,
+            self.mux_frame_errors,
         });
     }
 };
@@ -221,6 +256,9 @@ test "Metrics init starts at zero" {
     try std.testing.expectEqual(@as(u64, 0), m.status_2xx);
     try std.testing.expectEqual(@as(u64, 0), m.status_4xx);
     try std.testing.expectEqual(@as(u64, 0), m.active_connections);
+    try std.testing.expectEqual(@as(u64, 0), m.mux_connections);
+    try std.testing.expectEqual(@as(u64, 0), m.mux_subscriptions);
+    try std.testing.expectEqual(@as(u64, 0), m.mux_frame_errors);
 }
 
 test "Metrics recordRequest tracks status classes" {
@@ -247,13 +285,19 @@ test "Metrics uptimeSeconds is non-negative" {
 test "Metrics tracks active connections and rejections" {
     var m = Metrics.init();
     m.setActiveConnections(7);
+    m.setMuxConnections(2);
+    m.setMuxSubscriptions(5);
     m.recordConnectionRejection();
     m.recordQueueRejection();
     m.recordQueueRejection();
+    m.recordMuxFrameError();
 
     try std.testing.expectEqual(@as(u64, 7), m.active_connections);
+    try std.testing.expectEqual(@as(u64, 2), m.mux_connections);
+    try std.testing.expectEqual(@as(u64, 5), m.mux_subscriptions);
     try std.testing.expectEqual(@as(u64, 1), m.connection_rejections);
     try std.testing.expectEqual(@as(u64, 2), m.queue_rejections);
+    try std.testing.expectEqual(@as(u64, 1), m.mux_frame_errors);
     m.setUpstreamUnhealthyBackends(3);
     try std.testing.expectEqual(@as(u64, 3), m.upstream_unhealthy_backends);
     m.recordErrorCode("invalid_request");

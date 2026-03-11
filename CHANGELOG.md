@@ -4,6 +4,11 @@
 ## [0.31.0] - 2026-03-xx
 
 ### Added
+- Documentation refresh:
+  - Reworked the top of `README.md` into a centered project header with navigation links, badges,
+    and a clearer summary of Tardigrade’s server and gateway roles.
+  - Added `CONTRIBUTING.md` with the repo’s actual upgrade-driven workflow, testing commands,
+    and documentation expectations.
 - Upgrade 12 approval workflow hardening:
   - Added `src/http/approval_store.zig` with atomic JSON-file persistence (`persist` + `load`)
     and a best-effort escalation webhook (`fireWebhook` via `std.http.Client`).
@@ -18,6 +23,31 @@
     outside the approval mutex for best-effort delivery.
   - Added integration tests covering the full approval round-trip, double-respond conflict
     (409), per-identity rate limiting (429), and store persistence across server restart.
+- Upgrade 13 mux observability and channel-cap hardening:
+  - Added mux metrics for active mux websocket connections, total active mux subscriptions,
+    per-device mux channel counts, and mux frame errors.
+  - Added `TARDIGRADE_MUX_MAX_CHANNELS_PER_DEVICE` and enforced per-device channel caps in
+    `/v1/ws/mux`.
+  - Added live integration coverage proving mux metrics update while a socket is open, invalid
+    mux frames increment the error counter, and a second subscription is rejected when the
+    per-device cap is set to `1`.
+  - Wired mux channel polling into the live websocket loop so subscribed event frames and async
+    command lifecycle updates are actually emitted over `/v1/ws/mux`.
+  - Added live mux integration coverage for unauthorized `401`, missing `X-Device-ID` `400`,
+    subscribe-plus-publish event delivery, and async `command.update` delivery.
+  - Added live two-client mux isolation coverage proving device A cannot receive events
+    published onto device B’s namespaced topic, even when both subscribe to the same logical
+    channel name.
+  - Added `TARDIGRADE_MUX_WRITE_BUFFER_MAX` and a bounded per-socket mux pending-frame queue;
+    when queued mux event/update frames exceed the configured byte budget, the oldest queued
+    frames are dropped and an explicit `{"type":"overflow","dropped":N}` notice is sent.
+  - Added live overflow coverage proving queued mux event delivery drops older frames and emits
+    the overflow notice once the bounded write buffer is exceeded.
+  - Added `last_event_id` replay on mux `subscribe` plus `TARDIGRADE_MUX_RECONNECT_GRACE_MS`
+    state restoration, allowing a reconnecting device to replay missed mux events either
+    explicitly by sequence ID or implicitly by reconnecting within the grace window.
+  - Added live replay coverage for explicit `last_event_id` resume and reconnect-within-grace
+    delivery of missed mux events.
 
 ## [0.30.0] - 2026-03-xx
 

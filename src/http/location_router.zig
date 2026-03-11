@@ -19,7 +19,6 @@ pub const MatchType = enum {
 };
 
 pub const Action = union(enum) {
-    builtin_route: BuiltinRoute,
     proxy_pass: []const u8,
     fastcgi_pass: []const u8,
     return_response: struct {
@@ -40,7 +39,6 @@ pub const Action = union(enum) {
 
     pub fn deinit(self: *Action, allocator: std.mem.Allocator) void {
         switch (self.*) {
-            .builtin_route => {},
             .proxy_pass => |target| allocator.free(target),
             .fastcgi_pass => |target| allocator.free(target),
             .return_response => |response| allocator.free(response.body),
@@ -64,29 +62,6 @@ pub const ErrorPageRule = struct {
         allocator.free(self.target);
         self.* = undefined;
     }
-};
-
-pub const BuiltinRoute = enum {
-    health,
-    metrics,
-    metrics_json,
-    metrics_prometheus,
-    admin_routes,
-    admin_connections,
-    admin_streams,
-    admin_upstreams,
-    admin_certs,
-    admin_auth_registry,
-    v1_chat,
-    v1_commands,
-    v1_commands_status,
-    v1_approvals_request,
-    v1_approvals_respond,
-    v1_approvals_status,
-    v1_devices_register,
-    v1_sessions_refresh,
-    v1_sessions,
-    v1_cache_purge,
 };
 
 pub const LocationBlock = struct {
@@ -293,28 +268,4 @@ test "longest plain prefix wins when no exact priority or regex matches" {
 
     const matched = matchLocation("/images/logo.png", &blocks).?;
     try std.testing.expectEqual(@as(usize, 1), matched.index);
-}
-
-test "builtin route actions participate in exact matching" {
-    const blocks = [_]LocationBlock{
-        .{
-            .match_type = .exact,
-            .pattern = "/health",
-            .priority = 0,
-            .action = .{ .builtin_route = .health },
-        },
-        .{
-            .match_type = .prefix,
-            .pattern = "/",
-            .priority = 1,
-            .action = .{ .builtin_route = .metrics },
-        },
-    };
-
-    const matched = matchLocation("/health", &blocks).?;
-    try std.testing.expectEqual(@as(usize, 0), matched.index);
-    switch (matched.block.action) {
-        .builtin_route => |route| try std.testing.expectEqual(BuiltinRoute.health, route),
-        else => return error.UnexpectedTestResult,
-    }
 }

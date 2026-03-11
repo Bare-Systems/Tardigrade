@@ -2,11 +2,9 @@
 
 ## Workflow
 
-Tardigrade uses `UPGRADES.md` as the implementation backlog and execution order.
-
 When contributing:
 
-1. Pick the next unchecked item in [UPGRADES.md](./UPGRADES.md)
+1. Pick the next unchecked item to fix, improve or build.
 2. Make one focused change at a time
 3. Add or update a short reference note under `changes/`
 4. Keep [CHANGELOG.md](./CHANGELOG.md) current while you work

@@ -9,6 +9,8 @@
     and a clearer summary of Tardigrade’s server and gateway roles.
   - Added `CONTRIBUTING.md` with the repo’s actual upgrade-driven workflow, testing commands,
     and documentation expectations.
+  - Removed product-specific naming from the root docs and added an isolated example deployment
+    bundle under `examples/` for the application-specific gateway setup.
 - Upgrade 12 approval workflow hardening:
   - Added `src/http/approval_store.zig` with atomic JSON-file persistence (`persist` + `load`)
     and a best-effort escalation webhook (`fireWebhook` via `std.http.Client`).
@@ -684,12 +686,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 - sendfile() zero-copy optimization for static file serving (in progress)
-- Remote BearClaw gateway MVP edge path:
+- Remote authenticated gateway MVP edge path:
   - New edge config loader (`src/edge_config.zig`) with `listen_host`, `listen_port`, `tls_cert_path`, `tls_key_path`, `upstream_base_url`, auth token hashes.
   - New edge runtime (`src/edge_gateway.zig`) with `GET /health` and authenticated `POST /v1/chat`.
   - Static bearer token auth using SHA-256 hash allowlist.
   - Request validation and stable API error envelopes with `request_id`.
-  - Upstream forwarding to BearClaw with `X-Correlation-ID` propagation.
+  - Upstream forwarding with `X-Correlation-ID` propagation.
   - Structured audit logs for route/status/auth/correlation/latency.
 - Correlation ID support via `X-Correlation-ID` header:
   - Echoes valid client-provided IDs in responses.

@@ -18,7 +18,8 @@ const ADMIN_ROUTES_JSON =
 const HTTP2_PREFACE = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 const HTTP2_MAX_FRAME_SIZE: usize = 16 * 1024;
 const WS_MUX_MAX_CHANNELS: usize = 32;
-const APPROVAL_TIMEOUT_MS: i64 = 60_000;
+/// Fallback approval TTL when no config value is provided (5 minutes).
+const APPROVAL_TIMEOUT_MS_DEFAULT: i64 = 300_000;
 const ProxyCacheLookup = struct {
     cached: http.idempotency.CachedResponse,
     is_stale: bool,
@@ -140,6 +141,8 @@ const ApprovalEntry = struct {
     expires_ms: i64,
     decided_ms: i64,
     decided_by: []u8,
+    /// True once the escalation webhook has been fired for this entry.
+    escalation_fired: bool = false,
 
     fn deinit(self: *ApprovalEntry, allocator: std.mem.Allocator) void {
         allocator.free(self.method);
@@ -225,6 +228,14 @@ const GatewayState = struct {
     fd_to_ip: std.AutoHashMap(std.posix.fd_t, []u8),
     command_lifecycle: std.StringHashMap(CommandLifecycleEntry),
     approvals: std.StringHashMap(ApprovalEntry),
+    /// Path to persistent approval store file (empty = in-memory only).
+    approval_store_path: []const u8,
+    /// Webhook URL for escalation notifications (empty = disabled).
+    approval_escalation_webhook: []const u8,
+    /// Approval TTL in milliseconds.
+    approval_ttl_ms: i64,
+    /// Max concurrent pending approval requests per identity (0 = unlimited).
+    approval_max_pending_per_identity: u32,
 
     fn deinit(self: *GatewayState) void {
         if (self.rate_limiter) |*rl| rl.deinit();
@@ -755,102 +766,238 @@ const GatewayState = struct {
     }
 
     fn approvalCreate(self: *GatewayState, allocator: std.mem.Allocator, method: []const u8, path: []const u8, identity: []const u8, command_id: ?[]const u8) !ApprovalCreateResult {
-        self.approval_mutex.lock();
-        defer self.approval_mutex.unlock();
+        const result = blk: {
+            self.approval_mutex.lock();
+            defer self.approval_mutex.unlock();
 
-        var rnd: [16]u8 = undefined;
-        std.crypto.random.bytes(&rnd);
-        const token = try std.fmt.allocPrint(self.allocator, "apr-{d}-{s}", .{
-            std.time.milliTimestamp(),
-            std.fmt.fmtSliceHexLower(&rnd),
-        });
-        errdefer self.allocator.free(token);
-        const now = std.time.milliTimestamp();
-        const entry = ApprovalEntry{
-            .method = try self.allocator.dupe(u8, method),
-            .path = try self.allocator.dupe(u8, path),
-            .identity = try self.allocator.dupe(u8, identity),
-            .command_id = try self.allocator.dupe(u8, command_id orelse ""),
-            .status = .pending,
-            .created_ms = now,
-            .expires_ms = now + APPROVAL_TIMEOUT_MS,
-            .decided_ms = 0,
-            .decided_by = try self.allocator.dupe(u8, ""),
+            // Rate-limit: cap pending approvals per identity.
+            if (self.approval_max_pending_per_identity > 0) {
+                if (self.approvalCountPendingForIdentityLocked(identity) >= self.approval_max_pending_per_identity) {
+                    return error.TooManyPendingApprovals;
+                }
+            }
+
+            var rnd: [16]u8 = undefined;
+            std.crypto.random.bytes(&rnd);
+            const token = try std.fmt.allocPrint(self.allocator, "apr-{d}-{s}", .{
+                std.time.milliTimestamp(),
+                std.fmt.fmtSliceHexLower(&rnd),
+            });
+            errdefer self.allocator.free(token);
+            const now = std.time.milliTimestamp();
+            const expires_ms = now + self.approval_ttl_ms;
+            const entry = ApprovalEntry{
+                .method = try self.allocator.dupe(u8, method),
+                .path = try self.allocator.dupe(u8, path),
+                .identity = try self.allocator.dupe(u8, identity),
+                .command_id = try self.allocator.dupe(u8, command_id orelse ""),
+                .status = .pending,
+                .created_ms = now,
+                .expires_ms = expires_ms,
+                .decided_ms = 0,
+                .decided_by = try self.allocator.dupe(u8, ""),
+            };
+            try self.approvals.put(token, entry);
+            break :blk ApprovalCreateResult{
+                .token = try allocator.dupe(u8, token),
+                .expires_ms = expires_ms,
+            };
         };
-        try self.approvals.put(token, entry);
-        return .{
-            .token = try allocator.dupe(u8, token),
-            .expires_ms = entry.expires_ms,
-        };
+        // Persist outside the mutex.
+        self.persistApprovals();
+        return result;
     }
 
     fn approvalRespond(self: *GatewayState, token: []const u8, decision: ApprovalDecision, actor: []const u8) bool {
-        self.approval_mutex.lock();
-        defer self.approval_mutex.unlock();
-        const entry = self.approvals.getPtr(token) orelse return false;
-        self.approvalEscalateIfExpiredLocked(entry);
-        if (entry.status != .pending) return false;
-        entry.status = if (decision == .approve) .approved else .denied;
-        entry.decided_ms = std.time.milliTimestamp();
-        self.allocator.free(entry.decided_by);
-        entry.decided_by = self.allocator.dupe(u8, actor) catch self.allocator.dupe(u8, "") catch return false;
-        return true;
+        var webhook_payload: ?[]u8 = null;
+        defer if (webhook_payload) |p| self.allocator.free(p);
+
+        const success = blk: {
+            self.approval_mutex.lock();
+            defer self.approval_mutex.unlock();
+            const entry = self.approvals.getPtr(token) orelse break :blk false;
+            if (approvalEscalateIfExpiredLocked(entry) and !entry.escalation_fired) {
+                entry.escalation_fired = true;
+                webhook_payload = self.buildApprovalWebhookPayloadLocked(token, entry);
+            }
+            if (entry.status != .pending) break :blk false;
+            entry.status = if (decision == .approve) .approved else .denied;
+            entry.decided_ms = std.time.milliTimestamp();
+            self.allocator.free(entry.decided_by);
+            entry.decided_by = self.allocator.dupe(u8, actor) catch self.allocator.dupe(u8, "") catch break :blk false;
+            break :blk true;
+        };
+
+        if (webhook_payload) |p| {
+            http.approval_store.fireWebhook(self.allocator, self.approval_escalation_webhook, p);
+        }
+        if (success) self.persistApprovals();
+        return success;
     }
 
     fn approvalValidate(self: *GatewayState, token: []const u8, method: []const u8, path: []const u8, identity: ?[]const u8) ApprovalValidation {
-        self.approval_mutex.lock();
-        defer self.approval_mutex.unlock();
-        const entry = self.approvals.getPtr(token) orelse return .missing;
-        self.approvalEscalateIfExpiredLocked(entry);
-        if (!http.rewrite.methodMatches(entry.method, method)) return .invalid;
-        if (!http.rewrite.regexMatches(entry.path, path)) return .invalid;
-        if (identity) |id| {
-            if (entry.identity.len > 0 and !std.mem.eql(u8, entry.identity, id)) return .invalid;
-        }
-        return switch (entry.status) {
-            .pending => .pending,
-            .approved => .approved,
-            .denied => .denied,
-            .escalated => .escalated,
+        var webhook_payload: ?[]u8 = null;
+        defer if (webhook_payload) |p| self.allocator.free(p);
+
+        const result = blk: {
+            self.approval_mutex.lock();
+            defer self.approval_mutex.unlock();
+            const entry = self.approvals.getPtr(token) orelse break :blk ApprovalValidation.missing;
+            if (approvalEscalateIfExpiredLocked(entry) and !entry.escalation_fired) {
+                entry.escalation_fired = true;
+                webhook_payload = self.buildApprovalWebhookPayloadLocked(token, entry);
+            }
+            if (!http.rewrite.methodMatches(entry.method, method)) break :blk ApprovalValidation.invalid;
+            if (!http.rewrite.regexMatches(entry.path, path)) break :blk ApprovalValidation.invalid;
+            if (identity) |id| {
+                if (entry.identity.len > 0 and !std.mem.eql(u8, entry.identity, id)) break :blk ApprovalValidation.invalid;
+            }
+            break :blk switch (entry.status) {
+                .pending => ApprovalValidation.pending,
+                .approved => ApprovalValidation.approved,
+                .denied => ApprovalValidation.denied,
+                .escalated => ApprovalValidation.escalated,
+            };
         };
+
+        if (webhook_payload) |p| {
+            http.approval_store.fireWebhook(self.allocator, self.approval_escalation_webhook, p);
+        }
+        return result;
     }
 
     fn approvalSnapshotJson(self: *GatewayState, allocator: std.mem.Allocator, token: []const u8) ?[]const u8 {
-        self.approval_mutex.lock();
-        defer self.approval_mutex.unlock();
-        const entry = self.approvals.getPtr(token) orelse return null;
-        self.approvalEscalateIfExpiredLocked(entry);
-        const command_id_json = if (entry.command_id.len > 0)
-            std.fmt.allocPrint(allocator, "\"{s}\"", .{entry.command_id}) catch return null
-        else
-            allocator.dupe(u8, "null") catch return null;
-        defer allocator.free(command_id_json);
-        const decided_by_json = if (entry.decided_by.len > 0)
-            std.fmt.allocPrint(allocator, "\"{s}\"", .{entry.decided_by}) catch return null
-        else
-            allocator.dupe(u8, "null") catch return null;
-        defer allocator.free(decided_by_json);
-        return std.fmt.allocPrint(allocator, "{{\"approval_token\":\"{s}\",\"status\":\"{s}\",\"method\":\"{s}\",\"path\":\"{s}\",\"identity\":\"{s}\",\"command_id\":{s},\"created_ms\":{d},\"expires_ms\":{d},\"decided_ms\":{d},\"decided_by\":{s}}}", .{
-            token,
-            @tagName(entry.status),
-            entry.method,
-            entry.path,
-            entry.identity,
-            command_id_json,
-            entry.created_ms,
-            entry.expires_ms,
-            entry.decided_ms,
-            decided_by_json,
-        }) catch null;
+        var webhook_payload: ?[]u8 = null;
+        defer if (webhook_payload) |p| self.allocator.free(p);
+
+        const json = blk: {
+            self.approval_mutex.lock();
+            defer self.approval_mutex.unlock();
+            const entry = self.approvals.getPtr(token) orelse break :blk @as(?[]const u8, null);
+            if (approvalEscalateIfExpiredLocked(entry) and !entry.escalation_fired) {
+                entry.escalation_fired = true;
+                webhook_payload = self.buildApprovalWebhookPayloadLocked(token, entry);
+            }
+            const command_id_json = if (entry.command_id.len > 0)
+                std.fmt.allocPrint(allocator, "\"{s}\"", .{entry.command_id}) catch break :blk @as(?[]const u8, null)
+            else
+                allocator.dupe(u8, "null") catch break :blk @as(?[]const u8, null);
+            defer allocator.free(command_id_json);
+            const decided_by_json = if (entry.decided_by.len > 0)
+                std.fmt.allocPrint(allocator, "\"{s}\"", .{entry.decided_by}) catch break :blk @as(?[]const u8, null)
+            else
+                allocator.dupe(u8, "null") catch break :blk @as(?[]const u8, null);
+            defer allocator.free(decided_by_json);
+            break :blk std.fmt.allocPrint(allocator, "{{\"approval_token\":\"{s}\",\"status\":\"{s}\",\"method\":\"{s}\",\"path\":\"{s}\",\"identity\":\"{s}\",\"command_id\":{s},\"created_ms\":{d},\"expires_ms\":{d},\"decided_ms\":{d},\"decided_by\":{s}}}", .{
+                token,
+                @tagName(entry.status),
+                entry.method,
+                entry.path,
+                entry.identity,
+                command_id_json,
+                entry.created_ms,
+                entry.expires_ms,
+                entry.decided_ms,
+                decided_by_json,
+            }) catch null;
+        };
+
+        if (webhook_payload) |p| {
+            http.approval_store.fireWebhook(self.allocator, self.approval_escalation_webhook, p);
+        }
+        return json;
     }
 
-    fn approvalEscalateIfExpiredLocked(_: *GatewayState, entry: *ApprovalEntry) void {
-        if (entry.status != .pending) return;
+    /// Returns true if the entry was JUST escalated (status transitioned from pending).
+    /// Must be called with approval_mutex held.
+    fn approvalEscalateIfExpiredLocked(entry: *ApprovalEntry) bool {
+        if (entry.status != .pending) return false;
         const now = std.time.milliTimestamp();
         if (now >= entry.expires_ms) {
             entry.status = .escalated;
             entry.decided_ms = now;
+            return true;
         }
+        return false;
+    }
+
+    /// Count pending approvals for a given identity. Must be called with approval_mutex held.
+    fn approvalCountPendingForIdentityLocked(self: *GatewayState, identity: []const u8) u32 {
+        var count: u32 = 0;
+        var it = self.approvals.iterator();
+        while (it.next()) |kv| {
+            const e = kv.value_ptr.*;
+            if (e.status == .pending and std.mem.eql(u8, e.identity, identity)) {
+                count += 1;
+            }
+        }
+        return count;
+    }
+
+    /// Build a JSON payload for the escalation webhook. Must be called with approval_mutex held.
+    /// Returns an allocator-owned slice or null on OOM.
+    fn buildApprovalWebhookPayloadLocked(self: *GatewayState, token: []const u8, entry: *const ApprovalEntry) ?[]u8 {
+        const command_id_part = if (entry.command_id.len > 0)
+            std.fmt.allocPrint(self.allocator, "\"{s}\"", .{entry.command_id}) catch return null
+        else
+            self.allocator.dupe(u8, "null") catch return null;
+        defer self.allocator.free(command_id_part);
+        return std.fmt.allocPrint(self.allocator,
+            "{{\"event\":\"escalated\",\"approval_token\":\"{s}\",\"method\":\"{s}\",\"path\":\"{s}\",\"identity\":\"{s}\",\"command_id\":{s},\"created_ms\":{d},\"expires_ms\":{d}}}",
+            .{ token, entry.method, entry.path, entry.identity, command_id_part, entry.created_ms, entry.expires_ms },
+        ) catch null;
+    }
+
+    /// Snapshot all approval entries into a slice suitable for persistence.
+    /// Must be called with approval_mutex held. Caller frees via http.approval_store.freeLoaded.
+    fn approvalSnapshotEntriesLocked(self: *GatewayState, allocator: std.mem.Allocator) ![]http.approval_store.StoredApproval {
+        var out = try allocator.alloc(http.approval_store.StoredApproval, self.approvals.count());
+        var i: usize = 0;
+        errdefer {
+            for (out[0..i]) |e| {
+                allocator.free(e.token);
+                allocator.free(e.method);
+                allocator.free(e.path);
+                allocator.free(e.identity);
+                allocator.free(e.command_id);
+                allocator.free(e.status);
+                allocator.free(e.decided_by);
+            }
+            allocator.free(out);
+        }
+        var it = self.approvals.iterator();
+        while (it.next()) |kv| {
+            const e = kv.value_ptr.*;
+            out[i] = .{
+                .token = try allocator.dupe(u8, kv.key_ptr.*),
+                .method = try allocator.dupe(u8, e.method),
+                .path = try allocator.dupe(u8, e.path),
+                .identity = try allocator.dupe(u8, e.identity),
+                .command_id = try allocator.dupe(u8, e.command_id),
+                .status = try allocator.dupe(u8, @tagName(e.status)),
+                .created_ms = e.created_ms,
+                .expires_ms = e.expires_ms,
+                .decided_ms = e.decided_ms,
+                .decided_by = try allocator.dupe(u8, e.decided_by),
+                .escalation_fired = e.escalation_fired,
+            };
+            i += 1;
+        }
+        return out[0..i];
+    }
+
+    /// Persist all approvals to disk (no-op when store path is unconfigured).
+    fn persistApprovals(self: *GatewayState) void {
+        if (self.approval_store_path.len == 0) return;
+        const snapshot = blk: {
+            self.approval_mutex.lock();
+            defer self.approval_mutex.unlock();
+            break :blk self.approvalSnapshotEntriesLocked(self.allocator) catch return;
+        };
+        defer http.approval_store.freeLoaded(self.allocator, snapshot);
+        http.approval_store.persist(self.allocator, self.approval_store_path, snapshot) catch |err| {
+            self.logger.warn(null, "approval store persist failed: {}", .{err});
+        };
     }
 
     fn circuitTryAcquire(self: *GatewayState) bool {
@@ -1508,6 +1655,38 @@ const ConnectionSessionPool = struct {
     }
 };
 
+/// Load persisted approvals from disk into state at startup.
+/// Prunes entries older than 1 hour that are no longer pending.
+fn loadApprovalStore(state: *GatewayState) !void {
+    const stored = try http.approval_store.load(state.allocator, state.approval_store_path);
+    defer http.approval_store.freeLoaded(state.allocator, stored);
+
+    const now = std.time.milliTimestamp();
+    const retention_ms: i64 = 3_600_000; // 1 hour retention for decided entries
+
+    for (stored) |s| {
+        const status = std.meta.stringToEnum(ApprovalStatus, s.status) orelse .escalated;
+        // Prune old decided entries; always keep pending ones.
+        if (status != .pending and s.decided_ms > 0 and (now - s.decided_ms) > retention_ms) {
+            continue;
+        }
+        const token_key = state.allocator.dupe(u8, s.token) catch continue;
+        const entry = ApprovalEntry{
+            .method = state.allocator.dupe(u8, s.method) catch { state.allocator.free(token_key); continue; },
+            .path = state.allocator.dupe(u8, s.path) catch { state.allocator.free(token_key); continue; },
+            .identity = state.allocator.dupe(u8, s.identity) catch { state.allocator.free(token_key); continue; },
+            .command_id = state.allocator.dupe(u8, s.command_id) catch { state.allocator.free(token_key); continue; },
+            .status = status,
+            .created_ms = s.created_ms,
+            .expires_ms = s.expires_ms,
+            .decided_ms = s.decided_ms,
+            .decided_by = state.allocator.dupe(u8, s.decided_by) catch { state.allocator.free(token_key); continue; },
+            .escalation_fired = s.escalation_fired,
+        };
+        state.approvals.put(token_key, entry) catch { state.allocator.free(token_key); };
+    }
+}
+
 pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -1582,8 +1761,20 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         .fd_to_ip = std.AutoHashMap(std.posix.fd_t, []u8).init(state_allocator),
         .command_lifecycle = std.StringHashMap(CommandLifecycleEntry).init(state_allocator),
         .approvals = std.StringHashMap(ApprovalEntry).init(state_allocator),
+        .approval_store_path = cfg.approval_store_path,
+        .approval_escalation_webhook = cfg.approval_escalation_webhook,
+        .approval_ttl_ms = if (cfg.approval_ttl_ms > 0) cfg.approval_ttl_ms else APPROVAL_TIMEOUT_MS_DEFAULT,
+        .approval_max_pending_per_identity = cfg.approval_max_pending_per_identity,
     };
     defer state.deinit();
+
+    // Load approval state from persistent store (if configured).
+    if (cfg.approval_store_path.len > 0) {
+        loadApprovalStore(&state) catch |err| {
+            state.logger.warn(null, "failed to load approval store '{s}': {}", .{ cfg.approval_store_path, err });
+        };
+    }
+
     http.access_log.init(state_allocator, .{
         .format = cfg.access_log_format,
         .custom_template = cfg.access_log_template,

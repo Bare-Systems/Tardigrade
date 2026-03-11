@@ -60,6 +60,7 @@ pub const scgi = @import("http/scgi.zig");
 pub const memcached = @import("http/memcached.zig");
 pub const config_file = @import("http/config_file.zig");
 pub const secrets = @import("http/secrets.zig");
+pub const approval_store = @import("http/approval_store.zig");
 
 // Re-export constants
 pub const MAX_HEADERS = headers.MAX_HEADERS;

@@ -382,6 +382,14 @@ pub const EdgeConfig = struct {
     udp_proxy_upstream: []const u8,
     /// Enable stream-module SSL termination mode for stream proxy routes.
     stream_ssl_termination: bool,
+    /// Path for persistent approval store file (empty = in-memory only).
+    approval_store_path: []const u8,
+    /// Approval request TTL in milliseconds (default 300000 = 5 minutes).
+    approval_ttl_ms: i64,
+    /// Webhook URL for escalation notifications (empty = disabled).
+    approval_escalation_webhook: []const u8,
+    /// Max concurrent pending approval requests per identity (0 = unlimited).
+    approval_max_pending_per_identity: u32,
 
     pub fn deinit(self: *EdgeConfig, allocator: std.mem.Allocator) void {
         allocator.free(self.listen_host);
@@ -522,6 +530,8 @@ pub const EdgeConfig = struct {
         allocator.free(self.pop3_upstream);
         allocator.free(self.tcp_proxy_upstream);
         allocator.free(self.udp_proxy_upstream);
+        allocator.free(self.approval_store_path);
+        allocator.free(self.approval_escalation_webhook);
         self.* = undefined;
     }
 };
@@ -1150,6 +1160,13 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     errdefer allocator.free(udp_proxy_upstream);
     const stream_ssl_termination = parseBoolEnv(allocator, "TARDIGRADE_STREAM_SSL_TERMINATION", false);
 
+    const approval_store_path = envOrDefault(allocator, "TARDIGRADE_APPROVAL_STORE_PATH", "") catch unreachable;
+    errdefer allocator.free(approval_store_path);
+    const approval_ttl_ms = parseIntEnv(i64, allocator, "TARDIGRADE_APPROVAL_TTL_MS", 300_000);
+    const approval_escalation_webhook = envOrDefault(allocator, "TARDIGRADE_APPROVAL_ESCALATION_WEBHOOK", "") catch unreachable;
+    errdefer allocator.free(approval_escalation_webhook);
+    const approval_max_pending_per_identity = parseIntEnv(u32, allocator, "TARDIGRADE_APPROVAL_MAX_PENDING_PER_IDENTITY", 10);
+
     return .{
         .listen_host = listen_host,
         .listen_port = listen_port,
@@ -1318,6 +1335,10 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .tcp_proxy_upstream = tcp_proxy_upstream,
         .udp_proxy_upstream = udp_proxy_upstream,
         .stream_ssl_termination = stream_ssl_termination,
+        .approval_store_path = approval_store_path,
+        .approval_ttl_ms = approval_ttl_ms,
+        .approval_escalation_webhook = approval_escalation_webhook,
+        .approval_max_pending_per_identity = approval_max_pending_per_identity,
     };
 }
 

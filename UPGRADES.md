@@ -480,24 +480,24 @@ implementation exists. This is a stub.
 
 - [x] TCP stream relay for SMTP (port 25 / 587 / 465)
 - [x] STARTTLS upgrade support
-- [ ] Auth header injection for upstream relay
+- [x] Auth header injection for upstream relay
 - [x] `smtp_pass` config directive
 
 ### 11.1 IMAP Proxy
 
-- [ ] TCP stream relay for IMAP (port 143 / 993)
-- [ ] STARTTLS support
-- [ ] `imap_pass` config directive
+- [x] TCP stream relay for IMAP (port 143 / 993)
+- [x] STARTTLS support
+- [x] `imap_pass` config directive
 
 ### 11.2 POP3 Proxy
 
-- [ ] TCP stream relay for POP3 (port 110 / 995)
-- [ ] `pop3_pass` config directive
+- [x] TCP stream relay for POP3 (port 110 / 995)
+- [x] `pop3_pass` config directive
 
 ### 11.3 Tests
 
 - [x] Integration test: SMTP relay forwards EHLO and DATA through to test upstream
-- [ ] Integration test: IMAP LOGIN command is proxied and response returned to client
+- [x] Integration test: IMAP LOGIN command is proxied and response returned to client
 
 ---
 

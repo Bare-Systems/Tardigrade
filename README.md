@@ -1,10 +1,3 @@
-<p align="center">
-  <a href="./README.md"><strong>README</strong></a>
-  &nbsp;&nbsp;|&nbsp;&nbsp;
-  <a href="./CONTRIBUTING.md"><strong>Contributing</strong></a>
-  &nbsp;&nbsp;|&nbsp;&nbsp;
-  <a href="./LICENSE"><strong>Apache-2.0 License</strong></a>
-</p>
 
 <h1 align="center">Tardigrade</h1>
 

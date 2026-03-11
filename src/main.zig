@@ -23,11 +23,12 @@ pub fn main() !void {
 
     var cfg = try edge_config.loadFromEnv(allocator);
     defer cfg.deinit(allocator);
+    try edge_config.validate(&cfg);
     try configureErrorLog(&cfg);
     try writePidFile(&cfg);
     defer removePidFile(&cfg);
     if (validate_flag) {
-        std.debug.print("configuration valid\\n", .{});
+        std.debug.print("configuration valid\n", .{});
         return;
     }
 
@@ -51,6 +52,14 @@ fn configureErrorLog(cfg: *const edge_config.EdgeConfig) !void {
             try rotateLogFiles(std.fs.cwd(), cfg.error_log_path, rotate_max_files);
         }
     }
+    var file = try std.fs.cwd().createFile(cfg.error_log_path, .{ .truncate = false, .read = false });
+    defer file.close();
+    try file.seekFromEnd(0);
+    try std.posix.dup2(file.handle, std.io.getStdErr().handle);
+}
+
+fn reopenErrorLog(cfg: *const edge_config.EdgeConfig) !void {
+    if (cfg.error_log_path.len == 0 or std.ascii.eqlIgnoreCase(cfg.error_log_path, "stderr")) return;
     var file = try std.fs.cwd().createFile(cfg.error_log_path, .{ .truncate = false, .read = false });
     defer file.close();
     try file.seekFromEnd(0);
@@ -89,7 +98,7 @@ fn writePidFile(cfg: *const edge_config.EdgeConfig) !void {
     if (cfg.pid_file.len == 0) return;
     var file = try std.fs.cwd().createFile(cfg.pid_file, .{ .truncate = true, .read = false });
     defer file.close();
-    try file.writer().print("{d}\n", .{std.posix.getpid()});
+    try file.writer().print("{d}\n", .{std.c.getpid()});
 }
 
 fn removePidFile(cfg: *const edge_config.EdgeConfig) void {
@@ -149,13 +158,15 @@ fn runMaster(allocator: std.mem.Allocator, cfg: *const edge_config.EdgeConfig) !
             http.shutdown.requestShutdown();
             break;
         }
+        if (http.shutdown.consumeReopenLogsRequested()) {
+            reopenErrorLog(cfg) catch {};
+        }
 
         for (0..worker_count) |i| {
-            if (children[i].tryWait()) |status_opt| {
-                if (status_opt != null and !http.shutdown.isShutdownRequested()) {
-                    children[i] = try spawnWorker(allocator, exe_path, i);
-                }
-            } else |_| {}
+            const wait_result = std.posix.waitpid(children[i].id, std.posix.W.NOHANG);
+            if (wait_result.pid == children[i].id and !http.shutdown.isShutdownRequested()) {
+                children[i] = try spawnWorker(allocator, exe_path, i);
+            }
         }
         std.time.sleep(250 * std.time.ns_per_ms);
     }

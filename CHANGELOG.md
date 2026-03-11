@@ -1,6 +1,215 @@
 
 # Changelog
 
+## [0.31.0] - 2026-03-xx
+
+### Added
+- Integration harness cleanup:
+  - Split `tests/integration.zig` into explicit generic-server boots and optional BearClaw-profile boots sourced from `examples/bearclaw/`.
+  - Added fixture generation from the BearClaw example config/env, layered config support, and deterministic harness-owned port/log overrides.
+  - BearClaw-profile boots now default to HTTP for generic app-fixture tests and only enable fixture TLS when a test explicitly requests TLS/HTTP3 behavior.
+  - Removed the deleted built-in application-surface assumptions from the live integration target by trimming the suite down to generic config-defined routing, reload, and static-file cases; removed product-surface tests are now skipped instead of failing against the generic core.
+  - `zig build test` and `zig build test-integration` are green again after the harness split.
+- Documentation refresh:
+  - Reworked the top of `README.md` into a centered project header with navigation links, badges,
+    and a clearer summary of Tardigrade’s server and gateway roles.
+  - Added `CONTRIBUTING.md` with the repo’s actual upgrade-driven workflow, testing commands,
+    and documentation expectations.
+  - Removed product-specific naming from the root docs and added an isolated example deployment
+    bundle under `examples/` for the application-specific gateway setup.
+- Upgrade 12 approval workflow hardening:
+  - Added `src/http/approval_store.zig` with atomic JSON-file persistence (`persist` + `load`)
+    and a best-effort escalation webhook (`fireWebhook` via `std.http.Client`).
+  - Added four new env-driven config fields: `TARDIGRADE_APPROVAL_STORE_PATH`,
+    `TARDIGRADE_APPROVAL_TTL_MS`, `TARDIGRADE_APPROVAL_ESCALATION_WEBHOOK`, and
+    `TARDIGRADE_APPROVAL_MAX_PENDING_PER_IDENTITY`.
+  - Pending approvals are now persisted on create/decide and reloaded on startup; decided
+    entries older than one hour are pruned on load.
+  - Added per-identity pending-approval rate limiting: exceeding the configured cap returns
+    429 Too Many Requests on both HTTP/1.1 and HTTP/3 paths.
+  - Expired approvals auto-escalate to `"escalated"` status; escalation webhook fires
+    outside the approval mutex for best-effort delivery.
+  - Added integration tests covering the full approval round-trip, double-respond conflict
+    (409), per-identity rate limiting (429), and store persistence across server restart.
+- Upgrade 13 mux observability and channel-cap hardening:
+  - Added mux metrics for active mux websocket connections, total active mux subscriptions,
+    per-device mux channel counts, and mux frame errors.
+  - Added `TARDIGRADE_MUX_MAX_CHANNELS_PER_DEVICE` and enforced per-device channel caps in
+    `/v1/ws/mux`.
+  - Added live integration coverage proving mux metrics update while a socket is open, invalid
+    mux frames increment the error counter, and a second subscription is rejected when the
+    per-device cap is set to `1`.
+  - Wired mux channel polling into the live websocket loop so subscribed event frames and async
+    command lifecycle updates are actually emitted over `/v1/ws/mux`.
+  - Added live mux integration coverage for unauthorized `401`, missing `X-Device-ID` `400`,
+    subscribe-plus-publish event delivery, and async `command.update` delivery.
+  - Added live two-client mux isolation coverage proving device A cannot receive events
+    published onto device B’s namespaced topic, even when both subscribe to the same logical
+    channel name.
+  - Added `TARDIGRADE_MUX_WRITE_BUFFER_MAX` and a bounded per-socket mux pending-frame queue;
+    when queued mux event/update frames exceed the configured byte budget, the oldest queued
+    frames are dropped and an explicit `{"type":"overflow","dropped":N}` notice is sent.
+  - Added live overflow coverage proving queued mux event delivery drops older frames and emits
+    the overflow notice once the bounded write buffer is exceeded.
+  - Added `last_event_id` replay on mux `subscribe` plus `TARDIGRADE_MUX_RECONNECT_GRACE_MS`
+    state restoration, allowing a reconnecting device to replay missed mux events either
+    explicitly by sequence ID or implicitly by reconnecting within the grace window.
+  - Added live replay coverage for explicit `last_event_id` resume and reconnect-within-grace
+    delivery of missed mux events.
+
+## [0.30.0] - 2026-03-xx
+
+### Added
+- Completed the remaining Upgrade 11.0 SMTP auth relay slice by injecting `X-Tardigrade-Auth-Identity` into relayed SMTP `DATA` message headers for authenticated requests, with integration coverage against the test upstream.
+- Added live IMAP and POP3 mail-relay coverage, proving `imap_pass` and `pop3_pass` relay LOGIN/USER/PASS command traffic through the existing raw mail proxy path.
+- Added IMAP STARTTLS upstream support for `imap_pass starttls://...`, including a live integration harness; on macOS the harness is currently skipped because the local Zig test runner intermittently disconnects before the STARTTLS exchange even though the relay path works in direct manual repros.
+- Upgrade 1 integration-test harness foundation:
+  - Added a live-process `tests/integration.zig` suite that boots Tardigrade with deterministic env config.
+  - Added a loopback upstream test server to exercise real proxy requests over TCP.
+  - Added `zig build test-integration` and CI coverage for unit + integration test runs.
+  - Added coverage for `/metrics` Prometheus output and moved JSON metrics output to `/metrics/json` while preserving `/metrics/prometheus`.
+  - Added integration coverage for JWT, device auth, session lifecycle, rate limiting, proxy cache stale refresh, hot reload, and graceful shutdown flows.
+  - Added integration coverage for proxy forwarding fidelity, upstream `Cache-Control: no-store` cache bypass, and upstream 5xx retry handling.
+  - Added integration coverage for single-hop upstream redirect following and `Connection: close` on keep-alive responses during graceful shutdown.
+  - Added TLS integration coverage for self-signed HTTPS health checks and mTLS rejection of clients signed by an untrusted CA.
+  - Added TLS graceful-drain coverage that verifies in-flight HTTPS responses switch to `Connection: close` during shutdown.
+  - Added SNI integration coverage that verifies `sni.integration.test` presents the configured alternate certificate while unknown hostnames keep the default certificate.
+  - Added concurrency integration coverage for 100 parallel chat requests and worker-queue saturation with queue-rejection metrics.
+  - Added concurrent mixed bearer-auth and session-auth chat coverage to prove auth-plus-rate-limit contention does not deadlock the shared gateway state path.
+  - Added graceful-shutdown exit coverage that verifies the gateway process exits promptly after drain, closes the listener, and logs shutdown completion.
+  - Added saturation-ordering coverage that verifies a single-worker queue drains accepted `/v1/chat` requests in the same order they were admitted.
+- Upgrade 2 active upstream health-check foundation:
+  - Added `src/http/health_checker.zig` with explicit up/down/half-open transition logic and unit coverage.
+  - Added integration coverage for active probe down detection, rerouting away from failed upstreams, recovery after probe successes, and degraded `/health` reporting.
+  - Added Upgrade 2 env aliases for upstream probe settings on top of the existing active-probe settings.
+  - Added active probe success-status config with a default range plus exact upstream URL overrides for non-2xx health endpoints.
+- Upgrade 3 HTTP/3 ngtcp2/nghttp3 foundation:
+  - Added opt-in build wiring for `ngtcp2`, `ngtcp2_crypto_ossl`, and `nghttp3` via `-Denable-http3-ngtcp2=true`.
+  - Added `src/http/ngtcp2_binding.zig` as a compile-safe ngtcp2/nghttp3 wrapper seam gated by build options.
+  - Added `src/http/http3_handler.zig` with initial `Alt-Svc` formatting and pseudo-header-to-request mapping helpers.
+  - Added HTTP/3 stream-assembly helpers in `src/http/http3_session.zig` for split HEADERS/DATA accumulation and response header-block encoding.
+  - Added a compile-safe nghttp3 server-session wrapper in `src/http/http3_session.zig` with control/QPACK stream binding and response-submission plumbing.
+  - Added `TARDIGRADE_QUIC_PORT` config support and `src/http/http3_runtime.zig` as the first UDP listener/bootstrap path for future ngtcp2 packet handling.
+  - Added HTTP/1.1 `Alt-Svc` advertisement for configured HTTP/3 endpoints and integration coverage for that header on `/health`.
+  - Added initial QUIC datagram parsing and connection-ID tracking in the HTTP/3 runtime as groundwork for real migration handling.
+  - Added TLS cert/key/version plumbing from gateway config into the HTTP/3 bootstrap seam, plus a warning when HTTP/3 is enabled without TLS material.
+  - Added one-time QUIC bootstrap server state in the HTTP/3 runtime so datagrams are handled against persistent bootstrap state instead of reinitializing per packet.
+  - Added a first QUIC-specific OpenSSL TLS context setup path in the ngtcp2 binding seam, including TLS 1.3 enforcement and cert/key loading.
+  - Added `/health` reporting for HTTP/3 configuration state and QUIC port, plus integration coverage for the incomplete-TLS QUIC configuration case.
+  - Added native ngtcp2 server-connection creation for Initial packets, real `ngtcp2_conn_read_pkt` processing, and HTTP/3 runtime snapshot surfacing for handshake/read state on `/health`.
+  - Added HTTP/3-enabled unit coverage for native packet-read state tracking in `src/http/ngtcp2_binding.zig`.
+  - Added guarded QUIC packet output attempts via `ngtcp2_conn_write_pkt` after successful packet ingest, plus `/health` surfacing for emitted packet and byte counts.
+  - Verified the opt-in HTTP/3 build path against installed `libngtcp2`, `libngtcp2_crypto_ossl`, and `libnghttp3` system packages.
+  - Added per-connection nghttp3 session ownership in the ngtcp2 binding, including QUIC stream-data callbacks, stream-close cleanup, and `/health` surfacing for received HTTP/3 stream bytes and completed request assemblies.
+  - Added HTTP/3 runtime fixes for stable thread lifetime, correct nonblocking UDP setup, TLS 1.3 QUIC bootstrap, ALPN `h3` selection, Initial-packet acceptance gating, and timer-driven ngtcp2 expiry handling.
+  - Added HTTP/3 diagnostics surfacing for ngtcp2 error names on `/health` and in runtime logs while driving live `curl --http3-only` handshake probes.
+  - Added pending ngtcp2 write flushing after QUIC reads and expiry ticks so the runtime drains all immediately available handshake output instead of stopping after the first send attempt.
+  - Added live QUIC-handshake alignment with the upstream ngtcp2 server by passing the client packet SCID into `ngtcp2_conn_server_new`, seeding a real server transport-parameter set, enabling QUIC TLS early data, and using stricter `h3` ALPN selection.
+  - Added the first live HTTP/3 loopback integration test using Homebrew `curl --http3-only`, verifying `/health` completes successfully over QUIC.
+  - Added a gateway-owned HTTP/3 request-dispatch seam so ngtcp2/nghttp3 can hand completed requests back to edge logic instead of hardcoding the transport response in the binding layer.
+  - Added HTTP/3 response-body streaming via an nghttp3 data reader for gateway-owned responses, and extended the loopback QUIC integration test to assert the real `/health` JSON body.
+  - Added gateway-backed HTTP/3 dispatch for `/metrics`, `/metrics/json`, and `/metrics/prometheus`, plus live QUIC integration coverage for Prometheus metrics over HTTP/3.
+  - Added HTTP/3 concurrent-stream integration coverage proving one QUIC connection can serve independent `/health` and `/metrics/json` responses in parallel.
+  - Added authenticated `/admin/routes` coverage over HTTP/3, exercising header propagation and bearer-token authorization on the gateway-backed QUIC path.
+  - Added dynamic `/admin/connections` coverage over HTTP/3 so the gateway-backed QUIC path now serves live admin state in addition to static admin metadata.
+  - Added `/admin/upstreams` coverage over HTTP/3 so the gateway-backed QUIC path can serve dynamic upstream-state JSON on authenticated admin routes.
+  - Added a dedicated `handleHttp3Connection()` gateway entry point so HTTP/3 route dispatch now lives behind a stable edge-gateway function instead of directly inside the ngtcp2 callback adapter.
+  - Added gateway-backed `/v1/chat` handling over HTTP/3, with live QUIC coverage for both unauthorized and successful proxied chat requests.
+  - Added gateway-backed `/v1/commands` handling over HTTP/3, with live QUIC coverage for both unauthorized and successful proxied command requests.
+  - Added gateway-backed `/v1/commands/status` handling over HTTP/3, with live QUIC coverage for authenticated lifecycle snapshot reads after command execution.
+  - Added gateway-backed approvals workflow handling over HTTP/3, with live QUIC coverage for request, respond, and status operations.
+  - Added gateway-backed `/v1/sessions` handling over HTTP/3, with live QUIC coverage for session creation, listing, and revocation.
+  - Added gateway-backed `/v1/cache/purge` handling over HTTP/3, with live QUIC coverage that purges an existing proxy-cache entry and forces the next upstream fetch to miss.
+  - Added gateway-backed `/v1/devices/register` handling over HTTP/3, with live QUIC coverage for authenticated device registration.
+  - Added gateway-backed `/v1/sessions/refresh` handling over HTTP/3, with live QUIC coverage for session-token refresh and rotated token headers.
+  - Archived the old QUIC parser/tracker stub as `src/http/quic_stub.zig` and repointed live HTTP/3 imports at that explicit stub name now that real transport ownership lives in `ngtcp2_binding.zig`.
+  - Removed the old standalone `src/http/qpack.zig` stub by inlining the remaining literal header-block helper into `src/http/http3_session.zig` and repointing HTTP/3 handler code at the session-layer types.
+  - Added a dedicated HTTP/3 resumption harness (`tests/http3_resumption_client.zig`) that drives the upstream ngtcp2/OpenSSL `osslclient` with TLS session and QUIC transport-parameter reuse to prove 0-RTT over the live Tardigrade QUIC listener.
+  - Started Upgrade 4 FastCGI protocol implementation by replacing the envelope-only FastCGI bridge with full record framing, CGI env construction, response parsing, and end-to-end integration coverage against an in-repo FastCGI mock server.
+  - Added FastCGI upstream connection reuse with a per-endpoint keep-conn socket pool and integration coverage proving sequential requests reuse the same backend connection.
+  - Added FastCGI request-ID tracking on reused backend sockets, including target-request response parsing and integration coverage that verifies request IDs advance across a reused FastCGI connection.
+  - Completed Upgrade 4.1 SCGI by replacing the request-only stub with full SCGI CGI-env encoding, parsed response handling, and end-to-end integration coverage against an in-repo SCGI mock server.
+  - Started Upgrade 4.2 uWSGI by replacing the request-only stub with full variable-packet encoding, parsed response handling, and end-to-end integration coverage against an in-repo uWSGI mock server.
+  - Completed the remaining Upgrade 4.2 chunked uWSGI response path by decoding upstream `Transfer-Encoding: chunked` bodies before mapping them back into normal gateway responses, with live integration coverage.
+  - Completed Upgrade 4.3 backend protocol config integration by wiring `fastcgi_pass`, `scgi_pass`, `uwsgi_pass`, `fastcgi_param`, and `fastcgi_index` through the config-file parser, runtime config, and FastCGI execution path.
+  - Added a real PHP-FPM integration test that boots a private `php-fpm` instance on a Unix socket and proves `/v1/backend/fastcgi` returns a parsed live FastCGI response.
+  - Added capture-substitution rewrite support (`$1`, `$2`, ...) plus rewrite unit/integration coverage for `last`, `break`, `redirect`, `permanent`, and transparent path rewrites.
+  - Added `rewrite` directive parsing in `src/http/config_file.zig`, with config-driven integration coverage for transparent rewrites.
+  - Added `return` directive parsing and redirect semantics, including `$request_uri` expansion and config-driven integration coverage for `return 301 https://example.com$request_uri`.
+  - Added named capture substitution support in rewrite patterns, translating `(?P<name>...)` groups into POSIX-regex captures internally and expanding `$name` in replacements.
+  - Added the first conditional rewrite/return support for inline `if (...)` directives with `$http_host`, `$request_uri`, and `$args` matching, including case-insensitive `~*` conditions.
+  - Added the Upgrade 6 location-router foundation with a standalone nginx-style location matcher, `LocationBlock` runtime data model, serialized `TARDIGRADE_LOCATION_BLOCKS` loading, and unit coverage for exact/prefix/regex precedence.
+  - Added `location { ... }` block parsing in `src/http/config_file.zig`, including `proxy_pass`, `fastcgi_pass`, `root`, `alias`, `index`, `try_files`, `return`, and `rewrite` serialization into the new location-table config path.
+  - Added the first live location-dispatch hook in `src/edge_gateway.zig`, routing configured `location` blocks before the legacy hardcoded chain and adding integration coverage for three-block routing plus SIGHUP location reload.
+  - Added synthesized built-in location blocks for the core gateway routes (`/health`, metrics, admin metadata, `/v1/chat`, `/v1/commands`, `/v1/commands/status`) so configured and built-in routes now share the same matcher table during the Upgrade 6 migration.
+  - Added direct matcher-backed execution for simple built-in HTTP/1 routes (health, metrics, and admin metadata) plus an HTTP/3 location-matcher entry point with live QUIC coverage for configured `location`-block proxy routing.
+  - Added shared matcher-backed dispatch for `/v1/devices/register`, `/v1/sessions`, `/v1/sessions/refresh`, and `/v1/cache/purge` so those endpoints now execute through the same built-in location table on both HTTP/1 and HTTP/3.
+  - Added shared matcher-backed dispatch for `/v1/commands/status` and the approvals routes (`/v1/approvals/request`, `/v1/approvals/respond`, `/v1/approvals/status`) so those endpoints now execute through the same built-in location table on both HTTP/1 and HTTP/3.
+  - Added shared bearer-or-session identity resolution for `/v1/chat` and `/v1/commands`, so the remaining HTTP/1 and HTTP/3 route splits now differ mainly in execution behavior instead of auth/control-flow logic.
+  - Added shared request-preparation helpers for `/v1/chat` and `/v1/commands`, so both HTTP/1 and HTTP/3 now reuse the same auth/content-type/body parsing and upstream payload construction before diverging into protocol-specific execution paths.
+  - Added direct matcher-backed execution for `/v1/chat` and `/v1/commands` on both HTTP/1 and HTTP/3, including shared prep-error mapping and shared buffered upstream-result normalization while preserving the existing HTTP/1 cache/idempotency/circuit-breaker behavior.
+  - Started Upgrade 7 static-file serving by adding `src/http/static_file.zig` and `src/http/range.zig`, wiring shared static-file handling into both HTTP/1 and HTTP/3 location-root handlers, and adding unit coverage for traversal rejection and `.wasm` MIME detection plus live integration coverage for serving `/index.html` from a configured static root.
+  - Extended the static-file integration coverage to verify `If-Modified-Since` returns `304 Not Modified` and `Range: bytes=0-3` returns `206 Partial Content` with the expected `Content-Range`.
+  - Added `autoindex on/off` config support for location-root static routes and live integration coverage for directory listing when no index file exists.
+  - Completed Upgrade 8 custom error pages by adding location-level `error_page` directive parsing, multiple-status mappings, static-root error-page serving through the shared static-file module, absolute-URI redirect targets, and integration coverage for static HTML 404 pages while preserving JSON API 404 envelopes on `/v1/...`.
+  - Started Upgrade 9 `handleConnection()` refactoring by extracting the pre-routing middleware/guard path (geo blocking, request limits, API version/policy checks, ACL, idempotency capture, and rate limiting) into a dedicated `runMiddlewarePipeline()` helper while keeping the full integration suite green.
+  - Continued Upgrade 9 by centralizing matcher-backed HTTP/1 route handoff in `routeRequest()`, removing duplicated health/metrics/admin branches from `handleConnection()`, and preserving the static-root fallback to built-in routes such as `/health`.
+  - Continued Upgrade 9 by extracting the shared chat/commands upstream execution core into `handleProxyRequest()`, centralizing circuit-open handling, `proxyJsonExecute` dispatch, and buffered result normalization while keeping route-specific cache, idempotency, and command-lifecycle behavior unchanged.
+  - Continued Upgrade 9 by extracting the HTTP/1 WebSocket upgrade path into `handleWebSocketUpgrade()`, centralizing route detection, auth/session fallback, handshake validation, handshake writes, and stream-count bookkeeping for `/v1/ws/...`.
+  - Continued Upgrade 9 by extracting the SSE stream lifecycle into `handleSseStream()`, centralizing `/v1/events/stream` route detection, shared realtime auth, topic and `Last-Event-ID` parsing, stream-count bookkeeping, and the long-lived `keep_alive = false` transition.
+  - Continued Upgrade 9 by extracting the SSE publish path into `handleSsePublish()`, centralizing `/v1/events/publish` route detection, realtime feature gating, event-hub publication, and accepted-response generation.
+  - Continued Upgrade 9 by collapsing the remaining duplicated device/session/cache/command-status/approvals HTTP/1 branches onto the shared builtin dispatcher, removing a second implementation from `handleConnection()` and preserving clean `404` JSON behavior for unknown `/v1/...` routes.
+  - Continued Upgrade 9 by extracting the remaining subrequest/backend/mail/stream protocol tail into `handleBackendProtocolTail()`, removing another large inline branch cluster from `handleConnection()` while preserving FastCGI/uWSGI/SCGI/gRPC/memcached/mail/TCP/UDP route status behavior.
+  - Continued Upgrade 9 by collapsing the remaining inline `/v1/chat` and `/v1/commands` HTTP/1 bodies onto the shared builtin dispatcher, leaving `handleConnection()` much closer to parse -> middleware -> match -> route.
+  - Continued Upgrade 9 by moving the remaining post-middleware route/helper ladder into `routeRequest()`, so configured locations, built-in API tails, WebSocket/SSE paths, and backend protocol bridges are routed from one place instead of being retried inline in `handleConnection()`.
+  - Completed the Upgrade 9 routing-shape refactor by folding the final `try_files` / `404` fallback into `routeRequest()`, so `handleConnection()` now hands off to one terminal routing path after parsing, rewrites, mirrors, and middleware.
+  - Completed Upgrade 9.1 by replacing the single `GatewayState` mutex with narrower subsystem locks for connection bookkeeping, rate limiting, idempotency, proxy cache, sessions, commands, approvals, circuit-breaker state, metrics, upstream health/load-balancing state, and hot-reload runtime fields.
+  - Advanced Upgrade 9.2 by auditing request-arena lifetimes through `handleConnection()` and its extracted helpers, moving detached async command jobs onto `GatewayState.allocator`, and adding a regression test that proves copied job inputs survive request-arena teardown.
+  - Closed the non-benchmark portion of Upgrade 9.3 by re-running `zig build test` and `zig build test-integration` after the refactor work and marking the unit/integration regression guard items complete.
+  - Closed the remaining Upgrade 9.3 benchmark item by installing `wrk` locally and recording a current `/health` throughput run at roughly 29.8k requests/sec on the refactored gateway path.
+  - Started Upgrade 10.0 by adding `edge_config.validate()`, wiring config validation into startup and SIGHUP reload, and rejecting invalid ports, malformed upstream endpoints, missing TLS assets, and missing location error-page roots before live config activation.
+  - Completed the remaining Upgrade 10.0 conflict-warning item by detecting env-vs-file override mismatches at the `envOrDefault()` merge boundary and logging a warning while preserving env precedence.
+  - Completed Upgrade 10.1 by adding SIGUSR1 log-reopen handling, flushing buffered access logs before reopen, and reopening the configured stderr log file from both the worker event loop and the master supervision loop.
+  - Started Upgrade 10.2 virtual hosts by parsing `server { ... }` blocks from config files, selecting per-host server-block overlays from the incoming `Host` header on both HTTP/1 and HTTP/3 dispatch paths, honoring a default server block for unmatched hosts, mapping server-block TLS cert/key pairs into the listener's default and SNI cert configuration, and adding integration coverage for both multi-host routing and config-driven SNI certificate selection.
+  - Added the remaining Upgrade 10.3 validation and reload regression coverage with a missing-TLS-cert validation test and an integration test proving invalid SIGHUP reloads are rejected without disrupting in-flight requests.
+  - Started Upgrade 11.0 mail proxying by adding `smtp_pass` config parsing and a real raw-TCP SMTP relay integration test that proves `EHLO` and `DATA` are forwarded to a loopback upstream and the upstream SMTP reply is returned to the client.
+  - Extended Upgrade 11.0 SMTP proxying with explicit `starttls://` / `tls://` upstream schemes, gateway-managed STARTTLS negotiation, validation for secure mail upstream endpoints, and integration coverage that proves the relay upgrades before forwarding the SMTP payload.
+  - The new SMTP STARTTLS integration harness is currently skipped on macOS because the external local helper is unstable under the Zig test runner there, although the relay path is manually verified end to end.
+
+### Fixed
+- Upgrade 1 integration hardening in the live gateway path:
+  - Rebuilt rate limiter and proxy cache runtime state during SIGHUP reload so new limits apply immediately.
+  - Buffered cacheable upstream success responses so `/v1/chat` and `/v1/commands` can be cached and revalidated correctly.
+  - Fixed proxy cache lock handling, response body ownership, and detached refresh-thread lifetime issues uncovered by the integration suite.
+  - Fixed single-upstream retry budgeting so configured retry attempts are honored even without multiple upstream URLs.
+  - Fixed proxy cache writes to respect upstream `Cache-Control: no-store`.
+  - Fixed the integration request builder so explicit `Host` headers are preserved in end-to-end proxy tests.
+  - Fixed proxied upstream requests to follow a single redirect deterministically instead of timing out in the client path.
+  - Fixed the TLS integration probe path to force HTTP/1.1 so TLS tests are not blocked by the separate HTTP/2 Huffman decoder gap.
+  - Fixed the TLS drain harness to use an asynchronously spawned `curl` subprocess from the main test thread, avoiding the Zig/macOS threaded child-process crash.
+  - Restored OpenSSL SNI callback registration through `SSL_CTX_callback_ctrl`/`SSL_CTX_ctrl` and fixed a TLS handshake deadlock by not holding the TLS state mutex across `SSL_accept()`.
+  - Fixed connection-session cleanup to release request buffers back to the pool during shutdown and zero-initialize reused sessions.
+  - Fixed the contention test harness to use bounded socket timeouts instead of concurrent `curl` subprocess fan-out, which was unstable on macOS under threaded Zig tests.
+  - Fixed the worker-pool own-queue pop path to preserve FIFO drain order under saturation instead of reversing requests with LIFO `pop()`.
+  - Fixed active upstream health routing so a backend stays out of rotation until recovery probes succeed, instead of becoming eligible again solely because the passive fail-time window elapsed.
+  - Fixed the TLS SNI maintenance path to own its static SNI spec slice instead of retaining a pointer to the caller's freed temporary allocation.
+  - Fixed the HTTP/3 server-connection bootstrap to use the correct peer CID semantics for `ngtcp2_conn_server_new`; live `curl --http3-only` probes now complete the local QUIC/TLS handshake instead of stalling after the first server Initial packet.
+  - Fixed the HTTP/3 post-handshake path to reuse existing native connections for repeated Initial packets and to submit a minimal live response over nghttp3/QUIC without freeing header buffers too early.
+  - Fixed the HTTP/3 response path to advance nghttp3 body write offsets correctly and widened QUIC curl timeouts in the integration harness so live `/health` probes stop flaking under the test runner.
+  - Fixed the integration curl helper to retain generated header arguments until `Child.run()` completes; the previous lifetime bug could crash tests that passed custom headers to curl.
+  - Fixed several integration-suite stability issues uncovered while expanding HTTP/3 coverage:
+    - added explicit HTTPS-side `http3_status=configured` readiness checks before QUIC probes,
+    - widened HTTP/3 curl retry timing in the live QUIC tests,
+    - refreshed device-auth timestamps/signatures per request in the device/session integration test,
+    - reduced the mixed auth/rate contention fan-out and widened its timeout to avoid scheduler-noise failures in the full suite.
+  - Fixed QUIC TLS bootstrap to align more closely with the upstream ngtcp2/OpenSSL server defaults for TLS 1.3 early data, including server-only TLS context creation, certificate-chain loading, explicit TLS 1.3 ciphersuite/group defaults, and session-ticket reuse.
+  - Fixed HTTP/3 resumption observability by replacing the dead libcurl-based 0-RTT probe with the real ngtcp2/OpenSSL client path and by counting coalesced Initial + 0-RTT packets correctly in `src/http/quic_stub.zig`.
+  - Fixed `/v1/backend/fastcgi` to return parsed FastCGI responses instead of raw protocol bytes, log FastCGI `STDERR` at WARN level, and map non-zero `FCGI_END_REQUEST` app status to `502`.
+  - Fixed the FastCGI backend route to honor configured `root`, `fastcgi_param`, and `fastcgi_index` defaults while still allowing request-header overrides for script metadata during targeted protocol tests.
+  - Fixed the integration HTTP response reader to stop waiting for EOF when a `Content-Length` header is present, which removed a graceful-shutdown suite failure under the longer backend/rewrite test matrix.
+  - Fixed integration startup readiness to allow tests to declare a non-200 ready status, which is required for full-gateway redirect configurations such as top-level `return 301`.
+  - Fixed the integration shutdown response reader to tolerate peer resets after partial response bytes and added failure-safe child cleanup in the inflight shutdown tests.
+
 ## [0.29.0] - 2026-03-08
 
 ### Added
@@ -155,11 +364,11 @@
   - Added upstream unhealthy backend gauge derived from passive health tracking state.
   - Extended `/metrics` JSON and `/metrics/prometheus` output to include the new operational metrics.
 - Phase 4.4 active upstream health checks (`src/edge_config.zig`, `src/edge_gateway.zig`):
-  - Added periodic active probe controls: `TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_INTERVAL_MS`, `TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_PATH`, and `TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_TIMEOUT_MS`.
+  - Added periodic active probe controls: `TARDIGRADE_UPSTREAM_ACTIVE_PROBE_INTERVAL_MS`, `TARDIGRADE_UPSTREAM_ACTIVE_PROBE_PATH`, and `TARDIGRADE_UPSTREAM_ACTIVE_PROBE_TIMEOUT_MS`.
   - Event-loop timer ticks now run active health probes across configured upstreams.
   - Active probe outcomes now feed existing passive-health failover tracking.
 - Phase 4.4 configurable health thresholds (`src/edge_config.zig`, `src/edge_gateway.zig`):
-  - Added `TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_FAIL_THRESHOLD` and `TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_SUCCESS_THRESHOLD`.
+  - Added `TARDIGRADE_UPSTREAM_ACTIVE_PROBE_FAIL_THRESHOLD` and `TARDIGRADE_UPSTREAM_ACTIVE_PROBE_SUCCESS_THRESHOLD`.
   - Active probe failures/successes now use configurable consecutive-threshold transitions for unhealthy/healthy state changes.
 - Phase 4.4 slow-start for recovered upstreams (`src/edge_config.zig`, `src/edge_gateway.zig`):
   - Added `TARDIGRADE_UPSTREAM_SLOW_START_MS` for recovered-backend traffic ramp windows.
@@ -483,12 +692,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 - sendfile() zero-copy optimization for static file serving (in progress)
-- Remote BearClaw gateway MVP edge path:
+- Remote authenticated gateway MVP edge path:
   - New edge config loader (`src/edge_config.zig`) with `listen_host`, `listen_port`, `tls_cert_path`, `tls_key_path`, `upstream_base_url`, auth token hashes.
   - New edge runtime (`src/edge_gateway.zig`) with `GET /health` and authenticated `POST /v1/chat`.
   - Static bearer token auth using SHA-256 hash allowlist.
   - Request validation and stable API error envelopes with `request_id`.
-  - Upstream forwarding to BearClaw with `X-Correlation-ID` propagation.
+  - Upstream forwarding with `X-Correlation-ID` propagation.
   - Structured audit logs for route/status/auth/correlation/latency.
 - Correlation ID support via `X-Correlation-ID` header:
   - Echoes valid client-provided IDs in responses.

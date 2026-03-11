@@ -6,19 +6,11 @@ const edge_config = @import("edge_config.zig");
 const MAX_REQUEST_SIZE: usize = 256 * 1024;
 const STREAM_RELAY_BUFFER_SIZE: usize = 16 * 1024;
 const JSON_CONTENT_TYPE = "application/json";
-const ADMIN_ROUTES_JSON =
-    "{\"routes\":[" ++
-    "\"/health\",\"/metrics\",\"/metrics/prometheus\"," ++
-    "\"/admin/routes\",\"/admin/connections\",\"/admin/streams\",\"/admin/upstreams\",\"/admin/certs\",\"/admin/auth-registry\"," ++
-    "\"/v1/chat\",\"/v1/commands\",\"/v1/commands/status\",\"/v1/approvals/request\",\"/v1/approvals/respond\",\"/v1/approvals/status\",\"/v1/sessions\",\"/v1/cache/purge\"," ++
-    "\"/v1/ws/chat\",\"/v1/ws/commands\",\"/v1/ws/mux\",\"/v1/events/stream\",\"/v1/events/publish\"," ++
-    "\"/v1/subrequest\",\"/v1/backend/fastcgi\",\"/v1/backend/uwsgi\",\"/v1/backend/scgi\",\"/v1/backend/grpc\",\"/v1/backend/memcached\"," ++
-    "\"/v1/mail/smtp\",\"/v1/mail/imap\",\"/v1/mail/pop3\",\"/v1/stream/tcp\",\"/v1/stream/udp\"" ++
-    "]}";
 const HTTP2_PREFACE = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 const HTTP2_MAX_FRAME_SIZE: usize = 16 * 1024;
 const WS_MUX_MAX_CHANNELS: usize = 32;
-const APPROVAL_TIMEOUT_MS: i64 = 60_000;
+/// Fallback approval TTL when no config value is provided (5 minutes).
+const APPROVAL_TIMEOUT_MS_DEFAULT: i64 = 300_000;
 const ProxyCacheLookup = struct {
     cached: http.idempotency.CachedResponse,
     is_stale: bool,
@@ -27,8 +19,7 @@ const ProxyCacheLookup = struct {
 const UpstreamHealth = struct {
     fail_count: u32 = 0,
     unhealthy_until_ms: u64 = 0,
-    probe_fail_streak: u32 = 0,
-    probe_success_streak: u32 = 0,
+    probe: http.health_checker.State = .{},
     slow_start_until_ms: u64 = 0,
 };
 
@@ -141,6 +132,8 @@ const ApprovalEntry = struct {
     expires_ms: i64,
     decided_ms: i64,
     decided_by: []u8,
+    /// True once the escalation webhook has been fired for this entry.
+    escalation_fired: bool = false,
 
     fn deinit(self: *ApprovalEntry, allocator: std.mem.Allocator) void {
         allocator.free(self.method);
@@ -171,10 +164,86 @@ const MuxChannel = struct {
     last_command_status: ?CommandLifecycleStatus = null,
 };
 
+const MuxPendingFrame = struct {
+    payload: []u8,
+};
+
+const MuxResumeState = struct {
+    channels: []MuxChannel,
+    expires_ms: i64,
+};
+
+const MuxDeviceCount = struct {
+    device_id: []u8,
+    count: usize,
+};
+
+const MuxMetricsSnapshot = struct {
+    device_counts: []MuxDeviceCount,
+};
+
+fn deinitMuxMetricsSnapshot(allocator: std.mem.Allocator, device_counts: []MuxDeviceCount) void {
+    for (device_counts) |entry| allocator.free(entry.device_id);
+    allocator.free(device_counts);
+}
+
+fn deinitMuxPendingFrames(allocator: std.mem.Allocator, pending: *std.ArrayList(MuxPendingFrame)) void {
+    for (pending.items) |frame| allocator.free(frame.payload);
+    pending.deinit();
+}
+
+fn deinitMuxChannel(allocator: std.mem.Allocator, ch: *MuxChannel) void {
+    allocator.free(ch.name);
+    if (ch.topic) |t| allocator.free(t);
+    if (ch.command_id) |id| allocator.free(id);
+    ch.* = undefined;
+}
+
+fn cloneMuxChannel(allocator: std.mem.Allocator, ch: *const MuxChannel) !MuxChannel {
+    return .{
+        .name = try allocator.dupe(u8, ch.name),
+        .kind = ch.kind,
+        .topic = if (ch.topic) |topic| try allocator.dupe(u8, topic) else null,
+        .last_event_id = ch.last_event_id,
+        .command_id = if (ch.command_id) |command_id| try allocator.dupe(u8, command_id) else null,
+        .last_command_status = ch.last_command_status,
+    };
+}
+
+fn cloneMuxChannels(allocator: std.mem.Allocator, channels: []const MuxChannel) ![]MuxChannel {
+    var out = try allocator.alloc(MuxChannel, channels.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |*ch| deinitMuxChannel(allocator, ch);
+        allocator.free(out);
+    }
+    for (channels, 0..) |ch, idx| {
+        out[idx] = try cloneMuxChannel(allocator, &ch);
+        initialized += 1;
+    }
+    return out;
+}
+
+fn deinitMuxResumeState(allocator: std.mem.Allocator, saved_state: *MuxResumeState) void {
+    for (saved_state.channels) |*ch| deinitMuxChannel(allocator, ch);
+    allocator.free(saved_state.channels);
+    saved_state.* = undefined;
+}
+
 /// Persistent gateway state shared across connections.
 const GatewayState = struct {
     allocator: std.mem.Allocator,
-    mutex: std.Thread.Mutex = .{},
+    connection_mutex: std.Thread.Mutex = .{},
+    rate_limiter_mutex: std.Thread.Mutex = .{},
+    idempotency_mutex: std.Thread.Mutex = .{},
+    proxy_cache_mutex: std.Thread.Mutex = .{},
+    session_mutex: std.Thread.Mutex = .{},
+    command_mutex: std.Thread.Mutex = .{},
+    approval_mutex: std.Thread.Mutex = .{},
+    circuit_mutex: std.Thread.Mutex = .{},
+    metrics_mutex: std.Thread.Mutex = .{},
+    upstream_mutex: std.Thread.Mutex = .{},
+    runtime_mutex: std.Thread.Mutex = .{},
     rate_limiter: ?http.rate_limiter.RateLimiter,
     idempotency_store: ?http.idempotency.IdempotencyStore,
     proxy_cache_store: ?http.idempotency.IdempotencyStore,
@@ -182,6 +251,8 @@ const GatewayState = struct {
     proxy_cache_ttl_seconds: u32,
     security_headers: http.security_headers.SecurityHeaders,
     add_headers: []const edge_config.EdgeConfig.HeaderPair,
+    http3_alt_svc: ?[]u8,
+    http3_runtime: ?*http.http3_runtime.Runtime,
     session_store: ?http.session.SessionStore,
     access_control: ?http.access_control.AccessControl,
     logger: http.logger.Logger,
@@ -197,6 +268,8 @@ const GatewayState = struct {
     active_connections_total: usize,
     active_ws_streams: usize,
     active_sse_streams: usize,
+    active_mux_connections: usize,
+    active_mux_subscriptions: usize,
     connection_memory_estimate_bytes: usize,
     max_total_connection_memory_bytes: usize,
     upstream_rr_index: usize,
@@ -206,12 +279,24 @@ const GatewayState = struct {
     next_proxy_cache_maintenance_ms: u64,
     upstream_health: std.StringHashMap(UpstreamHealth),
     upstream_active_requests: std.StringHashMap(usize),
+    fastcgi_pool: std.StringHashMap(std.ArrayList(std.net.Stream)),
+    fastcgi_next_request_id: std.StringHashMap(u16),
     proxy_cache_locks: std.StringHashMap(u32),
     active_connections_by_ip: std.StringHashMap(u32),
     active_fds: std.AutoHashMap(std.posix.fd_t, void),
     fd_to_ip: std.AutoHashMap(std.posix.fd_t, []u8),
     command_lifecycle: std.StringHashMap(CommandLifecycleEntry),
     approvals: std.StringHashMap(ApprovalEntry),
+    mux_subscriptions_by_device: std.StringHashMap(usize),
+    mux_resume_state: std.StringHashMap(MuxResumeState),
+    /// Path to persistent approval store file (empty = in-memory only).
+    approval_store_path: []const u8,
+    /// Webhook URL for escalation notifications (empty = disabled).
+    approval_escalation_webhook: []const u8,
+    /// Approval TTL in milliseconds.
+    approval_ttl_ms: i64,
+    /// Max concurrent pending approval requests per identity (0 = unlimited).
+    approval_max_pending_per_identity: u32,
 
     fn deinit(self: *GatewayState) void {
         if (self.rate_limiter) |*rl| rl.deinit();
@@ -223,12 +308,26 @@ const GatewayState = struct {
         self.event_hub.deinit();
         self.request_buffer_pool.deinit();
         self.relay_buffer_pool.deinit();
+        if (self.http3_alt_svc) |value| self.allocator.free(value);
         var upstream_it = self.upstream_health.iterator();
         while (upstream_it.next()) |entry| self.allocator.free(entry.key_ptr.*);
         self.upstream_health.deinit();
         var upstream_active_it = self.upstream_active_requests.iterator();
         while (upstream_active_it.next()) |entry| self.allocator.free(entry.key_ptr.*);
         self.upstream_active_requests.deinit();
+        var fastcgi_it = self.fastcgi_pool.iterator();
+        while (fastcgi_it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            for (entry.value_ptr.items) |stream| {
+                var owned = stream;
+                owned.close();
+            }
+            entry.value_ptr.deinit();
+        }
+        self.fastcgi_pool.deinit();
+        var fastcgi_id_it = self.fastcgi_next_request_id.iterator();
+        while (fastcgi_id_it.next()) |entry| self.allocator.free(entry.key_ptr.*);
+        self.fastcgi_next_request_id.deinit();
         var cache_lock_it = self.proxy_cache_locks.iterator();
         while (cache_lock_it.next()) |entry| self.allocator.free(entry.key_ptr.*);
         self.proxy_cache_locks.deinit();
@@ -257,20 +356,109 @@ const GatewayState = struct {
             entry.value_ptr.deinit(self.allocator);
         }
         self.approvals.deinit();
+        var mux_sub_it = self.mux_subscriptions_by_device.iterator();
+        while (mux_sub_it.next()) |entry| self.allocator.free(entry.key_ptr.*);
+        self.mux_subscriptions_by_device.deinit();
+        var mux_resume_it = self.mux_resume_state.iterator();
+        while (mux_resume_it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            deinitMuxResumeState(self.allocator, entry.value_ptr);
+        }
+        self.mux_resume_state.deinit();
+    }
+
+    fn acquireFastcgiStream(self: *GatewayState, endpoint: []const u8) !struct { stream: std.net.Stream, reused: bool } {
+        self.connection_mutex.lock();
+        if (self.fastcgi_pool.getPtr(endpoint)) |pool| {
+            if (pool.items.len > 0) {
+                const stream = pool.pop().?;
+                self.connection_mutex.unlock();
+                return .{ .stream = stream, .reused = true };
+            }
+        }
+        self.connection_mutex.unlock();
+        return .{ .stream = try http.fastcgi.connect(self.allocator, endpoint), .reused = false };
+    }
+
+    fn releaseFastcgiStream(self: *GatewayState, endpoint: []const u8, stream: std.net.Stream, allow_reuse: bool) void {
+        if (!allow_reuse) {
+            var owned = stream;
+            owned.close();
+            return;
+        }
+
+        self.connection_mutex.lock();
+        defer self.connection_mutex.unlock();
+
+        if (self.fastcgi_pool.getPtr(endpoint)) |pool| {
+            if (pool.items.len >= 4) {
+                var owned = stream;
+                owned.close();
+                return;
+            }
+            pool.append(stream) catch {
+                var owned = stream;
+                owned.close();
+            };
+            return;
+        }
+
+        const owned_key = self.allocator.dupe(u8, endpoint) catch {
+            var owned = stream;
+            owned.close();
+            return;
+        };
+        var pool = std.ArrayList(std.net.Stream).init(self.allocator);
+        pool.append(stream) catch {
+            self.allocator.free(owned_key);
+            var owned = stream;
+            owned.close();
+            return;
+        };
+        self.fastcgi_pool.put(owned_key, pool) catch {
+            for (pool.items) |item| {
+                var owned = item;
+                owned.close();
+            }
+            pool.deinit();
+            self.allocator.free(owned_key);
+        };
+    }
+
+    fn nextFastcgiRequestId(self: *GatewayState, endpoint: []const u8) u16 {
+        self.connection_mutex.lock();
+        defer self.connection_mutex.unlock();
+
+        if (self.fastcgi_next_request_id.getPtr(endpoint)) |value| {
+            const next = value.*;
+            value.* = if (next == std.math.maxInt(u16)) 1 else next + 1;
+            return next;
+        }
+
+        const owned_key = self.allocator.dupe(u8, endpoint) catch return 1;
+        self.fastcgi_next_request_id.put(owned_key, 2) catch {
+            self.allocator.free(owned_key);
+            return 1;
+        };
+        return 1;
     }
 
     fn tryAcquireConnectionSlot(self: *GatewayState, fd: std.posix.fd_t, ip_key: []const u8) !ConnectionSlotResult {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.connection_mutex.lock();
+        defer self.connection_mutex.unlock();
 
         if (self.max_active_connections > 0 and self.active_connections_total >= self.max_active_connections) {
+            self.metrics_mutex.lock();
             self.metrics.recordConnectionRejection();
+            self.metrics_mutex.unlock();
             return .over_global_limit;
         }
         if (self.max_total_connection_memory_bytes > 0 and self.connection_memory_estimate_bytes > 0) {
             const projected: u128 = (@as(u128, self.active_connections_total) + 1) * @as(u128, self.connection_memory_estimate_bytes);
             if (projected > self.max_total_connection_memory_bytes) {
+                self.metrics_mutex.lock();
                 self.metrics.recordConnectionRejection();
+                self.metrics_mutex.unlock();
                 return .over_global_memory_limit;
             }
         }
@@ -279,7 +467,9 @@ const GatewayState = struct {
         if (self.max_connections_per_ip > 0) {
             const current = self.active_connections_by_ip.get(ip_key) orelse 0;
             if (current >= self.max_connections_per_ip) {
+                self.metrics_mutex.lock();
                 self.metrics.recordConnectionRejection();
+                self.metrics_mutex.unlock();
                 return .over_ip_limit;
             }
 
@@ -324,17 +514,21 @@ const GatewayState = struct {
             return err;
         };
         self.active_connections_total += 1;
+        self.metrics_mutex.lock();
         self.metrics.setActiveConnections(self.active_connections_total);
+        self.metrics_mutex.unlock();
         return .accepted;
     }
 
     fn releaseConnectionSlot(self: *GatewayState, fd: std.posix.fd_t) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.connection_mutex.lock();
+        defer self.connection_mutex.unlock();
 
         if (self.active_fds.fetchRemove(fd) != null and self.active_connections_total > 0) {
             self.active_connections_total -= 1;
+            self.metrics_mutex.lock();
             self.metrics.setActiveConnections(self.active_connections_total);
+            self.metrics_mutex.unlock();
         }
         if (self.max_connections_per_ip == 0) return;
 
@@ -353,8 +547,8 @@ const GatewayState = struct {
     }
 
     fn rateLimitAllow(self: *GatewayState, client_ip: []const u8) bool {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.rate_limiter_mutex.lock();
+        defer self.rate_limiter_mutex.unlock();
         if (self.rate_limiter) |*rl| {
             return rl.allow(client_ip) != null;
         }
@@ -362,8 +556,8 @@ const GatewayState = struct {
     }
 
     fn idempotencyGetCopy(self: *GatewayState, allocator: std.mem.Allocator, key: []const u8) !?http.idempotency.CachedResponse {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.idempotency_mutex.lock();
+        defer self.idempotency_mutex.unlock();
         if (self.idempotency_store) |*store| {
             if (store.get(key)) |cached| {
                 const body = try allocator.dupe(u8, cached.body);
@@ -381,24 +575,24 @@ const GatewayState = struct {
     }
 
     fn idempotencyPut(self: *GatewayState, key: []const u8, status: u16, body: []const u8, content_type: []const u8) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.idempotency_mutex.lock();
+        defer self.idempotency_mutex.unlock();
         if (self.idempotency_store) |*store| {
             try store.put(key, status, body, content_type);
         }
     }
 
     fn proxyCacheGetCopyWithStale(self: *GatewayState, allocator: std.mem.Allocator, key: []const u8, stale_seconds: u32) !?ProxyCacheLookup {
-        self.mutex.lock();
+        self.proxy_cache_mutex.lock();
         var locked = true;
-        defer if (locked) self.mutex.unlock();
+        defer if (locked) self.proxy_cache_mutex.unlock();
         if (self.proxy_cache_store) |*store| {
             if (store.getWithStale(key, stale_seconds)) |lookup| {
                 const body = try allocator.dupe(u8, lookup.response.body);
                 errdefer allocator.free(body);
                 const ct = try allocator.dupe(u8, lookup.response.content_type);
                 locked = false;
-                self.mutex.unlock();
+                self.proxy_cache_mutex.unlock();
                 return .{
                     .cached = .{
                         .status = lookup.response.status,
@@ -411,13 +605,13 @@ const GatewayState = struct {
             }
         }
         locked = false;
-        self.mutex.unlock();
+        self.proxy_cache_mutex.unlock();
 
         if (self.proxy_cache_path.len == 0) return null;
         const disk_lookup = try proxyCacheReadFromDisk(allocator, self.proxy_cache_path, key, self.proxy_cache_ttl_seconds, stale_seconds);
         if (disk_lookup) |found| {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.proxy_cache_mutex.lock();
+            defer self.proxy_cache_mutex.unlock();
             if (self.proxy_cache_store) |*store| {
                 store.put(key, found.cached.status, found.cached.body, found.cached.content_type) catch {};
             }
@@ -426,26 +620,26 @@ const GatewayState = struct {
     }
 
     fn proxyCachePut(self: *GatewayState, key: []const u8, status: u16, body: []const u8, content_type: []const u8) !void {
-        self.mutex.lock();
+        self.proxy_cache_mutex.lock();
         var locked = true;
-        defer if (locked) self.mutex.unlock();
+        defer if (locked) self.proxy_cache_mutex.unlock();
         if (self.proxy_cache_store) |*store| {
             try store.put(key, status, body, content_type);
         }
         locked = false;
-        self.mutex.unlock();
+        self.proxy_cache_mutex.unlock();
         if (self.proxy_cache_path.len > 0) {
             try proxyCacheWriteToDisk(self.proxy_cache_path, key, status, body, content_type);
         }
     }
 
     fn proxyCacheDelete(self: *GatewayState, key: []const u8) bool {
-        self.mutex.lock();
+        self.proxy_cache_mutex.lock();
         var removed = false;
         if (self.proxy_cache_store) |*store| {
             removed = store.delete(key);
         }
-        self.mutex.unlock();
+        self.proxy_cache_mutex.unlock();
         if (self.proxy_cache_path.len > 0) {
             removed = proxyCacheDeleteFromDisk(self.proxy_cache_path, key) or removed;
         }
@@ -453,12 +647,12 @@ const GatewayState = struct {
     }
 
     fn proxyCachePurgeAll(self: *GatewayState) usize {
-        self.mutex.lock();
+        self.proxy_cache_mutex.lock();
         var removed: usize = 0;
         if (self.proxy_cache_store) |*store| {
             removed += store.clear();
         }
-        self.mutex.unlock();
+        self.proxy_cache_mutex.unlock();
         if (self.proxy_cache_path.len > 0) {
             removed += proxyCachePurgeDisk(self.proxy_cache_path);
         }
@@ -466,8 +660,8 @@ const GatewayState = struct {
     }
 
     fn proxyCacheTryLock(self: *GatewayState, key: []const u8) !bool {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.proxy_cache_mutex.lock();
+        defer self.proxy_cache_mutex.unlock();
         if (self.proxy_cache_locks.contains(key)) return false;
         const owned = try self.allocator.dupe(u8, key);
         errdefer self.allocator.free(owned);
@@ -476,8 +670,8 @@ const GatewayState = struct {
     }
 
     fn proxyCacheUnlock(self: *GatewayState, key: []const u8) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.proxy_cache_mutex.lock();
+        defer self.proxy_cache_mutex.unlock();
         if (self.proxy_cache_locks.fetchRemove(key)) |removed| {
             self.allocator.free(removed.key);
         }
@@ -486,9 +680,9 @@ const GatewayState = struct {
     fn proxyCacheWaitForUnlock(self: *GatewayState, key: []const u8, timeout_ms: u32) bool {
         const deadline = http.event_loop.monotonicMs() + timeout_ms;
         while (http.event_loop.monotonicMs() < deadline) {
-            self.mutex.lock();
+            self.proxy_cache_mutex.lock();
             const locked = self.proxy_cache_locks.contains(key);
-            self.mutex.unlock();
+            self.proxy_cache_mutex.unlock();
             if (!locked) return true;
             std.time.sleep(10 * std.time.ns_per_ms);
         }
@@ -496,16 +690,16 @@ const GatewayState = struct {
     }
 
     fn createSession(self: *GatewayState, allocator: std.mem.Allocator, identity: []const u8, client_ip: []const u8, device_id: ?[]const u8) ![]const u8 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.session_mutex.lock();
+        defer self.session_mutex.unlock();
         if (self.session_store == null) return error.SessionsDisabled;
         const token = try self.session_store.?.create(identity, client_ip, device_id);
         return try allocator.dupe(u8, token);
     }
 
     fn validateSessionIdentity(self: *GatewayState, allocator: std.mem.Allocator, token: []const u8) ?[]const u8 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.session_mutex.lock();
+        defer self.session_mutex.unlock();
         if (self.session_store) |*ss| {
             if (ss.validate(token)) |session| {
                 return allocator.dupe(u8, session.identity) catch null;
@@ -515,15 +709,15 @@ const GatewayState = struct {
     }
 
     fn revokeSession(self: *GatewayState, token: []const u8) bool {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.session_mutex.lock();
+        defer self.session_mutex.unlock();
         if (self.session_store) |*ss| return ss.revoke(token);
         return false;
     }
 
     fn countSessionsByIdentity(self: *GatewayState, allocator: std.mem.Allocator, identity: []const u8) !usize {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.session_mutex.lock();
+        defer self.session_mutex.unlock();
         if (self.session_store == null) return error.SessionsDisabled;
         const sessions = try self.session_store.?.listByIdentity(allocator, identity);
         defer allocator.free(sessions);
@@ -531,8 +725,8 @@ const GatewayState = struct {
     }
 
     fn refreshSession(self: *GatewayState, allocator: std.mem.Allocator, token: []const u8, client_ip: []const u8) ![]const u8 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.session_mutex.lock();
+        defer self.session_mutex.unlock();
         if (self.session_store == null) return error.SessionsDisabled;
         const existing = self.session_store.?.validate(token) orelse return error.InvalidSession;
         const new_token = try self.session_store.?.create(existing.identity, client_ip, existing.device_id);
@@ -541,8 +735,8 @@ const GatewayState = struct {
     }
 
     fn commandLifecycleCreate(self: *GatewayState, command_id: []const u8, command_type: []const u8, correlation_id: []const u8, identity: []const u8) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.command_mutex.lock();
+        defer self.command_mutex.unlock();
         const now = std.time.milliTimestamp();
         const owned_id = try self.allocator.dupe(u8, command_id);
         errdefer self.allocator.free(owned_id);
@@ -568,8 +762,8 @@ const GatewayState = struct {
     }
 
     fn commandLifecycleSetRunning(self: *GatewayState, command_id: []const u8) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.command_mutex.lock();
+        defer self.command_mutex.unlock();
         if (self.command_lifecycle.getPtr(command_id)) |entry| {
             entry.status = .running;
             entry.updated_ms = std.time.milliTimestamp();
@@ -577,8 +771,8 @@ const GatewayState = struct {
     }
 
     fn commandLifecycleSetCompleted(self: *GatewayState, command_id: []const u8, status: u16, body: []const u8, content_type: []const u8) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.command_mutex.lock();
+        defer self.command_mutex.unlock();
         if (self.command_lifecycle.getPtr(command_id)) |entry| {
             self.allocator.free(entry.response_body);
             self.allocator.free(entry.response_content_type);
@@ -593,8 +787,8 @@ const GatewayState = struct {
     }
 
     fn commandLifecycleSetFailed(self: *GatewayState, command_id: []const u8, message: []const u8) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.command_mutex.lock();
+        defer self.command_mutex.unlock();
         if (self.command_lifecycle.getPtr(command_id)) |entry| {
             self.allocator.free(entry.error_message);
             entry.status = .failed;
@@ -604,8 +798,8 @@ const GatewayState = struct {
     }
 
     fn commandLifecycleSnapshotJson(self: *GatewayState, allocator: std.mem.Allocator, command_id: []const u8) ?[]const u8 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.command_mutex.lock();
+        defer self.command_mutex.unlock();
         const entry = self.command_lifecycle.get(command_id) orelse return null;
         const status_name = @tagName(entry.status);
         return std.fmt.allocPrint(allocator, "{{\"command_id\":\"{s}\",\"status\":\"{s}\",\"command\":\"{s}\",\"correlation_id\":\"{s}\",\"identity\":\"{s}\",\"created_ms\":{d},\"updated_ms\":{d},\"response_status\":{d},\"response_content_type\":\"{s}\",\"response_body\":{s},\"error\":\"{s}\"}}", .{
@@ -624,8 +818,8 @@ const GatewayState = struct {
     }
 
     fn commandLifecycleGet(self: *GatewayState, allocator: std.mem.Allocator, command_id: []const u8) ?CommandLifecycleSnapshot {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.command_mutex.lock();
+        defer self.command_mutex.unlock();
         const entry = self.command_lifecycle.get(command_id) orelse return null;
         const response_body = allocator.dupe(u8, entry.response_body) catch return null;
         errdefer allocator.free(response_body);
@@ -642,151 +836,364 @@ const GatewayState = struct {
     }
 
     fn approvalCreate(self: *GatewayState, allocator: std.mem.Allocator, method: []const u8, path: []const u8, identity: []const u8, command_id: ?[]const u8) !ApprovalCreateResult {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        const result = blk: {
+            self.approval_mutex.lock();
+            defer self.approval_mutex.unlock();
 
-        var rnd: [16]u8 = undefined;
-        std.crypto.random.bytes(&rnd);
-        const token = try std.fmt.allocPrint(self.allocator, "apr-{d}-{s}", .{
-            std.time.milliTimestamp(),
-            std.fmt.fmtSliceHexLower(&rnd),
-        });
-        errdefer self.allocator.free(token);
-        const now = std.time.milliTimestamp();
-        const entry = ApprovalEntry{
-            .method = try self.allocator.dupe(u8, method),
-            .path = try self.allocator.dupe(u8, path),
-            .identity = try self.allocator.dupe(u8, identity),
-            .command_id = try self.allocator.dupe(u8, command_id orelse ""),
-            .status = .pending,
-            .created_ms = now,
-            .expires_ms = now + APPROVAL_TIMEOUT_MS,
-            .decided_ms = 0,
-            .decided_by = try self.allocator.dupe(u8, ""),
+            // Rate-limit: cap pending approvals per identity.
+            if (self.approval_max_pending_per_identity > 0) {
+                if (self.approvalCountPendingForIdentityLocked(identity) >= self.approval_max_pending_per_identity) {
+                    return error.TooManyPendingApprovals;
+                }
+            }
+
+            var rnd: [16]u8 = undefined;
+            std.crypto.random.bytes(&rnd);
+            const token = try std.fmt.allocPrint(self.allocator, "apr-{d}-{s}", .{
+                std.time.milliTimestamp(),
+                std.fmt.fmtSliceHexLower(&rnd),
+            });
+            errdefer self.allocator.free(token);
+            const now = std.time.milliTimestamp();
+            const expires_ms = now + self.approval_ttl_ms;
+            const entry = ApprovalEntry{
+                .method = try self.allocator.dupe(u8, method),
+                .path = try self.allocator.dupe(u8, path),
+                .identity = try self.allocator.dupe(u8, identity),
+                .command_id = try self.allocator.dupe(u8, command_id orelse ""),
+                .status = .pending,
+                .created_ms = now,
+                .expires_ms = expires_ms,
+                .decided_ms = 0,
+                .decided_by = try self.allocator.dupe(u8, ""),
+            };
+            try self.approvals.put(token, entry);
+            break :blk ApprovalCreateResult{
+                .token = try allocator.dupe(u8, token),
+                .expires_ms = expires_ms,
+            };
         };
-        try self.approvals.put(token, entry);
-        return .{
-            .token = try allocator.dupe(u8, token),
-            .expires_ms = entry.expires_ms,
-        };
+        // Persist outside the mutex.
+        self.persistApprovals();
+        return result;
     }
 
     fn approvalRespond(self: *GatewayState, token: []const u8, decision: ApprovalDecision, actor: []const u8) bool {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        const entry = self.approvals.getPtr(token) orelse return false;
-        self.approvalEscalateIfExpiredLocked(entry);
-        if (entry.status != .pending) return false;
-        entry.status = if (decision == .approve) .approved else .denied;
-        entry.decided_ms = std.time.milliTimestamp();
-        self.allocator.free(entry.decided_by);
-        entry.decided_by = self.allocator.dupe(u8, actor) catch self.allocator.dupe(u8, "") catch return false;
-        return true;
+        var webhook_payload: ?[]u8 = null;
+        defer if (webhook_payload) |p| self.allocator.free(p);
+
+        const success = blk: {
+            self.approval_mutex.lock();
+            defer self.approval_mutex.unlock();
+            const entry = self.approvals.getPtr(token) orelse break :blk false;
+            if (approvalEscalateIfExpiredLocked(entry) and !entry.escalation_fired) {
+                entry.escalation_fired = true;
+                webhook_payload = self.buildApprovalWebhookPayloadLocked(token, entry);
+            }
+            if (entry.status != .pending) break :blk false;
+            entry.status = if (decision == .approve) .approved else .denied;
+            entry.decided_ms = std.time.milliTimestamp();
+            self.allocator.free(entry.decided_by);
+            entry.decided_by = self.allocator.dupe(u8, actor) catch self.allocator.dupe(u8, "") catch break :blk false;
+            break :blk true;
+        };
+
+        if (webhook_payload) |p| {
+            http.approval_store.fireWebhook(self.allocator, self.approval_escalation_webhook, p);
+        }
+        if (success) self.persistApprovals();
+        return success;
     }
 
     fn approvalValidate(self: *GatewayState, token: []const u8, method: []const u8, path: []const u8, identity: ?[]const u8) ApprovalValidation {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        const entry = self.approvals.getPtr(token) orelse return .missing;
-        self.approvalEscalateIfExpiredLocked(entry);
-        if (!http.rewrite.methodMatches(entry.method, method)) return .invalid;
-        if (!http.rewrite.regexMatches(entry.path, path)) return .invalid;
-        if (identity) |id| {
-            if (entry.identity.len > 0 and !std.mem.eql(u8, entry.identity, id)) return .invalid;
-        }
-        return switch (entry.status) {
-            .pending => .pending,
-            .approved => .approved,
-            .denied => .denied,
-            .escalated => .escalated,
+        var webhook_payload: ?[]u8 = null;
+        defer if (webhook_payload) |p| self.allocator.free(p);
+
+        const result = blk: {
+            self.approval_mutex.lock();
+            defer self.approval_mutex.unlock();
+            const entry = self.approvals.getPtr(token) orelse break :blk ApprovalValidation.missing;
+            if (approvalEscalateIfExpiredLocked(entry) and !entry.escalation_fired) {
+                entry.escalation_fired = true;
+                webhook_payload = self.buildApprovalWebhookPayloadLocked(token, entry);
+            }
+            if (!http.rewrite.methodMatches(entry.method, method)) break :blk ApprovalValidation.invalid;
+            if (!http.rewrite.regexMatches(entry.path, path)) break :blk ApprovalValidation.invalid;
+            if (identity) |id| {
+                if (entry.identity.len > 0 and !std.mem.eql(u8, entry.identity, id)) break :blk ApprovalValidation.invalid;
+            }
+            break :blk switch (entry.status) {
+                .pending => ApprovalValidation.pending,
+                .approved => ApprovalValidation.approved,
+                .denied => ApprovalValidation.denied,
+                .escalated => ApprovalValidation.escalated,
+            };
         };
+
+        if (webhook_payload) |p| {
+            http.approval_store.fireWebhook(self.allocator, self.approval_escalation_webhook, p);
+        }
+        return result;
     }
 
     fn approvalSnapshotJson(self: *GatewayState, allocator: std.mem.Allocator, token: []const u8) ?[]const u8 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        const entry = self.approvals.getPtr(token) orelse return null;
-        self.approvalEscalateIfExpiredLocked(entry);
-        return std.fmt.allocPrint(allocator, "{{\"approval_token\":\"{s}\",\"status\":\"{s}\",\"method\":\"{s}\",\"path\":\"{s}\",\"identity\":\"{s}\",\"command_id\":{s},\"created_ms\":{d},\"expires_ms\":{d},\"decided_ms\":{d},\"decided_by\":{s}}}", .{
-            token,
-            @tagName(entry.status),
-            entry.method,
-            entry.path,
-            entry.identity,
-            if (entry.command_id.len > 0) std.json.fmt(entry.command_id, .{}) else "null",
-            entry.created_ms,
-            entry.expires_ms,
-            entry.decided_ms,
-            if (entry.decided_by.len > 0) std.json.fmt(entry.decided_by, .{}) else "null",
-        }) catch null;
+        var webhook_payload: ?[]u8 = null;
+        defer if (webhook_payload) |p| self.allocator.free(p);
+
+        const json = blk: {
+            self.approval_mutex.lock();
+            defer self.approval_mutex.unlock();
+            const entry = self.approvals.getPtr(token) orelse break :blk @as(?[]const u8, null);
+            if (approvalEscalateIfExpiredLocked(entry) and !entry.escalation_fired) {
+                entry.escalation_fired = true;
+                webhook_payload = self.buildApprovalWebhookPayloadLocked(token, entry);
+            }
+            const command_id_json = if (entry.command_id.len > 0)
+                std.fmt.allocPrint(allocator, "\"{s}\"", .{entry.command_id}) catch break :blk @as(?[]const u8, null)
+            else
+                allocator.dupe(u8, "null") catch break :blk @as(?[]const u8, null);
+            defer allocator.free(command_id_json);
+            const decided_by_json = if (entry.decided_by.len > 0)
+                std.fmt.allocPrint(allocator, "\"{s}\"", .{entry.decided_by}) catch break :blk @as(?[]const u8, null)
+            else
+                allocator.dupe(u8, "null") catch break :blk @as(?[]const u8, null);
+            defer allocator.free(decided_by_json);
+            break :blk std.fmt.allocPrint(allocator, "{{\"approval_token\":\"{s}\",\"status\":\"{s}\",\"method\":\"{s}\",\"path\":\"{s}\",\"identity\":\"{s}\",\"command_id\":{s},\"created_ms\":{d},\"expires_ms\":{d},\"decided_ms\":{d},\"decided_by\":{s}}}", .{
+                token,
+                @tagName(entry.status),
+                entry.method,
+                entry.path,
+                entry.identity,
+                command_id_json,
+                entry.created_ms,
+                entry.expires_ms,
+                entry.decided_ms,
+                decided_by_json,
+            }) catch null;
+        };
+
+        if (webhook_payload) |p| {
+            http.approval_store.fireWebhook(self.allocator, self.approval_escalation_webhook, p);
+        }
+        return json;
     }
 
-    fn approvalEscalateIfExpiredLocked(_: *GatewayState, entry: *ApprovalEntry) void {
-        if (entry.status != .pending) return;
+    /// Returns true if the entry was JUST escalated (status transitioned from pending).
+    /// Must be called with approval_mutex held.
+    fn approvalEscalateIfExpiredLocked(entry: *ApprovalEntry) bool {
+        if (entry.status != .pending) return false;
         const now = std.time.milliTimestamp();
         if (now >= entry.expires_ms) {
             entry.status = .escalated;
             entry.decided_ms = now;
+            return true;
         }
+        return false;
+    }
+
+    /// Count pending approvals for a given identity. Must be called with approval_mutex held.
+    fn approvalCountPendingForIdentityLocked(self: *GatewayState, identity: []const u8) u32 {
+        var count: u32 = 0;
+        var it = self.approvals.iterator();
+        while (it.next()) |kv| {
+            const e = kv.value_ptr.*;
+            if (e.status == .pending and std.mem.eql(u8, e.identity, identity)) {
+                count += 1;
+            }
+        }
+        return count;
+    }
+
+    /// Build a JSON payload for the escalation webhook. Must be called with approval_mutex held.
+    /// Returns an allocator-owned slice or null on OOM.
+    fn buildApprovalWebhookPayloadLocked(self: *GatewayState, token: []const u8, entry: *const ApprovalEntry) ?[]u8 {
+        const command_id_part = if (entry.command_id.len > 0)
+            std.fmt.allocPrint(self.allocator, "\"{s}\"", .{entry.command_id}) catch return null
+        else
+            self.allocator.dupe(u8, "null") catch return null;
+        defer self.allocator.free(command_id_part);
+        return std.fmt.allocPrint(self.allocator,
+            "{{\"event\":\"escalated\",\"approval_token\":\"{s}\",\"method\":\"{s}\",\"path\":\"{s}\",\"identity\":\"{s}\",\"command_id\":{s},\"created_ms\":{d},\"expires_ms\":{d}}}",
+            .{ token, entry.method, entry.path, entry.identity, command_id_part, entry.created_ms, entry.expires_ms },
+        ) catch null;
+    }
+
+    /// Snapshot all approval entries into a slice suitable for persistence.
+    /// Must be called with approval_mutex held. Caller frees via http.approval_store.freeLoaded.
+    fn approvalSnapshotEntriesLocked(self: *GatewayState, allocator: std.mem.Allocator) ![]http.approval_store.StoredApproval {
+        var out = try allocator.alloc(http.approval_store.StoredApproval, self.approvals.count());
+        var i: usize = 0;
+        errdefer {
+            for (out[0..i]) |e| {
+                allocator.free(e.token);
+                allocator.free(e.method);
+                allocator.free(e.path);
+                allocator.free(e.identity);
+                allocator.free(e.command_id);
+                allocator.free(e.status);
+                allocator.free(e.decided_by);
+            }
+            allocator.free(out);
+        }
+        var it = self.approvals.iterator();
+        while (it.next()) |kv| {
+            const e = kv.value_ptr.*;
+            out[i] = .{
+                .token = try allocator.dupe(u8, kv.key_ptr.*),
+                .method = try allocator.dupe(u8, e.method),
+                .path = try allocator.dupe(u8, e.path),
+                .identity = try allocator.dupe(u8, e.identity),
+                .command_id = try allocator.dupe(u8, e.command_id),
+                .status = try allocator.dupe(u8, @tagName(e.status)),
+                .created_ms = e.created_ms,
+                .expires_ms = e.expires_ms,
+                .decided_ms = e.decided_ms,
+                .decided_by = try allocator.dupe(u8, e.decided_by),
+                .escalation_fired = e.escalation_fired,
+            };
+            i += 1;
+        }
+        return out[0..i];
+    }
+
+    /// Persist all approvals to disk (no-op when store path is unconfigured).
+    fn persistApprovals(self: *GatewayState) void {
+        if (self.approval_store_path.len == 0) return;
+        const snapshot = blk: {
+            self.approval_mutex.lock();
+            defer self.approval_mutex.unlock();
+            break :blk self.approvalSnapshotEntriesLocked(self.allocator) catch return;
+        };
+        defer http.approval_store.freeLoaded(self.allocator, snapshot);
+        http.approval_store.persist(self.allocator, self.approval_store_path, snapshot) catch |err| {
+            self.logger.warn(null, "approval store persist failed: {}", .{err});
+        };
     }
 
     fn circuitTryAcquire(self: *GatewayState) bool {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.circuit_mutex.lock();
+        defer self.circuit_mutex.unlock();
         return self.circuit_breaker.tryAcquire();
     }
 
     fn circuitRecordFailure(self: *GatewayState) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.circuit_mutex.lock();
+        defer self.circuit_mutex.unlock();
         self.circuit_breaker.recordFailure();
     }
 
     fn circuitRecordSuccess(self: *GatewayState) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.circuit_mutex.lock();
+        defer self.circuit_mutex.unlock();
         self.circuit_breaker.recordSuccess();
     }
 
     fn circuitStateName(self: *GatewayState) []const u8 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.circuit_mutex.lock();
+        defer self.circuit_mutex.unlock();
         return self.circuit_breaker.stateName();
     }
 
     fn metricsRecord(self: *GatewayState, status: u16) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.metrics_mutex.lock();
+        defer self.metrics_mutex.unlock();
         self.metrics.recordRequest(status);
     }
 
     fn metricsRecordQueueRejection(self: *GatewayState) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.metrics_mutex.lock();
+        defer self.metrics_mutex.unlock();
         self.metrics.recordQueueRejection();
     }
 
+    fn metricsRecordMuxFrameError(self: *GatewayState) void {
+        self.metrics_mutex.lock();
+        defer self.metrics_mutex.unlock();
+        self.metrics.recordMuxFrameError();
+    }
+
     fn metricsRecordErrorCode(self: *GatewayState, code: []const u8) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.metrics_mutex.lock();
+        defer self.metrics_mutex.unlock();
         self.metrics.recordErrorCode(code);
     }
 
     fn metricsToJson(self: *GatewayState, allocator: std.mem.Allocator) ![]u8 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        return self.metrics.toJson(allocator);
+        const mux_snapshot = try self.muxMetricsSnapshot(allocator);
+        defer deinitMuxMetricsSnapshot(allocator, mux_snapshot.device_counts);
+
+        self.metrics_mutex.lock();
+        const metrics_snapshot = self.metrics;
+        self.metrics_mutex.unlock();
+
+        var device_json = std.ArrayList(u8).init(allocator);
+        errdefer device_json.deinit();
+        try device_json.append('{');
+        for (mux_snapshot.device_counts, 0..) |entry, idx| {
+            if (idx > 0) try device_json.append(',');
+            try device_json.writer().print("{s}:{d}", .{ std.json.fmt(entry.device_id, .{}), entry.count });
+        }
+        try device_json.append('}');
+        const device_json_owned = try device_json.toOwnedSlice();
+        defer allocator.free(device_json_owned);
+
+        return std.fmt.allocPrint(allocator,
+            \\{{"total_requests":{d},"status_2xx":{d},"status_3xx":{d},"status_4xx":{d},"status_5xx":{d},"uptime_seconds":{d},"active_connections":{d},"mux_connections":{d},"mux_subscriptions":{d},"mux_subscriptions_by_device":{s},"connection_rejections":{d},"queue_rejections":{d},"upstream_unhealthy_backends":{d},"error_invalid_request":{d},"error_unauthorized":{d},"error_rate_limited":{d},"error_upstream_timeout":{d},"error_upstream_unavailable":{d},"error_internal_error":{d},"error_overload":{d},"mux_frame_errors":{d}}}
+        , .{
+            metrics_snapshot.total_requests,
+            metrics_snapshot.status_2xx,
+            metrics_snapshot.status_3xx,
+            metrics_snapshot.status_4xx,
+            metrics_snapshot.status_5xx,
+            metrics_snapshot.uptimeSeconds(),
+            metrics_snapshot.active_connections,
+            metrics_snapshot.mux_connections,
+            metrics_snapshot.mux_subscriptions,
+            device_json_owned,
+            metrics_snapshot.connection_rejections,
+            metrics_snapshot.queue_rejections,
+            metrics_snapshot.upstream_unhealthy_backends,
+            metrics_snapshot.err_invalid_request,
+            metrics_snapshot.err_unauthorized,
+            metrics_snapshot.err_rate_limited,
+            metrics_snapshot.err_upstream_timeout,
+            metrics_snapshot.err_upstream_unavailable,
+            metrics_snapshot.err_internal_error,
+            metrics_snapshot.err_overload,
+            metrics_snapshot.mux_frame_errors,
+        });
     }
 
     fn metricsToPrometheus(self: *GatewayState, allocator: std.mem.Allocator) ![]u8 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        return self.metrics.toPrometheus(allocator);
+        const mux_snapshot = try self.muxMetricsSnapshot(allocator);
+        defer deinitMuxMetricsSnapshot(allocator, mux_snapshot.device_counts);
+
+        self.metrics_mutex.lock();
+        const metrics_snapshot = self.metrics;
+        self.metrics_mutex.unlock();
+
+        const base = try metrics_snapshot.toPrometheus(allocator);
+        defer allocator.free(base);
+
+        var combined = std.ArrayList(u8).init(allocator);
+        errdefer combined.deinit();
+        try combined.appendSlice(base);
+        if (mux_snapshot.device_counts.len > 0) {
+            try combined.appendSlice(
+                \\# HELP tardigrade_mux_device_channels Current active mux channels by device
+                \\# TYPE tardigrade_mux_device_channels gauge
+                \\
+            );
+            for (mux_snapshot.device_counts) |entry| {
+                try combined.writer().print("tardigrade_mux_device_channels{{device_id=\"{s}\"}} {d}\n", .{ entry.device_id, entry.count });
+            }
+        }
+        return combined.toOwnedSlice();
     }
 
     fn nextUpstreamBaseUrl(self: *GatewayState, cfg: *const edge_config.EdgeConfig, pool: UpstreamPoolView, client_ip: []const u8, hash_key: []const u8) []const u8 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.upstream_mutex.lock();
+        defer self.upstream_mutex.unlock();
         if (pool.primary_urls.len == 0) {
             return self.selectPrimaryFallbackWithBackupsLocked(cfg, pool, http.event_loop.monotonicMs());
         }
@@ -1009,12 +1416,11 @@ const GatewayState = struct {
     fn recordUpstreamFailure(self: *GatewayState, cfg: *const edge_config.EdgeConfig, upstream_base_url: []const u8) void {
         if (cfg.upstream_max_fails == 0) return;
 
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.upstream_mutex.lock();
+        defer self.upstream_mutex.unlock();
 
         if (self.upstream_health.getPtr(upstream_base_url)) |health| {
             health.fail_count +|= 1;
-            health.probe_success_streak = 0;
             if (health.fail_count >= cfg.upstream_max_fails) {
                 health.fail_count = 0;
                 health.unhealthy_until_ms = http.event_loop.monotonicMs() + cfg.upstream_fail_timeout_ms;
@@ -1030,7 +1436,6 @@ const GatewayState = struct {
         };
         if (self.upstream_health.getPtr(owned)) |health| {
             health.fail_count = 1;
-            health.probe_success_streak = 0;
             if (health.fail_count >= cfg.upstream_max_fails) {
                 health.fail_count = 0;
                 health.unhealthy_until_ms = http.event_loop.monotonicMs() + cfg.upstream_fail_timeout_ms;
@@ -1042,21 +1447,19 @@ const GatewayState = struct {
     fn recordUpstreamSuccess(self: *GatewayState, cfg: *const edge_config.EdgeConfig, upstream_base_url: []const u8) void {
         if (cfg.upstream_max_fails == 0) return;
 
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.upstream_mutex.lock();
+        defer self.upstream_mutex.unlock();
         if (self.upstream_health.getPtr(upstream_base_url)) |health| {
             health.fail_count = 0;
             health.unhealthy_until_ms = 0;
-            health.probe_fail_streak = 0;
-            health.probe_success_streak = 0;
             health.slow_start_until_ms = 0;
         }
         self.updateUpstreamHealthMetricLocked();
     }
 
     fn recordActiveProbeResult(self: *GatewayState, cfg: *const edge_config.EdgeConfig, upstream_base_url: []const u8, healthy: bool) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.upstream_mutex.lock();
+        defer self.upstream_mutex.unlock();
 
         const health = if (self.upstream_health.getPtr(upstream_base_url)) |existing|
             existing
@@ -1069,38 +1472,38 @@ const GatewayState = struct {
             break :blk self.upstream_health.getPtr(owned).?;
         };
 
-        if (healthy) {
-            health.probe_fail_streak = 0;
-            health.probe_success_streak +|= 1;
-            if (health.probe_success_streak >= cfg.upstream_active_health_success_threshold) {
+        const health_cfg = activeHealthConfig(cfg, upstream_base_url);
+        const transition = if (healthy)
+            health.probe.recordSuccess(health_cfg)
+        else
+            health.probe.recordFailure(health_cfg);
+
+        switch (transition) {
+            .marked_up => {
                 health.unhealthy_until_ms = 0;
                 health.fail_count = 0;
-                health.probe_success_streak = 0;
                 self.beginSlowStartLocked(cfg, health, http.event_loop.monotonicMs());
-            }
-        } else {
-            health.probe_success_streak = 0;
-            health.probe_fail_streak +|= 1;
-            if (health.probe_fail_streak >= cfg.upstream_active_health_fail_threshold) {
-                health.probe_fail_streak = 0;
+            },
+            .marked_down => {
                 health.unhealthy_until_ms = http.event_loop.monotonicMs() + cfg.upstream_fail_timeout_ms;
                 health.slow_start_until_ms = 0;
-            }
+            },
+            else => {},
         }
         self.updateUpstreamHealthMetricLocked();
     }
 
     fn isUpstreamHealthyLocked(self: *GatewayState, cfg: *const edge_config.EdgeConfig, upstream_base_url: []const u8, now_ms: u64) bool {
         if (self.upstream_health.getPtr(upstream_base_url)) |health| {
-            if (health.unhealthy_until_ms == 0) return true;
-            if (now_ms >= health.unhealthy_until_ms) {
+            if (health.unhealthy_until_ms != 0 and now_ms >= health.unhealthy_until_ms) {
                 health.unhealthy_until_ms = 0;
                 health.fail_count = 0;
                 self.beginSlowStartLocked(cfg, health, now_ms);
                 self.updateUpstreamHealthMetricLocked();
-                return true;
             }
-            return false;
+            if (health.unhealthy_until_ms != 0 and now_ms < health.unhealthy_until_ms) return false;
+            if (cfg.upstream_active_health_interval_ms > 0 and !health.probe.isRoutable()) return false;
+            return true;
         }
         return true;
     }
@@ -1136,14 +1539,29 @@ const GatewayState = struct {
         var it = self.upstream_health.iterator();
         while (it.next()) |entry| {
             const health = entry.value_ptr.*;
-            if (health.unhealthy_until_ms > now_ms) unhealthy += 1;
+            if (health.unhealthy_until_ms > now_ms or !health.probe.isRoutable()) unhealthy += 1;
         }
+        self.metrics_mutex.lock();
         self.metrics.setUpstreamUnhealthyBackends(unhealthy);
+        self.metrics_mutex.unlock();
+    }
+
+    fn upstreamUnhealthyCount(self: *GatewayState) usize {
+        self.upstream_mutex.lock();
+        defer self.upstream_mutex.unlock();
+        const now_ms = http.event_loop.monotonicMs();
+        var unhealthy: usize = 0;
+        var it = self.upstream_health.iterator();
+        while (it.next()) |entry| {
+            const health = entry.value_ptr.*;
+            if (health.unhealthy_until_ms > now_ms or !health.probe.isRoutable()) unhealthy += 1;
+        }
+        return unhealthy;
     }
 
     fn recordUpstreamAttemptStart(self: *GatewayState, upstream_base_url: []const u8) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.upstream_mutex.lock();
+        defer self.upstream_mutex.unlock();
 
         if (self.upstream_active_requests.getPtr(upstream_base_url)) |count| {
             count.* += 1;
@@ -1156,8 +1574,8 @@ const GatewayState = struct {
     }
 
     fn recordUpstreamAttemptEnd(self: *GatewayState, upstream_base_url: []const u8) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.upstream_mutex.lock();
+        defer self.upstream_mutex.unlock();
         if (self.upstream_active_requests.getPtr(upstream_base_url)) |count| {
             if (count.* > 1) {
                 count.* -= 1;
@@ -1170,8 +1588,8 @@ const GatewayState = struct {
     }
 
     fn streamCountAdjust(self: *GatewayState, ws_delta: i32, sse_delta: i32) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.connection_mutex.lock();
+        defer self.connection_mutex.unlock();
         if (ws_delta < 0) {
             const dec: usize = @intCast(-ws_delta);
             self.active_ws_streams = if (self.active_ws_streams > dec) self.active_ws_streams - dec else 0;
@@ -1187,20 +1605,137 @@ const GatewayState = struct {
     }
 
     fn streamCounts(self: *GatewayState) struct { ws: usize, sse: usize } {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.connection_mutex.lock();
+        defer self.connection_mutex.unlock();
         return .{ .ws = self.active_ws_streams, .sse = self.active_sse_streams };
     }
 
+    fn muxConnectionAdjust(self: *GatewayState, delta: i32) void {
+        self.connection_mutex.lock();
+        if (delta < 0) {
+            const dec: usize = @intCast(-delta);
+            self.active_mux_connections = if (self.active_mux_connections > dec) self.active_mux_connections - dec else 0;
+        } else if (delta > 0) {
+            self.active_mux_connections += @intCast(delta);
+        }
+        const active = self.active_mux_connections;
+        self.connection_mutex.unlock();
+
+        self.metrics_mutex.lock();
+        defer self.metrics_mutex.unlock();
+        self.metrics.setMuxConnections(active);
+    }
+
+    fn muxSubscriptionCount(self: *GatewayState, device_id: []const u8) usize {
+        self.connection_mutex.lock();
+        defer self.connection_mutex.unlock();
+        return self.mux_subscriptions_by_device.get(device_id) orelse 0;
+    }
+
+    fn muxSubscriptionAdjust(self: *GatewayState, device_id: []const u8, delta: i32) void {
+        self.connection_mutex.lock();
+        if (delta < 0) {
+            const dec: usize = @intCast(-delta);
+            self.active_mux_subscriptions = if (self.active_mux_subscriptions > dec) self.active_mux_subscriptions - dec else 0;
+            if (self.mux_subscriptions_by_device.getPtr(device_id)) |count_ptr| {
+                count_ptr.* = if (count_ptr.* > dec) count_ptr.* - dec else 0;
+                if (count_ptr.* == 0) {
+                    if (self.mux_subscriptions_by_device.fetchRemove(device_id)) |removed| {
+                        self.allocator.free(removed.key);
+                    }
+                }
+            }
+        } else if (delta > 0) {
+            const inc: usize = @intCast(delta);
+            self.active_mux_subscriptions += inc;
+            if (self.mux_subscriptions_by_device.getPtr(device_id)) |count_ptr| {
+                count_ptr.* += inc;
+            } else {
+                const owned = self.allocator.dupe(u8, device_id) catch {
+                    self.connection_mutex.unlock();
+                    return;
+                };
+                self.mux_subscriptions_by_device.put(owned, inc) catch {
+                    self.allocator.free(owned);
+                    self.connection_mutex.unlock();
+                    return;
+                };
+            }
+        }
+        const active = self.active_mux_subscriptions;
+        self.connection_mutex.unlock();
+
+        self.metrics_mutex.lock();
+        defer self.metrics_mutex.unlock();
+        self.metrics.setMuxSubscriptions(active);
+    }
+
+    fn muxMetricsSnapshot(self: *GatewayState, allocator: std.mem.Allocator) !MuxMetricsSnapshot {
+        self.connection_mutex.lock();
+        defer self.connection_mutex.unlock();
+
+        var device_counts = std.ArrayList(MuxDeviceCount).init(allocator);
+        errdefer {
+            for (device_counts.items) |entry| allocator.free(entry.device_id);
+            device_counts.deinit();
+        }
+        var it = self.mux_subscriptions_by_device.iterator();
+        while (it.next()) |entry| {
+            try device_counts.append(.{
+                .device_id = try allocator.dupe(u8, entry.key_ptr.*),
+                .count = entry.value_ptr.*,
+            });
+        }
+        return .{ .device_counts = try device_counts.toOwnedSlice() };
+    }
+
+    fn saveMuxResumeState(self: *GatewayState, device_id: []const u8, channels: []const MuxChannel, grace_ms: u32) void {
+        self.runtime_mutex.lock();
+        defer self.runtime_mutex.unlock();
+
+        if (self.mux_resume_state.fetchRemove(device_id)) |removed| {
+            self.allocator.free(removed.key);
+            var value = removed.value;
+            deinitMuxResumeState(self.allocator, &value);
+        }
+        if (grace_ms == 0 or channels.len == 0) return;
+
+        const owned_key = self.allocator.dupe(u8, device_id) catch return;
+        const owned_channels = cloneMuxChannels(self.allocator, channels) catch {
+            self.allocator.free(owned_key);
+            return;
+        };
+        self.mux_resume_state.put(owned_key, .{
+            .channels = owned_channels,
+            .expires_ms = std.time.milliTimestamp() + @as(i64, grace_ms),
+        }) catch {
+            var saved_state = MuxResumeState{ .channels = owned_channels, .expires_ms = 0 };
+            deinitMuxResumeState(self.allocator, &saved_state);
+            self.allocator.free(owned_key);
+        };
+    }
+
+    fn takeMuxResumeState(self: *GatewayState, allocator: std.mem.Allocator, device_id: []const u8) ?[]MuxChannel {
+        self.runtime_mutex.lock();
+        defer self.runtime_mutex.unlock();
+
+        const removed = self.mux_resume_state.fetchRemove(device_id) orelse return null;
+        defer self.allocator.free(removed.key);
+        var saved = removed.value;
+        defer deinitMuxResumeState(self.allocator, &saved);
+        if (saved.expires_ms < std.time.milliTimestamp()) return null;
+        return cloneMuxChannels(allocator, saved.channels) catch null;
+    }
+
     fn connectionCounts(self: *GatewayState) struct { active: usize, per_ip: usize } {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.connection_mutex.lock();
+        defer self.connection_mutex.unlock();
         return .{ .active = self.active_connections_total, .per_ip = self.active_connections_by_ip.count() };
     }
 
     fn upstreamHealthJson(self: *GatewayState, allocator: std.mem.Allocator) ![]u8 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.upstream_mutex.lock();
+        defer self.upstream_mutex.unlock();
         var out = std.ArrayList(u8).init(allocator);
         errdefer out.deinit();
         try out.appendSlice("{\"upstreams\":[");
@@ -1212,8 +1747,11 @@ const GatewayState = struct {
             first = false;
             const url = entry.key_ptr.*;
             const h = entry.value_ptr.*;
-            const healthy = h.unhealthy_until_ms == 0 or h.unhealthy_until_ms <= now_ms;
-            try out.writer().print("{{\"url\":\"{s}\",\"healthy\":{},\"unhealthy_until_ms\":{d}}}", .{ url, healthy, h.unhealthy_until_ms });
+            const healthy = (h.unhealthy_until_ms == 0 or h.unhealthy_until_ms <= now_ms) and h.probe.isRoutable();
+            try out.writer().print(
+                "{{\"url\":\"{s}\",\"healthy\":{},\"unhealthy_until_ms\":{d},\"active_status\":\"{s}\"}}",
+                .{ url, healthy, h.unhealthy_until_ms, h.probe.status.asString() },
+            );
         }
         try out.appendSlice("]}");
         return out.toOwnedSlice();
@@ -1315,13 +1853,15 @@ const ConnectionSession = struct {
 
 const ConnectionSessionPool = struct {
     allocator: std.mem.Allocator,
+    buffer_pool: *http.buffer_pool.BufferPool,
     mutex: std.Thread.Mutex = .{},
     free_list: std.ArrayList(*ConnectionSession),
     max_cached: usize,
 
-    fn init(allocator: std.mem.Allocator, max_cached: usize) ConnectionSessionPool {
+    fn init(allocator: std.mem.Allocator, buffer_pool: *http.buffer_pool.BufferPool, max_cached: usize) ConnectionSessionPool {
         return .{
             .allocator = allocator,
+            .buffer_pool = buffer_pool,
             .free_list = std.ArrayList(*ConnectionSession).init(allocator),
             .max_cached = max_cached,
         };
@@ -1329,6 +1869,7 @@ const ConnectionSessionPool = struct {
 
     fn deinit(self: *ConnectionSessionPool) void {
         for (self.free_list.items) |session| {
+            if (session.pending_buf) |buf| self.buffer_pool.release(buf);
             self.allocator.destroy(session);
         }
         self.free_list.deinit();
@@ -1339,12 +1880,17 @@ const ConnectionSessionPool = struct {
         defer self.mutex.unlock();
 
         if (self.free_list.items.len > 0) {
-            return self.free_list.pop().?;
+            const session = self.free_list.pop().?;
+            session.* = .{};
+            return session;
         }
-        return try self.allocator.create(ConnectionSession);
+        const session = try self.allocator.create(ConnectionSession);
+        session.* = .{};
+        return session;
     }
 
     fn release(self: *ConnectionSessionPool, session: *ConnectionSession) void {
+        if (session.pending_buf) |buf| self.buffer_pool.release(buf);
         session.pending_len = 0;
         session.pending_buf = null;
         session.proxy_protocol_checked = false;
@@ -1362,6 +1908,38 @@ const ConnectionSessionPool = struct {
         };
     }
 };
+
+/// Load persisted approvals from disk into state at startup.
+/// Prunes entries older than 1 hour that are no longer pending.
+fn loadApprovalStore(state: *GatewayState) !void {
+    const stored = try http.approval_store.load(state.allocator, state.approval_store_path);
+    defer http.approval_store.freeLoaded(state.allocator, stored);
+
+    const now = std.time.milliTimestamp();
+    const retention_ms: i64 = 3_600_000; // 1 hour retention for decided entries
+
+    for (stored) |s| {
+        const status = std.meta.stringToEnum(ApprovalStatus, s.status) orelse .escalated;
+        // Prune old decided entries; always keep pending ones.
+        if (status != .pending and s.decided_ms > 0 and (now - s.decided_ms) > retention_ms) {
+            continue;
+        }
+        const token_key = state.allocator.dupe(u8, s.token) catch continue;
+        const entry = ApprovalEntry{
+            .method = state.allocator.dupe(u8, s.method) catch { state.allocator.free(token_key); continue; },
+            .path = state.allocator.dupe(u8, s.path) catch { state.allocator.free(token_key); continue; },
+            .identity = state.allocator.dupe(u8, s.identity) catch { state.allocator.free(token_key); continue; },
+            .command_id = state.allocator.dupe(u8, s.command_id) catch { state.allocator.free(token_key); continue; },
+            .status = status,
+            .created_ms = s.created_ms,
+            .expires_ms = s.expires_ms,
+            .decided_ms = s.decided_ms,
+            .decided_by = state.allocator.dupe(u8, s.decided_by) catch { state.allocator.free(token_key); continue; },
+            .escalation_fired = s.escalation_fired,
+        };
+        state.approvals.put(token_key, entry) catch { state.allocator.free(token_key); };
+    }
+}
 
 pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -1389,6 +1967,8 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         else
             http.security_headers.SecurityHeaders{ .x_frame_options = "", .x_content_type_options = "", .content_security_policy = "", .strict_transport_security = "", .referrer_policy = "", .permissions_policy = "", .x_xss_protection = "" },
         .add_headers = cfg.add_headers,
+        .http3_alt_svc = if (cfg.http3_enabled) http.http3_handler.formatAltSvc(state_allocator, cfg.quic_port) catch null else null,
+        .http3_runtime = null,
         .session_store = if (cfg.session_ttl_seconds > 0)
             http.session.SessionStore.init(state_allocator, cfg.session_ttl_seconds, cfg.session_max)
         else
@@ -1418,6 +1998,8 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         .active_connections_total = 0,
         .active_ws_streams = 0,
         .active_sse_streams = 0,
+        .active_mux_connections = 0,
+        .active_mux_subscriptions = 0,
         .connection_memory_estimate_bytes = if (cfg.max_connection_memory_bytes > 0) cfg.max_connection_memory_bytes else MAX_REQUEST_SIZE,
         .max_total_connection_memory_bytes = cfg.max_total_connection_memory_bytes,
         .upstream_rr_index = 0,
@@ -1427,14 +2009,30 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         .next_proxy_cache_maintenance_ms = 0,
         .upstream_health = std.StringHashMap(UpstreamHealth).init(state_allocator),
         .upstream_active_requests = std.StringHashMap(usize).init(state_allocator),
+        .fastcgi_pool = std.StringHashMap(std.ArrayList(std.net.Stream)).init(state_allocator),
+        .fastcgi_next_request_id = std.StringHashMap(u16).init(state_allocator),
         .proxy_cache_locks = std.StringHashMap(u32).init(state_allocator),
         .active_connections_by_ip = std.StringHashMap(u32).init(state_allocator),
         .active_fds = std.AutoHashMap(std.posix.fd_t, void).init(state_allocator),
         .fd_to_ip = std.AutoHashMap(std.posix.fd_t, []u8).init(state_allocator),
         .command_lifecycle = std.StringHashMap(CommandLifecycleEntry).init(state_allocator),
         .approvals = std.StringHashMap(ApprovalEntry).init(state_allocator),
+        .mux_subscriptions_by_device = std.StringHashMap(usize).init(state_allocator),
+        .mux_resume_state = std.StringHashMap(MuxResumeState).init(state_allocator),
+        .approval_store_path = cfg.approval_store_path,
+        .approval_escalation_webhook = cfg.approval_escalation_webhook,
+        .approval_ttl_ms = if (cfg.approval_ttl_ms > 0) cfg.approval_ttl_ms else APPROVAL_TIMEOUT_MS_DEFAULT,
+        .approval_max_pending_per_identity = cfg.approval_max_pending_per_identity,
     };
     defer state.deinit();
+
+    // Load approval state from persistent store (if configured).
+    if (cfg.approval_store_path.len > 0) {
+        loadApprovalStore(&state) catch |err| {
+            state.logger.warn(null, "failed to load approval store '{s}': {}", .{ cfg.approval_store_path, err });
+        };
+    }
+
     http.access_log.init(state_allocator, .{
         .format = cfg.access_log_format,
         .custom_template = cfg.access_log_template,
@@ -1458,7 +2056,9 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     defer event_loop.deinit();
     try event_loop.addReadFd(listen_fd);
     var timer = http.event_loop.TimerManager.init(250);
+    var http3_runtime: ?http.http3_runtime.Runtime = null;
     var tls_terminator: ?http.tls_termination.TlsTerminator = null;
+    var http3_dispatch_ctx = Http3DispatchContext{ .cfg = cfg, .state = &state };
     if (edge_config.hasTlsFiles(cfg)) {
         var sni_specs = try state_allocator.alloc(http.tls_termination.SniCertSpec, cfg.tls_sni_certs.len);
         defer state_allocator.free(sni_specs);
@@ -1491,6 +2091,33 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         });
     }
     defer if (tls_terminator) |*tls| tls.deinit();
+    if (cfg.http3_enabled) {
+        if (!edge_config.hasTlsFiles(cfg)) {
+            state.logger.warn(null, "HTTP/3 requested without TLS cert/key; QUIC bootstrap will remain incomplete", .{});
+        }
+        http3_runtime = http.http3_runtime.Runtime.init(state_allocator, &state.logger, .{
+            .listen_host = cfg.listen_host,
+            .quic_port = cfg.quic_port,
+            .tls_cert_path = cfg.tls_cert_path,
+            .tls_key_path = cfg.tls_key_path,
+            .tls_min_version = "1.3",
+            .tls_max_version = "1.3",
+            .enable_0rtt = cfg.http3_enable_0rtt,
+            .connection_migration = cfg.http3_connection_migration,
+            .max_datagram_size = cfg.http3_max_datagram_size,
+            .request_handler = handleHttp3Request,
+            .request_handler_ctx = &http3_dispatch_ctx,
+        }) catch |err| switch (err) {
+            error.DependencyUnavailable => blk: {
+                state.logger.warn(null, "HTTP/3 requested but ngtcp2/nghttp3 integration is not enabled in this build", .{});
+                break :blk null;
+            },
+            else => return err,
+        };
+        if (http3_runtime) |*runtime| runtime.start();
+    }
+    state.http3_runtime = if (http3_runtime) |*runtime| runtime else null;
+    defer if (http3_runtime) |*runtime| runtime.deinit();
     const worker_count: usize = blk: {
         const configured = if (cfg.worker_threads == 0)
             (std.Thread.getCpuCount() catch 1)
@@ -1504,7 +2131,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         .tls = if (tls_terminator) |*tls| tls else null,
         .session_pool = undefined,
     };
-    var session_pool = ConnectionSessionPool.init(state_allocator, cfg.connection_pool_size);
+    var session_pool = ConnectionSessionPool.init(state_allocator, &state.request_buffer_pool, cfg.connection_pool_size);
     defer session_pool.deinit();
     worker_ctx.session_pool = &session_pool;
     var reloaded_cfgs = std.ArrayList(*edge_config.EdgeConfig).init(state_allocator);
@@ -1570,7 +2197,8 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         }
     }
     if (cfg.http3_enabled) {
-        state.logger.info(null, "HTTP/3 foundation enabled: 0rtt={} migration={} max_datagram={d}", .{
+        state.logger.info(null, "HTTP/3 foundation enabled: quic_port={d} 0rtt={} migration={} max_datagram={d}", .{
+            cfg.quic_port,
             cfg.http3_enable_0rtt,
             cfg.http3_connection_migration,
             cfg.http3_max_datagram_size,
@@ -1725,7 +2353,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
 
     // Install signal handlers for graceful shutdown
     http.shutdown.installSignalHandlers();
-    state.logger.info(null, "Signal handlers installed (SIGTERM/SIGINT shutdown, SIGHUP reload, SIGUSR2 upgrade)", .{});
+    state.logger.info(null, "Signal handlers installed (SIGTERM/SIGINT shutdown, SIGHUP reload, SIGUSR1 reopen logs, SIGUSR2 upgrade)", .{});
 
     var ready_events: [64]http.event_loop.Event = undefined;
     while (!http.shutdown.isShutdownRequested()) {
@@ -1747,6 +2375,13 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
             if (http.shutdown.consumeUpgradeRequested()) {
                 state.logger.info(null, "Upgrade signal received; entering graceful shutdown", .{});
                 http.shutdown.requestShutdown();
+            }
+            if (http.shutdown.consumeReopenLogsRequested()) {
+                const current_cfg = worker_ctx.currentCfg();
+                http.access_log.flush();
+                reopenErrorLog(current_cfg) catch |err| {
+                    state.logger.warn(null, "log reopen failed: {}", .{err});
+                };
             }
             if (http.shutdown.consumeReloadRequested()) {
                 hotReloadConfig(state_allocator, &worker_ctx, &state, &reloaded_cfgs);
@@ -1834,7 +2469,15 @@ fn hotReloadConfig(
         state.logger.warn(null, "config reload failed during validation: {}", .{err});
         return;
     };
+    edge_config.validate(&loaded) catch |err| {
+        var rejected = loaded;
+        rejected.deinit(allocator);
+        state.logger.warn(null, "config reload rejected by validation: {}", .{err});
+        return;
+    };
     const cfg_ptr = allocator.create(edge_config.EdgeConfig) catch {
+        var rejected = loaded;
+        rejected.deinit(allocator);
         state.logger.warn(null, "config reload allocation failed", .{});
         return;
     };
@@ -1860,9 +2503,28 @@ fn hotReloadConfig(
 }
 
 fn applyReloadedRuntimeConfig(cfg: *const edge_config.EdgeConfig, state: *GatewayState) void {
-    state.mutex.lock();
-    defer state.mutex.unlock();
+    state.rate_limiter_mutex.lock();
+    if (state.rate_limiter) |*rl| rl.deinit();
+    state.rate_limiter = if (cfg.rate_limit_rps > 0)
+        http.rate_limiter.RateLimiter.init(state.allocator, cfg.rate_limit_rps, cfg.rate_limit_burst)
+    else
+        null;
+    state.rate_limiter_mutex.unlock();
+
+    state.proxy_cache_mutex.lock();
+    if (state.proxy_cache_store) |*pc| pc.deinit();
+    state.proxy_cache_store = if (cfg.proxy_cache_ttl_seconds > 0)
+        http.idempotency.IdempotencyStore.init(state.allocator, cfg.proxy_cache_ttl_seconds)
+    else
+        null;
+    state.proxy_cache_path = cfg.proxy_cache_path;
+    state.proxy_cache_ttl_seconds = cfg.proxy_cache_ttl_seconds;
+    state.proxy_cache_mutex.unlock();
+
+    state.runtime_mutex.lock();
     state.add_headers = cfg.add_headers;
+    if (state.http3_alt_svc) |value| state.allocator.free(value);
+    state.http3_alt_svc = if (cfg.http3_enabled) http.http3_handler.formatAltSvc(state.allocator, cfg.quic_port) catch null else null;
     state.security_headers = if (cfg.security_headers_enabled)
         http.security_headers.SecurityHeaders.api
     else
@@ -1871,8 +2533,6 @@ fn applyReloadedRuntimeConfig(cfg: *const edge_config.EdgeConfig, state: *Gatewa
     state.max_active_connections = cfg.max_active_connections;
     state.max_total_connection_memory_bytes = cfg.max_total_connection_memory_bytes;
     state.connection_memory_estimate_bytes = if (cfg.max_connection_memory_bytes > 0) cfg.max_connection_memory_bytes else MAX_REQUEST_SIZE;
-    state.proxy_cache_path = cfg.proxy_cache_path;
-    state.proxy_cache_ttl_seconds = cfg.proxy_cache_ttl_seconds;
     state.compression_config = .{
         .enabled = cfg.compression_enabled,
         .min_size = cfg.compression_min_size,
@@ -1880,6 +2540,15 @@ fn applyReloadedRuntimeConfig(cfg: *const edge_config.EdgeConfig, state: *Gatewa
         .brotli_quality = cfg.compression_brotli_quality,
     };
     state.logger.min_level = cfg.log_level;
+    state.runtime_mutex.unlock();
+}
+
+fn reopenErrorLog(cfg: *const edge_config.EdgeConfig) !void {
+    if (cfg.error_log_path.len == 0 or std.ascii.eqlIgnoreCase(cfg.error_log_path, "stderr")) return;
+    var file = try std.fs.cwd().createFile(cfg.error_log_path, .{ .truncate = false, .read = false });
+    defer file.close();
+    try file.seekFromEnd(0);
+    try std.posix.dup2(file.handle, std.io.getStdErr().handle);
 }
 
 fn rejectOverloadedClient(client_fd: std.posix.fd_t) void {
@@ -1930,6 +2599,25 @@ fn runActiveHealthChecks(cfg: *const edge_config.EdgeConfig, state: *GatewayStat
     }
 }
 
+fn activeHealthConfig(cfg: *const edge_config.EdgeConfig, upstream_base_url: []const u8) http.health_checker.Config {
+    var success_status = cfg.upstream_active_health_success_status;
+    for (cfg.upstream_active_health_success_status_overrides) |entry| {
+        if (std.mem.eql(u8, upstream_base_url, entry.upstream_base_url)) {
+            success_status = entry.range;
+            break;
+        }
+    }
+    return .{
+        .path = cfg.upstream_active_health_path,
+        .interval_ms = cfg.upstream_active_health_interval_ms,
+        .timeout_ms = cfg.upstream_active_health_timeout_ms,
+        .fail_threshold = cfg.upstream_active_health_fail_threshold,
+        .success_threshold = cfg.upstream_active_health_success_threshold,
+        .success_status_min = success_status.min,
+        .success_status_max = success_status.max,
+    };
+}
+
 fn runProxyCacheMaintenance(cfg: *const edge_config.EdgeConfig, state: *GatewayState) void {
     if (cfg.proxy_cache_ttl_seconds == 0) return;
     const interval = cfg.proxy_cache_manager_interval_ms;
@@ -1938,16 +2626,17 @@ fn runProxyCacheMaintenance(cfg: *const edge_config.EdgeConfig, state: *GatewayS
     if (state.next_proxy_cache_maintenance_ms != 0 and now_ms < state.next_proxy_cache_maintenance_ms) return;
     state.next_proxy_cache_maintenance_ms = now_ms + interval;
 
-    state.mutex.lock();
-    defer state.mutex.unlock();
+    state.proxy_cache_mutex.lock();
+    defer state.proxy_cache_mutex.unlock();
     if (state.proxy_cache_store) |*store| {
         _ = store.cleanupExpired();
     }
 }
 
 fn probeSingleUpstream(cfg: *const edge_config.EdgeConfig, state: *GatewayState, probe_client: *std.http.Client, base_url: []const u8) void {
+    const health_cfg = activeHealthConfig(cfg, base_url);
     const probe_base = if (unixSocketPathFromEndpoint(base_url) != null) "http://localhost" else base_url;
-    const probe_url = buildHealthProbeUrl(state.allocator, probe_base, cfg.upstream_active_health_path) catch |err| {
+    const probe_url = http.health_checker.buildProbeUrl(state.allocator, probe_base, health_cfg.path) catch |err| {
         state.logger.warn(null, "active health probe url build failed for {s}: {}", .{ base_url, err });
         state.recordActiveProbeResult(cfg, base_url, false);
         return;
@@ -2003,18 +2692,11 @@ fn probeSingleUpstream(cfg: *const edge_config.EdgeConfig, state: *GatewayState,
     };
 
     const status_code: u16 = @intFromEnum(req.response.status);
-    if (status_code >= 200 and status_code < 400) {
+    if (health_cfg.statusIsHealthy(status_code)) {
         state.recordActiveProbeResult(cfg, base_url, true);
     } else {
         state.recordActiveProbeResult(cfg, base_url, false);
     }
-}
-
-fn buildHealthProbeUrl(allocator: std.mem.Allocator, base_url: []const u8, probe_path: []const u8) ![]u8 {
-    const base_trimmed = std.mem.trimRight(u8, base_url, "/");
-    const path_trimmed = std.mem.trimLeft(u8, probe_path, "/");
-    if (path_trimmed.len == 0) return std.fmt.allocPrint(allocator, "{s}/", .{base_trimmed});
-    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ base_trimmed, path_trimmed });
 }
 
 fn applyFdSoftLimit(desired: u64) !?u64 {
@@ -2036,9 +2718,12 @@ fn applyFdSoftLimit(desired: u64) !?u64 {
 }
 
 fn applyRuntimeIdentity(cfg: *const edge_config.EdgeConfig, logger: *const http.logger.Logger) !void {
+    const c = @cImport({
+        @cInclude("unistd.h");
+    });
     if (cfg.chroot_dir.len > 0) {
         try std.posix.chdir(cfg.chroot_dir);
-        try std.posix.chroot(".");
+        if (c.chroot(".") != 0) return error.ChrootFailed;
         try std.posix.chdir("/");
         logger.info(null, "Applied chroot jail: {s}", .{cfg.chroot_dir});
     }
@@ -2060,7 +2745,7 @@ fn applyRuntimeIdentity(cfg: *const edge_config.EdgeConfig, logger: *const http.
         logger.info(null, "Applied runtime user: uid={d}", .{uid});
     }
 
-    if (cfg.require_unprivileged_user and std.posix.getuid() == 0) {
+    if (cfg.require_unprivileged_user and c.getuid() == 0) {
         return error.RunningAsRoot;
     }
 }
@@ -2167,7 +2852,7 @@ fn clientIpKeyFromAddress(allocator: std.mem.Allocator, address: std.net.Address
 
 fn setNonBlocking(fd: std.posix.fd_t, enabled: bool) !void {
     var flags = try std.posix.fcntl(fd, std.posix.F.GETFL, 0);
-    const nonblock_mask = @as(i32, 1 << @bitOffsetOf(std.posix.O, "NONBLOCK"));
+    const nonblock_mask = @as(usize, 1) << @bitOffsetOf(std.posix.O, "NONBLOCK");
     if (enabled) {
         flags |= nonblock_mask;
     } else {
@@ -2462,6 +3147,7 @@ fn respondHttp2Stream(
     ps: *const Http2PendingStream,
     next_server_stream_id: *u31,
 ) !void {
+    _ = next_server_stream_id;
     const method = ps.method orelse return error.InvalidHttp2Request;
     const path = ps.path orelse return error.InvalidHttp2Request;
     const correlation_id = try http.correlation.generate(allocator);
@@ -2469,151 +3155,16 @@ fn respondHttp2Stream(
 
     var status_code: u16 = 404;
     var body: []const u8 = "{\"error\":\"Not Found\"}";
-    var body_alloc: ?[]u8 = null;
+    const body_alloc: ?[]u8 = null;
     defer if (body_alloc) |b| allocator.free(b);
-    var content_type: []const u8 = JSON_CONTENT_TYPE;
+    const content_type: []const u8 = JSON_CONTENT_TYPE;
 
-    if (std.mem.eql(u8, method, "POST") and http.api_router.matchRoute(path, 1, "/chat")) {
-        const auth_result = authorizeRequest(cfg, &ps.headers);
-        if (!auth_result.ok) {
-            status_code = 401;
-            body = "{\"error\":\"Unauthorized\"}";
-        } else {
-            const message = parseChatMessage(allocator, ps.body.items, cfg.max_message_chars) catch null;
-            if (message) |msg| {
-                defer allocator.free(msg);
-                const chat_request_body = try std.fmt.allocPrint(allocator, "{{\"message\":{s}}}", .{std.json.fmt(msg, .{})});
-                defer allocator.free(chat_request_body);
-                const exec = proxyJsonExecute(
-                    allocator,
-                    cfg,
-                    .chat,
-                    cfg.proxy_pass_chat,
-                    null,
-                    chat_request_body,
-                    correlation_id,
-                    "h2",
-                    auth_result.token_hash,
-                    null,
-                    null,
-                    null,
-                    writer,
-                    state,
-                    false,
-                ) catch null;
-                if (exec) |res| switch (res) {
-                    .buffered => |proxy_result| {
-                        defer allocator.free(proxy_result.body);
-                        status_code = proxy_result.status;
-                        body_alloc = try allocator.dupe(u8, proxy_result.body);
-                        body = body_alloc.?;
-                        content_type = proxy_result.content_type;
-                        if (proxy_result.content_disposition) |cd| allocator.free(cd);
-                        allocator.free(proxy_result.content_type);
-                    },
-                    .streamed_status => |st| {
-                        status_code = st;
-                        body = "";
-                    },
-                } else {
-                    status_code = 503;
-                    body = "{\"error\":\"Upstream unavailable\"}";
-                }
-            } else {
-                status_code = 400;
-                body = "{\"error\":\"invalid chat payload\"}";
-            }
-        }
-    } else if (std.mem.eql(u8, method, "POST") and http.api_router.matchRoute(path, 1, "/commands")) {
-        const auth_result = authorizeRequest(cfg, &ps.headers);
-        if (!auth_result.ok) {
-            status_code = 401;
-            body = "{\"error\":\"Unauthorized\"}";
-        } else {
-            var cmd = http.command.parseCommand(allocator, ps.body.items) catch null;
-            if (cmd) |*command| {
-                defer command.deinit(allocator);
-                const upstream_path = command.command_type.upstreamPath();
-                const envelope = http.command.buildUpstreamEnvelope(
-                    allocator,
-                    command.command_type,
-                    command.params_raw,
-                    correlation_id,
-                    auth_result.token_hash orelse "-",
-                    "h2",
-                    null,
-                ) catch null;
-                if (envelope) |env| {
-                    defer allocator.free(env);
-                    const exec = proxyJsonExecute(
-                        allocator,
-                        cfg,
-                        .commands,
-                        cfg.proxy_pass_commands_prefix,
-                        upstream_path,
-                        env,
-                        correlation_id,
-                        "h2",
-                        auth_result.token_hash,
-                        null,
-                        null,
-                        null,
-                        writer,
-                        state,
-                        false,
-                    ) catch null;
-                    if (exec) |res| switch (res) {
-                        .buffered => |proxy_result| {
-                            defer allocator.free(proxy_result.body);
-                            status_code = proxy_result.status;
-                            body_alloc = try allocator.dupe(u8, proxy_result.body);
-                            body = body_alloc.?;
-                            content_type = proxy_result.content_type;
-                            if (proxy_result.content_disposition) |cd| allocator.free(cd);
-                            allocator.free(proxy_result.content_type);
-                        },
-                        .streamed_status => |st| {
-                            status_code = st;
-                            body = "";
-                        },
-                    } else {
-                        status_code = 503;
-                        body = "{\"error\":\"Upstream unavailable\"}";
-                    }
-                } else {
-                    status_code = 500;
-                    body = "{\"error\":\"failed to build command envelope\"}";
-                }
-            } else {
-                status_code = 400;
-                body = "{\"error\":\"invalid command envelope\"}";
-            }
-        }
-    }
+    _ = method;
+    _ = path;
+    _ = cfg;
 
-    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/health")) {
-        status_code = 200;
-        body = "{\"status\":\"ok\",\"service\":\"tardigrade-edge\"}";
-    } else if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/metrics")) {
-        body_alloc = state.metricsToJson(allocator) catch null;
-        if (body_alloc) |b| {
-            status_code = 200;
-            body = b;
-        } else {
-            status_code = 500;
-            body = "{\"error\":\"internal_error\"}";
-        }
-    } else if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/metrics/prometheus")) {
-        body_alloc = state.metricsToPrometheus(allocator) catch null;
-        if (body_alloc) |b| {
-            status_code = 200;
-            body = b;
-            content_type = "text/plain; version=0.0.4; charset=utf-8";
-        } else {
-            status_code = 500;
-            body = "{\"error\":\"internal_error\"}";
-        }
-    }
+    status_code = 404;
+    body = "{\"error\":\"not_found\"}";
 
     const status_str = try std.fmt.allocPrint(allocator, "{d}", .{status_code});
     defer allocator.free(status_str);
@@ -2640,11 +3191,6 @@ fn respondHttp2Stream(
         stream_id,
         header_block,
     );
-    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/health")) {
-        const promised_stream_id = next_server_stream_id.*;
-        next_server_stream_id.* += 2;
-        try pushHttp2Resource(writer, allocator, stream_id, promised_stream_id, "/metrics", "application/json", "{\"pushed\":true}");
-    }
     try http.http2_frame.writeFrame(
         writer,
         .data,
@@ -2768,20 +3314,89 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
     else
         "unknown";
     const client_ip = http.request_context.extractClientIp(&request, connection_ip);
+    var effective_cfg_storage = cfg.*;
+    const effective_cfg = resolveRequestConfig(cfg, request.headers.get("host"), &effective_cfg_storage) orelse {
+        try sendApiError(allocator, writer, .not_found, "invalid_request", "Not Found", correlation_id, keep_alive, state);
+        var ctx_404 = http.request_context.RequestContext.init(allocator, correlation_id, client_ip);
+        logAccess(&ctx_404, request.method.toString(), request.uri.path, 404, request.headers.get("user-agent") orelse "");
+        return;
+    };
     var ctx = http.request_context.RequestContext.init(allocator, correlation_id, client_ip);
-    if (!hostMatchesServerNames(cfg, &request)) {
+    if (!hostMatchesServerNames(effective_cfg, &request)) {
         try sendApiError(allocator, writer, .not_found, "invalid_request", "Not Found", correlation_id, keep_alive, state);
         logAccess(&ctx, request.method.toString(), request.uri.path, 404, request.headers.get("user-agent") orelse "");
         return;
     }
 
     // --- Rewrite / return directives ---
-    const rewrite_outcome = http.rewrite.evaluate(
+    var request_uri_buf = std.ArrayList(u8).init(allocator);
+    defer request_uri_buf.deinit();
+    try request_uri_buf.appendSlice(request.uri.path);
+    if (request.uri.query) |query| {
+        try request_uri_buf.append('?');
+        try request_uri_buf.appendSlice(query);
+    }
+
+    var conditional_outcome = try evaluateConditionalRules(
+        allocator,
+        effective_cfg.conditional_rules,
+        request.uri.path,
+        request_uri_buf.items,
+        request.headers.get("host") orelse "",
+        request.uri.query orelse "",
+    );
+    defer if (conditional_outcome) |*outcome| outcome.deinit(allocator);
+    if (conditional_outcome) |outcome| {
+        switch (outcome) {
+            .pass => |rewritten_path| {
+                request.uri.path = rewritten_path;
+            },
+            .redirect => |r| {
+                var response = http.Response.redirect(allocator, r.location, @enumFromInt(r.status));
+                defer response.deinit();
+                _ = response.setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
+                applyResponseHeaders(state, &response);
+                try response.write(writer);
+                state.metricsRecord(r.status);
+                logAccess(&ctx, request.method.toString(), request.uri.path, r.status, request.headers.get("user-agent") orelse "");
+                return;
+            },
+            .returned => |r| {
+                if (r.status >= 300 and r.status < 400 and r.body.len > 0) {
+                    var response = http.Response.redirect(allocator, r.body, @enumFromInt(r.status));
+                    defer response.deinit();
+                    _ = response.setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
+                    applyResponseHeaders(state, &response);
+                    try response.write(writer);
+                    state.metricsRecord(r.status);
+                    logAccess(&ctx, request.method.toString(), request.uri.path, r.status, request.headers.get("user-agent") orelse "");
+                    return;
+                }
+                var response = http.Response.init(allocator);
+                defer response.deinit();
+                _ = response.setStatus(@enumFromInt(r.status))
+                    .setBody(r.body)
+                    .setContentType("text/plain; charset=utf-8")
+                    .setConnection(keep_alive)
+                    .setHeader(http.correlation.HEADER_NAME, correlation_id);
+                applyResponseHeaders(state, &response);
+                try response.write(writer);
+                state.metricsRecord(r.status);
+                logAccess(&ctx, request.method.toString(), request.uri.path, r.status, request.headers.get("user-agent") orelse "");
+                return;
+            },
+        }
+    }
+
+    var rewrite_outcome = try http.rewrite.evaluate(
+        allocator,
         request.method.toString(),
         request.uri.path,
+        request_uri_buf.items,
         cfg.rewrite_rules,
         cfg.return_rules,
     );
+    defer rewrite_outcome.deinit(allocator);
     switch (rewrite_outcome) {
         .pass => |rewritten_path| {
             request.uri.path = rewritten_path;
@@ -2797,6 +3412,16 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
             return;
         },
         .returned => |r| {
+            if (r.status >= 300 and r.status < 400 and r.body.len > 0) {
+                var response = http.Response.redirect(allocator, r.body, @enumFromInt(r.status));
+                defer response.deinit();
+                _ = response.setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
+                applyResponseHeaders(state, &response);
+                try response.write(writer);
+                state.metricsRecord(r.status);
+                logAccess(&ctx, request.method.toString(), request.uri.path, r.status, request.headers.get("user-agent") orelse "");
+                return;
+            }
             var response = http.Response.init(allocator);
             defer response.deinit();
             _ = response.setStatus(@enumFromInt(r.status))
@@ -2816,15 +3441,15 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
     request.uri.path = applyInternalRedirectRules(
         request.method.toString(),
         request.uri.path,
-        cfg.internal_redirect_rules,
-        cfg.named_locations,
+        effective_cfg.internal_redirect_rules,
+        effective_cfg.named_locations,
     );
 
     // --- Mirror requests (best-effort async) ---
-    if (cfg.mirror_rules.len > 0) {
+    if (effective_cfg.mirror_rules.len > 0) {
         spawnMirrorRequests(
             allocator,
-            cfg.mirror_rules,
+            effective_cfg.mirror_rules,
             request.method.toString(),
             request.uri.path,
             request.body orelse "",
@@ -2834,17 +3459,304 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         );
     }
 
-    // --- Geo-based blocking (external country header) ---
+    if (try runMiddlewarePipeline(allocator, writer, effective_cfg, state, &ctx, &request, correlation_id, keep_alive)) {
+        return;
+    }
+
+    const route_status = try routeRequest(conn, allocator, effective_cfg, state, &ctx, &request, correlation_id, &keep_alive, client_ip);
+    logAccess(&ctx, request.method.toString(), request.uri.path, route_status, request.headers.get("user-agent") orelse "");
+    return;
+}
+
+fn routeRequest(
+    conn: anytype,
+    allocator: std.mem.Allocator,
+    cfg: *const edge_config.EdgeConfig,
+    state: *GatewayState,
+    ctx: *http.request_context.RequestContext,
+    request: *http.Request,
+    correlation_id: []const u8,
+    keep_alive: *bool,
+    client_ip: []const u8,
+) !u16 {
+    const writer = conn.writer();
+    if (http.location_router.matchLocation(request.uri.path, cfg.location_blocks)) |matched| {
+        switch (matched.block.action) {
+            .proxy_pass => |target| {
+                return try handleLocationProxyPass(allocator, writer, cfg, state, request, target, correlation_id, keep_alive.*, client_ip, ctx.identity);
+            },
+            .fastcgi_pass => |upstream| {
+                return try handleFastcgiRoute(allocator, writer, cfg, upstream, request, client_ip, correlation_id, keep_alive.*, state);
+            },
+            .return_response => |ret| {
+                if (ret.status >= 300 and ret.status < 400 and ret.body.len > 0) {
+                    var response = http.Response.redirect(allocator, ret.body, @enumFromInt(ret.status));
+                    defer response.deinit();
+                    _ = response.setConnection(keep_alive.*).setHeader(http.correlation.HEADER_NAME, correlation_id);
+                    applyResponseHeaders(state, &response);
+                    try response.write(writer);
+                } else {
+                    var response = http.Response.init(allocator);
+                    defer response.deinit();
+                    _ = response.setStatus(@enumFromInt(ret.status))
+                        .setBody(ret.body)
+                        .setContentType("text/plain; charset=utf-8")
+                        .setConnection(keep_alive.*)
+                        .setHeader(http.correlation.HEADER_NAME, correlation_id);
+                    applyResponseHeaders(state, &response);
+                    try response.write(writer);
+                }
+                state.metricsRecord(ret.status);
+                return ret.status;
+            },
+            .rewrite => |rw| {
+                request.uri.path = rw.replacement;
+            },
+            .static_root => |root_cfg| {
+                if (try handleStaticLocation(allocator, writer, request, matched, root_cfg, correlation_id, keep_alive.*, state)) |status| return status;
+            },
+        }
+    }
+
+    if (serveTryFilesFallback(allocator, cfg, request.method.toString(), request.uri.path, correlation_id, keep_alive.*, writer, state)) |status| {
+        state.metricsRecord(status);
+        return status;
+    } else |_| {}
+
+    try sendApiError(allocator, writer, .not_found, "invalid_request", "Not Found", correlation_id, keep_alive.*, state);
+    state.metricsRecord(404);
+    return 404;
+}
+
+fn handleLocationProxyPass(
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    cfg: *const edge_config.EdgeConfig,
+    state: *GatewayState,
+    request: *const http.Request,
+    target: []const u8,
+    correlation_id: []const u8,
+    keep_alive: bool,
+    _: []const u8,
+    _: ?[]const u8,
+) !u16 {
+    const resolved = try resolveProxyTarget(allocator, cfg.upstream_base_url, target, request.uri.path);
+    defer allocator.free(resolved.url);
+    const body = request.body orelse "";
+    var upstream_response = try executeRawHttpProxyRequest(allocator, resolved.url, request.method.toString(), request.contentType(), body, correlation_id);
+    defer upstream_response.deinit(allocator);
+
+    var response = http.Response.init(allocator);
+    defer response.deinit();
+    _ = response.setStatus(@enumFromInt(upstream_response.status_code))
+        .setBody(upstream_response.body)
+        .setContentType(upstream_response.content_type)
+        .setConnection(keep_alive)
+        .setHeader(http.correlation.HEADER_NAME, correlation_id);
+    applyResponseHeaders(state, &response);
+    try response.write(writer);
+    const status_code = upstream_response.status_code;
+    state.metricsRecord(status_code);
+    return status_code;
+}
+
+const RawUpstreamResponse = struct {
+    status_code: u16,
+    content_type: []u8,
+    body: []u8,
+
+    fn deinit(self: *RawUpstreamResponse, allocator: std.mem.Allocator) void {
+        allocator.free(self.content_type);
+        allocator.free(self.body);
+        self.* = undefined;
+    }
+};
+
+fn executeRawHttpProxyRequest(
+    allocator: std.mem.Allocator,
+    url: []const u8,
+    method: []const u8,
+    content_type: ?[]const u8,
+    body: []const u8,
+    correlation_id: []const u8,
+) !RawUpstreamResponse {
+    const parsed = try parseAbsoluteHttpUrl(url);
+    const stream = try std.net.tcpConnectToHost(allocator, parsed.host, parsed.port);
+    defer stream.close();
+
+    const ct = content_type orelse "application/octet-stream";
+    try stream.writer().print(
+        "{s} {s} HTTP/1.1\r\nHost: {s}\r\nContent-Length: {d}\r\nContent-Type: {s}\r\n{s}: {s}\r\nConnection: close\r\n\r\n",
+        .{ method, parsed.path, parsed.authority, body.len, ct, http.correlation.HEADER_NAME, correlation_id },
+    );
+    if (body.len > 0) try stream.writer().writeAll(body);
+
+    var raw = std.ArrayList(u8).init(allocator);
+    defer raw.deinit();
+    try readAllHttpMessage(allocator, stream, &raw, MAX_REQUEST_SIZE);
+
+    const response = raw.items;
+    const header_end = std.mem.indexOf(u8, response, "\r\n\r\n") orelse return error.InvalidHttpResponse;
+    const status_end = std.mem.indexOf(u8, response, "\r\n") orelse return error.InvalidHttpResponse;
+    const status_line = response[0..status_end];
+    const status_code = parseStatusCode(status_line) orelse return error.InvalidHttpResponse;
+    const header_blob = response[status_end + 2 .. header_end];
+    const body_slice = response[header_end + 4 ..];
+
+    return .{
+        .status_code = status_code,
+        .content_type = try allocator.dupe(u8, headerValue(header_blob, "Content-Type") orelse "application/octet-stream"),
+        .body = try allocator.dupe(u8, body_slice),
+    };
+}
+
+const ParsedAbsoluteUrl = struct {
+    authority: []const u8,
+    host: []const u8,
+    port: u16,
+    path: []const u8,
+};
+
+fn parseAbsoluteHttpUrl(url: []const u8) !ParsedAbsoluteUrl {
+    const scheme_end = std.mem.indexOf(u8, url, "://") orelse return error.InvalidUrl;
+    const scheme = url[0..scheme_end];
+    const authority_start = scheme_end + 3;
+    const path_start = std.mem.indexOfScalarPos(u8, url, authority_start, '/') orelse url.len;
+    const authority = url[authority_start..path_start];
+    if (authority.len == 0) return error.InvalidUrl;
+    return .{
+        .authority = authority,
+        .host = stripHostPort(authority),
+        .port = hostPort(authority) orelse if (std.ascii.eqlIgnoreCase(scheme, "https")) 443 else 80,
+        .path = if (path_start < url.len) url[path_start..] else "/",
+    };
+}
+
+fn readAllHttpMessage(
+    _: std.mem.Allocator,
+    stream: std.net.Stream,
+    out: *std.ArrayList(u8),
+    max_bytes: usize,
+) !void {
+    var buf: [4096]u8 = undefined;
+    var header_end: ?usize = null;
+    var content_length: usize = 0;
+
+    while (true) {
+        const n = try stream.read(&buf);
+        if (n == 0) break;
+        try out.appendSlice(buf[0..n]);
+        if (out.items.len > max_bytes) return error.MessageTooLarge;
+        if (header_end == null) {
+            if (std.mem.indexOf(u8, out.items, "\r\n\r\n")) |idx| {
+                header_end = idx + 4;
+                content_length = parseContentLength(out.items[0..idx]) orelse 0;
+            }
+        }
+        if (header_end) |headers_len| {
+            if (out.items.len >= headers_len + content_length) return;
+        }
+    }
+}
+
+fn parseStatusCode(status_line: []const u8) ?u16 {
+    var parts = std.mem.tokenizeAny(u8, status_line, " ");
+    _ = parts.next() orelse return null;
+    const code = parts.next() orelse return null;
+    return std.fmt.parseInt(u16, code, 10) catch null;
+}
+
+fn headerValue(headers_raw: []const u8, name: []const u8) ?[]const u8 {
+    var lines = std.mem.tokenizeAny(u8, headers_raw, "\r\n");
+    while (lines.next()) |line| {
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const header_name = std.mem.trim(u8, line[0..colon], " \t");
+        if (!std.ascii.eqlIgnoreCase(header_name, name)) continue;
+        return std.mem.trim(u8, line[colon + 1 ..], " \t");
+    }
+    return null;
+}
+
+const StaticErrorPageResult = union(enum) {
+    served: http.static_file.Result,
+    redirect: []u8,
+
+    fn deinit(self: *StaticErrorPageResult, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .served => |*served| served.deinit(allocator),
+            .redirect => |target| allocator.free(target),
+        }
+        self.* = undefined;
+    }
+};
+
+fn wantsHtmlErrorPage(request_path: []const u8, headers: *const http.Headers) bool {
+    if (std.mem.startsWith(u8, request_path, "/v1/")) return false;
+    const accept = headers.get("accept") orelse return false;
+    if (std.mem.indexOf(u8, accept, "text/html") != null) return true;
+    if (std.mem.indexOf(u8, accept, "*/*") != null) return true;
+    if (std.mem.indexOf(u8, accept, "application/json") != null) return false;
+    return false;
+}
+
+fn findErrorPageTarget(block: *const http.location_router.LocationBlock, status_code: u16) ?[]const u8 {
+    for (block.error_pages) |rule| {
+        for (rule.status_codes) |candidate| {
+            if (candidate == status_code) return rule.target;
+        }
+    }
+    return null;
+}
+
+fn maybeResolveStaticErrorPage(
+    allocator: std.mem.Allocator,
+    matched: http.location_router.MatchResult,
+    root_cfg: anytype,
+    request_path: []const u8,
+    headers: *const http.Headers,
+    status_code: u16,
+) !?StaticErrorPageResult {
+    if (!wantsHtmlErrorPage(request_path, headers)) return null;
+    const target = findErrorPageTarget(matched.block, status_code) orelse return null;
+    if (std.mem.startsWith(u8, target, "http://") or std.mem.startsWith(u8, target, "https://")) {
+        return .{ .redirect = try allocator.dupe(u8, target) };
+    }
+    var served = (try http.static_file.serve(allocator, .{
+        .root = root_cfg.root,
+        .request_path = target,
+        .matched_pattern = "/",
+        .alias = false,
+        .index = root_cfg.index,
+        .try_files = "",
+        .autoindex = false,
+        .headers = headers,
+        .max_bytes = MAX_REQUEST_SIZE,
+    })) orelse return null;
+    served.status_code = @enumFromInt(status_code);
+    return .{ .served = served };
+}
+
+fn runMiddlewarePipeline(
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    cfg: *const edge_config.EdgeConfig,
+    state: *GatewayState,
+    ctx: *http.request_context.RequestContext,
+    request: *const http.Request,
+    correlation_id: []const u8,
+    keep_alive: bool,
+) !bool {
+    const client_ip = ctx.client_ip;
+
     if (cfg.geo_blocked_countries.len > 0) {
         const country = request.headers.get(cfg.geo_country_header);
         if (isGeoBlocked(cfg.geo_blocked_countries, country)) {
             try sendApiError(allocator, writer, .forbidden, "forbidden", "Geo access denied", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), request.uri.path, 403, request.headers.get("user-agent") orelse "");
-            return;
+            logAccess(ctx, request.method.toString(), request.uri.path, 403, request.headers.get("user-agent") orelse "");
+            return true;
         }
     }
 
-    // --- Request validation (body size, URI length, header count) ---
     const limits = cfg.request_limits;
     const uri_check = http.request_limits.validateUriLength(request.uri.path.len, limits);
     if (uri_check != .ok) {
@@ -2852,2214 +3764,156 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         const msg = http.request_limits.rejectionMessage(uri_check, &msg_buf);
         try sendApiError(allocator, writer, .uri_too_long, "invalid_request", msg, correlation_id, keep_alive, state);
         state.logger.warn(correlation_id, "URI too long: {d} bytes", .{request.uri.path.len});
-        logAccess(&ctx, request.method.toString(), request.uri.path, 414, request.headers.get("user-agent") orelse "");
-        return;
+        logAccess(ctx, request.method.toString(), request.uri.path, 414, request.headers.get("user-agent") orelse "");
+        return true;
     }
     const header_count_check = http.request_limits.validateHeaderCount(request.headers.count(), limits);
     if (header_count_check != .ok) {
         try sendApiError(allocator, writer, .bad_request, "invalid_request", "Too many headers", correlation_id, keep_alive, state);
         state.logger.warn(correlation_id, "Too many headers: {d}", .{request.headers.count()});
-        logAccess(&ctx, request.method.toString(), request.uri.path, 400, request.headers.get("user-agent") orelse "");
-        return;
+        logAccess(ctx, request.method.toString(), request.uri.path, 400, request.headers.get("user-agent") orelse "");
+        return true;
     }
     if (request.body) |body| {
         const body_check = http.request_limits.validateBodySize(body.len, limits);
         if (body_check != .ok) {
             try sendApiError(allocator, writer, .payload_too_large, "invalid_request", "Request body too large", correlation_id, keep_alive, state);
             state.logger.warn(correlation_id, "Body too large: {d} bytes", .{body.len});
-            logAccess(&ctx, request.method.toString(), request.uri.path, 413, request.headers.get("user-agent") orelse "");
-            return;
+            logAccess(ctx, request.method.toString(), request.uri.path, 413, request.headers.get("user-agent") orelse "");
+            return true;
         }
     }
 
-    // --- Extract API version ---
-    if (http.api_router.parseVersionedPath(request.uri.path)) |versioned| {
-        ctx.setApiVersion(versioned.version);
-    }
-
-    if (ctx.api_version != null and isProtectedAuthRequestRoute(request.uri.path)) {
-        if (cfg.device_auth_required and !validateDeviceRequest(cfg, request.method.toString(), request.uri.path, &request.headers, request.body orelse "")) {
-            try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Device authentication failed", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), request.uri.path, 401, request.headers.get("user-agent") orelse "");
-            return;
-        }
-
-        const identity = try extractIdentityForPolicy(allocator, cfg, state, &request);
-        defer if (identity) |id| allocator.free(id);
-        if (evaluatePolicy(state, cfg, request.method.toString(), request.uri.path, identity, request.headers.get("x-device-id"), &request.headers)) |reason| {
-            try sendApiError(allocator, writer, .forbidden, "forbidden", reason, correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), request.uri.path, 403, request.headers.get("user-agent") orelse "");
-            return;
-        }
-    }
-
-    // --- Extract idempotency key ---
-    if (http.idempotency.fromHeaders(&request.headers)) |idem_key| {
-        ctx.setIdempotencyKey(idem_key);
-    }
-
-    // --- IP Access Control ---
     if (state.access_control) |*acl| {
         if (acl.check(client_ip) == .denied) {
             try sendApiError(allocator, writer, .forbidden, "forbidden", "Access denied", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), request.uri.path, 403, request.headers.get("user-agent") orelse "");
-            return;
+            logAccess(ctx, request.method.toString(), request.uri.path, 403, request.headers.get("user-agent") orelse "");
+            return true;
         }
     }
 
-    // --- Rate Limiting ---
     if (!state.rateLimitAllow(client_ip)) {
-        try sendApiError(allocator, writer, .too_many_requests, "rate_limited", "Rate limit exceeded", correlation_id, keep_alive, state);
-        logAccess(&ctx, request.method.toString(), request.uri.path, 429, request.headers.get("user-agent") orelse "");
-        return;
-    }
-
-    // --- Health endpoint ---
-    if (request.method == .GET and std.mem.eql(u8, request.uri.path, "/health")) {
-        var response = http.Response.json(allocator, "{\"status\":\"ok\",\"service\":\"tardigrade-edge\"}");
-        defer response.deinit();
-        _ = response.setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
-        applyResponseHeaders(state, &response);
-        try response.write(writer);
-        state.metricsRecord(200);
-        logAccess(&ctx, request.method.toString(), "/health", 200, request.headers.get("user-agent") orelse "");
-        return;
-    }
-
-    // --- Metrics endpoint ---
-    if (request.method == .GET and std.mem.eql(u8, request.uri.path, "/metrics")) {
-        const metrics_json = state.metricsToJson(allocator) catch {
-            try sendApiError(allocator, writer, .internal_server_error, "internal_error", "Failed to generate metrics", correlation_id, keep_alive, state);
-            return;
-        };
-        defer allocator.free(metrics_json);
-
-        var response = http.Response.json(allocator, metrics_json);
-        defer response.deinit();
-        _ = response.setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
-        applyResponseHeaders(state, &response);
-        try response.write(writer);
-        state.metricsRecord(200);
-        logAccess(&ctx, request.method.toString(), "/metrics", 200, request.headers.get("user-agent") orelse "");
-        return;
-    }
-
-    // --- Prometheus metrics endpoint ---
-    if (request.method == .GET and std.mem.eql(u8, request.uri.path, "/metrics/prometheus")) {
-        const prom_text = state.metricsToPrometheus(allocator) catch {
-            try sendApiError(allocator, writer, .internal_server_error, "internal_error", "Failed to generate metrics", correlation_id, keep_alive, state);
-            return;
-        };
-        defer allocator.free(prom_text);
-
-        var response = http.Response.init(allocator);
-        defer response.deinit();
-        _ = response.setBody(prom_text)
-            .setContentType("text/plain; version=0.0.4; charset=utf-8")
-            .setConnection(keep_alive)
-            .setHeader(http.correlation.HEADER_NAME, correlation_id);
-        applyResponseHeaders(state, &response);
-        try response.write(writer);
-        state.metricsRecord(200);
-        logAccess(&ctx, request.method.toString(), "/metrics/prometheus", 200, request.headers.get("user-agent") orelse "");
-        return;
-    }
-
-    // --- Admin API ---
-    if (request.method == .GET and std.mem.startsWith(u8, request.uri.path, "/admin/")) {
-        const auth_result = authorizeRequest(cfg, &request.headers);
-        if (!auth_result.ok) {
-            try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), request.uri.path, 401, request.headers.get("user-agent") orelse "");
-            return;
-        }
-        if (std.mem.eql(u8, request.uri.path, "/admin/routes")) {
-            var response = http.Response.json(allocator, ADMIN_ROUTES_JSON);
-            defer response.deinit();
-            _ = response.setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
-            applyResponseHeaders(state, &response);
-            try response.write(writer);
-            state.metricsRecord(200);
-            logAccess(&ctx, request.method.toString(), request.uri.path, 200, request.headers.get("user-agent") orelse "");
-            return;
-        }
-        if (std.mem.eql(u8, request.uri.path, "/admin/connections")) {
-            const counts = state.connectionCounts();
-            const body = try std.fmt.allocPrint(allocator, "{{\"active\":{d},\"tracked_ip_buckets\":{d}}}", .{ counts.active, counts.per_ip });
-            defer allocator.free(body);
-            var response = http.Response.json(allocator, body);
-            defer response.deinit();
-            _ = response.setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
-            applyResponseHeaders(state, &response);
-            try response.write(writer);
-            state.metricsRecord(200);
-            logAccess(&ctx, request.method.toString(), request.uri.path, 200, request.headers.get("user-agent") orelse "");
-            return;
-        }
-        if (std.mem.eql(u8, request.uri.path, "/admin/streams")) {
-            const counts = state.streamCounts();
-            const body = try std.fmt.allocPrint(allocator, "{{\"websocket_active\":{d},\"sse_active\":{d}}}", .{ counts.ws, counts.sse });
-            defer allocator.free(body);
-            var response = http.Response.json(allocator, body);
-            defer response.deinit();
-            _ = response.setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
-            applyResponseHeaders(state, &response);
-            try response.write(writer);
-            state.metricsRecord(200);
-            logAccess(&ctx, request.method.toString(), request.uri.path, 200, request.headers.get("user-agent") orelse "");
-            return;
-        }
-        if (std.mem.eql(u8, request.uri.path, "/admin/upstreams")) {
-            const body = state.upstreamHealthJson(allocator) catch try allocator.dupe(u8, "{\"upstreams\":[]}");
-            defer allocator.free(body);
-            var response = http.Response.json(allocator, body);
-            defer response.deinit();
-            _ = response.setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
-            applyResponseHeaders(state, &response);
-            try response.write(writer);
-            state.metricsRecord(200);
-            logAccess(&ctx, request.method.toString(), request.uri.path, 200, request.headers.get("user-agent") orelse "");
-            return;
-        }
-        if (std.mem.eql(u8, request.uri.path, "/admin/certs")) {
-            const body = try std.fmt.allocPrint(allocator, "{{\"default_cert\":\"{s}\",\"default_key\":\"{s}\",\"sni_count\":{d}}}", .{ cfg.tls_cert_path, cfg.tls_key_path, cfg.tls_sni_certs.len });
-            defer allocator.free(body);
-            var response = http.Response.json(allocator, body);
-            defer response.deinit();
-            _ = response.setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
-            applyResponseHeaders(state, &response);
-            try response.write(writer);
-            state.metricsRecord(200);
-            logAccess(&ctx, request.method.toString(), request.uri.path, 200, request.headers.get("user-agent") orelse "");
-            return;
-        }
-        if (std.mem.eql(u8, request.uri.path, "/admin/auth-registry")) {
-            const body = try std.fmt.allocPrint(allocator, "{{\"bearer_hashes\":{d},\"basic_auth_hashes\":{d},\"sessions_enabled\":{}}}", .{
-                cfg.auth_token_hashes.len,
-                cfg.basic_auth_hashes.len,
-                state.session_store != null,
-            });
-            defer allocator.free(body);
-            var response = http.Response.json(allocator, body);
-            defer response.deinit();
-            _ = response.setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
-            applyResponseHeaders(state, &response);
-            try response.write(writer);
-            state.metricsRecord(200);
-            logAccess(&ctx, request.method.toString(), request.uri.path, 200, request.headers.get("user-agent") orelse "");
-            return;
-        }
-
-        try sendApiError(allocator, writer, .not_found, "invalid_request", "Unknown admin route", correlation_id, keep_alive, state);
-        logAccess(&ctx, request.method.toString(), request.uri.path, 404, request.headers.get("user-agent") orelse "");
-        return;
-    }
-
-    // --- Versioned API routing ---
-    const versioned = http.api_router.parseVersionedPath(request.uri.path);
-    if (versioned) |route| {
-        if (!http.api_router.isSupportedVersion(route.version)) {
-            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Unsupported API version", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), request.uri.path, 400, request.headers.get("user-agent") orelse "");
-            return;
-        }
-        if (cfg.auth_request_url.len > 0 and isProtectedAuthRequestRoute(request.uri.path)) {
-            if (!authorizeViaSubrequest(allocator, cfg, &request, correlation_id, client_ip)) {
-                try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, keep_alive, state);
-                logAccess(&ctx, request.method.toString(), request.uri.path, 401, request.headers.get("user-agent") orelse "");
-                return;
-            }
-        }
-    }
-
-    // --- POST /v1/subrequest ---
-    if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/subrequest")) {
-        const auth_result = authorizeRequest(cfg, &request.headers);
-        if (!auth_result.ok) {
-            try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/subrequest", 401, request.headers.get("user-agent") orelse "");
-            return;
-        }
-        ctx.setIdentity(auth_result.token_hash orelse "-");
-        const body = request.body orelse "";
-        const sub = parseSubrequestPayload(allocator, body) catch {
-            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Invalid subrequest payload", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/subrequest", 400, request.headers.get("user-agent") orelse "");
-            return;
-        };
-        defer {
-            allocator.free(sub.url);
-            if (sub.body) |b| allocator.free(b);
-        }
-        const out = executeSubrequest(allocator, sub.url, sub.method, sub.body) catch |err| {
-            state.logger.warn(correlation_id, "subrequest failed: {}", .{err});
-            try sendApiError(allocator, writer, .bad_gateway, "tool_unavailable", "Subrequest failed", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/subrequest", 502, request.headers.get("user-agent") orelse "");
-            return;
-        };
-        defer allocator.free(out.body);
-        var response = http.Response.init(allocator);
-        defer response.deinit();
-        _ = response.setStatus(@enumFromInt(out.status))
-            .setBody(out.body)
-            .setContentType(out.content_type)
-            .setConnection(keep_alive)
-            .setHeader(http.correlation.HEADER_NAME, correlation_id);
-        applyResponseHeaders(state, &response);
-        try response.write(writer);
-        state.metricsRecord(out.status);
-        logAccess(&ctx, request.method.toString(), "/v1/subrequest", out.status, request.headers.get("user-agent") orelse "");
-        return;
-    }
-
-    // --- Backend protocol bridges (Phase 11.3) ---
-    if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/backend/fastcgi")) {
-        try handleBackendProtocolRoute(
-            allocator,
-            writer,
-            cfg.fastcgi_upstream,
-            request.method.toString(),
-            request.uri.path,
-            request.body orelse "",
-            correlation_id,
-            keep_alive,
-            state,
-            .fastcgi,
-        );
-        logAccess(&ctx, request.method.toString(), "/v1/backend/fastcgi", 200, request.headers.get("user-agent") orelse "");
-        return;
-    }
-    if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/backend/uwsgi")) {
-        try handleBackendProtocolRoute(
-            allocator,
-            writer,
-            cfg.uwsgi_upstream,
-            request.method.toString(),
-            request.uri.path,
-            request.body orelse "",
-            correlation_id,
-            keep_alive,
-            state,
-            .uwsgi,
-        );
-        logAccess(&ctx, request.method.toString(), "/v1/backend/uwsgi", 200, request.headers.get("user-agent") orelse "");
-        return;
-    }
-    if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/backend/scgi")) {
-        try handleBackendProtocolRoute(
-            allocator,
-            writer,
-            cfg.scgi_upstream,
-            request.method.toString(),
-            request.uri.path,
-            request.body orelse "",
-            correlation_id,
-            keep_alive,
-            state,
-            .scgi,
-        );
-        logAccess(&ctx, request.method.toString(), "/v1/backend/scgi", 200, request.headers.get("user-agent") orelse "");
-        return;
-    }
-    if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/backend/grpc")) {
-        const upstream = std.mem.trim(u8, cfg.grpc_upstream, " \t\r\n");
-        if (upstream.len == 0) {
-            try sendApiError(allocator, writer, .not_implemented, "tool_unavailable", "gRPC upstream not configured", correlation_id, keep_alive, state);
-            return;
-        }
-        const body = request.body orelse "";
-        const grpc_resp = proxyGrpcExecute(
-            allocator,
-            upstream,
-            body,
-            correlation_id,
-            state,
-        ) catch |err| {
-            state.logger.warn(correlation_id, "grpc proxy failed: {}", .{err});
-            try sendApiError(allocator, writer, .bad_gateway, "tool_unavailable", "gRPC proxy failed", correlation_id, keep_alive, state);
-            return;
-        };
-        defer allocator.free(grpc_resp);
-        var response = http.Response.init(allocator);
-        defer response.deinit();
-        _ = response.setStatus(.ok)
-            .setBody(grpc_resp)
-            .setContentType("application/grpc")
-            .setConnection(keep_alive)
-            .setHeader(http.correlation.HEADER_NAME, correlation_id);
-        applyResponseHeaders(state, &response);
-        try response.write(writer);
-        state.metricsRecord(200);
-        logAccess(&ctx, request.method.toString(), "/v1/backend/grpc", 200, request.headers.get("user-agent") orelse "");
-        return;
-    }
-    if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/backend/memcached")) {
-        const ep = std.mem.trim(u8, cfg.memcached_upstream, " \t\r\n");
-        if (ep.len == 0) {
-            try sendApiError(allocator, writer, .not_implemented, "tool_unavailable", "Memcached upstream not configured", correlation_id, keep_alive, state);
-            return;
-        }
-        const payload = request.body orelse "";
-        const parsed = parseMemcachedPayload(allocator, payload) catch {
-            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Invalid memcached payload", correlation_id, keep_alive, state);
-            return;
-        };
-        defer {
-            allocator.free(parsed.op);
-            allocator.free(parsed.key);
-            if (parsed.value) |v| allocator.free(v);
-        }
-        if (std.ascii.eqlIgnoreCase(parsed.op, "get")) {
-            const value = http.memcached.get(allocator, ep, parsed.key) catch null;
-            defer if (value) |v| allocator.free(v);
-            const body = if (value) |v|
-                try std.fmt.allocPrint(allocator, "{{\"value\":{s}}}", .{std.json.fmt(v, .{})})
-            else
-                try allocator.dupe(u8, "{\"value\":null}");
-            defer allocator.free(body);
-            var response = http.Response.json(allocator, body);
-            defer response.deinit();
-            _ = response.setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
-            applyResponseHeaders(state, &response);
-            try response.write(writer);
-            state.metricsRecord(200);
-            logAccess(&ctx, request.method.toString(), "/v1/backend/memcached", 200, request.headers.get("user-agent") orelse "");
-            return;
-        }
-        if (std.ascii.eqlIgnoreCase(parsed.op, "set")) {
-            const stored = http.memcached.set(allocator, ep, parsed.key, parsed.value orelse "", parsed.ttl) catch false;
-            const body = if (stored) "{\"stored\":true}" else "{\"stored\":false}";
-            var response = http.Response.json(allocator, body);
-            defer response.deinit();
-            _ = response.setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
-            applyResponseHeaders(state, &response);
-            try response.write(writer);
-            state.metricsRecord(200);
-            logAccess(&ctx, request.method.toString(), "/v1/backend/memcached", 200, request.headers.get("user-agent") orelse "");
-            return;
-        }
-        try sendApiError(allocator, writer, .bad_request, "invalid_request", "Unsupported memcached operation", correlation_id, keep_alive, state);
-        return;
-    }
-
-    // --- Mail proxy routes (Phase 11.4 optional) ---
-    if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/mail/smtp")) {
-        try handleMailProxyRoute(allocator, writer, cfg.smtp_upstream, request.body orelse "", correlation_id, keep_alive, state);
-        logAccess(&ctx, request.method.toString(), "/v1/mail/smtp", 200, request.headers.get("user-agent") orelse "");
-        return;
-    }
-    if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/mail/imap")) {
-        try handleMailProxyRoute(allocator, writer, cfg.imap_upstream, request.body orelse "", correlation_id, keep_alive, state);
-        logAccess(&ctx, request.method.toString(), "/v1/mail/imap", 200, request.headers.get("user-agent") orelse "");
-        return;
-    }
-    if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/mail/pop3")) {
-        try handleMailProxyRoute(allocator, writer, cfg.pop3_upstream, request.body orelse "", correlation_id, keep_alive, state);
-        logAccess(&ctx, request.method.toString(), "/v1/mail/pop3", 200, request.headers.get("user-agent") orelse "");
-        return;
-    }
-
-    // --- Stream module routes (Phase 11.5) ---
-    if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/stream/tcp")) {
-        try handleMailProxyRoute(allocator, writer, cfg.tcp_proxy_upstream, request.body orelse "", correlation_id, keep_alive, state);
-        logAccess(&ctx, request.method.toString(), "/v1/stream/tcp", 200, request.headers.get("user-agent") orelse "");
-        return;
-    }
-    if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/stream/udp")) {
-        const upstream = std.mem.trim(u8, cfg.udp_proxy_upstream, " \t\r\n");
-        if (upstream.len == 0) {
-            try sendApiError(allocator, writer, .not_implemented, "tool_unavailable", "UDP upstream not configured", correlation_id, keep_alive, state);
-            return;
-        }
-        const udp_resp = executeUdpDatagramRequest(allocator, upstream, request.body orelse "") catch |err| {
-            state.logger.warn(correlation_id, "udp stream proxy failed: {}", .{err});
-            try sendApiError(allocator, writer, .bad_gateway, "tool_unavailable", "UDP proxy failed", correlation_id, keep_alive, state);
-            return;
-        };
-        defer allocator.free(udp_resp);
-        var response = http.Response.init(allocator);
-        defer response.deinit();
-        _ = response.setStatus(.ok)
-            .setBody(udp_resp)
-            .setContentType("application/octet-stream")
-            .setConnection(keep_alive)
-            .setHeader(http.correlation.HEADER_NAME, correlation_id)
-            .setHeader("X-Stream-SSL-Termination", if (cfg.stream_ssl_termination) "enabled" else "disabled");
-        applyResponseHeaders(state, &response);
-        try response.write(writer);
-        state.metricsRecord(200);
-        logAccess(&ctx, request.method.toString(), "/v1/stream/udp", 200, request.headers.get("user-agent") orelse "");
-        return;
-    }
-
-    // --- WebSocket proxy routes ---
-    if (request.method == .GET and http.api_router.matchRoute(request.uri.path, 1, "/ws/mux")) {
-        if (!cfg.websocket_enabled or !cfg.sse_enabled) {
-            try sendApiError(allocator, writer, .not_found, "invalid_request", "Not Found", correlation_id, false, state);
-            logAccess(&ctx, request.method.toString(), request.uri.path, 404, request.headers.get("user-agent") orelse "");
-            return;
-        }
-        if (!http.websocket.isUpgradeRequest(&request.headers)) {
-            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Expected websocket upgrade request", correlation_id, false, state);
-            logAccess(&ctx, request.method.toString(), request.uri.path, 400, request.headers.get("user-agent") orelse "");
-            return;
-        }
-        var authenticated = false;
-        const auth_result = authorizeRequest(cfg, &request.headers);
-        if (auth_result.ok) {
-            ctx.setIdentity(auth_result.token_hash orelse "-");
-            authenticated = true;
-        }
-        if (!authenticated) {
-            if (http.session.fromHeaders(&request.headers)) |session_token| {
-                if (state.validateSessionIdentity(allocator, session_token)) |identity| {
-                    defer allocator.free(identity);
-                    ctx.setIdentity(identity);
-                    authenticated = true;
-                }
-            }
-        }
-        if (!authenticated) {
-            try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, false, state);
-            logAccess(&ctx, request.method.toString(), request.uri.path, 401, request.headers.get("user-agent") orelse "");
-            return;
-        }
-        const device_id = request.headers.get("x-device-id") orelse {
-            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Missing X-Device-ID for multiplex stream", correlation_id, false, state);
-            logAccess(&ctx, request.method.toString(), request.uri.path, 400, request.headers.get("user-agent") orelse "");
-            return;
-        };
-        if (!isValidDeviceTopicSegment(device_id)) {
-            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Invalid device id", correlation_id, false, state);
-            logAccess(&ctx, request.method.toString(), request.uri.path, 400, request.headers.get("user-agent") orelse "");
-            return;
-        }
-
-        const ws_key = request.headers.get("sec-websocket-key") orelse {
-            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Missing Sec-WebSocket-Key", correlation_id, false, state);
-            logAccess(&ctx, request.method.toString(), request.uri.path, 400, request.headers.get("user-agent") orelse "");
-            return;
-        };
-        const accept_key = try http.websocket.acceptKey(allocator, ws_key);
-        defer allocator.free(accept_key);
-        try http.websocket.writeServerHandshake(writer, accept_key, request.headers.get("sec-websocket-protocol"));
-
-        state.streamCountAdjust(1, 1);
-        defer state.streamCountAdjust(-1, -1);
-        handleWebSocketMultiplexLoop(
-            conn,
-            allocator,
-            cfg,
-            state,
-            correlation_id,
-            client_ip,
-            ctx.identity,
-            ctx.api_version,
-            request.headers.get("host"),
-            request.headers.get("x-forwarded-for"),
-            device_id,
-        ) catch |err| {
-            state.logger.warn(correlation_id, "websocket multiplex loop ended: {}", .{err});
-        };
-        state.metricsRecord(101);
-        logAccess(&ctx, request.method.toString(), request.uri.path, 101, request.headers.get("user-agent") orelse "");
-        keep_alive = false;
-        return;
-    }
-
-    if (request.method == .GET and (http.api_router.matchRoute(request.uri.path, 1, "/ws/chat") or http.api_router.matchRoute(request.uri.path, 1, "/ws/commands"))) {
-        if (!cfg.websocket_enabled) {
-            try sendApiError(allocator, writer, .not_found, "invalid_request", "Not Found", correlation_id, false, state);
-            logAccess(&ctx, request.method.toString(), request.uri.path, 404, request.headers.get("user-agent") orelse "");
-            return;
-        }
-        if (!http.websocket.isUpgradeRequest(&request.headers)) {
-            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Expected websocket upgrade request", correlation_id, false, state);
-            logAccess(&ctx, request.method.toString(), request.uri.path, 400, request.headers.get("user-agent") orelse "");
-            return;
-        }
-
-        var authenticated = false;
-        const auth_result = authorizeRequest(cfg, &request.headers);
-        if (auth_result.ok) {
-            ctx.setIdentity(auth_result.token_hash orelse "-");
-            authenticated = true;
-        }
-        if (!authenticated) {
-            if (http.session.fromHeaders(&request.headers)) |session_token| {
-                if (state.validateSessionIdentity(allocator, session_token)) |identity| {
-                    defer allocator.free(identity);
-                    ctx.setIdentity(identity);
-                    authenticated = true;
-                }
-            }
-        }
-        if (!authenticated) {
-            try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, false, state);
-            logAccess(&ctx, request.method.toString(), request.uri.path, 401, request.headers.get("user-agent") orelse "");
-            return;
-        }
-
-        const ws_key = request.headers.get("sec-websocket-key") orelse {
-            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Missing Sec-WebSocket-Key", correlation_id, false, state);
-            logAccess(&ctx, request.method.toString(), request.uri.path, 400, request.headers.get("user-agent") orelse "");
-            return;
-        };
-        const accept_key = try http.websocket.acceptKey(allocator, ws_key);
-        defer allocator.free(accept_key);
-        try http.websocket.writeServerHandshake(writer, accept_key, request.headers.get("sec-websocket-protocol"));
-
-        const ws_scope: UpstreamScope = if (http.api_router.matchRoute(request.uri.path, 1, "/ws/chat")) .chat else .commands;
-        const ws_proxy_target = if (ws_scope == .chat) cfg.proxy_pass_chat else cfg.proxy_pass_commands_prefix;
-        state.streamCountAdjust(1, 0);
-        defer state.streamCountAdjust(-1, 0);
-        handleWebSocketProxyLoop(
-            conn,
-            allocator,
-            cfg,
-            state,
-            correlation_id,
-            client_ip,
-            ctx.identity,
-            ctx.api_version,
-            request.headers.get("host"),
-            request.headers.get("x-forwarded-for"),
-            ws_scope,
-            ws_proxy_target,
-        ) catch |err| {
-            state.logger.warn(correlation_id, "websocket loop ended: {}", .{err});
-        };
-        state.metricsRecord(101);
-        logAccess(&ctx, request.method.toString(), request.uri.path, 101, request.headers.get("user-agent") orelse "");
-        keep_alive = false;
-        return;
-    }
-
-    // --- SSE stream route ---
-    if (request.method == .GET and http.api_router.matchRoute(request.uri.path, 1, "/events/stream")) {
-        if (!cfg.sse_enabled) {
-            try sendApiError(allocator, writer, .not_found, "invalid_request", "Not Found", correlation_id, false, state);
-            logAccess(&ctx, request.method.toString(), request.uri.path, 404, request.headers.get("user-agent") orelse "");
-            return;
-        }
-
-        var authenticated = false;
-        const auth_result = authorizeRequest(cfg, &request.headers);
-        if (auth_result.ok) {
-            ctx.setIdentity(auth_result.token_hash orelse "-");
-            authenticated = true;
-        }
-        if (!authenticated) {
-            if (http.session.fromHeaders(&request.headers)) |session_token| {
-                if (state.validateSessionIdentity(allocator, session_token)) |identity| {
-                    defer allocator.free(identity);
-                    ctx.setIdentity(identity);
-                    authenticated = true;
-                }
-            }
-        }
-        if (!authenticated) {
-            try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, false, state);
-            logAccess(&ctx, request.method.toString(), request.uri.path, 401, request.headers.get("user-agent") orelse "");
-            return;
-        }
-
-        const topic = parseQueryParam(request.uri.query, "topic") orelse "default";
-        const last_event_id = parseLastEventId(request.headers.get("last-event-id"));
-        state.streamCountAdjust(0, 1);
-        defer state.streamCountAdjust(0, -1);
-        try streamSseTopic(writer, allocator, cfg, state, topic, last_event_id, correlation_id);
-        state.metricsRecord(200);
-        logAccess(&ctx, request.method.toString(), request.uri.path, 200, request.headers.get("user-agent") orelse "");
-        keep_alive = false;
-        return;
-    }
-
-    // --- SSE publish route ---
-    if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/events/publish")) {
-        if (!cfg.sse_enabled) {
-            try sendApiError(allocator, writer, .not_found, "invalid_request", "Not Found", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), request.uri.path, 404, request.headers.get("user-agent") orelse "");
-            return;
-        }
-        const auth_result = authorizeRequest(cfg, &request.headers);
-        if (!auth_result.ok) {
-            try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), request.uri.path, 401, request.headers.get("user-agent") orelse "");
-            return;
-        }
-        ctx.setIdentity(auth_result.token_hash orelse "-");
-
-        const topic = parseQueryParam(request.uri.query, "topic") orelse "default";
-        const payload = request.body orelse "";
-        const event_id = try state.event_hub.publish(topic, payload, http.event_loop.monotonicMs());
-        const body = try std.fmt.allocPrint(allocator, "{{\"topic\":\"{s}\",\"id\":{d}}}", .{ topic, event_id });
-        defer allocator.free(body);
-        var response = http.Response.json(allocator, body);
-        defer response.deinit();
-        _ = response.setStatus(.accepted)
-            .setConnection(keep_alive)
-            .setHeader(http.correlation.HEADER_NAME, correlation_id);
-        applyResponseHeaders(state, &response);
-        try response.write(writer);
-        state.metricsRecord(202);
-        logAccess(&ctx, request.method.toString(), request.uri.path, 202, request.headers.get("user-agent") orelse "");
-        return;
-    }
-
-    // --- POST /v1/devices/register (device identity registration) ---
-    if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/devices/register")) {
-        if (cfg.device_registry_path.len == 0) {
-            try sendApiError(allocator, writer, .not_implemented, "tool_unavailable", "Device registry not configured", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/devices/register", 501, request.headers.get("user-agent") orelse "");
-            return;
-        }
-        const auth_result = authorizeRequest(cfg, &request.headers);
-        if (!auth_result.ok) {
-            try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/devices/register", 401, request.headers.get("user-agent") orelse "");
-            return;
-        }
-        const body = request.body orelse "";
-        const reg = parseDeviceRegistration(allocator, body) catch {
-            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Invalid device registration payload", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/devices/register", 400, request.headers.get("user-agent") orelse "");
-            return;
-        };
-        defer {
-            allocator.free(reg.device_id);
-            allocator.free(reg.public_key);
-        }
-        registerDeviceIdentity(cfg.device_registry_path, reg.device_id, reg.public_key) catch {
-            try sendApiError(allocator, writer, .internal_server_error, "internal_error", "Failed to persist device identity", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/devices/register", 500, request.headers.get("user-agent") orelse "");
-            return;
-        };
-        var response = http.Response.created(allocator, "{\"registered\":true}", null);
-        defer response.deinit();
-        _ = response.setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
-        applyResponseHeaders(state, &response);
-        try response.write(writer);
-        state.metricsRecord(201);
-        logAccess(&ctx, request.method.toString(), "/v1/devices/register", 201, request.headers.get("user-agent") orelse "");
-        return;
-    }
-
-    // --- POST /v1/sessions/refresh ---
-    if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/sessions/refresh")) {
-        if (state.session_store == null) {
-            try sendApiError(allocator, writer, .not_found, "invalid_request", "Sessions not enabled", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/sessions/refresh", 404, request.headers.get("user-agent") orelse "");
-            return;
-        }
-        const session_token = http.session.fromHeaders(&request.headers) orelse {
-            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Missing or invalid X-Session-Token", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/sessions/refresh", 400, request.headers.get("user-agent") orelse "");
-            return;
-        };
-        const refreshed = state.refreshSession(allocator, session_token, client_ip) catch {
-            try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Invalid session token", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/sessions/refresh", 401, request.headers.get("user-agent") orelse "");
-            return;
-        };
-        defer allocator.free(refreshed);
-        const resp_body = try std.fmt.allocPrint(allocator, "{{\"session_token\":\"{s}\",\"access_ttl_seconds\":{d},\"refresh_ttl_seconds\":{d}}}", .{
-            refreshed,
-            cfg.access_token_ttl_seconds,
-            cfg.refresh_token_ttl_seconds,
-        });
-        defer allocator.free(resp_body);
-        var response = http.Response.ok(allocator, resp_body)
-            .setContentType(JSON_CONTENT_TYPE)
-            .setConnection(keep_alive)
-            .setHeader(http.correlation.HEADER_NAME, correlation_id)
-            .setHeader(http.session.SESSION_HEADER, refreshed);
-        applyResponseHeaders(state, &response);
-        try response.write(writer);
-        state.metricsRecord(200);
-        logAccess(&ctx, request.method.toString(), "/v1/sessions/refresh", 200, request.headers.get("user-agent") orelse "");
-        return;
-    }
-
-    // --- POST /v1/sessions (create session) ---
-    if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/sessions")) {
-        if (state.session_store == null) {
-            try sendApiError(allocator, writer, .not_found, "invalid_request", "Sessions not enabled", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/sessions", 404, request.headers.get("user-agent") orelse "");
-            return;
-        }
-
-        // Requires bearer auth to create a session
-        const auth_result = authorizeRequest(cfg, &request.headers);
-        if (!auth_result.ok) {
-            try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/sessions", 401, request.headers.get("user-agent") orelse "");
-            return;
-        }
-        const identity = auth_result.token_hash orelse "-";
-        ctx.setIdentity(identity);
-
-        // Optional device_id from JSON body
-        var device_id: ?[]const u8 = null;
-        if (request.body) |body| {
-            if (isJsonContentType(request.contentType())) {
-                device_id = parseDeviceId(allocator, body) catch null;
-            }
-        }
-        defer if (device_id) |d| allocator.free(d);
-
-        const session_token = state.createSession(allocator, identity, client_ip, device_id) catch |err| {
-            const msg = switch (err) {
-                error.TooManySessions => "Too many active sessions",
-                else => "Session creation failed",
-            };
-            try sendApiError(allocator, writer, .too_many_requests, "rate_limited", msg, correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/sessions", 429, request.headers.get("user-agent") orelse "");
-            return;
-        };
-        defer allocator.free(session_token);
-
-        const resp_body = try std.fmt.allocPrint(allocator, "{{\"session_token\":\"{s}\"}}", .{session_token});
-        defer allocator.free(resp_body);
-
-        var response = http.Response.json(allocator, resp_body);
-        defer response.deinit();
-        _ = response.setStatus(.created)
-            .setConnection(keep_alive)
-            .setHeader(http.correlation.HEADER_NAME, correlation_id)
-            .setHeader(http.session.SESSION_HEADER, session_token);
-        applyResponseHeaders(state, &response);
-        try response.write(writer);
-        state.metricsRecord(201);
-        logAccess(&ctx, request.method.toString(), "/v1/sessions", 201, request.headers.get("user-agent") orelse "");
-        return;
-    }
-
-    // --- DELETE /v1/sessions (revoke session) ---
-    if (request.method == .DELETE and http.api_router.matchRoute(request.uri.path, 1, "/sessions")) {
-        if (state.session_store == null) {
-            try sendApiError(allocator, writer, .not_found, "invalid_request", "Sessions not enabled", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/sessions", 404, request.headers.get("user-agent") orelse "");
-            return;
-        }
-
-        const session_token = http.session.fromHeaders(&request.headers) orelse {
-            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Missing or invalid X-Session-Token", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/sessions", 400, request.headers.get("user-agent") orelse "");
-            return;
-        };
-
-        const revoked = state.revokeSession(session_token);
-        const resp_body = if (revoked)
-            "{\"revoked\":true}"
-        else
-            "{\"revoked\":false}";
-
-        var response = http.Response.json(allocator, resp_body);
-        defer response.deinit();
-        _ = response.setConnection(keep_alive)
-            .setHeader(http.correlation.HEADER_NAME, correlation_id);
-        applyResponseHeaders(state, &response);
-        try response.write(writer);
-        state.metricsRecord(200);
-        logAccess(&ctx, request.method.toString(), "/v1/sessions", 200, request.headers.get("user-agent") orelse "");
-        return;
-    }
-
-    // --- GET /v1/sessions (list sessions for identity) ---
-    if (request.method == .GET and http.api_router.matchRoute(request.uri.path, 1, "/sessions")) {
-        if (state.session_store == null) {
-            try sendApiError(allocator, writer, .not_found, "invalid_request", "Sessions not enabled", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/sessions", 404, request.headers.get("user-agent") orelse "");
-            return;
-        }
-
-        // Requires bearer auth
-        const auth_result = authorizeRequest(cfg, &request.headers);
-        if (!auth_result.ok) {
-            try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/sessions", 401, request.headers.get("user-agent") orelse "");
-            return;
-        }
-        const identity = auth_result.token_hash orelse "-";
-
-        const active_sessions = state.countSessionsByIdentity(allocator, identity) catch {
-            try sendApiError(allocator, writer, .internal_server_error, "internal_error", "Failed to list sessions", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/sessions", 500, request.headers.get("user-agent") orelse "");
-            return;
-        };
-
-        const resp_body = try std.fmt.allocPrint(allocator, "{{\"active_sessions\":{d}}}", .{active_sessions});
-        defer allocator.free(resp_body);
-
-        var response = http.Response.json(allocator, resp_body);
-        defer response.deinit();
-        _ = response.setConnection(keep_alive)
-            .setHeader(http.correlation.HEADER_NAME, correlation_id);
-        applyResponseHeaders(state, &response);
-        try response.write(writer);
-        state.metricsRecord(200);
-        logAccess(&ctx, request.method.toString(), "/v1/sessions", 200, request.headers.get("user-agent") orelse "");
-        return;
-    }
-
-    // --- POST /v1/cache/purge ---
-    if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/cache/purge")) {
-        if (state.proxy_cache_store == null) {
-            try sendApiError(allocator, writer, .not_found, "invalid_request", "Proxy cache not enabled", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/cache/purge", 404, request.headers.get("user-agent") orelse "");
-            return;
-        }
-
-        const auth_result = authorizeRequest(cfg, &request.headers);
-        if (!auth_result.ok) {
-            try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/cache/purge", 401, request.headers.get("user-agent") orelse "");
-            return;
-        }
-        ctx.setIdentity(auth_result.token_hash orelse "-");
-
-        var purged: usize = 0;
-        if (request.body) |body| {
-            if (isJsonContentType(request.contentType())) {
-                if (parseCachePurgeKey(allocator, body)) |key| {
-                    defer allocator.free(key);
-                    purged = if (state.proxyCacheDelete(key)) 1 else 0;
-                } else |_| {
-                    purged = state.proxyCachePurgeAll();
-                }
-            } else {
-                purged = state.proxyCachePurgeAll();
-            }
-        } else {
-            purged = state.proxyCachePurgeAll();
-        }
-
-        const resp_body = try std.fmt.allocPrint(allocator, "{{\"purged\":{d}}}", .{purged});
-        defer allocator.free(resp_body);
-        var response = http.Response.json(allocator, resp_body);
-        defer response.deinit();
-        _ = response.setConnection(keep_alive)
-            .setHeader(http.correlation.HEADER_NAME, correlation_id);
-        applyResponseHeaders(state, &response);
-        try response.write(writer);
-        state.metricsRecord(200);
-        logAccess(&ctx, request.method.toString(), "/v1/cache/purge", 200, request.headers.get("user-agent") orelse "");
-        return;
-    }
-
-    // --- GET /v1/commands/status?command_id=... ---
-    if (request.method == .GET and http.api_router.matchRoute(request.uri.path, 1, "/commands/status")) {
-        var authenticated = false;
-        const auth_result = authorizeRequest(cfg, &request.headers);
-        if (auth_result.ok) authenticated = true;
-        if (!authenticated) {
-            if (http.session.fromHeaders(&request.headers)) |session_token| {
-                if (state.validateSessionIdentity(allocator, session_token) != null) authenticated = true;
-            }
-        }
-        if (!authenticated) {
-            try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/commands/status", 401, request.headers.get("user-agent") orelse "");
-            return;
-        }
-        const cmd_id = parseQueryParam(request.uri.query orelse "", "command_id") orelse {
-            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Missing command_id", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/commands/status", 400, request.headers.get("user-agent") orelse "");
-            return;
-        };
-        const snapshot = state.commandLifecycleSnapshotJson(allocator, cmd_id) orelse {
-            try sendApiError(allocator, writer, .not_found, "invalid_request", "Unknown command_id", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/commands/status", 404, request.headers.get("user-agent") orelse "");
-            return;
-        };
-        defer allocator.free(snapshot);
-        var response = http.Response.json(allocator, snapshot);
-        defer response.deinit();
-        _ = response.setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
-        applyResponseHeaders(state, &response);
-        try response.write(writer);
-        state.metricsRecord(200);
-        logAccess(&ctx, request.method.toString(), "/v1/commands/status", 200, request.headers.get("user-agent") orelse "");
-        return;
-    }
-
-    // --- POST /v1/approvals/request ---
-    if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/approvals/request")) {
-        var authenticated = false;
-        const auth_result = authorizeRequest(cfg, &request.headers);
-        if (auth_result.ok) {
-            ctx.setIdentity(auth_result.token_hash orelse "-");
-            authenticated = true;
-        }
-        if (!authenticated) {
-            if (http.session.fromHeaders(&request.headers)) |session_token| {
-                if (state.validateSessionIdentity(allocator, session_token)) |identity| {
-                    defer allocator.free(identity);
-                    ctx.setIdentity(identity);
-                    authenticated = true;
-                }
-            }
-        }
-        if (!authenticated) {
-            try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/approvals/request", 401, request.headers.get("user-agent") orelse "");
-            return;
-        }
-        if (!isJsonContentType(request.contentType())) {
-            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Content-Type must be application/json", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/approvals/request", 400, request.headers.get("user-agent") orelse "");
-            return;
-        }
-        const body = request.body orelse {
-            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Missing request body", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/approvals/request", 400, request.headers.get("user-agent") orelse "");
-            return;
-        };
-        var approval_req = parseApprovalRequestBody(allocator, body) catch {
-            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Invalid approval request payload", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/approvals/request", 400, request.headers.get("user-agent") orelse "");
-            return;
-        };
-        defer approval_req.deinit(allocator);
-        if (!routeNeedsApproval(approval_req.method, approval_req.path, cfg.policy_approval_routes_raw) and
-            !routeRequiresApprovalRule(approval_req.method, approval_req.path, cfg.policy_rules_raw))
-        {
-            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Route does not require approval", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/approvals/request", 400, request.headers.get("user-agent") orelse "");
-            return;
-        }
-        const created = state.approvalCreate(allocator, approval_req.method, approval_req.path, ctx.identity orelse "-", approval_req.command_id) catch {
-            try sendApiError(allocator, writer, .internal_server_error, "internal_error", "Failed to create approval request", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/approvals/request", 500, request.headers.get("user-agent") orelse "");
-            return;
-        };
-        defer allocator.free(created.token);
-        _ = state.event_hub.publish("approvals.requests", body, http.event_loop.monotonicMs()) catch 0;
-        const response_body = try std.fmt.allocPrint(allocator, "{{\"approval_token\":\"{s}\",\"status\":\"pending\",\"expires_ms\":{d},\"status_url\":\"/v1/approvals/status?approval_token={s}\"}}", .{
-            created.token,
-            created.expires_ms,
-            created.token,
-        });
-        defer allocator.free(response_body);
-        var response = http.Response.json(allocator, response_body);
-        defer response.deinit();
-        _ = response.setStatus(.accepted).setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
-        applyResponseHeaders(state, &response);
-        try response.write(writer);
-        state.metricsRecord(202);
-        logAccess(&ctx, request.method.toString(), "/v1/approvals/request", 202, request.headers.get("user-agent") orelse "");
-        return;
-    }
-
-    // --- POST /v1/approvals/respond ---
-    if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/approvals/respond")) {
-        const auth_result = authorizeRequest(cfg, &request.headers);
-        if (!auth_result.ok) {
-            try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/approvals/respond", 401, request.headers.get("user-agent") orelse "");
-            return;
-        }
-        ctx.setIdentity(auth_result.token_hash orelse "-");
-        if (!isJsonContentType(request.contentType())) {
-            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Content-Type must be application/json", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/approvals/respond", 400, request.headers.get("user-agent") orelse "");
-            return;
-        }
-        const body = request.body orelse {
-            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Missing request body", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/approvals/respond", 400, request.headers.get("user-agent") orelse "");
-            return;
-        };
-        var approval_resp = parseApprovalResponseBody(allocator, body) catch {
-            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Invalid approval response payload", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/approvals/respond", 400, request.headers.get("user-agent") orelse "");
-            return;
-        };
-        defer approval_resp.deinit(allocator);
-        if (!state.approvalRespond(approval_resp.token, approval_resp.decision, ctx.identity orelse "-")) {
-            try sendApiError(allocator, writer, .conflict, "invalid_request", "Approval token not pending or not found", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/approvals/respond", 409, request.headers.get("user-agent") orelse "");
-            return;
-        }
-        _ = state.event_hub.publish("approvals.responses", body, http.event_loop.monotonicMs()) catch 0;
-        const response_body = try std.fmt.allocPrint(allocator, "{{\"approval_token\":\"{s}\",\"status\":\"{s}\"}}", .{
-            approval_resp.token,
-            if (approval_resp.decision == .approve) "approved" else "denied",
-        });
-        defer allocator.free(response_body);
-        var response = http.Response.json(allocator, response_body);
-        defer response.deinit();
-        _ = response.setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
-        applyResponseHeaders(state, &response);
-        try response.write(writer);
-        state.metricsRecord(200);
-        logAccess(&ctx, request.method.toString(), "/v1/approvals/respond", 200, request.headers.get("user-agent") orelse "");
-        return;
-    }
-
-    // --- GET /v1/approvals/status?approval_token=... ---
-    if (request.method == .GET and http.api_router.matchRoute(request.uri.path, 1, "/approvals/status")) {
-        var authenticated = false;
-        const auth_result = authorizeRequest(cfg, &request.headers);
-        if (auth_result.ok) {
-            ctx.setIdentity(auth_result.token_hash orelse "-");
-            authenticated = true;
-        }
-        if (!authenticated) {
-            if (http.session.fromHeaders(&request.headers)) |session_token| {
-                if (state.validateSessionIdentity(allocator, session_token)) |identity| {
-                    defer allocator.free(identity);
-                    ctx.setIdentity(identity);
-                    authenticated = true;
-                }
-            }
-        }
-        if (!authenticated) {
-            try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/approvals/status", 401, request.headers.get("user-agent") orelse "");
-            return;
-        }
-        const approval_token = parseQueryParam(request.uri.query orelse "", "approval_token") orelse {
-            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Missing approval_token", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/approvals/status", 400, request.headers.get("user-agent") orelse "");
-            return;
-        };
-        const snapshot = state.approvalSnapshotJson(allocator, approval_token) orelse {
-            try sendApiError(allocator, writer, .not_found, "invalid_request", "Unknown approval_token", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/approvals/status", 404, request.headers.get("user-agent") orelse "");
-            return;
-        };
-        defer allocator.free(snapshot);
-        var response = http.Response.json(allocator, snapshot);
-        defer response.deinit();
-        _ = response.setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
-        applyResponseHeaders(state, &response);
-        try response.write(writer);
-        state.metricsRecord(200);
-        logAccess(&ctx, request.method.toString(), "/v1/approvals/status", 200, request.headers.get("user-agent") orelse "");
-        return;
-    }
-
-    // --- POST /v1/commands (structured command routing) ---
-    if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/commands")) {
-        // --- Auth (bearer token or session token) ---
-        var cmd_authenticated = false;
-        const cmd_auth_result = authorizeRequest(cfg, &request.headers);
-        if (cmd_auth_result.ok) {
-            ctx.setIdentity(cmd_auth_result.token_hash orelse "-");
-            cmd_authenticated = true;
-        }
-        if (!cmd_authenticated) {
-            if (http.session.fromHeaders(&request.headers)) |session_token| {
-                if (state.validateSessionIdentity(allocator, session_token)) |identity| {
-                    defer allocator.free(identity);
-                    ctx.setIdentity(identity);
-                    cmd_authenticated = true;
-                }
-            }
-        }
-        if (!cmd_authenticated) {
-            try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/commands", 401, request.headers.get("user-agent") orelse "");
-            return;
-        }
-
-        // --- Content-Type validation ---
-        if (!isJsonContentType(request.contentType())) {
-            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Content-Type must be application/json", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/commands", 400, request.headers.get("user-agent") orelse "");
-            return;
-        }
-
-        // --- Body parsing ---
-        const cmd_body = request.body orelse {
-            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Missing request body", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/commands", 400, request.headers.get("user-agent") orelse "");
-            return;
-        };
-
-        var cmd = http.command.parseCommand(allocator, cmd_body) catch |err| {
-            const msg = switch (err) {
-                http.command.ParseError.MissingCommand => "Missing 'command' field",
-                http.command.ParseError.UnknownCommand => "Unknown command type",
-                http.command.ParseError.InvalidParams => "Invalid or missing 'params' object",
-                else => "Invalid command envelope",
-            };
-            try sendApiError(allocator, writer, .bad_request, "invalid_request", msg, correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/commands", 400, request.headers.get("user-agent") orelse "");
-            return;
-        };
-        defer cmd.deinit(allocator);
-        const command_id = if (cmd.command_id) |cid|
-            try allocator.dupe(u8, cid)
-        else
-            try generateCommandId(allocator);
-        defer allocator.free(command_id);
-
-        // --- Idempotency (inline key overrides header) ---
-        const effective_idem_key = cmd.idempotency_key orelse ctx.idempotency_key;
-        if (effective_idem_key) |idem_key| {
-            if (try state.idempotencyGetCopy(allocator, idem_key)) |cached| {
-                defer allocator.free(cached.body);
-                defer allocator.free(cached.content_type);
-
-                var response = http.Response.init(allocator);
-                defer response.deinit();
-                _ = response.setStatus(@enumFromInt(cached.status))
-                    .setBody(cached.body)
-                    .setContentType(cached.content_type)
-                    .setConnection(keep_alive)
-                    .setHeader(http.correlation.HEADER_NAME, correlation_id)
-                    .setHeader("X-Idempotent-Replayed", "true");
-                applyResponseHeaders(state, &response);
-                try response.write(writer);
-                state.metricsRecord(cached.status);
-                logAccess(&ctx, request.method.toString(), "/v1/commands", cached.status, request.headers.get("user-agent") orelse "");
-                return;
-            }
-        }
-
-        // --- Build upstream envelope with context ---
-        const envelope = http.command.buildUpstreamEnvelope(
-            allocator,
-            cmd.command_type,
-            cmd.params_raw,
-            command_id,
-            correlation_id,
-            ctx.identity orelse "-",
-            client_ip,
-            ctx.api_version,
-        ) catch {
-            try sendApiError(allocator, writer, .internal_server_error, "internal_error", "Failed to build upstream request", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/commands", 500, request.headers.get("user-agent") orelse "");
-            return;
-        };
-        defer allocator.free(envelope);
-        const upstream_path = cmd.command_type.upstreamPath();
-
-        if (cmd.async_execute) {
-            state.commandLifecycleCreate(command_id, cmd.command_type.toString(), correlation_id, ctx.identity orelse "-") catch {
-                try sendApiError(allocator, writer, .internal_server_error, "internal_error", "Failed to initialize command lifecycle", correlation_id, keep_alive, state);
-                logAccess(&ctx, request.method.toString(), "/v1/commands", 500, request.headers.get("user-agent") orelse "");
-                return;
-            };
-            spawnAsyncCommandExecution(
-                allocator,
-                cfg,
-                state,
-                command_id,
-                cmd.command_type.toString(),
-                upstream_path,
-                envelope,
-                correlation_id,
-                client_ip,
-                ctx.identity,
-                ctx.api_version,
-                request.headers.get("host"),
-                request.headers.get("x-forwarded-for"),
-            );
-            const accepted_body = try std.fmt.allocPrint(allocator, "{{\"command_id\":\"{s}\",\"status\":\"pending\",\"status_url\":\"/v1/commands/status?command_id={s}\"}}", .{ command_id, command_id });
-            defer allocator.free(accepted_body);
-            var accepted = http.Response.json(allocator, accepted_body);
-            defer accepted.deinit();
-            _ = accepted.setStatus(.accepted).setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
-            applyResponseHeaders(state, &accepted);
-            try accepted.write(writer);
-            state.metricsRecord(202);
-            logAccess(&ctx, request.method.toString(), "/v1/commands", 202, request.headers.get("user-agent") orelse "");
-            return;
-        }
-
-        state.commandLifecycleCreate(command_id, cmd.command_type.toString(), correlation_id, ctx.identity orelse "-") catch {};
-        state.commandLifecycleSetRunning(command_id);
-
-        const proxy_cache_bypass = shouldBypassProxyCache(&request.headers) or effective_idem_key != null;
-        const proxy_cache_key = if (cfg.proxy_cache_ttl_seconds > 0 and !proxy_cache_bypass)
-            try buildProxyCacheKey(allocator, cfg.proxy_cache_key_template, request.method.toString(), "/v1/commands", envelope, ctx.identity, ctx.api_version)
-        else
-            null;
-        defer if (proxy_cache_key) |k| allocator.free(k);
-        var proxy_cache_locked = false;
-        defer if (proxy_cache_locked) {
-            if (proxy_cache_key) |cache_key| state.proxyCacheUnlock(cache_key);
-        };
-        if (proxy_cache_key) |cache_key| {
-            if (try state.proxyCacheGetCopyWithStale(allocator, cache_key, cfg.proxy_cache_stale_while_revalidate_seconds)) |lookup| {
-                defer allocator.free(lookup.cached.body);
-                defer allocator.free(lookup.cached.content_type);
-
-                var response = http.Response.init(allocator);
-                defer response.deinit();
-                _ = response.setStatus(@enumFromInt(lookup.cached.status))
-                    .setBody(lookup.cached.body)
-                    .setContentType(lookup.cached.content_type)
-                    .setConnection(keep_alive)
-                    .setHeader(http.correlation.HEADER_NAME, correlation_id)
-                    .setHeader("X-Proxy-Cache", if (lookup.is_stale) "STALE" else "HIT");
-                applyResponseHeaders(state, &response);
-                try response.write(writer);
-                state.metricsRecord(lookup.cached.status);
-                logAccess(&ctx, request.method.toString(), "/v1/commands", lookup.cached.status, request.headers.get("user-agent") orelse "");
-                if (lookup.is_stale) {
-                    spawnProxyCacheRefresh(
-                        allocator,
-                        cfg,
-                        state,
-                        cache_key,
-                        .commands,
-                        cfg.proxy_pass_commands_prefix,
-                        upstream_path,
-                        envelope,
-                        client_ip,
-                        ctx.identity,
-                        ctx.api_version,
-                    );
-                }
-                return;
-            }
-
-            if (!try state.proxyCacheTryLock(cache_key)) {
-                _ = state.proxyCacheWaitForUnlock(cache_key, cfg.proxy_cache_lock_timeout_ms);
-                if (try state.proxyCacheGetCopyWithStale(allocator, cache_key, 0)) |post_wait_lookup| {
-                    defer allocator.free(post_wait_lookup.cached.body);
-                    defer allocator.free(post_wait_lookup.cached.content_type);
-                    var response = http.Response.init(allocator);
-                    defer response.deinit();
-                    _ = response.setStatus(@enumFromInt(post_wait_lookup.cached.status))
-                        .setBody(post_wait_lookup.cached.body)
-                        .setContentType(post_wait_lookup.cached.content_type)
-                        .setConnection(keep_alive)
-                        .setHeader(http.correlation.HEADER_NAME, correlation_id)
-                        .setHeader("X-Proxy-Cache", "HIT");
-                    applyResponseHeaders(state, &response);
-                    try response.write(writer);
-                    state.metricsRecord(post_wait_lookup.cached.status);
-                    logAccess(&ctx, request.method.toString(), "/v1/commands", post_wait_lookup.cached.status, request.headers.get("user-agent") orelse "");
-                    return;
-                }
-            }
-            proxy_cache_locked = try state.proxyCacheTryLock(cache_key);
-        }
-
-        // --- Forward to upstream ---
-
-        // --- Circuit breaker check ---
-        if (!state.circuitTryAcquire()) {
-            state.logger.warn(null, "circuit breaker open, rejecting /v1/commands", .{});
-            try sendApiError(allocator, writer, .service_unavailable, "upstream_unavailable", "Upstream unavailable", correlation_id, keep_alive, state);
-            state.commandLifecycleSetFailed(command_id, "upstream_unavailable");
-            const cb_audit = http.command.CommandAudit{
-                .command = cmd.command_type.toString(),
-                .correlation_id = correlation_id,
-                .identity = ctx.identity orelse "-",
-                .status = 503,
-                .latency_ms = ctx.elapsedMs(),
-            };
-            cb_audit.log();
-            return;
-        }
-
-        const cmd_exec = proxyJsonExecute(
-            allocator,
-            cfg,
-            .commands,
-            cfg.proxy_pass_commands_prefix,
-            upstream_path,
-            envelope,
-            correlation_id,
-            client_ip,
-            ctx.identity,
-            ctx.api_version,
-            request.headers.get("host"),
-            request.headers.get("x-forwarded-for"),
-            writer,
-            state,
-            effective_idem_key == null,
-        ) catch |err| {
-            state.circuitRecordFailure();
-            state.commandLifecycleSetFailed(command_id, @errorName(err));
-            state.logger.warn(null, "circuit breaker: recorded failure, state={s}", .{state.circuitStateName()});
-            const mapped = mapProxyExecutionError(err);
-            try sendApiError(allocator, writer, mapped.status, mapped.code, mapped.message, correlation_id, keep_alive, state);
-            // Audit
-            const cmd_audit = http.command.CommandAudit{
-                .command = cmd.command_type.toString(),
-                .correlation_id = correlation_id,
-                .identity = ctx.identity orelse "-",
-                .status = @intFromEnum(mapped.status),
-                .latency_ms = ctx.elapsedMs(),
-            };
-            cmd_audit.log();
-            return;
-        };
-        var cmd_final_status: u16 = undefined;
-        var cmd_final_body: []const u8 = "";
-        var cmd_final_content_type: []const u8 = JSON_CONTENT_TYPE;
-        var cmd_final_content_disposition: ?[]const u8 = null;
-        var cmd_final_content_type_alloc: ?[]u8 = null;
-        var cmd_final_content_disposition_alloc: ?[]u8 = null;
-        var cmd_error_body: ?[]const u8 = null;
-        defer if (cmd_final_content_type_alloc) |ct| allocator.free(ct);
-        defer if (cmd_final_content_disposition_alloc) |cd| allocator.free(cd);
-        switch (cmd_exec) {
-            .streamed_status => |status| {
-                cmd_final_status = status;
-                if (status >= 500) {
-                    state.circuitRecordFailure();
-                } else {
-                    state.circuitRecordSuccess();
-                }
-                state.commandLifecycleSetCompleted(command_id, status, "", JSON_CONTENT_TYPE);
-                state.metricsRecord(status);
-
-                const streamed_audit = http.command.CommandAudit{
-                    .command = cmd.command_type.toString(),
-                    .correlation_id = correlation_id,
-                    .identity = ctx.identity orelse "-",
-                    .status = status,
-                    .latency_ms = ctx.elapsedMs(),
-                };
-                streamed_audit.log();
-                logAccess(&ctx, request.method.toString(), "/v1/commands", status, request.headers.get("user-agent") orelse "");
-                return;
-            },
-            .buffered => |proxy_result| {
-                defer allocator.free(proxy_result.body);
-
-                if (proxy_result.status >= 500) {
-                    state.circuitRecordFailure();
-                } else {
-                    state.circuitRecordSuccess();
-                }
-
-                cmd_final_status = proxy_result.status;
-                cmd_final_body = proxy_result.body;
-                if (proxy_result.status != 200) {
-                    allocator.free(proxy_result.content_type);
-                    if (proxy_result.content_disposition) |cd| allocator.free(cd);
-                    const mapped = mapUpstreamError(proxy_result.status);
-                    cmd_final_status = mapped.status;
-                    cmd_final_body = try buildApiErrorJson(allocator, mapped.code, mapped.message, correlation_id);
-                    cmd_final_content_type = JSON_CONTENT_TYPE;
-                    cmd_final_content_disposition = null;
-                    cmd_error_body = cmd_final_body;
-                } else {
-                    cmd_final_content_type_alloc = proxy_result.content_type;
-                    cmd_final_content_type = proxy_result.content_type;
-                    if (proxy_result.content_disposition) |cd| {
-                        cmd_final_content_disposition_alloc = cd;
-                        cmd_final_content_disposition = cd;
-                    } else {
-                        cmd_final_content_disposition = null;
-                    }
-                }
-            },
-        }
-        defer {
-            if (cmd_error_body) |eb| allocator.free(eb);
-        }
-
-        // --- Compress and send ---
-        const cmd_accept_encoding = request.headers.get("Accept-Encoding");
-        const cmd_comp = http.compression.compressResponse(allocator, cmd_final_body, cmd_final_content_type, cmd_accept_encoding, state.compression_config);
-        defer if (cmd_comp.body) |cb| allocator.free(cb);
-        const cmd_resp_body = if (cmd_comp.body) |cb| cb else cmd_final_body;
-        var response = http.Response.init(allocator);
+        const payload = try buildApiErrorJson(allocator, "rate_limited", "Rate limit exceeded", correlation_id);
+        defer allocator.free(payload);
+        var response = http.Response.json(allocator, payload);
         defer response.deinit();
         _ = response
-            .setStatus(@enumFromInt(cmd_final_status))
-            .setBody(cmd_resp_body)
-            .setContentType(cmd_final_content_type)
+            .setStatus(.too_many_requests)
             .setConnection(keep_alive)
+            .setHeader("Retry-After", "1")
             .setHeader(http.correlation.HEADER_NAME, correlation_id);
-        if (cmd_final_content_disposition) |cd| {
-            _ = response.setHeader("Content-Disposition", cd);
-        }
-        if (cmd_comp.compressed and cmd_comp.encoding != null) {
-            _ = response.setHeader("Content-Encoding", cmd_comp.encoding.?.headerValue());
-        }
         applyResponseHeaders(state, &response);
         try response.write(writer);
-        state.metricsRecord(cmd_final_status);
-        state.commandLifecycleSetCompleted(command_id, cmd_final_status, cmd_final_body, cmd_final_content_type);
-
-        if (proxy_cache_key) |cache_key| {
-            if (cmd_final_status == 200) {
-                state.proxyCachePut(cache_key, cmd_final_status, cmd_final_body, cmd_final_content_type) catch |err| {
-                    std.log.warn("proxy cache store error: {}", .{err});
-                };
-            }
-        }
-
-        // --- Store idempotency result ---
-        if (effective_idem_key) |idem_key| {
-            state.idempotencyPut(idem_key, cmd_final_status, cmd_final_body, JSON_CONTENT_TYPE) catch |err| {
-                std.log.warn("idempotency store error: {}", .{err});
-            };
-        }
-
-        // --- Structured command audit ---
-        const audit = http.command.CommandAudit{
-            .command = cmd.command_type.toString(),
-            .correlation_id = correlation_id,
-            .identity = ctx.identity orelse "-",
-            .status = cmd_final_status,
-            .latency_ms = ctx.elapsedMs(),
-        };
-        audit.log();
-        return;
+        state.metricsRecord(429);
+        state.metricsRecordErrorCode("rate_limited");
+        logAccess(ctx, request.method.toString(), request.uri.path, 429, request.headers.get("user-agent") orelse "");
+        return true;
     }
 
-    // --- POST /v1/chat ---
-    if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/chat")) {
-        // --- Idempotency check ---
-        if (ctx.idempotency_key) |idem_key| {
-            if (try state.idempotencyGetCopy(allocator, idem_key)) |cached| {
-                defer allocator.free(cached.body);
-                defer allocator.free(cached.content_type);
+    return false;
+}
 
+fn handleStaticLocation(
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    request: *const http.Request,
+    matched: http.location_router.MatchResult,
+    root_cfg: anytype,
+    correlation_id: []const u8,
+    keep_alive: bool,
+    state: *GatewayState,
+) !?u16 {
+    if (!(request.method == .GET or request.method == .HEAD)) return null;
+    var served = (try http.static_file.serve(allocator, .{
+        .root = root_cfg.root,
+        .request_path = request.uri.path,
+        .matched_pattern = matched.block.pattern,
+        .alias = root_cfg.alias,
+        .index = root_cfg.index,
+        .try_files = root_cfg.try_files,
+        .autoindex = root_cfg.autoindex,
+        .headers = &request.headers,
+        .max_bytes = MAX_REQUEST_SIZE,
+    })) orelse blk: {
+        var error_page = (try maybeResolveStaticErrorPage(allocator, matched, root_cfg, request.uri.path, &request.headers, 404)) orelse return null;
+        switch (error_page) {
+            .redirect => |target| {
+                defer allocator.free(target);
                 var response = http.Response.init(allocator);
                 defer response.deinit();
-                _ = response.setStatus(@enumFromInt(cached.status))
-                    .setBody(cached.body)
-                    .setContentType(cached.content_type)
+                _ = response
+                    .setStatus(.found)
+                    .setBody("")
+                    .setContentType("text/plain; charset=utf-8")
                     .setConnection(keep_alive)
-                    .setHeader(http.correlation.HEADER_NAME, correlation_id)
-                    .setHeader("X-Idempotent-Replayed", "true");
+                    .setHeader("Location", target)
+                    .setHeader(http.correlation.HEADER_NAME, correlation_id);
                 applyResponseHeaders(state, &response);
-                try response.write(writer);
-                state.metricsRecord(cached.status);
-                logAccess(&ctx, request.method.toString(), "/v1/chat", cached.status, request.headers.get("user-agent") orelse "");
-                return;
-            }
-        }
-
-        // --- Auth (bearer token or session token) ---
-        var authenticated = false;
-        // Try bearer token first
-        const auth_result = authorizeRequest(cfg, &request.headers);
-        if (auth_result.ok) {
-            ctx.setIdentity(auth_result.token_hash orelse "-");
-            authenticated = true;
-        }
-        // Fall back to session token
-        if (!authenticated) {
-            if (http.session.fromHeaders(&request.headers)) |session_token| {
-                if (state.validateSessionIdentity(allocator, session_token)) |identity| {
-                    defer allocator.free(identity);
-                    ctx.setIdentity(identity);
-                    authenticated = true;
+                if (request.method == .HEAD) {
+                    try response.writeHead(writer);
+                } else {
+                    try response.write(writer);
                 }
-            }
+                state.metricsRecord(302);
+                return 302;
+            },
+            .served => |*resolved| break :blk resolved.*,
         }
-        if (!authenticated) {
-            try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/chat", 401, request.headers.get("user-agent") orelse "");
-            return;
-        }
+    };
+    defer served.deinit(allocator);
 
-        // --- Content-Type validation ---
-        if (!isJsonContentType(request.contentType())) {
-            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Content-Type must be application/json", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/chat", 400, request.headers.get("user-agent") orelse "");
-            return;
-        }
-
-        // --- Body validation ---
-        const body = request.body orelse {
-            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Missing request body", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/chat", 400, request.headers.get("user-agent") orelse "");
-            return;
-        };
-
-        const proxy_cache_bypass = shouldBypassProxyCache(&request.headers) or ctx.idempotency_key != null;
-        const proxy_cache_key = if (cfg.proxy_cache_ttl_seconds > 0 and !proxy_cache_bypass)
-            try buildProxyCacheKey(allocator, cfg.proxy_cache_key_template, request.method.toString(), "/v1/chat", body, ctx.identity, ctx.api_version)
-        else
-            null;
-        defer if (proxy_cache_key) |k| allocator.free(k);
-        var proxy_cache_locked = false;
-        defer if (proxy_cache_locked) {
-            if (proxy_cache_key) |cache_key| state.proxyCacheUnlock(cache_key);
-        };
-        if (proxy_cache_key) |cache_key| {
-            if (try state.proxyCacheGetCopyWithStale(allocator, cache_key, cfg.proxy_cache_stale_while_revalidate_seconds)) |lookup| {
-                defer allocator.free(lookup.cached.body);
-                defer allocator.free(lookup.cached.content_type);
-
-                var response = http.Response.init(allocator);
-                defer response.deinit();
-                _ = response.setStatus(@enumFromInt(lookup.cached.status))
-                    .setBody(lookup.cached.body)
-                    .setContentType(lookup.cached.content_type)
-                    .setConnection(keep_alive)
-                    .setHeader(http.correlation.HEADER_NAME, correlation_id)
-                    .setHeader("X-Proxy-Cache", if (lookup.is_stale) "STALE" else "HIT");
-                applyResponseHeaders(state, &response);
-                try response.write(writer);
-                state.metricsRecord(lookup.cached.status);
-                logAccess(&ctx, request.method.toString(), "/v1/chat", lookup.cached.status, request.headers.get("user-agent") orelse "");
-                if (lookup.is_stale) {
-                    spawnProxyCacheRefresh(
-                        allocator,
-                        cfg,
-                        state,
-                        cache_key,
-                        .chat,
-                        cfg.proxy_pass_chat,
-                        null,
-                        body,
-                        client_ip,
-                        ctx.identity,
-                        ctx.api_version,
-                    );
-                }
-                return;
-            }
-
-            if (!try state.proxyCacheTryLock(cache_key)) {
-                _ = state.proxyCacheWaitForUnlock(cache_key, cfg.proxy_cache_lock_timeout_ms);
-                if (try state.proxyCacheGetCopyWithStale(allocator, cache_key, 0)) |post_wait_lookup| {
-                    defer allocator.free(post_wait_lookup.cached.body);
-                    defer allocator.free(post_wait_lookup.cached.content_type);
+    if (@intFromEnum(served.status_code) >= 400) {
+        if (try maybeResolveStaticErrorPage(allocator, matched, root_cfg, request.uri.path, &request.headers, @intFromEnum(served.status_code))) |error_page| {
+            switch (error_page) {
+                .redirect => |target| {
+                    defer allocator.free(target);
                     var response = http.Response.init(allocator);
                     defer response.deinit();
-                    _ = response.setStatus(@enumFromInt(post_wait_lookup.cached.status))
-                        .setBody(post_wait_lookup.cached.body)
-                        .setContentType(post_wait_lookup.cached.content_type)
+                    _ = response
+                        .setStatus(.found)
+                        .setBody("")
+                        .setContentType("text/plain; charset=utf-8")
                         .setConnection(keep_alive)
-                        .setHeader(http.correlation.HEADER_NAME, correlation_id)
-                        .setHeader("X-Proxy-Cache", "HIT");
+                        .setHeader("Location", target)
+                        .setHeader(http.correlation.HEADER_NAME, correlation_id);
                     applyResponseHeaders(state, &response);
-                    try response.write(writer);
-                    state.metricsRecord(post_wait_lookup.cached.status);
-                    logAccess(&ctx, request.method.toString(), "/v1/chat", post_wait_lookup.cached.status, request.headers.get("user-agent") orelse "");
-                    return;
-                }
-            }
-            proxy_cache_locked = try state.proxyCacheTryLock(cache_key);
-        }
-
-        const message = parseChatMessage(allocator, body, cfg.max_message_chars) catch |err| {
-            const msg = switch (err) {
-                error.EmptyMessage => "message must not be empty",
-                error.MessageTooLarge => "message too long",
-                else => "invalid chat payload",
-            };
-            try sendApiError(allocator, writer, .bad_request, "invalid_request", msg, correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/chat", 400, request.headers.get("user-agent") orelse "");
-            return;
-        };
-
-        // --- Circuit breaker check ---
-        if (!state.circuitTryAcquire()) {
-            state.logger.warn(null, "circuit breaker open, rejecting /v1/chat", .{});
-            try sendApiError(allocator, writer, .service_unavailable, "upstream_unavailable", "Upstream unavailable", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/chat", 503, request.headers.get("user-agent") orelse "");
-            return;
-        }
-
-        // --- Upstream proxy ---
-        const chat_request_body = try std.fmt.allocPrint(allocator, "{{\"message\":{s}}}", .{std.json.fmt(message, .{})});
-        defer allocator.free(chat_request_body);
-
-        const chat_exec = proxyJsonExecute(
-            allocator,
-            cfg,
-            .chat,
-            cfg.proxy_pass_chat,
-            null,
-            chat_request_body,
-            correlation_id,
-            client_ip,
-            ctx.identity,
-            ctx.api_version,
-            request.headers.get("host"),
-            request.headers.get("x-forwarded-for"),
-            writer,
-            state,
-            ctx.idempotency_key == null,
-        ) catch |err| {
-            state.circuitRecordFailure();
-            state.logger.warn(null, "circuit breaker: recorded failure, state={s}", .{state.circuitStateName()});
-            const mapped = mapProxyExecutionError(err);
-            try sendApiError(allocator, writer, mapped.status, mapped.code, mapped.message, correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/chat", @intFromEnum(mapped.status), request.headers.get("user-agent") orelse "");
-            return;
-        };
-        defer allocator.free(message);
-
-        var final_status: u16 = undefined;
-        var final_body: []const u8 = "";
-        var final_content_type: []const u8 = JSON_CONTENT_TYPE;
-        var final_content_disposition: ?[]const u8 = null;
-        var final_content_type_alloc: ?[]u8 = null;
-        var final_content_disposition_alloc: ?[]u8 = null;
-        var error_body_to_free: ?[]const u8 = null;
-        defer if (final_content_type_alloc) |ct| allocator.free(ct);
-        defer if (final_content_disposition_alloc) |cd| allocator.free(cd);
-        switch (chat_exec) {
-            .streamed_status => |status| {
-                final_status = status;
-                if (status >= 500) {
-                    state.circuitRecordFailure();
-                } else {
-                    state.circuitRecordSuccess();
-                }
-                state.metricsRecord(status);
-                logAccess(&ctx, request.method.toString(), "/v1/chat", status, request.headers.get("user-agent") orelse "");
-                return;
-            },
-            .buffered => |proxy_result| {
-                defer allocator.free(proxy_result.body);
-
-                if (proxy_result.status >= 500) {
-                    state.circuitRecordFailure();
-                } else {
-                    state.circuitRecordSuccess();
-                }
-
-                final_status = proxy_result.status;
-                final_body = proxy_result.body;
-                if (proxy_result.status != 200) {
-                    allocator.free(proxy_result.content_type);
-                    if (proxy_result.content_disposition) |cd| allocator.free(cd);
-                    const mapped = mapUpstreamError(proxy_result.status);
-                    final_status = mapped.status;
-                    final_body = try buildApiErrorJson(allocator, mapped.code, mapped.message, correlation_id);
-                    final_content_type = JSON_CONTENT_TYPE;
-                    final_content_disposition = null;
-                    error_body_to_free = final_body;
-                } else {
-                    final_content_type_alloc = proxy_result.content_type;
-                    final_content_type = proxy_result.content_type;
-                    if (proxy_result.content_disposition) |cd| {
-                        final_content_disposition_alloc = cd;
-                        final_content_disposition = cd;
+                    if (request.method == .HEAD) {
+                        try response.writeHead(writer);
                     } else {
-                        final_content_disposition = null;
+                        try response.write(writer);
                     }
-                }
-            },
+                    state.metricsRecord(302);
+                    return 302;
+                },
+                .served => |replacement| {
+                    served.deinit(allocator);
+                    served = replacement;
+                },
+            }
         }
-        defer {
-            if (error_body_to_free) |eb| allocator.free(eb);
-        }
+    }
 
-        // --- Compress and send ---
-        const chat_accept_encoding = request.headers.get("Accept-Encoding");
-        const chat_comp = http.compression.compressResponse(allocator, final_body, final_content_type, chat_accept_encoding, state.compression_config);
-        defer if (chat_comp.body) |cb| allocator.free(cb);
-        const chat_resp_body = if (chat_comp.body) |cb| cb else final_body;
-        var response = http.Response.init(allocator);
-        defer response.deinit();
-        _ = response
-            .setStatus(@enumFromInt(final_status))
-            .setBody(chat_resp_body)
-            .setContentType(final_content_type)
-            .setConnection(keep_alive)
-            .setHeader(http.correlation.HEADER_NAME, correlation_id);
-        if (final_content_disposition) |cd| {
-            _ = response.setHeader("Content-Disposition", cd);
-        }
-        if (chat_comp.compressed and chat_comp.encoding != null) {
-            _ = response.setHeader("Content-Encoding", chat_comp.encoding.?.headerValue());
-        }
-        applyResponseHeaders(state, &response);
+    var response = http.Response.init(allocator);
+    defer response.deinit();
+    _ = response
+        .setStatus(served.status_code)
+        .setBody(served.body)
+        .setContentType(served.content_type)
+        .setConnection(keep_alive)
+        .setHeader(http.correlation.HEADER_NAME, correlation_id);
+    if (served.etag_value) |etag_value| _ = response.setHeader("ETag", etag_value);
+    if (served.last_modified_value) |last_modified| _ = response.setHeader("Last-Modified", last_modified);
+    if (served.content_range_value) |content_range| _ = response.setHeader("Content-Range", content_range);
+    if (served.accept_ranges) _ = response.setHeader("Accept-Ranges", "bytes");
+    applyResponseHeaders(state, &response);
+    if (request.method == .HEAD) {
+        try response.writeHead(writer);
+    } else {
         try response.write(writer);
-        state.metricsRecord(final_status);
-
-        if (proxy_cache_key) |cache_key| {
-            if (final_status == 200) {
-                state.proxyCachePut(cache_key, final_status, final_body, final_content_type) catch |err| {
-                    std.log.warn("proxy cache store error: {}", .{err});
-                };
-            }
-        }
-
-        // --- Store idempotency result ---
-        if (ctx.idempotency_key) |idem_key| {
-            state.idempotencyPut(idem_key, final_status, final_body, JSON_CONTENT_TYPE) catch |err| {
-                std.log.warn("idempotency store error: {}", .{err});
-            };
-        }
-
-        logAccess(&ctx, request.method.toString(), "/v1/chat", final_status, request.headers.get("user-agent") orelse "");
-        return;
     }
-
-    if (serveTryFilesFallback(allocator, cfg, request.method.toString(), request.uri.path, correlation_id, keep_alive, writer, state)) |status| {
-        state.metricsRecord(status);
-        logAccess(&ctx, request.method.toString(), request.uri.path, status, request.headers.get("user-agent") orelse "");
-        return;
-    } else |_| {}
-
-    try sendApiError(allocator, writer, .not_found, "invalid_request", "Not Found", correlation_id, keep_alive, state);
-    logAccess(&ctx, request.method.toString(), request.uri.path, 404, request.headers.get("user-agent") orelse "");
-}
-
-fn handleWebSocketProxyLoop(
-    conn: anytype,
-    allocator: std.mem.Allocator,
-    cfg: *const edge_config.EdgeConfig,
-    state: *GatewayState,
-    correlation_id: []const u8,
-    client_ip: []const u8,
-    identity: ?[]const u8,
-    api_version: ?u32,
-    incoming_host: ?[]const u8,
-    incoming_x_forwarded_for: ?[]const u8,
-    scope: UpstreamScope,
-    proxy_target: []const u8,
-) !void {
-    const writer = conn.writer();
-    var last_activity_ms = http.event_loop.monotonicMs();
-    var last_ping_ms = last_activity_ms;
-
-    while (!http.shutdown.isShutdownRequested()) {
-        const frame = http.websocket.readFrame(conn, allocator, cfg.websocket_max_frame_size) catch |err| switch (err) {
-            error.ConnectionClosed => return,
-            error.WouldBlock => {
-                const now_ms = http.event_loop.monotonicMs();
-                if (cfg.websocket_ping_interval_ms > 0 and now_ms - last_ping_ms >= cfg.websocket_ping_interval_ms) {
-                    try http.websocket.writeFrame(writer, .ping, "", true);
-                    last_ping_ms = now_ms;
-                }
-                if (cfg.websocket_idle_timeout_ms > 0 and now_ms - last_activity_ms >= cfg.websocket_idle_timeout_ms) return;
-                continue;
-            },
-            else => return err,
-        };
-        defer http.websocket.deinitFrame(allocator, &frame);
-        last_activity_ms = http.event_loop.monotonicMs();
-
-        switch (frame.opcode) {
-            .close => {
-                try http.websocket.writeFrame(writer, .close, "", true);
-                return;
-            },
-            .ping => {
-                try http.websocket.writeFrame(writer, .pong, frame.payload, true);
-                continue;
-            },
-            .pong => continue,
-            .binary => continue,
-            .continuation => continue,
-            .text => {},
-        }
-
-        const payload = std.mem.trim(u8, frame.payload, " \t\r\n");
-        if (payload.len == 0) {
-            try http.websocket.writeFrame(writer, .text, "{\"code\":\"invalid_request\",\"message\":\"empty websocket message\"}", true);
-            continue;
-        }
-
-        const upstream_payload = if (scope == .chat)
-            try std.fmt.allocPrint(allocator, "{{\"message\":{s}}}", .{std.json.fmt(payload, .{})})
-        else
-            try allocator.dupe(u8, payload);
-        defer allocator.free(upstream_payload);
-
-        const exec = proxyJsonExecute(
-            allocator,
-            cfg,
-            scope,
-            proxy_target,
-            null,
-            upstream_payload,
-            correlation_id,
-            client_ip,
-            identity,
-            api_version,
-            incoming_host,
-            incoming_x_forwarded_for,
-            std.io.null_writer,
-            state,
-            false,
-        ) catch |err| {
-            const mapped = mapProxyExecutionError(err);
-            const err_json = try buildApiErrorJson(allocator, mapped.code, mapped.message, correlation_id);
-            defer allocator.free(err_json);
-            try http.websocket.writeFrame(writer, .text, err_json, true);
-            continue;
-        };
-
-        switch (exec) {
-            .streamed_status => |status| {
-                const mapped = mapUpstreamError(status);
-                const err_json = try buildApiErrorJson(allocator, mapped.code, mapped.message, correlation_id);
-                defer allocator.free(err_json);
-                try http.websocket.writeFrame(writer, .text, err_json, true);
-            },
-            .buffered => |result| {
-                defer allocator.free(result.body);
-                defer allocator.free(result.content_type);
-                if (result.content_disposition) |cd| allocator.free(cd);
-
-                if (result.status == 200) {
-                    if (scope == .chat) {
-                        try state.event_hub.publish("ws.chat.responses", result.body, http.event_loop.monotonicMs());
-                    } else {
-                        try state.event_hub.publish("ws.commands.responses", result.body, http.event_loop.monotonicMs());
-                    }
-                    try http.websocket.writeFrame(writer, .text, result.body, true);
-                } else {
-                    const mapped = mapUpstreamError(result.status);
-                    const err_json = try buildApiErrorJson(allocator, mapped.code, mapped.message, correlation_id);
-                    defer allocator.free(err_json);
-                    try http.websocket.writeFrame(writer, .text, err_json, true);
-                }
-            },
-        }
-    }
-}
-
-fn handleWebSocketMultiplexLoop(
-    conn: anytype,
-    allocator: std.mem.Allocator,
-    cfg: *const edge_config.EdgeConfig,
-    state: *GatewayState,
-    correlation_id: []const u8,
-    client_ip: []const u8,
-    identity: ?[]const u8,
-    api_version: ?u32,
-    incoming_host: ?[]const u8,
-    incoming_x_forwarded_for: ?[]const u8,
-    device_id: []const u8,
-) !void {
-    const writer = conn.writer();
-    var channels = std.ArrayList(MuxChannel).init(allocator);
-    defer {
-        for (channels.items) |*ch| deinitMuxChannel(allocator, ch);
-        channels.deinit();
-    }
-
-    var last_activity_ms = http.event_loop.monotonicMs();
-    var last_ping_ms = last_activity_ms;
-    while (!http.shutdown.isShutdownRequested()) {
-        const frame = http.websocket.readFrame(conn, allocator, cfg.websocket_max_frame_size) catch |err| switch (err) {
-            error.ConnectionClosed => return,
-            error.WouldBlock => {
-                try pollMuxChannels(writer, allocator, state, &channels);
-                const now_ms = http.event_loop.monotonicMs();
-                if (cfg.websocket_ping_interval_ms > 0 and now_ms - last_ping_ms >= cfg.websocket_ping_interval_ms) {
-                    try http.websocket.writeFrame(writer, .ping, "", true);
-                    last_ping_ms = now_ms;
-                }
-                if (cfg.websocket_idle_timeout_ms > 0 and now_ms - last_activity_ms >= cfg.websocket_idle_timeout_ms) return;
-                continue;
-            },
-            else => return err,
-        };
-        defer http.websocket.deinitFrame(allocator, &frame);
-        last_activity_ms = http.event_loop.monotonicMs();
-
-        switch (frame.opcode) {
-            .close => {
-                try http.websocket.writeFrame(writer, .close, "", true);
-                return;
-            },
-            .ping => {
-                try http.websocket.writeFrame(writer, .pong, frame.payload, true);
-                continue;
-            },
-            .pong, .binary, .continuation => continue,
-            .text => {},
-        }
-
-        const payload = std.mem.trim(u8, frame.payload, " \t\r\n");
-        if (payload.len == 0) continue;
-        var parsed = std.json.parseFromSlice(std.json.Value, allocator, payload, .{ .ignore_unknown_fields = true }) catch {
-            try http.websocket.writeFrame(writer, .text, "{\"type\":\"error\",\"message\":\"invalid json\"}", true);
-            continue;
-        };
-        defer parsed.deinit();
-        if (parsed.value != .object) {
-            try http.websocket.writeFrame(writer, .text, "{\"type\":\"error\",\"message\":\"invalid envelope\"}", true);
-            continue;
-        }
-        const obj = parsed.value.object;
-        const msg_type = parseMuxObjectFieldString(obj, "type") orelse {
-            try http.websocket.writeFrame(writer, .text, "{\"type\":\"error\",\"message\":\"missing type\"}", true);
-            continue;
-        };
-        const channel_name = parseMuxObjectFieldString(obj, "channel") orelse "default";
-
-        if (std.ascii.eqlIgnoreCase(msg_type, "subscribe")) {
-            const topic = parseMuxObjectFieldString(obj, "topic") orelse {
-                try http.websocket.writeFrame(writer, .text, "{\"type\":\"error\",\"message\":\"missing topic\"}", true);
-                continue;
-            };
-            if (!isValidDeviceTopicSegment(topic) or channels.items.len >= WS_MUX_MAX_CHANNELS) {
-                try http.websocket.writeFrame(writer, .text, "{\"type\":\"error\",\"message\":\"invalid or too many channels\"}", true);
-                continue;
-            }
-            const namespaced_topic = try std.fmt.allocPrint(allocator, "device/{s}/{s}", .{ device_id, topic });
-            defer allocator.free(namespaced_topic);
-            upsertMuxEventChannel(allocator, &channels, channel_name, namespaced_topic);
-            const ack = try std.fmt.allocPrint(allocator, "{{\"channel\":\"{s}\",\"type\":\"subscribed\",\"topic\":\"{s}\"}}", .{ channel_name, topic });
-            defer allocator.free(ack);
-            try http.websocket.writeFrame(writer, .text, ack, true);
-            continue;
-        }
-        if (std.ascii.eqlIgnoreCase(msg_type, "unsubscribe")) {
-            removeMuxChannel(allocator, &channels, channel_name);
-            const ack = try std.fmt.allocPrint(allocator, "{{\"channel\":\"{s}\",\"type\":\"unsubscribed\"}}", .{channel_name});
-            defer allocator.free(ack);
-            try http.websocket.writeFrame(writer, .text, ack, true);
-            continue;
-        }
-        if (std.ascii.eqlIgnoreCase(msg_type, "publish")) {
-            const topic = parseMuxObjectFieldString(obj, "topic") orelse {
-                try http.websocket.writeFrame(writer, .text, "{\"type\":\"error\",\"message\":\"missing topic\"}", true);
-                continue;
-            };
-            var payload_owned: ?[]u8 = null;
-            defer if (payload_owned) |owned| allocator.free(owned);
-            const msg = if (obj.get("payload")) |payload_value|
-                switch (payload_value) {
-                    .string => payload_value.string,
-                    else => blk: {
-                        const encoded = std.json.stringifyAlloc(allocator, payload_value, .{}) catch {
-                            try http.websocket.writeFrame(writer, .text, "{\"type\":\"error\",\"message\":\"invalid payload\"}", true);
-                            continue;
-                        };
-                        payload_owned = encoded;
-                        break :blk encoded;
-                    },
-                }
-            else
-                "";
-            if (!isValidDeviceTopicSegment(topic)) {
-                try http.websocket.writeFrame(writer, .text, "{\"type\":\"error\",\"message\":\"invalid topic\"}", true);
-                continue;
-            }
-            const namespaced_topic = try std.fmt.allocPrint(allocator, "device/{s}/{s}", .{ device_id, topic });
-            defer allocator.free(namespaced_topic);
-            const event_id = try state.event_hub.publish(namespaced_topic, msg, http.event_loop.monotonicMs());
-            const ack = try std.fmt.allocPrint(allocator, "{{\"channel\":\"{s}\",\"type\":\"published\",\"topic\":\"{s}\",\"id\":{d}}}", .{ channel_name, topic, event_id });
-            defer allocator.free(ack);
-            try http.websocket.writeFrame(writer, .text, ack, true);
-            continue;
-        }
-        if (std.ascii.eqlIgnoreCase(msg_type, "command")) {
-            var cmd = http.command.parseCommand(allocator, payload) catch {
-                try http.websocket.writeFrame(writer, .text, "{\"type\":\"error\",\"message\":\"invalid command envelope\"}", true);
-                continue;
-            };
-            defer cmd.deinit(allocator);
-            const command_id = if (cmd.command_id) |cid| try allocator.dupe(u8, cid) else try generateCommandId(allocator);
-            defer allocator.free(command_id);
-            const envelope = try http.command.buildUpstreamEnvelope(
-                allocator,
-                cmd.command_type,
-                cmd.params_raw,
-                command_id,
-                correlation_id,
-                identity orelse "-",
-                client_ip,
-                api_version,
-            );
-            defer allocator.free(envelope);
-
-            if (cmd.async_execute) {
-                state.commandLifecycleCreate(command_id, cmd.command_type.toString(), correlation_id, identity orelse "-") catch {};
-                spawnAsyncCommandExecution(
-                    allocator,
-                    cfg,
-                    state,
-                    command_id,
-                    cmd.command_type.toString(),
-                    cmd.command_type.upstreamPath(),
-                    envelope,
-                    correlation_id,
-                    client_ip,
-                    identity,
-                    api_version,
-                    incoming_host,
-                    incoming_x_forwarded_for,
-                );
-                upsertMuxCommandChannel(allocator, &channels, channel_name, command_id, .pending);
-                const ack = try std.fmt.allocPrint(allocator, "{{\"channel\":\"{s}\",\"type\":\"command.accepted\",\"command_id\":\"{s}\"}}", .{ channel_name, command_id });
-                defer allocator.free(ack);
-                try http.websocket.writeFrame(writer, .text, ack, true);
-                continue;
-            }
-
-            const exec = proxyJsonExecute(
-                allocator,
-                cfg,
-                .commands,
-                cfg.proxy_pass_commands_prefix,
-                cmd.command_type.upstreamPath(),
-                envelope,
-                correlation_id,
-                client_ip,
-                identity,
-                api_version,
-                incoming_host,
-                incoming_x_forwarded_for,
-                std.io.null_writer,
-                state,
-                false,
-            ) catch |err| {
-                const err_msg = try std.fmt.allocPrint(allocator, "{{\"channel\":\"{s}\",\"type\":\"command.error\",\"command_id\":\"{s}\",\"error\":\"{s}\"}}", .{ channel_name, command_id, @errorName(err) });
-                defer allocator.free(err_msg);
-                try http.websocket.writeFrame(writer, .text, err_msg, true);
-                continue;
-            };
-            switch (exec) {
-                .streamed_status => |status| {
-                    const msg = try std.fmt.allocPrint(allocator, "{{\"channel\":\"{s}\",\"type\":\"command.result\",\"command_id\":\"{s}\",\"status\":{d}}}", .{ channel_name, command_id, status });
-                    defer allocator.free(msg);
-                    try http.websocket.writeFrame(writer, .text, msg, true);
-                },
-                .buffered => |result| {
-                    defer allocator.free(result.body);
-                    defer allocator.free(result.content_type);
-                    if (result.content_disposition) |cd| allocator.free(cd);
-                    const body_is_json = std.mem.startsWith(u8, std.mem.trim(u8, result.body, " \t\r\n"), "{") or std.mem.startsWith(u8, std.mem.trim(u8, result.body, " \t\r\n"), "[");
-                    const msg = if (body_is_json)
-                        try std.fmt.allocPrint(allocator, "{{\"channel\":\"{s}\",\"type\":\"command.result\",\"command_id\":\"{s}\",\"status\":{d},\"body\":{s}}}", .{ channel_name, command_id, result.status, result.body })
-                    else
-                        try std.fmt.allocPrint(allocator, "{{\"channel\":\"{s}\",\"type\":\"command.result\",\"command_id\":\"{s}\",\"status\":{d},\"body\":{s}}}", .{ channel_name, command_id, result.status, std.json.fmt(result.body, .{}) });
-                    defer allocator.free(msg);
-                    try http.websocket.writeFrame(writer, .text, msg, true);
-                },
-            }
-            continue;
-        }
-
-        try http.websocket.writeFrame(writer, .text, "{\"type\":\"error\",\"message\":\"unknown type\"}", true);
-    }
-}
-
-fn deinitMuxChannel(allocator: std.mem.Allocator, ch: *MuxChannel) void {
-    allocator.free(ch.name);
-    if (ch.topic) |t| allocator.free(t);
-    if (ch.command_id) |id| allocator.free(id);
-    ch.* = undefined;
-}
-
-fn upsertMuxEventChannel(allocator: std.mem.Allocator, channels: *std.ArrayList(MuxChannel), channel_name: []const u8, topic: []const u8) void {
-    for (channels.items) |*ch| {
-        if (std.mem.eql(u8, ch.name, channel_name)) {
-            if (ch.topic) |old| allocator.free(old);
-            if (ch.command_id) |id| {
-                allocator.free(id);
-                ch.command_id = null;
-            }
-            ch.kind = .events;
-            ch.topic = allocator.dupe(u8, topic) catch null;
-            ch.last_event_id = 0;
-            ch.last_command_status = null;
-            return;
-        }
-    }
-    channels.append(.{
-        .name = allocator.dupe(u8, channel_name) catch return,
-        .kind = .events,
-        .topic = allocator.dupe(u8, topic) catch null,
-        .last_event_id = 0,
-        .command_id = null,
-        .last_command_status = null,
-    }) catch {};
-}
-
-fn upsertMuxCommandChannel(allocator: std.mem.Allocator, channels: *std.ArrayList(MuxChannel), channel_name: []const u8, command_id: []const u8, status: CommandLifecycleStatus) void {
-    for (channels.items) |*ch| {
-        if (std.mem.eql(u8, ch.name, channel_name)) {
-            if (ch.command_id) |old| allocator.free(old);
-            if (ch.topic) |old_topic| {
-                allocator.free(old_topic);
-                ch.topic = null;
-            }
-            ch.kind = .command;
-            ch.command_id = allocator.dupe(u8, command_id) catch null;
-            ch.last_command_status = status;
-            return;
-        }
-    }
-    channels.append(.{
-        .name = allocator.dupe(u8, channel_name) catch return,
-        .kind = .command,
-        .topic = null,
-        .last_event_id = 0,
-        .command_id = allocator.dupe(u8, command_id) catch null,
-        .last_command_status = status,
-    }) catch {};
-}
-
-fn removeMuxChannel(allocator: std.mem.Allocator, channels: *std.ArrayList(MuxChannel), channel_name: []const u8) void {
-    var i: usize = 0;
-    while (i < channels.items.len) : (i += 1) {
-        if (!std.mem.eql(u8, channels.items[i].name, channel_name)) continue;
-        var ch = channels.swapRemove(i);
-        deinitMuxChannel(allocator, &ch);
-        return;
-    }
-}
-
-fn pollMuxChannels(writer: anytype, allocator: std.mem.Allocator, state: *GatewayState, channels: *std.ArrayList(MuxChannel)) !void {
-    for (channels.items) |*ch| {
-        switch (ch.kind) {
-            .events => {
-                const topic = ch.topic orelse continue;
-                const events = state.event_hub.snapshotSince(allocator, topic, ch.last_event_id) catch continue;
-                defer http.event_hub.deinitSnapshot(allocator, events);
-                for (events) |event| {
-                    const msg = try std.fmt.allocPrint(allocator, "{{\"channel\":\"{s}\",\"type\":\"event\",\"topic\":{s},\"id\":{d},\"payload\":{s}}}", .{
-                        ch.name,
-                        std.json.fmt(topic, .{}),
-                        event.id,
-                        std.json.fmt(event.payload, .{}),
-                    });
-                    defer allocator.free(msg);
-                    try http.websocket.writeFrame(writer, .text, msg, true);
-                    ch.last_event_id = event.id;
-                }
-            },
-            .command => {
-                const command_id = ch.command_id orelse continue;
-                var snap = state.commandLifecycleGet(allocator, command_id) orelse continue;
-                defer snap.deinit(allocator);
-                if (ch.last_command_status != null and ch.last_command_status.? == snap.status) continue;
-                ch.last_command_status = snap.status;
-                const body_json = if (snap.response_body.len > 0 and (std.mem.startsWith(u8, std.mem.trim(u8, snap.response_body, " \t\r\n"), "{") or std.mem.startsWith(u8, std.mem.trim(u8, snap.response_body, " \t\r\n"), "[")))
-                    snap.response_body
-                else
-                    "\"\"";
-                const msg = try std.fmt.allocPrint(allocator, "{{\"channel\":\"{s}\",\"type\":\"command.update\",\"command_id\":\"{s}\",\"status\":\"{s}\",\"response_status\":{d},\"body\":{s},\"error\":{s}}}", .{
-                    ch.name,
-                    command_id,
-                    @tagName(snap.status),
-                    snap.response_status,
-                    body_json,
-                    std.json.fmt(snap.error_message, .{}),
-                });
-                defer allocator.free(msg);
-                try http.websocket.writeFrame(writer, .text, msg, true);
-            },
-        }
-    }
-}
-
-fn parseMuxObjectFieldString(obj: std.json.ObjectMap, field_name: []const u8) ?[]const u8 {
-    const v = obj.get(field_name) orelse return null;
-    if (v != .string) return null;
-    const trimmed = std.mem.trim(u8, v.string, " \t\r\n");
-    if (trimmed.len == 0) return null;
-    return trimmed;
-}
-
-fn isValidDeviceTopicSegment(raw: []const u8) bool {
-    const s = std.mem.trim(u8, raw, " \t\r\n");
-    if (s.len == 0 or s.len > 128) return false;
-    for (s) |ch| {
-        if (!(std.ascii.isAlphanumeric(ch) or ch == '-' or ch == '_' or ch == '.')) return false;
-    }
-    return true;
+    const status_code = @intFromEnum(served.status_code);
+    state.metricsRecord(status_code);
+    return status_code;
 }
 
 fn serveTryFilesFallback(
@@ -5086,10 +3940,9 @@ fn serveTryFilesFallback(
         const file_data = std.fs.cwd().readFileAlloc(allocator, full_path, MAX_REQUEST_SIZE) catch continue;
         defer allocator.free(file_data);
 
-        var response = http.Response.ok(allocator, if (std.ascii.eqlIgnoreCase(method, "HEAD")) "" else file_data);
+        var response = http.Response.ok(allocator, if (std.ascii.eqlIgnoreCase(method, "HEAD")) "" else file_data, "application/octet-stream");
         defer response.deinit();
         _ = response
-            .setContentType("application/octet-stream")
             .setConnection(keep_alive)
             .setHeader(http.correlation.HEADER_NAME, correlation_id);
         applyResponseHeaders(state, &response);
@@ -5205,7 +4058,6 @@ const AsyncCommandJob = struct {
 };
 
 fn spawnAsyncCommandExecution(
-    allocator: std.mem.Allocator,
     cfg: *const edge_config.EdgeConfig,
     state: *GatewayState,
     command_id: []const u8,
@@ -5219,7 +4071,46 @@ fn spawnAsyncCommandExecution(
     incoming_host: ?[]const u8,
     incoming_x_forwarded_for: ?[]const u8,
 ) void {
-    const job = allocator.create(AsyncCommandJob) catch return;
+    const job = createAsyncCommandJob(
+        state.allocator,
+        cfg,
+        state,
+        command_id,
+        command_name,
+        upstream_path,
+        envelope,
+        correlation_id,
+        client_ip,
+        identity,
+        api_version,
+        incoming_host,
+        incoming_x_forwarded_for,
+    ) catch return;
+    const t = std.Thread.spawn(.{}, runAsyncCommandJob, .{job}) catch {
+        destroyAsyncCommandJob(job);
+        state.commandLifecycleSetFailed(command_id, "async_spawn_failed");
+        return;
+    };
+    t.detach();
+}
+
+fn createAsyncCommandJob(
+    allocator: std.mem.Allocator,
+    cfg: *const edge_config.EdgeConfig,
+    state: *GatewayState,
+    command_id: []const u8,
+    command_name: []const u8,
+    upstream_path: []const u8,
+    envelope: []const u8,
+    correlation_id: []const u8,
+    client_ip: []const u8,
+    identity: ?[]const u8,
+    api_version: ?u32,
+    incoming_host: ?[]const u8,
+    incoming_x_forwarded_for: ?[]const u8,
+) !*AsyncCommandJob {
+    const job = try allocator.create(AsyncCommandJob);
+    errdefer allocator.destroy(job);
     job.* = .{
         .allocator = allocator,
         .cfg = cfg,
@@ -5235,31 +4126,29 @@ fn spawnAsyncCommandExecution(
         .incoming_x_forwarded_for = if (incoming_x_forwarded_for) |xff| allocator.dupe(u8, xff) catch null else null,
         .api_version = api_version,
     };
-    const t = std.Thread.spawn(.{}, runAsyncCommandJob, .{job}) catch {
-        state.commandLifecycleSetFailed(command_id, "async_spawn_failed");
-        return;
-    };
-    t.detach();
+    return job;
 }
 
 fn dupeOrEmpty(allocator: std.mem.Allocator, src: []const u8) []u8 {
     return allocator.dupe(u8, src) catch allocator.alloc(u8, 0) catch unreachable;
 }
 
+fn destroyAsyncCommandJob(job: *AsyncCommandJob) void {
+    const alloc = job.allocator;
+    if (job.command_id.len > 0) alloc.free(job.command_id);
+    if (job.command_name.len > 0) alloc.free(job.command_name);
+    if (job.upstream_path.len > 0) alloc.free(job.upstream_path);
+    if (job.envelope.len > 0) alloc.free(job.envelope);
+    if (job.correlation_id.len > 0) alloc.free(job.correlation_id);
+    if (job.client_ip.len > 0) alloc.free(job.client_ip);
+    if (job.identity) |id| alloc.free(id);
+    if (job.incoming_host) |h| alloc.free(h);
+    if (job.incoming_x_forwarded_for) |xff| alloc.free(xff);
+    alloc.destroy(job);
+}
+
 fn runAsyncCommandJob(job: *AsyncCommandJob) void {
-    defer {
-        const alloc = job.allocator;
-        if (job.command_id.len > 0) alloc.free(job.command_id);
-        if (job.command_name.len > 0) alloc.free(job.command_name);
-        if (job.upstream_path.len > 0) alloc.free(job.upstream_path);
-        if (job.envelope.len > 0) alloc.free(job.envelope);
-        if (job.correlation_id.len > 0) alloc.free(job.correlation_id);
-        if (job.client_ip.len > 0) alloc.free(job.client_ip);
-        if (job.identity) |id| alloc.free(id);
-        if (job.incoming_host) |h| alloc.free(h);
-        if (job.incoming_x_forwarded_for) |xff| alloc.free(xff);
-        alloc.destroy(job);
-    }
+    defer destroyAsyncCommandJob(job);
 
     job.state.commandLifecycleSetRunning(job.command_id);
     const exec = proxyJsonExecute(
@@ -5296,6 +4185,54 @@ fn runAsyncCommandJob(job: *AsyncCommandJob) void {
     }
 }
 
+test "async command jobs copy request-owned inputs onto long-lived allocator" {
+    var request_arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    const request_allocator = request_arena_state.allocator();
+
+    const command_id = try request_allocator.dupe(u8, "cmd-request-owned");
+    const command_name = try request_allocator.dupe(u8, "chat.send");
+    const upstream_path = try request_allocator.dupe(u8, "/run");
+    const envelope = try request_allocator.dupe(u8, "{\"ok\":true}");
+    const correlation_id = try request_allocator.dupe(u8, "corr-123");
+    const client_ip = try request_allocator.dupe(u8, "127.0.0.1");
+    const identity = try request_allocator.dupe(u8, "identity-1");
+    const incoming_host = try request_allocator.dupe(u8, "example.test");
+    const incoming_xff = try request_allocator.dupe(u8, "10.0.0.1");
+
+    var cfg: edge_config.EdgeConfig = undefined;
+    var state: GatewayState = undefined;
+    state.allocator = std.testing.allocator;
+
+    const job = try createAsyncCommandJob(
+        std.testing.allocator,
+        &cfg,
+        &state,
+        command_id,
+        command_name,
+        upstream_path,
+        envelope,
+        correlation_id,
+        client_ip,
+        identity,
+        1,
+        incoming_host,
+        incoming_xff,
+    );
+    defer destroyAsyncCommandJob(job);
+
+    request_arena_state.deinit();
+
+    try std.testing.expectEqualStrings("cmd-request-owned", job.command_id);
+    try std.testing.expectEqualStrings("chat.send", job.command_name);
+    try std.testing.expectEqualStrings("/run", job.upstream_path);
+    try std.testing.expectEqualStrings("{\"ok\":true}", job.envelope);
+    try std.testing.expectEqualStrings("corr-123", job.correlation_id);
+    try std.testing.expectEqualStrings("127.0.0.1", job.client_ip);
+    try std.testing.expectEqualStrings("identity-1", job.identity.?);
+    try std.testing.expectEqualStrings("example.test", job.incoming_host.?);
+    try std.testing.expectEqualStrings("10.0.0.1", job.incoming_x_forwarded_for.?);
+}
+
 fn parseLastEventId(raw: ?[]const u8) u64 {
     const value = raw orelse return 0;
     return std.fmt.parseInt(u64, std.mem.trim(u8, value, " \t\r\n"), 10) catch 0;
@@ -5329,6 +4266,54 @@ fn applyInternalRedirectRules(
         if (!changed) break;
     }
     return current;
+}
+
+fn evaluateConditionalRules(
+    allocator: std.mem.Allocator,
+    rules: []const edge_config.EdgeConfig.ConditionalRule,
+    path: []const u8,
+    request_uri: []const u8,
+    host: []const u8,
+    args: []const u8,
+) !?http.rewrite.Outcome {
+    for (rules) |rule| {
+        const input = switch (rule.variable) {
+            .request_uri => request_uri,
+            .http_host => host,
+            .args => args,
+        };
+
+        switch (rule.action) {
+            .rewrite => |rw| {
+                const replacement = try http.rewrite.substitutePattern(
+                    allocator,
+                    rule.pattern,
+                    input,
+                    request_uri,
+                    rw.replacement,
+                    rule.case_insensitive,
+                ) orelse continue;
+                switch (rw.flag) {
+                    .redirect => return .{ .redirect = .{ .status = 302, .location = replacement } },
+                    .permanent => return .{ .redirect = .{ .status = 301, .location = replacement } },
+                    .@"break", .last => return .{ .pass = replacement },
+                }
+            },
+            .returned => |ret| {
+                const body = try http.rewrite.substitutePattern(
+                    allocator,
+                    rule.pattern,
+                    input,
+                    request_uri,
+                    ret.body,
+                    rule.case_insensitive,
+                ) orelse continue;
+                return .{ .returned = .{ .status = ret.status, .body = body } };
+            },
+        }
+    }
+    _ = path;
+    return null;
 }
 
 fn resolveNamedLocation(name: []const u8, named_locations: []const edge_config.EdgeConfig.NamedLocation) ?[]const u8 {
@@ -5432,64 +4417,339 @@ fn executeSubrequest(allocator: std.mem.Allocator, url: []const u8, method: std.
     };
 }
 
-const BackendProtocol = enum {
-    fastcgi,
-    uwsgi,
-    scgi,
-};
-
-fn handleBackendProtocolRoute(
+fn handleFastcgiRoute(
     allocator: std.mem.Allocator,
     writer: anytype,
+    cfg: *const edge_config.EdgeConfig,
     upstream: []const u8,
-    method: []const u8,
-    path: []const u8,
-    body: []const u8,
+    request: *const http.Request,
+    client_ip: []const u8,
     correlation_id: []const u8,
     keep_alive: bool,
     state: *GatewayState,
-    kind: BackendProtocol,
-) !void {
+) !u16 {
     const endpoint = std.mem.trim(u8, upstream, " \t\r\n");
     if (endpoint.len == 0) {
-        try sendApiError(allocator, writer, .not_implemented, "tool_unavailable", "Backend upstream not configured", correlation_id, keep_alive, state);
-        return;
+        try sendApiError(allocator, writer, .not_implemented, "tool_unavailable", "FastCGI upstream not configured", correlation_id, keep_alive, state);
+        return 501;
     }
-    const wire = switch (kind) {
-        .fastcgi => try http.fastcgi.buildRequest(allocator, method, "/index.php", path, body),
-        .uwsgi => try http.uwsgi.buildPacket(allocator, method, path, body),
-        .scgi => try http.scgi.buildRequest(allocator, method, path, body),
+
+    const configured_doc_root = std.mem.trim(u8, cfg.doc_root, " \t\r\n");
+    const document_root = request.headers.get("x-fastcgi-document-root") orelse configured_doc_root;
+    const path_info = request.headers.get("x-fastcgi-path-info") orelse request.uri.path;
+    const fastcgi_index = if (cfg.fastcgi_index.len > 0) cfg.fastcgi_index else "index.php";
+    const default_script_path = defaultFastcgiScriptPath(allocator, document_root, path_info, fastcgi_index) catch null;
+    defer if (default_script_path) |path| allocator.free(path);
+    const script_filename = request.headers.get("x-fastcgi-script-filename") orelse (default_script_path orelse "/index.php");
+    const default_script_name = if (std.mem.endsWith(u8, path_info, "/"))
+        std.fmt.allocPrint(allocator, "{s}{s}", .{ path_info, fastcgi_index }) catch null
+    else
+        null;
+    defer if (default_script_name) |path| allocator.free(path);
+    const script_name = request.headers.get("x-fastcgi-script-name") orelse (default_script_name orelse path_info);
+    const host = request.headers.get("host") orelse "";
+    const server_name = stripHostPort(host);
+
+    var port_buf: [16]u8 = undefined;
+    const server_port = if (hostPort(host)) |port|
+        std.fmt.bufPrint(&port_buf, "{d}", .{port}) catch "80"
+    else if (cfg.listen_port > 0)
+        std.fmt.bufPrint(&port_buf, "{d}", .{cfg.listen_port}) catch "80"
+    else
+        "80";
+
+    var remote_port_buf: [8]u8 = undefined;
+    const remote_port = request.headers.get("x-forwarded-port") orelse request.headers.get("x-real-port") orelse
+        (std.fmt.bufPrint(&remote_port_buf, "{d}", .{0}) catch "0");
+
+    var request_uri = std.ArrayList(u8).init(allocator);
+    defer request_uri.deinit();
+    try request_uri.appendSlice(request.uri.path);
+    if (request.uri.query) |query| {
+        try request_uri.append('?');
+        try request_uri.appendSlice(query);
+    }
+
+    var extra_env = std.ArrayList(http.fastcgi.EnvPair).init(allocator);
+    defer extra_env.deinit();
+    for (cfg.fastcgi_params) |pair| {
+        try extra_env.append(.{ .name = pair.name, .value = pair.value });
+    }
+    try extra_env.append(.{ .name = "TARDIGRADE_CORRELATION_ID", .value = correlation_id });
+
+    var leased = state.acquireFastcgiStream(endpoint) catch |err| {
+        state.logger.warn(correlation_id, "fastcgi connect failed for {s}: {}", .{ endpoint, err });
+        try sendApiError(allocator, writer, .bad_gateway, "tool_unavailable", "FastCGI request failed", correlation_id, keep_alive, state);
+        return 502;
     };
-    defer allocator.free(wire);
-    const resp = executeRawProtocolRequest(allocator, endpoint, wire) catch |err| {
-        std.log.warn("backend protocol request failed: {}", .{err});
-        try sendApiError(allocator, writer, .bad_gateway, "tool_unavailable", "Backend protocol request failed", correlation_id, keep_alive, state);
-        return;
+    errdefer {
+        var owned = leased.stream;
+        owned.close();
+    }
+
+    var fcgi = http.fastcgi.exchange(allocator, &leased.stream, .{
+        .request_id = state.nextFastcgiRequestId(endpoint),
+        .keep_conn = true,
+        .method = request.method.toString(),
+        .script_filename = script_filename,
+        .request_uri = request_uri.items,
+        .query_string = request.uri.query orelse "",
+        .path_info = path_info,
+        .script_name = script_name,
+        .document_root = document_root,
+        .content_type = request.contentType(),
+        .remote_addr = client_ip,
+        .remote_port = remote_port,
+        .server_name = if (server_name.len > 0) server_name else "localhost",
+        .server_port = server_port,
+        .server_protocol = request.version.toString(),
+        .request_scheme = if (cfg.tls_cert_path.len > 0 and cfg.tls_key_path.len > 0) "https" else "http",
+        .https = cfg.tls_cert_path.len > 0 and cfg.tls_key_path.len > 0,
+        .headers = &request.headers,
+        .extra_env = extra_env.items,
+    }, request.body orelse "") catch |err| {
+        state.logger.warn(correlation_id, "fastcgi request failed for {s}: {}", .{ endpoint, err });
+        var owned = leased.stream;
+        owned.close();
+        try sendApiError(allocator, writer, .bad_gateway, "tool_unavailable", "FastCGI request failed", correlation_id, keep_alive, state);
+        return 502;
     };
-    defer allocator.free(resp);
+    defer fcgi.deinit();
+
+    if (fcgi.stderr.len > 0) {
+        state.logger.warn(correlation_id, "fastcgi stderr from {s}: {s}", .{ endpoint, fcgi.stderr });
+    }
+
+    if (fcgi.protocol_status != http.fastcgi.request_complete or fcgi.app_status != 0) {
+        state.logger.warn(correlation_id, "fastcgi end_request failure from {s}: app_status={d} protocol_status={d}", .{ endpoint, fcgi.app_status, fcgi.protocol_status });
+        var owned = leased.stream;
+        owned.close();
+        try sendApiError(allocator, writer, .bad_gateway, "tool_unavailable", "FastCGI upstream failed", correlation_id, keep_alive, state);
+        return 502;
+    }
+
     var response = http.Response.init(allocator);
     defer response.deinit();
-    _ = response.setStatus(.ok)
-        .setBody(resp)
-        .setContentType("application/octet-stream")
+    _ = response.setStatus(@enumFromInt(fcgi.status))
+        .setBody(fcgi.body)
+        .setContentType(fcgi.contentType())
         .setConnection(keep_alive)
         .setHeader(http.correlation.HEADER_NAME, correlation_id);
+
+    for (fcgi.headers.iterator()) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, "status") or
+            std.ascii.eqlIgnoreCase(header.name, "content-type") or
+            std.ascii.eqlIgnoreCase(header.name, "content-length") or
+            std.ascii.eqlIgnoreCase(header.name, "connection"))
+        {
+            continue;
+        }
+        _ = response.setHeader(header.name, header.value);
+    }
+
     applyResponseHeaders(state, &response);
     try response.write(writer);
-    state.metricsRecord(200);
+    state.metricsRecord(fcgi.status);
+    state.releaseFastcgiStream(endpoint, leased.stream, true);
+    return fcgi.status;
 }
 
-fn executeRawProtocolRequest(allocator: std.mem.Allocator, endpoint: []const u8, payload: []const u8) ![]u8 {
-    const ep = try http.memcached.parseEndpoint(endpoint);
-    const stream = try std.net.tcpConnectToHost(allocator, ep.host, ep.port);
-    defer stream.close();
-    try stream.writer().writeAll(payload);
-    var out = std.ArrayList(u8).init(allocator);
-    errdefer out.deinit();
-    var buf: [16 * 1024]u8 = undefined;
-    const n = try stream.read(&buf);
-    if (n > 0) try out.appendSlice(buf[0..n]);
-    return out.toOwnedSlice();
+fn defaultFastcgiScriptPath(
+    allocator: std.mem.Allocator,
+    document_root: []const u8,
+    path_info: []const u8,
+    fastcgi_index: []const u8,
+) ![]u8 {
+    if (document_root.len == 0) {
+        return allocator.dupe(u8, if (std.mem.endsWith(u8, path_info, "/")) fastcgi_index else path_info);
+    }
+    if (std.mem.endsWith(u8, path_info, "/")) {
+        return std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ document_root, path_info, fastcgi_index });
+    }
+    return std.fmt.allocPrint(allocator, "{s}{s}", .{ document_root, path_info });
+}
+
+fn handleScgiRoute(
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    cfg: *const edge_config.EdgeConfig,
+    upstream: []const u8,
+    request: *const http.Request,
+    client_ip: []const u8,
+    correlation_id: []const u8,
+    keep_alive: bool,
+    state: *GatewayState,
+) !u16 {
+    const endpoint = std.mem.trim(u8, upstream, " \t\r\n");
+    if (endpoint.len == 0) {
+        try sendApiError(allocator, writer, .not_implemented, "tool_unavailable", "SCGI upstream not configured", correlation_id, keep_alive, state);
+        return 501;
+    }
+
+    const path_info = request.headers.get("x-scgi-path-info") orelse request.uri.path;
+    const script_name = request.headers.get("x-scgi-script-name") orelse path_info;
+    const document_root = request.headers.get("x-scgi-document-root") orelse "";
+    const host = request.headers.get("host") orelse "";
+    const server_name = stripHostPort(host);
+    var port_buf: [16]u8 = undefined;
+    const server_port = if (hostPort(host)) |port|
+        std.fmt.bufPrint(&port_buf, "{d}", .{port}) catch "80"
+    else if (cfg.listen_port > 0)
+        std.fmt.bufPrint(&port_buf, "{d}", .{cfg.listen_port}) catch "80"
+    else
+        "80";
+
+    var remote_port_buf: [8]u8 = undefined;
+    const remote_port = request.headers.get("x-forwarded-port") orelse request.headers.get("x-real-port") orelse
+        (std.fmt.bufPrint(&remote_port_buf, "{d}", .{0}) catch "0");
+
+    var request_uri = std.ArrayList(u8).init(allocator);
+    defer request_uri.deinit();
+    try request_uri.appendSlice(request.uri.path);
+    if (request.uri.query) |query| {
+        try request_uri.append('?');
+        try request_uri.appendSlice(query);
+    }
+
+    var scgi = http.scgi.execute(allocator, endpoint, .{
+        .method = request.method.toString(),
+        .request_uri = request_uri.items,
+        .query_string = request.uri.query orelse "",
+        .path_info = path_info,
+        .script_name = script_name,
+        .document_root = document_root,
+        .content_type = request.contentType(),
+        .remote_addr = client_ip,
+        .remote_port = remote_port,
+        .server_name = if (server_name.len > 0) server_name else "localhost",
+        .server_port = server_port,
+        .server_protocol = request.version.toString(),
+        .request_scheme = if (cfg.tls_cert_path.len > 0 and cfg.tls_key_path.len > 0) "https" else "http",
+        .https = cfg.tls_cert_path.len > 0 and cfg.tls_key_path.len > 0,
+        .headers = &request.headers,
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_CORRELATION_ID", .value = correlation_id },
+        },
+    }, request.body orelse "") catch |err| {
+        state.logger.warn(correlation_id, "scgi request failed for {s}: {}", .{ endpoint, err });
+        try sendApiError(allocator, writer, .bad_gateway, "tool_unavailable", "SCGI request failed", correlation_id, keep_alive, state);
+        return 502;
+    };
+    defer scgi.deinit();
+
+    var response = http.Response.init(allocator);
+    defer response.deinit();
+    _ = response.setStatus(@enumFromInt(scgi.status))
+        .setBody(scgi.body)
+        .setContentType(scgi.contentType())
+        .setConnection(keep_alive)
+        .setHeader(http.correlation.HEADER_NAME, correlation_id);
+    for (scgi.headers.iterator()) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, "status") or
+            std.ascii.eqlIgnoreCase(header.name, "content-type") or
+            std.ascii.eqlIgnoreCase(header.name, "content-length") or
+            std.ascii.eqlIgnoreCase(header.name, "connection"))
+        {
+            continue;
+        }
+        _ = response.setHeader(header.name, header.value);
+    }
+    applyResponseHeaders(state, &response);
+    try response.write(writer);
+    state.metricsRecord(scgi.status);
+    return scgi.status;
+}
+
+fn handleUwsgiRoute(
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    cfg: *const edge_config.EdgeConfig,
+    upstream: []const u8,
+    request: *const http.Request,
+    client_ip: []const u8,
+    correlation_id: []const u8,
+    keep_alive: bool,
+    state: *GatewayState,
+) !u16 {
+    const endpoint = std.mem.trim(u8, upstream, " \t\r\n");
+    if (endpoint.len == 0) {
+        try sendApiError(allocator, writer, .not_implemented, "tool_unavailable", "uWSGI upstream not configured", correlation_id, keep_alive, state);
+        return 501;
+    }
+
+    const path_info = request.headers.get("x-uwsgi-path-info") orelse request.uri.path;
+    const script_name = request.headers.get("x-uwsgi-script-name") orelse path_info;
+    const document_root = request.headers.get("x-uwsgi-document-root") orelse "";
+    const host = request.headers.get("host") orelse "";
+    const server_name = stripHostPort(host);
+    var port_buf: [16]u8 = undefined;
+    const server_port = if (hostPort(host)) |port|
+        std.fmt.bufPrint(&port_buf, "{d}", .{port}) catch "80"
+    else if (cfg.listen_port > 0)
+        std.fmt.bufPrint(&port_buf, "{d}", .{cfg.listen_port}) catch "80"
+    else
+        "80";
+
+    var remote_port_buf: [8]u8 = undefined;
+    const remote_port = request.headers.get("x-forwarded-port") orelse request.headers.get("x-real-port") orelse
+        (std.fmt.bufPrint(&remote_port_buf, "{d}", .{0}) catch "0");
+
+    var request_uri = std.ArrayList(u8).init(allocator);
+    defer request_uri.deinit();
+    try request_uri.appendSlice(request.uri.path);
+    if (request.uri.query) |query| {
+        try request_uri.append('?');
+        try request_uri.appendSlice(query);
+    }
+
+    var uwsgi = http.uwsgi.execute(allocator, endpoint, .{
+        .method = request.method.toString(),
+        .request_uri = request_uri.items,
+        .query_string = request.uri.query orelse "",
+        .path_info = path_info,
+        .script_name = script_name,
+        .document_root = document_root,
+        .content_type = request.contentType(),
+        .remote_addr = client_ip,
+        .remote_port = remote_port,
+        .server_name = if (server_name.len > 0) server_name else "localhost",
+        .server_port = server_port,
+        .server_protocol = request.version.toString(),
+        .request_scheme = if (cfg.tls_cert_path.len > 0 and cfg.tls_key_path.len > 0) "https" else "http",
+        .https = cfg.tls_cert_path.len > 0 and cfg.tls_key_path.len > 0,
+        .headers = &request.headers,
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_CORRELATION_ID", .value = correlation_id },
+        },
+    }, request.body orelse "") catch |err| {
+        state.logger.warn(correlation_id, "uwsgi request failed for {s}: {}", .{ endpoint, err });
+        try sendApiError(allocator, writer, .bad_gateway, "tool_unavailable", "uWSGI request failed", correlation_id, keep_alive, state);
+        return 502;
+    };
+    defer uwsgi.deinit();
+
+    var response = http.Response.init(allocator);
+    defer response.deinit();
+    _ = response.setStatus(@enumFromInt(uwsgi.status))
+        .setBody(uwsgi.body)
+        .setContentType(uwsgi.contentType())
+        .setConnection(keep_alive)
+        .setHeader(http.correlation.HEADER_NAME, correlation_id);
+    for (uwsgi.headers.iterator()) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, "status") or
+            std.ascii.eqlIgnoreCase(header.name, "content-type") or
+            std.ascii.eqlIgnoreCase(header.name, "content-length") or
+            std.ascii.eqlIgnoreCase(header.name, "connection") or
+            std.ascii.eqlIgnoreCase(header.name, "transfer-encoding"))
+        {
+            continue;
+        }
+        _ = response.setHeader(header.name, header.value);
+    }
+    applyResponseHeaders(state, &response);
+    try response.write(writer);
+    state.metricsRecord(uwsgi.status);
+    return uwsgi.status;
 }
 
 fn proxyGrpcExecute(
@@ -5555,6 +4815,450 @@ fn handleMailProxyRoute(
     state.metricsRecord(200);
 }
 
+fn handleImapProxyRoute(
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    upstream: []const u8,
+    body: []const u8,
+    correlation_id: []const u8,
+    keep_alive: bool,
+    state: *GatewayState,
+) !void {
+    const endpoint = std.mem.trim(u8, upstream, " \t\r\n");
+    if (endpoint.len == 0) {
+        try sendApiError(allocator, writer, .not_implemented, "tool_unavailable", "Upstream not configured", correlation_id, keep_alive, state);
+        return;
+    }
+    const resp = blk: {
+        const maybe_mail_endpoint = parseMailProxyEndpoint(endpoint) catch |err| {
+            std.log.warn("imap proxy endpoint invalid: {}", .{err});
+            try sendApiError(allocator, writer, .bad_gateway, "tool_unavailable", "Upstream request failed", correlation_id, keep_alive, state);
+            return;
+        };
+        if (maybe_mail_endpoint) |mail_endpoint| {
+            break :blk executeImapProtocolRequest(allocator, mail_endpoint, body) catch |err| {
+                std.log.warn("imap proxy failed: {}", .{err});
+                try sendApiError(allocator, writer, .bad_gateway, "tool_unavailable", "Upstream request failed", correlation_id, keep_alive, state);
+                return;
+            };
+        }
+        break :blk executeRawProtocolRequest(allocator, endpoint, body) catch |err| {
+            std.log.warn("imap proxy failed: {}", .{err});
+            try sendApiError(allocator, writer, .bad_gateway, "tool_unavailable", "Upstream request failed", correlation_id, keep_alive, state);
+            return;
+        };
+    };
+    defer allocator.free(resp);
+    var response = http.Response.init(allocator);
+    defer response.deinit();
+    _ = response.setStatus(.ok)
+        .setBody(resp)
+        .setContentType("application/octet-stream")
+        .setConnection(keep_alive)
+        .setHeader(http.correlation.HEADER_NAME, correlation_id);
+    applyResponseHeaders(state, &response);
+    try response.write(writer);
+    state.metricsRecord(200);
+}
+
+const MailProxyTransport = enum {
+    starttls,
+    tls,
+};
+
+const MailProxyEndpoint = struct {
+    transport: MailProxyTransport,
+    host: []const u8,
+    port: u16,
+};
+
+fn handleSmtpProxyRoute(
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    upstream: []const u8,
+    body: []const u8,
+    correlation_id: []const u8,
+    keep_alive: bool,
+    state: *GatewayState,
+    auth_identity: ?[]const u8,
+) !void {
+    const endpoint = std.mem.trim(u8, upstream, " \t\r\n");
+    if (endpoint.len == 0) {
+        try sendApiError(allocator, writer, .not_implemented, "tool_unavailable", "Upstream not configured", correlation_id, keep_alive, state);
+        return;
+    }
+    const upstream_payload = try injectSmtpAuthIdentity(allocator, body, auth_identity);
+    defer if (upstream_payload.ptr != body.ptr) allocator.free(upstream_payload);
+    const resp = blk: {
+        const maybe_mail_endpoint = parseMailProxyEndpoint(endpoint) catch |err| {
+            std.log.warn("smtp proxy endpoint invalid: {}", .{err});
+            try sendApiError(allocator, writer, .bad_gateway, "tool_unavailable", "Upstream request failed", correlation_id, keep_alive, state);
+            return;
+        };
+        if (maybe_mail_endpoint) |mail_endpoint| {
+            break :blk executeSmtpProtocolRequest(allocator, mail_endpoint, upstream_payload) catch |err| {
+                std.log.warn("smtp proxy failed: {}", .{err});
+                try sendApiError(allocator, writer, .bad_gateway, "tool_unavailable", "Upstream request failed", correlation_id, keep_alive, state);
+                return;
+            };
+        }
+        break :blk executeRawProtocolRequest(allocator, endpoint, upstream_payload) catch |err| {
+            std.log.warn("smtp proxy failed: {}", .{err});
+            try sendApiError(allocator, writer, .bad_gateway, "tool_unavailable", "Upstream request failed", correlation_id, keep_alive, state);
+            return;
+        };
+    };
+    defer allocator.free(resp);
+    var response = http.Response.init(allocator);
+    defer response.deinit();
+    _ = response.setStatus(.ok)
+        .setBody(resp)
+        .setContentType("application/octet-stream")
+        .setConnection(keep_alive)
+        .setHeader(http.correlation.HEADER_NAME, correlation_id);
+    applyResponseHeaders(state, &response);
+    try response.write(writer);
+    state.metricsRecord(200);
+}
+
+fn injectSmtpAuthIdentity(
+    allocator: std.mem.Allocator,
+    payload: []const u8,
+    auth_identity: ?[]const u8,
+) ![]const u8 {
+    const identity = auth_identity orelse return payload;
+    if (identity.len == 0) return payload;
+
+    const data_start = findSmtpDataStart(payload) orelse return payload;
+    if (std.mem.indexOfPos(u8, payload, data_start, "X-Tardigrade-Auth-Identity:")) |_| return payload;
+
+    const header_line = try std.fmt.allocPrint(allocator, "X-Tardigrade-Auth-Identity: {s}\r\n", .{identity});
+    defer allocator.free(header_line);
+
+    if (std.mem.indexOfPos(u8, payload, data_start, "\r\n\r\n")) |_| {
+        return std.fmt.allocPrint(
+            allocator,
+            "{s}{s}{s}",
+            .{ payload[0..data_start], header_line, payload[data_start..] },
+        );
+    }
+
+    return std.fmt.allocPrint(
+        allocator,
+        "{s}{s}\r\n{s}",
+        .{ payload[0..data_start], header_line, payload[data_start..] },
+    );
+}
+
+fn findSmtpDataStart(payload: []const u8) ?usize {
+    if (std.mem.startsWith(u8, payload, "DATA\r\n")) return "DATA\r\n".len;
+    if (std.mem.indexOf(u8, payload, "\r\nDATA\r\n")) |idx| return idx + "\r\nDATA\r\n".len;
+    return null;
+}
+
+fn executeRawProtocolRequest(allocator: std.mem.Allocator, endpoint: []const u8, payload: []const u8) ![]u8 {
+    const ep = try http.memcached.parseEndpoint(endpoint);
+    const stream = try std.net.tcpConnectToHost(allocator, ep.host, ep.port);
+    defer stream.close();
+    try setSocketTimeoutMs(stream.handle, 2_000, 2_000);
+    try stream.writer().writeAll(payload);
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    var buf: [16 * 1024]u8 = undefined;
+    const n = try stream.read(&buf);
+    if (n > 0) try out.appendSlice(buf[0..n]);
+    return out.toOwnedSlice();
+}
+
+fn parseMailProxyEndpoint(raw: []const u8) !?MailProxyEndpoint {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    var transport: MailProxyTransport = undefined;
+    var endpoint = trimmed;
+    if (std.mem.startsWith(u8, endpoint, "starttls://")) {
+        transport = .starttls;
+        endpoint = endpoint["starttls://".len..];
+    } else if (std.mem.startsWith(u8, endpoint, "smtp+starttls://")) {
+        transport = .starttls;
+        endpoint = endpoint["smtp+starttls://".len..];
+    } else if (std.mem.startsWith(u8, endpoint, "tls://")) {
+        transport = .tls;
+        endpoint = endpoint["tls://".len..];
+    } else if (std.mem.startsWith(u8, endpoint, "smtps://")) {
+        transport = .tls;
+        endpoint = endpoint["smtps://".len..];
+    } else {
+        return null;
+    }
+    const parsed = http.memcached.parseEndpoint(endpoint) catch |err| switch (err) {
+        error.InvalidEndpoint => return error.InvalidConfigEndpoint,
+        else => return err,
+    };
+    if (parsed.host.len == 0 or parsed.port == 0) return error.InvalidConfigEndpoint;
+    return .{
+        .transport = transport,
+        .host = parsed.host,
+        .port = parsed.port,
+    };
+}
+
+fn executeSmtpProtocolRequest(allocator: std.mem.Allocator, endpoint: MailProxyEndpoint, payload: []const u8) ![]u8 {
+    const stream = try std.net.tcpConnectToHost(allocator, endpoint.host, endpoint.port);
+    defer stream.close();
+    try setSocketTimeoutMs(stream.handle, 10_000, 10_000);
+    return switch (endpoint.transport) {
+        .tls => executeSmtpTlsRequest(allocator, stream, endpoint.host, payload),
+        .starttls => executeSmtpStartTlsRequest(allocator, stream, endpoint.host, payload),
+    };
+}
+
+fn executeImapProtocolRequest(allocator: std.mem.Allocator, endpoint: MailProxyEndpoint, payload: []const u8) ![]u8 {
+    const stream = try std.net.tcpConnectToHost(allocator, endpoint.host, endpoint.port);
+    defer stream.close();
+    try setSocketTimeoutMs(stream.handle, 10_000, 10_000);
+    return switch (endpoint.transport) {
+        .tls => executeImapTlsRequest(allocator, stream, endpoint.host, payload),
+        .starttls => executeImapStartTlsRequest(allocator, stream, endpoint.host, payload),
+    };
+}
+
+fn executeSmtpTlsRequest(
+    allocator: std.mem.Allocator,
+    stream: std.net.Stream,
+    host: []const u8,
+    payload: []const u8,
+) ![]u8 {
+    _ = host;
+    var tls_client = try std.crypto.tls.Client.init(stream, .{
+        .host = .no_verification,
+        .ca = .no_verification,
+    });
+    tls_client.allow_truncation_attacks = true;
+    try tls_client.writeAll(stream, payload);
+    return readSmtpReplyTls(allocator, &tls_client, stream);
+}
+
+fn executeSmtpStartTlsRequest(
+    allocator: std.mem.Allocator,
+    stream: std.net.Stream,
+    host: []const u8,
+    payload: []const u8,
+) ![]u8 {
+    _ = host;
+    const greeting = try readSmtpReplyPlain(allocator, stream);
+    defer allocator.free(greeting);
+    if (!smtpReplyContainsCode(greeting, "220")) return error.ProtocolError;
+
+    try stream.writer().writeAll("EHLO tardigrade.local\r\n");
+    const ehlo_reply = try readSmtpReplyPlain(allocator, stream);
+    defer allocator.free(ehlo_reply);
+    if (!smtpReplyAdvertisesStartTls(ehlo_reply)) return error.ProtocolError;
+
+    try stream.writer().writeAll("STARTTLS\r\n");
+    const starttls_reply = try readSmtpReplyPlain(allocator, stream);
+    defer allocator.free(starttls_reply);
+    if (!smtpReplyContainsCode(starttls_reply, "220")) return error.ProtocolError;
+
+    var tls_client = try std.crypto.tls.Client.init(stream, .{
+        .host = .no_verification,
+        .ca = .no_verification,
+    });
+    tls_client.allow_truncation_attacks = true;
+
+    try tls_client.writeAll(stream, "EHLO tardigrade.local\r\n");
+    const post_tls_ehlo = try readSmtpReplyTls(allocator, &tls_client, stream);
+    defer allocator.free(post_tls_ehlo);
+    if (!smtpReplyContainsCode(post_tls_ehlo, "250")) return error.ProtocolError;
+
+    try tls_client.writeAll(stream, payload);
+    return readSmtpReplyTls(allocator, &tls_client, stream);
+}
+
+fn executeImapTlsRequest(
+    allocator: std.mem.Allocator,
+    stream: std.net.Stream,
+    host: []const u8,
+    payload: []const u8,
+) ![]u8 {
+    _ = host;
+    var tls_client = try std.crypto.tls.Client.init(stream, .{
+        .host = .no_verification,
+        .ca = .no_verification,
+    });
+    tls_client.allow_truncation_attacks = true;
+
+    const greeting = try readImapReplyTls(allocator, &tls_client, stream, null);
+    defer allocator.free(greeting);
+    if (!imapReplyContainsOk(greeting)) return error.ProtocolError;
+
+    try tls_client.writeAll(stream, payload);
+    return readImapReplyTls(allocator, &tls_client, stream, imapPayloadTag(payload));
+}
+
+fn executeImapStartTlsRequest(
+    allocator: std.mem.Allocator,
+    stream: std.net.Stream,
+    host: []const u8,
+    payload: []const u8,
+) ![]u8 {
+    _ = host;
+    const greeting = try readImapReplyPlain(allocator, stream, null);
+    defer allocator.free(greeting);
+    if (!imapReplyContainsOk(greeting)) return error.ProtocolError;
+
+    try stream.writer().writeAll("a001 STARTTLS\r\n");
+    const starttls_reply = try readImapReplyPlain(allocator, stream, "a001");
+    defer allocator.free(starttls_reply);
+    if (!imapTaggedReplyContainsOk(starttls_reply, "a001")) return error.ProtocolError;
+
+    var tls_client = try std.crypto.tls.Client.init(stream, .{
+        .host = .no_verification,
+        .ca = .no_verification,
+    });
+    tls_client.allow_truncation_attacks = true;
+
+    try tls_client.writeAll(stream, payload);
+    return readImapReplyTls(allocator, &tls_client, stream, imapPayloadTag(payload));
+}
+
+fn readSmtpReplyPlain(allocator: std.mem.Allocator, stream: std.net.Stream) ![]u8 {
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    var buf: [2048]u8 = undefined;
+    while (true) {
+        const n = try stream.read(&buf);
+        if (n == 0) break;
+        try out.appendSlice(buf[0..n]);
+        if (smtpReplyComplete(out.items)) break;
+    }
+    if (out.items.len == 0) return error.EndOfStream;
+    return out.toOwnedSlice();
+}
+
+fn readSmtpReplyTls(allocator: std.mem.Allocator, tls_client: *std.crypto.tls.Client, stream: std.net.Stream) ![]u8 {
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    var buf: [2048]u8 = undefined;
+    while (true) {
+        const n = try tls_client.read(stream, &buf);
+        if (n == 0) break;
+        try out.appendSlice(buf[0..n]);
+        if (smtpReplyComplete(out.items)) break;
+    }
+    if (out.items.len == 0) return error.EndOfStream;
+    return out.toOwnedSlice();
+}
+
+fn readImapReplyPlain(allocator: std.mem.Allocator, stream: std.net.Stream, tag: ?[]const u8) ![]u8 {
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    var buf: [2048]u8 = undefined;
+    while (true) {
+        const n = try stream.read(&buf);
+        if (n == 0) break;
+        try out.appendSlice(buf[0..n]);
+        if (imapReplyComplete(out.items, tag)) break;
+    }
+    if (out.items.len == 0) return error.EndOfStream;
+    return out.toOwnedSlice();
+}
+
+fn readImapReplyTls(
+    allocator: std.mem.Allocator,
+    tls_client: *std.crypto.tls.Client,
+    stream: std.net.Stream,
+    tag: ?[]const u8,
+) ![]u8 {
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    var buf: [2048]u8 = undefined;
+    while (true) {
+        const n = try tls_client.read(stream, &buf);
+        if (n == 0) break;
+        try out.appendSlice(buf[0..n]);
+        if (imapReplyComplete(out.items, tag)) break;
+    }
+    if (out.items.len == 0) return error.EndOfStream;
+    return out.toOwnedSlice();
+}
+
+fn imapPayloadTag(payload: []const u8) ?[]const u8 {
+    const line_end = std.mem.indexOf(u8, payload, "\r\n") orelse payload.len;
+    const first_line = payload[0..line_end];
+    var toks = std.mem.tokenizeAny(u8, first_line, " \t");
+    return toks.next();
+}
+
+fn imapReplyComplete(reply: []const u8, tag: ?[]const u8) bool {
+    if (!std.mem.endsWith(u8, reply, "\r\n")) return false;
+    if (tag) |t| {
+        var it = std.mem.splitSequence(u8, reply, "\r\n");
+        while (it.next()) |line| {
+            if (line.len == 0) continue;
+            if (std.mem.startsWith(u8, line, t) and line.len > t.len and line[t.len] == ' ') return true;
+        }
+        return false;
+    }
+    return true;
+}
+
+fn imapReplyContainsOk(reply: []const u8) bool {
+    return std.mem.indexOf(u8, reply, " OK") != null or std.mem.startsWith(u8, std.mem.trim(u8, reply, " \t\r\n"), "* OK");
+}
+
+fn imapTaggedReplyContainsOk(reply: []const u8, tag: []const u8) bool {
+    var it = std.mem.splitSequence(u8, reply, "\r\n");
+    while (it.next()) |line| {
+        if (std.mem.startsWith(u8, line, tag) and line.len > tag.len and line[tag.len] == ' ') {
+            return std.mem.indexOf(u8, line, " OK") != null;
+        }
+    }
+    return false;
+}
+
+fn smtpReplyComplete(reply: []const u8) bool {
+    var idx: usize = 0;
+    var multiline_code: ?[]const u8 = null;
+    var saw_terminal = false;
+    while (idx < reply.len) {
+        const line_end = std.mem.indexOfPos(u8, reply, idx, "\r\n") orelse return false;
+        const line = reply[idx..line_end];
+        if (line.len >= 4 and std.ascii.isDigit(line[0]) and std.ascii.isDigit(line[1]) and std.ascii.isDigit(line[2])) {
+            if (line[3] == '-') {
+                multiline_code = line[0..3];
+            } else if (line[3] == ' ') {
+                if (multiline_code) |code| {
+                    if (std.mem.eql(u8, code, line[0..3])) {
+                        saw_terminal = true;
+                        multiline_code = null;
+                    }
+                } else {
+                    saw_terminal = true;
+                }
+            }
+        }
+        idx = line_end + 2;
+    }
+    return saw_terminal and idx == reply.len;
+}
+
+fn smtpReplyContainsCode(reply: []const u8, code: []const u8) bool {
+    var it = std.mem.splitSequence(u8, reply, "\r\n");
+    while (it.next()) |line| {
+        if (line.len >= 3 and std.mem.eql(u8, line[0..3], code)) return true;
+    }
+    return false;
+}
+
+fn smtpReplyAdvertisesStartTls(reply: []const u8) bool {
+    var it = std.mem.splitSequence(u8, reply, "\r\n");
+    while (it.next()) |line| {
+        if (line.len < 4 or !std.mem.eql(u8, line[0..3], "250")) continue;
+        const feature = std.mem.trim(u8, line[4..], " \t\r\n");
+        if (std.ascii.eqlIgnoreCase(feature, "STARTTLS")) return true;
+    }
+    return false;
+}
+
 fn executeUdpDatagramRequest(allocator: std.mem.Allocator, endpoint: []const u8, payload: []const u8) ![]u8 {
     const ep = try http.memcached.parseEndpoint(endpoint);
     const addr = try std.net.Address.resolveIp(ep.host, ep.port);
@@ -5606,38 +5310,341 @@ fn applyResponseHeaders(state: *GatewayState, response: *http.Response) void {
     for (state.add_headers) |pair| {
         _ = response.setHeader(pair.name, pair.value);
     }
+    if (state.http3_alt_svc) |value| {
+        _ = response.setHeader("Alt-Svc", value);
+    }
+}
+
+const Http3HealthSnapshot = struct {
+    handshake_state: []const u8,
+    snapshot: http.http3_runtime.Snapshot,
+};
+
+const Http3DispatchContext = struct {
+    cfg: *const edge_config.EdgeConfig,
+    state: *GatewayState,
+};
+
+const Http3LocationOutcome = union(enum) {
+    not_handled,
+    handled,
+    rewritten: struct {
+        path: []const u8,
+        query: ?[]const u8,
+    },
+};
+
+fn http3HandshakeState(state: *const GatewayState, cfg: *const edge_config.EdgeConfig, snapshot: http.http3_runtime.Snapshot) []const u8 {
+    if (!cfg.http3_enabled) return "disabled";
+    if (!edge_config.hasTlsFiles(cfg)) return "config_incomplete";
+    if (state.http3_runtime == null) return "unavailable";
+    return snapshot.handshakeState();
+}
+
+fn http3HealthSnapshot(state: *const GatewayState, cfg: *const edge_config.EdgeConfig) Http3HealthSnapshot {
+    const snapshot = if (state.http3_runtime) |runtime| runtime.snapshot() else http.http3_runtime.Snapshot{ .quic_port = if (cfg.http3_enabled) cfg.quic_port else 0 };
+    return .{
+        .handshake_state = http3HandshakeState(state, cfg, snapshot),
+        .snapshot = snapshot,
+    };
+}
+
+fn populateHealthResponse(
+    allocator: std.mem.Allocator,
+    response: *http.Response,
+    keep_alive: ?bool,
+    correlation_id: []const u8,
+    state: *GatewayState,
+    cfg: *const edge_config.EdgeConfig,
+    http3_mode: bool,
+) !void {
+    const unhealthy_backends = state.upstreamUnhealthyCount();
+    const http3_status = http.http3_handler.configurationStatus(cfg.http3_enabled, edge_config.hasTlsFiles(cfg));
+    const http3_health = http3HealthSnapshot(state, cfg);
+    const http3_last_error_name = http.ngtcp2_binding.errorName(http3_health.snapshot.last_error_code) orelse "-";
+    const body = try std.fmt.allocPrint(
+        allocator,
+        "{{\"status\":\"ok\",\"service\":\"tardigrade-edge\",\"upstream_status\":\"{s}\",\"upstream_unhealthy_backends\":{d},\"http3_status\":\"{s}\",\"http3_quic_port\":{d},\"http3_handshake_state\":\"{s}\",\"http3_datagrams_seen\":{d},\"http3_zero_rtt_packets_seen\":{d},\"http3_tracked_connections\":{d},\"http3_native_connections\":{d},\"http3_native_reads_attempted\":{d},\"http3_native_read_calls\":{d},\"http3_handshakes_completed\":{d},\"http3_stream_bytes_received\":{d},\"http3_stream_chunks_received\":{d},\"http3_requests_completed\":{d},\"http3_packets_emitted\":{d},\"http3_bytes_emitted\":{d},\"http3_migration_events\":{d},\"http3_last_error_code\":{d},\"http3_last_error_name\":\"{s}\"}}",
+        .{
+            if (unhealthy_backends > 0) "degraded" else "healthy",
+            unhealthy_backends,
+            http3_status,
+            if (cfg.http3_enabled) cfg.quic_port else 0,
+            http3_health.handshake_state,
+            http3_health.snapshot.datagrams_seen,
+            http3_health.snapshot.zero_rtt_packets_seen,
+            http3_health.snapshot.tracked_connections,
+            http3_health.snapshot.native_connections,
+            http3_health.snapshot.native_reads_attempted,
+            http3_health.snapshot.native_read_calls,
+            http3_health.snapshot.handshakes_completed,
+            http3_health.snapshot.stream_bytes_received,
+            http3_health.snapshot.stream_chunks_received,
+            http3_health.snapshot.requests_completed,
+            http3_health.snapshot.packets_emitted,
+            http3_health.snapshot.bytes_emitted,
+            http3_health.snapshot.migration_events,
+            http3_health.snapshot.last_error_code,
+            http3_last_error_name,
+        },
+    );
+    _ = response
+        .setStatus(.ok)
+        .setBodyOwned(body)
+        .setContentType("application/json")
+        .setHeader(http.correlation.HEADER_NAME, correlation_id);
+    if (keep_alive) |value| _ = response.setConnection(value);
+    if (http3_mode) {
+        _ = response
+            .setHeader("server", http.SERVER_NAME ++ "/" ++ http.SERVER_VERSION)
+            .setContentLength(body.len);
+    }
+    applyResponseHeaders(state, response);
+}
+
+fn finalizeHttp3Response(response: *http.Response) void {
+    _ = response
+        .setHeader("server", http.SERVER_NAME ++ "/" ++ http.SERVER_VERSION)
+        .setContentLength(if (response.body) |body| body.len else 0);
+}
+
+fn handleHttp3LocationProxyPass(
+    allocator: std.mem.Allocator,
+    request: *const http.http3_session.StreamRequest,
+    response: *http.Response,
+    ctx: *Http3DispatchContext,
+    request_path: []const u8,
+    target: []const u8,
+    correlation_id: []const u8,
+) !void {
+    const resolved = try resolveProxyTarget(allocator, ctx.cfg.upstream_base_url, target, request_path);
+    defer allocator.free(resolved.url);
+
+    var upstream_response = try executeRawHttpProxyRequest(
+        allocator,
+        resolved.url,
+        request.method,
+        request.headers.get("content-type"),
+        request.body,
+        correlation_id,
+    );
+    defer upstream_response.deinit(allocator);
+
+    _ = response
+        .setStatus(@enumFromInt(upstream_response.status_code))
+        .setBodyOwned(try allocator.dupe(u8, upstream_response.body))
+        .setContentType(upstream_response.content_type)
+        .setHeader(http.correlation.HEADER_NAME, correlation_id);
+    finalizeHttp3Response(response);
+    applyResponseHeaders(ctx.state, response);
+    ctx.state.metricsRecord(upstream_response.status_code);
+}
+
+fn handleHttp3StaticLocation(
+    allocator: std.mem.Allocator,
+    request: *const http.http3_session.StreamRequest,
+    response: *http.Response,
+    matched: http.location_router.MatchResult,
+    root_cfg: anytype,
+    correlation_id: []const u8,
+    ctx: *Http3DispatchContext,
+    request_path: []const u8,
+) !bool {
+    if (!(std.mem.eql(u8, request.method, "GET") or std.mem.eql(u8, request.method, "HEAD"))) return false;
+
+    var served = (try http.static_file.serve(allocator, .{
+        .root = root_cfg.root,
+        .request_path = request_path,
+        .matched_pattern = matched.block.pattern,
+        .alias = root_cfg.alias,
+        .index = root_cfg.index,
+        .try_files = root_cfg.try_files,
+        .autoindex = root_cfg.autoindex,
+        .headers = &request.headers,
+        .max_bytes = MAX_REQUEST_SIZE,
+    })) orelse blk: {
+        var error_page = (try maybeResolveStaticErrorPage(allocator, matched, root_cfg, request_path, &request.headers, 404)) orelse return false;
+        switch (error_page) {
+            .redirect => |target| {
+                defer allocator.free(target);
+                _ = response
+                    .setStatus(.found)
+                    .setBody("")
+                    .setContentType("text/plain; charset=utf-8")
+                    .setHeader("Location", target)
+                    .setHeader(http.correlation.HEADER_NAME, correlation_id);
+                finalizeHttp3Response(response);
+                applyResponseHeaders(ctx.state, response);
+                ctx.state.metricsRecord(302);
+                return true;
+            },
+            .served => |*resolved| break :blk resolved.*,
+        }
+    };
+    defer served.deinit(allocator);
+
+    if (@intFromEnum(served.status_code) >= 400) {
+        if (try maybeResolveStaticErrorPage(allocator, matched, root_cfg, request_path, &request.headers, @intFromEnum(served.status_code))) |error_page| {
+            switch (error_page) {
+                .redirect => |target| {
+                    defer allocator.free(target);
+                    _ = response
+                        .setStatus(.found)
+                        .setBody("")
+                        .setContentType("text/plain; charset=utf-8")
+                        .setHeader("Location", target)
+                        .setHeader(http.correlation.HEADER_NAME, correlation_id);
+                    finalizeHttp3Response(response);
+                    applyResponseHeaders(ctx.state, response);
+                    ctx.state.metricsRecord(302);
+                    return true;
+                },
+                .served => |replacement| {
+                    served.deinit(allocator);
+                    served = replacement;
+                },
+            }
+        }
+    }
+
+    _ = response
+        .setStatus(served.status_code)
+        .setBodyOwned(if (std.mem.eql(u8, request.method, "HEAD")) try allocator.dupe(u8, "") else try allocator.dupe(u8, served.body))
+        .setContentType(served.content_type)
+        .setHeader(http.correlation.HEADER_NAME, correlation_id);
+    if (served.etag_value) |etag_value| _ = response.setHeader("ETag", etag_value);
+    if (served.last_modified_value) |last_modified| _ = response.setHeader("Last-Modified", last_modified);
+    if (served.content_range_value) |content_range| _ = response.setHeader("Content-Range", content_range);
+    if (served.accept_ranges) _ = response.setHeader("Accept-Ranges", "bytes");
+    _ = response
+        .setHeader("server", http.SERVER_NAME ++ "/" ++ http.SERVER_VERSION)
+        .setContentLength(served.content_length);
+    applyResponseHeaders(ctx.state, response);
+    ctx.state.metricsRecord(@intFromEnum(served.status_code));
+    return true;
+}
+
+fn routeHttp3Location(
+    allocator: std.mem.Allocator,
+    request: *const http.http3_session.StreamRequest,
+    response: *http.Response,
+    ctx: *Http3DispatchContext,
+    request_path: []const u8,
+    correlation_id: []const u8,
+) !Http3LocationOutcome {
+    const matched = http.location_router.matchLocation(request_path, ctx.cfg.location_blocks) orelse return .not_handled;
+    switch (matched.block.action) {
+        .proxy_pass => |target| {
+            try handleHttp3LocationProxyPass(allocator, request, response, ctx, request_path, target, correlation_id);
+            return .handled;
+        },
+        .return_response => |ret| {
+            _ = response
+                .setStatus(@enumFromInt(ret.status))
+                .setBody(ret.body)
+                .setContentType(if (ret.status >= 300 and ret.status < 400) "text/plain; charset=utf-8" else "text/plain; charset=utf-8")
+                .setHeader(http.correlation.HEADER_NAME, correlation_id);
+            if (ret.status >= 300 and ret.status < 400 and ret.body.len > 0) {
+                _ = response.setHeader("location", ret.body);
+            }
+            finalizeHttp3Response(response);
+            applyResponseHeaders(ctx.state, response);
+            ctx.state.metricsRecord(ret.status);
+            return .handled;
+        },
+        .rewrite => |rw| {
+            const rewritten_path, const rewritten_query = splitHttp3PathAndQuery(rw.replacement);
+            return .{ .rewritten = .{ .path = rewritten_path, .query = rewritten_query } };
+        },
+        .static_root => |root_cfg| {
+            if (try handleHttp3StaticLocation(allocator, request, response, matched, root_cfg, correlation_id, ctx, request_path)) {
+                return .handled;
+            }
+            return .not_handled;
+        },
+        .fastcgi_pass => return .not_handled,
+    }
+}
+
+fn handleHttp3Connection(
+    allocator: std.mem.Allocator,
+    request: *const http.http3_session.StreamRequest,
+    response: *http.Response,
+    ctx: *Http3DispatchContext,
+) !void {
+    const correlation_id = request.headers.get(http.correlation.HEADER_NAME) orelse "http3";
+    var http3_path, _ = splitHttp3PathAndQuery(request.path);
+    var rewrite_budget: usize = 0;
+    while (rewrite_budget < 4) : (rewrite_budget += 1) {
+        switch (try routeHttp3Location(allocator, request, response, ctx, http3_path, correlation_id)) {
+            .handled => return,
+            .not_handled => break,
+            .rewritten => |rewrite_result| {
+                http3_path = rewrite_result.path;
+            },
+        }
+    }
+
+    const payload = try buildApiErrorJson(allocator, "invalid_request", "Not Found", correlation_id);
+    _ = response
+        .setStatus(.not_found)
+        .setBodyOwned(payload)
+        .setContentType("application/json")
+        .setHeader(http.correlation.HEADER_NAME, correlation_id);
+    finalizeHttp3Response(response);
+    applyResponseHeaders(ctx.state, response);
+    ctx.state.metricsRecord(404);
+}
+
+fn splitHttp3PathAndQuery(path: []const u8) struct { []const u8, ?[]const u8 } {
+    if (std.mem.indexOfScalar(u8, path, '?')) |idx| {
+        return .{ path[0..idx], path[idx + 1 ..] };
+    }
+    return .{ path, null };
+}
+
+fn handleHttp3Request(
+    allocator: std.mem.Allocator,
+    request: *const http.http3_session.StreamRequest,
+    response: *http.Response,
+    user_data: ?*anyopaque,
+) !void {
+    const ctx: *Http3DispatchContext = @ptrCast(@alignCast(user_data orelse return error.InvalidArgument));
+    const authority = request.headers.get(":authority") orelse request.headers.get("host");
+    var effective_cfg_storage = ctx.cfg.*;
+    const effective_cfg = resolveRequestConfig(ctx.cfg, authority, &effective_cfg_storage) orelse {
+        const correlation_id = request.headers.get(http.correlation.HEADER_NAME) orelse "http3";
+        const payload = try buildApiErrorJson(allocator, "invalid_request", "Not Found", correlation_id);
+        _ = response
+            .setStatus(.not_found)
+            .setBodyOwned(payload)
+            .setContentType("application/json")
+            .setHeader(http.correlation.HEADER_NAME, correlation_id);
+        finalizeHttp3Response(response);
+        applyResponseHeaders(ctx.state, response);
+        ctx.state.metricsRecord(404);
+        return;
+    };
+    if (!hostMatchesPatterns(effective_cfg.server_names, authority)) {
+        const correlation_id = request.headers.get(http.correlation.HEADER_NAME) orelse "http3";
+        const payload = try buildApiErrorJson(allocator, "invalid_request", "Not Found", correlation_id);
+        _ = response
+            .setStatus(.not_found)
+            .setBodyOwned(payload)
+            .setContentType("application/json")
+            .setHeader(http.correlation.HEADER_NAME, correlation_id);
+        finalizeHttp3Response(response);
+        applyResponseHeaders(ctx.state, response);
+        ctx.state.metricsRecord(404);
+        return;
+    }
+
+    var effective_ctx = ctx.*;
+    effective_ctx.cfg = effective_cfg;
+    try handleHttp3Connection(allocator, request, response, &effective_ctx);
 }
 
 fn authorizeRequest(cfg: *const edge_config.EdgeConfig, headers: *const http.Headers) AuthResult {
-    if (cfg.jwt_secret.len > 0) {
-        if (http.auth.authorize(headers, null)) |token| {
-            const claims = http.jwt.validateHs256(std.heap.page_allocator, token, .{
-                .secret = cfg.jwt_secret,
-                .required_issuer = if (cfg.jwt_issuer.len > 0) cfg.jwt_issuer else null,
-                .required_audience = if (cfg.jwt_audience.len > 0) cfg.jwt_audience else null,
-            }) catch null;
-            if (claims != null) {
-                return .{ .ok = true, .token_hash = "jwt" };
-            }
-        } else |_| {}
-    }
-
-    // Try bearer token auth first
-    if (cfg.auth_token_hashes.len > 0) {
-        if (http.auth.authorize(headers, null)) |token| {
-            var digest: [32]u8 = undefined;
-            std.crypto.hash.sha2.Sha256.hash(token, &digest, .{});
-
-            var digest_hex: [64]u8 = undefined;
-            _ = std.fmt.bufPrint(&digest_hex, "{s}", .{std.fmt.fmtSliceHexLower(&digest)}) catch return .{ .ok = false, .token_hash = null };
-
-            for (cfg.auth_token_hashes) |allowed| {
-                if (allowed.len == 64 and std.crypto.utils.timingSafeEql([64]u8, allowed[0..64].*, digest_hex)) return .{ .ok = true, .token_hash = allowed };
-            }
-        } else |_| {}
-    }
-
-    // Fall back to HTTP Basic Auth
     if (cfg.basic_auth_hashes.len > 0) {
         var cred_buf: [512]u8 = undefined;
         if (http.basic_auth.fromHeaders(headers, &cred_buf)) |creds| {
@@ -5722,11 +5729,43 @@ fn isProtectedAuthRequestRoute(path: []const u8) bool {
         std.mem.startsWith(u8, path, "/admin/");
 }
 
+fn resolveRequestConfig(base_cfg: *const edge_config.EdgeConfig, raw_host: ?[]const u8, out: *edge_config.EdgeConfig) ?*const edge_config.EdgeConfig {
+    out.* = base_cfg.*;
+    if (base_cfg.server_blocks.len > 0) {
+        const block = selectServerBlock(base_cfg, raw_host) orelse return null;
+        if (block.server_names.len > 0 and !hostMatchesPatterns(block.server_names, raw_host)) return null;
+        out.server_names = block.server_names;
+        if (block.doc_root.len > 0) out.doc_root = block.doc_root;
+        if (block.try_files.len > 0) out.try_files = block.try_files;
+        if (block.location_blocks.len > 0) out.location_blocks = block.location_blocks;
+        if (block.tls_cert_path.len > 0) out.tls_cert_path = block.tls_cert_path;
+        if (block.tls_key_path.len > 0) out.tls_key_path = block.tls_key_path;
+        if (block.upstream_base_url.len > 0) out.upstream_base_url = block.upstream_base_url;
+        if (block.proxy_pass_chat.len > 0) out.proxy_pass_chat = block.proxy_pass_chat;
+        if (block.proxy_pass_commands_prefix.len > 0) out.proxy_pass_commands_prefix = block.proxy_pass_commands_prefix;
+        return out;
+    }
+    if (!hostMatchesPatterns(base_cfg.server_names, raw_host)) return null;
+    return out;
+}
+
+fn selectServerBlock(cfg: *const edge_config.EdgeConfig, raw_host: ?[]const u8) ?*const edge_config.EdgeConfig.ServerBlock {
+    var default_block: ?*const edge_config.EdgeConfig.ServerBlock = null;
+    for (cfg.server_blocks) |*block| {
+        if (block.server_names.len == 0 and default_block == null) default_block = block;
+        if (hostMatchesPatterns(block.server_names, raw_host)) return block;
+    }
+    return default_block orelse if (cfg.server_blocks.len > 0) &cfg.server_blocks[0] else null;
+}
+
 fn hostMatchesServerNames(cfg: *const edge_config.EdgeConfig, request: *const http.Request) bool {
-    if (cfg.server_names.len == 0) return true;
-    const raw_host = request.headers.get("host") orelse return false;
-    const host = stripHostPort(raw_host);
-    for (cfg.server_names) |pattern| {
+    return hostMatchesPatterns(cfg.server_names, request.headers.get("host"));
+}
+
+fn hostMatchesPatterns(patterns: []const []const u8, raw_host: ?[]const u8) bool {
+    if (patterns.len == 0) return true;
+    const host = stripHostPort(raw_host orelse return false);
+    for (patterns) |pattern| {
         if (matchHostPattern(pattern, host)) return true;
     }
     return false;
@@ -5743,6 +5782,20 @@ fn stripHostPort(raw_host: []const u8) []const u8 {
     const head = trimmed[0..colon];
     if (std.mem.indexOfScalar(u8, head, ':') != null) return trimmed;
     return head;
+}
+
+fn hostPort(raw_host: []const u8) ?u16 {
+    const trimmed = std.mem.trim(u8, raw_host, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    if (trimmed[0] == '[') {
+        const end = std.mem.indexOfScalar(u8, trimmed, ']') orelse return null;
+        if (end + 1 >= trimmed.len or trimmed[end + 1] != ':') return null;
+        return std.fmt.parseInt(u16, trimmed[end + 2 ..], 10) catch null;
+    }
+    const colon = std.mem.lastIndexOfScalar(u8, trimmed, ':') orelse return null;
+    const head = trimmed[0..colon];
+    if (std.mem.indexOfScalar(u8, head, ':') != null) return null;
+    return std.fmt.parseInt(u16, trimmed[colon + 1 ..], 10) catch null;
 }
 
 fn matchHostPattern(pattern_raw: []const u8, host: []const u8) bool {
@@ -5910,7 +5963,8 @@ fn extractIdentityForPolicy(
 ) !?[]const u8 {
     const auth_res = authorizeRequest(cfg, &request.headers);
     if (auth_res.ok and auth_res.token_hash != null) {
-        return allocator.dupe(u8, auth_res.token_hash.?);
+        const identity = try allocator.dupe(u8, auth_res.token_hash.?);
+        return identity;
     }
     if (http.session.fromHeaders(&request.headers)) |session_token| {
         if (state.validateSessionIdentity(allocator, session_token)) |identity| return identity;
@@ -6285,6 +6339,7 @@ const ProxyResult = struct {
     body: []u8,
     content_type: []u8,
     content_disposition: ?[]u8,
+    cacheable: bool,
 };
 
 const ProxyExecution = union(enum) {
@@ -6308,12 +6363,12 @@ const ProxyCacheRefreshTask = struct {
 
 fn proxyCacheRefreshThread(task: *ProxyCacheRefreshTask) void {
     defer {
+        task.state.proxyCacheUnlock(task.cache_key);
         task.allocator.free(task.cache_key);
         if (task.suffix_path) |suffix| task.allocator.free(suffix);
         task.allocator.free(task.payload);
         task.allocator.free(task.client_ip);
         if (task.identity) |id| task.allocator.free(id);
-        task.state.proxyCacheUnlock(task.cache_key);
         task.allocator.destroy(task);
     }
 
@@ -6349,7 +6404,7 @@ fn proxyCacheRefreshThread(task: *ProxyCacheRefreshTask) void {
 }
 
 fn spawnProxyCacheRefresh(
-    allocator: std.mem.Allocator,
+    _: std.mem.Allocator,
     cfg: *const edge_config.EdgeConfig,
     state: *GatewayState,
     cache_key: []const u8,
@@ -6361,48 +6416,49 @@ fn spawnProxyCacheRefresh(
     identity: ?[]const u8,
     api_version: ?u32,
 ) void {
+    const task_allocator = state.allocator;
     if (!(state.proxyCacheTryLock(cache_key) catch false)) return;
 
-    const task = allocator.create(ProxyCacheRefreshTask) catch {
+    const task = task_allocator.create(ProxyCacheRefreshTask) catch {
         state.proxyCacheUnlock(cache_key);
         return;
     };
-    errdefer allocator.destroy(task);
+    errdefer task_allocator.destroy(task);
 
-    const owned_key = allocator.dupe(u8, cache_key) catch {
+    const owned_key = task_allocator.dupe(u8, cache_key) catch {
         state.proxyCacheUnlock(cache_key);
         return;
     };
-    errdefer allocator.free(owned_key);
-    const owned_payload = allocator.dupe(u8, payload) catch {
+    errdefer task_allocator.free(owned_key);
+    const owned_payload = task_allocator.dupe(u8, payload) catch {
         state.proxyCacheUnlock(cache_key);
         return;
     };
-    errdefer allocator.free(owned_payload);
-    const owned_ip = allocator.dupe(u8, client_ip) catch {
+    errdefer task_allocator.free(owned_payload);
+    const owned_ip = task_allocator.dupe(u8, client_ip) catch {
         state.proxyCacheUnlock(cache_key);
         return;
     };
-    errdefer allocator.free(owned_ip);
+    errdefer task_allocator.free(owned_ip);
     const owned_suffix = if (suffix_path) |suffix|
-        allocator.dupe(u8, suffix) catch {
+        task_allocator.dupe(u8, suffix) catch {
             state.proxyCacheUnlock(cache_key);
             return;
         }
     else
         null;
-    errdefer if (owned_suffix) |s| allocator.free(s);
+    errdefer if (owned_suffix) |s| task_allocator.free(s);
     const owned_identity = if (identity) |id|
-        allocator.dupe(u8, id) catch {
+        task_allocator.dupe(u8, id) catch {
             state.proxyCacheUnlock(cache_key);
             return;
         }
     else
         null;
-    errdefer if (owned_identity) |id| allocator.free(id);
+    errdefer if (owned_identity) |id| task_allocator.free(id);
 
     task.* = .{
-        .allocator = allocator,
+        .allocator = task_allocator,
         .cfg = cfg,
         .state = state,
         .cache_key = owned_key,
@@ -6417,12 +6473,12 @@ fn spawnProxyCacheRefresh(
 
     const thread = std.Thread.spawn(.{}, proxyCacheRefreshThread, .{task}) catch {
         state.proxyCacheUnlock(cache_key);
-        allocator.free(owned_key);
-        allocator.free(owned_payload);
-        allocator.free(owned_ip);
-        if (owned_suffix) |s| allocator.free(s);
-        if (owned_identity) |id| allocator.free(id);
-        allocator.destroy(task);
+        task_allocator.free(owned_key);
+        task_allocator.free(owned_payload);
+        task_allocator.free(owned_ip);
+        if (owned_suffix) |s| task_allocator.free(s);
+        if (owned_identity) |id| task_allocator.free(id);
+        task_allocator.destroy(task);
         return;
     };
     thread.detach();
@@ -6447,11 +6503,7 @@ fn proxyJsonExecute(
 ) !ProxyExecution {
     const upstream_pool = upstreamPoolForScope(cfg, upstream_scope);
     const configured_attempts: usize = @intCast(@max(cfg.upstream_retry_attempts, @as(u32, 1)));
-    const configured_upstream_count = if (upstream_pool.primary_urls.len > 0 or upstream_pool.backup_urls.len > 0)
-        upstream_pool.primary_urls.len + upstream_pool.backup_urls.len
-    else
-        @as(usize, 1);
-    const max_attempts = @min(configured_attempts, configured_upstream_count);
+    const max_attempts = configured_attempts;
     const start_ms = http.event_loop.monotonicMs();
     const upstream_hash_key = if (payload.len > 0) payload else (suffix_path orelse proxy_pass_target);
 
@@ -6548,7 +6600,10 @@ fn proxyJsonExecuteSingleAttempt(
     enable_streaming_success: bool,
 ) !ProxyExecution {
     const resolved_target = try resolveProxyTarget(allocator, upstream_base_url, proxy_pass_target, suffix_path);
-    defer allocator.free(resolved_target.url);
+    var current_url = resolved_target.url;
+    defer allocator.free(current_url);
+    var current_unix_socket_path = resolved_target.unix_socket_path;
+    var redirects_followed: u8 = 0;
 
     const forwarded_for = try buildForwardedFor(allocator, incoming_x_forwarded_for, client_ip);
     defer allocator.free(forwarded_for);
@@ -6596,62 +6651,114 @@ fn proxyJsonExecuteSingleAttempt(
         payload,
     );
 
-    var server_header_buffer: [16 * 1024]u8 = undefined;
-    const uri = try std.Uri.parse(resolved_target.url);
-    const unix_conn: ?*std.http.Client.Connection = if (resolved_target.unix_socket_path) |socket_path|
-        try state.upstream_client.connectUnix(socket_path)
-    else
-        null;
-    var req = try state.upstream_client.open(.POST, uri, .{
-        .server_header_buffer = &server_header_buffer,
-        .connection = unix_conn,
-        .headers = .{ .content_type = .{ .override = "application/json" } },
-        .extra_headers = extra_headers.items,
-        .keep_alive = true,
-    });
-    defer req.deinit();
+    while (true) {
+        var server_header_buffer: [16 * 1024]u8 = undefined;
+        const uri = try std.Uri.parse(current_url);
+        const unix_conn: ?*std.http.Client.Connection = if (current_unix_socket_path) |socket_path|
+            try state.upstream_client.connectUnix(socket_path)
+        else
+            null;
+        var req = try state.upstream_client.open(.POST, uri, .{
+            .server_header_buffer = &server_header_buffer,
+            .connection = unix_conn,
+            .headers = .{ .content_type = .{ .override = "application/json" } },
+            .extra_headers = extra_headers.items,
+            .keep_alive = true,
+            .redirect_behavior = .unhandled,
+        });
+        defer req.deinit();
 
-    if (attempt_timeout_ms > 0) {
-        if (req.connection) |conn| {
-            setSocketTimeoutMs(conn.stream.handle, attempt_timeout_ms, attempt_timeout_ms) catch |err| {
-                state.logger.warn(null, "failed to set upstream socket timeout: {}", .{err});
+        if (attempt_timeout_ms > 0) {
+            if (req.connection) |conn| {
+                setSocketTimeoutMs(conn.stream.handle, attempt_timeout_ms, attempt_timeout_ms) catch |err| {
+                    state.logger.warn(null, "failed to set upstream socket timeout: {}", .{err});
+                };
+            }
+        }
+
+        req.transfer_encoding = .{ .content_length = payload.len };
+        try req.send();
+        try req.writeAll(payload);
+        try req.finish();
+        try req.wait();
+
+        const status_code: u16 = @intFromEnum(req.response.status);
+        if (redirects_followed == 0 and isRedirectStatusCode(status_code)) {
+            if (req.response.location) |location| {
+                const drain_buf = try state.relay_buffer_pool.acquire();
+                defer state.relay_buffer_pool.release(drain_buf);
+                while (true) {
+                    const n = try req.reader().read(drain_buf);
+                    if (n == 0) break;
+                }
+                const next_url = try resolveRedirectTargetUrl(allocator, current_url, location);
+                allocator.free(current_url);
+                current_url = next_url;
+                current_unix_socket_path = null;
+                redirects_followed += 1;
+                continue;
+            }
+        }
+
+        const upstream_content_type = req.response.content_type orelse JSON_CONTENT_TYPE;
+        const upstream_content_disposition = req.response.content_disposition;
+        const cacheable = !upstreamResponseHasNoStore(req.response);
+        const stream_status = enable_streaming_success and (status_code == 200 or cfg.proxy_stream_all_statuses);
+        if (stream_status) {
+            try writeStreamedUpstreamResponse(
+                downstream_writer,
+                status_code,
+                req.response.reason,
+                upstream_content_type,
+                upstream_content_disposition,
+                correlation_id,
+                &state.security_headers,
+            );
+
+            const read_buf = try state.relay_buffer_pool.acquire();
+            defer state.relay_buffer_pool.release(read_buf);
+            while (true) {
+                const n = try req.reader().read(read_buf);
+                if (n == 0) break;
+                try writeChunk(downstream_writer, read_buf[0..n]);
+            }
+            try downstream_writer.writeAll("0\r\n\r\n");
+            return .{ .streamed_status = status_code };
+        }
+
+        if (status_code != 200) {
+            const buffered_content_type = try allocator.dupe(u8, upstream_content_type);
+            errdefer allocator.free(buffered_content_type);
+            const buffered_content_disposition = if (upstream_content_disposition) |cd|
+                try allocator.dupe(u8, cd)
+            else
+                null;
+            errdefer if (buffered_content_disposition) |cd| allocator.free(cd);
+
+            const drain_buf = try state.relay_buffer_pool.acquire();
+            defer state.relay_buffer_pool.release(drain_buf);
+            while (true) {
+                const n = try req.reader().read(drain_buf);
+                if (n == 0) break;
+            }
+            return .{
+                .buffered = .{
+                    .status = status_code,
+                    .body = try allocator.alloc(u8, 0),
+                    .content_type = buffered_content_type,
+                    .content_disposition = buffered_content_disposition,
+                    .cacheable = false,
+                },
             };
         }
-    }
 
-    req.transfer_encoding = .{ .content_length = payload.len };
-    try req.send();
-    try req.writeAll(payload);
-    try req.finish();
-    try req.wait();
-
-    const status_code: u16 = @intFromEnum(req.response.status);
-    const upstream_content_type = req.response.content_type orelse JSON_CONTENT_TYPE;
-    const upstream_content_disposition = req.response.content_disposition;
-    const stream_status = enable_streaming_success and (status_code == 200 or cfg.proxy_stream_all_statuses);
-    if (stream_status) {
-        try writeStreamedUpstreamResponse(
-            downstream_writer,
-            status_code,
-            req.response.reason,
-            upstream_content_type,
-            upstream_content_disposition,
-            correlation_id,
-            &state.security_headers,
-        );
-
-        const read_buf = try state.relay_buffer_pool.acquire();
-        defer state.relay_buffer_pool.release(read_buf);
-        while (true) {
-            const n = try req.reader().read(read_buf);
-            if (n == 0) break;
-            try writeChunk(downstream_writer, read_buf[0..n]);
-        }
-        try downstream_writer.writeAll("0\r\n\r\n");
-        return .{ .streamed_status = status_code };
-    }
-
-    if (status_code != 200) {
+        const max_buffered = if (cfg.max_connection_memory_bytes > 0)
+            cfg.max_connection_memory_bytes
+        else
+            2 * 1024 * 1024;
+        var body = std.ArrayList(u8).init(allocator);
+        errdefer body.deinit();
+        try req.reader().readAllArrayList(&body, max_buffered);
         const buffered_content_type = try allocator.dupe(u8, upstream_content_type);
         errdefer allocator.free(buffered_content_type);
         const buffered_content_disposition = if (upstream_content_disposition) |cd|
@@ -6659,45 +6766,16 @@ fn proxyJsonExecuteSingleAttempt(
         else
             null;
         errdefer if (buffered_content_disposition) |cd| allocator.free(cd);
-
-        const drain_buf = try state.relay_buffer_pool.acquire();
-        defer state.relay_buffer_pool.release(drain_buf);
-        while (true) {
-            const n = try req.reader().read(drain_buf);
-            if (n == 0) break;
-        }
         return .{
             .buffered = .{
                 .status = status_code,
-                .body = try allocator.alloc(u8, 0),
+                .body = try body.toOwnedSlice(),
                 .content_type = buffered_content_type,
                 .content_disposition = buffered_content_disposition,
+                .cacheable = cacheable,
             },
         };
     }
-
-    const max_buffered = if (cfg.max_connection_memory_bytes > 0)
-        cfg.max_connection_memory_bytes
-    else
-        2 * 1024 * 1024;
-    var body = std.ArrayList(u8).init(allocator);
-    errdefer body.deinit();
-    try req.reader().readAllArrayList(&body, max_buffered);
-    const buffered_content_type = try allocator.dupe(u8, upstream_content_type);
-    errdefer allocator.free(buffered_content_type);
-    const buffered_content_disposition = if (upstream_content_disposition) |cd|
-        try allocator.dupe(u8, cd)
-    else
-        null;
-    errdefer if (buffered_content_disposition) |cd| allocator.free(cd);
-    return .{
-        .buffered = .{
-            .status = status_code,
-            .body = try body.toOwnedSlice(),
-            .content_type = buffered_content_type,
-            .content_disposition = buffered_content_disposition,
-        },
-    };
 }
 
 fn writeStreamedUpstreamResponse(
@@ -6824,11 +6902,31 @@ fn buildForwardedFor(allocator: std.mem.Allocator, incoming: ?[]const u8, client
     return allocator.dupe(u8, client_ip);
 }
 
+fn upstreamResponseHasNoStore(response: std.http.Client.Response) bool {
+    var it = response.iterateHeaders();
+    while (it.next()) |header| {
+        if (!std.ascii.eqlIgnoreCase(header.name, "cache-control")) continue;
+        var tokens = std.mem.splitScalar(u8, header.value, ',');
+        while (tokens.next()) |token_raw| {
+            const token = std.mem.trim(u8, token_raw, " \t\r\n");
+            if (std.ascii.eqlIgnoreCase(token, "no-store")) return true;
+        }
+    }
+    return false;
+}
+
 const ResolvedProxyTarget = struct {
     url: []u8,
     upstream_host: []const u8,
     unix_socket_path: ?[]const u8 = null,
 };
+
+fn isRedirectStatusCode(status_code: u16) bool {
+    return switch (status_code) {
+        301, 302, 303, 307, 308 => true,
+        else => false,
+    };
+}
 
 fn resolveProxyTarget(
     allocator: std.mem.Allocator,
@@ -6884,6 +6982,19 @@ fn resolveProxyTarget(
     };
 }
 
+fn resolveRedirectTargetUrl(allocator: std.mem.Allocator, current_url: []const u8, location: []const u8) ![]u8 {
+    if (isAbsoluteHttpUrl(location)) return allocator.dupe(u8, location);
+    if (!std.mem.startsWith(u8, location, "/")) return error.HttpRedirectLocationInvalid;
+
+    const current_uri = try std.Uri.parse(current_url);
+    const scheme = current_uri.scheme;
+    const host = (current_uri.host orelse return error.HttpRedirectLocationInvalid).raw;
+    if (current_uri.port) |port| {
+        return std.fmt.allocPrint(allocator, "{s}://{s}:{d}{s}", .{ scheme, host, port, location });
+    }
+    return std.fmt.allocPrint(allocator, "{s}://{s}{s}", .{ scheme, host, location });
+}
+
 fn unixSocketPathFromEndpoint(endpoint: []const u8) ?[]const u8 {
     if (std.mem.startsWith(u8, endpoint, "unix://")) {
         const path = endpoint["unix://".len..];
@@ -6937,7 +7048,7 @@ const UpstreamMappedError = struct {
 };
 
 const ProxyExecMappedError = struct {
-    status: http.status.StatusCode,
+    status: http.Status,
     code: []const u8,
     message: []const u8,
 };
@@ -7044,10 +7155,7 @@ fn readHttpRequest(conn: anytype, buf: []u8, pending_len: *usize) !usize {
         }
         if (total_read == buf.len) break;
 
-        const n = conn.read(buf[total_read..]) catch |err| switch (err) {
-            error.WouldBlock => return 0,
-            else => return err,
-        };
+        const n = conn.read(buf[total_read..]) catch |err| return err;
         if (n == 0) break;
         total_read += n;
     }
@@ -7108,9 +7216,9 @@ test "parseUpstreamHost extracts authority" {
 
 test "buildHealthProbeUrl joins base and probe path" {
     const allocator = std.testing.allocator;
-    const url = try buildHealthProbeUrl(allocator, "http://127.0.0.1:8080/", "/health");
+    const url = try http.health_checker.buildProbeUrl(allocator, "http://127.0.0.1:8080/", "/status");
     defer allocator.free(url);
-    try std.testing.expectEqualStrings("http://127.0.0.1:8080/health", url);
+    try std.testing.expectEqualStrings("http://127.0.0.1:8080/status", url);
 }
 
 test "selectUpstreamBaseUrl round-robins across configured bases" {
@@ -7209,7 +7317,9 @@ test "firstRequestCompleteLen handles keep-alive pipelined requests" {
 }
 
 test "connection session pool reuses released sessions" {
-    var pool = ConnectionSessionPool.init(std.testing.allocator, 4);
+    var buffer_pool = http.buffer_pool.BufferPool.init(std.testing.allocator, 1024, 4);
+    defer buffer_pool.deinit();
+    var pool = ConnectionSessionPool.init(std.testing.allocator, &buffer_pool, 4);
     defer pool.deinit();
 
     const first = try pool.acquire();
@@ -7225,9 +7335,9 @@ test "connection session pool reuses released sessions" {
 
 test "combineProxyTarget joins prefix and suffix" {
     const allocator = std.testing.allocator;
-    const joined = try combineProxyTarget(allocator, "/api", "/v1/chat");
+    const joined = try combineProxyTarget(allocator, "/api", "/api/messages");
     defer allocator.free(joined);
-    try std.testing.expectEqualStrings("/api/v1/chat", joined);
+    try std.testing.expectEqualStrings("/api/api/messages", joined);
 }
 
 test "resolveProxyTarget handles absolute and relative proxy_pass" {
@@ -7258,6 +7368,7 @@ test "resolveProxyTarget handles absolute and relative proxy_pass" {
         .tls_acme_cert_dir = "",
         .http2_enabled = true,
         .http3_enabled = false,
+        .quic_port = 443,
         .http3_enable_0rtt = false,
         .http3_connection_migration = false,
         .http3_max_datagram_size = 1350,
@@ -7277,11 +7388,8 @@ test "resolveProxyTarget handles absolute and relative proxy_pass" {
         .upstream_commands_base_url_weights = &[_]u32{},
         .upstream_commands_backup_base_urls = &[_][]const u8{},
         .upstream_lb_algorithm = .round_robin,
-        .proxy_pass_chat = "/v1/chat",
-        .proxy_pass_commands_prefix = "",
-        .auth_token_hashes = &[_][]const u8{},
-        .max_message_chars = 4000,
         .upstream_timeout_ms = 10000,
+        .auth_request_url = "",
         .rate_limit_rps = 0,
         .rate_limit_burst = 0,
         .security_headers_enabled = false,
@@ -7294,24 +7402,16 @@ test "resolveProxyTarget handles absolute and relative proxy_pass" {
         .proxy_cache_manager_interval_ms = 30_000,
         .geo_blocked_countries = &[_][]const u8{},
         .geo_country_header = "CF-IPCountry",
-        .auth_request_url = "",
-        .auth_request_timeout_ms = 2000,
-        .jwt_secret = "",
-        .jwt_issuer = "",
-        .jwt_audience = "",
         .add_headers = &[_]edge_config.EdgeConfig.HeaderPair{},
-        .policy_rules_raw = "",
-        .policy_user_scopes_raw = "",
-        .policy_approval_routes_raw = "",
-        .session_ttl_seconds = 0,
-        .session_max = 0,
-        .device_registry_path = "",
-        .device_auth_required = false,
-        .access_token_ttl_seconds = 900,
-        .refresh_token_ttl_seconds = 86_400,
         .access_control_rules = "",
         .request_limits = http.request_limits.RequestLimits.default,
         .basic_auth_hashes = &[_][]const u8{},
+        .session_ttl_seconds = 0,
+        .session_max = 128,
+        .device_registry_path = "",
+        .policy_rules_raw = "",
+        .policy_user_scopes_raw = "",
+        .policy_approval_routes_raw = "",
         .log_level = .info,
         .error_log_path = "",
         .pid_file = "",
@@ -7355,26 +7455,25 @@ test "resolveProxyTarget handles absolute and relative proxy_pass" {
         .upstream_max_fails = 0,
         .upstream_fail_timeout_ms = 10_000,
         .upstream_active_health_interval_ms = 0,
-        .upstream_active_health_path = "/health",
+        .upstream_active_health_path = "/status",
         .upstream_active_health_timeout_ms = 2000,
         .upstream_active_health_fail_threshold = 1,
         .upstream_active_health_success_threshold = 1,
+        .upstream_active_health_success_status = .{ .min = 200, .max = 299 },
+        .upstream_active_health_success_status_overrides = &[_]edge_config.EdgeConfig.UpstreamHealthSuccessStatusOverride{},
         .upstream_slow_start_ms = 0,
-        .websocket_enabled = true,
-        .websocket_idle_timeout_ms = 60_000,
-        .websocket_max_frame_size = 1024 * 1024,
-        .websocket_ping_interval_ms = 15_000,
-        .sse_enabled = true,
-        .sse_max_events_per_topic = 1024,
-        .sse_poll_interval_ms = 250,
-        .sse_max_backlog = 1024,
-        .sse_idle_timeout_ms = 60_000,
         .rewrite_rules = &[_]edge_config.EdgeConfig.RewriteRule{},
         .return_rules = &[_]edge_config.EdgeConfig.ReturnRule{},
+        .conditional_rules = &[_]edge_config.EdgeConfig.ConditionalRule{},
+        .location_blocks = &[_]edge_config.EdgeConfig.LocationBlock{},
         .internal_redirect_rules = &[_]edge_config.EdgeConfig.InternalRedirectRule{},
         .named_locations = &[_]edge_config.EdgeConfig.NamedLocation{},
         .mirror_rules = &[_]edge_config.EdgeConfig.MirrorRule{},
+        .proxy_pass_chat = "",
+        .proxy_pass_commands_prefix = "",
         .fastcgi_upstream = "",
+        .fastcgi_params = &[_]edge_config.EdgeConfig.HeaderPair{},
+        .fastcgi_index = "index.php",
         .uwsgi_upstream = "",
         .scgi_upstream = "",
         .grpc_upstream = "",
@@ -7385,11 +7484,24 @@ test "resolveProxyTarget handles absolute and relative proxy_pass" {
         .tcp_proxy_upstream = "",
         .udp_proxy_upstream = "",
         .stream_ssl_termination = false,
+        .websocket_enabled = false,
+        .websocket_idle_timeout_ms = 30_000,
+        .websocket_max_frame_size = 64 * 1024,
+        .websocket_ping_interval_ms = 15_000,
+        .sse_enabled = false,
+        .sse_max_events_per_topic = 128,
+        .sse_poll_interval_ms = 250,
+        .sse_max_backlog = 128,
+        .sse_idle_timeout_ms = 30_000,
+        .approval_store_path = "",
+        .approval_escalation_webhook = "",
+        .approval_ttl_ms = 300_000,
+        .approval_max_pending_per_identity = 0,
     };
 
-    const abs = try resolveProxyTarget(allocator, cfg.upstream_base_url, "https://api.example.com/base", "/v1/chat");
+    const abs = try resolveProxyTarget(allocator, cfg.upstream_base_url, "https://api.example.com/base", "/api/messages");
     defer allocator.free(abs.url);
-    try std.testing.expectEqualStrings("https://api.example.com/base/v1/chat", abs.url);
+    try std.testing.expectEqualStrings("https://api.example.com/base/api/messages", abs.url);
     try std.testing.expectEqualStrings("api.example.com", abs.upstream_host);
 
     const rel = try resolveProxyTarget(allocator, cfg.upstream_base_url, "/gateway", "/v1/tools");
@@ -7400,187 +7512,12 @@ test "resolveProxyTarget handles absolute and relative proxy_pass" {
 
 test "resolveProxyTarget supports unix socket upstream base" {
     const allocator = std.testing.allocator;
-    const resolved = try resolveProxyTarget(allocator, "unix:/tmp/tardigrade.sock", "/gateway", "/v1/chat");
+    const resolved = try resolveProxyTarget(allocator, "unix:/tmp/tardigrade.sock", "/gateway", "/api/messages");
     defer allocator.free(resolved.url);
-    try std.testing.expectEqualStrings("http://localhost/gateway/v1/chat", resolved.url);
+    try std.testing.expectEqualStrings("http://localhost/gateway/api/messages", resolved.url);
     try std.testing.expectEqualStrings("/tmp/tardigrade.sock", resolved.upstream_host);
     try std.testing.expect(resolved.unix_socket_path != null);
     try std.testing.expectEqualStrings("/tmp/tardigrade.sock", resolved.unix_socket_path.?);
-}
-
-test "authorizeRequest accepts valid hash" {
-    const allocator = std.testing.allocator;
-    const token = "secret-token";
-
-    var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(token, &digest, .{});
-    const hash = try std.fmt.allocPrint(allocator, "{s}", .{std.fmt.fmtSliceHexLower(&digest)});
-    defer allocator.free(hash);
-
-    const hashes = try allocator.alloc([]const u8, 1);
-    defer allocator.free(hashes);
-    hashes[0] = hash;
-
-    var cfg = edge_config.EdgeConfig{
-        .listen_host = "0.0.0.0",
-        .listen_port = 8069,
-        .tls_cert_path = "",
-        .tls_key_path = "",
-        .tls_min_version = "1.2",
-        .tls_max_version = "1.3",
-        .tls_cipher_list = "",
-        .tls_cipher_suites = "",
-        .tls_sni_certs = &[_]edge_config.EdgeConfig.TlsSniCert{},
-        .tls_session_cache_enabled = true,
-        .tls_session_cache_size = 20_480,
-        .tls_session_timeout_seconds = 300,
-        .tls_session_tickets_enabled = true,
-        .tls_ocsp_stapling_enabled = false,
-        .tls_ocsp_response_path = "",
-        .tls_client_ca_path = "",
-        .tls_client_verify = false,
-        .tls_client_verify_depth = 3,
-        .tls_crl_path = "",
-        .tls_crl_check = false,
-        .tls_dynamic_reload_interval_ms = 5000,
-        .tls_acme_enabled = false,
-        .tls_acme_cert_dir = "",
-        .http2_enabled = true,
-        .http3_enabled = false,
-        .http3_enable_0rtt = false,
-        .http3_connection_migration = false,
-        .http3_max_datagram_size = 1350,
-        .proxy_protocol_mode = .off,
-        .trust_gateway_id = "tardigrade-edge",
-        .trust_shared_secret = "",
-        .trusted_upstream_identities = &[_][]const u8{},
-        .trust_require_upstream_identity = false,
-        .upstream_base_url = "http://127.0.0.1:8080",
-        .upstream_base_urls = &[_][]const u8{},
-        .upstream_base_url_weights = &[_]u32{},
-        .upstream_backup_base_urls = &[_][]const u8{},
-        .upstream_chat_base_urls = &[_][]const u8{},
-        .upstream_chat_base_url_weights = &[_]u32{},
-        .upstream_chat_backup_base_urls = &[_][]const u8{},
-        .upstream_commands_base_urls = &[_][]const u8{},
-        .upstream_commands_base_url_weights = &[_]u32{},
-        .upstream_commands_backup_base_urls = &[_][]const u8{},
-        .upstream_lb_algorithm = .round_robin,
-        .proxy_pass_chat = "/v1/chat",
-        .proxy_pass_commands_prefix = "",
-        .auth_token_hashes = hashes,
-        .max_message_chars = 4000,
-        .upstream_timeout_ms = 10000,
-        .rate_limit_rps = 0,
-        .rate_limit_burst = 0,
-        .security_headers_enabled = false,
-        .idempotency_ttl_seconds = 0,
-        .proxy_cache_ttl_seconds = 0,
-        .proxy_cache_path = "",
-        .proxy_cache_key_template = "method:path:payload_sha256",
-        .proxy_cache_stale_while_revalidate_seconds = 0,
-        .proxy_cache_lock_timeout_ms = 250,
-        .proxy_cache_manager_interval_ms = 30_000,
-        .geo_blocked_countries = &[_][]const u8{},
-        .geo_country_header = "CF-IPCountry",
-        .auth_request_url = "",
-        .auth_request_timeout_ms = 2000,
-        .jwt_secret = "",
-        .jwt_issuer = "",
-        .jwt_audience = "",
-        .add_headers = &[_]edge_config.EdgeConfig.HeaderPair{},
-        .policy_rules_raw = "",
-        .policy_user_scopes_raw = "",
-        .policy_approval_routes_raw = "",
-        .session_ttl_seconds = 0,
-        .session_max = 0,
-        .device_registry_path = "",
-        .device_auth_required = false,
-        .access_token_ttl_seconds = 900,
-        .refresh_token_ttl_seconds = 86_400,
-        .access_control_rules = "",
-        .request_limits = http.request_limits.RequestLimits.default,
-        .basic_auth_hashes = &[_][]const u8{},
-        .log_level = .info,
-        .error_log_path = "",
-        .pid_file = "",
-        .run_user = "",
-        .run_group = "",
-        .chroot_dir = "",
-        .require_unprivileged_user = false,
-        .server_names = &[_][]const u8{},
-        .doc_root = "",
-        .try_files = "",
-        .access_log_format = .json,
-        .access_log_template = "",
-        .access_log_min_status = 0,
-        .access_log_buffer_size = 0,
-        .access_log_syslog_udp = "",
-        .compression_enabled = false,
-        .compression_min_size = 256,
-        .compression_brotli_enabled = true,
-        .compression_brotli_quality = 5,
-        .upstream_gunzip_enabled = true,
-        .cb_threshold = 0,
-        .cb_timeout_ms = 30_000,
-        .worker_threads = 0,
-        .master_process_enabled = false,
-        .worker_processes = 1,
-        .binary_upgrade_enabled = true,
-        .worker_recycle_seconds = 0,
-        .worker_cpu_affinity = "",
-        .worker_queue_size = 1024,
-        .fd_soft_limit = 0,
-        .max_connections_per_ip = 0,
-        .max_active_connections = 0,
-        .keep_alive_timeout_ms = 5000,
-        .max_requests_per_connection = 100,
-        .connection_pool_size = 256,
-        .max_connection_memory_bytes = 2 * 1024 * 1024,
-        .max_total_connection_memory_bytes = 0,
-        .proxy_stream_all_statuses = false,
-        .upstream_retry_attempts = 1,
-        .upstream_timeout_budget_ms = 0,
-        .upstream_max_fails = 0,
-        .upstream_fail_timeout_ms = 10_000,
-        .upstream_active_health_interval_ms = 0,
-        .upstream_active_health_path = "/health",
-        .upstream_active_health_timeout_ms = 2000,
-        .upstream_active_health_fail_threshold = 1,
-        .upstream_active_health_success_threshold = 1,
-        .upstream_slow_start_ms = 0,
-        .websocket_enabled = true,
-        .websocket_idle_timeout_ms = 60_000,
-        .websocket_max_frame_size = 1024 * 1024,
-        .websocket_ping_interval_ms = 15_000,
-        .sse_enabled = true,
-        .sse_max_events_per_topic = 1024,
-        .sse_poll_interval_ms = 250,
-        .sse_max_backlog = 1024,
-        .sse_idle_timeout_ms = 60_000,
-        .rewrite_rules = &[_]edge_config.EdgeConfig.RewriteRule{},
-        .return_rules = &[_]edge_config.EdgeConfig.ReturnRule{},
-        .internal_redirect_rules = &[_]edge_config.EdgeConfig.InternalRedirectRule{},
-        .named_locations = &[_]edge_config.EdgeConfig.NamedLocation{},
-        .mirror_rules = &[_]edge_config.EdgeConfig.MirrorRule{},
-        .fastcgi_upstream = "",
-        .uwsgi_upstream = "",
-        .scgi_upstream = "",
-        .grpc_upstream = "",
-        .memcached_upstream = "",
-        .smtp_upstream = "",
-        .imap_upstream = "",
-        .pop3_upstream = "",
-        .tcp_proxy_upstream = "",
-        .udp_proxy_upstream = "",
-        .stream_ssl_termination = false,
-    };
-
-    var headers = http.Headers.init(allocator);
-    defer headers.deinit();
-    try headers.append("Authorization", "Bearer secret-token");
-
-    try std.testing.expect(authorizeRequest(&cfg, &headers).ok);
 }
 
 test "parseChatMessage validates payload" {
@@ -7598,13 +7535,13 @@ test "buildProxyCacheKey supports template tokens" {
         allocator,
         "method:path:identity:api_version",
         "POST",
-        "/v1/chat",
+        "/api/messages",
         "{\"message\":\"hello\"}",
         "identity-1",
         2,
     );
     defer allocator.free(key);
-    try std.testing.expectEqualStrings("POST:/v1/chat:identity-1:2", key);
+    try std.testing.expectEqualStrings("POST:/api/messages:identity-1:2", key);
 }
 
 test "buildProxyCacheKey falls back for unknown template tokens" {
@@ -7614,7 +7551,7 @@ test "buildProxyCacheKey falls back for unknown template tokens" {
         allocator,
         "unknown:also_unknown",
         "POST",
-        "/v1/commands",
+        "/api/tasks",
         payload,
         null,
         null,
@@ -7623,7 +7560,7 @@ test "buildProxyCacheKey falls back for unknown template tokens" {
 
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(payload, &digest, .{});
-    const expected = try std.fmt.allocPrint(allocator, "POST:/v1/commands:{s}", .{std.fmt.fmtSliceHexLower(&digest)});
+    const expected = try std.fmt.allocPrint(allocator, "POST:/api/tasks:{s}", .{std.fmt.fmtSliceHexLower(&digest)});
     defer allocator.free(expected);
     try std.testing.expectEqualStrings(expected, key);
 }
@@ -7657,22 +7594,9 @@ test "parseLastEventId handles invalid values" {
     try std.testing.expectEqual(@as(u64, 0), parseLastEventId(null));
 }
 
-test "isValidDeviceTopicSegment accepts safe values" {
-    try std.testing.expect(isValidDeviceTopicSegment("device-1"));
-    try std.testing.expect(isValidDeviceTopicSegment("topic.alpha_2"));
-    try std.testing.expect(isValidDeviceTopicSegment("  status.update  "));
-}
-
-test "isValidDeviceTopicSegment rejects invalid values" {
-    try std.testing.expect(!isValidDeviceTopicSegment(""));
-    try std.testing.expect(!isValidDeviceTopicSegment("bad/topic"));
-    try std.testing.expect(!isValidDeviceTopicSegment("bad topic"));
-    try std.testing.expect(!isValidDeviceTopicSegment("..*"));
-}
-
 test "routeRequiresApprovalRule detects approval requirement" {
-    try std.testing.expect(routeRequiresApprovalRule("POST", "/v1/commands", "POST|/v1/commands|ops|true||"));
-    try std.testing.expect(!routeRequiresApprovalRule("POST", "/v1/chat", "POST|/v1/commands|ops|true||"));
+    try std.testing.expect(routeRequiresApprovalRule("POST", "/api/tasks", "POST|/api/tasks|ops|true||"));
+    try std.testing.expect(!routeRequiresApprovalRule("POST", "/api/messages", "POST|/api/tasks|ops|true||"));
 }
 
 test "parseApprovalResponseBody parses approve and deny" {
@@ -7690,10 +7614,10 @@ test "parseApprovalResponseBody parses approve and deny" {
 
 test "parseApprovalRequestBody parses command scoped request" {
     const allocator = std.testing.allocator;
-    var req = try parseApprovalRequestBody(allocator, "{\"method\":\"POST\",\"path\":\"/v1/commands\",\"command_id\":\"cmd-123\"}");
+    var req = try parseApprovalRequestBody(allocator, "{\"method\":\"POST\",\"path\":\"/api/tasks\",\"command_id\":\"cmd-123\"}");
     defer req.deinit(allocator);
     try std.testing.expectEqualStrings("POST", req.method);
-    try std.testing.expectEqualStrings("/v1/commands", req.path);
+    try std.testing.expectEqualStrings("/api/tasks", req.path);
     try std.testing.expect(req.command_id != null);
     try std.testing.expectEqualStrings("cmd-123", req.command_id.?);
 }

@@ -16,17 +16,16 @@ pub const EventLoop = struct {
     backend: Backend,
 
     pub fn init() !EventLoop {
-        const backend = try detectBackend();
-        return switch (backend) {
-            .epoll => .{
+        return if (builtin.os.tag == .linux)
+            .{
                 .fd = try std.posix.epoll_create1(std.os.linux.EPOLL.CLOEXEC),
                 .backend = .epoll,
-            },
-            .kqueue => .{
+            }
+        else
+            .{
                 .fd = try std.posix.kqueue(),
                 .backend = .kqueue,
-            },
-        };
+            };
     }
 
     pub fn deinit(self: *EventLoop) void {
@@ -42,35 +41,32 @@ pub const EventLoop = struct {
     }
 
     pub fn addReadFd(self: *EventLoop, fd: std.posix.fd_t) !void {
-        switch (self.backend) {
-            .epoll => {
-                var event = std.os.linux.epoll_event{
-                    .events = std.os.linux.EPOLL.IN,
-                    .data = .{ .fd = @intCast(fd) },
-                };
-                try std.posix.epoll_ctl(self.fd, std.os.linux.EPOLL.CTL_ADD, @intCast(fd), &event);
-            },
-            .kqueue => {
-                const changes = [_]std.posix.Kevent{.{
-                    .ident = @intCast(fd),
-                    .filter = std.c.EVFILT.READ,
-                    .flags = std.c.EV.ADD | std.c.EV.ENABLE,
-                    .fflags = 0,
-                    .data = 0,
-                    .udata = 0,
-                }};
-                _ = try std.posix.kevent(self.fd, &changes, &.{}, null);
-            },
+        if (builtin.os.tag == .linux) {
+            var event = std.os.linux.epoll_event{
+                .events = std.os.linux.EPOLL.IN,
+                .data = .{ .fd = @intCast(fd) },
+            };
+            try std.posix.epoll_ctl(self.fd, std.os.linux.EPOLL.CTL_ADD, @intCast(fd), @ptrCast(&event));
+        } else {
+            const changes = [_]std.posix.Kevent{.{
+                .ident = @intCast(fd),
+                .filter = std.c.EVFILT.READ,
+                .flags = std.c.EV.ADD | std.c.EV.ENABLE,
+                .fflags = 0,
+                .data = 0,
+                .udata = 0,
+            }};
+            _ = try std.posix.kevent(self.fd, &changes, &.{}, null);
         }
     }
 
     pub fn wait(self: *EventLoop, out_events: []Event, timeout_ms: i32) !usize {
         if (out_events.len == 0) return 0;
 
-        return switch (self.backend) {
-            .epoll => self.waitEpoll(out_events, timeout_ms),
-            .kqueue => self.waitKqueue(out_events, timeout_ms),
-        };
+        return if (builtin.os.tag == .linux)
+            self.waitEpoll(out_events, timeout_ms)
+        else
+            self.waitKqueue(out_events, timeout_ms);
     }
 
     fn waitEpoll(self: *EventLoop, out_events: []Event, timeout_ms: i32) usize {

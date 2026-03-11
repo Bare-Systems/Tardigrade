@@ -10,6 +10,15 @@ const c = @cImport({
     @cInclude("openssl/crypto.h");
 });
 
+extern fn SSL_CTX_set_alpn_select_cb(
+    ctx: *c.SSL_CTX,
+    cb: *const fn (?*c.SSL, [*c][*c]u8, [*c]u8, [*c]const u8, c_uint, ?*anyopaque) callconv(.c) c_int,
+    arg: ?*anyopaque,
+) void;
+
+const ssl_op_no_ticket: c_ulong = @as(c_ulong, 1) << @as(u6, 14);
+const openssl_npn_negotiated: c_int = 1;
+
 pub const TlsError = error{
     OutOfMemory,
     OpenSslInitFailed,
@@ -87,12 +96,13 @@ const State = struct {
     crl_check: bool,
     acme_enabled: bool,
     acme_cert_dir: []const u8,
-    static_sni_specs: []const SniCertSpec,
+    static_sni_specs: []SniCertSpec,
     sni_certs: std.ArrayList(ManagedSniCert),
     http2_enabled: bool,
 
     fn deinit(self: *State) void {
         if (self.ocsp_response) |resp| self.allocator.free(resp);
+        self.allocator.free(self.static_sni_specs);
         for (self.sni_certs.items) |sc| {
             self.allocator.free(sc.host_lc);
             std.heap.c_allocator.free(sc.cert_path_z);
@@ -113,6 +123,9 @@ pub const TlsTerminator = struct {
         const method = c.TLS_server_method() orelse return error.ContextInitFailed;
         const ctx = c.SSL_CTX_new(method) orelse return error.ContextInitFailed;
         errdefer c.SSL_CTX_free(ctx);
+        const owned_sni_specs = try allocator.alloc(SniCertSpec, opts.sni_certs.len);
+        errdefer allocator.free(owned_sni_specs);
+        @memcpy(owned_sni_specs, opts.sni_certs);
 
         var st = try allocator.create(State);
         errdefer allocator.destroy(st);
@@ -128,7 +141,7 @@ pub const TlsTerminator = struct {
             .crl_check = opts.crl_check,
             .acme_enabled = opts.acme_enabled,
             .acme_cert_dir = opts.acme_cert_dir,
-            .static_sni_specs = opts.sni_certs,
+            .static_sni_specs = owned_sni_specs,
             .sni_certs = std.ArrayList(ManagedSniCert).init(allocator),
             .http2_enabled = opts.http2_enabled,
         };
@@ -143,10 +156,19 @@ pub const TlsTerminator = struct {
         if (opts.ocsp_stapling_enabled and opts.ocsp_response_path.len > 0) try loadOcspResponse(st);
         try rebuildSniCertificates(st);
         if (st.sni_certs.items.len > 0) {
-            _ = c.SSL_CTX_set_tlsext_servername_callback(ctx, sniCallback);
-            _ = c.SSL_CTX_set_tlsext_servername_arg(ctx, st);
+            _ = c.SSL_CTX_callback_ctrl(
+                ctx,
+                c.SSL_CTRL_SET_TLSEXT_SERVERNAME_CB,
+                @ptrCast(&sniCallback),
+            );
+            _ = c.SSL_CTX_ctrl(
+                ctx,
+                c.SSL_CTRL_SET_TLSEXT_SERVERNAME_ARG,
+                0,
+                st,
+            );
         }
-        _ = c.SSL_CTX_set_alpn_select_cb(ctx, alpnSelectCallback, st);
+        SSL_CTX_set_alpn_select_cb(ctx, alpnSelectCallback, st);
 
         return .{ .allocator = allocator, .ctx = ctx, .state = st };
     }
@@ -190,13 +212,15 @@ pub const TlsTerminator = struct {
         errdefer c.SSL_free(ssl);
         if (c.SSL_set_fd(ssl, fd) != 1) return error.HandshakeFailed;
 
-        self.state.mutex.lock();
-        defer self.state.mutex.unlock();
-        if (self.state.ocsp_enabled and self.state.ocsp_response) |resp| {
-            const copied = @as([*]u8, @ptrCast(c.OPENSSL_malloc(resp.len) orelse return error.OutOfMemory))[0..resp.len];
-            std.mem.copyForwards(u8, copied, resp);
-            if (c.SSL_set_tlsext_status_ocsp_resp(ssl, copied.ptr, @intCast(copied.len)) != 1) {
-                c.OPENSSL_free(copied.ptr);
+        if (self.state.ocsp_enabled) {
+            self.state.mutex.lock();
+            defer self.state.mutex.unlock();
+            if (self.state.ocsp_response) |resp| {
+                const copied = @as([*]u8, @ptrCast(std.c.malloc(resp.len) orelse return error.OutOfMemory))[0..resp.len];
+                std.mem.copyForwards(u8, copied, resp);
+                if (c.SSL_set_tlsext_status_ocsp_resp(ssl, copied.ptr, @as(c_int, @intCast(copied.len))) != 1) {
+                    std.c.free(copied.ptr);
+                }
             }
         }
 
@@ -288,7 +312,7 @@ fn configureSessionCache(ctx: *c.SSL_CTX, enabled: bool, size: u32, timeout_seco
     } else {
         _ = c.SSL_CTX_set_session_cache_mode(ctx, c.SSL_SESS_CACHE_OFF);
     }
-    if (!tickets_enabled) _ = c.SSL_CTX_set_options(ctx, c.SSL_OP_NO_TICKET);
+    if (!tickets_enabled) _ = c.SSL_CTX_set_options(ctx, ssl_op_no_ticket);
 }
 
 fn configureClientVerification(ctx: *c.SSL_CTX, ca_path: []const u8, verify: bool, depth: u32) TlsError!void {
@@ -306,7 +330,7 @@ fn configureCrl(ctx: *c.SSL_CTX, crl_path: []const u8) TlsError!void {
     const path_z = try std.heap.c_allocator.dupeZ(u8, crl_path);
     defer std.heap.c_allocator.free(path_z);
     const bio = c.BIO_new_file(path_z.ptr, "r") orelse return error.CrlLoadFailed;
-    defer c.BIO_free(bio);
+    defer _ = c.BIO_free(bio);
     const crl = c.PEM_read_bio_X509_CRL(bio, null, null, null) orelse return error.CrlLoadFailed;
     defer c.X509_CRL_free(crl);
     const store = c.SSL_CTX_get_cert_store(ctx) orelse return error.CrlLoadFailed;
@@ -398,7 +422,7 @@ fn alpnSelectCallback(
     const http11_only = "\x08http/1.1";
     const server_protos = if (state.http2_enabled) h2_and_http11 else http11_only;
     const rc = c.SSL_select_next_proto(out, outlen, server_protos.ptr, @intCast(server_protos.len), in, inlen);
-    return if (rc == c.OPENSSL_NPN_NEGOTIATED) c.SSL_TLSEXT_ERR_OK else c.SSL_TLSEXT_ERR_NOACK;
+    return if (rc == openssl_npn_negotiated) c.SSL_TLSEXT_ERR_OK else c.SSL_TLSEXT_ERR_NOACK;
 }
 
 fn fileMtime(path: []const u8) !i128 {
@@ -408,4 +432,27 @@ fn fileMtime(path: []const u8) !i128 {
 
 test "openssl init" {
     try std.testing.expect(c.OPENSSL_init_ssl(0, null) == 1);
+}
+
+test "tls terminator copies sni specs for maintenance reload" {
+    const allocator = std.testing.allocator;
+    var specs = try allocator.alloc(SniCertSpec, 1);
+    specs[0] = .{
+        .server_name = "sni.integration.test",
+        .cert_path = "tests/fixtures/tls/alt_server.crt",
+        .key_path = "tests/fixtures/tls/alt_server.key",
+    };
+
+    var tls = try TlsTerminator.init(allocator, .{
+        .cert_path = "tests/fixtures/tls/server.crt",
+        .key_path = "tests/fixtures/tls/server.key",
+        .sni_certs = specs,
+        .dynamic_reload_interval_ms = 1,
+    });
+    defer tls.deinit();
+
+    allocator.free(specs);
+
+    tls.runMaintenance(1);
+    tls.runMaintenance(2);
 }

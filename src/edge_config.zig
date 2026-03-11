@@ -37,6 +37,18 @@ pub const ProxyProtocolMode = enum {
 };
 
 pub const EdgeConfig = struct {
+    pub const HealthStatusRange = struct {
+        min: u16,
+        max: u16,
+
+        pub fn contains(self: HealthStatusRange, status_code: u16) bool {
+            return status_code >= self.min and status_code <= self.max;
+        }
+    };
+    pub const UpstreamHealthSuccessStatusOverride = struct {
+        upstream_base_url: []const u8,
+        range: HealthStatusRange,
+    };
     pub const HeaderPair = struct {
         name: []const u8,
         value: []const u8,
@@ -48,6 +60,8 @@ pub const EdgeConfig = struct {
     };
     pub const RewriteRule = http.rewrite.RewriteRule;
     pub const ReturnRule = http.rewrite.ReturnRule;
+    pub const ConditionalRule = http.rewrite.ConditionalRule;
+    pub const LocationBlock = http.location_router.LocationBlock;
     pub const InternalRedirectRule = struct {
         method: []const u8,
         pattern: []const u8,
@@ -61,6 +75,32 @@ pub const EdgeConfig = struct {
         method: []const u8,
         pattern: []const u8,
         target_url: []const u8,
+    };
+    pub const ServerBlock = struct {
+        server_names: [][]const u8,
+        doc_root: []const u8,
+        try_files: []const u8,
+        location_blocks: []LocationBlock,
+        tls_cert_path: []const u8,
+        tls_key_path: []const u8,
+        upstream_base_url: []const u8,
+        proxy_pass_chat: []const u8,
+        proxy_pass_commands_prefix: []const u8,
+
+        pub fn deinit(self: *ServerBlock, allocator: std.mem.Allocator) void {
+            for (self.server_names) |name| allocator.free(name);
+            allocator.free(self.server_names);
+            allocator.free(self.doc_root);
+            allocator.free(self.try_files);
+            for (self.location_blocks) |*block| block.deinit(allocator);
+            allocator.free(self.location_blocks);
+            allocator.free(self.tls_cert_path);
+            allocator.free(self.tls_key_path);
+            allocator.free(self.upstream_base_url);
+            allocator.free(self.proxy_pass_chat);
+            allocator.free(self.proxy_pass_commands_prefix);
+            self.* = undefined;
+        }
     };
 
     listen_host: []const u8,
@@ -88,6 +128,7 @@ pub const EdgeConfig = struct {
     tls_acme_cert_dir: []const u8,
     http2_enabled: bool,
     http3_enabled: bool,
+    quic_port: u16,
     http3_enable_0rtt: bool,
     http3_connection_migration: bool,
     http3_max_datagram_size: usize,
@@ -111,14 +152,8 @@ pub const EdgeConfig = struct {
     upstream_commands_base_url_weights: []u32,
     upstream_commands_backup_base_urls: [][]const u8,
     upstream_lb_algorithm: UpstreamLbAlgorithm,
-    /// Proxy target for /v1/chat. Supports absolute URL or path.
-    proxy_pass_chat: []const u8,
-    /// Proxy target prefix for /v1/commands upstream subpaths.
-    /// Supports absolute URL prefix or path prefix.
-    proxy_pass_commands_prefix: []const u8,
-    auth_token_hashes: [][]const u8,
-    max_message_chars: usize,
     upstream_timeout_ms: u32,
+    auth_request_url: []const u8,
     /// Requests per second per client IP (0 = disabled).
     rate_limit_rps: f64,
     /// Burst capacity for rate limiter.
@@ -144,36 +179,8 @@ pub const EdgeConfig = struct {
     geo_blocked_countries: [][]const u8,
     /// Header containing country code provided by external edge/CDN.
     geo_country_header: []const u8,
-    /// Optional auth subrequest URL; non-2xx denies protected routes.
-    auth_request_url: []const u8,
-    /// Timeout for auth subrequest in milliseconds.
-    auth_request_timeout_ms: u32,
-    /// Optional JWT shared secret for HS256 bearer validation.
-    jwt_secret: []const u8,
-    /// Optional JWT issuer constraint.
-    jwt_issuer: []const u8,
-    /// Optional JWT audience constraint.
-    jwt_audience: []const u8,
     /// Additional response headers from add_header directive.
     add_headers: []HeaderPair,
-    /// Policy engine route rules (`METHOD|REGEX|required_scope|require_approval|hours|device_regex`; semicolon-separated).
-    policy_rules_raw: []const u8,
-    /// Policy scope mapping (`identity:scope1,scope2;...`).
-    policy_user_scopes_raw: []const u8,
-    /// Routes requiring approval (`METHOD|REGEX;...`).
-    policy_approval_routes_raw: []const u8,
-    /// Session idle TTL in seconds (0 = sessions disabled).
-    session_ttl_seconds: u32,
-    /// Maximum concurrent sessions (0 = unlimited).
-    session_max: u32,
-    /// Device identity registry path (line format: `device_id|key`).
-    device_registry_path: []const u8,
-    /// Require registered device key proof headers for protected API routes.
-    device_auth_required: bool,
-    /// Access token ttl seconds for issued device tokens.
-    access_token_ttl_seconds: u32,
-    /// Refresh token ttl seconds for issued device tokens.
-    refresh_token_ttl_seconds: u32,
     /// IP access control rules (empty = disabled).
     /// Format: "allow 10.0.0.0/8, deny 0.0.0.0/0"
     access_control_rules: []const u8,
@@ -181,6 +188,12 @@ pub const EdgeConfig = struct {
     request_limits: http.request_limits.RequestLimits,
     /// Basic auth credential hashes (SHA-256 of "user:password", empty = disabled).
     basic_auth_hashes: [][]const u8,
+    session_ttl_seconds: u32,
+    session_max: u32,
+    device_registry_path: []const u8,
+    policy_rules_raw: []const u8,
+    policy_user_scopes_raw: []const u8,
+    policy_approval_routes_raw: []const u8,
     /// Minimum log level (debug, info, warn, error).
     log_level: http.logger.Level,
     /// Optional error log destination path (`stderr` keeps current behavior).
@@ -197,6 +210,8 @@ pub const EdgeConfig = struct {
     require_unprivileged_user: bool,
     /// Optional accepted Host patterns for virtual-host matching.
     server_names: [][]const u8,
+    /// Optional per-host server blocks loaded from config file.
+    server_blocks: []ServerBlock = &.{},
     /// Optional document root for try_files/static fallback handling.
     doc_root: []const u8,
     /// Optional `try_files` candidate list (comma-separated paths; supports `$uri`).
@@ -275,38 +290,34 @@ pub const EdgeConfig = struct {
     upstream_active_health_fail_threshold: u32,
     /// Consecutive active probe successes required before clearing unhealthy state.
     upstream_active_health_success_threshold: u32,
+    /// Default success-status range used by active health probes.
+    upstream_active_health_success_status: HealthStatusRange,
+    /// Exact upstream URL overrides for active health probe success-status matching.
+    upstream_active_health_success_status_overrides: []UpstreamHealthSuccessStatusOverride,
     /// Slow-start window (ms) for recovered upstreams before receiving full traffic (0 = disabled).
     upstream_slow_start_ms: u64,
-    /// Enable WebSocket upgrade routes.
-    websocket_enabled: bool,
-    /// Idle timeout for WebSocket connections in milliseconds.
-    websocket_idle_timeout_ms: u32,
-    /// Maximum payload size per WebSocket frame in bytes.
-    websocket_max_frame_size: usize,
-    /// Ping interval for WebSocket keepalive frames in milliseconds (0 = disabled).
-    websocket_ping_interval_ms: u32,
-    /// Enable SSE publish/stream routes.
-    sse_enabled: bool,
-    /// Maximum retained events per topic in the in-memory SSE hub.
-    sse_max_events_per_topic: usize,
-    /// SSE polling interval in milliseconds for long-lived stream loops.
-    sse_poll_interval_ms: u32,
-    /// Maximum tolerated replay backlog before forcing reconnect.
-    sse_max_backlog: usize,
-    /// Idle timeout for SSE streams in milliseconds (0 = disabled).
-    sse_idle_timeout_ms: u32,
     /// Rewrite rules evaluated before route dispatch.
     rewrite_rules: []RewriteRule,
     /// Return rules evaluated after rewrites and before route dispatch.
     return_rules: []ReturnRule,
+    /// Conditional inline `if (...) return|rewrite` rules.
+    conditional_rules: []ConditionalRule,
+    /// Location blocks loaded from env/config for nginx-style route matching.
+    location_blocks: []LocationBlock,
     /// Internal redirect rules evaluated before route dispatch.
     internal_redirect_rules: []InternalRedirectRule,
     /// Named location map for redirect targets prefixed with '@'.
     named_locations: []NamedLocation,
     /// Mirror request rules (best-effort asynchronous copies).
     mirror_rules: []MirrorRule,
+    proxy_pass_chat: []const u8,
+    proxy_pass_commands_prefix: []const u8,
     /// FastCGI upstream endpoint (`host:port`).
     fastcgi_upstream: []const u8,
+    /// Additional `fastcgi_param` CGI variables injected into FastCGI requests.
+    fastcgi_params: []HeaderPair,
+    /// Default index script for directory-style FastCGI requests.
+    fastcgi_index: []const u8,
     /// uWSGI upstream endpoint (`host:port`).
     uwsgi_upstream: []const u8,
     /// SCGI upstream endpoint (`host:port`).
@@ -327,6 +338,19 @@ pub const EdgeConfig = struct {
     udp_proxy_upstream: []const u8,
     /// Enable stream-module SSL termination mode for stream proxy routes.
     stream_ssl_termination: bool,
+    websocket_enabled: bool,
+    websocket_idle_timeout_ms: u32,
+    websocket_max_frame_size: usize,
+    websocket_ping_interval_ms: u32,
+    sse_enabled: bool,
+    sse_max_events_per_topic: usize,
+    sse_poll_interval_ms: u32,
+    sse_max_backlog: u32,
+    sse_idle_timeout_ms: u32,
+    approval_store_path: []const u8,
+    approval_escalation_webhook: []const u8,
+    approval_ttl_ms: i64,
+    approval_max_pending_per_identity: u32,
 
     pub fn deinit(self: *EdgeConfig, allocator: std.mem.Allocator) void {
         allocator.free(self.listen_host);
@@ -366,31 +390,24 @@ pub const EdgeConfig = struct {
         allocator.free(self.upstream_commands_base_url_weights);
         for (self.upstream_commands_backup_base_urls) |u| allocator.free(u);
         allocator.free(self.upstream_commands_backup_base_urls);
-        allocator.free(self.proxy_pass_chat);
-        allocator.free(self.proxy_pass_commands_prefix);
-        for (self.auth_token_hashes) |h| allocator.free(h);
-        allocator.free(self.auth_token_hashes);
+        allocator.free(self.auth_request_url);
         allocator.free(self.access_control_rules);
         allocator.free(self.proxy_cache_path);
         allocator.free(self.proxy_cache_key_template);
         for (self.geo_blocked_countries) |c| allocator.free(c);
         allocator.free(self.geo_blocked_countries);
         allocator.free(self.geo_country_header);
-        allocator.free(self.auth_request_url);
-        allocator.free(self.jwt_secret);
-        allocator.free(self.jwt_issuer);
-        allocator.free(self.jwt_audience);
         for (self.add_headers) |h| {
             allocator.free(h.name);
             allocator.free(h.value);
         }
         allocator.free(self.add_headers);
+        for (self.basic_auth_hashes) |h| allocator.free(h);
+        allocator.free(self.basic_auth_hashes);
+        allocator.free(self.device_registry_path);
         allocator.free(self.policy_rules_raw);
         allocator.free(self.policy_user_scopes_raw);
         allocator.free(self.policy_approval_routes_raw);
-        allocator.free(self.device_registry_path);
-        for (self.basic_auth_hashes) |h| allocator.free(h);
-        allocator.free(self.basic_auth_hashes);
         allocator.free(self.error_log_path);
         allocator.free(self.pid_file);
         allocator.free(self.run_user);
@@ -398,12 +415,18 @@ pub const EdgeConfig = struct {
         allocator.free(self.chroot_dir);
         for (self.server_names) |name| allocator.free(name);
         allocator.free(self.server_names);
+        for (self.server_blocks) |*block| block.deinit(allocator);
+        if (self.server_blocks.len > 0) allocator.free(self.server_blocks);
         allocator.free(self.doc_root);
         allocator.free(self.try_files);
         allocator.free(self.access_log_template);
         allocator.free(self.access_log_syslog_udp);
         allocator.free(self.worker_cpu_affinity);
         allocator.free(self.upstream_active_health_path);
+        for (self.upstream_active_health_success_status_overrides) |entry| {
+            allocator.free(entry.upstream_base_url);
+        }
+        allocator.free(self.upstream_active_health_success_status_overrides);
         for (self.rewrite_rules) |rule| {
             allocator.free(rule.method);
             allocator.free(rule.pattern);
@@ -416,6 +439,18 @@ pub const EdgeConfig = struct {
             allocator.free(rule.body);
         }
         allocator.free(self.return_rules);
+        for (self.conditional_rules) |rule| {
+            allocator.free(rule.pattern);
+            switch (rule.action) {
+                .rewrite => |rw| allocator.free(rw.replacement),
+                .returned => |ret| allocator.free(ret.body),
+            }
+        }
+        allocator.free(self.conditional_rules);
+        for (self.location_blocks) |*block| {
+            block.deinit(allocator);
+        }
+        allocator.free(self.location_blocks);
         for (self.internal_redirect_rules) |rule| {
             allocator.free(rule.method);
             allocator.free(rule.pattern);
@@ -433,7 +468,15 @@ pub const EdgeConfig = struct {
             allocator.free(rule.target_url);
         }
         allocator.free(self.mirror_rules);
+        allocator.free(self.proxy_pass_chat);
+        allocator.free(self.proxy_pass_commands_prefix);
         allocator.free(self.fastcgi_upstream);
+        for (self.fastcgi_params) |pair| {
+            allocator.free(pair.name);
+            allocator.free(pair.value);
+        }
+        allocator.free(self.fastcgi_params);
+        allocator.free(self.fastcgi_index);
         allocator.free(self.uwsgi_upstream);
         allocator.free(self.scgi_upstream);
         allocator.free(self.grpc_upstream);
@@ -443,6 +486,8 @@ pub const EdgeConfig = struct {
         allocator.free(self.pop3_upstream);
         allocator.free(self.tcp_proxy_upstream);
         allocator.free(self.udp_proxy_upstream);
+        allocator.free(self.approval_store_path);
+        allocator.free(self.approval_escalation_webhook);
         self.* = undefined;
     }
 };
@@ -465,10 +510,10 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     defer allocator.free(listen_port_str);
     const listen_port = std.fmt.parseInt(u16, listen_port_str, 10) catch 8069;
 
-    const tls_cert_path = envOrDefault(allocator, "TARDIGRADE_TLS_CERT_PATH", "") catch unreachable;
+    var tls_cert_path = envOrDefault(allocator, "TARDIGRADE_TLS_CERT_PATH", "") catch unreachable;
     errdefer allocator.free(tls_cert_path);
 
-    const tls_key_path = envOrDefault(allocator, "TARDIGRADE_TLS_KEY_PATH", "") catch unreachable;
+    var tls_key_path = envOrDefault(allocator, "TARDIGRADE_TLS_KEY_PATH", "") catch unreachable;
     errdefer allocator.free(tls_key_path);
     const tls_min_version = envOrDefault(allocator, "TARDIGRADE_TLS_MIN_VERSION", "1.2") catch unreachable;
     errdefer allocator.free(tls_min_version);
@@ -480,7 +525,7 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     errdefer allocator.free(tls_cipher_suites);
     const tls_sni_certs_raw = envOrDefault(allocator, "TARDIGRADE_TLS_SNI_CERTS", "") catch unreachable;
     defer allocator.free(tls_sni_certs_raw);
-    const tls_sni_certs = try parseTlsSniCerts(allocator, tls_sni_certs_raw);
+    var tls_sni_certs = try parseTlsSniCerts(allocator, tls_sni_certs_raw);
     errdefer {
         for (tls_sni_certs) |sc| {
             allocator.free(sc.server_name);
@@ -509,6 +554,9 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     errdefer allocator.free(tls_acme_cert_dir);
     const http2_enabled = parseBoolEnv(allocator, "TARDIGRADE_HTTP2_ENABLED", true);
     const http3_enabled = parseBoolEnv(allocator, "TARDIGRADE_HTTP3_ENABLED", false);
+    const quic_port_str = envOrDefault(allocator, "TARDIGRADE_QUIC_PORT", "443") catch unreachable;
+    defer allocator.free(quic_port_str);
+    const quic_port = std.fmt.parseInt(u16, quic_port_str, 10) catch 443;
     const http3_enable_0rtt = parseBoolEnv(allocator, "TARDIGRADE_HTTP3_ENABLE_0RTT", false);
     const http3_connection_migration = parseBoolEnv(allocator, "TARDIGRADE_HTTP3_CONNECTION_MIGRATION", false);
     const http3_max_datagram_size = parseIntEnv(usize, allocator, "TARDIGRADE_HTTP3_MAX_DATAGRAM_SIZE", 1350);
@@ -565,7 +613,7 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     const upstream_chat_base_url_weights = try parseCsvU32Values(allocator, upstream_chat_base_url_weights_raw);
     errdefer allocator.free(upstream_chat_base_url_weights);
     if (upstream_chat_base_url_weights.len > 0 and upstream_chat_base_url_weights.len != upstream_chat_base_urls.len) {
-        return error.InvalidUpstreamChatBaseUrlWeightsCount;
+        return error.InvalidUpstreamBaseUrlWeightsCount;
     }
     const upstream_chat_backup_base_urls_raw = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_CHAT_BACKUP_BASE_URLS", "") catch unreachable;
     defer allocator.free(upstream_chat_backup_base_urls_raw);
@@ -586,7 +634,7 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     const upstream_commands_base_url_weights = try parseCsvU32Values(allocator, upstream_commands_base_url_weights_raw);
     errdefer allocator.free(upstream_commands_base_url_weights);
     if (upstream_commands_base_url_weights.len > 0 and upstream_commands_base_url_weights.len != upstream_commands_base_urls.len) {
-        return error.InvalidUpstreamCommandsBaseUrlWeightsCount;
+        return error.InvalidUpstreamBaseUrlWeightsCount;
     }
     const upstream_commands_backup_base_urls_raw = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_COMMANDS_BACKUP_BASE_URLS", "") catch unreachable;
     defer allocator.free(upstream_commands_backup_base_urls_raw);
@@ -598,22 +646,12 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     const lb_algo_str = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_LB_ALGORITHM", "round_robin") catch unreachable;
     defer allocator.free(lb_algo_str);
     const upstream_lb_algorithm = UpstreamLbAlgorithm.parse(lb_algo_str) orelse .round_robin;
-    const proxy_pass_chat = envOrDefault(allocator, "TARDIGRADE_PROXY_PASS_CHAT", "/v1/chat") catch unreachable;
-    errdefer allocator.free(proxy_pass_chat);
-    const proxy_pass_commands_prefix = envOrDefault(allocator, "TARDIGRADE_PROXY_PASS_COMMANDS_PREFIX", "") catch unreachable;
-    errdefer allocator.free(proxy_pass_commands_prefix);
-
-    const max_message_chars_str = envOrDefault(allocator, "TARDIGRADE_MAX_MESSAGE_CHARS", "4000") catch unreachable;
-    defer allocator.free(max_message_chars_str);
-    const max_message_chars = std.fmt.parseInt(usize, max_message_chars_str, 10) catch 4000;
 
     const timeout_str = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_TIMEOUT_MS", "10000") catch unreachable;
     defer allocator.free(timeout_str);
     const upstream_timeout_ms = std.fmt.parseInt(u32, timeout_str, 10) catch 10000;
-
-    const raw_hashes = envOrDefault(allocator, "TARDIGRADE_AUTH_TOKEN_HASHES", "") catch unreachable;
-    defer allocator.free(raw_hashes);
-    const hashes = try parseHashes(allocator, raw_hashes);
+    const auth_request_url = envOrDefault(allocator, "TARDIGRADE_AUTH_REQUEST_URL", "") catch unreachable;
+    errdefer allocator.free(auth_request_url);
 
     const rate_rps_str = envOrDefault(allocator, "TARDIGRADE_RATE_LIMIT_RPS", "10") catch unreachable;
     defer allocator.free(rate_rps_str);
@@ -660,17 +698,6 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     }
     const geo_country_header = envOrDefault(allocator, "TARDIGRADE_GEO_COUNTRY_HEADER", "CF-IPCountry") catch unreachable;
     errdefer allocator.free(geo_country_header);
-    const auth_request_url = envOrDefault(allocator, "TARDIGRADE_AUTH_REQUEST_URL", "") catch unreachable;
-    errdefer allocator.free(auth_request_url);
-    const auth_request_timeout_ms_str = envOrDefault(allocator, "TARDIGRADE_AUTH_REQUEST_TIMEOUT_MS", "2000") catch unreachable;
-    defer allocator.free(auth_request_timeout_ms_str);
-    const auth_request_timeout_ms = std.fmt.parseInt(u32, auth_request_timeout_ms_str, 10) catch 2000;
-    const jwt_secret = envOrDefault(allocator, "TARDIGRADE_JWT_SECRET", "") catch unreachable;
-    errdefer allocator.free(jwt_secret);
-    const jwt_issuer = envOrDefault(allocator, "TARDIGRADE_JWT_ISSUER", "") catch unreachable;
-    errdefer allocator.free(jwt_issuer);
-    const jwt_audience = envOrDefault(allocator, "TARDIGRADE_JWT_AUDIENCE", "") catch unreachable;
-    errdefer allocator.free(jwt_audience);
     const add_headers_raw = envOrDefault(allocator, "TARDIGRADE_ADD_HEADERS", "") catch unreachable;
     defer allocator.free(add_headers_raw);
     const add_headers = try parseHeaderPairs(allocator, add_headers_raw);
@@ -681,26 +708,6 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         }
         allocator.free(add_headers);
     }
-    const policy_rules_raw = envOrDefault(allocator, "TARDIGRADE_POLICY_RULES", "") catch unreachable;
-    errdefer allocator.free(policy_rules_raw);
-    const policy_user_scopes_raw = envOrDefault(allocator, "TARDIGRADE_POLICY_USER_SCOPES", "") catch unreachable;
-    errdefer allocator.free(policy_user_scopes_raw);
-    const policy_approval_routes_raw = envOrDefault(allocator, "TARDIGRADE_POLICY_APPROVAL_ROUTES", "") catch unreachable;
-    errdefer allocator.free(policy_approval_routes_raw);
-
-    const session_ttl_str = envOrDefault(allocator, "TARDIGRADE_SESSION_TTL", "3600") catch unreachable;
-    defer allocator.free(session_ttl_str);
-    const session_ttl_seconds = std.fmt.parseInt(u32, session_ttl_str, 10) catch 3600;
-
-    const session_max_str = envOrDefault(allocator, "TARDIGRADE_SESSION_MAX", "1000") catch unreachable;
-    defer allocator.free(session_max_str);
-    const session_max = std.fmt.parseInt(u32, session_max_str, 10) catch 1000;
-    const device_registry_path = envOrDefault(allocator, "TARDIGRADE_DEVICE_REGISTRY_PATH", "") catch unreachable;
-    errdefer allocator.free(device_registry_path);
-    const device_auth_required = parseBoolEnv(allocator, "TARDIGRADE_DEVICE_AUTH_REQUIRED", false);
-    const access_token_ttl_seconds = parseIntEnv(u32, allocator, "TARDIGRADE_ACCESS_TOKEN_TTL_SECONDS", 900);
-    const refresh_token_ttl_seconds = parseIntEnv(u32, allocator, "TARDIGRADE_REFRESH_TOKEN_TTL_SECONDS", 86_400);
-
     const access_control_rules = envOrDefault(allocator, "TARDIGRADE_ACCESS_CONTROL", "") catch unreachable;
     errdefer allocator.free(access_control_rules);
 
@@ -733,6 +740,16 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     const raw_basic_hashes = envOrDefault(allocator, "TARDIGRADE_BASIC_AUTH_HASHES", "") catch unreachable;
     defer allocator.free(raw_basic_hashes);
     const basic_auth_hashes = try parseHashes(allocator, raw_basic_hashes);
+    const session_ttl_seconds = parseIntEnv(u32, allocator, "TARDIGRADE_SESSION_TTL_SECONDS", 3600);
+    const session_max = parseIntEnv(u32, allocator, "TARDIGRADE_SESSION_MAX", 128);
+    const device_registry_path = envOrDefault(allocator, "TARDIGRADE_DEVICE_REGISTRY_PATH", "") catch unreachable;
+    errdefer allocator.free(device_registry_path);
+    const policy_rules_raw = envOrDefault(allocator, "TARDIGRADE_POLICY_RULES", "") catch unreachable;
+    errdefer allocator.free(policy_rules_raw);
+    const policy_user_scopes_raw = envOrDefault(allocator, "TARDIGRADE_POLICY_USER_SCOPES", "") catch unreachable;
+    errdefer allocator.free(policy_user_scopes_raw);
+    const policy_approval_routes_raw = envOrDefault(allocator, "TARDIGRADE_POLICY_APPROVAL_ROUTES", "") catch unreachable;
+    errdefer allocator.free(policy_approval_routes_raw);
 
     // Log level
     const log_level_str = envOrDefault(allocator, "TARDIGRADE_LOG_LEVEL", "info") catch unreachable;
@@ -756,6 +773,14 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         for (server_names) |name| allocator.free(name);
         allocator.free(server_names);
     }
+    const server_blocks_raw = envOrDefault(allocator, "TARDIGRADE_SERVER_BLOCKS", "") catch unreachable;
+    defer allocator.free(server_blocks_raw);
+    const server_blocks = try parseServerBlocks(allocator, server_blocks_raw);
+    errdefer {
+        for (server_blocks) |*block| block.deinit(allocator);
+        allocator.free(server_blocks);
+    }
+    try applyServerBlockTlsConfig(allocator, &tls_cert_path, &tls_key_path, &tls_sni_certs, server_blocks);
     const doc_root = envOrDefault(allocator, "TARDIGRADE_DOC_ROOT", "") catch unreachable;
     errdefer allocator.free(doc_root);
     const try_files = envOrDefault(allocator, "TARDIGRADE_TRY_FILES", "") catch unreachable;
@@ -811,6 +836,21 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     const worker_queue_str = envOrDefault(allocator, "TARDIGRADE_WORKER_QUEUE_SIZE", "1024") catch unreachable;
     defer allocator.free(worker_queue_str);
     const worker_queue_size = std.fmt.parseInt(usize, worker_queue_str, 10) catch 1024;
+    const websocket_enabled = parseBoolEnv(allocator, "TARDIGRADE_WEBSOCKET_ENABLED", false);
+    const websocket_idle_timeout_ms = parseIntEnv(u32, allocator, "TARDIGRADE_WEBSOCKET_IDLE_TIMEOUT_MS", 30_000);
+    const websocket_max_frame_size = parseIntEnv(usize, allocator, "TARDIGRADE_WEBSOCKET_MAX_FRAME_SIZE", 64 * 1024);
+    const websocket_ping_interval_ms = parseIntEnv(u32, allocator, "TARDIGRADE_WEBSOCKET_PING_INTERVAL_MS", 15_000);
+    const sse_enabled = parseBoolEnv(allocator, "TARDIGRADE_SSE_ENABLED", false);
+    const sse_max_events_per_topic = parseIntEnv(usize, allocator, "TARDIGRADE_SSE_MAX_EVENTS_PER_TOPIC", 128);
+    const sse_poll_interval_ms = parseIntEnv(u32, allocator, "TARDIGRADE_SSE_POLL_INTERVAL_MS", 250);
+    const sse_max_backlog = parseIntEnv(u32, allocator, "TARDIGRADE_SSE_MAX_BACKLOG", 128);
+    const sse_idle_timeout_ms = parseIntEnv(u32, allocator, "TARDIGRADE_SSE_IDLE_TIMEOUT_MS", 30_000);
+    const approval_store_path = envOrDefault(allocator, "TARDIGRADE_APPROVAL_STORE_PATH", "") catch unreachable;
+    errdefer allocator.free(approval_store_path);
+    const approval_escalation_webhook = envOrDefault(allocator, "TARDIGRADE_APPROVAL_ESCALATION_WEBHOOK", "") catch unreachable;
+    errdefer allocator.free(approval_escalation_webhook);
+    const approval_ttl_ms = parseIntEnv(i64, allocator, "TARDIGRADE_APPROVAL_TTL_MS", 300_000);
+    const approval_max_pending_per_identity = parseIntEnv(u32, allocator, "TARDIGRADE_APPROVAL_MAX_PENDING_PER_IDENTITY", 0);
 
     const fd_soft_limit_str = envOrDefault(allocator, "TARDIGRADE_FD_SOFT_LIMIT", "0") catch unreachable;
     defer allocator.free(fd_soft_limit_str);
@@ -869,37 +909,75 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     defer allocator.free(fail_timeout_str);
     const upstream_fail_timeout_ms = std.fmt.parseInt(u64, fail_timeout_str, 10) catch 10_000;
 
-    const active_health_interval_str = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_INTERVAL_MS", "0") catch unreachable;
+    const active_health_interval_str = envOrDefaultAlias(
+        allocator,
+        "TARDIGRADE_UPSTREAM_PROBE_INTERVAL_MS",
+        "TARDIGRADE_UPSTREAM_ACTIVE_PROBE_INTERVAL_MS",
+        "0",
+    ) catch unreachable;
     defer allocator.free(active_health_interval_str);
     const upstream_active_health_interval_ms = std.fmt.parseInt(u64, active_health_interval_str, 10) catch 0;
 
-    const upstream_active_health_path = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_PATH", "/health") catch unreachable;
+    const upstream_active_health_path = envOrDefaultAlias(
+        allocator,
+        "TARDIGRADE_UPSTREAM_PROBE_PATH",
+        "TARDIGRADE_UPSTREAM_ACTIVE_PROBE_PATH",
+        "/",
+    ) catch unreachable;
     errdefer allocator.free(upstream_active_health_path);
 
-    const active_health_timeout_str = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_TIMEOUT_MS", "2000") catch unreachable;
+    const active_health_timeout_str = envOrDefaultAlias(
+        allocator,
+        "TARDIGRADE_UPSTREAM_PROBE_TIMEOUT_MS",
+        "TARDIGRADE_UPSTREAM_ACTIVE_PROBE_TIMEOUT_MS",
+        "2000",
+    ) catch unreachable;
     defer allocator.free(active_health_timeout_str);
     const upstream_active_health_timeout_ms = std.fmt.parseInt(u32, active_health_timeout_str, 10) catch 2000;
 
-    const active_health_fail_threshold_str = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_FAIL_THRESHOLD", "1") catch unreachable;
+    const active_health_fail_threshold_str = envOrDefaultAlias(
+        allocator,
+        "TARDIGRADE_UPSTREAM_PROBE_FAIL_THRESHOLD",
+        "TARDIGRADE_UPSTREAM_ACTIVE_PROBE_FAIL_THRESHOLD",
+        "1",
+    ) catch unreachable;
     defer allocator.free(active_health_fail_threshold_str);
     const upstream_active_health_fail_threshold = @max(std.fmt.parseInt(u32, active_health_fail_threshold_str, 10) catch 1, 1);
 
-    const active_health_success_threshold_str = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_SUCCESS_THRESHOLD", "1") catch unreachable;
+    const active_health_success_threshold_str = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_ACTIVE_PROBE_SUCCESS_THRESHOLD", "1") catch unreachable;
     defer allocator.free(active_health_success_threshold_str);
     const upstream_active_health_success_threshold = @max(std.fmt.parseInt(u32, active_health_success_threshold_str, 10) catch 1, 1);
+
+    const active_health_success_status_str = envOrDefaultAlias(
+        allocator,
+        "TARDIGRADE_UPSTREAM_PROBE_SUCCESS_STATUS",
+        "TARDIGRADE_UPSTREAM_ACTIVE_PROBE_SUCCESS_STATUS",
+        "200-299",
+    ) catch unreachable;
+    defer allocator.free(active_health_success_status_str);
+    const upstream_active_health_success_status = parseHealthStatusRange(active_health_success_status_str) catch EdgeConfig.HealthStatusRange{ .min = 200, .max = 299 };
+
+    const active_health_success_status_overrides_raw = envOrDefaultAlias(
+        allocator,
+        "TARDIGRADE_UPSTREAM_PROBE_SUCCESS_STATUS_OVERRIDES",
+        "TARDIGRADE_UPSTREAM_ACTIVE_PROBE_SUCCESS_STATUS_OVERRIDES",
+        "",
+    ) catch unreachable;
+    defer allocator.free(active_health_success_status_overrides_raw);
+    const upstream_active_health_success_status_overrides = try parseUpstreamHealthSuccessStatusOverrides(
+        allocator,
+        active_health_success_status_overrides_raw,
+    );
+    errdefer {
+        for (upstream_active_health_success_status_overrides) |entry| {
+            allocator.free(entry.upstream_base_url);
+        }
+        allocator.free(upstream_active_health_success_status_overrides);
+    }
 
     const slow_start_str = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_SLOW_START_MS", "0") catch unreachable;
     defer allocator.free(slow_start_str);
     const upstream_slow_start_ms = std.fmt.parseInt(u64, slow_start_str, 10) catch 0;
-    const websocket_enabled = parseBoolEnv(allocator, "TARDIGRADE_WEBSOCKET_ENABLED", true);
-    const websocket_idle_timeout_ms = parseIntEnv(u32, allocator, "TARDIGRADE_WEBSOCKET_IDLE_TIMEOUT_MS", 60_000);
-    const websocket_max_frame_size = parseIntEnv(usize, allocator, "TARDIGRADE_WEBSOCKET_MAX_FRAME_SIZE", 1024 * 1024);
-    const websocket_ping_interval_ms = parseIntEnv(u32, allocator, "TARDIGRADE_WEBSOCKET_PING_INTERVAL_MS", 15_000);
-    const sse_enabled = parseBoolEnv(allocator, "TARDIGRADE_SSE_ENABLED", true);
-    const sse_max_events_per_topic = parseIntEnv(usize, allocator, "TARDIGRADE_SSE_MAX_EVENTS_PER_TOPIC", 1024);
-    const sse_poll_interval_ms = parseIntEnv(u32, allocator, "TARDIGRADE_SSE_POLL_INTERVAL_MS", 250);
-    const sse_max_backlog = parseIntEnv(usize, allocator, "TARDIGRADE_SSE_MAX_BACKLOG", 1024);
-    const sse_idle_timeout_ms = parseIntEnv(u32, allocator, "TARDIGRADE_SSE_IDLE_TIMEOUT_MS", 60_000);
     const rewrite_rules_raw = envOrDefault(allocator, "TARDIGRADE_REWRITE_RULES", "") catch unreachable;
     defer allocator.free(rewrite_rules_raw);
     const rewrite_rules = try parseRewriteRules(allocator, rewrite_rules_raw);
@@ -922,6 +1000,31 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         }
         allocator.free(return_rules);
     }
+    const conditional_rules_raw = envOrDefault(allocator, "TARDIGRADE_CONDITIONAL_RULES", "") catch unreachable;
+    defer allocator.free(conditional_rules_raw);
+    const conditional_rules = try parseConditionalRules(allocator, conditional_rules_raw);
+    errdefer {
+        for (conditional_rules) |rule| {
+            allocator.free(rule.pattern);
+            switch (rule.action) {
+                .rewrite => |rw| allocator.free(rw.replacement),
+                .returned => |ret| allocator.free(ret.body),
+            }
+        }
+        allocator.free(conditional_rules);
+    }
+    const location_blocks_raw = envOrDefault(allocator, "TARDIGRADE_LOCATION_BLOCKS", "") catch unreachable;
+    defer allocator.free(location_blocks_raw);
+    const location_blocks = try parseLocationBlocks(allocator, location_blocks_raw);
+    errdefer {
+        for (location_blocks) |*block| {
+            block.deinit(allocator);
+        }
+        allocator.free(location_blocks);
+    }
+    const location_error_pages_raw = envOrDefault(allocator, "TARDIGRADE_LOCATION_ERROR_PAGES", "") catch unreachable;
+    defer allocator.free(location_error_pages_raw);
+    try applyLocationErrorPages(allocator, location_blocks, location_error_pages_raw);
     const internal_redirects_raw = envOrDefault(allocator, "TARDIGRADE_INTERNAL_REDIRECT_RULES", "") catch unreachable;
     defer allocator.free(internal_redirects_raw);
     const internal_redirect_rules = try parseInternalRedirectRules(allocator, internal_redirects_raw);
@@ -954,8 +1057,24 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         }
         allocator.free(mirror_rules);
     }
+    const proxy_pass_chat = envOrDefault(allocator, "TARDIGRADE_PROXY_PASS_CHAT", "") catch unreachable;
+    errdefer allocator.free(proxy_pass_chat);
+    const proxy_pass_commands_prefix = envOrDefault(allocator, "TARDIGRADE_PROXY_PASS_COMMANDS_PREFIX", "") catch unreachable;
+    errdefer allocator.free(proxy_pass_commands_prefix);
     const fastcgi_upstream = envOrDefault(allocator, "TARDIGRADE_FASTCGI_UPSTREAM", "") catch unreachable;
     errdefer allocator.free(fastcgi_upstream);
+    const fastcgi_params_raw = envOrDefault(allocator, "TARDIGRADE_FASTCGI_PARAMS", "") catch unreachable;
+    defer allocator.free(fastcgi_params_raw);
+    const fastcgi_params = try parseFastcgiParams(allocator, fastcgi_params_raw);
+    errdefer {
+        for (fastcgi_params) |pair| {
+            allocator.free(pair.name);
+            allocator.free(pair.value);
+        }
+        allocator.free(fastcgi_params);
+    }
+    const fastcgi_index = envOrDefault(allocator, "TARDIGRADE_FASTCGI_INDEX", "index.php") catch unreachable;
+    errdefer allocator.free(fastcgi_index);
     const uwsgi_upstream = envOrDefault(allocator, "TARDIGRADE_UWSGI_UPSTREAM", "") catch unreachable;
     errdefer allocator.free(uwsgi_upstream);
     const scgi_upstream = envOrDefault(allocator, "TARDIGRADE_SCGI_UPSTREAM", "") catch unreachable;
@@ -1002,6 +1121,7 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .tls_acme_cert_dir = tls_acme_cert_dir,
         .http2_enabled = http2_enabled,
         .http3_enabled = http3_enabled,
+        .quic_port = quic_port,
         .http3_enable_0rtt = http3_enable_0rtt,
         .http3_connection_migration = http3_connection_migration,
         .http3_max_datagram_size = http3_max_datagram_size,
@@ -1021,11 +1141,8 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .upstream_commands_base_url_weights = upstream_commands_base_url_weights,
         .upstream_commands_backup_base_urls = upstream_commands_backup_base_urls,
         .upstream_lb_algorithm = upstream_lb_algorithm,
-        .proxy_pass_chat = proxy_pass_chat,
-        .proxy_pass_commands_prefix = proxy_pass_commands_prefix,
-        .auth_token_hashes = hashes,
-        .max_message_chars = max_message_chars,
         .upstream_timeout_ms = upstream_timeout_ms,
+        .auth_request_url = auth_request_url,
         .rate_limit_rps = rate_limit_rps,
         .rate_limit_burst = rate_limit_burst,
         .security_headers_enabled = security_headers_enabled,
@@ -1038,21 +1155,7 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .proxy_cache_manager_interval_ms = proxy_cache_manager_interval_ms,
         .geo_blocked_countries = geo_blocked_countries,
         .geo_country_header = geo_country_header,
-        .auth_request_url = auth_request_url,
-        .auth_request_timeout_ms = auth_request_timeout_ms,
-        .jwt_secret = jwt_secret,
-        .jwt_issuer = jwt_issuer,
-        .jwt_audience = jwt_audience,
         .add_headers = add_headers,
-        .policy_rules_raw = policy_rules_raw,
-        .policy_user_scopes_raw = policy_user_scopes_raw,
-        .policy_approval_routes_raw = policy_approval_routes_raw,
-        .session_ttl_seconds = session_ttl_seconds,
-        .session_max = session_max,
-        .device_registry_path = device_registry_path,
-        .device_auth_required = device_auth_required,
-        .access_token_ttl_seconds = access_token_ttl_seconds,
-        .refresh_token_ttl_seconds = refresh_token_ttl_seconds,
         .access_control_rules = access_control_rules,
         .request_limits = .{
             .max_body_size = max_body_size,
@@ -1063,6 +1166,12 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
             .header_timeout_ms = header_timeout_ms,
         },
         .basic_auth_hashes = basic_auth_hashes,
+        .session_ttl_seconds = session_ttl_seconds,
+        .session_max = session_max,
+        .device_registry_path = device_registry_path,
+        .policy_rules_raw = policy_rules_raw,
+        .policy_user_scopes_raw = policy_user_scopes_raw,
+        .policy_approval_routes_raw = policy_approval_routes_raw,
         .log_level = log_level,
         .error_log_path = error_log_path,
         .pid_file = pid_file,
@@ -1071,6 +1180,7 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .chroot_dir = chroot_dir,
         .require_unprivileged_user = require_unprivileged_user,
         .server_names = server_names,
+        .server_blocks = server_blocks,
         .doc_root = doc_root,
         .try_files = try_files,
         .access_log_format = access_log_format,
@@ -1110,22 +1220,21 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .upstream_active_health_timeout_ms = upstream_active_health_timeout_ms,
         .upstream_active_health_fail_threshold = upstream_active_health_fail_threshold,
         .upstream_active_health_success_threshold = upstream_active_health_success_threshold,
+        .upstream_active_health_success_status = upstream_active_health_success_status,
+        .upstream_active_health_success_status_overrides = upstream_active_health_success_status_overrides,
         .upstream_slow_start_ms = upstream_slow_start_ms,
-        .websocket_enabled = websocket_enabled,
-        .websocket_idle_timeout_ms = websocket_idle_timeout_ms,
-        .websocket_max_frame_size = websocket_max_frame_size,
-        .websocket_ping_interval_ms = websocket_ping_interval_ms,
-        .sse_enabled = sse_enabled,
-        .sse_max_events_per_topic = sse_max_events_per_topic,
-        .sse_poll_interval_ms = sse_poll_interval_ms,
-        .sse_max_backlog = sse_max_backlog,
-        .sse_idle_timeout_ms = sse_idle_timeout_ms,
         .rewrite_rules = rewrite_rules,
         .return_rules = return_rules,
+        .conditional_rules = conditional_rules,
+        .location_blocks = location_blocks,
         .internal_redirect_rules = internal_redirect_rules,
         .named_locations = named_locations,
         .mirror_rules = mirror_rules,
+        .proxy_pass_chat = proxy_pass_chat,
+        .proxy_pass_commands_prefix = proxy_pass_commands_prefix,
         .fastcgi_upstream = fastcgi_upstream,
+        .fastcgi_params = fastcgi_params,
+        .fastcgi_index = fastcgi_index,
         .uwsgi_upstream = uwsgi_upstream,
         .scgi_upstream = scgi_upstream,
         .grpc_upstream = grpc_upstream,
@@ -1136,11 +1245,132 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .tcp_proxy_upstream = tcp_proxy_upstream,
         .udp_proxy_upstream = udp_proxy_upstream,
         .stream_ssl_termination = stream_ssl_termination,
+        .websocket_enabled = websocket_enabled,
+        .websocket_idle_timeout_ms = websocket_idle_timeout_ms,
+        .websocket_max_frame_size = websocket_max_frame_size,
+        .websocket_ping_interval_ms = websocket_ping_interval_ms,
+        .sse_enabled = sse_enabled,
+        .sse_max_events_per_topic = sse_max_events_per_topic,
+        .sse_poll_interval_ms = sse_poll_interval_ms,
+        .sse_max_backlog = sse_max_backlog,
+        .sse_idle_timeout_ms = sse_idle_timeout_ms,
+        .approval_store_path = approval_store_path,
+        .approval_escalation_webhook = approval_escalation_webhook,
+        .approval_ttl_ms = approval_ttl_ms,
+        .approval_max_pending_per_identity = approval_max_pending_per_identity,
     };
+}
+
+const server_block_record_sep = "\x1e";
+const server_block_field_sep = "\x1f";
+
+fn parseServerBlocks(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeConfig.ServerBlock {
+    if (std.mem.trim(u8, raw, " \t\r\n").len == 0) return &.{};
+    var out = std.ArrayList(EdgeConfig.ServerBlock).init(allocator);
+    errdefer {
+        for (out.items) |*block| block.deinit(allocator);
+        out.deinit();
+    }
+    var records = std.mem.splitSequence(u8, raw, server_block_record_sep);
+    while (records.next()) |record| {
+        if (record.len == 0) continue;
+        var fields = std.mem.splitSequence(u8, record, server_block_field_sep);
+        const names_raw = fields.next() orelse return error.InvalidServerBlockFormat;
+        const doc_root = fields.next() orelse return error.InvalidServerBlockFormat;
+        const try_files = fields.next() orelse return error.InvalidServerBlockFormat;
+        const tls_cert_path = fields.next() orelse return error.InvalidServerBlockFormat;
+        const tls_key_path = fields.next() orelse return error.InvalidServerBlockFormat;
+        const upstream_base_url = fields.next() orelse return error.InvalidServerBlockFormat;
+        const location_blocks_raw = fields.next() orelse return error.InvalidServerBlockFormat;
+        const proxy_pass_chat = fields.next() orelse "";
+        const proxy_pass_commands_prefix = fields.next() orelse "";
+        if (fields.next() != null) return error.InvalidServerBlockFormat;
+
+        const names = try parseServerNames(allocator, names_raw);
+        errdefer {
+            for (names) |name| allocator.free(name);
+            allocator.free(names);
+        }
+        const location_blocks = try parseLocationBlocks(allocator, location_blocks_raw);
+        errdefer {
+            for (location_blocks) |*block| block.deinit(allocator);
+            allocator.free(location_blocks);
+        }
+        try out.append(.{
+            .server_names = names,
+            .doc_root = try allocator.dupe(u8, doc_root),
+            .try_files = try allocator.dupe(u8, try_files),
+            .location_blocks = location_blocks,
+            .tls_cert_path = try allocator.dupe(u8, tls_cert_path),
+            .tls_key_path = try allocator.dupe(u8, tls_key_path),
+            .upstream_base_url = try allocator.dupe(u8, upstream_base_url),
+            .proxy_pass_chat = try allocator.dupe(u8, proxy_pass_chat),
+            .proxy_pass_commands_prefix = try allocator.dupe(u8, proxy_pass_commands_prefix),
+        });
+    }
+    return out.toOwnedSlice();
+}
+
+fn applyServerBlockTlsConfig(
+    allocator: std.mem.Allocator,
+    tls_cert_path: *[]u8,
+    tls_key_path: *[]u8,
+    tls_sni_certs: *[]EdgeConfig.TlsSniCert,
+    server_blocks: []const EdgeConfig.ServerBlock,
+) !void {
+    var extra_sni: usize = 0;
+    var default_block: ?*const EdgeConfig.ServerBlock = null;
+    for (server_blocks) |*block| {
+        if (block.server_names.len == 0 and default_block == null) default_block = block;
+        if (block.tls_cert_path.len == 0 and block.tls_key_path.len == 0) continue;
+        if (block.server_names.len > 0) extra_sni += block.server_names.len;
+    }
+
+    if ((tls_cert_path.*.len == 0 or tls_key_path.*.len == 0) and default_block != null) {
+        const block = default_block.?;
+        if (block.tls_cert_path.len > 0 and block.tls_key_path.len > 0) {
+            allocator.free(tls_cert_path.*);
+            allocator.free(tls_key_path.*);
+            tls_cert_path.* = try allocator.dupe(u8, block.tls_cert_path);
+            tls_key_path.* = try allocator.dupe(u8, block.tls_key_path);
+        }
+    }
+
+    if (extra_sni == 0) return;
+    const existing = tls_sni_certs.*;
+    const merged = try allocator.alloc(EdgeConfig.TlsSniCert, existing.len + extra_sni);
+    errdefer allocator.free(merged);
+
+    var idx: usize = 0;
+    for (existing) |entry| {
+        merged[idx] = .{
+            .server_name = entry.server_name,
+            .cert_path = entry.cert_path,
+            .key_path = entry.key_path,
+        };
+        idx += 1;
+    }
+    for (server_blocks) |block| {
+        if (block.server_names.len == 0) continue;
+        if (block.tls_cert_path.len == 0 or block.tls_key_path.len == 0) continue;
+        for (block.server_names) |name| {
+            merged[idx] = .{
+                .server_name = try allocator.dupe(u8, name),
+                .cert_path = try allocator.dupe(u8, block.tls_cert_path),
+                .key_path = try allocator.dupe(u8, block.tls_key_path),
+            };
+            idx += 1;
+        }
+    }
+    allocator.free(existing);
+    tls_sni_certs.* = merged;
 }
 
 fn envOrDefault(allocator: std.mem.Allocator, key: []const u8, default_value: []const u8) ![]u8 {
     if (std.process.getEnvVarOwned(allocator, key)) |owned| {
+        if (conflictingFileOverrideValue(key, owned)) |file_value| {
+            std.log.warn("config override conflict for {s}: env value '{s}' overrides file-config value '{s}'", .{ key, owned, file_value });
+        }
         return owned;
     } else |_| {}
 
@@ -1155,6 +1385,21 @@ fn envOrDefault(allocator: std.mem.Allocator, key: []const u8, default_value: []
         }
     }
     return allocator.dupe(u8, default_value);
+}
+
+fn conflictingFileOverrideValue(key: []const u8, env_value: []const u8) ?[]const u8 {
+    const overrides = active_file_overrides orelse return null;
+    const file_value = overrides.map.get(key) orelse return null;
+    if (std.mem.eql(u8, file_value, env_value)) return null;
+    return file_value;
+}
+
+fn envOrDefaultAlias(allocator: std.mem.Allocator, primary_key: []const u8, fallback_key: []const u8, default_value: []const u8) ![]u8 {
+    if (std.process.getEnvVarOwned(allocator, primary_key)) |owned| {
+        return owned;
+    } else |_| {}
+
+    return envOrDefault(allocator, fallback_key, default_value);
 }
 
 fn parseBoolEnv(allocator: std.mem.Allocator, key: []const u8, default_value: bool) bool {
@@ -1247,6 +1492,47 @@ fn parseCsvU32Values(allocator: std.mem.Allocator, raw: []const u8) ![]u32 {
     return out.toOwnedSlice();
 }
 
+fn parseHealthStatusRange(raw: []const u8) !EdgeConfig.HealthStatusRange {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return error.InvalidHealthStatusRange;
+    if (std.mem.indexOfScalar(u8, trimmed, '-')) |dash| {
+        const min_raw = std.mem.trim(u8, trimmed[0..dash], " \t\r\n");
+        const max_raw = std.mem.trim(u8, trimmed[dash + 1 ..], " \t\r\n");
+        const min = std.fmt.parseInt(u16, min_raw, 10) catch return error.InvalidHealthStatusRange;
+        const max = std.fmt.parseInt(u16, max_raw, 10) catch return error.InvalidHealthStatusRange;
+        if (min > max) return error.InvalidHealthStatusRange;
+        return .{ .min = min, .max = max };
+    }
+    const code = std.fmt.parseInt(u16, trimmed, 10) catch return error.InvalidHealthStatusRange;
+    return .{ .min = code, .max = code };
+}
+
+fn parseUpstreamHealthSuccessStatusOverrides(
+    allocator: std.mem.Allocator,
+    raw: []const u8,
+) ![]EdgeConfig.UpstreamHealthSuccessStatusOverride {
+    var out = std.ArrayList(EdgeConfig.UpstreamHealthSuccessStatusOverride).init(allocator);
+    errdefer {
+        for (out.items) |entry| allocator.free(entry.upstream_base_url);
+        out.deinit();
+    }
+
+    var it = std.mem.splitScalar(u8, raw, ';');
+    while (it.next()) |entry_raw| {
+        const entry = std.mem.trim(u8, entry_raw, " \t\r\n");
+        if (entry.len == 0) continue;
+        const sep = std.mem.lastIndexOfScalar(u8, entry, '|') orelse return error.InvalidHealthStatusOverride;
+        const upstream_base_url = std.mem.trim(u8, entry[0..sep], " \t\r\n");
+        const status_raw = std.mem.trim(u8, entry[sep + 1 ..], " \t\r\n");
+        if (upstream_base_url.len == 0 or status_raw.len == 0) return error.InvalidHealthStatusOverride;
+        try out.append(.{
+            .upstream_base_url = try allocator.dupe(u8, upstream_base_url),
+            .range = try parseHealthStatusRange(status_raw),
+        });
+    }
+    return out.toOwnedSlice();
+}
+
 fn parseHeaderPairs(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeConfig.HeaderPair {
     var out = std.ArrayList(EdgeConfig.HeaderPair).init(allocator);
     errdefer {
@@ -1270,6 +1556,32 @@ fn parseHeaderPairs(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeConfig
         const value = try allocator.dupe(u8, value_raw);
         errdefer allocator.free(value);
         try out.append(.{ .name = name, .value = value });
+    }
+    return out.toOwnedSlice();
+}
+
+fn parseFastcgiParams(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeConfig.HeaderPair {
+    var out = std.ArrayList(EdgeConfig.HeaderPair).init(allocator);
+    errdefer {
+        for (out.items) |pair| {
+            allocator.free(pair.name);
+            allocator.free(pair.value);
+        }
+        out.deinit();
+    }
+
+    var it = std.mem.splitScalar(u8, raw, '|');
+    while (it.next()) |entry| {
+        const trimmed = std.mem.trim(u8, entry, " \t\r\n");
+        if (trimmed.len == 0) continue;
+        const eq = std.mem.indexOfScalar(u8, trimmed, '=') orelse return error.InvalidFastcgiParamFormat;
+        const name = std.mem.trim(u8, trimmed[0..eq], " \t\r\n");
+        const value = std.mem.trim(u8, trimmed[eq + 1 ..], " \t\r\n");
+        if (name.len == 0) return error.InvalidFastcgiParamFormat;
+        try out.append(.{
+            .name = try allocator.dupe(u8, name),
+            .value = try allocator.dupe(u8, value),
+        });
     }
     return out.toOwnedSlice();
 }
@@ -1366,6 +1678,243 @@ fn parseReturnRules(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeConfig
         });
     }
     return out.toOwnedSlice();
+}
+
+fn parseConditionalRules(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeConfig.ConditionalRule {
+    var out = std.ArrayList(EdgeConfig.ConditionalRule).init(allocator);
+    errdefer {
+        for (out.items) |rule| {
+            allocator.free(rule.pattern);
+            switch (rule.action) {
+                .rewrite => |rw| allocator.free(rw.replacement),
+                .returned => |ret| allocator.free(ret.body),
+            }
+        }
+        out.deinit();
+    }
+
+    var it = std.mem.splitScalar(u8, raw, ';');
+    while (it.next()) |entry| {
+        const trimmed = std.mem.trim(u8, entry, " \t\r\n");
+        if (trimmed.len == 0) continue;
+        var fields = std.mem.splitScalar(u8, trimmed, '|');
+        const variable_raw = fields.next() orelse return error.InvalidConditionalRuleFormat;
+        const sensitivity_raw = fields.next() orelse return error.InvalidConditionalRuleFormat;
+        const pattern_raw = fields.next() orelse return error.InvalidConditionalRuleFormat;
+        const action_raw = fields.next() orelse return error.InvalidConditionalRuleFormat;
+
+        const variable_name = std.mem.trim(u8, variable_raw, " \t\r\n");
+        const sensitivity_name = std.mem.trim(u8, sensitivity_raw, " \t\r\n");
+        const pattern = std.mem.trim(u8, pattern_raw, " \t\r\n");
+        const action_name = std.mem.trim(u8, action_raw, " \t\r\n");
+        if (variable_name.len == 0 or sensitivity_name.len == 0 or pattern.len == 0 or action_name.len == 0) {
+            return error.InvalidConditionalRuleFormat;
+        }
+
+        const variable = http.rewrite.ConditionalVariable.parse(variable_name) orelse return error.InvalidConditionalVariable;
+        const case_insensitive = if (std.ascii.eqlIgnoreCase(sensitivity_name, "ci"))
+            true
+        else if (std.ascii.eqlIgnoreCase(sensitivity_name, "cs"))
+            false
+        else
+            return error.InvalidConditionalRuleFormat;
+
+        const owned_pattern = try allocator.dupe(u8, pattern);
+        errdefer allocator.free(owned_pattern);
+
+        if (std.ascii.eqlIgnoreCase(action_name, "rewrite")) {
+            const replacement_raw = fields.next() orelse return error.InvalidConditionalRuleFormat;
+            const flag_raw = fields.next() orelse return error.InvalidConditionalRuleFormat;
+            if (fields.next() != null) return error.InvalidConditionalRuleFormat;
+            const replacement = std.mem.trim(u8, replacement_raw, " \t\r\n");
+            const flag_name = std.mem.trim(u8, flag_raw, " \t\r\n");
+            if (replacement.len == 0 or flag_name.len == 0) return error.InvalidConditionalRuleFormat;
+            const flag = http.rewrite.RewriteFlag.parse(flag_name) orelse return error.InvalidRewriteRuleFlag;
+            const owned_replacement = try allocator.dupe(u8, replacement);
+            errdefer allocator.free(owned_replacement);
+            try out.append(.{
+                .variable = variable,
+                .case_insensitive = case_insensitive,
+                .pattern = owned_pattern,
+                .action = .{ .rewrite = .{
+                    .replacement = owned_replacement,
+                    .flag = flag,
+                } },
+            });
+            continue;
+        }
+
+        if (std.ascii.eqlIgnoreCase(action_name, "return")) {
+            const status_raw = fields.next() orelse return error.InvalidConditionalRuleFormat;
+            const body_raw = fields.next() orelse return error.InvalidConditionalRuleFormat;
+            if (fields.next() != null) return error.InvalidConditionalRuleFormat;
+            const status_str = std.mem.trim(u8, status_raw, " \t\r\n");
+            const body = std.mem.trim(u8, body_raw, " \t\r\n");
+            if (status_str.len == 0) return error.InvalidConditionalRuleFormat;
+            const status = std.fmt.parseInt(u16, status_str, 10) catch return error.InvalidReturnRuleStatus;
+            const owned_body = try allocator.dupe(u8, body);
+            errdefer allocator.free(owned_body);
+            try out.append(.{
+                .variable = variable,
+                .case_insensitive = case_insensitive,
+                .pattern = owned_pattern,
+                .action = .{ .returned = .{
+                    .status = status,
+                    .body = owned_body,
+                } },
+            });
+            continue;
+        }
+
+        return error.InvalidConditionalRuleFormat;
+    }
+    return out.toOwnedSlice();
+}
+
+fn parseLocationBlocks(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeConfig.LocationBlock {
+    var out = std.ArrayList(EdgeConfig.LocationBlock).init(allocator);
+    errdefer {
+        for (out.items) |*block| {
+            block.deinit(allocator);
+        }
+        out.deinit();
+    }
+
+    var it = std.mem.splitScalar(u8, raw, ';');
+    var priority: usize = 0;
+    while (it.next()) |entry_raw| : (priority += 1) {
+        const entry = std.mem.trim(u8, entry_raw, " \t\r\n");
+        if (entry.len == 0) continue;
+
+        var fields = std.mem.splitScalar(u8, entry, '|');
+        const match_type_raw = fields.next() orelse return error.InvalidLocationBlockFormat;
+        const pattern_raw = fields.next() orelse return error.InvalidLocationBlockFormat;
+        const action_kind_raw = fields.next() orelse return error.InvalidLocationBlockFormat;
+
+        const match_type = http.location_router.MatchType.parse(std.mem.trim(u8, match_type_raw, " \t\r\n")) orelse return error.InvalidLocationBlockFormat;
+        const pattern = std.mem.trim(u8, pattern_raw, " \t\r\n");
+        const action_kind = std.mem.trim(u8, action_kind_raw, " \t\r\n");
+        if (pattern.len == 0 or action_kind.len == 0) return error.InvalidLocationBlockFormat;
+
+        var action: http.location_router.Action = undefined;
+        if (std.ascii.eqlIgnoreCase(action_kind, "proxy_pass")) {
+            const target_raw = fields.next() orelse return error.InvalidLocationBlockFormat;
+            if (fields.next() != null) return error.InvalidLocationBlockFormat;
+            const target = std.mem.trim(u8, target_raw, " \t\r\n");
+            if (target.len == 0) return error.InvalidLocationBlockFormat;
+            action = .{ .proxy_pass = try allocator.dupe(u8, target) };
+        } else if (std.ascii.eqlIgnoreCase(action_kind, "fastcgi_pass")) {
+            const target_raw = fields.next() orelse return error.InvalidLocationBlockFormat;
+            if (fields.next() != null) return error.InvalidLocationBlockFormat;
+            const target = std.mem.trim(u8, target_raw, " \t\r\n");
+            if (target.len == 0) return error.InvalidLocationBlockFormat;
+            action = .{ .fastcgi_pass = try allocator.dupe(u8, target) };
+        } else if (std.ascii.eqlIgnoreCase(action_kind, "return")) {
+            const status_raw = fields.next() orelse return error.InvalidLocationBlockFormat;
+            const body_raw = fields.next() orelse return error.InvalidLocationBlockFormat;
+            if (fields.next() != null) return error.InvalidLocationBlockFormat;
+            const status = std.fmt.parseInt(u16, std.mem.trim(u8, status_raw, " \t\r\n"), 10) catch return error.InvalidLocationBlockFormat;
+            action = .{ .return_response = .{
+                .status = status,
+                .body = try allocator.dupe(u8, std.mem.trim(u8, body_raw, " \t\r\n")),
+            } };
+        } else if (std.ascii.eqlIgnoreCase(action_kind, "rewrite")) {
+            const replacement_raw = fields.next() orelse return error.InvalidLocationBlockFormat;
+            const flag_raw = fields.next() orelse return error.InvalidLocationBlockFormat;
+            if (fields.next() != null) return error.InvalidLocationBlockFormat;
+            const replacement = std.mem.trim(u8, replacement_raw, " \t\r\n");
+            const flag = http.rewrite.RewriteFlag.parse(std.mem.trim(u8, flag_raw, " \t\r\n")) orelse return error.InvalidLocationBlockFormat;
+            if (replacement.len == 0) return error.InvalidLocationBlockFormat;
+            action = .{ .rewrite = .{
+                .replacement = try allocator.dupe(u8, replacement),
+                .flag = flag,
+            } };
+        } else if (std.ascii.eqlIgnoreCase(action_kind, "static_root")) {
+            const root_raw = fields.next() orelse return error.InvalidLocationBlockFormat;
+            const alias_raw = fields.next() orelse return error.InvalidLocationBlockFormat;
+            const autoindex_raw = fields.next() orelse return error.InvalidLocationBlockFormat;
+            const index_raw = fields.next() orelse return error.InvalidLocationBlockFormat;
+            const try_files_raw = fields.next() orelse return error.InvalidLocationBlockFormat;
+            if (fields.next() != null) return error.InvalidLocationBlockFormat;
+            const root = std.mem.trim(u8, root_raw, " \t\r\n");
+            if (root.len == 0) return error.InvalidLocationBlockFormat;
+            const alias = parseBoolish(std.mem.trim(u8, alias_raw, " \t\r\n")) orelse return error.InvalidLocationBlockFormat;
+            const autoindex = parseBoolish(std.mem.trim(u8, autoindex_raw, " \t\r\n")) orelse return error.InvalidLocationBlockFormat;
+            action = .{ .static_root = .{
+                .root = try allocator.dupe(u8, root),
+                .alias = alias,
+                .autoindex = autoindex,
+                .index = try allocator.dupe(u8, std.mem.trim(u8, index_raw, " \t\r\n")),
+                .try_files = try allocator.dupe(u8, std.mem.trim(u8, try_files_raw, " \t\r\n")),
+            } };
+        } else {
+            return error.InvalidLocationBlockFormat;
+        }
+
+        try out.append(.{
+            .match_type = match_type,
+            .pattern = try allocator.dupe(u8, pattern),
+            .priority = priority,
+            .action = action,
+            .error_pages = &.{},
+        });
+    }
+
+    return out.toOwnedSlice();
+}
+
+fn applyLocationErrorPages(allocator: std.mem.Allocator, blocks: []EdgeConfig.LocationBlock, raw: []const u8) !void {
+    var it = std.mem.splitScalar(u8, raw, ';');
+    while (it.next()) |entry_raw| {
+        const entry = std.mem.trim(u8, entry_raw, " \t\r\n");
+        if (entry.len == 0) continue;
+
+        var fields = std.mem.splitScalar(u8, entry, '|');
+        const match_type_raw = fields.next() orelse return error.InvalidLocationBlockFormat;
+        const pattern_raw = fields.next() orelse return error.InvalidLocationBlockFormat;
+        const status_codes_raw = fields.next() orelse return error.InvalidLocationBlockFormat;
+        const target_raw = fields.next() orelse return error.InvalidLocationBlockFormat;
+        if (fields.next() != null) return error.InvalidLocationBlockFormat;
+
+        const match_type = http.location_router.MatchType.parse(std.mem.trim(u8, match_type_raw, " \t\r\n")) orelse return error.InvalidLocationBlockFormat;
+        const pattern = std.mem.trim(u8, pattern_raw, " \t\r\n");
+        const target = std.mem.trim(u8, target_raw, " \t\r\n");
+        if (pattern.len == 0 or target.len == 0) return error.InvalidLocationBlockFormat;
+
+        var code_tokens = std.mem.splitScalar(u8, status_codes_raw, ',');
+        var status_codes = std.ArrayList(u16).init(allocator);
+        defer status_codes.deinit();
+        while (code_tokens.next()) |code_raw| {
+            const code = std.fmt.parseInt(u16, std.mem.trim(u8, code_raw, " \t\r\n"), 10) catch return error.InvalidLocationBlockFormat;
+            try status_codes.append(code);
+        }
+        if (status_codes.items.len == 0) return error.InvalidLocationBlockFormat;
+
+        var matched_block: ?*EdgeConfig.LocationBlock = null;
+        for (blocks) |*block| {
+            if (block.match_type == match_type and std.mem.eql(u8, block.pattern, pattern)) {
+                matched_block = block;
+                break;
+            }
+        }
+        const block = matched_block orelse return error.InvalidLocationBlockFormat;
+
+        const existing_len = block.error_pages.len;
+        const merged = try allocator.alloc(http.location_router.ErrorPageRule, existing_len + 1);
+        for (block.error_pages, 0..) |existing, idx| merged[idx] = existing;
+        merged[existing_len] = .{
+            .status_codes = try allocator.dupe(u16, status_codes.items),
+            .target = try allocator.dupe(u8, target),
+        };
+        if (existing_len > 0) allocator.free(block.error_pages);
+        block.error_pages = merged;
+    }
+}
+
+fn parseBoolish(raw: []const u8) ?bool {
+    if (std.ascii.eqlIgnoreCase(raw, "1") or std.ascii.eqlIgnoreCase(raw, "true") or std.ascii.eqlIgnoreCase(raw, "on") or std.ascii.eqlIgnoreCase(raw, "yes")) return true;
+    if (std.ascii.eqlIgnoreCase(raw, "0") or std.ascii.eqlIgnoreCase(raw, "false") or std.ascii.eqlIgnoreCase(raw, "off") or std.ascii.eqlIgnoreCase(raw, "no")) return false;
+    return null;
 }
 
 fn parseInternalRedirectRules(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeConfig.InternalRedirectRule {
@@ -1497,6 +2046,223 @@ pub fn hasTlsFiles(cfg: *const EdgeConfig) bool {
     return cfg.tls_cert_path.len > 0 and cfg.tls_key_path.len > 0;
 }
 
+pub fn validate(cfg: *const EdgeConfig) !void {
+    if (cfg.listen_port == 0) {
+        std.log.err("config validation failed: listen_port must be between 1 and 65535", .{});
+        return error.InvalidConfigPort;
+    }
+    if (cfg.http3_enabled and cfg.quic_port == 0) {
+        std.log.err("config validation failed: quic_port must be between 1 and 65535 when HTTP/3 is enabled", .{});
+        return error.InvalidConfigPort;
+    }
+
+    try validateOptionalFile(cfg.tls_cert_path, "tls_cert_path");
+    try validateOptionalFile(cfg.tls_key_path, "tls_key_path");
+    for (cfg.tls_sni_certs) |entry| {
+        try validateOptionalFile(entry.cert_path, "tls_sni_cert.cert_path");
+        try validateOptionalFile(entry.key_path, "tls_sni_cert.key_path");
+    }
+    for (cfg.server_blocks) |block| {
+        if ((block.tls_cert_path.len == 0) != (block.tls_key_path.len == 0)) {
+            std.log.err("config validation failed: server block TLS config requires both tls_cert_path and tls_key_path", .{});
+            return error.InvalidConfigPath;
+        }
+        try validateOptionalFile(block.tls_cert_path, "server_block.tls_cert_path");
+        try validateOptionalFile(block.tls_key_path, "server_block.tls_key_path");
+        try validateOptionalUpstreamBaseUrl(block.upstream_base_url, "server_block.upstream_base_url");
+    }
+    try validateOptionalFile(cfg.tls_ocsp_response_path, "tls_ocsp_response_path");
+    try validateOptionalFile(cfg.tls_client_ca_path, "tls_client_ca_path");
+    try validateOptionalFile(cfg.tls_crl_path, "tls_crl_path");
+    try validateOptionalDir(cfg.tls_acme_cert_dir, "tls_acme_cert_dir");
+    try validateOptionalDir(cfg.chroot_dir, "chroot_dir");
+    try validateOptionalPathForErrorLog(cfg.error_log_path, "error_log_path");
+    for (cfg.location_blocks) |block| {
+        if (block.error_pages.len > 0) switch (block.action) {
+            .static_root => |root| try validateOptionalDir(root.root, "location.error_page_root"),
+            else => {},
+        };
+        for (block.error_pages) |rule| {
+            if (isAbsoluteHttpUrl(rule.target)) continue;
+            if (rule.target.len == 0) {
+                std.log.err("config validation failed: location error_page target must not be empty", .{});
+                return error.InvalidConfigPath;
+            }
+        }
+    }
+
+    try validateOptionalUpstreamBaseUrl(cfg.upstream_base_url, "upstream_base_url");
+    try validateUpstreamBaseUrlList(cfg.upstream_base_urls, "upstream_base_urls");
+    try validateUpstreamBaseUrlList(cfg.upstream_backup_base_urls, "upstream_backup_base_urls");
+    try validateOptionalAbsoluteUrl(cfg.grpc_upstream, "grpc_upstream");
+    for (cfg.mirror_rules) |rule| try validateOptionalAbsoluteUrl(rule.target_url, "mirror_rule.target_url");
+    for (cfg.location_blocks) |block| {
+        switch (block.action) {
+            .proxy_pass => |target| if (isAbsoluteHttpUrl(target) or isUnixEndpoint(target)) try validateOptionalUpstreamBaseUrl(target, "location.proxy_pass"),
+            .fastcgi_pass => |target| try validateOptionalSocketEndpoint(target, "location.fastcgi_pass"),
+            else => {},
+        }
+    }
+
+    try validateOptionalSocketEndpoint(cfg.fastcgi_upstream, "fastcgi_upstream");
+    try validateOptionalSocketEndpoint(cfg.uwsgi_upstream, "uwsgi_upstream");
+    try validateOptionalSocketEndpoint(cfg.scgi_upstream, "scgi_upstream");
+    try validateOptionalSocketEndpoint(cfg.memcached_upstream, "memcached_upstream");
+    try validateOptionalSocketEndpoint(cfg.smtp_upstream, "smtp_upstream");
+    try validateOptionalSocketEndpoint(cfg.imap_upstream, "imap_upstream");
+    try validateOptionalSocketEndpoint(cfg.pop3_upstream, "pop3_upstream");
+    try validateOptionalSocketEndpoint(cfg.tcp_proxy_upstream, "tcp_proxy_upstream");
+    try validateOptionalSocketEndpoint(cfg.udp_proxy_upstream, "udp_proxy_upstream");
+}
+
+fn validateOptionalFile(path: []const u8, label: []const u8) !void {
+    validateOptionalFileChecked(path) catch {
+        std.log.err("config validation failed: {s} path does not exist: {s}", .{ label, path });
+        return error.InvalidConfigPath;
+    };
+}
+
+fn validateOptionalDir(path: []const u8, label: []const u8) !void {
+    validateOptionalDirChecked(path) catch |err| {
+        if (err == error.InvalidConfigPath) {
+            std.log.err("config validation failed: {s} path does not exist: {s}", .{ label, path });
+        } else {
+            std.log.err("config validation failed: {s} must be a directory: {s}", .{ label, path });
+        }
+        return err;
+    };
+}
+
+fn validateOptionalPathForErrorLog(path: []const u8, label: []const u8) !void {
+    validateOptionalPathForErrorLogChecked(path) catch |err| {
+        std.log.err("config validation failed: {s} directory must exist: {s}", .{ label, path });
+        return err;
+    };
+}
+
+fn validateUpstreamBaseUrlList(values: []const []const u8, label: []const u8) !void {
+    for (values) |value| try validateOptionalUpstreamBaseUrl(value, label);
+}
+
+fn validateOptionalAbsoluteUrl(raw: []const u8, label: []const u8) !void {
+    validateOptionalAbsoluteUrlChecked(raw) catch |err| {
+        if (!isAbsoluteHttpUrl(raw)) {
+            std.log.err("config validation failed: {s} must be an absolute http/https URL: {s}", .{ label, raw });
+        } else {
+            std.log.err("config validation failed: {s} is not a valid URL: {s}", .{ label, raw });
+        }
+        return err;
+    };
+}
+
+fn validateOptionalUpstreamBaseUrl(raw: []const u8, label: []const u8) !void {
+    if (isUnixEndpoint(raw)) {
+        validateUnixEndpoint(raw, label) catch |err| return err;
+        return;
+    }
+    try validateOptionalAbsoluteUrl(raw, label);
+}
+
+fn validateOptionalSocketEndpoint(raw: []const u8, label: []const u8) !void {
+    validateOptionalSocketEndpointChecked(raw) catch |err| {
+        switch (err) {
+            error.InvalidConfigPort => std.log.err("config validation failed: {s} port must be between 1 and 65535: {s}", .{ label, raw }),
+            else => std.log.err("config validation failed: {s} must be host:port, unix:/path, starttls://host:port, or tls://host:port: {s}", .{ label, raw }),
+        }
+        return err;
+    };
+}
+
+fn validateUnixEndpoint(raw: []const u8, label: []const u8) !void {
+    validateUnixEndpointChecked(raw) catch |err| {
+        std.log.err("config validation failed: {s} unix endpoint path must not be empty: {s}", .{ label, raw });
+        return err;
+    };
+}
+
+fn validateOptionalFileChecked(path: []const u8) !void {
+    if (path.len == 0) return;
+    std.fs.cwd().access(path, .{}) catch return error.InvalidConfigPath;
+}
+
+fn validateOptionalDirChecked(path: []const u8) !void {
+    if (path.len == 0) return;
+    const stat = std.fs.cwd().statFile(path) catch {
+        return error.InvalidConfigPath;
+    };
+    if (stat.kind != .directory) {
+        return error.InvalidConfigPath;
+    }
+}
+
+fn validateOptionalPathForErrorLogChecked(path: []const u8) !void {
+    if (path.len == 0 or std.ascii.eqlIgnoreCase(path, "stderr")) return;
+    const dir_path = std.fs.path.dirname(path) orelse ".";
+    try validateOptionalDirChecked(dir_path);
+}
+
+fn validateOptionalAbsoluteUrlChecked(raw: []const u8) !void {
+    if (raw.len == 0) return;
+    if (!isAbsoluteHttpUrl(raw)) {
+        return error.InvalidConfigUrl;
+    }
+    _ = std.Uri.parse(raw) catch return error.InvalidConfigUrl;
+}
+
+fn validateOptionalSocketEndpointChecked(raw: []const u8) !void {
+    if (raw.len == 0) return;
+    if (isUnixEndpoint(raw)) {
+        try validateUnixEndpointChecked(raw);
+        return;
+    }
+    const normalized = if (std.mem.startsWith(u8, raw, "starttls://"))
+        raw["starttls://".len..]
+    else if (std.mem.startsWith(u8, raw, "smtp+starttls://"))
+        raw["smtp+starttls://".len..]
+    else if (std.mem.startsWith(u8, raw, "tls://"))
+        raw["tls://".len..]
+    else if (std.mem.startsWith(u8, raw, "smtps://"))
+        raw["smtps://".len..]
+    else
+        raw;
+    if (std.mem.indexOfScalar(u8, normalized, ':') == null) {
+        return error.InvalidConfigEndpoint;
+    }
+    const parts = splitHostPort(normalized) orelse return error.InvalidConfigEndpoint;
+    if (parts[0].len == 0) {
+        return error.InvalidConfigEndpoint;
+    }
+    if (std.fmt.parseInt(u16, parts[1], 10) catch 0 == 0) {
+        return error.InvalidConfigPort;
+    }
+}
+
+fn validateUnixEndpointChecked(raw: []const u8) !void {
+    const path = if (std.mem.startsWith(u8, raw, "unix:///"))
+        raw["unix://".len..]
+    else if (std.mem.startsWith(u8, raw, "unix:/"))
+        raw["unix:".len..]
+    else
+        raw[0..0];
+    if (path.len == 0) {
+        return error.InvalidConfigEndpoint;
+    }
+}
+
+fn isAbsoluteHttpUrl(raw: []const u8) bool {
+    return std.mem.startsWith(u8, raw, "http://") or std.mem.startsWith(u8, raw, "https://");
+}
+
+fn isUnixEndpoint(raw: []const u8) bool {
+    return std.mem.startsWith(u8, raw, "unix:/");
+}
+
+fn splitHostPort(raw: []const u8) ?struct { []const u8, []const u8 } {
+    const idx = std.mem.lastIndexOfScalar(u8, raw, ':') orelse return null;
+    if (idx == 0 or idx + 1 >= raw.len) return null;
+    return .{ std.mem.trim(u8, raw[0..idx], " \t\r\n"), std.mem.trim(u8, raw[idx + 1 ..], " \t\r\n") };
+}
+
 test "parse token hashes from csv" {
     const allocator = std.testing.allocator;
     const hashes = try parseHashes(allocator, "aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11, BB22BB22BB22BB22BB22BB22BB22BB22BB22BB22BB22BB22BB22BB22BB22BB22");
@@ -1538,6 +2304,105 @@ test "parse proxy protocol mode aliases" {
     try std.testing.expect(ProxyProtocolMode.parse("unknown") == null);
 }
 
+test "parse health status range" {
+    try std.testing.expectEqualDeep(
+        EdgeConfig.HealthStatusRange{ .min = 200, .max = 299 },
+        try parseHealthStatusRange("200-299"),
+    );
+    try std.testing.expectEqualDeep(
+        EdgeConfig.HealthStatusRange{ .min = 304, .max = 304 },
+        try parseHealthStatusRange("304"),
+    );
+    try std.testing.expectError(error.InvalidHealthStatusRange, parseHealthStatusRange("500-200"));
+}
+
+test "validate absolute upstream URL accepts http and rejects malformed input" {
+    try validateOptionalAbsoluteUrlChecked("http://127.0.0.1:8080");
+    try validateOptionalAbsoluteUrlChecked("https://example.com/api");
+    try std.testing.expectError(error.InvalidConfigUrl, validateOptionalAbsoluteUrlChecked("127.0.0.1:8080"));
+    try std.testing.expectError(error.InvalidConfigUrl, validateOptionalAbsoluteUrlChecked("http://"));
+}
+
+test "validate socket endpoint accepts host port, unix path, and tls schemes" {
+    try validateOptionalSocketEndpointChecked("127.0.0.1:9000");
+    try validateOptionalSocketEndpointChecked("unix:/tmp/php-fpm.sock");
+    try validateOptionalSocketEndpointChecked("starttls://127.0.0.1:587");
+    try validateOptionalSocketEndpointChecked("tls://127.0.0.1:465");
+    try std.testing.expectError(error.InvalidConfigEndpoint, validateOptionalSocketEndpointChecked("missing-port"));
+    try std.testing.expectError(error.InvalidConfigPort, validateOptionalSocketEndpointChecked("127.0.0.1:0"));
+}
+
+test "missing tls cert path helper returns InvalidConfigPath" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var file = try tmp.dir.createFile("exists.pem", .{});
+    file.close();
+
+    const existing_path = try tmp.dir.realpathAlloc(std.testing.allocator, "exists.pem");
+    defer std.testing.allocator.free(existing_path);
+    const missing_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(missing_path);
+    const missing_file = try std.fmt.allocPrint(std.testing.allocator, "{s}/missing.pem", .{missing_path});
+    defer std.testing.allocator.free(missing_file);
+
+    try validateOptionalFileChecked(existing_path);
+    try std.testing.expectError(error.InvalidConfigPath, validateOptionalFileChecked(missing_file));
+}
+
+test "parse server blocks" {
+    const allocator = std.testing.allocator;
+    const raw =
+        "api.example.test" ++ "\x1f" ++ "/srv/api" ++ "\x1f" ++ "$uri /index.html" ++ "\x1f" ++ "/certs/api.crt" ++ "\x1f" ++ "/certs/api.key" ++ "\x1f" ++ "http://127.0.0.1:9101" ++ "\x1f" ++ "prefix|/|proxy_pass|http://127.0.0.1:9101";
+    const blocks = try parseServerBlocks(allocator, raw);
+    defer {
+        for (blocks) |*block| block.deinit(allocator);
+        allocator.free(blocks);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), blocks.len);
+    try std.testing.expectEqual(@as(usize, 1), blocks[0].server_names.len);
+    try std.testing.expectEqualStrings("api.example.test", blocks[0].server_names[0]);
+    try std.testing.expectEqualStrings("/srv/api", blocks[0].doc_root);
+    try std.testing.expectEqualStrings("$uri /index.html", blocks[0].try_files);
+    try std.testing.expectEqualStrings("/certs/api.crt", blocks[0].tls_cert_path);
+    try std.testing.expectEqualStrings("/certs/api.key", blocks[0].tls_key_path);
+    try std.testing.expectEqualStrings("http://127.0.0.1:9101", blocks[0].upstream_base_url);
+    try std.testing.expectEqual(@as(usize, 1), blocks[0].location_blocks.len);
+}
+
+test "conflicting file override value detects env/file mismatch" {
+    const allocator = std.testing.allocator;
+    var overrides = http.config_file.Overrides.init(allocator);
+    defer overrides.deinit(allocator);
+
+    try overrides.map.put(try allocator.dupe(u8, "TARDIGRADE_LISTEN_PORT"), try allocator.dupe(u8, "8069"));
+    const previous = active_file_overrides;
+    active_file_overrides = &overrides;
+    defer active_file_overrides = previous;
+
+    try std.testing.expectEqualStrings("8069", conflictingFileOverrideValue("TARDIGRADE_LISTEN_PORT", "18069").?);
+    try std.testing.expect(conflictingFileOverrideValue("TARDIGRADE_LISTEN_PORT", "8069") == null);
+    try std.testing.expect(conflictingFileOverrideValue("TARDIGRADE_WORKER_THREADS", "4") == null);
+}
+
+test "parse upstream health success status overrides" {
+    const allocator = std.testing.allocator;
+    const overrides = try parseUpstreamHealthSuccessStatusOverrides(
+        allocator,
+        "http://127.0.0.1:8080|304;http://127.0.0.1:8081|200-204",
+    );
+    defer {
+        for (overrides) |entry| allocator.free(entry.upstream_base_url);
+        allocator.free(overrides);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), overrides.len);
+    try std.testing.expectEqualStrings("http://127.0.0.1:8080", overrides[0].upstream_base_url);
+    try std.testing.expectEqualDeep(EdgeConfig.HealthStatusRange{ .min = 304, .max = 304 }, overrides[0].range);
+    try std.testing.expectEqualDeep(EdgeConfig.HealthStatusRange{ .min = 200, .max = 204 }, overrides[1].range);
+}
+
 test "parse rewrite rules csv" {
     const allocator = std.testing.allocator;
     const rules = try parseRewriteRules(allocator, "GET|^/old$|/new|last;*|^/foo$|/bar|redirect");
@@ -1571,6 +2436,87 @@ test "parse return rules csv" {
     try std.testing.expectEqualStrings("blocked", rules[1].body);
 }
 
+test "parse conditional rules csv" {
+    const allocator = std.testing.allocator;
+    const rules = try parseConditionalRules(
+        allocator,
+        "request_uri|ci|^/legacy/(.*)$|rewrite|/$1|last;http_host|ci|^admin\\.example\\.com$|return|301|https://example.com$request_uri",
+    );
+    defer {
+        for (rules) |rule| {
+            allocator.free(rule.pattern);
+            switch (rule.action) {
+                .rewrite => |rw| allocator.free(rw.replacement),
+                .returned => |ret| allocator.free(ret.body),
+            }
+        }
+        allocator.free(rules);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), rules.len);
+    try std.testing.expectEqual(http.rewrite.ConditionalVariable.request_uri, rules[0].variable);
+    try std.testing.expect(rules[0].case_insensitive);
+    switch (rules[0].action) {
+        .rewrite => |rw| try std.testing.expectEqual(http.rewrite.RewriteFlag.last, rw.flag),
+        else => return error.UnexpectedTestResult,
+    }
+    try std.testing.expectEqual(http.rewrite.ConditionalVariable.http_host, rules[1].variable);
+    switch (rules[1].action) {
+        .returned => |ret| try std.testing.expectEqual(@as(u16, 301), ret.status),
+        else => return error.UnexpectedTestResult,
+    }
+}
+
+test "parse location blocks csv" {
+    const allocator = std.testing.allocator;
+    const blocks = try parseLocationBlocks(
+        allocator,
+        "exact|/health|return|200|ok;prefix_priority|/api/private/|proxy_pass|http://127.0.0.1:9001;regex_case_insensitive|^/assets/.*$|static_root|/srv/www|on|on|index.html|$uri",
+    );
+    defer {
+        for (blocks) |*block| {
+            block.deinit(allocator);
+        }
+        allocator.free(blocks);
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), blocks.len);
+    try std.testing.expectEqual(http.location_router.MatchType.exact, blocks[0].match_type);
+    try std.testing.expectEqual(@as(usize, 1), blocks[1].priority);
+    switch (blocks[0].action) {
+        .return_response => |response| try std.testing.expectEqual(@as(u16, 200), response.status),
+        else => return error.UnexpectedTestResult,
+    }
+    switch (blocks[2].action) {
+        .static_root => |root| {
+            try std.testing.expect(root.alias);
+            try std.testing.expect(root.autoindex);
+            try std.testing.expectEqualStrings("index.html", root.index);
+        },
+        else => return error.UnexpectedTestResult,
+    }
+}
+
+test "apply location error pages csv" {
+    const allocator = std.testing.allocator;
+    const blocks = try parseLocationBlocks(
+        allocator,
+        "prefix|/|static_root|/srv/www|off|off|index.html|;exact|/health|return|200|ok",
+    );
+    defer {
+        for (blocks) |*block| block.deinit(allocator);
+        allocator.free(blocks);
+    }
+
+    try applyLocationErrorPages(allocator, blocks, "prefix|/|404|/errors/404.html;prefix|/|500,502,503,504|https://example.com/50x");
+
+    try std.testing.expectEqual(@as(usize, 2), blocks[0].error_pages.len);
+    try std.testing.expectEqual(@as(u16, 404), blocks[0].error_pages[0].status_codes[0]);
+    try std.testing.expectEqualStrings("/errors/404.html", blocks[0].error_pages[0].target);
+    try std.testing.expectEqual(@as(usize, 4), blocks[0].error_pages[1].status_codes.len);
+    try std.testing.expectEqualStrings("https://example.com/50x", blocks[0].error_pages[1].target);
+}
+
 test "parse internal redirect rules csv" {
     const allocator = std.testing.allocator;
     const rules = try parseInternalRedirectRules(allocator, "GET|^/a$|/b;*|^/x$|@named");
@@ -1588,7 +2534,7 @@ test "parse internal redirect rules csv" {
 
 test "parse named locations csv" {
     const allocator = std.testing.allocator;
-    const entries = try parseNamedLocations(allocator, "admin|/v1/chat;metrics|/metrics");
+    const entries = try parseNamedLocations(allocator, "admin|/api/messages;metrics|/status/metrics");
     defer {
         for (entries) |entry| {
             allocator.free(entry.name);
@@ -1602,7 +2548,7 @@ test "parse named locations csv" {
 
 test "parse mirror rules csv" {
     const allocator = std.testing.allocator;
-    const rules = try parseMirrorRules(allocator, "POST|^/v1/chat$|http://127.0.0.1:9000/mirror");
+    const rules = try parseMirrorRules(allocator, "POST|^/api/messages$|http://127.0.0.1:9000/mirror");
     defer {
         for (rules) |rule| {
             allocator.free(rule.method);
@@ -1624,4 +2570,22 @@ test "parse server names" {
     }
     try std.testing.expectEqual(@as(usize, 3), names.len);
     try std.testing.expectEqualStrings("*.example.org", names[1]);
+}
+
+test "parse fastcgi params" {
+    const allocator = std.testing.allocator;
+    const params = try parseFastcgiParams(allocator, "APP_ENV=prod|APP_ROLE=api");
+    defer {
+        for (params) |pair| {
+            allocator.free(pair.name);
+            allocator.free(pair.value);
+        }
+        allocator.free(params);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), params.len);
+    try std.testing.expectEqualStrings("APP_ENV", params[0].name);
+    try std.testing.expectEqualStrings("prod", params[0].value);
+    try std.testing.expectEqualStrings("APP_ROLE", params[1].name);
+    try std.testing.expectEqualStrings("api", params[1].value);
 }

@@ -1,47 +1,38 @@
 # Feature: Custom Error Pages
 
-Overview
+Status: done
 
-Add support for custom error pages for common HTTP error responses (400, 401, 403, 404, 500, 502, 503, 504). The server should allow serving user-provided HTML files for each status code and fall back to a built-in short response if no custom page exists.
+## Scope
 
-Scope
+- Implement Upgrade 8 custom error pages for location-backed static routes
+- Keep API routes on the existing JSON error envelope
+- Reuse the shared static-file module instead of adding a second file-serving path
 
-- Expose a configuration point (initially simple: look for files under `public/errors/` named `400.html`, `401.html`, etc.).
-- Update the response builder to prefer serving custom error pages when generating error responses.
-- Ensure Content-Type and Content-Length are set correctly for custom error pages.
-- Maintain existing behavior for non-HTML error responses and for requests that do not have an associated custom page.
+## What Changed
 
-Files to modify
+- Extended the location runtime model in `src/http/location_router.zig` with per-location `error_page` rules
+- Extended `src/http/config_file.zig` to parse:
+  - `error_page 404 /errors/404.html`
+  - `error_page 500 502 503 504 /50x.html`
+  - `error_page 404 https://example.com/missing`
+- Added parallel serialized config wiring through:
+  - `TARDIGRADE_LOCATION_ERROR_PAGES`
+  - `src/edge_config.zig` runtime parsing/apply logic
+- Updated the shared static handlers in `src/edge_gateway.zig` so:
+  - non-API requests with explicit HTML-style `Accept` headers can resolve configured custom error pages
+  - local error-page targets are served via `src/http/static_file.zig`
+  - absolute URI targets return `302 Found` redirects
+  - `/v1/...` routes keep their JSON error envelopes regardless of `error_page`
 
-- `src/http/response.zig` — add helpers to load and send custom error pages
-- `src/main.zig` — small wiring if necessary for config path
-- `public/errors/` — sample example files for testing (added under `public/errors/` in the repo)
+## Tests
 
-Testing plan
+- Added config parser coverage in `src/http/config_file.zig` for `error_page` serialization
+- Added runtime parsing coverage in `src/edge_config.zig` for applying location error-page rules
+- Added integration coverage in `tests/integration.zig` for:
+  - static 404 returning configured HTML error page with status 404
+  - API 404 still returning JSON even when `error_page` is configured on `/`
 
-- Unit tests for `response` helper to ensure it returns correct `Content-Type` and `Content-Length` when a custom page exists and when it doesn't.
-- Integration test: start server, curl `/nonexistent` and assert `404` body matches `public/errors/404.html` when present.
-- Manual testing instructions included in this doc.
+## Notes
 
-Acceptance criteria
-
-- Requests that trigger listed error statuses serve `public/errors/<status>.html` when that file exists.
-- If custom page is absent, server returns the existing short error response body and proper headers.
-- No panics or crashes when serving custom pages.
-
-Manual test commands
-
-```bash
-# start the server
-zig build run &
-# create a custom 404
-cat > public/errors/404.html <<'HTML'
-<html><body><h1>Custom 404</h1></body></html>
-HTML
-# verify
-curl -i http://localhost:8069/nonexistent
-```
-
-Notes
-
-This initial implementation will be file-based (static `public/errors/`). Future work can add configurable locations and templating.
+- Custom error pages are intentionally gated by explicit HTML-ish `Accept` headers.
+- This prevents internal readiness checks and API-style callers with no `Accept` header from being silently converted to HTML responses.

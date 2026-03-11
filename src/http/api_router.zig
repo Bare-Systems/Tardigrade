@@ -2,11 +2,11 @@ const std = @import("std");
 
 /// API version routing.
 ///
-/// Extracts the version number from paths like `/v1/chat`, `/v2/users`, etc.
+/// Extracts the version number from paths like `/v1/messages`, `/v2/users`, etc.
 /// and provides the remaining path segment for downstream routing.
 pub const VersionedRoute = struct {
     version: u16,
-    /// Path after the version prefix (e.g. "/chat" from "/v1/chat").
+    /// Path after the version prefix (e.g. "/messages" from "/v1/messages").
     path: []const u8,
 };
 
@@ -54,9 +54,9 @@ pub fn isSupportedVersion(version: u16) bool {
 // Tests
 
 test "parseVersionedPath extracts version and route" {
-    const route = parseVersionedPath("/v1/chat").?;
+    const route = parseVersionedPath("/v1/messages").?;
     try std.testing.expectEqual(@as(u16, 1), route.version);
-    try std.testing.expectEqualStrings("/chat", route.path);
+    try std.testing.expectEqualStrings("/messages", route.path);
 }
 
 test "parseVersionedPath handles multi-digit version" {
@@ -66,7 +66,7 @@ test "parseVersionedPath handles multi-digit version" {
 }
 
 test "parseVersionedPath returns null for non-versioned paths" {
-    try std.testing.expect(parseVersionedPath("/health") == null);
+    try std.testing.expect(parseVersionedPath("/status") == null);
     try std.testing.expect(parseVersionedPath("/api/chat") == null);
     try std.testing.expect(parseVersionedPath("/v/chat") == null); // no digits
     try std.testing.expect(parseVersionedPath("/v0/chat") == null); // v0 invalid
@@ -81,10 +81,10 @@ test "parseVersionedPath handles bare version" {
 }
 
 test "matchRoute checks version and path" {
-    try std.testing.expect(matchRoute("/v1/chat", 1, "/chat"));
-    try std.testing.expect(!matchRoute("/v2/chat", 1, "/chat"));
-    try std.testing.expect(!matchRoute("/v1/users", 1, "/chat"));
-    try std.testing.expect(!matchRoute("/health", 1, "/health"));
+    try std.testing.expect(matchRoute("/v1/messages", 1, "/messages"));
+    try std.testing.expect(!matchRoute("/v2/messages", 1, "/messages"));
+    try std.testing.expect(!matchRoute("/v1/users", 1, "/messages"));
+    try std.testing.expect(!matchRoute("/status", 1, "/status"));
 }
 
 test "isSupportedVersion checks allowlist" {

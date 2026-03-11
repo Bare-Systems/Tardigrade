@@ -1,4 +1,3 @@
-
 <h1 align="center">Tardigrade</h1>
 
 <p align="center">

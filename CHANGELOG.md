@@ -114,6 +114,7 @@
   - Started Upgrade 10.2 virtual hosts by parsing `server { ... }` blocks from config files, selecting per-host server-block overlays from the incoming `Host` header on both HTTP/1 and HTTP/3 dispatch paths, honoring a default server block for unmatched hosts, mapping server-block TLS cert/key pairs into the listener's default and SNI cert configuration, and adding integration coverage for both multi-host routing and config-driven SNI certificate selection.
   - Added the remaining Upgrade 10.3 validation and reload regression coverage with a missing-TLS-cert validation test and an integration test proving invalid SIGHUP reloads are rejected without disrupting in-flight requests.
   - Started Upgrade 11.0 mail proxying by adding `smtp_pass` config parsing and a real raw-TCP SMTP relay integration test that proves `EHLO` and `DATA` are forwarded to a loopback upstream and the upstream SMTP reply is returned to the client.
+  - Extended Upgrade 11.0 SMTP proxying with explicit `starttls://` / `tls://` upstream schemes, gateway-managed STARTTLS negotiation, validation for secure mail upstream endpoints, and integration coverage that proves the relay upgrades before forwarding the SMTP payload.
 
 ### Fixed
 - Upgrade 1 integration hardening in the live gateway path:

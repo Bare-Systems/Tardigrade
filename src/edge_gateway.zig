@@ -5603,7 +5603,7 @@ fn handleBackendProtocolTail(
     }
 
     if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/mail/smtp")) {
-        try handleMailProxyRoute(allocator, writer, cfg.smtp_upstream, request.body orelse "", correlation_id, keep_alive, state);
+        try handleSmtpProxyRoute(allocator, writer, cfg.smtp_upstream, request.body orelse "", correlation_id, keep_alive, state);
         return 200;
     }
     if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/mail/imap")) {
@@ -7012,10 +7012,68 @@ fn handleMailProxyRoute(
     state.metricsRecord(200);
 }
 
+const MailProxyTransport = enum {
+    starttls,
+    tls,
+};
+
+const MailProxyEndpoint = struct {
+    transport: MailProxyTransport,
+    host: []const u8,
+    port: u16,
+};
+
+fn handleSmtpProxyRoute(
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    upstream: []const u8,
+    body: []const u8,
+    correlation_id: []const u8,
+    keep_alive: bool,
+    state: *GatewayState,
+) !void {
+    const endpoint = std.mem.trim(u8, upstream, " \t\r\n");
+    if (endpoint.len == 0) {
+        try sendApiError(allocator, writer, .not_implemented, "tool_unavailable", "Upstream not configured", correlation_id, keep_alive, state);
+        return;
+    }
+    const resp = blk: {
+        const maybe_mail_endpoint = parseMailProxyEndpoint(endpoint) catch |err| {
+            std.log.warn("smtp proxy endpoint invalid: {}", .{err});
+            try sendApiError(allocator, writer, .bad_gateway, "tool_unavailable", "Upstream request failed", correlation_id, keep_alive, state);
+            return;
+        };
+        if (maybe_mail_endpoint) |mail_endpoint| {
+            break :blk executeSmtpProtocolRequest(allocator, mail_endpoint, body) catch |err| {
+                std.log.warn("smtp proxy failed: {}", .{err});
+                try sendApiError(allocator, writer, .bad_gateway, "tool_unavailable", "Upstream request failed", correlation_id, keep_alive, state);
+                return;
+            };
+        }
+        break :blk executeRawProtocolRequest(allocator, endpoint, body) catch |err| {
+            std.log.warn("smtp proxy failed: {}", .{err});
+            try sendApiError(allocator, writer, .bad_gateway, "tool_unavailable", "Upstream request failed", correlation_id, keep_alive, state);
+            return;
+        };
+    };
+    defer allocator.free(resp);
+    var response = http.Response.init(allocator);
+    defer response.deinit();
+    _ = response.setStatus(.ok)
+        .setBody(resp)
+        .setContentType("application/octet-stream")
+        .setConnection(keep_alive)
+        .setHeader(http.correlation.HEADER_NAME, correlation_id);
+    applyResponseHeaders(state, &response);
+    try response.write(writer);
+    state.metricsRecord(200);
+}
+
 fn executeRawProtocolRequest(allocator: std.mem.Allocator, endpoint: []const u8, payload: []const u8) ![]u8 {
     const ep = try http.memcached.parseEndpoint(endpoint);
     const stream = try std.net.tcpConnectToHost(allocator, ep.host, ep.port);
     defer stream.close();
+    try setSocketTimeoutMs(stream.handle, 2_000, 2_000);
     try stream.writer().writeAll(payload);
     var out = std.ArrayList(u8).init(allocator);
     errdefer out.deinit();
@@ -7023,6 +7081,181 @@ fn executeRawProtocolRequest(allocator: std.mem.Allocator, endpoint: []const u8,
     const n = try stream.read(&buf);
     if (n > 0) try out.appendSlice(buf[0..n]);
     return out.toOwnedSlice();
+}
+
+fn parseMailProxyEndpoint(raw: []const u8) !?MailProxyEndpoint {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    var transport: MailProxyTransport = undefined;
+    var endpoint = trimmed;
+    if (std.mem.startsWith(u8, endpoint, "starttls://")) {
+        transport = .starttls;
+        endpoint = endpoint["starttls://".len..];
+    } else if (std.mem.startsWith(u8, endpoint, "smtp+starttls://")) {
+        transport = .starttls;
+        endpoint = endpoint["smtp+starttls://".len..];
+    } else if (std.mem.startsWith(u8, endpoint, "tls://")) {
+        transport = .tls;
+        endpoint = endpoint["tls://".len..];
+    } else if (std.mem.startsWith(u8, endpoint, "smtps://")) {
+        transport = .tls;
+        endpoint = endpoint["smtps://".len..];
+    } else {
+        return null;
+    }
+    const parsed = http.memcached.parseEndpoint(endpoint) catch |err| switch (err) {
+        error.InvalidEndpoint => return error.InvalidConfigEndpoint,
+        else => return err,
+    };
+    if (parsed.host.len == 0 or parsed.port == 0) return error.InvalidConfigEndpoint;
+    return .{
+        .transport = transport,
+        .host = parsed.host,
+        .port = parsed.port,
+    };
+}
+
+fn executeSmtpProtocolRequest(allocator: std.mem.Allocator, endpoint: MailProxyEndpoint, payload: []const u8) ![]u8 {
+    const stream = try std.net.tcpConnectToHost(allocator, endpoint.host, endpoint.port);
+    defer stream.close();
+    try setSocketTimeoutMs(stream.handle, 10_000, 10_000);
+    return switch (endpoint.transport) {
+        .tls => executeSmtpTlsRequest(allocator, stream, endpoint.host, payload),
+        .starttls => executeSmtpStartTlsRequest(allocator, stream, endpoint.host, payload),
+    };
+}
+
+fn executeSmtpTlsRequest(
+    allocator: std.mem.Allocator,
+    stream: std.net.Stream,
+    host: []const u8,
+    payload: []const u8,
+) ![]u8 {
+    _ = host;
+    var tls_client = try std.crypto.tls.Client.init(stream, .{
+        .host = .no_verification,
+        .ca = .no_verification,
+    });
+    tls_client.allow_truncation_attacks = true;
+    try tls_client.writeAll(stream, payload);
+    return readSmtpReplyTls(allocator, &tls_client, stream);
+}
+
+fn executeSmtpStartTlsRequest(
+    allocator: std.mem.Allocator,
+    stream: std.net.Stream,
+    host: []const u8,
+    payload: []const u8,
+) ![]u8 {
+    _ = host;
+    std.log.warn("smtp starttls stage=greeting_read", .{});
+    const greeting = try readSmtpReplyPlain(allocator, stream);
+    defer allocator.free(greeting);
+    std.log.warn("smtp starttls stage=greeting_ok", .{});
+    if (!smtpReplyContainsCode(greeting, "220")) return error.ProtocolError;
+
+    try stream.writer().writeAll("EHLO tardigrade.local\r\n");
+    std.log.warn("smtp starttls stage=ehlo_sent", .{});
+    const ehlo_reply = try readSmtpReplyPlain(allocator, stream);
+    defer allocator.free(ehlo_reply);
+    std.log.warn("smtp starttls stage=ehlo_reply_ok", .{});
+    if (!smtpReplyAdvertisesStartTls(ehlo_reply)) return error.ProtocolError;
+
+    try stream.writer().writeAll("STARTTLS\r\n");
+    std.log.warn("smtp starttls stage=starttls_sent", .{});
+    const starttls_reply = try readSmtpReplyPlain(allocator, stream);
+    defer allocator.free(starttls_reply);
+    std.log.warn("smtp starttls stage=starttls_reply_ok", .{});
+    if (!smtpReplyContainsCode(starttls_reply, "220")) return error.ProtocolError;
+
+    var tls_client = try std.crypto.tls.Client.init(stream, .{
+        .host = .no_verification,
+        .ca = .no_verification,
+    });
+    tls_client.allow_truncation_attacks = true;
+    std.log.warn("smtp starttls stage=tls_client_ready", .{});
+
+    try tls_client.writeAll(stream, "EHLO tardigrade.local\r\n");
+    std.log.warn("smtp starttls stage=post_tls_ehlo_sent", .{});
+    const post_tls_ehlo = try readSmtpReplyTls(allocator, &tls_client, stream);
+    defer allocator.free(post_tls_ehlo);
+    std.log.warn("smtp starttls stage=post_tls_ehlo_ok", .{});
+    if (!smtpReplyContainsCode(post_tls_ehlo, "250")) return error.ProtocolError;
+
+    try tls_client.writeAll(stream, payload);
+    std.log.warn("smtp starttls stage=payload_sent", .{});
+    return readSmtpReplyTls(allocator, &tls_client, stream);
+}
+
+fn readSmtpReplyPlain(allocator: std.mem.Allocator, stream: std.net.Stream) ![]u8 {
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    var buf: [2048]u8 = undefined;
+    while (true) {
+        const n = try stream.read(&buf);
+        if (n == 0) break;
+        try out.appendSlice(buf[0..n]);
+        if (smtpReplyComplete(out.items)) break;
+    }
+    if (out.items.len == 0) return error.EndOfStream;
+    return out.toOwnedSlice();
+}
+
+fn readSmtpReplyTls(allocator: std.mem.Allocator, tls_client: *std.crypto.tls.Client, stream: std.net.Stream) ![]u8 {
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    var buf: [2048]u8 = undefined;
+    while (true) {
+        const n = try tls_client.read(stream, &buf);
+        if (n == 0) break;
+        try out.appendSlice(buf[0..n]);
+        if (smtpReplyComplete(out.items)) break;
+    }
+    if (out.items.len == 0) return error.EndOfStream;
+    return out.toOwnedSlice();
+}
+
+fn smtpReplyComplete(reply: []const u8) bool {
+    var idx: usize = 0;
+    var multiline_code: ?[]const u8 = null;
+    var saw_terminal = false;
+    while (idx < reply.len) {
+        const line_end = std.mem.indexOfPos(u8, reply, idx, "\r\n") orelse return false;
+        const line = reply[idx..line_end];
+        if (line.len >= 4 and std.ascii.isDigit(line[0]) and std.ascii.isDigit(line[1]) and std.ascii.isDigit(line[2])) {
+            if (line[3] == '-') {
+                multiline_code = line[0..3];
+            } else if (line[3] == ' ') {
+                if (multiline_code) |code| {
+                    if (std.mem.eql(u8, code, line[0..3])) {
+                        saw_terminal = true;
+                        multiline_code = null;
+                    }
+                } else {
+                    saw_terminal = true;
+                }
+            }
+        }
+        idx = line_end + 2;
+    }
+    return saw_terminal and idx == reply.len;
+}
+
+fn smtpReplyContainsCode(reply: []const u8, code: []const u8) bool {
+    var it = std.mem.splitSequence(u8, reply, "\r\n");
+    while (it.next()) |line| {
+        if (line.len >= 3 and std.mem.eql(u8, line[0..3], code)) return true;
+    }
+    return false;
+}
+
+fn smtpReplyAdvertisesStartTls(reply: []const u8) bool {
+    var it = std.mem.splitSequence(u8, reply, "\r\n");
+    while (it.next()) |line| {
+        if (line.len < 4 or !std.mem.eql(u8, line[0..3], "250")) continue;
+        const feature = std.mem.trim(u8, line[4..], " \t\r\n");
+        if (std.ascii.eqlIgnoreCase(feature, "STARTTLS")) return true;
+    }
+    return false;
 }
 
 fn executeUdpDatagramRequest(allocator: std.mem.Allocator, endpoint: []const u8, payload: []const u8) ![]u8 {

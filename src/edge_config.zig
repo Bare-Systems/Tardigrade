@@ -2235,7 +2235,7 @@ fn validateOptionalSocketEndpoint(raw: []const u8, label: []const u8) !void {
     validateOptionalSocketEndpointChecked(raw) catch |err| {
         switch (err) {
             error.InvalidConfigPort => std.log.err("config validation failed: {s} port must be between 1 and 65535: {s}", .{ label, raw }),
-            else => std.log.err("config validation failed: {s} must be host:port or unix:/path: {s}", .{ label, raw }),
+            else => std.log.err("config validation failed: {s} must be host:port, unix:/path, starttls://host:port, or tls://host:port: {s}", .{ label, raw }),
         }
         return err;
     };
@@ -2283,10 +2283,20 @@ fn validateOptionalSocketEndpointChecked(raw: []const u8) !void {
         try validateUnixEndpointChecked(raw);
         return;
     }
-    if (std.mem.indexOfScalar(u8, raw, ':') == null) {
+    const normalized = if (std.mem.startsWith(u8, raw, "starttls://"))
+        raw["starttls://".len..]
+    else if (std.mem.startsWith(u8, raw, "smtp+starttls://"))
+        raw["smtp+starttls://".len..]
+    else if (std.mem.startsWith(u8, raw, "tls://"))
+        raw["tls://".len..]
+    else if (std.mem.startsWith(u8, raw, "smtps://"))
+        raw["smtps://".len..]
+    else
+        raw;
+    if (std.mem.indexOfScalar(u8, normalized, ':') == null) {
         return error.InvalidConfigEndpoint;
     }
-    const parts = splitHostPort(raw) orelse return error.InvalidConfigEndpoint;
+    const parts = splitHostPort(normalized) orelse return error.InvalidConfigEndpoint;
     if (parts[0].len == 0) {
         return error.InvalidConfigEndpoint;
     }
@@ -2381,9 +2391,11 @@ test "validate absolute upstream URL accepts http and rejects malformed input" {
     try std.testing.expectError(error.InvalidConfigUrl, validateOptionalAbsoluteUrlChecked("http://"));
 }
 
-test "validate socket endpoint accepts host port and unix path" {
+test "validate socket endpoint accepts host port, unix path, and tls schemes" {
     try validateOptionalSocketEndpointChecked("127.0.0.1:9000");
     try validateOptionalSocketEndpointChecked("unix:/tmp/php-fpm.sock");
+    try validateOptionalSocketEndpointChecked("starttls://127.0.0.1:587");
+    try validateOptionalSocketEndpointChecked("tls://127.0.0.1:465");
     try std.testing.expectError(error.InvalidConfigEndpoint, validateOptionalSocketEndpointChecked("missing-port"));
     try std.testing.expectError(error.InvalidConfigPort, validateOptionalSocketEndpointChecked("127.0.0.1:0"));
 }

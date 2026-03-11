@@ -530,6 +530,153 @@ const RawTcpServer = struct {
     }
 };
 
+const StartTlsSmtpProcess = struct {
+    allocator: std.mem.Allocator,
+    child: std.process.Child,
+    port: u16,
+    dir_rel: []u8,
+    script_path: []u8,
+    plain_capture_path: []u8,
+    tls_capture_path: []u8,
+    debug_log_path: []u8,
+
+    fn start(allocator: std.mem.Allocator) !StartTlsSmtpProcess {
+        const port = try findFreePort();
+        const unique = std.time.milliTimestamp();
+        const dir_rel = try std.fmt.allocPrint(allocator, ".zig-cache/starttls-smtp-{d}-{d}", .{ port, unique });
+        errdefer allocator.free(dir_rel);
+        try std.fs.cwd().makePath(dir_rel);
+
+        const cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+        defer allocator.free(cwd);
+        const dir_abs = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ cwd, dir_rel });
+        defer allocator.free(dir_abs);
+
+        const script_path = try std.fmt.allocPrint(allocator, "{s}/server.py", .{dir_abs});
+        errdefer allocator.free(script_path);
+        const plain_capture_path = try std.fmt.allocPrint(allocator, "{s}/plain.txt", .{dir_abs});
+        errdefer allocator.free(plain_capture_path);
+        const tls_capture_path = try std.fmt.allocPrint(allocator, "{s}/tls.txt", .{dir_abs});
+        errdefer allocator.free(tls_capture_path);
+        const debug_log_path = try std.fmt.allocPrint(allocator, "{s}/debug.log", .{dir_abs});
+        errdefer allocator.free(debug_log_path);
+        const cert_path = try std.fmt.allocPrint(allocator, "{s}/tests/fixtures/tls/server.crt", .{cwd});
+        defer allocator.free(cert_path);
+        const key_path = try std.fmt.allocPrint(allocator, "{s}/tests/fixtures/tls/server.key", .{cwd});
+        defer allocator.free(key_path);
+
+        const script = try std.fmt.allocPrint(allocator,
+            \\import socket, ssl
+            \\HOST = "127.0.0.1"
+            \\PORT = {d}
+            \\PLAIN = r"""{s}"""
+            \\TLS = r"""{s}"""
+            \\DEBUG = r"""{s}"""
+            \\CERT = r"""{s}"""
+            \\KEY = r"""{s}"""
+            \\def log(msg):
+            \\    with open(DEBUG, "a") as f:
+            \\        f.write(msg + "\\n")
+            \\listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            \\listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            \\listener.bind((HOST, PORT))
+            \\listener.listen(1)
+            \\print("READY", flush=True)
+            \\log("ready")
+            \\conn, _ = listener.accept()
+            \\log("accepted")
+            \\conn.sendall(b"220 starttls.integration.test ESMTP\\r\\n")
+            \\log("greeting_sent")
+            \\plain = conn.recv(4096)
+            \\log("plain_recv_1")
+            \\with open(PLAIN, "ab") as f:
+            \\    f.write(plain)
+            \\conn.sendall(b"250-starttls.integration.test\\r\\n250-STARTTLS\\r\\n250 OK\\r\\n")
+            \\log("ehlo_reply_sent")
+            \\starttls = conn.recv(4096)
+            \\log("plain_recv_2")
+            \\with open(PLAIN, "ab") as f:
+            \\    f.write(starttls)
+            \\conn.sendall(b"220 Ready to start TLS\\r\\n")
+            \\log("starttls_reply_sent")
+            \\ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            \\ctx.load_cert_chain(CERT, KEY)
+            \\tls_conn = ctx.wrap_socket(conn, server_side=True)
+            \\log("tls_wrapped")
+            \\post_tls_ehlo = tls_conn.recv(4096)
+            \\log("tls_recv_1")
+            \\with open(TLS, "ab") as f:
+            \\    f.write(post_tls_ehlo)
+            \\tls_conn.sendall(b"250-starttls.integration.test\\r\\n250 AUTH PLAIN\\r\\n")
+            \\log("post_tls_reply_sent")
+            \\payload = tls_conn.recv(4096)
+            \\log("tls_recv_2")
+            \\with open(TLS, "ab") as f:
+            \\    f.write(payload)
+            \\tls_conn.sendall(b"250 queued over tls\\r\\n")
+            \\log("payload_reply_sent")
+            \\tls_conn.close()
+            \\listener.close()
+        , .{ port, plain_capture_path, tls_capture_path, debug_log_path, cert_path, key_path });
+        defer allocator.free(script);
+        {
+            var file = try std.fs.createFileAbsolute(script_path, .{});
+            defer file.close();
+            try file.writeAll(script);
+        }
+
+        var argv = [_][]const u8{ "python3", script_path };
+        var child = std.process.Child.init(&argv, allocator);
+        child.stdin_behavior = .Ignore;
+        child.stdout_behavior = .Pipe;
+        child.stderr_behavior = .Ignore;
+        try child.spawn();
+
+        var proc = StartTlsSmtpProcess{
+            .allocator = allocator,
+            .child = child,
+            .port = port,
+            .dir_rel = dir_rel,
+            .script_path = script_path,
+            .plain_capture_path = plain_capture_path,
+            .tls_capture_path = tls_capture_path,
+            .debug_log_path = debug_log_path,
+        };
+        errdefer proc.stop();
+        try waitUntilChildReady(&proc.child);
+        return proc;
+    }
+
+    fn stop(self: *StartTlsSmtpProcess) void {
+        _ = self.child.kill() catch {};
+        _ = self.child.wait() catch {};
+        // Keep the temp tree on disk until the SMTP STARTTLS integration path is stable.
+        self.allocator.free(self.dir_rel);
+        self.allocator.free(self.script_path);
+        self.allocator.free(self.plain_capture_path);
+        self.allocator.free(self.tls_capture_path);
+        self.allocator.free(self.debug_log_path);
+        self.* = undefined;
+    }
+
+    fn getPort(self: *const StartTlsSmtpProcess) u16 {
+        return self.port;
+    }
+
+    fn plainCapture(self: *StartTlsSmtpProcess) ![]u8 {
+        var file = try std.fs.openFileAbsolute(self.plain_capture_path, .{});
+        defer file.close();
+        return try file.readToEndAlloc(self.allocator, 1024 * 1024);
+    }
+
+    fn tlsCapture(self: *StartTlsSmtpProcess) ![]u8 {
+        var file = try std.fs.openFileAbsolute(self.tls_capture_path, .{});
+        defer file.close();
+        return try file.readToEndAlloc(self.allocator, 1024 * 1024);
+    }
+};
+
+
 const TardigradeProcess = struct {
     allocator: std.mem.Allocator,
     child: std.process.Child,
@@ -746,6 +893,14 @@ fn waitUntilUnixSocketReady(socket_path: []const u8, log_path: []const u8) !void
     }
     _ = log_path;
     return error.Timeout;
+}
+
+fn waitUntilChildReady(child: *std.process.Child) !void {
+    const stdout = child.stdout orelse return error.Unexpected;
+    var buf: [64]u8 = undefined;
+    const n = try stdout.read(&buf);
+    if (n == 0) return error.EndOfStream;
+    if (std.mem.indexOf(u8, buf[0..n], "READY") == null) return error.Unexpected;
 }
 
 const RawHttpMessage = struct {
@@ -4425,6 +4580,7 @@ test "smtp proxy integration relays raw smtp payload through configured smtp_pas
         .upstream_port = null,
         .auth_token_hashes = null,
         .config_text = config_text,
+        .extra_env = &.{.{ .name = "TARDIGRADE_WORKER_THREADS", .value = "4" }},
     });
     defer tardigrade.stop();
 
@@ -4451,6 +4607,65 @@ test "smtp proxy integration relays raw smtp payload through configured smtp_pas
     try assertContains(smtp.capture.raw, "EHLO integration.test");
     try assertContains(smtp.capture.raw, "DATA\r\n");
     try assertContains(smtp.capture.raw, "hello smtp");
+}
+
+test "smtp proxy integration upgrades upstream with STARTTLS when configured" {
+    const allocator = std.testing.allocator;
+
+    var smtp = try StartTlsSmtpProcess.start(allocator);
+    defer smtp.stop();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\smtp_pass starttls://{s}:{d};
+    , .{ test_host, smtp.getPort() });
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .upstream_port = null,
+        .auth_token_hashes = null,
+        .config_text = config_text,
+    });
+    defer tardigrade.stop();
+
+    const smtp_payload =
+        "MAIL FROM:<sender@example.test>\r\n" ++
+        "RCPT TO:<receiver@example.test>\r\n" ++
+        "DATA\r\n" ++
+        "Subject: integration\r\n\r\nhello starttls\r\n.\r\nQUIT\r\n";
+
+    var response: HttpResponse = undefined;
+    var have_response = false;
+    defer if (have_response) response.deinit();
+    var attempt: usize = 0;
+    while (attempt < 3) : (attempt += 1) {
+        if (have_response) {
+            response.deinit();
+            have_response = false;
+        }
+        response = try sendRequest(allocator, tardigrade.port, .{
+            .method = "POST",
+            .path = "/v1/mail/smtp",
+            .body = smtp_payload,
+            .headers = &.{},
+        });
+        have_response = true;
+        if (response.status_code == 200) break;
+        std.time.sleep(250 * std.time.ns_per_ms);
+    }
+
+    try std.testing.expectEqual(@as(u16, 200), response.status_code);
+    try assertContains(response.body, "250 queued over tls");
+
+    const plain_capture = try smtp.plainCapture();
+    defer allocator.free(plain_capture);
+    const tls_capture = try smtp.tlsCapture();
+    defer allocator.free(tls_capture);
+
+    try assertContains(plain_capture, "EHLO tardigrade.local");
+    try assertContains(plain_capture, "STARTTLS");
+    try assertContains(tls_capture, "EHLO tardigrade.local");
+    try assertContains(tls_capture, "MAIL FROM:<sender@example.test>");
+    try assertContains(tls_capture, "hello starttls");
 }
 
 test "tls graceful shutdown integration sends connection close on inflight response" {

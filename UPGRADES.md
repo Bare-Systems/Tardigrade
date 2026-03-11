@@ -479,7 +479,7 @@ implementation exists. This is a stub.
 ### 11.0 SMTP Proxy
 
 - [x] TCP stream relay for SMTP (port 25 / 587 / 465)
-- [ ] STARTTLS upgrade support
+- [x] STARTTLS upgrade support
 - [ ] Auth header injection for upstream relay
 - [x] `smtp_pass` config directive
 

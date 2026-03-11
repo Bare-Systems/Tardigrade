@@ -49,8 +49,12 @@ pub fn loadOverrides(allocator: std.mem.Allocator) !Overrides {
 
 const BlockContext = union(enum) {
     passthrough,
+    server: ServerBlockBuilder,
     location: LocationBlockBuilder,
 };
+
+const server_block_record_sep = "\x1e";
+const server_block_field_sep = "\x1f";
 
 const LocationBlockBuilder = struct {
     const ErrorPageBuilder = struct {
@@ -98,6 +102,32 @@ const LocationBlockBuilder = struct {
     }
 };
 
+const ServerBlockBuilder = struct {
+    server_names: ?[]u8 = null,
+    doc_root: ?[]u8 = null,
+    try_files: ?[]u8 = null,
+    tls_cert_path: ?[]u8 = null,
+    tls_key_path: ?[]u8 = null,
+    upstream_base_url: ?[]u8 = null,
+    proxy_pass_chat: ?[]u8 = null,
+    proxy_pass_commands_prefix: ?[]u8 = null,
+    location_entries: std.ArrayListUnmanaged([]u8) = .{},
+
+    fn deinit(self: *ServerBlockBuilder, allocator: std.mem.Allocator) void {
+        if (self.server_names) |value| allocator.free(value);
+        if (self.doc_root) |value| allocator.free(value);
+        if (self.try_files) |value| allocator.free(value);
+        if (self.tls_cert_path) |value| allocator.free(value);
+        if (self.tls_key_path) |value| allocator.free(value);
+        if (self.upstream_base_url) |value| allocator.free(value);
+        if (self.proxy_pass_chat) |value| allocator.free(value);
+        if (self.proxy_pass_commands_prefix) |value| allocator.free(value);
+        for (self.location_entries.items) |entry| allocator.free(entry);
+        self.location_entries.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
 fn parseFile(
     allocator: std.mem.Allocator,
     path: []const u8,
@@ -120,6 +150,7 @@ fn parseFile(
         for (blocks.items) |*block| {
             switch (block.*) {
                 .passthrough => {},
+                .server => |*builder| builder.deinit(allocator),
                 .location => |*builder| builder.deinit(allocator),
             }
         }
@@ -139,17 +170,35 @@ fn parseFile(
             const block = blocks.pop().?;
             switch (block) {
                 .passthrough => {},
+                .server => |builder| {
+                    var owned_builder = builder;
+                    defer owned_builder.deinit(allocator);
+                    try flushServerBlock(allocator, overrides, &owned_builder);
+                },
                 .location => |builder| {
                     var owned_builder = builder;
                     defer owned_builder.deinit(allocator);
-                    try flushLocationBlock(allocator, overrides, &owned_builder);
+                    if (blocks.items.len > 0) {
+                        switch (blocks.items[blocks.items.len - 1]) {
+                            .server => |*server_builder| {
+                                const entry = try buildLocationBlockEntry(allocator, &owned_builder);
+                                errdefer allocator.free(entry);
+                                try server_builder.location_entries.append(allocator, entry);
+                            },
+                            else => try flushLocationBlock(allocator, overrides, &owned_builder),
+                        }
+                    } else {
+                        try flushLocationBlock(allocator, overrides, &owned_builder);
+                    }
                 },
             }
             continue;
         }
         if (line[line.len - 1] == '{') {
             const header = std.mem.trimRight(u8, line[0 .. line.len - 1], " \t\r\n");
-            if (std.mem.startsWith(u8, header, "location")) {
+            if (std.ascii.eqlIgnoreCase(header, "server")) {
+                try blocks.append(.{ .server = .{} });
+            } else if (std.mem.startsWith(u8, header, "location")) {
                 const builder = try parseLocationHeader(allocator, normalized, header, line_no);
                 try blocks.append(.{ .location = builder });
             } else {
@@ -165,6 +214,7 @@ fn parseFile(
         if (blocks.items.len > 0) {
             switch (blocks.items[blocks.items.len - 1]) {
                 .passthrough => try parseStatement(allocator, normalized, stmt, overrides, vars, visited, line_no),
+                .server => |*builder| try parseServerStatement(allocator, normalized, stmt, builder, vars, line_no),
                 .location => |*builder| try parseLocationStatement(allocator, normalized, stmt, builder, vars, line_no),
             }
         } else {
@@ -286,6 +336,18 @@ fn parseStatement(
     }
     if (std.ascii.eqlIgnoreCase(directive, "uwsgi_pass")) {
         try putOverride(allocator, &overrides.map, "TARDIGRADE_UWSGI_UPSTREAM", trimmed_value);
+        return;
+    }
+    if (std.ascii.eqlIgnoreCase(directive, "smtp_pass")) {
+        try putOverride(allocator, &overrides.map, "TARDIGRADE_SMTP_UPSTREAM", trimmed_value);
+        return;
+    }
+    if (std.ascii.eqlIgnoreCase(directive, "imap_pass")) {
+        try putOverride(allocator, &overrides.map, "TARDIGRADE_IMAP_UPSTREAM", trimmed_value);
+        return;
+    }
+    if (std.ascii.eqlIgnoreCase(directive, "pop3_pass")) {
+        try putOverride(allocator, &overrides.map, "TARDIGRADE_POP3_UPSTREAM", trimmed_value);
         return;
     }
     if (std.ascii.eqlIgnoreCase(directive, "fastcgi_index")) {
@@ -453,6 +515,58 @@ fn parseStatement(
     const env_key = try normalizeDirectiveToEnv(allocator, directive);
     defer allocator.free(env_key);
     try putOverride(allocator, &overrides.map, env_key, value_interp);
+}
+
+fn parseServerStatement(
+    allocator: std.mem.Allocator,
+    file_path: []const u8,
+    stmt: []const u8,
+    builder: *ServerBlockBuilder,
+    vars: *std.StringHashMap([]const u8),
+    line_no: usize,
+) !void {
+    var it = std.mem.tokenizeAny(u8, stmt, " \t");
+    const directive = it.next() orelse return;
+    const value_raw = std.mem.trim(u8, it.rest(), " \t");
+    if (value_raw.len == 0) {
+        std.log.err("config syntax error at {s}:{d}: directive '{s}' missing value", .{ file_path, line_no, directive });
+        return error.InvalidConfigSyntax;
+    }
+    const value_interp = try interpolate(allocator, std.mem.trim(u8, value_raw, " \t\"'"), vars);
+    defer allocator.free(value_interp);
+
+    if (std.ascii.eqlIgnoreCase(directive, "server_name")) {
+        try replaceOptionalOwned(allocator, &builder.server_names, value_interp);
+        return;
+    }
+    if (std.ascii.eqlIgnoreCase(directive, "root")) {
+        try replaceOptionalOwned(allocator, &builder.doc_root, value_interp);
+        return;
+    }
+    if (std.ascii.eqlIgnoreCase(directive, "try_files")) {
+        try replaceOptionalOwned(allocator, &builder.try_files, value_interp);
+        return;
+    }
+    if (std.ascii.eqlIgnoreCase(directive, "tls_cert_path")) {
+        try replaceOptionalOwned(allocator, &builder.tls_cert_path, value_interp);
+        return;
+    }
+    if (std.ascii.eqlIgnoreCase(directive, "tls_key_path")) {
+        try replaceOptionalOwned(allocator, &builder.tls_key_path, value_interp);
+        return;
+    }
+    if (std.ascii.eqlIgnoreCase(directive, "upstream_base_url")) {
+        try replaceOptionalOwned(allocator, &builder.upstream_base_url, value_interp);
+        return;
+    }
+    if (std.ascii.eqlIgnoreCase(directive, "proxy_pass_chat")) {
+        try replaceOptionalOwned(allocator, &builder.proxy_pass_chat, value_interp);
+        return;
+    }
+    if (std.ascii.eqlIgnoreCase(directive, "proxy_pass_commands_prefix")) {
+        try replaceOptionalOwned(allocator, &builder.proxy_pass_commands_prefix, value_interp);
+        return;
+    }
 }
 
 fn putOverride(allocator: std.mem.Allocator, map: *std.StringHashMap([]const u8), key_raw: []const u8, value_raw: []const u8) !void {
@@ -635,7 +749,7 @@ fn parseLocationStatement(
     }
 }
 
-fn flushLocationBlock(allocator: std.mem.Allocator, overrides: *Overrides, builder: *LocationBlockBuilder) !void {
+fn buildLocationBlockEntry(allocator: std.mem.Allocator, builder: *LocationBlockBuilder) ![]u8 {
     const entry = if (builder.proxy_pass) |target|
         try std.fmt.allocPrint(allocator, "{s}|{s}|proxy_pass|{s}", .{ builder.match_type, builder.pattern, target })
     else if (builder.fastcgi_pass) |target|
@@ -668,9 +782,16 @@ fn flushLocationBlock(allocator: std.mem.Allocator, overrides: *Overrides, build
             builder.rewrite_flag orelse "last",
         })
     else
-        return;
-    defer allocator.free(entry);
+        return error.InvalidConfigSyntax;
+    return entry;
+}
 
+fn flushLocationBlock(allocator: std.mem.Allocator, overrides: *Overrides, builder: *LocationBlockBuilder) !void {
+    const entry = buildLocationBlockEntry(allocator, builder) catch |err| switch (err) {
+        error.InvalidConfigSyntax => return,
+        else => return err,
+    };
+    defer allocator.free(entry);
     try appendOverride(allocator, &overrides.map, "TARDIGRADE_LOCATION_BLOCKS", entry, ";");
 
     for (builder.error_pages.items) |rule| {
@@ -683,6 +804,40 @@ fn flushLocationBlock(allocator: std.mem.Allocator, overrides: *Overrides, build
         defer allocator.free(error_entry);
         try appendOverride(allocator, &overrides.map, "TARDIGRADE_LOCATION_ERROR_PAGES", error_entry, ";");
     }
+}
+
+fn flushServerBlock(allocator: std.mem.Allocator, overrides: *Overrides, builder: *ServerBlockBuilder) !void {
+    var location_blob = std.ArrayList(u8).init(allocator);
+    defer location_blob.deinit();
+    for (builder.location_entries.items, 0..) |entry, idx| {
+        if (idx != 0) try location_blob.append(';');
+        try location_blob.appendSlice(entry);
+    }
+    const record = try std.fmt.allocPrint(
+        allocator,
+        "{s}{s}{s}{s}{s}{s}{s}{s}{s}{s}{s}{s}{s}{s}{s}{s}{s}",
+        .{
+            builder.server_names orelse "",
+            server_block_field_sep,
+            builder.doc_root orelse "",
+            server_block_field_sep,
+            builder.try_files orelse "",
+            server_block_field_sep,
+            builder.tls_cert_path orelse "",
+            server_block_field_sep,
+            builder.tls_key_path orelse "",
+            server_block_field_sep,
+            builder.upstream_base_url orelse "",
+            server_block_field_sep,
+            builder.proxy_pass_chat orelse "",
+            server_block_field_sep,
+            builder.proxy_pass_commands_prefix orelse "",
+            server_block_field_sep,
+            location_blob.items,
+        },
+    );
+    defer allocator.free(record);
+    try appendOverride(allocator, &overrides.map, "TARDIGRADE_SERVER_BLOCKS", record, server_block_record_sep);
 }
 
 fn replaceOptionalOwned(allocator: std.mem.Allocator, target: *?[]u8, value: []const u8) !void {
@@ -1085,4 +1240,53 @@ test "location block supports error_page serialization" {
         "prefix|/|404|/errors/404.html;prefix|/|500,502,503,504|https://example.com/50x",
         overrides.map.get("TARDIGRADE_LOCATION_ERROR_PAGES").?,
     );
+}
+
+test "server block supports nested location serialization" {
+    const allocator = std.testing.allocator;
+    var cfg_dir = std.testing.tmpDir(.{});
+    defer cfg_dir.cleanup();
+
+    try cfg_dir.dir.writeFile(.{
+        .sub_path = "server-block.conf",
+        .data =
+        \\server {
+        \\    server_name api.example.test;
+        \\    root /srv/api;
+        \\    try_files $uri /index.html;
+        \\    tls_cert_path /certs/api.crt;
+        \\    tls_key_path /certs/api.key;
+        \\    location / {
+        \\        proxy_pass http://127.0.0.1:9101;
+        \\    }
+        \\}
+        ,
+    });
+
+    const absolute = try cfg_dir.dir.realpathAlloc(allocator, "server-block.conf");
+    defer allocator.free(absolute);
+
+    var overrides = Overrides.init(allocator);
+    defer overrides.deinit(allocator);
+    var vars = std.StringHashMap([]const u8).init(allocator);
+    defer vars.deinit();
+    var visited = std.StringHashMap(void).init(allocator);
+    defer {
+        var it = visited.iterator();
+        while (it.next()) |entry| allocator.free(entry.key_ptr.*);
+        visited.deinit();
+    }
+
+    try parseFile(allocator, absolute, &overrides, &vars, &visited);
+
+    const expected = "api.example.test" ++
+        server_block_field_sep ++ "/srv/api" ++
+        server_block_field_sep ++ "$uri /index.html" ++
+        server_block_field_sep ++ "/certs/api.crt" ++
+        server_block_field_sep ++ "/certs/api.key" ++
+        server_block_field_sep ++ "" ++
+        server_block_field_sep ++ "" ++
+        server_block_field_sep ++ "" ++
+        server_block_field_sep ++ "prefix|/|proxy_pass|http://127.0.0.1:9101";
+    try std.testing.expectEqualStrings(expected, overrides.map.get("TARDIGRADE_SERVER_BLOCKS").?);
 }

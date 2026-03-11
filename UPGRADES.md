@@ -403,11 +403,11 @@ stubs in a single function. This is a maintenance and correctness risk.
 - [x] Extract `handleWebSocketUpgrade(ctx)` — WebSocket handshake and proxy loop
 - [x] Extract `handleSseStream(ctx)` — SSE connection lifecycle
 - [ ] Extract `handleStaticFile(ctx, root)` — delegates to `serveStaticFile()`
-- [ ] `handleConnection()` becomes: parse request → run middleware → match location → route
+- [x] `handleConnection()` becomes: parse request → run middleware → match location → route
 
 ### 9.1 GatewayState Mutex Partitioning
 
-- [ ] Replace single `GatewayState.mutex` with per-subsystem locks:
+- [x] Replace single `GatewayState.mutex` with per-subsystem locks:
   - `rate_limiter_mutex` — guards `RateLimiter`
   - `session_mutex` — guards `SessionStore`
   - `metrics_mutex` — guards `Metrics`
@@ -418,16 +418,16 @@ stubs in a single function. This is a maintenance and correctness risk.
 
 ### 9.2 Per-Request Arena Allocator
 
-- [ ] Verify every code path through `handleConnection()` and its extracted functions
+- [x] Verify every code path through `handleConnection()` and its extracted functions
       frees all allocations on both success and error return
-- [ ] Use a single `ArenaAllocator` per request, freed unconditionally at connection handler exit
+- [x] Use a single `ArenaAllocator` per request, freed unconditionally at connection handler exit
 - [ ] Add compile-time check or Valgrind/ASAN run to confirm no leaks across request paths
 
 ### 9.3 Tests (regression guards before and after refactor)
 
-- [ ] All existing unit tests pass unchanged after refactor
-- [ ] All integration tests from UPGRADE 1 pass after refactor
-- [ ] No performance regression: benchmark `wrk` before and after at 1k req/s
+- [x] All existing unit tests pass unchanged after refactor
+- [x] All integration tests from UPGRADE 1 pass after refactor
+- [x] No performance regression: benchmark `wrk` before and after at 1k req/s
 
 ---
 
@@ -437,11 +437,11 @@ Priority: MEDIUM
 
 ### 10.0 Config Validation
 
-- [ ] On startup, validate all referenced file paths exist (cert, key, error page roots)
-- [ ] Validate upstream URLs are well-formed
-- [ ] Validate port numbers are in range
-- [ ] Validate that env var overrides do not conflict with file config (warn, don't crash)
-- [ ] On SIGHUP, validate new config before applying — roll back if invalid
+- [x] On startup, validate all referenced file paths exist (cert, key, error page roots)
+- [x] Validate upstream URLs are well-formed
+- [x] Validate port numbers are in range
+- [x] Validate that env var overrides do not conflict with file config (warn, don't crash)
+- [x] On SIGHUP, validate new config before applying — roll back if invalid
 
 ### 10.1 Log Rotation
 
@@ -452,20 +452,20 @@ Generation shifting (`error.log` → `error.log.1` → ...) and trim are tested.
 
 - [x] Max log file size + automatic rotation when size exceeded (configurable)
 - [x] Generation retention control (`TARDIGRADE_LOG_ROTATE_MAX_FILES`)
-- [ ] On `SIGUSR1`: close and reopen log file (standard log rotation signal for external rotators like logrotate)
+- [x] On `SIGUSR1`: close and reopen log file (standard log rotation signal for external rotators like logrotate)
 
 ### 10.2 Virtual Hosts (Server Blocks)
 
-- [ ] `server { server_name ...; ... }` blocks in config parsed by `config_file.zig`
-- [ ] On incoming connection, match `Host` header to correct `ServerBlock`
+- [x] `server { server_name ...; ... }` blocks in config parsed by `config_file.zig`
+- [x] On incoming connection, match `Host` header to correct `ServerBlock`
 - [ ] Each `ServerBlock` has its own location table, upstream pool, and TLS config
-- [ ] Default server block for unmatched hosts
+- [x] Default server block for unmatched hosts
 
 ### 10.3 Tests
 
-- [ ] Unit test: config with missing cert path fails validation with clear error
-- [ ] Integration test: SIGHUP with invalid config does not disrupt in-flight requests
-- [ ] Integration test: two virtual hosts on same port route to separate upstreams
+- [x] Unit test: config with missing cert path fails validation with clear error
+- [x] Integration test: SIGHUP with invalid config does not disrupt in-flight requests
+- [x] Integration test: two virtual hosts on same port route to separate upstreams
 
 ---
 
@@ -478,10 +478,10 @@ implementation exists. This is a stub.
 
 ### 11.0 SMTP Proxy
 
-- [ ] TCP stream relay for SMTP (port 25 / 587 / 465)
+- [x] TCP stream relay for SMTP (port 25 / 587 / 465)
 - [ ] STARTTLS upgrade support
 - [ ] Auth header injection for upstream relay
-- [ ] `smtp_pass` config directive
+- [x] `smtp_pass` config directive
 
 ### 11.1 IMAP Proxy
 
@@ -496,7 +496,7 @@ implementation exists. This is a stub.
 
 ### 11.3 Tests
 
-- [ ] Integration test: SMTP relay forwards EHLO and DATA through to test upstream
+- [x] Integration test: SMTP relay forwards EHLO and DATA through to test upstream
 - [ ] Integration test: IMAP LOGIN command is proxied and response returned to client
 
 ---

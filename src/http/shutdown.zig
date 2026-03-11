@@ -5,6 +5,7 @@ const std = @import("std");
 var shutdown_requested: bool = false;
 var reload_requested: bool = false;
 var upgrade_requested: bool = false;
+var reopen_logs_requested: bool = false;
 
 /// Returns whether a graceful shutdown has been requested.
 pub fn isShutdownRequested() bool {
@@ -40,14 +41,27 @@ pub fn consumeUpgradeRequested() bool {
     return @cmpxchgStrong(bool, &upgrade_requested, true, false, .seq_cst, .seq_cst) == null;
 }
 
+pub fn requestReopenLogs() void {
+    @atomicStore(bool, &reopen_logs_requested, true, .seq_cst);
+}
+
+pub fn isReopenLogsRequested() bool {
+    return @atomicLoad(bool, &reopen_logs_requested, .seq_cst);
+}
+
+pub fn consumeReopenLogsRequested() bool {
+    return @cmpxchgStrong(bool, &reopen_logs_requested, true, false, .seq_cst, .seq_cst) == null;
+}
+
 /// Reset the shutdown flag (for testing).
 pub fn reset() void {
     @atomicStore(bool, &shutdown_requested, false, .seq_cst);
     @atomicStore(bool, &reload_requested, false, .seq_cst);
     @atomicStore(bool, &upgrade_requested, false, .seq_cst);
+    @atomicStore(bool, &reopen_logs_requested, false, .seq_cst);
 }
 
-/// Install signal handlers for SIGTERM, SIGINT and SIGHUP.
+/// Install signal handlers for SIGTERM, SIGINT, SIGHUP, SIGUSR1 and SIGUSR2.
 /// On receipt, sets the shutdown flag so the accept loop exits cleanly.
 pub fn installSignalHandlers() void {
     const handler = std.posix.Sigaction{
@@ -59,12 +73,15 @@ pub fn installSignalHandlers() void {
     std.posix.sigaction(std.posix.SIG.TERM, &handler, null);
     std.posix.sigaction(std.posix.SIG.INT, &handler, null);
     std.posix.sigaction(std.posix.SIG.HUP, &handler, null);
+    std.posix.sigaction(std.posix.SIG.USR1, &handler, null);
     std.posix.sigaction(std.posix.SIG.USR2, &handler, null);
 }
 
 fn handleSignal(sig: c_int) callconv(.c) void {
     if (sig == std.posix.SIG.HUP) {
         @atomicStore(bool, &reload_requested, true, .seq_cst);
+    } else if (sig == std.posix.SIG.USR1) {
+        @atomicStore(bool, &reopen_logs_requested, true, .seq_cst);
     } else if (sig == std.posix.SIG.USR2) {
         @atomicStore(bool, &upgrade_requested, true, .seq_cst);
     } else {
@@ -100,6 +117,14 @@ test "requestUpgrade sets upgrade flag" {
     try std.testing.expect(isUpgradeRequested());
     try std.testing.expect(consumeUpgradeRequested());
     try std.testing.expect(!isUpgradeRequested());
+}
+
+test "requestReopenLogs sets reopen flag" {
+    reset();
+    requestReopenLogs();
+    try std.testing.expect(isReopenLogsRequested());
+    try std.testing.expect(consumeReopenLogsRequested());
+    try std.testing.expect(!isReopenLogsRequested());
 }
 
 test "reset clears the flag" {

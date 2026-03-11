@@ -173,7 +173,17 @@ const MuxChannel = struct {
 /// Persistent gateway state shared across connections.
 const GatewayState = struct {
     allocator: std.mem.Allocator,
-    mutex: std.Thread.Mutex = .{},
+    connection_mutex: std.Thread.Mutex = .{},
+    rate_limiter_mutex: std.Thread.Mutex = .{},
+    idempotency_mutex: std.Thread.Mutex = .{},
+    proxy_cache_mutex: std.Thread.Mutex = .{},
+    session_mutex: std.Thread.Mutex = .{},
+    command_mutex: std.Thread.Mutex = .{},
+    approval_mutex: std.Thread.Mutex = .{},
+    circuit_mutex: std.Thread.Mutex = .{},
+    metrics_mutex: std.Thread.Mutex = .{},
+    upstream_mutex: std.Thread.Mutex = .{},
+    runtime_mutex: std.Thread.Mutex = .{},
     rate_limiter: ?http.rate_limiter.RateLimiter,
     idempotency_store: ?http.idempotency.IdempotencyStore,
     proxy_cache_store: ?http.idempotency.IdempotencyStore,
@@ -277,15 +287,15 @@ const GatewayState = struct {
     }
 
     fn acquireFastcgiStream(self: *GatewayState, endpoint: []const u8) !struct { stream: std.net.Stream, reused: bool } {
-        self.mutex.lock();
+        self.connection_mutex.lock();
         if (self.fastcgi_pool.getPtr(endpoint)) |pool| {
             if (pool.items.len > 0) {
                 const stream = pool.pop().?;
-                self.mutex.unlock();
+                self.connection_mutex.unlock();
                 return .{ .stream = stream, .reused = true };
             }
         }
-        self.mutex.unlock();
+        self.connection_mutex.unlock();
         return .{ .stream = try http.fastcgi.connect(self.allocator, endpoint), .reused = false };
     }
 
@@ -296,8 +306,8 @@ const GatewayState = struct {
             return;
         }
 
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.connection_mutex.lock();
+        defer self.connection_mutex.unlock();
 
         if (self.fastcgi_pool.getPtr(endpoint)) |pool| {
             if (pool.items.len >= 4) {
@@ -335,8 +345,8 @@ const GatewayState = struct {
     }
 
     fn nextFastcgiRequestId(self: *GatewayState, endpoint: []const u8) u16 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.connection_mutex.lock();
+        defer self.connection_mutex.unlock();
 
         if (self.fastcgi_next_request_id.getPtr(endpoint)) |value| {
             const next = value.*;
@@ -353,17 +363,21 @@ const GatewayState = struct {
     }
 
     fn tryAcquireConnectionSlot(self: *GatewayState, fd: std.posix.fd_t, ip_key: []const u8) !ConnectionSlotResult {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.connection_mutex.lock();
+        defer self.connection_mutex.unlock();
 
         if (self.max_active_connections > 0 and self.active_connections_total >= self.max_active_connections) {
+            self.metrics_mutex.lock();
             self.metrics.recordConnectionRejection();
+            self.metrics_mutex.unlock();
             return .over_global_limit;
         }
         if (self.max_total_connection_memory_bytes > 0 and self.connection_memory_estimate_bytes > 0) {
             const projected: u128 = (@as(u128, self.active_connections_total) + 1) * @as(u128, self.connection_memory_estimate_bytes);
             if (projected > self.max_total_connection_memory_bytes) {
+                self.metrics_mutex.lock();
                 self.metrics.recordConnectionRejection();
+                self.metrics_mutex.unlock();
                 return .over_global_memory_limit;
             }
         }
@@ -372,7 +386,9 @@ const GatewayState = struct {
         if (self.max_connections_per_ip > 0) {
             const current = self.active_connections_by_ip.get(ip_key) orelse 0;
             if (current >= self.max_connections_per_ip) {
+                self.metrics_mutex.lock();
                 self.metrics.recordConnectionRejection();
+                self.metrics_mutex.unlock();
                 return .over_ip_limit;
             }
 
@@ -417,17 +433,21 @@ const GatewayState = struct {
             return err;
         };
         self.active_connections_total += 1;
+        self.metrics_mutex.lock();
         self.metrics.setActiveConnections(self.active_connections_total);
+        self.metrics_mutex.unlock();
         return .accepted;
     }
 
     fn releaseConnectionSlot(self: *GatewayState, fd: std.posix.fd_t) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.connection_mutex.lock();
+        defer self.connection_mutex.unlock();
 
         if (self.active_fds.fetchRemove(fd) != null and self.active_connections_total > 0) {
             self.active_connections_total -= 1;
+            self.metrics_mutex.lock();
             self.metrics.setActiveConnections(self.active_connections_total);
+            self.metrics_mutex.unlock();
         }
         if (self.max_connections_per_ip == 0) return;
 
@@ -446,8 +466,8 @@ const GatewayState = struct {
     }
 
     fn rateLimitAllow(self: *GatewayState, client_ip: []const u8) bool {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.rate_limiter_mutex.lock();
+        defer self.rate_limiter_mutex.unlock();
         if (self.rate_limiter) |*rl| {
             return rl.allow(client_ip) != null;
         }
@@ -455,8 +475,8 @@ const GatewayState = struct {
     }
 
     fn idempotencyGetCopy(self: *GatewayState, allocator: std.mem.Allocator, key: []const u8) !?http.idempotency.CachedResponse {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.idempotency_mutex.lock();
+        defer self.idempotency_mutex.unlock();
         if (self.idempotency_store) |*store| {
             if (store.get(key)) |cached| {
                 const body = try allocator.dupe(u8, cached.body);
@@ -474,24 +494,24 @@ const GatewayState = struct {
     }
 
     fn idempotencyPut(self: *GatewayState, key: []const u8, status: u16, body: []const u8, content_type: []const u8) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.idempotency_mutex.lock();
+        defer self.idempotency_mutex.unlock();
         if (self.idempotency_store) |*store| {
             try store.put(key, status, body, content_type);
         }
     }
 
     fn proxyCacheGetCopyWithStale(self: *GatewayState, allocator: std.mem.Allocator, key: []const u8, stale_seconds: u32) !?ProxyCacheLookup {
-        self.mutex.lock();
+        self.proxy_cache_mutex.lock();
         var locked = true;
-        defer if (locked) self.mutex.unlock();
+        defer if (locked) self.proxy_cache_mutex.unlock();
         if (self.proxy_cache_store) |*store| {
             if (store.getWithStale(key, stale_seconds)) |lookup| {
                 const body = try allocator.dupe(u8, lookup.response.body);
                 errdefer allocator.free(body);
                 const ct = try allocator.dupe(u8, lookup.response.content_type);
                 locked = false;
-                self.mutex.unlock();
+                self.proxy_cache_mutex.unlock();
                 return .{
                     .cached = .{
                         .status = lookup.response.status,
@@ -504,13 +524,13 @@ const GatewayState = struct {
             }
         }
         locked = false;
-        self.mutex.unlock();
+        self.proxy_cache_mutex.unlock();
 
         if (self.proxy_cache_path.len == 0) return null;
         const disk_lookup = try proxyCacheReadFromDisk(allocator, self.proxy_cache_path, key, self.proxy_cache_ttl_seconds, stale_seconds);
         if (disk_lookup) |found| {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.proxy_cache_mutex.lock();
+            defer self.proxy_cache_mutex.unlock();
             if (self.proxy_cache_store) |*store| {
                 store.put(key, found.cached.status, found.cached.body, found.cached.content_type) catch {};
             }
@@ -519,26 +539,26 @@ const GatewayState = struct {
     }
 
     fn proxyCachePut(self: *GatewayState, key: []const u8, status: u16, body: []const u8, content_type: []const u8) !void {
-        self.mutex.lock();
+        self.proxy_cache_mutex.lock();
         var locked = true;
-        defer if (locked) self.mutex.unlock();
+        defer if (locked) self.proxy_cache_mutex.unlock();
         if (self.proxy_cache_store) |*store| {
             try store.put(key, status, body, content_type);
         }
         locked = false;
-        self.mutex.unlock();
+        self.proxy_cache_mutex.unlock();
         if (self.proxy_cache_path.len > 0) {
             try proxyCacheWriteToDisk(self.proxy_cache_path, key, status, body, content_type);
         }
     }
 
     fn proxyCacheDelete(self: *GatewayState, key: []const u8) bool {
-        self.mutex.lock();
+        self.proxy_cache_mutex.lock();
         var removed = false;
         if (self.proxy_cache_store) |*store| {
             removed = store.delete(key);
         }
-        self.mutex.unlock();
+        self.proxy_cache_mutex.unlock();
         if (self.proxy_cache_path.len > 0) {
             removed = proxyCacheDeleteFromDisk(self.proxy_cache_path, key) or removed;
         }
@@ -546,12 +566,12 @@ const GatewayState = struct {
     }
 
     fn proxyCachePurgeAll(self: *GatewayState) usize {
-        self.mutex.lock();
+        self.proxy_cache_mutex.lock();
         var removed: usize = 0;
         if (self.proxy_cache_store) |*store| {
             removed += store.clear();
         }
-        self.mutex.unlock();
+        self.proxy_cache_mutex.unlock();
         if (self.proxy_cache_path.len > 0) {
             removed += proxyCachePurgeDisk(self.proxy_cache_path);
         }
@@ -559,8 +579,8 @@ const GatewayState = struct {
     }
 
     fn proxyCacheTryLock(self: *GatewayState, key: []const u8) !bool {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.proxy_cache_mutex.lock();
+        defer self.proxy_cache_mutex.unlock();
         if (self.proxy_cache_locks.contains(key)) return false;
         const owned = try self.allocator.dupe(u8, key);
         errdefer self.allocator.free(owned);
@@ -569,8 +589,8 @@ const GatewayState = struct {
     }
 
     fn proxyCacheUnlock(self: *GatewayState, key: []const u8) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.proxy_cache_mutex.lock();
+        defer self.proxy_cache_mutex.unlock();
         if (self.proxy_cache_locks.fetchRemove(key)) |removed| {
             self.allocator.free(removed.key);
         }
@@ -579,9 +599,9 @@ const GatewayState = struct {
     fn proxyCacheWaitForUnlock(self: *GatewayState, key: []const u8, timeout_ms: u32) bool {
         const deadline = http.event_loop.monotonicMs() + timeout_ms;
         while (http.event_loop.monotonicMs() < deadline) {
-            self.mutex.lock();
+            self.proxy_cache_mutex.lock();
             const locked = self.proxy_cache_locks.contains(key);
-            self.mutex.unlock();
+            self.proxy_cache_mutex.unlock();
             if (!locked) return true;
             std.time.sleep(10 * std.time.ns_per_ms);
         }
@@ -589,16 +609,16 @@ const GatewayState = struct {
     }
 
     fn createSession(self: *GatewayState, allocator: std.mem.Allocator, identity: []const u8, client_ip: []const u8, device_id: ?[]const u8) ![]const u8 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.session_mutex.lock();
+        defer self.session_mutex.unlock();
         if (self.session_store == null) return error.SessionsDisabled;
         const token = try self.session_store.?.create(identity, client_ip, device_id);
         return try allocator.dupe(u8, token);
     }
 
     fn validateSessionIdentity(self: *GatewayState, allocator: std.mem.Allocator, token: []const u8) ?[]const u8 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.session_mutex.lock();
+        defer self.session_mutex.unlock();
         if (self.session_store) |*ss| {
             if (ss.validate(token)) |session| {
                 return allocator.dupe(u8, session.identity) catch null;
@@ -608,15 +628,15 @@ const GatewayState = struct {
     }
 
     fn revokeSession(self: *GatewayState, token: []const u8) bool {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.session_mutex.lock();
+        defer self.session_mutex.unlock();
         if (self.session_store) |*ss| return ss.revoke(token);
         return false;
     }
 
     fn countSessionsByIdentity(self: *GatewayState, allocator: std.mem.Allocator, identity: []const u8) !usize {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.session_mutex.lock();
+        defer self.session_mutex.unlock();
         if (self.session_store == null) return error.SessionsDisabled;
         const sessions = try self.session_store.?.listByIdentity(allocator, identity);
         defer allocator.free(sessions);
@@ -624,8 +644,8 @@ const GatewayState = struct {
     }
 
     fn refreshSession(self: *GatewayState, allocator: std.mem.Allocator, token: []const u8, client_ip: []const u8) ![]const u8 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.session_mutex.lock();
+        defer self.session_mutex.unlock();
         if (self.session_store == null) return error.SessionsDisabled;
         const existing = self.session_store.?.validate(token) orelse return error.InvalidSession;
         const new_token = try self.session_store.?.create(existing.identity, client_ip, existing.device_id);
@@ -634,8 +654,8 @@ const GatewayState = struct {
     }
 
     fn commandLifecycleCreate(self: *GatewayState, command_id: []const u8, command_type: []const u8, correlation_id: []const u8, identity: []const u8) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.command_mutex.lock();
+        defer self.command_mutex.unlock();
         const now = std.time.milliTimestamp();
         const owned_id = try self.allocator.dupe(u8, command_id);
         errdefer self.allocator.free(owned_id);
@@ -661,8 +681,8 @@ const GatewayState = struct {
     }
 
     fn commandLifecycleSetRunning(self: *GatewayState, command_id: []const u8) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.command_mutex.lock();
+        defer self.command_mutex.unlock();
         if (self.command_lifecycle.getPtr(command_id)) |entry| {
             entry.status = .running;
             entry.updated_ms = std.time.milliTimestamp();
@@ -670,8 +690,8 @@ const GatewayState = struct {
     }
 
     fn commandLifecycleSetCompleted(self: *GatewayState, command_id: []const u8, status: u16, body: []const u8, content_type: []const u8) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.command_mutex.lock();
+        defer self.command_mutex.unlock();
         if (self.command_lifecycle.getPtr(command_id)) |entry| {
             self.allocator.free(entry.response_body);
             self.allocator.free(entry.response_content_type);
@@ -686,8 +706,8 @@ const GatewayState = struct {
     }
 
     fn commandLifecycleSetFailed(self: *GatewayState, command_id: []const u8, message: []const u8) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.command_mutex.lock();
+        defer self.command_mutex.unlock();
         if (self.command_lifecycle.getPtr(command_id)) |entry| {
             self.allocator.free(entry.error_message);
             entry.status = .failed;
@@ -697,8 +717,8 @@ const GatewayState = struct {
     }
 
     fn commandLifecycleSnapshotJson(self: *GatewayState, allocator: std.mem.Allocator, command_id: []const u8) ?[]const u8 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.command_mutex.lock();
+        defer self.command_mutex.unlock();
         const entry = self.command_lifecycle.get(command_id) orelse return null;
         const status_name = @tagName(entry.status);
         return std.fmt.allocPrint(allocator, "{{\"command_id\":\"{s}\",\"status\":\"{s}\",\"command\":\"{s}\",\"correlation_id\":\"{s}\",\"identity\":\"{s}\",\"created_ms\":{d},\"updated_ms\":{d},\"response_status\":{d},\"response_content_type\":\"{s}\",\"response_body\":{s},\"error\":\"{s}\"}}", .{
@@ -717,8 +737,8 @@ const GatewayState = struct {
     }
 
     fn commandLifecycleGet(self: *GatewayState, allocator: std.mem.Allocator, command_id: []const u8) ?CommandLifecycleSnapshot {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.command_mutex.lock();
+        defer self.command_mutex.unlock();
         const entry = self.command_lifecycle.get(command_id) orelse return null;
         const response_body = allocator.dupe(u8, entry.response_body) catch return null;
         errdefer allocator.free(response_body);
@@ -735,8 +755,8 @@ const GatewayState = struct {
     }
 
     fn approvalCreate(self: *GatewayState, allocator: std.mem.Allocator, method: []const u8, path: []const u8, identity: []const u8, command_id: ?[]const u8) !ApprovalCreateResult {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.approval_mutex.lock();
+        defer self.approval_mutex.unlock();
 
         var rnd: [16]u8 = undefined;
         std.crypto.random.bytes(&rnd);
@@ -765,8 +785,8 @@ const GatewayState = struct {
     }
 
     fn approvalRespond(self: *GatewayState, token: []const u8, decision: ApprovalDecision, actor: []const u8) bool {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.approval_mutex.lock();
+        defer self.approval_mutex.unlock();
         const entry = self.approvals.getPtr(token) orelse return false;
         self.approvalEscalateIfExpiredLocked(entry);
         if (entry.status != .pending) return false;
@@ -778,8 +798,8 @@ const GatewayState = struct {
     }
 
     fn approvalValidate(self: *GatewayState, token: []const u8, method: []const u8, path: []const u8, identity: ?[]const u8) ApprovalValidation {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.approval_mutex.lock();
+        defer self.approval_mutex.unlock();
         const entry = self.approvals.getPtr(token) orelse return .missing;
         self.approvalEscalateIfExpiredLocked(entry);
         if (!http.rewrite.methodMatches(entry.method, method)) return .invalid;
@@ -796,8 +816,8 @@ const GatewayState = struct {
     }
 
     fn approvalSnapshotJson(self: *GatewayState, allocator: std.mem.Allocator, token: []const u8) ?[]const u8 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.approval_mutex.lock();
+        defer self.approval_mutex.unlock();
         const entry = self.approvals.getPtr(token) orelse return null;
         self.approvalEscalateIfExpiredLocked(entry);
         const command_id_json = if (entry.command_id.len > 0)
@@ -834,62 +854,62 @@ const GatewayState = struct {
     }
 
     fn circuitTryAcquire(self: *GatewayState) bool {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.circuit_mutex.lock();
+        defer self.circuit_mutex.unlock();
         return self.circuit_breaker.tryAcquire();
     }
 
     fn circuitRecordFailure(self: *GatewayState) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.circuit_mutex.lock();
+        defer self.circuit_mutex.unlock();
         self.circuit_breaker.recordFailure();
     }
 
     fn circuitRecordSuccess(self: *GatewayState) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.circuit_mutex.lock();
+        defer self.circuit_mutex.unlock();
         self.circuit_breaker.recordSuccess();
     }
 
     fn circuitStateName(self: *GatewayState) []const u8 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.circuit_mutex.lock();
+        defer self.circuit_mutex.unlock();
         return self.circuit_breaker.stateName();
     }
 
     fn metricsRecord(self: *GatewayState, status: u16) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.metrics_mutex.lock();
+        defer self.metrics_mutex.unlock();
         self.metrics.recordRequest(status);
     }
 
     fn metricsRecordQueueRejection(self: *GatewayState) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.metrics_mutex.lock();
+        defer self.metrics_mutex.unlock();
         self.metrics.recordQueueRejection();
     }
 
     fn metricsRecordErrorCode(self: *GatewayState, code: []const u8) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.metrics_mutex.lock();
+        defer self.metrics_mutex.unlock();
         self.metrics.recordErrorCode(code);
     }
 
     fn metricsToJson(self: *GatewayState, allocator: std.mem.Allocator) ![]u8 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.metrics_mutex.lock();
+        defer self.metrics_mutex.unlock();
         return self.metrics.toJson(allocator);
     }
 
     fn metricsToPrometheus(self: *GatewayState, allocator: std.mem.Allocator) ![]u8 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.metrics_mutex.lock();
+        defer self.metrics_mutex.unlock();
         return self.metrics.toPrometheus(allocator);
     }
 
     fn nextUpstreamBaseUrl(self: *GatewayState, cfg: *const edge_config.EdgeConfig, pool: UpstreamPoolView, client_ip: []const u8, hash_key: []const u8) []const u8 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.upstream_mutex.lock();
+        defer self.upstream_mutex.unlock();
         if (pool.primary_urls.len == 0) {
             return self.selectPrimaryFallbackWithBackupsLocked(cfg, pool, http.event_loop.monotonicMs());
         }
@@ -1112,8 +1132,8 @@ const GatewayState = struct {
     fn recordUpstreamFailure(self: *GatewayState, cfg: *const edge_config.EdgeConfig, upstream_base_url: []const u8) void {
         if (cfg.upstream_max_fails == 0) return;
 
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.upstream_mutex.lock();
+        defer self.upstream_mutex.unlock();
 
         if (self.upstream_health.getPtr(upstream_base_url)) |health| {
             health.fail_count +|= 1;
@@ -1143,8 +1163,8 @@ const GatewayState = struct {
     fn recordUpstreamSuccess(self: *GatewayState, cfg: *const edge_config.EdgeConfig, upstream_base_url: []const u8) void {
         if (cfg.upstream_max_fails == 0) return;
 
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.upstream_mutex.lock();
+        defer self.upstream_mutex.unlock();
         if (self.upstream_health.getPtr(upstream_base_url)) |health| {
             health.fail_count = 0;
             health.unhealthy_until_ms = 0;
@@ -1154,8 +1174,8 @@ const GatewayState = struct {
     }
 
     fn recordActiveProbeResult(self: *GatewayState, cfg: *const edge_config.EdgeConfig, upstream_base_url: []const u8, healthy: bool) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.upstream_mutex.lock();
+        defer self.upstream_mutex.unlock();
 
         const health = if (self.upstream_health.getPtr(upstream_base_url)) |existing|
             existing
@@ -1237,12 +1257,14 @@ const GatewayState = struct {
             const health = entry.value_ptr.*;
             if (health.unhealthy_until_ms > now_ms or !health.probe.isRoutable()) unhealthy += 1;
         }
+        self.metrics_mutex.lock();
         self.metrics.setUpstreamUnhealthyBackends(unhealthy);
+        self.metrics_mutex.unlock();
     }
 
     fn upstreamUnhealthyCount(self: *GatewayState) usize {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.upstream_mutex.lock();
+        defer self.upstream_mutex.unlock();
         const now_ms = http.event_loop.monotonicMs();
         var unhealthy: usize = 0;
         var it = self.upstream_health.iterator();
@@ -1254,8 +1276,8 @@ const GatewayState = struct {
     }
 
     fn recordUpstreamAttemptStart(self: *GatewayState, upstream_base_url: []const u8) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.upstream_mutex.lock();
+        defer self.upstream_mutex.unlock();
 
         if (self.upstream_active_requests.getPtr(upstream_base_url)) |count| {
             count.* += 1;
@@ -1268,8 +1290,8 @@ const GatewayState = struct {
     }
 
     fn recordUpstreamAttemptEnd(self: *GatewayState, upstream_base_url: []const u8) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.upstream_mutex.lock();
+        defer self.upstream_mutex.unlock();
         if (self.upstream_active_requests.getPtr(upstream_base_url)) |count| {
             if (count.* > 1) {
                 count.* -= 1;
@@ -1282,8 +1304,8 @@ const GatewayState = struct {
     }
 
     fn streamCountAdjust(self: *GatewayState, ws_delta: i32, sse_delta: i32) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.connection_mutex.lock();
+        defer self.connection_mutex.unlock();
         if (ws_delta < 0) {
             const dec: usize = @intCast(-ws_delta);
             self.active_ws_streams = if (self.active_ws_streams > dec) self.active_ws_streams - dec else 0;
@@ -1299,20 +1321,20 @@ const GatewayState = struct {
     }
 
     fn streamCounts(self: *GatewayState) struct { ws: usize, sse: usize } {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.connection_mutex.lock();
+        defer self.connection_mutex.unlock();
         return .{ .ws = self.active_ws_streams, .sse = self.active_sse_streams };
     }
 
     fn connectionCounts(self: *GatewayState) struct { active: usize, per_ip: usize } {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.connection_mutex.lock();
+        defer self.connection_mutex.unlock();
         return .{ .active = self.active_connections_total, .per_ip = self.active_connections_by_ip.count() };
     }
 
     fn upstreamHealthJson(self: *GatewayState, allocator: std.mem.Allocator) ![]u8 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.upstream_mutex.lock();
+        defer self.upstream_mutex.unlock();
         var out = std.ArrayList(u8).init(allocator);
         errdefer out.deinit();
         try out.appendSlice("{\"upstreams\":[");
@@ -1882,7 +1904,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
 
     // Install signal handlers for graceful shutdown
     http.shutdown.installSignalHandlers();
-    state.logger.info(null, "Signal handlers installed (SIGTERM/SIGINT shutdown, SIGHUP reload, SIGUSR2 upgrade)", .{});
+    state.logger.info(null, "Signal handlers installed (SIGTERM/SIGINT shutdown, SIGHUP reload, SIGUSR1 reopen logs, SIGUSR2 upgrade)", .{});
 
     var ready_events: [64]http.event_loop.Event = undefined;
     while (!http.shutdown.isShutdownRequested()) {
@@ -1904,6 +1926,13 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
             if (http.shutdown.consumeUpgradeRequested()) {
                 state.logger.info(null, "Upgrade signal received; entering graceful shutdown", .{});
                 http.shutdown.requestShutdown();
+            }
+            if (http.shutdown.consumeReopenLogsRequested()) {
+                const current_cfg = worker_ctx.currentCfg();
+                http.access_log.flush();
+                reopenErrorLog(current_cfg) catch |err| {
+                    state.logger.warn(null, "log reopen failed: {}", .{err});
+                };
             }
             if (http.shutdown.consumeReloadRequested()) {
                 hotReloadConfig(state_allocator, &worker_ctx, &state, &reloaded_cfgs);
@@ -1991,7 +2020,15 @@ fn hotReloadConfig(
         state.logger.warn(null, "config reload failed during validation: {}", .{err});
         return;
     };
+    edge_config.validate(&loaded) catch |err| {
+        var rejected = loaded;
+        rejected.deinit(allocator);
+        state.logger.warn(null, "config reload rejected by validation: {}", .{err});
+        return;
+    };
     const cfg_ptr = allocator.create(edge_config.EdgeConfig) catch {
+        var rejected = loaded;
+        rejected.deinit(allocator);
         state.logger.warn(null, "config reload allocation failed", .{});
         return;
     };
@@ -2017,18 +2054,25 @@ fn hotReloadConfig(
 }
 
 fn applyReloadedRuntimeConfig(cfg: *const edge_config.EdgeConfig, state: *GatewayState) void {
-    state.mutex.lock();
-    defer state.mutex.unlock();
+    state.rate_limiter_mutex.lock();
     if (state.rate_limiter) |*rl| rl.deinit();
     state.rate_limiter = if (cfg.rate_limit_rps > 0)
         http.rate_limiter.RateLimiter.init(state.allocator, cfg.rate_limit_rps, cfg.rate_limit_burst)
     else
         null;
+    state.rate_limiter_mutex.unlock();
+
+    state.proxy_cache_mutex.lock();
     if (state.proxy_cache_store) |*pc| pc.deinit();
     state.proxy_cache_store = if (cfg.proxy_cache_ttl_seconds > 0)
         http.idempotency.IdempotencyStore.init(state.allocator, cfg.proxy_cache_ttl_seconds)
     else
         null;
+    state.proxy_cache_path = cfg.proxy_cache_path;
+    state.proxy_cache_ttl_seconds = cfg.proxy_cache_ttl_seconds;
+    state.proxy_cache_mutex.unlock();
+
+    state.runtime_mutex.lock();
     state.add_headers = cfg.add_headers;
     if (state.http3_alt_svc) |value| state.allocator.free(value);
     state.http3_alt_svc = if (cfg.http3_enabled) http.http3_handler.formatAltSvc(state.allocator, cfg.quic_port) catch null else null;
@@ -2040,8 +2084,6 @@ fn applyReloadedRuntimeConfig(cfg: *const edge_config.EdgeConfig, state: *Gatewa
     state.max_active_connections = cfg.max_active_connections;
     state.max_total_connection_memory_bytes = cfg.max_total_connection_memory_bytes;
     state.connection_memory_estimate_bytes = if (cfg.max_connection_memory_bytes > 0) cfg.max_connection_memory_bytes else MAX_REQUEST_SIZE;
-    state.proxy_cache_path = cfg.proxy_cache_path;
-    state.proxy_cache_ttl_seconds = cfg.proxy_cache_ttl_seconds;
     state.compression_config = .{
         .enabled = cfg.compression_enabled,
         .min_size = cfg.compression_min_size,
@@ -2049,6 +2091,15 @@ fn applyReloadedRuntimeConfig(cfg: *const edge_config.EdgeConfig, state: *Gatewa
         .brotli_quality = cfg.compression_brotli_quality,
     };
     state.logger.min_level = cfg.log_level;
+    state.runtime_mutex.unlock();
+}
+
+fn reopenErrorLog(cfg: *const edge_config.EdgeConfig) !void {
+    if (cfg.error_log_path.len == 0 or std.ascii.eqlIgnoreCase(cfg.error_log_path, "stderr")) return;
+    var file = try std.fs.cwd().createFile(cfg.error_log_path, .{ .truncate = false, .read = false });
+    defer file.close();
+    try file.seekFromEnd(0);
+    try std.posix.dup2(file.handle, std.io.getStdErr().handle);
 }
 
 fn rejectOverloadedClient(client_fd: std.posix.fd_t) void {
@@ -2126,8 +2177,8 @@ fn runProxyCacheMaintenance(cfg: *const edge_config.EdgeConfig, state: *GatewayS
     if (state.next_proxy_cache_maintenance_ms != 0 and now_ms < state.next_proxy_cache_maintenance_ms) return;
     state.next_proxy_cache_maintenance_ms = now_ms + interval;
 
-    state.mutex.lock();
-    defer state.mutex.unlock();
+    state.proxy_cache_mutex.lock();
+    defer state.proxy_cache_mutex.unlock();
     if (state.proxy_cache_store) |*store| {
         _ = store.cleanupExpired();
     }
@@ -2964,8 +3015,15 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
     else
         "unknown";
     const client_ip = http.request_context.extractClientIp(&request, connection_ip);
+    var effective_cfg_storage = cfg.*;
+    const effective_cfg = resolveRequestConfig(cfg, request.headers.get("host"), &effective_cfg_storage) orelse {
+        try sendApiError(allocator, writer, .not_found, "invalid_request", "Not Found", correlation_id, keep_alive, state);
+        var ctx_404 = http.request_context.RequestContext.init(allocator, correlation_id, client_ip);
+        logAccess(&ctx_404, request.method.toString(), request.uri.path, 404, request.headers.get("user-agent") orelse "");
+        return;
+    };
     var ctx = http.request_context.RequestContext.init(allocator, correlation_id, client_ip);
-    if (!hostMatchesServerNames(cfg, &request)) {
+    if (!hostMatchesServerNames(effective_cfg, &request)) {
         try sendApiError(allocator, writer, .not_found, "invalid_request", "Not Found", correlation_id, keep_alive, state);
         logAccess(&ctx, request.method.toString(), request.uri.path, 404, request.headers.get("user-agent") orelse "");
         return;
@@ -2982,7 +3040,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
 
     var conditional_outcome = try evaluateConditionalRules(
         allocator,
-        cfg.conditional_rules,
+        effective_cfg.conditional_rules,
         request.uri.path,
         request_uri_buf.items,
         request.headers.get("host") orelse "",
@@ -3084,15 +3142,15 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
     request.uri.path = applyInternalRedirectRules(
         request.method.toString(),
         request.uri.path,
-        cfg.internal_redirect_rules,
-        cfg.named_locations,
+        effective_cfg.internal_redirect_rules,
+        effective_cfg.named_locations,
     );
 
     // --- Mirror requests (best-effort async) ---
-    if (cfg.mirror_rules.len > 0) {
+    if (effective_cfg.mirror_rules.len > 0) {
         spawnMirrorRequests(
             allocator,
-            cfg.mirror_rules,
+            effective_cfg.mirror_rules,
             request.method.toString(),
             request.uri.path,
             request.body orelse "",
@@ -3102,101 +3160,43 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         );
     }
 
-    if (try runMiddlewarePipeline(allocator, writer, cfg, state, &ctx, &request, correlation_id, keep_alive)) {
+    if (try runMiddlewarePipeline(allocator, writer, effective_cfg, state, &ctx, &request, correlation_id, keep_alive)) {
         return;
     }
 
-    if (try routeRequest(allocator, writer, cfg, state, &ctx, &request, correlation_id, keep_alive, client_ip)) |status| {
-        logAccess(&ctx, request.method.toString(), request.uri.path, status, request.headers.get("user-agent") orelse "");
-        return;
-    }
-
-    // --- Versioned API routing ---
-    const versioned = http.api_router.parseVersionedPath(request.uri.path);
-    if (versioned) |route| {
-        if (!http.api_router.isSupportedVersion(route.version)) {
-            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Unsupported API version", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), request.uri.path, 400, request.headers.get("user-agent") orelse "");
-            return;
-        }
-        if (cfg.auth_request_url.len > 0 and isProtectedAuthRequestRoute(request.uri.path)) {
-            if (!authorizeViaSubrequest(allocator, cfg, &request, correlation_id, client_ip)) {
-                try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, keep_alive, state);
-                logAccess(&ctx, request.method.toString(), request.uri.path, 401, request.headers.get("user-agent") orelse "");
-                return;
-            }
-        }
-    }
-
-    if (try handleBackendProtocolTail(conn, allocator, cfg, state, &ctx, &request, correlation_id, client_ip, keep_alive)) |status| {
-        logAccess(&ctx, request.method.toString(), request.uri.path, status, request.headers.get("user-agent") orelse "");
-        return;
-    }
-
-    if (try handleWebSocketUpgrade(conn, allocator, cfg, state, &ctx, &request, correlation_id, client_ip, &keep_alive)) |status| {
-        logAccess(&ctx, request.method.toString(), request.uri.path, status, request.headers.get("user-agent") orelse "");
-        return;
-    }
-
-    if (try handleSseStream(writer, allocator, cfg, state, &ctx, &request, correlation_id, &keep_alive)) |status| {
-        logAccess(&ctx, request.method.toString(), request.uri.path, status, request.headers.get("user-agent") orelse "");
-        return;
-    }
-
-    if (try handleSsePublish(writer, allocator, cfg, state, &ctx, &request, correlation_id, keep_alive)) |status| {
-        logAccess(&ctx, request.method.toString(), request.uri.path, status, request.headers.get("user-agent") orelse "");
-        return;
-    }
-
-    if (try handleBuiltinApiTailHttp1(allocator, writer, cfg, state, &ctx, &request, correlation_id, keep_alive, client_ip)) |status| {
-        logAccess(&ctx, request.method.toString(), request.uri.path, status, request.headers.get("user-agent") orelse "");
-        return;
-    }
-
-    if (try handlePrimaryApiTailHttp1(allocator, writer, cfg, state, &ctx, &request, correlation_id, keep_alive, client_ip)) |status| {
-        logAccess(&ctx, request.method.toString(), request.uri.path, status, request.headers.get("user-agent") orelse "");
-        return;
-    }
-
-    if (serveTryFilesFallback(allocator, cfg, request.method.toString(), request.uri.path, correlation_id, keep_alive, writer, state)) |status| {
-        state.metricsRecord(status);
-        logAccess(&ctx, request.method.toString(), request.uri.path, status, request.headers.get("user-agent") orelse "");
-        return;
-    } else |_| {}
-
-    try sendApiError(allocator, writer, .not_found, "invalid_request", "Not Found", correlation_id, keep_alive, state);
-    logAccess(&ctx, request.method.toString(), request.uri.path, 404, request.headers.get("user-agent") orelse "");
+    const route_status = try routeRequest(conn, allocator, effective_cfg, state, &ctx, &request, correlation_id, &keep_alive, client_ip);
+    logAccess(&ctx, request.method.toString(), request.uri.path, route_status, request.headers.get("user-agent") orelse "");
+    return;
 }
 
 fn routeRequest(
+    conn: anytype,
     allocator: std.mem.Allocator,
-    writer: anytype,
     cfg: *const edge_config.EdgeConfig,
     state: *GatewayState,
     ctx: *http.request_context.RequestContext,
     request: *http.Request,
     correlation_id: []const u8,
-    keep_alive: bool,
+    keep_alive: *bool,
     client_ip: []const u8,
-) !?u16 {
+) !u16 {
+    const writer = conn.writer();
     if (http.location_router.matchLocation(request.uri.path, cfg.location_blocks)) |matched| {
         switch (matched.block.action) {
             .builtin_route => |route| {
-                if (try dispatchBuiltinRouteHttp1(allocator, writer, cfg, state, ctx, request, correlation_id, keep_alive, client_ip, route)) |status| {
-                    return status;
-                }
+                if (try dispatchBuiltinRouteHttp1(allocator, writer, cfg, state, ctx, request, correlation_id, keep_alive.*, client_ip, route)) |status| return status;
             },
             .proxy_pass => |target| {
-                return try handleLocationProxyPass(allocator, writer, cfg, state, request, target, correlation_id, keep_alive, client_ip, ctx.identity);
+                return try handleLocationProxyPass(allocator, writer, cfg, state, request, target, correlation_id, keep_alive.*, client_ip, ctx.identity);
             },
             .fastcgi_pass => |upstream| {
-                return try handleFastcgiRoute(allocator, writer, cfg, upstream, request, client_ip, correlation_id, keep_alive, state);
+                return try handleFastcgiRoute(allocator, writer, cfg, upstream, request, client_ip, correlation_id, keep_alive.*, state);
             },
             .return_response => |ret| {
                 if (ret.status >= 300 and ret.status < 400 and ret.body.len > 0) {
                     var response = http.Response.redirect(allocator, ret.body, @enumFromInt(ret.status));
                     defer response.deinit();
-                    _ = response.setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
+                    _ = response.setConnection(keep_alive.*).setHeader(http.correlation.HEADER_NAME, correlation_id);
                     applyResponseHeaders(state, &response);
                     try response.write(writer);
                 } else {
@@ -3205,7 +3205,7 @@ fn routeRequest(
                     _ = response.setStatus(@enumFromInt(ret.status))
                         .setBody(ret.body)
                         .setContentType("text/plain; charset=utf-8")
-                        .setConnection(keep_alive)
+                        .setConnection(keep_alive.*)
                         .setHeader(http.correlation.HEADER_NAME, correlation_id);
                     applyResponseHeaders(state, &response);
                     try response.write(writer);
@@ -3217,68 +3217,111 @@ fn routeRequest(
                 request.uri.path = rw.replacement;
             },
             .static_root => |root_cfg| {
-                if (try handleStaticLocation(allocator, writer, request, matched, root_cfg, correlation_id, keep_alive, state)) |status| {
-                    return status;
-                }
+                if (try handleStaticLocation(allocator, writer, request, matched, root_cfg, correlation_id, keep_alive.*, state)) |status| return status;
             },
         }
     }
 
     const builtin_blocks = buildBuiltinLocationBlocks(cfg);
-    const matched = http.location_router.matchLocation(request.uri.path, builtin_blocks[0..]) orelse {
+    if (http.location_router.matchLocation(request.uri.path, builtin_blocks[0..])) |matched| {
+        switch (matched.block.action) {
+            .builtin_route => |route| {
+                return (try dispatchBuiltinRouteHttp1(allocator, writer, cfg, state, ctx, request, correlation_id, keep_alive.*, client_ip, route)) orelse {
+                    try sendApiError(allocator, writer, .not_found, "invalid_request", "Not Found", correlation_id, keep_alive.*, state);
+                    state.metricsRecord(404);
+                    return 404;
+                };
+            },
+            .proxy_pass => |target| {
+                return try handleLocationProxyPass(allocator, writer, cfg, state, request, target, correlation_id, keep_alive.*, client_ip, ctx.identity);
+            },
+            .fastcgi_pass => |upstream| {
+                return try handleFastcgiRoute(allocator, writer, cfg, upstream, request, client_ip, correlation_id, keep_alive.*, state);
+            },
+            .return_response => |ret| {
+                if (ret.status >= 300 and ret.status < 400 and ret.body.len > 0) {
+                    var response = http.Response.redirect(allocator, ret.body, @enumFromInt(ret.status));
+                    defer response.deinit();
+                    _ = response.setConnection(keep_alive.*).setHeader(http.correlation.HEADER_NAME, correlation_id);
+                    applyResponseHeaders(state, &response);
+                    try response.write(writer);
+                } else {
+                    var response = http.Response.init(allocator);
+                    defer response.deinit();
+                    _ = response.setStatus(@enumFromInt(ret.status))
+                        .setBody(ret.body)
+                        .setContentType("text/plain; charset=utf-8")
+                        .setConnection(keep_alive.*)
+                        .setHeader(http.correlation.HEADER_NAME, correlation_id);
+                    applyResponseHeaders(state, &response);
+                    try response.write(writer);
+                }
+                state.metricsRecord(ret.status);
+                return ret.status;
+            },
+            .rewrite => |rw| {
+                request.uri.path = rw.replacement;
+            },
+            .static_root => |root_cfg| {
+                if (try handleStaticLocation(allocator, writer, request, matched, root_cfg, correlation_id, keep_alive.*, state)) |status| return status;
+            },
+        }
+    } else {
         if (request.method == .GET and std.mem.startsWith(u8, request.uri.path, "/admin/")) {
             const auth_result = authorizeRequest(cfg, &request.headers);
             if (!auth_result.ok) {
-                try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, keep_alive, state);
+                try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, keep_alive.*, state);
                 state.metricsRecord(401);
                 return 401;
             }
-            try sendApiError(allocator, writer, .not_found, "invalid_request", "Unknown admin route", correlation_id, keep_alive, state);
+            try sendApiError(allocator, writer, .not_found, "invalid_request", "Unknown admin route", correlation_id, keep_alive.*, state);
             state.metricsRecord(404);
             return 404;
         }
-        return null;
-    };
 
-    switch (matched.block.action) {
-        .builtin_route => |route| {
-            return try dispatchBuiltinRouteHttp1(allocator, writer, cfg, state, ctx, request, correlation_id, keep_alive, client_ip, route);
-        },
-        .proxy_pass => |target| {
-            return try handleLocationProxyPass(allocator, writer, cfg, state, request, target, correlation_id, keep_alive, client_ip, ctx.identity);
-        },
-        .fastcgi_pass => |upstream| {
-            return try handleFastcgiRoute(allocator, writer, cfg, upstream, request, client_ip, correlation_id, keep_alive, state);
-        },
-        .return_response => |ret| {
-            if (ret.status >= 300 and ret.status < 400 and ret.body.len > 0) {
-                var response = http.Response.redirect(allocator, ret.body, @enumFromInt(ret.status));
-                defer response.deinit();
-                _ = response.setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
-                applyResponseHeaders(state, &response);
-                try response.write(writer);
-            } else {
-                var response = http.Response.init(allocator);
-                defer response.deinit();
-                _ = response.setStatus(@enumFromInt(ret.status))
-                    .setBody(ret.body)
-                    .setContentType("text/plain; charset=utf-8")
-                    .setConnection(keep_alive)
-                    .setHeader(http.correlation.HEADER_NAME, correlation_id);
-                applyResponseHeaders(state, &response);
-                try response.write(writer);
+        if (http.api_router.parseVersionedPath(request.uri.path)) |versioned| {
+            if (!http.api_router.isSupportedVersion(versioned.version)) {
+                try sendApiError(allocator, writer, .bad_request, "invalid_request", "Unsupported API version", correlation_id, keep_alive.*, state);
+                state.metricsRecord(400);
+                return 400;
             }
-            state.metricsRecord(ret.status);
-            return ret.status;
-        },
-        .rewrite => |rw| {
-            request.uri.path = rw.replacement;
-            return null;
-        },
-        .static_root => |root_cfg| {
-            return try handleStaticLocation(allocator, writer, request, matched, root_cfg, correlation_id, keep_alive, state);
-        },
+            if (cfg.auth_request_url.len > 0 and isProtectedAuthRequestRoute(request.uri.path)) {
+                if (!authorizeViaSubrequest(allocator, cfg, request, correlation_id, client_ip)) {
+                    try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, keep_alive.*, state);
+                    state.metricsRecord(401);
+                    return 401;
+                }
+            }
+        }
+
+        if (try handleBackendProtocolTail(conn, allocator, cfg, state, ctx, request, correlation_id, client_ip, keep_alive.*)) |status| {
+            return status;
+        }
+        if (try handleWebSocketUpgrade(conn, allocator, cfg, state, ctx, request, correlation_id, client_ip, keep_alive)) |status| {
+            return status;
+        }
+        if (try handleSseStream(writer, allocator, cfg, state, ctx, request, correlation_id, keep_alive)) |status| {
+            return status;
+        }
+        if (try handleSsePublish(writer, allocator, cfg, state, ctx, request, correlation_id, keep_alive.*)) |status| {
+            return status;
+        }
+        if (try handleBuiltinApiTailHttp1(allocator, writer, cfg, state, ctx, request, correlation_id, keep_alive.*, client_ip)) |status| {
+            return status;
+        }
+        if (try handlePrimaryApiTailHttp1(allocator, writer, cfg, state, ctx, request, correlation_id, keep_alive.*, client_ip)) |status| {
+            return status;
+        }
     }
+
+    if (serveTryFilesFallback(allocator, cfg, request.method.toString(), request.uri.path, correlation_id, keep_alive.*, writer, state)) |status| {
+        state.metricsRecord(status);
+        return status;
+    } else |_| {}
+
+    try sendApiError(allocator, writer, .not_found, "invalid_request", "Not Found", correlation_id, keep_alive.*, state);
+    state.metricsRecord(404);
+    return 404;
 }
 
 fn matchEffectiveLocation(cfg: *const edge_config.EdgeConfig, path: []const u8) ?http.location_router.MatchResult {
@@ -4403,7 +4446,6 @@ fn dispatchBuiltinRouteHttp1(
                     return 500;
                 };
                 spawnAsyncCommandExecution(
-                    allocator,
                     cfg,
                     state,
                     prep.command_id,
@@ -5876,7 +5918,6 @@ fn handleWebSocketMultiplexLoop(
             if (cmd.async_execute) {
                 state.commandLifecycleCreate(command_id, cmd.command_type.toString(), correlation_id, identity orelse "-") catch {};
                 spawnAsyncCommandExecution(
-                    allocator,
                     cfg,
                     state,
                     command_id,
@@ -6214,7 +6255,6 @@ const AsyncCommandJob = struct {
 };
 
 fn spawnAsyncCommandExecution(
-    allocator: std.mem.Allocator,
     cfg: *const edge_config.EdgeConfig,
     state: *GatewayState,
     command_id: []const u8,
@@ -6228,7 +6268,46 @@ fn spawnAsyncCommandExecution(
     incoming_host: ?[]const u8,
     incoming_x_forwarded_for: ?[]const u8,
 ) void {
-    const job = allocator.create(AsyncCommandJob) catch return;
+    const job = createAsyncCommandJob(
+        state.allocator,
+        cfg,
+        state,
+        command_id,
+        command_name,
+        upstream_path,
+        envelope,
+        correlation_id,
+        client_ip,
+        identity,
+        api_version,
+        incoming_host,
+        incoming_x_forwarded_for,
+    ) catch return;
+    const t = std.Thread.spawn(.{}, runAsyncCommandJob, .{job}) catch {
+        destroyAsyncCommandJob(job);
+        state.commandLifecycleSetFailed(command_id, "async_spawn_failed");
+        return;
+    };
+    t.detach();
+}
+
+fn createAsyncCommandJob(
+    allocator: std.mem.Allocator,
+    cfg: *const edge_config.EdgeConfig,
+    state: *GatewayState,
+    command_id: []const u8,
+    command_name: []const u8,
+    upstream_path: []const u8,
+    envelope: []const u8,
+    correlation_id: []const u8,
+    client_ip: []const u8,
+    identity: ?[]const u8,
+    api_version: ?u32,
+    incoming_host: ?[]const u8,
+    incoming_x_forwarded_for: ?[]const u8,
+) !*AsyncCommandJob {
+    const job = try allocator.create(AsyncCommandJob);
+    errdefer allocator.destroy(job);
     job.* = .{
         .allocator = allocator,
         .cfg = cfg,
@@ -6244,31 +6323,29 @@ fn spawnAsyncCommandExecution(
         .incoming_x_forwarded_for = if (incoming_x_forwarded_for) |xff| allocator.dupe(u8, xff) catch null else null,
         .api_version = api_version,
     };
-    const t = std.Thread.spawn(.{}, runAsyncCommandJob, .{job}) catch {
-        state.commandLifecycleSetFailed(command_id, "async_spawn_failed");
-        return;
-    };
-    t.detach();
+    return job;
 }
 
 fn dupeOrEmpty(allocator: std.mem.Allocator, src: []const u8) []u8 {
     return allocator.dupe(u8, src) catch allocator.alloc(u8, 0) catch unreachable;
 }
 
+fn destroyAsyncCommandJob(job: *AsyncCommandJob) void {
+    const alloc = job.allocator;
+    if (job.command_id.len > 0) alloc.free(job.command_id);
+    if (job.command_name.len > 0) alloc.free(job.command_name);
+    if (job.upstream_path.len > 0) alloc.free(job.upstream_path);
+    if (job.envelope.len > 0) alloc.free(job.envelope);
+    if (job.correlation_id.len > 0) alloc.free(job.correlation_id);
+    if (job.client_ip.len > 0) alloc.free(job.client_ip);
+    if (job.identity) |id| alloc.free(id);
+    if (job.incoming_host) |h| alloc.free(h);
+    if (job.incoming_x_forwarded_for) |xff| alloc.free(xff);
+    alloc.destroy(job);
+}
+
 fn runAsyncCommandJob(job: *AsyncCommandJob) void {
-    defer {
-        const alloc = job.allocator;
-        if (job.command_id.len > 0) alloc.free(job.command_id);
-        if (job.command_name.len > 0) alloc.free(job.command_name);
-        if (job.upstream_path.len > 0) alloc.free(job.upstream_path);
-        if (job.envelope.len > 0) alloc.free(job.envelope);
-        if (job.correlation_id.len > 0) alloc.free(job.correlation_id);
-        if (job.client_ip.len > 0) alloc.free(job.client_ip);
-        if (job.identity) |id| alloc.free(id);
-        if (job.incoming_host) |h| alloc.free(h);
-        if (job.incoming_x_forwarded_for) |xff| alloc.free(xff);
-        alloc.destroy(job);
-    }
+    defer destroyAsyncCommandJob(job);
 
     job.state.commandLifecycleSetRunning(job.command_id);
     const exec = proxyJsonExecute(
@@ -6303,6 +6380,54 @@ fn runAsyncCommandJob(job: *AsyncCommandJob) void {
             job.state.commandLifecycleSetCompleted(job.command_id, resp.status, resp.body, resp.content_type);
         },
     }
+}
+
+test "async command jobs copy request-owned inputs onto long-lived allocator" {
+    var request_arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    const request_allocator = request_arena_state.allocator();
+
+    const command_id = try request_allocator.dupe(u8, "cmd-request-owned");
+    const command_name = try request_allocator.dupe(u8, "chat.send");
+    const upstream_path = try request_allocator.dupe(u8, "/run");
+    const envelope = try request_allocator.dupe(u8, "{\"ok\":true}");
+    const correlation_id = try request_allocator.dupe(u8, "corr-123");
+    const client_ip = try request_allocator.dupe(u8, "127.0.0.1");
+    const identity = try request_allocator.dupe(u8, "identity-1");
+    const incoming_host = try request_allocator.dupe(u8, "example.test");
+    const incoming_xff = try request_allocator.dupe(u8, "10.0.0.1");
+
+    var cfg: edge_config.EdgeConfig = undefined;
+    var state: GatewayState = undefined;
+    state.allocator = std.testing.allocator;
+
+    const job = try createAsyncCommandJob(
+        std.testing.allocator,
+        &cfg,
+        &state,
+        command_id,
+        command_name,
+        upstream_path,
+        envelope,
+        correlation_id,
+        client_ip,
+        identity,
+        1,
+        incoming_host,
+        incoming_xff,
+    );
+    defer destroyAsyncCommandJob(job);
+
+    request_arena_state.deinit();
+
+    try std.testing.expectEqualStrings("cmd-request-owned", job.command_id);
+    try std.testing.expectEqualStrings("chat.send", job.command_name);
+    try std.testing.expectEqualStrings("/run", job.upstream_path);
+    try std.testing.expectEqualStrings("{\"ok\":true}", job.envelope);
+    try std.testing.expectEqualStrings("corr-123", job.correlation_id);
+    try std.testing.expectEqualStrings("127.0.0.1", job.client_ip);
+    try std.testing.expectEqualStrings("identity-1", job.identity.?);
+    try std.testing.expectEqualStrings("example.test", job.incoming_host.?);
+    try std.testing.expectEqualStrings("10.0.0.1", job.incoming_x_forwarded_for.?);
 }
 
 fn parseLastEventId(raw: ?[]const u8) u64 {
@@ -8634,7 +8759,38 @@ fn handleHttp3Request(
     user_data: ?*anyopaque,
 ) !void {
     const ctx: *Http3DispatchContext = @ptrCast(@alignCast(user_data orelse return error.InvalidArgument));
-    try handleHttp3Connection(allocator, request, response, ctx);
+    const authority = request.headers.get(":authority") orelse request.headers.get("host");
+    var effective_cfg_storage = ctx.cfg.*;
+    const effective_cfg = resolveRequestConfig(ctx.cfg, authority, &effective_cfg_storage) orelse {
+        const correlation_id = request.headers.get(http.correlation.HEADER_NAME) orelse "http3";
+        const payload = try buildApiErrorJson(allocator, "invalid_request", "Not Found", correlation_id);
+        _ = response
+            .setStatus(.not_found)
+            .setBodyOwned(payload)
+            .setContentType("application/json")
+            .setHeader(http.correlation.HEADER_NAME, correlation_id);
+        finalizeHttp3Response(response);
+        applyResponseHeaders(ctx.state, response);
+        ctx.state.metricsRecord(404);
+        return;
+    };
+    if (!hostMatchesPatterns(effective_cfg.server_names, authority)) {
+        const correlation_id = request.headers.get(http.correlation.HEADER_NAME) orelse "http3";
+        const payload = try buildApiErrorJson(allocator, "invalid_request", "Not Found", correlation_id);
+        _ = response
+            .setStatus(.not_found)
+            .setBodyOwned(payload)
+            .setContentType("application/json")
+            .setHeader(http.correlation.HEADER_NAME, correlation_id);
+        finalizeHttp3Response(response);
+        applyResponseHeaders(ctx.state, response);
+        ctx.state.metricsRecord(404);
+        return;
+    }
+
+    var effective_ctx = ctx.*;
+    effective_ctx.cfg = effective_cfg;
+    try handleHttp3Connection(allocator, request, response, &effective_ctx);
 }
 
 fn authorizeRequest(cfg: *const edge_config.EdgeConfig, headers: *const http.Headers) AuthResult {
@@ -8751,11 +8907,43 @@ fn isProtectedAuthRequestRoute(path: []const u8) bool {
         std.mem.startsWith(u8, path, "/admin/");
 }
 
+fn resolveRequestConfig(base_cfg: *const edge_config.EdgeConfig, raw_host: ?[]const u8, out: *edge_config.EdgeConfig) ?*const edge_config.EdgeConfig {
+    out.* = base_cfg.*;
+    if (base_cfg.server_blocks.len > 0) {
+        const block = selectServerBlock(base_cfg, raw_host) orelse return null;
+        if (block.server_names.len > 0 and !hostMatchesPatterns(block.server_names, raw_host)) return null;
+        out.server_names = block.server_names;
+        if (block.doc_root.len > 0) out.doc_root = block.doc_root;
+        if (block.try_files.len > 0) out.try_files = block.try_files;
+        if (block.location_blocks.len > 0) out.location_blocks = block.location_blocks;
+        if (block.tls_cert_path.len > 0) out.tls_cert_path = block.tls_cert_path;
+        if (block.tls_key_path.len > 0) out.tls_key_path = block.tls_key_path;
+        if (block.upstream_base_url.len > 0) out.upstream_base_url = block.upstream_base_url;
+        if (block.proxy_pass_chat.len > 0) out.proxy_pass_chat = block.proxy_pass_chat;
+        if (block.proxy_pass_commands_prefix.len > 0) out.proxy_pass_commands_prefix = block.proxy_pass_commands_prefix;
+        return out;
+    }
+    if (!hostMatchesPatterns(base_cfg.server_names, raw_host)) return null;
+    return out;
+}
+
+fn selectServerBlock(cfg: *const edge_config.EdgeConfig, raw_host: ?[]const u8) ?*const edge_config.EdgeConfig.ServerBlock {
+    var default_block: ?*const edge_config.EdgeConfig.ServerBlock = null;
+    for (cfg.server_blocks) |*block| {
+        if (block.server_names.len == 0 and default_block == null) default_block = block;
+        if (hostMatchesPatterns(block.server_names, raw_host)) return block;
+    }
+    return default_block orelse if (cfg.server_blocks.len > 0) &cfg.server_blocks[0] else null;
+}
+
 fn hostMatchesServerNames(cfg: *const edge_config.EdgeConfig, request: *const http.Request) bool {
-    if (cfg.server_names.len == 0) return true;
-    const raw_host = request.headers.get("host") orelse return false;
-    const host = stripHostPort(raw_host);
-    for (cfg.server_names) |pattern| {
+    return hostMatchesPatterns(cfg.server_names, request.headers.get("host"));
+}
+
+fn hostMatchesPatterns(patterns: []const []const u8, raw_host: ?[]const u8) bool {
+    if (patterns.len == 0) return true;
+    const host = stripHostPort(raw_host orelse return false);
+    for (patterns) |pattern| {
         if (matchHostPattern(pattern, host)) return true;
     }
     return false;

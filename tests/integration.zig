@@ -270,6 +270,31 @@ const UwsgiCapture = struct {
     }
 };
 
+const RawTcpCapture = struct {
+    allocator: std.mem.Allocator,
+    raw: []u8,
+    request_count: u32,
+
+    fn init(allocator: std.mem.Allocator) !RawTcpCapture {
+        return .{
+            .allocator = allocator,
+            .raw = try allocator.dupe(u8, ""),
+            .request_count = 0,
+        };
+    }
+
+    fn deinit(self: *RawTcpCapture) void {
+        self.allocator.free(self.raw);
+        self.* = undefined;
+    }
+
+    fn record(self: *RawTcpCapture, raw: []const u8) !void {
+        self.allocator.free(self.raw);
+        self.raw = try self.allocator.dupe(u8, raw);
+        self.request_count += 1;
+    }
+};
+
 const UpstreamServer = struct {
     allocator: std.mem.Allocator,
     server: std.net.Server,
@@ -456,6 +481,46 @@ const UwsgiServer = struct {
     }
 
     fn stop(self: *UwsgiServer) void {
+        self.stop_flag.store(true, .seq_cst);
+        wakeListener(self.port());
+        if (self.thread) |thread| thread.join();
+        self.server.deinit();
+        self.capture.deinit();
+        self.* = undefined;
+    }
+};
+
+const RawTcpServer = struct {
+    allocator: std.mem.Allocator,
+    server: std.net.Server,
+    thread: ?std.Thread,
+    stop_flag: std.atomic.Value(bool),
+    mutex: std.Thread.Mutex = .{},
+    capture: RawTcpCapture,
+    response: []const u8,
+
+    fn start(allocator: std.mem.Allocator, response: []const u8) !RawTcpServer {
+        const address = try std.net.Address.parseIp(test_host, 0);
+        const server = try std.net.Address.listen(address, .{ .reuse_address = true });
+        return .{
+            .allocator = allocator,
+            .server = server,
+            .thread = null,
+            .stop_flag = std.atomic.Value(bool).init(false),
+            .capture = try RawTcpCapture.init(allocator),
+            .response = response,
+        };
+    }
+
+    fn port(self: *const RawTcpServer) u16 {
+        return self.server.listen_address.getPort();
+    }
+
+    fn run(self: *RawTcpServer) !void {
+        self.thread = try std.Thread.spawn(.{}, rawTcpThreadMain, .{self});
+    }
+
+    fn stop(self: *RawTcpServer) void {
         self.stop_flag.store(true, .seq_cst);
         wakeListener(self.port());
         if (self.thread) |thread| thread.join();
@@ -746,6 +811,36 @@ fn uwsgiThreadMain(server: *UwsgiServer) void {
             std.debug.print("uwsgi handler failed: {}\n", .{err});
         };
         if (server.stop_flag.load(.seq_cst)) return;
+    }
+}
+
+fn rawTcpThreadMain(server: *RawTcpServer) void {
+    while (!server.stop_flag.load(.seq_cst)) {
+        var conn = server.server.accept() catch |err| {
+            if (server.stop_flag.load(.seq_cst)) return;
+            std.debug.print("raw tcp accept failed: {}\n", .{err});
+            continue;
+        };
+        defer conn.stream.close();
+
+        var buf: [16 * 1024]u8 = undefined;
+        const n = conn.stream.read(&buf) catch |err| {
+            if (server.stop_flag.load(.seq_cst)) return;
+            std.debug.print("raw tcp read failed: {}\n", .{err});
+            continue;
+        };
+        if (n == 0) continue;
+
+        server.mutex.lock();
+        server.capture.record(buf[0..n]) catch {};
+        const response = server.response;
+        server.mutex.unlock();
+
+        conn.stream.writeAll(response) catch |err| {
+            if (server.stop_flag.load(.seq_cst)) return;
+            std.debug.print("raw tcp write failed: {}\n", .{err});
+            continue;
+        };
     }
 }
 
@@ -4272,6 +4367,92 @@ test "tls integration routes SNI hostnames to the configured certificate" {
     try assertContains(default_subject, "127.0.0.1");
 }
 
+test "server block tls config drives SNI certificate selection" {
+    const allocator = std.testing.allocator;
+
+    const config_text =
+        \\server {
+        \\    tls_cert_path tests/fixtures/tls/server.crt;
+        \\    tls_key_path tests/fixtures/tls/server.key;
+        \\    location = /health {
+        \\        return 200 ready;
+        \\    }
+        \\}
+        \\server {
+        \\    server_name sni.integration.test;
+        \\    tls_cert_path tests/fixtures/tls/alt_server.crt;
+        \\    tls_key_path tests/fixtures/tls/alt_server.key;
+        \\    location = /health {
+        \\        return 200 ready;
+        \\    }
+        \\}
+    ;
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .upstream_port = null,
+        .auth_token_hashes = null,
+        .config_text = config_text,
+        .ready_https_insecure = true,
+    });
+    defer tardigrade.stop();
+
+    const sni_subject = try opensslPresentedSubject(allocator, tardigrade.port, "sni.integration.test");
+    defer allocator.free(sni_subject);
+    try assertContains(sni_subject, "sni.integration.test");
+
+    const default_subject = try opensslPresentedSubject(allocator, tardigrade.port, "unknown.integration.test");
+    defer allocator.free(default_subject);
+    try assertContains(default_subject, "127.0.0.1");
+}
+
+test "smtp proxy integration relays raw smtp payload through configured smtp_pass upstream" {
+    const allocator = std.testing.allocator;
+
+    const smtp_reply =
+        "220 smtp.integration.test ESMTP\r\n" ++
+        "250-PIPELINING\r\n" ++
+        "250 OK\r\n";
+    var smtp = try RawTcpServer.start(allocator, smtp_reply);
+    defer smtp.stop();
+    try smtp.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\smtp_pass {s}:{d};
+    , .{ test_host, smtp.port() });
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .upstream_port = null,
+        .auth_token_hashes = null,
+        .config_text = config_text,
+    });
+    defer tardigrade.stop();
+
+    const smtp_payload =
+        "EHLO integration.test\r\n" ++
+        "MAIL FROM:<sender@example.test>\r\n" ++
+        "RCPT TO:<receiver@example.test>\r\n" ++
+        "DATA\r\n" ++
+        "Subject: integration\r\n\r\nhello smtp\r\n.\r\nQUIT\r\n";
+
+    var response = try sendRequest(allocator, tardigrade.port, .{
+        .method = "POST",
+        .path = "/v1/mail/smtp",
+        .body = smtp_payload,
+        .headers = &.{},
+    });
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status_code);
+    try std.testing.expectEqualStrings("application/octet-stream", response.header("Content-Type").?);
+    try assertContains(response.body, "220 smtp.integration.test ESMTP");
+    try assertContains(response.body, "250 OK");
+
+    try std.testing.expectEqual(@as(u32, 1), smtp.capture.request_count);
+    try assertContains(smtp.capture.raw, "EHLO integration.test");
+    try assertContains(smtp.capture.raw, "DATA\r\n");
+    try assertContains(smtp.capture.raw, "hello smtp");
+}
+
 test "tls graceful shutdown integration sends connection close on inflight response" {
     const allocator = std.testing.allocator;
 
@@ -4800,6 +4981,79 @@ test "graceful shutdown integration exits promptly after drain completes" {
     try assertContains(log_data, "Graceful shutdown complete");
 }
 
+test "invalid sighup reload does not disrupt inflight requests" {
+    const allocator = std.testing.allocator;
+
+    const upstream1_responses = [_]UpstreamResponseSpec{
+        .{
+            .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
+            .body = "{\"upstream\":1,\"phase\":\"inflight\"}",
+            .delay_ms = 350,
+        },
+        .{
+            .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
+            .body = "{\"upstream\":1,\"phase\":\"post_reload\"}",
+        },
+    };
+    var upstream1 = try UpstreamServer.start(allocator, &upstream1_responses);
+    defer upstream1.stop();
+    try upstream1.run();
+
+    const initial_config = try std.fmt.allocPrint(
+        allocator,
+        "upstream_base_url http://{s}:{d};\nrate_limit_rps 1000;\nrate_limit_burst 1000;\n",
+        .{ test_host, upstream1.port() },
+    );
+    defer allocator.free(initial_config);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .upstream_port = null,
+        .auth_token_hashes = valid_bearer_hash,
+        .rate_limit_rps = null,
+        .rate_limit_burst = null,
+        .config_text = initial_config,
+    });
+    defer tardigrade.stop();
+
+    var in_flight_stream = try openRequestStream(allocator, tardigrade.port, .{
+        .method = "POST",
+        .path = "/v1/chat",
+        .body = "{\"message\":\"reload should be rejected\"}",
+        .headers = &.{
+            .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
+            .{ .name = "Content-Type", .value = "application/json" },
+        },
+    });
+    defer in_flight_stream.close();
+
+    try tardigrade.rewriteConfig("tls_cert_path /definitely/missing-cert.pem;\n");
+    tardigrade.sendSignal(std.posix.SIG.HUP);
+
+    var inflight_response = try readHttpResponse(allocator, in_flight_stream);
+    defer inflight_response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), inflight_response.status_code);
+    try assertContains(inflight_response.body, "\"phase\":\"inflight\"");
+
+    var post_reload = try sendRequest(allocator, tardigrade.port, .{
+        .method = "POST",
+        .path = "/v1/chat",
+        .body = "{\"message\":\"config should remain old\"}",
+        .headers = &.{
+            .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
+            .{ .name = "Content-Type", .value = "application/json" },
+        },
+    });
+    defer post_reload.deinit();
+    try std.testing.expectEqual(@as(u16, 200), post_reload.status_code);
+    try assertContains(post_reload.body, "\"phase\":\"post_reload\"");
+
+    try std.testing.expectEqual(@as(u32, 2), upstream1.capture.request_count);
+
+    const log_data = try std.fs.cwd().readFileAlloc(allocator, tardigrade.log_path, 256 * 1024);
+    defer allocator.free(log_data);
+    try assertContains(log_data, "config validation failed");
+}
+
 test "location blocks integration routes requests to matching upstreams" {
     const allocator = std.testing.allocator;
 
@@ -4876,6 +5130,95 @@ test "location blocks integration routes requests to matching upstreams" {
     try std.testing.expectEqual(@as(u32, 1), exact_upstream.capture.request_count);
     try std.testing.expectEqual(@as(u32, 1), prefix_upstream.capture.request_count);
     try std.testing.expectEqual(@as(u32, 1), regex_upstream.capture.request_count);
+}
+
+test "server blocks integration routes hosts to separate upstreams with default fallback" {
+    const allocator = std.testing.allocator;
+
+    const host_a_responses = [_]UpstreamResponseSpec{.{ .body = "host-a-upstream" }};
+    const host_b_responses = [_]UpstreamResponseSpec{.{ .body = "host-b-upstream" }};
+    const default_responses = [_]UpstreamResponseSpec{.{ .body = "default-upstream" }};
+
+    var host_a_upstream = try UpstreamServer.start(allocator, &host_a_responses);
+    defer host_a_upstream.stop();
+    try host_a_upstream.run();
+
+    var host_b_upstream = try UpstreamServer.start(allocator, &host_b_responses);
+    defer host_b_upstream.stop();
+    try host_b_upstream.run();
+
+    var default_upstream = try UpstreamServer.start(allocator, &default_responses);
+    defer default_upstream.stop();
+    try default_upstream.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\server {{
+        \\    server_name api-a.example.test;
+        \\    location / {{
+        \\        proxy_pass http://{s}:{d};
+        \\    }}
+        \\}}
+        \\server {{
+        \\    server_name api-b.example.test;
+        \\    location / {{
+        \\        proxy_pass http://{s}:{d};
+        \\    }}
+        \\}}
+        \\server {{
+        \\    location = /health {{
+        \\        return 200 ready;
+        \\    }}
+        \\    location / {{
+        \\        proxy_pass http://{s}:{d};
+        \\    }}
+        \\}}
+    , .{
+        test_host, host_a_upstream.port(),
+        test_host, host_b_upstream.port(),
+        test_host, default_upstream.port(),
+    });
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .upstream_port = null,
+        .auth_token_hashes = null,
+        .config_text = config_text,
+    });
+    defer tardigrade.stop();
+
+    var host_a_response = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/",
+        .body = null,
+        .headers = &.{.{ .name = "Host", .value = "api-a.example.test" }},
+    });
+    defer host_a_response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), host_a_response.status_code);
+    try std.testing.expectEqualStrings("host-a-upstream", host_a_response.body);
+
+    var host_b_response = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/",
+        .body = null,
+        .headers = &.{.{ .name = "Host", .value = "api-b.example.test:443" }},
+    });
+    defer host_b_response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), host_b_response.status_code);
+    try std.testing.expectEqualStrings("host-b-upstream", host_b_response.body);
+
+    var default_response = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/",
+        .body = null,
+        .headers = &.{.{ .name = "Host", .value = "unknown.example.test" }},
+    });
+    defer default_response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), default_response.status_code);
+    try std.testing.expectEqualStrings("default-upstream", default_response.body);
+
+    try std.testing.expectEqual(@as(u32, 1), host_a_upstream.capture.request_count);
+    try std.testing.expectEqual(@as(u32, 1), host_b_upstream.capture.request_count);
+    try std.testing.expectEqual(@as(u32, 1), default_upstream.capture.request_count);
 }
 
 test "static file integration serves configured index html" {

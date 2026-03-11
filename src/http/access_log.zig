@@ -70,6 +70,14 @@ pub fn deinit() void {
     }
 }
 
+pub fn flush() void {
+    if (global_state) |st| {
+        st.mutex.lock();
+        defer st.mutex.unlock();
+        flushLocked(st);
+    }
+}
+
 pub fn emit(entry: AccessLogEntry) void {
     if (global_state) |st| {
         if (st.cfg.min_status > 0 and entry.status < st.cfg.min_status) return;

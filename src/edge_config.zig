@@ -76,6 +76,32 @@ pub const EdgeConfig = struct {
         pattern: []const u8,
         target_url: []const u8,
     };
+    pub const ServerBlock = struct {
+        server_names: [][]const u8,
+        doc_root: []const u8,
+        try_files: []const u8,
+        location_blocks: []LocationBlock,
+        tls_cert_path: []const u8,
+        tls_key_path: []const u8,
+        upstream_base_url: []const u8,
+        proxy_pass_chat: []const u8,
+        proxy_pass_commands_prefix: []const u8,
+
+        pub fn deinit(self: *ServerBlock, allocator: std.mem.Allocator) void {
+            for (self.server_names) |name| allocator.free(name);
+            allocator.free(self.server_names);
+            allocator.free(self.doc_root);
+            allocator.free(self.try_files);
+            for (self.location_blocks) |*block| block.deinit(allocator);
+            allocator.free(self.location_blocks);
+            allocator.free(self.tls_cert_path);
+            allocator.free(self.tls_key_path);
+            allocator.free(self.upstream_base_url);
+            allocator.free(self.proxy_pass_chat);
+            allocator.free(self.proxy_pass_commands_prefix);
+            self.* = undefined;
+        }
+    };
 
     listen_host: []const u8,
     listen_port: u16,
@@ -212,6 +238,8 @@ pub const EdgeConfig = struct {
     require_unprivileged_user: bool,
     /// Optional accepted Host patterns for virtual-host matching.
     server_names: [][]const u8,
+    /// Optional per-host server blocks loaded from config file.
+    server_blocks: []ServerBlock = &.{},
     /// Optional document root for try_files/static fallback handling.
     doc_root: []const u8,
     /// Optional `try_files` candidate list (comma-separated paths; supports `$uri`).
@@ -425,6 +453,8 @@ pub const EdgeConfig = struct {
         allocator.free(self.chroot_dir);
         for (self.server_names) |name| allocator.free(name);
         allocator.free(self.server_names);
+        for (self.server_blocks) |*block| block.deinit(allocator);
+        if (self.server_blocks.len > 0) allocator.free(self.server_blocks);
         allocator.free(self.doc_root);
         allocator.free(self.try_files);
         allocator.free(self.access_log_template);
@@ -514,10 +544,10 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     defer allocator.free(listen_port_str);
     const listen_port = std.fmt.parseInt(u16, listen_port_str, 10) catch 8069;
 
-    const tls_cert_path = envOrDefault(allocator, "TARDIGRADE_TLS_CERT_PATH", "") catch unreachable;
+    var tls_cert_path = envOrDefault(allocator, "TARDIGRADE_TLS_CERT_PATH", "") catch unreachable;
     errdefer allocator.free(tls_cert_path);
 
-    const tls_key_path = envOrDefault(allocator, "TARDIGRADE_TLS_KEY_PATH", "") catch unreachable;
+    var tls_key_path = envOrDefault(allocator, "TARDIGRADE_TLS_KEY_PATH", "") catch unreachable;
     errdefer allocator.free(tls_key_path);
     const tls_min_version = envOrDefault(allocator, "TARDIGRADE_TLS_MIN_VERSION", "1.2") catch unreachable;
     errdefer allocator.free(tls_min_version);
@@ -529,7 +559,7 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     errdefer allocator.free(tls_cipher_suites);
     const tls_sni_certs_raw = envOrDefault(allocator, "TARDIGRADE_TLS_SNI_CERTS", "") catch unreachable;
     defer allocator.free(tls_sni_certs_raw);
-    const tls_sni_certs = try parseTlsSniCerts(allocator, tls_sni_certs_raw);
+    var tls_sni_certs = try parseTlsSniCerts(allocator, tls_sni_certs_raw);
     errdefer {
         for (tls_sni_certs) |sc| {
             allocator.free(sc.server_name);
@@ -808,6 +838,14 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         for (server_names) |name| allocator.free(name);
         allocator.free(server_names);
     }
+    const server_blocks_raw = envOrDefault(allocator, "TARDIGRADE_SERVER_BLOCKS", "") catch unreachable;
+    defer allocator.free(server_blocks_raw);
+    const server_blocks = try parseServerBlocks(allocator, server_blocks_raw);
+    errdefer {
+        for (server_blocks) |*block| block.deinit(allocator);
+        allocator.free(server_blocks);
+    }
+    try applyServerBlockTlsConfig(allocator, &tls_cert_path, &tls_key_path, &tls_sni_certs, server_blocks);
     const doc_root = envOrDefault(allocator, "TARDIGRADE_DOC_ROOT", "") catch unreachable;
     errdefer allocator.free(doc_root);
     const try_files = envOrDefault(allocator, "TARDIGRADE_TRY_FILES", "") catch unreachable;
@@ -1208,6 +1246,7 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .chroot_dir = chroot_dir,
         .require_unprivileged_user = require_unprivileged_user,
         .server_names = server_names,
+        .server_blocks = server_blocks,
         .doc_root = doc_root,
         .try_files = try_files,
         .access_log_format = access_log_format,
@@ -1282,8 +1321,116 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     };
 }
 
+const server_block_record_sep = "\x1e";
+const server_block_field_sep = "\x1f";
+
+fn parseServerBlocks(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeConfig.ServerBlock {
+    if (std.mem.trim(u8, raw, " \t\r\n").len == 0) return &.{};
+    var out = std.ArrayList(EdgeConfig.ServerBlock).init(allocator);
+    errdefer {
+        for (out.items) |*block| block.deinit(allocator);
+        out.deinit();
+    }
+    var records = std.mem.splitSequence(u8, raw, server_block_record_sep);
+    while (records.next()) |record| {
+        if (record.len == 0) continue;
+        var fields = std.mem.splitSequence(u8, record, server_block_field_sep);
+        const names_raw = fields.next() orelse return error.InvalidServerBlockFormat;
+        const doc_root = fields.next() orelse return error.InvalidServerBlockFormat;
+        const try_files = fields.next() orelse return error.InvalidServerBlockFormat;
+        const tls_cert_path = fields.next() orelse return error.InvalidServerBlockFormat;
+        const tls_key_path = fields.next() orelse return error.InvalidServerBlockFormat;
+        const upstream_base_url = fields.next() orelse return error.InvalidServerBlockFormat;
+        const proxy_pass_chat = fields.next() orelse return error.InvalidServerBlockFormat;
+        const proxy_pass_commands_prefix = fields.next() orelse return error.InvalidServerBlockFormat;
+        const location_blocks_raw = fields.next() orelse return error.InvalidServerBlockFormat;
+        if (fields.next() != null) return error.InvalidServerBlockFormat;
+
+        const names = try parseServerNames(allocator, names_raw);
+        errdefer {
+            for (names) |name| allocator.free(name);
+            allocator.free(names);
+        }
+        const location_blocks = try parseLocationBlocks(allocator, location_blocks_raw);
+        errdefer {
+            for (location_blocks) |*block| block.deinit(allocator);
+            allocator.free(location_blocks);
+        }
+        try out.append(.{
+            .server_names = names,
+            .doc_root = try allocator.dupe(u8, doc_root),
+            .try_files = try allocator.dupe(u8, try_files),
+            .location_blocks = location_blocks,
+            .tls_cert_path = try allocator.dupe(u8, tls_cert_path),
+            .tls_key_path = try allocator.dupe(u8, tls_key_path),
+            .upstream_base_url = try allocator.dupe(u8, upstream_base_url),
+            .proxy_pass_chat = try allocator.dupe(u8, proxy_pass_chat),
+            .proxy_pass_commands_prefix = try allocator.dupe(u8, proxy_pass_commands_prefix),
+        });
+    }
+    return out.toOwnedSlice();
+}
+
+fn applyServerBlockTlsConfig(
+    allocator: std.mem.Allocator,
+    tls_cert_path: *[]u8,
+    tls_key_path: *[]u8,
+    tls_sni_certs: *[]EdgeConfig.TlsSniCert,
+    server_blocks: []const EdgeConfig.ServerBlock,
+) !void {
+    var extra_sni: usize = 0;
+    var default_block: ?*const EdgeConfig.ServerBlock = null;
+    for (server_blocks) |*block| {
+        if (block.server_names.len == 0 and default_block == null) default_block = block;
+        if (block.tls_cert_path.len == 0 and block.tls_key_path.len == 0) continue;
+        if (block.server_names.len > 0) extra_sni += block.server_names.len;
+    }
+
+    if ((tls_cert_path.*.len == 0 or tls_key_path.*.len == 0) and default_block != null) {
+        const block = default_block.?;
+        if (block.tls_cert_path.len > 0 and block.tls_key_path.len > 0) {
+            allocator.free(tls_cert_path.*);
+            allocator.free(tls_key_path.*);
+            tls_cert_path.* = try allocator.dupe(u8, block.tls_cert_path);
+            tls_key_path.* = try allocator.dupe(u8, block.tls_key_path);
+        }
+    }
+
+    if (extra_sni == 0) return;
+    const existing = tls_sni_certs.*;
+    const merged = try allocator.alloc(EdgeConfig.TlsSniCert, existing.len + extra_sni);
+    errdefer allocator.free(merged);
+
+    var idx: usize = 0;
+    for (existing) |entry| {
+        merged[idx] = .{
+            .server_name = entry.server_name,
+            .cert_path = entry.cert_path,
+            .key_path = entry.key_path,
+        };
+        idx += 1;
+    }
+    for (server_blocks) |block| {
+        if (block.server_names.len == 0) continue;
+        if (block.tls_cert_path.len == 0 or block.tls_key_path.len == 0) continue;
+        for (block.server_names) |name| {
+            merged[idx] = .{
+                .server_name = try allocator.dupe(u8, name),
+                .cert_path = try allocator.dupe(u8, block.tls_cert_path),
+                .key_path = try allocator.dupe(u8, block.tls_key_path),
+            };
+            idx += 1;
+        }
+    }
+    allocator.free(existing);
+    tls_sni_certs.* = merged;
+}
+
 fn envOrDefault(allocator: std.mem.Allocator, key: []const u8, default_value: []const u8) ![]u8 {
     if (std.process.getEnvVarOwned(allocator, key)) |owned| {
+        if (conflictingFileOverrideValue(key, owned)) |file_value| {
+            std.log.warn("config override conflict for {s}: env value '{s}' overrides file-config value '{s}'", .{ key, owned, file_value });
+        }
         return owned;
     } else |_| {}
 
@@ -1298,6 +1445,13 @@ fn envOrDefault(allocator: std.mem.Allocator, key: []const u8, default_value: []
         }
     }
     return allocator.dupe(u8, default_value);
+}
+
+fn conflictingFileOverrideValue(key: []const u8, env_value: []const u8) ?[]const u8 {
+    const overrides = active_file_overrides orelse return null;
+    const file_value = overrides.map.get(key) orelse return null;
+    if (std.mem.eql(u8, file_value, env_value)) return null;
+    return file_value;
 }
 
 fn envOrDefaultAlias(allocator: std.mem.Allocator, primary_key: []const u8, fallback_key: []const u8, default_value: []const u8) ![]u8 {
@@ -1952,6 +2106,221 @@ pub fn hasTlsFiles(cfg: *const EdgeConfig) bool {
     return cfg.tls_cert_path.len > 0 and cfg.tls_key_path.len > 0;
 }
 
+pub fn validate(cfg: *const EdgeConfig) !void {
+    if (cfg.listen_port == 0) {
+        std.log.err("config validation failed: listen_port must be between 1 and 65535", .{});
+        return error.InvalidConfigPort;
+    }
+    if (cfg.http3_enabled and cfg.quic_port == 0) {
+        std.log.err("config validation failed: quic_port must be between 1 and 65535 when HTTP/3 is enabled", .{});
+        return error.InvalidConfigPort;
+    }
+
+    try validateOptionalFile(cfg.tls_cert_path, "tls_cert_path");
+    try validateOptionalFile(cfg.tls_key_path, "tls_key_path");
+    for (cfg.tls_sni_certs) |entry| {
+        try validateOptionalFile(entry.cert_path, "tls_sni_cert.cert_path");
+        try validateOptionalFile(entry.key_path, "tls_sni_cert.key_path");
+    }
+    for (cfg.server_blocks) |block| {
+        if ((block.tls_cert_path.len == 0) != (block.tls_key_path.len == 0)) {
+            std.log.err("config validation failed: server block TLS config requires both tls_cert_path and tls_key_path", .{});
+            return error.InvalidConfigPath;
+        }
+        try validateOptionalFile(block.tls_cert_path, "server_block.tls_cert_path");
+        try validateOptionalFile(block.tls_key_path, "server_block.tls_key_path");
+        try validateOptionalUpstreamBaseUrl(block.upstream_base_url, "server_block.upstream_base_url");
+    }
+    try validateOptionalFile(cfg.tls_ocsp_response_path, "tls_ocsp_response_path");
+    try validateOptionalFile(cfg.tls_client_ca_path, "tls_client_ca_path");
+    try validateOptionalFile(cfg.tls_crl_path, "tls_crl_path");
+    try validateOptionalDir(cfg.tls_acme_cert_dir, "tls_acme_cert_dir");
+    try validateOptionalDir(cfg.chroot_dir, "chroot_dir");
+    try validateOptionalPathForErrorLog(cfg.error_log_path, "error_log_path");
+    for (cfg.location_blocks) |block| {
+        if (block.error_pages.len > 0) switch (block.action) {
+            .static_root => |root| try validateOptionalDir(root.root, "location.error_page_root"),
+            else => {},
+        };
+        for (block.error_pages) |rule| {
+            if (isAbsoluteHttpUrl(rule.target)) continue;
+            if (rule.target.len == 0) {
+                std.log.err("config validation failed: location error_page target must not be empty", .{});
+                return error.InvalidConfigPath;
+            }
+        }
+    }
+
+    try validateOptionalUpstreamBaseUrl(cfg.upstream_base_url, "upstream_base_url");
+    try validateUpstreamBaseUrlList(cfg.upstream_base_urls, "upstream_base_urls");
+    try validateUpstreamBaseUrlList(cfg.upstream_backup_base_urls, "upstream_backup_base_urls");
+    try validateUpstreamBaseUrlList(cfg.upstream_chat_base_urls, "upstream_chat_base_urls");
+    try validateUpstreamBaseUrlList(cfg.upstream_chat_backup_base_urls, "upstream_chat_backup_base_urls");
+    try validateUpstreamBaseUrlList(cfg.upstream_commands_base_urls, "upstream_commands_base_urls");
+    try validateUpstreamBaseUrlList(cfg.upstream_commands_backup_base_urls, "upstream_commands_backup_base_urls");
+    try validateOptionalAbsoluteUrl(cfg.auth_request_url, "auth_request_url");
+    try validateOptionalAbsoluteUrl(cfg.grpc_upstream, "grpc_upstream");
+    for (cfg.mirror_rules) |rule| try validateOptionalAbsoluteUrl(rule.target_url, "mirror_rule.target_url");
+
+    if (isAbsoluteHttpUrl(cfg.proxy_pass_chat)) try validateOptionalAbsoluteUrl(cfg.proxy_pass_chat, "proxy_pass_chat");
+    if (isAbsoluteHttpUrl(cfg.proxy_pass_commands_prefix)) try validateOptionalAbsoluteUrl(cfg.proxy_pass_commands_prefix, "proxy_pass_commands_prefix");
+    for (cfg.location_blocks) |block| {
+        switch (block.action) {
+            .proxy_pass => |target| if (isAbsoluteHttpUrl(target) or isUnixEndpoint(target)) try validateOptionalUpstreamBaseUrl(target, "location.proxy_pass"),
+            .fastcgi_pass => |target| try validateOptionalSocketEndpoint(target, "location.fastcgi_pass"),
+            else => {},
+        }
+    }
+
+    try validateOptionalSocketEndpoint(cfg.fastcgi_upstream, "fastcgi_upstream");
+    try validateOptionalSocketEndpoint(cfg.uwsgi_upstream, "uwsgi_upstream");
+    try validateOptionalSocketEndpoint(cfg.scgi_upstream, "scgi_upstream");
+    try validateOptionalSocketEndpoint(cfg.memcached_upstream, "memcached_upstream");
+    try validateOptionalSocketEndpoint(cfg.smtp_upstream, "smtp_upstream");
+    try validateOptionalSocketEndpoint(cfg.imap_upstream, "imap_upstream");
+    try validateOptionalSocketEndpoint(cfg.pop3_upstream, "pop3_upstream");
+    try validateOptionalSocketEndpoint(cfg.tcp_proxy_upstream, "tcp_proxy_upstream");
+    try validateOptionalSocketEndpoint(cfg.udp_proxy_upstream, "udp_proxy_upstream");
+}
+
+fn validateOptionalFile(path: []const u8, label: []const u8) !void {
+    validateOptionalFileChecked(path) catch {
+        std.log.err("config validation failed: {s} path does not exist: {s}", .{ label, path });
+        return error.InvalidConfigPath;
+    };
+}
+
+fn validateOptionalDir(path: []const u8, label: []const u8) !void {
+    validateOptionalDirChecked(path) catch |err| {
+        if (err == error.InvalidConfigPath) {
+            std.log.err("config validation failed: {s} path does not exist: {s}", .{ label, path });
+        } else {
+            std.log.err("config validation failed: {s} must be a directory: {s}", .{ label, path });
+        }
+        return err;
+    };
+}
+
+fn validateOptionalPathForErrorLog(path: []const u8, label: []const u8) !void {
+    validateOptionalPathForErrorLogChecked(path) catch |err| {
+        std.log.err("config validation failed: {s} directory must exist: {s}", .{ label, path });
+        return err;
+    };
+}
+
+fn validateUpstreamBaseUrlList(values: []const []const u8, label: []const u8) !void {
+    for (values) |value| try validateOptionalUpstreamBaseUrl(value, label);
+}
+
+fn validateOptionalAbsoluteUrl(raw: []const u8, label: []const u8) !void {
+    validateOptionalAbsoluteUrlChecked(raw) catch |err| {
+        if (!isAbsoluteHttpUrl(raw)) {
+            std.log.err("config validation failed: {s} must be an absolute http/https URL: {s}", .{ label, raw });
+        } else {
+            std.log.err("config validation failed: {s} is not a valid URL: {s}", .{ label, raw });
+        }
+        return err;
+    };
+}
+
+fn validateOptionalUpstreamBaseUrl(raw: []const u8, label: []const u8) !void {
+    if (isUnixEndpoint(raw)) {
+        validateUnixEndpoint(raw, label) catch |err| return err;
+        return;
+    }
+    try validateOptionalAbsoluteUrl(raw, label);
+}
+
+fn validateOptionalSocketEndpoint(raw: []const u8, label: []const u8) !void {
+    validateOptionalSocketEndpointChecked(raw) catch |err| {
+        switch (err) {
+            error.InvalidConfigPort => std.log.err("config validation failed: {s} port must be between 1 and 65535: {s}", .{ label, raw }),
+            else => std.log.err("config validation failed: {s} must be host:port or unix:/path: {s}", .{ label, raw }),
+        }
+        return err;
+    };
+}
+
+fn validateUnixEndpoint(raw: []const u8, label: []const u8) !void {
+    validateUnixEndpointChecked(raw) catch |err| {
+        std.log.err("config validation failed: {s} unix endpoint path must not be empty: {s}", .{ label, raw });
+        return err;
+    };
+}
+
+fn validateOptionalFileChecked(path: []const u8) !void {
+    if (path.len == 0) return;
+    std.fs.cwd().access(path, .{}) catch return error.InvalidConfigPath;
+}
+
+fn validateOptionalDirChecked(path: []const u8) !void {
+    if (path.len == 0) return;
+    const stat = std.fs.cwd().statFile(path) catch {
+        return error.InvalidConfigPath;
+    };
+    if (stat.kind != .directory) {
+        return error.InvalidConfigPath;
+    }
+}
+
+fn validateOptionalPathForErrorLogChecked(path: []const u8) !void {
+    if (path.len == 0 or std.ascii.eqlIgnoreCase(path, "stderr")) return;
+    const dir_path = std.fs.path.dirname(path) orelse ".";
+    try validateOptionalDirChecked(dir_path);
+}
+
+fn validateOptionalAbsoluteUrlChecked(raw: []const u8) !void {
+    if (raw.len == 0) return;
+    if (!isAbsoluteHttpUrl(raw)) {
+        return error.InvalidConfigUrl;
+    }
+    _ = std.Uri.parse(raw) catch return error.InvalidConfigUrl;
+}
+
+fn validateOptionalSocketEndpointChecked(raw: []const u8) !void {
+    if (raw.len == 0) return;
+    if (isUnixEndpoint(raw)) {
+        try validateUnixEndpointChecked(raw);
+        return;
+    }
+    if (std.mem.indexOfScalar(u8, raw, ':') == null) {
+        return error.InvalidConfigEndpoint;
+    }
+    const parts = splitHostPort(raw) orelse return error.InvalidConfigEndpoint;
+    if (parts[0].len == 0) {
+        return error.InvalidConfigEndpoint;
+    }
+    if (std.fmt.parseInt(u16, parts[1], 10) catch 0 == 0) {
+        return error.InvalidConfigPort;
+    }
+}
+
+fn validateUnixEndpointChecked(raw: []const u8) !void {
+    const path = if (std.mem.startsWith(u8, raw, "unix:///"))
+        raw["unix://".len..]
+    else if (std.mem.startsWith(u8, raw, "unix:/"))
+        raw["unix:".len..]
+    else
+        raw[0..0];
+    if (path.len == 0) {
+        return error.InvalidConfigEndpoint;
+    }
+}
+
+fn isAbsoluteHttpUrl(raw: []const u8) bool {
+    return std.mem.startsWith(u8, raw, "http://") or std.mem.startsWith(u8, raw, "https://");
+}
+
+fn isUnixEndpoint(raw: []const u8) bool {
+    return std.mem.startsWith(u8, raw, "unix:/");
+}
+
+fn splitHostPort(raw: []const u8) ?struct { []const u8, []const u8 } {
+    const idx = std.mem.lastIndexOfScalar(u8, raw, ':') orelse return null;
+    if (idx == 0 or idx + 1 >= raw.len) return null;
+    return .{ std.mem.trim(u8, raw[0..idx], " \t\r\n"), std.mem.trim(u8, raw[idx + 1 ..], " \t\r\n") };
+}
+
 test "parse token hashes from csv" {
     const allocator = std.testing.allocator;
     const hashes = try parseHashes(allocator, "aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11, BB22BB22BB22BB22BB22BB22BB22BB22BB22BB22BB22BB22BB22BB22BB22BB22");
@@ -2003,6 +2372,74 @@ test "parse health status range" {
         try parseHealthStatusRange("304"),
     );
     try std.testing.expectError(error.InvalidHealthStatusRange, parseHealthStatusRange("500-200"));
+}
+
+test "validate absolute upstream URL accepts http and rejects malformed input" {
+    try validateOptionalAbsoluteUrlChecked("http://127.0.0.1:8080");
+    try validateOptionalAbsoluteUrlChecked("https://example.com/api");
+    try std.testing.expectError(error.InvalidConfigUrl, validateOptionalAbsoluteUrlChecked("127.0.0.1:8080"));
+    try std.testing.expectError(error.InvalidConfigUrl, validateOptionalAbsoluteUrlChecked("http://"));
+}
+
+test "validate socket endpoint accepts host port and unix path" {
+    try validateOptionalSocketEndpointChecked("127.0.0.1:9000");
+    try validateOptionalSocketEndpointChecked("unix:/tmp/php-fpm.sock");
+    try std.testing.expectError(error.InvalidConfigEndpoint, validateOptionalSocketEndpointChecked("missing-port"));
+    try std.testing.expectError(error.InvalidConfigPort, validateOptionalSocketEndpointChecked("127.0.0.1:0"));
+}
+
+test "missing tls cert path helper returns InvalidConfigPath" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var file = try tmp.dir.createFile("exists.pem", .{});
+    file.close();
+
+    const existing_path = try tmp.dir.realpathAlloc(std.testing.allocator, "exists.pem");
+    defer std.testing.allocator.free(existing_path);
+    const missing_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(missing_path);
+    const missing_file = try std.fmt.allocPrint(std.testing.allocator, "{s}/missing.pem", .{missing_path});
+    defer std.testing.allocator.free(missing_file);
+
+    try validateOptionalFileChecked(existing_path);
+    try std.testing.expectError(error.InvalidConfigPath, validateOptionalFileChecked(missing_file));
+}
+
+test "parse server blocks" {
+    const allocator = std.testing.allocator;
+    const raw =
+        "api.example.test" ++ "\x1f" ++ "/srv/api" ++ "\x1f" ++ "$uri /index.html" ++ "\x1f" ++ "/certs/api.crt" ++ "\x1f" ++ "/certs/api.key" ++ "\x1f" ++ "http://127.0.0.1:9101" ++ "\x1f" ++ "" ++ "\x1f" ++ "" ++ "\x1f" ++ "prefix|/|proxy_pass|http://127.0.0.1:9101";
+    const blocks = try parseServerBlocks(allocator, raw);
+    defer {
+        for (blocks) |*block| block.deinit(allocator);
+        allocator.free(blocks);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), blocks.len);
+    try std.testing.expectEqual(@as(usize, 1), blocks[0].server_names.len);
+    try std.testing.expectEqualStrings("api.example.test", blocks[0].server_names[0]);
+    try std.testing.expectEqualStrings("/srv/api", blocks[0].doc_root);
+    try std.testing.expectEqualStrings("$uri /index.html", blocks[0].try_files);
+    try std.testing.expectEqualStrings("/certs/api.crt", blocks[0].tls_cert_path);
+    try std.testing.expectEqualStrings("/certs/api.key", blocks[0].tls_key_path);
+    try std.testing.expectEqualStrings("http://127.0.0.1:9101", blocks[0].upstream_base_url);
+    try std.testing.expectEqual(@as(usize, 1), blocks[0].location_blocks.len);
+}
+
+test "conflicting file override value detects env/file mismatch" {
+    const allocator = std.testing.allocator;
+    var overrides = http.config_file.Overrides.init(allocator);
+    defer overrides.deinit(allocator);
+
+    try overrides.map.put(try allocator.dupe(u8, "TARDIGRADE_LISTEN_PORT"), try allocator.dupe(u8, "8069"));
+    const previous = active_file_overrides;
+    active_file_overrides = &overrides;
+    defer active_file_overrides = previous;
+
+    try std.testing.expectEqualStrings("8069", conflictingFileOverrideValue("TARDIGRADE_LISTEN_PORT", "18069").?);
+    try std.testing.expect(conflictingFileOverrideValue("TARDIGRADE_LISTEN_PORT", "8069") == null);
+    try std.testing.expect(conflictingFileOverrideValue("TARDIGRADE_WORKER_THREADS", "4") == null);
 }
 
 test "parse upstream health success status overrides" {

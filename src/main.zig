@@ -23,11 +23,12 @@ pub fn main() !void {
 
     var cfg = try edge_config.loadFromEnv(allocator);
     defer cfg.deinit(allocator);
+    try edge_config.validate(&cfg);
     try configureErrorLog(&cfg);
     try writePidFile(&cfg);
     defer removePidFile(&cfg);
     if (validate_flag) {
-        std.debug.print("configuration valid\\n", .{});
+        std.debug.print("configuration valid\n", .{});
         return;
     }
 
@@ -51,6 +52,14 @@ fn configureErrorLog(cfg: *const edge_config.EdgeConfig) !void {
             try rotateLogFiles(std.fs.cwd(), cfg.error_log_path, rotate_max_files);
         }
     }
+    var file = try std.fs.cwd().createFile(cfg.error_log_path, .{ .truncate = false, .read = false });
+    defer file.close();
+    try file.seekFromEnd(0);
+    try std.posix.dup2(file.handle, std.io.getStdErr().handle);
+}
+
+fn reopenErrorLog(cfg: *const edge_config.EdgeConfig) !void {
+    if (cfg.error_log_path.len == 0 or std.ascii.eqlIgnoreCase(cfg.error_log_path, "stderr")) return;
     var file = try std.fs.cwd().createFile(cfg.error_log_path, .{ .truncate = false, .read = false });
     defer file.close();
     try file.seekFromEnd(0);
@@ -148,6 +157,9 @@ fn runMaster(allocator: std.mem.Allocator, cfg: *const edge_config.EdgeConfig) !
             _ = try spawnMasterUpgrade(allocator, exe_path);
             http.shutdown.requestShutdown();
             break;
+        }
+        if (http.shutdown.consumeReopenLogsRequested()) {
+            reopenErrorLog(cfg) catch {};
         }
 
         for (0..worker_count) |i| {

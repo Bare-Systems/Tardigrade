@@ -4,6 +4,9 @@
 ## [0.30.0] - 2026-03-xx
 
 ### Added
+- Completed the remaining Upgrade 11.0 SMTP auth relay slice by injecting `X-Tardigrade-Auth-Identity` into relayed SMTP `DATA` message headers for authenticated requests, with integration coverage against the test upstream.
+- Added live IMAP and POP3 mail-relay coverage, proving `imap_pass` and `pop3_pass` relay LOGIN/USER/PASS command traffic through the existing raw mail proxy path.
+- Added IMAP STARTTLS upstream support for `imap_pass starttls://...`, including a live integration harness; on macOS the harness is currently skipped because the local Zig test runner intermittently disconnects before the STARTTLS exchange even though the relay path works in direct manual repros.
 - Upgrade 1 integration-test harness foundation:
   - Added a live-process `tests/integration.zig` suite that boots Tardigrade with deterministic env config.
   - Added a loopback upstream test server to exercise real proxy requests over TCP.
@@ -115,6 +118,7 @@
   - Added the remaining Upgrade 10.3 validation and reload regression coverage with a missing-TLS-cert validation test and an integration test proving invalid SIGHUP reloads are rejected without disrupting in-flight requests.
   - Started Upgrade 11.0 mail proxying by adding `smtp_pass` config parsing and a real raw-TCP SMTP relay integration test that proves `EHLO` and `DATA` are forwarded to a loopback upstream and the upstream SMTP reply is returned to the client.
   - Extended Upgrade 11.0 SMTP proxying with explicit `starttls://` / `tls://` upstream schemes, gateway-managed STARTTLS negotiation, validation for secure mail upstream endpoints, and integration coverage that proves the relay upgrades before forwarding the SMTP payload.
+  - The new SMTP STARTTLS integration harness is currently skipped on macOS because the external local helper is unstable under the Zig test runner there, although the relay path is manually verified end to end.
 
 ### Fixed
 - Upgrade 1 integration hardening in the live gateway path:

@@ -5794,11 +5794,22 @@ fn handleBackendProtocolTail(
     }
 
     if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/mail/smtp")) {
-        try handleSmtpProxyRoute(allocator, writer, cfg.smtp_upstream, request.body orelse "", correlation_id, keep_alive, state);
+        var identity = resolveRequestIdentity(allocator, cfg, state, &request.headers);
+        defer if (identity) |*owned_identity| owned_identity.deinit(allocator);
+        try handleSmtpProxyRoute(
+            allocator,
+            writer,
+            cfg.smtp_upstream,
+            request.body orelse "",
+            correlation_id,
+            keep_alive,
+            state,
+            if (identity) |resolved| resolved.value else null,
+        );
         return 200;
     }
     if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/mail/imap")) {
-        try handleMailProxyRoute(allocator, writer, cfg.imap_upstream, request.body orelse "", correlation_id, keep_alive, state);
+        try handleImapProxyRoute(allocator, writer, cfg.imap_upstream, request.body orelse "", correlation_id, keep_alive, state);
         return 200;
     }
     if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/mail/pop3")) {
@@ -7203,6 +7214,52 @@ fn handleMailProxyRoute(
     state.metricsRecord(200);
 }
 
+fn handleImapProxyRoute(
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    upstream: []const u8,
+    body: []const u8,
+    correlation_id: []const u8,
+    keep_alive: bool,
+    state: *GatewayState,
+) !void {
+    const endpoint = std.mem.trim(u8, upstream, " \t\r\n");
+    if (endpoint.len == 0) {
+        try sendApiError(allocator, writer, .not_implemented, "tool_unavailable", "Upstream not configured", correlation_id, keep_alive, state);
+        return;
+    }
+    const resp = blk: {
+        const maybe_mail_endpoint = parseMailProxyEndpoint(endpoint) catch |err| {
+            std.log.warn("imap proxy endpoint invalid: {}", .{err});
+            try sendApiError(allocator, writer, .bad_gateway, "tool_unavailable", "Upstream request failed", correlation_id, keep_alive, state);
+            return;
+        };
+        if (maybe_mail_endpoint) |mail_endpoint| {
+            break :blk executeImapProtocolRequest(allocator, mail_endpoint, body) catch |err| {
+                std.log.warn("imap proxy failed: {}", .{err});
+                try sendApiError(allocator, writer, .bad_gateway, "tool_unavailable", "Upstream request failed", correlation_id, keep_alive, state);
+                return;
+            };
+        }
+        break :blk executeRawProtocolRequest(allocator, endpoint, body) catch |err| {
+            std.log.warn("imap proxy failed: {}", .{err});
+            try sendApiError(allocator, writer, .bad_gateway, "tool_unavailable", "Upstream request failed", correlation_id, keep_alive, state);
+            return;
+        };
+    };
+    defer allocator.free(resp);
+    var response = http.Response.init(allocator);
+    defer response.deinit();
+    _ = response.setStatus(.ok)
+        .setBody(resp)
+        .setContentType("application/octet-stream")
+        .setConnection(keep_alive)
+        .setHeader(http.correlation.HEADER_NAME, correlation_id);
+    applyResponseHeaders(state, &response);
+    try response.write(writer);
+    state.metricsRecord(200);
+}
+
 const MailProxyTransport = enum {
     starttls,
     tls,
@@ -7222,12 +7279,15 @@ fn handleSmtpProxyRoute(
     correlation_id: []const u8,
     keep_alive: bool,
     state: *GatewayState,
+    auth_identity: ?[]const u8,
 ) !void {
     const endpoint = std.mem.trim(u8, upstream, " \t\r\n");
     if (endpoint.len == 0) {
         try sendApiError(allocator, writer, .not_implemented, "tool_unavailable", "Upstream not configured", correlation_id, keep_alive, state);
         return;
     }
+    const upstream_payload = try injectSmtpAuthIdentity(allocator, body, auth_identity);
+    defer if (upstream_payload.ptr != body.ptr) allocator.free(upstream_payload);
     const resp = blk: {
         const maybe_mail_endpoint = parseMailProxyEndpoint(endpoint) catch |err| {
             std.log.warn("smtp proxy endpoint invalid: {}", .{err});
@@ -7235,13 +7295,13 @@ fn handleSmtpProxyRoute(
             return;
         };
         if (maybe_mail_endpoint) |mail_endpoint| {
-            break :blk executeSmtpProtocolRequest(allocator, mail_endpoint, body) catch |err| {
+            break :blk executeSmtpProtocolRequest(allocator, mail_endpoint, upstream_payload) catch |err| {
                 std.log.warn("smtp proxy failed: {}", .{err});
                 try sendApiError(allocator, writer, .bad_gateway, "tool_unavailable", "Upstream request failed", correlation_id, keep_alive, state);
                 return;
             };
         }
-        break :blk executeRawProtocolRequest(allocator, endpoint, body) catch |err| {
+        break :blk executeRawProtocolRequest(allocator, endpoint, upstream_payload) catch |err| {
             std.log.warn("smtp proxy failed: {}", .{err});
             try sendApiError(allocator, writer, .bad_gateway, "tool_unavailable", "Upstream request failed", correlation_id, keep_alive, state);
             return;
@@ -7258,6 +7318,41 @@ fn handleSmtpProxyRoute(
     applyResponseHeaders(state, &response);
     try response.write(writer);
     state.metricsRecord(200);
+}
+
+fn injectSmtpAuthIdentity(
+    allocator: std.mem.Allocator,
+    payload: []const u8,
+    auth_identity: ?[]const u8,
+) ![]const u8 {
+    const identity = auth_identity orelse return payload;
+    if (identity.len == 0) return payload;
+
+    const data_start = findSmtpDataStart(payload) orelse return payload;
+    if (std.mem.indexOfPos(u8, payload, data_start, "X-Tardigrade-Auth-Identity:")) |_| return payload;
+
+    const header_line = try std.fmt.allocPrint(allocator, "X-Tardigrade-Auth-Identity: {s}\r\n", .{identity});
+    defer allocator.free(header_line);
+
+    if (std.mem.indexOfPos(u8, payload, data_start, "\r\n\r\n")) |_| {
+        return std.fmt.allocPrint(
+            allocator,
+            "{s}{s}{s}",
+            .{ payload[0..data_start], header_line, payload[data_start..] },
+        );
+    }
+
+    return std.fmt.allocPrint(
+        allocator,
+        "{s}{s}\r\n{s}",
+        .{ payload[0..data_start], header_line, payload[data_start..] },
+    );
+}
+
+fn findSmtpDataStart(payload: []const u8) ?usize {
+    if (std.mem.startsWith(u8, payload, "DATA\r\n")) return "DATA\r\n".len;
+    if (std.mem.indexOf(u8, payload, "\r\nDATA\r\n")) |idx| return idx + "\r\nDATA\r\n".len;
+    return null;
 }
 
 fn executeRawProtocolRequest(allocator: std.mem.Allocator, endpoint: []const u8, payload: []const u8) ![]u8 {
@@ -7315,6 +7410,16 @@ fn executeSmtpProtocolRequest(allocator: std.mem.Allocator, endpoint: MailProxyE
     };
 }
 
+fn executeImapProtocolRequest(allocator: std.mem.Allocator, endpoint: MailProxyEndpoint, payload: []const u8) ![]u8 {
+    const stream = try std.net.tcpConnectToHost(allocator, endpoint.host, endpoint.port);
+    defer stream.close();
+    try setSocketTimeoutMs(stream.handle, 10_000, 10_000);
+    return switch (endpoint.transport) {
+        .tls => executeImapTlsRequest(allocator, stream, endpoint.host, payload),
+        .starttls => executeImapStartTlsRequest(allocator, stream, endpoint.host, payload),
+    };
+}
+
 fn executeSmtpTlsRequest(
     allocator: std.mem.Allocator,
     stream: std.net.Stream,
@@ -7338,24 +7443,18 @@ fn executeSmtpStartTlsRequest(
     payload: []const u8,
 ) ![]u8 {
     _ = host;
-    std.log.warn("smtp starttls stage=greeting_read", .{});
     const greeting = try readSmtpReplyPlain(allocator, stream);
     defer allocator.free(greeting);
-    std.log.warn("smtp starttls stage=greeting_ok", .{});
     if (!smtpReplyContainsCode(greeting, "220")) return error.ProtocolError;
 
     try stream.writer().writeAll("EHLO tardigrade.local\r\n");
-    std.log.warn("smtp starttls stage=ehlo_sent", .{});
     const ehlo_reply = try readSmtpReplyPlain(allocator, stream);
     defer allocator.free(ehlo_reply);
-    std.log.warn("smtp starttls stage=ehlo_reply_ok", .{});
     if (!smtpReplyAdvertisesStartTls(ehlo_reply)) return error.ProtocolError;
 
     try stream.writer().writeAll("STARTTLS\r\n");
-    std.log.warn("smtp starttls stage=starttls_sent", .{});
     const starttls_reply = try readSmtpReplyPlain(allocator, stream);
     defer allocator.free(starttls_reply);
-    std.log.warn("smtp starttls stage=starttls_reply_ok", .{});
     if (!smtpReplyContainsCode(starttls_reply, "220")) return error.ProtocolError;
 
     var tls_client = try std.crypto.tls.Client.init(stream, .{
@@ -7363,18 +7462,61 @@ fn executeSmtpStartTlsRequest(
         .ca = .no_verification,
     });
     tls_client.allow_truncation_attacks = true;
-    std.log.warn("smtp starttls stage=tls_client_ready", .{});
 
     try tls_client.writeAll(stream, "EHLO tardigrade.local\r\n");
-    std.log.warn("smtp starttls stage=post_tls_ehlo_sent", .{});
     const post_tls_ehlo = try readSmtpReplyTls(allocator, &tls_client, stream);
     defer allocator.free(post_tls_ehlo);
-    std.log.warn("smtp starttls stage=post_tls_ehlo_ok", .{});
     if (!smtpReplyContainsCode(post_tls_ehlo, "250")) return error.ProtocolError;
 
     try tls_client.writeAll(stream, payload);
-    std.log.warn("smtp starttls stage=payload_sent", .{});
     return readSmtpReplyTls(allocator, &tls_client, stream);
+}
+
+fn executeImapTlsRequest(
+    allocator: std.mem.Allocator,
+    stream: std.net.Stream,
+    host: []const u8,
+    payload: []const u8,
+) ![]u8 {
+    _ = host;
+    var tls_client = try std.crypto.tls.Client.init(stream, .{
+        .host = .no_verification,
+        .ca = .no_verification,
+    });
+    tls_client.allow_truncation_attacks = true;
+
+    const greeting = try readImapReplyTls(allocator, &tls_client, stream, null);
+    defer allocator.free(greeting);
+    if (!imapReplyContainsOk(greeting)) return error.ProtocolError;
+
+    try tls_client.writeAll(stream, payload);
+    return readImapReplyTls(allocator, &tls_client, stream, imapPayloadTag(payload));
+}
+
+fn executeImapStartTlsRequest(
+    allocator: std.mem.Allocator,
+    stream: std.net.Stream,
+    host: []const u8,
+    payload: []const u8,
+) ![]u8 {
+    _ = host;
+    const greeting = try readImapReplyPlain(allocator, stream, null);
+    defer allocator.free(greeting);
+    if (!imapReplyContainsOk(greeting)) return error.ProtocolError;
+
+    try stream.writer().writeAll("a001 STARTTLS\r\n");
+    const starttls_reply = try readImapReplyPlain(allocator, stream, "a001");
+    defer allocator.free(starttls_reply);
+    if (!imapTaggedReplyContainsOk(starttls_reply, "a001")) return error.ProtocolError;
+
+    var tls_client = try std.crypto.tls.Client.init(stream, .{
+        .host = .no_verification,
+        .ca = .no_verification,
+    });
+    tls_client.allow_truncation_attacks = true;
+
+    try tls_client.writeAll(stream, payload);
+    return readImapReplyTls(allocator, &tls_client, stream, imapPayloadTag(payload));
 }
 
 fn readSmtpReplyPlain(allocator: std.mem.Allocator, stream: std.net.Stream) ![]u8 {
@@ -7403,6 +7545,73 @@ fn readSmtpReplyTls(allocator: std.mem.Allocator, tls_client: *std.crypto.tls.Cl
     }
     if (out.items.len == 0) return error.EndOfStream;
     return out.toOwnedSlice();
+}
+
+fn readImapReplyPlain(allocator: std.mem.Allocator, stream: std.net.Stream, tag: ?[]const u8) ![]u8 {
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    var buf: [2048]u8 = undefined;
+    while (true) {
+        const n = try stream.read(&buf);
+        if (n == 0) break;
+        try out.appendSlice(buf[0..n]);
+        if (imapReplyComplete(out.items, tag)) break;
+    }
+    if (out.items.len == 0) return error.EndOfStream;
+    return out.toOwnedSlice();
+}
+
+fn readImapReplyTls(
+    allocator: std.mem.Allocator,
+    tls_client: *std.crypto.tls.Client,
+    stream: std.net.Stream,
+    tag: ?[]const u8,
+) ![]u8 {
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    var buf: [2048]u8 = undefined;
+    while (true) {
+        const n = try tls_client.read(stream, &buf);
+        if (n == 0) break;
+        try out.appendSlice(buf[0..n]);
+        if (imapReplyComplete(out.items, tag)) break;
+    }
+    if (out.items.len == 0) return error.EndOfStream;
+    return out.toOwnedSlice();
+}
+
+fn imapPayloadTag(payload: []const u8) ?[]const u8 {
+    const line_end = std.mem.indexOf(u8, payload, "\r\n") orelse payload.len;
+    const first_line = payload[0..line_end];
+    var toks = std.mem.tokenizeAny(u8, first_line, " \t");
+    return toks.next();
+}
+
+fn imapReplyComplete(reply: []const u8, tag: ?[]const u8) bool {
+    if (!std.mem.endsWith(u8, reply, "\r\n")) return false;
+    if (tag) |t| {
+        var it = std.mem.splitSequence(u8, reply, "\r\n");
+        while (it.next()) |line| {
+            if (line.len == 0) continue;
+            if (std.mem.startsWith(u8, line, t) and line.len > t.len and line[t.len] == ' ') return true;
+        }
+        return false;
+    }
+    return true;
+}
+
+fn imapReplyContainsOk(reply: []const u8) bool {
+    return std.mem.indexOf(u8, reply, " OK") != null or std.mem.startsWith(u8, std.mem.trim(u8, reply, " \t\r\n"), "* OK");
+}
+
+fn imapTaggedReplyContainsOk(reply: []const u8, tag: []const u8) bool {
+    var it = std.mem.splitSequence(u8, reply, "\r\n");
+    while (it.next()) |line| {
+        if (std.mem.startsWith(u8, line, tag) and line.len > tag.len and line[tag.len] == ' ') {
+            return std.mem.indexOf(u8, line, " OK") != null;
+        }
+    }
+    return false;
 }
 
 fn smtpReplyComplete(reply: []const u8) bool {

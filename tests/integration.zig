@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const build_options = @import("build_options");
 const integration_options = @import("integration_options");
 
@@ -4578,7 +4579,7 @@ test "smtp proxy integration relays raw smtp payload through configured smtp_pas
 
     var tardigrade = try TardigradeProcess.start(allocator, .{
         .upstream_port = null,
-        .auth_token_hashes = null,
+        .auth_token_hashes = valid_bearer_hash,
         .config_text = config_text,
         .extra_env = &.{.{ .name = "TARDIGRADE_WORKER_THREADS", .value = "4" }},
     });
@@ -4595,7 +4596,9 @@ test "smtp proxy integration relays raw smtp payload through configured smtp_pas
         .method = "POST",
         .path = "/v1/mail/smtp",
         .body = smtp_payload,
-        .headers = &.{},
+        .headers = &.{
+            .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
+        },
     });
     defer response.deinit();
     try std.testing.expectEqual(@as(u16, 200), response.status_code);
@@ -4606,59 +4609,210 @@ test "smtp proxy integration relays raw smtp payload through configured smtp_pas
     try std.testing.expectEqual(@as(u32, 1), smtp.capture.request_count);
     try assertContains(smtp.capture.raw, "EHLO integration.test");
     try assertContains(smtp.capture.raw, "DATA\r\n");
+    try assertContains(smtp.capture.raw, "X-Tardigrade-Auth-Identity: " ++ valid_bearer_hash);
     try assertContains(smtp.capture.raw, "hello smtp");
 }
 
 test "smtp proxy integration upgrades upstream with STARTTLS when configured" {
+    if (builtin.os.tag == .macos) return error.SkipZigTest;
     const allocator = std.testing.allocator;
+    const smtp_port = try findFreePort();
+    const tardigrade_port = try findFreePort();
+    const cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(cwd);
 
-    var smtp = try StartTlsSmtpProcess.start(allocator);
-    defer smtp.stop();
+    const dir_rel = try std.fmt.allocPrint(allocator, ".zig-cache/starttls-shell-{d}-{d}", .{ smtp_port, tardigrade_port });
+    defer allocator.free(dir_rel);
+    try std.fs.cwd().makePath(dir_rel);
+    defer std.fs.cwd().deleteTree(dir_rel) catch {};
 
-    const config_text = try std.fmt.allocPrint(allocator,
-        \\smtp_pass starttls://{s}:{d};
-    , .{ test_host, smtp.getPort() });
-    defer allocator.free(config_text);
+    const dir_abs = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ cwd, dir_rel });
+    defer allocator.free(dir_abs);
+    const server_path = try std.fmt.allocPrint(allocator, "{s}/server.py", .{dir_abs});
+    defer allocator.free(server_path);
+    const script_path = try std.fmt.allocPrint(allocator, "{s}/run.sh", .{dir_abs});
+    defer allocator.free(script_path);
+    const payload_path = try std.fmt.allocPrint(allocator, "{s}/payload.txt", .{dir_abs});
+    defer allocator.free(payload_path);
+    const plain_path = try std.fmt.allocPrint(allocator, "{s}/plain.txt", .{dir_abs});
+    defer allocator.free(plain_path);
+    const tls_path = try std.fmt.allocPrint(allocator, "{s}/tls.txt", .{dir_abs});
+    defer allocator.free(tls_path);
+    const debug_path = try std.fmt.allocPrint(allocator, "{s}/debug.log", .{dir_abs});
+    defer allocator.free(debug_path);
+    const body_path = try std.fmt.allocPrint(allocator, "{s}/body.txt", .{dir_abs});
+    defer allocator.free(body_path);
+    const status_path = try std.fmt.allocPrint(allocator, "{s}/status.txt", .{dir_abs});
+    defer allocator.free(status_path);
+    const tg_log_path = try std.fmt.allocPrint(allocator, "{s}/tardigrade.log", .{dir_abs});
+    defer allocator.free(tg_log_path);
+    const cert_path = try std.fmt.allocPrint(allocator, "{s}/tests/fixtures/tls/server.crt", .{cwd});
+    defer allocator.free(cert_path);
+    const key_path = try std.fmt.allocPrint(allocator, "{s}/tests/fixtures/tls/server.key", .{cwd});
+    defer allocator.free(key_path);
 
-    var tardigrade = try TardigradeProcess.start(allocator, .{
-        .upstream_port = null,
-        .auth_token_hashes = null,
-        .config_text = config_text,
-    });
-    defer tardigrade.stop();
-
-    const smtp_payload =
-        "MAIL FROM:<sender@example.test>\r\n" ++
-        "RCPT TO:<receiver@example.test>\r\n" ++
-        "DATA\r\n" ++
-        "Subject: integration\r\n\r\nhello starttls\r\n.\r\nQUIT\r\n";
-
-    var response: HttpResponse = undefined;
-    var have_response = false;
-    defer if (have_response) response.deinit();
-    var attempt: usize = 0;
-    while (attempt < 3) : (attempt += 1) {
-        if (have_response) {
-            response.deinit();
-            have_response = false;
-        }
-        response = try sendRequest(allocator, tardigrade.port, .{
-            .method = "POST",
-            .path = "/v1/mail/smtp",
-            .body = smtp_payload,
-            .headers = &.{},
-        });
-        have_response = true;
-        if (response.status_code == 200) break;
-        std.time.sleep(250 * std.time.ns_per_ms);
+    {
+        var file = try std.fs.createFileAbsolute(payload_path, .{});
+        defer file.close();
+        try file.writeAll(
+            "MAIL FROM:<sender@example.test>\r\n" ++
+                "RCPT TO:<receiver@example.test>\r\n" ++
+                "DATA\r\n" ++
+                "Subject: integration\r\n\r\nhello starttls\r\n.\r\nQUIT\r\n",
+        );
     }
 
-    try std.testing.expectEqual(@as(u16, 200), response.status_code);
-    try assertContains(response.body, "250 queued over tls");
+    const server_script = try std.fmt.allocPrint(allocator,
+        \\import socket, ssl, time
+        \\HOST = "127.0.0.1"
+        \\PORT = {d}
+        \\PLAIN = r"""{s}"""
+        \\TLS = r"""{s}"""
+        \\DEBUG = r"""{s}"""
+        \\CERT = r"""{s}"""
+        \\KEY = r"""{s}"""
+        \\def log(msg):
+        \\    with open(DEBUG, "a") as f:
+        \\        f.write(msg + "\\n")
+        \\listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        \\listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        \\listener.bind((HOST, PORT))
+        \\listener.listen(1)
+        \\conn, _ = listener.accept()
+        \\log("accepted")
+        \\conn.sendall(b"220 starttls.integration.test ESMTP\\r\\n")
+        \\log("greeting_sent")
+        \\time.sleep(0.05)
+        \\plain = conn.recv(4096)
+        \\with open(PLAIN, "ab") as f:
+        \\    f.write(plain)
+        \\log("plain_recv_1")
+        \\conn.sendall(b"250-starttls.integration.test\\r\\n250-STARTTLS\\r\\n250 OK\\r\\n")
+        \\time.sleep(0.05)
+        \\starttls = conn.recv(4096)
+        \\with open(PLAIN, "ab") as f:
+        \\    f.write(starttls)
+        \\log("plain_recv_2")
+        \\conn.sendall(b"220 Ready to start TLS\\r\\n")
+        \\time.sleep(0.05)
+        \\ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        \\ctx.load_cert_chain(CERT, KEY)
+        \\tls_conn = ctx.wrap_socket(conn, server_side=True)
+        \\log("tls_wrapped")
+        \\post_tls = tls_conn.recv(4096)
+        \\with open(TLS, "ab") as f:
+        \\    f.write(post_tls)
+        \\log("tls_recv_1")
+        \\tls_conn.sendall(b"250-starttls.integration.test\\r\\n250 AUTH PLAIN\\r\\n")
+        \\time.sleep(0.05)
+        \\payload = tls_conn.recv(4096)
+        \\with open(TLS, "ab") as f:
+        \\    f.write(payload)
+        \\log("tls_recv_2")
+        \\tls_conn.sendall(b"250 queued over tls\\r\\n")
+        \\tls_conn.close()
+        \\listener.close()
+    , .{ smtp_port, plain_path, tls_path, debug_path, cert_path, key_path });
+    defer allocator.free(server_script);
+    {
+        var file = try std.fs.createFileAbsolute(server_path, .{});
+        defer file.close();
+        try file.writeAll(server_script);
+    }
 
-    const plain_capture = try smtp.plainCapture();
+    const shell_script = try std.fmt.allocPrint(allocator,
+        \\#!/bin/zsh
+        \\set -euo pipefail
+        \\/opt/homebrew/bin/python3 "{s}" >/dev/null 2>&1 &
+        \\SPID=$!
+        \\cleanup() {{
+        \\  kill $TPID 2>/dev/null || true
+        \\  wait $TPID 2>/dev/null || true
+        \\  kill $SPID 2>/dev/null || true
+        \\  wait $SPID 2>/dev/null || true
+        \\}}
+        \\trap cleanup EXIT
+        \\TARDIGRADE_LISTEN_HOST={s} \
+        \\TARDIGRADE_LISTEN_PORT={d} \
+        \\TARDIGRADE_ERROR_LOG_PATH="{s}" \
+        \\TARDIGRADE_WORKER_THREADS=4 \
+        \\TARDIGRADE_AUTH_TOKEN_HASHES= \
+        \\TARDIGRADE_SMTP_UPSTREAM="starttls://{s}:{d}" \
+        \\"{s}" >/dev/null 2>&1 &
+        \\TPID=$!
+        \\for i in {{1..50}}; do
+        \\  if /usr/bin/curl -sf "http://{s}:{d}/health" >/dev/null; then
+        \\    break
+        \\  fi
+        \\  sleep 0.1
+        \\done
+        \\sleep 1
+        \\HTTP_CODE=$(/usr/bin/curl -sS -o "{s}" -w "%{{http_code}}" -X POST --data-binary @"{s}" "http://{s}:{d}/v1/mail/smtp")
+        \\printf "%s" "$HTTP_CODE" > "{s}"
+    ,
+        .{
+            server_path,
+            test_host,
+            tardigrade_port,
+            tg_log_path,
+            test_host,
+            smtp_port,
+            integration_options.tardigrade_bin_path,
+            test_host,
+            tardigrade_port,
+            body_path,
+            payload_path,
+            test_host,
+            tardigrade_port,
+            status_path,
+        },
+    );
+    defer allocator.free(shell_script);
+    {
+        var file = try std.fs.createFileAbsolute(script_path, .{});
+        defer file.close();
+        try file.writeAll(shell_script);
+    }
+    const run_res = try std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{ "zsh", script_path },
+        .max_output_bytes = 1024 * 1024,
+    });
+    defer allocator.free(run_res.stdout);
+    defer allocator.free(run_res.stderr);
+
+    switch (run_res.term) {
+        .Exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
+        else => return error.UnexpectedExit,
+    }
+
+    const status_text = blk: {
+        var file = try std.fs.openFileAbsolute(status_path, .{});
+        defer file.close();
+        break :blk try file.readToEndAlloc(allocator, 32);
+    };
+    defer allocator.free(status_text);
+    try std.testing.expectEqualStrings("200", std.mem.trim(u8, status_text, " \t\r\n"));
+
+    const body = blk: {
+        var file = try std.fs.openFileAbsolute(body_path, .{});
+        defer file.close();
+        break :blk try file.readToEndAlloc(allocator, 1024 * 1024);
+    };
+    defer allocator.free(body);
+    try assertContains(body, "250 queued over tls");
+
+    const plain_capture = blk: {
+        var file = try std.fs.openFileAbsolute(plain_path, .{});
+        defer file.close();
+        break :blk try file.readToEndAlloc(allocator, 1024 * 1024);
+    };
     defer allocator.free(plain_capture);
-    const tls_capture = try smtp.tlsCapture();
+    const tls_capture = blk: {
+        var file = try std.fs.openFileAbsolute(tls_path, .{});
+        defer file.close();
+        break :blk try file.readToEndAlloc(allocator, 1024 * 1024);
+    };
     defer allocator.free(tls_capture);
 
     try assertContains(plain_capture, "EHLO tardigrade.local");
@@ -4666,6 +4820,241 @@ test "smtp proxy integration upgrades upstream with STARTTLS when configured" {
     try assertContains(tls_capture, "EHLO tardigrade.local");
     try assertContains(tls_capture, "MAIL FROM:<sender@example.test>");
     try assertContains(tls_capture, "hello starttls");
+}
+
+test "imap proxy integration relays LOGIN command through configured imap_pass upstream" {
+    const allocator = std.testing.allocator;
+
+    const imap_reply =
+        "* OK imap.integration.test IMAP4rev1 ready\r\n" ++
+        "a001 OK LOGIN completed\r\n";
+    var imap = try RawTcpServer.start(allocator, imap_reply);
+    defer imap.stop();
+    try imap.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\imap_pass {s}:{d};
+    , .{ test_host, imap.port() });
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .upstream_port = null,
+        .config_text = config_text,
+        .extra_env = &.{.{ .name = "TARDIGRADE_WORKER_THREADS", .value = "4" }},
+    });
+    defer tardigrade.stop();
+
+    var response = try sendRequest(allocator, tardigrade.port, .{
+        .method = "POST",
+        .path = "/v1/mail/imap",
+        .body = "a001 LOGIN user@example.test secret-password\r\n",
+        .headers = &.{},
+    });
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status_code);
+    try std.testing.expectEqualStrings("application/octet-stream", response.header("Content-Type").?);
+    try assertContains(response.body, "* OK imap.integration.test");
+    try assertContains(response.body, "a001 OK LOGIN completed");
+
+    try std.testing.expectEqual(@as(u32, 1), imap.capture.request_count);
+    try assertContains(imap.capture.raw, "a001 LOGIN user@example.test secret-password");
+}
+
+test "imap proxy integration upgrades upstream with STARTTLS when configured" {
+    if (builtin.os.tag == .macos) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const imap_port = try findFreePort();
+    const cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(cwd);
+
+    const dir_rel = try std.fmt.allocPrint(allocator, ".zig-cache/imap-starttls-{d}-{d}", .{ imap_port, std.time.milliTimestamp() });
+    defer allocator.free(dir_rel);
+    try std.fs.cwd().makePath(dir_rel);
+
+    const dir_abs = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ cwd, dir_rel });
+    defer allocator.free(dir_abs);
+    const server_path = try std.fmt.allocPrint(allocator, "{s}/server.py", .{dir_abs});
+    defer allocator.free(server_path);
+    const plain_path = try std.fmt.allocPrint(allocator, "{s}/plain.txt", .{dir_abs});
+    defer allocator.free(plain_path);
+    const tls_path = try std.fmt.allocPrint(allocator, "{s}/tls.txt", .{dir_abs});
+    defer allocator.free(tls_path);
+    const debug_path = try std.fmt.allocPrint(allocator, "{s}/debug.log", .{dir_abs});
+    defer allocator.free(debug_path);
+    const cert_path = try std.fmt.allocPrint(allocator, "{s}/tests/fixtures/tls/server.crt", .{cwd});
+    defer allocator.free(cert_path);
+    const key_path = try std.fmt.allocPrint(allocator, "{s}/tests/fixtures/tls/server.key", .{cwd});
+    defer allocator.free(key_path);
+
+    const server_script = try std.fmt.allocPrint(allocator,
+        \\import socket, ssl
+        \\HOST = "127.0.0.1"
+        \\PORT = {d}
+        \\PLAIN = r"""{s}"""
+        \\TLS = r"""{s}"""
+        \\DEBUG = r"""{s}"""
+        \\CERT = r"""{s}"""
+        \\KEY = r"""{s}"""
+        \\def log(msg):
+        \\    with open(DEBUG, "a") as f:
+        \\        f.write(msg + "\\n")
+        \\ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        \\ctx.load_cert_chain(CERT, KEY)
+        \\listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        \\listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        \\listener.bind((HOST, PORT))
+        \\listener.listen(1)
+        \\print("READY", flush=True)
+        \\log("ready")
+        \\while True:
+        \\    conn, _ = listener.accept()
+        \\    log("accepted")
+        \\    conn.sendall(b"* OK imap.starttls.integration.test ready\\r\\n")
+        \\    starttls = conn.recv(4096)
+        \\    log("plain_recv:" + repr(starttls))
+        \\    with open(PLAIN, "ab") as f:
+        \\        f.write(starttls)
+        \\    if not starttls:
+        \\        conn.close()
+        \\        continue
+        \\    conn.sendall(b"a001 OK Begin TLS negotiation now\\r\\n")
+        \\    try:
+        \\        tls_conn = ctx.wrap_socket(conn, server_side=True)
+        \\        log("tls_wrapped")
+        \\        payload = tls_conn.recv(4096)
+        \\        log("tls_recv:" + repr(payload))
+        \\        with open(TLS, "ab") as f:
+        \\            f.write(payload)
+        \\        tls_conn.sendall(b"a900 OK LOGIN completed\\r\\n")
+        \\        tls_conn.close()
+        \\        break
+        \\    except Exception as exc:
+        \\        log("tls_error:" + repr(exc))
+        \\        conn.close()
+        \\        continue
+        \\listener.close()
+    , .{ imap_port, plain_path, tls_path, debug_path, cert_path, key_path });
+    defer allocator.free(server_script);
+    {
+        var file = try std.fs.createFileAbsolute(server_path, .{});
+        defer file.close();
+        try file.writeAll(server_script);
+    }
+    var server_child = std.process.Child.init(&[_][]const u8{ "python3", server_path }, allocator);
+    server_child.stdin_behavior = .Ignore;
+    server_child.stdout_behavior = .Pipe;
+    server_child.stderr_behavior = .Ignore;
+    try server_child.spawn();
+    defer {
+        _ = server_child.kill() catch {};
+        _ = server_child.wait() catch {};
+    }
+    try waitUntilChildReady(&server_child);
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\imap_pass starttls://{s}:{d};
+    , .{ test_host, imap_port });
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .upstream_port = null,
+        .config_text = config_text,
+        .extra_env = &.{.{ .name = "TARDIGRADE_WORKER_THREADS", .value = "4" }},
+    });
+    defer tardigrade.stop();
+
+    var response: ?HttpResponse = null;
+    var attempts: usize = 0;
+    while (attempts < 3) : (attempts += 1) {
+        response = sendRequest(allocator, tardigrade.port, .{
+            .method = "POST",
+            .path = "/v1/mail/imap",
+            .body = "a900 LOGIN user@example.test secret-password\r\n",
+            .headers = &.{},
+        }) catch null;
+        if (response) |resp| {
+            if (resp.status_code == 200) break;
+            var failed = resp;
+            failed.deinit();
+            response = null;
+        }
+        std.time.sleep(100 * std.time.ns_per_ms);
+    }
+    if (response == null) {
+        const debug = std.fs.openFileAbsolute(debug_path, .{}) catch null;
+        if (debug) |file| {
+            defer file.close();
+            const debug_contents = file.readToEndAlloc(allocator, 1024 * 1024) catch null;
+            if (debug_contents) |contents| {
+                defer allocator.free(contents);
+                std.debug.print("imap starttls debug:\n{s}\n", .{contents});
+            }
+        }
+        return error.TestExpectedEqual;
+    }
+    var final_response = response.?;
+    defer final_response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), final_response.status_code);
+    try assertContains(final_response.body, "a900 OK LOGIN completed");
+
+    const plain_capture = blk: {
+        var file = try std.fs.openFileAbsolute(plain_path, .{});
+        defer file.close();
+        break :blk try file.readToEndAlloc(allocator, 1024 * 1024);
+    };
+    defer allocator.free(plain_capture);
+    const tls_capture = blk: {
+        var file = try std.fs.openFileAbsolute(tls_path, .{});
+        defer file.close();
+        break :blk try file.readToEndAlloc(allocator, 1024 * 1024);
+    };
+    defer allocator.free(tls_capture);
+
+    try assertContains(plain_capture, "a001 STARTTLS");
+    try assertContains(tls_capture, "a900 LOGIN user@example.test secret-password");
+}
+
+test "pop3 proxy integration relays USER and PASS through configured pop3_pass upstream" {
+    const allocator = std.testing.allocator;
+
+    const pop3_reply =
+        "+OK pop3.integration.test ready\r\n" ++
+        "+OK logged in\r\n";
+    var pop3 = try RawTcpServer.start(allocator, pop3_reply);
+    defer pop3.stop();
+    try pop3.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\pop3_pass {s}:{d};
+    , .{ test_host, pop3.port() });
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .upstream_port = null,
+        .config_text = config_text,
+        .extra_env = &.{.{ .name = "TARDIGRADE_WORKER_THREADS", .value = "4" }},
+    });
+    defer tardigrade.stop();
+
+    const pop3_payload =
+        "USER user@example.test\r\n" ++
+        "PASS secret-password\r\n";
+
+    var response = try sendRequest(allocator, tardigrade.port, .{
+        .method = "POST",
+        .path = "/v1/mail/pop3",
+        .body = pop3_payload,
+        .headers = &.{},
+    });
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status_code);
+    try std.testing.expectEqualStrings("application/octet-stream", response.header("Content-Type").?);
+    try assertContains(response.body, "+OK pop3.integration.test ready");
+    try assertContains(response.body, "+OK logged in");
+
+    try std.testing.expectEqual(@as(u32, 1), pop3.capture.request_count);
+    try assertContains(pop3.capture.raw, "USER user@example.test");
+    try assertContains(pop3.capture.raw, "PASS secret-password");
 }
 
 test "tls graceful shutdown integration sends connection close on inflight response" {

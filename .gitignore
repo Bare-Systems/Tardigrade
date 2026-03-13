@@ -3,6 +3,7 @@ zig-out/
 changes/
 CLAUDE.md
 .claude/worktrees/
+PLAN.md
 
 # Secrets and environment files — never commit these
 .env

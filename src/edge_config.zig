@@ -188,8 +188,11 @@ pub const EdgeConfig = struct {
     request_limits: http.request_limits.RequestLimits,
     /// Basic auth credential hashes (SHA-256 of "user:password", empty = disabled).
     basic_auth_hashes: [][]const u8,
+    /// Bearer token hashes (SHA-256 of the raw bearer token, empty = disabled).
+    auth_token_hashes: [][]const u8,
     session_ttl_seconds: u32,
     session_max: u32,
+    session_store_path: []const u8,
     device_registry_path: []const u8,
     policy_rules_raw: []const u8,
     policy_user_scopes_raw: []const u8,
@@ -351,6 +354,7 @@ pub const EdgeConfig = struct {
     approval_escalation_webhook: []const u8,
     approval_ttl_ms: i64,
     approval_max_pending_per_identity: u32,
+    transcript_store_path: []const u8,
 
     pub fn deinit(self: *EdgeConfig, allocator: std.mem.Allocator) void {
         allocator.free(self.listen_host);
@@ -404,6 +408,9 @@ pub const EdgeConfig = struct {
         allocator.free(self.add_headers);
         for (self.basic_auth_hashes) |h| allocator.free(h);
         allocator.free(self.basic_auth_hashes);
+        for (self.auth_token_hashes) |h| allocator.free(h);
+        allocator.free(self.auth_token_hashes);
+        allocator.free(self.session_store_path);
         allocator.free(self.device_registry_path);
         allocator.free(self.policy_rules_raw);
         allocator.free(self.policy_user_scopes_raw);
@@ -488,6 +495,7 @@ pub const EdgeConfig = struct {
         allocator.free(self.udp_proxy_upstream);
         allocator.free(self.approval_store_path);
         allocator.free(self.approval_escalation_webhook);
+        allocator.free(self.transcript_store_path);
         self.* = undefined;
     }
 };
@@ -740,8 +748,13 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     const raw_basic_hashes = envOrDefault(allocator, "TARDIGRADE_BASIC_AUTH_HASHES", "") catch unreachable;
     defer allocator.free(raw_basic_hashes);
     const basic_auth_hashes = try parseHashes(allocator, raw_basic_hashes);
+    const raw_auth_token_hashes = envOrDefault(allocator, "TARDIGRADE_AUTH_TOKEN_HASHES", "") catch unreachable;
+    defer allocator.free(raw_auth_token_hashes);
+    const auth_token_hashes = try parseHashes(allocator, raw_auth_token_hashes);
     const session_ttl_seconds = parseIntEnv(u32, allocator, "TARDIGRADE_SESSION_TTL_SECONDS", 3600);
     const session_max = parseIntEnv(u32, allocator, "TARDIGRADE_SESSION_MAX", 128);
+    const session_store_path = envOrDefault(allocator, "TARDIGRADE_SESSION_STORE_PATH", "") catch unreachable;
+    errdefer allocator.free(session_store_path);
     const device_registry_path = envOrDefault(allocator, "TARDIGRADE_DEVICE_REGISTRY_PATH", "") catch unreachable;
     errdefer allocator.free(device_registry_path);
     const policy_rules_raw = envOrDefault(allocator, "TARDIGRADE_POLICY_RULES", "") catch unreachable;
@@ -851,6 +864,8 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     errdefer allocator.free(approval_escalation_webhook);
     const approval_ttl_ms = parseIntEnv(i64, allocator, "TARDIGRADE_APPROVAL_TTL_MS", 300_000);
     const approval_max_pending_per_identity = parseIntEnv(u32, allocator, "TARDIGRADE_APPROVAL_MAX_PENDING_PER_IDENTITY", 0);
+    const transcript_store_path = envOrDefault(allocator, "TARDIGRADE_TRANSCRIPT_STORE_PATH", "") catch unreachable;
+    errdefer allocator.free(transcript_store_path);
 
     const fd_soft_limit_str = envOrDefault(allocator, "TARDIGRADE_FD_SOFT_LIMIT", "0") catch unreachable;
     defer allocator.free(fd_soft_limit_str);
@@ -1166,8 +1181,10 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
             .header_timeout_ms = header_timeout_ms,
         },
         .basic_auth_hashes = basic_auth_hashes,
+        .auth_token_hashes = auth_token_hashes,
         .session_ttl_seconds = session_ttl_seconds,
         .session_max = session_max,
+        .session_store_path = session_store_path,
         .device_registry_path = device_registry_path,
         .policy_rules_raw = policy_rules_raw,
         .policy_user_scopes_raw = policy_user_scopes_raw,
@@ -1258,6 +1275,7 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .approval_escalation_webhook = approval_escalation_webhook,
         .approval_ttl_ms = approval_ttl_ms,
         .approval_max_pending_per_identity = approval_max_pending_per_identity,
+        .transcript_store_path = transcript_store_path,
     };
 }
 

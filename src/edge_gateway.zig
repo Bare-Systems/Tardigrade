@@ -59,6 +59,20 @@ const UpstreamScope = enum {
     commands,
 };
 
+fn upstreamScopeName(scope: UpstreamScope) []const u8 {
+    return switch (scope) {
+        .global => "global",
+        .chat => "chat",
+        .commands => "commands",
+    };
+}
+
+fn proxyScopeForPath(path: []const u8) UpstreamScope {
+    if (http.api_router.matchRoute(path, 1, "/chat")) return .chat;
+    if (http.api_router.matchRoute(path, 1, "/commands")) return .commands;
+    return .global;
+}
+
 const UpstreamPoolView = struct {
     fallback_url: []const u8,
     primary_urls: []const []const u8,
@@ -238,6 +252,7 @@ const GatewayState = struct {
     idempotency_mutex: std.Thread.Mutex = .{},
     proxy_cache_mutex: std.Thread.Mutex = .{},
     session_mutex: std.Thread.Mutex = .{},
+    transcript_mutex: std.Thread.Mutex = .{},
     command_mutex: std.Thread.Mutex = .{},
     approval_mutex: std.Thread.Mutex = .{},
     circuit_mutex: std.Thread.Mutex = .{},
@@ -254,6 +269,7 @@ const GatewayState = struct {
     http3_alt_svc: ?[]u8,
     http3_runtime: ?*http.http3_runtime.Runtime,
     session_store: ?http.session.SessionStore,
+    session_store_path: []const u8,
     access_control: ?http.access_control.AccessControl,
     logger: http.logger.Logger,
     metrics: http.metrics.Metrics,
@@ -297,6 +313,7 @@ const GatewayState = struct {
     approval_ttl_ms: i64,
     /// Max concurrent pending approval requests per identity (0 = unlimited).
     approval_max_pending_per_identity: u32,
+    transcript_store_path: []const u8,
 
     fn deinit(self: *GatewayState) void {
         if (self.rate_limiter) |*rl| rl.deinit();
@@ -694,6 +711,7 @@ const GatewayState = struct {
         defer self.session_mutex.unlock();
         if (self.session_store == null) return error.SessionsDisabled;
         const token = try self.session_store.?.create(identity, client_ip, device_id);
+        self.persistSessionsLocked();
         return try allocator.dupe(u8, token);
     }
 
@@ -702,6 +720,7 @@ const GatewayState = struct {
         defer self.session_mutex.unlock();
         if (self.session_store) |*ss| {
             if (ss.validate(token)) |session| {
+                self.persistSessionsLocked();
                 return allocator.dupe(u8, session.identity) catch null;
             }
         }
@@ -711,7 +730,11 @@ const GatewayState = struct {
     fn revokeSession(self: *GatewayState, token: []const u8) bool {
         self.session_mutex.lock();
         defer self.session_mutex.unlock();
-        if (self.session_store) |*ss| return ss.revoke(token);
+        if (self.session_store) |*ss| {
+            const revoked = ss.revoke(token);
+            if (revoked) self.persistSessionsLocked();
+            return revoked;
+        }
         return false;
     }
 
@@ -731,7 +754,50 @@ const GatewayState = struct {
         const existing = self.session_store.?.validate(token) orelse return error.InvalidSession;
         const new_token = try self.session_store.?.create(existing.identity, client_ip, existing.device_id);
         _ = self.session_store.?.revoke(token);
+        self.persistSessionsLocked();
         return try allocator.dupe(u8, new_token);
+    }
+
+    fn persistSessionsLocked(self: *GatewayState) void {
+        if (self.session_store_path.len == 0) return;
+        if (self.session_store) |*ss| {
+            http.session_store_file.persist(self.allocator, self.session_store_path, ss) catch |err| {
+                self.logger.warn(null, "session store persist failed: {}", .{err});
+            };
+        }
+    }
+
+    fn appendTranscript(
+        self: *GatewayState,
+        scope: []const u8,
+        route: []const u8,
+        correlation_id: []const u8,
+        identity: ?[]const u8,
+        client_ip: []const u8,
+        upstream_url: []const u8,
+        request_body: []const u8,
+        response_status: u16,
+        response_content_type: []const u8,
+        response_body: []const u8,
+    ) void {
+        if (self.transcript_store_path.len == 0) return;
+        self.transcript_mutex.lock();
+        defer self.transcript_mutex.unlock();
+        http.transcript_store.append(self.allocator, self.transcript_store_path, .{
+            .ts_ms = std.time.milliTimestamp(),
+            .scope = scope,
+            .route = route,
+            .correlation_id = correlation_id,
+            .identity = identity orelse "",
+            .client_ip = client_ip,
+            .upstream_url = upstream_url,
+            .request_body = request_body,
+            .response_status = response_status,
+            .response_content_type = response_content_type,
+            .response_body = response_body,
+        }) catch |err| {
+            self.logger.warn(correlation_id, "transcript store append failed: {}", .{err});
+        };
     }
 
     fn commandLifecycleCreate(self: *GatewayState, command_id: []const u8, command_type: []const u8, correlation_id: []const u8, identity: []const u8) !void {
@@ -1941,6 +2007,15 @@ fn loadApprovalStore(state: *GatewayState) !void {
     }
 }
 
+fn loadSessionStore(state: *GatewayState) !void {
+    if (state.session_store == null or state.session_store_path.len == 0) return;
+    const stored = try http.session_store_file.load(state.allocator, state.session_store_path);
+    defer http.session_store_file.freeLoaded(state.allocator, stored);
+    if (state.session_store) |*store| {
+        try http.session_store_file.restore(state.allocator, store, stored);
+    }
+}
+
 pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -1973,6 +2048,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
             http.session.SessionStore.init(state_allocator, cfg.session_ttl_seconds, cfg.session_max)
         else
             null,
+        .session_store_path = cfg.session_store_path,
         .access_control = if (cfg.access_control_rules.len > 0)
             http.access_control.AccessControl.fromConfig(state_allocator, cfg.access_control_rules, .allow) catch null
         else
@@ -2023,6 +2099,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         .approval_escalation_webhook = cfg.approval_escalation_webhook,
         .approval_ttl_ms = if (cfg.approval_ttl_ms > 0) cfg.approval_ttl_ms else APPROVAL_TIMEOUT_MS_DEFAULT,
         .approval_max_pending_per_identity = cfg.approval_max_pending_per_identity,
+        .transcript_store_path = cfg.transcript_store_path,
     };
     defer state.deinit();
 
@@ -2030,6 +2107,11 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     if (cfg.approval_store_path.len > 0) {
         loadApprovalStore(&state) catch |err| {
             state.logger.warn(null, "failed to load approval store '{s}': {}", .{ cfg.approval_store_path, err });
+        };
+    }
+    if (cfg.session_store_path.len > 0) {
+        loadSessionStore(&state) catch |err| {
+            state.logger.warn(null, "failed to load session store '{s}': {}", .{ cfg.session_store_path, err });
         };
     }
 
@@ -3483,7 +3565,19 @@ fn routeRequest(
     if (http.location_router.matchLocation(request.uri.path, cfg.location_blocks)) |matched| {
         switch (matched.block.action) {
             .proxy_pass => |target| {
-                return try handleLocationProxyPass(allocator, writer, cfg, state, request, target, correlation_id, keep_alive.*, client_ip, ctx.identity);
+                return try handleLocationProxyPass(
+                    allocator,
+                    writer,
+                    cfg,
+                    state,
+                    request,
+                    target,
+                    suffixPathForLocationMatch(request.uri.path, matched),
+                    correlation_id,
+                    keep_alive.*,
+                    client_ip,
+                    ctx.identity,
+                );
             },
             .fastcgi_pass => |upstream| {
                 return try handleFastcgiRoute(allocator, writer, cfg, upstream, request, client_ip, correlation_id, keep_alive.*, state);
@@ -3523,9 +3617,153 @@ fn routeRequest(
         return status;
     } else |_| {}
 
+    if (try handleVersionedApiProxyRoute(allocator, writer, cfg, state, ctx, request, correlation_id, keep_alive.*, client_ip)) |status| {
+        return status;
+    }
+
     try sendApiError(allocator, writer, .not_found, "invalid_request", "Not Found", correlation_id, keep_alive.*, state);
     state.metricsRecord(404);
     return 404;
+}
+
+fn suffixPathForLocationMatch(
+    request_path: []const u8,
+    matched: http.location_router.MatchResult,
+) ?[]const u8 {
+    return switch (matched.block.match_type) {
+        .exact => null,
+        .prefix, .prefix_priority => blk: {
+            if (std.mem.startsWith(u8, request_path, matched.block.pattern)) {
+                const suffix = request_path[matched.block.pattern.len..];
+                break :blk if (suffix.len == 0) null else suffix;
+            }
+            break :blk request_path;
+        },
+        .regex, .regex_case_insensitive => request_path,
+    };
+}
+
+fn handleVersionedApiProxyRoute(
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    cfg: *const edge_config.EdgeConfig,
+    state: *GatewayState,
+    ctx: *http.request_context.RequestContext,
+    request: *http.Request,
+    correlation_id: []const u8,
+    keep_alive: bool,
+    client_ip: []const u8,
+) !?u16 {
+    const versioned = http.api_router.parseVersionedPath(request.uri.path) orelse return null;
+    const incoming_host = request.headers.get("host");
+    const incoming_x_forwarded_for = request.headers.get("x-forwarded-for");
+    const body = request.body orelse "";
+
+    if (std.mem.eql(u8, versioned.path, "/chat") and cfg.proxy_pass_chat.len > 0) {
+        return try executeVersionedApiProxyRoute(
+            allocator,
+            writer,
+            cfg,
+            state,
+            ctx,
+            .chat,
+            cfg.proxy_pass_chat,
+            null,
+            body,
+            correlation_id,
+            keep_alive,
+            client_ip,
+            versioned.version,
+            incoming_host,
+            incoming_x_forwarded_for,
+        );
+    }
+
+    if (std.mem.eql(u8, versioned.path, "/commands") and cfg.proxy_pass_commands_prefix.len > 0) {
+        return try executeVersionedApiProxyRoute(
+            allocator,
+            writer,
+            cfg,
+            state,
+            ctx,
+            .commands,
+            cfg.proxy_pass_commands_prefix,
+            null,
+            body,
+            correlation_id,
+            keep_alive,
+            client_ip,
+            versioned.version,
+            incoming_host,
+            incoming_x_forwarded_for,
+        );
+    }
+
+    return null;
+}
+
+fn executeVersionedApiProxyRoute(
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    cfg: *const edge_config.EdgeConfig,
+    state: *GatewayState,
+    ctx: *http.request_context.RequestContext,
+    upstream_scope: UpstreamScope,
+    proxy_pass_target: []const u8,
+    suffix_path: ?[]const u8,
+    payload: []const u8,
+    correlation_id: []const u8,
+    keep_alive: bool,
+    client_ip: []const u8,
+    api_version: u16,
+    incoming_host: ?[]const u8,
+    incoming_x_forwarded_for: ?[]const u8,
+) !u16 {
+    const exec = proxyJsonExecute(
+        allocator,
+        cfg,
+        upstream_scope,
+        proxy_pass_target,
+        suffix_path,
+        payload,
+        correlation_id,
+        client_ip,
+        ctx.identity,
+        api_version,
+        incoming_host,
+        incoming_x_forwarded_for,
+        writer,
+        state,
+        false,
+    ) catch |err| {
+        const mapped = mapProxyExecutionError(err);
+        try sendApiError(allocator, writer, mapped.status, mapped.code, mapped.message, correlation_id, keep_alive, state);
+        return @intFromEnum(mapped.status);
+    };
+
+    switch (exec) {
+        .streamed_status => |status| return status,
+        .buffered => |resp| {
+            defer allocator.free(resp.body);
+            defer allocator.free(resp.content_type);
+            if (resp.content_disposition) |cd| allocator.free(cd);
+
+            var response = http.Response.init(allocator);
+            defer response.deinit();
+            _ = response.setStatus(@enumFromInt(resp.status))
+                .setBody(resp.body)
+                .setContentType(resp.content_type)
+                .setConnection(keep_alive)
+                .setHeader(http.correlation.HEADER_NAME, correlation_id);
+            if (resp.content_disposition) |cd| {
+                _ = response.setHeader("Content-Disposition", cd);
+            }
+            applyResponseHeaders(state, &response);
+            try response.write(writer);
+            state.metricsRecord(resp.status);
+            return resp.status;
+        },
+    }
 }
 
 fn handleLocationProxyPass(
@@ -3535,16 +3773,29 @@ fn handleLocationProxyPass(
     state: *GatewayState,
     request: *const http.Request,
     target: []const u8,
+    suffix_path: ?[]const u8,
     correlation_id: []const u8,
     keep_alive: bool,
-    _: []const u8,
-    _: ?[]const u8,
+    client_ip: []const u8,
+    auth_identity: ?[]const u8,
 ) !u16 {
-    const resolved = try resolveProxyTarget(allocator, cfg.upstream_base_url, target, request.uri.path);
+    const resolved = try resolveProxyTarget(allocator, cfg.upstream_base_url, target, suffix_path);
     defer allocator.free(resolved.url);
     const body = request.body orelse "";
     var upstream_response = try executeRawHttpProxyRequest(allocator, resolved.url, request.method.toString(), request.contentType(), body, correlation_id);
     defer upstream_response.deinit(allocator);
+    state.appendTranscript(
+        upstreamScopeName(proxyScopeForPath(request.uri.path)),
+        request.uri.path,
+        correlation_id,
+        auth_identity,
+        client_ip,
+        resolved.url,
+        body,
+        upstream_response.status_code,
+        upstream_response.content_type,
+        upstream_response.body,
+    );
 
     var response = http.Response.init(allocator);
     defer response.deinit();
@@ -3808,6 +4059,40 @@ fn runMiddlewarePipeline(
         state.metricsRecordErrorCode("rate_limited");
         logAccess(ctx, request.method.toString(), request.uri.path, 429, request.headers.get("user-agent") orelse "");
         return true;
+    }
+
+    if (isProtectedAuthRequestRoute(request.uri.path)) {
+        const has_auth_policy = cfg.basic_auth_hashes.len > 0 or
+            cfg.auth_token_hashes.len > 0 or
+            cfg.auth_request_url.len > 0 or
+            state.session_store != null;
+        if (has_auth_policy) {
+            const auth_res = authorizeRequest(cfg, &request.headers);
+            if (auth_res.ok) {
+                if (auth_res.token_hash) |identity| {
+                    const owned_identity = try allocator.dupe(u8, identity[0..]);
+                    ctx.setIdentity(owned_identity);
+                }
+            } else if (http.session.fromHeaders(&request.headers)) |session_token| {
+                if (state.validateSessionIdentity(allocator, session_token)) |identity| {
+                    ctx.setIdentity(identity);
+                } else {
+                    try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, keep_alive, state);
+                    state.metricsRecord(401);
+                    state.metricsRecordErrorCode("unauthorized");
+                    logAccess(ctx, request.method.toString(), request.uri.path, 401, request.headers.get("user-agent") orelse "");
+                    return true;
+                }
+            } else if (cfg.auth_request_url.len > 0 and authorizeViaSubrequest(allocator, cfg, request, correlation_id, client_ip)) {
+                ctx.authenticated = true;
+            } else {
+                try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, keep_alive, state);
+                state.metricsRecord(401);
+                state.metricsRecordErrorCode("unauthorized");
+                logAccess(ctx, request.method.toString(), request.uri.path, 401, request.headers.get("user-agent") orelse "");
+                return true;
+            }
+        }
     }
 
     return false;
@@ -5302,7 +5587,7 @@ fn parseMemcachedPayload(allocator: std.mem.Allocator, body: []const u8) !Memcac
 
 const AuthResult = struct {
     ok: bool,
-    token_hash: ?[]const u8,
+    token_hash: ?[64]u8,
 };
 
 fn applyResponseHeaders(state: *GatewayState, response: *http.Response) void {
@@ -5654,7 +5939,25 @@ fn authorizeRequest(cfg: *const edge_config.EdgeConfig, headers: *const http.Hea
         } else |_| {}
     }
 
+    if (cfg.auth_token_hashes.len > 0) {
+        const token = http.auth.bearerTokenFromHeaders(headers) orelse return .{ .ok = false, .token_hash = null };
+        const token_hash = hashBearerToken(token);
+        for (cfg.auth_token_hashes) |allowed| {
+            if (std.mem.eql(u8, allowed, token_hash[0..])) {
+                return .{ .ok = true, .token_hash = token_hash };
+            }
+        }
+    }
+
     return .{ .ok = false, .token_hash = null };
+}
+
+fn hashBearerToken(token: []const u8) [64]u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(token, &digest, .{});
+    var digest_hex: [64]u8 = undefined;
+    _ = std.fmt.bufPrint(&digest_hex, "{s}", .{std.fmt.fmtSliceHexLower(&digest)}) catch unreachable;
+    return digest_hex;
 }
 
 fn isJsonContentType(content_type: ?[]const u8) bool {
@@ -5963,7 +6266,7 @@ fn extractIdentityForPolicy(
 ) !?[]const u8 {
     const auth_res = authorizeRequest(cfg, &request.headers);
     if (auth_res.ok and auth_res.token_hash != null) {
-        const identity = try allocator.dupe(u8, auth_res.token_hash.?);
+        const identity = try allocator.dupe(u8, auth_res.token_hash.?[0..]);
         return identity;
     }
     if (http.session.fromHeaders(&request.headers)) |session_token| {
@@ -6528,6 +6831,7 @@ fn proxyJsonExecute(
             break :blk proxyJsonExecuteSingleAttempt(
                 allocator,
                 cfg,
+                upstream_scope,
                 per_attempt_timeout_ms,
                 upstream_base_url,
                 proxy_pass_target,
@@ -6584,6 +6888,7 @@ fn proxyJsonExecute(
 fn proxyJsonExecuteSingleAttempt(
     allocator: std.mem.Allocator,
     cfg: *const edge_config.EdgeConfig,
+    upstream_scope: UpstreamScope,
     attempt_timeout_ms: u32,
     upstream_base_url: []const u8,
     proxy_pass_target: []const u8,
@@ -6741,6 +7046,18 @@ fn proxyJsonExecuteSingleAttempt(
                 const n = try req.reader().read(drain_buf);
                 if (n == 0) break;
             }
+            state.appendTranscript(
+                upstreamScopeName(upstream_scope),
+                proxy_pass_target,
+                correlation_id,
+                auth_identity,
+                client_ip,
+                current_url,
+                payload,
+                status_code,
+                upstream_content_type,
+                "",
+            );
             return .{
                 .buffered = .{
                     .status = status_code,
@@ -6766,6 +7083,18 @@ fn proxyJsonExecuteSingleAttempt(
         else
             null;
         errdefer if (buffered_content_disposition) |cd| allocator.free(cd);
+        state.appendTranscript(
+            upstreamScopeName(upstream_scope),
+            proxy_pass_target,
+            correlation_id,
+            auth_identity,
+            client_ip,
+            current_url,
+            payload,
+            status_code,
+            buffered_content_type,
+            body.items,
+        );
         return .{
             .buffered = .{
                 .status = status_code,
@@ -7406,8 +7735,10 @@ test "resolveProxyTarget handles absolute and relative proxy_pass" {
         .access_control_rules = "",
         .request_limits = http.request_limits.RequestLimits.default,
         .basic_auth_hashes = &[_][]const u8{},
+        .auth_token_hashes = &[_][]const u8{},
         .session_ttl_seconds = 0,
         .session_max = 128,
+        .session_store_path = "",
         .device_registry_path = "",
         .policy_rules_raw = "",
         .policy_user_scopes_raw = "",
@@ -7497,6 +7828,7 @@ test "resolveProxyTarget handles absolute and relative proxy_pass" {
         .approval_escalation_webhook = "",
         .approval_ttl_ms = 300_000,
         .approval_max_pending_per_identity = 0,
+        .transcript_store_path = "",
     };
 
     const abs = try resolveProxyTarget(allocator, cfg.upstream_base_url, "https://api.example.com/base", "/api/messages");

@@ -26,6 +26,7 @@ pub const request_context = @import("http/request_context.zig");
 pub const api_router = @import("http/api_router.zig");
 pub const idempotency = @import("http/idempotency.zig");
 pub const session = @import("http/session.zig");
+pub const session_store_file = @import("http/session_store_file.zig");
 pub const command = @import("http/command.zig");
 pub const access_control = @import("http/access_control.zig");
 pub const request_limits = @import("http/request_limits.zig");
@@ -61,6 +62,7 @@ pub const memcached = @import("http/memcached.zig");
 pub const config_file = @import("http/config_file.zig");
 pub const secrets = @import("http/secrets.zig");
 pub const approval_store = @import("http/approval_store.zig");
+pub const transcript_store = @import("http/transcript_store.zig");
 
 // Re-export constants
 pub const MAX_HEADERS = headers.MAX_HEADERS;

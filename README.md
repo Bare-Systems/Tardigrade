@@ -175,6 +175,9 @@ Config file notes:
 | Name | Description | Default |
 |---|---|---|
 | `TARDIGRADE_BASIC_AUTH_HASHES` | Lowercase SHA-256 hashes of `user:password` | empty |
+| `TARDIGRADE_AUTH_TOKEN_HASHES` | Lowercase SHA-256 hashes of accepted bearer tokens | empty |
+| `TARDIGRADE_SESSION_STORE_PATH` | Optional JSON file for persisted gateway sessions | empty |
+| `TARDIGRADE_TRANSCRIPT_STORE_PATH` | Optional NDJSON file for persisted gateway chat/command transcripts | empty |
 
 #### Request Handling, Limits, and Connection Management
 

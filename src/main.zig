@@ -219,14 +219,30 @@ fn applyWorkerCpuAffinity(cfg: *const edge_config.EdgeConfig, worker_id: usize) 
 }
 
 fn setLinuxCpuAffinity(cpu: u32) !void {
-    const c = @cImport({
-        @cInclude("sched.h");
-        @cInclude("unistd.h");
-    });
-    var mask: c.cpu_set_t = undefined;
-    c.CPU_ZERO(&mask);
-    c.CPU_SET(@intCast(cpu), &mask);
-    if (c.sched_setaffinity(c.getpid(), @sizeOf(c.cpu_set_t), &mask) != 0) {
+    if (@import("builtin").os.tag != .linux) {
+        return error.CpuAffinityUnsupported;
+    }
+    const linux = struct {
+        const cpu_set_bits = 1024;
+        const CpuMaskWord = usize;
+        const word_bits = @bitSizeOf(CpuMaskWord);
+        const word_count = cpu_set_bits / word_bits;
+
+        const CpuSet = extern struct {
+            bits: [word_count]CpuMaskWord = [_]CpuMaskWord{0} ** word_count,
+        };
+
+        extern "c" fn getpid() std.c.pid_t;
+        extern "c" fn sched_setaffinity(pid: std.c.pid_t, cpusetsize: usize, mask: *const CpuSet) c_int;
+    };
+    if (cpu >= linux.cpu_set_bits) {
+        return error.CpuAffinityUnsupported;
+    }
+    var mask = linux.CpuSet{};
+    const word_index: usize = @intCast(cpu / linux.word_bits);
+    const bit_index = cpu % linux.word_bits;
+    mask.bits[word_index] |= @as(linux.CpuMaskWord, 1) << @intCast(bit_index);
+    if (linux.sched_setaffinity(linux.getpid(), @sizeOf(linux.CpuSet), &mask) != 0) {
         return error.CpuAffinityFailed;
     }
 }

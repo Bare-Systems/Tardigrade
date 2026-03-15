@@ -439,17 +439,28 @@ test "openssl init" {
 
 test "tls terminator copies sni specs for maintenance reload" {
     const allocator = std.testing.allocator;
+    const cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(cwd);
+    const alt_cert_path = try std.fmt.allocPrint(allocator, "{s}/tests/fixtures/tls/alt_server.crt", .{cwd});
+    defer allocator.free(alt_cert_path);
+    const alt_key_path = try std.fmt.allocPrint(allocator, "{s}/tests/fixtures/tls/alt_server.key", .{cwd});
+    defer allocator.free(alt_key_path);
+    const cert_path = try std.fmt.allocPrint(allocator, "{s}/tests/fixtures/tls/server.crt", .{cwd});
+    defer allocator.free(cert_path);
+    const key_path = try std.fmt.allocPrint(allocator, "{s}/tests/fixtures/tls/server.key", .{cwd});
+    defer allocator.free(key_path);
+
     var specs = try allocator.alloc(SniCertSpec, 1);
     defer allocator.free(specs);
     specs[0] = .{
         .server_name = "sni.integration.test",
-        .cert_path = "tests/fixtures/tls/alt_server.crt",
-        .key_path = "tests/fixtures/tls/alt_server.key",
+        .cert_path = alt_cert_path,
+        .key_path = alt_key_path,
     };
 
     var tls = try TlsTerminator.init(allocator, .{
-        .cert_path = "tests/fixtures/tls/server.crt",
-        .key_path = "tests/fixtures/tls/server.key",
+        .cert_path = cert_path,
+        .key_path = key_path,
         .sni_certs = specs,
         .dynamic_reload_interval_ms = 1,
     });

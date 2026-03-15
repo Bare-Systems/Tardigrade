@@ -16,3 +16,4 @@ secrets.txt
 *.key
 *.p12
 *.pfx
+.zig/

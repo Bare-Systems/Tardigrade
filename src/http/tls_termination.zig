@@ -123,9 +123,12 @@ pub const TlsTerminator = struct {
         const method = c.TLS_server_method() orelse return error.ContextInitFailed;
         const ctx = c.SSL_CTX_new(method) orelse return error.ContextInitFailed;
         errdefer c.SSL_CTX_free(ctx);
-        const owned_sni_specs = try allocator.alloc(SniCertSpec, opts.sni_certs.len);
-        errdefer allocator.free(owned_sni_specs);
-        @memcpy(owned_sni_specs, opts.sni_certs);
+        const owned_sni_specs = owned: {
+            const specs = try allocator.alloc(SniCertSpec, opts.sni_certs.len);
+            errdefer allocator.free(specs);
+            @memcpy(specs, opts.sni_certs);
+            break :owned specs;
+        };
 
         var st = try allocator.create(State);
         errdefer allocator.destroy(st);
@@ -437,6 +440,7 @@ test "openssl init" {
 test "tls terminator copies sni specs for maintenance reload" {
     const allocator = std.testing.allocator;
     var specs = try allocator.alloc(SniCertSpec, 1);
+    defer allocator.free(specs);
     specs[0] = .{
         .server_name = "sni.integration.test",
         .cert_path = "tests/fixtures/tls/alt_server.crt",
@@ -450,8 +454,6 @@ test "tls terminator copies sni specs for maintenance reload" {
         .dynamic_reload_interval_ms = 1,
     });
     defer tls.deinit();
-
-    allocator.free(specs);
 
     tls.runMaintenance(1);
     tls.runMaintenance(2);

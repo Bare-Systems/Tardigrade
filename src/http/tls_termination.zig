@@ -18,6 +18,10 @@ extern fn SSL_CTX_set_alpn_select_cb(
 
 const ssl_op_no_ticket: c_ulong = @as(c_ulong, 1) << @as(u6, 14);
 const openssl_npn_negotiated: c_int = 1;
+const embedded_server_crt = @embedFile("testdata/test_server.crt");
+const embedded_server_key = @embedFile("testdata/test_server.key");
+const embedded_alt_server_crt = @embedFile("testdata/test_alt_server.crt");
+const embedded_alt_server_key = @embedFile("testdata/test_alt_server.key");
 
 pub const TlsError = error{
     OutOfMemory,
@@ -439,15 +443,21 @@ test "openssl init" {
 
 test "tls terminator copies sni specs for maintenance reload" {
     const allocator = std.testing.allocator;
-    const cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
-    defer allocator.free(cwd);
-    const alt_cert_path = try std.fmt.allocPrint(allocator, "{s}/tests/fixtures/tls/alt_server.crt", .{cwd});
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(.{ .sub_path = "test_server.crt", .data = embedded_server_crt });
+    try tmp.dir.writeFile(.{ .sub_path = "test_server.key", .data = embedded_server_key });
+    try tmp.dir.writeFile(.{ .sub_path = "test_alt_server.crt", .data = embedded_alt_server_crt });
+    try tmp.dir.writeFile(.{ .sub_path = "test_alt_server.key", .data = embedded_alt_server_key });
+
+    const alt_cert_path = try tmp.dir.realpathAlloc(allocator, "test_alt_server.crt");
     defer allocator.free(alt_cert_path);
-    const alt_key_path = try std.fmt.allocPrint(allocator, "{s}/tests/fixtures/tls/alt_server.key", .{cwd});
+    const alt_key_path = try tmp.dir.realpathAlloc(allocator, "test_alt_server.key");
     defer allocator.free(alt_key_path);
-    const cert_path = try std.fmt.allocPrint(allocator, "{s}/tests/fixtures/tls/server.crt", .{cwd});
+    const cert_path = try tmp.dir.realpathAlloc(allocator, "test_server.crt");
     defer allocator.free(cert_path);
-    const key_path = try std.fmt.allocPrint(allocator, "{s}/tests/fixtures/tls/server.key", .{cwd});
+    const key_path = try tmp.dir.realpathAlloc(allocator, "test_server.key");
     defer allocator.free(key_path);
 
     var specs = try allocator.alloc(SniCertSpec, 1);

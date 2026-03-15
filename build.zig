@@ -14,6 +14,9 @@ pub fn build(b: *std.Build) void {
     // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall. Here we do not
     // set a preferred release mode, allowing the user to decide how to optimize.
     const optimize = b.standardOptimizeOption(.{});
+    const prefer_static_system_libs = b.option(bool, "prefer-static-system-libs", "Prefer static linking for system libraries") orelse false;
+    const require_static_system_libs = b.option(bool, "require-static-system-libs", "Require static linking for system libraries") orelse false;
+    const static_executable = b.option(bool, "static-executable", "Build the tardigrade executable as a static binary") orelse false;
     const enable_http3_ngtcp2 = b.option(bool, "enable-http3-ngtcp2", "Enable experimental HTTP/3 ngtcp2/nghttp3 system-library integration") orelse false;
     const osslclient_default_path = "/tmp/ngtcp2-upstream/build/examples/osslclient";
     const http3_osslclient_path = b.option([]const u8, "http3-osslclient-path", "Path to the ngtcp2 OpenSSL HTTP/3 example client used by 0-RTT integration tests") orelse if (pathExists(osslclient_default_path)) osslclient_default_path else "";
@@ -38,14 +41,16 @@ pub fn build(b: *std.Build) void {
     const exe = b.addExecutable(.{
         .name = "tardigrade",
         .root_module = exe_mod,
+        .linkage = if (static_executable) .static else null,
     });
+    configureSystemLibrarySearchPaths(exe, prefer_static_system_libs);
     exe.linkLibC();
-    exe.linkSystemLibrary("ssl");
-    exe.linkSystemLibrary("crypto");
+    linkSystemLibrary(exe, "ssl", prefer_static_system_libs, require_static_system_libs);
+    linkSystemLibrary(exe, "crypto", prefer_static_system_libs, require_static_system_libs);
     if (enable_http3_ngtcp2) {
-        exe.linkSystemLibrary("ngtcp2");
-        exe.linkSystemLibrary("ngtcp2_crypto_ossl");
-        exe.linkSystemLibrary("nghttp3");
+        linkSystemLibrary(exe, "ngtcp2", prefer_static_system_libs, require_static_system_libs);
+        linkSystemLibrary(exe, "ngtcp2_crypto_ossl", prefer_static_system_libs, require_static_system_libs);
+        linkSystemLibrary(exe, "nghttp3", prefer_static_system_libs, require_static_system_libs);
     }
 
     // This declares intent for the executable to be installed into the
@@ -79,13 +84,14 @@ pub fn build(b: *std.Build) void {
     const exe_unit_tests = b.addTest(.{
         .root_module = exe_mod,
     });
+    configureSystemLibrarySearchPaths(exe_unit_tests, prefer_static_system_libs);
     exe_unit_tests.linkLibC();
-    exe_unit_tests.linkSystemLibrary("ssl");
-    exe_unit_tests.linkSystemLibrary("crypto");
+    linkSystemLibrary(exe_unit_tests, "ssl", prefer_static_system_libs, require_static_system_libs);
+    linkSystemLibrary(exe_unit_tests, "crypto", prefer_static_system_libs, require_static_system_libs);
     if (enable_http3_ngtcp2) {
-        exe_unit_tests.linkSystemLibrary("ngtcp2");
-        exe_unit_tests.linkSystemLibrary("ngtcp2_crypto_ossl");
-        exe_unit_tests.linkSystemLibrary("nghttp3");
+        linkSystemLibrary(exe_unit_tests, "ngtcp2", prefer_static_system_libs, require_static_system_libs);
+        linkSystemLibrary(exe_unit_tests, "ngtcp2_crypto_ossl", prefer_static_system_libs, require_static_system_libs);
+        linkSystemLibrary(exe_unit_tests, "nghttp3", prefer_static_system_libs, require_static_system_libs);
     }
 
     const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);
@@ -132,4 +138,31 @@ pub fn build(b: *std.Build) void {
 fn pathExists(path: []const u8) bool {
     std.fs.accessAbsolute(path, .{}) catch return false;
     return true;
+}
+
+fn linkSystemLibrary(
+    compile: *std.Build.Step.Compile,
+    name: []const u8,
+    prefer_static_system_libs: bool,
+    require_static_system_libs: bool,
+) void {
+    compile.linkSystemLibrary2(name, .{
+        .use_pkg_config = .no,
+        .preferred_link_mode = if (prefer_static_system_libs) .static else .dynamic,
+        .search_strategy = if (prefer_static_system_libs)
+            (if (require_static_system_libs) .no_fallback else .mode_first)
+        else
+            .paths_first,
+    });
+}
+
+fn configureSystemLibrarySearchPaths(
+    compile: *std.Build.Step.Compile,
+    prefer_static_system_libs: bool,
+) void {
+    if (!prefer_static_system_libs) return;
+    compile.addSystemIncludePath(.{ .cwd_relative = "/usr/include" });
+    compile.addLibraryPath(.{ .cwd_relative = "/lib" });
+    compile.addLibraryPath(.{ .cwd_relative = "/usr/lib" });
+    compile.addLibraryPath(.{ .cwd_relative = "/usr/local/lib" });
 }

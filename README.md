@@ -175,6 +175,9 @@ Config file notes:
 | Name | Description | Default |
 |---|---|---|
 | `TARDIGRADE_BASIC_AUTH_HASHES` | Lowercase SHA-256 hashes of `user:password` | empty |
+| `TARDIGRADE_AUTH_TOKEN_HASHES` | Lowercase SHA-256 hashes of accepted bearer tokens | empty |
+| `TARDIGRADE_SESSION_STORE_PATH` | Optional JSON file for persisted gateway sessions | empty |
+| `TARDIGRADE_TRANSCRIPT_STORE_PATH` | Optional NDJSON file for persisted gateway chat/command transcripts | empty |
 
 #### Request Handling, Limits, and Connection Management
 
@@ -295,6 +298,67 @@ zig build -Doptimize=ReleaseFast
 
 # Run the binary directly
 ./zig-out/bin/tardigrade
+```
+
+### Linux `systemd --user` service
+
+For a manual host-native install on Linux, keep Tardigrade as a normal
+non-root process and let `systemd --user` manage restarts and reloads:
+
+```bash
+sudo loginctl enable-linger "$USER"
+mkdir -p "$HOME/.local/bin" "$HOME/.config/tardigrade" "$HOME/.config/systemd/user"
+cp ./zig-out/bin/tardigrade "$HOME/.local/bin/tardigrade"
+
+cat > "$HOME/.local/bin/run-tardigrade.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+set -a
+source "$HOME/.config/tardigrade/tardigrade.env"
+set +a
+exec "$HOME/.local/bin/tardigrade"
+EOF
+chmod +x "$HOME/.local/bin/run-tardigrade.sh"
+
+cat > "$HOME/.config/systemd/user/tardigrade.service" <<'EOF'
+[Unit]
+Description=Tardigrade edge gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=HOME=%h
+ExecStart=%h/.local/bin/run-tardigrade.sh
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=2
+LimitNOFILE=65536
+
+[Install]
+WantedBy=default.target
+EOF
+
+systemctl --user daemon-reload
+systemctl --user enable --now tardigrade.service
+systemctl --user reload tardigrade.service
+systemctl --user status tardigrade.service
+journalctl --user -u tardigrade.service -f
+```
+
+If you need Tardigrade on port `443`, either run a root-managed system unit or
+grant the binary `CAP_NET_BIND_SERVICE`. The current `blink` homelab deployment
+uses `8443`, so a non-root user unit is sufficient there.
+
+On the `blink` homelab deployment, the staged unit file and installer live at:
+
+- `/home/admin/barelabs/runtime/blink-homelab/systemd-user/tardigrade.service`
+- `/home/admin/barelabs/runtime/blink-homelab/install_user_systemd_units.sh`
+
+After enabling lingering for `admin`, install the staged units with:
+
+```bash
+/home/admin/barelabs/runtime/blink-homelab/install_user_systemd_units.sh enable
 ```
 
 ## Usage

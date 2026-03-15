@@ -941,15 +941,27 @@ fn prepareBearClawFixture(
 
     const device_registry_abs = try std.fmt.allocPrint(allocator, "{s}/devices.json", .{fixture_dir_abs});
     defer allocator.free(device_registry_abs);
+    const session_store_abs = try std.fmt.allocPrint(allocator, "{s}/sessions.json", .{fixture_dir_abs});
+    defer allocator.free(session_store_abs);
     const approval_store_abs = try std.fmt.allocPrint(allocator, "{s}/approvals.json", .{fixture_dir_abs});
     defer allocator.free(approval_store_abs);
+    const transcript_store_abs = try std.fmt.allocPrint(allocator, "{s}/transcripts.ndjson", .{fixture_dir_abs});
+    defer allocator.free(transcript_store_abs);
     {
         var device_file = try std.fs.createFileAbsolute(device_registry_abs, .{ .truncate = true });
         device_file.close();
     }
     {
+        var session_file = try std.fs.createFileAbsolute(session_store_abs, .{ .truncate = true });
+        session_file.close();
+    }
+    {
         var approval_file = try std.fs.createFileAbsolute(approval_store_abs, .{ .truncate = true });
         approval_file.close();
+    }
+    {
+        var transcript_file = try std.fs.createFileAbsolute(transcript_store_abs, .{ .truncate = true });
+        transcript_file.close();
     }
 
     const server_cert_abs = try std.fmt.allocPrint(allocator, "{s}/tests/fixtures/tls/server.crt", .{cwd});
@@ -1011,7 +1023,9 @@ fn prepareBearClawFixture(
         _ = env_map.remove("TARDIGRADE_TLS_KEY_PATH");
     }
     try env_map.put("TARDIGRADE_DEVICE_REGISTRY_PATH", device_registry_abs);
+    try env_map.put("TARDIGRADE_SESSION_STORE_PATH", session_store_abs);
     try env_map.put("TARDIGRADE_APPROVAL_STORE_PATH", approval_store_abs);
+    try env_map.put("TARDIGRADE_TRANSCRIPT_STORE_PATH", transcript_store_abs);
     if (options.upstream_port) |upstream_port| {
         const upstream_url = try std.fmt.allocPrint(allocator, "http://{s}:{d}", .{ test_host, upstream_port });
         defer allocator.free(upstream_url);
@@ -2362,6 +2376,62 @@ test "core gateway integration covers health metrics auth proxying invalid json 
 
 test "mux websocket metrics and channel caps are enforced" {
     return error.SkipZigTest;
+}
+
+test "bearclaw fixture serves chat over https with bearer auth and transcript persistence" {
+    const allocator = std.testing.allocator;
+
+    var upstream = try UpstreamServer.start(allocator, &.{.{
+        .body = "{\"ok\":true,\"source\":\"bearclaw-upstream\"}",
+        .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
+    }});
+    defer upstream.stop();
+    try upstream.run();
+
+    var options = bearClawProfile(baseOptions(upstream.port()));
+    options.ready_https_insecure = true;
+
+    var tardigrade = try TardigradeProcess.start(allocator, options);
+    defer tardigrade.stop();
+
+    var unauthorized = try sendCurlRequest(allocator, tardigrade.port, .{
+        .scheme = "https",
+        .path = "/v1/chat",
+        .method = "POST",
+        .body = "{\"message\":\"hello\"}",
+        .headers = &.{
+            .{ .name = "Host", .value = "api.example.com" },
+            .{ .name = "Content-Type", .value = "application/json" },
+        },
+        .insecure = true,
+    });
+    defer unauthorized.deinit();
+    try std.testing.expectEqual(@as(u16, 401), unauthorized.status_code);
+
+    var authorized = try sendCurlRequest(allocator, tardigrade.port, .{
+        .scheme = "https",
+        .path = "/v1/chat",
+        .method = "POST",
+        .body = "{\"message\":\"hello\"}",
+        .headers = &.{
+            .{ .name = "Host", .value = "api.example.com" },
+            .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
+            .{ .name = "Content-Type", .value = "application/json" },
+        },
+        .insecure = true,
+    });
+    defer authorized.deinit();
+    try std.testing.expectEqual(@as(u16, 200), authorized.status_code);
+    try assertContains(authorized.body, "\"source\":\"bearclaw-upstream\"");
+
+    const fixture_dir = tardigrade.fixture_dir_rel orelse return error.TestUnexpectedResult;
+    const transcript_rel = try std.fmt.allocPrint(allocator, "{s}/transcripts.ndjson", .{fixture_dir});
+    defer allocator.free(transcript_rel);
+    const transcript = try std.fs.cwd().readFileAlloc(allocator, transcript_rel, 1024 * 1024);
+    defer allocator.free(transcript);
+    try assertContains(transcript, "\"scope\":\"chat\"");
+    try assertContains(transcript, "\"route\":\"/v1/chat\"");
+    try assertContains(transcript, valid_bearer_hash);
 }
 
 const GenericFixtureDir = struct {

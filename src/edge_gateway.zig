@@ -3612,6 +3612,18 @@ fn routeRequest(
         }
     }
 
+    if (try handleOperatorRoute(
+        allocator,
+        writer,
+        cfg,
+        state,
+        request,
+        correlation_id,
+        keep_alive.*,
+    )) |status| {
+        return status;
+    }
+
     if (serveTryFilesFallback(allocator, cfg, request.method.toString(), request.uri.path, correlation_id, keep_alive.*, writer, state)) |status| {
         state.metricsRecord(status);
         return status;
@@ -3998,6 +4010,7 @@ fn runMiddlewarePipeline(
     keep_alive: bool,
 ) !bool {
     const client_ip = ctx.client_ip;
+    const operator_route = isOperatorRoute(request.uri.path);
 
     if (cfg.geo_blocked_countries.len > 0) {
         const country = request.headers.get(cfg.geo_country_header);
@@ -4043,7 +4056,7 @@ fn runMiddlewarePipeline(
         }
     }
 
-    if (!state.rateLimitAllow(client_ip)) {
+    if (!operator_route and !state.rateLimitAllow(client_ip)) {
         const payload = try buildApiErrorJson(allocator, "rate_limited", "Rate limit exceeded", correlation_id);
         defer allocator.free(payload);
         var response = http.Response.json(allocator, payload);
@@ -5685,6 +5698,103 @@ fn populateHealthResponse(
             .setContentLength(body.len);
     }
     applyResponseHeaders(state, response);
+}
+
+fn isOperatorRoute(path: []const u8) bool {
+    return std.mem.eql(u8, path, "/health") or
+        std.mem.eql(u8, path, "/status") or
+        std.mem.eql(u8, path, "/metrics") or
+        std.mem.eql(u8, path, "/status/metrics");
+}
+
+fn populateStatusResponse(
+    allocator: std.mem.Allocator,
+    response: *http.Response,
+    keep_alive: bool,
+    correlation_id: []const u8,
+    state: *GatewayState,
+) !void {
+    const counts = state.connectionCounts();
+    const metrics_json = try state.metricsToJson(allocator);
+    defer allocator.free(metrics_json);
+    const upstream_health_json = try state.upstreamHealthJson(allocator);
+    defer allocator.free(upstream_health_json);
+    const body = try std.fmt.allocPrint(
+        allocator,
+        "{{\"status\":\"{s}\",\"service\":\"tardigrade-edge\",\"version\":\"{s}\",\"pid\":{d},\"connections\":{{\"active\":{d},\"tracked_ips\":{d}}},\"metrics\":{s},\"upstream_health\":{s}}}",
+        .{
+            if (state.upstreamUnhealthyCount() > 0) "degraded" else "ok",
+            http.SERVER_VERSION,
+            std.c.getpid(),
+            counts.active,
+            counts.per_ip,
+            metrics_json,
+            upstream_health_json,
+        },
+    );
+    _ = response
+        .setStatus(.ok)
+        .setBodyOwned(body)
+        .setContentType("application/json")
+        .setConnection(keep_alive)
+        .setHeader(http.correlation.HEADER_NAME, correlation_id);
+    applyResponseHeaders(state, response);
+}
+
+fn populateMetricsResponse(
+    allocator: std.mem.Allocator,
+    response: *http.Response,
+    keep_alive: bool,
+    correlation_id: []const u8,
+    state: *GatewayState,
+    json_format: bool,
+) !void {
+    const body = if (json_format)
+        try state.metricsToJson(allocator)
+    else
+        try state.metricsToPrometheus(allocator);
+    _ = response
+        .setStatus(.ok)
+        .setBodyOwned(body)
+        .setContentType(if (json_format) "application/json" else "text/plain; version=0.0.4")
+        .setConnection(keep_alive)
+        .setHeader(http.correlation.HEADER_NAME, correlation_id);
+    applyResponseHeaders(state, response);
+}
+
+fn handleOperatorRoute(
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    cfg: *const edge_config.EdgeConfig,
+    state: *GatewayState,
+    request: *const http.Request,
+    correlation_id: []const u8,
+    keep_alive: bool,
+) !?u16 {
+    if (!(request.method == .GET or request.method == .HEAD)) return null;
+
+    var response = http.Response.init(allocator);
+    defer response.deinit();
+
+    if (std.mem.eql(u8, request.uri.path, "/health")) {
+        try populateHealthResponse(allocator, &response, keep_alive, correlation_id, state, cfg, false);
+    } else if (std.mem.eql(u8, request.uri.path, "/status")) {
+        try populateStatusResponse(allocator, &response, keep_alive, correlation_id, state);
+    } else if (std.mem.eql(u8, request.uri.path, "/metrics")) {
+        try populateMetricsResponse(allocator, &response, keep_alive, correlation_id, state, false);
+    } else if (std.mem.eql(u8, request.uri.path, "/status/metrics")) {
+        try populateMetricsResponse(allocator, &response, keep_alive, correlation_id, state, true);
+    } else {
+        return null;
+    }
+
+    if (request.method == .HEAD) {
+        try response.writeHead(writer);
+    } else {
+        try response.write(writer);
+    }
+    state.metricsRecord(200);
+    return 200;
 }
 
 fn finalizeHttp3Response(response: *http.Response) void {

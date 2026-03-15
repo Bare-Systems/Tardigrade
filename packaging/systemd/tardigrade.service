@@ -1,0 +1,20 @@
+[Unit]
+Description=Tardigrade edge gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tardigrade
+Group=tardigrade
+WorkingDirectory=/var/lib/tardigrade
+Environment=TARDIGRADE_CONFIG_PATH=/etc/tardigrade/tardigrade.conf
+ExecStart=/usr/local/bin/tardigrade run
+ExecReload=/usr/local/bin/tardigrade reload -c /etc/tardigrade/tardigrade.conf
+ExecStop=/usr/local/bin/tardigrade stop -c /etc/tardigrade/tardigrade.conf
+Restart=on-failure
+RestartSec=2
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

@@ -1,7 +1,25 @@
+const builtin = @import("builtin");
 const std = @import("std");
 const c = @cImport({
     @cInclude("regex.h");
 });
+
+const LinuxRegex = extern struct {
+    buffer: ?*anyopaque,
+    allocated: c_ulong,
+    used: c_ulong,
+    syntax: c_ulong,
+    fastmap: ?*anyopaque,
+    translate: ?*anyopaque,
+    re_nsub: usize,
+    flags: c_uint,
+};
+
+const Regex = if (builtin.os.tag == .linux and builtin.abi == .gnu) LinuxRegex else c.regex_t;
+
+extern "c" fn regcomp(regex: *Regex, pattern: [*:0]const u8, flags: c_int) c_int;
+extern "c" fn regexec(regex: *const Regex, input: [*:0]const u8, match_count: usize, matches: ?[*]c.regmatch_t, flags: c_int) c_int;
+extern "c" fn regfree(regex: *Regex) void;
 
 pub const RewriteFlag = enum {
     last,
@@ -113,18 +131,20 @@ pub fn regexMatchesOptions(pattern: []const u8, input: []const u8, case_insensit
     defer allocator.free(pattern_z);
     @memcpy(pattern_z[0..prepared.normalized_pattern.len], prepared.normalized_pattern);
     pattern_z[prepared.normalized_pattern.len] = 0;
+    const pattern_z_ptr: [*:0]const u8 = @ptrCast(pattern_z.ptr);
 
     const input_z = allocator.alloc(u8, input.len + 1) catch return false;
     defer allocator.free(input_z);
     @memcpy(input_z[0..input.len], input);
     input_z[input.len] = 0;
+    const input_z_ptr: [*:0]const u8 = @ptrCast(input_z.ptr);
 
-    var regex: c.regex_t = undefined;
+    var regex: Regex = undefined;
     const compile_flags = c.REG_EXTENDED | c.REG_NOSUB | if (case_insensitive) @as(c_int, c.REG_ICASE) else 0;
-    const compile_rc = c.regcomp(&regex, pattern_z.ptr, compile_flags);
+    const compile_rc = regcomp(&regex, pattern_z_ptr, compile_flags);
     if (compile_rc != 0) return false;
-    defer _ = c.regfree(&regex);
-    return c.regexec(&regex, input_z.ptr, 0, null, 0) == 0;
+    defer regfree(&regex);
+    return regexec(&regex, input_z_ptr, 0, null, 0) == 0;
 }
 
 pub fn evaluate(
@@ -205,20 +225,22 @@ fn regexReplace(
     defer allocator.free(pattern_z);
     @memcpy(pattern_z[0..prepared.normalized_pattern.len], prepared.normalized_pattern);
     pattern_z[prepared.normalized_pattern.len] = 0;
+    const pattern_z_ptr: [*:0]const u8 = @ptrCast(pattern_z.ptr);
 
     const input_z = try allocator.alloc(u8, input.len + 1);
     defer allocator.free(input_z);
     @memcpy(input_z[0..input.len], input);
     input_z[input.len] = 0;
+    const input_z_ptr: [*:0]const u8 = @ptrCast(input_z.ptr);
 
-    var regex: c.regex_t = undefined;
+    var regex: Regex = undefined;
     const compile_flags = c.REG_EXTENDED | if (case_insensitive) @as(c_int, c.REG_ICASE) else 0;
-    const compile_rc = c.regcomp(&regex, pattern_z.ptr, compile_flags);
+    const compile_rc = regcomp(&regex, pattern_z_ptr, compile_flags);
     if (compile_rc != 0) return null;
-    defer _ = c.regfree(&regex);
+    defer regfree(&regex);
 
     var captures: [10]c.regmatch_t = undefined;
-    if (c.regexec(&regex, input_z.ptr, captures.len, &captures, 0) != 0) return null;
+    if (regexec(&regex, input_z_ptr, captures.len, captures[0..].ptr, 0) != 0) return null;
 
     var out = std.ArrayList(u8).init(allocator);
     errdefer out.deinit();

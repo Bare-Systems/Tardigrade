@@ -2,10 +2,12 @@ zig-out/
 .zig-cache/
 changes/
 CLAUDE.md
+AGENTS.md
 .claude/worktrees/
 PLAN.md
 
 # Secrets and environment files — never commit these
+.DS_Store
 .env
 .env.*
 *.secret

@@ -102,13 +102,13 @@ pub fn matchLocation(request_uri: []const u8, blocks: []const LocationBlock) ?Ma
                 }
             },
             .prefix_priority => {
-                if (std.mem.startsWith(u8, path, block.pattern) and block.pattern.len >= best_priority_prefix_len) {
+                if (std.mem.startsWith(u8, path, block.pattern) and isBetterPrefixMatch(blocks, idx, best_priority_prefix, block.pattern.len, best_priority_prefix_len)) {
                     best_priority_prefix = idx;
                     best_priority_prefix_len = block.pattern.len;
                 }
             },
             .prefix => {
-                if (std.mem.startsWith(u8, path, block.pattern) and block.pattern.len >= best_plain_prefix_len) {
+                if (std.mem.startsWith(u8, path, block.pattern) and isBetterPrefixMatch(blocks, idx, best_plain_prefix, block.pattern.len, best_plain_prefix_len)) {
                     best_plain_prefix = idx;
                     best_plain_prefix_len = block.pattern.len;
                 }
@@ -143,6 +143,19 @@ pub fn matchLocation(request_uri: []const u8, blocks: []const LocationBlock) ?Ma
     }
 
     return null;
+}
+
+fn isBetterPrefixMatch(
+    blocks: []const LocationBlock,
+    candidate_idx: usize,
+    current_idx: ?usize,
+    candidate_len: usize,
+    current_len: usize,
+) bool {
+    if (candidate_len > current_len) return true;
+    if (candidate_len < current_len) return false;
+    if (current_idx == null) return true;
+    return blocks[candidate_idx].priority < blocks[current_idx.?].priority;
 }
 
 fn normalizeRequestPath(request_uri: []const u8) []const u8 {
@@ -268,4 +281,24 @@ test "longest plain prefix wins when no exact priority or regex matches" {
 
     const matched = matchLocation("/images/logo.png", &blocks).?;
     try std.testing.expectEqual(@as(usize, 1), matched.index);
+}
+
+test "equal length prefixes keep first configured block" {
+    const blocks = [_]LocationBlock{
+        .{
+            .match_type = .prefix,
+            .pattern = "/api",
+            .priority = 0,
+            .action = .{ .proxy_pass = "http://first" },
+        },
+        .{
+            .match_type = .prefix,
+            .pattern = "/api",
+            .priority = 1,
+            .action = .{ .proxy_pass = "http://second" },
+        },
+    };
+
+    const matched = matchLocation("/api/users", &blocks).?;
+    try std.testing.expectEqual(@as(usize, 0), matched.index);
 }

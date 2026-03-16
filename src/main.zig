@@ -39,7 +39,7 @@ const ConfigInitOptions = struct {
 
 const starter_config =
     \\# Tardigrade starter config.
-    \\# Built-in operator endpoints are available at /health, /status, and /metrics.
+    \\# All HTTP request-path behavior is config-defined.
     \\
     \\pid /var/run/tardigrade.pid;
     \\listen 8069;
@@ -243,7 +243,6 @@ fn printUsage(writer: anytype) !void {
         \\    `./tardigrade.conf`, `./config/tardigrade.conf`,
         \\    `/etc/tardigrade/tardigrade.conf`, and
         \\    `$HOME/.config/tardigrade/tardigrade.conf`.
-        \\  - Built-in operator endpoints are `/health`, `/status`, and `/metrics`.
         \\
     );
 }

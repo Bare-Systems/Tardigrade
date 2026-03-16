@@ -1,10 +1,5 @@
 zig-out/
 .zig-cache/
-changes/
-CLAUDE.md
-AGENTS.md
-.claude/worktrees/
-PLAN.md
 
 # Secrets and environment files — never commit these
 .DS_Store
@@ -17,3 +12,17 @@ secrets.txt
 *.p12
 *.pfx
 .zig/
+
+# Agent Context
+changes/
+.cursor/
+AGENTS.md
+PLAN.md
+CLAUDE.md
+.claude/worktrees/
+ROADMAP.md
+PORTFOLIO.md
+CONTEXTS.md
+deploy/
+PLAN-TEST*.md
+PLAN*.md

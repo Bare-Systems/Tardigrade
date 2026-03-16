@@ -1,0 +1,11 @@
+.git
+.github
+.zig-cache
+zig-out/*
+!zig-out/bin/
+zig-out/bin/*
+!zig-out/bin/tardigrade
+docs
+tests
+examples
+PLAN.md

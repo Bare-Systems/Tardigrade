@@ -2,24 +2,36 @@ name: Release Tardigrade
 
 on:
   push:
+    branches:
+      - main
     tags:
-      - 'v*'
+      - "v*"
+  workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
-  release-linux:
-    runs-on: ubuntu-latest
+  build-release:
+    name: Build ${{ matrix.asset_name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            asset_name: tardigrade-linux-x86_64
+          - os: macos-13
+            asset_name: tardigrade-darwin-x86_64
+          - os: macos-14
+            asset_name: tardigrade-darwin-arm64
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
-      - name: Setup Zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.14.1
+      - name: Install Zig
+        run: sh ./scripts/install-zig.sh 0.14.1
 
       - name: Build release binary
         run: zig build -Doptimize=ReleaseFast
@@ -28,10 +40,29 @@ jobs:
         run: |
           mkdir -p dist
           cp zig-out/bin/tardigrade dist/tardigrade
-          tar -C dist -czf tardigrade-linux-x86_64.tar.gz tardigrade
+          ln -sf tardigrade dist/tardi
+          tar -C dist -czf "${{ matrix.asset_name }}.tar.gz" tardigrade tardi
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: ${{ matrix.asset_name }}.tar.gz
+          if-no-files-found: error
+
+  publish-release:
+    name: Publish GitHub release assets
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    needs: build-release
+
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
 
       - name: Publish release assets
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            tardigrade-linux-x86_64.tar.gz
+          files: dist/*/*.tar.gz

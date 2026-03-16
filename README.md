@@ -56,15 +56,53 @@ zig build run
 
 The server starts on `http://localhost:8069` by default.
 
-### Install latest Linux binary
+### Install latest release
 
 ```bash
-curl -fsSL -o tardigrade-linux-x86_64.tar.gz \
-  https://github.com/Bare-Labs/Tardigrade/releases/latest/download/tardigrade-linux-x86_64.tar.gz
-tar -xzf tardigrade-linux-x86_64.tar.gz
-chmod +x tardigrade
-./tardigrade
+curl -fsSL https://raw.githubusercontent.com/Bare-Labs/Tardigrade/main/scripts/install.sh | sh
 ```
+
+By default the installer places `tardigrade` in `~/.local/bin`. To install a
+specific tag or choose a different directory:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Bare-Labs/Tardigrade/main/scripts/install.sh | \
+  TARDIGRADE_VERSION=v0.7.0 TARDIGRADE_INSTALL_DIR=/usr/local/bin sh
+```
+
+Tagged releases are built in GitHub Actions and published as downloadable
+GitHub artifacts and release assets.
+
+The canonical command name is `tardigrade`. Release installs also provide a
+`tardi` alias for local convenience.
+
+### Operator CLI
+
+```bash
+# Start with automatic config discovery
+./zig-out/bin/tardigrade run
+
+# Validate a specific config
+./zig-out/bin/tardigrade validate -c /etc/tardigrade/tardigrade.conf
+
+# Reload or stop a managed process
+./zig-out/bin/tardigrade reload -c /etc/tardigrade/tardigrade.conf
+./zig-out/bin/tardigrade stop -c /etc/tardigrade/tardigrade.conf
+
+# Generate a starter config
+./zig-out/bin/tardigrade config init
+```
+
+Config discovery checks `-c/--config`, `TARDIGRADE_CONFIG_PATH`, `./tardigrade.conf`,
+`./config/tardigrade.conf`, `/etc/tardigrade/tardigrade.conf`, and
+`$HOME/.config/tardigrade/tardigrade.conf`.
+
+Built-in operator endpoints:
+
+- `GET /health` returns runtime health JSON
+- `GET /status` returns runtime status JSON
+- `GET /metrics` returns Prometheus text metrics
+- `GET /status/metrics` returns JSON metrics
 
 ## Configuration
 
@@ -87,6 +125,7 @@ Config file notes:
 - variables: `set $base /etc/tardigrade;` with `${base}` interpolation
 - include support: `include conf.d/*.conf;`
 - environment variables override config-file values
+- `config init` generates a starter file with static serving and a PID path
 
 ### Environment Variables
 
@@ -297,7 +336,26 @@ zig build test-integration
 zig build -Doptimize=ReleaseFast
 
 # Run the binary directly
-./zig-out/bin/tardigrade
+./zig-out/bin/tardigrade run
+```
+
+### Container Image
+
+```bash
+zig build -Doptimize=ReleaseFast
+docker build -t tardigrade .
+docker run --rm -p 8069:8069 tardigrade
+```
+
+The repository Docker image expects `zig-out/bin/tardigrade` to exist in the
+build context. The published CI image runs as a non-root user and includes a
+`/health` container healthcheck.
+
+GitHub Actions also publishes a public GHCR image from `main` and release tags:
+
+```bash
+docker pull ghcr.io/bare-labs/tardigrade:latest
+docker run --rm -p 8069:8069 ghcr.io/bare-labs/tardigrade:latest
 ```
 
 ### Linux `systemd --user` service
@@ -360,6 +418,11 @@ After enabling lingering for `admin`, install the staged units with:
 ```bash
 /home/admin/barelabs/runtime/blink-homelab/install_user_systemd_units.sh enable
 ```
+
+Example host-native service manifests now live under `packaging/`:
+
+- `packaging/systemd/tardigrade.service`
+- `packaging/launchd/io.barelabs.tardigrade.plist`
 
 ## Usage
 

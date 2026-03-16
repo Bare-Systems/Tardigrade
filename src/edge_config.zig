@@ -1299,17 +1299,19 @@ fn parseServerBlocks(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeConfi
         const tls_cert_path = fields.next() orelse return error.InvalidServerBlockFormat;
         const tls_key_path = fields.next() orelse return error.InvalidServerBlockFormat;
         const upstream_base_url = fields.next() orelse return error.InvalidServerBlockFormat;
-        const location_blocks_raw = fields.next() orelse return error.InvalidServerBlockFormat;
-        const proxy_pass_chat = fields.next() orelse "";
-        const proxy_pass_commands_prefix = fields.next() orelse "";
+        const rem_a = fields.next() orelse return error.InvalidServerBlockFormat;
+        const rem_b = fields.next();
+        const rem_c = fields.next();
         if (fields.next() != null) return error.InvalidServerBlockFormat;
+
+        const route_fields = try parseServerBlockRouteFields(rem_a, rem_b, rem_c);
 
         const names = try parseServerNames(allocator, names_raw);
         errdefer {
             for (names) |name| allocator.free(name);
             allocator.free(names);
         }
-        const location_blocks = try parseLocationBlocks(allocator, location_blocks_raw);
+        const location_blocks = try parseLocationBlocks(allocator, route_fields.location_blocks_raw);
         errdefer {
             for (location_blocks) |*block| block.deinit(allocator);
             allocator.free(location_blocks);
@@ -1322,11 +1324,63 @@ fn parseServerBlocks(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeConfi
             .tls_cert_path = try allocator.dupe(u8, tls_cert_path),
             .tls_key_path = try allocator.dupe(u8, tls_key_path),
             .upstream_base_url = try allocator.dupe(u8, upstream_base_url),
-            .proxy_pass_chat = try allocator.dupe(u8, proxy_pass_chat),
-            .proxy_pass_commands_prefix = try allocator.dupe(u8, proxy_pass_commands_prefix),
+            .proxy_pass_chat = try allocator.dupe(u8, route_fields.proxy_pass_chat),
+            .proxy_pass_commands_prefix = try allocator.dupe(u8, route_fields.proxy_pass_commands_prefix),
         });
     }
     return out.toOwnedSlice();
+}
+
+const ParsedServerBlockRouteFields = struct {
+    location_blocks_raw: []const u8,
+    proxy_pass_chat: []const u8,
+    proxy_pass_commands_prefix: []const u8,
+};
+
+fn parseServerBlockRouteFields(
+    rem_a: []const u8,
+    rem_b: ?[]const u8,
+    rem_c: ?[]const u8,
+) !ParsedServerBlockRouteFields {
+    if (rem_b == null and rem_c == null) {
+        return .{
+            .location_blocks_raw = rem_a,
+            .proxy_pass_chat = "",
+            .proxy_pass_commands_prefix = "",
+        };
+    }
+
+    if (rem_c) |location_blocks_raw| {
+        return .{
+            .location_blocks_raw = location_blocks_raw,
+            .proxy_pass_chat = rem_a,
+            .proxy_pass_commands_prefix = rem_b.?,
+        };
+    }
+
+    if (rem_b) |value_b| {
+        if (looksLikeLocationBlockBlob(rem_a)) {
+            return .{
+                .location_blocks_raw = rem_a,
+                .proxy_pass_chat = value_b,
+                .proxy_pass_commands_prefix = "",
+            };
+        }
+        if (looksLikeLocationBlockBlob(value_b)) {
+            return .{
+                .location_blocks_raw = value_b,
+                .proxy_pass_chat = rem_a,
+                .proxy_pass_commands_prefix = "",
+            };
+        }
+    }
+
+    return error.InvalidServerBlockFormat;
+}
+
+fn looksLikeLocationBlockBlob(value: []const u8) bool {
+    if (value.len == 0) return true;
+    return std.mem.indexOfScalar(u8, value, '|') != null;
 }
 
 fn applyServerBlockTlsConfig(
@@ -2386,6 +2440,22 @@ test "parse server blocks" {
     try std.testing.expectEqualStrings("/certs/api.crt", blocks[0].tls_cert_path);
     try std.testing.expectEqualStrings("/certs/api.key", blocks[0].tls_key_path);
     try std.testing.expectEqualStrings("http://127.0.0.1:9101", blocks[0].upstream_base_url);
+    try std.testing.expectEqual(@as(usize, 1), blocks[0].location_blocks.len);
+}
+
+test "parse server blocks with explicit proxy route fields" {
+    const allocator = std.testing.allocator;
+    const raw =
+        "api.example.test" ++ "\x1f" ++ "/srv/api" ++ "\x1f" ++ "$uri /index.html" ++ "\x1f" ++ "/certs/api.crt" ++ "\x1f" ++ "/certs/api.key" ++ "\x1f" ++ "http://127.0.0.1:9101" ++ "\x1f" ++ "http://127.0.0.1:9201/v1/chat" ++ "\x1f" ++ "http://127.0.0.1:9202/v1" ++ "\x1f" ++ "prefix|/|proxy_pass|http://127.0.0.1:9101";
+    const blocks = try parseServerBlocks(allocator, raw);
+    defer {
+        for (blocks) |*block| block.deinit(allocator);
+        allocator.free(blocks);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), blocks.len);
+    try std.testing.expectEqualStrings("http://127.0.0.1:9201/v1/chat", blocks[0].proxy_pass_chat);
+    try std.testing.expectEqualStrings("http://127.0.0.1:9202/v1", blocks[0].proxy_pass_commands_prefix);
     try std.testing.expectEqual(@as(usize, 1), blocks[0].location_blocks.len);
 }
 

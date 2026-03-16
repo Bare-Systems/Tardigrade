@@ -18,6 +18,10 @@ extern fn SSL_CTX_set_alpn_select_cb(
 
 const ssl_op_no_ticket: c_ulong = @as(c_ulong, 1) << @as(u6, 14);
 const openssl_npn_negotiated: c_int = 1;
+const embedded_server_crt = @embedFile("testdata/test_server.crt");
+const embedded_server_key = @embedFile("testdata/test_server.key");
+const embedded_alt_server_crt = @embedFile("testdata/test_alt_server.crt");
+const embedded_alt_server_key = @embedFile("testdata/test_alt_server.key");
 
 pub const TlsError = error{
     OutOfMemory,
@@ -123,9 +127,12 @@ pub const TlsTerminator = struct {
         const method = c.TLS_server_method() orelse return error.ContextInitFailed;
         const ctx = c.SSL_CTX_new(method) orelse return error.ContextInitFailed;
         errdefer c.SSL_CTX_free(ctx);
-        const owned_sni_specs = try allocator.alloc(SniCertSpec, opts.sni_certs.len);
-        errdefer allocator.free(owned_sni_specs);
-        @memcpy(owned_sni_specs, opts.sni_certs);
+        const owned_sni_specs = owned: {
+            const specs = try allocator.alloc(SniCertSpec, opts.sni_certs.len);
+            errdefer allocator.free(specs);
+            @memcpy(specs, opts.sni_certs);
+            break :owned specs;
+        };
 
         var st = try allocator.create(State);
         errdefer allocator.destroy(st);
@@ -436,22 +443,38 @@ test "openssl init" {
 
 test "tls terminator copies sni specs for maintenance reload" {
     const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(.{ .sub_path = "test_server.crt", .data = embedded_server_crt });
+    try tmp.dir.writeFile(.{ .sub_path = "test_server.key", .data = embedded_server_key });
+    try tmp.dir.writeFile(.{ .sub_path = "test_alt_server.crt", .data = embedded_alt_server_crt });
+    try tmp.dir.writeFile(.{ .sub_path = "test_alt_server.key", .data = embedded_alt_server_key });
+
+    const alt_cert_path = try tmp.dir.realpathAlloc(allocator, "test_alt_server.crt");
+    defer allocator.free(alt_cert_path);
+    const alt_key_path = try tmp.dir.realpathAlloc(allocator, "test_alt_server.key");
+    defer allocator.free(alt_key_path);
+    const cert_path = try tmp.dir.realpathAlloc(allocator, "test_server.crt");
+    defer allocator.free(cert_path);
+    const key_path = try tmp.dir.realpathAlloc(allocator, "test_server.key");
+    defer allocator.free(key_path);
+
     var specs = try allocator.alloc(SniCertSpec, 1);
+    defer allocator.free(specs);
     specs[0] = .{
         .server_name = "sni.integration.test",
-        .cert_path = "tests/fixtures/tls/alt_server.crt",
-        .key_path = "tests/fixtures/tls/alt_server.key",
+        .cert_path = alt_cert_path,
+        .key_path = alt_key_path,
     };
 
     var tls = try TlsTerminator.init(allocator, .{
-        .cert_path = "tests/fixtures/tls/server.crt",
-        .key_path = "tests/fixtures/tls/server.key",
+        .cert_path = cert_path,
+        .key_path = key_path,
         .sni_certs = specs,
         .dynamic_reload_interval_ms = 1,
     });
     defer tls.deinit();
-
-    allocator.free(specs);
 
     tls.runMaintenance(1);
     tls.runMaintenance(2);

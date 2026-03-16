@@ -26,3 +26,6 @@ CONTEXTS.md
 deploy/
 PLAN-TEST*.md
 PLAN*.md
+
+# Deployment symlink
+suite/

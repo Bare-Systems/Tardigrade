@@ -3953,9 +3953,6 @@ fn executeRawHttpProxyRequest(
         const trimmed = std.mem.trim(u8, value, " \t\r\n");
         if (trimmed.len > 0) try extra_headers.append(.{ .name = "X-Forwarded-Host", .value = trimmed });
     }
-    if (parseUpstreamHost(url)) |upstream_host| {
-        if (upstream_host.len > 0) try extra_headers.append(.{ .name = "Host", .value = upstream_host });
-    }
 
     var req = try client.open(method_enum, uri, .{
         .server_header_buffer = &server_header_buffer,
@@ -3987,6 +3984,9 @@ fn executeRawHttpProxyRequest(
             .value = try allocator.dupe(u8, header.value),
         });
     }
+    try appendSpecialUpstreamResponseHeader(allocator, &headers, "Content-Type", req.response.content_type);
+    try appendSpecialUpstreamResponseHeader(allocator, &headers, "Content-Disposition", req.response.content_disposition);
+    try appendSpecialUpstreamResponseHeader(allocator, &headers, "Location", req.response.location);
 
     var response_body = std.ArrayList(u8).init(allocator);
     errdefer response_body.deinit();
@@ -3998,6 +3998,22 @@ fn executeRawHttpProxyRequest(
         .headers = try headers.toOwnedSlice(),
         .body = try response_body.toOwnedSlice(),
     };
+}
+
+fn appendSpecialUpstreamResponseHeader(
+    allocator: std.mem.Allocator,
+    headers: *std.ArrayList(UpstreamHeader),
+    name: []const u8,
+    value: ?[]const u8,
+) !void {
+    const raw = value orelse return;
+    for (headers.items) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, name)) return;
+    }
+    try headers.append(.{
+        .name = try allocator.dupe(u8, name),
+        .value = try allocator.dupe(u8, raw),
+    });
 }
 
 const StaticErrorPageResult = union(enum) {
@@ -5673,11 +5689,6 @@ fn applyResponseHeaders(state: *GatewayState, response: *http.Response) void {
     }
 }
 
-const Http3HealthSnapshot = struct {
-    handshake_state: []const u8,
-    snapshot: http.http3_runtime.Snapshot,
-};
-
 const Http3DispatchContext = struct {
     cfg: *const edge_config.EdgeConfig,
     state: *GatewayState,
@@ -5691,171 +5702,6 @@ const Http3LocationOutcome = union(enum) {
         query: ?[]const u8,
     },
 };
-
-fn http3HandshakeState(state: *const GatewayState, cfg: *const edge_config.EdgeConfig, snapshot: http.http3_runtime.Snapshot) []const u8 {
-    if (!cfg.http3_enabled) return "disabled";
-    if (!edge_config.hasTlsFiles(cfg)) return "config_incomplete";
-    if (state.http3_runtime == null) return "unavailable";
-    return snapshot.handshakeState();
-}
-
-fn http3HealthSnapshot(state: *const GatewayState, cfg: *const edge_config.EdgeConfig) Http3HealthSnapshot {
-    const snapshot = if (state.http3_runtime) |runtime| runtime.snapshot() else http.http3_runtime.Snapshot{ .quic_port = if (cfg.http3_enabled) cfg.quic_port else 0 };
-    return .{
-        .handshake_state = http3HandshakeState(state, cfg, snapshot),
-        .snapshot = snapshot,
-    };
-}
-
-fn populateHealthResponse(
-    allocator: std.mem.Allocator,
-    response: *http.Response,
-    keep_alive: ?bool,
-    correlation_id: []const u8,
-    state: *GatewayState,
-    cfg: *const edge_config.EdgeConfig,
-    http3_mode: bool,
-) !void {
-    const unhealthy_backends = state.upstreamUnhealthyCount();
-    const http3_status = http.http3_handler.configurationStatus(cfg.http3_enabled, edge_config.hasTlsFiles(cfg));
-    const http3_health = http3HealthSnapshot(state, cfg);
-    const http3_last_error_name = http.ngtcp2_binding.errorName(http3_health.snapshot.last_error_code) orelse "-";
-    const body = try std.fmt.allocPrint(
-        allocator,
-        "{{\"status\":\"ok\",\"service\":\"tardigrade-edge\",\"upstream_status\":\"{s}\",\"upstream_unhealthy_backends\":{d},\"http3_status\":\"{s}\",\"http3_quic_port\":{d},\"http3_handshake_state\":\"{s}\",\"http3_datagrams_seen\":{d},\"http3_zero_rtt_packets_seen\":{d},\"http3_tracked_connections\":{d},\"http3_native_connections\":{d},\"http3_native_reads_attempted\":{d},\"http3_native_read_calls\":{d},\"http3_handshakes_completed\":{d},\"http3_stream_bytes_received\":{d},\"http3_stream_chunks_received\":{d},\"http3_requests_completed\":{d},\"http3_packets_emitted\":{d},\"http3_bytes_emitted\":{d},\"http3_migration_events\":{d},\"http3_last_error_code\":{d},\"http3_last_error_name\":\"{s}\"}}",
-        .{
-            if (unhealthy_backends > 0) "degraded" else "healthy",
-            unhealthy_backends,
-            http3_status,
-            if (cfg.http3_enabled) cfg.quic_port else 0,
-            http3_health.handshake_state,
-            http3_health.snapshot.datagrams_seen,
-            http3_health.snapshot.zero_rtt_packets_seen,
-            http3_health.snapshot.tracked_connections,
-            http3_health.snapshot.native_connections,
-            http3_health.snapshot.native_reads_attempted,
-            http3_health.snapshot.native_read_calls,
-            http3_health.snapshot.handshakes_completed,
-            http3_health.snapshot.stream_bytes_received,
-            http3_health.snapshot.stream_chunks_received,
-            http3_health.snapshot.requests_completed,
-            http3_health.snapshot.packets_emitted,
-            http3_health.snapshot.bytes_emitted,
-            http3_health.snapshot.migration_events,
-            http3_health.snapshot.last_error_code,
-            http3_last_error_name,
-        },
-    );
-    _ = response
-        .setStatus(.ok)
-        .setBodyOwned(body)
-        .setContentType("application/json")
-        .setHeader(http.correlation.HEADER_NAME, correlation_id);
-    if (keep_alive) |value| _ = response.setConnection(value);
-    if (http3_mode) {
-        _ = response
-            .setHeader("server", http.SERVER_NAME ++ "/" ++ http.SERVER_VERSION)
-            .setContentLength(body.len);
-    }
-    applyResponseHeaders(state, response);
-}
-
-fn isOperatorRoute(path: []const u8) bool {
-    return std.mem.eql(u8, path, "/health") or
-        std.mem.eql(u8, path, "/status") or
-        std.mem.eql(u8, path, "/metrics") or
-        std.mem.eql(u8, path, "/status/metrics");
-}
-
-fn populateStatusResponse(
-    allocator: std.mem.Allocator,
-    response: *http.Response,
-    keep_alive: bool,
-    correlation_id: []const u8,
-    state: *GatewayState,
-) !void {
-    const counts = state.connectionCounts();
-    const metrics_json = try state.metricsToJson(allocator);
-    defer allocator.free(metrics_json);
-    const upstream_health_json = try state.upstreamHealthJson(allocator);
-    defer allocator.free(upstream_health_json);
-    const body = try std.fmt.allocPrint(
-        allocator,
-        "{{\"status\":\"{s}\",\"service\":\"tardigrade-edge\",\"version\":\"{s}\",\"pid\":{d},\"connections\":{{\"active\":{d},\"tracked_ips\":{d}}},\"metrics\":{s},\"upstream_health\":{s}}}",
-        .{
-            if (state.upstreamUnhealthyCount() > 0) "degraded" else "ok",
-            http.SERVER_VERSION,
-            std.c.getpid(),
-            counts.active,
-            counts.per_ip,
-            metrics_json,
-            upstream_health_json,
-        },
-    );
-    _ = response
-        .setStatus(.ok)
-        .setBodyOwned(body)
-        .setContentType("application/json")
-        .setConnection(keep_alive)
-        .setHeader(http.correlation.HEADER_NAME, correlation_id);
-    applyResponseHeaders(state, response);
-}
-
-fn populateMetricsResponse(
-    allocator: std.mem.Allocator,
-    response: *http.Response,
-    keep_alive: bool,
-    correlation_id: []const u8,
-    state: *GatewayState,
-    json_format: bool,
-) !void {
-    const body = if (json_format)
-        try state.metricsToJson(allocator)
-    else
-        try state.metricsToPrometheus(allocator);
-    _ = response
-        .setStatus(.ok)
-        .setBodyOwned(body)
-        .setContentType(if (json_format) "application/json" else "text/plain; version=0.0.4")
-        .setConnection(keep_alive)
-        .setHeader(http.correlation.HEADER_NAME, correlation_id);
-    applyResponseHeaders(state, response);
-}
-
-fn handleOperatorRoute(
-    allocator: std.mem.Allocator,
-    writer: anytype,
-    cfg: *const edge_config.EdgeConfig,
-    state: *GatewayState,
-    request: *const http.Request,
-    correlation_id: []const u8,
-    keep_alive: bool,
-) !?u16 {
-    if (!(request.method == .GET or request.method == .HEAD)) return null;
-
-    var response = http.Response.init(allocator);
-    defer response.deinit();
-
-    if (std.mem.eql(u8, request.uri.path, "/health")) {
-        try populateHealthResponse(allocator, &response, keep_alive, correlation_id, state, cfg, false);
-    } else if (std.mem.eql(u8, request.uri.path, "/status")) {
-        try populateStatusResponse(allocator, &response, keep_alive, correlation_id, state);
-    } else if (std.mem.eql(u8, request.uri.path, "/metrics")) {
-        try populateMetricsResponse(allocator, &response, keep_alive, correlation_id, state, false);
-    } else if (std.mem.eql(u8, request.uri.path, "/status/metrics")) {
-        try populateMetricsResponse(allocator, &response, keep_alive, correlation_id, state, true);
-    } else {
-        return null;
-    }
-
-    if (request.method == .HEAD) {
-        try response.writeHead(writer);
-    } else {
-        try response.write(writer);
-    }
-    state.metricsRecord(200);
-    return 200;
-}
 
 fn finalizeHttp3Response(response: *http.Response) void {
     _ = response
@@ -5874,7 +5720,7 @@ fn handleHttp3LocationProxyPass(
     target: []const u8,
     correlation_id: []const u8,
 ) !void {
-    const resolved = try resolveProxyTarget(allocator, ctx.cfg.upstream_base_url, target, suffixPathForLocationMatch(request_path, matched));
+    const resolved = try resolveProxyTarget(allocator, ctx.cfg.upstream_base_url, target, proxySuffixPathForLocation(request_path, matched, ctx.cfg.location_blocks));
     defer allocator.free(resolved.url);
     const upstream_url = try appendProxyQueryString(allocator, resolved.url, request_query);
     defer allocator.free(upstream_url);
@@ -7057,6 +6903,7 @@ fn proxyJsonExecute(
                         allocator.free(res.body);
                         allocator.free(res.content_type);
                         if (res.content_disposition) |cd| allocator.free(cd);
+                        if (res.location) |location| allocator.free(location);
                         continue;
                     }
                 } else {
@@ -7090,10 +6937,9 @@ fn proxyJsonExecuteSingleAttempt(
     enable_streaming_success: bool,
 ) !ProxyExecution {
     const resolved_target = try resolveProxyTarget(allocator, upstream_base_url, proxy_pass_target, suffix_path);
-    var current_url = resolved_target.url;
+    const current_url = resolved_target.url;
     defer allocator.free(current_url);
-    var current_unix_socket_path = resolved_target.unix_socket_path;
-    var redirects_followed: u8 = 0;
+    const current_unix_socket_path = resolved_target.unix_socket_path;
 
     const forwarded_for = try buildForwardedFor(allocator, incoming_x_forwarded_for, client_ip);
     defer allocator.free(forwarded_for);
@@ -7119,7 +6965,6 @@ fn proxyJsonExecuteSingleAttempt(
         try extra_headers.append(.{ .name = "Accept-Encoding", .value = "gzip, identity" });
     }
     if (forwarded_host.len > 0) try extra_headers.append(.{ .name = "X-Forwarded-Host", .value = forwarded_host });
-    if (upstream_host.len > 0) try extra_headers.append(.{ .name = "Host", .value = upstream_host });
     if (auth_identity) |identity| {
         if (identity.len > 0) try extra_headers.append(.{ .name = "X-Tardigrade-Auth-Identity", .value = identity });
     }
@@ -7141,126 +6986,69 @@ fn proxyJsonExecuteSingleAttempt(
         payload,
     );
 
-    while (true) {
-        var server_header_buffer: [16 * 1024]u8 = undefined;
-        const uri = try std.Uri.parse(current_url);
-        const unix_conn: ?*std.http.Client.Connection = if (current_unix_socket_path) |socket_path|
-            try state.upstream_client.connectUnix(socket_path)
-        else
-            null;
-        var req = try state.upstream_client.open(.POST, uri, .{
-            .server_header_buffer = &server_header_buffer,
-            .connection = unix_conn,
-            .headers = .{ .content_type = .{ .override = "application/json" } },
-            .extra_headers = extra_headers.items,
-            .keep_alive = true,
-            .redirect_behavior = .unhandled,
-        });
-        defer req.deinit();
+    var server_header_buffer: [16 * 1024]u8 = undefined;
+    const uri = try std.Uri.parse(current_url);
+    const unix_conn: ?*std.http.Client.Connection = if (current_unix_socket_path) |socket_path|
+        try state.upstream_client.connectUnix(socket_path)
+    else
+        null;
+    var req = try state.upstream_client.open(.POST, uri, .{
+        .server_header_buffer = &server_header_buffer,
+        .connection = unix_conn,
+        .headers = .{ .content_type = .{ .override = "application/json" } },
+        .extra_headers = extra_headers.items,
+        .keep_alive = true,
+        .redirect_behavior = .unhandled,
+    });
+    defer req.deinit();
 
-        if (attempt_timeout_ms > 0) {
-            if (req.connection) |conn| {
-                setSocketTimeoutMs(conn.stream.handle, attempt_timeout_ms, attempt_timeout_ms) catch |err| {
-                    state.logger.warn(null, "failed to set upstream socket timeout: {}", .{err});
-                };
-            }
-        }
-
-        req.transfer_encoding = .{ .content_length = payload.len };
-        try req.send();
-        try req.writeAll(payload);
-        try req.finish();
-        try req.wait();
-
-        const status_code: u16 = @intFromEnum(req.response.status);
-        if (redirects_followed == 0 and isRedirectStatusCode(status_code)) {
-            if (req.response.location) |location| {
-                const drain_buf = try state.relay_buffer_pool.acquire();
-                defer state.relay_buffer_pool.release(drain_buf);
-                while (true) {
-                    const n = try req.reader().read(drain_buf);
-                    if (n == 0) break;
-                }
-                const next_url = try resolveRedirectTargetUrl(allocator, current_url, location);
-                allocator.free(current_url);
-                current_url = next_url;
-                current_unix_socket_path = null;
-                redirects_followed += 1;
-                continue;
-            }
-        }
-
-        const upstream_content_type = req.response.content_type orelse JSON_CONTENT_TYPE;
-        const upstream_content_disposition = req.response.content_disposition;
-        const cacheable = !upstreamResponseHasNoStore(req.response);
-        const stream_status = enable_streaming_success and (status_code == 200 or cfg.proxy_stream_all_statuses);
-        if (stream_status) {
-            try writeStreamedUpstreamResponse(
-                downstream_writer,
-                status_code,
-                req.response.reason,
-                upstream_content_type,
-                upstream_content_disposition,
-                correlation_id,
-                &state.security_headers,
-            );
-
-            const read_buf = try state.relay_buffer_pool.acquire();
-            defer state.relay_buffer_pool.release(read_buf);
-            while (true) {
-                const n = try req.reader().read(read_buf);
-                if (n == 0) break;
-                try writeChunk(downstream_writer, read_buf[0..n]);
-            }
-            try downstream_writer.writeAll("0\r\n\r\n");
-            return .{ .streamed_status = status_code };
-        }
-
-        if (status_code != 200) {
-            const buffered_content_type = try allocator.dupe(u8, upstream_content_type);
-            errdefer allocator.free(buffered_content_type);
-            const buffered_content_disposition = if (upstream_content_disposition) |cd|
-                try allocator.dupe(u8, cd)
-            else
-                null;
-            errdefer if (buffered_content_disposition) |cd| allocator.free(cd);
-
-            const drain_buf = try state.relay_buffer_pool.acquire();
-            defer state.relay_buffer_pool.release(drain_buf);
-            while (true) {
-                const n = try req.reader().read(drain_buf);
-                if (n == 0) break;
-            }
-            state.appendTranscript(
-                upstreamScopeName(upstream_scope),
-                proxy_pass_target,
-                correlation_id,
-                auth_identity,
-                client_ip,
-                current_url,
-                payload,
-                status_code,
-                upstream_content_type,
-                "",
-            );
-            return .{
-                .buffered = .{
-                    .status = status_code,
-                    .body = try allocator.alloc(u8, 0),
-                    .content_type = buffered_content_type,
-                    .content_disposition = buffered_content_disposition,
-                    .cacheable = false,
-                },
+    if (attempt_timeout_ms > 0) {
+        if (req.connection) |conn| {
+            setSocketTimeoutMs(conn.stream.handle, attempt_timeout_ms, attempt_timeout_ms) catch |err| {
+                state.logger.warn(null, "failed to set upstream socket timeout: {}", .{err});
             };
         }
+    }
 
-        const max_buffered = if (cfg.max_connection_memory_bytes > 0)
-            cfg.max_connection_memory_bytes
-        else
-            2 * 1024 * 1024;
-        var body = std.ArrayList(u8).init(allocator);
-        errdefer body.deinit();
-        try req.reader().readAllArrayList(&body, max_buffered);
+    req.transfer_encoding = .{ .content_length = payload.len };
+    try req.send();
+    try req.writeAll(payload);
+    try req.finish();
+    try req.wait();
+
+    const status_code: u16 = @intFromEnum(req.response.status);
+    const upstream_content_type = req.response.content_type orelse JSON_CONTENT_TYPE;
+    const upstream_content_disposition = req.response.content_disposition;
+    const upstream_location = if (req.response.location) |location|
+        try allocator.dupe(u8, location)
+    else
+        null;
+    errdefer if (upstream_location) |location| allocator.free(location);
+    const cacheable = !upstreamResponseHasNoStore(req.response);
+    const stream_status = enable_streaming_success and (status_code == 200 or cfg.proxy_stream_all_statuses);
+    if (stream_status) {
+        try writeStreamedUpstreamResponse(
+            downstream_writer,
+            status_code,
+            req.response.reason,
+            upstream_content_type,
+            upstream_content_disposition,
+            correlation_id,
+            &state.security_headers,
+        );
+
+        const read_buf = try state.relay_buffer_pool.acquire();
+        defer state.relay_buffer_pool.release(read_buf);
+        while (true) {
+            const n = try req.reader().read(read_buf);
+            if (n == 0) break;
+            try writeChunk(downstream_writer, read_buf[0..n]);
+        }
+        try downstream_writer.writeAll("0\r\n\r\n");
+        return .{ .streamed_status = status_code };
+    }
+
+    if (status_code != 200) {
         const buffered_content_type = try allocator.dupe(u8, upstream_content_type);
         errdefer allocator.free(buffered_content_type);
         const buffered_content_disposition = if (upstream_content_disposition) |cd|
@@ -7268,6 +7056,13 @@ fn proxyJsonExecuteSingleAttempt(
         else
             null;
         errdefer if (buffered_content_disposition) |cd| allocator.free(cd);
+
+        const drain_buf = try state.relay_buffer_pool.acquire();
+        defer state.relay_buffer_pool.release(drain_buf);
+        while (true) {
+            const n = try req.reader().read(drain_buf);
+            if (n == 0) break;
+        }
         state.appendTranscript(
             upstreamScopeName(upstream_scope),
             proxy_pass_target,
@@ -7277,19 +7072,57 @@ fn proxyJsonExecuteSingleAttempt(
             current_url,
             payload,
             status_code,
-            buffered_content_type,
-            body.items,
+            upstream_content_type,
+            "",
         );
         return .{
             .buffered = .{
                 .status = status_code,
-                .body = try body.toOwnedSlice(),
+                .body = try allocator.alloc(u8, 0),
                 .content_type = buffered_content_type,
                 .content_disposition = buffered_content_disposition,
-                .cacheable = cacheable,
+                .location = upstream_location,
+                .cacheable = false,
             },
         };
     }
+
+    const max_buffered = if (cfg.max_connection_memory_bytes > 0)
+        cfg.max_connection_memory_bytes
+    else
+        2 * 1024 * 1024;
+    var body = std.ArrayList(u8).init(allocator);
+    errdefer body.deinit();
+    try req.reader().readAllArrayList(&body, max_buffered);
+    const buffered_content_type = try allocator.dupe(u8, upstream_content_type);
+    errdefer allocator.free(buffered_content_type);
+    const buffered_content_disposition = if (upstream_content_disposition) |cd|
+        try allocator.dupe(u8, cd)
+    else
+        null;
+    errdefer if (buffered_content_disposition) |cd| allocator.free(cd);
+    state.appendTranscript(
+        upstreamScopeName(upstream_scope),
+        proxy_pass_target,
+        correlation_id,
+        auth_identity,
+        client_ip,
+        current_url,
+        payload,
+        status_code,
+        buffered_content_type,
+        body.items,
+    );
+    return .{
+        .buffered = .{
+            .status = status_code,
+            .body = try body.toOwnedSlice(),
+            .content_type = buffered_content_type,
+            .content_disposition = buffered_content_disposition,
+            .location = upstream_location,
+            .cacheable = cacheable,
+        },
+    };
 }
 
 fn writeStreamedUpstreamResponse(
@@ -7929,6 +7762,48 @@ test "combineProxyTarget joins prefix and suffix" {
     const joined = try combineProxyTarget(allocator, "/api", "/api/messages");
     defer allocator.free(joined);
     try std.testing.expectEqualStrings("/api/api/messages", joined);
+}
+
+test "proxySuffixPathForLocation uses mount prefix for split upstream exact route" {
+    const blocks = [_]edge_config.EdgeConfig.LocationBlock{
+        .{
+            .match_type = .exact,
+            .pattern = "/ursa/health",
+            .priority = 0,
+            .action = .{ .proxy_pass = "http://127.0.0.1:18443" },
+        },
+        .{
+            .match_type = .prefix,
+            .pattern = "/ursa/",
+            .priority = 1,
+            .action = .{ .proxy_pass = "http://127.0.0.1:18080" },
+        },
+    };
+
+    const matched = http.location_router.matchLocation("/ursa/health", &blocks).?;
+    const suffix = proxySuffixPathForLocation("/ursa/health", matched, &blocks).?;
+    try std.testing.expectEqualStrings("health", suffix);
+}
+
+test "proxySuffixPathForLocation keeps mount prefix for split upstream longer prefix route" {
+    const blocks = [_]edge_config.EdgeConfig.LocationBlock{
+        .{
+            .match_type = .prefix_priority,
+            .pattern = "/ursa/download/",
+            .priority = 0,
+            .action = .{ .proxy_pass = "http://127.0.0.1:18443" },
+        },
+        .{
+            .match_type = .prefix,
+            .pattern = "/ursa/",
+            .priority = 1,
+            .action = .{ .proxy_pass = "http://127.0.0.1:18080" },
+        },
+    };
+
+    const matched = http.location_router.matchLocation("/ursa/download/file.bin", &blocks).?;
+    const suffix = proxySuffixPathForLocation("/ursa/download/file.bin", matched, &blocks).?;
+    try std.testing.expectEqualStrings("download/file.bin", suffix);
 }
 
 test "resolveProxyTarget handles absolute and relative proxy_pass" {

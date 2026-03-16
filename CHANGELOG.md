@@ -57,6 +57,12 @@
   - Added live replay coverage for explicit `last_event_id` resume and reconnect-within-grace
     delivery of missed mux events.
 
+### Fixed
+- Config-driven reverse-proxy routing and header transparency:
+  - Removed the remaining implicit operator-route handlers so `/health`, `/status`, and metrics paths are only served when config routes them.
+  - Fixed mounted split-upstream location proxying so exact and more-specific `/ursa/...` routes can win over the generic mount while still stripping the mount prefix before proxying upstream.
+  - Preserved upstream redirect `Location` headers and stopped auto-following proxy redirects, keeping upstream status, headers, and body intact for config-driven proxy locations.
+
 ## [0.30.0] - 2026-03-xx
 
 ### Added

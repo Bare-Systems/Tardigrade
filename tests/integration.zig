@@ -440,6 +440,18 @@ const UpstreamServer = struct {
         defer self.mutex.unlock();
         return headerValue(self.capture.headers_raw, name);
     }
+
+    fn capturedPath(self: *UpstreamServer, allocator: std.mem.Allocator) ![]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return allocator.dupe(u8, self.capture.path);
+    }
+
+    fn capturedPathHistoryAt(self: *UpstreamServer, allocator: std.mem.Allocator, index: usize) ![]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return allocator.dupe(u8, self.capture.path_history.items[index]);
+    }
 };
 
 const FastCgiServer = struct {
@@ -2498,6 +2510,148 @@ test "return config directive issues redirect with request_uri expansion" {
     defer response.deinit();
     try std.testing.expectEqual(@as(u16, 301), response.status_code);
     try std.testing.expectEqualStrings("https://example.com/redirected", response.header("Location").?);
+}
+
+test "split upstream /ursa mount strips mount prefix and preserves redirects" {
+    const allocator = std.testing.allocator;
+
+    const ui_responses = [_]UpstreamResponseSpec{
+        .{
+            .status_code = 303,
+            .headers = &.{
+                .{ .name = "Location", .value = "/ursa/auth/login?next=%2F" },
+                .{ .name = "Content-Type", .value = "text/plain; charset=utf-8" },
+            },
+            .body = "",
+        },
+        .{
+            .status_code = 200,
+            .headers = &.{.{ .name = "Content-Type", .value = "text/html; charset=utf-8" }},
+            .body = "<html>login</html>",
+        },
+    };
+    const c2_responses = [_]UpstreamResponseSpec{
+        .{
+            .status_code = 200,
+            .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
+            .body = "{\"status\":\"healthy\"}",
+        },
+        .{
+            .status_code = 200,
+            .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
+            .body = "{\"registered\":true}",
+        },
+        .{
+            .status_code = 200,
+            .headers = &.{.{ .name = "Content-Type", .value = "application/octet-stream" }},
+            .body = "payload",
+        },
+    };
+
+    var ui_upstream = try UpstreamServer.start(allocator, &ui_responses);
+    defer ui_upstream.stop();
+    try ui_upstream.run();
+
+    var c2_upstream = try UpstreamServer.start(allocator, &c2_responses);
+    defer c2_upstream.stop();
+    try c2_upstream.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location = /ursa/health {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+        \\location = /ursa/register {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+        \\location ^~ /ursa/download/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+        \\location /ursa/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+    , .{
+        test_host, c2_upstream.port(),
+        test_host, c2_upstream.port(),
+        test_host, c2_upstream.port(),
+        test_host, ui_upstream.port(),
+    });
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+    });
+    defer tardigrade.stop();
+
+    var health = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/ursa/health",
+        .body = null,
+        .headers = &.{},
+    });
+    defer health.deinit();
+    try std.testing.expectEqual(@as(u16, 200), health.status_code);
+    try std.testing.expectEqualStrings("{\"status\":\"healthy\"}", health.body);
+    try std.testing.expectEqual(@as(u32, 0), ui_upstream.requestCount());
+
+    var register = try sendRequest(allocator, tardigrade.port, .{
+        .method = "POST",
+        .path = "/ursa/register",
+        .body = "{\"hostname\":\"TEST\"}",
+        .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
+    });
+    defer register.deinit();
+    try std.testing.expectEqual(@as(u16, 200), register.status_code);
+    try std.testing.expectEqualStrings("{\"registered\":true}", register.body);
+
+    var download = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/ursa/download/file.bin",
+        .body = null,
+        .headers = &.{},
+    });
+    defer download.deinit();
+    try std.testing.expectEqual(@as(u16, 200), download.status_code);
+    try std.testing.expectEqualStrings("payload", download.body);
+
+    var root = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/ursa/",
+        .body = null,
+        .headers = &.{},
+    });
+    defer root.deinit();
+    try std.testing.expectEqual(@as(u16, 303), root.status_code);
+    try std.testing.expectEqualStrings("/ursa/auth/login?next=%2F", root.header("Location").?);
+
+    var login = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/ursa/auth/login",
+        .body = null,
+        .headers = &.{},
+    });
+    defer login.deinit();
+    try std.testing.expectEqual(@as(u16, 200), login.status_code);
+    try std.testing.expectEqualStrings("<html>login</html>", login.body);
+
+    const c2_path_0 = try c2_upstream.capturedPathHistoryAt(allocator, 0);
+    defer allocator.free(c2_path_0);
+    try std.testing.expectEqualStrings("/health", c2_path_0);
+
+    const c2_path_1 = try c2_upstream.capturedPathHistoryAt(allocator, 1);
+    defer allocator.free(c2_path_1);
+    try std.testing.expectEqualStrings("/register", c2_path_1);
+
+    const c2_path_2 = try c2_upstream.capturedPathHistoryAt(allocator, 2);
+    defer allocator.free(c2_path_2);
+    try std.testing.expectEqualStrings("/download/file.bin", c2_path_2);
+
+    const ui_path_0 = try ui_upstream.capturedPathHistoryAt(allocator, 0);
+    defer allocator.free(ui_path_0);
+    try std.testing.expectEqualStrings("/", ui_path_0);
+
+    const ui_path_1 = try ui_upstream.capturedPathHistoryAt(allocator, 1);
+    defer allocator.free(ui_path_1);
+    try std.testing.expectEqualStrings("/auth/login", ui_path_1);
 }
 
 test "if return directive redirects on host match" {

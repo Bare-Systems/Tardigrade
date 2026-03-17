@@ -70,8 +70,10 @@ curl -fsSL https://raw.githubusercontent.com/Bare-Labs/Tardigrade/main/scripts/i
   TARDIGRADE_VERSION=v0.7.0 TARDIGRADE_INSTALL_DIR=/usr/local/bin sh
 ```
 
-Tagged releases are built in GitHub Actions and published as downloadable
-GitHub artifacts and release assets.
+Pushes to `main` read the top semantic version in `CHANGELOG.md`. When that
+version has not been tagged yet, GitHub Actions creates the matching `vX.Y.Z`
+tag, publishes the GitHub release automatically, and uploads Linux x86_64 plus
+macOS x86_64 and arm64 archives with a SHA-256 checksum manifest.
 
 The canonical command name is `tardigrade`. Release installs also provide a
 `tardi` alias for local convenience.
@@ -354,8 +356,8 @@ build context. The published CI image runs as a non-root user and includes a
 GitHub Actions also publishes a public GHCR image from `main` and release tags:
 
 ```bash
-docker pull ghcr.io/bare-labs/tardigrade:latest
-docker run --rm -p 8069:8069 ghcr.io/bare-labs/tardigrade:latest
+docker pull ghcr.io/bare-systems/tardigrade:latest
+docker run --rm -p 8069:8069 ghcr.io/bare-systems/tardigrade:latest
 ```
 
 ### Linux `systemd --user` service
@@ -410,19 +412,19 @@ uses `8443`, so a non-root user unit is sufficient there.
 
 On the `blink` homelab deployment, the staged unit file and installer live at:
 
-- `/home/admin/barelabs/runtime/blink-homelab/systemd-user/tardigrade.service`
-- `/home/admin/barelabs/runtime/blink-homelab/install_user_systemd_units.sh`
+- `/home/admin/baresystems/runtime/blink-homelab/systemd-user/tardigrade.service`
+- `/home/admin/baresystems/runtime/blink-homelab/install_user_systemd_units.sh`
 
 After enabling lingering for `admin`, install the staged units with:
 
 ```bash
-/home/admin/barelabs/runtime/blink-homelab/install_user_systemd_units.sh enable
+/home/admin/baresystems/runtime/blink-homelab/install_user_systemd_units.sh enable
 ```
 
 Example host-native service manifests now live under `packaging/`:
 
 - `packaging/systemd/tardigrade.service`
-- `packaging/launchd/io.barelabs.tardigrade.plist`
+- `packaging/launchd/io.baresystems.tardigrade.plist`
 
 ## Usage
 
@@ -463,7 +465,7 @@ curl -v http://localhost:8069/
 
 All responses include:
 - `Date`: Current timestamp in RFC 7231 format
-- `Server`: Server identification (tardigrade/0.4.1)
+- `Server`: Server identification (`tardigrade/<build version>`)
 - `Content-Type`: Automatically detected from file extension
 - `Content-Length`: Size of response body
 

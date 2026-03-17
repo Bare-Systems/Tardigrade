@@ -1,4 +1,5 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const Allocator = std.mem.Allocator;
 const Status = @import("status.zig").Status;
 const Headers = @import("headers.zig").Headers;
@@ -6,7 +7,7 @@ const Version = @import("version.zig").Version;
 
 /// Server name and version for Server header
 pub const SERVER_NAME = "tardigrade";
-pub const SERVER_VERSION = "0.4.1";
+pub const SERVER_VERSION = build_options.version;
 
 // Try to load a custom error page from `public/errors/<code>.html`.
 fn loadCustomErrorPage(allocator: Allocator, status: Status) ?[]const u8 {

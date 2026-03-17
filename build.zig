@@ -18,11 +18,13 @@ pub fn build(b: *std.Build) void {
     const require_static_system_libs = b.option(bool, "require-static-system-libs", "Require static linking for system libraries") orelse false;
     const static_executable = b.option(bool, "static-executable", "Build the tardigrade executable as a static binary") orelse false;
     const enable_http3_ngtcp2 = b.option(bool, "enable-http3-ngtcp2", "Enable experimental HTTP/3 ngtcp2/nghttp3 system-library integration") orelse false;
+    const app_version = b.option([]const u8, "version", "Version string embedded in the tardigrade binary") orelse "dev";
     const osslclient_default_path = "/tmp/ngtcp2-upstream/build/examples/osslclient";
     const http3_osslclient_path = b.option([]const u8, "http3-osslclient-path", "Path to the ngtcp2 OpenSSL HTTP/3 example client used by 0-RTT integration tests") orelse if (pathExists(osslclient_default_path)) osslclient_default_path else "";
 
     const build_options = b.addOptions();
     build_options.addOption(bool, "enable_http3_ngtcp2", enable_http3_ngtcp2);
+    build_options.addOption([]const u8, "version", app_version);
 
     // We will also create a module for our other entry point, 'main.zig'.
     const exe_mod = b.createModule(.{

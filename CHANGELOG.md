@@ -1,6 +1,17 @@
 
 # Changelog
 
+## [0.32.0] - 2026-03-xx
+
+### Added
+- GitHub Actions release pipeline hardening:
+  - CI now validates Tardigrade on both pull requests and `main` pushes so release-facing breakage is caught before packaging.
+  - Release automation now reads the top semantic version from `CHANGELOG.md`, creates the matching Git tag on `main`, and publishes GitHub releases automatically.
+  - Release assets now include Linux x86_64, macOS x86_64, and macOS arm64 archives plus a SHA-256 checksum manifest.
+  - Release builds now embed the published semantic version into the Tardigrade binary and server header instead of shipping the stale hard-coded version string.
+- TLS unit-test fixture tracking:
+  - Added explicit `.gitignore` exceptions for the embedded TLS test private keys so CI sees the same fixture set as local development.
+
 ## [0.31.0] - 2026-03-xx
 
 ### Added

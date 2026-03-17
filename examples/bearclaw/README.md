@@ -43,7 +43,7 @@ Use this example when Tardigrade is the public TLS terminator and the BearClaw a
 - Static shell: `/` and `/assets/` continue serving the application shell from disk.
 - Persistence: session, approval, and transcript files live under `/var/lib/tardigrade/`.
 
-The integration fixture in [tests/integration.zig](/Users/joecaruso/Projects/BareLabs/Tardigrade/tests/integration.zig) exercises this path over HTTPS with Tardigrade-owned TLS.
+The integration fixture in [tests/integration.zig](/Users/joecaruso/Projects/BareSystems/Tardigrade/tests/integration.zig) exercises this path over HTTPS with Tardigrade-owned TLS.
 
 ## Suggested Startup
 

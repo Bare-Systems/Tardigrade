@@ -12,6 +12,8 @@ secrets.txt
 *.p12
 *.pfx
 .zig/
+!src/http/testdata/test_server.key
+!src/http/testdata/test_alt_server.key
 
 # Agent Context
 changes/
@@ -29,3 +31,5 @@ PLAN*.md
 
 # Deployment symlink
 suite/
+blink/
+blink

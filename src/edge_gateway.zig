@@ -2849,6 +2849,10 @@ fn handleAcceptedClient(raw_ctx: *anyopaque, client_fd: std.posix.fd_t) void {
     }
     defer ctx.session_pool.release(session);
 
+    const owned_connection_ip = clientIpFromFd(ctx.state.allocator, client_fd) catch null;
+    defer if (owned_connection_ip) |ip| ctx.state.allocator.free(ip);
+    const connection_ip = owned_connection_ip orelse "unknown";
+
     const cfg = ctx.currentCfg();
     const idle_timeout_ms = if (cfg.keep_alive_timeout_ms > 0)
         cfg.keep_alive_timeout_ms
@@ -2868,7 +2872,12 @@ fn handleAcceptedClient(raw_ctx: *anyopaque, client_fd: std.posix.fd_t) void {
 
     if (ctx.tls) |tls| {
         var tls_conn = tls.accept(client_fd) catch |err| {
-            ctx.state.logger.warn(null, "tls handshake error: {}", .{err});
+            if (http.tls_termination.lastOpenSslError(ctx.state.allocator)) |openssl_err| {
+                defer ctx.state.allocator.free(openssl_err);
+                ctx.state.logger.warn(null, "tls handshake error: {} ({s})", .{ err, openssl_err });
+            } else {
+                ctx.state.logger.warn(null, "tls handshake error: {}", .{err});
+            }
             std.posix.close(client_fd);
             return;
         };
@@ -2876,7 +2885,7 @@ fn handleAcceptedClient(raw_ctx: *anyopaque, client_fd: std.posix.fd_t) void {
         defer std.posix.close(client_fd);
 
         if (tls_conn.negotiatedProtocol() == .http2 and cfg.http2_enabled) {
-            handleHttp2Connection(&tls_conn, session, cfg, ctx.state) catch |err| {
+            handleHttp2Connection(&tls_conn, session, cfg, ctx.state, connection_ip) catch |err| {
                 ctx.state.logger.err(null, "http2 connection error: {}", .{err});
             };
             return;
@@ -2886,7 +2895,7 @@ fn handleAcceptedClient(raw_ctx: *anyopaque, client_fd: std.posix.fd_t) void {
         while (true) {
             const live_cfg = ctx.currentCfg();
             var keep_alive = false;
-            handleConnection(&tls_conn, session, live_cfg, ctx.state, &keep_alive, false) catch |err| {
+            handleConnection(&tls_conn, session, live_cfg, ctx.state, &keep_alive, connection_ip, false) catch |err| {
                 ctx.state.logger.err(null, "edge connection error: {}", .{err});
                 break;
             };
@@ -2906,7 +2915,7 @@ fn handleAcceptedClient(raw_ctx: *anyopaque, client_fd: std.posix.fd_t) void {
         while (true) {
             const live_cfg = ctx.currentCfg();
             var keep_alive = false;
-            handleConnection(stream, session, live_cfg, ctx.state, &keep_alive, true) catch |err| {
+            handleConnection(stream, session, live_cfg, ctx.state, &keep_alive, connection_ip, true) catch |err| {
                 ctx.state.logger.err(null, "edge connection error: {}", .{err});
                 break;
             };
@@ -2930,6 +2939,35 @@ fn clientIpKeyFromAddress(allocator: std.mem.Allocator, address: std.net.Address
         std.posix.AF.INET6 => std.fmt.allocPrint(allocator, "v6:{s}", .{std.fmt.fmtSliceHexLower(address.in6.sa.addr[0..])}),
         else => error.UnsupportedAddressFamily,
     };
+}
+
+fn clientIpFromAddress(allocator: std.mem.Allocator, address: std.net.Address) ![]const u8 {
+    return switch (address.any.family) {
+        std.posix.AF.INET => blk: {
+            const b = @as(*const [4]u8, @ptrCast(&address.in.sa.addr));
+            break :blk std.fmt.allocPrint(allocator, "{d}.{d}.{d}.{d}", .{ b[0], b[1], b[2], b[3] });
+        },
+        std.posix.AF.INET6 => blk: {
+            const src = address.in6.sa.addr[0..];
+            const g0 = std.mem.readInt(u16, src[0..2], .big);
+            const g1 = std.mem.readInt(u16, src[2..4], .big);
+            const g2 = std.mem.readInt(u16, src[4..6], .big);
+            const g3 = std.mem.readInt(u16, src[6..8], .big);
+            const g4 = std.mem.readInt(u16, src[8..10], .big);
+            const g5 = std.mem.readInt(u16, src[10..12], .big);
+            const g6 = std.mem.readInt(u16, src[12..14], .big);
+            const g7 = std.mem.readInt(u16, src[14..16], .big);
+            break :blk std.fmt.allocPrint(allocator, "{x}:{x}:{x}:{x}:{x}:{x}:{x}:{x}", .{ g0, g1, g2, g3, g4, g5, g6, g7 });
+        },
+        else => error.UnsupportedAddressFamily,
+    };
+}
+
+fn clientIpFromFd(allocator: std.mem.Allocator, fd: std.posix.fd_t) ![]const u8 {
+    var peer_addr: std.net.Address = undefined;
+    var addr_len: std.posix.socklen_t = @sizeOf(std.net.Address);
+    try std.posix.getpeername(fd, &peer_addr.any, &addr_len);
+    return clientIpFromAddress(allocator, peer_addr);
 }
 
 fn setNonBlocking(fd: std.posix.fd_t, enabled: bool) !void {
@@ -3076,8 +3114,9 @@ fn parseProxyHeaderV2(buf: []const u8, strict: bool, client_ip_buf: *[64]u8) Pro
     }
 }
 
-fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const edge_config.EdgeConfig, state: *GatewayState) !void {
+fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const edge_config.EdgeConfig, state: *GatewayState, connection_ip: []const u8) !void {
     _ = session;
+    _ = connection_ip;
     var preface: [HTTP2_PREFACE.len]u8 = undefined;
     try readExactConn(conn, preface[0..]);
     if (!std.mem.eql(u8, preface[0..], HTTP2_PREFACE)) return error.InvalidHttp2Preface;
@@ -3322,7 +3361,7 @@ fn readExactConn(conn: anytype, out: []u8) !void {
     }
 }
 
-fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge_config.EdgeConfig, state: *GatewayState, keep_alive_out: *bool, enable_proxy_protocol: bool) !void {
+fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge_config.EdgeConfig, state: *GatewayState, keep_alive_out: *bool, connection_ip: []const u8, enable_proxy_protocol: bool) !void {
     var keep_alive = false;
     keep_alive_out.* = false;
     defer keep_alive_out.* = keep_alive;
@@ -3391,11 +3430,11 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
     defer allocator.free(correlation_id);
 
     // --- Request Context ---
-    const connection_ip = if (session.proxy_client_ip_len > 0)
+    const effective_connection_ip = if (session.proxy_client_ip_len > 0)
         session.proxy_client_ip_buf[0..session.proxy_client_ip_len]
     else
-        "unknown";
-    const client_ip = http.request_context.extractClientIp(&request, connection_ip);
+        connection_ip;
+    const client_ip = http.request_context.extractClientIp(&request, effective_connection_ip);
     var effective_cfg_storage = cfg.*;
     const effective_cfg = resolveRequestConfig(cfg, request.headers.get("host"), &effective_cfg_storage) orelse {
         try sendApiError(allocator, writer, .not_found, "invalid_request", "Not Found", correlation_id, keep_alive, state);
@@ -6036,29 +6075,11 @@ fn isGeoBlocked(blocked: []const []const u8, country: ?[]const u8) bool {
 }
 
 fn isProtectedAuthRequestRoute(path: []const u8) bool {
-    return http.api_router.matchRoute(path, 1, "/chat") or
-        http.api_router.matchRoute(path, 1, "/commands") or
-        http.api_router.matchRoute(path, 1, "/approvals/request") or
-        http.api_router.matchRoute(path, 1, "/approvals/respond") or
-        http.api_router.matchRoute(path, 1, "/approvals/status") or
-        http.api_router.matchRoute(path, 1, "/sessions") or
-        http.api_router.matchRoute(path, 1, "/cache/purge") or
-        http.api_router.matchRoute(path, 1, "/events/stream") or
-        http.api_router.matchRoute(path, 1, "/events/publish") or
-        http.api_router.matchRoute(path, 1, "/ws/chat") or
-        http.api_router.matchRoute(path, 1, "/ws/commands") or
-        http.api_router.matchRoute(path, 1, "/subrequest") or
-        http.api_router.matchRoute(path, 1, "/backend/fastcgi") or
-        http.api_router.matchRoute(path, 1, "/backend/uwsgi") or
-        http.api_router.matchRoute(path, 1, "/backend/scgi") or
-        http.api_router.matchRoute(path, 1, "/backend/grpc") or
-        http.api_router.matchRoute(path, 1, "/backend/memcached") or
-        http.api_router.matchRoute(path, 1, "/mail/smtp") or
-        http.api_router.matchRoute(path, 1, "/mail/imap") or
-        http.api_router.matchRoute(path, 1, "/mail/pop3") or
-        http.api_router.matchRoute(path, 1, "/stream/tcp") or
-        http.api_router.matchRoute(path, 1, "/stream/udp") or
-        std.mem.startsWith(u8, path, "/admin/");
+    // Auth is handled by upstream applications, not hardcoded here.
+    // Tardigrade is a general-purpose reverse proxy — route protection
+    // should be configured per-vhost, not baked into the binary.
+    _ = path;
+    return false;
 }
 
 fn resolveRequestConfig(base_cfg: *const edge_config.EdgeConfig, raw_host: ?[]const u8, out: *edge_config.EdgeConfig) ?*const edge_config.EdgeConfig {
@@ -7207,6 +7228,7 @@ fn shouldSkipUpstreamRequestHeader(name: []const u8) bool {
 
 fn shouldSkipUpstreamResponseHeader(name: []const u8) bool {
     return std.ascii.eqlIgnoreCase(name, "connection") or
+        std.ascii.eqlIgnoreCase(name, "content-encoding") or
         std.ascii.eqlIgnoreCase(name, "content-length") or
         std.ascii.eqlIgnoreCase(name, "keep-alive") or
         std.ascii.eqlIgnoreCase(name, "proxy-connection") or
@@ -7714,6 +7736,22 @@ test "parse proxy protocol v2 header extracts source ip" {
     }
 }
 
+test "clientIpFromAddress formats ipv4 address" {
+    const address = try std.net.Address.parseIp("203.0.113.9", 443);
+    const ip = try clientIpFromAddress(std.testing.allocator, address);
+    defer std.testing.allocator.free(ip);
+
+    try std.testing.expectEqualStrings("203.0.113.9", ip);
+}
+
+test "clientIpFromAddress formats ipv6 address" {
+    const address = try std.net.Address.parseIp("2001:db8::44", 443);
+    const ip = try clientIpFromAddress(std.testing.allocator, address);
+    defer std.testing.allocator.free(ip);
+
+    try std.testing.expectEqualStrings("2001:db8:0:0:0:0:0:44", ip);
+}
+
 test "firstRequestCompleteLen detects pipelined boundary" {
     const pipelined =
         "GET /one HTTP/1.1\r\nHost: localhost\r\n\r\n" ++
@@ -8044,6 +8082,12 @@ test "buildProxyCacheKey falls back for unknown template tokens" {
     const expected = try std.fmt.allocPrint(allocator, "POST:/api/tasks:{s}", .{std.fmt.fmtSliceHexLower(&digest)});
     defer allocator.free(expected);
     try std.testing.expectEqualStrings(expected, key);
+}
+
+test "shouldSkipUpstreamResponseHeader strips stale content-encoding" {
+    try std.testing.expect(shouldSkipUpstreamResponseHeader("Content-Encoding"));
+    try std.testing.expect(shouldSkipUpstreamResponseHeader("content-encoding"));
+    try std.testing.expect(!shouldSkipUpstreamResponseHeader("Content-Type"));
 }
 
 test "mapUpstreamError returns stable codes" {

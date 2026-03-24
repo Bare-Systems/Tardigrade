@@ -273,12 +273,21 @@ pub const TlsConnection = struct {
     }
 };
 
+pub fn lastOpenSslError(allocator: std.mem.Allocator) ?[]u8 {
+    const err_code = c.ERR_get_error();
+    if (err_code == 0) return null;
+
+    var buf: [256]u8 = undefined;
+    _ = c.ERR_error_string_n(err_code, &buf, buf.len);
+    return allocator.dupe(u8, std.mem.sliceTo(&buf, 0)) catch null;
+}
+
 fn loadDefaultCertificate(ctx: *c.SSL_CTX, st: *State) TlsError!void {
     const cert_z = try std.heap.c_allocator.dupeZ(u8, st.default_cert_path);
     defer std.heap.c_allocator.free(cert_z);
     const key_z = try std.heap.c_allocator.dupeZ(u8, st.default_key_path);
     defer std.heap.c_allocator.free(key_z);
-    if (c.SSL_CTX_use_certificate_file(ctx, cert_z.ptr, c.SSL_FILETYPE_PEM) != 1) return error.CertificateLoadFailed;
+    if (c.SSL_CTX_use_certificate_chain_file(ctx, cert_z.ptr) != 1) return error.CertificateLoadFailed;
     if (c.SSL_CTX_use_PrivateKey_file(ctx, key_z.ptr, c.SSL_FILETYPE_PEM) != 1) return error.PrivateKeyLoadFailed;
     if (c.SSL_CTX_check_private_key(ctx) != 1) return error.CertificateKeyMismatch;
     st.default_cert_mtime = fileMtime(st.default_cert_path) catch null;
@@ -407,7 +416,7 @@ fn sniCallback(ssl: ?*c.SSL, alert: ?*c_int, arg: ?*anyopaque) callconv(.c) c_in
     defer state.mutex.unlock();
     for (state.sni_certs.items) |entry| {
         if (!std.ascii.eqlIgnoreCase(servername, entry.host_lc)) continue;
-        if (c.SSL_use_certificate_file(s, entry.cert_path_z.ptr, c.SSL_FILETYPE_PEM) != 1) return c.SSL_TLSEXT_ERR_ALERT_FATAL;
+        if (c.SSL_use_certificate_chain_file(s, entry.cert_path_z.ptr) != 1) return c.SSL_TLSEXT_ERR_ALERT_FATAL;
         if (c.SSL_use_PrivateKey_file(s, entry.key_path_z.ptr, c.SSL_FILETYPE_PEM) != 1) return c.SSL_TLSEXT_ERR_ALERT_FATAL;
         if (c.SSL_check_private_key(s) != 1) return c.SSL_TLSEXT_ERR_ALERT_FATAL;
         return c.SSL_TLSEXT_ERR_OK;

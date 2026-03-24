@@ -106,6 +106,23 @@ Built-in operator endpoints:
 - `GET /metrics` returns Prometheus text metrics
 - `GET /status/metrics` returns JSON metrics
 
+## Blink Homelab Contract
+
+On `blink`, Tardigrade is the only public edge for the web surfaces:
+
+- TLS listener: `192.168.86.53:8443`
+- LAN traffic on `443` is redirected to `8443`
+- BearClaw stays private on `127.0.0.1:3001`
+- BearClaw public hostname: `https://bearclaw.baresystems.com`
+
+Do not "fix" BearClaw reachability by exposing `3001` on the LAN. The stable
+shape is TLS termination and proxying in Tardigrade, with `Host` and
+`X-Forwarded-Proto` preserved upstream.
+
+Compression behavior is part of that contract. If Tardigrade ever decompresses
+an upstream response, it must also remove the stale `Content-Encoding` header.
+That exact bug caused blank BearClaw pages on March 20, 2026.
+
 ## Configuration
 
 Tardigrade supports both environment-variable configuration and nginx-style config files.

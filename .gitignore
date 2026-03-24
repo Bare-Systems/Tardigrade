@@ -1,5 +1,6 @@
 zig-out/
 .zig-cache/
+dist/
 
 # Secrets and environment files — never commit these
 .DS_Store
@@ -32,4 +33,5 @@ PLAN*.md
 # Deployment symlink
 suite/
 blink/
+.blink/
 blink

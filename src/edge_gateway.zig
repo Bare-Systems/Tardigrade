@@ -276,6 +276,8 @@ const GatewayState = struct {
     compression_config: http.compression.CompressionConfig,
     circuit_breaker: http.circuit_breaker.CircuitBreaker,
     upstream_client: std.http.Client,
+    /// ACME HTTP-01 challenge token store (null when ACME automation is disabled).
+    acme_challenge_store: ?http.acme_client.ChallengeStore,
     event_hub: http.event_hub.EventHub,
     request_buffer_pool: http.buffer_pool.BufferPool,
     relay_buffer_pool: http.buffer_pool.BufferPool,
@@ -322,6 +324,7 @@ const GatewayState = struct {
         if (self.session_store) |*ss| ss.deinit();
         if (self.access_control) |*acl| acl.deinit();
         self.upstream_client.deinit();
+        if (self.acme_challenge_store) |*store| store.deinit();
         self.event_hub.deinit();
         self.request_buffer_pool.deinit();
         self.relay_buffer_pool.deinit();
@@ -2066,6 +2069,10 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
             .timeout_ms = cfg.cb_timeout_ms,
         }),
         .upstream_client = .{ .allocator = state_allocator },
+        .acme_challenge_store = if (cfg.tls_acme_enabled and cfg.tls_acme_domains.len > 0)
+            http.acme_client.ChallengeStore.init(state_allocator)
+        else
+            null,
         .event_hub = http.event_hub.EventHub.init(state_allocator, cfg.sse_max_events_per_topic),
         .request_buffer_pool = http.buffer_pool.BufferPool.init(state_allocator, MAX_REQUEST_SIZE, cfg.connection_pool_size),
         .relay_buffer_pool = http.buffer_pool.BufferPool.init(state_allocator, STREAM_RELAY_BUFFER_SIZE, cfg.connection_pool_size),
@@ -2124,6 +2131,32 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     }) catch {};
     defer http.access_log.deinit();
 
+    // Configure upstream HTTP client TLS (custom CA bundle and skip-verify).
+    if (cfg.upstream_tls_ca_bundle.len > 0) {
+        const ca_file = std.fs.cwd().openFile(cfg.upstream_tls_ca_bundle, .{}) catch |err| blk: {
+            state.logger.warn(null, "upstream TLS CA bundle open failed ({s}): {}", .{ cfg.upstream_tls_ca_bundle, err });
+            break :blk null;
+        };
+        if (ca_file) |f| {
+            defer f.close();
+            state.upstream_client.ca_bundle.addCertsFromFile(state_allocator, f) catch |err| {
+                state.logger.warn(null, "upstream TLS CA bundle load failed: {}", .{err});
+            };
+            // Disable auto-rescan so our bundle takes precedence.
+            state.upstream_client.next_https_rescan_certs = false;
+        }
+    }
+    if (!cfg.upstream_tls_verify) {
+        // Clear CA bundle so the Zig TLS client performs no certificate verification.
+        state.upstream_client.ca_bundle.deinit(state_allocator);
+        state.upstream_client.ca_bundle = .{};
+        state.upstream_client.next_https_rescan_certs = false;
+        state.logger.warn(null, "upstream TLS certificate verification disabled", .{});
+    }
+    if (cfg.upstream_tls_client_cert.len > 0 or cfg.upstream_tls_server_name.len > 0) {
+        state.logger.info(null, "upstream mTLS client cert and/or SNI override configured; applies to OpenSSL-backed connections", .{});
+    }
+
     const address = try std.net.Address.parseIp(cfg.listen_host, cfg.listen_port);
     var server = try std.net.Address.listen(address, .{ .reuse_address = true });
     defer server.deinit();
@@ -2161,6 +2194,9 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
             .session_tickets_enabled = cfg.tls_session_tickets_enabled,
             .ocsp_stapling_enabled = cfg.tls_ocsp_stapling_enabled,
             .ocsp_response_path = cfg.tls_ocsp_response_path,
+            .ocsp_auto_refresh_enabled = cfg.tls_ocsp_auto_refresh,
+            .ocsp_refresh_interval_ms = cfg.tls_ocsp_refresh_interval_ms,
+            .ocsp_refresh_timeout_ms = cfg.tls_ocsp_refresh_timeout_ms,
             .client_ca_path = cfg.tls_client_ca_path,
             .client_verify = cfg.tls_client_verify,
             .client_verify_depth = cfg.tls_client_verify_depth,
@@ -2169,6 +2205,13 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
             .dynamic_reload_interval_ms = cfg.tls_dynamic_reload_interval_ms,
             .acme_enabled = cfg.tls_acme_enabled,
             .acme_cert_dir = cfg.tls_acme_cert_dir,
+            .acme_auto_issue = cfg.tls_acme_enabled and cfg.tls_acme_domains.len > 0,
+            .acme_directory_url = cfg.tls_acme_directory_url,
+            .acme_domains = cfg.tls_acme_domains,
+            .acme_email = cfg.tls_acme_email,
+            .acme_account_key_path = cfg.tls_acme_account_key_path,
+            .acme_renew_days_before_expiry = cfg.tls_acme_renew_days_before_expiry,
+            .acme_challenge_store = if (state.acme_challenge_store) |*s| s else null,
             .http2_enabled = cfg.http2_enabled,
         });
     }
@@ -2273,10 +2316,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         if (cfg.access_log_syslog_udp.len > 0) cfg.access_log_syslog_udp else "off",
     });
     if (cfg.proxy_protocol_mode != .off) {
-        state.logger.info(null, "Proxy protocol enabled: {s}", .{@tagName(cfg.proxy_protocol_mode)});
-        if (edge_config.hasTlsFiles(cfg)) {
-            state.logger.warn(null, "proxy protocol parsing currently applies only to plaintext listeners", .{});
-        }
+        state.logger.info(null, "Proxy protocol enabled: {s} (plaintext and TLS listeners)", .{@tagName(cfg.proxy_protocol_mode)});
     }
     if (cfg.http3_enabled) {
         state.logger.info(null, "HTTP/3 foundation enabled: quic_port={d} 0rtt={} migration={} max_datagram={d}", .{
@@ -2867,6 +2907,22 @@ fn handleAcceptedClient(raw_ctx: *anyopaque, client_fd: std.posix.fd_t) void {
     };
 
     if (ctx.tls) |tls| {
+        // Parse PROXY protocol header from the raw TCP socket before SSL_accept.
+        // The PROXY header is plaintext even on TLS connections and must be consumed
+        // before OpenSSL sees the TLS ClientHello.
+        if (cfg.proxy_protocol_mode != .off and !session.proxy_protocol_checked) {
+            peekAndConsumeProxyHeaderFromRawFd(
+                client_fd,
+                cfg.proxy_protocol_mode,
+                &session.proxy_client_ip_buf,
+                &session.proxy_client_ip_len,
+            ) catch |err| {
+                ctx.state.logger.warn(null, "proxy protocol parse failed on TLS connection: {}", .{err});
+                std.posix.close(client_fd);
+                return;
+            };
+            session.proxy_protocol_checked = true;
+        }
         var tls_conn = tls.accept(client_fd) catch |err| {
             ctx.state.logger.warn(null, "tls handshake error: {}", .{err});
             std.posix.close(client_fd);
@@ -2982,6 +3038,54 @@ fn maybeConsumeProxyProtocolPreface(conn: anytype, mode: edge_config.ProxyProtoc
             },
         }
     }
+}
+
+/// Parse and consume a PROXY protocol header from a raw TCP socket fd before the TLS handshake.
+/// Uses MSG_PEEK so that unconsumed application bytes (TLS ClientHello) remain intact in the kernel
+/// receive buffer and OpenSSL can read them normally via SSL_set_fd / SSL_accept.
+fn peekAndConsumeProxyHeaderFromRawFd(
+    fd: std.posix.fd_t,
+    mode: edge_config.ProxyProtocolMode,
+    client_ip_buf: *[64]u8,
+    client_ip_len: *usize,
+) !void {
+    if (mode == .off) return;
+    const msg_peek: u32 = 2; // MSG_PEEK — peek without consuming
+    var peek_buf: [1024]u8 = undefined;
+    var peeked: usize = 0;
+    // Retry loop to handle blocking sockets that may not have all bytes immediately.
+    // In practice the PROXY header always arrives in the first TCP segment.
+    var attempts: u32 = 0;
+    while (attempts < 20) : (attempts += 1) {
+        const n = std.posix.recv(fd, &peek_buf, msg_peek) catch return error.ConnectionClosed;
+        if (n == 0) return error.ConnectionClosed;
+        if (n > peeked) peeked = n;
+        const outcome = parseProxyHeader(peek_buf[0..peeked], mode, client_ip_buf);
+        switch (outcome) {
+            .no_header => return,
+            .invalid => return error.InvalidProxyProtocolHeader,
+            .parsed => |parsed| {
+                client_ip_len.* = parsed.client_ip_len;
+                // Consume exactly `parsed.consumed` bytes from the socket so
+                // that OpenSSL's SSL_accept sees only the TLS ClientHello.
+                var consumed_total: usize = 0;
+                var discard: [1024]u8 = undefined;
+                while (consumed_total < parsed.consumed) {
+                    const to_read = @min(parsed.consumed - consumed_total, discard.len);
+                    const nr = std.posix.recv(fd, discard[0..to_read], 0) catch return error.ConnectionClosed;
+                    if (nr == 0) return error.ConnectionClosed;
+                    consumed_total += nr;
+                }
+                return;
+            },
+            .need_more => {
+                if (peeked >= peek_buf.len) return error.ProxyProtocolHeaderTooLarge;
+                // Wait briefly for more data to arrive in the kernel buffer.
+                std.time.sleep(500_000); // 0.5 ms
+            },
+        }
+    }
+    return error.ProxyProtocolHeaderTooLarge;
 }
 
 fn parseProxyHeader(buf: []const u8, mode: edge_config.ProxyProtocolMode, client_ip_buf: *[64]u8) ProxyHeaderOutcome {
@@ -3396,6 +3500,25 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
     else
         "unknown";
     const client_ip = http.request_context.extractClientIp(&request, connection_ip);
+
+    // --- ACME HTTP-01 challenge response (/.well-known/acme-challenge/<token>) ---
+    const acme_prefix = "/.well-known/acme-challenge/";
+    if (state.acme_challenge_store != null and
+        std.mem.startsWith(u8, request.uri.path, acme_prefix))
+    {
+        const token = request.uri.path[acme_prefix.len..];
+        if (state.acme_challenge_store.?.getCopy(allocator, token)) |key_auth| {
+            defer allocator.free(key_auth);
+            var acme_response = http.Response.init(allocator, .ok);
+            defer acme_response.deinit();
+            _ = acme_response.setBody(key_auth)
+                .setHeader("Content-Type", "application/octet-stream")
+                .setConnection(keep_alive);
+            try acme_response.write(writer);
+            return;
+        }
+    }
+
     var effective_cfg_storage = cfg.*;
     const effective_cfg = resolveRequestConfig(cfg, request.headers.get("host"), &effective_cfg_storage) orelse {
         try sendApiError(allocator, writer, .not_found, "invalid_request", "Not Found", correlation_id, keep_alive, state);
@@ -3854,19 +3977,35 @@ fn handleLocationProxyPass(
     const body = request.body orelse "";
     const upstream_url = try appendProxyQueryString(allocator, resolved.url, request.uri.query);
     defer allocator.free(upstream_url);
-    var upstream_response = try executeRawHttpProxyRequest(
-        allocator,
-        &state.upstream_client,
-        upstream_url,
-        resolved.unix_socket_path,
-        request.method.toString(),
-        &request.headers,
-        body,
-        correlation_id,
-        client_ip,
-        if (edge_config.hasTlsFiles(cfg)) "https" else "http",
-        request.headers.get("host"),
-    );
+    const use_mtls_path = cfg.upstream_tls_client_cert.len > 0 and
+        std.mem.startsWith(u8, upstream_url, "https://");
+    var upstream_response = if (use_mtls_path)
+        try executeUpstreamHttpsWithMtls(
+            allocator,
+            upstream_url,
+            request.method.toString(),
+            &request.headers,
+            body,
+            correlation_id,
+            client_ip,
+            if (edge_config.hasTlsFiles(cfg)) "https" else "http",
+            request.headers.get("host"),
+            cfg,
+        )
+    else
+        try executeRawHttpProxyRequest(
+            allocator,
+            &state.upstream_client,
+            upstream_url,
+            resolved.unix_socket_path,
+            request.method.toString(),
+            &request.headers,
+            body,
+            correlation_id,
+            client_ip,
+            if (edge_config.hasTlsFiles(cfg)) "https" else "http",
+            request.headers.get("host"),
+        );
     defer upstream_response.deinit(allocator);
     state.appendTranscript(
         upstreamScopeName(proxyScopeForPath(request.uri.path)),
@@ -4014,6 +4153,119 @@ fn appendSpecialUpstreamResponseHeader(
         .name = try allocator.dupe(u8, name),
         .value = try allocator.dupe(u8, raw),
     });
+}
+
+/// Execute an HTTPS upstream proxy request using OpenSSL directly, supporting
+/// custom CA bundles, SNI overrides, and mutual TLS client certificates.
+/// Used when `TARDIGRADE_UPSTREAM_TLS_CLIENT_CERT` is set.
+fn executeUpstreamHttpsWithMtls(
+    allocator: std.mem.Allocator,
+    url: []const u8,
+    method: []const u8,
+    request_headers: *const http.Headers,
+    body: []const u8,
+    correlation_id: []const u8,
+    client_ip: []const u8,
+    forwarded_proto: []const u8,
+    incoming_host: ?[]const u8,
+    cfg: *const edge_config.EdgeConfig,
+) !RawUpstreamResponse {
+    const uri = try std.Uri.parse(url);
+    const host = if (uri.host) |h| switch (h) {
+        .raw => |r| r,
+        .percent_encoded => |pe| pe,
+    } else return error.UnsupportedHttpMethod;
+    const port: u16 = if (uri.port) |p| p else 443;
+    const tcp_stream = try std.net.tcpConnectToHost(allocator, host, port);
+    defer tcp_stream.close();
+
+    var tls_conn = try http.tls_termination.UpstreamTlsConn.connect(tcp_stream.handle, host, .{
+        .skip_verify = !cfg.upstream_tls_verify,
+        .ca_bundle_path = cfg.upstream_tls_ca_bundle,
+        .sni_override = cfg.upstream_tls_server_name,
+        .client_cert_path = cfg.upstream_tls_client_cert,
+        .client_key_path = cfg.upstream_tls_client_key,
+    });
+    defer tls_conn.deinit();
+
+    // Build and send HTTP/1.1 request.
+    const path_raw = if (uri.path.len > 0) uri.path else "/";
+    const forwarded_for = try buildForwardedFor(allocator, request_headers.get("x-forwarded-for"), client_ip);
+    defer allocator.free(forwarded_for);
+
+    var req_buf = std.ArrayList(u8).init(allocator);
+    defer req_buf.deinit();
+    const req_writer = req_buf.writer();
+    try req_writer.print("{s} {s} HTTP/1.1\r\n", .{ method, path_raw });
+    try req_writer.print("Host: {s}\r\n", .{host});
+    try req_writer.print("Connection: close\r\n", .{});
+    if (body.len > 0) try req_writer.print("Content-Length: {d}\r\n", .{body.len});
+    try req_writer.print("{s}: {s}\r\n", .{ http.correlation.HEADER_NAME, correlation_id });
+    try req_writer.print("X-Forwarded-For: {s}\r\n", .{forwarded_for});
+    try req_writer.print("X-Real-IP: {s}\r\n", .{client_ip});
+    try req_writer.print("X-Forwarded-Proto: {s}\r\n", .{forwarded_proto});
+    if (incoming_host) |h| {
+        const trimmed = std.mem.trim(u8, h, " \t\r\n");
+        if (trimmed.len > 0) try req_writer.print("X-Forwarded-Host: {s}\r\n", .{trimmed});
+    }
+    var hdr_it = request_headers.iterator();
+    while (hdr_it.next()) |entry| {
+        if (shouldSkipUpstreamRequestHeader(entry.name)) continue;
+        try req_writer.print("{s}: {s}\r\n", .{ entry.name, entry.value });
+    }
+    try req_writer.writeAll("\r\n");
+    if (body.len > 0) try req_writer.writeAll(body);
+
+    try tls_conn.writeAll(req_buf.items);
+
+    // Read the raw HTTP response.
+    var resp_raw = std.ArrayList(u8).init(allocator);
+    defer resp_raw.deinit();
+    var read_buf: [8192]u8 = undefined;
+    while (true) {
+        const n = tls_conn.read(&read_buf) catch 0;
+        if (n == 0) break;
+        try resp_raw.appendSlice(read_buf[0..n]);
+        if (resp_raw.items.len > MAX_REQUEST_SIZE) break;
+    }
+
+    // Minimal HTTP/1.1 response parsing.
+    const raw = resp_raw.items;
+    const header_end = std.mem.indexOf(u8, raw, "\r\n\r\n") orelse return error.UnsupportedHttpMethod;
+    const headers_raw = raw[0..header_end];
+    const resp_body = raw[header_end + 4 ..];
+
+    const first_line_end = std.mem.indexOfScalar(u8, headers_raw, '\n') orelse return error.UnsupportedHttpMethod;
+    const first_line = std.mem.trimRight(u8, headers_raw[0..first_line_end], "\r");
+    var line_parts = std.mem.splitScalar(u8, first_line, ' ');
+    _ = line_parts.next(); // HTTP/1.1
+    const status_str = line_parts.next() orelse "200";
+    const status_code = std.fmt.parseInt(u16, status_str, 10) catch 200;
+    const reason = line_parts.rest();
+
+    var resp_headers = std.ArrayList(UpstreamHeader).init(allocator);
+    errdefer {
+        for (resp_headers.items) |*h| h.deinit(allocator);
+        resp_headers.deinit();
+    }
+    var hdr_lines = std.mem.splitSequence(u8, headers_raw[first_line_end + 1 ..], "\r\n");
+    while (hdr_lines.next()) |line| {
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const hname = std.mem.trim(u8, line[0..colon], " \t");
+        const hval = std.mem.trim(u8, line[colon + 1 ..], " \t");
+        if (shouldSkipUpstreamResponseHeader(hname)) continue;
+        try resp_headers.append(.{
+            .name = try allocator.dupe(u8, hname),
+            .value = try allocator.dupe(u8, hval),
+        });
+    }
+
+    return .{
+        .status_code = status_code,
+        .reason = try allocator.dupe(u8, reason),
+        .headers = try resp_headers.toOwnedSlice(),
+        .body = try allocator.dupe(u8, resp_body),
+    };
 }
 
 const StaticErrorPageResult = union(enum) {
@@ -5725,19 +5977,35 @@ fn handleHttp3LocationProxyPass(
     const upstream_url = try appendProxyQueryString(allocator, resolved.url, request_query);
     defer allocator.free(upstream_url);
 
-    var upstream_response = try executeRawHttpProxyRequest(
-        allocator,
-        &ctx.state.upstream_client,
-        upstream_url,
-        resolved.unix_socket_path,
-        request.method,
-        &request.headers,
-        request.body,
-        correlation_id,
-        request.headers.get("x-real-ip") orelse "unknown",
-        if (edge_config.hasTlsFiles(ctx.cfg)) "https" else "http",
-        request.headers.get(":authority") orelse request.headers.get("host"),
-    );
+    const h3_use_mtls_path = ctx.cfg.upstream_tls_client_cert.len > 0 and
+        std.mem.startsWith(u8, upstream_url, "https://");
+    var upstream_response = if (h3_use_mtls_path)
+        try executeUpstreamHttpsWithMtls(
+            allocator,
+            upstream_url,
+            request.method,
+            &request.headers,
+            request.body,
+            correlation_id,
+            request.headers.get("x-real-ip") orelse "unknown",
+            if (edge_config.hasTlsFiles(ctx.cfg)) "https" else "http",
+            request.headers.get(":authority") orelse request.headers.get("host"),
+            ctx.cfg,
+        )
+    else
+        try executeRawHttpProxyRequest(
+            allocator,
+            &ctx.state.upstream_client,
+            upstream_url,
+            resolved.unix_socket_path,
+            request.method,
+            &request.headers,
+            request.body,
+            correlation_id,
+            request.headers.get("x-real-ip") orelse "unknown",
+            if (edge_config.hasTlsFiles(ctx.cfg)) "https" else "http",
+            request.headers.get(":authority") orelse request.headers.get("host"),
+        );
     defer upstream_response.deinit(allocator);
 
     _ = response

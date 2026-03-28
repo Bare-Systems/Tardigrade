@@ -27,7 +27,7 @@ The current codebase includes:
 - approval workflows, session/device auth, and policy-gated command execution
 - FastCGI, SCGI, uWSGI, SMTP, IMAP, and POP3 relay support
 
-Breaking behavior is tracked in [CHANGELOG.md](./CHANGELOG.md). Work history and implementation notes live under `changes/`.
+Breaking behavior is tracked in [CHANGELOG.md](./CHANGELOG.md). Active unfinished work for the BareSystems portfolio lives in the workspace root `ROADMAP.md`.
 
 ## Features
 
@@ -522,14 +522,10 @@ All responses include:
 
 This project is under active development. See [CHANGELOG.md](CHANGELOG.md) for recent changes.
 
-### Roadmap
-
-Note: See [PLAN.md](PLAN.md) for the full roadmap and prioritized work.
-
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and guidelines.
 
 ## License
 
-This project is open source and available under the MIT License.
+This project is open source and available under the Apache License, Version 2.0.

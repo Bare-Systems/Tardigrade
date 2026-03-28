@@ -47,7 +47,7 @@ Breaking behavior is tracked in [CHANGELOG.md](./CHANGELOG.md). Active unfinishe
 
 ```bash
 # Clone the repository
-git clone https://github.com/Bare-Labs/Tardigrade.git
+git clone https://github.com/Bare-Systems/Tardigrade.git
 cd Tardigrade
 
 # Build and run
@@ -59,14 +59,14 @@ The server starts on `http://localhost:8069` by default.
 ### Install latest release
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Bare-Labs/Tardigrade/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/Bare-Systems/Tardigrade/main/scripts/install.sh | sh
 ```
 
 By default the installer places `tardigrade` in `~/.local/bin`. To install a
 specific tag or choose a different directory:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Bare-Labs/Tardigrade/main/scripts/install.sh | \
+curl -fsSL https://raw.githubusercontent.com/Bare-Systems/Tardigrade/main/scripts/install.sh | \
   TARDIGRADE_VERSION=v0.7.0 TARDIGRADE_INSTALL_DIR=/usr/local/bin sh
 ```
 

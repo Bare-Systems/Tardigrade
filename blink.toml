@@ -5,7 +5,7 @@ version = "1"
 
 [targets.homelab]
 type         = "ssh"
-host         = "blink"
+host         = "beelink"
 user         = "admin"
 base         = "/home/admin/barelabs"
 runtime_dir  = "/home/admin/barelabs/runtime/tardigrade-build"

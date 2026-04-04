@@ -7814,7 +7814,7 @@ test "proxySuffixPathForLocation uses mount prefix for split upstream exact rout
             .match_type = .prefix,
             .pattern = "/ursa/",
             .priority = 1,
-            .action = .{ .proxy_pass = "http://127.0.0.1:18080" },
+            .action = .{ .proxy_pass = "http://127.0.0.1:6707" },
         },
     };
 
@@ -7835,7 +7835,7 @@ test "proxySuffixPathForLocation keeps mount prefix for split upstream longer pr
             .match_type = .prefix,
             .pattern = "/ursa/",
             .priority = 1,
-            .action = .{ .proxy_pass = "http://127.0.0.1:18080" },
+            .action = .{ .proxy_pass = "http://127.0.0.1:6707" },
         },
     };
 

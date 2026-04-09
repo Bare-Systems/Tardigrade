@@ -27,8 +27,6 @@ The current codebase includes:
 - approval workflows, session/device auth, and policy-gated command execution
 - FastCGI, SCGI, uWSGI, SMTP, IMAP, and POP3 relay support
 
-Breaking behavior is tracked in [CHANGELOG.md](./CHANGELOG.md). Active unfinished work for the BareSystems portfolio lives in the workspace root `ROADMAP.md`.
-
 ## Features
 
 - **Zig-first runtime**: Built on Zig 0.14.1 with predictable memory ownership and low overhead

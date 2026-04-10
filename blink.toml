@@ -18,7 +18,7 @@ publish_host = "192.168.86.53"
 # Port:    8443 SSL (iptables redirects 443 → 8443 for LAN traffic)
 # Network contract:
 #   - Tardigrade is the public edge
-#   - BearClaw remains loopback-only on 127.0.0.1:3001
+#   - BearClaw remains loopback-only on 127.0.0.1:6701
 #   - preserve Host / X-Forwarded-Proto when proxying to BearClaw
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -120,7 +120,7 @@ tags          = ["health"]
 
 [services.tardigrade.verify.tests.bearclaw-upstream-configured]
 type          = "shell"
-command       = "grep -Eq 'proxy_pass http://127\\.0\\.0\\.1:3001;' /home/admin/barelabs/runtime/blink-homelab/tardigrade.conf && echo configured || echo missing"
+command       = "grep -Eq 'proxy_pass http://127\\.0\\.0\\.1:6701;' /home/admin/barelabs/runtime/blink-homelab/tardigrade.conf && echo configured || echo missing"
 expect_output = "configured"
 tags          = ["health"]
 

@@ -12,6 +12,9 @@
 - TLS unit-test fixture tracking:
   - Added explicit `.gitignore` exceptions for the embedded TLS test private keys so CI sees the same fixture set as local development.
 
+### Changed
+- Ignored the repository-root `blink.toml` and `BLINK.md` and stopped tracking them so homelab-specific Blink targets and operator notes stay local-only.
+
 ## [0.31.0] - 2026-03-xx
 
 ### Added

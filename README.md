@@ -110,10 +110,10 @@ On `blink`, Tardigrade is the only public edge for the web surfaces:
 
 - TLS listener: `192.168.86.53:8443`
 - LAN traffic on `443` is redirected to `8443`
-- BearClaw stays private on `127.0.0.1:3001`
+- BearClaw stays private on `127.0.0.1:6701`
 - BearClaw public hostname: `https://bearclaw.baresystems.com`
 
-Do not "fix" BearClaw reachability by exposing `3001` on the LAN. The stable
+Do not "fix" BearClaw reachability by exposing `6701` on the LAN. The stable
 shape is TLS termination and proxying in Tardigrade, with `Host` and
 `X-Forwarded-Proto` preserved upstream.
 

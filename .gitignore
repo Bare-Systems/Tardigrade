@@ -36,3 +36,5 @@ suite/
 blink/
 .blink/
 blink
+/blink.toml
+/BLINK.md

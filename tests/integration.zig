@@ -2446,6 +2446,96 @@ test "bearclaw fixture serves chat over https with bearer auth and transcript pe
     try assertContains(transcript, valid_bearer_hash);
 }
 
+// TC-TARDIGRADE-002 + TC-TARDIGRADE-004
+test "bearclaw edge prefix routes health without auth and enforces auth on v1 paths" {
+    const allocator = std.testing.allocator;
+
+    var upstream = try UpstreamServer.start(allocator, &.{
+        .{ .body = "{\"status\":\"ok\",\"service\":\"bareclaw\"}", .headers = &.{.{ .name = "Content-Type", .value = "application/json" }} },
+        .{ .body = "{\"ok\":true,\"source\":\"bearclaw-upstream\"}", .headers = &.{.{ .name = "Content-Type", .value = "application/json" }} },
+    });
+    defer upstream.stop();
+    try upstream.run();
+
+    var options = bearClawProfile(baseOptions(upstream.port()));
+    options.ready_https_insecure = true;
+
+    var tardigrade = try TardigradeProcess.start(allocator, options);
+    defer tardigrade.stop();
+
+    // TC-TARDIGRADE-002: /bearclaw/health proxied without requiring auth.
+    var health_no_auth = try sendCurlRequest(allocator, tardigrade.port, .{
+        .scheme = "https",
+        .path = "/bearclaw/health",
+        .method = "GET",
+        .headers = &.{.{ .name = "Host", .value = "api.example.com" }},
+        .insecure = true,
+    });
+    defer health_no_auth.deinit();
+    try std.testing.expectEqual(@as(u16, 200), health_no_auth.status_code);
+    try assertContains(health_no_auth.body, "bareclaw");
+    try std.testing.expectEqual(@as(u32, 1), upstream.requestCount());
+
+    const health_path = try upstream.capturedPath(allocator);
+    defer allocator.free(health_path);
+    try std.testing.expectEqualStrings("/health", health_path);
+
+    // TC-TARDIGRADE-004: /bearclaw/v1/* requires auth — no token → 401.
+    var api_no_auth = try sendCurlRequest(allocator, tardigrade.port, .{
+        .scheme = "https",
+        .path = "/bearclaw/v1/chat",
+        .method = "POST",
+        .body = "{\"message\":\"hello\"}",
+        .headers = &.{
+            .{ .name = "Host", .value = "api.example.com" },
+            .{ .name = "Content-Type", .value = "application/json" },
+        },
+        .insecure = true,
+    });
+    defer api_no_auth.deinit();
+    try std.testing.expectEqual(@as(u16, 401), api_no_auth.status_code);
+    try std.testing.expectEqual(@as(u32, 1), upstream.requestCount());
+
+    // TC-TARDIGRADE-004: malformed or invalid bearer → 403.
+    var api_invalid_auth = try sendCurlRequest(allocator, tardigrade.port, .{
+        .scheme = "https",
+        .path = "/bearclaw/v1/chat",
+        .method = "POST",
+        .body = "{\"message\":\"hello\"}",
+        .headers = &.{
+            .{ .name = "Host", .value = "api.example.com" },
+            .{ .name = "Authorization", .value = "Bearer wrong-token" },
+            .{ .name = "Content-Type", .value = "application/json" },
+        },
+        .insecure = true,
+    });
+    defer api_invalid_auth.deinit();
+    try std.testing.expectEqual(@as(u16, 403), api_invalid_auth.status_code);
+    try std.testing.expectEqual(@as(u32, 1), upstream.requestCount());
+
+    // TC-TARDIGRADE-004: /bearclaw/v1/* with valid auth → proxied, 200.
+    var api_authorized = try sendCurlRequest(allocator, tardigrade.port, .{
+        .scheme = "https",
+        .path = "/bearclaw/v1/chat",
+        .method = "POST",
+        .body = "{\"message\":\"hello\"}",
+        .headers = &.{
+            .{ .name = "Host", .value = "api.example.com" },
+            .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
+            .{ .name = "Content-Type", .value = "application/json" },
+        },
+        .insecure = true,
+    });
+    defer api_authorized.deinit();
+    try std.testing.expectEqual(@as(u16, 200), api_authorized.status_code);
+    try assertContains(api_authorized.body, "\"source\":\"bearclaw-upstream\"");
+    try std.testing.expectEqual(@as(u32, 2), upstream.requestCount());
+
+    const api_path = try upstream.capturedPath(allocator);
+    defer allocator.free(api_path);
+    try std.testing.expectEqualStrings("/v1/chat", api_path);
+}
+
 const GenericFixtureDir = struct {
     allocator: std.mem.Allocator,
     dir_rel: []u8,

@@ -1,6 +1,26 @@
 
 # Changelog
 
+## [0.32.0] - 2026-03-xx
+
+### Added
+- GitHub Actions release pipeline hardening:
+  - CI now validates Tardigrade on both pull requests and `main` pushes so release-facing breakage is caught before packaging.
+  - Release automation now reads the top semantic version from `CHANGELOG.md`, creates the matching Git tag on `main`, and publishes GitHub releases automatically.
+  - Release assets now include Linux x86_64, macOS x86_64, and macOS arm64 archives plus a SHA-256 checksum manifest.
+  - Release builds now embed the published semantic version into the Tardigrade binary and server header instead of shipping the stale hard-coded version string.
+- TLS unit-test fixture tracking:
+  - Added explicit `.gitignore` exceptions for the embedded TLS test private keys so CI sees the same fixture set as local development.
+
+### Changed
+- Ignored the repository-root `blink.toml` and `BLINK.md` and stopped tracking them so homelab-specific Blink targets and operator notes stay local-only.
+
+### Fixed
+- BearClaw edge auth and routing:
+  - Protected `/bearclaw/v1/*` the same way as direct `/v1/*` routes while keeping `/bearclaw/health` public through the prefixed proxy mount.
+  - Distinguished missing credentials (`401`) from invalid bearer tokens (`403`) at the edge gateway.
+  - Added integration coverage proving `/bearclaw/health` rewrites to upstream `/health`, unauthenticated `/bearclaw/v1/chat` is rejected, invalid bearer tokens return `403`, and valid bearer requests proxy through to `/v1/chat`.
+
 ## [0.31.0] - 2026-03-xx
 
 ### Added

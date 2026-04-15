@@ -2,7 +2,7 @@
 
 set -eu
 
-REPO="${TARDIGRADE_REPO:-Bare-Labs/Tardigrade}"
+REPO="${TARDIGRADE_REPO:-Bare-Systems/Tardigrade}"
 VERSION="${TARDIGRADE_VERSION:-latest}"
 INSTALL_DIR="${TARDIGRADE_INSTALL_DIR:-$HOME/.local/bin}"
 DRY_RUN=0
@@ -14,7 +14,7 @@ Usage: install.sh [--dir <install-dir>] [--version <tag>] [--dry-run]
 Environment:
   TARDIGRADE_INSTALL_DIR  Override the install directory
   TARDIGRADE_VERSION      Override the release tag (default: latest)
-  TARDIGRADE_REPO         Override the GitHub repo (default: Bare-Labs/Tardigrade)
+  TARDIGRADE_REPO         Override the GitHub repo (default: Bare-Systems/Tardigrade)
 EOF
 }
 

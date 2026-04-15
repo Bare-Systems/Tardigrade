@@ -27,8 +27,6 @@ The current codebase includes:
 - approval workflows, session/device auth, and policy-gated command execution
 - FastCGI, SCGI, uWSGI, SMTP, IMAP, and POP3 relay support
 
-Breaking behavior is tracked in [CHANGELOG.md](./CHANGELOG.md). Work history and implementation notes live under `changes/`.
-
 ## Features
 
 - **Zig-first runtime**: Built on Zig 0.14.1 with predictable memory ownership and low overhead
@@ -47,7 +45,7 @@ Breaking behavior is tracked in [CHANGELOG.md](./CHANGELOG.md). Work history and
 
 ```bash
 # Clone the repository
-git clone https://github.com/Bare-Labs/Tardigrade.git
+git clone https://github.com/Bare-Systems/Tardigrade.git
 cd Tardigrade
 
 # Build and run
@@ -59,19 +57,21 @@ The server starts on `http://localhost:8069` by default.
 ### Install latest release
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Bare-Labs/Tardigrade/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/Bare-Systems/Tardigrade/main/scripts/install.sh | sh
 ```
 
 By default the installer places `tardigrade` in `~/.local/bin`. To install a
 specific tag or choose a different directory:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Bare-Labs/Tardigrade/main/scripts/install.sh | \
+curl -fsSL https://raw.githubusercontent.com/Bare-Systems/Tardigrade/main/scripts/install.sh | \
   TARDIGRADE_VERSION=v0.7.0 TARDIGRADE_INSTALL_DIR=/usr/local/bin sh
 ```
 
-Tagged releases are built in GitHub Actions and published as downloadable
-GitHub artifacts and release assets.
+Pushes to `main` read the top semantic version in `CHANGELOG.md`. When that
+version has not been tagged yet, GitHub Actions creates the matching `vX.Y.Z`
+tag, publishes the GitHub release automatically, and uploads Linux x86_64 plus
+macOS x86_64 and arm64 archives with a SHA-256 checksum manifest.
 
 The canonical command name is `tardigrade`. Release installs also provide a
 `tardi` alias for local convenience.
@@ -103,6 +103,23 @@ Built-in operator endpoints:
 - `GET /status` returns runtime status JSON
 - `GET /metrics` returns Prometheus text metrics
 - `GET /status/metrics` returns JSON metrics
+
+## Blink Homelab Contract
+
+On `blink`, Tardigrade is the only public edge for the web surfaces:
+
+- TLS listener: `192.168.86.53:8443`
+- LAN traffic on `443` is redirected to `8443`
+- BearClaw stays private on `127.0.0.1:6701`
+- BearClaw public hostname: `https://bearclaw.baresystems.com`
+
+Do not "fix" BearClaw reachability by exposing `6701` on the LAN. The stable
+shape is TLS termination and proxying in Tardigrade, with `Host` and
+`X-Forwarded-Proto` preserved upstream.
+
+Compression behavior is part of that contract. If Tardigrade ever decompresses
+an upstream response, it must also remove the stale `Content-Encoding` header.
+That exact bug caused blank BearClaw pages on March 20, 2026.
 
 ## Configuration
 
@@ -367,8 +384,8 @@ build context. The published CI image runs as a non-root user and includes a
 GitHub Actions also publishes a public GHCR image from `main` and release tags:
 
 ```bash
-docker pull ghcr.io/bare-labs/tardigrade:latest
-docker run --rm -p 8069:8069 ghcr.io/bare-labs/tardigrade:latest
+docker pull ghcr.io/bare-systems/tardigrade:latest
+docker run --rm -p 8069:8069 ghcr.io/bare-systems/tardigrade:latest
 ```
 
 ### Linux `systemd --user` service
@@ -423,19 +440,19 @@ uses `8443`, so a non-root user unit is sufficient there.
 
 On the `blink` homelab deployment, the staged unit file and installer live at:
 
-- `/home/admin/barelabs/runtime/blink-homelab/systemd-user/tardigrade.service`
-- `/home/admin/barelabs/runtime/blink-homelab/install_user_systemd_units.sh`
+- `/home/admin/baresystems/runtime/blink-homelab/systemd-user/tardigrade.service`
+- `/home/admin/baresystems/runtime/blink-homelab/install_user_systemd_units.sh`
 
 After enabling lingering for `admin`, install the staged units with:
 
 ```bash
-/home/admin/barelabs/runtime/blink-homelab/install_user_systemd_units.sh enable
+/home/admin/baresystems/runtime/blink-homelab/install_user_systemd_units.sh enable
 ```
 
 Example host-native service manifests now live under `packaging/`:
 
 - `packaging/systemd/tardigrade.service`
-- `packaging/launchd/io.barelabs.tardigrade.plist`
+- `packaging/launchd/io.baresystems.tardigrade.plist`
 
 ## Usage
 
@@ -476,7 +493,7 @@ curl -v http://localhost:8069/
 
 All responses include:
 - `Date`: Current timestamp in RFC 7231 format
-- `Server`: Server identification (tardigrade/0.4.1)
+- `Server`: Server identification (`tardigrade/<build version>`)
 - `Content-Type`: Automatically detected from file extension
 - `Content-Length`: Size of response body
 
@@ -516,14 +533,10 @@ All responses include:
 
 This project is under active development. See [CHANGELOG.md](CHANGELOG.md) for recent changes.
 
-### Roadmap
-
-Note: See [PLAN.md](PLAN.md) for the full roadmap and prioritized work.
-
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and guidelines.
 
 ## License
 
-This project is open source and available under the MIT License.
+This project is open source and available under the Apache License, Version 2.0.

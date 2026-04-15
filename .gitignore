@@ -1,5 +1,6 @@
 zig-out/
 .zig-cache/
+dist/
 
 # Secrets and environment files — never commit these
 .DS_Store
@@ -12,6 +13,8 @@ secrets.txt
 *.p12
 *.pfx
 .zig/
+!src/http/testdata/test_server.key
+!src/http/testdata/test_alt_server.key
 
 # Agent Context
 changes/
@@ -26,6 +29,12 @@ CONTEXTS.md
 deploy/
 PLAN-TEST*.md
 PLAN*.md
+ISSUES.md
 
 # Deployment symlink
 suite/
+blink/
+.blink/
+blink
+/blink.toml
+/BLINK.md

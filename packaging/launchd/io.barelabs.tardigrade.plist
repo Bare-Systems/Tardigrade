@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>io.barelabs.tardigrade</string>
+    <string>io.baresystems.tardigrade</string>
 
     <key>ProgramArguments</key>
     <array>

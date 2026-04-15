@@ -118,6 +118,9 @@ pub const EdgeConfig = struct {
     tls_session_tickets_enabled: bool,
     tls_ocsp_stapling_enabled: bool,
     tls_ocsp_response_path: []const u8,
+    tls_ocsp_auto_refresh: bool,
+    tls_ocsp_refresh_interval_ms: u64,
+    tls_ocsp_refresh_timeout_ms: u32,
     tls_client_ca_path: []const u8,
     tls_client_verify: bool,
     tls_client_verify_depth: u32,
@@ -126,7 +129,29 @@ pub const EdgeConfig = struct {
     tls_dynamic_reload_interval_ms: u64,
     tls_acme_enabled: bool,
     tls_acme_cert_dir: []const u8,
+    /// ACME directory URL (e.g. Let's Encrypt production or staging).
+    tls_acme_directory_url: []const u8,
+    /// Comma-separated list of domain names to obtain/renew certificates for.
+    tls_acme_domains: [][]const u8,
+    /// Contact email for ACME account registration.
+    tls_acme_email: []const u8,
+    /// Path to the PEM-encoded ECDSA P-256 account private key (created on first run).
+    tls_acme_account_key_path: []const u8,
+    /// Days before certificate expiry at which renewal is triggered.
+    tls_acme_renew_days_before_expiry: u32,
     http2_enabled: bool,
+    /// Verify TLS certificates presented by HTTPS upstream backends (default: true).
+    upstream_tls_verify: bool,
+    /// Path to a PEM CA bundle used to verify upstream TLS certificates.
+    /// When empty, the system default CA bundle is used.
+    upstream_tls_ca_bundle: []const u8,
+    /// Override the SNI hostname sent to upstream HTTPS backends.
+    /// When empty, the hostname from the upstream URL is used.
+    upstream_tls_server_name: []const u8,
+    /// Path to the PEM client certificate for upstream mTLS connections.
+    upstream_tls_client_cert: []const u8,
+    /// Path to the PEM client private key for upstream mTLS connections.
+    upstream_tls_client_key: []const u8,
     http3_enabled: bool,
     quic_port: u16,
     http3_enable_0rtt: bool,
@@ -371,6 +396,15 @@ pub const EdgeConfig = struct {
         }
         allocator.free(self.tls_sni_certs);
         allocator.free(self.tls_ocsp_response_path);
+        allocator.free(self.tls_acme_directory_url);
+        for (self.tls_acme_domains) |d| allocator.free(d);
+        allocator.free(self.tls_acme_domains);
+        allocator.free(self.tls_acme_email);
+        allocator.free(self.tls_acme_account_key_path);
+        allocator.free(self.upstream_tls_ca_bundle);
+        allocator.free(self.upstream_tls_server_name);
+        allocator.free(self.upstream_tls_client_cert);
+        allocator.free(self.upstream_tls_client_key);
         allocator.free(self.tls_client_ca_path);
         allocator.free(self.tls_crl_path);
         allocator.free(self.tls_acme_cert_dir);
@@ -549,6 +583,9 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     const tls_ocsp_stapling_enabled = parseBoolEnv(allocator, "TARDIGRADE_TLS_OCSP_STAPLING", false);
     const tls_ocsp_response_path = envOrDefault(allocator, "TARDIGRADE_TLS_OCSP_RESPONSE_PATH", "") catch unreachable;
     errdefer allocator.free(tls_ocsp_response_path);
+    const tls_ocsp_auto_refresh = parseBoolEnv(allocator, "TARDIGRADE_TLS_OCSP_AUTO_REFRESH", false);
+    const tls_ocsp_refresh_interval_ms = parseIntEnv(u64, allocator, "TARDIGRADE_TLS_OCSP_REFRESH_INTERVAL_MS", 3_600_000);
+    const tls_ocsp_refresh_timeout_ms = parseIntEnv(u32, allocator, "TARDIGRADE_TLS_OCSP_REFRESH_TIMEOUT_MS", 10_000);
     const tls_client_ca_path = envOrDefault(allocator, "TARDIGRADE_TLS_CLIENT_CA_PATH", "") catch unreachable;
     errdefer allocator.free(tls_client_ca_path);
     const tls_client_verify = parseBoolEnv(allocator, "TARDIGRADE_TLS_CLIENT_VERIFY", false);
@@ -560,6 +597,29 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     const tls_acme_enabled = parseBoolEnv(allocator, "TARDIGRADE_TLS_ACME_ENABLED", false);
     const tls_acme_cert_dir = envOrDefault(allocator, "TARDIGRADE_TLS_ACME_CERT_DIR", "") catch unreachable;
     errdefer allocator.free(tls_acme_cert_dir);
+    const tls_acme_directory_url = envOrDefault(allocator, "TARDIGRADE_TLS_ACME_DIRECTORY_URL", "https://acme-v02.api.letsencrypt.org/directory") catch unreachable;
+    errdefer allocator.free(tls_acme_directory_url);
+    const tls_acme_domains_raw = envOrDefault(allocator, "TARDIGRADE_TLS_ACME_DOMAINS", "") catch unreachable;
+    defer allocator.free(tls_acme_domains_raw);
+    const tls_acme_domains = try parseCsvValues(allocator, tls_acme_domains_raw);
+    errdefer {
+        for (tls_acme_domains) |d| allocator.free(d);
+        allocator.free(tls_acme_domains);
+    }
+    const tls_acme_email = envOrDefault(allocator, "TARDIGRADE_TLS_ACME_EMAIL", "") catch unreachable;
+    errdefer allocator.free(tls_acme_email);
+    const tls_acme_account_key_path = envOrDefault(allocator, "TARDIGRADE_TLS_ACME_ACCOUNT_KEY_PATH", "") catch unreachable;
+    errdefer allocator.free(tls_acme_account_key_path);
+    const tls_acme_renew_days_before_expiry = parseIntEnv(u32, allocator, "TARDIGRADE_TLS_ACME_RENEW_DAYS_BEFORE_EXPIRY", 30);
+    const upstream_tls_verify = parseBoolEnv(allocator, "TARDIGRADE_UPSTREAM_TLS_VERIFY", true);
+    const upstream_tls_ca_bundle = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_TLS_CA_BUNDLE", "") catch unreachable;
+    errdefer allocator.free(upstream_tls_ca_bundle);
+    const upstream_tls_server_name = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_TLS_SERVER_NAME", "") catch unreachable;
+    errdefer allocator.free(upstream_tls_server_name);
+    const upstream_tls_client_cert = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_TLS_CLIENT_CERT", "") catch unreachable;
+    errdefer allocator.free(upstream_tls_client_cert);
+    const upstream_tls_client_key = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_TLS_CLIENT_KEY", "") catch unreachable;
+    errdefer allocator.free(upstream_tls_client_key);
     const http2_enabled = parseBoolEnv(allocator, "TARDIGRADE_HTTP2_ENABLED", true);
     const http3_enabled = parseBoolEnv(allocator, "TARDIGRADE_HTTP3_ENABLED", false);
     const quic_port_str = envOrDefault(allocator, "TARDIGRADE_QUIC_PORT", "443") catch unreachable;
@@ -1126,6 +1186,9 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .tls_session_tickets_enabled = tls_session_tickets_enabled,
         .tls_ocsp_stapling_enabled = tls_ocsp_stapling_enabled,
         .tls_ocsp_response_path = tls_ocsp_response_path,
+        .tls_ocsp_auto_refresh = tls_ocsp_auto_refresh,
+        .tls_ocsp_refresh_interval_ms = tls_ocsp_refresh_interval_ms,
+        .tls_ocsp_refresh_timeout_ms = tls_ocsp_refresh_timeout_ms,
         .tls_client_ca_path = tls_client_ca_path,
         .tls_client_verify = tls_client_verify,
         .tls_client_verify_depth = tls_client_verify_depth,
@@ -1134,7 +1197,17 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .tls_dynamic_reload_interval_ms = tls_dynamic_reload_interval_ms,
         .tls_acme_enabled = tls_acme_enabled,
         .tls_acme_cert_dir = tls_acme_cert_dir,
+        .tls_acme_directory_url = tls_acme_directory_url,
+        .tls_acme_domains = tls_acme_domains,
+        .tls_acme_email = tls_acme_email,
+        .tls_acme_account_key_path = tls_acme_account_key_path,
+        .tls_acme_renew_days_before_expiry = tls_acme_renew_days_before_expiry,
         .http2_enabled = http2_enabled,
+        .upstream_tls_verify = upstream_tls_verify,
+        .upstream_tls_ca_bundle = upstream_tls_ca_bundle,
+        .upstream_tls_server_name = upstream_tls_server_name,
+        .upstream_tls_client_cert = upstream_tls_client_cert,
+        .upstream_tls_client_key = upstream_tls_client_key,
         .http3_enabled = http3_enabled,
         .quic_port = quic_port,
         .http3_enable_0rtt = http3_enable_0rtt,

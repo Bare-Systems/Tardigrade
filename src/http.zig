@@ -44,6 +44,7 @@ pub const event_loop = @import("http/event_loop.zig");
 pub const worker_pool = @import("http/worker_pool.zig");
 pub const buffer_pool = @import("http/buffer_pool.zig");
 pub const tls_termination = @import("http/tls_termination.zig");
+pub const acme_client = @import("http/acme_client.zig");
 pub const hpack = @import("http/hpack.zig");
 pub const http2_frame = @import("http/http2_frame.zig");
 pub const ngtcp2_binding = @import("http/ngtcp2_binding.zig");

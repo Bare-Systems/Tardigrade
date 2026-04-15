@@ -179,7 +179,15 @@ Config file notes:
 | `TARDIGRADE_HTTP3_ENABLE_0RTT` | Allow 0-RTT handling in HTTP/3 foundation logic | `false` |
 | `TARDIGRADE_HTTP3_CONNECTION_MIGRATION` | Allow QUIC connection migration updates | `false` |
 | `TARDIGRADE_HTTP3_MAX_DATAGRAM_SIZE` | Target maximum QUIC datagram size | `1350` |
-| `TARDIGRADE_PROXY_PROTOCOL` | PROXY protocol mode for plaintext listeners | `off` |
+| `TARDIGRADE_PROXY_PROTOCOL` | PROXY protocol mode (`off`, `v1`, `v2`, `auto`) — supported on both plaintext and TLS listeners | `off` |
+| `TARDIGRADE_TLS_OCSP_AUTO_REFRESH` | Automatically fetch and refresh OCSP stapling response from the certificate's AIA OCSP URL | `false` |
+| `TARDIGRADE_TLS_OCSP_REFRESH_INTERVAL_MS` | How often (ms) the background OCSP refresh runs | `3600000` |
+| `TARDIGRADE_TLS_OCSP_REFRESH_TIMEOUT_MS` | HTTP timeout (ms) for OCSP responder requests | `10000` |
+| `TARDIGRADE_TLS_ACME_DIRECTORY_URL` | ACME directory URL for automated certificate issuance (e.g. Let's Encrypt) | empty |
+| `TARDIGRADE_TLS_ACME_DOMAINS` | Comma-separated list of domains to issue/renew via ACME | empty |
+| `TARDIGRADE_TLS_ACME_EMAIL` | Contact email sent to the ACME server during account registration | empty |
+| `TARDIGRADE_TLS_ACME_ACCOUNT_KEY_PATH` | Path for the ACME account EC private key (auto-generated if absent) | `acme_account.key` |
+| `TARDIGRADE_TLS_ACME_RENEW_DAYS_BEFORE_EXPIRY` | Renew certificate this many days before it expires | `30` |
 | `TARDIGRADE_VALIDATE_CONFIG_ONLY` | Validate config and exit without serving | empty |
 
 #### Trust, Upstreams, and Proxying
@@ -225,6 +233,11 @@ Config file notes:
 | `TARDIGRADE_PROXY_CACHE_MANAGER_INTERVAL_MS` | Cache maintenance interval | `30000` |
 | `TARDIGRADE_UPSTREAM_GUNZIP_ENABLED` | Gunzip upstream gzip responses before downstream negotiation | `true` |
 | `TARDIGRADE_MIRROR_RULES` | Semicolon-separated mirror dispatch rules | empty |
+| `TARDIGRADE_UPSTREAM_TLS_VERIFY` | Verify upstream TLS certificates | `true` |
+| `TARDIGRADE_UPSTREAM_TLS_CA_BUNDLE` | Path to PEM CA bundle for upstream certificate verification | empty (system default) |
+| `TARDIGRADE_UPSTREAM_TLS_SERVER_NAME` | Override SNI/hostname for upstream TLS handshake | empty |
+| `TARDIGRADE_UPSTREAM_TLS_CLIENT_CERT` | Path to PEM client certificate for mTLS upstream connections | empty |
+| `TARDIGRADE_UPSTREAM_TLS_CLIENT_KEY` | Path to PEM private key paired with `TARDIGRADE_UPSTREAM_TLS_CLIENT_CERT` | empty |
 
 #### Authentication and Access Control
 

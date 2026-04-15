@@ -4213,10 +4213,14 @@ fn runMiddlewarePipeline(
             } else if (cfg.auth_request_url.len > 0 and authorizeViaSubrequest(allocator, cfg, request, correlation_id, client_ip)) {
                 ctx.authenticated = true;
             } else {
-                try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, keep_alive, state);
-                state.metricsRecord(401);
-                state.metricsRecordErrorCode("unauthorized");
-                logAccess(ctx, request.method.toString(), request.uri.path, 401, request.headers.get("user-agent") orelse "");
+                const auth_status: http.Status = if (auth_res.failure_reason == .invalid) .forbidden else .unauthorized;
+                const auth_code = if (auth_res.failure_reason == .invalid) "forbidden" else "unauthorized";
+                const auth_message = if (auth_res.failure_reason == .invalid) "Forbidden" else "Unauthorized";
+                const auth_status_code: u16 = @intFromEnum(auth_status);
+                try sendApiError(allocator, writer, auth_status, auth_code, auth_message, correlation_id, keep_alive, state);
+                state.metricsRecord(auth_status_code);
+                state.metricsRecordErrorCode(auth_code);
+                logAccess(ctx, request.method.toString(), request.uri.path, auth_status_code, request.headers.get("user-agent") orelse "");
                 return true;
             }
         }
@@ -5716,6 +5720,12 @@ fn parseMemcachedPayload(allocator: std.mem.Allocator, body: []const u8) !Memcac
 const AuthResult = struct {
     ok: bool,
     token_hash: ?[64]u8,
+    failure_reason: ?AuthFailureReason = null,
+};
+
+const AuthFailureReason = enum {
+    missing,
+    invalid,
 };
 
 fn applyResponseHeaders(state: *GatewayState, response: *http.Response) void {
@@ -5998,26 +6008,35 @@ fn handleHttp3Request(
 }
 
 fn authorizeRequest(cfg: *const edge_config.EdgeConfig, headers: *const http.Headers) AuthResult {
+    const auth_header = headers.get("authorization");
+
     if (cfg.basic_auth_hashes.len > 0) {
         var cred_buf: [512]u8 = undefined;
         if (http.basic_auth.fromHeaders(headers, &cred_buf)) |creds| {
             if (http.basic_auth.verifyCredentials(creds, cfg.basic_auth_hashes)) {
-                return .{ .ok = true, .token_hash = null };
+                return .{ .ok = true, .token_hash = null, .failure_reason = null };
             }
         } else |_| {}
     }
 
     if (cfg.auth_token_hashes.len > 0) {
-        const token = http.auth.bearerTokenFromHeaders(headers) orelse return .{ .ok = false, .token_hash = null };
-        const token_hash = hashBearerToken(token);
-        for (cfg.auth_token_hashes) |allowed| {
-            if (std.mem.eql(u8, allowed, token_hash[0..])) {
-                return .{ .ok = true, .token_hash = token_hash };
+        if (auth_header) |raw_auth| {
+            if (http.auth.parseBearerToken(raw_auth)) |token| {
+                const token_hash = hashBearerToken(token);
+                for (cfg.auth_token_hashes) |allowed| {
+                    if (std.mem.eql(u8, allowed, token_hash[0..])) {
+                        return .{ .ok = true, .token_hash = token_hash, .failure_reason = null };
+                    }
+                }
             }
         }
     }
 
-    return .{ .ok = false, .token_hash = null };
+    return .{
+        .ok = false,
+        .token_hash = null,
+        .failure_reason = if (auth_header == null) .missing else .invalid,
+    };
 }
 
 fn hashBearerToken(token: []const u8) [64]u8 {
@@ -6075,10 +6094,11 @@ fn isGeoBlocked(blocked: []const []const u8, country: ?[]const u8) bool {
 }
 
 fn isProtectedAuthRequestRoute(path: []const u8) bool {
-    // Auth is handled by upstream applications, not hardcoded here.
-    // Tardigrade is a general-purpose reverse proxy — route protection
-    // should be configured per-vhost, not baked into the binary.
-    _ = path;
+    // Protect versioned API routes at both the direct path and the /bearclaw/
+    // edge prefix. Health and static paths remain public so readiness probes
+    // and asset serving work without credentials.
+    if (std.mem.startsWith(u8, path, "/bearclaw/v1/")) return true;
+    if (std.mem.startsWith(u8, path, "/v1/")) return true;
     return false;
 }
 

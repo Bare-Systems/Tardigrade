@@ -15,6 +15,12 @@
 ### Changed
 - Ignored the repository-root `blink.toml` and `BLINK.md` and stopped tracking them so homelab-specific Blink targets and operator notes stay local-only.
 
+### Fixed
+- BearClaw edge auth and routing:
+  - Protected `/bearclaw/v1/*` the same way as direct `/v1/*` routes while keeping `/bearclaw/health` public through the prefixed proxy mount.
+  - Distinguished missing credentials (`401`) from invalid bearer tokens (`403`) at the edge gateway.
+  - Added integration coverage proving `/bearclaw/health` rewrites to upstream `/health`, unauthenticated `/bearclaw/v1/chat` is rejected, invalid bearer tokens return `403`, and valid bearer requests proxy through to `/v1/chat`.
+
 ## [0.31.0] - 2026-03-xx
 
 ### Added

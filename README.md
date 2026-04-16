@@ -245,6 +245,9 @@ Config file notes:
 |---|---|---|
 | `TARDIGRADE_BASIC_AUTH_HASHES` | Lowercase SHA-256 hashes of `user:password` | empty |
 | `TARDIGRADE_AUTH_TOKEN_HASHES` | Lowercase SHA-256 hashes of accepted bearer tokens | empty |
+| `TARDIGRADE_JWT_SECRET` | Optional shared HS256 secret for BearClawWeb-issued identity JWTs | empty |
+| `TARDIGRADE_JWT_ISSUER` | Required `iss` claim when JWT auth is enabled | empty |
+| `TARDIGRADE_JWT_AUDIENCE` | Required `aud` claim when JWT auth is enabled | empty |
 | `TARDIGRADE_SESSION_STORE_PATH` | Optional JSON file for persisted gateway sessions | empty |
 | `TARDIGRADE_TRANSCRIPT_STORE_PATH` | Optional NDJSON file for persisted gateway chat/command transcripts | empty |
 

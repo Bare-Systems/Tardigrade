@@ -1,9 +1,18 @@
 
 # Changelog
 
+## [Unreleased]
+
+### Changed
+- `blink.toml`: renamed the legacy `health_check.insecure` key to `tls_insecure = true` (Blink Sprint D flipped the HTTP adapter to TLS-verify-by-default). Behaviour is unchanged — Tardigrade's `https://127.0.0.1:8443/health` probe continues to skip TLS verification for the self-signed edge cert, but the flag name now matches Blink's new schema and surfaces as a visible warning in `blink plan`.
+
 ## [0.32.0] - 2026-03-xx
 
 ### Added
+- Identity unification for the BearClaw edge:
+  - Added HS256 JWT auth support (`TARDIGRADE_JWT_SECRET`, `TARDIGRADE_JWT_ISSUER`, `TARDIGRADE_JWT_AUDIENCE`) so BearClawWeb can authenticate operator requests through Tardigrade without sharing a static bearer token per user.
+  - JWT-authenticated requests now project `X-Tardigrade-User-ID`, `X-Tardigrade-Device-ID`, and `X-Tardigrade-Scopes` to upstreams alongside `X-Tardigrade-Auth-Identity`.
+  - Added integration coverage for `/bearclaw/v1/chat` with a BearClawWeb-style JWT and asserted-header forwarding.
 - GitHub Actions release pipeline hardening:
   - CI now validates Tardigrade on both pull requests and `main` pushes so release-facing breakage is caught before packaging.
   - Release automation now reads the top semantic version from `CHANGELOG.md`, creates the matching Git tag on `main`, and publishes GitHub releases automatically.
@@ -11,6 +20,9 @@
   - Release builds now embed the published semantic version into the Tardigrade binary and server header instead of shipping the stale hard-coded version string.
 - TLS unit-test fixture tracking:
   - Added explicit `.gitignore` exceptions for the embedded TLS test private keys so CI sees the same fixture set as local development.
+- BearClaw edge contract documentation:
+  - Expanded `examples/bearclaw/tardigrade.env.example` with explicit notes for public ports, BearClaw mount paths, bearer token hashing, session/device/transcript persistence, and forwarded upstream headers.
+  - Added a canonical BearClaw edge contract section to `AGENTS.md` covering the live path, required headers, token-hash procedure, persistence file shapes, and header forwarding expectations.
 
 ### Changed
 - Ignored the repository-root `blink.toml` and `BLINK.md` and stopped tracking them so homelab-specific Blink targets and operator notes stay local-only.

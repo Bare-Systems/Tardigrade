@@ -3739,6 +3739,9 @@ fn routeRequest(
                     keep_alive.*,
                     client_ip,
                     ctx.identity,
+                    ctx.user_id,
+                    ctx.device_id,
+                    ctx.scopes,
                 );
             },
             .fastcgi_pass => |upstream| {
@@ -3957,6 +3960,9 @@ fn executeVersionedApiProxyRoute(
         correlation_id,
         client_ip,
         ctx.identity,
+        ctx.user_id,
+        ctx.device_id,
+        ctx.scopes,
         api_version,
         incoming_host,
         incoming_x_forwarded_for,
@@ -4010,6 +4016,9 @@ fn handleLocationProxyPass(
     keep_alive: bool,
     client_ip: []const u8,
     auth_identity: ?[]const u8,
+    auth_user_id: ?[]const u8,
+    auth_device_id: ?[]const u8,
+    auth_scopes: ?[]const u8,
 ) !u16 {
     const resolved = try resolveProxyTarget(allocator, cfg.upstream_base_url, target, suffix_path);
     defer allocator.free(resolved.url);
@@ -4029,6 +4038,10 @@ fn handleLocationProxyPass(
             client_ip,
             if (edge_config.hasTlsFiles(cfg)) "https" else "http",
             request.headers.get("host"),
+            auth_identity,
+            auth_user_id,
+            auth_device_id,
+            auth_scopes,
             cfg,
         )
     else
@@ -4044,6 +4057,10 @@ fn handleLocationProxyPass(
             client_ip,
             if (edge_config.hasTlsFiles(cfg)) "https" else "http",
             request.headers.get("host"),
+            auth_identity,
+            auth_user_id,
+            auth_device_id,
+            auth_scopes,
         );
     defer upstream_response.deinit(allocator);
     state.appendTranscript(
@@ -4109,6 +4126,10 @@ fn executeRawHttpProxyRequest(
     client_ip: []const u8,
     forwarded_proto: []const u8,
     incoming_host: ?[]const u8,
+    auth_identity: ?[]const u8,
+    auth_user_id: ?[]const u8,
+    auth_device_id: ?[]const u8,
+    auth_scopes: ?[]const u8,
 ) !RawUpstreamResponse {
     const method_enum = std.meta.stringToEnum(std.http.Method, method) orelse return error.UnsupportedHttpMethod;
     const uri = try std.Uri.parse(url);
@@ -4131,6 +4152,7 @@ fn executeRawHttpProxyRequest(
         const trimmed = std.mem.trim(u8, value, " \t\r\n");
         if (trimmed.len > 0) try extra_headers.append(.{ .name = "X-Forwarded-Host", .value = trimmed });
     }
+    try appendAssertedIdentityHeaders(&extra_headers, auth_identity, auth_user_id, auth_device_id, auth_scopes);
 
     var req = try client.open(method_enum, uri, .{
         .server_header_buffer = &server_header_buffer,
@@ -4207,6 +4229,10 @@ fn executeUpstreamHttpsWithMtls(
     client_ip: []const u8,
     forwarded_proto: []const u8,
     incoming_host: ?[]const u8,
+    auth_identity: ?[]const u8,
+    auth_user_id: ?[]const u8,
+    auth_device_id: ?[]const u8,
+    auth_scopes: ?[]const u8,
     cfg: *const edge_config.EdgeConfig,
 ) !RawUpstreamResponse {
     const uri = try std.Uri.parse(url);
@@ -4247,6 +4273,7 @@ fn executeUpstreamHttpsWithMtls(
         const trimmed = std.mem.trim(u8, h, " \t\r\n");
         if (trimmed.len > 0) try req_writer.print("X-Forwarded-Host: {s}\r\n", .{trimmed});
     }
+    try writeAssertedIdentityHeaders(req_writer, auth_identity, auth_user_id, auth_device_id, auth_scopes);
     var hdr_it = request_headers.iterator();
     while (hdr_it.next()) |entry| {
         if (shouldSkipUpstreamRequestHeader(entry.name)) continue;
@@ -4443,14 +4470,19 @@ fn runMiddlewarePipeline(
     if (isProtectedAuthRequestRoute(request.uri.path)) {
         const has_auth_policy = cfg.basic_auth_hashes.len > 0 or
             cfg.auth_token_hashes.len > 0 or
+            cfg.jwt_secret.len > 0 or
             cfg.auth_request_url.len > 0 or
             state.session_store != null;
         if (has_auth_policy) {
-            const auth_res = authorizeRequest(cfg, &request.headers);
+            var auth_res = try authorizeRequest(allocator, cfg, &request.headers);
+            defer auth_res.deinit(allocator);
             if (auth_res.ok) {
-                if (auth_res.token_hash) |identity| {
-                    const owned_identity = try allocator.dupe(u8, identity[0..]);
-                    ctx.setIdentity(owned_identity);
+                if (auth_res.identity) |identity| {
+                    ctx.setAuthContext(identity, auth_res.user_id, auth_res.device_id, auth_res.scopes);
+                    auth_res.identity = null;
+                    auth_res.user_id = null;
+                    auth_res.device_id = null;
+                    auth_res.scopes = null;
                 }
             } else if (http.session.fromHeaders(&request.headers)) |session_token| {
                 if (state.validateSessionIdentity(allocator, session_token)) |identity| {
@@ -4829,6 +4861,9 @@ fn runAsyncCommandJob(job: *AsyncCommandJob) void {
         job.correlation_id,
         job.client_ip,
         job.identity,
+        null,
+        null,
+        null,
         job.api_version,
         job.incoming_host,
         job.incoming_x_forwarded_for,
@@ -5971,8 +6006,19 @@ fn parseMemcachedPayload(allocator: std.mem.Allocator, body: []const u8) !Memcac
 
 const AuthResult = struct {
     ok: bool,
-    token_hash: ?[64]u8,
+    identity: ?[]u8 = null,
+    user_id: ?[]u8 = null,
+    device_id: ?[]u8 = null,
+    scopes: ?[]u8 = null,
     failure_reason: ?AuthFailureReason = null,
+
+    fn deinit(self: *AuthResult, allocator: std.mem.Allocator) void {
+        if (self.identity) |value| allocator.free(value);
+        if (self.user_id) |value| allocator.free(value);
+        if (self.device_id) |value| allocator.free(value);
+        if (self.scopes) |value| allocator.free(value);
+        self.* = undefined;
+    }
 };
 
 const AuthFailureReason = enum {
@@ -6039,6 +6085,10 @@ fn handleHttp3LocationProxyPass(
             request.headers.get("x-real-ip") orelse "unknown",
             if (edge_config.hasTlsFiles(ctx.cfg)) "https" else "http",
             request.headers.get(":authority") orelse request.headers.get("host"),
+            null,
+            null,
+            null,
+            null,
             ctx.cfg,
         )
     else
@@ -6054,6 +6104,10 @@ fn handleHttp3LocationProxyPass(
             request.headers.get("x-real-ip") orelse "unknown",
             if (edge_config.hasTlsFiles(ctx.cfg)) "https" else "http",
             request.headers.get(":authority") orelse request.headers.get("host"),
+            null,
+            null,
+            null,
+            null,
         );
     defer upstream_response.deinit(allocator);
 
@@ -6275,34 +6329,74 @@ fn handleHttp3Request(
     try handleHttp3Connection(allocator, request, response, &effective_ctx);
 }
 
-fn authorizeRequest(cfg: *const edge_config.EdgeConfig, headers: *const http.Headers) AuthResult {
+fn authorizeRequest(allocator: std.mem.Allocator, cfg: *const edge_config.EdgeConfig, headers: *const http.Headers) !AuthResult {
     const auth_header = headers.get("authorization");
 
     if (cfg.basic_auth_hashes.len > 0) {
         var cred_buf: [512]u8 = undefined;
         if (http.basic_auth.fromHeaders(headers, &cred_buf)) |creds| {
             if (http.basic_auth.verifyCredentials(creds, cfg.basic_auth_hashes)) {
-                return .{ .ok = true, .token_hash = null, .failure_reason = null };
+                return .{ .ok = true, .failure_reason = null };
             }
         } else |_| {}
     }
 
-    if (cfg.auth_token_hashes.len > 0) {
-        if (auth_header) |raw_auth| {
-            if (http.auth.parseBearerToken(raw_auth)) |token| {
+    if (auth_header) |raw_auth| {
+        if (http.auth.parseBearerToken(raw_auth)) |token| {
+            if (cfg.auth_token_hashes.len > 0) {
                 const token_hash = hashBearerToken(token);
                 for (cfg.auth_token_hashes) |allowed| {
                     if (std.mem.eql(u8, allowed, token_hash[0..])) {
-                        return .{ .ok = true, .token_hash = token_hash, .failure_reason = null };
+                        return .{
+                            .ok = true,
+                            .identity = try allocator.dupe(u8, token_hash[0..]),
+                            .failure_reason = null,
+                        };
                     }
                 }
+            }
+
+            if (cfg.jwt_secret.len > 0) {
+                var claims = http.jwt.validateHs256Owned(allocator, token, .{
+                    .secret = cfg.jwt_secret,
+                    .required_issuer = if (cfg.jwt_issuer.len > 0) cfg.jwt_issuer else null,
+                    .required_audience = if (cfg.jwt_audience.len > 0) cfg.jwt_audience else null,
+                }) catch {
+                    return .{
+                        .ok = false,
+                        .failure_reason = .invalid,
+                    };
+                };
+                if (claims.subject == null) {
+                    claims.deinit(allocator);
+                    return .{
+                        .ok = false,
+                        .failure_reason = .invalid,
+                    };
+                }
+
+                const subject = claims.subject.?;
+                claims.subject = null;
+                const scope = claims.scope;
+                claims.scope = null;
+                const device_id = claims.device_id;
+                claims.device_id = null;
+                claims.deinit(allocator);
+
+                return .{
+                    .ok = true,
+                    .identity = subject,
+                    .user_id = try allocator.dupe(u8, subject),
+                    .device_id = device_id,
+                    .scopes = scope,
+                    .failure_reason = null,
+                };
             }
         }
     }
 
     return .{
         .ok = false,
-        .token_hash = null,
         .failure_reason = if (auth_header == null) .missing else .invalid,
     };
 }
@@ -6602,9 +6696,11 @@ fn extractIdentityForPolicy(
     state: *GatewayState,
     request: *const http.Request,
 ) !?[]const u8 {
-    const auth_res = authorizeRequest(cfg, &request.headers);
-    if (auth_res.ok and auth_res.token_hash != null) {
-        const identity = try allocator.dupe(u8, auth_res.token_hash.?[0..]);
+    var auth_res = try authorizeRequest(allocator, cfg, &request.headers);
+    defer auth_res.deinit(allocator);
+    if (auth_res.ok and auth_res.identity != null) {
+        const identity = auth_res.identity.?;
+        auth_res.identity = null;
         return identity;
     }
     if (http.session.fromHeaders(&request.headers)) |session_token| {
@@ -7137,6 +7233,9 @@ fn proxyJsonExecute(
     correlation_id: []const u8,
     client_ip: []const u8,
     auth_identity: ?[]const u8,
+    auth_user_id: ?[]const u8,
+    auth_device_id: ?[]const u8,
+    auth_scopes: ?[]const u8,
     api_version: ?u32,
     incoming_host: ?[]const u8,
     incoming_x_forwarded_for: ?[]const u8,
@@ -7180,6 +7279,9 @@ fn proxyJsonExecute(
                 correlation_id,
                 client_ip,
                 auth_identity,
+                auth_user_id,
+                auth_device_id,
+                auth_scopes,
                 api_version,
                 incoming_host,
                 incoming_x_forwarded_for,
@@ -7238,6 +7340,9 @@ fn proxyJsonExecuteSingleAttempt(
     correlation_id: []const u8,
     client_ip: []const u8,
     auth_identity: ?[]const u8,
+    auth_user_id: ?[]const u8,
+    auth_device_id: ?[]const u8,
+    auth_scopes: ?[]const u8,
     api_version: ?u32,
     incoming_host: ?[]const u8,
     incoming_x_forwarded_for: ?[]const u8,
@@ -7276,6 +7381,15 @@ fn proxyJsonExecuteSingleAttempt(
     if (forwarded_host.len > 0) try extra_headers.append(.{ .name = "X-Forwarded-Host", .value = forwarded_host });
     if (auth_identity) |identity| {
         if (identity.len > 0) try extra_headers.append(.{ .name = "X-Tardigrade-Auth-Identity", .value = identity });
+    }
+    if (auth_user_id) |user_id| {
+        if (user_id.len > 0) try extra_headers.append(.{ .name = "X-Tardigrade-User-ID", .value = user_id });
+    }
+    if (auth_device_id) |device_id| {
+        if (device_id.len > 0) try extra_headers.append(.{ .name = "X-Tardigrade-Device-ID", .value = device_id });
+    }
+    if (auth_scopes) |scopes| {
+        if (scopes.len > 0) try extra_headers.append(.{ .name = "X-Tardigrade-Scopes", .value = scopes });
     }
     if (api_version) |ver| {
         const api_version_value = try std.fmt.allocPrint(allocator, "{d}", .{ver});
@@ -7432,6 +7546,48 @@ fn proxyJsonExecuteSingleAttempt(
             .cacheable = cacheable,
         },
     };
+}
+
+fn appendAssertedIdentityHeaders(
+    headers: *std.ArrayList(std.http.Header),
+    auth_identity: ?[]const u8,
+    auth_user_id: ?[]const u8,
+    auth_device_id: ?[]const u8,
+    auth_scopes: ?[]const u8,
+) !void {
+    if (auth_identity) |identity| {
+        if (identity.len > 0) try headers.append(.{ .name = "X-Tardigrade-Auth-Identity", .value = identity });
+    }
+    if (auth_user_id) |user_id| {
+        if (user_id.len > 0) try headers.append(.{ .name = "X-Tardigrade-User-ID", .value = user_id });
+    }
+    if (auth_device_id) |device_id| {
+        if (device_id.len > 0) try headers.append(.{ .name = "X-Tardigrade-Device-ID", .value = device_id });
+    }
+    if (auth_scopes) |scopes| {
+        if (scopes.len > 0) try headers.append(.{ .name = "X-Tardigrade-Scopes", .value = scopes });
+    }
+}
+
+fn writeAssertedIdentityHeaders(
+    writer: anytype,
+    auth_identity: ?[]const u8,
+    auth_user_id: ?[]const u8,
+    auth_device_id: ?[]const u8,
+    auth_scopes: ?[]const u8,
+) !void {
+    if (auth_identity) |identity| {
+        if (identity.len > 0) try writer.print("X-Tardigrade-Auth-Identity: {s}\r\n", .{identity});
+    }
+    if (auth_user_id) |user_id| {
+        if (user_id.len > 0) try writer.print("X-Tardigrade-User-ID: {s}\r\n", .{user_id});
+    }
+    if (auth_device_id) |device_id| {
+        if (device_id.len > 0) try writer.print("X-Tardigrade-Device-ID: {s}\r\n", .{device_id});
+    }
+    if (auth_scopes) |scopes| {
+        if (scopes.len > 0) try writer.print("X-Tardigrade-Scopes: {s}\r\n", .{scopes});
+    }
 }
 
 fn writeStreamedUpstreamResponse(
@@ -8150,6 +8306,9 @@ test "resolveProxyTarget handles absolute and relative proxy_pass" {
         .tls_session_tickets_enabled = true,
         .tls_ocsp_stapling_enabled = false,
         .tls_ocsp_response_path = "",
+        .tls_ocsp_auto_refresh = false,
+        .tls_ocsp_refresh_interval_ms = 300_000,
+        .tls_ocsp_refresh_timeout_ms = 5_000,
         .tls_client_ca_path = "",
         .tls_client_verify = false,
         .tls_client_verify_depth = 3,
@@ -8158,7 +8317,17 @@ test "resolveProxyTarget handles absolute and relative proxy_pass" {
         .tls_dynamic_reload_interval_ms = 5000,
         .tls_acme_enabled = false,
         .tls_acme_cert_dir = "",
+        .tls_acme_directory_url = "",
+        .tls_acme_domains = &[_][]const u8{},
+        .tls_acme_email = "",
+        .tls_acme_account_key_path = "",
+        .tls_acme_renew_days_before_expiry = 30,
         .http2_enabled = true,
+        .upstream_tls_verify = true,
+        .upstream_tls_ca_bundle = "",
+        .upstream_tls_server_name = "",
+        .upstream_tls_client_cert = "",
+        .upstream_tls_client_key = "",
         .http3_enabled = false,
         .quic_port = 443,
         .http3_enable_0rtt = false,
@@ -8182,6 +8351,9 @@ test "resolveProxyTarget handles absolute and relative proxy_pass" {
         .upstream_lb_algorithm = .round_robin,
         .upstream_timeout_ms = 10000,
         .auth_request_url = "",
+        .jwt_secret = "",
+        .jwt_issuer = "",
+        .jwt_audience = "",
         .rate_limit_rps = 0,
         .rate_limit_burst = 0,
         .security_headers_enabled = false,

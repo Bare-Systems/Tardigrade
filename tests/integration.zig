@@ -2536,6 +2536,58 @@ test "bearclaw edge prefix routes health without auth and enforces auth on v1 pa
     try std.testing.expectEqualStrings("/v1/chat", api_path);
 }
 
+test "bearclaw jwt auth forwards asserted identity headers upstream" {
+    const allocator = std.testing.allocator;
+
+    var upstream = try UpstreamServer.start(allocator, &.{.{
+        .body = "{\"ok\":true,\"source\":\"bearclaw-upstream\"}",
+        .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
+    }});
+    defer upstream.stop();
+    try upstream.run();
+
+    var options = bearClawProfile(baseOptions(upstream.port()));
+    options.ready_https_insecure = true;
+    options.auth_token_hashes = null;
+    options.extra_env = &.{
+        .{ .name = "TARDIGRADE_JWT_SECRET", .value = "stage-2c-secret" },
+        .{ .name = "TARDIGRADE_JWT_ISSUER", .value = "bearclaw-web" },
+        .{ .name = "TARDIGRADE_JWT_AUDIENCE", .value = "bearclaw-api" },
+    };
+
+    var tardigrade = try TardigradeProcess.start(allocator, options);
+    defer tardigrade.stop();
+
+    const jwt = try hs256Jwt(
+        allocator,
+        "stage-2c-secret",
+        "{\"sub\":\"user-42\",\"iss\":\"bearclaw-web\",\"aud\":\"bearclaw-api\",\"scope\":\"bearclaw.operator\",\"device_id\":\"bearclaw-web\",\"exp\":4102444800}",
+    );
+    defer allocator.free(jwt);
+    const auth_header = try std.fmt.allocPrint(allocator, "Bearer {s}", .{jwt});
+    defer allocator.free(auth_header);
+
+    var api_authorized = try sendCurlRequest(allocator, tardigrade.port, .{
+        .scheme = "https",
+        .path = "/bearclaw/v1/chat",
+        .method = "POST",
+        .body = "{\"message\":\"hello\"}",
+        .headers = &.{
+            .{ .name = "Host", .value = "api.example.com" },
+            .{ .name = "Authorization", .value = auth_header },
+            .{ .name = "Content-Type", .value = "application/json" },
+        },
+        .insecure = true,
+    });
+    defer api_authorized.deinit();
+    try std.testing.expectEqual(@as(u16, 200), api_authorized.status_code);
+    try std.testing.expectEqual(@as(u32, 1), upstream.requestCount());
+    try std.testing.expectEqualStrings("user-42", upstream.capturedHeader("X-Tardigrade-User-ID").?);
+    try std.testing.expectEqualStrings("bearclaw-web", upstream.capturedHeader("X-Tardigrade-Device-ID").?);
+    try std.testing.expectEqualStrings("bearclaw.operator", upstream.capturedHeader("X-Tardigrade-Scopes").?);
+    try std.testing.expectEqualStrings("user-42", upstream.capturedHeader("X-Tardigrade-Auth-Identity").?);
+}
+
 const GenericFixtureDir = struct {
     allocator: std.mem.Allocator,
     dir_rel: []u8,

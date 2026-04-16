@@ -13,6 +13,12 @@ pub const RequestContext = struct {
     request_id: []const u8,
     /// Authenticated identity (bearer token hash, device id, etc.) or null.
     identity: ?[]const u8,
+    /// Asserted upstream-facing user identifier when auth carries one.
+    user_id: ?[]const u8,
+    /// Asserted upstream-facing device identifier when auth carries one.
+    device_id: ?[]const u8,
+    /// Space-delimited scopes asserted for the authenticated request.
+    scopes: ?[]const u8,
     /// Whether the request passed authentication.
     authenticated: bool,
     /// Monotonic start time for latency tracking (nanoseconds).
@@ -31,6 +37,9 @@ pub const RequestContext = struct {
             .allocator = allocator,
             .request_id = request_id,
             .identity = null,
+            .user_id = null,
+            .device_id = null,
+            .scopes = null,
             .authenticated = false,
             .started_ns = std.time.nanoTimestamp(),
             .started_ms = std.time.milliTimestamp(),
@@ -48,6 +57,21 @@ pub const RequestContext = struct {
     /// Set authenticated identity.
     pub fn setIdentity(self: *RequestContext, id: []const u8) void {
         self.identity = id;
+        self.authenticated = true;
+    }
+
+    /// Set the asserted auth context that will be forwarded upstream.
+    pub fn setAuthContext(
+        self: *RequestContext,
+        identity: []const u8,
+        user_id: ?[]const u8,
+        device_id: ?[]const u8,
+        scopes: ?[]const u8,
+    ) void {
+        self.identity = identity;
+        self.user_id = user_id;
+        self.device_id = device_id;
+        self.scopes = scopes;
         self.authenticated = true;
     }
 
@@ -114,6 +138,18 @@ test "RequestContext tracks timing and identity" {
     ctx.setIdentity("user-abc");
     try std.testing.expect(ctx.authenticated);
     try std.testing.expectEqualStrings("user-abc", ctx.identity.?);
+}
+
+test "RequestContext tracks asserted user scope context" {
+    const allocator = std.testing.allocator;
+    var ctx = RequestContext.init(allocator, "req-003", "127.0.0.1");
+
+    ctx.setAuthContext("user-42", "user-42", "bearclaw-web", "bearclaw.operator");
+    try std.testing.expect(ctx.authenticated);
+    try std.testing.expectEqualStrings("user-42", ctx.identity.?);
+    try std.testing.expectEqualStrings("user-42", ctx.user_id.?);
+    try std.testing.expectEqualStrings("bearclaw-web", ctx.device_id.?);
+    try std.testing.expectEqualStrings("bearclaw.operator", ctx.scopes.?);
 }
 
 test "RequestContext setApiVersion and setIdempotencyKey" {

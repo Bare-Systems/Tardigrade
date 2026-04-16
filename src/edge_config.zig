@@ -179,6 +179,9 @@ pub const EdgeConfig = struct {
     upstream_lb_algorithm: UpstreamLbAlgorithm,
     upstream_timeout_ms: u32,
     auth_request_url: []const u8,
+    jwt_secret: []const u8,
+    jwt_issuer: []const u8,
+    jwt_audience: []const u8,
     /// Requests per second per client IP (0 = disabled).
     rate_limit_rps: f64,
     /// Burst capacity for rate limiter.
@@ -429,6 +432,9 @@ pub const EdgeConfig = struct {
         for (self.upstream_commands_backup_base_urls) |u| allocator.free(u);
         allocator.free(self.upstream_commands_backup_base_urls);
         allocator.free(self.auth_request_url);
+        allocator.free(self.jwt_secret);
+        allocator.free(self.jwt_issuer);
+        allocator.free(self.jwt_audience);
         allocator.free(self.access_control_rules);
         allocator.free(self.proxy_cache_path);
         allocator.free(self.proxy_cache_key_template);
@@ -720,6 +726,12 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     const upstream_timeout_ms = std.fmt.parseInt(u32, timeout_str, 10) catch 10000;
     const auth_request_url = envOrDefault(allocator, "TARDIGRADE_AUTH_REQUEST_URL", "") catch unreachable;
     errdefer allocator.free(auth_request_url);
+    const jwt_secret = envOrDefault(allocator, "TARDIGRADE_JWT_SECRET", "") catch unreachable;
+    errdefer allocator.free(jwt_secret);
+    const jwt_issuer = envOrDefault(allocator, "TARDIGRADE_JWT_ISSUER", "") catch unreachable;
+    errdefer allocator.free(jwt_issuer);
+    const jwt_audience = envOrDefault(allocator, "TARDIGRADE_JWT_AUDIENCE", "") catch unreachable;
+    errdefer allocator.free(jwt_audience);
 
     const rate_rps_str = envOrDefault(allocator, "TARDIGRADE_RATE_LIMIT_RPS", "10") catch unreachable;
     defer allocator.free(rate_rps_str);
@@ -1231,6 +1243,9 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .upstream_lb_algorithm = upstream_lb_algorithm,
         .upstream_timeout_ms = upstream_timeout_ms,
         .auth_request_url = auth_request_url,
+        .jwt_secret = jwt_secret,
+        .jwt_issuer = jwt_issuer,
+        .jwt_audience = jwt_audience,
         .rate_limit_rps = rate_limit_rps,
         .rate_limit_burst = rate_limit_burst,
         .security_headers_enabled = security_headers_enabled,

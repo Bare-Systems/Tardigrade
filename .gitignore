@@ -19,7 +19,6 @@ secrets.txt
 # Agent Context
 changes/
 .cursor/
-AGENTS.md
 PLAN.md
 CLAUDE.md
 .claude/worktrees/

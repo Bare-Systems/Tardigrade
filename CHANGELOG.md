@@ -21,6 +21,11 @@
   - Added coverage for transcript persistence, transcript browser responses, and the failure mode where a bad transcript path logs a warning while the proxied request still succeeds.
 
 ### Added
+- Kubernetes deployment story: initial Helm chart and deployment guide (#29):
+  - `packaging/kubernetes/helm/tardigrade/` — full Helm chart: `Chart.yaml`, `values.yaml`, Deployment, Service, ServiceAccount, HPA, Ingress templates, and `_helpers.tpl`.
+  - TLS Secret mounting, ConfigMap config-file mounting, and `envFrom` Secret reference support.
+  - `packaging/kubernetes/README.md` — topology guide, Helm install/upgrade/TLS/secrets examples, hot reload via SIGHUP in-pod, and a Kubernetes support positioning table.
+  - Tardigrade is positioned as a standalone Deployment; Ingress controller and Gateway API controller modes are tracked as future work.
 - Benchmark and regression harness under `benchmarks/` (#28):
   - `benchmarks/run.sh` — multi-tool runner (wrk, h2load, fortio, k6 auto-detected) with configurable duration, connections, and scenario list.
   - Scenarios: `static-http1`, `proxy-http1`, `proxy-http2`, `keepalive`, `reload-under-load`.

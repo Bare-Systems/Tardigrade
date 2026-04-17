@@ -134,6 +134,18 @@ curl -s https://localhost:8443/tardigrade/reload/status
 # {"ok":null,"at_ms":null,"error":null}             # no reload attempted since start
 ```
 
+## Kubernetes
+
+A Helm chart and deployment guide live under [`packaging/kubernetes/`](packaging/kubernetes/).
+
+```bash
+helm install tardigrade ./deploy/kubernetes/helm/tardigrade \
+  --namespace tardigrade --create-namespace \
+  --set env.TARDIGRADE_UPSTREAM_BASE_URL=http://backend:8080
+```
+
+Tardigrade runs as a standalone reverse-proxy Deployment. It does not yet act as a Kubernetes Ingress controller or implement Gateway API semantics. See [`packaging/kubernetes/README.md`](packaging/kubernetes/README.md) for TLS mounting, config-file injection, secrets via `envFrom`, and hot-reload guidance.
+
 ## Blink Homelab Contract
 
 On `blink`, Tardigrade is the only public edge for the web surfaces:

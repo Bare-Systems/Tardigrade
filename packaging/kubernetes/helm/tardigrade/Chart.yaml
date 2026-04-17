@@ -1,0 +1,18 @@
+apiVersion: v2
+name: tardigrade
+description: Tardigrade edge gateway — TLS termination, reverse proxying, and realtime transport
+type: application
+version: 0.1.0
+appVersion: "0.50"
+home: https://github.com/Bare-Systems/Tardigrade
+sources:
+  - https://github.com/Bare-Systems/Tardigrade
+maintainers:
+  - name: Bare Systems
+    url: https://github.com/Bare-Systems
+keywords:
+  - gateway
+  - reverse-proxy
+  - tls
+  - edge
+  - zig

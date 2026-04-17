@@ -1,0 +1,122 @@
+# Default values for the Tardigrade Helm chart.
+# Override these in a values file or with --set on the command line.
+
+replicaCount: 1
+
+image:
+  repository: ghcr.io/bare-systems/tardigrade
+  pullPolicy: IfNotPresent
+  # Defaults to the chart appVersion when empty.
+  tag: ""
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  automount: true
+  annotations: {}
+  name: ""
+
+# Tardigrade configuration via environment variables.
+# Any TARDIGRADE_* variable can be set here.
+env:
+  TARDIGRADE_LISTEN_PORT: "8443"
+  TARDIGRADE_LOG_LEVEL: "info"
+  # Set these to configure reverse proxying:
+  # TARDIGRADE_UPSTREAM_BASE_URL: "http://backend-service:8080"
+  # TLS is expected to be provided via a mounted secret (see tls below).
+
+# Extra environment variables sourced from existing Secrets or ConfigMaps.
+envFrom: []
+# - secretRef:
+#     name: tardigrade-secrets
+
+# TLS certificate/key mounted as a Secret.
+# When enabled, the secret must contain keys "tls.crt" and "tls.key".
+tls:
+  enabled: false
+  secretName: ""
+  mountPath: /etc/tardigrade/tls
+  # Set these env vars to point Tardigrade at the mounted files:
+  certEnv: TARDIGRADE_TLS_CERT_PATH
+  keyEnv: TARDIGRADE_TLS_KEY_PATH
+
+# Config file mounted from a ConfigMap.
+# When enabled, the ConfigMap must contain a key "tardigrade.conf".
+config:
+  enabled: false
+  configMapName: ""
+  mountPath: /etc/tardigrade
+  filename: tardigrade.conf
+
+service:
+  type: ClusterIP
+  port: 8443
+  # Set to LoadBalancer and annotations for cloud LB integration.
+  annotations: {}
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: tardigrade.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 64Mi
+  limits:
+    cpu: 1000m
+    memory: 256Mi
+
+livenessProbe:
+  httpGet:
+    path: /health
+    port: http
+    scheme: HTTP
+  initialDelaySeconds: 5
+  periodSeconds: 15
+  failureThreshold: 3
+
+readinessProbe:
+  httpGet:
+    path: /health
+    port: http
+    scheme: HTTP
+  initialDelaySeconds: 3
+  periodSeconds: 10
+  failureThreshold: 2
+
+# Pod-level security context.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  fsGroup: 65532
+
+# Container-level security context.
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 5
+  targetCPUUtilizationPercentage: 75
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+podAnnotations: {}
+podLabels: {}

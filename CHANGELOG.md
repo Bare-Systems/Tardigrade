@@ -21,10 +21,14 @@
   - Added coverage for transcript persistence, transcript browser responses, and the failure mode where a bad transcript path logs a warning while the proxied request still succeeds.
 
 ### Added
+- `GET /tardigrade/reload/status` built-in route returns the last config reload outcome as JSON (`ok`, `at_ms`, `error`). On no reload since start, all fields are `null` (#26).
 - `install.sh` now downloads and verifies `tardigrade-checksums.txt` before extracting the release archive (#23). SHA-256 is checked with `sha256sum` (Linux) or `shasum -a 256` (macOS); a warning is printed and install continues if neither tool is available.
 - README links to the GitHub Releases page as the primary install surface.
 - `SECURITY.md` with supported-version policy, private vulnerability reporting instructions (GitHub advisory + email), response SLAs, coordinated disclosure process, and security fix release workflow (#24).
 - `README.md` links to security policy from the project overview.
+
+### Changed
+- `hotReloadConfig` now records the outcome of every reload attempt in `GatewayState` (`last_reload_ok`, `last_reload_at_ms`, `last_reload_error`). Previously outcomes were logged only (#26).
 
 ### Fixed
 - BearClaw route returning 404 (#21):

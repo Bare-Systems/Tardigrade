@@ -334,6 +334,13 @@ const GatewayState = struct {
     /// Max concurrent pending approval requests per identity (0 = unlimited).
     approval_max_pending_per_identity: u32,
     transcript_store_path: []const u8,
+    /// Reload state: set by hotReloadConfig on every attempt so operators can
+    /// query the outcome without tailing logs.
+    reload_mutex: std.Thread.Mutex = .{},
+    last_reload_ok: bool = false,
+    last_reload_at_ms: i64 = 0,
+    last_reload_error: [256]u8 = undefined,
+    last_reload_error_len: usize = 0,
 
     fn deinit(self: *GatewayState) void {
         if (self.rate_limiter) |*rl| rl.deinit();
@@ -2814,19 +2821,38 @@ fn hotReloadConfig(
     state: *GatewayState,
     reloaded_cfgs: *std.ArrayList(*edge_config.EdgeConfig),
 ) void {
+    const now_ms = std.time.milliTimestamp();
     const loaded = edge_config.loadFromEnv(allocator) catch |err| {
-        state.logger.warn(null, "config reload failed during validation: {}", .{err});
+        const msg = std.fmt.bufPrint(&state.last_reload_error, "load failed: {}", .{err}) catch "load failed";
+        state.reload_mutex.lock();
+        state.last_reload_ok = false;
+        state.last_reload_at_ms = now_ms;
+        state.last_reload_error_len = msg.len;
+        state.reload_mutex.unlock();
+        state.logger.warn(null, "config reload failed during load: {}", .{err});
         return;
     };
     edge_config.validate(&loaded) catch |err| {
         var rejected = loaded;
         rejected.deinit(allocator);
+        const msg = std.fmt.bufPrint(&state.last_reload_error, "validation rejected: {}", .{err}) catch "validation rejected";
+        state.reload_mutex.lock();
+        state.last_reload_ok = false;
+        state.last_reload_at_ms = now_ms;
+        state.last_reload_error_len = msg.len;
+        state.reload_mutex.unlock();
         state.logger.warn(null, "config reload rejected by validation: {}", .{err});
         return;
     };
     const cfg_ptr = allocator.create(edge_config.EdgeConfig) catch {
         var rejected = loaded;
         rejected.deinit(allocator);
+        state.reload_mutex.lock();
+        state.last_reload_ok = false;
+        state.last_reload_at_ms = now_ms;
+        @memcpy(state.last_reload_error[0..19], "allocation failed  ");
+        state.last_reload_error_len = 19;
+        state.reload_mutex.unlock();
         state.logger.warn(null, "config reload allocation failed", .{});
         return;
     };
@@ -2834,6 +2860,12 @@ fn hotReloadConfig(
     reloaded_cfgs.append(cfg_ptr) catch {
         cfg_ptr.deinit(allocator);
         allocator.destroy(cfg_ptr);
+        state.reload_mutex.lock();
+        state.last_reload_ok = false;
+        state.last_reload_at_ms = now_ms;
+        @memcpy(state.last_reload_error[0..21], "bookkeeping failed   ");
+        state.last_reload_error_len = 21;
+        state.reload_mutex.unlock();
         state.logger.warn(null, "config reload bookkeeping failed", .{});
         return;
     };
@@ -2848,6 +2880,11 @@ fn hotReloadConfig(
         .buffer_size_bytes = cfg_ptr.access_log_buffer_size,
         .syslog_udp_endpoint = cfg_ptr.access_log_syslog_udp,
     }) catch {};
+    state.reload_mutex.lock();
+    state.last_reload_ok = true;
+    state.last_reload_at_ms = now_ms;
+    state.last_reload_error_len = 0;
+    state.reload_mutex.unlock();
     state.logger.info(null, "configuration hot-reload applied", .{});
 }
 
@@ -3957,6 +3994,12 @@ fn routeRequest(
         return status;
     }
 
+    if (std.mem.eql(u8, request.uri.path, "/tardigrade/reload/status")) {
+        const status = try handleReloadStatusRoute(allocator, writer, state, correlation_id, keep_alive.*);
+        state.metricsRecord(status);
+        return status;
+    }
+
     if (http.location_router.matchLocation(request.uri.path, cfg.location_blocks)) |matched| {
         switch (matched.block.action) {
             .proxy_pass => |target| {
@@ -4073,6 +4116,40 @@ fn handleTranscriptRoute(
     }
 
     return null;
+}
+
+fn handleReloadStatusRoute(
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    state: *GatewayState,
+    correlation_id: []const u8,
+    keep_alive: bool,
+) !u16 {
+    state.reload_mutex.lock();
+    const ok = state.last_reload_ok;
+    const at_ms = state.last_reload_at_ms;
+    const err_slice = state.last_reload_error[0..state.last_reload_error_len];
+    state.reload_mutex.unlock();
+
+    const payload = if (at_ms == 0)
+        try std.fmt.allocPrint(allocator, "{{\"ok\":null,\"at_ms\":null,\"error\":null}}", .{})
+    else if (ok)
+        try std.fmt.allocPrint(allocator, "{{\"ok\":true,\"at_ms\":{d},\"error\":null}}", .{at_ms})
+    else
+        try std.fmt.allocPrint(allocator, "{{\"ok\":false,\"at_ms\":{d},\"error\":\"{s}\"}}", .{ at_ms, err_slice });
+    defer allocator.free(payload);
+
+    var response = http.Response.init(allocator);
+    defer response.deinit();
+    _ = response
+        .setStatus(.ok)
+        .setBody(payload)
+        .setContentType("application/json")
+        .setConnection(keep_alive)
+        .setHeader(http.correlation.HEADER_NAME, correlation_id);
+    applyResponseHeaders(state, &response);
+    try response.write(writer);
+    return 200;
 }
 
 fn normalizeTranscriptRoutePath(path: []const u8) ?[]const u8 {

@@ -110,8 +110,29 @@ Built-in operator endpoints:
 - `GET /status` returns runtime status JSON
 - `GET /metrics` returns Prometheus text metrics
 - `GET /status/metrics` returns JSON metrics
+- `GET /tardigrade/reload/status` returns last config reload outcome as JSON
 - `GET /bearclaw/transcripts` returns recent redacted BearClaw edge transcripts
 - `GET /bearclaw/transcripts/:id` returns one redacted transcript record
+
+### Config reload guarantees
+
+`tardigrade validate` pre-checks config and exits 0 on success or non-zero with an error message. Use this in deployment pipelines before signalling a live process.
+
+`tardigrade reload` sends `SIGHUP` to the running process. On receipt, Tardigrade:
+
+1. Loads and parses the candidate config.
+2. Validates it with the same logic as `tardigrade validate`.
+3. If validation fails — the running config is **unchanged**. The process logs `config reload rejected by validation: <reason>` and continues serving on the last-known-good config.
+4. If validation succeeds — the new config is **atomically activated** (a single pointer swap). In-flight requests complete under the old config.
+
+Check the reload outcome without reading logs:
+
+```bash
+curl -s https://localhost:8443/tardigrade/reload/status
+# {"ok":true,"at_ms":1713399600000,"error":null}   # last reload succeeded
+# {"ok":false,"at_ms":1713399500000,"error":"validation rejected: missing tls_cert_path"}
+# {"ok":null,"at_ms":null,"error":null}             # no reload attempted since start
+```
 
 ## Blink Homelab Contract
 

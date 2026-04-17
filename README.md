@@ -406,6 +406,23 @@ zig build test
 zig build test-integration
 ```
 
+## Benchmarks
+
+A repeatable benchmark and regression harness lives under `benchmarks/`.
+
+```bash
+# Run with wrk (or h2load/fortio/k6 — auto-detected)
+./benchmarks/run.sh --duration 30 --connections 50
+
+# Save a baseline for regression comparison
+./benchmarks/run.sh --save benchmarks/baselines/$(git describe --tags).json
+
+# Compare against a saved baseline (exit 2 = regression above threshold)
+./benchmarks/run.sh --baseline benchmarks/baselines/v0.50.json
+```
+
+See [`benchmarks/README.md`](benchmarks/README.md) for full usage, scenario descriptions, CI integration guidance, and test-host recommendations.
+
 ### Build for Production
 
 ```bash

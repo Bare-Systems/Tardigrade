@@ -21,6 +21,12 @@
   - Added coverage for transcript persistence, transcript browser responses, and the failure mode where a bad transcript path logs a warning while the proxied request still succeeds.
 
 ### Added
+- Benchmark and regression harness under `benchmarks/` (#28):
+  - `benchmarks/run.sh` — multi-tool runner (wrk, h2load, fortio, k6 auto-detected) with configurable duration, connections, and scenario list.
+  - Scenarios: `static-http1`, `proxy-http1`, `proxy-http2`, `keepalive`, `reload-under-load`.
+  - Baseline JSON save/compare with configurable regression threshold; exit code 2 signals regression.
+  - `benchmarks/README.md` — methodology, test-host recommendations, CI integration, and baseline file guidance.
+  - `benchmarks/baselines/` — directory for per-release JSON baseline files.
 - Platform support matrix and production-readiness section in README (#27, #32):
   - Explicit supported-target table (Linux x86_64/aarch64, macOS x86_64/arm64) with CI status notes.
   - Windows declared as unsupported with rationale (OpenSSL + POSIX signal dependency).

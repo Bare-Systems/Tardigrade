@@ -75,10 +75,13 @@ Pushes to `main` read the top semantic version in `CHANGELOG.md`. When that
 version has not been tagged yet, GitHub Actions creates the matching `vX.Y.Z`
 tag, publishes the GitHub release automatically, and uploads Linux x86_64,
 Linux aarch64, macOS x86_64, and macOS arm64 archives with a SHA-256 checksum
-manifest.
+manifest. The installer downloads and verifies `tardigrade-checksums.txt`
+before extracting the binary.
 
 The canonical command name is `tardigrade`. Release installs also provide a
 `tardi` alias for local convenience.
+
+All releases are available at **[github.com/Bare-Systems/Tardigrade/releases](https://github.com/Bare-Systems/Tardigrade/releases)**.
 
 ### Operator CLI
 

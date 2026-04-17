@@ -142,12 +142,45 @@ install_alias() {
   chmod 0755 "$alias_path"
 }
 
+checksum_url_for() {
+  if [ "$VERSION" = "latest" ]; then
+    printf 'https://github.com/%s/releases/latest/download/tardigrade-checksums.txt\n' "$REPO"
+  else
+    printf 'https://github.com/%s/releases/download/%s/tardigrade-checksums.txt\n' "$REPO" "$VERSION"
+  fi
+}
+
+verify_checksum() {
+  archive="$1"
+  checksums="$2"
+  expected="$(grep "$(basename "$archive")" "$checksums" | awk '{print $1}')"
+  if [ -z "$expected" ]; then
+    echo "warning: no checksum entry found for $(basename "$archive") — skipping verification" >&2
+    return
+  fi
+  if command -v sha256sum >/dev/null 2>&1; then
+    actual="$(sha256sum "$archive" | awk '{print $1}')"
+  elif command -v shasum >/dev/null 2>&1; then
+    actual="$(shasum -a 256 "$archive" | awk '{print $1}')"
+  else
+    echo "warning: sha256sum/shasum not found — skipping checksum verification" >&2
+    return
+  fi
+  if [ "$actual" != "$expected" ]; then
+    printf 'checksum mismatch for %s\n  expected: %s\n  got:      %s\n' \
+      "$(basename "$archive")" "$expected" "$actual" >&2
+    exit 1
+  fi
+}
+
 platform="$(detect_platform)"
 asset_url="$(download_url_for "$platform")"
+checksum_url="$(checksum_url_for)"
 
 if [ "$DRY_RUN" -eq 1 ]; then
   printf 'install_dir=%s\n' "$INSTALL_DIR"
   printf 'download_url=%s\n' "$asset_url"
+  printf 'checksum_url=%s\n' "$checksum_url"
   exit 0
 fi
 
@@ -155,7 +188,12 @@ tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT INT TERM
 
 archive_path="$tmpdir/tardigrade.tar.gz"
+checksums_path="$tmpdir/tardigrade-checksums.txt"
+
 download_file "$asset_url" "$archive_path"
+download_file "$checksum_url" "$checksums_path"
+verify_checksum "$archive_path" "$checksums_path"
+
 tar -xzf "$archive_path" -C "$tmpdir"
 
 mkdir -p "$INSTALL_DIR"

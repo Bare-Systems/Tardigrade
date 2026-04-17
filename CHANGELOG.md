@@ -21,6 +21,8 @@
   - Added coverage for transcript persistence, transcript browser responses, and the failure mode where a bad transcript path logs a warning while the proxied request still succeeds.
 
 ### Added
+- `install.sh` now downloads and verifies `tardigrade-checksums.txt` before extracting the release archive (#23). SHA-256 is checked with `sha256sum` (Linux) or `shasum -a 256` (macOS); a warning is printed and install continues if neither tool is available.
+- README links to the GitHub Releases page as the primary install surface.
 - `SECURITY.md` with supported-version policy, private vulnerability reporting instructions (GitHub advisory + email), response SLAs, coordinated disclosure process, and security fix release workflow (#24).
 - `README.md` links to security policy from the project overview.
 

@@ -68,10 +68,14 @@ curl -fsSL https://raw.githubusercontent.com/Bare-Systems/Tardigrade/main/script
   TARDIGRADE_VERSION=v0.7.0 TARDIGRADE_INSTALL_DIR=/usr/local/bin sh
 ```
 
+The installer auto-detects `x86_64-linux`, `aarch64-linux`, `x86_64-darwin`,
+and `arm64-darwin` release assets.
+
 Pushes to `main` read the top semantic version in `CHANGELOG.md`. When that
 version has not been tagged yet, GitHub Actions creates the matching `vX.Y.Z`
-tag, publishes the GitHub release automatically, and uploads Linux x86_64 plus
-macOS x86_64 and arm64 archives with a SHA-256 checksum manifest.
+tag, publishes the GitHub release automatically, and uploads Linux x86_64,
+Linux aarch64, macOS x86_64, and macOS arm64 archives with a SHA-256 checksum
+manifest.
 
 The canonical command name is `tardigrade`. Release installs also provide a
 `tardi` alias for local convenience.
@@ -103,6 +107,8 @@ Built-in operator endpoints:
 - `GET /status` returns runtime status JSON
 - `GET /metrics` returns Prometheus text metrics
 - `GET /status/metrics` returns JSON metrics
+- `GET /bearclaw/transcripts` returns recent redacted BearClaw edge transcripts
+- `GET /bearclaw/transcripts/:id` returns one redacted transcript record
 
 ## Blink Homelab Contract
 
@@ -195,7 +201,7 @@ Config file notes:
 | Name | Description | Default |
 |---|---|---|
 | `TARDIGRADE_TRUST_GATEWAY_ID` | Gateway identity sent in trusted upstream headers | `tardigrade-edge` |
-| `TARDIGRADE_TRUST_SHARED_SECRET` | Shared secret for signed upstream trust headers | empty |
+| `TARDIGRADE_TRUST_SHARED_SECRET` | Shared secret for signed upstream trust headers and sticky affinity cookies | empty |
 | `TARDIGRADE_TRUSTED_UPSTREAM_IDENTITIES` | Allowed trusted upstream identities or hosts | empty |
 | `TARDIGRADE_TRUST_REQUIRE_UPSTREAM_IDENTITY` | Require trusted upstream identity verification | `false` |
 | `TARDIGRADE_UPSTREAM_BASE_URL` | Primary upstream base URL | `http://127.0.0.1:8080` |
@@ -239,6 +245,8 @@ Config file notes:
 | `TARDIGRADE_UPSTREAM_TLS_CLIENT_CERT` | Path to PEM client certificate for mTLS upstream connections | empty |
 | `TARDIGRADE_UPSTREAM_TLS_CLIENT_KEY` | Path to PEM private key paired with `TARDIGRADE_UPSTREAM_TLS_CLIENT_CERT` | empty |
 
+When `TARDIGRADE_TRUST_SHARED_SECRET` is set and a relative proxy target has more than one eligible upstream, Tardigrade emits a per-host, per-location sticky cookie to keep repeat requests on the same healthy backend. The cookie is HMAC-signed, ignored if tampered, rotated when the mapped backend turns unhealthy, and written with `HttpOnly`, `Secure`, and `SameSite=Lax`.
+
 #### Authentication and Access Control
 
 | Name | Description | Default |
@@ -249,14 +257,14 @@ Config file notes:
 | `TARDIGRADE_JWT_ISSUER` | Required `iss` claim when JWT auth is enabled | empty |
 | `TARDIGRADE_JWT_AUDIENCE` | Required `aud` claim when JWT auth is enabled | empty |
 | `TARDIGRADE_SESSION_STORE_PATH` | Optional JSON file for persisted gateway sessions | empty |
-| `TARDIGRADE_TRANSCRIPT_STORE_PATH` | Optional NDJSON file for persisted gateway chat/command transcripts | empty |
+| `TARDIGRADE_TRANSCRIPT_STORE_PATH` | Optional owner-only NDJSON file for persisted, redacted gateway chat/command transcripts | empty |
 
 #### Request Handling, Limits, and Connection Management
 
 | Name | Description | Default |
 |---|---|---|
-| `TARDIGRADE_RATE_LIMIT_RPS` | Per-IP rate limit requests per second | `10` |
-| `TARDIGRADE_RATE_LIMIT_BURST` | Rate limiter burst capacity | `20` |
+| `TARDIGRADE_RATE_LIMIT_RPS` | Per-descriptor rate limit requests per second; authenticated BearClaw API traffic uses asserted identity and other traffic falls back to client IP | `10` |
+| `TARDIGRADE_RATE_LIMIT_BURST` | Rate limiter burst capacity per descriptor | `20` |
 | `TARDIGRADE_SECURITY_HEADERS` | Enable default security headers | `true` |
 | `TARDIGRADE_IDEMPOTENCY_TTL` | Idempotency cache TTL in seconds | `300` |
 | `TARDIGRADE_GEO_BLOCKED_COUNTRIES` | Comma-separated blocked ISO country codes | empty |

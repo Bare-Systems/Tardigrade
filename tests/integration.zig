@@ -1648,6 +1648,11 @@ fn headerValue(headers_raw: []const u8, name: []const u8) ?[]const u8 {
     return null;
 }
 
+fn cookiePairFromSetCookie(set_cookie: []const u8) []const u8 {
+    const end = std.mem.indexOfScalar(u8, set_cookie, ';') orelse set_cookie.len;
+    return std.mem.trim(u8, set_cookie[0..end], " \t\r\n");
+}
+
 fn sendRequest(allocator: std.mem.Allocator, port: u16, spec: RequestSpec) !HttpResponse {
     var stream = try openRequestStream(allocator, port, spec);
     defer stream.close();
@@ -2443,7 +2448,80 @@ test "bearclaw fixture serves chat over https with bearer auth and transcript pe
     defer allocator.free(transcript);
     try assertContains(transcript, "\"scope\":\"chat\"");
     try assertContains(transcript, "\"route\":\"/v1/chat\"");
-    try assertContains(transcript, valid_bearer_hash);
+    try std.testing.expect(std.mem.indexOf(u8, transcript, valid_bearer_token) == null);
+
+    var transcript_list = try sendCurlRequest(allocator, tardigrade.port, .{
+        .scheme = "https",
+        .path = "/bearclaw/transcripts?limit=5",
+        .method = "GET",
+        .headers = &.{
+            .{ .name = "Host", .value = "api.example.com" },
+            .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
+        },
+        .insecure = true,
+    });
+    defer transcript_list.deinit();
+    try std.testing.expectEqual(@as(u16, 200), transcript_list.status_code);
+    try assertContains(transcript_list.body, "\"transcripts\":[");
+    try assertContains(transcript_list.body, "\"route\":\"/v1/chat\"");
+
+    var transcript_detail = try sendCurlRequest(allocator, tardigrade.port, .{
+        .scheme = "https",
+        .path = "/bearclaw/transcripts/1",
+        .method = "GET",
+        .headers = &.{
+            .{ .name = "Host", .value = "api.example.com" },
+            .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
+        },
+        .insecure = true,
+    });
+    defer transcript_detail.deinit();
+    try std.testing.expectEqual(@as(u16, 200), transcript_detail.status_code);
+    try assertContains(transcript_detail.body, "\"transcript\":{");
+    try assertContains(transcript_detail.body, "\"request_body\":\"{\\\"message\\\":\\\"hello\\\"}\"");
+}
+
+test "bearclaw transcript append logs path errors without failing the request" {
+    const allocator = std.testing.allocator;
+
+    var upstream = try UpstreamServer.start(allocator, &.{.{
+        .body = "{\"ok\":true,\"source\":\"bearclaw-upstream\"}",
+        .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
+    }});
+    defer upstream.stop();
+    try upstream.run();
+
+    var options = bearClawProfile(baseOptions(upstream.port()));
+    options.ready_https_insecure = true;
+    options.extra_env = &.{
+        .{ .name = "TARDIGRADE_TRANSCRIPT_STORE_PATH", .value = "/" },
+    };
+
+    var tardigrade = try TardigradeProcess.start(allocator, options);
+    defer tardigrade.stop();
+
+    var authorized = try sendCurlRequest(allocator, tardigrade.port, .{
+        .scheme = "https",
+        .path = "/bearclaw/v1/chat",
+        .method = "POST",
+        .body = "{\"message\":\"hello\"}",
+        .headers = &.{
+            .{ .name = "Host", .value = "api.example.com" },
+            .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
+            .{ .name = "Content-Type", .value = "application/json" },
+        },
+        .insecure = true,
+    });
+    defer authorized.deinit();
+    try std.testing.expectEqual(@as(u16, 200), authorized.status_code);
+    try assertContains(authorized.body, "\"source\":\"bearclaw-upstream\"");
+
+    std.time.sleep(100 * std.time.ns_per_ms);
+    const log_file = try std.fs.openFileAbsolute(tardigrade.log_path, .{});
+    defer log_file.close();
+    const log_data = try log_file.readToEndAlloc(allocator, 256 * 1024);
+    defer allocator.free(log_data);
+    try assertContains(log_data, "transcript store append failed");
 }
 
 // TC-TARDIGRADE-002 + TC-TARDIGRADE-004
@@ -2586,6 +2664,287 @@ test "bearclaw jwt auth forwards asserted identity headers upstream" {
     try std.testing.expectEqualStrings("bearclaw-web", upstream.capturedHeader("X-Tardigrade-Device-ID").?);
     try std.testing.expectEqualStrings("bearclaw.operator", upstream.capturedHeader("X-Tardigrade-Scopes").?);
     try std.testing.expectEqualStrings("user-42", upstream.capturedHeader("X-Tardigrade-Auth-Identity").?);
+}
+
+test "bearclaw rate limiting uses asserted identity for shared nat clients" {
+    const allocator = std.testing.allocator;
+
+    var upstream = try UpstreamServer.start(allocator, &.{
+        .{ .body = "{\"ok\":true,\"user\":\"user-42\"}", .headers = &.{.{ .name = "Content-Type", .value = "application/json" }} },
+        .{ .body = "{\"ok\":true,\"user\":\"user-84\"}", .headers = &.{.{ .name = "Content-Type", .value = "application/json" }} },
+    });
+    defer upstream.stop();
+    try upstream.run();
+
+    var options = bearClawProfile(baseOptions(upstream.port()));
+    options.ready_https_insecure = true;
+    options.auth_token_hashes = null;
+    options.rate_limit_rps = "0.001";
+    options.rate_limit_burst = "1";
+    options.extra_env = &.{
+        .{ .name = "TARDIGRADE_JWT_SECRET", .value = "stage-3a-secret" },
+        .{ .name = "TARDIGRADE_JWT_ISSUER", .value = "bearclaw-web" },
+        .{ .name = "TARDIGRADE_JWT_AUDIENCE", .value = "bearclaw-api" },
+    };
+
+    var tardigrade = try TardigradeProcess.start(allocator, options);
+    defer tardigrade.stop();
+
+    const jwt_a = try hs256Jwt(
+        allocator,
+        "stage-3a-secret",
+        "{\"sub\":\"user-42\",\"iss\":\"bearclaw-web\",\"aud\":\"bearclaw-api\",\"scope\":\"bearclaw.operator\",\"device_id\":\"bearclaw-web\",\"exp\":4102444800}",
+    );
+    defer allocator.free(jwt_a);
+    const jwt_b = try hs256Jwt(
+        allocator,
+        "stage-3a-secret",
+        "{\"sub\":\"user-84\",\"iss\":\"bearclaw-web\",\"aud\":\"bearclaw-api\",\"scope\":\"bearclaw.operator\",\"device_id\":\"bearclaw-web\",\"exp\":4102444800}",
+    );
+    defer allocator.free(jwt_b);
+    const auth_a = try std.fmt.allocPrint(allocator, "Bearer {s}", .{jwt_a});
+    defer allocator.free(auth_a);
+    const auth_b = try std.fmt.allocPrint(allocator, "Bearer {s}", .{jwt_b});
+    defer allocator.free(auth_b);
+
+    var first_a = try sendCurlRequest(allocator, tardigrade.port, .{
+        .scheme = "https",
+        .path = "/bearclaw/v1/chat",
+        .method = "POST",
+        .body = "{\"message\":\"hello from user 42\"}",
+        .headers = &.{
+            .{ .name = "Host", .value = "api.example.com" },
+            .{ .name = "Authorization", .value = auth_a },
+            .{ .name = "Content-Type", .value = "application/json" },
+        },
+        .insecure = true,
+    });
+    defer first_a.deinit();
+    try std.testing.expectEqual(@as(u16, 200), first_a.status_code);
+
+    var second_a = try sendCurlRequest(allocator, tardigrade.port, .{
+        .scheme = "https",
+        .path = "/bearclaw/v1/chat",
+        .method = "POST",
+        .body = "{\"message\":\"second request same identity\"}",
+        .headers = &.{
+            .{ .name = "Host", .value = "api.example.com" },
+            .{ .name = "Authorization", .value = auth_a },
+            .{ .name = "Content-Type", .value = "application/json" },
+        },
+        .insecure = true,
+    });
+    defer second_a.deinit();
+    try std.testing.expectEqual(@as(u16, 429), second_a.status_code);
+
+    var first_b = try sendCurlRequest(allocator, tardigrade.port, .{
+        .scheme = "https",
+        .path = "/bearclaw/v1/chat",
+        .method = "POST",
+        .body = "{\"message\":\"hello from user 84\"}",
+        .headers = &.{
+            .{ .name = "Host", .value = "api.example.com" },
+            .{ .name = "Authorization", .value = auth_b },
+            .{ .name = "Content-Type", .value = "application/json" },
+        },
+        .insecure = true,
+    });
+    defer first_b.deinit();
+    try std.testing.expectEqual(@as(u16, 200), first_b.status_code);
+    try std.testing.expectEqual(@as(u32, 2), upstream.requestCount());
+}
+
+test "sticky affinity cookie pins relative proxy_pass upstream and sets secure defaults" {
+    const allocator = std.testing.allocator;
+
+    var first_upstream = try UpstreamServer.start(allocator, &.{
+        .{ .body = "first-upstream-a" },
+        .{ .body = "first-upstream-b" },
+    });
+    defer first_upstream.stop();
+    try first_upstream.run();
+
+    var second_upstream = try UpstreamServer.start(allocator, &.{.{ .body = "second-upstream" }});
+    defer second_upstream.stop();
+    try second_upstream.run();
+
+    const upstream_urls = try std.fmt.allocPrint(
+        allocator,
+        "http://{s}:{d},http://{s}:{d}",
+        .{ test_host, first_upstream.port(), test_host, second_upstream.port() },
+    );
+    defer allocator.free(upstream_urls);
+    const config_text = try allocator.dupe(
+        u8,
+        \\location /sticky/ {
+        \\    proxy_pass /upstream/;
+        \\}
+    );
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_UPSTREAM_BASE_URLS", .value = upstream_urls },
+            .{ .name = "TARDIGRADE_UPSTREAM_LB_ALGORITHM", .value = "round_robin" },
+            .{ .name = "TARDIGRADE_TRUST_SHARED_SECRET", .value = "stage-3b-secret" },
+        },
+    });
+    defer tardigrade.stop();
+
+    var first_response = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/sticky/demo",
+        .body = null,
+        .headers = &.{},
+    });
+    defer first_response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), first_response.status_code);
+    const set_cookie = first_response.header("Set-Cookie") orelse return error.MissingSetCookie;
+    try std.testing.expect(std.mem.indexOf(u8, set_cookie, "HttpOnly") != null);
+    try std.testing.expect(std.mem.indexOf(u8, set_cookie, "Secure") != null);
+    try std.testing.expect(std.mem.indexOf(u8, set_cookie, "SameSite=Lax") != null);
+
+    var second_response = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/sticky/demo",
+        .body = null,
+        .headers = &.{.{ .name = "Cookie", .value = cookiePairFromSetCookie(set_cookie) }},
+    });
+    defer second_response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), second_response.status_code);
+    try std.testing.expectEqual(@as(u32, 2), first_upstream.requestCount());
+    try std.testing.expectEqual(@as(u32, 0), second_upstream.requestCount());
+}
+
+test "sticky affinity ignores tampered cookie and rotates to a healthy upstream" {
+    const allocator = std.testing.allocator;
+
+    var first_upstream = try UpstreamServer.start(allocator, &.{.{ .body = "first-upstream" }});
+    defer first_upstream.stop();
+    try first_upstream.run();
+
+    var second_upstream = try UpstreamServer.start(allocator, &.{.{ .body = "second-upstream" }});
+    defer second_upstream.stop();
+    try second_upstream.run();
+
+    const upstream_urls = try std.fmt.allocPrint(
+        allocator,
+        "http://{s}:{d},http://{s}:{d}",
+        .{ test_host, first_upstream.port(), test_host, second_upstream.port() },
+    );
+    defer allocator.free(upstream_urls);
+    const config_text = try allocator.dupe(
+        u8,
+        \\location /sticky/ {
+        \\    proxy_pass /upstream/;
+        \\}
+    );
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_UPSTREAM_BASE_URLS", .value = upstream_urls },
+            .{ .name = "TARDIGRADE_UPSTREAM_LB_ALGORITHM", .value = "round_robin" },
+            .{ .name = "TARDIGRADE_TRUST_SHARED_SECRET", .value = "stage-3b-secret" },
+        },
+    });
+    defer tardigrade.stop();
+
+    var first_response = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/sticky/demo",
+        .body = null,
+        .headers = &.{},
+    });
+    defer first_response.deinit();
+    const cookie_pair = cookiePairFromSetCookie(first_response.header("Set-Cookie") orelse return error.MissingSetCookie);
+    const tampered_cookie = try allocator.dupe(u8, cookie_pair);
+    defer allocator.free(tampered_cookie);
+    tampered_cookie[tampered_cookie.len - 1] = if (tampered_cookie[tampered_cookie.len - 1] == 'a') 'b' else 'a';
+
+    var second_response = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/sticky/demo",
+        .body = null,
+        .headers = &.{.{ .name = "Cookie", .value = tampered_cookie }},
+    });
+    defer second_response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), second_response.status_code);
+    try std.testing.expectEqual(@as(u32, 1), first_upstream.requestCount());
+    try std.testing.expectEqual(@as(u32, 1), second_upstream.requestCount());
+}
+
+test "sticky affinity remaps unhealthy upstream cookies to a healthy backend" {
+    const allocator = std.testing.allocator;
+
+    var first_upstream = try UpstreamServer.start(allocator, &.{
+        .{ .status_code = 200, .body = "first-upstream" },
+        .{ .status_code = 500, .body = "first-failed" },
+    });
+    defer first_upstream.stop();
+    try first_upstream.run();
+
+    var second_upstream = try UpstreamServer.start(allocator, &.{.{ .status_code = 200, .body = "second-upstream" }});
+    defer second_upstream.stop();
+    try second_upstream.run();
+
+    const upstream_urls = try std.fmt.allocPrint(
+        allocator,
+        "http://{s}:{d},http://{s}:{d}",
+        .{ test_host, first_upstream.port(), test_host, second_upstream.port() },
+    );
+    defer allocator.free(upstream_urls);
+    const config_text = try allocator.dupe(
+        u8,
+        \\location /sticky/ {
+        \\    proxy_pass /upstream/;
+        \\}
+    );
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_UPSTREAM_BASE_URLS", .value = upstream_urls },
+            .{ .name = "TARDIGRADE_UPSTREAM_LB_ALGORITHM", .value = "round_robin" },
+            .{ .name = "TARDIGRADE_TRUST_SHARED_SECRET", .value = "stage-3b-secret" },
+            .{ .name = "TARDIGRADE_UPSTREAM_MAX_FAILS", .value = "1" },
+            .{ .name = "TARDIGRADE_UPSTREAM_FAIL_TIMEOUT_MS", .value = "60000" },
+        },
+    });
+    defer tardigrade.stop();
+
+    var first_response = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/sticky/demo",
+        .body = null,
+        .headers = &.{},
+    });
+    defer first_response.deinit();
+    const cookie_pair = cookiePairFromSetCookie(first_response.header("Set-Cookie") orelse return error.MissingSetCookie);
+
+    var second_response = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/sticky/demo",
+        .body = null,
+        .headers = &.{.{ .name = "Cookie", .value = cookie_pair }},
+    });
+    defer second_response.deinit();
+    try std.testing.expectEqual(@as(u16, 500), second_response.status_code);
+
+    var third_response = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/sticky/demo",
+        .body = null,
+        .headers = &.{.{ .name = "Cookie", .value = cookie_pair }},
+    });
+    defer third_response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), third_response.status_code);
+    try std.testing.expectEqual(@as(u32, 2), first_upstream.requestCount());
+    try std.testing.expectEqual(@as(u32, 1), second_upstream.requestCount());
+    try std.testing.expect(!std.mem.eql(u8, cookie_pair, cookiePairFromSetCookie(third_response.header("Set-Cookie") orelse return error.MissingSetCookie)));
 }
 
 const GenericFixtureDir = struct {

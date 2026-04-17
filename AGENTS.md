@@ -29,6 +29,8 @@ as the canonical BearClaw-facing edge shape.
     `/health` without bearer auth.
   - `/bearclaw/v1/*` strips the `/bearclaw` mount and proxies to upstream
     `/v1/*` with bearer auth enforced at Tardigrade.
+  - `GET /bearclaw/transcripts` and `GET /bearclaw/transcripts/:id` expose the
+    redacted transcript browser payloads that BearClawWeb renders for operators.
 - Required auth headers:
   - Protected API requests use `Authorization: Bearer <raw-token>`.
   - BearClawWeb can also send HS256 JWT bearer tokens with `sub`, `scope`, and
@@ -36,6 +38,17 @@ as the canonical BearClaw-facing edge shape.
   - Session-authenticated requests use `X-Session-Token: <64-lowercase-hex>`.
   - Device-authenticated requests use `X-Device-ID`, `X-Device-Timestamp`, and
     `X-Device-Signature`.
+- Rate limiting:
+  - Authenticated BearClaw API requests are rate-limited by asserted identity,
+    not by raw client IP alone.
+  - Unauthenticated traffic falls back to an IP-based descriptor.
+  - Idle limiter buckets are evicted automatically to keep memory bounded.
+- Sticky upstream affinity:
+  - When multiple upstreams are configured for a relative proxy target,
+    Tardigrade issues a per-host, per-location HMAC-signed sticky cookie.
+  - The cookie is emitted as `HttpOnly`, `Secure`, and `SameSite=Lax`.
+  - Tampered cookies are ignored, and cookies pointing at unhealthy upstreams
+    are remapped to a healthy backend and rotated.
 - Bearer token hashing:
   - `TARDIGRADE_AUTH_TOKEN_HASHES` stores lowercase SHA-256 hashes of the raw
     bearer tokens, never the raw tokens themselves.
@@ -58,9 +71,9 @@ as the canonical BearClaw-facing edge shape.
   - Each line records `ts_ms`, `scope`, `route`, `correlation_id`, `identity`,
     `client_ip`, `upstream_url`, request body, response status,
     response content type, and response body.
-  - Transcript files can contain token hashes, request payloads, and model
-    output; keep them outside the web root and lock permissions down to the
-    Tardigrade operator account.
+  - Raw bearer tokens and raw JWT values are redacted before write.
+  - The transcript file is owned by the Tardigrade service account with
+    owner-only permissions.
 - Upstream header forwarding:
   - Tardigrade forwards `X-Correlation-ID`, `X-Forwarded-For`, `X-Real-IP`,
     `X-Forwarded-Proto`, and `X-Forwarded-Host` to BearClaw.

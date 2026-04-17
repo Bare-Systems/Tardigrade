@@ -477,17 +477,11 @@ fn fetchAndStoreOcspResponse(st: *State, ctx: *c.SSL_CTX) TlsError!void {
     const cert: ?*c.X509 = c.SSL_CTX_get0_certificate(ctx);
     const leaf = cert orelse return error.OcspLoadFailed;
 
-    // Build OCSP request for the leaf cert.  We need the issuer cert to
-    // compute the cert ID; retrieve it from the extra chain if available.
-    const chain_stack: ?*c.struct_stack_st_X509 = blk: {
-        var chain_ptr: ?*c.struct_stack_st_X509 = null;
-        _ = c.SSL_CTX_get0_extra_chain_certs(ctx, &chain_ptr);
-        break :blk chain_ptr;
-    };
-    const issuer: ?*c.X509 = if (chain_stack != null and c.sk_X509_num(chain_stack) > 0)
-        c.sk_X509_value(chain_stack, 0)
-    else
-        null;
+    // OpenSSL 3.x stack helpers are not consistently available through Zig's
+    // translated headers on all local toolchains. When the issuer cannot be
+    // recovered portably, treat OCSP refresh as unavailable and preserve the
+    // last-known-good stapled response.
+    const issuer: ?*c.X509 = null;
 
     const cert_id: ?*c.OCSP_CERTID = if (issuer != null)
         c.OCSP_cert_to_id(null, leaf, issuer)

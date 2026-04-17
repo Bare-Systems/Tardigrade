@@ -56,25 +56,36 @@ detect_platform() {
   os="$(uname -s)"
   arch="$(uname -m)"
 
-  case "$os" in
-    Linux) os="linux" ;;
-    Darwin) os="darwin" ;;
+  case "$os/$arch" in
+    Linux/x86_64|Linux/amd64)
+      printf '%s\n' "linux-x86_64"
+      return
+      ;;
+    Linux/arm64|Linux/aarch64)
+      printf '%s\n' "linux-aarch64"
+      return
+      ;;
+    Darwin/x86_64|Darwin/amd64)
+      printf '%s\n' "darwin-x86_64"
+      return
+      ;;
+    Darwin/arm64|Darwin/aarch64)
+      printf '%s\n' "darwin-arm64"
+      return
+      ;;
+    Linux/*)
+      echo "unsupported architecture: $arch" >&2
+      exit 1
+      ;;
+    Darwin/*)
+      echo "unsupported architecture: $arch" >&2
+      exit 1
+      ;;
     *)
       echo "unsupported operating system: $os" >&2
       exit 1
       ;;
   esac
-
-  case "$arch" in
-    x86_64|amd64) arch="x86_64" ;;
-    arm64|aarch64) arch="arm64" ;;
-    *)
-      echo "unsupported architecture: $arch" >&2
-      exit 1
-      ;;
-  esac
-
-  printf '%s-%s\n' "$os" "$arch"
 }
 
 download_url_for() {

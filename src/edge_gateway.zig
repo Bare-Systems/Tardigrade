@@ -80,6 +80,24 @@ const UpstreamPoolView = struct {
     backup_urls: []const []const u8,
 };
 
+const StickyAffinityRequest = struct {
+    location_key: []u8,
+    cookie_name: []u8,
+    requested_upstream: ?[]u8,
+
+    fn deinit(self: *StickyAffinityRequest, allocator: std.mem.Allocator) void {
+        allocator.free(self.location_key);
+        allocator.free(self.cookie_name);
+        if (self.requested_upstream) |value| allocator.free(value);
+        self.* = undefined;
+    }
+};
+
+const StickyUpstreamSelection = struct {
+    base_url: []const u8,
+    used_requested: bool,
+};
+
 const CommandLifecycleStatus = enum {
     pending,
     running,
@@ -566,11 +584,11 @@ const GatewayState = struct {
         }
     }
 
-    fn rateLimitAllow(self: *GatewayState, client_ip: []const u8) bool {
+    fn rateLimitAllow(self: *GatewayState, descriptor: []const u8) bool {
         self.rate_limiter_mutex.lock();
         defer self.rate_limiter_mutex.unlock();
         if (self.rate_limiter) |*rl| {
-            return rl.allow(client_ip) != null;
+            return rl.allow(descriptor) != null;
         }
         return true;
     }
@@ -782,6 +800,7 @@ const GatewayState = struct {
         response_status: u16,
         response_content_type: []const u8,
         response_body: []const u8,
+        redacted_values: []const []const u8,
     ) void {
         if (self.transcript_store_path.len == 0) return;
         self.transcript_mutex.lock();
@@ -798,7 +817,7 @@ const GatewayState = struct {
             .response_status = response_status,
             .response_content_type = response_content_type,
             .response_body = response_body,
-        }) catch |err| {
+        }, redacted_values) catch |err| {
             self.logger.warn(correlation_id, "transcript store append failed: {}", .{err});
         };
     }
@@ -1263,10 +1282,44 @@ const GatewayState = struct {
     fn nextUpstreamBaseUrl(self: *GatewayState, cfg: *const edge_config.EdgeConfig, pool: UpstreamPoolView, client_ip: []const u8, hash_key: []const u8) []const u8 {
         self.upstream_mutex.lock();
         defer self.upstream_mutex.unlock();
-        if (pool.primary_urls.len == 0) {
-            return self.selectPrimaryFallbackWithBackupsLocked(cfg, pool, http.event_loop.monotonicMs());
-        }
+        return self.nextUpstreamBaseUrlLocked(cfg, pool, client_ip, hash_key, http.event_loop.monotonicMs());
+    }
+
+    fn nextStickyUpstreamBaseUrl(
+        self: *GatewayState,
+        cfg: *const edge_config.EdgeConfig,
+        pool: UpstreamPoolView,
+        client_ip: []const u8,
+        hash_key: []const u8,
+        requested_upstream: ?[]const u8,
+    ) StickyUpstreamSelection {
+        self.upstream_mutex.lock();
+        defer self.upstream_mutex.unlock();
         const now_ms = http.event_loop.monotonicMs();
+
+        if (requested_upstream) |candidate| {
+            if (self.isStickyUpstreamHealthyLocked(cfg, pool, candidate, now_ms)) {
+                return .{ .base_url = candidate, .used_requested = true };
+            }
+        }
+
+        return .{
+            .base_url = self.nextUpstreamBaseUrlLocked(cfg, pool, client_ip, hash_key, now_ms),
+            .used_requested = false,
+        };
+    }
+
+    fn nextUpstreamBaseUrlLocked(
+        self: *GatewayState,
+        cfg: *const edge_config.EdgeConfig,
+        pool: UpstreamPoolView,
+        client_ip: []const u8,
+        hash_key: []const u8,
+        now_ms: u64,
+    ) []const u8 {
+        if (pool.primary_urls.len == 0) {
+            return self.selectPrimaryFallbackWithBackupsLocked(cfg, pool, now_ms);
+        }
 
         switch (cfg.upstream_lb_algorithm) {
             .least_connections => {
@@ -1322,6 +1375,33 @@ const GatewayState = struct {
         }
 
         return self.selectPrimaryFallbackWithBackupsLocked(cfg, pool, now_ms);
+    }
+
+    fn isStickyUpstreamHealthyLocked(self: *GatewayState, cfg: *const edge_config.EdgeConfig, pool: UpstreamPoolView, candidate: []const u8, now_ms: u64) bool {
+        for (pool.primary_urls, 0..) |upstream, idx| {
+            if (!std.mem.eql(u8, upstream, candidate)) continue;
+            if (!self.isUpstreamHealthyLocked(cfg, upstream, now_ms)) return false;
+            if (self.slowStartAllowsTrafficLocked(cfg, upstream, now_ms, @intCast(idx))) return true;
+        }
+        for (pool.primary_urls) |upstream| {
+            if (std.mem.eql(u8, upstream, candidate)) {
+                return self.isUpstreamHealthyLocked(cfg, upstream, now_ms);
+            }
+        }
+        for (pool.backup_urls, 0..) |upstream, idx| {
+            if (!std.mem.eql(u8, upstream, candidate)) continue;
+            if (!self.isUpstreamHealthyLocked(cfg, upstream, now_ms)) return false;
+            if (self.slowStartAllowsTrafficLocked(cfg, upstream, now_ms, @intCast(idx))) return true;
+        }
+        for (pool.backup_urls) |upstream| {
+            if (std.mem.eql(u8, upstream, candidate)) {
+                return self.isUpstreamHealthyLocked(cfg, upstream, now_ms);
+            }
+        }
+        if (std.mem.eql(u8, pool.fallback_url, candidate)) {
+            return self.isUpstreamHealthyLocked(cfg, candidate, now_ms);
+        }
+        return false;
     }
 
     fn selectLeastConnectionsUpstreamLocked(self: *GatewayState, cfg: *const edge_config.EdgeConfig, pool: UpstreamPoolView, now_ms: u64) ?[]const u8 {
@@ -1854,6 +1934,153 @@ fn upstreamPoolForScope(cfg: *const edge_config.EdgeConfig, scope: UpstreamScope
             .backup_urls = cfg.upstream_backup_base_urls,
         },
     };
+}
+
+fn stickyCookieSecret(cfg: *const edge_config.EdgeConfig) []const u8 {
+    if (cfg.trust_shared_secret.len > 0) return cfg.trust_shared_secret;
+    if (cfg.jwt_secret.len > 0) return cfg.jwt_secret;
+    return "";
+}
+
+fn stickyAffinityEligible(cfg: *const edge_config.EdgeConfig, pool: UpstreamPoolView, proxy_pass_target: []const u8) bool {
+    if (stickyCookieSecret(cfg).len == 0) return false;
+    if (isAbsoluteHttpUrl(std.mem.trim(u8, proxy_pass_target, " \t\r\n"))) return false;
+
+    var upstreams: usize = pool.primary_urls.len + pool.backup_urls.len;
+    if (upstreams == 0 and pool.fallback_url.len > 0) upstreams = 1;
+    return upstreams > 1;
+}
+
+fn prepareStickyAffinityRequest(
+    allocator: std.mem.Allocator,
+    cfg: *const edge_config.EdgeConfig,
+    pool: UpstreamPoolView,
+    headers: *const http.Headers,
+    incoming_host: ?[]const u8,
+    location_id: []const u8,
+    proxy_pass_target: []const u8,
+) !?StickyAffinityRequest {
+    if (!stickyAffinityEligible(cfg, pool, proxy_pass_target)) return null;
+
+    const host = if (incoming_host) |value|
+        std.mem.trim(u8, value, " \t\r\n")
+    else
+        "";
+    const normalized_host = if (host.len > 0) host else "-";
+    const location_key = try std.fmt.allocPrint(allocator, "{s}|{s}", .{ normalized_host, location_id });
+    errdefer allocator.free(location_key);
+    const cookie_name = try affinityCookieName(allocator, location_key);
+    errdefer allocator.free(cookie_name);
+    const requested_upstream = try parseStickyCookieUpstream(allocator, cfg, headers, location_key, cookie_name);
+
+    return .{
+        .location_key = location_key,
+        .cookie_name = cookie_name,
+        .requested_upstream = requested_upstream,
+    };
+}
+
+fn affinityCookieName(allocator: std.mem.Allocator, location_key: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "__Host-tg-aff-{x}", .{std.hash.Wyhash.hash(0, location_key)});
+}
+
+fn buildStickySetCookieHeader(
+    allocator: std.mem.Allocator,
+    cfg: *const edge_config.EdgeConfig,
+    affinity: *const StickyAffinityRequest,
+    selected_upstream: []const u8,
+) !?[]u8 {
+    if (affinity.requested_upstream) |requested| {
+        if (std.mem.eql(u8, requested, selected_upstream)) return null;
+    }
+
+    const value = try stickyCookieValue(allocator, stickyCookieSecret(cfg), affinity.location_key, selected_upstream);
+    defer allocator.free(value);
+    return try std.fmt.allocPrint(
+        allocator,
+        "{s}={s}; Path=/; HttpOnly; Secure; SameSite=Lax",
+        .{ affinity.cookie_name, value },
+    );
+}
+
+fn stickyCookieValue(
+    allocator: std.mem.Allocator,
+    secret: []const u8,
+    location_key: []const u8,
+    upstream_base_url: []const u8,
+) ![]u8 {
+    const enc = std.base64.url_safe_no_pad.Encoder;
+    const upstream_b64 = try allocator.alloc(u8, enc.calcSize(upstream_base_url.len));
+    defer allocator.free(upstream_b64);
+    _ = enc.encode(upstream_b64, upstream_base_url);
+
+    const signature_hex = try stickyCookieSignatureHex(allocator, secret, location_key, upstream_base_url);
+    defer allocator.free(signature_hex);
+    return std.fmt.allocPrint(allocator, "{s}.{s}", .{ upstream_b64, signature_hex });
+}
+
+fn stickyCookieSignatureHex(
+    allocator: std.mem.Allocator,
+    secret: []const u8,
+    location_key: []const u8,
+    upstream_base_url: []const u8,
+) ![]u8 {
+    const material = try std.fmt.allocPrint(allocator, "{s}\n{s}", .{ location_key, upstream_base_url });
+    defer allocator.free(material);
+
+    var mac: [32]u8 = undefined;
+    std.crypto.auth.hmac.sha2.HmacSha256.create(&mac, material, secret);
+    return std.fmt.allocPrint(allocator, "{s}", .{std.fmt.fmtSliceHexLower(&mac)});
+}
+
+fn parseStickyCookieUpstream(
+    allocator: std.mem.Allocator,
+    cfg: *const edge_config.EdgeConfig,
+    headers: *const http.Headers,
+    location_key: []const u8,
+    cookie_name: []const u8,
+) !?[]u8 {
+    const raw_cookie = findCookieValue(headers, cookie_name) orelse return null;
+    const dot = std.mem.lastIndexOfScalar(u8, raw_cookie, '.') orelse return null;
+    const encoded_upstream = raw_cookie[0..dot];
+    const provided_sig = raw_cookie[dot + 1 ..];
+    if (encoded_upstream.len == 0 or provided_sig.len == 0) return null;
+
+    const dec = std.base64.url_safe_no_pad.Decoder;
+    const decoded_len = dec.calcSizeForSlice(encoded_upstream) catch return null;
+    const upstream = try allocator.alloc(u8, decoded_len);
+    dec.decode(upstream, encoded_upstream) catch {
+        allocator.free(upstream);
+        return null;
+    };
+
+    const expected_sig = try stickyCookieSignatureHex(allocator, stickyCookieSecret(cfg), location_key, upstream);
+    defer allocator.free(expected_sig);
+    if (!std.mem.eql(u8, expected_sig, provided_sig)) {
+        allocator.free(upstream);
+        return null;
+    }
+
+    return upstream;
+}
+
+fn findCookieValue(headers: *const http.Headers, cookie_name: []const u8) ?[]const u8 {
+    for (headers.iterator()) |header| {
+        if (!std.ascii.eqlIgnoreCase(header.name, "cookie")) continue;
+        if (findCookieValueInHeader(header.value, cookie_name)) |value| return value;
+    }
+    return null;
+}
+
+fn findCookieValueInHeader(cookie_header: []const u8, cookie_name: []const u8) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, cookie_header, ';');
+    while (it.next()) |segment_raw| {
+        const segment = std.mem.trim(u8, segment_raw, " \t\r\n");
+        if (segment.len <= cookie_name.len or segment[cookie_name.len] != '=') continue;
+        if (!std.mem.eql(u8, segment[0..cookie_name.len], cookie_name)) continue;
+        return std.mem.trim(u8, segment[cookie_name.len + 1 ..], " \t\r\n");
+    }
+    return null;
 }
 
 fn selectUpstreamBaseUrl(base_urls: []const []const u8, fallback: []const u8, rr_index: *usize) []const u8 {
@@ -3548,9 +3775,10 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         const token = request.uri.path[acme_prefix.len..];
         if (state.acme_challenge_store.?.getCopy(allocator, token)) |key_auth| {
             defer allocator.free(key_auth);
-            var acme_response = http.Response.init(allocator, .ok);
+            var acme_response = http.Response.init(allocator);
             defer acme_response.deinit();
-            _ = acme_response.setBody(key_auth)
+            _ = acme_response.setStatus(.ok)
+                .setBody(key_auth)
                 .setHeader("Content-Type", "application/octet-stream")
                 .setConnection(keep_alive);
             try acme_response.write(writer);
@@ -3724,6 +3952,11 @@ fn routeRequest(
     client_ip: []const u8,
 ) !u16 {
     const writer = conn.writer();
+    if (try handleTranscriptRoute(allocator, writer, state, request, correlation_id, keep_alive.*)) |status| {
+        state.metricsRecord(status);
+        return status;
+    }
+
     if (http.location_router.matchLocation(request.uri.path, cfg.location_blocks)) |matched| {
         switch (matched.block.action) {
             .proxy_pass => |target| {
@@ -3742,6 +3975,8 @@ fn routeRequest(
                     ctx.user_id,
                     ctx.device_id,
                     ctx.scopes,
+                    request.headers.get("host"),
+                    matched.block.pattern,
                 );
             },
             .fastcgi_pass => |upstream| {
@@ -3785,6 +4020,109 @@ fn routeRequest(
     try sendApiError(allocator, writer, .not_found, "invalid_request", "Not Found", correlation_id, keep_alive.*, state);
     state.metricsRecord(404);
     return 404;
+}
+
+fn handleTranscriptRoute(
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    state: *GatewayState,
+    request: *const http.Request,
+    correlation_id: []const u8,
+    keep_alive: bool,
+) !?u16 {
+    const transcript_path = normalizeTranscriptRoutePath(request.uri.path) orelse return null;
+
+    if (!(request.method == .GET or request.method == .HEAD)) {
+        try sendApiError(allocator, writer, .method_not_allowed, "invalid_request", "Method Not Allowed", correlation_id, keep_alive, state);
+        return 405;
+    }
+
+    if (state.transcript_store_path.len == 0) {
+        try sendApiError(allocator, writer, .not_found, "invalid_request", "Transcript store not configured", correlation_id, keep_alive, state);
+        return 404;
+    }
+
+    if (std.mem.eql(u8, transcript_path, "/transcripts")) {
+        const limit = parseTranscriptLimit(request.uri.query);
+        const transcripts = try http.transcript_store.listRecent(allocator, state.transcript_store_path, limit);
+        defer {
+            for (transcripts) |*summary| summary.deinit(allocator);
+            allocator.free(transcripts);
+        }
+        const payload = try jsonifyTranscriptSummaries(allocator, transcripts);
+        defer allocator.free(payload);
+        try writeJsonPayload(writer, allocator, payload, correlation_id, keep_alive, state, request.method == .HEAD);
+        return 200;
+    }
+
+    if (std.mem.startsWith(u8, transcript_path, "/transcripts/")) {
+        const id_raw = std.mem.trim(u8, transcript_path["/transcripts/".len..], " \t\r\n");
+        const id = std.fmt.parseInt(usize, id_raw, 10) catch {
+            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Invalid transcript id", correlation_id, keep_alive, state);
+            return 400;
+        };
+        var entry = (try http.transcript_store.getById(allocator, state.transcript_store_path, id)) orelse {
+            try sendApiError(allocator, writer, .not_found, "invalid_request", "Transcript not found", correlation_id, keep_alive, state);
+            return 404;
+        };
+        defer entry.deinit(allocator);
+        const payload = try jsonifyTranscriptEntry(allocator, &entry);
+        defer allocator.free(payload);
+        try writeJsonPayload(writer, allocator, payload, correlation_id, keep_alive, state, request.method == .HEAD);
+        return 200;
+    }
+
+    return null;
+}
+
+fn normalizeTranscriptRoutePath(path: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, path, "/transcripts") or std.mem.startsWith(u8, path, "/transcripts/")) return path;
+    if (std.mem.eql(u8, path, "/bearclaw/transcripts")) return "/transcripts";
+    if (std.mem.startsWith(u8, path, "/bearclaw/transcripts/")) return path["/bearclaw".len..];
+    return null;
+}
+
+fn parseTranscriptLimit(query: ?[]const u8) usize {
+    const raw = parseQueryParam(query, "limit") orelse return 50;
+    const parsed = std.fmt.parseInt(usize, raw, 10) catch return 50;
+    return std.math.clamp(parsed, 1, 200);
+}
+
+fn jsonifyTranscriptSummaries(allocator: std.mem.Allocator, transcripts: []const http.transcript_store.Summary) ![]u8 {
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    try std.json.stringify(.{ .transcripts = transcripts }, .{}, out.writer());
+    return out.toOwnedSlice();
+}
+
+fn jsonifyTranscriptEntry(allocator: std.mem.Allocator, transcript: *const http.transcript_store.StoredEntry) ![]u8 {
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    try std.json.stringify(.{ .transcript = transcript }, .{}, out.writer());
+    return out.toOwnedSlice();
+}
+
+fn writeJsonPayload(
+    writer: anytype,
+    allocator: std.mem.Allocator,
+    payload: []const u8,
+    correlation_id: []const u8,
+    keep_alive: bool,
+    state: *GatewayState,
+    head_only: bool,
+) !void {
+    var response = http.Response.json(allocator, if (head_only) "" else payload);
+    defer response.deinit();
+    _ = response
+        .setStatus(.ok)
+        .setConnection(keep_alive)
+        .setHeader(http.correlation.HEADER_NAME, correlation_id);
+    applyResponseHeaders(state, &response);
+    if (head_only) {
+        try response.writeHead(writer);
+    } else {
+        try response.write(writer);
+    }
 }
 
 fn proxySuffixPathForLocation(
@@ -3897,6 +4235,7 @@ fn handleVersionedApiProxyRoute(
             cfg,
             state,
             ctx,
+            &request.headers,
             .chat,
             cfg.proxy_pass_chat,
             null,
@@ -3917,6 +4256,7 @@ fn handleVersionedApiProxyRoute(
             cfg,
             state,
             ctx,
+            &request.headers,
             .commands,
             cfg.proxy_pass_commands_prefix,
             null,
@@ -3939,6 +4279,7 @@ fn executeVersionedApiProxyRoute(
     cfg: *const edge_config.EdgeConfig,
     state: *GatewayState,
     ctx: *http.request_context.RequestContext,
+    request_headers: *const http.Headers,
     upstream_scope: UpstreamScope,
     proxy_pass_target: []const u8,
     suffix_path: ?[]const u8,
@@ -3950,6 +4291,23 @@ fn executeVersionedApiProxyRoute(
     incoming_host: ?[]const u8,
     incoming_x_forwarded_for: ?[]const u8,
 ) !u16 {
+    const upstream_pool = upstreamPoolForScope(cfg, upstream_scope);
+    const location_id = switch (upstream_scope) {
+        .chat => "versioned:/chat",
+        .commands => "versioned:/commands",
+        .global => "versioned:/",
+    };
+    var sticky_affinity = try prepareStickyAffinityRequest(
+        allocator,
+        cfg,
+        upstream_pool,
+        request_headers,
+        incoming_host,
+        location_id,
+        proxy_pass_target,
+    );
+    defer if (sticky_affinity) |*value| value.deinit(allocator);
+
     const exec = proxyJsonExecute(
         allocator,
         cfg,
@@ -3969,6 +4327,7 @@ fn executeVersionedApiProxyRoute(
         writer,
         state,
         false,
+        if (sticky_affinity) |*value| value else null,
     ) catch |err| {
         const mapped = mapProxyExecutionError(err);
         try sendApiError(allocator, writer, mapped.status, mapped.code, mapped.message, correlation_id, keep_alive, state);
@@ -3982,6 +4341,7 @@ fn executeVersionedApiProxyRoute(
             defer allocator.free(resp.content_type);
             if (resp.content_disposition) |cd| allocator.free(cd);
             if (resp.location) |location| allocator.free(location);
+            if (resp.set_cookie) |cookie| allocator.free(cookie);
 
             var response = http.Response.init(allocator);
             defer response.deinit();
@@ -3995,6 +4355,9 @@ fn executeVersionedApiProxyRoute(
             }
             if (resp.location) |location| {
                 _ = response.setHeader("Location", location);
+            }
+            if (resp.set_cookie) |cookie| {
+                _ = response.setHeader("Set-Cookie", cookie);
             }
             applyResponseHeaders(state, &response);
             try response.write(writer);
@@ -4019,14 +4382,46 @@ fn handleLocationProxyPass(
     auth_user_id: ?[]const u8,
     auth_device_id: ?[]const u8,
     auth_scopes: ?[]const u8,
+    incoming_host: ?[]const u8,
+    location_id: []const u8,
 ) !u16 {
-    const resolved = try resolveProxyTarget(allocator, cfg.upstream_base_url, target, suffix_path);
+    const upstream_scope = .global;
+    const upstream_pool = upstreamPoolForScope(cfg, upstream_scope);
+    var sticky_affinity = try prepareStickyAffinityRequest(
+        allocator,
+        cfg,
+        upstream_pool,
+        &request.headers,
+        incoming_host,
+        location_id,
+        target,
+    );
+    defer if (sticky_affinity) |*value| value.deinit(allocator);
+
+    const upstream_hash_key = if (suffix_path) |suffix| suffix else target;
+    const selection: StickyUpstreamSelection = if (sticky_affinity) |*value|
+        state.nextStickyUpstreamBaseUrl(cfg, upstream_pool, client_ip, upstream_hash_key, value.requested_upstream)
+    else
+        .{ .base_url = state.nextUpstreamBaseUrl(cfg, upstream_pool, client_ip, upstream_hash_key), .used_requested = false };
+    const selected_base_url = if (isAbsoluteHttpUrl(std.mem.trim(u8, target, " \t\r\n")))
+        cfg.upstream_base_url
+    else
+        selection.base_url;
+
+    const resolved = try resolveProxyTarget(allocator, selected_base_url, target, suffix_path);
     defer allocator.free(resolved.url);
     const body = request.body orelse "";
     const upstream_url = try appendProxyQueryString(allocator, resolved.url, request.uri.query);
     defer allocator.free(upstream_url);
+    const sticky_set_cookie = if (sticky_affinity) |*value|
+        try buildStickySetCookieHeader(allocator, cfg, value, selection.base_url)
+    else
+        null;
+    defer if (sticky_set_cookie) |cookie| allocator.free(cookie);
     const use_mtls_path = cfg.upstream_tls_client_cert.len > 0 and
         std.mem.startsWith(u8, upstream_url, "https://");
+    state.recordUpstreamAttemptStart(selection.base_url);
+    defer state.recordUpstreamAttemptEnd(selection.base_url);
     var upstream_response = if (use_mtls_path)
         try executeUpstreamHttpsWithMtls(
             allocator,
@@ -4063,6 +4458,10 @@ fn handleLocationProxyPass(
             auth_scopes,
         );
     defer upstream_response.deinit(allocator);
+    const transcript_redactions: []const []const u8 = if (request.headers.get("authorization")) |raw_auth|
+        if (http.auth.parseBearerToken(raw_auth)) |token| &.{token} else &.{}
+    else
+        &.{};
     state.appendTranscript(
         upstreamScopeName(proxyScopeForPath(request.uri.path)),
         request.uri.path,
@@ -4074,8 +4473,16 @@ fn handleLocationProxyPass(
         upstream_response.status_code,
         upstream_response.headerValue("content-type") orelse "application/octet-stream",
         upstream_response.body,
+        transcript_redactions,
     );
-    try writeBufferedUpstreamResponse(writer, &upstream_response, keep_alive, correlation_id, &state.security_headers);
+    if (!isAbsoluteHttpUrl(std.mem.trim(u8, target, " \t\r\n"))) {
+        if (upstream_response.status_code >= 500) {
+            state.recordUpstreamFailure(cfg, selection.base_url);
+        } else {
+            state.recordUpstreamSuccess(cfg, selection.base_url);
+        }
+    }
+    try writeBufferedUpstreamResponse(writer, &upstream_response, keep_alive, correlation_id, &state.security_headers, sticky_set_cookie);
     const status_code = upstream_response.status_code;
     state.metricsRecord(status_code);
     return status_code;
@@ -4254,7 +4661,10 @@ fn executeUpstreamHttpsWithMtls(
     defer tls_conn.deinit();
 
     // Build and send HTTP/1.1 request.
-    const path_raw = if (uri.path.len > 0) uri.path else "/";
+    const path_raw = switch (uri.path) {
+        .raw => |path| if (path.len > 0) path else "/",
+        .percent_encoded => |path| if (path.len > 0) path else "/",
+    };
     const forwarded_for = try buildForwardedFor(allocator, request_headers.get("x-forwarded-for"), client_ip);
     defer allocator.free(forwarded_for);
 
@@ -4274,8 +4684,7 @@ fn executeUpstreamHttpsWithMtls(
         if (trimmed.len > 0) try req_writer.print("X-Forwarded-Host: {s}\r\n", .{trimmed});
     }
     try writeAssertedIdentityHeaders(req_writer, auth_identity, auth_user_id, auth_device_id, auth_scopes);
-    var hdr_it = request_headers.iterator();
-    while (hdr_it.next()) |entry| {
+    for (request_headers.iterator()) |entry| {
         if (shouldSkipUpstreamRequestHeader(entry.name)) continue;
         try req_writer.print("{s}: {s}\r\n", .{ entry.name, entry.value });
     }
@@ -4354,6 +4763,19 @@ fn wantsHtmlErrorPage(request_path: []const u8, headers: *const http.Headers) bo
     if (std.mem.indexOf(u8, accept, "*/*") != null) return true;
     if (std.mem.indexOf(u8, accept, "application/json") != null) return false;
     return false;
+}
+
+fn rateLimitDescriptor(identity: ?[]const u8, client_ip: []const u8, buf: *[192]u8) []const u8 {
+    if (identity) |id| {
+        return std.fmt.bufPrint(buf, "identity:{s}", .{id}) catch blk: {
+            const hash = std.hash.Wyhash.hash(0, id);
+            break :blk std.fmt.bufPrint(buf, "identity-hash:{x}", .{hash}) catch "identity-hash";
+        };
+    }
+    return std.fmt.bufPrint(buf, "ip:{s}", .{client_ip}) catch blk: {
+        const hash = std.hash.Wyhash.hash(0, client_ip);
+        break :blk std.fmt.bufPrint(buf, "ip-hash:{x}", .{hash}) catch "ip-hash";
+    };
 }
 
 fn findErrorPageTarget(block: *const http.location_router.LocationBlock, status_code: u16) ?[]const u8 {
@@ -4449,24 +4871,6 @@ fn runMiddlewarePipeline(
         }
     }
 
-    if (!state.rateLimitAllow(client_ip)) {
-        const payload = try buildApiErrorJson(allocator, "rate_limited", "Rate limit exceeded", correlation_id);
-        defer allocator.free(payload);
-        var response = http.Response.json(allocator, payload);
-        defer response.deinit();
-        _ = response
-            .setStatus(.too_many_requests)
-            .setConnection(keep_alive)
-            .setHeader("Retry-After", "1")
-            .setHeader(http.correlation.HEADER_NAME, correlation_id);
-        applyResponseHeaders(state, &response);
-        try response.write(writer);
-        state.metricsRecord(429);
-        state.metricsRecordErrorCode("rate_limited");
-        logAccess(ctx, request.method.toString(), request.uri.path, 429, request.headers.get("user-agent") orelse "");
-        return true;
-    }
-
     if (isProtectedAuthRequestRoute(request.uri.path)) {
         const has_auth_policy = cfg.basic_auth_hashes.len > 0 or
             cfg.auth_token_hashes.len > 0 or
@@ -4508,6 +4912,26 @@ fn runMiddlewarePipeline(
                 return true;
             }
         }
+    }
+
+    var rate_limit_buf: [192]u8 = undefined;
+    const limit_key = rateLimitDescriptor(ctx.identity, client_ip, &rate_limit_buf);
+    if (!state.rateLimitAllow(limit_key)) {
+        const payload = try buildApiErrorJson(allocator, "rate_limited", "Rate limit exceeded", correlation_id);
+        defer allocator.free(payload);
+        var response = http.Response.json(allocator, payload);
+        defer response.deinit();
+        _ = response
+            .setStatus(.too_many_requests)
+            .setConnection(keep_alive)
+            .setHeader("Retry-After", "1")
+            .setHeader(http.correlation.HEADER_NAME, correlation_id);
+        applyResponseHeaders(state, &response);
+        try response.write(writer);
+        state.metricsRecord(429);
+        state.metricsRecordErrorCode("rate_limited");
+        logAccess(ctx, request.method.toString(), request.uri.path, 429, request.headers.get("user-agent") orelse "");
+        return true;
     }
 
     return false;
@@ -4870,6 +5294,7 @@ fn runAsyncCommandJob(job: *AsyncCommandJob) void {
         std.io.null_writer,
         job.state,
         false,
+        null,
     ) catch |err| {
         job.state.commandLifecycleSetFailed(job.command_id, @errorName(err));
         return;
@@ -6459,7 +6884,11 @@ fn isProtectedAuthRequestRoute(path: []const u8) bool {
     // Protect versioned API routes at both the direct path and the /bearclaw/
     // edge prefix. Health and static paths remain public so readiness probes
     // and asset serving work without credentials.
+    if (std.mem.eql(u8, path, "/bearclaw/transcripts")) return true;
+    if (std.mem.startsWith(u8, path, "/bearclaw/transcripts/")) return true;
     if (std.mem.startsWith(u8, path, "/bearclaw/v1/")) return true;
+    if (std.mem.eql(u8, path, "/transcripts")) return true;
+    if (std.mem.startsWith(u8, path, "/transcripts/")) return true;
     if (std.mem.startsWith(u8, path, "/v1/")) return true;
     return false;
 }
@@ -7077,6 +7506,7 @@ const ProxyResult = struct {
     content_type: []u8,
     content_disposition: ?[]u8,
     location: ?[]u8,
+    set_cookie: ?[]u8,
     cacheable: bool,
 };
 
@@ -7126,6 +7556,7 @@ fn proxyCacheRefreshThread(task: *ProxyCacheRefreshTask) void {
         std.io.null_writer,
         task.state,
         false,
+        null,
     ) catch return;
 
     switch (exec) {
@@ -7135,6 +7566,7 @@ fn proxyCacheRefreshThread(task: *ProxyCacheRefreshTask) void {
             defer task.allocator.free(result.content_type);
             if (result.content_disposition) |cd| task.allocator.free(cd);
             if (result.location) |location| task.allocator.free(location);
+            if (result.set_cookie) |cookie| task.allocator.free(cookie);
             if (result.status == 200) {
                 task.state.proxyCachePut(task.cache_key, result.status, result.body, result.content_type) catch {};
             }
@@ -7242,6 +7674,7 @@ fn proxyJsonExecute(
     downstream_writer: anytype,
     state: *GatewayState,
     enable_streaming_success: bool,
+    sticky_affinity: ?*const StickyAffinityRequest,
 ) !ProxyExecution {
     const upstream_pool = upstreamPoolForScope(cfg, upstream_scope);
     const configured_attempts: usize = @intCast(@max(cfg.upstream_retry_attempts, @as(u32, 1)));
@@ -7263,7 +7696,16 @@ fn proxyJsonExecute(
             break :blk @intCast(@min(@as(u64, cfg.upstream_timeout_ms), remaining));
         };
 
-        const upstream_base_url = state.nextUpstreamBaseUrl(cfg, upstream_pool, client_ip, upstream_hash_key);
+        const selection = if (sticky_affinity) |value|
+            state.nextStickyUpstreamBaseUrl(cfg, upstream_pool, client_ip, upstream_hash_key, value.requested_upstream)
+        else
+            StickyUpstreamSelection{ .base_url = state.nextUpstreamBaseUrl(cfg, upstream_pool, client_ip, upstream_hash_key), .used_requested = false };
+        const upstream_base_url = selection.base_url;
+        const sticky_set_cookie = if (sticky_affinity) |value|
+            try buildStickySetCookieHeader(allocator, cfg, value, upstream_base_url)
+        else
+            null;
+        defer if (sticky_set_cookie) |cookie| allocator.free(cookie);
         state.recordUpstreamAttemptStart(upstream_base_url);
         const exec = blk: {
             defer state.recordUpstreamAttemptEnd(upstream_base_url);
@@ -7288,6 +7730,7 @@ fn proxyJsonExecute(
                 downstream_writer,
                 state,
                 enable_streaming_success,
+                sticky_set_cookie,
             ) catch |err| {
                 state.recordUpstreamFailure(cfg, upstream_base_url);
                 last_err = err;
@@ -7315,6 +7758,7 @@ fn proxyJsonExecute(
                         allocator.free(res.content_type);
                         if (res.content_disposition) |cd| allocator.free(cd);
                         if (res.location) |location| allocator.free(location);
+                        if (res.set_cookie) |cookie| allocator.free(cookie);
                         continue;
                     }
                 } else {
@@ -7349,6 +7793,7 @@ fn proxyJsonExecuteSingleAttempt(
     downstream_writer: anytype,
     state: *GatewayState,
     enable_streaming_success: bool,
+    sticky_set_cookie: ?[]const u8,
 ) !ProxyExecution {
     const resolved_target = try resolveProxyTarget(allocator, upstream_base_url, proxy_pass_target, suffix_path);
     const current_url = resolved_target.url;
@@ -7458,6 +7903,7 @@ fn proxyJsonExecuteSingleAttempt(
             upstream_content_disposition,
             correlation_id,
             &state.security_headers,
+            sticky_set_cookie,
         );
 
         const read_buf = try state.relay_buffer_pool.acquire();
@@ -7479,6 +7925,11 @@ fn proxyJsonExecuteSingleAttempt(
         else
             null;
         errdefer if (buffered_content_disposition) |cd| allocator.free(cd);
+        const buffered_set_cookie = if (sticky_set_cookie) |cookie|
+            try allocator.dupe(u8, cookie)
+        else
+            null;
+        errdefer if (buffered_set_cookie) |cookie| allocator.free(cookie);
 
         const drain_buf = try state.relay_buffer_pool.acquire();
         defer state.relay_buffer_pool.release(drain_buf);
@@ -7497,6 +7948,7 @@ fn proxyJsonExecuteSingleAttempt(
             status_code,
             upstream_content_type,
             "",
+            &.{},
         );
         return .{
             .buffered = .{
@@ -7505,6 +7957,7 @@ fn proxyJsonExecuteSingleAttempt(
                 .content_type = buffered_content_type,
                 .content_disposition = buffered_content_disposition,
                 .location = upstream_location,
+                .set_cookie = buffered_set_cookie,
                 .cacheable = false,
             },
         };
@@ -7524,6 +7977,11 @@ fn proxyJsonExecuteSingleAttempt(
     else
         null;
     errdefer if (buffered_content_disposition) |cd| allocator.free(cd);
+    const buffered_set_cookie = if (sticky_set_cookie) |cookie|
+        try allocator.dupe(u8, cookie)
+    else
+        null;
+    errdefer if (buffered_set_cookie) |cookie| allocator.free(cookie);
     state.appendTranscript(
         upstreamScopeName(upstream_scope),
         proxy_pass_target,
@@ -7535,6 +7993,7 @@ fn proxyJsonExecuteSingleAttempt(
         status_code,
         buffered_content_type,
         body.items,
+        &.{},
     );
     return .{
         .buffered = .{
@@ -7543,6 +8002,7 @@ fn proxyJsonExecuteSingleAttempt(
             .content_type = buffered_content_type,
             .content_disposition = buffered_content_disposition,
             .location = upstream_location,
+            .set_cookie = buffered_set_cookie,
             .cacheable = cacheable,
         },
     };
@@ -7598,6 +8058,7 @@ fn writeStreamedUpstreamResponse(
     content_disposition: ?[]const u8,
     correlation_id: []const u8,
     security: *const http.security_headers.SecurityHeaders,
+    sticky_set_cookie: ?[]const u8,
 ) !void {
     const phrase = if (reason.len > 0)
         reason
@@ -7613,6 +8074,9 @@ fn writeStreamedUpstreamResponse(
     if (content_disposition) |cd| {
         try writer.print("Content-Disposition: {s}\r\n", .{cd});
     }
+    if (sticky_set_cookie) |cookie| {
+        try writer.print("Set-Cookie: {s}\r\n", .{cookie});
+    }
 
     try writeSecurityHeaders(writer, security);
     try writer.writeAll("\r\n");
@@ -7624,6 +8088,7 @@ fn writeBufferedUpstreamResponse(
     keep_alive: bool,
     correlation_id: []const u8,
     security: *const http.security_headers.SecurityHeaders,
+    sticky_set_cookie: ?[]const u8,
 ) !void {
     const phrase = if (upstream_response.reason.len > 0)
         upstream_response.reason
@@ -7637,6 +8102,9 @@ fn writeBufferedUpstreamResponse(
     try writer.print("{s}: {s}\r\n", .{ http.correlation.HEADER_NAME, correlation_id });
     for (upstream_response.headers) |header| {
         try writer.print("{s}: {s}\r\n", .{ header.name, header.value });
+    }
+    if (sticky_set_cookie) |cookie| {
+        try writer.print("Set-Cookie: {s}\r\n", .{cookie});
     }
     try writeSecurityHeaders(writer, security);
     try writer.writeAll("\r\n");

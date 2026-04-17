@@ -110,7 +110,8 @@ const b64url_dec = std.base64.url_safe_no_pad.Decoder;
 
 fn b64urlEncode(allocator: std.mem.Allocator, data: []const u8) ![]u8 {
     const out = try allocator.alloc(u8, b64url_enc.calcSize(data.len));
-    return b64url_enc.encode(out, data);
+    _ = b64url_enc.encode(out, data);
+    return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -372,7 +373,7 @@ fn buildCsr(allocator: std.mem.Allocator, domains: []const []const u8, domain_ke
     const san_ext = c.X509V3_EXT_conf_nid(null, null, c.NID_subject_alt_name, san_z.ptr) orelse return error.CsrFailed;
     defer c.X509_EXTENSION_free(san_ext);
 
-    const exts = c.sk_X509_EXTENSION_new_null() orelse return error.CsrFailed;
+    const exts = @as(?*c.struct_stack_st_X509_EXTENSION, @ptrCast(c.OPENSSL_sk_new_null())) orelse return error.CsrFailed;
     defer c.sk_X509_EXTENSION_pop_free(exts, c.X509_EXTENSION_free);
     if (c.sk_X509_EXTENSION_push(exts, san_ext) == 0) return error.CsrFailed;
     if (c.X509_REQ_add_extensions(req, exts) != 1) return error.CsrFailed;

@@ -1,7 +1,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-/// Token-bucket rate limiter keyed by client IP.
+/// Token-bucket rate limiter keyed by a request descriptor.
 ///
 /// Each bucket starts with `burst` tokens. Tokens are consumed on each
 /// request and refilled at `rate` tokens per second. When a bucket is
@@ -13,6 +13,7 @@ pub const RateLimiter = struct {
     burst: u32, // max tokens (burst capacity)
     cleanup_interval_ns: i128, // how often to prune stale entries
     last_cleanup: i128,
+    stale_ttl_ns: i128, // how long an idle descriptor bucket may live
 
     const Bucket = struct {
         tokens: f64,
@@ -20,6 +21,10 @@ pub const RateLimiter = struct {
     };
 
     pub fn init(allocator: Allocator, rate: f64, burst: u32) RateLimiter {
+        return initWithIdleTtlSeconds(allocator, rate, burst, 300);
+    }
+
+    pub fn initWithIdleTtlSeconds(allocator: Allocator, rate: f64, burst: u32, idle_ttl_seconds: u32) RateLimiter {
         return .{
             .allocator = allocator,
             .buckets = std.StringHashMap(Bucket).init(allocator),
@@ -27,6 +32,7 @@ pub const RateLimiter = struct {
             .burst = burst,
             .cleanup_interval_ns = 60 * std.time.ns_per_s, // 60 seconds
             .last_cleanup = std.time.nanoTimestamp(),
+            .stale_ttl_ns = @as(i128, @intCast(idle_ttl_seconds)) * std.time.ns_per_s,
         };
     }
 
@@ -88,13 +94,12 @@ pub const RateLimiter = struct {
     }
 
     fn cleanup(self: *RateLimiter, now: i128) void {
-        const stale_threshold_ns: i128 = 300 * std.time.ns_per_s; // 5 minutes
         var keys_to_remove = std.ArrayList([]const u8).init(self.allocator);
         defer keys_to_remove.deinit();
 
         var it = self.buckets.iterator();
         while (it.next()) |entry| {
-            if (now - entry.value_ptr.last_refill > stale_threshold_ns) {
+            if (now - entry.value_ptr.last_refill > self.stale_ttl_ns) {
                 keys_to_remove.append(entry.key_ptr.*) catch continue;
             }
         }
@@ -171,6 +176,29 @@ test "rate limiter tracks keys independently" {
 
     // client-b is also exhausted
     try std.testing.expect(limiter.allow("client-b") == null);
+}
+
+test "rate limiter evicts stale descriptor buckets after ttl" {
+    const allocator = std.testing.allocator;
+    var limiter = RateLimiter.initWithIdleTtlSeconds(allocator, 1.0, 2, 1);
+    defer limiter.deinit();
+
+    _ = limiter.allow("identity:user-1");
+    _ = limiter.allow("identity:user-2");
+    try std.testing.expectEqual(@as(usize, 2), limiter.buckets.count());
+
+    limiter.last_cleanup = 0;
+    if (limiter.buckets.getPtr("identity:user-1")) |bucket| {
+        bucket.last_refill = std.time.nanoTimestamp() - (2 * std.time.ns_per_s);
+    }
+    if (limiter.buckets.getPtr("identity:user-2")) |bucket| {
+        bucket.last_refill = std.time.nanoTimestamp();
+    }
+
+    _ = limiter.allow("identity:user-2");
+    try std.testing.expectEqual(@as(usize, 1), limiter.buckets.count());
+    try std.testing.expect(limiter.buckets.contains("identity:user-2"));
+    try std.testing.expect(!limiter.buckets.contains("identity:user-1"));
 }
 
 test "formatHeaders produces valid strings" {

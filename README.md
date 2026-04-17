@@ -576,6 +576,83 @@ All responses include:
 | 501 | Not Implemented - Unknown HTTP method |
 | 505 | HTTP Version Not Supported |
 
+## Platform Support
+
+### Supported Targets
+
+Tardigrade is built and released for the following targets. Each release publishes a prebuilt binary and a SHA-256 checksum.
+
+| Platform | Architecture | Release artifact | CI status |
+|---|---|---|---|
+| Linux (glibc 2.35+) | x86_64 | `tardigrade-linux-x86_64` | Built and tested on every PR |
+| Linux (glibc 2.35+) | aarch64 | `tardigrade-linux-aarch64` | Built and tested on every PR |
+| macOS 13+ (Ventura) | x86_64 (Intel) | `tardigrade-darwin-x86_64` | Built on release tags |
+| macOS 14+ (Sonoma) | arm64 (Apple Silicon) | `tardigrade-darwin-arm64` | Built on release tags |
+
+### Windows
+
+Windows is not currently supported. Tardigrade depends on OpenSSL for TLS termination and the standard Linux/macOS socket and signal semantics for hot reload (`SIGHUP`), graceful shutdown, and binary upgrade (`SIGUSR2`). Porting these to Windows is a non-trivial effort.
+
+If Windows support matters to you, open a discussion on GitHub — community interest helps prioritize it.
+
+### Musl / Alpine Linux
+
+The release binaries link against glibc. Musl/Alpine builds are not yet published but can be produced locally from source against Zig's bundled libc. Container deployments that require musl should build from source using `zig build -Dtarget=x86_64-linux-musl -Doptimize=ReleaseFast`.
+
+### TLS dependencies
+
+TLS termination uses the system or linked OpenSSL 1.1.1+ / 3.x library. The Dockerfile bundles OpenSSL 3 so container deployments are fully self-contained. Host-native deployments require a compatible libssl/libcrypto on the `PATH` at runtime.
+
+---
+
+## Production Readiness
+
+| Feature | Maturity | Notes |
+|---|---|---|
+| HTTP/1.1 serving and reverse proxying | **GA** | Core path; production-deployed |
+| TLS termination (SNI, mTLS, OCSP) | **GA** | OpenSSL 3.x; SNI-based cert selection |
+| Hot reload (`SIGHUP` + atomic swap) | **GA** | Reload-status endpoint at `/tardigrade/reload/status` |
+| Active upstream health checks | **GA** | Configurable probe path, threshold, slow-start |
+| JWT/Basic/Bearer auth enforcement | **GA** | Protecting all `/bearclaw/v1/*` and `/v1/*` paths |
+| Rate limiting (identity + IP) | **GA** | Token-bucket, descriptor-aware, idle TTL eviction |
+| Sticky upstream affinity (HMAC cookie) | **GA** | Per-location signed cookies |
+| W3C Trace Context propagation | **GA** | Always-on; OTLP export optional |
+| Access logging (JSON / template) | **GA** | Syslog UDP + file; configurable format |
+| Static file serving | **GA** | Range, ETag, conditional, autoindex, `try_files` |
+| Response compression (Gzip + Brotli) | **GA** | Configurable min-size and quality |
+| HTTP/2 (multiplexing, server push) | **Beta** | Enabled by default; no known production blockers |
+| WebSocket proxying | **Beta** | Bidirectional forwarding; idle timeout |
+| SSE / event-hub streaming | **Beta** | Backpressure, replay, per-topic limits |
+| Config-file mode (nginx-style DSL) | **Beta** | Location blocks, rewrites, return, error_page |
+| FastCGI / SCGI / uWSGI bridges | **Beta** | PHP/Python/Ruby backend support |
+| HTTP/3 (QUIC via ngtcp2/nghttp3) | **Experimental** | Opt-in via `TARDIGRADE_HTTP3_ENABLED=true`; not recommended for production |
+| ACME auto-renewal | **Experimental** | Directory-based cert discovery; not battle-tested |
+| Binary upgrade (`SIGUSR2`) | **Experimental** | Zero-downtime rollover; semantics may change |
+| gRPC proxy | **Experimental** | Upstream forwarding only; no transcoding |
+| Mail relay (SMTP, IMAP, POP3) | **Experimental** | Basic upstream forwarding |
+| Stream TCP/UDP proxy | **Experimental** | Forward-only; no protocol awareness |
+| Kubernetes / Helm | **Planned** | See [#29](https://github.com/Bare-Systems/Tardigrade/issues/29) |
+| Service discovery (DNS SRV, k8s endpoints) | **Planned** | See [#30](https://github.com/Bare-Systems/Tardigrade/issues/30) |
+| Native packages (DEB, RPM, Homebrew) | **Planned** | See [#31](https://github.com/Bare-Systems/Tardigrade/issues/31) |
+| Windows | **Not supported** | See [Platform Support](#platform-support) above |
+
+### Hardening checklist for operators
+
+Before putting Tardigrade in production:
+
+- [ ] Set `TARDIGRADE_REQUIRE_UNPRIVILEGED_USER=true` to fail fast if the process is still root.
+- [ ] Set `TARDIGRADE_TLS_CLIENT_VERIFY=true` and supply a CA bundle if upstreams must use mTLS.
+- [ ] Set `TARDIGRADE_MAX_BODY_SIZE`, `TARDIGRADE_MAX_URI_LENGTH`, and `TARDIGRADE_MAX_HEADER_COUNT` to limit request surface.
+- [ ] Set `TARDIGRADE_RATE_LIMIT_RPS` and `TARDIGRADE_RATE_LIMIT_BURST` to match expected traffic profile.
+- [ ] Configure `TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_PATH` and `TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_INTERVAL_MS` so unhealthy backends are removed automatically.
+- [ ] Store secrets in a `TARDIGRADE_SECRETS_PATH` file or `ENC:` encrypted env vars — do not expose raw tokens in environment.
+- [ ] Review `SECURITY.md` for the private reporting and disclosure workflow.
+- [ ] Use `tardigrade validate` in CI/CD before signalling `SIGHUP` to a running process.
+- [ ] Confirm `LimitNOFILE=65536` (or equivalent) in the service unit; set `TARDIGRADE_FD_SOFT_LIMIT` if the OS default is lower.
+- [ ] Enable `TARDIGRADE_ACCESS_LOG_FORMAT=json` and route logs to a structured collector.
+
+---
+
 ## Project Status
 
 This project is under active development. See [CHANGELOG.md](CHANGELOG.md) for recent changes.

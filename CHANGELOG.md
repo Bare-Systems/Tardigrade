@@ -21,6 +21,11 @@
   - Added coverage for transcript persistence, transcript browser responses, and the failure mode where a bad transcript path logs a warning while the proxied request still succeeds.
 
 ### Added
+- Platform support matrix and production-readiness section in README (#27, #32):
+  - Explicit supported-target table (Linux x86_64/aarch64, macOS x86_64/arm64) with CI status notes.
+  - Windows declared as unsupported with rationale (OpenSSL + POSIX signal dependency).
+  - Feature maturity table (GA / Beta / Experimental / Planned) for all major subsystems.
+  - Operator hardening checklist covering privilege drop, TLS, rate limits, secrets, and logging.
 - W3C Trace Context propagation on all upstream requests (#25):
   - Inbound `traceparent` headers are forwarded verbatim so trace IDs survive the edge hop.
   - When no `traceparent` is present, Tardigrade originates a new root span (random trace ID + span ID, sampled flag `0x01`) before forwarding.

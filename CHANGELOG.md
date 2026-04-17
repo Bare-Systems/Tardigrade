@@ -20,6 +20,10 @@
   - Transcript persistence now tightens the NDJSON file to owner-only permissions and redacts raw bearer token / JWT values before write.
   - Added coverage for transcript persistence, transcript browser responses, and the failure mode where a bad transcript path logs a warning while the proxied request still succeeds.
 
+### Added
+- `SECURITY.md` with supported-version policy, private vulnerability reporting instructions (GitHub advisory + email), response SLAs, coordinated disclosure process, and security fix release workflow (#24).
+- `README.md` links to security policy from the project overview.
+
 ### Fixed
 - BearClaw route returning 404 (#21):
   - The `/bearclaw/` location block was present in the live conf but the deployed binary had a stub `isProtectedAuthRequestRoute` that returned `false` for all paths, letting unauthenticated requests through to `/bearclaw/v1/*`. The correct implementation (protecting `/bearclaw/v1/*`, `/bearclaw/transcripts`, and direct `/v1/*` / `/transcripts` paths) has been in source since v1.22 and is now deployed.

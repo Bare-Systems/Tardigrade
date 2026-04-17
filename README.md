@@ -544,6 +544,10 @@ All responses include:
 
 This project is under active development. See [CHANGELOG.md](CHANGELOG.md) for recent changes.
 
+## Security
+
+Tardigrade terminates TLS and enforces auth at the edge. See [SECURITY.md](SECURITY.md) for the supported-version policy, private vulnerability reporting instructions, and disclosure process.
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and guidelines.

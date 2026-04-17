@@ -3,6 +3,29 @@
 
 ## [Unreleased]
 
+### Added
+- Multi-arch Linux release packaging:
+  - GitHub Actions now builds and validates `tardigrade-linux-aarch64` alongside the existing `tardigrade-linux-x86_64` release artifact.
+  - The release installer now resolves the correct Linux asset name for both `x86_64` and `aarch64` hosts.
+- Sticky upstream affinity at the edge:
+  - Relative `proxy_pass` locations and load-balanced API proxy routes now issue per-location HMAC-signed sticky cookies so repeat requests stay pinned to the same healthy upstream.
+  - Tampered affinity cookies are ignored, unhealthy cookie targets are remapped to a healthy backend, and refreshed cookies are reissued with `HttpOnly`, `Secure`, and `SameSite=Lax`.
+  - Added integration coverage for sticky pinning, tampered-cookie rejection, and unhealthy-backend remapping.
+- Identity-aware rate limiting:
+  - Authenticated BearClaw API traffic now rate-limits on asserted identity descriptors instead of collapsing all users behind the same client IP.
+  - Limiter buckets now expire after an idle TTL so stale descriptors are evicted automatically.
+  - Added shared-NAT coverage proving two JWT-authenticated users on the same IP are rate-limited independently.
+- BearClaw transcript browser support at the edge:
+  - Added authenticated `GET /bearclaw/transcripts` and `GET /bearclaw/transcripts/:id` endpoints so BearClawWeb can browse edge transcripts without reading the NDJSON file directly.
+  - Transcript persistence now tightens the NDJSON file to owner-only permissions and redacts raw bearer token / JWT values before write.
+  - Added coverage for transcript persistence, transcript browser responses, and the failure mode where a bad transcript path logs a warning while the proxied request still succeeds.
+
+### Fixed
+- BearClaw route returning 404 (#21):
+  - The `/bearclaw/` location block was present in the live conf but the deployed binary had a stub `isProtectedAuthRequestRoute` that returned `false` for all paths, letting unauthenticated requests through to `/bearclaw/v1/*`. The correct implementation (protecting `/bearclaw/v1/*`, `/bearclaw/transcripts`, and direct `/v1/*` / `/transcripts` paths) has been in source since v1.22 and is now deployed.
+  - Removed the `patch-source-and-rebuild` and `deploy-compiled-binary` hack verify tests that worked around the stale binary.
+  - Fixed the `bearclaw-upstream-configured` verify test to check for the `/bearclaw/` location block rather than a hardcoded absolute upstream URL that was never written to the conf.
+
 ### Changed
 - `blink.toml`: renamed the legacy `health_check.insecure` key to `tls_insecure = true` (Blink Sprint D flipped the HTTP adapter to TLS-verify-by-default). Behaviour is unchanged — Tardigrade's `https://127.0.0.1:8443/health` probe continues to skip TLS verification for the self-signed edge cert, but the flag name now matches Blink's new schema and surfaces as a visible warning in `blink plan`.
 

@@ -4637,6 +4637,15 @@ fn executeRawHttpProxyRequest(
         if (trimmed.len > 0) try extra_headers.append(.{ .name = "X-Forwarded-Host", .value = trimmed });
     }
     try appendAssertedIdentityHeaders(&extra_headers, auth_identity, auth_user_id, auth_device_id, auth_scopes);
+    // W3C Trace Context: propagate inbound traceparent or originate a new one.
+    // A child span is created from an inbound context so the trace ID is preserved
+    // but each hop gets its own span ID.
+    var traceparent_buf: [55]u8 = undefined;
+    if (request_headers.get("traceparent") == null) {
+        const tc = http.trace_context.generate();
+        const tp = tc.format(&traceparent_buf);
+        if (tp.len > 0) try extra_headers.append(.{ .name = "traceparent", .value = tp });
+    }
 
     var req = try client.open(method_enum, uri, .{
         .server_header_buffer = &server_header_buffer,
@@ -4764,6 +4773,14 @@ fn executeUpstreamHttpsWithMtls(
     for (request_headers.iterator()) |entry| {
         if (shouldSkipUpstreamRequestHeader(entry.name)) continue;
         try req_writer.print("{s}: {s}\r\n", .{ entry.name, entry.value });
+    }
+    // W3C Trace Context: originate when absent (inbound propagation happens via
+    // the iterator loop above since traceparent is not in the skip list).
+    if (request_headers.get("traceparent") == null) {
+        var tp_buf: [55]u8 = undefined;
+        const tc = http.trace_context.generate();
+        const tp = tc.format(&tp_buf);
+        if (tp.len > 0) try req_writer.print("traceparent: {s}\r\n", .{tp});
     }
     try req_writer.writeAll("\r\n");
     if (body.len > 0) try req_writer.writeAll(body);

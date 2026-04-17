@@ -383,6 +383,12 @@ pub const EdgeConfig = struct {
     approval_ttl_ms: i64,
     approval_max_pending_per_identity: u32,
     transcript_store_path: []const u8,
+    /// Enable W3C Trace Context propagation and OTLP export (TARDIGRADE_OTEL_ENABLED).
+    otel_enabled: bool,
+    /// OTLP/HTTP endpoint for span export, e.g. `http://jaeger:4318/v1/traces` (TARDIGRADE_OTEL_ENDPOINT).
+    otel_endpoint: []const u8,
+    /// Sampling rate as an integer percentage 0-100; 100 = sample everything (TARDIGRADE_OTEL_SAMPLE_RATE).
+    otel_sample_rate: u32,
 
     pub fn deinit(self: *EdgeConfig, allocator: std.mem.Allocator) void {
         allocator.free(self.listen_host);
@@ -536,6 +542,7 @@ pub const EdgeConfig = struct {
         allocator.free(self.approval_store_path);
         allocator.free(self.approval_escalation_webhook);
         allocator.free(self.transcript_store_path);
+        allocator.free(self.otel_endpoint);
         self.* = undefined;
     }
 };
@@ -938,6 +945,10 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     const approval_max_pending_per_identity = parseIntEnv(u32, allocator, "TARDIGRADE_APPROVAL_MAX_PENDING_PER_IDENTITY", 0);
     const transcript_store_path = envOrDefault(allocator, "TARDIGRADE_TRANSCRIPT_STORE_PATH", "") catch unreachable;
     errdefer allocator.free(transcript_store_path);
+    const otel_enabled = parseBoolEnv(allocator, "TARDIGRADE_OTEL_ENABLED", false);
+    const otel_endpoint = envOrDefault(allocator, "TARDIGRADE_OTEL_ENDPOINT", "") catch unreachable;
+    errdefer allocator.free(otel_endpoint);
+    const otel_sample_rate = parseIntEnv(u32, allocator, "TARDIGRADE_OTEL_SAMPLE_RATE", 100);
 
     const fd_soft_limit_str = envOrDefault(allocator, "TARDIGRADE_FD_SOFT_LIMIT", "0") catch unreachable;
     defer allocator.free(fd_soft_limit_str);
@@ -1364,6 +1375,9 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .approval_ttl_ms = approval_ttl_ms,
         .approval_max_pending_per_identity = approval_max_pending_per_identity,
         .transcript_store_path = transcript_store_path,
+        .otel_enabled = otel_enabled,
+        .otel_endpoint = otel_endpoint,
+        .otel_sample_rate = otel_sample_rate,
     };
 }
 

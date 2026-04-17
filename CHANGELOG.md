@@ -21,6 +21,12 @@
   - Added coverage for transcript persistence, transcript browser responses, and the failure mode where a bad transcript path logs a warning while the proxied request still succeeds.
 
 ### Added
+- W3C Trace Context propagation on all upstream requests (#25):
+  - Inbound `traceparent` headers are forwarded verbatim so trace IDs survive the edge hop.
+  - When no `traceparent` is present, Tardigrade originates a new root span (random trace ID + span ID, sampled flag `0x01`) before forwarding.
+  - Both the stdlib HTTP proxy path and the raw TLS/mTLS socket path now inject a `traceparent` header.
+  - Three new env vars control OTLP export: `TARDIGRADE_OTEL_ENABLED`, `TARDIGRADE_OTEL_ENDPOINT`, and `TARDIGRADE_OTEL_SAMPLE_RATE` (propagation is always active regardless of export config).
+  - Added `src/http/trace_context.zig` — standalone W3C parse/format/generate module with 7 unit tests.
 - `GET /tardigrade/reload/status` built-in route returns the last config reload outcome as JSON (`ok`, `at_ms`, `error`). On no reload since start, all fields are `null` (#26).
 - `install.sh` now downloads and verifies `tardigrade-checksums.txt` before extracting the release archive (#23). SHA-256 is checked with `sha256sum` (Linux) or `shasum -a 256` (macOS); a warning is printed and install continues if neither tool is available.
 - README links to the GitHub Releases page as the primary install surface.

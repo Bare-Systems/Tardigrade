@@ -379,6 +379,18 @@ When `TARDIGRADE_TRUST_SHARED_SECRET` is set and a relative proxy target has mor
 | `TARDIGRADE_WORKER_RECYCLE_SECONDS` | Worker recycle interval | `0` |
 | `TARDIGRADE_WORKER_CPU_AFFINITY` | Linux CPU affinity list for workers | empty |
 
+#### Observability — W3C Trace Context and OTLP
+
+Tardigrade propagates [W3C Trace Context](https://www.w3.org/TR/trace-context/) (`traceparent`) on every upstream request. When a valid `traceparent` header arrives it is forwarded verbatim (inbound propagation). When it is absent Tardigrade originates a new root span before forwarding so every upstream hop has a trace ID available.
+
+| Name | Description | Default |
+|---|---|---|
+| `TARDIGRADE_OTEL_ENABLED` | Enable OTel span export to the OTLP endpoint | `false` |
+| `TARDIGRADE_OTEL_ENDPOINT` | OTLP/HTTP endpoint for span export (e.g. `http://jaeger:4318/v1/traces`) | empty |
+| `TARDIGRADE_OTEL_SAMPLE_RATE` | Trace sampling percentage (0–100); 100 samples every request | `100` |
+
+`traceparent` propagation is always active regardless of `TARDIGRADE_OTEL_ENABLED`; the env vars only control whether spans are exported. Set `TARDIGRADE_OTEL_ENABLED=true` alongside a Jaeger, Tempo, or any OTLP-compatible collector to receive Tardigrade gateway spans.
+
 ## Examples
 
 Example deployment bundles live under `examples/`.

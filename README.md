@@ -83,6 +83,25 @@ The canonical command name is `tardigrade`. Release installs also provide a
 
 All releases are available at **[github.com/Bare-Systems/Tardigrade/releases](https://github.com/Bare-Systems/Tardigrade/releases)**.
 
+### Native packages
+
+**Debian / Ubuntu (.deb)**
+```bash
+# Download from the releases page and install
+sudo apt install ./tardigrade_0.50_amd64.deb
+sudo systemctl enable --now tardigrade
+```
+
+**RHEL / Fedora / AlmaLinux (.rpm)** — see [`packaging/README.md`](packaging/README.md) for build instructions.
+
+**Homebrew (macOS)**
+```bash
+# From local source (tap not yet published)
+brew install --formula packaging/homebrew/tardigrade.rb
+```
+
+See [`packaging/README.md`](packaging/README.md) for full details on each packaging format.
+
 ### Operator CLI
 
 ```bash

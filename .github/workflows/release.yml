@@ -105,11 +105,59 @@ jobs:
           path: ${{ matrix.archive_name }}.tar.gz
           if-no-files-found: error
 
+  build-deb:
+    name: Build DEB packages
+    needs:
+      - prepare-release
+      - build-release
+    if: needs.prepare-release.result == 'success' && needs.prepare-release.outputs.should_publish == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            artifact: tardigrade-linux-x86_64
+          - arch: arm64
+            artifact: tardigrade-linux-aarch64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Download binary artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: artifact
+
+      - name: Extract binary
+        run: |
+          tar -xzf artifact/${{ matrix.artifact }}.tar.gz
+          chmod +x tardigrade
+
+      - name: Build DEB
+        run: |
+          mkdir -p zig-out/bin
+          cp tardigrade zig-out/bin/tardigrade
+          ./packaging/deb/build.sh \
+            --version ${{ needs.prepare-release.outputs.version }} \
+            --arch ${{ matrix.arch }} \
+            --binary zig-out/bin/tardigrade
+
+      - name: Upload DEB artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tardigrade_${{ needs.prepare-release.outputs.version }}_${{ matrix.arch }}.deb
+          path: dist/*.deb
+          if-no-files-found: error
+
   publish-release:
     name: Publish GitHub release assets
     needs:
       - prepare-release
       - build-release
+      - build-deb
     if: needs.prepare-release.result == 'success' && needs.prepare-release.outputs.should_publish == 'true'
     runs-on: ubuntu-latest
 
@@ -126,7 +174,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          find dist -type f -name '*.tar.gz' -print0 | sort -z | xargs -0 shasum -a 256 > dist/tardigrade-checksums.txt
+          find dist -type f \( -name '*.tar.gz' -o -name '*.deb' \) -print0 | sort -z | xargs -0 shasum -a 256 > dist/tardigrade-checksums.txt
 
       - name: Generate release notes
         run: ./scripts/release-metadata.sh notes > release-notes.md
@@ -139,5 +187,6 @@ jobs:
           body_path: release-notes.md
           files: |
             dist/*/*.tar.gz
+            dist/*/*.deb
             dist/tardigrade-checksums.txt
           fail_on_unmatched_files: true

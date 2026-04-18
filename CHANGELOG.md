@@ -21,6 +21,12 @@
   - Added coverage for transcript persistence, transcript browser responses, and the failure mode where a bad transcript path logs a warning while the proxied request still succeeds.
 
 ### Added
+- Native package distribution: DEB, RPM, and Homebrew formula (#31):
+  - `packaging/deb/build.sh` — builds a Debian/Ubuntu `.deb` from a pre-built binary; creates a `tardigrade` system user, installs systemd unit, env config template, and logrotate config.
+  - `packaging/rpm/tardigrade.spec` + `packaging/rpm/build.sh` — RPM spec and build wrapper for RHEL/Fedora/AlmaLinux.
+  - `packaging/homebrew/tardigrade.rb` — Homebrew formula for macOS and Linux; sha256 placeholders to be filled per-release.
+  - `packaging/README.md` — install paths for all packaging formats.
+  - `release.yml` CI: added `build-deb` matrix job that produces `tardigrade_<version>_amd64.deb` and `tardigrade_<version>_arm64.deb` and uploads them as release assets.
 - Kubernetes deployment story: initial Helm chart and deployment guide (#29):
   - `packaging/kubernetes/helm/tardigrade/` — full Helm chart: `Chart.yaml`, `values.yaml`, Deployment, Service, ServiceAccount, HPA, Ingress templates, and `_helpers.tpl`.
   - TLS Secret mounting, ConfigMap config-file mounting, and `envFrom` Secret reference support.

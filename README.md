@@ -422,6 +422,19 @@ Tardigrade propagates [W3C Trace Context](https://www.w3.org/TR/trace-context/) 
 
 `traceparent` propagation is always active regardless of `TARDIGRADE_OTEL_ENABLED`; the env vars only control whether spans are exported. Set `TARDIGRADE_OTEL_ENABLED=true` alongside a Jaeger, Tempo, or any OTLP-compatible collector to receive Tardigrade gateway spans.
 
+#### Service Discovery — DNS A/AAAA
+
+Tardigrade supports DNS-based upstream discovery as a supplement to static pool configuration. Set `TARDIGRADE_UPSTREAM_DNS_DISCOVERY_HOST` to a hostname; Tardigrade will resolve all A/AAAA records for that hostname and add the resulting addresses to the upstream pool. The list refreshes periodically and membership changes are logged.
+
+| Name | Description | Default |
+|---|---|---|
+| `TARDIGRADE_UPSTREAM_DNS_DISCOVERY_HOST` | Hostname to resolve for dynamic upstream discovery (empty = disabled) | empty |
+| `TARDIGRADE_UPSTREAM_DNS_DISCOVERY_PORT` | Port number to use for discovered upstream addresses | `80` |
+| `TARDIGRADE_UPSTREAM_DNS_DISCOVERY_TLS` | Use HTTPS for discovered upstreams | `false` |
+| `TARDIGRADE_UPSTREAM_DNS_REFRESH_INTERVAL_MS` | How often to re-resolve the discovery hostname | `30000` |
+
+Discovered upstreams participate in the active health check probe loop when `TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_INTERVAL_MS` is set. When no static primaries are configured, discovered upstreams serve as the primary pool in round-robin rotation. Static and discovered pools can be combined: set both `TARDIGRADE_UPSTREAM_BASE_URLS` and `TARDIGRADE_UPSTREAM_DNS_DISCOVERY_HOST`.
+
 ## Examples
 
 Example deployment bundles live under `examples/`.
@@ -680,7 +693,8 @@ TLS termination uses the system or linked OpenSSL 1.1.1+ / 3.x library. The Dock
 | Mail relay (SMTP, IMAP, POP3) | **Experimental** | Basic upstream forwarding |
 | Stream TCP/UDP proxy | **Experimental** | Forward-only; no protocol awareness |
 | Kubernetes / Helm | **Planned** | See [#29](https://github.com/Bare-Systems/Tardigrade/issues/29) |
-| Service discovery (DNS SRV, k8s endpoints) | **Planned** | See [#30](https://github.com/Bare-Systems/Tardigrade/issues/30) |
+| Service discovery (DNS A/AAAA refresh) | **Beta** | Configured via `TARDIGRADE_UPSTREAM_DNS_DISCOVERY_HOST` |
+| Service discovery (DNS SRV, k8s endpoints) | **Planned** | SRV and k8s endpoint watch are future scope |
 | Native packages (DEB, RPM, Homebrew) | **Planned** | See [#31](https://github.com/Bare-Systems/Tardigrade/issues/31) |
 | Windows | **Not supported** | See [Platform Support](#platform-support) above |
 

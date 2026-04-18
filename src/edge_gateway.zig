@@ -334,6 +334,9 @@ const GatewayState = struct {
     /// Max concurrent pending approval requests per identity (0 = unlimited).
     approval_max_pending_per_identity: u32,
     transcript_store_path: []const u8,
+    /// DNS-based upstream discovery state. Active when
+    /// cfg.upstream_dns_discovery_host is non-empty.
+    dns_discovery: http.dns_discovery.DnsDiscovery,
     /// Reload state: set by hotReloadConfig on every attempt so operators can
     /// query the outcome without tailing logs.
     reload_mutex: std.Thread.Mutex = .{},
@@ -343,6 +346,7 @@ const GatewayState = struct {
     last_reload_error_len: usize = 0,
 
     fn deinit(self: *GatewayState) void {
+        self.dns_discovery.deinit();
         if (self.rate_limiter) |*rl| rl.deinit();
         if (self.idempotency_store) |*is| is.deinit();
         if (self.proxy_cache_store) |*pc| pc.deinit();
@@ -1289,7 +1293,28 @@ const GatewayState = struct {
     fn nextUpstreamBaseUrl(self: *GatewayState, cfg: *const edge_config.EdgeConfig, pool: UpstreamPoolView, client_ip: []const u8, hash_key: []const u8) []const u8 {
         self.upstream_mutex.lock();
         defer self.upstream_mutex.unlock();
-        return self.nextUpstreamBaseUrlLocked(cfg, pool, client_ip, hash_key, http.event_loop.monotonicMs());
+        const now_ms = http.event_loop.monotonicMs();
+        // When the pool has no static primaries, check DNS-discovered upstreams first.
+        if (pool.primary_urls.len == 0) {
+            if (self.selectDiscoveredUpstreamLocked(now_ms)) |discovered| return discovered;
+        }
+        return self.nextUpstreamBaseUrlLocked(cfg, pool, client_ip, hash_key, now_ms);
+    }
+
+    /// Select a URL from the DNS-discovered upstream set in round-robin order.
+    /// Must be called while holding upstream_mutex. Returns null when discovery
+    /// is inactive or the discovered set is empty.
+    fn selectDiscoveredUpstreamLocked(self: *GatewayState, now_ms: u64) ?[]const u8 {
+        _ = now_ms;
+        // We need to read dns_discovery.urls. Since dns_discovery has its own mutex
+        // and we already hold upstream_mutex, we must not block — tryLock instead.
+        if (!self.dns_discovery.mutex.tryLock()) return null;
+        defer self.dns_discovery.mutex.unlock();
+        const urls = self.dns_discovery.urls.items;
+        if (urls.len == 0) return null;
+        const idx = self.upstream_rr_index % urls.len;
+        self.upstream_rr_index = (idx + 1) % urls.len;
+        return urls[idx];
     }
 
     fn nextStickyUpstreamBaseUrl(
@@ -2341,6 +2366,12 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         .approval_ttl_ms = if (cfg.approval_ttl_ms > 0) cfg.approval_ttl_ms else APPROVAL_TIMEOUT_MS_DEFAULT,
         .approval_max_pending_per_identity = cfg.approval_max_pending_per_identity,
         .transcript_store_path = cfg.transcript_store_path,
+        .dns_discovery = http.dns_discovery.DnsDiscovery.init(state_allocator, .{
+            .host = cfg.upstream_dns_discovery_host,
+            .port = cfg.upstream_dns_discovery_port,
+            .tls = cfg.upstream_dns_discovery_tls,
+            .refresh_interval_ms = cfg.upstream_dns_refresh_interval_ms,
+        }),
     };
     defer state.deinit();
 
@@ -2744,6 +2775,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
             }
             const current_cfg = worker_ctx.currentCfg();
             runActiveHealthChecks(current_cfg, &state);
+            runDnsDiscoveryRefresh(current_cfg, &state);
             runProxyCacheMaintenance(current_cfg, &state);
             if (tls_terminator) |*tls| tls.runMaintenance(http.event_loop.monotonicMs());
         }
@@ -2950,6 +2982,16 @@ fn rejectOverloadedClient(client_fd: std.posix.fd_t) void {
     stream.close();
 }
 
+/// Refresh DNS-discovered upstreams when the refresh interval has elapsed.
+/// Discovered addresses supplement the statically configured upstream pool
+/// via GatewayState.dns_discovery; the selection functions read from both.
+fn runDnsDiscoveryRefresh(_: *const edge_config.EdgeConfig, state: *GatewayState) void {
+    const now_ms = http.event_loop.monotonicMs();
+    if (state.dns_discovery.needsRefresh(now_ms)) {
+        state.dns_discovery.refresh(now_ms);
+    }
+}
+
 fn runActiveHealthChecks(cfg: *const edge_config.EdgeConfig, state: *GatewayState) void {
     if (cfg.upstream_active_health_interval_ms == 0) return;
 
@@ -2982,6 +3024,20 @@ fn runActiveHealthChecks(cfg: *const edge_config.EdgeConfig, state: *GatewayStat
     }
     for (cfg.upstream_commands_backup_base_urls) |base_url| {
         probeSingleUpstream(cfg, state, &probe_client, base_url);
+    }
+
+    // Also probe DNS-discovered upstreams when active health checks are enabled.
+    if (state.dns_discovery.config.host.len > 0) {
+        state.dns_discovery.mutex.lock();
+        // Snapshot URLs under the discovery lock, then probe without it to avoid
+        // blocking the discovery refresh thread.
+        var discovered_buf: [32][]u8 = undefined;
+        const n = @min(state.dns_discovery.urls.items.len, discovered_buf.len);
+        for (state.dns_discovery.urls.items[0..n], 0..) |url, i| discovered_buf[i] = url;
+        state.dns_discovery.mutex.unlock();
+        for (discovered_buf[0..n]) |url| {
+            probeSingleUpstream(cfg, state, &probe_client, url);
+        }
     }
 }
 

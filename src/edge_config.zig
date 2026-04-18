@@ -389,6 +389,16 @@ pub const EdgeConfig = struct {
     otel_endpoint: []const u8,
     /// Sampling rate as an integer percentage 0-100; 100 = sample everything (TARDIGRADE_OTEL_SAMPLE_RATE).
     otel_sample_rate: u32,
+    /// Hostname for DNS A/AAAA-based upstream discovery (TARDIGRADE_UPSTREAM_DNS_DISCOVERY_HOST).
+    /// When non-empty, Tardigrade periodically resolves this hostname and merges the resulting
+    /// addresses into the upstream pool.
+    upstream_dns_discovery_host: []const u8,
+    /// Port to assign to DNS-discovered upstream addresses (TARDIGRADE_UPSTREAM_DNS_DISCOVERY_PORT).
+    upstream_dns_discovery_port: u16,
+    /// Whether to use HTTPS for DNS-discovered upstreams (TARDIGRADE_UPSTREAM_DNS_DISCOVERY_TLS).
+    upstream_dns_discovery_tls: bool,
+    /// How often to re-resolve the discovery hostname in milliseconds (TARDIGRADE_UPSTREAM_DNS_REFRESH_INTERVAL_MS).
+    upstream_dns_refresh_interval_ms: u64,
 
     pub fn deinit(self: *EdgeConfig, allocator: std.mem.Allocator) void {
         allocator.free(self.listen_host);
@@ -543,6 +553,7 @@ pub const EdgeConfig = struct {
         allocator.free(self.approval_escalation_webhook);
         allocator.free(self.transcript_store_path);
         allocator.free(self.otel_endpoint);
+        allocator.free(self.upstream_dns_discovery_host);
         self.* = undefined;
     }
 };
@@ -949,6 +960,11 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     const otel_endpoint = envOrDefault(allocator, "TARDIGRADE_OTEL_ENDPOINT", "") catch unreachable;
     errdefer allocator.free(otel_endpoint);
     const otel_sample_rate = parseIntEnv(u32, allocator, "TARDIGRADE_OTEL_SAMPLE_RATE", 100);
+    const upstream_dns_discovery_host = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_DNS_DISCOVERY_HOST", "") catch unreachable;
+    errdefer allocator.free(upstream_dns_discovery_host);
+    const upstream_dns_discovery_port = parseIntEnv(u16, allocator, "TARDIGRADE_UPSTREAM_DNS_DISCOVERY_PORT", 80);
+    const upstream_dns_discovery_tls = parseBoolEnv(allocator, "TARDIGRADE_UPSTREAM_DNS_DISCOVERY_TLS", false);
+    const upstream_dns_refresh_interval_ms = parseIntEnv(u64, allocator, "TARDIGRADE_UPSTREAM_DNS_REFRESH_INTERVAL_MS", 30_000);
 
     const fd_soft_limit_str = envOrDefault(allocator, "TARDIGRADE_FD_SOFT_LIMIT", "0") catch unreachable;
     defer allocator.free(fd_soft_limit_str);
@@ -1378,6 +1394,10 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .otel_enabled = otel_enabled,
         .otel_endpoint = otel_endpoint,
         .otel_sample_rate = otel_sample_rate,
+        .upstream_dns_discovery_host = upstream_dns_discovery_host,
+        .upstream_dns_discovery_port = upstream_dns_discovery_port,
+        .upstream_dns_discovery_tls = upstream_dns_discovery_tls,
+        .upstream_dns_refresh_interval_ms = upstream_dns_refresh_interval_ms,
     };
 }
 

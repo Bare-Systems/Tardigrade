@@ -65,6 +65,7 @@ pub const secrets = @import("http/secrets.zig");
 pub const approval_store = @import("http/approval_store.zig");
 pub const transcript_store = @import("http/transcript_store.zig");
 pub const trace_context = @import("http/trace_context.zig");
+pub const dns_discovery = @import("http/dns_discovery.zig");
 
 // Re-export constants
 pub const MAX_HEADERS = headers.MAX_HEADERS;

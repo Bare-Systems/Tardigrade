@@ -21,6 +21,12 @@
   - Added coverage for transcript persistence, transcript browser responses, and the failure mode where a bad transcript path logs a warning while the proxied request still succeeds.
 
 ### Added
+- DNS A/AAAA-based upstream service discovery (#30):
+  - `src/http/dns_discovery.zig`: standalone discovery module — resolves a hostname, produces `http[s]://addr:port` URLs, refreshes on a configurable interval, logs membership changes. 4 unit tests.
+  - `GatewayState.dns_discovery`: active when `TARDIGRADE_UPSTREAM_DNS_DISCOVERY_HOST` is set; runs in the existing maintenance loop alongside health checks.
+  - Discovered upstreams are used as primary pool when no static primaries are configured (round-robin selection via `selectDiscoveredUpstreamLocked`).
+  - Active health probes now also probe discovered upstreams when `TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_INTERVAL_MS` is set.
+  - New env vars: `TARDIGRADE_UPSTREAM_DNS_DISCOVERY_HOST`, `TARDIGRADE_UPSTREAM_DNS_DISCOVERY_PORT`, `TARDIGRADE_UPSTREAM_DNS_DISCOVERY_TLS`, `TARDIGRADE_UPSTREAM_DNS_REFRESH_INTERVAL_MS`.
 - Native package distribution: DEB, RPM, and Homebrew formula (#31):
   - `packaging/deb/build.sh` — builds a Debian/Ubuntu `.deb` from a pre-built binary; creates a `tardigrade` system user, installs systemd unit, env config template, and logrotate config.
   - `packaging/rpm/tardigrade.spec` + `packaging/rpm/build.sh` — RPM spec and build wrapper for RHEL/Fedora/AlmaLinux.

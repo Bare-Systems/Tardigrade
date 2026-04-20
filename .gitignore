@@ -29,6 +29,7 @@ deploy/
 PLAN-TEST*.md
 PLAN*.md
 ISSUES.md
+RESEARCH*
 
 # Deployment symlink
 suite/

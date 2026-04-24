@@ -2666,6 +2666,97 @@ test "bearclaw jwt auth forwards asserted identity headers upstream" {
     try std.testing.expectEqualStrings("user-42", upstream.capturedHeader("X-Tardigrade-Auth-Identity").?);
 }
 
+test "inbound X-Tardigrade headers are stripped and unauthenticated requests are not proxied" {
+    const allocator = std.testing.allocator;
+
+    var upstream = try UpstreamServer.start(allocator, &.{.{
+        .body = "{\"ok\":true,\"source\":\"bearclaw-upstream\"}",
+        .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
+    }});
+    defer upstream.stop();
+    try upstream.run();
+
+    var options = bearClawProfile(baseOptions(upstream.port()));
+    options.ready_https_insecure = true;
+    options.auth_token_hashes = null;
+    options.extra_env = &.{
+        .{ .name = "TARDIGRADE_JWT_SECRET", .value = "stage-2c-strip-secret" },
+        .{ .name = "TARDIGRADE_JWT_ISSUER", .value = "bearclaw-web" },
+        .{ .name = "TARDIGRADE_JWT_AUDIENCE", .value = "bearclaw-api" },
+    };
+
+    var tardigrade = try TardigradeProcess.start(allocator, options);
+    defer tardigrade.stop();
+
+    const jwt = try hs256Jwt(
+        allocator,
+        "stage-2c-strip-secret",
+        "{\"sub\":\"real-user\",\"iss\":\"bearclaw-web\",\"aud\":\"bearclaw-api\",\"scope\":\"bearclaw.operator\",\"device_id\":\"real-device\",\"exp\":4102444800}",
+    );
+    defer allocator.free(jwt);
+    const auth_header = try std.fmt.allocPrint(allocator, "Bearer {s}", .{jwt});
+    defer allocator.free(auth_header);
+
+    // Authenticated request with forged identity headers — upstream should see
+    // Tardigrade's asserted values, not the forged ones.
+    var forged = try sendCurlRequest(allocator, tardigrade.port, .{
+        .scheme = "https",
+        .path = "/bearclaw/v1/chat",
+        .method = "POST",
+        .body = "{\"message\":\"hello\"}",
+        .headers = &.{
+            .{ .name = "Host", .value = "api.example.com" },
+            .{ .name = "Authorization", .value = auth_header },
+            .{ .name = "Content-Type", .value = "application/json" },
+            .{ .name = "X-Tardigrade-User-ID", .value = "forged-user" },
+            .{ .name = "X-Tardigrade-Auth-Identity", .value = "forged-identity" },
+            .{ .name = "X-Tardigrade-Scopes", .value = "forged.scope" },
+        },
+        .insecure = true,
+    });
+    defer forged.deinit();
+    try std.testing.expectEqual(@as(u16, 200), forged.status_code);
+    try std.testing.expectEqual(@as(u32, 1), upstream.requestCount());
+    // Forged values must be overwritten by Tardigrade's real asserted values.
+    try std.testing.expectEqualStrings("real-user", upstream.capturedHeader("X-Tardigrade-User-ID").?);
+    try std.testing.expectEqualStrings("real-user", upstream.capturedHeader("X-Tardigrade-Auth-Identity").?);
+    try std.testing.expectEqualStrings("bearclaw.operator", upstream.capturedHeader("X-Tardigrade-Scopes").?);
+
+    // Unauthenticated request to a protected path must be rejected at the edge
+    // and never reach the upstream (request count stays at 1).
+    var rejected = try sendCurlRequest(allocator, tardigrade.port, .{
+        .scheme = "https",
+        .path = "/bearclaw/v1/chat",
+        .method = "POST",
+        .body = "{\"message\":\"hello\"}",
+        .headers = &.{
+            .{ .name = "Host", .value = "api.example.com" },
+            .{ .name = "Content-Type", .value = "application/json" },
+        },
+        .insecure = true,
+    });
+    defer rejected.deinit();
+    try std.testing.expectEqual(@as(u16, 401), rejected.status_code);
+    try std.testing.expectEqual(@as(u32, 1), upstream.requestCount());
+
+    // Invalid bearer must produce 403 and also not reach the upstream.
+    var forbidden = try sendCurlRequest(allocator, tardigrade.port, .{
+        .scheme = "https",
+        .path = "/bearclaw/v1/chat",
+        .method = "POST",
+        .body = "{\"message\":\"hello\"}",
+        .headers = &.{
+            .{ .name = "Host", .value = "api.example.com" },
+            .{ .name = "Authorization", .value = "Bearer invalid-token" },
+            .{ .name = "Content-Type", .value = "application/json" },
+        },
+        .insecure = true,
+    });
+    defer forbidden.deinit();
+    try std.testing.expectEqual(@as(u16, 403), forbidden.status_code);
+    try std.testing.expectEqual(@as(u32, 1), upstream.requestCount());
+}
+
 test "bearclaw rate limiting uses asserted identity for shared nat clients" {
     const allocator = std.testing.allocator;
 

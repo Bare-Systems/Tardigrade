@@ -8250,6 +8250,12 @@ fn appendProxyRequestHeaders(
 }
 
 fn shouldSkipUpstreamRequestHeader(name: []const u8) bool {
+    // Strip inbound X-Tardigrade-* headers so clients cannot forge asserted
+    // identity. Tardigrade re-adds the real values after auth resolves.
+    const tardigrade_prefix = "x-tardigrade-";
+    if (name.len >= tardigrade_prefix.len and
+        std.ascii.eqlIgnoreCase(name[0..tardigrade_prefix.len], tardigrade_prefix))
+        return true;
     return std.ascii.eqlIgnoreCase(name, "connection") or
         std.ascii.eqlIgnoreCase(name, "content-length") or
         std.ascii.eqlIgnoreCase(name, "host") or
@@ -9138,6 +9144,17 @@ test "buildProxyCacheKey falls back for unknown template tokens" {
     const expected = try std.fmt.allocPrint(allocator, "POST:/api/tasks:{s}", .{std.fmt.fmtSliceHexLower(&digest)});
     defer allocator.free(expected);
     try std.testing.expectEqualStrings(expected, key);
+}
+
+test "shouldSkipUpstreamRequestHeader strips inbound X-Tardigrade headers" {
+    try std.testing.expect(shouldSkipUpstreamRequestHeader("X-Tardigrade-Auth-Identity"));
+    try std.testing.expect(shouldSkipUpstreamRequestHeader("x-tardigrade-user-id"));
+    try std.testing.expect(shouldSkipUpstreamRequestHeader("X-TARDIGRADE-DEVICE-ID"));
+    try std.testing.expect(shouldSkipUpstreamRequestHeader("x-tardigrade-scopes"));
+    try std.testing.expect(shouldSkipUpstreamRequestHeader("x-tardigrade-anything-custom"));
+    try std.testing.expect(!shouldSkipUpstreamRequestHeader("X-Custom-Header"));
+    try std.testing.expect(!shouldSkipUpstreamRequestHeader("Authorization"));
+    try std.testing.expect(!shouldSkipUpstreamRequestHeader("Content-Type"));
 }
 
 test "shouldSkipUpstreamResponseHeader strips stale content-encoding" {

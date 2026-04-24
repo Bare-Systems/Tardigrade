@@ -1,7 +1,13 @@
 
 # Changelog
 
-## [Unreleased]
+## [0.62.0] - 2026-04-24
+
+### Added
+- **Identity header stripping** — inbound `X-Tardigrade-*` headers from clients are now stripped unconditionally in `shouldSkipUpstreamRequestHeader` before any proxying occurs. Clients cannot forge `X-Tardigrade-Auth-Identity`, `X-Tardigrade-User-ID`, `X-Tardigrade-Device-ID`, `X-Tardigrade-Scopes`, or any future `X-Tardigrade-*` header. Tardigrade re-adds the real asserted values after auth resolves. Unit test added for `shouldSkipUpstreamRequestHeader`; integration test added covering all three [2C] criteria: stripping forged headers, forwarding real asserted headers, and rejecting unauthenticated/invalid requests before they reach the upstream.
+
+### Added
+- **Edge contract documentation** (`AGENTS.md` + `examples/bearclaw/tardigrade.env.example`): full written contract covering ports, base paths and their auth requirements, per-location `auth required`/`auth off` directive syntax (conf file and env var formats), required auth headers, identity header stripping guarantee, header forwarding contract to upstreams, token hashing procedure, session TTL and store shape, device registry format and permissions, transcript file path and redaction guarantees, rate limiting knobs and recommended production values.
 
 ### Changed
 - **Per-location auth enforcement** — auth is now declared on individual location blocks instead of being hardcoded to a fixed set of paths. Add `auth required;` inside any `location { }` block (config file) or append `|auth:required` to an entry in `TARDIGRADE_LOCATION_BLOCKS`. The default is `auth off` (public). The `isProtectedAuthRequestRoute` function and all BearClaw-specific path coupling have been removed from the core; the `examples/bearclaw/tardigrade.conf` example config now carries the auth directives instead.

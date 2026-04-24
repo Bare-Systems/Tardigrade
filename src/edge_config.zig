@@ -1993,20 +1993,17 @@ fn parseLocationBlocks(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeCon
         var action: http.location_router.Action = undefined;
         if (std.ascii.eqlIgnoreCase(action_kind, "proxy_pass")) {
             const target_raw = fields.next() orelse return error.InvalidLocationBlockFormat;
-            if (fields.next() != null) return error.InvalidLocationBlockFormat;
             const target = std.mem.trim(u8, target_raw, " \t\r\n");
             if (target.len == 0) return error.InvalidLocationBlockFormat;
             action = .{ .proxy_pass = try allocator.dupe(u8, target) };
         } else if (std.ascii.eqlIgnoreCase(action_kind, "fastcgi_pass")) {
             const target_raw = fields.next() orelse return error.InvalidLocationBlockFormat;
-            if (fields.next() != null) return error.InvalidLocationBlockFormat;
             const target = std.mem.trim(u8, target_raw, " \t\r\n");
             if (target.len == 0) return error.InvalidLocationBlockFormat;
             action = .{ .fastcgi_pass = try allocator.dupe(u8, target) };
         } else if (std.ascii.eqlIgnoreCase(action_kind, "return")) {
             const status_raw = fields.next() orelse return error.InvalidLocationBlockFormat;
             const body_raw = fields.next() orelse return error.InvalidLocationBlockFormat;
-            if (fields.next() != null) return error.InvalidLocationBlockFormat;
             const status = std.fmt.parseInt(u16, std.mem.trim(u8, status_raw, " \t\r\n"), 10) catch return error.InvalidLocationBlockFormat;
             action = .{ .return_response = .{
                 .status = status,
@@ -2015,7 +2012,6 @@ fn parseLocationBlocks(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeCon
         } else if (std.ascii.eqlIgnoreCase(action_kind, "rewrite")) {
             const replacement_raw = fields.next() orelse return error.InvalidLocationBlockFormat;
             const flag_raw = fields.next() orelse return error.InvalidLocationBlockFormat;
-            if (fields.next() != null) return error.InvalidLocationBlockFormat;
             const replacement = std.mem.trim(u8, replacement_raw, " \t\r\n");
             const flag = http.rewrite.RewriteFlag.parse(std.mem.trim(u8, flag_raw, " \t\r\n")) orelse return error.InvalidLocationBlockFormat;
             if (replacement.len == 0) return error.InvalidLocationBlockFormat;
@@ -2029,7 +2025,6 @@ fn parseLocationBlocks(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeCon
             const autoindex_raw = fields.next() orelse return error.InvalidLocationBlockFormat;
             const index_raw = fields.next() orelse return error.InvalidLocationBlockFormat;
             const try_files_raw = fields.next() orelse return error.InvalidLocationBlockFormat;
-            if (fields.next() != null) return error.InvalidLocationBlockFormat;
             const root = std.mem.trim(u8, root_raw, " \t\r\n");
             if (root.len == 0) return error.InvalidLocationBlockFormat;
             const alias = parseBoolish(std.mem.trim(u8, alias_raw, " \t\r\n")) orelse return error.InvalidLocationBlockFormat;
@@ -2045,12 +2040,21 @@ fn parseLocationBlocks(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeCon
             return error.InvalidLocationBlockFormat;
         }
 
+        var auth: http.location_router.AuthMode = .off;
+        if (fields.next()) |auth_raw| {
+            const trimmed_auth = std.mem.trim(u8, auth_raw, " \t\r\n");
+            if (!std.mem.startsWith(u8, trimmed_auth, "auth:")) return error.InvalidLocationBlockFormat;
+            auth = http.location_router.AuthMode.parse(trimmed_auth["auth:".len..]) orelse return error.InvalidLocationBlockFormat;
+            if (fields.next() != null) return error.InvalidLocationBlockFormat;
+        }
+
         try out.append(.{
             .match_type = match_type,
             .pattern = try allocator.dupe(u8, pattern),
             .priority = priority,
             .action = action,
             .error_pages = &.{},
+            .auth = auth,
         });
     }
 

@@ -3,6 +3,32 @@
 
 ## [Unreleased]
 
+### Changed
+- **Per-location auth enforcement** — auth is now declared on individual location blocks instead of being hardcoded to a fixed set of paths. Add `auth required;` inside any `location { }` block (config file) or append `|auth:required` to an entry in `TARDIGRADE_LOCATION_BLOCKS`. The default is `auth off` (public). The `isProtectedAuthRequestRoute` function and all BearClaw-specific path coupling have been removed from the core; the `examples/bearclaw/tardigrade.conf` example config now carries the auth directives instead.
+
+### Fixed
+- README incorrectly listed `/health`, `/status`, `/metrics`, and `/status/metrics` as hard-wired operator endpoints. They are not built-in — they must be wired via `location` blocks or `TARDIGRADE_LOCATION_BLOCKS`. The README now distinguishes hard-wired endpoints (`/tardigrade/reload/status`, `/bearclaw/transcripts`) from convention endpoints that operators configure.
+
+### Added
+- `CODE_OF_CONDUCT.md` — Contributor Covenant-based code of conduct.
+- `.github/ISSUE_TEMPLATE/bug_report.md` and `feature_request.md` — structured GitHub issue templates.
+- `.github/PULL_REQUEST_TEMPLATE.md` — PR checklist template.
+- CI now runs `zig fmt --check src/ build.zig` before tests to enforce consistent formatting.
+- `RESEARCH.md` and `RESEARCH-PAST.md` moved from project root to `.claude/` (non-canonical files kept out of the public tree).
+- ISSUES.md updated: `[3A]` (identity-aware rate limiting) and `[3B]` (sticky cookie affinity) and `[2F]` (transcript storage) marked complete.
+
+### Added
+- k6 performance testing and markdown report generation:
+  - Four k6 scenario scripts under `benchmarks/scenarios/`: `throughput.js` (raw req/s, used by all throughput scenarios when k6 is the active tool), `auth-enforcement.js` (verifies 401/2xx correctness under concurrent load), `rate-limit.js` (confirms 429s appear when the request rate exceeds the configured ceiling), and `spike.js` (sudden surge to peak VUs with error-rate and p99 thresholds).
+  - `benchmarks/run.sh` now includes a `run_k6()` throughput runner and a `run_k6_scenario()` behavioral runner; k6 is a fully supported tool in the dispatcher alongside wrk/h2load/fortio.
+  - Three new named scenarios wired into the runner: `auth-enforcement`, `rate-limit`, and `spike` (all require `--tool k6`).
+  - `benchmarks/report.sh`: reads a `--save` JSON results file and emits a markdown performance table; `--update-readme <file>` rewrites the table in-place between `<!-- BENCHMARK_REPORT_START -->` / `<!-- BENCHMARK_REPORT_END -->` markers.
+  - README now has a `### Latest Results` section with those markers so the table is always one command away from being current.
+  - Fixed empty-array bash `-u` expansion bug in all tool runners (`wrk`, `h2load`, `fortio`, `k6`) — was causing silent zero results on macOS.
+  - Fixed wrk latency parsing: added `-L` flag to produce percentile distribution; updated awk parser to handle `ms`/`us` suffixed values.
+  - Fixed k6 summary JSON parsing for k6 v1.x (flat metric format replacing the old nested `values` wrapper).
+  - Fixed `auth-enforcement` and `spike` scenarios: added `http.setResponseCallback(http.expectedStatuses({min:200,max:499}))` so 4xx responses (401, 429) are not counted as failures by `http_req_failed`.
+
 ### Added
 - Multi-arch Linux release packaging:
   - GitHub Actions now builds and validates `tardigrade-linux-aarch64` alongside the existing `tardigrade-linux-x86_64` release artifact.

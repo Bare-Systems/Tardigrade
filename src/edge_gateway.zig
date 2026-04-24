@@ -4057,6 +4057,39 @@ fn routeRequest(
     }
 
     if (http.location_router.matchLocation(request.uri.path, cfg.location_blocks)) |matched| {
+        if (matched.block.auth == .required) {
+            var auth_res = try authorizeRequest(allocator, cfg, &request.headers);
+            defer auth_res.deinit(allocator);
+            if (auth_res.ok) {
+                if (auth_res.identity) |identity| {
+                    ctx.setAuthContext(identity, auth_res.user_id, auth_res.device_id, auth_res.scopes);
+                    auth_res.identity = null;
+                    auth_res.user_id = null;
+                    auth_res.device_id = null;
+                    auth_res.scopes = null;
+                }
+            } else if (http.session.fromHeaders(&request.headers)) |session_token| {
+                if (state.validateSessionIdentity(allocator, session_token)) |identity| {
+                    ctx.setIdentity(identity);
+                } else {
+                    try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, keep_alive.*, state);
+                    state.metricsRecord(401);
+                    state.metricsRecordErrorCode("unauthorized");
+                    return 401;
+                }
+            } else if (cfg.auth_request_url.len > 0 and authorizeViaSubrequest(allocator, cfg, request, correlation_id, client_ip)) {
+                ctx.authenticated = true;
+            } else {
+                const auth_status: http.Status = if (auth_res.failure_reason == .invalid) .forbidden else .unauthorized;
+                const auth_code = if (auth_res.failure_reason == .invalid) "forbidden" else "unauthorized";
+                const auth_message = if (auth_res.failure_reason == .invalid) "Forbidden" else "Unauthorized";
+                const auth_status_code: u16 = @intFromEnum(auth_status);
+                try sendApiError(allocator, writer, auth_status, auth_code, auth_message, correlation_id, keep_alive.*, state);
+                state.metricsRecord(auth_status_code);
+                state.metricsRecordErrorCode(auth_code);
+                return auth_status_code;
+            }
+        }
         switch (matched.block.action) {
             .proxy_pass => |target| {
                 return try handleLocationProxyPass(
@@ -5018,49 +5051,6 @@ fn runMiddlewarePipeline(
             try sendApiError(allocator, writer, .forbidden, "forbidden", "Access denied", correlation_id, keep_alive, state);
             logAccess(ctx, request.method.toString(), request.uri.path, 403, request.headers.get("user-agent") orelse "");
             return true;
-        }
-    }
-
-    if (isProtectedAuthRequestRoute(request.uri.path)) {
-        const has_auth_policy = cfg.basic_auth_hashes.len > 0 or
-            cfg.auth_token_hashes.len > 0 or
-            cfg.jwt_secret.len > 0 or
-            cfg.auth_request_url.len > 0 or
-            state.session_store != null;
-        if (has_auth_policy) {
-            var auth_res = try authorizeRequest(allocator, cfg, &request.headers);
-            defer auth_res.deinit(allocator);
-            if (auth_res.ok) {
-                if (auth_res.identity) |identity| {
-                    ctx.setAuthContext(identity, auth_res.user_id, auth_res.device_id, auth_res.scopes);
-                    auth_res.identity = null;
-                    auth_res.user_id = null;
-                    auth_res.device_id = null;
-                    auth_res.scopes = null;
-                }
-            } else if (http.session.fromHeaders(&request.headers)) |session_token| {
-                if (state.validateSessionIdentity(allocator, session_token)) |identity| {
-                    ctx.setIdentity(identity);
-                } else {
-                    try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, keep_alive, state);
-                    state.metricsRecord(401);
-                    state.metricsRecordErrorCode("unauthorized");
-                    logAccess(ctx, request.method.toString(), request.uri.path, 401, request.headers.get("user-agent") orelse "");
-                    return true;
-                }
-            } else if (cfg.auth_request_url.len > 0 and authorizeViaSubrequest(allocator, cfg, request, correlation_id, client_ip)) {
-                ctx.authenticated = true;
-            } else {
-                const auth_status: http.Status = if (auth_res.failure_reason == .invalid) .forbidden else .unauthorized;
-                const auth_code = if (auth_res.failure_reason == .invalid) "forbidden" else "unauthorized";
-                const auth_message = if (auth_res.failure_reason == .invalid) "Forbidden" else "Unauthorized";
-                const auth_status_code: u16 = @intFromEnum(auth_status);
-                try sendApiError(allocator, writer, auth_status, auth_code, auth_message, correlation_id, keep_alive, state);
-                state.metricsRecord(auth_status_code);
-                state.metricsRecordErrorCode(auth_code);
-                logAccess(ctx, request.method.toString(), request.uri.path, auth_status_code, request.headers.get("user-agent") orelse "");
-                return true;
-            }
         }
     }
 
@@ -7030,18 +7020,6 @@ fn isGeoBlocked(blocked: []const []const u8, country: ?[]const u8) bool {
     return false;
 }
 
-fn isProtectedAuthRequestRoute(path: []const u8) bool {
-    // Protect versioned API routes at both the direct path and the /bearclaw/
-    // edge prefix. Health and static paths remain public so readiness probes
-    // and asset serving work without credentials.
-    if (std.mem.eql(u8, path, "/bearclaw/transcripts")) return true;
-    if (std.mem.startsWith(u8, path, "/bearclaw/transcripts/")) return true;
-    if (std.mem.startsWith(u8, path, "/bearclaw/v1/")) return true;
-    if (std.mem.eql(u8, path, "/transcripts")) return true;
-    if (std.mem.startsWith(u8, path, "/transcripts/")) return true;
-    if (std.mem.startsWith(u8, path, "/v1/")) return true;
-    return false;
-}
 
 fn resolveRequestConfig(base_cfg: *const edge_config.EdgeConfig, raw_host: ?[]const u8, out: *edge_config.EdgeConfig) ?*const edge_config.EdgeConfig {
     out.* = base_cfg.*;

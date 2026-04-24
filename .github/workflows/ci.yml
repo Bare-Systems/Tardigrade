@@ -25,6 +25,9 @@ jobs:
       - name: Install Zig
         run: sh ./scripts/install-zig.sh 0.14.1
 
+      - name: Check formatting
+        run: zig fmt --check src/ build.zig
+
       - name: Run unit tests
         run: zig build test
 

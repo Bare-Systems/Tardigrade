@@ -123,15 +123,21 @@ Config discovery checks `-c/--config`, `TARDIGRADE_CONFIG_PATH`, `./tardigrade.c
 `./config/tardigrade.conf`, `/etc/tardigrade/tardigrade.conf`, and
 `$HOME/.config/tardigrade/tardigrade.conf`.
 
-Built-in operator endpoints:
+Hard-wired operator endpoints (always available, no config required):
 
-- `GET /health` returns runtime health JSON
-- `GET /status` returns runtime status JSON
-- `GET /metrics` returns Prometheus text metrics
-- `GET /status/metrics` returns JSON metrics
-- `GET /tardigrade/reload/status` returns last config reload outcome as JSON
-- `GET /bearclaw/transcripts` returns recent redacted BearClaw edge transcripts
-- `GET /bearclaw/transcripts/:id` returns one redacted transcript record
+- `GET /tardigrade/reload/status` — last config reload outcome as JSON
+- `GET /bearclaw/transcripts` — recent redacted BearClaw edge transcripts (requires `TARDIGRADE_TRANSCRIPT_STORE_PATH`)
+- `GET /bearclaw/transcripts/:id` — one redacted transcript record
+
+Convention endpoints (wire up via `location` blocks or `TARDIGRADE_LOCATION_BLOCKS`):
+
+```nginx
+location /health  { return 200 ok; }
+location /status  { return 200 ok; }
+location /metrics { proxy_pass http://127.0.0.1:9091; }
+```
+
+These are intentionally not hard-wired — Tardigrade leaves `/health`, `/status`, and `/metrics` to operator config so they can proxy to an upstream, return a static payload, or be omitted entirely.
 
 ### Config reload guarantees
 
@@ -466,6 +472,20 @@ A repeatable benchmark and regression harness lives under `benchmarks/`.
 ```
 
 See [`benchmarks/README.md`](benchmarks/README.md) for full usage, scenario descriptions, CI integration guidance, and test-host recommendations.
+
+### Latest Results
+
+<!-- BENCHMARK_REPORT_START -->
+| Scenario | req/s | p50 (ms) | p99 (ms) | Errors |
+| --- | ---: | ---: | ---: | ---: |
+| `keepalive` | 11588 | 0.3 | 118.9 | 0 |
+| `proxy-http1` | 11633 | 0.3 | 115.8 | 0 |
+| `static-http1` | 11568 | 0.3 | 118.5 | 0 |
+
+> **v0.32.0-14-ge035a0a** · 2026-04-23 · tool: `k6` · 50 connections · 15s per scenario · host: `127.0.0.1`
+>
+> Run `./benchmarks/run.sh --save benchmarks/baselines/$(git describe --tags).json` then `./benchmarks/report.sh <file> --update-readme README.md` to refresh this table.
+<!-- BENCHMARK_REPORT_END -->
 
 ### Build for Production
 

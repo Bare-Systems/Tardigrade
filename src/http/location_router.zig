@@ -64,12 +64,24 @@ pub const ErrorPageRule = struct {
     }
 };
 
+pub const AuthMode = enum {
+    off,
+    required,
+
+    pub fn parse(value: []const u8) ?AuthMode {
+        if (std.ascii.eqlIgnoreCase(value, "off")) return .off;
+        if (std.ascii.eqlIgnoreCase(value, "required")) return .required;
+        return null;
+    }
+};
+
 pub const LocationBlock = struct {
     match_type: MatchType,
     pattern: []const u8,
     priority: usize,
     action: Action,
     error_pages: []ErrorPageRule = &.{},
+    auth: AuthMode = .off,
 
     pub fn deinit(self: *LocationBlock, allocator: std.mem.Allocator) void {
         allocator.free(self.pattern);

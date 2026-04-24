@@ -77,6 +77,7 @@ const LocationBlockBuilder = struct {
     return_body: ?[]u8 = null,
     rewrite_replacement: ?[]u8 = null,
     rewrite_flag: ?[]u8 = null,
+    auth: ?[]u8 = null,
     error_pages: std.ArrayListUnmanaged(ErrorPageBuilder) = .{},
 
     fn deinit(self: *LocationBlockBuilder, allocator: std.mem.Allocator) void {
@@ -93,6 +94,7 @@ const LocationBlockBuilder = struct {
         if (self.return_body) |value| allocator.free(value);
         if (self.rewrite_replacement) |value| allocator.free(value);
         if (self.rewrite_flag) |value| allocator.free(value);
+        if (self.auth) |value| allocator.free(value);
         for (self.error_pages.items) |entry| {
             allocator.free(entry.status_codes_csv);
             allocator.free(entry.target);
@@ -747,10 +749,18 @@ fn parseLocationStatement(
         try replaceOptionalOwned(allocator, &builder.rewrite_flag, flag_raw);
         return;
     }
+    if (std.ascii.eqlIgnoreCase(directive, "auth")) {
+        if (!std.ascii.eqlIgnoreCase(value_interp, "required") and !std.ascii.eqlIgnoreCase(value_interp, "off")) {
+            std.log.err("config syntax error at {s}:{d}: auth must be 'required' or 'off'", .{ file_path, line_no });
+            return error.InvalidConfigSyntax;
+        }
+        try replaceOptionalOwned(allocator, &builder.auth, value_interp);
+        return;
+    }
 }
 
 fn buildLocationBlockEntry(allocator: std.mem.Allocator, builder: *LocationBlockBuilder) ![]u8 {
-    const entry = if (builder.proxy_pass) |target|
+    var entry = if (builder.proxy_pass) |target|
         try std.fmt.allocPrint(allocator, "{s}|{s}|proxy_pass|{s}", .{ builder.match_type, builder.pattern, target })
     else if (builder.fastcgi_pass) |target|
         try std.fmt.allocPrint(allocator, "{s}|{s}|fastcgi_pass|{s}", .{ builder.match_type, builder.pattern, target })
@@ -783,6 +793,14 @@ fn buildLocationBlockEntry(allocator: std.mem.Allocator, builder: *LocationBlock
         })
     else
         return error.InvalidConfigSyntax;
+
+    if (builder.auth) |auth_mode| {
+        if (!std.ascii.eqlIgnoreCase(auth_mode, "off")) {
+            const with_auth = try std.fmt.allocPrint(allocator, "{s}|auth:{s}", .{ entry, auth_mode });
+            allocator.free(entry);
+            entry = with_auth;
+        }
+    }
     return entry;
 }
 

@@ -110,13 +110,14 @@ run_wrk() {
     local extra=()
     $INSECURE && extra+=(--insecure)
     local raw
-    raw=$(wrk -t"$THREADS" -c"$CONNECTIONS" -d"${DURATION}s" \
-        "${extra[@]}" "$url" 2>&1) || true
+    raw=$(wrk -t"$THREADS" -c"$CONNECTIONS" -d"${DURATION}s" -L \
+        ${extra[@]+"${extra[@]}"} "$url" 2>&1) || true
     local rps p50 p99 errors
     rps=$(echo "$raw" | grep -E "Requests/sec" | awk '{print $2}' | tr -d ',' || echo 0)
-    p50=$(echo "$raw" | grep -E "50%" | awk '{print $2}' | sed 's/ms//' || echo 0)
-    p99=$(echo "$raw" | grep -E "99%" | awk '{print $2}' | sed 's/ms//' || echo 0)
-    errors=$(echo "$raw" | grep -E "Non-2xx|Socket errors" | grep -oE '[0-9]+' | head -1 || echo 0)
+    # -L produces a latency distribution block; parse ms values (wrk may suffix us/ms/s)
+    p50=$(echo "$raw" | awk '/50%/{v=$2; sub(/ms$/,"",v); sub(/us$/,"",v); if($2~/us/)v=v/1000; print v+0}' || echo 0)
+    p99=$(echo "$raw" | awk '/99%/{v=$2; sub(/ms$/,"",v); sub(/us$/,"",v); if($2~/us/)v=v/1000; print v+0}' || echo 0)
+    errors=$(echo "$raw" | grep -E "Non-2xx" | grep -oE '[0-9]+' | head -1 || echo 0)
     rps=${rps:-0}; p50=${p50:-0}; p99=${p99:-0}; errors=${errors:-0}
     echo "  $label — ${rps} req/s  p50=${p50}ms  p99=${p99}ms  errors=${errors}"
     add_result "$label" "$rps" "$p50" "$p99" "$errors"
@@ -129,7 +130,7 @@ run_h2load() {
     $INSECURE && extra+=(--insecure)
     local raw
     raw=$(h2load -n $((CONNECTIONS * DURATION * 10)) \
-        -c "$CONNECTIONS" -t "$THREADS" "${extra[@]}" "$url" 2>&1) || true
+        -c "$CONNECTIONS" -t "$THREADS" ${extra[@]+"${extra[@]}"} "$url" 2>&1) || true
     local rps p50 p99 errors
     rps=$(echo "$raw" | grep -E "^finished" | grep -oE '[0-9.]+ req/s' | grep -oE '[0-9.]+' || echo 0)
     p50=$(echo "$raw" | grep -E "50th" | grep -oE '[0-9.]+ us' | grep -oE '[0-9.]+' | \
@@ -149,7 +150,7 @@ run_fortio() {
     $INSECURE && extra+=(-insecure)
     local raw
     raw=$(fortio load -c "$CONNECTIONS" -t "${DURATION}s" \
-        -json /dev/stdout "${extra[@]}" "$url" 2>/dev/null) || true
+        -json /dev/stdout ${extra[@]+"${extra[@]}"} "$url" 2>/dev/null) || true
     local rps p50 p99 errors
     rps=$(echo "$raw" | jq -r '.ActualQPS // 0')
     p50=$(echo "$raw" | jq -r '(.DurationHistogram.Percentiles[] | select(.Percentile==50) | .Value) // 0' | \
@@ -162,6 +163,67 @@ run_fortio() {
     add_result "$label" "$rps" "$p50" "$p99" "$errors"
 }
 
+# ── k6 summary parser ────────────────────────────────────────────────────────
+# Parses a k6 --summary-export JSON file (v1.x flat format) and calls add_result.
+_k6_parse_summary() {
+    local tmpfile="$1" label="$2"
+    local rps p50 p99 errors
+    # k6 v1.x: metrics are flat objects — .rate/.count/.med/.["p(99)"] directly
+    rps=$(jq -r '.metrics.http_reqs.rate // 0' "$tmpfile" | awk '{printf "%.0f", $1}')
+    p50=$(jq -r '.metrics.http_req_duration.med // 0' "$tmpfile" | awk '{printf "%.3f", $1}')
+    p99=$(jq -r '.metrics.http_req_duration["p(99)"] // 0' "$tmpfile" | awk '{printf "%.3f", $1}')
+    # passes = count of http_req_failed=1 samples (i.e. actual failed requests)
+    errors=$(jq -r '.metrics.http_req_failed.passes // 0' "$tmpfile")
+    rps=${rps:-0}; p50=${p50:-0}; p99=${p99:-0}; errors=${errors:-0}
+    echo "  $label — ${rps} req/s  p50=${p50}ms  p99=${p99}ms  errors=${errors}"
+    add_result "$label" "$rps" "$p50" "$p99" "$errors"
+}
+
+# ── k6 throughput runner ──────────────────────────────────────────────────────
+run_k6() {
+    local url="$1" label="$2"
+    local tmpfile; tmpfile=$(mktemp /tmp/k6-summary-XXXX.json)
+    local extra_flags=()
+    $INSECURE && extra_flags+=(--insecure-skip-tls-verify)
+
+    # BASE_URL is the scheme+host+port only; the scenario appends /health
+    local base_url="${url%/health}"
+    base_url="${base_url%/}"
+
+    BASE_URL="$base_url" \
+    K6_VUS="$CONNECTIONS" \
+    K6_DURATION="${DURATION}s" \
+        k6 run --no-color --quiet \
+            --summary-export "$tmpfile" \
+            ${extra_flags[@]+"${extra_flags[@]}"} \
+            "$(dirname "$0")/scenarios/throughput.js" 2>/dev/null || true
+
+    _k6_parse_summary "$tmpfile" "$label"
+    rm -f "$tmpfile"
+}
+
+# ── k6 behavioral scenario runner ─────────────────────────────────────────────
+# Runs a named k6 JS script; passes BASE_URL and env overrides through.
+# Results are added to the accumulator with rps/p50/p99/errors extracted from
+# the k6 summary export.
+run_k6_scenario() {
+    local script="$1" label="$2"
+    shift 2
+    local tmpfile; tmpfile=$(mktemp /tmp/k6-summary-XXXX.json)
+    local extra_flags=()
+    $INSECURE && extra_flags+=(--insecure-skip-tls-verify)
+
+    BASE_URL="${SCHEME}://${TARGET_HOST}:${TARGET_PORT}" \
+        k6 run --no-color --quiet \
+            --summary-export "$tmpfile" \
+            ${extra_flags[@]+"${extra_flags[@]}"} \
+            "$@" \
+            "$(dirname "$0")/scenarios/${script}.js" 2>/dev/null || true
+
+    _k6_parse_summary "$tmpfile" "$label"
+    rm -f "$tmpfile"
+}
+
 # ── Generic runner dispatcher ─────────────────────────────────────────────────
 run_scenario() {
     local url="$1" label="$2"
@@ -169,6 +231,7 @@ run_scenario() {
         wrk)    run_wrk    "$url" "$label" ;;
         h2load) run_h2load "$url" "$label" ;;
         fortio) run_fortio "$url" "$label" ;;
+        k6)     run_k6     "$url" "$label" ;;
         *)      echo "Unsupported tool: $TOOL" >&2; exit 1 ;;
     esac
 }
@@ -196,6 +259,40 @@ scenario_proxy_http2() {
 scenario_keepalive() {
     echo "==> keepalive: keep-alive connection reuse"
     run_scenario "${BASE_URL}/health" "keepalive"
+}
+
+scenario_auth_enforcement() {
+    echo "==> auth-enforcement: verify 401 for unauthenticated and 2xx for authenticated requests"
+    if [[ "$TOOL" != "k6" ]]; then
+        echo "  Skipping — auth-enforcement scenario requires k6"
+        return
+    fi
+    run_k6_scenario "auth-enforcement" "auth-enforcement" \
+        -e K6_VUS="${CONNECTIONS}" \
+        -e K6_DURATION="${DURATION}s" \
+        ${AUTH_TOKEN:+-e AUTH_TOKEN="$AUTH_TOKEN"} \
+        ${AUTH_PROTECTED_PATH:+-e AUTH_PROTECTED_PATH="$AUTH_PROTECTED_PATH"}
+}
+
+scenario_rate_limit() {
+    echo "==> rate-limit: verify 429s appear when request rate exceeds the configured ceiling"
+    if [[ "$TOOL" != "k6" ]]; then
+        echo "  Skipping — rate-limit scenario requires k6"
+        return
+    fi
+    run_k6_scenario "rate-limit" "rate-limit" \
+        ${TARDIGRADE_RATE_LIMIT_RPS:+-e RATE_LIMIT_RPS="$TARDIGRADE_RATE_LIMIT_RPS"} \
+        ${RATE_LIMIT_PATH:+-e RATE_LIMIT_PATH="$RATE_LIMIT_PATH"}
+}
+
+scenario_spike() {
+    echo "==> spike: sudden surge to ${SPIKE_PEAK:-150} VUs — measure error rate and p99 under peak load"
+    if [[ "$TOOL" != "k6" ]]; then
+        echo "  Skipping — spike scenario requires k6"
+        return
+    fi
+    run_k6_scenario "spike" "spike" \
+        ${SPIKE_PEAK:+-e SPIKE_PEAK="$SPIKE_PEAK"}
 }
 
 scenario_reload_under_load() {
@@ -232,6 +329,9 @@ for scenario in "${SCENARIO_LIST[@]}"; do
         proxy-http2)        scenario_proxy_http2 ;;
         keepalive)          scenario_keepalive ;;
         reload-under-load)  scenario_reload_under_load ;;
+        auth-enforcement)   scenario_auth_enforcement ;;
+        rate-limit)         scenario_rate_limit ;;
+        spike)              scenario_spike ;;
         *)                  echo "Unknown scenario: $scenario" >&2 ;;
     esac
 done

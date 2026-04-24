@@ -1,6 +1,13 @@
 
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+- **CI: format drift + missing libssl-dev** — Ran `zig fmt` on 10 source files that had drifted from canonical formatting, unblocking the `zig fmt --check` gate. Added explicit `libssl-dev` install to the test job so the OpenSSL dependency is never silently absent on a runner image update.
+
+---
+
 ## [0.62.0] - 2026-04-24
 
 ### Added

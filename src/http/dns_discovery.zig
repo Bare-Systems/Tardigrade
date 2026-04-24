@@ -162,7 +162,10 @@ fn urlSetsEqual(a: []const []u8, b: []const []u8) bool {
     for (a) |ua| {
         var found = false;
         for (b) |ub| {
-            if (std.mem.eql(u8, ua, ub)) { found = true; break; }
+            if (std.mem.eql(u8, ua, ub)) {
+                found = true;
+                break;
+            }
         }
         if (!found) return false;
     }
@@ -199,7 +202,7 @@ test "needsRefresh respects interval" {
 test "urlSetsEqual" {
     var a = [_][]u8{ @constCast("http://1.2.3.4:80"), @constCast("http://5.6.7.8:80") };
     var b = [_][]u8{ @constCast("http://5.6.7.8:80"), @constCast("http://1.2.3.4:80") };
-    var c = [_][]u8{ @constCast("http://1.2.3.4:80") };
+    var c = [_][]u8{@constCast("http://1.2.3.4:80")};
     try testing.expect(urlSetsEqual(&a, &b));
     try testing.expect(!urlSetsEqual(&a, &c));
     try testing.expect(urlSetsEqual(&c, &c));

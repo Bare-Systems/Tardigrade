@@ -298,13 +298,10 @@ pub const ServerSession = if (nghttp3_enabled) struct {
         defer owned_nva.deinit(allocator);
 
         var data_reader = c.nghttp3_data_reader{ .read_data = readDataCb };
-        const reader_ptr = if (response.body) |body|
-            blk: {
-                entry.response_body = try allocator.dupe(u8, body);
-                break :blk if (body.len > 0) &data_reader else null;
-            }
-        else
-            null;
+        const reader_ptr = if (response.body) |body| blk: {
+            entry.response_body = try allocator.dupe(u8, body);
+            break :blk if (body.len > 0) &data_reader else null;
+        } else null;
 
         if (c.nghttp3_conn_submit_response(self.conn, stream_id, owned_nva.nva.ptr, owned_nva.nva.len, reader_ptr) != 0) {
             return error.NotYetImplemented;

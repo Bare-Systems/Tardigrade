@@ -3,7 +3,6 @@
 /// Provides atomic JSON-file persistence and best-effort HTTP webhook delivery
 /// for the approval workflow. All operations that can fail are non-fatal callers
 /// log warnings and continue.
-
 const std = @import("std");
 
 // ---------------------------------------------------------------------------

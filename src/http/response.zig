@@ -12,7 +12,7 @@ pub const SERVER_VERSION = build_options.version;
 // Try to load a custom error page from `public/errors/<code>.html`.
 fn loadCustomErrorPage(allocator: Allocator, status: Status) ?[]const u8 {
     var path_buf: [64]u8 = undefined;
-    const path = std.fmt.bufPrint(&path_buf, "public/errors/{d}.html", .{ status.code() }) catch return null;
+    const path = std.fmt.bufPrint(&path_buf, "public/errors/{d}.html", .{status.code()}) catch return null;
 
     var file = std.fs.cwd().openFile(path, .{}) catch return null;
     defer file.close();

@@ -333,9 +333,10 @@ fn responseContainsEndRequest(data: []const u8, request_id: u16) bool {
 fn appendBeginRequest(out: *std.ArrayList(u8), request_id: u16, keep_conn: bool) !void {
     try writeHeader(out, .begin_request, request_id, 8, 0);
     try out.appendSlice(&[_]u8{
-        0, responder_role,
-        if (keep_conn) keep_conn_flag else 0,
-        0, 0, 0, 0, 0,
+        0,                                    responder_role,
+        if (keep_conn) keep_conn_flag else 0, 0,
+        0,                                    0,
+        0,                                    0,
     });
 }
 

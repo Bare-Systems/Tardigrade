@@ -326,8 +326,7 @@ test "parseResponse handles cgi style status response" {
 
 test "parseResponse decodes chunked http body" {
     const allocator = std.testing.allocator;
-    var parsed = try parseResponse(allocator,
-        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: text/plain\r\n\r\n" ++
+    var parsed = try parseResponse(allocator, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: text/plain\r\n\r\n" ++
         "5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n");
     defer parsed.deinit();
     try std.testing.expectEqual(@as(u16, 200), parsed.status);

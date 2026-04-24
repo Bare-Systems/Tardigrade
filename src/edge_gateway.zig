@@ -1111,7 +1111,8 @@ const GatewayState = struct {
         else
             self.allocator.dupe(u8, "null") catch return null;
         defer self.allocator.free(command_id_part);
-        return std.fmt.allocPrint(self.allocator,
+        return std.fmt.allocPrint(
+            self.allocator,
             "{{\"event\":\"escalated\",\"approval_token\":\"{s}\",\"method\":\"{s}\",\"path\":\"{s}\",\"identity\":\"{s}\",\"command_id\":{s},\"created_ms\":{d},\"expires_ms\":{d}}}",
             .{ token, entry.method, entry.path, entry.identity, command_id_part, entry.created_ms, entry.expires_ms },
         ) catch null;
@@ -2254,18 +2255,35 @@ fn loadApprovalStore(state: *GatewayState) !void {
         }
         const token_key = state.allocator.dupe(u8, s.token) catch continue;
         const entry = ApprovalEntry{
-            .method = state.allocator.dupe(u8, s.method) catch { state.allocator.free(token_key); continue; },
-            .path = state.allocator.dupe(u8, s.path) catch { state.allocator.free(token_key); continue; },
-            .identity = state.allocator.dupe(u8, s.identity) catch { state.allocator.free(token_key); continue; },
-            .command_id = state.allocator.dupe(u8, s.command_id) catch { state.allocator.free(token_key); continue; },
+            .method = state.allocator.dupe(u8, s.method) catch {
+                state.allocator.free(token_key);
+                continue;
+            },
+            .path = state.allocator.dupe(u8, s.path) catch {
+                state.allocator.free(token_key);
+                continue;
+            },
+            .identity = state.allocator.dupe(u8, s.identity) catch {
+                state.allocator.free(token_key);
+                continue;
+            },
+            .command_id = state.allocator.dupe(u8, s.command_id) catch {
+                state.allocator.free(token_key);
+                continue;
+            },
             .status = status,
             .created_ms = s.created_ms,
             .expires_ms = s.expires_ms,
             .decided_ms = s.decided_ms,
-            .decided_by = state.allocator.dupe(u8, s.decided_by) catch { state.allocator.free(token_key); continue; },
+            .decided_by = state.allocator.dupe(u8, s.decided_by) catch {
+                state.allocator.free(token_key);
+                continue;
+            },
             .escalation_fired = s.escalation_fired,
         };
-        state.approvals.put(token_key, entry) catch { state.allocator.free(token_key); };
+        state.approvals.put(token_key, entry) catch {
+            state.allocator.free(token_key);
+        };
     }
 }
 
@@ -7019,7 +7037,6 @@ fn isGeoBlocked(blocked: []const []const u8, country: ?[]const u8) bool {
     }
     return false;
 }
-
 
 fn resolveRequestConfig(base_cfg: *const edge_config.EdgeConfig, raw_host: ?[]const u8, out: *edge_config.EdgeConfig) ?*const edge_config.EdgeConfig {
     out.* = base_cfg.*;

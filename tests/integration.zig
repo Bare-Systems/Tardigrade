@@ -3360,6 +3360,81 @@ test "location block reload takes effect for new requests after sighup" {
     try std.testing.expectEqualStrings("second-location", second_response.body);
 }
 
+test "in-flight request completes safely across reload and new requests use new config" {
+    const allocator = std.testing.allocator;
+
+    const first_responses = [_]UpstreamResponseSpec{.{ .body = "first-location", .delay_ms = 700 }};
+    const second_responses = [_]UpstreamResponseSpec{.{ .body = "second-location" }};
+
+    var first_upstream = try UpstreamServer.start(allocator, &first_responses);
+    defer first_upstream.stop();
+    try first_upstream.run();
+
+    var second_upstream = try UpstreamServer.start(allocator, &second_responses);
+    defer second_upstream.stop();
+    try second_upstream.run();
+
+    const initial_config = try std.fmt.allocPrint(allocator,
+        \\location /dynamic/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+    , .{ test_host, first_upstream.port() });
+    defer allocator.free(initial_config);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = initial_config,
+    });
+    defer tardigrade.stop();
+
+    const InFlightResult = struct {
+        response: ?HttpResponse = null,
+        err: ?anyerror = null,
+    };
+    var in_flight = InFlightResult{};
+    const RequestRunner = struct {
+        fn run(ctx: *InFlightResult, alloc: std.mem.Allocator, port: u16) void {
+            ctx.response = sendRequest(alloc, port, .{
+                .method = "GET",
+                .path = "/dynamic/test",
+                .body = null,
+                .headers = &.{},
+            }) catch |err| {
+                ctx.err = err;
+                return;
+            };
+        }
+    };
+
+    var request_thread = try std.Thread.spawn(.{}, RequestRunner.run, .{ &in_flight, std.heap.page_allocator, tardigrade.port });
+    try waitForUpstreamCount(&first_upstream, 1, 2_000);
+
+    const updated_config = try std.fmt.allocPrint(allocator,
+        \\location /dynamic/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+    , .{ test_host, second_upstream.port() });
+    defer allocator.free(updated_config);
+
+    try tardigrade.rewriteConfig(updated_config);
+    tardigrade.sendSignal(std.posix.SIG.HUP);
+    std.time.sleep(300 * std.time.ns_per_ms);
+
+    var second_response = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/dynamic/test",
+        .body = null,
+        .headers = &.{},
+    });
+    defer second_response.deinit();
+    try std.testing.expectEqualStrings("second-location", second_response.body);
+
+    request_thread.join();
+    if (in_flight.err) |err| return err;
+    var first_response = in_flight.response orelse return error.InvalidHttpResponse;
+    defer first_response.deinit();
+    try std.testing.expectEqualStrings("first-location", first_response.body);
+}
+
 test "location blocks integration routes requests to matching upstreams" {
     const allocator = std.testing.allocator;
 

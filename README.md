@@ -86,6 +86,9 @@ When authentication credentials are present, rate limiting keys on the
 authenticated identity before routing. Requests without resolved auth context
 still fall back to client IP rate limiting.
 
+Hot reloads now retire superseded configs after in-flight requests drain, so
+repeated `reload` or `SIGHUP` cycles do not retain old config allocations.
+
 ## Documentation
 
 | Topic | Location |

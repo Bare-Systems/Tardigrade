@@ -2161,14 +2161,139 @@ fn ipHashIndex(client_ip: []const u8, len: usize) usize {
 }
 
 const WorkerContext = struct {
-    cfg_ptr: std.atomic.Value(usize),
+    config_store: *ReloadableConfigStore,
     state: *GatewayState,
     tls: ?*http.tls_termination.TlsTerminator,
     session_pool: *ConnectionSessionPool,
 
-    fn currentCfg(self: *const WorkerContext) *const edge_config.EdgeConfig {
-        const ptr: *const edge_config.EdgeConfig = @ptrFromInt(self.cfg_ptr.load(.seq_cst));
-        return ptr;
+    fn acquireConfig(self: *WorkerContext) ConfigLease {
+        return self.config_store.acquire();
+    }
+};
+
+const ManagedConfigVersion = struct {
+    cfg: *const edge_config.EdgeConfig,
+    owned_cfg: ?*edge_config.EdgeConfig,
+    ref_count: usize,
+};
+
+const ConfigLease = struct {
+    store: *ReloadableConfigStore,
+    version: *ManagedConfigVersion,
+    cfg: *const edge_config.EdgeConfig,
+
+    fn release(self: *ConfigLease) void {
+        self.store.release(self.version);
+        self.* = undefined;
+    }
+};
+
+const ReloadableConfigStore = struct {
+    allocator: std.mem.Allocator,
+    mutex: std.Thread.Mutex = .{},
+    current: *ManagedConfigVersion,
+    retired: std.ArrayList(*ManagedConfigVersion),
+
+    fn initBorrowed(allocator: std.mem.Allocator, cfg: *const edge_config.EdgeConfig) !ReloadableConfigStore {
+        return .{
+            .allocator = allocator,
+            .current = try createBorrowedVersion(allocator, cfg),
+            .retired = std.ArrayList(*ManagedConfigVersion).init(allocator),
+        };
+    }
+
+    fn deinit(self: *ReloadableConfigStore) void {
+        for (self.retired.items) |version| {
+            self.destroyVersion(version);
+        }
+        self.retired.deinit();
+        self.destroyVersion(self.current);
+        self.* = undefined;
+    }
+
+    fn acquire(self: *ReloadableConfigStore) ConfigLease {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        self.current.ref_count += 1;
+        return .{
+            .store = self,
+            .version = self.current,
+            .cfg = self.current.cfg,
+        };
+    }
+
+    fn prepareOwned(self: *ReloadableConfigStore, cfg_ptr: *edge_config.EdgeConfig) !*ManagedConfigVersion {
+        const version = try createOwnedVersion(self.allocator, cfg_ptr);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.retired.ensureUnusedCapacity(1) catch |err| {
+            self.destroyVersion(version);
+            return err;
+        };
+        return version;
+    }
+
+    fn installPrepared(self: *ReloadableConfigStore, new_version: *ManagedConfigVersion) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const old_version = self.current;
+        self.current = new_version;
+        self.retired.appendAssumeCapacity(old_version);
+        std.debug.assert(old_version.ref_count > 0);
+        old_version.ref_count -= 1;
+        self.collectRetiredLocked();
+    }
+
+    fn release(self: *ReloadableConfigStore, version: *ManagedConfigVersion) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        std.debug.assert(version.ref_count > 0);
+        version.ref_count -= 1;
+        self.collectRetiredLocked();
+    }
+
+    fn collectRetiredLocked(self: *ReloadableConfigStore) void {
+        var idx: usize = 0;
+        while (idx < self.retired.items.len) {
+            const version = self.retired.items[idx];
+            if (version.ref_count == 0) {
+                self.destroyVersion(version);
+                _ = self.retired.swapRemove(idx);
+                continue;
+            }
+            idx += 1;
+        }
+    }
+
+    fn destroyVersion(self: *ReloadableConfigStore, version: *ManagedConfigVersion) void {
+        if (version.owned_cfg) |owned_cfg| {
+            owned_cfg.deinit(self.allocator);
+            self.allocator.destroy(owned_cfg);
+        }
+        self.allocator.destroy(version);
+    }
+
+    fn createBorrowedVersion(allocator: std.mem.Allocator, cfg: *const edge_config.EdgeConfig) !*ManagedConfigVersion {
+        const version = try allocator.create(ManagedConfigVersion);
+        version.* = .{
+            .cfg = cfg,
+            .owned_cfg = null,
+            .ref_count = 1,
+        };
+        return version;
+    }
+
+    fn createOwnedVersion(allocator: std.mem.Allocator, cfg_ptr: *edge_config.EdgeConfig) !*ManagedConfigVersion {
+        const version = try allocator.create(ManagedConfigVersion);
+        version.* = .{
+            .cfg = cfg_ptr,
+            .owned_cfg = cfg_ptr,
+            .ref_count = 1,
+        };
+        return version;
     }
 };
 
@@ -2454,9 +2579,15 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     defer event_loop.deinit();
     try event_loop.addReadFd(listen_fd);
     var timer = http.event_loop.TimerManager.init(250);
+    var config_store = try ReloadableConfigStore.initBorrowed(state_allocator, cfg);
+    defer config_store.deinit();
     var http3_runtime: ?http.http3_runtime.Runtime = null;
     var tls_terminator: ?http.tls_termination.TlsTerminator = null;
-    var http3_dispatch_ctx = Http3DispatchContext{ .cfg = cfg, .state = &state };
+    var http3_dispatch_ctx = Http3DispatchContext{
+        .config_store = &config_store,
+        .cfg = cfg,
+        .state = &state,
+    };
     if (edge_config.hasTlsFiles(cfg)) {
         var sni_specs = try state_allocator.alloc(http.tls_termination.SniCertSpec, cfg.tls_sni_certs.len);
         defer state_allocator.free(sni_specs);
@@ -2534,7 +2665,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         break :blk @intCast(@max(configured, @as(u32, 1)));
     };
     var worker_ctx = WorkerContext{
-        .cfg_ptr = std.atomic.Value(usize).init(@intFromPtr(cfg)),
+        .config_store = &config_store,
         .state = &state,
         .tls = if (tls_terminator) |*tls| tls else null,
         .session_pool = undefined,
@@ -2542,14 +2673,6 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     var session_pool = ConnectionSessionPool.init(state_allocator, &state.request_buffer_pool, cfg.connection_pool_size);
     defer session_pool.deinit();
     worker_ctx.session_pool = &session_pool;
-    var reloaded_cfgs = std.ArrayList(*edge_config.EdgeConfig).init(state_allocator);
-    defer {
-        for (reloaded_cfgs.items) |rcfg| {
-            rcfg.deinit(state_allocator);
-            state_allocator.destroy(rcfg);
-        }
-        reloaded_cfgs.deinit();
-    }
 
     var worker_pool: http.worker_pool.WorkerPool = undefined;
     try worker_pool.init(
@@ -2782,16 +2905,20 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
                 http.shutdown.requestShutdown();
             }
             if (http.shutdown.consumeReopenLogsRequested()) {
-                const current_cfg = worker_ctx.currentCfg();
+                var current_cfg_lease = worker_ctx.acquireConfig();
+                defer current_cfg_lease.release();
+                const current_cfg = current_cfg_lease.cfg;
                 http.access_log.flush();
                 reopenErrorLog(current_cfg) catch |err| {
                     state.logger.warn(null, "log reopen failed: {}", .{err});
                 };
             }
             if (http.shutdown.consumeReloadRequested()) {
-                hotReloadConfig(state_allocator, &worker_ctx, &state, &reloaded_cfgs);
+                hotReloadConfig(state_allocator, &worker_ctx, &state, &http3_dispatch_ctx);
             }
-            const current_cfg = worker_ctx.currentCfg();
+            var current_cfg_lease = worker_ctx.acquireConfig();
+            defer current_cfg_lease.release();
+            const current_cfg = current_cfg_lease.cfg;
             runActiveHealthChecks(current_cfg, &state);
             runDnsDiscoveryRefresh(current_cfg, &state);
             runProxyCacheMaintenance(current_cfg, &state);
@@ -2869,7 +2996,7 @@ fn hotReloadConfig(
     allocator: std.mem.Allocator,
     worker_ctx: *WorkerContext,
     state: *GatewayState,
-    reloaded_cfgs: *std.ArrayList(*edge_config.EdgeConfig),
+    http3_dispatch_ctx: *Http3DispatchContext,
 ) void {
     const now_ms = std.time.milliTimestamp();
     const loaded = edge_config.loadFromEnv(allocator) catch |err| {
@@ -2907,7 +3034,7 @@ fn hotReloadConfig(
         return;
     };
     cfg_ptr.* = loaded;
-    reloaded_cfgs.append(cfg_ptr) catch {
+    const prepared_version = worker_ctx.config_store.prepareOwned(cfg_ptr) catch {
         cfg_ptr.deinit(allocator);
         allocator.destroy(cfg_ptr);
         state.reload_mutex.lock();
@@ -2921,7 +3048,8 @@ fn hotReloadConfig(
     };
 
     applyReloadedRuntimeConfig(cfg_ptr, state);
-    worker_ctx.cfg_ptr.store(@intFromPtr(cfg_ptr), .seq_cst);
+    worker_ctx.config_store.installPrepared(prepared_version);
+    http3_dispatch_ctx.cfg = cfg_ptr;
     http.access_log.deinit();
     http.access_log.init(allocator, .{
         .format = cfg_ptr.access_log_format,
@@ -3231,7 +3359,9 @@ fn handleAcceptedClient(raw_ctx: *anyopaque, client_fd: std.posix.fd_t) void {
     defer if (owned_connection_ip) |ip| ctx.state.allocator.free(ip);
     const connection_ip = owned_connection_ip orelse "unknown";
 
-    const cfg = ctx.currentCfg();
+    var cfg_lease = ctx.acquireConfig();
+    defer cfg_lease.release();
+    const cfg = cfg_lease.cfg;
     const idle_timeout_ms = if (cfg.keep_alive_timeout_ms > 0)
         cfg.keep_alive_timeout_ms
     else
@@ -3291,16 +3421,20 @@ fn handleAcceptedClient(raw_ctx: *anyopaque, client_fd: std.posix.fd_t) void {
 
         var served: u32 = 0;
         while (true) {
-            const live_cfg = ctx.currentCfg();
+            var live_cfg_lease = ctx.acquireConfig();
+            const live_cfg = live_cfg_lease.cfg;
             var keep_alive = false;
             handleConnection(&tls_conn, session, live_cfg, ctx.state, &keep_alive, connection_ip, false) catch |err| {
+                live_cfg_lease.release();
                 ctx.state.logger.err(null, "edge connection error: {}", .{err});
                 break;
             };
             served += 1;
+            const max_requests_per_connection = live_cfg.max_requests_per_connection;
+            live_cfg_lease.release();
             if (http.shutdown.isShutdownRequested()) break;
             if (!keep_alive) break;
-            if (live_cfg.max_requests_per_connection > 0 and served >= live_cfg.max_requests_per_connection) break;
+            if (max_requests_per_connection > 0 and served >= max_requests_per_connection) break;
         }
         if (served == cfg.max_requests_per_connection and cfg.max_requests_per_connection > 0) {
             ctx.state.logger.debug(null, "closing connection after max requests per connection reached ({d})", .{cfg.max_requests_per_connection});
@@ -3311,16 +3445,20 @@ fn handleAcceptedClient(raw_ctx: *anyopaque, client_fd: std.posix.fd_t) void {
 
         var served: u32 = 0;
         while (true) {
-            const live_cfg = ctx.currentCfg();
+            var live_cfg_lease = ctx.acquireConfig();
+            const live_cfg = live_cfg_lease.cfg;
             var keep_alive = false;
             handleConnection(stream, session, live_cfg, ctx.state, &keep_alive, connection_ip, true) catch |err| {
+                live_cfg_lease.release();
                 ctx.state.logger.err(null, "edge connection error: {}", .{err});
                 break;
             };
             served += 1;
+            const max_requests_per_connection = live_cfg.max_requests_per_connection;
+            live_cfg_lease.release();
             if (http.shutdown.isShutdownRequested()) break;
             if (!keep_alive) break;
-            if (live_cfg.max_requests_per_connection > 0 and served >= live_cfg.max_requests_per_connection) break;
+            if (max_requests_per_connection > 0 and served >= max_requests_per_connection) break;
         }
         if (served == cfg.max_requests_per_connection and cfg.max_requests_per_connection > 0) {
             ctx.state.logger.debug(null, "closing connection after max requests per connection reached ({d})", .{cfg.max_requests_per_connection});
@@ -6707,6 +6845,7 @@ fn applyResponseHeaders(state: *GatewayState, response: *http.Response) void {
 }
 
 const Http3DispatchContext = struct {
+    config_store: *ReloadableConfigStore,
     cfg: *const edge_config.EdgeConfig,
     state: *GatewayState,
 };
@@ -6965,9 +7104,12 @@ fn handleHttp3Request(
     user_data: ?*anyopaque,
 ) !void {
     const ctx: *Http3DispatchContext = @ptrCast(@alignCast(user_data orelse return error.InvalidArgument));
+    var cfg_lease = ctx.config_store.acquire();
+    defer cfg_lease.release();
+    const active_cfg = cfg_lease.cfg;
     const authority = request.headers.get(":authority") orelse request.headers.get("host");
-    var effective_cfg_storage = ctx.cfg.*;
-    const effective_cfg = resolveRequestConfig(ctx.cfg, authority, &effective_cfg_storage) orelse {
+    var effective_cfg_storage = active_cfg.*;
+    const effective_cfg = resolveRequestConfig(active_cfg, authority, &effective_cfg_storage) orelse {
         const correlation_id = request.headers.get(http.correlation.HEADER_NAME) orelse "http3";
         const payload = try buildApiErrorJson(allocator, "invalid_request", "Not Found", correlation_id);
         _ = response
@@ -8960,6 +9102,23 @@ test "connection session pool reuses released sessions" {
 
     try std.testing.expect(first == second);
     try std.testing.expectEqual(@as(usize, 0), second.pending_len);
+}
+
+test "reloadable config store retires old config after last lease" {
+    var first_cfg = std.mem.zeroInit(edge_config.EdgeConfig, .{});
+    var second_cfg = std.mem.zeroInit(edge_config.EdgeConfig, .{});
+
+    var store = try ReloadableConfigStore.initBorrowed(std.testing.allocator, &first_cfg);
+    defer store.deinit();
+
+    var lease = store.acquire();
+    try store.retired.ensureUnusedCapacity(1);
+    const new_version = try ReloadableConfigStore.createBorrowedVersion(std.testing.allocator, &second_cfg);
+    store.installPrepared(new_version);
+
+    try std.testing.expectEqual(@as(usize, 1), store.retired.items.len);
+    lease.release();
+    try std.testing.expectEqual(@as(usize, 0), store.retired.items.len);
 }
 
 test "combineProxyTarget joins prefix and suffix" {

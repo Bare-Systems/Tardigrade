@@ -74,6 +74,10 @@ location = /health {
 When proxying, Tardigrade strips hop-by-hop request headers, including headers
 named by the incoming `Connection` header, before forwarding requests upstream.
 
+Static file requests are percent-decoded and normalized before filesystem
+access. Traversal attempts and symlink escapes outside the configured root are
+rejected with `403`.
+
 ## Documentation
 
 | Topic | Location |

@@ -768,7 +768,6 @@ const StartTlsSmtpProcess = struct {
     }
 };
 
-
 const TardigradeProcess = struct {
     allocator: std.mem.Allocator,
     child: std.process.Child,
@@ -2390,7 +2389,6 @@ test "core gateway integration covers health metrics auth proxying invalid json 
     return error.SkipZigTest;
 }
 
-
 test "mux websocket metrics and channel caps are enforced" {
     return error.SkipZigTest;
 }
@@ -2920,8 +2918,7 @@ test "sticky affinity cookie pins relative proxy_pass upstream and sets secure d
         .{ test_host, first_upstream.port(), test_host, second_upstream.port() },
     );
     defer allocator.free(upstream_urls);
-    const config_text = try allocator.dupe(
-        u8,
+    const config_text = try allocator.dupe(u8,
         \\location /sticky/ {
         \\    proxy_pass /upstream/;
         \\}
@@ -2980,8 +2977,7 @@ test "sticky affinity ignores tampered cookie and rotates to a healthy upstream"
         .{ test_host, first_upstream.port(), test_host, second_upstream.port() },
     );
     defer allocator.free(upstream_urls);
-    const config_text = try allocator.dupe(
-        u8,
+    const config_text = try allocator.dupe(u8,
         \\location /sticky/ {
         \\    proxy_pass /upstream/;
         \\}
@@ -3042,8 +3038,7 @@ test "sticky affinity remaps unhealthy upstream cookies to a healthy backend" {
         .{ test_host, first_upstream.port(), test_host, second_upstream.port() },
     );
     defer allocator.free(upstream_urls);
-    const config_text = try allocator.dupe(
-        u8,
+    const config_text = try allocator.dupe(u8,
         \\location /sticky/ {
         \\    proxy_pass /upstream/;
         \\}
@@ -3463,6 +3458,80 @@ test "static file integration serves configured index html" {
     defer response.deinit();
     try std.testing.expectEqual(@as(u16, 200), response.status_code);
     try assertContains(response.body, "index fixture");
+}
+
+test "top-level try_files serves index html and rejects encoded traversal" {
+    const allocator = std.testing.allocator;
+    var fixture = try GenericFixtureDir.create(allocator, "static-top-level");
+    defer fixture.deinit();
+    try fixture.writeRel("public/index.html", "<html><body>root fixture</body></html>\n");
+    try fixture.writeRel("secret.txt", "do not leak\n");
+
+    const public_abs = try fixture.joinAbs("public");
+    defer allocator.free(public_abs);
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\root {s};
+        \\try_files $uri /index.html;
+    , .{public_abs});
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{ .config_text = config_text });
+    defer tardigrade.stop();
+
+    var index_response = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/",
+        .body = null,
+        .headers = &.{},
+    });
+    defer index_response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), index_response.status_code);
+    try assertContains(index_response.body, "root fixture");
+
+    var traversal_response = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/%2e%2e/secret.txt",
+        .body = null,
+        .headers = &.{},
+    });
+    defer traversal_response.deinit();
+    try std.testing.expectEqual(@as(u16, 403), traversal_response.status_code);
+}
+
+test "static file integration rejects symlink escape outside root" {
+    const allocator = std.testing.allocator;
+    var fixture = try GenericFixtureDir.create(allocator, "static-symlink-escape");
+    defer fixture.deinit();
+    try fixture.writeRel("public/index.html", "<html><body>safe</body></html>\n");
+    try fixture.writeRel("secret.txt", "do not leak\n");
+
+    const public_abs = try fixture.joinAbs("public");
+    defer allocator.free(public_abs);
+    const secret_abs = try fixture.joinAbs("secret.txt");
+    defer allocator.free(secret_abs);
+    const symlink_abs = try fixture.joinAbs("public/linked-secret.txt");
+    defer allocator.free(symlink_abs);
+    try std.fs.symLinkAbsolute(secret_abs, symlink_abs, .{});
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location / {{
+        \\    root {s};
+        \\    try_files $uri /index.html;
+        \\}}
+    , .{public_abs});
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{ .config_text = config_text });
+    defer tardigrade.stop();
+
+    var response = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/linked-secret.txt",
+        .body = null,
+        .headers = &.{},
+    });
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 403), response.status_code);
 }
 
 test "static file integration returns 304 for matching If-Modified-Since" {

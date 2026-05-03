@@ -185,7 +185,14 @@ fn resolvePath(allocator: std.mem.Allocator, opts: Options) !ResolvedPath {
                 else => return err,
             };
             if (maybe_resolved) |resolved| {
-                return .{ .kind = resolved, .root_real = root_real };
+                switch (resolved) {
+                    .file => return .{ .kind = resolved, .root_real = root_real },
+                    .directory => |path| {
+                        if (opts.autoindex) return .{ .kind = resolved, .root_real = root_real };
+                        allocator.free(path);
+                    },
+                    else => {},
+                }
             }
         }
     }
@@ -219,12 +226,32 @@ fn resolvePath(allocator: std.mem.Allocator, opts: Options) !ResolvedPath {
     return .{ .kind = .not_found, .root_real = root_real };
 }
 
+pub fn resolveFileCandidate(
+    allocator: std.mem.Allocator,
+    root_real: []const u8,
+    rel: []const u8,
+) !?[]u8 {
+    const maybe_resolved = try resolveExistingCandidate(allocator, root_real, rel);
+    if (maybe_resolved) |resolved| {
+        return switch (resolved) {
+            .file => |path| path,
+            .directory => |path| blk: {
+                allocator.free(path);
+                break :blk null;
+            },
+            else => null,
+        };
+    }
+    return null;
+}
+
 fn resolveExistingCandidate(
     allocator: std.mem.Allocator,
     root_real: []const u8,
     rel: []const u8,
 ) !?ResolvedKind {
-    const normalized_rel = std.mem.trimLeft(u8, rel, "/");
+    const normalized_rel = try normalizeRelativePath(allocator, rel);
+    defer allocator.free(normalized_rel);
     const joined = try std.fs.path.join(allocator, &[_][]const u8{ root_real, normalized_rel });
     defer allocator.free(joined);
 
@@ -246,6 +273,35 @@ fn resolveExistingCandidate(
             break :blk null;
         },
     };
+}
+
+fn normalizeRelativePath(allocator: std.mem.Allocator, rel: []const u8) ![]u8 {
+    const decoded_buf = try allocator.dupe(u8, std.mem.trimLeft(u8, rel, "/"));
+    defer allocator.free(decoded_buf);
+
+    const decoded = std.Uri.percentDecodeInPlace(decoded_buf);
+    var normalized = std.ArrayList(u8).init(allocator);
+    errdefer normalized.deinit();
+
+    var cursor: usize = 0;
+    while (cursor < decoded.len) {
+        while (cursor < decoded.len and isPathSeparator(decoded[cursor])) : (cursor += 1) {}
+        const segment_start = cursor;
+        while (cursor < decoded.len and !isPathSeparator(decoded[cursor])) : (cursor += 1) {}
+
+        const segment = decoded[segment_start..cursor];
+        if (segment.len == 0 or std.mem.eql(u8, segment, ".")) continue;
+        if (std.mem.eql(u8, segment, "..")) return error.PathEscapesRoot;
+
+        if (normalized.items.len > 0) try normalized.append(std.fs.path.sep);
+        try normalized.appendSlice(segment);
+    }
+
+    return normalized.toOwnedSlice();
+}
+
+fn isPathSeparator(ch: u8) bool {
+    return ch == '/' or ch == '\\';
 }
 
 fn isWithinRoot(root_real: []const u8, target_real: []const u8) bool {
@@ -313,6 +369,109 @@ test "serve rejects traversal escaping root" {
     const result = try serve(allocator, .{
         .root = root_path,
         .request_path = request_path,
+        .matched_pattern = "/",
+        .alias = false,
+        .index = "index.html",
+        .try_files = "",
+        .headers = &hdrs,
+    });
+    try std.testing.expect(result != null);
+    var served = result.?;
+    defer served.deinit(allocator);
+    try std.testing.expectEqual(status.Status.forbidden, served.status_code);
+}
+
+test "serve rejects percent-encoded traversal escaping root" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(.{ .sub_path = "index.html", .data = "ok" });
+    const root_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+    const parent = std.fs.path.dirname(root_path).?;
+    const escape_name = "escape-encoded.txt";
+    const escape_path = try std.fs.path.join(allocator, &[_][]const u8{ parent, escape_name });
+    defer allocator.free(escape_path);
+    try std.fs.cwd().writeFile(.{ .sub_path = escape_path, .data = "escape" });
+    defer std.fs.cwd().deleteFile(escape_path) catch {};
+
+    var hdrs = headers_mod.Headers.init(allocator);
+    defer hdrs.deinit();
+
+    const result = try serve(allocator, .{
+        .root = root_path,
+        .request_path = "/%2e%2e/escape-encoded.txt",
+        .matched_pattern = "/",
+        .alias = false,
+        .index = "index.html",
+        .try_files = "",
+        .headers = &hdrs,
+    });
+    try std.testing.expect(result != null);
+    var served = result.?;
+    defer served.deinit(allocator);
+    try std.testing.expectEqual(status.Status.forbidden, served.status_code);
+}
+
+test "serve rejects backslash traversal escaping root" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(.{ .sub_path = "index.html", .data = "ok" });
+    const root_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+    const parent = std.fs.path.dirname(root_path).?;
+    const escape_name = "escape-backslash.txt";
+    const escape_path = try std.fs.path.join(allocator, &[_][]const u8{ parent, escape_name });
+    defer allocator.free(escape_path);
+    try std.fs.cwd().writeFile(.{ .sub_path = escape_path, .data = "escape" });
+    defer std.fs.cwd().deleteFile(escape_path) catch {};
+
+    var hdrs = headers_mod.Headers.init(allocator);
+    defer hdrs.deinit();
+
+    const result = try serve(allocator, .{
+        .root = root_path,
+        .request_path = "/..\\escape-backslash.txt",
+        .matched_pattern = "/",
+        .alias = false,
+        .index = "index.html",
+        .try_files = "",
+        .headers = &hdrs,
+    });
+    try std.testing.expect(result != null);
+    var served = result.?;
+    defer served.deinit(allocator);
+    try std.testing.expectEqual(status.Status.forbidden, served.status_code);
+}
+
+test "serve rejects symlink escape outside root" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(.{ .sub_path = "index.html", .data = "ok" });
+    const root_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+    const parent = std.fs.path.dirname(root_path).?;
+    const escape_name = "escape-target.txt";
+    const escape_path = try std.fs.path.join(allocator, &[_][]const u8{ parent, escape_name });
+    defer allocator.free(escape_path);
+    try std.fs.cwd().writeFile(.{ .sub_path = escape_path, .data = "escape" });
+    defer std.fs.cwd().deleteFile(escape_path) catch {};
+
+    const symlink_path = try std.fs.path.join(allocator, &[_][]const u8{ root_path, "linked.txt" });
+    defer allocator.free(symlink_path);
+    try std.fs.symLinkAbsolute(escape_path, symlink_path, .{});
+
+    var hdrs = headers_mod.Headers.init(allocator);
+    defer hdrs.deinit();
+
+    const result = try serve(allocator, .{
+        .root = root_path,
+        .request_path = "/linked.txt",
         .matched_pattern = "/",
         .alias = false,
         .index = "index.html",

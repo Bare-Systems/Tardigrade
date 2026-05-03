@@ -4170,7 +4170,7 @@ fn routeRequest(
         }
     }
 
-    if (serveTryFilesFallback(allocator, cfg, request.method.toString(), request.uri.path, correlation_id, keep_alive.*, writer, state)) |status| {
+    if (serveTryFilesFallback(allocator, cfg, request, correlation_id, keep_alive.*, writer, state)) |status| {
         state.metricsRecord(status);
         return status;
     } else |_| {}
@@ -5214,37 +5214,49 @@ fn handleStaticLocation(
 fn serveTryFilesFallback(
     allocator: std.mem.Allocator,
     cfg: *const edge_config.EdgeConfig,
-    method: []const u8,
-    request_path: []const u8,
+    request: *const http.Request,
     correlation_id: []const u8,
     keep_alive: bool,
     writer: anytype,
     state: *GatewayState,
 ) !u16 {
+    const method = request.method.toString();
+    const request_path = request.uri.path;
     if (!(std.ascii.eqlIgnoreCase(method, "GET") or std.ascii.eqlIgnoreCase(method, "HEAD"))) return error.NoTryFiles;
     if (cfg.doc_root.len == 0 or cfg.try_files.len == 0) return error.NoTryFiles;
 
-    var candidates = std.mem.splitScalar(u8, cfg.try_files, ',');
-    while (candidates.next()) |cand_raw| {
-        const cand = std.mem.trim(u8, cand_raw, " \t\r\n");
-        if (cand.len == 0) continue;
-        const rel = if (std.mem.eql(u8, cand, "$uri")) request_path else cand;
-        const safe_rel = std.mem.trimLeft(u8, rel, "/");
-        const full_path = try std.fs.path.join(allocator, &[_][]const u8{ cfg.doc_root, safe_rel });
-        defer allocator.free(full_path);
-        const file_data = std.fs.cwd().readFileAlloc(allocator, full_path, MAX_REQUEST_SIZE) catch continue;
-        defer allocator.free(file_data);
+    var served = (try http.static_file.serve(allocator, .{
+        .root = cfg.doc_root,
+        .request_path = request_path,
+        .matched_pattern = "/",
+        .alias = false,
+        .index = "",
+        .try_files = cfg.try_files,
+        .autoindex = false,
+        .headers = &request.headers,
+        .max_bytes = MAX_REQUEST_SIZE,
+    })) orelse return error.NoTryFiles;
+    defer served.deinit(allocator);
 
-        var response = http.Response.ok(allocator, if (std.ascii.eqlIgnoreCase(method, "HEAD")) "" else file_data, "application/octet-stream");
-        defer response.deinit();
-        _ = response
-            .setConnection(keep_alive)
-            .setHeader(http.correlation.HEADER_NAME, correlation_id);
-        applyResponseHeaders(state, &response);
+    var response = http.Response.init(allocator);
+    defer response.deinit();
+    _ = response
+        .setStatus(served.status_code)
+        .setBody(served.body)
+        .setContentType(served.content_type)
+        .setConnection(keep_alive)
+        .setHeader(http.correlation.HEADER_NAME, correlation_id);
+    if (served.etag_value) |etag_value| _ = response.setHeader("ETag", etag_value);
+    if (served.last_modified_value) |last_modified| _ = response.setHeader("Last-Modified", last_modified);
+    if (served.content_range_value) |content_range| _ = response.setHeader("Content-Range", content_range);
+    if (served.accept_ranges) _ = response.setHeader("Accept-Ranges", "bytes");
+    applyResponseHeaders(state, &response);
+    if (std.ascii.eqlIgnoreCase(method, "HEAD")) {
+        try response.writeHead(writer);
+    } else {
         try response.write(writer);
-        return 200;
     }
-    return error.NoTryFiles;
+    return @intFromEnum(served.status_code);
 }
 
 fn streamSseTopic(

@@ -16,6 +16,7 @@ All notable user-facing changes to Tardigrade are documented here.
 - CI now installs OpenSSL development headers explicitly and enforces formatting consistently.
 - Proxy requests now strip RFC hop-by-hop headers, including headers named by the incoming `Connection` field, before forwarding to upstreams.
 - Static file serving now rejects percent-encoded traversal, separator-variant traversal, and symlink escapes outside the configured root.
+- Rate limiting now resolves authenticated identity before middleware enforcement so JWT, bearer, and session traffic do not share an IP-only bucket.
 
 ## [0.62.0] - 2026-04-24
 

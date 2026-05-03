@@ -2315,6 +2315,19 @@ fn bearClawProfile(options: TardigradeOptions) TardigradeOptions {
     return updated;
 }
 
+fn authProxyConfig(allocator: std.mem.Allocator) ![]u8 {
+    return std.fmt.allocPrint(allocator,
+        \\location = /health {{
+        \\    return 200 ok;
+        \\}}
+        \\
+        \\location = /v1/chat {{
+        \\    proxy_pass /v1/chat;
+        \\    auth required;
+        \\}}
+    , .{});
+}
+
 const ConcurrentRequestResult = struct {
     status_code: u16 = 0,
     body_contains_ok: bool = false,
@@ -2612,7 +2625,7 @@ test "bearclaw edge prefix routes health without auth and enforces auth on v1 pa
     try std.testing.expectEqualStrings("/v1/chat", api_path);
 }
 
-test "bearclaw jwt auth forwards asserted identity headers upstream" {
+test "jwt auth forwards asserted identity headers upstream" {
     const allocator = std.testing.allocator;
 
     var upstream = try UpstreamServer.start(allocator, &.{.{
@@ -2622,16 +2635,20 @@ test "bearclaw jwt auth forwards asserted identity headers upstream" {
     defer upstream.stop();
     try upstream.run();
 
-    var options = bearClawProfile(baseOptions(upstream.port()));
-    options.ready_https_insecure = true;
-    options.auth_token_hashes = null;
-    options.extra_env = &.{
-        .{ .name = "TARDIGRADE_JWT_SECRET", .value = "stage-2c-secret" },
-        .{ .name = "TARDIGRADE_JWT_ISSUER", .value = "bearclaw-web" },
-        .{ .name = "TARDIGRADE_JWT_AUDIENCE", .value = "bearclaw-api" },
-    };
+    const config_text = try authProxyConfig(allocator);
+    defer allocator.free(config_text);
 
-    var tardigrade = try TardigradeProcess.start(allocator, options);
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .profile = .generic,
+        .upstream_port = upstream.port(),
+        .auth_token_hashes = null,
+        .config_text = config_text,
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_JWT_SECRET", .value = "stage-2c-secret" },
+            .{ .name = "TARDIGRADE_JWT_ISSUER", .value = "bearclaw-web" },
+            .{ .name = "TARDIGRADE_JWT_AUDIENCE", .value = "bearclaw-api" },
+        },
+    });
     defer tardigrade.stop();
 
     const jwt = try hs256Jwt(
@@ -2643,17 +2660,14 @@ test "bearclaw jwt auth forwards asserted identity headers upstream" {
     const auth_header = try std.fmt.allocPrint(allocator, "Bearer {s}", .{jwt});
     defer allocator.free(auth_header);
 
-    var api_authorized = try sendCurlRequest(allocator, tardigrade.port, .{
-        .scheme = "https",
-        .path = "/bearclaw/v1/chat",
+    var api_authorized = try sendRequest(allocator, tardigrade.port, .{
         .method = "POST",
+        .path = "/v1/chat",
         .body = "{\"message\":\"hello\"}",
         .headers = &.{
-            .{ .name = "Host", .value = "api.example.com" },
             .{ .name = "Authorization", .value = auth_header },
             .{ .name = "Content-Type", .value = "application/json" },
         },
-        .insecure = true,
     });
     defer api_authorized.deinit();
     try std.testing.expectEqual(@as(u16, 200), api_authorized.status_code);
@@ -2674,16 +2688,20 @@ test "inbound X-Tardigrade headers are stripped and unauthenticated requests are
     defer upstream.stop();
     try upstream.run();
 
-    var options = bearClawProfile(baseOptions(upstream.port()));
-    options.ready_https_insecure = true;
-    options.auth_token_hashes = null;
-    options.extra_env = &.{
-        .{ .name = "TARDIGRADE_JWT_SECRET", .value = "stage-2c-strip-secret" },
-        .{ .name = "TARDIGRADE_JWT_ISSUER", .value = "bearclaw-web" },
-        .{ .name = "TARDIGRADE_JWT_AUDIENCE", .value = "bearclaw-api" },
-    };
+    const config_text = try authProxyConfig(allocator);
+    defer allocator.free(config_text);
 
-    var tardigrade = try TardigradeProcess.start(allocator, options);
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .profile = .generic,
+        .upstream_port = upstream.port(),
+        .auth_token_hashes = null,
+        .config_text = config_text,
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_JWT_SECRET", .value = "stage-2c-strip-secret" },
+            .{ .name = "TARDIGRADE_JWT_ISSUER", .value = "bearclaw-web" },
+            .{ .name = "TARDIGRADE_JWT_AUDIENCE", .value = "bearclaw-api" },
+        },
+    });
     defer tardigrade.stop();
 
     const jwt = try hs256Jwt(
@@ -2697,20 +2715,17 @@ test "inbound X-Tardigrade headers are stripped and unauthenticated requests are
 
     // Authenticated request with forged identity headers — upstream should see
     // Tardigrade's asserted values, not the forged ones.
-    var forged = try sendCurlRequest(allocator, tardigrade.port, .{
-        .scheme = "https",
-        .path = "/bearclaw/v1/chat",
+    var forged = try sendRequest(allocator, tardigrade.port, .{
         .method = "POST",
+        .path = "/v1/chat",
         .body = "{\"message\":\"hello\"}",
         .headers = &.{
-            .{ .name = "Host", .value = "api.example.com" },
             .{ .name = "Authorization", .value = auth_header },
             .{ .name = "Content-Type", .value = "application/json" },
             .{ .name = "X-Tardigrade-User-ID", .value = "forged-user" },
             .{ .name = "X-Tardigrade-Auth-Identity", .value = "forged-identity" },
             .{ .name = "X-Tardigrade-Scopes", .value = "forged.scope" },
         },
-        .insecure = true,
     });
     defer forged.deinit();
     try std.testing.expectEqual(@as(u16, 200), forged.status_code);
@@ -2722,33 +2737,27 @@ test "inbound X-Tardigrade headers are stripped and unauthenticated requests are
 
     // Unauthenticated request to a protected path must be rejected at the edge
     // and never reach the upstream (request count stays at 1).
-    var rejected = try sendCurlRequest(allocator, tardigrade.port, .{
-        .scheme = "https",
-        .path = "/bearclaw/v1/chat",
+    var rejected = try sendRequest(allocator, tardigrade.port, .{
         .method = "POST",
+        .path = "/v1/chat",
         .body = "{\"message\":\"hello\"}",
         .headers = &.{
-            .{ .name = "Host", .value = "api.example.com" },
             .{ .name = "Content-Type", .value = "application/json" },
         },
-        .insecure = true,
     });
     defer rejected.deinit();
     try std.testing.expectEqual(@as(u16, 401), rejected.status_code);
     try std.testing.expectEqual(@as(u32, 1), upstream.requestCount());
 
     // Invalid bearer must produce 403 and also not reach the upstream.
-    var forbidden = try sendCurlRequest(allocator, tardigrade.port, .{
-        .scheme = "https",
-        .path = "/bearclaw/v1/chat",
+    var forbidden = try sendRequest(allocator, tardigrade.port, .{
         .method = "POST",
+        .path = "/v1/chat",
         .body = "{\"message\":\"hello\"}",
         .headers = &.{
-            .{ .name = "Host", .value = "api.example.com" },
             .{ .name = "Authorization", .value = "Bearer invalid-token" },
             .{ .name = "Content-Type", .value = "application/json" },
         },
-        .insecure = true,
     });
     defer forbidden.deinit();
     try std.testing.expectEqual(@as(u16, 403), forbidden.status_code);
@@ -2810,7 +2819,7 @@ test "proxy requests strip hop-by-hop headers before reaching upstreams" {
     try std.testing.expectEqualStrings("still-here", upstream.capturedHeader("X-Custom-Pass").?);
 }
 
-test "bearclaw rate limiting uses asserted identity for shared nat clients" {
+test "rate limiting uses asserted identity for shared nat clients" {
     const allocator = std.testing.allocator;
 
     var upstream = try UpstreamServer.start(allocator, &.{
@@ -2820,18 +2829,22 @@ test "bearclaw rate limiting uses asserted identity for shared nat clients" {
     defer upstream.stop();
     try upstream.run();
 
-    var options = bearClawProfile(baseOptions(upstream.port()));
-    options.ready_https_insecure = true;
-    options.auth_token_hashes = null;
-    options.rate_limit_rps = "0.001";
-    options.rate_limit_burst = "1";
-    options.extra_env = &.{
-        .{ .name = "TARDIGRADE_JWT_SECRET", .value = "stage-3a-secret" },
-        .{ .name = "TARDIGRADE_JWT_ISSUER", .value = "bearclaw-web" },
-        .{ .name = "TARDIGRADE_JWT_AUDIENCE", .value = "bearclaw-api" },
-    };
+    const config_text = try authProxyConfig(allocator);
+    defer allocator.free(config_text);
 
-    var tardigrade = try TardigradeProcess.start(allocator, options);
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .profile = .generic,
+        .upstream_port = upstream.port(),
+        .auth_token_hashes = null,
+        .rate_limit_rps = "0.001",
+        .rate_limit_burst = "1",
+        .config_text = config_text,
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_JWT_SECRET", .value = "stage-3a-secret" },
+            .{ .name = "TARDIGRADE_JWT_ISSUER", .value = "bearclaw-web" },
+            .{ .name = "TARDIGRADE_JWT_AUDIENCE", .value = "bearclaw-api" },
+        },
+    });
     defer tardigrade.stop();
 
     const jwt_a = try hs256Jwt(
@@ -2851,47 +2864,38 @@ test "bearclaw rate limiting uses asserted identity for shared nat clients" {
     const auth_b = try std.fmt.allocPrint(allocator, "Bearer {s}", .{jwt_b});
     defer allocator.free(auth_b);
 
-    var first_a = try sendCurlRequest(allocator, tardigrade.port, .{
-        .scheme = "https",
-        .path = "/bearclaw/v1/chat",
+    var first_a = try sendRequest(allocator, tardigrade.port, .{
         .method = "POST",
+        .path = "/v1/chat",
         .body = "{\"message\":\"hello from user 42\"}",
         .headers = &.{
-            .{ .name = "Host", .value = "api.example.com" },
             .{ .name = "Authorization", .value = auth_a },
             .{ .name = "Content-Type", .value = "application/json" },
         },
-        .insecure = true,
     });
     defer first_a.deinit();
     try std.testing.expectEqual(@as(u16, 200), first_a.status_code);
 
-    var second_a = try sendCurlRequest(allocator, tardigrade.port, .{
-        .scheme = "https",
-        .path = "/bearclaw/v1/chat",
+    var second_a = try sendRequest(allocator, tardigrade.port, .{
         .method = "POST",
+        .path = "/v1/chat",
         .body = "{\"message\":\"second request same identity\"}",
         .headers = &.{
-            .{ .name = "Host", .value = "api.example.com" },
             .{ .name = "Authorization", .value = auth_a },
             .{ .name = "Content-Type", .value = "application/json" },
         },
-        .insecure = true,
     });
     defer second_a.deinit();
     try std.testing.expectEqual(@as(u16, 429), second_a.status_code);
 
-    var first_b = try sendCurlRequest(allocator, tardigrade.port, .{
-        .scheme = "https",
-        .path = "/bearclaw/v1/chat",
+    var first_b = try sendRequest(allocator, tardigrade.port, .{
         .method = "POST",
+        .path = "/v1/chat",
         .body = "{\"message\":\"hello from user 84\"}",
         .headers = &.{
-            .{ .name = "Host", .value = "api.example.com" },
             .{ .name = "Authorization", .value = auth_b },
             .{ .name = "Content-Type", .value = "application/json" },
         },
-        .insecure = true,
     });
     defer first_b.deinit();
     try std.testing.expectEqual(@as(u16, 200), first_b.status_code);

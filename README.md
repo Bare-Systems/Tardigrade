@@ -78,6 +78,10 @@ Static file requests are percent-decoded and normalized before filesystem
 access. Traversal attempts and symlink escapes outside the configured root are
 rejected with `403`.
 
+When authentication credentials are present, rate limiting keys on the
+authenticated identity before routing. Requests without resolved auth context
+still fall back to client IP rate limiting.
+
 ## Documentation
 
 | Topic | Location |

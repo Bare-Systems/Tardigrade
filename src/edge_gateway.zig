@@ -4050,6 +4050,8 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         );
     }
 
+    try primeRequestAuthContext(allocator, effective_cfg, state, &ctx, &request.headers);
+
     if (try runMiddlewarePipeline(allocator, writer, effective_cfg, state, &ctx, &request, correlation_id, keep_alive)) {
         return;
     }
@@ -4083,7 +4085,7 @@ fn routeRequest(
     }
 
     if (http.location_router.matchLocation(request.uri.path, cfg.location_blocks)) |matched| {
-        if (matched.block.auth == .required) {
+        if (matched.block.auth == .required and !ctx.authenticated and ctx.identity == null) {
             var auth_res = try authorizeRequest(allocator, cfg, &request.headers);
             defer auth_res.deinit(allocator);
             if (auth_res.ok) {
@@ -4178,6 +4180,37 @@ fn routeRequest(
     try sendApiError(allocator, writer, .not_found, "invalid_request", "Not Found", correlation_id, keep_alive.*, state);
     state.metricsRecord(404);
     return 404;
+}
+
+fn primeRequestAuthContext(
+    allocator: std.mem.Allocator,
+    cfg: *const edge_config.EdgeConfig,
+    state: *GatewayState,
+    ctx: *http.request_context.RequestContext,
+    headers: *const http.Headers,
+) !void {
+    if (ctx.authenticated or ctx.identity != null) return;
+
+    var auth_res = try authorizeRequest(allocator, cfg, headers);
+    defer auth_res.deinit(allocator);
+    if (auth_res.ok) {
+        if (auth_res.identity) |identity| {
+            ctx.setAuthContext(identity, auth_res.user_id, auth_res.device_id, auth_res.scopes);
+            auth_res.identity = null;
+            auth_res.user_id = null;
+            auth_res.device_id = null;
+            auth_res.scopes = null;
+        } else {
+            ctx.authenticated = true;
+        }
+        return;
+    }
+
+    if (http.session.fromHeaders(headers)) |session_token| {
+        if (state.validateSessionIdentity(allocator, session_token)) |identity| {
+            ctx.setIdentity(identity);
+        }
+    }
 }
 
 fn handleTranscriptRoute(

@@ -78,6 +78,10 @@ Static file requests are percent-decoded and normalized before filesystem
 access. Traversal attempts and symlink escapes outside the configured root are
 rejected with `403`.
 
+On plain HTTP connections, static file responses use a file-backed transfer
+path when the OS supports it, while TLS and other transformed response paths
+continue to use the buffered fallback.
+
 When authentication credentials are present, rate limiting keys on the
 authenticated identity before routing. Requests without resolved auth context
 still fall back to client IP rate limiting.

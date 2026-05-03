@@ -136,11 +136,16 @@ pub const Response = struct {
         try writer.print("Server: {s}/{s}\r\n", .{ SERVER_NAME, SERVER_VERSION });
 
         // Content-Length
-        const body_len = if (self.body) |b| b.len else 0;
-        try writer.print("Content-Length: {d}\r\n", .{body_len});
+        if (self.headers.get("content-length")) |content_length| {
+            try writer.print("Content-Length: {s}\r\n", .{content_length});
+        } else {
+            const body_len = if (self.body) |b| b.len else 0;
+            try writer.print("Content-Length: {d}\r\n", .{body_len});
+        }
 
         // User-defined headers
         for (self.headers.iterator()) |header| {
+            if (std.ascii.eqlIgnoreCase(header.name, "content-length")) continue;
             try writer.print("{s}: {s}\r\n", .{ header.name, header.value });
         }
 
@@ -169,11 +174,16 @@ pub const Response = struct {
         try writer.print("Server: {s}/{s}\r\n", .{ SERVER_NAME, SERVER_VERSION });
 
         // Content-Length (still include even for HEAD)
-        const body_len = if (self.body) |b| b.len else 0;
-        try writer.print("Content-Length: {d}\r\n", .{body_len});
+        if (self.headers.get("content-length")) |content_length| {
+            try writer.print("Content-Length: {s}\r\n", .{content_length});
+        } else {
+            const body_len = if (self.body) |b| b.len else 0;
+            try writer.print("Content-Length: {d}\r\n", .{body_len});
+        }
 
         // User-defined headers
         for (self.headers.iterator()) |header| {
+            if (std.ascii.eqlIgnoreCase(header.name, "content-length")) continue;
             try writer.print("{s}: {s}\r\n", .{ header.name, header.value });
         }
 

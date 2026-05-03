@@ -3464,6 +3464,42 @@ test "static file integration serves configured index html" {
     try assertContains(response.body, "index fixture");
 }
 
+test "static file integration serves large files over plain http" {
+    const allocator = std.testing.allocator;
+    var fixture = try GenericFixtureDir.create(allocator, "static-large");
+    defer fixture.deinit();
+
+    const payload_len = 256 * 1024;
+    const payload = try allocator.alloc(u8, payload_len);
+    defer allocator.free(payload);
+    for (payload, 0..) |*byte, i| byte.* = @intCast(i % 251);
+    try fixture.writeRel("public/large.bin", payload);
+
+    const public_abs = try fixture.joinAbs("public");
+    defer allocator.free(public_abs);
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location / {{
+        \\    root {s};
+        \\    try_files $uri /index.html;
+        \\}}
+    , .{public_abs});
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{ .config_text = config_text });
+    defer tardigrade.stop();
+
+    var response = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/large.bin",
+        .body = null,
+        .headers = &.{},
+    });
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status_code);
+    try std.testing.expectEqual(@as(usize, payload_len), response.body.len);
+    try std.testing.expect(std.mem.eql(u8, payload, response.body));
+}
+
 test "top-level try_files serves index html and rejects encoded traversal" {
     const allocator = std.testing.allocator;
     var fixture = try GenericFixtureDir.create(allocator, "static-top-level");

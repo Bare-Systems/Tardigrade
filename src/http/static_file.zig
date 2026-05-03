@@ -16,11 +16,16 @@ pub const Options = struct {
     autoindex: bool = false,
     headers: *const headers_mod.Headers,
     max_bytes: usize = 8 * 1024 * 1024,
+    prefer_file_backed: bool = false,
 };
 
 pub const Result = struct {
     status_code: status.Status,
-    body: []u8,
+    body: ?[]u8 = null,
+    body_owned: bool = false,
+    file_path: ?[]u8 = null,
+    file_offset: u64 = 0,
+    file_len: u64 = 0,
     content_type: []const u8,
     content_length: usize,
     etag_value: ?[]u8 = null,
@@ -29,7 +34,10 @@ pub const Result = struct {
     accept_ranges: bool = false,
 
     pub fn deinit(self: *Result, allocator: std.mem.Allocator) void {
-        allocator.free(self.body);
+        if (self.body_owned) {
+            if (self.body) |body| allocator.free(body);
+        }
+        if (self.file_path) |path| allocator.free(path);
         if (self.etag_value) |v| allocator.free(v);
         if (self.last_modified_value) |v| allocator.free(v);
         if (self.content_range_value) |v| allocator.free(v);
@@ -47,6 +55,7 @@ pub fn serve(allocator: std.mem.Allocator, opts: Options) !?Result {
             return .{
                 .status_code = .forbidden,
                 .body = try allocator.dupe(u8, ""),
+                .body_owned = true,
                 .content_type = "text/plain; charset=utf-8",
                 .content_length = 0,
             };
@@ -56,6 +65,8 @@ pub fn serve(allocator: std.mem.Allocator, opts: Options) !?Result {
             defer file.close();
             const stat_info = try file.stat();
             const mtime_secs: usize = @intCast(@divTrunc(stat_info.mtime, std.time.ns_per_s));
+            const file_size: usize = @intCast(stat_info.size);
+            const content_type = detectMimeType(file_path);
 
             const etag_value = @constCast(try etag.generateETag(allocator, stat_info.size, mtime_secs));
             errdefer allocator.free(etag_value);
@@ -67,7 +78,8 @@ pub fn serve(allocator: std.mem.Allocator, opts: Options) !?Result {
                     return .{
                         .status_code = .not_modified,
                         .body = try allocator.dupe(u8, ""),
-                        .content_type = detectMimeType(file_path),
+                        .body_owned = true,
+                        .content_type = content_type,
                         .content_length = 0,
                         .etag_value = etag_value,
                         .last_modified_value = last_modified,
@@ -82,7 +94,8 @@ pub fn serve(allocator: std.mem.Allocator, opts: Options) !?Result {
                         return .{
                             .status_code = .not_modified,
                             .body = try allocator.dupe(u8, ""),
-                            .content_type = detectMimeType(file_path),
+                            .body_owned = true,
+                            .content_type = content_type,
                             .content_length = 0,
                             .etag_value = etag_value,
                             .last_modified_value = last_modified,
@@ -92,40 +105,85 @@ pub fn serve(allocator: std.mem.Allocator, opts: Options) !?Result {
                 }
             }
 
+            if (opts.headers.get("range")) |header_value| {
+                const parsed = range.parseSingle(header_value, file_size) catch |err| switch (err) {
+                    error.RangeNotSatisfiable => {
+                        return .{
+                            .status_code = .range_not_satisfiable,
+                            .body = try allocator.dupe(u8, ""),
+                            .body_owned = true,
+                            .content_type = content_type,
+                            .content_length = 0,
+                            .etag_value = etag_value,
+                            .last_modified_value = last_modified,
+                            .content_range_value = try std.fmt.allocPrint(allocator, "bytes */{d}", .{file_size}),
+                            .accept_ranges = true,
+                        };
+                    },
+                    else => return error.InvalidRange,
+                };
+
+                if (opts.prefer_file_backed) {
+                    resolved.kind = .not_found;
+                    return .{
+                        .status_code = .partial_content,
+                        .file_path = file_path,
+                        .file_offset = parsed.start,
+                        .file_len = parsed.end_inclusive - parsed.start + 1,
+                        .content_type = content_type,
+                        .content_length = parsed.end_inclusive - parsed.start + 1,
+                        .etag_value = etag_value,
+                        .last_modified_value = last_modified,
+                        .content_range_value = try range.formatContentRange(allocator, parsed, file_size),
+                        .accept_ranges = true,
+                    };
+                }
+
+                const file_data = try file.readToEndAlloc(allocator, opts.max_bytes);
+                errdefer allocator.free(file_data);
+                const slice = try allocator.dupe(u8, file_data[parsed.start .. parsed.end_inclusive + 1]);
+                allocator.free(file_data);
+                return .{
+                    .status_code = .partial_content,
+                    .body = slice,
+                    .body_owned = true,
+                    .content_type = content_type,
+                    .content_length = slice.len,
+                    .etag_value = etag_value,
+                    .last_modified_value = last_modified,
+                    .content_range_value = try range.formatContentRange(allocator, parsed, file_size),
+                    .accept_ranges = true,
+                };
+            }
+
+            if (opts.prefer_file_backed) {
+                resolved.kind = .not_found;
+                return .{
+                    .status_code = .ok,
+                    .file_path = file_path,
+                    .file_offset = 0,
+                    .file_len = stat_info.size,
+                    .content_type = content_type,
+                    .content_length = file_size,
+                    .etag_value = etag_value,
+                    .last_modified_value = last_modified,
+                    .accept_ranges = true,
+                };
+            }
+
             const file_data = try file.readToEndAlloc(allocator, opts.max_bytes);
             errdefer allocator.free(file_data);
 
-            var out = Result{
+            return .{
                 .status_code = .ok,
                 .body = file_data,
-                .content_type = detectMimeType(file_path),
+                .body_owned = true,
+                .content_type = content_type,
                 .content_length = file_data.len,
                 .etag_value = etag_value,
                 .last_modified_value = last_modified,
                 .accept_ranges = true,
             };
-
-            if (opts.headers.get("range")) |header_value| {
-                const parsed = range.parseSingle(header_value, file_data.len) catch |err| switch (err) {
-                    error.RangeNotSatisfiable => {
-                        allocator.free(out.body);
-                        out.body = try allocator.dupe(u8, "");
-                        out.content_length = 0;
-                        out.status_code = .range_not_satisfiable;
-                        out.content_range_value = try std.fmt.allocPrint(allocator, "bytes */{d}", .{file_data.len});
-                        return out;
-                    },
-                    else => return error.InvalidRange,
-                };
-                const slice = try allocator.dupe(u8, file_data[parsed.start .. parsed.end_inclusive + 1]);
-                allocator.free(out.body);
-                out.body = slice;
-                out.content_length = slice.len;
-                out.status_code = .partial_content;
-                out.content_range_value = try range.formatContentRange(allocator, parsed, file_data.len);
-            }
-
-            return out;
         },
         .directory => |dir_path| {
             if (!opts.autoindex) return null;
@@ -133,6 +191,7 @@ pub fn serve(allocator: std.mem.Allocator, opts: Options) !?Result {
             return .{
                 .status_code = .ok,
                 .body = listing,
+                .body_owned = true,
                 .content_type = "text/html; charset=utf-8",
                 .content_length = listing.len,
             };
@@ -482,6 +541,72 @@ test "serve rejects symlink escape outside root" {
     var served = result.?;
     defer served.deinit(allocator);
     try std.testing.expectEqual(status.Status.forbidden, served.status_code);
+}
+
+test "serve returns file-backed payload when preferred" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(.{ .sub_path = "asset.txt", .data = "hello file path" });
+    const root_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+
+    var hdrs = headers_mod.Headers.init(allocator);
+    defer hdrs.deinit();
+
+    var served = (try serve(allocator, .{
+        .root = root_path,
+        .request_path = "/asset.txt",
+        .matched_pattern = "/",
+        .alias = false,
+        .index = "index.html",
+        .try_files = "",
+        .headers = &hdrs,
+        .prefer_file_backed = true,
+    })).?;
+    defer served.deinit(allocator);
+
+    try std.testing.expectEqual(status.Status.ok, served.status_code);
+    try std.testing.expect(served.body == null);
+    try std.testing.expect(served.file_path != null);
+    try std.testing.expectEqual(@as(u64, 0), served.file_offset);
+    try std.testing.expectEqual(@as(u64, 15), served.file_len);
+    try std.testing.expectEqual(@as(usize, 15), served.content_length);
+}
+
+test "serve returns file-backed range payload when preferred" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(.{ .sub_path = "asset.txt", .data = "hello file path" });
+    const root_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+
+    var hdrs = headers_mod.Headers.init(allocator);
+    defer hdrs.deinit();
+    try hdrs.append("Range", "bytes=6-9");
+
+    var served = (try serve(allocator, .{
+        .root = root_path,
+        .request_path = "/asset.txt",
+        .matched_pattern = "/",
+        .alias = false,
+        .index = "index.html",
+        .try_files = "",
+        .headers = &hdrs,
+        .prefer_file_backed = true,
+    })).?;
+    defer served.deinit(allocator);
+
+    try std.testing.expectEqual(status.Status.partial_content, served.status_code);
+    try std.testing.expect(served.body == null);
+    try std.testing.expect(served.file_path != null);
+    try std.testing.expectEqual(@as(u64, 6), served.file_offset);
+    try std.testing.expectEqual(@as(u64, 4), served.file_len);
+    try std.testing.expectEqual(@as(usize, 4), served.content_length);
+    try std.testing.expectEqualStrings("bytes 6-9/15", served.content_range_value.?);
 }
 
 test "serve uses application wasm mime type" {

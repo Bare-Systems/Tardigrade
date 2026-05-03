@@ -4167,12 +4167,12 @@ fn routeRequest(
                 request.uri.path = rw.replacement;
             },
             .static_root => |root_cfg| {
-                if (try handleStaticLocation(allocator, writer, request, matched, root_cfg, correlation_id, keep_alive.*, state)) |status| return status;
+                if (try handleStaticLocation(allocator, conn, request, matched, root_cfg, correlation_id, keep_alive.*, state)) |status| return status;
             },
         }
     }
 
-    if (serveTryFilesFallback(allocator, cfg, request, correlation_id, keep_alive.*, writer, state)) |status| {
+    if (serveTryFilesFallback(allocator, conn, cfg, request, correlation_id, keep_alive.*, state)) |status| {
         state.metricsRecord(status);
         return status;
     } else |_| {}
@@ -5143,7 +5143,7 @@ fn runMiddlewarePipeline(
 
 fn handleStaticLocation(
     allocator: std.mem.Allocator,
-    writer: anytype,
+    conn: anytype,
     request: *const http.Request,
     matched: http.location_router.MatchResult,
     root_cfg: anytype,
@@ -5152,6 +5152,8 @@ fn handleStaticLocation(
     state: *GatewayState,
 ) !?u16 {
     if (!(request.method == .GET or request.method == .HEAD)) return null;
+    const writer = conn.writer();
+    const prefer_file_backed = @TypeOf(conn) == std.net.Stream;
     var served = (try http.static_file.serve(allocator, .{
         .root = root_cfg.root,
         .request_path = request.uri.path,
@@ -5162,6 +5164,7 @@ fn handleStaticLocation(
         .autoindex = root_cfg.autoindex,
         .headers = &request.headers,
         .max_bytes = MAX_REQUEST_SIZE,
+        .prefer_file_backed = prefer_file_backed,
     })) orelse blk: {
         var error_page = (try maybeResolveStaticErrorPage(allocator, matched, root_cfg, request.uri.path, &request.headers, 404)) orelse return null;
         switch (error_page) {
@@ -5221,42 +5224,25 @@ fn handleStaticLocation(
         }
     }
 
-    var response = http.Response.init(allocator);
-    defer response.deinit();
-    _ = response
-        .setStatus(served.status_code)
-        .setBody(served.body)
-        .setContentType(served.content_type)
-        .setConnection(keep_alive)
-        .setHeader(http.correlation.HEADER_NAME, correlation_id);
-    if (served.etag_value) |etag_value| _ = response.setHeader("ETag", etag_value);
-    if (served.last_modified_value) |last_modified| _ = response.setHeader("Last-Modified", last_modified);
-    if (served.content_range_value) |content_range| _ = response.setHeader("Content-Range", content_range);
-    if (served.accept_ranges) _ = response.setHeader("Accept-Ranges", "bytes");
-    applyResponseHeaders(state, &response);
-    if (request.method == .HEAD) {
-        try response.writeHead(writer);
-    } else {
-        try response.write(writer);
-    }
-    const status_code = @intFromEnum(served.status_code);
+    const status_code = try writeStaticServedResponse(allocator, conn, request.method == .HEAD, keep_alive, correlation_id, state, &served);
     state.metricsRecord(status_code);
     return status_code;
 }
 
 fn serveTryFilesFallback(
     allocator: std.mem.Allocator,
+    conn: anytype,
     cfg: *const edge_config.EdgeConfig,
     request: *const http.Request,
     correlation_id: []const u8,
     keep_alive: bool,
-    writer: anytype,
     state: *GatewayState,
 ) !u16 {
     const method = request.method.toString();
     const request_path = request.uri.path;
     if (!(std.ascii.eqlIgnoreCase(method, "GET") or std.ascii.eqlIgnoreCase(method, "HEAD"))) return error.NoTryFiles;
     if (cfg.doc_root.len == 0 or cfg.try_files.len == 0) return error.NoTryFiles;
+    const prefer_file_backed = @TypeOf(conn) == std.net.Stream;
 
     var served = (try http.static_file.serve(allocator, .{
         .root = cfg.doc_root,
@@ -5268,14 +5254,28 @@ fn serveTryFilesFallback(
         .autoindex = false,
         .headers = &request.headers,
         .max_bytes = MAX_REQUEST_SIZE,
+        .prefer_file_backed = prefer_file_backed,
     })) orelse return error.NoTryFiles;
     defer served.deinit(allocator);
 
+    return writeStaticServedResponse(allocator, conn, std.ascii.eqlIgnoreCase(method, "HEAD"), keep_alive, correlation_id, state, &served);
+}
+
+fn writeStaticServedResponse(
+    allocator: std.mem.Allocator,
+    conn: anytype,
+    head_only: bool,
+    keep_alive: bool,
+    correlation_id: []const u8,
+    state: *GatewayState,
+    served: *const http.static_file.Result,
+) !u16 {
+    const writer = conn.writer();
     var response = http.Response.init(allocator);
     defer response.deinit();
     _ = response
         .setStatus(served.status_code)
-        .setBody(served.body)
+        .setBody(served.body orelse "")
         .setContentType(served.content_type)
         .setConnection(keep_alive)
         .setHeader(http.correlation.HEADER_NAME, correlation_id);
@@ -5283,12 +5283,41 @@ fn serveTryFilesFallback(
     if (served.last_modified_value) |last_modified| _ = response.setHeader("Last-Modified", last_modified);
     if (served.content_range_value) |content_range| _ = response.setHeader("Content-Range", content_range);
     if (served.accept_ranges) _ = response.setHeader("Accept-Ranges", "bytes");
-    applyResponseHeaders(state, &response);
-    if (std.ascii.eqlIgnoreCase(method, "HEAD")) {
-        try response.writeHead(writer);
-    } else {
-        try response.write(writer);
+
+    if (served.file_path != null) {
+        _ = response.setContentLength(served.content_length);
     }
+
+    applyResponseHeaders(state, &response);
+    try response.writeHead(writer);
+
+    if (head_only) {
+        if (served.file_path) |file_path| {
+            state.logger.debug(correlation_id, "served static file headers from file-backed path: {s}", .{file_path});
+        } else {
+            state.logger.debug(correlation_id, "served static file headers from buffered path", .{});
+        }
+        return @intFromEnum(served.status_code);
+    }
+
+    if (served.file_path) |file_path| {
+        if (@TypeOf(conn) == std.net.Stream) {
+            const out_file = std.fs.File{ .handle = conn.handle };
+            const in_file = try std.fs.openFileAbsolute(file_path, .{});
+            defer in_file.close();
+            try out_file.writeFileAll(in_file, .{
+                .in_offset = served.file_offset,
+                .in_len = served.file_len,
+            });
+            state.logger.debug(correlation_id, "served static file via file-backed path: {s}", .{file_path});
+        } else {
+            return error.InvalidStaticTransferState;
+        }
+    } else if (served.body) |body| {
+        try writer.writeAll(body);
+        state.logger.debug(correlation_id, "served static file via buffered path", .{});
+    }
+
     return @intFromEnum(served.status_code);
 }
 
@@ -6833,7 +6862,7 @@ fn handleHttp3StaticLocation(
 
     _ = response
         .setStatus(served.status_code)
-        .setBodyOwned(if (std.mem.eql(u8, request.method, "HEAD")) try allocator.dupe(u8, "") else try allocator.dupe(u8, served.body))
+        .setBodyOwned(if (std.mem.eql(u8, request.method, "HEAD")) try allocator.dupe(u8, "") else try allocator.dupe(u8, served.body orelse ""))
         .setContentType(served.content_type)
         .setHeader(http.correlation.HEADER_NAME, correlation_id);
     if (served.etag_value) |etag_value| _ = response.setHeader("ETag", etag_value);

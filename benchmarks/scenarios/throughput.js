@@ -6,11 +6,13 @@ import { sleep } from 'k6';
 //
 // Env vars (set by run.sh):
 //   BASE_URL      target URL  (default: http://127.0.0.1:8069/health)
+//   K6_HOST_HEADER  optional Host header / :authority override
 //   K6_VUS        virtual users  (default: 50)
 //   K6_DURATION   test duration  (default: 30s)
 
 const baseUrl = __ENV.BASE_URL || 'http://127.0.0.1:8069';
 const target  = __ENV.K6_TARGET_PATH ? `${baseUrl}${__ENV.K6_TARGET_PATH}` : `${baseUrl}/health`;
+const params  = __ENV.K6_HOST_HEADER ? { headers: { Host: __ENV.K6_HOST_HEADER } } : undefined;
 
 export const options = {
   vus:                parseInt(__ENV.K6_VUS      || '50'),
@@ -20,6 +22,6 @@ export const options = {
 };
 
 export default function () {
-  http.get(target);
+  http.get(target, params);
   // no sleep — maximise request rate to match wrk/h2load/fortio behaviour
 }

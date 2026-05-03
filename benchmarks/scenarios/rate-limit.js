@@ -10,15 +10,18 @@ import { check, sleep } from 'k6';
 //
 // Env vars:
 //   BASE_URL          target base URL        (default: http://127.0.0.1:8069)
+//   K6_HOST_HEADER    optional Host header / :authority override
 //   RATE_LIMIT_RPS    configured RPS ceiling (default: 10 — matches Tardigrade default)
 //   RATE_LIMIT_PATH   path to hammer         (default: /health)
 //   K6_DURATION       test duration          (default: 15s)
 
 const baseUrl       = __ENV.BASE_URL         || 'http://127.0.0.1:8069';
+const hostHeader    = __ENV.K6_HOST_HEADER   || '';
 const rateLimitRps  = parseInt(__ENV.RATE_LIMIT_RPS  || '10');
 const ratePath      = __ENV.RATE_LIMIT_PATH  || '/health';
 
 const targetUrl = `${baseUrl}${ratePath}`;
+const params = hostHeader ? { headers: { Host: hostHeader } } : undefined;
 
 // Iterations: enough to comfortably exceed the RPS budget within the duration.
 // Single VU so all requests share the same client IP descriptor.
@@ -36,7 +39,7 @@ export const options = {
 };
 
 export default function () {
-  const res = http.get(targetUrl);
+  const res = http.get(targetUrl, params);
   check(res, { 'rate-limited': (r) => r.status === 429 }, { check: 'rate-limited' });
   // No sleep — fire as fast as possible to hit the limit
 }

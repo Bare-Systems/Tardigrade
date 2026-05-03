@@ -14,14 +14,17 @@ http.setResponseCallback(http.expectedStatuses({ min: 200, max: 499 }));
 //
 // Env vars:
 //   BASE_URL      target base URL    (default: http://127.0.0.1:8069)
+//   K6_HOST_HEADER  optional Host header / :authority override
 //   SPIKE_PEAK    peak VU count      (default: 150)
 //   SPIKE_PATH    path to request    (default: /health)
 
 const baseUrl  = __ENV.BASE_URL   || 'http://127.0.0.1:8069';
+const hostHeader = __ENV.K6_HOST_HEADER || '';
 const peak     = parseInt(__ENV.SPIKE_PEAK || '150');
 const path     = __ENV.SPIKE_PATH || '/health';
 
 const targetUrl = `${baseUrl}${path}`;
+const params = hostHeader ? { headers: { Host: hostHeader } } : undefined;
 
 export const options = {
   stages: [
@@ -39,6 +42,6 @@ export const options = {
 };
 
 export default function () {
-  http.get(targetUrl);
+  http.get(targetUrl, params);
   sleep(0.05); // light pacing to avoid starving the OS scheduler
 }

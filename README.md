@@ -1,39 +1,27 @@
 <h1 align="center">Tardigrade</h1>
 
 <p align="center">
-  High-performance Zig edge gateway and HTTP server for static delivery, reverse proxying,
-  protocol bridging, and realtime event transport.
-</p>
-
-<p align="center">
-  <img src="https://img.shields.io/badge/zig-0.14.1%2B-f7a41d?style=flat-square" alt="Zig 0.14.1+">
-  <img src="https://img.shields.io/badge/license-Apache%202.0-7cb518?style=flat-square" alt="Apache 2.0">
-  <img src="https://img.shields.io/badge/protocols-HTTP%2F1.1%20%2B%20HTTP%2F2%20%2B%20HTTP%2F3-6c5ce7?style=flat-square" alt="HTTP protocols">
-  <img src="https://img.shields.io/badge/interfaces-REST%20%2B%20WebSocket%20%2B%20SSE-118ab2?style=flat-square" alt="Interfaces">
+  A small Zig HTTP server and edge gateway for static delivery, reverse proxying,
+  config-driven routing, TLS termination, and operator-friendly reloads.
 </p>
 
 ---
 
-Tardigrade is a Zig service runtime with two primary roles:
+Tardigrade is an early-stage Zig service runtime for lightweight edge deployments,
+internal platforms, and controlled homelab environments.
 
-- **HTTP server** for static assets, conditional requests, range responses, location routing, custom error pages, and TLS termination.
-- **Edge gateway** for authenticated APIs, upstream health checks, HTTP/3, protocol bridges (FastCGI, SCGI, uWSGI, gRPC, memcached), mail relays, and realtime mux/SSE streams.
+The project currently focuses on:
 
-The current codebase includes:
+- static file serving
+- reverse proxying
+- config-driven routing with `server` and `location` blocks
+- TLS termination
+- config validation and hot reloads
+- access logging and basic operational controls
 
-- HTTP/1.1, HTTP/2, and opt-in HTTP/3 via `ngtcp2`/`nghttp3`
-- reverse proxying with retries, cache, health checks, and hot reload
-- WebSocket chat/command paths plus multiplexed mux channels with replay and backpressure handling
-- approval workflows, session/device auth, and policy-gated command execution
-- FastCGI, SCGI, uWSGI, SMTP, IMAP, and POP3 relay support
-
-## Features
-
-- **Zig-first runtime**: Built on Zig 0.14.1 with predictable memory ownership and low overhead
-- **Gateway routing**: Health, metrics, chat, commands, approvals, sessions, cache purge, and admin routes
-- **Protocol breadth**: Static files, reverse proxy, HTTP/2, HTTP/3, WebSocket, SSE, FastCGI, SCGI, uWSGI, and mail relay paths
-- **Operational controls**: Hot reload, active upstream health checks, TLS/SNI, config validation, access logging, and graceful shutdown
-- **Realtime delivery**: Multiplexed WebSocket channels with device scoping, overflow protection, and replay support
+Some protocol and gateway features are still experimental. Prefer the example
+configs and integration tests as the source of truth when evaluating a specific
+capability.
 
 ## Quick Start
 
@@ -41,18 +29,15 @@ The current codebase includes:
 
 - [Zig](https://ziglang.org/) 0.14.1 or later
 
-### Build and Run
+### Build and run from source
 
 ```bash
-# Clone the repository
 git clone https://github.com/Bare-Systems/Tardigrade.git
 cd Tardigrade
-
-# Build and run
 zig build run
 ```
 
-The server starts on `http://localhost:8069` by default.
+The default development listener starts on `http://localhost:8069`.
 
 ### Install latest release
 
@@ -60,394 +45,43 @@ The server starts on `http://localhost:8069` by default.
 curl -fsSL https://raw.githubusercontent.com/Bare-Systems/Tardigrade/main/scripts/install.sh | sh
 ```
 
-By default the installer places `tardigrade` in `~/.local/bin`. To install a
-specific tag or choose a different directory:
+## Basic Usage
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Bare-Systems/Tardigrade/main/scripts/install.sh | \
-  TARDIGRADE_VERSION=v0.7.0 TARDIGRADE_INSTALL_DIR=/usr/local/bin sh
-```
-
-The installer auto-detects `x86_64-linux`, `aarch64-linux`, `x86_64-darwin`,
-and `arm64-darwin` release assets.
-
-Pushes to `main` read the top semantic version in `CHANGELOG.md`. When that
-version has not been tagged yet, GitHub Actions creates the matching `vX.Y.Z`
-tag, publishes the GitHub release automatically, and uploads Linux x86_64,
-Linux aarch64, macOS x86_64, and macOS arm64 archives with a SHA-256 checksum
-manifest. The installer downloads and verifies `tardigrade-checksums.txt`
-before extracting the binary.
-
-The canonical command name is `tardigrade`. Release installs also provide a
-`tardi` alias for local convenience.
-
-All releases are available at **[github.com/Bare-Systems/Tardigrade/releases](https://github.com/Bare-Systems/Tardigrade/releases)**.
-
-### Native packages
-
-**Debian / Ubuntu (.deb)**
-```bash
-# Download from the releases page and install
-sudo apt install ./tardigrade_0.50_amd64.deb
-sudo systemctl enable --now tardigrade
-```
-
-**RHEL / Fedora / AlmaLinux (.rpm)** — see [`packaging/README.md`](packaging/README.md) for build instructions.
-
-**Homebrew (macOS)**
-```bash
-# From local source (tap not yet published)
-brew install --formula packaging/homebrew/tardigrade.rb
-```
-
-See [`packaging/README.md`](packaging/README.md) for full details on each packaging format.
-
-### Operator CLI
-
-```bash
-# Start with automatic config discovery
 ./zig-out/bin/tardigrade run
-
-# Validate a specific config
 ./zig-out/bin/tardigrade validate -c /etc/tardigrade/tardigrade.conf
-
-# Reload or stop a managed process
 ./zig-out/bin/tardigrade reload -c /etc/tardigrade/tardigrade.conf
 ./zig-out/bin/tardigrade stop -c /etc/tardigrade/tardigrade.conf
-
-# Generate a starter config
 ./zig-out/bin/tardigrade config init
 ```
 
-Config discovery checks `-c/--config`, `TARDIGRADE_CONFIG_PATH`, `./tardigrade.conf`,
-`./config/tardigrade.conf`, `/etc/tardigrade/tardigrade.conf`, and
-`$HOME/.config/tardigrade/tardigrade.conf`.
-
-Hard-wired operator endpoints (always available, no config required):
-
-- `GET /tardigrade/reload/status` — last config reload outcome as JSON
-- `GET /bearclaw/transcripts` — recent redacted BearClaw edge transcripts (requires `TARDIGRADE_TRANSCRIPT_STORE_PATH`)
-- `GET /bearclaw/transcripts/:id` — one redacted transcript record
-
-Convention endpoints (wire up via `location` blocks or `TARDIGRADE_LOCATION_BLOCKS`):
+## Minimal Config Example
 
 ```nginx
-location /health  { return 200 ok; }
-location /status  { return 200 ok; }
-location /metrics { proxy_pass http://127.0.0.1:9091; }
+listen_port 8069;
+root ./public;
+try_files $uri /index.html;
+
+location /api/ {
+    proxy_pass http://127.0.0.1:8080;
+}
+
+location = /health {
+    return 200 ok;
+}
 ```
 
-These are intentionally not hard-wired — Tardigrade leaves `/health`, `/status`, and `/metrics` to operator config so they can proxy to an upstream, return a static payload, or be omitted entirely.
+## Documentation
 
-### Config reload guarantees
-
-`tardigrade validate` pre-checks config and exits 0 on success or non-zero with an error message. Use this in deployment pipelines before signalling a live process.
-
-`tardigrade reload` sends `SIGHUP` to the running process. On receipt, Tardigrade:
-
-1. Loads and parses the candidate config.
-2. Validates it with the same logic as `tardigrade validate`.
-3. If validation fails — the running config is **unchanged**. The process logs `config reload rejected by validation: <reason>` and continues serving on the last-known-good config.
-4. If validation succeeds — the new config is **atomically activated** (a single pointer swap). In-flight requests complete under the old config.
-
-Check the reload outcome without reading logs:
-
-```bash
-curl -s https://localhost:8443/tardigrade/reload/status
-# {"ok":true,"at_ms":1713399600000,"error":null}   # last reload succeeded
-# {"ok":false,"at_ms":1713399500000,"error":"validation rejected: missing tls_cert_path"}
-# {"ok":null,"at_ms":null,"error":null}             # no reload attempted since start
-```
-
-## Kubernetes
-
-A Helm chart and deployment guide live under [`packaging/kubernetes/`](packaging/kubernetes/).
-
-```bash
-helm install tardigrade ./deploy/kubernetes/helm/tardigrade \
-  --namespace tardigrade --create-namespace \
-  --set env.TARDIGRADE_UPSTREAM_BASE_URL=http://backend:8080
-```
-
-Tardigrade runs as a standalone reverse-proxy Deployment. It does not yet act as a Kubernetes Ingress controller or implement Gateway API semantics. See [`packaging/kubernetes/README.md`](packaging/kubernetes/README.md) for TLS mounting, config-file injection, secrets via `envFrom`, and hot-reload guidance.
-
-## Blink Homelab Contract
-
-On `blink`, Tardigrade is the only public edge for the web surfaces:
-
-- TLS listener: `192.168.86.53:8443`
-- LAN traffic on `443` is redirected to `8443`
-- BearClaw stays private on `127.0.0.1:6701`
-- BearClaw public hostname: `https://bearclaw.baresystems.com`
-
-Do not "fix" BearClaw reachability by exposing `6701` on the LAN. The stable
-shape is TLS termination and proxying in Tardigrade, with `Host` and
-`X-Forwarded-Proto` preserved upstream.
-
-Compression behavior is part of that contract. If Tardigrade ever decompresses
-an upstream response, it must also remove the stale `Content-Encoding` header.
-That exact bug caused blank BearClaw pages on March 20, 2026.
-
-## Configuration
-
-Tardigrade supports both environment-variable configuration and nginx-style config files.
-
-Core generic capabilities include:
-
-- listeners, TLS, HTTP/2, and opt-in HTTP/3
-- `server` and `location` blocks
-- static roots, `try_files`, `rewrite`, `return`, `error_page`, and `autoindex`
-- reverse proxying, upstream pools, retries, active health checks, and proxy caching
-- FastCGI, SCGI, uWSGI, gRPC, memcached, mail, and stream proxy backends
-- access logging, graceful shutdown, hot reload, and config validation
-
-Config file notes:
-
-- statements end with `;`
-- basic directive: `listen_port 8069;`
-- explicit env-style directive: `TARDIGRADE_LOG_LEVEL debug;`
-- variables: `set $base /etc/tardigrade;` with `${base}` interpolation
-- include support: `include conf.d/*.conf;`
-- environment variables override config-file values
-- `config init` generates a starter file with static serving and a PID path
-
-### Environment Variables
-
-#### Listener, TLS, and HTTP
-
-| Name | Description | Default |
-|---|---|---|
-| `TARDIGRADE_LISTEN_HOST` | Listener bind address | `0.0.0.0` |
-| `TARDIGRADE_LISTEN_PORT` | Listener TCP port | `8069` |
-| `TARDIGRADE_TLS_CERT_PATH` | PEM certificate path | empty |
-| `TARDIGRADE_TLS_KEY_PATH` | PEM private key path | empty |
-| `TARDIGRADE_TLS_MIN_VERSION` | Minimum TLS version | `1.2` |
-| `TARDIGRADE_TLS_MAX_VERSION` | Maximum TLS version | `1.3` |
-| `TARDIGRADE_TLS_CIPHER_LIST` | OpenSSL cipher list for TLS <= 1.2 | empty |
-| `TARDIGRADE_TLS_CIPHER_SUITES` | OpenSSL cipher suites for TLS 1.3 | empty |
-| `TARDIGRADE_TLS_SNI_CERTS` | SNI cert mapping `host:cert:key|...` | empty |
-| `TARDIGRADE_TLS_SESSION_CACHE` | Enable TLS session cache | `true` |
-| `TARDIGRADE_TLS_SESSION_CACHE_SIZE` | Session cache target entry count | `20480` |
-| `TARDIGRADE_TLS_SESSION_TIMEOUT_SECONDS` | TLS session resumption timeout | `300` |
-| `TARDIGRADE_TLS_SESSION_TICKETS` | Enable TLS session tickets | `true` |
-| `TARDIGRADE_TLS_OCSP_STAPLING` | Enable static OCSP stapling | `false` |
-| `TARDIGRADE_TLS_OCSP_RESPONSE_PATH` | DER OCSP response file path | empty |
-| `TARDIGRADE_TLS_CLIENT_CA_PATH` | CA bundle for client certificate verification | empty |
-| `TARDIGRADE_TLS_CLIENT_VERIFY` | Require and verify client certificates | `false` |
-| `TARDIGRADE_TLS_CLIENT_VERIFY_DEPTH` | Maximum client certificate chain depth | `3` |
-| `TARDIGRADE_TLS_CRL_PATH` | PEM CRL file path | empty |
-| `TARDIGRADE_TLS_CRL_CHECK` | Enable CRL checks | `false` |
-| `TARDIGRADE_TLS_DYNAMIC_RELOAD_INTERVAL_MS` | TLS asset reload poll interval | `5000` |
-| `TARDIGRADE_TLS_ACME_ENABLED` | Enable ACME-style cert directory discovery | `false` |
-| `TARDIGRADE_TLS_ACME_CERT_DIR` | Directory containing `<host>.crt` and `<host>.key` files | empty |
-| `TARDIGRADE_HTTP2_ENABLED` | Enable HTTP/2 on TLS listeners | `true` |
-| `TARDIGRADE_HTTP3_ENABLED` | Enable HTTP/3 runtime | `false` |
-| `TARDIGRADE_QUIC_PORT` | UDP QUIC listener port | `443` |
-| `TARDIGRADE_HTTP3_ENABLE_0RTT` | Allow 0-RTT handling in HTTP/3 foundation logic | `false` |
-| `TARDIGRADE_HTTP3_CONNECTION_MIGRATION` | Allow QUIC connection migration updates | `false` |
-| `TARDIGRADE_HTTP3_MAX_DATAGRAM_SIZE` | Target maximum QUIC datagram size | `1350` |
-| `TARDIGRADE_PROXY_PROTOCOL` | PROXY protocol mode (`off`, `v1`, `v2`, `auto`) — supported on both plaintext and TLS listeners | `off` |
-| `TARDIGRADE_TLS_OCSP_AUTO_REFRESH` | Automatically fetch and refresh OCSP stapling response from the certificate's AIA OCSP URL | `false` |
-| `TARDIGRADE_TLS_OCSP_REFRESH_INTERVAL_MS` | How often (ms) the background OCSP refresh runs | `3600000` |
-| `TARDIGRADE_TLS_OCSP_REFRESH_TIMEOUT_MS` | HTTP timeout (ms) for OCSP responder requests | `10000` |
-| `TARDIGRADE_TLS_ACME_DIRECTORY_URL` | ACME directory URL for automated certificate issuance (e.g. Let's Encrypt) | empty |
-| `TARDIGRADE_TLS_ACME_DOMAINS` | Comma-separated list of domains to issue/renew via ACME | empty |
-| `TARDIGRADE_TLS_ACME_EMAIL` | Contact email sent to the ACME server during account registration | empty |
-| `TARDIGRADE_TLS_ACME_ACCOUNT_KEY_PATH` | Path for the ACME account EC private key (auto-generated if absent) | `acme_account.key` |
-| `TARDIGRADE_TLS_ACME_RENEW_DAYS_BEFORE_EXPIRY` | Renew certificate this many days before it expires | `30` |
-| `TARDIGRADE_VALIDATE_CONFIG_ONLY` | Validate config and exit without serving | empty |
-
-#### Trust, Upstreams, and Proxying
-
-| Name | Description | Default |
-|---|---|---|
-| `TARDIGRADE_TRUST_GATEWAY_ID` | Gateway identity sent in trusted upstream headers | `tardigrade-edge` |
-| `TARDIGRADE_TRUST_SHARED_SECRET` | Shared secret for signed upstream trust headers and sticky affinity cookies | empty |
-| `TARDIGRADE_TRUSTED_UPSTREAM_IDENTITIES` | Allowed trusted upstream identities or hosts | empty |
-| `TARDIGRADE_TRUST_REQUIRE_UPSTREAM_IDENTITY` | Require trusted upstream identity verification | `false` |
-| `TARDIGRADE_UPSTREAM_BASE_URL` | Primary upstream base URL | `http://127.0.0.1:8080` |
-| `TARDIGRADE_UPSTREAM_BASE_URLS` | Comma-separated primary upstream URLs | empty |
-| `TARDIGRADE_UPSTREAM_BASE_URL_WEIGHTS` | Weights aligned with `TARDIGRADE_UPSTREAM_BASE_URLS` | empty |
-| `TARDIGRADE_UPSTREAM_BACKUP_BASE_URLS` | Backup upstream base URLs | empty |
-| `TARDIGRADE_UPSTREAM_LB_ALGORITHM` | Upstream load-balancing algorithm | `round_robin` |
-| `TARDIGRADE_UPSTREAM_TIMEOUT_MS` | Per-attempt upstream timeout | `10000` |
-| `TARDIGRADE_PROXY_STREAM_ALL_STATUSES` | Stream non-200 upstream responses directly | `false` |
-| `TARDIGRADE_UPSTREAM_RETRY_ATTEMPTS` | Upstream attempts per request | `1` |
-| `TARDIGRADE_UPSTREAM_TIMEOUT_BUDGET_MS` | Total timeout budget across retries | `0` |
-| `TARDIGRADE_UPSTREAM_MAX_FAILS` | Passive unhealthy threshold | `0` |
-| `TARDIGRADE_UPSTREAM_FAIL_TIMEOUT_MS` | Passive failure cooldown window | `10000` |
-| `TARDIGRADE_UPSTREAM_PROBE_INTERVAL_MS` | Active upstream probe interval | `0` |
-| `TARDIGRADE_UPSTREAM_ACTIVE_PROBE_INTERVAL_MS` | Legacy alias for active upstream probe interval | `0` |
-| `TARDIGRADE_UPSTREAM_PROBE_PATH` | Active upstream probe path | `/` |
-| `TARDIGRADE_UPSTREAM_ACTIVE_PROBE_PATH` | Legacy alias for active upstream probe path | `/` |
-| `TARDIGRADE_UPSTREAM_PROBE_TIMEOUT_MS` | Active upstream probe timeout | `2000` |
-| `TARDIGRADE_UPSTREAM_ACTIVE_PROBE_TIMEOUT_MS` | Legacy alias for active upstream probe timeout | `2000` |
-| `TARDIGRADE_UPSTREAM_PROBE_FAIL_THRESHOLD` | Consecutive active probe failures before unhealthy | `1` |
-| `TARDIGRADE_UPSTREAM_ACTIVE_PROBE_FAIL_THRESHOLD` | Legacy alias for active upstream probe failure threshold | `1` |
-| `TARDIGRADE_UPSTREAM_ACTIVE_PROBE_SUCCESS_THRESHOLD` | Consecutive active probe successes before healthy | `1` |
-| `TARDIGRADE_UPSTREAM_PROBE_SUCCESS_STATUS` | Accepted active probe status range | `200-299` |
-| `TARDIGRADE_UPSTREAM_ACTIVE_PROBE_SUCCESS_STATUS` | Legacy alias for accepted active probe status range | `200-299` |
-| `TARDIGRADE_UPSTREAM_PROBE_SUCCESS_STATUS_OVERRIDES` | Per-upstream active probe success-status overrides | empty |
-| `TARDIGRADE_UPSTREAM_ACTIVE_PROBE_SUCCESS_STATUS_OVERRIDES` | Legacy alias for per-upstream active probe success-status overrides | empty |
-| `TARDIGRADE_UPSTREAM_SLOW_START_MS` | Recovered-backend ramp window | `0` |
-| `TARDIGRADE_CB_THRESHOLD` | Circuit-breaker trip threshold | `0` |
-| `TARDIGRADE_CB_TIMEOUT_MS` | Circuit-breaker open timeout | `30000` |
-| `TARDIGRADE_PROXY_CACHE_TTL_SECONDS` | In-memory proxy cache TTL | `0` |
-| `TARDIGRADE_PROXY_CACHE_PATH` | Optional disk proxy cache path | empty |
-| `TARDIGRADE_PROXY_CACHE_KEY_TEMPLATE` | Proxy cache key template | `method:path:payload_sha256` |
-| `TARDIGRADE_PROXY_CACHE_STALE_WHILE_REVALIDATE_SECONDS` | Stale serving window after TTL expiry | `0` |
-| `TARDIGRADE_PROXY_CACHE_LOCK_TIMEOUT_MS` | Cache lock wait timeout | `250` |
-| `TARDIGRADE_PROXY_CACHE_MANAGER_INTERVAL_MS` | Cache maintenance interval | `30000` |
-| `TARDIGRADE_UPSTREAM_GUNZIP_ENABLED` | Gunzip upstream gzip responses before downstream negotiation | `true` |
-| `TARDIGRADE_MIRROR_RULES` | Semicolon-separated mirror dispatch rules | empty |
-| `TARDIGRADE_UPSTREAM_TLS_VERIFY` | Verify upstream TLS certificates | `true` |
-| `TARDIGRADE_UPSTREAM_TLS_CA_BUNDLE` | Path to PEM CA bundle for upstream certificate verification | empty (system default) |
-| `TARDIGRADE_UPSTREAM_TLS_SERVER_NAME` | Override SNI/hostname for upstream TLS handshake | empty |
-| `TARDIGRADE_UPSTREAM_TLS_CLIENT_CERT` | Path to PEM client certificate for mTLS upstream connections | empty |
-| `TARDIGRADE_UPSTREAM_TLS_CLIENT_KEY` | Path to PEM private key paired with `TARDIGRADE_UPSTREAM_TLS_CLIENT_CERT` | empty |
-
-When `TARDIGRADE_TRUST_SHARED_SECRET` is set and a relative proxy target has more than one eligible upstream, Tardigrade emits a per-host, per-location sticky cookie to keep repeat requests on the same healthy backend. The cookie is HMAC-signed, ignored if tampered, rotated when the mapped backend turns unhealthy, and written with `HttpOnly`, `Secure`, and `SameSite=Lax`.
-
-#### Authentication and Access Control
-
-| Name | Description | Default |
-|---|---|---|
-| `TARDIGRADE_BASIC_AUTH_HASHES` | Lowercase SHA-256 hashes of `user:password` | empty |
-| `TARDIGRADE_AUTH_TOKEN_HASHES` | Lowercase SHA-256 hashes of accepted bearer tokens | empty |
-| `TARDIGRADE_JWT_SECRET` | Optional shared HS256 secret for BearClawWeb-issued identity JWTs | empty |
-| `TARDIGRADE_JWT_ISSUER` | Required `iss` claim when JWT auth is enabled | empty |
-| `TARDIGRADE_JWT_AUDIENCE` | Required `aud` claim when JWT auth is enabled | empty |
-| `TARDIGRADE_SESSION_STORE_PATH` | Optional JSON file for persisted gateway sessions | empty |
-| `TARDIGRADE_TRANSCRIPT_STORE_PATH` | Optional owner-only NDJSON file for persisted, redacted gateway chat/command transcripts | empty |
-
-#### Request Handling, Limits, and Connection Management
-
-| Name | Description | Default |
-|---|---|---|
-| `TARDIGRADE_RATE_LIMIT_RPS` | Per-descriptor rate limit requests per second; authenticated BearClaw API traffic uses asserted identity and other traffic falls back to client IP | `10` |
-| `TARDIGRADE_RATE_LIMIT_BURST` | Rate limiter burst capacity per descriptor | `20` |
-| `TARDIGRADE_SECURITY_HEADERS` | Enable default security headers | `true` |
-| `TARDIGRADE_IDEMPOTENCY_TTL` | Idempotency cache TTL in seconds | `300` |
-| `TARDIGRADE_GEO_BLOCKED_COUNTRIES` | Comma-separated blocked ISO country codes | empty |
-| `TARDIGRADE_GEO_COUNTRY_HEADER` | Header used to read country code | `CF-IPCountry` |
-| `TARDIGRADE_ACCESS_CONTROL` | IP access-control rules | empty |
-| `TARDIGRADE_MAX_BODY_SIZE` | Maximum request body size in bytes | `0` |
-| `TARDIGRADE_MAX_URI_LENGTH` | Maximum request URI length | `0` |
-| `TARDIGRADE_MAX_HEADER_COUNT` | Maximum request header count | `0` |
-| `TARDIGRADE_MAX_HEADER_SIZE` | Maximum total request header bytes | `0` |
-| `TARDIGRADE_BODY_TIMEOUT_MS` | Request body read timeout | `0` |
-| `TARDIGRADE_HEADER_TIMEOUT_MS` | Request header read timeout | `0` |
-| `TARDIGRADE_FD_SOFT_LIMIT` | Desired process soft file-descriptor limit | `0` |
-| `TARDIGRADE_LIMIT_CONN_PER_IP` | Alias for per-IP connection cap | empty |
-| `TARDIGRADE_MAX_CONNECTIONS_PER_IP` | Per-IP connection cap | `0` |
-| `TARDIGRADE_MAX_ACTIVE_CONNECTIONS` | Global active connection cap | `0` |
-| `TARDIGRADE_KEEP_ALIVE_TIMEOUT_MS` | Keep-alive idle timeout | `5000` |
-| `TARDIGRADE_MAX_REQUESTS_PER_CONNECTION` | Max requests served on one keep-alive connection | `100` |
-| `TARDIGRADE_CONNECTION_POOL_SIZE` | Cached connection-session pool size | `256` |
-| `TARDIGRADE_MAX_CONNECTION_MEMORY_BYTES` | Max retained memory per active connection | `2097152` |
-| `TARDIGRADE_MAX_TOTAL_CONNECTION_MEMORY_BYTES` | Global estimated connection memory cap | `0` |
-
-#### Routing, Config, Static, and Secrets
-
-| Name | Description | Default |
-|---|---|---|
-| `TARDIGRADE_REWRITE_RULES` | Semicolon-separated rewrite rules | empty |
-| `TARDIGRADE_RETURN_RULES` | Semicolon-separated return rules | empty |
-| `TARDIGRADE_CONDITIONAL_RULES` | Semicolon-separated inline conditional rules | empty |
-| `TARDIGRADE_LOCATION_BLOCKS` | Serialized location block definitions | empty |
-| `TARDIGRADE_LOCATION_ERROR_PAGES` | Serialized location error-page rules | empty |
-| `TARDIGRADE_INTERNAL_REDIRECT_RULES` | Internal redirect rules | empty |
-| `TARDIGRADE_NAMED_LOCATIONS` | Named location mappings | empty |
-| `TARDIGRADE_SERVER_NAMES` | Listener-level accepted host patterns | empty |
-| `TARDIGRADE_SERVER_BLOCKS` | Serialized server block definitions | empty |
-| `TARDIGRADE_DOC_ROOT` | Static fallback document root | empty |
-| `TARDIGRADE_TRY_FILES` | Comma-separated `try_files` candidates | empty |
-| `TARDIGRADE_CONFIG_PATH` | nginx-style config file path | empty |
-| `TARDIGRADE_SECRETS_PATH` | Secrets override file path | empty |
-| `TARDIGRADE_SECRET_KEYS` | Hex keys for `ENC:` secret values | empty |
-
-#### Backend, Mail, and Stream Protocol Bridges
-
-| Name | Description | Default |
-|---|---|---|
-| `TARDIGRADE_FASTCGI_UPSTREAM` | FastCGI upstream endpoint | empty |
-| `TARDIGRADE_FASTCGI_PARAMS` | Additional FastCGI params | empty |
-| `TARDIGRADE_FASTCGI_INDEX` | Default FastCGI index file | `index.php` |
-| `TARDIGRADE_UWSGI_UPSTREAM` | uWSGI upstream endpoint | empty |
-| `TARDIGRADE_SCGI_UPSTREAM` | SCGI upstream endpoint | empty |
-| `TARDIGRADE_GRPC_UPSTREAM` | gRPC upstream URL | empty |
-| `TARDIGRADE_MEMCACHED_UPSTREAM` | Memcached upstream endpoint | empty |
-| `TARDIGRADE_SMTP_UPSTREAM` | SMTP upstream endpoint | empty |
-| `TARDIGRADE_IMAP_UPSTREAM` | IMAP upstream endpoint | empty |
-| `TARDIGRADE_POP3_UPSTREAM` | POP3 upstream endpoint | empty |
-| `TARDIGRADE_TCP_PROXY_UPSTREAM` | Stream TCP upstream endpoint | empty |
-| `TARDIGRADE_UDP_PROXY_UPSTREAM` | Stream UDP upstream endpoint | empty |
-| `TARDIGRADE_STREAM_SSL_TERMINATION` | Enable stream SSL-termination mode indicator | `false` |
-| `TARDIGRADE_CORRELATION_ID` | Internal correlation ID env forwarded to protocol bridge subprocess-style backends | empty |
-
-#### Logging, Compression, and Process Model
-
-| Name | Description | Default |
-|---|---|---|
-| `TARDIGRADE_ADD_HEADERS` | Additional response headers as `Name: Value` entries | empty |
-| `TARDIGRADE_ACCESS_LOG_FORMAT` | Access log format | `json` |
-| `TARDIGRADE_ACCESS_LOG_TEMPLATE` | Custom access-log template | empty |
-| `TARDIGRADE_ACCESS_LOG_MIN_STATUS` | Minimum status code required for access-log emission | `0` |
-| `TARDIGRADE_ACCESS_LOG_BUFFER_SIZE` | Access-log buffer size in bytes | `0` |
-| `TARDIGRADE_ACCESS_LOG_SYSLOG_UDP` | Syslog UDP endpoint | empty |
-| `TARDIGRADE_LOG_LEVEL` | Error-log level | `info` |
-| `TARDIGRADE_ERROR_LOG_PATH` | Error-log destination path | empty |
-| `TARDIGRADE_LOG_ROTATE_MAX_BYTES` | Rotate error log at startup above this size | `0` |
-| `TARDIGRADE_LOG_ROTATE_MAX_FILES` | Number of rotated error-log generations to keep | `5` |
-| `TARDIGRADE_COMPRESSION_ENABLED` | Enable response compression | `true` |
-| `TARDIGRADE_COMPRESSION_MIN_SIZE` | Minimum body size to compress | `256` |
-| `TARDIGRADE_COMPRESSION_BROTLI_ENABLED` | Enable Brotli compression | `true` |
-| `TARDIGRADE_COMPRESSION_BROTLI_QUALITY` | Brotli quality level | `5` |
-| `TARDIGRADE_PID_FILE` | PID file path | empty |
-| `TARDIGRADE_RUN_USER` | Numeric uid for privilege drop | empty |
-| `TARDIGRADE_RUN_GROUP` | Numeric gid for privilege drop | empty |
-| `TARDIGRADE_REQUIRE_UNPRIVILEGED_USER` | Fail startup if still running as uid 0 after privilege-drop flow | `false` |
-| `TARDIGRADE_CHROOT_DIR` | Optional chroot directory | empty |
-| `TARDIGRADE_WORKER_THREADS` | Worker thread count, `0` uses runtime default | `0` |
-| `TARDIGRADE_WORKER_QUEUE_SIZE` | Worker queue depth | `1024` |
-| `TARDIGRADE_MASTER_PROCESS` | Enable master-worker process supervision | `false` |
-| `TARDIGRADE_WORKER_PROCESSES` | Worker process count in master mode | `1` |
-| `TARDIGRADE_BINARY_UPGRADE` | Enable `SIGUSR2` binary upgrade handoff | `true` |
-| `TARDIGRADE_WORKER_RECYCLE_SECONDS` | Worker recycle interval | `0` |
-| `TARDIGRADE_WORKER_CPU_AFFINITY` | Linux CPU affinity list for workers | empty |
-
-#### Observability — W3C Trace Context and OTLP
-
-Tardigrade propagates [W3C Trace Context](https://www.w3.org/TR/trace-context/) (`traceparent`) on every upstream request. When a valid `traceparent` header arrives it is forwarded verbatim (inbound propagation). When it is absent Tardigrade originates a new root span before forwarding so every upstream hop has a trace ID available.
-
-| Name | Description | Default |
-|---|---|---|
-| `TARDIGRADE_OTEL_ENABLED` | Enable OTel span export to the OTLP endpoint | `false` |
-| `TARDIGRADE_OTEL_ENDPOINT` | OTLP/HTTP endpoint for span export (e.g. `http://jaeger:4318/v1/traces`) | empty |
-| `TARDIGRADE_OTEL_SAMPLE_RATE` | Trace sampling percentage (0–100); 100 samples every request | `100` |
-
-`traceparent` propagation is always active regardless of `TARDIGRADE_OTEL_ENABLED`; the env vars only control whether spans are exported. Set `TARDIGRADE_OTEL_ENABLED=true` alongside a Jaeger, Tempo, or any OTLP-compatible collector to receive Tardigrade gateway spans.
-
-#### Service Discovery — DNS A/AAAA
-
-Tardigrade supports DNS-based upstream discovery as a supplement to static pool configuration. Set `TARDIGRADE_UPSTREAM_DNS_DISCOVERY_HOST` to a hostname; Tardigrade will resolve all A/AAAA records for that hostname and add the resulting addresses to the upstream pool. The list refreshes periodically and membership changes are logged.
-
-| Name | Description | Default |
-|---|---|---|
-| `TARDIGRADE_UPSTREAM_DNS_DISCOVERY_HOST` | Hostname to resolve for dynamic upstream discovery (empty = disabled) | empty |
-| `TARDIGRADE_UPSTREAM_DNS_DISCOVERY_PORT` | Port number to use for discovered upstream addresses | `80` |
-| `TARDIGRADE_UPSTREAM_DNS_DISCOVERY_TLS` | Use HTTPS for discovered upstreams | `false` |
-| `TARDIGRADE_UPSTREAM_DNS_REFRESH_INTERVAL_MS` | How often to re-resolve the discovery hostname | `30000` |
-
-Discovered upstreams participate in the active health check probe loop when `TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_INTERVAL_MS` is set. When no static primaries are configured, discovered upstreams serve as the primary pool in round-robin rotation. Static and discovered pools can be combined: set both `TARDIGRADE_UPSTREAM_BASE_URLS` and `TARDIGRADE_UPSTREAM_DNS_DISCOVERY_HOST`.
-
-## Examples
-
-Example deployment bundles live under `examples/`.
-
-- Generic static/reverse-proxy deployments can be built directly from the core directives.
-- Product-specific API layouts belong in example bundles, not in the default project description.
-- An application-facing gateway example is available under `examples/`.
+| Topic | Location |
+| --- | --- |
+| Packaging | `packaging/README.md` |
+| Kubernetes | `packaging/kubernetes/README.md` |
+| Benchmarks | `benchmarks/README.md` |
+| BearClaw example | `examples/bearclaw/README.md` |
+| Security policy | `SECURITY.md` |
+| Contributing | `CONTRIBUTING.md` |
+| Release history | `CHANGELOG.md` |
 
 ## Testing
 
@@ -455,298 +89,3 @@ Example deployment bundles live under `examples/`.
 zig build test
 zig build test-integration
 ```
-
-## Benchmarks
-
-A repeatable benchmark and regression harness lives under `benchmarks/`.
-
-```bash
-# Run with wrk (or h2load/fortio/k6 — auto-detected)
-./benchmarks/run.sh --duration 30 --connections 50
-
-# Save a baseline for regression comparison
-./benchmarks/run.sh --save benchmarks/baselines/$(git describe --tags).json
-
-# Compare against a saved baseline (exit 2 = regression above threshold)
-./benchmarks/run.sh --baseline benchmarks/baselines/v0.50.json
-```
-
-See [`benchmarks/README.md`](benchmarks/README.md) for full usage, scenario descriptions, CI integration guidance, and test-host recommendations.
-
-### Latest Results
-
-<!-- BENCHMARK_REPORT_START -->
-| Scenario | req/s | p50 (ms) | p99 (ms) | Errors |
-| --- | ---: | ---: | ---: | ---: |
-| `keepalive` | 11588 | 0.3 | 118.9 | 0 |
-| `proxy-http1` | 11633 | 0.3 | 115.8 | 0 |
-| `static-http1` | 11568 | 0.3 | 118.5 | 0 |
-
-> **v0.32.0-14-ge035a0a** · 2026-04-23 · tool: `k6` · 50 connections · 15s per scenario · host: `127.0.0.1`
->
-> Run `./benchmarks/run.sh --save benchmarks/baselines/$(git describe --tags).json` then `./benchmarks/report.sh <file> --update-readme README.md` to refresh this table.
-<!-- BENCHMARK_REPORT_END -->
-
-### Build for Production
-
-```bash
-# Build optimized release binary
-zig build -Doptimize=ReleaseFast
-
-# Run the binary directly
-./zig-out/bin/tardigrade run
-```
-
-### Container Image
-
-```bash
-zig build -Doptimize=ReleaseFast
-docker build -t tardigrade .
-docker run --rm -p 8069:8069 tardigrade
-```
-
-The repository Docker image expects `zig-out/bin/tardigrade` to exist in the
-build context. The published CI image runs as a non-root user and includes a
-`/health` container healthcheck.
-
-GitHub Actions also publishes a public GHCR image from `main` and release tags:
-
-```bash
-docker pull ghcr.io/bare-systems/tardigrade:latest
-docker run --rm -p 8069:8069 ghcr.io/bare-systems/tardigrade:latest
-```
-
-### Linux `systemd --user` service
-
-For a manual host-native install on Linux, keep Tardigrade as a normal
-non-root process and let `systemd --user` manage restarts and reloads:
-
-```bash
-sudo loginctl enable-linger "$USER"
-mkdir -p "$HOME/.local/bin" "$HOME/.config/tardigrade" "$HOME/.config/systemd/user"
-cp ./zig-out/bin/tardigrade "$HOME/.local/bin/tardigrade"
-
-cat > "$HOME/.local/bin/run-tardigrade.sh" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-set -a
-source "$HOME/.config/tardigrade/tardigrade.env"
-set +a
-exec "$HOME/.local/bin/tardigrade"
-EOF
-chmod +x "$HOME/.local/bin/run-tardigrade.sh"
-
-cat > "$HOME/.config/systemd/user/tardigrade.service" <<'EOF'
-[Unit]
-Description=Tardigrade edge gateway
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-Environment=HOME=%h
-ExecStart=%h/.local/bin/run-tardigrade.sh
-ExecReload=/bin/kill -HUP $MAINPID
-Restart=on-failure
-RestartSec=2
-LimitNOFILE=65536
-
-[Install]
-WantedBy=default.target
-EOF
-
-systemctl --user daemon-reload
-systemctl --user enable --now tardigrade.service
-systemctl --user reload tardigrade.service
-systemctl --user status tardigrade.service
-journalctl --user -u tardigrade.service -f
-```
-
-If you need Tardigrade on port `443`, either run a root-managed system unit or
-grant the binary `CAP_NET_BIND_SERVICE`. The current `blink` homelab deployment
-uses `8443`, so a non-root user unit is sufficient there.
-
-On the `blink` homelab deployment, the staged unit file and installer live at:
-
-- `/home/admin/baresystems/runtime/blink-homelab/systemd-user/tardigrade.service`
-- `/home/admin/baresystems/runtime/blink-homelab/install_user_systemd_units.sh`
-
-After enabling lingering for `admin`, install the staged units with:
-
-```bash
-/home/admin/baresystems/runtime/blink-homelab/install_user_systemd_units.sh enable
-```
-
-Example host-native service manifests now live under `packaging/`:
-
-- `packaging/systemd/tardigrade.service`
-- `packaging/launchd/io.baresystems.tardigrade.plist`
-
-## Usage
-
-### Serving Static Files
-
-Place your files in the `public/` directory:
-
-```
-public/
-├── index.html      # Served at /
-├── css/
-│   └── style.css   # Served at /css/style.css
-├── js/
-│   └── app.js      # Served at /js/app.js
-└── images/
-    └── logo.png    # Served at /images/logo.png
-```
-
-Directory index behavior: requests to a directory will serve `index.html` or `index.htm` if present. Directories requested without a trailing slash will be redirected with `301 Moved Permanently` to the trailing-slash form (for correct relative asset resolution).
-
-### Example Requests
-
-```bash
-# Get the index page
-curl http://localhost:8069/
-
-# Get a specific file
-curl http://localhost:8069/css/style.css
-
-# HEAD request (headers only)
-curl -I http://localhost:8069/
-
-# Check response headers
-curl -v http://localhost:8069/
-```
-
-### Response Headers
-
-All responses include:
-- `Date`: Current timestamp in RFC 7231 format
-- `Server`: Server identification (`tardigrade/<build version>`)
-- `Content-Type`: Automatically detected from file extension
-- `Content-Length`: Size of response body
-
-## Supported MIME Types
-
-| Extension | Content-Type |
-|-----------|--------------|
-| .html, .htm | text/html; charset=utf-8 |
-| .css | text/css; charset=utf-8 |
-| .js | text/javascript; charset=utf-8 |
-| .json | application/json |
-| .png | image/png |
-| .jpg, .jpeg | image/jpeg |
-| .gif | image/gif |
-| .svg | image/svg+xml |
-| .pdf | application/pdf |
-| .wasm | application/wasm |
-| ... | (30+ types supported) |
-
-## HTTP Status Codes
-
-| Code | Description |
-|------|-------------|
-| 200 | OK - File served successfully |
-| 400 | Bad Request - Malformed HTTP request |
-| 403 | Forbidden - Path traversal attempt blocked |
-| 404 | Not Found - File does not exist |
-| 405 | Method Not Allowed - Only GET/HEAD supported |
-| 413 | Payload Too Large - Request body exceeds limit |
-| 414 | URI Too Long - Request URI exceeds limit |
-| 431 | Request Header Fields Too Large |
-| 500 | Internal Server Error |
-| 501 | Not Implemented - Unknown HTTP method |
-| 505 | HTTP Version Not Supported |
-
-## Platform Support
-
-### Supported Targets
-
-Tardigrade is built and released for the following targets. Each release publishes a prebuilt binary and a SHA-256 checksum.
-
-| Platform | Architecture | Release artifact | CI status |
-|---|---|---|---|
-| Linux (glibc 2.35+) | x86_64 | `tardigrade-linux-x86_64` | Built and tested on every PR |
-| Linux (glibc 2.35+) | aarch64 | `tardigrade-linux-aarch64` | Built and tested on every PR |
-| macOS 13+ (Ventura) | x86_64 (Intel) | `tardigrade-darwin-x86_64` | Built on release tags |
-| macOS 14+ (Sonoma) | arm64 (Apple Silicon) | `tardigrade-darwin-arm64` | Built on release tags |
-
-### Windows
-
-Windows is not currently supported. Tardigrade depends on OpenSSL for TLS termination and the standard Linux/macOS socket and signal semantics for hot reload (`SIGHUP`), graceful shutdown, and binary upgrade (`SIGUSR2`). Porting these to Windows is a non-trivial effort.
-
-If Windows support matters to you, open a discussion on GitHub — community interest helps prioritize it.
-
-### Musl / Alpine Linux
-
-The release binaries link against glibc. Musl/Alpine builds are not yet published but can be produced locally from source against Zig's bundled libc. Container deployments that require musl should build from source using `zig build -Dtarget=x86_64-linux-musl -Doptimize=ReleaseFast`.
-
-### TLS dependencies
-
-TLS termination uses the system or linked OpenSSL 1.1.1+ / 3.x library. The Dockerfile bundles OpenSSL 3 so container deployments are fully self-contained. Host-native deployments require a compatible libssl/libcrypto on the `PATH` at runtime.
-
----
-
-## Production Readiness
-
-| Feature | Maturity | Notes |
-|---|---|---|
-| HTTP/1.1 serving and reverse proxying | **GA** | Core path; production-deployed |
-| TLS termination (SNI, mTLS, OCSP) | **GA** | OpenSSL 3.x; SNI-based cert selection |
-| Hot reload (`SIGHUP` + atomic swap) | **GA** | Reload-status endpoint at `/tardigrade/reload/status` |
-| Active upstream health checks | **GA** | Configurable probe path, threshold, slow-start |
-| JWT/Basic/Bearer auth enforcement | **GA** | Protecting all `/bearclaw/v1/*` and `/v1/*` paths |
-| Rate limiting (identity + IP) | **GA** | Token-bucket, descriptor-aware, idle TTL eviction |
-| Sticky upstream affinity (HMAC cookie) | **GA** | Per-location signed cookies |
-| W3C Trace Context propagation | **GA** | Always-on; OTLP export optional |
-| Access logging (JSON / template) | **GA** | Syslog UDP + file; configurable format |
-| Static file serving | **GA** | Range, ETag, conditional, autoindex, `try_files` |
-| Response compression (Gzip + Brotli) | **GA** | Configurable min-size and quality |
-| HTTP/2 (multiplexing, server push) | **Beta** | Enabled by default; no known production blockers |
-| WebSocket proxying | **Beta** | Bidirectional forwarding; idle timeout |
-| SSE / event-hub streaming | **Beta** | Backpressure, replay, per-topic limits |
-| Config-file mode (nginx-style DSL) | **Beta** | Location blocks, rewrites, return, error_page |
-| FastCGI / SCGI / uWSGI bridges | **Beta** | PHP/Python/Ruby backend support |
-| HTTP/3 (QUIC via ngtcp2/nghttp3) | **Experimental** | Opt-in via `TARDIGRADE_HTTP3_ENABLED=true`; not recommended for production |
-| ACME auto-renewal | **Experimental** | Directory-based cert discovery; not battle-tested |
-| Binary upgrade (`SIGUSR2`) | **Experimental** | Zero-downtime rollover; semantics may change |
-| gRPC proxy | **Experimental** | Upstream forwarding only; no transcoding |
-| Mail relay (SMTP, IMAP, POP3) | **Experimental** | Basic upstream forwarding |
-| Stream TCP/UDP proxy | **Experimental** | Forward-only; no protocol awareness |
-| Kubernetes / Helm | **Planned** | See [#29](https://github.com/Bare-Systems/Tardigrade/issues/29) |
-| Service discovery (DNS A/AAAA refresh) | **Beta** | Configured via `TARDIGRADE_UPSTREAM_DNS_DISCOVERY_HOST` |
-| Service discovery (DNS SRV, k8s endpoints) | **Planned** | SRV and k8s endpoint watch are future scope |
-| Native packages (DEB, RPM, Homebrew) | **Planned** | See [#31](https://github.com/Bare-Systems/Tardigrade/issues/31) |
-| Windows | **Not supported** | See [Platform Support](#platform-support) above |
-
-### Hardening checklist for operators
-
-Before putting Tardigrade in production:
-
-- [ ] Set `TARDIGRADE_REQUIRE_UNPRIVILEGED_USER=true` to fail fast if the process is still root.
-- [ ] Set `TARDIGRADE_TLS_CLIENT_VERIFY=true` and supply a CA bundle if upstreams must use mTLS.
-- [ ] Set `TARDIGRADE_MAX_BODY_SIZE`, `TARDIGRADE_MAX_URI_LENGTH`, and `TARDIGRADE_MAX_HEADER_COUNT` to limit request surface.
-- [ ] Set `TARDIGRADE_RATE_LIMIT_RPS` and `TARDIGRADE_RATE_LIMIT_BURST` to match expected traffic profile.
-- [ ] Configure `TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_PATH` and `TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_INTERVAL_MS` so unhealthy backends are removed automatically.
-- [ ] Store secrets in a `TARDIGRADE_SECRETS_PATH` file or `ENC:` encrypted env vars — do not expose raw tokens in environment.
-- [ ] Review `SECURITY.md` for the private reporting and disclosure workflow.
-- [ ] Use `tardigrade validate` in CI/CD before signalling `SIGHUP` to a running process.
-- [ ] Confirm `LimitNOFILE=65536` (or equivalent) in the service unit; set `TARDIGRADE_FD_SOFT_LIMIT` if the OS default is lower.
-- [ ] Enable `TARDIGRADE_ACCESS_LOG_FORMAT=json` and route logs to a structured collector.
-
----
-
-## Project Status
-
-This project is under active development. See [CHANGELOG.md](CHANGELOG.md) for recent changes.
-
-## Security
-
-Tardigrade terminates TLS and enforces auth at the edge. See [SECURITY.md](SECURITY.md) for the supported-version policy, private vulnerability reporting instructions, and disclosure process.
-
-## Contributing
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and guidelines.
-
-## License
-
-This project is open source and available under the Apache License, Version 2.0.

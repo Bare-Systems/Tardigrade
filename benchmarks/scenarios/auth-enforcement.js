@@ -9,16 +9,19 @@ http.setResponseCallback(http.expectedStatuses({ min: 200, max: 499 }));
 //
 // Env vars:
 //   BASE_URL             target base URL  (default: http://127.0.0.1:8069)
+//   K6_HOST_HEADER       optional Host header / :authority override
 //   AUTH_TOKEN           valid bearer token for authenticated requests
 //   AUTH_PROTECTED_PATH  path that requires auth  (default: /v1/status)
 //   K6_VUS               virtual users  (default: 20)
 //   K6_DURATION          test duration  (default: 15s)
 
 const baseUrl       = __ENV.BASE_URL             || 'http://127.0.0.1:8069';
+const hostHeader    = __ENV.K6_HOST_HEADER       || '';
 const protectedPath = __ENV.AUTH_PROTECTED_PATH  || '/v1/status';
 const authToken     = __ENV.AUTH_TOKEN           || '';
 
 const protectedUrl = `${baseUrl}${protectedPath}`;
+const baseParams = hostHeader ? { headers: { Host: hostHeader } } : {};
 
 // Treat 401 as an expected (non-failure) response so http_req_failed only
 // captures genuine errors (5xx, network failures).
@@ -38,13 +41,13 @@ export const options = {
 
 export default function () {
   // Unauthenticated — expect 401
-  const unauthRes = http.get(protectedUrl, { tags: { type: 'unauth' } });
+  const unauthRes = http.get(protectedUrl, { ...baseParams, tags: { type: 'unauth' } });
   check(unauthRes, { 'unauthenticated → 401': (r) => r.status === 401 }, { type: 'unauth' });
 
   // Authenticated — expect 2xx (only runs when a token is supplied)
   if (authToken) {
     const authRes = http.get(protectedUrl, {
-      headers: { Authorization: `Bearer ${authToken}` },
+      headers: { ...(baseParams.headers || {}), Authorization: `Bearer ${authToken}` },
       tags:    { type: 'auth' },
     });
     check(authRes, { 'authenticated → 2xx': (r) => r.status >= 200 && r.status < 300 }, { type: 'auth' });

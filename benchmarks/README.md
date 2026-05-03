@@ -8,14 +8,15 @@ Repeatable benchmark and regression harness for Tardigrade.
 # Start a local Tardigrade instance (adjust env as needed)
 TARDIGRADE_LISTEN_PORT=8069 ./zig-out/bin/tardigrade &
 
-# Run all default scenarios with auto-detected tool (30 s, 50 connections)
-./benchmarks/run.sh
+# Run the default scenario set.
+# For honest proxy numbers, point --proxy-path at a real proxied route.
+./benchmarks/run.sh --proxy-path /proxy/health
 
 # Save a baseline for the current release
-./benchmarks/run.sh --save benchmarks/baselines/$(git describe --tags).json
+./benchmarks/run.sh --proxy-path /proxy/health --save benchmarks/baselines/$(git describe --tags).json
 
 # Compare a future run against that baseline
-./benchmarks/run.sh --baseline benchmarks/baselines/<tag>.json
+./benchmarks/run.sh --proxy-path /proxy/health --baseline benchmarks/baselines/<tag>.json
 
 # Generate a markdown report from a saved baseline
 ./benchmarks/report.sh benchmarks/baselines/<tag>.json
@@ -46,9 +47,9 @@ These measure raw request throughput and run with whichever tool is auto-detecte
 | Scenario | Description |
 |---|---|
 | `static-http1` | Static file serving over HTTP/1.1 (hits `/health`) |
-| `proxy-http1` | Reverse proxy route over HTTP/1.1 |
-| `proxy-http2` | Reverse proxy route over HTTP/2 (requires `h2load`) |
-| `keepalive` | Keep-alive connection reuse |
+| `proxy-http1` | Reverse proxy route over HTTP/1.1 (default path: `/proxy/health`) |
+| `proxy-http2` | Reverse proxy route over HTTP/2 (requires `h2load`, default path: `/proxy/health`) |
+| `keepalive` | Keep-alive connection reuse (default path: `/health`) |
 | `reload-under-load` | SIGHUP sent mid-run; measures degradation during reload |
 
 ### k6-only behavioral scenarios
@@ -80,11 +81,15 @@ Run only k6 behavioral tests: `--tool k6 --scenarios auth-enforcement,rate-limit
 ```
 --host HOST           Target host (default: 127.0.0.1)
 --port PORT           Target port (default: 8069)
+--host-header NAME    Override the HTTP Host header / :authority
 --tls                 Use HTTPS
 --insecure            Skip TLS certificate verification
 --duration SECS       Seconds per scenario (default: 30)
 --connections N       Concurrent connections (default: 50)
 --threads N           wrk worker threads (default: 4)
+--static-path PATH    Path for static-http1 and reload-under-load (default: /health)
+--proxy-path PATH     Path for proxy-http1/proxy-http2 (default: /proxy/health)
+--keepalive-path PATH Path for keepalive (default: /health)
 --scenarios LIST      Comma-separated scenario names
 --tool TOOL           Force tool: wrk|h2load|fortio|k6
 --baseline FILE       Compare against a baseline JSON file
@@ -93,6 +98,134 @@ Run only k6 behavioral tests: `--tool k6 --scenarios auth-enforcement,rate-limit
 ```
 
 Exit code 2 indicates at least one scenario regressed beyond the threshold.
+
+## Path and host overrides
+
+Two things commonly invalidate a run if you miss them:
+
+- `proxy-http1` and `proxy-http2` are only meaningful when `--proxy-path` points at a real proxied upstream route.
+- If the target config uses `server_name`, send a matching `Host` header with `--host-header` or benchmark via the named hostname instead of by raw IP.
+
+Examples:
+
+```bash
+# Named vhost on a remote IP
+./benchmarks/run.sh \
+  --host 192.168.86.55 \
+  --host-header tardigrade-perf \
+  --static-path /health \
+  --proxy-path /proxy/health
+
+# HTTP/2 proxy route over TLS
+./benchmarks/run.sh \
+  --host edge.example.test \
+  --port 443 \
+  --tls \
+  --tool h2load \
+  --proxy-path /bearclaw/health
+```
+
+## Remote perf target
+
+The current homelab perf target lives on the Proxmox node reachable as `ssh proxmox`.
+
+Current staged shape:
+
+- Proxmox node: `beelink`
+- LXC guest: `102 (tardigrade-perf)`
+- Guest IP: `192.168.86.55`
+- Tardigrade service: `tardigrade-perf.service`
+- Stub upstream service: `tardigrade-upstream.service`
+- Benchmark routes:
+  - `/health` → direct edge return
+  - `/proxy/health` → proxied loopback upstream
+  - `/proxy/payload-64k.bin` → proxied 64 KiB payload
+
+### Verify the staged target
+
+```bash
+ssh proxmox 'pct list'
+ssh proxmox 'pct exec 102 -- systemctl status --no-pager tardigrade-perf tardigrade-upstream'
+curl -i http://192.168.86.55:8069/health
+curl -i http://192.168.86.55:8069/proxy/health
+```
+
+### Rebuild the staged target
+
+```bash
+ssh proxmox 'pct exec 102 -- bash -lc "
+  cd /opt/tardigrade-src &&
+  git pull &&
+  /opt/zig/zig build -Doptimize=ReleaseFast &&
+  systemctl restart tardigrade-perf &&
+  systemctl --no-pager --lines=20 status tardigrade-perf
+"'
+```
+
+### Run from this laptop
+
+```bash
+./benchmarks/run.sh \
+  --host 192.168.86.55 \
+  --port 8069 \
+  --tool k6 \
+  --duration 30 \
+  --connections 50 \
+  --static-path /health \
+  --proxy-path /proxy/health \
+  --keepalive-path /health \
+  --save benchmarks/baselines/$(date +%Y%m%d)-homelab.json
+```
+
+If the perf guest is switched to a config that declares `server_name tardigrade-perf;`, add `--host-header tardigrade-perf` to every benchmark command.
+
+### Run from inside the container (loopback — most accurate for proxy overhead)
+
+Running `wrk` inside the perf LXC against `127.0.0.1` eliminates all network RTT.
+This is the only setup that reveals Tardigrade's actual per-request processing cost.
+
+```bash
+ssh proxmox 'pct exec 102 -- bash -c "
+  wrk -t2 -c4 -d30s -L http://127.0.0.1:8069/health
+  wrk -t2 -c4 -d30s -L http://127.0.0.1:8069/proxy/health
+"'
+```
+
+Keep connections at or near the worker count (`workers=2` by default on a 2-core LXC)
+to avoid queue-saturation inflating p99. The p50 is the honest latency signal.
+
+### Run from the Jetson (external load driver — preferred for regression tracking)
+
+The Jetson Orin Nano (`ssh jetson`) is a separate LAN machine with `wrk` built at
+`~/tools/wrk/wrk`. Using it as the driver avoids contaminating latency numbers with
+shared CPU/RAM/scheduler from the same Proxmox host as the target.
+
+Use `benchmarks/jetson-run.sh` — it SSHes to the Jetson for each `wrk` invocation
+and parses/saves results locally in the same JSON format as `run.sh`:
+
+```bash
+./benchmarks/jetson-run.sh \
+  --host 192.168.86.55 \
+  --port 8069 \
+  --duration 30 \
+  --connections 50 \
+  --save benchmarks/results/$(date +%Y-%m-%d)/jetson-wrk.json
+```
+
+To compare against a previous run:
+
+```bash
+./benchmarks/jetson-run.sh \
+  --host 192.168.86.55 \
+  --port 8069 \
+  --duration 30 \
+  --connections 50 \
+  --baseline benchmarks/results/2026-05-02/jetson-wrk.json \
+  --save benchmarks/results/$(date +%Y-%m-%d)/jetson-wrk.json
+```
+
+`jetson-run.sh` supports: `static-http1`, `proxy-http1`, `keepalive`. For HTTP/2,
+behavioral (k6), or reload-under-load scenarios, use `run.sh` directly.
 
 ## Generating a report
 
@@ -129,6 +262,7 @@ Benchmark results are only meaningful when the test environment is controlled:
 - Pin to specific CPU cores if the machine has more than Tardigrade needs
 - Disable power management / frequency scaling (`cpufreq-set -g performance`)
 - Run the benchmark driver on a separate host from Tardigrade when possible
+- Record the exact benchmark paths and Host header used, not just the IP/port
 
 Document the test host in each baseline file's `_meta.host` field.
 

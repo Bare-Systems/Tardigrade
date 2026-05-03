@@ -3,6 +3,19 @@
 
 ## [Unreleased]
 
+### Added
+- **TCP_NODELAY on accepted connections** — `setNoDelay` is now called on every accepted client socket in `handleAcceptedClient`. Without this, the Nagle algorithm combined with TCP delayed ACK (40 ms on Linux) caused every keep-alive response to be held for ~40 ms before flushing, regardless of whether the connection was over loopback or LAN. Loopback throughput on the perf target went from ~50 req/s to ~4 600 req/s; p50 latency dropped from 41 ms to 0.45 ms.
+
+### Added
+- **Jetson external load driver** — `benchmarks/jetson-run.sh` runs `wrk` on the Jetson Orin Nano (`ssh jetson`) via SSH so the load driver is on a separate physical machine from the Proxmox perf target. Produces the same JSON result format as `run.sh` (including `_meta` with `driver` field), supports `--save`, `--baseline`, and `--threshold` comparison, and pre-validates SSH access, wrk availability, and target reachability before starting. `benchmarks/README.md` updated with Jetson driver usage and comparison workflow.
+
+### Added
+- **Homelab perf execution guide** — `benchmarks/README.md` now documents the staged Proxmox perf target (`ssh proxmox` → LXC `102`), the guest rebuild flow, the benchmark routes it exposes, and the exact commands to run remote benchmark captures from the laptop.
+
+### Changed
+- **Benchmark runner path + Host-header controls** — `benchmarks/run.sh` now accepts `--host-header`, `--static-path`, `--proxy-path`, and `--keepalive-path`, records those settings in the saved baseline metadata, and forwards the Host override through `wrk`, `h2load`, `fortio`, and all `k6` scenarios. This removes the hidden named-vhost trap where a config with `server_name` would return 404s when benchmarked by raw IP, and it lets `proxy-http1` / `proxy-http2` hit a real proxied route instead of reusing `/health`.
+- **README simplified into a public landing page** — the root README now focuses on project scope, maturity, quick start, minimal config, and links to deeper documentation. Operator-manual content, BearClaw/Blink deployment details, environment-variable reference tables, and embedded benchmark output were removed from the root document.
+
 ### Fixed
 - **CI: format drift + missing libssl-dev** — Ran `zig fmt` on 10 source files that had drifted from canonical formatting, unblocking the `zig fmt --check` gate. Added explicit `libssl-dev` install to the test job so the OpenSSL dependency is never silently absent on a runner image update.
 

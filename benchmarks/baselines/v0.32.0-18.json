@@ -1,0 +1,35 @@
+{
+  "static-http1": {
+    "rps": 4586,
+    "p50_ms": 0.445,
+    "p99_ms": 46.06,
+    "errors": 0
+  },
+  "proxy-http1": {
+    "rps": 1724,
+    "p50_ms": 1.27,
+    "p99_ms": 114.9,
+    "errors": 0
+  },
+  "keepalive": {
+    "rps": 4700,
+    "p50_ms": 0.447,
+    "p99_ms": 41.84,
+    "errors": 0
+  },
+  "_meta": {
+    "tag": "v0.32.0-18-gb44f8c1",
+    "timestamp": "2026-05-02T17:00:00Z",
+    "host": "127.0.0.1",
+    "port": "8069",
+    "tool": "wrk",
+    "driver": "loopback (inside tardigrade-perf LXC)",
+    "duration_s": 30,
+    "connections": 4,
+    "host_header": "",
+    "static_path": "/health",
+    "proxy_path": "/proxy/health",
+    "keepalive_path": "/health",
+    "note": "p50 is meaningful; p99 reflects 4-connection queue depth against 2-worker pool, not proxy overhead"
+  }
+}

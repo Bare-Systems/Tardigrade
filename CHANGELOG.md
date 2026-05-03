@@ -21,6 +21,7 @@ All notable user-facing changes to Tardigrade are documented here.
 - Static file serving now rejects percent-encoded traversal, separator-variant traversal, and symlink escapes outside the configured root.
 - Rate limiting now resolves authenticated identity before middleware enforcement so JWT, bearer, and session traffic do not share an IP-only bucket.
 - Hot reload now retires superseded configs after in-flight requests complete so repeated reloads do not accumulate stale config allocations.
+- Request IDs now accept `X-Request-ID` input, echo both request-id headers on responses, propagate upstream, and enrich JSON access logs with upstream address, upstream status, and response byte counts.
 
 ## [0.62.0] - 2026-04-24
 

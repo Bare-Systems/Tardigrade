@@ -89,6 +89,12 @@ still fall back to client IP rate limiting.
 Hot reloads now retire superseded configs after in-flight requests drain, so
 repeated `reload` or `SIGHUP` cycles do not retain old config allocations.
 
+Tardigrade accepts a safe inbound `X-Request-ID` or legacy
+`X-Correlation-ID`, generates one when neither is valid, echoes both response
+headers, and forwards the same ID upstream. JSON access logs include
+`request_id`, `latency_ms`, `upstream_addr`, `upstream_status`, and
+`response_bytes`.
+
 ## Documentation
 
 | Topic | Location |

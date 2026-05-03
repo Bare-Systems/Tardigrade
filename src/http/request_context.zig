@@ -31,6 +31,12 @@ pub const RequestContext = struct {
     api_version: ?u16,
     /// Idempotency key if provided.
     idempotency_key: ?[]const u8,
+    /// Upstream address selected for proxied requests.
+    upstream_addr: ?[]const u8,
+    /// Final upstream status observed for proxied requests.
+    upstream_status: ?u16,
+    /// Response body bytes written back to the client when tracked.
+    response_bytes: usize,
 
     pub fn init(allocator: Allocator, request_id: []const u8, client_ip: []const u8) RequestContext {
         return .{
@@ -46,6 +52,9 @@ pub const RequestContext = struct {
             .client_ip = client_ip,
             .api_version = null,
             .idempotency_key = null,
+            .upstream_addr = null,
+            .upstream_status = null,
+            .response_bytes = 0,
         };
     }
 
@@ -83,6 +92,12 @@ pub const RequestContext = struct {
     /// Set idempotency key.
     pub fn setIdempotencyKey(self: *RequestContext, key: []const u8) void {
         self.idempotency_key = key;
+    }
+
+    pub fn setUpstreamResult(self: *RequestContext, upstream_addr: []const u8, upstream_status: u16, response_bytes: usize) void {
+        self.upstream_addr = self.allocator.dupe(u8, upstream_addr) catch upstream_addr;
+        self.upstream_status = upstream_status;
+        self.response_bytes = response_bytes;
     }
 
     /// Format a structured audit log line.

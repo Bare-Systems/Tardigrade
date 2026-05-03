@@ -2,6 +2,7 @@ const std = @import("std");
 const Headers = @import("headers.zig").Headers;
 
 pub const HEADER_NAME = "X-Correlation-ID";
+pub const REQUEST_HEADER_NAME = "X-Request-ID";
 pub const MAX_CORRELATION_ID_LEN: usize = 128;
 
 /// Allowed token characters for correlation IDs.
@@ -20,6 +21,11 @@ pub fn isValid(id: []const u8) bool {
 
 /// Return client-provided correlation ID if valid; otherwise generate one.
 pub fn fromHeadersOrGenerate(allocator: std.mem.Allocator, headers: *const Headers) ![]u8 {
+    if (headers.get("x-request-id")) |incoming| {
+        if (isValid(incoming)) {
+            return allocator.dupe(u8, incoming);
+        }
+    }
     if (headers.get("x-correlation-id")) |incoming| {
         if (isValid(incoming)) {
             return allocator.dupe(u8, incoming);
@@ -58,6 +64,21 @@ test "fromHeadersOrGenerate reuses valid incoming header" {
     defer allocator.free(correlation_id);
 
     try testing.expectEqualStrings("req-123", correlation_id);
+}
+
+test "fromHeadersOrGenerate prefers valid request id header" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var headers = Headers.init(allocator);
+    defer headers.deinit();
+    try headers.append("X-Request-ID", "req-789");
+    try headers.append("X-Correlation-ID", "req-123");
+
+    const correlation_id = try fromHeadersOrGenerate(allocator, &headers);
+    defer allocator.free(correlation_id);
+
+    try testing.expectEqualStrings("req-789", correlation_id);
 }
 
 test "fromHeadersOrGenerate falls back when incoming header is invalid" {

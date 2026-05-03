@@ -8,9 +8,12 @@ pub const AccessLogEntry = struct {
     latency_ms: i64,
     client_ip: []const u8,
     correlation_id: []const u8,
+    upstream_addr: []const u8,
+    upstream_status: ?u16,
     identity: []const u8,
     user_agent: []const u8,
     bytes_sent: usize,
+    response_bytes: usize,
     error_category: []const u8,
 
     pub fn log(self: AccessLogEntry) void {
@@ -104,16 +107,37 @@ pub fn emit(entry: AccessLogEntry) void {
 fn formatEntry(allocator: std.mem.Allocator, cfg: Config, entry: AccessLogEntry) ![]u8 {
     var ts_buf: [32]u8 = undefined;
     const ts = logger.formatTimestamp(&ts_buf);
+    var upstream_status_buf: [16]u8 = undefined;
+    const upstream_status_text = if (entry.upstream_status) |status|
+        std.fmt.bufPrint(&upstream_status_buf, "{d}", .{status}) catch "null"
+    else
+        "null";
     return switch (cfg.format) {
         .json => std.fmt.allocPrint(
             allocator,
-            "{{\"type\":\"access\",\"ts\":\"{s}\",\"method\":\"{s}\",\"path\":\"{s}\",\"status\":{d},\"latency_ms\":{d},\"client_ip\":\"{s}\",\"correlation_id\":\"{s}\",\"identity\":\"{s}\",\"user_agent\":\"{s}\",\"bytes_sent\":{d},\"error_category\":\"{s}\"}}\n",
-            .{ ts, entry.method, entry.path, entry.status, entry.latency_ms, entry.client_ip, entry.correlation_id, entry.identity, entry.user_agent, entry.bytes_sent, entry.error_category },
+            "{{\"type\":\"access\",\"ts\":\"{s}\",\"request_id\":\"{s}\",\"correlation_id\":\"{s}\",\"method\":\"{s}\",\"path\":\"{s}\",\"status\":{d},\"latency_ms\":{d},\"client_ip\":\"{s}\",\"upstream_addr\":\"{s}\",\"upstream_status\":{s},\"identity\":\"{s}\",\"user_agent\":\"{s}\",\"bytes_sent\":{d},\"response_bytes\":{d},\"error_category\":\"{s}\"}}\n",
+            .{
+                ts,
+                entry.correlation_id,
+                entry.correlation_id,
+                entry.method,
+                entry.path,
+                entry.status,
+                entry.latency_ms,
+                entry.client_ip,
+                entry.upstream_addr,
+                upstream_status_text,
+                entry.identity,
+                entry.user_agent,
+                entry.bytes_sent,
+                entry.response_bytes,
+                entry.error_category,
+            },
         ),
         .plain => std.fmt.allocPrint(
             allocator,
-            "{s} {s} {d} {d}ms ip={s} req={s} id={s} ua=\"{s}\" err={s}\n",
-            .{ entry.method, entry.path, entry.status, entry.latency_ms, entry.client_ip, entry.correlation_id, entry.identity, entry.user_agent, entry.error_category },
+            "{s} {s} {d} {d}ms ip={s} req={s} upstream={s} upstream_status={?d} bytes={d} ua=\"{s}\" err={s}\n",
+            .{ entry.method, entry.path, entry.status, entry.latency_ms, entry.client_ip, entry.correlation_id, entry.upstream_addr, entry.upstream_status, entry.response_bytes, entry.user_agent, entry.error_category },
         ),
         .custom => renderTemplate(allocator, if (cfg.custom_template.len > 0) cfg.custom_template else "{method} {path} {status}", ts, entry),
     };
@@ -138,6 +162,12 @@ fn renderTemplate(allocator: std.mem.Allocator, template: []const u8, ts: []cons
                 try out.writer().print("{d}", .{entry.latency_ms});
             } else if (std.mem.eql(u8, key, "bytes_sent")) {
                 try out.writer().print("{d}", .{entry.bytes_sent});
+            } else if (std.mem.eql(u8, key, "response_bytes")) {
+                try out.writer().print("{d}", .{entry.response_bytes});
+            } else if (std.mem.eql(u8, key, "upstream_status")) {
+                if (entry.upstream_status) |status| {
+                    try out.writer().print("{d}", .{status});
+                }
             } else {
                 const replacement: []const u8 = if (std.mem.eql(u8, key, "ts"))
                     ts
@@ -147,8 +177,12 @@ fn renderTemplate(allocator: std.mem.Allocator, template: []const u8, ts: []cons
                     entry.path
                 else if (std.mem.eql(u8, key, "client_ip"))
                     entry.client_ip
+                else if (std.mem.eql(u8, key, "request_id"))
+                    entry.correlation_id
                 else if (std.mem.eql(u8, key, "correlation_id"))
                     entry.correlation_id
+                else if (std.mem.eql(u8, key, "upstream_addr"))
+                    entry.upstream_addr
                 else if (std.mem.eql(u8, key, "identity"))
                     entry.identity
                 else if (std.mem.eql(u8, key, "user_agent"))
@@ -199,9 +233,12 @@ test "AccessLogEntry fields are set correctly" {
         .latency_ms = 42,
         .client_ip = "1.2.3.4",
         .correlation_id = "req-001",
+        .upstream_addr = "http://127.0.0.1:8080",
+        .upstream_status = 200,
         .identity = "token-abc",
         .user_agent = "curl/8.0",
         .bytes_sent = 256,
+        .response_bytes = 256,
         .error_category = "-",
     };
 
@@ -225,9 +262,12 @@ test "AccessLogEntry log does not panic" {
         .latency_ms = 0,
         .client_ip = "127.0.0.1",
         .correlation_id = "test-001",
+        .upstream_addr = "",
+        .upstream_status = null,
         .identity = "-",
         .user_agent = "",
         .bytes_sent = 0,
+        .response_bytes = 0,
         .error_category = "-",
     };
     entry.log();

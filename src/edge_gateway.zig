@@ -3902,6 +3902,7 @@ fn respondHttp2Stream(
     try response_headers.append(.{ .name = ":status", .value = status_str });
     try response_headers.append(.{ .name = "content-type", .value = content_type });
     try response_headers.append(.{ .name = "content-length", .value = len_str });
+    try response_headers.append(.{ .name = http.correlation.REQUEST_HEADER_NAME, .value = correlation_id });
     try response_headers.append(.{ .name = http.correlation.HEADER_NAME, .value = correlation_id });
     for (state.add_headers) |h| {
         try response_headers.append(.{ .name = h.name, .value = h.value });
@@ -4280,6 +4281,7 @@ fn routeRequest(
                     writer,
                     cfg,
                     state,
+                    ctx,
                     request,
                     target,
                     proxySuffixPathForLocation(request.uri.path, matched, cfg.location_blocks),
@@ -4301,7 +4303,9 @@ fn routeRequest(
                 if (ret.status >= 300 and ret.status < 400 and ret.body.len > 0) {
                     var response = http.Response.redirect(allocator, ret.body, @enumFromInt(ret.status));
                     defer response.deinit();
-                    _ = response.setConnection(keep_alive.*).setHeader(http.correlation.HEADER_NAME, correlation_id);
+                    _ = response.setConnection(keep_alive.*);
+                    setRequestIdHeaders(&response, correlation_id);
+                    ctx.response_bytes = 0;
                     applyResponseHeaders(state, &response);
                     try response.write(writer);
                 } else {
@@ -4310,8 +4314,9 @@ fn routeRequest(
                     _ = response.setStatus(@enumFromInt(ret.status))
                         .setBody(ret.body)
                         .setContentType("text/plain; charset=utf-8")
-                        .setConnection(keep_alive.*)
-                        .setHeader(http.correlation.HEADER_NAME, correlation_id);
+                        .setConnection(keep_alive.*);
+                    setRequestIdHeaders(&response, correlation_id);
+                    ctx.response_bytes = ret.body.len;
                     applyResponseHeaders(state, &response);
                     try response.write(writer);
                 }
@@ -4715,7 +4720,10 @@ fn executeVersionedApiProxyRoute(
     };
 
     switch (exec) {
-        .streamed_status => |status| return status,
+        .streamed_status => |streamed| {
+            ctx.setUpstreamResult(streamed.upstream_addr, streamed.status, 0);
+            return streamed.status;
+        },
         .buffered => |resp| {
             defer allocator.free(resp.body);
             defer allocator.free(resp.content_type);
@@ -4728,8 +4736,8 @@ fn executeVersionedApiProxyRoute(
             _ = response.setStatus(@enumFromInt(resp.status))
                 .setBody(resp.body)
                 .setContentType(resp.content_type)
-                .setConnection(keep_alive)
-                .setHeader(http.correlation.HEADER_NAME, correlation_id);
+                .setConnection(keep_alive);
+            setRequestIdHeaders(&response, correlation_id);
             if (resp.content_disposition) |cd| {
                 _ = response.setHeader("Content-Disposition", cd);
             }
@@ -4741,6 +4749,7 @@ fn executeVersionedApiProxyRoute(
             }
             applyResponseHeaders(state, &response);
             try response.write(writer);
+            ctx.setUpstreamResult(resp.upstream_addr, resp.status, resp.body.len);
             state.metricsRecord(resp.status);
             return resp.status;
         },
@@ -4752,6 +4761,7 @@ fn handleLocationProxyPass(
     writer: anytype,
     cfg: *const edge_config.EdgeConfig,
     state: *GatewayState,
+    ctx: *http.request_context.RequestContext,
     request: *const http.Request,
     target: []const u8,
     suffix_path: ?[]const u8,
@@ -4862,6 +4872,7 @@ fn handleLocationProxyPass(
             state.recordUpstreamSuccess(cfg, selection.base_url);
         }
     }
+    ctx.setUpstreamResult(resolved.upstream_host, upstream_response.status_code, upstream_response.body.len);
     try writeBufferedUpstreamResponse(writer, &upstream_response, keep_alive, correlation_id, &state.security_headers, sticky_set_cookie);
     const status_code = upstream_response.status_code;
     state.metricsRecord(status_code);
@@ -4931,7 +4942,7 @@ fn executeRawHttpProxyRequest(
     var extra_headers = std.ArrayList(std.http.Header).init(allocator);
     defer extra_headers.deinit();
     try appendProxyRequestHeaders(&extra_headers, request_headers);
-    try extra_headers.append(.{ .name = http.correlation.HEADER_NAME, .value = correlation_id });
+    try appendRequestIdHeaders(&extra_headers, correlation_id);
     try extra_headers.append(.{ .name = "X-Forwarded-For", .value = forwarded_for });
     try extra_headers.append(.{ .name = "X-Real-IP", .value = client_ip });
     try extra_headers.append(.{ .name = "X-Forwarded-Proto", .value = forwarded_proto });
@@ -5068,7 +5079,7 @@ fn executeUpstreamHttpsWithMtls(
     try req_writer.print("Host: {s}\r\n", .{host});
     try req_writer.print("Connection: close\r\n", .{});
     if (body.len > 0) try req_writer.print("Content-Length: {d}\r\n", .{body.len});
-    try req_writer.print("{s}: {s}\r\n", .{ http.correlation.HEADER_NAME, correlation_id });
+    try writeRequestIdHeaders(req_writer, correlation_id);
     try req_writer.print("X-Forwarded-For: {s}\r\n", .{forwarded_for});
     try req_writer.print("X-Real-IP: {s}\r\n", .{client_ip});
     try req_writer.print("X-Forwarded-Proto: {s}\r\n", .{forwarded_proto});
@@ -5491,7 +5502,7 @@ fn streamSseTopic(
     try writer.writeAll("Cache-Control: no-cache\r\n");
     try writer.writeAll("Content-Type: text/event-stream\r\n");
     try writer.writeAll("X-Accel-Buffering: no\r\n");
-    try writer.print("{s}: {s}\r\n", .{ http.correlation.HEADER_NAME, correlation_id });
+    try writeRequestIdHeaders(writer, correlation_id);
     try writeSecurityHeaders(writer, &state.security_headers);
     for (state.add_headers) |pair| {
         try writer.print("{s}: {s}\r\n", .{ pair.name, pair.value });
@@ -5701,8 +5712,8 @@ fn runAsyncCommandJob(job: *AsyncCommandJob) void {
     };
 
     switch (exec) {
-        .streamed_status => |status| {
-            job.state.commandLifecycleSetCompleted(job.command_id, status, "", JSON_CONTENT_TYPE);
+        .streamed_status => |streamed| {
+            job.state.commandLifecycleSetCompleted(job.command_id, streamed.status, "", JSON_CONTENT_TYPE);
         },
         .buffered => |resp| {
             defer job.allocator.free(resp.body);
@@ -5870,6 +5881,7 @@ fn spawnMirrorRequests(
         const uri = std.Uri.parse(rule.target_url) catch continue;
         var header_buf: [8 * 1024]u8 = undefined;
         var headers = [_]std.http.Header{
+            .{ .name = http.correlation.REQUEST_HEADER_NAME, .value = correlation_id },
             .{ .name = http.correlation.HEADER_NAME, .value = correlation_id },
             .{ .name = "X-Mirror-Client-IP", .value = client_ip },
             .{ .name = "Content-Type", .value = content_type orelse "application/octet-stream" },
@@ -6291,6 +6303,7 @@ fn proxyGrpcExecute(
     const uri = try std.Uri.parse(upstream_url);
     var header_buf: [16 * 1024]u8 = undefined;
     var headers = [_]std.http.Header{
+        .{ .name = http.correlation.REQUEST_HEADER_NAME, .value = correlation_id },
         .{ .name = http.correlation.HEADER_NAME, .value = correlation_id },
         .{ .name = "TE", .value = "trailers" },
     };
@@ -6877,6 +6890,11 @@ const Http3LocationOutcome = union(enum) {
 };
 
 fn finalizeHttp3Response(response: *http.Response) void {
+    if (response.headers.get("x-request-id")) |request_id| {
+        _ = response.setHeader(http.correlation.HEADER_NAME, request_id);
+    } else if (response.headers.get("x-correlation-id")) |correlation_id| {
+        _ = response.setHeader(http.correlation.REQUEST_HEADER_NAME, correlation_id);
+    }
     _ = response
         .setHeader("server", http.SERVER_NAME ++ "/" ++ http.SERVER_VERSION)
         .setContentLength(if (response.body) |body| body.len else 0);
@@ -7083,7 +7101,7 @@ fn handleHttp3Connection(
     response: *http.Response,
     ctx: *Http3DispatchContext,
 ) !void {
-    const correlation_id = request.headers.get(http.correlation.HEADER_NAME) orelse "http3";
+    const correlation_id = request.headers.get(http.correlation.REQUEST_HEADER_NAME) orelse request.headers.get(http.correlation.HEADER_NAME) orelse "http3";
     var http3_path, _ = splitHttp3PathAndQuery(request.path);
     var rewrite_budget: usize = 0;
     while (rewrite_budget < 4) : (rewrite_budget += 1) {
@@ -7127,7 +7145,7 @@ fn handleHttp3Request(
     const authority = request.headers.get(":authority") orelse request.headers.get("host");
     var effective_cfg_storage = active_cfg.*;
     const effective_cfg = resolveRequestConfig(active_cfg, authority, &effective_cfg_storage) orelse {
-        const correlation_id = request.headers.get(http.correlation.HEADER_NAME) orelse "http3";
+        const correlation_id = request.headers.get(http.correlation.REQUEST_HEADER_NAME) orelse request.headers.get(http.correlation.HEADER_NAME) orelse "http3";
         const payload = try buildApiErrorJson(allocator, "invalid_request", "Not Found", correlation_id);
         _ = response
             .setStatus(.not_found)
@@ -7140,7 +7158,7 @@ fn handleHttp3Request(
         return;
     };
     if (!hostMatchesPatterns(effective_cfg.server_names, authority)) {
-        const correlation_id = request.headers.get(http.correlation.HEADER_NAME) orelse "http3";
+        const correlation_id = request.headers.get(http.correlation.REQUEST_HEADER_NAME) orelse request.headers.get(http.correlation.HEADER_NAME) orelse "http3";
         const payload = try buildApiErrorJson(allocator, "invalid_request", "Not Found", correlation_id);
         _ = response
             .setStatus(.not_found)
@@ -7671,6 +7689,8 @@ fn authorizeViaSubrequest(
     header_count += 1;
     headers_buf[header_count] = .{ .name = "X-Client-IP", .value = client_ip };
     header_count += 1;
+    headers_buf[header_count] = .{ .name = http.correlation.REQUEST_HEADER_NAME, .value = correlation_id };
+    header_count += 1;
     headers_buf[header_count] = .{ .name = http.correlation.HEADER_NAME, .value = correlation_id };
     header_count += 1;
     if (request.headers.get("authorization")) |authz| {
@@ -7899,10 +7919,14 @@ const ProxyResult = struct {
     location: ?[]u8,
     set_cookie: ?[]u8,
     cacheable: bool,
+    upstream_addr: []const u8,
 };
 
 const ProxyExecution = union(enum) {
-    streamed_status: u16,
+    streamed_status: struct {
+        status: u16,
+        upstream_addr: []const u8,
+    },
     buffered: ProxyResult,
 };
 
@@ -8133,8 +8157,8 @@ fn proxyJsonExecute(
             };
         };
         switch (exec) {
-            .streamed_status => |status| {
-                if (status >= 500) {
+            .streamed_status => |streamed| {
+                if (streamed.status >= 500) {
                     state.recordUpstreamFailure(cfg, upstream_base_url);
                 } else {
                     state.recordUpstreamSuccess(cfg, upstream_base_url);
@@ -8207,7 +8231,7 @@ fn proxyJsonExecuteSingleAttempt(
         for (owned_header_values.items) |value| allocator.free(value);
         owned_header_values.deinit();
     }
-    try extra_headers.append(.{ .name = http.correlation.HEADER_NAME, .value = correlation_id });
+    try appendRequestIdHeaders(&extra_headers, correlation_id);
     try extra_headers.append(.{ .name = "X-Forwarded-For", .value = forwarded_for });
     try extra_headers.append(.{ .name = "X-Real-IP", .value = client_ip });
     try extra_headers.append(.{ .name = "X-Forwarded-Proto", .value = forwarded_proto });
@@ -8305,7 +8329,7 @@ fn proxyJsonExecuteSingleAttempt(
             try writeChunk(downstream_writer, read_buf[0..n]);
         }
         try downstream_writer.writeAll("0\r\n\r\n");
-        return .{ .streamed_status = status_code };
+        return .{ .streamed_status = .{ .status = status_code, .upstream_addr = upstream_host } };
     }
 
     if (status_code != 200) {
@@ -8350,6 +8374,7 @@ fn proxyJsonExecuteSingleAttempt(
                 .location = upstream_location,
                 .set_cookie = buffered_set_cookie,
                 .cacheable = false,
+                .upstream_addr = upstream_host,
             },
         };
     }
@@ -8395,6 +8420,7 @@ fn proxyJsonExecuteSingleAttempt(
             .location = upstream_location,
             .set_cookie = buffered_set_cookie,
             .cacheable = cacheable,
+            .upstream_addr = upstream_host,
         },
     };
 }
@@ -8461,7 +8487,7 @@ fn writeStreamedUpstreamResponse(
     try writer.writeAll("Connection: close\r\n");
     try writer.writeAll("Transfer-Encoding: chunked\r\n");
     try writer.print("Content-Type: {s}\r\n", .{content_type});
-    try writer.print("{s}: {s}\r\n", .{ http.correlation.HEADER_NAME, correlation_id });
+    try writeRequestIdHeaders(writer, correlation_id);
     if (content_disposition) |cd| {
         try writer.print("Content-Disposition: {s}\r\n", .{cd});
     }
@@ -8490,7 +8516,7 @@ fn writeBufferedUpstreamResponse(
     try writer.print("Server: {s}/{s}\r\n", .{ http.SERVER_NAME, http.SERVER_VERSION });
     try writer.print("Connection: {s}\r\n", .{if (keep_alive) "keep-alive" else "close"});
     try writer.print("Content-Length: {d}\r\n", .{upstream_response.body.len});
-    try writer.print("{s}: {s}\r\n", .{ http.correlation.HEADER_NAME, correlation_id });
+    try writeRequestIdHeaders(writer, correlation_id);
     for (upstream_response.headers) |header| {
         try writer.print("{s}: {s}\r\n", .{ header.name, header.value });
     }
@@ -8538,6 +8564,7 @@ fn shouldSkipUpstreamRequestHeader(name: []const u8, connection_header: ?[]const
         std.ascii.eqlIgnoreCase(name, "x-forwarded-host") or
         std.ascii.eqlIgnoreCase(name, "x-forwarded-proto") or
         std.ascii.eqlIgnoreCase(name, "x-real-ip") or
+        std.ascii.eqlIgnoreCase(name, http.correlation.REQUEST_HEADER_NAME) or
         std.ascii.eqlIgnoreCase(name, http.correlation.HEADER_NAME);
 }
 
@@ -8562,6 +8589,7 @@ fn shouldSkipUpstreamResponseHeader(name: []const u8) bool {
         std.ascii.eqlIgnoreCase(name, "trailer") or
         std.ascii.eqlIgnoreCase(name, "transfer-encoding") or
         std.ascii.eqlIgnoreCase(name, "upgrade") or
+        std.ascii.eqlIgnoreCase(name, http.correlation.REQUEST_HEADER_NAME) or
         std.ascii.eqlIgnoreCase(name, http.correlation.HEADER_NAME);
 }
 
@@ -8872,6 +8900,21 @@ fn buildApiErrorJson(allocator: std.mem.Allocator, code: []const u8, message: []
     return std.fmt.allocPrint(allocator, "{{\"code\":\"{s}\",\"message\":\"{s}\",\"request_id\":null}}", .{ code, message });
 }
 
+fn setRequestIdHeaders(response: *http.Response, request_id: []const u8) void {
+    _ = response.setHeader(http.correlation.REQUEST_HEADER_NAME, request_id);
+    _ = response.setHeader(http.correlation.HEADER_NAME, request_id);
+}
+
+fn writeRequestIdHeaders(writer: anytype, request_id: []const u8) !void {
+    try writer.print("{s}: {s}\r\n", .{ http.correlation.REQUEST_HEADER_NAME, request_id });
+    try writer.print("{s}: {s}\r\n", .{ http.correlation.HEADER_NAME, request_id });
+}
+
+fn appendRequestIdHeaders(headers: *std.ArrayList(std.http.Header), request_id: []const u8) !void {
+    try headers.append(.{ .name = http.correlation.REQUEST_HEADER_NAME, .value = request_id });
+    try headers.append(.{ .name = http.correlation.HEADER_NAME, .value = request_id });
+}
+
 fn sendApiError(allocator: std.mem.Allocator, writer: anytype, status: http.Status, code: []const u8, message: []const u8, request_id: ?[]const u8, keep_alive: bool, state: *GatewayState) !void {
     const payload = try buildApiErrorJson(allocator, code, message, request_id);
     defer allocator.free(payload);
@@ -8880,7 +8923,7 @@ fn sendApiError(allocator: std.mem.Allocator, writer: anytype, status: http.Stat
     defer response.deinit();
     _ = response.setStatus(status).setConnection(keep_alive);
     if (request_id) |rid| {
-        _ = response.setHeader(http.correlation.HEADER_NAME, rid);
+        setRequestIdHeaders(&response, rid);
     }
     applyResponseHeaders(state, &response);
     try response.write(writer);
@@ -8900,9 +8943,12 @@ fn logAccess(ctx: *const http.request_context.RequestContext, method: []const u8
         .latency_ms = ctx.elapsedMs(),
         .client_ip = ctx.client_ip,
         .correlation_id = ctx.request_id,
+        .upstream_addr = ctx.upstream_addr orelse "",
+        .upstream_status = ctx.upstream_status,
         .identity = ctx.identity orelse "-",
         .user_agent = user_agent,
-        .bytes_sent = 0,
+        .bytes_sent = ctx.response_bytes,
+        .response_bytes = ctx.response_bytes,
         .error_category = classifyErrorCategory(status),
     };
     entry.log();

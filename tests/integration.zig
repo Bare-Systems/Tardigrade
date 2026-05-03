@@ -2176,6 +2176,24 @@ fn waitForPortClosed(port: u16, timeout_ms: u64) !void {
     return error.Timeout;
 }
 
+fn waitForLogSubstring(allocator: std.mem.Allocator, path: []const u8, needle: []const u8, timeout_ms: u64) !void {
+    const deadline = std.time.milliTimestamp() + @as(i64, @intCast(timeout_ms));
+    while (std.time.milliTimestamp() < deadline) {
+        const contents = blk: {
+            if (std.fs.path.isAbsolute(path)) {
+                var file = try std.fs.openFileAbsolute(path, .{});
+                defer file.close();
+                break :blk try file.readToEndAlloc(allocator, 256 * 1024);
+            }
+            break :blk try std.fs.cwd().readFileAlloc(allocator, path, 256 * 1024);
+        };
+        defer allocator.free(contents);
+        if (std.mem.indexOf(u8, contents, needle) != null) return;
+        std.time.sleep(25 * std.time.ns_per_ms);
+    }
+    return error.Timeout;
+}
+
 fn wakeListener(port: u16) void {
     const address = std.net.Address.parseIp(test_host, port) catch return;
     var stream = std.net.tcpConnectToAddress(address) catch return;
@@ -2900,6 +2918,88 @@ test "rate limiting uses asserted identity for shared nat clients" {
     defer first_b.deinit();
     try std.testing.expectEqual(@as(u16, 200), first_b.status_code);
     try std.testing.expectEqual(@as(u32, 2), upstream.requestCount());
+}
+
+test "proxy requests preserve safe request ids and structured access logs include upstream metadata" {
+    const allocator = std.testing.allocator;
+
+    var upstream = try UpstreamServer.start(allocator, &.{
+        .{ .body = "{\"ok\":true}", .headers = &.{.{ .name = "Content-Type", .value = "application/json" }} },
+        .{ .body = "{\"ok\":true}", .headers = &.{.{ .name = "Content-Type", .value = "application/json" }} },
+        .{ .body = "{\"ok\":true}", .headers = &.{.{ .name = "Content-Type", .value = "application/json" }} },
+    });
+    defer upstream.stop();
+    try upstream.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location /proxy/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+    , .{ test_host, upstream.port() });
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .profile = .generic,
+        .config_text = config_text,
+    });
+    defer tardigrade.stop();
+
+    var generated = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/proxy/generated",
+        .body = null,
+        .headers = &.{},
+    });
+    defer generated.deinit();
+    const generated_request_id = generated.header("X-Request-ID") orelse return error.InvalidHttpResponse;
+    const generated_correlation_id = generated.header("X-Correlation-ID") orelse return error.InvalidHttpResponse;
+    try std.testing.expect(generated_request_id.len > 0);
+    try std.testing.expectEqualStrings(generated_request_id, generated_correlation_id);
+    try std.testing.expectEqualStrings(generated_request_id, upstream.capturedHeader("X-Request-ID").?);
+    try std.testing.expectEqualStrings(generated_request_id, upstream.capturedHeader("X-Correlation-ID").?);
+
+    const valid_request_id = "req-abc-123";
+    var preserved = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/proxy/preserved",
+        .body = null,
+        .headers = &.{
+            .{ .name = "X-Request-ID", .value = valid_request_id },
+        },
+    });
+    defer preserved.deinit();
+    try std.testing.expectEqualStrings(valid_request_id, preserved.header("X-Request-ID").?);
+    try std.testing.expectEqualStrings(valid_request_id, preserved.header("X-Correlation-ID").?);
+    try std.testing.expectEqualStrings(valid_request_id, upstream.capturedHeader("X-Request-ID").?);
+    try std.testing.expectEqualStrings(valid_request_id, upstream.capturedHeader("X-Correlation-ID").?);
+
+    const upstream_addr = try std.fmt.allocPrint(allocator, "\"upstream_addr\":\"{s}:{d}\"", .{ test_host, upstream.port() });
+    defer allocator.free(upstream_addr);
+    const upstream_status = "\"upstream_status\":200";
+    const response_bytes = "\"response_bytes\":11";
+    const request_id_log = try std.fmt.allocPrint(allocator, "\"request_id\":\"{s}\"", .{valid_request_id});
+    defer allocator.free(request_id_log);
+    try waitForLogSubstring(allocator, tardigrade.log_path, request_id_log, 2_000);
+    try waitForLogSubstring(allocator, tardigrade.log_path, upstream_addr, 2_000);
+    try waitForLogSubstring(allocator, tardigrade.log_path, upstream_status, 2_000);
+    try waitForLogSubstring(allocator, tardigrade.log_path, response_bytes, 2_000);
+
+    var replaced = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/proxy/replaced",
+        .body = null,
+        .headers = &.{
+            .{ .name = "X-Request-ID", .value = "bad id" },
+        },
+    });
+    defer replaced.deinit();
+    const replaced_request_id = replaced.header("X-Request-ID") orelse return error.InvalidHttpResponse;
+    try std.testing.expect(replaced_request_id.len > 0);
+    try std.testing.expect(!std.mem.eql(u8, replaced_request_id, "bad id"));
+    try std.testing.expect(std.mem.indexOfScalar(u8, replaced_request_id, ' ') == null);
+    try std.testing.expectEqualStrings(replaced_request_id, replaced.header("X-Correlation-ID").?);
+    try std.testing.expectEqualStrings(replaced_request_id, upstream.capturedHeader("X-Request-ID").?);
+    try std.testing.expectEqualStrings(replaced_request_id, upstream.capturedHeader("X-Correlation-ID").?);
 }
 
 test "sticky affinity cookie pins relative proxy_pass upstream and sets secure defaults" {

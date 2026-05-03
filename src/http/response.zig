@@ -4,6 +4,7 @@ const Allocator = std.mem.Allocator;
 const Status = @import("status.zig").Status;
 const Headers = @import("headers.zig").Headers;
 const Version = @import("version.zig").Version;
+const correlation = @import("correlation_id.zig");
 
 /// Server name and version for Server header
 pub const SERVER_NAME = "tardigrade";
@@ -143,9 +144,13 @@ pub const Response = struct {
             try writer.print("Content-Length: {d}\r\n", .{body_len});
         }
 
+        try self.writeRequestIdHeaders(writer);
+
         // User-defined headers
         for (self.headers.iterator()) |header| {
             if (std.ascii.eqlIgnoreCase(header.name, "content-length")) continue;
+            if (std.ascii.eqlIgnoreCase(header.name, correlation.HEADER_NAME) or
+                std.ascii.eqlIgnoreCase(header.name, correlation.REQUEST_HEADER_NAME)) continue;
             try writer.print("{s}: {s}\r\n", .{ header.name, header.value });
         }
 
@@ -181,9 +186,13 @@ pub const Response = struct {
             try writer.print("Content-Length: {d}\r\n", .{body_len});
         }
 
+        try self.writeRequestIdHeaders(writer);
+
         // User-defined headers
         for (self.headers.iterator()) |header| {
             if (std.ascii.eqlIgnoreCase(header.name, "content-length")) continue;
+            if (std.ascii.eqlIgnoreCase(header.name, correlation.HEADER_NAME) or
+                std.ascii.eqlIgnoreCase(header.name, correlation.REQUEST_HEADER_NAME)) continue;
             try writer.print("{s}: {s}\r\n", .{ header.name, header.value });
         }
 
@@ -218,6 +227,15 @@ pub const Response = struct {
             day_secs.getMinutesIntoHour(),
             day_secs.getSecondsIntoMinute(),
         });
+    }
+
+    fn writeRequestIdHeaders(self: *Response, writer: anytype) !void {
+        const request_id = self.headers.get("x-request-id");
+        const correlation_id = self.headers.get("x-correlation-id");
+        const effective = request_id orelse correlation_id orelse return;
+
+        try writer.print("{s}: {s}\r\n", .{ correlation.REQUEST_HEADER_NAME, effective });
+        try writer.print("{s}: {s}\r\n", .{ correlation.HEADER_NAME, effective });
     }
 
     // ============ Convenience constructors ============

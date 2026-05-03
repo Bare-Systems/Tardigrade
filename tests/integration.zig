@@ -2424,6 +2424,93 @@ test "mux websocket metrics and channel caps are enforced" {
     return error.SkipZigTest;
 }
 
+test "prometheus metrics endpoint exposes counters and can require auth" {
+    const allocator = std.testing.allocator;
+
+    var upstream = try UpstreamServer.start(allocator, &.{.{
+        .body = "{\"ok\":true}",
+        .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
+    }});
+    defer upstream.stop();
+    try upstream.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location /proxy/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+    , .{ test_host, upstream.port() });
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .profile = .generic,
+        .config_text = config_text,
+    });
+    defer tardigrade.stop();
+
+    var metrics_before = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/status/metrics",
+        .body = null,
+        .headers = &.{},
+    });
+    defer metrics_before.deinit();
+    try std.testing.expectEqual(@as(u16, 200), metrics_before.status_code);
+    try std.testing.expect(std.mem.indexOf(u8, metrics_before.body, "# TYPE tardigrade_requests_total counter") != null);
+    const requests_before = prometheusMetricValue(metrics_before.body, "tardigrade_requests_total") orelse return error.InvalidHttpResponse;
+    const status_2xx_before = prometheusMetricValue(metrics_before.body, "tardigrade_requests_2xx_total") orelse return error.InvalidHttpResponse;
+
+    var proxy_response = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/proxy/demo",
+        .body = null,
+        .headers = &.{},
+    });
+    defer proxy_response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), proxy_response.status_code);
+
+    var metrics_after = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/status/metrics",
+        .body = null,
+        .headers = &.{},
+    });
+    defer metrics_after.deinit();
+    const requests_after = prometheusMetricValue(metrics_after.body, "tardigrade_requests_total") orelse return error.InvalidHttpResponse;
+    const status_2xx_after = prometheusMetricValue(metrics_after.body, "tardigrade_requests_2xx_total") orelse return error.InvalidHttpResponse;
+    try std.testing.expect(requests_after >= requests_before + 2);
+    try std.testing.expect(status_2xx_after >= status_2xx_before + 2);
+
+    var protected = try TardigradeProcess.start(allocator, .{
+        .profile = .generic,
+        .config_text = config_text,
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_METRICS_REQUIRE_AUTH", .value = "true" },
+        },
+    });
+    defer protected.stop();
+
+    var unauthorized = try sendRequest(allocator, protected.port, .{
+        .method = "GET",
+        .path = "/status/metrics",
+        .body = null,
+        .headers = &.{},
+    });
+    defer unauthorized.deinit();
+    try std.testing.expectEqual(@as(u16, 401), unauthorized.status_code);
+
+    var authorized = try sendRequest(allocator, protected.port, .{
+        .method = "GET",
+        .path = "/status/metrics",
+        .body = null,
+        .headers = &.{
+            .{ .name = "Authorization", .value = "Bearer " ++ valid_bearer_token },
+        },
+    });
+    defer authorized.deinit();
+    try std.testing.expectEqual(@as(u16, 200), authorized.status_code);
+    try std.testing.expect(std.mem.indexOf(u8, authorized.body, "tardigrade_requests_total") != null);
+}
+
 test "bearclaw fixture serves chat over https with bearer auth and transcript persistence" {
     const allocator = std.testing.allocator;
 

@@ -4240,6 +4240,12 @@ fn routeRequest(
         return status;
     }
 
+    if (cfg.metrics_path.len > 0 and std.mem.eql(u8, request.uri.path, cfg.metrics_path)) {
+        const status = try handleMetricsRoute(allocator, writer, cfg, state, ctx, request, correlation_id, keep_alive.*);
+        state.metricsRecord(status);
+        return status;
+    }
+
     if (http.location_router.matchLocation(request.uri.path, cfg.location_blocks)) |matched| {
         if (matched.block.auth == .required and !ctx.authenticated and ctx.identity == null) {
             var auth_res = try authorizeRequest(allocator, cfg, &request.headers);
@@ -4457,6 +4463,51 @@ fn handleReloadStatusRoute(
         .setHeader(http.correlation.HEADER_NAME, correlation_id);
     applyResponseHeaders(state, &response);
     try response.write(writer);
+    return 200;
+}
+
+fn handleMetricsRoute(
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    cfg: *const edge_config.EdgeConfig,
+    state: *GatewayState,
+    ctx: *http.request_context.RequestContext,
+    request: *const http.Request,
+    correlation_id: []const u8,
+    keep_alive: bool,
+) !u16 {
+    if (!(request.method == .GET or request.method == .HEAD)) {
+        try sendApiError(allocator, writer, .method_not_allowed, "invalid_request", "Method Not Allowed", correlation_id, keep_alive, state);
+        return 405;
+    }
+
+    if (cfg.metrics_require_auth and !ctx.authenticated and ctx.identity == null) {
+        try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, keep_alive, state);
+        state.metricsRecordErrorCode("unauthorized");
+        return 401;
+    }
+
+    const payload = try state.metricsToPrometheus(allocator);
+    defer allocator.free(payload);
+
+    var response = http.Response.init(allocator);
+    defer response.deinit();
+    _ = response
+        .setStatus(.ok)
+        .setBody(if (request.method == .HEAD) "" else payload)
+        .setContentType("text/plain; version=0.0.4; charset=utf-8")
+        .setConnection(keep_alive);
+    setRequestIdHeaders(&response, correlation_id);
+    if (request.method == .HEAD) {
+        _ = response.setContentLength(payload.len);
+        ctx.response_bytes = 0;
+        applyResponseHeaders(state, &response);
+        try response.writeHead(writer);
+    } else {
+        ctx.response_bytes = payload.len;
+        applyResponseHeaders(state, &response);
+        try response.write(writer);
+    }
     return 200;
 }
 

@@ -10,6 +10,7 @@ All notable user-facing changes to Tardigrade are documented here.
 - Enabled `TCP_NODELAY` on accepted connections to remove keep-alive latency spikes.
 - Added a remote benchmark driver and documented the dedicated performance-target workflow.
 - Added a file-backed plain-HTTP static response path with unit and integration coverage for full-file and range handling.
+- Added a configurable Prometheus metrics endpoint with optional auth gating and integration coverage for counter growth.
 
 ### Changed
 - Simplified the root docs into a smaller public-facing set: `README.md`, `AGENTS.md`, `CONTRIBUTING.md`, and the example deployment bundle.

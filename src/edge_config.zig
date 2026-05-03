@@ -266,6 +266,10 @@ pub const EdgeConfig = struct {
     access_log_buffer_size: usize,
     /// Optional syslog UDP endpoint (host:port).
     access_log_syslog_udp: []const u8,
+    /// Prometheus metrics route path (empty disables the endpoint).
+    metrics_path: []const u8,
+    /// Require request auth before serving the metrics endpoint.
+    metrics_require_auth: bool,
     /// Whether response compression is enabled.
     compression_enabled: bool,
     /// Minimum response body size to compress (bytes).
@@ -493,6 +497,7 @@ pub const EdgeConfig = struct {
         allocator.free(self.try_files);
         allocator.free(self.access_log_template);
         allocator.free(self.access_log_syslog_udp);
+        allocator.free(self.metrics_path);
         allocator.free(self.worker_cpu_affinity);
         allocator.free(self.upstream_active_health_path);
         for (self.upstream_active_health_success_status_overrides) |entry| {
@@ -910,6 +915,9 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     const access_log_buffer_size = parseIntEnv(usize, allocator, "TARDIGRADE_ACCESS_LOG_BUFFER_SIZE", 0);
     const access_log_syslog_udp = envOrDefault(allocator, "TARDIGRADE_ACCESS_LOG_SYSLOG_UDP", "") catch unreachable;
     errdefer allocator.free(access_log_syslog_udp);
+    const metrics_path = envOrDefault(allocator, "TARDIGRADE_METRICS_PATH", "/status/metrics") catch unreachable;
+    errdefer allocator.free(metrics_path);
+    const metrics_require_auth = parseBoolEnv(allocator, "TARDIGRADE_METRICS_REQUIRE_AUTH", false);
 
     // Compression
     const comp_enabled_str = envOrDefault(allocator, "TARDIGRADE_COMPRESSION_ENABLED", "true") catch unreachable;
@@ -1337,6 +1345,8 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .access_log_min_status = access_log_min_status,
         .access_log_buffer_size = access_log_buffer_size,
         .access_log_syslog_udp = access_log_syslog_udp,
+        .metrics_path = metrics_path,
+        .metrics_require_auth = metrics_require_auth,
         .compression_enabled = compression_enabled,
         .compression_min_size = compression_min_size,
         .compression_brotli_enabled = compression_brotli_enabled,

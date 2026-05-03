@@ -95,6 +95,11 @@ headers, and forwards the same ID upstream. JSON access logs include
 `request_id`, `latency_ms`, `upstream_addr`, `upstream_status`, and
 `response_bytes`.
 
+Prometheus metrics are available on `TARDIGRADE_METRICS_PATH` (default
+`/status/metrics`). Set the path to an empty string to disable the endpoint, or
+set `TARDIGRADE_METRICS_REQUIRE_AUTH=true` to require the configured request
+auth controls before serving metrics.
+
 ## Documentation
 
 | Topic | Location |

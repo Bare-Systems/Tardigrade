@@ -13,7 +13,9 @@ pub const SecurityHeaders = struct {
     x_frame_options: []const u8 = "DENY",
     x_content_type_options: []const u8 = "nosniff",
     content_security_policy: []const u8 = "default-src 'self'",
-    strict_transport_security: []const u8 = "max-age=31536000; includeSubDomains",
+    /// HSTS value is intentionally empty by default. The gateway populates this
+    /// field only when TLS is active and HSTS is explicitly enabled in config.
+    strict_transport_security: []const u8 = "",
     referrer_policy: []const u8 = "strict-origin-when-cross-origin",
     permissions_policy: []const u8 = "camera=(), microphone=(), geolocation=()",
     x_xss_protection: []const u8 = "0", // Disabled per modern best practice (CSP preferred)
@@ -43,7 +45,6 @@ pub const SecurityHeaders = struct {
     pub const api: SecurityHeaders = .{
         .x_frame_options = "",
         .content_security_policy = "",
-        .strict_transport_security = "max-age=31536000; includeSubDomains",
     };
 };
 
@@ -60,7 +61,7 @@ test "apply sets all default security headers" {
     try std.testing.expectEqualStrings("DENY", response.headers.get("X-Frame-Options").?);
     try std.testing.expectEqualStrings("nosniff", response.headers.get("X-Content-Type-Options").?);
     try std.testing.expectEqualStrings("default-src 'self'", response.headers.get("Content-Security-Policy").?);
-    try std.testing.expectEqualStrings("max-age=31536000; includeSubDomains", response.headers.get("Strict-Transport-Security").?);
+    try std.testing.expect(response.headers.get("Strict-Transport-Security") == null);
     try std.testing.expectEqualStrings("strict-origin-when-cross-origin", response.headers.get("Referrer-Policy").?);
     try std.testing.expectEqualStrings("0", response.headers.get("X-XSS-Protection").?);
 }
@@ -76,4 +77,30 @@ test "api preset skips frame and csp headers" {
     try std.testing.expect(response.headers.get("X-Frame-Options") == null);
     try std.testing.expect(response.headers.get("Content-Security-Policy") == null);
     try std.testing.expectEqualStrings("nosniff", response.headers.get("X-Content-Type-Options").?);
+}
+
+test "hsts is emitted when strict_transport_security is set" {
+    const allocator = std.testing.allocator;
+    var response = Response.init(allocator);
+    defer response.deinit();
+
+    var headers = SecurityHeaders.default;
+    headers.strict_transport_security = "max-age=31536000; includeSubDomains";
+    headers.apply(&response);
+
+    try std.testing.expectEqualStrings(
+        "max-age=31536000; includeSubDomains",
+        response.headers.get("Strict-Transport-Security").?,
+    );
+}
+
+test "hsts is absent when strict_transport_security is empty" {
+    const allocator = std.testing.allocator;
+    var response = Response.init(allocator);
+    defer response.deinit();
+
+    const headers = SecurityHeaders.default;
+    headers.apply(&response);
+
+    try std.testing.expect(response.headers.get("Strict-Transport-Security") == null);
 }

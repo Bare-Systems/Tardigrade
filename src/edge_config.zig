@@ -188,6 +188,15 @@ pub const EdgeConfig = struct {
     rate_limit_burst: u32,
     /// Whether to add security headers to responses.
     security_headers_enabled: bool,
+    /// Emit Strict-Transport-Security header on HTTPS responses.
+    /// Has no effect when TLS is not configured.
+    hsts_enabled: bool,
+    /// HSTS max-age in seconds (default: 31536000 = 1 year).
+    hsts_max_age: u32,
+    /// Include the includeSubDomains directive in the HSTS header.
+    hsts_include_subdomains: bool,
+    /// Include the preload directive in the HSTS header.
+    hsts_preload: bool,
     /// Idempotency cache TTL in seconds (0 = disabled).
     idempotency_ttl_seconds: u32,
     /// Proxy response cache TTL in seconds (0 = disabled).
@@ -762,6 +771,10 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     const sec_headers_str = envOrDefault(allocator, "TARDIGRADE_SECURITY_HEADERS", "true") catch unreachable;
     defer allocator.free(sec_headers_str);
     const security_headers_enabled = std.mem.eql(u8, sec_headers_str, "true") or std.mem.eql(u8, sec_headers_str, "1");
+    const hsts_enabled = parseBoolEnv(allocator, "TARDIGRADE_HSTS_ENABLED", false);
+    const hsts_max_age = parseIntEnv(u32, allocator, "TARDIGRADE_HSTS_MAX_AGE", 31536000);
+    const hsts_include_subdomains = parseBoolEnv(allocator, "TARDIGRADE_HSTS_INCLUDE_SUBDOMAINS", true);
+    const hsts_preload = parseBoolEnv(allocator, "TARDIGRADE_HSTS_PRELOAD", false);
 
     const idem_ttl_str = envOrDefault(allocator, "TARDIGRADE_IDEMPOTENCY_TTL", "300") catch unreachable;
     defer allocator.free(idem_ttl_str);
@@ -1276,6 +1289,10 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .rate_limit_rps = rate_limit_rps,
         .rate_limit_burst = rate_limit_burst,
         .security_headers_enabled = security_headers_enabled,
+        .hsts_enabled = hsts_enabled,
+        .hsts_max_age = hsts_max_age,
+        .hsts_include_subdomains = hsts_include_subdomains,
+        .hsts_preload = hsts_preload,
         .idempotency_ttl_seconds = idempotency_ttl_seconds,
         .proxy_cache_ttl_seconds = proxy_cache_ttl_seconds,
         .proxy_cache_path = proxy_cache_path,
@@ -2254,6 +2271,12 @@ pub fn validate(cfg: *const EdgeConfig) !void {
         return error.InvalidConfigPort;
     }
 
+    if (std.mem.eql(u8, cfg.tls_min_version, "1.0") or std.mem.eql(u8, cfg.tls_min_version, "1.1") or
+        std.mem.eql(u8, cfg.tls_max_version, "1.0") or std.mem.eql(u8, cfg.tls_max_version, "1.1"))
+    {
+        std.log.err("config validation failed: TLS 1.0 and 1.1 are not supported; set tls_min_version to 1.2 or 1.3", .{});
+        return error.InvalidConfigTlsVersion;
+    }
     try validateOptionalFile(cfg.tls_cert_path, "tls_cert_path");
     try validateOptionalFile(cfg.tls_key_path, "tls_key_path");
     for (cfg.tls_sni_certs) |entry| {

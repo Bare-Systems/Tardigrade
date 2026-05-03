@@ -283,6 +283,8 @@ const GatewayState = struct {
     proxy_cache_path: []const u8,
     proxy_cache_ttl_seconds: u32,
     security_headers: http.security_headers.SecurityHeaders,
+    /// Owned HSTS header value. Empty when HSTS is disabled or TLS is not configured.
+    hsts_value: []u8 = &.{},
     add_headers: []const edge_config.EdgeConfig.HeaderPair,
     http3_alt_svc: ?[]u8,
     http3_runtime: ?*http.http3_runtime.Runtime,
@@ -357,6 +359,7 @@ const GatewayState = struct {
         self.event_hub.deinit();
         self.request_buffer_pool.deinit();
         self.relay_buffer_pool.deinit();
+        if (self.hsts_value.len > 0) self.allocator.free(self.hsts_value);
         if (self.http3_alt_svc) |value| self.allocator.free(value);
         var upstream_it = self.upstream_health.iterator();
         while (upstream_it.next()) |entry| self.allocator.free(entry.key_ptr.*);
@@ -2426,6 +2429,9 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     defer _ = gpa.deinit();
     const state_allocator = gpa.allocator();
 
+    const initial_hsts = try computeHstsValue(state_allocator, cfg);
+    errdefer if (initial_hsts.len > 0) state_allocator.free(initial_hsts);
+
     var state = GatewayState{
         .allocator = state_allocator,
         .rate_limiter = if (cfg.rate_limit_rps > 0)
@@ -2442,10 +2448,15 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
             null,
         .proxy_cache_path = cfg.proxy_cache_path,
         .proxy_cache_ttl_seconds = cfg.proxy_cache_ttl_seconds,
-        .security_headers = if (cfg.security_headers_enabled)
-            http.security_headers.SecurityHeaders.api
-        else
-            http.security_headers.SecurityHeaders{ .x_frame_options = "", .x_content_type_options = "", .content_security_policy = "", .strict_transport_security = "", .referrer_policy = "", .permissions_policy = "", .x_xss_protection = "" },
+        .security_headers = blk: {
+            var s = if (cfg.security_headers_enabled)
+                http.security_headers.SecurityHeaders.api
+            else
+                http.security_headers.SecurityHeaders{ .x_frame_options = "", .x_content_type_options = "", .content_security_policy = "", .strict_transport_security = "", .referrer_policy = "", .permissions_policy = "", .x_xss_protection = "" };
+            s.strict_transport_security = initial_hsts;
+            break :blk s;
+        },
+        .hsts_value = initial_hsts,
         .add_headers = cfg.add_headers,
         .http3_alt_svc = if (cfg.http3_enabled) http.http3_handler.formatAltSvc(state_allocator, cfg.quic_port) catch null else null,
         .http3_runtime = null,
@@ -3089,10 +3100,16 @@ fn applyReloadedRuntimeConfig(cfg: *const edge_config.EdgeConfig, state: *Gatewa
     state.add_headers = cfg.add_headers;
     if (state.http3_alt_svc) |value| state.allocator.free(value);
     state.http3_alt_svc = if (cfg.http3_enabled) http.http3_handler.formatAltSvc(state.allocator, cfg.quic_port) catch null else null;
-    state.security_headers = if (cfg.security_headers_enabled)
-        http.security_headers.SecurityHeaders.api
-    else
-        http.security_headers.SecurityHeaders{ .x_frame_options = "", .x_content_type_options = "", .content_security_policy = "", .strict_transport_security = "", .referrer_policy = "", .permissions_policy = "", .x_xss_protection = "" };
+    if (state.hsts_value.len > 0) state.allocator.free(state.hsts_value);
+    state.hsts_value = computeHstsValue(state.allocator, cfg) catch &.{};
+    state.security_headers = blk: {
+        var s = if (cfg.security_headers_enabled)
+            http.security_headers.SecurityHeaders.api
+        else
+            http.security_headers.SecurityHeaders{ .x_frame_options = "", .x_content_type_options = "", .content_security_policy = "", .strict_transport_security = "", .referrer_policy = "", .permissions_policy = "", .x_xss_protection = "" };
+        s.strict_transport_security = state.hsts_value;
+        break :blk s;
+    };
     state.max_connections_per_ip = cfg.max_connections_per_ip;
     state.max_active_connections = cfg.max_active_connections;
     state.max_total_connection_memory_bytes = cfg.max_total_connection_memory_bytes;
@@ -8546,6 +8563,16 @@ fn shouldSkipUpstreamResponseHeader(name: []const u8) bool {
         std.ascii.eqlIgnoreCase(name, "transfer-encoding") or
         std.ascii.eqlIgnoreCase(name, "upgrade") or
         std.ascii.eqlIgnoreCase(name, http.correlation.HEADER_NAME);
+}
+
+fn computeHstsValue(allocator: std.mem.Allocator, cfg: *const edge_config.EdgeConfig) ![]u8 {
+    if (!cfg.hsts_enabled or cfg.tls_cert_path.len == 0) return allocator.dupe(u8, "");
+    var buf = std.ArrayList(u8).init(allocator);
+    errdefer buf.deinit();
+    try buf.writer().print("max-age={d}", .{cfg.hsts_max_age});
+    if (cfg.hsts_include_subdomains) try buf.appendSlice("; includeSubDomains");
+    if (cfg.hsts_preload) try buf.appendSlice("; preload");
+    return buf.toOwnedSlice();
 }
 
 fn writeSecurityHeaders(writer: anytype, sec: *const http.security_headers.SecurityHeaders) !void {

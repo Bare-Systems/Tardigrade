@@ -162,6 +162,13 @@ fn configureSystemLibrarySearchPaths(
     compile: *std.Build.Step.Compile,
     prefer_static_system_libs: bool,
 ) void {
+    // Always add Homebrew paths on macOS so OpenSSL (not in Apple's SDK) is found.
+    if (compile.rootModuleTarget().os.tag == .macos) {
+        compile.addSystemIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
+        compile.addSystemIncludePath(.{ .cwd_relative = "/opt/homebrew/opt/openssl@3/include" });
+        compile.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
+        compile.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/opt/openssl@3/lib" });
+    }
     if (!prefer_static_system_libs) return;
     compile.addSystemIncludePath(.{ .cwd_relative = "/usr/include" });
     compile.addLibraryPath(.{ .cwd_relative = "/lib" });

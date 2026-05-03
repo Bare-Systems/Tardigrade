@@ -2757,6 +2757,61 @@ test "inbound X-Tardigrade headers are stripped and unauthenticated requests are
     try std.testing.expectEqual(@as(u32, 1), upstream.requestCount());
 }
 
+test "proxy requests strip hop-by-hop headers before reaching upstreams" {
+    const allocator = std.testing.allocator;
+
+    var upstream = try UpstreamServer.start(allocator, &.{.{
+        .body = "{\"ok\":true}",
+        .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
+    }});
+    defer upstream.stop();
+    try upstream.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location /proxy/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+    , .{ test_host, upstream.port() });
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+    });
+    defer tardigrade.stop();
+
+    const raw_request =
+        "GET /proxy/test HTTP/1.1\r\n" ++
+        "Host: 127.0.0.1\r\n" ++
+        "Connection: X-Test-Hop, X-Another-Hop, keep-alive\r\n" ++
+        "Keep-Alive: timeout=5\r\n" ++
+        "Proxy-Authenticate: Basic realm=\"upstream\"\r\n" ++
+        "Proxy-Authorization: Basic dGVzdDp0ZXN0\r\n" ++
+        "TE: trailers\r\n" ++
+        "Trailer: X-Trailer-Test\r\n" ++
+        "Transfer-Encoding: chunked\r\n" ++
+        "Upgrade: websocket\r\n" ++
+        "X-Test-Hop: secret-one\r\n" ++
+        "X-Another-Hop: secret-two\r\n" ++
+        "X-Custom-Pass: still-here\r\n" ++
+        "\r\n";
+
+    var response = try sendRawRequest(allocator, tardigrade.port, raw_request);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status_code);
+    try std.testing.expectEqual(@as(u32, 1), upstream.requestCount());
+    try std.testing.expect(upstream.capturedHeader("Connection") == null);
+    try std.testing.expect(upstream.capturedHeader("Keep-Alive") == null);
+    try std.testing.expect(upstream.capturedHeader("Proxy-Authenticate") == null);
+    try std.testing.expect(upstream.capturedHeader("Proxy-Authorization") == null);
+    try std.testing.expect(upstream.capturedHeader("TE") == null);
+    try std.testing.expect(upstream.capturedHeader("Trailer") == null);
+    try std.testing.expect(upstream.capturedHeader("Transfer-Encoding") == null);
+    try std.testing.expect(upstream.capturedHeader("Upgrade") == null);
+    try std.testing.expect(upstream.capturedHeader("X-Test-Hop") == null);
+    try std.testing.expect(upstream.capturedHeader("X-Another-Hop") == null);
+    try std.testing.expectEqualStrings("still-here", upstream.capturedHeader("X-Custom-Pass").?);
+}
+
 test "bearclaw rate limiting uses asserted identity for shared nat clients" {
     const allocator = std.testing.allocator;
 

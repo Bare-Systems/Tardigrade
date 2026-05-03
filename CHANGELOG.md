@@ -14,6 +14,7 @@ All notable user-facing changes to Tardigrade are documented here.
 
 ### Fixed
 - CI now installs OpenSSL development headers explicitly and enforces formatting consistently.
+- Proxy requests now strip RFC hop-by-hop headers, including headers named by the incoming `Connection` field, before forwarding to upstreams.
 
 ## [0.62.0] - 2026-04-24
 

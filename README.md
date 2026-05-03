@@ -71,6 +71,9 @@ location = /health {
 }
 ```
 
+When proxying, Tardigrade strips hop-by-hop request headers, including headers
+named by the incoming `Connection` header, before forwarding requests upstream.
+
 ## Documentation
 
 | Topic | Location |

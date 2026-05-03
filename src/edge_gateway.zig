@@ -4765,6 +4765,10 @@ fn executeRawHttpProxyRequest(
     var req = try client.open(method_enum, uri, .{
         .server_header_buffer = &server_header_buffer,
         .connection = unix_conn,
+        .headers = .{
+            .connection = .omit,
+            .accept_encoding = .omit,
+        },
         .extra_headers = extra_headers.items,
         .keep_alive = true,
         .redirect_behavior = .unhandled,
@@ -4885,8 +4889,9 @@ fn executeUpstreamHttpsWithMtls(
         if (trimmed.len > 0) try req_writer.print("X-Forwarded-Host: {s}\r\n", .{trimmed});
     }
     try writeAssertedIdentityHeaders(req_writer, auth_identity, auth_user_id, auth_device_id, auth_scopes);
+    const connection_header = request_headers.get("connection");
     for (request_headers.iterator()) |entry| {
-        if (shouldSkipUpstreamRequestHeader(entry.name)) continue;
+        if (shouldSkipUpstreamRequestHeader(entry.name, connection_header)) continue;
         try req_writer.print("{s}: {s}\r\n", .{ entry.name, entry.value });
     }
     // W3C Trace Context: originate when absent (inbound propagation happens via
@@ -8268,23 +8273,29 @@ fn appendProxyRequestHeaders(
     extra_headers: *std.ArrayList(std.http.Header),
     request_headers: *const http.Headers,
 ) !void {
+    const connection_header = request_headers.get("connection");
     for (request_headers.iterator()) |header| {
-        if (shouldSkipUpstreamRequestHeader(header.name)) continue;
+        if (shouldSkipUpstreamRequestHeader(header.name, connection_header)) continue;
         try extra_headers.append(.{ .name = header.name, .value = header.value });
     }
 }
 
-fn shouldSkipUpstreamRequestHeader(name: []const u8) bool {
+fn shouldSkipUpstreamRequestHeader(name: []const u8, connection_header: ?[]const u8) bool {
     // Strip inbound X-Tardigrade-* headers so clients cannot forge asserted
     // identity. Tardigrade re-adds the real values after auth resolves.
     const tardigrade_prefix = "x-tardigrade-";
     if (name.len >= tardigrade_prefix.len and
         std.ascii.eqlIgnoreCase(name[0..tardigrade_prefix.len], tardigrade_prefix))
         return true;
+
+    if (connectionHeaderReferencesHeader(connection_header, name)) return true;
+
     return std.ascii.eqlIgnoreCase(name, "connection") or
         std.ascii.eqlIgnoreCase(name, "content-length") or
         std.ascii.eqlIgnoreCase(name, "host") or
         std.ascii.eqlIgnoreCase(name, "keep-alive") or
+        std.ascii.eqlIgnoreCase(name, "proxy-authenticate") or
+        std.ascii.eqlIgnoreCase(name, "proxy-authorization") or
         std.ascii.eqlIgnoreCase(name, "proxy-connection") or
         std.ascii.eqlIgnoreCase(name, "te") or
         std.ascii.eqlIgnoreCase(name, "trailer") or
@@ -8295,6 +8306,17 @@ fn shouldSkipUpstreamRequestHeader(name: []const u8) bool {
         std.ascii.eqlIgnoreCase(name, "x-forwarded-proto") or
         std.ascii.eqlIgnoreCase(name, "x-real-ip") or
         std.ascii.eqlIgnoreCase(name, http.correlation.HEADER_NAME);
+}
+
+fn connectionHeaderReferencesHeader(connection_header: ?[]const u8, name: []const u8) bool {
+    const raw = connection_header orelse return false;
+    var tokens = std.mem.splitScalar(u8, raw, ',');
+    while (tokens.next()) |token_raw| {
+        const token = std.mem.trim(u8, token_raw, " \t");
+        if (token.len == 0) continue;
+        if (std.ascii.eqlIgnoreCase(token, name)) return true;
+    }
+    return false;
 }
 
 fn shouldSkipUpstreamResponseHeader(name: []const u8) bool {
@@ -9000,14 +9022,33 @@ test "buildProxyCacheKey falls back for unknown template tokens" {
 }
 
 test "shouldSkipUpstreamRequestHeader strips inbound X-Tardigrade headers" {
-    try std.testing.expect(shouldSkipUpstreamRequestHeader("X-Tardigrade-Auth-Identity"));
-    try std.testing.expect(shouldSkipUpstreamRequestHeader("x-tardigrade-user-id"));
-    try std.testing.expect(shouldSkipUpstreamRequestHeader("X-TARDIGRADE-DEVICE-ID"));
-    try std.testing.expect(shouldSkipUpstreamRequestHeader("x-tardigrade-scopes"));
-    try std.testing.expect(shouldSkipUpstreamRequestHeader("x-tardigrade-anything-custom"));
-    try std.testing.expect(!shouldSkipUpstreamRequestHeader("X-Custom-Header"));
-    try std.testing.expect(!shouldSkipUpstreamRequestHeader("Authorization"));
-    try std.testing.expect(!shouldSkipUpstreamRequestHeader("Content-Type"));
+    try std.testing.expect(shouldSkipUpstreamRequestHeader("X-Tardigrade-Auth-Identity", null));
+    try std.testing.expect(shouldSkipUpstreamRequestHeader("x-tardigrade-user-id", null));
+    try std.testing.expect(shouldSkipUpstreamRequestHeader("X-TARDIGRADE-DEVICE-ID", null));
+    try std.testing.expect(shouldSkipUpstreamRequestHeader("x-tardigrade-scopes", null));
+    try std.testing.expect(shouldSkipUpstreamRequestHeader("x-tardigrade-anything-custom", null));
+    try std.testing.expect(!shouldSkipUpstreamRequestHeader("X-Custom-Header", null));
+    try std.testing.expect(!shouldSkipUpstreamRequestHeader("Authorization", null));
+    try std.testing.expect(!shouldSkipUpstreamRequestHeader("Content-Type", null));
+}
+
+test "shouldSkipUpstreamRequestHeader strips standard hop-by-hop headers" {
+    try std.testing.expect(shouldSkipUpstreamRequestHeader("Connection", null));
+    try std.testing.expect(shouldSkipUpstreamRequestHeader("Keep-Alive", null));
+    try std.testing.expect(shouldSkipUpstreamRequestHeader("Proxy-Authenticate", null));
+    try std.testing.expect(shouldSkipUpstreamRequestHeader("Proxy-Authorization", null));
+    try std.testing.expect(shouldSkipUpstreamRequestHeader("TE", null));
+    try std.testing.expect(shouldSkipUpstreamRequestHeader("Trailer", null));
+    try std.testing.expect(shouldSkipUpstreamRequestHeader("Transfer-Encoding", null));
+    try std.testing.expect(shouldSkipUpstreamRequestHeader("Upgrade", null));
+}
+
+test "shouldSkipUpstreamRequestHeader strips headers named by Connection" {
+    const connection_header = "X-Test-Hop, keep-alive, Another-Hop";
+    try std.testing.expect(shouldSkipUpstreamRequestHeader("X-Test-Hop", connection_header));
+    try std.testing.expect(shouldSkipUpstreamRequestHeader("another-hop", connection_header));
+    try std.testing.expect(shouldSkipUpstreamRequestHeader("Keep-Alive", connection_header));
+    try std.testing.expect(!shouldSkipUpstreamRequestHeader("X-Not-Hop", connection_header));
 }
 
 test "shouldSkipUpstreamResponseHeader strips stale content-encoding" {

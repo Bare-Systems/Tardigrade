@@ -288,3 +288,49 @@ test "AccessLogEntry log does not panic" {
     };
     entry.log();
 }
+
+test "formatEntry json contains required fields" {
+    const entry = AccessLogEntry{
+        .method = "POST",
+        .path = "/api/chat",
+        .status = 201,
+        .latency_ms = 15,
+        .client_ip = "10.0.0.1",
+        .correlation_id = "corr-xyz",
+        .upstream_addr = "http://127.0.0.1:9000",
+        .upstream_status = 200,
+        .identity = "user-1",
+        .user_agent = "test-agent/1.0",
+        .bytes_sent = 128,
+        .response_bytes = 128,
+        .error_category = "-",
+    };
+    const line = try formatEntry(std.testing.allocator, .{}, entry);
+    defer std.testing.allocator.free(line);
+    try std.testing.expect(std.mem.find(u8, line, "\"method\":\"POST\"") != null);
+    try std.testing.expect(std.mem.find(u8, line, "\"path\":\"/api/chat\"") != null);
+    try std.testing.expect(std.mem.find(u8, line, "\"status\":201") != null);
+    try std.testing.expect(std.mem.find(u8, line, "\"identity\":\"user-1\"") != null);
+    try std.testing.expect(std.mem.find(u8, line, "\"upstream_status\":200") != null);
+}
+
+test "formatEntry json encodes null upstream_status as literal null" {
+    const entry = AccessLogEntry{
+        .method = "GET",
+        .path = "/health",
+        .status = 200,
+        .latency_ms = 0,
+        .client_ip = "127.0.0.1",
+        .correlation_id = "hc",
+        .upstream_addr = "",
+        .upstream_status = null,
+        .identity = "-",
+        .user_agent = "",
+        .bytes_sent = 0,
+        .response_bytes = 0,
+        .error_category = "-",
+    };
+    const line = try formatEntry(std.testing.allocator, .{}, entry);
+    defer std.testing.allocator.free(line);
+    try std.testing.expect(std.mem.find(u8, line, "\"upstream_status\":null") != null);
+}

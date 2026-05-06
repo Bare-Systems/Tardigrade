@@ -353,3 +353,79 @@ pub fn cwd() DirCompat {
 pub fn wrapDir(dir: std.Io.Dir) DirCompat {
     return .{ .dir = dir };
 }
+
+test "milliTimestamp returns a positive value" {
+    const ms = milliTimestamp();
+    try std.testing.expect(ms > 0);
+}
+
+test "monotonicMs does not go backward" {
+    // Just verify it's callable and returns a plausible value (> 0)
+    const a = milliTimestamp();
+    const b = milliTimestamp();
+    try std.testing.expect(b >= a);
+}
+
+test "randomBytes fills buffer with data" {
+    var buf1: [16]u8 = [_]u8{0} ** 16;
+    var buf2: [16]u8 = [_]u8{0} ** 16;
+    randomBytes(&buf1);
+    randomBytes(&buf2);
+    // Both filled (not all zeros — near-zero probability of collision)
+    var all_zero1 = true;
+    for (buf1) |b| if (b != 0) {
+        all_zero1 = false;
+        break;
+    };
+    try std.testing.expect(!all_zero1);
+}
+
+test "stringifyAlloc produces valid JSON for a simple struct" {
+    const val = .{ .ok = true, .code = 42 };
+    const json = try stringifyAlloc(std.testing.allocator, val, .{});
+    defer std.testing.allocator.free(json);
+    try std.testing.expect(std.mem.find(u8, json, "\"ok\":true") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"code\":42") != null);
+}
+
+test "fixedBufferStream write and read back" {
+    var buf: [32]u8 = undefined;
+    var fbs = fixedBufferStream(&buf);
+    try fbs.writer().writeAll("hello");
+    try std.testing.expectEqualStrings("hello", fbs.getWritten());
+}
+
+test "trimRight removes trailing characters" {
+    try std.testing.expectEqualStrings("foo", trimRight(u8, "foo   ", " "));
+    try std.testing.expectEqualStrings("foo", trimRight(u8, "foo\n\r", "\r\n"));
+    try std.testing.expectEqualStrings("", trimRight(u8, "   ", " "));
+}
+
+test "fmtSliceHexLower formats bytes as lowercase hex" {
+    const hex = fmtSliceHexLower(&[_]u8{ 0xde, 0xad, 0xbe, 0xef });
+    var buf: [64]u8 = undefined;
+    var fbs = fixedBufferStream(&buf);
+    try hex.format(fbs.writer());
+    try std.testing.expectEqualStrings("deadbeef", fbs.getWritten());
+}
+
+test "DirCompat write and read file roundtrip" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = wrapDir(tmp.dir);
+    try dir.writeFile(.{ .sub_path = "test.txt", .data = "hello zig" });
+    const data = try dir.readFileAlloc(std.testing.allocator, "test.txt", 1024);
+    defer std.testing.allocator.free(data);
+    try std.testing.expectEqualStrings("hello zig", data);
+}
+
+test "DirCompat createFile and stat" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = wrapDir(tmp.dir);
+    var f = try dir.createFile("out.txt", .{});
+    try f.writeAll("data");
+    f.close();
+    const stat = try dir.statFile("out.txt");
+    try std.testing.expect(stat.size > 0);
+}

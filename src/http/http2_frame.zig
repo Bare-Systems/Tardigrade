@@ -148,3 +148,45 @@ test "write and parse frame header values" {
     try std.testing.expectEqual(@as(u8, 3), out[2]);
     try std.testing.expectEqual(@as(u8, 0x4), out[3]);
 }
+
+test "writeSettings encodes entries as big-endian id/value pairs" {
+    var buf: [128]u8 = undefined;
+    var fbs = compat.fixedBufferStream(&buf);
+    // SETTINGS_INITIAL_WINDOW_SIZE (0x4) = 65535
+    try writeSettings(std.testing.allocator, fbs.writer(), &[_][2]u32{.{ 0x4, 65535 }});
+    const out = fbs.getWritten();
+    // Frame header: length=6 (3 bytes), type=0x4 (settings), flags=0, stream=0
+    try std.testing.expectEqual(@as(usize, 9 + 6), out.len);
+    try std.testing.expectEqual(@as(u8, 0x4), out[3]); // type = settings
+    // Payload: 2-byte id 0x0004, 4-byte value 65535
+    try std.testing.expectEqual(@as(u8, 0x00), out[9]);
+    try std.testing.expectEqual(@as(u8, 0x04), out[10]);
+    try std.testing.expectEqual(@as(u8, 0x00), out[11]);
+    try std.testing.expectEqual(@as(u8, 0x00), out[12]);
+    try std.testing.expectEqual(@as(u8, 0xff), out[13]);
+    try std.testing.expectEqual(@as(u8, 0xff), out[14]);
+}
+
+test "writeSettingsAck writes zero-length settings frame with ACK flag" {
+    var buf: [16]u8 = undefined;
+    var fbs = compat.fixedBufferStream(&buf);
+    try writeSettingsAck(fbs.writer());
+    const out = fbs.getWritten();
+    try std.testing.expectEqual(@as(usize, 9), out.len);
+    try std.testing.expectEqual(@as(u8, 0x4), out[3]); // type = settings
+    try std.testing.expectEqual(@as(u8, Flags.ACK), out[4]); // ACK flag
+}
+
+test "writeGoaway encodes last stream id and error code" {
+    var buf: [32]u8 = undefined;
+    var fbs = compat.fixedBufferStream(&buf);
+    try writeGoaway(fbs.writer(), 7, 0);
+    const out = fbs.getWritten();
+    try std.testing.expectEqual(@as(usize, 9 + 8), out.len);
+    try std.testing.expectEqual(@as(u8, 0x7), out[3]); // type = goaway
+    // last_stream = 7 in big-endian, top bit clear
+    try std.testing.expectEqual(@as(u8, 0x00), out[9]);
+    try std.testing.expectEqual(@as(u8, 0x00), out[10]);
+    try std.testing.expectEqual(@as(u8, 0x00), out[11]);
+    try std.testing.expectEqual(@as(u8, 0x07), out[12]);
+}

@@ -12,6 +12,9 @@ All notable user-facing changes to Tardigrade are documented here.
 - Added a file-backed plain-HTTP static response path with unit and integration coverage for full-file and range handling.
 - Added a configurable Prometheus metrics endpoint with optional auth gating and integration coverage for counter growth.
 
+### Added
+- Added 14 unit tests covering `zig_compat.zig` compat functions (timestamp, random, stringify, fixedBufferStream, trimRight, fmtSliceHexLower, DirCompat file I/O), `http2_frame` writeSettings/writeSettingsAck/writeGoaway encoding, and `access_log` formatEntry JSON output including null upstream_status handling.
+
 ### Changed
 - Modernized `build.zig` for Zig 0.16: removed boilerplate comments, extracted `configureSsl` helper to deduplicate OpenSSL/HTTP3 library setup across exe and test targets, removed unused `Io` import. Expanded `CONTRIBUTING.md` with a build-option table and common workflow examples.
 - Replaced deprecated `std.fs.path.*` module access with `std.Io.Dir.path.*`; updated deprecated `std.Io.File.CreateFlags`/`OpenFlags` parameter types to `std.Io.Dir.CreateFileOptions`/`OpenFileOptions` across main.zig and filesystem helpers.

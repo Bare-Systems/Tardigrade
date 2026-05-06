@@ -17,8 +17,8 @@ pub fn monthNameToNum(name: []const u8) ?u8 {
 }
 
 fn parseTime(tok: []const u8) ?struct { hour: u8, min: u8, sec: u8 } {
-    const first = std.mem.indexOf(u8, tok, ":") orelse return null;
-    const second = std.mem.indexOfPos(u8, tok, first + 1, ":") orelse return null;
+    const first = std.mem.find(u8, tok, ":") orelse return null;
+    const second = std.mem.findPos(u8, tok, first + 1, ":") orelse return null;
     const h = tok[0..first];
     const m = tok[first + 1 .. second];
     const s = tok[second + 1 ..];
@@ -43,24 +43,24 @@ pub fn parseHttpDate(s: []const u8) ?i64 {
     const trimmed = std.mem.trim(u8, s, " \t");
 
     // Try RFC1123: "Day, DD Mon YYYY HH:MM:SS GMT"
-    if (std.mem.indexOf(u8, trimmed, ",") != null) {
+    if (std.mem.find(u8, trimmed, ",") != null) {
         // Split on comma
-        const comma = std.mem.indexOf(u8, trimmed, ",") orelse return null;
+        const comma = std.mem.find(u8, trimmed, ",") orelse return null;
         const after = std.mem.trim(u8, trimmed[comma + 1 ..], " \t");
 
         // If contains '-', treat as RFC850: DD-Mon-YY
-        if (std.mem.indexOf(u8, after, "-") != null) {
+        if (std.mem.find(u8, after, "-") != null) {
             // RFC850: "Sunday, 06-Nov-94 08:49:37 GMT"
-            const first_sp = std.mem.indexOf(u8, after, " ") orelse return null;
+            const first_sp = std.mem.find(u8, after, " ") orelse return null;
             const date_tok = after[0..first_sp];
             const rest = std.mem.trim(u8, after[first_sp + 1 ..], " \t");
-            const second_sp = std.mem.indexOf(u8, rest, " ") orelse return null;
+            const second_sp = std.mem.find(u8, rest, " ") orelse return null;
             const time_tok = rest[0..second_sp];
             const tz = std.mem.trim(u8, rest[second_sp + 1 ..], " \t");
             if (!std.mem.eql(u8, tz, "GMT")) return null;
 
-            const dash1 = std.mem.indexOf(u8, date_tok, "-") orelse return null;
-            const dash2 = std.mem.indexOfPos(u8, date_tok, dash1 + 1, "-") orelse return null;
+            const dash1 = std.mem.find(u8, date_tok, "-") orelse return null;
+            const dash2 = std.mem.findPos(u8, date_tok, dash1 + 1, "-") orelse return null;
             const dd_s = date_tok[0..dash1];
             const mon_s = date_tok[dash1 + 1 .. dash2];
             const yy_s = date_tok[dash2 + 1 ..];
@@ -73,16 +73,16 @@ pub fn parseHttpDate(s: []const u8) ?i64 {
         } else {
             // RFC1123: "06 Nov 1994 08:49:37 GMT" (after the comma)
             // split tokens by spaces: dd mon year time tz
-            const sp1 = std.mem.indexOf(u8, after, " ") orelse return null;
+            const sp1 = std.mem.find(u8, after, " ") orelse return null;
             const dd = after[0..sp1];
             const rem1 = std.mem.trim(u8, after[sp1 + 1 ..], " \t");
-            const sp2 = std.mem.indexOf(u8, rem1, " ") orelse return null;
+            const sp2 = std.mem.find(u8, rem1, " ") orelse return null;
             const mon = rem1[0..sp2];
             const rem2 = std.mem.trim(u8, rem1[sp2 + 1 ..], " \t");
-            const sp3 = std.mem.indexOf(u8, rem2, " ") orelse return null;
+            const sp3 = std.mem.find(u8, rem2, " ") orelse return null;
             const year_s = rem2[0..sp3];
             const rem3 = std.mem.trim(u8, rem2[sp3 + 1 ..], " \t");
-            const sp4 = std.mem.indexOf(u8, rem3, " ") orelse return null;
+            const sp4 = std.mem.find(u8, rem3, " ") orelse return null;
             const time_tok = rem3[0..sp4];
             const tz = std.mem.trim(u8, rem3[sp4 + 1 ..], " \t");
             if (!std.mem.eql(u8, tz, "GMT")) return null;
@@ -95,15 +95,15 @@ pub fn parseHttpDate(s: []const u8) ?i64 {
     }
 
     // Try asctime: "Sun Nov  6 08:49:37 1994"
-    const sp1 = std.mem.indexOf(u8, trimmed, " ") orelse return null;
+    const sp1 = std.mem.find(u8, trimmed, " ") orelse return null;
     const rem0 = std.mem.trim(u8, trimmed[sp1 + 1 ..], " \t");
-    const sp2 = std.mem.indexOf(u8, rem0, " ") orelse return null;
+    const sp2 = std.mem.find(u8, rem0, " ") orelse return null;
     const mon = rem0[0..sp2];
     const rem1 = std.mem.trim(u8, rem0[sp2 + 1 ..], " \t");
-    const sp3 = std.mem.indexOf(u8, rem1, " ") orelse return null;
+    const sp3 = std.mem.find(u8, rem1, " ") orelse return null;
     const day_s = rem1[0..sp3];
     const rem2 = std.mem.trim(u8, rem1[sp3 + 1 ..], " \t");
-    const sp4 = std.mem.indexOf(u8, rem2, " ") orelse return null;
+    const sp4 = std.mem.find(u8, rem2, " ") orelse return null;
     const time_tok2 = rem2[0..sp4];
     const year_s2 = std.mem.trim(u8, rem2[sp4 + 1 ..], " \t");
     const day = std.fmt.parseInt(i32, day_s, 10) catch return null;

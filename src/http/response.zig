@@ -454,9 +454,9 @@ test "build simple 200 response" {
 
     const output = stream.getWritten();
     try testing.expect(std.mem.startsWith(u8, output, "HTTP/1.1 200 OK\r\n"));
-    try testing.expect(std.mem.indexOf(u8, output, "Content-Length: 13\r\n") != null);
-    try testing.expect(std.mem.indexOf(u8, output, "Server: tardigrade/") != null);
-    try testing.expect(std.mem.indexOf(u8, output, "Date: ") != null);
+    try testing.expect(std.mem.find(u8, output, "Content-Length: 13\r\n") != null);
+    try testing.expect(std.mem.find(u8, output, "Server: tardigrade/") != null);
+    try testing.expect(std.mem.find(u8, output, "Date: ") != null);
     try testing.expect(std.mem.endsWith(u8, output, "Hello, World!"));
 }
 
@@ -474,8 +474,8 @@ test "404 response" {
     const output = stream.getWritten();
     try testing.expect(std.mem.startsWith(u8, output, "HTTP/1.1 404 Not Found\r\n"));
     // Headers are lowercased when stored. Accept plain text or html if a custom page is present.
-    const has_plain = std.mem.indexOf(u8, output, "content-type: text/plain") != null;
-    const has_html = std.mem.indexOf(u8, output, "content-type: text/html") != null;
+    const has_plain = std.mem.find(u8, output, "content-type: text/plain") != null;
+    const has_html = std.mem.find(u8, output, "content-type: text/html") != null;
     try testing.expect(has_plain or has_html);
 }
 
@@ -492,7 +492,7 @@ test "redirect response" {
 
     const output = stream.getWritten();
     try testing.expect(std.mem.startsWith(u8, output, "HTTP/1.1 301 Moved Permanently\r\n"));
-    try testing.expect(std.mem.indexOf(u8, output, "location: /new-location\r\n") != null);
+    try testing.expect(std.mem.find(u8, output, "location: /new-location\r\n") != null);
 }
 
 test "custom headers" {
@@ -509,8 +509,8 @@ test "custom headers" {
     try response.write(stream.writer());
 
     const output = stream.getWritten();
-    try testing.expect(std.mem.indexOf(u8, output, "x-custom: my-value\r\n") != null);
-    try testing.expect(std.mem.indexOf(u8, output, "x-another: another-value\r\n") != null);
+    try testing.expect(std.mem.find(u8, output, "x-custom: my-value\r\n") != null);
+    try testing.expect(std.mem.find(u8, output, "x-another: another-value\r\n") != null);
 }
 
 test "head response excludes body" {
@@ -528,8 +528,8 @@ test "head response excludes body" {
 
     const output = stream.getWritten();
     // Should have Content-Length but not the body
-    try testing.expect(std.mem.indexOf(u8, output, "Content-Length: 27\r\n") != null);
-    try testing.expect(std.mem.indexOf(u8, output, "This body should not appear") == null);
+    try testing.expect(std.mem.find(u8, output, "Content-Length: 27\r\n") != null);
+    try testing.expect(std.mem.find(u8, output, "This body should not appear") == null);
 }
 
 test "json response" {
@@ -545,7 +545,7 @@ test "json response" {
 
     const output = stream.getWritten();
     // Headers are lowercased when stored
-    try testing.expect(std.mem.indexOf(u8, output, "content-type: application/json\r\n") != null);
+    try testing.expect(std.mem.find(u8, output, "content-type: application/json\r\n") != null);
     try testing.expect(std.mem.endsWith(u8, output, "{\"status\": \"ok\"}"));
 }
 
@@ -562,7 +562,7 @@ test "method not allowed includes Allow header" {
 
     const output = stream.getWritten();
     try testing.expect(std.mem.startsWith(u8, output, "HTTP/1.1 405 Method Not Allowed\r\n"));
-    try testing.expect(std.mem.indexOf(u8, output, "allow: GET, HEAD\r\n") != null);
+    try testing.expect(std.mem.find(u8, output, "allow: GET, HEAD\r\n") != null);
 }
 
 test "date header format" {
@@ -579,8 +579,8 @@ test "date header format" {
     const output = stream.getWritten();
     // Date format: "Date: Mon, 27 Jan 2026 03:00:00 GMT"
     // Check it contains "Date: " and " GMT"
-    try testing.expect(std.mem.indexOf(u8, output, "Date: ") != null);
-    try testing.expect(std.mem.indexOf(u8, output, " GMT\r\n") != null);
+    try testing.expect(std.mem.find(u8, output, "Date: ") != null);
+    try testing.expect(std.mem.find(u8, output, " GMT\r\n") != null);
 }
 
 test "connection header when setConnection(true)" {
@@ -597,7 +597,7 @@ test "connection header when setConnection(true)" {
     try response.write(stream.writer());
 
     const output = stream.getWritten();
-    try testing.expect(std.mem.indexOf(u8, output, "connection: keep-alive\r\n") != null);
+    try testing.expect(std.mem.find(u8, output, "connection: keep-alive\r\n") != null);
 }
 
 test "connection header when setConnection(false)" {
@@ -614,5 +614,5 @@ test "connection header when setConnection(false)" {
     try response.write(stream.writer());
 
     const output = stream.getWritten();
-    try testing.expect(std.mem.indexOf(u8, output, "connection: close\r\n") != null);
+    try testing.expect(std.mem.find(u8, output, "connection: close\r\n") != null);
 }

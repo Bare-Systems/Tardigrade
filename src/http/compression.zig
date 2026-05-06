@@ -9,15 +9,15 @@ fn isCompressibleMime(mime: []const u8) bool {
     // Text types
     if (std.mem.startsWith(u8, mime, "text/")) return true;
     // JSON / XML / JS application types
-    if (std.mem.indexOf(u8, mime, "application/json") != null) return true;
-    if (std.mem.indexOf(u8, mime, "application/xml") != null) return true;
-    if (std.mem.indexOf(u8, mime, "application/javascript") != null) return true;
-    if (std.mem.indexOf(u8, mime, "application/x-javascript") != null) return true;
-    if (std.mem.indexOf(u8, mime, "application/xhtml+xml") != null) return true;
-    if (std.mem.indexOf(u8, mime, "application/rss+xml") != null) return true;
-    if (std.mem.indexOf(u8, mime, "application/atom+xml") != null) return true;
-    if (std.mem.indexOf(u8, mime, "image/svg+xml") != null) return true;
-    if (std.mem.indexOf(u8, mime, "application/wasm") != null) return true;
+    if (std.mem.find(u8, mime, "application/json") != null) return true;
+    if (std.mem.find(u8, mime, "application/xml") != null) return true;
+    if (std.mem.find(u8, mime, "application/javascript") != null) return true;
+    if (std.mem.find(u8, mime, "application/x-javascript") != null) return true;
+    if (std.mem.find(u8, mime, "application/xhtml+xml") != null) return true;
+    if (std.mem.find(u8, mime, "application/rss+xml") != null) return true;
+    if (std.mem.find(u8, mime, "application/atom+xml") != null) return true;
+    if (std.mem.find(u8, mime, "image/svg+xml") != null) return true;
+    if (std.mem.find(u8, mime, "application/wasm") != null) return true;
     // Already compressed — do NOT compress
     // image/png, image/jpeg, font/woff2, application/gzip, etc. are excluded by default
     return false;

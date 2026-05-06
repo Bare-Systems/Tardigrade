@@ -41,10 +41,10 @@ pub fn loadOverrides(allocator: std.mem.Allocator) !Overrides {
     defer allocator.free(raw);
     var lines = std.mem.splitScalar(u8, raw, '\n');
     while (lines.next()) |line_raw| {
-        const no_comment = line_raw[0 .. std.mem.indexOfScalar(u8, line_raw, '#') orelse line_raw.len];
+        const no_comment = line_raw[0 .. std.mem.findScalar(u8, line_raw, '#') orelse line_raw.len];
         const line = std.mem.trim(u8, no_comment, " \t\r\n");
         if (line.len == 0) continue;
-        const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        const eq = std.mem.findScalar(u8, line, '=') orelse continue;
         const key = std.mem.trim(u8, line[0..eq], " \t");
         const value = std.mem.trim(u8, line[eq + 1 ..], " \t");
         if (key.len == 0 or value.len == 0) continue;

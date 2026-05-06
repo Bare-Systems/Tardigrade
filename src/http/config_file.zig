@@ -162,7 +162,7 @@ fn parseFile(
     var lines = std.mem.splitScalar(u8, raw, '\n');
     while (lines.next()) |line_raw| {
         line_no += 1;
-        const comment_idx = std.mem.indexOfScalar(u8, line_raw, '#') orelse line_raw.len;
+        const comment_idx = std.mem.findScalar(u8, line_raw, '#') orelse line_raw.len;
         const line = std.mem.trim(u8, line_raw[0..comment_idx], " \t\r\n");
         if (line.len == 0) continue;
         if (std.mem.eql(u8, line, "}")) {
@@ -419,11 +419,11 @@ fn parseStatement(
         return;
     }
     if (std.ascii.eqlIgnoreCase(directive, "if")) {
-        const open_paren = std.mem.indexOfScalar(u8, value_raw, '(') orelse {
+        const open_paren = std.mem.findScalar(u8, value_raw, '(') orelse {
             std.log.err("config syntax error at {s}:{d}: if requires condition in parentheses", .{ file_path, line_no });
             return error.InvalidConfigSyntax;
         };
-        const close_paren = std.mem.lastIndexOfScalar(u8, value_raw, ')') orelse {
+        const close_paren = std.mem.findScalarLast(u8, value_raw, ')') orelse {
             std.log.err("config syntax error at {s}:{d}: if requires closing ')'", .{ file_path, line_no });
             return error.InvalidConfigSyntax;
         };
@@ -875,7 +875,7 @@ fn parseOnOffBool(raw: []const u8) ?bool {
 fn mapListenDirective(allocator: std.mem.Allocator, map: *std.StringHashMap([]const u8), raw: []const u8) !void {
     var it = std.mem.tokenizeAny(u8, raw, " \t");
     const addr = it.next() orelse return;
-    if (std.mem.indexOfScalar(u8, addr, ':')) |colon| {
+    if (std.mem.findScalar(u8, addr, ':')) |colon| {
         const host = addr[0..colon];
         const port = addr[colon + 1 ..];
         if (host.len > 0) try putOverride(allocator, map, "TARDIGRADE_LISTEN_HOST", host);
@@ -904,8 +904,8 @@ fn parseInclude(
     const resolved = try resolveIncludePath(allocator, current_file_path, include_path);
     defer allocator.free(resolved);
 
-    if (std.mem.indexOfScalar(u8, resolved, '*')) |star| {
-        const slash = std.mem.lastIndexOfScalar(u8, resolved[0..star], '/') orelse return error.InvalidIncludePattern;
+    if (std.mem.findScalar(u8, resolved, '*')) |star| {
+        const slash = std.mem.findScalarLast(u8, resolved[0..star], '/') orelse return error.InvalidIncludePattern;
         const dir_path = resolved[0..slash];
         const pattern = resolved[slash + 1 ..];
         const suffix = if (std.mem.startsWith(u8, pattern, "*")) pattern[1..] else "";
@@ -949,7 +949,7 @@ fn interpolate(allocator: std.mem.Allocator, raw: []const u8, vars: *std.StringH
     var i: usize = 0;
     while (i < raw.len) {
         if (raw[i] == '$' and i + 1 < raw.len and raw[i + 1] == '{') {
-            const end = std.mem.indexOfScalarPos(u8, raw, i + 2, '}') orelse return error.InvalidVariableInterpolation;
+            const end = std.mem.findScalarPos(u8, raw, i + 2, '}') orelse return error.InvalidVariableInterpolation;
             const key = raw[i + 2 .. end];
             if (vars.get(key)) |value| {
                 try out.appendSlice(allocator, value);

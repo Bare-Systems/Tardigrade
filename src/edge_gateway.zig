@@ -2080,7 +2080,7 @@ fn parseStickyCookieUpstream(
     cookie_name: []const u8,
 ) !?[]u8 {
     const raw_cookie = findCookieValue(headers, cookie_name) orelse return null;
-    const dot = std.mem.lastIndexOfScalar(u8, raw_cookie, '.') orelse return null;
+    const dot = std.mem.findScalarLast(u8, raw_cookie, '.') orelse return null;
     const encoded_upstream = raw_cookie[0..dot];
     const provided_sig = raw_cookie[dot + 1 ..];
     if (encoded_upstream.len == 0 or provided_sig.len == 0) return null;
@@ -3662,7 +3662,7 @@ fn parseProxyHeaderV1(buf: []const u8, strict: bool, client_ip_buf: *[64]u8) Pro
     }
     if (!std.mem.eql(u8, buf[0..prefix.len], prefix)) return if (strict) .invalid else .no_header;
 
-    const line_end = std.mem.indexOf(u8, buf, "\r\n") orelse {
+    const line_end = std.mem.find(u8, buf, "\r\n") orelse {
         if (buf.len >= 108) return .invalid;
         return .need_more;
     };
@@ -5175,11 +5175,11 @@ fn executeUpstreamHttpsWithMtls(
 
     // Minimal HTTP/1.1 response parsing.
     const raw = resp_raw.items;
-    const header_end = std.mem.indexOf(u8, raw, "\r\n\r\n") orelse return error.UnsupportedHttpMethod;
+    const header_end = std.mem.find(u8, raw, "\r\n\r\n") orelse return error.UnsupportedHttpMethod;
     const headers_raw = raw[0..header_end];
     const resp_body = raw[header_end + 4 ..];
 
-    const first_line_end = std.mem.indexOfScalar(u8, headers_raw, '\n') orelse return error.UnsupportedHttpMethod;
+    const first_line_end = std.mem.findScalar(u8, headers_raw, '\n') orelse return error.UnsupportedHttpMethod;
     const first_line = compat.trimRight(u8, headers_raw[0..first_line_end], "\r");
     var line_parts = std.mem.splitScalar(u8, first_line, ' ');
     _ = line_parts.next(); // HTTP/1.1
@@ -5194,7 +5194,7 @@ fn executeUpstreamHttpsWithMtls(
     }
     var hdr_lines = std.mem.splitSequence(u8, headers_raw[first_line_end + 1 ..], "\r\n");
     while (hdr_lines.next()) |line| {
-        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const colon = std.mem.findScalar(u8, line, ':') orelse continue;
         const hname = std.mem.trim(u8, line[0..colon], " \t");
         const hval = std.mem.trim(u8, line[colon + 1 ..], " \t");
         if (shouldSkipUpstreamResponseHeader(hname)) continue;
@@ -5228,9 +5228,9 @@ const StaticErrorPageResult = union(enum) {
 fn wantsHtmlErrorPage(request_path: []const u8, headers: *const http.Headers) bool {
     if (std.mem.startsWith(u8, request_path, "/v1/")) return false;
     const accept = headers.get("accept") orelse return false;
-    if (std.mem.indexOf(u8, accept, "text/html") != null) return true;
-    if (std.mem.indexOf(u8, accept, "*/*") != null) return true;
-    if (std.mem.indexOf(u8, accept, "application/json") != null) return false;
+    if (std.mem.find(u8, accept, "text/html") != null) return true;
+    if (std.mem.find(u8, accept, "*/*") != null) return true;
+    if (std.mem.find(u8, accept, "application/json") != null) return false;
     return false;
 }
 
@@ -5620,7 +5620,7 @@ fn parseQueryParam(query: ?[]const u8, key: []const u8) ?[]const u8 {
     const raw = query orelse return null;
     var it = std.mem.splitScalar(u8, raw, '&');
     while (it.next()) |part| {
-        const eq = std.mem.indexOfScalar(u8, part, '=') orelse continue;
+        const eq = std.mem.findScalar(u8, part, '=') orelse continue;
         const name = std.mem.trim(u8, part[0..eq], " \t\r\n");
         if (!std.mem.eql(u8, name, key)) continue;
         return std.mem.trim(u8, part[eq + 1 ..], " \t\r\n");
@@ -6522,12 +6522,12 @@ fn injectSmtpAuthIdentity(
     if (identity.len == 0) return payload;
 
     const data_start = findSmtpDataStart(payload) orelse return payload;
-    if (std.mem.indexOfPos(u8, payload, data_start, "X-Tardigrade-Auth-Identity:")) |_| return payload;
+    if (std.mem.findPos(u8, payload, data_start, "X-Tardigrade-Auth-Identity:")) |_| return payload;
 
     const header_line = try std.fmt.allocPrint(allocator, "X-Tardigrade-Auth-Identity: {s}\r\n", .{identity});
     defer allocator.free(header_line);
 
-    if (std.mem.indexOfPos(u8, payload, data_start, "\r\n\r\n")) |_| {
+    if (std.mem.findPos(u8, payload, data_start, "\r\n\r\n")) |_| {
         return std.fmt.allocPrint(
             allocator,
             "{s}{s}{s}",
@@ -6544,7 +6544,7 @@ fn injectSmtpAuthIdentity(
 
 fn findSmtpDataStart(payload: []const u8) ?usize {
     if (std.mem.startsWith(u8, payload, "DATA\r\n")) return "DATA\r\n".len;
-    if (std.mem.indexOf(u8, payload, "\r\nDATA\r\n")) |idx| return idx + "\r\nDATA\r\n".len;
+    if (std.mem.find(u8, payload, "\r\nDATA\r\n")) |idx| return idx + "\r\nDATA\r\n".len;
     return null;
 }
 
@@ -6774,7 +6774,7 @@ fn readImapReplyTls(
 }
 
 fn imapPayloadTag(payload: []const u8) ?[]const u8 {
-    const line_end = std.mem.indexOf(u8, payload, "\r\n") orelse payload.len;
+    const line_end = std.mem.find(u8, payload, "\r\n") orelse payload.len;
     const first_line = payload[0..line_end];
     var toks = std.mem.tokenizeAny(u8, first_line, " \t");
     return toks.next();
@@ -6794,14 +6794,14 @@ fn imapReplyComplete(reply: []const u8, tag: ?[]const u8) bool {
 }
 
 fn imapReplyContainsOk(reply: []const u8) bool {
-    return std.mem.indexOf(u8, reply, " OK") != null or std.mem.startsWith(u8, std.mem.trim(u8, reply, " \t\r\n"), "* OK");
+    return std.mem.find(u8, reply, " OK") != null or std.mem.startsWith(u8, std.mem.trim(u8, reply, " \t\r\n"), "* OK");
 }
 
 fn imapTaggedReplyContainsOk(reply: []const u8, tag: []const u8) bool {
     var it = std.mem.splitSequence(u8, reply, "\r\n");
     while (it.next()) |line| {
         if (std.mem.startsWith(u8, line, tag) and line.len > tag.len and line[tag.len] == ' ') {
-            return std.mem.indexOf(u8, line, " OK") != null;
+            return std.mem.find(u8, line, " OK") != null;
         }
     }
     return false;
@@ -6812,7 +6812,7 @@ fn smtpReplyComplete(reply: []const u8) bool {
     var multiline_code: ?[]const u8 = null;
     var saw_terminal = false;
     while (idx < reply.len) {
-        const line_end = std.mem.indexOfPos(u8, reply, idx, "\r\n") orelse return false;
+        const line_end = std.mem.findPos(u8, reply, idx, "\r\n") orelse return false;
         const line = reply[idx..line_end];
         if (line.len >= 4 and std.ascii.isDigit(line[0]) and std.ascii.isDigit(line[1]) and std.ascii.isDigit(line[2])) {
             if (line[3] == '-') {
@@ -7192,7 +7192,7 @@ fn handleHttp3Connection(
 }
 
 fn splitHttp3PathAndQuery(path: []const u8) struct { []const u8, ?[]const u8 } {
-    if (std.mem.indexOfScalar(u8, path, '?')) |idx| {
+    if (std.mem.findScalar(u8, path, '?')) |idx| {
         return .{ path[0..idx], path[idx + 1 ..] };
     }
     return .{ path, null };
@@ -7329,7 +7329,7 @@ fn isJsonContentType(content_type: ?[]const u8) bool {
         std.ascii.lowerString(lower_buf[0..ct.len], ct)
     else
         ct;
-    return std.mem.indexOf(u8, lower, JSON_CONTENT_TYPE) != null;
+    return std.mem.find(u8, lower, JSON_CONTENT_TYPE) != null;
 }
 
 fn shouldBypassProxyCache(headers: *const http.Headers) bool {
@@ -7414,12 +7414,12 @@ fn stripHostPort(raw_host: []const u8) []const u8 {
     const trimmed = std.mem.trim(u8, raw_host, " \t\r\n");
     if (trimmed.len == 0) return trimmed;
     if (trimmed[0] == '[') {
-        const end = std.mem.indexOfScalar(u8, trimmed, ']') orelse return trimmed;
+        const end = std.mem.findScalar(u8, trimmed, ']') orelse return trimmed;
         return trimmed[1..end];
     }
-    const colon = std.mem.lastIndexOfScalar(u8, trimmed, ':') orelse return trimmed;
+    const colon = std.mem.findScalarLast(u8, trimmed, ':') orelse return trimmed;
     const head = trimmed[0..colon];
-    if (std.mem.indexOfScalar(u8, head, ':') != null) return trimmed;
+    if (std.mem.findScalar(u8, head, ':') != null) return trimmed;
     return head;
 }
 
@@ -7427,13 +7427,13 @@ fn hostPort(raw_host: []const u8) ?u16 {
     const trimmed = std.mem.trim(u8, raw_host, " \t\r\n");
     if (trimmed.len == 0) return null;
     if (trimmed[0] == '[') {
-        const end = std.mem.indexOfScalar(u8, trimmed, ']') orelse return null;
+        const end = std.mem.findScalar(u8, trimmed, ']') orelse return null;
         if (end + 1 >= trimmed.len or trimmed[end + 1] != ':') return null;
         return std.fmt.parseInt(u16, trimmed[end + 2 ..], 10) catch null;
     }
-    const colon = std.mem.lastIndexOfScalar(u8, trimmed, ':') orelse return null;
+    const colon = std.mem.findScalarLast(u8, trimmed, ':') orelse return null;
     const head = trimmed[0..colon];
-    if (std.mem.indexOfScalar(u8, head, ':') != null) return null;
+    if (std.mem.findScalar(u8, head, ':') != null) return null;
     return std.fmt.parseInt(u16, trimmed[colon + 1 ..], 10) catch null;
 }
 
@@ -7563,7 +7563,7 @@ fn loadRegisteredDeviceKey(allocator: std.mem.Allocator, registry_path: []const 
     while (lines.next()) |line_raw| {
         const line = std.mem.trim(u8, line_raw, " \t\r\n");
         if (line.len == 0) continue;
-        const sep = std.mem.indexOfScalar(u8, line, '|') orelse continue;
+        const sep = std.mem.findScalar(u8, line, '|') orelse continue;
         const did = std.mem.trim(u8, line[0..sep], " \t");
         const key = std.mem.trim(u8, line[sep + 1 ..], " \t");
         if (std.mem.eql(u8, did, device_id)) return allocator.dupe(u8, key) catch null;
@@ -7718,7 +7718,7 @@ fn identityHasScope(scopes_raw: []const u8, identity: ?[]const u8, required: []c
     while (it.next()) |entry_raw| {
         const entry = std.mem.trim(u8, entry_raw, " \t\r\n");
         if (entry.len == 0) continue;
-        const colon = std.mem.indexOfScalar(u8, entry, ':') orelse continue;
+        const colon = std.mem.findScalar(u8, entry, ':') orelse continue;
         const id = std.mem.trim(u8, entry[0..colon], " \t");
         if (!std.mem.eql(u8, id, identity.?)) continue;
         var s_it = std.mem.splitScalar(u8, entry[colon + 1 ..], ',');
@@ -7730,7 +7730,7 @@ fn identityHasScope(scopes_raw: []const u8, identity: ?[]const u8, required: []c
 }
 
 fn timeWindowAllows(raw: []const u8) bool {
-    const dash = std.mem.indexOfScalar(u8, raw, '-') orelse return true;
+    const dash = std.mem.findScalar(u8, raw, '-') orelse return true;
     const start = std.fmt.parseInt(u8, std.mem.trim(u8, raw[0..dash], " \t"), 10) catch return true;
     const stop = std.fmt.parseInt(u8, std.mem.trim(u8, raw[dash + 1 ..], " \t"), 10) catch return true;
     const now = compat.unixTimestamp();
@@ -7922,9 +7922,9 @@ fn proxyCacheReadFromDisk(
     };
     defer allocator.free(raw);
 
-    const l1 = std.mem.indexOfScalar(u8, raw, '\n') orelse return null;
-    const l2 = std.mem.indexOfScalarPos(u8, raw, l1 + 1, '\n') orelse return null;
-    const l3 = std.mem.indexOfScalarPos(u8, raw, l2 + 1, '\n') orelse return null;
+    const l1 = std.mem.findScalar(u8, raw, '\n') orelse return null;
+    const l2 = std.mem.findScalarPos(u8, raw, l1 + 1, '\n') orelse return null;
+    const l3 = std.mem.findScalarPos(u8, raw, l2 + 1, '\n') orelse return null;
     if (l3 + 1 >= raw.len or raw[l3 + 1] != '\n') return null;
     const body_start = l3 + 2;
 
@@ -8688,10 +8688,10 @@ fn writeChunk(writer: anytype, bytes: []const u8) !void {
 fn stripPort(authority: []const u8) []const u8 {
     if (authority.len == 0) return authority;
     if (authority[0] == '[') {
-        const close_idx = std.mem.indexOfScalar(u8, authority, ']') orelse return authority;
+        const close_idx = std.mem.findScalar(u8, authority, ']') orelse return authority;
         return authority[0 .. close_idx + 1];
     }
-    const colon_idx = std.mem.lastIndexOfScalar(u8, authority, ':') orelse return authority;
+    const colon_idx = std.mem.findScalarLast(u8, authority, ':') orelse return authority;
     return authority[0..colon_idx];
 }
 
@@ -8852,7 +8852,7 @@ fn appendProxyQueryString(
 ) ![]u8 {
     const value = query orelse return allocator.dupe(u8, url);
     if (value.len == 0) return allocator.dupe(u8, url);
-    if (std.mem.indexOfScalar(u8, url, '?') != null) {
+    if (std.mem.findScalar(u8, url, '?') != null) {
         return std.fmt.allocPrint(allocator, "{s}&{s}", .{ url, value });
     }
     return std.fmt.allocPrint(allocator, "{s}?{s}", .{ url, value });
@@ -8908,11 +8908,11 @@ fn isAbsoluteHttpUrl(value: []const u8) bool {
 }
 
 fn parseUpstreamHost(base_url: []const u8) ?[]const u8 {
-    const scheme_end = std.mem.indexOf(u8, base_url, "://") orelse return null;
+    const scheme_end = std.mem.find(u8, base_url, "://") orelse return null;
     const authority_start = scheme_end + 3;
     if (authority_start >= base_url.len) return null;
 
-    const path_start = std.mem.indexOfScalarPos(u8, base_url, authority_start, '/') orelse base_url.len;
+    const path_start = std.mem.findScalarPos(u8, base_url, authority_start, '/') orelse base_url.len;
     if (path_start <= authority_start) return null;
     return base_url[authority_start..path_start];
 }
@@ -9059,7 +9059,7 @@ fn readHttpRequest(conn: anytype, buf: []u8, pending_len: *usize) !usize {
 }
 
 fn firstRequestCompleteLen(data: []const u8) ?usize {
-    const header_pos = std.mem.indexOf(u8, data, "\r\n\r\n") orelse return null;
+    const header_pos = std.mem.find(u8, data, "\r\n\r\n") orelse return null;
     const headers_len = header_pos + 4;
     const content_length = parseContentLength(data[0..headers_len]) orelse 0;
     const full_len = headers_len + content_length;
@@ -9071,7 +9071,7 @@ fn parseContentLength(headers: []const u8) ?usize {
     var it = std.mem.tokenizeAny(u8, headers, "\r\n");
     while (it.next()) |line| {
         if (line.len == 0) continue;
-        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const colon = std.mem.findScalar(u8, line, ':') orelse continue;
         const name = std.mem.trim(u8, line[0..colon], " \t");
         if (!std.ascii.eqlIgnoreCase(name, "content-length")) continue;
 
@@ -9230,8 +9230,8 @@ test "firstRequestCompleteLen handles keep-alive pipelined requests" {
         "GET /b HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
     const first_len = firstRequestCompleteLen(reqs).?;
     const first = reqs[0..first_len];
-    try std.testing.expect(std.mem.indexOf(u8, first, "GET /a") != null);
-    try std.testing.expect(std.mem.indexOf(u8, first, "keep-alive") != null);
+    try std.testing.expect(std.mem.find(u8, first, "GET /a") != null);
+    try std.testing.expect(std.mem.find(u8, first, "keep-alive") != null);
 }
 
 test "connection session pool reuses released sessions" {

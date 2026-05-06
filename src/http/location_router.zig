@@ -171,8 +171,8 @@ fn isBetterPrefixMatch(
 }
 
 fn normalizeRequestPath(request_uri: []const u8) []const u8 {
-    const query_start = std.mem.indexOfScalar(u8, request_uri, '?') orelse request_uri.len;
-    const fragment_start = std.mem.indexOfScalar(u8, request_uri[0..query_start], '#') orelse query_start;
+    const query_start = std.mem.findScalar(u8, request_uri, '?') orelse request_uri.len;
+    const fragment_start = std.mem.findScalar(u8, request_uri[0..query_start], '#') orelse query_start;
     return request_uri[0..fragment_start];
 }
 

@@ -1530,7 +1530,7 @@ fn parseServerBlockRouteFields(
 
 fn looksLikeLocationBlockBlob(value: []const u8) bool {
     if (value.len == 0) return true;
-    return std.mem.indexOfScalar(u8, value, '|') != null;
+    return std.mem.findScalar(u8, value, '|') != null;
 }
 
 fn applyServerBlockTlsConfig(
@@ -1717,7 +1717,7 @@ fn parseCsvU32Values(allocator: std.mem.Allocator, raw: []const u8) ![]u32 {
 fn parseHealthStatusRange(raw: []const u8) !EdgeConfig.HealthStatusRange {
     const trimmed = std.mem.trim(u8, raw, " \t\r\n");
     if (trimmed.len == 0) return error.InvalidHealthStatusRange;
-    if (std.mem.indexOfScalar(u8, trimmed, '-')) |dash| {
+    if (std.mem.findScalar(u8, trimmed, '-')) |dash| {
         const min_raw = std.mem.trim(u8, trimmed[0..dash], " \t\r\n");
         const max_raw = std.mem.trim(u8, trimmed[dash + 1 ..], " \t\r\n");
         const min = std.fmt.parseInt(u16, min_raw, 10) catch return error.InvalidHealthStatusRange;
@@ -1743,7 +1743,7 @@ fn parseUpstreamHealthSuccessStatusOverrides(
     while (it.next()) |entry_raw| {
         const entry = std.mem.trim(u8, entry_raw, " \t\r\n");
         if (entry.len == 0) continue;
-        const sep = std.mem.lastIndexOfScalar(u8, entry, '|') orelse return error.InvalidHealthStatusOverride;
+        const sep = std.mem.findScalarLast(u8, entry, '|') orelse return error.InvalidHealthStatusOverride;
         const upstream_base_url = std.mem.trim(u8, entry[0..sep], " \t\r\n");
         const status_raw = std.mem.trim(u8, entry[sep + 1 ..], " \t\r\n");
         if (upstream_base_url.len == 0 or status_raw.len == 0) return error.InvalidHealthStatusOverride;
@@ -1769,7 +1769,7 @@ fn parseHeaderPairs(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeConfig
     while (it.next()) |part| {
         const trimmed = std.mem.trim(u8, part, " \t\r\n");
         if (trimmed.len == 0) continue;
-        const colon = std.mem.indexOfScalar(u8, trimmed, ':') orelse return error.InvalidAddHeaderFormat;
+        const colon = std.mem.findScalar(u8, trimmed, ':') orelse return error.InvalidAddHeaderFormat;
         const name_raw = std.mem.trim(u8, trimmed[0..colon], " \t\r\n");
         const value_raw = std.mem.trim(u8, trimmed[colon + 1 ..], " \t\r\n");
         if (name_raw.len == 0) return error.InvalidAddHeaderFormat;
@@ -1796,7 +1796,7 @@ fn parseFastcgiParams(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeConf
     while (it.next()) |entry| {
         const trimmed = std.mem.trim(u8, entry, " \t\r\n");
         if (trimmed.len == 0) continue;
-        const eq = std.mem.indexOfScalar(u8, trimmed, '=') orelse return error.InvalidFastcgiParamFormat;
+        const eq = std.mem.findScalar(u8, trimmed, '=') orelse return error.InvalidFastcgiParamFormat;
         const name = std.mem.trim(u8, trimmed[0..eq], " \t\r\n");
         const value = std.mem.trim(u8, trimmed[eq + 1 ..], " \t\r\n");
         if (name.len == 0) return error.InvalidFastcgiParamFormat;
@@ -2190,7 +2190,7 @@ fn parseNamedLocations(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeCon
     while (it.next()) |entry_raw| {
         const entry = std.mem.trim(u8, entry_raw, " \t\r\n");
         if (entry.len == 0) continue;
-        const sep = std.mem.indexOfScalar(u8, entry, '|') orelse return error.InvalidNamedLocationFormat;
+        const sep = std.mem.findScalar(u8, entry, '|') orelse return error.InvalidNamedLocationFormat;
         const name = std.mem.trim(u8, entry[0..sep], " \t\r\n");
         const path = std.mem.trim(u8, entry[sep + 1 ..], " \t\r\n");
         if (name.len == 0 or path.len == 0) return error.InvalidNamedLocationFormat;
@@ -2454,7 +2454,7 @@ fn validateOptionalSocketEndpointChecked(raw: []const u8) !void {
         raw["smtps://".len..]
     else
         raw;
-    if (std.mem.indexOfScalar(u8, normalized, ':') == null) {
+    if (std.mem.findScalar(u8, normalized, ':') == null) {
         return error.InvalidConfigEndpoint;
     }
     const parts = splitHostPort(normalized) orelse return error.InvalidConfigEndpoint;
@@ -2487,7 +2487,7 @@ fn isUnixEndpoint(raw: []const u8) bool {
 }
 
 fn splitHostPort(raw: []const u8) ?struct { []const u8, []const u8 } {
-    const idx = std.mem.lastIndexOfScalar(u8, raw, ':') orelse return null;
+    const idx = std.mem.findScalarLast(u8, raw, ':') orelse return null;
     if (idx == 0 or idx + 1 >= raw.len) return null;
     return .{ std.mem.trim(u8, raw[0..idx], " \t\r\n"), std.mem.trim(u8, raw[idx + 1 ..], " \t\r\n") };
 }

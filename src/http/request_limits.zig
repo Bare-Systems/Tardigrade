@@ -182,15 +182,15 @@ test "rejectionMessage formats body_too_large" {
     const result = ValidationResult{ .body_too_large = .{ .size = 2048, .limit = 1024 } };
     var buf: [256]u8 = undefined;
     const msg = rejectionMessage(result, &buf);
-    try std.testing.expect(std.mem.indexOf(u8, msg, "2048") != null);
-    try std.testing.expect(std.mem.indexOf(u8, msg, "1024") != null);
+    try std.testing.expect(std.mem.find(u8, msg, "2048") != null);
+    try std.testing.expect(std.mem.find(u8, msg, "1024") != null);
 }
 
 test "rejectionMessage formats uri_too_long" {
     const result = ValidationResult{ .uri_too_long = .{ .length = 10000, .limit = 8192 } };
     var buf: [256]u8 = undefined;
     const msg = rejectionMessage(result, &buf);
-    try std.testing.expect(std.mem.indexOf(u8, msg, "10000") != null);
+    try std.testing.expect(std.mem.find(u8, msg, "10000") != null);
 }
 
 test "validateHeaderCount accepts under limit" {
@@ -232,13 +232,13 @@ test "rejectionMessage formats too_many_headers" {
     const result = ValidationResult{ .too_many_headers = .{ .count = 200, .limit = 100 } };
     var buf: [256]u8 = undefined;
     const msg = rejectionMessage(result, &buf);
-    try std.testing.expect(std.mem.indexOf(u8, msg, "200") != null);
-    try std.testing.expect(std.mem.indexOf(u8, msg, "100") != null);
+    try std.testing.expect(std.mem.find(u8, msg, "200") != null);
+    try std.testing.expect(std.mem.find(u8, msg, "100") != null);
 }
 
 test "rejectionMessage formats header_too_large" {
     const result = ValidationResult{ .header_too_large = .{ .size = 16384, .limit = 8192 } };
     var buf: [256]u8 = undefined;
     const msg = rejectionMessage(result, &buf);
-    try std.testing.expect(std.mem.indexOf(u8, msg, "16384") != null);
+    try std.testing.expect(std.mem.find(u8, msg, "16384") != null);
 }

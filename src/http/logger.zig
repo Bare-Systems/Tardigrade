@@ -191,7 +191,7 @@ test "formatTimestamp produces valid ISO 8601" {
     var buf: [32]u8 = undefined;
     const ts = formatTimestamp(&buf);
     // Should contain 'T' and end with 'Z'
-    try std.testing.expect(std.mem.indexOf(u8, ts, "T") != null);
+    try std.testing.expect(std.mem.find(u8, ts, "T") != null);
     try std.testing.expect(std.mem.endsWith(u8, ts, "Z"));
     // Should be at least 20 chars: "2026-03-07T12:00:00Z"
     try std.testing.expect(ts.len >= 20);

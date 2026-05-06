@@ -151,7 +151,7 @@ fn renderTemplate(allocator: std.mem.Allocator, template: []const u8, ts: []cons
     var i: usize = 0;
     while (i < template.len) {
         if (template[i] == '{') {
-            const close = std.mem.indexOfScalarPos(u8, template, i + 1, '}') orelse {
+            const close = std.mem.findScalarPos(u8, template, i + 1, '}') orelse {
                 try out.append(allocator, template[i]);
                 i += 1;
                 continue;
@@ -220,7 +220,7 @@ fn flushLocked(st: *State) void {
 }
 
 fn sendSyslogUdp(endpoint: []const u8, msg: []const u8) void {
-    const colon = std.mem.lastIndexOfScalar(u8, endpoint, ':') orelse return;
+    const colon = std.mem.findScalarLast(u8, endpoint, ':') orelse return;
     const host = endpoint[0..colon];
     const port = std.fmt.parseInt(u16, endpoint[colon + 1 ..], 10) catch return;
     const addr = std.Io.net.IpAddress.resolve(compat.io(), host, port) catch return;

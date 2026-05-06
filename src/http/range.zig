@@ -14,9 +14,9 @@ pub fn parseSingle(header_value: []const u8, size: usize) !ByteRange {
     if (!std.mem.startsWith(u8, trimmed, "bytes=")) return error.InvalidRange;
 
     const spec = trimmed["bytes=".len..];
-    if (std.mem.indexOfScalar(u8, spec, ',')) |_| return error.MultiRangeUnsupported;
+    if (std.mem.findScalar(u8, spec, ',')) |_| return error.MultiRangeUnsupported;
 
-    const dash = std.mem.indexOfScalar(u8, spec, '-') orelse return error.InvalidRange;
+    const dash = std.mem.findScalar(u8, spec, '-') orelse return error.InvalidRange;
     const start_raw = std.mem.trim(u8, spec[0..dash], " \t");
     const end_raw = std.mem.trim(u8, spec[dash + 1 ..], " \t");
 

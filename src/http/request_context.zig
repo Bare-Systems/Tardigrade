@@ -125,7 +125,7 @@ pub const RequestContext = struct {
 pub fn extractClientIp(request: *const Request, default: []const u8) []const u8 {
     // Prefer X-Forwarded-For first IP
     if (request.headers.get("x-forwarded-for")) |xff| {
-        if (std.mem.indexOfScalar(u8, xff, ',')) |comma| {
+        if (std.mem.findScalar(u8, xff, ',')) |comma| {
             const first = std.mem.trim(u8, xff[0..comma], " \t");
             if (first.len > 0) return first;
         } else {

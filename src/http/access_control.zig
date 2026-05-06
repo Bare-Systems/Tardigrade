@@ -152,7 +152,7 @@ pub const AccessControl = struct {
 /// Parse a single rule like "allow 10.0.0.0/8" or "deny 192.168.1.100".
 fn parseRule(s: []const u8) !Rule {
     // Find the space between action and CIDR
-    const space = std.mem.indexOfScalar(u8, s, ' ') orelse return error.InvalidRule;
+    const space = std.mem.findScalar(u8, s, ' ') orelse return error.InvalidRule;
     const action_str = s[0..space];
     const cidr_str = std.mem.trim(u8, s[space + 1 ..], " \t");
 
@@ -171,7 +171,7 @@ fn parseRule(s: []const u8) !Rule {
 /// Parse a CIDR string like "10.0.0.0/8" or a plain IP like "192.168.1.1".
 /// Plain IPs get /32 (IPv4) or /128 (IPv6) prefix.
 pub fn parseCidr(s: []const u8) ?CidrBlock {
-    if (std.mem.indexOfScalar(u8, s, '/')) |slash| {
+    if (std.mem.findScalar(u8, s, '/')) |slash| {
         const ip_part = s[0..slash];
         const prefix_str = s[slash + 1 ..];
         const prefix_len = std.fmt.parseInt(u8, prefix_str, 10) catch return null;
@@ -226,7 +226,7 @@ fn parseIpv6(s: []const u8) ?[16]u8 {
     var result: [16]u8 = .{0} ** 16;
 
     // Handle :: expansion
-    if (std.mem.indexOf(u8, s, "::")) |dcolon_pos| {
+    if (std.mem.find(u8, s, "::")) |dcolon_pos| {
         // Parse before ::
         var before_count: usize = 0;
         if (dcolon_pos > 0) {

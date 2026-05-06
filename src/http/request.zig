@@ -55,7 +55,7 @@ pub const Request = struct {
     /// Returns the request and the total number of bytes consumed
     pub fn parse(allocator: Allocator, data: []const u8, max_body_size: usize) ParseError!struct { request: Request, bytes_consumed: usize } {
         // Find end of request line
-        const request_line_end = std.mem.indexOf(u8, data, "\r\n") orelse {
+        const request_line_end = std.mem.find(u8, data, "\r\n") orelse {
             return error.InvalidRequestLine;
         };
 
@@ -159,10 +159,10 @@ pub const Request = struct {
             }
             const lower = lower_buf[0..len];
 
-            if (std.mem.indexOf(u8, lower, "close") != null) {
+            if (std.mem.find(u8, lower, "close") != null) {
                 return false;
             }
-            if (std.mem.indexOf(u8, lower, "keep-alive") != null) {
+            if (std.mem.find(u8, lower, "keep-alive") != null) {
                 return true;
             }
         }
@@ -174,14 +174,14 @@ pub const Request = struct {
 /// Parse the request line into its components
 fn parseRequestLine(line: []const u8) ?struct { method: []const u8, uri: []const u8, version: []const u8 } {
     // Find first space (after method)
-    const first_space = std.mem.indexOf(u8, line, " ") orelse return null;
+    const first_space = std.mem.find(u8, line, " ") orelse return null;
     if (first_space == 0) return null;
 
     const method = line[0..first_space];
 
     // Find second space (after URI)
     const rest = line[first_space + 1 ..];
-    const second_space = std.mem.indexOf(u8, rest, " ") orelse return null;
+    const second_space = std.mem.find(u8, rest, " ") orelse return null;
     if (second_space == 0) return null;
 
     const uri = rest[0..second_space];
@@ -203,8 +203,8 @@ fn parseUri(uri: []const u8) ?Uri {
     // URI must start with / for absolute path (or be *)
     if (uri[0] != '/' and !std.mem.eql(u8, uri, "*")) {
         // Could be absolute URI, just take the path portion
-        if (std.mem.indexOf(u8, uri, "://")) |proto_end| {
-            if (std.mem.indexOfPos(u8, uri, proto_end + 3, "/")) |path_start| {
+        if (std.mem.find(u8, uri, "://")) |proto_end| {
+            if (std.mem.findPos(u8, uri, proto_end + 3, "/")) |path_start| {
                 return parseUri(uri[path_start..]);
             }
         }
@@ -212,7 +212,7 @@ fn parseUri(uri: []const u8) ?Uri {
     }
 
     // Find query string
-    if (std.mem.indexOf(u8, uri, "?")) |query_start| {
+    if (std.mem.find(u8, uri, "?")) |query_start| {
         return Uri{
             .raw = uri,
             .path = uri[0..query_start],

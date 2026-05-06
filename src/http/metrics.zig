@@ -316,16 +316,16 @@ test "Metrics toPrometheus produces valid Prometheus text" {
     const prom = try m.toPrometheus(allocator);
     defer allocator.free(prom);
 
-    try std.testing.expect(std.mem.indexOf(u8, prom, "tardigrade_requests_total 2") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prom, "tardigrade_requests_2xx_total 1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prom, "tardigrade_requests_5xx_total 1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prom, "tardigrade_active_connections") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prom, "tardigrade_connection_rejections_total") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prom, "tardigrade_queue_rejections_total") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prom, "tardigrade_upstream_unhealthy_backends") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prom, "tardigrade_error_invalid_request_total") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prom, "# TYPE tardigrade_requests_total counter") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prom, "# TYPE tardigrade_uptime_seconds gauge") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_requests_total 2") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_requests_2xx_total 1") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_requests_5xx_total 1") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_active_connections") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_connection_rejections_total") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_queue_rejections_total") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_upstream_unhealthy_backends") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_error_invalid_request_total") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "# TYPE tardigrade_requests_total counter") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "# TYPE tardigrade_uptime_seconds gauge") != null);
 }
 
 test "Metrics toJson produces valid JSON" {
@@ -337,13 +337,13 @@ test "Metrics toJson produces valid JSON" {
     const json = try m.toJson(allocator);
     defer allocator.free(json);
 
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"total_requests\":2") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"status_2xx\":1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"status_4xx\":1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"active_connections\":0") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"connection_rejections\":0") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"queue_rejections\":0") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"upstream_unhealthy_backends\":0") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"error_invalid_request\":0") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"uptime_seconds\":") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"total_requests\":2") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"status_2xx\":1") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"status_4xx\":1") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"active_connections\":0") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"connection_rejections\":0") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"queue_rejections\":0") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"upstream_unhealthy_backends\":0") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"error_invalid_request\":0") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"uptime_seconds\":") != null);
 }

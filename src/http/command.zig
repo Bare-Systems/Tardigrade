@@ -218,7 +218,7 @@ test "parseCommand valid chat" {
     try std.testing.expect(cmd.command_id == null);
     try std.testing.expect(!cmd.async_execute);
     // params_raw should contain the message
-    try std.testing.expect(std.mem.indexOf(u8, cmd.params_raw, "hello") != null);
+    try std.testing.expect(std.mem.find(u8, cmd.params_raw, "hello") != null);
 }
 
 test "parseCommand with idempotency key" {

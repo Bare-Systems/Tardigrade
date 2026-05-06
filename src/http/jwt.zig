@@ -88,8 +88,8 @@ fn parseAndValidateHs256(allocator: std.mem.Allocator, token: []const u8, opts: 
     const sig_b64 = parts.next() orelse return error.InvalidTokenFormat;
     if (parts.next() != null) return error.InvalidTokenFormat;
 
-    const dot1 = std.mem.indexOfScalar(u8, token, '.') orelse return error.InvalidTokenFormat;
-    const dot2_rel = std.mem.indexOfScalar(u8, token[dot1 + 1 ..], '.') orelse return error.InvalidTokenFormat;
+    const dot1 = std.mem.findScalar(u8, token, '.') orelse return error.InvalidTokenFormat;
+    const dot2_rel = std.mem.findScalar(u8, token[dot1 + 1 ..], '.') orelse return error.InvalidTokenFormat;
     const dot2 = dot1 + 1 + dot2_rel;
     const signing_input = token[0..dot2];
 

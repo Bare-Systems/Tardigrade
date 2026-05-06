@@ -126,7 +126,7 @@ pub fn parseHeaders(allocator: Allocator, data: []const u8) !struct { headers: H
 
     while (pos < data.len) {
         // Find end of line
-        const line_end = std.mem.indexOfPos(u8, data, pos, "\r\n") orelse {
+        const line_end = std.mem.findPos(u8, data, pos, "\r\n") orelse {
             return error.IncompleteHeaders;
         };
 
@@ -151,7 +151,7 @@ pub fn parseHeaders(allocator: Allocator, data: []const u8) !struct { headers: H
         }
 
         // Parse header: find the colon separator
-        const colon_pos = std.mem.indexOf(u8, line, ":") orelse {
+        const colon_pos = std.mem.find(u8, line, ":") orelse {
             return error.InvalidHeader;
         };
 

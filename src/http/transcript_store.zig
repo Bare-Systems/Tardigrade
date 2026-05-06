@@ -209,7 +209,7 @@ fn redactText(allocator: std.mem.Allocator, value: []const u8, redacted_values: 
 
     for (redacted_values) |secret| {
         if (secret.len == 0) continue;
-        if (std.mem.indexOf(u8, out, secret) == null) continue;
+        if (std.mem.find(u8, out, secret) == null) continue;
         const replaced = try std.mem.replaceOwned(u8, allocator, out, secret, "[REDACTED]");
         allocator.free(out);
         out = replaced;
@@ -293,7 +293,7 @@ test "transcript store appends ndjson records" {
 
     const contents = try compat.cwd().readFileAlloc(allocator, path, 1024 * 1024);
     defer allocator.free(contents);
-    try std.testing.expect(std.mem.indexOf(u8, contents, "\"scope\":\"chat\"") != null);
+    try std.testing.expect(std.mem.find(u8, contents, "\"scope\":\"chat\"") != null);
     try std.testing.expect(std.mem.endsWith(u8, contents, "\n"));
 }
 
@@ -323,9 +323,9 @@ test "transcript store redacts explicit bearer values and jwt-looking tokens" {
 
     const contents = try compat.cwd().readFileAlloc(allocator, path, 1024 * 1024);
     defer allocator.free(contents);
-    try std.testing.expect(std.mem.indexOf(u8, contents, "opaque-secret") == null);
-    try std.testing.expect(std.mem.indexOf(u8, contents, jwt) == null);
-    try std.testing.expect(std.mem.indexOf(u8, contents, "[REDACTED]") != null);
+    try std.testing.expect(std.mem.find(u8, contents, "opaque-secret") == null);
+    try std.testing.expect(std.mem.find(u8, contents, jwt) == null);
+    try std.testing.expect(std.mem.find(u8, contents, "[REDACTED]") != null);
 }
 
 test "transcript store writes owner-only file permissions when supported" {

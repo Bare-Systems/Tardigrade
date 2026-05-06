@@ -36,9 +36,9 @@ test "static file large streaming sends full body" {
 
     try main.serveFileContent(allocator, &req, file_name, stream.writer(), false, false, true, null);
     const output = stream.getWritten();
-    try std.testing.expect(std.mem.indexOf(u8, output, "200 OK") != null);
+    try std.testing.expect(std.mem.find(u8, output, "200 OK") != null);
 
-    const sep = std.mem.indexOf(u8, output, "\r\n\r\n") orelse @panic("no header-body separator");
+    const sep = std.mem.find(u8, output, "\r\n\r\n") orelse @panic("no header-body separator");
     const body = output[sep + 4 ..];
     try std.testing.expectEqual(file_size, body.len);
     // spot-check first bytes
@@ -75,10 +75,10 @@ test "static file If-None-Match returns 304 Not Modified" {
 
     try main.serveFileContent(allocator, &req, file_name, stream.writer(), false, false, true, null);
     const output = stream.getWritten();
-    try std.testing.expect(std.mem.indexOf(u8, output, "304 Not Modified") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "\r\n\r\n") == std.mem.indexOf(u8, output, "\r\n\r\n"));
+    try std.testing.expect(std.mem.find(u8, output, "304 Not Modified") != null);
+    try std.testing.expect(std.mem.find(u8, output, "\r\n\r\n") == std.mem.find(u8, output, "\r\n\r\n"));
     // ensure no body content after separator
-    const sep = std.mem.indexOf(u8, output, "\r\n\r\n") orelse @panic("no header-body separator");
+    const sep = std.mem.find(u8, output, "\r\n\r\n") orelse @panic("no header-body separator");
     const body = output[sep + 4 ..];
     try std.testing.expectEqual(0, body.len);
 }

@@ -99,12 +99,12 @@ pub const CachePolicy = struct {
 /// Choose a cache policy based on Content-Type / MIME type.
 pub fn policyForMimeType(mime: []const u8) CachePolicy {
     // Immutable fingerprinted assets
-    if (std.mem.indexOf(u8, mime, "font/") != null) {
+    if (std.mem.find(u8, mime, "font/") != null) {
         return CachePolicy.static_immutable;
     }
 
     // Long-cache static assets
-    if (std.mem.indexOf(u8, mime, "image/") != null) {
+    if (std.mem.find(u8, mime, "image/") != null) {
         return .{ .public = true, .max_age = 86_400 }; // 1 day
     }
     if (endsWith(mime, "/css") or endsWith(mime, "/javascript") or endsWith(mime, "/js")) {
@@ -112,12 +112,12 @@ pub fn policyForMimeType(mime: []const u8) CachePolicy {
     }
 
     // HTML — short cache with revalidation
-    if (std.mem.indexOf(u8, mime, "text/html") != null) {
+    if (std.mem.find(u8, mime, "text/html") != null) {
         return .{ .public = true, .max_age = 300, .must_revalidate = true }; // 5 min
     }
 
     // API / JSON
-    if (std.mem.indexOf(u8, mime, "application/json") != null) {
+    if (std.mem.find(u8, mime, "application/json") != null) {
         return CachePolicy.api_default;
     }
 
@@ -167,24 +167,24 @@ test "CachePolicy.format empty policy" {
 test "CachePolicy.format no_caching preset" {
     var buf: [256]u8 = undefined;
     const result = CachePolicy.no_caching.format(&buf);
-    try std.testing.expect(std.mem.indexOf(u8, result, "no-cache") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "no-store") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "must-revalidate") != null);
+    try std.testing.expect(std.mem.find(u8, result, "no-cache") != null);
+    try std.testing.expect(std.mem.find(u8, result, "no-store") != null);
+    try std.testing.expect(std.mem.find(u8, result, "must-revalidate") != null);
 }
 
 test "CachePolicy.format static_immutable preset" {
     var buf: [256]u8 = undefined;
     const result = CachePolicy.static_immutable.format(&buf);
-    try std.testing.expect(std.mem.indexOf(u8, result, "public") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "immutable") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "max-age=31536000") != null);
+    try std.testing.expect(std.mem.find(u8, result, "public") != null);
+    try std.testing.expect(std.mem.find(u8, result, "immutable") != null);
+    try std.testing.expect(std.mem.find(u8, result, "max-age=31536000") != null);
 }
 
 test "CachePolicy.format static_default preset" {
     var buf: [256]u8 = undefined;
     const result = CachePolicy.static_default.format(&buf);
-    try std.testing.expect(std.mem.indexOf(u8, result, "public") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "max-age=3600") != null);
+    try std.testing.expect(std.mem.find(u8, result, "public") != null);
+    try std.testing.expect(std.mem.find(u8, result, "max-age=3600") != null);
 }
 
 test "CachePolicy.format custom policy" {
@@ -195,11 +195,11 @@ test "CachePolicy.format custom policy" {
     };
     var buf: [256]u8 = undefined;
     const result = policy.format(&buf);
-    try std.testing.expect(std.mem.indexOf(u8, result, "private") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "must-revalidate") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "max-age=600") != null);
+    try std.testing.expect(std.mem.find(u8, result, "private") != null);
+    try std.testing.expect(std.mem.find(u8, result, "must-revalidate") != null);
+    try std.testing.expect(std.mem.find(u8, result, "max-age=600") != null);
     // Should not contain public
-    try std.testing.expect(std.mem.indexOf(u8, result, "public") == null);
+    try std.testing.expect(std.mem.find(u8, result, "public") == null);
 }
 
 test "policyForMimeType returns correct policies" {
@@ -243,18 +243,18 @@ test "CachePolicy.apply sets headers" {
     // Check Cache-Control header was set
     const cc = response.headers.get("Cache-Control");
     try std.testing.expect(cc != null);
-    try std.testing.expect(std.mem.indexOf(u8, cc.?, "public") != null);
-    try std.testing.expect(std.mem.indexOf(u8, cc.?, "max-age=3600") != null);
+    try std.testing.expect(std.mem.find(u8, cc.?, "public") != null);
+    try std.testing.expect(std.mem.find(u8, cc.?, "max-age=3600") != null);
 
     // Check Expires header was set
     const exp = response.headers.get("Expires");
     try std.testing.expect(exp != null);
-    try std.testing.expect(std.mem.indexOf(u8, exp.?, "GMT") != null);
+    try std.testing.expect(std.mem.find(u8, exp.?, "GMT") != null);
 }
 
 test "formatExpires produces valid HTTP date" {
     var buf: [40]u8 = undefined;
     const result = formatExpires(3600, &buf);
-    try std.testing.expect(std.mem.indexOf(u8, result, "GMT") != null);
+    try std.testing.expect(std.mem.find(u8, result, "GMT") != null);
     try std.testing.expect(result.len >= 25);
 }

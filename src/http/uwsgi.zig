@@ -145,8 +145,8 @@ pub fn parseResponse(allocator: std.mem.Allocator, raw: []const u8) !Response {
 }
 
 fn parseHttpResponse(allocator: std.mem.Allocator, raw: []const u8) !Response {
-    const header_end = std.mem.indexOf(u8, raw, "\r\n\r\n") orelse return error.InvalidResponse;
-    const status_end = std.mem.indexOf(u8, raw, "\r\n") orelse return error.InvalidResponse;
+    const header_end = std.mem.find(u8, raw, "\r\n\r\n") orelse return error.InvalidResponse;
+    const status_end = std.mem.find(u8, raw, "\r\n") orelse return error.InvalidResponse;
     const status_line = raw[0..status_end];
     var parts = std.mem.splitScalar(u8, status_line, ' ');
     _ = parts.next() orelse return error.InvalidResponse;
@@ -181,9 +181,9 @@ fn decodeChunkedBody(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
     errdefer out.deinit(allocator);
     var pos: usize = 0;
     while (pos < raw.len) {
-        const line_end = std.mem.indexOfPos(u8, raw, pos, "\r\n") orelse return error.InvalidChunkedResponse;
+        const line_end = std.mem.findPos(u8, raw, pos, "\r\n") orelse return error.InvalidChunkedResponse;
         const size_text = std.mem.trim(u8, raw[pos..line_end], " \t");
-        const semi = std.mem.indexOfScalar(u8, size_text, ';') orelse size_text.len;
+        const semi = std.mem.findScalar(u8, size_text, ';') orelse size_text.len;
         const chunk_size = std.fmt.parseInt(usize, size_text[0..semi], 16) catch return error.InvalidChunkedResponse;
         pos = line_end + 2;
         if (chunk_size == 0) {
@@ -220,8 +220,8 @@ const HeaderSplit = struct {
 };
 
 fn headerBodySplit(data: []const u8) ?HeaderSplit {
-    if (std.mem.indexOf(u8, data, "\r\n\r\n")) |idx| return .{ .headers_end = idx + 2, .body_start = idx + 4 };
-    if (std.mem.indexOf(u8, data, "\n\n")) |idx| return .{ .headers_end = idx + 1, .body_start = idx + 2 };
+    if (std.mem.find(u8, data, "\r\n\r\n")) |idx| return .{ .headers_end = idx + 2, .body_start = idx + 4 };
+    if (std.mem.find(u8, data, "\n\n")) |idx| return .{ .headers_end = idx + 1, .body_start = idx + 2 };
     return null;
 }
 
@@ -254,7 +254,7 @@ fn normalizeHeaderBlock(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
 fn parseStatus(raw: []const u8) u16 {
     const trimmed = std.mem.trim(u8, raw, " \t");
     if (trimmed.len == 0) return 200;
-    const end = std.mem.indexOfScalar(u8, trimmed, ' ') orelse trimmed.len;
+    const end = std.mem.findScalar(u8, trimmed, ' ') orelse trimmed.len;
     return std.fmt.parseInt(u16, trimmed[0..end], 10) catch 200;
 }
 
@@ -303,8 +303,8 @@ test "buildPacket writes uwsgi header and vars" {
     defer allocator.free(pkt);
     try std.testing.expect(pkt.len > 12);
     try std.testing.expectEqual(@as(u8, 0), pkt[0]);
-    try std.testing.expect(std.mem.indexOf(u8, pkt, "REQUEST_METHODPOST") != null);
-    try std.testing.expect(std.mem.indexOf(u8, pkt, "HTTP_X_CORRELATION_IDreq-123") != null);
+    try std.testing.expect(std.mem.find(u8, pkt, "REQUEST_METHODPOST") != null);
+    try std.testing.expect(std.mem.find(u8, pkt, "HTTP_X_CORRELATION_IDreq-123") != null);
 }
 
 test "parseResponse handles http status line response" {

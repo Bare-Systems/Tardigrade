@@ -313,7 +313,7 @@ fn preparePattern(allocator: std.mem.Allocator, pattern: []const u8) !PreparedPa
 
         if (!in_class and std.mem.startsWith(u8, pattern[i..], "(?P<")) {
             const name_start = i + "(?P<".len;
-            const name_end = std.mem.indexOfScalarPos(u8, pattern, name_start, '>') orelse return error.InvalidNamedCapture;
+            const name_end = std.mem.findScalarPos(u8, pattern, name_start, '>') orelse return error.InvalidNamedCapture;
             capture_index += 1;
             try named.append(allocator, .{
                 .name = try allocator.dupe(u8, pattern[name_start..name_end]),

@@ -21,8 +21,8 @@ test "static file Accept-Encoding identity" {
     var stream = compat.fixedBufferStream(&buf);
     try main.serveFileContent(allocator, &req, file_name, stream.writer(), false, false, true, null);
     const output = stream.getWritten();
-    try std.testing.expect(std.mem.indexOf(u8, output, "200 OK") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "Content-Encoding") == null or std.mem.indexOf(u8, output, "identity") != null);
+    try std.testing.expect(std.mem.find(u8, output, "200 OK") != null);
+    try std.testing.expect(std.mem.find(u8, output, "Content-Encoding") == null or std.mem.find(u8, output, "identity") != null);
 }
 
 // Test Accept-Encoding: br (should 406)
@@ -43,7 +43,7 @@ test "static file Accept-Encoding br returns 406" {
     var stream = compat.fixedBufferStream(&buf);
     try main.serveFileContent(allocator, &req, file_name, stream.writer(), false, false, true, null);
     const output = stream.getWritten();
-    try std.testing.expect(std.mem.indexOf(u8, output, "406 Not Acceptable") != null);
+    try std.testing.expect(std.mem.find(u8, output, "406 Not Acceptable") != null);
 }
 
 // Test Accept-Encoding: gzip, identity (should succeed as identity)
@@ -64,8 +64,8 @@ test "static file Accept-Encoding gzip, identity" {
     var stream = compat.fixedBufferStream(&buf);
     try main.serveFileContent(allocator, &req, file_name, stream.writer(), false, false, true, null);
     const output = stream.getWritten();
-    try std.testing.expect(std.mem.indexOf(u8, output, "200 OK") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "Content-Encoding") == null or std.mem.indexOf(u8, output, "identity") != null);
+    try std.testing.expect(std.mem.find(u8, output, "200 OK") != null);
+    try std.testing.expect(std.mem.find(u8, output, "Content-Encoding") == null or std.mem.find(u8, output, "identity") != null);
 }
 
 test "serveFileContent echoes valid X-Correlation-ID from request" {
@@ -86,7 +86,7 @@ test "serveFileContent echoes valid X-Correlation-ID from request" {
     try main.serveFileContent(allocator, &req, file_name, stream.writer(), false, false, true, null);
 
     const output = stream.getWritten();
-    try std.testing.expect(std.mem.indexOf(u8, output, "x-correlation-id: req-abc-123\r\n") != null);
+    try std.testing.expect(std.mem.find(u8, output, "x-correlation-id: req-abc-123\r\n") != null);
 }
 
 test "serveFileContent generates X-Correlation-ID when missing or invalid" {
@@ -108,9 +108,9 @@ test "serveFileContent generates X-Correlation-ID when missing or invalid" {
 
     const output = stream.getWritten();
     const marker = "x-correlation-id: ";
-    const start = std.mem.indexOf(u8, output, marker) orelse return error.TestUnexpectedResult;
+    const start = std.mem.find(u8, output, marker) orelse return error.TestUnexpectedResult;
     const rest = output[start + marker.len ..];
-    const end = std.mem.indexOf(u8, rest, "\r\n") orelse return error.TestUnexpectedResult;
+    const end = std.mem.find(u8, rest, "\r\n") orelse return error.TestUnexpectedResult;
     const generated = rest[0..end];
 
     try std.testing.expect(generated.len > 0);

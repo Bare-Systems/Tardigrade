@@ -10,5 +10,5 @@ pub fn matchesIfNoneMatch(etag: []const u8, header: []const u8) bool {
     // If header is '*', it always matches
     if (std.mem.eql(u8, std.mem.trim(u8, header, " \t"), "*")) return true;
     // Simple substring match handles lists like '"a","b"'
-    return std.mem.indexOf(u8, header, etag) != null;
+    return std.mem.find(u8, header, etag) != null;
 }

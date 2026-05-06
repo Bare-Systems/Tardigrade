@@ -400,10 +400,10 @@ const HeaderSplit = struct {
 };
 
 fn headerBodySplit(data: []const u8) ?HeaderSplit {
-    if (std.mem.indexOf(u8, data, "\r\n\r\n")) |idx| {
+    if (std.mem.find(u8, data, "\r\n\r\n")) |idx| {
         return .{ .headers_end = idx + 2, .body_start = idx + 4 };
     }
-    if (std.mem.indexOf(u8, data, "\n\n")) |idx| {
+    if (std.mem.find(u8, data, "\n\n")) |idx| {
         return .{ .headers_end = idx + 1, .body_start = idx + 2 };
     }
     return null;
@@ -444,7 +444,7 @@ fn parseStatus(raw: []const u8) !u16 {
     if (raw.len == 0) return 200;
     const trimmed = std.mem.trim(u8, raw, " \t");
     if (trimmed.len == 0) return 200;
-    const end = std.mem.indexOfScalar(u8, trimmed, ' ') orelse trimmed.len;
+    const end = std.mem.findScalar(u8, trimmed, ' ') orelse trimmed.len;
     return std.fmt.parseInt(u16, trimmed[0..end], 10) catch error.InvalidStatusHeader;
 }
 
@@ -465,10 +465,10 @@ test "buildRequestWithOptions emits known-good fcgi layout" {
 
     try std.testing.expectEqual(@as(u8, version_1), req[0]);
     try std.testing.expectEqual(@as(u8, @intFromEnum(RecordType.begin_request)), req[1]);
-    try std.testing.expect(std.mem.indexOf(u8, req, "REQUEST_METHODPOST") != null);
-    try std.testing.expect(std.mem.indexOf(u8, req, "SCRIPT_FILENAME/srv/app.php") != null);
-    try std.testing.expect(std.mem.indexOf(u8, req, "QUERY_STRINGname=tardi") != null);
-    try std.testing.expect(std.mem.indexOf(u8, req, "CONTENT_TYPEapplication/json") != null);
+    try std.testing.expect(std.mem.find(u8, req, "REQUEST_METHODPOST") != null);
+    try std.testing.expect(std.mem.find(u8, req, "SCRIPT_FILENAME/srv/app.php") != null);
+    try std.testing.expect(std.mem.find(u8, req, "QUERY_STRINGname=tardi") != null);
+    try std.testing.expect(std.mem.find(u8, req, "CONTENT_TYPEapplication/json") != null);
 }
 
 test "parseResponse splits headers and body across stdout records" {
@@ -535,6 +535,6 @@ test "buildRequest preserves incoming headers as HTTP_* env vars" {
     }, "");
     defer allocator.free(req);
 
-    try std.testing.expect(std.mem.indexOf(u8, req, "HTTP_HOSTexample.test") != null);
-    try std.testing.expect(std.mem.indexOf(u8, req, "HTTP_X_CORRELATION_IDreq-123") != null);
+    try std.testing.expect(std.mem.find(u8, req, "HTTP_HOSTexample.test") != null);
+    try std.testing.expect(std.mem.find(u8, req, "HTTP_X_CORRELATION_IDreq-123") != null);
 }

@@ -1018,7 +1018,7 @@ fn prepareBearClawFixture(
     while (lines.next()) |line_raw| {
         const line = std.mem.trim(u8, line_raw, " \t\r");
         if (line.len == 0 or line[0] == '#') continue;
-        const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        const eq = std.mem.findScalar(u8, line, '=') orelse continue;
         const key = std.mem.trim(u8, line[0..eq], " \t");
         const value = std.mem.trim(u8, line[eq + 1 ..], " \t");
         if (key.len == 0) continue;
@@ -1185,7 +1185,7 @@ fn waitUntilChildReady(child: *std.process.Child) !void {
     var buf: [64]u8 = undefined;
     const n = try stdout.read(&buf);
     if (n == 0) return error.EndOfStream;
-    if (std.mem.indexOf(u8, buf[0..n], "READY") == null) return error.Unexpected;
+    if (std.mem.find(u8, buf[0..n], "READY") == null) return error.Unexpected;
 }
 
 const RawHttpMessage = struct {
@@ -1438,7 +1438,7 @@ fn readHttpMessage(allocator: std.mem.Allocator, stream: std.net.Stream, max_byt
         if (buf.items.len > max_bytes) return error.MessageTooLarge;
 
         if (header_end == null) {
-            if (std.mem.indexOf(u8, buf.items, "\r\n\r\n")) |idx| {
+            if (std.mem.find(u8, buf.items, "\r\n\r\n")) |idx| {
                 header_end = idx + 4;
                 content_length = parseContentLength(buf.items[0..idx]);
             }
@@ -1449,8 +1449,8 @@ fn readHttpMessage(allocator: std.mem.Allocator, stream: std.net.Stream, max_byt
     }
 
     const raw = try buf.toOwnedSlice();
-    const split_idx = std.mem.indexOf(u8, raw, "\r\n\r\n") orelse return error.InvalidHttpMessage;
-    const request_line_end = std.mem.indexOf(u8, raw, "\r\n") orelse return error.InvalidHttpMessage;
+    const split_idx = std.mem.find(u8, raw, "\r\n\r\n") orelse return error.InvalidHttpMessage;
+    const request_line_end = std.mem.find(u8, raw, "\r\n") orelse return error.InvalidHttpMessage;
     const headers_raw = raw[0 .. split_idx + 2];
     const body_start = split_idx + 4;
     return .{
@@ -1537,7 +1537,7 @@ fn uwsgiContentLength(vars: []const u8) usize {
 }
 
 fn scgiRequestComplete(data: []const u8) bool {
-    const colon = std.mem.indexOfScalar(u8, data, ':') orelse return false;
+    const colon = std.mem.findScalar(u8, data, ':') orelse return false;
     const net_len = std.fmt.parseInt(usize, data[0..colon], 10) catch return false;
     const headers_end = colon + 1 + net_len;
     if (headers_end >= data.len or data[headers_end] != ',') return false;
@@ -1549,10 +1549,10 @@ fn scgiRequestComplete(data: []const u8) bool {
 fn scgiContentLength(header_blob: []const u8) usize {
     var i: usize = 0;
     while (i < header_blob.len) {
-        const key_end_rel = std.mem.indexOfScalarPos(u8, header_blob, i, 0) orelse break;
+        const key_end_rel = std.mem.findScalarPos(u8, header_blob, i, 0) orelse break;
         const key = header_blob[i..key_end_rel];
         const value_start = key_end_rel + 1;
-        const value_end_rel = std.mem.indexOfScalarPos(u8, header_blob, value_start, 0) orelse break;
+        const value_end_rel = std.mem.findScalarPos(u8, header_blob, value_start, 0) orelse break;
         const value = header_blob[value_start..value_end_rel];
         if (std.mem.eql(u8, key, "CONTENT_LENGTH")) {
             return std.fmt.parseInt(usize, value, 10) catch 0;
@@ -1639,7 +1639,7 @@ fn headerValue(headers_raw: []const u8, name: []const u8) ?[]const u8 {
     _ = lines.next();
     while (lines.next()) |line| {
         if (line.len == 0) break;
-        const sep = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const sep = std.mem.findScalar(u8, line, ':') orelse continue;
         const key = std.mem.trim(u8, line[0..sep], " \t");
         if (!std.ascii.eqlIgnoreCase(key, name)) continue;
         return std.mem.trim(u8, line[sep + 1 ..], " \t");
@@ -1648,7 +1648,7 @@ fn headerValue(headers_raw: []const u8, name: []const u8) ?[]const u8 {
 }
 
 fn cookiePairFromSetCookie(set_cookie: []const u8) []const u8 {
-    const end = std.mem.indexOfScalar(u8, set_cookie, ';') orelse set_cookie.len;
+    const end = std.mem.findScalar(u8, set_cookie, ';') orelse set_cookie.len;
     return std.mem.trim(u8, set_cookie[0..end], " \t\r\n");
 }
 
@@ -1756,7 +1756,7 @@ fn readHttpResponse(allocator: std.mem.Allocator, stream: std.net.Stream) !HttpR
         try raw_buf.appendSlice(tmp[0..n]);
 
         if (header_end == null) {
-            if (std.mem.indexOf(u8, raw_buf.items, "\r\n\r\n")) |idx| {
+            if (std.mem.find(u8, raw_buf.items, "\r\n\r\n")) |idx| {
                 header_end = idx;
                 const headers_raw = raw_buf.items[0 .. idx + 2];
                 if (headerValue(headers_raw, "Content-Length")) |content_length_raw| {
@@ -1769,8 +1769,8 @@ fn readHttpResponse(allocator: std.mem.Allocator, stream: std.net.Stream) !HttpR
 
     const raw = try raw_buf.toOwnedSlice();
     errdefer allocator.free(raw);
-    const final_header_end = header_end orelse std.mem.indexOf(u8, raw, "\r\n\r\n") orelse return error.InvalidHttpResponse;
-    const status_end = std.mem.indexOf(u8, raw, "\r\n") orelse return error.InvalidHttpResponse;
+    const final_header_end = header_end orelse std.mem.find(u8, raw, "\r\n\r\n") orelse return error.InvalidHttpResponse;
+    const status_end = std.mem.find(u8, raw, "\r\n") orelse return error.InvalidHttpResponse;
     const status_line = raw[0..status_end];
     var parts = std.mem.splitScalar(u8, status_line, ' ');
     _ = parts.next() orelse return error.InvalidHttpResponse;
@@ -1794,7 +1794,7 @@ fn readHttpHeadersOnly(allocator: std.mem.Allocator, stream: std.net.Stream) ![]
         const n = try stream.read(&tmp);
         if (n == 0) return error.InvalidHttpResponse;
         try raw_buf.appendSlice(tmp[0..n]);
-        if (std.mem.indexOf(u8, raw_buf.items, "\r\n\r\n") != null) break;
+        if (std.mem.find(u8, raw_buf.items, "\r\n\r\n") != null) break;
     }
     return raw_buf.toOwnedSlice();
 }
@@ -2081,8 +2081,8 @@ fn sendCurlRequest(allocator: std.mem.Allocator, port: u16, spec: CurlRequestSpe
         .allocator = allocator,
         .raw = result.stdout,
         .status_code = try parseStatusCode(result.stdout),
-        .headers_raw = result.stdout[0 .. (std.mem.indexOf(u8, result.stdout, "\r\n\r\n") orelse return error.InvalidHttpResponse) + 2],
-        .body = result.stdout[(std.mem.indexOf(u8, result.stdout, "\r\n\r\n") orelse return error.InvalidHttpResponse) + 4 ..],
+        .headers_raw = result.stdout[0 .. (std.mem.find(u8, result.stdout, "\r\n\r\n") orelse return error.InvalidHttpResponse) + 2],
+        .body = result.stdout[(std.mem.find(u8, result.stdout, "\r\n\r\n") orelse return error.InvalidHttpResponse) + 4 ..],
     };
 }
 
@@ -2138,7 +2138,7 @@ fn opensslPresentedSubject(allocator: std.mem.Allocator, port: u16, servername: 
 }
 
 fn parseStatusCode(raw: []const u8) !u16 {
-    const status_end = std.mem.indexOf(u8, raw, "\r\n") orelse return error.InvalidHttpResponse;
+    const status_end = std.mem.find(u8, raw, "\r\n") orelse return error.InvalidHttpResponse;
     const status_line = raw[0..status_end];
     var parts = std.mem.splitScalar(u8, status_line, ' ');
     _ = parts.next() orelse return error.InvalidHttpResponse;
@@ -2188,7 +2188,7 @@ fn waitForLogSubstring(allocator: std.mem.Allocator, path: []const u8, needle: [
             break :blk try std.fs.cwd().readFileAlloc(allocator, path, 256 * 1024);
         };
         defer allocator.free(contents);
-        if (std.mem.indexOf(u8, contents, needle) != null) return;
+        if (std.mem.find(u8, contents, needle) != null) return;
         std.time.sleep(25 * std.time.ns_per_ms);
     }
     return error.Timeout;
@@ -2255,7 +2255,7 @@ fn jsonU64Field(allocator: std.mem.Allocator, body: []const u8, key: []const u8)
 }
 
 fn assertContains(haystack: []const u8, needle: []const u8) !void {
-    try std.testing.expect(std.mem.indexOf(u8, haystack, needle) != null);
+    try std.testing.expect(std.mem.find(u8, haystack, needle) != null);
 }
 
 fn waitForBodyContains(allocator: std.mem.Allocator, port: u16, path: []const u8, headers: []const RequestHeader, needle: []const u8, timeout_ms: u64) !void {
@@ -2271,7 +2271,7 @@ fn waitForBodyContains(allocator: std.mem.Allocator, port: u16, path: []const u8
             continue;
         };
         defer response.deinit();
-        if (std.mem.indexOf(u8, response.body, needle) != null) return;
+        if (std.mem.find(u8, response.body, needle) != null) return;
         std.time.sleep(50 * std.time.ns_per_ms);
     }
     return error.Timeout;
@@ -2281,7 +2281,7 @@ fn waitForWebSocketFrameContains(ws: *WebSocketClient, allocator: std.mem.Alloca
     var remaining = attempts;
     while (remaining > 0) : (remaining -= 1) {
         var frame = try ws.readFrame(allocator, 8192);
-        if (std.mem.indexOf(u8, frame.payload, needle) != null) return frame;
+        if (std.mem.find(u8, frame.payload, needle) != null) return frame;
         frame.deinit(allocator);
     }
     return error.Timeout;
@@ -2302,7 +2302,7 @@ fn waitForHttp3Configured(port: u16, timeout_ms: u64) !void {
             return err;
         };
         defer response.deinit();
-        if (response.status_code == 200 and std.mem.indexOf(u8, response.body, "\"http3_status\":\"configured\"") != null) return;
+        if (response.status_code == 200 and std.mem.find(u8, response.body, "\"http3_status\":\"configured\"") != null) return;
         std.time.sleep(100 * std.time.ns_per_ms);
     }
     return error.Timeout;
@@ -2391,7 +2391,7 @@ fn concurrentChatRequestMain(ctx: *ConcurrentRequestContext) void {
     };
     defer response.deinit();
     ctx.result.status_code = response.status_code;
-    ctx.result.body_contains_ok = std.mem.indexOf(u8, response.body, "\"ok\":true") != null;
+    ctx.result.body_contains_ok = std.mem.find(u8, response.body, "\"ok\":true") != null;
 }
 
 fn concurrentAuthRateRequestMain(ctx: *ConcurrentAuthRateContext) void {
@@ -2413,7 +2413,7 @@ fn concurrentAuthRateRequestMain(ctx: *ConcurrentAuthRateContext) void {
     };
     defer response.deinit();
     ctx.result.status_code = response.status_code;
-    ctx.result.body_contains_ok = std.mem.indexOf(u8, response.body, "\"ok\":true") != null;
+    ctx.result.body_contains_ok = std.mem.find(u8, response.body, "\"ok\":true") != null;
 }
 
 test "core gateway integration covers health metrics auth proxying invalid json and correlation ids" {
@@ -2455,7 +2455,7 @@ test "prometheus metrics endpoint exposes counters and can require auth" {
     });
     defer metrics_before.deinit();
     try std.testing.expectEqual(@as(u16, 200), metrics_before.status_code);
-    try std.testing.expect(std.mem.indexOf(u8, metrics_before.body, "# TYPE tardigrade_requests_total counter") != null);
+    try std.testing.expect(std.mem.find(u8, metrics_before.body, "# TYPE tardigrade_requests_total counter") != null);
     const requests_before = prometheusMetricValue(metrics_before.body, "tardigrade_requests_total") orelse return error.InvalidHttpResponse;
     const status_2xx_before = prometheusMetricValue(metrics_before.body, "tardigrade_requests_2xx_total") orelse return error.InvalidHttpResponse;
 
@@ -2508,7 +2508,7 @@ test "prometheus metrics endpoint exposes counters and can require auth" {
     });
     defer authorized.deinit();
     try std.testing.expectEqual(@as(u16, 200), authorized.status_code);
-    try std.testing.expect(std.mem.indexOf(u8, authorized.body, "tardigrade_requests_total") != null);
+    try std.testing.expect(std.mem.find(u8, authorized.body, "tardigrade_requests_total") != null);
 }
 
 test "bearclaw fixture serves chat over https with bearer auth and transcript persistence" {
@@ -2564,7 +2564,7 @@ test "bearclaw fixture serves chat over https with bearer auth and transcript pe
     defer allocator.free(transcript);
     try assertContains(transcript, "\"scope\":\"chat\"");
     try assertContains(transcript, "\"route\":\"/v1/chat\"");
-    try std.testing.expect(std.mem.indexOf(u8, transcript, valid_bearer_token) == null);
+    try std.testing.expect(std.mem.find(u8, transcript, valid_bearer_token) == null);
 
     var transcript_list = try sendCurlRequest(allocator, tardigrade.port, .{
         .scheme = "https",
@@ -3083,7 +3083,7 @@ test "proxy requests preserve safe request ids and structured access logs includ
     const replaced_request_id = replaced.header("X-Request-ID") orelse return error.InvalidHttpResponse;
     try std.testing.expect(replaced_request_id.len > 0);
     try std.testing.expect(!std.mem.eql(u8, replaced_request_id, "bad id"));
-    try std.testing.expect(std.mem.indexOfScalar(u8, replaced_request_id, ' ') == null);
+    try std.testing.expect(std.mem.findScalar(u8, replaced_request_id, ' ') == null);
     try std.testing.expectEqualStrings(replaced_request_id, replaced.header("X-Correlation-ID").?);
     try std.testing.expectEqualStrings(replaced_request_id, upstream.capturedHeader("X-Request-ID").?);
     try std.testing.expectEqualStrings(replaced_request_id, upstream.capturedHeader("X-Correlation-ID").?);
@@ -3135,9 +3135,9 @@ test "sticky affinity cookie pins relative proxy_pass upstream and sets secure d
     defer first_response.deinit();
     try std.testing.expectEqual(@as(u16, 200), first_response.status_code);
     const set_cookie = first_response.header("Set-Cookie") orelse return error.MissingSetCookie;
-    try std.testing.expect(std.mem.indexOf(u8, set_cookie, "HttpOnly") != null);
-    try std.testing.expect(std.mem.indexOf(u8, set_cookie, "Secure") != null);
-    try std.testing.expect(std.mem.indexOf(u8, set_cookie, "SameSite=Lax") != null);
+    try std.testing.expect(std.mem.find(u8, set_cookie, "HttpOnly") != null);
+    try std.testing.expect(std.mem.find(u8, set_cookie, "Secure") != null);
+    try std.testing.expect(std.mem.find(u8, set_cookie, "SameSite=Lax") != null);
 
     var second_response = try sendRequest(allocator, tardigrade.port, .{
         .method = "GET",

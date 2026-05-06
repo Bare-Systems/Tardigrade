@@ -44,7 +44,7 @@ pub fn parseBasicCredentials(header_value: []const u8, out_buf: []u8) BasicAuthE
     const decoded = out_buf[0..decoded_len];
 
     // Split on first ':'
-    const colon = std.mem.indexOfScalar(u8, decoded, ':') orelse return error.MalformedCredentials;
+    const colon = std.mem.findScalar(u8, decoded, ':') orelse return error.MalformedCredentials;
     if (colon == 0) return error.MalformedCredentials;
 
     return .{

@@ -5,9 +5,9 @@ fn parseUrl(url: []const u8) !struct { host: []const u8, port: []const u8 } {
     const prefix = "https://";
     if (!std.mem.startsWith(u8, url, prefix)) return error.InvalidUrl;
     const rest = url[prefix.len..];
-    const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return error.InvalidUrl;
+    const slash = std.mem.findScalar(u8, rest, '/') orelse return error.InvalidUrl;
     const authority = rest[0..slash];
-    const colon = std.mem.lastIndexOfScalar(u8, authority, ':') orelse return error.InvalidUrl;
+    const colon = std.mem.findScalarLast(u8, authority, ':') orelse return error.InvalidUrl;
     return .{
         .host = authority[0..colon],
         .port = authority[colon + 1 ..],
@@ -16,16 +16,16 @@ fn parseUrl(url: []const u8) !struct { host: []const u8, port: []const u8 } {
 
 fn extractStatus(output: []const u8) ?u16 {
     const marker = "[:status: ";
-    const start = std.mem.indexOf(u8, output, marker) orelse return null;
+    const start = std.mem.find(u8, output, marker) orelse return null;
     const value_start = start + marker.len;
-    const value_end = std.mem.indexOfScalarPos(u8, output, value_start, ']') orelse return null;
+    const value_end = std.mem.findScalarPos(u8, output, value_start, ']') orelse return null;
     return std.fmt.parseInt(u16, output[value_start..value_end], 10) catch null;
 }
 
 fn countOccurrences(haystack: []const u8, needle: []const u8) usize {
     var count: usize = 0;
     var cursor: usize = 0;
-    while (std.mem.indexOfPos(u8, haystack, cursor, needle)) |idx| {
+    while (std.mem.findPos(u8, haystack, cursor, needle)) |idx| {
         count += 1;
         cursor = idx + needle.len;
     }

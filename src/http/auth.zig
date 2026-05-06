@@ -39,7 +39,7 @@ pub fn parseBearerToken(header_value: []const u8) ?[]const u8 {
 
     const token = std.mem.trim(u8, trimmed[BEARER_SCHEME.len + 1 ..], " \t");
     if (token.len == 0) return null;
-    if (std.mem.indexOfAny(u8, token, " \t")) |_| return null;
+    if (std.mem.findAny(u8, token, " \t")) |_| return null;
     return token;
 }
 

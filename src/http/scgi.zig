@@ -153,8 +153,8 @@ pub fn parseResponse(allocator: std.mem.Allocator, raw: []const u8) !Response {
 }
 
 fn parseHttpResponse(allocator: std.mem.Allocator, raw: []const u8) !Response {
-    const header_end = std.mem.indexOf(u8, raw, "\r\n\r\n") orelse return error.InvalidResponse;
-    const status_end = std.mem.indexOf(u8, raw, "\r\n") orelse return error.InvalidResponse;
+    const header_end = std.mem.find(u8, raw, "\r\n\r\n") orelse return error.InvalidResponse;
+    const status_end = std.mem.find(u8, raw, "\r\n") orelse return error.InvalidResponse;
     const status_line = raw[0..status_end];
 
     var parts = std.mem.splitScalar(u8, status_line, ' ');
@@ -201,10 +201,10 @@ const HeaderSplit = struct {
 };
 
 fn headerBodySplit(data: []const u8) ?HeaderSplit {
-    if (std.mem.indexOf(u8, data, "\r\n\r\n")) |idx| {
+    if (std.mem.find(u8, data, "\r\n\r\n")) |idx| {
         return .{ .headers_end = idx + 2, .body_start = idx + 4 };
     }
-    if (std.mem.indexOf(u8, data, "\n\n")) |idx| {
+    if (std.mem.find(u8, data, "\n\n")) |idx| {
         return .{ .headers_end = idx + 1, .body_start = idx + 2 };
     }
     return null;
@@ -239,7 +239,7 @@ fn normalizeHeaderBlock(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
 fn parseStatus(raw: []const u8) u16 {
     const trimmed = std.mem.trim(u8, raw, " \t");
     if (trimmed.len == 0) return 200;
-    const end = std.mem.indexOfScalar(u8, trimmed, ' ') orelse trimmed.len;
+    const end = std.mem.findScalar(u8, trimmed, ' ') orelse trimmed.len;
     return std.fmt.parseInt(u16, trimmed[0..end], 10) catch 200;
 }
 
@@ -285,10 +285,10 @@ test "buildRequest writes scgi netstring prefix and cgi env" {
         .headers = &headers,
     }, "{}");
     defer allocator.free(req);
-    try std.testing.expect(std.mem.indexOfScalar(u8, req, ':') != null);
-    try std.testing.expect(std.mem.indexOf(u8, req, "REQUEST_METHOD\x00POST\x00") != null);
-    try std.testing.expect(std.mem.indexOf(u8, req, "QUERY_STRING\x00y=1\x00") != null);
-    try std.testing.expect(std.mem.indexOf(u8, req, "HTTP_X_CORRELATION_ID\x00req-123\x00") != null);
+    try std.testing.expect(std.mem.findScalar(u8, req, ':') != null);
+    try std.testing.expect(std.mem.find(u8, req, "REQUEST_METHOD\x00POST\x00") != null);
+    try std.testing.expect(std.mem.find(u8, req, "QUERY_STRING\x00y=1\x00") != null);
+    try std.testing.expect(std.mem.find(u8, req, "HTTP_X_CORRELATION_ID\x00req-123\x00") != null);
 }
 
 test "parseResponse handles CGI-like status and body" {

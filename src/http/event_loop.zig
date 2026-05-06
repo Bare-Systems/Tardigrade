@@ -59,7 +59,7 @@ pub const EventLoop = struct {
                 .data = 0,
                 .udata = 0,
             }};
-            const ret = std.c.kevent(self.fd, &changes, @intCast(changes.len), @as([*]std.c.Kevent, @constCast(@ptrCast(&changes))), 0, null);
+            const ret = std.c.kevent(self.fd, &changes, @intCast(changes.len), @as([*]std.c.Kevent, @ptrCast(@constCast(&changes))), 0, null);
             if (ret < 0) return error.Unexpected;
         }
     }

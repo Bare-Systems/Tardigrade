@@ -3739,14 +3739,14 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
     try readExactConn(conn, preface[0..]);
     if (!std.mem.eql(u8, preface[0..], HTTP2_PREFACE)) return error.InvalidHttp2Preface;
 
-    try http.http2_frame.writeSettings(conn.writer(), &[_][2]u32{
-        .{ 0x3, 100 }, // max concurrent streams
-        .{ 0x4, 1024 * 1024 }, // initial window size
-    });
-
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
+
+    try http.http2_frame.writeSettings(allocator, conn.writer(), &[_][2]u32{
+        .{ 0x3, 100 }, // max concurrent streams
+        .{ 0x4, 1024 * 1024 }, // initial window size
+    });
     var pending = std.AutoHashMap(u31, Http2PendingStream).init(allocator);
     var stream_windows = std.AutoHashMap(u31, i32).init(allocator);
     defer stream_windows.deinit();
@@ -3959,7 +3959,7 @@ fn pushHttp2Resource(
     };
     const req_block = try http.hpack.encodeLiteralHeaderBlock(allocator, req_headers[0..]);
     defer allocator.free(req_block);
-    try http.http2_frame.writePushPromise(writer, parent_stream_id, promised_stream_id, req_block, true);
+    try http.http2_frame.writePushPromise(allocator, writer, parent_stream_id, promised_stream_id, req_block, true);
 
     const status_headers = [_]http.hpack.HeaderField{
         .{ .name = ":status", .value = "200" },

@@ -13,6 +13,7 @@ All notable user-facing changes to Tardigrade are documented here.
 - Added a configurable Prometheus metrics endpoint with optional auth gating and integration coverage for counter growth.
 
 ### Changed
+- Replaced deprecated `std.ArrayListUnmanaged` with `std.ArrayList` in config file parser; threaded explicit allocator through `http2_frame.writeSettings` and `writePushPromise` to remove hardcoded `page_allocator` usage.
 - Simplified the root docs into a smaller public-facing set: `README.md`, `AGENTS.md`, `CONTRIBUTING.md`, and the example deployment bundle.
 - Updated the benchmark runner to support explicit host and route overrides for named-vhost and proxied-route testing.
 - Pinned the repository, CI workflows, and homelab deploy build script to Zig `0.16.0` as the first step of the Zig 0.16 migration.

@@ -79,7 +79,7 @@ const LocationBlockBuilder = struct {
     rewrite_replacement: ?[]u8 = null,
     rewrite_flag: ?[]u8 = null,
     auth: ?[]u8 = null,
-    error_pages: std.ArrayListUnmanaged(ErrorPageBuilder) = .empty,
+    error_pages: std.ArrayList(ErrorPageBuilder) = .empty,
 
     fn deinit(self: *LocationBlockBuilder, allocator: std.mem.Allocator) void {
         allocator.free(self.match_type);
@@ -114,7 +114,7 @@ const ServerBlockBuilder = struct {
     upstream_base_url: ?[]u8 = null,
     proxy_pass_chat: ?[]u8 = null,
     proxy_pass_commands_prefix: ?[]u8 = null,
-    location_entries: std.ArrayListUnmanaged([]u8) = .empty,
+    location_entries: std.ArrayList([]u8) = .empty,
 
     fn deinit(self: *ServerBlockBuilder, allocator: std.mem.Allocator) void {
         if (self.server_names) |value| allocator.free(value);

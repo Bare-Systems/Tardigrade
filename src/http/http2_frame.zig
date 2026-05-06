@@ -68,14 +68,14 @@ pub fn writeFrame(writer: anytype, typ: Type, flags: u8, stream_id: u31, payload
     try writer.writeAll(payload);
 }
 
-pub fn writeSettings(writer: anytype, entries: []const [2]u32) !void {
-    var buf = std.array_list.Managed(u8).init(std.heap.page_allocator);
-    defer buf.deinit();
+pub fn writeSettings(allocator: std.mem.Allocator, writer: anytype, entries: []const [2]u32) !void {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
     for (entries) |e| {
         var raw: [6]u8 = undefined;
         std.mem.writeInt(u16, raw[0..2], @intCast(e[0]), .big);
         std.mem.writeInt(u32, raw[2..6], e[1], .big);
-        try buf.appendSlice(raw[0..]);
+        try buf.appendSlice(allocator, raw[0..]);
     }
     try writeFrame(writer, .settings, 0, 0, buf.items);
 }
@@ -102,13 +102,13 @@ pub fn writeWindowUpdate(writer: anytype, stream_id: u31, increment: u31) !void 
     try writeFrame(writer, .window_update, 0, stream_id, payload[0..]);
 }
 
-pub fn writePushPromise(writer: anytype, stream_id: u31, promised_stream_id: u31, header_block: []const u8, end_headers: bool) !void {
-    var payload = std.array_list.Managed(u8).init(std.heap.page_allocator);
-    defer payload.deinit();
+pub fn writePushPromise(allocator: std.mem.Allocator, writer: anytype, stream_id: u31, promised_stream_id: u31, header_block: []const u8, end_headers: bool) !void {
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(allocator);
     var sid: [4]u8 = undefined;
     std.mem.writeInt(u32, sid[0..4], @as(u32, promised_stream_id) & 0x7FFF_FFFF, .big);
-    try payload.appendSlice(sid[0..]);
-    try payload.appendSlice(header_block);
+    try payload.appendSlice(allocator, sid[0..]);
+    try payload.appendSlice(allocator, header_block);
     try writeFrame(writer, .push_promise, if (end_headers) Flags.END_HEADERS else 0, stream_id, payload.items);
 }
 

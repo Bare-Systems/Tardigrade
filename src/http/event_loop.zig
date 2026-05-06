@@ -20,7 +20,7 @@ pub const EventLoop = struct {
         return if (builtin.os.tag == .linux) blk: {
             const linux = std.os.linux;
             const rc = linux.epoll_create1(@intCast(linux.EPOLL.CLOEXEC));
-            if (linux.getErrno(rc) != .SUCCESS) return error.SystemResources;
+            if (linux.errno(rc) != .SUCCESS) return error.SystemResources;
             break :blk .{ .fd = @intCast(rc), .backend = .epoll };
         } else blk: {
             const fd = std.c.kqueue();
@@ -49,7 +49,7 @@ pub const EventLoop = struct {
                 .data = .{ .fd = @intCast(fd) },
             };
             const rc = linux.epoll_ctl(@intCast(self.fd), linux.EPOLL.CTL_ADD, @intCast(fd), &event);
-            if (linux.getErrno(rc) != .SUCCESS) return error.Unexpected;
+            if (linux.errno(rc) != .SUCCESS) return error.Unexpected;
         } else {
             const changes = [_]std.c.Kevent{.{
                 .ident = @intCast(fd),
@@ -78,7 +78,7 @@ pub const EventLoop = struct {
         var epoll_events: [64]linux.epoll_event = undefined;
         const cap = @min(out_events.len, epoll_events.len);
         const rc = linux.epoll_wait(@intCast(self.fd), epoll_events[0..cap].ptr, @intCast(cap), timeout_ms);
-        if (linux.getErrno(rc) != .SUCCESS) return 0;
+        if (linux.errno(rc) != .SUCCESS) return 0;
         const n: usize = @intCast(rc);
 
         for (epoll_events[0..n], 0..) |ev, idx| {

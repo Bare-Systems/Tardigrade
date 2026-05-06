@@ -13,6 +13,7 @@ All notable user-facing changes to Tardigrade are documented here.
 - Added a configurable Prometheus metrics endpoint with optional auth gating and integration coverage for counter growth.
 
 ### Changed
+- Replaced deprecated `std.fs.path.*` module access with `std.Io.Dir.path.*`; updated deprecated `std.Io.File.CreateFlags`/`OpenFlags` parameter types to `std.Io.Dir.CreateFileOptions`/`OpenFileOptions` across main.zig and filesystem helpers.
 - Replaced deprecated `std.mem.indexOf*` and `std.mem.lastIndexOf*` family with the Zig 0.16 `find*` equivalents across 33 source files (256 call sites).
 - Replaced deprecated `std.ArrayListUnmanaged` with `std.ArrayList` in config file parser; threaded explicit allocator through `http2_frame.writeSettings` and `writePushPromise` to remove hardcoded `page_allocator` usage.
 - Simplified the root docs into a smaller public-facing set: `README.md`, `AGENTS.md`, `CONTRIBUTING.md`, and the example deployment bundle.

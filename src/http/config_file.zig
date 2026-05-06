@@ -968,13 +968,13 @@ fn interpolate(allocator: std.mem.Allocator, raw: []const u8, vars: *std.StringH
 }
 
 fn resolveIncludePath(allocator: std.mem.Allocator, current_file: []const u8, include_path: []const u8) ![]u8 {
-    if (std.fs.path.isAbsolute(include_path)) return allocator.dupe(u8, include_path);
-    const dir = std.fs.path.dirname(current_file) orelse ".";
+    if (std.Io.Dir.path.isAbsolute(include_path)) return allocator.dupe(u8, include_path);
+    const dir = std.Io.Dir.path.dirname(current_file) orelse ".";
     return std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, include_path });
 }
 
 fn normalizePath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    if (std.fs.path.isAbsolute(path)) return allocator.dupe(u8, path);
+    if (std.Io.Dir.path.isAbsolute(path)) return allocator.dupe(u8, path);
     return std.fmt.allocPrint(allocator, "./{s}", .{path});
 }
 

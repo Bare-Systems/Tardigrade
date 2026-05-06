@@ -312,7 +312,7 @@ fn resolveExistingCandidate(
 ) !?ResolvedKind {
     const normalized_rel = try normalizeRelativePath(allocator, rel);
     defer allocator.free(normalized_rel);
-    const joined = try std.fs.path.join(allocator, &[_][]const u8{ root_real, normalized_rel });
+    const joined = try std.Io.Dir.path.join(allocator, &[_][]const u8{ root_real, normalized_rel });
     defer allocator.free(joined);
 
     const real = compat.cwd().realpathAlloc(allocator, joined) catch return null;
@@ -353,7 +353,7 @@ fn normalizeRelativePath(allocator: std.mem.Allocator, rel: []const u8) ![]u8 {
         if (segment.len == 0 or std.mem.eql(u8, segment, ".")) continue;
         if (std.mem.eql(u8, segment, "..")) return error.PathEscapesRoot;
 
-        if (normalized.items.len > 0) try normalized.append(allocator, std.fs.path.sep);
+        if (normalized.items.len > 0) try normalized.append(allocator, std.Io.Dir.path.sep);
         try normalized.appendSlice(allocator, segment);
     }
 
@@ -367,11 +367,11 @@ fn isPathSeparator(ch: u8) bool {
 fn isWithinRoot(root_real: []const u8, target_real: []const u8) bool {
     if (!std.mem.startsWith(u8, target_real, root_real)) return false;
     if (target_real.len == root_real.len) return true;
-    return target_real[root_real.len] == std.fs.path.sep;
+    return target_real[root_real.len] == std.Io.Dir.path.sep;
 }
 
 fn detectMimeType(path: []const u8) []const u8 {
-    const ext = std.fs.path.extension(path);
+    const ext = std.Io.Dir.path.extension(path);
     if (std.ascii.eqlIgnoreCase(ext, ".html") or std.ascii.eqlIgnoreCase(ext, ".htm")) return "text/html; charset=utf-8";
     if (std.ascii.eqlIgnoreCase(ext, ".css")) return "text/css; charset=utf-8";
     if (std.ascii.eqlIgnoreCase(ext, ".js")) return "application/javascript; charset=utf-8";
@@ -414,9 +414,9 @@ test "serve rejects traversal escaping root" {
     try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "index.html", .data = "ok" });
     const root_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(root_path);
-    const parent = std.fs.path.dirname(root_path).?;
+    const parent = std.Io.Dir.path.dirname(root_path).?;
     const escape_name = "escape-target.txt";
-    const escape_path = try std.fs.path.join(allocator, &[_][]const u8{ parent, escape_name });
+    const escape_path = try std.Io.Dir.path.join(allocator, &[_][]const u8{ parent, escape_name });
     defer allocator.free(escape_path);
     try compat.cwd().writeFile(.{ .sub_path = escape_path, .data = "escape" });
     defer compat.cwd().deleteFile(escape_path) catch {};
@@ -449,9 +449,9 @@ test "serve rejects percent-encoded traversal escaping root" {
     try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "index.html", .data = "ok" });
     const root_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(root_path);
-    const parent = std.fs.path.dirname(root_path).?;
+    const parent = std.Io.Dir.path.dirname(root_path).?;
     const escape_name = "escape-encoded.txt";
-    const escape_path = try std.fs.path.join(allocator, &[_][]const u8{ parent, escape_name });
+    const escape_path = try std.Io.Dir.path.join(allocator, &[_][]const u8{ parent, escape_name });
     defer allocator.free(escape_path);
     try compat.cwd().writeFile(.{ .sub_path = escape_path, .data = "escape" });
     defer compat.cwd().deleteFile(escape_path) catch {};
@@ -482,9 +482,9 @@ test "serve rejects backslash traversal escaping root" {
     try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "index.html", .data = "ok" });
     const root_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(root_path);
-    const parent = std.fs.path.dirname(root_path).?;
+    const parent = std.Io.Dir.path.dirname(root_path).?;
     const escape_name = "escape-backslash.txt";
-    const escape_path = try std.fs.path.join(allocator, &[_][]const u8{ parent, escape_name });
+    const escape_path = try std.Io.Dir.path.join(allocator, &[_][]const u8{ parent, escape_name });
     defer allocator.free(escape_path);
     try compat.cwd().writeFile(.{ .sub_path = escape_path, .data = "escape" });
     defer compat.cwd().deleteFile(escape_path) catch {};
@@ -515,14 +515,14 @@ test "serve rejects symlink escape outside root" {
     try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "index.html", .data = "ok" });
     const root_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(root_path);
-    const parent = std.fs.path.dirname(root_path).?;
+    const parent = std.Io.Dir.path.dirname(root_path).?;
     const escape_name = "escape-target.txt";
-    const escape_path = try std.fs.path.join(allocator, &[_][]const u8{ parent, escape_name });
+    const escape_path = try std.Io.Dir.path.join(allocator, &[_][]const u8{ parent, escape_name });
     defer allocator.free(escape_path);
     try compat.cwd().writeFile(.{ .sub_path = escape_path, .data = "escape" });
     defer compat.cwd().deleteFile(escape_path) catch {};
 
-    const symlink_path = try std.fs.path.join(allocator, &[_][]const u8{ root_path, "linked.txt" });
+    const symlink_path = try std.Io.Dir.path.join(allocator, &[_][]const u8{ root_path, "linked.txt" });
     defer allocator.free(symlink_path);
     try std.Io.Dir.symLinkAbsolute(compat.io(), escape_path, symlink_path, .{});
 

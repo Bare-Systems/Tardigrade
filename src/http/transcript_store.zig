@@ -84,7 +84,7 @@ pub const StoredEntry = struct {
 pub fn append(allocator: std.mem.Allocator, path: []const u8, entry: Entry, redacted_values: []const []const u8) !void {
     if (path.len == 0) return;
 
-    if (std.fs.path.dirname(path)) |dir_name| {
+    if (std.Io.Dir.path.dirname(path)) |dir_name| {
         compat.cwd().makePath(dir_name) catch |err| switch (err) {
             error.PathAlreadyExists => {},
             else => return err,

@@ -2426,7 +2426,7 @@ fn validateOptionalDirChecked(path: []const u8) !void {
 
 fn validateOptionalPathForErrorLogChecked(path: []const u8) !void {
     if (path.len == 0 or std.ascii.eqlIgnoreCase(path, "stderr")) return;
-    const dir_path = std.fs.path.dirname(path) orelse ".";
+    const dir_path = std.Io.Dir.path.dirname(path) orelse ".";
     try validateOptionalDirChecked(dir_path);
 }
 

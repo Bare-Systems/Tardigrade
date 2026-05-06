@@ -443,7 +443,7 @@ fn spawnDaemonizedProcess(allocator: std.mem.Allocator, config_path: ?[]const u8
 }
 
 fn pathExists(path: []const u8) bool {
-    if (std.fs.path.isAbsolute(path)) {
+    if (std.Io.Dir.path.isAbsolute(path)) {
         std.Io.Dir.accessAbsolute(compat.io(), path, .{}) catch return false;
         return true;
     }
@@ -452,9 +452,9 @@ fn pathExists(path: []const u8) bool {
 }
 
 fn ensureParentPath(path: []const u8) !void {
-    const parent = std.fs.path.dirname(path) orelse return;
+    const parent = std.Io.Dir.path.dirname(path) orelse return;
     if (parent.len == 0 or std.mem.eql(u8, parent, ".")) return;
-    if (std.fs.path.isAbsolute(parent)) {
+    if (std.Io.Dir.path.isAbsolute(parent)) {
         if (std.mem.eql(u8, parent, "/")) return;
         var root = try std.Io.Dir.openDirAbsolute(compat.io(), "/", .{});
         defer root.close(compat.io());
@@ -464,25 +464,25 @@ fn ensureParentPath(path: []const u8) !void {
     try std.Io.Dir.cwd().createDirPath(compat.io(), parent);
 }
 
-fn createFileAtPath(path: []const u8, flags: std.Io.File.CreateFlags) !std.Io.File {
-    if (std.fs.path.isAbsolute(path)) return std.Io.Dir.createFileAbsolute(compat.io(), path, flags);
+fn createFileAtPath(path: []const u8, flags: std.Io.Dir.CreateFileOptions) !std.Io.File {
+    if (std.Io.Dir.path.isAbsolute(path)) return std.Io.Dir.createFileAbsolute(compat.io(), path, flags);
     return std.Io.Dir.cwd().createFile(compat.io(), path, flags);
 }
 
-fn openFileAtPath(path: []const u8, flags: std.Io.File.OpenFlags) !std.Io.File {
-    if (std.fs.path.isAbsolute(path)) return std.Io.Dir.openFileAbsolute(compat.io(), path, flags);
+fn openFileAtPath(path: []const u8, flags: std.Io.Dir.OpenFileOptions) !std.Io.File {
+    if (std.Io.Dir.path.isAbsolute(path)) return std.Io.Dir.openFileAbsolute(compat.io(), path, flags);
     return std.Io.Dir.cwd().openFile(compat.io(), path, flags);
 }
 
 fn deleteFileAtPath(path: []const u8) !void {
-    if (std.fs.path.isAbsolute(path)) return std.Io.Dir.deleteFileAbsolute(compat.io(), path);
+    if (std.Io.Dir.path.isAbsolute(path)) return std.Io.Dir.deleteFileAbsolute(compat.io(), path);
     return std.Io.Dir.cwd().deleteFile(compat.io(), path);
 }
 
 fn openParentDirForPath(path: []const u8) !struct { dir: std.Io.Dir, basename: []const u8 } {
-    const basename = std.fs.path.basename(path);
-    const dirname = std.fs.path.dirname(path) orelse ".";
-    const dir = if (std.fs.path.isAbsolute(path))
+    const basename = std.Io.Dir.path.basename(path);
+    const dirname = std.Io.Dir.path.dirname(path) orelse ".";
+    const dir = if (std.Io.Dir.path.isAbsolute(path))
         try std.Io.Dir.openDirAbsolute(compat.io(), dirname, .{})
     else
         try std.Io.Dir.cwd().openDir(compat.io(), dirname, .{});

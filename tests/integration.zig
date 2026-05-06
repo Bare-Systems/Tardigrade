@@ -2180,7 +2180,7 @@ fn waitForLogSubstring(allocator: std.mem.Allocator, path: []const u8, needle: [
     const deadline = std.time.milliTimestamp() + @as(i64, @intCast(timeout_ms));
     while (std.time.milliTimestamp() < deadline) {
         const contents = blk: {
-            if (std.fs.path.isAbsolute(path)) {
+            if (std.Io.Dir.path.isAbsolute(path)) {
                 var file = try std.fs.openFileAbsolute(path, .{});
                 defer file.close();
                 break :blk try file.readToEndAlloc(allocator, 256 * 1024);
@@ -3308,7 +3308,7 @@ const GenericFixtureDir = struct {
     fn writeRel(self: GenericFixtureDir, suffix: []const u8, data: []const u8) !void {
         const rel = try self.joinRel(suffix);
         defer self.allocator.free(rel);
-        if (std.fs.path.dirname(rel)) |parent| try std.fs.cwd().makePath(parent);
+        if (std.Io.Dir.path.dirname(rel)) |parent| try std.fs.cwd().makePath(parent);
         try std.fs.cwd().writeFile(.{ .sub_path = rel, .data = data });
     }
 

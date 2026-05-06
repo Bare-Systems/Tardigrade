@@ -350,7 +350,7 @@ fn readPidFromFile(allocator: std.mem.Allocator, path: []const u8) !std.posix.pi
     defer file.close(compat.io());
     var file_buf: [256]u8 = undefined;
     var reader = file.reader(compat.io(), &file_buf);
-    const raw = try reader.interface.readAlloc(allocator, 128);
+    const raw = try reader.interface.allocRemaining(allocator, .limited(128));
     defer allocator.free(raw);
     return try parsePid(std.mem.trim(u8, raw, " \t\r\n"));
 }
@@ -747,4 +747,126 @@ test "parse config init command supports stdout" {
         .config_init => |options| try std.testing.expect(options.stdout),
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "parsePid accepts valid positive pid" {
+    try std.testing.expectEqual(@as(std.posix.pid_t, 1234), try parsePid("1234"));
+    try std.testing.expectEqual(@as(std.posix.pid_t, 1), try parsePid("1"));
+}
+
+test "parsePid rejects zero and negative pids" {
+    try std.testing.expectError(error.InvalidPid, parsePid("0"));
+    try std.testing.expectError(error.InvalidPid, parsePid("-5"));
+}
+
+test "parsePid rejects non-numeric input" {
+    try std.testing.expectError(error.InvalidCharacter, parsePid("abc"));
+    try std.testing.expectError(error.InvalidCharacter, parsePid("12px"));
+}
+
+test "readPidFromFile reads pid written to a temp file" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Write a PID to a file using the compat dir wrapper
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "tardigrade.pid", .data = "42\n" });
+
+    // Resolve absolute path so openFileAtPath can find it
+    const abs = try compat.wrapDir(tmp.dir).realpathAlloc(std.testing.allocator, "tardigrade.pid");
+    defer std.testing.allocator.free(abs);
+
+    const pid = try readPidFromFile(std.testing.allocator, abs);
+    try std.testing.expectEqual(@as(std.posix.pid_t, 42), pid);
+}
+
+test "rotateLogFiles preserves content in generation .1" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "app.log", .data = "current entry" });
+
+    try rotateLogFiles(tmp.dir, "app.log", 2);
+
+    const rotated = try compat.wrapDir(tmp.dir).readFileAlloc(std.testing.allocator, "app.log.1", 1024);
+    defer std.testing.allocator.free(rotated);
+    try std.testing.expectEqualStrings("current entry", rotated);
+}
+
+test "rotateLogFiles with max_files=1 evicts oldest generation" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "app.log", .data = "new" });
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "app.log.1", .data = "old" });
+
+    try rotateLogFiles(tmp.dir, "app.log", 1);
+
+    // .1 is replaced with the original log; old .1 is deleted
+    const rotated = try compat.wrapDir(tmp.dir).readFileAlloc(std.testing.allocator, "app.log.1", 1024);
+    defer std.testing.allocator.free(rotated);
+    try std.testing.expectEqualStrings("new", rotated);
+    // There must be no .2 file (max_files=1 means only one backup)
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(compat.io(), "app.log.2", .{}));
+}
+
+test "parseCliCommand default (no args) returns run command" {
+    const cmd = try parseCliCommand(&.{});
+    switch (cmd) {
+        .run => {},
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parseCliCommand help flags" {
+    for (&[_][]const u8{ "help", "-h", "--help" }) |flag| {
+        const cmd = try parseCliCommand(&.{flag});
+        try std.testing.expectEqual(CliCommand.help, cmd);
+    }
+}
+
+test "parseCliCommand version" {
+    const cmd = try parseCliCommand(&.{"version"});
+    try std.testing.expectEqual(CliCommand.version, cmd);
+}
+
+test "parseCliCommand reload requires pid file option" {
+    const cmd = try parseCliCommand(&.{ "reload", "--pid-file", "tardigrade.pid" });
+    switch (cmd) {
+        .reload => |s| try std.testing.expectEqualStrings("tardigrade.pid", s.pid_file.?),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parseCliCommand stop requires pid file option" {
+    const cmd = try parseCliCommand(&.{ "stop", "--pid-file", "tardigrade.pid" });
+    switch (cmd) {
+        .stop => {},
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "writeStarterConfig writes config content to absolute path" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const abs = try compat.wrapDir(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(abs);
+    const out_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/out.conf", .{abs});
+    defer std.testing.allocator.free(out_path);
+
+    try writeStarterConfig(.{ .output_path = out_path, .stdout = false });
+
+    const written = try compat.wrapDir(tmp.dir).readFileAlloc(std.testing.allocator, "out.conf", 4096);
+    defer std.testing.allocator.free(written);
+    try std.testing.expect(std.mem.find(u8, written, "listen 8069") != null);
+    try std.testing.expect(std.mem.find(u8, written, "pid /var/run/tardigrade.pid") != null);
+}
+
+test "writeStarterConfig returns error if file exists and force is false" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "out.conf", .data = "existing" });
+    const abs = try compat.wrapDir(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(abs);
+    const out_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/out.conf", .{abs});
+    defer std.testing.allocator.free(out_path);
+
+    try std.testing.expectError(error.PathAlreadyExists, writeStarterConfig(.{ .output_path = out_path, .stdout = false }));
 }

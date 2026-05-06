@@ -13,6 +13,7 @@ All notable user-facing changes to Tardigrade are documented here.
 - Added a configurable Prometheus metrics endpoint with optional auth gating and integration coverage for counter growth.
 
 ### Added
+- Added unit tests covering `main.zig` core helpers: `parsePid`, `readPidFromFile`, `rotateLogFiles`, `parseCliCommand`, and `writeStarterConfig`; fixed `readPidFromFile` to use `allocRemaining` instead of `readAlloc` so it correctly reads pid files shorter than the buffer size.
 - Added 14 unit tests covering `zig_compat.zig` compat functions (timestamp, random, stringify, fixedBufferStream, trimRight, fmtSliceHexLower, DirCompat file I/O), `http2_frame` writeSettings/writeSettingsAck/writeGoaway encoding, and `access_log` formatEntry JSON output including null upstream_status handling.
 
 ### Changed

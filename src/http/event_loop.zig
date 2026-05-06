@@ -17,12 +17,12 @@ pub const EventLoop = struct {
     backend: Backend,
 
     pub fn init() !EventLoop {
-        return if (builtin.os.tag == .linux)
-            .{
-                .fd = try std.posix.epoll_create1(std.os.linux.EPOLL.CLOEXEC),
-                .backend = .epoll,
-            }
-        else blk: {
+        return if (builtin.os.tag == .linux) blk: {
+            const linux = std.os.linux;
+            const rc = linux.epoll_create1(@intCast(linux.EPOLL.CLOEXEC));
+            if (linux.getErrno(rc) != .SUCCESS) return error.SystemResources;
+            break :blk .{ .fd = @intCast(rc), .backend = .epoll };
+        } else blk: {
             const fd = std.c.kqueue();
             if (fd < 0) return error.SystemResources;
             break :blk .{ .fd = fd, .backend = .kqueue };
@@ -43,11 +43,13 @@ pub const EventLoop = struct {
 
     pub fn addReadFd(self: *EventLoop, fd: std.posix.fd_t) !void {
         if (builtin.os.tag == .linux) {
-            var event = std.os.linux.epoll_event{
-                .events = std.os.linux.EPOLL.IN,
+            const linux = std.os.linux;
+            var event = linux.epoll_event{
+                .events = linux.EPOLL.IN,
                 .data = .{ .fd = @intCast(fd) },
             };
-            try std.posix.epoll_ctl(self.fd, std.os.linux.EPOLL.CTL_ADD, @intCast(fd), @ptrCast(&event));
+            const rc = linux.epoll_ctl(@intCast(self.fd), linux.EPOLL.CTL_ADD, @intCast(fd), &event);
+            if (linux.getErrno(rc) != .SUCCESS) return error.Unexpected;
         } else {
             const changes = [_]std.c.Kevent{.{
                 .ident = @intCast(fd),
@@ -72,12 +74,15 @@ pub const EventLoop = struct {
     }
 
     fn waitEpoll(self: *EventLoop, out_events: []Event, timeout_ms: i32) usize {
-        var epoll_events: [64]std.os.linux.epoll_event = undefined;
+        const linux = std.os.linux;
+        var epoll_events: [64]linux.epoll_event = undefined;
         const cap = @min(out_events.len, epoll_events.len);
-        const n = std.posix.epoll_wait(self.fd, epoll_events[0..cap], timeout_ms);
+        const rc = linux.epoll_wait(@intCast(self.fd), epoll_events[0..cap].ptr, @intCast(cap), timeout_ms);
+        if (linux.getErrno(rc) != .SUCCESS) return 0;
+        const n: usize = @intCast(rc);
 
         for (epoll_events[0..n], 0..) |ev, idx| {
-            const readable = (ev.events & (std.os.linux.EPOLL.IN | std.os.linux.EPOLL.HUP | std.os.linux.EPOLL.ERR)) != 0;
+            const readable = (ev.events & (linux.EPOLL.IN | linux.EPOLL.HUP | linux.EPOLL.ERR)) != 0;
             out_events[idx] = .{
                 .fd = @intCast(ev.data.fd),
                 .readable = readable,

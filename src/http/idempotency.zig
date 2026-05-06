@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("../zig_compat.zig");
 const Allocator = std.mem.Allocator;
 const Headers = @import("headers.zig").Headers;
 
@@ -55,7 +56,7 @@ pub const IdempotencyStore = struct {
     /// Look up cached value and optionally permit stale values within `stale_seconds`.
     pub fn getWithStale(self: *IdempotencyStore, key: []const u8, stale_seconds: u32) ?LookupResult {
         const entry = self.entries.get(key) orelse return null;
-        const now = std.time.nanoTimestamp();
+        const now = compat.nanoTimestamp();
         const age_ns = now - entry.created_ns;
         if (age_ns <= self.ttl_ns) {
             return .{ .response = entry, .is_stale = false };
@@ -95,7 +96,7 @@ pub const IdempotencyStore = struct {
             .status = status,
             .body = owned_body,
             .content_type = owned_ct,
-            .created_ns = std.time.nanoTimestamp(),
+            .created_ns = compat.nanoTimestamp(),
         });
     }
 
@@ -125,14 +126,14 @@ pub const IdempotencyStore = struct {
     }
 
     pub fn cleanupExpired(self: *IdempotencyStore) usize {
-        const now = std.time.nanoTimestamp();
-        var keys_to_remove = std.ArrayList([]const u8).init(self.allocator);
-        defer keys_to_remove.deinit();
+        const now = compat.nanoTimestamp();
+        var keys_to_remove = std.ArrayList([]const u8).empty;
+        defer keys_to_remove.deinit(self.allocator);
 
         var it = self.entries.iterator();
         while (it.next()) |entry| {
             if (now - entry.value_ptr.created_ns > self.ttl_ns) {
-                keys_to_remove.append(entry.key_ptr.*) catch continue;
+                keys_to_remove.append(self.allocator, entry.key_ptr.*) catch continue;
             }
         }
 

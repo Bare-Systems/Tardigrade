@@ -7,6 +7,7 @@
 /// Actual OTLP span export (configured via TARDIGRADE_OTEL_ENDPOINT) is a
 /// separate runtime concern; this module focuses on the wire protocol.
 const std = @import("std");
+const compat = @import("../zig_compat.zig");
 
 /// Parsed representation of a W3C `traceparent` header value.
 pub const TraceContext = struct {
@@ -24,14 +25,14 @@ pub const TraceContext = struct {
 
     /// Write the trace-id as 32 lowercase hex characters into `buf`.
     pub fn traceIdHex(self: TraceContext, buf: *[32]u8) void {
-        _ = std.fmt.bufPrint(buf, "{}", .{std.fmt.fmtSliceHexLower(&self.trace_id)}) catch {};
+        _ = std.fmt.bufPrint(buf, "{f}", .{compat.fmtSliceHexLower(&self.trace_id)}) catch {};
     }
 
     /// Format a `traceparent` header value into `buf` (must be ≥55 bytes).
     pub fn format(self: TraceContext, buf: []u8) []u8 {
-        return std.fmt.bufPrint(buf, "00-{s}-{s}-{x:0>2}", .{
-            std.fmt.fmtSliceHexLower(&self.trace_id),
-            std.fmt.fmtSliceHexLower(&self.parent_id),
+        return std.fmt.bufPrint(buf, "00-{f}-{f}-{x:0>2}", .{
+            compat.fmtSliceHexLower(&self.trace_id),
+            compat.fmtSliceHexLower(&self.parent_id),
             self.flags,
         }) catch buf[0..0];
     }
@@ -68,8 +69,8 @@ pub fn parse(header: ?[]const u8) ?TraceContext {
 /// and the sampled flag set (0x01).
 pub fn generate() TraceContext {
     var ctx: TraceContext = undefined;
-    std.crypto.random.bytes(&ctx.trace_id);
-    std.crypto.random.bytes(&ctx.parent_id);
+    compat.randomBytes(&ctx.trace_id);
+    compat.randomBytes(&ctx.parent_id);
     ctx.flags = 0x01;
     return ctx;
 }
@@ -77,7 +78,7 @@ pub fn generate() TraceContext {
 /// Create a child-span context: same trace-id, new random span-id, same flags.
 pub fn childSpan(parent: TraceContext) TraceContext {
     var child = parent;
-    std.crypto.random.bytes(&child.parent_id);
+    compat.randomBytes(&child.parent_id);
     return child;
 }
 

@@ -1,3 +1,4 @@
+const compat = @import("../zig_compat.zig");
 const std = @import("std");
 const build_options = @import("build_options");
 const Headers = @import("headers.zig").Headers;
@@ -52,7 +53,7 @@ pub const StreamAssembler = struct {
         return .{
             .allocator = allocator,
             .headers = Headers.init(allocator),
-            .body = std.ArrayList(u8).init(allocator),
+            .body = .empty,
         };
     }
 
@@ -61,7 +62,7 @@ pub const StreamAssembler = struct {
         if (self.path) |value| self.allocator.free(value);
         if (self.authority) |value| self.allocator.free(value);
         self.headers.deinit();
-        self.body.deinit();
+        self.body.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -85,7 +86,7 @@ pub const StreamAssembler = struct {
     }
 
     pub fn appendBody(self: *StreamAssembler, chunk: []const u8) !void {
-        try self.body.appendSlice(chunk);
+        try self.body.appendSlice(self.allocator, chunk);
     }
 
     pub fn finish(self: *StreamAssembler) !StreamRequest {
@@ -107,7 +108,7 @@ pub const StreamAssembler = struct {
             .path = try self.allocator.dupe(u8, path),
             .authority = if (self.authority) |authority| try self.allocator.dupe(u8, authority) else null,
             .headers = headers,
-            .body = try self.body.toOwnedSlice(),
+            .body = try self.body.toOwnedSlice(self.allocator),
         };
     }
 };
@@ -234,7 +235,7 @@ pub const ServerSession = if (nghttp3_enabled) struct {
             src.ptr,
             src.len,
             if (fin) 1 else 0,
-            @intCast(std.time.nanoTimestamp()),
+            @intCast(compat.nanoTimestamp()),
         );
         if (consumed < 0) return error.NotYetImplemented;
         return @intCast(consumed);
@@ -479,14 +480,14 @@ pub const ServerSession = if (nghttp3_enabled) struct {
 };
 
 pub fn encodeResponseHeaderBlock(allocator: std.mem.Allocator, response: *const Response) !EncodedHeaderBlock {
-    var fields = std.ArrayList(HeaderField).init(allocator);
-    defer fields.deinit();
+    var fields = std.ArrayList(HeaderField).empty;
+    defer fields.deinit(allocator);
 
     var status_buf: [3]u8 = undefined;
     const status_text = try std.fmt.bufPrint(&status_buf, "{d}", .{response.status.code()});
-    try fields.append(.{ .name = ":status", .value = status_text });
+    try fields.append(allocator, .{ .name = ":status", .value = status_text });
     for (response.headers.iterator()) |header| {
-        try fields.append(.{ .name = header.name, .value = header.value });
+        try fields.append(allocator, .{ .name = header.name, .value = header.value });
     }
     return encodeLiteralHeaderBlock(allocator, fields.items);
 }
@@ -496,40 +497,40 @@ fn replaceOwnedString(allocator: std.mem.Allocator, slot: *?[]u8, value: []const
     slot.* = try allocator.dupe(u8, value);
 }
 
-fn appendH3Frame(out: *std.ArrayList(u8), frame_type: u8, payload: []const u8) !void {
-    try appendQuicVarInt(out, frame_type);
-    try appendQuicVarInt(out, payload.len);
-    try out.appendSlice(payload);
+fn appendH3Frame(allocator: std.mem.Allocator, out: *std.ArrayList(u8), frame_type: u8, payload: []const u8) !void {
+    try appendQuicVarInt(allocator, out, frame_type);
+    try appendQuicVarInt(allocator, out, payload.len);
+    try out.appendSlice(allocator, payload);
 }
 
-fn appendQuicVarInt(out: *std.ArrayList(u8), value: usize) !void {
+fn appendQuicVarInt(allocator: std.mem.Allocator, out: *std.ArrayList(u8), value: usize) !void {
     if (value < 64) {
-        try out.append(@intCast(value));
+        try out.append(allocator, @intCast(value));
         return;
     }
     if (value < 16_384) {
         const encoded: u16 = @intCast(0x4000 | value);
-        try out.append(@intCast(encoded >> 8));
-        try out.append(@intCast(encoded & 0xff));
+        try out.append(allocator, @intCast(encoded >> 8));
+        try out.append(allocator, @intCast(encoded & 0xff));
         return;
     }
     return error.NotYetImplemented;
 }
 
 pub fn encodeLiteralHeaderBlock(allocator: std.mem.Allocator, headers: []const HeaderField) !EncodedHeaderBlock {
-    var out = std.ArrayList(u8).init(allocator);
-    errdefer out.deinit();
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
 
-    try out.append(0x00);
-    try out.append(0x00);
+    try out.append(allocator, 0x00);
+    try out.append(allocator, 0x00);
 
     for (headers) |h| {
-        try out.append(0x20);
-        try encodeHeaderString(&out, h.name);
-        try encodeHeaderString(&out, h.value);
+        try out.append(allocator, 0x20);
+        try encodeHeaderString(allocator, &out, h.name);
+        try encodeHeaderString(allocator, &out, h.value);
     }
     return .{
-        .data = try out.toOwnedSlice(),
+        .data = try out.toOwnedSlice(allocator),
         .required_insert_count = 0,
         .base = 0,
     };
@@ -538,13 +539,13 @@ pub fn encodeLiteralHeaderBlock(allocator: std.mem.Allocator, headers: []const H
 pub fn decodeLiteralHeaderBlock(allocator: std.mem.Allocator, block: []const u8) ![]HeaderField {
     if (block.len < 2) return error.InvalidQpackBlock;
     var i: usize = 2;
-    var out = std.ArrayList(HeaderField).init(allocator);
+    var out = std.ArrayList(HeaderField).empty;
     errdefer {
         for (out.items) |h| {
             allocator.free(h.name);
             allocator.free(h.value);
         }
-        out.deinit();
+        out.deinit(allocator);
     }
     while (i < block.len) {
         const prefix = block[i];
@@ -554,9 +555,9 @@ pub fn decodeLiteralHeaderBlock(allocator: std.mem.Allocator, block: []const u8)
         errdefer allocator.free(name);
         const value = try decodeHeaderStringAlloc(allocator, block, &i);
         errdefer allocator.free(value);
-        try out.append(.{ .name = name, .value = value });
+        try out.append(allocator, .{ .name = name, .value = value });
     }
-    return out.toOwnedSlice();
+    return out.toOwnedSlice(allocator);
 }
 
 pub fn deinitDecodedHeaderBlock(allocator: std.mem.Allocator, headers: []HeaderField) void {
@@ -567,10 +568,10 @@ pub fn deinitDecodedHeaderBlock(allocator: std.mem.Allocator, headers: []HeaderF
     allocator.free(headers);
 }
 
-fn encodeHeaderString(out: *std.ArrayList(u8), value: []const u8) !void {
+fn encodeHeaderString(allocator: std.mem.Allocator, out: *std.ArrayList(u8), value: []const u8) !void {
     if (value.len > 127) return error.QpackStringTooLarge;
-    try out.append(@as(u8, @intCast(value.len)));
-    try out.appendSlice(value);
+    try out.append(allocator, @as(u8, @intCast(value.len)));
+    try out.appendSlice(allocator, value);
 }
 
 fn decodeHeaderStringAlloc(allocator: std.mem.Allocator, block: []const u8, idx: *usize) ![]u8 {

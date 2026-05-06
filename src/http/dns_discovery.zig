@@ -1,3 +1,4 @@
+const compat = @import("../zig_compat.zig");
 /// DNS-based upstream service discovery for Tardigrade.
 ///
 /// Resolves a configured hostname to its A/AAAA addresses and produces a list
@@ -32,7 +33,7 @@ pub const Config = struct {
 pub const DnsDiscovery = struct {
     allocator: std.mem.Allocator,
     config: Config,
-    mutex: std.Thread.Mutex,
+    mutex: compat.Mutex,
     /// Currently known upstream URLs (owned strings).
     urls: std.ArrayList([]u8),
     /// Epoch-ms timestamp of the last successful resolution.
@@ -45,7 +46,7 @@ pub const DnsDiscovery = struct {
             .allocator = allocator,
             .config = config,
             .mutex = .{},
-            .urls = std.ArrayList([]u8).init(allocator),
+            .urls = .empty,
             .last_refresh_ms = 0,
             .change_count = 0,
         };
@@ -53,7 +54,7 @@ pub const DnsDiscovery = struct {
 
     pub fn deinit(self: *DnsDiscovery) void {
         for (self.urls.items) |url| self.allocator.free(url);
-        self.urls.deinit();
+        self.urls.deinit(self.allocator);
     }
 
     /// Returns true when the next refresh is due.
@@ -71,49 +72,41 @@ pub const DnsDiscovery = struct {
 
         // Resolve — getAddressList is blocking and must not be called under
         // our mutex (it can be slow). Build the new list without the lock.
-        var new_urls = std.ArrayList([]u8).init(self.allocator);
+        var new_urls: std.ArrayList([]u8) = .empty;
         defer {
             // On any early return free what we built.
             for (new_urls.items) |u| self.allocator.free(u);
-            new_urls.deinit();
+            new_urls.deinit(self.allocator);
         }
 
-        const list = std.net.getAddressList(self.allocator, self.config.host, self.config.port) catch |err| {
+        const resolved = std.Io.net.IpAddress.resolve(compat.io(), self.config.host, self.config.port) catch |err| {
             std.debug.print("dns_discovery: resolve {s}:{d} failed: {s}\n", .{
                 self.config.host, self.config.port, @errorName(err),
             });
             return;
         };
-        defer list.deinit();
 
         const scheme: []const u8 = if (self.config.tls) "https" else "http";
-        for (list.addrs) |addr| {
-            const url = switch (addr.any.family) {
-                std.posix.AF.INET => blk: {
-                    const ip4 = addr.in;
-                    const b = std.mem.toBytes(ip4.sa.addr);
-                    break :blk std.fmt.allocPrint(self.allocator, "{s}://{d}.{d}.{d}.{d}:{d}", .{
-                        scheme, b[0], b[1], b[2], b[3], self.config.port,
-                    }) catch continue;
-                },
-                std.posix.AF.INET6 => blk: {
-                    // Format IPv6 as [addr]:port
-                    var buf: [64]u8 = undefined;
-                    const ip6_str = std.fmt.bufPrint(&buf, "{}", .{addr}) catch continue;
-                    // ip6_str includes the port, e.g. "[::1]:8080"; strip it.
-                    const bracket_end = std.mem.indexOfScalar(u8, ip6_str, ']') orelse continue;
-                    const ip6_only = ip6_str[0 .. bracket_end + 1];
-                    break :blk std.fmt.allocPrint(self.allocator, "{s}://{s}:{d}", .{
-                        scheme, ip6_only, self.config.port,
-                    }) catch continue;
-                },
-                else => continue,
-            };
-            new_urls.append(url) catch {
-                self.allocator.free(url);
-                continue;
-            };
-        }
+        const url = switch (resolved) {
+            .ip4 => |ip4| std.fmt.allocPrint(self.allocator, "{s}://{d}.{d}.{d}.{d}:{d}", .{
+                scheme, ip4.bytes[0], ip4.bytes[1], ip4.bytes[2], ip4.bytes[3], self.config.port,
+            }) catch return,
+            .ip6 => |ip6| std.fmt.allocPrint(self.allocator, "{s}://[{x}:{x}:{x}:{x}:{x}:{x}:{x}:{x}]:{d}", .{
+                scheme,
+                std.mem.readInt(u16, ip6.bytes[0..2], .big),
+                std.mem.readInt(u16, ip6.bytes[2..4], .big),
+                std.mem.readInt(u16, ip6.bytes[4..6], .big),
+                std.mem.readInt(u16, ip6.bytes[6..8], .big),
+                std.mem.readInt(u16, ip6.bytes[8..10], .big),
+                std.mem.readInt(u16, ip6.bytes[10..12], .big),
+                std.mem.readInt(u16, ip6.bytes[12..14], .big),
+                std.mem.readInt(u16, ip6.bytes[14..16], .big),
+                self.config.port,
+            }) catch return,
+        };
+        new_urls.append(self.allocator, url) catch {
+            self.allocator.free(url);
+        };
 
         // Swap under the lock.
         self.mutex.lock();
@@ -135,7 +128,7 @@ pub const DnsDiscovery = struct {
         self.urls.clearRetainingCapacity();
         // Transfer ownership of new_urls items to self.urls.
         for (new_urls.items) |u| {
-            self.urls.append(u) catch {};
+            self.urls.append(self.allocator, u) catch {};
         }
         // Prevent new_urls defer from double-freeing transferred items.
         new_urls.clearRetainingCapacity();

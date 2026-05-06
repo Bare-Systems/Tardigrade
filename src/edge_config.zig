@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("zig_compat.zig");
 const http = @import("http.zig");
 
 var active_file_overrides: ?*const http.config_file.Overrides = null;
@@ -1433,10 +1434,10 @@ const server_block_field_sep = "\x1f";
 
 fn parseServerBlocks(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeConfig.ServerBlock {
     if (std.mem.trim(u8, raw, " \t\r\n").len == 0) return &.{};
-    var out = std.ArrayList(EdgeConfig.ServerBlock).init(allocator);
+    var out = std.ArrayList(EdgeConfig.ServerBlock).empty;
     errdefer {
         for (out.items) |*block| block.deinit(allocator);
-        out.deinit();
+        out.deinit(allocator);
     }
     var records = std.mem.splitSequence(u8, raw, server_block_record_sep);
     while (records.next()) |record| {
@@ -1465,7 +1466,7 @@ fn parseServerBlocks(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeConfi
             for (location_blocks) |*block| block.deinit(allocator);
             allocator.free(location_blocks);
         }
-        try out.append(.{
+        try out.append(allocator, .{
             .server_names = names,
             .doc_root = try allocator.dupe(u8, doc_root),
             .try_files = try allocator.dupe(u8, try_files),
@@ -1477,7 +1478,7 @@ fn parseServerBlocks(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeConfi
             .proxy_pass_commands_prefix = try allocator.dupe(u8, route_fields.proxy_pass_commands_prefix),
         });
     }
-    return out.toOwnedSlice();
+    return out.toOwnedSlice(allocator);
 }
 
 const ParsedServerBlockRouteFields = struct {
@@ -1588,7 +1589,7 @@ fn applyServerBlockTlsConfig(
 }
 
 fn envOrDefault(allocator: std.mem.Allocator, key: []const u8, default_value: []const u8) ![]u8 {
-    if (std.process.getEnvVarOwned(allocator, key)) |owned| {
+    if (compat.getEnvVarOwned(allocator, key)) |owned| {
         if (conflictingFileOverrideValue(key, owned)) |file_value| {
             std.log.warn("config override conflict for {s}: env value '{s}' overrides file-config value '{s}'", .{ key, owned, file_value });
         }
@@ -1616,7 +1617,7 @@ fn conflictingFileOverrideValue(key: []const u8, env_value: []const u8) ?[]const
 }
 
 fn envOrDefaultAlias(allocator: std.mem.Allocator, primary_key: []const u8, fallback_key: []const u8, default_value: []const u8) ![]u8 {
-    if (std.process.getEnvVarOwned(allocator, primary_key)) |owned| {
+    if (compat.getEnvVarOwned(allocator, primary_key)) |owned| {
         return owned;
     } else |_| {}
 
@@ -1637,10 +1638,10 @@ fn parseIntEnv(comptime T: type, allocator: std.mem.Allocator, key: []const u8, 
 }
 
 fn parseHashes(allocator: std.mem.Allocator, raw: []const u8) ![][]const u8 {
-    var out = std.ArrayList([]const u8).init(allocator);
+    var out = std.ArrayList([]const u8).empty;
     errdefer {
         for (out.items) |h| allocator.free(h);
-        out.deinit();
+        out.deinit(allocator);
     }
 
     var it = std.mem.splitScalar(u8, raw, ',');
@@ -1657,17 +1658,17 @@ fn parseHashes(allocator: std.mem.Allocator, raw: []const u8) ![][]const u8 {
             }
             lower[i] = std.ascii.toLower(c);
         }
-        try out.append(lower);
+        try out.append(allocator, lower);
     }
 
-    return out.toOwnedSlice();
+    return out.toOwnedSlice(allocator);
 }
 
 fn parseCsvValues(allocator: std.mem.Allocator, raw: []const u8) ![][]const u8 {
-    var out = std.ArrayList([]const u8).init(allocator);
+    var out = std.ArrayList([]const u8).empty;
     errdefer {
         for (out.items) |v| allocator.free(v);
-        out.deinit();
+        out.deinit(allocator);
     }
 
     var it = std.mem.splitScalar(u8, raw, ',');
@@ -1675,31 +1676,31 @@ fn parseCsvValues(allocator: std.mem.Allocator, raw: []const u8) ![][]const u8 {
         const trimmed = std.mem.trim(u8, part, " \t\r\n");
         if (trimmed.len == 0) continue;
         const duped = try allocator.dupe(u8, trimmed);
-        try out.append(duped);
+        try out.append(allocator, duped);
     }
 
-    return out.toOwnedSlice();
+    return out.toOwnedSlice(allocator);
 }
 
 fn parseServerNames(allocator: std.mem.Allocator, raw: []const u8) ![][]const u8 {
-    var out = std.ArrayList([]const u8).init(allocator);
+    var out = std.ArrayList([]const u8).empty;
     errdefer {
         for (out.items) |name| allocator.free(name);
-        out.deinit();
+        out.deinit(allocator);
     }
 
     var it = std.mem.tokenizeAny(u8, raw, ", \t\r\n");
     while (it.next()) |part| {
         const trimmed = std.mem.trim(u8, part, " \t\r\n");
         if (trimmed.len == 0) continue;
-        try out.append(try allocator.dupe(u8, trimmed));
+        try out.append(allocator, try allocator.dupe(u8, trimmed));
     }
-    return out.toOwnedSlice();
+    return out.toOwnedSlice(allocator);
 }
 
 fn parseCsvU32Values(allocator: std.mem.Allocator, raw: []const u8) ![]u32 {
-    var out = std.ArrayList(u32).init(allocator);
-    errdefer out.deinit();
+    var out = std.ArrayList(u32).empty;
+    errdefer out.deinit(allocator);
 
     var it = std.mem.splitScalar(u8, raw, ',');
     while (it.next()) |part| {
@@ -1707,10 +1708,10 @@ fn parseCsvU32Values(allocator: std.mem.Allocator, raw: []const u8) ![]u32 {
         if (trimmed.len == 0) continue;
         const value = try std.fmt.parseInt(u32, trimmed, 10);
         if (value == 0) return error.InvalidUpstreamBaseUrlWeight;
-        try out.append(value);
+        try out.append(allocator, value);
     }
 
-    return out.toOwnedSlice();
+    return out.toOwnedSlice(allocator);
 }
 
 fn parseHealthStatusRange(raw: []const u8) !EdgeConfig.HealthStatusRange {
@@ -1732,10 +1733,10 @@ fn parseUpstreamHealthSuccessStatusOverrides(
     allocator: std.mem.Allocator,
     raw: []const u8,
 ) ![]EdgeConfig.UpstreamHealthSuccessStatusOverride {
-    var out = std.ArrayList(EdgeConfig.UpstreamHealthSuccessStatusOverride).init(allocator);
+    var out = std.ArrayList(EdgeConfig.UpstreamHealthSuccessStatusOverride).empty;
     errdefer {
         for (out.items) |entry| allocator.free(entry.upstream_base_url);
-        out.deinit();
+        out.deinit(allocator);
     }
 
     var it = std.mem.splitScalar(u8, raw, ';');
@@ -1746,22 +1747,22 @@ fn parseUpstreamHealthSuccessStatusOverrides(
         const upstream_base_url = std.mem.trim(u8, entry[0..sep], " \t\r\n");
         const status_raw = std.mem.trim(u8, entry[sep + 1 ..], " \t\r\n");
         if (upstream_base_url.len == 0 or status_raw.len == 0) return error.InvalidHealthStatusOverride;
-        try out.append(.{
+        try out.append(allocator, .{
             .upstream_base_url = try allocator.dupe(u8, upstream_base_url),
             .range = try parseHealthStatusRange(status_raw),
         });
     }
-    return out.toOwnedSlice();
+    return out.toOwnedSlice(allocator);
 }
 
 fn parseHeaderPairs(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeConfig.HeaderPair {
-    var out = std.ArrayList(EdgeConfig.HeaderPair).init(allocator);
+    var out = std.ArrayList(EdgeConfig.HeaderPair).empty;
     errdefer {
         for (out.items) |pair| {
             allocator.free(pair.name);
             allocator.free(pair.value);
         }
-        out.deinit();
+        out.deinit(allocator);
     }
 
     var it = std.mem.splitScalar(u8, raw, '|');
@@ -1776,19 +1777,19 @@ fn parseHeaderPairs(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeConfig
         errdefer allocator.free(name);
         const value = try allocator.dupe(u8, value_raw);
         errdefer allocator.free(value);
-        try out.append(.{ .name = name, .value = value });
+        try out.append(allocator, .{ .name = name, .value = value });
     }
-    return out.toOwnedSlice();
+    return out.toOwnedSlice(allocator);
 }
 
 fn parseFastcgiParams(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeConfig.HeaderPair {
-    var out = std.ArrayList(EdgeConfig.HeaderPair).init(allocator);
+    var out = std.ArrayList(EdgeConfig.HeaderPair).empty;
     errdefer {
         for (out.items) |pair| {
             allocator.free(pair.name);
             allocator.free(pair.value);
         }
-        out.deinit();
+        out.deinit(allocator);
     }
 
     var it = std.mem.splitScalar(u8, raw, '|');
@@ -1799,23 +1800,23 @@ fn parseFastcgiParams(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeConf
         const name = std.mem.trim(u8, trimmed[0..eq], " \t\r\n");
         const value = std.mem.trim(u8, trimmed[eq + 1 ..], " \t\r\n");
         if (name.len == 0) return error.InvalidFastcgiParamFormat;
-        try out.append(.{
+        try out.append(allocator, .{
             .name = try allocator.dupe(u8, name),
             .value = try allocator.dupe(u8, value),
         });
     }
-    return out.toOwnedSlice();
+    return out.toOwnedSlice(allocator);
 }
 
 fn parseRewriteRules(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeConfig.RewriteRule {
-    var out = std.ArrayList(EdgeConfig.RewriteRule).init(allocator);
+    var out = std.ArrayList(EdgeConfig.RewriteRule).empty;
     errdefer {
         for (out.items) |rule| {
             allocator.free(rule.method);
             allocator.free(rule.pattern);
             allocator.free(rule.replacement);
         }
-        out.deinit();
+        out.deinit(allocator);
     }
 
     var it = std.mem.splitScalar(u8, raw, ';');
@@ -1844,25 +1845,25 @@ fn parseRewriteRules(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeConfi
         errdefer allocator.free(owned_pattern);
         const owned_replacement = try allocator.dupe(u8, replacement);
         errdefer allocator.free(owned_replacement);
-        try out.append(.{
+        try out.append(allocator, .{
             .method = owned_method,
             .pattern = owned_pattern,
             .replacement = owned_replacement,
             .flag = flag,
         });
     }
-    return out.toOwnedSlice();
+    return out.toOwnedSlice(allocator);
 }
 
 fn parseReturnRules(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeConfig.ReturnRule {
-    var out = std.ArrayList(EdgeConfig.ReturnRule).init(allocator);
+    var out = std.ArrayList(EdgeConfig.ReturnRule).empty;
     errdefer {
         for (out.items) |rule| {
             allocator.free(rule.method);
             allocator.free(rule.pattern);
             allocator.free(rule.body);
         }
-        out.deinit();
+        out.deinit(allocator);
     }
 
     var it = std.mem.splitScalar(u8, raw, ';');
@@ -1891,18 +1892,18 @@ fn parseReturnRules(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeConfig
         errdefer allocator.free(owned_pattern);
         const owned_body = try allocator.dupe(u8, body);
         errdefer allocator.free(owned_body);
-        try out.append(.{
+        try out.append(allocator, .{
             .method = owned_method,
             .pattern = owned_pattern,
             .status = status,
             .body = owned_body,
         });
     }
-    return out.toOwnedSlice();
+    return out.toOwnedSlice(allocator);
 }
 
 fn parseConditionalRules(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeConfig.ConditionalRule {
-    var out = std.ArrayList(EdgeConfig.ConditionalRule).init(allocator);
+    var out = std.ArrayList(EdgeConfig.ConditionalRule).empty;
     errdefer {
         for (out.items) |rule| {
             allocator.free(rule.pattern);
@@ -1911,7 +1912,7 @@ fn parseConditionalRules(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeC
                 .returned => |ret| allocator.free(ret.body),
             }
         }
-        out.deinit();
+        out.deinit(allocator);
     }
 
     var it = std.mem.splitScalar(u8, raw, ';');
@@ -1953,7 +1954,7 @@ fn parseConditionalRules(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeC
             const flag = http.rewrite.RewriteFlag.parse(flag_name) orelse return error.InvalidRewriteRuleFlag;
             const owned_replacement = try allocator.dupe(u8, replacement);
             errdefer allocator.free(owned_replacement);
-            try out.append(.{
+            try out.append(allocator, .{
                 .variable = variable,
                 .case_insensitive = case_insensitive,
                 .pattern = owned_pattern,
@@ -1975,7 +1976,7 @@ fn parseConditionalRules(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeC
             const status = std.fmt.parseInt(u16, status_str, 10) catch return error.InvalidReturnRuleStatus;
             const owned_body = try allocator.dupe(u8, body);
             errdefer allocator.free(owned_body);
-            try out.append(.{
+            try out.append(allocator, .{
                 .variable = variable,
                 .case_insensitive = case_insensitive,
                 .pattern = owned_pattern,
@@ -1989,16 +1990,16 @@ fn parseConditionalRules(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeC
 
         return error.InvalidConditionalRuleFormat;
     }
-    return out.toOwnedSlice();
+    return out.toOwnedSlice(allocator);
 }
 
 fn parseLocationBlocks(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeConfig.LocationBlock {
-    var out = std.ArrayList(EdgeConfig.LocationBlock).init(allocator);
+    var out = std.ArrayList(EdgeConfig.LocationBlock).empty;
     errdefer {
         for (out.items) |*block| {
             block.deinit(allocator);
         }
-        out.deinit();
+        out.deinit(allocator);
     }
 
     var it = std.mem.splitScalar(u8, raw, ';');
@@ -2075,7 +2076,7 @@ fn parseLocationBlocks(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeCon
             if (fields.next() != null) return error.InvalidLocationBlockFormat;
         }
 
-        try out.append(.{
+        try out.append(allocator, .{
             .match_type = match_type,
             .pattern = try allocator.dupe(u8, pattern),
             .priority = priority,
@@ -2085,7 +2086,7 @@ fn parseLocationBlocks(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeCon
         });
     }
 
-    return out.toOwnedSlice();
+    return out.toOwnedSlice(allocator);
 }
 
 fn applyLocationErrorPages(allocator: std.mem.Allocator, blocks: []EdgeConfig.LocationBlock, raw: []const u8) !void {
@@ -2107,11 +2108,11 @@ fn applyLocationErrorPages(allocator: std.mem.Allocator, blocks: []EdgeConfig.Lo
         if (pattern.len == 0 or target.len == 0) return error.InvalidLocationBlockFormat;
 
         var code_tokens = std.mem.splitScalar(u8, status_codes_raw, ',');
-        var status_codes = std.ArrayList(u16).init(allocator);
-        defer status_codes.deinit();
+        var status_codes = std.ArrayList(u16).empty;
+        defer status_codes.deinit(allocator);
         while (code_tokens.next()) |code_raw| {
             const code = std.fmt.parseInt(u16, std.mem.trim(u8, code_raw, " \t\r\n"), 10) catch return error.InvalidLocationBlockFormat;
-            try status_codes.append(code);
+            try status_codes.append(allocator, code);
         }
         if (status_codes.items.len == 0) return error.InvalidLocationBlockFormat;
 
@@ -2143,14 +2144,14 @@ fn parseBoolish(raw: []const u8) ?bool {
 }
 
 fn parseInternalRedirectRules(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeConfig.InternalRedirectRule {
-    var out = std.ArrayList(EdgeConfig.InternalRedirectRule).init(allocator);
+    var out = std.ArrayList(EdgeConfig.InternalRedirectRule).empty;
     errdefer {
         for (out.items) |rule| {
             allocator.free(rule.method);
             allocator.free(rule.pattern);
             allocator.free(rule.target);
         }
-        out.deinit();
+        out.deinit(allocator);
     }
 
     var it = std.mem.splitScalar(u8, raw, ';');
@@ -2166,23 +2167,23 @@ fn parseInternalRedirectRules(allocator: std.mem.Allocator, raw: []const u8) ![]
         const pattern = std.mem.trim(u8, pattern_raw, " \t\r\n");
         const target = std.mem.trim(u8, target_raw, " \t\r\n");
         if (method.len == 0 or pattern.len == 0 or target.len == 0) return error.InvalidInternalRedirectRuleFormat;
-        try out.append(.{
+        try out.append(allocator, .{
             .method = try allocator.dupe(u8, method),
             .pattern = try allocator.dupe(u8, pattern),
             .target = try allocator.dupe(u8, target),
         });
     }
-    return out.toOwnedSlice();
+    return out.toOwnedSlice(allocator);
 }
 
 fn parseNamedLocations(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeConfig.NamedLocation {
-    var out = std.ArrayList(EdgeConfig.NamedLocation).init(allocator);
+    var out = std.ArrayList(EdgeConfig.NamedLocation).empty;
     errdefer {
         for (out.items) |entry| {
             allocator.free(entry.name);
             allocator.free(entry.path);
         }
-        out.deinit();
+        out.deinit(allocator);
     }
 
     var it = std.mem.splitScalar(u8, raw, ';');
@@ -2193,23 +2194,23 @@ fn parseNamedLocations(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeCon
         const name = std.mem.trim(u8, entry[0..sep], " \t\r\n");
         const path = std.mem.trim(u8, entry[sep + 1 ..], " \t\r\n");
         if (name.len == 0 or path.len == 0) return error.InvalidNamedLocationFormat;
-        try out.append(.{
+        try out.append(allocator, .{
             .name = try allocator.dupe(u8, name),
             .path = try allocator.dupe(u8, path),
         });
     }
-    return out.toOwnedSlice();
+    return out.toOwnedSlice(allocator);
 }
 
 fn parseMirrorRules(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeConfig.MirrorRule {
-    var out = std.ArrayList(EdgeConfig.MirrorRule).init(allocator);
+    var out = std.ArrayList(EdgeConfig.MirrorRule).empty;
     errdefer {
         for (out.items) |rule| {
             allocator.free(rule.method);
             allocator.free(rule.pattern);
             allocator.free(rule.target_url);
         }
-        out.deinit();
+        out.deinit(allocator);
     }
 
     var it = std.mem.splitScalar(u8, raw, ';');
@@ -2225,24 +2226,24 @@ fn parseMirrorRules(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeConfig
         const pattern = std.mem.trim(u8, pattern_raw, " \t\r\n");
         const target = std.mem.trim(u8, target_raw, " \t\r\n");
         if (method.len == 0 or pattern.len == 0 or target.len == 0) return error.InvalidMirrorRuleFormat;
-        try out.append(.{
+        try out.append(allocator, .{
             .method = try allocator.dupe(u8, method),
             .pattern = try allocator.dupe(u8, pattern),
             .target_url = try allocator.dupe(u8, target),
         });
     }
-    return out.toOwnedSlice();
+    return out.toOwnedSlice(allocator);
 }
 
 fn parseTlsSniCerts(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeConfig.TlsSniCert {
-    var out = std.ArrayList(EdgeConfig.TlsSniCert).init(allocator);
+    var out = std.ArrayList(EdgeConfig.TlsSniCert).empty;
     errdefer {
         for (out.items) |sc| {
             allocator.free(sc.server_name);
             allocator.free(sc.cert_path);
             allocator.free(sc.key_path);
         }
-        out.deinit();
+        out.deinit(allocator);
     }
 
     var it = std.mem.splitScalar(u8, raw, '|');
@@ -2258,13 +2259,13 @@ fn parseTlsSniCerts(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeConfig
         const cert = std.mem.trim(u8, cert_raw, " \t\r\n");
         const key = std.mem.trim(u8, key_raw, " \t\r\n");
         if (host.len == 0 or cert.len == 0 or key.len == 0) return error.InvalidTlsSniCertFormat;
-        try out.append(.{
+        try out.append(allocator, .{
             .server_name = try allocator.dupe(u8, host),
             .cert_path = try allocator.dupe(u8, cert),
             .key_path = try allocator.dupe(u8, key),
         });
     }
-    return out.toOwnedSlice();
+    return out.toOwnedSlice(allocator);
 }
 
 pub fn hasTlsFiles(cfg: *const EdgeConfig) bool {
@@ -2413,17 +2414,14 @@ fn validateUnixEndpoint(raw: []const u8, label: []const u8) !void {
 
 fn validateOptionalFileChecked(path: []const u8) !void {
     if (path.len == 0) return;
-    std.fs.cwd().access(path, .{}) catch return error.InvalidConfigPath;
+    var file = compat.cwd().openFile(path, .{}) catch return error.InvalidConfigPath;
+    defer file.close();
 }
 
 fn validateOptionalDirChecked(path: []const u8) !void {
     if (path.len == 0) return;
-    const stat = std.fs.cwd().statFile(path) catch {
-        return error.InvalidConfigPath;
-    };
-    if (stat.kind != .directory) {
-        return error.InvalidConfigPath;
-    }
+    var dir = std.Io.Dir.cwd().openDir(compat.io(), path, .{}) catch return error.InvalidConfigPath;
+    defer dir.close(compat.io());
 }
 
 fn validateOptionalPathForErrorLogChecked(path: []const u8) !void {
@@ -2567,12 +2565,12 @@ test "missing tls cert path helper returns InvalidConfigPath" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var file = try tmp.dir.createFile("exists.pem", .{});
+    var file = try compat.wrapDir(tmp.dir).createFile("exists.pem", .{});
     file.close();
 
-    const existing_path = try tmp.dir.realpathAlloc(std.testing.allocator, "exists.pem");
+    const existing_path = try compat.wrapDir(tmp.dir).realpathAlloc(std.testing.allocator, "exists.pem");
     defer std.testing.allocator.free(existing_path);
-    const missing_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const missing_path = try compat.wrapDir(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(missing_path);
     const missing_file = try std.fmt.allocPrint(std.testing.allocator, "{s}/missing.pem", .{missing_path});
     defer std.testing.allocator.free(missing_file);

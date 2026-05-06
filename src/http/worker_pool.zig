@@ -1,3 +1,4 @@
+const compat = @import("../zig_compat.zig");
 const builtin = @import("builtin");
 const std = @import("std");
 
@@ -12,8 +13,8 @@ pub const WorkerPool = struct {
     threads: if (builtin.single_threaded) [0]std.Thread else []std.Thread,
     worker_queues: []WorkerQueue,
     worker_ids: []usize,
-    mutex: std.Thread.Mutex = .{},
-    cond: std.Thread.Condition = .{},
+    mutex: compat.Mutex = .{},
+    cond: compat.Condition = .{},
     shutting_down: bool = false,
     joined: bool = false,
     active_jobs: usize = 0,
@@ -52,10 +53,10 @@ pub const WorkerPool = struct {
         errdefer allocator.free(self.worker_queues);
 
         for (self.worker_queues) |*wq| {
-            wq.* = .{ .items = std.ArrayList(std.posix.fd_t).init(allocator) };
+            wq.* = .{ .items = .empty };
         }
         errdefer {
-            for (self.worker_queues) |*wq| wq.items.deinit();
+            for (self.worker_queues) |*wq| wq.items.deinit(allocator);
         }
 
         self.worker_ids = try allocator.alloc(usize, thread_count);
@@ -80,7 +81,7 @@ pub const WorkerPool = struct {
     pub fn deinit(self: *WorkerPool) void {
         self.shutdownAndJoin(true);
         if (!builtin.single_threaded) {
-            for (self.worker_queues) |*wq| wq.items.deinit();
+            for (self.worker_queues) |*wq| wq.items.deinit(self.allocator);
             self.allocator.free(self.worker_queues);
             self.allocator.free(self.worker_ids);
             self.allocator.free(self.threads);
@@ -101,7 +102,7 @@ pub const WorkerPool = struct {
         if (self.queued_jobs >= self.max_queue_len) return error.QueueFull;
 
         const queue_index = self.selectQueueForSubmitLocked();
-        try self.worker_queues[queue_index].items.append(fd);
+        try self.worker_queues[queue_index].items.append(self.allocator, fd);
         self.queued_jobs += 1;
         if (self.worker_queues.len > 0) {
             self.next_queue = (queue_index + 1) % self.worker_queues.len;
@@ -118,7 +119,7 @@ pub const WorkerPool = struct {
 
         if (!drain_pending) {
             for (self.worker_queues) |*wq| {
-                for (wq.items.items) |fd| std.posix.close(fd);
+                for (wq.items.items) |fd| _ = std.c.close(fd);
                 wq.items.clearRetainingCapacity();
             }
             self.queued_jobs = 0;
@@ -212,7 +213,7 @@ test "worker pool processes submitted items" {
     if (builtin.single_threaded) return;
 
     const Ctx = struct {
-        mutex: std.Thread.Mutex = .{},
+        mutex: compat.Mutex = .{},
         total: usize = 0,
     };
 
@@ -235,7 +236,7 @@ test "worker pool processes submitted items" {
     try pool.submit(2);
     try pool.submit(3);
 
-    std.time.sleep(50 * std.time.ns_per_ms);
+    std.Io.sleep(compat.io(), .fromMilliseconds(50), .awake) catch unreachable;
 
     ctx.mutex.lock();
     defer ctx.mutex.unlock();
@@ -246,7 +247,7 @@ test "worker pool shutdown drains in-flight work" {
     if (builtin.single_threaded) return;
 
     const Ctx = struct {
-        mutex: std.Thread.Mutex = .{},
+        mutex: compat.Mutex = .{},
         done: bool = false,
     };
     var ctx = Ctx{};
@@ -254,7 +255,7 @@ test "worker pool shutdown drains in-flight work" {
     const handler = struct {
         fn run(raw_ctx: *anyopaque, _: std.posix.fd_t) void {
             const typed: *Ctx = @ptrCast(@alignCast(raw_ctx));
-            std.time.sleep(20 * std.time.ns_per_ms);
+            std.Io.sleep(compat.io(), .fromMilliseconds(20), .awake) catch unreachable;
             typed.mutex.lock();
             typed.done = true;
             typed.mutex.unlock();
@@ -279,15 +280,15 @@ test "worker pool queue selection prefers least-loaded worker queue" {
     var queues = try std.testing.allocator.alloc(WorkerQueue, 3);
     defer std.testing.allocator.free(queues);
     for (queues) |*q| {
-        q.* = .{ .items = std.ArrayList(std.posix.fd_t).init(std.testing.allocator) };
+        q.* = .{ .items = .empty };
     }
     defer {
-        for (queues) |*q| q.items.deinit();
+        for (queues) |*q| q.items.deinit(std.testing.allocator);
     }
 
-    try queues[0].items.append(10);
-    try queues[0].items.append(11);
-    try queues[1].items.append(20);
+    try queues[0].items.append(std.testing.allocator, 10);
+    try queues[0].items.append(std.testing.allocator, 11);
+    try queues[1].items.append(std.testing.allocator, 20);
 
     var pool = WorkerPool{
         .allocator = std.testing.allocator,
@@ -311,13 +312,13 @@ test "worker pool popWorkLocked steals from peer queue" {
     var queues = try std.testing.allocator.alloc(WorkerQueue, 2);
     defer std.testing.allocator.free(queues);
     for (queues) |*q| {
-        q.* = .{ .items = std.ArrayList(std.posix.fd_t).init(std.testing.allocator) };
+        q.* = .{ .items = .empty };
     }
     defer {
-        for (queues) |*q| q.items.deinit();
+        for (queues) |*q| q.items.deinit(std.testing.allocator);
     }
 
-    try queues[1].items.append(42);
+    try queues[1].items.append(std.testing.allocator, 42);
 
     var pool = WorkerPool{
         .allocator = std.testing.allocator,

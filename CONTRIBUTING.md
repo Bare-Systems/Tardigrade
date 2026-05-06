@@ -9,6 +9,8 @@
 
 ## Testing
 
+Use Zig `0.16.0` for local builds and validation.
+
 ```bash
 zig build test
 zig build test-integration

@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("../zig_compat.zig");
 
 pub const Overrides = struct {
     map: std.StringHashMap([]const u8),
@@ -18,12 +19,12 @@ pub const Overrides = struct {
 };
 
 pub fn loadOverrides(allocator: std.mem.Allocator) !Overrides {
-    const path = std.process.getEnvVarOwned(allocator, "TARDIGRADE_SECRETS_PATH") catch {
+    const path = compat.getEnvVarOwned(allocator, "TARDIGRADE_SECRETS_PATH") catch {
         return Overrides.init(allocator);
     };
     defer allocator.free(path);
 
-    const keys_raw = std.process.getEnvVarOwned(allocator, "TARDIGRADE_SECRET_KEYS") catch "";
+    const keys_raw = compat.getEnvVarOwned(allocator, "TARDIGRADE_SECRET_KEYS") catch "";
     defer if (keys_raw.len > 0) allocator.free(keys_raw);
     if (keys_raw.len == 0) return Overrides.init(allocator);
 
@@ -36,7 +37,7 @@ pub fn loadOverrides(allocator: std.mem.Allocator) !Overrides {
     var out = Overrides.init(allocator);
     errdefer out.deinit(allocator);
 
-    const raw = try std.fs.cwd().readFileAlloc(allocator, path, 2 * 1024 * 1024);
+    const raw = try std.Io.Dir.cwd().readFileAlloc(compat.io(), path, allocator, .limited(2 * 1024 * 1024));
     defer allocator.free(raw);
     var lines = std.mem.splitScalar(u8, raw, '\n');
     while (lines.next()) |line_raw| {
@@ -73,10 +74,10 @@ fn putOverride(allocator: std.mem.Allocator, map: *std.StringHashMap([]const u8)
 }
 
 fn parseKeyList(allocator: std.mem.Allocator, raw: []const u8) ![][]u8 {
-    var out = std.ArrayList([]u8).init(allocator);
+    var out: std.ArrayList([]u8) = .empty;
     errdefer {
         for (out.items) |k| allocator.free(k);
-        out.deinit();
+        out.deinit(allocator);
     }
 
     var it = std.mem.splitScalar(u8, raw, ',');
@@ -88,9 +89,9 @@ fn parseKeyList(allocator: std.mem.Allocator, raw: []const u8) ![][]u8 {
             allocator.free(key);
             continue;
         }
-        try out.append(key);
+        try out.append(allocator, key);
     }
-    return out.toOwnedSlice();
+    return try out.toOwnedSlice(allocator);
 }
 
 fn hexDecode(allocator: std.mem.Allocator, hex: []const u8) ![]u8 {
@@ -145,10 +146,10 @@ test "decrypt xor envelope with key rotation list" {
     defer allocator.free(enc);
     _ = std.base64.standard.Encoder.encode(enc, cipher);
 
-    var keys = std.ArrayList([]u8).init(allocator);
-    defer keys.deinit();
-    try keys.append(try hexDecode(allocator, "0000000000000000"));
-    try keys.append(try hexDecode(allocator, key));
+    var keys = std.ArrayList([]u8).empty;
+    defer keys.deinit(allocator);
+    try keys.append(allocator, try hexDecode(allocator, "0000000000000000"));
+    try keys.append(allocator, try hexDecode(allocator, key));
     defer {
         for (keys.items) |k| allocator.free(k);
     }

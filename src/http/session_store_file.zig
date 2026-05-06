@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("../zig_compat.zig");
 const session = @import("session.zig");
 
 pub const StoredSession = struct {
@@ -23,29 +24,29 @@ pub fn persist(allocator: std.mem.Allocator, path: []const u8, store: *const ses
     const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{path});
     defer allocator.free(tmp_path);
 
-    var buf = std.ArrayList(u8).init(allocator);
-    defer buf.deinit();
-    try std.json.stringify(StoreEnvelope{
+    const buf = try compat.stringifyAlloc(allocator, StoreEnvelope{
         .version = 1,
         .entries = entries,
-    }, .{}, buf.writer());
+    }, .{});
+    defer allocator.free(buf);
 
     {
-        const file = try std.fs.createFileAbsolute(tmp_path, .{ .truncate = true });
-        defer file.close();
-        try file.writeAll(buf.items);
+        const file = try std.Io.Dir.createFileAbsolute(compat.io(), tmp_path, .{ .truncate = true });
+        defer file.close(compat.io());
+        try file.writeStreamingAll(compat.io(), buf);
     }
-    try std.fs.renameAbsolute(tmp_path, path);
+    try std.Io.Dir.renameAbsolute(tmp_path, path, compat.io());
 }
 
 pub fn load(allocator: std.mem.Allocator, path: []const u8) ![]StoredSession {
-    const file = std.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
+    const file = std.Io.Dir.openFileAbsolute(compat.io(), path, .{}) catch |err| switch (err) {
         error.FileNotFound => return try allocator.alloc(StoredSession, 0),
         else => return err,
     };
-    defer file.close();
-
-    const data = try file.readToEndAlloc(allocator, 64 * 1024 * 1024);
+    defer file.close(compat.io());
+    var file_buf: [8192]u8 = undefined;
+    var reader = file.reader(compat.io(), &file_buf);
+    const data = try reader.interface.allocRemaining(allocator, .limited(64 * 1024 * 1024));
     defer allocator.free(data);
 
     const parsed = try std.json.parseFromSlice(StoreEnvelope, allocator, data, .{ .ignore_unknown_fields = true });
@@ -157,7 +158,7 @@ test "session store persistence round trips active and revoked entries" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const tmp_abs = try tmp.dir.realpathAlloc(allocator, ".");
+    const tmp_abs = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(tmp_abs);
     const path = try std.fmt.allocPrint(allocator, "{s}/sessions.json", .{tmp_abs});
     defer allocator.free(path);

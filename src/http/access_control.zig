@@ -107,8 +107,8 @@ pub const AccessControl = struct {
     /// Format: comma-separated rules, each is "allow <CIDR>" or "deny <CIDR>".
     /// Example: "allow 10.0.0.0/8, deny 192.168.1.0/24, allow 0.0.0.0/0"
     pub fn fromConfig(allocator: Allocator, config: []const u8, default_action: Action) !AccessControl {
-        var rules = std.ArrayList(Rule).init(allocator);
-        errdefer rules.deinit();
+        var rules = std.ArrayList(Rule).empty;
+        errdefer rules.deinit(allocator);
 
         var it = std.mem.splitScalar(u8, config, ',');
         while (it.next()) |part| {
@@ -116,11 +116,11 @@ pub const AccessControl = struct {
             if (trimmed.len == 0) continue;
 
             const rule = try parseRule(trimmed);
-            try rules.append(rule);
+            try rules.append(allocator, rule);
         }
 
         return .{
-            .rules = try rules.toOwnedSlice(),
+            .rules = try rules.toOwnedSlice(allocator),
             .default_action = default_action,
             .allocator = allocator,
         };

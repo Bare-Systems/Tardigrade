@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("../zig_compat.zig");
 
 // Archived QUIC parser/tracker stub kept only as local helper glue around the
 // live ngtcp2-backed HTTP/3 transport. Real QUIC handshake, packet crypto, and
@@ -57,7 +58,7 @@ pub const ConnectionTracker = struct {
 
     pub fn observe(self: *ConnectionTracker, packet: ParsedPacket, remote_ip: []const u8, remote_port: u16, allow_migration: bool) !bool {
         if (packet.dcid.len == 0) return false;
-        const cid_hex = try std.fmt.allocPrint(self.allocator, "{s}", .{std.fmt.fmtSliceHexLower(packet.dcid)});
+        const cid_hex = try std.fmt.allocPrint(self.allocator, "{f}", .{compat.fmtSliceHexLower(packet.dcid)});
         defer self.allocator.free(cid_hex);
 
         if (self.table.getPtr(cid_hex)) |addr| {

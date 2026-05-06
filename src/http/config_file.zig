@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("../zig_compat.zig");
 
 pub const Overrides = struct {
     map: std.StringHashMap([]const u8),
@@ -18,7 +19,7 @@ pub const Overrides = struct {
 };
 
 pub fn loadOverrides(allocator: std.mem.Allocator) !Overrides {
-    const cfg_path = std.process.getEnvVarOwned(allocator, "TARDIGRADE_CONFIG_PATH") catch {
+    const cfg_path = compat.getEnvVarOwned(allocator, "TARDIGRADE_CONFIG_PATH") catch {
         return Overrides.init(allocator);
     };
     defer allocator.free(cfg_path);
@@ -78,7 +79,7 @@ const LocationBlockBuilder = struct {
     rewrite_replacement: ?[]u8 = null,
     rewrite_flag: ?[]u8 = null,
     auth: ?[]u8 = null,
-    error_pages: std.ArrayListUnmanaged(ErrorPageBuilder) = .{},
+    error_pages: std.ArrayListUnmanaged(ErrorPageBuilder) = .empty,
 
     fn deinit(self: *LocationBlockBuilder, allocator: std.mem.Allocator) void {
         allocator.free(self.match_type);
@@ -113,7 +114,7 @@ const ServerBlockBuilder = struct {
     upstream_base_url: ?[]u8 = null,
     proxy_pass_chat: ?[]u8 = null,
     proxy_pass_commands_prefix: ?[]u8 = null,
-    location_entries: std.ArrayListUnmanaged([]u8) = .{},
+    location_entries: std.ArrayListUnmanaged([]u8) = .empty,
 
     fn deinit(self: *ServerBlockBuilder, allocator: std.mem.Allocator) void {
         if (self.server_names) |value| allocator.free(value);
@@ -143,11 +144,11 @@ fn parseFile(
     const owned_key = try allocator.dupe(u8, normalized);
     try visited.put(owned_key, {});
 
-    const raw = try std.fs.cwd().readFileAlloc(allocator, normalized, 4 * 1024 * 1024);
+    const raw = try compat.cwd().readFileAlloc(allocator, normalized, 4 * 1024 * 1024);
     defer allocator.free(raw);
 
     var line_no: usize = 0;
-    var blocks = std.ArrayList(BlockContext).init(allocator);
+    var blocks = std.ArrayList(BlockContext).empty;
     defer {
         for (blocks.items) |*block| {
             switch (block.*) {
@@ -156,7 +157,7 @@ fn parseFile(
                 .location => |*builder| builder.deinit(allocator),
             }
         }
-        blocks.deinit();
+        blocks.deinit(allocator);
     }
     var lines = std.mem.splitScalar(u8, raw, '\n');
     while (lines.next()) |line_raw| {
@@ -197,14 +198,14 @@ fn parseFile(
             continue;
         }
         if (line[line.len - 1] == '{') {
-            const header = std.mem.trimRight(u8, line[0 .. line.len - 1], " \t\r\n");
+            const header = compat.trimRight(u8, line[0 .. line.len - 1], " \t\r\n");
             if (std.ascii.eqlIgnoreCase(header, "server")) {
-                try blocks.append(.{ .server = .{} });
+                try blocks.append(allocator, .{ .server = .{} });
             } else if (std.mem.startsWith(u8, header, "location")) {
                 const builder = try parseLocationHeader(allocator, normalized, header, line_no);
-                try blocks.append(.{ .location = builder });
+                try blocks.append(allocator, .{ .location = builder });
             } else {
-                try blocks.append(.passthrough);
+                try blocks.append(allocator, .passthrough);
             }
             continue;
         }
@@ -212,7 +213,7 @@ fn parseFile(
             std.log.err("config syntax error at {s}:{d}: missing ';'", .{ normalized, line_no });
             return error.InvalidConfigSyntax;
         }
-        const stmt = std.mem.trimRight(u8, line[0 .. line.len - 1], " \t\r\n");
+        const stmt = compat.trimRight(u8, line[0 .. line.len - 1], " \t\r\n");
         if (blocks.items.len > 0) {
             switch (blocks.items[blocks.items.len - 1]) {
                 .passthrough => try parseStatement(allocator, normalized, stmt, overrides, vars, visited, line_no),
@@ -695,8 +696,8 @@ fn parseLocationStatement(
     }
     if (std.ascii.eqlIgnoreCase(directive, "error_page")) {
         var toks = std.mem.tokenizeAny(u8, value_raw, " \t");
-        var status_codes = std.ArrayList([]const u8).init(allocator);
-        defer status_codes.deinit();
+        var status_codes = std.ArrayList([]const u8).empty;
+        defer status_codes.deinit(allocator);
         var target_raw: ?[]const u8 = null;
         while (toks.next()) |token| {
             if (std.mem.startsWith(u8, token, "/") or std.mem.startsWith(u8, token, "http://") or std.mem.startsWith(u8, token, "https://")) {
@@ -704,7 +705,7 @@ fn parseLocationStatement(
                 break;
             }
             _ = std.fmt.parseInt(u16, token, 10) catch return error.InvalidConfigSyntax;
-            try status_codes.append(token);
+            try status_codes.append(allocator, token);
         }
         const target_token = target_raw orelse return error.InvalidConfigSyntax;
         if (status_codes.items.len == 0) return error.InvalidConfigSyntax;
@@ -825,11 +826,11 @@ fn flushLocationBlock(allocator: std.mem.Allocator, overrides: *Overrides, build
 }
 
 fn flushServerBlock(allocator: std.mem.Allocator, overrides: *Overrides, builder: *ServerBlockBuilder) !void {
-    var location_blob = std.ArrayList(u8).init(allocator);
-    defer location_blob.deinit();
+    var location_blob = std.ArrayList(u8).empty;
+    defer location_blob.deinit(allocator);
     for (builder.location_entries.items, 0..) |entry, idx| {
-        if (idx != 0) try location_blob.append(';');
-        try location_blob.appendSlice(entry);
+        if (idx != 0) try location_blob.append(allocator, ';');
+        try location_blob.appendSlice(allocator, entry);
     }
     const record = try std.fmt.allocPrint(
         allocator,
@@ -908,10 +909,10 @@ fn parseInclude(
         const dir_path = resolved[0..slash];
         const pattern = resolved[slash + 1 ..];
         const suffix = if (std.mem.startsWith(u8, pattern, "*")) pattern[1..] else "";
-        var dir = try std.fs.cwd().openDir(dir_path, .{ .iterate = true });
-        defer dir.close();
+        var dir = try std.Io.Dir.cwd().openDir(compat.io(), dir_path, .{ .iterate = true });
+        defer dir.close(compat.io());
         var iter = dir.iterate();
-        while (try iter.next()) |entry| {
+        while (try iter.next(compat.io())) |entry| {
             if (entry.kind != .file) continue;
             if (suffix.len > 0 and !std.mem.endsWith(u8, entry.name, suffix)) continue;
             const child = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, entry.name });
@@ -931,19 +932,19 @@ fn normalizeDirectiveToEnv(allocator: std.mem.Allocator, directive: []const u8) 
         return out;
     }
 
-    var out = std.ArrayList(u8).init(allocator);
-    errdefer out.deinit();
-    try out.appendSlice("TARDIGRADE_");
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "TARDIGRADE_");
     for (directive) |ch| {
         const c = if (ch == '-') '_' else ch;
-        try out.append(std.ascii.toUpper(c));
+        try out.append(allocator, std.ascii.toUpper(c));
     }
-    return out.toOwnedSlice();
+    return out.toOwnedSlice(allocator);
 }
 
 fn interpolate(allocator: std.mem.Allocator, raw: []const u8, vars: *std.StringHashMap([]const u8)) ![]u8 {
-    var out = std.ArrayList(u8).init(allocator);
-    errdefer out.deinit();
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
 
     var i: usize = 0;
     while (i < raw.len) {
@@ -951,19 +952,19 @@ fn interpolate(allocator: std.mem.Allocator, raw: []const u8, vars: *std.StringH
             const end = std.mem.indexOfScalarPos(u8, raw, i + 2, '}') orelse return error.InvalidVariableInterpolation;
             const key = raw[i + 2 .. end];
             if (vars.get(key)) |value| {
-                try out.appendSlice(value);
+                try out.appendSlice(allocator, value);
             } else {
-                const env_value = std.process.getEnvVarOwned(allocator, key) catch "";
+                const env_value = compat.getEnvVarOwned(allocator, key) catch "";
                 defer if (env_value.len > 0) allocator.free(env_value);
-                try out.appendSlice(env_value);
+                try out.appendSlice(allocator, env_value);
             }
             i = end + 1;
             continue;
         }
-        try out.append(raw[i]);
+        try out.append(allocator, raw[i]);
         i += 1;
     }
-    return out.toOwnedSlice();
+    return out.toOwnedSlice(allocator);
 }
 
 fn resolveIncludePath(allocator: std.mem.Allocator, current_file: []const u8, include_path: []const u8) ![]u8 {
@@ -1141,7 +1142,7 @@ test "location blocks accumulate into location block env" {
     var cfg_dir = std.testing.tmpDir(.{});
     defer cfg_dir.cleanup();
 
-    try cfg_dir.dir.writeFile(.{
+    try compat.wrapDir(cfg_dir.dir).writeFile(.{
         .sub_path = "location.conf",
         .data =
         \\location = /health {
@@ -1158,8 +1159,8 @@ test "location blocks accumulate into location block env" {
         ,
     });
 
-    const cwd = std.fs.cwd();
-    const absolute = try cfg_dir.dir.realpathAlloc(allocator, "location.conf");
+    const cwd = compat.cwd().dir;
+    const absolute = try compat.wrapDir(cfg_dir.dir).realpathAlloc(allocator, "location.conf");
     defer allocator.free(absolute);
 
     var overrides = Overrides.init(allocator);
@@ -1187,7 +1188,7 @@ test "location block supports alias and fastcgi pass serialization" {
     var cfg_dir = std.testing.tmpDir(.{});
     defer cfg_dir.cleanup();
 
-    try cfg_dir.dir.writeFile(.{
+    try compat.wrapDir(cfg_dir.dir).writeFile(.{
         .sub_path = "location-fastcgi.conf",
         .data =
         \\location /php/ {
@@ -1200,7 +1201,7 @@ test "location block supports alias and fastcgi pass serialization" {
         ,
     });
 
-    const absolute = try cfg_dir.dir.realpathAlloc(allocator, "location-fastcgi.conf");
+    const absolute = try compat.wrapDir(cfg_dir.dir).realpathAlloc(allocator, "location-fastcgi.conf");
     defer allocator.free(absolute);
 
     var overrides = Overrides.init(allocator);
@@ -1227,7 +1228,7 @@ test "location block supports error_page serialization" {
     var cfg_dir = std.testing.tmpDir(.{});
     defer cfg_dir.cleanup();
 
-    try cfg_dir.dir.writeFile(.{
+    try compat.wrapDir(cfg_dir.dir).writeFile(.{
         .sub_path = "location-error-page.conf",
         .data =
         \\location / {
@@ -1238,7 +1239,7 @@ test "location block supports error_page serialization" {
         ,
     });
 
-    const absolute = try cfg_dir.dir.realpathAlloc(allocator, "location-error-page.conf");
+    const absolute = try compat.wrapDir(cfg_dir.dir).realpathAlloc(allocator, "location-error-page.conf");
     defer allocator.free(absolute);
 
     var overrides = Overrides.init(allocator);
@@ -1265,7 +1266,7 @@ test "server block supports nested location serialization" {
     var cfg_dir = std.testing.tmpDir(.{});
     defer cfg_dir.cleanup();
 
-    try cfg_dir.dir.writeFile(.{
+    try compat.wrapDir(cfg_dir.dir).writeFile(.{
         .sub_path = "server-block.conf",
         .data =
         \\server {
@@ -1281,7 +1282,7 @@ test "server block supports nested location serialization" {
         ,
     });
 
-    const absolute = try cfg_dir.dir.realpathAlloc(allocator, "server-block.conf");
+    const absolute = try compat.wrapDir(cfg_dir.dir).realpathAlloc(allocator, "server-block.conf");
     defer allocator.free(absolute);
 
     var overrides = Overrides.init(allocator);

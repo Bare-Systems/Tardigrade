@@ -66,7 +66,7 @@ pub fn reset() void {
 pub fn installSignalHandlers() void {
     const handler = std.posix.Sigaction{
         .handler = .{ .handler = handleSignal },
-        .mask = std.posix.empty_sigset,
+        .mask = std.posix.sigemptyset(),
         .flags = 0,
     };
 
@@ -77,7 +77,7 @@ pub fn installSignalHandlers() void {
     std.posix.sigaction(std.posix.SIG.USR2, &handler, null);
 }
 
-fn handleSignal(sig: c_int) callconv(.c) void {
+fn handleSignal(sig: std.c.SIG) callconv(.c) void {
     if (sig == std.posix.SIG.HUP) {
         @atomicStore(bool, &reload_requested, true, .seq_cst);
     } else if (sig == std.posix.SIG.USR1) {

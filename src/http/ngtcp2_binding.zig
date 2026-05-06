@@ -1,3 +1,4 @@
+const compat = @import("../zig_compat.zig");
 const std = @import("std");
 const build_options = @import("build_options");
 const http3_session = @import("http3_session.zig");
@@ -84,7 +85,7 @@ pub const DatagramResult = struct {
 
 pub const TimerResult = struct {
     bytes_to_send: usize = 0,
-    remote_addr: ?std.net.Address = null,
+    remote_addr: ?std.c.sockaddr.storage = null,
 };
 
 pub const WriteResult = TimerResult;
@@ -130,8 +131,8 @@ pub const Binding = if (enabled) struct {
             requests_completed: usize,
             conn_ref: c.ngtcp2_crypto_conn_ref,
             path_storage: c.ngtcp2_path_storage,
-            local_addr: std.net.Address,
-            remote_addr: std.net.Address,
+            local_addr: std.c.sockaddr.storage,
+            remote_addr: std.c.sockaddr.storage,
             scid: c.ngtcp2_cid,
             dcid: c.ngtcp2_cid,
         };
@@ -250,7 +251,7 @@ pub const Binding = if (enabled) struct {
         };
     }
 
-    pub fn handleDatagram(server: *@This().Server, packet: quic.ParsedPacket, datagram: []const u8, remote_ip: []const u8, local_addr: std.net.Address, remote_addr: std.net.Address, out_buf: []u8) Ngtcp2Error!DatagramResult {
+    pub fn handleDatagram(server: *@This().Server, packet: quic.ParsedPacket, datagram: []const u8, remote_ip: []const u8, local_addr: std.c.sockaddr.storage, remote_addr: std.c.sockaddr.storage, out_buf: []u8) Ngtcp2Error!DatagramResult {
         if (datagram.len == 0) return .{};
         server.stats.datagrams_seen += 1;
         server.stats.bytes_seen += datagram.len;
@@ -309,7 +310,7 @@ pub const Binding = if (enabled) struct {
 
     fn upsertConnection(server: *@This().Server, packet: quic.ParsedPacket, datagram: []const u8, remote_ip: []const u8, remote_port: u16) !void {
         if (packet.dcid.len == 0) return;
-        const cid_hex = try std.fmt.allocPrint(server.allocator, "{s}", .{std.fmt.fmtSliceHexLower(packet.dcid)});
+        const cid_hex = try std.fmt.allocPrint(server.allocator, "{f}", .{compat.fmtSliceHexLower(packet.dcid)});
         defer server.allocator.free(cid_hex);
 
         if (server.connections.getPtr(cid_hex)) |conn| {
@@ -345,12 +346,12 @@ pub const Binding = if (enabled) struct {
         server.stats.connections_created += 1;
     }
 
-    fn ensureNativeConnection(server: *@This().Server, packet: quic.ParsedPacket, local_addr: std.net.Address, remote_addr: std.net.Address) !void {
+    fn ensureNativeConnection(server: *@This().Server, packet: quic.ParsedPacket, local_addr: std.c.sockaddr.storage, remote_addr: std.c.sockaddr.storage) !void {
         const original_dcid = packet.dcid;
         if (original_dcid.len == 0) return;
         if (packet.scid.len == 0) return;
 
-        const cid_hex = try std.fmt.allocPrint(server.allocator, "{s}", .{std.fmt.fmtSliceHexLower(original_dcid)});
+        const cid_hex = try std.fmt.allocPrint(server.allocator, "{f}", .{compat.fmtSliceHexLower(original_dcid)});
         defer server.allocator.free(cid_hex);
         if (server.native_connections.contains(cid_hex)) return;
 
@@ -469,7 +470,7 @@ pub const Binding = if (enabled) struct {
         setConnectionStateFlags(server, packet.dcid, true, false, false, 0);
     }
 
-    fn readNativePacket(server: *@This().Server, native: *@This().Server.NativeConnection, datagram: []const u8, local_addr: std.net.Address, remote_addr: std.net.Address) !c_int {
+    fn readNativePacket(server: *@This().Server, native: *@This().Server.NativeConnection, datagram: []const u8, local_addr: std.c.sockaddr.storage, remote_addr: std.c.sockaddr.storage) !c_int {
         native.local_addr = local_addr;
         native.remote_addr = remote_addr;
         c.ngtcp2_path_storage_init(
@@ -510,7 +511,7 @@ pub const Binding = if (enabled) struct {
         return rc;
     }
 
-    fn writeNativePacket(server: *@This().Server, native: *@This().Server.NativeConnection, local_addr: std.net.Address, remote_addr: std.net.Address, out_buf: []u8) !usize {
+    fn writeNativePacket(server: *@This().Server, native: *@This().Server.NativeConnection, local_addr: std.c.sockaddr.storage, remote_addr: std.c.sockaddr.storage, out_buf: []u8) !usize {
         if (out_buf.len == 0) return 0;
         c.ngtcp2_path_storage_init(
             &native.path_storage,
@@ -629,7 +630,7 @@ pub const Binding = if (enabled) struct {
 
     fn lookupNativeConnection(server: *@This().Server, cid: []const u8) !?*@This().Server.NativeConnection {
         if (cid.len == 0) return null;
-        const cid_hex = try std.fmt.allocPrint(server.allocator, "{s}", .{std.fmt.fmtSliceHexLower(cid)});
+        const cid_hex = try std.fmt.allocPrint(server.allocator, "{f}", .{compat.fmtSliceHexLower(cid)});
         defer server.allocator.free(cid_hex);
         if (server.native_connections.getPtr(cid_hex)) |native| return native.*;
         if (server.native_connection_aliases.get(cid_hex)) |primary_key| {
@@ -640,7 +641,7 @@ pub const Binding = if (enabled) struct {
 
     fn addNativeAlias(server: *@This().Server, alias_cid: []const u8, primary_key: []const u8) !void {
         if (alias_cid.len == 0) return;
-        const alias_hex = try std.fmt.allocPrint(server.allocator, "{s}", .{std.fmt.fmtSliceHexLower(alias_cid)});
+        const alias_hex = try std.fmt.allocPrint(server.allocator, "{f}", .{compat.fmtSliceHexLower(alias_cid)});
         defer server.allocator.free(alias_hex);
         if (server.native_connection_aliases.contains(alias_hex)) return;
         const key = try server.allocator.dupe(u8, alias_hex);
@@ -652,7 +653,7 @@ pub const Binding = if (enabled) struct {
 
     fn setConnectionStateFlags(server: *@This().Server, cid: []const u8, native_created: bool, read_attempted: bool, handshake_complete: bool, last_error_code: c_int) void {
         if (cid.len == 0) return;
-        const cid_hex = std.fmt.allocPrint(server.allocator, "{s}", .{std.fmt.fmtSliceHexLower(cid)}) catch return;
+        const cid_hex = std.fmt.allocPrint(server.allocator, "{f}", .{compat.fmtSliceHexLower(cid)}) catch return;
         defer server.allocator.free(cid_hex);
         if (server.connections.getPtr(cid_hex)) |conn| {
             conn.native_connection_created = conn.native_connection_created or native_created;
@@ -665,7 +666,7 @@ pub const Binding = if (enabled) struct {
 
     fn noteStreamData(server: *@This().Server, cid: []const u8, datalen: usize, completed_request: bool) void {
         if (cid.len == 0) return;
-        const cid_hex = std.fmt.allocPrint(server.allocator, "{s}", .{std.fmt.fmtSliceHexLower(cid)}) catch return;
+        const cid_hex = std.fmt.allocPrint(server.allocator, "{f}", .{compat.fmtSliceHexLower(cid)}) catch return;
         defer server.allocator.free(cid_hex);
         if (server.connections.getPtr(cid_hex)) |conn| {
             conn.stream_bytes_received += datalen;
@@ -675,7 +676,7 @@ pub const Binding = if (enabled) struct {
     }
 
     fn timestampNow() c.ngtcp2_tstamp {
-        return @intCast(std.time.nanoTimestamp());
+        return @intCast(compat.nanoTimestamp());
     }
 
     fn getConnFromRef(ref: [*c]c.ngtcp2_crypto_conn_ref) callconv(.c) ?*c.ngtcp2_conn {
@@ -959,7 +960,7 @@ pub const Binding = if (enabled) struct {
         return error.DependencyUnavailable;
     }
 
-    pub fn handleDatagram(_: *@This().Server, _: quic.ParsedPacket, _: []const u8, _: []const u8, _: std.net.Address, _: std.net.Address, _: []u8) Ngtcp2Error!DatagramResult {
+    pub fn handleDatagram(_: *@This().Server, _: quic.ParsedPacket, _: []const u8, _: []const u8, _: std.c.sockaddr.storage, _: std.c.sockaddr.storage, _: []u8) Ngtcp2Error!DatagramResult {
         return error.DependencyUnavailable;
     }
 
@@ -994,7 +995,7 @@ pub fn bootstrapServer(allocator: std.mem.Allocator, cfg: ServerBootstrap) Ngtcp
     return Binding.bootstrapServer(allocator, cfg);
 }
 
-pub fn handleDatagram(server: *Server, packet: quic.ParsedPacket, datagram: []const u8, remote_ip: []const u8, local_addr: std.net.Address, remote_addr: std.net.Address, out_buf: []u8) Ngtcp2Error!DatagramResult {
+pub fn handleDatagram(server: *Server, packet: quic.ParsedPacket, datagram: []const u8, remote_ip: []const u8, local_addr: std.c.sockaddr.storage, remote_addr: std.c.sockaddr.storage, out_buf: []u8) Ngtcp2Error!DatagramResult {
     return Binding.handleDatagram(server, packet, datagram, remote_ip, local_addr, remote_addr, out_buf);
 }
 
@@ -1022,8 +1023,8 @@ test "runtime support reports disabled when ngtcp2 integration is off" {
         .token = "",
         .payload = "",
     };
-    const local_addr = try std.net.Address.parseIp("127.0.0.1", 443);
-    const remote_addr = try std.net.Address.parseIp("127.0.0.1", 44444);
+    const local_addr = (try compat.parseIpAddress("127.0.0.1", 443)).storage;
+    const remote_addr = (try compat.parseIpAddress("127.0.0.1", 44444)).storage;
     var out_buf: [64]u8 = undefined;
     try std.testing.expectError(error.DependencyUnavailable, handleDatagram(&server, packet, "hello", "127.0.0.1", local_addr, remote_addr, &out_buf));
 }
@@ -1048,8 +1049,8 @@ test "enabled binding ignores malformed initial packets before native bootstrap"
         0x01, 0xaa,
     };
     const packet = try quic.parsePacket(&datagram);
-    const local_addr = try std.net.Address.parseIp("127.0.0.1", 9444);
-    const remote_addr = try std.net.Address.parseIp("127.0.0.1", 44444);
+    const local_addr = (try compat.parseIpAddress("127.0.0.1", 9444)).storage;
+    const remote_addr = (try compat.parseIpAddress("127.0.0.1", 44444)).storage;
 
     var out_buf: [1500]u8 = undefined;
     const result = try handleDatagram(&server, packet, &datagram, "v4:127.0.0.1", local_addr, remote_addr, &out_buf);

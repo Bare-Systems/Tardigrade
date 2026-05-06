@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("../zig_compat.zig");
 const Allocator = std.mem.Allocator;
 const Headers = @import("headers.zig").Headers;
 
@@ -67,14 +68,14 @@ pub const SessionStore = struct {
             return error.TooManySessions;
         }
 
-        const now = std.time.nanoTimestamp();
+        const now = compat.nanoTimestamp();
 
         // Generate cryptographically random token
         var token_bytes: [TOKEN_BYTES]u8 = undefined;
-        std.crypto.random.bytes(&token_bytes);
+        compat.randomBytes(&token_bytes);
 
         var token_hex: [TOKEN_HEX_LEN]u8 = undefined;
-        _ = std.fmt.bufPrint(&token_hex, "{s}", .{std.fmt.fmtSliceHexLower(&token_bytes)}) catch unreachable;
+        _ = std.fmt.bufPrint(&token_hex, "{f}", .{compat.fmtSliceHexLower(&token_bytes)}) catch unreachable;
 
         const owned_identity = try self.allocator.dupe(u8, identity);
         errdefer self.allocator.free(owned_identity);
@@ -110,7 +111,7 @@ pub const SessionStore = struct {
         const entry = self.sessions.getPtr(token) orelse return null;
         if (entry.revoked) return null;
 
-        const now = std.time.nanoTimestamp();
+        const now = compat.nanoTimestamp();
         if (now - entry.last_active_ns > self.ttl_ns) {
             // Expired — remove it
             self.removeByToken(token);
@@ -146,10 +147,10 @@ pub const SessionStore = struct {
 
     /// List active sessions for a given identity.
     pub fn listByIdentity(self: *const SessionStore, allocator: Allocator, identity: []const u8) ![]const Session {
-        var result = std.ArrayList(Session).init(allocator);
-        errdefer result.deinit();
+        var result = std.ArrayList(Session).empty;
+        errdefer result.deinit(allocator);
 
-        const now = std.time.nanoTimestamp();
+        const now = compat.nanoTimestamp();
         var it = self.sessions.iterator();
         while (it.next()) |entry| {
             const s = entry.value_ptr;
@@ -157,16 +158,16 @@ pub const SessionStore = struct {
                 std.mem.eql(u8, s.identity, identity) and
                 now - s.last_active_ns <= self.ttl_ns)
             {
-                try result.append(s.*);
+                try result.append(allocator, s.*);
             }
         }
-        return result.toOwnedSlice();
+        return result.toOwnedSlice(allocator);
     }
 
     /// Count active (non-revoked, non-expired) sessions.
     pub fn activeCount(self: *const SessionStore) u32 {
         var count: u32 = 0;
-        const now = std.time.nanoTimestamp();
+        const now = compat.nanoTimestamp();
         var it = self.sessions.iterator();
         while (it.next()) |entry| {
             if (!entry.value_ptr.revoked and now - entry.value_ptr.last_active_ns <= self.ttl_ns) {
@@ -191,16 +192,16 @@ pub const SessionStore = struct {
     }
 
     fn cleanupExpired(self: *SessionStore) void {
-        const now = std.time.nanoTimestamp();
-        var keys_to_remove = std.ArrayList([]const u8).init(self.allocator);
-        defer keys_to_remove.deinit();
+        const now = compat.nanoTimestamp();
+        var keys_to_remove = std.ArrayList([]const u8).empty;
+        defer keys_to_remove.deinit(self.allocator);
 
         var it = self.sessions.iterator();
         while (it.next()) |entry| {
             const s = entry.value_ptr;
             // Remove expired sessions or revoked sessions (cleaned up at next cycle)
             if (now - s.last_active_ns > self.ttl_ns or s.revoked) {
-                keys_to_remove.append(entry.key_ptr.*) catch continue;
+                keys_to_remove.append(self.allocator, entry.key_ptr.*) catch continue;
             }
         }
 

@@ -1,3 +1,4 @@
+const compat = @import("../zig_compat.zig");
 const std = @import("std");
 const headers_mod = @import("headers.zig");
 const Headers = headers_mod.Headers;
@@ -65,26 +66,26 @@ pub fn buildPacketWithOptions(
     opts: RequestOptions,
     body: []const u8,
 ) ![]u8 {
-    var vars = std.ArrayList(u8).init(allocator);
-    defer vars.deinit();
+    var vars = std.ArrayList(u8).empty;
+    defer vars.deinit(allocator);
 
     var len_buf: [32]u8 = undefined;
     const len_str = try std.fmt.bufPrint(&len_buf, "{d}", .{body.len});
-    try appendKv(&vars, "REQUEST_METHOD", opts.method);
-    try appendKv(&vars, "REQUEST_URI", opts.request_uri);
-    try appendKv(&vars, "QUERY_STRING", opts.query_string);
-    try appendKv(&vars, "PATH_INFO", opts.path_info);
-    try appendKv(&vars, "SCRIPT_NAME", opts.script_name);
-    try appendKv(&vars, "DOCUMENT_ROOT", opts.document_root);
-    try appendKv(&vars, "CONTENT_LENGTH", len_str);
-    try appendKv(&vars, "REMOTE_ADDR", opts.remote_addr);
-    try appendKv(&vars, "REMOTE_PORT", opts.remote_port);
-    try appendKv(&vars, "SERVER_NAME", opts.server_name);
-    try appendKv(&vars, "SERVER_PORT", opts.server_port);
-    try appendKv(&vars, "SERVER_PROTOCOL", opts.server_protocol);
-    try appendKv(&vars, "REQUEST_SCHEME", opts.request_scheme);
-    try appendKv(&vars, "HTTPS", if (opts.https) "on" else "off");
-    if (opts.content_type) |content_type| try appendKv(&vars, "CONTENT_TYPE", content_type);
+    try appendKv(allocator, &vars, "REQUEST_METHOD", opts.method);
+    try appendKv(allocator, &vars, "REQUEST_URI", opts.request_uri);
+    try appendKv(allocator, &vars, "QUERY_STRING", opts.query_string);
+    try appendKv(allocator, &vars, "PATH_INFO", opts.path_info);
+    try appendKv(allocator, &vars, "SCRIPT_NAME", opts.script_name);
+    try appendKv(allocator, &vars, "DOCUMENT_ROOT", opts.document_root);
+    try appendKv(allocator, &vars, "CONTENT_LENGTH", len_str);
+    try appendKv(allocator, &vars, "REMOTE_ADDR", opts.remote_addr);
+    try appendKv(allocator, &vars, "REMOTE_PORT", opts.remote_port);
+    try appendKv(allocator, &vars, "SERVER_NAME", opts.server_name);
+    try appendKv(allocator, &vars, "SERVER_PORT", opts.server_port);
+    try appendKv(allocator, &vars, "SERVER_PROTOCOL", opts.server_protocol);
+    try appendKv(allocator, &vars, "REQUEST_SCHEME", opts.request_scheme);
+    try appendKv(allocator, &vars, "HTTPS", if (opts.https) "on" else "off");
+    if (opts.content_type) |content_type| try appendKv(allocator, &vars, "CONTENT_TYPE", content_type);
 
     if (opts.headers) |req_headers| {
         for (req_headers.iterator()) |header| {
@@ -95,21 +96,21 @@ pub fn buildPacketWithOptions(
             }
             const env_name = try headerNameToEnv(allocator, header.name);
             defer allocator.free(env_name);
-            try appendKv(&vars, env_name, header.value);
+            try appendKv(allocator, &vars, env_name, header.value);
         }
     }
-    for (opts.extra_env) |pair| try appendKv(&vars, pair.name, pair.value);
+    for (opts.extra_env) |pair| try appendKv(allocator, &vars, pair.name, pair.value);
 
     const size: u16 = @intCast(vars.items.len);
-    var out = std.ArrayList(u8).init(allocator);
-    errdefer out.deinit();
-    try out.append(opts.modifier1);
-    try out.append(@intCast(size & 0xff));
-    try out.append(@intCast((size >> 8) & 0xff));
-    try out.append(opts.modifier2);
-    try out.appendSlice(vars.items);
-    try out.appendSlice(body);
-    return out.toOwnedSlice();
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    try out.append(allocator, opts.modifier1);
+    try out.append(allocator, @intCast(size & 0xff));
+    try out.append(allocator, @intCast((size >> 8) & 0xff));
+    try out.append(allocator, opts.modifier2);
+    try out.appendSlice(allocator, vars.items);
+    try out.appendSlice(allocator, body);
+    return out.toOwnedSlice(allocator);
 }
 
 pub fn execute(
@@ -126,13 +127,13 @@ pub fn execute(
     return readResponse(allocator, &stream);
 }
 
-pub fn connect(allocator: std.mem.Allocator, endpoint: []const u8) !std.net.Stream {
-    if (unixSocketPath(endpoint)) |path| return std.net.connectUnixSocket(path);
+pub fn connect(allocator: std.mem.Allocator, endpoint: []const u8) !compat.NetStream {
+    if (unixSocketPath(endpoint)) |path| return compat.connectUnixSocket(path) catch unreachable;
     const ep = try memcached.parseEndpoint(endpoint);
-    return std.net.tcpConnectToHost(allocator, ep.host, ep.port);
+    return compat.tcpConnectToHost(allocator, ep.host, ep.port);
 }
 
-pub fn readResponse(allocator: std.mem.Allocator, stream: *std.net.Stream) !Response {
+pub fn readResponse(allocator: std.mem.Allocator, stream: *compat.NetStream) !Response {
     const raw = try stream.reader().readAllAlloc(allocator, 2 * 1024 * 1024);
     errdefer allocator.free(raw);
     return parseResponse(allocator, raw);
@@ -176,8 +177,8 @@ fn isChunked(transfer_encoding: ?[]const u8) bool {
 }
 
 fn decodeChunkedBody(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
-    var out = std.ArrayList(u8).init(allocator);
-    errdefer out.deinit();
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
     var pos: usize = 0;
     while (pos < raw.len) {
         const line_end = std.mem.indexOfPos(u8, raw, pos, "\r\n") orelse return error.InvalidChunkedResponse;
@@ -186,10 +187,10 @@ fn decodeChunkedBody(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
         const chunk_size = std.fmt.parseInt(usize, size_text[0..semi], 16) catch return error.InvalidChunkedResponse;
         pos = line_end + 2;
         if (chunk_size == 0) {
-            return out.toOwnedSlice();
+            return out.toOwnedSlice(allocator);
         }
         if (pos + chunk_size + 2 > raw.len) return error.InvalidChunkedResponse;
-        try out.appendSlice(raw[pos .. pos + chunk_size]);
+        try out.appendSlice(allocator, raw[pos .. pos + chunk_size]);
         pos += chunk_size;
         if (!std.mem.eql(u8, raw[pos .. pos + 2], "\r\n")) return error.InvalidChunkedResponse;
         pos += 2;
@@ -225,29 +226,29 @@ fn headerBodySplit(data: []const u8) ?HeaderSplit {
 }
 
 fn normalizeHeaderBlock(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
-    var out = std.ArrayList(u8).init(allocator);
-    errdefer out.deinit();
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
     var i: usize = 0;
     while (i < raw.len) : (i += 1) {
         const c = raw[i];
         if (c == '\r') {
-            try out.append('\r');
+            try out.append(allocator, '\r');
             if (i + 1 < raw.len and raw[i + 1] == '\n') {
-                try out.append('\n');
+                try out.append(allocator, '\n');
                 i += 1;
             } else {
-                try out.append('\n');
+                try out.append(allocator, '\n');
             }
             continue;
         }
         if (c == '\n') {
-            try out.appendSlice("\r\n");
+            try out.appendSlice(allocator, "\r\n");
             continue;
         }
-        try out.append(c);
+        try out.append(allocator, c);
     }
-    if (!std.mem.endsWith(u8, out.items, "\r\n\r\n")) try out.appendSlice("\r\n\r\n");
-    return out.toOwnedSlice();
+    if (!std.mem.endsWith(u8, out.items, "\r\n\r\n")) try out.appendSlice(allocator, "\r\n\r\n");
+    return out.toOwnedSlice(allocator);
 }
 
 fn parseStatus(raw: []const u8) u16 {
@@ -257,13 +258,13 @@ fn parseStatus(raw: []const u8) u16 {
     return std.fmt.parseInt(u16, trimmed[0..end], 10) catch 200;
 }
 
-fn appendKv(out: *std.ArrayList(u8), key: []const u8, value: []const u8) !void {
-    try out.append(@intCast(key.len & 0xff));
-    try out.append(@intCast((key.len >> 8) & 0xff));
-    try out.append(@intCast(value.len & 0xff));
-    try out.append(@intCast((value.len >> 8) & 0xff));
-    try out.appendSlice(key);
-    try out.appendSlice(value);
+fn appendKv(allocator: std.mem.Allocator, out: *std.ArrayList(u8), key: []const u8, value: []const u8) !void {
+    try out.append(allocator, @intCast(key.len & 0xff));
+    try out.append(allocator, @intCast((key.len >> 8) & 0xff));
+    try out.append(allocator, @intCast(value.len & 0xff));
+    try out.append(allocator, @intCast((value.len >> 8) & 0xff));
+    try out.appendSlice(allocator, key);
+    try out.appendSlice(allocator, value);
 }
 
 fn headerNameToEnv(allocator: std.mem.Allocator, name: []const u8) ![]u8 {

@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("../zig_compat.zig");
 const build_options = @import("build_options");
 const Allocator = std.mem.Allocator;
 const Status = @import("status.zig").Status;
@@ -14,21 +15,12 @@ pub const SERVER_VERSION = build_options.version;
 fn loadCustomErrorPage(allocator: Allocator, status: Status) ?[]const u8 {
     var path_buf: [64]u8 = undefined;
     const path = std.fmt.bufPrint(&path_buf, "public/errors/{d}.html", .{status.code()}) catch return null;
-
-    var file = std.fs.cwd().openFile(path, .{}) catch return null;
-    defer file.close();
-
-    const stat = file.stat() catch return null;
-    const file_size = @as(usize, stat.size);
-    if (file_size == 0) return null;
-
-    const buf = allocator.alloc(u8, file_size) catch return null;
-    const bytes_read = file.readAll(buf) catch {
-        allocator.free(buf);
+    const body = compat.cwd().readFileAlloc(allocator, path, 512 * 1024) catch return null;
+    if (body.len == 0) {
+        allocator.free(body);
         return null;
-    };
-
-    return buf[0..bytes_read];
+    }
+    return body;
 }
 
 /// HTTP Response builder
@@ -202,7 +194,7 @@ pub const Response = struct {
 
     fn writeDate(self: *Response, writer: anytype) !void {
         _ = self;
-        const timestamp = std.time.timestamp();
+        const timestamp = compat.unixTimestamp();
         const epoch_secs: std.time.epoch.EpochSeconds = .{ .secs = @intCast(timestamp) };
         const day_secs = epoch_secs.getDaySeconds();
         const epoch_day = epoch_secs.getEpochDay();
@@ -457,7 +449,7 @@ test "build simple 200 response" {
     _ = response.setStatus(.ok).setBody("Hello, World!").setContentType("text/plain");
 
     var buf: [1024]u8 = undefined;
-    var stream = std.io.fixedBufferStream(&buf);
+    var stream = compat.fixedBufferStream(&buf);
     try response.write(stream.writer());
 
     const output = stream.getWritten();
@@ -476,7 +468,7 @@ test "404 response" {
     defer response.deinit();
 
     var buf: [1024]u8 = undefined;
-    var stream = std.io.fixedBufferStream(&buf);
+    var stream = compat.fixedBufferStream(&buf);
     try response.write(stream.writer());
 
     const output = stream.getWritten();
@@ -495,7 +487,7 @@ test "redirect response" {
     defer response.deinit();
 
     var buf: [1024]u8 = undefined;
-    var stream = std.io.fixedBufferStream(&buf);
+    var stream = compat.fixedBufferStream(&buf);
     try response.write(stream.writer());
 
     const output = stream.getWritten();
@@ -513,7 +505,7 @@ test "custom headers" {
     _ = response.setStatus(.ok).setHeader("X-Custom", "my-value").setHeader("X-Another", "another-value");
 
     var buf: [1024]u8 = undefined;
-    var stream = std.io.fixedBufferStream(&buf);
+    var stream = compat.fixedBufferStream(&buf);
     try response.write(stream.writer());
 
     const output = stream.getWritten();
@@ -531,7 +523,7 @@ test "head response excludes body" {
     _ = response.setStatus(.ok).setBody("This body should not appear");
 
     var buf: [1024]u8 = undefined;
-    var stream = std.io.fixedBufferStream(&buf);
+    var stream = compat.fixedBufferStream(&buf);
     try response.writeHead(stream.writer());
 
     const output = stream.getWritten();
@@ -548,7 +540,7 @@ test "json response" {
     defer response.deinit();
 
     var buf: [1024]u8 = undefined;
-    var stream = std.io.fixedBufferStream(&buf);
+    var stream = compat.fixedBufferStream(&buf);
     try response.write(stream.writer());
 
     const output = stream.getWritten();
@@ -565,7 +557,7 @@ test "method not allowed includes Allow header" {
     defer response.deinit();
 
     var buf: [1024]u8 = undefined;
-    var stream = std.io.fixedBufferStream(&buf);
+    var stream = compat.fixedBufferStream(&buf);
     try response.write(stream.writer());
 
     const output = stream.getWritten();
@@ -581,7 +573,7 @@ test "date header format" {
     defer response.deinit();
 
     var buf: [1024]u8 = undefined;
-    var stream = std.io.fixedBufferStream(&buf);
+    var stream = compat.fixedBufferStream(&buf);
     try response.write(stream.writer());
 
     const output = stream.getWritten();
@@ -601,7 +593,7 @@ test "connection header when setConnection(true)" {
     _ = response.setBody("hi").setConnection(true);
 
     var buf: [256]u8 = undefined;
-    var stream = std.io.fixedBufferStream(&buf);
+    var stream = compat.fixedBufferStream(&buf);
     try response.write(stream.writer());
 
     const output = stream.getWritten();
@@ -618,7 +610,7 @@ test "connection header when setConnection(false)" {
     _ = response.setBody("hi").setConnection(false);
 
     var buf: [256]u8 = undefined;
-    var stream = std.io.fixedBufferStream(&buf);
+    var stream = compat.fixedBufferStream(&buf);
     try response.write(stream.writer());
 
     const output = stream.getWritten();

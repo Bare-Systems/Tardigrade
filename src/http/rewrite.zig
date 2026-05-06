@@ -242,23 +242,23 @@ fn regexReplace(
     var captures: [10]c.regmatch_t = undefined;
     if (regexec(&regex, input_z_ptr, captures.len, captures[0..].ptr, 0) != 0) return null;
 
-    var out = std.ArrayList(u8).init(allocator);
-    errdefer out.deinit();
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
 
     var i: usize = 0;
     while (i < replacement.len) : (i += 1) {
         if (replacement[i] != '$' or i + 1 >= replacement.len) {
-            try out.append(replacement[i]);
+            try out.append(allocator, replacement[i]);
             continue;
         }
 
         if (std.mem.startsWith(u8, replacement[i..], "$request_uri")) {
-            try out.appendSlice(request_uri);
+            try out.appendSlice(allocator, request_uri);
             i += "$request_uri".len - 1;
             continue;
         }
         if (std.mem.startsWith(u8, replacement[i..], "$uri")) {
-            try out.appendSlice(input);
+            try out.appendSlice(allocator, input);
             i += "$uri".len - 1;
             continue;
         }
@@ -266,7 +266,7 @@ fn regexReplace(
         const next = replacement[i + 1];
         if (next >= '0' and next <= '9') {
             const capture_index: usize = next - '0';
-            try appendCapture(&out, input, &captures, capture_index);
+            try appendCapture(allocator, &out, input, &captures, capture_index);
             i += 1;
             continue;
         }
@@ -275,25 +275,25 @@ fn regexReplace(
             while (end < replacement.len and (std.ascii.isAlphanumeric(replacement[end]) or replacement[end] == '_')) : (end += 1) {}
             const capture_name = replacement[i + 1 .. end];
             if (namedCaptureIndex(prepared.named_captures, capture_name)) |capture_index| {
-                try appendCapture(&out, input, &captures, capture_index);
+                try appendCapture(allocator, &out, input, &captures, capture_index);
                 i = end - 1;
                 continue;
             }
         }
 
-        try out.append(replacement[i]);
+        try out.append(allocator, replacement[i]);
     }
-    const result = try out.toOwnedSlice();
+    const result = try out.toOwnedSlice(allocator);
     return result;
 }
 
 fn preparePattern(allocator: std.mem.Allocator, pattern: []const u8) !PreparedPattern {
-    var normalized = std.ArrayList(u8).init(allocator);
-    errdefer normalized.deinit();
-    var named = std.ArrayList(NamedCapture).init(allocator);
+    var normalized = std.ArrayList(u8).empty;
+    errdefer normalized.deinit(allocator);
+    var named = std.ArrayList(NamedCapture).empty;
     errdefer {
         for (named.items) |entry| allocator.free(entry.name);
-        named.deinit();
+        named.deinit(allocator);
     }
 
     var capture_index: usize = 0;
@@ -301,10 +301,10 @@ fn preparePattern(allocator: std.mem.Allocator, pattern: []const u8) !PreparedPa
     var in_class = false;
     while (i < pattern.len) : (i += 1) {
         if (pattern[i] == '\\') {
-            try normalized.append(pattern[i]);
+            try normalized.append(allocator, pattern[i]);
             if (i + 1 < pattern.len) {
                 i += 1;
-                try normalized.append(pattern[i]);
+                try normalized.append(allocator, pattern[i]);
             }
             continue;
         }
@@ -315,24 +315,24 @@ fn preparePattern(allocator: std.mem.Allocator, pattern: []const u8) !PreparedPa
             const name_start = i + "(?P<".len;
             const name_end = std.mem.indexOfScalarPos(u8, pattern, name_start, '>') orelse return error.InvalidNamedCapture;
             capture_index += 1;
-            try named.append(.{
+            try named.append(allocator, .{
                 .name = try allocator.dupe(u8, pattern[name_start..name_end]),
                 .index = capture_index,
             });
-            try normalized.append('(');
+            try normalized.append(allocator, '(');
             i = name_end;
             continue;
         }
         if (!in_class and pattern[i] == '(') {
             capture_index += 1;
         }
-        try normalized.append(pattern[i]);
+        try normalized.append(allocator, pattern[i]);
     }
 
     return .{
         .allocator = allocator,
-        .normalized_pattern = try normalized.toOwnedSlice(),
-        .named_captures = try named.toOwnedSlice(),
+        .normalized_pattern = try normalized.toOwnedSlice(allocator),
+        .named_captures = try named.toOwnedSlice(allocator),
     };
 }
 
@@ -344,6 +344,7 @@ fn namedCaptureIndex(named_captures: []const NamedCapture, name: []const u8) ?us
 }
 
 fn appendCapture(
+    allocator: std.mem.Allocator,
     out: *std.ArrayList(u8),
     input: []const u8,
     captures: []const c.regmatch_t,
@@ -353,7 +354,7 @@ fn appendCapture(
     if (captures[capture_index].rm_so < 0 or captures[capture_index].rm_eo < captures[capture_index].rm_so) return;
     const start: usize = @intCast(captures[capture_index].rm_so);
     const end: usize = @intCast(captures[capture_index].rm_eo);
-    try out.appendSlice(input[start..end]);
+    try out.appendSlice(allocator, input[start..end]);
 }
 
 test "parse rewrite flag aliases" {

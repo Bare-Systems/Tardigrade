@@ -25,7 +25,7 @@ pub const Headers = struct {
     pub fn init(allocator: Allocator) Headers {
         return .{
             .allocator = allocator,
-            .items = std.ArrayList(Header).init(allocator),
+            .items = .empty,
         };
     }
 
@@ -35,7 +35,7 @@ pub const Headers = struct {
             self.allocator.free(header.name);
             self.allocator.free(header.value);
         }
-        self.items.deinit();
+        self.items.deinit(self.allocator);
     }
 
     /// Add a header (name will be lowercased)
@@ -54,7 +54,7 @@ pub const Headers = struct {
         const trimmed_value = std.mem.trim(u8, value, " \t");
         const value_copy = try self.allocator.dupe(u8, trimmed_value);
 
-        try self.items.append(.{
+        try self.items.append(self.allocator, .{
             .name = lower_name,
             .value = value_copy,
         });
@@ -89,13 +89,14 @@ pub const Headers = struct {
         }
         const lower_name = lower_buf[0..name.len];
 
-        var result = std.ArrayList([]const u8).init(allocator);
+        var result = std.ArrayList([]const u8).empty;
+        errdefer result.deinit(allocator);
         for (self.items.items) |header| {
             if (std.mem.eql(u8, header.name, lower_name)) {
-                try result.append(header.value);
+                try result.append(allocator, header.value);
             }
         }
-        return result.toOwnedSlice();
+        return result.toOwnedSlice(allocator);
     }
 
     /// Check if a header exists

@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("../zig_compat.zig");
 
 /// HTTP Status Codes as defined in RFC 7231 and related RFCs
 pub const Status = enum(u16) {
@@ -193,7 +194,7 @@ pub const Status = enum(u16) {
 
     /// Create a Status from a numeric code
     pub fn fromCode(code_num: u16) ?Status {
-        return std.meta.intToEnum(Status, code_num) catch null;
+        return compat.intToEnum(Status, code_num);
     }
 };
 

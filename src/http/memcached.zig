@@ -1,3 +1,4 @@
+const compat = @import("../zig_compat.zig");
 const std = @import("std");
 
 pub const Endpoint = struct {
@@ -17,7 +18,7 @@ pub fn parseEndpoint(raw: []const u8) !Endpoint {
 
 pub fn get(allocator: std.mem.Allocator, endpoint: []const u8, key: []const u8) !?[]u8 {
     const ep = try parseEndpoint(endpoint);
-    const stream = try std.net.tcpConnectToHost(allocator, ep.host, ep.port);
+    const stream = try compat.tcpConnectToHost(allocator, ep.host, ep.port);
     defer stream.close();
     try stream.writer().print("get {s}\r\n", .{key});
     var buf: [64 * 1024]u8 = undefined;
@@ -32,7 +33,7 @@ pub fn get(allocator: std.mem.Allocator, endpoint: []const u8, key: []const u8) 
 
 pub fn set(allocator: std.mem.Allocator, endpoint: []const u8, key: []const u8, value: []const u8, ttl: u32) !bool {
     const ep = try parseEndpoint(endpoint);
-    const stream = try std.net.tcpConnectToHost(allocator, ep.host, ep.port);
+    const stream = try compat.tcpConnectToHost(allocator, ep.host, ep.port);
     defer stream.close();
     try stream.writer().print("set {s} 0 {d} {d}\r\n", .{ key, ttl, value.len });
     try stream.writer().writeAll(value);

@@ -1,3 +1,4 @@
+const compat = @import("../zig_compat.zig");
 /// ACME (RFC 8555) client for automated TLS certificate issuance and renewal.
 ///
 /// Supports:
@@ -45,7 +46,7 @@ pub const AcmeError = error{
 /// /.well-known/acme-challenge/<token> responses.
 pub const ChallengeStore = struct {
     allocator: std.mem.Allocator,
-    mutex: std.Thread.Mutex = .{},
+    mutex: compat.Mutex = .{},
     tokens: std.StringHashMap([]u8),
 
     pub fn init(allocator: std.mem.Allocator) ChallengeStore {
@@ -285,32 +286,30 @@ fn acmeRequest(
     body_opt: ?[]const u8,
 ) AcmeError!AcmeResponse {
     const uri = std.Uri.parse(url) catch return error.NetworkError;
-    var server_header_buf: [8192]u8 = undefined;
+    var redirect_buf: [8192]u8 = undefined;
     const extra: []const std.http.Header = if (body_opt != null)
         &.{.{ .name = "Content-Type", .value = "application/jose+json" }}
     else
         &.{};
-    var req = client.open(method, uri, .{
-        .server_header_buffer = &server_header_buf,
+    var req = client.request(method, uri, .{
         .extra_headers = extra,
         .keep_alive = false,
     }) catch return error.NetworkError;
     defer req.deinit();
-    if (body_opt) |body| {
-        req.transfer_encoding = .{ .content_length = body.len };
-    }
-    req.send() catch return error.NetworkError;
-    if (body_opt) |body| req.writeAll(body) catch return error.NetworkError;
-    req.finish() catch return error.NetworkError;
-    req.wait() catch return error.NetworkError;
+    if (body_opt) |body|
+        req.sendBodyComplete(@constCast(body)) catch return error.NetworkError
+    else
+        req.sendBodiless() catch return error.NetworkError;
+    var response = req.receiveHead(&redirect_buf) catch return error.NetworkError;
 
-    var body_list = std.ArrayList(u8).init(allocator);
-    errdefer body_list.deinit();
-    req.reader().readAllArrayList(&body_list, 512 * 1024) catch return error.NetworkError;
+    var body_list: std.ArrayList(u8) = .empty;
+    errdefer body_list.deinit(allocator);
+    var transfer_buf: [4096]u8 = undefined;
+    response.reader(&transfer_buf).appendRemaining(allocator, &body_list, .limited(512 * 1024)) catch return error.NetworkError;
 
     var location: ?[]u8 = null;
     var replay_nonce: ?[]u8 = null;
-    var header_it = req.response.iterateHeaders();
+    var header_it = response.head.iterateHeaders();
     while (header_it.next()) |h| {
         if (std.ascii.eqlIgnoreCase(h.name, "location")) {
             location = allocator.dupe(u8, h.value) catch null;
@@ -320,10 +319,10 @@ fn acmeRequest(
     }
     return .{
         .allocator = allocator,
-        .status = req.response.status,
+        .status = response.head.status,
         .location = location,
         .replay_nonce = replay_nonce,
-        .body = try body_list.toOwnedSlice(),
+        .body = try body_list.toOwnedSlice(allocator),
     };
 }
 
@@ -360,14 +359,14 @@ fn buildCsr(allocator: std.mem.Allocator, domains: []const []const u8, domain_ke
     if (c.X509_NAME_add_entry_by_txt(name, "CN", c.MBSTRING_UTF8, cn_z.ptr, -1, -1, 0) != 1) return error.CsrFailed;
 
     // Build SANs extension
-    var san_buf = std.ArrayList(u8).init(allocator);
-    defer san_buf.deinit();
+    var san_buf: std.ArrayList(u8) = .empty;
+    defer san_buf.deinit(allocator);
     for (domains, 0..) |domain, i| {
-        if (i > 0) try san_buf.appendSlice(", ");
-        try san_buf.appendSlice("DNS:");
-        try san_buf.appendSlice(domain);
+        if (i > 0) try san_buf.appendSlice(allocator, ", ");
+        try san_buf.appendSlice(allocator, "DNS:");
+        try san_buf.appendSlice(allocator, domain);
     }
-    try san_buf.append(0); // null terminate for OpenSSL
+    try san_buf.append(allocator, 0); // null terminate for OpenSSL
 
     const san_z: [:0]const u8 = san_buf.items[0 .. san_buf.items.len - 1 :0];
     const san_ext = c.X509V3_EXT_conf_nid(null, null, c.NID_subject_alt_name, san_z.ptr) orelse return error.CsrFailed;
@@ -463,7 +462,7 @@ pub fn runOnce(opts: AcmeOptions) AcmeError!void {
     if (c.EC_KEY_generate_key(domain_key) != 1) return error.KeyGenFailed;
 
     // HTTP client for ACME server communication.
-    var http_client = std.http.Client{ .allocator = allocator };
+    var http_client = std.http.Client{ .allocator = allocator, .io = compat.io() };
     defer http_client.deinit();
 
     // Step 1: Fetch ACME directory.
@@ -509,14 +508,16 @@ pub fn runOnce(opts: AcmeOptions) AcmeError!void {
     }
 
     // Step 3: Create order.
-    var ids_buf = std.ArrayList(u8).init(allocator);
-    defer ids_buf.deinit();
-    try ids_buf.appendSlice("[");
+    var ids_buf: std.ArrayList(u8) = .empty;
+    defer ids_buf.deinit(allocator);
+    try ids_buf.appendSlice(allocator, "[");
     for (opts.domains, 0..) |domain, i| {
-        if (i > 0) try ids_buf.appendSlice(",");
-        try ids_buf.writer().print("{{\"type\":\"dns\",\"value\":\"{s}\"}}", .{domain});
+        if (i > 0) try ids_buf.appendSlice(allocator, ",");
+        const item = std.fmt.allocPrint(allocator, "{{\"type\":\"dns\",\"value\":\"{s}\"}}", .{domain}) catch return error.OutOfMemory;
+        defer allocator.free(item);
+        try ids_buf.appendSlice(allocator, item);
     }
-    try ids_buf.appendSlice("]");
+    try ids_buf.appendSlice(allocator, "]");
     const order_payload = std.fmt.allocPrint(allocator, "{{\"identifiers\":{s}}}", .{ids_buf.items}) catch return error.OutOfMemory;
     defer allocator.free(order_payload);
 
@@ -618,9 +619,9 @@ pub fn runOnce(opts: AcmeOptions) AcmeError!void {
         }
 
         // Poll the authorization until valid or timeout.
-        const deadline = std.time.milliTimestamp() + @as(i64, opts.challenge_timeout_s) * 1000;
+        const deadline = compat.milliTimestamp() + @as(i64, opts.challenge_timeout_s) * 1000;
         while (true) {
-            std.time.sleep(2_000_000_000); // 2 seconds
+            std.Io.sleep(compat.io(), .fromSeconds(2), .awake) catch return error.NetworkError;
             allocator.free(nonce);
             nonce = try fetchNonce(allocator, &http_client, new_nonce_url.string);
             jws_ctx.nonce = nonce;
@@ -640,7 +641,7 @@ pub fn runOnce(opts: AcmeOptions) AcmeError!void {
                 if (std.mem.eql(u8, status_val.string, "valid")) break;
                 if (std.mem.eql(u8, status_val.string, "invalid")) return error.ChallengeFailed;
             }
-            if (std.time.milliTimestamp() > deadline) return error.ChallengeFailed;
+            if (compat.milliTimestamp() > deadline) return error.ChallengeFailed;
         }
     }
 
@@ -668,11 +669,11 @@ pub fn runOnce(opts: AcmeOptions) AcmeError!void {
     }
 
     // Poll the order until the certificate URL is available.
-    const order_deadline = std.time.milliTimestamp() + 120_000;
+    const order_deadline = compat.milliTimestamp() + 120_000;
     var cert_url: ?[]u8 = null;
     defer if (cert_url) |u| allocator.free(u);
     while (cert_url == null) {
-        std.time.sleep(2_000_000_000);
+        std.Io.sleep(compat.io(), .fromSeconds(2), .awake) catch return error.NetworkError;
         allocator.free(nonce);
         nonce = try fetchNonce(allocator, &http_client, new_nonce_url.string);
         jws_ctx.nonce = nonce;
@@ -692,7 +693,7 @@ pub fn runOnce(opts: AcmeOptions) AcmeError!void {
             cert_url = allocator.dupe(u8, cert_url_val.?.string) catch return error.OutOfMemory;
             break;
         }
-        if (std.time.milliTimestamp() > order_deadline) return error.CertDownloadFailed;
+        if (compat.milliTimestamp() > order_deadline) return error.CertDownloadFailed;
     }
 
     // Step 7: Download the certificate chain.
@@ -706,11 +707,11 @@ pub fn runOnce(opts: AcmeOptions) AcmeError!void {
     if (dl_resp.status != .ok) return error.CertDownloadFailed;
 
     // Step 8: Atomically save the certificate and private key to disk.
-    std.fs.cwd().makePath(opts.cert_dir) catch {};
+    compat.cwd().makePath(opts.cert_dir) catch {};
     const tmp_cert = std.fmt.allocPrint(allocator, "{s}.tmp", .{cert_path}) catch return error.OutOfMemory;
     defer allocator.free(tmp_cert);
-    std.fs.cwd().writeFile(.{ .sub_path = tmp_cert, .data = dl_resp.body }) catch return error.CertSaveFailed;
-    std.fs.cwd().rename(tmp_cert, cert_path) catch return error.CertSaveFailed;
+    compat.cwd().writeFile(.{ .sub_path = tmp_cert, .data = dl_resp.body }) catch return error.CertSaveFailed;
+    compat.cwd().rename(tmp_cert, compat.cwd(), cert_path) catch return error.CertSaveFailed;
 
     // Write domain private key in PEM.
     const domain_bio = c.BIO_new(c.BIO_s_mem()) orelse return error.CertSaveFailed;
@@ -721,8 +722,8 @@ pub fn runOnce(opts: AcmeOptions) AcmeError!void {
     if (key_len <= 0 or key_ptr == null) return error.CertSaveFailed;
     const tmp_key = std.fmt.allocPrint(allocator, "{s}.tmp", .{key_path}) catch return error.OutOfMemory;
     defer allocator.free(tmp_key);
-    std.fs.cwd().writeFile(.{ .sub_path = tmp_key, .data = key_ptr.?[0..@intCast(key_len)] }) catch return error.CertSaveFailed;
-    std.fs.cwd().rename(tmp_key, key_path) catch return error.CertSaveFailed;
+    compat.cwd().writeFile(.{ .sub_path = tmp_key, .data = key_ptr.?[0..@intCast(key_len)] }) catch return error.CertSaveFailed;
+    compat.cwd().rename(tmp_key, compat.cwd(), key_path) catch return error.CertSaveFailed;
 }
 
 // ---------------------------------------------------------------------------

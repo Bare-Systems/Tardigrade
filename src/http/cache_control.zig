@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("../zig_compat.zig");
 const Response = @import("response.zig").Response;
 
 /// Cache-Control directives configuration.
@@ -48,7 +49,7 @@ pub const CachePolicy = struct {
 
     /// Format the Cache-Control header value into the provided buffer.
     pub fn format(self: CachePolicy, buf: []u8) []const u8 {
-        var stream = std.io.fixedBufferStream(buf);
+        var stream = compat.fixedBufferStream(buf);
         const writer = stream.writer();
         var first = true;
 
@@ -126,7 +127,7 @@ pub fn policyForMimeType(mime: []const u8) CachePolicy {
 
 /// Format an RFC 7231 Expires date given a max-age offset from now.
 fn formatExpires(max_age: u32, buf: *[40]u8) []const u8 {
-    const now = std.time.timestamp();
+    const now = compat.unixTimestamp();
     const expires_ts = now + @as(i64, max_age);
     const epoch_secs: std.time.epoch.EpochSeconds = .{ .secs = @intCast(expires_ts) };
     const day_secs = epoch_secs.getDaySeconds();

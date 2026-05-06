@@ -27,7 +27,7 @@ capability.
 
 ### Prerequisites
 
-- [Zig](https://ziglang.org/) 0.14.1 or later
+- [Zig](https://ziglang.org/) 0.16.0
 
 ### Build and run from source
 

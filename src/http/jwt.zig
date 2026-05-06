@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("../zig_compat.zig");
 
 const ParsedClaims = struct {
     issuer: ?[]const u8,
@@ -114,7 +115,7 @@ fn parseAndValidateHs256(allocator: std.mem.Allocator, token: []const u8, opts: 
     var mac: [32]u8 = undefined;
     std.crypto.auth.hmac.sha2.HmacSha256.create(&mac, signing_input, opts.secret);
     if (sig.len != 32) return error.InvalidSignature;
-    if (!std.crypto.utils.timingSafeEql([32]u8, sig[0..32].*, mac)) return error.InvalidSignature;
+    if (!compat.timingSafeEql([32]u8, sig[0..32].*, mac)) return error.InvalidSignature;
 
     var parsed_payload = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
     defer parsed_payload.deinit();
@@ -144,7 +145,7 @@ fn parseAndValidateHs256(allocator: std.mem.Allocator, token: []const u8, opts: 
     if (opts.required_audience) |aud| {
         if (audience == null or !std.mem.eql(u8, audience.?, aud)) return error.AudienceMismatch;
     }
-    const now_unix = if (opts.now_unix == 0) std.time.timestamp() else opts.now_unix;
+    const now_unix = if (opts.now_unix == 0) compat.unixTimestamp() else opts.now_unix;
     if (expires_at) |exp| {
         if (now_unix >= exp) return error.TokenExpired;
     }

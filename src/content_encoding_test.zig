@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("zig_compat.zig");
 const main = @import("main.zig");
 const http = @import("http.zig");
 
@@ -13,11 +14,11 @@ test "static file Accept-Encoding identity" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const file_name = "test.txt";
-    var file = try tmp.dir.createFile(file_name, .{});
+    var file = try compat.wrapDir(tmp.dir).createFile(file_name, .{});
     try file.writeAll("hello world");
     // Call serveFileContent
     var buf: [1024]u8 = undefined;
-    var stream = std.io.fixedBufferStream(&buf);
+    var stream = compat.fixedBufferStream(&buf);
     try main.serveFileContent(allocator, &req, file_name, stream.writer(), false, false, true, null);
     const output = stream.getWritten();
     try std.testing.expect(std.mem.indexOf(u8, output, "200 OK") != null);
@@ -35,11 +36,11 @@ test "static file Accept-Encoding br returns 406" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const file_name = "test.txt";
-    var file = try tmp.dir.createFile(file_name, .{});
+    var file = try compat.wrapDir(tmp.dir).createFile(file_name, .{});
     try file.writeAll("hello world");
     // Call serveFileContent
     var buf: [1024]u8 = undefined;
-    var stream = std.io.fixedBufferStream(&buf);
+    var stream = compat.fixedBufferStream(&buf);
     try main.serveFileContent(allocator, &req, file_name, stream.writer(), false, false, true, null);
     const output = stream.getWritten();
     try std.testing.expect(std.mem.indexOf(u8, output, "406 Not Acceptable") != null);
@@ -56,11 +57,11 @@ test "static file Accept-Encoding gzip, identity" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const file_name = "test.txt";
-    var file = try tmp.dir.createFile(file_name, .{});
+    var file = try compat.wrapDir(tmp.dir).createFile(file_name, .{});
     try file.writeAll("hello world");
     // Call serveFileContent
     var buf: [1024]u8 = undefined;
-    var stream = std.io.fixedBufferStream(&buf);
+    var stream = compat.fixedBufferStream(&buf);
     try main.serveFileContent(allocator, &req, file_name, stream.writer(), false, false, true, null);
     const output = stream.getWritten();
     try std.testing.expect(std.mem.indexOf(u8, output, "200 OK") != null);
@@ -77,11 +78,11 @@ test "serveFileContent echoes valid X-Correlation-ID from request" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const file_name = "test.txt";
-    var file = try tmp.dir.createFile(file_name, .{});
+    var file = try compat.wrapDir(tmp.dir).createFile(file_name, .{});
     try file.writeAll("hello world");
 
     var buf: [1024]u8 = undefined;
-    var stream = std.io.fixedBufferStream(&buf);
+    var stream = compat.fixedBufferStream(&buf);
     try main.serveFileContent(allocator, &req, file_name, stream.writer(), false, false, true, null);
 
     const output = stream.getWritten();
@@ -98,11 +99,11 @@ test "serveFileContent generates X-Correlation-ID when missing or invalid" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const file_name = "test.txt";
-    var file = try tmp.dir.createFile(file_name, .{});
+    var file = try compat.wrapDir(tmp.dir).createFile(file_name, .{});
     try file.writeAll("hello world");
 
     var buf: [2048]u8 = undefined;
-    var stream = std.io.fixedBufferStream(&buf);
+    var stream = compat.fixedBufferStream(&buf);
     try main.serveFileContent(allocator, &req, file_name, stream.writer(), false, false, true, null);
 
     const output = stream.getWritten();

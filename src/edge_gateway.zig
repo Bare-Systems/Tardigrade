@@ -1,3 +1,4 @@
+const compat = @import("zig_compat.zig");
 const std = @import("std");
 const builtin = @import("builtin");
 const http = @import("http.zig");
@@ -34,13 +35,13 @@ const Http2PendingStream = struct {
     method: ?[]u8 = null,
     path: ?[]u8 = null,
     headers: http.Headers,
-    body: std.ArrayList(u8),
+    body: std.array_list.Managed(u8),
     priority_weight: u8 = 16,
 
     fn init(allocator: std.mem.Allocator) Http2PendingStream {
         return .{
             .headers = http.Headers.init(allocator),
-            .body = std.ArrayList(u8).init(allocator),
+            .body = std.array_list.Managed(u8).init(allocator),
         };
     }
 
@@ -219,7 +220,7 @@ fn deinitMuxMetricsSnapshot(allocator: std.mem.Allocator, device_counts: []MuxDe
     allocator.free(device_counts);
 }
 
-fn deinitMuxPendingFrames(allocator: std.mem.Allocator, pending: *std.ArrayList(MuxPendingFrame)) void {
+fn deinitMuxPendingFrames(allocator: std.mem.Allocator, pending: *std.array_list.Managed(MuxPendingFrame)) void {
     for (pending.items) |frame| allocator.free(frame.payload);
     pending.deinit();
 }
@@ -265,18 +266,18 @@ fn deinitMuxResumeState(allocator: std.mem.Allocator, saved_state: *MuxResumeSta
 /// Persistent gateway state shared across connections.
 const GatewayState = struct {
     allocator: std.mem.Allocator,
-    connection_mutex: std.Thread.Mutex = .{},
-    rate_limiter_mutex: std.Thread.Mutex = .{},
-    idempotency_mutex: std.Thread.Mutex = .{},
-    proxy_cache_mutex: std.Thread.Mutex = .{},
-    session_mutex: std.Thread.Mutex = .{},
-    transcript_mutex: std.Thread.Mutex = .{},
-    command_mutex: std.Thread.Mutex = .{},
-    approval_mutex: std.Thread.Mutex = .{},
-    circuit_mutex: std.Thread.Mutex = .{},
-    metrics_mutex: std.Thread.Mutex = .{},
-    upstream_mutex: std.Thread.Mutex = .{},
-    runtime_mutex: std.Thread.Mutex = .{},
+    connection_mutex: compat.Mutex = .{},
+    rate_limiter_mutex: compat.Mutex = .{},
+    idempotency_mutex: compat.Mutex = .{},
+    proxy_cache_mutex: compat.Mutex = .{},
+    session_mutex: compat.Mutex = .{},
+    transcript_mutex: compat.Mutex = .{},
+    command_mutex: compat.Mutex = .{},
+    approval_mutex: compat.Mutex = .{},
+    circuit_mutex: compat.Mutex = .{},
+    metrics_mutex: compat.Mutex = .{},
+    upstream_mutex: compat.Mutex = .{},
+    runtime_mutex: compat.Mutex = .{},
     rate_limiter: ?http.rate_limiter.RateLimiter,
     idempotency_store: ?http.idempotency.IdempotencyStore,
     proxy_cache_store: ?http.idempotency.IdempotencyStore,
@@ -317,7 +318,7 @@ const GatewayState = struct {
     next_proxy_cache_maintenance_ms: u64,
     upstream_health: std.StringHashMap(UpstreamHealth),
     upstream_active_requests: std.StringHashMap(usize),
-    fastcgi_pool: std.StringHashMap(std.ArrayList(std.net.Stream)),
+    fastcgi_pool: std.StringHashMap(std.ArrayList(compat.NetStream)),
     fastcgi_next_request_id: std.StringHashMap(u16),
     proxy_cache_locks: std.StringHashMap(u32),
     active_connections_by_ip: std.StringHashMap(u32),
@@ -341,7 +342,7 @@ const GatewayState = struct {
     dns_discovery: http.dns_discovery.DnsDiscovery,
     /// Reload state: set by hotReloadConfig on every attempt so operators can
     /// query the outcome without tailing logs.
-    reload_mutex: std.Thread.Mutex = .{},
+    reload_mutex: compat.Mutex = .{},
     last_reload_ok: bool = false,
     last_reload_at_ms: i64 = 0,
     last_reload_error: [256]u8 = undefined,
@@ -374,7 +375,7 @@ const GatewayState = struct {
                 var owned = stream;
                 owned.close();
             }
-            entry.value_ptr.deinit();
+            entry.value_ptr.deinit(self.allocator);
         }
         self.fastcgi_pool.deinit();
         var fastcgi_id_it = self.fastcgi_next_request_id.iterator();
@@ -419,7 +420,7 @@ const GatewayState = struct {
         self.mux_resume_state.deinit();
     }
 
-    fn acquireFastcgiStream(self: *GatewayState, endpoint: []const u8) !struct { stream: std.net.Stream, reused: bool } {
+    fn acquireFastcgiStream(self: *GatewayState, endpoint: []const u8) !struct { stream: compat.NetStream, reused: bool } {
         self.connection_mutex.lock();
         if (self.fastcgi_pool.getPtr(endpoint)) |pool| {
             if (pool.items.len > 0) {
@@ -432,7 +433,7 @@ const GatewayState = struct {
         return .{ .stream = try http.fastcgi.connect(self.allocator, endpoint), .reused = false };
     }
 
-    fn releaseFastcgiStream(self: *GatewayState, endpoint: []const u8, stream: std.net.Stream, allow_reuse: bool) void {
+    fn releaseFastcgiStream(self: *GatewayState, endpoint: []const u8, stream: compat.NetStream, allow_reuse: bool) void {
         if (!allow_reuse) {
             var owned = stream;
             owned.close();
@@ -448,7 +449,7 @@ const GatewayState = struct {
                 owned.close();
                 return;
             }
-            pool.append(stream) catch {
+            pool.append(self.allocator, stream) catch {
                 var owned = stream;
                 owned.close();
             };
@@ -460,8 +461,8 @@ const GatewayState = struct {
             owned.close();
             return;
         };
-        var pool = std.ArrayList(std.net.Stream).init(self.allocator);
-        pool.append(stream) catch {
+        var pool: std.ArrayList(compat.NetStream) = .empty;
+        pool.append(self.allocator, stream) catch {
             self.allocator.free(owned_key);
             var owned = stream;
             owned.close();
@@ -472,7 +473,7 @@ const GatewayState = struct {
                 var owned = item;
                 owned.close();
             }
-            pool.deinit();
+            pool.deinit(self.allocator);
             self.allocator.free(owned_key);
         };
     }
@@ -736,7 +737,7 @@ const GatewayState = struct {
             const locked = self.proxy_cache_locks.contains(key);
             self.proxy_cache_mutex.unlock();
             if (!locked) return true;
-            std.time.sleep(10 * std.time.ns_per_ms);
+            std.Io.sleep(compat.io(), std.Io.Duration.fromMilliseconds(10), .awake) catch {};
         }
         return false;
     }
@@ -820,7 +821,7 @@ const GatewayState = struct {
         self.transcript_mutex.lock();
         defer self.transcript_mutex.unlock();
         http.transcript_store.append(self.allocator, self.transcript_store_path, .{
-            .ts_ms = std.time.milliTimestamp(),
+            .ts_ms = compat.milliTimestamp(),
             .scope = scope,
             .route = route,
             .correlation_id = correlation_id,
@@ -839,7 +840,7 @@ const GatewayState = struct {
     fn commandLifecycleCreate(self: *GatewayState, command_id: []const u8, command_type: []const u8, correlation_id: []const u8, identity: []const u8) !void {
         self.command_mutex.lock();
         defer self.command_mutex.unlock();
-        const now = std.time.milliTimestamp();
+        const now = compat.milliTimestamp();
         const owned_id = try self.allocator.dupe(u8, command_id);
         errdefer self.allocator.free(owned_id);
         const owned_cmd = try self.allocator.dupe(u8, command_type);
@@ -868,7 +869,7 @@ const GatewayState = struct {
         defer self.command_mutex.unlock();
         if (self.command_lifecycle.getPtr(command_id)) |entry| {
             entry.status = .running;
-            entry.updated_ms = std.time.milliTimestamp();
+            entry.updated_ms = compat.milliTimestamp();
         }
     }
 
@@ -880,7 +881,7 @@ const GatewayState = struct {
             self.allocator.free(entry.response_content_type);
             self.allocator.free(entry.error_message);
             entry.status = .completed;
-            entry.updated_ms = std.time.milliTimestamp();
+            entry.updated_ms = compat.milliTimestamp();
             entry.response_status = status;
             entry.response_body = self.allocator.dupe(u8, body) catch self.allocator.dupe(u8, "") catch return;
             entry.response_content_type = self.allocator.dupe(u8, content_type) catch self.allocator.dupe(u8, "") catch return;
@@ -894,7 +895,7 @@ const GatewayState = struct {
         if (self.command_lifecycle.getPtr(command_id)) |entry| {
             self.allocator.free(entry.error_message);
             entry.status = .failed;
-            entry.updated_ms = std.time.milliTimestamp();
+            entry.updated_ms = compat.milliTimestamp();
             entry.error_message = self.allocator.dupe(u8, message) catch self.allocator.dupe(u8, "command_failed") catch return;
         }
     }
@@ -951,12 +952,12 @@ const GatewayState = struct {
 
             var rnd: [16]u8 = undefined;
             std.crypto.random.bytes(&rnd);
-            const token = try std.fmt.allocPrint(self.allocator, "apr-{d}-{s}", .{
-                std.time.milliTimestamp(),
-                std.fmt.fmtSliceHexLower(&rnd),
+            const token = try std.fmt.allocPrint(self.allocator, "apr-{d}-{f}", .{
+                compat.milliTimestamp(),
+                compat.fmtSliceHexLower(&rnd),
             });
             errdefer self.allocator.free(token);
-            const now = std.time.milliTimestamp();
+            const now = compat.milliTimestamp();
             const expires_ms = now + self.approval_ttl_ms;
             const entry = ApprovalEntry{
                 .method = try self.allocator.dupe(u8, method),
@@ -994,7 +995,7 @@ const GatewayState = struct {
             }
             if (entry.status != .pending) break :blk false;
             entry.status = if (decision == .approve) .approved else .denied;
-            entry.decided_ms = std.time.milliTimestamp();
+            entry.decided_ms = compat.milliTimestamp();
             self.allocator.free(entry.decided_by);
             entry.decided_by = self.allocator.dupe(u8, actor) catch self.allocator.dupe(u8, "") catch break :blk false;
             break :blk true;
@@ -1084,7 +1085,7 @@ const GatewayState = struct {
     /// Must be called with approval_mutex held.
     fn approvalEscalateIfExpiredLocked(entry: *ApprovalEntry) bool {
         if (entry.status != .pending) return false;
-        const now = std.time.milliTimestamp();
+        const now = compat.milliTimestamp();
         if (now >= entry.expires_ms) {
             entry.status = .escalated;
             entry.decided_ms = now;
@@ -1229,7 +1230,7 @@ const GatewayState = struct {
         const metrics_snapshot = self.metrics;
         self.metrics_mutex.unlock();
 
-        var device_json = std.ArrayList(u8).init(allocator);
+        var device_json = std.array_list.Managed(u8).init(allocator);
         errdefer device_json.deinit();
         try device_json.append('{');
         for (mux_snapshot.device_counts, 0..) |entry, idx| {
@@ -1278,7 +1279,7 @@ const GatewayState = struct {
         const base = try metrics_snapshot.toPrometheus(allocator);
         defer allocator.free(base);
 
-        var combined = std.ArrayList(u8).init(allocator);
+        var combined = std.array_list.Managed(u8).init(allocator);
         errdefer combined.deinit();
         try combined.appendSlice(base);
         if (mux_snapshot.device_counts.len > 0) {
@@ -1288,7 +1289,9 @@ const GatewayState = struct {
                 \\
             );
             for (mux_snapshot.device_counts) |entry| {
-                try combined.writer().print("tardigrade_mux_device_channels{{device_id=\"{s}\"}} {d}\n", .{ entry.device_id, entry.count });
+                const line = try std.fmt.allocPrint(allocator, "tardigrade_mux_device_channels{{device_id=\"{s}\"}} {d}\n", .{ entry.device_id, entry.count });
+                defer allocator.free(line);
+                try combined.appendSlice(line);
             }
         }
         return combined.toOwnedSlice();
@@ -1859,7 +1862,7 @@ const GatewayState = struct {
         self.connection_mutex.lock();
         defer self.connection_mutex.unlock();
 
-        var device_counts = std.ArrayList(MuxDeviceCount).init(allocator);
+        var device_counts = std.array_list.Managed(MuxDeviceCount).init(allocator);
         errdefer {
             for (device_counts.items) |entry| allocator.free(entry.device_id);
             device_counts.deinit();
@@ -1892,7 +1895,7 @@ const GatewayState = struct {
         };
         self.mux_resume_state.put(owned_key, .{
             .channels = owned_channels,
-            .expires_ms = std.time.milliTimestamp() + @as(i64, grace_ms),
+            .expires_ms = compat.milliTimestamp() + @as(i64, grace_ms),
         }) catch {
             var saved_state = MuxResumeState{ .channels = owned_channels, .expires_ms = 0 };
             deinitMuxResumeState(self.allocator, &saved_state);
@@ -1908,7 +1911,7 @@ const GatewayState = struct {
         defer self.allocator.free(removed.key);
         var saved = removed.value;
         defer deinitMuxResumeState(self.allocator, &saved);
-        if (saved.expires_ms < std.time.milliTimestamp()) return null;
+        if (saved.expires_ms < compat.milliTimestamp()) return null;
         return cloneMuxChannels(allocator, saved.channels) catch null;
     }
 
@@ -1921,7 +1924,7 @@ const GatewayState = struct {
     fn upstreamHealthJson(self: *GatewayState, allocator: std.mem.Allocator) ![]u8 {
         self.upstream_mutex.lock();
         defer self.upstream_mutex.unlock();
-        var out = std.ArrayList(u8).init(allocator);
+        var out = std.array_list.Managed(u8).init(allocator);
         errdefer out.deinit();
         try out.appendSlice("{\"upstreams\":[");
         var first = true;
@@ -2066,7 +2069,7 @@ fn stickyCookieSignatureHex(
 
     var mac: [32]u8 = undefined;
     std.crypto.auth.hmac.sha2.HmacSha256.create(&mac, material, secret);
-    return std.fmt.allocPrint(allocator, "{s}", .{std.fmt.fmtSliceHexLower(&mac)});
+    return std.fmt.allocPrint(allocator, "{f}", .{compat.fmtSliceHexLower(&mac)});
 }
 
 fn parseStickyCookieUpstream(
@@ -2193,7 +2196,7 @@ const ConfigLease = struct {
 
 const ReloadableConfigStore = struct {
     allocator: std.mem.Allocator,
-    mutex: std.Thread.Mutex = .{},
+    mutex: compat.Mutex = .{},
     current: *ManagedConfigVersion,
     retired: std.ArrayList(*ManagedConfigVersion),
 
@@ -2201,7 +2204,7 @@ const ReloadableConfigStore = struct {
         return .{
             .allocator = allocator,
             .current = try createBorrowedVersion(allocator, cfg),
-            .retired = std.ArrayList(*ManagedConfigVersion).init(allocator),
+            .retired = .empty,
         };
     }
 
@@ -2209,7 +2212,7 @@ const ReloadableConfigStore = struct {
         for (self.retired.items) |version| {
             self.destroyVersion(version);
         }
-        self.retired.deinit();
+        self.retired.deinit(self.allocator);
         self.destroyVersion(self.current);
         self.* = undefined;
     }
@@ -2230,7 +2233,7 @@ const ReloadableConfigStore = struct {
         const version = try createOwnedVersion(self.allocator, cfg_ptr);
         self.mutex.lock();
         defer self.mutex.unlock();
-        self.retired.ensureUnusedCapacity(1) catch |err| {
+        self.retired.ensureUnusedCapacity(self.allocator, 1) catch |err| {
             self.destroyVersion(version);
             return err;
         };
@@ -2311,7 +2314,7 @@ const ConnectionSession = struct {
 const ConnectionSessionPool = struct {
     allocator: std.mem.Allocator,
     buffer_pool: *http.buffer_pool.BufferPool,
-    mutex: std.Thread.Mutex = .{},
+    mutex: compat.Mutex = .{},
     free_list: std.ArrayList(*ConnectionSession),
     max_cached: usize,
 
@@ -2319,7 +2322,7 @@ const ConnectionSessionPool = struct {
         return .{
             .allocator = allocator,
             .buffer_pool = buffer_pool,
-            .free_list = std.ArrayList(*ConnectionSession).init(allocator),
+            .free_list = .empty,
             .max_cached = max_cached,
         };
     }
@@ -2329,7 +2332,7 @@ const ConnectionSessionPool = struct {
             if (session.pending_buf) |buf| self.buffer_pool.release(buf);
             self.allocator.destroy(session);
         }
-        self.free_list.deinit();
+        self.free_list.deinit(self.allocator);
     }
 
     fn acquire(self: *ConnectionSessionPool) !*ConnectionSession {
@@ -2360,7 +2363,7 @@ const ConnectionSessionPool = struct {
             self.allocator.destroy(session);
             return;
         }
-        self.free_list.append(session) catch {
+        self.free_list.append(self.allocator, session) catch {
             self.allocator.destroy(session);
         };
     }
@@ -2372,7 +2375,7 @@ fn loadApprovalStore(state: *GatewayState) !void {
     const stored = try http.approval_store.load(state.allocator, state.approval_store_path);
     defer http.approval_store.freeLoaded(state.allocator, stored);
 
-    const now = std.time.milliTimestamp();
+    const now = compat.milliTimestamp();
     const retention_ms: i64 = 3_600_000; // 1 hour retention for decided entries
 
     for (stored) |s| {
@@ -2425,7 +2428,7 @@ fn loadSessionStore(state: *GatewayState) !void {
 }
 
 pub fn run(cfg: *const edge_config.EdgeConfig) !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const state_allocator = gpa.allocator();
 
@@ -2481,7 +2484,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
             .threshold = cfg.cb_threshold,
             .timeout_ms = cfg.cb_timeout_ms,
         }),
-        .upstream_client = .{ .allocator = state_allocator },
+        .upstream_client = .{ .allocator = state_allocator, .io = compat.io() },
         .acme_challenge_store = if (cfg.tls_acme_enabled and cfg.tls_acme_domains.len > 0)
             http.acme_client.ChallengeStore.init(state_allocator)
         else
@@ -2505,7 +2508,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         .next_proxy_cache_maintenance_ms = 0,
         .upstream_health = std.StringHashMap(UpstreamHealth).init(state_allocator),
         .upstream_active_requests = std.StringHashMap(usize).init(state_allocator),
-        .fastcgi_pool = std.StringHashMap(std.ArrayList(std.net.Stream)).init(state_allocator),
+        .fastcgi_pool = std.StringHashMap(std.ArrayList(compat.NetStream)).init(state_allocator),
         .fastcgi_next_request_id = std.StringHashMap(u16).init(state_allocator),
         .proxy_cache_locks = std.StringHashMap(u32).init(state_allocator),
         .active_connections_by_ip = std.StringHashMap(u32).init(state_allocator),
@@ -2552,34 +2555,34 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
 
     // Configure upstream HTTP client TLS (custom CA bundle and skip-verify).
     if (cfg.upstream_tls_ca_bundle.len > 0) {
-        const ca_file = std.fs.cwd().openFile(cfg.upstream_tls_ca_bundle, .{}) catch |err| blk: {
+        const ca_fc_opt: ?compat.FileCompat = compat.cwd().openFile(cfg.upstream_tls_ca_bundle, .{}) catch |err| blk: {
             state.logger.warn(null, "upstream TLS CA bundle open failed ({s}): {}", .{ cfg.upstream_tls_ca_bundle, err });
             break :blk null;
         };
-        if (ca_file) |f| {
-            defer f.close();
-            state.upstream_client.ca_bundle.addCertsFromFile(state_allocator, f) catch |err| {
+        if (ca_fc_opt) |ca_fc| {
+            var ca_f = ca_fc;
+            defer ca_f.close();
+            var ca_buf: [8192]u8 = undefined;
+            var ca_reader = ca_f.file.reader(compat.io(), &ca_buf);
+            state.upstream_client.ca_bundle.addCertsFromFile(state_allocator, &ca_reader, compat.unixTimestamp()) catch |err| {
                 state.logger.warn(null, "upstream TLS CA bundle load failed: {}", .{err});
             };
-            // Disable auto-rescan so our bundle takes precedence.
-            state.upstream_client.next_https_rescan_certs = false;
         }
     }
     if (!cfg.upstream_tls_verify) {
         // Clear CA bundle so the Zig TLS client performs no certificate verification.
         state.upstream_client.ca_bundle.deinit(state_allocator);
-        state.upstream_client.ca_bundle = .{};
-        state.upstream_client.next_https_rescan_certs = false;
+        state.upstream_client.ca_bundle = .empty;
         state.logger.warn(null, "upstream TLS certificate verification disabled", .{});
     }
     if (cfg.upstream_tls_client_cert.len > 0 or cfg.upstream_tls_server_name.len > 0) {
         state.logger.info(null, "upstream mTLS client cert and/or SNI override configured; applies to OpenSSL-backed connections", .{});
     }
 
-    const address = try std.net.Address.parseIp(cfg.listen_host, cfg.listen_port);
-    var server = try std.net.Address.listen(address, .{ .reuse_address = true });
-    defer server.deinit();
-    const listen_fd = server.stream.handle;
+    const address = try std.Io.net.IpAddress.parse(cfg.listen_host, cfg.listen_port);
+    var server = try address.listen(compat.io(), .{ .reuse_address = true });
+    defer server.deinit(compat.io());
+    const listen_fd = server.socket.handle;
 
     try setNonBlocking(listen_fd, true);
     applyRuntimeIdentity(cfg, &state.logger) catch |err| {
@@ -2711,7 +2714,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     if (state.proxy_cache_store != null) {
         state.logger.info(null, "Proxy cache enabled: TTL {d}s key_template={s}", .{ cfg.proxy_cache_ttl_seconds, cfg.proxy_cache_key_template });
         if (cfg.proxy_cache_path.len > 0) {
-            std.fs.cwd().makePath(cfg.proxy_cache_path) catch |err| {
+            compat.cwd().makePath(cfg.proxy_cache_path) catch |err| {
                 state.logger.warn(null, "failed to create proxy cache path {s}: {}", .{ cfg.proxy_cache_path, err });
             };
             state.logger.info(null, "Proxy cache disk path enabled: {s}", .{cfg.proxy_cache_path});
@@ -2944,30 +2947,33 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
 
 fn acceptReadyConnections(listen_fd: std.posix.fd_t, worker_pool: *http.worker_pool.WorkerPool, state: *GatewayState) void {
     while (!http.shutdown.isShutdownRequested()) {
-        var accepted_addr: std.net.Address = undefined;
-        var addr_len: std.posix.socklen_t = @sizeOf(std.net.Address);
+        var accepted_addr: std.c.sockaddr.storage = undefined;
+        var addr_len: std.c.socklen_t = @sizeOf(std.c.sockaddr.storage);
 
-        const client_fd = std.posix.accept(
-            listen_fd,
-            &accepted_addr.any,
-            &addr_len,
-            std.posix.SOCK.CLOEXEC | std.posix.SOCK.NONBLOCK,
-        ) catch |err| switch (err) {
-            error.WouldBlock => return,
-            error.ConnectionAborted => continue,
-            else => {
-                state.logger.err(null, "accept error: {}", .{err});
-                return;
-            },
-        };
+        const client_fd = std.c.accept(listen_fd, @ptrCast(&accepted_addr), &addr_len);
+        if (client_fd >= 0) {
+            const flags = std.c.fcntl(client_fd, std.c.F.GETFL, @as(c_int, 0));
+            if (flags >= 0) {
+                const nonblock: c_int = @intCast(@as(u32, @bitCast(std.c.O{ .NONBLOCK = true })));
+                _ = std.c.fcntl(client_fd, std.c.F.SETFL, flags | nonblock);
+            }
+            _ = std.c.fcntl(client_fd, std.c.F.SETFD, @as(c_int, 1)); // FD_CLOEXEC
+        }
+        if (client_fd < 0) {
+            const e = std.posix.errno(client_fd);
+            if (e == .AGAIN) return;
+            if (e == .CONNABORTED) continue;
+            state.logger.err(null, "accept error: {}", .{e});
+            return;
+        }
 
-        const owned_ip_key = clientIpKeyFromAddress(state.allocator, accepted_addr) catch null;
+        const owned_ip_key = clientIpKeyFromAddress(state.allocator, &accepted_addr) catch null;
         defer if (owned_ip_key) |key| state.allocator.free(key);
         const ip_key = owned_ip_key orelse "unknown";
 
         const slot_result = state.tryAcquireConnectionSlot(client_fd, ip_key) catch |err| {
             state.logger.warn(null, "connection slot tracking error: {}", .{err});
-            std.posix.close(client_fd);
+            _ = std.c.close(client_fd);
             continue;
         };
         switch (slot_result) {
@@ -3009,7 +3015,7 @@ fn hotReloadConfig(
     state: *GatewayState,
     http3_dispatch_ctx: *Http3DispatchContext,
 ) void {
-    const now_ms = std.time.milliTimestamp();
+    const now_ms = compat.milliTimestamp();
     const loaded = edge_config.loadFromEnv(allocator) catch |err| {
         const msg = std.fmt.bufPrint(&state.last_reload_error, "load failed: {}", .{err}) catch "load failed";
         state.reload_mutex.lock();
@@ -3126,15 +3132,15 @@ fn applyReloadedRuntimeConfig(cfg: *const edge_config.EdgeConfig, state: *Gatewa
 
 fn reopenErrorLog(cfg: *const edge_config.EdgeConfig) !void {
     if (cfg.error_log_path.len == 0 or std.ascii.eqlIgnoreCase(cfg.error_log_path, "stderr")) return;
-    var file = try std.fs.cwd().createFile(cfg.error_log_path, .{ .truncate = false, .read = false });
-    defer file.close();
-    try file.seekFromEnd(0);
-    try std.posix.dup2(file.handle, std.io.getStdErr().handle);
+    var fc = try compat.cwd().createFile(cfg.error_log_path, .{ .truncate = false, .read = false });
+    defer fc.close();
+    _ = std.c.lseek(fc.file.handle, 0, std.c.SEEK.END);
+    _ = std.c.dup2(fc.file.handle, std.Io.File.stderr().handle);
 }
 
 fn rejectOverloadedClient(client_fd: std.posix.fd_t) void {
     setNonBlocking(client_fd, false) catch {};
-    const stream = std.net.Stream{ .handle = client_fd };
+    const stream = compat.NetStream{ .handle = client_fd };
     stream.writer().writeAll(
         "HTTP/1.1 503 Service Unavailable\r\n" ++
             "Connection: close\r\n" ++
@@ -3162,7 +3168,7 @@ fn runActiveHealthChecks(cfg: *const edge_config.EdgeConfig, state: *GatewayStat
     if (state.next_active_health_probe_ms != 0 and now_ms < state.next_active_health_probe_ms) return;
     state.next_active_health_probe_ms = now_ms + cfg.upstream_active_health_interval_ms;
 
-    var probe_client = std.http.Client{ .allocator = state.allocator };
+    var probe_client = std.http.Client{ .allocator = state.allocator, .io = compat.io() };
     defer probe_client.deinit();
 
     if (cfg.upstream_base_urls.len > 0) {
@@ -3263,8 +3269,7 @@ fn probeSingleUpstream(cfg: *const edge_config.EdgeConfig, state: *GatewayState,
         }
     else
         null;
-    var req = probe_client.open(.GET, uri, .{
-        .server_header_buffer = &header_buf,
+    var req = probe_client.request(.GET, uri, .{
         .connection = unix_conn,
         .keep_alive = false,
     }) catch |err| {
@@ -3276,27 +3281,23 @@ fn probeSingleUpstream(cfg: *const edge_config.EdgeConfig, state: *GatewayState,
 
     if (cfg.upstream_active_health_timeout_ms > 0) {
         if (req.connection) |conn| {
-            setSocketTimeoutMs(conn.stream.handle, cfg.upstream_active_health_timeout_ms, cfg.upstream_active_health_timeout_ms) catch {};
+            setSocketTimeoutMs(conn.stream_reader.stream.socket.handle, cfg.upstream_active_health_timeout_ms, cfg.upstream_active_health_timeout_ms) catch {};
         }
     }
 
-    req.send() catch |err| {
+    req.sendBodiless() catch |err| {
         state.logger.warn(null, "active health probe send failed for {s}: {}", .{ base_url, err });
         state.recordActiveProbeResult(cfg, base_url, false);
         return;
     };
-    req.finish() catch |err| {
-        state.logger.warn(null, "active health probe finish failed for {s}: {}", .{ base_url, err });
-        state.recordActiveProbeResult(cfg, base_url, false);
-        return;
-    };
-    req.wait() catch |err| {
+    var probe_resp = req.receiveHead(&header_buf) catch |err| {
         state.logger.warn(null, "active health probe wait failed for {s}: {}", .{ base_url, err });
         state.recordActiveProbeResult(cfg, base_url, false);
         return;
     };
+    _ = &probe_resp;
 
-    const status_code: u16 = @intFromEnum(req.response.status);
+    const status_code: u16 = @intFromEnum(probe_resp.head.status);
     if (health_cfg.statusIsHealthy(status_code)) {
         state.recordActiveProbeResult(cfg, base_url, true);
     } else {
@@ -3307,7 +3308,7 @@ fn probeSingleUpstream(cfg: *const edge_config.EdgeConfig, state: *GatewayState,
 fn applyFdSoftLimit(desired: u64) !?u64 {
     if (desired == 0) return null;
     switch (builtin.os.tag) {
-        .linux, .macos, .freebsd, .netbsd, .openbsd, .dragonfly, .solaris, .illumos, .ios, .tvos, .watchos, .visionos => {},
+        .linux, .macos, .freebsd, .netbsd, .openbsd, .dragonfly, .illumos, .ios, .tvos, .watchos, .visionos => {},
         else => return null,
     }
 
@@ -3327,9 +3328,11 @@ fn applyRuntimeIdentity(cfg: *const edge_config.EdgeConfig, logger: *const http.
         @cInclude("unistd.h");
     });
     if (cfg.chroot_dir.len > 0) {
-        try std.posix.chdir(cfg.chroot_dir);
+        const chroot_dir_z = try std.heap.page_allocator.dupeZ(u8, cfg.chroot_dir);
+        defer std.heap.page_allocator.free(chroot_dir_z);
+        if (c.chdir(chroot_dir_z.ptr) != 0) return error.Unexpected;
         if (c.chroot(".") != 0) return error.ChrootFailed;
-        try std.posix.chdir("/");
+        if (c.chdir("/") != 0) return error.Unexpected;
         logger.info(null, "Applied chroot jail: {s}", .{cfg.chroot_dir});
     }
 
@@ -3338,7 +3341,7 @@ fn applyRuntimeIdentity(cfg: *const edge_config.EdgeConfig, logger: *const http.
             logger.warn(null, "run_group expects numeric gid; got '{s}'", .{cfg.run_group});
             return error.InvalidRunGroup;
         };
-        try std.posix.setgid(gid);
+        if (c.setgid(gid) != 0) return error.Unexpected;
         logger.info(null, "Applied runtime group: gid={d}", .{gid});
     }
     if (cfg.run_user.len > 0) {
@@ -3346,7 +3349,7 @@ fn applyRuntimeIdentity(cfg: *const edge_config.EdgeConfig, logger: *const http.
             logger.warn(null, "run_user expects numeric uid; got '{s}'", .{cfg.run_user});
             return error.InvalidRunUser;
         };
-        try std.posix.setuid(uid);
+        if (c.setuid(uid) != 0) return error.Unexpected;
         logger.info(null, "Applied runtime user: uid={d}", .{uid});
     }
 
@@ -3360,7 +3363,7 @@ fn handleAcceptedClient(raw_ctx: *anyopaque, client_fd: std.posix.fd_t) void {
     defer ctx.state.releaseConnectionSlot(client_fd);
     const session = ctx.session_pool.acquire() catch |err| {
         ctx.state.logger.warn(null, "failed to acquire pooled connection session: {}", .{err});
-        std.posix.close(client_fd);
+        _ = std.c.close(client_fd);
         return;
     };
     defer {
@@ -3391,7 +3394,7 @@ fn handleAcceptedClient(raw_ctx: *anyopaque, client_fd: std.posix.fd_t) void {
 
     setNonBlocking(client_fd, false) catch |err| {
         ctx.state.logger.warn(null, "failed to switch client fd to blocking mode: {}", .{err});
-        std.posix.close(client_fd);
+        _ = std.c.close(client_fd);
         return;
     };
 
@@ -3411,7 +3414,7 @@ fn handleAcceptedClient(raw_ctx: *anyopaque, client_fd: std.posix.fd_t) void {
                 &session.proxy_client_ip_len,
             ) catch |err| {
                 ctx.state.logger.warn(null, "proxy protocol parse failed on TLS connection: {}", .{err});
-                std.posix.close(client_fd);
+                _ = std.c.close(client_fd);
                 return;
             };
             session.proxy_protocol_checked = true;
@@ -3423,11 +3426,11 @@ fn handleAcceptedClient(raw_ctx: *anyopaque, client_fd: std.posix.fd_t) void {
             } else {
                 ctx.state.logger.warn(null, "tls handshake error: {}", .{err});
             }
-            std.posix.close(client_fd);
+            _ = std.c.close(client_fd);
             return;
         };
         defer tls_conn.deinit();
-        defer std.posix.close(client_fd);
+        defer _ = std.c.close(client_fd);
 
         if (tls_conn.negotiatedProtocol() == .http2 and cfg.http2_enabled) {
             handleHttp2Connection(&tls_conn, session, cfg, ctx.state, connection_ip) catch |err| {
@@ -3457,7 +3460,7 @@ fn handleAcceptedClient(raw_ctx: *anyopaque, client_fd: std.posix.fd_t) void {
             ctx.state.logger.debug(null, "closing connection after max requests per connection reached ({d})", .{cfg.max_requests_per_connection});
         }
     } else {
-        const stream = std.net.Stream{ .handle = client_fd };
+        const stream = compat.NetStream{ .handle = client_fd };
         defer stream.close();
 
         var served: u32 = 0;
@@ -3483,25 +3486,31 @@ fn handleAcceptedClient(raw_ctx: *anyopaque, client_fd: std.posix.fd_t) void {
     }
 }
 
-fn clientIpKeyFromAddress(allocator: std.mem.Allocator, address: std.net.Address) ![]const u8 {
-    return switch (address.any.family) {
+fn clientIpKeyFromAddress(allocator: std.mem.Allocator, address: *const std.c.sockaddr.storage) ![]const u8 {
+    return switch (address.family) {
         std.posix.AF.INET => blk: {
-            const b = @as(*const [4]u8, @ptrCast(&address.in.sa.addr));
+            const sin: *const std.c.sockaddr.in = @ptrCast(address);
+            const b = @as(*const [4]u8, @ptrCast(&sin.addr));
             break :blk std.fmt.allocPrint(allocator, "v4:{d}.{d}.{d}.{d}", .{ b[0], b[1], b[2], b[3] });
         },
-        std.posix.AF.INET6 => std.fmt.allocPrint(allocator, "v6:{s}", .{std.fmt.fmtSliceHexLower(address.in6.sa.addr[0..])}),
+        std.posix.AF.INET6 => blk: {
+            const sin6: *const std.c.sockaddr.in6 = @ptrCast(address);
+            break :blk std.fmt.allocPrint(allocator, "v6:{f}", .{compat.fmtSliceHexLower(sin6.addr[0..])});
+        },
         else => error.UnsupportedAddressFamily,
     };
 }
 
-fn clientIpFromAddress(allocator: std.mem.Allocator, address: std.net.Address) ![]const u8 {
-    return switch (address.any.family) {
+fn clientIpFromAddress(allocator: std.mem.Allocator, address: *const std.c.sockaddr.storage) ![]const u8 {
+    return switch (address.family) {
         std.posix.AF.INET => blk: {
-            const b = @as(*const [4]u8, @ptrCast(&address.in.sa.addr));
+            const sin: *const std.c.sockaddr.in = @ptrCast(address);
+            const b = @as(*const [4]u8, @ptrCast(&sin.addr));
             break :blk std.fmt.allocPrint(allocator, "{d}.{d}.{d}.{d}", .{ b[0], b[1], b[2], b[3] });
         },
         std.posix.AF.INET6 => blk: {
-            const src = address.in6.sa.addr[0..];
+            const sin6: *const std.c.sockaddr.in6 = @ptrCast(address);
+            const src = sin6.addr[0..];
             const g0 = std.mem.readInt(u16, src[0..2], .big);
             const g1 = std.mem.readInt(u16, src[2..4], .big);
             const g2 = std.mem.readInt(u16, src[4..6], .big);
@@ -3517,10 +3526,10 @@ fn clientIpFromAddress(allocator: std.mem.Allocator, address: std.net.Address) !
 }
 
 fn clientIpFromFd(allocator: std.mem.Allocator, fd: std.posix.fd_t) ![]const u8 {
-    var peer_addr: std.net.Address = undefined;
-    var addr_len: std.posix.socklen_t = @sizeOf(std.net.Address);
-    try std.posix.getpeername(fd, &peer_addr.any, &addr_len);
-    return clientIpFromAddress(allocator, peer_addr);
+    var peer_addr: std.c.sockaddr.storage = undefined;
+    var addr_len: std.posix.socklen_t = @sizeOf(std.c.sockaddr.storage);
+    try std.posix.getpeername(fd, @ptrCast(&peer_addr), &addr_len);
+    return clientIpFromAddress(allocator, &peer_addr);
 }
 
 fn setNoDelay(fd: std.posix.fd_t) !void {
@@ -3528,14 +3537,16 @@ fn setNoDelay(fd: std.posix.fd_t) !void {
 }
 
 fn setNonBlocking(fd: std.posix.fd_t, enabled: bool) !void {
-    var flags = try std.posix.fcntl(fd, std.posix.F.GETFL, 0);
+    const current_flags = std.c.fcntl(fd, std.posix.F.GETFL, @as(c_int, 0));
+    if (current_flags < 0) return error.Unexpected;
+    var flags: usize = @intCast(current_flags);
     const nonblock_mask = @as(usize, 1) << @bitOffsetOf(std.posix.O, "NONBLOCK");
     if (enabled) {
         flags |= nonblock_mask;
     } else {
         flags &= ~nonblock_mask;
     }
-    _ = try std.posix.fcntl(fd, std.posix.F.SETFL, flags);
+    if (std.c.fcntl(fd, std.posix.F.SETFL, @as(c_int, @intCast(flags))) < 0) return error.Unexpected;
 }
 
 const ProxyHeaderOutcome = union(enum) {
@@ -3596,7 +3607,9 @@ fn peekAndConsumeProxyHeaderFromRawFd(
     // In practice the PROXY header always arrives in the first TCP segment.
     var attempts: u32 = 0;
     while (attempts < 20) : (attempts += 1) {
-        const n = std.posix.recv(fd, &peek_buf, msg_peek) catch return error.ConnectionClosed;
+        const n_raw = std.c.recv(fd, @as(*anyopaque, @ptrCast(&peek_buf)), peek_buf.len, @intCast(msg_peek));
+        if (n_raw < 0) return error.ConnectionClosed;
+        const n: usize = @intCast(n_raw);
         if (n == 0) return error.ConnectionClosed;
         if (n > peeked) peeked = n;
         const outcome = parseProxyHeader(peek_buf[0..peeked], mode, client_ip_buf);
@@ -3611,16 +3624,16 @@ fn peekAndConsumeProxyHeaderFromRawFd(
                 var discard: [1024]u8 = undefined;
                 while (consumed_total < parsed.consumed) {
                     const to_read = @min(parsed.consumed - consumed_total, discard.len);
-                    const nr = std.posix.recv(fd, discard[0..to_read], 0) catch return error.ConnectionClosed;
-                    if (nr == 0) return error.ConnectionClosed;
-                    consumed_total += nr;
+                    const nr_raw = std.c.recv(fd, @as(*anyopaque, @ptrCast(&discard)), to_read, 0);
+                    if (nr_raw <= 0) return error.ConnectionClosed;
+                    consumed_total += @intCast(nr_raw);
                 }
                 return;
             },
             .need_more => {
                 if (peeked >= peek_buf.len) return error.ProxyProtocolHeaderTooLarge;
                 // Wait briefly for more data to arrive in the kernel buffer.
-                std.time.sleep(500_000); // 0.5 ms
+                std.Io.sleep(compat.io(), std.Io.Duration.fromMicroseconds(500), .awake) catch {};
             },
         }
     }
@@ -3731,7 +3744,7 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
         .{ 0x4, 1024 * 1024 }, // initial window size
     });
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
     var pending = std.AutoHashMap(u31, Http2PendingStream).init(allocator);
@@ -3739,7 +3752,7 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
     defer stream_windows.deinit();
     var stream_priorities = std.AutoHashMap(u31, u8).init(allocator);
     defer stream_priorities.deinit();
-    var ready_streams = std.ArrayList(u31).init(allocator);
+    var ready_streams = std.array_list.Managed(u31).init(allocator);
     defer ready_streams.deinit();
     var next_server_stream_id: u31 = 2;
     var conn_send_window: i32 = 65_535;
@@ -3897,7 +3910,7 @@ fn respondHttp2Stream(
     const len_str = try std.fmt.allocPrint(allocator, "{d}", .{body.len});
     defer allocator.free(len_str);
 
-    var response_headers = std.ArrayList(http.hpack.HeaderField).init(allocator);
+    var response_headers = std.array_list.Managed(http.hpack.HeaderField).init(allocator);
     defer response_headers.deinit();
     try response_headers.append(.{ .name = ":status", .value = status_str });
     try response_headers.append(.{ .name = "content-type", .value = content_type });
@@ -4076,7 +4089,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
     }
 
     // --- Rewrite / return directives ---
-    var request_uri_buf = std.ArrayList(u8).init(allocator);
+    var request_uri_buf = std.array_list.Managed(u8).init(allocator);
     defer request_uri_buf.deinit();
     try request_uri_buf.appendSlice(request.uri.path);
     if (request.uri.query) |query| {
@@ -4525,17 +4538,11 @@ fn parseTranscriptLimit(query: ?[]const u8) usize {
 }
 
 fn jsonifyTranscriptSummaries(allocator: std.mem.Allocator, transcripts: []const http.transcript_store.Summary) ![]u8 {
-    var out = std.ArrayList(u8).init(allocator);
-    errdefer out.deinit();
-    try std.json.stringify(.{ .transcripts = transcripts }, .{}, out.writer());
-    return out.toOwnedSlice();
+    return std.json.Stringify.valueAlloc(allocator, .{ .transcripts = transcripts }, .{});
 }
 
 fn jsonifyTranscriptEntry(allocator: std.mem.Allocator, transcript: *const http.transcript_store.StoredEntry) ![]u8 {
-    var out = std.ArrayList(u8).init(allocator);
-    errdefer out.deinit();
-    try std.json.stringify(.{ .transcript = transcript }, .{}, out.writer());
-    return out.toOwnedSlice();
+    return std.json.Stringify.valueAlloc(allocator, .{ .transcript = transcript }, .{});
 }
 
 fn writeJsonPayload(
@@ -4990,7 +4997,7 @@ fn executeRawHttpProxyRequest(
     const forwarded_for = try buildForwardedFor(allocator, request_headers.get("x-forwarded-for"), client_ip);
     defer allocator.free(forwarded_for);
 
-    var extra_headers = std.ArrayList(std.http.Header).init(allocator);
+    var extra_headers = std.array_list.Managed(std.http.Header).init(allocator);
     defer extra_headers.deinit();
     try appendProxyRequestHeaders(&extra_headers, request_headers);
     try appendRequestIdHeaders(&extra_headers, correlation_id);
@@ -5012,8 +5019,7 @@ fn executeRawHttpProxyRequest(
         if (tp.len > 0) try extra_headers.append(.{ .name = "traceparent", .value = tp });
     }
 
-    var req = try client.open(method_enum, uri, .{
-        .server_header_buffer = &server_header_buffer,
+    var req = try client.request(method_enum, uri, .{
         .connection = unix_conn,
         .headers = .{
             .connection = .omit,
@@ -5026,19 +5032,18 @@ fn executeRawHttpProxyRequest(
     defer req.deinit();
 
     if (body.len > 0) {
-        req.transfer_encoding = .{ .content_length = body.len };
+        try req.sendBodyComplete(@constCast(body));
+    } else {
+        try req.sendBodiless();
     }
-    try req.send();
-    if (body.len > 0) try req.writeAll(body);
-    try req.finish();
-    try req.wait();
+    var resp = try req.receiveHead(&server_header_buffer);
 
-    var headers = std.ArrayList(UpstreamHeader).init(allocator);
+    var headers = std.array_list.Managed(UpstreamHeader).init(allocator);
     errdefer {
         for (headers.items) |*header| header.deinit(allocator);
         headers.deinit();
     }
-    var header_it = req.response.iterateHeaders();
+    var header_it = resp.head.iterateHeaders();
     while (header_it.next()) |header| {
         if (shouldSkipUpstreamResponseHeader(header.name)) continue;
         try headers.append(.{
@@ -5046,25 +5051,25 @@ fn executeRawHttpProxyRequest(
             .value = try allocator.dupe(u8, header.value),
         });
     }
-    try appendSpecialUpstreamResponseHeader(allocator, &headers, "Content-Type", req.response.content_type);
-    try appendSpecialUpstreamResponseHeader(allocator, &headers, "Content-Disposition", req.response.content_disposition);
-    try appendSpecialUpstreamResponseHeader(allocator, &headers, "Location", req.response.location);
+    try appendSpecialUpstreamResponseHeader(allocator, &headers, "Content-Type", resp.head.content_type);
+    try appendSpecialUpstreamResponseHeader(allocator, &headers, "Content-Disposition", resp.head.content_disposition);
+    try appendSpecialUpstreamResponseHeader(allocator, &headers, "Location", resp.head.location);
 
-    var response_body = std.ArrayList(u8).init(allocator);
-    errdefer response_body.deinit();
-    try req.reader().readAllArrayList(&response_body, MAX_REQUEST_SIZE);
+    var body_buf: [8192]u8 = undefined;
+    const body_data = try resp.reader(&body_buf).allocRemaining(allocator, .limited(MAX_REQUEST_SIZE));
+    errdefer allocator.free(body_data);
 
     return .{
-        .status_code = @intFromEnum(req.response.status),
-        .reason = try allocator.dupe(u8, req.response.reason),
+        .status_code = @intFromEnum(resp.head.status),
+        .reason = try allocator.dupe(u8, resp.head.reason),
         .headers = try headers.toOwnedSlice(),
-        .body = try response_body.toOwnedSlice(),
+        .body = body_data,
     };
 }
 
 fn appendSpecialUpstreamResponseHeader(
     allocator: std.mem.Allocator,
-    headers: *std.ArrayList(UpstreamHeader),
+    headers: *std.array_list.Managed(UpstreamHeader),
     name: []const u8,
     value: ?[]const u8,
 ) !void {
@@ -5103,7 +5108,7 @@ fn executeUpstreamHttpsWithMtls(
         .percent_encoded => |pe| pe,
     } else return error.UnsupportedHttpMethod;
     const port: u16 = if (uri.port) |p| p else 443;
-    const tcp_stream = try std.net.tcpConnectToHost(allocator, host, port);
+    const tcp_stream = try compat.tcpConnectToHost(allocator, host, port);
     defer tcp_stream.close();
 
     var tls_conn = try http.tls_termination.UpstreamTlsConn.connect(tcp_stream.handle, host, .{
@@ -5123,9 +5128,9 @@ fn executeUpstreamHttpsWithMtls(
     const forwarded_for = try buildForwardedFor(allocator, request_headers.get("x-forwarded-for"), client_ip);
     defer allocator.free(forwarded_for);
 
-    var req_buf = std.ArrayList(u8).init(allocator);
-    defer req_buf.deinit();
-    const req_writer = req_buf.writer();
+    var req_aw: std.Io.Writer.Allocating = .init(allocator);
+    defer req_aw.deinit();
+    const req_writer = &req_aw.writer;
     try req_writer.print("{s} {s} HTTP/1.1\r\n", .{ method, path_raw });
     try req_writer.print("Host: {s}\r\n", .{host});
     try req_writer.print("Connection: close\r\n", .{});
@@ -5155,10 +5160,10 @@ fn executeUpstreamHttpsWithMtls(
     try req_writer.writeAll("\r\n");
     if (body.len > 0) try req_writer.writeAll(body);
 
-    try tls_conn.writeAll(req_buf.items);
+    try tls_conn.writeAll(req_aw.written());
 
     // Read the raw HTTP response.
-    var resp_raw = std.ArrayList(u8).init(allocator);
+    var resp_raw = std.array_list.Managed(u8).init(allocator);
     defer resp_raw.deinit();
     var read_buf: [8192]u8 = undefined;
     while (true) {
@@ -5175,14 +5180,14 @@ fn executeUpstreamHttpsWithMtls(
     const resp_body = raw[header_end + 4 ..];
 
     const first_line_end = std.mem.indexOfScalar(u8, headers_raw, '\n') orelse return error.UnsupportedHttpMethod;
-    const first_line = std.mem.trimRight(u8, headers_raw[0..first_line_end], "\r");
+    const first_line = compat.trimRight(u8, headers_raw[0..first_line_end], "\r");
     var line_parts = std.mem.splitScalar(u8, first_line, ' ');
     _ = line_parts.next(); // HTTP/1.1
     const status_str = line_parts.next() orelse "200";
     const status_code = std.fmt.parseInt(u16, status_str, 10) catch 200;
     const reason = line_parts.rest();
 
-    var resp_headers = std.ArrayList(UpstreamHeader).init(allocator);
+    var resp_headers = std.array_list.Managed(UpstreamHeader).init(allocator);
     errdefer {
         for (resp_headers.items) |*h| h.deinit(allocator);
         resp_headers.deinit();
@@ -5370,7 +5375,7 @@ fn handleStaticLocation(
 ) !?u16 {
     if (!(request.method == .GET or request.method == .HEAD)) return null;
     const writer = conn.writer();
-    const prefer_file_backed = @TypeOf(conn) == std.net.Stream;
+    const prefer_file_backed = @TypeOf(conn) == compat.NetStream;
     var served = (try http.static_file.serve(allocator, .{
         .root = root_cfg.root,
         .request_path = request.uri.path,
@@ -5459,7 +5464,7 @@ fn serveTryFilesFallback(
     const request_path = request.uri.path;
     if (!(std.ascii.eqlIgnoreCase(method, "GET") or std.ascii.eqlIgnoreCase(method, "HEAD"))) return error.NoTryFiles;
     if (cfg.doc_root.len == 0 or cfg.try_files.len == 0) return error.NoTryFiles;
-    const prefer_file_backed = @TypeOf(conn) == std.net.Stream;
+    const prefer_file_backed = @TypeOf(conn) == compat.NetStream;
 
     var served = (try http.static_file.serve(allocator, .{
         .root = cfg.doc_root,
@@ -5518,14 +5523,19 @@ fn writeStaticServedResponse(
     }
 
     if (served.file_path) |file_path| {
-        if (@TypeOf(conn) == std.net.Stream) {
-            const out_file = std.fs.File{ .handle = conn.handle };
-            const in_file = try std.fs.openFileAbsolute(file_path, .{});
-            defer in_file.close();
-            try out_file.writeFileAll(in_file, .{
-                .in_offset = served.file_offset,
-                .in_len = served.file_len,
-            });
+        if (@TypeOf(conn) == compat.NetStream) {
+            var in_fc = try std.Io.Dir.openFileAbsolute(compat.io(), file_path, .{});
+            defer in_fc.close(compat.io());
+            _ = std.c.lseek(in_fc.handle, @intCast(served.file_offset), std.c.SEEK.SET);
+            var remaining: u64 = served.file_len;
+            var xfer_buf: [65536]u8 = undefined;
+            while (remaining > 0) {
+                const to_read: usize = @intCast(@min(xfer_buf.len, remaining));
+                const n = std.c.read(in_fc.handle, &xfer_buf, to_read);
+                if (n <= 0) break;
+                try conn.writeAll(xfer_buf[0..@intCast(n)]);
+                remaining -= @intCast(n);
+            }
             state.logger.debug(correlation_id, "served static file via file-backed path: {s}", .{file_path});
         } else {
             return error.InvalidStaticTransferState;
@@ -5593,7 +5603,7 @@ fn streamSseTopic(
             if (cfg.sse_idle_timeout_ms > 0 and now_ms - last_send_ms >= cfg.sse_idle_timeout_ms) return;
         }
 
-        std.time.sleep(@as(u64, poll_ms) * std.time.ns_per_ms);
+        std.Io.sleep(compat.io(), std.Io.Duration.fromMilliseconds(@as(i64, @intCast(poll_ms))), .awake) catch {};
     }
 }
 
@@ -5621,9 +5631,9 @@ fn parseQueryParam(query: ?[]const u8, key: []const u8) ?[]const u8 {
 fn generateCommandId(allocator: std.mem.Allocator) ![]const u8 {
     var rnd: [16]u8 = undefined;
     std.crypto.random.bytes(&rnd);
-    return std.fmt.allocPrint(allocator, "cmd-{d}-{s}", .{
-        std.time.milliTimestamp(),
-        std.fmt.fmtSliceHexLower(&rnd),
+    return std.fmt.allocPrint(allocator, "cmd-{d}-{f}", .{
+        compat.milliTimestamp(),
+        compat.fmtSliceHexLower(&rnd),
     });
 }
 
@@ -5927,26 +5937,23 @@ fn spawnMirrorRequests(
     for (rules) |rule| {
         if (!http.rewrite.methodMatches(rule.method, method)) continue;
         if (!http.rewrite.regexMatches(rule.pattern, path)) continue;
-        var client = std.http.Client{ .allocator = allocator };
+        var client = std.http.Client{ .allocator = allocator, .io = compat.io() };
         defer client.deinit();
         const uri = std.Uri.parse(rule.target_url) catch continue;
-        var header_buf: [8 * 1024]u8 = undefined;
+        var header_buf: [1024]u8 = undefined;
         var headers = [_]std.http.Header{
             .{ .name = http.correlation.REQUEST_HEADER_NAME, .value = correlation_id },
             .{ .name = http.correlation.HEADER_NAME, .value = correlation_id },
             .{ .name = "X-Mirror-Client-IP", .value = client_ip },
             .{ .name = "Content-Type", .value = content_type orelse "application/octet-stream" },
         };
-        var req = client.open(.POST, uri, .{
-            .server_header_buffer = &header_buf,
+        var req = client.request(.POST, uri, .{
             .extra_headers = headers[0..],
             .headers = .{ .content_type = .{ .override = content_type orelse "application/octet-stream" } },
         }) catch continue;
         defer req.deinit();
-        req.send() catch continue;
-        req.writeAll(body) catch continue;
-        req.finish() catch continue;
-        req.wait() catch continue;
+        req.sendBodyComplete(@constCast(body)) catch continue;
+        _ = req.receiveHead(&header_buf) catch {};
     }
 }
 
@@ -5984,28 +5991,26 @@ fn parseSubrequestPayload(allocator: std.mem.Allocator, body: []const u8) !Subre
 }
 
 fn executeSubrequest(allocator: std.mem.Allocator, url: []const u8, method: std.http.Method, req_body: ?[]const u8) !SubrequestResult {
-    var client = std.http.Client{ .allocator = allocator };
+    var client = std.http.Client{ .allocator = allocator, .io = compat.io() };
     defer client.deinit();
     const uri = try std.Uri.parse(url);
     var header_buf: [16 * 1024]u8 = undefined;
-    var req = try client.open(method, uri, .{ .server_header_buffer = &header_buf });
+    var req = try client.request(method, uri, .{});
     defer req.deinit();
     if (req_body) |b| {
-        req.transfer_encoding = .{ .content_length = b.len };
+        try req.sendBodyComplete(@constCast(b));
+    } else {
+        try req.sendBodiless();
     }
-    try req.send();
-    if (req_body) |b| {
-        try req.writeAll(b);
-    }
-    try req.finish();
-    try req.wait();
-    var out = std.ArrayList(u8).init(allocator);
-    errdefer out.deinit();
-    try req.reader().readAllArrayList(&out, 2 * 1024 * 1024);
+    var resp = try req.receiveHead(&header_buf);
+    const resp_status = @intFromEnum(resp.head.status);
+    const resp_content_type = resp.head.content_type orelse "application/octet-stream";
+    var resp_buf: [8192]u8 = undefined;
+    const body_data = try resp.reader(&resp_buf).allocRemaining(allocator, .limited(2 * 1024 * 1024));
     return .{
-        .status = @intFromEnum(req.response.status),
-        .body = try out.toOwnedSlice(),
-        .content_type = req.response.content_type orelse "application/octet-stream",
+        .status = resp_status,
+        .body = body_data,
+        .content_type = resp_content_type,
     };
 }
 
@@ -6054,7 +6059,7 @@ fn handleFastcgiRoute(
     const remote_port = request.headers.get("x-forwarded-port") orelse request.headers.get("x-real-port") orelse
         (std.fmt.bufPrint(&remote_port_buf, "{d}", .{0}) catch "0");
 
-    var request_uri = std.ArrayList(u8).init(allocator);
+    var request_uri = std.array_list.Managed(u8).init(allocator);
     defer request_uri.deinit();
     try request_uri.appendSlice(request.uri.path);
     if (request.uri.query) |query| {
@@ -6062,7 +6067,7 @@ fn handleFastcgiRoute(
         try request_uri.appendSlice(query);
     }
 
-    var extra_env = std.ArrayList(http.fastcgi.EnvPair).init(allocator);
+    var extra_env = std.array_list.Managed(http.fastcgi.EnvPair).init(allocator);
     defer extra_env.deinit();
     for (cfg.fastcgi_params) |pair| {
         try extra_env.append(.{ .name = pair.name, .value = pair.value });
@@ -6195,7 +6200,7 @@ fn handleScgiRoute(
     const remote_port = request.headers.get("x-forwarded-port") orelse request.headers.get("x-real-port") orelse
         (std.fmt.bufPrint(&remote_port_buf, "{d}", .{0}) catch "0");
 
-    var request_uri = std.ArrayList(u8).init(allocator);
+    var request_uri = std.array_list.Managed(u8).init(allocator);
     defer request_uri.deinit();
     try request_uri.appendSlice(request.uri.path);
     if (request.uri.query) |query| {
@@ -6286,7 +6291,7 @@ fn handleUwsgiRoute(
     const remote_port = request.headers.get("x-forwarded-port") orelse request.headers.get("x-real-port") orelse
         (std.fmt.bufPrint(&remote_port_buf, "{d}", .{0}) catch "0");
 
-    var request_uri = std.ArrayList(u8).init(allocator);
+    var request_uri = std.array_list.Managed(u8).init(allocator);
     defer request_uri.deinit();
     try request_uri.appendSlice(request.uri.path);
     if (request.uri.query) |query| {
@@ -6358,22 +6363,16 @@ fn proxyGrpcExecute(
         .{ .name = http.correlation.HEADER_NAME, .value = correlation_id },
         .{ .name = "TE", .value = "trailers" },
     };
-    var req = try state.upstream_client.open(.POST, uri, .{
-        .server_header_buffer = &header_buf,
+    var req = try state.upstream_client.request(.POST, uri, .{
         .extra_headers = headers[0..],
         .headers = .{ .content_type = .{ .override = "application/grpc" } },
         .keep_alive = true,
     });
     defer req.deinit();
-    req.transfer_encoding = .{ .content_length = body.len };
-    try req.send();
-    try req.writeAll(body);
-    try req.finish();
-    try req.wait();
-    var out = std.ArrayList(u8).init(allocator);
-    errdefer out.deinit();
-    try req.reader().readAllArrayList(&out, 4 * 1024 * 1024);
-    return out.toOwnedSlice();
+    try req.sendBodyComplete(@constCast(body));
+    var resp = try req.receiveHead(&header_buf);
+    var resp_buf: [8192]u8 = undefined;
+    return try resp.reader(&resp_buf).allocRemaining(allocator, .limited(4 * 1024 * 1024));
 }
 
 fn handleMailProxyRoute(
@@ -6551,11 +6550,11 @@ fn findSmtpDataStart(payload: []const u8) ?usize {
 
 fn executeRawProtocolRequest(allocator: std.mem.Allocator, endpoint: []const u8, payload: []const u8) ![]u8 {
     const ep = try http.memcached.parseEndpoint(endpoint);
-    const stream = try std.net.tcpConnectToHost(allocator, ep.host, ep.port);
+    const stream = try compat.tcpConnectToHost(allocator, ep.host, ep.port);
     defer stream.close();
     try setSocketTimeoutMs(stream.handle, 2_000, 2_000);
     try stream.writer().writeAll(payload);
-    var out = std.ArrayList(u8).init(allocator);
+    var out = std.array_list.Managed(u8).init(allocator);
     errdefer out.deinit();
     var buf: [16 * 1024]u8 = undefined;
     const n = try stream.read(&buf);
@@ -6595,7 +6594,7 @@ fn parseMailProxyEndpoint(raw: []const u8) !?MailProxyEndpoint {
 }
 
 fn executeSmtpProtocolRequest(allocator: std.mem.Allocator, endpoint: MailProxyEndpoint, payload: []const u8) ![]u8 {
-    const stream = try std.net.tcpConnectToHost(allocator, endpoint.host, endpoint.port);
+    const stream = try compat.tcpConnectToHost(allocator, endpoint.host, endpoint.port);
     defer stream.close();
     try setSocketTimeoutMs(stream.handle, 10_000, 10_000);
     return switch (endpoint.transport) {
@@ -6605,7 +6604,7 @@ fn executeSmtpProtocolRequest(allocator: std.mem.Allocator, endpoint: MailProxyE
 }
 
 fn executeImapProtocolRequest(allocator: std.mem.Allocator, endpoint: MailProxyEndpoint, payload: []const u8) ![]u8 {
-    const stream = try std.net.tcpConnectToHost(allocator, endpoint.host, endpoint.port);
+    const stream = try compat.tcpConnectToHost(allocator, endpoint.host, endpoint.port);
     defer stream.close();
     try setSocketTimeoutMs(stream.handle, 10_000, 10_000);
     return switch (endpoint.transport) {
@@ -6616,7 +6615,7 @@ fn executeImapProtocolRequest(allocator: std.mem.Allocator, endpoint: MailProxyE
 
 fn executeSmtpTlsRequest(
     allocator: std.mem.Allocator,
-    stream: std.net.Stream,
+    stream: compat.NetStream,
     host: []const u8,
     payload: []const u8,
 ) ![]u8 {
@@ -6632,7 +6631,7 @@ fn executeSmtpTlsRequest(
 
 fn executeSmtpStartTlsRequest(
     allocator: std.mem.Allocator,
-    stream: std.net.Stream,
+    stream: compat.NetStream,
     host: []const u8,
     payload: []const u8,
 ) ![]u8 {
@@ -6668,7 +6667,7 @@ fn executeSmtpStartTlsRequest(
 
 fn executeImapTlsRequest(
     allocator: std.mem.Allocator,
-    stream: std.net.Stream,
+    stream: compat.NetStream,
     host: []const u8,
     payload: []const u8,
 ) ![]u8 {
@@ -6689,7 +6688,7 @@ fn executeImapTlsRequest(
 
 fn executeImapStartTlsRequest(
     allocator: std.mem.Allocator,
-    stream: std.net.Stream,
+    stream: compat.NetStream,
     host: []const u8,
     payload: []const u8,
 ) ![]u8 {
@@ -6713,8 +6712,8 @@ fn executeImapStartTlsRequest(
     return readImapReplyTls(allocator, &tls_client, stream, imapPayloadTag(payload));
 }
 
-fn readSmtpReplyPlain(allocator: std.mem.Allocator, stream: std.net.Stream) ![]u8 {
-    var out = std.ArrayList(u8).init(allocator);
+fn readSmtpReplyPlain(allocator: std.mem.Allocator, stream: compat.NetStream) ![]u8 {
+    var out = std.array_list.Managed(u8).init(allocator);
     errdefer out.deinit();
     var buf: [2048]u8 = undefined;
     while (true) {
@@ -6727,8 +6726,8 @@ fn readSmtpReplyPlain(allocator: std.mem.Allocator, stream: std.net.Stream) ![]u
     return out.toOwnedSlice();
 }
 
-fn readSmtpReplyTls(allocator: std.mem.Allocator, tls_client: *std.crypto.tls.Client, stream: std.net.Stream) ![]u8 {
-    var out = std.ArrayList(u8).init(allocator);
+fn readSmtpReplyTls(allocator: std.mem.Allocator, tls_client: *std.crypto.tls.Client, stream: compat.NetStream) ![]u8 {
+    var out = std.array_list.Managed(u8).init(allocator);
     errdefer out.deinit();
     var buf: [2048]u8 = undefined;
     while (true) {
@@ -6741,8 +6740,8 @@ fn readSmtpReplyTls(allocator: std.mem.Allocator, tls_client: *std.crypto.tls.Cl
     return out.toOwnedSlice();
 }
 
-fn readImapReplyPlain(allocator: std.mem.Allocator, stream: std.net.Stream, tag: ?[]const u8) ![]u8 {
-    var out = std.ArrayList(u8).init(allocator);
+fn readImapReplyPlain(allocator: std.mem.Allocator, stream: compat.NetStream, tag: ?[]const u8) ![]u8 {
+    var out = std.array_list.Managed(u8).init(allocator);
     errdefer out.deinit();
     var buf: [2048]u8 = undefined;
     while (true) {
@@ -6758,10 +6757,10 @@ fn readImapReplyPlain(allocator: std.mem.Allocator, stream: std.net.Stream, tag:
 fn readImapReplyTls(
     allocator: std.mem.Allocator,
     tls_client: *std.crypto.tls.Client,
-    stream: std.net.Stream,
+    stream: compat.NetStream,
     tag: ?[]const u8,
 ) ![]u8 {
-    var out = std.ArrayList(u8).init(allocator);
+    var out = std.array_list.Managed(u8).init(allocator);
     errdefer out.deinit();
     var buf: [2048]u8 = undefined;
     while (true) {
@@ -6854,13 +6853,29 @@ fn smtpReplyAdvertisesStartTls(reply: []const u8) bool {
 
 fn executeUdpDatagramRequest(allocator: std.mem.Allocator, endpoint: []const u8, payload: []const u8) ![]u8 {
     const ep = try http.memcached.parseEndpoint(endpoint);
-    const addr = try std.net.Address.resolveIp(ep.host, ep.port);
-    const sock = try std.posix.socket(addr.any.family, std.posix.SOCK.DGRAM, std.posix.IPPROTO.UDP);
-    defer std.posix.close(sock);
-    _ = try std.posix.sendto(sock, payload, 0, &addr.any, addr.getOsSockLen());
+    const address = try std.Io.net.IpAddress.resolve(compat.io(), ep.host, ep.port);
+    var sin: std.c.sockaddr.in = undefined;
+    const sock_family: c_uint = switch (address) {
+        .ip4 => |ip4| blk: {
+            sin = .{
+                .family = std.posix.AF.INET,
+                .port = std.mem.nativeToBig(u16, ip4.port),
+                .addr = std.mem.readInt(u32, &ip4.bytes, .big),
+                .zero = [8]u8{ 0, 0, 0, 0, 0, 0, 0, 0 },
+            };
+            break :blk std.posix.AF.INET;
+        },
+        .ip6 => return error.Ipv6NotSupportedForUdp,
+    };
+    const sock = std.c.socket(sock_family, std.posix.SOCK.DGRAM, std.posix.IPPROTO.UDP);
+    if (sock < 0) return error.SocketFailed;
+    defer _ = std.c.close(sock);
+    const sent = std.c.sendto(sock, payload.ptr, payload.len, 0, @ptrCast(&sin), @sizeOf(std.c.sockaddr.in));
+    if (sent < 0) return error.SendFailed;
     var buf: [16 * 1024]u8 = undefined;
-    const n = try std.posix.recv(sock, &buf, 0);
-    return allocator.dupe(u8, buf[0..n]);
+    const n = std.c.recv(sock, &buf, buf.len, 0);
+    if (n < 0) return error.RecvFailed;
+    return allocator.dupe(u8, buf[0..@intCast(n)]);
 }
 
 const MemcachedPayload = struct {
@@ -7303,7 +7318,7 @@ fn hashBearerToken(token: []const u8) [64]u8 {
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(token, &digest, .{});
     var digest_hex: [64]u8 = undefined;
-    _ = std.fmt.bufPrint(&digest_hex, "{s}", .{std.fmt.fmtSliceHexLower(&digest)}) catch unreachable;
+    _ = std.fmt.bufPrint(&digest_hex, "{f}", .{compat.fmtSliceHexLower(&digest)}) catch unreachable;
     return digest_hex;
 }
 
@@ -7530,14 +7545,19 @@ fn parseDeviceRegistration(allocator: std.mem.Allocator, body: []const u8) !Devi
 }
 
 fn registerDeviceIdentity(path: []const u8, device_id: []const u8, public_key: []const u8) !void {
-    var file = std.fs.cwd().openFile(path, .{ .mode = .read_write }) catch try std.fs.cwd().createFile(path, .{ .truncate = false, .read = true });
-    defer file.close();
-    try file.seekFromEnd(0);
-    try file.writer().print("{s}|{s}\n", .{ device_id, public_key });
+    const path_z = try std.heap.page_allocator.dupeZ(u8, path);
+    defer std.heap.page_allocator.free(path_z);
+    const fd = std.c.open(path_z.ptr, std.c.O.WRONLY | std.c.O.CREAT | std.c.O.APPEND, 0o644);
+    if (fd < 0) return error.FileOpenFailed;
+    defer _ = std.c.close(fd);
+    const line = try std.fmt.allocPrint(std.heap.page_allocator, "{s}|{s}\n", .{ device_id, public_key });
+    defer std.heap.page_allocator.free(line);
+    const stream = compat.NetStream{ .handle = fd };
+    try stream.writeAll(line);
 }
 
 fn loadRegisteredDeviceKey(allocator: std.mem.Allocator, registry_path: []const u8, device_id: []const u8) ?[]const u8 {
-    const raw = std.fs.cwd().readFileAlloc(allocator, registry_path, 2 * 1024 * 1024) catch return null;
+    const raw = compat.cwd().readFileAlloc(allocator, registry_path, 2 * 1024 * 1024) catch return null;
     defer allocator.free(raw);
     var lines = std.mem.splitScalar(u8, raw, '\n');
     while (lines.next()) |line_raw| {
@@ -7563,7 +7583,7 @@ fn validateDeviceRequest(
     const ts_str = headers.get("x-device-timestamp") orelse return false;
     const provided_sig = headers.get("x-device-signature") orelse return false;
     const ts = std.fmt.parseInt(i64, ts_str, 10) catch return false;
-    const now = std.time.timestamp();
+    const now = compat.unixTimestamp();
     const delta = if (now > ts) now - ts else ts - now;
     if (delta > 300) return false;
 
@@ -7575,7 +7595,7 @@ fn validateDeviceRequest(
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(signed, &digest, .{});
     var digest_hex: [64]u8 = undefined;
-    _ = std.fmt.bufPrint(&digest_hex, "{s}", .{std.fmt.fmtSliceHexLower(&digest)}) catch return false;
+    _ = std.fmt.bufPrint(&digest_hex, "{f}", .{compat.fmtSliceHexLower(&digest)}) catch return false;
     return std.ascii.eqlIgnoreCase(std.mem.trim(u8, provided_sig, " \t\r\n"), digest_hex[0..]);
 }
 
@@ -7713,7 +7733,7 @@ fn timeWindowAllows(raw: []const u8) bool {
     const dash = std.mem.indexOfScalar(u8, raw, '-') orelse return true;
     const start = std.fmt.parseInt(u8, std.mem.trim(u8, raw[0..dash], " \t"), 10) catch return true;
     const stop = std.fmt.parseInt(u8, std.mem.trim(u8, raw[dash + 1 ..], " \t"), 10) catch return true;
-    const now = std.time.timestamp();
+    const now = compat.unixTimestamp();
     const hour = @as(u8, @intCast(@mod(@divFloor(now, 3600), 24)));
     if (start <= stop) return hour >= start and hour < stop;
     return hour >= start or hour < stop;
@@ -7728,7 +7748,7 @@ fn authorizeViaSubrequest(
 ) bool {
     if (cfg.auth_request_url.len == 0) return true;
     const uri = std.Uri.parse(cfg.auth_request_url) catch return false;
-    var client = std.http.Client{ .allocator = allocator };
+    var client = std.http.Client{ .allocator = allocator, .io = compat.io() };
     defer client.deinit();
 
     var header_buf: [4 * 1024]u8 = undefined;
@@ -7753,15 +7773,13 @@ fn authorizeViaSubrequest(
         header_count += 1;
     }
 
-    var req = client.open(.GET, uri, .{
-        .server_header_buffer = &header_buf,
+    var req = client.request(.GET, uri, .{
         .extra_headers = headers_buf[0..header_count],
     }) catch return false;
     defer req.deinit();
-    req.send() catch return false;
-    req.finish() catch return false;
-    req.wait() catch return false;
-    const status = @intFromEnum(req.response.status);
+    req.sendBodiless() catch return false;
+    const resp = req.receiveHead(&header_buf) catch return false;
+    const status = @intFromEnum(resp.head.status);
     return status >= 200 and status < 300;
 }
 
@@ -7817,7 +7835,7 @@ fn buildProxyCacheKey(
     var payload_digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(payload, &payload_digest, .{});
     var payload_digest_hex: [64]u8 = undefined;
-    _ = std.fmt.bufPrint(&payload_digest_hex, "{s}", .{std.fmt.fmtSliceHexLower(&payload_digest)}) catch unreachable;
+    _ = std.fmt.bufPrint(&payload_digest_hex, "{f}", .{compat.fmtSliceHexLower(&payload_digest)}) catch unreachable;
 
     const identity_value = identity orelse "-";
     var api_version_buf: [20]u8 = undefined;
@@ -7826,8 +7844,8 @@ fn buildProxyCacheKey(
     else
         "-";
 
-    var out = std.ArrayList(u8).init(allocator);
-    errdefer out.deinit();
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
     var token_it = std.mem.splitScalar(u8, key_template, ':');
     var wrote_any = false;
     while (token_it.next()) |part| {
@@ -7845,32 +7863,32 @@ fn buildProxyCacheKey(
             api_version_value
         else
             continue;
-        if (wrote_any) try out.append(':');
-        try out.appendSlice(value);
+        if (wrote_any) try out.append(allocator, ':');
+        try out.appendSlice(allocator, value);
         wrote_any = true;
     }
 
     if (!wrote_any) {
-        try out.appendSlice(method);
-        try out.append(':');
-        try out.appendSlice(path);
-        try out.append(':');
-        try out.appendSlice(payload_digest_hex[0..]);
+        try out.appendSlice(allocator, method);
+        try out.append(allocator, ':');
+        try out.appendSlice(allocator, path);
+        try out.append(allocator, ':');
+        try out.appendSlice(allocator, payload_digest_hex[0..]);
     }
-    return out.toOwnedSlice();
+    return out.toOwnedSlice(allocator);
 }
 
 fn proxyCacheFilePath(allocator: std.mem.Allocator, cache_path: []const u8, key: []const u8) ![]u8 {
     var key_digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(key, &key_digest, .{});
     var key_digest_hex: [64]u8 = undefined;
-    _ = std.fmt.bufPrint(&key_digest_hex, "{s}", .{std.fmt.fmtSliceHexLower(&key_digest)}) catch unreachable;
+    _ = std.fmt.bufPrint(&key_digest_hex, "{f}", .{compat.fmtSliceHexLower(&key_digest)}) catch unreachable;
     return std.fmt.allocPrint(allocator, "{s}/{s}.cache", .{ cache_path, key_digest_hex[0..] });
 }
 
 fn proxyCacheWriteToDisk(cache_path: []const u8, key: []const u8, status: u16, body: []const u8, content_type: []const u8) !void {
     if (cache_path.len == 0) return;
-    std.fs.cwd().makePath(cache_path) catch |err| switch (err) {
+    compat.cwd().makePath(cache_path) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return err,
     };
@@ -7879,11 +7897,12 @@ fn proxyCacheWriteToDisk(cache_path: []const u8, key: []const u8, status: u16, b
     const file_path = try proxyCacheFilePath(allocator, cache_path, key);
     defer allocator.free(file_path);
 
-    const file = try std.fs.cwd().createFile(file_path, .{ .truncate = true, .read = true });
-    defer file.close();
-    var writer = file.writer();
-    try writer.print("{d}\n{d}\n{s}\n\n", .{ status, std.time.nanoTimestamp(), content_type });
-    try writer.writeAll(body);
+    var fc = try compat.cwd().createFile(file_path, .{ .truncate = true, .read = false });
+    defer fc.close();
+    const header = try std.fmt.allocPrint(allocator, "{d}\n{d}\n{s}\n\n", .{ status, compat.nanoTimestamp(), content_type });
+    defer allocator.free(header);
+    try fc.writeAll(header);
+    try fc.writeAll(body);
 }
 
 fn proxyCacheReadFromDisk(
@@ -7897,7 +7916,7 @@ fn proxyCacheReadFromDisk(
     const file_path = try proxyCacheFilePath(allocator, cache_path, key);
     defer allocator.free(file_path);
 
-    const raw = std.fs.cwd().readFileAlloc(allocator, file_path, 16 * 1024 * 1024) catch |err| switch (err) {
+    const raw = compat.cwd().readFileAlloc(allocator, file_path, 16 * 1024 * 1024) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
     };
@@ -7912,7 +7931,7 @@ fn proxyCacheReadFromDisk(
     const status = std.fmt.parseInt(u16, std.mem.trim(u8, raw[0..l1], " \t\r\n"), 10) catch return null;
     const created_ns = std.fmt.parseInt(i128, std.mem.trim(u8, raw[l1 + 1 .. l2], " \t\r\n"), 10) catch return null;
     const ct_slice = std.mem.trim(u8, raw[l2 + 1 .. l3], " \t\r\n");
-    const now_ns = std.time.nanoTimestamp();
+    const now_ns = compat.nanoTimestamp();
     const age_ns = now_ns - created_ns;
     const ttl_ns: i128 = @as(i128, ttl_seconds) * std.time.ns_per_s;
     const stale_ns: i128 = @as(i128, stale_seconds) * std.time.ns_per_s;
@@ -7940,7 +7959,7 @@ fn proxyCacheDeleteFromDisk(cache_path: []const u8, key: []const u8) bool {
     const allocator = std.heap.page_allocator;
     const file_path = proxyCacheFilePath(allocator, cache_path, key) catch return false;
     defer allocator.free(file_path);
-    std.fs.cwd().deleteFile(file_path) catch |err| switch (err) {
+    compat.cwd().deleteFile(file_path) catch |err| switch (err) {
         error.FileNotFound => return false,
         else => return false,
     };
@@ -7949,7 +7968,7 @@ fn proxyCacheDeleteFromDisk(cache_path: []const u8, key: []const u8) bool {
 
 fn proxyCachePurgeDisk(cache_path: []const u8) usize {
     if (cache_path.len == 0) return 0;
-    var dir = std.fs.cwd().openDir(cache_path, .{ .iterate = true }) catch return 0;
+    var dir = compat.cwd().openDir(cache_path, .{ .iterate = true }) catch return 0;
     defer dir.close();
 
     var removed: usize = 0;
@@ -8026,7 +8045,7 @@ fn proxyCacheRefreshThread(task: *ProxyCacheRefreshTask) void {
     ) catch return;
 
     switch (exec) {
-        .streamed_status => |_| {},
+        .streamed_status => {},
         .buffered => |result| {
             defer task.allocator.free(result.body);
             defer task.allocator.free(result.content_type);
@@ -8275,9 +8294,9 @@ fn proxyJsonExecuteSingleAttempt(
     if (cfg.trust_require_upstream_identity and cfg.trust_shared_secret.len == 0) return error.UpstreamUntrusted;
     if (!isTrustedUpstream(cfg, upstream_host)) return error.UpstreamUntrusted;
 
-    var extra_headers = std.ArrayList(std.http.Header).init(allocator);
+    var extra_headers = std.array_list.Managed(std.http.Header).init(allocator);
     defer extra_headers.deinit();
-    var owned_header_values = std.ArrayList([]u8).init(allocator);
+    var owned_header_values = std.array_list.Managed([]u8).init(allocator);
     defer {
         for (owned_header_values.items) |value| allocator.free(value);
         owned_header_values.deinit();
@@ -8326,8 +8345,7 @@ fn proxyJsonExecuteSingleAttempt(
         try state.upstream_client.connectUnix(socket_path)
     else
         null;
-    var req = try state.upstream_client.open(.POST, uri, .{
-        .server_header_buffer = &server_header_buffer,
+    var req = try state.upstream_client.request(.POST, uri, .{
         .connection = unix_conn,
         .headers = .{ .content_type = .{ .override = "application/json" } },
         .extra_headers = extra_headers.items,
@@ -8338,33 +8356,32 @@ fn proxyJsonExecuteSingleAttempt(
 
     if (attempt_timeout_ms > 0) {
         if (req.connection) |conn| {
-            setSocketTimeoutMs(conn.stream.handle, attempt_timeout_ms, attempt_timeout_ms) catch |err| {
+            setSocketTimeoutMs(conn.stream_reader.stream.socket.handle, attempt_timeout_ms, attempt_timeout_ms) catch |err| {
                 state.logger.warn(null, "failed to set upstream socket timeout: {}", .{err});
             };
         }
     }
 
-    req.transfer_encoding = .{ .content_length = payload.len };
-    try req.send();
-    try req.writeAll(payload);
-    try req.finish();
-    try req.wait();
+    try req.sendBodyComplete(@constCast(payload));
+    var resp = try req.receiveHead(&server_header_buffer);
 
-    const status_code: u16 = @intFromEnum(req.response.status);
-    const upstream_content_type = req.response.content_type orelse JSON_CONTENT_TYPE;
-    const upstream_content_disposition = req.response.content_disposition;
-    const upstream_location = if (req.response.location) |location|
+    const status_code: u16 = @intFromEnum(resp.head.status);
+    const upstream_reason = resp.head.reason;
+    const upstream_content_type = resp.head.content_type orelse JSON_CONTENT_TYPE;
+    const upstream_content_disposition = resp.head.content_disposition;
+    const upstream_location = if (resp.head.location) |location|
         try allocator.dupe(u8, location)
     else
         null;
     errdefer if (upstream_location) |location| allocator.free(location);
-    const cacheable = !upstreamResponseHasNoStore(req.response);
+    const cacheable = !upstreamResponseHasNoStore(resp.head);
     const stream_status = enable_streaming_success and (status_code == 200 or cfg.proxy_stream_all_statuses);
+    var resp_read_buf: [8192]u8 = undefined;
     if (stream_status) {
         try writeStreamedUpstreamResponse(
             downstream_writer,
             status_code,
-            req.response.reason,
+            upstream_reason,
             upstream_content_type,
             upstream_content_disposition,
             correlation_id,
@@ -8374,8 +8391,9 @@ fn proxyJsonExecuteSingleAttempt(
 
         const read_buf = try state.relay_buffer_pool.acquire();
         defer state.relay_buffer_pool.release(read_buf);
+        const body_reader = resp.reader(&resp_read_buf);
         while (true) {
-            const n = try req.reader().read(read_buf);
+            const n = try body_reader.read(read_buf);
             if (n == 0) break;
             try writeChunk(downstream_writer, read_buf[0..n]);
         }
@@ -8399,8 +8417,9 @@ fn proxyJsonExecuteSingleAttempt(
 
         const drain_buf = try state.relay_buffer_pool.acquire();
         defer state.relay_buffer_pool.release(drain_buf);
+        const body_reader = resp.reader(&resp_read_buf);
         while (true) {
-            const n = try req.reader().read(drain_buf);
+            const n = try body_reader.read(drain_buf);
             if (n == 0) break;
         }
         state.appendTranscript(
@@ -8434,9 +8453,8 @@ fn proxyJsonExecuteSingleAttempt(
         cfg.max_connection_memory_bytes
     else
         2 * 1024 * 1024;
-    var body = std.ArrayList(u8).init(allocator);
-    errdefer body.deinit();
-    try req.reader().readAllArrayList(&body, max_buffered);
+    const body = try resp.reader(&resp_read_buf).allocRemaining(allocator, .limited(max_buffered));
+    errdefer allocator.free(body);
     const buffered_content_type = try allocator.dupe(u8, upstream_content_type);
     errdefer allocator.free(buffered_content_type);
     const buffered_content_disposition = if (upstream_content_disposition) |cd|
@@ -8459,13 +8477,13 @@ fn proxyJsonExecuteSingleAttempt(
         payload,
         status_code,
         buffered_content_type,
-        body.items,
+        body,
         &.{},
     );
     return .{
         .buffered = .{
             .status = status_code,
-            .body = try body.toOwnedSlice(),
+            .body = body,
             .content_type = buffered_content_type,
             .content_disposition = buffered_content_disposition,
             .location = upstream_location,
@@ -8477,7 +8495,7 @@ fn proxyJsonExecuteSingleAttempt(
 }
 
 fn appendAssertedIdentityHeaders(
-    headers: *std.ArrayList(std.http.Header),
+    headers: *std.array_list.Managed(std.http.Header),
     auth_identity: ?[]const u8,
     auth_user_id: ?[]const u8,
     auth_device_id: ?[]const u8,
@@ -8580,7 +8598,7 @@ fn writeBufferedUpstreamResponse(
 }
 
 fn appendProxyRequestHeaders(
-    extra_headers: *std.ArrayList(std.http.Header),
+    extra_headers: *std.array_list.Managed(std.http.Header),
     request_headers: *const http.Headers,
 ) !void {
     const connection_header = request_headers.get("connection");
@@ -8646,12 +8664,9 @@ fn shouldSkipUpstreamResponseHeader(name: []const u8) bool {
 
 fn computeHstsValue(allocator: std.mem.Allocator, cfg: *const edge_config.EdgeConfig) ![]u8 {
     if (!cfg.hsts_enabled or cfg.tls_cert_path.len == 0) return allocator.dupe(u8, "");
-    var buf = std.ArrayList(u8).init(allocator);
-    errdefer buf.deinit();
-    try buf.writer().print("max-age={d}", .{cfg.hsts_max_age});
-    if (cfg.hsts_include_subdomains) try buf.appendSlice("; includeSubDomains");
-    if (cfg.hsts_preload) try buf.appendSlice("; preload");
-    return buf.toOwnedSlice();
+    const subs = if (cfg.hsts_include_subdomains) "; includeSubDomains" else "";
+    const preload = if (cfg.hsts_preload) "; preload" else "";
+    return std.fmt.allocPrint(allocator, "max-age={d}{s}{s}", .{ cfg.hsts_max_age, subs, preload });
 }
 
 fn writeSecurityHeaders(writer: anytype, sec: *const http.security_headers.SecurityHeaders) !void {
@@ -8697,8 +8712,8 @@ fn isTrustedUpstream(cfg: *const edge_config.EdgeConfig, upstream_host: []const 
 fn appendTrustedUpstreamHeaders(
     allocator: std.mem.Allocator,
     cfg: *const edge_config.EdgeConfig,
-    extra_headers: *std.ArrayList(std.http.Header),
-    owned_header_values: *std.ArrayList([]u8),
+    extra_headers: *std.array_list.Managed(std.http.Header),
+    owned_header_values: *std.array_list.Managed([]u8),
     target_url: []const u8,
     correlation_id: []const u8,
     client_ip: []const u8,
@@ -8708,7 +8723,7 @@ fn appendTrustedUpstreamHeaders(
 ) !void {
     if (cfg.trust_shared_secret.len == 0) return;
 
-    const ts = std.time.timestamp();
+    const ts = compat.unixTimestamp();
     const ts_value = try std.fmt.allocPrint(allocator, "{d}", .{ts});
     try owned_header_values.append(ts_value);
     try extra_headers.append(.{ .name = "X-Tardigrade-Gateway-Id", .value = cfg.trust_gateway_id });
@@ -8717,7 +8732,7 @@ fn appendTrustedUpstreamHeaders(
     var payload_digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(payload, &payload_digest, .{});
     var payload_digest_hex: [64]u8 = undefined;
-    _ = std.fmt.bufPrint(&payload_digest_hex, "{s}", .{std.fmt.fmtSliceHexLower(&payload_digest)}) catch unreachable;
+    _ = std.fmt.bufPrint(&payload_digest_hex, "{f}", .{compat.fmtSliceHexLower(&payload_digest)}) catch unreachable;
 
     const identity = auth_identity orelse "-";
     const api_version_value = if (api_version) |ver|
@@ -8735,7 +8750,7 @@ fn appendTrustedUpstreamHeaders(
 
     var mac: [32]u8 = undefined;
     std.crypto.auth.hmac.sha2.HmacSha256.create(&mac, material, cfg.trust_shared_secret);
-    const signature_hex = try std.fmt.allocPrint(allocator, "{s}", .{std.fmt.fmtSliceHexLower(&mac)});
+    const signature_hex = try std.fmt.allocPrint(allocator, "{f}", .{compat.fmtSliceHexLower(&mac)});
     try owned_header_values.append(signature_hex);
     try extra_headers.append(.{ .name = "X-Tardigrade-Trust-Signature", .value = signature_hex });
 }
@@ -8750,7 +8765,7 @@ fn buildForwardedFor(allocator: std.mem.Allocator, incoming: ?[]const u8, client
     return allocator.dupe(u8, client_ip);
 }
 
-fn upstreamResponseHasNoStore(response: std.http.Client.Response) bool {
+fn upstreamResponseHasNoStore(response: std.http.Client.Response.Head) bool {
     var it = response.iterateHeaders();
     while (it.next()) |header| {
         if (!std.ascii.eqlIgnoreCase(header.name, "cache-control")) continue;
@@ -8874,8 +8889,8 @@ fn combineProxyTarget(allocator: std.mem.Allocator, target: []const u8, suffix_p
     if (suffix_path == null) return allocator.dupe(u8, target);
 
     const suffix = suffix_path.?;
-    const left_trimmed = std.mem.trimRight(u8, target, "/");
-    const right_trimmed = std.mem.trimLeft(u8, suffix, "/");
+    const left_trimmed = compat.trimRight(u8, target, "/");
+    const right_trimmed = std.mem.trimStart(u8, suffix, "/");
 
     if (left_trimmed.len == 0) {
         return std.fmt.allocPrint(allocator, "/{s}", .{right_trimmed});
@@ -8961,7 +8976,7 @@ fn writeRequestIdHeaders(writer: anytype, request_id: []const u8) !void {
     try writer.print("{s}: {s}\r\n", .{ http.correlation.HEADER_NAME, request_id });
 }
 
-fn appendRequestIdHeaders(headers: *std.ArrayList(std.http.Header), request_id: []const u8) !void {
+fn appendRequestIdHeaders(headers: *std.array_list.Managed(std.http.Header), request_id: []const u8) !void {
     try headers.append(.{ .name = http.correlation.REQUEST_HEADER_NAME, .value = request_id });
     try headers.append(.{ .name = http.correlation.HEADER_NAME, .value = request_id });
 }
@@ -9170,16 +9185,24 @@ test "parse proxy protocol v2 header extracts source ip" {
 }
 
 test "clientIpFromAddress formats ipv4 address" {
-    const address = try std.net.Address.parseIp("203.0.113.9", 443);
-    const ip = try clientIpFromAddress(std.testing.allocator, address);
+    var storage: std.c.sockaddr.storage = std.mem.zeroes(std.c.sockaddr.storage);
+    var sin: *std.c.sockaddr.in = @ptrCast(&storage);
+    sin.family = std.posix.AF.INET;
+    sin.addr = std.mem.nativeToBig(u32, (203 << 24) | (0 << 16) | (113 << 8) | 9);
+    const ip = try clientIpFromAddress(std.testing.allocator, &storage);
     defer std.testing.allocator.free(ip);
 
     try std.testing.expectEqualStrings("203.0.113.9", ip);
 }
 
 test "clientIpFromAddress formats ipv6 address" {
-    const address = try std.net.Address.parseIp("2001:db8::44", 443);
-    const ip = try clientIpFromAddress(std.testing.allocator, address);
+    var storage: std.c.sockaddr.storage = std.mem.zeroes(std.c.sockaddr.storage);
+    var sin6: *std.c.sockaddr.in6 = @ptrCast(&storage);
+    sin6.family = std.posix.AF.INET6;
+    // 2001:0db8::0044
+    const addr = [16]u8{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x44 };
+    sin6.addr = addr;
+    const ip = try clientIpFromAddress(std.testing.allocator, &storage);
     defer std.testing.allocator.free(ip);
 
     try std.testing.expectEqualStrings("2001:db8:0:0:0:0:0:44", ip);
@@ -9236,7 +9259,7 @@ test "reloadable config store retires old config after last lease" {
     defer store.deinit();
 
     var lease = store.acquire();
-    try store.retired.ensureUnusedCapacity(1);
+    try store.retired.ensureUnusedCapacity(std.testing.allocator, 1);
     const new_version = try ReloadableConfigStore.createBorrowedVersion(std.testing.allocator, &second_cfg);
     store.installPrepared(new_version);
 
@@ -9373,7 +9396,7 @@ test "buildProxyCacheKey falls back for unknown template tokens" {
 
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(payload, &digest, .{});
-    const expected = try std.fmt.allocPrint(allocator, "POST:/api/tasks:{s}", .{std.fmt.fmtSliceHexLower(&digest)});
+    const expected = try std.fmt.allocPrint(allocator, "POST:/api/tasks:{f}", .{compat.fmtSliceHexLower(&digest)});
     defer allocator.free(expected);
     try std.testing.expectEqualStrings(expected, key);
 }

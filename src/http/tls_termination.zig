@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("../zig_compat.zig");
 const acme_client = @import("acme_client.zig");
 
 const c = @cImport({
@@ -110,7 +111,7 @@ const ManagedSniCert = struct {
 
 const State = struct {
     allocator: std.mem.Allocator,
-    mutex: std.Thread.Mutex = .{},
+    mutex: compat.Mutex = .{},
     dynamic_reload_interval_ms: u64,
     next_reload_ms: u64 = 0,
     default_cert_path: []const u8,
@@ -154,7 +155,7 @@ const State = struct {
             std.heap.c_allocator.free(sc.cert_path_z);
             std.heap.c_allocator.free(sc.key_path_z);
         }
-        self.sni_certs.deinit();
+        self.sni_certs.deinit(self.allocator);
     }
 };
 
@@ -201,7 +202,7 @@ pub const TlsTerminator = struct {
             .acme_renew_days_before_expiry = opts.acme_renew_days_before_expiry,
             .acme_challenge_store = opts.acme_challenge_store,
             .static_sni_specs = owned_sni_specs,
-            .sni_certs = std.ArrayList(ManagedSniCert).init(allocator),
+            .sni_certs = .empty,
             .http2_enabled = opts.http2_enabled,
         };
         errdefer st.deinit();
@@ -341,10 +342,26 @@ pub const TlsConnection = struct {
         return error.TlsReadFailed;
     }
 
-    pub const Writer = std.io.Writer(*TlsConnection, TlsError, writeFn);
+    pub const Writer = struct {
+        conn: *TlsConnection,
+
+        pub fn writeAll(self: Writer, data: []const u8) TlsError!void {
+            var remaining = data;
+            while (remaining.len > 0) {
+                const n = try writeFn(self.conn, remaining);
+                remaining = remaining[n..];
+            }
+        }
+
+        pub fn print(self: Writer, comptime fmt: []const u8, args: anytype) !void {
+            const s = try std.fmt.allocPrint(std.heap.page_allocator, fmt, args);
+            defer std.heap.page_allocator.free(s);
+            return self.writeAll(s);
+        }
+    };
 
     pub fn writer(self: *TlsConnection) Writer {
-        return .{ .context = self };
+        return .{ .conn = self };
     }
 
     pub fn negotiatedProtocol(self: *const TlsConnection) NegotiatedProtocol {
@@ -505,7 +522,7 @@ fn fetchAndStoreOcspResponse(st: *State, ctx: *c.SSL_CTX) TlsError!void {
     const req_bytes = req_buf.?[0..@intCast(req_len)];
 
     // HTTP POST to responder URL using std.http.Client.
-    var client = std.http.Client{ .allocator = st.allocator };
+    var client = std.http.Client{ .allocator = st.allocator, .io = compat.io() };
     defer client.deinit();
 
     const uri = std.Uri.parse(st.ocsp_responder_url) catch return error.OcspLoadFailed;
@@ -525,8 +542,8 @@ fn fetchAndStoreOcspResponse(st: *State, ctx: *c.SSL_CTX) TlsError!void {
     ocsp_req.wait() catch return error.OcspLoadFailed;
     if (ocsp_req.response.status != .ok) return error.OcspLoadFailed;
 
-    var resp_body = std.ArrayList(u8).init(st.allocator);
-    defer resp_body.deinit();
+    var resp_body: std.ArrayList(u8) = .empty;
+    defer resp_body.deinit(st.allocator);
     ocsp_req.reader().readAllArrayList(&resp_body, 64 * 1024) catch return error.OcspLoadFailed;
 
     // Parse and validate the OCSP response structure minimally.
@@ -550,14 +567,14 @@ fn fetchAndStoreOcspResponse(st: *State, ctx: *c.SSL_CTX) TlsError!void {
 
     // Persist to the static-file path so it survives restarts (best-effort).
     if (st.ocsp_response_path.len > 0) {
-        std.fs.cwd().writeFile(.{ .sub_path = st.ocsp_response_path, .data = new_response }) catch {};
+        compat.cwd().writeFile(.{ .sub_path = st.ocsp_response_path, .data = new_response }) catch {};
     }
 }
 
 fn loadOcspResponse(st: *State) TlsError!void {
     if (st.ocsp_response) |old| st.allocator.free(old);
     st.ocsp_response = null;
-    st.ocsp_response = std.fs.cwd().readFileAlloc(st.allocator, st.ocsp_response_path, 1024 * 1024) catch return error.OcspLoadFailed;
+    st.ocsp_response = std.Io.Dir.cwd().readFileAlloc(compat.io(), st.ocsp_response_path, st.allocator, .limited(1024 * 1024)) catch return error.OcspLoadFailed;
     st.ocsp_mtime = fileMtime(st.ocsp_response_path) catch null;
 }
 
@@ -574,10 +591,10 @@ fn rebuildSniCertificates(st: *State) TlsError!void {
     }
 
     if (st.acme_enabled and st.acme_cert_dir.len > 0) {
-        var dir = std.fs.cwd().openDir(st.acme_cert_dir, .{ .iterate = true }) catch return;
-        defer dir.close();
+        var dir = std.Io.Dir.cwd().openDir(compat.io(), st.acme_cert_dir, .{ .iterate = true }) catch return;
+        defer dir.close(compat.io());
         var it = dir.iterate();
-        while (it.next() catch null) |entry| {
+        while (it.next(compat.io()) catch null) |entry| {
             if (entry.kind != .file) continue;
             if (!std.mem.endsWith(u8, entry.name, ".crt")) continue;
             const host = entry.name[0 .. entry.name.len - 4];
@@ -587,7 +604,7 @@ fn rebuildSniCertificates(st: *State) TlsError!void {
             defer st.allocator.free(key_file);
             const key_path = std.fmt.allocPrint(st.allocator, "{s}/{s}", .{ st.acme_cert_dir, key_file }) catch continue;
             defer st.allocator.free(key_path);
-            std.fs.cwd().access(key_path, .{}) catch continue;
+            std.Io.Dir.cwd().access(compat.io(), key_path, .{}) catch continue;
             try appendSniCert(st, host, cert_path, key_path);
         }
     }
@@ -598,7 +615,7 @@ fn appendSniCert(st: *State, host: []const u8, cert_path: []const u8, key_path: 
     for (host_lc) |*ch| ch.* = std.ascii.toLower(ch.*);
     const cert_z = try std.heap.c_allocator.dupeZ(u8, cert_path);
     const key_z = try std.heap.c_allocator.dupeZ(u8, key_path);
-    try st.sni_certs.append(.{
+    try st.sni_certs.append(st.allocator, .{
         .host_lc = host_lc,
         .cert_path_z = cert_z,
         .key_path_z = key_z,
@@ -642,8 +659,8 @@ fn alpnSelectCallback(
 }
 
 fn fileMtime(path: []const u8) !i128 {
-    const stat = try std.fs.cwd().statFile(path);
-    return stat.mtime;
+    const stat = try std.Io.Dir.cwd().statFile(compat.io(), path, .{});
+    return @intCast(stat.mtime.toNanoseconds());
 }
 
 // ---------------------------------------------------------------------------
@@ -760,18 +777,18 @@ test "tls terminator copies sni specs for maintenance reload" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(.{ .sub_path = "test_server.crt", .data = embedded_server_crt });
-    try tmp.dir.writeFile(.{ .sub_path = "test_server.key", .data = embedded_server_key });
-    try tmp.dir.writeFile(.{ .sub_path = "test_alt_server.crt", .data = embedded_alt_server_crt });
-    try tmp.dir.writeFile(.{ .sub_path = "test_alt_server.key", .data = embedded_alt_server_key });
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "test_server.crt", .data = embedded_server_crt });
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "test_server.key", .data = embedded_server_key });
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "test_alt_server.crt", .data = embedded_alt_server_crt });
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "test_alt_server.key", .data = embedded_alt_server_key });
 
-    const alt_cert_path = try tmp.dir.realpathAlloc(allocator, "test_alt_server.crt");
+    const alt_cert_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, "test_alt_server.crt");
     defer allocator.free(alt_cert_path);
-    const alt_key_path = try tmp.dir.realpathAlloc(allocator, "test_alt_server.key");
+    const alt_key_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, "test_alt_server.key");
     defer allocator.free(alt_key_path);
-    const cert_path = try tmp.dir.realpathAlloc(allocator, "test_server.crt");
+    const cert_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, "test_server.crt");
     defer allocator.free(cert_path);
-    const key_path = try tmp.dir.realpathAlloc(allocator, "test_server.key");
+    const key_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, "test_server.key");
     defer allocator.free(key_path);
 
     var specs = try allocator.alloc(SniCertSpec, 1);

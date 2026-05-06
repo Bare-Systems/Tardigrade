@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("../src/zig_compat.zig");
 
 fn parseUrl(url: []const u8) !struct { host: []const u8, port: []const u8 } {
     const prefix = "https://";
@@ -32,10 +33,10 @@ fn countOccurrences(haystack: []const u8, needle: []const u8) usize {
 }
 
 fn runOsslClient(allocator: std.mem.Allocator, timeout_seconds: []const u8, args: []const []const u8) !std.process.Child.RunResult {
-    var argv = std.ArrayList([]const u8).init(allocator);
-    defer argv.deinit();
-    try argv.appendSlice(&.{ "perl", "-e", "alarm shift; exec @ARGV", timeout_seconds });
-    try argv.appendSlice(args);
+    var argv = std.ArrayList([]const u8).empty;
+    defer argv.deinit(allocator);
+    try argv.appendSlice(allocator, &.{ "perl", "-e", "alarm shift; exec @ARGV", timeout_seconds });
+    try argv.appendSlice(allocator, args);
     return try std.process.Child.run(.{
         .allocator = allocator,
         .argv = argv.items,
@@ -60,7 +61,7 @@ pub fn main() !u8 {
     const parsed = try parseUrl(request_url);
 
     var rand_buf: [8]u8 = undefined;
-    std.crypto.random.bytes(&rand_buf);
+    compat.randomBytes(&rand_buf);
     const run_id = std.fmt.bytesToHex(rand_buf, .lower);
     const base_dir_path = try std.fmt.allocPrint(allocator, ".zig-cache/http3-resumption-{s}", .{run_id});
     try std.fs.cwd().makePath(base_dir_path);
@@ -97,18 +98,24 @@ pub fn main() !u8 {
     const resumed_status = extractStatus(resumed.stdout) orelse extractStatus(resumed.stderr) orelse 0;
     const zero_rtt_count = countOccurrences(resumed.stdout, "type=0RTT") + countOccurrences(resumed.stderr, "type=0RTT");
 
-    try std.io.getStdOut().writer().print(
+    var stdout_buf: [512]u8 = undefined;
+    var stdout = compat.stdoutWriter(&stdout_buf);
+    try stdout.print(
         "{{\"warm_status\":{d},\"resumed_status\":{d},\"resumed_zero_rtt_count\":{d},\"warm_stdout_bytes\":{d},\"resumed_stdout_bytes\":{d}}}\n",
         .{ warm_status, resumed_status, zero_rtt_count, warm.stdout.len, resumed.stdout.len },
     );
+    try stdout.flush();
 
     if (warm_status == expected_status and resumed_status == expected_status and zero_rtt_count > 0) {
         return 0;
     }
 
-    try std.io.getStdErr().writer().print(
+    var stderr_buf: [512]u8 = undefined;
+    var stderr = compat.stderrWriter(&stderr_buf);
+    try stderr.print(
         "unexpected outcome: warm_term={any} resumed_term={any} warm_status={d} resumed_status={d} resumed_zero_rtt_count={d}\n",
         .{ warm.term, resumed.term, warm_status, resumed_status, zero_rtt_count },
     );
+    try stderr.flush();
     return 1;
 }

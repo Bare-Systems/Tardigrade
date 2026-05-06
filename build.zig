@@ -1,4 +1,5 @@
 const std = @import("std");
+const Io = std.Io;
 
 // Although this function looks imperative, note that its job is to
 // declaratively construct a build graph that will be executed by an external
@@ -35,6 +36,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
     exe_mod.addImport("build_options", build_options.createModule());
 
@@ -46,7 +48,6 @@ pub fn build(b: *std.Build) void {
         .linkage = if (static_executable) .static else null,
     });
     configureSystemLibrarySearchPaths(exe, prefer_static_system_libs);
-    exe.linkLibC();
     linkSystemLibrary(exe, "ssl", prefer_static_system_libs, require_static_system_libs);
     linkSystemLibrary(exe, "crypto", prefer_static_system_libs, require_static_system_libs);
     if (enable_http3_ngtcp2) {
@@ -87,7 +88,6 @@ pub fn build(b: *std.Build) void {
         .root_module = exe_mod,
     });
     configureSystemLibrarySearchPaths(exe_unit_tests, prefer_static_system_libs);
-    exe_unit_tests.linkLibC();
     linkSystemLibrary(exe_unit_tests, "ssl", prefer_static_system_libs, require_static_system_libs);
     linkSystemLibrary(exe_unit_tests, "crypto", prefer_static_system_libs, require_static_system_libs);
     if (enable_http3_ngtcp2) {
@@ -110,11 +110,14 @@ pub fn build(b: *std.Build) void {
     integration_options.addOption([]const u8, "http3_osslclient_bin_path", http3_osslclient_path);
 
     if (enable_http3_ngtcp2) {
-        const resumption_client = b.addExecutable(.{
-            .name = "http3_resumption_client",
+        const resumption_client_mod = b.createModule(.{
             .root_source_file = b.path("tests/http3_resumption_client.zig"),
             .target = target,
             .optimize = optimize,
+        });
+        const resumption_client = b.addExecutable(.{
+            .name = "http3_resumption_client",
+            .root_module = resumption_client_mod,
         });
         b.installArtifact(resumption_client);
     }
@@ -138,7 +141,7 @@ pub fn build(b: *std.Build) void {
 }
 
 fn pathExists(path: []const u8) bool {
-    std.fs.accessAbsolute(path, .{}) catch return false;
+    Io.Dir.accessAbsolute(std.Io.Threaded.global_single_threaded.io(), path, .{}) catch return false;
     return true;
 }
 
@@ -148,7 +151,7 @@ fn linkSystemLibrary(
     prefer_static_system_libs: bool,
     require_static_system_libs: bool,
 ) void {
-    compile.linkSystemLibrary2(name, .{
+    compile.root_module.linkSystemLibrary(name, .{
         .use_pkg_config = .no,
         .preferred_link_mode = if (prefer_static_system_libs) .static else .dynamic,
         .search_strategy = if (prefer_static_system_libs)
@@ -164,14 +167,14 @@ fn configureSystemLibrarySearchPaths(
 ) void {
     // Always add Homebrew paths on macOS so OpenSSL (not in Apple's SDK) is found.
     if (compile.rootModuleTarget().os.tag == .macos) {
-        compile.addSystemIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
-        compile.addSystemIncludePath(.{ .cwd_relative = "/opt/homebrew/opt/openssl@3/include" });
-        compile.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
-        compile.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/opt/openssl@3/lib" });
+        compile.root_module.addSystemIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
+        compile.root_module.addSystemIncludePath(.{ .cwd_relative = "/opt/homebrew/opt/openssl@3/include" });
+        compile.root_module.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
+        compile.root_module.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/opt/openssl@3/lib" });
     }
     if (!prefer_static_system_libs) return;
-    compile.addSystemIncludePath(.{ .cwd_relative = "/usr/include" });
-    compile.addLibraryPath(.{ .cwd_relative = "/lib" });
-    compile.addLibraryPath(.{ .cwd_relative = "/usr/lib" });
-    compile.addLibraryPath(.{ .cwd_relative = "/usr/local/lib" });
+    compile.root_module.addSystemIncludePath(.{ .cwd_relative = "/usr/include" });
+    compile.root_module.addLibraryPath(.{ .cwd_relative = "/lib" });
+    compile.root_module.addLibraryPath(.{ .cwd_relative = "/usr/lib" });
+    compile.root_module.addLibraryPath(.{ .cwd_relative = "/usr/local/lib" });
 }

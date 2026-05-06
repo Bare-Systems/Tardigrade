@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("../zig_compat.zig");
 
 pub const ProbeStatus = enum {
     up,
@@ -99,8 +100,8 @@ pub const State = struct {
 };
 
 pub fn buildProbeUrl(allocator: std.mem.Allocator, base_url: []const u8, probe_path: []const u8) ![]u8 {
-    const base_trimmed = std.mem.trimRight(u8, base_url, "/");
-    const path_trimmed = std.mem.trimLeft(u8, probe_path, "/");
+    const base_trimmed = compat.trimRight(u8, base_url, "/");
+    const path_trimmed = std.mem.trimStart(u8, probe_path, "/");
     if (path_trimmed.len == 0) return std.fmt.allocPrint(allocator, "{s}/", .{base_trimmed});
     return std.fmt.allocPrint(allocator, "{s}/{s}", .{ base_trimmed, path_trimmed });
 }

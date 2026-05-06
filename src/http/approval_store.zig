@@ -4,6 +4,7 @@
 /// for the approval workflow. All operations that can fail are non-fatal callers
 /// log warnings and continue.
 const std = @import("std");
+const compat = @import("../zig_compat.zig");
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -46,20 +47,15 @@ pub fn persist(
     const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{path});
     defer allocator.free(tmp_path);
 
-    var buf = std.ArrayList(u8).init(allocator);
-    defer buf.deinit();
-    try std.json.stringify(
-        StoreEnvelope{ .version = 1, .entries = entries },
-        .{},
-        buf.writer(),
-    );
+    const json_bytes = try compat.stringifyAlloc(allocator, StoreEnvelope{ .version = 1, .entries = entries }, .{});
+    defer allocator.free(json_bytes);
 
     {
-        const f = try std.fs.createFileAbsolute(tmp_path, .{ .truncate = true });
-        defer f.close();
-        try f.writeAll(buf.items);
+        const f = try std.Io.Dir.createFileAbsolute(compat.io(), tmp_path, .{ .truncate = true });
+        defer f.close(compat.io());
+        try f.writeStreamingAll(compat.io(), json_bytes);
     }
-    try std.fs.renameAbsolute(tmp_path, path);
+    try std.Io.Dir.renameAbsolute(tmp_path, path, compat.io());
 }
 
 // ---------------------------------------------------------------------------
@@ -72,13 +68,16 @@ pub fn load(
     allocator: std.mem.Allocator,
     path: []const u8,
 ) ![]StoredApproval {
-    const f = std.fs.openFileAbsolute(path, .{}) catch |e| switch (e) {
-        error.FileNotFound => return try allocator.alloc(StoredApproval, 0),
-        else => return e,
+    const data = blk: {
+        const f = std.Io.Dir.openFileAbsolute(compat.io(), path, .{}) catch |e| switch (e) {
+            error.FileNotFound => return try allocator.alloc(StoredApproval, 0),
+            else => return e,
+        };
+        defer f.close(compat.io());
+        var file_buf: [8192]u8 = undefined;
+        var reader = f.reader(compat.io(), &file_buf);
+        break :blk try reader.interface.readAlloc(allocator, 64 * 1024 * 1024);
     };
-    defer f.close();
-
-    const data = try f.readToEndAlloc(allocator, 64 * 1024 * 1024);
     defer allocator.free(data);
 
     const parsed = try std.json.parseFromSlice(
@@ -154,7 +153,7 @@ fn doFireWebhook(
     body: []const u8,
 ) !void {
     const uri = try std.Uri.parse(webhook_url);
-    var client = std.http.Client{ .allocator = allocator };
+    var client = std.http.Client{ .allocator = allocator, .io = compat.io() };
     defer client.deinit();
 
     var header_buf: [4096]u8 = undefined;

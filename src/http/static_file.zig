@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("../zig_compat.zig");
 const autoindex = @import("autoindex.zig");
 const dates = @import("dates.zig");
 const etag = @import("etag.zig");
@@ -61,7 +62,7 @@ pub fn serve(allocator: std.mem.Allocator, opts: Options) !?Result {
             };
         },
         .file => |file_path| {
-            const file = try std.fs.cwd().openFile(file_path, .{});
+            var file = try compat.cwd().openFile(file_path, .{});
             defer file.close();
             const stat_info = try file.stat();
             const mtime_secs: usize = @intCast(@divTrunc(stat_info.mtime, std.time.ns_per_s));
@@ -222,13 +223,13 @@ const ResolvedPath = struct {
 };
 
 fn resolvePath(allocator: std.mem.Allocator, opts: Options) !ResolvedPath {
-    const root_real = try std.fs.cwd().realpathAlloc(allocator, opts.root);
+    const root_real = try compat.cwd().realpathAlloc(allocator, opts.root);
     errdefer allocator.free(root_real);
 
     const rel_path = if (opts.alias)
-        std.mem.trimLeft(u8, opts.request_path[opts.matched_pattern.len..], "/")
+        std.mem.trimStart(u8, opts.request_path[opts.matched_pattern.len..], "/")
     else
-        std.mem.trimLeft(u8, opts.request_path, "/");
+        std.mem.trimStart(u8, opts.request_path, "/");
 
     if (opts.try_files.len > 0) {
         var candidates = std.mem.tokenizeAny(u8, opts.try_files, " ,");
@@ -238,7 +239,7 @@ fn resolvePath(allocator: std.mem.Allocator, opts: Options) !ResolvedPath {
             const rel = if (std.mem.eql(u8, candidate, "$uri"))
                 rel_path
             else
-                std.mem.trimLeft(u8, candidate, "/");
+                std.mem.trimStart(u8, candidate, "/");
             const maybe_resolved = resolveExistingCandidate(allocator, root_real, rel) catch |err| switch (err) {
                 error.PathEscapesRoot => return .{ .kind = .forbidden, .root_real = root_real },
                 else => return err,
@@ -314,12 +315,12 @@ fn resolveExistingCandidate(
     const joined = try std.fs.path.join(allocator, &[_][]const u8{ root_real, normalized_rel });
     defer allocator.free(joined);
 
-    const real = std.fs.cwd().realpathAlloc(allocator, joined) catch return null;
+    const real = compat.cwd().realpathAlloc(allocator, joined) catch return null;
     errdefer allocator.free(real);
 
     if (!isWithinRoot(root_real, real)) return error.PathEscapesRoot;
 
-    const stat_info = std.fs.cwd().statFile(real) catch {
+    const stat_info = compat.cwd().statFile(real) catch {
         allocator.free(real);
         return null;
     };
@@ -335,12 +336,12 @@ fn resolveExistingCandidate(
 }
 
 fn normalizeRelativePath(allocator: std.mem.Allocator, rel: []const u8) ![]u8 {
-    const decoded_buf = try allocator.dupe(u8, std.mem.trimLeft(u8, rel, "/"));
+    const decoded_buf = try allocator.dupe(u8, std.mem.trimStart(u8, rel, "/"));
     defer allocator.free(decoded_buf);
 
     const decoded = std.Uri.percentDecodeInPlace(decoded_buf);
-    var normalized = std.ArrayList(u8).init(allocator);
-    errdefer normalized.deinit();
+    var normalized = std.ArrayList(u8).empty;
+    errdefer normalized.deinit(allocator);
 
     var cursor: usize = 0;
     while (cursor < decoded.len) {
@@ -352,11 +353,11 @@ fn normalizeRelativePath(allocator: std.mem.Allocator, rel: []const u8) ![]u8 {
         if (segment.len == 0 or std.mem.eql(u8, segment, ".")) continue;
         if (std.mem.eql(u8, segment, "..")) return error.PathEscapesRoot;
 
-        if (normalized.items.len > 0) try normalized.append(std.fs.path.sep);
-        try normalized.appendSlice(segment);
+        if (normalized.items.len > 0) try normalized.append(allocator, std.fs.path.sep);
+        try normalized.appendSlice(allocator, segment);
     }
 
-    return normalized.toOwnedSlice();
+    return normalized.toOwnedSlice(allocator);
 }
 
 fn isPathSeparator(ch: u8) bool {
@@ -410,15 +411,15 @@ test "serve rejects traversal escaping root" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(.{ .sub_path = "index.html", .data = "ok" });
-    const root_path = try tmp.dir.realpathAlloc(allocator, ".");
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "index.html", .data = "ok" });
+    const root_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(root_path);
     const parent = std.fs.path.dirname(root_path).?;
     const escape_name = "escape-target.txt";
     const escape_path = try std.fs.path.join(allocator, &[_][]const u8{ parent, escape_name });
     defer allocator.free(escape_path);
-    try std.fs.cwd().writeFile(.{ .sub_path = escape_path, .data = "escape" });
-    defer std.fs.cwd().deleteFile(escape_path) catch {};
+    try compat.cwd().writeFile(.{ .sub_path = escape_path, .data = "escape" });
+    defer compat.cwd().deleteFile(escape_path) catch {};
     const request_path = try std.fmt.allocPrint(allocator, "/../{s}", .{escape_name});
     defer allocator.free(request_path);
 
@@ -445,15 +446,15 @@ test "serve rejects percent-encoded traversal escaping root" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(.{ .sub_path = "index.html", .data = "ok" });
-    const root_path = try tmp.dir.realpathAlloc(allocator, ".");
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "index.html", .data = "ok" });
+    const root_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(root_path);
     const parent = std.fs.path.dirname(root_path).?;
     const escape_name = "escape-encoded.txt";
     const escape_path = try std.fs.path.join(allocator, &[_][]const u8{ parent, escape_name });
     defer allocator.free(escape_path);
-    try std.fs.cwd().writeFile(.{ .sub_path = escape_path, .data = "escape" });
-    defer std.fs.cwd().deleteFile(escape_path) catch {};
+    try compat.cwd().writeFile(.{ .sub_path = escape_path, .data = "escape" });
+    defer compat.cwd().deleteFile(escape_path) catch {};
 
     var hdrs = headers_mod.Headers.init(allocator);
     defer hdrs.deinit();
@@ -478,15 +479,15 @@ test "serve rejects backslash traversal escaping root" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(.{ .sub_path = "index.html", .data = "ok" });
-    const root_path = try tmp.dir.realpathAlloc(allocator, ".");
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "index.html", .data = "ok" });
+    const root_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(root_path);
     const parent = std.fs.path.dirname(root_path).?;
     const escape_name = "escape-backslash.txt";
     const escape_path = try std.fs.path.join(allocator, &[_][]const u8{ parent, escape_name });
     defer allocator.free(escape_path);
-    try std.fs.cwd().writeFile(.{ .sub_path = escape_path, .data = "escape" });
-    defer std.fs.cwd().deleteFile(escape_path) catch {};
+    try compat.cwd().writeFile(.{ .sub_path = escape_path, .data = "escape" });
+    defer compat.cwd().deleteFile(escape_path) catch {};
 
     var hdrs = headers_mod.Headers.init(allocator);
     defer hdrs.deinit();
@@ -511,19 +512,19 @@ test "serve rejects symlink escape outside root" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(.{ .sub_path = "index.html", .data = "ok" });
-    const root_path = try tmp.dir.realpathAlloc(allocator, ".");
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "index.html", .data = "ok" });
+    const root_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(root_path);
     const parent = std.fs.path.dirname(root_path).?;
     const escape_name = "escape-target.txt";
     const escape_path = try std.fs.path.join(allocator, &[_][]const u8{ parent, escape_name });
     defer allocator.free(escape_path);
-    try std.fs.cwd().writeFile(.{ .sub_path = escape_path, .data = "escape" });
-    defer std.fs.cwd().deleteFile(escape_path) catch {};
+    try compat.cwd().writeFile(.{ .sub_path = escape_path, .data = "escape" });
+    defer compat.cwd().deleteFile(escape_path) catch {};
 
     const symlink_path = try std.fs.path.join(allocator, &[_][]const u8{ root_path, "linked.txt" });
     defer allocator.free(symlink_path);
-    try std.fs.symLinkAbsolute(escape_path, symlink_path, .{});
+    try std.Io.Dir.symLinkAbsolute(compat.io(), escape_path, symlink_path, .{});
 
     var hdrs = headers_mod.Headers.init(allocator);
     defer hdrs.deinit();
@@ -548,8 +549,8 @@ test "serve returns file-backed payload when preferred" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(.{ .sub_path = "asset.txt", .data = "hello file path" });
-    const root_path = try tmp.dir.realpathAlloc(allocator, ".");
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "asset.txt", .data = "hello file path" });
+    const root_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(root_path);
 
     var hdrs = headers_mod.Headers.init(allocator);
@@ -580,8 +581,8 @@ test "serve returns file-backed range payload when preferred" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(.{ .sub_path = "asset.txt", .data = "hello file path" });
-    const root_path = try tmp.dir.realpathAlloc(allocator, ".");
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "asset.txt", .data = "hello file path" });
+    const root_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(root_path);
 
     var hdrs = headers_mod.Headers.init(allocator);
@@ -614,8 +615,8 @@ test "serve uses application wasm mime type" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(.{ .sub_path = "app.wasm", .data = "wasm-bytes" });
-    const root_path = try tmp.dir.realpathAlloc(allocator, ".");
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "app.wasm", .data = "wasm-bytes" });
+    const root_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(root_path);
 
     var hdrs = headers_mod.Headers.init(allocator);

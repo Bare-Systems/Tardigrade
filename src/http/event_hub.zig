@@ -1,3 +1,4 @@
+const compat = @import("../zig_compat.zig");
 const std = @import("std");
 
 pub const Event = struct {
@@ -12,7 +13,8 @@ pub const Topic = struct {
     events: std.ArrayList(Event),
 
     fn init(allocator: std.mem.Allocator) Topic {
-        return .{ .events = std.ArrayList(Event).init(allocator) };
+        _ = allocator;
+        return .{ .events = .empty };
     }
 
     fn deinit(self: *Topic, allocator: std.mem.Allocator) void {
@@ -20,13 +22,13 @@ pub const Topic = struct {
             allocator.free(e.topic);
             allocator.free(e.payload);
         }
-        self.events.deinit();
+        self.events.deinit(allocator);
     }
 };
 
 pub const EventHub = struct {
     allocator: std.mem.Allocator,
-    mutex: std.Thread.Mutex = .{},
+    mutex: compat.Mutex = .{},
     topics: std.StringHashMap(Topic),
     max_events_per_topic: usize,
 
@@ -55,7 +57,7 @@ pub const EventHub = struct {
         var topic = gop.value_ptr;
         const id = topic.next_id;
         topic.next_id += 1;
-        try topic.events.append(.{
+        try topic.events.append(self.allocator, .{
             .id = id,
             .topic = try self.allocator.dupe(u8, topic_name),
             .payload = try self.allocator.dupe(u8, payload),
@@ -73,24 +75,24 @@ pub const EventHub = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         const topic = self.topics.getPtr(topic_name) orelse return allocator.alloc(Event, 0);
-        var out = std.ArrayList(Event).init(allocator);
+        var out: std.ArrayList(Event) = .empty;
         errdefer {
             for (out.items) |e| {
                 allocator.free(e.topic);
                 allocator.free(e.payload);
             }
-            out.deinit();
+            out.deinit(allocator);
         }
         for (topic.events.items) |ev| {
             if (ev.id <= after_id) continue;
-            try out.append(.{
+            try out.append(allocator, .{
                 .id = ev.id,
                 .topic = try allocator.dupe(u8, ev.topic),
                 .payload = try allocator.dupe(u8, ev.payload),
                 .created_ms = ev.created_ms,
             });
         }
-        return out.toOwnedSlice();
+        return out.toOwnedSlice(allocator);
     }
 
     pub fn oldestId(self: *EventHub, topic_name: []const u8) ?u64 {

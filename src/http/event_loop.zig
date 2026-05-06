@@ -1,3 +1,4 @@
+const compat = @import("../zig_compat.zig");
 const builtin = @import("builtin");
 const std = @import("std");
 
@@ -21,15 +22,15 @@ pub const EventLoop = struct {
                 .fd = try std.posix.epoll_create1(std.os.linux.EPOLL.CLOEXEC),
                 .backend = .epoll,
             }
-        else
-            .{
-                .fd = try std.posix.kqueue(),
-                .backend = .kqueue,
-            };
+        else blk: {
+            const fd = std.c.kqueue();
+            if (fd < 0) return error.SystemResources;
+            break :blk .{ .fd = fd, .backend = .kqueue };
+        };
     }
 
     pub fn deinit(self: *EventLoop) void {
-        std.posix.close(self.fd);
+        _ = std.c.close(self.fd);
         self.* = undefined;
     }
 
@@ -48,7 +49,7 @@ pub const EventLoop = struct {
             };
             try std.posix.epoll_ctl(self.fd, std.os.linux.EPOLL.CTL_ADD, @intCast(fd), @ptrCast(&event));
         } else {
-            const changes = [_]std.posix.Kevent{.{
+            const changes = [_]std.c.Kevent{.{
                 .ident = @intCast(fd),
                 .filter = std.c.EVFILT.READ,
                 .flags = std.c.EV.ADD | std.c.EV.ENABLE,
@@ -56,7 +57,8 @@ pub const EventLoop = struct {
                 .data = 0,
                 .udata = 0,
             }};
-            _ = try std.posix.kevent(self.fd, &changes, &.{}, null);
+            const ret = std.c.kevent(self.fd, &changes, @intCast(changes.len), @as([*]std.c.Kevent, @constCast(@ptrCast(&changes))), 0, null);
+            if (ret < 0) return error.Unexpected;
         }
     }
 
@@ -85,11 +87,11 @@ pub const EventLoop = struct {
     }
 
     fn waitKqueue(self: *EventLoop, out_events: []Event, timeout_ms: i32) !usize {
-        var kq_events: [64]std.posix.Kevent = undefined;
+        var kq_events: [64]std.c.Kevent = undefined;
         const cap = @min(out_events.len, kq_events.len);
 
-        var ts: std.posix.timespec = undefined;
-        const timeout_ptr: ?*const std.posix.timespec = if (timeout_ms < 0)
+        var ts: std.c.timespec = undefined;
+        const timeout_ptr: ?*const std.c.timespec = if (timeout_ms < 0)
             null
         else blk: {
             const millis: u64 = @intCast(timeout_ms);
@@ -100,14 +102,16 @@ pub const EventLoop = struct {
             break :blk &ts;
         };
 
-        const n = try std.posix.kevent(self.fd, &.{}, kq_events[0..cap], timeout_ptr);
-        for (kq_events[0..n], 0..) |ev, idx| {
+        var dummy_ev: std.c.Kevent = undefined;
+        const n = std.c.kevent(self.fd, @as([*]const std.c.Kevent, @ptrCast(&dummy_ev)), 0, kq_events[0..cap].ptr, @intCast(cap), timeout_ptr);
+        if (n < 0) return error.Unexpected;
+        for (kq_events[0..@intCast(n)], 0..) |ev, idx| {
             out_events[idx] = .{
                 .fd = @intCast(ev.ident),
                 .readable = ev.filter == std.c.EVFILT.READ,
             };
         }
-        return n;
+        return @intCast(n);
     }
 };
 
@@ -151,7 +155,7 @@ pub fn detectBackend() !Backend {
 }
 
 pub fn monotonicMs() u64 {
-    const now = std.time.milliTimestamp();
+    const now = compat.milliTimestamp();
     return if (now <= 0) 0 else @intCast(now);
 }
 

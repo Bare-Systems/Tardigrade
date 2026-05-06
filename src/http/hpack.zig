@@ -79,13 +79,13 @@ const static_table = [_]StaticEntry{
 };
 
 pub fn decode(allocator: std.mem.Allocator, block: []const u8) !DecodeResult {
-    var out = std.ArrayList(HeaderField).init(allocator);
+    var out = std.ArrayList(HeaderField).empty;
     errdefer {
         for (out.items) |h| {
             allocator.free(h.name);
             allocator.free(h.value);
         }
-        out.deinit();
+        out.deinit(allocator);
     }
 
     var i: usize = 0;
@@ -94,7 +94,7 @@ pub fn decode(allocator: std.mem.Allocator, block: []const u8) !DecodeResult {
         if ((b & 0x80) != 0) {
             const indexed = try decodeInteger(block, &i, 7);
             const entry = staticByIndex(indexed) orelse return error.InvalidHpackIndex;
-            try out.append(.{
+            try out.append(allocator, .{
                 .name = try allocator.dupe(u8, entry.name),
                 .value = try allocator.dupe(u8, entry.value),
             });
@@ -116,12 +116,12 @@ pub fn decode(allocator: std.mem.Allocator, block: []const u8) !DecodeResult {
             errdefer allocator.free(name);
             const value = try decodeStringAlloc(allocator, block, &i);
             errdefer allocator.free(value);
-            try out.append(.{ .name = name, .value = value });
+            try out.append(allocator, .{ .name = name, .value = value });
             continue;
         }
         return error.UnsupportedHpackRepresentation;
     }
-    return .{ .headers = try out.toOwnedSlice() };
+    return .{ .headers = try out.toOwnedSlice(allocator) };
 }
 
 pub fn deinitDecoded(allocator: std.mem.Allocator, decoded: *DecodeResult) void {
@@ -134,14 +134,14 @@ pub fn deinitDecoded(allocator: std.mem.Allocator, decoded: *DecodeResult) void 
 }
 
 pub fn encodeLiteralHeaderBlock(allocator: std.mem.Allocator, headers: []const HeaderField) ![]u8 {
-    var out = std.ArrayList(u8).init(allocator);
-    errdefer out.deinit();
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
     for (headers) |h| {
-        try out.append(0x00);
-        try encodeString(&out, h.name);
-        try encodeString(&out, h.value);
+        try out.append(allocator, 0x00);
+        try encodeString(allocator, &out, h.name);
+        try encodeString(allocator, &out, h.value);
     }
-    return out.toOwnedSlice();
+    return out.toOwnedSlice(allocator);
 }
 
 fn decodeInteger(buf: []const u8, idx: *usize, prefix_bits: u3) !usize {
@@ -175,24 +175,24 @@ fn decodeStringAlloc(allocator: std.mem.Allocator, buf: []const u8, idx: *usize)
     return out;
 }
 
-fn encodeInteger(out: *std.ArrayList(u8), value: usize, prefix_bits: u3, first_prefix: u8) !void {
+fn encodeInteger(allocator: std.mem.Allocator, out: *std.ArrayList(u8), value: usize, prefix_bits: u3, first_prefix: u8) !void {
     const prefix_max: usize = (@as(usize, 1) << prefix_bits) - 1;
     if (value < prefix_max) {
-        try out.append(first_prefix | @as(u8, @intCast(value)));
+        try out.append(allocator, first_prefix | @as(u8, @intCast(value)));
         return;
     }
-    try out.append(first_prefix | @as(u8, @intCast(prefix_max)));
+    try out.append(allocator, first_prefix | @as(u8, @intCast(prefix_max)));
     var rem = value - prefix_max;
     while (rem >= 128) {
-        try out.append(@as(u8, @intCast(rem % 128 + 128)));
+        try out.append(allocator, @as(u8, @intCast(rem % 128 + 128)));
         rem /= 128;
     }
-    try out.append(@as(u8, @intCast(rem)));
+    try out.append(allocator, @as(u8, @intCast(rem)));
 }
 
-fn encodeString(out: *std.ArrayList(u8), value: []const u8) !void {
-    try encodeInteger(out, value.len, 7, 0x00);
-    try out.appendSlice(value);
+fn encodeString(allocator: std.mem.Allocator, out: *std.ArrayList(u8), value: []const u8) !void {
+    try encodeInteger(allocator, out, value.len, 7, 0x00);
+    try out.appendSlice(allocator, value);
 }
 
 fn staticByIndex(index: usize) ?StaticEntry {

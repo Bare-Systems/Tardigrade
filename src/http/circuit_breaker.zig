@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("../zig_compat.zig");
 
 /// Circuit breaker states.
 ///
@@ -50,7 +51,7 @@ pub const CircuitBreaker = struct {
         return switch (self.state) {
             .closed => true,
             .open => blk: {
-                const now = std.time.nanoTimestamp();
+                const now = compat.nanoTimestamp();
                 const elapsed_ns = now - self.last_failure_ns;
                 if (elapsed_ns < 0) break :blk false;
                 const elapsed_ms: u64 = @intCast(@divFloor(elapsed_ns, std.time.ns_per_ms));
@@ -87,7 +88,7 @@ pub const CircuitBreaker = struct {
     pub fn recordFailure(self: *CircuitBreaker) void {
         if (self.config.threshold == 0) return;
 
-        self.last_failure_ns = std.time.nanoTimestamp();
+        self.last_failure_ns = compat.nanoTimestamp();
         switch (self.state) {
             .closed => {
                 self.failure_count += 1;

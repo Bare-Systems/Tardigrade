@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("../zig_compat.zig");
 
 /// Server-wide metrics counters.
 ///
@@ -57,7 +58,7 @@ pub const Metrics = struct {
             .err_internal_error = 0,
             .err_overload = 0,
             .mux_frame_errors = 0,
-            .started_ns = std.time.nanoTimestamp(),
+            .started_ns = compat.nanoTimestamp(),
         };
     }
 
@@ -123,7 +124,7 @@ pub const Metrics = struct {
 
     /// Uptime in seconds.
     pub fn uptimeSeconds(self: *const Metrics) u64 {
-        const now = std.time.nanoTimestamp();
+        const now = compat.nanoTimestamp();
         const elapsed_ns = now - self.started_ns;
         if (elapsed_ns <= 0) return 0;
         return @intCast(@divFloor(elapsed_ns, std.time.ns_per_s));

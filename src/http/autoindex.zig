@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("../zig_compat.zig");
 
 pub const DirItem = struct {
     name: []const u8,
@@ -6,29 +7,28 @@ pub const DirItem = struct {
 };
 
 pub fn generateAutoIndex(allocator: std.mem.Allocator, dirPath: []const u8, uriPath: []const u8) ![]u8 {
-    var out = std.ArrayList(u8).init(allocator);
-    defer out.deinit();
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(allocator);
 
     // Build output by appending bytes
-    for ("<!doctype html><html><head><meta charset=\"utf-8\">\n") |b| try out.append(b);
-    for ("<title>Index of ") |b| try out.append(b);
-    for (uriPath) |b| try out.append(b);
-    for ("</title></head><body><h1>Index of ") |b| try out.append(b);
-    for (uriPath) |b| try out.append(b);
-    for ("</h1><hr><pre>\n") |b| try out.append(b);
+    for ("<!doctype html><html><head><meta charset=\"utf-8\">\n") |b| try out.append(allocator, b);
+    for ("<title>Index of ") |b| try out.append(allocator, b);
+    for (uriPath) |b| try out.append(allocator, b);
+    for ("</title></head><body><h1>Index of ") |b| try out.append(allocator, b);
+    for (uriPath) |b| try out.append(allocator, b);
+    for ("</h1><hr><pre>\n") |b| try out.append(allocator, b);
 
-    const fs = std.fs.cwd();
-    var dir = fs.openDir(dirPath, .{}) catch |err| {
+    var dir = std.Io.Dir.cwd().openDir(compat.io(), dirPath, .{}) catch |err| {
         return err;
     };
-    defer dir.close();
+    defer dir.close(compat.io());
 
-    var items = std.ArrayList(DirItem).init(allocator);
-    defer items.deinit();
+    var items = std.ArrayList(DirItem).empty;
+    defer items.deinit(allocator);
 
     var it = dir.iterate();
     while (true) {
-        const entry = try it.next();
+        const entry = try it.next(compat.io());
         if (entry == null) break;
         const e = entry.?;
         if (e.name.len == 0) continue;
@@ -42,7 +42,7 @@ pub fn generateAutoIndex(allocator: std.mem.Allocator, dirPath: []const u8, uriP
             _k += 1;
         }
 
-        try items.append(DirItem{ .name = name_copy, .is_dir = e.kind == .directory });
+        try items.append(allocator, DirItem{ .name = name_copy, .is_dir = e.kind == .directory });
     }
 
     // Simple stable sort: directories first, then by name
@@ -75,29 +75,29 @@ pub fn generateAutoIndex(allocator: std.mem.Allocator, dirPath: []const u8, uriP
 
     // Parent link if not root
     if (!(uriPath.len == 1 and uriPath[0] == '/')) {
-        for ("<a href=\"../\">../</a>\n") |b| try out.append(b);
+        for ("<a href=\"../\">../</a>\n") |b| try out.append(allocator, b);
     }
 
     // Append entries
     for (items.items) |ent| {
-        for ("<a href=\"") |b| try out.append(b);
+        for ("<a href=\"") |b| try out.append(allocator, b);
 
         // Ensure uriPath ends with '/'
-        for (uriPath) |b| try out.append(b);
-        if (uriPath.len == 0 or uriPath[uriPath.len - 1] != '/') for ("/") |b| try out.append(b);
+        for (uriPath) |b| try out.append(allocator, b);
+        if (uriPath.len == 0 or uriPath[uriPath.len - 1] != '/') for ("/") |b| try out.append(allocator, b);
 
-        for (ent.name) |b| try out.append(b);
-        if (ent.is_dir) for ("/") |b| try out.append(b);
-        for ("\"") |b| try out.append(b);
-        for (">") |b| try out.append(b);
-        for (ent.name) |b| try out.append(b);
-        if (ent.is_dir) for ("/") |b| try out.append(b);
-        for ("</a>\n") |b| try out.append(b);
+        for (ent.name) |b| try out.append(allocator, b);
+        if (ent.is_dir) for ("/") |b| try out.append(allocator, b);
+        for ("\"") |b| try out.append(allocator, b);
+        for (">") |b| try out.append(allocator, b);
+        for (ent.name) |b| try out.append(allocator, b);
+        if (ent.is_dir) for ("/") |b| try out.append(allocator, b);
+        for ("</a>\n") |b| try out.append(allocator, b);
     }
 
-    for ("</pre><hr><address>tardigrade</address></body></html>\n") |b| try out.append(b);
+    for ("</pre><hr><address>tardigrade</address></body></html>\n") |b| try out.append(allocator, b);
 
-    const slice = try out.toOwnedSlice();
+    const slice = try out.toOwnedSlice(allocator);
     // free copied names
     for (items.items) |entry_item| {
         allocator.free(entry_item.name);

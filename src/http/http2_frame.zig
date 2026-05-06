@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("../zig_compat.zig");
 
 pub const Type = enum(u8) {
     data = 0x0,
@@ -68,7 +69,7 @@ pub fn writeFrame(writer: anytype, typ: Type, flags: u8, stream_id: u31, payload
 }
 
 pub fn writeSettings(writer: anytype, entries: []const [2]u32) !void {
-    var buf = std.ArrayList(u8).init(std.heap.page_allocator);
+    var buf = std.array_list.Managed(u8).init(std.heap.page_allocator);
     defer buf.deinit();
     for (entries) |e| {
         var raw: [6]u8 = undefined;
@@ -102,7 +103,7 @@ pub fn writeWindowUpdate(writer: anytype, stream_id: u31, increment: u31) !void 
 }
 
 pub fn writePushPromise(writer: anytype, stream_id: u31, promised_stream_id: u31, header_block: []const u8, end_headers: bool) !void {
-    var payload = std.ArrayList(u8).init(std.heap.page_allocator);
+    var payload = std.array_list.Managed(u8).init(std.heap.page_allocator);
     defer payload.deinit();
     var sid: [4]u8 = undefined;
     std.mem.writeInt(u32, sid[0..4], @as(u32, promised_stream_id) & 0x7FFF_FFFF, .big);
@@ -139,7 +140,7 @@ fn readExact(conn: anytype, out: []u8) !void {
 
 test "write and parse frame header values" {
     var buf: [64]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
+    var fbs = compat.fixedBufferStream(&buf);
     try writeFrame(fbs.writer(), .settings, 0, 0, &[_]u8{ 1, 2, 3 });
     const out = fbs.getWritten();
     try std.testing.expectEqual(@as(u8, 0), out[0]);

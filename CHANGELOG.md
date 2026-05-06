@@ -15,6 +15,8 @@ All notable user-facing changes to Tardigrade are documented here.
 ### Changed
 - Simplified the root docs into a smaller public-facing set: `README.md`, `AGENTS.md`, `CONTRIBUTING.md`, and the example deployment bundle.
 - Updated the benchmark runner to support explicit host and route overrides for named-vhost and proxied-route testing.
+- Pinned the repository, CI workflows, and homelab deploy build script to Zig `0.16.0` as the first step of the Zig 0.16 migration.
+- Completed the Zig 0.16.0 upgrade: migrated all `std.http.Client` call sites from `open()`/`send()`/`wait()` to `request()`/`sendBodyComplete()`/`receiveHead()`, replaced `std.json.stringify` with `std.json.Stringify.valueAlloc`, resolved all `ArrayList`/`Managed` type mismatches across `fastcgi`, `scgi`, `uwsgi`, and `http3_session`, replaced `accept4` with `accept`+`fcntl` for macOS compatibility, and fixed `UnixAddress.init` error propagation. All 357 tests pass on Zig 0.16.0.
 
 ### Fixed
 - CI now installs OpenSSL development headers explicitly and enforces formatting consistently.

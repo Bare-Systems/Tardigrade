@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("../zig_compat.zig");
 const Allocator = std.mem.Allocator;
 const Request = @import("request.zig").Request;
 
@@ -47,8 +48,8 @@ pub const RequestContext = struct {
             .device_id = null,
             .scopes = null,
             .authenticated = false,
-            .started_ns = std.time.nanoTimestamp(),
-            .started_ms = std.time.milliTimestamp(),
+            .started_ns = compat.nanoTimestamp(),
+            .started_ms = compat.milliTimestamp(),
             .client_ip = client_ip,
             .api_version = null,
             .idempotency_key = null,
@@ -60,7 +61,7 @@ pub const RequestContext = struct {
 
     /// Elapsed milliseconds since request started.
     pub fn elapsedMs(self: *const RequestContext) i64 {
-        return std.time.milliTimestamp() - self.started_ms;
+        return compat.milliTimestamp() - self.started_ms;
     }
 
     /// Set authenticated identity.

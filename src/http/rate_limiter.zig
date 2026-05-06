@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("../zig_compat.zig");
 const Allocator = std.mem.Allocator;
 
 /// Token-bucket rate limiter keyed by a request descriptor.
@@ -31,7 +32,7 @@ pub const RateLimiter = struct {
             .rate = rate,
             .burst = burst,
             .cleanup_interval_ns = 60 * std.time.ns_per_s, // 60 seconds
-            .last_cleanup = std.time.nanoTimestamp(),
+            .last_cleanup = compat.nanoTimestamp(),
             .stale_ttl_ns = @as(i128, @intCast(idle_ttl_seconds)) * std.time.ns_per_s,
         };
     }
@@ -47,7 +48,7 @@ pub const RateLimiter = struct {
     /// Check whether `key` is allowed. Returns remaining tokens if allowed,
     /// or null if the request should be rejected.
     pub fn allow(self: *RateLimiter, key: []const u8) ?AllowResult {
-        const now = std.time.nanoTimestamp();
+        const now = compat.nanoTimestamp();
 
         // Periodic cleanup of stale buckets
         if (now - self.last_cleanup > self.cleanup_interval_ns) {
@@ -94,13 +95,13 @@ pub const RateLimiter = struct {
     }
 
     fn cleanup(self: *RateLimiter, now: i128) void {
-        var keys_to_remove = std.ArrayList([]const u8).init(self.allocator);
-        defer keys_to_remove.deinit();
+        var keys_to_remove = std.ArrayList([]const u8).empty;
+        defer keys_to_remove.deinit(self.allocator);
 
         var it = self.buckets.iterator();
         while (it.next()) |entry| {
             if (now - entry.value_ptr.last_refill > self.stale_ttl_ns) {
-                keys_to_remove.append(entry.key_ptr.*) catch continue;
+                keys_to_remove.append(self.allocator, entry.key_ptr.*) catch continue;
             }
         }
 
@@ -189,10 +190,10 @@ test "rate limiter evicts stale descriptor buckets after ttl" {
 
     limiter.last_cleanup = 0;
     if (limiter.buckets.getPtr("identity:user-1")) |bucket| {
-        bucket.last_refill = std.time.nanoTimestamp() - (2 * std.time.ns_per_s);
+        bucket.last_refill = compat.nanoTimestamp() - (2 * std.time.ns_per_s);
     }
     if (limiter.buckets.getPtr("identity:user-2")) |bucket| {
-        bucket.last_refill = std.time.nanoTimestamp();
+        bucket.last_refill = compat.nanoTimestamp();
     }
 
     _ = limiter.allow("identity:user-2");

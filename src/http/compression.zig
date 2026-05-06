@@ -45,7 +45,7 @@ pub const CompressionConfig = struct {
     /// Brotli quality [0..11].
     brotli_quality: u32 = 5,
     /// Compression level.
-    level: std.compress.gzip.Options = .{ .level = .default },
+    level: std.compress.flate.Compress.Options = std.compress.flate.Compress.Options.default,
 };
 
 /// Result of attempting compression.
@@ -208,26 +208,37 @@ pub fn compressResponse(
         }
     }
 
-    // Perform gzip compression
-    var compressed = std.ArrayList(u8).init(allocator);
-    errdefer compressed.deinit();
-
-    var input_stream = std.io.fixedBufferStream(body);
-
-    std.compress.gzip.compress(input_stream.reader(), compressed.writer(), config.level) catch {
-        compressed.deinit();
-        return .{ .body = null, .compressed = false, .encoding = null };
+    // Perform gzip compression using the new flate API
+    var aw = std.Io.Writer.Allocating.initCapacity(allocator, @max(body.len, 64)) catch return .{ .body = null, .compressed = false, .encoding = null };
+    var window_buf: [std.compress.flate.max_window_len * 2]u8 = undefined;
+    const compress_ok = blk: {
+        var c = std.compress.flate.Compress.init(
+            &aw.writer,
+            &window_buf,
+            .gzip,
+            config.level,
+        ) catch break :blk false;
+        c.writer.writeAll(body) catch break :blk false;
+        c.finish() catch break :blk false;
+        break :blk true;
     };
+    if (!compress_ok) {
+        var al = aw.toArrayList();
+        al.deinit(allocator);
+        return .{ .body = null, .compressed = false, .encoding = null };
+    }
+
+    var compressed_list = aw.toArrayList();
 
     // Only use compressed version if it's actually smaller
-    if (compressed.items.len >= body.len) {
-        compressed.deinit();
+    if (compressed_list.items.len >= body.len) {
+        compressed_list.deinit(allocator);
         return .{ .body = null, .compressed = false, .encoding = null };
     }
 
     return .{
-        .body = compressed.toOwnedSlice() catch {
-            compressed.deinit();
+        .body = compressed_list.toOwnedSlice(allocator) catch {
+            compressed_list.deinit(allocator);
             return .{ .body = null, .compressed = false, .encoding = null };
         },
         .compressed = true,

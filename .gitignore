@@ -1,5 +1,9 @@
 zig-out/
 .zig-cache/
+.zig-toolchain/
+/tardigrade
+/test_cwd
+/test_fs
 dist/
 
 # Secrets and environment files — never commit these

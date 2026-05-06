@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("zig_compat.zig");
 const edge_config = @import("edge_config.zig");
 const edge_gateway = @import("edge_gateway.zig");
 const http = @import("http.zig");
@@ -66,22 +67,38 @@ const starter_config =
 
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+pub fn main(init: std.process.Init.Minimal) !void {
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    var args_iter = init.args.iterate();
+    var args_list: std.ArrayList([]const u8) = .empty;
+    defer args_list.deinit(allocator);
+    while (args_iter.next()) |arg| try args_list.append(allocator, arg);
+    const args = args_list.items;
 
     const command = parseCliCommand(args[1..]) catch |err| {
-        try printUsage(std.io.getStdErr().writer());
+        var stderr_buf: [2048]u8 = undefined;
+        var stderr = compat.stderrWriter(&stderr_buf);
+        try printUsage(&stderr);
+        try stderr.flush();
         return err;
     };
 
     switch (command) {
-        .help => try printUsage(std.io.getStdOut().writer()),
-        .version => try std.io.getStdOut().writer().print("{s}\n", .{http.SERVER_VERSION}),
+        .help => {
+            var stdout_buf: [2048]u8 = undefined;
+            var stdout = compat.stdoutWriter(&stdout_buf);
+            try printUsage(&stdout);
+            try stdout.flush();
+        },
+        .version => {
+            var stdout_buf: [128]u8 = undefined;
+            var stdout = compat.stdoutWriter(&stdout_buf);
+            try stdout.print("{s}\n", .{http.SERVER_VERSION});
+            try stdout.flush();
+        },
         .config_init => |options| try writeStarterConfig(options),
         .reload => |options| try executeSignalCommand(allocator, "reload", std.posix.SIG.HUP, options),
         .stop => |options| try executeSignalCommand(allocator, "stop", std.posix.SIG.TERM, options),
@@ -248,7 +265,7 @@ fn printUsage(writer: anytype) !void {
 }
 
 fn environmentRequestsValidate() bool {
-    const env = std.process.getEnvVarOwned(std.heap.page_allocator, "TARDIGRADE_VALIDATE_CONFIG_ONLY") catch return false;
+    const env = compat.getEnvVarOwned(std.heap.page_allocator, "TARDIGRADE_VALIDATE_CONFIG_ONLY") catch return false;
     defer std.heap.page_allocator.free(env);
     return std.mem.eql(u8, env, "1") or std.ascii.eqlIgnoreCase(env, "true");
 }
@@ -297,12 +314,15 @@ fn executeRunCommand(allocator: std.mem.Allocator, args: []const []const u8, opt
 fn executeSignalCommand(
     allocator: std.mem.Allocator,
     label: []const u8,
-    signal: u8,
+    signal: std.posix.SIG,
     options: SignalOptions,
 ) !void {
     const pid = try resolveCommandPid(allocator, options);
     try std.posix.kill(pid, signal);
-    try std.io.getStdOut().writer().print("{s} signal sent to pid {d}\n", .{ label, pid });
+    var stdout_buf: [256]u8 = undefined;
+    var stdout = compat.stdoutWriter(&stdout_buf);
+    try stdout.print("{s} signal sent to pid {d}\n", .{ label, pid });
+    try stdout.flush();
 }
 
 fn resolveCommandPid(allocator: std.mem.Allocator, options: SignalOptions) !std.posix.pid_t {
@@ -327,30 +347,38 @@ fn parsePid(value: []const u8) !std.posix.pid_t {
 
 fn readPidFromFile(allocator: std.mem.Allocator, path: []const u8) !std.posix.pid_t {
     var file = try openFileAtPath(path, .{});
-    defer file.close();
-    const raw = try file.readToEndAlloc(allocator, 128);
+    defer file.close(compat.io());
+    var file_buf: [256]u8 = undefined;
+    var reader = file.reader(compat.io(), &file_buf);
+    const raw = try reader.interface.readAlloc(allocator, 128);
     defer allocator.free(raw);
     return try parsePid(std.mem.trim(u8, raw, " \t\r\n"));
 }
 
 fn writeStarterConfig(options: ConfigInitOptions) !void {
     if (options.stdout) {
-        try std.io.getStdOut().writer().writeAll(starter_config);
+        var stdout_buf: [2048]u8 = undefined;
+        var stdout = compat.stdoutWriter(&stdout_buf);
+        try stdout.writeAll(starter_config);
+        try stdout.flush();
         return;
     }
 
     if (!options.force and pathExists(options.output_path)) return error.PathAlreadyExists;
     try ensureParentPath(options.output_path);
     var file = try createFileAtPath(options.output_path, .{ .truncate = true, .read = false });
-    defer file.close();
-    try file.writeAll(starter_config);
-    try std.io.getStdOut().writer().print("wrote starter config to {s}\n", .{options.output_path});
+    defer file.close(compat.io());
+    try file.writeStreamingAll(compat.io(), starter_config);
+    var stdout_buf: [256]u8 = undefined;
+    var stdout = compat.stdoutWriter(&stdout_buf);
+    try stdout.print("wrote starter config to {s}\n", .{options.output_path});
+    try stdout.flush();
 }
 
 fn resolveRuntimeConfigPath(allocator: std.mem.Allocator, cli_path: ?[]const u8) !?[]u8 {
     if (cli_path) |path| return try requireConfigPath(allocator, path);
 
-    const env_path = std.process.getEnvVarOwned(allocator, ENV_CONFIG_PATH) catch "";
+    const env_path = compat.getEnvVarOwned(allocator, ENV_CONFIG_PATH) catch "";
     defer if (env_path.len > 0) allocator.free(env_path);
     if (env_path.len > 0) return try requireConfigPath(allocator, env_path);
 
@@ -363,7 +391,7 @@ fn resolveRuntimeConfigPath(allocator: std.mem.Allocator, cli_path: ?[]const u8)
         if (pathExists(candidate)) return try allocator.dupe(u8, candidate);
     }
 
-    const home = std.process.getEnvVarOwned(allocator, "HOME") catch "";
+    const home = compat.getEnvVarOwned(allocator, "HOME") catch "";
     defer if (home.len > 0) allocator.free(home);
     if (home.len > 0) {
         const home_candidate = try std.fmt.allocPrint(allocator, "{s}/.config/tardigrade/tardigrade.conf", .{home});
@@ -389,33 +417,37 @@ fn setProcessEnv(allocator: std.mem.Allocator, name: []const u8, value: []const 
 }
 
 fn spawnDaemonizedProcess(allocator: std.mem.Allocator, config_path: ?[]const u8) !void {
-    const exe_path = try std.fs.selfExePathAlloc(allocator);
+    const exe_path = try std.process.executablePathAlloc(compat.io(), allocator);
     defer allocator.free(exe_path);
 
-    var argv = std.ArrayList([]const u8).init(allocator);
-    defer argv.deinit();
-    try argv.append(exe_path);
-    try argv.append("run");
+    var argv = std.ArrayList([]const u8).empty;
+    defer argv.deinit(allocator);
+    try argv.append(allocator, exe_path);
+    try argv.append(allocator, "run");
     if (config_path) |path| {
-        try argv.append("-c");
-        try argv.append(path);
+        try argv.append(allocator, "-c");
+        try argv.append(allocator, path);
     }
-    try argv.append("--daemonized");
+    try argv.append(allocator, "--daemonized");
 
-    var child = std.process.Child.init(argv.items, allocator);
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Ignore;
-    try child.spawn();
-    try std.io.getStdOut().writer().print("started tardigrade in background (pid {d})\n", .{child.id});
+    const child = try std.process.spawn(compat.io(), .{
+        .argv = argv.items,
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
+    var stdout_buf: [256]u8 = undefined;
+    var stdout = compat.stdoutWriter(&stdout_buf);
+    try stdout.print("started tardigrade in background (pid {d})\n", .{child.id.?});
+    try stdout.flush();
 }
 
 fn pathExists(path: []const u8) bool {
     if (std.fs.path.isAbsolute(path)) {
-        std.fs.accessAbsolute(path, .{}) catch return false;
+        std.Io.Dir.accessAbsolute(compat.io(), path, .{}) catch return false;
         return true;
     }
-    std.fs.cwd().access(path, .{}) catch return false;
+    std.Io.Dir.cwd().access(compat.io(), path, .{}) catch return false;
     return true;
 }
 
@@ -424,36 +456,36 @@ fn ensureParentPath(path: []const u8) !void {
     if (parent.len == 0 or std.mem.eql(u8, parent, ".")) return;
     if (std.fs.path.isAbsolute(parent)) {
         if (std.mem.eql(u8, parent, "/")) return;
-        var root = try std.fs.openDirAbsolute("/", .{});
-        defer root.close();
-        try root.makePath(parent[1..]);
+        var root = try std.Io.Dir.openDirAbsolute(compat.io(), "/", .{});
+        defer root.close(compat.io());
+        try root.createDirPath(compat.io(), parent[1..]);
         return;
     }
-    try std.fs.cwd().makePath(parent);
+    try std.Io.Dir.cwd().createDirPath(compat.io(), parent);
 }
 
-fn createFileAtPath(path: []const u8, flags: std.fs.File.CreateFlags) !std.fs.File {
-    if (std.fs.path.isAbsolute(path)) return std.fs.createFileAbsolute(path, flags);
-    return std.fs.cwd().createFile(path, flags);
+fn createFileAtPath(path: []const u8, flags: std.Io.File.CreateFlags) !std.Io.File {
+    if (std.fs.path.isAbsolute(path)) return std.Io.Dir.createFileAbsolute(compat.io(), path, flags);
+    return std.Io.Dir.cwd().createFile(compat.io(), path, flags);
 }
 
-fn openFileAtPath(path: []const u8, flags: std.fs.File.OpenFlags) !std.fs.File {
-    if (std.fs.path.isAbsolute(path)) return std.fs.openFileAbsolute(path, flags);
-    return std.fs.cwd().openFile(path, flags);
+fn openFileAtPath(path: []const u8, flags: std.Io.File.OpenFlags) !std.Io.File {
+    if (std.fs.path.isAbsolute(path)) return std.Io.Dir.openFileAbsolute(compat.io(), path, flags);
+    return std.Io.Dir.cwd().openFile(compat.io(), path, flags);
 }
 
 fn deleteFileAtPath(path: []const u8) !void {
-    if (std.fs.path.isAbsolute(path)) return std.fs.deleteFileAbsolute(path);
-    return std.fs.cwd().deleteFile(path);
+    if (std.fs.path.isAbsolute(path)) return std.Io.Dir.deleteFileAbsolute(compat.io(), path);
+    return std.Io.Dir.cwd().deleteFile(compat.io(), path);
 }
 
-fn openParentDirForPath(path: []const u8) !struct { dir: std.fs.Dir, basename: []const u8 } {
+fn openParentDirForPath(path: []const u8) !struct { dir: std.Io.Dir, basename: []const u8 } {
     const basename = std.fs.path.basename(path);
     const dirname = std.fs.path.dirname(path) orelse ".";
     const dir = if (std.fs.path.isAbsolute(path))
-        try std.fs.openDirAbsolute(dirname, .{})
+        try std.Io.Dir.openDirAbsolute(compat.io(), dirname, .{})
     else
-        try std.fs.cwd().openDir(dirname, .{});
+        try std.Io.Dir.cwd().openDir(compat.io(), dirname, .{});
     return .{ .dir = dir, .basename = basename };
 }
 
@@ -464,45 +496,45 @@ fn configureErrorLog(cfg: *const edge_config.EdgeConfig) !void {
     if (rotate_max_bytes > 0) {
         const stat = blk: {
             var existing = openFileAtPath(cfg.error_log_path, .{}) catch break :blk null;
-            defer existing.close();
-            break :blk existing.stat() catch null;
+            defer existing.close(compat.io());
+            break :blk existing.stat(compat.io()) catch null;
         };
         if (stat != null and stat.?.size >= rotate_max_bytes) {
             var dir_info = try openParentDirForPath(cfg.error_log_path);
-            defer dir_info.dir.close();
+            defer dir_info.dir.close(compat.io());
             try rotateLogFiles(dir_info.dir, dir_info.basename, rotate_max_files);
         }
     }
     try ensureParentPath(cfg.error_log_path);
     var file = try createFileAtPath(cfg.error_log_path, .{ .truncate = false, .read = false });
-    defer file.close();
-    try file.seekFromEnd(0);
-    try std.posix.dup2(file.handle, std.io.getStdErr().handle);
+    defer file.close(compat.io());
+    _ = std.c.lseek(file.handle, 0, std.c.SEEK.END);
+    _ = std.c.dup2(file.handle, std.Io.File.stderr().handle);
 }
 
 fn reopenErrorLog(cfg: *const edge_config.EdgeConfig) !void {
     if (cfg.error_log_path.len == 0 or std.ascii.eqlIgnoreCase(cfg.error_log_path, "stderr")) return;
     try ensureParentPath(cfg.error_log_path);
     var file = try createFileAtPath(cfg.error_log_path, .{ .truncate = false, .read = false });
-    defer file.close();
-    try file.seekFromEnd(0);
-    try std.posix.dup2(file.handle, std.io.getStdErr().handle);
+    defer file.close(compat.io());
+    _ = std.c.lseek(file.handle, 0, std.c.SEEK.END);
+    _ = std.c.dup2(file.handle, std.Io.File.stderr().handle);
 }
 
 fn parseIntEnv(comptime T: type, key: []const u8, default: T) T {
-    const raw = std.process.getEnvVarOwned(std.heap.page_allocator, key) catch return default;
+    const raw = compat.getEnvVarOwned(std.heap.page_allocator, key) catch return default;
     defer std.heap.page_allocator.free(raw);
     return std.fmt.parseInt(T, std.mem.trim(u8, raw, " \t\r\n"), 10) catch default;
 }
 
-fn rotateLogFiles(dir: std.fs.Dir, path: []const u8, max_files: usize) !void {
+fn rotateLogFiles(dir: std.Io.Dir, path: []const u8, max_files: usize) !void {
     if (max_files == 0) {
-        dir.deleteFile(path) catch {};
+        dir.deleteFile(compat.io(), path) catch {};
         return;
     }
     const oldest = try std.fmt.allocPrint(std.heap.page_allocator, "{s}.{d}", .{ path, max_files });
     defer std.heap.page_allocator.free(oldest);
-    dir.deleteFile(oldest) catch {};
+    dir.deleteFile(compat.io(), oldest) catch {};
 
     var idx = max_files;
     while (idx > 1) : (idx -= 1) {
@@ -510,19 +542,22 @@ fn rotateLogFiles(dir: std.fs.Dir, path: []const u8, max_files: usize) !void {
         defer std.heap.page_allocator.free(src);
         const dst = try std.fmt.allocPrint(std.heap.page_allocator, "{s}.{d}", .{ path, idx });
         defer std.heap.page_allocator.free(dst);
-        dir.rename(src, dst) catch {};
+        dir.rename(src, dir, dst, compat.io()) catch {};
     }
     const first = try std.fmt.allocPrint(std.heap.page_allocator, "{s}.1", .{path});
     defer std.heap.page_allocator.free(first);
-    try dir.rename(path, first);
+    try dir.rename(path, dir, first, compat.io());
 }
 
 fn writePidFile(cfg: *const edge_config.EdgeConfig) !void {
     if (cfg.pid_file.len == 0) return;
     try ensureParentPath(cfg.pid_file);
     var file = try createFileAtPath(cfg.pid_file, .{ .truncate = true, .read = false });
-    defer file.close();
-    try file.writer().print("{d}\n", .{std.c.getpid()});
+    defer file.close(compat.io());
+    var pid_buf: [32]u8 = undefined;
+    var writer = file.writerStreaming(compat.io(), &pid_buf);
+    try writer.interface.print("{d}\n", .{std.c.getpid()});
+    try writer.flush();
 }
 
 fn removePidFile(cfg: *const edge_config.EdgeConfig) void {
@@ -555,7 +590,8 @@ fn startWorkerRecycleTimer(cfg: *const edge_config.EdgeConfig) void {
     const secs = cfg.worker_recycle_seconds;
     _ = std.Thread.spawn(.{}, struct {
         fn run(wait_secs: u32) void {
-            std.time.sleep(@as(u64, wait_secs) * std.time.ns_per_s);
+            const compat2 = @import("zig_compat.zig");
+            std.Io.sleep(compat2.io(), std.Io.Duration.fromSeconds(@intCast(wait_secs)), .awake) catch {};
             http.shutdown.requestShutdown();
         }
     }.run, .{secs}) catch {};
@@ -563,7 +599,7 @@ fn startWorkerRecycleTimer(cfg: *const edge_config.EdgeConfig) void {
 
 fn runMaster(allocator: std.mem.Allocator, cfg: *const edge_config.EdgeConfig) !void {
     http.shutdown.installSignalHandlers();
-    const exe_path = try std.fs.selfExePathAlloc(allocator);
+    const exe_path = try std.process.executablePathAlloc(compat.io(), allocator);
     defer allocator.free(exe_path);
     const worker_count: usize = if (cfg.worker_processes == 0)
         (std.Thread.getCpuCount() catch 1)
@@ -578,7 +614,7 @@ fn runMaster(allocator: std.mem.Allocator, cfg: *const edge_config.EdgeConfig) !
 
     while (!http.shutdown.isShutdownRequested()) {
         if (cfg.binary_upgrade_enabled and http.shutdown.consumeUpgradeRequested()) {
-            _ = try spawnMasterUpgrade(allocator, exe_path);
+            _ = try spawnMasterUpgrade(exe_path);
             http.shutdown.requestShutdown();
             break;
         }
@@ -587,41 +623,41 @@ fn runMaster(allocator: std.mem.Allocator, cfg: *const edge_config.EdgeConfig) !
         }
 
         for (0..worker_count) |i| {
-            const wait_result = std.posix.waitpid(children[i].id, std.posix.W.NOHANG);
-            if (wait_result.pid == children[i].id and !http.shutdown.isShutdownRequested()) {
+            const pid = children[i].id orelse continue;
+            const wait_pid = std.c.waitpid(pid, null, std.c.W.NOHANG);
+            if (wait_pid == pid and !http.shutdown.isShutdownRequested()) {
                 children[i] = try spawnWorker(allocator, exe_path, i);
             }
         }
-        std.time.sleep(250 * std.time.ns_per_ms);
+        std.Io.sleep(compat.io(), std.Io.Duration.fromMilliseconds(250), .awake) catch {};
     }
 
     for (0..worker_count) |i| {
-        _ = children[i].kill() catch {};
-        _ = children[i].wait() catch {};
+        children[i].kill(compat.io());
+        _ = children[i].wait(compat.io()) catch {};
     }
 }
 
 fn spawnWorker(allocator: std.mem.Allocator, exe_path: []const u8, worker_id: usize) !std.process.Child {
     const id_str = try std.fmt.allocPrint(allocator, "{d}", .{worker_id});
-    var argv = [_][]const u8{ exe_path, "--worker", "--worker-id", id_str };
-    var child = std.process.Child.init(&argv, allocator);
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Inherit;
-    child.stderr_behavior = .Inherit;
-    errdefer allocator.free(id_str);
-    try child.spawn();
-    allocator.free(id_str);
-    return child;
+    defer allocator.free(id_str);
+    const argv = [_][]const u8{ exe_path, "--worker", "--worker-id", id_str };
+    return try std.process.spawn(compat.io(), .{
+        .argv = &argv,
+        .stdin = .ignore,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    });
 }
 
-fn spawnMasterUpgrade(allocator: std.mem.Allocator, exe_path: []const u8) !std.process.Child {
-    var argv = [_][]const u8{exe_path};
-    var child = std.process.Child.init(&argv, allocator);
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Inherit;
-    child.stderr_behavior = .Inherit;
-    try child.spawn();
-    return child;
+fn spawnMasterUpgrade(exe_path: []const u8) !std.process.Child {
+    const argv = [_][]const u8{exe_path};
+    return try std.process.spawn(compat.io(), .{
+        .argv = &argv,
+        .stdin = .ignore,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    });
 }
 
 fn applyWorkerCpuAffinity(cfg: *const edge_config.EdgeConfig, worker_id: usize) !void {
@@ -680,21 +716,21 @@ test {
 test "rotateLogFiles shifts generations" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "error.log", .data = "latest" });
-    try tmp.dir.writeFile(.{ .sub_path = "error.log.1", .data = "older" });
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "error.log", .data = "latest" });
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "error.log.1", .data = "older" });
 
     try rotateLogFiles(tmp.dir, "error.log", 3);
 
-    _ = try tmp.dir.statFile("error.log.1");
-    _ = try tmp.dir.statFile("error.log.2");
+    _ = try tmp.dir.statFile(compat.io(), "error.log.1", .{});
+    _ = try tmp.dir.statFile(compat.io(), "error.log.2", .{});
 }
 
 test "rotateLogFiles deletes source when max_files is zero" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "error.log", .data = "latest" });
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "error.log", .data = "latest" });
     try rotateLogFiles(tmp.dir, "error.log", 0);
-    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile("error.log"));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(compat.io(), "error.log", .{}));
 }
 
 test "parse run command supports legacy validate flag" {

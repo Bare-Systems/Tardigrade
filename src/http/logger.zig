@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("../zig_compat.zig");
 
 /// Log severity levels, ordered from most to least verbose.
 pub const Level = enum(u8) {
@@ -85,7 +86,8 @@ pub const Logger = struct {
         var ts_buf: [32]u8 = undefined;
         const ts = formatTimestamp(&ts_buf);
 
-        const stderr = std.io.getStdErr().writer();
+        var stderr_buf: [1024]u8 = undefined;
+        var stderr = compat.stderrWriter(&stderr_buf);
 
         // Build JSON log line
         stderr.print("{{\"ts\":\"{s}\",\"level\":\"{s}\",\"component\":\"{s}\"", .{
@@ -102,12 +104,13 @@ pub const Logger = struct {
         stderr.writeAll(",\"msg\":\"") catch return;
         writeJsonEscaped(stderr, msg);
         stderr.writeAll("\"}\n") catch return;
+        stderr.flush() catch {};
     }
 };
 
 /// Format a UTC ISO 8601 timestamp into the provided buffer.
 pub fn formatTimestamp(buf: *[32]u8) []const u8 {
-    const timestamp = std.time.timestamp();
+    const timestamp = compat.unixTimestamp();
     const epoch_secs: std.time.epoch.EpochSeconds = .{ .secs = @intCast(timestamp) };
     const day_secs = epoch_secs.getDaySeconds();
     const epoch_day = epoch_secs.getEpochDay();

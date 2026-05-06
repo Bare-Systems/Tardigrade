@@ -1,3 +1,4 @@
+const compat = @import("../zig_compat.zig");
 const std = @import("std");
 const logger = @import("logger.zig");
 
@@ -45,7 +46,7 @@ pub const Config = struct {
 const State = struct {
     allocator: std.mem.Allocator,
     cfg: Config,
-    mutex: std.Thread.Mutex = .{},
+    mutex: compat.Mutex = .{},
     buffer: std.ArrayList(u8),
 };
 
@@ -57,7 +58,7 @@ pub fn init(allocator: std.mem.Allocator, cfg: Config) !void {
     st.* = .{
         .allocator = allocator,
         .cfg = cfg,
-        .buffer = std.ArrayList(u8).init(allocator),
+        .buffer = .empty,
     };
     global_state = st;
 }
@@ -67,7 +68,7 @@ pub fn deinit() void {
         st.mutex.lock();
         flushLocked(st);
         st.mutex.unlock();
-        st.buffer.deinit();
+        st.buffer.deinit(st.allocator);
         st.allocator.destroy(st);
         global_state = null;
     }
@@ -94,7 +95,7 @@ pub fn emit(entry: AccessLogEntry) void {
             writeLine(line, st.cfg.syslog_udp_endpoint);
             return;
         }
-        st.buffer.appendSlice(line) catch return;
+        st.buffer.appendSlice(st.allocator, line) catch return;
         if (st.buffer.items.len >= st.cfg.buffer_size_bytes) flushLocked(st);
         return;
     }
@@ -144,29 +145,29 @@ fn formatEntry(allocator: std.mem.Allocator, cfg: Config, entry: AccessLogEntry)
 }
 
 fn renderTemplate(allocator: std.mem.Allocator, template: []const u8, ts: []const u8, entry: AccessLogEntry) ![]u8 {
-    var out = std.ArrayList(u8).init(allocator);
-    errdefer out.deinit();
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
 
     var i: usize = 0;
     while (i < template.len) {
         if (template[i] == '{') {
             const close = std.mem.indexOfScalarPos(u8, template, i + 1, '}') orelse {
-                try out.append(template[i]);
+                try out.append(allocator, template[i]);
                 i += 1;
                 continue;
             };
             const key = template[i + 1 .. close];
             if (std.mem.eql(u8, key, "status")) {
-                try out.writer().print("{d}", .{entry.status});
+                try out.print(allocator, "{d}", .{entry.status});
             } else if (std.mem.eql(u8, key, "latency_ms")) {
-                try out.writer().print("{d}", .{entry.latency_ms});
+                try out.print(allocator, "{d}", .{entry.latency_ms});
             } else if (std.mem.eql(u8, key, "bytes_sent")) {
-                try out.writer().print("{d}", .{entry.bytes_sent});
+                try out.print(allocator, "{d}", .{entry.bytes_sent});
             } else if (std.mem.eql(u8, key, "response_bytes")) {
-                try out.writer().print("{d}", .{entry.response_bytes});
+                try out.print(allocator, "{d}", .{entry.response_bytes});
             } else if (std.mem.eql(u8, key, "upstream_status")) {
                 if (entry.upstream_status) |status| {
-                    try out.writer().print("{d}", .{status});
+                    try out.print(allocator, "{d}", .{status});
                 }
             } else {
                 const replacement: []const u8 = if (std.mem.eql(u8, key, "ts"))
@@ -191,21 +192,24 @@ fn renderTemplate(allocator: std.mem.Allocator, template: []const u8, ts: []cons
                     entry.error_category
                 else
                     "";
-                try out.appendSlice(replacement);
+                try out.appendSlice(allocator, replacement);
             }
             i = close + 1;
             continue;
         }
-        try out.append(template[i]);
+        try out.append(allocator, template[i]);
         i += 1;
     }
 
-    if (out.items.len == 0 or out.items[out.items.len - 1] != '\n') try out.append('\n');
-    return out.toOwnedSlice();
+    if (out.items.len == 0 or out.items[out.items.len - 1] != '\n') try out.append(allocator, '\n');
+    return out.toOwnedSlice(allocator);
 }
 
 fn writeLine(line: []const u8, syslog_udp_endpoint: []const u8) void {
-    std.io.getStdErr().writer().writeAll(line) catch {};
+    var buf: [256]u8 = undefined;
+    var w = compat.stderrWriter(&buf);
+    w.writeAll(line) catch {};
+    w.flush() catch {};
     if (syslog_udp_endpoint.len > 0) sendSyslogUdp(syslog_udp_endpoint, line);
 }
 
@@ -219,10 +223,22 @@ fn sendSyslogUdp(endpoint: []const u8, msg: []const u8) void {
     const colon = std.mem.lastIndexOfScalar(u8, endpoint, ':') orelse return;
     const host = endpoint[0..colon];
     const port = std.fmt.parseInt(u16, endpoint[colon + 1 ..], 10) catch return;
-    const addr = std.net.Address.resolveIp(host, port) catch return;
-    const sock = std.posix.socket(addr.any.family, std.posix.SOCK.DGRAM, std.posix.IPPROTO.UDP) catch return;
-    defer std.posix.close(sock);
-    _ = std.posix.sendto(sock, msg, 0, &addr.any, addr.getOsSockLen()) catch {};
+    const addr = std.Io.net.IpAddress.resolve(compat.io(), host, port) catch return;
+    switch (addr) {
+        .ip4 => |ip4| {
+            const sin = std.c.sockaddr.in{
+                .family = std.posix.AF.INET,
+                .port = std.mem.nativeToBig(u16, ip4.port),
+                .addr = std.mem.readInt(u32, &ip4.bytes, .big),
+                .zero = [8]u8{ 0, 0, 0, 0, 0, 0, 0, 0 },
+            };
+            const sock = std.c.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, std.posix.IPPROTO.UDP);
+            if (sock < 0) return;
+            defer _ = std.c.close(sock);
+            _ = std.c.sendto(sock, msg.ptr, msg.len, 0, @ptrCast(&sin), @sizeOf(std.c.sockaddr.in));
+        },
+        .ip6 => {},
+    }
 }
 
 test "AccessLogEntry fields are set correctly" {

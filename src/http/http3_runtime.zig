@@ -1,3 +1,4 @@
+const compat = @import("../zig_compat.zig");
 const std = @import("std");
 const ngtcp2_binding = @import("ngtcp2_binding.zig");
 const logger_mod = @import("logger.zig");
@@ -60,7 +61,7 @@ pub const Runtime = struct {
     socket_fd: std.posix.fd_t,
     thread: ?std.Thread,
     logger: *logger_mod.Logger,
-    local_address: std.net.Address,
+    local_address: std.c.sockaddr.storage,
     max_datagram_size: usize,
     allow_migration: bool,
     quic_port: u16,
@@ -69,7 +70,7 @@ pub const Runtime = struct {
     tls_min_version: []const u8,
     tls_max_version: []const u8,
     tracker: quic.ConnectionTracker,
-    snapshot_mutex: std.Thread.Mutex = .{},
+    snapshot_mutex: compat.Mutex = .{},
     snapshot_state: Snapshot,
     server: ?ngtcp2_binding.Server,
     stopping: std.atomic.Value(bool),
@@ -85,19 +86,21 @@ pub const Runtime = struct {
             else => return error.NotYetImplemented,
         };
 
-        const address = std.net.Address.parseIp(cfg.listen_host, cfg.quic_port) catch return error.BindFailed;
-        const fd = std.posix.socket(address.any.family, std.posix.SOCK.DGRAM | std.posix.SOCK.CLOEXEC, std.posix.IPPROTO.UDP) catch return error.BindFailed;
-        errdefer std.posix.close(fd);
+        const address = compat.parseIpAddress(cfg.listen_host, cfg.quic_port) catch return error.BindFailed;
+        const sa_family = @as(*const std.c.sockaddr, @ptrCast(&address.storage)).family;
+        const fd = std.c.socket(@intCast(sa_family), std.posix.SOCK.DGRAM | std.posix.SOCK.CLOEXEC, std.posix.IPPROTO.UDP);
+        if (fd < 0) return error.BindFailed;
+        errdefer _ = std.c.close(fd);
 
         std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.REUSEADDR, std.mem.asBytes(&@as(c_int, 1))) catch {};
-        std.posix.bind(fd, &address.any, address.getOsSockLen()) catch return error.BindFailed;
+        if (std.c.bind(fd, @ptrCast(&address.storage), @intCast(address.len)) < 0) return error.BindFailed;
         setNonBlocking(fd, true) catch {};
 
         var runtime = Runtime{
             .socket_fd = fd,
             .thread = null,
             .logger = logger,
-            .local_address = address,
+            .local_address = address.storage,
             .max_datagram_size = cfg.max_datagram_size,
             .allow_migration = cfg.connection_migration,
             .quic_port = cfg.quic_port,
@@ -140,7 +143,7 @@ pub const Runtime = struct {
     pub fn deinit(self: *Runtime) void {
         self.stopping.store(true, .release);
         if (self.thread) |thread| thread.join();
-        std.posix.close(self.socket_fd);
+        _ = std.c.close(self.socket_fd);
         if (self.server) |*server| server.deinit();
         self.tracker.deinit();
         self.* = undefined;
@@ -159,25 +162,25 @@ pub const Runtime = struct {
         const out_buf = allocator.alloc(u8, self.max_datagram_size) catch return;
         defer allocator.free(out_buf);
 
-        var from: std.net.Address = undefined;
-        var from_len: std.posix.socklen_t = @sizeOf(std.net.Address);
+        var from: std.c.sockaddr.storage = undefined;
+        var from_len: std.posix.socklen_t = @sizeOf(std.c.sockaddr.storage);
         while (!self.stopping.load(.acquire) and !shutdown.isShutdownRequested()) {
-            const received = std.posix.recvfrom(self.socket_fd, buf, 0, &from.any, &from_len) catch |err| switch (err) {
-                error.WouldBlock => {
+            const n = std.c.recvfrom(self.socket_fd, buf.ptr, buf.len, 0, @ptrCast(&from), &from_len);
+            if (n < 0) {
+                const e = std.posix.errno(n);
+                if (e == .AGAIN) {
                     pumpExpiry(self, out_buf) catch {};
-                    std.time.sleep(25 * std.time.ns_per_ms);
-                    continue;
-                },
-                error.ConnectionRefused, error.ConnectionResetByPeer => continue,
-                else => {
-                    self.logger.warn(null, "http3 udp recv failed: {}", .{err});
-                    std.time.sleep(25 * std.time.ns_per_ms);
-                    continue;
-                },
-            };
+                    std.Io.sleep(compat.io(), std.Io.Duration.fromMilliseconds(25), .awake) catch {};
+                } else if (e != .CONNREFUSED and e != .CONNRESET) {
+                    self.logger.warn(null, "http3 udp recv failed: errno={}", .{@intFromEnum(e)});
+                    std.Io.sleep(compat.io(), std.Io.Duration.fromMilliseconds(25), .awake) catch {};
+                }
+                continue;
+            }
+            const received: usize = @intCast(n);
             if (received == 0) continue;
             ingestDatagram(self, buf[0..received], from, out_buf) catch {};
-            from_len = @sizeOf(std.net.Address);
+            from_len = @sizeOf(std.c.sockaddr.storage);
         }
     }
 
@@ -226,15 +229,16 @@ pub const Runtime = struct {
     }
 };
 
-fn ingestDatagram(self: *Runtime, datagram: []const u8, from: std.net.Address, out_buf: []u8) !void {
+fn ingestDatagram(self: *Runtime, datagram: []const u8, from: std.c.sockaddr.storage, out_buf: []u8) !void {
     const packet = quic.parsePacket(datagram) catch return;
     if (packet.dcid.len == 0) return;
     const ip = formatAddressIp(from) orelse return;
     defer std.heap.page_allocator.free(ip);
-    const migrated = try self.tracker.observe(packet, ip, from.getPort(), self.allow_migration);
+    const from_port = std.mem.bigToNative(u16, @as(*const std.c.sockaddr.in, @ptrCast(&from)).port);
+    const migrated = try self.tracker.observe(packet, ip, from_port, self.allow_migration);
     if (migrated) {
         self.noteMigration();
-        self.logger.info(null, "http3 connection migration observed for dcid={s}", .{std.fmt.fmtSliceHexLower(packet.dcid)});
+        self.logger.info(null, "http3 connection migration observed for dcid={f}", .{compat.fmtSliceHexLower(packet.dcid)});
     }
     if (self.server) |*server| {
         const result = ngtcp2_binding.handleDatagram(server, packet, datagram, ip, self.local_address, from, out_buf) catch |err| {
@@ -244,7 +248,7 @@ fn ingestDatagram(self: *Runtime, datagram: []const u8, from: std.net.Address, o
         };
         if (result.bytes_to_send > 0) {
             logOutgoingPacket(self, out_buf[0..result.bytes_to_send]);
-            _ = std.posix.sendto(self.socket_fd, out_buf[0..result.bytes_to_send], 0, &from.any, from.getOsSockLen()) catch {};
+            _ = std.c.sendto(self.socket_fd, @as(*const anyopaque, @ptrCast(out_buf.ptr)), result.bytes_to_send, 0, @as(?*const std.c.sockaddr, @ptrCast(&from)), sockAddrStorageLen(from));
         }
         flushPendingWrites(self, out_buf) catch {};
     }
@@ -261,7 +265,7 @@ fn pumpExpiry(self: *Runtime, out_buf: []u8) !void {
         if (result.bytes_to_send > 0) {
             if (result.remote_addr) |remote_addr| {
                 logOutgoingPacket(self, out_buf[0..result.bytes_to_send]);
-                _ = std.posix.sendto(self.socket_fd, out_buf[0..result.bytes_to_send], 0, &remote_addr.any, remote_addr.getOsSockLen()) catch {};
+                _ = std.c.sendto(self.socket_fd, @as(*const anyopaque, @ptrCast(out_buf.ptr)), result.bytes_to_send, 0, @as(?*const std.c.sockaddr, @ptrCast(&remote_addr)), sockAddrStorageLen(remote_addr));
             }
         }
         flushPendingWrites(self, out_buf) catch {};
@@ -279,7 +283,7 @@ fn flushPendingWrites(self: *Runtime, out_buf: []u8) !void {
             if (result.bytes_to_send == 0) break;
             if (result.remote_addr) |remote_addr| {
                 logOutgoingPacket(self, out_buf[0..result.bytes_to_send]);
-                _ = std.posix.sendto(self.socket_fd, out_buf[0..result.bytes_to_send], 0, &remote_addr.any, remote_addr.getOsSockLen()) catch {};
+                _ = std.c.sendto(self.socket_fd, @as(*const anyopaque, @ptrCast(out_buf.ptr)), result.bytes_to_send, 0, @as(?*const std.c.sockaddr, @ptrCast(&remote_addr)), sockAddrStorageLen(remote_addr));
             } else break;
         }
     }
@@ -303,20 +307,33 @@ fn logOutgoingPacket(self: *Runtime, packet: []const u8) void {
     }
 }
 
-fn formatAddressIp(address: std.net.Address) ?[]u8 {
-    return switch (address.any.family) {
+fn sockAddrStorageLen(addr: std.c.sockaddr.storage) std.posix.socklen_t {
+    return if (addr.family == std.posix.AF.INET6)
+        @sizeOf(std.c.sockaddr.in6)
+    else
+        @sizeOf(std.c.sockaddr.in);
+}
+
+fn formatAddressIp(address: std.c.sockaddr.storage) ?[]u8 {
+    const alloc = std.heap.page_allocator;
+    return switch (address.family) {
         std.posix.AF.INET => blk: {
-            const b = @as(*const [4]u8, @ptrCast(&address.in.sa.addr));
-            break :blk std.fmt.allocPrint(std.heap.page_allocator, "v4:{d}.{d}.{d}.{d}", .{ b[0], b[1], b[2], b[3] }) catch null;
+            const in4 = @as(*const std.c.sockaddr.in, @ptrCast(&address));
+            const b = std.mem.asBytes(&in4.addr);
+            break :blk std.fmt.allocPrint(alloc, "v4:{d}.{d}.{d}.{d}", .{ b[0], b[1], b[2], b[3] }) catch null;
         },
-        std.posix.AF.INET6 => std.fmt.allocPrint(std.heap.page_allocator, "v6:{s}", .{std.fmt.fmtSliceHexLower(address.in6.sa.addr[0..])}) catch null,
+        std.posix.AF.INET6 => blk: {
+            const in6 = @as(*const std.c.sockaddr.in6, @ptrCast(&address));
+            break :blk std.fmt.allocPrint(alloc, "v6:{f}", .{compat.fmtSliceHexLower(in6.addr[0..])}) catch null;
+        },
         else => null,
     };
 }
 
 fn setNonBlocking(fd: std.posix.fd_t, enabled: bool) !void {
-    const flags = try std.posix.fcntl(fd, std.posix.F.GETFL, 0);
-    const nonblock_flag = @as(usize, 1) << @bitOffsetOf(std.posix.O, "NONBLOCK");
-    const new_flags = if (enabled) flags | nonblock_flag else flags & ~nonblock_flag;
-    _ = try std.posix.fcntl(fd, std.posix.F.SETFL, new_flags);
+    const flags = std.c.fcntl(fd, std.c.F.GETFL, @as(c_int, 0));
+    if (flags < 0) return error.Unexpected;
+    const nonblock: c_int = @intCast(@as(u32, @bitCast(std.c.O{ .NONBLOCK = true })));
+    const new_flags: c_int = if (enabled) flags | nonblock else flags & ~nonblock;
+    if (std.c.fcntl(fd, std.c.F.SETFL, new_flags) < 0) return error.Unexpected;
 }

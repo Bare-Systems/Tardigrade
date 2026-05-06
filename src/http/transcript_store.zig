@@ -1,5 +1,6 @@
 const builtin = @import("builtin");
 const std = @import("std");
+const compat = @import("../zig_compat.zig");
 
 pub const Entry = struct {
     ts_ms: i64,
@@ -84,24 +85,23 @@ pub fn append(allocator: std.mem.Allocator, path: []const u8, entry: Entry, reda
     if (path.len == 0) return;
 
     if (std.fs.path.dirname(path)) |dir_name| {
-        std.fs.makeDirAbsolute(dir_name) catch |err| switch (err) {
+        compat.cwd().makePath(dir_name) catch |err| switch (err) {
             error.PathAlreadyExists => {},
             else => return err,
         };
     }
 
-    const file = try std.fs.createFileAbsolute(path, .{ .read = true, .truncate = false });
+    var file = try compat.cwd().createFile(path, .{ .read = true, .truncate = false });
     defer file.close();
     try ensureOwnerOnlyPermissions(file);
-    try file.seekFromEnd(0);
+    _ = std.c.lseek(file.file.handle, 0, std.c.SEEK.END);
 
     var sanitized = try sanitizeEntry(allocator, entry, redacted_values);
     defer sanitized.deinit(allocator);
 
-    var buf = std.ArrayList(u8).init(allocator);
-    defer buf.deinit();
-    try std.json.stringify(sanitized, .{}, buf.writer());
-    try file.writeAll(buf.items);
+    const buf = try compat.stringifyAlloc(allocator, sanitized, .{});
+    defer allocator.free(buf);
+    try file.writeAll(buf);
     try file.writeAll("\n");
 }
 
@@ -114,10 +114,10 @@ pub fn listRecent(allocator: std.mem.Allocator, path: []const u8, limit: usize) 
     };
     defer allocator.free(contents);
 
-    var window = std.ArrayList(Summary).init(allocator);
+    var window: std.ArrayList(Summary) = .empty;
     errdefer {
         for (window.items) |*summary| summary.deinit(allocator);
-        window.deinit();
+        window.deinit(allocator);
     }
 
     var line_id: usize = 0;
@@ -133,7 +133,7 @@ pub fn listRecent(allocator: std.mem.Allocator, path: []const u8, limit: usize) 
             var oldest = window.orderedRemove(0);
             oldest.deinit(allocator);
         }
-        try window.append(.{
+        try window.append(allocator, .{
             .id = entry.id,
             .ts_ms = entry.ts_ms,
             .scope = try allocator.dupe(u8, entry.scope),
@@ -146,7 +146,7 @@ pub fn listRecent(allocator: std.mem.Allocator, path: []const u8, limit: usize) 
     }
 
     std.mem.reverse(Summary, window.items);
-    return window.toOwnedSlice();
+    return try window.toOwnedSlice(allocator);
 }
 
 pub fn getById(allocator: std.mem.Allocator, path: []const u8, id: usize) !?StoredEntry {
@@ -172,15 +172,10 @@ pub fn getById(allocator: std.mem.Allocator, path: []const u8, id: usize) !?Stor
 }
 
 fn readFileOrEmpty(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    const file = std.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
+    return compat.cwd().readFileAlloc(allocator, path, 8 * 1024 * 1024) catch |err| switch (err) {
         error.FileNotFound => return allocator.alloc(u8, 0),
         else => return err,
     };
-    defer file.close();
-    const stat = try file.stat();
-    const max_bytes: usize = 8 * 1024 * 1024;
-    const size: usize = @intCast(@min(stat.size, max_bytes));
-    return try file.readToEndAlloc(allocator, size);
 }
 
 fn parseStoredEntryLine(allocator: std.mem.Allocator, id: usize, line: []const u8) !StoredEntry {
@@ -268,16 +263,16 @@ fn isJwtTokenChar(ch: u8) bool {
     return std.ascii.isAlphanumeric(ch) or ch == '-' or ch == '_';
 }
 
-fn ensureOwnerOnlyPermissions(file: std.fs.File) !void {
+fn ensureOwnerOnlyPermissions(file: compat.FileCompat) !void {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
-    try file.chmod(0o600);
+    if (std.c.fchmod(file.file.handle, 0o600) != 0) return error.PermissionDenied;
 }
 
 test "transcript store appends ndjson records" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const tmp_abs = try tmp.dir.realpathAlloc(allocator, ".");
+    const tmp_abs = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(tmp_abs);
     const path = try std.fmt.allocPrint(allocator, "{s}/transcripts.ndjson", .{tmp_abs});
     defer allocator.free(path);
@@ -296,7 +291,7 @@ test "transcript store appends ndjson records" {
         .response_body = "{\"ok\":true}",
     }, &.{});
 
-    const contents = try std.fs.cwd().readFileAlloc(allocator, path, 1024 * 1024);
+    const contents = try compat.cwd().readFileAlloc(allocator, path, 1024 * 1024);
     defer allocator.free(contents);
     try std.testing.expect(std.mem.indexOf(u8, contents, "\"scope\":\"chat\"") != null);
     try std.testing.expect(std.mem.endsWith(u8, contents, "\n"));
@@ -306,7 +301,7 @@ test "transcript store redacts explicit bearer values and jwt-looking tokens" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const tmp_abs = try tmp.dir.realpathAlloc(allocator, ".");
+    const tmp_abs = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(tmp_abs);
     const path = try std.fmt.allocPrint(allocator, "{s}/transcripts.ndjson", .{tmp_abs});
     defer allocator.free(path);
@@ -326,7 +321,7 @@ test "transcript store redacts explicit bearer values and jwt-looking tokens" {
         .response_body = "{\"echo\":\"opaque-secret\",\"jwt\":\"" ++ jwt ++ "\"}",
     }, &.{ "opaque-secret", jwt });
 
-    const contents = try std.fs.cwd().readFileAlloc(allocator, path, 1024 * 1024);
+    const contents = try compat.cwd().readFileAlloc(allocator, path, 1024 * 1024);
     defer allocator.free(contents);
     try std.testing.expect(std.mem.indexOf(u8, contents, "opaque-secret") == null);
     try std.testing.expect(std.mem.indexOf(u8, contents, jwt) == null);
@@ -339,7 +334,7 @@ test "transcript store writes owner-only file permissions when supported" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const tmp_abs = try tmp.dir.realpathAlloc(allocator, ".");
+    const tmp_abs = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(tmp_abs);
     const path = try std.fmt.allocPrint(allocator, "{s}/transcripts.ndjson", .{tmp_abs});
     defer allocator.free(path);
@@ -358,17 +353,17 @@ test "transcript store writes owner-only file permissions when supported" {
         .response_body = "{\"ok\":true}",
     }, &.{});
 
-    const file = try std.fs.openFileAbsolute(path, .{});
+    var file = try compat.cwd().openFile(path, .{});
     defer file.close();
     const stat = try file.stat();
-    try std.testing.expectEqual(@as(u32, 0o600), stat.mode & 0o777);
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), stat.permissions.toMode() & 0o777);
 }
 
 test "transcript store lists recent entries and loads details by id" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const tmp_abs = try tmp.dir.realpathAlloc(allocator, ".");
+    const tmp_abs = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(tmp_abs);
     const path = try std.fmt.allocPrint(allocator, "{s}/transcripts.ndjson", .{tmp_abs});
     defer allocator.free(path);

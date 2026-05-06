@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("../zig_compat.zig");
 const Headers = @import("headers.zig").Headers;
 
 pub const HEADER_NAME = "X-Correlation-ID";
@@ -37,10 +38,10 @@ pub fn fromHeadersOrGenerate(allocator: std.mem.Allocator, headers: *const Heade
 /// Generate a compact ID suitable for logs and response headers.
 pub fn generate(allocator: std.mem.Allocator) ![]u8 {
     var random: [8]u8 = undefined;
-    std.crypto.random.bytes(&random);
-    return std.fmt.allocPrint(allocator, "tg-{d}-{s}", .{
-        std.time.milliTimestamp(),
-        std.fmt.fmtSliceHexLower(&random),
+    compat.randomBytes(&random);
+    return std.fmt.allocPrint(allocator, "tg-{d}-{f}", .{
+        compat.milliTimestamp(),
+        compat.fmtSliceHexLower(&random),
     });
 }
 

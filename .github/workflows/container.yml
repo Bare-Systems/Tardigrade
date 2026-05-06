@@ -25,7 +25,10 @@ jobs:
         uses: docker/setup-qemu-action@v3
 
       - name: Install Zig
-        run: sh ./scripts/install-zig.sh 0.14.1
+        run: sh ./scripts/install-zig.sh 0.16.0
+
+      - name: Print Zig version
+        run: zig version
 
       - name: Build Linux release binary
         run: zig build -Doptimize=ReleaseFast

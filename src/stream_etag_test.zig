@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("zig_compat.zig");
 const main = @import("main.zig");
 const http = @import("http.zig");
 
@@ -15,7 +16,7 @@ test "static file large streaming sends full body" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const file_name = "large.bin";
-    var f = try tmp.dir.createFile(file_name, .{});
+    var f = try compat.wrapDir(tmp.dir).createFile(file_name, .{});
     // Write a repeating pattern
     var written: usize = 0;
     while (written < file_size) {
@@ -31,7 +32,7 @@ test "static file large streaming sends full body" {
     // Prepare output buffer large enough
     var out_buf = try allocator.alloc(u8, file_size + 8192);
     defer allocator.free(out_buf);
-    var stream = std.io.fixedBufferStream(out_buf);
+    var stream = compat.fixedBufferStream(out_buf);
 
     try main.serveFileContent(allocator, &req, file_name, stream.writer(), false, false, true, null);
     const output = stream.getWritten();
@@ -52,7 +53,7 @@ test "static file If-None-Match returns 304 Not Modified" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const file_name = "et.bin";
-    var f = try tmp.dir.createFile(file_name, .{});
+    var f = try compat.wrapDir(tmp.dir).createFile(file_name, .{});
     try f.writeAll("abcd");
     try f.flush();
 
@@ -70,7 +71,7 @@ test "static file If-None-Match returns 304 Not Modified" {
 
     var out_buf = try allocator.alloc(u8, 4096);
     defer allocator.free(out_buf);
-    var stream = std.io.fixedBufferStream(out_buf);
+    var stream = compat.fixedBufferStream(out_buf);
 
     try main.serveFileContent(allocator, &req, file_name, stream.writer(), false, false, true, null);
     const output = stream.getWritten();

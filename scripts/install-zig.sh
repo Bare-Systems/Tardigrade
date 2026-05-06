@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-version="${1:-0.14.1}"
+version="${1:-0.16.0}"
 install_root="${2:-$PWD/.zig}"
 
 os="$(uname -s)"

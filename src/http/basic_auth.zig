@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("../zig_compat.zig");
 const Headers = @import("headers.zig").Headers;
 
 pub const AUTHORIZATION_HEADER = "authorization";
@@ -78,10 +79,10 @@ pub fn verifyCredentials(creds: Credentials, allowed_hashes: []const []const u8)
 
     // Hex encode for comparison
     var hex_buf: [64]u8 = undefined;
-    _ = std.fmt.bufPrint(&hex_buf, "{s}", .{std.fmt.fmtSliceHexLower(&digest)}) catch return false;
+    _ = std.fmt.bufPrint(&hex_buf, "{f}", .{compat.fmtSliceHexLower(&digest)}) catch return false;
 
     for (allowed_hashes) |allowed| {
-        if (allowed.len == 64 and std.crypto.utils.timingSafeEql([64]u8, allowed[0..64].*, hex_buf)) {
+        if (allowed.len == 64 and compat.timingSafeEql([64]u8, allowed[0..64].*, hex_buf)) {
             return true;
         }
     }
@@ -167,7 +168,7 @@ test "verifyCredentials accepts valid hash" {
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash("admin:password", &digest, .{});
     var expected: [64]u8 = undefined;
-    _ = std.fmt.bufPrint(&expected, "{s}", .{std.fmt.fmtSliceHexLower(&digest)}) catch unreachable;
+    _ = std.fmt.bufPrint(&expected, "{f}", .{compat.fmtSliceHexLower(&digest)}) catch unreachable;
 
     const hashes = &[_][]const u8{expected[0..]};
     const creds = Credentials{ .username = "admin", .password = "password" };
@@ -178,7 +179,7 @@ test "verifyCredentials rejects wrong credentials" {
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash("admin:password", &digest, .{});
     var expected: [64]u8 = undefined;
-    _ = std.fmt.bufPrint(&expected, "{s}", .{std.fmt.fmtSliceHexLower(&digest)}) catch unreachable;
+    _ = std.fmt.bufPrint(&expected, "{f}", .{compat.fmtSliceHexLower(&digest)}) catch unreachable;
 
     const hashes = &[_][]const u8{expected[0..]};
     const creds = Credentials{ .username = "admin", .password = "wrong" };

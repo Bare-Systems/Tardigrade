@@ -1,9 +1,10 @@
+const compat = @import("../zig_compat.zig");
 const std = @import("std");
 
 /// Thread-safe fixed-size byte buffer pool.
 pub const BufferPool = struct {
     allocator: std.mem.Allocator,
-    mutex: std.Thread.Mutex = .{},
+    mutex: compat.Mutex = .{},
     free_list: std.ArrayList([]u8),
     buffer_size: usize,
     max_cached: usize,
@@ -11,7 +12,7 @@ pub const BufferPool = struct {
     pub fn init(allocator: std.mem.Allocator, buffer_size: usize, max_cached: usize) BufferPool {
         return .{
             .allocator = allocator,
-            .free_list = std.ArrayList([]u8).init(allocator),
+            .free_list = .empty,
             .buffer_size = buffer_size,
             .max_cached = max_cached,
         };
@@ -19,7 +20,7 @@ pub const BufferPool = struct {
 
     pub fn deinit(self: *BufferPool) void {
         for (self.free_list.items) |buf| self.allocator.free(buf);
-        self.free_list.deinit();
+        self.free_list.deinit(self.allocator);
     }
 
     pub fn acquire(self: *BufferPool) ![]u8 {
@@ -46,7 +47,7 @@ pub const BufferPool = struct {
             return;
         }
 
-        self.free_list.append(buf) catch {
+        self.free_list.append(self.allocator, buf) catch {
             self.allocator.free(buf);
         };
     }

@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("../zig_compat.zig");
 const Allocator = std.mem.Allocator;
 
 /// Supported command types that can be routed through the gateway.
@@ -98,7 +99,7 @@ pub fn parseCommand(allocator: Allocator, body: []const u8) !Command {
     if (params_val != .object) return ParseError.InvalidParams;
 
     // Re-serialize params to JSON string
-    const params_raw = std.json.stringifyAlloc(allocator, params_val, .{}) catch
+    const params_raw = compat.stringifyAlloc(allocator, params_val, .{}) catch
         return ParseError.InvalidParams;
     errdefer allocator.free(params_raw);
 
@@ -163,7 +164,7 @@ pub fn buildUpstreamEnvelope(
         identity,
         client_ip,
         version_str,
-        std.time.timestamp(),
+        compat.unixTimestamp(),
     });
 }
 

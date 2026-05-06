@@ -1,0 +1,36 @@
+{
+  "static-http1": {
+    "rps": 4713,
+    "p50_ms": 0.490,
+    "p99_ms": 47.35,
+    "errors": 1413
+  },
+  "proxy-http1": {
+    "rps": 1770,
+    "p50_ms": 1.28,
+    "p99_ms": 112.15,
+    "errors": 530
+  },
+  "keepalive": {
+    "rps": 4713,
+    "p50_ms": 0.487,
+    "p99_ms": 47.59,
+    "errors": 1413
+  },
+  "_meta": {
+    "tag": "7928099",
+    "timestamp": "2026-05-06T02:50:00Z",
+    "host": "127.0.0.1",
+    "port": "8069",
+    "tool": "wrk",
+    "driver": "loopback (inside tardigrade-perf LXC)",
+    "zig_version": "0.16.0",
+    "duration_s": 30,
+    "connections": 4,
+    "host_header": "",
+    "static_path": "/health",
+    "proxy_path": "/proxy/health",
+    "keepalive_path": "/health",
+    "note": "read errors are wrk connection-close events; server closes keep-alive connections normally"
+  }
+}

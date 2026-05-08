@@ -278,6 +278,7 @@ fn executeValidateCommand(allocator: std.mem.Allocator, options: CommonOptions) 
     var cfg = try edge_config.loadFromEnv(allocator);
     defer cfg.deinit(allocator);
     try edge_config.validate(&cfg);
+    edge_config.warnRiskyConfig(&cfg);
     std.debug.print("configuration valid\n", .{});
 }
 
@@ -297,6 +298,7 @@ fn executeRunCommand(allocator: std.mem.Allocator, args: []const []const u8, opt
     var cfg = try edge_config.loadFromEnv(allocator);
     defer cfg.deinit(allocator);
     try edge_config.validate(&cfg);
+    edge_config.warnRiskyConfig(&cfg);
     try configureErrorLog(&cfg);
     try writePidFile(&cfg);
     defer removePidFile(&cfg);

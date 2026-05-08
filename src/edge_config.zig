@@ -2361,6 +2361,75 @@ pub fn validate(cfg: *const EdgeConfig) !void {
     try validateOptionalSocketEndpoint(cfg.pop3_upstream, "pop3_upstream");
     try validateOptionalSocketEndpoint(cfg.tcp_proxy_upstream, "tcp_proxy_upstream");
     try validateOptionalSocketEndpoint(cfg.udp_proxy_upstream, "udp_proxy_upstream");
+
+    // TLS cert and key must both be present or both absent.
+    validateTlsCertKeyPair(cfg.tls_cert_path, cfg.tls_key_path) catch {
+        std.log.err("config validation failed: TARDIGRADE_TLS_CERT_PATH and TARDIGRADE_TLS_KEY_PATH must both be set or both be empty", .{});
+        return error.InvalidConfigPath;
+    };
+
+    // mTLS: CA path required when client verification is enabled.
+    validateMtlsConsistency(cfg.tls_client_verify, cfg.tls_client_ca_path) catch {
+        std.log.err("config validation failed: TARDIGRADE_TLS_CLIENT_CA_PATH must be set when TARDIGRADE_TLS_CLIENT_VERIFY is enabled", .{});
+        return error.InvalidConfigPath;
+    };
+
+    // Numeric range validations.
+    validateOtelSampleRate(cfg.otel_sample_rate) catch {
+        std.log.err("config validation failed: TARDIGRADE_OTEL_SAMPLE_RATE must be between 0 and 100 (got {})", .{cfg.otel_sample_rate});
+        return error.InvalidConfigValue;
+    };
+    validateBrotliQuality(cfg.compression_brotli_quality) catch {
+        std.log.err("config validation failed: TARDIGRADE_COMPRESSION_BROTLI_QUALITY must be between 0 and 11 (got {})", .{cfg.compression_brotli_quality});
+        return error.InvalidConfigValue;
+    };
+    validateUpstreamRetryAttempts(cfg.upstream_retry_attempts) catch {
+        std.log.err("config validation failed: TARDIGRADE_UPSTREAM_RETRY_ATTEMPTS must be at least 1", .{});
+        return error.InvalidConfigValue;
+    };
+}
+
+fn validateTlsCertKeyPair(cert_path: []const u8, key_path: []const u8) !void {
+    if ((cert_path.len == 0) != (key_path.len == 0)) return error.InvalidConfigPath;
+}
+
+fn validateMtlsConsistency(client_verify: bool, ca_path: []const u8) !void {
+    if (client_verify and ca_path.len == 0) return error.InvalidConfigPath;
+}
+
+fn validateOtelSampleRate(rate: u32) !void {
+    if (rate > 100) return error.InvalidConfigValue;
+}
+
+fn validateBrotliQuality(quality: u32) !void {
+    if (quality > 11) return error.InvalidConfigValue;
+}
+
+fn validateUpstreamRetryAttempts(attempts: u32) !void {
+    if (attempts == 0) return error.InvalidConfigValue;
+}
+
+/// Emit log warnings for configurations that are valid but operationally risky.
+/// Call this after validate() succeeds.
+pub fn warnRiskyConfig(cfg: *const EdgeConfig) void {
+    if (!cfg.upstream_tls_verify) {
+        std.log.warn("config warning: TARDIGRADE_UPSTREAM_TLS_VERIFY is false — upstream TLS certificates are not verified (MITM risk)", .{});
+    }
+    if (cfg.rate_limit_rps == 0) {
+        std.log.warn("config warning: TARDIGRADE_RATE_LIMIT_RPS is 0 — rate limiting is disabled; consider enabling it to protect against DoS", .{});
+    }
+    if (cfg.http3_enable_0rtt) {
+        std.log.warn("config warning: TARDIGRADE_HTTP3_ENABLE_0RTT is true — 0-RTT enables replay attacks; only use on idempotent services", .{});
+    }
+    if (cfg.tls_acme_enabled and cfg.tls_acme_domains.len == 0) {
+        std.log.warn("config warning: TARDIGRADE_TLS_ACME_ENABLED is true but TARDIGRADE_TLS_ACME_DOMAINS is empty — ACME will not obtain any certificates", .{});
+    }
+    if (hasTlsFiles(cfg) and !cfg.hsts_enabled) {
+        std.log.warn("config warning: TLS is configured but TARDIGRADE_HSTS_ENABLED is false — consider enabling HSTS to prevent downgrade attacks", .{});
+    }
+    if (cfg.tls_client_ca_path.len > 0 and !cfg.tls_client_verify) {
+        std.log.warn("config warning: TARDIGRADE_TLS_CLIENT_CA_PATH is set but TARDIGRADE_TLS_CLIENT_VERIFY is false — the CA path is ignored", .{});
+    }
 }
 
 fn validateOptionalFile(path: []const u8, label: []const u8) !void {
@@ -2849,4 +2918,39 @@ test "parse fastcgi params" {
     try std.testing.expectEqualStrings("prod", params[0].value);
     try std.testing.expectEqualStrings("APP_ROLE", params[1].name);
     try std.testing.expectEqualStrings("api", params[1].value);
+}
+
+test "validate TLS cert/key pair rejects mismatched presence" {
+    try validateTlsCertKeyPair("", "");
+    try validateTlsCertKeyPair("/cert.pem", "/key.pem");
+    try std.testing.expectError(error.InvalidConfigPath, validateTlsCertKeyPair("/cert.pem", ""));
+    try std.testing.expectError(error.InvalidConfigPath, validateTlsCertKeyPair("", "/key.pem"));
+}
+
+test "validate mTLS consistency requires CA path when verify is enabled" {
+    try validateMtlsConsistency(false, "");
+    try validateMtlsConsistency(false, "/ca.pem");
+    try validateMtlsConsistency(true, "/ca.pem");
+    try std.testing.expectError(error.InvalidConfigPath, validateMtlsConsistency(true, ""));
+}
+
+test "validate OTEL sample rate rejects values above 100" {
+    try validateOtelSampleRate(0);
+    try validateOtelSampleRate(50);
+    try validateOtelSampleRate(100);
+    try std.testing.expectError(error.InvalidConfigValue, validateOtelSampleRate(101));
+    try std.testing.expectError(error.InvalidConfigValue, validateOtelSampleRate(200));
+}
+
+test "validate Brotli quality rejects values above 11" {
+    try validateBrotliQuality(0);
+    try validateBrotliQuality(6);
+    try validateBrotliQuality(11);
+    try std.testing.expectError(error.InvalidConfigValue, validateBrotliQuality(12));
+}
+
+test "validate upstream retry attempts rejects zero" {
+    try validateUpstreamRetryAttempts(1);
+    try validateUpstreamRetryAttempts(3);
+    try std.testing.expectError(error.InvalidConfigValue, validateUpstreamRetryAttempts(0));
 }

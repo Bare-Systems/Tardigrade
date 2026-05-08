@@ -16,6 +16,7 @@ All notable user-facing changes to Tardigrade are documented here.
 - Added a configurable Prometheus metrics endpoint with optional auth gating and integration coverage for counter growth.
 
 ### Added
+- Improved config validation and added `warnRiskyConfig`: `validate()` now rejects mismatched TLS cert/key pairs, `tls_client_verify` without a CA path, `otel_sample_rate` outside 0–100, `compression_brotli_quality` outside 0–11, and `upstream_retry_attempts` of 0. A new `warnRiskyConfig` function logs operator warnings for insecure defaults such as disabled upstream TLS verification, disabled rate limiting, 0-RTT HTTP/3, ACME enabled with no domains, TLS without HSTS, and an ignored client CA path. Both `tardigrade validate` and `tardigrade run` now surface these warnings at startup and on reload. Added 5 unit tests covering the new validation helpers.
 - Added unit tests covering `main.zig` core helpers: `parsePid`, `readPidFromFile`, `rotateLogFiles`, `parseCliCommand`, and `writeStarterConfig`; fixed `readPidFromFile` to use `allocRemaining` instead of `readAlloc` so it correctly reads pid files shorter than the buffer size.
 - Added 14 unit tests covering `zig_compat.zig` compat functions (timestamp, random, stringify, fixedBufferStream, trimRight, fmtSliceHexLower, DirCompat file I/O), `http2_frame` writeSettings/writeSettingsAck/writeGoaway encoding, and `access_log` formatEntry JSON output including null upstream_status handling.
 

@@ -3041,6 +3041,7 @@ fn hotReloadConfig(
         state.logger.warn(null, "config reload rejected by validation: {}", .{err});
         return;
     };
+    edge_config.warnRiskyConfig(&loaded);
     const cfg_ptr = allocator.create(edge_config.EdgeConfig) catch {
         var rejected = loaded;
         rejected.deinit(allocator);

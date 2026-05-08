@@ -74,3 +74,31 @@ test "parseSingle parses suffix range" {
 test "parseSingle rejects unsatisfiable range" {
     try std.testing.expectError(error.RangeNotSatisfiable, parseSingle("bytes=999-1000", 10));
 }
+
+test "parseSingle parses open-ended range (bytes=N-)" {
+    const parsed = try parseSingle("bytes=5-", 20);
+    try std.testing.expectEqual(@as(usize, 5), parsed.start);
+    try std.testing.expectEqual(@as(usize, 19), parsed.end_inclusive);
+    try std.testing.expectEqual(@as(usize, 15), parsed.len());
+}
+
+test "parseSingle clamps end to file size" {
+    const parsed = try parseSingle("bytes=0-9999", 50);
+    try std.testing.expectEqual(@as(usize, 0), parsed.start);
+    try std.testing.expectEqual(@as(usize, 49), parsed.end_inclusive);
+}
+
+test "parseSingle rejects reversed range (end < start)" {
+    try std.testing.expectError(error.InvalidRange, parseSingle("bytes=10-5", 100));
+}
+
+test "parseSingle rejects multi-range" {
+    try std.testing.expectError(error.MultiRangeUnsupported, parseSingle("bytes=0-9,20-29", 100));
+}
+
+test "formatContentRange produces correct header value" {
+    const br = ByteRange{ .start = 10, .end_inclusive = 19 };
+    const hdr = try formatContentRange(std.testing.allocator, br, 100);
+    defer std.testing.allocator.free(hdr);
+    try std.testing.expectEqualStrings("bytes 10-19/100", hdr);
+}

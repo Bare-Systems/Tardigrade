@@ -610,6 +610,337 @@ test "serve returns file-backed range payload when preferred" {
     try std.testing.expectEqualStrings("bytes 6-9/15", served.content_range_value.?);
 }
 
+test "serve returns 206 with correct body slice and Content-Range for valid range" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // File content is exactly "0123456789" (10 bytes)
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "data.txt", .data = "0123456789" });
+    const root_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+
+    var hdrs = headers_mod.Headers.init(allocator);
+    defer hdrs.deinit();
+    try hdrs.append("Range", "bytes=0-4");
+
+    var served = (try serve(allocator, .{
+        .root = root_path,
+        .request_path = "/data.txt",
+        .matched_pattern = "/",
+        .alias = false,
+        .index = "index.html",
+        .try_files = "",
+        .headers = &hdrs,
+    })).?;
+    defer served.deinit(allocator);
+
+    try std.testing.expectEqual(status.Status.partial_content, served.status_code);
+    try std.testing.expectEqualStrings("01234", served.body.?);
+    try std.testing.expectEqual(@as(usize, 5), served.content_length);
+    try std.testing.expectEqualStrings("bytes 0-4/10", served.content_range_value.?);
+    try std.testing.expect(served.accept_ranges);
+}
+
+test "serve returns 206 for suffix range (bytes=-N)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "tail.txt", .data = "abcdefghij" });
+    const root_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+
+    var hdrs = headers_mod.Headers.init(allocator);
+    defer hdrs.deinit();
+    try hdrs.append("Range", "bytes=-3");
+
+    var served = (try serve(allocator, .{
+        .root = root_path,
+        .request_path = "/tail.txt",
+        .matched_pattern = "/",
+        .alias = false,
+        .index = "index.html",
+        .try_files = "",
+        .headers = &hdrs,
+    })).?;
+    defer served.deinit(allocator);
+
+    try std.testing.expectEqual(status.Status.partial_content, served.status_code);
+    try std.testing.expectEqualStrings("hij", served.body.?);
+    try std.testing.expectEqualStrings("bytes 7-9/10", served.content_range_value.?);
+}
+
+test "serve returns 416 for unsatisfiable range" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "small.txt", .data = "hi" });
+    const root_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+
+    var hdrs = headers_mod.Headers.init(allocator);
+    defer hdrs.deinit();
+    try hdrs.append("Range", "bytes=1000-2000");
+
+    var served = (try serve(allocator, .{
+        .root = root_path,
+        .request_path = "/small.txt",
+        .matched_pattern = "/",
+        .alias = false,
+        .index = "index.html",
+        .try_files = "",
+        .headers = &hdrs,
+    })).?;
+    defer served.deinit(allocator);
+
+    try std.testing.expectEqual(status.Status.range_not_satisfiable, served.status_code);
+    // Content-Range must use wildcard form bytes */N for 416
+    try std.testing.expect(served.content_range_value != null);
+    try std.testing.expect(std.mem.startsWith(u8, served.content_range_value.?, "bytes */"));
+}
+
+test "serve returns 304 for matching If-None-Match" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "cached.txt", .data = "hello" });
+    const root_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+
+    // Obtain the real ETag by doing an initial unguarded request.
+    var hdrs0 = headers_mod.Headers.init(allocator);
+    defer hdrs0.deinit();
+    var first = (try serve(allocator, .{
+        .root = root_path,
+        .request_path = "/cached.txt",
+        .matched_pattern = "/",
+        .alias = false,
+        .index = "index.html",
+        .try_files = "",
+        .headers = &hdrs0,
+    })).?;
+    const real_etag = try allocator.dupe(u8, first.etag_value.?);
+    defer allocator.free(real_etag);
+    first.deinit(allocator);
+
+    var hdrs = headers_mod.Headers.init(allocator);
+    defer hdrs.deinit();
+    try hdrs.append("If-None-Match", real_etag);
+
+    var served = (try serve(allocator, .{
+        .root = root_path,
+        .request_path = "/cached.txt",
+        .matched_pattern = "/",
+        .alias = false,
+        .index = "index.html",
+        .try_files = "",
+        .headers = &hdrs,
+    })).?;
+    defer served.deinit(allocator);
+
+    try std.testing.expectEqual(status.Status.not_modified, served.status_code);
+    try std.testing.expectEqual(@as(usize, 0), served.content_length);
+}
+
+test "serve returns 304 for wildcard If-None-Match" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "wild.txt", .data = "data" });
+    const root_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+
+    var hdrs = headers_mod.Headers.init(allocator);
+    defer hdrs.deinit();
+    try hdrs.append("If-None-Match", "*");
+
+    var served = (try serve(allocator, .{
+        .root = root_path,
+        .request_path = "/wild.txt",
+        .matched_pattern = "/",
+        .alias = false,
+        .index = "index.html",
+        .try_files = "",
+        .headers = &hdrs,
+    })).?;
+    defer served.deinit(allocator);
+
+    try std.testing.expectEqual(status.Status.not_modified, served.status_code);
+}
+
+test "serve returns 200 for non-matching If-None-Match" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "miss.txt", .data = "body" });
+    const root_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+
+    var hdrs = headers_mod.Headers.init(allocator);
+    defer hdrs.deinit();
+    try hdrs.append("If-None-Match", "\"deadbeef-0\"");
+
+    var served = (try serve(allocator, .{
+        .root = root_path,
+        .request_path = "/miss.txt",
+        .matched_pattern = "/",
+        .alias = false,
+        .index = "index.html",
+        .try_files = "",
+        .headers = &hdrs,
+    })).?;
+    defer served.deinit(allocator);
+
+    try std.testing.expectEqual(status.Status.ok, served.status_code);
+    try std.testing.expect(served.body != null);
+}
+
+test "serve returns 304 for If-Modified-Since not older than mtime" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "mod.txt", .data = "stale?" });
+    const root_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+
+    // Use a far-future date so mtime is always <= header.
+    var hdrs = headers_mod.Headers.init(allocator);
+    defer hdrs.deinit();
+    try hdrs.append("If-Modified-Since", "Sat, 01 Jan 2050 00:00:00 GMT");
+
+    var served = (try serve(allocator, .{
+        .root = root_path,
+        .request_path = "/mod.txt",
+        .matched_pattern = "/",
+        .alias = false,
+        .index = "index.html",
+        .try_files = "",
+        .headers = &hdrs,
+    })).?;
+    defer served.deinit(allocator);
+
+    try std.testing.expectEqual(status.Status.not_modified, served.status_code);
+}
+
+test "serve returns 200 for If-Modified-Since older than mtime" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "fresh.txt", .data = "new" });
+    const root_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+
+    // Epoch = before any real file mtime.
+    var hdrs = headers_mod.Headers.init(allocator);
+    defer hdrs.deinit();
+    try hdrs.append("If-Modified-Since", "Thu, 01 Jan 1970 00:00:00 GMT");
+
+    var served = (try serve(allocator, .{
+        .root = root_path,
+        .request_path = "/fresh.txt",
+        .matched_pattern = "/",
+        .alias = false,
+        .index = "index.html",
+        .try_files = "",
+        .headers = &hdrs,
+    })).?;
+    defer served.deinit(allocator);
+
+    try std.testing.expectEqual(status.Status.ok, served.status_code);
+}
+
+test "serve: If-None-Match match takes precedence over Range, returns 304 not 206" {
+    // RFC 9110 §13.1: conditional headers are evaluated before range headers.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "cond.txt", .data = "0123456789" });
+    const root_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+
+    // Get real ETag first.
+    var hdrs0 = headers_mod.Headers.init(allocator);
+    defer hdrs0.deinit();
+    var first = (try serve(allocator, .{
+        .root = root_path,
+        .request_path = "/cond.txt",
+        .matched_pattern = "/",
+        .alias = false,
+        .index = "index.html",
+        .try_files = "",
+        .headers = &hdrs0,
+    })).?;
+    const real_etag = try allocator.dupe(u8, first.etag_value.?);
+    defer allocator.free(real_etag);
+    first.deinit(allocator);
+
+    var hdrs = headers_mod.Headers.init(allocator);
+    defer hdrs.deinit();
+    try hdrs.append("If-None-Match", real_etag);
+    try hdrs.append("Range", "bytes=0-4");
+
+    var served = (try serve(allocator, .{
+        .root = root_path,
+        .request_path = "/cond.txt",
+        .matched_pattern = "/",
+        .alias = false,
+        .index = "index.html",
+        .try_files = "",
+        .headers = &hdrs,
+    })).?;
+    defer served.deinit(allocator);
+
+    try std.testing.expectEqual(status.Status.not_modified, served.status_code);
+}
+
+test "serve large file returns 200 with full body" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Write a 512 KB file with a repeating pattern.
+    const file_size: usize = 512 * 1024;
+    const pattern = "TARDIGRADE";
+    var data = try allocator.alloc(u8, file_size);
+    defer allocator.free(data);
+    var i: usize = 0;
+    while (i < file_size) : (i += 1) data[i] = pattern[i % pattern.len];
+
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "large.bin", .data = data });
+    const root_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+
+    var hdrs = headers_mod.Headers.init(allocator);
+    defer hdrs.deinit();
+
+    var served = (try serve(allocator, .{
+        .root = root_path,
+        .request_path = "/large.bin",
+        .matched_pattern = "/",
+        .alias = false,
+        .index = "index.html",
+        .try_files = "",
+        .headers = &hdrs,
+        .max_bytes = 1024 * 1024,
+    })).?;
+    defer served.deinit(allocator);
+
+    try std.testing.expectEqual(status.Status.ok, served.status_code);
+    try std.testing.expectEqual(file_size, served.content_length);
+    try std.testing.expectEqual(file_size, served.body.?.len);
+    // Spot-check first and last byte of the pattern.
+    try std.testing.expectEqual(data[0], served.body.?[0]);
+    try std.testing.expectEqual(data[file_size - 1], served.body.?[file_size - 1]);
+}
+
 test "serve uses application wasm mime type" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

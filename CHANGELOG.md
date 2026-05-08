@@ -5,6 +5,7 @@ All notable user-facing changes to Tardigrade are documented here.
 ## [Unreleased]
 
 ### Added
+- Added 22 unit tests covering `range.zig` (open-ended range, clamping, reversed range, multi-range, `formatContentRange`), `etag.zig` (determinism, wildcard, list matching), and `static_file.zig` (206 partial content with exact body and `Content-Range`, suffix range, 416 for unsatisfiable range, 304 for matching `If-None-Match`, wildcard `If-None-Match`, non-matching `If-None-Match`, `If-Modified-Since` cache hit and miss, conditional-takes-precedence-over-range per RFC 9110 §13.1, and large-file 512 KB body integrity). Removed two orphaned test files that referenced non-existent APIs.
 - Added `TARDIGRADE_SHUTDOWN_DRAIN_TIMEOUT_MS` config option (default 30 000 ms). On SIGTERM/SIGINT, tardigrade now waits up to this timeout for in-flight requests to finish before force-closing queued connections. Setting it to 0 reverts to immediate close behavior.
 - TLS 1.0 and 1.1 are now explicitly rejected at config validation; only TLS 1.2 and 1.3 are accepted.
 - Added `TARDIGRADE_HSTS_ENABLED`, `TARDIGRADE_HSTS_MAX_AGE`, `TARDIGRADE_HSTS_INCLUDE_SUBDOMAINS`, and `TARDIGRADE_HSTS_PRELOAD` config options. HSTS is emitted only on HTTPS responses and only when TLS is configured.

@@ -2940,8 +2940,8 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         }
     }
 
-    state.logger.info(null, "Shutdown requested; draining active connection work", .{});
-    worker_pool.shutdownAndJoin(true);
+    state.logger.info(null, "Shutdown requested; draining active connection work (timeout={}ms)", .{cfg.shutdown_drain_timeout_ms});
+    worker_pool.shutdownAndJoin(cfg.shutdown_drain_timeout_ms);
     state.logger.info(null, "Graceful shutdown complete", .{});
 }
 

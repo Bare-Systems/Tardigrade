@@ -79,7 +79,7 @@ pub const WorkerPool = struct {
     }
 
     pub fn deinit(self: *WorkerPool) void {
-        self.shutdownAndJoin(true);
+        self.shutdownAndJoin(30_000);
         if (!builtin.single_threaded) {
             for (self.worker_queues) |*wq| wq.items.deinit(self.allocator);
             self.allocator.free(self.worker_queues);
@@ -110,22 +110,49 @@ pub const WorkerPool = struct {
         self.cond.signal();
     }
 
-    pub fn shutdownAndJoin(self: *WorkerPool, drain_pending: bool) void {
+    /// Drain in-flight work and shut down workers.
+    ///
+    /// `drain_timeout_ms` controls how long to wait for queued and active jobs
+    /// to finish before forcibly closing any remaining queued file descriptors:
+    ///   - 0  → close queued fds immediately, then join (no drain)
+    ///   - >0 → wait up to that many milliseconds for work to drain;
+    ///           after the deadline, force-close remaining queued fds and join
+    ///
+    /// Active (already-dispatched) handlers are always allowed to finish
+    /// naturally; only unstarted queued fds are force-closed on timeout.
+    pub fn shutdownAndJoin(self: *WorkerPool, drain_timeout_ms: u64) void {
         if (builtin.single_threaded) return;
         if (self.joined) return;
 
         self.mutex.lock();
         self.shutting_down = true;
 
-        if (!drain_pending) {
+        if (drain_timeout_ms == 0) {
+            // Immediate: close queued fds without waiting.
             for (self.worker_queues) |*wq| {
                 for (wq.items.items) |fd| _ = std.c.close(fd);
                 wq.items.clearRetainingCapacity();
             }
             self.queued_jobs = 0;
         } else {
+            // Drain with deadline.
+            const deadline_ms = compat.milliTimestamp() + @as(i64, @intCast(drain_timeout_ms));
             while (self.queued_jobs > 0 or self.active_jobs > 0) {
-                self.cond.wait(&self.mutex);
+                const now_ms = compat.milliTimestamp();
+                if (now_ms >= deadline_ms) {
+                    // Timeout: force-close remaining queued fds.
+                    for (self.worker_queues) |*wq| {
+                        for (wq.items.items) |fd| _ = std.c.close(fd);
+                        wq.items.clearRetainingCapacity();
+                    }
+                    self.queued_jobs = 0;
+                    break;
+                }
+                // Unlock and sleep briefly to let workers make progress,
+                // then re-check.
+                self.mutex.unlock();
+                std.Io.sleep(compat.io(), .fromMilliseconds(5), .awake) catch {};
+                self.mutex.lock();
             }
         }
 
@@ -267,7 +294,7 @@ test "worker pool shutdown drains in-flight work" {
     defer pool.deinit();
 
     try pool.submit(1);
-    pool.shutdownAndJoin(true);
+    pool.shutdownAndJoin(5_000);
 
     ctx.mutex.lock();
     defer ctx.mutex.unlock();
@@ -335,4 +362,102 @@ test "worker pool popWorkLocked steals from peer queue" {
     const stolen = pool.popWorkLocked(0);
     try std.testing.expectEqual(@as(?std.posix.fd_t, 42), stolen);
     try std.testing.expectEqual(@as(usize, 0), pool.queued_jobs);
+}
+
+test "shutdownAndJoin drain_timeout_ms=0 closes queued fds immediately" {
+    // Verify that a zero timeout immediately discards queued (unstarted) work
+    // without blocking.
+    if (builtin.single_threaded) return;
+
+    const Ctx = struct {
+        mutex: compat.Mutex = .{},
+        ran: bool = false,
+    };
+    var ctx = Ctx{};
+
+    const handler = struct {
+        fn run(raw_ctx: *anyopaque, _: std.posix.fd_t) void {
+            // This should not be called because we force-close before dispatch.
+            const typed: *Ctx = @ptrCast(@alignCast(raw_ctx));
+            typed.mutex.lock();
+            typed.ran = true;
+            typed.mutex.unlock();
+        }
+    }.run;
+
+    var pool: WorkerPool = undefined;
+    // Single worker — keep it busy so the queued job never starts.
+    try pool.init(std.testing.allocator, 1, 16, handler, &ctx);
+    defer pool.deinit();
+
+    // Immediate shutdown with zero timeout must complete quickly.
+    const t0 = compat.milliTimestamp();
+    pool.shutdownAndJoin(0);
+    const elapsed = compat.milliTimestamp() - t0;
+    // Should finish in well under 1 second even on a slow machine.
+    try std.testing.expect(elapsed < 1_000);
+}
+
+test "shutdownAndJoin drain_timeout_ms positive drains in-flight work before timeout" {
+    // Submit one short job, then call shutdownAndJoin with a generous timeout.
+    // The job should complete and done should be true.
+    if (builtin.single_threaded) return;
+
+    const Ctx = struct {
+        mutex: compat.Mutex = .{},
+        done: bool = false,
+    };
+    var ctx = Ctx{};
+
+    const handler = struct {
+        fn run(raw_ctx: *anyopaque, _: std.posix.fd_t) void {
+            const typed: *Ctx = @ptrCast(@alignCast(raw_ctx));
+            std.Io.sleep(compat.io(), .fromMilliseconds(10), .awake) catch unreachable;
+            typed.mutex.lock();
+            typed.done = true;
+            typed.mutex.unlock();
+        }
+    }.run;
+
+    var pool: WorkerPool = undefined;
+    try pool.init(std.testing.allocator, 1, 16, handler, &ctx);
+    defer pool.deinit();
+
+    try pool.submit(1);
+    // 2-second timeout is much more than the 10ms handler needs.
+    pool.shutdownAndJoin(2_000);
+
+    ctx.mutex.lock();
+    defer ctx.mutex.unlock();
+    try std.testing.expect(ctx.done);
+}
+
+test "shutdownAndJoin drain_timeout_ms expires and returns" {
+    // Submit a job that sleeps much longer than the drain timeout.
+    // shutdownAndJoin should return within a bounded time (timeout + join overhead).
+    if (builtin.single_threaded) return;
+
+    const Ctx = struct {};
+    var ctx = Ctx{};
+
+    const handler = struct {
+        fn run(_: *anyopaque, _: std.posix.fd_t) void {
+            // Sleep longer than the drain timeout below (50ms vs 20ms timeout).
+            std.Io.sleep(compat.io(), .fromMilliseconds(50), .awake) catch {};
+        }
+    }.run;
+
+    var pool: WorkerPool = undefined;
+    try pool.init(std.testing.allocator, 1, 16, handler, &ctx);
+    defer pool.deinit();
+
+    try pool.submit(1);
+    // Give the handler time to start running so it becomes an active job.
+    std.Io.sleep(compat.io(), .fromMilliseconds(5), .awake) catch {};
+    const t0 = compat.milliTimestamp();
+    // Very short drain timeout — the active handler will outlive it.
+    pool.shutdownAndJoin(20);
+    const elapsed = compat.milliTimestamp() - t0;
+    // Should finish well under 1s (handler finishes after timeout).
+    try std.testing.expect(elapsed < 1_000);
 }

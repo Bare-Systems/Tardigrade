@@ -5,6 +5,7 @@ All notable user-facing changes to Tardigrade are documented here.
 ## [Unreleased]
 
 ### Added
+- Added `TARDIGRADE_SHUTDOWN_DRAIN_TIMEOUT_MS` config option (default 30 000 ms). On SIGTERM/SIGINT, tardigrade now waits up to this timeout for in-flight requests to finish before force-closing queued connections. Setting it to 0 reverts to immediate close behavior.
 - TLS 1.0 and 1.1 are now explicitly rejected at config validation; only TLS 1.2 and 1.3 are accepted.
 - Added `TARDIGRADE_HSTS_ENABLED`, `TARDIGRADE_HSTS_MAX_AGE`, `TARDIGRADE_HSTS_INCLUDE_SUBDOMAINS`, and `TARDIGRADE_HSTS_PRELOAD` config options. HSTS is emitted only on HTTPS responses and only when TLS is configured.
 - Enabled `TCP_NODELAY` on accepted connections to remove keep-alive latency spikes.

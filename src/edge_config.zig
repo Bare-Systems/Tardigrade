@@ -299,6 +299,10 @@ pub const EdgeConfig = struct {
     worker_cpu_affinity: []const u8,
     /// Maximum queued accepted connections waiting for workers.
     worker_queue_size: usize,
+    /// Graceful shutdown drain timeout in milliseconds (TARDIGRADE_SHUTDOWN_DRAIN_TIMEOUT_MS).
+    /// On shutdown signal, tardigrade waits up to this long for in-flight requests to complete
+    /// before force-closing any remaining queued connections. 0 force-closes immediately.
+    shutdown_drain_timeout_ms: u64,
     /// Desired soft file-descriptor limit (RLIMIT_NOFILE). 0 leaves OS default.
     fd_soft_limit: u64,
     /// Maximum active connections per client IP (0 = unlimited).
@@ -961,6 +965,7 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     const worker_queue_str = envOrDefault(allocator, "TARDIGRADE_WORKER_QUEUE_SIZE", "1024") catch unreachable;
     defer allocator.free(worker_queue_str);
     const worker_queue_size = std.fmt.parseInt(usize, worker_queue_str, 10) catch 1024;
+    const shutdown_drain_timeout_ms = parseIntEnv(u64, allocator, "TARDIGRADE_SHUTDOWN_DRAIN_TIMEOUT_MS", 30_000);
     const websocket_enabled = parseBoolEnv(allocator, "TARDIGRADE_WEBSOCKET_ENABLED", false);
     const websocket_idle_timeout_ms = parseIntEnv(u32, allocator, "TARDIGRADE_WEBSOCKET_IDLE_TIMEOUT_MS", 30_000);
     const websocket_max_frame_size = parseIntEnv(usize, allocator, "TARDIGRADE_WEBSOCKET_MAX_FRAME_SIZE", 64 * 1024);
@@ -1362,6 +1367,7 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .worker_recycle_seconds = worker_recycle_seconds,
         .worker_cpu_affinity = worker_cpu_affinity,
         .worker_queue_size = worker_queue_size,
+        .shutdown_drain_timeout_ms = shutdown_drain_timeout_ms,
         .fd_soft_limit = fd_soft_limit,
         .max_connections_per_ip = max_connections_per_ip,
         .max_active_connections = max_active_connections,

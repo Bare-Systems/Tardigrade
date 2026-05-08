@@ -323,6 +323,12 @@ pub const EdgeConfig = struct {
     proxy_stream_all_statuses: bool,
     /// Number of upstream attempt retries for proxy requests (minimum 1).
     upstream_retry_attempts: u32,
+    /// When true, retries are limited to idempotent HTTP methods (GET, HEAD, PUT, DELETE, OPTIONS, TRACE).
+    /// POST and PATCH are never retried when this is enabled (TARDIGRADE_UPSTREAM_RETRY_IDEMPOTENT_ONLY).
+    upstream_retry_idempotent_only: bool,
+    /// Connect timeout for upstream TCP connections in milliseconds (0 = no limit).
+    /// Applied independently of the per-attempt read/write timeout (TARDIGRADE_UPSTREAM_CONNECT_TIMEOUT_MS).
+    upstream_connect_timeout_ms: u32,
     /// Total timeout budget across all upstream attempts for a request (ms, 0 = disabled).
     upstream_timeout_budget_ms: u64,
     /// Passive health threshold: mark upstream as failed after this many failed attempts (0 = disabled).
@@ -1037,6 +1043,8 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     const retry_attempts_str = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_RETRY_ATTEMPTS", "1") catch unreachable;
     defer allocator.free(retry_attempts_str);
     const upstream_retry_attempts = @max(std.fmt.parseInt(u32, retry_attempts_str, 10) catch 1, 1);
+    const upstream_retry_idempotent_only = parseBoolEnv(allocator, "TARDIGRADE_UPSTREAM_RETRY_IDEMPOTENT_ONLY", true);
+    const upstream_connect_timeout_ms = parseIntEnv(u32, allocator, "TARDIGRADE_UPSTREAM_CONNECT_TIMEOUT_MS", 5_000);
 
     const timeout_budget_str = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_TIMEOUT_BUDGET_MS", "0") catch unreachable;
     defer allocator.free(timeout_budget_str);
@@ -1378,6 +1386,8 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .max_total_connection_memory_bytes = max_total_connection_memory_bytes,
         .proxy_stream_all_statuses = proxy_stream_all_statuses,
         .upstream_retry_attempts = upstream_retry_attempts,
+        .upstream_retry_idempotent_only = upstream_retry_idempotent_only,
+        .upstream_connect_timeout_ms = upstream_connect_timeout_ms,
         .upstream_timeout_budget_ms = upstream_timeout_budget_ms,
         .upstream_max_fails = upstream_max_fails,
         .upstream_fail_timeout_ms = upstream_fail_timeout_ms,

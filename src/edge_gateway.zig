@@ -2863,7 +2863,10 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         }
     }
     if (cfg.upstream_retry_attempts > 1) {
-        state.logger.info(null, "Upstream retry attempts configured: {d}", .{cfg.upstream_retry_attempts});
+        state.logger.info(null, "Upstream retry attempts configured: {d} (idempotent_only={})", .{ cfg.upstream_retry_attempts, cfg.upstream_retry_idempotent_only });
+    }
+    if (cfg.upstream_connect_timeout_ms > 0) {
+        state.logger.info(null, "Upstream connect timeout configured: {d}ms", .{cfg.upstream_connect_timeout_ms});
     }
     if (cfg.upstream_timeout_budget_ms > 0) {
         state.logger.info(null, "Upstream timeout budget configured: {d}ms", .{cfg.upstream_timeout_budget_ms});
@@ -4868,44 +4871,90 @@ fn handleLocationProxyPass(
     defer if (sticky_set_cookie) |cookie| allocator.free(cookie);
     const use_mtls_path = cfg.upstream_tls_client_cert.len > 0 and
         std.mem.startsWith(u8, upstream_url, "https://");
-    state.recordUpstreamAttemptStart(selection.base_url);
-    defer state.recordUpstreamAttemptEnd(selection.base_url);
-    var upstream_response = if (use_mtls_path)
-        try executeUpstreamHttpsWithMtls(
-            allocator,
-            upstream_url,
-            request.method.toString(),
-            &request.headers,
-            body,
-            correlation_id,
-            client_ip,
-            if (edge_config.hasTlsFiles(cfg)) "https" else "http",
-            request.headers.get("host"),
-            auth_identity,
-            auth_user_id,
-            auth_device_id,
-            auth_scopes,
-            cfg,
-        )
-    else
-        try executeRawHttpProxyRequest(
-            allocator,
-            &state.upstream_client,
-            upstream_url,
-            resolved.unix_socket_path,
-            request.method.toString(),
-            &request.headers,
-            body,
-            correlation_id,
-            client_ip,
-            if (edge_config.hasTlsFiles(cfg)) "https" else "http",
-            request.headers.get("host"),
-            auth_identity,
-            auth_user_id,
-            auth_device_id,
-            auth_scopes,
-        );
+    const forwarded_proto = if (edge_config.hasTlsFiles(cfg)) "https" else "http";
+    const method_str = request.method.toString();
+
+    // Determine retry budget. Non-idempotent methods are not retried when the
+    // idempotent-only guard is enabled (default on).
+    const max_attempts: usize = blk: {
+        const n: usize = @intCast(@max(cfg.upstream_retry_attempts, @as(u32, 1)));
+        if (n <= 1) break :blk 1;
+        if (cfg.upstream_retry_idempotent_only and !isHttpMethodIdempotent(method_str)) break :blk 1;
+        break :blk n;
+    };
+    const budget_start_ms = http.event_loop.monotonicMs();
+
+    var attempt: usize = 0;
+    var upstream_response: RawUpstreamResponse = while (attempt < max_attempts) : (attempt += 1) {
+        const per_attempt_timeout_ms: u32 = blk: {
+            if (cfg.upstream_timeout_budget_ms == 0) break :blk cfg.upstream_timeout_ms;
+            const elapsed_ms = http.event_loop.monotonicMs() - budget_start_ms;
+            if (elapsed_ms >= cfg.upstream_timeout_budget_ms) return error.Timeout;
+            const remaining = cfg.upstream_timeout_budget_ms - elapsed_ms;
+            if (cfg.upstream_timeout_ms == 0) {
+                break :blk @intCast(@min(remaining, @as(u64, std.math.maxInt(u32))));
+            }
+            break :blk @intCast(@min(@as(u64, cfg.upstream_timeout_ms), remaining));
+        };
+        state.recordUpstreamAttemptStart(selection.base_url);
+        const resp = if (use_mtls_path)
+            executeUpstreamHttpsWithMtls(
+                allocator,
+                upstream_url,
+                method_str,
+                &request.headers,
+                body,
+                correlation_id,
+                client_ip,
+                forwarded_proto,
+                request.headers.get("host"),
+                auth_identity,
+                auth_user_id,
+                auth_device_id,
+                auth_scopes,
+                cfg,
+            )
+        else
+            executeRawHttpProxyRequest(
+                allocator,
+                &state.upstream_client,
+                upstream_url,
+                resolved.unix_socket_path,
+                method_str,
+                &request.headers,
+                body,
+                correlation_id,
+                client_ip,
+                forwarded_proto,
+                request.headers.get("host"),
+                auth_identity,
+                auth_user_id,
+                auth_device_id,
+                auth_scopes,
+                per_attempt_timeout_ms,
+                cfg.upstream_connect_timeout_ms,
+            );
+        state.recordUpstreamAttemptEnd(selection.base_url);
+        const result = resp catch |err| {
+            state.recordUpstreamFailure(cfg, selection.base_url);
+            if (attempt + 1 < max_attempts) {
+                state.logger.warn(correlation_id, "proxy attempt {d}/{d} failed: {}", .{ attempt + 1, max_attempts, err });
+                continue;
+            }
+            return err;
+        };
+        // Retry on 5xx only when attempts remain and the method allows it.
+        if (result.status_code >= 500 and attempt + 1 < max_attempts) {
+            state.recordUpstreamFailure(cfg, selection.base_url);
+            state.logger.warn(correlation_id, "proxy attempt {d}/{d} got {d}, retrying", .{ attempt + 1, max_attempts, result.status_code });
+            var r = result;
+            r.deinit(allocator);
+            continue;
+        }
+        break result;
+    } else return error.UpstreamUnavailable;
     defer upstream_response.deinit(allocator);
+
     const transcript_redactions: []const []const u8 = if (request.headers.get("authorization")) |raw_auth|
         if (http.auth.parseBearerToken(raw_auth)) |token| &.{token} else &.{}
     else
@@ -4986,6 +5035,8 @@ fn executeRawHttpProxyRequest(
     auth_user_id: ?[]const u8,
     auth_device_id: ?[]const u8,
     auth_scopes: ?[]const u8,
+    attempt_timeout_ms: u32,
+    connect_timeout_ms: u32,
 ) !RawUpstreamResponse {
     const method_enum = std.meta.stringToEnum(std.http.Method, method) orelse return error.UnsupportedHttpMethod;
     const uri = try std.Uri.parse(url);
@@ -5030,6 +5081,18 @@ fn executeRawHttpProxyRequest(
         .redirect_behavior = .unhandled,
     });
     defer req.deinit();
+
+    // Apply per-attempt socket timeouts now that the connection is established.
+    if (req.connection) |conn| {
+        const fd = conn.stream_reader.stream.socket.handle;
+        if (attempt_timeout_ms > 0) {
+            setSocketTimeoutMs(fd, attempt_timeout_ms, attempt_timeout_ms) catch {};
+        } else if (connect_timeout_ms > 0) {
+            // No per-attempt timeout configured; at least enforce the connect
+            // timeout as a send timeout to prevent unbounded sends.
+            setSocketTimeoutMs(fd, connect_timeout_ms, connect_timeout_ms) catch {};
+        }
+    }
 
     if (body.len > 0) {
         try req.sendBodyComplete(@constCast(body));
@@ -7018,6 +7081,8 @@ fn handleHttp3LocationProxyPass(
             null,
             null,
             null,
+            ctx.cfg.upstream_timeout_ms,
+            ctx.cfg.upstream_connect_timeout_ms,
         );
     defer upstream_response.deinit(allocator);
 
@@ -8162,8 +8227,9 @@ fn proxyJsonExecute(
     sticky_affinity: ?*const StickyAffinityRequest,
 ) !ProxyExecution {
     const upstream_pool = upstreamPoolForScope(cfg, upstream_scope);
+    // JSON proxy always POSTs; respect the idempotent-only guard.
     const configured_attempts: usize = @intCast(@max(cfg.upstream_retry_attempts, @as(u32, 1)));
-    const max_attempts = configured_attempts;
+    const max_attempts: usize = if (cfg.upstream_retry_idempotent_only) 1 else configured_attempts;
     const start_ms = http.event_loop.monotonicMs();
     const upstream_hash_key = if (payload.len > 0) payload else (suffix_path orelse proxy_pass_target);
 
@@ -9081,6 +9147,24 @@ fn parseContentLength(headers: []const u8) ?usize {
     return null;
 }
 
+/// Returns true for HTTP methods that are safe to retry on failure without
+/// risk of double-applying a non-idempotent side effect (RFC 9110 §9.2).
+/// GET, HEAD, PUT, DELETE, OPTIONS, and TRACE are idempotent.
+/// POST and PATCH are not and must not be retried unless the operator
+/// explicitly disables the idempotent-only guard.
+pub fn isHttpMethodIdempotent(method: []const u8) bool {
+    const upper = std.ascii.upperString;
+    var buf: [16]u8 = undefined;
+    if (method.len > buf.len) return false;
+    const m = upper(buf[0..method.len], method);
+    return std.mem.eql(u8, m, "GET") or
+        std.mem.eql(u8, m, "HEAD") or
+        std.mem.eql(u8, m, "PUT") or
+        std.mem.eql(u8, m, "DELETE") or
+        std.mem.eql(u8, m, "OPTIONS") or
+        std.mem.eql(u8, m, "TRACE");
+}
+
 fn setSocketTimeoutMs(fd: std.posix.fd_t, recv_timeout_ms: u32, send_timeout_ms: u32) !void {
     const recv_tv = std.posix.timeval{
         .sec = @intCast(recv_timeout_ms / 1000),
@@ -9492,4 +9576,62 @@ test "parseApprovalRequestBody parses command scoped request" {
     try std.testing.expectEqualStrings("/api/tasks", req.path);
     try std.testing.expect(req.command_id != null);
     try std.testing.expectEqualStrings("cmd-123", req.command_id.?);
+}
+
+test "isHttpMethodIdempotent classifies idempotent methods" {
+    // Idempotent methods (RFC 9110 §9.2)
+    try std.testing.expect(isHttpMethodIdempotent("GET"));
+    try std.testing.expect(isHttpMethodIdempotent("HEAD"));
+    try std.testing.expect(isHttpMethodIdempotent("PUT"));
+    try std.testing.expect(isHttpMethodIdempotent("DELETE"));
+    try std.testing.expect(isHttpMethodIdempotent("OPTIONS"));
+    try std.testing.expect(isHttpMethodIdempotent("TRACE"));
+    // Case-insensitive
+    try std.testing.expect(isHttpMethodIdempotent("get"));
+    try std.testing.expect(isHttpMethodIdempotent("Get"));
+    try std.testing.expect(isHttpMethodIdempotent("delete"));
+}
+
+test "isHttpMethodIdempotent rejects non-idempotent methods" {
+    try std.testing.expect(!isHttpMethodIdempotent("POST"));
+    try std.testing.expect(!isHttpMethodIdempotent("PATCH"));
+    try std.testing.expect(!isHttpMethodIdempotent("post"));
+    try std.testing.expect(!isHttpMethodIdempotent(""));
+    // Oversized input should not crash
+    try std.testing.expect(!isHttpMethodIdempotent("VERYLONGMETHODNAME"));
+}
+
+test "upstream_retry_idempotent_only default true limits POST retries to 1" {
+    // When idempotent_only is true and method is POST, max_attempts must be 1
+    // regardless of upstream_retry_attempts.
+    const attempts: u32 = 3;
+    const idempotent_only = true;
+    const method = "POST";
+    const max: usize = if (idempotent_only and !isHttpMethodIdempotent(method))
+        1
+    else
+        @intCast(@max(attempts, @as(u32, 1)));
+    try std.testing.expectEqual(@as(usize, 1), max);
+}
+
+test "upstream_retry_idempotent_only allows GET retries" {
+    const attempts: u32 = 3;
+    const idempotent_only = true;
+    const method = "GET";
+    const max: usize = if (idempotent_only and !isHttpMethodIdempotent(method))
+        1
+    else
+        @intCast(@max(attempts, @as(u32, 1)));
+    try std.testing.expectEqual(@as(usize, 3), max);
+}
+
+test "upstream_retry_idempotent_only=false allows POST retries" {
+    const attempts: u32 = 3;
+    const idempotent_only = false;
+    const method = "POST";
+    const max: usize = if (idempotent_only and !isHttpMethodIdempotent(method))
+        1
+    else
+        @intCast(@max(attempts, @as(u32, 1)));
+    try std.testing.expectEqual(@as(usize, 3), max);
 }

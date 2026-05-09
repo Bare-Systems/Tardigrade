@@ -23,6 +23,38 @@ zig build test
 zig build test-integration
 ```
 
+## compat.io() Migration Pattern
+
+`src/zig_compat.zig` exposes a global `compat.io()` helper as a migration bridge
+over the Zig 0.16 `std.Io` runtime.  Long-term, runtime/server modules should
+receive `std.Io` explicitly rather than reaching through the global singleton.
+
+**Pattern** (demonstrated in `src/http/autoindex.zig`, issue #79):
+
+```zig
+// Before: global singleton
+pub fn doWork(allocator: std.mem.Allocator, ...) !void {
+    var dir = std.Io.Dir.cwd().openDir(compat.io(), path, .{});
+}
+
+// After: explicit injection
+pub fn doWork(io: std.Io, allocator: std.mem.Allocator, ...) !void {
+    var dir = std.Io.Dir.cwd().openDir(io, path, .{});
+}
+```
+
+At call sites that have not yet been migrated, pass `compat.io()` as the `io`
+argument.  Migrate modules one at a time; avoid broad rewrites across unrelated
+modules.
+
+**Modules still using global `compat.io()`** (as of v0.62):
+`main.zig`, `edge_gateway.zig`, `tls_termination.zig`, `session_store_file.zig`,
+`approval_store.zig`, `worker_pool.zig`, `config_file.zig`, `acme_client.zig`,
+`http3_runtime.zig`, `edge_config.zig`, `static_file.zig`, `access_log.zig`,
+`dns_discovery.zig`, `secrets.zig`.
+
+---
+
 ## Zig 0.16 Performance Characteristics
 
 Summary of performance evaluation performed for issue #73.

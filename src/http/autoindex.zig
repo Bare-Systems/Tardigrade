@@ -1,12 +1,14 @@
 const std = @import("std");
-const compat = @import("../zig_compat.zig");
 
 pub const DirItem = struct {
     name: []const u8,
     is_dir: bool,
 };
 
-pub fn generateAutoIndex(allocator: std.mem.Allocator, dirPath: []const u8, uriPath: []const u8) ![]u8 {
+/// Generate an HTML directory listing for `dirPath` at URI `uriPath`.
+/// `io` is passed explicitly so the caller controls I/O context; use
+/// `io` at the call site until callers are fully migrated.
+pub fn generateAutoIndex(io: std.Io, allocator: std.mem.Allocator, dirPath: []const u8, uriPath: []const u8) ![]u8 {
     var out = std.ArrayList(u8).empty;
     defer out.deinit(allocator);
 
@@ -18,17 +20,17 @@ pub fn generateAutoIndex(allocator: std.mem.Allocator, dirPath: []const u8, uriP
     for (uriPath) |b| try out.append(allocator, b);
     for ("</h1><hr><pre>\n") |b| try out.append(allocator, b);
 
-    var dir = std.Io.Dir.cwd().openDir(compat.io(), dirPath, .{}) catch |err| {
+    var dir = std.Io.Dir.cwd().openDir(io, dirPath, .{}) catch |err| {
         return err;
     };
-    defer dir.close(compat.io());
+    defer dir.close(io);
 
     var items = std.ArrayList(DirItem).empty;
     defer items.deinit(allocator);
 
     var it = dir.iterate();
     while (true) {
-        const entry = try it.next(compat.io());
+        const entry = try it.next(io);
         if (entry == null) break;
         const e = entry.?;
         if (e.name.len == 0) continue;

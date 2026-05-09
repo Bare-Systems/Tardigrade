@@ -188,7 +188,7 @@ pub fn serve(allocator: std.mem.Allocator, opts: Options) !?Result {
         },
         .directory => |dir_path| {
             if (!opts.autoindex) return null;
-            const listing = try autoindex.generateAutoIndex(allocator, dir_path, opts.request_path);
+            const listing = try autoindex.generateAutoIndex(compat.io(), allocator, dir_path, opts.request_path);
             return .{
                 .status_code = .ok,
                 .body = listing,

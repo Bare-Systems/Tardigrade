@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const integration_options = @import("integration_options");
+const compat = @import("zig_compat");
 
 const test_host = "127.0.0.1";
 const valid_bearer_token = "integration-token";
@@ -12,6 +13,15 @@ const http3_osslclient_bin_path = integration_options.http3_osslclient_bin_path;
 const expected_server_header = "tardigrade/0.4.1";
 const http3_retry_attempts: usize = 20;
 const http3_retry_delay_ms: u64 = 250;
+
+fn inheritedEnvMap(allocator: std.mem.Allocator) !std.process.Environ.Map {
+    const c_environ = std.c.environ;
+    var env_count: usize = 0;
+    while (c_environ[env_count] != null) : (env_count += 1) {}
+    return std.process.Environ.createMap(.{
+        .block = .{ .slice = c_environ[0..env_count :null] },
+    }, allocator);
+}
 
 const EnvPair = struct {
     name: []const u8,
@@ -127,22 +137,22 @@ const WebSocketFrame = struct {
 };
 
 const WebSocketClient = struct {
-    stream: std.net.Stream,
+    stream: compat.NetStream,
 
     fn connect(allocator: std.mem.Allocator, port: u16, path: []const u8, headers: []const RequestHeader) !WebSocketClient {
-        const address = try std.net.Address.parseIp(test_host, port);
-        var stream = try std.net.tcpConnectToAddress(address);
+        var stream = try compat.tcpConnectToHost(allocator, test_host, port);
         errdefer stream.close();
         try setStreamTimeouts(&stream, 5_000);
 
-        var request = std.ArrayList(u8).init(allocator);
+        var request = std.array_list.Managed(u8).init(allocator);
         defer request.deinit();
-        try request.writer().print(
+        try request.print(
+            allocator,
             "GET {s} HTTP/1.1\r\nHost: {s}:{d}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n",
             .{ path, test_host, port },
         );
         for (headers) |header| {
-            try request.writer().print("{s}: {s}\r\n", .{ header.name, header.value });
+            try request.print("{s}: {s}\r\n", .{ header.name, header.value });
         }
         try request.appendSlice("\r\n");
         try stream.writeAll(request.items);
@@ -197,8 +207,8 @@ const RequestCapture = struct {
     body: []u8,
     correlation_id: []u8,
     headers_raw: []u8,
-    path_history: std.ArrayList([]u8),
-    body_history: std.ArrayList([]u8),
+    path_history: std.array_list.Managed([]u8),
+    body_history: std.array_list.Managed([]u8),
     request_count: u32,
 
     fn init(allocator: std.mem.Allocator) !RequestCapture {
@@ -209,8 +219,8 @@ const RequestCapture = struct {
             .body = try allocator.dupe(u8, ""),
             .correlation_id = try allocator.dupe(u8, ""),
             .headers_raw = try allocator.dupe(u8, ""),
-            .path_history = std.ArrayList([]u8).init(allocator),
-            .body_history = std.ArrayList([]u8).init(allocator),
+            .path_history = std.array_list.Managed([]u8).init(allocator),
+            .body_history = std.array_list.Managed([]u8).init(allocator),
             .request_count = 0,
         };
     }
@@ -377,17 +387,16 @@ const RawTcpCapture = struct {
 
 const UpstreamServer = struct {
     allocator: std.mem.Allocator,
-    server: std.net.Server,
+    server: compat.NetServer,
     thread: ?std.Thread,
     stop_flag: std.atomic.Value(bool),
-    mutex: std.Thread.Mutex = .{},
+    mutex: compat.Mutex = .{},
     capture: RequestCapture,
     responses: []const UpstreamResponseSpec,
     next_response_index: usize,
 
     fn start(allocator: std.mem.Allocator, responses: []const UpstreamResponseSpec) !UpstreamServer {
-        const address = try std.net.Address.parseIp(test_host, 0);
-        const server = try std.net.Address.listen(address, .{ .reuse_address = true });
+        const server = try compat.listenTcp(test_host, 0);
         return .{
             .allocator = allocator,
             .server = server,
@@ -400,7 +409,7 @@ const UpstreamServer = struct {
     }
 
     fn port(self: *const UpstreamServer) u16 {
-        return self.server.listen_address.getPort();
+        return self.server.port();
     }
 
     fn run(self: *UpstreamServer) !void {
@@ -456,18 +465,17 @@ const UpstreamServer = struct {
 
 const FastCgiServer = struct {
     allocator: std.mem.Allocator,
-    server: std.net.Server,
+    server: compat.NetServer,
     thread: ?std.Thread,
     stop_flag: std.atomic.Value(bool),
-    mutex: std.Thread.Mutex = .{},
+    mutex: compat.Mutex = .{},
     capture: FastCgiCapture,
     responses: []const FastCgiResponseSpec,
     next_response_index: usize,
     accepted_connections: u32,
 
     fn start(allocator: std.mem.Allocator, responses: []const FastCgiResponseSpec) !FastCgiServer {
-        const address = try std.net.Address.parseIp(test_host, 0);
-        const server = try std.net.Address.listen(address, .{ .reuse_address = true });
+        const server = try compat.listenTcp(test_host, 0);
         return .{
             .allocator = allocator,
             .server = server,
@@ -481,7 +489,7 @@ const FastCgiServer = struct {
     }
 
     fn port(self: *const FastCgiServer) u16 {
-        return self.server.listen_address.getPort();
+        return self.server.port();
     }
 
     fn run(self: *FastCgiServer) !void {
@@ -500,17 +508,16 @@ const FastCgiServer = struct {
 
 const ScgiServer = struct {
     allocator: std.mem.Allocator,
-    server: std.net.Server,
+    server: compat.NetServer,
     thread: ?std.Thread,
     stop_flag: std.atomic.Value(bool),
-    mutex: std.Thread.Mutex = .{},
+    mutex: compat.Mutex = .{},
     capture: ScgiCapture,
     responses: []const ScgiResponseSpec,
     next_response_index: usize,
 
     fn start(allocator: std.mem.Allocator, responses: []const ScgiResponseSpec) !ScgiServer {
-        const address = try std.net.Address.parseIp(test_host, 0);
-        const server = try std.net.Address.listen(address, .{ .reuse_address = true });
+        const server = try compat.listenTcp(test_host, 0);
         return .{
             .allocator = allocator,
             .server = server,
@@ -523,7 +530,7 @@ const ScgiServer = struct {
     }
 
     fn port(self: *const ScgiServer) u16 {
-        return self.server.listen_address.getPort();
+        return self.server.port();
     }
 
     fn run(self: *ScgiServer) !void {
@@ -542,17 +549,16 @@ const ScgiServer = struct {
 
 const UwsgiServer = struct {
     allocator: std.mem.Allocator,
-    server: std.net.Server,
+    server: compat.NetServer,
     thread: ?std.Thread,
     stop_flag: std.atomic.Value(bool),
-    mutex: std.Thread.Mutex = .{},
+    mutex: compat.Mutex = .{},
     capture: UwsgiCapture,
     responses: []const UwsgiResponseSpec,
     next_response_index: usize,
 
     fn start(allocator: std.mem.Allocator, responses: []const UwsgiResponseSpec) !UwsgiServer {
-        const address = try std.net.Address.parseIp(test_host, 0);
-        const server = try std.net.Address.listen(address, .{ .reuse_address = true });
+        const server = try compat.listenTcp(test_host, 0);
         return .{
             .allocator = allocator,
             .server = server,
@@ -565,7 +571,7 @@ const UwsgiServer = struct {
     }
 
     fn port(self: *const UwsgiServer) u16 {
-        return self.server.listen_address.getPort();
+        return self.server.port();
     }
 
     fn run(self: *UwsgiServer) !void {
@@ -584,16 +590,15 @@ const UwsgiServer = struct {
 
 const RawTcpServer = struct {
     allocator: std.mem.Allocator,
-    server: std.net.Server,
+    server: compat.NetServer,
     thread: ?std.Thread,
     stop_flag: std.atomic.Value(bool),
-    mutex: std.Thread.Mutex = .{},
+    mutex: compat.Mutex = .{},
     capture: RawTcpCapture,
     response: []const u8,
 
     fn start(allocator: std.mem.Allocator, response: []const u8) !RawTcpServer {
-        const address = try std.net.Address.parseIp(test_host, 0);
-        const server = try std.net.Address.listen(address, .{ .reuse_address = true });
+        const server = try compat.listenTcp(test_host, 0);
         return .{
             .allocator = allocator,
             .server = server,
@@ -605,7 +610,7 @@ const RawTcpServer = struct {
     }
 
     fn port(self: *const RawTcpServer) u16 {
-        return self.server.listen_address.getPort();
+        return self.server.port();
     }
 
     fn run(self: *RawTcpServer) !void {
@@ -634,12 +639,12 @@ const StartTlsSmtpProcess = struct {
 
     fn start(allocator: std.mem.Allocator) !StartTlsSmtpProcess {
         const port = try findFreePort();
-        const unique = std.time.milliTimestamp();
+        const unique = compat.milliTimestamp();
         const dir_rel = try std.fmt.allocPrint(allocator, ".zig-cache/starttls-smtp-{d}-{d}", .{ port, unique });
         errdefer allocator.free(dir_rel);
-        try std.fs.cwd().makePath(dir_rel);
+        try compat.cwd().makePath(dir_rel);
 
-        const cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+        const cwd = try compat.cwd().realpathAlloc(allocator, ".");
         defer allocator.free(cwd);
         const dir_abs = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ cwd, dir_rel });
         defer allocator.free(dir_abs);
@@ -712,17 +717,18 @@ const StartTlsSmtpProcess = struct {
         , .{ port, plain_capture_path, tls_capture_path, debug_log_path, cert_path, key_path });
         defer allocator.free(script);
         {
-            var file = try std.fs.createFileAbsolute(script_path, .{});
+            var file = try compat.createFileAbsolute(script_path, .{});
             defer file.close();
             try file.writeAll(script);
         }
 
         var argv = [_][]const u8{ "python3", script_path };
-        var child = std.process.Child.init(&argv, allocator);
-        child.stdin_behavior = .Ignore;
-        child.stdout_behavior = .Pipe;
-        child.stderr_behavior = .Ignore;
-        try child.spawn();
+        const child = try std.process.spawn(compat.io(), .{
+            .argv = &argv,
+            .stdin = .ignore,
+            .stdout = .pipe,
+            .stderr = .ignore,
+        });
 
         var proc = StartTlsSmtpProcess{
             .allocator = allocator,
@@ -740,8 +746,7 @@ const StartTlsSmtpProcess = struct {
     }
 
     fn stop(self: *StartTlsSmtpProcess) void {
-        _ = self.child.kill() catch {};
-        _ = self.child.wait() catch {};
+        self.child.kill(compat.io());
         // Keep the temp tree on disk until the SMTP STARTTLS integration path is stable.
         self.allocator.free(self.dir_rel);
         self.allocator.free(self.script_path);
@@ -756,13 +761,13 @@ const StartTlsSmtpProcess = struct {
     }
 
     fn plainCapture(self: *StartTlsSmtpProcess) ![]u8 {
-        var file = try std.fs.openFileAbsolute(self.plain_capture_path, .{});
+        var file = try compat.openFileAbsolute(self.plain_capture_path, .{});
         defer file.close();
         return try file.readToEndAlloc(self.allocator, 1024 * 1024);
     }
 
     fn tlsCapture(self: *StartTlsSmtpProcess) ![]u8 {
-        var file = try std.fs.openFileAbsolute(self.tls_capture_path, .{});
+        var file = try compat.openFileAbsolute(self.tls_capture_path, .{});
         defer file.close();
         return try file.readToEndAlloc(self.allocator, 1024 * 1024);
     }
@@ -778,17 +783,13 @@ const TardigradeProcess = struct {
 
     fn start(allocator: std.mem.Allocator, options: TardigradeOptions) !TardigradeProcess {
         const port = try findFreePort();
-        const cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+        const cwd = try compat.cwd().realpathAlloc(allocator, ".");
         defer allocator.free(cwd);
         const log_path = try std.fmt.allocPrint(allocator, "{s}/.zig-cache/tardigrade-integration-{d}.log", .{ cwd, port });
 
         var argv = [_][]const u8{integration_options.tardigrade_bin_path};
-        var child = std.process.Child.init(&argv, allocator);
-        child.stdin_behavior = .Ignore;
-        child.stdout_behavior = .Ignore;
-        child.stderr_behavior = .Ignore;
 
-        var env_map = try std.process.getEnvMap(allocator);
+        var env_map = try inheritedEnvMap(allocator);
         defer env_map.deinit();
 
         const port_str = try std.fmt.allocPrint(allocator, "{d}", .{port});
@@ -835,25 +836,25 @@ const TardigradeProcess = struct {
         if (options.config_text) |config_text| {
             if (use_bearclaw_fixture and config_path != null) {
                 const cfg_path = config_path.?;
-                const base_config = try std.fs.cwd().readFileAlloc(allocator, cfg_path, 512 * 1024);
+                const base_config = try compat.cwd().readFileAlloc(allocator, cfg_path, 512 * 1024);
                 defer allocator.free(base_config);
                 const merged_config = try std.fmt.allocPrint(allocator, "{s}\n\n{s}\n", .{ base_config, config_text });
                 defer allocator.free(merged_config);
-                try std.fs.cwd().writeFile(.{ .sub_path = cfg_path, .data = merged_config });
+                try compat.cwd().writeFile(.{ .sub_path = cfg_path, .data = merged_config });
             } else {
                 if (fixture_dir_rel) |dir_rel| {
-                    std.fs.cwd().deleteTree(dir_rel) catch {};
+                    compat.cwd().deleteTree(dir_rel) catch {};
                     allocator.free(dir_rel);
                     fixture_dir_rel = null;
                 }
                 if (config_path) |existing| {
-                    std.fs.cwd().deleteFile(existing) catch {};
+                    compat.cwd().deleteFile(existing) catch {};
                     allocator.free(existing);
                     config_path = null;
                 }
                 const cfg_path = try std.fmt.allocPrint(allocator, ".zig-cache/tardigrade-config-{d}.conf", .{port});
                 errdefer allocator.free(cfg_path);
-                try std.fs.cwd().writeFile(.{ .sub_path = cfg_path, .data = config_text });
+                try compat.cwd().writeFile(.{ .sub_path = cfg_path, .data = config_text });
                 try env_map.put("TARDIGRADE_CONFIG_PATH", cfg_path);
                 config_path = cfg_path;
             }
@@ -862,8 +863,13 @@ const TardigradeProcess = struct {
             try env_map.put(pair.name, pair.value);
         }
 
-        child.env_map = &env_map;
-        try child.spawn();
+        const child = try std.process.spawn(compat.io(), .{
+            .argv = &argv,
+            .environ_map = &env_map,
+            .stdin = .ignore,
+            .stdout = .ignore,
+            .stderr = .ignore,
+        });
 
         var proc = TardigradeProcess{
             .allocator = allocator,
@@ -879,27 +885,26 @@ const TardigradeProcess = struct {
     }
 
     fn stop(self: *TardigradeProcess) void {
-        _ = self.child.kill() catch {};
-        _ = self.child.wait() catch {};
+        self.child.kill(compat.io());
         self.allocator.free(self.log_path);
         if (self.config_path) |path| {
-            std.fs.cwd().deleteFile(path) catch {};
+            compat.cwd().deleteFile(path) catch {};
             self.allocator.free(path);
         }
         if (self.fixture_dir_rel) |path| {
-            std.fs.cwd().deleteTree(path) catch {};
+            compat.cwd().deleteTree(path) catch {};
             self.allocator.free(path);
         }
         self.* = undefined;
     }
 
-    fn sendSignal(self: *TardigradeProcess, sig: u8) void {
-        std.posix.kill(self.child.id, sig) catch {};
+    fn sendSignal(self: *TardigradeProcess, sig: std.posix.SIG) void {
+        std.posix.kill(self.child.id orelse return, sig) catch {};
     }
 
     fn rewriteConfig(self: *const TardigradeProcess, text: []const u8) !void {
         const path = self.config_path orelse return error.MissingConfigPath;
-        try std.fs.cwd().writeFile(.{ .sub_path = path, .data = text });
+        try compat.cwd().writeFile(.{ .sub_path = path, .data = text });
     }
 };
 
@@ -913,7 +918,7 @@ fn prepareBearClawFixture(
     cwd: []const u8,
     port: u16,
     options: TardigradeOptions,
-    env_map: *std.process.EnvMap,
+    env_map: *std.process.Environ.Map,
 ) !PreparedBearClawFixture {
     const fixture_tls_enabled = blk: {
         if (options.ready_https_insecure or options.ready_client_cert != null or options.ready_client_key != null) {
@@ -932,8 +937,8 @@ fn prepareBearClawFixture(
 
     const fixture_dir_rel = try std.fmt.allocPrint(allocator, ".zig-cache/bearclaw-fixture-{d}", .{port});
     errdefer allocator.free(fixture_dir_rel);
-    try std.fs.cwd().makePath(fixture_dir_rel);
-    errdefer std.fs.cwd().deleteTree(fixture_dir_rel) catch {};
+    try compat.cwd().makePath(fixture_dir_rel);
+    errdefer compat.cwd().deleteTree(fixture_dir_rel) catch {};
 
     const fixture_dir_abs = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ cwd, fixture_dir_rel });
     defer allocator.free(fixture_dir_abs);
@@ -941,11 +946,11 @@ fn prepareBearClawFixture(
     defer allocator.free(public_dir_abs);
     const public_dir_rel = try std.fmt.allocPrint(allocator, "{s}/public", .{fixture_dir_rel});
     defer allocator.free(public_dir_rel);
-    try std.fs.cwd().makePath(public_dir_rel);
+    try compat.cwd().makePath(public_dir_rel);
 
     const index_rel = try std.fmt.allocPrint(allocator, "{s}/public/index.html", .{fixture_dir_rel});
     defer allocator.free(index_rel);
-    try std.fs.cwd().writeFile(.{
+    try compat.cwd().writeFile(.{
         .sub_path = index_rel,
         .data = "<!doctype html><html><body>bearclaw fixture</body></html>\n",
     });
@@ -959,19 +964,19 @@ fn prepareBearClawFixture(
     const transcript_store_abs = try std.fmt.allocPrint(allocator, "{s}/transcripts.ndjson", .{fixture_dir_abs});
     defer allocator.free(transcript_store_abs);
     {
-        var device_file = try std.fs.createFileAbsolute(device_registry_abs, .{ .truncate = true });
+        var device_file = try compat.createFileAbsolute(device_registry_abs, .{ .truncate = true });
         device_file.close();
     }
     {
-        var session_file = try std.fs.createFileAbsolute(session_store_abs, .{ .truncate = true });
+        var session_file = try compat.createFileAbsolute(session_store_abs, .{ .truncate = true });
         session_file.close();
     }
     {
-        var approval_file = try std.fs.createFileAbsolute(approval_store_abs, .{ .truncate = true });
+        var approval_file = try compat.createFileAbsolute(approval_store_abs, .{ .truncate = true });
         approval_file.close();
     }
     {
-        var transcript_file = try std.fs.createFileAbsolute(transcript_store_abs, .{ .truncate = true });
+        var transcript_file = try compat.createFileAbsolute(transcript_store_abs, .{ .truncate = true });
         transcript_file.close();
     }
 
@@ -984,7 +989,7 @@ fn prepareBearClawFixture(
     const key_line = try std.fmt.allocPrint(allocator, "tls_key_path {s};\n", .{server_key_abs});
     defer allocator.free(key_line);
 
-    const config_template = try std.fs.cwd().readFileAlloc(allocator, "examples/bearclaw/tardigrade.conf", 256 * 1024);
+    const config_template = try compat.cwd().readFileAlloc(allocator, "examples/bearclaw/tardigrade.conf", 256 * 1024);
     defer allocator.free(config_template);
     const config_text = try std.mem.replaceOwned(u8, allocator, config_template, "/srv/bearclaw/public", public_dir_abs);
     defer allocator.free(config_text);
@@ -1005,14 +1010,14 @@ fn prepareBearClawFixture(
 
     const config_path = try std.fmt.allocPrint(allocator, "{s}/tardigrade.conf", .{fixture_dir_rel});
     errdefer {
-        std.fs.cwd().deleteFile(config_path) catch {};
+        compat.cwd().deleteFile(config_path) catch {};
         allocator.free(config_path);
     }
-    try std.fs.cwd().writeFile(.{ .sub_path = config_path, .data = final_config_text });
+    try compat.cwd().writeFile(.{ .sub_path = config_path, .data = final_config_text });
     allocator.free(final_config_text);
     try env_map.put("TARDIGRADE_CONFIG_PATH", config_path);
 
-    const env_template = try std.fs.cwd().readFileAlloc(allocator, "examples/bearclaw/tardigrade.env.example", 256 * 1024);
+    const env_template = try compat.cwd().readFileAlloc(allocator, "examples/bearclaw/tardigrade.env.example", 256 * 1024);
     defer allocator.free(env_template);
     var lines = std.mem.splitScalar(u8, env_template, '\n');
     while (lines.next()) |line_raw| {
@@ -1030,8 +1035,8 @@ fn prepareBearClawFixture(
         try env_map.put("TARDIGRADE_TLS_CERT_PATH", server_cert_abs);
         try env_map.put("TARDIGRADE_TLS_KEY_PATH", server_key_abs);
     } else {
-        _ = env_map.remove("TARDIGRADE_TLS_CERT_PATH");
-        _ = env_map.remove("TARDIGRADE_TLS_KEY_PATH");
+        _ = env_map.swapRemove("TARDIGRADE_TLS_CERT_PATH");
+        _ = env_map.swapRemove("TARDIGRADE_TLS_KEY_PATH");
     }
     try env_map.put("TARDIGRADE_DEVICE_REGISTRY_PATH", device_registry_abs);
     try env_map.put("TARDIGRADE_SESSION_STORE_PATH", session_store_abs);
@@ -1062,13 +1067,13 @@ const PhpFpmProcess = struct {
 
     fn start(allocator: std.mem.Allocator) !PhpFpmProcess {
         const binary = findPhpFpmBinary() orelse return error.SkipZigTest;
-        const cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+        const cwd = try compat.cwd().realpathAlloc(allocator, ".");
         defer allocator.free(cwd);
 
-        const unique = std.time.nanoTimestamp();
+        const unique = compat.nanoTimestamp();
         const dir_rel = try std.fmt.allocPrint(allocator, ".zig-cache/php-fpm-{d}", .{unique});
         errdefer allocator.free(dir_rel);
-        try std.fs.cwd().makePath(dir_rel);
+        try compat.cwd().makePath(dir_rel);
 
         const dir_abs = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ cwd, dir_rel });
         defer allocator.free(dir_abs);
@@ -1086,7 +1091,7 @@ const PhpFpmProcess = struct {
         const script_rel = try std.fmt.allocPrint(allocator, "{s}/index.php", .{dir_rel});
         defer allocator.free(script_rel);
 
-        try std.fs.cwd().writeFile(.{
+        try compat.cwd().writeFile(.{
             .sub_path = script_rel,
             .data =
             \\<?php
@@ -1119,14 +1124,15 @@ const PhpFpmProcess = struct {
             .{ log_path, dir_abs, socket_path, dir_abs },
         );
         defer allocator.free(config_text);
-        try std.fs.cwd().writeFile(.{ .sub_path = config_rel, .data = config_text });
+        try compat.cwd().writeFile(.{ .sub_path = config_rel, .data = config_text });
 
         var argv = [_][]const u8{ binary, "--nodaemonize", "--fpm-config", config_path };
-        var child = std.process.Child.init(&argv, allocator);
-        child.stdin_behavior = .Ignore;
-        child.stdout_behavior = .Ignore;
-        child.stderr_behavior = .Ignore;
-        try child.spawn();
+        const child = try std.process.spawn(compat.io(), .{
+            .argv = &argv,
+            .stdin = .ignore,
+            .stdout = .ignore,
+            .stderr = .ignore,
+        });
 
         var proc = PhpFpmProcess{
             .allocator = allocator,
@@ -1143,9 +1149,8 @@ const PhpFpmProcess = struct {
     }
 
     fn stop(self: *PhpFpmProcess) void {
-        _ = self.child.kill() catch {};
-        _ = self.child.wait() catch {};
-        std.fs.cwd().deleteTree(self.dir_rel) catch {};
+        self.child.kill(compat.io());
+        compat.cwd().deleteTree(self.dir_rel) catch {};
         self.allocator.free(self.dir_rel);
         self.allocator.free(self.socket_path);
         self.allocator.free(self.script_path);
@@ -1174,7 +1179,7 @@ fn waitUntilUnixSocketReady(socket_path: []const u8, log_path: []const u8) !void
     var attempts: usize = 0;
     while (attempts < 100) : (attempts += 1) {
         if (std.fs.accessAbsolute(socket_path, .{})) |_| return else |_| {}
-        std.time.sleep(100 * std.time.ns_per_ms);
+        compat.sleepNs(100 * std.time.ns_per_ms);
     }
     _ = log_path;
     return error.Timeout;
@@ -1284,7 +1289,7 @@ fn rawTcpThreadMain(server: *RawTcpServer) void {
     }
 }
 
-fn handleUpstreamConnection(server: *UpstreamServer, conn: std.net.Server.Connection) !void {
+fn handleUpstreamConnection(server: *UpstreamServer, conn: compat.NetConnection) !void {
     defer conn.stream.close();
     const req = try readHttpMessage(server.allocator, conn.stream, 1024 * 1024);
     defer server.allocator.free(req.raw);
@@ -1307,7 +1312,7 @@ fn handleUpstreamConnection(server: *UpstreamServer, conn: std.net.Server.Connec
     };
 
     if (response_spec.delay_ms > 0) {
-        std.time.sleep(@as(u64, response_spec.delay_ms) * std.time.ns_per_ms);
+        compat.sleepNs(@as(u64, response_spec.delay_ms) * std.time.ns_per_ms);
     }
 
     const reason = switch (response_spec.status_code) {
@@ -1336,7 +1341,7 @@ fn handleUpstreamConnection(server: *UpstreamServer, conn: std.net.Server.Connec
     try conn.stream.writer().print("\r\n{s}", .{response_spec.body});
 }
 
-fn handleFastCgiConnection(server: *FastCgiServer, conn: std.net.Server.Connection) !void {
+fn handleFastCgiConnection(server: *FastCgiServer, conn: compat.NetConnection) !void {
     defer conn.stream.close();
     while (true) {
         const maybe_req = try readFastCgiRequest(server.allocator, conn.stream, 1024 * 1024);
@@ -1368,7 +1373,7 @@ fn handleFastCgiConnection(server: *FastCgiServer, conn: std.net.Server.Connecti
     }
 }
 
-fn handleScgiConnection(server: *ScgiServer, conn: std.net.Server.Connection) !void {
+fn handleScgiConnection(server: *ScgiServer, conn: compat.NetConnection) !void {
     defer conn.stream.close();
     const req = try readScgiRequest(server.allocator, conn.stream, 1024 * 1024);
     defer server.allocator.free(req);
@@ -1396,7 +1401,7 @@ fn handleScgiConnection(server: *ScgiServer, conn: std.net.Server.Connection) !v
     try conn.stream.writer().print("\r\n{s}", .{response_spec.body});
 }
 
-fn handleUwsgiConnection(server: *UwsgiServer, conn: std.net.Server.Connection) !void {
+fn handleUwsgiConnection(server: *UwsgiServer, conn: compat.NetConnection) !void {
     defer conn.stream.close();
     const req = try readUwsgiRequest(server.allocator, conn.stream, 1024 * 1024);
     defer server.allocator.free(req);
@@ -1424,8 +1429,8 @@ fn handleUwsgiConnection(server: *UwsgiServer, conn: std.net.Server.Connection) 
     try conn.stream.writer().print("\r\n{s}", .{response_spec.body});
 }
 
-fn readHttpMessage(allocator: std.mem.Allocator, stream: std.net.Stream, max_bytes: usize) !RawHttpMessage {
-    var buf = std.ArrayList(u8).init(allocator);
+fn readHttpMessage(allocator: std.mem.Allocator, stream: compat.NetStream, max_bytes: usize) !RawHttpMessage {
+    var buf = std.array_list.Managed(u8).init(allocator);
     errdefer buf.deinit();
     var tmp: [4096]u8 = undefined;
     var header_end: ?usize = null;
@@ -1461,8 +1466,8 @@ fn readHttpMessage(allocator: std.mem.Allocator, stream: std.net.Stream, max_byt
     };
 }
 
-fn readFastCgiRequest(allocator: std.mem.Allocator, stream: std.net.Stream, max_bytes: usize) !?[]u8 {
-    var buf = std.ArrayList(u8).init(allocator);
+fn readFastCgiRequest(allocator: std.mem.Allocator, stream: compat.NetStream, max_bytes: usize) !?[]u8 {
+    var buf = std.array_list.Managed(u8).init(allocator);
     errdefer buf.deinit();
     var tmp: [4096]u8 = undefined;
 
@@ -1482,8 +1487,8 @@ fn readFastCgiRequest(allocator: std.mem.Allocator, stream: std.net.Stream, max_
     return owned;
 }
 
-fn readScgiRequest(allocator: std.mem.Allocator, stream: std.net.Stream, max_bytes: usize) ![]u8 {
-    var buf = std.ArrayList(u8).init(allocator);
+fn readScgiRequest(allocator: std.mem.Allocator, stream: compat.NetStream, max_bytes: usize) ![]u8 {
+    var buf = std.array_list.Managed(u8).init(allocator);
     errdefer buf.deinit();
     var tmp: [4096]u8 = undefined;
     while (true) {
@@ -1496,7 +1501,7 @@ fn readScgiRequest(allocator: std.mem.Allocator, stream: std.net.Stream, max_byt
     return try buf.toOwnedSlice();
 }
 
-fn readUwsgiRequest(allocator: std.mem.Allocator, stream: std.net.Stream, max_bytes: usize) ![]u8 {
+fn readUwsgiRequest(allocator: std.mem.Allocator, stream: compat.NetStream, max_bytes: usize) ![]u8 {
     var header: [4]u8 = undefined;
     try stream.reader().readNoEof(&header);
     const vars_len = @as(usize, header[1]) | (@as(usize, header[2]) << 8);
@@ -1508,7 +1513,7 @@ fn readUwsgiRequest(allocator: std.mem.Allocator, stream: std.net.Stream, max_by
     defer allocator.free(body);
     try stream.reader().readNoEof(body);
 
-    var out = std.ArrayList(u8).init(allocator);
+    var out = std.array_list.Managed(u8).init(allocator);
     errdefer out.deinit();
     try out.appendSlice(&header);
     try out.appendSlice(vars);
@@ -1583,11 +1588,11 @@ fn fastCgiRequestId(data: []const u8) ?u16 {
 }
 
 fn buildFastCgiStdoutPayload(allocator: std.mem.Allocator, spec: FastCgiResponseSpec) ![]u8 {
-    var payload = std.ArrayList(u8).init(allocator);
+    var payload = std.array_list.Managed(u8).init(allocator);
     errdefer payload.deinit();
-    try payload.writer().print("Status: {d} {s}\r\n", .{ spec.status_code, httpReason(spec.status_code) });
+    try payload.print("Status: {d} {s}\r\n", .{ spec.status_code, httpReason(spec.status_code) });
     for (spec.headers) |header| {
-        try payload.writer().print("{s}: {s}\r\n", .{ header.name, header.value });
+        try payload.print("{s}: {s}\r\n", .{ header.name, header.value });
     }
     try payload.appendSlice("\r\n");
     try payload.appendSlice(spec.body);
@@ -1666,20 +1671,18 @@ fn sendRequestWithTimeout(allocator: std.mem.Allocator, port: u16, spec: Request
 }
 
 fn sendRawRequest(allocator: std.mem.Allocator, port: u16, raw_request: []const u8) !HttpResponse {
-    const address = try std.net.Address.parseIp(test_host, port);
-    var stream = try std.net.tcpConnectToAddress(address);
+    var stream = try compat.tcpConnectToHost(allocator, test_host, port);
     defer stream.close();
     try setStreamTimeouts(&stream, 5_000);
     try stream.writeAll(raw_request);
     return readHttpResponse(allocator, stream);
 }
 
-fn openRequestStream(allocator: std.mem.Allocator, port: u16, spec: RequestSpec) !std.net.Stream {
-    const address = try std.net.Address.parseIp(test_host, port);
-    var stream = try std.net.tcpConnectToAddress(address);
+fn openRequestStream(allocator: std.mem.Allocator, port: u16, spec: RequestSpec) !compat.NetStream {
+    var stream = try compat.tcpConnectToHost(allocator, test_host, port);
     errdefer stream.close();
 
-    var request = std.ArrayList(u8).init(allocator);
+    var request = std.array_list.Managed(u8).init(allocator);
     defer request.deinit();
     const body = spec.body orelse "";
     var host_value: []const u8 = undefined;
@@ -1693,20 +1696,20 @@ fn openRequestStream(allocator: std.mem.Allocator, port: u16, spec: RequestSpec)
         break :blk generated;
     };
     if (spec.proxy_ip) |proxy_ip| {
-        try request.writer().print("PROXY TCP4 {s} 127.0.0.1 12345 {d}\r\n", .{ proxy_ip, port });
+        try request.print("PROXY TCP4 {s} 127.0.0.1 12345 {d}\r\n", .{ proxy_ip, port });
     }
     defer if (owned_host_value) |generated| allocator.free(generated);
-    try request.writer().print("{s} {s} HTTP/1.1\r\nHost: {s}\r\nConnection: {s}\r\n", .{
+    try request.print("{s} {s} HTTP/1.1\r\nHost: {s}\r\nConnection: {s}\r\n", .{
         spec.method,
         spec.path,
         host_value,
         if (spec.connection_close) "close" else "keep-alive",
     });
     for (spec.headers) |header| {
-        try request.writer().print("{s}: {s}\r\n", .{ header.name, header.value });
+        try request.print("{s}: {s}\r\n", .{ header.name, header.value });
     }
     if (spec.body != null) {
-        try request.writer().print("Content-Length: {d}\r\n", .{body.len});
+        try request.print("Content-Length: {d}\r\n", .{body.len});
     }
     try request.appendSlice("\r\n");
     if (spec.body != null) try request.appendSlice(body);
@@ -1715,7 +1718,7 @@ fn openRequestStream(allocator: std.mem.Allocator, port: u16, spec: RequestSpec)
     return stream;
 }
 
-fn setStreamTimeouts(stream: *std.net.Stream, timeout_ms: u64) !void {
+fn setStreamTimeouts(stream: *compat.NetStream, timeout_ms: u64) !void {
     const timeout = std.posix.timeval{
         .sec = @intCast(timeout_ms / 1000),
         .usec = @intCast((timeout_ms % 1000) * 1000),
@@ -1734,8 +1737,8 @@ fn setStreamTimeouts(stream: *std.net.Stream, timeout_ms: u64) !void {
     );
 }
 
-fn readHttpResponse(allocator: std.mem.Allocator, stream: std.net.Stream) !HttpResponse {
-    var raw_buf = std.ArrayList(u8).init(allocator);
+fn readHttpResponse(allocator: std.mem.Allocator, stream: compat.NetStream) !HttpResponse {
+    var raw_buf = std.array_list.Managed(u8).init(allocator);
     errdefer raw_buf.deinit();
     var tmp: [4096]u8 = undefined;
     var header_end: ?usize = null;
@@ -1785,8 +1788,8 @@ fn readHttpResponse(allocator: std.mem.Allocator, stream: std.net.Stream) !HttpR
     };
 }
 
-fn readHttpHeadersOnly(allocator: std.mem.Allocator, stream: std.net.Stream) ![]u8 {
-    var raw_buf = std.ArrayList(u8).init(allocator);
+fn readHttpHeadersOnly(allocator: std.mem.Allocator, stream: compat.NetStream) ![]u8 {
+    var raw_buf = std.array_list.Managed(u8).init(allocator);
     errdefer raw_buf.deinit();
     var tmp: [1024]u8 = undefined;
 
@@ -1824,7 +1827,7 @@ fn writeMaskedWebSocketFrame(writer: anytype, opcode: WebSocketOpCode, payload: 
     }
 }
 
-fn readWebSocketFrame(stream: std.net.Stream, allocator: std.mem.Allocator, max_payload: usize) !WebSocketFrame {
+fn readWebSocketFrame(stream: compat.NetStream, allocator: std.mem.Allocator, max_payload: usize) !WebSocketFrame {
     var hdr: [2]u8 = undefined;
     try readExact(stream, hdr[0..]);
     const fin = (hdr[0] & 0x80) != 0;
@@ -1855,7 +1858,7 @@ fn readWebSocketFrame(stream: std.net.Stream, allocator: std.mem.Allocator, max_
     return .{ .fin = fin, .opcode = opcode, .payload = payload };
 }
 
-fn readExact(stream: std.net.Stream, out: []u8) !void {
+fn readExact(stream: compat.NetStream, out: []u8) !void {
     var off: usize = 0;
     while (off < out.len) {
         const n = try stream.read(out[off..]);
@@ -1882,12 +1885,12 @@ fn waitUntilReady(port: u16, log_path: []const u8, options: TardigradeOptions) !
                 .key = options.ready_client_key,
             }) catch |err| {
                 if (attempts == 99) {
-                    const log_data = std.fs.cwd().readFileAlloc(std.testing.allocator, log_path, 256 * 1024) catch "";
+                    const log_data = compat.cwd().readFileAlloc(std.testing.allocator, log_path, 256 * 1024) catch "";
                     defer if (log_data.len > 0) std.testing.allocator.free(log_data);
                     std.debug.print("tardigrade failed to boot: {}\n{s}\n", .{ err, log_data });
                     return err;
                 }
-                std.time.sleep(50 * std.time.ns_per_ms);
+                compat.sleepNs(50 * std.time.ns_per_ms);
                 continue;
             };
             defer resp.deinit();
@@ -1905,12 +1908,12 @@ fn waitUntilReady(port: u16, log_path: []const u8, options: TardigradeOptions) !
                 .proxy_ip = options.ready_proxy_ip,
             }) catch |err| {
                 if (attempts == 99) {
-                    const log_data = std.fs.cwd().readFileAlloc(std.testing.allocator, log_path, 256 * 1024) catch "";
+                    const log_data = compat.cwd().readFileAlloc(std.testing.allocator, log_path, 256 * 1024) catch "";
                     defer if (log_data.len > 0) std.testing.allocator.free(log_data);
                     std.debug.print("tardigrade failed to boot: {}\n{s}\n", .{ err, log_data });
                     return err;
                 }
-                std.time.sleep(50 * std.time.ns_per_ms);
+                compat.sleepNs(50 * std.time.ns_per_ms);
                 continue;
             };
             defer resp.deinit();
@@ -1920,7 +1923,7 @@ fn waitUntilReady(port: u16, log_path: []const u8, options: TardigradeOptions) !
                 return;
             }
         }
-        std.time.sleep(50 * std.time.ns_per_ms);
+        compat.sleepNs(50 * std.time.ns_per_ms);
     }
     return error.ServerNotReady;
 }
@@ -1941,9 +1944,9 @@ const CurlRequestSpec = struct {
 };
 
 fn runCurl(allocator: std.mem.Allocator, port: u16, spec: CurlRequestSpec) !CurlRunResult {
-    var argv = std.ArrayList([]const u8).init(allocator);
+    var argv = std.array_list.Managed([]const u8).init(allocator);
     defer argv.deinit();
-    var owned_args = std.ArrayList([]u8).init(allocator);
+    var owned_args = std.array_list.Managed([]u8).init(allocator);
     defer {
         for (owned_args.items) |arg| allocator.free(arg);
         owned_args.deinit();
@@ -1993,10 +1996,10 @@ fn runCurl(allocator: std.mem.Allocator, port: u16, spec: CurlRequestSpec) !Curl
     defer allocator.free(url);
     try argv.append(url);
 
-    const run_res = try std.process.Child.run(.{
-        .allocator = allocator,
+    const run_res = try std.process.run(allocator, compat.io(), .{
         .argv = argv.items,
-        .max_output_bytes = 1024 * 1024,
+        .stdout_limit = .limited(1024 * 1024),
+        .stderr_limit = .limited(1024 * 1024),
     });
     return .{
         .allocator = allocator,
@@ -2007,9 +2010,9 @@ fn runCurl(allocator: std.mem.Allocator, port: u16, spec: CurlRequestSpec) !Curl
 }
 
 fn spawnCurlProcess(allocator: std.mem.Allocator, port: u16, spec: CurlRequestSpec) !std.process.Child {
-    var argv = std.ArrayList([]const u8).init(allocator);
+    var argv = std.array_list.Managed([]const u8).init(allocator);
     defer argv.deinit();
-    var owned_args = std.ArrayList([]u8).init(allocator);
+    var owned_args = std.array_list.Managed([]u8).init(allocator);
     defer {
         for (owned_args.items) |arg| allocator.free(arg);
         owned_args.deinit();
@@ -2060,19 +2063,19 @@ fn spawnCurlProcess(allocator: std.mem.Allocator, port: u16, spec: CurlRequestSp
     try owned_args.append(url);
     try argv.append(url);
 
-    var child = std.process.Child.init(argv.items, allocator);
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
-    try child.spawn();
-    return child;
+    return std.process.spawn(compat.io(), .{
+        .argv = argv.items,
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .pipe,
+    });
 }
 
 fn sendCurlRequest(allocator: std.mem.Allocator, port: u16, spec: CurlRequestSpec) !HttpResponse {
     var result = try runCurl(allocator, port, spec);
     errdefer result.deinit();
     switch (result.term) {
-        .Exited => |code| if (code != 0) return error.CurlFailed,
+        .exited => |code| if (code != 0) return error.CurlFailed,
         else => return error.CurlFailed,
     }
 
@@ -2091,7 +2094,7 @@ fn sendHttp3CurlRequestWithSpec(allocator: std.mem.Allocator, port: u16, spec: C
     for (0..http3_retry_attempts) |_| {
         return sendCurlRequest(allocator, port, spec) catch |err| {
             last_err = err;
-            std.time.sleep(http3_retry_delay_ms * std.time.ns_per_ms);
+            compat.sleepNs(http3_retry_delay_ms * std.time.ns_per_ms);
             continue;
         };
     }
@@ -2124,7 +2127,7 @@ fn opensslPresentedSubject(allocator: std.mem.Allocator, port: u16, servername: 
     defer std.heap.page_allocator.free(run_res.stderr);
 
     switch (run_res.term) {
-        .Exited => |code| if (code != 0) {
+        .exited => |code| if (code != 0) {
             std.heap.page_allocator.free(run_res.stdout);
             return error.OpensslFailed;
         },
@@ -2147,65 +2150,62 @@ fn parseStatusCode(raw: []const u8) !u16 {
 }
 
 fn waitForUpstreamCount(server: *UpstreamServer, expected: u32, timeout_ms: u64) !void {
-    const deadline = std.time.milliTimestamp() + @as(i64, @intCast(timeout_ms));
-    while (std.time.milliTimestamp() < deadline) {
+    const deadline = compat.milliTimestamp() + @as(i64, @intCast(timeout_ms));
+    while (compat.milliTimestamp() < deadline) {
         if (server.requestCount() >= expected) return;
-        std.time.sleep(25 * std.time.ns_per_ms);
+        compat.sleepNs(25 * std.time.ns_per_ms);
     }
     return error.Timeout;
 }
 
 fn waitForChildExit(pid: std.posix.pid_t, timeout_ms: u64) bool {
-    const deadline = std.time.milliTimestamp() + @as(i64, @intCast(timeout_ms));
-    while (std.time.milliTimestamp() < deadline) {
+    const deadline = compat.milliTimestamp() + @as(i64, @intCast(timeout_ms));
+    while (compat.milliTimestamp() < deadline) {
         const result = std.posix.waitpid(pid, std.posix.W.NOHANG);
         if (result.pid == pid) return true;
-        std.time.sleep(25 * std.time.ns_per_ms);
+        compat.sleepNs(25 * std.time.ns_per_ms);
     }
     return false;
 }
 
 fn waitForPortClosed(port: u16, timeout_ms: u64) !void {
-    const deadline = std.time.milliTimestamp() + @as(i64, @intCast(timeout_ms));
-    const address = try std.net.Address.parseIp(test_host, port);
-    while (std.time.milliTimestamp() < deadline) {
-        var stream = std.net.tcpConnectToAddress(address) catch return;
+    const deadline = compat.milliTimestamp() + @as(i64, @intCast(timeout_ms));
+    while (compat.milliTimestamp() < deadline) {
+        var stream = compat.tcpConnectToHost(std.testing.allocator, test_host, port) catch return;
         stream.close();
-        std.time.sleep(25 * std.time.ns_per_ms);
+        compat.sleepNs(25 * std.time.ns_per_ms);
     }
     return error.Timeout;
 }
 
 fn waitForLogSubstring(allocator: std.mem.Allocator, path: []const u8, needle: []const u8, timeout_ms: u64) !void {
-    const deadline = std.time.milliTimestamp() + @as(i64, @intCast(timeout_ms));
-    while (std.time.milliTimestamp() < deadline) {
+    const deadline = compat.milliTimestamp() + @as(i64, @intCast(timeout_ms));
+    while (compat.milliTimestamp() < deadline) {
         const contents = blk: {
             if (std.Io.Dir.path.isAbsolute(path)) {
-                var file = try std.fs.openFileAbsolute(path, .{});
+                var file = try compat.openFileAbsolute(path, .{});
                 defer file.close();
                 break :blk try file.readToEndAlloc(allocator, 256 * 1024);
             }
-            break :blk try std.fs.cwd().readFileAlloc(allocator, path, 256 * 1024);
+            break :blk try compat.cwd().readFileAlloc(allocator, path, 256 * 1024);
         };
         defer allocator.free(contents);
         if (std.mem.find(u8, contents, needle) != null) return;
-        std.time.sleep(25 * std.time.ns_per_ms);
+        compat.sleepNs(25 * std.time.ns_per_ms);
     }
     return error.Timeout;
 }
 
 fn wakeListener(port: u16) void {
-    const address = std.net.Address.parseIp(test_host, port) catch return;
-    var stream = std.net.tcpConnectToAddress(address) catch return;
+    var stream = compat.tcpConnectToHost(std.testing.allocator, test_host, port) catch return;
     defer stream.close();
     stream.writeAll("GET /__shutdown__ HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n") catch {};
 }
 
 fn findFreePort() !u16 {
-    const address = try std.net.Address.parseIp(test_host, 0);
-    var server = try std.net.Address.listen(address, .{ .reuse_address = true });
+    var server = try compat.listenTcp(test_host, 0);
     defer server.deinit();
-    return server.listen_address.getPort();
+    return server.port();
 }
 
 fn hs256Jwt(allocator: std.mem.Allocator, secret: []const u8, payload_json: []const u8) ![]u8 {
@@ -2259,20 +2259,20 @@ fn assertContains(haystack: []const u8, needle: []const u8) !void {
 }
 
 fn waitForBodyContains(allocator: std.mem.Allocator, port: u16, path: []const u8, headers: []const RequestHeader, needle: []const u8, timeout_ms: u64) !void {
-    const deadline = std.time.milliTimestamp() + @as(i64, @intCast(timeout_ms));
-    while (std.time.milliTimestamp() < deadline) {
+    const deadline = compat.milliTimestamp() + @as(i64, @intCast(timeout_ms));
+    while (compat.milliTimestamp() < deadline) {
         var response = sendRequest(allocator, port, .{
             .method = "GET",
             .path = path,
             .body = null,
             .headers = headers,
         }) catch {
-            std.time.sleep(50 * std.time.ns_per_ms);
+            compat.sleepNs(50 * std.time.ns_per_ms);
             continue;
         };
         defer response.deinit();
         if (std.mem.find(u8, response.body, needle) != null) return;
-        std.time.sleep(50 * std.time.ns_per_ms);
+        compat.sleepNs(50 * std.time.ns_per_ms);
     }
     return error.Timeout;
 }
@@ -2288,22 +2288,22 @@ fn waitForWebSocketFrameContains(ws: *WebSocketClient, allocator: std.mem.Alloca
 }
 
 fn waitForHttp3Configured(port: u16, timeout_ms: u64) !void {
-    const deadline = std.time.milliTimestamp() + @as(i64, @intCast(timeout_ms));
-    while (std.time.milliTimestamp() < deadline) {
+    const deadline = compat.milliTimestamp() + @as(i64, @intCast(timeout_ms));
+    while (compat.milliTimestamp() < deadline) {
         var response = sendCurlRequest(std.testing.allocator, port, .{
             .scheme = "https",
             .path = "/health",
             .insecure = true,
         }) catch |err| {
             if (err == error.CurlFailed or err == error.InvalidHttpResponse) {
-                std.time.sleep(100 * std.time.ns_per_ms);
+                compat.sleepNs(100 * std.time.ns_per_ms);
                 continue;
             }
             return err;
         };
         defer response.deinit();
         if (response.status_code == 200 and std.mem.find(u8, response.body, "\"http3_status\":\"configured\"") != null) return;
-        std.time.sleep(100 * std.time.ns_per_ms);
+        compat.sleepNs(100 * std.time.ns_per_ms);
     }
     return error.Timeout;
 }
@@ -2560,7 +2560,7 @@ test "bearclaw fixture serves chat over https with bearer auth and transcript pe
     const fixture_dir = tardigrade.fixture_dir_rel orelse return error.TestUnexpectedResult;
     const transcript_rel = try std.fmt.allocPrint(allocator, "{s}/transcripts.ndjson", .{fixture_dir});
     defer allocator.free(transcript_rel);
-    const transcript = try std.fs.cwd().readFileAlloc(allocator, transcript_rel, 1024 * 1024);
+    const transcript = try compat.cwd().readFileAlloc(allocator, transcript_rel, 1024 * 1024);
     defer allocator.free(transcript);
     try assertContains(transcript, "\"scope\":\"chat\"");
     try assertContains(transcript, "\"route\":\"/v1/chat\"");
@@ -2632,8 +2632,8 @@ test "bearclaw transcript append logs path errors without failing the request" {
     try std.testing.expectEqual(@as(u16, 200), authorized.status_code);
     try assertContains(authorized.body, "\"source\":\"bearclaw-upstream\"");
 
-    std.time.sleep(100 * std.time.ns_per_ms);
-    const log_file = try std.fs.openFileAbsolute(tardigrade.log_path, .{});
+    compat.sleepNs(100 * std.time.ns_per_ms);
+    var log_file = try compat.openFileAbsolute(tardigrade.log_path, .{});
     defer log_file.close();
     const log_data = try log_file.readToEndAlloc(allocator, 256 * 1024);
     defer allocator.free(log_data);
@@ -3285,13 +3285,13 @@ const GenericFixtureDir = struct {
     dir_abs: []u8,
 
     fn create(allocator: std.mem.Allocator, prefix: []const u8) !GenericFixtureDir {
-        const cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+        const cwd = try compat.cwd().realpathAlloc(allocator, ".");
         defer allocator.free(cwd);
-        const unique = std.time.nanoTimestamp();
+        const unique = compat.nanoTimestamp();
         const dir_rel = try std.fmt.allocPrint(allocator, ".zig-cache/{s}-{d}", .{ prefix, unique });
         errdefer allocator.free(dir_rel);
-        try std.fs.cwd().makePath(dir_rel);
-        errdefer std.fs.cwd().deleteTree(dir_rel) catch {};
+        try compat.cwd().makePath(dir_rel);
+        errdefer compat.cwd().deleteTree(dir_rel) catch {};
         const dir_abs = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ cwd, dir_rel });
         errdefer allocator.free(dir_abs);
         return .{ .allocator = allocator, .dir_rel = dir_rel, .dir_abs = dir_abs };
@@ -3308,12 +3308,12 @@ const GenericFixtureDir = struct {
     fn writeRel(self: GenericFixtureDir, suffix: []const u8, data: []const u8) !void {
         const rel = try self.joinRel(suffix);
         defer self.allocator.free(rel);
-        if (std.Io.Dir.path.dirname(rel)) |parent| try std.fs.cwd().makePath(parent);
-        try std.fs.cwd().writeFile(.{ .sub_path = rel, .data = data });
+        if (std.Io.Dir.path.dirname(rel)) |parent| try compat.cwd().makePath(parent);
+        try compat.cwd().writeFile(.{ .sub_path = rel, .data = data });
     }
 
     fn deinit(self: *GenericFixtureDir) void {
-        std.fs.cwd().deleteTree(self.dir_rel) catch {};
+        compat.cwd().deleteTree(self.dir_rel) catch {};
         self.allocator.free(self.dir_rel);
         self.allocator.free(self.dir_abs);
         self.* = undefined;
@@ -3535,7 +3535,7 @@ test "location block reload takes effect for new requests after sighup" {
 
     try tardigrade.rewriteConfig(updated_config);
     tardigrade.sendSignal(std.posix.SIG.HUP);
-    std.time.sleep(300 * std.time.ns_per_ms);
+    compat.sleepNs(300 * std.time.ns_per_ms);
 
     var second_response = try sendRequest(allocator, tardigrade.port, .{
         .method = "GET",
@@ -3604,7 +3604,7 @@ test "in-flight request completes safely across reload and new requests use new 
 
     try tardigrade.rewriteConfig(updated_config);
     tardigrade.sendSignal(std.posix.SIG.HUP);
-    std.time.sleep(300 * std.time.ns_per_ms);
+    compat.sleepNs(300 * std.time.ns_per_ms);
 
     var second_response = try sendRequest(allocator, tardigrade.port, .{
         .method = "GET",
@@ -3813,7 +3813,7 @@ test "static file integration rejects symlink escape outside root" {
     defer allocator.free(secret_abs);
     const symlink_abs = try fixture.joinAbs("public/linked-secret.txt");
     defer allocator.free(symlink_abs);
-    try std.fs.symLinkAbsolute(secret_abs, symlink_abs, .{});
+    try std.Io.Dir.symLinkAbsolute(compat.io(), secret_abs, symlink_abs, .{});
 
     const config_text = try std.fmt.allocPrint(allocator,
         \\location / {{

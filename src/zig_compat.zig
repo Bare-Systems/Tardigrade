@@ -1,36 +1,92 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub const Io = std.Io;
 
-pub fn io() std.Io {
-    return std.Io.Threaded.global_single_threaded.io();
+var threaded_io: ?std.Io.Threaded = null;
+
+fn inheritedEnviron() std.process.Environ {
+    if (!builtin.link_libc) return .empty;
+
+    const environ: [:null]?[*:0]u8 = switch (builtin.os.tag) {
+        .wasi, .emscripten => environ: {
+            const c_environ = std.c.environ;
+            var env_count: usize = 0;
+            while (c_environ[env_count] != null) : (env_count += 1) {}
+            break :environ c_environ[0..env_count :null];
+        },
+        else => env: {
+            const c_environ = std.c.environ;
+            var env_count: usize = 0;
+            while (c_environ[env_count] != null) : (env_count += 1) {}
+            break :env c_environ[0..env_count :null];
+        },
+    };
+    return .{ .block = .{ .slice = environ } };
 }
 
-/// Drop-in replacement for std.net.Stream using raw POSIX syscalls.
-/// Provides writeAll/read/close/writer() interface compatible with anytype writers.
+fn activeThreadedIo() *std.Io.Threaded {
+    if (threaded_io == null) {
+        threaded_io = std.Io.Threaded.init(std.heap.c_allocator, .{
+            .environ = inheritedEnviron(),
+        });
+    }
+    return &threaded_io.?;
+}
+
+pub fn io() std.Io {
+    return activeThreadedIo().io();
+}
+
+/// Drop-in replacement for std.net.Stream backed by Zig 0.16's std.Io runtime.
+/// Preserves the old surface area expected by the codebase while routing
+/// operations through the new reader/writer implementations.
 pub const NetStream = struct {
+    inner: ?std.Io.net.Stream = null,
     handle: std.posix.fd_t,
 
-    pub const WriteError = error{WriteFailed};
-    pub const ReadError = error{ReadFailed};
+    pub const WriteError = anyerror;
+    pub const ReadError = anyerror;
 
     pub fn close(self: NetStream) void {
+        if (self.inner) |inner| {
+            inner.close(io());
+            return;
+        }
         _ = std.c.close(self.handle);
     }
 
     pub fn writeAll(self: NetStream, data: []const u8) WriteError!void {
-        var remaining = data;
-        while (remaining.len > 0) {
-            const n = std.c.write(self.handle, remaining.ptr, remaining.len);
-            if (n <= 0) return error.WriteFailed;
-            remaining = remaining[@as(usize, @intCast(n))..];
+        if (self.inner == null) {
+            var remaining = data;
+            while (remaining.len > 0) {
+                const n = std.c.write(self.handle, remaining.ptr, remaining.len);
+                if (n <= 0) return error.WriteFailed;
+                remaining = remaining[@as(usize, @intCast(n))..];
+            }
+            return;
         }
+
+        var buf: [1024]u8 = undefined;
+        var io_writer = self.inner.?.writer(io(), &buf);
+        io_writer.interface.writeAll(data) catch |err| switch (err) {
+            error.WriteFailed => return io_writer.err orelse err,
+        };
+        io_writer.interface.flush() catch |err| switch (err) {
+            error.WriteFailed => return io_writer.err orelse err,
+        };
     }
 
     pub fn read(self: NetStream, buf: []u8) ReadError!usize {
-        const n = std.c.read(self.handle, buf.ptr, buf.len);
-        if (n < 0) return error.ReadFailed;
-        return @intCast(n);
+        if (self.inner == null) {
+            return std.posix.read(self.handle, buf);
+        }
+
+        var scratch: [1]u8 = undefined;
+        var io_reader = self.inner.?.reader(io(), &scratch);
+        return io_reader.interface.readSliceShort(buf) catch |err| switch (err) {
+            error.ReadFailed => return io_reader.err orelse err,
+        };
     }
 
     pub fn print(self: NetStream, comptime fmt: []const u8, args: anytype) !void {
@@ -39,25 +95,113 @@ pub const NetStream = struct {
         try self.writeAll(s);
     }
 
-    /// Returns self so stream.writer().writeAll() works with anytype consumers.
-    pub fn writer(self: NetStream) NetStream {
-        return self;
+    pub const Writer = struct {
+        stream: NetStream,
+
+        pub fn writeAll(self: Writer, data: []const u8) WriteError!void {
+            try self.stream.writeAll(data);
+        }
+
+        pub fn writeByte(self: Writer, byte: u8) WriteError!void {
+            try self.writeAll(&[_]u8{byte});
+        }
+
+        pub fn print(self: Writer, comptime fmt: []const u8, args: anytype) !void {
+            try self.stream.print(fmt, args);
+        }
+    };
+
+    pub fn writer(self: NetStream) Writer {
+        return .{ .stream = self };
+    }
+
+    pub const Reader = struct {
+        stream: NetStream,
+
+        pub fn readNoEof(self: Reader, out: []u8) ReadError!void {
+            var off: usize = 0;
+            while (off < out.len) {
+                const n = try self.stream.read(out[off..]);
+                if (n == 0) return error.EndOfStream;
+                off += n;
+            }
+        }
+
+        pub fn readAllAlloc(self: Reader, allocator: std.mem.Allocator, max_bytes: usize) ReadError![]u8 {
+            var out = std.array_list.Managed(u8).init(allocator);
+            errdefer out.deinit();
+
+            var buf: [4096]u8 = undefined;
+            while (true) {
+                const n = try self.stream.read(&buf);
+                if (n == 0) break;
+                try out.appendSlice(buf[0..n]);
+                if (out.items.len > max_bytes) return error.StreamTooLong;
+            }
+            return out.toOwnedSlice();
+        }
+    };
+
+    pub fn reader(self: NetStream) Reader {
+        return .{ .stream = self };
     }
 };
+
+pub fn netStreamFromFd(fd: std.posix.fd_t) NetStream {
+    return .{
+        .inner = null,
+        .handle = fd,
+    };
+}
 
 /// Connect a TCP socket to host:port, returning a NetStream.
 pub fn tcpConnectToHost(allocator: std.mem.Allocator, host: []const u8, port: u16) !NetStream {
     _ = allocator;
     const address = try std.Io.net.IpAddress.resolve(io(), host, port);
     const stream = try address.connect(io(), .{ .mode = .stream });
-    return NetStream{ .handle = stream.socket.handle };
+    return .{
+        .inner = stream,
+        .handle = stream.socket.handle,
+    };
 }
 
 /// Connect to a Unix domain socket path, returning a NetStream.
 pub fn connectUnixSocket(path: []const u8) !NetStream {
     const ua = try std.Io.net.UnixAddress.init(path);
     const stream = try ua.connect(io());
-    return NetStream{ .handle = stream.socket.handle };
+    return .{
+        .inner = stream,
+        .handle = stream.socket.handle,
+    };
+}
+
+pub const NetConnection = struct {
+    stream: NetStream,
+};
+
+pub const NetServer = struct {
+    inner: std.Io.net.Server,
+
+    pub fn accept(self: *NetServer) std.Io.net.Server.AcceptError!NetConnection {
+        const stream = try self.inner.accept(io());
+        return .{ .stream = .{
+            .inner = stream,
+            .handle = stream.socket.handle,
+        } };
+    }
+
+    pub fn deinit(self: *NetServer) void {
+        self.inner.deinit(io());
+    }
+
+    pub fn port(self: *const NetServer) u16 {
+        return self.inner.socket.address.getPort();
+    }
+};
+
+pub fn listenTcp(host: []const u8, port: u16) !NetServer {
+    const address = try std.Io.net.IpAddress.parse(host, port);
+    return .{ .inner = try address.listen(io(), .{ .reuse_address = true }) };
 }
 
 /// Drop-in replacement for std.Thread.Mutex using the new std.Io.Mutex API.
@@ -147,6 +291,10 @@ pub fn milliTimestamp() i64 {
 
 pub fn nanoTimestamp() i128 {
     return @intCast(std.Io.Clock.real.now(io()).toNanoseconds());
+}
+
+pub fn sleepNs(ns: u64) void {
+    std.Io.sleep(io(), .fromNanoseconds(ns), .awake) catch {};
 }
 
 pub fn randomBytes(buffer: []u8) void {
@@ -283,6 +431,14 @@ pub const FileCompat = struct {
         };
     }
 };
+
+pub fn openFileAbsolute(path: []const u8, flags: std.Io.Dir.OpenFileOptions) std.Io.File.OpenError!FileCompat {
+    return .{ .file = try std.Io.Dir.openFileAbsolute(io(), path, flags) };
+}
+
+pub fn createFileAbsolute(path: []const u8, flags: std.Io.Dir.CreateFileOptions) std.Io.File.OpenError!FileCompat {
+    return .{ .file = try std.Io.Dir.createFileAbsolute(io(), path, flags) };
+}
 
 pub const DirCompat = struct {
     dir: std.Io.Dir,

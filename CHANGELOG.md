@@ -23,6 +23,7 @@ All notable user-facing changes to Tardigrade are documented here.
 
 ### Changed
 - Modernized `build.zig` for Zig 0.16: removed boilerplate comments, extracted `configureSsl` helper to deduplicate OpenSSL/HTTP3 library setup across exe and test targets, removed unused `Io` import. Expanded `CONTRIBUTING.md` with a build-option table and common workflow examples.
+- Added a Zig `0.16.0` compatibility module to the integration harness and refreshed live test process/socket helpers for the new stdlib process and I/O APIs.
 - Replaced deprecated `std.fs.path.*` module access with `std.Io.Dir.path.*`; updated deprecated `std.Io.File.CreateFlags`/`OpenFlags` parameter types to `std.Io.Dir.CreateFileOptions`/`OpenFileOptions` across main.zig and filesystem helpers.
 - Replaced deprecated `std.mem.indexOf*` and `std.mem.lastIndexOf*` family with the Zig 0.16 `find*` equivalents across 33 source files (256 call sites).
 - Replaced deprecated `std.ArrayListUnmanaged` with `std.ArrayList` in config file parser; threaded explicit allocator through `http2_frame.writeSettings` and `writePushPromise` to remove hardcoded `page_allocator` usage.
@@ -33,6 +34,7 @@ All notable user-facing changes to Tardigrade are documented here.
 
 ### Fixed
 - CI now installs OpenSSL development headers explicitly and enforces formatting consistently.
+- Unix-socket upstream probing/proxying no longer depends on removed `std.http.Client.connectUnix()` behavior under Zig `0.16.0`; plain HTTP upstream compatibility paths now fall back to raw request/response handling where needed.
 - Proxy requests now strip RFC hop-by-hop headers, including headers named by the incoming `Connection` field, before forwarding to upstreams.
 - Static file serving now rejects percent-encoded traversal, separator-variant traversal, and symlink escapes outside the configured root.
 - Rate limiting now resolves authenticated identity before middleware enforcement so JWT, bearer, and session traffic do not share an IP-only bucket.

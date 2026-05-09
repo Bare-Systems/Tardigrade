@@ -14,6 +14,12 @@ pub fn build(b: *std.Build) void {
     const build_options = b.addOptions();
     build_options.addOption(bool, "enable_http3_ngtcp2", enable_http3_ngtcp2);
     build_options.addOption([]const u8, "version", app_version);
+    const compat_mod = b.createModule(.{
+        .root_source_file = b.path("src/zig_compat.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
 
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -71,6 +77,7 @@ pub fn build(b: *std.Build) void {
     });
     integration_mod.addImport("integration_options", integration_options.createModule());
     integration_mod.addImport("build_options", build_options.createModule());
+    integration_mod.addImport("zig_compat", compat_mod);
 
     const integration_tests = b.addTest(.{
         .root_module = integration_mod,

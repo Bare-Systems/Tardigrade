@@ -3144,7 +3144,7 @@ fn reopenErrorLog(cfg: *const edge_config.EdgeConfig) !void {
 
 fn rejectOverloadedClient(client_fd: std.posix.fd_t) void {
     setNonBlocking(client_fd, false) catch {};
-    const stream = compat.NetStream{ .handle = client_fd };
+    const stream = compat.netStreamFromFd(client_fd);
     stream.writer().writeAll(
         "HTTP/1.1 503 Service Unavailable\r\n" ++
             "Connection: close\r\n" ++
@@ -3264,17 +3264,18 @@ fn probeSingleUpstream(cfg: *const edge_config.EdgeConfig, state: *GatewayState,
         return;
     };
 
-    var header_buf: [4 * 1024]u8 = undefined;
-    const unix_conn: ?*std.http.Client.Connection = if (unixSocketPathFromEndpoint(base_url)) |socket_path|
-        probe_client.connectUnix(socket_path) catch |err| {
-            state.logger.warn(null, "active health probe unix connect failed for {s}: {}", .{ base_url, err });
+    if (unixSocketPathFromEndpoint(base_url)) |socket_path| {
+        const status_code = probeUnixSocketUpstream(socket_path, uri, cfg.upstream_active_health_timeout_ms) catch |err| {
+            state.logger.warn(null, "active health probe unix request failed for {s}: {}", .{ base_url, err });
             state.recordActiveProbeResult(cfg, base_url, false);
             return;
-        }
-    else
-        null;
+        };
+        state.recordActiveProbeResult(cfg, base_url, health_cfg.statusIsHealthy(status_code));
+        return;
+    }
+
+    var header_buf: [4 * 1024]u8 = undefined;
     var req = probe_client.request(.GET, uri, .{
-        .connection = unix_conn,
         .keep_alive = false,
     }) catch |err| {
         state.logger.warn(null, "active health probe open failed for {s}: {}", .{ base_url, err });
@@ -3282,12 +3283,6 @@ fn probeSingleUpstream(cfg: *const edge_config.EdgeConfig, state: *GatewayState,
         return;
     };
     defer req.deinit();
-
-    if (cfg.upstream_active_health_timeout_ms > 0) {
-        if (req.connection) |conn| {
-            setSocketTimeoutMs(conn.stream_reader.stream.socket.handle, cfg.upstream_active_health_timeout_ms, cfg.upstream_active_health_timeout_ms) catch {};
-        }
-    }
 
     req.sendBodiless() catch |err| {
         state.logger.warn(null, "active health probe send failed for {s}: {}", .{ base_url, err });
@@ -3307,6 +3302,45 @@ fn probeSingleUpstream(cfg: *const edge_config.EdgeConfig, state: *GatewayState,
     } else {
         state.recordActiveProbeResult(cfg, base_url, false);
     }
+}
+
+fn probeUnixSocketUpstream(socket_path: []const u8, uri: std.Uri, timeout_ms: u32) !u16 {
+    var stream = try compat.connectUnixSocket(socket_path);
+    defer stream.close();
+
+    if (timeout_ms > 0) {
+        try setSocketTimeoutMs(stream.handle, timeout_ms, timeout_ms);
+    }
+
+    var request_target_buf = std.array_list.Managed(u8).init(std.heap.page_allocator);
+    defer request_target_buf.deinit();
+    const path_raw = switch (uri.path) {
+        .raw => |path| if (path.len > 0) path else "/",
+        .percent_encoded => |path| if (path.len > 0) path else "/",
+    };
+    try request_target_buf.appendSlice(path_raw);
+    if (uri.query) |query| {
+        try request_target_buf.appendSlice("?");
+        try request_target_buf.appendSlice(uriComponentBytes(query));
+    }
+
+    try stream.print("GET {s} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n", .{request_target_buf.items});
+
+    var response_buf: [256]u8 = undefined;
+    var used: usize = 0;
+    while (used < response_buf.len) {
+        const n = try stream.read(response_buf[used..]);
+        if (n == 0) break;
+        used += n;
+        if (std.mem.find(u8, response_buf[0..used], "\r\n")) |line_end| {
+            var parts = std.mem.splitScalar(u8, response_buf[0..line_end], ' ');
+            _ = parts.next() orelse return error.InvalidHttpResponse;
+            const status_str = parts.next() orelse return error.InvalidHttpResponse;
+            return std.fmt.parseInt(u16, status_str, 10);
+        }
+    }
+
+    return error.InvalidHttpResponse;
 }
 
 fn applyFdSoftLimit(desired: u64) !?u64 {
@@ -3464,7 +3498,7 @@ fn handleAcceptedClient(raw_ctx: *anyopaque, client_fd: std.posix.fd_t) void {
             ctx.state.logger.debug(null, "closing connection after max requests per connection reached ({d})", .{cfg.max_requests_per_connection});
         }
     } else {
-        const stream = compat.NetStream{ .handle = client_fd };
+        const stream = compat.netStreamFromFd(client_fd);
         defer stream.close();
 
         var served: u32 = 0;
@@ -5020,6 +5054,185 @@ const RawUpstreamResponse = struct {
     }
 };
 
+fn uriComponentBytes(component: std.Uri.Component) []const u8 {
+    return switch (component) {
+        .raw => |value| value,
+        .percent_encoded => |value| value,
+    };
+}
+
+fn parseRawUpstreamResponse(allocator: std.mem.Allocator, raw: []const u8) !RawUpstreamResponse {
+    const header_end = std.mem.find(u8, raw, "\r\n\r\n") orelse return error.UnsupportedHttpMethod;
+    const headers_raw = raw[0..header_end];
+    const resp_body = raw[header_end + 4 ..];
+
+    const first_line_end = std.mem.findScalar(u8, headers_raw, '\n') orelse return error.UnsupportedHttpMethod;
+    const first_line = compat.trimRight(u8, headers_raw[0..first_line_end], "\r");
+    var line_parts = std.mem.splitScalar(u8, first_line, ' ');
+    _ = line_parts.next();
+    const status_str = line_parts.next() orelse "200";
+    const status_code = std.fmt.parseInt(u16, status_str, 10) catch 200;
+    const reason = line_parts.rest();
+
+    var resp_headers = std.array_list.Managed(UpstreamHeader).init(allocator);
+    errdefer {
+        for (resp_headers.items) |*h| h.deinit(allocator);
+        resp_headers.deinit();
+    }
+    var hdr_lines = std.mem.splitSequence(u8, headers_raw[first_line_end + 1 ..], "\r\n");
+    while (hdr_lines.next()) |line| {
+        const colon = std.mem.findScalar(u8, line, ':') orelse continue;
+        const hname = std.mem.trim(u8, line[0..colon], " \t");
+        const hval = std.mem.trim(u8, line[colon + 1 ..], " \t");
+        if (shouldSkipUpstreamResponseHeader(hname)) continue;
+        try resp_headers.append(.{
+            .name = try allocator.dupe(u8, hname),
+            .value = try allocator.dupe(u8, hval),
+        });
+    }
+
+    return .{
+        .status_code = status_code,
+        .reason = try allocator.dupe(u8, reason),
+        .headers = try resp_headers.toOwnedSlice(),
+        .body = try allocator.dupe(u8, resp_body),
+    };
+}
+
+fn executeUnixSocketHttpRequest(
+    allocator: std.mem.Allocator,
+    socket_path: []const u8,
+    uri: std.Uri,
+    method: []const u8,
+    extra_headers: []const std.http.Header,
+    body: []const u8,
+    content_type_override: ?[]const u8,
+    timeout_ms: u32,
+) !RawUpstreamResponse {
+    var stream = try compat.connectUnixSocket(socket_path);
+    defer stream.close();
+
+    if (timeout_ms > 0) {
+        try setSocketTimeoutMs(stream.handle, timeout_ms, timeout_ms);
+    }
+
+    var req_aw: std.Io.Writer.Allocating = .init(allocator);
+    defer req_aw.deinit();
+    const req_writer = &req_aw.writer;
+    var host_buf: [256]u8 = undefined;
+    const host = if (uri.host) |value| try value.toRaw(&host_buf) else "localhost";
+
+    try req_writer.print("{s} {s}", .{ method, uriComponentBytes(uri.path) });
+    if (uri.query) |query| {
+        try req_writer.print("?{s}", .{uriComponentBytes(query)});
+    }
+    try req_writer.writeAll(" HTTP/1.1\r\n");
+    try req_writer.print("Host: {s}\r\n", .{host});
+    try req_writer.writeAll("Connection: close\r\n");
+    if (content_type_override) |content_type| {
+        try req_writer.print("Content-Type: {s}\r\n", .{content_type});
+    }
+    for (extra_headers) |header| {
+        try req_writer.print("{s}: {s}\r\n", .{ header.name, header.value });
+    }
+    if (body.len > 0) {
+        try req_writer.print("Content-Length: {d}\r\n", .{body.len});
+    }
+    try req_writer.writeAll("\r\n");
+    if (body.len > 0) {
+        try req_writer.writeAll(body);
+    }
+
+    try stream.writeAll(req_aw.written());
+
+    var resp_raw = std.array_list.Managed(u8).init(allocator);
+    defer resp_raw.deinit();
+    var read_buf: [8192]u8 = undefined;
+    while (true) {
+        const n = try stream.read(&read_buf);
+        if (n == 0) break;
+        try resp_raw.appendSlice(read_buf[0..n]);
+        if (resp_raw.items.len > MAX_REQUEST_SIZE) break;
+    }
+
+    return parseRawUpstreamResponse(allocator, resp_raw.items);
+}
+
+fn executeTcpSocketHttpRequest(
+    allocator: std.mem.Allocator,
+    uri: std.Uri,
+    method: []const u8,
+    extra_headers: []const std.http.Header,
+    body: []const u8,
+    content_type_override: ?[]const u8,
+    timeout_ms: u32,
+) !RawUpstreamResponse {
+    _ = timeout_ms;
+
+    var host_buf: [256]u8 = undefined;
+    const host_component = uri.host orelse return error.UnsupportedHttpMethod;
+    const host = try host_component.toRaw(&host_buf);
+    const port = uri.port orelse 80;
+
+    var stream = try compat.tcpConnectToHost(allocator, host, port);
+    defer stream.close();
+
+    var req_aw: std.Io.Writer.Allocating = .init(allocator);
+    defer req_aw.deinit();
+    const req_writer = &req_aw.writer;
+
+    const path_raw = switch (uri.path) {
+        .raw => |path| if (path.len > 0) path else "/",
+        .percent_encoded => |path| if (path.len > 0) path else "/",
+    };
+    try req_writer.print("{s} {s}", .{ method, path_raw });
+    if (uri.query) |query| {
+        try req_writer.print("?{s}", .{uriComponentBytes(query)});
+    }
+    try req_writer.writeAll(" HTTP/1.1\r\n");
+    try req_writer.print("Host: {s}\r\n", .{host});
+    try req_writer.writeAll("Connection: close\r\n");
+    if (content_type_override) |content_type| {
+        try req_writer.print("Content-Type: {s}\r\n", .{content_type});
+    }
+    for (extra_headers) |header| {
+        try req_writer.print("{s}: {s}\r\n", .{ header.name, header.value });
+    }
+    if (body.len > 0) {
+        try req_writer.print("Content-Length: {d}\r\n", .{body.len});
+    }
+    try req_writer.writeAll("\r\n");
+    if (body.len > 0) {
+        try req_writer.writeAll(body);
+    }
+
+    try stream.writeAll(req_aw.written());
+
+    var resp_raw = std.array_list.Managed(u8).init(allocator);
+    defer resp_raw.deinit();
+    var read_buf: [8192]u8 = undefined;
+    while (true) {
+        const n = try stream.read(&read_buf);
+        if (n == 0) break;
+        try resp_raw.appendSlice(read_buf[0..n]);
+        if (resp_raw.items.len > MAX_REQUEST_SIZE) break;
+    }
+
+    return parseRawUpstreamResponse(allocator, resp_raw.items);
+}
+
+fn rawUpstreamResponseHasNoStore(response: *const RawUpstreamResponse) bool {
+    for (response.headers) |header| {
+        if (!std.ascii.eqlIgnoreCase(header.name, "cache-control")) continue;
+        var tokens = std.mem.splitScalar(u8, header.value, ',');
+        while (tokens.next()) |token_raw| {
+            const token = std.mem.trim(u8, token_raw, " \t\r\n");
+            if (std.ascii.eqlIgnoreCase(token, "no-store")) return true;
+        }
+    }
+    return false;
+}
+
 fn executeRawHttpProxyRequest(
     allocator: std.mem.Allocator,
     client: *std.http.Client,
@@ -5041,11 +5254,6 @@ fn executeRawHttpProxyRequest(
 ) !RawUpstreamResponse {
     const method_enum = std.meta.stringToEnum(std.http.Method, method) orelse return error.UnsupportedHttpMethod;
     const uri = try std.Uri.parse(url);
-    var server_header_buffer: [16 * 1024]u8 = undefined;
-    const unix_conn: ?*std.http.Client.Connection = if (unix_socket_path) |socket_path|
-        try client.connectUnix(socket_path)
-    else
-        null;
     const forwarded_for = try buildForwardedFor(allocator, request_headers.get("x-forwarded-for"), client_ip);
     defer allocator.free(forwarded_for);
 
@@ -5071,29 +5279,45 @@ fn executeRawHttpProxyRequest(
         if (tp.len > 0) try extra_headers.append(.{ .name = "traceparent", .value = tp });
     }
 
+    if (unix_socket_path) |socket_path| {
+        const effective_timeout_ms = if (attempt_timeout_ms > 0) attempt_timeout_ms else connect_timeout_ms;
+        return executeUnixSocketHttpRequest(
+            allocator,
+            socket_path,
+            uri,
+            method,
+            extra_headers.items,
+            body,
+            null,
+            effective_timeout_ms,
+        );
+    }
+
+    if (std.ascii.eqlIgnoreCase(uri.scheme, "http")) {
+        const effective_timeout_ms = if (attempt_timeout_ms > 0) attempt_timeout_ms else connect_timeout_ms;
+        return executeTcpSocketHttpRequest(
+            allocator,
+            uri,
+            method,
+            extra_headers.items,
+            body,
+            null,
+            effective_timeout_ms,
+        );
+    }
+
+    var server_header_buffer: [16 * 1024]u8 = undefined;
+
     var req = try client.request(method_enum, uri, .{
-        .connection = unix_conn,
         .headers = .{
             .connection = .omit,
             .accept_encoding = .omit,
         },
         .extra_headers = extra_headers.items,
-        .keep_alive = true,
+        .keep_alive = false,
         .redirect_behavior = .unhandled,
     });
     defer req.deinit();
-
-    // Apply per-attempt socket timeouts now that the connection is established.
-    if (req.connection) |conn| {
-        const fd = conn.stream_reader.stream.socket.handle;
-        if (attempt_timeout_ms > 0) {
-            setSocketTimeoutMs(fd, attempt_timeout_ms, attempt_timeout_ms) catch {};
-        } else if (connect_timeout_ms > 0) {
-            // No per-attempt timeout configured; at least enforce the connect
-            // timeout as a send timeout to prevent unbounded sends.
-            setSocketTimeoutMs(fd, connect_timeout_ms, connect_timeout_ms) catch {};
-        }
-    }
 
     if (body.len > 0) {
         try req.sendBodyComplete(@constCast(body));
@@ -7618,7 +7842,7 @@ fn registerDeviceIdentity(path: []const u8, device_id: []const u8, public_key: [
     defer _ = std.c.close(fd);
     const line = try std.fmt.allocPrint(std.heap.page_allocator, "{s}|{s}\n", .{ device_id, public_key });
     defer std.heap.page_allocator.free(line);
-    const stream = compat.NetStream{ .handle = fd };
+    const stream = compat.netStreamFromFd(fd);
     try stream.writeAll(line);
 }
 
@@ -8408,26 +8632,137 @@ fn proxyJsonExecuteSingleAttempt(
 
     var server_header_buffer: [16 * 1024]u8 = undefined;
     const uri = try std.Uri.parse(current_url);
-    const unix_conn: ?*std.http.Client.Connection = if (current_unix_socket_path) |socket_path|
-        try state.upstream_client.connectUnix(socket_path)
-    else
-        null;
+    if (current_unix_socket_path) |socket_path| {
+        var raw_resp = try executeUnixSocketHttpRequest(
+            allocator,
+            socket_path,
+            uri,
+            "POST",
+            extra_headers.items,
+            payload,
+            "application/json",
+            attempt_timeout_ms,
+        );
+        defer raw_resp.deinit(allocator);
+
+        const status_code = raw_resp.status_code;
+        const upstream_reason = raw_resp.reason;
+        const upstream_content_type = raw_resp.headerValue("Content-Type") orelse JSON_CONTENT_TYPE;
+        const upstream_content_disposition = raw_resp.headerValue("Content-Disposition");
+        const upstream_location = if (raw_resp.headerValue("Location")) |location|
+            try allocator.dupe(u8, location)
+        else
+            null;
+        errdefer if (upstream_location) |location| allocator.free(location);
+        const cacheable = !rawUpstreamResponseHasNoStore(&raw_resp);
+        const stream_status = enable_streaming_success and (status_code == 200 or cfg.proxy_stream_all_statuses);
+        if (stream_status) {
+            try writeStreamedUpstreamResponse(
+                downstream_writer,
+                status_code,
+                upstream_reason,
+                upstream_content_type,
+                upstream_content_disposition,
+                correlation_id,
+                &state.security_headers,
+                sticky_set_cookie,
+            );
+            if (raw_resp.body.len > 0) {
+                try writeChunk(downstream_writer, raw_resp.body);
+            }
+            try downstream_writer.writeAll("0\r\n\r\n");
+            return .{ .streamed_status = .{ .status = status_code, .upstream_addr = upstream_host } };
+        }
+
+        if (status_code != 200) {
+            const buffered_content_type = try allocator.dupe(u8, upstream_content_type);
+            errdefer allocator.free(buffered_content_type);
+            const buffered_content_disposition = if (upstream_content_disposition) |cd|
+                try allocator.dupe(u8, cd)
+            else
+                null;
+            errdefer if (buffered_content_disposition) |cd| allocator.free(cd);
+            const buffered_set_cookie = if (sticky_set_cookie) |cookie|
+                try allocator.dupe(u8, cookie)
+            else
+                null;
+            errdefer if (buffered_set_cookie) |cookie| allocator.free(cookie);
+
+            state.appendTranscript(
+                upstreamScopeName(upstream_scope),
+                proxy_pass_target,
+                correlation_id,
+                auth_identity,
+                client_ip,
+                current_url,
+                payload,
+                status_code,
+                upstream_content_type,
+                "",
+                &.{},
+            );
+            return .{
+                .buffered = .{
+                    .status = status_code,
+                    .body = try allocator.alloc(u8, 0),
+                    .content_type = buffered_content_type,
+                    .content_disposition = buffered_content_disposition,
+                    .location = upstream_location,
+                    .set_cookie = buffered_set_cookie,
+                    .cacheable = false,
+                    .upstream_addr = upstream_host,
+                },
+            };
+        }
+
+        const body = try allocator.dupe(u8, raw_resp.body);
+        errdefer allocator.free(body);
+        const buffered_content_type = try allocator.dupe(u8, upstream_content_type);
+        errdefer allocator.free(buffered_content_type);
+        const buffered_content_disposition = if (upstream_content_disposition) |cd|
+            try allocator.dupe(u8, cd)
+        else
+            null;
+        errdefer if (buffered_content_disposition) |cd| allocator.free(cd);
+        const buffered_set_cookie = if (sticky_set_cookie) |cookie|
+            try allocator.dupe(u8, cookie)
+        else
+            null;
+        errdefer if (buffered_set_cookie) |cookie| allocator.free(cookie);
+        state.appendTranscript(
+            upstreamScopeName(upstream_scope),
+            proxy_pass_target,
+            correlation_id,
+            auth_identity,
+            client_ip,
+            current_url,
+            payload,
+            status_code,
+            buffered_content_type,
+            body,
+            &.{},
+        );
+        return .{
+            .buffered = .{
+                .status = status_code,
+                .body = body,
+                .content_type = buffered_content_type,
+                .content_disposition = buffered_content_disposition,
+                .location = upstream_location,
+                .set_cookie = buffered_set_cookie,
+                .cacheable = cacheable,
+                .upstream_addr = upstream_host,
+            },
+        };
+    }
+
     var req = try state.upstream_client.request(.POST, uri, .{
-        .connection = unix_conn,
         .headers = .{ .content_type = .{ .override = "application/json" } },
         .extra_headers = extra_headers.items,
-        .keep_alive = true,
+        .keep_alive = false,
         .redirect_behavior = .unhandled,
     });
     defer req.deinit();
-
-    if (attempt_timeout_ms > 0) {
-        if (req.connection) |conn| {
-            setSocketTimeoutMs(conn.stream_reader.stream.socket.handle, attempt_timeout_ms, attempt_timeout_ms) catch |err| {
-                state.logger.warn(null, "failed to set upstream socket timeout: {}", .{err});
-            };
-        }
-    }
 
     try req.sendBodyComplete(@constCast(payload));
     var resp = try req.receiveHead(&server_header_buffer);

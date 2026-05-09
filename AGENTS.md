@@ -23,6 +23,46 @@ zig build test
 zig build test-integration
 ```
 
+## Shared State Inventory
+
+`GatewayState` is a single long-lived struct shared across all worker threads.
+Every mutable field that crosses thread boundaries has explicit ownership.
+
+| Field(s) | Guard | Notes |
+|---|---|---|
+| `rate_limiter` | `rate_limiter_mutex` | Token-bucket per-IP/identity buckets |
+| `idempotency_store` | `idempotency_mutex` | Request-ID dedup cache |
+| `proxy_cache_store`, `proxy_cache_locks` | `proxy_cache_mutex` | Response cache + per-key write locks |
+| `session_store` | `session_mutex` | Session token table |
+| `circuit_breaker` | `circuit_mutex` | Per-upstream open/half-open state |
+| `command_lifecycle` | `command_mutex` | In-flight command records |
+| `approvals` | `approval_mutex` | Pending approval entries |
+| `mux_subscriptions_by_device`, `mux_resume_state` | (transcript_mutex / approval_mutex scope) | Mux channel tracking |
+| `upstream_health`, `upstream_active_requests`, `upstream_rr_index`, `upstream_backup_rr_index`, `lb_random_state` | `upstream_mutex` | All upstream selection and health state; `lb_random_state` updated only via `lcrngNext` inside `Locked`-suffix helpers |
+| `active_connections_total`, `active_connections_by_ip`, `active_fds`, `fd_to_ip` | `connection_mutex` | Per-IP and total connection accounting |
+| `metrics` | `metrics_mutex` | Prometheus counters |
+| `dns_discovery` | `dns_discovery.mutex` (internal) | DNS resolver state |
+| Config pointer | `ReloadableConfigStore.mutex` + ref-counting | Old version kept alive until all in-flight leases are released; no dangling pointer possible |
+| `last_reload_ok`, `last_reload_at_ms`, `last_reload_error*` | `reload_mutex` | Hot-reload outcome, queried by admin endpoint |
+
+### Reload safety
+
+`ReloadableConfigStore` uses acquire/release reference counting protected by its
+own mutex.  On hot reload: (1) new config is allocated and installed atomically
+under the store mutex; (2) the old version is moved to a `retired` list;
+(3) when its `ref_count` reaches zero, it is freed.  Workers hold a
+`ConfigLease` for the duration of each request so the config pointer cannot be
+freed under them, even when repeated reloads arrive.
+
+### PRNG
+
+`lb_random_state` is stepped via the standalone `lcrngNext` pure function (an
+LCG with full 2^64 period).  The function is only called from
+`nextLbRandomLocked`, which is always reached through callers that hold
+`upstream_mutex`, so no atomic operation is required.
+
+---
+
 ## HTTP/3 Session Resumption and 0-RTT
 
 HTTP/3 support is gated on the `enable_http3_ngtcp2` build option and requires

@@ -1516,7 +1516,7 @@ const GatewayState = struct {
     }
 
     fn nextLbRandomLocked(self: *GatewayState) u64 {
-        self.lb_random_state = self.lb_random_state *% 6364136223846793005 +% 1442695040888963407;
+        self.lb_random_state = lcrngNext(self.lb_random_state);
         return self.lb_random_state;
     }
 
@@ -1945,6 +1945,13 @@ const GatewayState = struct {
         return out.toOwnedSlice();
     }
 };
+
+/// Linear congruential PRNG step used for load-balancing randomness.
+/// Always called while holding GatewayState.upstream_mutex; exposed as a
+/// standalone pure function so it can be unit-tested independently.
+pub fn lcrngNext(state: u64) u64 {
+    return state *% 6364136223846793005 +% 1442695040888963407;
+}
 
 fn upstreamPoolForScope(cfg: *const edge_config.EdgeConfig, scope: UpstreamScope) UpstreamPoolView {
     return switch (scope) {
@@ -9998,4 +10005,35 @@ test "upstream_retry_idempotent_only=false allows POST retries" {
     else
         @intCast(@max(attempts, @as(u32, 1)));
     try std.testing.expectEqual(@as(usize, 3), max);
+}
+
+test "lcrngNext produces distinct successive values" {
+    // Verify the LCG advances state on each step.
+    const seed: u64 = 1;
+    const v1 = lcrngNext(seed);
+    const v2 = lcrngNext(v1);
+    const v3 = lcrngNext(v2);
+    try std.testing.expect(v1 != seed);
+    try std.testing.expect(v2 != v1);
+    try std.testing.expect(v3 != v2);
+}
+
+test "lcrngNext is deterministic" {
+    // Same seed always produces the same sequence — important for reproducible
+    // load-balancing behaviour in tests.
+    const seed: u64 = 0xDEADBEEFCAFEBABE;
+    try std.testing.expectEqual(lcrngNext(seed), lcrngNext(seed));
+    try std.testing.expectEqual(lcrngNext(lcrngNext(seed)), lcrngNext(lcrngNext(seed)));
+}
+
+test "lcrngNext never returns zero from non-zero seed" {
+    // LCG multiplier is odd and addend is odd, so the period is 2^64.
+    // Verify a run of 1024 steps from a non-zero seed never wraps to zero
+    // (statistical sanity check, not a proof of full period).
+    var state: u64 = 42;
+    var i: usize = 0;
+    while (i < 1024) : (i += 1) {
+        state = lcrngNext(state);
+        try std.testing.expect(state != 0);
+    }
 }

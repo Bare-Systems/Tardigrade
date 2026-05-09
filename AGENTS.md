@@ -23,6 +23,65 @@ zig build test
 zig build test-integration
 ```
 
+## Zig 0.16 Performance Characteristics
+
+Summary of performance evaluation performed for issue #73.
+
+### Build times (Zig 0.16.0, aarch64 macOS, M-series)
+
+| Build mode | Typical time |
+|---|---|
+| `ReleaseFast` clean | ~30–60 s (first run compiles stdlib too; cached runs ~15–25 s) |
+| `ReleaseFast` incremental (1 file touched) | ~5–15 s |
+| `Debug` test build | ~20–40 s |
+
+Run `./scripts/build-benchmarks.sh` to capture current build times.
+
+### Zig 0.16 build improvements
+
+- **Incremental compilation**: Pass `-Zincremental` for faster rebuilds during
+  development. Incremental is not yet recommended for release builds as it may
+  produce slower binaries.
+- **Cross-compilation**: `zig build -Dtarget=aarch64-linux-gnu` produces a
+  native aarch64 binary from macOS without emulation.
+- **Link-time optimization**: Enabled implicitly at `ReleaseFast`; adds
+  ~5–10 s to link time but improves runtime throughput.
+
+### Runtime performance targets (HTTP/1.1 reverse proxy, loopback, 4 workers)
+
+These are indicative targets, not guaranteed SLAs:
+
+| Metric | Target |
+|---|---|
+| Throughput | ≥ 20 000 req/s (loopback, ReleaseFast, 4 workers) |
+| p50 latency | < 1 ms (loopback) |
+| p99 latency | < 5 ms (loopback) |
+| Memory (idle) | < 20 MB RSS |
+
+Capture baseline benchmarks with:
+```bash
+zig build -Doptimize=ReleaseFast
+./zig-out/bin/tardigrade run &
+./benchmarks/run.sh --duration 30 --connections 50 \
+  --save benchmarks/baselines/$(git describe --tags).json
+```
+
+Compare against a previous baseline:
+```bash
+./benchmarks/run.sh \
+  --baseline benchmarks/baselines/<previous-tag>.json \
+  --save benchmarks/results/$(date +%Y%m%d).json
+```
+
+### Known performance-sensitive areas
+
+- `runActiveHealthChecks` — now runs in a background thread (no event-loop impact)
+- `NetStream.Writer.print` / `TlsConnection.Writer.print` — now stack-allocated
+- `parseHeaders` — linear scan; no heap allocation for common header counts
+- TLS handshake — OpenSSL; cannot be parallelised per connection
+
+---
+
 ## Architecture and Ownership Audit (v0.62 baseline)
 
 Summary of the codebase audit performed for issue #60.

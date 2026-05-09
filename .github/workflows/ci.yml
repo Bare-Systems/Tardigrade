@@ -45,7 +45,7 @@ jobs:
         run: zig version
 
       - name: Check formatting
-        run: zig fmt --check src/ build.zig
+        run: zig fmt --check build.zig src/ tests/
 
       - name: Run unit tests
         run: zig build test --summary all --error-style verbose --multiline-errors

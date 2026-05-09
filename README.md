@@ -118,3 +118,17 @@ auth controls before serving metrics.
 zig build test
 zig build test-integration
 ```
+
+## Formatting
+
+Check formatting before committing:
+
+```bash
+zig fmt --check build.zig src/ tests/
+```
+
+Apply formatting in-place:
+
+```bash
+zig fmt build.zig src/ tests/
+```

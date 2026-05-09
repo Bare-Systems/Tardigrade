@@ -13,6 +13,9 @@ pub const RequestLimits = struct {
     max_header_count: usize,
     /// Maximum single header size in bytes (0 = use default 8KB).
     max_header_size: usize,
+    /// Maximum combined size of all request headers in bytes (0 = use default 32KB).
+    /// Requests that exceed this limit are rejected with 431 before body allocation.
+    max_headers_total_size: usize,
     /// Client body read timeout in milliseconds (0 = no timeout).
     body_timeout_ms: u32,
     /// Client header read timeout in milliseconds (0 = no timeout).
@@ -23,6 +26,7 @@ pub const RequestLimits = struct {
         .max_uri_length = 8 * 1024, // 8KB
         .max_header_count = 100,
         .max_header_size = 8 * 1024, // 8KB
+        .max_headers_total_size = 32 * 1024, // 32KB
         .body_timeout_ms = 30_000, // 30s
         .header_timeout_ms = 10_000, // 10s
     };
@@ -46,6 +50,11 @@ pub const RequestLimits = struct {
     pub fn effectiveMaxHeaderSize(self: RequestLimits) usize {
         return if (self.max_header_size > 0) self.max_header_size else default.max_header_size;
     }
+
+    /// Effective max total headers size (returns default if 0).
+    pub fn effectiveMaxHeadersTotalSize(self: RequestLimits) usize {
+        return if (self.max_headers_total_size > 0) self.max_headers_total_size else default.max_headers_total_size;
+    }
 };
 
 /// Validation result with specific rejection reason.
@@ -55,6 +64,7 @@ pub const ValidationResult = union(enum) {
     uri_too_long: struct { length: usize, limit: usize },
     too_many_headers: struct { count: usize, limit: usize },
     header_too_large: struct { size: usize, limit: usize },
+    headers_total_too_large: struct { size: usize, limit: usize },
 };
 
 /// Validate a request body size against limits.
@@ -93,6 +103,16 @@ pub fn validateHeaderSize(size: usize, limits: RequestLimits) ValidationResult {
     return .ok;
 }
 
+/// Validate the combined byte size of all headers against the configured total.
+/// Use this after parseHeaders to enforce the operator-configurable limit.
+pub fn validateHeadersTotalSize(total_size: usize, limits: RequestLimits) ValidationResult {
+    const max = limits.effectiveMaxHeadersTotalSize();
+    if (total_size > max) {
+        return .{ .headers_total_too_large = .{ .size = total_size, .limit = max } };
+    }
+    return .ok;
+}
+
 /// Format a human-readable rejection message.
 pub fn rejectionMessage(result: ValidationResult, buf: []u8) []const u8 {
     return switch (result) {
@@ -101,6 +121,7 @@ pub fn rejectionMessage(result: ValidationResult, buf: []u8) []const u8 {
         .uri_too_long => |info| std.fmt.bufPrint(buf, "URI too long: {d} bytes exceeds {d} byte limit", .{ info.length, info.limit }) catch "URI too long",
         .too_many_headers => |info| std.fmt.bufPrint(buf, "Too many headers: {d} exceeds {d} limit", .{ info.count, info.limit }) catch "Too many headers",
         .header_too_large => |info| std.fmt.bufPrint(buf, "Header too large: {d} bytes exceeds {d} byte limit", .{ info.size, info.limit }) catch "Header too large",
+        .headers_total_too_large => |info| std.fmt.bufPrint(buf, "Headers total too large: {d} bytes exceeds {d} byte limit", .{ info.size, info.limit }) catch "Headers total too large",
     };
 }
 
@@ -121,6 +142,7 @@ test "RequestLimits effective returns custom values" {
         .max_uri_length = 256,
         .max_header_count = 50,
         .max_header_size = 4096,
+        .max_headers_total_size = 16384,
         .body_timeout_ms = 5000,
         .header_timeout_ms = 2000,
     };
@@ -136,6 +158,7 @@ test "RequestLimits effective falls back to default when 0" {
         .max_uri_length = 0,
         .max_header_count = 0,
         .max_header_size = 0,
+        .max_headers_total_size = 0,
         .body_timeout_ms = 0,
         .header_timeout_ms = 0,
     };
@@ -144,13 +167,13 @@ test "RequestLimits effective falls back to default when 0" {
 }
 
 test "validateBodySize accepts under limit" {
-    const limits = RequestLimits{ .max_body_size = 1024, .max_uri_length = 0, .max_header_count = 0, .max_header_size = 0, .body_timeout_ms = 0, .header_timeout_ms = 0 };
+    const limits = RequestLimits{ .max_body_size = 1024, .max_uri_length = 0, .max_header_count = 0, .max_header_size = 0, .max_headers_total_size = 0, .body_timeout_ms = 0, .header_timeout_ms = 0 };
     try std.testing.expectEqual(ValidationResult.ok, validateBodySize(512, limits));
     try std.testing.expectEqual(ValidationResult.ok, validateBodySize(1024, limits));
 }
 
 test "validateBodySize rejects over limit" {
-    const limits = RequestLimits{ .max_body_size = 1024, .max_uri_length = 0, .max_header_count = 0, .max_header_size = 0, .body_timeout_ms = 0, .header_timeout_ms = 0 };
+    const limits = RequestLimits{ .max_body_size = 1024, .max_uri_length = 0, .max_header_count = 0, .max_header_size = 0, .max_headers_total_size = 0, .body_timeout_ms = 0, .header_timeout_ms = 0 };
     const result = validateBodySize(2048, limits);
     switch (result) {
         .body_too_large => |info| {
@@ -162,12 +185,12 @@ test "validateBodySize rejects over limit" {
 }
 
 test "validateUriLength accepts under limit" {
-    const limits = RequestLimits{ .max_body_size = 0, .max_uri_length = 256, .max_header_count = 0, .max_header_size = 0, .body_timeout_ms = 0, .header_timeout_ms = 0 };
+    const limits = RequestLimits{ .max_body_size = 0, .max_uri_length = 256, .max_header_count = 0, .max_header_size = 0, .max_headers_total_size = 0, .body_timeout_ms = 0, .header_timeout_ms = 0 };
     try std.testing.expectEqual(ValidationResult.ok, validateUriLength(100, limits));
 }
 
 test "validateUriLength rejects over limit" {
-    const limits = RequestLimits{ .max_body_size = 0, .max_uri_length = 256, .max_header_count = 0, .max_header_size = 0, .body_timeout_ms = 0, .header_timeout_ms = 0 };
+    const limits = RequestLimits{ .max_body_size = 0, .max_uri_length = 256, .max_header_count = 0, .max_header_size = 0, .max_headers_total_size = 0, .body_timeout_ms = 0, .header_timeout_ms = 0 };
     const result = validateUriLength(512, limits);
     switch (result) {
         .uri_too_long => |info| {
@@ -194,13 +217,13 @@ test "rejectionMessage formats uri_too_long" {
 }
 
 test "validateHeaderCount accepts under limit" {
-    const limits = RequestLimits{ .max_body_size = 0, .max_uri_length = 0, .max_header_count = 50, .max_header_size = 0, .body_timeout_ms = 0, .header_timeout_ms = 0 };
+    const limits = RequestLimits{ .max_body_size = 0, .max_uri_length = 0, .max_header_count = 50, .max_header_size = 0, .max_headers_total_size = 0, .body_timeout_ms = 0, .header_timeout_ms = 0 };
     try std.testing.expectEqual(ValidationResult.ok, validateHeaderCount(25, limits));
     try std.testing.expectEqual(ValidationResult.ok, validateHeaderCount(50, limits));
 }
 
 test "validateHeaderCount rejects over limit" {
-    const limits = RequestLimits{ .max_body_size = 0, .max_uri_length = 0, .max_header_count = 50, .max_header_size = 0, .body_timeout_ms = 0, .header_timeout_ms = 0 };
+    const limits = RequestLimits{ .max_body_size = 0, .max_uri_length = 0, .max_header_count = 50, .max_header_size = 0, .max_headers_total_size = 0, .body_timeout_ms = 0, .header_timeout_ms = 0 };
     const result = validateHeaderCount(100, limits);
     switch (result) {
         .too_many_headers => |info| {
@@ -212,12 +235,12 @@ test "validateHeaderCount rejects over limit" {
 }
 
 test "validateHeaderSize accepts under limit" {
-    const limits = RequestLimits{ .max_body_size = 0, .max_uri_length = 0, .max_header_count = 0, .max_header_size = 4096, .body_timeout_ms = 0, .header_timeout_ms = 0 };
+    const limits = RequestLimits{ .max_body_size = 0, .max_uri_length = 0, .max_header_count = 0, .max_header_size = 4096, .max_headers_total_size = 0, .body_timeout_ms = 0, .header_timeout_ms = 0 };
     try std.testing.expectEqual(ValidationResult.ok, validateHeaderSize(1024, limits));
 }
 
 test "validateHeaderSize rejects over limit" {
-    const limits = RequestLimits{ .max_body_size = 0, .max_uri_length = 0, .max_header_count = 0, .max_header_size = 4096, .body_timeout_ms = 0, .header_timeout_ms = 0 };
+    const limits = RequestLimits{ .max_body_size = 0, .max_uri_length = 0, .max_header_count = 0, .max_header_size = 4096, .max_headers_total_size = 0, .body_timeout_ms = 0, .header_timeout_ms = 0 };
     const result = validateHeaderSize(8192, limits);
     switch (result) {
         .header_too_large => |info| {
@@ -241,4 +264,49 @@ test "rejectionMessage formats header_too_large" {
     var buf: [256]u8 = undefined;
     const msg = rejectionMessage(result, &buf);
     try std.testing.expect(std.mem.find(u8, msg, "16384") != null);
+}
+
+test "RequestLimits includes max_headers_total_size with correct default" {
+    const limits = RequestLimits.default;
+    try std.testing.expectEqual(@as(usize, 32 * 1024), limits.max_headers_total_size);
+    try std.testing.expectEqual(@as(usize, 32 * 1024), limits.effectiveMaxHeadersTotalSize());
+}
+
+test "effectiveMaxHeadersTotalSize falls back to default when 0" {
+    const limits = RequestLimits{
+        .max_body_size = 0,
+        .max_uri_length = 0,
+        .max_header_count = 0,
+        .max_header_size = 0,
+        .max_headers_total_size = 0,
+        .body_timeout_ms = 0,
+        .header_timeout_ms = 0,
+    };
+    try std.testing.expectEqual(RequestLimits.default.max_headers_total_size, limits.effectiveMaxHeadersTotalSize());
+}
+
+test "validateHeadersTotalSize accepts under limit" {
+    const limits = RequestLimits{ .max_body_size = 0, .max_uri_length = 0, .max_header_count = 0, .max_header_size = 0, .max_headers_total_size = 4096, .body_timeout_ms = 0, .header_timeout_ms = 0 };
+    try std.testing.expectEqual(ValidationResult.ok, validateHeadersTotalSize(100, limits));
+    try std.testing.expectEqual(ValidationResult.ok, validateHeadersTotalSize(4096, limits));
+}
+
+test "validateHeadersTotalSize rejects over limit" {
+    const limits = RequestLimits{ .max_body_size = 0, .max_uri_length = 0, .max_header_count = 0, .max_header_size = 0, .max_headers_total_size = 4096, .body_timeout_ms = 0, .header_timeout_ms = 0 };
+    const result = validateHeadersTotalSize(8192, limits);
+    switch (result) {
+        .headers_total_too_large => |info| {
+            try std.testing.expectEqual(@as(usize, 8192), info.size);
+            try std.testing.expectEqual(@as(usize, 4096), info.limit);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "rejectionMessage formats headers_total_too_large" {
+    const result = ValidationResult{ .headers_total_too_large = .{ .size = 65536, .limit = 32768 } };
+    var buf: [256]u8 = undefined;
+    const msg = rejectionMessage(result, &buf);
+    try std.testing.expect(std.mem.find(u8, msg, "65536") != null);
+    try std.testing.expect(std.mem.find(u8, msg, "32768") != null);
 }

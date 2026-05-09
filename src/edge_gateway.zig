@@ -4063,7 +4063,15 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
     }
 
     const parse_result = http.Request.parse(allocator, pending_buf[0..total_read], MAX_REQUEST_SIZE) catch |err| {
-        try sendApiError(allocator, conn.writer(), .bad_request, "invalid_request", "Malformed request", null, keep_alive, state);
+        // Return the appropriate status code so clients can distinguish parse
+        // failures: 431 for header-size/count violations, 413 for oversized
+        // body, 400 for everything else (malformed syntax, invalid method, etc.).
+        const status: http.status.Status = switch (err) {
+            error.HeadersTooLarge, error.HeaderTooLarge, error.TooManyHeaders => .request_header_fields_too_large,
+            error.BodyTooLarge => .payload_too_large,
+            else => .bad_request,
+        };
+        try sendApiError(allocator, conn.writer(), status, "invalid_request", "Malformed request", null, keep_alive, state);
         state.logger.warn(null, "parse error: {}", .{err});
         return;
     };
@@ -5605,10 +5613,25 @@ fn runMiddlewarePipeline(
     }
     const header_count_check = http.request_limits.validateHeaderCount(request.headers.count(), limits);
     if (header_count_check != .ok) {
-        try sendApiError(allocator, writer, .bad_request, "invalid_request", "Too many headers", correlation_id, keep_alive, state);
+        var msg_buf: [256]u8 = undefined;
+        const msg = http.request_limits.rejectionMessage(header_count_check, &msg_buf);
+        try sendApiError(allocator, writer, .request_header_fields_too_large, "invalid_request", msg, correlation_id, keep_alive, state);
         state.logger.warn(correlation_id, "Too many headers: {d}", .{request.headers.count()});
-        logAccess(ctx, request.method.toString(), request.uri.path, 400, request.headers.get("user-agent") orelse "");
+        logAccess(ctx, request.method.toString(), request.uri.path, 431, request.headers.get("user-agent") orelse "");
         return true;
+    }
+    {
+        var headers_total: usize = 0;
+        for (request.headers.iterator()) |h| headers_total += h.name.len + h.value.len + 4; // ": \r\n"
+        const total_check = http.request_limits.validateHeadersTotalSize(headers_total, limits);
+        if (total_check != .ok) {
+            var msg_buf: [256]u8 = undefined;
+            const msg = http.request_limits.rejectionMessage(total_check, &msg_buf);
+            try sendApiError(allocator, writer, .request_header_fields_too_large, "invalid_request", msg, correlation_id, keep_alive, state);
+            state.logger.warn(correlation_id, "Headers total too large: {d} bytes", .{headers_total});
+            logAccess(ctx, request.method.toString(), request.uri.path, 431, request.headers.get("user-agent") orelse "");
+            return true;
+        }
     }
     if (request.body) |body| {
         const body_check = http.request_limits.validateBodySize(body.len, limits);

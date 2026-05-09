@@ -855,6 +855,10 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     defer allocator.free(max_hdr_size_str);
     const max_header_size = std.fmt.parseInt(usize, max_hdr_size_str, 10) catch 0;
 
+    const max_hdr_total_str = envOrDefault(allocator, "TARDIGRADE_MAX_HEADERS_TOTAL_SIZE", "0") catch unreachable;
+    defer allocator.free(max_hdr_total_str);
+    const max_headers_total_size = std.fmt.parseInt(usize, max_hdr_total_str, 10) catch 0;
+
     const body_timeout_str = envOrDefault(allocator, "TARDIGRADE_BODY_TIMEOUT_MS", "0") catch unreachable;
     defer allocator.free(body_timeout_str);
     const body_timeout_ms = std.fmt.parseInt(u32, body_timeout_str, 10) catch 0;
@@ -1331,6 +1335,7 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
             .max_uri_length = max_uri_length,
             .max_header_count = max_header_count,
             .max_header_size = max_header_size,
+            .max_headers_total_size = max_headers_total_size,
             .body_timeout_ms = body_timeout_ms,
             .header_timeout_ms = header_timeout_ms,
         },

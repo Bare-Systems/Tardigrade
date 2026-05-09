@@ -115,7 +115,10 @@ auth controls before serving metrics.
 ## Testing
 
 ```bash
-zig build test
+# Unit tests
+zig build test --summary all --error-style verbose --multiline-errors
+
+# Integration tests (requires a running tardigrade instance and system OpenSSL)
 zig build test-integration
 ```
 

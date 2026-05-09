@@ -7,13 +7,23 @@
 - Keep changes focused and minimal.
 - Update docs when behavior changes.
 
-## Testing
+## Development commands
 
-Use Zig `0.16.0` for local builds and validation.
+Use Zig `0.16.0` for all local builds and validation.
 
 ```bash
-zig build test
+# Format check (matches CI)
+zig fmt --check build.zig src/ tests/
+
+# Unit tests (matches CI)
+zig build test --summary all --error-style verbose --multiline-errors
+
+# Integration tests — requires a running tardigrade instance and system OpenSSL
+# (see tests/README.md for setup). Not required for most contributions.
 zig build test-integration
+
+# Release-mode build
+zig build -Doptimize=ReleaseFast
 ```
 
 ## Build options

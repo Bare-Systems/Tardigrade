@@ -1,6 +1,46 @@
 const std = @import("std");
 const compat = @import("../zig_compat.zig");
 
+/// AES-256-GCM AEAD used for `ENC2:` secret storage.
+/// Key length: 32 bytes. Nonce length: 12 bytes. Tag length: 16 bytes.
+pub const SecretAead = std.crypto.aead.aes_gcm.Aes256Gcm;
+
+/// Encrypt `plaintext` under `key` using AES-256-GCM and return a heap-allocated
+/// blob: `nonce (12 B) || ciphertext || tag (16 B)`.
+/// Caller owns the returned slice.
+pub fn encryptSecret(allocator: std.mem.Allocator, plaintext: []const u8, key: [SecretAead.key_length]u8) ![]u8 {
+    var nonce: [SecretAead.nonce_length]u8 = undefined;
+    compat.randomBytes(&nonce);
+
+    const blob_len = SecretAead.nonce_length + plaintext.len + SecretAead.tag_length;
+    const blob = try allocator.alloc(u8, blob_len);
+    errdefer allocator.free(blob);
+
+    const ciphertext_out = blob[SecretAead.nonce_length .. SecretAead.nonce_length + plaintext.len];
+    var tag: [SecretAead.tag_length]u8 = undefined;
+    SecretAead.encrypt(ciphertext_out, &tag, plaintext, "", nonce, key);
+    @memcpy(blob[0..SecretAead.nonce_length], &nonce);
+    @memcpy(blob[SecretAead.nonce_length + plaintext.len ..], &tag);
+    return blob;
+}
+
+/// Decrypt a blob produced by `encryptSecret`. Returns the plaintext.
+/// Caller owns the returned slice.
+pub fn decryptSecret(allocator: std.mem.Allocator, blob: []const u8, key: [SecretAead.key_length]u8) ![]u8 {
+    const min_len = SecretAead.nonce_length + SecretAead.tag_length;
+    if (blob.len < min_len) return error.InvalidBlob;
+
+    const nonce = blob[0..SecretAead.nonce_length].*;
+    const ciphertext = blob[SecretAead.nonce_length .. blob.len - SecretAead.tag_length];
+    const tag_start = blob.len - SecretAead.tag_length;
+    const tag: [SecretAead.tag_length]u8 = blob[tag_start..][0..SecretAead.tag_length].*;
+
+    const plain = try allocator.alloc(u8, ciphertext.len);
+    errdefer allocator.free(plain);
+    SecretAead.decrypt(plain, ciphertext, tag, "", nonce, key) catch return error.AuthenticationFailed;
+    return plain;
+}
+
 pub const Overrides = struct {
     map: std.StringHashMap([]const u8),
 
@@ -49,7 +89,9 @@ pub fn loadOverrides(allocator: std.mem.Allocator) !Overrides {
         const value = std.mem.trim(u8, line[eq + 1 ..], " \t");
         if (key.len == 0 or value.len == 0) continue;
 
-        const plain = if (std.mem.startsWith(u8, value, "ENC:"))
+        const plain = if (std.mem.startsWith(u8, value, "ENC2:"))
+            try decryptValueAesGcm(allocator, value["ENC2:".len..], key_list)
+        else if (std.mem.startsWith(u8, value, "ENC:"))
             try decryptValue(allocator, value["ENC:".len..], key_list)
         else
             try allocator.dupe(u8, value);
@@ -107,9 +149,27 @@ fn hexDecode(allocator: std.mem.Allocator, hex: []const u8) ![]u8 {
     return out;
 }
 
+/// Decrypt an `ENC2:` value (AES-256-GCM).
+/// Tries each key in `keys` that is exactly 32 bytes long.
+fn decryptValueAesGcm(allocator: std.mem.Allocator, encoded: []const u8, keys: [][]u8) ![]u8 {
+    const dec_len = try std.base64.standard.Decoder.calcSizeForSlice(encoded);
+    const blob = try allocator.alloc(u8, dec_len);
+    defer allocator.free(blob);
+    try std.base64.standard.Decoder.decode(blob, encoded);
+
+    for (keys) |key_bytes| {
+        if (key_bytes.len != SecretAead.key_length) continue;
+        const key: [SecretAead.key_length]u8 = key_bytes[0..SecretAead.key_length].*;
+        const plain = decryptSecret(allocator, blob, key) catch continue;
+        return plain;
+    }
+    return error.SecretDecryptFailed;
+}
+
 fn decryptValue(allocator: std.mem.Allocator, encoded: []const u8, keys: [][]u8) ![]u8 {
-    // Simple XOR envelope for branch-local encrypted secret storage:
+    // Simple XOR envelope for branch-local encrypted secret storage (legacy).
     // ENC:<base64(xor(plaintext,key))>
+    // Prefer ENC2: (AES-256-GCM) for new secrets.
     const dec_len = try std.base64.standard.Decoder.calcSizeForSlice(encoded);
     const cipher = try allocator.alloc(u8, dec_len);
     defer allocator.free(cipher);
@@ -129,6 +189,78 @@ fn decryptValue(allocator: std.mem.Allocator, encoded: []const u8, keys: [][]u8)
         return out;
     }
     return error.SecretDecryptFailed;
+}
+
+test "AES-256-GCM encrypt and decrypt roundtrip" {
+    const allocator = std.testing.allocator;
+    var key: [SecretAead.key_length]u8 = undefined;
+    compat.randomBytes(&key);
+
+    const plaintext = "top-secret-value";
+    const blob = try encryptSecret(allocator, plaintext, key);
+    defer allocator.free(blob);
+
+    // blob must contain nonce + ciphertext + tag
+    try std.testing.expectEqual(SecretAead.nonce_length + plaintext.len + SecretAead.tag_length, blob.len);
+
+    const recovered = try decryptSecret(allocator, blob, key);
+    defer allocator.free(recovered);
+    try std.testing.expectEqualStrings(plaintext, recovered);
+}
+
+test "AES-256-GCM decrypt fails with wrong key" {
+    const allocator = std.testing.allocator;
+    var key: [SecretAead.key_length]u8 = undefined;
+    compat.randomBytes(&key);
+    var bad_key: [SecretAead.key_length]u8 = undefined;
+    compat.randomBytes(&bad_key);
+
+    const blob = try encryptSecret(allocator, "secret", key);
+    defer allocator.free(blob);
+
+    const err = decryptSecret(allocator, blob, bad_key);
+    try std.testing.expectError(error.AuthenticationFailed, err);
+}
+
+test "AES-256-GCM produces distinct ciphertexts for same plaintext (nonce randomness)" {
+    const allocator = std.testing.allocator;
+    var key: [SecretAead.key_length]u8 = undefined;
+    compat.randomBytes(&key);
+
+    const plain = "determinism-test";
+    const blob1 = try encryptSecret(allocator, plain, key);
+    defer allocator.free(blob1);
+    const blob2 = try encryptSecret(allocator, plain, key);
+    defer allocator.free(blob2);
+
+    // Different nonces mean different ciphertexts (with overwhelming probability).
+    try std.testing.expect(!std.mem.eql(u8, blob1, blob2));
+}
+
+test "ENC2 base64 roundtrip via decryptValueAesGcm" {
+    const allocator = std.testing.allocator;
+    var key_bytes: [SecretAead.key_length]u8 = undefined;
+    compat.randomBytes(&key_bytes);
+
+    const plaintext = "my-database-password";
+    const blob = try encryptSecret(allocator, plaintext, key_bytes);
+    defer allocator.free(blob);
+
+    // Base64-encode the blob (as ENC2: would store it).
+    const enc_len = std.base64.standard.Encoder.calcSize(blob.len);
+    const enc = try allocator.alloc(u8, enc_len);
+    defer allocator.free(enc);
+    _ = std.base64.standard.Encoder.encode(enc, blob);
+
+    var keys = std.ArrayList([]u8).empty;
+    defer keys.deinit(allocator);
+    const key_copy = try allocator.dupe(u8, &key_bytes);
+    defer allocator.free(key_copy);
+    try keys.append(allocator, key_copy);
+
+    const out = try decryptValueAesGcm(allocator, enc, keys.items);
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings(plaintext, out);
 }
 
 test "decrypt xor envelope with key rotation list" {

@@ -23,6 +23,33 @@ zig build test
 zig build test-integration
 ```
 
+## WorkerPool Design Rationale (issue #81)
+
+`src/http/worker_pool.zig` uses manual `std.Thread.spawn` rather than
+`std.Thread.Pool` (removed in Zig 0.13) or `std.Io.Group` (Zig 0.16).
+
+**Why not `std.Io.Group`?**
+Tardigrade uses a **blocking thread-per-connection** I/O model.  TLS
+handshakes, request parsing, and upstream proxying are all blocking calls on
+the worker thread.  `std.Io.Group` expects non-blocking, async-style tasks;
+blocking calls on a Group-managed thread stall the entire group.
+
+**Current test coverage** (7 tests in `worker_pool.zig`):
+- submit and process items
+- shutdown drains in-flight work
+- queue selection prefers least-loaded queue
+- work-stealing across per-worker queues
+- `shutdownAndJoin` with drain timeout = 0 (close queued fds immediately)
+- `shutdownAndJoin` drain completes before timeout
+- `shutdownAndJoin` drain timeout expires cleanly
+
+**Decision:** keep the manual `std.Thread` pool unless the blocking I/O model
+is replaced with non-blocking I/O end-to-end.  If that migration happens,
+re-evaluate `std.Io.Group` and capture the expected throughput/latency delta
+before refactoring.
+
+---
+
 ## std.c / std.posix Usage Audit (v0.62 baseline, issue #80)
 
 Direct `std.c` and `std.posix` usage is intentional and appropriate in the

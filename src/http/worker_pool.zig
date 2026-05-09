@@ -1,3 +1,26 @@
+// WorkerPool — manual std.Thread-based connection dispatch pool.
+//
+// Design rationale (evaluated for Zig 0.16, issue #81):
+//
+// Tardigrade uses a thread-per-connection blocking I/O model.  Each accepted
+// fd is handed to a dedicated OS thread that does blocking TLS, HTTP parsing,
+// and proxying.  This is incompatible with async/coroutine runtimes because:
+//
+//   1. std.Io.Group (Zig 0.16) expects non-blocking, async-style work items.
+//      Blocking calls on a Group-managed thread stall the whole group.
+//
+//   2. std.Thread.Pool (removed in Zig 0.13+) had the same mismatch for
+//      long-running blocking tasks.
+//
+//   3. Manual std.Thread.spawn gives us direct control over thread count,
+//      queue depth, work-stealing across per-worker queues, CPU affinity,
+//      and graceful drain-before-shutdown semantics — all of which are
+//      critical for a production reverse proxy.
+//
+// Do NOT refactor to std.Io.Group unless the blocking I/O model is first
+// replaced with non-blocking I/O throughout the connection handler.  If that
+// change is ever made, capture the expected throughput/latency delta first.
+
 const compat = @import("../zig_compat.zig");
 const builtin = @import("builtin");
 const std = @import("std");

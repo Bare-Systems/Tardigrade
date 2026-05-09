@@ -32,9 +32,9 @@ Install at least one load-generation tool. The runner auto-detects in this order
 | Tool | Install | Supports |
 |---|---|---|
 | [`wrk`](https://github.com/wg/wrk) | `brew install wrk` / apt | HTTP/1.1 |
-| [`h2load`](https://nghttp2.org/) | `brew install nghttp2` / apt | HTTP/1.1 + HTTP/2 |
+| [`h2load`](https://nghttp2.org/) | `brew install nghttp2` / apt | HTTP/1.1 + HTTP/2; HTTP/3 if built with nghttp3+ngtcp2 |
 | [`fortio`](https://fortio.org/) | `brew install fortio` / apt | HTTP/1.1, JSON output |
-| [`k6`](https://k6.io/) | `brew install k6` / apt | HTTP/1.1 + HTTP/2 + behavioral scenarios |
+| [`k6`](https://k6.io/) | `brew install k6` / apt | HTTP/1.1 + HTTP/2 (over TLS) + behavioral scenarios |
 
 `jq` is required for result formatting, baseline comparison, and report generation.
 
@@ -44,13 +44,21 @@ Install at least one load-generation tool. The runner auto-detects in this order
 
 These measure raw request throughput and run with whichever tool is auto-detected.
 
-| Scenario | Description |
-|---|---|
-| `static-http1` | Static file serving over HTTP/1.1 (hits `/health`) |
-| `proxy-http1` | Reverse proxy route over HTTP/1.1 (default path: `/proxy/health`) |
-| `proxy-http2` | Reverse proxy route over HTTP/2 (requires `h2load`, default path: `/proxy/health`) |
-| `keepalive` | Keep-alive connection reuse (default path: `/health`) |
-| `reload-under-load` | SIGHUP sent mid-run; measures degradation during reload |
+| Scenario | Description | Skip condition |
+|---|---|---|
+| `static-http1` | Static file serving over HTTP/1.1 | — |
+| `proxy-http1` | Reverse proxy route over HTTP/1.1 | — |
+| `static-http2` | Static file serving over HTTP/2 | Skipped unless tool is `h2load` or `k6` + `--tls` |
+| `proxy-http2` | Reverse proxy route over HTTP/2 | Skipped unless tool is `h2load` |
+| `static-http3` | Static file serving over HTTP/3 (QUIC) | Skipped unless `h2load` with `--h3` support **and** `--tls` |
+| `proxy-http3` | Reverse proxy route over HTTP/3 (QUIC) | Skipped unless `h2load` with `--h3` support **and** `--tls` |
+| `keepalive` | Keep-alive connection reuse | — |
+| `reload-under-load` | SIGHUP sent mid-run; measures degradation during reload | Requires `wrk` and a PID file |
+
+HTTP/3 scenarios require `h2load` built with QUIC support (`nghttp3` + `ngtcp2`). The runner
+detects this at runtime by checking whether `h2load --h3` is recognized; if not, the scenario
+prints a skip message and continues. HTTP/3 also requires TLS because QUIC mandates it —
+always pass `--tls` (and `--insecure` for self-signed certs) for HTTP/3 runs.
 
 ### k6-only behavioral scenarios
 
@@ -90,6 +98,8 @@ Run only k6 behavioral tests: `--tool k6 --scenarios auth-enforcement,rate-limit
 --static-path PATH    Path for static-http1 and reload-under-load (default: /health)
 --proxy-path PATH     Path for proxy-http1/proxy-http2 (default: /proxy/health)
 --keepalive-path PATH Path for keepalive (default: /health)
+--h2-path PATH        Path for static-http2 (default: same as --static-path)
+--h3-path PATH        Path for static-http3 (default: same as --static-path)
 --scenarios LIST      Comma-separated scenario names
 --tool TOOL           Force tool: wrk|h2load|fortio|k6
 --baseline FILE       Compare against a baseline JSON file
@@ -123,6 +133,17 @@ Examples:
   --tls \
   --tool h2load \
   --proxy-path /bearclaw/health
+
+# HTTP/2 and HTTP/3 static + proxy over TLS (h2load with QUIC support required for HTTP/3)
+./benchmarks/run.sh \
+  --host edge.example.test \
+  --port 443 \
+  --tls \
+  --insecure \
+  --tool h2load \
+  --scenarios static-http2,proxy-http2,static-http3,proxy-http3 \
+  --static-path /health \
+  --proxy-path /proxy/health
 ```
 
 ## Remote perf target
@@ -294,3 +315,19 @@ For behavioral correctness in CI, add a k6-only step:
       --connections 20 \
       --scenarios auth-enforcement,rate-limit
 ```
+
+HTTP/2 and HTTP/3 protocol benchmarks are intended for manual regression runs on a
+dedicated perf target, not short CI smoke tests. `static-http2`, `proxy-http2`,
+`static-http3`, and `proxy-http3` are omitted from the default `--scenarios` list for
+this reason. Add them explicitly when running a full protocol comparison:
+
+```bash
+./benchmarks/run.sh \
+  --tool h2load \
+  --tls --insecure \
+  --duration 30 \
+  --scenarios static-http1,proxy-http1,static-http2,proxy-http2,static-http3,proxy-http3
+```
+
+If `h2load` is not available or was not built with QUIC support, the HTTP/2 and HTTP/3
+scenarios each print a clear skip message and the runner continues without error.

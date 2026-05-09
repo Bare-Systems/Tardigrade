@@ -16,8 +16,10 @@
 #   --connections N     Concurrent connections (default: 50)
 #   --threads N         Worker threads for wrk (default: 4)
 #   --static-path PATH  Path for static-http1 and reload-under-load (default: /health)
-#   --proxy-path PATH   Path for proxy-http1/proxy-http2 (default: /proxy/health)
+#   --proxy-path PATH   Path for proxy-http1/proxy-http2/proxy-http3 (default: /proxy/health)
 #   --keepalive-path PATH  Path for keepalive (default: /health)
+#   --h2-path PATH      Path for static-http2 (default: same as --static-path)
+#   --h3-path PATH      Path for static-http3 (default: same as --static-path)
 #   --scenarios LIST    Comma-separated scenario names to run (default: all)
 #   --tool TOOL         Preferred tool: wrk|h2load|fortio|k6 (default: auto-detect)
 #   --baseline FILE     Compare results against a baseline JSON file
@@ -27,7 +29,10 @@
 # Scenarios:
 #   static-http1        Static file serving over HTTP/1.1
 #   proxy-http1         Reverse proxy over HTTP/1.1
+#   static-http2        Static file serving over HTTP/2 (requires h2load or k6+TLS)
 #   proxy-http2         Reverse proxy over HTTP/2 (requires h2load)
+#   static-http3        Static file serving over HTTP/3 (requires h2load with QUIC + --tls)
+#   proxy-http3         Reverse proxy over HTTP/3 (requires h2load with QUIC + --tls)
 #   keepalive           Keep-alive connection reuse
 #   reload-under-load   Trigger SIGHUP during a load run and measure degradation
 #
@@ -55,6 +60,8 @@ THREADS=4
 STATIC_PATH="/health"
 PROXY_PATH="/proxy/health"
 KEEPALIVE_PATH="/health"
+H2_PATH=""      # defaults to STATIC_PATH after arg parsing
+H3_PATH=""      # defaults to STATIC_PATH after arg parsing
 SCENARIOS="static-http1,proxy-http1,keepalive"
 PREFERRED_TOOL=""
 BASELINE_FILE=""
@@ -75,6 +82,8 @@ while [[ $# -gt 0 ]]; do
         --static-path)STATIC_PATH="$2";        shift 2 ;;
         --proxy-path) PROXY_PATH="$2";         shift 2 ;;
         --keepalive-path)KEEPALIVE_PATH="$2";  shift 2 ;;
+        --h2-path)    H2_PATH="$2";            shift 2 ;;
+        --h3-path)    H3_PATH="$2";            shift 2 ;;
         --scenarios)  SCENARIOS="$2";          shift 2 ;;
         --tool)       PREFERRED_TOOL="$2";     shift 2 ;;
         --baseline)   BASELINE_FILE="$2";      shift 2 ;;
@@ -85,6 +94,8 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+H2_PATH="${H2_PATH:-$STATIC_PATH}"
+H3_PATH="${H3_PATH:-$STATIC_PATH}"
 SCHEME=$( $USE_TLS && echo "https" || echo "http" )
 BASE_URL="${SCHEME}://${TARGET_HOST}:${TARGET_PORT}"
 REQUEST_HEADERS=()
@@ -156,6 +167,37 @@ run_h2load() {
     add_tool_headers extra -H
     local raw
     raw=$(h2load -n $((CONNECTIONS * DURATION * 10)) \
+        -c "$CONNECTIONS" -t "$THREADS" ${extra[@]+"${extra[@]}"} "$url" 2>&1) || true
+    local rps p50 p99 errors
+    rps=$(echo "$raw" | grep -E "^finished" | grep -oE '[0-9.]+ req/s' | grep -oE '[0-9.]+' || echo 0)
+    p50=$(echo "$raw" | grep -E "50th" | grep -oE '[0-9.]+ us' | grep -oE '[0-9.]+' | \
+        awk '{printf "%.2f", $1/1000}' || echo 0)
+    p99=$(echo "$raw" | grep -E "99th" | grep -oE '[0-9.]+ us' | grep -oE '[0-9.]+' | \
+        awk '{printf "%.2f", $1/1000}' || echo 0)
+    errors=$(echo "$raw" | grep -E "failed" | grep -oE '[0-9]+' | head -1 || echo 0)
+    rps=${rps:-0}; p50=${p50:-0}; p99=${p99:-0}; errors=${errors:-0}
+    echo "  $label — ${rps} req/s  p50=${p50}ms  p99=${p99}ms  errors=${errors}"
+    add_result "$label" "$rps" "$p50" "$p99" "$errors"
+}
+
+# ── h2load HTTP/3 runner ──────────────────────────────────────────────────────
+# Requires h2load built with QUIC/nghttp3+ngtcp2 support.
+# If --h3 is unknown to this h2load build, the scenario is silently skipped.
+run_h2load_h3() {
+    local url="$1" label="$2"
+    if ! h2load --h3 --help &>/dev/null 2>&1; then
+        echo "  Skipping $label — h2load on this system does not support --h3 (HTTP/3)"
+        return
+    fi
+    if ! $USE_TLS; then
+        echo "  Skipping $label — HTTP/3 requires TLS; re-run with --tls"
+        return
+    fi
+    local extra=()
+    $INSECURE && extra+=(--insecure)
+    add_tool_headers extra -H
+    local raw
+    raw=$(h2load --h3 -n $((CONNECTIONS * DURATION * 10)) \
         -c "$CONNECTIONS" -t "$THREADS" ${extra[@]+"${extra[@]}"} "$url" 2>&1) || true
     local rps p50 p99 errors
     rps=$(echo "$raw" | grep -E "^finished" | grep -oE '[0-9.]+ req/s' | grep -oE '[0-9.]+' || echo 0)
@@ -285,6 +327,36 @@ scenario_proxy_http2() {
     run_h2load "${BASE_URL}${PROXY_PATH}" "proxy-http2"
 }
 
+scenario_static_http2() {
+    echo "==> static-http2: static file serving over HTTP/2 (${H2_PATH})"
+    if [[ "$TOOL" == "h2load" ]]; then
+        run_h2load "${BASE_URL}${H2_PATH}" "static-http2"
+    elif [[ "$TOOL" == "k6" ]] && $USE_TLS; then
+        # k6 negotiates HTTP/2 automatically over HTTPS
+        run_k6 "${BASE_URL}${H2_PATH}" "static-http2"
+    else
+        echo "  Skipping — static-http2 requires h2load or k6 with --tls"
+    fi
+}
+
+scenario_static_http3() {
+    echo "==> static-http3: static file serving over HTTP/3 (${H3_PATH})"
+    if [[ "$TOOL" == "h2load" ]]; then
+        run_h2load_h3 "${BASE_URL}${H3_PATH}" "static-http3"
+    else
+        echo "  Skipping — static-http3 requires h2load with HTTP/3 (QUIC) support"
+    fi
+}
+
+scenario_proxy_http3() {
+    echo "==> proxy-http3: reverse proxy route over HTTP/3 (${PROXY_PATH})"
+    if [[ "$TOOL" == "h2load" ]]; then
+        run_h2load_h3 "${BASE_URL}${PROXY_PATH}" "proxy-http3"
+    else
+        echo "  Skipping — proxy-http3 requires h2load with HTTP/3 (QUIC) support"
+    fi
+}
+
 scenario_keepalive() {
     echo "==> keepalive: keep-alive connection reuse (${KEEPALIVE_PATH})"
     run_scenario "${BASE_URL}${KEEPALIVE_PATH}" "keepalive"
@@ -348,7 +420,7 @@ scenario_reload_under_load() {
 # ── Main loop ─────────────────────────────────────────────────────────────────
 echo "Tardigrade benchmark — target: ${BASE_URL}  tool: ${TOOL}"
 echo "Duration: ${DURATION}s  Connections: ${CONNECTIONS}  Threads: ${THREADS}"
-echo "Paths: static=${STATIC_PATH} proxy=${PROXY_PATH} keepalive=${KEEPALIVE_PATH}"
+echo "Paths: static=${STATIC_PATH} proxy=${PROXY_PATH} keepalive=${KEEPALIVE_PATH} h2=${H2_PATH} h3=${H3_PATH}"
 if [[ -n "$HOST_HEADER" ]]; then
     echo "Host header override: ${HOST_HEADER}"
 fi
@@ -359,7 +431,10 @@ for scenario in "${SCENARIO_LIST[@]}"; do
     case "$scenario" in
         static-http1)       scenario_static_http1 ;;
         proxy-http1)        scenario_proxy_http1 ;;
+        static-http2)       scenario_static_http2 ;;
         proxy-http2)        scenario_proxy_http2 ;;
+        static-http3)       scenario_static_http3 ;;
+        proxy-http3)        scenario_proxy_http3 ;;
         keepalive)          scenario_keepalive ;;
         reload-under-load)  scenario_reload_under_load ;;
         auth-enforcement)   scenario_auth_enforcement ;;
@@ -376,12 +451,15 @@ RESULTS_JSON=$(jq \
     --arg tag "$GIT_TAG" --arg ts "$TIMESTAMP" \
     --arg host "$TARGET_HOST" --arg port "$TARGET_PORT" \
     --arg host_header "$HOST_HEADER" \
-    --arg static_path "$STATIC_PATH" --arg proxy_path "$PROXY_PATH" --arg keepalive_path "$KEEPALIVE_PATH" \
+    --arg static_path "$STATIC_PATH" --arg proxy_path "$PROXY_PATH" \
+    --arg keepalive_path "$KEEPALIVE_PATH" \
+    --arg h2_path "$H2_PATH" --arg h3_path "$H3_PATH" \
     --arg tool "$TOOL" --argjson dur "$DURATION" --argjson conn "$CONNECTIONS" \
     '. + {_meta: {tag: $tag, timestamp: $ts, host: $host, port: $port,
           tool: $tool, duration_s: $dur, connections: $conn,
           host_header: $host_header, static_path: $static_path,
-          proxy_path: $proxy_path, keepalive_path: $keepalive_path}}' \
+          proxy_path: $proxy_path, keepalive_path: $keepalive_path,
+          h2_path: $h2_path, h3_path: $h3_path}}' \
     <<<"$RESULTS_JSON")
 
 # ── Save ─────────────────────────────────────────────────────────────────────

@@ -38,11 +38,18 @@ pub const Headers = struct {
         self.items.deinit(self.allocator);
     }
 
-    /// Add a header (name will be lowercased)
+    /// Add a header (name will be lowercased).
+    /// Returns `error.InvalidHeader` if the name or value contains control
+    /// characters, CRLF sequences, or other bytes prohibited by RFC 7230 §3.2.6.
     pub fn append(self: *Headers, name: []const u8, value: []const u8) !void {
         if (self.items.items.len >= MAX_HEADERS) {
             return error.TooManyHeaders;
         }
+
+        // Validate before storing to prevent injection via programmatic paths
+        // (e.g., HTTP/2 HPACK headers that bypass parseHeaders).
+        if (!isValidHeaderName(name)) return error.InvalidHeader;
+        if (!isValidHeaderValue(value)) return error.InvalidHeader;
 
         // Lowercase the name for consistent lookup
         const lower_name = try self.allocator.alloc(u8, name.len);
@@ -115,6 +122,34 @@ pub const Headers = struct {
     }
 };
 
+/// Returns true if every byte of the header name is a valid RFC 7230 token
+/// character.  Control characters (0x00–0x1F) and DEL (0x7F) are forbidden;
+/// so are ASCII separators that would be ambiguous in a raw header stream.
+pub fn isValidHeaderName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    for (name) |c| {
+        // Reject control chars, DEL, space, and the colon separator.
+        if (c <= 0x20 or c == 0x7F or c == ':') return false;
+    }
+    return true;
+}
+
+/// Returns true if every byte of the header value is permitted by RFC 7230
+/// §3.2.6.  Visible ASCII (0x21–0x7E), SP (0x20), HTAB (0x09), and obs-text
+/// (0x80–0xFF) are all valid.  CR (0x0D), LF (0x0A), NUL (0x00), and other
+/// control characters are rejected to prevent header injection and log poisoning.
+pub fn isValidHeaderValue(value: []const u8) bool {
+    for (value) |c| {
+        // Allow HTAB and space; reject other control chars and DEL.
+        if (c == 0x09 or c >= 0x20) {
+            if (c == 0x7F) return false; // DEL
+            continue;
+        }
+        return false; // any other control char (0x00-0x08, 0x0A-0x1F)
+    }
+    return true;
+}
+
 /// Parse headers from a buffer
 /// Returns the headers and the position after the header block
 pub fn parseHeaders(allocator: Allocator, data: []const u8) !struct { headers: Headers, body_start: usize } {
@@ -162,12 +197,13 @@ pub fn parseHeaders(allocator: Allocator, data: []const u8) !struct { headers: H
         const name = line[0..colon_pos];
         const value = if (colon_pos + 1 < line.len) line[colon_pos + 1 ..] else "";
 
-        // Validate header name (no whitespace allowed)
-        for (name) |c| {
-            if (std.ascii.isWhitespace(c)) {
-                return error.InvalidHeader;
-            }
-        }
+        // Reject header names that contain control characters or separators
+        // (CRLF injection, NUL bytes, etc.) per RFC 7230 §3.2.6.
+        if (!isValidHeaderName(name)) return error.InvalidHeader;
+
+        // Reject header values that contain CR, LF, NUL, or other control
+        // characters to prevent CRLF injection and log poisoning.
+        if (!isValidHeaderValue(value)) return error.InvalidHeader;
 
         try headers.append(name, value);
         pos = line_end + 2;
@@ -268,4 +304,73 @@ test "incomplete headers" {
 
     const data = "Host: localhost\r\n";
     try testing.expectError(error.IncompleteHeaders, parseHeaders(allocator, data));
+}
+
+test "isValidHeaderName rejects control chars and accepts valid tokens" {
+    try std.testing.expect(isValidHeaderName("Host"));
+    try std.testing.expect(isValidHeaderName("X-Custom-Header"));
+    try std.testing.expect(isValidHeaderName("Content-Type"));
+    // Control chars
+    try std.testing.expect(!isValidHeaderName("Bad\x00Name"));
+    try std.testing.expect(!isValidHeaderName("Bad\x0DName")); // CR
+    try std.testing.expect(!isValidHeaderName("Bad\x0AName")); // LF
+    try std.testing.expect(!isValidHeaderName("Bad\x1FName")); // other control
+    // Space and colon are separators — not allowed in names
+    try std.testing.expect(!isValidHeaderName("Bad Name"));
+    try std.testing.expect(!isValidHeaderName("Bad:Name"));
+    // DEL
+    try std.testing.expect(!isValidHeaderName("Bad\x7FName"));
+    // Empty
+    try std.testing.expect(!isValidHeaderName(""));
+}
+
+test "isValidHeaderValue rejects CR LF and NUL but allows HTAB and printable chars" {
+    try std.testing.expect(isValidHeaderValue("application/json"));
+    try std.testing.expect(isValidHeaderValue("value with spaces"));
+    try std.testing.expect(isValidHeaderValue("value\twith\ttabs"));
+    try std.testing.expect(isValidHeaderValue("")); // empty value is fine
+    // CRLF injection
+    try std.testing.expect(!isValidHeaderValue("val\r\nX-Injected: evil"));
+    try std.testing.expect(!isValidHeaderValue("val\ralone"));
+    try std.testing.expect(!isValidHeaderValue("val\nalone"));
+    // NUL byte
+    try std.testing.expect(!isValidHeaderValue("val\x00ue"));
+    // Other control chars
+    try std.testing.expect(!isValidHeaderValue("val\x01ue"));
+    try std.testing.expect(!isValidHeaderValue("val\x1Fue"));
+    // DEL
+    try std.testing.expect(!isValidHeaderValue("val\x7Fue"));
+}
+
+test "parseHeaders rejects CRLF injection in header value" {
+    const allocator = std.testing.allocator;
+    // A lone CR in the value field (LF is already the line split character)
+    const cr_in_value = "X-Bad: value\rinjected\r\n\r\n";
+    try std.testing.expectError(error.InvalidHeader, parseHeaders(allocator, cr_in_value));
+    // NUL byte in value
+    const nul_in_value = "X-Bad: value\x00null\r\n\r\n";
+    try std.testing.expectError(error.InvalidHeader, parseHeaders(allocator, nul_in_value));
+}
+
+test "parseHeaders rejects control characters in header name" {
+    const allocator = std.testing.allocator;
+    // NUL in name
+    const nul_in_name = "X-Bad\x00: value\r\n\r\n";
+    try std.testing.expectError(error.InvalidHeader, parseHeaders(allocator, nul_in_name));
+    // Control char in name
+    const ctrl_in_name = "X-Bad\x01: value\r\n\r\n";
+    try std.testing.expectError(error.InvalidHeader, parseHeaders(allocator, ctrl_in_name));
+}
+
+test "Headers.append rejects invalid names and values" {
+    const allocator = std.testing.allocator;
+    var headers = Headers.init(allocator);
+    defer headers.deinit();
+    // Programmatic CRLF injection attempt in value
+    try std.testing.expectError(error.InvalidHeader, headers.append("X-Test", "bad\r\nX-Injected: evil"));
+    // Control char in name
+    try std.testing.expectError(error.InvalidHeader, headers.append("X-Bad\x00Name", "value"));
+    // Valid header passes
+    try headers.append("X-Good", "valid value");
+    try std.testing.expectEqualStrings("valid value", headers.get("X-Good").?);
 }

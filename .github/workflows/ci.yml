@@ -16,7 +16,7 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
 
     steps:
       - name: Checkout
@@ -28,6 +28,17 @@ jobs:
       - name: Install Zig
         run: sh ./scripts/install-zig.sh 0.16.0
 
+      - name: Cache Zig build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/zig
+            .zig-cache
+          key: zig-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig') }}-${{ github.sha }}
+          restore-keys: |
+            zig-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig') }}-
+            zig-${{ runner.os }}-${{ runner.arch }}-
+
       - name: Print Zig version
         run: zig version
 
@@ -35,10 +46,10 @@ jobs:
         run: zig fmt --check src/ build.zig
 
       - name: Run unit tests
-        run: zig build test
+        run: zig build test --summary all
 
       - name: Run integration tests
-        run: zig build test-integration
+        run: zig build test-integration --summary all
 
   build-linux-release:
     name: Build Linux release (${{ matrix.archive_name }})
@@ -59,6 +70,17 @@ jobs:
 
       - name: Install Zig
         run: sh ./scripts/install-zig.sh 0.16.0
+
+      - name: Cache Zig build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/zig
+            .zig-cache
+          key: zig-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig') }}-${{ github.sha }}
+          restore-keys: |
+            zig-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig') }}-
+            zig-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Print Zig version
         run: zig version

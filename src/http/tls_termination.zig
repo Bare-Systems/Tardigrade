@@ -354,9 +354,15 @@ pub const TlsConnection = struct {
         }
 
         pub fn print(self: Writer, comptime fmt: []const u8, args: anytype) !void {
-            const s = try std.fmt.allocPrint(std.heap.page_allocator, fmt, args);
-            defer std.heap.page_allocator.free(s);
+            // Format into a stack buffer to avoid heap allocation for the
+            // common case of short header lines (< 4 KiB).
+            var buf: [4096]u8 = undefined;
+            const s = try std.fmt.bufPrint(&buf, fmt, args);
             return self.writeAll(s);
+        }
+
+        pub fn writeByte(self: Writer, byte: u8) TlsError!void {
+            return self.writeAll(&[_]u8{byte});
         }
     };
 

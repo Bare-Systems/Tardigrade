@@ -90,8 +90,8 @@ pub const NetStream = struct {
     }
 
     pub fn print(self: NetStream, comptime fmt: []const u8, args: anytype) !void {
-        const s = try std.fmt.allocPrint(std.heap.page_allocator, fmt, args);
-        defer std.heap.page_allocator.free(s);
+        var buf: [4096]u8 = undefined;
+        const s = try std.fmt.bufPrint(&buf, fmt, args);
         try self.writeAll(s);
     }
 
@@ -107,7 +107,11 @@ pub const NetStream = struct {
         }
 
         pub fn print(self: Writer, comptime fmt: []const u8, args: anytype) !void {
-            try self.stream.print(fmt, args);
+            // Format into a stack buffer to avoid heap allocation for the
+            // common case of short header lines (< 4 KiB).
+            var buf: [4096]u8 = undefined;
+            const s = try std.fmt.bufPrint(&buf, fmt, args);
+            try self.writeAll(s);
         }
     };
 

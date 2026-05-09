@@ -616,3 +616,59 @@ test "connection header when setConnection(false)" {
     const output = stream.getWritten();
     try testing.expect(std.mem.find(u8, output, "connection: close\r\n") != null);
 }
+
+test "response write is transport-agnostic: in-memory buffer" {
+    // Verify that Response.write() works with any writer, not just live sockets.
+    // Uses a fixed-buffer writer identical to what integration tests use.
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var response = Response.init(allocator);
+    defer response.deinit();
+    _ = response.setStatus(.created).setBody("ok").setContentType("text/plain");
+
+    var buf: [512]u8 = undefined;
+    var fbs = compat.fixedBufferStream(&buf);
+    try response.write(fbs.writer());
+
+    const out = fbs.getWritten();
+    try testing.expect(std.mem.startsWith(u8, out, "HTTP/1.1 201 Created\r\n"));
+    try testing.expect(std.mem.find(u8, out, "Content-Length: 2\r\n") != null);
+    try testing.expect(std.mem.endsWith(u8, out, "ok"));
+}
+
+test "response writeHead emits only headers to in-memory buffer" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var response = Response.init(allocator);
+    defer response.deinit();
+    _ = response.setStatus(.no_content);
+
+    var buf: [512]u8 = undefined;
+    var fbs = compat.fixedBufferStream(&buf);
+    try response.writeHead(fbs.writer());
+
+    const out = fbs.getWritten();
+    try testing.expect(std.mem.startsWith(u8, out, "HTTP/1.1 204 No Content\r\n"));
+    // writeHead should not emit a body
+    try testing.expect(std.mem.endsWith(u8, out, "\r\n"));
+}
+
+test "request parse is transport-agnostic: in-memory slice" {
+    // Verify that Request.parse() works on any []const u8 slice without any
+    // socket or I/O dependency.
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const request_mod = @import("request.zig");
+
+    const raw = "GET /hello?world=1 HTTP/1.1\r\nHost: example.com\r\nAccept: */*\r\n\r\n";
+    const result = try request_mod.Request.parse(allocator, raw, 1024);
+    var req = result.request;
+    defer req.deinit();
+
+    try testing.expectEqualStrings("GET", req.method.toString());
+    try testing.expectEqualStrings("/hello", req.uri.path);
+    try testing.expectEqualStrings("world=1", req.uri.query orelse "");
+    try testing.expectEqualStrings("example.com", req.headers.get("host") orelse "");
+}

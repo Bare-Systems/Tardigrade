@@ -23,6 +23,51 @@ zig build test
 zig build test-integration
 ```
 
+## Event Loop I/O Model
+
+Tardigrade uses a **level-triggered epoll/kqueue** event loop on the listener
+socket and a **thread-per-connection blocking I/O** model for each accepted
+connection.
+
+### Main event loop thread
+
+- Listener socket is `O_NONBLOCK`; `accept()` is called in a tight loop that
+  drains all ready connections before returning to `epoll_wait`/`kevent`.
+- Level-triggered mode (no `EPOLLET`) is correct — draining ensures no
+  connection is silently dropped.
+- The main thread never performs blocking I/O on connection sockets.
+- Timer ticks (configurable interval) fire background housekeeping: hot-reload,
+  log rotation, proxy-cache maintenance, and active health probes.
+
+### Worker threads
+
+- Each accepted connection is switched to **blocking mode** before dispatch to
+  a worker thread.
+- Workers perform blocking `read`/`write`/`SSL_read`/`SSL_write` on their
+  assigned connection; the event loop is not involved.
+- TLS handshake, request parsing, upstream proxying, and response writing are
+  all blocking operations inside the worker.
+
+### Background threads
+
+Active health probes (`TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_*`) previously ran
+blocking HTTP requests on the main event loop thread. They now run in a
+dedicated background thread:
+- `GatewayState.health_probe_running` (atomic bool) prevents duplicate batches.
+- The probe thread holds a `ConfigLease` for its lifetime so hot-reload cannot
+  free the config while probes are in flight.
+- DNS resolution (`runDnsDiscoveryRefresh`) also runs its resolver call directly
+  in the timer-tick context; the blocking resolve call completes quickly enough
+  (typically < 1 ms on LAN) that it does not materially affect accept latency.
+
+### Event loop health metrics
+
+`tardigrade_event_loop_iterations_total` and
+`tardigrade_health_probe_runs_total` are exported via the Prometheus metrics
+endpoint and can be used to monitor event loop cadence and health-probe activity.
+
+---
+
 ## Shared State Inventory
 
 `GatewayState` is a single long-lived struct shared across all worker threads.

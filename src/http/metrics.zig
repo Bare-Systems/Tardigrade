@@ -34,6 +34,10 @@ pub const Metrics = struct {
     err_internal_error: u64,
     err_overload: u64,
     mux_frame_errors: u64,
+    /// Total event loop iterations (timer tick fires).
+    event_loop_iterations: u64,
+    /// Total background active health-probe batches dispatched.
+    health_probe_runs: u64,
     /// Server start time (nanoseconds since boot).
     started_ns: i128,
 
@@ -58,6 +62,8 @@ pub const Metrics = struct {
             .err_internal_error = 0,
             .err_overload = 0,
             .mux_frame_errors = 0,
+            .event_loop_iterations = 0,
+            .health_probe_runs = 0,
             .started_ns = compat.nanoTimestamp(),
         };
     }
@@ -98,6 +104,14 @@ pub const Metrics = struct {
 
     pub fn recordMuxFrameError(self: *Metrics) void {
         self.mux_frame_errors += 1;
+    }
+
+    pub fn recordEventLoopIteration(self: *Metrics) void {
+        self.event_loop_iterations += 1;
+    }
+
+    pub fn recordHealthProbeRun(self: *Metrics) void {
+        self.health_probe_runs += 1;
     }
 
     pub fn setUpstreamUnhealthyBackends(self: *Metrics, count: usize) void {
@@ -194,6 +208,12 @@ pub const Metrics = struct {
             \\# HELP tardigrade_mux_frame_errors_total Total mux frame parse or validation errors
             \\# TYPE tardigrade_mux_frame_errors_total counter
             \\tardigrade_mux_frame_errors_total {d}
+            \\# HELP tardigrade_event_loop_iterations_total Total event loop timer-tick iterations
+            \\# TYPE tardigrade_event_loop_iterations_total counter
+            \\tardigrade_event_loop_iterations_total {d}
+            \\# HELP tardigrade_health_probe_runs_total Total background active health-probe batches dispatched
+            \\# TYPE tardigrade_health_probe_runs_total counter
+            \\tardigrade_health_probe_runs_total {d}
             \\
         , .{
             self.total_requests,
@@ -216,6 +236,8 @@ pub const Metrics = struct {
             self.err_internal_error,
             self.err_overload,
             self.mux_frame_errors,
+            self.event_loop_iterations,
+            self.health_probe_runs,
         });
     }
 
@@ -223,7 +245,7 @@ pub const Metrics = struct {
     /// Caller owns the returned memory.
     pub fn toJson(self: *const Metrics, allocator: std.mem.Allocator) ![]u8 {
         return std.fmt.allocPrint(allocator,
-            \\{{"total_requests":{d},"status_2xx":{d},"status_3xx":{d},"status_4xx":{d},"status_5xx":{d},"uptime_seconds":{d},"active_connections":{d},"mux_connections":{d},"mux_subscriptions":{d},"connection_rejections":{d},"queue_rejections":{d},"upstream_unhealthy_backends":{d},"error_invalid_request":{d},"error_unauthorized":{d},"error_rate_limited":{d},"error_upstream_timeout":{d},"error_upstream_unavailable":{d},"error_internal_error":{d},"error_overload":{d},"mux_frame_errors":{d}}}
+            \\{{"total_requests":{d},"status_2xx":{d},"status_3xx":{d},"status_4xx":{d},"status_5xx":{d},"uptime_seconds":{d},"active_connections":{d},"mux_connections":{d},"mux_subscriptions":{d},"connection_rejections":{d},"queue_rejections":{d},"upstream_unhealthy_backends":{d},"error_invalid_request":{d},"error_unauthorized":{d},"error_rate_limited":{d},"error_upstream_timeout":{d},"error_upstream_unavailable":{d},"error_internal_error":{d},"error_overload":{d},"mux_frame_errors":{d},"event_loop_iterations":{d},"health_probe_runs":{d}}}
         , .{
             self.total_requests,
             self.status_2xx,
@@ -245,6 +267,8 @@ pub const Metrics = struct {
             self.err_internal_error,
             self.err_overload,
             self.mux_frame_errors,
+            self.event_loop_iterations,
+            self.health_probe_runs,
         });
     }
 };
@@ -346,4 +370,28 @@ test "Metrics toJson produces valid JSON" {
     try std.testing.expect(std.mem.find(u8, json, "\"upstream_unhealthy_backends\":0") != null);
     try std.testing.expect(std.mem.find(u8, json, "\"error_invalid_request\":0") != null);
     try std.testing.expect(std.mem.find(u8, json, "\"uptime_seconds\":") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"event_loop_iterations\":0") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"health_probe_runs\":0") != null);
+}
+
+test "Metrics event loop iteration and health probe counters" {
+    var m = Metrics.init();
+    try std.testing.expectEqual(@as(u64, 0), m.event_loop_iterations);
+    try std.testing.expectEqual(@as(u64, 0), m.health_probe_runs);
+    m.recordEventLoopIteration();
+    m.recordEventLoopIteration();
+    m.recordHealthProbeRun();
+    try std.testing.expectEqual(@as(u64, 2), m.event_loop_iterations);
+    try std.testing.expectEqual(@as(u64, 1), m.health_probe_runs);
+}
+
+test "Metrics toPrometheus includes event loop counters" {
+    const allocator = std.testing.allocator;
+    var m = Metrics.init();
+    m.recordEventLoopIteration();
+    m.recordHealthProbeRun();
+    const prom = try m.toPrometheus(allocator);
+    defer allocator.free(prom);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_event_loop_iterations_total 1") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_health_probe_runs_total 1") != null);
 }

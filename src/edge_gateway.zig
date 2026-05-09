@@ -316,6 +316,9 @@ const GatewayState = struct {
     lb_random_state: u64,
     next_active_health_probe_ms: u64,
     next_proxy_cache_maintenance_ms: u64,
+    /// Set to true while a background health-probe thread is running so the
+    /// event loop does not dispatch a second batch before the first finishes.
+    health_probe_running: std.atomic.Value(bool),
     upstream_health: std.StringHashMap(UpstreamHealth),
     upstream_active_requests: std.StringHashMap(usize),
     fastcgi_pool: std.StringHashMap(std.ArrayList(compat.NetStream)),
@@ -2513,6 +2516,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         .lb_random_state = 0x9e3779b97f4a7c15 ^ @as(u64, @intCast(http.event_loop.monotonicMs())),
         .next_active_health_probe_ms = 0,
         .next_proxy_cache_maintenance_ms = 0,
+        .health_probe_running = std.atomic.Value(bool).init(false),
         .upstream_health = std.StringHashMap(UpstreamHealth).init(state_allocator),
         .upstream_active_requests = std.StringHashMap(usize).init(state_allocator),
         .fastcgi_pool = std.StringHashMap(std.ArrayList(compat.NetStream)).init(state_allocator),
@@ -2944,10 +2948,13 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
             var current_cfg_lease = worker_ctx.acquireConfig();
             defer current_cfg_lease.release();
             const current_cfg = current_cfg_lease.cfg;
-            runActiveHealthChecks(current_cfg, &state);
+            runActiveHealthChecks(current_cfg, &state, worker_ctx.config_store);
             runDnsDiscoveryRefresh(current_cfg, &state);
             runProxyCacheMaintenance(current_cfg, &state);
             if (tls_terminator) |*tls| tls.runMaintenance(http.event_loop.monotonicMs());
+            state.metrics_mutex.lock();
+            state.metrics.recordEventLoopIteration();
+            state.metrics_mutex.unlock();
         }
     }
 
@@ -3174,14 +3181,28 @@ fn runDnsDiscoveryRefresh(_: *const edge_config.EdgeConfig, state: *GatewayState
     }
 }
 
-fn runActiveHealthChecks(cfg: *const edge_config.EdgeConfig, state: *GatewayState) void {
-    if (cfg.upstream_active_health_interval_ms == 0) return;
+/// Context passed to the background health-probe thread.
+const HealthProbeTask = struct {
+    state: *GatewayState,
+    config_store: *ReloadableConfigStore,
+    allocator: std.mem.Allocator,
+};
 
-    const now_ms = http.event_loop.monotonicMs();
-    if (state.next_active_health_probe_ms != 0 and now_ms < state.next_active_health_probe_ms) return;
-    state.next_active_health_probe_ms = now_ms + cfg.upstream_active_health_interval_ms;
+/// Background thread that runs all active health probes without blocking the
+/// main event loop. Clears GatewayState.health_probe_running on completion.
+fn activeHealthProbeThread(task: *HealthProbeTask) void {
+    const allocator = task.allocator;
+    const state = task.state;
+    const config_store = task.config_store;
+    allocator.destroy(task);
 
-    var probe_client = std.http.Client{ .allocator = state.allocator, .io = compat.io() };
+    defer state.health_probe_running.store(false, .release);
+
+    var cfg_lease = config_store.acquire();
+    defer cfg_lease.release();
+    const cfg = cfg_lease.cfg;
+
+    var probe_client = std.http.Client{ .allocator = allocator, .io = compat.io() };
     defer probe_client.deinit();
 
     if (cfg.upstream_base_urls.len > 0) {
@@ -3221,6 +3242,42 @@ fn runActiveHealthChecks(cfg: *const edge_config.EdgeConfig, state: *GatewayStat
             probeSingleUpstream(cfg, state, &probe_client, url);
         }
     }
+
+    state.metrics_mutex.lock();
+    state.metrics.recordHealthProbeRun();
+    state.metrics_mutex.unlock();
+}
+
+/// Schedule a background health-probe batch if one is not already running.
+/// Returns immediately; actual probing runs in a detached thread so the main
+/// event loop is never blocked by upstream HTTP round-trips.
+fn runActiveHealthChecks(cfg: *const edge_config.EdgeConfig, state: *GatewayState, config_store: *ReloadableConfigStore) void {
+    if (cfg.upstream_active_health_interval_ms == 0) return;
+
+    const now_ms = http.event_loop.monotonicMs();
+    if (state.next_active_health_probe_ms != 0 and now_ms < state.next_active_health_probe_ms) return;
+    state.next_active_health_probe_ms = now_ms + cfg.upstream_active_health_interval_ms;
+
+    // Skip if a previous batch is still in flight.
+    if (state.health_probe_running.load(.acquire)) return;
+    state.health_probe_running.store(true, .release);
+
+    const task = state.allocator.create(HealthProbeTask) catch {
+        state.health_probe_running.store(false, .release);
+        return;
+    };
+    task.* = .{
+        .state = state,
+        .config_store = config_store,
+        .allocator = state.allocator,
+    };
+
+    const thread = std.Thread.spawn(.{}, activeHealthProbeThread, .{task}) catch {
+        state.health_probe_running.store(false, .release);
+        state.allocator.destroy(task);
+        return;
+    };
+    thread.detach();
 }
 
 fn activeHealthConfig(cfg: *const edge_config.EdgeConfig, upstream_base_url: []const u8) http.health_checker.Config {

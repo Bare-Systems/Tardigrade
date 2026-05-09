@@ -96,7 +96,7 @@ jobs:
         run: zig version
 
       - name: Run unit tests
-        run: zig build test --summary all --error-style verbose --multiline-errors
+        run: zig build test --summary all --error-style verbose
 
   # ── Build validation ──────────────────────────────────────────────────────────
   # Validates Debug, ReleaseSafe, and ReleaseFast builds across platforms.
@@ -157,10 +157,13 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Install Gitleaks
+        run: |
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz" \
+            | tar -xz -C /usr/local/bin gitleaks
+
       - name: Secret scanning
-        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2.3.9
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gitleaks detect --source . --log-level warn
 
       - name: Filesystem vulnerability scan
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
@@ -185,10 +188,12 @@ jobs:
 
   # ── Dependency review (PRs only) ──────────────────────────────────────────────
   # Flags new dependency additions or removals in pull requests.
+  # Requires the Dependency Graph feature enabled under Settings → Security.
   dependency-review:
     name: Dependency review
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
+    continue-on-error: true
     permissions:
       contents: read
       pull-requests: write

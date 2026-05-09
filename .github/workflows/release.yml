@@ -46,7 +46,7 @@ jobs:
         run: zig version
 
       - name: Run unit tests
-        run: zig build test --summary all --error-style verbose --multiline-errors
+        run: zig build test --summary all --error-style verbose
 
   prepare-release:
     name: Prepare release
@@ -91,9 +91,11 @@ jobs:
             git push origin "$tag"
           fi
 
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "should_publish=$should_publish" >> "$GITHUB_OUTPUT"
+          {
+            echo "version=$version"
+            echo "tag=$tag"
+            echo "should_publish=$should_publish"
+          } >> "$GITHUB_OUTPUT"
 
   build-release:
     name: Build ${{ matrix.archive_name }}

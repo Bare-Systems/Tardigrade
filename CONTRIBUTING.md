@@ -16,7 +16,7 @@ Use Zig `0.16.0` for all local builds and validation.
 zig fmt --check build.zig src/ tests/
 
 # Unit tests (matches CI)
-zig build test --summary all --error-style verbose --multiline-errors
+zig build test --summary all --error-style verbose
 
 # Integration tests — requires a running tardigrade instance and system OpenSSL
 # (see tests/README.md for setup). Not required for most contributions.

@@ -4071,6 +4071,9 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         const status: http.status.Status = switch (err) {
             error.HeadersTooLarge, error.HeaderTooLarge, error.TooManyHeaders => .request_header_fields_too_large,
             error.BodyTooLarge => .payload_too_large,
+            // ConflictingHeaders and InvalidChunkedBody are 400 — explicit mapping
+            // here documents the intent (no request smuggling vector).
+            error.ConflictingHeaders, error.InvalidChunkedBody => .bad_request,
             else => .bad_request,
         };
         try sendApiError(allocator, conn.writer(), status, "invalid_request", "Malformed request", null, keep_alive, state);

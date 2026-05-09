@@ -31,6 +31,12 @@ pub const ParseError = error{
     TooManyHeaders,
     BodyTooLarge,
     InvalidContentLength,
+    /// Both Transfer-Encoding and Content-Length are present.
+    /// Per RFC 7230 §3.3.3 this is a potential request-smuggling vector and
+    /// MUST be rejected.
+    ConflictingHeaders,
+    /// Transfer-Encoding: chunked body is malformed.
+    InvalidChunkedBody,
     OutOfMemory,
 };
 
@@ -98,11 +104,34 @@ pub const Request = struct {
 
         const body_start = request_line_end + 2 + header_result.body_start;
 
-        // Parse body if Content-Length is present
+        const has_te = headers.get("transfer-encoding") != null;
+        const has_cl = headers.get("content-length") != null;
+
+        // RFC 7230 §3.3.3: If both Transfer-Encoding and Content-Length are
+        // present, reject as a potential request-smuggling attack.
+        if (has_te and has_cl) return error.ConflictingHeaders;
+
         var body: ?[]const u8 = null;
         var total_bytes = body_start;
 
-        if (headers.get("content-length")) |cl_str| {
+        if (has_te) {
+            // Only chunked is supported; other transfer codings are not valid
+            // for HTTP/1.1 requests from clients.
+            const te_value = headers.get("transfer-encoding").?;
+            var is_chunked = false;
+            var it = std.mem.splitSequence(u8, te_value, ",");
+            while (it.next()) |token| {
+                const trimmed = std.mem.trim(u8, token, " \t");
+                if (std.ascii.eqlIgnoreCase(trimmed, "chunked")) is_chunked = true;
+            }
+            if (!is_chunked) return error.ConflictingHeaders; // unsupported TE
+            // Decode chunked body from data[body_start..].
+            const decoded = try decodeChunkedBody(allocator, data[body_start..], max_body_size);
+            errdefer allocator.free(decoded);
+            body = decoded;
+            total_bytes = data.len; // consumed the rest of the buffer
+        } else if (has_cl) {
+            const cl_str = headers.get("content-length").?;
             const content_length = std.fmt.parseInt(usize, cl_str, 10) catch {
                 return error.InvalidContentLength;
             };
@@ -225,6 +254,33 @@ fn parseUri(uri: []const u8) ?Uri {
         .path = uri,
         .query = null,
     };
+}
+
+/// Decode an HTTP/1.1 chunked-encoded body per RFC 7230 §4.1.
+/// Returns an owned slice with the decoded content.  Caller must free.
+fn decodeChunkedBody(allocator: Allocator, data: []const u8, max_body_size: usize) ParseError![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    var pos: usize = 0;
+    while (pos < data.len) {
+        // Find end of chunk-size line.
+        const line_end = std.mem.find(u8, data[pos..], "\r\n") orelse return error.InvalidChunkedBody;
+        const chunk_size_line = data[pos .. pos + line_end];
+        // Strip optional chunk extensions (;ext=value …).
+        const semi = std.mem.findScalar(u8, chunk_size_line, ';');
+        const hex = std.mem.trim(u8, if (semi) |s| chunk_size_line[0..s] else chunk_size_line, " \t");
+        const chunk_size = std.fmt.parseInt(usize, hex, 16) catch return error.InvalidChunkedBody;
+        pos += line_end + 2; // skip size line + CRLF
+        if (chunk_size == 0) break; // last-chunk
+        if (out.items.len + chunk_size > max_body_size) return error.BodyTooLarge;
+        if (pos + chunk_size > data.len) return error.InvalidChunkedBody;
+        out.appendSlice(allocator, data[pos .. pos + chunk_size]) catch return error.OutOfMemory;
+        pos += chunk_size;
+        // Each chunk must end with CRLF.
+        if (pos + 2 > data.len or data[pos] != '\r' or data[pos + 1] != '\n') return error.InvalidChunkedBody;
+        pos += 2;
+    }
+    return out.toOwnedSlice(allocator) catch error.OutOfMemory;
 }
 
 // Tests
@@ -391,4 +447,44 @@ test "bytes consumed tracking" {
         defer req.deinit();
         try testing.expectEqualStrings("hello", req.body.?);
     }
+}
+
+test "reject request with both Transfer-Encoding and Content-Length (smuggling defense)" {
+    const allocator = std.testing.allocator;
+    // Per RFC 7230 §3.3.3, having both TE and CL is a request-smuggling risk.
+    const raw = "POST /api HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+    try std.testing.expectError(error.ConflictingHeaders, Request.parse(allocator, raw, DEFAULT_MAX_BODY_SIZE));
+}
+
+test "parse chunked body correctly" {
+    const allocator = std.testing.allocator;
+    // Two chunks: "Hello, " (7 bytes) + "World!" (6 bytes) = "Hello, World!"
+    const raw = "POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n7\r\nHello, \r\n6\r\nWorld!\r\n0\r\n\r\n";
+    const result = try Request.parse(allocator, raw, DEFAULT_MAX_BODY_SIZE);
+    var req = result.request;
+    defer req.deinit();
+    try std.testing.expectEqualStrings("Hello, World!", req.body.?);
+}
+
+test "chunked body with chunk extensions is parsed correctly" {
+    const allocator = std.testing.allocator;
+    // Chunk extensions (;name=value) must be stripped before parsing hex size.
+    const raw = "POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n5;ext=ignore\r\nhello\r\n0\r\n\r\n";
+    const result = try Request.parse(allocator, raw, DEFAULT_MAX_BODY_SIZE);
+    var req = result.request;
+    defer req.deinit();
+    try std.testing.expectEqualStrings("hello", req.body.?);
+}
+
+test "malformed chunked body returns InvalidChunkedBody" {
+    const allocator = std.testing.allocator;
+    // Missing CRLF after chunk data.
+    const raw = "POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello0\r\n\r\n";
+    try std.testing.expectError(error.InvalidChunkedBody, Request.parse(allocator, raw, DEFAULT_MAX_BODY_SIZE));
+}
+
+test "chunked body exceeding max body size returns BodyTooLarge" {
+    const allocator = std.testing.allocator;
+    const raw = "POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+    try std.testing.expectError(error.BodyTooLarge, Request.parse(allocator, raw, 3));
 }

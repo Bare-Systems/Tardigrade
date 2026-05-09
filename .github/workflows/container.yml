@@ -30,6 +30,12 @@ jobs:
       - name: Print Zig version
         run: zig version
 
+      - name: Install dependencies
+        run: sudo apt-get install -y libssl-dev
+
+      - name: Run unit tests
+        run: zig build test --summary all --error-style verbose --multiline-errors
+
       - name: Build Linux release binary
         run: zig build -Doptimize=ReleaseFast
 

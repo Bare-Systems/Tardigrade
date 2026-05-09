@@ -48,7 +48,7 @@ jobs:
         run: zig fmt --check src/ build.zig
 
       - name: Run unit tests
-        run: zig build test --summary all
+        run: zig build test --summary all --error-style verbose --multiline-errors
 
   # ── Integration tests ─────────────────────────────────────────────────────────
   # Slow to compile (~45-60 min cold on a 2-core runner). Runs on push to main

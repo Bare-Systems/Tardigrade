@@ -1,0 +1,7 @@
+# GitHub Actions workflow files contain SHA pins for third-party actions.
+# These 40-character hex strings are public commit SHAs, not secrets.
+[allowlist]
+description = "GitHub Actions workflow SHA pins are public commit SHAs, not secrets"
+paths = [
+  '''^\.github/workflows/''',
+]

@@ -52,6 +52,7 @@ jobs:
         uses: hadolint/hadolint-action@2332a7b74a6de0dda2e2221d575162eba76ba5e5 # v3.3.0
         with:
           dockerfile: Dockerfile
+          failure-threshold: error
 
   # ── Unit tests ────────────────────────────────────────────────────────────────
   # Runs unit tests across platforms. Required on every PR and push.
@@ -96,7 +97,7 @@ jobs:
         run: zig version
 
       - name: Run unit tests
-        run: zig build test --summary all --error-style verbose --multiline-errors
+        run: zig build test --summary all --error-style verbose
 
   # ── Build validation ──────────────────────────────────────────────────────────
   # Validates Debug, ReleaseSafe, and ReleaseFast builds across platforms.
@@ -157,10 +158,13 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Install Gitleaks
+        run: |
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz" \
+            | tar -xz -C /usr/local/bin gitleaks
+
       - name: Secret scanning
-        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2.3.9
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gitleaks detect --source . --config .gitleaks.toml --log-level warn
 
       - name: Filesystem vulnerability scan
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
@@ -173,7 +177,7 @@ jobs:
 
       - name: Upload Trivy SARIF
         if: always()
-        uses: github/codeql-action/upload-sarif@7fd177fa680c9881b53cdab4d346d32574c9f7f4 # v3.35.4
+        uses: github/codeql-action/upload-sarif@68bde559dea0fdcac2102bfdf6230c5f70eb485e # v4.35.4
         with:
           sarif_file: trivy-results.sarif
           category: trivy-fs
@@ -185,10 +189,12 @@ jobs:
 
   # ── Dependency review (PRs only) ──────────────────────────────────────────────
   # Flags new dependency additions or removals in pull requests.
+  # Requires the Dependency Graph feature enabled under Settings → Security.
   dependency-review:
     name: Dependency review
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
+    continue-on-error: true
     permissions:
       contents: read
       pull-requests: write

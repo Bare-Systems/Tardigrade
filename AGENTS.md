@@ -23,6 +23,62 @@ zig build test
 zig build test-integration
 ```
 
+## Profiling Workflow
+
+Profiling is driven entirely by external tools — no instrumentation is compiled
+into the binary by default.
+
+### Build modes for profiling
+
+| Mode | Command | Use case |
+|---|---|---|
+| Debug (default) | `zig build` | Symbol-rich; slowest; use for sanitizer runs |
+| ReleaseSafe | `zig build -Doptimize=ReleaseSafe` | Optimised + safety checks; recommended for profiling |
+| ReleaseFast | `zig build -Doptimize=ReleaseFast` | Maximum throughput; use to validate absolute peak performance |
+
+### Quick start
+
+```bash
+# Build a profiling binary
+./scripts/profile.sh build
+
+# Show CPU profiling instructions for your platform
+./scripts/profile.sh cpu-linux   # Linux: perf + flamegraph
+./scripts/profile.sh cpu-macos   # macOS: sample / Instruments
+
+# Show memory profiling instructions
+./scripts/profile.sh mem-linux   # Valgrind massif or heaptrack
+./scripts/profile.sh mem-macos   # leaks or Instruments Allocations
+```
+
+### Known hot paths to investigate
+
+- TLS handshake (`SSL_accept`, `SSL_read`, `SSL_write` in OpenSSL)
+- Header parsing (`parseHeaders`, `parseRequest` in `src/http/request.zig`)
+- Rate-limiter and idempotency lock contention (short critical sections, but
+  called on every request)
+- Upstream connection establishment (TCP connect + TLS handshake round trip)
+- JSON access-log serialisation (`formatEntry` in `access_log.zig`)
+
+### Benchmark + profile workflow
+
+```bash
+# Terminal 1 — start server under profiling (Linux example)
+zig build -Doptimize=ReleaseSafe
+perf record -g -F 997 ./zig-out/bin/tardigrade run &
+
+# Terminal 2 — run load
+./benchmarks/run.sh --duration 60 --connections 100
+
+# Back in Terminal 1 — stop and analyse
+kill %1
+perf report --no-children
+```
+
+See `scripts/profile.sh` for full platform-specific instructions.
+
+---
+
 ## Event Loop I/O Model
 
 Tardigrade uses a **level-triggered epoll/kqueue** event loop on the listener

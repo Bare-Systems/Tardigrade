@@ -124,6 +124,8 @@ pub const ServerSession = if (nghttp3_enabled) struct {
         complete_request: ?StreamRequest = null,
         response_body: ?[]u8 = null,
         response_sent: usize = 0,
+        /// True when any data for this stream arrived as QUIC 0-RTT early data.
+        is_early_data: bool = false,
 
         fn deinit(self: *StreamEntry) void {
             if (self.complete_request) |*req| req.deinit();
@@ -278,6 +280,22 @@ pub const ServerSession = if (nghttp3_enabled) struct {
             var removed = entry.value;
             removed.deinit();
         }
+    }
+
+    /// Mark a stream as having received QUIC 0-RTT early-data frames.
+    /// Called by the transport layer when NGTCP2_STREAM_DATA_FLAG_0RTT is set.
+    pub fn markStreamEarlyData(self: *@This(), stream_id: i64) void {
+        if (self.state.streams.getPtr(stream_id)) |entry| {
+            entry.is_early_data = true;
+        }
+    }
+
+    /// Returns true if any data for the stream arrived as 0-RTT early data.
+    pub fn isStreamEarlyData(self: *const @This(), stream_id: i64) bool {
+        if (self.state.streams.getPtr(stream_id)) |entry| {
+            return entry.is_early_data;
+        }
+        return false;
     }
 
     pub fn addWriteOffset(self: *@This(), stream_id: i64, datalen: usize) void {
@@ -474,10 +492,27 @@ pub const ServerSession = if (nghttp3_enabled) struct {
 
     pub fn closeStream(_: *@This(), _: i64) void {}
 
+    pub fn markStreamEarlyData(_: *@This(), _: i64) void {}
+
+    pub fn isStreamEarlyData(_: *const @This(), _: i64) bool {
+        return false;
+    }
+
     pub fn submitResponse(_: *@This(), _: std.mem.Allocator, _: i64, _: *const Response) !void {
         return error.DependencyUnavailable;
     }
 };
+
+/// Returns true for HTTP methods that are safe (no observable side effects) and
+/// therefore eligible to be replayed as 0-RTT early data without replay risk.
+/// POST, PUT, PATCH, DELETE, and CONNECT are considered unsafe and must not be
+/// served from early data when 0-RTT is enabled.
+pub fn isMethodSafe(method: []const u8) bool {
+    return std.mem.eql(u8, method, "GET") or
+        std.mem.eql(u8, method, "HEAD") or
+        std.mem.eql(u8, method, "OPTIONS") or
+        std.mem.eql(u8, method, "TRACE");
+}
 
 pub fn encodeResponseHeaderBlock(allocator: std.mem.Allocator, response: *const Response) !EncodedHeaderBlock {
     var fields = std.ArrayList(HeaderField).empty;
@@ -639,4 +674,32 @@ test "enabled nghttp3 session initializes and rejects unopened response streams 
     defer response.deinit();
     _ = response.setStatus(.ok).setHeader("content-type", "application/json");
     try std.testing.expectError(error.NotYetImplemented, session.submitResponse(allocator, 0, &response));
+}
+
+test "isMethodSafe identifies safe versus unsafe HTTP methods" {
+    // Safe (idempotent and side-effect-free) methods should be accepted as 0-RTT.
+    try std.testing.expect(isMethodSafe("GET"));
+    try std.testing.expect(isMethodSafe("HEAD"));
+    try std.testing.expect(isMethodSafe("OPTIONS"));
+    try std.testing.expect(isMethodSafe("TRACE"));
+    // Unsafe methods must not be replayed as 0-RTT early data.
+    try std.testing.expect(!isMethodSafe("POST"));
+    try std.testing.expect(!isMethodSafe("PUT"));
+    try std.testing.expect(!isMethodSafe("PATCH"));
+    try std.testing.expect(!isMethodSafe("DELETE"));
+    try std.testing.expect(!isMethodSafe("CONNECT"));
+    try std.testing.expect(!isMethodSafe(""));
+}
+
+test "disabled ServerSession early-data helpers return safe defaults" {
+    if (nghttp3_enabled) return;
+
+    const allocator = std.testing.allocator;
+    var session = ServerSession.init(allocator) catch |err| {
+        if (err == error.DependencyUnavailable) return;
+        return err;
+    };
+    defer session.deinit();
+    session.markStreamEarlyData(1);
+    try std.testing.expect(!session.isStreamEarlyData(1));
 }

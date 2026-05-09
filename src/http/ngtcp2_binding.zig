@@ -696,12 +696,16 @@ pub const Binding = if (enabled) struct {
         const native: *@This().Server.NativeConnection = @ptrCast(@alignCast(user_data orelse return c.NGTCP2_ERR_CALLBACK_FAILURE));
         const server: *@This().Server = @ptrCast(@alignCast(native.server_ptr));
         const fin = (flags & c.NGTCP2_STREAM_DATA_FLAG_FIN) != 0;
+        const is_0rtt = (flags & c.NGTCP2_STREAM_DATA_FLAG_0RTT) != 0;
         if (native.session) |*session| {
+            // Track 0-RTT provenance on the stream so the request handler can
+            // enforce replay safety after the full request is assembled.
+            if (is_0rtt) session.markStreamEarlyData(stream_id);
             const consumed = session.ingestRequestBytes(stream_id, data[0..datalen], fin) catch |err| {
                 std.debug.print("http3 ingest request bytes failed: stream_id={d} datalen={d} fin={} err={any}\n", .{ stream_id, datalen, fin, err });
                 return c.NGTCP2_ERR_CALLBACK_FAILURE;
             };
-            std.debug.print("http3 recv stream data: stream_id={d} datalen={d} consumed={d} fin={}\n", .{ stream_id, datalen, consumed, fin });
+            std.debug.print("http3 recv stream data: stream_id={d} datalen={d} consumed={d} fin={} 0rtt={}\n", .{ stream_id, datalen, consumed, fin, is_0rtt });
             if (conn) |quic_conn| {
                 _ = c.ngtcp2_conn_extend_max_stream_offset(quic_conn, stream_id, consumed);
                 c.ngtcp2_conn_extend_max_offset(quic_conn, consumed);
@@ -715,6 +719,22 @@ pub const Binding = if (enabled) struct {
                 var owned_request = request;
                 var response = response_mod.Response.init(server.allocator);
                 defer response.deinit();
+
+                // RFC 8470 §5.3: reject unsafe methods received as 0-RTT early
+                // data to prevent replay attacks.  Respond with 425 Too Early
+                // when 0-RTT is active and the method is not safe.
+                const early_data = session.isStreamEarlyData(stream_id);
+                if (early_data and !http3_session.isMethodSafe(owned_request.method)) {
+                    std.debug.print("http3 0-RTT replay rejected: stream_id={d} method={s}\n", .{ stream_id, owned_request.method });
+                    _ = response.setStatus(.too_early);
+                    session.submitResponse(server.allocator, stream_id, &response) catch |err| {
+                        std.debug.print("http3 submit 425 failed: stream_id={d} err={any}\n", .{ stream_id, err });
+                    };
+                    owned_request.deinit();
+                    noteStreamData(server, native.dcid.data[0..native.dcid.datalen], datalen, completed);
+                    return 0;
+                }
+
                 if (server.config.request_handler) |handler| {
                     handler(server.allocator, &owned_request, &response, server.config.request_handler_ctx) catch |err| {
                         std.debug.print("http3 request handler failed: stream_id={d} err={any}\n", .{ stream_id, err });

@@ -267,6 +267,10 @@ pub const EdgeConfig = struct {
     access_log_buffer_size: usize,
     /// Optional syslog UDP endpoint (host:port).
     access_log_syslog_udp: []const u8,
+    /// Header names (lowercase) that must never appear in log output.
+    /// Set via TARDIGRADE_REDACT_HEADERS (comma-separated).
+    /// Defaults to the built-in redaction list when empty.
+    log_redact_headers: []const []const u8,
     /// Prometheus metrics route path (empty disables the endpoint).
     metrics_path: []const u8,
     /// Require request auth before serving the metrics endpoint.
@@ -508,6 +512,8 @@ pub const EdgeConfig = struct {
         allocator.free(self.try_files);
         allocator.free(self.access_log_template);
         allocator.free(self.access_log_syslog_udp);
+        for (self.log_redact_headers) |name| allocator.free(name);
+        allocator.free(self.log_redact_headers);
         allocator.free(self.metrics_path);
         allocator.free(self.worker_cpu_affinity);
         allocator.free(self.upstream_active_health_path);
@@ -930,6 +936,13 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     const access_log_buffer_size = parseIntEnv(usize, allocator, "TARDIGRADE_ACCESS_LOG_BUFFER_SIZE", 0);
     const access_log_syslog_udp = envOrDefault(allocator, "TARDIGRADE_ACCESS_LOG_SYSLOG_UDP", "") catch unreachable;
     errdefer allocator.free(access_log_syslog_udp);
+    const log_redact_headers_raw = envOrDefault(allocator, "TARDIGRADE_REDACT_HEADERS", "") catch unreachable;
+    defer allocator.free(log_redact_headers_raw);
+    const log_redact_headers = try parseCsvValues(allocator, log_redact_headers_raw);
+    errdefer {
+        for (log_redact_headers) |name| allocator.free(name);
+        allocator.free(log_redact_headers);
+    }
     const metrics_path = envOrDefault(allocator, "TARDIGRADE_METRICS_PATH", "/status/metrics") catch unreachable;
     errdefer allocator.free(metrics_path);
     const metrics_require_auth = parseBoolEnv(allocator, "TARDIGRADE_METRICS_REQUIRE_AUTH", false);
@@ -1364,6 +1377,7 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .access_log_min_status = access_log_min_status,
         .access_log_buffer_size = access_log_buffer_size,
         .access_log_syslog_udp = access_log_syslog_udp,
+        .log_redact_headers = log_redact_headers,
         .metrics_path = metrics_path,
         .metrics_require_auth = metrics_require_auth,
         .compression_enabled = compression_enabled,

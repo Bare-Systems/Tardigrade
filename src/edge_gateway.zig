@@ -2550,6 +2550,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         .min_status = cfg.access_log_min_status,
         .buffer_size_bytes = cfg.access_log_buffer_size,
         .syslog_udp_endpoint = cfg.access_log_syslog_udp,
+        .redact_header_names = cfg.log_redact_headers,
     }) catch {};
     defer http.access_log.deinit();
 
@@ -3078,6 +3079,7 @@ fn hotReloadConfig(
         .min_status = cfg_ptr.access_log_min_status,
         .buffer_size_bytes = cfg_ptr.access_log_buffer_size,
         .syslog_udp_endpoint = cfg_ptr.access_log_syslog_udp,
+        .redact_header_names = cfg_ptr.log_redact_headers,
     }) catch {};
     state.reload_mutex.lock();
     state.last_reload_ok = true;

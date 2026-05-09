@@ -35,13 +35,46 @@ pub const Format = enum {
     }
 };
 
+/// Default set of header names that are always redacted.
+/// These are lowercased and compared case-insensitively against incoming names.
+pub const default_redact_header_names: []const []const u8 = &.{
+    "authorization",
+    "cookie",
+    "set-cookie",
+    "x-api-key",
+    "proxy-authorization",
+    "www-authenticate",
+};
+
 pub const Config = struct {
     format: Format = .json,
     custom_template: []const u8 = "",
     min_status: u16 = 0,
     buffer_size_bytes: usize = 0,
     syslog_udp_endpoint: []const u8 = "",
+    /// Header names (lowercase) that must never appear in logs.
+    /// Matched case-insensitively.  Defaults to `default_redact_header_names`
+    /// when empty.  Pass a non-empty slice to override the default list.
+    redact_header_names: []const []const u8 = &.{},
 };
+
+/// Returns true if `header_name` should be redacted from log output.
+/// Comparison is case-insensitive.  When `redact_names` is empty the check
+/// falls back to the built-in `default_redact_header_names` list.
+pub fn shouldRedactHeader(header_name: []const u8, redact_names: []const []const u8) bool {
+    const list = if (redact_names.len > 0) redact_names else default_redact_header_names;
+    for (list) |name| {
+        if (std.ascii.eqlIgnoreCase(header_name, name)) return true;
+    }
+    return false;
+}
+
+/// Sanitize a single header value for log output: returns `[REDACTED]` when
+/// `header_name` appears in the configured (or default) redaction list, or the
+/// original `value` otherwise.
+pub fn sanitizeHeaderValue(header_name: []const u8, value: []const u8, redact_names: []const []const u8) []const u8 {
+    return if (shouldRedactHeader(header_name, redact_names)) "[REDACTED]" else value;
+}
 
 const State = struct {
     allocator: std.mem.Allocator,
@@ -333,4 +366,36 @@ test "formatEntry json encodes null upstream_status as literal null" {
     const line = try formatEntry(std.testing.allocator, .{}, entry);
     defer std.testing.allocator.free(line);
     try std.testing.expect(std.mem.find(u8, line, "\"upstream_status\":null") != null);
+}
+
+test "shouldRedactHeader matches default sensitive headers case-insensitively" {
+    // Default sensitive headers should be redacted.
+    try std.testing.expect(shouldRedactHeader("Authorization", &.{}));
+    try std.testing.expect(shouldRedactHeader("AUTHORIZATION", &.{}));
+    try std.testing.expect(shouldRedactHeader("authorization", &.{}));
+    try std.testing.expect(shouldRedactHeader("Cookie", &.{}));
+    try std.testing.expect(shouldRedactHeader("SET-COOKIE", &.{}));
+    try std.testing.expect(shouldRedactHeader("X-Api-Key", &.{}));
+    try std.testing.expect(shouldRedactHeader("Proxy-Authorization", &.{}));
+    try std.testing.expect(shouldRedactHeader("WWW-Authenticate", &.{}));
+    // Non-sensitive headers should pass through.
+    try std.testing.expect(!shouldRedactHeader("Content-Type", &.{}));
+    try std.testing.expect(!shouldRedactHeader("User-Agent", &.{}));
+    try std.testing.expect(!shouldRedactHeader("Accept", &.{}));
+    try std.testing.expect(!shouldRedactHeader("X-Request-ID", &.{}));
+}
+
+test "shouldRedactHeader uses custom list when provided" {
+    const custom = &[_][]const u8{ "x-secret", "x-internal-token" };
+    try std.testing.expect(shouldRedactHeader("X-Secret", custom));
+    try std.testing.expect(shouldRedactHeader("x-internal-token", custom));
+    // Custom list overrides defaults — Authorization is NOT in this custom list.
+    try std.testing.expect(!shouldRedactHeader("Authorization", custom));
+}
+
+test "sanitizeHeaderValue returns [REDACTED] for sensitive headers" {
+    try std.testing.expectEqualStrings("[REDACTED]", sanitizeHeaderValue("Authorization", "Bearer secret-token", &.{}));
+    try std.testing.expectEqualStrings("[REDACTED]", sanitizeHeaderValue("cookie", "session=abc123", &.{}));
+    // Safe header value passes through unchanged.
+    try std.testing.expectEqualStrings("application/json", sanitizeHeaderValue("Content-Type", "application/json", &.{}));
 }

@@ -23,6 +23,35 @@ zig build test
 zig build test-integration
 ```
 
+## std.c / std.posix Usage Audit (v0.62 baseline, issue #80)
+
+Direct `std.c` and `std.posix` usage is intentional and appropriate in the
+following modules.  All sites were reviewed after the Zig 0.16 migration.
+
+| Module | Usage | Verdict |
+|---|---|---|
+| `edge_gateway.zig` | `accept`, `sockaddr`, `fcntl`, `close`, `dup2`, `lseek`, `rlimit`, AF/SOCK constants | ✅ Keep — low-level TCP accept loop and fd management |
+| `http/event_loop.zig` | kqueue / `kevent`, `EVFILT.READ`, `EV.ADD` | ✅ Keep — event-loop primitives with no `std.Io` equivalent |
+| `http/shutdown.zig` | `sigaction`, `SIG.HUP/INT/TERM/USR1/USR2` | ✅ Keep — signal handler registration |
+| `http/worker_pool.zig` | `pthread_setaffinity_np` / CPU affinity | ✅ Keep — platform thread tuning |
+| `http/tls_termination.zig` | `std.c.malloc`, `std.c.free` for OpenSSL ALPN/SNI buffers | ✅ Keep — OpenSSL C callbacks require C heap |
+| `http/acme_client.zig` | `std.c.free` for DER buffer from OpenSSL | ✅ Keep — OpenSSL owns the allocation |
+| `http/access_log.zig` | UDP syslog socket (`socket`, `sendto`, `sockaddr.in`) | ✅ Keep — raw UDP datagram send has no `std.Io` path |
+| `http/transcript_store.zig` | `lseek` (seek-to-end), `fchmod` (set 0o600) | ✅ Keep — POSIX file-mode operations; no `std.Io` equivalent |
+| `http/ngtcp2_binding.zig` | QUIC `sockaddr`/UDP framing for ngtcp2 C binding | ✅ Keep — C library ABI requirement |
+| `http3_runtime.zig` | UDP send/recv, `sockaddr`, QUIC socket options | ✅ Keep — QUIC transport layer |
+| `main.zig` | PID file, `dup2`, signal masks, process spawn | ✅ Keep — process management, no `std.Io` alternative |
+
+**No avoidable calls were identified.**  The `zig_compat.zig` layer is the right
+boundary for filesystem and process I/O that has `std.Io` equivalents; the
+modules above deal with sockets, signals, C library interop, and file-descriptor
+manipulation that do not.
+
+If a future `std.Io` gains first-class kqueue/epoll, signal, or UDP socket APIs
+the relevant modules should be migrated at that point.
+
+---
+
 ## compat.io() Migration Pattern
 
 `src/zig_compat.zig` exposes a global `compat.io()` helper as a migration bridge

@@ -23,6 +23,83 @@ zig build test
 zig build test-integration
 ```
 
+## Architecture and Ownership Audit (v0.62 baseline)
+
+Summary of the codebase audit performed for issue #60.
+
+### Module size
+
+| File | Lines | Status |
+|---|---|---|
+| `src/edge_gateway.zig` | ~10 100 | ⚠️ Too large — contains HTTP handler, proxy, sessions, event loop, health checks, config reload. Split into sub-modules is the top structural debt item. |
+| `src/edge_config.zig` | ~2 975 | OK for now; grows with new env vars |
+| `src/http/config_file.zig` | ~1 310 | OK |
+| Everything else | < 1 100 | Reasonable |
+
+**Recommendation:** `edge_gateway.zig` should be split into at minimum:
+`gateway_handler.zig`, `gateway_proxy.zig`, `gateway_state.zig`,
+`gateway_sessions.zig`, and `gateway_health.zig` in a future refactor session.
+
+### Allocator ownership
+
+| Lifetime | Allocator | Pattern |
+|---|---|---|
+| Process | `std.heap.GeneralPurposeAllocator` (GPA) | Used for `GatewayState` and long-lived config; freed at shutdown |
+| Request | `state.allocator` (same GPA) | Most request-scoped allocations; freed in request handler defer chains |
+| Request (some paths) | `std.heap.ArenaAllocator` | Used for config validation and some request contexts; deinited at function end |
+| Buffer reuse | `BufferPool` (slab allocator) | Used for request and relay read buffers; correct pattern |
+
+**Gaps:** request paths do not universally use a per-request arena. Large proxied
+responses allocate into the GPA and are freed on response completion. No leaks
+observed but arena discipline would reduce fragmentation under high concurrency.
+
+### Config lifecycle
+
+`ReloadableConfigStore` correctly ref-counts config versions:
+- `acquire()` holds a lease; `release()` decrements refcount.
+- On reload, old config is moved to `retired` list and freed when its refcount
+  reaches zero.
+- Tested: probe threads and active workers hold leases; config never freed while
+  in use.
+
+### Error handling
+
+- 58 `errdefer` sites in `edge_gateway.zig` — reasonable coverage for partial init failures.
+- Several `catch {}` sites are intentional best-effort operations (sleep, log
+  flushing, non-critical socket options) — acceptable.
+- Notable: `proxy_cache_store.put catch {}` (line ~672) silently discards cache
+  write failures; this is intentional (cache is best-effort).
+- `setNonBlocking catch {}` after connection accept is acceptable (connection is
+  still usable in blocking mode).
+
+### Related issues addressed
+
+All hardening issues listed in #60 have been resolved:
+- #37 (hop-by-hop header stripping) ✅ CLOSED
+- #38 (directory traversal) ✅ CLOSED
+- #41 (config reload cleanup) ✅ CLOSED
+- #49 (validation/error messages) ✅ CLOSED
+- #52 (header injection) ✅ CLOSED
+- #53 (size limits) ✅ CLOSED
+- #54 (log redaction) ✅ CLOSED
+- #56 (TE/CL conflict) ✅ CLOSED
+- #57 (concurrency audit) ✅ CLOSED
+- #58 (event loop audit) ✅ CLOSED
+- #59 (profiling hooks) ✅ CLOSED
+
+### Recommendation
+
+**Continue feature development.** The foundation is sound:
+- No memory safety issues or races found.
+- Config and connection lifecycles are correctly managed.
+- Error paths use errdefer consistently.
+- All listed hardening items are resolved.
+
+The one outstanding structural debt is `edge_gateway.zig` size; this should be
+tracked and split when the next large feature area is added.
+
+---
+
 ## Profiling Workflow
 
 Profiling is driven entirely by external tools — no instrumentation is compiled

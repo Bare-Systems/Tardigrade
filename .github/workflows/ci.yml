@@ -14,48 +14,199 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # ── Unit tests ────────────────────────────────────────────────────────────────
-  # Fast (<5 min). Required to pass on every push.
-  test:
+  # ── Format ────────────────────────────────────────────────────────────────────
+  # Fast source formatting check. Required on every PR and push.
+  format:
+    name: Format
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Install Zig
+        run: sh ./scripts/install-zig.sh 0.16.0
+
+      - name: Check formatting
+        run: zig fmt --check build.zig src/ tests/
+
+  # ── Lint ──────────────────────────────────────────────────────────────────────
+  # Workflow syntax, shell scripts, and Dockerfile linting.
+  lint:
+    name: Lint
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
-      - name: Install dependencies
+      - name: Run actionlint
+        uses: rhysd/actionlint@a443f344ff32813837fa49f7aa6cbc478d770e62 # v1.7.9
+
+      - name: Run shellcheck
+        run: find scripts/ -name "*.sh" -exec shellcheck {} +
+
+      - name: Run hadolint
+        uses: hadolint/hadolint-action@2332a7b74a6de0dda2e2221d575162eba76ba5e5 # v3.3.0
+        with:
+          dockerfile: Dockerfile
+
+  # ── Unit tests ────────────────────────────────────────────────────────────────
+  # Runs unit tests across platforms. Required on every PR and push.
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            install-deps: sudo apt-get install -y libssl-dev
+          - os: ubuntu-24.04-arm
+            install-deps: sudo apt-get install -y libssl-dev
+          - os: macos-14
+            install-deps: ""
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Install system dependencies
+        if: matrix.install-deps != ''
+        run: ${{ matrix.install-deps }}
+
+      - name: Install Zig
+        run: sh ./scripts/install-zig.sh 0.16.0
+
+      - name: Cache Zig build artifacts
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cache/zig
+            .zig-cache
+          key: zig-test-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig') }}-${{ github.sha }}
+          restore-keys: |
+            zig-test-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig') }}-
+            zig-test-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Print Zig version
+        run: zig version
+
+      - name: Run unit tests
+        run: zig build test --summary all --error-style verbose --multiline-errors
+
+  # ── Build validation ──────────────────────────────────────────────────────────
+  # Validates Debug, ReleaseSafe, and ReleaseFast builds across platforms.
+  # Debug catches assertion failures; ReleaseSafe catches safety-check panics;
+  # ReleaseFast confirms production artifact parity.
+  build:
+    name: Build (${{ matrix.os }}, ${{ matrix.optimize }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-14]
+        optimize: [Debug, ReleaseSafe, ReleaseFast]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
         run: sudo apt-get install -y libssl-dev
 
       - name: Install Zig
         run: sh ./scripts/install-zig.sh 0.16.0
 
       - name: Cache Zig build artifacts
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cache/zig
             .zig-cache
-          key: zig-unit-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig') }}-${{ github.sha }}
+          key: zig-build-${{ matrix.optimize }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig') }}-${{ github.sha }}
           restore-keys: |
-            zig-unit-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig') }}-
-            zig-unit-${{ runner.os }}-${{ runner.arch }}-
+            zig-build-${{ matrix.optimize }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig') }}-
+            zig-build-${{ matrix.optimize }}-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Print Zig version
         run: zig version
 
-      - name: Check formatting
-        run: zig fmt --check build.zig src/ tests/
+      - name: Build (${{ matrix.optimize }})
+        run: zig build -Doptimize=${{ matrix.optimize }}
 
-      - name: Run unit tests
-        run: zig build test --summary all --error-style verbose --multiline-errors
+  # ── Security scanning ─────────────────────────────────────────────────────────
+  # Secret detection, filesystem vulnerability scanning, and GitHub Actions
+  # hardening checks. Results are uploaded to the Security tab as SARIF.
+  security:
+    name: Security
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      security-events: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+
+      - name: Secret scanning
+        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2.3.9
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Filesystem vulnerability scan
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH
+
+      - name: Upload Trivy SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@7fd177fa680c9881b53cdab4d346d32574c9f7f4 # v3.35.4
+        with:
+          sarif_file: trivy-results.sarif
+          category: trivy-fs
+
+      - name: GitHub Actions hardening
+        uses: zizmorcore/zizmor-action@b1d7e1fb5de872772f31590499237e7cce841e8e # v0.5.3
+        with:
+          gh-token: ${{ secrets.GITHUB_TOKEN }}
+
+  # ── Dependency review (PRs only) ──────────────────────────────────────────────
+  # Flags new dependency additions or removals in pull requests.
+  dependency-review:
+    name: Dependency review
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Dependency review
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
 
   # ── Integration tests ─────────────────────────────────────────────────────────
-  # Slow to compile (~45-60 min cold on a 2-core runner). Runs on push to main
-  # only (not PRs). Does not block the required test job.
+  # Slow to compile (~45–60 min cold on a 2-core runner). Runs on push to main
+  # only (not PRs). Does not block the required jobs.
   # The first cold-cache run will hit the timeout; subsequent runs use the
   # saved cache and complete in a few minutes.
   integration-test:
+    name: Integration tests
     runs-on: ubuntu-latest
     timeout-minutes: 90
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -63,7 +214,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
       - name: Install dependencies
         run: sudo apt-get install -y libssl-dev
@@ -72,7 +223,7 @@ jobs:
         run: sh ./scripts/install-zig.sh 0.16.0
 
       - name: Cache Zig build artifacts
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cache/zig
@@ -87,41 +238,3 @@ jobs:
 
       - name: Run integration tests
         run: zig build test-integration --summary all
-
-  # ── Linux release builds ─────────────────────────────────────────────────────
-  build-linux-release:
-    name: Build Linux release (${{ matrix.archive_name }})
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            archive_name: tardigrade-linux-x86_64
-          - os: ubuntu-24.04-arm
-            archive_name: tardigrade-linux-aarch64
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v5
-
-      - name: Install Zig
-        run: sh ./scripts/install-zig.sh 0.16.0
-
-      - name: Cache Zig build artifacts
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cache/zig
-            .zig-cache
-          key: zig-release-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig') }}-${{ github.sha }}
-          restore-keys: |
-            zig-release-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig') }}-
-            zig-release-${{ runner.os }}-${{ runner.arch }}-
-
-      - name: Print Zig version
-        run: zig version
-
-      - name: Build Linux release binary
-        run: zig build -Doptimize=ReleaseFast -Dversion=ci

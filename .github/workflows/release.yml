@@ -23,7 +23,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
       - name: Install dependencies
         run: sudo apt-get install -y libssl-dev
@@ -32,7 +32,7 @@ jobs:
         run: sh ./scripts/install-zig.sh 0.16.0
 
       - name: Cache Zig build artifacts
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cache/zig
@@ -61,7 +61,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           fetch-depth: 0
 
@@ -100,6 +100,10 @@ jobs:
     needs: prepare-release
     if: needs.prepare-release.result == 'success' && needs.prepare-release.outputs.should_publish == 'true'
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     strategy:
       fail-fast: false
       matrix:
@@ -115,7 +119,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
       - name: Install Zig
         run: sh ./scripts/install-zig.sh 0.16.0
@@ -136,11 +140,31 @@ jobs:
           cp LICENSE dist/LICENSE
           tar -C dist -czf "${{ matrix.archive_name }}.tar.gz" tardigrade tardi LICENSE
 
-      - name: Upload workflow artifact
-        uses: actions/upload-artifact@v4
+      - name: Generate SBOM
+        uses: anchore/sbom-action@e11c554f704a0b820cbf8c51673f6945e0731532 # v0.20.0
+        with:
+          path: dist/
+          artifact-name: sbom-${{ matrix.archive_name }}.spdx.json
+          format: spdx-json
+          output-file: sbom-${{ matrix.archive_name }}.spdx.json
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: ${{ matrix.archive_name }}.tar.gz
+
+      - name: Upload archive artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ matrix.archive_name }}
           path: ${{ matrix.archive_name }}.tar.gz
+          if-no-files-found: error
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sbom-${{ matrix.archive_name }}
+          path: sbom-${{ matrix.archive_name }}.spdx.json
           if-no-files-found: error
 
   build-deb:
@@ -161,10 +185,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
       - name: Download binary artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: ${{ matrix.artifact }}
           path: artifact
@@ -183,11 +207,26 @@ jobs:
             --arch ${{ matrix.arch }} \
             --binary zig-out/bin/tardigrade
 
+      - name: Generate DEB SBOM
+        uses: anchore/sbom-action@e11c554f704a0b820cbf8c51673f6945e0731532 # v0.20.0
+        with:
+          path: dist/
+          artifact-name: sbom-tardigrade_${{ needs.prepare-release.outputs.version }}_${{ matrix.arch }}.spdx.json
+          format: spdx-json
+          output-file: sbom-tardigrade_${{ needs.prepare-release.outputs.version }}_${{ matrix.arch }}.spdx.json
+
       - name: Upload DEB artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: tardigrade_${{ needs.prepare-release.outputs.version }}_${{ matrix.arch }}.deb
           path: dist/*.deb
+          if-no-files-found: error
+
+      - name: Upload DEB SBOM artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sbom-tardigrade_${{ needs.prepare-release.outputs.version }}_${{ matrix.arch }}
+          path: sbom-tardigrade_${{ needs.prepare-release.outputs.version }}_${{ matrix.arch }}.spdx.json
           if-no-files-found: error
 
   publish-release:
@@ -201,10 +240,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
       - name: Download build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: dist
 
@@ -214,11 +253,20 @@ jobs:
           set -euo pipefail
           find dist -type f \( -name '*.tar.gz' -o -name '*.deb' \) -print0 | sort -z | xargs -0 shasum -a 256 > dist/tardigrade-checksums.txt
 
+      - name: Scan release archives for vulnerabilities
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: dist/
+          format: table
+          severity: CRITICAL
+          exit-code: 0
+
       - name: Generate release notes
         run: ./scripts/release-metadata.sh notes > release-notes.md
 
       - name: Publish release assets
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: ${{ needs.prepare-release.outputs.tag }}
           name: Tardigrade ${{ needs.prepare-release.outputs.tag }}
@@ -226,5 +274,6 @@ jobs:
           files: |
             dist/*/*.tar.gz
             dist/*/*.deb
+            dist/*/*.spdx.json
             dist/tardigrade-checksums.txt
           fail_on_unmatched_files: true

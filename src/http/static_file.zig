@@ -474,6 +474,34 @@ test "serve rejects percent-encoded traversal escaping root" {
     try std.testing.expectEqual(status.Status.forbidden, served.status_code);
 }
 
+test "serve rejects double-encoded traversal escaping root" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "index.html", .data = "ok" });
+    const root_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+
+    var hdrs = headers_mod.Headers.init(allocator);
+    defer hdrs.deinit();
+
+    const result = try serve(allocator, .{
+        .root = root_path,
+        .request_path = "/%252e%252e/escape-double.txt",
+        .matched_pattern = "/",
+        .alias = false,
+        .index = "index.html",
+        .try_files = "",
+        .headers = &hdrs,
+    });
+    try std.testing.expect(result == null or result.?.status_code == status.Status.forbidden);
+    if (result) |served_result| {
+        var served = served_result;
+        defer served.deinit(allocator);
+    }
+}
+
 test "serve rejects backslash traversal escaping root" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -534,6 +562,34 @@ test "serve rejects symlink escape outside root" {
         .request_path = "/linked.txt",
         .matched_pattern = "/",
         .alias = false,
+        .index = "index.html",
+        .try_files = "",
+        .headers = &hdrs,
+    });
+    try std.testing.expect(result != null);
+    var served = result.?;
+    defer served.deinit(allocator);
+    try std.testing.expectEqual(status.Status.forbidden, served.status_code);
+}
+
+test "serve rejects alias traversal escaping alias root" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try compat.wrapDir(tmp.dir).makePath("assets");
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "assets/index.html", .data = "asset" });
+    const assets_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, "assets");
+    defer allocator.free(assets_path);
+
+    var hdrs = headers_mod.Headers.init(allocator);
+    defer hdrs.deinit();
+
+    const result = try serve(allocator, .{
+        .root = assets_path,
+        .request_path = "/assets/%2e%2e/secrets.txt",
+        .matched_pattern = "/assets/",
+        .alias = true,
         .index = "index.html",
         .try_files = "",
         .headers = &hdrs,

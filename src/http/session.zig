@@ -256,6 +256,27 @@ test "SessionStore create with device_id" {
     try std.testing.expectEqualStrings("iphone-14-xyz", session.device_id.?);
 }
 
+test "fromHeaders accepts valid session token and rejects malformed values" {
+    const allocator = std.testing.allocator;
+    var headers = Headers.init(allocator);
+    defer headers.deinit();
+
+    var token_buf: [TOKEN_HEX_LEN]u8 = undefined;
+    @memset(token_buf[0..], 'a');
+    try headers.append(SESSION_HEADER, &token_buf);
+    try std.testing.expectEqualStrings(&token_buf, fromHeaders(&headers).?);
+
+    headers.deinit();
+    headers = Headers.init(allocator);
+    try headers.append(SESSION_HEADER, "short");
+    try std.testing.expect(fromHeaders(&headers) == null);
+
+    headers.deinit();
+    headers = Headers.init(allocator);
+    try headers.append(SESSION_HEADER, "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz");
+    try std.testing.expect(fromHeaders(&headers) == null);
+}
+
 test "SessionStore revoke" {
     const allocator = std.testing.allocator;
     var store = SessionStore.init(allocator, 300, 0);

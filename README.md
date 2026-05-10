@@ -100,6 +100,10 @@ Prometheus metrics are available on `TARDIGRADE_METRICS_PATH` (default
 set `TARDIGRADE_METRICS_REQUIRE_AUTH=true` to require the configured request
 auth controls before serving metrics.
 
+Security validation is treated as a release gate. The current security program,
+corpus replay entrypoint, and internal pentest workflow are documented in
+`docs/SECURITY_TEST_PLAN.md` and `docs/PENTEST_PLAYBOOK.md`.
+
 ## Documentation
 
 | Topic | Location |
@@ -107,6 +111,8 @@ auth controls before serving metrics.
 | Packaging | `packaging/README.md` |
 | Kubernetes | `packaging/kubernetes/README.md` |
 | Benchmarks | `benchmarks/README.md` |
+| Security test plan | `docs/SECURITY_TEST_PLAN.md` |
+| Pentest playbook | `docs/PENTEST_PLAYBOOK.md` |
 | BearClaw example | `examples/bearclaw/README.md` |
 | Security policy | `SECURITY.md` |
 | Contributing | `CONTRIBUTING.md` |
@@ -117,6 +123,9 @@ auth controls before serving metrics.
 ```bash
 # Unit tests
 zig build test --summary all --error-style verbose --multiline-errors
+
+# Security corpus replay
+zig build test-security-corpus
 
 # Integration tests (requires a running tardigrade instance and system OpenSSL)
 zig build test-integration

@@ -9983,6 +9983,20 @@ test "routeRequiresApprovalRule detects approval requirement" {
     try std.testing.expect(!routeRequiresApprovalRule("POST", "/api/messages", "POST|/api/tasks|ops|true||"));
 }
 
+test "evaluatePolicy bypasses approval management endpoints" {
+    const allocator = std.testing.allocator;
+    var headers = http.Headers.init(allocator);
+    defer headers.deinit();
+
+    var cfg = std.mem.zeroes(edge_config.EdgeConfig);
+    cfg.policy_approval_routes_raw = "POST|^/v1/commands$";
+
+    var state: GatewayState = undefined;
+    try std.testing.expect(evaluatePolicy(&state, &cfg, "POST", "/approvals/request", null, null, &headers) == null);
+    try std.testing.expect(evaluatePolicy(&state, &cfg, "POST", "/approvals/respond", null, null, &headers) == null);
+    try std.testing.expect(evaluatePolicy(&state, &cfg, "GET", "/approvals/status", null, null, &headers) == null);
+}
+
 test "parseApprovalResponseBody parses approve and deny" {
     const allocator = std.testing.allocator;
     var approve = try parseApprovalResponseBody(allocator, "{\"approval_token\":\"tok-1\",\"decision\":\"approve\"}");

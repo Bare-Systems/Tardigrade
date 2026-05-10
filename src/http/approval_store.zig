@@ -155,18 +155,13 @@ fn doFireWebhook(
     const uri = try std.Uri.parse(webhook_url);
     var client = std.http.Client{ .allocator = allocator, .io = compat.io() };
     defer client.deinit();
-
-    var header_buf: [4096]u8 = undefined;
-    var req = try client.open(.POST, uri, .{
-        .server_header_buffer = &header_buf,
-        .headers = .{
-            .content_type = .{ .override = "application/json" },
+    _ = try client.fetch(.{
+        .location = .{ .uri = uri },
+        .method = .POST,
+        .payload = body,
+        .keep_alive = false,
+        .extra_headers = &.{
+            .{ .name = "Content-Type", .value = "application/json" },
         },
     });
-    defer req.deinit();
-    req.transfer_encoding = .{ .content_length = body.len };
-    try req.send();
-    try req.writeAll(body);
-    try req.finish();
-    try req.wait();
 }

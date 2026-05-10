@@ -111,6 +111,23 @@ pub const Headers = struct {
         return self.get(name) != null;
     }
 
+    /// Count how many times a header name appears.
+    pub fn countByName(self: *const Headers, name: []const u8) usize {
+        var lower_buf: [256]u8 = undefined;
+        if (name.len > lower_buf.len) return 0;
+
+        for (name, 0..) |c, i| {
+            lower_buf[i] = std.ascii.toLower(c);
+        }
+        const lower_name = lower_buf[0..name.len];
+
+        var matches: usize = 0;
+        for (self.items.items) |header| {
+            if (std.mem.eql(u8, header.name, lower_name)) matches += 1;
+        }
+        return matches;
+    }
+
     /// Get the number of headers
     pub fn count(self: *const Headers) usize {
         return self.items.items.len;
@@ -373,4 +390,46 @@ test "Headers.append rejects invalid names and values" {
     // Valid header passes
     try headers.append("X-Good", "valid value");
     try std.testing.expectEqualStrings("valid value", headers.get("X-Good").?);
+}
+
+test "parseHeaders rejects obs-fold continuation lines" {
+    const allocator = std.testing.allocator;
+    const folded = "Host: localhost\r\n\tX-Folded: no\r\n\r\n";
+    try std.testing.expectError(error.InvalidHeader, parseHeaders(allocator, folded));
+}
+
+test "parseHeaders rejects too many headers" {
+    const allocator = std.testing.allocator;
+    var data = std.ArrayList(u8).empty;
+    defer data.deinit(allocator);
+
+    for (0..MAX_HEADERS + 1) |idx| {
+        const line = try std.fmt.allocPrint(allocator, "X-{d}: value\r\n", .{idx});
+        defer allocator.free(line);
+        try data.appendSlice(allocator, line);
+    }
+    try data.appendSlice(allocator, "\r\n");
+    try std.testing.expectError(error.TooManyHeaders, parseHeaders(allocator, data.items));
+}
+
+test "parseHeaders rejects header line above single-header limit" {
+    const allocator = std.testing.allocator;
+    const oversized_value = "a" ** (MAX_HEADER_SIZE + 1);
+    const data = "X-Test: " ++ oversized_value ++ "\r\n\r\n";
+    try std.testing.expectError(error.HeaderTooLarge, parseHeaders(allocator, data));
+}
+
+test "parseHeaders rejects aggregate header bytes above total limit" {
+    const allocator = std.testing.allocator;
+    const big_value = "a" ** 2048;
+    var data = std.ArrayList(u8).empty;
+    defer data.deinit(allocator);
+
+    while (data.items.len <= MAX_HEADERS_TOTAL_SIZE) {
+        const line = try std.fmt.allocPrint(allocator, "X-Test: {s}\r\n", .{big_value});
+        defer allocator.free(line);
+        try data.appendSlice(allocator, line);
+    }
+    try data.appendSlice(allocator, "\r\n");
+    try std.testing.expectError(error.HeadersTooLarge, parseHeaders(allocator, data.items));
 }

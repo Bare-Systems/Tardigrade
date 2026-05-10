@@ -104,8 +104,12 @@ pub const Request = struct {
 
         const body_start = request_line_end + 2 + header_result.body_start;
 
-        const has_te = headers.get("transfer-encoding") != null;
-        const has_cl = headers.get("content-length") != null;
+        const te_count = headers.countByName("transfer-encoding");
+        const cl_count = headers.countByName("content-length");
+        const has_te = te_count > 0;
+        const has_cl = cl_count > 0;
+
+        if (cl_count > 1 or te_count > 1) return error.ConflictingHeaders;
 
         // RFC 7230 §3.3.3: If both Transfer-Encoding and Content-Length are
         // present, reject as a potential request-smuggling attack.
@@ -426,6 +430,14 @@ test "reject body too large" {
     try testing.expectError(error.BodyTooLarge, Request.parse(allocator, raw, 100));
 }
 
+test "reject oversized request line" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const long_uri = "/" ++ ("a" ** (MAX_REQUEST_LINE_SIZE + 1));
+    const raw = "GET " ++ long_uri ++ " HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    try testing.expectError(error.InvalidRequestLine, Request.parse(allocator, raw, DEFAULT_MAX_BODY_SIZE));
+}
+
 test "bytes consumed tracking" {
     const testing = std.testing;
     const allocator = testing.allocator;
@@ -456,6 +468,12 @@ test "reject request with both Transfer-Encoding and Content-Length (smuggling d
     try std.testing.expectError(error.ConflictingHeaders, Request.parse(allocator, raw, DEFAULT_MAX_BODY_SIZE));
 }
 
+test "reject duplicate Content-Length headers" {
+    const allocator = std.testing.allocator;
+    const raw = "POST /api HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\nContent-Length: 7\r\n\r\nhello!!";
+    try std.testing.expectError(error.ConflictingHeaders, Request.parse(allocator, raw, DEFAULT_MAX_BODY_SIZE));
+}
+
 test "parse chunked body correctly" {
     const allocator = std.testing.allocator;
     // Two chunks: "Hello, " (7 bytes) + "World!" (6 bytes) = "Hello, World!"
@@ -480,6 +498,12 @@ test "malformed chunked body returns InvalidChunkedBody" {
     const allocator = std.testing.allocator;
     // Missing CRLF after chunk data.
     const raw = "POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello0\r\n\r\n";
+    try std.testing.expectError(error.InvalidChunkedBody, Request.parse(allocator, raw, DEFAULT_MAX_BODY_SIZE));
+}
+
+test "premature EOF in chunked body returns InvalidChunkedBody" {
+    const allocator = std.testing.allocator;
+    const raw = "POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhel";
     try std.testing.expectError(error.InvalidChunkedBody, Request.parse(allocator, raw, DEFAULT_MAX_BODY_SIZE));
 }
 

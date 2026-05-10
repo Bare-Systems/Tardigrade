@@ -87,6 +87,27 @@ pub fn build(b: *std.Build) void {
 
     const integration_step = b.step("test-integration", "Run live-process integration tests");
     integration_step.dependOn(&run_integration_tests.step);
+
+    const security_corpus_mod = b.createModule(.{
+        .root_source_file = b.path("tests/security/request_parser_corpus.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    security_corpus_mod.addImport("zig_compat", compat_mod);
+    security_corpus_mod.addImport("request_mod", b.createModule(.{
+        .root_source_file = b.path("src/http/request.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    }));
+
+    const security_corpus_tests = b.addTest(.{
+        .root_module = security_corpus_mod,
+    });
+    const run_security_corpus_tests = b.addRunArtifact(security_corpus_tests);
+    const security_corpus_step = b.step("test-security-corpus", "Run request parser corpus regression tests");
+    security_corpus_step.dependOn(&run_security_corpus_tests.step);
 }
 
 fn pathExists(path: []const u8) bool {

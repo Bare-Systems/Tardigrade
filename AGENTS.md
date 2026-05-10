@@ -34,6 +34,22 @@ zig build test
 zig build test-integration
 ```
 
+## Benchmark Execution Policy
+
+Performance benchmarks are to be run on the dedicated homelab perf target by
+default.
+
+- Use the `tardigrade-perf` guest for all normal benchmark, regression, and
+  release-baseline work.
+- Run the load generator **inside** the `tardigrade-perf` guest against
+  `127.0.0.1` for canonical numbers.
+- Do **not** treat Jetson, laptop, or other external network paths as the
+  default benchmark path.
+- Only run benchmarks on the local laptop when the user explicitly requests a
+  local run or when the homelab target is unavailable.
+- If a local fallback run is used, label it clearly as a fallback and do not
+  present it as the canonical performance result.
+
 ## WorkerPool Design Rationale (issue #81)
 
 `src/http/worker_pool.zig` uses manual `std.Thread.spawn` rather than

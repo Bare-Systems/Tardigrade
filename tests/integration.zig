@@ -2976,7 +2976,7 @@ test "proxy requests strip hop-by-hop headers before reaching upstreams" {
     defer response.deinit();
     try std.testing.expectEqual(@as(u16, 200), response.status_code);
     try std.testing.expectEqual(@as(u32, 1), upstream.requestCount());
-    try std.testing.expectEqualStrings("close", upstream.capturedHeader("Connection").?);
+    try std.testing.expect(upstream.capturedHeader("Connection") == null);
     try std.testing.expect(upstream.capturedHeader("Keep-Alive") == null);
     try std.testing.expect(upstream.capturedHeader("Proxy-Authenticate") == null);
     try std.testing.expect(upstream.capturedHeader("Proxy-Authorization") == null);

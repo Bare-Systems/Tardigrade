@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Run a self-contained low-concurrency benchmark smoke test against a local
-# Tardigrade instance. Intended for shared CI runners where only clear
-# regressions should fail the job.
+# Tardigrade instance. Intended for shared CI runners or explicit local-fallback
+# runs where only clear regressions should fail the job. This is not the default
+# benchmark path; canonical runs belong on the homelab perf target.
 
 set -euo pipefail
 
@@ -10,7 +11,7 @@ BENCH_DIR="${REPO_ROOT}/benchmarks"
 BINARY="${REPO_ROOT}/zig-out/bin/tardigrade"
 LISTEN_PORT="18069"
 UPSTREAM_PORT="18080"
-DURATION="5"
+DURATION="30"
 CONNECTIONS="10"
 THREADS="2"
 SAVE_FILE=""

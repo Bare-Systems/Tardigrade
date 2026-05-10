@@ -5235,69 +5235,6 @@ fn executeUnixSocketHttpRequest(
     return parseRawUpstreamResponse(allocator, resp_raw.items);
 }
 
-fn executeTcpSocketHttpRequest(
-    allocator: std.mem.Allocator,
-    uri: std.Uri,
-    method: []const u8,
-    extra_headers: []const std.http.Header,
-    body: []const u8,
-    content_type_override: ?[]const u8,
-    timeout_ms: u32,
-) !RawUpstreamResponse {
-    _ = timeout_ms;
-
-    var host_buf: [256]u8 = undefined;
-    const host_component = uri.host orelse return error.UnsupportedHttpMethod;
-    const host = try host_component.toRaw(&host_buf);
-    const port = uri.port orelse 80;
-
-    var stream = try compat.tcpConnectToHost(allocator, host, port);
-    defer stream.close();
-
-    var req_aw: std.Io.Writer.Allocating = .init(allocator);
-    defer req_aw.deinit();
-    const req_writer = &req_aw.writer;
-
-    const path_raw = switch (uri.path) {
-        .raw => |path| if (path.len > 0) path else "/",
-        .percent_encoded => |path| if (path.len > 0) path else "/",
-    };
-    try req_writer.print("{s} {s}", .{ method, path_raw });
-    if (uri.query) |query| {
-        try req_writer.print("?{s}", .{uriComponentBytes(query)});
-    }
-    try req_writer.writeAll(" HTTP/1.1\r\n");
-    try req_writer.print("Host: {s}\r\n", .{host});
-    try req_writer.writeAll("Connection: close\r\n");
-    if (content_type_override) |content_type| {
-        try req_writer.print("Content-Type: {s}\r\n", .{content_type});
-    }
-    for (extra_headers) |header| {
-        try req_writer.print("{s}: {s}\r\n", .{ header.name, header.value });
-    }
-    if (body.len > 0) {
-        try req_writer.print("Content-Length: {d}\r\n", .{body.len});
-    }
-    try req_writer.writeAll("\r\n");
-    if (body.len > 0) {
-        try req_writer.writeAll(body);
-    }
-
-    try stream.writeAll(req_aw.written());
-
-    var resp_raw = std.array_list.Managed(u8).init(allocator);
-    defer resp_raw.deinit();
-    var read_buf: [8192]u8 = undefined;
-    while (true) {
-        const n = try stream.read(&read_buf);
-        if (n == 0) break;
-        try resp_raw.appendSlice(read_buf[0..n]);
-        if (resp_raw.items.len > MAX_REQUEST_SIZE) break;
-    }
-
-    return parseRawUpstreamResponse(allocator, resp_raw.items);
-}
-
 fn rawUpstreamResponseHasNoStore(response: *const RawUpstreamResponse) bool {
     for (response.headers) |header| {
         if (!std.ascii.eqlIgnoreCase(header.name, "cache-control")) continue;
@@ -5308,6 +5245,10 @@ fn rawUpstreamResponseHasNoStore(response: *const RawUpstreamResponse) bool {
         }
     }
     return false;
+}
+
+fn upstreamReasonPhrase(status: std.http.Status) []const u8 {
+    return status.phrase() orelse "";
 }
 
 fn executeRawHttpProxyRequest(
@@ -5370,19 +5311,6 @@ fn executeRawHttpProxyRequest(
         );
     }
 
-    if (std.ascii.eqlIgnoreCase(uri.scheme, "http")) {
-        const effective_timeout_ms = if (attempt_timeout_ms > 0) attempt_timeout_ms else connect_timeout_ms;
-        return executeTcpSocketHttpRequest(
-            allocator,
-            uri,
-            method,
-            extra_headers.items,
-            body,
-            null,
-            effective_timeout_ms,
-        );
-    }
-
     var server_header_buffer: [16 * 1024]u8 = undefined;
 
     var req = try client.request(method_enum, uri, .{
@@ -5391,7 +5319,7 @@ fn executeRawHttpProxyRequest(
             .accept_encoding = .omit,
         },
         .extra_headers = extra_headers.items,
-        .keep_alive = false,
+        .keep_alive = true,
         .redirect_behavior = .unhandled,
     });
     defer req.deinit();
@@ -5426,7 +5354,7 @@ fn executeRawHttpProxyRequest(
 
     return .{
         .status_code = @intFromEnum(resp.head.status),
-        .reason = try allocator.dupe(u8, resp.head.reason),
+        .reason = try allocator.dupe(u8, upstreamReasonPhrase(resp.head.status)),
         .headers = try headers.toOwnedSlice(),
         .body = body_data,
     };
@@ -8860,7 +8788,7 @@ fn proxyJsonExecuteSingleAttempt(
     var resp = try req.receiveHead(&server_header_buffer);
 
     const status_code: u16 = @intFromEnum(resp.head.status);
-    const upstream_reason = resp.head.reason;
+    const upstream_reason = upstreamReasonPhrase(resp.head.status);
     const upstream_content_type = resp.head.content_type orelse JSON_CONTENT_TYPE;
     const upstream_content_disposition = resp.head.content_disposition;
     const upstream_location = if (resp.head.location) |location|

@@ -2,12 +2,22 @@
 
 Repeatable benchmark and regression harness for Tardigrade.
 
+## Default Policy
+
+Run benchmarks on the dedicated homelab perf target by default.
+
+- Canonical benchmark, regression, and release-baseline runs belong on
+  `tardigrade-perf`.
+- Run the load driver inside `tardigrade-perf` against `127.0.0.1` for
+  published numbers.
+- Only run benchmarks on the local laptop when explicitly requested or when the
+  homelab target is unavailable.
+- Treat any laptop-local run as fallback data, not as the canonical performance
+  result.
+
 ## Quick start
 
 ```bash
-# Shared-runner smoke test (the same harness used in CI)
-./benchmarks/ci-smoke.sh
-
 # Capture a release baseline JSON + markdown report
 ./benchmarks/release-baseline.sh \
   --meta-file benchmarks/targets/release-baseline.json \
@@ -16,6 +26,10 @@ Repeatable benchmark and regression harness for Tardigrade.
   --host 192.168.86.55 \
   --host-header tardigrade-perf \
   --proxy-path /proxy/health
+
+# Fallback only: local/shared-runner smoke test
+# Use this only when explicitly requested or when the homelab target is unavailable.
+./benchmarks/ci-smoke.sh
 ```
 
 ## Prerequisites
@@ -192,12 +206,12 @@ The canonical release target is the `tardigrade-perf` guest:
 - Guest: `LXC 102`
 - Guest name: `tardigrade-perf`
 - Default worker count: `2`
-- Preferred load driver: Jetson Orin Nano via `benchmarks/jetson-run.sh`
-- Fallback low-noise mode: loopback run inside the guest with `benchmarks/run.sh`
+- Canonical load driver: `wrk` running inside the guest against `127.0.0.1`
+- Fallback external path: Jetson or laptop only when you explicitly need that network measurement
 
-Use Jetson runs when you need host-to-host numbers that include a real LAN path.
-Use loopback runs when you need to isolate proxy and request-processing cost
-without network RTT dominating the result.
+Use guest-local loopback runs for canonical performance because they remove
+Wi-Fi and LAN noise entirely. Use Jetson or laptop runs only when you
+specifically want to measure an external network path.
 
 ### Verify the staged target
 
@@ -220,7 +234,7 @@ ssh proxmox 'pct exec 102 -- bash -lc "
 "'
 ```
 
-### Run from this laptop
+### Fallback: run from this laptop only when explicitly requested or when the homelab target is unavailable
 
 ```bash
 ./benchmarks/run.sh \
@@ -236,8 +250,9 @@ ssh proxmox 'pct exec 102 -- bash -lc "
 ```
 
 If the perf guest is switched to a config that declares `server_name tardigrade-perf;`, add `--host-header tardigrade-perf` to every benchmark command.
+This laptop path is fallback-only and should not replace the normal homelab run policy.
 
-### Run from inside the container (loopback — most accurate for proxy overhead)
+### Canonical run: inside the container (loopback)
 
 Running `wrk` inside the perf LXC against `127.0.0.1` eliminates all network RTT.
 This is the only setup that reveals Tardigrade's actual per-request processing cost.
@@ -252,11 +267,11 @@ ssh proxmox 'pct exec 102 -- bash -c "
 Keep connections at or near the worker count (`workers=2` by default on a 2-core LXC)
 to avoid queue-saturation inflating p99. The p50 is the honest latency signal.
 
-### Run from the Jetson (external load driver — preferred for regression tracking)
+### Optional: run from the Jetson only when you explicitly want a network-path measurement
 
 The Jetson Orin Nano (`ssh jetson`) is a separate LAN machine with `wrk` built at
-`~/tools/wrk/wrk`. Using it as the driver avoids contaminating latency numbers with
-shared CPU/RAM/scheduler from the same Proxmox host as the target.
+`~/tools/wrk/wrk`. This path includes real network effects and is not the
+canonical release-baseline path.
 
 Use `benchmarks/jetson-run.sh` — it SSHes to the Jetson for each `wrk` invocation
 and parses/saves results locally in the same JSON format as `run.sh`:
@@ -328,14 +343,16 @@ appropriate benchmark-context JSON with `--meta-file`.
 
 ## CI integration
 
-The repository now runs a short shared-runner smoke test in CI:
+The repository also runs a shared-runner smoke test in CI with `30s` per
+scenario by default:
 
 ```bash
 ./benchmarks/ci-smoke.sh --save benchmarks/results/ci-smoke.json
 ```
 
 The smoke run intentionally uses low concurrency, loopback traffic, and generous
-minimum req/s floors so only obvious regressions fail the job.
+minimum req/s floors so only obvious regressions fail the job. It exists as an
+automation backstop, not as the default operator benchmark path.
 
 For behavioral correctness in CI, add a k6-only step:
 
@@ -344,7 +361,7 @@ For behavioral correctness in CI, add a k6-only step:
   run: |
     ./benchmarks/run.sh \
       --tool k6 \
-      --duration 15 \
+      --duration 30 \
       --connections 20 \
       --scenarios auth-enforcement,rate-limit
 ```

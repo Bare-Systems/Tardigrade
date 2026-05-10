@@ -13,7 +13,7 @@ http.setResponseCallback(http.expectedStatuses({ min: 200, max: 499 }));
 //   AUTH_TOKEN           valid bearer token for authenticated requests
 //   AUTH_PROTECTED_PATH  path that requires auth  (default: /v1/status)
 //   K6_VUS               virtual users  (default: 20)
-//   K6_DURATION          test duration  (default: 15s)
+//   K6_DURATION          test duration  (default: 30s)
 
 const baseUrl       = __ENV.BASE_URL             || 'http://127.0.0.1:8069';
 const hostHeader    = __ENV.K6_HOST_HEADER       || '';
@@ -27,7 +27,7 @@ const baseParams = hostHeader ? { headers: { Host: hostHeader } } : {};
 // captures genuine errors (5xx, network failures).
 export const options = {
   vus:               parseInt(__ENV.K6_VUS || '20'),
-  duration:          __ENV.K6_DURATION     || '15s',
+  duration:          __ENV.K6_DURATION     || '30s',
   summaryTrendStats: ['med', 'p(99)'],
   thresholds: {
     // Unauthenticated requests must be rejected — virtually all should be 401

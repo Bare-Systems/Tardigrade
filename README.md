@@ -138,6 +138,8 @@ zig build test-integration
 
 Benchmark releases should be captured from saved JSON under `benchmarks/baselines/`
 and refreshed with `./benchmarks/report.sh <baseline.json> --update-readme README.md`.
+Canonical benchmark runs are taken from the homelab perf target, not from a
+local laptop fallback run.
 
 <!-- BENCHMARK_REPORT_START -->
 | Scenario | req/s | p50 (ms) | p99 (ms) | Errors |

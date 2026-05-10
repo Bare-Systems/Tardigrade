@@ -59,8 +59,9 @@ All notable user-facing changes to Tardigrade are documented here.
 - Completed the Zig 0.16.0 upgrade: migrated all `std.http.Client` call sites from `open()`/`send()`/`wait()` to `request()`/`sendBodyComplete()`/`receiveHead()`, replaced `std.json.stringify` with `std.json.Stringify.valueAlloc`, resolved all `ArrayList`/`Managed` type mismatches across `fastcgi`, `scgi`, `uwsgi`, and `http3_session`, replaced `accept4` with `accept`+`fcntl` for macOS compatibility, and fixed `UnixAddress.init` error propagation. All 357 tests pass on Zig 0.16.0.
 
 ### Fixed
+- Plain HTTP `proxy_pass` routes now reuse the shared upstream `std.http.Client` path instead of opening a one-off `Connection: close` socket for every proxied request, while preserving hop-by-hop header stripping semantics for upstream requests.
 - CI now installs OpenSSL development headers explicitly and enforces formatting consistently.
-- Unix-socket upstream probing/proxying no longer depends on removed `std.http.Client.connectUnix()` behavior under Zig `0.16.0`; plain HTTP upstream compatibility paths now fall back to raw request/response handling where needed.
+- Unix-socket upstream probing/proxying no longer depends on removed `std.http.Client.connectUnix()` behavior under Zig `0.16.0`; Unix-socket compatibility paths now fall back to raw request/response handling where needed.
 - Proxy requests now strip RFC hop-by-hop headers, including headers named by the incoming `Connection` field, before forwarding to upstreams.
 - Static file serving now rejects percent-encoded traversal, separator-variant traversal, and symlink escapes outside the configured root.
 - Rate limiting now resolves authenticated identity before middleware enforcement so JWT, bearer, and session traffic do not share an IP-only bucket.

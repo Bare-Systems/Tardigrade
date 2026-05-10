@@ -13,7 +13,7 @@ import { check, sleep } from 'k6';
 //   K6_HOST_HEADER    optional Host header / :authority override
 //   RATE_LIMIT_RPS    configured RPS ceiling (default: 10 — matches Tardigrade default)
 //   RATE_LIMIT_PATH   path to hammer         (default: /health)
-//   K6_DURATION       test duration          (default: 15s)
+//   K6_DURATION       test duration          (default: 30s)
 
 const baseUrl       = __ENV.BASE_URL         || 'http://127.0.0.1:8069';
 const hostHeader    = __ENV.K6_HOST_HEADER   || '';
@@ -25,7 +25,7 @@ const params = hostHeader ? { headers: { Host: hostHeader } } : undefined;
 
 // Iterations: enough to comfortably exceed the RPS budget within the duration.
 // Single VU so all requests share the same client IP descriptor.
-const durationSecs = 15;
+const durationSecs = parseInt((__ENV.K6_DURATION || '30s').replace(/s$/, ''), 10);
 const iterations   = rateLimitRps * durationSecs * 3;
 
 export const options = {

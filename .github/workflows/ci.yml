@@ -142,9 +142,9 @@ jobs:
         run: zig build -Doptimize=${{ matrix.optimize }}
 
   # ── Performance smoke ────────────────────────────────────────────────────────
-  # Shared-runner loopback benchmark with conservative floors. This is not a
-  # release benchmark; it exists only to catch obvious regressions without
-  # making PRs noisy or flaky.
+  # Shared-runner loopback benchmark with conservative floors and a 30s default
+  # run per scenario. This is not a release benchmark; it exists only to catch
+  # obvious regressions without making PRs noisy or flaky.
   perf-smoke:
     name: Perf smoke
     runs-on: ubuntu-latest

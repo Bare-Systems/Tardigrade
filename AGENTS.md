@@ -2,6 +2,17 @@
 
 Scope: the `Tardigrade` repository.
 
+## Key References
+
+Before making any code changes, read these documents:
+
+- **[docs/ZIG_ENGINEERING_GUIDE.md](docs/ZIG_ENGINEERING_GUIDE.md)** — Tardigrade-specific Zig 0.16
+  patterns, APIs to avoid, runtime architecture, allocator rules, error handling,
+  security rules, and testing requirements. This is the authoritative guide for
+  writing correct Zig in this repo.
+- **[docs/CODE_REVIEW_CHECKLIST.md](docs/CODE_REVIEW_CHECKLIST.md)** — Short checklist to run on
+  every non-trivial change before committing.
+
 ## Rules
 
 - Keep the core runtime generic.

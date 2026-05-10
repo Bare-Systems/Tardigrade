@@ -298,7 +298,7 @@ pub fn nanoTimestamp() i128 {
 }
 
 pub fn sleepNs(ns: u64) void {
-    std.Io.sleep(io(), .fromNanoseconds(ns), .awake) catch {};
+    std.Io.sleep(io(), .fromNanoseconds(ns), .awake) catch {}; // interrupt wakes are fine; caller requested a sleep, not a guarantee
 }
 
 pub fn randomBytes(buffer: []u8) void {

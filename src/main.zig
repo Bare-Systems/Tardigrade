@@ -308,7 +308,7 @@ fn executeRunCommand(allocator: std.mem.Allocator, args: []const []const u8, opt
         return;
     }
 
-    applyWorkerCpuAffinity(&cfg, worker_id) catch {};
+    applyWorkerCpuAffinity(&cfg, worker_id) catch {}; // CPU affinity is optional; worker runs on any core if unavailable
     startWorkerRecycleTimer(&cfg);
     try edge_gateway.run(&cfg);
 }
@@ -531,12 +531,12 @@ fn parseIntEnv(comptime T: type, key: []const u8, default: T) T {
 
 fn rotateLogFiles(dir: std.Io.Dir, path: []const u8, max_files: usize) !void {
     if (max_files == 0) {
-        dir.deleteFile(compat.io(), path) catch {};
+        dir.deleteFile(compat.io(), path) catch {}; // best-effort delete; max_files=0 discards the log regardless
         return;
     }
     const oldest = try std.fmt.allocPrint(std.heap.page_allocator, "{s}.{d}", .{ path, max_files });
     defer std.heap.page_allocator.free(oldest);
-    dir.deleteFile(compat.io(), oldest) catch {};
+    dir.deleteFile(compat.io(), oldest) catch {}; // best-effort delete; oldest rotation slot may not exist yet
 
     var idx = max_files;
     while (idx > 1) : (idx -= 1) {
@@ -544,7 +544,7 @@ fn rotateLogFiles(dir: std.Io.Dir, path: []const u8, max_files: usize) !void {
         defer std.heap.page_allocator.free(src);
         const dst = try std.fmt.allocPrint(std.heap.page_allocator, "{s}.{d}", .{ path, idx });
         defer std.heap.page_allocator.free(dst);
-        dir.rename(src, dir, dst, compat.io()) catch {};
+        dir.rename(src, dir, dst, compat.io()) catch {}; // best-effort rename; rotation continues even if a slot is missing
     }
     const first = try std.fmt.allocPrint(std.heap.page_allocator, "{s}.1", .{path});
     defer std.heap.page_allocator.free(first);
@@ -564,7 +564,7 @@ fn writePidFile(cfg: *const edge_config.EdgeConfig) !void {
 
 fn removePidFile(cfg: *const edge_config.EdgeConfig) void {
     if (cfg.pid_file.len == 0) return;
-    deleteFileAtPath(cfg.pid_file) catch {};
+    deleteFileAtPath(cfg.pid_file) catch {}; // best-effort cleanup; stale pid file is harmless after process exit
 }
 
 fn hasArg(args: []const []const u8, target: []const u8) bool {
@@ -593,10 +593,10 @@ fn startWorkerRecycleTimer(cfg: *const edge_config.EdgeConfig) void {
     _ = std.Thread.spawn(.{}, struct {
         fn run(wait_secs: u32) void {
             const compat2 = @import("zig_compat.zig");
-            std.Io.sleep(compat2.io(), std.Io.Duration.fromSeconds(@intCast(wait_secs)), .awake) catch {};
+            std.Io.sleep(compat2.io(), std.Io.Duration.fromSeconds(@intCast(wait_secs)), .awake) catch {}; // interrupt wakes are fine; recycle fires immediately on wake
             http.shutdown.requestShutdown();
         }
-    }.run, .{secs}) catch {};
+    }.run, .{secs}) catch {}; // best-effort; worker continues without auto-recycle if thread spawn fails
 }
 
 fn runMaster(allocator: std.mem.Allocator, cfg: *const edge_config.EdgeConfig) !void {
@@ -621,7 +621,7 @@ fn runMaster(allocator: std.mem.Allocator, cfg: *const edge_config.EdgeConfig) !
             break;
         }
         if (http.shutdown.consumeReopenLogsRequested()) {
-            reopenErrorLog(cfg) catch {};
+            reopenErrorLog(cfg) catch {}; // best-effort SIGHUP handler; stderr continues on the previous fd
         }
 
         for (0..worker_count) |i| {
@@ -631,12 +631,12 @@ fn runMaster(allocator: std.mem.Allocator, cfg: *const edge_config.EdgeConfig) !
                 children[i] = try spawnWorker(allocator, exe_path, i);
             }
         }
-        std.Io.sleep(compat.io(), std.Io.Duration.fromMilliseconds(250), .awake) catch {};
+        std.Io.sleep(compat.io(), std.Io.Duration.fromMilliseconds(250), .awake) catch {}; // interrupt wakes are fine; master poll loop continues
     }
 
     for (0..worker_count) |i| {
         children[i].kill(compat.io());
-        _ = children[i].wait(compat.io()) catch {};
+        _ = children[i].wait(compat.io()) catch {}; // best-effort wait; process may have already exited
     }
 }
 

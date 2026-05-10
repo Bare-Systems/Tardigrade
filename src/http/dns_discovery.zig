@@ -128,7 +128,9 @@ pub const DnsDiscovery = struct {
         self.urls.clearRetainingCapacity();
         // Transfer ownership of new_urls items to self.urls.
         for (new_urls.items) |u| {
-            self.urls.append(self.allocator, u) catch {};
+            self.urls.append(self.allocator, u) catch {
+                self.allocator.free(u); // free the string we failed to store so it is not leaked
+            };
         }
         // Prevent new_urls defer from double-freeing transferred items.
         new_urls.clearRetainingCapacity();

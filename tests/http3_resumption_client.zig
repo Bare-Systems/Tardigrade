@@ -65,7 +65,7 @@ pub fn main() !u8 {
     const run_id = std.fmt.bytesToHex(rand_buf, .lower);
     const base_dir_path = try std.fmt.allocPrint(allocator, ".zig-cache/http3-resumption-{s}", .{run_id});
     try compat.cwd().makePath(base_dir_path);
-    defer compat.cwd().deleteTree(base_dir_path) catch {};
+    defer compat.cwd().deleteTree(base_dir_path) catch {}; // best-effort cleanup; ephemeral test cache directory
 
     const session_path = try std.fmt.allocPrint(allocator, "{s}/session.pem", .{base_dir_path});
     const tp_path = try std.fmt.allocPrint(allocator, "{s}/transport-params.bin", .{base_dir_path});

@@ -419,7 +419,7 @@ test "serve rejects traversal escaping root" {
     const escape_path = try std.Io.Dir.path.join(allocator, &[_][]const u8{ parent, escape_name });
     defer allocator.free(escape_path);
     try compat.cwd().writeFile(.{ .sub_path = escape_path, .data = "escape" });
-    defer compat.cwd().deleteFile(escape_path) catch {};
+    defer compat.cwd().deleteFile(escape_path) catch {}; // best-effort test cleanup; file may not exist if the test failed early
     const request_path = try std.fmt.allocPrint(allocator, "/../{s}", .{escape_name});
     defer allocator.free(request_path);
 
@@ -454,7 +454,7 @@ test "serve rejects percent-encoded traversal escaping root" {
     const escape_path = try std.Io.Dir.path.join(allocator, &[_][]const u8{ parent, escape_name });
     defer allocator.free(escape_path);
     try compat.cwd().writeFile(.{ .sub_path = escape_path, .data = "escape" });
-    defer compat.cwd().deleteFile(escape_path) catch {};
+    defer compat.cwd().deleteFile(escape_path) catch {}; // best-effort test cleanup; file may not exist if the test failed early
 
     var hdrs = headers_mod.Headers.init(allocator);
     defer hdrs.deinit();
@@ -515,7 +515,7 @@ test "serve rejects backslash traversal escaping root" {
     const escape_path = try std.Io.Dir.path.join(allocator, &[_][]const u8{ parent, escape_name });
     defer allocator.free(escape_path);
     try compat.cwd().writeFile(.{ .sub_path = escape_path, .data = "escape" });
-    defer compat.cwd().deleteFile(escape_path) catch {};
+    defer compat.cwd().deleteFile(escape_path) catch {}; // best-effort test cleanup; file may not exist if the test failed early
 
     var hdrs = headers_mod.Headers.init(allocator);
     defer hdrs.deinit();
@@ -548,7 +548,7 @@ test "serve rejects symlink escape outside root" {
     const escape_path = try std.Io.Dir.path.join(allocator, &[_][]const u8{ parent, escape_name });
     defer allocator.free(escape_path);
     try compat.cwd().writeFile(.{ .sub_path = escape_path, .data = "escape" });
-    defer compat.cwd().deleteFile(escape_path) catch {};
+    defer compat.cwd().deleteFile(escape_path) catch {}; // best-effort test cleanup; file may not exist if the test failed early
 
     const symlink_path = try std.Io.Dir.path.join(allocator, &[_][]const u8{ root_path, "linked.txt" });
     defer allocator.free(symlink_path);

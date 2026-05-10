@@ -843,12 +843,12 @@ const TardigradeProcess = struct {
                 try compat.cwd().writeFile(.{ .sub_path = cfg_path, .data = merged_config });
             } else {
                 if (fixture_dir_rel) |dir_rel| {
-                    compat.cwd().deleteTree(dir_rel) catch {};
+                    compat.cwd().deleteTree(dir_rel) catch {}; // best-effort cleanup; test fixture directory
                     allocator.free(dir_rel);
                     fixture_dir_rel = null;
                 }
                 if (config_path) |existing| {
-                    compat.cwd().deleteFile(existing) catch {};
+                    compat.cwd().deleteFile(existing) catch {}; // best-effort cleanup; test config file
                     allocator.free(existing);
                     config_path = null;
                 }
@@ -888,7 +888,7 @@ const TardigradeProcess = struct {
         self.child.kill(compat.io());
         self.allocator.free(self.log_path);
         if (self.config_path) |path| {
-            compat.cwd().deleteFile(path) catch {};
+            compat.cwd().deleteFile(path) catch {}; // best-effort cleanup; config file may not exist if setup failed
             self.allocator.free(path);
         }
         if (self.fixture_dir_rel) |path| {

@@ -92,9 +92,9 @@ pub const Runtime = struct {
         if (fd < 0) return error.BindFailed;
         errdefer _ = std.c.close(fd);
 
-        std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.REUSEADDR, std.mem.asBytes(&@as(c_int, 1))) catch {};
+        std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.REUSEADDR, std.mem.asBytes(&@as(c_int, 1))) catch {}; // REUSEADDR is advisory; bind proceeds regardless
         if (std.c.bind(fd, @ptrCast(&address.storage), @intCast(address.len)) < 0) return error.BindFailed;
-        setNonBlocking(fd, true) catch {};
+        setNonBlocking(fd, true) catch {}; // fd is still usable in blocking mode if this fails
 
         var runtime = Runtime{
             .socket_fd = fd,
@@ -169,17 +169,17 @@ pub const Runtime = struct {
             if (n < 0) {
                 const e = std.posix.errno(n);
                 if (e == .AGAIN) {
-                    pumpExpiry(self, out_buf) catch {};
-                    std.Io.sleep(compat.io(), std.Io.Duration.fromMilliseconds(25), .awake) catch {};
+                    pumpExpiry(self, out_buf) catch {}; // expiry handling is best-effort; ngtcp2 retries on the next tick
+                    std.Io.sleep(compat.io(), std.Io.Duration.fromMilliseconds(25), .awake) catch {}; // interrupt wakes are fine; EAGAIN path polls again immediately
                 } else if (e != .CONNREFUSED and e != .CONNRESET) {
                     self.logger.warn(null, "http3 udp recv failed: errno={}", .{@intFromEnum(e)});
-                    std.Io.sleep(compat.io(), std.Io.Duration.fromMilliseconds(25), .awake) catch {};
+                    std.Io.sleep(compat.io(), std.Io.Duration.fromMilliseconds(25), .awake) catch {}; // interrupt wakes are fine; transient recv error backs off briefly
                 }
                 continue;
             }
             const received: usize = @intCast(n);
             if (received == 0) continue;
-            ingestDatagram(self, buf[0..received], from, out_buf) catch {};
+            ingestDatagram(self, buf[0..received], from, out_buf) catch {}; // datagram processing is best-effort; QUIC client will retransmit
             from_len = @sizeOf(std.c.sockaddr.storage);
         }
     }
@@ -250,7 +250,7 @@ fn ingestDatagram(self: *Runtime, datagram: []const u8, from: std.c.sockaddr.sto
             logOutgoingPacket(self, out_buf[0..result.bytes_to_send]);
             _ = std.c.sendto(self.socket_fd, @as(*const anyopaque, @ptrCast(out_buf.ptr)), result.bytes_to_send, 0, @as(?*const std.c.sockaddr, @ptrCast(&from)), sockAddrStorageLen(from));
         }
-        flushPendingWrites(self, out_buf) catch {};
+        flushPendingWrites(self, out_buf) catch {}; // flush is best-effort; ngtcp2 retransmits on the next tick
     }
     self.refreshSnapshot();
 }
@@ -268,7 +268,7 @@ fn pumpExpiry(self: *Runtime, out_buf: []u8) !void {
                 _ = std.c.sendto(self.socket_fd, @as(*const anyopaque, @ptrCast(out_buf.ptr)), result.bytes_to_send, 0, @as(?*const std.c.sockaddr, @ptrCast(&remote_addr)), sockAddrStorageLen(remote_addr));
             }
         }
-        flushPendingWrites(self, out_buf) catch {};
+        flushPendingWrites(self, out_buf) catch {}; // flush is best-effort; ngtcp2 retransmits on the next tick
         self.refreshSnapshot();
     }
 }

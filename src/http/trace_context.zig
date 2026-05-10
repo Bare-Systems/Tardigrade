@@ -25,7 +25,7 @@ pub const TraceContext = struct {
 
     /// Write the trace-id as 32 lowercase hex characters into `buf`.
     pub fn traceIdHex(self: TraceContext, buf: *[32]u8) void {
-        _ = std.fmt.bufPrint(buf, "{f}", .{compat.fmtSliceHexLower(&self.trace_id)}) catch {};
+        _ = std.fmt.bufPrint(buf, "{f}", .{compat.fmtSliceHexLower(&self.trace_id)}) catch {}; // buf is always 32 bytes for a 16-byte trace-id; NoSpaceLeft is unreachable in practice
     }
 
     /// Format a `traceparent` header value into `buf` (must be ≥55 bytes).

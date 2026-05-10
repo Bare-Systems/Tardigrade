@@ -669,7 +669,7 @@ const GatewayState = struct {
             self.proxy_cache_mutex.lock();
             defer self.proxy_cache_mutex.unlock();
             if (self.proxy_cache_store) |*store| {
-                store.put(key, found.cached.status, found.cached.body, found.cached.content_type) catch {};
+                store.put(key, found.cached.status, found.cached.body, found.cached.content_type) catch {}; // cache write is best-effort; a miss on the next request is acceptable
             }
         }
         return disk_lookup;
@@ -740,7 +740,7 @@ const GatewayState = struct {
             const locked = self.proxy_cache_locks.contains(key);
             self.proxy_cache_mutex.unlock();
             if (!locked) return true;
-            std.Io.sleep(compat.io(), std.Io.Duration.fromMilliseconds(10), .awake) catch {};
+            std.Io.sleep(compat.io(), std.Io.Duration.fromMilliseconds(10), .awake) catch {}; // interrupt wakes are fine; loop continues immediately
         }
         return false;
     }
@@ -2562,7 +2562,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         .buffer_size_bytes = cfg.access_log_buffer_size,
         .syslog_udp_endpoint = cfg.access_log_syslog_udp,
         .redact_header_names = cfg.log_redact_headers,
-    }) catch {};
+    }) catch {}; // access log is best-effort; gateway continues without it
     defer http.access_log.deinit();
 
     // Configure upstream HTTP client TLS (custom CA bundle and skip-verify).
@@ -3094,7 +3094,7 @@ fn hotReloadConfig(
         .buffer_size_bytes = cfg_ptr.access_log_buffer_size,
         .syslog_udp_endpoint = cfg_ptr.access_log_syslog_udp,
         .redact_header_names = cfg_ptr.log_redact_headers,
-    }) catch {};
+    }) catch {}; // access log is best-effort; gateway continues without it
     state.reload_mutex.lock();
     state.last_reload_ok = true;
     state.last_reload_at_ms = now_ms;
@@ -3159,7 +3159,7 @@ fn reopenErrorLog(cfg: *const edge_config.EdgeConfig) !void {
 }
 
 fn rejectOverloadedClient(client_fd: std.posix.fd_t) void {
-    setNonBlocking(client_fd, false) catch {};
+    setNonBlocking(client_fd, false) catch {}; // connection is usable in blocking mode; write and close still succeed
     const stream = compat.netStreamFromFd(client_fd);
     stream.writer().writeAll(
         "HTTP/1.1 503 Service Unavailable\r\n" ++
@@ -3167,7 +3167,7 @@ fn rejectOverloadedClient(client_fd: std.posix.fd_t) void {
             "Content-Length: 0\r\n" ++
             "Retry-After: 1\r\n" ++
             "\r\n",
-    ) catch {};
+    ) catch {}; // best-effort 503; client will time out if the write fails
     stream.close();
 }
 
@@ -3737,7 +3737,7 @@ fn peekAndConsumeProxyHeaderFromRawFd(
             .need_more => {
                 if (peeked >= peek_buf.len) return error.ProxyProtocolHeaderTooLarge;
                 // Wait briefly for more data to arrive in the kernel buffer.
-                std.Io.sleep(compat.io(), std.Io.Duration.fromMicroseconds(500), .awake) catch {};
+                std.Io.sleep(compat.io(), std.Io.Duration.fromMicroseconds(500), .awake) catch {}; // interrupt wakes are fine; loop continues immediately
             },
         }
     }
@@ -5983,7 +5983,7 @@ fn streamSseTopic(
             if (cfg.sse_idle_timeout_ms > 0 and now_ms - last_send_ms >= cfg.sse_idle_timeout_ms) return;
         }
 
-        std.Io.sleep(compat.io(), std.Io.Duration.fromMilliseconds(@as(i64, @intCast(poll_ms))), .awake) catch {};
+        std.Io.sleep(compat.io(), std.Io.Duration.fromMilliseconds(@as(i64, @intCast(poll_ms))), .awake) catch {}; // interrupt wakes are fine; SSE poll loop continues
     }
 }
 
@@ -6333,7 +6333,7 @@ fn spawnMirrorRequests(
         }) catch continue;
         defer req.deinit();
         req.sendBodyComplete(@constCast(body)) catch continue;
-        _ = req.receiveHead(&header_buf) catch {};
+        _ = req.receiveHead(&header_buf) catch {}; // subrequest response is intentionally ignored; fire-and-forget
     }
 }
 
@@ -8435,7 +8435,7 @@ fn proxyCacheRefreshThread(task: *ProxyCacheRefreshTask) void {
             if (result.location) |location| task.allocator.free(location);
             if (result.set_cookie) |cookie| task.allocator.free(cookie);
             if (result.status == 200) {
-                task.state.proxyCachePut(task.cache_key, result.status, result.body, result.content_type) catch {};
+                task.state.proxyCachePut(task.cache_key, result.status, result.body, result.content_type) catch {}; // cache write is best-effort; a miss on the next request is acceptable
             }
         },
     }

@@ -256,23 +256,23 @@ pub const TlsTerminator = struct {
         const cert_mtime = fileMtime(self.state.default_cert_path) catch self.state.default_cert_mtime;
         const key_mtime = fileMtime(self.state.default_key_path) catch self.state.default_key_mtime;
         if (cert_mtime != self.state.default_cert_mtime or key_mtime != self.state.default_key_mtime) {
-            _ = loadDefaultCertificate(self.ctx, self.state) catch {};
+            _ = loadDefaultCertificate(self.ctx, self.state) catch {}; // cert reload is best-effort; existing certificate remains active
         }
 
         if (self.state.crl_check and self.state.crl_path.len > 0) {
-            _ = configureCrl(self.ctx, self.state.crl_path) catch {};
+            _ = configureCrl(self.ctx, self.state.crl_path) catch {}; // CRL reload is best-effort; existing CRL remains active
         }
 
         if (self.state.ocsp_enabled and self.state.ocsp_response_path.len > 0) {
             const ocsp_mtime = fileMtime(self.state.ocsp_response_path) catch self.state.ocsp_mtime;
             if (ocsp_mtime != self.state.ocsp_mtime) {
-                _ = loadOcspResponse(self.state) catch {};
+                _ = loadOcspResponse(self.state) catch {}; // OCSP reload is best-effort; stapled response may be stale
             }
         }
 
         if (self.state.ocsp_auto_refresh_enabled and self.state.ocsp_responder_url.len > 0) {
             if (self.state.ocsp_next_auto_refresh_ms == 0 or now_ms >= self.state.ocsp_next_auto_refresh_ms) {
-                _ = fetchAndStoreOcspResponse(self.state, self.ctx) catch {};
+                _ = fetchAndStoreOcspResponse(self.state, self.ctx) catch {}; // OCSP auto-fetch is best-effort; stapling continues with cached response
                 self.state.ocsp_next_auto_refresh_ms = now_ms + self.state.ocsp_refresh_interval_ms;
             }
         }
@@ -301,7 +301,7 @@ pub const TlsTerminator = struct {
             // After a successful issuance, rebuild the SNI cert list to pick up the new cert.
         }
 
-        _ = rebuildSniCertificates(self.state) catch {};
+        _ = rebuildSniCertificates(self.state) catch {}; // SNI cert rebuild is best-effort; existing certificate mappings remain active
     }
 
     pub fn accept(self: *TlsTerminator, fd: std.posix.fd_t) TlsError!TlsConnection {
@@ -573,7 +573,7 @@ fn fetchAndStoreOcspResponse(st: *State, ctx: *c.SSL_CTX) TlsError!void {
 
     // Persist to the static-file path so it survives restarts (best-effort).
     if (st.ocsp_response_path.len > 0) {
-        compat.cwd().writeFile(.{ .sub_path = st.ocsp_response_path, .data = new_response }) catch {};
+        compat.cwd().writeFile(.{ .sub_path = st.ocsp_response_path, .data = new_response }) catch {}; // best-effort disk persist; response is already loaded in memory
     }
 }
 

@@ -174,7 +174,7 @@ pub const WorkerPool = struct {
                 // Unlock and sleep briefly to let workers make progress,
                 // then re-check.
                 self.mutex.unlock();
-                std.Io.sleep(compat.io(), .fromMilliseconds(5), .awake) catch {};
+                std.Io.sleep(compat.io(), .fromMilliseconds(5), .awake) catch {}; // interrupt wakes are fine; drain loop continues
                 self.mutex.lock();
             }
         }
@@ -466,7 +466,7 @@ test "shutdownAndJoin drain_timeout_ms expires and returns" {
     const handler = struct {
         fn run(_: *anyopaque, _: std.posix.fd_t) void {
             // Sleep longer than the drain timeout below (50ms vs 20ms timeout).
-            std.Io.sleep(compat.io(), .fromMilliseconds(50), .awake) catch {};
+            std.Io.sleep(compat.io(), .fromMilliseconds(50), .awake) catch {}; // interrupt wakes are fine; test timer accuracy is not critical
         }
     }.run;
 
@@ -476,7 +476,7 @@ test "shutdownAndJoin drain_timeout_ms expires and returns" {
 
     try pool.submit(1);
     // Give the handler time to start running so it becomes an active job.
-    std.Io.sleep(compat.io(), .fromMilliseconds(5), .awake) catch {};
+    std.Io.sleep(compat.io(), .fromMilliseconds(5), .awake) catch {}; // interrupt wakes are fine; test waits for handler to start
     const t0 = compat.milliTimestamp();
     // Very short drain timeout — the active handler will outlive it.
     pool.shutdownAndJoin(20);

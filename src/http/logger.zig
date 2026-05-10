@@ -104,7 +104,7 @@ pub const Logger = struct {
         stderr.writeAll(",\"msg\":\"") catch return;
         writeJsonEscaped(stderr, msg);
         stderr.writeAll("\"}\n") catch return;
-        stderr.flush() catch {};
+        stderr.flush() catch {}; // best-effort flush; log loss on stderr is acceptable
     }
 };
 

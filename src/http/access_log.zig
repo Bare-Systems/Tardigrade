@@ -241,8 +241,8 @@ fn renderTemplate(allocator: std.mem.Allocator, template: []const u8, ts: []cons
 fn writeLine(line: []const u8, syslog_udp_endpoint: []const u8) void {
     var buf: [256]u8 = undefined;
     var w = compat.stderrWriter(&buf);
-    w.writeAll(line) catch {};
-    w.flush() catch {};
+    w.writeAll(line) catch {}; // best-effort stderr write; log loss is acceptable
+    w.flush() catch {}; // best-effort flush; log loss is acceptable
     if (syslog_udp_endpoint.len > 0) sendSyslogUdp(syslog_udp_endpoint, line);
 }
 

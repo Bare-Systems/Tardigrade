@@ -707,7 +707,7 @@ pub fn runOnce(opts: AcmeOptions) AcmeError!void {
     if (dl_resp.status != .ok) return error.CertDownloadFailed;
 
     // Step 8: Atomically save the certificate and private key to disk.
-    compat.cwd().makePath(opts.cert_dir) catch {};
+    compat.cwd().makePath(opts.cert_dir) catch {}; // best-effort; directory may already exist, or writeFile below will fail if it cannot be created
     const tmp_cert = std.fmt.allocPrint(allocator, "{s}.tmp", .{cert_path}) catch return error.OutOfMemory;
     defer allocator.free(tmp_cert);
     compat.cwd().writeFile(.{ .sub_path = tmp_cert, .data = dl_resp.body }) catch return error.CertSaveFailed;

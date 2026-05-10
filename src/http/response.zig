@@ -68,7 +68,7 @@ pub const Response = struct {
 
     /// Set a header value
     pub fn setHeader(self: *Response, name: []const u8, value: []const u8) *Response {
-        self.headers.append(name, value) catch {};
+        self.headers.append(name, value) catch {}; // OOM during header set is best-effort; header is omitted from the response
         return self;
     }
 

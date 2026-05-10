@@ -23,7 +23,7 @@ const corpus_cases = [_]CorpusCase{
 fn loadCorpusCase(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     const raw = try compat.cwd().readFileAlloc(allocator, path, 64 * 1024);
     errdefer allocator.free(raw);
-    if (std.mem.indexOf(u8, raw, "\r\n") != null) return raw;
+    if (std.mem.find(u8, raw, "\r\n") != null) return raw;
 
     var normalized = std.ArrayList(u8).empty;
     errdefer normalized.deinit(allocator);

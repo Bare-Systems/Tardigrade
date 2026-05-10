@@ -10,6 +10,9 @@
 #   --host HOST         Target host (default: 127.0.0.1)
 #   --port PORT         Target port (default: 8069)
 #   --host-header NAME  Override the HTTP Host header / :authority
+#   --driver LABEL      Load-driver label recorded in metadata
+#   --worker-count N    Tardigrade worker count recorded in metadata
+#   --config-label STR  Config/profile label recorded in metadata
 #   --tls               Use HTTPS (default: plain HTTP)
 #   --insecure          Skip TLS certificate verification (for self-signed certs)
 #   --duration SECS     Benchmark duration per scenario (default: 30)
@@ -24,6 +27,7 @@
 #   --tool TOOL         Preferred tool: wrk|h2load|fortio|k6 (default: auto-detect)
 #   --baseline FILE     Compare results against a baseline JSON file
 #   --save FILE         Write results JSON to this file
+#   --meta-file FILE    Merge extra JSON metadata into _meta
 #   --help              Show this message and exit
 #
 # Scenarios:
@@ -52,6 +56,9 @@ set -euo pipefail
 TARGET_HOST="127.0.0.1"
 TARGET_PORT="8069"
 HOST_HEADER=""
+DRIVER_LABEL="local"
+WORKER_COUNT=""
+CONFIG_LABEL=""
 USE_TLS=false
 INSECURE=false
 DURATION=30
@@ -66,6 +73,7 @@ SCENARIOS="static-http1,proxy-http1,keepalive"
 PREFERRED_TOOL=""
 BASELINE_FILE=""
 SAVE_FILE=""
+META_FILE=""
 REGRESSION_THRESHOLD=10  # percent
 
 # ── Arg parsing ───────────────────────────────────────────────────────────────
@@ -74,6 +82,9 @@ while [[ $# -gt 0 ]]; do
         --host)       TARGET_HOST="$2";        shift 2 ;;
         --port)       TARGET_PORT="$2";        shift 2 ;;
         --host-header)HOST_HEADER="$2";        shift 2 ;;
+        --driver)     DRIVER_LABEL="$2";       shift 2 ;;
+        --worker-count)WORKER_COUNT="$2";      shift 2 ;;
+        --config-label)CONFIG_LABEL="$2";      shift 2 ;;
         --tls)        USE_TLS=true;            shift ;;
         --insecure)   INSECURE=true;           shift ;;
         --duration)   DURATION="$2";           shift 2 ;;
@@ -88,6 +99,7 @@ while [[ $# -gt 0 ]]; do
         --tool)       PREFERRED_TOOL="$2";     shift 2 ;;
         --baseline)   BASELINE_FILE="$2";      shift 2 ;;
         --save)       SAVE_FILE="$2";          shift 2 ;;
+        --meta-file)  META_FILE="$2";          shift 2 ;;
         --threshold)  REGRESSION_THRESHOLD="$2"; shift 2 ;;
         --help)       sed -n '/^# Usage/,/^[^#]/p' "$0" | head -n -1; exit 0 ;;
         *) echo "Unknown option: $1" >&2; exit 1 ;;
@@ -117,11 +129,76 @@ detect_tool() {
     exit 1
 }
 
+detect_zig_version() {
+    if command -v zig &>/dev/null; then
+        zig version
+    else
+        echo "unknown"
+    fi
+}
+
+detect_os_name() {
+    uname -s 2>/dev/null || echo "unknown"
+}
+
+detect_kernel_release() {
+    uname -r 2>/dev/null || echo "unknown"
+}
+
+detect_arch() {
+    uname -m 2>/dev/null || echo "unknown"
+}
+
+detect_cpu_model() {
+    case "$(uname -s 2>/dev/null || true)" in
+        Darwin)
+            sysctl -n machdep.cpu.brand_string 2>/dev/null || sysctl -n hw.model 2>/dev/null || echo "unknown"
+            ;;
+        Linux)
+            if command -v lscpu &>/dev/null; then
+                lscpu | awk -F: '/Model name:/{gsub(/^[ \t]+/, "", $2); print $2; exit}'
+            elif [[ -r /proc/cpuinfo ]]; then
+                awk -F: '/model name/{gsub(/^[ \t]+/, "", $2); print $2; exit}' /proc/cpuinfo
+            else
+                echo "unknown"
+            fi
+            ;;
+        *)
+            echo "unknown"
+            ;;
+    esac
+}
+
+detect_cpu_threads() {
+    getconf _NPROCESSORS_ONLN 2>/dev/null || echo "unknown"
+}
+
+detect_memory_mb() {
+    case "$(uname -s 2>/dev/null || true)" in
+        Darwin)
+            local bytes
+            bytes=$(sysctl -n hw.memsize 2>/dev/null || echo 0)
+            awk -v b="$bytes" 'BEGIN { printf "%.0f", b / 1048576 }'
+            ;;
+        Linux)
+            if [[ -r /proc/meminfo ]]; then
+                awk '/MemTotal:/{printf "%.0f", $2 / 1024}' /proc/meminfo
+            else
+                echo "unknown"
+            fi
+            ;;
+        *)
+            echo "unknown"
+            ;;
+    esac
+}
+
 TOOL=$(detect_tool "$PREFERRED_TOOL")
 echo "Using tool: $TOOL"
 
 # ── Result accumulator ────────────────────────────────────────────────────────
 RESULTS_JSON="{}"
+TOOL_HEADERS=()
 add_result() {
     local scenario="$1" rps="$2" p50_ms="$3" p99_ms="$4" errors="$5"
     RESULTS_JSON=$(jq --arg s "$scenario" --argjson rps "$rps" \
@@ -130,12 +207,13 @@ add_result() {
         <<<"$RESULTS_JSON")
 }
 
-add_tool_headers() {
-    local -n out_ref="$1"
-    local opt="$2"
+build_tool_headers() {
+    local opt="$1"
+    TOOL_HEADERS=()
+    [[ ${#REQUEST_HEADERS[@]} -eq 0 ]] && return 0
     local header
     for header in "${REQUEST_HEADERS[@]}"; do
-        out_ref+=("$opt" "$header")
+        TOOL_HEADERS+=("$opt" "$header")
     done
 }
 
@@ -144,7 +222,8 @@ run_wrk() {
     local url="$1" label="$2"
     local extra=()
     $INSECURE && extra+=(--insecure)
-    add_tool_headers extra -H
+    build_tool_headers -H
+    [[ ${#TOOL_HEADERS[@]} -gt 0 ]] && extra+=("${TOOL_HEADERS[@]}")
     local raw
     raw=$(wrk -t"$THREADS" -c"$CONNECTIONS" -d"${DURATION}s" -L \
         ${extra[@]+"${extra[@]}"} "$url" 2>&1) || true
@@ -164,7 +243,8 @@ run_h2load() {
     local url="$1" label="$2"
     local extra=()
     $INSECURE && extra+=(--insecure)
-    add_tool_headers extra -H
+    build_tool_headers -H
+    [[ ${#TOOL_HEADERS[@]} -gt 0 ]] && extra+=("${TOOL_HEADERS[@]}")
     local raw
     raw=$(h2load -n $((CONNECTIONS * DURATION * 10)) \
         -c "$CONNECTIONS" -t "$THREADS" ${extra[@]+"${extra[@]}"} "$url" 2>&1) || true
@@ -195,7 +275,8 @@ run_h2load_h3() {
     fi
     local extra=()
     $INSECURE && extra+=(--insecure)
-    add_tool_headers extra -H
+    build_tool_headers -H
+    [[ ${#TOOL_HEADERS[@]} -gt 0 ]] && extra+=("${TOOL_HEADERS[@]}")
     local raw
     raw=$(h2load --h3 -n $((CONNECTIONS * DURATION * 10)) \
         -c "$CONNECTIONS" -t "$THREADS" ${extra[@]+"${extra[@]}"} "$url" 2>&1) || true
@@ -216,7 +297,8 @@ run_fortio() {
     local url="$1" label="$2"
     local extra=()
     $INSECURE && extra+=(-insecure)
-    add_tool_headers extra -H
+    build_tool_headers -H
+    [[ ${#TOOL_HEADERS[@]} -gt 0 ]] && extra+=("${TOOL_HEADERS[@]}")
     local raw
     raw=$(fortio load -c "$CONNECTIONS" -t "${DURATION}s" \
         -json /dev/stdout ${extra[@]+"${extra[@]}"} "$url" 2>/dev/null) || true
@@ -447,23 +529,62 @@ done
 # ── Attach metadata ──────────────────────────────────────────────────────────
 GIT_TAG=$(git -C "$(dirname "$0")/.." describe --tags --always 2>/dev/null || echo "unknown")
 TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+ZIG_VERSION=$(detect_zig_version)
+OS_NAME=$(detect_os_name)
+KERNEL_RELEASE=$(detect_kernel_release)
+ARCH_NAME=$(detect_arch)
+CPU_MODEL=$(detect_cpu_model)
+CPU_THREADS=$(detect_cpu_threads)
+MEMORY_MB=$(detect_memory_mb)
 RESULTS_JSON=$(jq \
     --arg tag "$GIT_TAG" --arg ts "$TIMESTAMP" \
     --arg host "$TARGET_HOST" --arg port "$TARGET_PORT" \
     --arg host_header "$HOST_HEADER" \
+    --arg driver "$DRIVER_LABEL" \
+    --arg worker_count "$WORKER_COUNT" \
+    --arg config_label "$CONFIG_LABEL" \
     --arg static_path "$STATIC_PATH" --arg proxy_path "$PROXY_PATH" \
     --arg keepalive_path "$KEEPALIVE_PATH" \
     --arg h2_path "$H2_PATH" --arg h3_path "$H3_PATH" \
-    --arg tool "$TOOL" --argjson dur "$DURATION" --argjson conn "$CONNECTIONS" \
+    --arg tool "$TOOL" \
+    --arg zig_version "$ZIG_VERSION" \
+    --arg os_name "$OS_NAME" \
+    --arg kernel_release "$KERNEL_RELEASE" \
+    --arg arch_name "$ARCH_NAME" \
+    --arg cpu_model "$CPU_MODEL" \
+    --arg cpu_threads "$CPU_THREADS" \
+    --arg memory_mb "$MEMORY_MB" \
+    --argjson dur "$DURATION" --argjson conn "$CONNECTIONS" \
     '. + {_meta: {tag: $tag, timestamp: $ts, host: $host, port: $port,
           tool: $tool, duration_s: $dur, connections: $conn,
-          host_header: $host_header, static_path: $static_path,
+          host_header: $host_header, driver: $driver,
+          worker_count: (if $worker_count == "" then null else ($worker_count | tonumber) end),
+          config_label: (if $config_label == "" then null else $config_label end),
+          zig_version: $zig_version,
+          environment: {
+            os: $os_name,
+            kernel: $kernel_release,
+            arch: $arch_name,
+            cpu_model: $cpu_model,
+            cpu_threads: $cpu_threads,
+            memory_mb: $memory_mb
+          },
+          static_path: $static_path,
           proxy_path: $proxy_path, keepalive_path: $keepalive_path,
           h2_path: $h2_path, h3_path: $h3_path}}' \
     <<<"$RESULTS_JSON")
 
+if [[ -n "$META_FILE" ]]; then
+    if [[ ! -f "$META_FILE" ]]; then
+        echo "Metadata file not found: $META_FILE" >&2
+        exit 1
+    fi
+    RESULTS_JSON=$(jq --slurpfile meta "$META_FILE" '._meta += ($meta[0] // {})' <<<"$RESULTS_JSON")
+fi
+
 # ── Save ─────────────────────────────────────────────────────────────────────
 if [[ -n "$SAVE_FILE" ]]; then
+    mkdir -p "$(dirname "$SAVE_FILE")"
     echo "$RESULTS_JSON" > "$SAVE_FILE"
     echo ""
     echo "Results saved to: $SAVE_FILE"

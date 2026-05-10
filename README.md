@@ -110,6 +110,7 @@ corpus replay entrypoint, and internal pentest workflow are documented in
 | --- | --- |
 | Zig 0.16 engineering guide | `docs/ZIG_ENGINEERING_GUIDE.md` |
 | Code review checklist | `docs/CODE_REVIEW_CHECKLIST.md` |
+| Release checklist | `docs/RELEASE_CHECKLIST.md` |
 | Packaging | `packaging/README.md` |
 | Kubernetes | `packaging/kubernetes/README.md` |
 | Benchmarks | `benchmarks/README.md` |
@@ -132,6 +133,24 @@ zig build test-security-corpus
 # Integration tests (requires a running tardigrade instance and system OpenSSL)
 zig build test-integration
 ```
+
+## Performance
+
+Benchmark releases should be captured from saved JSON under `benchmarks/baselines/`
+and refreshed with `./benchmarks/report.sh <baseline.json> --update-readme README.md`.
+
+<!-- BENCHMARK_REPORT_START -->
+| Scenario | req/s | p50 (ms) | p99 (ms) | Errors |
+| --- | ---: | ---: | ---: | ---: |
+| `keepalive` | 4700 | 0.4 | 41.8 | 0 |
+| `proxy-http1` | 1724 | 1.3 | 114.9 | 0 |
+| `static-http1` | 4586 | 0.4 | 46.1 | 0 |
+
+> **v0.32.0-18-gb44f8c1** · 2026-05-02 · tool: `wrk` · 4 connections · 30s per scenario · host: `127.0.0.1`
+> driver: `loopback (inside tardigrade-perf LXC)` · env: `release-baseline` · workers: `2` · config: `dedicated tardigrade-perf guest config`
+>
+> Run `./benchmarks/run.sh --save benchmarks/baselines/$(git describe --tags).json` then `./benchmarks/report.sh <file> --update-readme README.md` to refresh this table.
+<!-- BENCHMARK_REPORT_END -->
 
 ## Formatting
 

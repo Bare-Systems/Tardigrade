@@ -1,0 +1,6 @@
+{
+  "environment_name": "ci-smoke",
+  "purpose": "Short shared-runner regression smoke test",
+  "gating_policy": "static-http1 >= 250 req/s, proxy-http1 >= 100 req/s, keepalive >= 250 req/s, zero non-2xx errors, p99 <= 250 ms",
+  "driver_notes": "Loopback run on a shared GitHub Actions runner; intended to catch only obvious regressions."
+}

@@ -5,24 +5,17 @@ Repeatable benchmark and regression harness for Tardigrade.
 ## Quick start
 
 ```bash
-# Start a local Tardigrade instance (adjust env as needed)
-TARDIGRADE_LISTEN_PORT=8069 ./zig-out/bin/tardigrade &
+# Shared-runner smoke test (the same harness used in CI)
+./benchmarks/ci-smoke.sh
 
-# Run the default scenario set.
-# For honest proxy numbers, point --proxy-path at a real proxied route.
-./benchmarks/run.sh --proxy-path /proxy/health
-
-# Save a baseline for the current release
-./benchmarks/run.sh --proxy-path /proxy/health --save benchmarks/baselines/$(git describe --tags).json
-
-# Compare a future run against that baseline
-./benchmarks/run.sh --proxy-path /proxy/health --baseline benchmarks/baselines/<tag>.json
-
-# Generate a markdown report from a saved baseline
-./benchmarks/report.sh benchmarks/baselines/<tag>.json
-
-# Update the README performance table in-place
-./benchmarks/report.sh benchmarks/baselines/<tag>.json --update-readme README.md
+# Capture a release baseline JSON + markdown report
+./benchmarks/release-baseline.sh \
+  --meta-file benchmarks/targets/release-baseline.json \
+  --update-readme README.md \
+  -- \
+  --host 192.168.86.55 \
+  --host-header tardigrade-perf \
+  --proxy-path /proxy/health
 ```
 
 ## Prerequisites
@@ -37,6 +30,31 @@ Install at least one load-generation tool. The runner auto-detects in this order
 | [`k6`](https://k6.io/) | `brew install k6` / apt | HTTP/1.1 + HTTP/2 (over TLS) + behavioral scenarios |
 
 `jq` is required for result formatting, baseline comparison, and report generation.
+
+## Release baseline process
+
+The release benchmark flow is now codified in-repo:
+
+1. Capture the benchmark with `./benchmarks/release-baseline.sh`.
+2. Save the JSON under `benchmarks/baselines/<tag>.json`.
+3. Compare against the previous release baseline JSON.
+4. Emit a markdown report next to the JSON.
+5. Refresh the README benchmark block from that saved baseline.
+
+`release-baseline.sh` is a thin wrapper over `run.sh` and `report.sh`. It exists
+to keep the release flow consistent rather than to add a second benchmark engine.
+
+## Metadata
+
+Saved benchmark JSON now carries two categories of metadata:
+
+- Auto-detected driver metadata: Zig version, OS, kernel, architecture, CPU model, CPU thread count, and memory.
+- Process metadata: driver label, worker count, config label, and any extra JSON merged via `--meta-file`.
+
+Use the committed metadata files for common contexts:
+
+- `benchmarks/targets/release-baseline.json`
+- `benchmarks/targets/ci-smoke.json`
 
 ## Scenarios
 
@@ -90,6 +108,9 @@ Run only k6 behavioral tests: `--tool k6 --scenarios auth-enforcement,rate-limit
 --host HOST           Target host (default: 127.0.0.1)
 --port PORT           Target port (default: 8069)
 --host-header NAME    Override the HTTP Host header / :authority
+--driver LABEL        Load-driver label recorded in metadata
+--worker-count N      Tardigrade worker count recorded in metadata
+--config-label STR    Config/profile label recorded in metadata
 --tls                 Use HTTPS
 --insecure            Skip TLS certificate verification
 --duration SECS       Seconds per scenario (default: 30)
@@ -104,6 +125,7 @@ Run only k6 behavioral tests: `--tool k6 --scenarios auth-enforcement,rate-limit
 --tool TOOL           Force tool: wrk|h2load|fortio|k6
 --baseline FILE       Compare against a baseline JSON file
 --save FILE           Write results JSON to a file
+--meta-file FILE      Merge extra JSON metadata into _meta
 --threshold PCT       Regression threshold percentage (default: 10)
 ```
 
@@ -161,6 +183,21 @@ Current staged shape:
   - `/health` → direct edge return
   - `/proxy/health` → proxied loopback upstream
   - `/proxy/payload-64k.bin` → proxied 64 KiB payload
+
+### Official release baseline environment
+
+The canonical release target is the `tardigrade-perf` guest:
+
+- Proxmox node: `beelink`
+- Guest: `LXC 102`
+- Guest name: `tardigrade-perf`
+- Default worker count: `2`
+- Preferred load driver: Jetson Orin Nano via `benchmarks/jetson-run.sh`
+- Fallback low-noise mode: loopback run inside the guest with `benchmarks/run.sh`
+
+Use Jetson runs when you need host-to-host numbers that include a real LAN path.
+Use loopback runs when you need to isolate proxy and request-processing cost
+without network RTT dominating the result.
 
 ### Verify the staged target
 
@@ -260,7 +297,8 @@ behavioral (k6), or reload-under-load scenarios, use `run.sh` directly.
 ./benchmarks/report.sh benchmarks/baselines/v0.61.json --update-readme README.md
 ```
 
-The table includes req/s, p50, p99, error count, tool, version tag, and capture date.
+The table includes req/s, p50, p99, error count, tool, version tag, capture date,
+driver label, environment label, worker count, and config label.
 To refresh the table after a release, re-run the benchmark with `--save` and then
 re-run `report.sh --update-readme`.
 
@@ -285,24 +323,19 @@ Benchmark results are only meaningful when the test environment is controlled:
 - Run the benchmark driver on a separate host from Tardigrade when possible
 - Record the exact benchmark paths and Host header used, not just the IP/port
 
-Document the test host in each baseline file's `_meta.host` field.
+Document the test host in each baseline file's `_meta.host` field and merge the
+appropriate benchmark-context JSON with `--meta-file`.
 
 ## CI integration
 
-Add a regression check to CI by storing a pinned baseline and running:
+The repository now runs a short shared-runner smoke test in CI:
 
-```yaml
-- name: Regression benchmark
-  run: |
-    ./benchmarks/run.sh \
-      --duration 10 \
-      --connections 20 \
-      --baseline benchmarks/baselines/latest.json \
-      --threshold 15
+```bash
+./benchmarks/ci-smoke.sh --save benchmarks/results/ci-smoke.json
 ```
 
-Exit code 2 fails the job. Keep CI duration short (10 s) and connections low (20)
-to avoid flaky results in shared runner environments.
+The smoke run intentionally uses low concurrency, loopback traffic, and generous
+minimum req/s floors so only obvious regressions fail the job.
 
 For behavioral correctness in CI, add a k6-only step:
 

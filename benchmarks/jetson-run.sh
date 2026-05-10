@@ -11,6 +11,8 @@
 #   --host HOST           Target Tardigrade host (default: 192.168.86.55)
 #   --port PORT           Target port (default: 8069)
 #   --host-header NAME    Override the HTTP Host header
+#   --worker-count N      Tardigrade worker count recorded in metadata
+#   --config-label STR    Config/profile label recorded in metadata
 #   --duration SECS       Seconds per scenario (default: 30)
 #   --connections N       Concurrent connections (default: 50)
 #   --threads N           wrk worker threads (default: 4)
@@ -23,6 +25,7 @@
 #   --threshold PCT       Regression threshold percentage (default: 10)
 #   --jetson SSH_HOST     SSH target for the Jetson (default: jetson)
 #   --wrk-path PATH       Path to wrk binary on the Jetson (default: ~/tools/wrk/wrk)
+#   --meta-file FILE      Merge extra JSON metadata into _meta
 #   --help                Show this message and exit
 #
 # Prerequisites (local machine):
@@ -43,6 +46,8 @@ set -euo pipefail
 TARGET_HOST="192.168.86.55"
 TARGET_PORT="8069"
 HOST_HEADER=""
+WORKER_COUNT=""
+CONFIG_LABEL=""
 DURATION=30
 CONNECTIONS=50
 THREADS=4
@@ -55,6 +60,7 @@ BASELINE_FILE=""
 REGRESSION_THRESHOLD=10
 JETSON_HOST="jetson"
 WRK_PATH="~/tools/wrk/wrk"
+META_FILE=""
 
 # ── Arg parsing ───────────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -62,6 +68,8 @@ while [[ $# -gt 0 ]]; do
         --host)           TARGET_HOST="$2";           shift 2 ;;
         --port)           TARGET_PORT="$2";           shift 2 ;;
         --host-header)    HOST_HEADER="$2";           shift 2 ;;
+        --worker-count)   WORKER_COUNT="$2";          shift 2 ;;
+        --config-label)   CONFIG_LABEL="$2";          shift 2 ;;
         --duration)       DURATION="$2";              shift 2 ;;
         --connections)    CONNECTIONS="$2";           shift 2 ;;
         --threads)        THREADS="$2";               shift 2 ;;
@@ -74,6 +82,7 @@ while [[ $# -gt 0 ]]; do
         --threshold)      REGRESSION_THRESHOLD="$2";  shift 2 ;;
         --jetson)         JETSON_HOST="$2";           shift 2 ;;
         --wrk-path)       WRK_PATH="$2";              shift 2 ;;
+        --meta-file)      META_FILE="$2";             shift 2 ;;
         --help)           sed -n '/^# Usage/,/^[^#]/p' "$0" | head -n -1; exit 0 ;;
         *) echo "Unknown option: $1" >&2; exit 1 ;;
     esac
@@ -179,14 +188,26 @@ RESULTS_JSON=$(jq \
     --arg tag "$GIT_TAG" --arg ts "$TIMESTAMP" \
     --arg host "$TARGET_HOST" --arg port "$TARGET_PORT" \
     --arg host_header "$HOST_HEADER" \
+    --arg worker_count "$WORKER_COUNT" \
+    --arg config_label "$CONFIG_LABEL" \
     --arg static_path "$STATIC_PATH" --arg proxy_path "$PROXY_PATH" --arg keepalive_path "$KEEPALIVE_PATH" \
     --arg driver "${JETSON_HOST}" \
     --argjson dur "$DURATION" --argjson conn "$CONNECTIONS" \
     '. + {_meta: {tag: $tag, timestamp: $ts, host: $host, port: $port,
           tool: "wrk", driver: $driver, duration_s: $dur, connections: $conn,
+          worker_count: (if $worker_count == "" then null else ($worker_count | tonumber) end),
+          config_label: (if $config_label == "" then null else $config_label end),
           host_header: $host_header, static_path: $static_path,
           proxy_path: $proxy_path, keepalive_path: $keepalive_path}}' \
     <<<"$RESULTS_JSON")
+
+if [[ -n "$META_FILE" ]]; then
+    if [[ ! -f "$META_FILE" ]]; then
+        echo "Metadata file not found: $META_FILE" >&2
+        exit 1
+    fi
+    RESULTS_JSON=$(jq --slurpfile meta "$META_FILE" '._meta += ($meta[0] // {})' <<<"$RESULTS_JSON")
+fi
 
 # ── Save ──────────────────────────────────────────────────────────────────────
 if [[ -n "$SAVE_FILE" ]]; then

@@ -48,6 +48,10 @@ meta_tag=$(jq -r '._meta.tag       // "unknown"' "$RESULTS_FILE")
 meta_ts=$(jq  -r '._meta.timestamp // "unknown"' "$RESULTS_FILE")
 meta_tool=$(jq -r '._meta.tool     // "unknown"' "$RESULTS_FILE")
 meta_host=$(jq -r '._meta.host     // "unknown"' "$RESULTS_FILE")
+meta_driver=$(jq -r '._meta.driver // "unknown"' "$RESULTS_FILE")
+meta_env=$(jq -r '._meta.environment_name // "unknown"' "$RESULTS_FILE")
+meta_workers=$(jq -r '._meta.worker_count // "?"' "$RESULTS_FILE")
+meta_config=$(jq -r '._meta.config_label // "unknown"' "$RESULTS_FILE")
 meta_dur=$(jq  -r '._meta.duration_s // "?"'     "$RESULTS_FILE")
 meta_conn=$(jq -r '._meta.connections // "?"'    "$RESULTS_FILE")
 
@@ -80,6 +84,7 @@ build_report() {
 ${table}
 
 > **${meta_tag}** · ${date_part} · tool: \`${meta_tool}\` · ${meta_conn} connections · ${meta_dur}s per scenario · host: \`${meta_host}\`
+> driver: \`${meta_driver}\` · env: \`${meta_env}\` · workers: \`${meta_workers}\` · config: \`${meta_config}\`
 >
 > Run \`./benchmarks/run.sh --save benchmarks/baselines/\$(git describe --tags).json\` then \`./benchmarks/report.sh <file> --update-readme README.md\` to refresh this table.
 EOF

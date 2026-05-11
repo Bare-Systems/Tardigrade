@@ -86,25 +86,16 @@ pub const Logger = struct {
         var ts_buf: [32]u8 = undefined;
         const ts = formatTimestamp(&ts_buf);
 
-        var stderr_buf: [1024]u8 = undefined;
-        var stderr = compat.stderrWriter(&stderr_buf);
-
-        // Build JSON log line
-        stderr.print("{{\"ts\":\"{s}\",\"level\":\"{s}\",\"component\":\"{s}\"", .{
-            ts,
-            level.toString(),
-            self.component,
-        }) catch return;
-
-        if (correlation_id) |cid| {
-            stderr.print(",\"correlation_id\":\"{s}\"", .{cid}) catch return;
-        }
-
-        // Escape message for JSON
-        stderr.writeAll(",\"msg\":\"") catch return;
-        writeJsonEscaped(stderr, msg);
-        stderr.writeAll("\"}\n") catch return;
-        stderr.flush() catch {}; // best-effort flush; log loss on stderr is acceptable
+        var line_buf: [4096]u8 = undefined;
+        var line_stream = compat.fixedBufferStream(&line_buf);
+        appendJsonLine(line_stream.writer(), self, level, correlation_id, ts, msg) catch {
+            var stderr_buf: [1024]u8 = undefined;
+            var stderr = compat.stderrWriter(&stderr_buf);
+            appendJsonLine(stderr, self, level, correlation_id, ts, msg) catch return;
+            stderr.flush() catch {}; // best-effort flush; log loss on stderr is acceptable
+            return;
+        };
+        writeLine(line_stream.getWritten());
     }
 };
 
@@ -127,20 +118,45 @@ pub fn formatTimestamp(buf: *[32]u8) []const u8 {
     }) catch "1970-01-01T00:00:00Z";
 }
 
+fn appendJsonLine(writer: anytype, self: Logger, level: Level, correlation_id: ?[]const u8, ts: []const u8, msg: []const u8) !void {
+    try writer.print("{{\"ts\":\"{s}\",\"level\":\"{s}\",\"component\":\"{s}\"", .{
+        ts,
+        level.toString(),
+        self.component,
+    });
+
+    if (correlation_id) |cid| {
+        try writer.print(",\"correlation_id\":\"{s}\"", .{cid});
+    }
+
+    try writer.writeAll(",\"msg\":\"");
+    try writeJsonEscaped(writer, msg);
+    try writer.writeAll("\"}\n");
+}
+
+fn writeLine(line: []const u8) void {
+    var remaining = line;
+    while (remaining.len > 0) {
+        const n = std.c.write(std.posix.STDERR_FILENO, remaining.ptr, remaining.len);
+        if (n <= 0) break;
+        remaining = remaining[@as(usize, @intCast(n))..];
+    }
+}
+
 /// Write a string to a writer with JSON escaping for special characters.
-fn writeJsonEscaped(writer: anytype, s: []const u8) void {
+fn writeJsonEscaped(writer: anytype, s: []const u8) !void {
     for (s) |c| {
         switch (c) {
-            '"' => writer.writeAll("\\\"") catch return,
-            '\\' => writer.writeAll("\\\\") catch return,
-            '\n' => writer.writeAll("\\n") catch return,
-            '\r' => writer.writeAll("\\r") catch return,
-            '\t' => writer.writeAll("\\t") catch return,
+            '"' => try writer.writeAll("\\\""),
+            '\\' => try writer.writeAll("\\\\"),
+            '\n' => try writer.writeAll("\\n"),
+            '\r' => try writer.writeAll("\\r"),
+            '\t' => try writer.writeAll("\\t"),
             else => {
                 if (c < 0x20) {
-                    writer.print("\\u{d:0>4}", .{c}) catch return;
+                    try writer.print("\\u{d:0>4}", .{c});
                 } else {
-                    writer.writeByte(c) catch return;
+                    try writer.writeByte(c);
                 }
             },
         }
@@ -195,4 +211,15 @@ test "formatTimestamp produces valid ISO 8601" {
     try std.testing.expect(std.mem.endsWith(u8, ts, "Z"));
     // Should be at least 20 chars: "2026-03-07T12:00:00Z"
     try std.testing.expect(ts.len >= 20);
+}
+
+test "appendJsonLine escapes message content and includes correlation id" {
+    const log = Logger.init(.info, "gateway");
+    var buf: [256]u8 = undefined;
+    var fbs = compat.fixedBufferStream(&buf);
+    try appendJsonLine(fbs.writer(), log, .warn, "cid-1", "2026-05-11T00:00:00Z", "quote\"\nslash\\tab\t");
+    const line = fbs.getWritten();
+    try std.testing.expect(std.mem.find(u8, line, "\"level\":\"WARN\"") != null);
+    try std.testing.expect(std.mem.find(u8, line, "\"correlation_id\":\"cid-1\"") != null);
+    try std.testing.expect(std.mem.find(u8, line, "\"msg\":\"quote\\\"\\nslash\\\\tab\\t\"") != null);
 }

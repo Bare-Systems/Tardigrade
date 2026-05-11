@@ -9,6 +9,8 @@ const Response = @import("response.zig").Response;
 /// - Strict-Transport-Security
 /// - Referrer-Policy
 /// - Permissions-Policy
+/// - Cross-Origin-Opener-Policy
+/// - Cross-Origin-Resource-Policy
 pub const SecurityHeaders = struct {
     x_frame_options: []const u8 = "DENY",
     x_content_type_options: []const u8 = "nosniff",
@@ -19,6 +21,12 @@ pub const SecurityHeaders = struct {
     referrer_policy: []const u8 = "strict-origin-when-cross-origin",
     permissions_policy: []const u8 = "camera=(), microphone=(), geolocation=()",
     x_xss_protection: []const u8 = "0", // Disabled per modern best practice (CSP preferred)
+    /// Isolates the browsing context from cross-origin documents, preventing
+    /// Spectre-style attacks that exploit shared browsing context groups.
+    cross_origin_opener_policy: []const u8 = "same-origin",
+    /// Controls which origins may embed this resource cross-origin, preventing
+    /// cross-origin information leaks via <img>, <video>, fetch, etc.
+    cross_origin_resource_policy: []const u8 = "same-origin",
 
     /// Apply all configured security headers to a response.
     pub fn apply(self: *const SecurityHeaders, response: *Response) void {
@@ -36,12 +44,17 @@ pub const SecurityHeaders = struct {
             _ = response.setHeader("Permissions-Policy", self.permissions_policy);
         if (self.x_xss_protection.len > 0)
             _ = response.setHeader("X-XSS-Protection", self.x_xss_protection);
+        if (self.cross_origin_opener_policy.len > 0)
+            _ = response.setHeader("Cross-Origin-Opener-Policy", self.cross_origin_opener_policy);
+        if (self.cross_origin_resource_policy.len > 0)
+            _ = response.setHeader("Cross-Origin-Resource-Policy", self.cross_origin_resource_policy);
     }
 
     /// Default secure configuration.
     pub const default: SecurityHeaders = .{};
 
-    /// API-oriented configuration (no CSP frame restrictions).
+    /// API-oriented configuration. Omits CSP and X-Frame-Options (not
+    /// meaningful for JSON APIs) but retains COOP and CORP for isolation.
     pub const api: SecurityHeaders = .{
         .x_frame_options = "",
         .content_security_policy = "",
@@ -64,9 +77,11 @@ test "apply sets all default security headers" {
     try std.testing.expect(response.headers.get("Strict-Transport-Security") == null);
     try std.testing.expectEqualStrings("strict-origin-when-cross-origin", response.headers.get("Referrer-Policy").?);
     try std.testing.expectEqualStrings("0", response.headers.get("X-XSS-Protection").?);
+    try std.testing.expectEqualStrings("same-origin", response.headers.get("Cross-Origin-Opener-Policy").?);
+    try std.testing.expectEqualStrings("same-origin", response.headers.get("Cross-Origin-Resource-Policy").?);
 }
 
-test "api preset skips frame and csp headers" {
+test "api preset skips frame and csp headers but retains coop and corp" {
     const allocator = std.testing.allocator;
     var response = Response.init(allocator);
     defer response.deinit();
@@ -77,6 +92,8 @@ test "api preset skips frame and csp headers" {
     try std.testing.expect(response.headers.get("X-Frame-Options") == null);
     try std.testing.expect(response.headers.get("Content-Security-Policy") == null);
     try std.testing.expectEqualStrings("nosniff", response.headers.get("X-Content-Type-Options").?);
+    try std.testing.expectEqualStrings("same-origin", response.headers.get("Cross-Origin-Opener-Policy").?);
+    try std.testing.expectEqualStrings("same-origin", response.headers.get("Cross-Origin-Resource-Policy").?);
 }
 
 test "hsts is emitted when strict_transport_security is set" {

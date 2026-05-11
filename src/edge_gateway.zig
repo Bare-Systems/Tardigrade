@@ -2465,7 +2465,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
             var s = if (cfg.security_headers_enabled)
                 http.security_headers.SecurityHeaders.api
             else
-                http.security_headers.SecurityHeaders{ .x_frame_options = "", .x_content_type_options = "", .content_security_policy = "", .strict_transport_security = "", .referrer_policy = "", .permissions_policy = "", .x_xss_protection = "" };
+                http.security_headers.SecurityHeaders{ .x_frame_options = "", .x_content_type_options = "", .content_security_policy = "", .strict_transport_security = "", .referrer_policy = "", .permissions_policy = "", .x_xss_protection = "", .cross_origin_opener_policy = "", .cross_origin_resource_policy = "" };
             s.strict_transport_security = initial_hsts;
             break :blk s;
         },
@@ -3132,7 +3132,7 @@ fn applyReloadedRuntimeConfig(cfg: *const edge_config.EdgeConfig, state: *Gatewa
         var s = if (cfg.security_headers_enabled)
             http.security_headers.SecurityHeaders.api
         else
-            http.security_headers.SecurityHeaders{ .x_frame_options = "", .x_content_type_options = "", .content_security_policy = "", .strict_transport_security = "", .referrer_policy = "", .permissions_policy = "", .x_xss_protection = "" };
+            http.security_headers.SecurityHeaders{ .x_frame_options = "", .x_content_type_options = "", .content_security_policy = "", .strict_transport_security = "", .referrer_policy = "", .permissions_policy = "", .x_xss_protection = "", .cross_origin_opener_policy = "", .cross_origin_resource_policy = "" };
         s.strict_transport_security = state.hsts_value;
         break :blk s;
     };
@@ -5270,6 +5270,7 @@ fn executeRawHttpProxyRequest(
     attempt_timeout_ms: u32,
     connect_timeout_ms: u32,
 ) !RawUpstreamResponse {
+    const proxy_extra_header_slack = 10;
     const method_enum = std.meta.stringToEnum(std.http.Method, method) orelse return error.UnsupportedHttpMethod;
     const uri = try std.Uri.parse(url);
     const forwarded_for = try buildForwardedFor(allocator, request_headers.get("x-forwarded-for"), client_ip);
@@ -5277,6 +5278,7 @@ fn executeRawHttpProxyRequest(
 
     var extra_headers = std.array_list.Managed(std.http.Header).init(allocator);
     defer extra_headers.deinit();
+    try extra_headers.ensureUnusedCapacity(request_headers.count() + proxy_extra_header_slack);
     try appendProxyRequestHeaders(&extra_headers, request_headers);
     try appendRequestIdHeaders(&extra_headers, correlation_id);
     try extra_headers.append(.{ .name = "X-Forwarded-For", .value = forwarded_for });
@@ -5316,6 +5318,7 @@ fn executeRawHttpProxyRequest(
     var req = try client.request(method_enum, uri, .{
         .headers = .{
             .connection = .omit,
+            .user_agent = .omit,
             .accept_encoding = .omit,
         },
         .extra_headers = extra_headers.items,
@@ -5336,6 +5339,7 @@ fn executeRawHttpProxyRequest(
         for (headers.items) |*header| header.deinit(allocator);
         headers.deinit();
     }
+    try headers.ensureUnusedCapacity(8);
     var header_it = resp.head.iterateHeaders();
     while (header_it.next()) |header| {
         if (shouldSkipUpstreamResponseHeader(header.name)) continue;
@@ -5344,12 +5348,17 @@ fn executeRawHttpProxyRequest(
             .value = try allocator.dupe(u8, header.value),
         });
     }
-    try appendSpecialUpstreamResponseHeader(allocator, &headers, "Content-Type", resp.head.content_type);
-    try appendSpecialUpstreamResponseHeader(allocator, &headers, "Content-Disposition", resp.head.content_disposition);
-    try appendSpecialUpstreamResponseHeader(allocator, &headers, "Location", resp.head.location);
 
     var body_buf: [8192]u8 = undefined;
-    const body_data = try resp.reader(&body_buf).allocRemaining(allocator, .limited(MAX_REQUEST_SIZE));
+    var body_reader = resp.reader(&body_buf);
+    const body_data = if (resp.head.content_length) |content_length| blk: {
+        if (content_length > MAX_REQUEST_SIZE) return error.StreamTooLong;
+        const exact_len: usize = @intCast(content_length);
+        var body_list: std.ArrayList(u8) = .empty;
+        defer body_list.deinit(allocator);
+        try body_reader.appendExact(allocator, &body_list, exact_len);
+        break :blk try body_list.toOwnedSlice(allocator);
+    } else try body_reader.allocRemaining(allocator, .limited(MAX_REQUEST_SIZE));
     errdefer allocator.free(body_data);
 
     return .{
@@ -5358,22 +5367,6 @@ fn executeRawHttpProxyRequest(
         .headers = try headers.toOwnedSlice(),
         .body = body_data,
     };
-}
-
-fn appendSpecialUpstreamResponseHeader(
-    allocator: std.mem.Allocator,
-    headers: *std.array_list.Managed(UpstreamHeader),
-    name: []const u8,
-    value: ?[]const u8,
-) !void {
-    const raw = value orelse return;
-    for (headers.items) |header| {
-        if (std.ascii.eqlIgnoreCase(header.name, name)) return;
-    }
-    try headers.append(.{
-        .name = try allocator.dupe(u8, name),
-        .value = try allocator.dupe(u8, raw),
-    });
 }
 
 /// Execute an HTTPS upstream proxy request using OpenSSL directly, supporting
@@ -8591,6 +8584,8 @@ fn proxyJsonExecuteSingleAttempt(
     enable_streaming_success: bool,
     sticky_set_cookie: ?[]const u8,
 ) !ProxyExecution {
+    const proxy_json_extra_header_slack = 12;
+    const proxy_json_owned_header_value_slack = 3;
     const resolved_target = try resolveProxyTarget(allocator, upstream_base_url, proxy_pass_target, suffix_path);
     const current_url = resolved_target.url;
     defer allocator.free(current_url);
@@ -8612,6 +8607,8 @@ fn proxyJsonExecuteSingleAttempt(
         for (owned_header_values.items) |value| allocator.free(value);
         owned_header_values.deinit();
     }
+    try extra_headers.ensureUnusedCapacity(proxy_json_extra_header_slack);
+    try owned_header_values.ensureUnusedCapacity(proxy_json_owned_header_value_slack);
     try appendRequestIdHeaders(&extra_headers, correlation_id);
     try extra_headers.append(.{ .name = "X-Forwarded-For", .value = forwarded_for });
     try extra_headers.append(.{ .name = "X-Real-IP", .value = client_ip });
@@ -9009,6 +9006,10 @@ fn writeBufferedUpstreamResponse(
     try writer.print("Content-Length: {d}\r\n", .{upstream_response.body.len});
     try writeRequestIdHeaders(writer, correlation_id);
     for (upstream_response.headers) |header| {
+        // Defense-in-depth: skip any upstream header that should not be
+        // forwarded even if parse-time filtering missed it (e.g. headers
+        // populated through a code path that bypasses shouldSkipUpstreamResponseHeader).
+        if (shouldSkipUpstreamResponseHeader(header.name)) continue;
         try writer.print("{s}: {s}\r\n", .{ header.name, header.value });
     }
     if (sticky_set_cookie) |cookie| {
@@ -9080,6 +9081,11 @@ fn shouldSkipUpstreamResponseHeader(name: []const u8) bool {
         std.ascii.eqlIgnoreCase(name, "trailer") or
         std.ascii.eqlIgnoreCase(name, "transfer-encoding") or
         std.ascii.eqlIgnoreCase(name, "upgrade") or
+        // Strip upstream technology-disclosure headers. Tardigrade emits its
+        // own Server header; leaking the upstream value exposes backend stack
+        // details to external clients (WSTG-INFO-02, ASVS-14.3.3).
+        std.ascii.eqlIgnoreCase(name, "server") or
+        std.ascii.eqlIgnoreCase(name, "x-powered-by") or
         std.ascii.eqlIgnoreCase(name, http.correlation.REQUEST_HEADER_NAME) or
         std.ascii.eqlIgnoreCase(name, http.correlation.HEADER_NAME);
 }
@@ -9099,6 +9105,8 @@ fn writeSecurityHeaders(writer: anytype, sec: *const http.security_headers.Secur
     if (sec.referrer_policy.len > 0) try writer.print("Referrer-Policy: {s}\r\n", .{sec.referrer_policy});
     if (sec.permissions_policy.len > 0) try writer.print("Permissions-Policy: {s}\r\n", .{sec.permissions_policy});
     if (sec.x_xss_protection.len > 0) try writer.print("X-XSS-Protection: {s}\r\n", .{sec.x_xss_protection});
+    if (sec.cross_origin_opener_policy.len > 0) try writer.print("Cross-Origin-Opener-Policy: {s}\r\n", .{sec.cross_origin_opener_policy});
+    if (sec.cross_origin_resource_policy.len > 0) try writer.print("Cross-Origin-Resource-Policy: {s}\r\n", .{sec.cross_origin_resource_policy});
 }
 
 fn writeChunk(writer: anytype, bytes: []const u8) !void {
@@ -9875,6 +9883,21 @@ test "shouldSkipUpstreamResponseHeader strips stale content-encoding" {
     try std.testing.expect(shouldSkipUpstreamResponseHeader("Content-Encoding"));
     try std.testing.expect(shouldSkipUpstreamResponseHeader("content-encoding"));
     try std.testing.expect(!shouldSkipUpstreamResponseHeader("Content-Type"));
+}
+
+test "shouldSkipUpstreamResponseHeader strips upstream Server and X-Powered-By" {
+    // WSTG-INFO-02 / ASVS-14.3.3: upstream technology headers must not leak
+    // to external clients — Tardigrade emits its own Server header instead.
+    try std.testing.expect(shouldSkipUpstreamResponseHeader("Server"));
+    try std.testing.expect(shouldSkipUpstreamResponseHeader("server"));
+    try std.testing.expect(shouldSkipUpstreamResponseHeader("SERVER"));
+    try std.testing.expect(shouldSkipUpstreamResponseHeader("X-Powered-By"));
+    try std.testing.expect(shouldSkipUpstreamResponseHeader("x-powered-by"));
+    try std.testing.expect(shouldSkipUpstreamResponseHeader("X-POWERED-BY"));
+    // Must not suppress unrelated headers
+    try std.testing.expect(!shouldSkipUpstreamResponseHeader("Content-Type"));
+    try std.testing.expect(!shouldSkipUpstreamResponseHeader("X-Custom-Header"));
+    try std.testing.expect(!shouldSkipUpstreamResponseHeader("Set-Cookie"));
 }
 
 test "mapUpstreamError returns stable codes" {

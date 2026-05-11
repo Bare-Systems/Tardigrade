@@ -81,6 +81,7 @@ const State = struct {
     cfg: Config,
     mutex: compat.Mutex = .{},
     buffer: std.ArrayList(u8),
+    line_scratch: std.ArrayList(u8),
 };
 
 var global_state: ?*State = null;
@@ -92,6 +93,7 @@ pub fn init(allocator: std.mem.Allocator, cfg: Config) !void {
         .allocator = allocator,
         .cfg = cfg,
         .buffer = .empty,
+        .line_scratch = .empty,
     };
     global_state = st;
 }
@@ -102,6 +104,7 @@ pub fn deinit() void {
         flushLocked(st);
         st.mutex.unlock();
         st.buffer.deinit(st.allocator);
+        st.line_scratch.deinit(st.allocator);
         st.allocator.destroy(st);
         global_state = null;
     }
@@ -118,17 +121,15 @@ pub fn flush() void {
 pub fn emit(entry: AccessLogEntry) void {
     if (global_state) |st| {
         if (st.cfg.min_status > 0 and entry.status < st.cfg.min_status) return;
-        const line = formatEntry(st.allocator, st.cfg, entry) catch return;
-        defer st.allocator.free(line);
-
         st.mutex.lock();
         defer st.mutex.unlock();
 
         if (st.cfg.buffer_size_bytes == 0) {
-            writeLine(line, st.cfg.syslog_udp_endpoint);
+            formatEntryInto(st.allocator, &st.line_scratch, st.cfg, entry) catch return;
+            writeLine(st.line_scratch.items, st.cfg.syslog_udp_endpoint);
             return;
         }
-        st.buffer.appendSlice(st.allocator, line) catch return;
+        appendEntry(st.allocator, &st.buffer, st.cfg, entry) catch return;
         if (st.buffer.items.len >= st.cfg.buffer_size_bytes) flushLocked(st);
         return;
     }
@@ -139,6 +140,18 @@ pub fn emit(entry: AccessLogEntry) void {
 }
 
 fn formatEntry(allocator: std.mem.Allocator, cfg: Config, entry: AccessLogEntry) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    try formatEntryInto(allocator, &out, cfg, entry);
+    return out.toOwnedSlice(allocator);
+}
+
+fn formatEntryInto(allocator: std.mem.Allocator, out: *std.ArrayList(u8), cfg: Config, entry: AccessLogEntry) !void {
+    out.clearRetainingCapacity();
+    try appendEntry(allocator, out, cfg, entry);
+}
+
+fn appendEntry(allocator: std.mem.Allocator, out: *std.ArrayList(u8), cfg: Config, entry: AccessLogEntry) !void {
     var ts_buf: [32]u8 = undefined;
     const ts = logger.formatTimestamp(&ts_buf);
     var upstream_status_buf: [16]u8 = undefined;
@@ -146,8 +159,9 @@ fn formatEntry(allocator: std.mem.Allocator, cfg: Config, entry: AccessLogEntry)
         std.fmt.bufPrint(&upstream_status_buf, "{d}", .{status}) catch "null"
     else
         "null";
-    return switch (cfg.format) {
-        .json => std.fmt.allocPrint(
+
+    switch (cfg.format) {
+        .json => try out.print(
             allocator,
             "{{\"type\":\"access\",\"ts\":\"{s}\",\"request_id\":\"{s}\",\"correlation_id\":\"{s}\",\"method\":\"{s}\",\"path\":\"{s}\",\"status\":{d},\"latency_ms\":{d},\"client_ip\":\"{s}\",\"upstream_addr\":\"{s}\",\"upstream_status\":{s},\"identity\":\"{s}\",\"user_agent\":\"{s}\",\"bytes_sent\":{d},\"response_bytes\":{d},\"error_category\":\"{s}\"}}\n",
             .{
@@ -168,19 +182,16 @@ fn formatEntry(allocator: std.mem.Allocator, cfg: Config, entry: AccessLogEntry)
                 entry.error_category,
             },
         ),
-        .plain => std.fmt.allocPrint(
+        .plain => try out.print(
             allocator,
             "{s} {s} {d} {d}ms ip={s} req={s} upstream={s} upstream_status={?d} bytes={d} ua=\"{s}\" err={s}\n",
             .{ entry.method, entry.path, entry.status, entry.latency_ms, entry.client_ip, entry.correlation_id, entry.upstream_addr, entry.upstream_status, entry.response_bytes, entry.user_agent, entry.error_category },
         ),
-        .custom => renderTemplate(allocator, if (cfg.custom_template.len > 0) cfg.custom_template else "{method} {path} {status}", ts, entry),
-    };
+        .custom => try appendTemplate(allocator, out, if (cfg.custom_template.len > 0) cfg.custom_template else "{method} {path} {status}", ts, entry),
+    }
 }
 
-fn renderTemplate(allocator: std.mem.Allocator, template: []const u8, ts: []const u8, entry: AccessLogEntry) ![]u8 {
-    var out = std.ArrayList(u8).empty;
-    errdefer out.deinit(allocator);
-
+fn appendTemplate(allocator: std.mem.Allocator, out: *std.ArrayList(u8), template: []const u8, ts: []const u8, entry: AccessLogEntry) !void {
     var i: usize = 0;
     while (i < template.len) {
         if (template[i] == '{') {
@@ -235,14 +246,15 @@ fn renderTemplate(allocator: std.mem.Allocator, template: []const u8, ts: []cons
     }
 
     if (out.items.len == 0 or out.items[out.items.len - 1] != '\n') try out.append(allocator, '\n');
-    return out.toOwnedSlice(allocator);
 }
 
 fn writeLine(line: []const u8, syslog_udp_endpoint: []const u8) void {
-    var buf: [256]u8 = undefined;
-    var w = compat.stderrWriter(&buf);
-    w.writeAll(line) catch {}; // best-effort stderr write; log loss is acceptable
-    w.flush() catch {}; // best-effort flush; log loss is acceptable
+    var remaining = line;
+    while (remaining.len > 0) {
+        const n = std.c.write(std.posix.STDERR_FILENO, remaining.ptr, remaining.len);
+        if (n <= 0) break;
+        remaining = remaining[@as(usize, @intCast(n))..];
+    }
     if (syslog_udp_endpoint.len > 0) sendSyslogUdp(syslog_udp_endpoint, line);
 }
 
@@ -366,6 +378,35 @@ test "formatEntry json encodes null upstream_status as literal null" {
     const line = try formatEntry(std.testing.allocator, .{}, entry);
     defer std.testing.allocator.free(line);
     try std.testing.expect(std.mem.find(u8, line, "\"upstream_status\":null") != null);
+}
+
+test "formatEntryInto reuses a scratch buffer and matches formatEntry" {
+    const entry = AccessLogEntry{
+        .method = "GET",
+        .path = "/proxy/health",
+        .status = 200,
+        .latency_ms = 1,
+        .client_ip = "127.0.0.1",
+        .correlation_id = "req-123",
+        .upstream_addr = "http://127.0.0.1:8080/health",
+        .upstream_status = 200,
+        .identity = "-",
+        .user_agent = "wrk/4.2.0",
+        .bytes_sent = 2,
+        .response_bytes = 2,
+        .error_category = "-",
+    };
+    const cfg = Config{ .format = .plain };
+
+    const expected = try formatEntry(std.testing.allocator, cfg, entry);
+    defer std.testing.allocator.free(expected);
+
+    var scratch = std.ArrayList(u8).empty;
+    defer scratch.deinit(std.testing.allocator);
+    try scratch.appendSlice(std.testing.allocator, "stale");
+
+    try formatEntryInto(std.testing.allocator, &scratch, cfg, entry);
+    try std.testing.expectEqualStrings(expected, scratch.items);
 }
 
 test "shouldRedactHeader matches default sensitive headers case-insensitively" {

@@ -2959,6 +2959,7 @@ test "proxy requests strip hop-by-hop headers before reaching upstreams" {
     const raw_request =
         "GET /proxy/test HTTP/1.1\r\n" ++
         "Host: 127.0.0.1\r\n" ++
+        "User-Agent: integration-client/1.0\r\n" ++
         "Connection: X-Test-Hop, X-Another-Hop, keep-alive\r\n" ++
         "Keep-Alive: timeout=5\r\n" ++
         "Proxy-Authenticate: Basic realm=\"upstream\"\r\n" ++
@@ -2986,6 +2987,7 @@ test "proxy requests strip hop-by-hop headers before reaching upstreams" {
     try std.testing.expect(upstream.capturedHeader("Upgrade") == null);
     try std.testing.expect(upstream.capturedHeader("X-Test-Hop") == null);
     try std.testing.expect(upstream.capturedHeader("X-Another-Hop") == null);
+    try std.testing.expectEqualStrings("integration-client/1.0", upstream.capturedHeader("User-Agent").?);
     try std.testing.expectEqualStrings("still-here", upstream.capturedHeader("X-Custom-Pass").?);
 }
 

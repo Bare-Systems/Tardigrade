@@ -86,3 +86,41 @@ Do not ship a wider public distribution unless all of the following are true:
   coverage-guided fuzz target.
 - Security replay and fuzz-style runs are manual today; moving them into
   scheduled CI or nightly automation remains follow-up work.
+
+### Gaps Identified in Pass 8 (2026-05-10, tardigrade-perf)
+
+**F-01 — HTTP method enforcement (WSTG-CONF-06, ASVS-13.2.1)**
+All HTTP verbs accepted on direct routes (`location = /health`). No gateway-level
+method restriction today. Fix: add `allowed_methods` directive to config DSL;
+add corpus cases for OPTIONS/TRACE/PUT/DELETE on direct routes expecting 405.
+
+**F-02 — Upstream Server header passthrough (WSTG-INFO-02, ASVS-14.3.3)**
+Proxy responses include upstream `Server` header alongside Tardigrade's own.
+Fix: strip upstream `Server` (and `X-Powered-By`) in the proxy response path.
+Add `proxy_hide_header` or equivalent; unit-test that upstream headers are
+scrubbed before `writeSecurityHeaders()` fires.
+
+**F-03 — Missing Host header not rejected (WSTG-CONF-07, ASVS-14.5.1)**
+HTTP/1.1 requests with no `Host` header should be rejected with 400. Currently
+accepted. Fix: add explicit check in the request parser or router; add corpus
+case `no-host-http1.1.txt`.
+
+**F-04 — Client-controlled X-Request-ID / X-Correlation-ID (WSTG-INPV-11, ASVS-7.1.1)**
+Client-supplied `X-Request-ID` / `X-Correlation-ID` are reflected verbatim in
+response and access log. Enables log poisoning and trace-ID spoofing. Fix:
+validate format against `^tg-[0-9]+-[0-9a-f]+$` or always generate fresh IDs
+ignoring client input; sanitize log values for non-printable characters.
+
+**F-05 — TLS pass still pending**
+The homelab edge at `192.168.86.53:8443` (Tardigrade with real TLS) has not yet
+been probed with `tls_scan`. Run a dedicated TLS engagement against that surface.
+
+**F-06 — Auth enforcement pass still pending**
+`/bearclaw/v1/*` requires Bearer per blink.toml verify tests. Auth bypass,
+malformed bearer, token replay, and method-change bypass have not been probed
+against the live edge.
+
+**F-07 — Static file serving via catch-all `location /` non-functional**
+Files in `/opt/tardigrade/public` return 404 despite `root` directive in
+`location /`. Investigate whether this is a static-serving bug or intentional;
+add integration test for static root fallback.

@@ -126,7 +126,7 @@ pub const Response = struct {
         try self.writeDate(writer);
 
         // Server header
-        try writer.print("Server: {s}/{s}\r\n", .{ SERVER_NAME, SERVER_VERSION });
+        try writer.print("Server: {s}\r\n", .{SERVER_NAME});
 
         // Content-Length
         if (self.headers.get("content-length")) |content_length| {
@@ -168,7 +168,7 @@ pub const Response = struct {
         try self.writeDate(writer);
 
         // Server header
-        try writer.print("Server: {s}/{s}\r\n", .{ SERVER_NAME, SERVER_VERSION });
+        try writer.print("Server: {s}\r\n", .{SERVER_NAME});
 
         // Content-Length (still include even for HEAD)
         if (self.headers.get("content-length")) |content_length| {
@@ -455,7 +455,7 @@ test "build simple 200 response" {
     const output = stream.getWritten();
     try testing.expect(std.mem.startsWith(u8, output, "HTTP/1.1 200 OK\r\n"));
     try testing.expect(std.mem.find(u8, output, "Content-Length: 13\r\n") != null);
-    try testing.expect(std.mem.find(u8, output, "Server: tardigrade/") != null);
+    try testing.expect(std.mem.find(u8, output, "Server: tardigrade\r\n") != null);
     try testing.expect(std.mem.find(u8, output, "Date: ") != null);
     try testing.expect(std.mem.endsWith(u8, output, "Hello, World!"));
 }

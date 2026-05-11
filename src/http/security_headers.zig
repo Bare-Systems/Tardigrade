@@ -53,12 +53,11 @@ pub const SecurityHeaders = struct {
     /// Default secure configuration.
     pub const default: SecurityHeaders = .{};
 
-    /// API-oriented configuration. Omits CSP and X-Frame-Options (not
-    /// meaningful for JSON APIs) but retains COOP and CORP for isolation.
-    pub const api: SecurityHeaders = .{
-        .x_frame_options = "",
-        .content_security_policy = "",
-    };
+    /// API-oriented configuration. Includes the full default security header
+    /// set: CSP (`default-src 'self'`), X-Frame-Options (`DENY`), COOP, CORP,
+    /// and all other standard headers. Operators can override individual fields
+    /// in config if a looser policy is required for their application.
+    pub const api: SecurityHeaders = .{};
 };
 
 // Tests
@@ -81,7 +80,7 @@ test "apply sets all default security headers" {
     try std.testing.expectEqualStrings("same-origin", response.headers.get("Cross-Origin-Resource-Policy").?);
 }
 
-test "api preset skips frame and csp headers but retains coop and corp" {
+test "api preset includes csp and x-frame-options alongside coop and corp" {
     const allocator = std.testing.allocator;
     var response = Response.init(allocator);
     defer response.deinit();
@@ -89,8 +88,8 @@ test "api preset skips frame and csp headers but retains coop and corp" {
     const headers = SecurityHeaders.api;
     headers.apply(&response);
 
-    try std.testing.expect(response.headers.get("X-Frame-Options") == null);
-    try std.testing.expect(response.headers.get("Content-Security-Policy") == null);
+    try std.testing.expectEqualStrings("DENY", response.headers.get("X-Frame-Options").?);
+    try std.testing.expectEqualStrings("default-src 'self'", response.headers.get("Content-Security-Policy").?);
     try std.testing.expectEqualStrings("nosniff", response.headers.get("X-Content-Type-Options").?);
     try std.testing.expectEqualStrings("same-origin", response.headers.get("Cross-Origin-Opener-Policy").?);
     try std.testing.expectEqualStrings("same-origin", response.headers.get("Cross-Origin-Resource-Policy").?);

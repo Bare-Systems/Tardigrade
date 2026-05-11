@@ -5923,7 +5923,7 @@ fn streamSseTopic(
     correlation_id: []const u8,
 ) !void {
     try writer.writeAll("HTTP/1.1 200 OK\r\n");
-    try writer.print("Server: {s}/{s}\r\n", .{ http.SERVER_NAME, http.SERVER_VERSION });
+    try writer.print("Server: {s}\r\n", .{http.SERVER_NAME});
     try writer.writeAll("Connection: close\r\n");
     try writer.writeAll("Cache-Control: no-cache\r\n");
     try writer.writeAll("Content-Type: text/event-stream\r\n");
@@ -7327,7 +7327,7 @@ fn finalizeHttp3Response(response: *http.Response) void {
         _ = response.setHeader(http.correlation.REQUEST_HEADER_NAME, correlation_id);
     }
     _ = response
-        .setHeader("server", http.SERVER_NAME ++ "/" ++ http.SERVER_VERSION)
+        .setHeader("server", http.SERVER_NAME)
         .setContentLength(if (response.body) |body| body.len else 0);
 }
 
@@ -7477,7 +7477,7 @@ fn handleHttp3StaticLocation(
     if (served.content_range_value) |content_range| _ = response.setHeader("Content-Range", content_range);
     if (served.accept_ranges) _ = response.setHeader("Accept-Ranges", "bytes");
     _ = response
-        .setHeader("server", http.SERVER_NAME ++ "/" ++ http.SERVER_VERSION)
+        .setHeader("server", http.SERVER_NAME)
         .setContentLength(served.content_length);
     applyResponseHeaders(ctx.state, response);
     ctx.state.metricsRecord(@intFromEnum(served.status_code));
@@ -9076,7 +9076,7 @@ fn writeStreamedUpstreamResponseHead(
         (@as(std.http.Status, @enumFromInt(status_code)).phrase() orelse "");
 
     try writer.print("HTTP/1.1 {d} {s}\r\n", .{ status_code, phrase });
-    try writer.print("Server: {s}/{s}\r\n", .{ http.SERVER_NAME, http.SERVER_VERSION });
+    try writer.print("Server: {s}\r\n", .{http.SERVER_NAME});
     try writer.writeAll("Connection: close\r\n");
     try writer.writeAll("Transfer-Encoding: chunked\r\n");
     try writer.print("Content-Type: {s}\r\n", .{content_type});
@@ -9145,7 +9145,7 @@ fn writeBufferedUpstreamResponseHead(
         (@as(std.http.Status, @enumFromInt(upstream_response.status_code)).phrase() orelse "");
 
     try writer.print("HTTP/1.1 {d} {s}\r\n", .{ upstream_response.status_code, phrase });
-    try writer.print("Server: {s}/{s}\r\n", .{ http.SERVER_NAME, http.SERVER_VERSION });
+    try writer.print("Server: {s}\r\n", .{http.SERVER_NAME});
     try writer.print("Connection: {s}\r\n", .{if (keep_alive) "keep-alive" else "close"});
     try writer.print("Content-Length: {d}\r\n", .{upstream_response.body.len});
     try writeRequestIdHeaders(writer, correlation_id);
@@ -10168,7 +10168,7 @@ test "writeBufferedUpstreamResponse serializes a single forwarded response head"
 
     const output = stream.getWritten();
     try std.testing.expect(std.mem.startsWith(u8, output, "HTTP/1.1 200 OK\r\n"));
-    try std.testing.expect(std.mem.find(u8, output, "Server: tardigrade/") != null);
+    try std.testing.expect(std.mem.find(u8, output, "Server: tardigrade\r\n") != null);
     try std.testing.expect(std.mem.find(u8, output, "Connection: keep-alive\r\n") != null);
     try std.testing.expect(std.mem.find(u8, output, "Content-Length: 4\r\n") != null);
     try std.testing.expect(std.mem.find(u8, output, "Content-Type: text/plain\r\n") != null);

@@ -2,6 +2,15 @@
 
 All notable user-facing changes to Tardigrade are documented here.
 
+## [Unreleased]
+
+### Fixed
+- **CSP and X-Frame-Options missing from API-preset responses (#96)** — `SecurityHeaders.api` explicitly zeroed `content_security_policy` and `x_frame_options`, so any response rendered through the API preset (proxy pass, versioned API routes, error replies) silently omitted `Content-Security-Policy` and `X-Frame-Options`. Removed the overrides so `api` is now identical to `default`: every response carries `Content-Security-Policy: default-src 'self'` and `X-Frame-Options: DENY`. Operators who genuinely need a looser policy can override individual fields in config. Updated 1 unit test. Closes #96.
+- **Server header disclosed version string (#97)** — All 5 `Server` header emission sites in `edge_gateway.zig` and both sites in `response.zig` emitted `Server: tardigrade/<version>`, leaking the precise release tag to unauthenticated clients. Removed the version suffix; header now reads `Server: tardigrade`. Updated 2 unit tests. Closes #97.
+
+### Added
+- Blink verify tests TC-TARDIGRADE-005/006/007 — `security-header-csp`, `security-header-x-frame-options`, and `security-header-server-no-version` confirm that CSP, X-Frame-Options, and a version-free Server header are present on every deploy.
+
 ## [0.3.0] - 2026-05-11
 
 ### Fixed

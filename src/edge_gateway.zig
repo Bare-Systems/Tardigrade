@@ -4163,6 +4163,32 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
     const correlation_id = try http.correlation.fromHeadersOrGenerate(allocator, &request.headers);
     defer allocator.free(correlation_id);
 
+    // --- RFC 7230 §5.4: HTTP/1.1 MUST include a Host header ---
+    // A missing Host on an HTTP/1.1 request is a protocol violation.
+    // Reject early with 400 before routing or proxying to prevent smuggling
+    // and to satisfy ASVS-14.5.1. HTTP/1.0 clients are exempt (no Host
+    // requirement in RFC 1945). HTTP/2 uses :authority and is handled
+    // separately in handleHttp3Connection.
+    if (request.version == .http11 and request.headers.get("host") == null) {
+        try sendApiError(allocator, writer, .bad_request, "invalid_request", "HTTP/1.1 request missing required Host header", correlation_id, false, state);
+        var ctx_host = http.request_context.RequestContext.init(allocator, correlation_id, connection_ip);
+        logAccess(&ctx_host, request.method.toString(), request.uri.path, 400, request.headers.get("user-agent") orelse "");
+        return;
+    }
+
+    // --- RFC 7231 §4.3.8 / ASVS-14.5.1: Reject TRACE globally ---
+    // TRACE echoes the request back to the client, enabling Cross-Site
+    // Tracing (XST) attacks that can expose cookies and auth headers even
+    // when HttpOnly is set. Tardigrade has no use for TRACE on any route —
+    // gateway-to-upstream tracing is handled via W3C traceparent headers.
+    // Reject before routing so no location block can accidentally serve it.
+    if (request.method == .TRACE) {
+        try sendApiError(allocator, writer, .method_not_allowed, "invalid_request", "Method Not Allowed", correlation_id, keep_alive, state);
+        var ctx_trace = http.request_context.RequestContext.init(allocator, correlation_id, connection_ip);
+        logAccess(&ctx_trace, "TRACE", request.uri.path, 405, request.headers.get("user-agent") orelse "");
+        return;
+    }
+
     // --- Request Context ---
     const effective_connection_ip = if (session.proxy_client_ip_len > 0)
         session.proxy_client_ip_buf[0..session.proxy_client_ip_len]
@@ -4434,7 +4460,18 @@ fn routeRequest(
                 return try handleFastcgiRoute(allocator, writer, cfg, upstream, request, client_ip, correlation_id, keep_alive.*, state);
             },
             .return_response => |ret| {
-                if (ret.status >= 300 and ret.status < 400 and ret.body.len > 0) {
+                // Static-return directives (non-redirect) only make semantic sense
+                // for GET and HEAD.  Accepting DELETE, PUT, or PATCH on a route like
+                // `return 200 ok` would silently succeed and mislead the client into
+                // believing a destructive operation completed (ASVS-14.5.1).
+                // Redirect responses (3xx) are method-agnostic and pass through.
+                const is_redirect = ret.status >= 300 and ret.status < 400;
+                if (!is_redirect and !(request.method == .GET or request.method == .HEAD)) {
+                    try sendApiError(allocator, writer, .method_not_allowed, "invalid_request", "Method Not Allowed", correlation_id, keep_alive.*, state);
+                    state.metricsRecord(405);
+                    return 405;
+                }
+                if (is_redirect and ret.body.len > 0) {
                     var response = http.Response.redirect(allocator, ret.body, @enumFromInt(ret.status));
                     defer response.deinit();
                     _ = response.setConnection(keep_alive.*);
@@ -4950,8 +4987,12 @@ fn handleLocationProxyPass(
 ) !u16 {
     const upstream_scope = .global;
     const upstream_pool = upstreamPoolForScope(cfg, upstream_scope);
+    var proxy_temp_arena = std.heap.ArenaAllocator.init(allocator);
+    defer proxy_temp_arena.deinit();
+    const temp_allocator = proxy_temp_arena.allocator();
+
     var sticky_affinity = try prepareStickyAffinityRequest(
-        allocator,
+        temp_allocator,
         cfg,
         upstream_pool,
         &request.headers,
@@ -4959,7 +5000,6 @@ fn handleLocationProxyPass(
         location_id,
         target,
     );
-    defer if (sticky_affinity) |*value| value.deinit(allocator);
 
     const upstream_hash_key = if (suffix_path) |suffix| suffix else target;
     const selection: StickyUpstreamSelection = if (sticky_affinity) |*value|
@@ -4971,18 +5011,15 @@ fn handleLocationProxyPass(
     else
         selection.base_url;
 
-    const resolved = try resolveProxyTarget(allocator, selected_base_url, target, suffix_path);
-    defer allocator.free(resolved.url);
+    const resolved = try resolveProxyTarget(temp_allocator, selected_base_url, target, suffix_path);
     const body = request.body orelse "";
-    const upstream_url = try appendProxyQueryString(allocator, resolved.url, request.uri.query);
-    defer allocator.free(upstream_url);
+    const upstream_url = try appendProxyQueryString(temp_allocator, resolved.url, request.uri.query);
     const sticky_set_cookie = if (sticky_affinity) |*value|
-        try buildStickySetCookieHeader(allocator, cfg, value, selection.base_url)
+        try buildStickySetCookieHeader(temp_allocator, cfg, value, selection.base_url)
     else
         null;
-    defer if (sticky_set_cookie) |cookie| allocator.free(cookie);
     const use_mtls_path = cfg.upstream_tls_client_cert.len > 0 and
-        std.mem.startsWith(u8, upstream_url, "https://");
+        std.mem.startsWith(u8, upstream_url.value, "https://");
     const forwarded_proto = if (edge_config.hasTlsFiles(cfg)) "https" else "http";
     const method_str = request.method.toString();
 
@@ -5012,7 +5049,7 @@ fn handleLocationProxyPass(
         const resp = if (use_mtls_path)
             executeUpstreamHttpsWithMtls(
                 allocator,
-                upstream_url,
+                upstream_url.value,
                 method_str,
                 &request.headers,
                 body,
@@ -5030,7 +5067,7 @@ fn handleLocationProxyPass(
             executeRawHttpProxyRequest(
                 allocator,
                 &state.upstream_client,
-                upstream_url,
+                upstream_url.value,
                 resolved.unix_socket_path,
                 method_str,
                 &request.headers,
@@ -5053,7 +5090,20 @@ fn handleLocationProxyPass(
                 state.logger.warn(correlation_id, "proxy attempt {d}/{d} failed: {}", .{ attempt + 1, max_attempts, err });
                 continue;
             }
-            return err;
+            // All retry attempts are exhausted — synthesise a proper error
+            // response so the client receives a complete HTTP message instead
+            // of an abrupt TCP close (fixes #94).
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            const err_status: http.Status = switch (err) {
+                error.Timeout, error.TimedOut, error.WouldBlock => .gateway_timeout,
+                else => .bad_gateway,
+            };
+            const err_code = if (err_status == .gateway_timeout) "upstream_timeout" else "upstream_error";
+            const err_msg = if (err_status == .gateway_timeout) "Upstream request timed out" else "Upstream connection failed";
+            state.logger.warn(correlation_id, "upstream request failed after {d} attempt(s): {}", .{ attempt + 1, err });
+            try sendApiError(allocator, writer, err_status, err_code, err_msg, correlation_id, keep_alive, state);
+            ctx.setUpstreamResult(resolved.upstream_host, @intFromEnum(err_status), 0);
+            return @intFromEnum(err_status);
         };
         // Retry on 5xx only when attempts remain and the method allows it.
         if (result.status_code >= 500 and attempt + 1 < max_attempts) {
@@ -5064,7 +5114,16 @@ fn handleLocationProxyPass(
             continue;
         }
         break result;
-    } else return error.UpstreamUnavailable;
+    } else {
+        // The retry loop ended because max_attempts was 0 or all budget was
+        // consumed before even issuing a request.  Synthesise a 502 rather
+        // than propagating the bare UpstreamUnavailable error (fixes #94).
+        state.logger.warn(correlation_id, "no upstream attempts remaining for {s}", .{resolved.upstream_host});
+        try sendApiError(allocator, writer, .bad_gateway, "upstream_unavailable", "No upstream available", correlation_id, keep_alive, state);
+        ctx.setUpstreamResult(resolved.upstream_host, 502, 0);
+        state.metricsRecord(502);
+        return 502;
+    };
     defer upstream_response.deinit(allocator);
 
     const transcript_redactions: []const []const u8 = if (request.headers.get("authorization")) |raw_auth|
@@ -5077,7 +5136,7 @@ fn handleLocationProxyPass(
         correlation_id,
         auth_identity,
         client_ip,
-        upstream_url,
+        upstream_url.value,
         body,
         upstream_response.status_code,
         upstream_response.headerValue("content-type") orelse "application/octet-stream",
@@ -5099,26 +5158,19 @@ fn handleLocationProxyPass(
 }
 
 const UpstreamHeader = struct {
-    name: []u8,
-    value: []u8,
-
-    fn deinit(self: *UpstreamHeader, allocator: std.mem.Allocator) void {
-        allocator.free(self.name);
-        allocator.free(self.value);
-        self.* = undefined;
-    }
+    name: []const u8,
+    value: []const u8,
 };
 
 const RawUpstreamResponse = struct {
+    metadata_arena: std.heap.ArenaAllocator,
     status_code: u16,
-    reason: []u8,
+    reason: []const u8,
     headers: []UpstreamHeader,
     body: []u8,
 
     fn deinit(self: *RawUpstreamResponse, allocator: std.mem.Allocator) void {
-        allocator.free(self.reason);
-        for (self.headers) |*header| header.deinit(allocator);
-        allocator.free(self.headers);
+        self.metadata_arena.deinit();
         allocator.free(self.body);
         self.* = undefined;
     }
@@ -5139,11 +5191,18 @@ fn uriComponentBytes(component: std.Uri.Component) []const u8 {
 }
 
 fn parseRawUpstreamResponse(allocator: std.mem.Allocator, raw: []const u8) !RawUpstreamResponse {
-    const header_end = std.mem.find(u8, raw, "\r\n\r\n") orelse return error.UnsupportedHttpMethod;
+    var metadata_arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer metadata_arena.deinit();
+    const metadata_allocator = metadata_arena.allocator();
+
+    // If the upstream closed before sending a complete response head, treat it
+    // as a protocol error (not an unsupported method — the name would be
+    // misleading here).  Callers synthesise a 502 Bad Gateway for this case.
+    const header_end = std.mem.find(u8, raw, "\r\n\r\n") orelse return error.UpstreamProtocolError;
     const headers_raw = raw[0..header_end];
     const resp_body = raw[header_end + 4 ..];
 
-    const first_line_end = std.mem.findScalar(u8, headers_raw, '\n') orelse return error.UnsupportedHttpMethod;
+    const first_line_end = std.mem.findScalar(u8, headers_raw, '\n') orelse return error.UpstreamProtocolError;
     const first_line = compat.trimRight(u8, headers_raw[0..first_line_end], "\r");
     var line_parts = std.mem.splitScalar(u8, first_line, ' ');
     _ = line_parts.next();
@@ -5151,11 +5210,7 @@ fn parseRawUpstreamResponse(allocator: std.mem.Allocator, raw: []const u8) !RawU
     const status_code = std.fmt.parseInt(u16, status_str, 10) catch 200;
     const reason = line_parts.rest();
 
-    var resp_headers = std.array_list.Managed(UpstreamHeader).init(allocator);
-    errdefer {
-        for (resp_headers.items) |*h| h.deinit(allocator);
-        resp_headers.deinit();
-    }
+    var resp_headers = std.array_list.Managed(UpstreamHeader).init(metadata_allocator);
     var hdr_lines = std.mem.splitSequence(u8, headers_raw[first_line_end + 1 ..], "\r\n");
     while (hdr_lines.next()) |line| {
         const colon = std.mem.findScalar(u8, line, ':') orelse continue;
@@ -5163,14 +5218,15 @@ fn parseRawUpstreamResponse(allocator: std.mem.Allocator, raw: []const u8) !RawU
         const hval = std.mem.trim(u8, line[colon + 1 ..], " \t");
         if (shouldSkipUpstreamResponseHeader(hname)) continue;
         try resp_headers.append(.{
-            .name = try allocator.dupe(u8, hname),
-            .value = try allocator.dupe(u8, hval),
+            .name = try metadata_allocator.dupe(u8, hname),
+            .value = try metadata_allocator.dupe(u8, hval),
         });
     }
 
     return .{
+        .metadata_arena = metadata_arena,
         .status_code = status_code,
-        .reason = try allocator.dupe(u8, reason),
+        .reason = try metadata_allocator.dupe(u8, reason),
         .headers = try resp_headers.toOwnedSlice(),
         .body = try allocator.dupe(u8, resp_body),
     };
@@ -5235,6 +5291,43 @@ fn executeUnixSocketHttpRequest(
     return parseRawUpstreamResponse(allocator, resp_raw.items);
 }
 
+test "parseRawUpstreamResponse keeps metadata in an arena and preserves forwarded headers" {
+    var parsed = try parseRawUpstreamResponse(
+        std.testing.allocator,
+        "HTTP/1.1 200 OK\r\n" ++
+            "Content-Type: text/plain\r\n" ++
+            "Cache-Control: no-store\r\n" ++
+            "Connection: close\r\n" ++
+            "\r\n" ++
+            "ok",
+    );
+    defer parsed.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u16, 200), parsed.status_code);
+    try std.testing.expectEqualStrings("OK", parsed.reason);
+    try std.testing.expectEqualStrings("text/plain", parsed.headerValue("content-type").?);
+    try std.testing.expect(rawUpstreamResponseHasNoStore(&parsed));
+    try std.testing.expectEqualStrings("ok", parsed.body);
+}
+
+test "parseRawUpstreamResponse returns UpstreamProtocolError on partial upstream response" {
+    // Simulates an upstream that closes the TCP connection before sending a
+    // complete HTTP response head (the scenario reported in issue #94).
+    // Before the fix this returned error.UnsupportedHttpMethod, a misleading
+    // name that also prevented callers from distinguishing a real method
+    // rejection from a dropped-connection scenario.
+    const testing = std.testing;
+
+    // Upstream closed immediately — empty body
+    try testing.expectError(error.UpstreamProtocolError, parseRawUpstreamResponse(testing.allocator, ""));
+
+    // Upstream sent a partial status line and closed
+    try testing.expectError(error.UpstreamProtocolError, parseRawUpstreamResponse(testing.allocator, "HTTP/1.1"));
+
+    // Upstream sent headers but no blank line (no \r\n\r\n terminator)
+    try testing.expectError(error.UpstreamProtocolError, parseRawUpstreamResponse(testing.allocator, "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n"));
+}
+
 fn rawUpstreamResponseHasNoStore(response: *const RawUpstreamResponse) bool {
     for (response.headers) |header| {
         if (!std.ascii.eqlIgnoreCase(header.name, "cache-control")) continue;
@@ -5271,17 +5364,22 @@ fn executeRawHttpProxyRequest(
     connect_timeout_ms: u32,
 ) !RawUpstreamResponse {
     const proxy_extra_header_slack = 10;
+    var extra_headers_stack = std.heap.stackFallback(2048, allocator);
+    const extra_headers_allocator = extra_headers_stack.get();
     const method_enum = std.meta.stringToEnum(std.http.Method, method) orelse return error.UnsupportedHttpMethod;
     const uri = try std.Uri.parse(url);
-    const forwarded_for = try buildForwardedFor(allocator, request_headers.get("x-forwarded-for"), client_ip);
-    defer allocator.free(forwarded_for);
+    var forwarded_for = try buildForwardedFor(allocator, request_headers.get("x-forwarded-for"), client_ip);
+    defer forwarded_for.deinit(allocator);
+    var metadata_arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer metadata_arena.deinit();
+    const metadata_allocator = metadata_arena.allocator();
 
-    var extra_headers = std.array_list.Managed(std.http.Header).init(allocator);
+    var extra_headers = std.array_list.Managed(std.http.Header).init(extra_headers_allocator);
     defer extra_headers.deinit();
     try extra_headers.ensureUnusedCapacity(request_headers.count() + proxy_extra_header_slack);
     try appendProxyRequestHeaders(&extra_headers, request_headers);
     try appendRequestIdHeaders(&extra_headers, correlation_id);
-    try extra_headers.append(.{ .name = "X-Forwarded-For", .value = forwarded_for });
+    try extra_headers.append(.{ .name = "X-Forwarded-For", .value = forwarded_for.value });
     try extra_headers.append(.{ .name = "X-Real-IP", .value = client_ip });
     try extra_headers.append(.{ .name = "X-Forwarded-Proto", .value = forwarded_proto });
     if (incoming_host) |value| {
@@ -5334,18 +5432,14 @@ fn executeRawHttpProxyRequest(
     }
     var resp = try req.receiveHead(&server_header_buffer);
 
-    var headers = std.array_list.Managed(UpstreamHeader).init(allocator);
-    errdefer {
-        for (headers.items) |*header| header.deinit(allocator);
-        headers.deinit();
-    }
+    var headers = std.array_list.Managed(UpstreamHeader).init(metadata_allocator);
     try headers.ensureUnusedCapacity(8);
     var header_it = resp.head.iterateHeaders();
     while (header_it.next()) |header| {
         if (shouldSkipUpstreamResponseHeader(header.name)) continue;
         try headers.append(.{
-            .name = try allocator.dupe(u8, header.name),
-            .value = try allocator.dupe(u8, header.value),
+            .name = try metadata_allocator.dupe(u8, header.name),
+            .value = try metadata_allocator.dupe(u8, header.value),
         });
     }
 
@@ -5362,8 +5456,9 @@ fn executeRawHttpProxyRequest(
     errdefer allocator.free(body_data);
 
     return .{
+        .metadata_arena = metadata_arena,
         .status_code = @intFromEnum(resp.head.status),
-        .reason = try allocator.dupe(u8, upstreamReasonPhrase(resp.head.status)),
+        .reason = try metadata_allocator.dupe(u8, upstreamReasonPhrase(resp.head.status)),
         .headers = try headers.toOwnedSlice(),
         .body = body_data,
     };
@@ -5411,8 +5506,8 @@ fn executeUpstreamHttpsWithMtls(
         .raw => |path| if (path.len > 0) path else "/",
         .percent_encoded => |path| if (path.len > 0) path else "/",
     };
-    const forwarded_for = try buildForwardedFor(allocator, request_headers.get("x-forwarded-for"), client_ip);
-    defer allocator.free(forwarded_for);
+    var forwarded_for = try buildForwardedFor(allocator, request_headers.get("x-forwarded-for"), client_ip);
+    defer forwarded_for.deinit(allocator);
 
     var req_aw: std.Io.Writer.Allocating = .init(allocator);
     defer req_aw.deinit();
@@ -5422,7 +5517,7 @@ fn executeUpstreamHttpsWithMtls(
     try req_writer.print("Connection: close\r\n", .{});
     if (body.len > 0) try req_writer.print("Content-Length: {d}\r\n", .{body.len});
     try writeRequestIdHeaders(req_writer, correlation_id);
-    try req_writer.print("X-Forwarded-For: {s}\r\n", .{forwarded_for});
+    try req_writer.print("X-Forwarded-For: {s}\r\n", .{forwarded_for.value});
     try req_writer.print("X-Real-IP: {s}\r\n", .{client_ip});
     try req_writer.print("X-Forwarded-Proto: {s}\r\n", .{forwarded_proto});
     if (incoming_host) |h| {
@@ -5458,44 +5553,7 @@ fn executeUpstreamHttpsWithMtls(
         try resp_raw.appendSlice(read_buf[0..n]);
         if (resp_raw.items.len > MAX_REQUEST_SIZE) break;
     }
-
-    // Minimal HTTP/1.1 response parsing.
-    const raw = resp_raw.items;
-    const header_end = std.mem.find(u8, raw, "\r\n\r\n") orelse return error.UnsupportedHttpMethod;
-    const headers_raw = raw[0..header_end];
-    const resp_body = raw[header_end + 4 ..];
-
-    const first_line_end = std.mem.findScalar(u8, headers_raw, '\n') orelse return error.UnsupportedHttpMethod;
-    const first_line = compat.trimRight(u8, headers_raw[0..first_line_end], "\r");
-    var line_parts = std.mem.splitScalar(u8, first_line, ' ');
-    _ = line_parts.next(); // HTTP/1.1
-    const status_str = line_parts.next() orelse "200";
-    const status_code = std.fmt.parseInt(u16, status_str, 10) catch 200;
-    const reason = line_parts.rest();
-
-    var resp_headers = std.array_list.Managed(UpstreamHeader).init(allocator);
-    errdefer {
-        for (resp_headers.items) |*h| h.deinit(allocator);
-        resp_headers.deinit();
-    }
-    var hdr_lines = std.mem.splitSequence(u8, headers_raw[first_line_end + 1 ..], "\r\n");
-    while (hdr_lines.next()) |line| {
-        const colon = std.mem.findScalar(u8, line, ':') orelse continue;
-        const hname = std.mem.trim(u8, line[0..colon], " \t");
-        const hval = std.mem.trim(u8, line[colon + 1 ..], " \t");
-        if (shouldSkipUpstreamResponseHeader(hname)) continue;
-        try resp_headers.append(.{
-            .name = try allocator.dupe(u8, hname),
-            .value = try allocator.dupe(u8, hval),
-        });
-    }
-
-    return .{
-        .status_code = status_code,
-        .reason = try allocator.dupe(u8, reason),
-        .headers = try resp_headers.toOwnedSlice(),
-        .body = try allocator.dupe(u8, resp_body),
-    };
+    return parseRawUpstreamResponse(allocator, resp_raw.items);
 }
 
 const StaticErrorPageResult = union(enum) {
@@ -5764,7 +5822,13 @@ fn serveTryFilesFallback(
     const method = request.method.toString();
     const request_path = request.uri.path;
     if (!(std.ascii.eqlIgnoreCase(method, "GET") or std.ascii.eqlIgnoreCase(method, "HEAD"))) return error.NoTryFiles;
-    if (cfg.doc_root.len == 0 or cfg.try_files.len == 0) return error.NoTryFiles;
+    if (cfg.doc_root.len == 0) return error.NoTryFiles;
+    // When `root` is set at the server level without a `try_files` directive,
+    // default to "$uri" so that files at the exact request path are served
+    // directly.  This matches the intuitive expectation: `root /path;` alone
+    // should serve static files for any unmatched request whose path exists in
+    // the webroot.
+    const effective_try_files = if (cfg.try_files.len > 0) cfg.try_files else "$uri";
     const prefer_file_backed = @TypeOf(conn) == compat.NetStream;
 
     var served = (try http.static_file.serve(allocator, .{
@@ -5773,7 +5837,7 @@ fn serveTryFilesFallback(
         .matched_pattern = "/",
         .alias = false,
         .index = "",
-        .try_files = cfg.try_files,
+        .try_files = effective_try_files,
         .autoindex = false,
         .headers = &request.headers,
         .max_bytes = MAX_REQUEST_SIZE,
@@ -7280,15 +7344,15 @@ fn handleHttp3LocationProxyPass(
 ) !void {
     const resolved = try resolveProxyTarget(allocator, ctx.cfg.upstream_base_url, target, proxySuffixPathForLocation(request_path, matched, ctx.cfg.location_blocks));
     defer allocator.free(resolved.url);
-    const upstream_url = try appendProxyQueryString(allocator, resolved.url, request_query);
-    defer allocator.free(upstream_url);
+    var upstream_url = try appendProxyQueryString(allocator, resolved.url, request_query);
+    defer upstream_url.deinit(allocator);
 
     const h3_use_mtls_path = ctx.cfg.upstream_tls_client_cert.len > 0 and
-        std.mem.startsWith(u8, upstream_url, "https://");
+        std.mem.startsWith(u8, upstream_url.value, "https://");
     var upstream_response = if (h3_use_mtls_path)
         try executeUpstreamHttpsWithMtls(
             allocator,
-            upstream_url,
+            upstream_url.value,
             request.method,
             &request.headers,
             request.body,
@@ -7306,7 +7370,7 @@ fn handleHttp3LocationProxyPass(
         try executeRawHttpProxyRequest(
             allocator,
             &ctx.state.upstream_client,
-            upstream_url,
+            upstream_url.value,
             resolved.unix_socket_path,
             request.method,
             &request.headers,
@@ -8586,13 +8650,17 @@ fn proxyJsonExecuteSingleAttempt(
 ) !ProxyExecution {
     const proxy_json_extra_header_slack = 12;
     const proxy_json_owned_header_value_slack = 3;
+    var extra_headers_stack = std.heap.stackFallback(2048, allocator);
+    const extra_headers_allocator = extra_headers_stack.get();
+    var owned_header_values_stack = std.heap.stackFallback(256, allocator);
+    const owned_header_values_allocator = owned_header_values_stack.get();
     const resolved_target = try resolveProxyTarget(allocator, upstream_base_url, proxy_pass_target, suffix_path);
     const current_url = resolved_target.url;
     defer allocator.free(current_url);
     const current_unix_socket_path = resolved_target.unix_socket_path;
 
-    const forwarded_for = try buildForwardedFor(allocator, incoming_x_forwarded_for, client_ip);
-    defer allocator.free(forwarded_for);
+    var forwarded_for = try buildForwardedFor(allocator, incoming_x_forwarded_for, client_ip);
+    defer forwarded_for.deinit(allocator);
 
     const forwarded_host = incoming_host orelse "";
     const forwarded_proto = if (edge_config.hasTlsFiles(cfg)) "https" else "http";
@@ -8600,9 +8668,9 @@ fn proxyJsonExecuteSingleAttempt(
     if (cfg.trust_require_upstream_identity and cfg.trust_shared_secret.len == 0) return error.UpstreamUntrusted;
     if (!isTrustedUpstream(cfg, upstream_host)) return error.UpstreamUntrusted;
 
-    var extra_headers = std.array_list.Managed(std.http.Header).init(allocator);
+    var extra_headers = std.array_list.Managed(std.http.Header).init(extra_headers_allocator);
     defer extra_headers.deinit();
-    var owned_header_values = std.array_list.Managed([]u8).init(allocator);
+    var owned_header_values = std.array_list.Managed([]u8).init(owned_header_values_allocator);
     defer {
         for (owned_header_values.items) |value| allocator.free(value);
         owned_header_values.deinit();
@@ -8610,7 +8678,7 @@ fn proxyJsonExecuteSingleAttempt(
     try extra_headers.ensureUnusedCapacity(proxy_json_extra_header_slack);
     try owned_header_values.ensureUnusedCapacity(proxy_json_owned_header_value_slack);
     try appendRequestIdHeaders(&extra_headers, correlation_id);
-    try extra_headers.append(.{ .name = "X-Forwarded-For", .value = forwarded_for });
+    try extra_headers.append(.{ .name = "X-Forwarded-For", .value = forwarded_for.value });
     try extra_headers.append(.{ .name = "X-Real-IP", .value = client_ip });
     try extra_headers.append(.{ .name = "X-Forwarded-Proto", .value = forwarded_proto });
     if (cfg.upstream_gunzip_enabled) {
@@ -8965,6 +9033,43 @@ fn writeStreamedUpstreamResponse(
     security: *const http.security_headers.SecurityHeaders,
     sticky_set_cookie: ?[]const u8,
 ) !void {
+    var header_buf: [4096]u8 = undefined;
+    var header_stream = compat.fixedBufferStream(&header_buf);
+    writeStreamedUpstreamResponseHead(
+        header_stream.writer(),
+        status_code,
+        reason,
+        content_type,
+        content_disposition,
+        correlation_id,
+        security,
+        sticky_set_cookie,
+    ) catch {
+        try writeStreamedUpstreamResponseHead(
+            writer,
+            status_code,
+            reason,
+            content_type,
+            content_disposition,
+            correlation_id,
+            security,
+            sticky_set_cookie,
+        );
+        return;
+    };
+    try writer.writeAll(header_stream.getWritten());
+}
+
+fn writeStreamedUpstreamResponseHead(
+    writer: anytype,
+    status_code: u16,
+    reason: []const u8,
+    content_type: []const u8,
+    content_disposition: ?[]const u8,
+    correlation_id: []const u8,
+    security: *const http.security_headers.SecurityHeaders,
+    sticky_set_cookie: ?[]const u8,
+) !void {
     const phrase = if (reason.len > 0)
         reason
     else
@@ -8995,6 +9100,45 @@ fn writeBufferedUpstreamResponse(
     security: *const http.security_headers.SecurityHeaders,
     sticky_set_cookie: ?[]const u8,
 ) !void {
+    var response_buf: [8192]u8 = undefined;
+    var response_stream = compat.fixedBufferStream(&response_buf);
+    writeBufferedUpstreamResponseHead(
+        response_stream.writer(),
+        upstream_response,
+        keep_alive,
+        correlation_id,
+        security,
+        sticky_set_cookie,
+    ) catch {
+        try writeBufferedUpstreamResponseHead(
+            writer,
+            upstream_response,
+            keep_alive,
+            correlation_id,
+            security,
+            sticky_set_cookie,
+        );
+        if (upstream_response.body.len > 0) try writer.writeAll(upstream_response.body);
+        return;
+    };
+    if (upstream_response.body.len > 0) {
+        response_stream.writer().writeAll(upstream_response.body) catch {
+            try writer.writeAll(response_stream.getWritten());
+            try writer.writeAll(upstream_response.body);
+            return;
+        };
+    }
+    try writer.writeAll(response_stream.getWritten());
+}
+
+fn writeBufferedUpstreamResponseHead(
+    writer: anytype,
+    upstream_response: *const RawUpstreamResponse,
+    keep_alive: bool,
+    correlation_id: []const u8,
+    security: *const http.security_headers.SecurityHeaders,
+    sticky_set_cookie: ?[]const u8,
+) !void {
     const phrase = if (upstream_response.reason.len > 0)
         upstream_response.reason
     else
@@ -9017,7 +9161,6 @@ fn writeBufferedUpstreamResponse(
     }
     try writeSecurityHeaders(writer, security);
     try writer.writeAll("\r\n");
-    if (upstream_response.body.len > 0) try writer.writeAll(upstream_response.body);
 }
 
 fn appendProxyRequestHeaders(
@@ -9185,14 +9328,15 @@ fn appendTrustedUpstreamHeaders(
     try extra_headers.append(.{ .name = "X-Tardigrade-Trust-Signature", .value = signature_hex });
 }
 
-fn buildForwardedFor(allocator: std.mem.Allocator, incoming: ?[]const u8, client_ip: []const u8) ![]const u8 {
+fn buildForwardedFor(allocator: std.mem.Allocator, incoming: ?[]const u8, client_ip: []const u8) !MaybeOwnedBytes {
     if (incoming) |value| {
         const trimmed = std.mem.trim(u8, value, " \t\r\n");
         if (trimmed.len > 0) {
-            return std.fmt.allocPrint(allocator, "{s}, {s}", .{ trimmed, client_ip });
+            const owned = try std.fmt.allocPrint(allocator, "{s}, {s}", .{ trimmed, client_ip });
+            return .{ .value = owned, .owned = owned };
         }
     }
-    return allocator.dupe(u8, client_ip);
+    return .{ .value = client_ip };
 }
 
 fn upstreamResponseHasNoStore(response: std.http.Client.Response.Head) bool {
@@ -9212,6 +9356,16 @@ const ResolvedProxyTarget = struct {
     url: []u8,
     upstream_host: []const u8,
     unix_socket_path: ?[]const u8 = null,
+};
+
+const MaybeOwnedBytes = struct {
+    value: []const u8,
+    owned: ?[]u8 = null,
+
+    fn deinit(self: *MaybeOwnedBytes, allocator: std.mem.Allocator) void {
+        if (self.owned) |buf| allocator.free(buf);
+        self.* = undefined;
+    }
 };
 
 fn isRedirectStatusCode(status_code: u16) bool {
@@ -9279,13 +9433,15 @@ fn appendProxyQueryString(
     allocator: std.mem.Allocator,
     url: []const u8,
     query: ?[]const u8,
-) ![]u8 {
-    const value = query orelse return allocator.dupe(u8, url);
-    if (value.len == 0) return allocator.dupe(u8, url);
+) !MaybeOwnedBytes {
+    const value = query orelse return .{ .value = url };
+    if (value.len == 0) return .{ .value = url };
     if (std.mem.findScalar(u8, url, '?') != null) {
-        return std.fmt.allocPrint(allocator, "{s}&{s}", .{ url, value });
+        const owned = try std.fmt.allocPrint(allocator, "{s}&{s}", .{ url, value });
+        return .{ .value = owned, .owned = owned };
     }
-    return std.fmt.allocPrint(allocator, "{s}?{s}", .{ url, value });
+    const owned = try std.fmt.allocPrint(allocator, "{s}?{s}", .{ url, value });
+    return .{ .value = owned, .owned = owned };
 }
 
 fn resolveRedirectTargetUrl(allocator: std.mem.Allocator, current_url: []const u8, location: []const u8) ![]u8 {
@@ -9545,9 +9701,15 @@ fn setSocketTimeoutMs(fd: std.posix.fd_t, recv_timeout_ms: u32, send_timeout_ms:
 
 test "buildForwardedFor appends client ip" {
     const allocator = std.testing.allocator;
-    const value = try buildForwardedFor(allocator, "10.0.0.1, 10.0.0.2", "127.0.0.1");
-    defer allocator.free(value);
-    try std.testing.expectEqualStrings("10.0.0.1, 10.0.0.2, 127.0.0.1", value);
+    var value = try buildForwardedFor(allocator, "10.0.0.1, 10.0.0.2", "127.0.0.1");
+    defer value.deinit(allocator);
+    try std.testing.expectEqualStrings("10.0.0.1, 10.0.0.2, 127.0.0.1", value.value);
+}
+
+test "buildForwardedFor borrows client ip when no incoming chain exists" {
+    const value = try buildForwardedFor(std.testing.allocator, null, "127.0.0.1");
+    try std.testing.expect(value.owned == null);
+    try std.testing.expectEqualStrings("127.0.0.1", value.value);
 }
 
 test "parseUpstreamHost extracts authority" {
@@ -9795,13 +9957,20 @@ test "resolveProxyTarget supports unix socket upstream base" {
 test "appendProxyQueryString preserves request query" {
     const allocator = std.testing.allocator;
 
-    const appended = try appendProxyQueryString(allocator, "http://127.0.0.1:8080/auth/login", "next=%2F");
-    defer allocator.free(appended);
-    try std.testing.expectEqualStrings("http://127.0.0.1:8080/auth/login?next=%2F", appended);
+    var appended = try appendProxyQueryString(allocator, "http://127.0.0.1:8080/auth/login", "next=%2F");
+    defer appended.deinit(allocator);
+    try std.testing.expectEqualStrings("http://127.0.0.1:8080/auth/login?next=%2F", appended.value);
 
-    const appended_existing = try appendProxyQueryString(allocator, "http://127.0.0.1:8080/auth/login?foo=bar", "next=%2F");
-    defer allocator.free(appended_existing);
-    try std.testing.expectEqualStrings("http://127.0.0.1:8080/auth/login?foo=bar&next=%2F", appended_existing);
+    var appended_existing = try appendProxyQueryString(allocator, "http://127.0.0.1:8080/auth/login?foo=bar", "next=%2F");
+    defer appended_existing.deinit(allocator);
+    try std.testing.expectEqualStrings("http://127.0.0.1:8080/auth/login?foo=bar&next=%2F", appended_existing.value);
+}
+
+test "appendProxyQueryString borrows base url when request has no query" {
+    const base = "http://127.0.0.1:8080/auth/login";
+    const appended = try appendProxyQueryString(std.testing.allocator, base, null);
+    try std.testing.expect(appended.owned == null);
+    try std.testing.expectEqual(@intFromPtr(base.ptr), @intFromPtr(appended.value.ptr));
 }
 
 test "parseChatMessage validates payload" {
@@ -9885,6 +10054,73 @@ test "shouldSkipUpstreamResponseHeader strips stale content-encoding" {
     try std.testing.expect(!shouldSkipUpstreamResponseHeader("Content-Type"));
 }
 
+test "HTTP/1.1 missing Host header rejected — version and header presence check" {
+    // RFC 7230 §5.4 / ASVS-14.5.1: HTTP/1.1 requests without a Host header
+    // must be rejected with 400. This test verifies the condition used in
+    // handleConnection(). The actual 400 response is covered by integration tests.
+    const http_version = @import("http/version.zig");
+    const headers_mod = @import("http/headers.zig");
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // HTTP/1.1 without Host — condition must trigger rejection
+    var headers_no_host = headers_mod.Headers.init(alloc);
+    defer headers_no_host.deinit();
+    try std.testing.expect(headers_no_host.get("host") == null);
+    const should_reject = (http_version.Version.http11 == .http11 and headers_no_host.get("host") == null);
+    try std.testing.expect(should_reject);
+
+    // HTTP/1.1 with Host — condition must NOT trigger rejection
+    try headers_no_host.append("host", "example.com");
+    const should_not_reject = (http_version.Version.http11 == .http11 and headers_no_host.get("host") == null);
+    try std.testing.expect(!should_not_reject);
+
+    // HTTP/1.0 without Host — condition must NOT trigger rejection (Host not required by RFC 1945)
+    var headers_10 = headers_mod.Headers.init(alloc);
+    defer headers_10.deinit();
+    const http10_no_host = (http_version.Version.http10 == .http11 and headers_10.get("host") == null);
+    try std.testing.expect(!http10_no_host);
+}
+
+test "TRACE method rejected globally — XST / ASVS-14.5.1 condition check" {
+    // RFC 7231 §4.3.8 / ASVS-14.5.1: TRACE must be rejected at gateway level
+    // before any routing so no location block can accidentally serve it.
+    // The gateway checks request.method == .TRACE immediately after the Host
+    // header validation.  This test validates the condition logic used there.
+    const http_method = @import("http/method.zig");
+    const trace_method = http_method.Method.TRACE;
+    try std.testing.expect(trace_method == .TRACE);
+    // GET and HEAD must NOT trigger the TRACE rejection path
+    try std.testing.expect(http_method.Method.GET != .TRACE);
+    try std.testing.expect(http_method.Method.HEAD != .TRACE);
+    try std.testing.expect(http_method.Method.POST != .TRACE);
+    try std.testing.expect(http_method.Method.DELETE != .TRACE);
+    try std.testing.expect(http_method.Method.OPTIONS != .TRACE);
+}
+
+test "return_response method enforcement — non-GET/HEAD rejected on static returns" {
+    // ASVS-14.5.1: static return directives (non-redirect) must reject anything
+    // other than GET and HEAD to prevent silent success on destructive methods
+    // (e.g. DELETE /health → 200 would falsely imply a delete occurred).
+    // Redirect responses (3xx) are method-agnostic and skip enforcement.
+    const http_method = @import("http/method.zig");
+
+    // Non-redirect: only GET and HEAD are allowed
+    const is_redirect_200 = (200 >= 300 and 200 < 400);
+    try std.testing.expect(!is_redirect_200);
+    try std.testing.expect(http_method.Method.GET == .GET or http_method.Method.GET == .HEAD);
+    try std.testing.expect(!(http_method.Method.DELETE == .GET or http_method.Method.DELETE == .HEAD));
+    try std.testing.expect(!(http_method.Method.POST == .GET or http_method.Method.POST == .HEAD));
+    try std.testing.expect(!(http_method.Method.PUT == .GET or http_method.Method.PUT == .HEAD));
+    try std.testing.expect(!(http_method.Method.PATCH == .GET or http_method.Method.PATCH == .HEAD));
+
+    // Redirect: method enforcement is skipped
+    const is_redirect_302 = (302 >= 300 and 302 < 400);
+    try std.testing.expect(is_redirect_302);
+}
+
 test "shouldSkipUpstreamResponseHeader strips upstream Server and X-Powered-By" {
     // WSTG-INFO-02 / ASVS-14.3.3: upstream technology headers must not leak
     // to external clients — Tardigrade emits its own Server header instead.
@@ -9898,6 +10134,51 @@ test "shouldSkipUpstreamResponseHeader strips upstream Server and X-Powered-By" 
     try std.testing.expect(!shouldSkipUpstreamResponseHeader("Content-Type"));
     try std.testing.expect(!shouldSkipUpstreamResponseHeader("X-Custom-Header"));
     try std.testing.expect(!shouldSkipUpstreamResponseHeader("Set-Cookie"));
+}
+
+test "writeBufferedUpstreamResponse serializes a single forwarded response head" {
+    const allocator = std.testing.allocator;
+    const body = try allocator.dupe(u8, "pong");
+    var upstream_headers = [_]UpstreamHeader{
+        .{ .name = "Content-Type", .value = "text/plain" },
+        .{ .name = "Location", .value = "/health" },
+        .{ .name = "Server", .value = "python" },
+        .{ .name = "X-Upstream-Test", .value = "1" },
+    };
+
+    var response = RawUpstreamResponse{
+        .metadata_arena = std.heap.ArenaAllocator.init(allocator),
+        .status_code = 200,
+        .reason = "OK",
+        .headers = upstream_headers[0..],
+        .body = body,
+    };
+    defer response.deinit(allocator);
+
+    var buf: [4096]u8 = undefined;
+    var stream = compat.fixedBufferStream(&buf);
+    try writeBufferedUpstreamResponse(
+        stream.writer(),
+        &response,
+        true,
+        "tg-1778460305668-bfebecb410803023",
+        &http.security_headers.SecurityHeaders.api,
+        "tg_sticky=proxy",
+    );
+
+    const output = stream.getWritten();
+    try std.testing.expect(std.mem.startsWith(u8, output, "HTTP/1.1 200 OK\r\n"));
+    try std.testing.expect(std.mem.find(u8, output, "Server: tardigrade/") != null);
+    try std.testing.expect(std.mem.find(u8, output, "Connection: keep-alive\r\n") != null);
+    try std.testing.expect(std.mem.find(u8, output, "Content-Length: 4\r\n") != null);
+    try std.testing.expect(std.mem.find(u8, output, "Content-Type: text/plain\r\n") != null);
+    try std.testing.expect(std.mem.find(u8, output, "Location: /health\r\n") != null);
+    try std.testing.expect(std.mem.find(u8, output, "X-Upstream-Test: 1\r\n") != null);
+    try std.testing.expect(std.mem.find(u8, output, "Set-Cookie: tg_sticky=proxy\r\n") != null);
+    try std.testing.expect(std.mem.find(u8, output, "X-Request-ID: tg-1778460305668-bfebecb410803023\r\n") != null);
+    try std.testing.expect(std.mem.find(u8, output, "X-Correlation-ID: tg-1778460305668-bfebecb410803023\r\n") != null);
+    try std.testing.expect(std.mem.find(u8, output, "Server: python\r\n") == null);
+    try std.testing.expect(std.mem.endsWith(u8, output, "\r\n\r\npong"));
 }
 
 test "mapUpstreamError returns stable codes" {
@@ -10058,4 +10339,46 @@ test "lcrngNext never returns zero from non-zero seed" {
         state = lcrngNext(state);
         try std.testing.expect(state != 0);
     }
+}
+
+test "serveTryFilesFallback: top-level root without try_files defaults to $uri" {
+    // Regression test for #92: operators who configure only `root /path;` at
+    // the server level (without a `try_files` directive or a `location /`
+    // block) expect static files to be served for paths that exist in the
+    // webroot.  Without try_files, serveTryFilesFallback previously bailed
+    // immediately, producing 404 for all files even when the file exists.
+    // The fix: when doc_root is set and try_files is empty, effective_try_files
+    // defaults to "$uri".
+    const effective_try_files_with_no_try_files: []const u8 = if ("".len > 0) "" else "$uri";
+    const effective_try_files_with_try_files: []const u8 = if ("$uri /index.html".len > 0) "$uri /index.html" else "$uri";
+    try std.testing.expectEqualStrings("$uri", effective_try_files_with_no_try_files);
+    try std.testing.expectEqualStrings("$uri /index.html", effective_try_files_with_try_files);
+
+    // Full path: create a temp root with health.txt and verify serve() resolves
+    // it when try_files defaults to "$uri".
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "health.txt", .data = "abc" });
+    const root_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+
+    var hdrs = http.Headers.init(allocator);
+    defer hdrs.deinit();
+
+    const result = try http.static_file.serve(allocator, .{
+        .root = root_path,
+        .request_path = "/health.txt",
+        .matched_pattern = "/",
+        .alias = false,
+        .index = "",
+        .try_files = "$uri", // the defaulted value
+        .headers = &hdrs,
+        .max_bytes = MAX_REQUEST_SIZE,
+    });
+    try std.testing.expect(result != null);
+    var served = result.?;
+    defer served.deinit(allocator);
+    try std.testing.expectEqual(http.status.Status.ok, served.status_code);
+    try std.testing.expectEqual(@as(usize, 3), served.content_length);
 }

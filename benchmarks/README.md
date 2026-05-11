@@ -193,6 +193,7 @@ Current staged shape:
 - Guest IP: `192.168.86.55`
 - Tardigrade service: `tardigrade-perf.service`
 - Stub upstream service: `tardigrade-upstream.service`
+  It should run `benchmarks/fixtures/upstream_server.py` in HTTP/1.1 keep-alive mode, not `python -m http.server`, so proxy benchmarks measure Tardigrade rather than one upstream TCP connect per request.
 - Benchmark routes:
   - `/health` → direct edge return
   - `/proxy/health` → proxied loopback upstream

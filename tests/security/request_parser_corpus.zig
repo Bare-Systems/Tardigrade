@@ -18,6 +18,13 @@ const corpus_cases = [_]CorpusCase{
     .{ .path = "tests/corpus/http/request/conflicting_transfer_encoding.http", .expected = .{ .err = error.ConflictingHeaders } },
     .{ .path = "tests/corpus/http/request/obs_fold_header.http", .expected = .{ .err = error.InvalidHeader } },
     .{ .path = "tests/corpus/http/request/malformed_chunked.http", .expected = .{ .err = error.InvalidChunkedBody } },
+    // Parser accepts a Host-less HTTP/1.1 request (syntax is valid); the
+    // gateway layer rejects it with 400 per RFC 7230 §5.4 (ASVS-14.5.1).
+    .{ .path = "tests/corpus/http/request/no_host_http11.http", .expected = .ok },
+    // Parser accepts TRACE requests (valid syntax); the gateway layer rejects
+    // TRACE globally with 405 before routing to prevent XST attacks
+    // (RFC 7231 §4.3.8, ASVS-14.5.1).
+    .{ .path = "tests/corpus/http/request/trace_method.http", .expected = .ok },
 };
 
 fn loadCorpusCase(allocator: std.mem.Allocator, path: []const u8) ![]u8 {

@@ -1,0 +1,2 @@
+TRACE /health HTTP/1.1
+Host: localhost

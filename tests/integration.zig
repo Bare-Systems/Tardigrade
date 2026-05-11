@@ -3174,7 +3174,7 @@ test "proxy requests preserve safe request ids and structured access logs includ
     try std.testing.expectEqualStrings(generated_request_id, upstream.capturedHeader("X-Request-ID").?);
     try std.testing.expectEqualStrings(generated_request_id, upstream.capturedHeader("X-Correlation-ID").?);
 
-    const valid_request_id = "req-abc-123";
+    const valid_request_id = "tg-1778460305668-bfebecb410803023";
     var preserved = try sendRequest(allocator, tardigrade.port, .{
         .method = "GET",
         .path = "/proxy/preserved",

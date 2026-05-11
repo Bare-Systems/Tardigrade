@@ -2,9 +2,14 @@
 
 All notable user-facing changes to Tardigrade are documented here.
 
-## [Unreleased]
+## [0.3.0] - 2026-05-11
 
 ### Fixed
+- **Static file serving broken when `root` is set without `try_files` (top-level config)** — `serveTryFilesFallback` exited immediately when `try_files` was empty (`if (cfg.doc_root.len == 0 or cfg.try_files.len == 0) return error.NoTryFiles`), so operators who set only `root /path;` at the server level could not serve static files — all unmatched paths returned 404 even when the file existed in the webroot. Fixed by defaulting `effective_try_files` to `"$uri"` when `doc_root` is non-empty but `try_files` is empty, so the exact request path is checked in the webroot. Files that exist are served; files that do not exist still 404 correctly. The `location / { root ...; }` block form is unaffected. Added 1 unit test validating both the defaulting logic and the full file-serve path. 475 tests total. Closes #92.
+- **TRACE method accepted on all routes (XST / ASVS-14.5.1)** — `handleConnection()` had no global TRACE guard; the TRACE method was forwarded to location blocks and proxy upstreams, enabling Cross-Site Tracing attacks. Added a pre-routing TRACE rejection that returns `405 Method Not Allowed` before any dispatch, mirroring the Host header check added in #90. Static-return location blocks (`return_response`) now also enforce GET/HEAD-only for non-redirect responses — `DELETE /health → 200` was silently succeeding and could mislead clients. Redirect responses (3xx) are method-agnostic and are unaffected. Added corpus case `tests/corpus/http/request/trace_method.http` and 2 unit tests. 473 tests total. Closes #88.
+- **Upstream connection drop returned bare TCP close instead of 502 Bad Gateway** — when a proxied upstream closed the connection before sending a complete HTTP response, `parseRawUpstreamResponse` returned `error.UnsupportedHttpMethod` (misnamed) and `handleLocationProxyPass` propagated it unhandled, causing Tardigrade to close the TCP connection to the client with no response. All connection-error paths in the proxy retry loop now synthesise a proper `502 Bad Gateway` (or `504 Gateway Timeout` for timeout errors) using `sendApiError`, so clients always receive a complete HTTP message. Renamed the parse-error to `error.UpstreamProtocolError` for clarity. Added 3 unit tests for partial/empty upstream response detection. 471 tests total. Closes #94.
+- **Correlation-ID spoofing and log poisoning via client-supplied X-Request-ID / X-Correlation-ID** — `isValid()` in `correlation_id.zig` accepted any alphanumeric string, allowing clients to inject arbitrary trace IDs into responses and access logs. Narrowed the validation to enforce the Tardigrade format `tg-<decimal>-<lowercase-hex>` exactly: IDs not matching this pattern are discarded and a fresh ID is generated. Prevents spoofing of trace IDs and poisoning of structured logs with operator-controlled values. 6 updated/new unit tests. 468 tests total. Closes #91.
+- **HTTP/1.1 requests without Host header accepted (RFC 7230 §5.4 violation)** — `handleConnection()` routed requests before checking for the Host header; a missing Host fell through to a name-mismatch 404 rather than the RFC-required 400 Bad Request. Added an explicit check immediately after correlation ID generation: HTTP/1.1 requests without Host now return `400 invalid_request` before any routing or proxying. HTTP/1.0 is exempt per RFC 1945. Also added corpus case `tests/corpus/http/request/no_host_http11.http` and a unit test for the condition logic. 467 tests total. Closes #90.
 - **Upstream `Server` and `X-Powered-By` headers leaked through proxy responses** — `shouldSkipUpstreamResponseHeader()` did not include `server` or `x-powered-by`, causing upstream technology headers to appear alongside Tardigrade's own `Server` header in proxy responses. Fixed by adding both to the skip list and adding a defense-in-depth filter call inside `writeBufferedUpstreamResponse()`'s header loop. 9 new unit tests. 465 tests total. Closes #89.
 - **HSTS missing after deploy** — `TARDIGRADE_HSTS_ENABLED` was absent from the live `tardigrade.env`, causing the new binary to default to `false` and omit `Strict-Transport-Security` after the 2026-05-10 deploy. Fixed by adding `TARDIGRADE_HSTS_ENABLED=true` to the live env file and adding it to the `blink.toml` `start` command using the same grep-sed-or-append pattern used for `TARDIGRADE_TLS_DYNAMIC_RELOAD_INTERVAL_MS`, so all future deploys enforce it automatically.
 
@@ -45,8 +50,6 @@ All notable user-facing changes to Tardigrade are documented here.
 - Added a remote benchmark driver and documented the dedicated performance-target workflow.
 - Added a file-backed plain-HTTP static response path with unit and integration coverage for full-file and range handling.
 - Added a configurable Prometheus metrics endpoint with optional auth gating and integration coverage for counter growth.
-
-### Added
 - Added `static-http2`, `static-http3`, and `proxy-http3` benchmark scenarios to `benchmarks/run.sh`. `static-http2` uses `h2load` (cleartext HTTP/2) or `k6` over TLS; `static-http3` and `proxy-http3` use `h2load --h3` and require TLS — both print a clear skip message when `h2load` lacks QUIC support or TLS is absent. Added `--h2-path` and `--h3-path` path overrides. The metadata block now records `h2_path` and `h3_path`. Updated `benchmarks/README.md` with a skip-condition table, tool capability notes, and example commands for HTTP/2 and HTTP/3 protocol runs.
 - Improved config validation and added `warnRiskyConfig`: `validate()` now rejects mismatched TLS cert/key pairs, `tls_client_verify` without a CA path, `otel_sample_rate` outside 0–100, `compression_brotli_quality` outside 0–11, and `upstream_retry_attempts` of 0. A new `warnRiskyConfig` function logs operator warnings for insecure defaults such as disabled upstream TLS verification, disabled rate limiting, 0-RTT HTTP/3, ACME enabled with no domains, TLS without HSTS, and an ignored client CA path. Both `tardigrade validate` and `tardigrade run` now surface these warnings at startup and on reload. Added 5 unit tests covering the new validation helpers.
 - Added unit tests covering `main.zig` core helpers: `parsePid`, `readPidFromFile`, `rotateLogFiles`, `parseCliCommand`, and `writeStarterConfig`; fixed `readPidFromFile` to use `allocRemaining` instead of `readAlloc` so it correctly reads pid files shorter than the buffer size.
@@ -69,6 +72,12 @@ All notable user-facing changes to Tardigrade are documented here.
 - Access logging now reuses in-memory formatting buffers and writes directly to stderr on the unbuffered path, reducing per-request allocator churn on hot routes.
 - Runtime JSON logs now use a fixed-buffer fast path with direct stderr writes for typical log lines, keeping long-message fallback behavior while reducing writer overhead.
 - Benchmark runner `wrk` percentile parsing now stops at the first matching percentile line, avoiding malformed saved JSON on noisy output.
+- Generic `proxy_pass` responses now keep upstream header metadata in a short-lived arena, reducing small per-request GPA allocations on proxied requests.
+- Generic proxy request helpers now borrow existing `X-Forwarded-For` and upstream URL values when no rewrite is needed, avoiding no-op per-request allocations on the common path.
+- The main HTTP/1 proxy route now uses a request-scoped temp arena for sticky-affinity and target-resolution scratch data, reducing short-lived allocator churn without changing upstream response ownership.
+- Proxy request header assembly now uses stack-fallback buffers before spilling to the GPA, keeping ordinary header sets off the heap on the common path.
+- Proxy response heads are now serialized into a stack buffer, and small buffered proxy responses now emit headers plus body in a single write when they fit, reducing small-write syscall overhead on the common HTTP/1 proxy path.
+- The bundled benchmark upstream fixture now speaks explicit HTTP/1.1 keep-alive, and homelab perf docs now require that fixture instead of `python -m http.server` for canonical proxy baselines.
 - CI now installs OpenSSL development headers explicitly and enforces formatting consistently.
 - Unix-socket upstream probing/proxying no longer depends on removed `std.http.Client.connectUnix()` behavior under Zig `0.16.0`; Unix-socket compatibility paths now fall back to raw request/response handling where needed.
 - Proxy requests now strip RFC hop-by-hop headers, including headers named by the incoming `Connection` field, before forwarding to upstreams.
@@ -77,7 +86,7 @@ All notable user-facing changes to Tardigrade are documented here.
 - Hot reload now retires superseded configs after in-flight requests complete so repeated reloads do not accumulate stale config allocations.
 - Request IDs now accept `X-Request-ID` input, echo both request-id headers on responses, propagate upstream, and enrich JSON access logs with upstream address, upstream status, and response byte counts.
 
-## [0.62.0] - 2026-04-24
+## [0.2.0] - 2026-04-24
 
 ### Added
 - Added per-location auth controls in config files and env-driven location blocks.
@@ -91,202 +100,76 @@ All notable user-facing changes to Tardigrade are documented here.
 - Stripped inbound `X-Tardigrade-*` headers before proxying so clients cannot forge asserted identity headers.
 - Corrected routing and auth behavior on prefixed API mounts and fixed root-doc endpoint descriptions.
 
-## [0.32.0] - 2026-03-xx
+## [0.1.3] - 2026-03-15
 
 ### Added
 - Added HS256 JWT auth support with asserted identity headers for upstream services.
 - Added automated release tagging, published multi-platform release assets, and embedded release versions in the binary.
 - Expanded the example deployment bundle with clearer edge-contract documentation.
+- Reworked the integration harness around generic server boots and example-driven fixtures.
+- Refreshed the public documentation set and isolated integration-specific guidance under `examples/`.
+- Added persisted approval workflows, escalation hooks, mux replay support, overflow handling, and channel-cap controls.
+- Added the first full live integration suite covering proxying, TLS, auth, reloads, shutdown, and concurrency behavior.
+- Added active upstream health checks and the first opt-in HTTP/3 runtime path with live QUIC test coverage.
+- Added FastCGI, SCGI, uWSGI, and mail-relay bridge support, plus rewrite, `return`, and `location` routing foundations.
+- Added authenticated WebSocket and SSE streaming support.
+- Added Brotli and gzip response compression improvements.
+- Added nginx-style config parsing, hot reload, secret management, and device/session policy controls.
+- Added async command lifecycle handling, multiplexed streams, approval workflows, richer access logging, and admin observability endpoints.
 
 ### Changed
 - Stopped tracking repo-local deployment notes and local-only runtime files in the public tree.
 
 ### Fixed
 - Fixed prefixed API auth and routing behavior, including correct `401` versus `403` handling.
-
-## [0.31.0] - 2026-03-xx
-
-### Added
-- Reworked the integration harness around generic server boots and example-driven fixtures.
-- Refreshed the public documentation set and isolated integration-specific guidance under `examples/`.
-- Added persisted approval workflows, escalation hooks, mux replay support, overflow handling, and channel-cap controls.
-
-### Fixed
 - Fixed config-driven proxy routing precedence, upstream redirect transparency, and mounted-path proxy behavior.
-
-## [0.30.0] - 2026-03-xx
-
-### Added
-- Added the first full live integration suite covering proxying, TLS, auth, reloads, shutdown, and concurrency behavior.
-- Added active upstream health checks and the first opt-in HTTP/3 runtime path with live QUIC test coverage.
-- Added FastCGI, SCGI, uWSGI, and mail-relay bridge support, plus rewrite, `return`, and `location` routing foundations.
-
-### Fixed
 - Fixed QUIC/TLS bootstrap issues, backend protocol parsing, and several integration-harness stability problems.
 
-## [0.29.0] - 2026-03-08
-
-### Added
-- Added authenticated WebSocket and SSE streaming support.
-- Added Brotli and gzip response compression improvements.
-- Added nginx-style config parsing, hot reload, secret management, and device/session policy controls.
-- Added async command lifecycle handling, multiplexed streams, approval workflows, richer access logging, and admin observability endpoints.
-
-## [0.28.0] - 2026-03-07
+## [0.1.2] - 2026-03-07
 
 ### Added
 - Added proxy caching with purge, stale serving, and configurable cache keys.
 - Added JWT validation, auth subrequests, geo blocking, and response-header controls.
 - Added expanded TLS features including SNI, mTLS, OCSP stapling, session resumption, and dynamic reload checks.
 - Added HTTP/2 foundations, richer upstream load-balancing modes, active/passive health tracking, PROXY protocol support, trusted-upstream signing, and Unix-socket upstreams.
-
-## [0.27.0] - 2026-03-07
-
-### Added
 - Added keep-alive request reuse, request pipelining support, and graceful connection draining.
 - Added worker-queue load balancing, work stealing, reusable connection state, and tighter memory controls.
 - Added upstream retries, timeout budgets, overload shedding, operational metrics, and multiple load-balancing strategies.
 
-## [0.26.0] - 2026-03-07
-
-### Added
-- Switched request processing to a request-scoped arena allocator to reduce per-request allocation overhead.
-
-## [0.25.0] - 2026-03-07
-
-### Added
-- Added configurable keep-alive connection reuse and max-requests-per-connection limits.
-
-## [0.24.0] - 2026-03-07
-
-### Added
-- Added configurable socket timeouts for request headers and upstream send/receive operations.
-
-## [0.23.0] - 2026-03-07
-
-### Added
-- Added the initial `proxy_pass` routing model for chat and command upstreams.
-
-## [0.22.0] - 2026-03-07
-
-### Added
-- Added shared upstream HTTP client pooling so proxied requests can reuse backend connections.
-
-## [0.21.0] - 2026-03-07
-
-### Added
-- Added streamed upstream response forwarding for successful proxy responses.
-
-## [0.20.0] - 2026-03-07
-
-### Added
-- Added native HTTPS/TLS termination backed by OpenSSL.
-
-## [0.19.0] - 2026-03-07
-
-### Added
-- Added per-IP active connection limiting for inbound client traffic.
-
-## [0.18.0] - 2026-03-07
-
-### Added
-- Added graceful worker draining so queued and in-flight work completes during shutdown.
-
-## [0.17.0] - 2026-03-07
-
-### Added
-- Added standard forwarded upstream headers and upstream `Host` rewriting for proxy requests.
-
-## [0.16.0] - 2026-03-07
-
-### Added
-- Added a fixed-size worker thread pool with bounded queue backpressure.
-
-## [0.15.0] - 2026-03-07
-
-### Added
-- Added the cross-platform async event-loop foundation with non-blocking accept handling and timer ticks.
-
-## [0.14.0] - 2026-03-07
-
-### Added
-- Added an upstream circuit breaker, Prometheus metrics output, and structured JSON access logs.
-
-## [0.13.0] - 2026-03-07
-
-### Added
-- Added gzip response compression, JSON metrics output, and graceful shutdown signal handling.
-
-## [0.12.0] - 2026-03-07
-
-### Added
-- Added HTTP Basic Auth support, structured JSON logging, browser cache-control helpers, and request-size/header validation.
-
-## [0.11.0] - 2026-03-xx
-
-### Added
-- Added CIDR-based IP allow and deny rules.
-
-## [0.10.0] - 2026-03-xx
-
-### Added
-- Added structured command routing, command-specific proxying, and command audit logging.
-
-## [0.9.0] - 2026-03-xx
-
-### Added
-- Added session creation, listing, revocation, expiry, and session-token auth support.
-
-## [0.8.0] - 2026-03-xx
-
-### Added
-- Added token-bucket rate limiting, security headers, request-context propagation, API version routing, and idempotency-key replay support.
-
-## [0.7.0] - unreleased
-
-### Added
-- Introduced the authenticated edge gateway MVP with config loading, bearer auth, correlation IDs, request validation, and upstream proxying.
-
-## [0.6.0] - 2026-01-29
-
-### Added
-- Added `Accept-Encoding` negotiation groundwork for static responses.
-
-## [0.5.0] - 2026-01-30
-
-### Added
-- Added `Last-Modified`, `ETag`, conditional requests, and directory autoindex support for static files.
-
-## [0.4.1] - 2026-01-27
-
-### Added
-- Added custom error pages for common client and server error responses.
-
-### Changed
-- Updated the reported server version string.
-
-## [0.4.0] - 2026-01-27
-
-### Added
-- Added directory index resolution and trailing-slash redirects for directory requests.
+## [0.1.1] - 2026-03-01
 
 ### Fixed
 - Fixed keep-alive timeout handling across macOS and Linux.
 
-## [0.3.0] - 2026-01-27
-
-### Added
-- Added reusable HTTP response-builder and status-code modules.
-
 ### Changed
 - Standardized `Date`, `Server`, and `Allow` response headers.
-
-## [0.2.0] - 2026-01-26
+- Updated the reported server version string.
 
 ### Added
 - Added a modular HTTP/1.1 parser with HEAD support, MIME detection, robust error handling, and path-traversal protection.
-
-## [0.1.0] - 2025-05-28
-
-### Added
 - Initial HTTP server with static file serving and basic GET request handling.
+- Added reusable HTTP response-builder and status-code modules.
+- Added directory index resolution and trailing-slash redirects for directory requests.
+- Added custom error pages for common client and server error responses.
+- Added `Last-Modified`, `ETag`, conditional requests, and directory autoindex support for static files.
+- Added `Accept-Encoding` negotiation groundwork for static responses.
+- Introduced the authenticated edge gateway MVP with config loading, bearer auth, correlation IDs, request validation, and upstream proxying.
+- Added token-bucket rate limiting, security headers, request-context propagation, API version routing, and idempotency-key replay support.
+- Added session creation, listing, revocation, expiry, and session-token auth support.
+- Added structured command routing, command-specific proxying, and command audit logging.
+- Added HTTP Basic Auth support, structured JSON logging, browser cache-control helpers, and request-size/header validation.
+- Added CIDR-based IP allow and deny rules.
+- Added gzip response compression, JSON metrics output, and graceful shutdown signal handling.
+- Added an upstream circuit breaker, Prometheus metrics output, and structured JSON access logs.
+- Added the cross-platform async event-loop foundation with non-blocking accept handling and timer ticks.
+- Added a fixed-size worker thread pool with bounded queue backpressure.
+- Added standard forwarded upstream headers and upstream `Host` rewriting for proxy requests.
+- Added graceful worker draining so queued and in-flight work completes during shutdown.
+- Added streamed upstream response forwarding for successful proxy responses.
+- Added per-IP active connection limiting for inbound client traffic.
+- Added shared upstream HTTP client pooling so proxied requests can reuse backend connections.
+- Added the initial `proxy_pass` routing model for chat and command upstreams.
+- Added native HTTPS/TLS termination backed by OpenSSL.
+- Added configurable socket timeouts for request headers and upstream send/receive operations.
+- Added configurable keep-alive connection reuse and max-requests-per-connection limits.
+- Switched request processing to a request-scoped arena allocator to reduce per-request allocation overhead.

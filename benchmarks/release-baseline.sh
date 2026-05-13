@@ -13,6 +13,7 @@ BASELINE_FILE=""
 README_FILE=""
 REPORT_FILE=""
 RUN_ARGS=()
+HAS_SCENARIOS_OVERRIDE=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -21,6 +22,11 @@ while [[ $# -gt 0 ]]; do
         --baseline)      BASELINE_FILE="$2";  shift 2 ;;
         --update-readme) README_FILE="$2";    shift 2 ;;
         --report-file)   REPORT_FILE="$2";    shift 2 ;;
+        --scenarios)
+            HAS_SCENARIOS_OVERRIDE=true
+            RUN_ARGS+=("$1" "$2")
+            shift 2
+            ;;
         --help)
             cat <<'EOF'
 Usage:
@@ -44,6 +50,9 @@ EOF
             break
             ;;
         *)
+            if [[ "$1" == "--scenarios" ]]; then
+                HAS_SCENARIOS_OVERRIDE=true
+            fi
             RUN_ARGS+=("$1")
             shift
             ;;
@@ -58,6 +67,12 @@ cmd=(
     --meta-file "${META_FILE}"
     --save "${SAVE_FILE}"
 )
+
+if ! $HAS_SCENARIOS_OVERRIDE; then
+    cmd+=(
+        --scenarios "static-http1,proxy-http1,proxy-payload-64k,proxy-payload-256k,keepalive"
+    )
+fi
 
 if [[ -n "${BASELINE_FILE}" ]]; then
     cmd+=(--baseline "${BASELINE_FILE}")

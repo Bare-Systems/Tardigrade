@@ -21,6 +21,8 @@
 #   --static-path PATH  Path for static-http1 and reload-under-load (default: /health)
 #   --proxy-path PATH   Path for proxy-http1/proxy-http2/proxy-http3 (default: /proxy/health)
 #   --keepalive-path PATH  Path for keepalive (default: /health)
+#   --proxy-payload-64k-path PATH  Path for 64 KiB proxied payload benchmark (default: /proxy/payload-64k.bin)
+#   --proxy-payload-256k-path PATH  Path for 256 KiB proxied payload benchmark (default: /proxy/payload-256k.bin)
 #   --h2-path PATH      Path for static-http2 (default: same as --static-path)
 #   --h3-path PATH      Path for static-http3 (default: same as --static-path)
 #   --scenarios LIST    Comma-separated scenario names to run (default: all)
@@ -38,6 +40,8 @@
 #   static-http3        Static file serving over HTTP/3 (requires h2load with QUIC + --tls)
 #   proxy-http3         Reverse proxy over HTTP/3 (requires h2load with QUIC + --tls)
 #   keepalive           Keep-alive connection reuse
+#   proxy-payload-64k   Reverse proxy 64 KiB payload transfer
+#   proxy-payload-256k  Reverse proxy 256 KiB payload transfer
 #   reload-under-load   Trigger SIGHUP during a load run and measure degradation
 #
 # Prerequisites:
@@ -67,6 +71,8 @@ THREADS=4
 STATIC_PATH="/health"
 PROXY_PATH="/proxy/health"
 KEEPALIVE_PATH="/health"
+PROXY_PAYLOAD_64K_PATH="/proxy/payload-64k.bin"
+PROXY_PAYLOAD_256K_PATH="/proxy/payload-256k.bin"
 H2_PATH=""      # defaults to STATIC_PATH after arg parsing
 H3_PATH=""      # defaults to STATIC_PATH after arg parsing
 SCENARIOS="static-http1,proxy-http1,keepalive"
@@ -93,6 +99,8 @@ while [[ $# -gt 0 ]]; do
         --static-path)STATIC_PATH="$2";        shift 2 ;;
         --proxy-path) PROXY_PATH="$2";         shift 2 ;;
         --keepalive-path)KEEPALIVE_PATH="$2";  shift 2 ;;
+        --proxy-payload-64k-path)PROXY_PAYLOAD_64K_PATH="$2"; shift 2 ;;
+        --proxy-payload-256k-path)PROXY_PAYLOAD_256K_PATH="$2"; shift 2 ;;
         --h2-path)    H2_PATH="$2";            shift 2 ;;
         --h3-path)    H3_PATH="$2";            shift 2 ;;
         --scenarios)  SCENARIOS="$2";          shift 2 ;;
@@ -444,6 +452,16 @@ scenario_keepalive() {
     run_scenario "${BASE_URL}${KEEPALIVE_PATH}" "keepalive"
 }
 
+scenario_proxy_payload_64k() {
+    echo "==> proxy-payload-64k: reverse proxy 64 KiB payload (${PROXY_PAYLOAD_64K_PATH})"
+    run_scenario "${BASE_URL}${PROXY_PAYLOAD_64K_PATH}" "proxy-payload-64k"
+}
+
+scenario_proxy_payload_256k() {
+    echo "==> proxy-payload-256k: reverse proxy 256 KiB payload (${PROXY_PAYLOAD_256K_PATH})"
+    run_scenario "${BASE_URL}${PROXY_PAYLOAD_256K_PATH}" "proxy-payload-256k"
+}
+
 scenario_auth_enforcement() {
     echo "==> auth-enforcement: verify 401 for unauthenticated and 2xx for authenticated requests"
     if [[ "$TOOL" != "k6" ]]; then
@@ -502,7 +520,7 @@ scenario_reload_under_load() {
 # ── Main loop ─────────────────────────────────────────────────────────────────
 echo "Tardigrade benchmark — target: ${BASE_URL}  tool: ${TOOL}"
 echo "Duration: ${DURATION}s  Connections: ${CONNECTIONS}  Threads: ${THREADS}"
-echo "Paths: static=${STATIC_PATH} proxy=${PROXY_PATH} keepalive=${KEEPALIVE_PATH} h2=${H2_PATH} h3=${H3_PATH}"
+echo "Paths: static=${STATIC_PATH} proxy=${PROXY_PATH} keepalive=${KEEPALIVE_PATH} proxy64k=${PROXY_PAYLOAD_64K_PATH} proxy256k=${PROXY_PAYLOAD_256K_PATH} h2=${H2_PATH} h3=${H3_PATH}"
 if [[ -n "$HOST_HEADER" ]]; then
     echo "Host header override: ${HOST_HEADER}"
 fi
@@ -518,6 +536,8 @@ for scenario in "${SCENARIO_LIST[@]}"; do
         static-http3)       scenario_static_http3 ;;
         proxy-http3)        scenario_proxy_http3 ;;
         keepalive)          scenario_keepalive ;;
+        proxy-payload-64k)  scenario_proxy_payload_64k ;;
+        proxy-payload-256k) scenario_proxy_payload_256k ;;
         reload-under-load)  scenario_reload_under_load ;;
         auth-enforcement)   scenario_auth_enforcement ;;
         rate-limit)         scenario_rate_limit ;;

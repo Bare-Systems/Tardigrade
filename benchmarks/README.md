@@ -80,6 +80,8 @@ These measure raw request throughput and run with whichever tool is auto-detecte
 |---|---|---|
 | `static-http1` | Static file serving over HTTP/1.1 | — |
 | `proxy-http1` | Reverse proxy route over HTTP/1.1 | — |
+| `proxy-payload-64k` | Reverse proxy 64 KiB payload transfer | — |
+| `proxy-payload-256k` | Reverse proxy 256 KiB payload transfer | — |
 | `static-http2` | Static file serving over HTTP/2 | Skipped unless tool is `h2load` or `k6` + `--tls` |
 | `proxy-http2` | Reverse proxy route over HTTP/2 | Skipped unless tool is `h2load` |
 | `static-http3` | Static file serving over HTTP/3 (QUIC) | Skipped unless `h2load` with `--h3` support **and** `--tls` |
@@ -133,6 +135,8 @@ Run only k6 behavioral tests: `--tool k6 --scenarios auth-enforcement,rate-limit
 --static-path PATH    Path for static-http1 and reload-under-load (default: /health)
 --proxy-path PATH     Path for proxy-http1/proxy-http2 (default: /proxy/health)
 --keepalive-path PATH Path for keepalive (default: /health)
+--proxy-payload-64k-path PATH  Path for proxy-payload-64k (default: /proxy/payload-64k.bin)
+--proxy-payload-256k-path PATH Path for proxy-payload-256k (default: /proxy/payload-256k.bin)
 --h2-path PATH        Path for static-http2 (default: same as --static-path)
 --h3-path PATH        Path for static-http3 (default: same as --static-path)
 --scenarios LIST      Comma-separated scenario names
@@ -193,11 +197,12 @@ Current staged shape:
 - Guest IP: `192.168.86.55`
 - Tardigrade service: `tardigrade-perf.service`
 - Stub upstream service: `tardigrade-upstream.service`
-  It should run `benchmarks/fixtures/upstream_server.py` in HTTP/1.1 keep-alive mode, not `python -m http.server`, so proxy benchmarks measure Tardigrade rather than one upstream TCP connect per request.
+  It runs `benchmarks/fixtures/upstream_server.py` in HTTP/1.1 keep-alive mode, not `python -m http.server`, so proxy benchmarks measure Tardigrade rather than one upstream TCP connect per request.
 - Benchmark routes:
   - `/health` → direct edge return
   - `/proxy/health` → proxied loopback upstream
   - `/proxy/payload-64k.bin` → proxied 64 KiB payload
+  - `/proxy/payload-256k.bin` → proxied 256 KiB payload
 
 ### Official release baseline environment
 
@@ -262,11 +267,20 @@ This is the only setup that reveals Tardigrade's actual per-request processing c
 ssh proxmox 'pct exec 102 -- bash -c "
   wrk -t2 -c4 -d30s -L http://127.0.0.1:8069/health
   wrk -t2 -c4 -d30s -L http://127.0.0.1:8069/proxy/health
+  wrk -t2 -c2 -d30s -L http://127.0.0.1:8069/proxy/payload-64k.bin
 "'
 ```
 
 Keep connections at or near the worker count (`workers=2` by default on a 2-core LXC)
 to avoid queue-saturation inflating p99. The p50 is the honest latency signal.
+
+The default `release-baseline.sh` flow now includes:
+
+- `static-http1`
+- `proxy-http1`
+- `proxy-payload-64k`
+- `proxy-payload-256k`
+- `keepalive`
 
 ### Optional: run from the Jetson only when you explicitly want a network-path measurement
 

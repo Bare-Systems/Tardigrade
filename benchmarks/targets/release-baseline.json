@@ -10,6 +10,7 @@
   "routes": {
     "static": "/health",
     "proxy": "/proxy/health",
-    "large_proxy_payload": "/proxy/payload-64k.bin"
+    "proxy_payload_64k": "/proxy/payload-64k.bin",
+    "proxy_payload_256k": "/proxy/payload-256k.bin"
   }
 }

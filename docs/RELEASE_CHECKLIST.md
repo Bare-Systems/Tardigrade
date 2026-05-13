@@ -10,7 +10,7 @@ Use this checklist before tagging and distributing a Tardigrade release.
 
 ## Performance
 
-- [ ] Capture the release baseline JSON with `./benchmarks/release-baseline.sh` on the homelab perf target
+- [ ] Capture the release baseline JSON with `./benchmarks/release-baseline.sh` on the homelab perf target, including the default `64 KiB` and `256 KiB` payload scenarios
 - [ ] Compare against the previous saved baseline JSON
 - [ ] Generate the markdown report for the new baseline
 - [ ] Refresh the README benchmark report block from the saved baseline data

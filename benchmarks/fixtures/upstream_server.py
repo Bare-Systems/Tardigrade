@@ -5,11 +5,13 @@ from __future__ import annotations
 import argparse
 import socket
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlsplit
 
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     PAYLOAD_64K = b"x" * (64 * 1024)
+    PAYLOAD_256K = b"y" * (256 * 1024)
 
     def setup(self) -> None:
         super().setup()
@@ -22,7 +24,11 @@ class Handler(BaseHTTPRequestHandler):
         self._handle(send_body=True)
 
     def _handle(self, *, send_body: bool) -> None:
-        if self.path == "/health":
+        parsed = urlsplit(self.path)
+        path = parsed.path
+        query = parse_qs(parsed.query)
+
+        if path == "/health":
             body = b"ok"
             self.send_response(200)
             self.send_header("Content-Type", "text/plain")
@@ -34,14 +40,28 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.flush()
             return
 
-        if self.path == "/payload-64k.bin":
+        if path == "/payload-64k.bin":
+            payload = self.PAYLOAD_64K
+            if query.get("size", [""])[0] == "256k":
+                payload = self.PAYLOAD_256K
             self.send_response(200)
             self.send_header("Content-Type", "application/octet-stream")
-            self.send_header("Content-Length", str(len(self.PAYLOAD_64K)))
+            self.send_header("Content-Length", str(len(payload)))
             self.send_header("Connection", "keep-alive")
             self.end_headers()
             if send_body:
-                self.wfile.write(self.PAYLOAD_64K)
+                self.wfile.write(payload)
+                self.wfile.flush()
+            return
+
+        if path == "/payload-256k.bin":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(len(self.PAYLOAD_256K)))
+            self.send_header("Connection", "keep-alive")
+            self.end_headers()
+            if send_body:
+                self.wfile.write(self.PAYLOAD_256K)
                 self.wfile.flush()
             return
 

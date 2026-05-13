@@ -146,11 +146,11 @@ Canonical benchmark runs are taken from the homelab perf target, not from a
 local laptop fallback run.
 
 <!-- BENCHMARK_REPORT_START -->
-| Scenario | req/s | p50 (ms) | p99 (ms) | Errors |
-| --- | ---: | ---: | ---: | ---: |
-| `keepalive` | 4700 | 0.4 | 41.8 | 0 |
-| `proxy-http1` | 1724 | 1.3 | 114.9 | 0 |
-| `static-http1` | 4586 | 0.4 | 46.1 | 0 |
+| Scenario | req/s | p50 (ms) | p99 (ms) | MB/s | Errors |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `keepalive` | 4700 | 0.4 | 41.8 | - | 0 |
+| `proxy-http1` | 1724 | 1.3 | 114.9 | - | 0 |
+| `static-http1` | 4586 | 0.4 | 46.1 | - | 0 |
 
 > **v0.32.0-18-gb44f8c1** · 2026-05-02 · tool: `wrk` · 4 connections · 30s per scenario · host: `127.0.0.1`
 > driver: `loopback (inside tardigrade-perf LXC)` · env: `release-baseline` · workers: `2` · config: `dedicated tardigrade-perf guest config`

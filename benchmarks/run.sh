@@ -208,10 +208,11 @@ echo "Using tool: $TOOL"
 RESULTS_JSON="{}"
 TOOL_HEADERS=()
 add_result() {
-    local scenario="$1" rps="$2" p50_ms="$3" p99_ms="$4" errors="$5"
-    RESULTS_JSON=$(jq --arg s "$scenario" --argjson rps "$rps" \
-        --argjson p50 "$p50_ms" --argjson p99 "$p99_ms" --argjson err "$errors" \
-        '.[$s] = {rps: $rps, p50_ms: $p50, p99_ms: $p99, errors: $err}' \
+    local scenario="$1" rps="$2" p50_ms="$3" p99_ms="$4" errors="$5" mbps="${6:-null}"
+    RESULTS_JSON=$(jq --arg s "$scenario" \
+        --argjson rps "$rps" --argjson p50 "$p50_ms" --argjson p99 "$p99_ms" \
+        --argjson err "$errors" --argjson mbps "$mbps" \
+        '.[$s] = {rps: $rps, p50_ms: $p50, p99_ms: $p99, errors: $err, throughput_mbps: $mbps}' \
         <<<"$RESULTS_JSON")
 }
 
@@ -242,8 +243,19 @@ run_wrk() {
     p99=$(echo "$raw" | awk '/99%/{v=$2; sub(/ms$/,"",v); sub(/us$/,"",v); if($2~/us/)v=v/1000; print v+0; exit}' || echo 0)
     errors=$(echo "$raw" | grep -E "Non-2xx" | grep -oE '[0-9]+' | head -1 || echo 0)
     rps=${rps:-0}; p50=${p50:-0}; p99=${p99:-0}; errors=${errors:-0}
-    echo "  $label — ${rps} req/s  p50=${p50}ms  p99=${p99}ms  errors=${errors}"
-    add_result "$label" "$rps" "$p50" "$p99" "$errors"
+    local tput_mbps
+    tput_mbps=$(echo "$raw" | awk '/^Transfer\/sec:/{
+        v=$2
+        if (v ~ /GB$/) { sub(/GB$/, "", v); printf "%.2f", v*1024; exit }
+        if (v ~ /MB$/) { sub(/MB$/, "", v); printf "%.2f", v; exit }
+        if (v ~ /KB$/) { sub(/KB$/, "", v); printf "%.2f", v/1024; exit }
+        if (v ~ /B$/)  { sub(/B$/, "", v);  printf "%.2f", v/1048576; exit }
+    }')
+    tput_mbps="${tput_mbps:-null}"
+    local tput_display=""
+    [[ "$tput_mbps" != "null" ]] && tput_display="  throughput=${tput_mbps}MB/s"
+    echo "  $label — ${rps} req/s  p50=${p50}ms  p99=${p99}ms  errors=${errors}${tput_display}"
+    add_result "$label" "$rps" "$p50" "$p99" "$errors" "$tput_mbps"
 }
 
 # ── h2load runner ─────────────────────────────────────────────────────────────
@@ -264,8 +276,18 @@ run_h2load() {
         awk '{printf "%.2f", $1/1000}' || echo 0)
     errors=$(echo "$raw" | grep -E "failed" | grep -oE '[0-9]+' | head -1 || echo 0)
     rps=${rps:-0}; p50=${p50:-0}; p99=${p99:-0}; errors=${errors:-0}
-    echo "  $label — ${rps} req/s  p50=${p50}ms  p99=${p99}ms  errors=${errors}"
-    add_result "$label" "$rps" "$p50" "$p99" "$errors"
+    local tput_mbps
+    tput_mbps=$(echo "$raw" | grep -E "^finished" | grep -oE '[0-9.]+[KMG]B/s' | awk '{
+        v=$1
+        if (v ~ /GB\/s$/) { sub(/GB\/s$/, "", v); printf "%.2f", v*1024; exit }
+        if (v ~ /MB\/s$/) { sub(/MB\/s$/, "", v); printf "%.2f", v; exit }
+        if (v ~ /KB\/s$/) { sub(/KB\/s$/, "", v); printf "%.2f", v/1024; exit }
+    }')
+    tput_mbps="${tput_mbps:-null}"
+    local tput_display=""
+    [[ "$tput_mbps" != "null" ]] && tput_display="  throughput=${tput_mbps}MB/s"
+    echo "  $label — ${rps} req/s  p50=${p50}ms  p99=${p99}ms  errors=${errors}${tput_display}"
+    add_result "$label" "$rps" "$p50" "$p99" "$errors" "$tput_mbps"
 }
 
 # ── h2load HTTP/3 runner ──────────────────────────────────────────────────────
@@ -296,8 +318,18 @@ run_h2load_h3() {
         awk '{printf "%.2f", $1/1000}' || echo 0)
     errors=$(echo "$raw" | grep -E "failed" | grep -oE '[0-9]+' | head -1 || echo 0)
     rps=${rps:-0}; p50=${p50:-0}; p99=${p99:-0}; errors=${errors:-0}
-    echo "  $label — ${rps} req/s  p50=${p50}ms  p99=${p99}ms  errors=${errors}"
-    add_result "$label" "$rps" "$p50" "$p99" "$errors"
+    local tput_mbps
+    tput_mbps=$(echo "$raw" | grep -E "^finished" | grep -oE '[0-9.]+[KMG]B/s' | awk '{
+        v=$1
+        if (v ~ /GB\/s$/) { sub(/GB\/s$/, "", v); printf "%.2f", v*1024; exit }
+        if (v ~ /MB\/s$/) { sub(/MB\/s$/, "", v); printf "%.2f", v; exit }
+        if (v ~ /KB\/s$/) { sub(/KB\/s$/, "", v); printf "%.2f", v/1024; exit }
+    }')
+    tput_mbps="${tput_mbps:-null}"
+    local tput_display=""
+    [[ "$tput_mbps" != "null" ]] && tput_display="  throughput=${tput_mbps}MB/s"
+    echo "  $label — ${rps} req/s  p50=${p50}ms  p99=${p99}ms  errors=${errors}${tput_display}"
+    add_result "$label" "$rps" "$p50" "$p99" "$errors" "$tput_mbps"
 }
 
 # ── fortio runner ─────────────────────────────────────────────────────────────
@@ -334,8 +366,13 @@ _k6_parse_summary() {
     # passes = count of http_req_failed=1 samples (i.e. actual failed requests)
     errors=$(jq -r '.metrics.http_req_failed.passes // 0' "$tmpfile")
     rps=${rps:-0}; p50=${p50:-0}; p99=${p99:-0}; errors=${errors:-0}
-    echo "  $label — ${rps} req/s  p50=${p50}ms  p99=${p99}ms  errors=${errors}"
-    add_result "$label" "$rps" "$p50" "$p99" "$errors"
+    local dr_rate tput_mbps
+    dr_rate=$(jq -r '.metrics.data_received.rate // 0' "$tmpfile" 2>/dev/null || echo 0)
+    tput_mbps=$(awk -v r="${dr_rate:-0}" 'BEGIN { if (r > 0) printf "%.2f", r/1048576; else print "null" }')
+    local tput_display=""
+    [[ "$tput_mbps" != "null" ]] && tput_display="  throughput=${tput_mbps}MB/s"
+    echo "  $label — ${rps} req/s  p50=${p50}ms  p99=${p99}ms  errors=${errors}${tput_display}"
+    add_result "$label" "$rps" "$p50" "$p99" "$errors" "$tput_mbps"
 }
 
 # ── k6 throughput runner ──────────────────────────────────────────────────────

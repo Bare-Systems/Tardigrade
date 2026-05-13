@@ -58,18 +58,24 @@ meta_conn=$(jq -r '._meta.connections // "?"'    "$RESULTS_FILE")
 # ── Build markdown table ──────────────────────────────────────────────────────
 build_table() {
     local header
-    header="| Scenario | req/s | p50 (ms) | p99 (ms) | Errors |"$'\n'
-    header+="| --- | ---: | ---: | ---: | ---: |"
+    header="| Scenario | req/s | p50 (ms) | p99 (ms) | MB/s | Errors |"$'\n'
+    header+="| --- | ---: | ---: | ---: | ---: | ---: |"
 
     local rows=""
     while IFS= read -r scenario; do
         [[ "$scenario" == "_meta" ]] && continue
-        local rps p50 p99 errors
-        rps=$(jq    -r --arg s "$scenario" '.[$s].rps    // 0' "$RESULTS_FILE" | awk '{printf "%\x27.0f", $1}')
-        p50=$(jq    -r --arg s "$scenario" '.[$s].p50_ms // 0' "$RESULTS_FILE" | awk '{printf "%.1f", $1}')
-        p99=$(jq    -r --arg s "$scenario" '.[$s].p99_ms // 0' "$RESULTS_FILE" | awk '{printf "%.1f", $1}')
-        errors=$(jq -r --arg s "$scenario" '.[$s].errors // 0' "$RESULTS_FILE")
-        rows+=$'\n'"| \`${scenario}\` | ${rps} | ${p50} | ${p99} | ${errors} |"
+        local rps p50 p99 errors tput tput_raw
+        rps=$(jq      -r --arg s "$scenario" '.[$s].rps    // 0' "$RESULTS_FILE" | awk '{printf "%\x27.0f", $1}')
+        p50=$(jq      -r --arg s "$scenario" '.[$s].p50_ms // 0' "$RESULTS_FILE" | awk '{printf "%.1f", $1}')
+        p99=$(jq      -r --arg s "$scenario" '.[$s].p99_ms // 0' "$RESULTS_FILE" | awk '{printf "%.1f", $1}')
+        errors=$(jq   -r --arg s "$scenario" '.[$s].errors // 0' "$RESULTS_FILE")
+        tput_raw=$(jq -r --arg s "$scenario" '.[$s].throughput_mbps // "null"' "$RESULTS_FILE")
+        if [[ "$tput_raw" == "null" ]]; then
+            tput="-"
+        else
+            tput=$(echo "$tput_raw" | awk '{printf "%.1f", $1}')
+        fi
+        rows+=$'\n'"| \`${scenario}\` | ${rps} | ${p50} | ${p99} | ${tput} | ${errors} |"
     done < <(jq -r 'keys[]' "$RESULTS_FILE" | sort)
 
     printf '%s%s\n' "$header" "$rows"

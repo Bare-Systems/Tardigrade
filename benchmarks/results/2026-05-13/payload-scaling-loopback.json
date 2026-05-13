@@ -1,0 +1,59 @@
+{
+  "proxy-http1": {
+    "rps": 7100.06,
+    "p50_ms": 0.27,
+    "p99_ms": 0.27897,
+    "errors": 0
+  },
+  "proxy-payload-64k": {
+    "rps": 3837.25,
+    "p50_ms": 0.474,
+    "p99_ms": 0.688,
+    "errors": 0
+  },
+  "proxy-payload-256k": {
+    "rps": 2636.37,
+    "p50_ms": 0.691,
+    "p99_ms": 1,
+    "errors": 0
+  },
+  "_meta": {
+    "tag": "unknown",
+    "timestamp": "2026-05-13T18:11:52Z",
+    "host": "127.0.0.1",
+    "port": "8069",
+    "tool": "wrk",
+    "duration_s": 30,
+    "connections": 2,
+    "host_header": "tardigrade-perf",
+    "driver": "loopback (inside tardigrade-perf LXC)",
+    "worker_count": 2,
+    "config_label": "dedicated tardigrade-perf guest config",
+    "zig_version": "unknown",
+    "environment": {
+      "os": "Linux",
+      "kernel": "6.17.13-2-pve",
+      "arch": "x86_64",
+      "cpu_model": "Intel(R) N150",
+      "cpu_threads": "2",
+      "memory_mb": "4096"
+    },
+    "static_path": "/health",
+    "proxy_path": "/proxy/health",
+    "keepalive_path": "/health",
+    "h2_path": "/health",
+    "h3_path": "/health",
+    "environment_name": "release-baseline",
+    "canonical_target": "beelink / tardigrade-perf (Proxmox LXC 102)",
+    "canonical_target_ip": "192.168.86.55",
+    "preferred_driver": "wrk inside tardigrade-perf LXC against 127.0.0.1",
+    "fallback_driver": "external network path only when explicitly requested",
+    "policy": "Capture one saved baseline JSON per release tag under benchmarks/baselines/, compare it to the previous release, and generate a markdown report before distribution.",
+    "routes": {
+      "static": "/health",
+      "proxy": "/proxy/health",
+      "proxy_payload_64k": "/proxy/payload-64k.bin",
+      "proxy_payload_256k": "/proxy/payload-256k.bin"
+    }
+  }
+}

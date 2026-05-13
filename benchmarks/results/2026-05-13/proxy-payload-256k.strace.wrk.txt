@@ -1,0 +1,9 @@
+Running 30s test @ http://127.0.0.1:8069/proxy/payload-256k.bin
+  2 threads and 2 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     1.22ms  210.52us   5.00ms   74.96%
+    Req/Sec   790.41     36.25   848.00     84.00%
+  47219 requests in 30.01s, 11.36GB read
+  Socket errors: connect 0, read 47219, write 0, timeout 0
+Requests/sec:   1573.42
+Transfer/sec:    387.64MB

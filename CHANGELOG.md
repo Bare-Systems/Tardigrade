@@ -5,11 +5,13 @@ All notable user-facing changes to Tardigrade are documented here.
 ## [Unreleased]
 
 ### Fixed
+- **Buffered proxy response size was coupled to inbound request parsing (#99)** — the plain HTTP/1 buffered proxy readers shared `MAX_REQUEST_SIZE` (`256 KiB`) with request parsing, so operators could not raise proxied response payload ceilings without also changing the parser constant in code. Added `TARDIGRADE_MAX_BUFFERED_UPSTREAM_RESPONSE_BYTES` (default `262144`) as a dedicated buffered-upstream limit, switched the HTTP/1 proxy readers to use it, and made oversized upstream bodies fail deterministically with a stable `502` path instead of relying on truncated partial reads. Added config validation, 1 unit test, and 3 integration tests. Closes #99.
 - **CSP and X-Frame-Options missing from API-preset responses (#96)** — `SecurityHeaders.api` explicitly zeroed `content_security_policy` and `x_frame_options`, so any response rendered through the API preset (proxy pass, versioned API routes, error replies) silently omitted `Content-Security-Policy` and `X-Frame-Options`. Removed the overrides so `api` is now identical to `default`: every response carries `Content-Security-Policy: default-src 'self'` and `X-Frame-Options: DENY`. Operators who genuinely need a looser policy can override individual fields in config. Updated 1 unit test. Closes #96.
 - **Server header disclosed version string (#97)** — All 5 `Server` header emission sites in `edge_gateway.zig` and both sites in `response.zig` emitted `Server: tardigrade/<version>`, leaking the precise release tag to unauthenticated clients. Removed the version suffix; header now reads `Server: tardigrade`. Updated 2 unit tests. Closes #97.
 
 ### Added
 - Blink verify tests TC-TARDIGRADE-005/006/007 — `security-header-csp`, `security-header-x-frame-options`, and `security-header-server-no-version` confirm that CSP, X-Frame-Options, and a version-free Server header are present on every deploy.
+- Payload-size benchmark coverage for the canonical perf flow — `benchmarks/run.sh` now supports `proxy-payload-64k` and `proxy-payload-256k` scenarios plus path overrides, `benchmarks/release-baseline.sh` includes those scenarios by default unless overridden, and `benchmarks/fixtures/upstream_server.py` now serves both fixture payload sizes. The `256 KiB` case rides the existing exact-match guest route via `/proxy/payload-64k.bin?size=256k`, which keeps the canonical homelab target compatible without depending on extra out-of-repo location blocks. Larger payload benchmarks can now raise `TARDIGRADE_MAX_BUFFERED_UPSTREAM_RESPONSE_BYTES` on the perf target instead of depending on the inbound request parser constant.
 
 ## [0.3.0] - 2026-05-11
 

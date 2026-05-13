@@ -74,6 +74,13 @@ fn proxyScopeForPath(path: []const u8) UpstreamScope {
     return .global;
 }
 
+fn maxBufferedUpstreamResponseBytes(cfg: *const edge_config.EdgeConfig) usize {
+    return if (cfg.max_buffered_upstream_response_bytes > 0)
+        cfg.max_buffered_upstream_response_bytes
+    else
+        MAX_REQUEST_SIZE;
+}
+
 const UpstreamPoolView = struct {
     fallback_url: []const u8,
     primary_urls: []const []const u8,
@@ -5067,6 +5074,7 @@ fn handleLocationProxyPass(
             executeRawHttpProxyRequest(
                 allocator,
                 &state.upstream_client,
+                cfg,
                 upstream_url.value,
                 resolved.unix_socket_path,
                 method_str,
@@ -5240,6 +5248,7 @@ fn executeUnixSocketHttpRequest(
     extra_headers: []const std.http.Header,
     body: []const u8,
     content_type_override: ?[]const u8,
+    max_buffered_response_bytes: usize,
     timeout_ms: u32,
 ) !RawUpstreamResponse {
     var stream = try compat.connectUnixSocket(socket_path);
@@ -5285,7 +5294,7 @@ fn executeUnixSocketHttpRequest(
         const n = try stream.read(&read_buf);
         if (n == 0) break;
         try resp_raw.appendSlice(read_buf[0..n]);
-        if (resp_raw.items.len > MAX_REQUEST_SIZE) break;
+        if (resp_raw.items.len > max_buffered_response_bytes) return error.StreamTooLong;
     }
 
     return parseRawUpstreamResponse(allocator, resp_raw.items);
@@ -5347,6 +5356,7 @@ fn upstreamReasonPhrase(status: std.http.Status) []const u8 {
 fn executeRawHttpProxyRequest(
     allocator: std.mem.Allocator,
     client: *std.http.Client,
+    cfg: *const edge_config.EdgeConfig,
     url: []const u8,
     unix_socket_path: ?[]const u8,
     method: []const u8,
@@ -5364,6 +5374,7 @@ fn executeRawHttpProxyRequest(
     connect_timeout_ms: u32,
 ) !RawUpstreamResponse {
     const proxy_extra_header_slack = 10;
+    const max_buffered_response_bytes = maxBufferedUpstreamResponseBytes(cfg);
     var extra_headers_stack = std.heap.stackFallback(2048, allocator);
     const extra_headers_allocator = extra_headers_stack.get();
     const method_enum = std.meta.stringToEnum(std.http.Method, method) orelse return error.UnsupportedHttpMethod;
@@ -5407,6 +5418,7 @@ fn executeRawHttpProxyRequest(
             extra_headers.items,
             body,
             null,
+            max_buffered_response_bytes,
             effective_timeout_ms,
         );
     }
@@ -5446,13 +5458,13 @@ fn executeRawHttpProxyRequest(
     var body_buf: [8192]u8 = undefined;
     var body_reader = resp.reader(&body_buf);
     const body_data = if (resp.head.content_length) |content_length| blk: {
-        if (content_length > MAX_REQUEST_SIZE) return error.StreamTooLong;
+        if (content_length > max_buffered_response_bytes) return error.StreamTooLong;
         const exact_len: usize = @intCast(content_length);
         var body_list: std.ArrayList(u8) = .empty;
         defer body_list.deinit(allocator);
         try body_reader.appendExact(allocator, &body_list, exact_len);
         break :blk try body_list.toOwnedSlice(allocator);
-    } else try body_reader.allocRemaining(allocator, .limited(MAX_REQUEST_SIZE));
+    } else try body_reader.allocRemaining(allocator, .limited(max_buffered_response_bytes));
     errdefer allocator.free(body_data);
 
     return .{
@@ -5483,6 +5495,7 @@ fn executeUpstreamHttpsWithMtls(
     auth_scopes: ?[]const u8,
     cfg: *const edge_config.EdgeConfig,
 ) !RawUpstreamResponse {
+    const max_buffered_response_bytes = maxBufferedUpstreamResponseBytes(cfg);
     const uri = try std.Uri.parse(url);
     const host = if (uri.host) |h| switch (h) {
         .raw => |r| r,
@@ -5551,7 +5564,7 @@ fn executeUpstreamHttpsWithMtls(
         const n = tls_conn.read(&read_buf) catch 0;
         if (n == 0) break;
         try resp_raw.appendSlice(read_buf[0..n]);
-        if (resp_raw.items.len > MAX_REQUEST_SIZE) break;
+        if (resp_raw.items.len > max_buffered_response_bytes) return error.StreamTooLong;
     }
     return parseRawUpstreamResponse(allocator, resp_raw.items);
 }
@@ -7370,6 +7383,7 @@ fn handleHttp3LocationProxyPass(
         try executeRawHttpProxyRequest(
             allocator,
             &ctx.state.upstream_client,
+            ctx.cfg,
             upstream_url.value,
             resolved.unix_socket_path,
             request.method,
@@ -8726,6 +8740,7 @@ fn proxyJsonExecuteSingleAttempt(
             extra_headers.items,
             payload,
             "application/json",
+            if (cfg.max_connection_memory_bytes > 0) cfg.max_connection_memory_bytes else 2 * 1024 * 1024,
             attempt_timeout_ms,
         );
         defer raw_resp.deinit(allocator);

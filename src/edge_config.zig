@@ -321,6 +321,8 @@ pub const EdgeConfig = struct {
     connection_pool_size: usize,
     /// Maximum in-memory bytes retained per active connection (0 = unlimited).
     max_connection_memory_bytes: usize,
+    /// Maximum buffered bytes accepted from an upstream HTTP response body.
+    max_buffered_upstream_response_bytes: usize,
     /// Maximum estimated total connection memory across active clients (0 = unlimited).
     max_total_connection_memory_bytes: usize,
     /// Whether to stream all upstream statuses directly (including non-200) instead of mapping.
@@ -1049,6 +1051,10 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     defer allocator.free(max_conn_mem_str);
     const max_connection_memory_bytes = std.fmt.parseInt(usize, max_conn_mem_str, 10) catch 2 * 1024 * 1024;
 
+    const max_buffered_upstream_resp_str = envOrDefault(allocator, "TARDIGRADE_MAX_BUFFERED_UPSTREAM_RESPONSE_BYTES", "262144") catch unreachable;
+    defer allocator.free(max_buffered_upstream_resp_str);
+    const max_buffered_upstream_response_bytes = std.fmt.parseInt(usize, max_buffered_upstream_resp_str, 10) catch 256 * 1024;
+
     const max_total_conn_mem_str = envOrDefault(allocator, "TARDIGRADE_MAX_TOTAL_CONNECTION_MEMORY_BYTES", "0") catch unreachable;
     defer allocator.free(max_total_conn_mem_str);
     const max_total_connection_memory_bytes = std.fmt.parseInt(usize, max_total_conn_mem_str, 10) catch 0;
@@ -1402,6 +1408,7 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .max_requests_per_connection = max_requests_per_connection,
         .connection_pool_size = connection_pool_size,
         .max_connection_memory_bytes = max_connection_memory_bytes,
+        .max_buffered_upstream_response_bytes = max_buffered_upstream_response_bytes,
         .max_total_connection_memory_bytes = max_total_connection_memory_bytes,
         .proxy_stream_all_statuses = proxy_stream_all_statuses,
         .upstream_retry_attempts = upstream_retry_attempts,
@@ -2406,6 +2413,10 @@ pub fn validate(cfg: *const EdgeConfig) !void {
         std.log.err("config validation failed: TARDIGRADE_UPSTREAM_RETRY_ATTEMPTS must be at least 1", .{});
         return error.InvalidConfigValue;
     };
+    validateBufferedUpstreamResponseLimit(cfg.max_buffered_upstream_response_bytes) catch {
+        std.log.err("config validation failed: TARDIGRADE_MAX_BUFFERED_UPSTREAM_RESPONSE_BYTES must be at least 1", .{});
+        return error.InvalidConfigValue;
+    };
 }
 
 fn validateTlsCertKeyPair(cert_path: []const u8, key_path: []const u8) !void {
@@ -2426,6 +2437,10 @@ fn validateBrotliQuality(quality: u32) !void {
 
 fn validateUpstreamRetryAttempts(attempts: u32) !void {
     if (attempts == 0) return error.InvalidConfigValue;
+}
+
+fn validateBufferedUpstreamResponseLimit(limit: usize) !void {
+    if (limit == 0) return error.InvalidConfigValue;
 }
 
 /// Emit log warnings for configurations that are valid but operationally risky.
@@ -2972,4 +2987,10 @@ test "validate upstream retry attempts rejects zero" {
     try validateUpstreamRetryAttempts(1);
     try validateUpstreamRetryAttempts(3);
     try std.testing.expectError(error.InvalidConfigValue, validateUpstreamRetryAttempts(0));
+}
+
+test "validate buffered upstream response limit rejects zero" {
+    try validateBufferedUpstreamResponseLimit(256 * 1024);
+    try validateBufferedUpstreamResponseLimit(1024 * 1024);
+    try std.testing.expectError(error.InvalidConfigValue, validateBufferedUpstreamResponseLimit(0));
 }

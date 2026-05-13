@@ -73,6 +73,10 @@ location = /health {
 
 When proxying, Tardigrade strips hop-by-hop request headers, including headers
 named by the incoming `Connection` header, before forwarding requests upstream.
+Buffered upstream response bodies use a dedicated limit controlled by
+`TARDIGRADE_MAX_BUFFERED_UPSTREAM_RESPONSE_BYTES` (default `262144`), so
+operators can raise proxy payload ceilings without changing inbound request
+parsing limits.
 
 Static file requests are percent-decoded and normalized before filesystem
 access. Traversal attempts and symlink escapes outside the configured root are

@@ -1338,7 +1338,8 @@ fn handleUpstreamConnection(server: *UpstreamServer, conn: compat.NetConnection)
     for (response_spec.headers) |header| {
         try conn.stream.writer().print("{s}: {s}\r\n", .{ header.name, header.value });
     }
-    try conn.stream.writer().print("\r\n{s}", .{response_spec.body});
+    try conn.stream.writer().writeAll("\r\n");
+    try conn.stream.writer().writeAll(response_spec.body);
 }
 
 fn handleFastCgiConnection(server: *FastCgiServer, conn: compat.NetConnection) !void {
@@ -1777,6 +1778,12 @@ fn readHttpResponse(allocator: std.mem.Allocator, stream: compat.NetStream) !Htt
                     target_len = idx + 4 + content_length;
                 }
             }
+        }
+    }
+
+    if (target_len) |needed| {
+        if (raw_buf.items.len > needed) {
+            raw_buf.shrinkRetainingCapacity(needed);
         }
     }
 
@@ -2989,6 +2996,129 @@ test "proxy requests strip hop-by-hop headers before reaching upstreams" {
     try std.testing.expect(upstream.capturedHeader("X-Another-Hop") == null);
     try std.testing.expectEqualStrings("integration-client/1.0", upstream.capturedHeader("User-Agent").?);
     try std.testing.expectEqualStrings("still-here", upstream.capturedHeader("X-Custom-Pass").?);
+}
+
+test "proxy buffered response limit can exceed request parser cap" {
+    const allocator = std.testing.allocator;
+    const payload_len = 300 * 1024;
+    const payload = try allocator.alloc(u8, payload_len);
+    defer allocator.free(payload);
+    @memset(payload, 'x');
+
+    var upstream = try UpstreamServer.start(allocator, &.{.{
+        .body = payload,
+        .headers = &.{.{ .name = "Content-Type", .value = "application/octet-stream" }},
+    }});
+    defer upstream.stop();
+    try upstream.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location /proxy/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+    , .{ test_host, upstream.port() });
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_MAX_BUFFERED_UPSTREAM_RESPONSE_BYTES", .value = "393216" },
+        },
+    });
+    defer tardigrade.stop();
+
+    var response = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/proxy/payload.bin",
+        .body = null,
+        .headers = &.{},
+    });
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status_code);
+    try std.testing.expectEqual(@as(usize, payload_len), response.body.len);
+    try std.testing.expectEqualStrings(payload, response.body);
+    try std.testing.expectEqual(@as(u32, 1), upstream.requestCount());
+}
+
+test "proxy buffered response limit returns stable 502 when upstream body exceeds cap" {
+    const allocator = std.testing.allocator;
+    const payload_len = 300 * 1024;
+    const payload = try allocator.alloc(u8, payload_len);
+    defer allocator.free(payload);
+    @memset(payload, 'y');
+
+    var upstream = try UpstreamServer.start(allocator, &.{.{
+        .body = payload,
+        .headers = &.{.{ .name = "Content-Type", .value = "application/octet-stream" }},
+    }});
+    defer upstream.stop();
+    try upstream.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location /proxy/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+    , .{ test_host, upstream.port() });
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_MAX_BUFFERED_UPSTREAM_RESPONSE_BYTES", .value = "131072" },
+        },
+    });
+    defer tardigrade.stop();
+
+    var response = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/proxy/payload.bin",
+        .body = null,
+        .headers = &.{},
+    });
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 502), response.status_code);
+    try std.testing.expectEqual(@as(u32, 1), upstream.requestCount());
+}
+
+test "raising proxy buffered response limit does not relax request parsing" {
+    const allocator = std.testing.allocator;
+
+    var upstream = try UpstreamServer.start(allocator, &.{.{
+        .body = "{\"ok\":true}",
+        .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
+    }});
+    defer upstream.stop();
+    try upstream.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location /proxy/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+    , .{ test_host, upstream.port() });
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_MAX_BUFFERED_UPSTREAM_RESPONSE_BYTES", .value = "393216" },
+        },
+    });
+    defer tardigrade.stop();
+
+    const oversized_path_len = 270 * 1024;
+    const oversized_path = try allocator.alloc(u8, oversized_path_len);
+    defer allocator.free(oversized_path);
+    oversized_path[0] = '/';
+    for (oversized_path[1..]) |*byte| byte.* = 'a';
+
+    var raw_request = std.array_list.Managed(u8).init(allocator);
+    defer raw_request.deinit();
+    try raw_request.print("GET {s} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", .{oversized_path});
+
+    var response = try sendRawRequest(allocator, tardigrade.port, raw_request.items);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 400), response.status_code);
+    try std.testing.expectEqual(@as(u32, 0), upstream.requestCount());
 }
 
 test "parser abuse requests are rejected before reaching upstreams" {

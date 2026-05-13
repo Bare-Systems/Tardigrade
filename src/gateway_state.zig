@@ -33,14 +33,14 @@ pub const Http2PendingStream = struct {
     body: std.array_list.Managed(u8),
     priority_weight: u8 = 16,
 
-    fn init(allocator: std.mem.Allocator) Http2PendingStream {
+    pub fn init(allocator: std.mem.Allocator) Http2PendingStream {
         return .{
             .headers = http.Headers.init(allocator),
             .body = std.array_list.Managed(u8).init(allocator),
         };
     }
 
-    fn deinit(self: *Http2PendingStream, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *Http2PendingStream, allocator: std.mem.Allocator) void {
         if (self.method) |m| allocator.free(m);
         if (self.path) |p| allocator.free(p);
         self.headers.deinit();
@@ -2184,7 +2184,7 @@ pub const WorkerContext = struct {
     tls: ?*http.tls_termination.TlsTerminator,
     session_pool: *ConnectionSessionPool,
 
-    fn acquireConfig(self: *WorkerContext) ConfigLease {
+    pub fn acquireConfig(self: *WorkerContext) ConfigLease {
         return self.config_store.acquire();
     }
 };
@@ -2200,7 +2200,7 @@ pub const ConfigLease = struct {
     version: *ManagedConfigVersion,
     cfg: *const edge_config.EdgeConfig,
 
-    fn release(self: *ConfigLease) void {
+    pub fn release(self: *ConfigLease) void {
         self.store.release(self.version);
         self.* = undefined;
     }

@@ -305,7 +305,8 @@ test "transcript store redacts explicit bearer values and jwt-looking tokens" {
     defer allocator.free(tmp_abs);
     const path = try std.fmt.allocPrint(allocator, "{s}/transcripts.ndjson", .{tmp_abs});
     defer allocator.free(path);
-    const jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyLTQyIn0.c2lnbmF0dXJl";
+    // alg:none — unsigned synthetic token, not a real secret
+    const jwt = "eyJhbGciOiJub25lIn0.eyJzdWIiOiJ1c2VyLTQyIn0.dGVzdA";
 
     try append(allocator, path, .{
         .ts_ms = 1,

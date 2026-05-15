@@ -128,7 +128,7 @@ pub fn execute(
 }
 
 pub fn connect(allocator: std.mem.Allocator, endpoint: []const u8) !compat.NetStream {
-    if (unixSocketPath(endpoint)) |path| return compat.connectUnixSocket(path) catch unreachable;
+    if (unixSocketPath(endpoint)) |path| return compat.connectUnixSocket(path);
     const ep = try memcached.parseEndpoint(endpoint);
     return compat.tcpConnectToHost(allocator, ep.host, ep.port);
 }

@@ -7,8 +7,9 @@ URL:            https://github.com/Bare-Systems/Tardigrade
 Source0:        tardigrade
 Source1:        tardigrade.service
 Source2:        tardigrade.env
+Source3:        LICENSE
 
-BuildArch:      x86_64
+BuildArch:      %{build_arch}
 Requires:       openssl-libs
 
 %description
@@ -19,6 +20,7 @@ reverse proxying, protocol bridging, and realtime event transport.
 install -D -m 0755 %{SOURCE0} %{buildroot}%{_bindir}/tardigrade
 install -D -m 0644 %{SOURCE1} %{buildroot}%{_unitdir}/tardigrade.service
 install -D -m 0640 %{SOURCE2} %{buildroot}%{_sysconfdir}/tardigrade/tardigrade.env
+install -D -m 0644 %{SOURCE3} %{buildroot}%{_datadir}/licenses/%{name}/LICENSE
 install -d %{buildroot}%{_localstatedir}/log/tardigrade
 
 %pre
@@ -40,7 +42,7 @@ exit 0
 exit 0
 
 %files
-%license LICENSE
+%{_datadir}/licenses/%{name}/LICENSE
 %{_bindir}/tardigrade
 %{_unitdir}/tardigrade.service
 %config(noreplace) %{_sysconfdir}/tardigrade/tardigrade.env

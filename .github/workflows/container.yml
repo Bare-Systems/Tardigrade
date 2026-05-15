@@ -10,7 +10,6 @@ on:
 
 permissions:
   contents: read
-  packages: write
 
 jobs:
   # ── Build per-arch image ───────────────────────────────────────────────────────
@@ -20,6 +19,8 @@ jobs:
     name: Build image (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
+    permissions:
+      packages: write
     strategy:
       fail-fast: false
       matrix:
@@ -107,6 +108,8 @@ jobs:
     name: Merge multi-arch manifest
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      packages: write
     needs: build-image
 
     steps:

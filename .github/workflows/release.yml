@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release-main
@@ -24,6 +24,8 @@ jobs:
     if: >-
       github.event_name == 'workflow_dispatch' ||
       github.event.workflow_run.conclusion == 'success'
+    permissions:
+      contents: write
 
     outputs:
       tag: ${{ steps.meta.outputs.tag }}
@@ -74,7 +76,6 @@ jobs:
     if: needs.prepare-release.result == 'success' && needs.prepare-release.outputs.should_publish == 'true'
     runs-on: ${{ matrix.os }}
     permissions:
-      contents: write
       id-token: write
       attestations: write
     strategy:
@@ -276,6 +277,8 @@ jobs:
       - build-rpm
     if: needs.prepare-release.result == 'success' && needs.prepare-release.outputs.should_publish == 'true'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout

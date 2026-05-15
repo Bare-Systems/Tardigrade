@@ -31,4 +31,4 @@ zig build test-integration
 
 ## Benchmarks
 
-Run benchmarks on the `tardigrade-perf` homelab guest against `127.0.0.1` for canonical numbers. Label any local fallback runs as non-canonical.
+Run benchmarks on a dedicated benchmark target against `127.0.0.1` for canonical numbers. Label any local fallback runs as non-canonical.

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Capture a release baseline JSON, optionally compare it to the previous saved
-# baseline, and emit a markdown report. Intended for the homelab perf target;
-# do not substitute a laptop-local run unless the homelab is unavailable.
+# baseline, and emit a markdown report. Intended for a dedicated benchmark target;
+# do not substitute a laptop-local run unless a dedicated target is unavailable.
 
 set -euo pipefail
 

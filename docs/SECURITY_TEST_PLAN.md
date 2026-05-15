@@ -87,7 +87,7 @@ Do not ship a wider public distribution unless all of the following are true:
 - Security replay and fuzz-style runs are manual today; moving them into
   scheduled CI or nightly automation remains follow-up work.
 
-### Gaps Identified in Pass 8 (2026-05-10, tardigrade-perf)
+### Open Gaps
 
 **F-01 — HTTP method enforcement (WSTG-CONF-06, ASVS-13.2.1)**
 All HTTP verbs accepted on direct routes (`location = /health`). No gateway-level
@@ -111,16 +111,15 @@ response and access log. Enables log poisoning and trace-ID spoofing. Fix:
 validate format against `^tg-[0-9]+-[0-9a-f]+$` or always generate fresh IDs
 ignoring client input; sanitize log values for non-printable characters.
 
-**F-05 — TLS pass still pending**
-The homelab edge at `192.168.86.53:8443` (Tardigrade with real TLS) has not yet
-been probed with `tls_scan`. Run a dedicated TLS engagement against that surface.
+**F-05 — TLS surface pass still pending**
+A dedicated TLS engagement against a Tardigrade instance with real TLS has not
+yet been completed with `tls_scan`. Run against an isolated lab target.
 
 **F-06 — Auth enforcement pass still pending**
-`/bearclaw/v1/*` requires Bearer per blink.toml verify tests. Auth bypass,
-malformed bearer, token replay, and method-change bypass have not been probed
-against the live edge.
+Bearer auth bypass, malformed bearer, token replay, and method-change bypass
+have not been probed against a live edge with auth configured.
 
 **F-07 — Static file serving via catch-all `location /` non-functional**
-Files in `/opt/tardigrade/public` return 404 despite `root` directive in
+Files in a configured `doc_root` return 404 despite `root` directive in
 `location /`. Investigate whether this is a static-serving bug or intentional;
 add integration test for static root fallback.

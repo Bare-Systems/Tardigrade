@@ -4,14 +4,14 @@ Repeatable benchmark and regression harness for Tardigrade.
 
 ## Default Policy
 
-Run benchmarks on the dedicated homelab perf target by default.
+Run benchmarks on a dedicated, isolated benchmark target by default.
 
-- Canonical benchmark, regression, and release-baseline runs belong on
-  `tardigrade-perf`.
-- Run the load driver inside `tardigrade-perf` against `127.0.0.1` for
-  published numbers.
-- Only run benchmarks on the local laptop when explicitly requested or when the
-  homelab target is unavailable.
+- Canonical benchmark, regression, and release-baseline runs belong on a stable
+  benchmark target, not a shared laptop or CI runner.
+- Run the load driver on the same host as Tardigrade against `127.0.0.1` for
+  published numbers (eliminates network noise).
+- Only run benchmarks on a local laptop when explicitly requested or when a
+  dedicated target is unavailable.
 - Treat any laptop-local run as fallback data, not as the canonical performance
   result.
 
@@ -23,12 +23,11 @@ Run benchmarks on the dedicated homelab perf target by default.
   --meta-file benchmarks/targets/release-baseline.json \
   --update-readme README.md \
   -- \
-  --host 192.168.86.55 \
-  --host-header tardigrade-perf \
+  --host 127.0.0.1 \
   --proxy-path /proxy/health
 
 # Fallback only: local/shared-runner smoke test
-# Use this only when explicitly requested or when the homelab target is unavailable.
+# Use this only when explicitly requested or when a dedicated target is unavailable.
 ./benchmarks/ci-smoke.sh
 ```
 
@@ -159,10 +158,10 @@ Two things commonly invalidate a run if you miss them:
 Examples:
 
 ```bash
-# Named vhost on a remote IP
+# Named vhost target
 ./benchmarks/run.sh \
-  --host 192.168.86.55 \
-  --host-header tardigrade-perf \
+  --host benchmark-target.example.test \
+  --host-header benchmark-target \
   --static-path /health \
   --proxy-path /proxy/health
 
@@ -172,7 +171,7 @@ Examples:
   --port 443 \
   --tls \
   --tool h2load \
-  --proxy-path /bearclaw/health
+  --proxy-path /proxy/health
 
 # HTTP/2 and HTTP/3 static + proxy over TLS (h2load with QUIC support required for HTTP/3)
 ./benchmarks/run.sh \
@@ -185,135 +184,6 @@ Examples:
   --static-path /health \
   --proxy-path /proxy/health
 ```
-
-## Remote perf target
-
-The current homelab perf target lives on the Proxmox node reachable as `ssh proxmox`.
-
-Current staged shape:
-
-- Proxmox node: `beelink`
-- LXC guest: `102 (tardigrade-perf)`
-- Guest IP: `192.168.86.55`
-- Tardigrade service: `tardigrade-perf.service`
-- Stub upstream service: `tardigrade-upstream.service`
-  It runs `benchmarks/fixtures/upstream_server.py` in HTTP/1.1 keep-alive mode, not `python -m http.server`, so proxy benchmarks measure Tardigrade rather than one upstream TCP connect per request.
-- Benchmark routes:
-  - `/health` → direct edge return
-  - `/proxy/health` → proxied loopback upstream
-  - `/proxy/payload-64k.bin` → proxied 64 KiB payload
-  - `/proxy/payload-256k.bin` → proxied 256 KiB payload
-
-### Official release baseline environment
-
-The canonical release target is the `tardigrade-perf` guest:
-
-- Proxmox node: `beelink`
-- Guest: `LXC 102`
-- Guest name: `tardigrade-perf`
-- Default worker count: `2`
-- Canonical load driver: `wrk` running inside the guest against `127.0.0.1`
-- Fallback external path: Jetson or laptop only when you explicitly need that network measurement
-
-Use guest-local loopback runs for canonical performance because they remove
-Wi-Fi and LAN noise entirely. Use Jetson or laptop runs only when you
-specifically want to measure an external network path.
-
-### Verify the staged target
-
-```bash
-ssh proxmox 'pct list'
-ssh proxmox 'pct exec 102 -- systemctl status --no-pager tardigrade-perf tardigrade-upstream'
-curl -i http://192.168.86.55:8069/health
-curl -i http://192.168.86.55:8069/proxy/health
-```
-
-### Rebuild the staged target
-
-```bash
-ssh proxmox 'pct exec 102 -- bash -lc "
-  cd /opt/tardigrade-src &&
-  git pull &&
-  /opt/zig/zig build -Doptimize=ReleaseFast &&
-  systemctl restart tardigrade-perf &&
-  systemctl --no-pager --lines=20 status tardigrade-perf
-"'
-```
-
-### Fallback: run from this laptop only when explicitly requested or when the homelab target is unavailable
-
-```bash
-./benchmarks/run.sh \
-  --host 192.168.86.55 \
-  --port 8069 \
-  --tool k6 \
-  --duration 30 \
-  --connections 50 \
-  --static-path /health \
-  --proxy-path /proxy/health \
-  --keepalive-path /health \
-  --save benchmarks/baselines/$(date +%Y%m%d)-homelab.json
-```
-
-If the perf guest is switched to a config that declares `server_name tardigrade-perf;`, add `--host-header tardigrade-perf` to every benchmark command.
-This laptop path is fallback-only and should not replace the normal homelab run policy.
-
-### Canonical run: inside the container (loopback)
-
-Running `wrk` inside the perf LXC against `127.0.0.1` eliminates all network RTT.
-This is the only setup that reveals Tardigrade's actual per-request processing cost.
-
-```bash
-ssh proxmox 'pct exec 102 -- bash -c "
-  wrk -t2 -c4 -d30s -L http://127.0.0.1:8069/health
-  wrk -t2 -c4 -d30s -L http://127.0.0.1:8069/proxy/health
-  wrk -t2 -c2 -d30s -L http://127.0.0.1:8069/proxy/payload-64k.bin
-"'
-```
-
-Keep connections at or near the worker count (`workers=2` by default on a 2-core LXC)
-to avoid queue-saturation inflating p99. The p50 is the honest latency signal.
-
-The default `release-baseline.sh` flow now includes:
-
-- `static-http1`
-- `proxy-http1`
-- `proxy-payload-64k`
-- `proxy-payload-256k`
-- `keepalive`
-
-### Optional: run from the Jetson only when you explicitly want a network-path measurement
-
-The Jetson Orin Nano (`ssh jetson`) is a separate LAN machine with `wrk` built at
-`~/tools/wrk/wrk`. This path includes real network effects and is not the
-canonical release-baseline path.
-
-Use `benchmarks/jetson-run.sh` — it SSHes to the Jetson for each `wrk` invocation
-and parses/saves results locally in the same JSON format as `run.sh`:
-
-```bash
-./benchmarks/jetson-run.sh \
-  --host 192.168.86.55 \
-  --port 8069 \
-  --duration 30 \
-  --connections 50 \
-  --save benchmarks/results/$(date +%Y-%m-%d)/jetson-wrk.json
-```
-
-To compare against a previous run:
-
-```bash
-./benchmarks/jetson-run.sh \
-  --host 192.168.86.55 \
-  --port 8069 \
-  --duration 30 \
-  --connections 50 \
-  --baseline benchmarks/results/2026-05-02/jetson-wrk.json \
-  --save benchmarks/results/$(date +%Y-%m-%d)/jetson-wrk.json
-```
-
-`jetson-run.sh` supports: `static-http1`, `proxy-http1`, `keepalive`. For HTTP/2,
-behavioral (k6), or reload-under-load scenarios, use `run.sh` directly.
 
 ## Generating a report
 

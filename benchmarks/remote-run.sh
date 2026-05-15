@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# Run Tardigrade benchmarks using wrk on the Jetson Orin Nano (external load driver).
+# Run Tardigrade benchmarks using wrk on a remote load-driver host via SSH.
 #
-# The Jetson is a separate LAN machine, so measurements are not contaminated by
+# The remote host is a separate machine, so measurements are not contaminated by
 # sharing physical CPU/RAM/scheduler with the Tardigrade process under test.
 #
 # Usage:
-#   ./benchmarks/jetson-run.sh [OPTIONS]
+#   ./benchmarks/remote-run.sh [OPTIONS]
 #
 # Options:
-#   --host HOST           Target Tardigrade host (default: 192.168.86.55)
+#   --host HOST           Target Tardigrade host (default: 127.0.0.1)
 #   --port PORT           Target port (default: 8069)
 #   --host-header NAME    Override the HTTP Host header
 #   --worker-count N      Tardigrade worker count recorded in metadata
@@ -23,17 +23,17 @@
 #   --save FILE           Write results JSON to this file
 #   --baseline FILE       Compare results against a baseline JSON file
 #   --threshold PCT       Regression threshold percentage (default: 10)
-#   --jetson SSH_HOST     SSH target for the Jetson (default: jetson)
-#   --wrk-path PATH       Path to wrk binary on the Jetson (default: ~/tools/wrk/wrk)
+#   --remote SSH_HOST     SSH target for the remote runner (default: remote-runner)
+#   --wrk-path PATH       Path to wrk binary on the remote host (default: wrk)
 #   --meta-file FILE      Merge extra JSON metadata into _meta
 #   --help                Show this message and exit
 #
 # Prerequisites (local machine):
-#   ssh access to the Jetson (SSH host alias "jetson" or --jetson override)
+#   ssh access to the remote runner (SSH host alias or --remote override)
 #   jq (for result formatting and baseline comparison)
 #
-# Prerequisites (Jetson):
-#   wrk built at ~/tools/wrk/wrk (or --wrk-path override)
+# Prerequisites (remote host):
+#   wrk installed and on PATH (or --wrk-path override)
 #   Network access to the target host/port
 #
 # Result layout:
@@ -43,7 +43,7 @@
 set -euo pipefail
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
-TARGET_HOST="192.168.86.55"
+TARGET_HOST="127.0.0.1"
 TARGET_PORT="8069"
 HOST_HEADER=""
 WORKER_COUNT=""
@@ -58,8 +58,8 @@ SCENARIOS="static-http1,proxy-http1,keepalive"
 SAVE_FILE=""
 BASELINE_FILE=""
 REGRESSION_THRESHOLD=10
-JETSON_HOST="jetson"
-WRK_PATH="~/tools/wrk/wrk"
+REMOTE_HOST="remote-runner"
+WRK_PATH="wrk"
 META_FILE=""
 
 # ── Arg parsing ───────────────────────────────────────────────────────────────
@@ -80,7 +80,6 @@ while [[ $# -gt 0 ]]; do
         --save)           SAVE_FILE="$2";             shift 2 ;;
         --baseline)       BASELINE_FILE="$2";         shift 2 ;;
         --threshold)      REGRESSION_THRESHOLD="$2";  shift 2 ;;
-        --jetson)         JETSON_HOST="$2";           shift 2 ;;
         --wrk-path)       WRK_PATH="$2";              shift 2 ;;
         --meta-file)      META_FILE="$2";             shift 2 ;;
         --help)           sed -n '/^# Usage/,/^[^#]/p' "$0" | head -n -1; exit 0 ;;
@@ -91,22 +90,22 @@ done
 BASE_URL="http://${TARGET_HOST}:${TARGET_PORT}"
 
 # ── Verify connectivity ────────────────────────────────────────────────────────
-echo "Verifying SSH access to ${JETSON_HOST}..."
-if ! ssh -o ConnectTimeout=5 -o BatchMode=yes "$JETSON_HOST" true 2>/dev/null; then
-    echo "Cannot reach Jetson at '${JETSON_HOST}' via SSH." >&2
+echo "Verifying SSH access to ${REMOTE_HOST}..."
+if ! ssh -o ConnectTimeout=5 -o BatchMode=yes "$REMOTE_HOST" true 2>/dev/null; then
+    echo "Cannot reach remote runner at '${REMOTE_HOST}' via SSH." >&2
     exit 1
 fi
 
-echo "Verifying wrk at ${WRK_PATH} on ${JETSON_HOST}..."
-if ! ssh "$JETSON_HOST" "test -x ${WRK_PATH}" 2>/dev/null; then
-    echo "wrk not found or not executable at ${WRK_PATH} on ${JETSON_HOST}." >&2
-    echo "Build it with: ssh ${JETSON_HOST} 'cd ~/tools/wrk && make'" >&2
+echo "Verifying wrk at ${WRK_PATH} on ${REMOTE_HOST}..."
+if ! ssh "$REMOTE_HOST" "test -x ${WRK_PATH}" 2>/dev/null; then
+    echo "wrk not found or not executable at ${WRK_PATH} on ${REMOTE_HOST}." >&2
+    echo "Build it with: ssh ${REMOTE_HOST} 'cd ~/tools/wrk && make'" >&2
     exit 1
 fi
 
-echo "Verifying target ${BASE_URL}/health from ${JETSON_HOST}..."
-if ! ssh "$JETSON_HOST" "curl -sf --max-time 5 '${BASE_URL}/health' >/dev/null" 2>/dev/null; then
-    echo "Target ${BASE_URL}/health did not respond from ${JETSON_HOST}." >&2
+echo "Verifying target ${BASE_URL}/health from ${REMOTE_HOST}..."
+if ! ssh "$REMOTE_HOST" "curl -sf --max-time 5 '${BASE_URL}/health' >/dev/null" 2>/dev/null; then
+    echo "Target ${BASE_URL}/health did not respond from ${REMOTE_HOST}." >&2
     exit 1
 fi
 
@@ -120,7 +119,7 @@ add_result() {
         <<<"$RESULTS_JSON")
 }
 
-# ── wrk runner (executes on Jetson via SSH) ───────────────────────────────────
+# ── wrk runner (executes on remote host via SSH) ─────────────────────────────
 run_wrk_remote() {
     local url="$1" label="$2"
     local header_flags=""
@@ -129,7 +128,7 @@ run_wrk_remote() {
     fi
 
     local raw
-    raw=$(ssh "$JETSON_HOST" \
+    raw=$(ssh "$REMOTE_HOST" \
         "${WRK_PATH} -t${THREADS} -c${CONNECTIONS} -d${DURATION}s -L ${header_flags} '${url}'" \
         2>&1) || true
 
@@ -160,7 +159,7 @@ scenario_keepalive() {
 }
 
 # ── Main ──────────────────────────────────────────────────────────────────────
-echo "Tardigrade benchmark — target: ${BASE_URL}  driver: ${JETSON_HOST} (wrk)"
+echo "Tardigrade benchmark — target: ${BASE_URL}  driver: ${REMOTE_HOST} (wrk)"
 echo "Duration: ${DURATION}s  Connections: ${CONNECTIONS}  Threads: ${THREADS}"
 echo "Paths: static=${STATIC_PATH} proxy=${PROXY_PATH} keepalive=${KEEPALIVE_PATH}"
 if [[ -n "$HOST_HEADER" ]]; then
@@ -175,7 +174,7 @@ for scenario in "${SCENARIO_LIST[@]}"; do
         proxy-http1)  scenario_proxy_http1 ;;
         keepalive)    scenario_keepalive ;;
         proxy-http2 | reload-under-load | auth-enforcement | rate-limit | spike)
-            echo "==> ${scenario}: not supported by jetson-run.sh (use run.sh with --tool k6 or h2load)"
+            echo "==> ${scenario}: not supported by remote-run.sh (use run.sh with --tool k6 or h2load)"
             ;;
         *) echo "Unknown scenario: $scenario" >&2 ;;
     esac
@@ -191,7 +190,7 @@ RESULTS_JSON=$(jq \
     --arg worker_count "$WORKER_COUNT" \
     --arg config_label "$CONFIG_LABEL" \
     --arg static_path "$STATIC_PATH" --arg proxy_path "$PROXY_PATH" --arg keepalive_path "$KEEPALIVE_PATH" \
-    --arg driver "${JETSON_HOST}" \
+    --arg driver "${REMOTE_HOST}" \
     --argjson dur "$DURATION" --argjson conn "$CONNECTIONS" \
     '. + {_meta: {tag: $tag, timestamp: $ts, host: $host, port: $port,
           tool: "wrk", driver: $driver, duration_s: $dur, connections: $conn,

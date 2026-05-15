@@ -8,7 +8,7 @@
 ---
 
 Tardigrade is an early-stage Zig service runtime for lightweight edge deployments,
-internal platforms, and controlled homelab environments.
+internal platforms, and controlled lab environments.
 
 The project currently focuses on:
 
@@ -141,7 +141,7 @@ zig build test-integration
 
 Benchmark releases should be captured from saved JSON under `benchmarks/baselines/`
 and refreshed with `./benchmarks/report.sh <baseline.json> --update-readme README.md`.
-Canonical benchmark runs are taken from the homelab perf target, not from a
+Canonical benchmark runs are taken from a dedicated benchmark target, not from a
 local laptop fallback run.
 
 <!-- BENCHMARK_REPORT_START -->
@@ -152,7 +152,7 @@ local laptop fallback run.
 | `static-http1` | 4586 | 0.4 | 46.1 | - | 0 |
 
 > **v0.32.0-18-gb44f8c1** · 2026-05-02 · tool: `wrk` · 4 connections · 30s per scenario · host: `127.0.0.1`
-> driver: `loopback (inside tardigrade-perf LXC)` · env: `release-baseline` · workers: `2` · config: `dedicated tardigrade-perf guest config`
+> driver: `loopback (dedicated benchmark target)` · env: `release-baseline` · workers: `2` · config: `release-baseline config`
 >
 > Run `./benchmarks/run.sh --save benchmarks/baselines/$(git describe --tags).json` then `./benchmarks/report.sh <file> --update-readme README.md` to refresh this table.
 <!-- BENCHMARK_REPORT_END -->

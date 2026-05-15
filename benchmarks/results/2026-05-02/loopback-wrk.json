@@ -23,7 +23,7 @@
     "host": "127.0.0.1",
     "port": "8069",
     "tool": "wrk",
-    "driver": "loopback (inside tardigrade-perf LXC)",
+    "driver": "loopback (dedicated benchmark target)",
     "duration_s": 30,
     "connections": 4,
     "host_header": "",

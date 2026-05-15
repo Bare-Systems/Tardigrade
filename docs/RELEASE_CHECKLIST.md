@@ -10,11 +10,11 @@ Use this checklist before tagging and distributing a Tardigrade release.
 
 ## Performance
 
-- [ ] Capture the release baseline JSON with `./benchmarks/release-baseline.sh` on the homelab perf target, including the default `64 KiB` and `256 KiB` payload scenarios
+- [ ] Capture the release baseline JSON with `./benchmarks/release-baseline.sh` on a stable, dedicated benchmark target, including the default `64 KiB` and `256 KiB` payload scenarios
 - [ ] Compare against the previous saved baseline JSON
 - [ ] Generate the markdown report for the new baseline
 - [ ] Refresh the README benchmark report block from the saved baseline data
-- [ ] If the homelab target was unavailable and a local fallback run was used, record that exception explicitly and do not treat it as the canonical release number
+- [ ] If a dedicated target was unavailable and a local fallback run was used, record that exception explicitly and do not treat it as the canonical release number
 - [ ] Record any known benchmark caveats in the release notes
 
 ## Artifacts

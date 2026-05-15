@@ -3,9 +3,9 @@
 Date: 2026-05-13
 
 Canonical target:
-- `tardigrade-perf` (`LXC 102`) on `beelink`
+- `dedicated benchmark target` (loopback)
 - load driver: `wrk` inside the guest against `127.0.0.1`
-- Tardigrade route host header: `tardigrade-perf`
+- Tardigrade route host header: `benchmark-target`
 - duration: `30s`
 - threads: `2`
 - connections: `2`
@@ -39,7 +39,7 @@ So by `256 KiB` the proxy is clearly bandwidth-oriented instead of per-request-o
 
 ## Hotspots
 
-`perf` was not available inside the guest, so the larger-payload profile used host-side `strace -f -c` against the live `tardigrade-perf` process while driving `/proxy/payload-256k.bin`.
+`perf` was not available on the benchmark host, so the larger-payload profile used `strace -f -c` against the live Tardigrade process while driving `/proxy/payload-256k.bin`.
 
 Important caveat:
 - the `strace` run perturbed the benchmark heavily and the companion `wrk` output shows socket read errors plus much lower req/s

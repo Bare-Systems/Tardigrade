@@ -3,8 +3,8 @@
 Date: `2026-05-10`
 
 Target:
-- Proxmox node: `beelink`
-- Guest: `LXC 102 (tardigrade-perf)`
+- Benchmark host: `dedicated benchmark target`
+- Guest: `dedicated benchmark target`
 - Driver: `wrk` running **inside** the guest
 - URL base: `http://127.0.0.1:8069`
 - Duration: `30s` per scenario

@@ -2,7 +2,7 @@
 # Run a self-contained low-concurrency benchmark smoke test against a local
 # Tardigrade instance. Intended for shared CI runners or explicit local-fallback
 # runs where only clear regressions should fail the job. This is not the default
-# benchmark path; canonical runs belong on the homelab perf target.
+# benchmark path; canonical runs belong on a dedicated benchmark target.
 
 set -euo pipefail
 

@@ -65,19 +65,18 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            install-deps: sudo apt-get install -y libssl-dev
           - os: ubuntu-24.04-arm
-            install-deps: sudo apt-get install -y libssl-dev
           - os: macos-14
-            install-deps: ""
 
     steps:
       - name: Checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
 
       - name: Install system dependencies
-        if: matrix.install-deps != ''
-        run: ${{ matrix.install-deps }}
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y libssl-dev
 
       - name: Install Zig
         run: sh ./scripts/install-zig.sh 0.16.0
@@ -139,7 +138,9 @@ jobs:
         run: zig version
 
       - name: Build (${{ matrix.optimize }})
-        run: zig build -Doptimize=${{ matrix.optimize }}
+        env:
+          OPTIMIZE: ${{ matrix.optimize }}
+        run: zig build -Doptimize=$OPTIMIZE
 
   # ── Performance smoke ────────────────────────────────────────────────────────
   # Shared-runner loopback benchmark with conservative floors and a 30s default
@@ -153,6 +154,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
 
       - name: Install dependencies
         run: sudo apt-get install -y libssl-dev wrk
@@ -201,6 +204,7 @@ jobs:
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Install Gitleaks
         run: |

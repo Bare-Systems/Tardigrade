@@ -91,6 +91,3 @@ Pre-built service files for host-native installs:
 | [`systemd/tardigrade.service`](systemd/tardigrade.service) | systemd service unit (Linux) |
 | [`launchd/io.baresystems.tardigrade.plist`](launchd/io.baresystems.tardigrade.plist) | launchd plist (macOS) |
 
-## Kubernetes
-
-See [`kubernetes/`](kubernetes/) for the Helm chart and deployment guide.

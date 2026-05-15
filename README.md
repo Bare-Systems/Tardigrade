@@ -116,7 +116,6 @@ corpus replay entrypoint, and internal pentest workflow are documented in
 | Code review checklist | `docs/CODE_REVIEW_CHECKLIST.md` |
 | Release checklist | `docs/RELEASE_CHECKLIST.md` |
 | Packaging | `packaging/README.md` |
-| Kubernetes | `packaging/kubernetes/README.md` |
 | Benchmarks | `benchmarks/README.md` |
 | Security test plan | `docs/SECURITY_TEST_PLAN.md` |
 | Pentest playbook | `docs/PENTEST_PLAYBOOK.md` |

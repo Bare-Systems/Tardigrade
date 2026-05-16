@@ -116,7 +116,7 @@ jobs:
       - name: Build release binary
         env:
           VERSION: ${{ needs.prepare-release.outputs.version }}
-        run: zig build -Doptimize=ReleaseFast -Dversion=$VERSION
+        run: zig build -Doptimize=ReleaseFast "-Dversion=$VERSION"
 
       - name: Package artifact
         shell: bash

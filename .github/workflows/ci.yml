@@ -140,7 +140,7 @@ jobs:
       - name: Build (${{ matrix.optimize }})
         env:
           OPTIMIZE: ${{ matrix.optimize }}
-        run: zig build -Doptimize=$OPTIMIZE
+        run: zig build "-Doptimize=$OPTIMIZE"
 
   # ── Performance smoke ────────────────────────────────────────────────────────
   # Shared-runner loopback benchmark with conservative floors and a 30s default

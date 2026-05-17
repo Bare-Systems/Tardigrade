@@ -10,19 +10,36 @@ on:
 
 permissions:
   contents: read
-  packages: write
 
 jobs:
-  publish-ghcr:
-    name: Publish GHCR image
-    runs-on: ubuntu-latest
+  # ── Build per-arch image ───────────────────────────────────────────────────────
+  # Builds natively on each runner to avoid QEMU-emulated compilation.
+  # Pushes each arch image by digest (no tags yet) for the merge step to consume.
+  build-image:
+    name: Build image (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+            platform: linux/amd64
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
 
     steps:
       - name: Checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+      - name: Install dependencies
+        run: sudo apt-get install -y libssl-dev
 
       - name: Install Zig
         run: sh ./scripts/install-zig.sh 0.16.0
@@ -30,22 +47,90 @@ jobs:
       - name: Print Zig version
         run: zig version
 
-      - name: Install dependencies
-        run: sudo apt-get install -y libssl-dev
-
       - name: Run unit tests
         run: zig build test --summary all --error-style verbose
 
-      - name: Build Linux release binary
-        run: zig build -Doptimize=ReleaseFast
+      - name: Determine version
+        id: version
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            echo "value=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=$(./scripts/release-metadata.sh version)" >> "$GITHUB_OUTPUT"
+          fi
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Build release binary
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+        run: zig build -Doptimize=ReleaseFast "-Dversion=$VERSION"
 
       - name: Compute image name
         id: image
         shell: bash
         run: echo "name=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/tardigrade" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: push
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ steps.image.outputs.name }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=container-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=container-${{ matrix.arch }}
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${DIGEST#sha256:}"
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+
+      - name: Upload digest artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: digest-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+
+  # ── Merge manifest list ────────────────────────────────────────────────────────
+  # Combines the per-arch digests into a single multi-arch manifest, then applies
+  # all tags, scans, and generates the SBOM.
+  merge-manifest:
+    name: Merge multi-arch manifest
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      packages: write
+    needs: build-image
+
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: /tmp/digests
+          pattern: digest-*
+          merge-multiple: true
+
+      - name: Compute image name
+        id: image
+        shell: bash
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/tardigrade" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Log in to GHCR
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
@@ -69,22 +154,27 @@ jobs:
             org.opencontainers.image.description=High-performance Zig edge gateway and HTTP server
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
 
-      - name: Build and push image
-        id: push
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
-        with:
-          context: .
-          file: ./Dockerfile
-          platforms: linux/amd64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+      - name: Create and push manifest list
+        working-directory: /tmp/digests
+        env:
+          IMAGE_NAME: ${{ steps.image.outputs.name }}
+        run: |
+          # shellcheck disable=SC2046
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf "${IMAGE_NAME}@sha256:%s " *)
+
+      - name: Inspect manifest
+        env:
+          IMAGE_NAME: ${{ steps.image.outputs.name }}
+          IMAGE_VERSION: ${{ steps.meta.outputs.version }}
+        run: docker buildx imagetools inspect "${IMAGE_NAME}:${IMAGE_VERSION}"
 
       - name: Scan container image for vulnerabilities
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           scan-type: image
-          image-ref: ${{ steps.image.outputs.name }}@${{ steps.push.outputs.digest }}
+          image-ref: ${{ steps.image.outputs.name }}:${{ steps.meta.outputs.version }}
           format: table
           severity: CRITICAL,HIGH
           exit-code: 0
@@ -92,6 +182,6 @@ jobs:
       - name: Generate container SBOM
         uses: anchore/sbom-action@e11c554f704a0b820cbf8c51673f6945e0731532 # v0.20.0
         with:
-          image: ${{ steps.image.outputs.name }}@${{ steps.push.outputs.digest }}
+          image: ${{ steps.image.outputs.name }}:${{ steps.meta.outputs.version }}
           artifact-name: sbom-container-${{ github.sha }}.spdx.json
           format: spdx-json

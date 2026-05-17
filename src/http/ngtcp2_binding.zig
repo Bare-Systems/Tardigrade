@@ -496,15 +496,15 @@ pub const Binding = if (enabled) struct {
             if (native.session) |*session| {
                 if (!session.isActivated() and native.conn != null) {
                     session.activate(@ptrCast(native.conn.?)) catch |err| {
-                        std.debug.print("http3 session activation failed: {any}\n", .{err});
+                        std.log.err("http3 session activation failed: {}", .{err});
                     };
-                    if (session.isActivated()) std.debug.print("http3 session activated after tls finish\n", .{});
+                    if (session.isActivated()) std.log.debug("http3 session activated after tls finish", .{});
                 }
             }
         }
         if (rc != 0 and native.conn != null) {
             const ccerr = c.ngtcp2_conn_get_ccerr(native.conn.?);
-            std.debug.print("http3 read rc={d} ccerr_type={d} ccerr_code={d}\n", .{ rc, ccerr.*.type, ccerr.*.error_code });
+            std.log.warn("http3 read rc={d} ccerr_type={d} ccerr_code={d}", .{ rc, ccerr.*.type, ccerr.*.error_code });
         }
         const handshake_complete = c.ngtcp2_conn_get_handshake_completed(native.conn) != 0;
         setConnectionStateFlags(server, native.dcid.data[0..native.dcid.datalen], true, true, handshake_complete, rc);
@@ -558,7 +558,7 @@ pub const Binding = if (enabled) struct {
             if (c.ngtcp2_conn_get_max_data_left(native.conn) != 0) {
                 stream_vec_count = c.nghttp3_conn_writev_stream(http3_conn, &stream_id, &fin, &vecs, vecs.len);
                 if (stream_vec_count < 0) {
-                    std.debug.print("http3 writev_stream failed: {d}\n", .{stream_vec_count});
+                    std.log.err("http3 writev_stream failed: {d}", .{stream_vec_count});
                     return error.NotYetImplemented;
                 }
             }
@@ -585,17 +585,17 @@ pub const Binding = if (enabled) struct {
             if (packet_written < 0) {
                 switch (packet_written) {
                     c.NGTCP2_ERR_STREAM_DATA_BLOCKED => {
-                        std.debug.print("http3 stream data blocked: stream_id={d}\n", .{stream_id});
+                        std.log.debug("http3 stream data blocked: stream_id={d}", .{stream_id});
                         if (stream_id >= 0) _ = c.nghttp3_conn_block_stream(http3_conn, stream_id);
                         continue;
                     },
                     c.NGTCP2_ERR_STREAM_SHUT_WR => {
-                        std.debug.print("http3 stream shutdown write: stream_id={d}\n", .{stream_id});
+                        std.log.debug("http3 stream shutdown write: stream_id={d}", .{stream_id});
                         if (stream_id >= 0) _ = c.nghttp3_conn_shutdown_stream_write(http3_conn, stream_id);
                         continue;
                     },
                     c.NGTCP2_ERR_WRITE_MORE => {
-                        std.debug.print("http3 write more: stream_id={d} data_written={d}\n", .{ stream_id, data_written });
+                        std.log.debug("http3 write more: stream_id={d} data_written={d}", .{ stream_id, data_written });
                         if (stream_id >= 0 and data_written >= 0) {
                             _ = c.nghttp3_conn_add_write_offset(http3_conn, stream_id, @intCast(data_written));
                             session.addWriteOffset(stream_id, @intCast(data_written));
@@ -603,14 +603,14 @@ pub const Binding = if (enabled) struct {
                         continue;
                     },
                     else => {
-                        std.debug.print("http3 ngtcp2 writev_stream failed: {d}\n", .{packet_written});
+                        std.log.err("http3 ngtcp2 writev_stream failed: {d}", .{packet_written});
                         return packet_written;
                     },
                 }
             }
 
             if (stream_id >= 0 and data_written >= 0) {
-                std.debug.print("http3 wrote stream data: stream_id={d} data_written={d} packet_written={d} fin={d}\n", .{ stream_id, data_written, packet_written, fin });
+                std.log.debug("http3 wrote stream data: stream_id={d} data_written={d} packet_written={d} fin={d}", .{ stream_id, data_written, packet_written, fin });
                 _ = c.nghttp3_conn_add_write_offset(http3_conn, stream_id, @intCast(data_written));
                 session.addWriteOffset(stream_id, @intCast(data_written));
             }
@@ -702,10 +702,10 @@ pub const Binding = if (enabled) struct {
             // enforce replay safety after the full request is assembled.
             if (is_0rtt) session.markStreamEarlyData(stream_id);
             const consumed = session.ingestRequestBytes(stream_id, data[0..datalen], fin) catch |err| {
-                std.debug.print("http3 ingest request bytes failed: stream_id={d} datalen={d} fin={} err={any}\n", .{ stream_id, datalen, fin, err });
+                std.log.err("http3 ingest request bytes failed: stream_id={d} datalen={d} fin={} err={}", .{ stream_id, datalen, fin, err });
                 return c.NGTCP2_ERR_CALLBACK_FAILURE;
             };
-            std.debug.print("http3 recv stream data: stream_id={d} datalen={d} consumed={d} fin={} 0rtt={}\n", .{ stream_id, datalen, consumed, fin, is_0rtt });
+            std.log.debug("http3 recv stream data: stream_id={d} datalen={d} consumed={d} fin={} 0rtt={}", .{ stream_id, datalen, consumed, fin, is_0rtt });
             if (conn) |quic_conn| {
                 _ = c.ngtcp2_conn_extend_max_stream_offset(quic_conn, stream_id, consumed);
                 c.ngtcp2_conn_extend_max_offset(quic_conn, consumed);
@@ -725,10 +725,10 @@ pub const Binding = if (enabled) struct {
                 // when 0-RTT is active and the method is not safe.
                 const early_data = session.isStreamEarlyData(stream_id);
                 if (early_data and !http3_session.isMethodSafe(owned_request.method)) {
-                    std.debug.print("http3 0-RTT replay rejected: stream_id={d} method={s}\n", .{ stream_id, owned_request.method });
+                    std.log.warn("http3 0-RTT replay rejected: stream_id={d} method={s}", .{ stream_id, owned_request.method });
                     _ = response.setStatus(.too_early);
                     session.submitResponse(server.allocator, stream_id, &response) catch |err| {
-                        std.debug.print("http3 submit 425 failed: stream_id={d} err={any}\n", .{ stream_id, err });
+                        std.log.err("http3 submit 425 failed: stream_id={d} err={}", .{ stream_id, err });
                     };
                     owned_request.deinit();
                     noteStreamData(server, native.dcid.data[0..native.dcid.datalen], datalen, completed);
@@ -737,7 +737,7 @@ pub const Binding = if (enabled) struct {
 
                 if (server.config.request_handler) |handler| {
                     handler(server.allocator, &owned_request, &response, server.config.request_handler_ctx) catch |err| {
-                        std.debug.print("http3 request handler failed: stream_id={d} err={any}\n", .{ stream_id, err });
+                        std.log.err("http3 request handler failed: stream_id={d} err={}", .{ stream_id, err });
                         owned_request.deinit();
                         return c.NGTCP2_ERR_CALLBACK_FAILURE;
                     };
@@ -745,7 +745,7 @@ pub const Binding = if (enabled) struct {
                     populateFallbackResponse(&response, &owned_request);
                 }
                 session.submitResponse(server.allocator, stream_id, &response) catch |err| {
-                    std.debug.print("http3 submit response failed: stream_id={d} err={any}\n", .{ stream_id, err });
+                    std.log.err("http3 submit response failed: stream_id={d} err={}", .{ stream_id, err });
                     owned_request.deinit();
                     return c.NGTCP2_ERR_CALLBACK_FAILURE;
                 };
@@ -799,16 +799,16 @@ pub const Binding = if (enabled) struct {
     }
 
     fn recvTxKeyCb(conn: ?*c.ngtcp2_conn, level: c.ngtcp2_encryption_level, user_data: ?*anyopaque) callconv(.c) c_int {
-        std.debug.print("http3 recv_tx_key level={d} has_conn={} has_user_data={}\n", .{ level, conn != null, user_data != null });
+        std.log.debug("http3 recv_tx_key level={d} has_conn={} has_user_data={}", .{ level, conn != null, user_data != null });
         if (level != c.NGTCP2_ENCRYPTION_LEVEL_1RTT) return 0;
         if (conn == null or user_data == null) return 0;
         const native: *@This().Server.NativeConnection = @ptrCast(@alignCast(user_data.?));
         if (native.session) |*session| {
             if (!session.isActivated()) {
                 session.activate(@ptrCast(conn.?)) catch |err| {
-                    std.debug.print("http3 recv_tx_key activation failed: {any}\n", .{err});
+                    std.log.err("http3 recv_tx_key activation failed: {}", .{err});
                 };
-                std.debug.print("http3 recv_tx_key activation state={}\n", .{session.isActivated()});
+                std.log.debug("http3 recv_tx_key activation state={}", .{session.isActivated()});
             }
         }
         return 0;

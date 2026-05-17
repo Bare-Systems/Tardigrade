@@ -65,19 +65,18 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            install-deps: sudo apt-get install -y libssl-dev
           - os: ubuntu-24.04-arm
-            install-deps: sudo apt-get install -y libssl-dev
           - os: macos-14
-            install-deps: ""
 
     steps:
       - name: Checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
 
       - name: Install system dependencies
-        if: matrix.install-deps != ''
-        run: ${{ matrix.install-deps }}
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y libssl-dev
 
       - name: Install Zig
         run: sh ./scripts/install-zig.sh 0.16.0
@@ -139,7 +138,9 @@ jobs:
         run: zig version
 
       - name: Build (${{ matrix.optimize }})
-        run: zig build -Doptimize=${{ matrix.optimize }}
+        env:
+          OPTIMIZE: ${{ matrix.optimize }}
+        run: zig build "-Doptimize=$OPTIMIZE"
 
   # ── Performance smoke ────────────────────────────────────────────────────────
   # Shared-runner loopback benchmark with conservative floors and a 30s default
@@ -153,6 +154,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
 
       - name: Install dependencies
         run: sudo apt-get install -y libssl-dev wrk
@@ -201,6 +204,7 @@ jobs:
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Install Gitleaks
         run: |
@@ -238,7 +242,6 @@ jobs:
     name: Dependency review
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
-    continue-on-error: true
     permissions:
       contents: read
       pull-requests: write
@@ -251,16 +254,12 @@ jobs:
         uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
 
   # ── Integration tests ─────────────────────────────────────────────────────────
-  # Slow to compile (~45–60 min cold on a 2-core runner). Runs on push to main
-  # only (not PRs). Does not block the required jobs.
-  # The first cold-cache run will hit the timeout; subsequent runs use the
-  # saved cache and complete in a few minutes.
+  # Runs on push to main only (not PRs). Failures block the workflow.
   integration-test:
     name: Integration tests
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 30
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    continue-on-error: true
 
     steps:
       - name: Checkout

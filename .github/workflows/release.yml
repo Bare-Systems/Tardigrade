@@ -1,58 +1,31 @@
 name: Release Tardigrade
 
 on:
-  push:
-    branches:
-      - main
+  workflow_run:
+    workflows: ["CI"]
+    branches: [main]
+    types: [completed]
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release-main
   cancel-in-progress: false
 
 jobs:
-  # ── Unit tests ─────────────────────────────────────────────────────────────
-  # Must pass before any release artifacts are built or published.
-  test:
-    name: Unit tests
-    runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main'
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-
-      - name: Install dependencies
-        run: sudo apt-get install -y libssl-dev
-
-      - name: Install Zig
-        run: sh ./scripts/install-zig.sh 0.16.0
-
-      - name: Cache Zig build artifacts
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
-        with:
-          path: |
-            ~/.cache/zig
-            .zig-cache
-          key: zig-unit-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig') }}-${{ github.sha }}
-          restore-keys: |
-            zig-unit-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig') }}-
-            zig-unit-${{ runner.os }}-${{ runner.arch }}-
-
-      - name: Print Zig version
-        run: zig version
-
-      - name: Run unit tests
-        run: zig build test --summary all --error-style verbose
-
+  # ── Prepare release ─────────────────────────────────────────────────────────
+  # Skipped if triggered by workflow_run and CI did not succeed, ensuring
+  # releases are never cut from a failing main.
   prepare-release:
     name: Prepare release
     runs-on: ubuntu-latest
-    needs: test
-    if: github.ref == 'refs/heads/main'
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    permissions:
+      contents: write
 
     outputs:
       tag: ${{ steps.meta.outputs.tag }}
@@ -97,13 +70,22 @@ jobs:
             echo "should_publish=$should_publish"
           } >> "$GITHUB_OUTPUT"
 
+      - name: Generate release notes
+        run: ./scripts/release-metadata.sh notes > release-notes.md
+
+      - name: Upload release notes
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-notes
+          path: release-notes.md
+          if-no-files-found: error
+
   build-release:
     name: Build ${{ matrix.archive_name }}
     needs: prepare-release
     if: needs.prepare-release.result == 'success' && needs.prepare-release.outputs.should_publish == 'true'
     runs-on: ${{ matrix.os }}
     permissions:
-      contents: write
       id-token: write
       attestations: write
     strategy:
@@ -122,6 +104,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
 
       - name: Install Zig
         run: sh ./scripts/install-zig.sh 0.16.0
@@ -130,17 +114,21 @@ jobs:
         run: zig version
 
       - name: Build release binary
-        run: zig build -Doptimize=ReleaseFast -Dversion=${{ needs.prepare-release.outputs.version }}
+        env:
+          VERSION: ${{ needs.prepare-release.outputs.version }}
+        run: zig build -Doptimize=ReleaseFast "-Dversion=$VERSION"
 
       - name: Package artifact
         shell: bash
+        env:
+          ARCHIVE_NAME: ${{ matrix.archive_name }}
         run: |
           set -euo pipefail
           mkdir -p dist
           cp zig-out/bin/tardigrade dist/tardigrade
           ln -sf tardigrade dist/tardi
           cp LICENSE dist/LICENSE
-          tar -C dist -czf "${{ matrix.archive_name }}.tar.gz" tardigrade tardi LICENSE
+          tar -C dist -czf "${ARCHIVE_NAME}.tar.gz" tardigrade tardi LICENSE
 
       - name: Generate SBOM
         uses: anchore/sbom-action@e11c554f704a0b820cbf8c51673f6945e0731532 # v0.20.0
@@ -188,6 +176,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
 
       - name: Download binary artifact
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -196,17 +186,22 @@ jobs:
           path: artifact
 
       - name: Extract binary
+        env:
+          ARTIFACT: ${{ matrix.artifact }}
         run: |
-          tar -xzf artifact/${{ matrix.artifact }}.tar.gz
+          tar -xzf "artifact/${ARTIFACT}.tar.gz"
           chmod +x tardigrade
 
       - name: Build DEB
+        env:
+          VERSION: ${{ needs.prepare-release.outputs.version }}
+          ARCH: ${{ matrix.arch }}
         run: |
           mkdir -p zig-out/bin
           cp tardigrade zig-out/bin/tardigrade
           ./packaging/deb/build.sh \
-            --version ${{ needs.prepare-release.outputs.version }} \
-            --arch ${{ matrix.arch }} \
+            --version "$VERSION" \
+            --arch "$ARCH" \
             --binary zig-out/bin/tardigrade
 
       - name: Generate DEB SBOM
@@ -231,29 +226,108 @@ jobs:
           path: sbom-tardigrade_${{ needs.prepare-release.outputs.version }}_${{ matrix.arch }}.spdx.json
           if-no-files-found: error
 
+  build-rpm:
+    name: Build RPM packages
+    needs:
+      - prepare-release
+      - build-release
+    if: needs.prepare-release.result == 'success' && needs.prepare-release.outputs.should_publish == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            artifact: tardigrade-linux-x86_64
+          - arch: arm64
+            artifact: tardigrade-linux-aarch64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+
+      - name: Install rpm-build
+        run: sudo apt-get install -y rpm-build
+
+      - name: Download binary artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: artifact
+
+      - name: Extract binary
+        env:
+          ARTIFACT: ${{ matrix.artifact }}
+        run: |
+          tar -xzf "artifact/${ARTIFACT}.tar.gz"
+          chmod +x tardigrade
+
+      - name: Build RPM
+        env:
+          VERSION: ${{ needs.prepare-release.outputs.version }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          mkdir -p zig-out/bin
+          cp tardigrade zig-out/bin/tardigrade
+          ./packaging/rpm/build.sh \
+            --version "$VERSION" \
+            --arch "$ARCH" \
+            --binary zig-out/bin/tardigrade
+
+      - name: Generate RPM SBOM
+        uses: anchore/sbom-action@e11c554f704a0b820cbf8c51673f6945e0731532 # v0.20.0
+        with:
+          path: dist/
+          artifact-name: sbom-tardigrade-${{ needs.prepare-release.outputs.version }}-${{ matrix.arch }}.rpm.spdx.json
+          format: spdx-json
+          output-file: sbom-tardigrade-${{ needs.prepare-release.outputs.version }}-${{ matrix.arch }}.rpm.spdx.json
+
+      - name: Upload RPM artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: tardigrade-${{ needs.prepare-release.outputs.version }}-${{ matrix.arch }}.rpm
+          path: dist/*.rpm
+          if-no-files-found: error
+
+      - name: Upload RPM SBOM artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sbom-tardigrade-${{ needs.prepare-release.outputs.version }}-${{ matrix.arch }}.rpm
+          path: sbom-tardigrade-${{ needs.prepare-release.outputs.version }}-${{ matrix.arch }}.rpm.spdx.json
+          if-no-files-found: error
+
   publish-release:
     name: Publish GitHub release assets
     needs:
       - prepare-release
       - build-release
       - build-deb
+      - build-rpm
     if: needs.prepare-release.result == 'success' && needs.prepare-release.outputs.should_publish == 'true'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Download release notes
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-notes
 
       - name: Download build artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: dist
+          pattern: 'tardigrade*,sbom*'
+          merge-multiple: true
 
       - name: Generate checksums
         shell: bash
         run: |
           set -euo pipefail
-          find dist -type f \( -name '*.tar.gz' -o -name '*.deb' \) -print0 | sort -z | xargs -0 shasum -a 256 > dist/tardigrade-checksums.txt
+          find dist -type f \( -name '*.tar.gz' -o -name '*.deb' -o -name '*.rpm' \) -print0 | sort -z | xargs -0 shasum -a 256 > dist/tardigrade-checksums.txt
 
       - name: Scan release archives for vulnerabilities
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
@@ -264,9 +338,6 @@ jobs:
           severity: CRITICAL
           exit-code: 0
 
-      - name: Generate release notes
-        run: ./scripts/release-metadata.sh notes > release-notes.md
-
       - name: Publish release assets
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
@@ -276,6 +347,7 @@ jobs:
           files: |
             dist/*/*.tar.gz
             dist/*/*.deb
+            dist/*/*.rpm
             dist/*/*.spdx.json
             dist/tardigrade-checksums.txt
           fail_on_unmatched_files: true

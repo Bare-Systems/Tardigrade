@@ -304,7 +304,7 @@ pub fn parseResponseForRequest(allocator: std.mem.Allocator, data: []const u8, r
 
 fn openStream(allocator: std.mem.Allocator, endpoint: []const u8) !compat.NetStream {
     if (unixSocketPath(endpoint)) |path| {
-        return compat.connectUnixSocket(path) catch unreachable;
+        return compat.connectUnixSocket(path);
     }
     const ep = try memcached.parseEndpoint(endpoint);
     return compat.tcpConnectToHost(allocator, ep.host, ep.port);

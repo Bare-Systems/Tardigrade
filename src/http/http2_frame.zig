@@ -122,6 +122,12 @@ pub fn parsePriority(payload: []const u8) !struct { dependency: u31, weight: u8,
     };
 }
 
+pub fn writeRstStream(writer: anytype, stream_id: u31, err_code: u32) !void {
+    var payload: [4]u8 = undefined;
+    std.mem.writeInt(u32, payload[0..4], err_code, .big);
+    try writeFrame(writer, .rst_stream, 0, stream_id, payload[0..]);
+}
+
 pub fn parseWindowUpdateIncrement(payload: []const u8) !u31 {
     if (payload.len != 4) return error.InvalidWindowUpdateFrame;
     const raw = std.mem.readInt(u32, payload[0..4], .big) & 0x7FFF_FFFF;
@@ -136,6 +142,26 @@ fn readExact(conn: anytype, out: []u8) !void {
         if (n == 0) return error.ConnectionClosed;
         off += n;
     }
+}
+
+test "writeRstStream encodes stream id and error code" {
+    var buf: [32]u8 = undefined;
+    var fbs = compat.fixedBufferStream(&buf);
+    try writeRstStream(fbs.writer(), 5, 0x7); // REFUSED_STREAM
+    const out = fbs.getWritten();
+    try std.testing.expectEqual(@as(usize, 9 + 4), out.len);
+    try std.testing.expectEqual(@as(u8, 0x3), out[3]); // type = rst_stream
+    try std.testing.expectEqual(@as(u8, 0x0), out[4]); // no flags
+    // stream id = 5 in big-endian
+    try std.testing.expectEqual(@as(u8, 0x00), out[5]);
+    try std.testing.expectEqual(@as(u8, 0x00), out[6]);
+    try std.testing.expectEqual(@as(u8, 0x00), out[7]);
+    try std.testing.expectEqual(@as(u8, 0x05), out[8]);
+    // error code = 7 in big-endian
+    try std.testing.expectEqual(@as(u8, 0x00), out[9]);
+    try std.testing.expectEqual(@as(u8, 0x00), out[10]);
+    try std.testing.expectEqual(@as(u8, 0x00), out[11]);
+    try std.testing.expectEqual(@as(u8, 0x07), out[12]);
 }
 
 test "write and parse frame header values" {

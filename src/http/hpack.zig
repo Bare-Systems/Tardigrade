@@ -14,6 +14,100 @@ const StaticEntry = struct {
     value: []const u8,
 };
 
+const DYNAMIC_TABLE_ENTRY_OVERHEAD: usize = 32;
+
+/// HPACK dynamic table per RFC 7541 §2.3.2.
+///
+/// Entries are stored newest-first (index 0 = most recently inserted,
+/// HPACK index 62). Each entry evicts the oldest entries as needed to
+/// stay within `max_size`. Max size is 4 096 bytes by default and can
+/// be reduced by a table-size update instruction in the header block.
+pub const DynamicTable = struct {
+    entries: std.ArrayListUnmanaged(HeaderField),
+    size: usize,
+    max_size: usize,
+
+    pub fn init() DynamicTable {
+        return .{ .entries = .{}, .size = 0, .max_size = 4096 };
+    }
+
+    pub fn deinit(self: *DynamicTable, allocator: std.mem.Allocator) void {
+        for (self.entries.items) |h| {
+            allocator.free(h.name);
+            allocator.free(h.value);
+        }
+        self.entries.deinit(allocator);
+        self.* = undefined;
+    }
+
+    pub fn insert(self: *DynamicTable, allocator: std.mem.Allocator, name: []const u8, value: []const u8) !void {
+        const cost = name.len + value.len + DYNAMIC_TABLE_ENTRY_OVERHEAD;
+        if (cost > self.max_size) {
+            self.evictAll(allocator);
+            return;
+        }
+        while (self.size + cost > self.max_size) self.evictOldest(allocator);
+        const name_copy = try allocator.dupe(u8, name);
+        errdefer allocator.free(name_copy);
+        const value_copy = try allocator.dupe(u8, value);
+        errdefer allocator.free(value_copy);
+        try self.entries.insert(allocator, 0, .{ .name = name_copy, .value = value_copy });
+        self.size += cost;
+    }
+
+    pub fn setMaxSize(self: *DynamicTable, allocator: std.mem.Allocator, new_max: usize) void {
+        self.max_size = new_max;
+        while (self.size > self.max_size) self.evictOldest(allocator);
+    }
+
+    pub fn getByDynIndex(self: *const DynamicTable, dyn_idx: usize) ?StaticEntry {
+        if (dyn_idx >= self.entries.items.len) return null;
+        const h = self.entries.items[dyn_idx];
+        return .{ .name = h.name, .value = h.value };
+    }
+
+    fn evictOldest(self: *DynamicTable, allocator: std.mem.Allocator) void {
+        if (self.entries.items.len == 0) return;
+        const last_idx = self.entries.items.len - 1;
+        const last = self.entries.items[last_idx]; // struct copy; safe to free slices after
+        self.size -= last.name.len + last.value.len + DYNAMIC_TABLE_ENTRY_OVERHEAD;
+        allocator.free(last.name);
+        allocator.free(last.value);
+        self.entries.shrinkRetainingCapacity(last_idx);
+    }
+
+    fn evictAll(self: *DynamicTable, allocator: std.mem.Allocator) void {
+        for (self.entries.items) |h| {
+            allocator.free(h.name);
+            allocator.free(h.value);
+        }
+        self.entries.clearRetainingCapacity();
+        self.size = 0;
+    }
+};
+
+/// Stateful HPACK decoder.
+///
+/// Maintains the dynamic table across decode calls so that incremental
+/// indexing accumulates correctly over the lifetime of an HTTP/2
+/// connection. One Decoder per connection direction (one for requests,
+/// one for responses if acting as a client).
+pub const Decoder = struct {
+    dynamic: DynamicTable,
+
+    pub fn init() Decoder {
+        return .{ .dynamic = DynamicTable.init() };
+    }
+
+    pub fn deinit(self: *Decoder, allocator: std.mem.Allocator) void {
+        self.dynamic.deinit(allocator);
+    }
+
+    pub fn decode(self: *Decoder, allocator: std.mem.Allocator, block: []const u8) !DecodeResult {
+        return decodeWithTable(allocator, block, &self.dynamic);
+    }
+};
+
 const static_table = [_]StaticEntry{
     .{ .name = ":authority", .value = "" },
     .{ .name = ":method", .value = "GET" },
@@ -78,7 +172,17 @@ const static_table = [_]StaticEntry{
     .{ .name = "www-authenticate", .value = "" },
 };
 
+/// Decode an HPACK header block without maintaining a dynamic table.
+/// Suitable for one-shot decoding and tests; does not persist state
+/// across calls. Use `Decoder` for per-connection stateful decoding.
 pub fn decode(allocator: std.mem.Allocator, block: []const u8) !DecodeResult {
+    return decodeWithTable(allocator, block, null);
+}
+
+/// Decode an HPACK header block using an optional dynamic table.
+/// When `dyn` is non-null, table-size updates and incremental indexing
+/// are applied to the table so state is preserved across calls.
+fn decodeWithTable(allocator: std.mem.Allocator, block: []const u8, dyn: ?*DynamicTable) !DecodeResult {
     var out = std.ArrayList(HeaderField).empty;
     errdefer {
         for (out.items) |h| {
@@ -91,26 +195,50 @@ pub fn decode(allocator: std.mem.Allocator, block: []const u8) !DecodeResult {
     var i: usize = 0;
     while (i < block.len) {
         const b = block[i];
+
         if ((b & 0x80) != 0) {
+            // Indexed header field (RFC 7541 §6.1): reference to static or dynamic table.
             const indexed = try decodeInteger(block, &i, 7);
-            const entry = staticByIndex(indexed) orelse return error.InvalidHpackIndex;
+            const entry = entryByIndex(indexed, dyn) orelse return error.InvalidHpackIndex;
             try out.append(allocator, .{
                 .name = try allocator.dupe(u8, entry.name),
                 .value = try allocator.dupe(u8, entry.value),
             });
             continue;
         }
+
         if ((b & 0xE0) == 0x20) {
-            _ = try decodeInteger(block, &i, 5);
+            // Dynamic table size update (RFC 7541 §6.3).
+            const new_max = try decodeInteger(block, &i, 5);
+            if (dyn) |d| d.setMaxSize(allocator, new_max);
             continue;
         }
-        if ((b & 0xF0) == 0x10 or (b & 0xF0) == 0x00 or (b & 0xC0) == 0x40) {
-            const prefix_bits: u3 = if ((b & 0xC0) == 0x40) 6 else 4;
-            const name_index = try decodeInteger(block, &i, prefix_bits);
+
+        if ((b & 0xC0) == 0x40) {
+            // Literal with incremental indexing (RFC 7541 §6.2.1): add to dynamic table.
+            const name_index = try decodeInteger(block, &i, 6);
             const name = if (name_index == 0)
                 try decodeStringAlloc(allocator, block, &i)
             else blk: {
-                const entry = staticByIndex(name_index) orelse return error.InvalidHpackIndex;
+                const entry = entryByIndex(name_index, dyn) orelse return error.InvalidHpackIndex;
+                break :blk try allocator.dupe(u8, entry.name);
+            };
+            errdefer allocator.free(name);
+            const value = try decodeStringAlloc(allocator, block, &i);
+            errdefer allocator.free(value);
+            if (dyn) |d| try d.insert(allocator, name, value);
+            try out.append(allocator, .{ .name = name, .value = value });
+            continue;
+        }
+
+        if ((b & 0xF0) == 0x00 or (b & 0xF0) == 0x10) {
+            // Literal without indexing (0x00) or never indexed (0x10) — RFC 7541 §6.2.2/6.2.3.
+            // Do not add to dynamic table.
+            const name_index = try decodeInteger(block, &i, 4);
+            const name = if (name_index == 0)
+                try decodeStringAlloc(allocator, block, &i)
+            else blk: {
+                const entry = entryByIndex(name_index, dyn) orelse return error.InvalidHpackIndex;
                 break :blk try allocator.dupe(u8, entry.name);
             };
             errdefer allocator.free(name);
@@ -119,9 +247,19 @@ pub fn decode(allocator: std.mem.Allocator, block: []const u8) !DecodeResult {
             try out.append(allocator, .{ .name = name, .value = value });
             continue;
         }
+
         return error.UnsupportedHpackRepresentation;
     }
     return .{ .headers = try out.toOwnedSlice(allocator) };
+}
+
+/// Look up an HPACK index across the static table and optional dynamic table.
+/// Index 1..61 are static; 62+ are dynamic (newest first).
+fn entryByIndex(index: usize, dyn: ?*DynamicTable) ?StaticEntry {
+    if (index == 0) return null;
+    if (index <= static_table.len) return static_table[index - 1];
+    if (dyn == null) return null;
+    return dyn.?.getByDynIndex(index - static_table.len - 1);
 }
 
 pub fn deinitDecoded(allocator: std.mem.Allocator, decoded: *DecodeResult) void {
@@ -195,11 +333,6 @@ fn encodeString(allocator: std.mem.Allocator, out: *std.ArrayList(u8), value: []
     try out.appendSlice(allocator, value);
 }
 
-fn staticByIndex(index: usize) ?StaticEntry {
-    if (index == 0 or index > static_table.len) return null;
-    return static_table[index - 1];
-}
-
 test "hpack decode indexed and literal headers" {
     const allocator = std.testing.allocator;
     // Indexed :method GET (2), literal new-name "x-test: abc"
@@ -236,4 +369,84 @@ test "hpack encode literal header block" {
     const encoded = try encodeLiteralHeaderBlock(allocator, headers[0..]);
     defer allocator.free(encoded);
     try std.testing.expect(encoded.len > 0);
+}
+
+test "DynamicTable insert and lookup by dyn index" {
+    const allocator = std.testing.allocator;
+    var table = DynamicTable.init();
+    defer table.deinit(allocator);
+
+    try table.insert(allocator, "x-custom", "value1");
+    try table.insert(allocator, "x-other", "value2");
+
+    // Most recently inserted is at dyn index 0.
+    const newest = table.getByDynIndex(0).?;
+    try std.testing.expectEqualStrings("x-other", newest.name);
+    try std.testing.expectEqualStrings("value2", newest.value);
+
+    const older = table.getByDynIndex(1).?;
+    try std.testing.expectEqualStrings("x-custom", older.name);
+    try std.testing.expectEqualStrings("value1", older.value);
+
+    try std.testing.expect(table.getByDynIndex(2) == null);
+}
+
+test "DynamicTable evicts oldest entries to stay within max_size" {
+    const allocator = std.testing.allocator;
+    var table = DynamicTable.init();
+    defer table.deinit(allocator);
+
+    // Each entry costs name.len + value.len + 32.
+    // Set a small max so the second insert evicts the first.
+    const name = "a";
+    const val = "b";
+    const entry_cost = name.len + val.len + DYNAMIC_TABLE_ENTRY_OVERHEAD;
+    table.setMaxSize(allocator, entry_cost); // room for exactly one entry
+
+    try table.insert(allocator, name, val);
+    try std.testing.expectEqual(@as(usize, 1), table.entries.items.len);
+
+    try table.insert(allocator, "c", "d");
+    try std.testing.expectEqual(@as(usize, 1), table.entries.items.len);
+    const e = table.getByDynIndex(0).?;
+    try std.testing.expectEqualStrings("c", e.name);
+}
+
+test "DynamicTable setMaxSize zero evicts everything" {
+    const allocator = std.testing.allocator;
+    var table = DynamicTable.init();
+    defer table.deinit(allocator);
+
+    try table.insert(allocator, "key", "val");
+    try std.testing.expectEqual(@as(usize, 1), table.entries.items.len);
+
+    table.setMaxSize(allocator, 0);
+    try std.testing.expectEqual(@as(usize, 0), table.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), table.size);
+}
+
+test "Decoder accumulates dynamic table across calls" {
+    const allocator = std.testing.allocator;
+    var dec = Decoder.init();
+    defer dec.deinit(allocator);
+
+    // First call: literal with incremental indexing (0x40 prefix, name index 0).
+    // Encodes: name="x-hdr", value="hello"
+    const block1 = [_]u8{
+        0x40, // literal + incremental indexing, name follows
+        0x05, 'x', '-', 'h', 'd', 'r',
+        0x05, 'h', 'e', 'l', 'l', 'o',
+    };
+    var r1 = try dec.decode(allocator, block1[0..]);
+    defer deinitDecoded(allocator, &r1);
+    try std.testing.expectEqual(@as(usize, 1), r1.headers.len);
+    try std.testing.expectEqualStrings("x-hdr", r1.headers[0].name);
+
+    // Second call: reference dynamic table entry (index 62 = first dynamic).
+    const block2 = [_]u8{0x80 | 62}; // indexed representation, index 62
+    var r2 = try dec.decode(allocator, block2[0..]);
+    defer deinitDecoded(allocator, &r2);
+    try std.testing.expectEqual(@as(usize, 1), r2.headers.len);
+    try std.testing.expectEqualStrings("x-hdr", r2.headers[0].name);
+    try std.testing.expectEqualStrings("hello", r2.headers[0].value);
 }

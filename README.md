@@ -60,10 +60,18 @@ curl -fsSL https://github.com/Bare-Systems/Tardigrade/releases/latest/download/i
 ```bash
 ./zig-out/bin/tardigrade run
 ./zig-out/bin/tardigrade validate -c /etc/tardigrade/tardigrade.conf
+./zig-out/bin/tardigrade status -c /etc/tardigrade/tardigrade.conf
+./zig-out/bin/tardigrade print-config -c /etc/tardigrade/tardigrade.conf
 ./zig-out/bin/tardigrade reload -c /etc/tardigrade/tardigrade.conf
 ./zig-out/bin/tardigrade stop -c /etc/tardigrade/tardigrade.conf
 ./zig-out/bin/tardigrade config init
 ```
+
+`validate` now prints the resolved config path plus a compact summary of the
+effective listener, pid file, protocol toggles, worker settings, and metrics
+path. `status` reports whether the configured pid is running when a pid or pid
+file is available, and `print-config` prints the same effective-config summary
+without starting the runtime.
 
 ## Minimal Config Example
 

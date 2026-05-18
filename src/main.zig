@@ -10,6 +10,8 @@ const ENV_CONFIG_PATH = "TARDIGRADE_CONFIG_PATH";
 const CliCommand = union(enum) {
     run: RunOptions,
     validate: CommonOptions,
+    status: SignalOptions,
+    print_config: CommonOptions,
     reload: SignalOptions,
     stop: SignalOptions,
     version,
@@ -82,6 +84,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const command = parseCliCommand(args[1..]) catch |err| {
         var stderr_buf: [2048]u8 = undefined;
         var stderr = compat.stderrWriter(&stderr_buf);
+        try printCliParseError(&stderr, err);
         try printUsage(&stderr);
         try stderr.flush();
         return err;
@@ -101,6 +104,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
             try stdout.flush();
         },
         .config_init => |options| try writeStarterConfig(options),
+        .status => |options| try executeStatusCommand(control_allocator, options),
+        .print_config => |options| try executePrintConfigCommand(control_allocator, options),
         .reload => |options| try executeSignalCommand(control_allocator, "reload", std.posix.SIG.HUP, options),
         .stop => |options| try executeSignalCommand(control_allocator, "stop", std.posix.SIG.TERM, options),
         .validate => |options| try executeValidateCommand(control_allocator, options),
@@ -124,10 +129,13 @@ fn parseCliCommand(args: []const []const u8) !CliCommand {
     if (std.mem.eql(u8, first, "version")) return .version;
     if (std.mem.eql(u8, first, "run")) return try parseRunCommand(args[1..]);
     if (std.mem.eql(u8, first, "validate")) return try parseValidateCommand(args[1..]);
+    if (std.mem.eql(u8, first, "status")) return try parseSignalCommand(.status, args[1..]);
+    if (std.mem.eql(u8, first, "print-config")) return try parsePrintConfigCommand(args[1..]);
     if (std.mem.eql(u8, first, "reload")) return try parseSignalCommand(.reload, args[1..]);
     if (std.mem.eql(u8, first, "stop")) return try parseSignalCommand(.stop, args[1..]);
     if (std.mem.eql(u8, first, "config")) {
         if (args.len >= 2 and std.mem.eql(u8, args[1], "init")) return try parseConfigInitCommand(args[2..]);
+        if (args.len >= 2 and std.mem.eql(u8, args[1], "print")) return try parsePrintConfigCommand(args[2..]);
         return error.InvalidCommand;
     }
 
@@ -191,7 +199,7 @@ fn parseValidateCommand(args: []const []const u8) !CliCommand {
     return .{ .validate = options };
 }
 
-fn parseSignalCommand(comptime kind: enum { reload, stop }, args: []const []const u8) !CliCommand {
+fn parseSignalCommand(comptime kind: enum { reload, stop, status }, args: []const []const u8) !CliCommand {
     var options = SignalOptions{};
     var idx: usize = 0;
     while (idx < args.len) : (idx += 1) {
@@ -221,7 +229,25 @@ fn parseSignalCommand(comptime kind: enum { reload, stop }, args: []const []cons
     return switch (kind) {
         .reload => .{ .reload = options },
         .stop => .{ .stop = options },
+        .status => .{ .status = options },
     };
+}
+
+fn parsePrintConfigCommand(args: []const []const u8) !CliCommand {
+    var options = CommonOptions{};
+    var idx: usize = 0;
+    while (idx < args.len) : (idx += 1) {
+        const arg = args[idx];
+        if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) return .help;
+        if (std.mem.eql(u8, arg, "-c") or std.mem.eql(u8, arg, "--config")) {
+            if (idx + 1 >= args.len) return error.MissingOptionValue;
+            options.config_path = args[idx + 1];
+            idx += 1;
+            continue;
+        }
+        return error.UnknownOption;
+    }
+    return .{ .print_config = options };
 }
 
 fn parseConfigInitCommand(args: []const []const u8) !CliCommand {
@@ -250,19 +276,35 @@ fn printUsage(writer: anytype) !void {
         \\Usage:
         \\  tardigrade run [-c <path>] [--daemon]
         \\  tardigrade validate [-c <path>]
+        \\  tardigrade status [-c <path>] [--pid-file <path> | --pid <pid>]
+        \\  tardigrade print-config [-c <path>]
         \\  tardigrade reload [-c <path>] [--pid-file <path> | --pid <pid>]
         \\  tardigrade stop [-c <path>] [--pid-file <path> | --pid <pid>]
         \\  tardigrade version
         \\  tardigrade config init [<path>] [--force | --stdout]
+        \\  tardigrade config print [-c <path>]
         \\
         \\Notes:
         \\  - Legacy `--validate-config` remains supported.
+        \\  - `status` reports process state when a pid target is available.
+        \\  - `print-config` prints the effective operator-facing config summary.
         \\  - Config discovery checks `-c/--config`, `TARDIGRADE_CONFIG_PATH`,
         \\    `./tardigrade.conf`, `./config/tardigrade.conf`,
         \\    `/etc/tardigrade/tardigrade.conf`, and
         \\    `$HOME/.config/tardigrade/tardigrade.conf`.
         \\
     );
+}
+
+fn printCliParseError(writer: anytype, err: anyerror) !void {
+    const msg = switch (err) {
+        error.InvalidCommand => "error: unknown command\n",
+        error.UnknownOption => "error: unknown option\n",
+        error.MissingOptionValue => "error: missing option value\n",
+        error.TooManyArguments => "error: too many positional arguments\n",
+        else => "error: invalid command line\n",
+    };
+    try writer.writeAll(msg);
 }
 
 fn environmentRequestsValidate() bool {
@@ -280,7 +322,61 @@ fn executeValidateCommand(allocator: std.mem.Allocator, options: CommonOptions) 
     defer cfg.deinit(allocator);
     try edge_config.validate(&cfg);
     edge_config.warnRiskyConfig(&cfg);
-    std.debug.print("configuration valid\n", .{});
+    var stdout_buf: [2048]u8 = undefined;
+    var stdout = compat.stdoutWriter(&stdout_buf);
+    try stdout.writeAll("configuration valid\n");
+    try writeConfigSummary(&stdout, resolved_config_path, &cfg);
+    try stdout.flush();
+}
+
+fn executePrintConfigCommand(allocator: std.mem.Allocator, options: CommonOptions) !void {
+    const resolved_config_path = try resolveRuntimeConfigPath(allocator, options.config_path);
+    defer if (resolved_config_path) |path| allocator.free(path);
+    if (resolved_config_path) |path| try setProcessEnv(allocator, ENV_CONFIG_PATH, path);
+
+    var cfg = try edge_config.loadFromEnv(allocator);
+    defer cfg.deinit(allocator);
+    try edge_config.validate(&cfg);
+
+    var stdout_buf: [4096]u8 = undefined;
+    var stdout = compat.stdoutWriter(&stdout_buf);
+    try stdout.writeAll("effective config\n");
+    try writeConfigSummary(&stdout, resolved_config_path, &cfg);
+    try stdout.flush();
+}
+
+fn executeStatusCommand(allocator: std.mem.Allocator, options: SignalOptions) !void {
+    const resolved_config_path = try resolveRuntimeConfigPath(allocator, options.common.config_path);
+    defer if (resolved_config_path) |path| allocator.free(path);
+    if (resolved_config_path) |path| try setProcessEnv(allocator, ENV_CONFIG_PATH, path);
+
+    var cfg = try edge_config.loadFromEnv(allocator);
+    defer cfg.deinit(allocator);
+    try edge_config.validate(&cfg);
+
+    const pid_file_path = if (options.pid_file) |path| path else (cfg.pid_file);
+    const pid = blk: {
+        if (options.pid) |explicit_pid| break :blk explicit_pid;
+        if (pid_file_path.len > 0 and pathExists(pid_file_path)) {
+            break :blk try readPidFromFile(allocator, pid_file_path);
+        }
+        break :blk null;
+    };
+    const running = if (pid) |resolved_pid| try processExists(resolved_pid) else false;
+
+    var stdout_buf: [4096]u8 = undefined;
+    var stdout = compat.stdoutWriter(&stdout_buf);
+    try stdout.print("status: {s}\n", .{if (pid == null and pid_file_path.len == 0) "unknown" else if (running) "running" else "stopped"});
+    if (pid) |resolved_pid| {
+        try stdout.print("pid: {d}\n", .{resolved_pid});
+    } else if (pid_file_path.len > 0) {
+        try stdout.print("pid file: {s} (not present)\n", .{pid_file_path});
+    } else {
+        try stdout.writeAll("pid: unavailable\n");
+        try stdout.writeAll("note: set `pid ...;` in config or pass `--pid` / `--pid-file` for process checks\n");
+    }
+    try writeConfigSummary(&stdout, resolved_config_path, &cfg);
+    try stdout.flush();
 }
 
 fn executeRunCommand(allocator: std.mem.Allocator, args: []const []const u8, options: RunOptions) !void {
@@ -328,6 +424,45 @@ fn executeSignalCommand(
     try stdout.flush();
 }
 
+fn writeConfigSummary(writer: anytype, resolved_config_path: ?[]const u8, cfg: *const edge_config.EdgeConfig) !void {
+    try writer.print("config path: {s}\n", .{resolved_config_path orelse "<env/defaults only>"});
+    try writer.print("listen: {s}:{d}\n", .{ cfg.listen_host, cfg.listen_port });
+    try writer.print("tls: {s}\n", .{if (hasTlsConfig(cfg)) "enabled" else "disabled"});
+    try writer.print("pid file: {s}\n", .{if (cfg.pid_file.len > 0) cfg.pid_file else "<disabled>"});
+    try writer.print("doc root: {s}\n", .{if (cfg.doc_root.len > 0) cfg.doc_root else "<unset>"});
+    try writer.print("server blocks: {d}\n", .{cfg.server_blocks.len});
+    try writer.print("location blocks: {d}\n", .{countLocationBlocks(cfg)});
+    try writer.print("upstream: {s}\n", .{if (cfg.upstream_base_url.len > 0) cfg.upstream_base_url else "<unset>"});
+    try writer.print("metrics: {s}\n", .{if (cfg.metrics_path.len > 0) cfg.metrics_path else "<disabled>"});
+    try writer.print("metrics auth: {s}\n", .{if (cfg.metrics_require_auth) "required" else "off"});
+    try writer.print("workers: threads={d} processes={d} master={s} queue={d}\n", .{
+        cfg.worker_threads,
+        cfg.worker_processes,
+        if (cfg.master_process_enabled) "true" else "false",
+        cfg.worker_queue_size,
+    });
+    try writer.print("limits: active_connections={d} keep_alive_timeout_ms={d} drain_timeout_ms={d}\n", .{
+        cfg.max_active_connections,
+        cfg.keep_alive_timeout_ms,
+        cfg.shutdown_drain_timeout_ms,
+    });
+    try writer.print("protocols: http2={s} http3={s}\n", .{
+        if (cfg.http2_enabled) "on" else "off",
+        if (cfg.http3_enabled) "on" else "off",
+    });
+    try writer.print("rate limit rps: {d}\n", .{@as(i64, @intFromFloat(cfg.rate_limit_rps))});
+}
+
+fn countLocationBlocks(cfg: *const edge_config.EdgeConfig) usize {
+    var total: usize = 0;
+    for (cfg.server_blocks) |block| total += block.location_blocks.len;
+    return total;
+}
+
+fn hasTlsConfig(cfg: *const edge_config.EdgeConfig) bool {
+    return (cfg.tls_cert_path.len > 0 and cfg.tls_key_path.len > 0) or cfg.tls_sni_certs.len > 0 or cfg.tls_acme_enabled;
+}
+
 fn resolveCommandPid(allocator: std.mem.Allocator, options: SignalOptions) !std.posix.pid_t {
     if (options.pid) |pid| return pid;
     if (options.pid_file) |pid_file| return try readPidFromFile(allocator, pid_file);
@@ -346,6 +481,16 @@ fn parsePid(value: []const u8) !std.posix.pid_t {
     const pid = try std.fmt.parseInt(std.posix.pid_t, value, 10);
     if (pid <= 0) return error.InvalidPid;
     return pid;
+}
+
+fn processExists(pid: std.posix.pid_t) !bool {
+    const signal_zero: std.posix.SIG = @enumFromInt(0);
+    std.posix.kill(pid, signal_zero) catch |err| switch (err) {
+        error.PermissionDenied => return true,
+        error.ProcessNotFound => return false,
+        else => return err,
+    };
+    return true;
 }
 
 fn readPidFromFile(allocator: std.mem.Allocator, path: []const u8) !std.posix.pid_t {
@@ -842,6 +987,30 @@ test "parseCliCommand stop requires pid file option" {
     const cmd = try parseCliCommand(&.{ "stop", "--pid-file", "tardigrade.pid" });
     switch (cmd) {
         .stop => {},
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parseCliCommand status supports pid file option" {
+    const cmd = try parseCliCommand(&.{ "status", "--pid-file", "tardigrade.pid" });
+    switch (cmd) {
+        .status => |s| try std.testing.expectEqualStrings("tardigrade.pid", s.pid_file.?),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parseCliCommand print-config supports config path" {
+    const cmd = try parseCliCommand(&.{ "print-config", "-c", "tardigrade.conf" });
+    switch (cmd) {
+        .print_config => |options| try std.testing.expectEqualStrings("tardigrade.conf", options.config_path.?),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parseCliCommand config print alias supports config path" {
+    const cmd = try parseCliCommand(&.{ "config", "print", "--config", "tardigrade.conf" });
+    switch (cmd) {
+        .print_config => |options| try std.testing.expectEqualStrings("tardigrade.conf", options.config_path.?),
         else => return error.TestUnexpectedResult,
     }
 }

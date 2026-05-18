@@ -42,7 +42,7 @@ The default development listener starts on `http://localhost:8069`.
 ### Install latest release
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Bare-Systems/Tardigrade/main/scripts/install.sh | sh
+curl -fsSL https://github.com/Bare-Systems/Tardigrade/releases/latest/download/install.sh | sh
 ```
 
 ## Basic Usage

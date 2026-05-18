@@ -5,7 +5,11 @@ set -eu
 REPO="${TARDIGRADE_REPO:-Bare-Systems/Tardigrade}"
 VERSION="${TARDIGRADE_VERSION:-latest}"
 INSTALL_DIR="${TARDIGRADE_INSTALL_DIR:-$HOME/.local/bin}"
+RELEASE_BASE_URL="${TARDIGRADE_RELEASE_BASE_URL:-https://github.com/$REPO/releases}"
 DRY_RUN=0
+stage_binary=""
+stage_alias=""
+tmpdir=""
 
 usage() {
   cat <<'EOF'
@@ -15,6 +19,7 @@ Environment:
   TARDIGRADE_INSTALL_DIR  Override the install directory
   TARDIGRADE_VERSION      Override the release tag (default: latest)
   TARDIGRADE_REPO         Override the GitHub repo (default: Bare-Systems/Tardigrade)
+  TARDIGRADE_RELEASE_BASE_URL  Override the release base URL
 EOF
 }
 
@@ -52,9 +57,23 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 
+cleanup() {
+  if [ -n "${tmpdir:-}" ]; then
+    rm -rf "$tmpdir"
+  fi
+  if [ -n "${stage_binary:-}" ]; then
+    rm -f "$stage_binary"
+  fi
+  if [ -n "${stage_alias:-}" ]; then
+    rm -f "$stage_alias"
+  fi
+}
+
+trap cleanup EXIT INT TERM
+
 detect_platform() {
-  os="$(uname -s)"
-  arch="$(uname -m)"
+  os="${TARDIGRADE_TEST_UNAME_S:-$(uname -s)}"
+  arch="${TARDIGRADE_TEST_UNAME_M:-$(uname -m)}"
 
   case "$os/$arch" in
     Linux/x86_64|Linux/amd64)
@@ -92,9 +111,9 @@ download_url_for() {
   platform="$1"
   asset="tardigrade-${platform}.tar.gz"
   if [ "$VERSION" = "latest" ]; then
-    printf 'https://github.com/%s/releases/latest/download/%s\n' "$REPO" "$asset"
+    printf '%s/latest/download/%s\n' "$RELEASE_BASE_URL" "$asset"
   else
-    printf 'https://github.com/%s/releases/download/%s/%s\n' "$REPO" "$VERSION" "$asset"
+    printf '%s/download/%s/%s\n' "$RELEASE_BASE_URL" "$VERSION" "$asset"
   fi
 }
 
@@ -130,45 +149,55 @@ install_binary() {
 }
 
 install_alias() {
-  target="$1"
-  alias_path="$2"
+  src="$1"
+  link_target="$2"
+  alias_path="$3"
 
   rm -f "$alias_path"
-  if ln -s "$target" "$alias_path" 2>/dev/null; then
+  if ln -s "$link_target" "$alias_path" 2>/dev/null; then
     return
   fi
 
-  cp "$target" "$alias_path"
+  cp "$src" "$alias_path"
   chmod 0755 "$alias_path"
 }
 
 checksum_url_for() {
   if [ "$VERSION" = "latest" ]; then
-    printf 'https://github.com/%s/releases/latest/download/tardigrade-checksums.txt\n' "$REPO"
+    printf '%s/latest/download/tardigrade-checksums.txt\n' "$RELEASE_BASE_URL"
   else
-    printf 'https://github.com/%s/releases/download/%s/tardigrade-checksums.txt\n' "$REPO" "$VERSION"
+    printf '%s/download/%s/tardigrade-checksums.txt\n' "$RELEASE_BASE_URL" "$VERSION"
   fi
 }
 
 verify_checksum() {
   archive="$1"
   checksums="$2"
-  expected="$(grep "$(basename "$archive")" "$checksums" | awk '{print $1}')"
+  asset_name="$3"
+  expected="$(awk -v target="$asset_name" '
+    {
+      count = split($2, parts, "/");
+      if (parts[count] == target) {
+        print $1;
+        exit;
+      }
+    }
+  ' "$checksums")"
   if [ -z "$expected" ]; then
-    echo "warning: no checksum entry found for $(basename "$archive") — skipping verification" >&2
-    return
+    echo "missing checksum entry for $asset_name" >&2
+    exit 1
   fi
   if command -v sha256sum >/dev/null 2>&1; then
     actual="$(sha256sum "$archive" | awk '{print $1}')"
   elif command -v shasum >/dev/null 2>&1; then
     actual="$(shasum -a 256 "$archive" | awk '{print $1}')"
   else
-    echo "warning: sha256sum/shasum not found — skipping checksum verification" >&2
-    return
+    echo "sha256sum or shasum is required to verify Tardigrade releases" >&2
+    exit 1
   fi
   if [ "$actual" != "$expected" ]; then
     printf 'checksum mismatch for %s\n  expected: %s\n  got:      %s\n' \
-      "$(basename "$archive")" "$expected" "$actual" >&2
+      "$asset_name" "$expected" "$actual" >&2
     exit 1
   fi
 }
@@ -185,20 +214,30 @@ if [ "$DRY_RUN" -eq 1 ]; then
 fi
 
 tmpdir="$(mktemp -d)"
-trap 'rm -rf "$tmpdir"' EXIT INT TERM
 
 archive_path="$tmpdir/tardigrade.tar.gz"
 checksums_path="$tmpdir/tardigrade-checksums.txt"
+asset_name="$(basename "$asset_url")"
 
 download_file "$asset_url" "$archive_path"
 download_file "$checksum_url" "$checksums_path"
-verify_checksum "$archive_path" "$checksums_path"
+verify_checksum "$archive_path" "$checksums_path" "$asset_name"
 
 tar -xzf "$archive_path" -C "$tmpdir"
+[ -f "$tmpdir/tardigrade" ] || {
+  echo "release archive did not contain a tardigrade binary" >&2
+  exit 1
+}
 
 mkdir -p "$INSTALL_DIR"
-install_binary "$tmpdir/tardigrade" "$INSTALL_DIR/tardigrade"
-install_alias "$INSTALL_DIR/tardigrade" "$INSTALL_DIR/tardi"
+stage_binary="$INSTALL_DIR/.tardigrade.$$"
+stage_alias="$INSTALL_DIR/.tardi.$$"
+install_binary "$tmpdir/tardigrade" "$stage_binary"
+install_alias "$stage_binary" "tardigrade" "$stage_alias"
+mv -f "$stage_binary" "$INSTALL_DIR/tardigrade"
+stage_binary=""
+mv -f "$stage_alias" "$INSTALL_DIR/tardi"
+stage_alias=""
 
 printf 'Installed tardigrade to %s/tardigrade\n' "$INSTALL_DIR"
 printf 'Installed alias to %s/tardi\n' "$INSTALL_DIR"

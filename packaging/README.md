@@ -32,10 +32,12 @@ sudo systemctl enable --now tardigrade
 
 The DEB package:
 - Installs the binary to `/usr/bin/tardigrade`
+- Installs a starter config at `/etc/tardigrade/tardigrade.conf`
 - Creates a `tardigrade` system user
 - Installs a systemd service unit at `/lib/systemd/system/tardigrade.service`
 - Installs an env config template at `/etc/tardigrade/tardigrade.env` (mode 0640, owned by `root:tardigrade`)
 - Installs a logrotate config at `/etc/logrotate.d/tardigrade`
+- Creates `/var/lib/tardigrade` for the service working directory
 
 ## RPM (RHEL / Fedora / AlmaLinux)
 
@@ -90,4 +92,3 @@ Pre-built service files for host-native installs:
 |---|---|
 | [`systemd/tardigrade.service`](systemd/tardigrade.service) | systemd service unit (Linux) |
 | [`launchd/io.baresystems.tardigrade.plist`](launchd/io.baresystems.tardigrade.plist) | launchd plist (macOS) |
-

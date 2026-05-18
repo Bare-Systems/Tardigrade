@@ -57,9 +57,11 @@ BIN_DIR="${PKG_DIR}/usr/bin"
 CONF_DIR="${PKG_DIR}/etc/tardigrade"
 SYSTEMD_DIR="${PKG_DIR}/lib/systemd/system"
 LOGROTATE_DIR="${PKG_DIR}/etc/logrotate.d"
+STATE_DIR="${PKG_DIR}/var/lib/tardigrade"
+LOG_DIR="${PKG_DIR}/var/log/tardigrade"
 DEBIAN_DIR="${PKG_DIR}/DEBIAN"
 
-mkdir -p "$BIN_DIR" "$CONF_DIR" "$SYSTEMD_DIR" "$LOGROTATE_DIR" "$DEBIAN_DIR"
+mkdir -p "$BIN_DIR" "$CONF_DIR" "$SYSTEMD_DIR" "$LOGROTATE_DIR" "$STATE_DIR" "$LOG_DIR" "$DEBIAN_DIR"
 
 # Binary
 install -m 0755 "$BINARY" "${BIN_DIR}/tardigrade"
@@ -68,6 +70,7 @@ install -m 0755 "$BINARY" "${BIN_DIR}/tardigrade"
 cat > "${CONF_DIR}/tardigrade.env" <<'ENVEOF'
 # Tardigrade environment configuration
 # See https://github.com/Bare-Systems/Tardigrade for full reference.
+TARDIGRADE_CONFIG_PATH=/etc/tardigrade/tardigrade.conf
 TARDIGRADE_LISTEN_PORT=8069
 TARDIGRADE_LOG_LEVEL=info
 TARDIGRADE_REQUIRE_UNPRIVILEGED_USER=true
@@ -76,6 +79,9 @@ TARDIGRADE_REQUIRE_UNPRIVILEGED_USER=true
 # TARDIGRADE_TLS_KEY_PATH=/etc/tardigrade/tls/server.key
 ENVEOF
 chmod 0640 "${CONF_DIR}/tardigrade.env"
+
+# Starter config
+install -m 0644 "${REPO_ROOT}/packaging/tardigrade.conf" "${CONF_DIR}/tardigrade.conf"
 
 # systemd unit
 cp "${REPO_ROOT}/packaging/systemd/tardigrade.service" "${SYSTEMD_DIR}/tardigrade.service"
@@ -95,6 +101,13 @@ cat > "${LOGROTATE_DIR}/tardigrade" <<'LREOF'
     endscript
 }
 LREOF
+chmod 0644 "${LOGROTATE_DIR}/tardigrade"
+
+# Preserve operator-edited config files across upgrades.
+cat > "${DEBIAN_DIR}/conffiles" <<'CONFEOF'
+/etc/tardigrade/tardigrade.conf
+/etc/tardigrade/tardigrade.env
+CONFEOF
 
 # DEBIAN/control
 cat > "${DEBIAN_DIR}/control" <<CONTROL
@@ -121,7 +134,10 @@ if ! id -u tardigrade >/dev/null 2>&1; then
     useradd --system --no-create-home --shell /usr/sbin/nologin tardigrade
 fi
 chown root:tardigrade /etc/tardigrade/tardigrade.env
-systemctl daemon-reload
+install -d -o tardigrade -g tardigrade /var/lib/tardigrade /var/log/tardigrade
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload || true
+fi
 POSTINST
 chmod 0755 "${DEBIAN_DIR}/postinst"
 
@@ -129,8 +145,10 @@ chmod 0755 "${DEBIAN_DIR}/postinst"
 cat > "${DEBIAN_DIR}/prerm" <<'PRERM'
 #!/bin/sh
 set -e
-systemctl stop tardigrade.service 2>/dev/null || true
-systemctl disable tardigrade.service 2>/dev/null || true
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl stop tardigrade.service 2>/dev/null || true
+    systemctl disable tardigrade.service 2>/dev/null || true
+fi
 PRERM
 chmod 0755 "${DEBIAN_DIR}/prerm"
 

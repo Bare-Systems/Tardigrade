@@ -8,10 +8,10 @@ Type=simple
 User=tardigrade
 Group=tardigrade
 WorkingDirectory=/var/lib/tardigrade
-Environment=TARDIGRADE_CONFIG_PATH=/etc/tardigrade/tardigrade.conf
-ExecStart=/usr/local/bin/tardigrade run
-ExecReload=/usr/local/bin/tardigrade reload -c /etc/tardigrade/tardigrade.conf
-ExecStop=/usr/local/bin/tardigrade stop -c /etc/tardigrade/tardigrade.conf
+EnvironmentFile=-/etc/tardigrade/tardigrade.env
+ExecStart=/usr/bin/tardigrade run -c /etc/tardigrade/tardigrade.conf
+ExecReload=/usr/bin/tardigrade reload -c /etc/tardigrade/tardigrade.conf
+ExecStop=/usr/bin/tardigrade stop -c /etc/tardigrade/tardigrade.conf
 Restart=on-failure
 RestartSec=2
 LimitNOFILE=65536

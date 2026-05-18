@@ -46,7 +46,7 @@ jobs:
         uses: rhysd/actionlint@a443f344ff32813837fa49f7aa6cbc478d770e62 # v1.7.9
 
       - name: Run shellcheck
-        run: find scripts/ -name "*.sh" -exec shellcheck {} +
+        run: find scripts/ packaging/ -name "*.sh" -exec shellcheck {} +
 
       - name: Run hadolint
         uses: hadolint/hadolint-action@2332a7b74a6de0dda2e2221d575162eba76ba5e5 # v3.3.0
@@ -141,6 +141,44 @@ jobs:
         env:
           OPTIMIZE: ${{ matrix.optimize }}
         run: zig build "-Doptimize=$OPTIMIZE"
+
+  # ── Packaging smoke ─────────────────────────────────────────────────────────
+  # Verifies the release archive layout, install script behavior, and host-native
+  # DEB package layout against a disposable Ubuntu container.
+  packaging-smoke:
+    name: Packaging smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Install dependencies
+        run: sudo apt-get install -y libssl-dev
+
+      - name: Install Zig
+        run: sh ./scripts/install-zig.sh 0.16.0
+
+      - name: Cache Zig build artifacts
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cache/zig
+            .zig-cache
+          key: zig-packaging-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig') }}-${{ github.sha }}
+          restore-keys: |
+            zig-packaging-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig') }}-
+            zig-packaging-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Build ReleaseFast binary
+        run: zig build -Doptimize=ReleaseFast
+
+      - name: Smoke test install script
+        run: ./scripts/test-install.sh
+
+      - name: Smoke test DEB package
+        run: ./scripts/test-deb-package.sh
 
   # ── Performance smoke ────────────────────────────────────────────────────────
   # Shared-runner loopback benchmark with conservative floors and a 30s default

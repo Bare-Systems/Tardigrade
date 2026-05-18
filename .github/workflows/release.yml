@@ -107,6 +107,11 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Verify checkout is clean
+        run: |
+          git diff --exit-code
+          git diff --cached --exit-code
+
       - name: Install Zig
         run: sh ./scripts/install-zig.sh 0.16.0
 
@@ -119,16 +124,12 @@ jobs:
         run: zig build -Doptimize=ReleaseFast "-Dversion=$VERSION"
 
       - name: Package artifact
-        shell: bash
-        env:
-          ARCHIVE_NAME: ${{ matrix.archive_name }}
         run: |
-          set -euo pipefail
-          mkdir -p dist
-          cp zig-out/bin/tardigrade dist/tardigrade
-          ln -sf tardigrade dist/tardi
-          cp LICENSE dist/LICENSE
-          tar -C dist -czf "${ARCHIVE_NAME}.tar.gz" tardigrade tardi LICENSE
+          ./scripts/package-release-archive.sh \
+            --archive-name "${{ matrix.archive_name }}" \
+            --binary zig-out/bin/tardigrade \
+            --staging-dir dist \
+            --output-dir .
 
       - name: Generate SBOM
         uses: anchore/sbom-action@e11c554f704a0b820cbf8c51673f6945e0731532 # v0.20.0
@@ -311,6 +312,9 @@ jobs:
       contents: write
 
     steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
       - name: Download release notes
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -327,7 +331,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          find dist -type f \( -name '*.tar.gz' -o -name '*.deb' -o -name '*.rpm' \) -print0 | sort -z | xargs -0 shasum -a 256 > dist/tardigrade-checksums.txt
+          install -m 0755 scripts/install.sh dist/install.sh
+          find dist -type f \( -name '*.tar.gz' -o -name '*.deb' -o -name '*.rpm' -o -name 'install.sh' \) -print0 | sort -z | xargs -0 sha256sum > dist/tardigrade-checksums.txt
+
+      - name: Verify checksums
+        run: sha256sum --check dist/tardigrade-checksums.txt
 
       - name: Scan release archives for vulnerabilities
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
@@ -349,5 +357,6 @@ jobs:
             dist/*/*.deb
             dist/*/*.rpm
             dist/*/*.spdx.json
+            dist/install.sh
             dist/tardigrade-checksums.txt
           fail_on_unmatched_files: true

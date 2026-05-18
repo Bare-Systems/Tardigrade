@@ -1209,6 +1209,12 @@ pub const GatewayState = struct {
         self.metrics.recordRequest(status);
     }
 
+    pub fn metricsRecordLatencyMs(self: *GatewayState, latency_ms: i64) void {
+        self.metrics_mutex.lock();
+        defer self.metrics_mutex.unlock();
+        self.metrics.recordLatencyMs(latency_ms);
+    }
+
     pub fn metricsRecordQueueRejection(self: *GatewayState) void {
         self.metrics_mutex.lock();
         defer self.metrics_mutex.unlock();
@@ -1253,7 +1259,7 @@ pub const GatewayState = struct {
         defer allocator.free(device_json_owned);
 
         return std.fmt.allocPrint(allocator,
-            \\{{"total_requests":{d},"status_2xx":{d},"status_3xx":{d},"status_4xx":{d},"status_5xx":{d},"uptime_seconds":{d},"active_connections":{d},"mux_connections":{d},"mux_subscriptions":{d},"mux_subscriptions_by_device":{s},"connection_rejections":{d},"queue_rejections":{d},"upstream_unhealthy_backends":{d},"worker_active_jobs":{d},"worker_queued_jobs":{d},"worker_threads":{d},"worker_queue_capacity":{d},"error_invalid_request":{d},"error_unauthorized":{d},"error_rate_limited":{d},"error_upstream_timeout":{d},"error_upstream_unavailable":{d},"error_internal_error":{d},"error_overload":{d},"mux_frame_errors":{d}}}
+            \\{{"total_requests":{d},"status_2xx":{d},"status_3xx":{d},"status_4xx":{d},"status_5xx":{d},"uptime_seconds":{d},"active_connections":{d},"mux_connections":{d},"mux_subscriptions":{d},"mux_subscriptions_by_device":{s},"connection_rejections":{d},"queue_rejections":{d},"upstream_unhealthy_backends":{d},"request_latency_ms_count":{d},"request_latency_ms_sum":{d},"worker_active_jobs":{d},"worker_queued_jobs":{d},"worker_threads":{d},"worker_queue_capacity":{d},"error_invalid_request":{d},"error_unauthorized":{d},"error_rate_limited":{d},"error_upstream_timeout":{d},"error_upstream_unavailable":{d},"error_internal_error":{d},"error_overload":{d},"mux_frame_errors":{d}}}
         , .{
             metrics_snapshot.total_requests,
             metrics_snapshot.status_2xx,
@@ -1268,6 +1274,8 @@ pub const GatewayState = struct {
             metrics_snapshot.connection_rejections,
             metrics_snapshot.queue_rejections,
             metrics_snapshot.upstream_unhealthy_backends,
+            metrics_snapshot.latency_count,
+            metrics_snapshot.latency_sum_ms,
             metrics_snapshot.worker_active_jobs,
             metrics_snapshot.worker_queued_jobs,
             metrics_snapshot.worker_threads,

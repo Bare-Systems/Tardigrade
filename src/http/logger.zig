@@ -126,7 +126,7 @@ fn appendJsonLine(writer: anytype, self: Logger, level: Level, correlation_id: ?
     });
 
     if (correlation_id) |cid| {
-        try writer.print(",\"correlation_id\":\"{s}\"", .{cid});
+        try writer.print(",\"request_id\":\"{s}\",\"correlation_id\":\"{s}\"", .{ cid, cid });
     }
 
     try writer.writeAll(",\"msg\":\"");
@@ -220,6 +220,7 @@ test "appendJsonLine escapes message content and includes correlation id" {
     try appendJsonLine(fbs.writer(), log, .warn, "cid-1", "2026-05-11T00:00:00Z", "quote\"\nslash\\tab\t");
     const line = fbs.getWritten();
     try std.testing.expect(std.mem.find(u8, line, "\"level\":\"WARN\"") != null);
+    try std.testing.expect(std.mem.find(u8, line, "\"request_id\":\"cid-1\"") != null);
     try std.testing.expect(std.mem.find(u8, line, "\"correlation_id\":\"cid-1\"") != null);
     try std.testing.expect(std.mem.find(u8, line, "\"msg\":\"quote\\\"\\nslash\\\\tab\\t\"") != null);
 }

@@ -120,7 +120,13 @@ headers, and forwards the same ID upstream. JSON access logs include
 Prometheus metrics are available on `TARDIGRADE_METRICS_PATH` (default
 `/status/metrics`). Set the path to an empty string to disable the endpoint, or
 set `TARDIGRADE_METRICS_REQUIRE_AUTH=true` to require the configured request
-auth controls before serving metrics.
+auth controls before serving metrics. The endpoint now includes a global
+`tardigrade_request_latency_ms` histogram plus the worker/event-loop gauges
+documented in `docs/OBSERVABILITY.md`.
+
+Proxy hops also propagate W3C `traceparent` in addition to Tardigrade's
+request ID headers, so upstream services can correlate the same request through
+logs, metrics, and trace context.
 
 Security validation is treated as a release gate. The current security program,
 corpus replay entrypoint, and internal pentest workflow are documented in
@@ -133,6 +139,7 @@ corpus replay entrypoint, and internal pentest workflow are documented in
 | Zig 0.16 engineering guide | `docs/ZIG_ENGINEERING_GUIDE.md` |
 | Core v1 support matrix | `docs/SUPPORT_MATRIX.md` |
 | Code review checklist | `docs/CODE_REVIEW_CHECKLIST.md` |
+| Observability | `docs/OBSERVABILITY.md` |
 | Release checklist | `docs/RELEASE_CHECKLIST.md` |
 | Packaging | `packaging/README.md` |
 | Benchmarks | `benchmarks/README.md` |

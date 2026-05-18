@@ -25,6 +25,19 @@ pub const Metrics = struct {
     queue_rejections: u64,
     /// Current number of upstream backends marked unhealthy.
     upstream_unhealthy_backends: u64,
+    /// Request latency histogram bucket counts (milliseconds).
+    latency_le_1ms: u64,
+    latency_le_5ms: u64,
+    latency_le_10ms: u64,
+    latency_le_25ms: u64,
+    latency_le_50ms: u64,
+    latency_le_100ms: u64,
+    latency_le_250ms: u64,
+    latency_le_500ms: u64,
+    latency_le_1000ms: u64,
+    latency_gt_1000ms: u64,
+    latency_count: u64,
+    latency_sum_ms: u64,
     /// Current number of worker jobs actively executing request work.
     worker_active_jobs: u64,
     /// Current number of connections queued for the worker pool.
@@ -62,6 +75,18 @@ pub const Metrics = struct {
             .connection_rejections = 0,
             .queue_rejections = 0,
             .upstream_unhealthy_backends = 0,
+            .latency_le_1ms = 0,
+            .latency_le_5ms = 0,
+            .latency_le_10ms = 0,
+            .latency_le_25ms = 0,
+            .latency_le_50ms = 0,
+            .latency_le_100ms = 0,
+            .latency_le_250ms = 0,
+            .latency_le_500ms = 0,
+            .latency_le_1000ms = 0,
+            .latency_gt_1000ms = 0,
+            .latency_count = 0,
+            .latency_sum_ms = 0,
             .worker_active_jobs = 0,
             .worker_queued_jobs = 0,
             .worker_threads = 0,
@@ -130,11 +155,53 @@ pub const Metrics = struct {
         self.upstream_unhealthy_backends = @intCast(count);
     }
 
+    pub fn recordLatencyMs(self: *Metrics, latency_ms: i64) void {
+        const latency_u64: u64 = if (latency_ms <= 0) 0 else @intCast(latency_ms);
+        self.latency_count += 1;
+        self.latency_sum_ms += latency_u64;
+
+        if (latency_u64 <= 1) {
+            self.latency_le_1ms += 1;
+        } else if (latency_u64 <= 5) {
+            self.latency_le_5ms += 1;
+        } else if (latency_u64 <= 10) {
+            self.latency_le_10ms += 1;
+        } else if (latency_u64 <= 25) {
+            self.latency_le_25ms += 1;
+        } else if (latency_u64 <= 50) {
+            self.latency_le_50ms += 1;
+        } else if (latency_u64 <= 100) {
+            self.latency_le_100ms += 1;
+        } else if (latency_u64 <= 250) {
+            self.latency_le_250ms += 1;
+        } else if (latency_u64 <= 500) {
+            self.latency_le_500ms += 1;
+        } else if (latency_u64 <= 1000) {
+            self.latency_le_1000ms += 1;
+        } else {
+            self.latency_gt_1000ms += 1;
+        }
+    }
+
     pub fn setWorkerPoolStats(self: *Metrics, active_jobs: usize, queued_jobs: usize, worker_threads: usize, queue_capacity: usize) void {
         self.worker_active_jobs = @intCast(active_jobs);
         self.worker_queued_jobs = @intCast(queued_jobs);
         self.worker_threads = @intCast(worker_threads);
         self.worker_queue_capacity = @intCast(queue_capacity);
+    }
+
+    fn latencyBucketCumulative(self: *const Metrics, le_ms: u64) u64 {
+        var total: u64 = 0;
+        if (le_ms >= 1) total += self.latency_le_1ms;
+        if (le_ms >= 5) total += self.latency_le_5ms;
+        if (le_ms >= 10) total += self.latency_le_10ms;
+        if (le_ms >= 25) total += self.latency_le_25ms;
+        if (le_ms >= 50) total += self.latency_le_50ms;
+        if (le_ms >= 100) total += self.latency_le_100ms;
+        if (le_ms >= 250) total += self.latency_le_250ms;
+        if (le_ms >= 500) total += self.latency_le_500ms;
+        if (le_ms >= 1000) total += self.latency_le_1000ms;
+        return total;
     }
 
     pub fn recordErrorCode(self: *Metrics, code: []const u8) void {
@@ -166,7 +233,10 @@ pub const Metrics = struct {
     /// Format metrics in Prometheus text exposition format.
     /// Caller owns the returned memory.
     pub fn toPrometheus(self: *const Metrics, allocator: std.mem.Allocator) ![]u8 {
-        return std.fmt.allocPrint(allocator,
+        var out = std.array_list.Managed(u8).init(allocator);
+        errdefer out.deinit();
+
+        try out.print(
             \\# HELP tardigrade_requests_total Total HTTP requests processed
             \\# TYPE tardigrade_requests_total counter
             \\tardigrade_requests_total {d}
@@ -203,6 +273,54 @@ pub const Metrics = struct {
             \\# HELP tardigrade_upstream_unhealthy_backends Current upstream backends marked unhealthy
             \\# TYPE tardigrade_upstream_unhealthy_backends gauge
             \\tardigrade_upstream_unhealthy_backends {d}
+            \\
+        , .{
+            self.total_requests,
+            self.status_2xx,
+            self.status_3xx,
+            self.status_4xx,
+            self.status_5xx,
+            self.uptimeSeconds(),
+            self.active_connections,
+            self.mux_connections,
+            self.mux_subscriptions,
+            self.connection_rejections,
+            self.queue_rejections,
+            self.upstream_unhealthy_backends,
+        });
+
+        try out.print(
+            \\# HELP tardigrade_request_latency_ms Request latency histogram in milliseconds
+            \\# TYPE tardigrade_request_latency_ms histogram
+            \\tardigrade_request_latency_ms_bucket{{le="1"}} {d}
+            \\tardigrade_request_latency_ms_bucket{{le="5"}} {d}
+            \\tardigrade_request_latency_ms_bucket{{le="10"}} {d}
+            \\tardigrade_request_latency_ms_bucket{{le="25"}} {d}
+            \\tardigrade_request_latency_ms_bucket{{le="50"}} {d}
+            \\tardigrade_request_latency_ms_bucket{{le="100"}} {d}
+            \\tardigrade_request_latency_ms_bucket{{le="250"}} {d}
+            \\tardigrade_request_latency_ms_bucket{{le="500"}} {d}
+            \\tardigrade_request_latency_ms_bucket{{le="1000"}} {d}
+            \\tardigrade_request_latency_ms_bucket{{le="+Inf"}} {d}
+            \\tardigrade_request_latency_ms_sum {d}
+            \\tardigrade_request_latency_ms_count {d}
+            \\
+        , .{
+            self.latencyBucketCumulative(1),
+            self.latencyBucketCumulative(5),
+            self.latencyBucketCumulative(10),
+            self.latencyBucketCumulative(25),
+            self.latencyBucketCumulative(50),
+            self.latencyBucketCumulative(100),
+            self.latencyBucketCumulative(250),
+            self.latencyBucketCumulative(500),
+            self.latencyBucketCumulative(1000),
+            self.latency_count,
+            self.latency_sum_ms,
+            self.latency_count,
+        });
+
+        try out.print(
             \\# HELP tardigrade_worker_active_jobs Current worker jobs actively executing request work
             \\# TYPE tardigrade_worker_active_jobs gauge
             \\tardigrade_worker_active_jobs {d}
@@ -247,18 +365,6 @@ pub const Metrics = struct {
             \\tardigrade_health_probe_runs_total {d}
             \\
         , .{
-            self.total_requests,
-            self.status_2xx,
-            self.status_3xx,
-            self.status_4xx,
-            self.status_5xx,
-            self.uptimeSeconds(),
-            self.active_connections,
-            self.mux_connections,
-            self.mux_subscriptions,
-            self.connection_rejections,
-            self.queue_rejections,
-            self.upstream_unhealthy_backends,
             self.worker_active_jobs,
             self.worker_queued_jobs,
             self.worker_threads,
@@ -274,13 +380,15 @@ pub const Metrics = struct {
             self.event_loop_iterations,
             self.health_probe_runs,
         });
+
+        return out.toOwnedSlice();
     }
 
     /// Format metrics as a JSON string.
     /// Caller owns the returned memory.
     pub fn toJson(self: *const Metrics, allocator: std.mem.Allocator) ![]u8 {
         return std.fmt.allocPrint(allocator,
-            \\{{"total_requests":{d},"status_2xx":{d},"status_3xx":{d},"status_4xx":{d},"status_5xx":{d},"uptime_seconds":{d},"active_connections":{d},"mux_connections":{d},"mux_subscriptions":{d},"connection_rejections":{d},"queue_rejections":{d},"upstream_unhealthy_backends":{d},"worker_active_jobs":{d},"worker_queued_jobs":{d},"worker_threads":{d},"worker_queue_capacity":{d},"error_invalid_request":{d},"error_unauthorized":{d},"error_rate_limited":{d},"error_upstream_timeout":{d},"error_upstream_unavailable":{d},"error_internal_error":{d},"error_overload":{d},"mux_frame_errors":{d},"event_loop_iterations":{d},"health_probe_runs":{d}}}
+            \\{{"total_requests":{d},"status_2xx":{d},"status_3xx":{d},"status_4xx":{d},"status_5xx":{d},"uptime_seconds":{d},"active_connections":{d},"mux_connections":{d},"mux_subscriptions":{d},"connection_rejections":{d},"queue_rejections":{d},"upstream_unhealthy_backends":{d},"request_latency_ms_count":{d},"request_latency_ms_sum":{d},"worker_active_jobs":{d},"worker_queued_jobs":{d},"worker_threads":{d},"worker_queue_capacity":{d},"error_invalid_request":{d},"error_unauthorized":{d},"error_rate_limited":{d},"error_upstream_timeout":{d},"error_upstream_unavailable":{d},"error_internal_error":{d},"error_overload":{d},"mux_frame_errors":{d},"event_loop_iterations":{d},"health_probe_runs":{d}}}
         , .{
             self.total_requests,
             self.status_2xx,
@@ -294,6 +402,8 @@ pub const Metrics = struct {
             self.connection_rejections,
             self.queue_rejections,
             self.upstream_unhealthy_backends,
+            self.latency_count,
+            self.latency_sum_ms,
             self.worker_active_jobs,
             self.worker_queued_jobs,
             self.worker_threads,
@@ -351,6 +461,9 @@ test "Metrics tracks active connections and rejections" {
     m.setActiveConnections(7);
     m.setMuxConnections(2);
     m.setMuxSubscriptions(5);
+    m.recordLatencyMs(0);
+    m.recordLatencyMs(6);
+    m.recordLatencyMs(1200);
     m.setWorkerPoolStats(3, 4, 8, 1024);
     m.recordConnectionRejection();
     m.recordQueueRejection();
@@ -360,6 +473,8 @@ test "Metrics tracks active connections and rejections" {
     try std.testing.expectEqual(@as(u64, 7), m.active_connections);
     try std.testing.expectEqual(@as(u64, 2), m.mux_connections);
     try std.testing.expectEqual(@as(u64, 5), m.mux_subscriptions);
+    try std.testing.expectEqual(@as(u64, 3), m.latency_count);
+    try std.testing.expectEqual(@as(u64, 1206), m.latency_sum_ms);
     try std.testing.expectEqual(@as(u64, 3), m.worker_active_jobs);
     try std.testing.expectEqual(@as(u64, 4), m.worker_queued_jobs);
     try std.testing.expectEqual(@as(u64, 8), m.worker_threads);
@@ -391,6 +506,8 @@ test "Metrics toPrometheus produces valid Prometheus text" {
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_connection_rejections_total") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_queue_rejections_total") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_upstream_unhealthy_backends") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_request_latency_ms_bucket{le=\"1\"}") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_request_latency_ms_count") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_worker_active_jobs") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_worker_queued_jobs") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_error_invalid_request_total") != null);
@@ -414,6 +531,8 @@ test "Metrics toJson produces valid JSON" {
     try std.testing.expect(std.mem.find(u8, json, "\"connection_rejections\":0") != null);
     try std.testing.expect(std.mem.find(u8, json, "\"queue_rejections\":0") != null);
     try std.testing.expect(std.mem.find(u8, json, "\"upstream_unhealthy_backends\":0") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"request_latency_ms_count\":0") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"request_latency_ms_sum\":0") != null);
     try std.testing.expect(std.mem.find(u8, json, "\"worker_active_jobs\":0") != null);
     try std.testing.expect(std.mem.find(u8, json, "\"worker_queued_jobs\":0") != null);
     try std.testing.expect(std.mem.find(u8, json, "\"error_invalid_request\":0") != null);

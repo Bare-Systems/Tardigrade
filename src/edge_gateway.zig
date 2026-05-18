@@ -1846,7 +1846,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
     if (request.version == .http11 and request.headers.get("host") == null) {
         try sendApiError(allocator, writer, .bad_request, "invalid_request", "HTTP/1.1 request missing required Host header", correlation_id, false, state);
         var ctx_host = http.request_context.RequestContext.init(allocator, correlation_id, connection_ip);
-        logAccess(&ctx_host, request.method.toString(), request.uri.path, 400, request.headers.get("user-agent") orelse "");
+        logAccess(state, &ctx_host, request.method.toString(), request.uri.path, 400, request.headers.get("user-agent") orelse "");
         return;
     }
 
@@ -1859,7 +1859,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
     if (request.method == .TRACE) {
         try sendApiError(allocator, writer, .method_not_allowed, "invalid_request", "Method Not Allowed", correlation_id, keep_alive, state);
         var ctx_trace = http.request_context.RequestContext.init(allocator, correlation_id, connection_ip);
-        logAccess(&ctx_trace, "TRACE", request.uri.path, 405, request.headers.get("user-agent") orelse "");
+        logAccess(state, &ctx_trace, "TRACE", request.uri.path, 405, request.headers.get("user-agent") orelse "");
         return;
     }
 
@@ -1893,13 +1893,13 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
     const effective_cfg = resolveRequestConfig(cfg, request.headers.get("host"), &effective_cfg_storage) orelse {
         try sendApiError(allocator, writer, .not_found, "invalid_request", "Not Found", correlation_id, keep_alive, state);
         var ctx_404 = http.request_context.RequestContext.init(allocator, correlation_id, client_ip);
-        logAccess(&ctx_404, request.method.toString(), request.uri.path, 404, request.headers.get("user-agent") orelse "");
+        logAccess(state, &ctx_404, request.method.toString(), request.uri.path, 404, request.headers.get("user-agent") orelse "");
         return;
     };
     var ctx = http.request_context.RequestContext.init(allocator, correlation_id, client_ip);
     if (!hostMatchesServerNames(effective_cfg, &request)) {
         try sendApiError(allocator, writer, .not_found, "invalid_request", "Not Found", correlation_id, keep_alive, state);
-        logAccess(&ctx, request.method.toString(), request.uri.path, 404, request.headers.get("user-agent") orelse "");
+        logAccess(state, &ctx, request.method.toString(), request.uri.path, 404, request.headers.get("user-agent") orelse "");
         return;
     }
 
@@ -1933,7 +1933,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
                 applyResponseHeaders(state, &response);
                 try response.write(writer);
                 state.metricsRecord(r.status);
-                logAccess(&ctx, request.method.toString(), request.uri.path, r.status, request.headers.get("user-agent") orelse "");
+                logAccess(state, &ctx, request.method.toString(), request.uri.path, r.status, request.headers.get("user-agent") orelse "");
                 return;
             },
             .returned => |r| {
@@ -1944,7 +1944,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
                     applyResponseHeaders(state, &response);
                     try response.write(writer);
                     state.metricsRecord(r.status);
-                    logAccess(&ctx, request.method.toString(), request.uri.path, r.status, request.headers.get("user-agent") orelse "");
+                    logAccess(state, &ctx, request.method.toString(), request.uri.path, r.status, request.headers.get("user-agent") orelse "");
                     return;
                 }
                 var response = http.Response.init(allocator);
@@ -1957,7 +1957,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
                 applyResponseHeaders(state, &response);
                 try response.write(writer);
                 state.metricsRecord(r.status);
-                logAccess(&ctx, request.method.toString(), request.uri.path, r.status, request.headers.get("user-agent") orelse "");
+                logAccess(state, &ctx, request.method.toString(), request.uri.path, r.status, request.headers.get("user-agent") orelse "");
                 return;
             },
         }
@@ -1983,7 +1983,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
             applyResponseHeaders(state, &response);
             try response.write(writer);
             state.metricsRecord(r.status);
-            logAccess(&ctx, request.method.toString(), request.uri.path, r.status, request.headers.get("user-agent") orelse "");
+            logAccess(state, &ctx, request.method.toString(), request.uri.path, r.status, request.headers.get("user-agent") orelse "");
             return;
         },
         .returned => |r| {
@@ -1994,7 +1994,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
                 applyResponseHeaders(state, &response);
                 try response.write(writer);
                 state.metricsRecord(r.status);
-                logAccess(&ctx, request.method.toString(), request.uri.path, r.status, request.headers.get("user-agent") orelse "");
+                logAccess(state, &ctx, request.method.toString(), request.uri.path, r.status, request.headers.get("user-agent") orelse "");
                 return;
             }
             var response = http.Response.init(allocator);
@@ -2007,7 +2007,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
             applyResponseHeaders(state, &response);
             try response.write(writer);
             state.metricsRecord(r.status);
-            logAccess(&ctx, request.method.toString(), request.uri.path, r.status, request.headers.get("user-agent") orelse "");
+            logAccess(state, &ctx, request.method.toString(), request.uri.path, r.status, request.headers.get("user-agent") orelse "");
             return;
         },
     }
@@ -2041,7 +2041,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
     }
 
     const route_status = try routeRequest(conn, allocator, effective_cfg, state, &ctx, &request, correlation_id, &keep_alive, client_ip);
-    logAccess(&ctx, request.method.toString(), request.uri.path, route_status, request.headers.get("user-agent") orelse "");
+    logAccess(state, &ctx, request.method.toString(), request.uri.path, route_status, request.headers.get("user-agent") orelse "");
     return;
 }
 
@@ -2920,7 +2920,7 @@ fn runMiddlewarePipeline(
         const country = request.headers.get(cfg.geo_country_header);
         if (isGeoBlocked(cfg.geo_blocked_countries, country)) {
             try sendApiError(allocator, writer, .forbidden, "forbidden", "Geo access denied", correlation_id, keep_alive, state);
-            logAccess(ctx, request.method.toString(), request.uri.path, 403, request.headers.get("user-agent") orelse "");
+            logAccess(state, ctx, request.method.toString(), request.uri.path, 403, request.headers.get("user-agent") orelse "");
             return true;
         }
     }
@@ -2932,7 +2932,7 @@ fn runMiddlewarePipeline(
         const msg = http.request_limits.rejectionMessage(uri_check, &msg_buf);
         try sendApiError(allocator, writer, .uri_too_long, "invalid_request", msg, correlation_id, keep_alive, state);
         state.logger.warn(correlation_id, "URI too long: {d} bytes", .{request.uri.path.len});
-        logAccess(ctx, request.method.toString(), request.uri.path, 414, request.headers.get("user-agent") orelse "");
+        logAccess(state, ctx, request.method.toString(), request.uri.path, 414, request.headers.get("user-agent") orelse "");
         return true;
     }
     const header_count_check = http.request_limits.validateHeaderCount(request.headers.count(), limits);
@@ -2941,7 +2941,7 @@ fn runMiddlewarePipeline(
         const msg = http.request_limits.rejectionMessage(header_count_check, &msg_buf);
         try sendApiError(allocator, writer, .request_header_fields_too_large, "invalid_request", msg, correlation_id, keep_alive, state);
         state.logger.warn(correlation_id, "Too many headers: {d}", .{request.headers.count()});
-        logAccess(ctx, request.method.toString(), request.uri.path, 431, request.headers.get("user-agent") orelse "");
+        logAccess(state, ctx, request.method.toString(), request.uri.path, 431, request.headers.get("user-agent") orelse "");
         return true;
     }
     {
@@ -2953,7 +2953,7 @@ fn runMiddlewarePipeline(
             const msg = http.request_limits.rejectionMessage(total_check, &msg_buf);
             try sendApiError(allocator, writer, .request_header_fields_too_large, "invalid_request", msg, correlation_id, keep_alive, state);
             state.logger.warn(correlation_id, "Headers total too large: {d} bytes", .{headers_total});
-            logAccess(ctx, request.method.toString(), request.uri.path, 431, request.headers.get("user-agent") orelse "");
+            logAccess(state, ctx, request.method.toString(), request.uri.path, 431, request.headers.get("user-agent") orelse "");
             return true;
         }
     }
@@ -2962,7 +2962,7 @@ fn runMiddlewarePipeline(
         if (body_check != .ok) {
             try sendApiError(allocator, writer, .payload_too_large, "invalid_request", "Request body too large", correlation_id, keep_alive, state);
             state.logger.warn(correlation_id, "Body too large: {d} bytes", .{body.len});
-            logAccess(ctx, request.method.toString(), request.uri.path, 413, request.headers.get("user-agent") orelse "");
+            logAccess(state, ctx, request.method.toString(), request.uri.path, 413, request.headers.get("user-agent") orelse "");
             return true;
         }
     }
@@ -2970,7 +2970,7 @@ fn runMiddlewarePipeline(
     if (state.access_control) |*acl| {
         if (acl.check(client_ip) == .denied) {
             try sendApiError(allocator, writer, .forbidden, "forbidden", "Access denied", correlation_id, keep_alive, state);
-            logAccess(ctx, request.method.toString(), request.uri.path, 403, request.headers.get("user-agent") orelse "");
+            logAccess(state, ctx, request.method.toString(), request.uri.path, 403, request.headers.get("user-agent") orelse "");
             return true;
         }
     }
@@ -2991,7 +2991,7 @@ fn runMiddlewarePipeline(
         try response.write(writer);
         state.metricsRecord(429);
         state.metricsRecordErrorCode("rate_limited");
-        logAccess(ctx, request.method.toString(), request.uri.path, 429, request.headers.get("user-agent") orelse "");
+        logAccess(state, ctx, request.method.toString(), request.uri.path, 429, request.headers.get("user-agent") orelse "");
         return true;
     }
 
@@ -3960,7 +3960,8 @@ fn handleHttp3Request(
     try handleHttp3Connection(allocator, request, response, &effective_ctx);
 }
 
-fn logAccess(ctx: *const http.request_context.RequestContext, method: []const u8, path: []const u8, status: u16, user_agent: []const u8) void {
+fn logAccess(state: *GatewayState, ctx: *const http.request_context.RequestContext, method: []const u8, path: []const u8, status: u16, user_agent: []const u8) void {
+    state.metricsRecordLatencyMs(ctx.elapsedMs());
     const entry = http.access_log.AccessLogEntry{
         .method = method,
         .path = path,

@@ -436,8 +436,18 @@ test "Decoder accumulates dynamic table across calls" {
     // Encodes: name="x-hdr", value="hello"
     const block1 = [_]u8{
         0x40, // literal + incremental indexing, name follows
-        0x05, 'x', '-', 'h', 'd', 'r',
-        0x05, 'h', 'e', 'l', 'l', 'o',
+        0x05,
+        'x',
+        '-',
+        'h',
+        'd',
+        'r',
+        0x05,
+        'h',
+        'e',
+        'l',
+        'l',
+        'o',
     };
     var r1 = try dec.decode(allocator, block1[0..]);
     defer deinitDecoded(allocator, &r1);

@@ -16,6 +16,9 @@ pub const AccessLogEntry = struct {
     bytes_sent: usize,
     response_bytes: usize,
     error_category: []const u8,
+    /// Cancellation or timeout reason when the request was terminated early.
+    /// Empty string when the request completed normally.
+    cancel_reason: []const u8 = "",
 
     pub fn log(self: AccessLogEntry) void {
         emit(self);
@@ -163,7 +166,7 @@ fn appendEntry(allocator: std.mem.Allocator, out: *std.ArrayList(u8), cfg: Confi
     switch (cfg.format) {
         .json => try out.print(
             allocator,
-            "{{\"type\":\"access\",\"ts\":\"{s}\",\"request_id\":\"{s}\",\"correlation_id\":\"{s}\",\"method\":\"{s}\",\"path\":\"{s}\",\"status\":{d},\"latency_ms\":{d},\"client_ip\":\"{s}\",\"upstream_addr\":\"{s}\",\"upstream_status\":{s},\"identity\":\"{s}\",\"user_agent\":\"{s}\",\"bytes_sent\":{d},\"response_bytes\":{d},\"error_category\":\"{s}\"}}\n",
+            "{{\"type\":\"access\",\"ts\":\"{s}\",\"request_id\":\"{s}\",\"correlation_id\":\"{s}\",\"method\":\"{s}\",\"path\":\"{s}\",\"status\":{d},\"latency_ms\":{d},\"client_ip\":\"{s}\",\"upstream_addr\":\"{s}\",\"upstream_status\":{s},\"identity\":\"{s}\",\"user_agent\":\"{s}\",\"bytes_sent\":{d},\"response_bytes\":{d},\"error_category\":\"{s}\",\"cancel_reason\":\"{s}\"}}\n",
             .{
                 ts,
                 entry.correlation_id,
@@ -180,13 +183,21 @@ fn appendEntry(allocator: std.mem.Allocator, out: *std.ArrayList(u8), cfg: Confi
                 entry.bytes_sent,
                 entry.response_bytes,
                 entry.error_category,
+                entry.cancel_reason,
             },
         ),
-        .plain => try out.print(
-            allocator,
-            "{s} {s} {d} {d}ms ip={s} req={s} upstream={s} upstream_status={?d} bytes={d} ua=\"{s}\" err={s}\n",
-            .{ entry.method, entry.path, entry.status, entry.latency_ms, entry.client_ip, entry.correlation_id, entry.upstream_addr, entry.upstream_status, entry.response_bytes, entry.user_agent, entry.error_category },
-        ),
+        .plain => if (entry.cancel_reason.len > 0)
+            try out.print(
+                allocator,
+                "{s} {s} {d} {d}ms ip={s} req={s} upstream={s} upstream_status={?d} bytes={d} ua=\"{s}\" err={s} cancel={s}\n",
+                .{ entry.method, entry.path, entry.status, entry.latency_ms, entry.client_ip, entry.correlation_id, entry.upstream_addr, entry.upstream_status, entry.response_bytes, entry.user_agent, entry.error_category, entry.cancel_reason },
+            )
+        else
+            try out.print(
+                allocator,
+                "{s} {s} {d} {d}ms ip={s} req={s} upstream={s} upstream_status={?d} bytes={d} ua=\"{s}\" err={s}\n",
+                .{ entry.method, entry.path, entry.status, entry.latency_ms, entry.client_ip, entry.correlation_id, entry.upstream_addr, entry.upstream_status, entry.response_bytes, entry.user_agent, entry.error_category },
+            ),
         .custom => try appendTemplate(allocator, out, if (cfg.custom_template.len > 0) cfg.custom_template else "{method} {path} {status}", ts, entry),
     }
 }
@@ -234,6 +245,8 @@ fn appendTemplate(allocator: std.mem.Allocator, out: *std.ArrayList(u8), templat
                     entry.user_agent
                 else if (std.mem.eql(u8, key, "error_category"))
                     entry.error_category
+                else if (std.mem.eql(u8, key, "cancel_reason"))
+                    entry.cancel_reason
                 else
                     "";
                 try out.appendSlice(allocator, replacement);
@@ -357,6 +370,7 @@ test "formatEntry json contains required fields" {
     try std.testing.expect(std.mem.find(u8, line, "\"status\":201") != null);
     try std.testing.expect(std.mem.find(u8, line, "\"identity\":\"user-1\"") != null);
     try std.testing.expect(std.mem.find(u8, line, "\"upstream_status\":200") != null);
+    try std.testing.expect(std.mem.find(u8, line, "\"cancel_reason\":\"\"") != null);
 }
 
 test "formatEntry json encodes null upstream_status as literal null" {

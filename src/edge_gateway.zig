@@ -4006,6 +4006,10 @@ fn handleHttp3Request(
 
 fn logAccess(state: *GatewayState, ctx: *const http.request_context.RequestContext, method: []const u8, path: []const u8, status: u16, user_agent: []const u8) void {
     state.metricsRecordLatencyMs(ctx.elapsedMs());
+    const cancel_reason: []const u8 = if (ctx.lifecycle) |lc|
+        if (lc.token.reason) |reason| @tagName(reason) else ""
+    else
+        "";
     const entry = http.access_log.AccessLogEntry{
         .method = method,
         .path = path,
@@ -4020,6 +4024,7 @@ fn logAccess(state: *GatewayState, ctx: *const http.request_context.RequestConte
         .bytes_sent = ctx.response_bytes,
         .response_bytes = ctx.response_bytes,
         .error_category = classifyErrorCategory(status),
+        .cancel_reason = cancel_reason,
     };
     entry.log();
 }
@@ -4031,6 +4036,8 @@ fn classifyErrorCategory(status: u16) []const u8 {
         "invalid_request"
     else if (status == 401 or status == 403)
         "authz"
+    else if (status == 408)
+        "request_timeout"
     else if (status == 429)
         "rate_limited"
     else if (status == 503)

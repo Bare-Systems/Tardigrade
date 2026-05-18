@@ -103,6 +103,14 @@ still fall back to client IP rate limiting.
 Hot reloads now retire superseded configs after in-flight requests drain, so
 repeated `reload` or `SIGHUP` cycles do not retain old config allocations.
 
+Connection handling is intentionally split: the main thread runs a non-blocking
+accept/event loop, while accepted sockets move onto a bounded worker pool for
+blocking TLS, HTTP parsing, proxying, and response writes. `/status/metrics`
+exports `tardigrade_active_connections`, `tardigrade_worker_active_jobs`,
+`tardigrade_worker_queued_jobs`, `tardigrade_worker_threads`, and
+`tardigrade_event_loop_iterations_total` so operators can see whether load is
+building at the listener, the worker queue, or inside active request work.
+
 Tardigrade accepts a safe inbound `X-Request-ID` or legacy
 `X-Correlation-ID`, generates one when neither is valid, echoes both response
 headers, and forwards the same ID upstream. JSON access logs include

@@ -393,6 +393,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         &worker_ctx,
     );
     defer worker_pool.deinit();
+    state.metricsSetWorkerPoolStats(0, 0, worker_count, cfg.worker_queue_size);
 
     state.logger.info(null, "Tardigrade edge listening on {s}:{d}", .{ cfg.listen_host, cfg.listen_port });
     state.logger.info(null, "Event loop initialized with backend: {s}", .{event_loop.backendName()});
@@ -591,6 +592,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     if (cfg.max_total_connection_memory_bytes > 0) {
         state.logger.info(null, "Global connection memory estimate limit enabled: {d} bytes", .{cfg.max_total_connection_memory_bytes});
     }
+    state.logger.info(null, "Connection model: non-blocking accept loop on the main thread with blocking per-connection work on a bounded worker pool", .{});
 
     // Install signal handlers for graceful shutdown
     http.shutdown.installSignalHandlers();
@@ -636,6 +638,13 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
             runDnsDiscoveryRefresh(current_cfg, &state);
             runProxyCacheMaintenance(current_cfg, &state);
             if (tls_terminator) |*tls| tls.runMaintenance(http.event_loop.monotonicMs());
+            const worker_snapshot = worker_pool.snapshot();
+            state.metricsSetWorkerPoolStats(
+                worker_snapshot.active_jobs,
+                worker_snapshot.queued_jobs,
+                worker_snapshot.worker_threads,
+                worker_snapshot.max_queue_len,
+            );
             state.metrics_mutex.lock();
             state.metrics.recordEventLoopIteration();
             state.metrics_mutex.unlock();

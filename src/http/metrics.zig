@@ -25,6 +25,14 @@ pub const Metrics = struct {
     queue_rejections: u64,
     /// Current number of upstream backends marked unhealthy.
     upstream_unhealthy_backends: u64,
+    /// Current number of worker jobs actively executing request work.
+    worker_active_jobs: u64,
+    /// Current number of connections queued for the worker pool.
+    worker_queued_jobs: u64,
+    /// Configured number of worker threads in the pool.
+    worker_threads: u64,
+    /// Configured maximum queue depth for the worker pool.
+    worker_queue_capacity: u64,
     /// Error category counters.
     err_invalid_request: u64,
     err_unauthorized: u64,
@@ -54,6 +62,10 @@ pub const Metrics = struct {
             .connection_rejections = 0,
             .queue_rejections = 0,
             .upstream_unhealthy_backends = 0,
+            .worker_active_jobs = 0,
+            .worker_queued_jobs = 0,
+            .worker_threads = 0,
+            .worker_queue_capacity = 0,
             .err_invalid_request = 0,
             .err_unauthorized = 0,
             .err_rate_limited = 0,
@@ -116,6 +128,13 @@ pub const Metrics = struct {
 
     pub fn setUpstreamUnhealthyBackends(self: *Metrics, count: usize) void {
         self.upstream_unhealthy_backends = @intCast(count);
+    }
+
+    pub fn setWorkerPoolStats(self: *Metrics, active_jobs: usize, queued_jobs: usize, worker_threads: usize, queue_capacity: usize) void {
+        self.worker_active_jobs = @intCast(active_jobs);
+        self.worker_queued_jobs = @intCast(queued_jobs);
+        self.worker_threads = @intCast(worker_threads);
+        self.worker_queue_capacity = @intCast(queue_capacity);
     }
 
     pub fn recordErrorCode(self: *Metrics, code: []const u8) void {
@@ -184,6 +203,18 @@ pub const Metrics = struct {
             \\# HELP tardigrade_upstream_unhealthy_backends Current upstream backends marked unhealthy
             \\# TYPE tardigrade_upstream_unhealthy_backends gauge
             \\tardigrade_upstream_unhealthy_backends {d}
+            \\# HELP tardigrade_worker_active_jobs Current worker jobs actively executing request work
+            \\# TYPE tardigrade_worker_active_jobs gauge
+            \\tardigrade_worker_active_jobs {d}
+            \\# HELP tardigrade_worker_queued_jobs Current connections queued for worker-pool dispatch
+            \\# TYPE tardigrade_worker_queued_jobs gauge
+            \\tardigrade_worker_queued_jobs {d}
+            \\# HELP tardigrade_worker_threads Configured worker thread count
+            \\# TYPE tardigrade_worker_threads gauge
+            \\tardigrade_worker_threads {d}
+            \\# HELP tardigrade_worker_queue_capacity Configured worker queue capacity
+            \\# TYPE tardigrade_worker_queue_capacity gauge
+            \\tardigrade_worker_queue_capacity {d}
             \\# HELP tardigrade_error_invalid_request_total Total invalid_request API errors
             \\# TYPE tardigrade_error_invalid_request_total counter
             \\tardigrade_error_invalid_request_total {d}
@@ -228,6 +259,10 @@ pub const Metrics = struct {
             self.connection_rejections,
             self.queue_rejections,
             self.upstream_unhealthy_backends,
+            self.worker_active_jobs,
+            self.worker_queued_jobs,
+            self.worker_threads,
+            self.worker_queue_capacity,
             self.err_invalid_request,
             self.err_unauthorized,
             self.err_rate_limited,
@@ -245,7 +280,7 @@ pub const Metrics = struct {
     /// Caller owns the returned memory.
     pub fn toJson(self: *const Metrics, allocator: std.mem.Allocator) ![]u8 {
         return std.fmt.allocPrint(allocator,
-            \\{{"total_requests":{d},"status_2xx":{d},"status_3xx":{d},"status_4xx":{d},"status_5xx":{d},"uptime_seconds":{d},"active_connections":{d},"mux_connections":{d},"mux_subscriptions":{d},"connection_rejections":{d},"queue_rejections":{d},"upstream_unhealthy_backends":{d},"error_invalid_request":{d},"error_unauthorized":{d},"error_rate_limited":{d},"error_upstream_timeout":{d},"error_upstream_unavailable":{d},"error_internal_error":{d},"error_overload":{d},"mux_frame_errors":{d},"event_loop_iterations":{d},"health_probe_runs":{d}}}
+            \\{{"total_requests":{d},"status_2xx":{d},"status_3xx":{d},"status_4xx":{d},"status_5xx":{d},"uptime_seconds":{d},"active_connections":{d},"mux_connections":{d},"mux_subscriptions":{d},"connection_rejections":{d},"queue_rejections":{d},"upstream_unhealthy_backends":{d},"worker_active_jobs":{d},"worker_queued_jobs":{d},"worker_threads":{d},"worker_queue_capacity":{d},"error_invalid_request":{d},"error_unauthorized":{d},"error_rate_limited":{d},"error_upstream_timeout":{d},"error_upstream_unavailable":{d},"error_internal_error":{d},"error_overload":{d},"mux_frame_errors":{d},"event_loop_iterations":{d},"health_probe_runs":{d}}}
         , .{
             self.total_requests,
             self.status_2xx,
@@ -259,6 +294,10 @@ pub const Metrics = struct {
             self.connection_rejections,
             self.queue_rejections,
             self.upstream_unhealthy_backends,
+            self.worker_active_jobs,
+            self.worker_queued_jobs,
+            self.worker_threads,
+            self.worker_queue_capacity,
             self.err_invalid_request,
             self.err_unauthorized,
             self.err_rate_limited,
@@ -312,6 +351,7 @@ test "Metrics tracks active connections and rejections" {
     m.setActiveConnections(7);
     m.setMuxConnections(2);
     m.setMuxSubscriptions(5);
+    m.setWorkerPoolStats(3, 4, 8, 1024);
     m.recordConnectionRejection();
     m.recordQueueRejection();
     m.recordQueueRejection();
@@ -320,6 +360,10 @@ test "Metrics tracks active connections and rejections" {
     try std.testing.expectEqual(@as(u64, 7), m.active_connections);
     try std.testing.expectEqual(@as(u64, 2), m.mux_connections);
     try std.testing.expectEqual(@as(u64, 5), m.mux_subscriptions);
+    try std.testing.expectEqual(@as(u64, 3), m.worker_active_jobs);
+    try std.testing.expectEqual(@as(u64, 4), m.worker_queued_jobs);
+    try std.testing.expectEqual(@as(u64, 8), m.worker_threads);
+    try std.testing.expectEqual(@as(u64, 1024), m.worker_queue_capacity);
     try std.testing.expectEqual(@as(u64, 1), m.connection_rejections);
     try std.testing.expectEqual(@as(u64, 2), m.queue_rejections);
     try std.testing.expectEqual(@as(u64, 1), m.mux_frame_errors);
@@ -347,6 +391,8 @@ test "Metrics toPrometheus produces valid Prometheus text" {
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_connection_rejections_total") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_queue_rejections_total") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_upstream_unhealthy_backends") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_worker_active_jobs") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_worker_queued_jobs") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_error_invalid_request_total") != null);
     try std.testing.expect(std.mem.find(u8, prom, "# TYPE tardigrade_requests_total counter") != null);
     try std.testing.expect(std.mem.find(u8, prom, "# TYPE tardigrade_uptime_seconds gauge") != null);
@@ -368,6 +414,8 @@ test "Metrics toJson produces valid JSON" {
     try std.testing.expect(std.mem.find(u8, json, "\"connection_rejections\":0") != null);
     try std.testing.expect(std.mem.find(u8, json, "\"queue_rejections\":0") != null);
     try std.testing.expect(std.mem.find(u8, json, "\"upstream_unhealthy_backends\":0") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"worker_active_jobs\":0") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"worker_queued_jobs\":0") != null);
     try std.testing.expect(std.mem.find(u8, json, "\"error_invalid_request\":0") != null);
     try std.testing.expect(std.mem.find(u8, json, "\"uptime_seconds\":") != null);
     try std.testing.expect(std.mem.find(u8, json, "\"event_loop_iterations\":0") != null);

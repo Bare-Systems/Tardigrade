@@ -2473,8 +2473,12 @@ test "prometheus metrics endpoint exposes counters and can require auth" {
     defer metrics_before.deinit();
     try std.testing.expectEqual(@as(u16, 200), metrics_before.status_code);
     try std.testing.expect(std.mem.find(u8, metrics_before.body, "# TYPE tardigrade_requests_total counter") != null);
+    try std.testing.expect(std.mem.find(u8, metrics_before.body, "# TYPE tardigrade_worker_active_jobs gauge") != null);
+    try std.testing.expect(std.mem.find(u8, metrics_before.body, "# TYPE tardigrade_worker_queued_jobs gauge") != null);
     const requests_before = prometheusMetricValue(metrics_before.body, "tardigrade_requests_total") orelse return error.InvalidHttpResponse;
     const status_2xx_before = prometheusMetricValue(metrics_before.body, "tardigrade_requests_2xx_total") orelse return error.InvalidHttpResponse;
+    const worker_threads = prometheusMetricValue(metrics_before.body, "tardigrade_worker_threads") orelse return error.InvalidHttpResponse;
+    try std.testing.expect(worker_threads >= 1);
 
     var proxy_response = try sendRequest(allocator, tardigrade.port, .{
         .method = "GET",

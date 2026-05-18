@@ -153,6 +153,14 @@ isolated cleanup PR rather than mixing it into a feature change.
 
 ### Main Event Loop
 
+Tardigrade's current connection model is explicit:
+
+- one main-thread event loop accepts sockets and runs housekeeping
+- accepted connections move to a bounded worker pool
+- request handling inside workers is blocking today, not async/hybrid
+- `std.Io.Group` / coroutine-style async request execution is deliberately not
+  used in the hot path yet
+
 The main thread runs a level-triggered epoll/kqueue loop on the listener socket.
 
 - `accept()` is called in a tight drain loop before returning to `epoll_wait` /

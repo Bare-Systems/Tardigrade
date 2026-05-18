@@ -32,6 +32,13 @@ const WorkerQueue = struct {
 };
 
 pub const WorkerPool = struct {
+    pub const Snapshot = struct {
+        active_jobs: usize,
+        queued_jobs: usize,
+        worker_threads: usize,
+        max_queue_len: usize,
+    };
+
     allocator: std.mem.Allocator,
     threads: if (builtin.single_threaded) [0]std.Thread else []std.Thread,
     worker_queues: []WorkerQueue,
@@ -131,6 +138,26 @@ pub const WorkerPool = struct {
             self.next_queue = (queue_index + 1) % self.worker_queues.len;
         }
         self.cond.signal();
+    }
+
+    pub fn snapshot(self: *WorkerPool) Snapshot {
+        if (builtin.single_threaded) {
+            return .{
+                .active_jobs = self.active_jobs,
+                .queued_jobs = self.queued_jobs,
+                .worker_threads = 0,
+                .max_queue_len = self.max_queue_len,
+            };
+        }
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return .{
+            .active_jobs = self.active_jobs,
+            .queued_jobs = self.queued_jobs,
+            .worker_threads = self.threads.len,
+            .max_queue_len = self.max_queue_len,
+        };
     }
 
     /// Drain in-flight work and shut down workers.
@@ -354,6 +381,27 @@ test "worker pool queue selection prefers least-loaded worker queue" {
 
     const idx = pool.selectQueueForSubmitLocked();
     try std.testing.expectEqual(@as(usize, 2), idx);
+}
+
+test "worker pool snapshot reports queue and worker capacity" {
+    var threads = [_]std.Thread{ undefined, undefined, undefined };
+    var pool = WorkerPool{
+        .allocator = std.testing.allocator,
+        .threads = threads[0..],
+        .worker_queues = &.{},
+        .worker_ids = &.{},
+        .active_jobs = 2,
+        .queued_jobs = 5,
+        .handler = undefined,
+        .handler_ctx = undefined,
+        .max_queue_len = 64,
+    };
+
+    const snapshot = pool.snapshot();
+    try std.testing.expectEqual(@as(usize, 2), snapshot.active_jobs);
+    try std.testing.expectEqual(@as(usize, 5), snapshot.queued_jobs);
+    try std.testing.expectEqual(@as(usize, 3), snapshot.worker_threads);
+    try std.testing.expectEqual(@as(usize, 64), snapshot.max_queue_len);
 }
 
 test "worker pool popWorkLocked steals from peer queue" {

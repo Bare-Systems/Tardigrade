@@ -441,9 +441,11 @@ fn writeConfigSummary(writer: anytype, resolved_config_path: ?[]const u8, cfg: *
         if (cfg.master_process_enabled) "true" else "false",
         cfg.worker_queue_size,
     });
-    try writer.print("limits: active_connections={d} keep_alive_timeout_ms={d} drain_timeout_ms={d}\n", .{
+    try writer.print("limits: active_connections={d} in_flight_requests={d} keep_alive_timeout_ms={d} request_total_timeout_ms={d} drain_timeout_ms={d}\n", .{
         cfg.max_active_connections,
+        cfg.max_in_flight_requests,
         cfg.keep_alive_timeout_ms,
+        cfg.request_total_timeout_ms,
         cfg.shutdown_drain_timeout_ms,
     });
     try writer.print("protocols: http2={s} http3={s}\n", .{

@@ -591,6 +591,12 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     if (cfg.max_active_connections > 0) {
         state.logger.info(null, "Global active connection limit enabled: {d}", .{cfg.max_active_connections});
     }
+    if (cfg.max_in_flight_requests > 0) {
+        state.logger.info(null, "Global in-flight request limit enabled: {d} (returns 503 when exceeded)", .{cfg.max_in_flight_requests});
+    }
+    if (cfg.request_total_timeout_ms > 0) {
+        state.logger.info(null, "Request total timeout enabled: {d}ms", .{cfg.request_total_timeout_ms});
+    }
     if (cfg.max_total_connection_memory_bytes > 0) {
         state.logger.info(null, "Global connection memory estimate limit enabled: {d} bytes", .{cfg.max_total_connection_memory_bytes});
     }

@@ -189,6 +189,8 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         .max_connections_per_ip = cfg.max_connections_per_ip,
         .max_active_connections = cfg.max_active_connections,
         .active_connections_total = 0,
+        .in_flight_requests = std.atomic.Value(u32).init(0),
+        .max_in_flight_requests = cfg.max_in_flight_requests,
         .active_ws_streams = 0,
         .active_sse_streams = 0,
         .active_mux_connections = 0,
@@ -389,6 +391,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         state_allocator,
         worker_count,
         cfg.worker_queue_size,
+        cfg.worker_max_queue_depth,
         handleAcceptedClient,
         &worker_ctx,
     );
@@ -507,7 +510,11 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     if (cfg.cb_threshold > 0) {
         state.logger.info(null, "Circuit breaker enabled: threshold={d} timeout={d}ms", .{ cfg.cb_threshold, cfg.cb_timeout_ms });
     }
-    state.logger.info(null, "Worker pool enabled: workers={d} queue={d}", .{ worker_count, cfg.worker_queue_size });
+    if (cfg.worker_max_queue_depth > 0) {
+        state.logger.info(null, "Worker pool enabled: workers={d} queue={d} per_worker_queue_depth={d}", .{ worker_count, cfg.worker_queue_size, cfg.worker_max_queue_depth });
+    } else {
+        state.logger.info(null, "Worker pool enabled: workers={d} queue={d}", .{ worker_count, cfg.worker_queue_size });
+    }
     if (cfg.fd_soft_limit > 0) {
         const applied = applyFdSoftLimit(cfg.fd_soft_limit) catch |err| blk: {
             state.logger.warn(null, "failed to apply fd soft limit: {}", .{err});
@@ -565,6 +572,9 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     if (cfg.upstream_connect_timeout_ms > 0) {
         state.logger.info(null, "Upstream connect timeout configured: {d}ms", .{cfg.upstream_connect_timeout_ms});
     }
+    if (cfg.upstream_response_timeout_ms > 0) {
+        state.logger.info(null, "Upstream response timeout configured: {d}ms (Unix socket upstreams only)", .{cfg.upstream_response_timeout_ms});
+    }
     if (cfg.upstream_timeout_budget_ms > 0) {
         state.logger.info(null, "Upstream timeout budget configured: {d}ms", .{cfg.upstream_timeout_budget_ms});
     }
@@ -588,6 +598,12 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     }
     if (cfg.max_active_connections > 0) {
         state.logger.info(null, "Global active connection limit enabled: {d}", .{cfg.max_active_connections});
+    }
+    if (cfg.max_in_flight_requests > 0) {
+        state.logger.info(null, "Global in-flight request limit enabled: {d} (returns 503 when exceeded)", .{cfg.max_in_flight_requests});
+    }
+    if (cfg.request_total_timeout_ms > 0) {
+        state.logger.info(null, "Request total timeout enabled: {d}ms", .{cfg.request_total_timeout_ms});
     }
     if (cfg.max_total_connection_memory_bytes > 0) {
         state.logger.info(null, "Global connection memory estimate limit enabled: {d} bytes", .{cfg.max_total_connection_memory_bytes});
@@ -831,6 +847,7 @@ fn applyReloadedRuntimeConfig(cfg: *const edge_config.EdgeConfig, state: *Gatewa
     };
     state.max_connections_per_ip = cfg.max_connections_per_ip;
     state.max_active_connections = cfg.max_active_connections;
+    state.max_in_flight_requests = cfg.max_in_flight_requests;
     state.max_total_connection_memory_bytes = cfg.max_total_connection_memory_bytes;
     state.connection_memory_estimate_bytes = if (cfg.max_connection_memory_bytes > 0) cfg.max_connection_memory_bytes else MAX_REQUEST_SIZE;
     state.compression_config = .{
@@ -1903,6 +1920,28 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         return;
     }
 
+    // --- In-flight request backpressure ---
+    if (!state.tryAcquireRequestSlot()) {
+        try sendApiError(allocator, writer, .service_unavailable, "overloaded", "Too many in-flight requests", correlation_id, false, state);
+        state.metricsRecord(503);
+        state.metricsRecordErrorCode("overloaded");
+        logAccess(state, &ctx, request.method.toString(), request.uri.path, 503, request.headers.get("user-agent") orelse "");
+        return;
+    }
+    defer state.releaseRequestSlot();
+
+    // --- Request Lifecycle ---
+    var lifecycle = http.request_lifecycle.RequestLifecycle.init(correlation_id, effective_cfg.request_total_timeout_ms);
+    ctx.lifecycle = &lifecycle;
+    // During graceful shutdown, cap the request deadline to the drain window so
+    // long-running requests don't block shutdown indefinitely.
+    if (http.shutdown.isShutdownRequested() and effective_cfg.shutdown_drain_timeout_ms > 0) {
+        const drain_deadline_ms = compat.milliTimestamp() + @as(i64, @intCast(effective_cfg.shutdown_drain_timeout_ms));
+        if (lifecycle.token.deadline_ms == 0 or lifecycle.token.deadline_ms > drain_deadline_ms) {
+            lifecycle.token.deadline_ms = drain_deadline_ms;
+        }
+    }
+
     // --- Rewrite / return directives ---
     var request_uri_buf = std.array_list.Managed(u8).init(allocator);
     defer request_uri_buf.deinit();
@@ -2037,6 +2076,16 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
     try primeRequestAuthContext(allocator, effective_cfg, state, &ctx, &request.headers);
 
     if (try runMiddlewarePipeline(allocator, writer, effective_cfg, state, &ctx, &request, correlation_id, keep_alive)) {
+        return;
+    }
+
+    // Deadline check: if the overall request deadline elapsed during auth/middleware,
+    // reject now rather than dispatching to the (potentially slow) upstream handler.
+    if (lifecycle.checkDeadline(.routing)) {
+        try sendApiError(allocator, writer, .request_timeout, "request_timeout", "Request deadline exceeded", correlation_id, keep_alive, state);
+        state.metricsRecord(408);
+        state.metricsRecordErrorCode("request_timeout");
+        logAccess(state, &ctx, request.method.toString(), request.uri.path, 408, request.headers.get("user-agent") orelse "");
         return;
     }
 
@@ -2757,10 +2806,19 @@ fn handleLocationProxyPass(
                 auth_scopes,
                 per_attempt_timeout_ms,
                 cfg.upstream_connect_timeout_ms,
+                cfg.upstream_response_timeout_ms,
+                if (ctx.lifecycle) |lc| &lc.token else null,
             );
         state.recordUpstreamAttemptEnd(selection.base_url);
         const result = resp catch |err| {
             state.recordUpstreamFailure(cfg, selection.base_url);
+            // If the request deadline elapsed, stop retrying immediately.
+            if (err == error.RequestCancelled) {
+                if (ctx.lifecycle) |lc| lc.logTimeout("upstream_connect");
+                try sendApiError(allocator, writer, .gateway_timeout, "upstream_timeout", "Upstream request timed out", correlation_id, keep_alive, state);
+                ctx.setUpstreamResult(resolved.upstream_host, @intFromEnum(http.Status.gateway_timeout), 0);
+                return @intFromEnum(http.Status.gateway_timeout);
+            }
             if (attempt + 1 < max_attempts) {
                 state.logger.warn(correlation_id, "proxy attempt {d}/{d} failed: {}", .{ attempt + 1, max_attempts, err });
                 continue;
@@ -3736,6 +3794,8 @@ fn handleHttp3LocationProxyPass(
             null,
             ctx.cfg.upstream_timeout_ms,
             ctx.cfg.upstream_connect_timeout_ms,
+            ctx.cfg.upstream_response_timeout_ms,
+            null, // HTTP/3 path: no per-request lifecycle yet
         );
     defer upstream_response.deinit(allocator);
 
@@ -3962,6 +4022,10 @@ fn handleHttp3Request(
 
 fn logAccess(state: *GatewayState, ctx: *const http.request_context.RequestContext, method: []const u8, path: []const u8, status: u16, user_agent: []const u8) void {
     state.metricsRecordLatencyMs(ctx.elapsedMs());
+    const cancel_reason: []const u8 = if (ctx.lifecycle) |lc|
+        if (lc.token.reason) |reason| @tagName(reason) else ""
+    else
+        "";
     const entry = http.access_log.AccessLogEntry{
         .method = method,
         .path = path,
@@ -3976,6 +4040,7 @@ fn logAccess(state: *GatewayState, ctx: *const http.request_context.RequestConte
         .bytes_sent = ctx.response_bytes,
         .response_bytes = ctx.response_bytes,
         .error_category = classifyErrorCategory(status),
+        .cancel_reason = cancel_reason,
     };
     entry.log();
 }
@@ -3987,6 +4052,8 @@ fn classifyErrorCategory(status: u16) []const u8 {
         "invalid_request"
     else if (status == 401 or status == 403)
         "authz"
+    else if (status == 408)
+        "request_timeout"
     else if (status == 429)
         "rate_limited"
     else if (status == 503)

@@ -435,16 +435,25 @@ fn writeConfigSummary(writer: anytype, resolved_config_path: ?[]const u8, cfg: *
     try writer.print("upstream: {s}\n", .{if (cfg.upstream_base_url.len > 0) cfg.upstream_base_url else "<unset>"});
     try writer.print("metrics: {s}\n", .{if (cfg.metrics_path.len > 0) cfg.metrics_path else "<disabled>"});
     try writer.print("metrics auth: {s}\n", .{if (cfg.metrics_require_auth) "required" else "off"});
-    try writer.print("workers: threads={d} processes={d} master={s} queue={d}\n", .{
+    try writer.print("workers: threads={d} processes={d} master={s} queue={d} per_worker_queue_depth={d}\n", .{
         cfg.worker_threads,
         cfg.worker_processes,
         if (cfg.master_process_enabled) "true" else "false",
         cfg.worker_queue_size,
+        cfg.worker_max_queue_depth,
     });
-    try writer.print("limits: active_connections={d} keep_alive_timeout_ms={d} drain_timeout_ms={d}\n", .{
+    try writer.print("limits: active_connections={d} in_flight_requests={d} keep_alive_timeout_ms={d} request_total_timeout_ms={d} drain_timeout_ms={d}\n", .{
         cfg.max_active_connections,
+        cfg.max_in_flight_requests,
         cfg.keep_alive_timeout_ms,
+        cfg.request_total_timeout_ms,
         cfg.shutdown_drain_timeout_ms,
+    });
+    try writer.print("upstream_timeouts: attempt_ms={d} connect_ms={d} response_ms={d} budget_ms={d}\n", .{
+        cfg.upstream_timeout_ms,
+        cfg.upstream_connect_timeout_ms,
+        cfg.upstream_response_timeout_ms,
+        cfg.upstream_timeout_budget_ms,
     });
     try writer.print("protocols: http2={s} http3={s}\n", .{
         if (cfg.http2_enabled) "on" else "off",

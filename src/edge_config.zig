@@ -303,6 +303,10 @@ pub const EdgeConfig = struct {
     worker_cpu_affinity: []const u8,
     /// Maximum queued accepted connections waiting for workers.
     worker_queue_size: usize,
+    /// Maximum connections queued per individual worker thread (0 = no per-worker limit).
+    /// When all worker queues are at this depth, new connections are rejected with 503.
+    /// Set via TARDIGRADE_WORKER_MAX_QUEUE_DEPTH.
+    worker_max_queue_depth: usize,
     /// Graceful shutdown drain timeout in milliseconds (TARDIGRADE_SHUTDOWN_DRAIN_TIMEOUT_MS).
     /// On shutdown signal, tardigrade waits up to this long for in-flight requests to complete
     /// before force-closing any remaining queued connections. 0 force-closes immediately.
@@ -313,8 +317,17 @@ pub const EdgeConfig = struct {
     max_connections_per_ip: u32,
     /// Maximum total active client connections across all IPs (0 = unlimited).
     max_active_connections: u32,
+    /// Maximum concurrent in-flight HTTP requests across all connections (0 = unlimited).
+    /// Distinct from max_active_connections: a single keep-alive connection counts as
+    /// one connection but may serve many sequential requests.
+    /// Returns 503 when exceeded. Set via TARDIGRADE_MAX_IN_FLIGHT_REQUESTS.
+    max_in_flight_requests: u32,
     /// Idle keep-alive timeout for client connections (ms, 0 = disabled).
     keep_alive_timeout_ms: u32,
+    /// Overall request deadline from first byte received to response fully written (ms, 0 = disabled).
+    /// Caps all downstream work (auth, upstream calls, response streaming) for a single request.
+    /// Set via TARDIGRADE_REQUEST_TOTAL_TIMEOUT_MS.
+    request_total_timeout_ms: u32,
     /// Maximum requests served per client connection (0 = unlimited).
     max_requests_per_connection: u32,
     /// Maximum idle connection sessions cached for reuse.
@@ -335,6 +348,10 @@ pub const EdgeConfig = struct {
     /// Connect timeout for upstream TCP connections in milliseconds (0 = no limit).
     /// Applied independently of the per-attempt read/write timeout (TARDIGRADE_UPSTREAM_CONNECT_TIMEOUT_MS).
     upstream_connect_timeout_ms: u32,
+    /// Maximum time (ms) to wait for the upstream to begin sending a response after the
+    /// request is fully sent (0 = disabled, falls back to upstream_timeout_ms).
+    /// Only enforced on Unix socket upstreams. Set via TARDIGRADE_UPSTREAM_RESPONSE_TIMEOUT_MS.
+    upstream_response_timeout_ms: u32,
     /// Total timeout budget across all upstream attempts for a request (ms, 0 = disabled).
     upstream_timeout_budget_ms: u64,
     /// Passive health threshold: mark upstream as failed after this many failed attempts (0 = disabled).
@@ -990,6 +1007,7 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     const worker_queue_str = envOrDefault(allocator, "TARDIGRADE_WORKER_QUEUE_SIZE", "1024") catch unreachable;
     defer allocator.free(worker_queue_str);
     const worker_queue_size = std.fmt.parseInt(usize, worker_queue_str, 10) catch 1024;
+    const worker_max_queue_depth = parseIntEnv(usize, allocator, "TARDIGRADE_WORKER_MAX_QUEUE_DEPTH", 0);
     const shutdown_drain_timeout_ms = parseIntEnv(u64, allocator, "TARDIGRADE_SHUTDOWN_DRAIN_TIMEOUT_MS", 30_000);
     const websocket_enabled = parseBoolEnv(allocator, "TARDIGRADE_WEBSOCKET_ENABLED", false);
     const websocket_idle_timeout_ms = parseIntEnv(u32, allocator, "TARDIGRADE_WEBSOCKET_IDLE_TIMEOUT_MS", 30_000);
@@ -1035,9 +1053,13 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     defer allocator.free(max_active_conn_str);
     const max_active_connections = std.fmt.parseInt(u32, max_active_conn_str, 10) catch 0;
 
+    const max_in_flight_requests = parseIntEnv(u32, allocator, "TARDIGRADE_MAX_IN_FLIGHT_REQUESTS", 0);
+
     const keep_alive_timeout_str = envOrDefault(allocator, "TARDIGRADE_KEEP_ALIVE_TIMEOUT_MS", "5000") catch unreachable;
     defer allocator.free(keep_alive_timeout_str);
     const keep_alive_timeout_ms = std.fmt.parseInt(u32, keep_alive_timeout_str, 10) catch 5000;
+
+    const request_total_timeout_ms = parseIntEnv(u32, allocator, "TARDIGRADE_REQUEST_TOTAL_TIMEOUT_MS", 0);
 
     const max_req_conn_str = envOrDefault(allocator, "TARDIGRADE_MAX_REQUESTS_PER_CONNECTION", "100") catch unreachable;
     defer allocator.free(max_req_conn_str);
@@ -1068,6 +1090,7 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     const upstream_retry_attempts = @max(std.fmt.parseInt(u32, retry_attempts_str, 10) catch 1, 1);
     const upstream_retry_idempotent_only = parseBoolEnv(allocator, "TARDIGRADE_UPSTREAM_RETRY_IDEMPOTENT_ONLY", true);
     const upstream_connect_timeout_ms = parseIntEnv(u32, allocator, "TARDIGRADE_UPSTREAM_CONNECT_TIMEOUT_MS", 5_000);
+    const upstream_response_timeout_ms = parseIntEnv(u32, allocator, "TARDIGRADE_UPSTREAM_RESPONSE_TIMEOUT_MS", 0);
 
     const timeout_budget_str = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_TIMEOUT_BUDGET_MS", "0") catch unreachable;
     defer allocator.free(timeout_budget_str);
@@ -1400,11 +1423,14 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .worker_recycle_seconds = worker_recycle_seconds,
         .worker_cpu_affinity = worker_cpu_affinity,
         .worker_queue_size = worker_queue_size,
+        .worker_max_queue_depth = worker_max_queue_depth,
         .shutdown_drain_timeout_ms = shutdown_drain_timeout_ms,
         .fd_soft_limit = fd_soft_limit,
         .max_connections_per_ip = max_connections_per_ip,
         .max_active_connections = max_active_connections,
+        .max_in_flight_requests = max_in_flight_requests,
         .keep_alive_timeout_ms = keep_alive_timeout_ms,
+        .request_total_timeout_ms = request_total_timeout_ms,
         .max_requests_per_connection = max_requests_per_connection,
         .connection_pool_size = connection_pool_size,
         .max_connection_memory_bytes = max_connection_memory_bytes,
@@ -1414,6 +1440,7 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .upstream_retry_attempts = upstream_retry_attempts,
         .upstream_retry_idempotent_only = upstream_retry_idempotent_only,
         .upstream_connect_timeout_ms = upstream_connect_timeout_ms,
+        .upstream_response_timeout_ms = upstream_response_timeout_ms,
         .upstream_timeout_budget_ms = upstream_timeout_budget_ms,
         .upstream_max_fails = upstream_max_fails,
         .upstream_fail_timeout_ms = upstream_fail_timeout_ms,

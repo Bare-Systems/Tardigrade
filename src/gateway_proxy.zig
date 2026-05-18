@@ -6,6 +6,7 @@ const gs = @import("gateway_state.zig");
 const GatewayState = gs.GatewayState;
 const maxBufferedUpstreamResponseBytes = gs.maxBufferedUpstreamResponseBytes;
 const isAbsoluteHttpUrl = gs.isAbsoluteHttpUrl;
+const CancellationToken = http.cancellation.CancellationToken;
 
 fn setSocketTimeoutMs(fd: std.posix.fd_t, recv_timeout_ms: u32, send_timeout_ms: u32) !void {
     const recv_tv = std.posix.timeval{
@@ -227,7 +228,12 @@ pub fn executeRawHttpProxyRequest(
     auth_scopes: ?[]const u8,
     attempt_timeout_ms: u32,
     connect_timeout_ms: u32,
+    cancel_token: ?*const CancellationToken,
 ) !RawUpstreamResponse {
+    // Bail out before touching the network if the request is already stopped.
+    if (cancel_token) |tok| {
+        if (tok.isStopped()) return error.RequestCancelled;
+    }
     const proxy_extra_header_slack = 10;
     const max_buffered_response_bytes = maxBufferedUpstreamResponseBytes(cfg);
     var extra_headers_stack = std.heap.stackFallback(2048, allocator);
@@ -264,7 +270,11 @@ pub fn executeRawHttpProxyRequest(
     }
 
     if (unix_socket_path) |socket_path| {
-        const effective_timeout_ms = if (attempt_timeout_ms > 0) attempt_timeout_ms else connect_timeout_ms;
+        const base_timeout_ms = if (attempt_timeout_ms > 0) attempt_timeout_ms else connect_timeout_ms;
+        const effective_timeout_ms = if (cancel_token) |tok|
+            tok.effectiveTimeoutMs(base_timeout_ms)
+        else
+            base_timeout_ms;
         return executeUnixSocketHttpRequest(
             allocator,
             socket_path,

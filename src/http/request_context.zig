@@ -2,6 +2,7 @@ const std = @import("std");
 const compat = @import("../zig_compat.zig");
 const Allocator = std.mem.Allocator;
 const Request = @import("request.zig").Request;
+const RequestLifecycle = @import("request_lifecycle.zig").RequestLifecycle;
 
 /// Per-request context propagated through the middleware pipeline.
 ///
@@ -38,6 +39,9 @@ pub const RequestContext = struct {
     upstream_status: ?u16,
     /// Response body bytes written back to the client when tracked.
     response_bytes: usize,
+    /// Request lifecycle tracker (deadline, cancellation). Null for short-circuit paths
+    /// that return before a full lifecycle is created (e.g. 400/405 early rejections).
+    lifecycle: ?*RequestLifecycle,
 
     pub fn init(allocator: Allocator, request_id: []const u8, client_ip: []const u8) RequestContext {
         return .{
@@ -56,6 +60,7 @@ pub const RequestContext = struct {
             .upstream_addr = null,
             .upstream_status = null,
             .response_bytes = 0,
+            .lifecycle = null,
         };
     }
 

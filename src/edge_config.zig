@@ -315,6 +315,10 @@ pub const EdgeConfig = struct {
     max_active_connections: u32,
     /// Idle keep-alive timeout for client connections (ms, 0 = disabled).
     keep_alive_timeout_ms: u32,
+    /// Overall request deadline from first byte received to response fully written (ms, 0 = disabled).
+    /// Caps all downstream work (auth, upstream calls, response streaming) for a single request.
+    /// Set via TARDIGRADE_REQUEST_TOTAL_TIMEOUT_MS.
+    request_total_timeout_ms: u32,
     /// Maximum requests served per client connection (0 = unlimited).
     max_requests_per_connection: u32,
     /// Maximum idle connection sessions cached for reuse.
@@ -1039,6 +1043,8 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     defer allocator.free(keep_alive_timeout_str);
     const keep_alive_timeout_ms = std.fmt.parseInt(u32, keep_alive_timeout_str, 10) catch 5000;
 
+    const request_total_timeout_ms = parseIntEnv(u32, allocator, "TARDIGRADE_REQUEST_TOTAL_TIMEOUT_MS", 0);
+
     const max_req_conn_str = envOrDefault(allocator, "TARDIGRADE_MAX_REQUESTS_PER_CONNECTION", "100") catch unreachable;
     defer allocator.free(max_req_conn_str);
     const max_requests_per_connection = std.fmt.parseInt(u32, max_req_conn_str, 10) catch 100;
@@ -1405,6 +1411,7 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .max_connections_per_ip = max_connections_per_ip,
         .max_active_connections = max_active_connections,
         .keep_alive_timeout_ms = keep_alive_timeout_ms,
+        .request_total_timeout_ms = request_total_timeout_ms,
         .max_requests_per_connection = max_requests_per_connection,
         .connection_pool_size = connection_pool_size,
         .max_connection_memory_bytes = max_connection_memory_bytes,

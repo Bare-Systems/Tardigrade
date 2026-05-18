@@ -1903,6 +1903,10 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         return;
     }
 
+    // --- Request Lifecycle ---
+    var lifecycle = http.request_lifecycle.RequestLifecycle.init(correlation_id, effective_cfg.request_total_timeout_ms);
+    ctx.lifecycle = &lifecycle;
+
     // --- Rewrite / return directives ---
     var request_uri_buf = std.array_list.Managed(u8).init(allocator);
     defer request_uri_buf.deinit();
@@ -2757,10 +2761,18 @@ fn handleLocationProxyPass(
                 auth_scopes,
                 per_attempt_timeout_ms,
                 cfg.upstream_connect_timeout_ms,
+                if (ctx.lifecycle) |lc| &lc.token else null,
             );
         state.recordUpstreamAttemptEnd(selection.base_url);
         const result = resp catch |err| {
             state.recordUpstreamFailure(cfg, selection.base_url);
+            // If the request deadline elapsed, stop retrying immediately.
+            if (err == error.RequestCancelled) {
+                if (ctx.lifecycle) |lc| lc.logTimeout("upstream_connect");
+                try sendApiError(allocator, writer, .gateway_timeout, "upstream_timeout", "Upstream request timed out", correlation_id, keep_alive, state);
+                ctx.setUpstreamResult(resolved.upstream_host, @intFromEnum(http.Status.gateway_timeout), 0);
+                return @intFromEnum(http.Status.gateway_timeout);
+            }
             if (attempt + 1 < max_attempts) {
                 state.logger.warn(correlation_id, "proxy attempt {d}/{d} failed: {}", .{ attempt + 1, max_attempts, err });
                 continue;
@@ -3736,6 +3748,7 @@ fn handleHttp3LocationProxyPass(
             null,
             ctx.cfg.upstream_timeout_ms,
             ctx.cfg.upstream_connect_timeout_ms,
+            null, // HTTP/3 path: no per-request lifecycle yet
         );
     defer upstream_response.deinit(allocator);
 

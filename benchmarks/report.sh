@@ -58,24 +58,48 @@ meta_conn=$(jq -r '._meta.connections // "?"'    "$RESULTS_FILE")
 # ── Build markdown table ──────────────────────────────────────────────────────
 build_table() {
     local header
-    header="| Scenario | req/s | p50 (ms) | p99 (ms) | MB/s | Errors |"$'\n'
-    header+="| --- | ---: | ---: | ---: | ---: | ---: |"
+    header="| Scenario | req/s | p50 (ms) | p95 (ms) | p99 (ms) | p999 (ms) | CPU % | Peak RSS (MiB) | MB/s | Errors |"$'\n'
+    header+="| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
 
     local rows=""
     while IFS= read -r scenario; do
         [[ "$scenario" == "_meta" ]] && continue
-        local rps p50 p99 errors tput tput_raw
+        local rps p50 p95 p99 p999 errors tput tput_raw cpu cpu_raw rss rss_raw
         rps=$(jq      -r --arg s "$scenario" '.[$s].rps    // 0' "$RESULTS_FILE" | awk '{printf "%\x27.0f", $1}')
         p50=$(jq      -r --arg s "$scenario" '.[$s].p50_ms // 0' "$RESULTS_FILE" | awk '{printf "%.1f", $1}')
+        p95=$(jq      -r --arg s "$scenario" '.[$s].p95_ms // "null"' "$RESULTS_FILE")
         p99=$(jq      -r --arg s "$scenario" '.[$s].p99_ms // 0' "$RESULTS_FILE" | awk '{printf "%.1f", $1}')
+        p999=$(jq     -r --arg s "$scenario" '.[$s].p999_ms // "null"' "$RESULTS_FILE")
         errors=$(jq   -r --arg s "$scenario" '.[$s].errors // 0' "$RESULTS_FILE")
         tput_raw=$(jq -r --arg s "$scenario" '.[$s].throughput_mbps // "null"' "$RESULTS_FILE")
+        cpu_raw=$(jq  -r --arg s "$scenario" '.[$s].cpu_pct_avg // "null"' "$RESULTS_FILE")
+        rss_raw=$(jq  -r --arg s "$scenario" '.[$s].rss_mb_peak // "null"' "$RESULTS_FILE")
+        if [[ "$p95" == "null" ]]; then
+            p95="-"
+        else
+            p95=$(echo "$p95" | awk '{printf "%.1f", $1}')
+        fi
+        if [[ "$p999" == "null" ]]; then
+            p999="-"
+        else
+            p999=$(echo "$p999" | awk '{printf "%.1f", $1}')
+        fi
         if [[ "$tput_raw" == "null" ]]; then
             tput="-"
         else
             tput=$(echo "$tput_raw" | awk '{printf "%.1f", $1}')
         fi
-        rows+=$'\n'"| \`${scenario}\` | ${rps} | ${p50} | ${p99} | ${tput} | ${errors} |"
+        if [[ "$cpu_raw" == "null" ]]; then
+            cpu="-"
+        else
+            cpu=$(echo "$cpu_raw" | awk '{printf "%.1f", $1}')
+        fi
+        if [[ "$rss_raw" == "null" ]]; then
+            rss="-"
+        else
+            rss=$(echo "$rss_raw" | awk '{printf "%.1f", $1}')
+        fi
+        rows+=$'\n'"| \`${scenario}\` | ${rps} | ${p50} | ${p95} | ${p99} | ${p999} | ${cpu} | ${rss} | ${tput} | ${errors} |"
     done < <(jq -r 'keys[]' "$RESULTS_FILE" | sort)
 
     printf '%s%s\n' "$header" "$rows"
@@ -91,6 +115,7 @@ ${table}
 
 > **${meta_tag}** · ${date_part} · tool: \`${meta_tool}\` · ${meta_conn} connections · ${meta_dur}s per scenario · host: \`${meta_host}\`
 > driver: \`${meta_driver}\` · env: \`${meta_env}\` · workers: \`${meta_workers}\` · config: \`${meta_config}\`
+> CPU/RSS columns are sampled from the target Tardigrade process only when the run used \`--pid\` or \`--pid-file\`; otherwise they remain \`-\`.
 >
 > Run \`./benchmarks/run.sh --save benchmarks/baselines/\$(git describe --tags).json\` then \`./benchmarks/report.sh <file> --update-readme README.md\` to refresh this table.
 EOF

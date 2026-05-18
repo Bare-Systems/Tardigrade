@@ -13,6 +13,8 @@
 #   --driver LABEL      Load-driver label recorded in metadata
 #   --worker-count N    Tardigrade worker count recorded in metadata
 #   --config-label STR  Config/profile label recorded in metadata
+#   --pid PID           Target Tardigrade process ID for CPU/RSS sampling
+#   --pid-file FILE     File containing the target Tardigrade PID for CPU/RSS sampling
 #   --tls               Use HTTPS (default: plain HTTP)
 #   --insecure          Skip TLS certificate verification (for self-signed certs)
 #   --duration SECS     Benchmark duration per scenario (default: 30)
@@ -30,6 +32,7 @@
 #   --baseline FILE     Compare results against a baseline JSON file
 #   --save FILE         Write results JSON to this file
 #   --meta-file FILE    Merge extra JSON metadata into _meta
+#   --sample-interval-ms N  CPU/RSS sample interval in milliseconds (default: 500)
 #   --help              Show this message and exit
 #
 # Scenarios:
@@ -63,6 +66,8 @@ HOST_HEADER=""
 DRIVER_LABEL="local"
 WORKER_COUNT=""
 CONFIG_LABEL=""
+TARGET_PID=""
+PID_FILE=""
 USE_TLS=false
 INSECURE=false
 DURATION=30
@@ -81,6 +86,7 @@ BASELINE_FILE=""
 SAVE_FILE=""
 META_FILE=""
 REGRESSION_THRESHOLD=10  # percent
+SAMPLE_INTERVAL_MS=500
 
 # ── Arg parsing ───────────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -91,6 +97,8 @@ while [[ $# -gt 0 ]]; do
         --driver)     DRIVER_LABEL="$2";       shift 2 ;;
         --worker-count)WORKER_COUNT="$2";      shift 2 ;;
         --config-label)CONFIG_LABEL="$2";      shift 2 ;;
+        --pid)        TARGET_PID="$2";         shift 2 ;;
+        --pid-file)   PID_FILE="$2";           shift 2 ;;
         --tls)        USE_TLS=true;            shift ;;
         --insecure)   INSECURE=true;           shift ;;
         --duration)   DURATION="$2";           shift 2 ;;
@@ -109,6 +117,7 @@ while [[ $# -gt 0 ]]; do
         --save)       SAVE_FILE="$2";          shift 2 ;;
         --meta-file)  META_FILE="$2";          shift 2 ;;
         --threshold)  REGRESSION_THRESHOLD="$2"; shift 2 ;;
+        --sample-interval-ms) SAMPLE_INTERVAL_MS="$2"; shift 2 ;;
         --help)       sed -n '/^# Usage/,/^[^#]/p' "$0" | head -n -1; exit 0 ;;
         *) echo "Unknown option: $1" >&2; exit 1 ;;
     esac
@@ -201,6 +210,138 @@ detect_memory_mb() {
     esac
 }
 
+resolve_target_pid() {
+    if [[ -n "$TARGET_PID" ]]; then
+        printf '%s\n' "$TARGET_PID"
+        return 0
+    fi
+    if [[ -n "$PID_FILE" ]]; then
+        if [[ ! -f "$PID_FILE" ]]; then
+            echo "PID file not found: $PID_FILE" >&2
+            exit 1
+        fi
+        tr -d '[:space:]' < "$PID_FILE"
+        return 0
+    fi
+    return 1
+}
+
+latency_value_to_ms() {
+    local value="$1"
+    if [[ -z "$value" || "$value" == "null" ]]; then
+        echo "null"
+        return 0
+    fi
+    awk -v v="$value" 'BEGIN {
+        if (v ~ /us$/) { sub(/us$/, "", v); printf "%.3f", v / 1000; exit }
+        if (v ~ /ms$/) { sub(/ms$/, "", v); printf "%.3f", v + 0; exit }
+        if (v ~ /s$/)  { sub(/s$/, "", v);  printf "%.3f", v * 1000; exit }
+        printf "%.3f", v + 0
+    }'
+}
+
+wrk_percentile_ms() {
+    local raw="$1" percentile="$2"
+    local value
+    value=$(printf '%s\n' "$raw" | awk -v pct="$percentile" '$1 == pct { print $2; exit }')
+    latency_value_to_ms "$value"
+}
+
+extract_h2load_percentile_ms() {
+    local raw="$1" percentile="$2"
+    local pattern
+    case "$percentile" in
+        50) pattern='50th' ;;
+        95) pattern='95th' ;;
+        99) pattern='99th' ;;
+        99.9) pattern='99.9th' ;;
+        *) echo "null"; return 0 ;;
+    esac
+    local value
+    value=$(printf '%s\n' "$raw" | grep -E "$pattern" | grep -oE '[0-9.]+ (us|ms|s)' | head -1 | tr -d ' ')
+    latency_value_to_ms "$value"
+}
+
+average_column_or_null() {
+    local file="$1" column="$2"
+    awk -v col="$column" '
+        NF >= col {
+            sum += $col
+            count += 1
+        }
+        END {
+            if (count > 0) {
+                printf "%.2f", sum / count
+            } else {
+                printf "null"
+            }
+        }
+    ' "$file"
+}
+
+peak_rss_mb_or_null() {
+    local file="$1"
+    awk '
+        NF >= 1 && $1 > max { max = $1 }
+        END {
+            if (max > 0) {
+                printf "%.2f", max / 1024
+            } else {
+                printf "null"
+            }
+        }
+    ' "$file"
+}
+
+MONITOR_FILE=""
+MONITOR_PID=""
+CURRENT_CPU_PCT_AVG="null"
+CURRENT_RSS_MB_PEAK="null"
+
+monitor_target_process() {
+    local pid="$1" sample_interval_s="$2" outfile="$3"
+    while kill -0 "$pid" 2>/dev/null; do
+        ps -p "$pid" -o rss= -o %cpu= 2>/dev/null | awk 'NF >= 2 { print $1, $2; exit }' >> "$outfile"
+        sleep "$sample_interval_s"
+    done
+}
+
+start_process_monitor() {
+    CURRENT_CPU_PCT_AVG="null"
+    CURRENT_RSS_MB_PEAK="null"
+    MONITOR_FILE=""
+    MONITOR_PID=""
+
+    local pid
+    if ! pid=$(resolve_target_pid 2>/dev/null); then
+        return 0
+    fi
+    if ! kill -0 "$pid" 2>/dev/null; then
+        echo "Target PID $pid is not running" >&2
+        exit 1
+    fi
+
+    local sample_interval_s
+    sample_interval_s=$(awk -v ms="$SAMPLE_INTERVAL_MS" 'BEGIN { printf "%.3f", ms / 1000 }')
+    MONITOR_FILE=$(mktemp /tmp/tardigrade-bench-monitor-XXXX.txt)
+    monitor_target_process "$pid" "$sample_interval_s" "$MONITOR_FILE" &
+    MONITOR_PID="$!"
+}
+
+stop_process_monitor() {
+    if [[ -n "$MONITOR_PID" ]]; then
+        kill "$MONITOR_PID" 2>/dev/null || true
+        wait "$MONITOR_PID" 2>/dev/null || true
+        MONITOR_PID=""
+    fi
+    if [[ -n "$MONITOR_FILE" && -f "$MONITOR_FILE" ]]; then
+        CURRENT_CPU_PCT_AVG=$(average_column_or_null "$MONITOR_FILE" 2)
+        CURRENT_RSS_MB_PEAK=$(peak_rss_mb_or_null "$MONITOR_FILE")
+        rm -f "$MONITOR_FILE"
+        MONITOR_FILE=""
+    fi
+}
+
 TOOL=$(detect_tool "$PREFERRED_TOOL")
 echo "Using tool: $TOOL"
 
@@ -208,11 +349,22 @@ echo "Using tool: $TOOL"
 RESULTS_JSON="{}"
 TOOL_HEADERS=()
 add_result() {
-    local scenario="$1" rps="$2" p50_ms="$3" p99_ms="$4" errors="$5" mbps="${6:-null}"
+    local scenario="$1" rps="$2" p50_ms="$3" p95_ms="$4" p99_ms="$5" p999_ms="$6" errors="$7" mbps="${8:-null}" cpu_pct_avg="${9:-null}" rss_mb_peak="${10:-null}"
     RESULTS_JSON=$(jq --arg s "$scenario" \
-        --argjson rps "$rps" --argjson p50 "$p50_ms" --argjson p99 "$p99_ms" \
-        --argjson err "$errors" --argjson mbps "$mbps" \
-        '.[$s] = {rps: $rps, p50_ms: $p50, p99_ms: $p99, errors: $err, throughput_mbps: $mbps}' \
+        --argjson rps "$rps" \
+        --argjson p50 "$p50_ms" --argjson p95 "$p95_ms" --argjson p99 "$p99_ms" --argjson p999 "$p999_ms" \
+        --argjson err "$errors" --argjson mbps "$mbps" --argjson cpu "$cpu_pct_avg" --argjson rss "$rss_mb_peak" \
+        '.[$s] = {
+            rps: $rps,
+            p50_ms: $p50,
+            p95_ms: $p95,
+            p99_ms: $p99,
+            p999_ms: $p999,
+            errors: $err,
+            throughput_mbps: $mbps,
+            cpu_pct_avg: $cpu,
+            rss_mb_peak: $rss
+        }' \
         <<<"$RESULTS_JSON")
 }
 
@@ -233,29 +385,35 @@ run_wrk() {
     $INSECURE && extra+=(--insecure)
     build_tool_headers -H
     [[ ${#TOOL_HEADERS[@]} -gt 0 ]] && extra+=("${TOOL_HEADERS[@]}")
-    local raw
-    raw=$(wrk -t"$THREADS" -c"$CONNECTIONS" -d"${DURATION}s" -L \
+    local raw summary_json
+    start_process_monitor
+    raw=$(wrk --latency -s "$(dirname "$0")/wrk-summary.lua" -t"$THREADS" -c"$CONNECTIONS" -d"${DURATION}s" \
         ${extra[@]+"${extra[@]}"} "$url" 2>&1) || true
-    local rps p50 p99 errors
-    rps=$(echo "$raw" | grep -E "Requests/sec" | awk '{print $2}' | tr -d ',' || echo 0)
-    # -L produces a latency distribution block; parse ms values (wrk may suffix us/ms/s)
-    p50=$(echo "$raw" | awk '/50%/{v=$2; sub(/ms$/,"",v); sub(/us$/,"",v); if($2~/us/)v=v/1000; print v+0; exit}' || echo 0)
-    p99=$(echo "$raw" | awk '/99%/{v=$2; sub(/ms$/,"",v); sub(/us$/,"",v); if($2~/us/)v=v/1000; print v+0; exit}' || echo 0)
-    errors=$(echo "$raw" | grep -E "Non-2xx" | grep -oE '[0-9]+' | head -1 || echo 0)
-    rps=${rps:-0}; p50=${p50:-0}; p99=${p99:-0}; errors=${errors:-0}
+    stop_process_monitor
+    local rps p50 p95 p99 p999 errors
+    summary_json=$(printf '%s\n' "$raw" | sed -n 's/^WRK_SUMMARY //p' | tail -1)
+    if [[ -z "$summary_json" ]]; then
+        echo "wrk summary hook did not emit percentile JSON" >&2
+        echo "$raw" >&2
+        exit 1
+    fi
+    rps=$(echo "$summary_json" | jq -r '.rps // 0')
+    p50=$(echo "$summary_json" | jq -r '.p50_ms // null')
+    p95=$(echo "$summary_json" | jq -r '.p95_ms // null')
+    p99=$(echo "$summary_json" | jq -r '.p99_ms // null')
+    p999=$(echo "$summary_json" | jq -r '.p999_ms // null')
+    errors=$(echo "$raw" | grep -E "Non-2xx|Socket errors" | grep -oE '[0-9]+' | head -1 || echo 0)
+    rps=${rps:-0}; errors=${errors:-0}
     local tput_mbps
-    tput_mbps=$(echo "$raw" | awk '/^Transfer\/sec:/{
-        v=$2
-        if (v ~ /GB$/) { sub(/GB$/, "", v); printf "%.2f", v*1024; exit }
-        if (v ~ /MB$/) { sub(/MB$/, "", v); printf "%.2f", v; exit }
-        if (v ~ /KB$/) { sub(/KB$/, "", v); printf "%.2f", v/1024; exit }
-        if (v ~ /B$/)  { sub(/B$/, "", v);  printf "%.2f", v/1048576; exit }
-    }')
+    tput_mbps=$(echo "$summary_json" | jq -r '.throughput_mbps // null')
     tput_mbps="${tput_mbps:-null}"
     local tput_display=""
+    local cpu_display="" rss_display=""
     [[ "$tput_mbps" != "null" ]] && tput_display="  throughput=${tput_mbps}MB/s"
-    echo "  $label — ${rps} req/s  p50=${p50}ms  p99=${p99}ms  errors=${errors}${tput_display}"
-    add_result "$label" "$rps" "$p50" "$p99" "$errors" "$tput_mbps"
+    [[ "$CURRENT_CPU_PCT_AVG" != "null" ]] && cpu_display="  cpu=${CURRENT_CPU_PCT_AVG}%"
+    [[ "$CURRENT_RSS_MB_PEAK" != "null" ]] && rss_display="  rss_peak=${CURRENT_RSS_MB_PEAK}MiB"
+    echo "  $label — ${rps} req/s  p50=${p50}ms  p95=${p95}ms  p99=${p99}ms  p999=${p999}ms  errors=${errors}${tput_display}${cpu_display}${rss_display}"
+    add_result "$label" "$rps" "$p50" "$p95" "$p99" "$p999" "$errors" "$tput_mbps" "$CURRENT_CPU_PCT_AVG" "$CURRENT_RSS_MB_PEAK"
 }
 
 # ── h2load runner ─────────────────────────────────────────────────────────────
@@ -266,16 +424,18 @@ run_h2load() {
     build_tool_headers -H
     [[ ${#TOOL_HEADERS[@]} -gt 0 ]] && extra+=("${TOOL_HEADERS[@]}")
     local raw
+    start_process_monitor
     raw=$(h2load -n $((CONNECTIONS * DURATION * 10)) \
         -c "$CONNECTIONS" -t "$THREADS" ${extra[@]+"${extra[@]}"} "$url" 2>&1) || true
-    local rps p50 p99 errors
+    stop_process_monitor
+    local rps p50 p95 p99 p999 errors
     rps=$(echo "$raw" | grep -E "^finished" | grep -oE '[0-9.]+ req/s' | grep -oE '[0-9.]+' || echo 0)
-    p50=$(echo "$raw" | grep -E "50th" | grep -oE '[0-9.]+ us' | grep -oE '[0-9.]+' | \
-        awk '{printf "%.2f", $1/1000}' || echo 0)
-    p99=$(echo "$raw" | grep -E "99th" | grep -oE '[0-9.]+ us' | grep -oE '[0-9.]+' | \
-        awk '{printf "%.2f", $1/1000}' || echo 0)
+    p50=$(extract_h2load_percentile_ms "$raw" "50")
+    p95=$(extract_h2load_percentile_ms "$raw" "95")
+    p99=$(extract_h2load_percentile_ms "$raw" "99")
+    p999=$(extract_h2load_percentile_ms "$raw" "99.9")
     errors=$(echo "$raw" | grep -E "failed" | grep -oE '[0-9]+' | head -1 || echo 0)
-    rps=${rps:-0}; p50=${p50:-0}; p99=${p99:-0}; errors=${errors:-0}
+    rps=${rps:-0}; errors=${errors:-0}
     local tput_mbps
     tput_mbps=$(echo "$raw" | grep -E "^finished" | grep -oE '[0-9.]+[KMG]B/s' | awk '{
         v=$1
@@ -284,10 +444,12 @@ run_h2load() {
         if (v ~ /KB\/s$/) { sub(/KB\/s$/, "", v); printf "%.2f", v/1024; exit }
     }')
     tput_mbps="${tput_mbps:-null}"
-    local tput_display=""
+    local tput_display="" cpu_display="" rss_display=""
     [[ "$tput_mbps" != "null" ]] && tput_display="  throughput=${tput_mbps}MB/s"
-    echo "  $label — ${rps} req/s  p50=${p50}ms  p99=${p99}ms  errors=${errors}${tput_display}"
-    add_result "$label" "$rps" "$p50" "$p99" "$errors" "$tput_mbps"
+    [[ "$CURRENT_CPU_PCT_AVG" != "null" ]] && cpu_display="  cpu=${CURRENT_CPU_PCT_AVG}%"
+    [[ "$CURRENT_RSS_MB_PEAK" != "null" ]] && rss_display="  rss_peak=${CURRENT_RSS_MB_PEAK}MiB"
+    echo "  $label — ${rps} req/s  p50=${p50}ms  p95=${p95}ms  p99=${p99}ms  p999=${p999}ms  errors=${errors}${tput_display}${cpu_display}${rss_display}"
+    add_result "$label" "$rps" "$p50" "$p95" "$p99" "$p999" "$errors" "$tput_mbps" "$CURRENT_CPU_PCT_AVG" "$CURRENT_RSS_MB_PEAK"
 }
 
 # ── h2load HTTP/3 runner ──────────────────────────────────────────────────────
@@ -308,16 +470,18 @@ run_h2load_h3() {
     build_tool_headers -H
     [[ ${#TOOL_HEADERS[@]} -gt 0 ]] && extra+=("${TOOL_HEADERS[@]}")
     local raw
+    start_process_monitor
     raw=$(h2load --h3 -n $((CONNECTIONS * DURATION * 10)) \
         -c "$CONNECTIONS" -t "$THREADS" ${extra[@]+"${extra[@]}"} "$url" 2>&1) || true
-    local rps p50 p99 errors
+    stop_process_monitor
+    local rps p50 p95 p99 p999 errors
     rps=$(echo "$raw" | grep -E "^finished" | grep -oE '[0-9.]+ req/s' | grep -oE '[0-9.]+' || echo 0)
-    p50=$(echo "$raw" | grep -E "50th" | grep -oE '[0-9.]+ us' | grep -oE '[0-9.]+' | \
-        awk '{printf "%.2f", $1/1000}' || echo 0)
-    p99=$(echo "$raw" | grep -E "99th" | grep -oE '[0-9.]+ us' | grep -oE '[0-9.]+' | \
-        awk '{printf "%.2f", $1/1000}' || echo 0)
+    p50=$(extract_h2load_percentile_ms "$raw" "50")
+    p95=$(extract_h2load_percentile_ms "$raw" "95")
+    p99=$(extract_h2load_percentile_ms "$raw" "99")
+    p999=$(extract_h2load_percentile_ms "$raw" "99.9")
     errors=$(echo "$raw" | grep -E "failed" | grep -oE '[0-9]+' | head -1 || echo 0)
-    rps=${rps:-0}; p50=${p50:-0}; p99=${p99:-0}; errors=${errors:-0}
+    rps=${rps:-0}; errors=${errors:-0}
     local tput_mbps
     tput_mbps=$(echo "$raw" | grep -E "^finished" | grep -oE '[0-9.]+[KMG]B/s' | awk '{
         v=$1
@@ -326,10 +490,12 @@ run_h2load_h3() {
         if (v ~ /KB\/s$/) { sub(/KB\/s$/, "", v); printf "%.2f", v/1024; exit }
     }')
     tput_mbps="${tput_mbps:-null}"
-    local tput_display=""
+    local tput_display="" cpu_display="" rss_display=""
     [[ "$tput_mbps" != "null" ]] && tput_display="  throughput=${tput_mbps}MB/s"
-    echo "  $label — ${rps} req/s  p50=${p50}ms  p99=${p99}ms  errors=${errors}${tput_display}"
-    add_result "$label" "$rps" "$p50" "$p99" "$errors" "$tput_mbps"
+    [[ "$CURRENT_CPU_PCT_AVG" != "null" ]] && cpu_display="  cpu=${CURRENT_CPU_PCT_AVG}%"
+    [[ "$CURRENT_RSS_MB_PEAK" != "null" ]] && rss_display="  rss_peak=${CURRENT_RSS_MB_PEAK}MiB"
+    echo "  $label — ${rps} req/s  p50=${p50}ms  p95=${p95}ms  p99=${p99}ms  p999=${p999}ms  errors=${errors}${tput_display}${cpu_display}${rss_display}"
+    add_result "$label" "$rps" "$p50" "$p95" "$p99" "$p999" "$errors" "$tput_mbps" "$CURRENT_CPU_PCT_AVG" "$CURRENT_RSS_MB_PEAK"
 }
 
 # ── fortio runner ─────────────────────────────────────────────────────────────
@@ -340,39 +506,49 @@ run_fortio() {
     build_tool_headers -H
     [[ ${#TOOL_HEADERS[@]} -gt 0 ]] && extra+=("${TOOL_HEADERS[@]}")
     local raw
+    start_process_monitor
     raw=$(fortio load -c "$CONNECTIONS" -t "${DURATION}s" \
         -json /dev/stdout ${extra[@]+"${extra[@]}"} "$url" 2>/dev/null) || true
-    local rps p50 p99 errors
+    stop_process_monitor
+    local rps p50 p95 p99 p999 errors
     rps=$(echo "$raw" | jq -r '.ActualQPS // 0')
-    p50=$(echo "$raw" | jq -r '(.DurationHistogram.Percentiles[] | select(.Percentile==50) | .Value) // 0' | \
-        awk '{printf "%.2f", $1*1000}')
-    p99=$(echo "$raw" | jq -r '(.DurationHistogram.Percentiles[] | select(.Percentile==99) | .Value) // 0' | \
-        awk '{printf "%.2f", $1*1000}')
+    p50=$(echo "$raw" | jq -r '((.DurationHistogram.Percentiles[] | select(.Percentile==50) | .Value) // empty)' | awk 'NF {printf "%.3f", $1*1000}' || true)
+    p95=$(echo "$raw" | jq -r '((.DurationHistogram.Percentiles[] | select(.Percentile==95) | .Value) // empty)' | awk 'NF {printf "%.3f", $1*1000}' || true)
+    p99=$(echo "$raw" | jq -r '((.DurationHistogram.Percentiles[] | select(.Percentile==99) | .Value) // empty)' | awk 'NF {printf "%.3f", $1*1000}' || true)
+    p999=$(echo "$raw" | jq -r '((.DurationHistogram.Percentiles[] | select(.Percentile==99.9) | .Value) // empty)' | awk 'NF {printf "%.3f", $1*1000}' || true)
     errors=$(echo "$raw" | jq -r '(.ErrorsDurationHistogram.Count // 0)')
-    rps=${rps:-0}; p50=${p50:-0}; p99=${p99:-0}; errors=${errors:-0}
-    echo "  $label — ${rps} req/s  p50=${p50}ms  p99=${p99}ms  errors=${errors}"
-    add_result "$label" "$rps" "$p50" "$p99" "$errors"
+    p50=${p50:-null}; p95=${p95:-null}; p99=${p99:-null}; p999=${p999:-null}
+    rps=${rps:-0}; errors=${errors:-0}
+    local cpu_display="" rss_display=""
+    [[ "$CURRENT_CPU_PCT_AVG" != "null" ]] && cpu_display="  cpu=${CURRENT_CPU_PCT_AVG}%"
+    [[ "$CURRENT_RSS_MB_PEAK" != "null" ]] && rss_display="  rss_peak=${CURRENT_RSS_MB_PEAK}MiB"
+    echo "  $label — ${rps} req/s  p50=${p50}ms  p95=${p95}ms  p99=${p99}ms  p999=${p999}ms  errors=${errors}${cpu_display}${rss_display}"
+    add_result "$label" "$rps" "$p50" "$p95" "$p99" "$p999" "$errors" "null" "$CURRENT_CPU_PCT_AVG" "$CURRENT_RSS_MB_PEAK"
 }
 
 # ── k6 summary parser ────────────────────────────────────────────────────────
 # Parses a k6 --summary-export JSON file (v1.x flat format) and calls add_result.
 _k6_parse_summary() {
     local tmpfile="$1" label="$2"
-    local rps p50 p99 errors
+    local rps p50 p95 p99 p999 errors
     # k6 v1.x: metrics are flat objects — .rate/.count/.med/.["p(99)"] directly
     rps=$(jq -r '.metrics.http_reqs.rate // 0' "$tmpfile" | awk '{printf "%.0f", $1}')
-    p50=$(jq -r '.metrics.http_req_duration.med // 0' "$tmpfile" | awk '{printf "%.3f", $1}')
-    p99=$(jq -r '.metrics.http_req_duration["p(99)"] // 0' "$tmpfile" | awk '{printf "%.3f", $1}')
+    p50=$(jq -r '(.metrics.http_req_duration.med // null)' "$tmpfile")
+    p95=$(jq -r '(.metrics.http_req_duration["p(95)"] // null)' "$tmpfile")
+    p99=$(jq -r '(.metrics.http_req_duration["p(99)"] // null)' "$tmpfile")
+    p999=$(jq -r '(.metrics.http_req_duration["p(99.9)"] // null)' "$tmpfile")
     # passes = count of http_req_failed=1 samples (i.e. actual failed requests)
     errors=$(jq -r '.metrics.http_req_failed.passes // 0' "$tmpfile")
-    rps=${rps:-0}; p50=${p50:-0}; p99=${p99:-0}; errors=${errors:-0}
+    rps=${rps:-0}; p50=${p50:-null}; p95=${p95:-null}; p99=${p99:-null}; p999=${p999:-null}; errors=${errors:-0}
     local dr_rate tput_mbps
     dr_rate=$(jq -r '.metrics.data_received.rate // 0' "$tmpfile" 2>/dev/null || echo 0)
     tput_mbps=$(awk -v r="${dr_rate:-0}" 'BEGIN { if (r > 0) printf "%.2f", r/1048576; else print "null" }')
-    local tput_display=""
+    local tput_display="" cpu_display="" rss_display=""
     [[ "$tput_mbps" != "null" ]] && tput_display="  throughput=${tput_mbps}MB/s"
-    echo "  $label — ${rps} req/s  p50=${p50}ms  p99=${p99}ms  errors=${errors}${tput_display}"
-    add_result "$label" "$rps" "$p50" "$p99" "$errors" "$tput_mbps"
+    [[ "$CURRENT_CPU_PCT_AVG" != "null" ]] && cpu_display="  cpu=${CURRENT_CPU_PCT_AVG}%"
+    [[ "$CURRENT_RSS_MB_PEAK" != "null" ]] && rss_display="  rss_peak=${CURRENT_RSS_MB_PEAK}MiB"
+    echo "  $label — ${rps} req/s  p50=${p50}ms  p95=${p95}ms  p99=${p99}ms  p999=${p999}ms  errors=${errors}${tput_display}${cpu_display}${rss_display}"
+    add_result "$label" "$rps" "$p50" "$p95" "$p99" "$p999" "$errors" "$tput_mbps" "$CURRENT_CPU_PCT_AVG" "$CURRENT_RSS_MB_PEAK"
 }
 
 # ── k6 throughput runner ──────────────────────────────────────────────────────
@@ -385,6 +561,7 @@ run_k6() {
     local base_url="$BASE_URL"
     local target_path="${url#"$BASE_URL"}"
 
+    start_process_monitor
     BASE_URL="$base_url" \
     K6_TARGET_PATH="$target_path" \
     K6_HOST_HEADER="$HOST_HEADER" \
@@ -394,6 +571,7 @@ run_k6() {
             --summary-export "$tmpfile" \
             ${extra_flags[@]+"${extra_flags[@]}"} \
             "$(dirname "$0")/scenarios/throughput.js" 2>/dev/null || true
+    stop_process_monitor
 
     _k6_parse_summary "$tmpfile" "$label"
     rm -f "$tmpfile"
@@ -410,6 +588,7 @@ run_k6_scenario() {
     local extra_flags=()
     $INSECURE && extra_flags+=(--insecure-skip-tls-verify)
 
+    start_process_monitor
     BASE_URL="${SCHEME}://${TARGET_HOST}:${TARGET_PORT}" \
         K6_HOST_HEADER="$HOST_HEADER" \
         k6 run --no-color --quiet \
@@ -417,6 +596,7 @@ run_k6_scenario() {
             ${extra_flags[@]+"${extra_flags[@]}"} \
             "$@" \
             "$(dirname "$0")/scenarios/${script}.js" 2>/dev/null || true
+    stop_process_monitor
 
     _k6_parse_summary "$tmpfile" "$label"
     rm -f "$tmpfile"
@@ -561,6 +741,9 @@ echo "Paths: static=${STATIC_PATH} proxy=${PROXY_PATH} keepalive=${KEEPALIVE_PAT
 if [[ -n "$HOST_HEADER" ]]; then
     echo "Host header override: ${HOST_HEADER}"
 fi
+if [[ -n "$TARGET_PID" || -n "$PID_FILE" ]]; then
+    echo "Process sampling: CPU/RSS every ${SAMPLE_INTERVAL_MS}ms"
+fi
 echo ""
 
 IFS=',' read -ra SCENARIO_LIST <<< "$SCENARIOS"
@@ -600,6 +783,7 @@ RESULTS_JSON=$(jq \
     --arg driver "$DRIVER_LABEL" \
     --arg worker_count "$WORKER_COUNT" \
     --arg config_label "$CONFIG_LABEL" \
+    --arg pid_source "$(if [[ -n "$TARGET_PID" ]]; then echo pid; elif [[ -n "$PID_FILE" ]]; then echo pid-file; else echo none; fi)" \
     --arg static_path "$STATIC_PATH" --arg proxy_path "$PROXY_PATH" \
     --arg keepalive_path "$KEEPALIVE_PATH" \
     --arg h2_path "$H2_PATH" --arg h3_path "$H3_PATH" \
@@ -611,12 +795,17 @@ RESULTS_JSON=$(jq \
     --arg cpu_model "$CPU_MODEL" \
     --arg cpu_threads "$CPU_THREADS" \
     --arg memory_mb "$MEMORY_MB" \
-    --argjson dur "$DURATION" --argjson conn "$CONNECTIONS" \
+    --argjson dur "$DURATION" --argjson conn "$CONNECTIONS" --argjson sample_interval_ms "$SAMPLE_INTERVAL_MS" \
     '. + {_meta: {tag: $tag, timestamp: $ts, host: $host, port: $port,
           tool: $tool, duration_s: $dur, connections: $conn,
           host_header: $host_header, driver: $driver,
           worker_count: (if $worker_count == "" then null else ($worker_count | tonumber) end),
           config_label: (if $config_label == "" then null else $config_label end),
+          process_metrics: {
+            enabled: ($pid_source != "none"),
+            pid_source: $pid_source,
+            sample_interval_ms: $sample_interval_ms
+          },
           zig_version: $zig_version,
           environment: {
             os: $os_name,
@@ -652,18 +841,40 @@ REGRESSION=0
 if [[ -n "$BASELINE_FILE" && -f "$BASELINE_FILE" ]]; then
     echo ""
     echo "Comparing against baseline: $BASELINE_FILE"
+    compare_metric() {
+        local scenario="$1" metric="$2" path="$3" direction="$4"
+        local baseline_value current_value delta status
+        baseline_value=$(jq -r --arg s "$scenario" "$path // null" "$BASELINE_FILE")
+        current_value=$(echo "$RESULTS_JSON" | jq -r --arg s "$scenario" "$path // null")
+        if [[ "$baseline_value" == "null" || "$current_value" == "null" || "$baseline_value" == "0" ]]; then
+            return 0
+        fi
+        delta=$(awk -v b="$baseline_value" -v c="$current_value" 'BEGIN { printf "%.1f", (c - b) / b * 100 }')
+        status="OK"
+        case "$direction" in
+            higher)
+                if awk -v d="$delta" -v t="$REGRESSION_THRESHOLD" 'BEGIN { exit !(d < -t) }'; then
+                    status="REGRESSION"
+                    REGRESSION=1
+                fi
+                ;;
+            lower)
+                if awk -v d="$delta" -v t="$REGRESSION_THRESHOLD" 'BEGIN { exit !(d > t) }'; then
+                    status="REGRESSION"
+                    REGRESSION=1
+                fi
+                ;;
+        esac
+        echo "  ${scenario}.${metric}: baseline=${baseline_value} current=${current_value} delta=${delta}% [${status}]"
+    }
     while IFS= read -r scenario; do
         [[ "$scenario" == _meta ]] && continue
-        baseline_rps=$(jq -r --arg s "$scenario" '.[$s].rps // 0' "$BASELINE_FILE")
-        current_rps=$(echo "$RESULTS_JSON" | jq -r --arg s "$scenario" '.[$s].rps // 0')
-        if [[ "$baseline_rps" == "0" || "$baseline_rps" == "null" ]]; then continue; fi
-        delta=$(awk -v b="$baseline_rps" -v c="$current_rps" \
-            'BEGIN { printf "%.1f", (c - b) / b * 100 }')
-        status="OK"
-        neg=$(awk -v d="$delta" -v t="$REGRESSION_THRESHOLD" \
-            'BEGIN { print (d < -t) ? "yes" : "no" }')
-        if [[ "$neg" == "yes" ]]; then status="REGRESSION"; REGRESSION=1; fi
-        echo "  $scenario: baseline=${baseline_rps} current=${current_rps} delta=${delta}% [$status]"
+        compare_metric "$scenario" "rps" '.[$s].rps' higher
+        compare_metric "$scenario" "p95_ms" '.[$s].p95_ms' lower
+        compare_metric "$scenario" "p99_ms" '.[$s].p99_ms' lower
+        compare_metric "$scenario" "p999_ms" '.[$s].p999_ms' lower
+        compare_metric "$scenario" "cpu_pct_avg" '.[$s].cpu_pct_avg' lower
+        compare_metric "$scenario" "rss_mb_peak" '.[$s].rss_mb_peak' lower
     done < <(echo "$RESULTS_JSON" | jq -r 'keys[]')
 fi
 

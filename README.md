@@ -168,17 +168,20 @@ zig build test-integration
 Benchmark releases should be captured from saved JSON under `benchmarks/baselines/`
 and refreshed with `./benchmarks/report.sh <baseline.json> --update-readme README.md`.
 Canonical benchmark runs are taken from a dedicated benchmark target, not from a
-local laptop fallback run.
+local laptop fallback run. Saved benchmark JSON now captures p50/p95/p99/p999
+latencies, and when the run is given `--pid` or `--pid-file`, sampled target
+CPU plus peak RSS for each scenario.
 
 <!-- BENCHMARK_REPORT_START -->
-| Scenario | req/s | p50 (ms) | p99 (ms) | MB/s | Errors |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| `keepalive` | 4700 | 0.4 | 41.8 | - | 0 |
-| `proxy-http1` | 1724 | 1.3 | 114.9 | - | 0 |
-| `static-http1` | 4586 | 0.4 | 46.1 | - | 0 |
+| Scenario | req/s | p50 (ms) | p95 (ms) | p99 (ms) | p999 (ms) | CPU % | Peak RSS (MiB) | MB/s | Errors |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `keepalive` | 4700 | 0.4 | - | 41.8 | - | - | - | - | 0 |
+| `proxy-http1` | 1724 | 1.3 | - | 114.9 | - | - | - | - | 0 |
+| `static-http1` | 4586 | 0.4 | - | 46.1 | - | - | - | - | 0 |
 
 > **v0.32.0-18-gb44f8c1** · 2026-05-02 · tool: `wrk` · 4 connections · 30s per scenario · host: `127.0.0.1`
 > driver: `loopback (dedicated benchmark target)` · env: `release-baseline` · workers: `2` · config: `release-baseline config`
+> CPU/RSS columns are sampled from the target Tardigrade process only when the run used `--pid` or `--pid-file`; otherwise they remain `-`.
 >
 > Run `./benchmarks/run.sh --save benchmarks/baselines/$(git describe --tags).json` then `./benchmarks/report.sh <file> --update-readme README.md` to refresh this table.
 <!-- BENCHMARK_REPORT_END -->

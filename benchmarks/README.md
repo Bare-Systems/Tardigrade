@@ -24,6 +24,7 @@ Run benchmarks on a dedicated, isolated benchmark target by default.
   --update-readme README.md \
   -- \
   --host 127.0.0.1 \
+  --pid-file /run/tardigrade/tardigrade.pid \
   --proxy-path /proxy/health
 
 # Fallback only: local/shared-runner smoke test
@@ -62,7 +63,15 @@ to keep the release flow consistent rather than to add a second benchmark engine
 Saved benchmark JSON now carries two categories of metadata:
 
 - Auto-detected driver metadata: Zig version, OS, kernel, architecture, CPU model, CPU thread count, and memory.
-- Process metadata: driver label, worker count, config label, and any extra JSON merged via `--meta-file`.
+- Process metadata: driver label, worker count, config label, process-sampling configuration, and any extra JSON merged via `--meta-file`.
+
+Each scenario entry in the JSON now records:
+
+- `rps`
+- `p50_ms`, `p95_ms`, `p99_ms`, and `p999_ms`
+- `errors`
+- `throughput_mbps` when the selected driver exposes it
+- `cpu_pct_avg` and `rss_mb_peak` when the run used `--pid` or `--pid-file`
 
 Use the committed metadata files for common contexts:
 
@@ -126,6 +135,8 @@ Run only k6 behavioral tests: `--tool k6 --scenarios auth-enforcement,rate-limit
 --driver LABEL        Load-driver label recorded in metadata
 --worker-count N      Tardigrade worker count recorded in metadata
 --config-label STR    Config/profile label recorded in metadata
+--pid PID             Target Tardigrade process ID for CPU/RSS sampling
+--pid-file FILE       File containing the target Tardigrade PID for CPU/RSS sampling
 --tls                 Use HTTPS
 --insecure            Skip TLS certificate verification
 --duration SECS       Seconds per scenario (default: 30)
@@ -144,9 +155,12 @@ Run only k6 behavioral tests: `--tool k6 --scenarios auth-enforcement,rate-limit
 --save FILE           Write results JSON to a file
 --meta-file FILE      Merge extra JSON metadata into _meta
 --threshold PCT       Regression threshold percentage (default: 10)
+--sample-interval-ms N  CPU/RSS sample interval in milliseconds (default: 500)
 ```
 
-Exit code 2 indicates at least one scenario regressed beyond the threshold.
+Exit code `2` indicates at least one scenario regressed beyond the threshold.
+Throughput regressions trigger when req/s drops beyond the threshold; latency,
+CPU, and RSS regressions trigger when those metrics grow beyond the threshold.
 
 ## Path and host overrides
 
@@ -197,8 +211,9 @@ Examples:
 ./benchmarks/report.sh benchmarks/baselines/v0.61.json --update-readme README.md
 ```
 
-The table includes req/s, p50, p99, error count, tool, version tag, capture date,
-driver label, environment label, worker count, and config label.
+The table includes req/s, p50, p95, p99, p999, error count, throughput, and
+sampled CPU/RSS columns when process sampling is enabled. Older baselines remain
+readable; missing columns render as `-`.
 To refresh the table after a release, re-run the benchmark with `--save` and then
 re-run `report.sh --update-readme`.
 

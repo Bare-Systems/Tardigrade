@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# Validate that report.sh correctly renders the MB/s column from benchmark JSON.
+# Validate that report.sh correctly renders benchmark metric columns from JSON.
 #
 # Tests:
-#   1. JSON with throughput_mbps — column shows numeric values.
-#   2. JSON without throughput_mbps (older format) — column shows "-" for each row.
-#   3. JSON with mixed presence — numeric where present, "-" where absent.
+#   1. JSON with throughput, percentiles, CPU, and RSS — columns show numeric values.
+#   2. Older JSON without new fields — missing columns show "-" for each row.
+#   3. JSON with null throughput — column shows "-".
+#   4. Numeric throughput values render correctly.
 #
 # Usage:
 #   ./benchmarks/test-report.sh
@@ -48,11 +49,11 @@ run_report() {
     echo "$out"
 }
 
-echo "==> Test 1: JSON with throughput_mbps — column shows numeric values"
+echo "==> Test 1: JSON with throughput, percentiles, CPU, and RSS — columns show numeric values"
 JSON1=$(cat <<'EOF'
 {
-  "proxy-http1":       {"rps": 7100.06, "p50_ms": 0.27, "p99_ms": 0.28, "errors": 0, "throughput_mbps": 12.50},
-  "proxy-payload-64k": {"rps": 3837.25, "p50_ms": 0.47, "p99_ms": 0.69, "errors": 0, "throughput_mbps": 239.83},
+  "proxy-http1":       {"rps": 7100.06, "p50_ms": 0.27, "p95_ms": 0.28, "p99_ms": 0.31, "p999_ms": 0.50, "errors": 0, "throughput_mbps": 12.50, "cpu_pct_avg": 41.2, "rss_mb_peak": 18.4},
+  "proxy-payload-64k": {"rps": 3837.25, "p50_ms": 0.47, "p95_ms": 0.58, "p99_ms": 0.69, "p999_ms": 1.20, "errors": 0, "throughput_mbps": 239.83, "cpu_pct_avg": 52.6, "rss_mb_peak": 24.8},
   "_meta": {"tag": "test", "timestamp": "2026-01-01T00:00:00Z", "tool": "wrk",
              "host": "127.0.0.1", "driver": "test", "environment_name": "test",
              "worker_count": 2, "config_label": "test", "duration_s": 30, "connections": 2}
@@ -61,11 +62,15 @@ EOF
 )
 OUT1=$(run_report "$JSON1")
 check "header includes MB/s"            "| MB/s |"       "$OUT1"
+check "header includes CPU %"           "| CPU % |"      "$OUT1"
+check "header includes Peak RSS"        "| Peak RSS (MiB) |" "$OUT1"
 check "proxy-http1 shows 12.5"          "| 12.5 |"       "$OUT1"
 check "proxy-payload-64k shows 239.8"   "| 239.8 |"      "$OUT1"
+check "proxy-http1 shows CPU"           "| 41.2 | 18.4 | 12.5 |" "$OUT1"
+check "report explains sampled CPU/RSS" "CPU/RSS columns are sampled from the target Tardigrade process only when the run used" "$OUT1"
 
 echo ""
-echo "==> Test 2: older JSON without throughput_mbps — column shows '-'"
+echo "==> Test 2: older JSON without new fields — columns show '-'"
 JSON2=$(cat <<'EOF'
 {
   "static-http1": {"rps": 4586, "p50_ms": 0.445, "p99_ms": 46.06, "errors": 0},
@@ -78,12 +83,12 @@ EOF
 )
 OUT2=$(run_report "$JSON2")
 check "header includes MB/s"    "| MB/s |"  "$OUT2"
-dash_count=$(echo "$OUT2" | grep -c "| - |" || true)
-if [[ "$dash_count" -ge 2 ]]; then
-    echo "  PASS: both rows show '-' for missing throughput ($dash_count rows)"
+check "header includes p999"    "| p999 (ms) |" "$OUT2"
+if echo "$OUT2" | grep -qF '| `proxy-http1` | 1724 | 1.3 | - | 114.9 | - | - | - | - | 0 |'; then
+    echo "  PASS: older rows show '-' for missing percentile/resource columns"
     pass=$((pass + 1))
 else
-    echo "  FAIL: expected at least 2 rows with '| - |', found $dash_count"
+    echo "  FAIL: expected proxy-http1 row to contain '-' placeholders for missing fields"
     fail=$((fail + 1))
 fi
 
@@ -91,7 +96,7 @@ echo ""
 echo "==> Test 3: JSON with null throughput_mbps — column shows '-'"
 JSON3=$(cat <<'EOF'
 {
-  "proxy-http1": {"rps": 1000, "p50_ms": 1.0, "p99_ms": 5.0, "errors": 0, "throughput_mbps": null},
+  "proxy-http1": {"rps": 1000, "p50_ms": 1.0, "p95_ms": 2.0, "p99_ms": 5.0, "p999_ms": 8.0, "errors": 0, "throughput_mbps": null, "cpu_pct_avg": null, "rss_mb_peak": null},
   "_meta": {"tag": "test", "timestamp": "2026-01-01T00:00:00Z", "tool": "wrk",
              "host": "127.0.0.1", "driver": "test", "environment_name": "test",
              "worker_count": 1, "config_label": "test", "duration_s": 30, "connections": 1}
@@ -99,14 +104,14 @@ JSON3=$(cat <<'EOF'
 EOF
 )
 OUT3=$(run_report "$JSON3")
-check "null throughput shows '-'" "| - |" "$OUT3"
+check "null throughput shows '-'" "| - | 0 |" "$OUT3"
 
 echo ""
 echo "==> Test 4: unit conversions — KB/s and GB/s values render correctly"
 JSON4=$(cat <<'EOF'
 {
-  "tiny":  {"rps": 500,  "p50_ms": 0.1, "p99_ms": 0.5, "errors": 0, "throughput_mbps": 0.5},
-  "large": {"rps": 100,  "p50_ms": 2.0, "p99_ms": 8.0, "errors": 0, "throughput_mbps": 1024.0},
+  "tiny":  {"rps": 500,  "p50_ms": 0.1, "p95_ms": 0.2, "p99_ms": 0.5, "p999_ms": 0.9, "errors": 0, "throughput_mbps": 0.5},
+  "large": {"rps": 100,  "p50_ms": 2.0, "p95_ms": 4.0, "p99_ms": 8.0, "p999_ms": 10.0, "errors": 0, "throughput_mbps": 1024.0},
   "_meta": {"tag": "test", "timestamp": "2026-01-01T00:00:00Z", "tool": "wrk",
              "host": "127.0.0.1", "driver": "test", "environment_name": "test",
              "worker_count": 1, "config_label": "test", "duration_s": 30, "connections": 1}

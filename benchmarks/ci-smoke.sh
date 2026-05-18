@@ -106,6 +106,7 @@ wait_for_http "http://127.0.0.1:${LISTEN_PORT}/health"
     --port "${LISTEN_PORT}" \
     --driver "ci-loopback" \
     --config-label "benchmarks/fixtures/ci-smoke.conf" \
+    --pid "${TARDIGRADE_PID}" \
     --meta-file "${META_FILE}" \
     --duration "${DURATION}" \
     --connections "${CONNECTIONS}" \
@@ -123,6 +124,10 @@ jq -e '
     ."static-http1".errors == 0 and
     ."proxy-http1".errors == 0 and
     .keepalive.errors == 0 and
+    ."static-http1".p95_ms != null and
+    ."static-http1".p999_ms != null and
+    ."static-http1".cpu_pct_avg != null and
+    ."static-http1".rss_mb_peak != null and
     ."static-http1".p99_ms <= 250 and
     ."proxy-http1".p99_ms <= 250 and
     .keepalive.p99_ms <= 250

@@ -307,6 +307,11 @@ pub const GatewayState = struct {
     max_connections_per_ip: u32,
     max_active_connections: u32,
     active_connections_total: usize,
+    /// Atomic count of HTTP requests currently being executed.
+    in_flight_requests: std.atomic.Value(u32),
+    /// Maximum concurrent in-flight requests (0 = unlimited). Requests exceeding
+    /// this limit are rejected with 503 before any work is done.
+    max_in_flight_requests: u32,
     active_ws_streams: usize,
     active_sse_streams: usize,
     active_mux_connections: usize,
@@ -602,6 +607,26 @@ pub const GatewayState = struct {
                 }
             }
         }
+    }
+
+    /// Attempt to reserve an in-flight request slot.
+    ///
+    /// Returns false (and the caller should respond 503) when
+    /// `max_in_flight_requests > 0` and the limit is already reached.
+    pub fn tryAcquireRequestSlot(self: *GatewayState) bool {
+        if (self.max_in_flight_requests == 0) return true;
+        const prev = self.in_flight_requests.fetchAdd(1, .acq_rel);
+        if (prev >= self.max_in_flight_requests) {
+            _ = self.in_flight_requests.fetchSub(1, .acq_rel);
+            return false;
+        }
+        return true;
+    }
+
+    /// Release a previously-acquired in-flight request slot.
+    pub fn releaseRequestSlot(self: *GatewayState) void {
+        if (self.max_in_flight_requests == 0) return;
+        _ = self.in_flight_requests.fetchSub(1, .acq_rel);
     }
 
     pub fn rateLimitAllow(self: *GatewayState, descriptor: []const u8) bool {

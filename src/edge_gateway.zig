@@ -189,6 +189,8 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         .max_connections_per_ip = cfg.max_connections_per_ip,
         .max_active_connections = cfg.max_active_connections,
         .active_connections_total = 0,
+        .in_flight_requests = std.atomic.Value(u32).init(0),
+        .max_in_flight_requests = cfg.max_in_flight_requests,
         .active_ws_streams = 0,
         .active_sse_streams = 0,
         .active_mux_connections = 0,
@@ -831,6 +833,7 @@ fn applyReloadedRuntimeConfig(cfg: *const edge_config.EdgeConfig, state: *Gatewa
     };
     state.max_connections_per_ip = cfg.max_connections_per_ip;
     state.max_active_connections = cfg.max_active_connections;
+    state.max_in_flight_requests = cfg.max_in_flight_requests;
     state.max_total_connection_memory_bytes = cfg.max_total_connection_memory_bytes;
     state.connection_memory_estimate_bytes = if (cfg.max_connection_memory_bytes > 0) cfg.max_connection_memory_bytes else MAX_REQUEST_SIZE;
     state.compression_config = .{
@@ -1903,9 +1906,27 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         return;
     }
 
+    // --- In-flight request backpressure ---
+    if (!state.tryAcquireRequestSlot()) {
+        try sendApiError(allocator, writer, .service_unavailable, "overloaded", "Too many in-flight requests", correlation_id, false, state);
+        state.metricsRecord(503);
+        state.metricsRecordErrorCode("overloaded");
+        logAccess(state, &ctx, request.method.toString(), request.uri.path, 503, request.headers.get("user-agent") orelse "");
+        return;
+    }
+    defer state.releaseRequestSlot();
+
     // --- Request Lifecycle ---
     var lifecycle = http.request_lifecycle.RequestLifecycle.init(correlation_id, effective_cfg.request_total_timeout_ms);
     ctx.lifecycle = &lifecycle;
+    // During graceful shutdown, cap the request deadline to the drain window so
+    // long-running requests don't block shutdown indefinitely.
+    if (http.shutdown.isShutdownRequested() and effective_cfg.shutdown_drain_timeout_ms > 0) {
+        const drain_deadline_ms = compat.milliTimestamp() + @as(i64, @intCast(effective_cfg.shutdown_drain_timeout_ms));
+        if (lifecycle.token.deadline_ms == 0 or lifecycle.token.deadline_ms > drain_deadline_ms) {
+            lifecycle.token.deadline_ms = drain_deadline_ms;
+        }
+    }
 
     // --- Rewrite / return directives ---
     var request_uri_buf = std.array_list.Managed(u8).init(allocator);
@@ -2041,6 +2062,16 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
     try primeRequestAuthContext(allocator, effective_cfg, state, &ctx, &request.headers);
 
     if (try runMiddlewarePipeline(allocator, writer, effective_cfg, state, &ctx, &request, correlation_id, keep_alive)) {
+        return;
+    }
+
+    // Deadline check: if the overall request deadline elapsed during auth/middleware,
+    // reject now rather than dispatching to the (potentially slow) upstream handler.
+    if (lifecycle.checkDeadline(.routing)) {
+        try sendApiError(allocator, writer, .request_timeout, "request_timeout", "Request deadline exceeded", correlation_id, keep_alive, state);
+        state.metricsRecord(408);
+        state.metricsRecordErrorCode("request_timeout");
+        logAccess(state, &ctx, request.method.toString(), request.uri.path, 408, request.headers.get("user-agent") orelse "");
         return;
     }
 

@@ -313,6 +313,11 @@ pub const EdgeConfig = struct {
     max_connections_per_ip: u32,
     /// Maximum total active client connections across all IPs (0 = unlimited).
     max_active_connections: u32,
+    /// Maximum concurrent in-flight HTTP requests across all connections (0 = unlimited).
+    /// Distinct from max_active_connections: a single keep-alive connection counts as
+    /// one connection but may serve many sequential requests.
+    /// Returns 503 when exceeded. Set via TARDIGRADE_MAX_IN_FLIGHT_REQUESTS.
+    max_in_flight_requests: u32,
     /// Idle keep-alive timeout for client connections (ms, 0 = disabled).
     keep_alive_timeout_ms: u32,
     /// Overall request deadline from first byte received to response fully written (ms, 0 = disabled).
@@ -1039,6 +1044,8 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     defer allocator.free(max_active_conn_str);
     const max_active_connections = std.fmt.parseInt(u32, max_active_conn_str, 10) catch 0;
 
+    const max_in_flight_requests = parseIntEnv(u32, allocator, "TARDIGRADE_MAX_IN_FLIGHT_REQUESTS", 0);
+
     const keep_alive_timeout_str = envOrDefault(allocator, "TARDIGRADE_KEEP_ALIVE_TIMEOUT_MS", "5000") catch unreachable;
     defer allocator.free(keep_alive_timeout_str);
     const keep_alive_timeout_ms = std.fmt.parseInt(u32, keep_alive_timeout_str, 10) catch 5000;
@@ -1410,6 +1417,7 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .fd_soft_limit = fd_soft_limit,
         .max_connections_per_ip = max_connections_per_ip,
         .max_active_connections = max_active_connections,
+        .max_in_flight_requests = max_in_flight_requests,
         .keep_alive_timeout_ms = keep_alive_timeout_ms,
         .request_total_timeout_ms = request_total_timeout_ms,
         .max_requests_per_connection = max_requests_per_connection,

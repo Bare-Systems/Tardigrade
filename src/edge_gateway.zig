@@ -391,6 +391,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         state_allocator,
         worker_count,
         cfg.worker_queue_size,
+        cfg.worker_max_queue_depth,
         handleAcceptedClient,
         &worker_ctx,
     );
@@ -509,7 +510,11 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     if (cfg.cb_threshold > 0) {
         state.logger.info(null, "Circuit breaker enabled: threshold={d} timeout={d}ms", .{ cfg.cb_threshold, cfg.cb_timeout_ms });
     }
-    state.logger.info(null, "Worker pool enabled: workers={d} queue={d}", .{ worker_count, cfg.worker_queue_size });
+    if (cfg.worker_max_queue_depth > 0) {
+        state.logger.info(null, "Worker pool enabled: workers={d} queue={d} per_worker_queue_depth={d}", .{ worker_count, cfg.worker_queue_size, cfg.worker_max_queue_depth });
+    } else {
+        state.logger.info(null, "Worker pool enabled: workers={d} queue={d}", .{ worker_count, cfg.worker_queue_size });
+    }
     if (cfg.fd_soft_limit > 0) {
         const applied = applyFdSoftLimit(cfg.fd_soft_limit) catch |err| blk: {
             state.logger.warn(null, "failed to apply fd soft limit: {}", .{err});
@@ -566,6 +571,9 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     }
     if (cfg.upstream_connect_timeout_ms > 0) {
         state.logger.info(null, "Upstream connect timeout configured: {d}ms", .{cfg.upstream_connect_timeout_ms});
+    }
+    if (cfg.upstream_response_timeout_ms > 0) {
+        state.logger.info(null, "Upstream response timeout configured: {d}ms (Unix socket upstreams only)", .{cfg.upstream_response_timeout_ms});
     }
     if (cfg.upstream_timeout_budget_ms > 0) {
         state.logger.info(null, "Upstream timeout budget configured: {d}ms", .{cfg.upstream_timeout_budget_ms});
@@ -2798,6 +2806,7 @@ fn handleLocationProxyPass(
                 auth_scopes,
                 per_attempt_timeout_ms,
                 cfg.upstream_connect_timeout_ms,
+                cfg.upstream_response_timeout_ms,
                 if (ctx.lifecycle) |lc| &lc.token else null,
             );
         state.recordUpstreamAttemptEnd(selection.base_url);
@@ -3785,6 +3794,7 @@ fn handleHttp3LocationProxyPass(
             null,
             ctx.cfg.upstream_timeout_ms,
             ctx.cfg.upstream_connect_timeout_ms,
+            ctx.cfg.upstream_response_timeout_ms,
             null, // HTTP/3 path: no per-request lifecycle yet
         );
     defer upstream_response.deinit(allocator);

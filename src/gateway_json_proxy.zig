@@ -460,6 +460,7 @@ fn proxyJsonExecuteSingleAttempt(
             "application/json",
             if (cfg.max_connection_memory_bytes > 0) cfg.max_connection_memory_bytes else 2 * 1024 * 1024,
             attempt_timeout_ms,
+            cfg.upstream_response_timeout_ms,
         );
         defer raw_resp.deinit(allocator);
 

@@ -8,6 +8,14 @@ const maxBufferedUpstreamResponseBytes = gs.maxBufferedUpstreamResponseBytes;
 const isAbsoluteHttpUrl = gs.isAbsoluteHttpUrl;
 const CancellationToken = http.cancellation.CancellationToken;
 
+fn setSocketRecvTimeoutMs(fd: std.posix.fd_t, timeout_ms: u32) !void {
+    const tv = std.posix.timeval{
+        .sec = @intCast(timeout_ms / 1000),
+        .usec = @intCast((timeout_ms % 1000) * 1000),
+    };
+    try std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv));
+}
+
 fn setSocketTimeoutMs(fd: std.posix.fd_t, recv_timeout_ms: u32, send_timeout_ms: u32) !void {
     const recv_tv = std.posix.timeval{
         .sec = @intCast(recv_timeout_ms / 1000),
@@ -106,6 +114,10 @@ pub fn executeUnixSocketHttpRequest(
     content_type_override: ?[]const u8,
     max_buffered_response_bytes: usize,
     timeout_ms: u32,
+    /// If > 0, overrides `SO_RCVTIMEO` after sending the request to enforce a
+    /// separate deadline for waiting on the first response byte (distinct from
+    /// the write-phase timeout above).
+    response_timeout_ms: u32,
 ) !RawUpstreamResponse {
     var stream = try compat.connectUnixSocket(socket_path);
     defer stream.close();
@@ -142,6 +154,12 @@ pub fn executeUnixSocketHttpRequest(
     }
 
     try stream.writeAll(req_aw.written());
+
+    // Switch the recv timeout to the response-specific limit after the request
+    // is sent, bounding just the wait for the upstream to begin responding.
+    if (response_timeout_ms > 0) {
+        try setSocketRecvTimeoutMs(stream.handle, response_timeout_ms);
+    }
 
     var resp_raw = std.array_list.Managed(u8).init(allocator);
     defer resp_raw.deinit();
@@ -228,6 +246,10 @@ pub fn executeRawHttpProxyRequest(
     auth_scopes: ?[]const u8,
     attempt_timeout_ms: u32,
     connect_timeout_ms: u32,
+    /// If > 0, caps the time from finished request-send to first response byte.
+    /// Only enforced on Unix socket upstreams; std.http.Client does not expose
+    /// per-phase socket timeout control.
+    response_timeout_ms: u32,
     cancel_token: ?*const CancellationToken,
 ) !RawUpstreamResponse {
     // Bail out before touching the network if the request is already stopped.
@@ -275,6 +297,10 @@ pub fn executeRawHttpProxyRequest(
             tok.effectiveTimeoutMs(base_timeout_ms)
         else
             base_timeout_ms;
+        const effective_response_timeout_ms = if (cancel_token) |tok|
+            tok.effectiveTimeoutMs(response_timeout_ms)
+        else
+            response_timeout_ms;
         return executeUnixSocketHttpRequest(
             allocator,
             socket_path,
@@ -285,6 +311,7 @@ pub fn executeRawHttpProxyRequest(
             null,
             max_buffered_response_bytes,
             effective_timeout_ms,
+            effective_response_timeout_ms,
         );
     }
 

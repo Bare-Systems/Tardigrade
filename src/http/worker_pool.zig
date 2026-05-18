@@ -53,12 +53,16 @@ pub const WorkerPool = struct {
     handler: HandlerFn,
     handler_ctx: *anyopaque,
     max_queue_len: usize,
+    /// Maximum items allowed in any single worker's local queue (0 = no per-worker limit).
+    /// When the least-loaded worker queue is at this depth, new submissions return QueueFull.
+    max_per_worker_queue_len: usize = 0,
 
     pub fn init(
         self: *WorkerPool,
         allocator: std.mem.Allocator,
         worker_count: usize,
         max_queue_len: usize,
+        max_per_worker_queue_len: usize,
         handler: HandlerFn,
         handler_ctx: *anyopaque,
     ) !void {
@@ -70,6 +74,7 @@ pub const WorkerPool = struct {
             .handler = handler,
             .handler_ctx = handler_ctx,
             .max_queue_len = max_queue_len,
+            .max_per_worker_queue_len = max_per_worker_queue_len,
         };
 
         if (builtin.single_threaded) return;
@@ -132,6 +137,10 @@ pub const WorkerPool = struct {
         if (self.queued_jobs >= self.max_queue_len) return error.QueueFull;
 
         const queue_index = self.selectQueueForSubmitLocked();
+        // Reject if the least-loaded worker queue is already at the per-worker depth limit.
+        if (self.max_per_worker_queue_len > 0 and
+            self.worker_queues[queue_index].items.items.len >= self.max_per_worker_queue_len)
+            return error.QueueFull;
         try self.worker_queues[queue_index].items.append(self.allocator, fd);
         self.queued_jobs += 1;
         if (self.worker_queues.len > 0) {
@@ -306,7 +315,7 @@ test "worker pool processes submitted items" {
     }.run;
 
     var pool: WorkerPool = undefined;
-    try pool.init(std.testing.allocator, 2, 64, handler, &ctx);
+    try pool.init(std.testing.allocator, 2, 64, 0, handler, &ctx);
     defer pool.deinit();
 
     try pool.submit(1);
@@ -340,7 +349,7 @@ test "worker pool shutdown drains in-flight work" {
     }.run;
 
     var pool: WorkerPool = undefined;
-    try pool.init(std.testing.allocator, 1, 16, handler, &ctx);
+    try pool.init(std.testing.allocator, 1, 16, 0, handler, &ctx);
     defer pool.deinit();
 
     try pool.submit(1);
@@ -458,7 +467,7 @@ test "shutdownAndJoin drain_timeout_ms=0 closes queued fds immediately" {
 
     var pool: WorkerPool = undefined;
     // Single worker — keep it busy so the queued job never starts.
-    try pool.init(std.testing.allocator, 1, 16, handler, &ctx);
+    try pool.init(std.testing.allocator, 1, 16, 0, handler, &ctx);
     defer pool.deinit();
 
     // Immediate shutdown with zero timeout must complete quickly.
@@ -491,7 +500,7 @@ test "shutdownAndJoin drain_timeout_ms positive drains in-flight work before tim
     }.run;
 
     var pool: WorkerPool = undefined;
-    try pool.init(std.testing.allocator, 1, 16, handler, &ctx);
+    try pool.init(std.testing.allocator, 1, 16, 0, handler, &ctx);
     defer pool.deinit();
 
     try pool.submit(1);
@@ -519,7 +528,7 @@ test "shutdownAndJoin drain_timeout_ms expires and returns" {
     }.run;
 
     var pool: WorkerPool = undefined;
-    try pool.init(std.testing.allocator, 1, 16, handler, &ctx);
+    try pool.init(std.testing.allocator, 1, 16, 0, handler, &ctx);
     defer pool.deinit();
 
     try pool.submit(1);
@@ -531,4 +540,51 @@ test "shutdownAndJoin drain_timeout_ms expires and returns" {
     const elapsed = compat.milliTimestamp() - t0;
     // Should finish well under 1s (handler finishes after timeout).
     try std.testing.expect(elapsed < 1_000);
+}
+
+test "worker pool per-worker queue depth limit rejects when all worker queues are full" {
+    if (builtin.single_threaded) return;
+
+    // 1 worker, global queue=16, per-worker limit=2.
+    // Keep the worker busy so queued items stay in the queue.
+    const Ctx = struct {
+        mutex: compat.Mutex = .{},
+        proceed: bool = false,
+    };
+    var ctx = Ctx{};
+
+    const handler = struct {
+        fn run(raw_ctx: *anyopaque, _: std.posix.fd_t) void {
+            const typed: *Ctx = @ptrCast(@alignCast(raw_ctx));
+            // Block until the test signals proceed so the queue doesn't drain.
+            while (true) {
+                std.Io.sleep(compat.io(), .fromMilliseconds(1), .awake) catch {};
+                typed.mutex.lock();
+                const done = typed.proceed;
+                typed.mutex.unlock();
+                if (done) break;
+            }
+        }
+    }.run;
+
+    var pool: WorkerPool = undefined;
+    try pool.init(std.testing.allocator, 1, 16, 2, handler, &ctx);
+    defer pool.deinit();
+
+    // First submission dispatches to the active handler — worker queue stays at 0.
+    try pool.submit(1);
+    // Give the handler time to start and become the active job.
+    std.Io.sleep(compat.io(), .fromMilliseconds(5), .awake) catch {};
+
+    // Queue two items — fills the per-worker queue to the limit.
+    try pool.submit(2);
+    try pool.submit(3);
+
+    // Third queued item should be rejected.
+    try std.testing.expectError(error.QueueFull, pool.submit(4));
+
+    // Unblock the handler so the pool can drain on deinit.
+    ctx.mutex.lock();
+    ctx.proceed = true;
+    ctx.mutex.unlock();
 }

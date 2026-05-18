@@ -7,6 +7,7 @@ Scope: the `Tardigrade` repository.
 Before making any code changes, read these documents:
 
 - **[docs/ZIG_ENGINEERING_GUIDE.md](docs/ZIG_ENGINEERING_GUIDE.md)** — Zig 0.16 patterns, APIs to avoid, runtime architecture, allocator rules, error handling, security rules, and testing requirements.
+- **[docs/SUPPORT_MATRIX.md](docs/SUPPORT_MATRIX.md)** — Official Core v1 scope and feature maturity levels (`stable`, `experimental`, `adapter`, `internal`).
 - **[docs/CODE_REVIEW_CHECKLIST.md](docs/CODE_REVIEW_CHECKLIST.md)** — Short checklist to run on every non-trivial change before committing.
 
 ## Rules
@@ -14,6 +15,7 @@ Before making any code changes, read these documents:
 - Keep the core runtime generic. Do not add product-specific logic to core.
 - Put integrations under `examples/`.
 - Keep docs concise and operator-focused.
+- New user-facing work must declare its target maturity level and update `docs/SUPPORT_MATRIX.md` when the public support contract changes.
 
 ## Workflow
 

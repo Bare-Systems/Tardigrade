@@ -20,6 +20,7 @@ Use this checklist before tagging and distributing a Tardigrade release.
 ## Artifacts
 
 - [ ] Confirm `scripts/release-metadata.sh` resolves the intended tag/version
+- [ ] Update `docs/SUPPORT_MATRIX.md` when public behavior or maturity claims changed
 - [ ] Run `./scripts/test-install.sh` against a ReleaseFast build
 - [ ] Run `./scripts/test-deb-package.sh` on a Linux host with Docker
 - [ ] Verify release packaging paths and checksums

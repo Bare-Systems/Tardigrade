@@ -2,6 +2,16 @@
 
 This directory contains a deployment example for running Tardigrade in front of a BearClaw stack.
 
+This example intentionally mixes:
+
+- stable Core v1 edge behavior such as TLS termination, static delivery, and reverse proxying
+- experimental surfaces such as HTTP/2 or realtime transports when enabled
+- internal or product-specific BearClaw flows such as transcript, approval, session, and device plumbing
+
+Use `docs/SUPPORT_MATRIX.md` as the support contract. This example is a
+reference deployment shape for BearClaw, not a blanket production-ready promise
+for every feature shown here.
+
 What is included:
 
 - `tardigrade.conf`: nginx-style Tardigrade config with TLS, server blocks, static assets, and the application-facing gateway routes
@@ -9,7 +19,8 @@ What is included:
 
 This example is intentionally isolated from the root project documentation so the main repo remains generic.
 
-Use `tardigrade.conf` plus `tardigrade.env.example` as the canonical BearClaw-facing edge shape.
+Use `tardigrade.conf` plus `tardigrade.env.example` as the reference
+BearClaw-facing edge shape.
 
 ## Files
 
@@ -32,6 +43,7 @@ Copy this into your deployment environment and replace placeholder values before
 - The config keeps Tardigrade generic by using plain reverse-proxy locations for `/v1/chat` and `/v1/commands`.
 - The intended mobile and pairing auth path is bearer-token based. Set `TARDIGRADE_AUTH_TOKEN_HASHES` to SHA-256 hashes of the raw bearer tokens your upstream issues.
 - Session state, approval state, and request transcripts can be persisted independently with `TARDIGRADE_SESSION_STORE_PATH`, `TARDIGRADE_APPROVAL_STORE_PATH`, and `TARDIGRADE_TRANSCRIPT_STORE_PATH`.
+- HTTP/2, HTTP/3, and realtime paths are outside the stable Core v1 contract unless the support matrix says otherwise.
 - If you run HTTP/3, build with `-Denable-http3-ngtcp2=true` and provide a QUIC-capable client.
 
 ## Edge Contract
@@ -42,7 +54,7 @@ Use this example when Tardigrade is the public TLS terminator and the BearClaw a
 
 | Port | Protocol | Role |
 |------|----------|------|
-| 443 | HTTPS (TLS + HTTP/2) | Public edge; all external traffic enters here |
+| 443 | HTTPS (TLS; optional experimental HTTP/2) | Public edge; all external traffic enters here |
 | 8080 | HTTP (loopback only) | BearClaw upstream; never exposed externally |
 
 ### Base Paths

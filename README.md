@@ -10,18 +10,28 @@
 Tardigrade is an early-stage Zig service runtime for lightweight edge deployments,
 internal platforms, and controlled lab environments.
 
-The project currently focuses on:
+## Support Status
+
+The official Core v1 support contract lives in
+`docs/SUPPORT_MATRIX.md`.
+
+Stable Core v1 currently covers:
 
 - static file serving
 - reverse proxying
 - config-driven routing with `server` and `location` blocks
 - TLS termination
-- config validation and hot reloads
-- access logging and basic operational controls
+- config validation, reload, and graceful drain behavior
+- access logging, Prometheus metrics, request limits, rate limiting, and
+  basic upstream health checks
+
+Visible but non-Core-v1 surfaces such as HTTP/2, HTTP/3/QUIC, WebSocket/SSE,
+ACME, FastCGI/uWSGI/SCGI, memcached, and BearClaw-specific auth/session/
+transcript/approval flows are classified separately in the support matrix.
 
 Some protocol and gateway features are still experimental. Prefer the example
-configs and integration tests as the source of truth when evaluating a specific
-capability.
+configs, the support matrix, and the integration tests as the source of truth
+when evaluating a specific capability.
 
 ## Quick Start
 
@@ -113,6 +123,7 @@ corpus replay entrypoint, and internal pentest workflow are documented in
 | Topic | Location |
 | --- | --- |
 | Zig 0.16 engineering guide | `docs/ZIG_ENGINEERING_GUIDE.md` |
+| Core v1 support matrix | `docs/SUPPORT_MATRIX.md` |
 | Code review checklist | `docs/CODE_REVIEW_CHECKLIST.md` |
 | Release checklist | `docs/RELEASE_CHECKLIST.md` |
 | Packaging | `packaging/README.md` |

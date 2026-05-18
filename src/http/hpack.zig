@@ -18,17 +18,19 @@ const DYNAMIC_TABLE_ENTRY_OVERHEAD: usize = 32;
 
 /// HPACK dynamic table per RFC 7541 §2.3.2.
 ///
-/// Entries are stored newest-first (index 0 = most recently inserted,
-/// HPACK index 62). Each entry evicts the oldest entries as needed to
-/// stay within `max_size`. Max size is 4 096 bytes by default and can
-/// be reduced by a table-size update instruction in the header block.
+/// Entries are stored oldest-first: index 0 holds the oldest entry and the
+/// last element holds the most recently inserted. HPACK dynamic index 0
+/// (absolute index 62) therefore maps to the last element. Each insert
+/// evicts the oldest entries as needed to stay within `max_size`. Max size
+/// is 4 096 bytes by default and may be reduced by a table-size update
+/// instruction in the header block.
 pub const DynamicTable = struct {
-    entries: std.ArrayListUnmanaged(HeaderField),
+    entries: std.ArrayList(HeaderField),
     size: usize,
     max_size: usize,
 
     pub fn init() DynamicTable {
-        return .{ .entries = .{}, .size = 0, .max_size = 4096 };
+        return .{ .entries = .empty, .size = 0, .max_size = 4096 };
     }
 
     pub fn deinit(self: *DynamicTable, allocator: std.mem.Allocator) void {
@@ -51,7 +53,7 @@ pub const DynamicTable = struct {
         errdefer allocator.free(name_copy);
         const value_copy = try allocator.dupe(u8, value);
         errdefer allocator.free(value_copy);
-        try self.entries.insert(allocator, 0, .{ .name = name_copy, .value = value_copy });
+        try self.entries.append(allocator, .{ .name = name_copy, .value = value_copy });
         self.size += cost;
     }
 
@@ -60,20 +62,20 @@ pub const DynamicTable = struct {
         while (self.size > self.max_size) self.evictOldest(allocator);
     }
 
+    /// dyn_idx 0 = most recently inserted (last element in oldest-first storage).
     pub fn getByDynIndex(self: *const DynamicTable, dyn_idx: usize) ?StaticEntry {
         if (dyn_idx >= self.entries.items.len) return null;
-        const h = self.entries.items[dyn_idx];
+        const actual = self.entries.items.len - 1 - dyn_idx;
+        const h = self.entries.items[actual];
         return .{ .name = h.name, .value = h.value };
     }
 
     fn evictOldest(self: *DynamicTable, allocator: std.mem.Allocator) void {
         if (self.entries.items.len == 0) return;
-        const last_idx = self.entries.items.len - 1;
-        const last = self.entries.items[last_idx]; // struct copy; safe to free slices after
-        self.size -= last.name.len + last.value.len + DYNAMIC_TABLE_ENTRY_OVERHEAD;
-        allocator.free(last.name);
-        allocator.free(last.value);
-        self.entries.shrinkRetainingCapacity(last_idx);
+        const oldest = self.entries.orderedRemove(0);
+        self.size -= oldest.name.len + oldest.value.len + DYNAMIC_TABLE_ENTRY_OVERHEAD;
+        allocator.free(oldest.name);
+        allocator.free(oldest.value);
     }
 
     fn evictAll(self: *DynamicTable, allocator: std.mem.Allocator) void {

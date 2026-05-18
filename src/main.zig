@@ -3,6 +3,7 @@ const compat = @import("zig_compat.zig");
 const edge_config = @import("edge_config.zig");
 const edge_gateway = @import("edge_gateway.zig");
 const http = @import("http.zig");
+const runtime_allocator = @import("runtime_allocator.zig");
 
 const ENV_CONFIG_PATH = "TARDIGRADE_CONFIG_PATH";
 
@@ -68,14 +69,14 @@ const starter_config =
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 
 pub fn main(init: std.process.Init.Minimal) !void {
-    var gpa: std.heap.DebugAllocator(.{}) = .init;
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    var control_allocator_state = runtime_allocator.ControlPlaneAllocator{};
+    defer std.debug.assert(control_allocator_state.deinit() == .ok);
+    const control_allocator = control_allocator_state.allocator();
 
     var args_iter = init.args.iterate();
     var args_list: std.ArrayList([]const u8) = .empty;
-    defer args_list.deinit(allocator);
-    while (args_iter.next()) |arg| try args_list.append(allocator, arg);
+    defer args_list.deinit(control_allocator);
+    while (args_iter.next()) |arg| try args_list.append(control_allocator, arg);
     const args = args_list.items;
 
     const command = parseCliCommand(args[1..]) catch |err| {
@@ -100,15 +101,15 @@ pub fn main(init: std.process.Init.Minimal) !void {
             try stdout.flush();
         },
         .config_init => |options| try writeStarterConfig(options),
-        .reload => |options| try executeSignalCommand(allocator, "reload", std.posix.SIG.HUP, options),
-        .stop => |options| try executeSignalCommand(allocator, "stop", std.posix.SIG.TERM, options),
-        .validate => |options| try executeValidateCommand(allocator, options),
+        .reload => |options| try executeSignalCommand(control_allocator, "reload", std.posix.SIG.HUP, options),
+        .stop => |options| try executeSignalCommand(control_allocator, "stop", std.posix.SIG.TERM, options),
+        .validate => |options| try executeValidateCommand(control_allocator, options),
         .run => |options| {
             if (environmentRequestsValidate()) {
-                try executeValidateCommand(allocator, options.common);
+                try executeValidateCommand(control_allocator, options.common);
                 return;
             }
-            try executeRunCommand(allocator, args, options);
+            try executeRunCommand(runtime_allocator.runtimeAllocator(), args, options);
         },
     }
 }

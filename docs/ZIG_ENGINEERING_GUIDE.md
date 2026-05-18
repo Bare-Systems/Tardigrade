@@ -208,10 +208,16 @@ one module per PR. The migration list is tracked in `AGENTS.md`.
 
 | Allocator | Use when |
 |---|---|
-| `std.heap.GeneralPurposeAllocator` (GPA) | Process-lifetime allocations — `GatewayState`, long-lived config |
+| `std.heap.smp_allocator` | Shared process-lifetime runtime state in the `run` path — `GatewayState`, long-lived config, HTTP/2 connection state |
+| `std.heap.DebugAllocator` | One-shot CLI/control-plane work where leak/use-after-free diagnostics matter more than throughput |
 | `std.heap.ArenaAllocator` | Request-scoped allocations that all free at the same time; config validation |
 | `BufferPool` (slab) | Request and relay read buffers; reused across requests to reduce GPA pressure |
 | `std.testing.allocator` | All unit tests |
+
+Tardigrade's Zig 0.16 toolchain does not expose the old
+`std.heap.GeneralPurposeAllocator` API in the runtime path here. For shared
+multi-threaded gateway state, use `std.heap.smp_allocator` instead of
+re-introducing `DebugAllocator` into the long-lived `run` path.
 
 ### Ownership Rules
 

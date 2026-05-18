@@ -3,6 +3,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const http = @import("http.zig");
 const edge_config = @import("edge_config.zig");
+const runtime_allocator = @import("runtime_allocator.zig");
 
 const STREAM_RELAY_BUFFER_SIZE: usize = 16 * 1024;
 const JSON_CONTENT_TYPE = "application/json";
@@ -123,9 +124,7 @@ const proxyJsonExecute = gjp.proxyJsonExecute;
 const buildProxyCacheKey = gjp.buildProxyCacheKey;
 
 pub fn run(cfg: *const edge_config.EdgeConfig) !void {
-    var gpa: std.heap.DebugAllocator(.{}) = .init;
-    defer _ = gpa.deinit();
-    const state_allocator = gpa.allocator();
+    const state_allocator = runtime_allocator.runtimeAllocator();
 
     const initial_hsts = try computeHstsValue(state_allocator, cfg);
     errdefer if (initial_hsts.len > 0) state_allocator.free(initial_hsts);
@@ -1511,9 +1510,7 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
     try readExactConn(conn, preface[0..]);
     if (!std.mem.eql(u8, preface[0..], HTTP2_PREFACE)) return error.InvalidHttp2Preface;
 
-    var gpa: std.heap.DebugAllocator(.{}) = .init;
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = state.allocator;
 
     try http.http2_frame.writeSettings(allocator, conn.writer(), &[_][2]u32{
         .{ 0x3, 100 }, // max concurrent streams
@@ -1757,7 +1754,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
     keep_alive_out.* = false;
     defer keep_alive_out.* = keep_alive;
 
-    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    var arena_state = std.heap.ArenaAllocator.init(state.allocator);
     defer arena_state.deinit();
     const allocator = arena_state.allocator();
 

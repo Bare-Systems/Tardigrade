@@ -15,6 +15,9 @@ Before making any code changes, read these documents:
 - Keep the core runtime generic. Do not add product-specific logic to core.
 - Put integrations under `examples/`.
 - Keep docs concise and operator-focused.
+- Runtime allocator policy: keep `DebugAllocator` for one-shot control-plane
+  work, and keep the long-lived `run` path on `std.heap.smp_allocator` plus
+  request-scoped arenas/buffer pools.
 - New user-facing work must declare its target maturity level and update `docs/SUPPORT_MATRIX.md` when the public support contract changes.
 
 ## Workflow

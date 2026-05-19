@@ -1764,7 +1764,7 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
 }
 
 /// Count streams that are still open (remote can still send data).
-fn countOpenStreams(streams: *const std.AutoHashMap(u31, http.http2_stream.Stream)) u32 {
+fn countOpenStreams(streams: *std.AutoHashMap(u31, http.http2_stream.Stream)) u32 {
     var count: u32 = 0;
     var it = streams.iterator();
     while (it.next()) |entry| {

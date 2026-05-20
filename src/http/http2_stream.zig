@@ -27,7 +27,6 @@ pub const ErrorCode = enum(u32) {
     enhance_your_calm = 0xb,
     inadequate_security = 0xc,
     http_1_1_required = 0xd,
-    _,
 
     pub fn value(self: ErrorCode) u32 {
         return @intFromEnum(self);

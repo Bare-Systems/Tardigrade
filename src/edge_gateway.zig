@@ -9,8 +9,6 @@ const STREAM_RELAY_BUFFER_SIZE: usize = 16 * 1024;
 const JSON_CONTENT_TYPE = "application/json";
 const HTTP2_PREFACE = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 const HTTP2_MAX_FRAME_SIZE: usize = 16 * 1024;
-const HTTP2_MAX_CONCURRENT_STREAMS: u32 = 100;
-const HTTP2_INITIAL_STREAM_RECV_WINDOW: u32 = 1024 * 1024;
 const WS_MUX_MAX_CHANNELS: usize = 32;
 /// Fallback approval TTL when no config value is provided (5 minutes).
 const APPROVAL_TIMEOUT_MS_DEFAULT: i64 = 300_000;
@@ -1540,14 +1538,19 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
 
     const allocator = state.allocator;
 
-    // Advertise our SETTINGS: max concurrent streams and initial receive window per stream.
     try http.http2_frame.writeSettings(allocator, conn.writer(), &[_][2]u32{
-        .{ 0x3, HTTP2_MAX_CONCURRENT_STREAMS },
-        .{ 0x4, HTTP2_INITIAL_STREAM_RECV_WINDOW },
+        .{ 0x3, 100 }, // max concurrent streams
+        .{ 0x4, 1024 * 1024 }, // initial window size
     });
-
-    // pending: HTTP request data (headers, body) assembled per stream.
     var pending = std.AutoHashMap(u31, Http2PendingStream).init(allocator);
+    var stream_windows = std.AutoHashMap(u31, i32).init(allocator);
+    defer stream_windows.deinit();
+    var stream_priorities = std.AutoHashMap(u31, u8).init(allocator);
+    defer stream_priorities.deinit();
+    var ready_streams = std.array_list.Managed(u31).init(allocator);
+    defer ready_streams.deinit();
+    var next_server_stream_id: u31 = 2;
+    var conn_send_window: i32 = 65_535;
     defer {
         var it = pending.iterator();
         while (it.next()) |entry| {
@@ -1557,28 +1560,7 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
         pending.deinit();
     }
 
-    // streams: RFC 7540 stream state and flow-control windows per stream.
-    var streams = std.AutoHashMap(u31, http.http2_stream.Stream).init(allocator);
-    defer streams.deinit();
-
-    // Stateful HPACK decoder — maintains dynamic table across HEADERS frames.
-    var decoder = http.hpack.Decoder.init();
-    defer decoder.deinit(allocator);
-
-    var ready_streams = std.array_list.Managed(u31).init(allocator);
-    defer ready_streams.deinit();
-
-    var next_server_stream_id: u31 = 2;
-    // Highest client-initiated stream ID seen; used in GOAWAY frames.
-    var last_client_stream_id: u31 = 0;
-    // Connection-level receive window (how much data the client may send us).
-    var conn_recv_window: i32 = 65_535;
-    // Connection-level send window (how much data we may send the client).
-    // Starts at the HTTP/2 default; increased by client WINDOW_UPDATE(stream=0).
-    var conn_send_window: i32 = 65_535;
-    var goaway_received = false;
-
-    while (!http.shutdown.isShutdownRequested() and !goaway_received) {
+    while (!http.shutdown.isShutdownRequested()) {
         var frame = http.http2_frame.readFrame(conn, allocator, HTTP2_MAX_FRAME_SIZE) catch |err| switch (err) {
             error.ConnectionClosed => return,
             else => return err,
@@ -1587,49 +1569,24 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
 
         switch (frame.typ) {
             .settings => {
-                if ((frame.flags & http.http2_frame.Flags.ACK) == 0) {
-                    try http.http2_frame.writeSettingsAck(conn.writer());
-                }
+                if ((frame.flags & http.http2_frame.Flags.ACK) == 0) try http.http2_frame.writeSettingsAck(conn.writer());
             },
             .ping => {
-                if ((frame.flags & http.http2_frame.Flags.ACK) == 0) {
-                    try http.http2_frame.writePingAck(conn.writer(), frame.payload);
-                }
+                if ((frame.flags & http.http2_frame.Flags.ACK) == 0) try http.http2_frame.writePingAck(conn.writer(), frame.payload);
             },
             .headers => {
-                if (frame.stream_id == 0) {
-                    try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.protocol_error.value());
-                    return error.Http2ProtocolError;
-                }
-
-                // Enforce maximum concurrent streams to bound memory usage.
-                if (countOpenStreams(&streams) >= HTTP2_MAX_CONCURRENT_STREAMS) {
-                    try http.http2_frame.writeRstStream(conn.writer(), frame.stream_id, http.http2_stream.ErrorCode.refused_stream.value());
-                    continue;
-                }
-
-                last_client_stream_id = @max(last_client_stream_id, frame.stream_id);
-
+                if (frame.stream_id == 0) return error.InvalidHttp2StreamId;
                 var payload_offset: usize = 0;
-                var priority_weight: u8 = 16;
                 if ((frame.flags & http.http2_frame.Flags.PRIORITY) != 0) {
-                    if (frame.payload.len < 5) {
-                        try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.frame_size_error.value());
-                        return error.Http2ProtocolError;
-                    }
                     const pr = try http.http2_frame.parsePriority(frame.payload);
-                    priority_weight = pr.weight;
+                    try stream_priorities.put(frame.stream_id, pr.weight);
                     payload_offset = 5;
                 }
-
-                var decoded = decoder.decode(allocator, frame.payload[payload_offset..]) catch {
-                    try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.compression_error.value());
-                    return error.Http2CompressionError;
-                };
+                var decoded = try http.hpack.decode(allocator, frame.payload[payload_offset..]);
                 defer http.hpack.deinitDecoded(allocator, &decoded);
 
                 var ps = pending.get(frame.stream_id) orelse Http2PendingStream.init(allocator);
-                ps.priority_weight = priority_weight;
+                ps.priority_weight = stream_priorities.get(frame.stream_id) orelse ps.priority_weight;
                 for (decoded.headers) |h| {
                     if (std.mem.eql(u8, h.name, ":method")) {
                         if (ps.method) |m| allocator.free(m);
@@ -1642,136 +1599,77 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                     }
                 }
                 try pending.put(frame.stream_id, ps);
-
-                // Register stream state on first HEADERS for this stream.
-                if (!streams.contains(frame.stream_id)) {
-                    try streams.put(frame.stream_id, http.http2_stream.Stream.init(frame.stream_id, conn_send_window));
-                }
-                if (streams.getPtr(frame.stream_id)) |s| s.priority_weight = priority_weight;
+                _ = try stream_windows.getOrPutValue(frame.stream_id, 65_535);
 
                 if ((frame.flags & http.http2_frame.Flags.END_STREAM) != 0) {
-                    if (streams.getPtr(frame.stream_id)) |s| s.remoteEndStream() catch {}; // ignore: state already half-closed-remote from a prior frame
                     try ready_streams.append(frame.stream_id);
                 }
             },
             .data => {
-                if (frame.stream_id == 0) {
-                    try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.protocol_error.value());
-                    return error.Http2ProtocolError;
-                }
-
-                const stream_ptr = streams.getPtr(frame.stream_id);
-                if (stream_ptr == null or !stream_ptr.?.canReceive()) {
-                    // DATA on a closed or non-existent stream.
-                    try http.http2_frame.writeRstStream(conn.writer(), frame.stream_id, http.http2_stream.ErrorCode.stream_closed.value());
-                    continue;
-                }
-
-                // Enforce bounded request body size.
-                const ps_ptr = pending.getPtr(frame.stream_id);
-                if (ps_ptr == null) {
-                    try http.http2_frame.writeRstStream(conn.writer(), frame.stream_id, http.http2_stream.ErrorCode.stream_closed.value());
-                    continue;
-                }
-                if (ps_ptr.?.body.items.len + frame.payload.len > MAX_REQUEST_SIZE) {
-                    try http.http2_frame.writeRstStream(conn.writer(), frame.stream_id, http.http2_stream.ErrorCode.cancel.value());
-                    _ = streams.remove(frame.stream_id);
-                    if (pending.fetchRemove(frame.stream_id)) |removed| {
-                        var tmp = removed.value;
-                        tmp.deinit(allocator);
+                if (frame.stream_id == 0) return error.InvalidHttp2StreamId;
+                if (stream_windows.getPtr(frame.stream_id)) |sw| sw.* -= @intCast(frame.payload.len);
+                conn_send_window -= @intCast(frame.payload.len);
+                if (pending.getPtr(frame.stream_id)) |ps| {
+                    try ps.body.appendSlice(frame.payload);
+                    try http.http2_frame.writeWindowUpdate(conn.writer(), frame.stream_id, @intCast(frame.payload.len));
+                    try http.http2_frame.writeWindowUpdate(conn.writer(), 0, @intCast(frame.payload.len));
+                    if (stream_windows.getPtr(frame.stream_id)) |sw| sw.* += @intCast(frame.payload.len);
+                    conn_send_window += @intCast(frame.payload.len);
+                    if ((frame.flags & http.http2_frame.Flags.END_STREAM) != 0) {
+                        try ready_streams.append(frame.stream_id);
                     }
-                    continue;
-                }
-
-                // Debit receive windows.
-                conn_recv_window -= @intCast(frame.payload.len);
-                stream_ptr.?.recv_window -= @intCast(frame.payload.len);
-
-                try ps_ptr.?.body.appendSlice(frame.payload);
-
-                // Immediately replenish receive windows so the client can keep sending.
-                try http.http2_frame.writeWindowUpdate(conn.writer(), frame.stream_id, @intCast(frame.payload.len));
-                try http.http2_frame.writeWindowUpdate(conn.writer(), 0, @intCast(frame.payload.len));
-                conn_recv_window += @intCast(frame.payload.len);
-                stream_ptr.?.recv_window += @intCast(frame.payload.len);
-
-                if ((frame.flags & http.http2_frame.Flags.END_STREAM) != 0) {
-                    stream_ptr.?.remoteEndStream() catch {}; // ignore: duplicate END_STREAM on same stream is benign
-                    try ready_streams.append(frame.stream_id);
+                } else {
+                    try http.http2_frame.writeGoaway(conn.writer(), frame.stream_id, 1);
+                    return;
                 }
             },
             .priority => {
                 const pr = try http.http2_frame.parsePriority(frame.payload);
-                if (streams.getPtr(frame.stream_id)) |s| s.priority_weight = pr.weight;
+                try stream_priorities.put(frame.stream_id, pr.weight);
                 if (pending.getPtr(frame.stream_id)) |ps| ps.priority_weight = pr.weight;
             },
             .window_update => {
-                if (http.http2_frame.parseWindowUpdateIncrement(frame.payload)) |inc| {
-                    if (frame.stream_id == 0) {
-                        conn_send_window += @intCast(inc);
-                    } else {
-                        if (streams.getPtr(frame.stream_id)) |s| s.send_window += @intCast(inc);
-                    }
-                } else |_| {
-                    if (frame.stream_id == 0) {
-                        try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.protocol_error.value());
-                        return error.Http2ProtocolError;
-                    }
-                    try http.http2_frame.writeRstStream(conn.writer(), frame.stream_id, http.http2_stream.ErrorCode.protocol_error.value());
+                const inc = try http.http2_frame.parseWindowUpdateIncrement(frame.payload);
+                if (frame.stream_id == 0) {
+                    conn_send_window += @intCast(inc);
+                } else {
+                    const gop = try stream_windows.getOrPutValue(frame.stream_id, 65_535);
+                    gop.value_ptr.* += @intCast(inc);
                 }
             },
             .rst_stream => {
-                if (streams.getPtr(frame.stream_id)) |s| s.close();
-                _ = streams.remove(frame.stream_id);
                 if (pending.fetchRemove(frame.stream_id)) |removed| {
                     var tmp = removed.value;
                     tmp.deinit(allocator);
                 }
+                _ = stream_windows.remove(frame.stream_id);
+                _ = stream_priorities.remove(frame.stream_id);
             },
-            .goaway => {
-                goaway_received = true;
-            },
-            .continuation, .push_promise => {},
+            .continuation, .push_promise, .goaway => {},
         }
 
-        // Dispatch ready streams in priority order (highest weight first).
         while (ready_streams.items.len > 0) {
             var best_idx: usize = 0;
             var best_weight: u8 = 0;
             for (ready_streams.items, 0..) |sid, idx| {
-                const w = if (streams.get(sid)) |s| s.priority_weight else 16;
+                const w = stream_priorities.get(sid) orelse 16;
                 if (w >= best_weight) {
                     best_weight = w;
                     best_idx = idx;
                 }
             }
             const sid = ready_streams.swapRemove(best_idx);
-            const stream_send = if (streams.get(sid)) |s| s.send_window else conn_send_window;
             if (pending.getPtr(sid)) |ps| {
-                try respondHttp2Stream(conn.writer(), allocator, state, cfg, sid, ps, &next_server_stream_id, &conn_send_window, stream_send);
+                try respondHttp2Stream(conn.writer(), allocator, state, cfg, sid, ps, &next_server_stream_id);
             }
-            if (streams.getPtr(sid)) |s| s.localEndStream() catch {}; // ignore: stream may already be half-closed or closed
-            _ = streams.remove(sid);
             if (pending.fetchRemove(sid)) |removed| {
                 var tmp = removed.value;
                 tmp.deinit(allocator);
             }
+            _ = stream_windows.remove(sid);
+            _ = stream_priorities.remove(sid);
         }
     }
-
-    // Send GOAWAY on clean shutdown so the client knows the last processed stream.
-    http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.no_error.value()) catch {}; // best-effort: connection is closing regardless
-}
-
-/// Count streams that are still open (remote can still send data).
-fn countOpenStreams(streams: *std.AutoHashMap(u31, http.http2_stream.Stream)) u32 {
-    var count: u32 = 0;
-    var it = streams.iterator();
-    while (it.next()) |entry| {
-        const state = entry.value_ptr.state;
-        if (state == .open or state == .half_closed_local) count += 1;
-    }
-    return count;
 }
 
 fn respondHttp2Stream(
@@ -1782,19 +1680,10 @@ fn respondHttp2Stream(
     stream_id: u31,
     ps: *const Http2PendingStream,
     next_server_stream_id: *u31,
-    conn_send_window: *i32,
-    stream_send_window: i32,
 ) !void {
     _ = next_server_stream_id;
     const method = ps.method orelse return error.InvalidHttp2Request;
     const path = ps.path orelse return error.InvalidHttp2Request;
-
-    var lifecycle = http.request_lifecycle.RequestLifecycle.init(
-        "h2",
-        cfg.request_total_timeout_ms,
-    );
-    if (lifecycle.checkDeadline(.headers_read)) return error.RequestTimeout;
-
     const correlation_id = try http.correlation.generate(allocator);
     defer allocator.free(correlation_id);
 
@@ -1837,22 +1726,13 @@ fn respondHttp2Stream(
         stream_id,
         header_block,
     );
-
-    // Respect flow-control windows: only send as much as both windows allow.
-    const effective_window: i32 = @min(conn_send_window.*, stream_send_window);
-    const send_len: usize = if (effective_window > 0)
-        @min(body.len, @as(usize, @intCast(effective_window)))
-    else
-        0;
-
     try http.http2_frame.writeFrame(
         writer,
         .data,
         http.http2_frame.Flags.END_STREAM,
         stream_id,
-        body[0..send_len],
+        body,
     );
-    conn_send_window.* -= @intCast(send_len);
 
     state.metricsRecord(status_code);
 }

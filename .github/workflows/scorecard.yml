@@ -34,11 +34,16 @@ jobs:
           results_format: sarif
           publish_results: true
 
+      - name: Stage SARIF artifact
+        run: |
+          mkdir -p "$RUNNER_TEMP/scorecard-artifacts"
+          cp results.sarif "$RUNNER_TEMP/scorecard-artifacts/results.sarif"
+
       - name: Upload SARIF artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: SARIF file
-          path: results.sarif
+          path: ${{ runner.temp }}/scorecard-artifacts/results.sarif
           retention-days: 5
 
       - name: Upload SARIF to Security tab

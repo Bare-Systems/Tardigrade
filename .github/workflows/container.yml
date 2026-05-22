@@ -92,18 +92,19 @@ jobs:
           cache-to: type=gha,mode=max,scope=container-${{ matrix.arch }}
 
       - name: Export digest
-        run: |
-          mkdir -p /tmp/digests
-          touch "/tmp/digests/${DIGEST#sha256:}"
         env:
           DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          mkdir -p /tmp/digests
+          printf '%s\n' "$DIGEST" > "/tmp/digests/${{ matrix.arch }}.txt"
 
       - name: Upload digest artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: digest-${{ matrix.arch }}
-          path: /tmp/digests/*
+          path: /tmp/digests/${{ matrix.arch }}.txt
           if-no-files-found: error
+          retention-days: 1
 
   # ── Merge manifest list ────────────────────────────────────────────────────────
   # Combines the per-arch digests into a single multi-arch manifest, then applies
@@ -155,14 +156,18 @@ jobs:
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
 
       - name: Create and push manifest list
-        working-directory: /tmp/digests
         env:
           IMAGE_NAME: ${{ steps.image.outputs.name }}
         run: |
-          # shellcheck disable=SC2046
+          set -euo pipefail
+          refs=()
+          for digest_file in /tmp/digests/*.txt; do
+            digest="$(cat "$digest_file")"
+            refs+=("${IMAGE_NAME}@${digest}")
+          done
           docker buildx imagetools create \
             $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            $(printf "${IMAGE_NAME}@sha256:%s " *)
+            "${refs[@]}"
 
       - name: Inspect manifest
         env:

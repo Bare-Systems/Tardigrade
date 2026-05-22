@@ -218,13 +218,20 @@ jobs:
       - name: Run performance smoke benchmark
         run: ./benchmarks/ci-smoke.sh --save benchmarks/results/ci-smoke.json
 
+      - name: Stage perf smoke artifact
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/perf-artifacts"
+          cp benchmarks/results/ci-smoke.json "$RUNNER_TEMP/perf-artifacts/ci-smoke.json"
+
       - name: Upload perf smoke results
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: perf-smoke-results
-          path: benchmarks/results/ci-smoke.json
+          path: ${{ runner.temp }}/perf-artifacts/ci-smoke.json
           if-no-files-found: error
+          retention-days: 7
 
   # ── Security scanning ─────────────────────────────────────────────────────────
   # Secret detection, filesystem vulnerability scanning, and GitHub Actions

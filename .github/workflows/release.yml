@@ -71,14 +71,17 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Generate release notes
-        run: ./scripts/release-metadata.sh notes > release-notes.md
+        run: |
+          mkdir -p "$RUNNER_TEMP/release-notes"
+          ./scripts/release-metadata.sh notes > "$RUNNER_TEMP/release-notes/release-notes.md"
 
       - name: Upload release notes
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-notes
-          path: release-notes.md
+          path: ${{ runner.temp }}/release-notes/release-notes.md
           if-no-files-found: error
+          retention-days: 1
 
   build-release:
     name: Build ${{ matrix.archive_name }}
@@ -118,45 +121,62 @@ jobs:
       - name: Print Zig version
         run: zig version
 
+      - name: Prepare archive artifact paths
+        id: archive_artifacts
+        env:
+          ARCHIVE_NAME: ${{ matrix.archive_name }}
+        run: |
+          set -euo pipefail
+          artifact_dir="$RUNNER_TEMP/release-artifacts/$ARCHIVE_NAME"
+          mkdir -p "$artifact_dir"
+          echo "artifact_dir=$artifact_dir" >> "$GITHUB_OUTPUT"
+          echo "archive_path=$artifact_dir/$ARCHIVE_NAME.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "sbom_path=$artifact_dir/sbom-$ARCHIVE_NAME.spdx.json" >> "$GITHUB_OUTPUT"
+
       - name: Build release binary
         env:
           VERSION: ${{ needs.prepare-release.outputs.version }}
         run: zig build -Doptimize=ReleaseFast "-Dversion=$VERSION"
 
       - name: Package artifact
+        env:
+          ARCHIVE_NAME: ${{ matrix.archive_name }}
+          ARTIFACT_DIR: ${{ steps.archive_artifacts.outputs.artifact_dir }}
         run: |
           ./scripts/package-release-archive.sh \
-            --archive-name "${{ matrix.archive_name }}" \
+            --archive-name "$ARCHIVE_NAME" \
             --binary zig-out/bin/tardigrade \
             --staging-dir dist \
-            --output-dir .
+            --output-dir "$ARTIFACT_DIR"
 
       - name: Generate SBOM
         uses: anchore/sbom-action@e11c554f704a0b820cbf8c51673f6945e0731532 # v0.20.0
         with:
-          path: dist/
+          path: ${{ steps.archive_artifacts.outputs.artifact_dir }}
           artifact-name: sbom-${{ matrix.archive_name }}.spdx.json
           format: spdx-json
-          output-file: sbom-${{ matrix.archive_name }}.spdx.json
+          output-file: ${{ steps.archive_artifacts.outputs.sbom_path }}
 
       - name: Attest build provenance
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:
-          subject-path: ${{ matrix.archive_name }}.tar.gz
+          subject-path: ${{ steps.archive_artifacts.outputs.archive_path }}
 
       - name: Upload archive artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ matrix.archive_name }}
-          path: ${{ matrix.archive_name }}.tar.gz
+          path: ${{ steps.archive_artifacts.outputs.archive_path }}
           if-no-files-found: error
+          retention-days: 1
 
       - name: Upload SBOM artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: sbom-${{ matrix.archive_name }}
-          path: sbom-${{ matrix.archive_name }}.spdx.json
+          path: ${{ steps.archive_artifacts.outputs.sbom_path }}
           if-no-files-found: error
+          retention-days: 1
 
   build-deb:
     name: Build DEB packages
@@ -205,27 +225,55 @@ jobs:
             --arch "$ARCH" \
             --binary zig-out/bin/tardigrade
 
+      - name: Prepare DEB artifact paths
+        id: deb_artifacts
+        env:
+          ARCH: ${{ matrix.arch }}
+          VERSION: ${{ needs.prepare-release.outputs.version }}
+        run: |
+          set -euo pipefail
+          artifact_dir="$RUNNER_TEMP/deb-artifacts/$ARCH"
+          mkdir -p "$artifact_dir"
+          echo "artifact_dir=$artifact_dir" >> "$GITHUB_OUTPUT"
+          echo "package_path=$artifact_dir/tardigrade_${VERSION}_${ARCH}.deb" >> "$GITHUB_OUTPUT"
+          echo "sbom_path=$artifact_dir/sbom-tardigrade_${VERSION}_${ARCH}.spdx.json" >> "$GITHUB_OUTPUT"
+
       - name: Generate DEB SBOM
         uses: anchore/sbom-action@e11c554f704a0b820cbf8c51673f6945e0731532 # v0.20.0
         with:
           path: dist/
           artifact-name: sbom-tardigrade_${{ needs.prepare-release.outputs.version }}_${{ matrix.arch }}.spdx.json
           format: spdx-json
-          output-file: sbom-tardigrade_${{ needs.prepare-release.outputs.version }}_${{ matrix.arch }}.spdx.json
+          output-file: ${{ steps.deb_artifacts.outputs.sbom_path }}
+
+      - name: Stage DEB artifact
+        env:
+          PACKAGE_PATH: ${{ steps.deb_artifacts.outputs.package_path }}
+        run: |
+          set -euo pipefail
+          package="$(find dist -maxdepth 1 -type f -name '*.deb' -print)"
+          if [ "$(printf '%s\n' "$package" | sed '/^$/d' | wc -l)" -ne 1 ]; then
+            echo "expected exactly one DEB package in dist/" >&2
+            printf '%s\n' "$package" >&2
+            exit 1
+          fi
+          cp "$package" "$PACKAGE_PATH"
 
       - name: Upload DEB artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: tardigrade_${{ needs.prepare-release.outputs.version }}_${{ matrix.arch }}.deb
-          path: dist/*.deb
+          path: ${{ steps.deb_artifacts.outputs.package_path }}
           if-no-files-found: error
+          retention-days: 1
 
       - name: Upload DEB SBOM artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: sbom-tardigrade_${{ needs.prepare-release.outputs.version }}_${{ matrix.arch }}
-          path: sbom-tardigrade_${{ needs.prepare-release.outputs.version }}_${{ matrix.arch }}.spdx.json
+          path: ${{ steps.deb_artifacts.outputs.sbom_path }}
           if-no-files-found: error
+          retention-days: 1
 
   build-rpm:
     name: Build RPM packages
@@ -277,27 +325,55 @@ jobs:
             --arch "$ARCH" \
             --binary zig-out/bin/tardigrade
 
+      - name: Prepare RPM artifact paths
+        id: rpm_artifacts
+        env:
+          ARCH: ${{ matrix.arch }}
+          VERSION: ${{ needs.prepare-release.outputs.version }}
+        run: |
+          set -euo pipefail
+          artifact_dir="$RUNNER_TEMP/rpm-artifacts/$ARCH"
+          mkdir -p "$artifact_dir"
+          echo "artifact_dir=$artifact_dir" >> "$GITHUB_OUTPUT"
+          echo "package_path=$artifact_dir/tardigrade-${VERSION}-${ARCH}.rpm" >> "$GITHUB_OUTPUT"
+          echo "sbom_path=$artifact_dir/sbom-tardigrade-${VERSION}-${ARCH}.rpm.spdx.json" >> "$GITHUB_OUTPUT"
+
       - name: Generate RPM SBOM
         uses: anchore/sbom-action@e11c554f704a0b820cbf8c51673f6945e0731532 # v0.20.0
         with:
           path: dist/
           artifact-name: sbom-tardigrade-${{ needs.prepare-release.outputs.version }}-${{ matrix.arch }}.rpm.spdx.json
           format: spdx-json
-          output-file: sbom-tardigrade-${{ needs.prepare-release.outputs.version }}-${{ matrix.arch }}.rpm.spdx.json
+          output-file: ${{ steps.rpm_artifacts.outputs.sbom_path }}
+
+      - name: Stage RPM artifact
+        env:
+          PACKAGE_PATH: ${{ steps.rpm_artifacts.outputs.package_path }}
+        run: |
+          set -euo pipefail
+          package="$(find dist -maxdepth 1 -type f -name '*.rpm' -print)"
+          if [ "$(printf '%s\n' "$package" | sed '/^$/d' | wc -l)" -ne 1 ]; then
+            echo "expected exactly one RPM package in dist/" >&2
+            printf '%s\n' "$package" >&2
+            exit 1
+          fi
+          cp "$package" "$PACKAGE_PATH"
 
       - name: Upload RPM artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: tardigrade-${{ needs.prepare-release.outputs.version }}-${{ matrix.arch }}.rpm
-          path: dist/*.rpm
+          path: ${{ steps.rpm_artifacts.outputs.package_path }}
           if-no-files-found: error
+          retention-days: 1
 
       - name: Upload RPM SBOM artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: sbom-tardigrade-${{ needs.prepare-release.outputs.version }}-${{ matrix.arch }}.rpm
-          path: sbom-tardigrade-${{ needs.prepare-release.outputs.version }}-${{ matrix.arch }}.rpm.spdx.json
+          path: ${{ steps.rpm_artifacts.outputs.sbom_path }}
           if-no-files-found: error
+          retention-days: 1
 
   publish-release:
     name: Publish GitHub release assets
@@ -319,29 +395,32 @@ jobs:
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: release-notes
+          path: ${{ runner.temp }}/publish-release/release-notes
 
       - name: Download build artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          path: dist
+          path: ${{ runner.temp }}/publish-release/dist
           pattern: 'tardigrade*,sbom*'
           merge-multiple: true
 
       - name: Generate checksums
         shell: bash
+        env:
+          DIST_DIR: ${{ runner.temp }}/publish-release/dist
         run: |
           set -euo pipefail
-          install -m 0755 scripts/install.sh dist/install.sh
-          find dist -type f \( -name '*.tar.gz' -o -name '*.deb' -o -name '*.rpm' -o -name 'install.sh' \) -print0 | sort -z | xargs -0 sha256sum > dist/tardigrade-checksums.txt
+          install -m 0755 scripts/install.sh "$DIST_DIR/install.sh"
+          find "$DIST_DIR" -type f \( -name '*.tar.gz' -o -name '*.deb' -o -name '*.rpm' -o -name 'install.sh' \) -print0 | sort -z | xargs -0 sha256sum > "$DIST_DIR/tardigrade-checksums.txt"
 
       - name: Verify checksums
-        run: sha256sum --check dist/tardigrade-checksums.txt
+        run: sha256sum --check "${{ runner.temp }}/publish-release/dist/tardigrade-checksums.txt"
 
       - name: Scan release archives for vulnerabilities
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           scan-type: fs
-          scan-ref: dist/
+          scan-ref: ${{ runner.temp }}/publish-release/dist/
           format: table
           severity: CRITICAL
           exit-code: 0
@@ -351,12 +430,12 @@ jobs:
         with:
           tag_name: ${{ needs.prepare-release.outputs.tag }}
           name: Tardigrade ${{ needs.prepare-release.outputs.tag }}
-          body_path: release-notes.md
+          body_path: ${{ runner.temp }}/publish-release/release-notes/release-notes.md
           files: |
-            dist/*/*.tar.gz
-            dist/*/*.deb
-            dist/*/*.rpm
-            dist/*/*.spdx.json
-            dist/install.sh
-            dist/tardigrade-checksums.txt
+            ${{ runner.temp }}/publish-release/dist/*.tar.gz
+            ${{ runner.temp }}/publish-release/dist/*.deb
+            ${{ runner.temp }}/publish-release/dist/*.rpm
+            ${{ runner.temp }}/publish-release/dist/*.spdx.json
+            ${{ runner.temp }}/publish-release/dist/install.sh
+            ${{ runner.temp }}/publish-release/dist/tardigrade-checksums.txt
           fail_on_unmatched_files: true

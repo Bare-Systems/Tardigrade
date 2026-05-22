@@ -414,7 +414,9 @@ jobs:
           find "$DIST_DIR" -type f \( -name '*.tar.gz' -o -name '*.deb' -o -name '*.rpm' -o -name 'install.sh' \) -print0 | sort -z | xargs -0 sha256sum > "$DIST_DIR/tardigrade-checksums.txt"
 
       - name: Verify checksums
-        run: sha256sum --check "${{ runner.temp }}/publish-release/dist/tardigrade-checksums.txt"
+        env:
+          CHECKSUMS_PATH: ${{ runner.temp }}/publish-release/dist/tardigrade-checksums.txt
+        run: sha256sum --check "$CHECKSUMS_PATH"
 
       - name: Scan release archives for vulnerabilities
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0

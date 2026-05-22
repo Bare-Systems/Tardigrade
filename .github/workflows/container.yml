@@ -94,9 +94,10 @@ jobs:
       - name: Export digest
         env:
           DIGEST: ${{ steps.push.outputs.digest }}
+          ARCH: ${{ matrix.arch }}
         run: |
           mkdir -p /tmp/digests
-          printf '%s\n' "$DIGEST" > "/tmp/digests/${{ matrix.arch }}.txt"
+          printf '%s\n' "$DIGEST" > "/tmp/digests/$ARCH.txt"
 
       - name: Upload digest artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

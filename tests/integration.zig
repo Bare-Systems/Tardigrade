@@ -52,6 +52,7 @@ const UpstreamResponseSpec = struct {
     headers: []const ResponseHeader = &.{},
     body: []const u8 = "{\"ok\":true}",
     delay_ms: u32 = 0,
+    connection_header: []const u8 = "close",
 };
 
 const FastCgiResponseSpec = struct {
@@ -396,7 +397,11 @@ const UpstreamServer = struct {
     next_response_index: usize,
 
     fn start(allocator: std.mem.Allocator, responses: []const UpstreamResponseSpec) !UpstreamServer {
-        const server = try compat.listenTcp(test_host, 0);
+        return startOnPort(allocator, 0, responses);
+    }
+
+    fn startOnPort(allocator: std.mem.Allocator, listen_port: u16, responses: []const UpstreamResponseSpec) !UpstreamServer {
+        const server = try compat.listenTcp(test_host, listen_port);
         return .{
             .allocator = allocator,
             .server = server,
@@ -1330,10 +1335,11 @@ fn handleUpstreamConnection(server: *UpstreamServer, conn: compat.NetConnection)
         else => "OK",
     };
 
-    try conn.stream.writer().print("HTTP/1.1 {d} {s}\r\nContent-Length: {d}\r\nConnection: close\r\n", .{
+    try conn.stream.writer().print("HTTP/1.1 {d} {s}\r\nContent-Length: {d}\r\nConnection: {s}\r\n", .{
         response_spec.status_code,
         reason,
         response_spec.body.len,
+        response_spec.connection_header,
     });
     for (response_spec.headers) |header| {
         try conn.stream.writer().print("{s}: {s}\r\n", .{ header.name, header.value });
@@ -3002,6 +3008,106 @@ test "proxy requests strip hop-by-hop headers before reaching upstreams" {
     try std.testing.expect(upstream.capturedHeader("X-Another-Hop") == null);
     try std.testing.expectEqualStrings("integration-client/1.0", upstream.capturedHeader("User-Agent").?);
     try std.testing.expectEqualStrings("still-here", upstream.capturedHeader("X-Custom-Pass").?);
+}
+
+test "proxy evicts stale pooled upstream connection after backend restart" {
+    const allocator = std.testing.allocator;
+
+    var upstream = try UpstreamServer.start(allocator, &.{.{
+        .body = "{\"version\":\"old\"}",
+        .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
+        .connection_header = "keep-alive",
+    }});
+    defer upstream.stop();
+    try upstream.run();
+
+    const upstream_port = upstream.port();
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location /proxy/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+    , .{ test_host, upstream_port });
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_UPSTREAM_RETRY_ATTEMPTS", .value = "1" },
+        },
+    });
+    defer tardigrade.stop();
+
+    var first = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/proxy/version",
+        .body = null,
+        .headers = &.{},
+    });
+    defer first.deinit();
+    try std.testing.expectEqual(@as(u16, 200), first.status_code);
+    try std.testing.expectEqualStrings("{\"version\":\"old\"}", first.body);
+    try std.testing.expectEqual(@as(u32, 1), upstream.requestCount());
+
+    upstream.stop();
+    upstream = try UpstreamServer.startOnPort(allocator, upstream_port, &.{.{
+        .body = "{\"version\":\"new\"}",
+        .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
+    }});
+    try upstream.run();
+
+    var second = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/proxy/version",
+        .body = null,
+        .headers = &.{},
+    });
+    defer second.deinit();
+    try std.testing.expectEqual(@as(u16, 502), second.status_code);
+    try std.testing.expectEqual(@as(u32, 0), upstream.requestCount());
+
+    var third = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/proxy/version",
+        .body = null,
+        .headers = &.{},
+    });
+    defer third.deinit();
+    try std.testing.expectEqual(@as(u16, 200), third.status_code);
+    try std.testing.expectEqualStrings("{\"version\":\"new\"}", third.body);
+    try std.testing.expectEqual(@as(u32, 1), upstream.requestCount());
+}
+
+test "proxy forwards POST with an explicit zero-length body" {
+    const allocator = std.testing.allocator;
+
+    var upstream = try UpstreamServer.start(allocator, &.{.{
+        .body = "{\"ok\":true}",
+        .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
+    }});
+    defer upstream.stop();
+    try upstream.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location /proxy/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+    , .{ test_host, upstream.port() });
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+    });
+    defer tardigrade.stop();
+
+    var response = try sendRequest(allocator, tardigrade.port, .{
+        .method = "POST",
+        .path = "/proxy/login",
+        .body = "",
+        .headers = &.{},
+    });
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status_code);
+    try std.testing.expectEqual(@as(u32, 1), upstream.requestCount());
 }
 
 test "proxy buffered response limit can exceed request parser cap" {

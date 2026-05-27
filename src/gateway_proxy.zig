@@ -227,6 +227,12 @@ pub fn upstreamReasonPhrase(status: std.http.Status) []const u8 {
     return status.phrase() orelse "";
 }
 
+fn markRequestConnectionClosing(req: *std.http.Client.Request) void {
+    if (req.connection) |connection| {
+        connection.closing = true;
+    }
+}
+
 pub fn executeRawHttpProxyRequest(
     allocator: std.mem.Allocator,
     client: *std.http.Client,
@@ -329,12 +335,21 @@ pub fn executeRawHttpProxyRequest(
     });
     defer req.deinit();
 
-    if (body.len > 0) {
-        try req.sendBodyComplete(@constCast(body));
+    if (body.len > 0 or method_enum.requestHasBody()) {
+        req.sendBodyComplete(@constCast(body)) catch |err| {
+            markRequestConnectionClosing(&req);
+            return err;
+        };
     } else {
-        try req.sendBodiless();
+        req.sendBodiless() catch |err| {
+            markRequestConnectionClosing(&req);
+            return err;
+        };
     }
-    var resp = try req.receiveHead(&server_header_buffer);
+    var resp = req.receiveHead(&server_header_buffer) catch |err| {
+        markRequestConnectionClosing(&req);
+        return err;
+    };
 
     var headers = std.array_list.Managed(UpstreamHeader).init(metadata_allocator);
     try headers.ensureUnusedCapacity(8);

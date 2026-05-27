@@ -95,6 +95,11 @@ Buffered upstream response bodies use a dedicated limit controlled by
 `TARDIGRADE_MAX_BUFFERED_UPSTREAM_RESPONSE_BYTES` (default `262144`), so
 operators can raise proxy payload ceilings without changing inbound request
 parsing limits.
+When an upstream container is replaced on the same host:port, the first request
+that hits a dead pooled keep-alive socket now evicts that stale connection so
+later requests reconnect cleanly without restarting Tardigrade. Proxy requests
+that send an explicit zero-length `POST` body are also forwarded without
+triggering a runtime panic.
 
 Static file requests are percent-decoded and normalized before filesystem
 access. Traversal attempts and symlink escapes outside the configured root are

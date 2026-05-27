@@ -626,10 +626,13 @@ pub fn writeBufferedUpstreamResponse(
         if (upstream_response.body.len > 0) try writer.writeAll(upstream_response.body);
         return;
     };
+    const head_len = response_stream.getWritten().len;
     if (upstream_response.body.len > 0) {
         response_stream.writer().writeAll(upstream_response.body) catch {
-            try writer.writeAll(response_stream.getWritten());
-            try writer.writeAll(upstream_response.body);
+            const written = response_stream.getWritten();
+            const body_prefix_len = written.len - head_len;
+            try writer.writeAll(written);
+            try writer.writeAll(upstream_response.body[body_prefix_len..]);
             return;
         };
     }
@@ -755,6 +758,45 @@ pub fn writeSecurityHeaders(writer: anytype, sec: *const http.security_headers.S
     if (sec.x_xss_protection.len > 0) try writer.print("X-XSS-Protection: {s}\r\n", .{sec.x_xss_protection});
     if (sec.cross_origin_opener_policy.len > 0) try writer.print("Cross-Origin-Opener-Policy: {s}\r\n", .{sec.cross_origin_opener_policy});
     if (sec.cross_origin_resource_policy.len > 0) try writer.print("Cross-Origin-Resource-Policy: {s}\r\n", .{sec.cross_origin_resource_policy});
+}
+
+test "writeBufferedUpstreamResponse preserves oversized body bytes exactly" {
+    const allocator = std.testing.allocator;
+    const prefix = "/*! tailwindcss v4.1.4 | MIT License | synthetic */\n";
+    const extra_len = 16 * 1024;
+    const body = try allocator.alloc(u8, prefix.len + extra_len);
+    defer allocator.free(body);
+    @memcpy(body[0..prefix.len], prefix);
+    for (body[prefix.len..], 0..) |*byte, idx| {
+        byte.* = @intCast('a' + @as(u8, @intCast(idx % 26)));
+    }
+
+    var upstream_headers = [_]UpstreamHeader{
+        .{ .name = "Content-Type", .value = "text/css" },
+    };
+    var response = RawUpstreamResponse{
+        .metadata_arena = std.heap.ArenaAllocator.init(allocator),
+        .status_code = 200,
+        .reason = "OK",
+        .headers = upstream_headers[0..],
+        .body = body,
+    };
+    defer response.metadata_arena.deinit();
+
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    try writeBufferedUpstreamResponse(
+        &output.writer,
+        &response,
+        false,
+        "req-large-body",
+        &http.security_headers.SecurityHeaders.api,
+        null,
+    );
+
+    const raw = output.written();
+    const head_end = std.mem.find(u8, raw, "\r\n\r\n") orelse return error.InvalidHttpResponse;
+    try std.testing.expectEqualStrings(body, raw[head_end + 4 ..]);
 }
 
 pub fn writeChunk(writer: anytype, bytes: []const u8) !void {

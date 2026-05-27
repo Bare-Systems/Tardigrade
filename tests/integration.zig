@@ -3110,6 +3110,48 @@ test "proxy forwards POST with an explicit zero-length body" {
     try std.testing.expectEqual(@as(u32, 1), upstream.requestCount());
 }
 
+test "proxy preserves large buffered upstream body bytes exactly" {
+    const allocator = std.testing.allocator;
+    const prefix = "/*! tailwindcss v4.1.4 | MIT License | integration */\n";
+    const payload_len = prefix.len + 24 * 1024;
+    const payload = try allocator.alloc(u8, payload_len);
+    defer allocator.free(payload);
+    @memcpy(payload[0..prefix.len], prefix);
+    for (payload[prefix.len..], 0..) |*byte, idx| {
+        byte.* = @intCast('a' + @as(u8, @intCast(idx % 26)));
+    }
+
+    var upstream = try UpstreamServer.start(allocator, &.{.{
+        .body = payload,
+        .headers = &.{.{ .name = "Content-Type", .value = "text/css" }},
+    }});
+    defer upstream.stop();
+    try upstream.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location /proxy/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+    , .{ test_host, upstream.port() });
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+    });
+    defer tardigrade.stop();
+
+    var response = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/proxy/assets/tailwind.css",
+        .body = null,
+        .headers = &.{},
+    });
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status_code);
+    try std.testing.expectEqual(@as(usize, payload_len), response.body.len);
+    try std.testing.expectEqualStrings(payload, response.body);
+}
+
 test "proxy buffered response limit can exceed request parser cap" {
     const allocator = std.testing.allocator;
     const payload_len = 300 * 1024;

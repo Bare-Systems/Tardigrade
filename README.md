@@ -100,6 +100,9 @@ that hits a dead pooled keep-alive socket now evicts that stale connection so
 later requests reconnect cleanly without restarting Tardigrade. Proxy requests
 that send an explicit zero-length `POST` body are also forwarded without
 triggering a runtime panic.
+Large buffered proxy responses now preserve the upstream body exactly instead of
+duplicating the first body chunk after the internal 8 KiB response scratch
+buffer fills.
 
 Static file requests are percent-decoded and normalized before filesystem
 access. Traversal attempts and symlink escapes outside the configured root are

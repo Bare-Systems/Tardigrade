@@ -66,9 +66,19 @@ pub const Response = struct {
         return self;
     }
 
-    /// Set a header value
+    /// Set a header value (always sets, even if header already present).
     pub fn setHeader(self: *Response, name: []const u8, value: []const u8) *Response {
         self.headers.append(name, value) catch {}; // OOM during header set is best-effort; header is omitted from the response
+        return self;
+    }
+
+    /// Set a header only if no header with that name is already present.
+    /// Used by security-header injection so upstream-supplied values are not
+    /// overwritten or duplicated (e.g. proxied responses that already carry CSP).
+    pub fn setHeaderIfAbsent(self: *Response, name: []const u8, value: []const u8) *Response {
+        if (self.headers.get(name) == null) {
+            self.headers.append(name, value) catch {};
+        }
         return self;
     }
 

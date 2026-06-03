@@ -667,7 +667,9 @@ pub fn writeBufferedUpstreamResponseHead(
     if (sticky_set_cookie) |cookie| {
         try writer.print("Set-Cookie: {s}\r\n", .{cookie});
     }
-    try writeSecurityHeaders(writer, security);
+    // Only inject security headers that the upstream did not already supply,
+    // preventing duplicate / conflicting headers (e.g. double CSP).
+    try writeSecurityHeadersFiltered(writer, security, upstream_response.headers);
     try writer.writeAll("\r\n");
 }
 
@@ -692,7 +694,8 @@ pub fn shouldSkipUpstreamRequestHeader(name: []const u8, connection_header: ?[]c
 
     if (connectionHeaderReferencesHeader(connection_header, name)) return true;
 
-    return std.ascii.eqlIgnoreCase(name, "connection") or
+    return std.ascii.eqlIgnoreCase(name, "accept-encoding") or
+        std.ascii.eqlIgnoreCase(name, "connection") or
         std.ascii.eqlIgnoreCase(name, "content-length") or
         std.ascii.eqlIgnoreCase(name, "host") or
         std.ascii.eqlIgnoreCase(name, "keep-alive") or
@@ -749,15 +752,44 @@ pub fn computeHstsValue(allocator: std.mem.Allocator, cfg: *const edge_config.Ed
 }
 
 pub fn writeSecurityHeaders(writer: anytype, sec: *const http.security_headers.SecurityHeaders) !void {
-    if (sec.x_frame_options.len > 0) try writer.print("X-Frame-Options: {s}\r\n", .{sec.x_frame_options});
-    if (sec.x_content_type_options.len > 0) try writer.print("X-Content-Type-Options: {s}\r\n", .{sec.x_content_type_options});
-    if (sec.content_security_policy.len > 0) try writer.print("Content-Security-Policy: {s}\r\n", .{sec.content_security_policy});
-    if (sec.strict_transport_security.len > 0) try writer.print("Strict-Transport-Security: {s}\r\n", .{sec.strict_transport_security});
-    if (sec.referrer_policy.len > 0) try writer.print("Referrer-Policy: {s}\r\n", .{sec.referrer_policy});
-    if (sec.permissions_policy.len > 0) try writer.print("Permissions-Policy: {s}\r\n", .{sec.permissions_policy});
-    if (sec.x_xss_protection.len > 0) try writer.print("X-XSS-Protection: {s}\r\n", .{sec.x_xss_protection});
-    if (sec.cross_origin_opener_policy.len > 0) try writer.print("Cross-Origin-Opener-Policy: {s}\r\n", .{sec.cross_origin_opener_policy});
-    if (sec.cross_origin_resource_policy.len > 0) try writer.print("Cross-Origin-Resource-Policy: {s}\r\n", .{sec.cross_origin_resource_policy});
+    try writeSecurityHeadersFiltered(writer, sec, &[_]UpstreamHeader{});
+}
+
+/// Like writeSecurityHeaders but skips any header already present in
+/// `upstream_headers`, preventing duplicate / conflicting headers when the
+/// upstream (e.g. a Rails app) already supplies its own security policy.
+pub fn writeSecurityHeadersFiltered(
+    writer: anytype,
+    sec: *const http.security_headers.SecurityHeaders,
+    upstream_headers: []const UpstreamHeader,
+) !void {
+    const has = struct {
+        fn header(headers: []const UpstreamHeader, name: []const u8) bool {
+            for (headers) |h| {
+                if (std.ascii.eqlIgnoreCase(h.name, name)) return true;
+            }
+            return false;
+        }
+    }.header;
+
+    if (sec.x_frame_options.len > 0 and !has(upstream_headers, "X-Frame-Options"))
+        try writer.print("X-Frame-Options: {s}\r\n", .{sec.x_frame_options});
+    if (sec.x_content_type_options.len > 0 and !has(upstream_headers, "X-Content-Type-Options"))
+        try writer.print("X-Content-Type-Options: {s}\r\n", .{sec.x_content_type_options});
+    if (sec.content_security_policy.len > 0 and !has(upstream_headers, "Content-Security-Policy"))
+        try writer.print("Content-Security-Policy: {s}\r\n", .{sec.content_security_policy});
+    if (sec.strict_transport_security.len > 0 and !has(upstream_headers, "Strict-Transport-Security"))
+        try writer.print("Strict-Transport-Security: {s}\r\n", .{sec.strict_transport_security});
+    if (sec.referrer_policy.len > 0 and !has(upstream_headers, "Referrer-Policy"))
+        try writer.print("Referrer-Policy: {s}\r\n", .{sec.referrer_policy});
+    if (sec.permissions_policy.len > 0 and !has(upstream_headers, "Permissions-Policy"))
+        try writer.print("Permissions-Policy: {s}\r\n", .{sec.permissions_policy});
+    if (sec.x_xss_protection.len > 0 and !has(upstream_headers, "X-XSS-Protection"))
+        try writer.print("X-XSS-Protection: {s}\r\n", .{sec.x_xss_protection});
+    if (sec.cross_origin_opener_policy.len > 0 and !has(upstream_headers, "Cross-Origin-Opener-Policy"))
+        try writer.print("Cross-Origin-Opener-Policy: {s}\r\n", .{sec.cross_origin_opener_policy});
+    if (sec.cross_origin_resource_policy.len > 0 and !has(upstream_headers, "Cross-Origin-Resource-Policy"))
+        try writer.print("Cross-Origin-Resource-Policy: {s}\r\n", .{sec.cross_origin_resource_policy});
 }
 
 test "writeBufferedUpstreamResponse preserves oversized body bytes exactly" {

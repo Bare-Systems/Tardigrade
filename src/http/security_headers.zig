@@ -29,25 +29,28 @@ pub const SecurityHeaders = struct {
     cross_origin_resource_policy: []const u8 = "same-origin",
 
     /// Apply all configured security headers to a response.
+    /// Each header is only set if the response does not already carry a header
+    /// with that name — this prevents duplicate or conflicting headers when the
+    /// upstream (e.g. a Rails app) already supplies its own security policy.
     pub fn apply(self: *const SecurityHeaders, response: *Response) void {
         if (self.x_frame_options.len > 0)
-            _ = response.setHeader("X-Frame-Options", self.x_frame_options);
+            _ = response.setHeaderIfAbsent("X-Frame-Options", self.x_frame_options);
         if (self.x_content_type_options.len > 0)
-            _ = response.setHeader("X-Content-Type-Options", self.x_content_type_options);
+            _ = response.setHeaderIfAbsent("X-Content-Type-Options", self.x_content_type_options);
         if (self.content_security_policy.len > 0)
-            _ = response.setHeader("Content-Security-Policy", self.content_security_policy);
+            _ = response.setHeaderIfAbsent("Content-Security-Policy", self.content_security_policy);
         if (self.strict_transport_security.len > 0)
-            _ = response.setHeader("Strict-Transport-Security", self.strict_transport_security);
+            _ = response.setHeaderIfAbsent("Strict-Transport-Security", self.strict_transport_security);
         if (self.referrer_policy.len > 0)
-            _ = response.setHeader("Referrer-Policy", self.referrer_policy);
+            _ = response.setHeaderIfAbsent("Referrer-Policy", self.referrer_policy);
         if (self.permissions_policy.len > 0)
-            _ = response.setHeader("Permissions-Policy", self.permissions_policy);
+            _ = response.setHeaderIfAbsent("Permissions-Policy", self.permissions_policy);
         if (self.x_xss_protection.len > 0)
-            _ = response.setHeader("X-XSS-Protection", self.x_xss_protection);
+            _ = response.setHeaderIfAbsent("X-XSS-Protection", self.x_xss_protection);
         if (self.cross_origin_opener_policy.len > 0)
-            _ = response.setHeader("Cross-Origin-Opener-Policy", self.cross_origin_opener_policy);
+            _ = response.setHeaderIfAbsent("Cross-Origin-Opener-Policy", self.cross_origin_opener_policy);
         if (self.cross_origin_resource_policy.len > 0)
-            _ = response.setHeader("Cross-Origin-Resource-Policy", self.cross_origin_resource_policy);
+            _ = response.setHeaderIfAbsent("Cross-Origin-Resource-Policy", self.cross_origin_resource_policy);
     }
 
     /// Default secure configuration.

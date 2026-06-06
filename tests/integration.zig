@@ -3134,8 +3134,9 @@ test "proxy evicts stale pooled upstream connection after backend restart" {
         .headers = &.{},
     });
     defer second.deinit();
-    try std.testing.expectEqual(@as(u16, 502), second.status_code);
-    try std.testing.expectEqual(@as(u32, 0), upstream.requestCount());
+    try std.testing.expectEqual(@as(u16, 200), second.status_code);
+    try std.testing.expectEqualStrings("{\"version\":\"new\"}", second.body);
+    try std.testing.expectEqual(@as(u32, 1), upstream.requestCount());
 
     var third = try sendRequest(allocator, tardigrade.port, .{
         .method = "GET",
@@ -3146,7 +3147,7 @@ test "proxy evicts stale pooled upstream connection after backend restart" {
     defer third.deinit();
     try std.testing.expectEqual(@as(u16, 200), third.status_code);
     try std.testing.expectEqualStrings("{\"version\":\"new\"}", third.body);
-    try std.testing.expectEqual(@as(u32, 1), upstream.requestCount());
+    try std.testing.expectEqual(@as(u32, 2), upstream.requestCount());
 }
 
 test "proxy forwards POST with an explicit zero-length body" {

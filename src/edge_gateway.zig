@@ -696,8 +696,15 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
                 worker_snapshot.worker_threads,
                 worker_snapshot.max_queue_len,
             );
+            const ka_stats = parked.stats();
             state.metrics_mutex.lock();
             state.metrics.recordEventLoopIteration();
+            state.metrics.setKeepaliveStats(
+                ka_stats.parked,
+                ka_stats.resumes_total,
+                ka_stats.timeouts_total,
+                ka_stats.closed_total,
+            );
             state.metrics_mutex.unlock();
         }
     }
@@ -1218,6 +1225,25 @@ fn isTlsConnPtr(comptime T: type) bool {
     return T == *http.tls_termination.TlsConnection;
 }
 
+/// Errors that just mean the peer closed/reset the connection. Common at the
+/// edge (and more visible with parking, since a peer-closed parked connection
+/// surfaces as a readable event that resumes into a failed read), so they log
+/// at debug rather than spamming ERROR. Typed as `anyerror` so any error name
+/// is valid regardless of the caller's inferred error set.
+fn isBenignDisconnect(err: anyerror) bool {
+    return switch (err) {
+        error.ConnectionResetByPeer,
+        error.BrokenPipe,
+        error.ConnectionClosed,
+        error.NotOpenForReading,
+        error.WouldBlock,
+        error.EndOfStream,
+        error.TlsReadFailed,
+        => true,
+        else => false,
+    };
+}
+
 /// Serve exactly one HTTP/1.1 request on `conn` (a `*TlsConnection` or a
 /// plaintext `NetStream`), then decide what to do with the connection.
 fn serveOneRequest(
@@ -1233,7 +1259,11 @@ fn serveOneRequest(
     const live_cfg = live_cfg_lease.cfg;
     handleConnection(conn, session, live_cfg, ctx.state, &keep_alive, connection_ip, enable_proxy_protocol) catch |err| {
         live_cfg_lease.release();
-        ctx.state.logger.err(null, "edge connection error: {}", .{err});
+        if (isBenignDisconnect(err)) {
+            ctx.state.logger.debug(null, "keepalive connection closed by peer: {}", .{err});
+        } else {
+            ctx.state.logger.err(null, "edge connection error: {}", .{err});
+        }
         return .close;
     };
     served.* += 1;

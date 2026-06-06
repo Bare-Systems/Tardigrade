@@ -1,6 +1,5 @@
 const compat = @import("zig_compat.zig");
 const std = @import("std");
-const builtin = @import("builtin");
 const http = @import("http.zig");
 const edge_config = @import("edge_config.zig");
 const runtime_allocator = @import("runtime_allocator.zig");
@@ -46,6 +45,27 @@ const proxyScopeForPath = gs.proxyScopeForPath;
 const maxBufferedUpstreamResponseBytes = gs.maxBufferedUpstreamResponseBytes;
 const prepareStickyAffinityRequest = gs.prepareStickyAffinityRequest;
 const buildStickySetCookieHeader = gs.buildStickySetCookieHeader;
+
+const gaccept = @import("gateway_accept.zig");
+const acceptReadyConnections = gaccept.acceptReadyConnections;
+const applyFdSoftLimit = gaccept.applyFdSoftLimit;
+
+const gconn = @import("gateway_connection.zig");
+const clientIpFromAddress = gconn.clientIpFromAddress;
+const clientIpFromFd = gconn.clientIpFromFd;
+const setNoDelay = gconn.setNoDelay;
+const setNonBlocking = gconn.setNonBlocking;
+const setSocketTimeoutMs = gconn.setSocketTimeoutMs;
+const maybeConsumeProxyProtocolPreface = gconn.maybeConsumeProxyProtocolPreface;
+const peekAndConsumeProxyHeaderFromRawFd = gconn.peekAndConsumeProxyHeaderFromRawFd;
+const parseProxyHeader = gconn.parseProxyHeader;
+const readHttpRequest = gconn.readHttpRequest;
+const firstRequestCompleteLen = gconn.firstRequestCompleteLen;
+
+const gstatic = @import("gateway_static_runtime.zig");
+const handleStaticLocation = gstatic.handleStaticLocation;
+const serveTryFilesFallback = gstatic.serveTryFilesFallback;
+const maybeResolveStaticErrorPage = gstatic.maybeResolveStaticErrorPage;
 
 const gp = @import("gateway_proxy.zig");
 // Types from gateway_proxy.zig
@@ -672,70 +692,6 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     state.logger.info(null, "Graceful shutdown complete", .{});
 }
 
-fn acceptReadyConnections(listen_fd: std.posix.fd_t, worker_pool: *http.worker_pool.WorkerPool, state: *GatewayState) void {
-    while (!http.shutdown.isShutdownRequested()) {
-        var accepted_addr: std.c.sockaddr.storage = undefined;
-        var addr_len: std.c.socklen_t = @sizeOf(std.c.sockaddr.storage);
-
-        const client_fd = std.c.accept(listen_fd, @ptrCast(&accepted_addr), &addr_len);
-        if (client_fd >= 0) {
-            const flags = std.c.fcntl(client_fd, std.c.F.GETFL, @as(c_int, 0));
-            if (flags >= 0) {
-                const nonblock: c_int = @intCast(@as(u32, @bitCast(std.c.O{ .NONBLOCK = true })));
-                _ = std.c.fcntl(client_fd, std.c.F.SETFL, flags | nonblock);
-            }
-            _ = std.c.fcntl(client_fd, std.c.F.SETFD, @as(c_int, 1)); // FD_CLOEXEC
-        }
-        if (client_fd < 0) {
-            const e = std.posix.errno(client_fd);
-            if (e == .AGAIN) return;
-            if (e == .CONNABORTED) continue;
-            state.logger.err(null, "accept error: {}", .{e});
-            return;
-        }
-
-        const owned_ip_key = clientIpKeyFromAddress(state.allocator, &accepted_addr) catch null;
-        defer if (owned_ip_key) |key| state.allocator.free(key);
-        const ip_key = owned_ip_key orelse "unknown";
-
-        const slot_result = state.tryAcquireConnectionSlot(client_fd, ip_key) catch |err| {
-            state.logger.warn(null, "connection slot tracking error: {}", .{err});
-            _ = std.c.close(client_fd);
-            continue;
-        };
-        switch (slot_result) {
-            .accepted => {},
-            .over_ip_limit => {
-                state.logger.warn(null, "per-IP connection limit reached for {s}", .{ip_key});
-                state.metricsRecordErrorCode("overload");
-                rejectOverloadedClient(client_fd);
-                continue;
-            },
-            .over_global_limit => {
-                state.logger.warn(null, "global active connection limit reached", .{});
-                state.metricsRecordErrorCode("overload");
-                rejectOverloadedClient(client_fd);
-                continue;
-            },
-            .over_global_memory_limit => {
-                state.logger.warn(null, "global connection memory estimate limit reached", .{});
-                state.metricsRecordErrorCode("overload");
-                rejectOverloadedClient(client_fd);
-                continue;
-            },
-        }
-
-        worker_pool.submit(client_fd) catch |err| {
-            state.logger.warn(null, "worker queue submit failed: {}", .{err});
-            state.metricsRecordQueueRejection();
-            state.metricsRecordErrorCode("overload");
-            state.releaseConnectionSlot(client_fd);
-            rejectOverloadedClient(client_fd);
-            continue;
-        };
-    }
-}
-
 fn hotReloadConfig(
     allocator: std.mem.Allocator,
     worker_ctx: *WorkerContext,
@@ -866,19 +822,6 @@ fn reopenErrorLog(cfg: *const edge_config.EdgeConfig) !void {
     defer fc.close();
     _ = std.c.lseek(fc.file.handle, 0, std.c.SEEK.END);
     _ = std.c.dup2(fc.file.handle, std.Io.File.stderr().handle);
-}
-
-fn rejectOverloadedClient(client_fd: std.posix.fd_t) void {
-    setNonBlocking(client_fd, false) catch {}; // connection is usable in blocking mode; write and close still succeed
-    const stream = compat.netStreamFromFd(client_fd);
-    stream.writer().writeAll(
-        "HTTP/1.1 503 Service Unavailable\r\n" ++
-            "Connection: close\r\n" ++
-            "Content-Length: 0\r\n" ++
-            "Retry-After: 1\r\n" ++
-            "\r\n",
-    ) catch {}; // best-effort 503; client will time out if the write fails
-    stream.close();
 }
 
 /// Refresh DNS-discovered upstreams when the refresh interval has elapsed.
@@ -1102,24 +1045,6 @@ fn probeUnixSocketUpstream(socket_path: []const u8, uri: std.Uri, timeout_ms: u3
     return error.InvalidHttpResponse;
 }
 
-fn applyFdSoftLimit(desired: u64) !?u64 {
-    if (desired == 0) return null;
-    switch (builtin.os.tag) {
-        .linux, .macos, .freebsd, .netbsd, .openbsd, .dragonfly, .illumos, .ios, .tvos, .watchos, .visionos => {},
-        else => return null,
-    }
-
-    var limits = try std.posix.getrlimit(std.posix.rlimit_resource.NOFILE);
-    const current_soft: u64 = @intCast(limits.cur);
-    const hard: u64 = @intCast(limits.max);
-    const target: u64 = @min(desired, hard);
-    if (target == current_soft) return target;
-
-    limits.cur = @intCast(target);
-    try std.posix.setrlimit(std.posix.rlimit_resource.NOFILE, limits);
-    return target;
-}
-
 fn applyRuntimeIdentity(cfg: *const edge_config.EdgeConfig, logger: *const http.logger.Logger) !void {
     const c = @cImport({
         @cInclude("unistd.h");
@@ -1280,252 +1205,6 @@ fn handleAcceptedClient(raw_ctx: *anyopaque, client_fd: std.posix.fd_t) void {
         if (served == cfg.max_requests_per_connection and cfg.max_requests_per_connection > 0) {
             ctx.state.logger.debug(null, "closing connection after max requests per connection reached ({d})", .{cfg.max_requests_per_connection});
         }
-    }
-}
-
-fn clientIpKeyFromAddress(allocator: std.mem.Allocator, address: *const std.c.sockaddr.storage) ![]const u8 {
-    return switch (address.family) {
-        std.posix.AF.INET => blk: {
-            const sin: *const std.c.sockaddr.in = @ptrCast(address);
-            const b = @as(*const [4]u8, @ptrCast(&sin.addr));
-            break :blk std.fmt.allocPrint(allocator, "v4:{d}.{d}.{d}.{d}", .{ b[0], b[1], b[2], b[3] });
-        },
-        std.posix.AF.INET6 => blk: {
-            const sin6: *const std.c.sockaddr.in6 = @ptrCast(address);
-            break :blk std.fmt.allocPrint(allocator, "v6:{f}", .{compat.fmtSliceHexLower(sin6.addr[0..])});
-        },
-        else => error.UnsupportedAddressFamily,
-    };
-}
-
-fn clientIpFromAddress(allocator: std.mem.Allocator, address: *const std.c.sockaddr.storage) ![]const u8 {
-    return switch (address.family) {
-        std.posix.AF.INET => blk: {
-            const sin: *const std.c.sockaddr.in = @ptrCast(address);
-            const b = @as(*const [4]u8, @ptrCast(&sin.addr));
-            break :blk std.fmt.allocPrint(allocator, "{d}.{d}.{d}.{d}", .{ b[0], b[1], b[2], b[3] });
-        },
-        std.posix.AF.INET6 => blk: {
-            const sin6: *const std.c.sockaddr.in6 = @ptrCast(address);
-            const src = sin6.addr[0..];
-            const g0 = std.mem.readInt(u16, src[0..2], .big);
-            const g1 = std.mem.readInt(u16, src[2..4], .big);
-            const g2 = std.mem.readInt(u16, src[4..6], .big);
-            const g3 = std.mem.readInt(u16, src[6..8], .big);
-            const g4 = std.mem.readInt(u16, src[8..10], .big);
-            const g5 = std.mem.readInt(u16, src[10..12], .big);
-            const g6 = std.mem.readInt(u16, src[12..14], .big);
-            const g7 = std.mem.readInt(u16, src[14..16], .big);
-            break :blk std.fmt.allocPrint(allocator, "{x}:{x}:{x}:{x}:{x}:{x}:{x}:{x}", .{ g0, g1, g2, g3, g4, g5, g6, g7 });
-        },
-        else => error.UnsupportedAddressFamily,
-    };
-}
-
-fn clientIpFromFd(allocator: std.mem.Allocator, fd: std.posix.fd_t) ![]const u8 {
-    var peer_addr: std.c.sockaddr.storage = undefined;
-    var addr_len: std.posix.socklen_t = @sizeOf(std.c.sockaddr.storage);
-    try std.posix.getpeername(fd, @ptrCast(&peer_addr), &addr_len);
-    return clientIpFromAddress(allocator, &peer_addr);
-}
-
-fn setNoDelay(fd: std.posix.fd_t) !void {
-    try std.posix.setsockopt(fd, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, std.mem.asBytes(&@as(c_int, 1)));
-}
-
-fn setNonBlocking(fd: std.posix.fd_t, enabled: bool) !void {
-    const current_flags = std.c.fcntl(fd, std.posix.F.GETFL, @as(c_int, 0));
-    if (current_flags < 0) return error.Unexpected;
-    var flags: usize = @intCast(current_flags);
-    const nonblock_mask = @as(usize, 1) << @bitOffsetOf(std.posix.O, "NONBLOCK");
-    if (enabled) {
-        flags |= nonblock_mask;
-    } else {
-        flags &= ~nonblock_mask;
-    }
-    if (std.c.fcntl(fd, std.posix.F.SETFL, @as(c_int, @intCast(flags))) < 0) return error.Unexpected;
-}
-
-const ProxyHeaderOutcome = union(enum) {
-    no_header,
-    need_more,
-    invalid,
-    parsed: struct {
-        consumed: usize,
-        client_ip_len: usize,
-    },
-};
-
-const proxy_v2_signature = "\r\n\r\n\x00\r\nQUIT\n";
-
-fn maybeConsumeProxyProtocolPreface(conn: anytype, mode: edge_config.ProxyProtocolMode, pending_buf: []u8, pending_len: *usize, client_ip_buf: *[64]u8, client_ip_len: *usize) !void {
-    if (mode == .off) return;
-
-    while (true) {
-        const outcome = parseProxyHeader(pending_buf[0..pending_len.*], mode, client_ip_buf);
-        switch (outcome) {
-            .no_header => return,
-            .invalid => return error.InvalidProxyProtocolHeader,
-            .parsed => |parsed| {
-                client_ip_len.* = parsed.client_ip_len;
-                if (parsed.consumed < pending_len.*) {
-                    const remaining = pending_len.* - parsed.consumed;
-                    std.mem.copyForwards(u8, pending_buf[0..remaining], pending_buf[parsed.consumed..pending_len.*]);
-                    pending_len.* = remaining;
-                } else {
-                    pending_len.* = 0;
-                }
-                return;
-            },
-            .need_more => {
-                if (pending_len.* == pending_buf.len) return error.ProxyProtocolHeaderTooLarge;
-                const n = try conn.read(pending_buf[pending_len.*..]);
-                if (n == 0) return error.ConnectionClosed;
-                pending_len.* += n;
-            },
-        }
-    }
-}
-
-/// Parse and consume a PROXY protocol header from a raw TCP socket fd before the TLS handshake.
-/// Uses MSG_PEEK so that unconsumed application bytes (TLS ClientHello) remain intact in the kernel
-/// receive buffer and OpenSSL can read them normally via SSL_set_fd / SSL_accept.
-fn peekAndConsumeProxyHeaderFromRawFd(
-    fd: std.posix.fd_t,
-    mode: edge_config.ProxyProtocolMode,
-    client_ip_buf: *[64]u8,
-    client_ip_len: *usize,
-) !void {
-    if (mode == .off) return;
-    const msg_peek: u32 = 2; // MSG_PEEK — peek without consuming
-    var peek_buf: [1024]u8 = undefined;
-    var peeked: usize = 0;
-    // Retry loop to handle blocking sockets that may not have all bytes immediately.
-    // In practice the PROXY header always arrives in the first TCP segment.
-    var attempts: u32 = 0;
-    while (attempts < 20) : (attempts += 1) {
-        const n_raw = std.c.recv(fd, @as(*anyopaque, @ptrCast(&peek_buf)), peek_buf.len, @intCast(msg_peek));
-        if (n_raw < 0) return error.ConnectionClosed;
-        const n: usize = @intCast(n_raw);
-        if (n == 0) return error.ConnectionClosed;
-        if (n > peeked) peeked = n;
-        const outcome = parseProxyHeader(peek_buf[0..peeked], mode, client_ip_buf);
-        switch (outcome) {
-            .no_header => return,
-            .invalid => return error.InvalidProxyProtocolHeader,
-            .parsed => |parsed| {
-                client_ip_len.* = parsed.client_ip_len;
-                // Consume exactly `parsed.consumed` bytes from the socket so
-                // that OpenSSL's SSL_accept sees only the TLS ClientHello.
-                var consumed_total: usize = 0;
-                var discard: [1024]u8 = undefined;
-                while (consumed_total < parsed.consumed) {
-                    const to_read = @min(parsed.consumed - consumed_total, discard.len);
-                    const nr_raw = std.c.recv(fd, @as(*anyopaque, @ptrCast(&discard)), to_read, 0);
-                    if (nr_raw <= 0) return error.ConnectionClosed;
-                    consumed_total += @intCast(nr_raw);
-                }
-                return;
-            },
-            .need_more => {
-                if (peeked >= peek_buf.len) return error.ProxyProtocolHeaderTooLarge;
-                // Wait briefly for more data to arrive in the kernel buffer.
-                std.Io.sleep(compat.io(), std.Io.Duration.fromMicroseconds(500), .awake) catch {}; // interrupt wakes are fine; loop continues immediately
-            },
-        }
-    }
-    return error.ProxyProtocolHeaderTooLarge;
-}
-
-fn parseProxyHeader(buf: []const u8, mode: edge_config.ProxyProtocolMode, client_ip_buf: *[64]u8) ProxyHeaderOutcome {
-    return switch (mode) {
-        .off => .no_header,
-        .v1 => parseProxyHeaderV1(buf, true, client_ip_buf),
-        .v2 => parseProxyHeaderV2(buf, true, client_ip_buf),
-        .auto => blk: {
-            if (buf.len == 0) break :blk .need_more;
-            if (buf[0] == 'P') break :blk parseProxyHeaderV1(buf, false, client_ip_buf);
-            if (buf[0] == '\r') break :blk parseProxyHeaderV2(buf, false, client_ip_buf);
-            break :blk .no_header;
-        },
-    };
-}
-
-fn parseProxyHeaderV1(buf: []const u8, strict: bool, client_ip_buf: *[64]u8) ProxyHeaderOutcome {
-    const prefix = "PROXY ";
-    if (buf.len < prefix.len) {
-        if (std.mem.eql(u8, buf, prefix[0..buf.len])) return .need_more;
-        return if (strict) .invalid else .no_header;
-    }
-    if (!std.mem.eql(u8, buf[0..prefix.len], prefix)) return if (strict) .invalid else .no_header;
-
-    const line_end = std.mem.find(u8, buf, "\r\n") orelse {
-        if (buf.len >= 108) return .invalid;
-        return .need_more;
-    };
-    const line = buf[0..line_end];
-
-    var tok_it = std.mem.tokenizeScalar(u8, line, ' ');
-    const sig = tok_it.next() orelse return .invalid;
-    if (!std.mem.eql(u8, sig, "PROXY")) return .invalid;
-    const proto = tok_it.next() orelse return .invalid;
-    if (std.mem.eql(u8, proto, "UNKNOWN")) {
-        return .{ .parsed = .{ .consumed = line_end + 2, .client_ip_len = 0 } };
-    }
-
-    if (!std.mem.eql(u8, proto, "TCP4") and !std.mem.eql(u8, proto, "TCP6")) return .invalid;
-    const src_ip = tok_it.next() orelse return .invalid;
-    _ = tok_it.next() orelse return .invalid;
-    _ = tok_it.next() orelse return .invalid;
-    _ = tok_it.next() orelse return .invalid;
-    if (src_ip.len == 0 or src_ip.len > client_ip_buf.len) return .invalid;
-    @memcpy(client_ip_buf[0..src_ip.len], src_ip);
-    return .{ .parsed = .{ .consumed = line_end + 2, .client_ip_len = src_ip.len } };
-}
-
-fn parseProxyHeaderV2(buf: []const u8, strict: bool, client_ip_buf: *[64]u8) ProxyHeaderOutcome {
-    if (buf.len < proxy_v2_signature.len) {
-        if (std.mem.eql(u8, buf, proxy_v2_signature[0..buf.len])) return .need_more;
-        return if (strict) .invalid else .no_header;
-    }
-    if (!std.mem.eql(u8, buf[0..proxy_v2_signature.len], proxy_v2_signature)) return if (strict) .invalid else .no_header;
-    if (buf.len < 16) return .need_more;
-
-    const ver_cmd = buf[12];
-    if ((ver_cmd >> 4) != 0x2) return .invalid;
-    const cmd = ver_cmd & 0x0f;
-    const fam = buf[13] >> 4;
-    const addr_len = std.mem.readInt(u16, buf[14..16], .big);
-    const total_len: usize = 16 + addr_len;
-    if (total_len > 1024) return .invalid;
-    if (buf.len < total_len) return .need_more;
-
-    if (cmd != 0x1) {
-        return .{ .parsed = .{ .consumed = total_len, .client_ip_len = 0 } };
-    }
-
-    switch (fam) {
-        0x1 => {
-            if (addr_len < 12) return .invalid;
-            const src = buf[16..20];
-            const printed = std.fmt.bufPrint(client_ip_buf, "{d}.{d}.{d}.{d}", .{ src[0], src[1], src[2], src[3] }) catch return .invalid;
-            return .{ .parsed = .{ .consumed = total_len, .client_ip_len = printed.len } };
-        },
-        0x2 => {
-            if (addr_len < 36) return .invalid;
-            const src = buf[16..32];
-            const g0 = std.mem.readInt(u16, src[0..2], .big);
-            const g1 = std.mem.readInt(u16, src[2..4], .big);
-            const g2 = std.mem.readInt(u16, src[4..6], .big);
-            const g3 = std.mem.readInt(u16, src[6..8], .big);
-            const g4 = std.mem.readInt(u16, src[8..10], .big);
-            const g5 = std.mem.readInt(u16, src[10..12], .big);
-            const g6 = std.mem.readInt(u16, src[12..14], .big);
-            const g7 = std.mem.readInt(u16, src[14..16], .big);
-            const printed = std.fmt.bufPrint(client_ip_buf, "{x}:{x}:{x}:{x}:{x}:{x}:{x}:{x}", .{ g0, g1, g2, g3, g4, g5, g6, g7 }) catch return .invalid;
-            return .{ .parsed = .{ .consumed = total_len, .client_ip_len = printed.len } };
-        },
-        else => return .{ .parsed = .{ .consumed = total_len, .client_ip_len = 0 } },
     }
 }
 
@@ -2919,28 +2598,6 @@ fn handleLocationProxyPass(
     return status_code;
 }
 
-const StaticErrorPageResult = union(enum) {
-    served: http.static_file.Result,
-    redirect: []u8,
-
-    fn deinit(self: *StaticErrorPageResult, allocator: std.mem.Allocator) void {
-        switch (self.*) {
-            .served => |*served| served.deinit(allocator),
-            .redirect => |target| allocator.free(target),
-        }
-        self.* = undefined;
-    }
-};
-
-fn wantsHtmlErrorPage(request_path: []const u8, headers: *const http.Headers) bool {
-    if (std.mem.startsWith(u8, request_path, "/v1/")) return false;
-    const accept = headers.get("accept") orelse return false;
-    if (std.mem.find(u8, accept, "text/html") != null) return true;
-    if (std.mem.find(u8, accept, "*/*") != null) return true;
-    if (std.mem.find(u8, accept, "application/json") != null) return false;
-    return false;
-}
-
 fn rateLimitDescriptor(identity: ?[]const u8, client_ip: []const u8, buf: *[192]u8) []const u8 {
     if (identity) |id| {
         return std.fmt.bufPrint(buf, "identity:{s}", .{id}) catch blk: {
@@ -2952,43 +2609,6 @@ fn rateLimitDescriptor(identity: ?[]const u8, client_ip: []const u8, buf: *[192]
         const hash = std.hash.Wyhash.hash(0, client_ip);
         break :blk std.fmt.bufPrint(buf, "ip-hash:{x}", .{hash}) catch "ip-hash";
     };
-}
-
-fn findErrorPageTarget(block: *const http.location_router.LocationBlock, status_code: u16) ?[]const u8 {
-    for (block.error_pages) |rule| {
-        for (rule.status_codes) |candidate| {
-            if (candidate == status_code) return rule.target;
-        }
-    }
-    return null;
-}
-
-fn maybeResolveStaticErrorPage(
-    allocator: std.mem.Allocator,
-    matched: http.location_router.MatchResult,
-    root_cfg: anytype,
-    request_path: []const u8,
-    headers: *const http.Headers,
-    status_code: u16,
-) !?StaticErrorPageResult {
-    if (!wantsHtmlErrorPage(request_path, headers)) return null;
-    const target = findErrorPageTarget(matched.block, status_code) orelse return null;
-    if (std.mem.startsWith(u8, target, "http://") or std.mem.startsWith(u8, target, "https://")) {
-        return .{ .redirect = try allocator.dupe(u8, target) };
-    }
-    var served = (try http.static_file.serve(allocator, .{
-        .root = root_cfg.root,
-        .request_path = target,
-        .matched_pattern = "/",
-        .alias = false,
-        .index = root_cfg.index,
-        .try_files = "",
-        .autoindex = false,
-        .headers = headers,
-        .max_bytes = MAX_REQUEST_SIZE,
-    })) orelse return null;
-    served.status_code = @enumFromInt(status_code);
-    return .{ .served = served };
 }
 
 fn runMiddlewarePipeline(
@@ -3083,197 +2703,6 @@ fn runMiddlewarePipeline(
     }
 
     return false;
-}
-
-fn handleStaticLocation(
-    allocator: std.mem.Allocator,
-    conn: anytype,
-    request: *const http.Request,
-    matched: http.location_router.MatchResult,
-    root_cfg: anytype,
-    correlation_id: []const u8,
-    keep_alive: bool,
-    state: *GatewayState,
-) !?u16 {
-    if (!(request.method == .GET or request.method == .HEAD)) return null;
-    const writer = conn.writer();
-    const prefer_file_backed = @TypeOf(conn) == compat.NetStream;
-    var served = (try http.static_file.serve(allocator, .{
-        .root = root_cfg.root,
-        .request_path = request.uri.path,
-        .matched_pattern = matched.block.pattern,
-        .alias = root_cfg.alias,
-        .index = root_cfg.index,
-        .try_files = root_cfg.try_files,
-        .autoindex = root_cfg.autoindex,
-        .headers = &request.headers,
-        .max_bytes = MAX_REQUEST_SIZE,
-        .prefer_file_backed = prefer_file_backed,
-    })) orelse blk: {
-        var error_page = (try maybeResolveStaticErrorPage(allocator, matched, root_cfg, request.uri.path, &request.headers, 404)) orelse return null;
-        switch (error_page) {
-            .redirect => |target| {
-                defer allocator.free(target);
-                var response = http.Response.init(allocator);
-                defer response.deinit();
-                _ = response
-                    .setStatus(.found)
-                    .setBody("")
-                    .setContentType("text/plain; charset=utf-8")
-                    .setConnection(keep_alive)
-                    .setHeader("Location", target)
-                    .setHeader(http.correlation.HEADER_NAME, correlation_id);
-                applyResponseHeaders(state, &response);
-                if (request.method == .HEAD) {
-                    try response.writeHead(writer);
-                } else {
-                    try response.write(writer);
-                }
-                state.metricsRecord(302);
-                return 302;
-            },
-            .served => |*resolved| break :blk resolved.*,
-        }
-    };
-    defer served.deinit(allocator);
-
-    if (@intFromEnum(served.status_code) >= 400) {
-        if (try maybeResolveStaticErrorPage(allocator, matched, root_cfg, request.uri.path, &request.headers, @intFromEnum(served.status_code))) |error_page| {
-            switch (error_page) {
-                .redirect => |target| {
-                    defer allocator.free(target);
-                    var response = http.Response.init(allocator);
-                    defer response.deinit();
-                    _ = response
-                        .setStatus(.found)
-                        .setBody("")
-                        .setContentType("text/plain; charset=utf-8")
-                        .setConnection(keep_alive)
-                        .setHeader("Location", target)
-                        .setHeader(http.correlation.HEADER_NAME, correlation_id);
-                    applyResponseHeaders(state, &response);
-                    if (request.method == .HEAD) {
-                        try response.writeHead(writer);
-                    } else {
-                        try response.write(writer);
-                    }
-                    state.metricsRecord(302);
-                    return 302;
-                },
-                .served => |replacement| {
-                    served.deinit(allocator);
-                    served = replacement;
-                },
-            }
-        }
-    }
-
-    const status_code = try writeStaticServedResponse(allocator, conn, request.method == .HEAD, keep_alive, correlation_id, state, &served);
-    state.metricsRecord(status_code);
-    return status_code;
-}
-
-fn serveTryFilesFallback(
-    allocator: std.mem.Allocator,
-    conn: anytype,
-    cfg: *const edge_config.EdgeConfig,
-    request: *const http.Request,
-    correlation_id: []const u8,
-    keep_alive: bool,
-    state: *GatewayState,
-) !u16 {
-    const method = request.method.toString();
-    const request_path = request.uri.path;
-    if (!(std.ascii.eqlIgnoreCase(method, "GET") or std.ascii.eqlIgnoreCase(method, "HEAD"))) return error.NoTryFiles;
-    if (cfg.doc_root.len == 0) return error.NoTryFiles;
-    // When `root` is set at the server level without a `try_files` directive,
-    // default to "$uri" so that files at the exact request path are served
-    // directly.  This matches the intuitive expectation: `root /path;` alone
-    // should serve static files for any unmatched request whose path exists in
-    // the webroot.
-    const effective_try_files = if (cfg.try_files.len > 0) cfg.try_files else "$uri";
-    const prefer_file_backed = @TypeOf(conn) == compat.NetStream;
-
-    var served = (try http.static_file.serve(allocator, .{
-        .root = cfg.doc_root,
-        .request_path = request_path,
-        .matched_pattern = "/",
-        .alias = false,
-        .index = "",
-        .try_files = effective_try_files,
-        .autoindex = false,
-        .headers = &request.headers,
-        .max_bytes = MAX_REQUEST_SIZE,
-        .prefer_file_backed = prefer_file_backed,
-    })) orelse return error.NoTryFiles;
-    defer served.deinit(allocator);
-
-    return writeStaticServedResponse(allocator, conn, std.ascii.eqlIgnoreCase(method, "HEAD"), keep_alive, correlation_id, state, &served);
-}
-
-fn writeStaticServedResponse(
-    allocator: std.mem.Allocator,
-    conn: anytype,
-    head_only: bool,
-    keep_alive: bool,
-    correlation_id: []const u8,
-    state: *GatewayState,
-    served: *const http.static_file.Result,
-) !u16 {
-    const writer = conn.writer();
-    var response = http.Response.init(allocator);
-    defer response.deinit();
-    _ = response
-        .setStatus(served.status_code)
-        .setBody(served.body orelse "")
-        .setContentType(served.content_type)
-        .setConnection(keep_alive)
-        .setHeader(http.correlation.HEADER_NAME, correlation_id);
-    if (served.etag_value) |etag_value| _ = response.setHeader("ETag", etag_value);
-    if (served.last_modified_value) |last_modified| _ = response.setHeader("Last-Modified", last_modified);
-    if (served.content_range_value) |content_range| _ = response.setHeader("Content-Range", content_range);
-    if (served.accept_ranges) _ = response.setHeader("Accept-Ranges", "bytes");
-
-    if (served.file_path != null) {
-        _ = response.setContentLength(served.content_length);
-    }
-
-    applyResponseHeaders(state, &response);
-    try response.writeHead(writer);
-
-    if (head_only) {
-        if (served.file_path) |file_path| {
-            state.logger.debug(correlation_id, "served static file headers from file-backed path: {s}", .{file_path});
-        } else {
-            state.logger.debug(correlation_id, "served static file headers from buffered path", .{});
-        }
-        return @intFromEnum(served.status_code);
-    }
-
-    if (served.file_path) |file_path| {
-        if (@TypeOf(conn) == compat.NetStream) {
-            var in_fc = try std.Io.Dir.openFileAbsolute(compat.io(), file_path, .{});
-            defer in_fc.close(compat.io());
-            _ = std.c.lseek(in_fc.handle, @intCast(served.file_offset), std.c.SEEK.SET);
-            var remaining: u64 = served.file_len;
-            var xfer_buf: [65536]u8 = undefined;
-            while (remaining > 0) {
-                const to_read: usize = @intCast(@min(xfer_buf.len, remaining));
-                const n = std.c.read(in_fc.handle, &xfer_buf, to_read);
-                if (n <= 0) break;
-                try conn.writeAll(xfer_buf[0..@intCast(n)]);
-                remaining -= @intCast(n);
-            }
-            state.logger.debug(correlation_id, "served static file via file-backed path: {s}", .{file_path});
-        } else {
-            return error.InvalidStaticTransferState;
-        }
-    } else if (served.body) |body| {
-        try writer.writeAll(body);
-        state.logger.debug(correlation_id, "served static file via buffered path", .{});
-    }
-
-    return @intFromEnum(served.status_code);
 }
 
 fn streamSseTopic(
@@ -4095,48 +3524,6 @@ fn classifyErrorCategory(status: u16) []const u8 {
         "client_error";
 }
 
-fn readHttpRequest(conn: anytype, buf: []u8, pending_len: *usize) !usize {
-    var total_read = pending_len.*;
-
-    while (total_read <= buf.len) {
-        if (firstRequestCompleteLen(buf[0..total_read])) |request_len| {
-            pending_len.* = total_read;
-            return @min(total_read, request_len);
-        }
-        if (total_read == buf.len) break;
-
-        const n = conn.read(buf[total_read..]) catch |err| return err;
-        if (n == 0) break;
-        total_read += n;
-    }
-
-    pending_len.* = total_read;
-    return total_read;
-}
-
-fn firstRequestCompleteLen(data: []const u8) ?usize {
-    const header_pos = std.mem.find(u8, data, "\r\n\r\n") orelse return null;
-    const headers_len = header_pos + 4;
-    const content_length = parseContentLength(data[0..headers_len]) orelse 0;
-    const full_len = headers_len + content_length;
-    if (data.len >= full_len) return full_len;
-    return null;
-}
-
-fn parseContentLength(headers: []const u8) ?usize {
-    var it = std.mem.tokenizeAny(u8, headers, "\r\n");
-    while (it.next()) |line| {
-        if (line.len == 0) continue;
-        const colon = std.mem.findScalar(u8, line, ':') orelse continue;
-        const name = std.mem.trim(u8, line[0..colon], " \t");
-        if (!std.ascii.eqlIgnoreCase(name, "content-length")) continue;
-
-        const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
-        return std.fmt.parseInt(usize, value, 10) catch null;
-    }
-    return null;
-}
-
 /// Returns true for HTTP methods that are safe to retry on failure without
 /// risk of double-applying a non-idempotent side effect (RFC 9110 §9.2).
 /// GET, HEAD, PUT, DELETE, OPTIONS, and TRACE are idempotent.
@@ -4153,20 +3540,6 @@ pub fn isHttpMethodIdempotent(method: []const u8) bool {
         std.mem.eql(u8, m, "DELETE") or
         std.mem.eql(u8, m, "OPTIONS") or
         std.mem.eql(u8, m, "TRACE");
-}
-
-fn setSocketTimeoutMs(fd: std.posix.fd_t, recv_timeout_ms: u32, send_timeout_ms: u32) !void {
-    const recv_tv = std.posix.timeval{
-        .sec = @intCast(recv_timeout_ms / 1000),
-        .usec = @intCast((recv_timeout_ms % 1000) * 1000),
-    };
-    const send_tv = std.posix.timeval{
-        .sec = @intCast(send_timeout_ms / 1000),
-        .usec = @intCast((send_timeout_ms % 1000) * 1000),
-    };
-
-    try std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&recv_tv));
-    try std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&send_tv));
 }
 
 test "buildForwardedFor appends client ip" {

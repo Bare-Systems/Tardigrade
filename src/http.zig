@@ -45,6 +45,7 @@ pub const access_log = @import("http/access_log.zig");
 pub const event_loop = @import("http/event_loop.zig");
 pub const worker_pool = @import("http/worker_pool.zig");
 pub const buffer_pool = @import("http/buffer_pool.zig");
+pub const keepalive_park = @import("http/keepalive_park.zig");
 pub const tls_termination = @import("http/tls_termination.zig");
 pub const acme_client = @import("http/acme_client.zig");
 pub const hpack = @import("http/hpack.zig");

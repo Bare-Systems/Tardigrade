@@ -233,10 +233,10 @@ pub const Metrics = struct {
     /// Format metrics in Prometheus text exposition format.
     /// Caller owns the returned memory.
     pub fn toPrometheus(self: *const Metrics, allocator: std.mem.Allocator) ![]u8 {
-        var out = std.array_list.Managed(u8).init(allocator);
-        errdefer out.deinit();
+        var out = std.ArrayList(u8).empty;
+        errdefer out.deinit(allocator);
 
-        try out.print(
+        try out.print(allocator,
             \\# HELP tardigrade_requests_total Total HTTP requests processed
             \\# TYPE tardigrade_requests_total counter
             \\tardigrade_requests_total {d}
@@ -289,7 +289,7 @@ pub const Metrics = struct {
             self.upstream_unhealthy_backends,
         });
 
-        try out.print(
+        try out.print(allocator,
             \\# HELP tardigrade_request_latency_ms Request latency histogram in milliseconds
             \\# TYPE tardigrade_request_latency_ms histogram
             \\tardigrade_request_latency_ms_bucket{{le="1"}} {d}
@@ -320,7 +320,7 @@ pub const Metrics = struct {
             self.latency_count,
         });
 
-        try out.print(
+        try out.print(allocator,
             \\# HELP tardigrade_worker_active_jobs Current worker jobs actively executing request work
             \\# TYPE tardigrade_worker_active_jobs gauge
             \\tardigrade_worker_active_jobs {d}
@@ -381,7 +381,7 @@ pub const Metrics = struct {
             self.health_probe_runs,
         });
 
-        return out.toOwnedSlice();
+        return out.toOwnedSlice(allocator);
     }
 
     /// Format metrics as a JSON string.

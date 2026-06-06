@@ -25,7 +25,7 @@ const DYNAMIC_TABLE_ENTRY_OVERHEAD: usize = 32;
 /// is 4 096 bytes by default and may be reduced by a table-size update
 /// instruction in the header block.
 pub const DynamicTable = struct {
-    entries: std.ArrayList(HeaderField),
+    entries: std.Deque(HeaderField),
     size: usize,
     max_size: usize,
 
@@ -34,7 +34,8 @@ pub const DynamicTable = struct {
     }
 
     pub fn deinit(self: *DynamicTable, allocator: std.mem.Allocator) void {
-        for (self.entries.items) |h| {
+        var it = self.entries.iterator();
+        while (it.next()) |h| {
             allocator.free(h.name);
             allocator.free(h.value);
         }
@@ -53,7 +54,7 @@ pub const DynamicTable = struct {
         errdefer allocator.free(name_copy);
         const value_copy = try allocator.dupe(u8, value);
         errdefer allocator.free(value_copy);
-        try self.entries.append(allocator, .{ .name = name_copy, .value = value_copy });
+        try self.entries.pushBack(allocator, .{ .name = name_copy, .value = value_copy });
         self.size += cost;
     }
 
@@ -64,26 +65,24 @@ pub const DynamicTable = struct {
 
     /// dyn_idx 0 = most recently inserted (last element in oldest-first storage).
     pub fn getByDynIndex(self: *const DynamicTable, dyn_idx: usize) ?StaticEntry {
-        if (dyn_idx >= self.entries.items.len) return null;
-        const actual = self.entries.items.len - 1 - dyn_idx;
-        const h = self.entries.items[actual];
+        if (dyn_idx >= self.entries.len) return null;
+        const actual = self.entries.len - 1 - dyn_idx;
+        const h = self.entries.at(actual);
         return .{ .name = h.name, .value = h.value };
     }
 
     fn evictOldest(self: *DynamicTable, allocator: std.mem.Allocator) void {
-        if (self.entries.items.len == 0) return;
-        const oldest = self.entries.orderedRemove(0);
+        const oldest = self.entries.popFront() orelse return;
         self.size -= oldest.name.len + oldest.value.len + DYNAMIC_TABLE_ENTRY_OVERHEAD;
         allocator.free(oldest.name);
         allocator.free(oldest.value);
     }
 
     fn evictAll(self: *DynamicTable, allocator: std.mem.Allocator) void {
-        for (self.entries.items) |h| {
+        while (self.entries.popFront()) |h| {
             allocator.free(h.name);
             allocator.free(h.value);
         }
-        self.entries.clearRetainingCapacity();
         self.size = 0;
     }
 };
@@ -406,10 +405,10 @@ test "DynamicTable evicts oldest entries to stay within max_size" {
     table.setMaxSize(allocator, entry_cost); // room for exactly one entry
 
     try table.insert(allocator, name, val);
-    try std.testing.expectEqual(@as(usize, 1), table.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), table.entries.len);
 
     try table.insert(allocator, "c", "d");
-    try std.testing.expectEqual(@as(usize, 1), table.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), table.entries.len);
     const e = table.getByDynIndex(0).?;
     try std.testing.expectEqualStrings("c", e.name);
 }
@@ -420,10 +419,10 @@ test "DynamicTable setMaxSize zero evicts everything" {
     defer table.deinit(allocator);
 
     try table.insert(allocator, "key", "val");
-    try std.testing.expectEqual(@as(usize, 1), table.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), table.entries.len);
 
     table.setMaxSize(allocator, 0);
-    try std.testing.expectEqual(@as(usize, 0), table.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), table.entries.len);
     try std.testing.expectEqual(@as(usize, 0), table.size);
 }
 

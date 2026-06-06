@@ -97,7 +97,12 @@ operators can raise proxy payload ceilings without changing inbound request
 parsing limits.
 When an upstream container is replaced on the same host:port, the first request
 that hits a dead pooled keep-alive socket now evicts that stale connection so
-later requests reconnect cleanly without restarting Tardigrade. Proxy requests
+later requests reconnect cleanly without restarting Tardigrade. If an upstream
+closes an idle keep-alive connection just as Tardigrade reuses it (so the
+response read returns zero bytes), Tardigrade transparently retries the request
+on a fresh connection instead of returning a `502` — the request was never
+delivered, so this is safe for idempotent methods (and for any method when
+`TARDIGRADE_UPSTREAM_RETRY_IDEMPOTENT_ONLY=false`). Proxy requests
 that send an explicit zero-length `POST` body are also forwarded without
 triggering a runtime panic.
 Large buffered proxy responses now preserve the upstream body exactly instead of

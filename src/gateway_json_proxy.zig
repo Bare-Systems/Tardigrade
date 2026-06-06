@@ -400,44 +400,46 @@ fn proxyJsonExecuteSingleAttempt(
     if (cfg.trust_require_upstream_identity and cfg.trust_shared_secret.len == 0) return error.UpstreamUntrusted;
     if (!isTrustedUpstream(cfg, upstream_host)) return error.UpstreamUntrusted;
 
-    var extra_headers = std.array_list.Managed(std.http.Header).init(extra_headers_allocator);
-    defer extra_headers.deinit();
-    var owned_header_values = std.array_list.Managed([]u8).init(owned_header_values_allocator);
+    var extra_headers = std.ArrayList(std.http.Header).empty;
+    defer extra_headers.deinit(extra_headers_allocator);
+    var owned_header_values = std.ArrayList([]u8).empty;
     defer {
         for (owned_header_values.items) |value| allocator.free(value);
-        owned_header_values.deinit();
+        owned_header_values.deinit(owned_header_values_allocator);
     }
-    try extra_headers.ensureUnusedCapacity(proxy_json_extra_header_slack);
-    try owned_header_values.ensureUnusedCapacity(proxy_json_owned_header_value_slack);
-    try appendRequestIdHeaders(&extra_headers, correlation_id);
-    try extra_headers.append(.{ .name = "X-Forwarded-For", .value = forwarded_for.value });
-    try extra_headers.append(.{ .name = "X-Real-IP", .value = client_ip });
-    try extra_headers.append(.{ .name = "X-Forwarded-Proto", .value = forwarded_proto });
+    try extra_headers.ensureUnusedCapacity(extra_headers_allocator, proxy_json_extra_header_slack);
+    try owned_header_values.ensureUnusedCapacity(owned_header_values_allocator, proxy_json_owned_header_value_slack);
+    try appendRequestIdHeaders(extra_headers_allocator, &extra_headers, correlation_id);
+    try extra_headers.append(extra_headers_allocator, .{ .name = "X-Forwarded-For", .value = forwarded_for.value });
+    try extra_headers.append(extra_headers_allocator, .{ .name = "X-Real-IP", .value = client_ip });
+    try extra_headers.append(extra_headers_allocator, .{ .name = "X-Forwarded-Proto", .value = forwarded_proto });
     if (cfg.upstream_gunzip_enabled) {
-        try extra_headers.append(.{ .name = "Accept-Encoding", .value = "gzip, identity" });
+        try extra_headers.append(extra_headers_allocator, .{ .name = "Accept-Encoding", .value = "gzip, identity" });
     }
-    if (forwarded_host.len > 0) try extra_headers.append(.{ .name = "X-Forwarded-Host", .value = forwarded_host });
+    if (forwarded_host.len > 0) try extra_headers.append(extra_headers_allocator, .{ .name = "X-Forwarded-Host", .value = forwarded_host });
     if (auth_identity) |identity| {
-        if (identity.len > 0) try extra_headers.append(.{ .name = "X-Tardigrade-Auth-Identity", .value = identity });
+        if (identity.len > 0) try extra_headers.append(extra_headers_allocator, .{ .name = "X-Tardigrade-Auth-Identity", .value = identity });
     }
     if (auth_user_id) |user_id| {
-        if (user_id.len > 0) try extra_headers.append(.{ .name = "X-Tardigrade-User-ID", .value = user_id });
+        if (user_id.len > 0) try extra_headers.append(extra_headers_allocator, .{ .name = "X-Tardigrade-User-ID", .value = user_id });
     }
     if (auth_device_id) |device_id| {
-        if (device_id.len > 0) try extra_headers.append(.{ .name = "X-Tardigrade-Device-ID", .value = device_id });
+        if (device_id.len > 0) try extra_headers.append(extra_headers_allocator, .{ .name = "X-Tardigrade-Device-ID", .value = device_id });
     }
     if (auth_scopes) |scopes| {
-        if (scopes.len > 0) try extra_headers.append(.{ .name = "X-Tardigrade-Scopes", .value = scopes });
+        if (scopes.len > 0) try extra_headers.append(extra_headers_allocator, .{ .name = "X-Tardigrade-Scopes", .value = scopes });
     }
     if (api_version) |ver| {
         const api_version_value = try std.fmt.allocPrint(allocator, "{d}", .{ver});
-        try owned_header_values.append(api_version_value);
-        try extra_headers.append(.{ .name = "X-Tardigrade-Api-Version", .value = api_version_value });
+        try owned_header_values.append(owned_header_values_allocator, api_version_value);
+        try extra_headers.append(extra_headers_allocator, .{ .name = "X-Tardigrade-Api-Version", .value = api_version_value });
     }
     try appendTrustedUpstreamHeaders(
         allocator,
         cfg,
+        extra_headers_allocator,
         &extra_headers,
+        owned_header_values_allocator,
         &owned_header_values,
         resolved_target.url,
         correlation_id,

@@ -30,13 +30,13 @@ pub const Http2PendingStream = struct {
     method: ?[]u8 = null,
     path: ?[]u8 = null,
     headers: http.Headers,
-    body: std.array_list.Managed(u8),
+    body: std.ArrayList(u8),
     priority_weight: u8 = 16,
 
     pub fn init(allocator: std.mem.Allocator) Http2PendingStream {
         return .{
             .headers = http.Headers.init(allocator),
-            .body = std.array_list.Managed(u8).init(allocator),
+            .body = .empty,
         };
     }
 
@@ -44,7 +44,7 @@ pub const Http2PendingStream = struct {
         if (self.method) |m| allocator.free(m);
         if (self.path) |p| allocator.free(p);
         self.headers.deinit();
-        self.body.deinit();
+        self.body.deinit(allocator);
         self.* = undefined;
     }
 };
@@ -222,9 +222,9 @@ fn deinitMuxMetricsSnapshot(allocator: std.mem.Allocator, device_counts: []MuxDe
     allocator.free(device_counts);
 }
 
-fn deinitMuxPendingFrames(allocator: std.mem.Allocator, pending: *std.array_list.Managed(MuxPendingFrame)) void {
+fn deinitMuxPendingFrames(allocator: std.mem.Allocator, pending: *std.ArrayList(MuxPendingFrame)) void {
     for (pending.items) |frame| allocator.free(frame.payload);
-    pending.deinit();
+    pending.deinit(allocator);
 }
 
 fn deinitMuxChannel(allocator: std.mem.Allocator, ch: *MuxChannel) void {
@@ -1272,15 +1272,15 @@ pub const GatewayState = struct {
         const metrics_snapshot = self.metrics;
         self.metrics_mutex.unlock();
 
-        var device_json = std.array_list.Managed(u8).init(allocator);
-        errdefer device_json.deinit();
-        try device_json.append('{');
+        var device_json = std.ArrayList(u8).empty;
+        errdefer device_json.deinit(allocator);
+        try device_json.append(allocator, '{');
         for (mux_snapshot.device_counts, 0..) |entry, idx| {
-            if (idx > 0) try device_json.append(',');
-            try device_json.writer().print("{s}:{d}", .{ std.json.fmt(entry.device_id, .{}), entry.count });
+            if (idx > 0) try device_json.append(allocator, ',');
+            try device_json.print(allocator, "{s}:{d}", .{ std.json.fmt(entry.device_id, .{}), entry.count });
         }
-        try device_json.append('}');
-        const device_json_owned = try device_json.toOwnedSlice();
+        try device_json.append(allocator, '}');
+        const device_json_owned = try device_json.toOwnedSlice(allocator);
         defer allocator.free(device_json_owned);
 
         return std.fmt.allocPrint(allocator,
@@ -1327,11 +1327,11 @@ pub const GatewayState = struct {
         const base = try metrics_snapshot.toPrometheus(allocator);
         defer allocator.free(base);
 
-        var combined = std.array_list.Managed(u8).init(allocator);
-        errdefer combined.deinit();
-        try combined.appendSlice(base);
+        var combined = std.ArrayList(u8).empty;
+        errdefer combined.deinit(allocator);
+        try combined.appendSlice(allocator, base);
         if (mux_snapshot.device_counts.len > 0) {
-            try combined.appendSlice(
+            try combined.appendSlice(allocator,
                 \\# HELP tardigrade_mux_device_channels Current active mux channels by device
                 \\# TYPE tardigrade_mux_device_channels gauge
                 \\
@@ -1339,10 +1339,10 @@ pub const GatewayState = struct {
             for (mux_snapshot.device_counts) |entry| {
                 const line = try std.fmt.allocPrint(allocator, "tardigrade_mux_device_channels{{device_id=\"{s}\"}} {d}\n", .{ entry.device_id, entry.count });
                 defer allocator.free(line);
-                try combined.appendSlice(line);
+                try combined.appendSlice(allocator, line);
             }
         }
-        return combined.toOwnedSlice();
+        return combined.toOwnedSlice(allocator);
     }
 
     pub fn nextUpstreamBaseUrl(self: *GatewayState, cfg: *const edge_config.EdgeConfig, pool: UpstreamPoolView, client_ip: []const u8, hash_key: []const u8) []const u8 {
@@ -1910,19 +1910,19 @@ pub const GatewayState = struct {
         self.connection_mutex.lock();
         defer self.connection_mutex.unlock();
 
-        var device_counts = std.array_list.Managed(MuxDeviceCount).init(allocator);
+        var device_counts = std.ArrayList(MuxDeviceCount).empty;
         errdefer {
             for (device_counts.items) |entry| allocator.free(entry.device_id);
-            device_counts.deinit();
+            device_counts.deinit(allocator);
         }
         var it = self.mux_subscriptions_by_device.iterator();
         while (it.next()) |entry| {
-            try device_counts.append(.{
+            try device_counts.append(allocator, .{
                 .device_id = try allocator.dupe(u8, entry.key_ptr.*),
                 .count = entry.value_ptr.*,
             });
         }
-        return .{ .device_counts = try device_counts.toOwnedSlice() };
+        return .{ .device_counts = try device_counts.toOwnedSlice(allocator) };
     }
 
     pub fn saveMuxResumeState(self: *GatewayState, device_id: []const u8, channels: []const MuxChannel, grace_ms: u32) void {
@@ -1972,25 +1972,26 @@ pub const GatewayState = struct {
     pub fn upstreamHealthJson(self: *GatewayState, allocator: std.mem.Allocator) ![]u8 {
         self.upstream_mutex.lock();
         defer self.upstream_mutex.unlock();
-        var out = std.array_list.Managed(u8).init(allocator);
-        errdefer out.deinit();
-        try out.appendSlice("{\"upstreams\":[");
+        var out = std.ArrayList(u8).empty;
+        errdefer out.deinit(allocator);
+        try out.appendSlice(allocator, "{\"upstreams\":[");
         var first = true;
         const now_ms = http.event_loop.monotonicMs();
         var it = self.upstream_health.iterator();
         while (it.next()) |entry| {
-            if (!first) try out.appendSlice(",");
+            if (!first) try out.appendSlice(allocator, ",");
             first = false;
             const url = entry.key_ptr.*;
             const h = entry.value_ptr.*;
             const healthy = (h.unhealthy_until_ms == 0 or h.unhealthy_until_ms <= now_ms) and h.probe.isRoutable();
-            try out.writer().print(
+            try out.print(
+                allocator,
                 "{{\"url\":\"{s}\",\"healthy\":{},\"unhealthy_until_ms\":{d},\"active_status\":\"{s}\"}}",
                 .{ url, healthy, h.unhealthy_until_ms, h.probe.status.asString() },
             );
         }
-        try out.appendSlice("]}");
-        return out.toOwnedSlice();
+        try out.appendSlice(allocator, "]}");
+        return out.toOwnedSlice(allocator);
     }
 };
 

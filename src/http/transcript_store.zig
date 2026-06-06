@@ -114,9 +114,10 @@ pub fn listRecent(allocator: std.mem.Allocator, path: []const u8, limit: usize) 
     };
     defer allocator.free(contents);
 
-    var window: std.ArrayList(Summary) = .empty;
+    var window: std.Deque(Summary) = .empty;
     errdefer {
-        for (window.items) |*summary| summary.deinit(allocator);
+        var it = window.iterator();
+        while (it.nextPtr()) |summary| summary.deinit(allocator);
         window.deinit(allocator);
     }
 
@@ -129,11 +130,11 @@ pub fn listRecent(allocator: std.mem.Allocator, path: []const u8, limit: usize) 
         var entry = try parseStoredEntryLine(allocator, line_id, line);
         defer entry.deinit(allocator);
 
-        if (window.items.len == limit) {
-            var oldest = window.orderedRemove(0);
+        if (window.len == limit) {
+            var oldest = window.popFront().?;
             oldest.deinit(allocator);
         }
-        try window.append(allocator, .{
+        try window.pushBack(allocator, .{
             .id = entry.id,
             .ts_ms = entry.ts_ms,
             .scope = try allocator.dupe(u8, entry.scope),
@@ -145,8 +146,16 @@ pub fn listRecent(allocator: std.mem.Allocator, path: []const u8, limit: usize) 
         });
     }
 
-    std.mem.reverse(Summary, window.items);
-    return try window.toOwnedSlice(allocator);
+    const out = try allocator.alloc(Summary, window.len);
+    errdefer allocator.free(out);
+
+    var idx = window.len;
+    while (window.popFront()) |summary| {
+        idx -= 1;
+        out[idx] = summary;
+    }
+    window.deinit(allocator);
+    return out;
 }
 
 pub fn getById(allocator: std.mem.Allocator, path: []const u8, id: usize) !?StoredEntry {

@@ -10,7 +10,7 @@ pub const Event = struct {
 
 pub const Topic = struct {
     next_id: u64 = 1,
-    events: std.ArrayList(Event),
+    events: std.Deque(Event),
 
     fn init(allocator: std.mem.Allocator) Topic {
         _ = allocator;
@@ -18,7 +18,8 @@ pub const Topic = struct {
     }
 
     fn deinit(self: *Topic, allocator: std.mem.Allocator) void {
-        for (self.events.items) |e| {
+        var it = self.events.iterator();
+        while (it.next()) |e| {
             allocator.free(e.topic);
             allocator.free(e.payload);
         }
@@ -57,14 +58,14 @@ pub const EventHub = struct {
         var topic = gop.value_ptr;
         const id = topic.next_id;
         topic.next_id += 1;
-        try topic.events.append(self.allocator, .{
+        try topic.events.pushBack(self.allocator, .{
             .id = id,
             .topic = try self.allocator.dupe(u8, topic_name),
             .payload = try self.allocator.dupe(u8, payload),
             .created_ms = now_ms,
         });
-        while (topic.events.items.len > self.max_events_per_topic) {
-            const ev = topic.events.orderedRemove(0);
+        while (topic.events.len > self.max_events_per_topic) {
+            const ev = topic.events.popFront().?;
             self.allocator.free(ev.topic);
             self.allocator.free(ev.payload);
         }
@@ -83,7 +84,8 @@ pub const EventHub = struct {
             }
             out.deinit(allocator);
         }
-        for (topic.events.items) |ev| {
+        var it = topic.events.iterator();
+        while (it.next()) |ev| {
             if (ev.id <= after_id) continue;
             try out.append(allocator, .{
                 .id = ev.id,
@@ -99,8 +101,7 @@ pub const EventHub = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         const topic = self.topics.getPtr(topic_name) orelse return null;
-        if (topic.events.items.len == 0) return null;
-        return topic.events.items[0].id;
+        return if (topic.events.front()) |event| event.id else null;
     }
 
     fn getOrCreateTopicLocked(self: *EventHub, topic_name: []const u8) !std.StringHashMap(Topic).GetOrPutResult {

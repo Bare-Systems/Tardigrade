@@ -1071,16 +1071,16 @@ fn probeUnixSocketUpstream(socket_path: []const u8, uri: std.Uri, timeout_ms: u3
         try setSocketTimeoutMs(stream.handle, timeout_ms, timeout_ms);
     }
 
-    var request_target_buf = std.array_list.Managed(u8).init(std.heap.page_allocator);
-    defer request_target_buf.deinit();
+    var request_target_buf = std.ArrayList(u8).empty;
+    defer request_target_buf.deinit(std.heap.page_allocator);
     const path_raw = switch (uri.path) {
         .raw => |path| if (path.len > 0) path else "/",
         .percent_encoded => |path| if (path.len > 0) path else "/",
     };
-    try request_target_buf.appendSlice(path_raw);
+    try request_target_buf.appendSlice(std.heap.page_allocator, path_raw);
     if (uri.query) |query| {
-        try request_target_buf.appendSlice("?");
-        try request_target_buf.appendSlice(uriComponentBytes(query));
+        try request_target_buf.appendSlice(std.heap.page_allocator, "?");
+        try request_target_buf.appendSlice(std.heap.page_allocator, uriComponentBytes(query));
     }
 
     try stream.print("GET {s} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n", .{request_target_buf.items});
@@ -1549,8 +1549,8 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
     var pending = std.AutoHashMap(u31, Http2PendingStream).init(allocator);
     var streams = std.AutoHashMap(u31, http.http2_stream.Stream).init(allocator);
     defer streams.deinit();
-    var ready_streams = std.array_list.Managed(u31).init(allocator);
-    defer ready_streams.deinit();
+    var ready_streams = std.ArrayList(u31).empty;
+    defer ready_streams.deinit(allocator);
     var next_server_stream_id: u31 = 2;
     var conn_send_window: i32 = 65_535;
     var last_client_stream_id: u31 = 0;
@@ -1611,7 +1611,7 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                 try pending.put(frame.stream_id, ps);
                 if ((frame.flags & http.http2_frame.Flags.END_STREAM) != 0) {
                     if (streams.getPtr(frame.stream_id)) |s| s.remoteEndStream() catch {};
-                    try ready_streams.append(frame.stream_id);
+                    try ready_streams.append(allocator, frame.stream_id);
                 }
             },
             .data => {
@@ -1619,14 +1619,14 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                 if (streams.getPtr(frame.stream_id)) |s| s.send_window -= @intCast(frame.payload.len);
                 conn_send_window -= @intCast(frame.payload.len);
                 if (pending.getPtr(frame.stream_id)) |ps| {
-                    try ps.body.appendSlice(frame.payload);
+                    try ps.body.appendSlice(allocator, frame.payload);
                     try http.http2_frame.writeWindowUpdate(conn.writer(), frame.stream_id, @intCast(frame.payload.len));
                     try http.http2_frame.writeWindowUpdate(conn.writer(), 0, @intCast(frame.payload.len));
                     if (streams.getPtr(frame.stream_id)) |s| s.send_window += @intCast(frame.payload.len);
                     conn_send_window += @intCast(frame.payload.len);
                     if ((frame.flags & http.http2_frame.Flags.END_STREAM) != 0) {
                         if (streams.getPtr(frame.stream_id)) |s| s.remoteEndStream() catch {};
-                        try ready_streams.append(frame.stream_id);
+                        try ready_streams.append(allocator, frame.stream_id);
                     }
                 } else {
                     try http.http2_frame.writeGoaway(conn.writer(), frame.stream_id, 1);
@@ -1733,15 +1733,15 @@ fn respondHttp2Stream(
     const len_str = try std.fmt.allocPrint(allocator, "{d}", .{body.len});
     defer allocator.free(len_str);
 
-    var response_headers = std.array_list.Managed(http.hpack.HeaderField).init(allocator);
-    defer response_headers.deinit();
-    try response_headers.append(.{ .name = ":status", .value = status_str });
-    try response_headers.append(.{ .name = "content-type", .value = content_type });
-    try response_headers.append(.{ .name = "content-length", .value = len_str });
-    try response_headers.append(.{ .name = http.correlation.REQUEST_HEADER_NAME, .value = correlation_id });
-    try response_headers.append(.{ .name = http.correlation.HEADER_NAME, .value = correlation_id });
+    var response_headers = std.ArrayList(http.hpack.HeaderField).empty;
+    defer response_headers.deinit(allocator);
+    try response_headers.append(allocator, .{ .name = ":status", .value = status_str });
+    try response_headers.append(allocator, .{ .name = "content-type", .value = content_type });
+    try response_headers.append(allocator, .{ .name = "content-length", .value = len_str });
+    try response_headers.append(allocator, .{ .name = http.correlation.REQUEST_HEADER_NAME, .value = correlation_id });
+    try response_headers.append(allocator, .{ .name = http.correlation.HEADER_NAME, .value = correlation_id });
     for (state.add_headers) |h| {
-        try response_headers.append(.{ .name = h.name, .value = h.value });
+        try response_headers.append(allocator, .{ .name = h.name, .value = h.value });
     }
 
     const header_block = try http.hpack.encodeLiteralHeaderBlock(allocator, response_headers.items);
@@ -1972,12 +1972,12 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
     }
 
     // --- Rewrite / return directives ---
-    var request_uri_buf = std.array_list.Managed(u8).init(allocator);
-    defer request_uri_buf.deinit();
-    try request_uri_buf.appendSlice(request.uri.path);
+    var request_uri_buf = std.ArrayList(u8).empty;
+    defer request_uri_buf.deinit(allocator);
+    try request_uri_buf.appendSlice(allocator, request.uri.path);
     if (request.uri.query) |query| {
-        try request_uri_buf.append('?');
-        try request_uri_buf.appendSlice(query);
+        try request_uri_buf.append(allocator, '?');
+        try request_uri_buf.appendSlice(allocator, query);
     }
 
     var conditional_outcome = try evaluateConditionalRules(
@@ -2785,8 +2785,18 @@ fn handleLocationProxyPass(
     };
     const budget_start_ms = http.event_loop.monotonicMs();
 
+    // Extra retry budget reserved for stale pooled keep-alive connections. When
+    // an upstream closes an idle keep-alive connection between the time we pull
+    // it from the pool and the time it would serve our request, the response
+    // read returns zero bytes (error.HttpConnectionClosing). The request was
+    // never processed, so it is always safe to retry on a fresh connection.
+    // This budget is independent of the operator-configured attempt count so the
+    // race is skipped transparently even with the default of a single attempt.
+    const max_stale_conn_retries: usize = 2;
+    var stale_conn_retries: usize = 0;
+
     var attempt: usize = 0;
-    var upstream_response: RawUpstreamResponse = while (attempt < max_attempts) : (attempt += 1) {
+    var upstream_response: RawUpstreamResponse = while (attempt < max_attempts + stale_conn_retries) : (attempt += 1) {
         const per_attempt_timeout_ms: u32 = blk: {
             if (cfg.upstream_timeout_budget_ms == 0) break :blk cfg.upstream_timeout_ms;
             const elapsed_ms = http.event_loop.monotonicMs() - budget_start_ms;
@@ -2840,6 +2850,25 @@ fn handleLocationProxyPass(
             );
         state.recordUpstreamAttemptEnd(selection.base_url);
         const result = resp catch |err| {
+            // A pooled keep-alive connection that the upstream closed before
+            // handling our request surfaces as HttpConnectionClosing (zero
+            // response bytes received). The request was never delivered, so this
+            // is a normal keep-alive lifecycle event rather than an upstream
+            // health failure: retry it on a fresh connection without counting it
+            // against upstream health / circuit-breaker state. Non-idempotent
+            // methods are only retried this way when the operator has disabled
+            // the idempotent-only guard.
+            if (shouldRetryStaleUpstreamConnection(
+                err,
+                method_str,
+                stale_conn_retries,
+                max_stale_conn_retries,
+                cfg.upstream_retry_idempotent_only,
+            )) {
+                stale_conn_retries += 1;
+                state.logger.warn(correlation_id, "proxy retrying on fresh connection after stale upstream keep-alive ({d}/{d})", .{ stale_conn_retries, max_stale_conn_retries });
+                continue;
+            }
             state.recordUpstreamFailure(cfg, selection.base_url);
             // If the request deadline elapsed, stop retrying immediately.
             if (err == error.RequestCancelled) {
@@ -4155,6 +4184,28 @@ pub fn isHttpMethodIdempotent(method: []const u8) bool {
         std.mem.eql(u8, m, "TRACE");
 }
 
+/// Decide whether a failed proxy attempt should be retried on a fresh upstream
+/// connection because the error indicates the request was never delivered.
+///
+/// `error.HttpConnectionClosing` is raised when a pooled keep-alive connection
+/// returns zero response bytes — i.e. the upstream closed an idle connection
+/// before serving our request. Because nothing reached the upstream, retrying
+/// cannot double-apply a side effect, so it is safe for idempotent methods and
+/// for any method when the operator has disabled the idempotent-only guard.
+/// The retry is bounded by `max_stale_conn_retries` so a persistently dead
+/// upstream still fails fast.
+fn shouldRetryStaleUpstreamConnection(
+    err: anyerror,
+    method: []const u8,
+    stale_conn_retries: usize,
+    max_stale_conn_retries: usize,
+    idempotent_only: bool,
+) bool {
+    if (err != error.HttpConnectionClosing) return false;
+    if (stale_conn_retries >= max_stale_conn_retries) return false;
+    return isHttpMethodIdempotent(method) or !idempotent_only;
+}
+
 fn setSocketTimeoutMs(fd: std.posix.fd_t, recv_timeout_ms: u32, send_timeout_ms: u32) !void {
     const recv_tv = std.posix.timeval{
         .sec = @intCast(recv_timeout_ms / 1000),
@@ -4677,6 +4728,34 @@ test "isHttpMethodIdempotent rejects non-idempotent methods" {
     try std.testing.expect(!isHttpMethodIdempotent(""));
     // Oversized input should not crash
     try std.testing.expect(!isHttpMethodIdempotent("VERYLONGMETHODNAME"));
+}
+
+test "shouldRetryStaleUpstreamConnection retries idempotent methods on closed keep-alive" {
+    // GET hitting a stale pooled keep-alive connection: always retried within budget.
+    try std.testing.expect(shouldRetryStaleUpstreamConnection(error.HttpConnectionClosing, "GET", 0, 2, true));
+    try std.testing.expect(shouldRetryStaleUpstreamConnection(error.HttpConnectionClosing, "GET", 1, 2, true));
+}
+
+test "shouldRetryStaleUpstreamConnection respects the retry budget" {
+    // Budget exhausted: no further stale retry even for an idempotent method.
+    try std.testing.expect(!shouldRetryStaleUpstreamConnection(error.HttpConnectionClosing, "GET", 2, 2, true));
+    try std.testing.expect(!shouldRetryStaleUpstreamConnection(error.HttpConnectionClosing, "GET", 3, 2, true));
+}
+
+test "shouldRetryStaleUpstreamConnection guards POST by idempotent-only setting" {
+    // POST is not retried when the idempotent-only guard is on (default)...
+    try std.testing.expect(!shouldRetryStaleUpstreamConnection(error.HttpConnectionClosing, "POST", 0, 2, true));
+    // ...but is retried when the operator disables the guard, since the request
+    // was never delivered.
+    try std.testing.expect(shouldRetryStaleUpstreamConnection(error.HttpConnectionClosing, "POST", 0, 2, false));
+}
+
+test "shouldRetryStaleUpstreamConnection only triggers for pre-delivery closes" {
+    // Mid-stream and connection-establishment errors are NOT treated as the
+    // always-safe stale keep-alive case.
+    try std.testing.expect(!shouldRetryStaleUpstreamConnection(error.ReadFailed, "GET", 0, 2, true));
+    try std.testing.expect(!shouldRetryStaleUpstreamConnection(error.ConnectionResetByPeer, "GET", 0, 2, true));
+    try std.testing.expect(!shouldRetryStaleUpstreamConnection(error.Timeout, "GET", 0, 2, true));
 }
 
 test "upstream_retry_idempotent_only default true limits POST retries to 1" {

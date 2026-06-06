@@ -82,14 +82,14 @@ pub fn parseRawUpstreamResponse(allocator: std.mem.Allocator, raw: []const u8) !
     const status_code = std.fmt.parseInt(u16, status_str, 10) catch 200;
     const reason = line_parts.rest();
 
-    var resp_headers = std.array_list.Managed(UpstreamHeader).init(metadata_allocator);
+    var resp_headers = std.ArrayList(UpstreamHeader).empty;
     var hdr_lines = std.mem.splitSequence(u8, headers_raw[first_line_end + 1 ..], "\r\n");
     while (hdr_lines.next()) |line| {
         const colon = std.mem.findScalar(u8, line, ':') orelse continue;
         const hname = std.mem.trim(u8, line[0..colon], " \t");
         const hval = std.mem.trim(u8, line[colon + 1 ..], " \t");
         if (shouldSkipUpstreamResponseHeader(hname)) continue;
-        try resp_headers.append(.{
+        try resp_headers.append(metadata_allocator, .{
             .name = try metadata_allocator.dupe(u8, hname),
             .value = try metadata_allocator.dupe(u8, hval),
         });
@@ -99,7 +99,7 @@ pub fn parseRawUpstreamResponse(allocator: std.mem.Allocator, raw: []const u8) !
         .metadata_arena = metadata_arena,
         .status_code = status_code,
         .reason = try metadata_allocator.dupe(u8, reason),
-        .headers = try resp_headers.toOwnedSlice(),
+        .headers = try resp_headers.toOwnedSlice(metadata_allocator),
         .body = try allocator.dupe(u8, resp_body),
     };
 }
@@ -161,13 +161,13 @@ pub fn executeUnixSocketHttpRequest(
         try setSocketRecvTimeoutMs(stream.handle, response_timeout_ms);
     }
 
-    var resp_raw = std.array_list.Managed(u8).init(allocator);
-    defer resp_raw.deinit();
+    var resp_raw = std.ArrayList(u8).empty;
+    defer resp_raw.deinit(allocator);
     var read_buf: [8192]u8 = undefined;
     while (true) {
         const n = try stream.read(&read_buf);
         if (n == 0) break;
-        try resp_raw.appendSlice(read_buf[0..n]);
+        try resp_raw.appendSlice(allocator, read_buf[0..n]);
         if (resp_raw.items.len > max_buffered_response_bytes) return error.StreamTooLong;
     }
 
@@ -274,19 +274,19 @@ pub fn executeRawHttpProxyRequest(
     errdefer metadata_arena.deinit();
     const metadata_allocator = metadata_arena.allocator();
 
-    var extra_headers = std.array_list.Managed(std.http.Header).init(extra_headers_allocator);
-    defer extra_headers.deinit();
-    try extra_headers.ensureUnusedCapacity(request_headers.count() + proxy_extra_header_slack);
-    try appendProxyRequestHeaders(&extra_headers, request_headers);
-    try appendRequestIdHeaders(&extra_headers, correlation_id);
-    try extra_headers.append(.{ .name = "X-Forwarded-For", .value = forwarded_for.value });
-    try extra_headers.append(.{ .name = "X-Real-IP", .value = client_ip });
-    try extra_headers.append(.{ .name = "X-Forwarded-Proto", .value = forwarded_proto });
+    var extra_headers = std.ArrayList(std.http.Header).empty;
+    defer extra_headers.deinit(extra_headers_allocator);
+    try extra_headers.ensureUnusedCapacity(extra_headers_allocator, request_headers.count() + proxy_extra_header_slack);
+    try appendProxyRequestHeaders(extra_headers_allocator, &extra_headers, request_headers);
+    try appendRequestIdHeaders(extra_headers_allocator, &extra_headers, correlation_id);
+    try extra_headers.append(extra_headers_allocator, .{ .name = "X-Forwarded-For", .value = forwarded_for.value });
+    try extra_headers.append(extra_headers_allocator, .{ .name = "X-Real-IP", .value = client_ip });
+    try extra_headers.append(extra_headers_allocator, .{ .name = "X-Forwarded-Proto", .value = forwarded_proto });
     if (incoming_host) |value| {
         const trimmed = std.mem.trim(u8, value, " \t\r\n");
-        if (trimmed.len > 0) try extra_headers.append(.{ .name = "X-Forwarded-Host", .value = trimmed });
+        if (trimmed.len > 0) try extra_headers.append(extra_headers_allocator, .{ .name = "X-Forwarded-Host", .value = trimmed });
     }
-    try appendAssertedIdentityHeaders(&extra_headers, auth_identity, auth_user_id, auth_device_id, auth_scopes);
+    try appendAssertedIdentityHeaders(extra_headers_allocator, &extra_headers, auth_identity, auth_user_id, auth_device_id, auth_scopes);
     // W3C Trace Context: propagate inbound traceparent or originate a new one.
     // A child span is created from an inbound context so the trace ID is preserved
     // but each hop gets its own span ID.
@@ -294,7 +294,7 @@ pub fn executeRawHttpProxyRequest(
     if (request_headers.get("traceparent") == null) {
         const tc = http.trace_context.generate();
         const tp = tc.format(&traceparent_buf);
-        if (tp.len > 0) try extra_headers.append(.{ .name = "traceparent", .value = tp });
+        if (tp.len > 0) try extra_headers.append(extra_headers_allocator, .{ .name = "traceparent", .value = tp });
     }
 
     if (unix_socket_path) |socket_path| {
@@ -351,12 +351,12 @@ pub fn executeRawHttpProxyRequest(
         return err;
     };
 
-    var headers = std.array_list.Managed(UpstreamHeader).init(metadata_allocator);
-    try headers.ensureUnusedCapacity(8);
+    var headers = std.ArrayList(UpstreamHeader).empty;
+    try headers.ensureUnusedCapacity(metadata_allocator, 8);
     var header_it = resp.head.iterateHeaders();
     while (header_it.next()) |header| {
         if (shouldSkipUpstreamResponseHeader(header.name)) continue;
-        try headers.append(.{
+        try headers.append(metadata_allocator, .{
             .name = try metadata_allocator.dupe(u8, header.name),
             .value = try metadata_allocator.dupe(u8, header.value),
         });
@@ -378,7 +378,7 @@ pub fn executeRawHttpProxyRequest(
         .metadata_arena = metadata_arena,
         .status_code = @intFromEnum(resp.head.status),
         .reason = try metadata_allocator.dupe(u8, upstreamReasonPhrase(resp.head.status)),
-        .headers = try headers.toOwnedSlice(),
+        .headers = try headers.toOwnedSlice(metadata_allocator),
         .body = body_data,
     };
 }
@@ -464,13 +464,13 @@ pub fn executeUpstreamHttpsWithMtls(
     try tls_conn.writeAll(req_aw.written());
 
     // Read the raw HTTP response.
-    var resp_raw = std.array_list.Managed(u8).init(allocator);
-    defer resp_raw.deinit();
+    var resp_raw = std.ArrayList(u8).empty;
+    defer resp_raw.deinit(allocator);
     var read_buf: [8192]u8 = undefined;
     while (true) {
         const n = tls_conn.read(&read_buf) catch 0;
         if (n == 0) break;
-        try resp_raw.appendSlice(read_buf[0..n]);
+        try resp_raw.appendSlice(allocator, read_buf[0..n]);
         if (resp_raw.items.len > max_buffered_response_bytes) return error.StreamTooLong;
     }
     return parseRawUpstreamResponse(allocator, resp_raw.items);
@@ -487,23 +487,24 @@ pub fn applyResponseHeaders(state: *GatewayState, response: *http.Response) void
 }
 
 pub fn appendAssertedIdentityHeaders(
-    headers: *std.array_list.Managed(std.http.Header),
+    allocator: std.mem.Allocator,
+    headers: *std.ArrayList(std.http.Header),
     auth_identity: ?[]const u8,
     auth_user_id: ?[]const u8,
     auth_device_id: ?[]const u8,
     auth_scopes: ?[]const u8,
 ) !void {
     if (auth_identity) |identity| {
-        if (identity.len > 0) try headers.append(.{ .name = "X-Tardigrade-Auth-Identity", .value = identity });
+        if (identity.len > 0) try headers.append(allocator, .{ .name = "X-Tardigrade-Auth-Identity", .value = identity });
     }
     if (auth_user_id) |user_id| {
-        if (user_id.len > 0) try headers.append(.{ .name = "X-Tardigrade-User-ID", .value = user_id });
+        if (user_id.len > 0) try headers.append(allocator, .{ .name = "X-Tardigrade-User-ID", .value = user_id });
     }
     if (auth_device_id) |device_id| {
-        if (device_id.len > 0) try headers.append(.{ .name = "X-Tardigrade-Device-ID", .value = device_id });
+        if (device_id.len > 0) try headers.append(allocator, .{ .name = "X-Tardigrade-Device-ID", .value = device_id });
     }
     if (auth_scopes) |scopes| {
-        if (scopes.len > 0) try headers.append(.{ .name = "X-Tardigrade-Scopes", .value = scopes });
+        if (scopes.len > 0) try headers.append(allocator, .{ .name = "X-Tardigrade-Scopes", .value = scopes });
     }
 }
 
@@ -674,13 +675,14 @@ pub fn writeBufferedUpstreamResponseHead(
 }
 
 pub fn appendProxyRequestHeaders(
-    extra_headers: *std.array_list.Managed(std.http.Header),
+    allocator: std.mem.Allocator,
+    extra_headers: *std.ArrayList(std.http.Header),
     request_headers: *const http.Headers,
 ) !void {
     const connection_header = request_headers.get("connection");
     for (request_headers.iterator()) |header| {
         if (shouldSkipUpstreamRequestHeader(header.name, connection_header)) continue;
-        try extra_headers.append(.{ .name = header.name, .value = header.value });
+        try extra_headers.append(allocator, .{ .name = header.name, .value = header.value });
     }
 }
 
@@ -862,10 +864,12 @@ pub fn isTrustedUpstream(cfg: *const edge_config.EdgeConfig, upstream_host: []co
 }
 
 pub fn appendTrustedUpstreamHeaders(
-    allocator: std.mem.Allocator,
+    value_allocator: std.mem.Allocator,
     cfg: *const edge_config.EdgeConfig,
-    extra_headers: *std.array_list.Managed(std.http.Header),
-    owned_header_values: *std.array_list.Managed([]u8),
+    extra_headers_allocator: std.mem.Allocator,
+    extra_headers: *std.ArrayList(std.http.Header),
+    owned_header_values_allocator: std.mem.Allocator,
+    owned_header_values: *std.ArrayList([]u8),
     target_url: []const u8,
     correlation_id: []const u8,
     client_ip: []const u8,
@@ -876,10 +880,10 @@ pub fn appendTrustedUpstreamHeaders(
     if (cfg.trust_shared_secret.len == 0) return;
 
     const ts = compat.unixTimestamp();
-    const ts_value = try std.fmt.allocPrint(allocator, "{d}", .{ts});
-    try owned_header_values.append(ts_value);
-    try extra_headers.append(.{ .name = "X-Tardigrade-Gateway-Id", .value = cfg.trust_gateway_id });
-    try extra_headers.append(.{ .name = "X-Tardigrade-Trust-Timestamp", .value = ts_value });
+    const ts_value = try std.fmt.allocPrint(value_allocator, "{d}", .{ts});
+    try owned_header_values.append(owned_header_values_allocator, ts_value);
+    try extra_headers.append(extra_headers_allocator, .{ .name = "X-Tardigrade-Gateway-Id", .value = cfg.trust_gateway_id });
+    try extra_headers.append(extra_headers_allocator, .{ .name = "X-Tardigrade-Trust-Timestamp", .value = ts_value });
 
     var payload_digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(payload, &payload_digest, .{});
@@ -888,23 +892,23 @@ pub fn appendTrustedUpstreamHeaders(
 
     const identity = auth_identity orelse "-";
     const api_version_value = if (api_version) |ver|
-        try std.fmt.allocPrint(allocator, "{d}", .{ver})
+        try std.fmt.allocPrint(value_allocator, "{d}", .{ver})
     else
-        try allocator.dupe(u8, "-");
-    defer allocator.free(api_version_value);
+        try value_allocator.dupe(u8, "-");
+    defer value_allocator.free(api_version_value);
 
     const material = try std.fmt.allocPrint(
-        allocator,
+        value_allocator,
         "POST\n{s}\n{s}\n{s}\n{s}\n{s}\n{s}\n{s}\n{s}",
         .{ target_url, correlation_id, client_ip, cfg.trust_gateway_id, ts_value, payload_digest_hex, identity, api_version_value },
     );
-    defer allocator.free(material);
+    defer value_allocator.free(material);
 
     var mac: [32]u8 = undefined;
     std.crypto.auth.hmac.sha2.HmacSha256.create(&mac, material, cfg.trust_shared_secret);
-    const signature_hex = try std.fmt.allocPrint(allocator, "{f}", .{compat.fmtSliceHexLower(&mac)});
-    try owned_header_values.append(signature_hex);
-    try extra_headers.append(.{ .name = "X-Tardigrade-Trust-Signature", .value = signature_hex });
+    const signature_hex = try std.fmt.allocPrint(value_allocator, "{f}", .{compat.fmtSliceHexLower(&mac)});
+    try owned_header_values.append(owned_header_values_allocator, signature_hex);
+    try extra_headers.append(extra_headers_allocator, .{ .name = "X-Tardigrade-Trust-Signature", .value = signature_hex });
 }
 
 pub fn buildForwardedFor(allocator: std.mem.Allocator, incoming: ?[]const u8, client_ip: []const u8) !MaybeOwnedBytes {
@@ -1137,9 +1141,9 @@ pub fn writeRequestIdHeaders(writer: anytype, request_id: []const u8) !void {
     try writer.print("{s}: {s}\r\n", .{ http.correlation.HEADER_NAME, request_id });
 }
 
-pub fn appendRequestIdHeaders(headers: *std.array_list.Managed(std.http.Header), request_id: []const u8) !void {
-    try headers.append(.{ .name = http.correlation.REQUEST_HEADER_NAME, .value = request_id });
-    try headers.append(.{ .name = http.correlation.HEADER_NAME, .value = request_id });
+pub fn appendRequestIdHeaders(allocator: std.mem.Allocator, headers: *std.ArrayList(std.http.Header), request_id: []const u8) !void {
+    try headers.append(allocator, .{ .name = http.correlation.REQUEST_HEADER_NAME, .value = request_id });
+    try headers.append(allocator, .{ .name = http.correlation.HEADER_NAME, .value = request_id });
 }
 
 pub fn sendApiError(allocator: std.mem.Allocator, writer: anytype, status: http.Status, code: []const u8, message: []const u8, request_id: ?[]const u8, keep_alive: bool, state: *GatewayState) !void {

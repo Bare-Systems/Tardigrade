@@ -28,7 +28,7 @@ const std = @import("std");
 pub const HandlerFn = *const fn (ctx: *anyopaque, fd: std.posix.fd_t) void;
 
 const WorkerQueue = struct {
-    items: std.ArrayList(std.posix.fd_t),
+    items: std.Deque(std.posix.fd_t),
 };
 
 pub const WorkerPool = struct {
@@ -139,9 +139,9 @@ pub const WorkerPool = struct {
         const queue_index = self.selectQueueForSubmitLocked();
         // Reject if the least-loaded worker queue is already at the per-worker depth limit.
         if (self.max_per_worker_queue_len > 0 and
-            self.worker_queues[queue_index].items.items.len >= self.max_per_worker_queue_len)
+            self.worker_queues[queue_index].items.len >= self.max_per_worker_queue_len)
             return error.QueueFull;
-        try self.worker_queues[queue_index].items.append(self.allocator, fd);
+        try self.worker_queues[queue_index].items.pushBack(self.allocator, fd);
         self.queued_jobs += 1;
         if (self.worker_queues.len > 0) {
             self.next_queue = (queue_index + 1) % self.worker_queues.len;
@@ -189,8 +189,7 @@ pub const WorkerPool = struct {
         if (drain_timeout_ms == 0) {
             // Immediate: close queued fds without waiting.
             for (self.worker_queues) |*wq| {
-                for (wq.items.items) |fd| _ = std.c.close(fd);
-                wq.items.clearRetainingCapacity();
+                while (wq.items.popFront()) |fd| _ = std.c.close(fd);
             }
             self.queued_jobs = 0;
         } else {
@@ -201,8 +200,7 @@ pub const WorkerPool = struct {
                 if (now_ms >= deadline_ms) {
                     // Timeout: force-close remaining queued fds.
                     for (self.worker_queues) |*wq| {
-                        for (wq.items.items) |fd| _ = std.c.close(fd);
-                        wq.items.clearRetainingCapacity();
+                        while (wq.items.popFront()) |fd| _ = std.c.close(fd);
                     }
                     self.queued_jobs = 0;
                     break;
@@ -257,12 +255,12 @@ pub const WorkerPool = struct {
 
         const start = self.next_queue % self.worker_queues.len;
         var best = start;
-        var best_len = self.worker_queues[start].items.items.len;
+        var best_len = self.worker_queues[start].items.len;
 
         var offset: usize = 1;
         while (offset < self.worker_queues.len) : (offset += 1) {
             const idx = (start + offset) % self.worker_queues.len;
-            const len = self.worker_queues[idx].items.items.len;
+            const len = self.worker_queues[idx].items.len;
             if (len < best_len) {
                 best = idx;
                 best_len = len;
@@ -275,9 +273,9 @@ pub const WorkerPool = struct {
     fn popWorkLocked(self: *WorkerPool, worker_index: usize) ?std.posix.fd_t {
         if (worker_index < self.worker_queues.len) {
             var own = &self.worker_queues[worker_index].items;
-            if (own.items.len > 0) {
+            if (own.len > 0) {
                 self.queued_jobs -= 1;
-                return own.orderedRemove(0);
+                return own.popFront().?;
             }
         }
 
@@ -285,9 +283,9 @@ pub const WorkerPool = struct {
         while (offset < self.worker_queues.len) : (offset += 1) {
             const victim = (worker_index + offset) % self.worker_queues.len;
             var victim_queue = &self.worker_queues[victim].items;
-            if (victim_queue.items.len > 0) {
+            if (victim_queue.len > 0) {
                 self.queued_jobs -= 1;
-                return victim_queue.orderedRemove(0);
+                return victim_queue.popFront().?;
             }
         }
 
@@ -372,9 +370,9 @@ test "worker pool queue selection prefers least-loaded worker queue" {
         for (queues) |*q| q.items.deinit(std.testing.allocator);
     }
 
-    try queues[0].items.append(std.testing.allocator, 10);
-    try queues[0].items.append(std.testing.allocator, 11);
-    try queues[1].items.append(std.testing.allocator, 20);
+    try queues[0].items.pushBack(std.testing.allocator, 10);
+    try queues[0].items.pushBack(std.testing.allocator, 11);
+    try queues[1].items.pushBack(std.testing.allocator, 20);
 
     var pool = WorkerPool{
         .allocator = std.testing.allocator,
@@ -425,7 +423,7 @@ test "worker pool popWorkLocked steals from peer queue" {
         for (queues) |*q| q.items.deinit(std.testing.allocator);
     }
 
-    try queues[1].items.append(std.testing.allocator, 42);
+    try queues[1].items.pushBack(std.testing.allocator, 42);
 
     var pool = WorkerPool{
         .allocator = std.testing.allocator,

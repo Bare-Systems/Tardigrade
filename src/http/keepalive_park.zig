@@ -62,11 +62,20 @@ pub const ParkedConnection = struct {
 
 pub const CloseReason = enum { idle_timeout, shutdown, peer, max_requests, @"error" };
 
+/// Called once per connection just before its fd is closed, so the owner can
+/// release connection-lifetime accounting it holds outside this module (e.g.
+/// GatewayState.releaseConnectionSlot). Runs without the registry mutex held.
+pub const CloseHook = *const fn (ctx: *anyopaque, fd: std.posix.fd_t) void;
+
 pub const ParkedRegistry = struct {
     allocator: std.mem.Allocator,
     session_pool: *ConnectionSessionPool,
     mutex: compat.Mutex = .{},
     map: std.AutoHashMapUnmanaged(std.posix.fd_t, *ParkedConnection) = .{},
+
+    /// Optional teardown hook (set by the owner after init). Null in unit tests.
+    close_hook: ?CloseHook = null,
+    close_hook_ctx: ?*anyopaque = null,
 
     // Counters (guarded by mutex) for observability (#138 metrics).
     resumes_total: u64 = 0,
@@ -133,9 +142,23 @@ pub const ParkedRegistry = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         const pc = self.map.get(fd) orelse return false;
+        // Idempotent: a second readiness event for an already-dispatched
+        // connection must not dispatch it twice (level-triggered backends).
+        if (pc.state == .resuming) return false;
         pc.state = .resuming;
         self.resumes_total += 1;
         return true;
+    }
+
+    /// Free a connection's resources: owner teardown hook, TLS shutdown, socket
+    /// close, pooled-session release, and slot destruction. Caller must not hold
+    /// the mutex (the hook and session pool take their own locks).
+    fn freeConn(self: *ParkedRegistry, pc: *ParkedConnection) void {
+        if (self.close_hook) |hook| hook(self.close_hook_ctx.?, pc.fd);
+        if (pc.tls) |*tls| tls.deinit();
+        _ = std.c.close(pc.fd);
+        self.session_pool.release(pc.session);
+        self.allocator.destroy(pc);
     }
 
     /// Worker side: take ownership of the parked connection for `fd` to serve a
@@ -152,10 +175,7 @@ pub const ParkedRegistry = struct {
     /// close the socket, and destroy the slot. Caller must NOT hold the mutex.
     pub fn closeSlot(self: *ParkedRegistry, pc: *ParkedConnection, reason: CloseReason) void {
         _ = reason;
-        if (pc.tls) |*tls| tls.deinit();
-        _ = std.c.close(pc.fd);
-        self.session_pool.release(pc.session);
-        self.allocator.destroy(pc);
+        self.freeConn(pc);
         self.mutex.lock();
         self.closed_total += 1;
         self.mutex.unlock();
@@ -184,14 +204,10 @@ pub const ParkedRegistry = struct {
         }
         for (victims.items) |pc| _ = self.map.remove(pc.fd);
         self.timeouts_total += victims.items.len;
+        self.closed_total += victims.items.len;
         self.mutex.unlock();
 
-        for (victims.items) |pc| {
-            if (pc.tls) |*tls| tls.deinit();
-            _ = std.c.close(pc.fd);
-            self.session_pool.release(pc.session);
-            self.allocator.destroy(pc);
-        }
+        for (victims.items) |pc| self.freeConn(pc);
         return victims.items.len;
     }
 
@@ -209,12 +225,7 @@ pub const ParkedRegistry = struct {
         self.closed_total += victims.items.len;
         self.mutex.unlock();
 
-        for (victims.items) |pc| {
-            if (pc.tls) |*tls| tls.deinit();
-            _ = std.c.close(pc.fd);
-            self.session_pool.release(pc.session);
-            self.allocator.destroy(pc);
-        }
+        for (victims.items) |pc| self.freeConn(pc);
     }
 
     pub const Stats = struct {

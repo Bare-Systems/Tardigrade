@@ -64,6 +64,36 @@ pub const EventLoop = struct {
         }
     }
 
+    /// Stop watching `fd` for readiness. Used to un-park a keepalive connection
+    /// before dispatching it to a worker (#138), so the level-triggered backends
+    /// do not keep re-firing while the worker drains the socket. Safe to call
+    /// from a worker thread concurrently with `wait` on the loop thread, since
+    /// both epoll_ctl and kevent change-list updates are thread-safe.
+    pub fn removeReadFd(self: *EventLoop, fd: std.posix.fd_t) !void {
+        if (builtin.os.tag == .linux) {
+            const linux = std.os.linux;
+            // EPOLL_CTL_DEL ignores the event argument on modern kernels, but a
+            // valid pointer is passed for portability with older ones.
+            var event = linux.epoll_event{
+                .events = 0,
+                .data = .{ .fd = @intCast(fd) },
+            };
+            const rc = linux.epoll_ctl(@intCast(self.fd), linux.EPOLL.CTL_DEL, @intCast(fd), &event);
+            if (linux.errno(rc) != .SUCCESS) return error.Unexpected;
+        } else {
+            const changes = [_]std.c.Kevent{.{
+                .ident = @intCast(fd),
+                .filter = std.c.EVFILT.READ,
+                .flags = std.c.EV.DELETE,
+                .fflags = 0,
+                .data = 0,
+                .udata = 0,
+            }};
+            const ret = std.c.kevent(self.fd, &changes, @intCast(changes.len), @as([*]std.c.Kevent, @ptrCast(@constCast(&changes))), 0, null);
+            if (ret < 0) return error.Unexpected;
+        }
+    }
+
     pub fn wait(self: *EventLoop, out_events: []Event, timeout_ms: i32) !usize {
         if (out_events.len == 0) return 0;
 

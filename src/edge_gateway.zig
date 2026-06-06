@@ -390,10 +390,22 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         .state = &state,
         .tls = if (tls_terminator) |*tls| tls else null,
         .session_pool = undefined,
+        .event_loop = &event_loop,
+        .parked = undefined,
     };
     var session_pool = ConnectionSessionPool.init(state_allocator, &state.request_buffer_pool, cfg.connection_pool_size);
     defer session_pool.deinit();
     worker_ctx.session_pool = &session_pool;
+
+    // Registry of idle keepalive connections parked off the worker pool (#138).
+    // Its close hook releases the connection slot held since accept, so parked
+    // connections torn down by the reaper/drain are accounted correctly. The
+    // deinit (closeAll) runs before session_pool.deinit thanks to defer order.
+    var parked = http.keepalive_park.ParkedRegistry.init(state_allocator, &session_pool);
+    parked.close_hook = parkedConnectionCloseHook;
+    parked.close_hook_ctx = &state;
+    defer parked.deinit();
+    worker_ctx.parked = &parked;
 
     var worker_pool: http.worker_pool.WorkerPool = undefined;
     try worker_pool.init(
@@ -635,8 +647,19 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         var i: usize = 0;
         while (i < event_count) : (i += 1) {
             const ev = ready_events[i];
-            if (!ev.readable or ev.fd != listen_fd) continue;
-            acceptReadyConnections(listen_fd, &worker_pool, &state);
+            if (!ev.readable) continue;
+            if (ev.fd == listen_fd) {
+                acceptReadyConnections(listen_fd, &worker_pool, &state);
+            } else if (parked.resumeReady(ev.fd)) {
+                // A parked keepalive connection has a new request (or closed).
+                // Stop watching it and hand it to a worker, which serves one
+                // request and re-parks or closes. The connection slot acquired
+                // at accept stays held across the park/resume cycle.
+                event_loop.removeReadFd(ev.fd) catch {};
+                worker_pool.submit(ev.fd) catch {
+                    if (parked.checkout(ev.fd)) |pc| parked.closeSlot(pc, .@"error");
+                };
+            }
         }
 
         if (timer.consumeTick(http.event_loop.monotonicMs())) {
@@ -663,6 +686,9 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
             runDnsDiscoveryRefresh(current_cfg, &state);
             runProxyCacheMaintenance(current_cfg, &state);
             if (tls_terminator) |*tls| tls.runMaintenance(http.event_loop.monotonicMs());
+            // Close keepalive connections idle longer than the keepalive timeout
+            // while parked off the worker pool (#138).
+            _ = parked.reapIdle(http.event_loop.monotonicMs(), current_cfg.keep_alive_timeout_ms);
             const worker_snapshot = worker_pool.snapshot();
             state.metricsSetWorkerPoolStats(
                 worker_snapshot.active_jobs,
@@ -1166,20 +1192,81 @@ fn applyRuntimeIdentity(cfg: *const edge_config.EdgeConfig, logger: *const http.
 
 fn handleAcceptedClient(raw_ctx: *anyopaque, client_fd: std.posix.fd_t) void {
     const ctx: *WorkerContext = @ptrCast(@alignCast(raw_ctx));
-    defer ctx.state.releaseConnectionSlot(client_fd);
+
+    // Resume path (#138): the event loop dispatched a parked keepalive
+    // connection that became readable. Its session, TLS state, and connection
+    // slot are already established and owned by the parked registry.
+    if (ctx.parked.checkout(client_fd)) |pc| {
+        resumeParkedConnection(ctx, pc);
+        return;
+    }
+
+    startNewConnection(ctx, client_fd);
+}
+
+/// Outcome of serving one request on a keepalive HTTP/1.1 connection.
+const ServeOutcome = enum {
+    /// Buffered (pipelined) data is already available; serve another request now.
+    serve_again,
+    /// Connection is idle and keep-alive; park it off the worker pool.
+    park,
+    /// Connection should be closed (no keep-alive, shutdown, max-requests, error).
+    close,
+};
+
+fn isTlsConnPtr(comptime T: type) bool {
+    return T == *http.tls_termination.TlsConnection;
+}
+
+/// Serve exactly one HTTP/1.1 request on `conn` (a `*TlsConnection` or a
+/// plaintext `NetStream`), then decide what to do with the connection.
+fn serveOneRequest(
+    ctx: *WorkerContext,
+    conn: anytype,
+    session: *ConnectionSession,
+    connection_ip: []const u8,
+    served: *u32,
+    enable_proxy_protocol: bool,
+) ServeOutcome {
+    var keep_alive = false;
+    var live_cfg_lease = ctx.acquireConfig();
+    const live_cfg = live_cfg_lease.cfg;
+    handleConnection(conn, session, live_cfg, ctx.state, &keep_alive, connection_ip, enable_proxy_protocol) catch |err| {
+        live_cfg_lease.release();
+        ctx.state.logger.err(null, "edge connection error: {}", .{err});
+        return .close;
+    };
+    served.* += 1;
+    const max_requests_per_connection = live_cfg.max_requests_per_connection;
+    live_cfg_lease.release();
+
+    if (!keep_alive or http.shutdown.isShutdownRequested()) return .close;
+    if (max_requests_per_connection > 0 and served.* >= max_requests_per_connection) return .close;
+
+    // TLS may have already-decrypted pipelined bytes buffered inside OpenSSL; a
+    // socket-readiness event never fires for those, so serve them now. Plaintext
+    // pipelined bytes sit in the socket buffer and the level-triggered event loop
+    // re-fires immediately after parking, so no special case is needed there.
+    if (comptime isTlsConnPtr(@TypeOf(conn))) {
+        if (conn.pending() > 0) return .serve_again;
+    }
+    return .park;
+}
+
+fn startNewConnection(ctx: *WorkerContext, client_fd: std.posix.fd_t) void {
     const session = ctx.session_pool.acquire() catch |err| {
         ctx.state.logger.warn(null, "failed to acquire pooled connection session: {}", .{err});
+        ctx.state.releaseConnectionSlot(client_fd);
         _ = std.c.close(client_fd);
         return;
     };
-    defer {
-        if (session.pending_buf) |buf| {
-            ctx.state.request_buffer_pool.release(buf);
-            session.pending_buf = null;
-            session.pending_len = 0;
-        }
-    }
-    defer ctx.session_pool.release(session);
+
+    // Ownership of session/fd/TLS transfers to the parked registry on `park`.
+    // Until then, this teardown runs on every other exit (set `transferred` to
+    // skip it once ownership has moved).
+    var transferred = false;
+    var tls_to_park: ?http.tls_termination.TlsConnection = null;
+    defer if (!transferred) closeNewConnection(ctx, client_fd, session, tls_to_park);
 
     const owned_connection_ip = clientIpFromFd(ctx.state.allocator, client_fd) catch null;
     defer if (owned_connection_ip) |ip| ctx.state.allocator.free(ip);
@@ -1200,7 +1287,6 @@ fn handleAcceptedClient(raw_ctx: *anyopaque, client_fd: std.posix.fd_t) void {
 
     setNonBlocking(client_fd, false) catch |err| {
         ctx.state.logger.warn(null, "failed to switch client fd to blocking mode: {}", .{err});
-        _ = std.c.close(client_fd);
         return;
     };
 
@@ -1210,8 +1296,8 @@ fn handleAcceptedClient(raw_ctx: *anyopaque, client_fd: std.posix.fd_t) void {
 
     if (ctx.tls) |tls| {
         // Parse PROXY protocol header from the raw TCP socket before SSL_accept.
-        // The PROXY header is plaintext even on TLS connections and must be consumed
-        // before OpenSSL sees the TLS ClientHello.
+        // The PROXY header is plaintext even on TLS connections and must be
+        // consumed before OpenSSL sees the TLS ClientHello.
         if (cfg.proxy_protocol_mode != .off and !session.proxy_protocol_checked) {
             peekAndConsumeProxyHeaderFromRawFd(
                 client_fd,
@@ -1220,7 +1306,6 @@ fn handleAcceptedClient(raw_ctx: *anyopaque, client_fd: std.posix.fd_t) void {
                 &session.proxy_client_ip_len,
             ) catch |err| {
                 ctx.state.logger.warn(null, "proxy protocol parse failed on TLS connection: {}", .{err});
-                _ = std.c.close(client_fd);
                 return;
             };
             session.proxy_protocol_checked = true;
@@ -1232,13 +1317,15 @@ fn handleAcceptedClient(raw_ctx: *anyopaque, client_fd: std.posix.fd_t) void {
             } else {
                 ctx.state.logger.warn(null, "tls handshake error: {}", .{err});
             }
-            _ = std.c.close(client_fd);
             return;
         };
-        defer tls_conn.deinit();
-        defer _ = std.c.close(client_fd);
+        // The TLS object now needs teardown on every exit; record it so the
+        // teardown defer (or a failed park) frees it exactly once.
+        tls_to_park = tls_conn;
 
         if (tls_conn.negotiatedProtocol() == .http2 and cfg.http2_enabled) {
+            // HTTP/2 multiplexes many streams over one connection internally and
+            // is not parked (out of scope for #138); the teardown defer closes it.
             handleHttp2Connection(&tls_conn, session, cfg, ctx.state, connection_ip) catch |err| {
                 ctx.state.logger.err(null, "http2 connection error: {}", .{err});
             };
@@ -1246,50 +1333,118 @@ fn handleAcceptedClient(raw_ctx: *anyopaque, client_fd: std.posix.fd_t) void {
         }
 
         var served: u32 = 0;
-        while (true) {
-            var live_cfg_lease = ctx.acquireConfig();
-            const live_cfg = live_cfg_lease.cfg;
-            var keep_alive = false;
-            handleConnection(&tls_conn, session, live_cfg, ctx.state, &keep_alive, connection_ip, false) catch |err| {
-                live_cfg_lease.release();
-                ctx.state.logger.err(null, "edge connection error: {}", .{err});
-                break;
-            };
-            served += 1;
-            const max_requests_per_connection = live_cfg.max_requests_per_connection;
-            live_cfg_lease.release();
-            if (http.shutdown.isShutdownRequested()) break;
-            if (!keep_alive) break;
-            if (max_requests_per_connection > 0 and served >= max_requests_per_connection) break;
-        }
-        if (served == cfg.max_requests_per_connection and cfg.max_requests_per_connection > 0) {
-            ctx.state.logger.debug(null, "closing connection after max requests per connection reached ({d})", .{cfg.max_requests_per_connection});
-        }
+        while (true) switch (serveOneRequest(ctx, &tls_conn, session, connection_ip, &served, false)) {
+            .serve_again => {},
+            .park => {
+                transferred = true;
+                parkConnection(ctx, client_fd, session, tls_conn, served, connection_ip);
+                return;
+            },
+            .close => return,
+        };
     } else {
         const stream = compat.netStreamFromFd(client_fd);
-        defer stream.close();
-
         var served: u32 = 0;
-        while (true) {
-            var live_cfg_lease = ctx.acquireConfig();
-            const live_cfg = live_cfg_lease.cfg;
-            var keep_alive = false;
-            handleConnection(stream, session, live_cfg, ctx.state, &keep_alive, connection_ip, true) catch |err| {
-                live_cfg_lease.release();
-                ctx.state.logger.err(null, "edge connection error: {}", .{err});
-                break;
-            };
-            served += 1;
-            const max_requests_per_connection = live_cfg.max_requests_per_connection;
-            live_cfg_lease.release();
-            if (http.shutdown.isShutdownRequested()) break;
-            if (!keep_alive) break;
-            if (max_requests_per_connection > 0 and served >= max_requests_per_connection) break;
-        }
-        if (served == cfg.max_requests_per_connection and cfg.max_requests_per_connection > 0) {
-            ctx.state.logger.debug(null, "closing connection after max requests per connection reached ({d})", .{cfg.max_requests_per_connection});
-        }
+        while (true) switch (serveOneRequest(ctx, stream, session, connection_ip, &served, true)) {
+            .serve_again => {},
+            .park => {
+                transferred = true;
+                parkConnection(ctx, client_fd, session, null, served, connection_ip);
+                return;
+            },
+            .close => return,
+        };
     }
+}
+
+fn resumeParkedConnection(ctx: *WorkerContext, pc: *http.keepalive_park.ParkedConnection) void {
+    var served = pc.served;
+    if (pc.tls) |*tls_conn| {
+        while (true) switch (serveOneRequest(ctx, tls_conn, pc.session, pc.ip(), &served, false)) {
+            .serve_again => {},
+            .park => {
+                pc.served = served;
+                reparkConnection(ctx, pc);
+                return;
+            },
+            .close => {
+                ctx.parked.closeSlot(pc, .peer);
+                return;
+            },
+        };
+    } else {
+        const stream = compat.netStreamFromFd(pc.fd);
+        while (true) switch (serveOneRequest(ctx, stream, pc.session, pc.ip(), &served, false)) {
+            .serve_again => {},
+            .park => {
+                pc.served = served;
+                reparkConnection(ctx, pc);
+                return;
+            },
+            .close => {
+                ctx.parked.closeSlot(pc, .peer);
+                return;
+            },
+        };
+    }
+}
+
+/// Tear down a connection that was never parked: TLS shutdown, socket close,
+/// pooled-session release, and connection-slot release. Mirrors the registry's
+/// teardown so a connection is accounted identically whichever path closes it.
+fn closeNewConnection(
+    ctx: *WorkerContext,
+    fd: std.posix.fd_t,
+    session: *ConnectionSession,
+    tls_conn: ?http.tls_termination.TlsConnection,
+) void {
+    if (tls_conn) |t| {
+        var tt = t;
+        tt.deinit();
+    }
+    _ = std.c.close(fd);
+    ctx.session_pool.release(session);
+    ctx.state.releaseConnectionSlot(fd);
+}
+
+/// Park a freshly-idle new connection off the worker pool and arm the event
+/// loop. On any failure the connection is fully closed.
+fn parkConnection(
+    ctx: *WorkerContext,
+    fd: std.posix.fd_t,
+    session: *ConnectionSession,
+    tls_conn: ?http.tls_termination.TlsConnection,
+    served: u32,
+    connection_ip: []const u8,
+) void {
+    const now = http.event_loop.monotonicMs();
+    ctx.parked.parkNew(fd, session, tls_conn, served, connection_ip, now) catch {
+        closeNewConnection(ctx, fd, session, tls_conn);
+        return;
+    };
+    ctx.event_loop.addReadFd(fd) catch {
+        if (ctx.parked.checkout(fd)) |pc| ctx.parked.closeSlot(pc, .@"error");
+    };
+}
+
+/// Re-park a connection a worker just finished serving on resume, reusing its
+/// existing slot. On any failure the connection is fully closed.
+fn reparkConnection(ctx: *WorkerContext, pc: *http.keepalive_park.ParkedConnection) void {
+    const now = http.event_loop.monotonicMs();
+    ctx.parked.repark(pc, now) catch {
+        ctx.parked.closeSlot(pc, .@"error");
+        return;
+    };
+    ctx.event_loop.addReadFd(pc.fd) catch {
+        if (ctx.parked.checkout(pc.fd)) |taken| ctx.parked.closeSlot(taken, .@"error");
+    };
+}
+
+/// Registry teardown hook: release the connection slot held since accept when a
+/// parked connection is finally closed (resume-close, idle reap, or drain).
+fn parkedConnectionCloseHook(raw_state: *anyopaque, fd: std.posix.fd_t) void {
+    const state: *GatewayState = @ptrCast(@alignCast(raw_state));
+    state.releaseConnectionSlot(fd);
 }
 
 fn clientIpKeyFromAddress(allocator: std.mem.Allocator, address: *const std.c.sockaddr.storage) ![]const u8 {

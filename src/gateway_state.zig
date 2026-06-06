@@ -2227,6 +2227,11 @@ pub const WorkerContext = struct {
     state: *GatewayState,
     tls: ?*http.tls_termination.TlsTerminator,
     session_pool: *ConnectionSessionPool,
+    /// Event loop used to (un)watch idle keepalive connections (#138). A worker
+    /// re-arms a parked fd here; the loop thread dispatches it back on readiness.
+    event_loop: *http.event_loop.EventLoop,
+    /// Registry of idle keepalive connections parked off the worker pool (#138).
+    parked: *http.keepalive_park.ParkedRegistry,
 
     pub fn acquireConfig(self: *WorkerContext) ConfigLease {
         return self.config_store.acquire();

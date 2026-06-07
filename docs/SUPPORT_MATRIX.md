@@ -46,7 +46,7 @@ surfaces that should not be marketed as generic operator-facing capabilities.
 | --- | --- | --- | --- |
 | HTTP/1.1 request parsing and response writing | `src/http.zig` core exports: `method`, `version`, `headers`, `request`, `response`, `status` | `stable` | This is the default runtime contract and the primary benchmark/release path. |
 | Static file serving | `static_file`, `autoindex`, `etag`, `range` | `stable` | Covered by public docs and integration tests for path normalization, ranges, cache validation, and symlink safety. |
-| Reverse proxying and config-driven routing | `location_router`, `rewrite`, `request_context`, `config_file`; README `server` / `location` examples | `stable` | Core HTTP/1.1 reverse-proxy path and route matching are part of the product identity. |
+| Reverse proxying and config-driven routing | `location_router`, `rewrite`, `request_context`, `config_file`; README `server` / `location` examples; `TARDIGRADE_PROXY_STREAMING_MODE` | `stable` | Core HTTP/1.1 reverse-proxy path, route matching, and opt-in bounded streaming policy are part of the product identity. |
 | TLS termination | `tls_termination` | `stable` | Core public edge capability with operator docs, config knobs, and release validation. |
 | Config loading and validation | `config_file`; `tardigrade validate`; README config examples | `stable` | Part of the operator workflow and startup contract. |
 | Hot reload and graceful drain | runtime reload path, drain behavior, `shutdown` | `stable` | Public CLI/runtime behavior; documented and integration-tested. |

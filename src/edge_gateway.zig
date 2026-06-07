@@ -17,6 +17,7 @@ const gaccept = @import("gateway_accept.zig");
 const gconn = @import("gateway_connection.zig");
 const gshutdown = @import("gateway_shutdown.zig");
 const ghandlers = @import("gateway_handlers.zig");
+const gproxy_runtime = @import("gateway_proxy_runtime.zig");
 const gp = @import("gateway_proxy.zig");
 const ga = @import("gateway_auth.zig");
 
@@ -1041,6 +1042,75 @@ fn readExactConn(conn: anytype, out: []u8) !void {
     }
 }
 
+fn parseRequestErrorStatus(err: anyerror) http.Status {
+    return switch (err) {
+        error.HeadersTooLarge, error.HeaderTooLarge, error.TooManyHeaders => .request_header_fields_too_large,
+        error.BodyTooLarge => .payload_too_large,
+        error.ConflictingHeaders, error.InvalidChunkedBody => .bad_request,
+        else => .bad_request,
+    };
+}
+
+fn isHttpUrl(raw: []const u8) bool {
+    return std.mem.startsWith(u8, raw, "http://") or std.mem.startsWith(u8, raw, "https://");
+}
+
+fn targetSupportsStdHttpStreaming(cfg: *const edge_config.EdgeConfig, target: []const u8) bool {
+    const trimmed = std.mem.trim(u8, target, " \t\r\n");
+    if (trimmed.len == 0) return false;
+    if (gp.unixSocketPathFromEndpoint(trimmed) != null) return false;
+    if (isHttpUrl(trimmed)) {
+        return !(cfg.upstream_tls_client_cert.len > 0 and std.mem.startsWith(u8, trimmed, "https://"));
+    }
+    if (gp.unixSocketPathFromEndpoint(cfg.upstream_base_url) != null) return false;
+    return !(cfg.upstream_tls_client_cert.len > 0 and std.mem.startsWith(u8, cfg.upstream_base_url, "https://"));
+}
+
+fn streamingUploadAllowedBeforeBodyRead(
+    cfg: *const edge_config.EdgeConfig,
+    request: *const http.Request,
+) bool {
+    if (!cfg.proxy_streaming_mode.requestStreamingEnabled()) return false;
+    if (!request.method.hasRequestBody()) return false;
+    if (request.hasTransferEncoding()) return false;
+    const content_length = request.contentLength() orelse return false;
+    if (content_length == 0) return false;
+    if (content_length > cfg.request_limits.effectiveMaxBodySize()) return false;
+
+    if (cfg.rewrite_rules.len > 0 or cfg.return_rules.len > 0 or
+        cfg.conditional_rules.len > 0 or cfg.internal_redirect_rules.len > 0 or
+        cfg.mirror_rules.len > 0 or cfg.auth_request_url.len > 0)
+    {
+        return false;
+    }
+    if (cfg.upstream_retry_attempts > 1) {
+        if (!cfg.upstream_retry_idempotent_only) return false;
+        if (request.method.isIdempotent()) return false;
+    }
+
+    const matched = http.location_router.matchLocation(request.uri.path, cfg.location_blocks) orelse return false;
+    return switch (matched.block.action) {
+        .proxy_pass => |target| targetSupportsStdHttpStreaming(cfg, target),
+        else => false,
+    };
+}
+
+fn streamingRequestBodyFromHead(
+    request: *const http.Request,
+    pending_buf: []const u8,
+    header_read: gconn.HttpRequestHeadRead,
+    bytes_consumed: usize,
+) ?gproxy_runtime.StreamingRequestBody {
+    const content_length = request.contentLength() orelse return null;
+    if (bytes_consumed > header_read.total_read) return null;
+    const available = header_read.total_read - bytes_consumed;
+    const initial_len = @min(available, content_length);
+    return .{
+        .content_length = content_length,
+        .initial_bytes = pending_buf[bytes_consumed .. bytes_consumed + initial_len],
+    };
+}
+
 fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge_config.EdgeConfig, state: *GatewayState, keep_alive_out: *bool, connection_ip: []const u8, enable_proxy_protocol: bool) !void {
     var keep_alive = false;
     keep_alive_out.* = false;
@@ -1077,43 +1147,85 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         session.proxy_protocol_checked = true;
     }
 
-    const total_read = try gconn.readHttpRequest(conn, pending_buf, &session.pending_len);
-    if (total_read == 0) return;
-    if (cfg.max_connection_memory_bytes > 0 and total_read > cfg.max_connection_memory_bytes) {
-        session.pending_len = 0;
-        try gp.sendApiError(allocator, conn.writer(), .payload_too_large, "invalid_request", "Connection memory limit exceeded", null, false, state);
-        return;
-    }
+    var streaming_request_body: ?gproxy_runtime.StreamingRequestBody = null;
+    var request: http.Request = undefined;
+    var request_initialized = false;
+    defer if (request_initialized) request.deinit();
 
-    const parse_result = http.Request.parse(allocator, pending_buf[0..total_read], MAX_REQUEST_SIZE) catch |err| {
-        // Return the appropriate status code so clients can distinguish parse
-        // failures: 431 for header-size/count violations, 413 for oversized
-        // body, 400 for everything else (malformed syntax, invalid method, etc.).
-        const status: http.status.Status = switch (err) {
-            error.HeadersTooLarge, error.HeaderTooLarge, error.TooManyHeaders => .request_header_fields_too_large,
-            error.BodyTooLarge => .payload_too_large,
-            // ConflictingHeaders and InvalidChunkedBody are 400 — explicit mapping
-            // here documents the intent (no request smuggling vector).
-            error.ConflictingHeaders, error.InvalidChunkedBody => .bad_request,
-            else => .bad_request,
+    if (cfg.proxy_streaming_mode.requestStreamingEnabled()) {
+        const head_read = try gconn.readHttpRequestHead(conn, pending_buf, &session.pending_len);
+        if (head_read.total_read == 0) return;
+        if (cfg.max_connection_memory_bytes > 0 and head_read.total_read > cfg.max_connection_memory_bytes) {
+            session.pending_len = 0;
+            try gp.sendApiError(allocator, conn.writer(), .payload_too_large, "invalid_request", "Connection memory limit exceeded", null, false, state);
+            return;
+        }
+        var head_parse = http.Request.parseHead(allocator, pending_buf[0..head_read.header_len], MAX_REQUEST_SIZE) catch |err| {
+            try gp.sendApiError(allocator, conn.writer(), parseRequestErrorStatus(err), "invalid_request", "Malformed request", null, keep_alive, state);
+            state.logger.warn(null, "parse error: {}", .{err});
+            return;
         };
-        try gp.sendApiError(allocator, conn.writer(), status, "invalid_request", "Malformed request", null, keep_alive, state);
-        state.logger.warn(null, "parse error: {}", .{err});
-        return;
-    };
-    const bytes_consumed = parse_result.bytes_consumed;
-    if (bytes_consumed < total_read) {
-        const remaining = total_read - bytes_consumed;
-        std.mem.copyForwards(u8, pending_buf[0..remaining], pending_buf[bytes_consumed..total_read]);
-        session.pending_len = remaining;
+        var pre_effective_cfg_storage = cfg.*;
+        const pre_effective_cfg = ga.resolveRequestConfig(cfg, head_parse.request.headers.get("host"), &pre_effective_cfg_storage) orelse cfg;
+        if (streamingUploadAllowedBeforeBodyRead(pre_effective_cfg, &head_parse.request)) {
+            streaming_request_body = streamingRequestBodyFromHead(&head_parse.request, pending_buf, head_read, head_parse.bytes_consumed);
+            request = head_parse.request;
+            request_initialized = true;
+            session.pending_len = 0;
+        } else {
+            head_parse.request.deinit();
+            const total_read = try gconn.readHttpRequest(conn, pending_buf, &session.pending_len);
+            if (total_read == 0) return;
+            if (cfg.max_connection_memory_bytes > 0 and total_read > cfg.max_connection_memory_bytes) {
+                session.pending_len = 0;
+                try gp.sendApiError(allocator, conn.writer(), .payload_too_large, "invalid_request", "Connection memory limit exceeded", null, false, state);
+                return;
+            }
+            const parse_result = http.Request.parse(allocator, pending_buf[0..total_read], MAX_REQUEST_SIZE) catch |err| {
+                try gp.sendApiError(allocator, conn.writer(), parseRequestErrorStatus(err), "invalid_request", "Malformed request", null, keep_alive, state);
+                state.logger.warn(null, "parse error: {}", .{err});
+                return;
+            };
+            const bytes_consumed = parse_result.bytes_consumed;
+            if (bytes_consumed < total_read) {
+                const remaining = total_read - bytes_consumed;
+                std.mem.copyForwards(u8, pending_buf[0..remaining], pending_buf[bytes_consumed..total_read]);
+                session.pending_len = remaining;
+            } else {
+                session.pending_len = 0;
+            }
+            request = parse_result.request;
+            request_initialized = true;
+        }
     } else {
-        session.pending_len = 0;
-    }
+        const total_read = try gconn.readHttpRequest(conn, pending_buf, &session.pending_len);
+        if (total_read == 0) return;
+        if (cfg.max_connection_memory_bytes > 0 and total_read > cfg.max_connection_memory_bytes) {
+            session.pending_len = 0;
+            try gp.sendApiError(allocator, conn.writer(), .payload_too_large, "invalid_request", "Connection memory limit exceeded", null, false, state);
+            return;
+        }
 
-    var request = parse_result.request;
-    defer request.deinit();
+        const parse_result = http.Request.parse(allocator, pending_buf[0..total_read], MAX_REQUEST_SIZE) catch |err| {
+            try gp.sendApiError(allocator, conn.writer(), parseRequestErrorStatus(err), "invalid_request", "Malformed request", null, keep_alive, state);
+            state.logger.warn(null, "parse error: {}", .{err});
+            return;
+        };
+        const bytes_consumed = parse_result.bytes_consumed;
+        if (bytes_consumed < total_read) {
+            const remaining = total_read - bytes_consumed;
+            std.mem.copyForwards(u8, pending_buf[0..remaining], pending_buf[bytes_consumed..total_read]);
+            session.pending_len = remaining;
+        } else {
+            session.pending_len = 0;
+        }
+
+        request = parse_result.request;
+        request_initialized = true;
+    }
     const writer = conn.writer();
     keep_alive = request.keepAlive();
+    if (streaming_request_body != null) keep_alive = false;
     if (http.shutdown.isShutdownRequested()) keep_alive = false;
 
     // --- Correlation ID ---
@@ -1355,7 +1467,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         return;
     }
 
-    const route_status = try ghandlers.routeRequest(conn, allocator, effective_cfg, state, &ctx, &request, correlation_id, &keep_alive, client_ip);
+    const route_status = try ghandlers.routeRequest(conn, allocator, effective_cfg, state, &ctx, &request, correlation_id, &keep_alive, client_ip, streaming_request_body);
     ghandlers.logAccess(state, &ctx, request.method.toString(), request.uri.path, route_status, request.headers.get("user-agent") orelse "");
     return;
 }

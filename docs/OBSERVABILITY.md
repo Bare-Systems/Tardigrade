@@ -27,6 +27,16 @@ logs are written through `src/http/logger.zig`.
 - event-loop iterations
 - queue and connection rejections
 - upstream unhealthy backend count
+- reverse-proxy streaming and buffered request counters:
+  `tardigrade_proxy_streaming_requests_total` and
+  `tardigrade_proxy_buffered_requests_total`
+- reverse-proxy buffered byte gauges/counters:
+  `tardigrade_proxy_buffered_bytes_current` and
+  `tardigrade_proxy_buffered_bytes_total`
+- reverse-proxy abort counters:
+  `tardigrade_proxy_client_aborts_total` and
+  `tardigrade_proxy_upstream_aborts_total`
+- reverse-proxy upstream TTFB summary: `tardigrade_proxy_ttfb_ms`
 
 The latency histogram is intentionally global rather than route-labeled to keep
 hot-path overhead predictable.

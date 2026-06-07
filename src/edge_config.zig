@@ -37,6 +37,27 @@ pub const ProxyProtocolMode = enum {
     }
 };
 
+pub const ProxyStreamingMode = enum {
+    off,
+    response,
+    full,
+
+    pub fn parse(value: []const u8) ?ProxyStreamingMode {
+        if (std.ascii.eqlIgnoreCase(value, "off") or std.ascii.eqlIgnoreCase(value, "buffered")) return .off;
+        if (std.ascii.eqlIgnoreCase(value, "response") or std.ascii.eqlIgnoreCase(value, "responses")) return .response;
+        if (std.ascii.eqlIgnoreCase(value, "full") or std.ascii.eqlIgnoreCase(value, "request_response") or std.ascii.eqlIgnoreCase(value, "request-response")) return .full;
+        return null;
+    }
+
+    pub fn responseStreamingEnabled(self: ProxyStreamingMode) bool {
+        return self == .response or self == .full;
+    }
+
+    pub fn requestStreamingEnabled(self: ProxyStreamingMode) bool {
+        return self == .full;
+    }
+};
+
 pub const EdgeConfig = struct {
     pub const HealthStatusRange = struct {
         min: u16,
@@ -336,6 +357,10 @@ pub const EdgeConfig = struct {
     max_connection_memory_bytes: usize,
     /// Maximum buffered bytes accepted from an upstream HTTP response body.
     max_buffered_upstream_response_bytes: usize,
+    /// Proxy streaming policy for data-plane HTTP proxy routes.
+    proxy_streaming_mode: ProxyStreamingMode,
+    /// Maximum relay buffer used per direction for streaming proxy transfers.
+    proxy_stream_buffer_size: usize,
     /// Maximum estimated total connection memory across active clients (0 = unlimited).
     max_total_connection_memory_bytes: usize,
     /// Whether to stream all upstream statuses directly (including non-200) instead of mapping.
@@ -1077,6 +1102,11 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     defer allocator.free(max_buffered_upstream_resp_str);
     const max_buffered_upstream_response_bytes = std.fmt.parseInt(usize, max_buffered_upstream_resp_str, 10) catch 256 * 1024;
 
+    const proxy_streaming_mode_str = envOrDefault(allocator, "TARDIGRADE_PROXY_STREAMING_MODE", "off") catch unreachable;
+    defer allocator.free(proxy_streaming_mode_str);
+    const proxy_streaming_mode = ProxyStreamingMode.parse(proxy_streaming_mode_str) orelse .off;
+    const proxy_stream_buffer_size = parseIntEnv(usize, allocator, "TARDIGRADE_PROXY_STREAM_BUFFER_SIZE", 16 * 1024);
+
     const max_total_conn_mem_str = envOrDefault(allocator, "TARDIGRADE_MAX_TOTAL_CONNECTION_MEMORY_BYTES", "0") catch unreachable;
     defer allocator.free(max_total_conn_mem_str);
     const max_total_connection_memory_bytes = std.fmt.parseInt(usize, max_total_conn_mem_str, 10) catch 0;
@@ -1435,6 +1465,8 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .connection_pool_size = connection_pool_size,
         .max_connection_memory_bytes = max_connection_memory_bytes,
         .max_buffered_upstream_response_bytes = max_buffered_upstream_response_bytes,
+        .proxy_streaming_mode = proxy_streaming_mode,
+        .proxy_stream_buffer_size = proxy_stream_buffer_size,
         .max_total_connection_memory_bytes = max_total_connection_memory_bytes,
         .proxy_stream_all_statuses = proxy_stream_all_statuses,
         .upstream_retry_attempts = upstream_retry_attempts,
@@ -2444,6 +2476,10 @@ pub fn validate(cfg: *const EdgeConfig) !void {
         std.log.err("config validation failed: TARDIGRADE_MAX_BUFFERED_UPSTREAM_RESPONSE_BYTES must be at least 1", .{});
         return error.InvalidConfigValue;
     };
+    validateProxyStreamBufferSize(cfg.proxy_stream_buffer_size) catch {
+        std.log.err("config validation failed: TARDIGRADE_PROXY_STREAM_BUFFER_SIZE must be between 1 and 1048576 bytes", .{});
+        return error.InvalidConfigValue;
+    };
 }
 
 fn validateTlsCertKeyPair(cert_path: []const u8, key_path: []const u8) !void {
@@ -2468,6 +2504,10 @@ fn validateUpstreamRetryAttempts(attempts: u32) !void {
 
 fn validateBufferedUpstreamResponseLimit(limit: usize) !void {
     if (limit == 0) return error.InvalidConfigValue;
+}
+
+fn validateProxyStreamBufferSize(size: usize) !void {
+    if (size == 0 or size > 1024 * 1024) return error.InvalidConfigValue;
 }
 
 /// Emit log warnings for configurations that are valid but operationally risky.
@@ -2677,6 +2717,18 @@ test "parse proxy protocol mode aliases" {
     try std.testing.expectEqual(ProxyProtocolMode.v1, ProxyProtocolMode.parse("v1").?);
     try std.testing.expectEqual(ProxyProtocolMode.v2, ProxyProtocolMode.parse("v2").?);
     try std.testing.expect(ProxyProtocolMode.parse("unknown") == null);
+}
+
+test "parse proxy streaming mode aliases" {
+    try std.testing.expectEqual(ProxyStreamingMode.off, ProxyStreamingMode.parse("off").?);
+    try std.testing.expectEqual(ProxyStreamingMode.off, ProxyStreamingMode.parse("buffered").?);
+    try std.testing.expectEqual(ProxyStreamingMode.response, ProxyStreamingMode.parse("RESPONSE").?);
+    try std.testing.expectEqual(ProxyStreamingMode.full, ProxyStreamingMode.parse("request-response").?);
+    try std.testing.expect(ProxyStreamingMode.response.responseStreamingEnabled());
+    try std.testing.expect(!ProxyStreamingMode.response.requestStreamingEnabled());
+    try std.testing.expect(ProxyStreamingMode.full.responseStreamingEnabled());
+    try std.testing.expect(ProxyStreamingMode.full.requestStreamingEnabled());
+    try std.testing.expect(ProxyStreamingMode.parse("invalid") == null);
 }
 
 test "parse health status range" {
@@ -3020,4 +3072,12 @@ test "validate buffered upstream response limit rejects zero" {
     try validateBufferedUpstreamResponseLimit(256 * 1024);
     try validateBufferedUpstreamResponseLimit(1024 * 1024);
     try std.testing.expectError(error.InvalidConfigValue, validateBufferedUpstreamResponseLimit(0));
+}
+
+test "validate proxy stream buffer size rejects zero and oversized buffers" {
+    try validateProxyStreamBufferSize(1);
+    try validateProxyStreamBufferSize(16 * 1024);
+    try validateProxyStreamBufferSize(1024 * 1024);
+    try std.testing.expectError(error.InvalidConfigValue, validateProxyStreamBufferSize(0));
+    try std.testing.expectError(error.InvalidConfigValue, validateProxyStreamBufferSize(1024 * 1024 + 1));
 }

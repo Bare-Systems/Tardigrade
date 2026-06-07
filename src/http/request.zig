@@ -166,6 +166,79 @@ pub const Request = struct {
         };
     }
 
+    /// Parse only the request line and headers from raw bytes.
+    ///
+    /// This is used by streaming proxy paths that must route and authorize a
+    /// request before the full body has been read into memory. Header-level
+    /// smuggling checks are still enforced; the returned request never owns a
+    /// body and `bytes_consumed` points at the first body byte.
+    pub fn parseHead(allocator: Allocator, data: []const u8, max_body_size: usize) ParseError!struct { request: Request, bytes_consumed: usize } {
+        _ = max_body_size;
+        const request_line_end = std.mem.find(u8, data, "\r\n") orelse {
+            return error.InvalidRequestLine;
+        };
+
+        if (request_line_end > MAX_REQUEST_LINE_SIZE) {
+            return error.InvalidRequestLine;
+        }
+
+        const request_line = data[0..request_line_end];
+        const parsed_line = parseRequestLine(request_line) orelse {
+            return error.InvalidRequestLine;
+        };
+        const method = Method.parse(parsed_line.method) orelse {
+            return error.InvalidMethod;
+        };
+        const version = Version.parse(parsed_line.version) orelse {
+            return error.InvalidVersion;
+        };
+        const uri = parseUri(parsed_line.uri) orelse {
+            return error.InvalidUri;
+        };
+
+        const header_data = data[request_line_end + 2 ..];
+        const header_result = parseHeaders(allocator, header_data) catch |err| {
+            return switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => @as(ParseError, err),
+            };
+        };
+        var headers = header_result.headers;
+        errdefer headers.deinit();
+
+        const te_count = headers.countByName("transfer-encoding");
+        const cl_count = headers.countByName("content-length");
+        if (cl_count > 1 or te_count > 1) return error.ConflictingHeaders;
+        if (te_count > 0 and cl_count > 0) return error.ConflictingHeaders;
+        if (cl_count == 1) {
+            _ = std.fmt.parseInt(usize, headers.get("content-length").?, 10) catch {
+                return error.InvalidContentLength;
+            };
+        }
+        if (te_count == 1) {
+            const te_value = headers.get("transfer-encoding").?;
+            var is_chunked = false;
+            var it = std.mem.splitSequence(u8, te_value, ",");
+            while (it.next()) |token| {
+                const trimmed = std.mem.trim(u8, token, " \t");
+                if (std.ascii.eqlIgnoreCase(trimmed, "chunked")) is_chunked = true;
+            }
+            if (!is_chunked) return error.ConflictingHeaders;
+        }
+
+        return .{
+            .request = Request{
+                .allocator = allocator,
+                .method = method,
+                .uri = uri,
+                .version = version,
+                .headers = headers,
+                .body = null,
+            },
+            .bytes_consumed = request_line_end + 2 + header_result.body_start,
+        };
+    }
+
     /// Get the Host header value
     pub fn host(self: *const Request) ?[]const u8 {
         return self.headers.get("host");
@@ -180,6 +253,10 @@ pub const Request = struct {
     pub fn contentLength(self: *const Request) ?usize {
         const cl_str = self.headers.get("content-length") orelse return null;
         return std.fmt.parseInt(usize, cl_str, 10) catch null;
+    }
+
+    pub fn hasTransferEncoding(self: *const Request) bool {
+        return self.headers.get("transfer-encoding") != null;
     }
 
     /// Check if the client wants to keep the connection alive
@@ -333,6 +410,21 @@ test "parse POST with body" {
     try testing.expectEqualStrings("Hello, World!", req.body.?);
     try testing.expectEqualStrings("text/plain", req.contentType().?);
     try testing.expectEqual(@as(usize, 13), req.contentLength().?);
+}
+
+test "parseHead parses headers without requiring body bytes" {
+    const allocator = std.testing.allocator;
+    const raw = "POST /upload?x=1 HTTP/1.1\r\nHost: localhost\r\nContent-Length: 10485760\r\nContent-Type: application/octet-stream\r\n\r\nprefix";
+    const result = try Request.parseHead(allocator, raw, DEFAULT_MAX_BODY_SIZE);
+    var req = result.request;
+    defer req.deinit();
+
+    try std.testing.expectEqual(Method.POST, req.method);
+    try std.testing.expectEqualStrings("/upload", req.uri.path);
+    try std.testing.expectEqualStrings("x=1", req.uri.query.?);
+    try std.testing.expectEqual(@as(usize, 10485760), req.contentLength().?);
+    try std.testing.expect(req.body == null);
+    try std.testing.expectEqual(raw.len - "prefix".len, result.bytes_consumed);
 }
 
 test "parse all HTTP methods" {

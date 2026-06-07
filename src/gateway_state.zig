@@ -1258,6 +1258,36 @@ pub const GatewayState = struct {
         self.metrics.recordErrorCode(code);
     }
 
+    pub fn metricsRecordProxyStreamingRequest(self: *GatewayState, ttfb_ms: u64) void {
+        self.metrics_mutex.lock();
+        defer self.metrics_mutex.unlock();
+        self.metrics.recordProxyStreamingRequest(ttfb_ms);
+    }
+
+    pub fn metricsRecordProxyBufferedRequest(self: *GatewayState, buffered_bytes: usize, ttfb_ms: u64) void {
+        self.metrics_mutex.lock();
+        defer self.metrics_mutex.unlock();
+        self.metrics.recordProxyBufferedRequest(buffered_bytes, ttfb_ms);
+    }
+
+    pub fn metricsReleaseProxyBufferedBytes(self: *GatewayState, buffered_bytes: usize) void {
+        self.metrics_mutex.lock();
+        defer self.metrics_mutex.unlock();
+        self.metrics.releaseProxyBufferedBytes(buffered_bytes);
+    }
+
+    pub fn metricsRecordProxyClientAbort(self: *GatewayState) void {
+        self.metrics_mutex.lock();
+        defer self.metrics_mutex.unlock();
+        self.metrics.recordProxyClientAbort();
+    }
+
+    pub fn metricsRecordProxyUpstreamAbort(self: *GatewayState) void {
+        self.metrics_mutex.lock();
+        defer self.metrics_mutex.unlock();
+        self.metrics.recordProxyUpstreamAbort();
+    }
+
     pub fn metricsSetWorkerPoolStats(self: *GatewayState, active_jobs: usize, queued_jobs: usize, worker_threads: usize, queue_capacity: usize) void {
         self.metrics_mutex.lock();
         defer self.metrics_mutex.unlock();
@@ -1283,8 +1313,10 @@ pub const GatewayState = struct {
         const device_json_owned = try device_json.toOwnedSlice();
         defer allocator.free(device_json_owned);
 
-        return std.fmt.allocPrint(allocator,
-            \\{{"total_requests":{d},"status_2xx":{d},"status_3xx":{d},"status_4xx":{d},"status_5xx":{d},"uptime_seconds":{d},"active_connections":{d},"mux_connections":{d},"mux_subscriptions":{d},"mux_subscriptions_by_device":{s},"connection_rejections":{d},"queue_rejections":{d},"upstream_unhealthy_backends":{d},"request_latency_ms_count":{d},"request_latency_ms_sum":{d},"worker_active_jobs":{d},"worker_queued_jobs":{d},"worker_threads":{d},"worker_queue_capacity":{d},"error_invalid_request":{d},"error_unauthorized":{d},"error_rate_limited":{d},"error_upstream_timeout":{d},"error_upstream_unavailable":{d},"error_internal_error":{d},"error_overload":{d},"mux_frame_errors":{d}}}
+        var out = std.array_list.Managed(u8).init(allocator);
+        errdefer out.deinit();
+        try out.print(
+            \\{{"total_requests":{d},"status_2xx":{d},"status_3xx":{d},"status_4xx":{d},"status_5xx":{d},"uptime_seconds":{d},"active_connections":{d},"mux_connections":{d},"mux_subscriptions":{d},"mux_subscriptions_by_device":{s},"connection_rejections":{d},"queue_rejections":{d},"upstream_unhealthy_backends":{d},"proxy_streaming_requests_total":{d},"proxy_buffered_requests_total":{d},"proxy_buffered_bytes_current":{d},"proxy_buffered_bytes_total":{d},"proxy_client_aborts_total":{d},"proxy_upstream_aborts_total":{d},"proxy_ttfb_ms_count":{d},"proxy_ttfb_ms_sum":{d}
         , .{
             metrics_snapshot.total_requests,
             metrics_snapshot.status_2xx,
@@ -1299,6 +1331,18 @@ pub const GatewayState = struct {
             metrics_snapshot.connection_rejections,
             metrics_snapshot.queue_rejections,
             metrics_snapshot.upstream_unhealthy_backends,
+            metrics_snapshot.proxy_streaming_requests,
+            metrics_snapshot.proxy_buffered_requests,
+            metrics_snapshot.proxy_buffered_bytes_current,
+            metrics_snapshot.proxy_buffered_bytes_total,
+            metrics_snapshot.proxy_client_aborts,
+            metrics_snapshot.proxy_upstream_aborts,
+            metrics_snapshot.proxy_ttfb_ms_count,
+            metrics_snapshot.proxy_ttfb_ms_sum,
+        });
+        try out.print(
+            \\,"request_latency_ms_count":{d},"request_latency_ms_sum":{d},"worker_active_jobs":{d},"worker_queued_jobs":{d},"worker_threads":{d},"worker_queue_capacity":{d},"error_invalid_request":{d},"error_unauthorized":{d},"error_rate_limited":{d},"error_upstream_timeout":{d},"error_upstream_unavailable":{d},"error_internal_error":{d},"error_overload":{d},"mux_frame_errors":{d}}}
+        , .{
             metrics_snapshot.latency_count,
             metrics_snapshot.latency_sum_ms,
             metrics_snapshot.worker_active_jobs,
@@ -1314,6 +1358,7 @@ pub const GatewayState = struct {
             metrics_snapshot.err_overload,
             metrics_snapshot.mux_frame_errors,
         });
+        return out.toOwnedSlice();
     }
 
     pub fn metricsToPrometheus(self: *GatewayState, allocator: std.mem.Allocator) ![]u8 {

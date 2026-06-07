@@ -25,6 +25,15 @@ pub const Metrics = struct {
     queue_rejections: u64,
     /// Current number of upstream backends marked unhealthy.
     upstream_unhealthy_backends: u64,
+    /// Proxy transfer mode and buffering counters.
+    proxy_streaming_requests: u64,
+    proxy_buffered_requests: u64,
+    proxy_buffered_bytes_current: u64,
+    proxy_buffered_bytes_total: u64,
+    proxy_client_aborts: u64,
+    proxy_upstream_aborts: u64,
+    proxy_ttfb_ms_count: u64,
+    proxy_ttfb_ms_sum: u64,
     /// Request latency histogram bucket counts (milliseconds).
     latency_le_1ms: u64,
     latency_le_5ms: u64,
@@ -75,6 +84,14 @@ pub const Metrics = struct {
             .connection_rejections = 0,
             .queue_rejections = 0,
             .upstream_unhealthy_backends = 0,
+            .proxy_streaming_requests = 0,
+            .proxy_buffered_requests = 0,
+            .proxy_buffered_bytes_current = 0,
+            .proxy_buffered_bytes_total = 0,
+            .proxy_client_aborts = 0,
+            .proxy_upstream_aborts = 0,
+            .proxy_ttfb_ms_count = 0,
+            .proxy_ttfb_ms_sum = 0,
             .latency_le_1ms = 0,
             .latency_le_5ms = 0,
             .latency_le_10ms = 0,
@@ -153,6 +170,37 @@ pub const Metrics = struct {
 
     pub fn setUpstreamUnhealthyBackends(self: *Metrics, count: usize) void {
         self.upstream_unhealthy_backends = @intCast(count);
+    }
+
+    pub fn recordProxyStreamingRequest(self: *Metrics, ttfb_ms: u64) void {
+        self.proxy_streaming_requests += 1;
+        self.recordProxyTtfbMs(ttfb_ms);
+    }
+
+    pub fn recordProxyBufferedRequest(self: *Metrics, buffered_bytes: usize, ttfb_ms: u64) void {
+        const bytes: u64 = @intCast(buffered_bytes);
+        self.proxy_buffered_requests += 1;
+        self.proxy_buffered_bytes_current += bytes;
+        self.proxy_buffered_bytes_total += bytes;
+        self.recordProxyTtfbMs(ttfb_ms);
+    }
+
+    pub fn releaseProxyBufferedBytes(self: *Metrics, buffered_bytes: usize) void {
+        const bytes: u64 = @intCast(buffered_bytes);
+        self.proxy_buffered_bytes_current = if (bytes >= self.proxy_buffered_bytes_current) 0 else self.proxy_buffered_bytes_current - bytes;
+    }
+
+    pub fn recordProxyClientAbort(self: *Metrics) void {
+        self.proxy_client_aborts += 1;
+    }
+
+    pub fn recordProxyUpstreamAbort(self: *Metrics) void {
+        self.proxy_upstream_aborts += 1;
+    }
+
+    fn recordProxyTtfbMs(self: *Metrics, ttfb_ms: u64) void {
+        self.proxy_ttfb_ms_count += 1;
+        self.proxy_ttfb_ms_sum += ttfb_ms;
     }
 
     pub fn recordLatencyMs(self: *Metrics, latency_ms: i64) void {
@@ -290,6 +338,41 @@ pub const Metrics = struct {
         });
 
         try out.print(
+            \\# HELP tardigrade_proxy_streaming_requests_total Total proxied requests served through streaming mode
+            \\# TYPE tardigrade_proxy_streaming_requests_total counter
+            \\tardigrade_proxy_streaming_requests_total {d}
+            \\# HELP tardigrade_proxy_buffered_requests_total Total proxied requests served through bounded buffered mode
+            \\# TYPE tardigrade_proxy_buffered_requests_total counter
+            \\tardigrade_proxy_buffered_requests_total {d}
+            \\# HELP tardigrade_proxy_buffered_bytes_current Current response bytes retained by buffered proxy requests
+            \\# TYPE tardigrade_proxy_buffered_bytes_current gauge
+            \\tardigrade_proxy_buffered_bytes_current {d}
+            \\# HELP tardigrade_proxy_buffered_bytes_total Total response bytes retained by buffered proxy requests
+            \\# TYPE tardigrade_proxy_buffered_bytes_total counter
+            \\tardigrade_proxy_buffered_bytes_total {d}
+            \\# HELP tardigrade_proxy_client_aborts_total Total proxied transfers aborted by downstream clients
+            \\# TYPE tardigrade_proxy_client_aborts_total counter
+            \\tardigrade_proxy_client_aborts_total {d}
+            \\# HELP tardigrade_proxy_upstream_aborts_total Total proxied transfers aborted by upstream origins
+            \\# TYPE tardigrade_proxy_upstream_aborts_total counter
+            \\tardigrade_proxy_upstream_aborts_total {d}
+            \\# HELP tardigrade_proxy_ttfb_ms Proxied upstream time to first byte in milliseconds
+            \\# TYPE tardigrade_proxy_ttfb_ms summary
+            \\tardigrade_proxy_ttfb_ms_sum {d}
+            \\tardigrade_proxy_ttfb_ms_count {d}
+            \\
+        , .{
+            self.proxy_streaming_requests,
+            self.proxy_buffered_requests,
+            self.proxy_buffered_bytes_current,
+            self.proxy_buffered_bytes_total,
+            self.proxy_client_aborts,
+            self.proxy_upstream_aborts,
+            self.proxy_ttfb_ms_sum,
+            self.proxy_ttfb_ms_count,
+        });
+
+        try out.print(
             \\# HELP tardigrade_request_latency_ms Request latency histogram in milliseconds
             \\# TYPE tardigrade_request_latency_ms histogram
             \\tardigrade_request_latency_ms_bucket{{le="1"}} {d}
@@ -387,8 +470,10 @@ pub const Metrics = struct {
     /// Format metrics as a JSON string.
     /// Caller owns the returned memory.
     pub fn toJson(self: *const Metrics, allocator: std.mem.Allocator) ![]u8 {
-        return std.fmt.allocPrint(allocator,
-            \\{{"total_requests":{d},"status_2xx":{d},"status_3xx":{d},"status_4xx":{d},"status_5xx":{d},"uptime_seconds":{d},"active_connections":{d},"mux_connections":{d},"mux_subscriptions":{d},"connection_rejections":{d},"queue_rejections":{d},"upstream_unhealthy_backends":{d},"request_latency_ms_count":{d},"request_latency_ms_sum":{d},"worker_active_jobs":{d},"worker_queued_jobs":{d},"worker_threads":{d},"worker_queue_capacity":{d},"error_invalid_request":{d},"error_unauthorized":{d},"error_rate_limited":{d},"error_upstream_timeout":{d},"error_upstream_unavailable":{d},"error_internal_error":{d},"error_overload":{d},"mux_frame_errors":{d},"event_loop_iterations":{d},"health_probe_runs":{d}}}
+        var out = std.array_list.Managed(u8).init(allocator);
+        errdefer out.deinit();
+        try out.print(
+            \\{{"total_requests":{d},"status_2xx":{d},"status_3xx":{d},"status_4xx":{d},"status_5xx":{d},"uptime_seconds":{d},"active_connections":{d},"mux_connections":{d},"mux_subscriptions":{d},"connection_rejections":{d},"queue_rejections":{d},"upstream_unhealthy_backends":{d},"proxy_streaming_requests_total":{d},"proxy_buffered_requests_total":{d},"proxy_buffered_bytes_current":{d},"proxy_buffered_bytes_total":{d},"proxy_client_aborts_total":{d},"proxy_upstream_aborts_total":{d},"proxy_ttfb_ms_count":{d},"proxy_ttfb_ms_sum":{d}
         , .{
             self.total_requests,
             self.status_2xx,
@@ -402,6 +487,18 @@ pub const Metrics = struct {
             self.connection_rejections,
             self.queue_rejections,
             self.upstream_unhealthy_backends,
+            self.proxy_streaming_requests,
+            self.proxy_buffered_requests,
+            self.proxy_buffered_bytes_current,
+            self.proxy_buffered_bytes_total,
+            self.proxy_client_aborts,
+            self.proxy_upstream_aborts,
+            self.proxy_ttfb_ms_count,
+            self.proxy_ttfb_ms_sum,
+        });
+        try out.print(
+            \\,"request_latency_ms_count":{d},"request_latency_ms_sum":{d},"worker_active_jobs":{d},"worker_queued_jobs":{d},"worker_threads":{d},"worker_queue_capacity":{d},"error_invalid_request":{d},"error_unauthorized":{d},"error_rate_limited":{d},"error_upstream_timeout":{d},"error_upstream_unavailable":{d},"error_internal_error":{d},"error_overload":{d},"mux_frame_errors":{d},"event_loop_iterations":{d},"health_probe_runs":{d}}}
+        , .{
             self.latency_count,
             self.latency_sum_ms,
             self.worker_active_jobs,
@@ -419,6 +516,7 @@ pub const Metrics = struct {
             self.event_loop_iterations,
             self.health_probe_runs,
         });
+        return out.toOwnedSlice();
     }
 };
 
@@ -433,6 +531,8 @@ test "Metrics init starts at zero" {
     try std.testing.expectEqual(@as(u64, 0), m.mux_connections);
     try std.testing.expectEqual(@as(u64, 0), m.mux_subscriptions);
     try std.testing.expectEqual(@as(u64, 0), m.mux_frame_errors);
+    try std.testing.expectEqual(@as(u64, 0), m.proxy_streaming_requests);
+    try std.testing.expectEqual(@as(u64, 0), m.proxy_buffered_bytes_current);
 }
 
 test "Metrics recordRequest tracks status classes" {
@@ -469,6 +569,11 @@ test "Metrics tracks active connections and rejections" {
     m.recordQueueRejection();
     m.recordQueueRejection();
     m.recordMuxFrameError();
+    m.recordProxyStreamingRequest(12);
+    m.recordProxyBufferedRequest(128, 8);
+    m.releaseProxyBufferedBytes(64);
+    m.recordProxyClientAbort();
+    m.recordProxyUpstreamAbort();
 
     try std.testing.expectEqual(@as(u64, 7), m.active_connections);
     try std.testing.expectEqual(@as(u64, 2), m.mux_connections);
@@ -482,6 +587,14 @@ test "Metrics tracks active connections and rejections" {
     try std.testing.expectEqual(@as(u64, 1), m.connection_rejections);
     try std.testing.expectEqual(@as(u64, 2), m.queue_rejections);
     try std.testing.expectEqual(@as(u64, 1), m.mux_frame_errors);
+    try std.testing.expectEqual(@as(u64, 1), m.proxy_streaming_requests);
+    try std.testing.expectEqual(@as(u64, 1), m.proxy_buffered_requests);
+    try std.testing.expectEqual(@as(u64, 64), m.proxy_buffered_bytes_current);
+    try std.testing.expectEqual(@as(u64, 128), m.proxy_buffered_bytes_total);
+    try std.testing.expectEqual(@as(u64, 1), m.proxy_client_aborts);
+    try std.testing.expectEqual(@as(u64, 1), m.proxy_upstream_aborts);
+    try std.testing.expectEqual(@as(u64, 2), m.proxy_ttfb_ms_count);
+    try std.testing.expectEqual(@as(u64, 20), m.proxy_ttfb_ms_sum);
     m.setUpstreamUnhealthyBackends(3);
     try std.testing.expectEqual(@as(u64, 3), m.upstream_unhealthy_backends);
     m.recordErrorCode("invalid_request");
@@ -495,6 +608,8 @@ test "Metrics toPrometheus produces valid Prometheus text" {
     var m = Metrics.init();
     m.recordRequest(200);
     m.recordRequest(500);
+    m.recordProxyStreamingRequest(3);
+    m.recordProxyBufferedRequest(42, 4);
 
     const prom = try m.toPrometheus(allocator);
     defer allocator.free(prom);
@@ -508,6 +623,10 @@ test "Metrics toPrometheus produces valid Prometheus text" {
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_upstream_unhealthy_backends") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_request_latency_ms_bucket{le=\"1\"}") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_request_latency_ms_count") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_proxy_streaming_requests_total 1") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_proxy_buffered_requests_total 1") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_proxy_buffered_bytes_current 42") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_proxy_ttfb_ms_count 2") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_worker_active_jobs") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_worker_queued_jobs") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_error_invalid_request_total") != null);
@@ -520,6 +639,8 @@ test "Metrics toJson produces valid JSON" {
     var m = Metrics.init();
     m.recordRequest(200);
     m.recordRequest(404);
+    m.recordProxyStreamingRequest(5);
+    m.recordProxyBufferedRequest(17, 7);
 
     const json = try m.toJson(allocator);
     defer allocator.free(json);
@@ -531,6 +652,10 @@ test "Metrics toJson produces valid JSON" {
     try std.testing.expect(std.mem.find(u8, json, "\"connection_rejections\":0") != null);
     try std.testing.expect(std.mem.find(u8, json, "\"queue_rejections\":0") != null);
     try std.testing.expect(std.mem.find(u8, json, "\"upstream_unhealthy_backends\":0") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"proxy_streaming_requests_total\":1") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"proxy_buffered_requests_total\":1") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"proxy_buffered_bytes_current\":17") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"proxy_ttfb_ms_sum\":12") != null);
     try std.testing.expect(std.mem.find(u8, json, "\"request_latency_ms_count\":0") != null);
     try std.testing.expect(std.mem.find(u8, json, "\"request_latency_ms_sum\":0") != null);
     try std.testing.expect(std.mem.find(u8, json, "\"worker_active_jobs\":0") != null);

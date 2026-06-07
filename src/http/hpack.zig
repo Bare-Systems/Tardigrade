@@ -1,4 +1,5 @@
 const std = @import("std");
+const huffman = @import("hpack_huffman.zig");
 
 pub const HeaderField = struct {
     name: []const u8,
@@ -306,13 +307,13 @@ fn decodeInteger(buf: []const u8, idx: *usize, prefix_bits: u3) !usize {
 
 fn decodeStringAlloc(allocator: std.mem.Allocator, buf: []const u8, idx: *usize) ![]u8 {
     if (idx.* >= buf.len) return error.TruncatedHpack;
-    const huffman = (buf[idx.*] & 0x80) != 0;
-    if (huffman) return error.HuffmanUnsupported;
+    const is_huffman = (buf[idx.*] & 0x80) != 0;
     const len = try decodeInteger(buf, idx, 7);
     if (idx.* + len > buf.len) return error.TruncatedHpack;
-    const out = try allocator.dupe(u8, buf[idx.* .. idx.* + len]);
+    const raw = buf[idx.* .. idx.* + len];
     idx.* += len;
-    return out;
+    if (is_huffman) return huffman.decodeAlloc(allocator, raw);
+    return allocator.dupe(u8, raw);
 }
 
 fn encodeInteger(allocator: std.mem.Allocator, out: *std.ArrayList(u8), value: usize, prefix_bits: u3, first_prefix: u8) !void {

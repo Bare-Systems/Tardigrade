@@ -911,6 +911,16 @@ fn countOpenStreams(streams: *std.AutoHashMap(u31, http.http2_stream.Stream)) u3
     return count;
 }
 
+/// Duplicate `name` lowercased for use as an HTTP/2 header field name. The
+/// allocation is tracked in `owned` so the caller frees it after encoding.
+fn lowercaseName(allocator: std.mem.Allocator, owned: *std.array_list.Managed([]u8), name: []const u8) ![]const u8 {
+    const dup = try allocator.dupe(u8, name);
+    errdefer allocator.free(dup);
+    for (dup) |*c| c.* = std.ascii.toLower(c.*);
+    try owned.append(dup);
+    return dup;
+}
+
 fn respondHttp2Stream(
     writer: anytype,
     allocator: std.mem.Allocator,
@@ -953,13 +963,22 @@ fn respondHttp2Stream(
 
     var response_headers = std.array_list.Managed(http.hpack.HeaderField).init(allocator);
     defer response_headers.deinit();
+    // HTTP/2 header field names MUST be lowercase (RFC 7540 §8.1.2); a peer
+    // treats any uppercase octet as a malformed response. The pseudo-header and
+    // static names below are already lowercase, but correlation and operator-
+    // configured names may not be, so those are lowercased before encoding.
+    var lowered_names = std.array_list.Managed([]u8).init(allocator);
+    defer {
+        for (lowered_names.items) |n| allocator.free(n);
+        lowered_names.deinit();
+    }
     try response_headers.append(.{ .name = ":status", .value = status_str });
     try response_headers.append(.{ .name = "content-type", .value = content_type });
     try response_headers.append(.{ .name = "content-length", .value = len_str });
-    try response_headers.append(.{ .name = http.correlation.REQUEST_HEADER_NAME, .value = correlation_id });
-    try response_headers.append(.{ .name = http.correlation.HEADER_NAME, .value = correlation_id });
+    try response_headers.append(.{ .name = try lowercaseName(allocator, &lowered_names, http.correlation.REQUEST_HEADER_NAME), .value = correlation_id });
+    try response_headers.append(.{ .name = try lowercaseName(allocator, &lowered_names, http.correlation.HEADER_NAME), .value = correlation_id });
     for (state.add_headers) |h| {
-        try response_headers.append(.{ .name = h.name, .value = h.value });
+        try response_headers.append(.{ .name = try lowercaseName(allocator, &lowered_names, h.name), .value = h.value });
     }
 
     const header_block = try http.hpack.encodeLiteralHeaderBlock(allocator, response_headers.items);

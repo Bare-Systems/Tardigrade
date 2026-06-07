@@ -25,6 +25,17 @@ const corpus_cases = [_]CorpusCase{
     // TRACE globally with 405 before routing to prevent XST attacks
     // (RFC 7231 §4.3.8, ASVS-14.5.1).
     .{ .path = "tests/corpus/http/request/trace_method.http", .expected = .ok },
+    // Absolute-form request target (RFC 7230 §5.3.2): parser extracts the
+    // path component and discards the scheme/authority.  The Host header is
+    // still used for virtual-host routing.
+    .{ .path = "tests/corpus/http/request/absolute_form_request.http", .expected = .ok },
+    // Connection header naming custom hop-by-hop headers (RFC 7230 §6.1):
+    // parser accepts the request; the gateway layer strips the listed headers
+    // before forwarding to the upstream.
+    .{ .path = "tests/corpus/http/request/connection_custom_hop.http", .expected = .ok },
+    // Host with explicit port (RFC 7230 §5.4): valid syntax; port is stripped
+    // by the gateway when used for server-name matching.
+    .{ .path = "tests/corpus/http/request/host_with_port.http", .expected = .ok },
 };
 
 fn loadCorpusCase(allocator: std.mem.Allocator, path: []const u8) ![]u8 {

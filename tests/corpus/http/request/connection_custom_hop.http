@@ -1,0 +1,7 @@
+GET /api/data HTTP/1.1
+Host: localhost
+Connection: X-Custom-Hop, Another-Hop
+X-Custom-Hop: client-value
+Another-Hop: client-value
+User-Agent: corpus
+

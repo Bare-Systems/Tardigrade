@@ -1349,3 +1349,255 @@ test "mapUpstreamError returns stable codes" {
     try std.testing.expectEqual(@as(u16, 503), mapped.status);
     try std.testing.expectEqualStrings("tool_unavailable", mapped.code);
 }
+
+// --- Hop-by-hop header filtering regression tests (RFC 7230 §6.1) ---
+
+test "shouldSkipUpstreamRequestHeader strips all standard hop-by-hop headers case-insensitively" {
+    const cases = [_][]const u8{
+        "Accept-Encoding", "accept-encoding", "ACCEPT-ENCODING",
+        "Connection",      "connection",      "CONNECTION",
+        "Content-Length",  "content-length",  "CONTENT-LENGTH",
+        "Host",            "host",            "HOST",
+        "Keep-Alive",      "keep-alive",      "KEEP-ALIVE",
+        "Proxy-Authenticate",
+        "Proxy-Authorization",
+        "Proxy-Connection",
+        "TE",              "te",
+        "Trailer",         "trailer",
+        "Transfer-Encoding", "transfer-encoding",
+        "Upgrade",         "upgrade",
+        "X-Forwarded-For", "x-forwarded-for",
+        "X-Forwarded-Host",
+        "X-Forwarded-Proto",
+        "X-Real-IP",       "x-real-ip",
+    };
+    for (cases) |name| {
+        try std.testing.expect(shouldSkipUpstreamRequestHeader(name, null));
+    }
+}
+
+test "shouldSkipUpstreamRequestHeader passes safe application headers" {
+    const pass_cases = [_][]const u8{
+        "Authorization",
+        "Accept",
+        "Content-Type",
+        "X-Custom-Header",
+        "traceparent",
+        "User-Agent",
+    };
+    for (pass_cases) |name| {
+        try std.testing.expect(!shouldSkipUpstreamRequestHeader(name, null));
+    }
+}
+
+test "connectionHeaderReferencesHeader handles whitespace around tokens" {
+    try std.testing.expect(connectionHeaderReferencesHeader("  X-Foo  ,  X-Bar  ", "X-Foo"));
+    try std.testing.expect(connectionHeaderReferencesHeader("  X-Foo  ,  X-Bar  ", "X-Bar"));
+    try std.testing.expect(connectionHeaderReferencesHeader("\tX-Foo\t,\tX-Bar\t", "x-foo"));
+    try std.testing.expect(!connectionHeaderReferencesHeader("X-Foo, X-Bar", "X-Baz"));
+}
+
+test "connectionHeaderReferencesHeader is case-insensitive" {
+    try std.testing.expect(connectionHeaderReferencesHeader("x-my-hop", "X-MY-HOP"));
+    try std.testing.expect(connectionHeaderReferencesHeader("X-MY-HOP", "x-my-hop"));
+    try std.testing.expect(connectionHeaderReferencesHeader("KEEP-ALIVE", "keep-alive"));
+}
+
+test "connectionHeaderReferencesHeader ignores empty tokens" {
+    try std.testing.expect(!connectionHeaderReferencesHeader(",,,", "X-Foo"));
+    try std.testing.expect(!connectionHeaderReferencesHeader("", "X-Foo"));
+    try std.testing.expect(connectionHeaderReferencesHeader(",X-Foo,", "X-Foo"));
+}
+
+test "shouldSkipUpstreamRequestHeader drops Connection-listed custom hop-by-hop headers" {
+    const conn = "X-Internal-State, X-Debug-Token";
+    try std.testing.expect(shouldSkipUpstreamRequestHeader("X-Internal-State", conn));
+    try std.testing.expect(shouldSkipUpstreamRequestHeader("x-debug-token", conn));
+    try std.testing.expect(!shouldSkipUpstreamRequestHeader("X-Safe-Header", conn));
+    try std.testing.expect(!shouldSkipUpstreamRequestHeader("Authorization", conn));
+}
+
+test "shouldSkipUpstreamResponseHeader strips all hop-by-hop and disclosure headers" {
+    const strip_cases = [_][]const u8{
+        "Connection", "connection", "CONNECTION",
+        "Keep-Alive", "keep-alive",
+        "Proxy-Connection",
+        "TE",         "te",
+        "Trailer",    "trailer",
+        "Transfer-Encoding", "transfer-encoding",
+        "Upgrade",    "upgrade",
+        "Content-Encoding", "content-encoding",
+        "Content-Length",   "content-length",
+        "Server",     "server",     "SERVER",
+        "X-Powered-By", "x-powered-by",
+    };
+    for (strip_cases) |name| {
+        try std.testing.expect(shouldSkipUpstreamResponseHeader(name));
+    }
+}
+
+test "shouldSkipUpstreamResponseHeader passes safe application response headers" {
+    const pass_cases = [_][]const u8{
+        "Content-Type",
+        "Cache-Control",
+        "Set-Cookie",
+        "Location",
+        "X-Custom-Response",
+        "ETag",
+        "Last-Modified",
+    };
+    for (pass_cases) |name| {
+        try std.testing.expect(!shouldSkipUpstreamResponseHeader(name));
+    }
+}
+
+// --- Forwarded header behavior tests ---
+
+test "buildForwardedFor handles empty incoming chain" {
+    const result = try buildForwardedFor(std.testing.allocator, "", "10.0.0.1");
+    try std.testing.expect(result.owned == null);
+    try std.testing.expectEqualStrings("10.0.0.1", result.value);
+}
+
+test "buildForwardedFor trims whitespace from existing chain" {
+    var result = try buildForwardedFor(std.testing.allocator, "  192.168.1.1  ", "10.0.0.1");
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("192.168.1.1, 10.0.0.1", result.value);
+}
+
+test "buildForwardedFor handles multi-hop chain" {
+    var result = try buildForwardedFor(std.testing.allocator, "1.2.3.4, 5.6.7.8", "9.10.11.12");
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("1.2.3.4, 5.6.7.8, 9.10.11.12", result.value);
+}
+
+// --- Upstream host trust boundary tests ---
+
+test "isTrustedUpstream returns true when trust is not required" {
+    const cfg = std.mem.zeroInit(edge_config.EdgeConfig, .{
+        .trust_require_upstream_identity = false,
+    });
+    try std.testing.expect(isTrustedUpstream(&cfg, "any-host.example.com"));
+    try std.testing.expect(isTrustedUpstream(&cfg, ""));
+}
+
+test "isTrustedUpstream matches host case-insensitively" {
+    var identities = [_][]const u8{"trusted.internal"};
+    const cfg = std.mem.zeroInit(edge_config.EdgeConfig, .{
+        .trust_require_upstream_identity = true,
+        .trusted_upstream_identities = identities[0..],
+    });
+    try std.testing.expect(isTrustedUpstream(&cfg, "trusted.internal"));
+    try std.testing.expect(isTrustedUpstream(&cfg, "TRUSTED.INTERNAL"));
+    try std.testing.expect(!isTrustedUpstream(&cfg, "untrusted.internal"));
+    try std.testing.expect(!isTrustedUpstream(&cfg, ""));
+}
+
+test "isTrustedUpstream strips port before matching" {
+    var identities = [_][]const u8{"trusted.internal"};
+    const cfg = std.mem.zeroInit(edge_config.EdgeConfig, .{
+        .trust_require_upstream_identity = true,
+        .trusted_upstream_identities = identities[0..],
+    });
+    try std.testing.expect(isTrustedUpstream(&cfg, "trusted.internal:8080"));
+    try std.testing.expect(!isTrustedUpstream(&cfg, "untrusted.internal:8080"));
+}
+
+test "stripPort handles bare hostname" {
+    try std.testing.expectEqualStrings("example.com", stripPort("example.com"));
+    try std.testing.expectEqualStrings("example.com", stripPort("example.com:443"));
+    try std.testing.expectEqualStrings("127.0.0.1", stripPort("127.0.0.1:8080"));
+    try std.testing.expectEqualStrings("", stripPort(""));
+}
+
+test "stripPort handles IPv6 addresses" {
+    try std.testing.expectEqualStrings("[::1]", stripPort("[::1]"));
+    try std.testing.expectEqualStrings("[::1]", stripPort("[::1]:8080"));
+    try std.testing.expectEqualStrings("[2001:db8::1]", stripPort("[2001:db8::1]:443"));
+}
+
+// --- Malformed upstream response handling tests ---
+
+test "parseBufferedUpstreamResponse handles response with no body" {
+    // The parser requires at least one header line so that headers_raw contains
+    // a newline (from which the status-line boundary is found).
+    var parsed = try parseBufferedUpstreamResponse(
+        std.testing.allocator,
+        "HTTP/1.1 204 No Content\r\nX-Accel-Buffering: no\r\n\r\n",
+    );
+    defer parsed.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 204), parsed.status_code);
+    try std.testing.expectEqualStrings("No Content", parsed.reason);
+    try std.testing.expectEqualStrings("", parsed.body);
+    try std.testing.expectEqualStrings("no", parsed.headerValue("X-Accel-Buffering").?);
+}
+
+test "parseBufferedUpstreamResponse strips hop-by-hop headers from upstream 5xx responses" {
+    var parsed = try parseBufferedUpstreamResponse(
+        std.testing.allocator,
+        "HTTP/1.1 502 Bad Gateway\r\n" ++
+            "Connection: close\r\n" ++
+            "Transfer-Encoding: chunked\r\n" ++
+            "Server: nginx/1.24.0\r\n" ++
+            "X-Powered-By: PHP/8.1\r\n" ++
+            "Content-Type: text/plain\r\n" ++
+            "\r\n" ++
+            "error",
+    );
+    defer parsed.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 502), parsed.status_code);
+    try std.testing.expect(parsed.headerValue("connection") == null);
+    try std.testing.expect(parsed.headerValue("transfer-encoding") == null);
+    try std.testing.expect(parsed.headerValue("server") == null);
+    try std.testing.expect(parsed.headerValue("x-powered-by") == null);
+    try std.testing.expectEqualStrings("text/plain", parsed.headerValue("content-type").?);
+}
+
+test "parseBufferedUpstreamResponse strips Content-Length from upstream (Tardigrade recalculates)" {
+    var parsed = try parseBufferedUpstreamResponse(
+        std.testing.allocator,
+        "HTTP/1.1 200 OK\r\n" ++
+            "Content-Length: 5\r\n" ++
+            "Content-Type: text/plain\r\n" ++
+            "\r\n" ++
+            "hello",
+    );
+    defer parsed.deinit(std.testing.allocator);
+    try std.testing.expect(parsed.headerValue("content-length") == null);
+    try std.testing.expectEqualStrings("text/plain", parsed.headerValue("content-type").?);
+    try std.testing.expectEqualStrings("hello", parsed.body);
+}
+
+test "parseBufferedUpstreamResponse handles upstream with missing reason phrase" {
+    var parsed = try parseBufferedUpstreamResponse(
+        std.testing.allocator,
+        "HTTP/1.1 200 \r\nContent-Type: text/plain\r\n\r\nbody",
+    );
+    defer parsed.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), parsed.status_code);
+    try std.testing.expectEqualStrings("body", parsed.body);
+}
+
+test "parseBufferedUpstreamResponse errors on empty response" {
+    try std.testing.expectError(
+        error.UpstreamProtocolError,
+        parseBufferedUpstreamResponse(std.testing.allocator, ""),
+    );
+}
+
+test "parseBufferedUpstreamResponse errors on truncated status line" {
+    try std.testing.expectError(
+        error.UpstreamProtocolError,
+        parseBufferedUpstreamResponse(std.testing.allocator, "HTTP/1.1 200"),
+    );
+}
+
+test "parseBufferedUpstreamResponse errors when header block is never terminated" {
+    try std.testing.expectError(
+        error.UpstreamProtocolError,
+        parseBufferedUpstreamResponse(
+            std.testing.allocator,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n",
+        ),
+    );
+}

@@ -76,7 +76,7 @@ jobs:
           ./scripts/release-metadata.sh notes > "$RUNNER_TEMP/release-notes/release-notes.md"
 
       - name: Upload release notes
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-notes
           path: ${{ runner.temp }}/release-notes/release-notes.md
@@ -165,7 +165,7 @@ jobs:
           subject-path: ${{ steps.archive_artifacts.outputs.archive_path }}
 
       - name: Upload archive artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ matrix.archive_name }}
           path: ${{ steps.archive_artifacts.outputs.archive_path }}
@@ -173,7 +173,7 @@ jobs:
           retention-days: 1
 
       - name: Upload SBOM artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: sbom-${{ matrix.archive_name }}
           path: ${{ steps.archive_artifacts.outputs.sbom_path }}
@@ -264,7 +264,7 @@ jobs:
           cp "$package" "$PACKAGE_PATH"
 
       - name: Upload DEB artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: tardigrade_${{ needs.prepare-release.outputs.version }}_${{ matrix.arch }}.deb
           path: ${{ steps.deb_artifacts.outputs.package_path }}
@@ -272,7 +272,7 @@ jobs:
           retention-days: 1
 
       - name: Upload DEB SBOM artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: sbom-tardigrade_${{ needs.prepare-release.outputs.version }}_${{ matrix.arch }}
           path: ${{ steps.deb_artifacts.outputs.sbom_path }}
@@ -366,7 +366,7 @@ jobs:
           cp "$package" "$PACKAGE_PATH"
 
       - name: Upload RPM artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: tardigrade-${{ needs.prepare-release.outputs.version }}-${{ matrix.arch }}.rpm
           path: ${{ steps.rpm_artifacts.outputs.package_path }}
@@ -374,7 +374,7 @@ jobs:
           retention-days: 1
 
       - name: Upload RPM SBOM artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: sbom-tardigrade-${{ needs.prepare-release.outputs.version }}-${{ matrix.arch }}.rpm
           path: ${{ steps.rpm_artifacts.outputs.sbom_path }}

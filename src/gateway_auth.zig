@@ -610,3 +610,54 @@ pub fn parseChatMessage(allocator: std.mem.Allocator, body: []const u8, max_len:
     if (message.len > max_len) return error.MessageTooLarge;
     return try allocator.dupe(u8, message);
 }
+
+test "parseChatMessage validates payload" {
+    const allocator = std.testing.allocator;
+    const message = try parseChatMessage(allocator, "{\"message\":\"hello\"}", 10);
+    defer allocator.free(message);
+    try std.testing.expectEqualStrings("hello", message);
+
+    try std.testing.expectError(error.MessageTooLarge, parseChatMessage(allocator, "{\"message\":\"hello\"}", 2));
+}
+
+test "routeRequiresApprovalRule detects approval requirement" {
+    try std.testing.expect(routeRequiresApprovalRule("POST", "/api/tasks", "POST|/api/tasks|ops|true||"));
+    try std.testing.expect(!routeRequiresApprovalRule("POST", "/api/messages", "POST|/api/tasks|ops|true||"));
+}
+
+test "evaluatePolicy bypasses approval management endpoints" {
+    const allocator = std.testing.allocator;
+    var headers = http.Headers.init(allocator);
+    defer headers.deinit();
+
+    var cfg = std.mem.zeroes(edge_config.EdgeConfig);
+    cfg.policy_approval_routes_raw = "POST|^/v1/commands$";
+
+    var state: GatewayState = undefined;
+    try std.testing.expect(evaluatePolicy(&state, &cfg, "POST", "/approvals/request", null, null, &headers) == null);
+    try std.testing.expect(evaluatePolicy(&state, &cfg, "POST", "/approvals/respond", null, null, &headers) == null);
+    try std.testing.expect(evaluatePolicy(&state, &cfg, "GET", "/approvals/status", null, null, &headers) == null);
+}
+
+test "parseApprovalResponseBody parses approve and deny" {
+    const allocator = std.testing.allocator;
+    var approve = try parseApprovalResponseBody(allocator, "{\"approval_token\":\"tok-1\",\"decision\":\"approve\"}");
+    defer approve.deinit(allocator);
+    try std.testing.expectEqualStrings("tok-1", approve.token);
+    try std.testing.expectEqual(ApprovalDecision.approve, approve.decision);
+
+    var deny = try parseApprovalResponseBody(allocator, "{\"approval_token\":\"tok-2\",\"decision\":\"deny\"}");
+    defer deny.deinit(allocator);
+    try std.testing.expectEqualStrings("tok-2", deny.token);
+    try std.testing.expectEqual(ApprovalDecision.deny, deny.decision);
+}
+
+test "parseApprovalRequestBody parses command scoped request" {
+    const allocator = std.testing.allocator;
+    var req = try parseApprovalRequestBody(allocator, "{\"method\":\"POST\",\"path\":\"/api/tasks\",\"command_id\":\"cmd-123\"}");
+    defer req.deinit(allocator);
+    try std.testing.expectEqualStrings("POST", req.method);
+    try std.testing.expectEqualStrings("/api/tasks", req.path);
+    try std.testing.expect(req.command_id != null);
+    try std.testing.expectEqualStrings("cmd-123", req.command_id.?);
+}

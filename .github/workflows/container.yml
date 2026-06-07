@@ -166,8 +166,12 @@ jobs:
             digest="$(cat "$digest_file")"
             refs+=("${IMAGE_NAME}@${digest}")
           done
+          tag_args=()
+          while IFS= read -r tag; do
+            tag_args+=("-t" "$tag")
+          done < <(jq -r '.tags[]' <<< "$DOCKER_METADATA_OUTPUT_JSON")
           docker buildx imagetools create \
-            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            "${tag_args[@]}" \
             "${refs[@]}"
 
       - name: Inspect manifest

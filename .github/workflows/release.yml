@@ -99,7 +99,7 @@ jobs:
             archive_name: tardigrade-linux-x86_64
           - os: ubuntu-24.04-arm
             archive_name: tardigrade-linux-aarch64
-          - os: macos-13
+          - os: macos-15-intel
             archive_name: tardigrade-darwin-x86_64
           - os: macos-14
             archive_name: tardigrade-darwin-arm64
@@ -129,9 +129,11 @@ jobs:
           set -euo pipefail
           artifact_dir="$RUNNER_TEMP/release-artifacts/$ARCHIVE_NAME"
           mkdir -p "$artifact_dir"
-          echo "artifact_dir=$artifact_dir" >> "$GITHUB_OUTPUT"
-          echo "archive_path=$artifact_dir/$ARCHIVE_NAME.tar.gz" >> "$GITHUB_OUTPUT"
-          echo "sbom_path=$artifact_dir/sbom-$ARCHIVE_NAME.spdx.json" >> "$GITHUB_OUTPUT"
+          {
+            echo "artifact_dir=$artifact_dir"
+            echo "archive_path=$artifact_dir/$ARCHIVE_NAME.tar.gz"
+            echo "sbom_path=$artifact_dir/sbom-$ARCHIVE_NAME.spdx.json"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Build release binary
         env:
@@ -234,9 +236,11 @@ jobs:
           set -euo pipefail
           artifact_dir="$RUNNER_TEMP/deb-artifacts/$ARCH"
           mkdir -p "$artifact_dir"
-          echo "artifact_dir=$artifact_dir" >> "$GITHUB_OUTPUT"
-          echo "package_path=$artifact_dir/tardigrade_${VERSION}_${ARCH}.deb" >> "$GITHUB_OUTPUT"
-          echo "sbom_path=$artifact_dir/sbom-tardigrade_${VERSION}_${ARCH}.spdx.json" >> "$GITHUB_OUTPUT"
+          {
+            echo "artifact_dir=$artifact_dir"
+            echo "package_path=$artifact_dir/tardigrade_${VERSION}_${ARCH}.deb"
+            echo "sbom_path=$artifact_dir/sbom-tardigrade_${VERSION}_${ARCH}.spdx.json"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Generate DEB SBOM
         uses: anchore/sbom-action@e11c554f704a0b820cbf8c51673f6945e0731532 # v0.20.0
@@ -334,9 +338,11 @@ jobs:
           set -euo pipefail
           artifact_dir="$RUNNER_TEMP/rpm-artifacts/$ARCH"
           mkdir -p "$artifact_dir"
-          echo "artifact_dir=$artifact_dir" >> "$GITHUB_OUTPUT"
-          echo "package_path=$artifact_dir/tardigrade-${VERSION}-${ARCH}.rpm" >> "$GITHUB_OUTPUT"
-          echo "sbom_path=$artifact_dir/sbom-tardigrade-${VERSION}-${ARCH}.rpm.spdx.json" >> "$GITHUB_OUTPUT"
+          {
+            echo "artifact_dir=$artifact_dir"
+            echo "package_path=$artifact_dir/tardigrade-${VERSION}-${ARCH}.rpm"
+            echo "sbom_path=$artifact_dir/sbom-tardigrade-${VERSION}-${ARCH}.rpm.spdx.json"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Generate RPM SBOM
         uses: anchore/sbom-action@e11c554f704a0b820cbf8c51673f6945e0731532 # v0.20.0

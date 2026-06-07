@@ -743,3 +743,39 @@ test "control-plane buffered response limit is explicit and bounded" {
     cfg.max_connection_memory_bytes = 512 * 1024;
     try std.testing.expectEqual(@as(usize, 512 * 1024), controlPlaneBufferedResponseLimit(&cfg));
 }
+
+test "buildProxyCacheKey supports template tokens" {
+    const allocator = std.testing.allocator;
+    const key = try buildProxyCacheKey(
+        allocator,
+        "method:path:identity:api_version",
+        "POST",
+        "/api/messages",
+        "{\"message\":\"hello\"}",
+        "identity-1",
+        2,
+    );
+    defer allocator.free(key);
+    try std.testing.expectEqualStrings("POST:/api/messages:identity-1:2", key);
+}
+
+test "buildProxyCacheKey falls back for unknown template tokens" {
+    const allocator = std.testing.allocator;
+    const payload = "{\"command\":\"list_tools\"}";
+    const key = try buildProxyCacheKey(
+        allocator,
+        "unknown:also_unknown",
+        "POST",
+        "/api/tasks",
+        payload,
+        null,
+        null,
+    );
+    defer allocator.free(key);
+
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(payload, &digest, .{});
+    const expected = try std.fmt.allocPrint(allocator, "POST:/api/tasks:{f}", .{compat.fmtSliceHexLower(&digest)});
+    defer allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, key);
+}

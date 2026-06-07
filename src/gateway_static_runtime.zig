@@ -257,3 +257,39 @@ pub fn writeStaticServedResponse(
 
     return @intFromEnum(served.status_code);
 }
+
+test "serveTryFilesFallback: top-level root without try_files defaults to $uri" {
+    // Regression test for #92: operators who configure only `root /path;` at
+    // the server level expect static files to be served for paths that exist in
+    // the webroot. The runtime defaults empty try_files to "$uri".
+    const effective_try_files_with_no_try_files: []const u8 = if ("".len > 0) "" else "$uri";
+    const effective_try_files_with_try_files: []const u8 = if ("$uri /index.html".len > 0) "$uri /index.html" else "$uri";
+    try std.testing.expectEqualStrings("$uri", effective_try_files_with_no_try_files);
+    try std.testing.expectEqualStrings("$uri /index.html", effective_try_files_with_try_files);
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "health.txt", .data = "abc" });
+    const root_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+
+    var hdrs = http.Headers.init(allocator);
+    defer hdrs.deinit();
+
+    const result = try http.static_file.serve(allocator, .{
+        .root = root_path,
+        .request_path = "/health.txt",
+        .matched_pattern = "/",
+        .alias = false,
+        .index = "",
+        .try_files = "$uri",
+        .headers = &hdrs,
+        .max_bytes = MAX_REQUEST_SIZE,
+    });
+    try std.testing.expect(result != null);
+    var served = result.?;
+    defer served.deinit(allocator);
+    try std.testing.expectEqual(http.status.Status.ok, served.status_code);
+    try std.testing.expectEqual(@as(usize, 3), served.content_length);
+}

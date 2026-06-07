@@ -33,6 +33,62 @@ const setRequestIdHeaders = gp.setRequestIdHeaders;
 const applyResponseHeaders = gp.applyResponseHeaders;
 const writeBufferedUpstreamResponse = gp.writeBufferedUpstreamResponse;
 
+pub const DataPlaneProxyResponse = union(enum) {
+    bounded_buffered: BufferedUpstreamResponse,
+
+    pub fn deinit(self: *DataPlaneProxyResponse, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .bounded_buffered => |*response| response.deinit(allocator),
+        }
+        self.* = undefined;
+    }
+
+    pub fn statusCode(self: *const DataPlaneProxyResponse) u16 {
+        return switch (self.*) {
+            .bounded_buffered => |*response| response.status_code,
+        };
+    }
+
+    pub fn bodyLen(self: *const DataPlaneProxyResponse) usize {
+        return switch (self.*) {
+            .bounded_buffered => |*response| response.body.len,
+        };
+    }
+
+    pub fn transcriptBody(self: *const DataPlaneProxyResponse) []const u8 {
+        return switch (self.*) {
+            .bounded_buffered => |*response| response.body,
+        };
+    }
+
+    pub fn contentTypeOr(self: *const DataPlaneProxyResponse, fallback: []const u8) []const u8 {
+        return switch (self.*) {
+            .bounded_buffered => |*response| response.headerValue("content-type") orelse fallback,
+        };
+    }
+
+    pub fn boundedBufferedForCompatibility(self: *const DataPlaneProxyResponse) *const BufferedUpstreamResponse {
+        return switch (self.*) {
+            .bounded_buffered => |*response| response,
+        };
+    }
+
+    pub fn writeHttp1(
+        self: *const DataPlaneProxyResponse,
+        writer: anytype,
+        keep_alive: bool,
+        correlation_id: []const u8,
+        security: *const http.security_headers.SecurityHeaders,
+        sticky_set_cookie: ?[]const u8,
+    ) !void {
+        switch (self.*) {
+            .bounded_buffered => |*response| {
+                try writeBufferedUpstreamResponse(writer, response, keep_alive, correlation_id, security, sticky_set_cookie);
+            },
+        }
+    }
+};
+
 /// The current data-plane HTTP/1 executor is a bounded-buffer compatibility
 /// path. It centralizes the call to the buffered transport helpers so #139 and
 /// #140 can replace this function with streaming/backpressure behavior without
@@ -58,9 +114,9 @@ pub fn executeBufferedDataPlaneProxyRequest(
     connect_timeout_ms: u32,
     response_timeout_ms: u32,
     cancel_token: ?*const http.cancellation.CancellationToken,
-) !BufferedUpstreamResponse {
+) !DataPlaneProxyResponse {
     if (cfg.upstream_tls_client_cert.len > 0 and std.mem.startsWith(u8, url, "https://")) {
-        return executeBoundedBufferedHttpsMtlsRequest(
+        return .{ .bounded_buffered = try executeBoundedBufferedHttpsMtlsRequest(
             allocator,
             url,
             method,
@@ -75,10 +131,10 @@ pub fn executeBufferedDataPlaneProxyRequest(
             auth_device_id,
             auth_scopes,
             cfg,
-        );
+        ) };
     }
 
-    return executeBoundedBufferedHttpProxyRequest(
+    return .{ .bounded_buffered = try executeBoundedBufferedHttpProxyRequest(
         allocator,
         client,
         cfg,
@@ -99,7 +155,7 @@ pub fn executeBufferedDataPlaneProxyRequest(
         connect_timeout_ms,
         response_timeout_ms,
         cancel_token,
-    );
+    ) };
 }
 
 pub fn dataPlaneBufferedCompatibilityResponseLimit(cfg: *const edge_config.EdgeConfig) usize {
@@ -418,7 +474,7 @@ pub fn handleLocationProxyPass(
     const budget_start_ms = http.event_loop.monotonicMs();
 
     var attempt: usize = 0;
-    var upstream_response: BufferedUpstreamResponse = while (attempt < max_attempts) : (attempt += 1) {
+    var upstream_response: DataPlaneProxyResponse = while (attempt < max_attempts) : (attempt += 1) {
         const per_attempt_timeout_ms: u32 = blk: {
             if (cfg.upstream_timeout_budget_ms == 0) break :blk cfg.upstream_timeout_ms;
             const elapsed_ms = http.event_loop.monotonicMs() - budget_start_ms;
@@ -482,9 +538,9 @@ pub fn handleLocationProxyPass(
             return @intFromEnum(err_status);
         };
         // Retry on 5xx only when attempts remain and the method allows it.
-        if (result.status_code >= 500 and attempt + 1 < max_attempts) {
+        if (result.statusCode() >= 500 and attempt + 1 < max_attempts) {
             state.recordUpstreamFailure(cfg, selection.base_url);
-            state.logger.warn(correlation_id, "proxy attempt {d}/{d} got {d}, retrying", .{ attempt + 1, max_attempts, result.status_code });
+            state.logger.warn(correlation_id, "proxy attempt {d}/{d} got {d}, retrying", .{ attempt + 1, max_attempts, result.statusCode() });
             var r = result;
             r.deinit(allocator);
             continue;
@@ -514,21 +570,21 @@ pub fn handleLocationProxyPass(
         client_ip,
         upstream_url.value,
         body,
-        upstream_response.status_code,
-        upstream_response.headerValue("content-type") orelse "application/octet-stream",
-        upstream_response.body,
+        upstream_response.statusCode(),
+        upstream_response.contentTypeOr("application/octet-stream"),
+        upstream_response.transcriptBody(),
         transcript_redactions,
     );
     if (!isAbsoluteHttpUrl(std.mem.trim(u8, target, " \t\r\n"))) {
-        if (upstream_response.status_code >= 500) {
+        if (upstream_response.statusCode() >= 500) {
             state.recordUpstreamFailure(cfg, selection.base_url);
         } else {
             state.recordUpstreamSuccess(cfg, selection.base_url);
         }
     }
-    ctx.setUpstreamResult(resolved.upstream_host, upstream_response.status_code, upstream_response.body.len);
-    try writeBufferedUpstreamResponse(writer, &upstream_response, keep_alive, correlation_id, &state.security_headers, sticky_set_cookie);
-    const status_code = upstream_response.status_code;
+    ctx.setUpstreamResult(resolved.upstream_host, upstream_response.statusCode(), upstream_response.bodyLen());
+    try upstream_response.writeHttp1(writer, keep_alive, correlation_id, &state.security_headers, sticky_set_cookie);
+    const status_code = upstream_response.statusCode();
     state.metricsRecord(status_code);
     return status_code;
 }
@@ -561,4 +617,26 @@ test "data-plane buffered compatibility response limit uses dedicated upstream c
 
     cfg.max_buffered_upstream_response_bytes = 768 * 1024;
     try std.testing.expectEqual(@as(usize, 768 * 1024), dataPlaneBufferedCompatibilityResponseLimit(&cfg));
+}
+
+test "data-plane response wrapper exposes bounded buffered metadata" {
+    const allocator = std.testing.allocator;
+    const body = try allocator.dupe(u8, "payload");
+    var upstream_headers = [_]gp.UpstreamHeader{
+        .{ .name = "Content-Type", .value = "text/plain" },
+    };
+
+    var response = DataPlaneProxyResponse{ .bounded_buffered = .{
+        .metadata_arena = std.heap.ArenaAllocator.init(allocator),
+        .status_code = 202,
+        .reason = "Accepted",
+        .headers = upstream_headers[0..],
+        .body = body,
+    } };
+    defer response.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u16, 202), response.statusCode());
+    try std.testing.expectEqual(@as(usize, body.len), response.bodyLen());
+    try std.testing.expectEqualStrings("payload", response.transcriptBody());
+    try std.testing.expectEqualStrings("text/plain", response.contentTypeOr("application/octet-stream"));
 }

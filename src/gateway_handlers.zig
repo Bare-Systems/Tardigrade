@@ -1027,17 +1027,18 @@ fn handleHttp3LocationProxyPass(
         null, // HTTP/3 path: no per-request lifecycle yet
     );
     defer upstream_response.deinit(allocator);
+    const buffered_response = upstream_response.boundedBufferedForCompatibility();
 
     _ = response
-        .setStatus(@enumFromInt(upstream_response.status_code))
-        .setBodyOwned(try allocator.dupe(u8, upstream_response.body))
+        .setStatus(@enumFromInt(buffered_response.status_code))
+        .setBodyOwned(try allocator.dupe(u8, buffered_response.body))
         .setHeader(http.correlation.HEADER_NAME, correlation_id);
-    for (upstream_response.headers) |header| {
+    for (buffered_response.headers) |header| {
         _ = response.setHeader(header.name, header.value);
     }
     finalizeHttp3Response(response);
     applyResponseHeaders(ctx.state, response);
-    ctx.state.metricsRecord(upstream_response.status_code);
+    ctx.state.metricsRecord(upstream_response.statusCode());
 }
 
 fn handleHttp3StaticLocation(

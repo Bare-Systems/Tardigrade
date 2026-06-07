@@ -11,6 +11,17 @@ const std = @import("std");
 const http = @import("http.zig");
 const edge_config = @import("edge_config.zig");
 const gs = @import("gateway_state.zig");
+const gph = @import("gateway_proxy_headers.zig");
+
+// Re-export the header-boundary API so existing callers that import from this
+// module continue to work without change.
+pub const MaybeOwnedBytes = gph.MaybeOwnedBytes;
+pub const buildForwardedFor = gph.buildForwardedFor;
+pub const isTrustedUpstream = gph.isTrustedUpstream;
+pub const appendTrustedUpstreamHeaders = gph.appendTrustedUpstreamHeaders;
+pub const appendRequestIdHeaders = gph.appendRequestIdHeaders;
+pub const writeRequestIdHeaders = gph.writeRequestIdHeaders;
+pub const setRequestIdHeaders = gph.setRequestIdHeaders;
 const GatewayState = gs.GatewayState;
 const maxBufferedUpstreamResponseBytes = gs.maxBufferedUpstreamResponseBytes;
 const isAbsoluteHttpUrl = gs.isAbsoluteHttpUrl;
@@ -99,7 +110,7 @@ pub fn parseBufferedUpstreamResponse(allocator: std.mem.Allocator, raw: []const 
         const colon = std.mem.findScalar(u8, line, ':') orelse continue;
         const hname = std.mem.trim(u8, line[0..colon], " \t");
         const hval = std.mem.trim(u8, line[colon + 1 ..], " \t");
-        if (shouldSkipUpstreamResponseHeader(hname)) continue;
+        if (gph.shouldSkipUpstreamResponseHeader(hname)) continue;
         try resp_headers.append(.{
             .name = try metadata_allocator.dupe(u8, hname),
             .value = try metadata_allocator.dupe(u8, hval),
@@ -285,7 +296,7 @@ pub fn executeBoundedBufferedHttpProxyRequest(
     const extra_headers_allocator = extra_headers_stack.get();
     const method_enum = std.meta.stringToEnum(std.http.Method, method) orelse return error.UnsupportedHttpMethod;
     const uri = try std.Uri.parse(url);
-    var forwarded_for = try buildForwardedFor(allocator, request_headers.get("x-forwarded-for"), client_ip);
+    var forwarded_for = try gph.buildForwardedFor(allocator, request_headers.get("x-forwarded-for"), client_ip);
     defer forwarded_for.deinit(allocator);
     var metadata_arena = std.heap.ArenaAllocator.init(allocator);
     errdefer metadata_arena.deinit();
@@ -294,8 +305,8 @@ pub fn executeBoundedBufferedHttpProxyRequest(
     var extra_headers = std.array_list.Managed(std.http.Header).init(extra_headers_allocator);
     defer extra_headers.deinit();
     try extra_headers.ensureUnusedCapacity(request_headers.count() + proxy_extra_header_slack);
-    try appendProxyRequestHeaders(&extra_headers, request_headers);
-    try appendRequestIdHeaders(&extra_headers, correlation_id);
+    try gph.appendProxyRequestHeaders(&extra_headers, request_headers);
+    try gph.appendRequestIdHeaders(&extra_headers, correlation_id);
     try extra_headers.append(.{ .name = "X-Forwarded-For", .value = forwarded_for.value });
     try extra_headers.append(.{ .name = "X-Real-IP", .value = client_ip });
     try extra_headers.append(.{ .name = "X-Forwarded-Proto", .value = forwarded_proto });
@@ -303,7 +314,7 @@ pub fn executeBoundedBufferedHttpProxyRequest(
         const trimmed = std.mem.trim(u8, value, " \t\r\n");
         if (trimmed.len > 0) try extra_headers.append(.{ .name = "X-Forwarded-Host", .value = trimmed });
     }
-    try appendAssertedIdentityHeaders(&extra_headers, auth_identity, auth_user_id, auth_device_id, auth_scopes);
+    try gph.appendAssertedIdentityHeaders(&extra_headers, auth_identity, auth_user_id, auth_device_id, auth_scopes);
     // W3C Trace Context: propagate inbound traceparent or originate a new one.
     // A child span is created from an inbound context so the trace ID is preserved
     // but each hop gets its own span ID.
@@ -372,7 +383,7 @@ pub fn executeBoundedBufferedHttpProxyRequest(
     try headers.ensureUnusedCapacity(8);
     var header_it = resp.head.iterateHeaders();
     while (header_it.next()) |header| {
-        if (shouldSkipUpstreamResponseHeader(header.name)) continue;
+        if (gph.shouldSkipUpstreamResponseHeader(header.name)) continue;
         try headers.append(.{
             .name = try metadata_allocator.dupe(u8, header.name),
             .value = try metadata_allocator.dupe(u8, header.value),
@@ -444,7 +455,7 @@ pub fn executeBoundedBufferedHttpsMtlsRequest(
         .raw => |path| if (path.len > 0) path else "/",
         .percent_encoded => |path| if (path.len > 0) path else "/",
     };
-    var forwarded_for = try buildForwardedFor(allocator, request_headers.get("x-forwarded-for"), client_ip);
+    var forwarded_for = try gph.buildForwardedFor(allocator, request_headers.get("x-forwarded-for"), client_ip);
     defer forwarded_for.deinit(allocator);
 
     var req_aw: std.Io.Writer.Allocating = .init(allocator);
@@ -454,7 +465,7 @@ pub fn executeBoundedBufferedHttpsMtlsRequest(
     try req_writer.print("Host: {s}\r\n", .{host});
     try req_writer.print("Connection: close\r\n", .{});
     if (body.len > 0) try req_writer.print("Content-Length: {d}\r\n", .{body.len});
-    try writeRequestIdHeaders(req_writer, correlation_id);
+    try gph.writeRequestIdHeaders(req_writer, correlation_id);
     try req_writer.print("X-Forwarded-For: {s}\r\n", .{forwarded_for.value});
     try req_writer.print("X-Real-IP: {s}\r\n", .{client_ip});
     try req_writer.print("X-Forwarded-Proto: {s}\r\n", .{forwarded_proto});
@@ -462,10 +473,10 @@ pub fn executeBoundedBufferedHttpsMtlsRequest(
         const trimmed = std.mem.trim(u8, h, " \t\r\n");
         if (trimmed.len > 0) try req_writer.print("X-Forwarded-Host: {s}\r\n", .{trimmed});
     }
-    try writeAssertedIdentityHeaders(req_writer, auth_identity, auth_user_id, auth_device_id, auth_scopes);
+    try gph.writeAssertedIdentityHeaders(req_writer, auth_identity, auth_user_id, auth_device_id, auth_scopes);
     const connection_header = request_headers.get("connection");
     for (request_headers.iterator()) |entry| {
-        if (shouldSkipUpstreamRequestHeader(entry.name, connection_header)) continue;
+        if (gph.shouldSkipUpstreamRequestHeader(entry.name, connection_header)) continue;
         try req_writer.print("{s}: {s}\r\n", .{ entry.name, entry.value });
     }
     // W3C Trace Context: originate when absent (inbound propagation happens via
@@ -504,47 +515,6 @@ pub fn applyResponseHeaders(state: *GatewayState, response: *http.Response) void
     }
 }
 
-pub fn appendAssertedIdentityHeaders(
-    headers: *std.array_list.Managed(std.http.Header),
-    auth_identity: ?[]const u8,
-    auth_user_id: ?[]const u8,
-    auth_device_id: ?[]const u8,
-    auth_scopes: ?[]const u8,
-) !void {
-    if (auth_identity) |identity| {
-        if (identity.len > 0) try headers.append(.{ .name = "X-Tardigrade-Auth-Identity", .value = identity });
-    }
-    if (auth_user_id) |user_id| {
-        if (user_id.len > 0) try headers.append(.{ .name = "X-Tardigrade-User-ID", .value = user_id });
-    }
-    if (auth_device_id) |device_id| {
-        if (device_id.len > 0) try headers.append(.{ .name = "X-Tardigrade-Device-ID", .value = device_id });
-    }
-    if (auth_scopes) |scopes| {
-        if (scopes.len > 0) try headers.append(.{ .name = "X-Tardigrade-Scopes", .value = scopes });
-    }
-}
-
-pub fn writeAssertedIdentityHeaders(
-    writer: anytype,
-    auth_identity: ?[]const u8,
-    auth_user_id: ?[]const u8,
-    auth_device_id: ?[]const u8,
-    auth_scopes: ?[]const u8,
-) !void {
-    if (auth_identity) |identity| {
-        if (identity.len > 0) try writer.print("X-Tardigrade-Auth-Identity: {s}\r\n", .{identity});
-    }
-    if (auth_user_id) |user_id| {
-        if (user_id.len > 0) try writer.print("X-Tardigrade-User-ID: {s}\r\n", .{user_id});
-    }
-    if (auth_device_id) |device_id| {
-        if (device_id.len > 0) try writer.print("X-Tardigrade-Device-ID: {s}\r\n", .{device_id});
-    }
-    if (auth_scopes) |scopes| {
-        if (scopes.len > 0) try writer.print("X-Tardigrade-Scopes: {s}\r\n", .{scopes});
-    }
-}
 
 pub fn writeStreamedUpstreamResponse(
     writer: anytype,
@@ -603,7 +573,7 @@ pub fn writeStreamedUpstreamResponseHead(
     try writer.writeAll("Connection: close\r\n");
     try writer.writeAll("Transfer-Encoding: chunked\r\n");
     try writer.print("Content-Type: {s}\r\n", .{content_type});
-    try writeRequestIdHeaders(writer, correlation_id);
+    try gph.writeRequestIdHeaders(writer, correlation_id);
     if (content_disposition) |cd| {
         try writer.print("Content-Disposition: {s}\r\n", .{cd});
     }
@@ -674,12 +644,12 @@ pub fn writeBufferedUpstreamResponseHead(
     try writer.print("Server: {s}\r\n", .{http.SERVER_NAME});
     try writer.print("Connection: {s}\r\n", .{if (keep_alive) "keep-alive" else "close"});
     try writer.print("Content-Length: {d}\r\n", .{upstream_response.body.len});
-    try writeRequestIdHeaders(writer, correlation_id);
+    try gph.writeRequestIdHeaders(writer, correlation_id);
     for (upstream_response.headers) |header| {
         // Defense-in-depth: skip any upstream header that should not be
         // forwarded even if parse-time filtering missed it (e.g. headers
         // populated through a code path that bypasses shouldSkipUpstreamResponseHeader).
-        if (shouldSkipUpstreamResponseHeader(header.name)) continue;
+        if (gph.shouldSkipUpstreamResponseHeader(header.name)) continue;
         try writer.print("{s}: {s}\r\n", .{ header.name, header.value });
     }
     if (sticky_set_cookie) |cookie| {
@@ -691,76 +661,6 @@ pub fn writeBufferedUpstreamResponseHead(
     try writer.writeAll("\r\n");
 }
 
-pub fn appendProxyRequestHeaders(
-    extra_headers: *std.array_list.Managed(std.http.Header),
-    request_headers: *const http.Headers,
-) !void {
-    const connection_header = request_headers.get("connection");
-    for (request_headers.iterator()) |header| {
-        if (shouldSkipUpstreamRequestHeader(header.name, connection_header)) continue;
-        try extra_headers.append(.{ .name = header.name, .value = header.value });
-    }
-}
-
-pub fn shouldSkipUpstreamRequestHeader(name: []const u8, connection_header: ?[]const u8) bool {
-    // Strip inbound X-Tardigrade-* headers so clients cannot forge asserted
-    // identity. Tardigrade re-adds the real values after auth resolves.
-    const tardigrade_prefix = "x-tardigrade-";
-    if (name.len >= tardigrade_prefix.len and
-        std.ascii.eqlIgnoreCase(name[0..tardigrade_prefix.len], tardigrade_prefix))
-        return true;
-
-    if (connectionHeaderReferencesHeader(connection_header, name)) return true;
-
-    return std.ascii.eqlIgnoreCase(name, "accept-encoding") or
-        std.ascii.eqlIgnoreCase(name, "connection") or
-        std.ascii.eqlIgnoreCase(name, "content-length") or
-        std.ascii.eqlIgnoreCase(name, "host") or
-        std.ascii.eqlIgnoreCase(name, "keep-alive") or
-        std.ascii.eqlIgnoreCase(name, "proxy-authenticate") or
-        std.ascii.eqlIgnoreCase(name, "proxy-authorization") or
-        std.ascii.eqlIgnoreCase(name, "proxy-connection") or
-        std.ascii.eqlIgnoreCase(name, "te") or
-        std.ascii.eqlIgnoreCase(name, "trailer") or
-        std.ascii.eqlIgnoreCase(name, "transfer-encoding") or
-        std.ascii.eqlIgnoreCase(name, "upgrade") or
-        std.ascii.eqlIgnoreCase(name, "x-forwarded-for") or
-        std.ascii.eqlIgnoreCase(name, "x-forwarded-host") or
-        std.ascii.eqlIgnoreCase(name, "x-forwarded-proto") or
-        std.ascii.eqlIgnoreCase(name, "x-real-ip") or
-        std.ascii.eqlIgnoreCase(name, http.correlation.REQUEST_HEADER_NAME) or
-        std.ascii.eqlIgnoreCase(name, http.correlation.HEADER_NAME);
-}
-
-pub fn connectionHeaderReferencesHeader(connection_header: ?[]const u8, name: []const u8) bool {
-    const raw = connection_header orelse return false;
-    var tokens = std.mem.splitScalar(u8, raw, ',');
-    while (tokens.next()) |token_raw| {
-        const token = std.mem.trim(u8, token_raw, " \t");
-        if (token.len == 0) continue;
-        if (std.ascii.eqlIgnoreCase(token, name)) return true;
-    }
-    return false;
-}
-
-pub fn shouldSkipUpstreamResponseHeader(name: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(name, "connection") or
-        std.ascii.eqlIgnoreCase(name, "content-encoding") or
-        std.ascii.eqlIgnoreCase(name, "content-length") or
-        std.ascii.eqlIgnoreCase(name, "keep-alive") or
-        std.ascii.eqlIgnoreCase(name, "proxy-connection") or
-        std.ascii.eqlIgnoreCase(name, "te") or
-        std.ascii.eqlIgnoreCase(name, "trailer") or
-        std.ascii.eqlIgnoreCase(name, "transfer-encoding") or
-        std.ascii.eqlIgnoreCase(name, "upgrade") or
-        // Strip upstream technology-disclosure headers. Tardigrade emits its
-        // own Server header; leaking the upstream value exposes backend stack
-        // details to external clients (WSTG-INFO-02, ASVS-14.3.3).
-        std.ascii.eqlIgnoreCase(name, "server") or
-        std.ascii.eqlIgnoreCase(name, "x-powered-by") or
-        std.ascii.eqlIgnoreCase(name, http.correlation.REQUEST_HEADER_NAME) or
-        std.ascii.eqlIgnoreCase(name, http.correlation.HEADER_NAME);
-}
 
 pub fn computeHstsValue(allocator: std.mem.Allocator, cfg: *const edge_config.EdgeConfig) ![]u8 {
     if (!cfg.hsts_enabled or cfg.tls_cert_path.len == 0) return allocator.dupe(u8, "");
@@ -855,86 +755,7 @@ pub fn writeChunk(writer: anytype, bytes: []const u8) !void {
     try writer.writeAll("\r\n");
 }
 
-pub fn stripPort(authority: []const u8) []const u8 {
-    if (authority.len == 0) return authority;
-    if (authority[0] == '[') {
-        const close_idx = std.mem.findScalar(u8, authority, ']') orelse return authority;
-        return authority[0 .. close_idx + 1];
-    }
-    const colon_idx = std.mem.findScalarLast(u8, authority, ':') orelse return authority;
-    return authority[0..colon_idx];
-}
 
-pub fn isTrustedUpstream(cfg: *const edge_config.EdgeConfig, upstream_host: []const u8) bool {
-    if (!cfg.trust_require_upstream_identity and cfg.trusted_upstream_identities.len == 0) return true;
-    if (upstream_host.len == 0) return false;
-    const host = stripPort(upstream_host);
-
-    for (cfg.trusted_upstream_identities) |trusted| {
-        const trusted_host = stripPort(trusted);
-        if (std.ascii.eqlIgnoreCase(trusted, upstream_host) or std.ascii.eqlIgnoreCase(trusted_host, host)) {
-            return true;
-        }
-    }
-    return false;
-}
-
-pub fn appendTrustedUpstreamHeaders(
-    allocator: std.mem.Allocator,
-    cfg: *const edge_config.EdgeConfig,
-    extra_headers: *std.array_list.Managed(std.http.Header),
-    owned_header_values: *std.array_list.Managed([]u8),
-    target_url: []const u8,
-    correlation_id: []const u8,
-    client_ip: []const u8,
-    auth_identity: ?[]const u8,
-    api_version: ?u32,
-    payload: []const u8,
-) !void {
-    if (cfg.trust_shared_secret.len == 0) return;
-
-    const ts = compat.unixTimestamp();
-    const ts_value = try std.fmt.allocPrint(allocator, "{d}", .{ts});
-    try owned_header_values.append(ts_value);
-    try extra_headers.append(.{ .name = "X-Tardigrade-Gateway-Id", .value = cfg.trust_gateway_id });
-    try extra_headers.append(.{ .name = "X-Tardigrade-Trust-Timestamp", .value = ts_value });
-
-    var payload_digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(payload, &payload_digest, .{});
-    var payload_digest_hex: [64]u8 = undefined;
-    _ = std.fmt.bufPrint(&payload_digest_hex, "{f}", .{compat.fmtSliceHexLower(&payload_digest)}) catch unreachable;
-
-    const identity = auth_identity orelse "-";
-    const api_version_value = if (api_version) |ver|
-        try std.fmt.allocPrint(allocator, "{d}", .{ver})
-    else
-        try allocator.dupe(u8, "-");
-    defer allocator.free(api_version_value);
-
-    const material = try std.fmt.allocPrint(
-        allocator,
-        "POST\n{s}\n{s}\n{s}\n{s}\n{s}\n{s}\n{s}\n{s}",
-        .{ target_url, correlation_id, client_ip, cfg.trust_gateway_id, ts_value, payload_digest_hex, identity, api_version_value },
-    );
-    defer allocator.free(material);
-
-    var mac: [32]u8 = undefined;
-    std.crypto.auth.hmac.sha2.HmacSha256.create(&mac, material, cfg.trust_shared_secret);
-    const signature_hex = try std.fmt.allocPrint(allocator, "{f}", .{compat.fmtSliceHexLower(&mac)});
-    try owned_header_values.append(signature_hex);
-    try extra_headers.append(.{ .name = "X-Tardigrade-Trust-Signature", .value = signature_hex });
-}
-
-pub fn buildForwardedFor(allocator: std.mem.Allocator, incoming: ?[]const u8, client_ip: []const u8) !MaybeOwnedBytes {
-    if (incoming) |value| {
-        const trimmed = std.mem.trim(u8, value, " \t\r\n");
-        if (trimmed.len > 0) {
-            const owned = try std.fmt.allocPrint(allocator, "{s}, {s}", .{ trimmed, client_ip });
-            return .{ .value = owned, .owned = owned };
-        }
-    }
-    return .{ .value = client_ip };
-}
 
 pub fn upstreamResponseHasNoStore(response: std.http.Client.Response.Head) bool {
     var it = response.iterateHeaders();
@@ -953,16 +774,6 @@ pub const ResolvedProxyTarget = struct {
     url: []u8,
     upstream_host: []const u8,
     unix_socket_path: ?[]const u8 = null,
-};
-
-pub const MaybeOwnedBytes = struct {
-    value: []const u8,
-    owned: ?[]u8 = null,
-
-    pub fn deinit(self: *MaybeOwnedBytes, allocator: std.mem.Allocator) void {
-        if (self.owned) |buf| allocator.free(buf);
-        self.* = undefined;
-    }
 };
 
 pub fn isRedirectStatusCode(status_code: u16) bool {
@@ -1145,20 +956,6 @@ pub fn buildApiErrorJson(allocator: std.mem.Allocator, code: []const u8, message
     return std.fmt.allocPrint(allocator, "{{\"code\":\"{s}\",\"message\":\"{s}\",\"request_id\":null}}", .{ code, message });
 }
 
-pub fn setRequestIdHeaders(response: *http.Response, request_id: []const u8) void {
-    _ = response.setHeader(http.correlation.REQUEST_HEADER_NAME, request_id);
-    _ = response.setHeader(http.correlation.HEADER_NAME, request_id);
-}
-
-pub fn writeRequestIdHeaders(writer: anytype, request_id: []const u8) !void {
-    try writer.print("{s}: {s}\r\n", .{ http.correlation.REQUEST_HEADER_NAME, request_id });
-    try writer.print("{s}: {s}\r\n", .{ http.correlation.HEADER_NAME, request_id });
-}
-
-pub fn appendRequestIdHeaders(headers: *std.array_list.Managed(std.http.Header), request_id: []const u8) !void {
-    try headers.append(.{ .name = http.correlation.REQUEST_HEADER_NAME, .value = request_id });
-    try headers.append(.{ .name = http.correlation.HEADER_NAME, .value = request_id });
-}
 
 pub fn sendApiError(allocator: std.mem.Allocator, writer: anytype, status: http.Status, code: []const u8, message: []const u8, request_id: ?[]const u8, keep_alive: bool, state: *GatewayState) !void {
     const payload = try buildApiErrorJson(allocator, code, message, request_id);
@@ -1174,19 +971,6 @@ pub fn sendApiError(allocator: std.mem.Allocator, writer: anytype, status: http.
     try response.write(writer);
     state.metricsRecord(@intFromEnum(status));
     state.metricsRecordErrorCode(code);
-}
-
-test "buildForwardedFor appends client ip" {
-    const allocator = std.testing.allocator;
-    var value = try buildForwardedFor(allocator, "10.0.0.1, 10.0.0.2", "127.0.0.1");
-    defer value.deinit(allocator);
-    try std.testing.expectEqualStrings("10.0.0.1, 10.0.0.2, 127.0.0.1", value.value);
-}
-
-test "buildForwardedFor borrows client ip when no incoming chain exists" {
-    const value = try buildForwardedFor(std.testing.allocator, null, "127.0.0.1");
-    try std.testing.expect(value.owned == null);
-    try std.testing.expectEqualStrings("127.0.0.1", value.value);
 }
 
 test "parseUpstreamHost extracts authority" {
@@ -1248,56 +1032,6 @@ test "appendProxyQueryString borrows base url when request has no query" {
     try std.testing.expectEqual(@intFromPtr(base.ptr), @intFromPtr(appended.value.ptr));
 }
 
-test "shouldSkipUpstreamRequestHeader strips inbound X-Tardigrade headers" {
-    try std.testing.expect(shouldSkipUpstreamRequestHeader("X-Tardigrade-Auth-Identity", null));
-    try std.testing.expect(shouldSkipUpstreamRequestHeader("x-tardigrade-user-id", null));
-    try std.testing.expect(shouldSkipUpstreamRequestHeader("X-TARDIGRADE-DEVICE-ID", null));
-    try std.testing.expect(shouldSkipUpstreamRequestHeader("x-tardigrade-scopes", null));
-    try std.testing.expect(shouldSkipUpstreamRequestHeader("x-tardigrade-anything-custom", null));
-    try std.testing.expect(!shouldSkipUpstreamRequestHeader("X-Custom-Header", null));
-    try std.testing.expect(!shouldSkipUpstreamRequestHeader("Authorization", null));
-    try std.testing.expect(!shouldSkipUpstreamRequestHeader("Content-Type", null));
-}
-
-test "shouldSkipUpstreamRequestHeader strips standard hop-by-hop headers" {
-    try std.testing.expect(shouldSkipUpstreamRequestHeader("Connection", null));
-    try std.testing.expect(shouldSkipUpstreamRequestHeader("Keep-Alive", null));
-    try std.testing.expect(shouldSkipUpstreamRequestHeader("Proxy-Authenticate", null));
-    try std.testing.expect(shouldSkipUpstreamRequestHeader("Proxy-Authorization", null));
-    try std.testing.expect(shouldSkipUpstreamRequestHeader("TE", null));
-    try std.testing.expect(shouldSkipUpstreamRequestHeader("Trailer", null));
-    try std.testing.expect(shouldSkipUpstreamRequestHeader("Transfer-Encoding", null));
-    try std.testing.expect(shouldSkipUpstreamRequestHeader("Upgrade", null));
-}
-
-test "shouldSkipUpstreamRequestHeader strips headers named by Connection" {
-    const connection_header = "X-Test-Hop, keep-alive, Another-Hop";
-    try std.testing.expect(shouldSkipUpstreamRequestHeader("X-Test-Hop", connection_header));
-    try std.testing.expect(shouldSkipUpstreamRequestHeader("another-hop", connection_header));
-    try std.testing.expect(shouldSkipUpstreamRequestHeader("Keep-Alive", connection_header));
-    try std.testing.expect(!shouldSkipUpstreamRequestHeader("X-Not-Hop", connection_header));
-}
-
-test "shouldSkipUpstreamResponseHeader strips stale content-encoding" {
-    try std.testing.expect(shouldSkipUpstreamResponseHeader("Content-Encoding"));
-    try std.testing.expect(shouldSkipUpstreamResponseHeader("content-encoding"));
-    try std.testing.expect(!shouldSkipUpstreamResponseHeader("Content-Type"));
-}
-
-test "shouldSkipUpstreamResponseHeader strips upstream Server and X-Powered-By" {
-    // WSTG-INFO-02 / ASVS-14.3.3: upstream technology headers must not leak
-    // to external clients — Tardigrade emits its own Server header instead.
-    try std.testing.expect(shouldSkipUpstreamResponseHeader("Server"));
-    try std.testing.expect(shouldSkipUpstreamResponseHeader("server"));
-    try std.testing.expect(shouldSkipUpstreamResponseHeader("SERVER"));
-    try std.testing.expect(shouldSkipUpstreamResponseHeader("X-Powered-By"));
-    try std.testing.expect(shouldSkipUpstreamResponseHeader("x-powered-by"));
-    try std.testing.expect(shouldSkipUpstreamResponseHeader("X-POWERED-BY"));
-    // Must not suppress unrelated headers.
-    try std.testing.expect(!shouldSkipUpstreamResponseHeader("Content-Type"));
-    try std.testing.expect(!shouldSkipUpstreamResponseHeader("X-Custom-Header"));
-    try std.testing.expect(!shouldSkipUpstreamResponseHeader("Set-Cookie"));
-}
 
 test "writeBufferedUpstreamResponse serializes a single forwarded response head" {
     const allocator = std.testing.allocator;
@@ -1348,172 +1082,6 @@ test "mapUpstreamError returns stable codes" {
     const mapped = mapUpstreamError(502);
     try std.testing.expectEqual(@as(u16, 503), mapped.status);
     try std.testing.expectEqualStrings("tool_unavailable", mapped.code);
-}
-
-// --- Hop-by-hop header filtering regression tests (RFC 7230 §6.1) ---
-
-test "shouldSkipUpstreamRequestHeader strips all standard hop-by-hop headers case-insensitively" {
-    const cases = [_][]const u8{
-        "Accept-Encoding", "accept-encoding", "ACCEPT-ENCODING",
-        "Connection",      "connection",      "CONNECTION",
-        "Content-Length",  "content-length",  "CONTENT-LENGTH",
-        "Host",            "host",            "HOST",
-        "Keep-Alive",      "keep-alive",      "KEEP-ALIVE",
-        "Proxy-Authenticate",
-        "Proxy-Authorization",
-        "Proxy-Connection",
-        "TE",              "te",
-        "Trailer",         "trailer",
-        "Transfer-Encoding", "transfer-encoding",
-        "Upgrade",         "upgrade",
-        "X-Forwarded-For", "x-forwarded-for",
-        "X-Forwarded-Host",
-        "X-Forwarded-Proto",
-        "X-Real-IP",       "x-real-ip",
-    };
-    for (cases) |name| {
-        try std.testing.expect(shouldSkipUpstreamRequestHeader(name, null));
-    }
-}
-
-test "shouldSkipUpstreamRequestHeader passes safe application headers" {
-    const pass_cases = [_][]const u8{
-        "Authorization",
-        "Accept",
-        "Content-Type",
-        "X-Custom-Header",
-        "traceparent",
-        "User-Agent",
-    };
-    for (pass_cases) |name| {
-        try std.testing.expect(!shouldSkipUpstreamRequestHeader(name, null));
-    }
-}
-
-test "connectionHeaderReferencesHeader handles whitespace around tokens" {
-    try std.testing.expect(connectionHeaderReferencesHeader("  X-Foo  ,  X-Bar  ", "X-Foo"));
-    try std.testing.expect(connectionHeaderReferencesHeader("  X-Foo  ,  X-Bar  ", "X-Bar"));
-    try std.testing.expect(connectionHeaderReferencesHeader("\tX-Foo\t,\tX-Bar\t", "x-foo"));
-    try std.testing.expect(!connectionHeaderReferencesHeader("X-Foo, X-Bar", "X-Baz"));
-}
-
-test "connectionHeaderReferencesHeader is case-insensitive" {
-    try std.testing.expect(connectionHeaderReferencesHeader("x-my-hop", "X-MY-HOP"));
-    try std.testing.expect(connectionHeaderReferencesHeader("X-MY-HOP", "x-my-hop"));
-    try std.testing.expect(connectionHeaderReferencesHeader("KEEP-ALIVE", "keep-alive"));
-}
-
-test "connectionHeaderReferencesHeader ignores empty tokens" {
-    try std.testing.expect(!connectionHeaderReferencesHeader(",,,", "X-Foo"));
-    try std.testing.expect(!connectionHeaderReferencesHeader("", "X-Foo"));
-    try std.testing.expect(connectionHeaderReferencesHeader(",X-Foo,", "X-Foo"));
-}
-
-test "shouldSkipUpstreamRequestHeader drops Connection-listed custom hop-by-hop headers" {
-    const conn = "X-Internal-State, X-Debug-Token";
-    try std.testing.expect(shouldSkipUpstreamRequestHeader("X-Internal-State", conn));
-    try std.testing.expect(shouldSkipUpstreamRequestHeader("x-debug-token", conn));
-    try std.testing.expect(!shouldSkipUpstreamRequestHeader("X-Safe-Header", conn));
-    try std.testing.expect(!shouldSkipUpstreamRequestHeader("Authorization", conn));
-}
-
-test "shouldSkipUpstreamResponseHeader strips all hop-by-hop and disclosure headers" {
-    const strip_cases = [_][]const u8{
-        "Connection", "connection", "CONNECTION",
-        "Keep-Alive", "keep-alive",
-        "Proxy-Connection",
-        "TE",         "te",
-        "Trailer",    "trailer",
-        "Transfer-Encoding", "transfer-encoding",
-        "Upgrade",    "upgrade",
-        "Content-Encoding", "content-encoding",
-        "Content-Length",   "content-length",
-        "Server",     "server",     "SERVER",
-        "X-Powered-By", "x-powered-by",
-    };
-    for (strip_cases) |name| {
-        try std.testing.expect(shouldSkipUpstreamResponseHeader(name));
-    }
-}
-
-test "shouldSkipUpstreamResponseHeader passes safe application response headers" {
-    const pass_cases = [_][]const u8{
-        "Content-Type",
-        "Cache-Control",
-        "Set-Cookie",
-        "Location",
-        "X-Custom-Response",
-        "ETag",
-        "Last-Modified",
-    };
-    for (pass_cases) |name| {
-        try std.testing.expect(!shouldSkipUpstreamResponseHeader(name));
-    }
-}
-
-// --- Forwarded header behavior tests ---
-
-test "buildForwardedFor handles empty incoming chain" {
-    const result = try buildForwardedFor(std.testing.allocator, "", "10.0.0.1");
-    try std.testing.expect(result.owned == null);
-    try std.testing.expectEqualStrings("10.0.0.1", result.value);
-}
-
-test "buildForwardedFor trims whitespace from existing chain" {
-    var result = try buildForwardedFor(std.testing.allocator, "  192.168.1.1  ", "10.0.0.1");
-    defer result.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("192.168.1.1, 10.0.0.1", result.value);
-}
-
-test "buildForwardedFor handles multi-hop chain" {
-    var result = try buildForwardedFor(std.testing.allocator, "1.2.3.4, 5.6.7.8", "9.10.11.12");
-    defer result.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("1.2.3.4, 5.6.7.8, 9.10.11.12", result.value);
-}
-
-// --- Upstream host trust boundary tests ---
-
-test "isTrustedUpstream returns true when trust is not required" {
-    const cfg = std.mem.zeroInit(edge_config.EdgeConfig, .{
-        .trust_require_upstream_identity = false,
-    });
-    try std.testing.expect(isTrustedUpstream(&cfg, "any-host.example.com"));
-    try std.testing.expect(isTrustedUpstream(&cfg, ""));
-}
-
-test "isTrustedUpstream matches host case-insensitively" {
-    var identities = [_][]const u8{"trusted.internal"};
-    const cfg = std.mem.zeroInit(edge_config.EdgeConfig, .{
-        .trust_require_upstream_identity = true,
-        .trusted_upstream_identities = identities[0..],
-    });
-    try std.testing.expect(isTrustedUpstream(&cfg, "trusted.internal"));
-    try std.testing.expect(isTrustedUpstream(&cfg, "TRUSTED.INTERNAL"));
-    try std.testing.expect(!isTrustedUpstream(&cfg, "untrusted.internal"));
-    try std.testing.expect(!isTrustedUpstream(&cfg, ""));
-}
-
-test "isTrustedUpstream strips port before matching" {
-    var identities = [_][]const u8{"trusted.internal"};
-    const cfg = std.mem.zeroInit(edge_config.EdgeConfig, .{
-        .trust_require_upstream_identity = true,
-        .trusted_upstream_identities = identities[0..],
-    });
-    try std.testing.expect(isTrustedUpstream(&cfg, "trusted.internal:8080"));
-    try std.testing.expect(!isTrustedUpstream(&cfg, "untrusted.internal:8080"));
-}
-
-test "stripPort handles bare hostname" {
-    try std.testing.expectEqualStrings("example.com", stripPort("example.com"));
-    try std.testing.expectEqualStrings("example.com", stripPort("example.com:443"));
-    try std.testing.expectEqualStrings("127.0.0.1", stripPort("127.0.0.1:8080"));
-    try std.testing.expectEqualStrings("", stripPort(""));
-}
-
-test "stripPort handles IPv6 addresses" {
-    try std.testing.expectEqualStrings("[::1]", stripPort("[::1]"));
-    try std.testing.expectEqualStrings("[::1]", stripPort("[::1]:8080"));
-    try std.testing.expectEqualStrings("[2001:db8::1]", stripPort("[2001:db8::1]:443"));
 }
 
 // --- Malformed upstream response handling tests ---

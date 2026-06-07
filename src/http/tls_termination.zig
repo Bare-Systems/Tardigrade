@@ -342,6 +342,17 @@ pub const TlsConnection = struct {
         return error.TlsReadFailed;
     }
 
+    /// Bytes of already-decrypted application data buffered inside OpenSSL,
+    /// readable without touching the socket. Used by keepalive parking (#138):
+    /// if a pipelined request is already buffered after a response, the
+    /// connection must be served immediately rather than parked, because a
+    /// socket-readiness event will never fire for data already drained off the
+    /// socket into OpenSSL's buffer.
+    pub fn pending(self: *const TlsConnection) usize {
+        const n = c.SSL_pending(self.ssl);
+        return if (n > 0) @intCast(n) else 0;
+    }
+
     pub const Writer = struct {
         conn: *TlsConnection,
 

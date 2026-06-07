@@ -1,3 +1,12 @@
+//! Bounded control-plane/API upstream proxy helpers.
+//!
+//! This module owns the small JSON/control-plane proxy calls used by versioned
+//! API routes and proxy-cache refreshes. Those calls may materialize upstream
+//! responses in memory because every buffered read is capped by
+//! `controlPlaneBufferedResponseLimit`. General location `proxy_pass` traffic
+//! belongs in `gateway_proxy_runtime.zig`, where future streaming/backpressure
+//! work can replace the current bounded-buffer compatibility executor.
+
 const compat = @import("zig_compat.zig");
 const std = @import("std");
 const http = @import("http.zig");
@@ -16,14 +25,25 @@ const buildForwardedFor = gp.buildForwardedFor;
 const isTrustedUpstream = gp.isTrustedUpstream;
 const appendRequestIdHeaders = gp.appendRequestIdHeaders;
 const appendTrustedUpstreamHeaders = gp.appendTrustedUpstreamHeaders;
-const executeUnixSocketHttpRequest = gp.executeUnixSocketHttpRequest;
-const rawUpstreamResponseHasNoStore = gp.rawUpstreamResponseHasNoStore;
+const executeBoundedBufferedUnixSocketHttpRequest = gp.executeBoundedBufferedUnixSocketHttpRequest;
+const bufferedUpstreamResponseHasNoStore = gp.bufferedUpstreamResponseHasNoStore;
 const upstreamResponseHasNoStore = gp.upstreamResponseHasNoStore;
 const upstreamReasonPhrase = gp.upstreamReasonPhrase;
 const writeStreamedUpstreamResponse = gp.writeStreamedUpstreamResponse;
 const writeChunk = gp.writeChunk;
 
 const JSON_CONTENT_TYPE = "application/json";
+const DEFAULT_CONTROL_PLANE_BUFFERED_RESPONSE_LIMIT: usize = 2 * 1024 * 1024;
+
+/// Buffered control-plane responses are intentionally small and bounded. This
+/// cap is separate from the data-plane proxy response cap because these calls
+/// are API/control-plane helpers, not the general reverse-proxy hot path.
+pub fn controlPlaneBufferedResponseLimit(cfg: *const edge_config.EdgeConfig) usize {
+    return if (cfg.max_connection_memory_bytes > 0)
+        cfg.max_connection_memory_bytes
+    else
+        DEFAULT_CONTROL_PLANE_BUFFERED_RESPONSE_LIMIT;
+}
 
 pub fn buildProxyCacheKey(
     allocator: std.mem.Allocator,
@@ -80,7 +100,7 @@ pub fn buildProxyCacheKey(
     return out.toOwnedSlice(allocator);
 }
 
-pub const ProxyResult = struct {
+pub const ControlPlaneProxyResult = struct {
     status: u16,
     body: []u8,
     content_type: []u8,
@@ -91,12 +111,12 @@ pub const ProxyResult = struct {
     upstream_addr: []const u8,
 };
 
-pub const ProxyExecution = union(enum) {
+pub const ControlPlaneProxyExecution = union(enum) {
     streamed_status: struct {
         status: u16,
         upstream_addr: []const u8,
     },
-    buffered: ProxyResult,
+    buffered: ControlPlaneProxyResult,
 };
 
 const ProxyCacheRefreshTask = struct {
@@ -124,7 +144,7 @@ fn proxyCacheRefreshThread(task: *ProxyCacheRefreshTask) void {
         task.allocator.destroy(task);
     }
 
-    const exec = proxyJsonExecute(
+    const exec = executeBoundedControlPlaneJsonProxy(
         task.allocator,
         task.cfg,
         task.upstream_scope,
@@ -239,7 +259,7 @@ fn spawnProxyCacheRefresh(
     thread.detach();
 }
 
-pub fn proxyJsonExecute(
+pub fn executeBoundedControlPlaneJsonProxy(
     allocator: std.mem.Allocator,
     cfg: *const edge_config.EdgeConfig,
     upstream_scope: UpstreamScope,
@@ -259,7 +279,7 @@ pub fn proxyJsonExecute(
     state: *GatewayState,
     enable_streaming_success: bool,
     sticky_affinity: ?*const StickyAffinityRequest,
-) !ProxyExecution {
+) !ControlPlaneProxyExecution {
     const upstream_pool = upstreamPoolForScope(cfg, upstream_scope);
     // JSON proxy always POSTs; respect the idempotent-only guard.
     const configured_attempts: usize = @intCast(@max(cfg.upstream_retry_attempts, @as(u32, 1)));
@@ -294,7 +314,7 @@ pub fn proxyJsonExecute(
         state.recordUpstreamAttemptStart(upstream_base_url);
         const exec = blk: {
             defer state.recordUpstreamAttemptEnd(upstream_base_url);
-            break :blk proxyJsonExecuteSingleAttempt(
+            break :blk executeBoundedControlPlaneJsonProxyAttempt(
                 allocator,
                 cfg,
                 upstream_scope,
@@ -357,7 +377,7 @@ pub fn proxyJsonExecute(
     return last_err orelse error.UpstreamUnavailable;
 }
 
-fn proxyJsonExecuteSingleAttempt(
+fn executeBoundedControlPlaneJsonProxyAttempt(
     allocator: std.mem.Allocator,
     cfg: *const edge_config.EdgeConfig,
     upstream_scope: UpstreamScope,
@@ -379,7 +399,7 @@ fn proxyJsonExecuteSingleAttempt(
     state: *GatewayState,
     enable_streaming_success: bool,
     sticky_set_cookie: ?[]const u8,
-) !ProxyExecution {
+) !ControlPlaneProxyExecution {
     const proxy_json_extra_header_slack = 12;
     const proxy_json_owned_header_value_slack = 3;
     var extra_headers_stack = std.heap.stackFallback(2048, allocator);
@@ -450,7 +470,7 @@ fn proxyJsonExecuteSingleAttempt(
     var server_header_buffer: [16 * 1024]u8 = undefined;
     const uri = try std.Uri.parse(current_url);
     if (current_unix_socket_path) |socket_path| {
-        var raw_resp = try executeUnixSocketHttpRequest(
+        var buffered_resp = try executeBoundedBufferedUnixSocketHttpRequest(
             allocator,
             socket_path,
             uri,
@@ -458,22 +478,22 @@ fn proxyJsonExecuteSingleAttempt(
             extra_headers.items,
             payload,
             "application/json",
-            if (cfg.max_connection_memory_bytes > 0) cfg.max_connection_memory_bytes else 2 * 1024 * 1024,
+            controlPlaneBufferedResponseLimit(cfg),
             attempt_timeout_ms,
             cfg.upstream_response_timeout_ms,
         );
-        defer raw_resp.deinit(allocator);
+        defer buffered_resp.deinit(allocator);
 
-        const status_code = raw_resp.status_code;
-        const upstream_reason = raw_resp.reason;
-        const upstream_content_type = raw_resp.headerValue("Content-Type") orelse JSON_CONTENT_TYPE;
-        const upstream_content_disposition = raw_resp.headerValue("Content-Disposition");
-        const upstream_location = if (raw_resp.headerValue("Location")) |location|
+        const status_code = buffered_resp.status_code;
+        const upstream_reason = buffered_resp.reason;
+        const upstream_content_type = buffered_resp.headerValue("Content-Type") orelse JSON_CONTENT_TYPE;
+        const upstream_content_disposition = buffered_resp.headerValue("Content-Disposition");
+        const upstream_location = if (buffered_resp.headerValue("Location")) |location|
             try allocator.dupe(u8, location)
         else
             null;
         errdefer if (upstream_location) |location| allocator.free(location);
-        const cacheable = !rawUpstreamResponseHasNoStore(&raw_resp);
+        const cacheable = !bufferedUpstreamResponseHasNoStore(&buffered_resp);
         const stream_status = enable_streaming_success and (status_code == 200 or cfg.proxy_stream_all_statuses);
         if (stream_status) {
             try writeStreamedUpstreamResponse(
@@ -486,8 +506,8 @@ fn proxyJsonExecuteSingleAttempt(
                 &state.security_headers,
                 sticky_set_cookie,
             );
-            if (raw_resp.body.len > 0) {
-                try writeChunk(downstream_writer, raw_resp.body);
+            if (buffered_resp.body.len > 0) {
+                try writeChunk(downstream_writer, buffered_resp.body);
             }
             try downstream_writer.writeAll("0\r\n\r\n");
             return .{ .streamed_status = .{ .status = status_code, .upstream_addr = upstream_host } };
@@ -534,7 +554,7 @@ fn proxyJsonExecuteSingleAttempt(
             };
         }
 
-        const body = try allocator.dupe(u8, raw_resp.body);
+        const body = try allocator.dupe(u8, buffered_resp.body);
         errdefer allocator.free(body);
         const buffered_content_type = try allocator.dupe(u8, upstream_content_type);
         errdefer allocator.free(buffered_content_type);
@@ -670,10 +690,7 @@ fn proxyJsonExecuteSingleAttempt(
         };
     }
 
-    const max_buffered = if (cfg.max_connection_memory_bytes > 0)
-        cfg.max_connection_memory_bytes
-    else
-        2 * 1024 * 1024;
+    const max_buffered = controlPlaneBufferedResponseLimit(cfg);
     const body = try resp.reader(&resp_read_buf).allocRemaining(allocator, .limited(max_buffered));
     errdefer allocator.free(body);
     const buffered_content_type = try allocator.dupe(u8, upstream_content_type);
@@ -713,4 +730,16 @@ fn proxyJsonExecuteSingleAttempt(
             .upstream_addr = upstream_host,
         },
     };
+}
+
+test "control-plane buffered response limit is explicit and bounded" {
+    var cfg: edge_config.EdgeConfig = undefined;
+    cfg.max_connection_memory_bytes = 0;
+    try std.testing.expectEqual(
+        @as(usize, DEFAULT_CONTROL_PLANE_BUFFERED_RESPONSE_LIMIT),
+        controlPlaneBufferedResponseLimit(&cfg),
+    );
+
+    cfg.max_connection_memory_bytes = 512 * 1024;
+    try std.testing.expectEqual(@as(usize, 512 * 1024), controlPlaneBufferedResponseLimit(&cfg));
 }

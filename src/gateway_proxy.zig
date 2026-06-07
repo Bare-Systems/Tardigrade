@@ -1,3 +1,11 @@
+//! Shared proxy primitives and bounded buffered HTTP/1 upstream transports.
+//!
+//! Functions whose names include `BoundedBuffered` materialize an upstream
+//! response in memory only after enforcing an explicit size cap. They are kept
+//! separate from the reverse-proxy data-plane orchestration in
+//! `gateway_proxy_runtime.zig` so streaming/backpressure work can replace the
+//! data-plane executor without depending on control-plane helper behavior.
+
 const compat = @import("zig_compat.zig");
 const std = @import("std");
 const http = @import("http.zig");
@@ -34,20 +42,21 @@ pub const UpstreamHeader = struct {
     value: []const u8,
 };
 
-pub const RawUpstreamResponse = struct {
+/// Fully materialized upstream response returned by bounded buffered helpers.
+pub const BufferedUpstreamResponse = struct {
     metadata_arena: std.heap.ArenaAllocator,
     status_code: u16,
     reason: []const u8,
     headers: []UpstreamHeader,
     body: []u8,
 
-    pub fn deinit(self: *RawUpstreamResponse, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *BufferedUpstreamResponse, allocator: std.mem.Allocator) void {
         self.metadata_arena.deinit();
         allocator.free(self.body);
         self.* = undefined;
     }
 
-    pub fn headerValue(self: *const RawUpstreamResponse, name: []const u8) ?[]const u8 {
+    pub fn headerValue(self: *const BufferedUpstreamResponse, name: []const u8) ?[]const u8 {
         for (self.headers) |header| {
             if (std.ascii.eqlIgnoreCase(header.name, name)) return header.value;
         }
@@ -62,7 +71,9 @@ pub fn uriComponentBytes(component: std.Uri.Component) []const u8 {
     };
 }
 
-pub fn parseRawUpstreamResponse(allocator: std.mem.Allocator, raw: []const u8) !RawUpstreamResponse {
+/// Parse an HTTP/1 response that has already been read under a caller-owned
+/// bound. Do not call this on unbounded network input.
+pub fn parseBufferedUpstreamResponse(allocator: std.mem.Allocator, raw: []const u8) !BufferedUpstreamResponse {
     var metadata_arena = std.heap.ArenaAllocator.init(allocator);
     errdefer metadata_arena.deinit();
     const metadata_allocator = metadata_arena.allocator();
@@ -104,7 +115,10 @@ pub fn parseRawUpstreamResponse(allocator: std.mem.Allocator, raw: []const u8) !
     };
 }
 
-pub fn executeUnixSocketHttpRequest(
+/// Execute a bounded buffered HTTP/1 request over a Unix socket. This is
+/// appropriate for small control-plane/internal calls and compatibility paths
+/// where the caller provides a strict response cap.
+pub fn executeBoundedBufferedUnixSocketHttpRequest(
     allocator: std.mem.Allocator,
     socket_path: []const u8,
     uri: std.Uri,
@@ -118,7 +132,7 @@ pub fn executeUnixSocketHttpRequest(
     /// separate deadline for waiting on the first response byte (distinct from
     /// the write-phase timeout above).
     response_timeout_ms: u32,
-) !RawUpstreamResponse {
+) !BufferedUpstreamResponse {
     var stream = try compat.connectUnixSocket(socket_path);
     defer stream.close();
 
@@ -171,11 +185,11 @@ pub fn executeUnixSocketHttpRequest(
         if (resp_raw.items.len > max_buffered_response_bytes) return error.StreamTooLong;
     }
 
-    return parseRawUpstreamResponse(allocator, resp_raw.items);
+    return parseBufferedUpstreamResponse(allocator, resp_raw.items);
 }
 
-test "parseRawUpstreamResponse keeps metadata in an arena and preserves forwarded headers" {
-    var parsed = try parseRawUpstreamResponse(
+test "parseBufferedUpstreamResponse keeps metadata in an arena and preserves forwarded headers" {
+    var parsed = try parseBufferedUpstreamResponse(
         std.testing.allocator,
         "HTTP/1.1 200 OK\r\n" ++
             "Content-Type: text/plain\r\n" ++
@@ -189,11 +203,11 @@ test "parseRawUpstreamResponse keeps metadata in an arena and preserves forwarde
     try std.testing.expectEqual(@as(u16, 200), parsed.status_code);
     try std.testing.expectEqualStrings("OK", parsed.reason);
     try std.testing.expectEqualStrings("text/plain", parsed.headerValue("content-type").?);
-    try std.testing.expect(rawUpstreamResponseHasNoStore(&parsed));
+    try std.testing.expect(bufferedUpstreamResponseHasNoStore(&parsed));
     try std.testing.expectEqualStrings("ok", parsed.body);
 }
 
-test "parseRawUpstreamResponse returns UpstreamProtocolError on partial upstream response" {
+test "parseBufferedUpstreamResponse returns UpstreamProtocolError on partial upstream response" {
     // Simulates an upstream that closes the TCP connection before sending a
     // complete HTTP response head (the scenario reported in issue #94).
     // Before the fix this returned error.UnsupportedHttpMethod, a misleading
@@ -202,16 +216,16 @@ test "parseRawUpstreamResponse returns UpstreamProtocolError on partial upstream
     const testing = std.testing;
 
     // Upstream closed immediately — empty body
-    try testing.expectError(error.UpstreamProtocolError, parseRawUpstreamResponse(testing.allocator, ""));
+    try testing.expectError(error.UpstreamProtocolError, parseBufferedUpstreamResponse(testing.allocator, ""));
 
     // Upstream sent a partial status line and closed
-    try testing.expectError(error.UpstreamProtocolError, parseRawUpstreamResponse(testing.allocator, "HTTP/1.1"));
+    try testing.expectError(error.UpstreamProtocolError, parseBufferedUpstreamResponse(testing.allocator, "HTTP/1.1"));
 
     // Upstream sent headers but no blank line (no \r\n\r\n terminator)
-    try testing.expectError(error.UpstreamProtocolError, parseRawUpstreamResponse(testing.allocator, "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n"));
+    try testing.expectError(error.UpstreamProtocolError, parseBufferedUpstreamResponse(testing.allocator, "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n"));
 }
 
-pub fn rawUpstreamResponseHasNoStore(response: *const RawUpstreamResponse) bool {
+pub fn bufferedUpstreamResponseHasNoStore(response: *const BufferedUpstreamResponse) bool {
     for (response.headers) |header| {
         if (!std.ascii.eqlIgnoreCase(header.name, "cache-control")) continue;
         var tokens = std.mem.splitScalar(u8, header.value, ',');
@@ -233,7 +247,10 @@ fn markRequestConnectionClosing(req: *std.http.Client.Request) void {
     }
 }
 
-pub fn executeRawHttpProxyRequest(
+/// Execute the current bounded buffered HTTP/1 reverse-proxy transport.
+/// `gateway_proxy_runtime.zig` owns data-plane retry/routing semantics and
+/// should be the place future streaming/backpressure work swaps this out.
+pub fn executeBoundedBufferedHttpProxyRequest(
     allocator: std.mem.Allocator,
     client: *std.http.Client,
     cfg: *const edge_config.EdgeConfig,
@@ -257,7 +274,7 @@ pub fn executeRawHttpProxyRequest(
     /// per-phase socket timeout control.
     response_timeout_ms: u32,
     cancel_token: ?*const CancellationToken,
-) !RawUpstreamResponse {
+) !BufferedUpstreamResponse {
     // Bail out before touching the network if the request is already stopped.
     if (cancel_token) |tok| {
         if (tok.isStopped()) return error.RequestCancelled;
@@ -307,7 +324,7 @@ pub fn executeRawHttpProxyRequest(
             tok.effectiveTimeoutMs(response_timeout_ms)
         else
             response_timeout_ms;
-        return executeUnixSocketHttpRequest(
+        return executeBoundedBufferedUnixSocketHttpRequest(
             allocator,
             socket_path,
             uri,
@@ -383,10 +400,11 @@ pub fn executeRawHttpProxyRequest(
     };
 }
 
-/// Execute an HTTPS upstream proxy request using OpenSSL directly, supporting
-/// custom CA bundles, SNI overrides, and mutual TLS client certificates.
-/// Used when `TARDIGRADE_UPSTREAM_TLS_CLIENT_CERT` is set.
-pub fn executeUpstreamHttpsWithMtls(
+/// Execute the bounded buffered HTTPS/mTLS compatibility transport using
+/// OpenSSL directly, supporting custom CA bundles, SNI overrides, and mutual
+/// TLS client certificates. Used when `TARDIGRADE_UPSTREAM_TLS_CLIENT_CERT`
+/// is set; not a streaming data-plane implementation.
+pub fn executeBoundedBufferedHttpsMtlsRequest(
     allocator: std.mem.Allocator,
     url: []const u8,
     method: []const u8,
@@ -401,7 +419,7 @@ pub fn executeUpstreamHttpsWithMtls(
     auth_device_id: ?[]const u8,
     auth_scopes: ?[]const u8,
     cfg: *const edge_config.EdgeConfig,
-) !RawUpstreamResponse {
+) !BufferedUpstreamResponse {
     const max_buffered_response_bytes = maxBufferedUpstreamResponseBytes(cfg);
     const uri = try std.Uri.parse(url);
     const host = if (uri.host) |h| switch (h) {
@@ -473,7 +491,7 @@ pub fn executeUpstreamHttpsWithMtls(
         try resp_raw.appendSlice(read_buf[0..n]);
         if (resp_raw.items.len > max_buffered_response_bytes) return error.StreamTooLong;
     }
-    return parseRawUpstreamResponse(allocator, resp_raw.items);
+    return parseBufferedUpstreamResponse(allocator, resp_raw.items);
 }
 
 pub fn applyResponseHeaders(state: *GatewayState, response: *http.Response) void {
@@ -599,7 +617,7 @@ pub fn writeStreamedUpstreamResponseHead(
 
 pub fn writeBufferedUpstreamResponse(
     writer: anytype,
-    upstream_response: *const RawUpstreamResponse,
+    upstream_response: *const BufferedUpstreamResponse,
     keep_alive: bool,
     correlation_id: []const u8,
     security: *const http.security_headers.SecurityHeaders,
@@ -641,7 +659,7 @@ pub fn writeBufferedUpstreamResponse(
 
 pub fn writeBufferedUpstreamResponseHead(
     writer: anytype,
-    upstream_response: *const RawUpstreamResponse,
+    upstream_response: *const BufferedUpstreamResponse,
     keep_alive: bool,
     correlation_id: []const u8,
     security: *const http.security_headers.SecurityHeaders,
@@ -806,7 +824,7 @@ test "writeBufferedUpstreamResponse preserves oversized body bytes exactly" {
     var upstream_headers = [_]UpstreamHeader{
         .{ .name = "Content-Type", .value = "text/css" },
     };
-    var response = RawUpstreamResponse{
+    var response = BufferedUpstreamResponse{
         .metadata_arena = std.heap.ArenaAllocator.init(allocator),
         .status_code = 200,
         .reason = "OK",
@@ -1100,7 +1118,7 @@ pub fn mapUpstreamError(status: u16) UpstreamMappedError {
     };
 }
 
-pub fn mapProxyExecutionError(err: anyerror) ProxyExecMappedError {
+pub fn mapControlPlaneProxyExecutionError(err: anyerror) ProxyExecMappedError {
     return switch (err) {
         error.UpstreamUntrusted => .{
             .status = .service_unavailable,

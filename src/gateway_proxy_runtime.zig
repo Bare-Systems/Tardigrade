@@ -1,17 +1,19 @@
 //! HTTP proxy runtime glue for the edge gateway. This module owns route-to-
 //! upstream target resolution, retry budgeting, sticky affinity, and writing
-//! proxied upstream responses back to clients.
+//! proxied upstream responses back to clients. This is the data-plane home for
+//! general `proxy_pass` traffic; control-plane JSON helpers live in
+//! `gateway_control_plane_proxy.zig`.
 
 const compat = @import("zig_compat.zig");
 const std = @import("std");
 const http = @import("http.zig");
 const edge_config = @import("edge_config.zig");
 const gp = @import("gateway_proxy.zig");
-const gjp = @import("gateway_json_proxy.zig");
+const gcp = @import("gateway_control_plane_proxy.zig");
 const gs = @import("gateway_state.zig");
 
 const GatewayState = gs.GatewayState;
-const RawUpstreamResponse = gp.RawUpstreamResponse;
+const BufferedUpstreamResponse = gp.BufferedUpstreamResponse;
 const UpstreamScope = gs.UpstreamScope;
 const StickyUpstreamSelection = gs.StickyUpstreamSelection;
 const upstreamPoolForScope = gs.upstreamPoolForScope;
@@ -20,16 +22,89 @@ const proxyScopeForPath = gs.proxyScopeForPath;
 const prepareStickyAffinityRequest = gs.prepareStickyAffinityRequest;
 const buildStickySetCookieHeader = gs.buildStickySetCookieHeader;
 const isAbsoluteHttpUrl = gs.isAbsoluteHttpUrl;
-const proxyJsonExecute = gjp.proxyJsonExecute;
+const executeBoundedControlPlaneJsonProxy = gcp.executeBoundedControlPlaneJsonProxy;
 const resolveProxyTarget = gp.resolveProxyTarget;
 const appendProxyQueryString = gp.appendProxyQueryString;
-const executeUpstreamHttpsWithMtls = gp.executeUpstreamHttpsWithMtls;
-const executeRawHttpProxyRequest = gp.executeRawHttpProxyRequest;
-const mapProxyExecutionError = gp.mapProxyExecutionError;
+const executeBoundedBufferedHttpsMtlsRequest = gp.executeBoundedBufferedHttpsMtlsRequest;
+const executeBoundedBufferedHttpProxyRequest = gp.executeBoundedBufferedHttpProxyRequest;
+const mapControlPlaneProxyExecutionError = gp.mapControlPlaneProxyExecutionError;
 const sendApiError = gp.sendApiError;
 const setRequestIdHeaders = gp.setRequestIdHeaders;
 const applyResponseHeaders = gp.applyResponseHeaders;
 const writeBufferedUpstreamResponse = gp.writeBufferedUpstreamResponse;
+
+/// The current data-plane HTTP/1 executor is a bounded-buffer compatibility
+/// path. It centralizes the call to the buffered transport helpers so #139 and
+/// #140 can replace this function with streaming/backpressure behavior without
+/// routing data-plane traffic through control-plane helper code.
+pub fn executeBufferedDataPlaneProxyRequest(
+    allocator: std.mem.Allocator,
+    client: *std.http.Client,
+    cfg: *const edge_config.EdgeConfig,
+    url: []const u8,
+    unix_socket_path: ?[]const u8,
+    method: []const u8,
+    request_headers: *const http.Headers,
+    body: []const u8,
+    correlation_id: []const u8,
+    client_ip: []const u8,
+    forwarded_proto: []const u8,
+    incoming_host: ?[]const u8,
+    auth_identity: ?[]const u8,
+    auth_user_id: ?[]const u8,
+    auth_device_id: ?[]const u8,
+    auth_scopes: ?[]const u8,
+    attempt_timeout_ms: u32,
+    connect_timeout_ms: u32,
+    response_timeout_ms: u32,
+    cancel_token: ?*const http.cancellation.CancellationToken,
+) !BufferedUpstreamResponse {
+    if (cfg.upstream_tls_client_cert.len > 0 and std.mem.startsWith(u8, url, "https://")) {
+        return executeBoundedBufferedHttpsMtlsRequest(
+            allocator,
+            url,
+            method,
+            request_headers,
+            body,
+            correlation_id,
+            client_ip,
+            forwarded_proto,
+            incoming_host,
+            auth_identity,
+            auth_user_id,
+            auth_device_id,
+            auth_scopes,
+            cfg,
+        );
+    }
+
+    return executeBoundedBufferedHttpProxyRequest(
+        allocator,
+        client,
+        cfg,
+        url,
+        unix_socket_path,
+        method,
+        request_headers,
+        body,
+        correlation_id,
+        client_ip,
+        forwarded_proto,
+        incoming_host,
+        auth_identity,
+        auth_user_id,
+        auth_device_id,
+        auth_scopes,
+        attempt_timeout_ms,
+        connect_timeout_ms,
+        response_timeout_ms,
+        cancel_token,
+    );
+}
+
+pub fn dataPlaneBufferedCompatibilityResponseLimit(cfg: *const edge_config.EdgeConfig) usize {
+    return gs.maxBufferedUpstreamResponseBytes(cfg);
+}
 
 pub fn proxySuffixPathForLocation(
     request_path: []const u8,
@@ -214,7 +289,7 @@ fn executeVersionedApiProxyRoute(
     );
     defer if (sticky_affinity) |*value| value.deinit(allocator);
 
-    const exec = proxyJsonExecute(
+    const exec = executeBoundedControlPlaneJsonProxy(
         allocator,
         cfg,
         upstream_scope,
@@ -235,7 +310,7 @@ fn executeVersionedApiProxyRoute(
         false,
         if (sticky_affinity) |*value| value else null,
     ) catch |err| {
-        const mapped = mapProxyExecutionError(err);
+        const mapped = mapControlPlaneProxyExecutionError(err);
         try sendApiError(allocator, writer, mapped.status, mapped.code, mapped.message, correlation_id, keep_alive, state);
         return @intFromEnum(mapped.status);
     };
@@ -329,8 +404,6 @@ pub fn handleLocationProxyPass(
         try buildStickySetCookieHeader(temp_allocator, cfg, value, selection.base_url)
     else
         null;
-    const use_mtls_path = cfg.upstream_tls_client_cert.len > 0 and
-        std.mem.startsWith(u8, upstream_url.value, "https://");
     const forwarded_proto = if (edge_config.hasTlsFiles(cfg)) "https" else "http";
     const method_str = request.method.toString();
 
@@ -345,7 +418,7 @@ pub fn handleLocationProxyPass(
     const budget_start_ms = http.event_loop.monotonicMs();
 
     var attempt: usize = 0;
-    var upstream_response: RawUpstreamResponse = while (attempt < max_attempts) : (attempt += 1) {
+    var upstream_response: BufferedUpstreamResponse = while (attempt < max_attempts) : (attempt += 1) {
         const per_attempt_timeout_ms: u32 = blk: {
             if (cfg.upstream_timeout_budget_ms == 0) break :blk cfg.upstream_timeout_ms;
             const elapsed_ms = http.event_loop.monotonicMs() - budget_start_ms;
@@ -357,46 +430,28 @@ pub fn handleLocationProxyPass(
             break :blk @intCast(@min(@as(u64, cfg.upstream_timeout_ms), remaining));
         };
         state.recordUpstreamAttemptStart(selection.base_url);
-        const resp = if (use_mtls_path)
-            executeUpstreamHttpsWithMtls(
-                allocator,
-                upstream_url.value,
-                method_str,
-                &request.headers,
-                body,
-                correlation_id,
-                client_ip,
-                forwarded_proto,
-                request.headers.get("host"),
-                auth_identity,
-                auth_user_id,
-                auth_device_id,
-                auth_scopes,
-                cfg,
-            )
-        else
-            executeRawHttpProxyRequest(
-                allocator,
-                &state.upstream_client,
-                cfg,
-                upstream_url.value,
-                resolved.unix_socket_path,
-                method_str,
-                &request.headers,
-                body,
-                correlation_id,
-                client_ip,
-                forwarded_proto,
-                request.headers.get("host"),
-                auth_identity,
-                auth_user_id,
-                auth_device_id,
-                auth_scopes,
-                per_attempt_timeout_ms,
-                cfg.upstream_connect_timeout_ms,
-                cfg.upstream_response_timeout_ms,
-                if (ctx.lifecycle) |lc| &lc.token else null,
-            );
+        const resp = executeBufferedDataPlaneProxyRequest(
+            allocator,
+            &state.upstream_client,
+            cfg,
+            upstream_url.value,
+            resolved.unix_socket_path,
+            method_str,
+            &request.headers,
+            body,
+            correlation_id,
+            client_ip,
+            forwarded_proto,
+            request.headers.get("host"),
+            auth_identity,
+            auth_user_id,
+            auth_device_id,
+            auth_scopes,
+            per_attempt_timeout_ms,
+            cfg.upstream_connect_timeout_ms,
+            cfg.upstream_response_timeout_ms,
+            if (ctx.lifecycle) |lc| &lc.token else null,
+        );
         state.recordUpstreamAttemptEnd(selection.base_url);
         const result = resp catch |err| {
             state.recordUpstreamFailure(cfg, selection.base_url);
@@ -494,4 +549,16 @@ pub fn isHttpMethodIdempotent(method: []const u8) bool {
         std.mem.eql(u8, m, "DELETE") or
         std.mem.eql(u8, m, "OPTIONS") or
         std.mem.eql(u8, m, "TRACE");
+}
+
+test "data-plane buffered compatibility response limit uses dedicated upstream cap" {
+    var cfg: edge_config.EdgeConfig = undefined;
+    cfg.max_buffered_upstream_response_bytes = 0;
+    try std.testing.expectEqual(
+        @as(usize, gs.MAX_REQUEST_SIZE),
+        dataPlaneBufferedCompatibilityResponseLimit(&cfg),
+    );
+
+    cfg.max_buffered_upstream_response_bytes = 768 * 1024;
+    try std.testing.expectEqual(@as(usize, 768 * 1024), dataPlaneBufferedCompatibilityResponseLimit(&cfg));
 }

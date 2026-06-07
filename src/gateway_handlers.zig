@@ -7,7 +7,7 @@ const std = @import("std");
 const http = @import("http.zig");
 const edge_config = @import("edge_config.zig");
 const ga = @import("gateway_auth.zig");
-const gjp = @import("gateway_json_proxy.zig");
+const gcp = @import("gateway_control_plane_proxy.zig");
 const gp = @import("gateway_proxy.zig");
 const gpr = @import("gateway_protocols.zig");
 const gproxy_runtime = @import("gateway_proxy_runtime.zig");
@@ -23,18 +23,17 @@ const authorizeViaSubrequest = ga.authorizeViaSubrequest;
 const hostMatchesPatterns = ga.hostMatchesPatterns;
 const resolveRequestConfig = ga.resolveRequestConfig;
 const isGeoBlocked = ga.isGeoBlocked;
-const proxyJsonExecute = gjp.proxyJsonExecute;
+const executeBoundedControlPlaneJsonProxy = gcp.executeBoundedControlPlaneJsonProxy;
 const applyResponseHeaders = gp.applyResponseHeaders;
 const appendProxyQueryString = gp.appendProxyQueryString;
 const buildApiErrorJson = gp.buildApiErrorJson;
-const executeRawHttpProxyRequest = gp.executeRawHttpProxyRequest;
-const executeUpstreamHttpsWithMtls = gp.executeUpstreamHttpsWithMtls;
 const resolveProxyTarget = gp.resolveProxyTarget;
 const sendApiError = gp.sendApiError;
 const setRequestIdHeaders = gp.setRequestIdHeaders;
 const writeRequestIdHeaders = gp.writeRequestIdHeaders;
 const writeSecurityHeaders = gp.writeSecurityHeaders;
 const handleFastcgiRoute = gpr.handleFastcgiRoute;
+const executeBufferedDataPlaneProxyRequest = gproxy_runtime.executeBufferedDataPlaneProxyRequest;
 const handleLocationProxyPass = gproxy_runtime.handleLocationProxyPass;
 const proxySuffixPathForLocation = gproxy_runtime.proxySuffixPathForLocation;
 const handleStaticLocation = gstatic.handleStaticLocation;
@@ -696,7 +695,7 @@ fn runAsyncCommandJob(job: *AsyncCommandJob) void {
     defer destroyAsyncCommandJob(job);
 
     job.state.commandLifecycleSetRunning(job.command_id);
-    const exec = proxyJsonExecute(
+    const exec = executeBoundedControlPlaneJsonProxy(
         job.allocator,
         job.cfg,
         .commands,
@@ -1005,48 +1004,28 @@ fn handleHttp3LocationProxyPass(
     var upstream_url = try appendProxyQueryString(allocator, resolved.url, request_query);
     defer upstream_url.deinit(allocator);
 
-    const h3_use_mtls_path = ctx.cfg.upstream_tls_client_cert.len > 0 and
-        std.mem.startsWith(u8, upstream_url.value, "https://");
-    var upstream_response = if (h3_use_mtls_path)
-        try executeUpstreamHttpsWithMtls(
-            allocator,
-            upstream_url.value,
-            request.method,
-            &request.headers,
-            request.body,
-            correlation_id,
-            request.headers.get("x-real-ip") orelse "unknown",
-            if (edge_config.hasTlsFiles(ctx.cfg)) "https" else "http",
-            request.headers.get(":authority") orelse request.headers.get("host"),
-            null,
-            null,
-            null,
-            null,
-            ctx.cfg,
-        )
-    else
-        try executeRawHttpProxyRequest(
-            allocator,
-            &ctx.state.upstream_client,
-            ctx.cfg,
-            upstream_url.value,
-            resolved.unix_socket_path,
-            request.method,
-            &request.headers,
-            request.body,
-            correlation_id,
-            request.headers.get("x-real-ip") orelse "unknown",
-            if (edge_config.hasTlsFiles(ctx.cfg)) "https" else "http",
-            request.headers.get(":authority") orelse request.headers.get("host"),
-            null,
-            null,
-            null,
-            null,
-            ctx.cfg.upstream_timeout_ms,
-            ctx.cfg.upstream_connect_timeout_ms,
-            ctx.cfg.upstream_response_timeout_ms,
-            null, // HTTP/3 path: no per-request lifecycle yet
-        );
+    var upstream_response = try executeBufferedDataPlaneProxyRequest(
+        allocator,
+        &ctx.state.upstream_client,
+        ctx.cfg,
+        upstream_url.value,
+        resolved.unix_socket_path,
+        request.method,
+        &request.headers,
+        request.body,
+        correlation_id,
+        request.headers.get("x-real-ip") orelse "unknown",
+        if (edge_config.hasTlsFiles(ctx.cfg)) "https" else "http",
+        request.headers.get(":authority") orelse request.headers.get("host"),
+        null,
+        null,
+        null,
+        null,
+        ctx.cfg.upstream_timeout_ms,
+        ctx.cfg.upstream_connect_timeout_ms,
+        ctx.cfg.upstream_response_timeout_ms,
+        null, // HTTP/3 path: no per-request lifecycle yet
+    );
     defer upstream_response.deinit(allocator);
 
     _ = response

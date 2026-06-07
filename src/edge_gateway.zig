@@ -96,19 +96,19 @@ const parseLastEventId = ghandlers.parseLastEventId;
 const gp = @import("gateway_proxy.zig");
 // Types from gateway_proxy.zig
 const UpstreamHeader = gp.UpstreamHeader;
-const RawUpstreamResponse = gp.RawUpstreamResponse;
+const BufferedUpstreamResponse = gp.BufferedUpstreamResponse;
 const MaybeOwnedBytes = gp.MaybeOwnedBytes;
 const ResolvedProxyTarget = gp.ResolvedProxyTarget;
 const UpstreamMappedError = gp.UpstreamMappedError;
 const ProxyExecMappedError = gp.ProxyExecMappedError;
 // Functions from gateway_proxy.zig
 const uriComponentBytes = gp.uriComponentBytes;
-const parseRawUpstreamResponse = gp.parseRawUpstreamResponse;
-const executeUnixSocketHttpRequest = gp.executeUnixSocketHttpRequest;
-const rawUpstreamResponseHasNoStore = gp.rawUpstreamResponseHasNoStore;
+const parseBufferedUpstreamResponse = gp.parseBufferedUpstreamResponse;
+const executeBoundedBufferedUnixSocketHttpRequest = gp.executeBoundedBufferedUnixSocketHttpRequest;
+const bufferedUpstreamResponseHasNoStore = gp.bufferedUpstreamResponseHasNoStore;
 const upstreamReasonPhrase = gp.upstreamReasonPhrase;
-const executeRawHttpProxyRequest = gp.executeRawHttpProxyRequest;
-const executeUpstreamHttpsWithMtls = gp.executeUpstreamHttpsWithMtls;
+const executeBoundedBufferedHttpProxyRequest = gp.executeBoundedBufferedHttpProxyRequest;
+const executeBoundedBufferedHttpsMtlsRequest = gp.executeBoundedBufferedHttpsMtlsRequest;
 const applyResponseHeaders = gp.applyResponseHeaders;
 const appendAssertedIdentityHeaders = gp.appendAssertedIdentityHeaders;
 const writeAssertedIdentityHeaders = gp.writeAssertedIdentityHeaders;
@@ -136,7 +136,7 @@ const unixSocketPathFromEndpoint = gp.unixSocketPathFromEndpoint;
 const combineProxyTarget = gp.combineProxyTarget;
 const parseUpstreamHost = gp.parseUpstreamHost;
 const mapUpstreamError = gp.mapUpstreamError;
-const mapProxyExecutionError = gp.mapProxyExecutionError;
+const mapControlPlaneProxyExecutionError = gp.mapControlPlaneProxyExecutionError;
 const buildApiErrorJson = gp.buildApiErrorJson;
 const setRequestIdHeaders = gp.setRequestIdHeaders;
 const writeRequestIdHeaders = gp.writeRequestIdHeaders;
@@ -163,11 +163,11 @@ const parseApprovalRequestBody = ga.parseApprovalRequestBody;
 const parseApprovalResponseBody = ga.parseApprovalResponseBody;
 const routeRequiresApprovalRule = ga.routeRequiresApprovalRule;
 const hostMatchesPatterns = ga.hostMatchesPatterns;
-const gjp = @import("gateway_json_proxy.zig");
-const ProxyResult = gjp.ProxyResult;
-const ProxyExecution = gjp.ProxyExecution;
-const proxyJsonExecute = gjp.proxyJsonExecute;
-const buildProxyCacheKey = gjp.buildProxyCacheKey;
+const gcp = @import("gateway_control_plane_proxy.zig");
+const ControlPlaneProxyResult = gcp.ControlPlaneProxyResult;
+const ControlPlaneProxyExecution = gcp.ControlPlaneProxyExecution;
+const executeBoundedControlPlaneJsonProxy = gcp.executeBoundedControlPlaneJsonProxy;
+const buildProxyCacheKey = gcp.buildProxyCacheKey;
 
 pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     const state_allocator = runtime_allocator.runtimeAllocator();
@@ -1856,7 +1856,7 @@ test "writeBufferedUpstreamResponse serializes a single forwarded response head"
         .{ .name = "X-Upstream-Test", .value = "1" },
     };
 
-    var response = RawUpstreamResponse{
+    var response = BufferedUpstreamResponse{
         .metadata_arena = std.heap.ArenaAllocator.init(allocator),
         .status_code = 200,
         .reason = "OK",

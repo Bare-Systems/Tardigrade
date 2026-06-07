@@ -78,6 +78,30 @@ Use the committed metadata files for common contexts:
 - `benchmarks/targets/release-baseline.json`
 - `benchmarks/targets/ci-smoke.json`
 
+## Allocation regression benchmark
+
+`zig build bench-allocations` runs an in-process hot-path allocation harness and
+prints JSON with `allocations_per_request` and `bytes_allocated_per_request` for
+each measured scenario. The same budgets are enforced by `zig build test`, so
+allocator regressions fail with the scenario name and the exceeded threshold.
+
+This harness does not replace canonical throughput benchmarks. It avoids live
+network timing noise and measures allocator calls around deterministic runtime
+helpers that are easy to regress during refactors.
+
+Current debug budgets:
+
+| Scenario | Allocation budget/request | Byte budget/request | Rationale |
+|---|---:|---:|---|
+| `static-tiny-file-warm` | 14 | 1024 | File-backed warm static responses allocate normalized path metadata, ETag, and Last-Modified strings; file bytes stay out of heap. |
+| `static-304-conditional` | 14 | 1024 | Conditional static hits follow the same path and validator allocation shape, but avoid response-body bytes. |
+| `proxy-keepalive-warm` | 6 | 512 | Warm proxy keep-alive helper work owns resolved target strings while forwarded header assembly stays stack-backed. |
+| `rejected-overload` | 12 | 1024 | This intentionally allocating path builds a structured JSON error and response header copies before closing the request. |
+
+Large streamed proxy-response allocation checks belong with the streaming data
+path once that path is available; the current harness covers the warm proxy
+keep-alive helper path and overload rejection path.
+
 ## Scenarios
 
 ### Throughput scenarios (all tools)

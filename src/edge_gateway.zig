@@ -13,166 +13,32 @@ const WS_MUX_MAX_CHANNELS: usize = 32;
 const APPROVAL_TIMEOUT_MS_DEFAULT: i64 = 300_000;
 
 const gs = @import("gateway_state.zig");
+const gaccept = @import("gateway_accept.zig");
+const gconn = @import("gateway_connection.zig");
+const gshutdown = @import("gateway_shutdown.zig");
+const ghandlers = @import("gateway_handlers.zig");
+const gp = @import("gateway_proxy.zig");
+const ga = @import("gateway_auth.zig");
 
-// Types extracted to gateway_state.zig — aliased so existing handler code
-// compiles without changes.
+// Local runtime shorthands only. Keep this list to state/types used by
+// edge_gateway itself; call subsystem behavior through the owning module alias
+// above. Do not add compatibility re-exports here.
 const MAX_REQUEST_SIZE = gs.MAX_REQUEST_SIZE;
 const GatewayState = gs.GatewayState;
 const WorkerContext = gs.WorkerContext;
-const ConfigLease = gs.ConfigLease;
-const ManagedConfigVersion = gs.ManagedConfigVersion;
 const ReloadableConfigStore = gs.ReloadableConfigStore;
 const ConnectionSession = gs.ConnectionSession;
 const ConnectionSessionPool = gs.ConnectionSessionPool;
-const ProxyCacheLookup = gs.ProxyCacheLookup;
 const UpstreamHealth = gs.UpstreamHealth;
-const ConnectionSlotResult = gs.ConnectionSlotResult;
 const Http2PendingStream = gs.Http2PendingStream;
-const UpstreamScope = gs.UpstreamScope;
-const UpstreamPoolView = gs.UpstreamPoolView;
-const StickyAffinityRequest = gs.StickyAffinityRequest;
-const StickyUpstreamSelection = gs.StickyUpstreamSelection;
 const CommandLifecycleEntry = gs.CommandLifecycleEntry;
 const ApprovalEntry = gs.ApprovalEntry;
-const ApprovalDecision = gs.ApprovalDecision;
-const ApprovalValidation = gs.ApprovalValidation;
 const MuxResumeState = gs.MuxResumeState;
-const loadApprovalStore = gs.loadApprovalStore;
-const loadSessionStore = gs.loadSessionStore;
-const upstreamPoolForScope = gs.upstreamPoolForScope;
-const upstreamScopeName = gs.upstreamScopeName;
-const proxyScopeForPath = gs.proxyScopeForPath;
-const maxBufferedUpstreamResponseBytes = gs.maxBufferedUpstreamResponseBytes;
-const prepareStickyAffinityRequest = gs.prepareStickyAffinityRequest;
-const buildStickySetCookieHeader = gs.buildStickySetCookieHeader;
-
-const gaccept = @import("gateway_accept.zig");
-const acceptReadyConnections = gaccept.acceptReadyConnections;
-const applyFdSoftLimit = gaccept.applyFdSoftLimit;
-
-const gconn = @import("gateway_connection.zig");
-const clientIpFromAddress = gconn.clientIpFromAddress;
-const clientIpFromFd = gconn.clientIpFromFd;
-const setNoDelay = gconn.setNoDelay;
-const setNonBlocking = gconn.setNonBlocking;
-const setSocketTimeoutMs = gconn.setSocketTimeoutMs;
-const maybeConsumeProxyProtocolPreface = gconn.maybeConsumeProxyProtocolPreface;
-const peekAndConsumeProxyHeaderFromRawFd = gconn.peekAndConsumeProxyHeaderFromRawFd;
-const parseProxyHeader = gconn.parseProxyHeader;
-const readHttpRequest = gconn.readHttpRequest;
-const firstRequestCompleteLen = gconn.firstRequestCompleteLen;
-
-const gstatic = @import("gateway_static_runtime.zig");
-const handleStaticLocation = gstatic.handleStaticLocation;
-const serveTryFilesFallback = gstatic.serveTryFilesFallback;
-const maybeResolveStaticErrorPage = gstatic.maybeResolveStaticErrorPage;
-
-const gshutdown = @import("gateway_shutdown.zig");
-const hotReloadConfig = gshutdown.hotReloadConfig;
-const reopenErrorLog = gshutdown.reopenErrorLog;
-const runDnsDiscoveryRefresh = gshutdown.runDnsDiscoveryRefresh;
-const runActiveHealthChecks = gshutdown.runActiveHealthChecks;
-const runProxyCacheMaintenance = gshutdown.runProxyCacheMaintenance;
-
-const gproxy_runtime = @import("gateway_proxy_runtime.zig");
-const proxySuffixPathForLocation = gproxy_runtime.proxySuffixPathForLocation;
-const handleLocationProxyPass = gproxy_runtime.handleLocationProxyPass;
-const isHttpMethodIdempotent = gproxy_runtime.isHttpMethodIdempotent;
-
-const ghandlers = @import("gateway_handlers.zig");
-const Http3DispatchContext = ghandlers.Http3DispatchContext;
-const handleHttp3Request = ghandlers.handleHttp3Request;
-const routeRequest = ghandlers.routeRequest;
-const primeRequestAuthContext = ghandlers.primeRequestAuthContext;
-const runMiddlewarePipeline = ghandlers.runMiddlewarePipeline;
-const evaluateConditionalRules = ghandlers.evaluateConditionalRules;
-const applyInternalRedirectRules = ghandlers.applyInternalRedirectRules;
-const spawnMirrorRequests = ghandlers.spawnMirrorRequests;
-const logAccess = ghandlers.logAccess;
-const classifyErrorCategory = ghandlers.classifyErrorCategory;
-const parseQueryParam = ghandlers.parseQueryParam;
-const parseLastEventId = ghandlers.parseLastEventId;
-
-const gp = @import("gateway_proxy.zig");
-// Types from gateway_proxy.zig
-const UpstreamHeader = gp.UpstreamHeader;
-const BufferedUpstreamResponse = gp.BufferedUpstreamResponse;
-const MaybeOwnedBytes = gp.MaybeOwnedBytes;
-const ResolvedProxyTarget = gp.ResolvedProxyTarget;
-const UpstreamMappedError = gp.UpstreamMappedError;
-const ProxyExecMappedError = gp.ProxyExecMappedError;
-// Functions from gateway_proxy.zig
-const uriComponentBytes = gp.uriComponentBytes;
-const parseBufferedUpstreamResponse = gp.parseBufferedUpstreamResponse;
-const executeBoundedBufferedUnixSocketHttpRequest = gp.executeBoundedBufferedUnixSocketHttpRequest;
-const bufferedUpstreamResponseHasNoStore = gp.bufferedUpstreamResponseHasNoStore;
-const upstreamReasonPhrase = gp.upstreamReasonPhrase;
-const executeBoundedBufferedHttpProxyRequest = gp.executeBoundedBufferedHttpProxyRequest;
-const executeBoundedBufferedHttpsMtlsRequest = gp.executeBoundedBufferedHttpsMtlsRequest;
-const applyResponseHeaders = gp.applyResponseHeaders;
-const appendAssertedIdentityHeaders = gp.appendAssertedIdentityHeaders;
-const writeAssertedIdentityHeaders = gp.writeAssertedIdentityHeaders;
-const writeStreamedUpstreamResponse = gp.writeStreamedUpstreamResponse;
-const writeStreamedUpstreamResponseHead = gp.writeStreamedUpstreamResponseHead;
-const writeBufferedUpstreamResponse = gp.writeBufferedUpstreamResponse;
-const writeBufferedUpstreamResponseHead = gp.writeBufferedUpstreamResponseHead;
-const appendProxyRequestHeaders = gp.appendProxyRequestHeaders;
-const shouldSkipUpstreamRequestHeader = gp.shouldSkipUpstreamRequestHeader;
-const connectionHeaderReferencesHeader = gp.connectionHeaderReferencesHeader;
-const shouldSkipUpstreamResponseHeader = gp.shouldSkipUpstreamResponseHeader;
-const computeHstsValue = gp.computeHstsValue;
-const writeSecurityHeaders = gp.writeSecurityHeaders;
-const writeChunk = gp.writeChunk;
-const stripPort = gp.stripPort;
-const isTrustedUpstream = gp.isTrustedUpstream;
-const appendTrustedUpstreamHeaders = gp.appendTrustedUpstreamHeaders;
-const buildForwardedFor = gp.buildForwardedFor;
-const upstreamResponseHasNoStore = gp.upstreamResponseHasNoStore;
-const isRedirectStatusCode = gp.isRedirectStatusCode;
-const resolveProxyTarget = gp.resolveProxyTarget;
-const appendProxyQueryString = gp.appendProxyQueryString;
-const resolveRedirectTargetUrl = gp.resolveRedirectTargetUrl;
-const unixSocketPathFromEndpoint = gp.unixSocketPathFromEndpoint;
-const combineProxyTarget = gp.combineProxyTarget;
-const parseUpstreamHost = gp.parseUpstreamHost;
-const mapUpstreamError = gp.mapUpstreamError;
-const mapControlPlaneProxyExecutionError = gp.mapControlPlaneProxyExecutionError;
-const buildApiErrorJson = gp.buildApiErrorJson;
-const setRequestIdHeaders = gp.setRequestIdHeaders;
-const writeRequestIdHeaders = gp.writeRequestIdHeaders;
-const appendRequestIdHeaders = gp.appendRequestIdHeaders;
-const sendApiError = gp.sendApiError;
-const isAbsoluteHttpUrl = gs.isAbsoluteHttpUrl;
-
-const gpr = @import("gateway_protocols.zig");
-const handleFastcgiRoute = gpr.handleFastcgiRoute;
-
-const ga = @import("gateway_auth.zig");
-const AuthResult = ga.AuthResult;
-const AuthFailureReason = ga.AuthFailureReason;
-const authorizeRequest = ga.authorizeRequest;
-const resolveRequestConfig = ga.resolveRequestConfig;
-const hostMatchesServerNames = ga.hostMatchesServerNames;
-const authorizeViaSubrequest = ga.authorizeViaSubrequest;
-const approvalPolicyError = ga.approvalPolicyError;
-const evaluatePolicy = ga.evaluatePolicy;
-const isGeoBlocked = ga.isGeoBlocked;
-const hashBearerToken = ga.hashBearerToken;
-const parseChatMessage = ga.parseChatMessage;
-const parseApprovalRequestBody = ga.parseApprovalRequestBody;
-const parseApprovalResponseBody = ga.parseApprovalResponseBody;
-const routeRequiresApprovalRule = ga.routeRequiresApprovalRule;
-const hostMatchesPatterns = ga.hostMatchesPatterns;
-const gcp = @import("gateway_control_plane_proxy.zig");
-const ControlPlaneProxyResult = gcp.ControlPlaneProxyResult;
-const ControlPlaneProxyExecution = gcp.ControlPlaneProxyExecution;
-const executeBoundedControlPlaneJsonProxy = gcp.executeBoundedControlPlaneJsonProxy;
-const buildProxyCacheKey = gcp.buildProxyCacheKey;
 
 pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     const state_allocator = runtime_allocator.runtimeAllocator();
 
-    const initial_hsts = try computeHstsValue(state_allocator, cfg);
+    const initial_hsts = try gp.computeHstsValue(state_allocator, cfg);
     errdefer if (initial_hsts.len > 0) state_allocator.free(initial_hsts);
 
     var state = GatewayState{
@@ -277,12 +143,12 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
 
     // Load approval state from persistent store (if configured).
     if (cfg.approval_store_path.len > 0) {
-        loadApprovalStore(&state) catch |err| {
+        gs.loadApprovalStore(&state) catch |err| {
             state.logger.warn(null, "failed to load approval store '{s}': {}", .{ cfg.approval_store_path, err });
         };
     }
     if (cfg.session_store_path.len > 0) {
-        loadSessionStore(&state) catch |err| {
+        gs.loadSessionStore(&state) catch |err| {
             state.logger.warn(null, "failed to load session store '{s}': {}", .{ cfg.session_store_path, err });
         };
     }
@@ -328,7 +194,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     defer server.deinit(compat.io());
     const listen_fd = server.socket.handle;
 
-    try setNonBlocking(listen_fd, true);
+    try gconn.setNonBlocking(listen_fd, true);
     applyRuntimeIdentity(cfg, &state.logger) catch |err| {
         state.logger.warn(null, "privilege drop configuration failed: {}", .{err});
     };
@@ -341,7 +207,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     defer config_store.deinit();
     var http3_runtime: ?http.http3_runtime.Runtime = null;
     var tls_terminator: ?http.tls_termination.TlsTerminator = null;
-    var http3_dispatch_ctx = Http3DispatchContext{
+    var http3_dispatch_ctx = ghandlers.Http3DispatchContext{
         .config_store = &config_store,
         .cfg = cfg,
         .state = &state,
@@ -402,7 +268,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
             .enable_0rtt = cfg.http3_enable_0rtt,
             .connection_migration = cfg.http3_connection_migration,
             .max_datagram_size = cfg.http3_max_datagram_size,
-            .request_handler = handleHttp3Request,
+            .request_handler = ghandlers.handleHttp3Request,
             .request_handler_ctx = &http3_dispatch_ctx,
         }) catch |err| switch (err) {
             error.DependencyUnavailable => blk: {
@@ -562,7 +428,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         state.logger.info(null, "Worker pool enabled: workers={d} queue={d}", .{ worker_count, cfg.worker_queue_size });
     }
     if (cfg.fd_soft_limit > 0) {
-        const applied = applyFdSoftLimit(cfg.fd_soft_limit) catch |err| blk: {
+        const applied = gaccept.applyFdSoftLimit(cfg.fd_soft_limit) catch |err| blk: {
             state.logger.warn(null, "failed to apply fd soft limit: {}", .{err});
             break :blk null;
         };
@@ -673,7 +539,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         while (i < event_count) : (i += 1) {
             const ev = ready_events[i];
             if (!ev.readable or ev.fd != listen_fd) continue;
-            acceptReadyConnections(listen_fd, &worker_pool, &state);
+            gaccept.acceptReadyConnections(listen_fd, &worker_pool, &state);
         }
 
         if (timer.consumeTick(http.event_loop.monotonicMs())) {
@@ -686,19 +552,19 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
                 defer current_cfg_lease.release();
                 const current_cfg = current_cfg_lease.cfg;
                 http.access_log.flush();
-                reopenErrorLog(current_cfg) catch |err| {
+                gshutdown.reopenErrorLog(current_cfg) catch |err| {
                     state.logger.warn(null, "log reopen failed: {}", .{err});
                 };
             }
             if (http.shutdown.consumeReloadRequested()) {
-                hotReloadConfig(state_allocator, &worker_ctx, &state, &http3_dispatch_ctx);
+                gshutdown.hotReloadConfig(state_allocator, &worker_ctx, &state, &http3_dispatch_ctx);
             }
             var current_cfg_lease = worker_ctx.acquireConfig();
             defer current_cfg_lease.release();
             const current_cfg = current_cfg_lease.cfg;
-            runActiveHealthChecks(current_cfg, &state, worker_ctx.config_store);
-            runDnsDiscoveryRefresh(current_cfg, &state);
-            runProxyCacheMaintenance(current_cfg, &state);
+            gshutdown.runActiveHealthChecks(current_cfg, &state, worker_ctx.config_store);
+            gshutdown.runDnsDiscoveryRefresh(current_cfg, &state);
+            gshutdown.runProxyCacheMaintenance(current_cfg, &state);
             if (tls_terminator) |*tls| tls.runMaintenance(http.event_loop.monotonicMs());
             const worker_snapshot = worker_pool.snapshot();
             state.metricsSetWorkerPoolStats(
@@ -770,7 +636,7 @@ fn handleAcceptedClient(raw_ctx: *anyopaque, client_fd: std.posix.fd_t) void {
     }
     defer ctx.session_pool.release(session);
 
-    const owned_connection_ip = clientIpFromFd(ctx.state.allocator, client_fd) catch null;
+    const owned_connection_ip = gconn.clientIpFromFd(ctx.state.allocator, client_fd) catch null;
     defer if (owned_connection_ip) |ip| ctx.state.allocator.free(ip);
     const connection_ip = owned_connection_ip orelse "unknown";
 
@@ -782,18 +648,18 @@ fn handleAcceptedClient(raw_ctx: *anyopaque, client_fd: std.posix.fd_t) void {
     else
         cfg.request_limits.header_timeout_ms;
     if (idle_timeout_ms > 0) {
-        setSocketTimeoutMs(client_fd, idle_timeout_ms, idle_timeout_ms) catch |err| {
+        gconn.setSocketTimeoutMs(client_fd, idle_timeout_ms, idle_timeout_ms) catch |err| {
             ctx.state.logger.warn(null, "failed to set client socket timeout: {}", .{err});
         };
     }
 
-    setNonBlocking(client_fd, false) catch |err| {
+    gconn.setNonBlocking(client_fd, false) catch |err| {
         ctx.state.logger.warn(null, "failed to switch client fd to blocking mode: {}", .{err});
         _ = std.c.close(client_fd);
         return;
     };
 
-    setNoDelay(client_fd) catch |err| {
+    gconn.setNoDelay(client_fd) catch |err| {
         ctx.state.logger.warn(null, "failed to set TCP_NODELAY on client fd: {}", .{err});
     };
 
@@ -802,7 +668,7 @@ fn handleAcceptedClient(raw_ctx: *anyopaque, client_fd: std.posix.fd_t) void {
         // The PROXY header is plaintext even on TLS connections and must be consumed
         // before OpenSSL sees the TLS ClientHello.
         if (cfg.proxy_protocol_mode != .off and !session.proxy_protocol_checked) {
-            peekAndConsumeProxyHeaderFromRawFd(
+            gconn.peekAndConsumeProxyHeaderFromRawFd(
                 client_fd,
                 cfg.proxy_protocol_mode,
                 &session.proxy_client_ip_buf,
@@ -1170,12 +1036,12 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
     }
     const pending_buf = session.pending_buf.?;
     if (cfg.max_connection_memory_bytes > 0 and pending_buf.len > cfg.max_connection_memory_bytes) {
-        try sendApiError(allocator, conn.writer(), .payload_too_large, "invalid_request", "Connection memory limit exceeded", null, false, state);
+        try gp.sendApiError(allocator, conn.writer(), .payload_too_large, "invalid_request", "Connection memory limit exceeded", null, false, state);
         return;
     }
 
     if (enable_proxy_protocol and !session.proxy_protocol_checked) {
-        maybeConsumeProxyProtocolPreface(
+        gconn.maybeConsumeProxyProtocolPreface(
             conn,
             cfg.proxy_protocol_mode,
             pending_buf,
@@ -1184,7 +1050,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
             &session.proxy_client_ip_len,
         ) catch |err| {
             state.logger.warn(null, "proxy protocol parse failed: {}", .{err});
-            try sendApiError(allocator, conn.writer(), .bad_request, "invalid_request", "Invalid proxy protocol header", null, false, state);
+            try gp.sendApiError(allocator, conn.writer(), .bad_request, "invalid_request", "Invalid proxy protocol header", null, false, state);
             return;
         };
         session.proxy_protocol_checked = true;
@@ -1192,11 +1058,11 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         session.proxy_protocol_checked = true;
     }
 
-    const total_read = try readHttpRequest(conn, pending_buf, &session.pending_len);
+    const total_read = try gconn.readHttpRequest(conn, pending_buf, &session.pending_len);
     if (total_read == 0) return;
     if (cfg.max_connection_memory_bytes > 0 and total_read > cfg.max_connection_memory_bytes) {
         session.pending_len = 0;
-        try sendApiError(allocator, conn.writer(), .payload_too_large, "invalid_request", "Connection memory limit exceeded", null, false, state);
+        try gp.sendApiError(allocator, conn.writer(), .payload_too_large, "invalid_request", "Connection memory limit exceeded", null, false, state);
         return;
     }
 
@@ -1212,7 +1078,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
             error.ConflictingHeaders, error.InvalidChunkedBody => .bad_request,
             else => .bad_request,
         };
-        try sendApiError(allocator, conn.writer(), status, "invalid_request", "Malformed request", null, keep_alive, state);
+        try gp.sendApiError(allocator, conn.writer(), status, "invalid_request", "Malformed request", null, keep_alive, state);
         state.logger.warn(null, "parse error: {}", .{err});
         return;
     };
@@ -1242,9 +1108,9 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
     // requirement in RFC 1945). HTTP/2 uses :authority and is handled
     // separately in handleHttp3Connection.
     if (request.version == .http11 and request.headers.get("host") == null) {
-        try sendApiError(allocator, writer, .bad_request, "invalid_request", "HTTP/1.1 request missing required Host header", correlation_id, false, state);
+        try gp.sendApiError(allocator, writer, .bad_request, "invalid_request", "HTTP/1.1 request missing required Host header", correlation_id, false, state);
         var ctx_host = http.request_context.RequestContext.init(allocator, correlation_id, connection_ip);
-        logAccess(state, &ctx_host, request.method.toString(), request.uri.path, 400, request.headers.get("user-agent") orelse "");
+        ghandlers.logAccess(state, &ctx_host, request.method.toString(), request.uri.path, 400, request.headers.get("user-agent") orelse "");
         return;
     }
 
@@ -1255,9 +1121,9 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
     // gateway-to-upstream tracing is handled via W3C traceparent headers.
     // Reject before routing so no location block can accidentally serve it.
     if (request.method == .TRACE) {
-        try sendApiError(allocator, writer, .method_not_allowed, "invalid_request", "Method Not Allowed", correlation_id, keep_alive, state);
+        try gp.sendApiError(allocator, writer, .method_not_allowed, "invalid_request", "Method Not Allowed", correlation_id, keep_alive, state);
         var ctx_trace = http.request_context.RequestContext.init(allocator, correlation_id, connection_ip);
-        logAccess(state, &ctx_trace, "TRACE", request.uri.path, 405, request.headers.get("user-agent") orelse "");
+        ghandlers.logAccess(state, &ctx_trace, "TRACE", request.uri.path, 405, request.headers.get("user-agent") orelse "");
         return;
     }
 
@@ -1288,25 +1154,25 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
     }
 
     var effective_cfg_storage = cfg.*;
-    const effective_cfg = resolveRequestConfig(cfg, request.headers.get("host"), &effective_cfg_storage) orelse {
-        try sendApiError(allocator, writer, .not_found, "invalid_request", "Not Found", correlation_id, keep_alive, state);
+    const effective_cfg = ga.resolveRequestConfig(cfg, request.headers.get("host"), &effective_cfg_storage) orelse {
+        try gp.sendApiError(allocator, writer, .not_found, "invalid_request", "Not Found", correlation_id, keep_alive, state);
         var ctx_404 = http.request_context.RequestContext.init(allocator, correlation_id, client_ip);
-        logAccess(state, &ctx_404, request.method.toString(), request.uri.path, 404, request.headers.get("user-agent") orelse "");
+        ghandlers.logAccess(state, &ctx_404, request.method.toString(), request.uri.path, 404, request.headers.get("user-agent") orelse "");
         return;
     };
     var ctx = http.request_context.RequestContext.init(allocator, correlation_id, client_ip);
-    if (!hostMatchesServerNames(effective_cfg, &request)) {
-        try sendApiError(allocator, writer, .not_found, "invalid_request", "Not Found", correlation_id, keep_alive, state);
-        logAccess(state, &ctx, request.method.toString(), request.uri.path, 404, request.headers.get("user-agent") orelse "");
+    if (!ga.hostMatchesServerNames(effective_cfg, &request)) {
+        try gp.sendApiError(allocator, writer, .not_found, "invalid_request", "Not Found", correlation_id, keep_alive, state);
+        ghandlers.logAccess(state, &ctx, request.method.toString(), request.uri.path, 404, request.headers.get("user-agent") orelse "");
         return;
     }
 
     // --- In-flight request backpressure ---
     if (!state.tryAcquireRequestSlot()) {
-        try sendApiError(allocator, writer, .service_unavailable, "overloaded", "Too many in-flight requests", correlation_id, false, state);
+        try gp.sendApiError(allocator, writer, .service_unavailable, "overloaded", "Too many in-flight requests", correlation_id, false, state);
         state.metricsRecord(503);
         state.metricsRecordErrorCode("overloaded");
-        logAccess(state, &ctx, request.method.toString(), request.uri.path, 503, request.headers.get("user-agent") orelse "");
+        ghandlers.logAccess(state, &ctx, request.method.toString(), request.uri.path, 503, request.headers.get("user-agent") orelse "");
         return;
     }
     defer state.releaseRequestSlot();
@@ -1332,7 +1198,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         try request_uri_buf.appendSlice(query);
     }
 
-    var conditional_outcome = try evaluateConditionalRules(
+    var conditional_outcome = try ghandlers.evaluateConditionalRules(
         allocator,
         effective_cfg.conditional_rules,
         request.uri.path,
@@ -1350,10 +1216,10 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
                 var response = http.Response.redirect(allocator, r.location, @enumFromInt(r.status));
                 defer response.deinit();
                 _ = response.setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
-                applyResponseHeaders(state, &response);
+                gp.applyResponseHeaders(state, &response);
                 try response.write(writer);
                 state.metricsRecord(r.status);
-                logAccess(state, &ctx, request.method.toString(), request.uri.path, r.status, request.headers.get("user-agent") orelse "");
+                ghandlers.logAccess(state, &ctx, request.method.toString(), request.uri.path, r.status, request.headers.get("user-agent") orelse "");
                 return;
             },
             .returned => |r| {
@@ -1361,10 +1227,10 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
                     var response = http.Response.redirect(allocator, r.body, @enumFromInt(r.status));
                     defer response.deinit();
                     _ = response.setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
-                    applyResponseHeaders(state, &response);
+                    gp.applyResponseHeaders(state, &response);
                     try response.write(writer);
                     state.metricsRecord(r.status);
-                    logAccess(state, &ctx, request.method.toString(), request.uri.path, r.status, request.headers.get("user-agent") orelse "");
+                    ghandlers.logAccess(state, &ctx, request.method.toString(), request.uri.path, r.status, request.headers.get("user-agent") orelse "");
                     return;
                 }
                 var response = http.Response.init(allocator);
@@ -1374,10 +1240,10 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
                     .setContentType("text/plain; charset=utf-8")
                     .setConnection(keep_alive)
                     .setHeader(http.correlation.HEADER_NAME, correlation_id);
-                applyResponseHeaders(state, &response);
+                gp.applyResponseHeaders(state, &response);
                 try response.write(writer);
                 state.metricsRecord(r.status);
-                logAccess(state, &ctx, request.method.toString(), request.uri.path, r.status, request.headers.get("user-agent") orelse "");
+                ghandlers.logAccess(state, &ctx, request.method.toString(), request.uri.path, r.status, request.headers.get("user-agent") orelse "");
                 return;
             },
         }
@@ -1400,10 +1266,10 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
             var response = http.Response.redirect(allocator, r.location, @enumFromInt(r.status));
             defer response.deinit();
             _ = response.setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
-            applyResponseHeaders(state, &response);
+            gp.applyResponseHeaders(state, &response);
             try response.write(writer);
             state.metricsRecord(r.status);
-            logAccess(state, &ctx, request.method.toString(), request.uri.path, r.status, request.headers.get("user-agent") orelse "");
+            ghandlers.logAccess(state, &ctx, request.method.toString(), request.uri.path, r.status, request.headers.get("user-agent") orelse "");
             return;
         },
         .returned => |r| {
@@ -1411,10 +1277,10 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
                 var response = http.Response.redirect(allocator, r.body, @enumFromInt(r.status));
                 defer response.deinit();
                 _ = response.setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
-                applyResponseHeaders(state, &response);
+                gp.applyResponseHeaders(state, &response);
                 try response.write(writer);
                 state.metricsRecord(r.status);
-                logAccess(state, &ctx, request.method.toString(), request.uri.path, r.status, request.headers.get("user-agent") orelse "");
+                ghandlers.logAccess(state, &ctx, request.method.toString(), request.uri.path, r.status, request.headers.get("user-agent") orelse "");
                 return;
             }
             var response = http.Response.init(allocator);
@@ -1424,16 +1290,16 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
                 .setContentType("text/plain; charset=utf-8")
                 .setConnection(keep_alive)
                 .setHeader(http.correlation.HEADER_NAME, correlation_id);
-            applyResponseHeaders(state, &response);
+            gp.applyResponseHeaders(state, &response);
             try response.write(writer);
             state.metricsRecord(r.status);
-            logAccess(state, &ctx, request.method.toString(), request.uri.path, r.status, request.headers.get("user-agent") orelse "");
+            ghandlers.logAccess(state, &ctx, request.method.toString(), request.uri.path, r.status, request.headers.get("user-agent") orelse "");
             return;
         },
     }
 
     // --- Internal redirects / named locations ---
-    request.uri.path = applyInternalRedirectRules(
+    request.uri.path = ghandlers.applyInternalRedirectRules(
         request.method.toString(),
         request.uri.path,
         effective_cfg.internal_redirect_rules,
@@ -1442,7 +1308,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
 
     // --- Mirror requests (best-effort async) ---
     if (effective_cfg.mirror_rules.len > 0) {
-        spawnMirrorRequests(
+        ghandlers.spawnMirrorRequests(
             allocator,
             effective_cfg.mirror_rules,
             request.method.toString(),
@@ -1454,314 +1320,25 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         );
     }
 
-    try primeRequestAuthContext(allocator, effective_cfg, state, &ctx, &request.headers);
+    try ghandlers.primeRequestAuthContext(allocator, effective_cfg, state, &ctx, &request.headers);
 
-    if (try runMiddlewarePipeline(allocator, writer, effective_cfg, state, &ctx, &request, correlation_id, keep_alive)) {
+    if (try ghandlers.runMiddlewarePipeline(allocator, writer, effective_cfg, state, &ctx, &request, correlation_id, keep_alive)) {
         return;
     }
 
     // Deadline check: if the overall request deadline elapsed during auth/middleware,
     // reject now rather than dispatching to the (potentially slow) upstream handler.
     if (lifecycle.checkDeadline(.routing)) {
-        try sendApiError(allocator, writer, .request_timeout, "request_timeout", "Request deadline exceeded", correlation_id, keep_alive, state);
+        try gp.sendApiError(allocator, writer, .request_timeout, "request_timeout", "Request deadline exceeded", correlation_id, keep_alive, state);
         state.metricsRecord(408);
         state.metricsRecordErrorCode("request_timeout");
-        logAccess(state, &ctx, request.method.toString(), request.uri.path, 408, request.headers.get("user-agent") orelse "");
+        ghandlers.logAccess(state, &ctx, request.method.toString(), request.uri.path, 408, request.headers.get("user-agent") orelse "");
         return;
     }
 
-    const route_status = try routeRequest(conn, allocator, effective_cfg, state, &ctx, &request, correlation_id, &keep_alive, client_ip);
-    logAccess(state, &ctx, request.method.toString(), request.uri.path, route_status, request.headers.get("user-agent") orelse "");
+    const route_status = try ghandlers.routeRequest(conn, allocator, effective_cfg, state, &ctx, &request, correlation_id, &keep_alive, client_ip);
+    ghandlers.logAccess(state, &ctx, request.method.toString(), request.uri.path, route_status, request.headers.get("user-agent") orelse "");
     return;
-}
-
-test "buildForwardedFor appends client ip" {
-    const allocator = std.testing.allocator;
-    var value = try buildForwardedFor(allocator, "10.0.0.1, 10.0.0.2", "127.0.0.1");
-    defer value.deinit(allocator);
-    try std.testing.expectEqualStrings("10.0.0.1, 10.0.0.2, 127.0.0.1", value.value);
-}
-
-test "buildForwardedFor borrows client ip when no incoming chain exists" {
-    const value = try buildForwardedFor(std.testing.allocator, null, "127.0.0.1");
-    try std.testing.expect(value.owned == null);
-    try std.testing.expectEqualStrings("127.0.0.1", value.value);
-}
-
-test "parseUpstreamHost extracts authority" {
-    try std.testing.expectEqualStrings("127.0.0.1:8080", parseUpstreamHost("http://127.0.0.1:8080") orelse "");
-    try std.testing.expectEqualStrings("api.example.com", parseUpstreamHost("https://api.example.com/v1") orelse "");
-    try std.testing.expect(parseUpstreamHost("invalid-url") == null);
-}
-
-test "buildHealthProbeUrl joins base and probe path" {
-    const allocator = std.testing.allocator;
-    const url = try http.health_checker.buildProbeUrl(allocator, "http://127.0.0.1:8080/", "/status");
-    defer allocator.free(url);
-    try std.testing.expectEqualStrings("http://127.0.0.1:8080/status", url);
-}
-
-test "parse proxy protocol v1 header extracts source ip" {
-    var ip_buf: [64]u8 = undefined;
-    const header = "PROXY TCP4 203.0.113.9 10.0.0.5 443 8080\r\nGET / HTTP/1.1\r\n\r\n";
-    const parsed = parseProxyHeader(header, .v1, &ip_buf);
-    switch (parsed) {
-        .parsed => |result| {
-            try std.testing.expectEqual(@as(usize, 42), result.consumed);
-            try std.testing.expectEqualStrings("203.0.113.9", ip_buf[0..result.client_ip_len]);
-        },
-        else => return error.UnexpectedTestResult,
-    }
-}
-
-test "parse proxy protocol auto mode ignores non-proxy preface" {
-    var ip_buf: [64]u8 = undefined;
-    const header = "GET / HTTP/1.1\r\nHost: example\r\n\r\n";
-    const parsed = parseProxyHeader(header, .auto, &ip_buf);
-    try std.testing.expect(parsed == .no_header);
-}
-
-test "parse proxy protocol v2 header extracts source ip" {
-    var ip_buf: [64]u8 = undefined;
-    const header = [_]u8{
-        0x0d, 0x0a, 0x0d, 0x0a, 0x00, 0x0d, 0x0a, 0x51, 0x55, 0x49, 0x54, 0x0a,
-        0x21, 0x11, 0x00, 0x0c, 203,  0,    113,  44,   10,   0,    0,    2,
-        0x01, 0xbb, 0x1f, 0x90,
-    };
-    const parsed = parseProxyHeader(header[0..], .v2, &ip_buf);
-    switch (parsed) {
-        .parsed => |result| {
-            try std.testing.expectEqual(@as(usize, 28), result.consumed);
-            try std.testing.expectEqualStrings("203.0.113.44", ip_buf[0..result.client_ip_len]);
-        },
-        else => return error.UnexpectedTestResult,
-    }
-}
-
-test "clientIpFromAddress formats ipv4 address" {
-    var storage: std.c.sockaddr.storage = std.mem.zeroes(std.c.sockaddr.storage);
-    var sin: *std.c.sockaddr.in = @ptrCast(&storage);
-    sin.family = std.posix.AF.INET;
-    sin.addr = std.mem.nativeToBig(u32, (203 << 24) | (0 << 16) | (113 << 8) | 9);
-    const ip = try clientIpFromAddress(std.testing.allocator, &storage);
-    defer std.testing.allocator.free(ip);
-
-    try std.testing.expectEqualStrings("203.0.113.9", ip);
-}
-
-test "clientIpFromAddress formats ipv6 address" {
-    var storage: std.c.sockaddr.storage = std.mem.zeroes(std.c.sockaddr.storage);
-    var sin6: *std.c.sockaddr.in6 = @ptrCast(&storage);
-    sin6.family = std.posix.AF.INET6;
-    // 2001:0db8::0044
-    const addr = [16]u8{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x44 };
-    sin6.addr = addr;
-    const ip = try clientIpFromAddress(std.testing.allocator, &storage);
-    defer std.testing.allocator.free(ip);
-
-    try std.testing.expectEqualStrings("2001:db8:0:0:0:0:0:44", ip);
-}
-
-test "firstRequestCompleteLen detects pipelined boundary" {
-    const pipelined =
-        "GET /one HTTP/1.1\r\nHost: localhost\r\n\r\n" ++
-        "GET /two HTTP/1.1\r\nHost: localhost\r\n\r\n";
-    const first_len = firstRequestCompleteLen(pipelined).?;
-    try std.testing.expectEqual(@as(usize, 38), first_len);
-}
-
-test "firstRequestCompleteLen waits for complete body" {
-    const partial = "POST /x HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nhel";
-    try std.testing.expect(firstRequestCompleteLen(partial) == null);
-
-    const complete = "POST /x HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nhello";
-    try std.testing.expectEqual(@as(usize, complete.len), firstRequestCompleteLen(complete).?);
-}
-
-test "firstRequestCompleteLen handles keep-alive pipelined requests" {
-    const reqs =
-        "GET /a HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n" ++
-        "GET /b HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
-    const first_len = firstRequestCompleteLen(reqs).?;
-    const first = reqs[0..first_len];
-    try std.testing.expect(std.mem.find(u8, first, "GET /a") != null);
-    try std.testing.expect(std.mem.find(u8, first, "keep-alive") != null);
-}
-
-test "combineProxyTarget joins prefix and suffix" {
-    const allocator = std.testing.allocator;
-    const joined = try combineProxyTarget(allocator, "/api", "/api/messages");
-    defer allocator.free(joined);
-    try std.testing.expectEqualStrings("/api/api/messages", joined);
-}
-
-test "proxySuffixPathForLocation uses mount prefix for split upstream exact route" {
-    const blocks = [_]edge_config.EdgeConfig.LocationBlock{
-        .{
-            .match_type = .exact,
-            .pattern = "/ursa/health",
-            .priority = 0,
-            .action = .{ .proxy_pass = "http://127.0.0.1:18443" },
-        },
-        .{
-            .match_type = .prefix,
-            .pattern = "/ursa/",
-            .priority = 1,
-            .action = .{ .proxy_pass = "http://127.0.0.1:6707" },
-        },
-    };
-
-    const matched = http.location_router.matchLocation("/ursa/health", &blocks).?;
-    const suffix = proxySuffixPathForLocation("/ursa/health", matched, &blocks).?;
-    try std.testing.expectEqualStrings("health", suffix);
-}
-
-test "proxySuffixPathForLocation keeps mount prefix for split upstream longer prefix route" {
-    const blocks = [_]edge_config.EdgeConfig.LocationBlock{
-        .{
-            .match_type = .prefix_priority,
-            .pattern = "/ursa/download/",
-            .priority = 0,
-            .action = .{ .proxy_pass = "http://127.0.0.1:18443" },
-        },
-        .{
-            .match_type = .prefix,
-            .pattern = "/ursa/",
-            .priority = 1,
-            .action = .{ .proxy_pass = "http://127.0.0.1:6707" },
-        },
-    };
-
-    const matched = http.location_router.matchLocation("/ursa/download/file.bin", &blocks).?;
-    const suffix = proxySuffixPathForLocation("/ursa/download/file.bin", matched, &blocks).?;
-    try std.testing.expectEqualStrings("download/file.bin", suffix);
-}
-
-test "resolveProxyTarget handles absolute and relative proxy_pass" {
-    const allocator = std.testing.allocator;
-    const cfg = std.mem.zeroInit(edge_config.EdgeConfig, .{
-        .upstream_base_url = "http://127.0.0.1:8080",
-    });
-
-    const abs = try resolveProxyTarget(allocator, cfg.upstream_base_url, "https://api.example.com/base", "/api/messages");
-    defer allocator.free(abs.url);
-    try std.testing.expectEqualStrings("https://api.example.com/base/api/messages", abs.url);
-    try std.testing.expectEqualStrings("api.example.com", abs.upstream_host);
-
-    const rel = try resolveProxyTarget(allocator, cfg.upstream_base_url, "/gateway", "/v1/tools");
-    defer allocator.free(rel.url);
-    try std.testing.expectEqualStrings("http://127.0.0.1:8080/gateway/v1/tools", rel.url);
-    try std.testing.expectEqualStrings("127.0.0.1:8080", rel.upstream_host);
-}
-
-test "resolveProxyTarget supports unix socket upstream base" {
-    const allocator = std.testing.allocator;
-    const resolved = try resolveProxyTarget(allocator, "unix:/tmp/tardigrade.sock", "/gateway", "/api/messages");
-    defer allocator.free(resolved.url);
-    try std.testing.expectEqualStrings("http://localhost/gateway/api/messages", resolved.url);
-    try std.testing.expectEqualStrings("/tmp/tardigrade.sock", resolved.upstream_host);
-    try std.testing.expect(resolved.unix_socket_path != null);
-    try std.testing.expectEqualStrings("/tmp/tardigrade.sock", resolved.unix_socket_path.?);
-}
-
-test "appendProxyQueryString preserves request query" {
-    const allocator = std.testing.allocator;
-
-    var appended = try appendProxyQueryString(allocator, "http://127.0.0.1:8080/auth/login", "next=%2F");
-    defer appended.deinit(allocator);
-    try std.testing.expectEqualStrings("http://127.0.0.1:8080/auth/login?next=%2F", appended.value);
-
-    var appended_existing = try appendProxyQueryString(allocator, "http://127.0.0.1:8080/auth/login?foo=bar", "next=%2F");
-    defer appended_existing.deinit(allocator);
-    try std.testing.expectEqualStrings("http://127.0.0.1:8080/auth/login?foo=bar&next=%2F", appended_existing.value);
-}
-
-test "appendProxyQueryString borrows base url when request has no query" {
-    const base = "http://127.0.0.1:8080/auth/login";
-    const appended = try appendProxyQueryString(std.testing.allocator, base, null);
-    try std.testing.expect(appended.owned == null);
-    try std.testing.expectEqual(@intFromPtr(base.ptr), @intFromPtr(appended.value.ptr));
-}
-
-test "parseChatMessage validates payload" {
-    const allocator = std.testing.allocator;
-    const message = try parseChatMessage(allocator, "{\"message\":\"hello\"}", 10);
-    defer allocator.free(message);
-    try std.testing.expectEqualStrings("hello", message);
-
-    try std.testing.expectError(error.MessageTooLarge, parseChatMessage(allocator, "{\"message\":\"hello\"}", 2));
-}
-
-test "buildProxyCacheKey supports template tokens" {
-    const allocator = std.testing.allocator;
-    const key = try buildProxyCacheKey(
-        allocator,
-        "method:path:identity:api_version",
-        "POST",
-        "/api/messages",
-        "{\"message\":\"hello\"}",
-        "identity-1",
-        2,
-    );
-    defer allocator.free(key);
-    try std.testing.expectEqualStrings("POST:/api/messages:identity-1:2", key);
-}
-
-test "buildProxyCacheKey falls back for unknown template tokens" {
-    const allocator = std.testing.allocator;
-    const payload = "{\"command\":\"list_tools\"}";
-    const key = try buildProxyCacheKey(
-        allocator,
-        "unknown:also_unknown",
-        "POST",
-        "/api/tasks",
-        payload,
-        null,
-        null,
-    );
-    defer allocator.free(key);
-
-    var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(payload, &digest, .{});
-    const expected = try std.fmt.allocPrint(allocator, "POST:/api/tasks:{f}", .{compat.fmtSliceHexLower(&digest)});
-    defer allocator.free(expected);
-    try std.testing.expectEqualStrings(expected, key);
-}
-
-test "shouldSkipUpstreamRequestHeader strips inbound X-Tardigrade headers" {
-    try std.testing.expect(shouldSkipUpstreamRequestHeader("X-Tardigrade-Auth-Identity", null));
-    try std.testing.expect(shouldSkipUpstreamRequestHeader("x-tardigrade-user-id", null));
-    try std.testing.expect(shouldSkipUpstreamRequestHeader("X-TARDIGRADE-DEVICE-ID", null));
-    try std.testing.expect(shouldSkipUpstreamRequestHeader("x-tardigrade-scopes", null));
-    try std.testing.expect(shouldSkipUpstreamRequestHeader("x-tardigrade-anything-custom", null));
-    try std.testing.expect(!shouldSkipUpstreamRequestHeader("X-Custom-Header", null));
-    try std.testing.expect(!shouldSkipUpstreamRequestHeader("Authorization", null));
-    try std.testing.expect(!shouldSkipUpstreamRequestHeader("Content-Type", null));
-}
-
-test "shouldSkipUpstreamRequestHeader strips standard hop-by-hop headers" {
-    try std.testing.expect(shouldSkipUpstreamRequestHeader("Connection", null));
-    try std.testing.expect(shouldSkipUpstreamRequestHeader("Keep-Alive", null));
-    try std.testing.expect(shouldSkipUpstreamRequestHeader("Proxy-Authenticate", null));
-    try std.testing.expect(shouldSkipUpstreamRequestHeader("Proxy-Authorization", null));
-    try std.testing.expect(shouldSkipUpstreamRequestHeader("TE", null));
-    try std.testing.expect(shouldSkipUpstreamRequestHeader("Trailer", null));
-    try std.testing.expect(shouldSkipUpstreamRequestHeader("Transfer-Encoding", null));
-    try std.testing.expect(shouldSkipUpstreamRequestHeader("Upgrade", null));
-}
-
-test "shouldSkipUpstreamRequestHeader strips headers named by Connection" {
-    const connection_header = "X-Test-Hop, keep-alive, Another-Hop";
-    try std.testing.expect(shouldSkipUpstreamRequestHeader("X-Test-Hop", connection_header));
-    try std.testing.expect(shouldSkipUpstreamRequestHeader("another-hop", connection_header));
-    try std.testing.expect(shouldSkipUpstreamRequestHeader("Keep-Alive", connection_header));
-    try std.testing.expect(!shouldSkipUpstreamRequestHeader("X-Not-Hop", connection_header));
-}
-
-test "shouldSkipUpstreamResponseHeader strips stale content-encoding" {
-    try std.testing.expect(shouldSkipUpstreamResponseHeader("Content-Encoding"));
-    try std.testing.expect(shouldSkipUpstreamResponseHeader("content-encoding"));
-    try std.testing.expect(!shouldSkipUpstreamResponseHeader("Content-Type"));
 }
 
 test "HTTP/1.1 missing Host header rejected — version and header presence check" {
@@ -1829,235 +1406,4 @@ test "return_response method enforcement — non-GET/HEAD rejected on static ret
     // Redirect: method enforcement is skipped
     const is_redirect_302 = (302 >= 300 and 302 < 400);
     try std.testing.expect(is_redirect_302);
-}
-
-test "shouldSkipUpstreamResponseHeader strips upstream Server and X-Powered-By" {
-    // WSTG-INFO-02 / ASVS-14.3.3: upstream technology headers must not leak
-    // to external clients — Tardigrade emits its own Server header instead.
-    try std.testing.expect(shouldSkipUpstreamResponseHeader("Server"));
-    try std.testing.expect(shouldSkipUpstreamResponseHeader("server"));
-    try std.testing.expect(shouldSkipUpstreamResponseHeader("SERVER"));
-    try std.testing.expect(shouldSkipUpstreamResponseHeader("X-Powered-By"));
-    try std.testing.expect(shouldSkipUpstreamResponseHeader("x-powered-by"));
-    try std.testing.expect(shouldSkipUpstreamResponseHeader("X-POWERED-BY"));
-    // Must not suppress unrelated headers
-    try std.testing.expect(!shouldSkipUpstreamResponseHeader("Content-Type"));
-    try std.testing.expect(!shouldSkipUpstreamResponseHeader("X-Custom-Header"));
-    try std.testing.expect(!shouldSkipUpstreamResponseHeader("Set-Cookie"));
-}
-
-test "writeBufferedUpstreamResponse serializes a single forwarded response head" {
-    const allocator = std.testing.allocator;
-    const body = try allocator.dupe(u8, "pong");
-    var upstream_headers = [_]UpstreamHeader{
-        .{ .name = "Content-Type", .value = "text/plain" },
-        .{ .name = "Location", .value = "/health" },
-        .{ .name = "Server", .value = "python" },
-        .{ .name = "X-Upstream-Test", .value = "1" },
-    };
-
-    var response = BufferedUpstreamResponse{
-        .metadata_arena = std.heap.ArenaAllocator.init(allocator),
-        .status_code = 200,
-        .reason = "OK",
-        .headers = upstream_headers[0..],
-        .body = body,
-    };
-    defer response.deinit(allocator);
-
-    var buf: [4096]u8 = undefined;
-    var stream = compat.fixedBufferStream(&buf);
-    try writeBufferedUpstreamResponse(
-        stream.writer(),
-        &response,
-        true,
-        "tg-1778460305668-bfebecb410803023",
-        &http.security_headers.SecurityHeaders.api,
-        "tg_sticky=proxy",
-    );
-
-    const output = stream.getWritten();
-    try std.testing.expect(std.mem.startsWith(u8, output, "HTTP/1.1 200 OK\r\n"));
-    try std.testing.expect(std.mem.find(u8, output, "Server: tardigrade\r\n") != null);
-    try std.testing.expect(std.mem.find(u8, output, "Connection: keep-alive\r\n") != null);
-    try std.testing.expect(std.mem.find(u8, output, "Content-Length: 4\r\n") != null);
-    try std.testing.expect(std.mem.find(u8, output, "Content-Type: text/plain\r\n") != null);
-    try std.testing.expect(std.mem.find(u8, output, "Location: /health\r\n") != null);
-    try std.testing.expect(std.mem.find(u8, output, "X-Upstream-Test: 1\r\n") != null);
-    try std.testing.expect(std.mem.find(u8, output, "Set-Cookie: tg_sticky=proxy\r\n") != null);
-    try std.testing.expect(std.mem.find(u8, output, "X-Request-ID: tg-1778460305668-bfebecb410803023\r\n") != null);
-    try std.testing.expect(std.mem.find(u8, output, "X-Correlation-ID: tg-1778460305668-bfebecb410803023\r\n") != null);
-    try std.testing.expect(std.mem.find(u8, output, "Server: python\r\n") == null);
-    try std.testing.expect(std.mem.endsWith(u8, output, "\r\n\r\npong"));
-}
-
-test "mapUpstreamError returns stable codes" {
-    const mapped = mapUpstreamError(502);
-    try std.testing.expectEqual(@as(u16, 503), mapped.status);
-    try std.testing.expectEqualStrings("tool_unavailable", mapped.code);
-}
-
-test "classifyErrorCategory maps statuses" {
-    try std.testing.expectEqualStrings("-", classifyErrorCategory(200));
-    try std.testing.expectEqualStrings("invalid_request", classifyErrorCategory(400));
-    try std.testing.expectEqualStrings("authz", classifyErrorCategory(401));
-    try std.testing.expectEqualStrings("rate_limited", classifyErrorCategory(429));
-    try std.testing.expectEqualStrings("upstream_unavailable", classifyErrorCategory(503));
-    try std.testing.expectEqualStrings("upstream_timeout", classifyErrorCategory(504));
-    try std.testing.expectEqualStrings("internal_error", classifyErrorCategory(500));
-}
-
-test "parseQueryParam extracts topic" {
-    const value = parseQueryParam("topic=alerts&foo=bar", "topic");
-    try std.testing.expect(value != null);
-    try std.testing.expectEqualStrings("alerts", value.?);
-    try std.testing.expect(parseQueryParam("foo=bar", "topic") == null);
-}
-
-test "parseLastEventId handles invalid values" {
-    try std.testing.expectEqual(@as(u64, 42), parseLastEventId("42"));
-    try std.testing.expectEqual(@as(u64, 0), parseLastEventId("bad"));
-    try std.testing.expectEqual(@as(u64, 0), parseLastEventId(null));
-}
-
-test "routeRequiresApprovalRule detects approval requirement" {
-    try std.testing.expect(routeRequiresApprovalRule("POST", "/api/tasks", "POST|/api/tasks|ops|true||"));
-    try std.testing.expect(!routeRequiresApprovalRule("POST", "/api/messages", "POST|/api/tasks|ops|true||"));
-}
-
-test "evaluatePolicy bypasses approval management endpoints" {
-    const allocator = std.testing.allocator;
-    var headers = http.Headers.init(allocator);
-    defer headers.deinit();
-
-    var cfg = std.mem.zeroes(edge_config.EdgeConfig);
-    cfg.policy_approval_routes_raw = "POST|^/v1/commands$";
-
-    var state: GatewayState = undefined;
-    try std.testing.expect(evaluatePolicy(&state, &cfg, "POST", "/approvals/request", null, null, &headers) == null);
-    try std.testing.expect(evaluatePolicy(&state, &cfg, "POST", "/approvals/respond", null, null, &headers) == null);
-    try std.testing.expect(evaluatePolicy(&state, &cfg, "GET", "/approvals/status", null, null, &headers) == null);
-}
-
-test "parseApprovalResponseBody parses approve and deny" {
-    const allocator = std.testing.allocator;
-    var approve = try parseApprovalResponseBody(allocator, "{\"approval_token\":\"tok-1\",\"decision\":\"approve\"}");
-    defer approve.deinit(allocator);
-    try std.testing.expectEqualStrings("tok-1", approve.token);
-    try std.testing.expectEqual(ApprovalDecision.approve, approve.decision);
-
-    var deny = try parseApprovalResponseBody(allocator, "{\"approval_token\":\"tok-2\",\"decision\":\"deny\"}");
-    defer deny.deinit(allocator);
-    try std.testing.expectEqualStrings("tok-2", deny.token);
-    try std.testing.expectEqual(ApprovalDecision.deny, deny.decision);
-}
-
-test "parseApprovalRequestBody parses command scoped request" {
-    const allocator = std.testing.allocator;
-    var req = try parseApprovalRequestBody(allocator, "{\"method\":\"POST\",\"path\":\"/api/tasks\",\"command_id\":\"cmd-123\"}");
-    defer req.deinit(allocator);
-    try std.testing.expectEqualStrings("POST", req.method);
-    try std.testing.expectEqualStrings("/api/tasks", req.path);
-    try std.testing.expect(req.command_id != null);
-    try std.testing.expectEqualStrings("cmd-123", req.command_id.?);
-}
-
-test "isHttpMethodIdempotent classifies idempotent methods" {
-    // Idempotent methods (RFC 9110 §9.2)
-    try std.testing.expect(isHttpMethodIdempotent("GET"));
-    try std.testing.expect(isHttpMethodIdempotent("HEAD"));
-    try std.testing.expect(isHttpMethodIdempotent("PUT"));
-    try std.testing.expect(isHttpMethodIdempotent("DELETE"));
-    try std.testing.expect(isHttpMethodIdempotent("OPTIONS"));
-    try std.testing.expect(isHttpMethodIdempotent("TRACE"));
-    // Case-insensitive
-    try std.testing.expect(isHttpMethodIdempotent("get"));
-    try std.testing.expect(isHttpMethodIdempotent("Get"));
-    try std.testing.expect(isHttpMethodIdempotent("delete"));
-}
-
-test "isHttpMethodIdempotent rejects non-idempotent methods" {
-    try std.testing.expect(!isHttpMethodIdempotent("POST"));
-    try std.testing.expect(!isHttpMethodIdempotent("PATCH"));
-    try std.testing.expect(!isHttpMethodIdempotent("post"));
-    try std.testing.expect(!isHttpMethodIdempotent(""));
-    // Oversized input should not crash
-    try std.testing.expect(!isHttpMethodIdempotent("VERYLONGMETHODNAME"));
-}
-
-test "upstream_retry_idempotent_only default true limits POST retries to 1" {
-    // When idempotent_only is true and method is POST, max_attempts must be 1
-    // regardless of upstream_retry_attempts.
-    const attempts: u32 = 3;
-    const idempotent_only = true;
-    const method = "POST";
-    const max: usize = if (idempotent_only and !isHttpMethodIdempotent(method))
-        1
-    else
-        @intCast(@max(attempts, @as(u32, 1)));
-    try std.testing.expectEqual(@as(usize, 1), max);
-}
-
-test "upstream_retry_idempotent_only allows GET retries" {
-    const attempts: u32 = 3;
-    const idempotent_only = true;
-    const method = "GET";
-    const max: usize = if (idempotent_only and !isHttpMethodIdempotent(method))
-        1
-    else
-        @intCast(@max(attempts, @as(u32, 1)));
-    try std.testing.expectEqual(@as(usize, 3), max);
-}
-
-test "upstream_retry_idempotent_only=false allows POST retries" {
-    const attempts: u32 = 3;
-    const idempotent_only = false;
-    const method = "POST";
-    const max: usize = if (idempotent_only and !isHttpMethodIdempotent(method))
-        1
-    else
-        @intCast(@max(attempts, @as(u32, 1)));
-    try std.testing.expectEqual(@as(usize, 3), max);
-}
-
-test "serveTryFilesFallback: top-level root without try_files defaults to $uri" {
-    // Regression test for #92: operators who configure only `root /path;` at
-    // the server level (without a `try_files` directive or a `location /`
-    // block) expect static files to be served for paths that exist in the
-    // webroot.  Without try_files, serveTryFilesFallback previously bailed
-    // immediately, producing 404 for all files even when the file exists.
-    // The fix: when doc_root is set and try_files is empty, effective_try_files
-    // defaults to "$uri".
-    const effective_try_files_with_no_try_files: []const u8 = if ("".len > 0) "" else "$uri";
-    const effective_try_files_with_try_files: []const u8 = if ("$uri /index.html".len > 0) "$uri /index.html" else "$uri";
-    try std.testing.expectEqualStrings("$uri", effective_try_files_with_no_try_files);
-    try std.testing.expectEqualStrings("$uri /index.html", effective_try_files_with_try_files);
-
-    // Full path: create a temp root with health.txt and verify serve() resolves
-    // it when try_files defaults to "$uri".
-    const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "health.txt", .data = "abc" });
-    const root_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
-    defer allocator.free(root_path);
-
-    var hdrs = http.Headers.init(allocator);
-    defer hdrs.deinit();
-
-    const result = try http.static_file.serve(allocator, .{
-        .root = root_path,
-        .request_path = "/health.txt",
-        .matched_pattern = "/",
-        .alias = false,
-        .index = "",
-        .try_files = "$uri", // the defaulted value
-        .headers = &hdrs,
-        .max_bytes = MAX_REQUEST_SIZE,
-    });
-    try std.testing.expect(result != null);
-    var served = result.?;
-    defer served.deinit(allocator);
-    try std.testing.expectEqual(http.status.Status.ok, served.status_code);
-    try std.testing.expectEqual(@as(usize, 3), served.content_length);
 }

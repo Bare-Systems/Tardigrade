@@ -311,3 +311,90 @@ pub fn parseContentLength(headers: []const u8) ?usize {
     }
     return null;
 }
+
+test "parse proxy protocol v1 header extracts source ip" {
+    var ip_buf: [64]u8 = undefined;
+    const header = "PROXY TCP4 203.0.113.9 10.0.0.5 443 8080\r\nGET / HTTP/1.1\r\n\r\n";
+    const parsed = parseProxyHeader(header, .v1, &ip_buf);
+    switch (parsed) {
+        .parsed => |result| {
+            try std.testing.expectEqual(@as(usize, 42), result.consumed);
+            try std.testing.expectEqualStrings("203.0.113.9", ip_buf[0..result.client_ip_len]);
+        },
+        else => return error.UnexpectedTestResult,
+    }
+}
+
+test "parse proxy protocol auto mode ignores non-proxy preface" {
+    var ip_buf: [64]u8 = undefined;
+    const header = "GET / HTTP/1.1\r\nHost: example\r\n\r\n";
+    const parsed = parseProxyHeader(header, .auto, &ip_buf);
+    try std.testing.expect(parsed == .no_header);
+}
+
+test "parse proxy protocol v2 header extracts source ip" {
+    var ip_buf: [64]u8 = undefined;
+    const header = [_]u8{
+        0x0d, 0x0a, 0x0d, 0x0a, 0x00, 0x0d, 0x0a, 0x51, 0x55, 0x49, 0x54, 0x0a,
+        0x21, 0x11, 0x00, 0x0c, 203,  0,    113,  44,   10,   0,    0,    2,
+        0x01, 0xbb, 0x1f, 0x90,
+    };
+    const parsed = parseProxyHeader(header[0..], .v2, &ip_buf);
+    switch (parsed) {
+        .parsed => |result| {
+            try std.testing.expectEqual(@as(usize, 28), result.consumed);
+            try std.testing.expectEqualStrings("203.0.113.44", ip_buf[0..result.client_ip_len]);
+        },
+        else => return error.UnexpectedTestResult,
+    }
+}
+
+test "clientIpFromAddress formats ipv4 address" {
+    var storage: std.c.sockaddr.storage = std.mem.zeroes(std.c.sockaddr.storage);
+    var sin: *std.c.sockaddr.in = @ptrCast(&storage);
+    sin.family = std.posix.AF.INET;
+    sin.addr = std.mem.nativeToBig(u32, (203 << 24) | (0 << 16) | (113 << 8) | 9);
+    const ip = try clientIpFromAddress(std.testing.allocator, &storage);
+    defer std.testing.allocator.free(ip);
+
+    try std.testing.expectEqualStrings("203.0.113.9", ip);
+}
+
+test "clientIpFromAddress formats ipv6 address" {
+    var storage: std.c.sockaddr.storage = std.mem.zeroes(std.c.sockaddr.storage);
+    var sin6: *std.c.sockaddr.in6 = @ptrCast(&storage);
+    sin6.family = std.posix.AF.INET6;
+    // 2001:0db8::0044
+    const addr = [16]u8{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x44 };
+    sin6.addr = addr;
+    const ip = try clientIpFromAddress(std.testing.allocator, &storage);
+    defer std.testing.allocator.free(ip);
+
+    try std.testing.expectEqualStrings("2001:db8:0:0:0:0:0:44", ip);
+}
+
+test "firstRequestCompleteLen detects pipelined boundary" {
+    const pipelined =
+        "GET /one HTTP/1.1\r\nHost: localhost\r\n\r\n" ++
+        "GET /two HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    const first_len = firstRequestCompleteLen(pipelined).?;
+    try std.testing.expectEqual(@as(usize, 38), first_len);
+}
+
+test "firstRequestCompleteLen waits for complete body" {
+    const partial = "POST /x HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nhel";
+    try std.testing.expect(firstRequestCompleteLen(partial) == null);
+
+    const complete = "POST /x HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nhello";
+    try std.testing.expectEqual(@as(usize, complete.len), firstRequestCompleteLen(complete).?);
+}
+
+test "firstRequestCompleteLen handles keep-alive pipelined requests" {
+    const reqs =
+        "GET /a HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n" ++
+        "GET /b HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    const first_len = firstRequestCompleteLen(reqs).?;
+    const first = reqs[0..first_len];
+    try std.testing.expect(std.mem.find(u8, first, "GET /a") != null);
+    try std.testing.expect(std.mem.find(u8, first, "keep-alive") != null);
+}

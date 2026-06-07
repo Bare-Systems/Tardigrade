@@ -1295,3 +1295,26 @@ pub fn classifyErrorCategory(status: u16) []const u8 {
     else
         "client_error";
 }
+
+test "classifyErrorCategory maps statuses" {
+    try std.testing.expectEqualStrings("-", classifyErrorCategory(200));
+    try std.testing.expectEqualStrings("invalid_request", classifyErrorCategory(400));
+    try std.testing.expectEqualStrings("authz", classifyErrorCategory(401));
+    try std.testing.expectEqualStrings("rate_limited", classifyErrorCategory(429));
+    try std.testing.expectEqualStrings("upstream_unavailable", classifyErrorCategory(503));
+    try std.testing.expectEqualStrings("upstream_timeout", classifyErrorCategory(504));
+    try std.testing.expectEqualStrings("internal_error", classifyErrorCategory(500));
+}
+
+test "parseQueryParam extracts topic" {
+    const value = parseQueryParam("topic=alerts&foo=bar", "topic");
+    try std.testing.expect(value != null);
+    try std.testing.expectEqualStrings("alerts", value.?);
+    try std.testing.expect(parseQueryParam("foo=bar", "topic") == null);
+}
+
+test "parseLastEventId handles invalid values" {
+    try std.testing.expectEqual(@as(u64, 42), parseLastEventId("42"));
+    try std.testing.expectEqual(@as(u64, 0), parseLastEventId("bad"));
+    try std.testing.expectEqual(@as(u64, 0), parseLastEventId(null));
+}

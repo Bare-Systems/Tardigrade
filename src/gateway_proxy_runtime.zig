@@ -249,6 +249,13 @@ fn proxyPassTargetsDiffer(
     return !std.mem.eql(u8, matched_target, candidate_target);
 }
 
+fn proxyRetryAttemptLimit(configured_attempts: u32, idempotent_only: bool, method: []const u8) usize {
+    const attempts: usize = @intCast(@max(configured_attempts, @as(u32, 1)));
+    if (attempts <= 1) return 1;
+    if (idempotent_only and !isHttpMethodIdempotent(method)) return 1;
+    return attempts;
+}
+
 pub fn handleVersionedApiProxyRoute(
     allocator: std.mem.Allocator,
     writer: anytype,
@@ -465,12 +472,7 @@ pub fn handleLocationProxyPass(
 
     // Determine retry budget. Non-idempotent methods are not retried when the
     // idempotent-only guard is enabled (default on).
-    const max_attempts: usize = blk: {
-        const n: usize = @intCast(@max(cfg.upstream_retry_attempts, @as(u32, 1)));
-        if (n <= 1) break :blk 1;
-        if (cfg.upstream_retry_idempotent_only and !isHttpMethodIdempotent(method_str)) break :blk 1;
-        break :blk n;
-    };
+    const max_attempts = proxyRetryAttemptLimit(cfg.upstream_retry_attempts, cfg.upstream_retry_idempotent_only, method_str);
     const budget_start_ms = http.event_loop.monotonicMs();
 
     var attempt: usize = 0;
@@ -617,6 +619,80 @@ test "data-plane buffered compatibility response limit uses dedicated upstream c
 
     cfg.max_buffered_upstream_response_bytes = 768 * 1024;
     try std.testing.expectEqual(@as(usize, 768 * 1024), dataPlaneBufferedCompatibilityResponseLimit(&cfg));
+}
+
+test "proxySuffixPathForLocation uses mount prefix for split upstream exact route" {
+    const blocks = [_]edge_config.EdgeConfig.LocationBlock{
+        .{
+            .match_type = .exact,
+            .pattern = "/ursa/health",
+            .priority = 0,
+            .action = .{ .proxy_pass = "http://127.0.0.1:18443" },
+        },
+        .{
+            .match_type = .prefix,
+            .pattern = "/ursa/",
+            .priority = 1,
+            .action = .{ .proxy_pass = "http://127.0.0.1:6707" },
+        },
+    };
+
+    const matched = http.location_router.matchLocation("/ursa/health", &blocks).?;
+    const suffix = proxySuffixPathForLocation("/ursa/health", matched, &blocks).?;
+    try std.testing.expectEqualStrings("health", suffix);
+}
+
+test "proxySuffixPathForLocation keeps mount prefix for split upstream longer prefix route" {
+    const blocks = [_]edge_config.EdgeConfig.LocationBlock{
+        .{
+            .match_type = .prefix_priority,
+            .pattern = "/ursa/download/",
+            .priority = 0,
+            .action = .{ .proxy_pass = "http://127.0.0.1:18443" },
+        },
+        .{
+            .match_type = .prefix,
+            .pattern = "/ursa/",
+            .priority = 1,
+            .action = .{ .proxy_pass = "http://127.0.0.1:6707" },
+        },
+    };
+
+    const matched = http.location_router.matchLocation("/ursa/download/file.bin", &blocks).?;
+    const suffix = proxySuffixPathForLocation("/ursa/download/file.bin", matched, &blocks).?;
+    try std.testing.expectEqualStrings("download/file.bin", suffix);
+}
+
+test "isHttpMethodIdempotent classifies idempotent methods" {
+    try std.testing.expect(isHttpMethodIdempotent("GET"));
+    try std.testing.expect(isHttpMethodIdempotent("HEAD"));
+    try std.testing.expect(isHttpMethodIdempotent("PUT"));
+    try std.testing.expect(isHttpMethodIdempotent("DELETE"));
+    try std.testing.expect(isHttpMethodIdempotent("OPTIONS"));
+    try std.testing.expect(isHttpMethodIdempotent("TRACE"));
+    try std.testing.expect(isHttpMethodIdempotent("get"));
+    try std.testing.expect(isHttpMethodIdempotent("Get"));
+    try std.testing.expect(isHttpMethodIdempotent("delete"));
+}
+
+test "isHttpMethodIdempotent rejects non-idempotent methods" {
+    try std.testing.expect(!isHttpMethodIdempotent("POST"));
+    try std.testing.expect(!isHttpMethodIdempotent("PATCH"));
+    try std.testing.expect(!isHttpMethodIdempotent("post"));
+    try std.testing.expect(!isHttpMethodIdempotent(""));
+    try std.testing.expect(!isHttpMethodIdempotent("VERYLONGMETHODNAME"));
+}
+
+test "upstream_retry_idempotent_only default true limits POST retries to 1" {
+    try std.testing.expectEqual(@as(usize, 1), proxyRetryAttemptLimit(3, true, "POST"));
+}
+
+test "upstream_retry_idempotent_only allows GET retries" {
+    try std.testing.expectEqual(@as(usize, 3), proxyRetryAttemptLimit(3, true, "GET"));
+}
+
+test "upstream_retry_idempotent_only=false allows POST retries" {
+    try std.testing.expectEqual(@as(usize, 3), proxyRetryAttemptLimit(3, false, "POST"));
 }
 
 test "data-plane response wrapper exposes bounded buffered metadata" {

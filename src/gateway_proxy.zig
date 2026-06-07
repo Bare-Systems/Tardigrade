@@ -1175,3 +1175,177 @@ pub fn sendApiError(allocator: std.mem.Allocator, writer: anytype, status: http.
     state.metricsRecord(@intFromEnum(status));
     state.metricsRecordErrorCode(code);
 }
+
+test "buildForwardedFor appends client ip" {
+    const allocator = std.testing.allocator;
+    var value = try buildForwardedFor(allocator, "10.0.0.1, 10.0.0.2", "127.0.0.1");
+    defer value.deinit(allocator);
+    try std.testing.expectEqualStrings("10.0.0.1, 10.0.0.2, 127.0.0.1", value.value);
+}
+
+test "buildForwardedFor borrows client ip when no incoming chain exists" {
+    const value = try buildForwardedFor(std.testing.allocator, null, "127.0.0.1");
+    try std.testing.expect(value.owned == null);
+    try std.testing.expectEqualStrings("127.0.0.1", value.value);
+}
+
+test "parseUpstreamHost extracts authority" {
+    try std.testing.expectEqualStrings("127.0.0.1:8080", parseUpstreamHost("http://127.0.0.1:8080") orelse "");
+    try std.testing.expectEqualStrings("api.example.com", parseUpstreamHost("https://api.example.com/v1") orelse "");
+    try std.testing.expect(parseUpstreamHost("invalid-url") == null);
+}
+
+test "combineProxyTarget joins prefix and suffix" {
+    const allocator = std.testing.allocator;
+    const joined = try combineProxyTarget(allocator, "/api", "/api/messages");
+    defer allocator.free(joined);
+    try std.testing.expectEqualStrings("/api/api/messages", joined);
+}
+
+test "resolveProxyTarget handles absolute and relative proxy_pass" {
+    const allocator = std.testing.allocator;
+    const cfg = std.mem.zeroInit(edge_config.EdgeConfig, .{
+        .upstream_base_url = "http://127.0.0.1:8080",
+    });
+
+    const abs = try resolveProxyTarget(allocator, cfg.upstream_base_url, "https://api.example.com/base", "/api/messages");
+    defer allocator.free(abs.url);
+    try std.testing.expectEqualStrings("https://api.example.com/base/api/messages", abs.url);
+    try std.testing.expectEqualStrings("api.example.com", abs.upstream_host);
+
+    const rel = try resolveProxyTarget(allocator, cfg.upstream_base_url, "/gateway", "/v1/tools");
+    defer allocator.free(rel.url);
+    try std.testing.expectEqualStrings("http://127.0.0.1:8080/gateway/v1/tools", rel.url);
+    try std.testing.expectEqualStrings("127.0.0.1:8080", rel.upstream_host);
+}
+
+test "resolveProxyTarget supports unix socket upstream base" {
+    const allocator = std.testing.allocator;
+    const resolved = try resolveProxyTarget(allocator, "unix:/tmp/tardigrade.sock", "/gateway", "/api/messages");
+    defer allocator.free(resolved.url);
+    try std.testing.expectEqualStrings("http://localhost/gateway/api/messages", resolved.url);
+    try std.testing.expectEqualStrings("/tmp/tardigrade.sock", resolved.upstream_host);
+    try std.testing.expect(resolved.unix_socket_path != null);
+    try std.testing.expectEqualStrings("/tmp/tardigrade.sock", resolved.unix_socket_path.?);
+}
+
+test "appendProxyQueryString preserves request query" {
+    const allocator = std.testing.allocator;
+
+    var appended = try appendProxyQueryString(allocator, "http://127.0.0.1:8080/auth/login", "next=%2F");
+    defer appended.deinit(allocator);
+    try std.testing.expectEqualStrings("http://127.0.0.1:8080/auth/login?next=%2F", appended.value);
+
+    var appended_existing = try appendProxyQueryString(allocator, "http://127.0.0.1:8080/auth/login?foo=bar", "next=%2F");
+    defer appended_existing.deinit(allocator);
+    try std.testing.expectEqualStrings("http://127.0.0.1:8080/auth/login?foo=bar&next=%2F", appended_existing.value);
+}
+
+test "appendProxyQueryString borrows base url when request has no query" {
+    const base = "http://127.0.0.1:8080/auth/login";
+    const appended = try appendProxyQueryString(std.testing.allocator, base, null);
+    try std.testing.expect(appended.owned == null);
+    try std.testing.expectEqual(@intFromPtr(base.ptr), @intFromPtr(appended.value.ptr));
+}
+
+test "shouldSkipUpstreamRequestHeader strips inbound X-Tardigrade headers" {
+    try std.testing.expect(shouldSkipUpstreamRequestHeader("X-Tardigrade-Auth-Identity", null));
+    try std.testing.expect(shouldSkipUpstreamRequestHeader("x-tardigrade-user-id", null));
+    try std.testing.expect(shouldSkipUpstreamRequestHeader("X-TARDIGRADE-DEVICE-ID", null));
+    try std.testing.expect(shouldSkipUpstreamRequestHeader("x-tardigrade-scopes", null));
+    try std.testing.expect(shouldSkipUpstreamRequestHeader("x-tardigrade-anything-custom", null));
+    try std.testing.expect(!shouldSkipUpstreamRequestHeader("X-Custom-Header", null));
+    try std.testing.expect(!shouldSkipUpstreamRequestHeader("Authorization", null));
+    try std.testing.expect(!shouldSkipUpstreamRequestHeader("Content-Type", null));
+}
+
+test "shouldSkipUpstreamRequestHeader strips standard hop-by-hop headers" {
+    try std.testing.expect(shouldSkipUpstreamRequestHeader("Connection", null));
+    try std.testing.expect(shouldSkipUpstreamRequestHeader("Keep-Alive", null));
+    try std.testing.expect(shouldSkipUpstreamRequestHeader("Proxy-Authenticate", null));
+    try std.testing.expect(shouldSkipUpstreamRequestHeader("Proxy-Authorization", null));
+    try std.testing.expect(shouldSkipUpstreamRequestHeader("TE", null));
+    try std.testing.expect(shouldSkipUpstreamRequestHeader("Trailer", null));
+    try std.testing.expect(shouldSkipUpstreamRequestHeader("Transfer-Encoding", null));
+    try std.testing.expect(shouldSkipUpstreamRequestHeader("Upgrade", null));
+}
+
+test "shouldSkipUpstreamRequestHeader strips headers named by Connection" {
+    const connection_header = "X-Test-Hop, keep-alive, Another-Hop";
+    try std.testing.expect(shouldSkipUpstreamRequestHeader("X-Test-Hop", connection_header));
+    try std.testing.expect(shouldSkipUpstreamRequestHeader("another-hop", connection_header));
+    try std.testing.expect(shouldSkipUpstreamRequestHeader("Keep-Alive", connection_header));
+    try std.testing.expect(!shouldSkipUpstreamRequestHeader("X-Not-Hop", connection_header));
+}
+
+test "shouldSkipUpstreamResponseHeader strips stale content-encoding" {
+    try std.testing.expect(shouldSkipUpstreamResponseHeader("Content-Encoding"));
+    try std.testing.expect(shouldSkipUpstreamResponseHeader("content-encoding"));
+    try std.testing.expect(!shouldSkipUpstreamResponseHeader("Content-Type"));
+}
+
+test "shouldSkipUpstreamResponseHeader strips upstream Server and X-Powered-By" {
+    // WSTG-INFO-02 / ASVS-14.3.3: upstream technology headers must not leak
+    // to external clients — Tardigrade emits its own Server header instead.
+    try std.testing.expect(shouldSkipUpstreamResponseHeader("Server"));
+    try std.testing.expect(shouldSkipUpstreamResponseHeader("server"));
+    try std.testing.expect(shouldSkipUpstreamResponseHeader("SERVER"));
+    try std.testing.expect(shouldSkipUpstreamResponseHeader("X-Powered-By"));
+    try std.testing.expect(shouldSkipUpstreamResponseHeader("x-powered-by"));
+    try std.testing.expect(shouldSkipUpstreamResponseHeader("X-POWERED-BY"));
+    // Must not suppress unrelated headers.
+    try std.testing.expect(!shouldSkipUpstreamResponseHeader("Content-Type"));
+    try std.testing.expect(!shouldSkipUpstreamResponseHeader("X-Custom-Header"));
+    try std.testing.expect(!shouldSkipUpstreamResponseHeader("Set-Cookie"));
+}
+
+test "writeBufferedUpstreamResponse serializes a single forwarded response head" {
+    const allocator = std.testing.allocator;
+    const body = try allocator.dupe(u8, "pong");
+    var upstream_headers = [_]UpstreamHeader{
+        .{ .name = "Content-Type", .value = "text/plain" },
+        .{ .name = "Location", .value = "/health" },
+        .{ .name = "Server", .value = "python" },
+        .{ .name = "X-Upstream-Test", .value = "1" },
+    };
+
+    var response = BufferedUpstreamResponse{
+        .metadata_arena = std.heap.ArenaAllocator.init(allocator),
+        .status_code = 200,
+        .reason = "OK",
+        .headers = upstream_headers[0..],
+        .body = body,
+    };
+    defer response.deinit(allocator);
+
+    var buf: [4096]u8 = undefined;
+    var stream = compat.fixedBufferStream(&buf);
+    try writeBufferedUpstreamResponse(
+        stream.writer(),
+        &response,
+        true,
+        "tg-1778460305668-bfebecb410803023",
+        &http.security_headers.SecurityHeaders.api,
+        "tg_sticky=proxy",
+    );
+
+    const output = stream.getWritten();
+    try std.testing.expect(std.mem.startsWith(u8, output, "HTTP/1.1 200 OK\r\n"));
+    try std.testing.expect(std.mem.find(u8, output, "Server: tardigrade\r\n") != null);
+    try std.testing.expect(std.mem.find(u8, output, "Connection: keep-alive\r\n") != null);
+    try std.testing.expect(std.mem.find(u8, output, "Content-Length: 4\r\n") != null);
+    try std.testing.expect(std.mem.find(u8, output, "Content-Type: text/plain\r\n") != null);
+    try std.testing.expect(std.mem.find(u8, output, "Location: /health\r\n") != null);
+    try std.testing.expect(std.mem.find(u8, output, "X-Upstream-Test: 1\r\n") != null);
+    try std.testing.expect(std.mem.find(u8, output, "Set-Cookie: tg_sticky=proxy\r\n") != null);
+    try std.testing.expect(std.mem.find(u8, output, "X-Request-ID: tg-1778460305668-bfebecb410803023\r\n") != null);
+    try std.testing.expect(std.mem.find(u8, output, "X-Correlation-ID: tg-1778460305668-bfebecb410803023\r\n") != null);
+    try std.testing.expect(std.mem.find(u8, output, "Server: python\r\n") == null);
+    try std.testing.expect(std.mem.endsWith(u8, output, "\r\n\r\npong"));
+}
+
+test "mapUpstreamError returns stable codes" {
+    const mapped = mapUpstreamError(502);
+    try std.testing.expectEqual(@as(u16, 503), mapped.status);
+    try std.testing.expectEqualStrings("tool_unavailable", mapped.code);
+}

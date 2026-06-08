@@ -189,7 +189,7 @@ Transcript store:
 - Cookies that point at unhealthy upstreams are remapped to a healthy backend and rotated
 - Requires `TARDIGRADE_TRUST_SHARED_SECRET`
 
-The integration fixture in [tests/integration.zig](/Users/joecaruso/Projects/BareSystems/Tardigrade/tests/integration.zig) exercises this path over HTTPS with Tardigrade-owned TLS.
+The integration fixture in [tests/integration.zig](../../tests/integration.zig) exercises this path over HTTPS with Tardigrade-owned TLS.
 
 ## Suggested Startup
 

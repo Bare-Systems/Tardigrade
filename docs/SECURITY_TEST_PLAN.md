@@ -87,29 +87,33 @@ Do not ship a wider public distribution unless all of the following are true:
 - Security replay and fuzz-style runs are manual today; moving them into
   scheduled CI or nightly automation remains follow-up work.
 
+### Resolved Gaps (issue #174)
+
+**F-01 — HTTP method enforcement (WSTG-CONF-06, ASVS-13.2.1)** ✅ RESOLVED
+`TRACE` is rejected globally with 405 in `edge_gateway.zig` before any
+location block is consulted. The `return_response` action additionally rejects
+non-GET/HEAD methods on non-redirect static-return directives with 405
+(ASVS-14.5.1). Corpus case `trace_method.http` documents the expected
+behavior.
+
+**F-02 — Upstream Server header passthrough (WSTG-INFO-02, ASVS-14.3.3)** ✅ RESOLVED
+`shouldSkipUpstreamResponseHeader()` in `gateway_proxy.zig` strips upstream
+`Server` and `X-Powered-By` headers. Tardigrade emits its own `Server:
+tardigrade` header. Covered by unit tests in `gateway_proxy.zig`.
+
+**F-03 — Missing Host header not rejected (WSTG-CONF-07, ASVS-14.5.1)** ✅ RESOLVED
+HTTP/1.1 requests missing `Host` are rejected with `400 Bad Request` in
+`edge_gateway.zig` before routing or proxying. HTTP/1.0 is exempt per RFC
+1945. Corpus case `no_host_http11.http` documents parser acceptance; gateway
+enforcement is tested via unit conditions in `edge_gateway.zig`.
+
+**F-04 — Client-controlled X-Request-ID / X-Correlation-ID (WSTG-INPV-11, ASVS-7.1.1)** ✅ RESOLVED
+`fromHeadersOrGenerate()` in `src/http/correlation_id.zig` validates incoming
+IDs against the `tg-<decimal>-<lowercase-hex>` format. Arbitrary client values
+are discarded and a fresh ID is generated. Covered by unit tests in
+`correlation_id.zig`.
+
 ### Open Gaps
-
-**F-01 — HTTP method enforcement (WSTG-CONF-06, ASVS-13.2.1)**
-All HTTP verbs accepted on direct routes (`location = /health`). No gateway-level
-method restriction today. Fix: add `allowed_methods` directive to config DSL;
-add corpus cases for OPTIONS/TRACE/PUT/DELETE on direct routes expecting 405.
-
-**F-02 — Upstream Server header passthrough (WSTG-INFO-02, ASVS-14.3.3)**
-Proxy responses include upstream `Server` header alongside Tardigrade's own.
-Fix: strip upstream `Server` (and `X-Powered-By`) in the proxy response path.
-Add `proxy_hide_header` or equivalent; unit-test that upstream headers are
-scrubbed before `writeSecurityHeaders()` fires.
-
-**F-03 — Missing Host header not rejected (WSTG-CONF-07, ASVS-14.5.1)**
-HTTP/1.1 requests with no `Host` header should be rejected with 400. Currently
-accepted. Fix: add explicit check in the request parser or router; add corpus
-case `no-host-http1.1.txt`.
-
-**F-04 — Client-controlled X-Request-ID / X-Correlation-ID (WSTG-INPV-11, ASVS-7.1.1)**
-Client-supplied `X-Request-ID` / `X-Correlation-ID` are reflected verbatim in
-response and access log. Enables log poisoning and trace-ID spoofing. Fix:
-validate format against `^tg-[0-9]+-[0-9a-f]+$` or always generate fresh IDs
-ignoring client input; sanitize log values for non-printable characters.
 
 **F-05 — TLS surface pass still pending**
 A dedicated TLS engagement against a Tardigrade instance with real TLS has not
@@ -123,3 +127,22 @@ have not been probed against a live edge with auth configured.
 Files in a configured `doc_root` return 404 despite `root` directive in
 `location /`. Investigate whether this is a static-serving bug or intentional;
 add integration test for static root fallback.
+
+## Proxy Security Behavior Reference
+
+See `docs/PROXY_SECURITY.md` for the authoritative description of Tardigrade's
+intended behavior at each HTTP proxy trust boundary, including:
+
+- Hop-by-hop header stripping (request and response directions)
+- Connection header token handling (RFC 7230 §6.1)
+- TE/CL conflict and duplicate Content-Length rejection
+- Header casing normalization and validation rules
+- Absolute-form vs origin-form URI handling
+- X-Forwarded-* trust boundary and safe deployment requirements
+- Host header enforcement (HTTP/1.1)
+- Body size and header size/count limits
+- Malformed upstream response handling
+- Directory traversal protection for static serving
+- TRACE method rejection (XST defense)
+- Correlation ID validation (log poisoning defense)
+- X-Tardigrade-* asserted identity header stripping

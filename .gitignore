@@ -35,6 +35,9 @@ PLAN*.md
 ISSUES.md
 RESEARCH*
 
+# Local benchmark baselines (laptop-fallback runs, not canonical)
+benchmarks/results/baseline-pre-change/
+
 # Deployment symlink
 suite/
 blink/

@@ -582,8 +582,18 @@ pub fn handleLocationProxyPass(
         return @intFromEnum(http.Status.bad_gateway);
     }
 
+    // Extra retry budget reserved for stale pooled keep-alive connections (see
+    // shouldRetryStaleUpstreamConnection). When an upstream closes an idle pooled
+    // connection between selection and use, the response read returns zero bytes
+    // (error.HttpConnectionClosing) and the request was never delivered, so it is
+    // always safe to retry on a fresh connection. This budget is independent of
+    // the operator-configured attempt count so the race is skipped transparently
+    // even with the default of a single attempt.
+    const max_stale_conn_retries: usize = 2;
+    var stale_conn_retries: usize = 0;
+
     var attempt: usize = 0;
-    var upstream_response: DataPlaneProxyResponse = while (attempt < max_attempts) : (attempt += 1) {
+    var upstream_response: DataPlaneProxyResponse = while (attempt < max_attempts + stale_conn_retries) : (attempt += 1) {
         const per_attempt_timeout_ms: u32 = blk: {
             if (cfg.upstream_timeout_budget_ms == 0) break :blk cfg.upstream_timeout_ms;
             const elapsed_ms = http.event_loop.monotonicMs() - budget_start_ms;
@@ -620,6 +630,25 @@ pub fn handleLocationProxyPass(
         );
         state.recordUpstreamAttemptEnd(selection.base_url);
         const result = resp catch |err| {
+            // A pooled keep-alive connection the upstream closed before handling
+            // our request surfaces as HttpConnectionClosing (zero response bytes
+            // received). The request was never delivered, so this is a normal
+            // keep-alive lifecycle event rather than an upstream health failure:
+            // retry it on a fresh connection without counting it against upstream
+            // health / circuit-breaker state. Non-idempotent methods are only
+            // retried this way when the operator has disabled the idempotent-only
+            // guard.
+            if (shouldRetryStaleUpstreamConnection(
+                err,
+                method_str,
+                stale_conn_retries,
+                max_stale_conn_retries,
+                cfg.upstream_retry_idempotent_only,
+            )) {
+                stale_conn_retries += 1;
+                state.logger.warn(correlation_id, "proxy retrying on fresh connection after stale upstream keep-alive ({d}/{d})", .{ stale_conn_retries, max_stale_conn_retries });
+                continue;
+            }
             state.recordUpstreamFailure(cfg, selection.base_url);
             // If the request deadline elapsed, stop retrying immediately.
             if (err == error.RequestCancelled) {
@@ -719,6 +748,49 @@ pub fn isHttpMethodIdempotent(method: []const u8) bool {
         std.mem.eql(u8, m, "DELETE") or
         std.mem.eql(u8, m, "OPTIONS") or
         std.mem.eql(u8, m, "TRACE");
+}
+
+/// Decide whether a failed proxy attempt should be retried on a fresh upstream
+/// connection because the error indicates the request was never delivered.
+///
+/// `error.HttpConnectionClosing` is raised when a pooled keep-alive connection
+/// returns zero response bytes — i.e. the upstream closed an idle connection
+/// before serving our request. Because nothing reached the upstream, retrying
+/// cannot double-apply a side effect, so it is safe for idempotent methods and
+/// for any method when the operator has disabled the idempotent-only guard.
+/// The retry is bounded by `max_stale_conn_retries` so a persistently dead
+/// upstream still fails fast.
+fn shouldRetryStaleUpstreamConnection(
+    err: anyerror,
+    method: []const u8,
+    stale_conn_retries: usize,
+    max_stale_conn_retries: usize,
+    idempotent_only: bool,
+) bool {
+    if (err != error.HttpConnectionClosing) return false;
+    if (stale_conn_retries >= max_stale_conn_retries) return false;
+    return isHttpMethodIdempotent(method) or !idempotent_only;
+}
+
+test "shouldRetryStaleUpstreamConnection retries idempotent methods on closed keep-alive" {
+    try std.testing.expect(shouldRetryStaleUpstreamConnection(error.HttpConnectionClosing, "GET", 0, 2, true));
+    try std.testing.expect(shouldRetryStaleUpstreamConnection(error.HttpConnectionClosing, "GET", 1, 2, true));
+}
+
+test "shouldRetryStaleUpstreamConnection respects the retry budget" {
+    try std.testing.expect(!shouldRetryStaleUpstreamConnection(error.HttpConnectionClosing, "GET", 2, 2, true));
+    try std.testing.expect(!shouldRetryStaleUpstreamConnection(error.HttpConnectionClosing, "GET", 3, 2, true));
+}
+
+test "shouldRetryStaleUpstreamConnection guards POST by idempotent-only setting" {
+    try std.testing.expect(!shouldRetryStaleUpstreamConnection(error.HttpConnectionClosing, "POST", 0, 2, true));
+    try std.testing.expect(shouldRetryStaleUpstreamConnection(error.HttpConnectionClosing, "POST", 0, 2, false));
+}
+
+test "shouldRetryStaleUpstreamConnection only triggers for pre-delivery closes" {
+    try std.testing.expect(!shouldRetryStaleUpstreamConnection(error.ReadFailed, "GET", 0, 2, true));
+    try std.testing.expect(!shouldRetryStaleUpstreamConnection(error.ConnectionResetByPeer, "GET", 0, 2, true));
+    try std.testing.expect(!shouldRetryStaleUpstreamConnection(error.Timeout, "GET", 0, 2, true));
 }
 
 test "data-plane buffered compatibility response limit uses dedicated upstream cap" {

@@ -55,6 +55,14 @@ pub const Metrics = struct {
     worker_threads: u64,
     /// Configured maximum queue depth for the worker pool.
     worker_queue_capacity: u64,
+    /// Idle keepalive connections currently parked off the worker pool (#138).
+    keepalive_parked: u64,
+    /// Total parked-connection resume dispatches.
+    keepalive_resumes_total: u64,
+    /// Total parked connections closed by the idle-keepalive reaper.
+    keepalive_timeouts_total: u64,
+    /// Total parked connections closed (resume-close, idle reap, or drain).
+    keepalive_closed_total: u64,
     /// Error category counters.
     err_invalid_request: u64,
     err_unauthorized: u64,
@@ -108,6 +116,10 @@ pub const Metrics = struct {
             .worker_queued_jobs = 0,
             .worker_threads = 0,
             .worker_queue_capacity = 0,
+            .keepalive_parked = 0,
+            .keepalive_resumes_total = 0,
+            .keepalive_timeouts_total = 0,
+            .keepalive_closed_total = 0,
             .err_invalid_request = 0,
             .err_unauthorized = 0,
             .err_rate_limited = 0,
@@ -236,6 +248,14 @@ pub const Metrics = struct {
         self.worker_queued_jobs = @intCast(queued_jobs);
         self.worker_threads = @intCast(worker_threads);
         self.worker_queue_capacity = @intCast(queue_capacity);
+    }
+
+    /// Snapshot of the idle keepalive parked-connection registry (#138).
+    pub fn setKeepaliveStats(self: *Metrics, parked: usize, resumes_total: u64, timeouts_total: u64, closed_total: u64) void {
+        self.keepalive_parked = @intCast(parked);
+        self.keepalive_resumes_total = resumes_total;
+        self.keepalive_timeouts_total = timeouts_total;
+        self.keepalive_closed_total = closed_total;
     }
 
     fn latencyBucketCumulative(self: *const Metrics, le_ms: u64) u64 {
@@ -462,6 +482,27 @@ pub const Metrics = struct {
             self.mux_frame_errors,
             self.event_loop_iterations,
             self.health_probe_runs,
+        });
+
+        try out.print(
+            \\# HELP tardigrade_keepalive_parked_connections Idle keepalive connections currently parked off the worker pool
+            \\# TYPE tardigrade_keepalive_parked_connections gauge
+            \\tardigrade_keepalive_parked_connections {d}
+            \\# HELP tardigrade_keepalive_resumes_total Total parked-connection resume dispatches
+            \\# TYPE tardigrade_keepalive_resumes_total counter
+            \\tardigrade_keepalive_resumes_total {d}
+            \\# HELP tardigrade_keepalive_timeouts_total Total parked connections closed by the idle-keepalive reaper
+            \\# TYPE tardigrade_keepalive_timeouts_total counter
+            \\tardigrade_keepalive_timeouts_total {d}
+            \\# HELP tardigrade_keepalive_closed_total Total parked connections closed (resume-close, idle reap, or drain)
+            \\# TYPE tardigrade_keepalive_closed_total counter
+            \\tardigrade_keepalive_closed_total {d}
+            \\
+        , .{
+            self.keepalive_parked,
+            self.keepalive_resumes_total,
+            self.keepalive_timeouts_total,
+            self.keepalive_closed_total,
         });
 
         return out.toOwnedSlice();

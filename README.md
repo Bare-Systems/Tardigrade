@@ -105,7 +105,12 @@ retry-enabled paths, rewrites, mirrors, and auth subrequests stay on the
 bounded buffered compatibility path.
 When an upstream container is replaced on the same host:port, the first request
 that hits a dead pooled keep-alive socket now evicts that stale connection so
-later requests reconnect cleanly without restarting Tardigrade. Proxy requests
+later requests reconnect cleanly without restarting Tardigrade. If an upstream
+closes an idle keep-alive connection just as Tardigrade reuses it (so the
+response read returns zero bytes), Tardigrade transparently retries the request
+on a fresh connection instead of returning a `502` — the request was never
+delivered, so this is safe for idempotent methods (and for any method when
+`TARDIGRADE_UPSTREAM_RETRY_IDEMPOTENT_ONLY=false`). Proxy requests
 that send an explicit zero-length `POST` body are also forwarded without
 triggering a runtime panic.
 Large buffered proxy responses now preserve the upstream body exactly instead of
@@ -129,11 +134,20 @@ repeated `reload` or `SIGHUP` cycles do not retain old config allocations.
 
 Connection handling is intentionally split: the main thread runs a non-blocking
 accept/event loop, while accepted sockets move onto a bounded worker pool for
-blocking TLS, HTTP parsing, proxying, and response writes. `/status/metrics`
-exports `tardigrade_active_connections`, `tardigrade_worker_active_jobs`,
-`tardigrade_worker_queued_jobs`, `tardigrade_worker_threads`, and
-`tardigrade_event_loop_iterations_total` so operators can see whether load is
-building at the listener, the worker queue, or inside active request work.
+blocking TLS, HTTP parsing, proxying, and response writes. Between requests an
+idle HTTP/1.1 keepalive connection is **parked** off the worker pool — its state
+returns to the event loop and the worker is freed — so idle clients do not
+consume worker capacity and connections far exceeding the worker count stay
+served with a low tail (HTTP/2 connections multiplex internally and are not
+parked). Because of this, `worker_threads` can be sized to CPU count rather than
+to peak concurrent connections. `/status/metrics` exports
+`tardigrade_active_connections`, `tardigrade_worker_active_jobs`,
+`tardigrade_worker_queued_jobs`, `tardigrade_worker_threads`,
+`tardigrade_event_loop_iterations_total`, and the parked-connection gauges
+`tardigrade_keepalive_parked_connections`, `tardigrade_keepalive_resumes_total`,
+`tardigrade_keepalive_timeouts_total`, and `tardigrade_keepalive_closed_total`,
+so operators can see whether load is building at the listener, the worker queue,
+parked keepalive connections, or inside active request work.
 
 Tardigrade accepts a safe inbound `X-Request-ID` or legacy
 `X-Correlation-ID`, generates one when neither is valid, echoes both response

@@ -75,17 +75,34 @@ pub fn acceptReadyConnections(listen_fd: std.posix.fd_t, worker_pool: *http.work
     }
 }
 
+/// Deterministic overload response sent to clients rejected at accept time
+/// (global, per-IP, or memory connection-slot limits, or a saturated worker
+/// queue). Kept as a single fixed byte string so every overload path returns an
+/// identical, predictable 503 — see docs/OBSERVABILITY.md "Resource Limits and
+/// Overload Behavior". When the socket cannot be written, the fd is closed
+/// instead (no partial/ambiguous response is ever emitted).
+pub const overload_response_503 =
+    "HTTP/1.1 503 Service Unavailable\r\n" ++
+    "Connection: close\r\n" ++
+    "Content-Length: 0\r\n" ++
+    "Retry-After: 1\r\n" ++
+    "\r\n";
+
 pub fn rejectOverloadedClient(client_fd: std.posix.fd_t) void {
     gc.setNonBlocking(client_fd, false) catch {}; // connection is usable in blocking mode; write and close still succeed
     const stream = compat.netStreamFromFd(client_fd);
-    stream.writer().writeAll(
-        "HTTP/1.1 503 Service Unavailable\r\n" ++
-            "Connection: close\r\n" ++
-            "Content-Length: 0\r\n" ++
-            "Retry-After: 1\r\n" ++
-            "\r\n",
-    ) catch {}; // best-effort 503; client will time out if the write fails
+    stream.writer().writeAll(overload_response_503) catch {}; // best-effort 503; client will time out if the write fails
     stream.close();
+}
+
+test "overload response is a deterministic 503 with close and retry hints" {
+    const r = overload_response_503;
+    try std.testing.expect(std.mem.startsWith(u8, r, "HTTP/1.1 503 Service Unavailable\r\n"));
+    try std.testing.expect(std.mem.find(u8, r, "Connection: close\r\n") != null);
+    try std.testing.expect(std.mem.find(u8, r, "Content-Length: 0\r\n") != null);
+    try std.testing.expect(std.mem.find(u8, r, "Retry-After: 1\r\n") != null);
+    // Response is a complete header block with no body: must end with a blank line.
+    try std.testing.expect(std.mem.endsWith(u8, r, "\r\n\r\n"));
 }
 
 pub fn applyFdSoftLimit(desired: u64) !?u64 {

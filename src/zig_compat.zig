@@ -3,14 +3,7 @@ const builtin = @import("builtin");
 
 pub const Io = std.Io;
 
-const ThreadedIoState = enum(u8) {
-    uninitialized,
-    initializing,
-    ready,
-};
-
-var threaded_io: std.Io.Threaded = undefined;
-var threaded_io_state = std.atomic.Value(ThreadedIoState).init(.uninitialized);
+var threaded_io: ?std.Io.Threaded = null;
 
 fn inheritedEnviron() std.process.Environ {
     if (!builtin.link_libc) return .empty;
@@ -33,24 +26,12 @@ fn inheritedEnviron() std.process.Environ {
 }
 
 fn activeThreadedIo() *std.Io.Threaded {
-    while (true) {
-        switch (threaded_io_state.load(.acquire)) {
-            .ready => return &threaded_io,
-            .uninitialized => {
-                if (threaded_io_state.cmpxchgStrong(.uninitialized, .initializing, .acq_rel, .acquire) == null) {
-                    threaded_io = std.Io.Threaded.init(std.heap.c_allocator, .{
-                        .environ = inheritedEnviron(),
-                    });
-                    threaded_io_state.store(.ready, .release);
-                    return &threaded_io;
-                }
-            },
-            .initializing => {
-                std.atomic.spinLoopHint();
-                std.Thread.yield() catch {};
-            },
-        }
+    if (threaded_io == null) {
+        threaded_io = std.Io.Threaded.init(std.heap.c_allocator, .{
+            .environ = inheritedEnviron(),
+        });
     }
+    return &threaded_io.?;
 }
 
 pub fn io() std.Io {
@@ -101,7 +82,7 @@ pub const NetStream = struct {
             return std.posix.read(self.handle, buf);
         }
 
-        var scratch: [1024]u8 = undefined;
+        var scratch: [1]u8 = undefined;
         var io_reader = self.inner.?.reader(io(), &scratch);
         return io_reader.interface.readSliceShort(buf) catch |err| switch (err) {
             error.ReadFailed => return io_reader.err orelse err,
@@ -151,17 +132,17 @@ pub const NetStream = struct {
         }
 
         pub fn readAllAlloc(self: Reader, allocator: std.mem.Allocator, max_bytes: usize) ReadError![]u8 {
-            var out = std.ArrayList(u8).empty;
-            errdefer out.deinit(allocator);
+            var out = std.array_list.Managed(u8).init(allocator);
+            errdefer out.deinit();
 
             var buf: [4096]u8 = undefined;
             while (true) {
                 const n = try self.stream.read(&buf);
                 if (n == 0) break;
-                try out.appendSlice(allocator, buf[0..n]);
+                try out.appendSlice(buf[0..n]);
                 if (out.items.len > max_bytes) return error.StreamTooLong;
             }
-            return out.toOwnedSlice(allocator);
+            return out.toOwnedSlice();
         }
     };
 

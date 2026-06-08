@@ -93,20 +93,20 @@ pub fn handleFastcgiRoute(
     const remote_port = request.headers.get("x-forwarded-port") orelse request.headers.get("x-real-port") orelse
         (std.fmt.bufPrint(&remote_port_buf, "{d}", .{0}) catch "0");
 
-    var request_uri = std.ArrayList(u8).empty;
-    defer request_uri.deinit(allocator);
-    try request_uri.appendSlice(allocator, request.uri.path);
+    var request_uri = std.array_list.Managed(u8).init(allocator);
+    defer request_uri.deinit();
+    try request_uri.appendSlice(request.uri.path);
     if (request.uri.query) |query| {
-        try request_uri.append(allocator, '?');
-        try request_uri.appendSlice(allocator, query);
+        try request_uri.append('?');
+        try request_uri.appendSlice(query);
     }
 
-    var extra_env = std.ArrayList(http.fastcgi.EnvPair).empty;
-    defer extra_env.deinit(allocator);
+    var extra_env = std.array_list.Managed(http.fastcgi.EnvPair).init(allocator);
+    defer extra_env.deinit();
     for (cfg.fastcgi_params) |pair| {
-        try extra_env.append(allocator, .{ .name = pair.name, .value = pair.value });
+        try extra_env.append(.{ .name = pair.name, .value = pair.value });
     }
-    try extra_env.append(allocator, .{ .name = "TARDIGRADE_CORRELATION_ID", .value = correlation_id });
+    try extra_env.append(.{ .name = "TARDIGRADE_CORRELATION_ID", .value = correlation_id });
 
     var leased = state.acquireFastcgiStream(endpoint) catch |err| {
         state.logger.warn(correlation_id, "fastcgi connect failed for {s}: {}", .{ endpoint, err });
@@ -234,12 +234,12 @@ pub fn handleScgiRoute(
     const remote_port = request.headers.get("x-forwarded-port") orelse request.headers.get("x-real-port") orelse
         (std.fmt.bufPrint(&remote_port_buf, "{d}", .{0}) catch "0");
 
-    var request_uri = std.ArrayList(u8).empty;
-    defer request_uri.deinit(allocator);
-    try request_uri.appendSlice(allocator, request.uri.path);
+    var request_uri = std.array_list.Managed(u8).init(allocator);
+    defer request_uri.deinit();
+    try request_uri.appendSlice(request.uri.path);
     if (request.uri.query) |query| {
-        try request_uri.append(allocator, '?');
-        try request_uri.appendSlice(allocator, query);
+        try request_uri.append('?');
+        try request_uri.appendSlice(query);
     }
 
     var scgi = http.scgi.execute(allocator, endpoint, .{
@@ -325,12 +325,12 @@ pub fn handleUwsgiRoute(
     const remote_port = request.headers.get("x-forwarded-port") orelse request.headers.get("x-real-port") orelse
         (std.fmt.bufPrint(&remote_port_buf, "{d}", .{0}) catch "0");
 
-    var request_uri = std.ArrayList(u8).empty;
-    defer request_uri.deinit(allocator);
-    try request_uri.appendSlice(allocator, request.uri.path);
+    var request_uri = std.array_list.Managed(u8).init(allocator);
+    defer request_uri.deinit();
+    try request_uri.appendSlice(request.uri.path);
     if (request.uri.query) |query| {
-        try request_uri.append(allocator, '?');
-        try request_uri.appendSlice(allocator, query);
+        try request_uri.append('?');
+        try request_uri.appendSlice(query);
     }
 
     var uwsgi = http.uwsgi.execute(allocator, endpoint, .{
@@ -588,12 +588,12 @@ fn executeRawProtocolRequest(allocator: std.mem.Allocator, endpoint: []const u8,
     defer stream.close();
     try setSocketTimeoutMs(stream.handle, 2_000, 2_000);
     try stream.writer().writeAll(payload);
-    var out = std.ArrayList(u8).empty;
-    errdefer out.deinit(allocator);
+    var out = std.array_list.Managed(u8).init(allocator);
+    errdefer out.deinit();
     var buf: [16 * 1024]u8 = undefined;
     const n = try stream.read(&buf);
-    if (n > 0) try out.appendSlice(allocator, buf[0..n]);
-    return out.toOwnedSlice(allocator);
+    if (n > 0) try out.appendSlice(buf[0..n]);
+    return out.toOwnedSlice();
 }
 
 fn parseMailProxyEndpoint(raw: []const u8) !?MailProxyEndpoint {
@@ -747,45 +747,45 @@ fn executeImapStartTlsRequest(
 }
 
 fn readSmtpReplyPlain(allocator: std.mem.Allocator, stream: compat.NetStream) ![]u8 {
-    var out = std.ArrayList(u8).empty;
-    errdefer out.deinit(allocator);
+    var out = std.array_list.Managed(u8).init(allocator);
+    errdefer out.deinit();
     var buf: [2048]u8 = undefined;
     while (true) {
         const n = try stream.read(&buf);
         if (n == 0) break;
-        try out.appendSlice(allocator, buf[0..n]);
+        try out.appendSlice(buf[0..n]);
         if (smtpReplyComplete(out.items)) break;
     }
     if (out.items.len == 0) return error.EndOfStream;
-    return out.toOwnedSlice(allocator);
+    return out.toOwnedSlice();
 }
 
 fn readSmtpReplyTls(allocator: std.mem.Allocator, tls_client: *std.crypto.tls.Client, stream: compat.NetStream) ![]u8 {
-    var out = std.ArrayList(u8).empty;
-    errdefer out.deinit(allocator);
+    var out = std.array_list.Managed(u8).init(allocator);
+    errdefer out.deinit();
     var buf: [2048]u8 = undefined;
     while (true) {
         const n = try tls_client.read(stream, &buf);
         if (n == 0) break;
-        try out.appendSlice(allocator, buf[0..n]);
+        try out.appendSlice(buf[0..n]);
         if (smtpReplyComplete(out.items)) break;
     }
     if (out.items.len == 0) return error.EndOfStream;
-    return out.toOwnedSlice(allocator);
+    return out.toOwnedSlice();
 }
 
 fn readImapReplyPlain(allocator: std.mem.Allocator, stream: compat.NetStream, tag: ?[]const u8) ![]u8 {
-    var out = std.ArrayList(u8).empty;
-    errdefer out.deinit(allocator);
+    var out = std.array_list.Managed(u8).init(allocator);
+    errdefer out.deinit();
     var buf: [2048]u8 = undefined;
     while (true) {
         const n = try stream.read(&buf);
         if (n == 0) break;
-        try out.appendSlice(allocator, buf[0..n]);
+        try out.appendSlice(buf[0..n]);
         if (imapReplyComplete(out.items, tag)) break;
     }
     if (out.items.len == 0) return error.EndOfStream;
-    return out.toOwnedSlice(allocator);
+    return out.toOwnedSlice();
 }
 
 fn readImapReplyTls(
@@ -794,17 +794,17 @@ fn readImapReplyTls(
     stream: compat.NetStream,
     tag: ?[]const u8,
 ) ![]u8 {
-    var out = std.ArrayList(u8).empty;
-    errdefer out.deinit(allocator);
+    var out = std.array_list.Managed(u8).init(allocator);
+    errdefer out.deinit();
     var buf: [2048]u8 = undefined;
     while (true) {
         const n = try tls_client.read(stream, &buf);
         if (n == 0) break;
-        try out.appendSlice(allocator, buf[0..n]);
+        try out.appendSlice(buf[0..n]);
         if (imapReplyComplete(out.items, tag)) break;
     }
     if (out.items.len == 0) return error.EndOfStream;
-    return out.toOwnedSlice(allocator);
+    return out.toOwnedSlice();
 }
 
 fn imapPayloadTag(payload: []const u8) ?[]const u8 {

@@ -105,6 +105,33 @@ test "overload response is a deterministic 503 with close and retry hints" {
     try std.testing.expect(std.mem.endsWith(u8, r, "\r\n\r\n"));
 }
 
+test "applyFdSoftLimit is a no-op for 0 and clamps to the hard limit" {
+    switch (builtin.os.tag) {
+        .linux, .macos, .freebsd, .netbsd, .openbsd, .dragonfly, .illumos, .ios, .tvos, .watchos, .visionos => {},
+        else => return, // unsupported platform path returns null; nothing to assert
+    }
+
+    // 0 means "leave the OS default alone".
+    try std.testing.expectEqual(@as(?u64, null), try applyFdSoftLimit(0));
+
+    const limits = try std.posix.getrlimit(std.posix.rlimit_resource.NOFILE);
+    const current_soft: u64 = @intCast(limits.cur);
+    const hard: u64 = @intCast(limits.max);
+
+    // Requesting the current soft limit is a no-op that returns it unchanged
+    // (exercises the target == current early return without mutating the
+    // process's real fd limit).
+    if (current_soft > 0) {
+        try std.testing.expectEqual(@as(?u64, current_soft), try applyFdSoftLimit(current_soft));
+    }
+
+    // A desired value above the hard cap is clamped to the hard limit, never
+    // exceeding it. Restore the original limit afterward to avoid side effects.
+    const raised = try applyFdSoftLimit(hard + 1_000_000);
+    try std.testing.expectEqual(@as(?u64, hard), raised);
+    std.posix.setrlimit(std.posix.rlimit_resource.NOFILE, limits) catch {};
+}
+
 pub fn applyFdSoftLimit(desired: u64) !?u64 {
     if (desired == 0) return null;
     switch (builtin.os.tag) {

@@ -65,3 +65,29 @@ test "buffer pool reuses buffers" {
     try std.testing.expect(first.ptr == second.ptr);
     try std.testing.expectEqual(@as(usize, 1024), second.len);
 }
+
+test "buffer pool caches at most max_cached and never blocks under pressure (#172)" {
+    // The pool is a bounded cache, not a hard cap: acquire always succeeds (no
+    // exhaustion/blocking), and release never grows the cache beyond max_cached,
+    // so a burst of releases cannot cause unbounded retained allocation.
+    var pool = BufferPool.init(std.testing.allocator, 64, 2);
+    defer pool.deinit();
+
+    // Acquire well past the cache size; every buffer is valid and distinct.
+    var bufs: [5][]u8 = undefined;
+    for (&bufs) |*b| {
+        b.* = try pool.acquire();
+        try std.testing.expectEqual(@as(usize, 64), b.len);
+    }
+    try std.testing.expectEqual(@as(usize, 0), pool.free_list.items.len);
+
+    // Release all 5; only max_cached (2) are retained, the rest are freed back
+    // to the allocator (testing.allocator would flag a leak otherwise).
+    for (bufs) |b| pool.release(b);
+    try std.testing.expectEqual(@as(usize, 2), pool.free_list.items.len);
+
+    // A wrong-sized buffer is freed immediately, never cached.
+    const odd = try std.testing.allocator.alloc(u8, 65);
+    pool.release(odd);
+    try std.testing.expectEqual(@as(usize, 2), pool.free_list.items.len);
+}

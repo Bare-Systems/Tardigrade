@@ -95,6 +95,14 @@ Buffered upstream response bodies use a dedicated limit controlled by
 `TARDIGRADE_MAX_BUFFERED_UPSTREAM_RESPONSE_BYTES` (default `262144`), so
 operators can raise proxy payload ceilings without changing inbound request
 parsing limits.
+Streaming proxy mode is available for large HTTP upstream transfers:
+`TARDIGRADE_PROXY_STREAMING_MODE=off|response|full` keeps the default buffered
+behavior, streams upstream responses, or streams both upstream responses and
+eligible fixed-length client request bodies. `TARDIGRADE_PROXY_STREAM_BUFFER_SIZE`
+defaults to `16384` bytes and is capped at 1 MiB. Streaming is used on simple
+single-attempt HTTP proxy routes; Unix-socket upstreams, custom upstream mTLS,
+retry-enabled paths, rewrites, mirrors, and auth subrequests stay on the
+bounded buffered compatibility path.
 When an upstream container is replaced on the same host:port, the first request
 that hits a dead pooled keep-alive socket now evicts that stale connection so
 later requests reconnect cleanly without restarting Tardigrade. Proxy requests
@@ -137,8 +145,10 @@ Prometheus metrics are available on `TARDIGRADE_METRICS_PATH` (default
 `/status/metrics`). Set the path to an empty string to disable the endpoint, or
 set `TARDIGRADE_METRICS_REQUIRE_AUTH=true` to require the configured request
 auth controls before serving metrics. The endpoint now includes a global
-`tardigrade_request_latency_ms` histogram plus the worker/event-loop gauges
-documented in `docs/OBSERVABILITY.md`.
+`tardigrade_request_latency_ms` histogram, proxy streaming/buffered counters,
+proxy buffered-byte gauges/counters, proxy abort counters, upstream TTFB summary
+metrics, and the worker/event-loop gauges documented in
+`docs/OBSERVABILITY.md`.
 
 Proxy hops also propagate W3C `traceparent` in addition to Tardigrade's
 request ID headers, so upstream services can correlate the same request through

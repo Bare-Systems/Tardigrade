@@ -326,22 +326,17 @@ test "shouldSkipUpstreamRequestHeader strips headers named by Connection" {
 
 test "shouldSkipUpstreamRequestHeader strips all standard hop-by-hop headers case-insensitively" {
     const cases = [_][]const u8{
-        "Accept-Encoding", "accept-encoding", "ACCEPT-ENCODING",
-        "Connection",      "connection",      "CONNECTION",
-        "Content-Length",  "content-length",  "CONTENT-LENGTH",
-        "Host",            "host",            "HOST",
-        "Keep-Alive",      "keep-alive",      "KEEP-ALIVE",
-        "Proxy-Authenticate",
-        "Proxy-Authorization",
-        "Proxy-Connection",
-        "TE",              "te",
-        "Trailer",         "trailer",
-        "Transfer-Encoding", "transfer-encoding",
-        "Upgrade",         "upgrade",
-        "X-Forwarded-For", "x-forwarded-for",
-        "X-Forwarded-Host",
-        "X-Forwarded-Proto",
-        "X-Real-IP",       "x-real-ip",
+        "Accept-Encoding",    "accept-encoding",     "ACCEPT-ENCODING",
+        "Connection",         "connection",          "CONNECTION",
+        "Content-Length",     "content-length",      "CONTENT-LENGTH",
+        "Host",               "host",                "HOST",
+        "Keep-Alive",         "keep-alive",          "KEEP-ALIVE",
+        "Proxy-Authenticate", "Proxy-Authorization", "Proxy-Connection",
+        "TE",                 "te",                  "Trailer",
+        "trailer",            "Transfer-Encoding",   "transfer-encoding",
+        "Upgrade",            "upgrade",             "X-Forwarded-For",
+        "x-forwarded-for",    "X-Forwarded-Host",    "X-Forwarded-Proto",
+        "X-Real-IP",          "x-real-ip",
     };
     for (cases) |name| {
         try std.testing.expect(shouldSkipUpstreamRequestHeader(name, null));
@@ -393,17 +388,14 @@ test "shouldSkipUpstreamResponseHeader strips upstream Server and X-Powered-By" 
 
 test "shouldSkipUpstreamResponseHeader strips all hop-by-hop and disclosure headers" {
     const strip_cases = [_][]const u8{
-        "Connection", "connection", "CONNECTION",
-        "Keep-Alive", "keep-alive",
-        "Proxy-Connection",
-        "TE",         "te",
-        "Trailer",    "trailer",
-        "Transfer-Encoding", "transfer-encoding",
-        "Upgrade",    "upgrade",
-        "Content-Encoding", "content-encoding",
-        "Content-Length",   "content-length",
-        "Server",     "server",     "SERVER",
-        "X-Powered-By", "x-powered-by",
+        "Connection",       "connection",        "CONNECTION",
+        "Keep-Alive",       "keep-alive",        "Proxy-Connection",
+        "TE",               "te",                "Trailer",
+        "trailer",          "Transfer-Encoding", "transfer-encoding",
+        "Upgrade",          "upgrade",           "Content-Encoding",
+        "content-encoding", "Content-Length",    "content-length",
+        "Server",           "server",            "SERVER",
+        "X-Powered-By",     "x-powered-by",
     };
     for (strip_cases) |name| {
         try std.testing.expect(shouldSkipUpstreamResponseHeader(name));

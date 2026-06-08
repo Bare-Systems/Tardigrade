@@ -25,6 +25,12 @@
 #   --keepalive-path PATH  Path for keepalive (default: /health)
 #   --proxy-payload-64k-path PATH  Path for 64 KiB proxied payload benchmark (default: /proxy/payload-64k.bin)
 #   --proxy-payload-256k-path PATH  Path for 256 KiB proxied payload benchmark (default: /proxy/payload-256k.bin)
+#   --proxy-payload-1m-path PATH    Path for 1 MiB proxied payload benchmark (default: /proxy/payload-1m.bin)
+#   --proxy-payload-16m-path PATH   Path for 16 MiB proxied payload benchmark (default: /proxy/payload-16m.bin)
+#   --proxy-upload-path PATH        Path for proxied upload benchmark (default: /proxy/upload-large)
+#   --proxy-slow-client-path PATH   Path for slow-client download benchmark (default: /proxy/payload-16m.bin)
+#   --slow-client-limit-rate RATE   curl --limit-rate value for slow clients (default: 1M)
+#   --slow-client-connections N     Concurrent slow clients (default: 4)
 #   --h2-path PATH      Path for static-http2 (default: same as --static-path)
 #   --h3-path PATH      Path for static-http3 (default: same as --static-path)
 #   --scenarios LIST    Comma-separated scenario names to run (default: all)
@@ -45,6 +51,11 @@
 #   keepalive           Keep-alive connection reuse
 #   proxy-payload-64k   Reverse proxy 64 KiB payload transfer
 #   proxy-payload-256k  Reverse proxy 256 KiB payload transfer
+#   proxy-payload-1m    Reverse proxy 1 MiB payload transfer
+#   proxy-payload-16m   Reverse proxy 16 MiB payload transfer
+#   proxy-upload-large  Reverse proxy 1 MiB fixed-length upload (requires k6)
+#   proxy-slow-client-download
+#                       Reverse proxy download through rate-limited clients
 #   reload-under-load   Trigger SIGHUP during a load run and measure degradation
 #
 # Prerequisites:
@@ -78,6 +89,12 @@ PROXY_PATH="/proxy/health"
 KEEPALIVE_PATH="/health"
 PROXY_PAYLOAD_64K_PATH="/proxy/payload-64k.bin"
 PROXY_PAYLOAD_256K_PATH="/proxy/payload-256k.bin"
+PROXY_PAYLOAD_1M_PATH="/proxy/payload-1m.bin"
+PROXY_PAYLOAD_16M_PATH="/proxy/payload-16m.bin"
+PROXY_UPLOAD_PATH="/proxy/upload-large"
+PROXY_SLOW_CLIENT_PATH="/proxy/payload-16m.bin"
+SLOW_CLIENT_LIMIT_RATE="1M"
+SLOW_CLIENT_CONNECTIONS=4
 H2_PATH=""      # defaults to STATIC_PATH after arg parsing
 H3_PATH=""      # defaults to STATIC_PATH after arg parsing
 SCENARIOS="static-http1,proxy-http1,keepalive"
@@ -109,6 +126,12 @@ while [[ $# -gt 0 ]]; do
         --keepalive-path)KEEPALIVE_PATH="$2";  shift 2 ;;
         --proxy-payload-64k-path)PROXY_PAYLOAD_64K_PATH="$2"; shift 2 ;;
         --proxy-payload-256k-path)PROXY_PAYLOAD_256K_PATH="$2"; shift 2 ;;
+        --proxy-payload-1m-path)PROXY_PAYLOAD_1M_PATH="$2"; shift 2 ;;
+        --proxy-payload-16m-path)PROXY_PAYLOAD_16M_PATH="$2"; shift 2 ;;
+        --proxy-upload-path)PROXY_UPLOAD_PATH="$2"; shift 2 ;;
+        --proxy-slow-client-path)PROXY_SLOW_CLIENT_PATH="$2"; shift 2 ;;
+        --slow-client-limit-rate)SLOW_CLIENT_LIMIT_RATE="$2"; shift 2 ;;
+        --slow-client-connections)SLOW_CLIENT_CONNECTIONS="$2"; shift 2 ;;
         --h2-path)    H2_PATH="$2";            shift 2 ;;
         --h3-path)    H3_PATH="$2";            shift 2 ;;
         --scenarios)  SCENARIOS="$2";          shift 2 ;;
@@ -238,6 +261,23 @@ latency_value_to_ms() {
         if (v ~ /s$/)  { sub(/s$/, "", v);  printf "%.3f", v * 1000; exit }
         printf "%.3f", v + 0
     }'
+}
+
+percentile_from_file() {
+    local file="$1" percentile="$2"
+    if [[ ! -s "$file" ]]; then
+        echo "null"
+        return 0
+    fi
+    sort -n "$file" | awk -v pct="$percentile" '
+        { values[++n] = $1 }
+        END {
+            if (n == 0) { print "null"; exit }
+            rank = int((pct / 100.0) * n + 0.999999)
+            if (rank < 1) rank = 1
+            if (rank > n) rank = n
+            printf "%.3f", values[rank]
+        }'
 }
 
 wrk_percentile_ms() {
@@ -602,6 +642,98 @@ run_k6_scenario() {
     rm -f "$tmpfile"
 }
 
+# ── slow-client download runner ──────────────────────────────────────────────
+# Uses curl --limit-rate so the gateway experiences real slow downstream reads.
+run_slow_client_download() {
+    local url="$1" label="$2"
+    if ! command -v curl &>/dev/null; then
+        echo "  Skipping — slow-client download scenario requires curl"
+        return 0
+    fi
+
+    local clients="$SLOW_CLIENT_CONNECTIONS"
+    if (( clients < 1 )); then
+        clients=1
+    fi
+    local max_time=$((DURATION + 60))
+    if (( max_time < 30 )); then
+        max_time=30
+    fi
+
+    local tmpdir; tmpdir=$(mktemp -d /tmp/tardigrade-slow-client-XXXX)
+    local times_file="$tmpdir/times_ms"
+    local extra=()
+    $INSECURE && extra+=(--insecure)
+    build_tool_headers -H
+    [[ ${#TOOL_HEADERS[@]} -gt 0 ]] && extra+=("${TOOL_HEADERS[@]}")
+
+    start_process_monitor
+    local start_epoch; start_epoch=$(date +%s)
+    local pids=()
+    local i
+    for ((i = 0; i < clients; i++)); do
+        (
+            curl -sS -f --http1.1 \
+                --limit-rate "$SLOW_CLIENT_LIMIT_RATE" \
+                --max-time "$max_time" \
+                -o /dev/null \
+                -w "%{http_code} %{size_download} %{time_total}\n" \
+                ${extra[@]+"${extra[@]}"} \
+                "$url" > "$tmpdir/$i.out" 2> "$tmpdir/$i.err"
+            printf '%s\n' "$?" > "$tmpdir/$i.code"
+        ) &
+        pids+=("$!")
+    done
+
+    local pid
+    for pid in "${pids[@]}"; do
+        wait "$pid" || true
+    done
+    local end_epoch; end_epoch=$(date +%s)
+    stop_process_monitor
+
+    local successes=0 errors=0 total_bytes=0
+    for ((i = 0; i < clients; i++)); do
+        local code="1"
+        if [[ -f "$tmpdir/$i.code" ]]; then
+            code=$(<"$tmpdir/$i.code")
+        fi
+        if [[ "$code" == "0" && -s "$tmpdir/$i.out" ]]; then
+            local status bytes seconds
+            read -r status bytes seconds < "$tmpdir/$i.out"
+            if [[ "$status" =~ ^2[0-9][0-9]$ ]]; then
+                successes=$((successes + 1))
+                total_bytes=$((total_bytes + bytes))
+                awk -v s="$seconds" 'BEGIN { printf "%.3f\n", s * 1000 }' >> "$times_file"
+            else
+                errors=$((errors + 1))
+            fi
+        else
+            errors=$((errors + 1))
+        fi
+    done
+
+    local elapsed=$((end_epoch - start_epoch))
+    if (( elapsed < 1 )); then
+        elapsed=1
+    fi
+    local rps tput_mbps p50 p95 p99 p999
+    rps=$(awk -v ok="$successes" -v elapsed="$elapsed" 'BEGIN { printf "%.3f", ok / elapsed }')
+    tput_mbps=$(awk -v bytes="$total_bytes" -v elapsed="$elapsed" 'BEGIN { if (bytes > 0) printf "%.2f", bytes / elapsed / 1048576; else print "null" }')
+    p50=$(percentile_from_file "$times_file" 50)
+    p95=$(percentile_from_file "$times_file" 95)
+    p99=$(percentile_from_file "$times_file" 99)
+    p999=$(percentile_from_file "$times_file" 99.9)
+
+    local tput_display="" cpu_display="" rss_display=""
+    [[ "$tput_mbps" != "null" ]] && tput_display="  throughput=${tput_mbps}MB/s"
+    [[ "$CURRENT_CPU_PCT_AVG" != "null" ]] && cpu_display="  cpu=${CURRENT_CPU_PCT_AVG}%"
+    [[ "$CURRENT_RSS_MB_PEAK" != "null" ]] && rss_display="  rss_peak=${CURRENT_RSS_MB_PEAK}MiB"
+    echo "  $label — ${rps} req/s  p50=${p50}ms  p95=${p95}ms  p99=${p99}ms  p999=${p999}ms  errors=${errors}${tput_display}${cpu_display}${rss_display}"
+    add_result "$label" "$rps" "$p50" "$p95" "$p99" "$p999" "$errors" "$tput_mbps" "$CURRENT_CPU_PCT_AVG" "$CURRENT_RSS_MB_PEAK"
+    rm -rf "$tmpdir"
+}
+
 # ── Generic runner dispatcher ─────────────────────────────────────────────────
 run_scenario() {
     local url="$1" label="$2"
@@ -679,6 +811,35 @@ scenario_proxy_payload_256k() {
     run_scenario "${BASE_URL}${PROXY_PAYLOAD_256K_PATH}" "proxy-payload-256k"
 }
 
+scenario_proxy_payload_1m() {
+    echo "==> proxy-payload-1m: reverse proxy 1 MiB payload (${PROXY_PAYLOAD_1M_PATH})"
+    run_scenario "${BASE_URL}${PROXY_PAYLOAD_1M_PATH}" "proxy-payload-1m"
+}
+
+scenario_proxy_payload_16m() {
+    echo "==> proxy-payload-16m: reverse proxy 16 MiB payload (${PROXY_PAYLOAD_16M_PATH})"
+    run_scenario "${BASE_URL}${PROXY_PAYLOAD_16M_PATH}" "proxy-payload-16m"
+}
+
+scenario_proxy_upload_large() {
+    echo "==> proxy-upload-large: reverse proxy 1 MiB fixed-length upload (${PROXY_UPLOAD_PATH})"
+    if [[ "$TOOL" != "k6" ]]; then
+        echo "  Skipping — proxy-upload-large scenario requires k6"
+        return 0
+    fi
+    run_k6_scenario "upload" "proxy-upload-large" \
+        -e "UPLOAD_PATH=${PROXY_UPLOAD_PATH}" \
+        -e "UPLOAD_BYTES=1048576" \
+        -e "K6_VUS=${CONNECTIONS}" \
+        -e "K6_DURATION=${DURATION}s"
+}
+
+scenario_proxy_slow_client_download() {
+    echo "==> proxy-slow-client-download: rate-limited clients downloading ${PROXY_SLOW_CLIENT_PATH}"
+    echo "  clients=${SLOW_CLIENT_CONNECTIONS} limit-rate=${SLOW_CLIENT_LIMIT_RATE}"
+    run_slow_client_download "${BASE_URL}${PROXY_SLOW_CLIENT_PATH}" "proxy-slow-client-download"
+}
+
 scenario_auth_enforcement() {
     echo "==> auth-enforcement: verify 401 for unauthenticated and 2xx for authenticated requests"
     if [[ "$TOOL" != "k6" ]]; then
@@ -737,7 +898,7 @@ scenario_reload_under_load() {
 # ── Main loop ─────────────────────────────────────────────────────────────────
 echo "Tardigrade benchmark — target: ${BASE_URL}  tool: ${TOOL}"
 echo "Duration: ${DURATION}s  Connections: ${CONNECTIONS}  Threads: ${THREADS}"
-echo "Paths: static=${STATIC_PATH} proxy=${PROXY_PATH} keepalive=${KEEPALIVE_PATH} proxy64k=${PROXY_PAYLOAD_64K_PATH} proxy256k=${PROXY_PAYLOAD_256K_PATH} h2=${H2_PATH} h3=${H3_PATH}"
+echo "Paths: static=${STATIC_PATH} proxy=${PROXY_PATH} keepalive=${KEEPALIVE_PATH} proxy64k=${PROXY_PAYLOAD_64K_PATH} proxy256k=${PROXY_PAYLOAD_256K_PATH} proxy1m=${PROXY_PAYLOAD_1M_PATH} proxy16m=${PROXY_PAYLOAD_16M_PATH} h2=${H2_PATH} h3=${H3_PATH}"
 if [[ -n "$HOST_HEADER" ]]; then
     echo "Host header override: ${HOST_HEADER}"
 fi
@@ -758,6 +919,10 @@ for scenario in "${SCENARIO_LIST[@]}"; do
         keepalive)          scenario_keepalive ;;
         proxy-payload-64k)  scenario_proxy_payload_64k ;;
         proxy-payload-256k) scenario_proxy_payload_256k ;;
+        proxy-payload-1m)   scenario_proxy_payload_1m ;;
+        proxy-payload-16m)  scenario_proxy_payload_16m ;;
+        proxy-upload-large) scenario_proxy_upload_large ;;
+        proxy-slow-client-download) scenario_proxy_slow_client_download ;;
         reload-under-load)  scenario_reload_under_load ;;
         auth-enforcement)   scenario_auth_enforcement ;;
         rate-limit)         scenario_rate_limit ;;

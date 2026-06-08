@@ -27,11 +27,14 @@ const resolveProxyTarget = gp.resolveProxyTarget;
 const appendProxyQueryString = gp.appendProxyQueryString;
 const executeBoundedBufferedHttpsMtlsRequest = gp.executeBoundedBufferedHttpsMtlsRequest;
 const executeBoundedBufferedHttpProxyRequest = gp.executeBoundedBufferedHttpProxyRequest;
+const executeStreamingHttpProxyRequest = gp.executeStreamingHttpProxyRequest;
 const mapControlPlaneProxyExecutionError = gp.mapControlPlaneProxyExecutionError;
 const sendApiError = gp.sendApiError;
 const setRequestIdHeaders = gp.setRequestIdHeaders;
 const applyResponseHeaders = gp.applyResponseHeaders;
 const writeBufferedUpstreamResponse = gp.writeBufferedUpstreamResponse;
+
+pub const StreamingRequestBody = gp.StreamingRequestBody;
 
 pub const DataPlaneProxyResponse = union(enum) {
     bounded_buffered: BufferedUpstreamResponse,
@@ -156,6 +159,19 @@ pub fn executeBufferedDataPlaneProxyRequest(
         response_timeout_ms,
         cancel_token,
     ) };
+}
+
+fn canStreamDataPlaneProxyRequest(
+    cfg: *const edge_config.EdgeConfig,
+    resolved: *const gp.ResolvedProxyTarget,
+    url: []const u8,
+    max_attempts: usize,
+) bool {
+    if (!cfg.proxy_streaming_mode.responseStreamingEnabled()) return false;
+    if (max_attempts != 1) return false;
+    if (resolved.unix_socket_path != null) return false;
+    if (cfg.upstream_tls_client_cert.len > 0 and std.mem.startsWith(u8, url, "https://")) return false;
+    return true;
 }
 
 pub fn dataPlaneBufferedCompatibilityResponseLimit(cfg: *const edge_config.EdgeConfig) usize {
@@ -417,6 +433,7 @@ fn executeVersionedApiProxyRoute(
 
 pub fn handleLocationProxyPass(
     allocator: std.mem.Allocator,
+    downstream_conn: anytype,
     writer: anytype,
     cfg: *const edge_config.EdgeConfig,
     state: *GatewayState,
@@ -433,6 +450,7 @@ pub fn handleLocationProxyPass(
     auth_scopes: ?[]const u8,
     incoming_host: ?[]const u8,
     location_id: []const u8,
+    streaming_request_body: ?StreamingRequestBody,
 ) !u16 {
     const upstream_scope = .global;
     const upstream_pool = upstreamPoolForScope(cfg, upstream_scope);
@@ -475,6 +493,95 @@ pub fn handleLocationProxyPass(
     const max_attempts = proxyRetryAttemptLimit(cfg.upstream_retry_attempts, cfg.upstream_retry_idempotent_only, method_str);
     const budget_start_ms = http.event_loop.monotonicMs();
 
+    if (canStreamDataPlaneProxyRequest(cfg, &resolved, upstream_url.value, max_attempts)) {
+        state.recordUpstreamAttemptStart(selection.base_url);
+        const streamed = executeStreamingHttpProxyRequest(
+            allocator,
+            &state.upstream_client,
+            cfg,
+            upstream_url.value,
+            method_str,
+            &request.headers,
+            body,
+            streaming_request_body,
+            downstream_conn,
+            writer,
+            correlation_id,
+            client_ip,
+            forwarded_proto,
+            request.headers.get("host"),
+            auth_identity,
+            auth_user_id,
+            auth_device_id,
+            auth_scopes,
+            &state.security_headers,
+            sticky_set_cookie,
+            if (ctx.lifecycle) |lc| &lc.token else null,
+        ) catch |err| {
+            state.recordUpstreamAttemptEnd(selection.base_url);
+            if (err == error.ClientAborted) {
+                state.metricsRecordProxyClientAbort();
+                return err;
+            }
+            state.recordUpstreamFailure(cfg, selection.base_url);
+            if (err == error.RequestCancelled) {
+                if (ctx.lifecycle) |lc| lc.logTimeout("upstream_connect");
+                try sendApiError(allocator, writer, .gateway_timeout, "upstream_timeout", "Upstream request timed out", correlation_id, false, state);
+                ctx.setUpstreamResult(resolved.upstream_host, @intFromEnum(http.Status.gateway_timeout), 0);
+                return @intFromEnum(http.Status.gateway_timeout);
+            }
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            const err_status: http.Status = switch (err) {
+                error.Timeout, error.WouldBlock => .gateway_timeout,
+                else => .bad_gateway,
+            };
+            const err_code = if (err_status == .gateway_timeout) "upstream_timeout" else "upstream_error";
+            const err_msg = if (err_status == .gateway_timeout) "Upstream request timed out" else "Upstream connection failed";
+            state.logger.warn(correlation_id, "streaming upstream request failed: {}", .{err});
+            try sendApiError(allocator, writer, err_status, err_code, err_msg, correlation_id, false, state);
+            ctx.setUpstreamResult(resolved.upstream_host, @intFromEnum(err_status), 0);
+            return @intFromEnum(err_status);
+        };
+        state.recordUpstreamAttemptEnd(selection.base_url);
+
+        const transcript_redactions: []const []const u8 = if (request.headers.get("authorization")) |raw_auth|
+            if (http.auth.parseBearerToken(raw_auth)) |token| &.{token} else &.{}
+        else
+            &.{};
+        state.appendTranscript(
+            upstreamScopeName(proxyScopeForPath(request.uri.path)),
+            request.uri.path,
+            correlation_id,
+            auth_identity,
+            client_ip,
+            upstream_url.value,
+            if (streaming_request_body == null) body else "",
+            streamed.status_code,
+            "application/octet-stream",
+            "",
+            transcript_redactions,
+        );
+        if (!isAbsoluteHttpUrl(std.mem.trim(u8, target, " \t\r\n"))) {
+            if (streamed.status_code >= 500 or streamed.upstream_aborted) {
+                state.recordUpstreamFailure(cfg, selection.base_url);
+            } else {
+                state.recordUpstreamSuccess(cfg, selection.base_url);
+            }
+        }
+        if (streamed.upstream_aborted) state.metricsRecordProxyUpstreamAbort();
+        state.metricsRecordProxyStreamingRequest(streamed.upstream_ttfb_ms);
+        ctx.setUpstreamResult(resolved.upstream_host, streamed.status_code, streamed.response_body_bytes);
+        state.metricsRecord(streamed.status_code);
+        return streamed.status_code;
+    }
+
+    if (streaming_request_body != null) {
+        state.logger.warn(correlation_id, "streaming upload could not use streaming proxy path after routing", .{});
+        try sendApiError(allocator, writer, .bad_gateway, "upstream_error", "Streaming upload could not be proxied", correlation_id, false, state);
+        ctx.setUpstreamResult(resolved.upstream_host, @intFromEnum(http.Status.bad_gateway), 0);
+        return @intFromEnum(http.Status.bad_gateway);
+    }
+
     var attempt: usize = 0;
     var upstream_response: DataPlaneProxyResponse = while (attempt < max_attempts) : (attempt += 1) {
         const per_attempt_timeout_ms: u32 = blk: {
@@ -488,6 +595,7 @@ pub fn handleLocationProxyPass(
             break :blk @intCast(@min(@as(u64, cfg.upstream_timeout_ms), remaining));
         };
         state.recordUpstreamAttemptStart(selection.base_url);
+        const upstream_start_ms = http.event_loop.monotonicMs();
         const resp = executeBufferedDataPlaneProxyRequest(
             allocator,
             &state.upstream_client,
@@ -539,11 +647,14 @@ pub fn handleLocationProxyPass(
             ctx.setUpstreamResult(resolved.upstream_host, @intFromEnum(err_status), 0);
             return @intFromEnum(err_status);
         };
+        const upstream_ttfb_ms = http.event_loop.monotonicMs() - upstream_start_ms;
+        state.metricsRecordProxyBufferedRequest(result.bodyLen(), upstream_ttfb_ms);
         // Retry on 5xx only when attempts remain and the method allows it.
         if (result.statusCode() >= 500 and attempt + 1 < max_attempts) {
             state.recordUpstreamFailure(cfg, selection.base_url);
             state.logger.warn(correlation_id, "proxy attempt {d}/{d} got {d}, retrying", .{ attempt + 1, max_attempts, result.statusCode() });
             var r = result;
+            state.metricsReleaseProxyBufferedBytes(r.bodyLen());
             r.deinit(allocator);
             continue;
         }
@@ -559,6 +670,7 @@ pub fn handleLocationProxyPass(
         return 502;
     };
     defer upstream_response.deinit(allocator);
+    defer state.metricsReleaseProxyBufferedBytes(upstream_response.bodyLen());
 
     const transcript_redactions: []const []const u8 = if (request.headers.get("authorization")) |raw_auth|
         if (http.auth.parseBearerToken(raw_auth)) |token| &.{token} else &.{}

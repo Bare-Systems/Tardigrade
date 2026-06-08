@@ -75,6 +75,19 @@ pub const BufferedUpstreamResponse = struct {
     }
 };
 
+pub const StreamingRequestBody = struct {
+    content_length: usize,
+    initial_bytes: []const u8 = &.{},
+};
+
+pub const StreamingProxyResult = struct {
+    status_code: u16,
+    reason: []const u8,
+    response_body_bytes: usize,
+    upstream_ttfb_ms: u64,
+    upstream_aborted: bool = false,
+};
+
 pub fn uriComponentBytes(component: std.Uri.Component) []const u8 {
     return switch (component) {
         .raw => |value| value,
@@ -515,7 +528,6 @@ pub fn applyResponseHeaders(state: *GatewayState, response: *http.Response) void
     }
 }
 
-
 pub fn writeStreamedUpstreamResponse(
     writer: anytype,
     status_code: u16,
@@ -582,6 +594,37 @@ pub fn writeStreamedUpstreamResponseHead(
     }
 
     try writeSecurityHeaders(writer, security);
+    try writer.writeAll("\r\n");
+}
+
+pub fn writeStreamedUpstreamResponseHeadFromHeaders(
+    writer: anytype,
+    status_code: u16,
+    reason: []const u8,
+    upstream_headers: []const UpstreamHeader,
+    body_allowed: bool,
+    correlation_id: []const u8,
+    security: *const http.security_headers.SecurityHeaders,
+    sticky_set_cookie: ?[]const u8,
+) !void {
+    const phrase = if (reason.len > 0)
+        reason
+    else
+        (@as(std.http.Status, @enumFromInt(status_code)).phrase() orelse "");
+
+    try writer.print("HTTP/1.1 {d} {s}\r\n", .{ status_code, phrase });
+    try writer.print("Server: {s}\r\n", .{http.SERVER_NAME});
+    try writer.writeAll("Connection: close\r\n");
+    if (body_allowed) try writer.writeAll("Transfer-Encoding: chunked\r\n");
+    try writeRequestIdHeaders(writer, correlation_id);
+    for (upstream_headers) |header| {
+        if (gph.shouldSkipUpstreamResponseHeader(header.name)) continue;
+        try writer.print("{s}: {s}\r\n", .{ header.name, header.value });
+    }
+    if (sticky_set_cookie) |cookie| {
+        try writer.print("Set-Cookie: {s}\r\n", .{cookie});
+    }
+    try writeSecurityHeadersFiltered(writer, security, upstream_headers);
     try writer.writeAll("\r\n");
 }
 
@@ -660,7 +703,6 @@ pub fn writeBufferedUpstreamResponseHead(
     try writeSecurityHeadersFiltered(writer, security, upstream_response.headers);
     try writer.writeAll("\r\n");
 }
-
 
 pub fn computeHstsValue(allocator: std.mem.Allocator, cfg: *const edge_config.EdgeConfig) ![]u8 {
     if (!cfg.hsts_enabled or cfg.tls_cert_path.len == 0) return allocator.dupe(u8, "");
@@ -755,7 +797,233 @@ pub fn writeChunk(writer: anytype, bytes: []const u8) !void {
     try writer.writeAll("\r\n");
 }
 
+fn responseBodyAllowed(method: []const u8, status_code: u16) bool {
+    if (std.ascii.eqlIgnoreCase(method, "HEAD")) return false;
+    return !(status_code >= 100 and status_code < 200) and status_code != 204 and status_code != 304;
+}
 
+pub fn executeStreamingHttpProxyRequest(
+    allocator: std.mem.Allocator,
+    client: *std.http.Client,
+    cfg: *const edge_config.EdgeConfig,
+    url: []const u8,
+    method: []const u8,
+    request_headers: *const http.Headers,
+    buffered_body: []const u8,
+    streaming_body: ?StreamingRequestBody,
+    downstream_conn: anytype,
+    downstream_writer: anytype,
+    correlation_id: []const u8,
+    client_ip: []const u8,
+    forwarded_proto: []const u8,
+    incoming_host: ?[]const u8,
+    auth_identity: ?[]const u8,
+    auth_user_id: ?[]const u8,
+    auth_device_id: ?[]const u8,
+    auth_scopes: ?[]const u8,
+    security: *const http.security_headers.SecurityHeaders,
+    sticky_set_cookie: ?[]const u8,
+    cancel_token: ?*const CancellationToken,
+) !StreamingProxyResult {
+    if (cancel_token) |tok| {
+        if (tok.isStopped()) return error.RequestCancelled;
+    }
+    const proxy_extra_header_slack = 10;
+    const method_enum = std.meta.stringToEnum(std.http.Method, method) orelse return error.UnsupportedHttpMethod;
+    const uri = try std.Uri.parse(url);
+    var forwarded_for = try buildForwardedFor(allocator, request_headers.get("x-forwarded-for"), client_ip);
+    defer forwarded_for.deinit(allocator);
+    var metadata_arena = std.heap.ArenaAllocator.init(allocator);
+    defer metadata_arena.deinit();
+    const metadata_allocator = metadata_arena.allocator();
+
+    var extra_headers_stack = std.heap.stackFallback(2048, allocator);
+    const extra_headers_allocator = extra_headers_stack.get();
+    var extra_headers = std.array_list.Managed(std.http.Header).init(extra_headers_allocator);
+    defer extra_headers.deinit();
+    try extra_headers.ensureUnusedCapacity(request_headers.count() + proxy_extra_header_slack);
+    try gph.appendProxyRequestHeaders(&extra_headers, request_headers);
+    try gph.appendRequestIdHeaders(&extra_headers, correlation_id);
+    try extra_headers.append(.{ .name = "X-Forwarded-For", .value = forwarded_for.value });
+    try extra_headers.append(.{ .name = "X-Real-IP", .value = client_ip });
+    try extra_headers.append(.{ .name = "X-Forwarded-Proto", .value = forwarded_proto });
+    if (incoming_host) |value| {
+        const trimmed = std.mem.trim(u8, value, " \t\r\n");
+        if (trimmed.len > 0) try extra_headers.append(.{ .name = "X-Forwarded-Host", .value = trimmed });
+    }
+    try gph.appendAssertedIdentityHeaders(&extra_headers, auth_identity, auth_user_id, auth_device_id, auth_scopes);
+    var traceparent_buf: [55]u8 = undefined;
+    if (request_headers.get("traceparent") == null) {
+        const tc = http.trace_context.generate();
+        const tp = tc.format(&traceparent_buf);
+        if (tp.len > 0) try extra_headers.append(.{ .name = "traceparent", .value = tp });
+    }
+
+    var server_header_buffer: [16 * 1024]u8 = undefined;
+    var req = try client.request(method_enum, uri, .{
+        .headers = .{
+            .connection = .omit,
+            .user_agent = .omit,
+            .accept_encoding = .omit,
+        },
+        .extra_headers = extra_headers.items,
+        .keep_alive = true,
+        .redirect_behavior = .unhandled,
+    });
+    defer req.deinit();
+
+    const ttfb_start_ms = http.event_loop.monotonicMs();
+    if (streaming_body) |stream_body| {
+        req.transfer_encoding = .{ .content_length = stream_body.content_length };
+        const body_writer_buffer = try allocator.alloc(u8, cfg.proxy_stream_buffer_size);
+        defer allocator.free(body_writer_buffer);
+        const relay_buffer = try allocator.alloc(u8, cfg.proxy_stream_buffer_size);
+        defer allocator.free(relay_buffer);
+        var body_writer = req.sendBodyUnflushed(body_writer_buffer) catch |err| {
+            markRequestConnectionClosing(&req);
+            return err;
+        };
+
+        var sent: usize = @min(stream_body.initial_bytes.len, stream_body.content_length);
+        if (sent > 0) {
+            body_writer.writer.writeAll(stream_body.initial_bytes[0..sent]) catch |err| {
+                markRequestConnectionClosing(&req);
+                return err;
+            };
+        }
+        while (sent < stream_body.content_length) {
+            if (cancel_token) |tok| {
+                if (tok.isStopped()) {
+                    markRequestConnectionClosing(&req);
+                    return error.RequestCancelled;
+                }
+            }
+            const want = @min(relay_buffer.len, stream_body.content_length - sent);
+            const n = downstream_conn.read(relay_buffer[0..want]) catch {
+                markRequestConnectionClosing(&req);
+                return error.ClientAborted;
+            };
+            if (n == 0) {
+                markRequestConnectionClosing(&req);
+                return error.ClientAborted;
+            }
+            body_writer.writer.writeAll(relay_buffer[0..n]) catch |err| {
+                markRequestConnectionClosing(&req);
+                return err;
+            };
+            sent += n;
+        }
+        body_writer.end() catch |err| {
+            markRequestConnectionClosing(&req);
+            return err;
+        };
+    } else if (buffered_body.len > 0 or method_enum.requestHasBody()) {
+        req.sendBodyComplete(@constCast(buffered_body)) catch |err| {
+            markRequestConnectionClosing(&req);
+            return err;
+        };
+    } else {
+        req.sendBodiless() catch |err| {
+            markRequestConnectionClosing(&req);
+            return err;
+        };
+    }
+
+    var resp = req.receiveHead(&server_header_buffer) catch |err| {
+        markRequestConnectionClosing(&req);
+        return err;
+    };
+    const ttfb_ms = http.event_loop.monotonicMs() - ttfb_start_ms;
+    const status_code: u16 = @intFromEnum(resp.head.status);
+    const reason = upstreamReasonPhrase(resp.head.status);
+
+    var headers = std.array_list.Managed(UpstreamHeader).init(metadata_allocator);
+    try headers.ensureUnusedCapacity(8);
+    var header_it = resp.head.iterateHeaders();
+    while (header_it.next()) |header| {
+        if (gph.shouldSkipUpstreamResponseHeader(header.name)) continue;
+        try headers.append(.{
+            .name = try metadata_allocator.dupe(u8, header.name),
+            .value = try metadata_allocator.dupe(u8, header.value),
+        });
+    }
+    const upstream_headers = try headers.toOwnedSlice();
+    const body_allowed = responseBodyAllowed(method, status_code);
+
+    writeStreamedUpstreamResponseHeadFromHeaders(
+        downstream_writer,
+        status_code,
+        reason,
+        upstream_headers,
+        body_allowed,
+        correlation_id,
+        security,
+        sticky_set_cookie,
+    ) catch {
+        markRequestConnectionClosing(&req);
+        return error.ClientAborted;
+    };
+
+    var streamed_body_bytes: usize = 0;
+    if (body_allowed) {
+        const expected_body_len = resp.head.content_length;
+        const transfer_buffer = try allocator.alloc(u8, cfg.proxy_stream_buffer_size);
+        defer allocator.free(transfer_buffer);
+        const relay_buffer = try allocator.alloc(u8, cfg.proxy_stream_buffer_size);
+        defer allocator.free(relay_buffer);
+        var body_reader = resp.reader(transfer_buffer);
+        while (true) {
+            if (cancel_token) |tok| {
+                if (tok.isStopped()) {
+                    markRequestConnectionClosing(&req);
+                    return error.RequestCancelled;
+                }
+            }
+            const n = body_reader.readSliceShort(relay_buffer) catch |err| switch (err) {
+                error.ReadFailed => {
+                    markRequestConnectionClosing(&req);
+                    return .{
+                        .status_code = status_code,
+                        .reason = reason,
+                        .response_body_bytes = streamed_body_bytes,
+                        .upstream_ttfb_ms = ttfb_ms,
+                        .upstream_aborted = true,
+                    };
+                },
+            };
+            if (n == 0) break;
+            writeChunk(downstream_writer, relay_buffer[0..n]) catch {
+                markRequestConnectionClosing(&req);
+                return error.ClientAborted;
+            };
+            streamed_body_bytes += n;
+        }
+        if (expected_body_len) |expected| {
+            if (@as(u64, @intCast(streamed_body_bytes)) < expected) {
+                markRequestConnectionClosing(&req);
+                return .{
+                    .status_code = status_code,
+                    .reason = reason,
+                    .response_body_bytes = streamed_body_bytes,
+                    .upstream_ttfb_ms = ttfb_ms,
+                    .upstream_aborted = true,
+                };
+            }
+        }
+        writeChunk(downstream_writer, "") catch {
+            markRequestConnectionClosing(&req);
+            return error.ClientAborted;
+        };
+    }
+
+    return .{
+        .status_code = status_code,
+        .reason = reason,
+        .response_body_bytes = streamed_body_bytes,
+        .upstream_ttfb_ms = ttfb_ms,
+        .upstream_aborted = false,
+    };
+}
 
 pub fn upstreamResponseHasNoStore(response: std.http.Client.Response.Head) bool {
     var it = response.iterateHeaders();
@@ -956,7 +1224,6 @@ pub fn buildApiErrorJson(allocator: std.mem.Allocator, code: []const u8, message
     return std.fmt.allocPrint(allocator, "{{\"code\":\"{s}\",\"message\":\"{s}\",\"request_id\":null}}", .{ code, message });
 }
 
-
 pub fn sendApiError(allocator: std.mem.Allocator, writer: anytype, status: http.Status, code: []const u8, message: []const u8, request_id: ?[]const u8, keep_alive: bool, state: *GatewayState) !void {
     const payload = try buildApiErrorJson(allocator, code, message, request_id);
     defer allocator.free(payload);
@@ -1031,7 +1298,6 @@ test "appendProxyQueryString borrows base url when request has no query" {
     try std.testing.expect(appended.owned == null);
     try std.testing.expectEqual(@intFromPtr(base.ptr), @intFromPtr(appended.value.ptr));
 }
-
 
 test "writeBufferedUpstreamResponse serializes a single forwarded response head" {
     const allocator = std.testing.allocator;

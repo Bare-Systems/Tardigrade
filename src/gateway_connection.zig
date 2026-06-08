@@ -289,9 +289,38 @@ pub fn readHttpRequest(conn: anytype, buf: []u8, pending_len: *usize) !usize {
     return total_read;
 }
 
-pub fn firstRequestCompleteLen(data: []const u8) ?usize {
+pub const HttpRequestHeadRead = struct {
+    header_len: usize,
+    total_read: usize,
+};
+
+pub fn readHttpRequestHead(conn: anytype, buf: []u8, pending_len: *usize) !HttpRequestHeadRead {
+    var total_read = pending_len.*;
+
+    while (total_read <= buf.len) {
+        if (firstRequestHeadersCompleteLen(buf[0..total_read])) |header_len| {
+            pending_len.* = total_read;
+            return .{ .header_len = header_len, .total_read = total_read };
+        }
+        if (total_read == buf.len) break;
+
+        const n = conn.read(buf[total_read..]) catch |err| return err;
+        if (n == 0) break;
+        total_read += n;
+    }
+
+    pending_len.* = total_read;
+    if (total_read == 0) return .{ .header_len = 0, .total_read = 0 };
+    return error.IncompleteHeaders;
+}
+
+pub fn firstRequestHeadersCompleteLen(data: []const u8) ?usize {
     const header_pos = std.mem.find(u8, data, "\r\n\r\n") orelse return null;
-    const headers_len = header_pos + 4;
+    return header_pos + 4;
+}
+
+pub fn firstRequestCompleteLen(data: []const u8) ?usize {
+    const headers_len = firstRequestHeadersCompleteLen(data) orelse return null;
     const content_length = parseContentLength(data[0..headers_len]) orelse 0;
     const full_len = headers_len + content_length;
     if (data.len >= full_len) return full_len;
@@ -387,6 +416,13 @@ test "firstRequestCompleteLen waits for complete body" {
 
     const complete = "POST /x HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nhello";
     try std.testing.expectEqual(@as(usize, complete.len), firstRequestCompleteLen(complete).?);
+}
+
+test "firstRequestHeadersCompleteLen stops before body" {
+    const raw = "POST /upload HTTP/1.1\r\nHost: local\r\nContent-Length: 5\r\n\r\nhello";
+    const head_len = firstRequestHeadersCompleteLen(raw).?;
+    try std.testing.expectEqual(raw.len - "hello".len, head_len);
+    try std.testing.expect(firstRequestHeadersCompleteLen("GET / HTTP/1.1\r\nHost: local\r\n") == null);
 }
 
 test "firstRequestCompleteLen handles keep-alive pipelined requests" {

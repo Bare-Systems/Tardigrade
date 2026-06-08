@@ -50,6 +50,7 @@ pub fn routeRequest(
     correlation_id: []const u8,
     keep_alive: *bool,
     client_ip: []const u8,
+    streaming_request_body: ?gproxy_runtime.StreamingRequestBody,
 ) !u16 {
     const writer = conn.writer();
     if (try handleTranscriptRoute(allocator, writer, state, request, correlation_id, keep_alive.*)) |status| {
@@ -107,6 +108,7 @@ pub fn routeRequest(
             .proxy_pass => |target| {
                 return try handleLocationProxyPass(
                     allocator,
+                    conn,
                     writer,
                     cfg,
                     state,
@@ -123,6 +125,7 @@ pub fn routeRequest(
                     ctx.scopes,
                     request.headers.get("host"),
                     matched.block.pattern,
+                    streaming_request_body,
                 );
             },
             .fastcgi_pass => |upstream| {

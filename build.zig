@@ -52,6 +52,31 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_exe_unit_tests.step);
 
+    const allocation_regression_mod = b.createModule(.{
+        .root_source_file = b.path("src/allocation_regression.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    allocation_regression_mod.addImport("build_options", build_options.createModule());
+
+    const allocation_regression_tests = b.addTest(.{
+        .root_module = allocation_regression_mod,
+        .filters = &.{"allocation"},
+    });
+    configureSsl(allocation_regression_tests, enable_http3_ngtcp2, prefer_static_system_libs, require_static_system_libs);
+    const run_allocation_regression_tests = b.addRunArtifact(allocation_regression_tests);
+    test_step.dependOn(&run_allocation_regression_tests.step);
+
+    const allocation_regression_exe = b.addExecutable(.{
+        .name = "allocation_regression",
+        .root_module = allocation_regression_mod,
+    });
+    configureSsl(allocation_regression_exe, enable_http3_ngtcp2, prefer_static_system_libs, require_static_system_libs);
+    const run_allocation_regression = b.addRunArtifact(allocation_regression_exe);
+    const allocation_regression_step = b.step("bench-allocations", "Report hot-path allocation budgets as JSON");
+    allocation_regression_step.dependOn(&run_allocation_regression.step);
+
     const integration_options = b.addOptions();
     integration_options.addOption([]const u8, "tardigrade_bin_path", b.getInstallPath(.bin, "tardigrade"));
     integration_options.addOption([]const u8, "http3_resumption_client_bin_path", if (enable_http3_ngtcp2) b.getInstallPath(.bin, "http3_resumption_client") else "");

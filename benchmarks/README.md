@@ -78,6 +78,31 @@ Use the committed metadata files for common contexts:
 - `benchmarks/targets/release-baseline.json`
 - `benchmarks/targets/ci-smoke.json`
 
+## Allocation regression benchmark
+
+`zig build bench-allocations` runs an in-process hot-path allocation harness and
+prints JSON with `allocations_per_request` and `bytes_allocated_per_request` for
+each measured scenario. The same budgets are enforced by `zig build test`, so
+allocator regressions fail with the scenario name and the exceeded threshold.
+
+This harness does not replace canonical throughput benchmarks. It avoids live
+network timing noise and measures allocator calls around deterministic runtime
+helpers that are easy to regress during refactors.
+
+Current debug budgets:
+
+| Scenario | Allocation budget/request | Byte budget/request | Rationale |
+|---|---:|---:|---|
+| `static-tiny-file-warm` | 14 | 1024 | File-backed warm static responses allocate normalized path metadata, ETag, and Last-Modified strings; file bytes stay out of heap. |
+| `static-304-conditional` | 14 | 1024 | Conditional static hits follow the same path and validator allocation shape, but avoid response-body bytes. |
+| `proxy-keepalive-warm` | 6 | 512 | Warm proxy keep-alive helper work owns resolved target strings while forwarded header assembly stays stack-backed. |
+| `rejected-overload` | 12 | 1024 | This intentionally allocating path builds a structured JSON error and response header copies before closing the request. |
+
+Large streamed proxy-response allocation checks belong with live throughput and
+RSS benchmarks because they exercise socket backpressure rather than isolated
+helper allocation counts. Use the streaming scenarios below with PID sampling
+to compare RSS, p99, throughput, buffered bytes, and CPU.
+
 ## Scenarios
 
 ### Throughput scenarios (all tools)
@@ -90,6 +115,10 @@ These measure raw request throughput and run with whichever tool is auto-detecte
 | `proxy-http1` | Reverse proxy route over HTTP/1.1 | — |
 | `proxy-payload-64k` | Reverse proxy 64 KiB payload transfer | — |
 | `proxy-payload-256k` | Reverse proxy 256 KiB payload transfer | — |
+| `proxy-payload-1m` | Reverse proxy 1 MiB payload transfer | Requires benchmark target route and upstream fixture payload |
+| `proxy-payload-16m` | Reverse proxy 16 MiB payload transfer | Requires streaming mode for bounded RSS on default proxy caps |
+| `proxy-upload-large` | Reverse proxy 1 MiB fixed-length upload | Requires `k6`; use `TARDIGRADE_PROXY_STREAMING_MODE=full` for upload streaming |
+| `proxy-slow-client-download` | Reverse proxy download through rate-limited clients | Requires `curl`; use PID sampling to compare bounded RSS |
 | `static-http2` | Static file serving over HTTP/2 | Skipped unless tool is `h2load` or `k6` + `--tls` |
 | `proxy-http2` | Reverse proxy route over HTTP/2 | Skipped unless tool is `h2load` |
 | `static-http3` | Static file serving over HTTP/3 (QUIC) | Skipped unless `h2load` with `--h3` support **and** `--tls` |
@@ -147,6 +176,12 @@ Run only k6 behavioral tests: `--tool k6 --scenarios auth-enforcement,rate-limit
 --keepalive-path PATH Path for keepalive (default: /health)
 --proxy-payload-64k-path PATH  Path for proxy-payload-64k (default: /proxy/payload-64k.bin)
 --proxy-payload-256k-path PATH Path for proxy-payload-256k (default: /proxy/payload-256k.bin)
+--proxy-payload-1m-path PATH   Path for proxy-payload-1m (default: /proxy/payload-1m.bin)
+--proxy-payload-16m-path PATH  Path for proxy-payload-16m (default: /proxy/payload-16m.bin)
+--proxy-upload-path PATH       Path for proxy-upload-large (default: /proxy/upload-large)
+--proxy-slow-client-path PATH  Path for proxy-slow-client-download (default: /proxy/payload-16m.bin)
+--slow-client-limit-rate RATE  curl --limit-rate value for slow clients (default: 1M)
+--slow-client-connections N    Concurrent slow clients (default: 4)
 --h2-path PATH        Path for static-http2 (default: same as --static-path)
 --h3-path PATH        Path for static-http3 (default: same as --static-path)
 --scenarios LIST      Comma-separated scenario names
@@ -168,6 +203,8 @@ Two things commonly invalidate a run if you miss them:
 
 - `proxy-http1` and `proxy-http2` are only meaningful when `--proxy-path` points at a real proxied upstream route.
 - If the target config uses `server_name`, send a matching `Host` header with `--host-header` or benchmark via the named hostname instead of by raw IP.
+- For pure throughput/RSS proxy benchmarks, run the target with `TARDIGRADE_RATE_LIMIT_RPS=0`; otherwise the default limiter becomes the bottleneck and 429 responses pollute the results.
+- Streaming proxy benchmarks should run with `TARDIGRADE_PROXY_STREAMING_MODE=response` for download cases and `full` for fixed-length upload cases. Keep `TARDIGRADE_UPSTREAM_RETRY_ATTEMPTS=1` for streaming runs.
 
 Examples:
 
@@ -278,6 +315,54 @@ this reason. Add them explicitly when running a full protocol comparison:
   --duration 30 \
   --scenarios static-http1,proxy-http1,static-http2,proxy-http2,static-http3,proxy-http3
 ```
+
+## Streaming proxy benchmarks
+
+Issue #139 added explicit scenarios for the streaming reverse-proxy data path.
+Use a benchmark config with the fixture upstream routes:
+
+- `/proxy/payload-1m.bin` -> upstream `/payload-1m.bin`
+- `/proxy/payload-16m.bin` -> upstream `/payload-16m.bin`
+- `/proxy/upload-large` -> upstream `/upload-large`
+- `/proxy/payload-16m.bin` for `proxy-slow-client-download`, with `curl`
+  enforcing the downstream read rate
+
+Run downloads with process sampling:
+
+```bash
+./benchmarks/run.sh \
+  --host 127.0.0.1 \
+  --pid-file /run/tardigrade/tardigrade.pid \
+  --scenarios proxy-http1,proxy-payload-1m,proxy-payload-16m \
+  --proxy-path /proxy/health
+```
+
+Run the slow-client download benchmark with rate-limited clients:
+
+```bash
+./benchmarks/run.sh \
+  --host 127.0.0.1 \
+  --pid-file /run/tardigrade/tardigrade.pid \
+  --scenarios proxy-slow-client-download \
+  --slow-client-connections 4 \
+  --slow-client-limit-rate 1M
+```
+
+Run the fixed-length upload scenario with k6:
+
+```bash
+./benchmarks/run.sh \
+  --tool k6 \
+  --host 127.0.0.1 \
+  --pid-file /run/tardigrade/tardigrade.pid \
+  --scenarios proxy-upload-large
+```
+
+Compare `rps`, `p99_ms`, `throughput_mbps`, `rss_mb_peak`, `cpu_pct_avg`, and
+the proxy metrics from `/status/metrics`: `tardigrade_proxy_streaming_requests_total`,
+`tardigrade_proxy_buffered_requests_total`, `tardigrade_proxy_buffered_bytes_current`,
+`tardigrade_proxy_buffered_bytes_total`, `tardigrade_proxy_client_aborts_total`,
+`tardigrade_proxy_upstream_aborts_total`, and `tardigrade_proxy_ttfb_ms_*`.
 
 If `h2load` is not available or was not built with QUIC support, the HTTP/2 and HTTP/3
 scenarios each print a clear skip message and the runner continues without error.

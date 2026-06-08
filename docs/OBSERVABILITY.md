@@ -83,13 +83,22 @@ Two outcome shapes exist:
 | Per-IP connection limit | `TARDIGRADE_MAX_CONNECTIONS_PER_IP` | 0 (unlimited) | `tryAcquireConnectionSlot` → `.over_ip_limit` | Deterministic `503`; `connection_rejections` + `error_overload`; warn log names the IP |
 | Connection memory budget | `TARDIGRADE_MAX_TOTAL_CONNECTION_MEMORY_BYTES` | 0 (off) | `tryAcquireConnectionSlot` → `.over_global_memory_limit` | Projected `(active+1) × per-conn estimate` over budget → deterministic `503`; `connection_rejections` + `error_overload` |
 | Worker queue saturation | `TARDIGRADE_WORKER_MAX_QUEUE_DEPTH` (+ per-worker depth) | 0 (uses pool default) | `WorkerPool.submit` → `error.QueueFull` | Slot released, deterministic `503`; `queue_rejections` + `error_overload` |
-| Concurrent in-flight requests | `TARDIGRADE_MAX_IN_FLIGHT_REQUESTS` | 0 (unlimited) | `GatewayState.tryAcquireRequestSlot` | Returns `503` before any request work; counted as a server error |
-| URI too long | `TARDIGRADE_MAX_URI_LENGTH` (per-route) | 8 KiB | `request_limits.validateUriLength` | `414`-class rejection before body allocation |
-| Too many headers | `max_header_count` | 100 | `request_limits.validateHeaderCount` | `431`-class rejection before body allocation |
-| Single header too large | `max_header_size` | 8 KiB | `request_limits.validateHeaderSize` | `431`-class rejection |
-| All headers too large | `max_headers_total_size` | 32 KiB | `request_limits.validateHeadersTotalSize` | `431` before body allocation |
-| Request body too large | `max_body_size` | 1 MiB | `request_limits.validateBodySize` | `413`-class rejection |
+| Concurrent in-flight requests | `TARDIGRADE_MAX_IN_FLIGHT_REQUESTS` | 0 (unlimited) | `GatewayState.tryAcquireRequestSlot` | Returns `503` before any request work; `error_overload` incremented |
+| URI too long | `TARDIGRADE_MAX_URI_LENGTH` | 8 KiB | `request_limits.validateUriLength` | `414`-class rejection before body allocation |
+| Too many headers | `TARDIGRADE_MAX_HEADER_COUNT` | 100 | `request_limits.validateHeaderCount` | `431`-class rejection before body allocation |
+| Single header too large | `TARDIGRADE_MAX_HEADER_SIZE` | 8 KiB | `request_limits.validateHeaderSize` | `431`-class rejection |
+| All headers too large | `TARDIGRADE_MAX_HEADERS_TOTAL_SIZE` | 32 KiB | `request_limits.validateHeadersTotalSize` | `431` before body allocation |
+| Request body too large | `TARDIGRADE_MAX_BODY_SIZE` | 1 MiB | `request_limits.validateBodySize` | `413`-class rejection |
 | Parked keepalive backlog | idle-park timeout / `max_requests_per_connection` | — | `keepalive_park.ParkedRegistry` | Idle parked connections reaped on the timer tick (`timeouts_total`); none hold a worker while idle |
+
+The request-size limits are enforced in two layers: the HTTP parser
+(`http/headers.zig`) applies fixed backstops (per-header 8 KiB, all-headers
+32 KiB, header count 100) that bound parse-time allocation regardless of
+config, and the handler (`gateway_handlers.zig`) then applies the
+operator-configured `request_limits` values. Configuring a value *stricter*
+than the parser backstop tightens the limit; a value *looser* is still capped
+by the parser backstop. All request-limit rejections are deterministic and
+emit a `warn` runtime log plus the corresponding access-log status.
 
 Notes on the two pool-style resources called out in the issue:
 

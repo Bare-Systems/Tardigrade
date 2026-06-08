@@ -1496,7 +1496,9 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
     if (!state.tryAcquireRequestSlot()) {
         try gp.sendApiError(allocator, writer, .service_unavailable, "overloaded", "Too many in-flight requests", correlation_id, false, state);
         state.metricsRecord(503);
-        state.metricsRecordErrorCode("overloaded");
+        // Metrics label must be the canonical "overload" the metrics switch
+        // accepts (recordErrorCode); the client-facing API code stays "overloaded".
+        state.metricsRecordErrorCode("overload");
         ghandlers.logAccess(state, &ctx, request.method.toString(), request.uri.path, 503, request.headers.get("user-agent") orelse "");
         return;
     }

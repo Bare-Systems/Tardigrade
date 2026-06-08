@@ -644,6 +644,18 @@ test "Metrics tracks active connections and rejections" {
     try std.testing.expectEqual(@as(u64, 1), m.err_overload);
 }
 
+test "recordErrorCode counts only the canonical overload label" {
+    // Regression guard: every overload path (accept-time connection/queue
+    // rejections and in-flight backpressure) must use exactly "overload".
+    // A near-miss like "overloaded" must not silently drop the count.
+    var m = Metrics.init();
+    m.recordErrorCode("overload");
+    try std.testing.expectEqual(@as(u64, 1), m.err_overload);
+    m.recordErrorCode("overloaded"); // not a recognized label -> no-op
+    m.recordErrorCode("");
+    try std.testing.expectEqual(@as(u64, 1), m.err_overload);
+}
+
 test "Metrics toPrometheus produces valid Prometheus text" {
     const allocator = std.testing.allocator;
     var m = Metrics.init();

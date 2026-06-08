@@ -71,6 +71,7 @@ pub const Metrics = struct {
     err_upstream_unavailable: u64,
     err_internal_error: u64,
     err_overload: u64,
+    err_request_timeout: u64,
     mux_frame_errors: u64,
     /// Total event loop iterations (timer tick fires).
     event_loop_iterations: u64,
@@ -127,6 +128,7 @@ pub const Metrics = struct {
             .err_upstream_unavailable = 0,
             .err_internal_error = 0,
             .err_overload = 0,
+            .err_request_timeout = 0,
             .mux_frame_errors = 0,
             .event_loop_iterations = 0,
             .health_probe_runs = 0,
@@ -287,6 +289,8 @@ pub const Metrics = struct {
             self.err_internal_error += 1;
         } else if (std.mem.eql(u8, code, "overload")) {
             self.err_overload += 1;
+        } else if (std.mem.eql(u8, code, "request_timeout")) {
+            self.err_request_timeout += 1;
         }
     }
 
@@ -457,6 +461,9 @@ pub const Metrics = struct {
             \\# HELP tardigrade_error_overload_total Total overload API errors
             \\# TYPE tardigrade_error_overload_total counter
             \\tardigrade_error_overload_total {d}
+            \\# HELP tardigrade_error_request_timeout_total Total request_timeout API errors
+            \\# TYPE tardigrade_error_request_timeout_total counter
+            \\tardigrade_error_request_timeout_total {d}
             \\# HELP tardigrade_mux_frame_errors_total Total mux frame parse or validation errors
             \\# TYPE tardigrade_mux_frame_errors_total counter
             \\tardigrade_mux_frame_errors_total {d}
@@ -479,6 +486,7 @@ pub const Metrics = struct {
             self.err_upstream_unavailable,
             self.err_internal_error,
             self.err_overload,
+            self.err_request_timeout,
             self.mux_frame_errors,
             self.event_loop_iterations,
             self.health_probe_runs,
@@ -538,7 +546,7 @@ pub const Metrics = struct {
             self.proxy_ttfb_ms_sum,
         });
         try out.print(
-            \\,"request_latency_ms_count":{d},"request_latency_ms_sum":{d},"worker_active_jobs":{d},"worker_queued_jobs":{d},"worker_threads":{d},"worker_queue_capacity":{d},"error_invalid_request":{d},"error_unauthorized":{d},"error_rate_limited":{d},"error_upstream_timeout":{d},"error_upstream_unavailable":{d},"error_internal_error":{d},"error_overload":{d},"mux_frame_errors":{d},"event_loop_iterations":{d},"health_probe_runs":{d}}}
+            \\,"request_latency_ms_count":{d},"request_latency_ms_sum":{d},"worker_active_jobs":{d},"worker_queued_jobs":{d},"worker_threads":{d},"worker_queue_capacity":{d},"error_invalid_request":{d},"error_unauthorized":{d},"error_rate_limited":{d},"error_upstream_timeout":{d},"error_upstream_unavailable":{d},"error_internal_error":{d},"error_overload":{d},"error_request_timeout":{d},"mux_frame_errors":{d},"event_loop_iterations":{d},"health_probe_runs":{d}}}
         , .{
             self.latency_count,
             self.latency_sum_ms,
@@ -553,6 +561,7 @@ pub const Metrics = struct {
             self.err_upstream_unavailable,
             self.err_internal_error,
             self.err_overload,
+            self.err_request_timeout,
             self.mux_frame_errors,
             self.event_loop_iterations,
             self.health_probe_runs,
@@ -654,6 +663,16 @@ test "recordErrorCode counts only the canonical overload label" {
     m.recordErrorCode("overloaded"); // not a recognized label -> no-op
     m.recordErrorCode("");
     try std.testing.expectEqual(@as(u64, 1), m.err_overload);
+}
+
+test "recordErrorCode counts request_timeout errors" {
+    // The request-total-timeout path records "request_timeout"; it must have a
+    // matching counter so the error is observable (previously a silent no-op).
+    var m = Metrics.init();
+    try std.testing.expectEqual(@as(u64, 0), m.err_request_timeout);
+    m.recordErrorCode("request_timeout");
+    m.recordErrorCode("request_timeout");
+    try std.testing.expectEqual(@as(u64, 2), m.err_request_timeout);
 }
 
 test "Metrics toPrometheus produces valid Prometheus text" {

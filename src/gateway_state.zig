@@ -1341,7 +1341,7 @@ pub const GatewayState = struct {
             metrics_snapshot.proxy_ttfb_ms_sum,
         });
         try out.print(
-            \\,"request_latency_ms_count":{d},"request_latency_ms_sum":{d},"worker_active_jobs":{d},"worker_queued_jobs":{d},"worker_threads":{d},"worker_queue_capacity":{d},"error_invalid_request":{d},"error_unauthorized":{d},"error_rate_limited":{d},"error_upstream_timeout":{d},"error_upstream_unavailable":{d},"error_internal_error":{d},"error_overload":{d},"mux_frame_errors":{d}}}
+            \\,"request_latency_ms_count":{d},"request_latency_ms_sum":{d},"worker_active_jobs":{d},"worker_queued_jobs":{d},"worker_threads":{d},"worker_queue_capacity":{d},"error_invalid_request":{d},"error_unauthorized":{d},"error_rate_limited":{d},"error_upstream_timeout":{d},"error_upstream_unavailable":{d},"error_internal_error":{d},"error_overload":{d},"error_request_timeout":{d},"mux_frame_errors":{d}}}
         , .{
             metrics_snapshot.latency_count,
             metrics_snapshot.latency_sum_ms,
@@ -1356,6 +1356,7 @@ pub const GatewayState = struct {
             metrics_snapshot.err_upstream_unavailable,
             metrics_snapshot.err_internal_error,
             metrics_snapshot.err_overload,
+            metrics_snapshot.err_request_timeout,
             metrics_snapshot.mux_frame_errors,
         });
         return out.toOwnedSlice();

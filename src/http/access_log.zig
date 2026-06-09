@@ -89,6 +89,28 @@ const State = struct {
 
 var global_state: ?*State = null;
 
+/// Test/diagnostic hook. When non-null, `writeLine` routes bytes here instead of
+/// STDERR and treats the return value as the number of bytes the sink accepted.
+/// A short or zero return simulates a slow or unavailable sink: the remainder of
+/// the line is dropped (best-effort, never retried) and counted in `dropped_lines`
+/// so the request hot path is never blocked waiting on the sink.
+pub var sink_override: ?*const fn (bytes: []const u8) usize = null;
+
+/// Count of log lines (or partial lines) dropped because the sink could not
+/// accept all bytes. Best-effort observability for a slow/unavailable log sink.
+var dropped_lines = std.atomic.Value(u64).init(0);
+
+/// Number of access-log lines dropped due to a stalled or failing sink.
+pub fn droppedLines() u64 {
+    return dropped_lines.load(.monotonic);
+}
+
+/// Test-only: clear the dropped-line counter and any installed sink hook.
+pub fn resetSinkForTest() void {
+    dropped_lines.store(0, .monotonic);
+    sink_override = null;
+}
+
 pub fn init(allocator: std.mem.Allocator, cfg: Config) !void {
     if (global_state != null) return;
     const st = try allocator.create(State);
@@ -263,9 +285,25 @@ fn appendTemplate(allocator: std.mem.Allocator, out: *std.ArrayList(u8), templat
 
 fn writeLine(line: []const u8, syslog_udp_endpoint: []const u8) void {
     var remaining = line;
+    if (sink_override) |sink| {
+        while (remaining.len > 0) {
+            const n = sink(remaining);
+            if (n == 0) {
+                _ = dropped_lines.fetchAdd(1, .monotonic);
+                break;
+            }
+            remaining = remaining[@min(n, remaining.len)..];
+        }
+        return;
+    }
     while (remaining.len > 0) {
         const n = std.c.write(std.posix.STDERR_FILENO, remaining.ptr, remaining.len);
-        if (n <= 0) break;
+        if (n <= 0) {
+            // Sink (stderr pipe) refused the write — drop the rest best-effort
+            // rather than spinning or blocking the request that emitted it.
+            _ = dropped_lines.fetchAdd(1, .monotonic);
+            break;
+        }
         remaining = remaining[@as(usize, @intCast(n))..];
     }
     if (syslog_udp_endpoint.len > 0) sendSyslogUdp(syslog_udp_endpoint, line);
@@ -421,6 +459,50 @@ test "formatEntryInto reuses a scratch buffer and matches formatEntry" {
 
     try formatEntryInto(std.testing.allocator, &scratch, cfg, entry);
     try std.testing.expectEqualStrings(expected, scratch.items);
+}
+
+fn rejectingSink(_: []const u8) usize {
+    return 0; // simulate a sink that accepts nothing (slow/unavailable)
+}
+
+test "buffered access log stays bounded and counts drops when the sink stalls" {
+    // #172 overload scenario: "logs or metrics sink becomes slow/unavailable".
+    // Even when the sink refuses every byte, the request hot path must stay
+    // bounded — the buffer flushes at its threshold and is cleared regardless of
+    // the write outcome, so retained memory never grows without bound and the
+    // drop is observable rather than silent.
+    try init(std.testing.allocator, .{ .buffer_size_bytes = 256 });
+    defer deinit();
+    resetSinkForTest();
+    sink_override = rejectingSink;
+    defer resetSinkForTest();
+
+    const entry = AccessLogEntry{
+        .method = "GET",
+        .path = "/status/metrics",
+        .status = 200,
+        .latency_ms = 0,
+        .client_ip = "127.0.0.1",
+        .correlation_id = "sink-stall",
+        .upstream_addr = "",
+        .upstream_status = null,
+        .identity = "-",
+        .user_agent = "",
+        .bytes_sent = 0,
+        .response_bytes = 0,
+        .error_category = "-",
+    };
+
+    var i: usize = 0;
+    while (i < 10_000) : (i += 1) entry.log();
+
+    // Buffer is cleared on every threshold flush even though the sink rejected
+    // it, so retained memory is bounded to roughly one threshold plus one entry.
+    if (global_state) |st| {
+        try std.testing.expect(st.buffer.items.len < st.cfg.buffer_size_bytes + 1024);
+    }
+    // A stalled sink is counted, not silently ignored.
+    try std.testing.expect(droppedLines() > 0);
 }
 
 test "shouldRedactHeader matches default sensitive headers case-insensitively" {

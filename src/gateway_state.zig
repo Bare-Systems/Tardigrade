@@ -266,92 +266,194 @@ fn deinitMuxResumeState(allocator: std.mem.Allocator, saved_state: *MuxResumeSta
 }
 
 /// Persistent gateway state shared across connections.
+///
+/// # Ownership, lifetime, and threading model
+///
+/// `GatewayState` is created once at startup (`edge_gateway.zig`), lives for the
+/// whole process, and is shared by reference across all threads. It mixes four
+/// kinds of fields; each field below is tagged with which kind it is.
+///
+/// ## Threads that touch this struct
+/// - **Main event loop** (one thread): the accept loop plus periodic maintenance
+///   (health-probe dispatch, proxy-cache maintenance, DNS refresh, reload/drain).
+/// - **Worker pool** (N threads): execute requests with blocking I/O; reach into
+///   the shared sub-stores, counters, and maps through the locked accessor
+///   methods on this struct.
+/// - **Background health-probe thread** (transient): spawned by the main loop and
+///   gated by `health_probe_running`; runs upstream probes off the hot path.
+///
+/// ## Synchronization domains (mutex → fields it guards)
+/// All locking is centralized in this file; callers use the accessor methods
+/// rather than touching the fields directly.
+/// - `connection_mutex` → `active_connections_total`, `active_connections_by_ip`,
+///   `active_fds`, `fd_to_ip`, `active_ws_streams`, `active_sse_streams`,
+///   `active_mux_connections`, `active_mux_subscriptions`,
+///   `mux_subscriptions_by_device`, `fastcgi_pool`, `fastcgi_next_request_id`.
+/// - `upstream_mutex` → `upstream_health`, `upstream_active_requests`,
+///   `upstream_rr_index`, `upstream_backup_rr_index`, `lb_random_state` (the
+///   load-balancer selection state mutated by the `*Locked` selectors).
+/// - `circuit_mutex` → `circuit_breaker`.
+/// - `metrics_mutex` → `metrics`.
+/// - `rate_limiter_mutex` → `rate_limiter`.
+/// - `idempotency_mutex` → `idempotency_store`.
+/// - `proxy_cache_mutex` → `proxy_cache_store`, `proxy_cache_locks`,
+///   `proxy_cache_path`, `proxy_cache_ttl_seconds`.
+/// - `session_mutex` → `session_store`.
+/// - `transcript_mutex` → serializes appends to the `transcript_store_path` file.
+/// - `command_mutex` → `command_lifecycle`.
+/// - `approval_mutex` → `approvals` (and the per-identity pending count derived
+///   from it).
+/// - `runtime_mutex` → `mux_resume_state`, and the reload-time rebinding of the
+///   hot config-derived fields (`add_headers`, `http3_alt_svc`, `hsts_value`,
+///   `security_headers`, the `max_*` limits, `compression_config`, log level).
+/// - `reload_mutex` → `last_reload_ok`, `last_reload_at_ms`, `last_reload_error`,
+///   `last_reload_error_len`.
+///
+/// ## Lock-free fields
+/// - **Atomics:** `in_flight_requests` (request-slot counter) and
+///   `health_probe_running` (acquire/release handoff between the main loop and
+///   the probe thread). No mutex required.
+/// - **Main-event-loop-only** (never touched by workers, so unsynchronized):
+///   `next_active_health_probe_ms`, `next_proxy_cache_maintenance_ms`,
+///   `http3_runtime`, and `dns_discovery` (which self-synchronizes internally).
+///
+/// ## Ownership / lifetime classification
+/// - **Borrowed from the active `EdgeConfig`** (NOT freed here; lifetime is the
+///   config version): `add_headers`, `proxy_cache_path`, `session_store_path`,
+///   `approval_store_path`, `approval_escalation_webhook`, `transcript_store_path`,
+///   and the scalar/POD config snapshots (`max_*`, `*_ttl*`, `compression_config`,
+///   `security_headers` contents). The startup config is borrowed by the
+///   `ReloadableConfigStore`; on reload a new version is installed and the old one
+///   is retained until in-flight leases release, so borrowed slices stay valid for
+///   readers holding a lease.
+/// - **Heap-owned by `GatewayState`** (freed in `deinit`): `hsts_value`,
+///   `http3_alt_svc`; every `StringHashMap` key (all are `dupe`d on insert) and
+///   the duped IP values in `fd_to_ip`; the nested allocations owned by
+///   `command_lifecycle`, `approvals`, and `mux_resume_state` entries; and the
+///   self-managed sub-stores (`rate_limiter`, `idempotency_store`,
+///   `proxy_cache_store`, `session_store`, `access_control`, `acme_challenge_store`,
+///   `event_hub`, `request_buffer_pool`, `relay_buffer_pool`, `upstream_client`,
+///   `dns_discovery`), each of which owns and frees its own internal state.
+///
+/// ## `deinit` ordering
+/// `deinit` tears down in this order: self-managed sub-stores first (each
+/// independent), then the owned scalar buffers (`hsts_value`, `http3_alt_svc`),
+/// then every map — freeing duped keys (and, for `fastcgi_pool`, closing pooled
+/// streams; for `command_lifecycle`/`approvals`/`mux_resume_state`, freeing nested
+/// values) before calling the map's own `deinit`. Maps are independent of each
+/// other, so their relative order does not matter; the invariant is keys/values
+/// freed *before* the backing map is destroyed.
+///
+/// ## Reload / drain behavior
+/// `applyReloadedRuntimeConfig` (`gateway_shutdown.zig`) re-derives the owned
+/// config-derived fields (`hsts_value`, `http3_alt_svc`, `security_headers`) —
+/// freeing the previous allocation — and rebinds the hot borrowed fields
+/// (`add_headers`, `proxy_cache_path`) and scalar limits to the new config under
+/// the appropriate locks. All owned *runtime* state (connection accounting,
+/// in-flight counter, upstream health/active-request maps, circuit breaker,
+/// metrics, pools, and the sub-stores not keyed off changed config) survives a
+/// reload untouched. NOTE: `session_store_path`, `approval_store_path`,
+/// `transcript_store_path`, and `approval_escalation_webhook` are bound once at
+/// startup and are intentionally NOT rebound on reload (see issue #191) — they
+/// remain valid because the startup config outlives the process, but changes to
+/// those paths require a restart.
 pub const GatewayState = struct {
     allocator: std.mem.Allocator,
-    connection_mutex: compat.Mutex = .{},
-    rate_limiter_mutex: compat.Mutex = .{},
-    idempotency_mutex: compat.Mutex = .{},
-    proxy_cache_mutex: compat.Mutex = .{},
-    session_mutex: compat.Mutex = .{},
-    transcript_mutex: compat.Mutex = .{},
-    command_mutex: compat.Mutex = .{},
-    approval_mutex: compat.Mutex = .{},
-    circuit_mutex: compat.Mutex = .{},
-    metrics_mutex: compat.Mutex = .{},
-    upstream_mutex: compat.Mutex = .{},
-    runtime_mutex: compat.Mutex = .{},
-    rate_limiter: ?http.rate_limiter.RateLimiter,
-    idempotency_store: ?http.idempotency.IdempotencyStore,
-    proxy_cache_store: ?http.idempotency.IdempotencyStore,
-    proxy_cache_path: []const u8,
-    proxy_cache_ttl_seconds: u32,
-    security_headers: http.security_headers.SecurityHeaders,
-    /// Owned HSTS header value. Empty when HSTS is disabled or TLS is not configured.
+    // --- Synchronization primitives (see the struct doc comment for the full
+    // mutex → field map). Each guards the fields named alongside it. ---
+    connection_mutex: compat.Mutex = .{}, // connection accounting + fastcgi/mux-sub maps
+    rate_limiter_mutex: compat.Mutex = .{}, // rate_limiter
+    idempotency_mutex: compat.Mutex = .{}, // idempotency_store
+    proxy_cache_mutex: compat.Mutex = .{}, // proxy_cache_store + proxy_cache_locks + path/ttl
+    session_mutex: compat.Mutex = .{}, // session_store
+    transcript_mutex: compat.Mutex = .{}, // transcript file appends
+    command_mutex: compat.Mutex = .{}, // command_lifecycle
+    approval_mutex: compat.Mutex = .{}, // approvals + pending-per-identity count
+    circuit_mutex: compat.Mutex = .{}, // circuit_breaker
+    metrics_mutex: compat.Mutex = .{}, // metrics
+    upstream_mutex: compat.Mutex = .{}, // upstream_health/active_requests + LB selection state
+    runtime_mutex: compat.Mutex = .{}, // mux_resume_state + reload-time config rebinding
+    rate_limiter: ?http.rate_limiter.RateLimiter, // owned; rebuilt on reload [rate_limiter_mutex]
+    idempotency_store: ?http.idempotency.IdempotencyStore, // owned [idempotency_mutex]
+    proxy_cache_store: ?http.idempotency.IdempotencyStore, // owned; rebuilt on reload [proxy_cache_mutex]
+    proxy_cache_path: []const u8, // borrowed from cfg; rebound on reload [proxy_cache_mutex]
+    proxy_cache_ttl_seconds: u32, // cfg snapshot [proxy_cache_mutex]
+    security_headers: http.security_headers.SecurityHeaders, // cfg-derived; re-derived on reload [runtime_mutex]
+    /// Owned HSTS header value. Empty when HSTS is disabled or TLS is not
+    /// configured. Heap-owned; re-derived (old value freed) on reload. [runtime_mutex]
     hsts_value: []u8 = &.{},
-    add_headers: []const edge_config.EdgeConfig.HeaderPair,
-    http3_alt_svc: ?[]u8,
-    http3_runtime: ?*http.http3_runtime.Runtime,
-    session_store: ?http.session.SessionStore,
-    session_store_path: []const u8,
-    access_control: ?http.access_control.AccessControl,
-    logger: http.logger.Logger,
-    metrics: http.metrics.Metrics,
-    compression_config: http.compression.CompressionConfig,
-    circuit_breaker: http.circuit_breaker.CircuitBreaker,
-    upstream_client: std.http.Client,
+    add_headers: []const edge_config.EdgeConfig.HeaderPair, // borrowed from cfg; rebound on reload [runtime_mutex]
+    http3_alt_svc: ?[]u8, // owned; re-derived (old freed) on reload [runtime_mutex]
+    http3_runtime: ?*http.http3_runtime.Runtime, // owned pointer; main-event-loop-only
+    session_store: ?http.session.SessionStore, // owned [session_mutex]
+    session_store_path: []const u8, // borrowed from startup cfg; NOT rebound on reload (#191)
+    access_control: ?http.access_control.AccessControl, // owned; main-loop-only
+    logger: http.logger.Logger, // owned; min_level updated on reload [runtime_mutex]
+    metrics: http.metrics.Metrics, // shared counters [metrics_mutex]
+    compression_config: http.compression.CompressionConfig, // cfg snapshot; updated on reload [runtime_mutex]
+    circuit_breaker: http.circuit_breaker.CircuitBreaker, // shared [circuit_mutex]
+    upstream_client: std.http.Client, // owned; self-synchronized HTTP client
     /// ACME HTTP-01 challenge token store (null when ACME automation is disabled).
+    /// Owned; main-loop-only.
     acme_challenge_store: ?http.acme_client.ChallengeStore,
-    event_hub: http.event_hub.EventHub,
-    request_buffer_pool: http.buffer_pool.BufferPool,
-    relay_buffer_pool: http.buffer_pool.BufferPool,
-    max_connections_per_ip: u32,
-    max_active_connections: u32,
-    active_connections_total: usize,
-    /// Atomic count of HTTP requests currently being executed.
+    event_hub: http.event_hub.EventHub, // owned; self-synchronized
+    request_buffer_pool: http.buffer_pool.BufferPool, // owned; self-synchronized
+    relay_buffer_pool: http.buffer_pool.BufferPool, // owned; self-synchronized
+    max_connections_per_ip: u32, // cfg snapshot; updated on reload [runtime_mutex]
+    max_active_connections: u32, // cfg snapshot; updated on reload [runtime_mutex]
+    active_connections_total: usize, // runtime accounting [connection_mutex]
+    /// Atomic count of HTTP requests currently being executed. Lock-free.
     in_flight_requests: std.atomic.Value(u32),
     /// Maximum concurrent in-flight requests (0 = unlimited). Requests exceeding
-    /// this limit are rejected with 503 before any work is done.
+    /// this limit are rejected with 503 before any work is done. cfg snapshot;
+    /// updated on reload [runtime_mutex].
     max_in_flight_requests: u32,
-    active_ws_streams: usize,
-    active_sse_streams: usize,
-    active_mux_connections: usize,
-    active_mux_subscriptions: usize,
-    connection_memory_estimate_bytes: usize,
-    max_total_connection_memory_bytes: usize,
-    upstream_rr_index: usize,
-    upstream_backup_rr_index: usize,
-    lb_random_state: u64,
-    next_active_health_probe_ms: u64,
-    next_proxy_cache_maintenance_ms: u64,
+    active_ws_streams: usize, // runtime accounting [connection_mutex]
+    active_sse_streams: usize, // runtime accounting [connection_mutex]
+    active_mux_connections: usize, // runtime accounting [connection_mutex]
+    active_mux_subscriptions: usize, // runtime accounting [connection_mutex]
+    connection_memory_estimate_bytes: usize, // cfg-derived; updated on reload [runtime_mutex]
+    max_total_connection_memory_bytes: usize, // cfg snapshot; updated on reload [runtime_mutex]
+    upstream_rr_index: usize, // LB selection state [upstream_mutex]
+    upstream_backup_rr_index: usize, // LB selection state [upstream_mutex]
+    lb_random_state: u64, // LB selection state [upstream_mutex]
+    next_active_health_probe_ms: u64, // schedule; main-event-loop-only
+    next_proxy_cache_maintenance_ms: u64, // schedule; main-event-loop-only
     /// Set to true while a background health-probe thread is running so the
     /// event loop does not dispatch a second batch before the first finishes.
+    /// Atomic acquire/release handoff between the main loop and the probe thread.
     health_probe_running: std.atomic.Value(bool),
-    upstream_health: std.StringHashMap(UpstreamHealth),
-    upstream_active_requests: std.StringHashMap(usize),
-    fastcgi_pool: std.StringHashMap(std.ArrayList(compat.NetStream)),
-    fastcgi_next_request_id: std.StringHashMap(u16),
-    proxy_cache_locks: std.StringHashMap(u32),
-    active_connections_by_ip: std.StringHashMap(u32),
-    active_fds: std.AutoHashMap(std.posix.fd_t, void),
-    fd_to_ip: std.AutoHashMap(std.posix.fd_t, []u8),
-    command_lifecycle: std.StringHashMap(CommandLifecycleEntry),
-    approvals: std.StringHashMap(ApprovalEntry),
-    mux_subscriptions_by_device: std.StringHashMap(usize),
-    mux_resume_state: std.StringHashMap(MuxResumeState),
+    upstream_health: std.StringHashMap(UpstreamHealth), // owned keys [upstream_mutex]
+    upstream_active_requests: std.StringHashMap(usize), // owned keys [upstream_mutex]
+    fastcgi_pool: std.StringHashMap(std.ArrayList(compat.NetStream)), // owned keys+streams [connection_mutex]
+    fastcgi_next_request_id: std.StringHashMap(u16), // owned keys [connection_mutex]
+    proxy_cache_locks: std.StringHashMap(u32), // owned keys [proxy_cache_mutex]
+    active_connections_by_ip: std.StringHashMap(u32), // owned keys [connection_mutex]
+    active_fds: std.AutoHashMap(std.posix.fd_t, void), // runtime accounting [connection_mutex]
+    fd_to_ip: std.AutoHashMap(std.posix.fd_t, []u8), // owned IP values [connection_mutex]
+    command_lifecycle: std.StringHashMap(CommandLifecycleEntry), // owned keys+nested values [command_mutex]
+    approvals: std.StringHashMap(ApprovalEntry), // owned keys+nested values [approval_mutex]
+    mux_subscriptions_by_device: std.StringHashMap(usize), // owned keys [connection_mutex]
+    mux_resume_state: std.StringHashMap(MuxResumeState), // owned keys+nested values [runtime_mutex]
     /// Path to persistent approval store file (empty = in-memory only).
+    /// Borrowed from startup cfg; NOT rebound on reload (#191).
     approval_store_path: []const u8,
     /// Webhook URL for escalation notifications (empty = disabled).
+    /// Borrowed from startup cfg; NOT rebound on reload (#191).
     approval_escalation_webhook: []const u8,
-    /// Approval TTL in milliseconds.
+    /// Approval TTL in milliseconds. cfg snapshot.
     approval_ttl_ms: i64,
     /// Max concurrent pending approval requests per identity (0 = unlimited).
+    /// cfg snapshot.
     approval_max_pending_per_identity: u32,
+    /// Borrowed from startup cfg; NOT rebound on reload (#191). [transcript_mutex guards appends]
     transcript_store_path: []const u8,
     /// DNS-based upstream discovery state. Active when
-    /// cfg.upstream_dns_discovery_host is non-empty.
+    /// cfg.upstream_dns_discovery_host is non-empty. Owned; self-synchronized;
+    /// refreshed by the main event loop.
     dns_discovery: http.dns_discovery.DnsDiscovery,
     /// Reload state: set by hotReloadConfig on every attempt so operators can
-    /// query the outcome without tailing logs.
+    /// query the outcome without tailing logs. [reload_mutex]
     reload_mutex: compat.Mutex = .{},
     last_reload_ok: bool = false,
     last_reload_at_ms: i64 = 0,

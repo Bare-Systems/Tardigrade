@@ -2,11 +2,8 @@
 
 ## Before You Start
 
-Read the engineering guide and review checklist before making changes:
+Read the review checklist before making changes:
 
-- **[docs/ZIG_ENGINEERING_GUIDE.md](docs/ZIG_ENGINEERING_GUIDE.md)** — Zig 0.16 patterns, APIs to
-  avoid, allocator rules, error handling, security rules, and testing requirements
-  specific to this codebase.
 - **[docs/CODE_REVIEW_CHECKLIST.md](docs/CODE_REVIEW_CHECKLIST.md)** — short checklist to complete
   before submitting a PR.
 

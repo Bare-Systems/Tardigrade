@@ -1326,12 +1326,21 @@ pub const GatewayState = struct {
         const metrics_snapshot = self.metrics;
         self.metrics_mutex.unlock();
 
+        // Delegate the counter list to the canonical serializer so the served
+        // JSON can never drift from `Metrics.toJson` (mirrors how
+        // `metricsToPrometheus` delegates to `Metrics.toPrometheus`). The only
+        // field unique to the served endpoint — `mux_subscriptions_by_device` —
+        // is appended just before the closing brace.
+        const base = try metrics_snapshot.toJson(allocator);
+        defer allocator.free(base);
+        std.debug.assert(base.len > 0 and base[base.len - 1] == '}');
+
         var device_json = std.array_list.Managed(u8).init(allocator);
         errdefer device_json.deinit();
         try device_json.append('{');
         for (mux_snapshot.device_counts, 0..) |entry, idx| {
             if (idx > 0) try device_json.append(',');
-            try device_json.writer().print("{s}:{d}", .{ std.json.fmt(entry.device_id, .{}), entry.count });
+            try device_json.print("{f}:{d}", .{ std.json.fmt(entry.device_id, .{}), entry.count });
         }
         try device_json.append('}');
         const device_json_owned = try device_json.toOwnedSlice();
@@ -1339,56 +1348,8 @@ pub const GatewayState = struct {
 
         var out = std.array_list.Managed(u8).init(allocator);
         errdefer out.deinit();
-        try out.print(
-            \\{{"total_requests":{d},"status_2xx":{d},"status_3xx":{d},"status_4xx":{d},"status_5xx":{d},"uptime_seconds":{d},"active_connections":{d},"mux_connections":{d},"mux_subscriptions":{d},"mux_subscriptions_by_device":{s},"connection_rejections":{d},"queue_rejections":{d},"upstream_unhealthy_backends":{d},"proxy_streaming_requests_total":{d},"proxy_buffered_requests_total":{d},"proxy_buffered_bytes_current":{d},"proxy_buffered_bytes_total":{d},"proxy_client_aborts_total":{d},"proxy_upstream_aborts_total":{d},"proxy_ttfb_ms_count":{d},"proxy_ttfb_ms_sum":{d}
-        , .{
-            metrics_snapshot.total_requests,
-            metrics_snapshot.status_2xx,
-            metrics_snapshot.status_3xx,
-            metrics_snapshot.status_4xx,
-            metrics_snapshot.status_5xx,
-            metrics_snapshot.uptimeSeconds(),
-            metrics_snapshot.active_connections,
-            metrics_snapshot.mux_connections,
-            metrics_snapshot.mux_subscriptions,
-            device_json_owned,
-            metrics_snapshot.connection_rejections,
-            metrics_snapshot.queue_rejections,
-            metrics_snapshot.upstream_unhealthy_backends,
-            metrics_snapshot.proxy_streaming_requests,
-            metrics_snapshot.proxy_buffered_requests,
-            metrics_snapshot.proxy_buffered_bytes_current,
-            metrics_snapshot.proxy_buffered_bytes_total,
-            metrics_snapshot.proxy_client_aborts,
-            metrics_snapshot.proxy_upstream_aborts,
-            metrics_snapshot.proxy_ttfb_ms_count,
-            metrics_snapshot.proxy_ttfb_ms_sum,
-        });
-        try out.print(
-            \\,"request_latency_ms_count":{d},"request_latency_ms_sum":{d},"worker_active_jobs":{d},"worker_queued_jobs":{d},"worker_threads":{d},"worker_queue_capacity":{d},"error_invalid_request":{d},"error_unauthorized":{d},"error_rate_limited":{d},"error_upstream_timeout":{d},"error_upstream_unavailable":{d},"error_internal_error":{d},"error_overload":{d},"error_request_timeout":{d},"mux_frame_errors":{d},"reload_attempts_total":{d},"reload_success_total":{d},"reload_failure_total":{d},"drain_total":{d},"drain_timeouts_total":{d},"drain_forced_closes_total":{d}}}
-        , .{
-            metrics_snapshot.latency_count,
-            metrics_snapshot.latency_sum_ms,
-            metrics_snapshot.worker_active_jobs,
-            metrics_snapshot.worker_queued_jobs,
-            metrics_snapshot.worker_threads,
-            metrics_snapshot.worker_queue_capacity,
-            metrics_snapshot.err_invalid_request,
-            metrics_snapshot.err_unauthorized,
-            metrics_snapshot.err_rate_limited,
-            metrics_snapshot.err_upstream_timeout,
-            metrics_snapshot.err_upstream_unavailable,
-            metrics_snapshot.err_internal_error,
-            metrics_snapshot.err_overload,
-            metrics_snapshot.err_request_timeout,
-            metrics_snapshot.mux_frame_errors,
-            metrics_snapshot.reload_attempts_total,
-            metrics_snapshot.reload_success_total,
-            metrics_snapshot.reload_failure_total,
-            metrics_snapshot.drain_total,
-            metrics_snapshot.drain_timeouts_total,
-            metrics_snapshot.drain_forced_closes_total,
-        });
+        try out.appendSlice(base[0 .. base.len - 1]); // canonical body, minus the closing '}'
+        try out.print(",\"mux_subscriptions_by_device\":{s}}}", .{device_json_owned});
         return out.toOwnedSlice();
     }
 
@@ -2937,4 +2898,172 @@ test "in-flight request slot is unlimited and release is a no-op when disabled" 
     while (i < 1000) : (i += 1) try std.testing.expect(gs.tryAcquireRequestSlot());
     gs.releaseRequestSlot(); // must not underflow the counter
     try std.testing.expectEqual(@as(u32, 0), gs.in_flight_requests.load(.acquire));
+}
+
+// ---------------------------------------------------------------------------
+// Upstream-pool / pending-upstream overload + metrics-JSON drift tests (#172).
+//
+// The upstream "connection pool exhausted" and "too many pending upstream
+// requests" scenarios from #172 are not single env caps — they are governed by
+// per-upstream active-request accounting (`upstream_active_requests`, used by
+// the least-connections balancer to shed load) and the circuit breaker. These
+// tests drive that real accounting to prove load sheds deterministically and
+// leaves no accounting leak, and that the served metrics JSON can never drift
+// from the canonical serializer.
+// ---------------------------------------------------------------------------
+
+fn initUpstreamTestState(gs: *GatewayState, allocator: std.mem.Allocator) void {
+    gs.allocator = allocator;
+    gs.upstream_mutex = .{};
+    gs.circuit_mutex = .{};
+    gs.metrics_mutex = .{};
+    gs.metrics = http.metrics.Metrics.init();
+    gs.upstream_rr_index = 0;
+    gs.circuit_breaker = http.circuit_breaker.CircuitBreaker.init(.{});
+    gs.upstream_health = std.StringHashMap(UpstreamHealth).init(allocator);
+    gs.upstream_active_requests = std.StringHashMap(usize).init(allocator);
+}
+
+fn deinitUpstreamTestState(gs: *GatewayState) void {
+    var h_it = gs.upstream_health.iterator();
+    while (h_it.next()) |entry| gs.allocator.free(entry.key_ptr.*);
+    gs.upstream_health.deinit();
+    var a_it = gs.upstream_active_requests.iterator();
+    while (a_it.next()) |entry| gs.allocator.free(entry.key_ptr.*);
+    gs.upstream_active_requests.deinit();
+}
+
+test "upstream active-request accounting saturates and drains without leaking" {
+    var gs: GatewayState = undefined;
+    initUpstreamTestState(&gs, std.testing.allocator);
+    defer deinitUpstreamTestState(&gs);
+
+    const url = "http://10.0.0.1:8080";
+    var i: usize = 0;
+    while (i < 64) : (i += 1) gs.recordUpstreamAttemptStart(url);
+    // In-flight count tracks every pending upstream request exactly.
+    try std.testing.expectEqual(@as(usize, 64), gs.upstream_active_requests.get(url).?);
+
+    i = 0;
+    while (i < 64) : (i += 1) gs.recordUpstreamAttemptEnd(url);
+    // Draining to zero removes the entry and frees its duped key — no growth, no
+    // leak (std.testing.allocator fails the test on any retained key).
+    try std.testing.expectEqual(@as(?usize, null), gs.upstream_active_requests.get(url));
+    try std.testing.expectEqual(@as(usize, 0), gs.upstream_active_requests.count());
+}
+
+test "least-connections selection sheds a saturated upstream to the idle one" {
+    var gs: GatewayState = undefined;
+    initUpstreamTestState(&gs, std.testing.allocator);
+    defer deinitUpstreamTestState(&gs);
+
+    var cfg: edge_config.EdgeConfig = undefined;
+    cfg.upstream_active_health_interval_ms = 0;
+    cfg.upstream_slow_start_ms = 0;
+    cfg.upstream_max_fails = 1;
+    cfg.upstream_fail_timeout_ms = 60_000;
+
+    const a = "http://a:8080";
+    const b = "http://b:8080";
+    const urls = [_][]const u8{ a, b };
+    const weights = [_]u32{ 1, 1 };
+    const pool = UpstreamPoolView{
+        .fallback_url = "",
+        .primary_urls = &urls,
+        .primary_weights = &weights,
+        .backup_urls = &.{},
+    };
+
+    // Saturate A with pending upstream requests; B stays idle.
+    var i: usize = 0;
+    while (i < 8) : (i += 1) gs.recordUpstreamAttemptStart(a);
+
+    gs.upstream_mutex.lock();
+    const chosen = gs.selectLeastConnectionsUpstreamLocked(&cfg, pool, 0);
+    gs.upstream_mutex.unlock();
+    // Deterministically sheds to the least-loaded healthy backend.
+    try std.testing.expectEqualStrings(b, chosen.?);
+
+    // With every backend unhealthy, selection returns null so the caller sheds
+    // the request rather than queueing it without bound.
+    gs.recordUpstreamFailure(&cfg, a);
+    gs.recordUpstreamFailure(&cfg, b);
+    gs.upstream_mutex.lock();
+    const none = gs.selectLeastConnectionsUpstreamLocked(&cfg, pool, 0);
+    gs.upstream_mutex.unlock();
+    try std.testing.expectEqual(@as(?[]const u8, null), none);
+}
+
+test "gateway circuit breaker opens under upstream failure pressure" {
+    var gs: GatewayState = undefined;
+    initUpstreamTestState(&gs, std.testing.allocator);
+    defer deinitUpstreamTestState(&gs);
+    gs.circuit_breaker = http.circuit_breaker.CircuitBreaker.init(.{ .threshold = 3, .timeout_ms = 30_000 });
+
+    try std.testing.expect(gs.circuitTryAcquire());
+    gs.circuitRecordFailure();
+    gs.circuitRecordFailure();
+    gs.circuitRecordFailure();
+    // Open: requests fast-fail deterministically instead of piling onto a sick
+    // upstream (the recovery timeout has not elapsed).
+    try std.testing.expect(!gs.circuitTryAcquire());
+    try std.testing.expectEqualStrings("open", gs.circuitStateName());
+}
+
+test "gateway circuit breaker recovers through a half-open probe" {
+    var gs: GatewayState = undefined;
+    initUpstreamTestState(&gs, std.testing.allocator);
+    defer deinitUpstreamTestState(&gs);
+    gs.circuit_breaker = http.circuit_breaker.CircuitBreaker.init(.{ .threshold = 1, .timeout_ms = 0, .half_open_successes = 1 });
+
+    gs.circuitRecordFailure();
+    // timeout_ms = 0 → the next acquire admits one probe in half-open state.
+    try std.testing.expect(gs.circuitTryAcquire());
+    try std.testing.expectEqualStrings("half-open", gs.circuitStateName());
+    gs.circuitRecordSuccess();
+    try std.testing.expectEqualStrings("closed", gs.circuitStateName());
+}
+
+fn initMetricsJsonTestState(gs: *GatewayState, allocator: std.mem.Allocator) void {
+    gs.allocator = allocator;
+    gs.connection_mutex = .{};
+    gs.metrics_mutex = .{};
+    gs.metrics = http.metrics.Metrics.init();
+    gs.mux_subscriptions_by_device = std.StringHashMap(usize).init(allocator);
+}
+
+test "served metrics JSON exposes every counter the canonical serializer does" {
+    var gs: GatewayState = undefined;
+    initMetricsJsonTestState(&gs, std.testing.allocator);
+    defer gs.mux_subscriptions_by_device.deinit();
+
+    // Drive a couple of counters that the previously hand-maintained served
+    // serializer had drifted away from.
+    gs.metrics.recordRequest(200);
+    gs.metrics.event_loop_iterations = 7;
+    gs.metrics.health_probe_runs = 3;
+
+    const served = try gs.metricsToJson(std.testing.allocator);
+    defer std.testing.allocator.free(served);
+    const canonical = try gs.metrics.toJson(std.testing.allocator);
+    defer std.testing.allocator.free(canonical);
+
+    var canon_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, canonical, .{});
+    defer canon_parsed.deinit();
+    var served_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, served, .{});
+    defer served_parsed.deinit();
+
+    // Every canonical counter must appear in the served JSON; this fails the
+    // moment a new Metrics field is added without flowing through to the status
+    // endpoint, which is exactly the drift that dropped event_loop_iterations
+    // and health_probe_runs before the dedup.
+    var it = canon_parsed.value.object.iterator();
+    while (it.next()) |entry| {
+        try std.testing.expect(served_parsed.value.object.contains(entry.key_ptr.*));
+    }
+    // The served endpoint additionally carries the per-device mux breakdown.
+    try std.testing.expect(served_parsed.value.object.contains("mux_subscriptions_by_device"));
+    // Explicit regression pins for the two fields the old serializer had lost.
+    try std.testing.expect(served_parsed.value.object.contains("event_loop_iterations"));
+    try std.testing.expect(served_parsed.value.object.contains("health_probe_runs"));
 }

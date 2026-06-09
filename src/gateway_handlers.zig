@@ -445,6 +445,18 @@ pub fn runMiddlewarePipeline(
         logAccess(state, ctx, request.method.toString(), request.uri.path, 431, request.headers.get("user-agent") orelse "");
         return true;
     }
+    for (request.headers.iterator()) |h| {
+        const header_len = h.name.len + h.value.len + 2; // "name: value"
+        const header_size_check = http.request_limits.validateHeaderSize(header_len, limits);
+        if (header_size_check != .ok) {
+            var msg_buf: [256]u8 = undefined;
+            const msg = http.request_limits.rejectionMessage(header_size_check, &msg_buf);
+            try sendApiError(allocator, writer, .request_header_fields_too_large, "invalid_request", msg, correlation_id, keep_alive, state);
+            state.logger.warn(correlation_id, "Header too large: {d} bytes", .{header_len});
+            logAccess(state, ctx, request.method.toString(), request.uri.path, 431, request.headers.get("user-agent") orelse "");
+            return true;
+        }
+    }
     {
         var headers_total: usize = 0;
         for (request.headers.iterator()) |h| headers_total += h.name.len + h.value.len + 4; // ": \r\n"

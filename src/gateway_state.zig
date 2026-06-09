@@ -1341,7 +1341,7 @@ pub const GatewayState = struct {
             metrics_snapshot.proxy_ttfb_ms_sum,
         });
         try out.print(
-            \\,"request_latency_ms_count":{d},"request_latency_ms_sum":{d},"worker_active_jobs":{d},"worker_queued_jobs":{d},"worker_threads":{d},"worker_queue_capacity":{d},"error_invalid_request":{d},"error_unauthorized":{d},"error_rate_limited":{d},"error_upstream_timeout":{d},"error_upstream_unavailable":{d},"error_internal_error":{d},"error_overload":{d},"mux_frame_errors":{d}}}
+            \\,"request_latency_ms_count":{d},"request_latency_ms_sum":{d},"worker_active_jobs":{d},"worker_queued_jobs":{d},"worker_threads":{d},"worker_queue_capacity":{d},"error_invalid_request":{d},"error_unauthorized":{d},"error_rate_limited":{d},"error_upstream_timeout":{d},"error_upstream_unavailable":{d},"error_internal_error":{d},"error_overload":{d},"error_request_timeout":{d},"mux_frame_errors":{d}}}
         , .{
             metrics_snapshot.latency_count,
             metrics_snapshot.latency_sum_ms,
@@ -1356,6 +1356,7 @@ pub const GatewayState = struct {
             metrics_snapshot.err_upstream_unavailable,
             metrics_snapshot.err_internal_error,
             metrics_snapshot.err_overload,
+            metrics_snapshot.err_request_timeout,
             metrics_snapshot.mux_frame_errors,
         });
         return out.toOwnedSlice();
@@ -2757,4 +2758,153 @@ test "reloadable config store retires old config after last lease" {
     try std.testing.expectEqual(@as(usize, 1), store.retired.items.len);
     lease.release();
     try std.testing.expectEqual(@as(usize, 0), store.retired.items.len);
+}
+
+// ---------------------------------------------------------------------------
+// Overload / resource-exhaustion accounting tests (#172).
+//
+// These drive the real connection-slot and in-flight-request accounting
+// methods to prove each configured limit rejects deterministically and — just
+// as importantly — that neither acceptance nor rejection leaks accounting
+// state. `std.testing.allocator` fails the test on any leaked duped IP key, so
+// a balanced acquire/release sequence is itself the leak-free invariant check.
+//
+// GatewayState has too many fields to construct fully here, but the accounting
+// methods touch only the subset initialized below and never perform any syscall
+// on the (fake) fds, so an `undefined` base with that subset set is safe.
+// ---------------------------------------------------------------------------
+
+fn initSlotTestState(gs: *GatewayState, allocator: std.mem.Allocator) void {
+    gs.allocator = allocator;
+    gs.connection_mutex = .{};
+    gs.metrics_mutex = .{};
+    gs.metrics = http.metrics.Metrics.init();
+    gs.active_connections_total = 0;
+    gs.max_active_connections = 0;
+    gs.max_connections_per_ip = 0;
+    gs.max_in_flight_requests = 0;
+    gs.in_flight_requests = std.atomic.Value(u32).init(0);
+    gs.connection_memory_estimate_bytes = 0;
+    gs.max_total_connection_memory_bytes = 0;
+    gs.active_connections_by_ip = std.StringHashMap(u32).init(allocator);
+    gs.active_fds = std.AutoHashMap(std.posix.fd_t, void).init(allocator);
+    gs.fd_to_ip = std.AutoHashMap(std.posix.fd_t, []u8).init(allocator);
+}
+
+fn deinitSlotTestState(gs: *GatewayState) void {
+    gs.active_connections_by_ip.deinit();
+    gs.active_fds.deinit();
+    gs.fd_to_ip.deinit();
+}
+
+test "connection slot enforces global limit and accounting is leak-free" {
+    var gs: GatewayState = undefined;
+    initSlotTestState(&gs, std.testing.allocator);
+    defer deinitSlotTestState(&gs);
+    gs.max_active_connections = 2;
+
+    try std.testing.expectEqual(ConnectionSlotResult.accepted, try gs.tryAcquireConnectionSlot(1001, "10.0.0.1"));
+    try std.testing.expectEqual(ConnectionSlotResult.accepted, try gs.tryAcquireConnectionSlot(1002, "10.0.0.2"));
+    try std.testing.expectEqual(@as(usize, 2), gs.active_connections_total);
+
+    // Third connection is rejected at the global cap and must not be tracked.
+    try std.testing.expectEqual(ConnectionSlotResult.over_global_limit, try gs.tryAcquireConnectionSlot(1003, "10.0.0.3"));
+    try std.testing.expectEqual(@as(usize, 2), gs.active_connections_total);
+    try std.testing.expectEqual(@as(usize, 2), gs.active_fds.count());
+    try std.testing.expectEqual(@as(u64, 1), gs.metrics.connection_rejections);
+
+    // Releasing both returns accounting to baseline (no leak).
+    gs.releaseConnectionSlot(1001);
+    gs.releaseConnectionSlot(1002);
+    try std.testing.expectEqual(@as(usize, 0), gs.active_connections_total);
+    try std.testing.expectEqual(@as(usize, 0), gs.active_fds.count());
+    try std.testing.expectEqual(@as(u32, 0), gs.metrics.active_connections);
+}
+
+test "connection slot enforces per-IP limit independently of other IPs" {
+    var gs: GatewayState = undefined;
+    initSlotTestState(&gs, std.testing.allocator);
+    defer deinitSlotTestState(&gs);
+    gs.max_connections_per_ip = 1;
+
+    try std.testing.expectEqual(ConnectionSlotResult.accepted, try gs.tryAcquireConnectionSlot(2001, "1.1.1.1"));
+    // Second connection from the same IP is rejected.
+    try std.testing.expectEqual(ConnectionSlotResult.over_ip_limit, try gs.tryAcquireConnectionSlot(2002, "1.1.1.1"));
+    // A different IP is unaffected.
+    try std.testing.expectEqual(ConnectionSlotResult.accepted, try gs.tryAcquireConnectionSlot(2003, "2.2.2.2"));
+    try std.testing.expectEqual(@as(usize, 2), gs.active_connections_total);
+    try std.testing.expectEqual(@as(u32, 1), gs.active_connections_by_ip.get("1.1.1.1").?);
+
+    gs.releaseConnectionSlot(2001);
+    gs.releaseConnectionSlot(2003);
+    // Per-IP bookkeeping is fully reclaimed (entry removed, duped key freed).
+    try std.testing.expectEqual(@as(usize, 0), gs.active_connections_by_ip.count());
+    try std.testing.expectEqual(@as(usize, 0), gs.fd_to_ip.count());
+    try std.testing.expectEqual(@as(usize, 0), gs.active_connections_total);
+}
+
+test "connection slot enforces total memory budget via projection" {
+    var gs: GatewayState = undefined;
+    initSlotTestState(&gs, std.testing.allocator);
+    defer deinitSlotTestState(&gs);
+    gs.connection_memory_estimate_bytes = 100;
+    gs.max_total_connection_memory_bytes = 250; // admits 2, rejects the 3rd
+
+    try std.testing.expectEqual(ConnectionSlotResult.accepted, try gs.tryAcquireConnectionSlot(3001, "10.0.0.1"));
+    try std.testing.expectEqual(ConnectionSlotResult.accepted, try gs.tryAcquireConnectionSlot(3002, "10.0.0.2"));
+    // Projected (2+1)*100 = 300 > 250 -> rejected.
+    try std.testing.expectEqual(ConnectionSlotResult.over_global_memory_limit, try gs.tryAcquireConnectionSlot(3003, "10.0.0.3"));
+    try std.testing.expectEqual(@as(usize, 2), gs.active_connections_total);
+    try std.testing.expectEqual(@as(usize, 2), gs.active_fds.count());
+
+    gs.releaseConnectionSlot(3001);
+    gs.releaseConnectionSlot(3002);
+    try std.testing.expectEqual(@as(usize, 0), gs.active_connections_total);
+}
+
+test "connection memory projection does not overflow at large counts" {
+    var gs: GatewayState = undefined;
+    initSlotTestState(&gs, std.testing.allocator);
+    defer deinitSlotTestState(&gs);
+    // A per-connection estimate near usize-max with a large existing count would
+    // overflow a usize multiply; the projection widens to u128 so it rejects
+    // deterministically instead of wrapping to a small value and admitting.
+    gs.connection_memory_estimate_bytes = std.math.maxInt(usize);
+    gs.max_total_connection_memory_bytes = std.math.maxInt(usize);
+    gs.active_connections_total = 1_000_000;
+    try std.testing.expectEqual(ConnectionSlotResult.over_global_memory_limit, try gs.tryAcquireConnectionSlot(4001, "10.0.0.1"));
+    // Nothing was admitted, so no slot to release; counts unchanged.
+    try std.testing.expectEqual(@as(usize, 0), gs.active_fds.count());
+}
+
+test "in-flight request slot rejects over limit and balances on release" {
+    var gs: GatewayState = undefined;
+    initSlotTestState(&gs, std.testing.allocator);
+    defer deinitSlotTestState(&gs);
+    gs.max_in_flight_requests = 2;
+
+    try std.testing.expect(gs.tryAcquireRequestSlot());
+    try std.testing.expect(gs.tryAcquireRequestSlot());
+    // Third concurrent request is rejected without leaving a reservation behind.
+    try std.testing.expect(!gs.tryAcquireRequestSlot());
+    try std.testing.expectEqual(@as(u32, 2), gs.in_flight_requests.load(.acquire));
+
+    gs.releaseRequestSlot();
+    // A slot freed up, so the next acquire succeeds again.
+    try std.testing.expect(gs.tryAcquireRequestSlot());
+    gs.releaseRequestSlot();
+    gs.releaseRequestSlot();
+    try std.testing.expectEqual(@as(u32, 0), gs.in_flight_requests.load(.acquire));
+}
+
+test "in-flight request slot is unlimited and release is a no-op when disabled" {
+    var gs: GatewayState = undefined;
+    initSlotTestState(&gs, std.testing.allocator);
+    defer deinitSlotTestState(&gs);
+    gs.max_in_flight_requests = 0; // disabled
+
+    var i: usize = 0;
+    while (i < 1000) : (i += 1) try std.testing.expect(gs.tryAcquireRequestSlot());
+    gs.releaseRequestSlot(); // must not underflow the counter
+    try std.testing.expectEqual(@as(u32, 0), gs.in_flight_requests.load(.acquire));
 }

@@ -540,6 +540,59 @@ test "shutdownAndJoin drain_timeout_ms expires and returns" {
     try std.testing.expect(elapsed < 1_000);
 }
 
+test "worker pool global queue cap rejects without unbounded growth" {
+    if (builtin.single_threaded) return;
+
+    // 1 worker, global queue depth = 2, no per-worker cap. With the worker
+    // blocked, queued work cannot drain, so the global cap must bound the queue
+    // and reject the overflowing submission with QueueFull rather than growing.
+    const Ctx = struct {
+        mutex: compat.Mutex = .{},
+        proceed: bool = false,
+    };
+    var ctx = Ctx{};
+
+    const handler = struct {
+        fn run(raw_ctx: *anyopaque, _: std.posix.fd_t) void {
+            const typed: *Ctx = @ptrCast(@alignCast(raw_ctx));
+            while (true) {
+                std.Io.sleep(compat.io(), .fromMilliseconds(1), .awake) catch {};
+                typed.mutex.lock();
+                const done = typed.proceed;
+                typed.mutex.unlock();
+                if (done) break;
+            }
+        }
+    }.run;
+
+    var pool: WorkerPool = undefined;
+    try pool.init(std.testing.allocator, 1, 2, 0, handler, &ctx);
+    defer pool.deinit();
+
+    // First submission dispatches to the (now blocked) worker; queue depth = 0.
+    try pool.submit(1);
+    // Wait until the worker has actually picked up fd 1 (active, queue drained)
+    // so the queue-depth assertions below are not racing the dispatch.
+    var spins: usize = 0;
+    while (pool.snapshot().active_jobs < 1 and spins < 1000) : (spins += 1) {
+        std.Io.sleep(compat.io(), .fromMilliseconds(1), .awake) catch {};
+    }
+    try std.testing.expectEqual(@as(usize, 0), pool.snapshot().queued_jobs);
+
+    // Fill the global queue to its depth of 2.
+    try pool.submit(2);
+    try pool.submit(3);
+    try std.testing.expectEqual(@as(usize, 2), pool.snapshot().queued_jobs);
+
+    // The next submission exceeds the global cap and is rejected.
+    try std.testing.expectError(error.QueueFull, pool.submit(4));
+    try std.testing.expectEqual(@as(usize, 2), pool.snapshot().queued_jobs);
+
+    ctx.mutex.lock();
+    ctx.proceed = true;
+    ctx.mutex.unlock();
+}
+
 test "worker pool per-worker queue depth limit rejects when all worker queues are full" {
     if (builtin.single_threaded) return;
 

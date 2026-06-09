@@ -75,17 +75,61 @@ pub fn acceptReadyConnections(listen_fd: std.posix.fd_t, worker_pool: *http.work
     }
 }
 
+/// Deterministic overload response sent to clients rejected at accept time
+/// (global, per-IP, or memory connection-slot limits, or a saturated worker
+/// queue). Kept as a single fixed byte string so every overload path returns an
+/// identical, predictable 503 — see docs/OBSERVABILITY.md "Resource Limits and
+/// Overload Behavior". When the socket cannot be written, the fd is closed
+/// instead (no partial/ambiguous response is ever emitted).
+pub const overload_response_503 =
+    "HTTP/1.1 503 Service Unavailable\r\n" ++
+    "Connection: close\r\n" ++
+    "Content-Length: 0\r\n" ++
+    "Retry-After: 1\r\n" ++
+    "\r\n";
+
 pub fn rejectOverloadedClient(client_fd: std.posix.fd_t) void {
     gc.setNonBlocking(client_fd, false) catch {}; // connection is usable in blocking mode; write and close still succeed
     const stream = compat.netStreamFromFd(client_fd);
-    stream.writer().writeAll(
-        "HTTP/1.1 503 Service Unavailable\r\n" ++
-            "Connection: close\r\n" ++
-            "Content-Length: 0\r\n" ++
-            "Retry-After: 1\r\n" ++
-            "\r\n",
-    ) catch {}; // best-effort 503; client will time out if the write fails
+    stream.writer().writeAll(overload_response_503) catch {}; // best-effort 503; client will time out if the write fails
     stream.close();
+}
+
+test "overload response is a deterministic 503 with close and retry hints" {
+    const r = overload_response_503;
+    try std.testing.expect(std.mem.startsWith(u8, r, "HTTP/1.1 503 Service Unavailable\r\n"));
+    try std.testing.expect(std.mem.find(u8, r, "Connection: close\r\n") != null);
+    try std.testing.expect(std.mem.find(u8, r, "Content-Length: 0\r\n") != null);
+    try std.testing.expect(std.mem.find(u8, r, "Retry-After: 1\r\n") != null);
+    // Response is a complete header block with no body: must end with a blank line.
+    try std.testing.expect(std.mem.endsWith(u8, r, "\r\n\r\n"));
+}
+
+test "applyFdSoftLimit is a no-op for 0 and clamps to the hard limit" {
+    switch (builtin.os.tag) {
+        .linux, .macos, .freebsd, .netbsd, .openbsd, .dragonfly, .illumos, .ios, .tvos, .watchos, .visionos => {},
+        else => return, // unsupported platform path returns null; nothing to assert
+    }
+
+    // 0 means "leave the OS default alone".
+    try std.testing.expectEqual(@as(?u64, null), try applyFdSoftLimit(0));
+
+    const limits = try std.posix.getrlimit(std.posix.rlimit_resource.NOFILE);
+    const current_soft: u64 = @intCast(limits.cur);
+    const hard: u64 = @intCast(limits.max);
+
+    // Requesting the current soft limit is a no-op that returns it unchanged
+    // (exercises the target == current early return without mutating the
+    // process's real fd limit).
+    if (current_soft > 0) {
+        try std.testing.expectEqual(@as(?u64, current_soft), try applyFdSoftLimit(current_soft));
+    }
+
+    // A desired value above the hard cap is clamped to the hard limit, never
+    // exceeding it. Restore the original limit afterward to avoid side effects.
+    const raised = try applyFdSoftLimit(hard + 1_000_000);
+    try std.testing.expectEqual(@as(?u64, hard), raised);
+    std.posix.setrlimit(std.posix.rlimit_resource.NOFILE, limits) catch {};
 }
 
 pub fn applyFdSoftLimit(desired: u64) !?u64 {

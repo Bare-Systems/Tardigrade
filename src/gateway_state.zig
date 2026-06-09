@@ -1258,6 +1258,30 @@ pub const GatewayState = struct {
         self.metrics.recordErrorCode(code);
     }
 
+    pub fn metricsRecordReloadAttempt(self: *GatewayState) void {
+        self.metrics_mutex.lock();
+        defer self.metrics_mutex.unlock();
+        self.metrics.recordReloadAttempt();
+    }
+
+    pub fn metricsRecordReloadSuccess(self: *GatewayState) void {
+        self.metrics_mutex.lock();
+        defer self.metrics_mutex.unlock();
+        self.metrics.recordReloadSuccess();
+    }
+
+    pub fn metricsRecordReloadFailure(self: *GatewayState) void {
+        self.metrics_mutex.lock();
+        defer self.metrics_mutex.unlock();
+        self.metrics.recordReloadFailure();
+    }
+
+    pub fn metricsRecordDrain(self: *GatewayState, timed_out: bool, forced_closes: usize) void {
+        self.metrics_mutex.lock();
+        defer self.metrics_mutex.unlock();
+        self.metrics.recordDrain(timed_out, forced_closes);
+    }
+
     pub fn metricsRecordProxyStreamingRequest(self: *GatewayState, ttfb_ms: u64) void {
         self.metrics_mutex.lock();
         defer self.metrics_mutex.unlock();
@@ -1341,7 +1365,7 @@ pub const GatewayState = struct {
             metrics_snapshot.proxy_ttfb_ms_sum,
         });
         try out.print(
-            \\,"request_latency_ms_count":{d},"request_latency_ms_sum":{d},"worker_active_jobs":{d},"worker_queued_jobs":{d},"worker_threads":{d},"worker_queue_capacity":{d},"error_invalid_request":{d},"error_unauthorized":{d},"error_rate_limited":{d},"error_upstream_timeout":{d},"error_upstream_unavailable":{d},"error_internal_error":{d},"error_overload":{d},"error_request_timeout":{d},"mux_frame_errors":{d}}}
+            \\,"request_latency_ms_count":{d},"request_latency_ms_sum":{d},"worker_active_jobs":{d},"worker_queued_jobs":{d},"worker_threads":{d},"worker_queue_capacity":{d},"error_invalid_request":{d},"error_unauthorized":{d},"error_rate_limited":{d},"error_upstream_timeout":{d},"error_upstream_unavailable":{d},"error_internal_error":{d},"error_overload":{d},"error_request_timeout":{d},"mux_frame_errors":{d},"reload_attempts_total":{d},"reload_success_total":{d},"reload_failure_total":{d},"drain_total":{d},"drain_timeouts_total":{d},"drain_forced_closes_total":{d}}}
         , .{
             metrics_snapshot.latency_count,
             metrics_snapshot.latency_sum_ms,
@@ -1358,6 +1382,12 @@ pub const GatewayState = struct {
             metrics_snapshot.err_overload,
             metrics_snapshot.err_request_timeout,
             metrics_snapshot.mux_frame_errors,
+            metrics_snapshot.reload_attempts_total,
+            metrics_snapshot.reload_success_total,
+            metrics_snapshot.reload_failure_total,
+            metrics_snapshot.drain_total,
+            metrics_snapshot.drain_timeouts_total,
+            metrics_snapshot.drain_forced_closes_total,
         });
         return out.toOwnedSlice();
     }

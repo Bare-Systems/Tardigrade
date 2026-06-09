@@ -146,3 +146,80 @@ Tuning principle: raise a limit only after confirming the gateway has headroom
 (CPU, memory, fds) to honor it. The limits exist so that exhaustion produces a
 predictable `503` or a clean socket close instead of unbounded allocation or
 worker starvation.
+
+## Reload and Shutdown
+
+Tardigrade supports zero-downtime configuration reload and graceful shutdown.
+Both are driven by POSIX signals delivered to the running process (the
+`tardigrade reload` / `tardigrade stop` CLI commands send these for you).
+
+| Signal | Effect |
+|---|---|
+| `SIGHUP` | Hot-reload configuration from the environment / config file. |
+| `SIGUSR1` | Reopen the error log (log rotation). |
+| `SIGUSR2` | Begin graceful shutdown (alias of the upgrade path). |
+| `SIGTERM` / `SIGINT` | Begin graceful shutdown. |
+
+### Hot reload (SIGHUP)
+
+On `SIGHUP` the gateway re-reads its configuration and applies it without
+dropping connections:
+
+1. **Load** the new configuration from the environment / config file.
+2. **Validate** it. Invalid configuration is rejected here.
+3. **Install** the new config version through a lease-counted store
+   (`ReloadableConfigStore`): in-flight requests keep the config version they
+   started with, and the old version is retired only after its last lease is
+   released. New requests pick up the new version once installation completes.
+
+Guarantees:
+
+- **A failed reload never replaces the active config.** If load or validation
+  fails, the previous configuration stays active and continues serving traffic;
+  the failure is recorded and logged.
+- **In-flight requests are not disrupted** by a reload; they finish on the
+  config they began with.
+- Reload status is queryable at `GET /tardigrade/reload/status`, which returns
+  `{"ok": <bool|null>, "at_ms": <ts>, "error": <string|null>}`.
+
+### Graceful shutdown and drain
+
+On a shutdown signal the accept loop stops taking new connections and the worker
+pool drains:
+
+- **Active (already-dispatched) requests are allowed to finish** up to
+  `TARDIGRADE_SHUTDOWN_DRAIN_TIMEOUT_MS`. During shutdown each request's deadline
+  is also capped to the remaining drain window so a single slow request cannot
+  block shutdown indefinitely.
+- **Queued (not-yet-started) connections** that remain when the drain deadline
+  elapses are **force-closed** (their sockets are closed; no partial HTTP
+  response is emitted). A drain timeout of `0` closes queued connections
+  immediately with no wait.
+- After the drain completes the worker threads are joined and the process exits.
+
+### Reload / shutdown observability
+
+Logs (runtime, via `src/http/logger.zig`):
+
+- `configuration hot-reload starting` / `configuration hot-reload applied`
+- `config reload failed during load` / `config reload rejected by validation` /
+  `config reload allocation failed` / `config reload bookkeeping failed`
+- `Shutdown requested; draining active connection work (timeout=… active_connections=…)`
+- `drain timeout elapsed; force-closed N queued connection(s)`
+- `Graceful shutdown complete (forced_closes=… drain_timed_out=…)`
+
+Metrics (`/status/metrics`):
+
+| Metric | Meaning |
+|---|---|
+| `tardigrade_reload_attempts_total` | Reloads started (SIGHUP received and processed). |
+| `tardigrade_reload_success_total` | Reloads that loaded, validated, and installed. |
+| `tardigrade_reload_failure_total` | Reloads rejected; previous config kept. |
+| `tardigrade_drain_total` | Graceful-shutdown drains started. |
+| `tardigrade_drain_timeouts_total` | Drains that hit the drain timeout. |
+| `tardigrade_drain_forced_closes_total` | Queued connections force-closed on drain timeout. |
+
+A healthy reload increments `reload_attempts_total` and `reload_success_total`
+together; a rejected reload increments `reload_attempts_total` and
+`reload_failure_total` while the reload-status endpoint reports `ok: false` with
+the rejection reason.

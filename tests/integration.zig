@@ -4692,3 +4692,528 @@ test "static file integration serves configured custom 404 error page" {
     try std.testing.expectEqual(@as(u16, 404), response.status_code);
     try assertContains(response.body, "custom not found");
 }
+
+// ---------------------------------------------------------------------------
+// Graceful reload / drain / shutdown correctness under load (#170).
+// ---------------------------------------------------------------------------
+
+fn sendKeepAliveGet(stream: *compat.NetStream, allocator: std.mem.Allocator, port: u16, path: []const u8) !void {
+    const req = try std.fmt.allocPrint(allocator, "GET {s} HTTP/1.1\r\nHost: {s}:{d}\r\nConnection: keep-alive\r\n\r\n", .{ path, test_host, port });
+    defer allocator.free(req);
+    try stream.writeAll(req);
+}
+
+test "reload while serving short static requests drops no in-flight request (#170)" {
+    const allocator = std.testing.allocator;
+    var fixture = try GenericFixtureDir.create(allocator, "reload-static-serving");
+    defer fixture.deinit();
+    try fixture.writeRel("a/index.html", "site-A\n");
+    try fixture.writeRel("b/index.html", "site-B\n");
+    const root_a = try fixture.joinAbs("a");
+    defer allocator.free(root_a);
+    const root_b = try fixture.joinAbs("b");
+    defer allocator.free(root_b);
+
+    const config_a = try std.fmt.allocPrint(allocator,
+        \\location / {{
+        \\    root {s};
+        \\    try_files $uri /index.html;
+        \\}}
+    , .{root_a});
+    defer allocator.free(config_a);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{ .config_text = config_a });
+    defer tardigrade.stop();
+
+    const Hammer = struct {
+        port: u16,
+        stop_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        ok: usize = 0,
+        fail: usize = 0,
+        fn run(self: *@This()) void {
+            const a = std.heap.page_allocator;
+            while (!self.stop_flag.load(.acquire)) {
+                var resp = sendRequest(a, self.port, .{ .method = "GET", .path = "/index.html", .body = null, .headers = &.{} }) catch {
+                    self.fail += 1;
+                    continue;
+                };
+                defer resp.deinit();
+                if (resp.status_code == 200) self.ok += 1 else self.fail += 1;
+            }
+        }
+    };
+    var hammer = Hammer{ .port = tardigrade.port };
+    const thread = try std.Thread.spawn(.{}, Hammer.run, .{&hammer});
+
+    // Let requests flow, reload to root B mid-stream, let more flow.
+    compat.sleepNs(150 * std.time.ns_per_ms);
+    const config_b = try std.fmt.allocPrint(allocator,
+        \\location / {{
+        \\    root {s};
+        \\    try_files $uri /index.html;
+        \\}}
+    , .{root_b});
+    defer allocator.free(config_b);
+    try tardigrade.rewriteConfig(config_b);
+    tardigrade.sendSignal(std.posix.SIG.HUP);
+    compat.sleepNs(300 * std.time.ns_per_ms);
+
+    hammer.stop_flag.store(true, .release);
+    thread.join();
+
+    // The core guarantee: every request served across the reload succeeded.
+    try std.testing.expect(hammer.ok > 0);
+    try std.testing.expectEqual(@as(usize, 0), hammer.fail);
+
+    // New requests reflect the reloaded config.
+    var after = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/index.html", .body = null, .headers = &.{} });
+    defer after.deinit();
+    try std.testing.expectEqual(@as(u16, 200), after.status_code);
+    try assertContains(after.body, "site-B");
+
+    var status = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/tardigrade/reload/status", .body = null, .headers = &.{} });
+    defer status.deinit();
+    try assertContains(status.body, "\"ok\":true");
+}
+
+test "reload while proxying a long upstream response preserves the in-flight body (#170)" {
+    const allocator = std.testing.allocator;
+
+    // ~48 KiB body so the transfer is non-trivial and clearly in flight.
+    const long_body = try allocator.alloc(u8, 48 * 1024);
+    defer allocator.free(long_body);
+    for (long_body, 0..) |*b, i| b.* = @intCast(i % 251);
+
+    const first_responses = [_]UpstreamResponseSpec{.{ .body = long_body, .delay_ms = 400 }};
+    const second_responses = [_]UpstreamResponseSpec{.{ .body = "second-upstream" }};
+
+    var first_upstream = try UpstreamServer.start(allocator, &first_responses);
+    defer first_upstream.stop();
+    try first_upstream.run();
+    var second_upstream = try UpstreamServer.start(allocator, &second_responses);
+    defer second_upstream.stop();
+    try second_upstream.run();
+
+    const config_a = try std.fmt.allocPrint(allocator,
+        \\location /p/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+    , .{ test_host, first_upstream.port() });
+    defer allocator.free(config_a);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{ .config_text = config_a });
+    defer tardigrade.stop();
+
+    const Result = struct { response: ?HttpResponse = null, err: ?anyerror = null };
+    var result = Result{};
+    const Runner = struct {
+        fn run(ctx: *Result, port: u16) void {
+            ctx.response = sendRequestWithTimeout(std.heap.page_allocator, port, .{
+                .method = "GET",
+                .path = "/p/big",
+                .body = null,
+                .headers = &.{},
+            }, 5_000) catch |err| {
+                ctx.err = err;
+                return;
+            };
+        }
+    };
+    const thread = try std.Thread.spawn(.{}, Runner.run, .{ &result, tardigrade.port });
+    try waitForUpstreamCount(&first_upstream, 1, 2_000);
+
+    // Reload to a different upstream while the long response is in flight.
+    const config_b = try std.fmt.allocPrint(allocator,
+        \\location /p/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+    , .{ test_host, second_upstream.port() });
+    defer allocator.free(config_b);
+    try tardigrade.rewriteConfig(config_b);
+    tardigrade.sendSignal(std.posix.SIG.HUP);
+
+    thread.join();
+    if (result.err) |err| return err;
+    // Let the reload settle before issuing the post-reload request.
+    compat.sleepNs(300 * std.time.ns_per_ms);
+    var in_flight = result.response orelse return error.InvalidHttpResponse;
+    defer in_flight.deinit();
+    // The in-flight request completes intact on the old upstream's full body.
+    try std.testing.expectEqual(@as(u16, 200), in_flight.status_code);
+    try std.testing.expectEqual(long_body.len, in_flight.body.len);
+    try std.testing.expect(std.mem.eql(u8, long_body, in_flight.body));
+
+    // New requests are routed to the reloaded upstream.
+    var after = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/p/big", .body = null, .headers = &.{} });
+    defer after.deinit();
+    try assertContains(after.body, "second-upstream");
+}
+
+test "reload while a client is uploading a request body completes the upload (#170)" {
+    const allocator = std.testing.allocator;
+
+    var upstream = try UpstreamServer.start(allocator, &.{.{ .body = "upload-ack" }});
+    defer upstream.stop();
+    try upstream.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location /upload/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+    , .{ test_host, upstream.port() });
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{ .config_text = config_text });
+    defer tardigrade.stop();
+
+    // Deterministic 4 KiB upload body sent in two halves with a reload in between.
+    const body = try allocator.alloc(u8, 4096);
+    defer allocator.free(body);
+    for (body, 0..) |*b, i| b.* = @intCast((i * 7) % 256);
+
+    var stream = try compat.tcpConnectToHost(allocator, test_host, tardigrade.port);
+    defer stream.close();
+    try setStreamTimeouts(&stream, 5_000);
+
+    const head = try std.fmt.allocPrint(allocator, "POST /upload/data HTTP/1.1\r\nHost: {s}:{d}\r\nConnection: close\r\nContent-Length: {d}\r\n\r\n", .{ test_host, tardigrade.port, body.len });
+    defer allocator.free(head);
+    try stream.writeAll(head);
+    try stream.writeAll(body[0 .. body.len / 2]);
+
+    // Reload mid-upload.
+    try tardigrade.rewriteConfig(config_text);
+    tardigrade.sendSignal(std.posix.SIG.HUP);
+    compat.sleepNs(150 * std.time.ns_per_ms);
+
+    // Finish the upload; it must still complete against the original config.
+    try stream.writeAll(body[body.len / 2 ..]);
+    var response = try readHttpResponse(allocator, stream);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status_code);
+    try assertContains(response.body, "upload-ack");
+
+    // The upstream received the full, intact body.
+    const captured = try upstream.capturedBody(allocator);
+    defer allocator.free(captured);
+    try std.testing.expectEqual(body.len, captured.len);
+    try std.testing.expect(std.mem.eql(u8, body, captured));
+}
+
+test "reload succeeds while active upstream health checks are running (#170)" {
+    const allocator = std.testing.allocator;
+
+    var upstream = try UpstreamServer.start(allocator, &.{.{ .body = "svc-ok" }});
+    defer upstream.stop();
+    try upstream.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location /svc/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+    , .{ test_host, upstream.port() });
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .upstream_port = upstream.port(),
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_UPSTREAM_ACTIVE_PROBE_INTERVAL_MS", .value = "100" },
+            .{ .name = "TARDIGRADE_UPSTREAM_ACTIVE_PROBE_PATH", .value = "/" },
+        },
+    });
+    defer tardigrade.stop();
+
+    // Let a few active health probes run before reloading.
+    compat.sleepNs(350 * std.time.ns_per_ms);
+    try tardigrade.rewriteConfig(config_text);
+    tardigrade.sendSignal(std.posix.SIG.HUP);
+    compat.sleepNs(350 * std.time.ns_per_ms);
+
+    // Reload must have succeeded and the gateway keeps serving.
+    var status = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/tardigrade/reload/status", .body = null, .headers = &.{} });
+    defer status.deinit();
+    try assertContains(status.body, "\"ok\":true");
+
+    var svc = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/svc/x", .body = null, .headers = &.{} });
+    defer svc.deinit();
+    try std.testing.expectEqual(@as(u16, 200), svc.status_code);
+    try assertContains(svc.body, "svc-ok");
+}
+
+test "reload does not disrupt a parked keepalive connection (#170)" {
+    const allocator = std.testing.allocator;
+    var fixture = try GenericFixtureDir.create(allocator, "reload-keepalive-park");
+    defer fixture.deinit();
+    try fixture.writeRel("public/index.html", "parked-site\n");
+    const public_abs = try fixture.joinAbs("public");
+    defer allocator.free(public_abs);
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location / {{
+        \\    root {s};
+        \\    try_files $uri /index.html;
+        \\}}
+    , .{public_abs});
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        // Keep the idle keepalive connection from being reaped during the test.
+        .extra_env = &.{.{ .name = "TARDIGRADE_KEEP_ALIVE_TIMEOUT_MS", .value = "30000" }},
+    });
+    defer tardigrade.stop();
+
+    var stream = try compat.tcpConnectToHost(allocator, test_host, tardigrade.port);
+    defer stream.close();
+    try setStreamTimeouts(&stream, 5_000);
+
+    // First request on the keepalive connection.
+    try sendKeepAliveGet(&stream, allocator, tardigrade.port, "/index.html");
+    var resp1 = try readHttpResponse(allocator, stream);
+    defer resp1.deinit();
+    try std.testing.expectEqual(@as(u16, 200), resp1.status_code);
+
+    // Let the idle connection park off the worker pool, then reload.
+    compat.sleepNs(250 * std.time.ns_per_ms);
+    try tardigrade.rewriteConfig(config_text);
+    tardigrade.sendSignal(std.posix.SIG.HUP);
+    compat.sleepNs(300 * std.time.ns_per_ms);
+
+    // The parked connection must still serve a second request after the reload.
+    try sendKeepAliveGet(&stream, allocator, tardigrade.port, "/index.html");
+    var resp2 = try readHttpResponse(allocator, stream);
+    defer resp2.deinit();
+    try std.testing.expectEqual(@as(u16, 200), resp2.status_code);
+    try assertContains(resp2.body, "parked-site");
+}
+
+test "graceful shutdown drains an active in-flight request before exiting (#170)" {
+    const allocator = std.testing.allocator;
+
+    var upstream = try UpstreamServer.start(allocator, &.{.{ .body = "slow-ok", .delay_ms = 700 }});
+    defer upstream.stop();
+    try upstream.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location /slow/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+    , .{ test_host, upstream.port() });
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        // Generous drain window so the 700ms request finishes during drain.
+        .extra_env = &.{.{ .name = "TARDIGRADE_SHUTDOWN_DRAIN_TIMEOUT_MS", .value = "3000" }},
+    });
+    defer tardigrade.stop();
+
+    const Result = struct { response: ?HttpResponse = null, err: ?anyerror = null };
+    var result = Result{};
+    const Runner = struct {
+        fn run(ctx: *Result, port: u16) void {
+            ctx.response = sendRequestWithTimeout(std.heap.page_allocator, port, .{
+                .method = "GET",
+                .path = "/slow/job",
+                .body = null,
+                .headers = &.{},
+            }, 5_000) catch |err| {
+                ctx.err = err;
+                return;
+            };
+        }
+    };
+    const thread = try std.Thread.spawn(.{}, Runner.run, .{ &result, tardigrade.port });
+    // Ensure the request is in flight at the upstream before shutting down.
+    try waitForUpstreamCount(&upstream, 1, 2_000);
+
+    tardigrade.sendSignal(std.posix.SIG.TERM);
+
+    thread.join();
+    if (result.err) |err| return err;
+    var response = result.response orelse return error.InvalidHttpResponse;
+    defer response.deinit();
+    // The active request completed during drain rather than being dropped.
+    try std.testing.expectEqual(@as(u16, 200), response.status_code);
+    try assertContains(response.body, "slow-ok");
+
+    // And the process actually shut down (listener stopped accepting).
+    try waitForPortClosed(tardigrade.port, 5_000);
+    try waitForLogSubstring(allocator, tardigrade.log_path, "Graceful shutdown complete", 3_000);
+}
+
+test "graceful shutdown completes promptly with a slow client connected (#170)" {
+    const allocator = std.testing.allocator;
+    var fixture = try GenericFixtureDir.create(allocator, "shutdown-slow-client");
+    defer fixture.deinit();
+    try fixture.writeRel("public/index.html", "ok\n");
+    const public_abs = try fixture.joinAbs("public");
+    defer allocator.free(public_abs);
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location / {{
+        \\    root {s};
+        \\    try_files $uri /index.html;
+        \\}}
+    , .{public_abs});
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .extra_env = &.{
+            // The client socket recv timeout is governed by keep_alive_timeout_ms;
+            // bound it (and the drain window) so a stalled read is force-timed-out
+            // and shutdown stays prompt.
+            .{ .name = "TARDIGRADE_KEEP_ALIVE_TIMEOUT_MS", .value = "400" },
+            .{ .name = "TARDIGRADE_SHUTDOWN_DRAIN_TIMEOUT_MS", .value = "500" },
+        },
+    });
+    defer tardigrade.stop();
+
+    // A slow client that opens a connection and sends only a partial request
+    // (no terminating blank line), then stalls.
+    var slow = try compat.tcpConnectToHost(allocator, test_host, tardigrade.port);
+    defer slow.close();
+    const partial = try std.fmt.allocPrint(allocator, "GET /index.html HTTP/1.1\r\nHost: {s}:{d}\r\n", .{ test_host, tardigrade.port });
+    defer allocator.free(partial);
+    try slow.writeAll(partial);
+    compat.sleepNs(50 * std.time.ns_per_ms);
+
+    const t0 = compat.milliTimestamp();
+    tardigrade.sendSignal(std.posix.SIG.TERM);
+
+    // Shutdown must complete in bounded time despite the stalled client.
+    try waitForPortClosed(tardigrade.port, 5_000);
+    const elapsed = compat.milliTimestamp() - t0;
+    try std.testing.expect(elapsed < 4_000);
+    try waitForLogSubstring(allocator, tardigrade.log_path, "Graceful shutdown complete", 3_000);
+}
+
+test "invalid reload leaves the previous config active (#170)" {
+    const allocator = std.testing.allocator;
+
+    var upstream = try UpstreamServer.start(allocator, &.{.{ .body = "original-upstream" }});
+    defer upstream.stop();
+    try upstream.run();
+
+    const valid_config = try std.fmt.allocPrint(allocator,
+        \\location /svc/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+    , .{ test_host, upstream.port() });
+    defer allocator.free(valid_config);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{ .config_text = valid_config });
+    defer tardigrade.stop();
+
+    var before = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/svc/x", .body = null, .headers = &.{} });
+    defer before.deinit();
+    try assertContains(before.body, "original-upstream");
+
+    // Rewrite the config to syntactically invalid content and reload.
+    try tardigrade.rewriteConfig("this_is_not_valid_config_without_a_terminator\n");
+    tardigrade.sendSignal(std.posix.SIG.HUP);
+    compat.sleepNs(300 * std.time.ns_per_ms);
+
+    // The previous (valid) config must still be active and serving.
+    var after = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/svc/x", .body = null, .headers = &.{} });
+    defer after.deinit();
+    try std.testing.expectEqual(@as(u16, 200), after.status_code);
+    try assertContains(after.body, "original-upstream");
+
+    // Reload status reports failure with the previous config kept.
+    var status = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/tardigrade/reload/status", .body = null, .headers = &.{} });
+    defer status.deinit();
+    try assertContains(status.body, "\"ok\":false");
+}
+
+test "static website with binary image assets loads correctly end-to-end and across reload (#170)" {
+    const allocator = std.testing.allocator;
+    var fixture = try GenericFixtureDir.create(allocator, "full-website");
+    defer fixture.deinit();
+
+    // A small but complete static site: markup, stylesheet, script, and binary
+    // image assets (PNG + JPEG) plus a text SVG.
+    try fixture.writeRel("public/index.html",
+        \\<!doctype html><html><head><title>Tardigrade Site</title>
+        \\<link rel="stylesheet" href="/style.css"></head>
+        \\<body><img src="/img/logo.png"><img src="/img/photo.jpg">
+        \\<img src="/img/icon.svg"><script src="/app.js"></script></body></html>
+    );
+    try fixture.writeRel("public/style.css", "body{background:#fff;color:#111}\n");
+    try fixture.writeRel("public/app.js", "console.log('tardigrade');\n");
+    try fixture.writeRel("public/img/icon.svg", "<svg xmlns=\"http://www.w3.org/2000/svg\"><rect/></svg>\n");
+
+    // Binary PNG: 8-byte signature + deterministic payload.
+    var png_bytes: [8 + 1024]u8 = undefined;
+    @memcpy(png_bytes[0..8], &[_]u8{ 0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A });
+    for (png_bytes[8..], 0..) |*b, i| b.* = @intCast(i % 256);
+    try fixture.writeRel("public/img/logo.png", &png_bytes);
+
+    // Binary JPEG: SOI + payload + EOI markers.
+    var jpg_bytes: [4 + 2048 + 2]u8 = undefined;
+    @memcpy(jpg_bytes[0..4], &[_]u8{ 0xFF, 0xD8, 0xFF, 0xE0 });
+    for (jpg_bytes[4 .. jpg_bytes.len - 2], 0..) |*b, i| b.* = @intCast((i * 3) % 256);
+    jpg_bytes[jpg_bytes.len - 2] = 0xFF;
+    jpg_bytes[jpg_bytes.len - 1] = 0xD9;
+    try fixture.writeRel("public/img/photo.jpg", &jpg_bytes);
+
+    const public_abs = try fixture.joinAbs("public");
+    defer allocator.free(public_abs);
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location / {{
+        \\    root {s};
+        \\    try_files $uri /index.html;
+        \\}}
+    , .{public_abs});
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{ .config_text = config_text });
+    defer tardigrade.stop();
+
+    const Asset = struct { path: []const u8, content_type: []const u8 };
+    const text_assets = [_]Asset{
+        .{ .path = "/index.html", .content_type = "text/html" },
+        .{ .path = "/style.css", .content_type = "text/css" },
+        .{ .path = "/app.js", .content_type = "application/javascript" },
+        .{ .path = "/img/icon.svg", .content_type = "image/svg+xml" },
+    };
+    for (text_assets) |asset| {
+        var resp = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = asset.path, .body = null, .headers = &.{} });
+        defer resp.deinit();
+        try std.testing.expectEqual(@as(u16, 200), resp.status_code);
+        const ct = resp.header("Content-Type") orelse return error.MissingContentType;
+        try assertContains(ct, asset.content_type);
+        try std.testing.expect(resp.body.len > 0);
+    }
+
+    // Binary image assets must arrive byte-for-byte with the right content type.
+    {
+        var resp = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/img/logo.png", .body = null, .headers = &.{} });
+        defer resp.deinit();
+        try std.testing.expectEqual(@as(u16, 200), resp.status_code);
+        const ct = resp.header("Content-Type") orelse return error.MissingContentType;
+        try assertContains(ct, "image/png");
+        try std.testing.expectEqual(png_bytes.len, resp.body.len);
+        try std.testing.expect(std.mem.eql(u8, &png_bytes, resp.body));
+    }
+    {
+        var resp = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/img/photo.jpg", .body = null, .headers = &.{} });
+        defer resp.deinit();
+        try std.testing.expectEqual(@as(u16, 200), resp.status_code);
+        const ct = resp.header("Content-Type") orelse return error.MissingContentType;
+        try assertContains(ct, "image/jpeg");
+        try std.testing.expectEqual(jpg_bytes.len, resp.body.len);
+        try std.testing.expect(std.mem.eql(u8, &jpg_bytes, resp.body));
+    }
+
+    // After a reload, the images still load intact.
+    try tardigrade.rewriteConfig(config_text);
+    tardigrade.sendSignal(std.posix.SIG.HUP);
+    compat.sleepNs(300 * std.time.ns_per_ms);
+
+    var png_after = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/img/logo.png", .body = null, .headers = &.{} });
+    defer png_after.deinit();
+    try std.testing.expectEqual(@as(u16, 200), png_after.status_code);
+    try std.testing.expect(std.mem.eql(u8, &png_bytes, png_after.body));
+}

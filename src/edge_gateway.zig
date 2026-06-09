@@ -622,9 +622,18 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         }
     }
 
-    state.logger.info(null, "Shutdown requested; draining active connection work (timeout={}ms)", .{cfg.shutdown_drain_timeout_ms});
-    worker_pool.shutdownAndJoin(cfg.shutdown_drain_timeout_ms);
-    state.logger.info(null, "Graceful shutdown complete", .{});
+    const active_at_drain_start = blk: {
+        state.connection_mutex.lock();
+        defer state.connection_mutex.unlock();
+        break :blk state.active_connections_total;
+    };
+    state.logger.info(null, "Shutdown requested; draining active connection work (timeout={}ms active_connections={d})", .{ cfg.shutdown_drain_timeout_ms, active_at_drain_start });
+    const drain_result = worker_pool.shutdownAndJoin(cfg.shutdown_drain_timeout_ms);
+    state.metricsRecordDrain(drain_result.timed_out, drain_result.forced_closes);
+    if (drain_result.timed_out) {
+        state.logger.warn(null, "drain timeout elapsed; force-closed {d} queued connection(s)", .{drain_result.forced_closes});
+    }
+    state.logger.info(null, "Graceful shutdown complete (forced_closes={d} drain_timed_out={})", .{ drain_result.forced_closes, drain_result.timed_out });
 }
 
 fn applyRuntimeIdentity(cfg: *const edge_config.EdgeConfig, logger: *const http.logger.Logger) !void {

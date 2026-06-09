@@ -26,6 +26,8 @@ pub fn hotReloadConfig(
     http3_dispatch_ctx: anytype,
 ) void {
     const now_ms = compat.milliTimestamp();
+    state.metricsRecordReloadAttempt();
+    state.logger.info(null, "configuration hot-reload starting", .{});
     const loaded = edge_config.loadFromEnv(allocator) catch |err| {
         const msg = std.fmt.bufPrint(&state.last_reload_error, "load failed: {}", .{err}) catch "load failed";
         state.reload_mutex.lock();
@@ -33,6 +35,7 @@ pub fn hotReloadConfig(
         state.last_reload_at_ms = now_ms;
         state.last_reload_error_len = msg.len;
         state.reload_mutex.unlock();
+        state.metricsRecordReloadFailure();
         state.logger.warn(null, "config reload failed during load: {}", .{err});
         return;
     };
@@ -45,6 +48,7 @@ pub fn hotReloadConfig(
         state.last_reload_at_ms = now_ms;
         state.last_reload_error_len = msg.len;
         state.reload_mutex.unlock();
+        state.metricsRecordReloadFailure();
         state.logger.warn(null, "config reload rejected by validation: {}", .{err});
         return;
     };
@@ -58,6 +62,7 @@ pub fn hotReloadConfig(
         @memcpy(state.last_reload_error[0..19], "allocation failed  ");
         state.last_reload_error_len = 19;
         state.reload_mutex.unlock();
+        state.metricsRecordReloadFailure();
         state.logger.warn(null, "config reload allocation failed", .{});
         return;
     };
@@ -71,6 +76,7 @@ pub fn hotReloadConfig(
         @memcpy(state.last_reload_error[0..21], "bookkeeping failed   ");
         state.last_reload_error_len = 21;
         state.reload_mutex.unlock();
+        state.metricsRecordReloadFailure();
         state.logger.warn(null, "config reload bookkeeping failed", .{});
         return;
     };
@@ -92,6 +98,7 @@ pub fn hotReloadConfig(
     state.last_reload_at_ms = now_ms;
     state.last_reload_error_len = 0;
     state.reload_mutex.unlock();
+    state.metricsRecordReloadSuccess();
     state.logger.info(null, "configuration hot-reload applied", .{});
 }
 

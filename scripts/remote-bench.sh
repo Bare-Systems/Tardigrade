@@ -33,12 +33,19 @@ tar -C "$REPO" -czf /tmp/tardigrade-bench-src.tgz \
   --exclude=zig-out --exclude=dist --exclude='*.tgz' .
 
 echo "[2/4] uploading to $TARGET"
-ssh "$TARGET" "rm -rf $REMOTE_DIR && mkdir -p $REMOTE_DIR"
+# Pass REMOTE_DIR as a positional arg ($1) so it is consumed by the remote
+# shell rather than expanded into the ssh command string (avoids shellcheck
+# SC2029 while keeping the value supplied by this client).
+ssh "$TARGET" bash -c 'rm -rf "$1" && mkdir -p "$1"' _ "$REMOTE_DIR"
 scp -q /tmp/tardigrade-bench-src.tgz "$TARGET:$REMOTE_DIR/src.tgz"
 
 echo "[3/4] building (ReleaseFast) on $TARGET"
-ssh "$TARGET" "ZIG='$ZIG' REMOTE_DIR='$REMOTE_DIR' bash -s" <<'REMOTE'
+# Inputs are passed as positional args to the remote `bash -s` (mapped to named
+# vars below) instead of being interpolated into the ssh command string, which
+# keeps shellcheck SC2029 quiet without changing where the values come from.
+ssh "$TARGET" bash -s "$ZIG" "$REMOTE_DIR" <<'REMOTE'
 set -e
+ZIG="$1"; REMOTE_DIR="$2"
 cd "$REMOTE_DIR" && tar -xzf src.tgz
 "$ZIG" version >/dev/null 2>&1 || { echo "Zig not found at '$ZIG' — set BENCH_ZIG to a Zig 0.16 binary"; exit 1; }
 case "$("$ZIG" version)" in 0.16.*) ;; *) echo "warning: Zig $("$ZIG" version) is not 0.16.x; build may fail";; esac
@@ -52,8 +59,12 @@ echo "  built OK"
 REMOTE
 
 echo "[4/4] running benchmark on $TARGET"
-ssh "$TARGET" "REMOTE_DIR='$REMOTE_DIR' FRONT_PORT='$FRONT_PORT' UP_PORT='$UP_PORT' DURATION='$DURATION' bash -s" <<'REMOTE'
+# Positional args ($1..$4) carry this client's values to the remote `bash -s`
+# and are captured into named vars before any function runs (the start/bench
+# helpers use their own positional params). Avoids shellcheck SC2029.
+ssh "$TARGET" bash -s "$REMOTE_DIR" "$FRONT_PORT" "$UP_PORT" "$DURATION" <<'REMOTE'
 set -e
+REMOTE_DIR="$1"; FRONT_PORT="$2"; UP_PORT="$3"; DURATION="$4"
 BIN="$REMOTE_DIR/zig-out/bin/tardigrade"
 D="$REMOTE_DIR/run"; mkdir -p "$D"
 printf 'pid %s/up.pid;\nlisten %s;\nlocation = /health {\n    return 200 ok;\n}\n' "$D" "$UP_PORT" > "$D/up.conf"

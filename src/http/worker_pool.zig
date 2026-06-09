@@ -114,7 +114,7 @@ pub const WorkerPool = struct {
     }
 
     pub fn deinit(self: *WorkerPool) void {
-        self.shutdownAndJoin(30_000);
+        _ = self.shutdownAndJoin(30_000);
         if (!builtin.single_threaded) {
             for (self.worker_queues) |*wq| wq.items.deinit(self.allocator);
             self.allocator.free(self.worker_queues);
@@ -169,6 +169,15 @@ pub const WorkerPool = struct {
         };
     }
 
+    /// Outcome of a drain, for observability (#170).
+    pub const DrainResult = struct {
+        /// Queued (unstarted) connections force-closed because the drain did not
+        /// finish in time (deadline elapsed, or an immediate no-drain shutdown).
+        forced_closes: usize = 0,
+        /// True when a positive drain deadline elapsed before work finished.
+        timed_out: bool = false,
+    };
+
     /// Drain in-flight work and shut down workers.
     ///
     /// `drain_timeout_ms` controls how long to wait for queued and active jobs
@@ -179,17 +188,25 @@ pub const WorkerPool = struct {
     ///
     /// Active (already-dispatched) handlers are always allowed to finish
     /// naturally; only unstarted queued fds are force-closed on timeout.
-    pub fn shutdownAndJoin(self: *WorkerPool, drain_timeout_ms: u64) void {
-        if (builtin.single_threaded) return;
-        if (self.joined) return;
+    ///
+    /// Returns a `DrainResult` describing whether the deadline was hit and how
+    /// many queued connections were force-closed.
+    pub fn shutdownAndJoin(self: *WorkerPool, drain_timeout_ms: u64) DrainResult {
+        if (builtin.single_threaded) return .{};
+        if (self.joined) return .{};
+
+        var result = DrainResult{};
 
         self.mutex.lock();
         self.shutting_down = true;
 
         if (drain_timeout_ms == 0) {
-            // Immediate: close queued fds without waiting.
+            // Immediate: close queued fds without waiting (configured no-drain).
             for (self.worker_queues) |*wq| {
-                while (wq.items.popFront()) |fd| _ = std.c.close(fd);
+                while (wq.items.popFront()) |fd| {
+                    _ = std.c.close(fd);
+                    result.forced_closes += 1;
+                }
             }
             self.queued_jobs = 0;
         } else {
@@ -199,8 +216,12 @@ pub const WorkerPool = struct {
                 const now_ms = compat.milliTimestamp();
                 if (now_ms >= deadline_ms) {
                     // Timeout: force-close remaining queued fds.
+                    result.timed_out = true;
                     for (self.worker_queues) |*wq| {
-                        while (wq.items.popFront()) |fd| _ = std.c.close(fd);
+                        while (wq.items.popFront()) |fd| {
+                            _ = std.c.close(fd);
+                            result.forced_closes += 1;
+                        }
                     }
                     self.queued_jobs = 0;
                     break;
@@ -220,6 +241,7 @@ pub const WorkerPool = struct {
             thread.join();
         }
         self.joined = true;
+        return result;
     }
 
     fn workerMain(self: *WorkerPool, worker_index: usize) void {
@@ -351,7 +373,10 @@ test "worker pool shutdown drains in-flight work" {
     defer pool.deinit();
 
     try pool.submit(1);
-    pool.shutdownAndJoin(5_000);
+    const drain = pool.shutdownAndJoin(5_000);
+    // The single in-flight job finishes well within the timeout: clean drain.
+    try std.testing.expect(!drain.timed_out);
+    try std.testing.expectEqual(@as(usize, 0), drain.forced_closes);
 
     ctx.mutex.lock();
     defer ctx.mutex.unlock();
@@ -470,7 +495,7 @@ test "shutdownAndJoin drain_timeout_ms=0 closes queued fds immediately" {
 
     // Immediate shutdown with zero timeout must complete quickly.
     const t0 = compat.milliTimestamp();
-    pool.shutdownAndJoin(0);
+    _ = pool.shutdownAndJoin(0);
     const elapsed = compat.milliTimestamp() - t0;
     // Should finish in well under 1 second even on a slow machine.
     try std.testing.expect(elapsed < 1_000);
@@ -503,7 +528,8 @@ test "shutdownAndJoin drain_timeout_ms positive drains in-flight work before tim
 
     try pool.submit(1);
     // 2-second timeout is much more than the 10ms handler needs.
-    pool.shutdownAndJoin(2_000);
+    const drain = pool.shutdownAndJoin(2_000);
+    try std.testing.expect(!drain.timed_out);
 
     ctx.mutex.lock();
     defer ctx.mutex.unlock();
@@ -534,10 +560,48 @@ test "shutdownAndJoin drain_timeout_ms expires and returns" {
     std.Io.sleep(compat.io(), .fromMilliseconds(5), .awake) catch {}; // interrupt wakes are fine; test waits for handler to start
     const t0 = compat.milliTimestamp();
     // Very short drain timeout — the active handler will outlive it.
-    pool.shutdownAndJoin(20);
+    const drain = pool.shutdownAndJoin(20);
     const elapsed = compat.milliTimestamp() - t0;
+    // The deadline elapsed before the active handler finished.
+    try std.testing.expect(drain.timed_out);
+    // Active (already-dispatched) handlers are not force-closed, only queued fds.
+    try std.testing.expectEqual(@as(usize, 0), drain.forced_closes);
     // Should finish well under 1s (handler finishes after timeout).
     try std.testing.expect(elapsed < 1_000);
+}
+
+test "shutdownAndJoin counts queued connections force-closed (#170)" {
+    if (builtin.single_threaded) return;
+
+    // Manually build a pool with no worker threads but with queued fds, so the
+    // drain cannot make progress and every queued fd must be force-closed. Using
+    // fake fds is safe: std.c.close on a non-socket fd just returns EBADF.
+    var queues = try std.testing.allocator.alloc(WorkerQueue, 2);
+    defer std.testing.allocator.free(queues);
+    for (queues) |*q| q.* = .{ .items = .empty };
+    defer for (queues) |*q| q.items.deinit(std.testing.allocator);
+
+    try queues[0].items.pushBack(std.testing.allocator, 90001);
+    try queues[0].items.pushBack(std.testing.allocator, 90002);
+    try queues[1].items.pushBack(std.testing.allocator, 90003);
+
+    var pool = WorkerPool{
+        .allocator = std.testing.allocator,
+        .threads = if (builtin.single_threaded) .{} else &.{},
+        .worker_queues = queues,
+        .worker_ids = &.{},
+        .handler = undefined,
+        .handler_ctx = undefined,
+        .max_queue_len = 128,
+        .queued_jobs = 3,
+        .next_queue = 0,
+    };
+
+    // Immediate (no-drain) shutdown force-closes all 3 queued fds without waiting.
+    const drain = pool.shutdownAndJoin(0);
+    try std.testing.expect(!drain.timed_out);
+    try std.testing.expectEqual(@as(usize, 3), drain.forced_closes);
+    try std.testing.expectEqual(@as(usize, 0), pool.queued_jobs);
 }
 
 test "worker pool global queue cap rejects without unbounded growth" {

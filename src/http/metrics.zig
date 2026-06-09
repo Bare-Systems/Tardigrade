@@ -77,6 +77,19 @@ pub const Metrics = struct {
     event_loop_iterations: u64,
     /// Total background active health-probe batches dispatched.
     health_probe_runs: u64,
+    /// Total config hot-reload attempts (incremented when a SIGHUP reload starts).
+    reload_attempts_total: u64,
+    /// Total config hot-reloads that loaded, validated, and installed successfully.
+    reload_success_total: u64,
+    /// Total config hot-reloads rejected (load/validation/bookkeeping failure); the
+    /// previous config stays active.
+    reload_failure_total: u64,
+    /// Total graceful-shutdown drains started.
+    drain_total: u64,
+    /// Total drains that hit the configured drain timeout before work finished.
+    drain_timeouts_total: u64,
+    /// Total queued (unstarted) connections force-closed because a drain timed out.
+    drain_forced_closes_total: u64,
     /// Server start time (nanoseconds since boot).
     started_ns: i128,
 
@@ -132,6 +145,12 @@ pub const Metrics = struct {
             .mux_frame_errors = 0,
             .event_loop_iterations = 0,
             .health_probe_runs = 0,
+            .reload_attempts_total = 0,
+            .reload_success_total = 0,
+            .reload_failure_total = 0,
+            .drain_total = 0,
+            .drain_timeouts_total = 0,
+            .drain_forced_closes_total = 0,
             .started_ns = compat.nanoTimestamp(),
         };
     }
@@ -180,6 +199,30 @@ pub const Metrics = struct {
 
     pub fn recordHealthProbeRun(self: *Metrics) void {
         self.health_probe_runs += 1;
+    }
+
+    /// Record the start of a config hot-reload attempt.
+    pub fn recordReloadAttempt(self: *Metrics) void {
+        self.reload_attempts_total += 1;
+    }
+
+    /// Record a successful config hot-reload (loaded, validated, installed).
+    pub fn recordReloadSuccess(self: *Metrics) void {
+        self.reload_success_total += 1;
+    }
+
+    /// Record a rejected config hot-reload; the previous config stays active.
+    pub fn recordReloadFailure(self: *Metrics) void {
+        self.reload_failure_total += 1;
+    }
+
+    /// Record a graceful-shutdown drain. `timed_out` is true when the drain
+    /// deadline elapsed before work finished; `forced_closes` is the number of
+    /// queued (unstarted) connections force-closed as a result.
+    pub fn recordDrain(self: *Metrics, timed_out: bool, forced_closes: usize) void {
+        self.drain_total += 1;
+        if (timed_out) self.drain_timeouts_total += 1;
+        self.drain_forced_closes_total += @intCast(forced_closes);
     }
 
     pub fn setUpstreamUnhealthyBackends(self: *Metrics, count: usize) void {
@@ -473,6 +516,24 @@ pub const Metrics = struct {
             \\# HELP tardigrade_health_probe_runs_total Total background active health-probe batches dispatched
             \\# TYPE tardigrade_health_probe_runs_total counter
             \\tardigrade_health_probe_runs_total {d}
+            \\# HELP tardigrade_reload_attempts_total Total config hot-reload attempts
+            \\# TYPE tardigrade_reload_attempts_total counter
+            \\tardigrade_reload_attempts_total {d}
+            \\# HELP tardigrade_reload_success_total Total successful config hot-reloads
+            \\# TYPE tardigrade_reload_success_total counter
+            \\tardigrade_reload_success_total {d}
+            \\# HELP tardigrade_reload_failure_total Total rejected config hot-reloads (previous config kept)
+            \\# TYPE tardigrade_reload_failure_total counter
+            \\tardigrade_reload_failure_total {d}
+            \\# HELP tardigrade_drain_total Total graceful-shutdown drains started
+            \\# TYPE tardigrade_drain_total counter
+            \\tardigrade_drain_total {d}
+            \\# HELP tardigrade_drain_timeouts_total Total drains that hit the drain timeout
+            \\# TYPE tardigrade_drain_timeouts_total counter
+            \\tardigrade_drain_timeouts_total {d}
+            \\# HELP tardigrade_drain_forced_closes_total Total queued connections force-closed on drain timeout
+            \\# TYPE tardigrade_drain_forced_closes_total counter
+            \\tardigrade_drain_forced_closes_total {d}
             \\
         , .{
             self.worker_active_jobs,
@@ -490,6 +551,12 @@ pub const Metrics = struct {
             self.mux_frame_errors,
             self.event_loop_iterations,
             self.health_probe_runs,
+            self.reload_attempts_total,
+            self.reload_success_total,
+            self.reload_failure_total,
+            self.drain_total,
+            self.drain_timeouts_total,
+            self.drain_forced_closes_total,
         });
 
         try out.print(
@@ -546,7 +613,7 @@ pub const Metrics = struct {
             self.proxy_ttfb_ms_sum,
         });
         try out.print(
-            \\,"request_latency_ms_count":{d},"request_latency_ms_sum":{d},"worker_active_jobs":{d},"worker_queued_jobs":{d},"worker_threads":{d},"worker_queue_capacity":{d},"error_invalid_request":{d},"error_unauthorized":{d},"error_rate_limited":{d},"error_upstream_timeout":{d},"error_upstream_unavailable":{d},"error_internal_error":{d},"error_overload":{d},"error_request_timeout":{d},"mux_frame_errors":{d},"event_loop_iterations":{d},"health_probe_runs":{d}}}
+            \\,"request_latency_ms_count":{d},"request_latency_ms_sum":{d},"worker_active_jobs":{d},"worker_queued_jobs":{d},"worker_threads":{d},"worker_queue_capacity":{d},"error_invalid_request":{d},"error_unauthorized":{d},"error_rate_limited":{d},"error_upstream_timeout":{d},"error_upstream_unavailable":{d},"error_internal_error":{d},"error_overload":{d},"error_request_timeout":{d},"mux_frame_errors":{d},"event_loop_iterations":{d},"health_probe_runs":{d},"reload_attempts_total":{d},"reload_success_total":{d},"reload_failure_total":{d},"drain_total":{d},"drain_timeouts_total":{d},"drain_forced_closes_total":{d}}}
         , .{
             self.latency_count,
             self.latency_sum_ms,
@@ -565,6 +632,12 @@ pub const Metrics = struct {
             self.mux_frame_errors,
             self.event_loop_iterations,
             self.health_probe_runs,
+            self.reload_attempts_total,
+            self.reload_success_total,
+            self.reload_failure_total,
+            self.drain_total,
+            self.drain_timeouts_total,
+            self.drain_forced_closes_total,
         });
         return out.toOwnedSlice();
     }
@@ -673,6 +746,47 @@ test "recordErrorCode counts request_timeout errors" {
     m.recordErrorCode("request_timeout");
     m.recordErrorCode("request_timeout");
     try std.testing.expectEqual(@as(u64, 2), m.err_request_timeout);
+}
+
+test "reload and drain counters record lifecycle events (#170)" {
+    var m = Metrics.init();
+    try std.testing.expectEqual(@as(u64, 0), m.reload_attempts_total);
+
+    m.recordReloadAttempt();
+    m.recordReloadSuccess();
+    m.recordReloadAttempt();
+    m.recordReloadFailure();
+    try std.testing.expectEqual(@as(u64, 2), m.reload_attempts_total);
+    try std.testing.expectEqual(@as(u64, 1), m.reload_success_total);
+    try std.testing.expectEqual(@as(u64, 1), m.reload_failure_total);
+
+    // A clean drain: no timeout, no forced closes.
+    m.recordDrain(false, 0);
+    // A drain that timed out and force-closed 3 queued connections.
+    m.recordDrain(true, 3);
+    try std.testing.expectEqual(@as(u64, 2), m.drain_total);
+    try std.testing.expectEqual(@as(u64, 1), m.drain_timeouts_total);
+    try std.testing.expectEqual(@as(u64, 3), m.drain_forced_closes_total);
+}
+
+test "reload and drain counters appear in Prometheus and JSON output (#170)" {
+    const allocator = std.testing.allocator;
+    var m = Metrics.init();
+    m.recordReloadAttempt();
+    m.recordReloadFailure();
+    m.recordDrain(true, 2);
+
+    const prom = try m.toPrometheus(allocator);
+    defer allocator.free(prom);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_reload_attempts_total 1") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_reload_failure_total 1") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_drain_timeouts_total 1") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_drain_forced_closes_total 2") != null);
+
+    const json = try m.toJson(allocator);
+    defer allocator.free(json);
+    try std.testing.expect(std.mem.find(u8, json, "\"reload_attempts_total\":1") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"drain_forced_closes_total\":2") != null);
 }
 
 test "Metrics toPrometheus produces valid Prometheus text" {

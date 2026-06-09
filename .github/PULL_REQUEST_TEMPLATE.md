@@ -20,6 +20,5 @@ describe the expected impact. If no, write "None."
 - [ ] `zig build test --summary all` green
 - [ ] `zig build test-integration` green (required for protocol, proxy, and TLS changes)
 - [ ] New behavior covered by tests
-- [ ] Security-sensitive changes reviewed against [docs/ZIG_ENGINEERING_GUIDE.md](docs/ZIG_ENGINEERING_GUIDE.md)
 - [ ] [docs/CODE_REVIEW_CHECKLIST.md](docs/CODE_REVIEW_CHECKLIST.md) completed
 - [ ] README / CHANGELOG updated if operator-visible behavior changed

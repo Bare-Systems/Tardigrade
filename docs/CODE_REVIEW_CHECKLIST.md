@@ -19,7 +19,6 @@ more than a minute, it belongs in a separate automated test.
       of allocation
 - [ ] `errdefer` guards partial construction so errors do not leak
 - [ ] No new uses of `std.Thread.Pool`, `std.fs.cwd()`, or `std.mem.indexOf`
-      (see [ZIG_ENGINEERING_GUIDE.md](ZIG_ENGINEERING_GUIDE.md#apis-to-avoid))
 - [ ] `std.testing.allocator` used in all new unit tests
 
 ## Error Handling
@@ -63,5 +62,3 @@ Answer these for changes that touch the event loop, worker pool, or hot paths:
 - [ ] `README.md` updated if operator-visible behavior changed
 - [ ] `BLINK.md` updated if deployment topology or blink.toml behavior changed
 - [ ] `AGENTS.md` updated if architecture decisions or shared-state inventory changed
-- [ ] `docs/ZIG_ENGINEERING_GUIDE.md` updated if new Zig 0.16 patterns were
-      introduced or existing guidance is now wrong

@@ -176,7 +176,6 @@ corpus replay entrypoint, and internal pentest workflow are documented in
 
 | Topic | Location |
 | --- | --- |
-| Zig 0.16 engineering guide | `docs/ZIG_ENGINEERING_GUIDE.md` |
 | Core v1 support matrix | `docs/SUPPORT_MATRIX.md` |
 | Code review checklist | `docs/CODE_REVIEW_CHECKLIST.md` |
 | Observability | `docs/OBSERVABILITY.md` |

@@ -5127,6 +5127,45 @@ test "invalid reload leaves the previous config active (#170)" {
     try assertContains(status.body, "\"ok\":false");
 }
 
+test "hot reload does not warn about restart-only store paths when they are unchanged (#191)" {
+    const allocator = std.testing.allocator;
+
+    // Use a fixture dir for absolute paths; the store files do not need to exist.
+    var fixture = try GenericFixtureDir.create(allocator, "reload-restart-only-paths");
+    defer fixture.deinit();
+
+    const session_path = try fixture.joinAbs("sessions.json");
+    defer allocator.free(session_path);
+    const approval_path = try fixture.joinAbs("approvals.json");
+    defer allocator.free(approval_path);
+    const transcript_path = try fixture.joinAbs("transcripts.ndjson");
+    defer allocator.free(transcript_path);
+
+    // Start with all four restart-only fields populated via environment.
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_SESSION_STORE_PATH", .value = session_path },
+            .{ .name = "TARDIGRADE_APPROVAL_STORE_PATH", .value = approval_path },
+            .{ .name = "TARDIGRADE_TRANSCRIPT_STORE_PATH", .value = transcript_path },
+            .{ .name = "TARDIGRADE_APPROVAL_ESCALATION_WEBHOOK", .value = "http://127.0.0.1:19999/hook" },
+        },
+    });
+    defer tardigrade.stop();
+
+    // Trigger a reload. Because env vars are fixed for a running process, the same
+    // paths/URL are re-read at reload time — the comparison should see no change and
+    // emit no "restart required" warnings.
+    tardigrade.sendSignal(std.posix.SIG.HUP);
+    try waitForLogSubstring(allocator, tardigrade.log_path, "configuration hot-reload applied", 3_000);
+
+    const log_contents = try compat.cwd().readFileAlloc(allocator, tardigrade.log_path, 256 * 1024);
+    defer allocator.free(log_contents);
+    if (std.mem.indexOf(u8, log_contents, "restart required") != null) {
+        std.debug.print("unexpected 'restart required' warning in log:\n{s}\n", .{log_contents});
+        return error.SpuriousRestartRequiredWarning;
+    }
+}
+
 test "static website with binary image assets loads correctly end-to-end and across reload (#170)" {
     const allocator = std.testing.allocator;
     var fixture = try GenericFixtureDir.create(allocator, "full-website");

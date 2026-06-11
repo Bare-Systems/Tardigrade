@@ -325,7 +325,8 @@ fn deinitMuxResumeState(allocator: std.mem.Allocator, saved_state: *MuxResumeSta
 ///   `security_headers` contents). The startup config is borrowed by the
 ///   `ReloadableConfigStore`; on reload a new version is installed and the old one
 ///   is retained until in-flight leases release, so borrowed slices stay valid for
-///   readers holding a lease.
+///   readers holding a lease. Note: `add_headers` and `proxy_cache_path` are rebound
+///   on reload; the store path/URL fields are restart-only (see below).
 /// - **Heap-owned by `GatewayState`** (freed in `deinit`): `hsts_value`,
 ///   `http3_alt_svc`; every `StringHashMap` key (all are `dupe`d on insert) and
 ///   the duped IP values in `fd_to_ip`; the nested allocations owned by
@@ -354,9 +355,10 @@ fn deinitMuxResumeState(allocator: std.mem.Allocator, saved_state: *MuxResumeSta
 /// metrics, pools, and the sub-stores not keyed off changed config) survives a
 /// reload untouched. NOTE: `session_store_path`, `approval_store_path`,
 /// `transcript_store_path`, and `approval_escalation_webhook` are bound once at
-/// startup and are intentionally NOT rebound on reload (see issue #191) — they
-/// remain valid because the startup config outlives the process, but changes to
-/// those paths require a restart.
+/// startup and intentionally NOT rebound on reload — they remain valid because
+/// the startup config outlives the process, but changes to those paths/URLs
+/// require a full restart. `applyReloadedRuntimeConfig` detects changes to these
+/// fields and logs a WARN so operators know the new value was not applied.
 pub const GatewayState = struct {
     allocator: std.mem.Allocator,
     // --- Synchronization primitives (see the struct doc comment for the full
@@ -386,7 +388,7 @@ pub const GatewayState = struct {
     http3_alt_svc: ?[]u8, // owned; re-derived (old freed) on reload [runtime_mutex]
     http3_runtime: ?*http.http3_runtime.Runtime, // owned pointer; main-event-loop-only
     session_store: ?http.session.SessionStore, // owned [session_mutex]
-    session_store_path: []const u8, // borrowed from startup cfg; NOT rebound on reload (#191)
+    session_store_path: []const u8, // borrowed from startup cfg; restart-only (warns on change at reload)
     access_control: ?http.access_control.AccessControl, // owned; main-loop-only
     logger: http.logger.Logger, // owned; min_level updated on reload [runtime_mutex]
     metrics: http.metrics.Metrics, // shared counters [metrics_mutex]
@@ -436,17 +438,17 @@ pub const GatewayState = struct {
     mux_subscriptions_by_device: std.StringHashMap(usize), // owned keys [connection_mutex]
     mux_resume_state: std.StringHashMap(MuxResumeState), // owned keys+nested values [runtime_mutex]
     /// Path to persistent approval store file (empty = in-memory only).
-    /// Borrowed from startup cfg; NOT rebound on reload (#191).
+    /// Borrowed from startup cfg; restart-only (warns on change at reload).
     approval_store_path: []const u8,
     /// Webhook URL for escalation notifications (empty = disabled).
-    /// Borrowed from startup cfg; NOT rebound on reload (#191).
+    /// Borrowed from startup cfg; restart-only (warns on change at reload).
     approval_escalation_webhook: []const u8,
     /// Approval TTL in milliseconds. cfg snapshot.
     approval_ttl_ms: i64,
     /// Max concurrent pending approval requests per identity (0 = unlimited).
     /// cfg snapshot.
     approval_max_pending_per_identity: u32,
-    /// Borrowed from startup cfg; NOT rebound on reload (#191). [transcript_mutex guards appends]
+    /// Borrowed from startup cfg; restart-only (warns on change at reload). [transcript_mutex guards appends]
     transcript_store_path: []const u8,
     /// DNS-based upstream discovery state. Active when
     /// cfg.upstream_dns_discovery_host is non-empty. Owned; self-synchronized;

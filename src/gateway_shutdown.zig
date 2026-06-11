@@ -103,6 +103,16 @@ pub fn hotReloadConfig(
 }
 
 fn applyReloadedRuntimeConfig(cfg: *const edge_config.EdgeConfig, state: *GatewayState) void {
+    // Warn when restart-only path/URL fields differ; they are NOT rebound here.
+    if (!std.mem.eql(u8, state.session_store_path, cfg.session_store_path))
+        state.logger.warn(null, "TARDIGRADE_SESSION_STORE_PATH changed on reload; restart required for new path to take effect (active: '{s}', new: '{s}')", .{ state.session_store_path, cfg.session_store_path });
+    if (!std.mem.eql(u8, state.approval_store_path, cfg.approval_store_path))
+        state.logger.warn(null, "TARDIGRADE_APPROVAL_STORE_PATH changed on reload; restart required for new path to take effect (active: '{s}', new: '{s}')", .{ state.approval_store_path, cfg.approval_store_path });
+    if (!std.mem.eql(u8, state.approval_escalation_webhook, cfg.approval_escalation_webhook))
+        state.logger.warn(null, "TARDIGRADE_APPROVAL_ESCALATION_WEBHOOK changed on reload; restart required for new URL to take effect (active: '{s}', new: '{s}')", .{ state.approval_escalation_webhook, cfg.approval_escalation_webhook });
+    if (!std.mem.eql(u8, state.transcript_store_path, cfg.transcript_store_path))
+        state.logger.warn(null, "TARDIGRADE_TRANSCRIPT_STORE_PATH changed on reload; restart required for new path to take effect (active: '{s}', new: '{s}')", .{ state.transcript_store_path, cfg.transcript_store_path });
+
     state.rate_limiter_mutex.lock();
     if (state.rate_limiter) |*rl| rl.deinit();
     state.rate_limiter = if (cfg.rate_limit_rps > 0)

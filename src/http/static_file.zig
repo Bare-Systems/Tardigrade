@@ -335,7 +335,7 @@ fn resolveExistingCandidate(
     };
 }
 
-fn normalizeRelativePath(allocator: std.mem.Allocator, rel: []const u8) ![]u8 {
+pub fn normalizeRelativePath(allocator: std.mem.Allocator, rel: []const u8) ![]u8 {
     const decoded_buf = try allocator.dupe(u8, std.mem.trimStart(u8, rel, "/"));
     defer allocator.free(decoded_buf);
 
@@ -1021,4 +1021,39 @@ test "serve uses application wasm mime type" {
     var served = result;
     defer served.deinit(allocator);
     try std.testing.expectEqualStrings("application/wasm", served.content_type);
+}
+
+test "fuzz: normalizeRelativePath never produces path traversal outputs" {
+    try std.testing.fuzz({}, fuzzNormalizePath, .{ .corpus = &.{
+        "/normal/path/file.txt",
+        "/../escape",
+        "/foo/../../bar",
+        "/foo/%2e%2e/bar",
+        "%2e%2e/secret",
+        "/foo\\..\\bar",
+        "",
+    } });
+}
+
+fn fuzzNormalizePath(_: void, smith: *std.testing.Smith) !void {
+    const allocator = std.testing.allocator;
+    var buf: [256]u8 = undefined;
+    const len = smith.sliceWeightedBytes(&buf, &.{
+        .value(u8, '/', 5),
+        .value(u8, '.', 4),
+        .rangeAtMost(u8, 'a', 'z', 4),
+        .value(u8, '%', 2),
+        .value(u8, '\\', 1),
+        .rangeAtMost(u8, 0x00, 0x1f, 1), // control characters
+    });
+    const result = normalizeRelativePath(allocator, buf[0..len]) catch return;
+    defer allocator.free(result);
+    // Security invariant: successful output must not contain ".." path segments.
+    var it = std.mem.splitScalar(u8, result, std.Io.Dir.path.sep);
+    while (it.next()) |seg| {
+        if (std.mem.eql(u8, seg, "..")) return error.PathTraversalBypass;
+    }
+    // Output must not begin with a path separator (no absolute paths).
+    if (result.len > 0 and (result[0] == '/' or result[0] == '\\'))
+        return error.AbsolutePathReturned;
 }

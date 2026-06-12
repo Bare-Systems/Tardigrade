@@ -433,3 +433,31 @@ test "parseHeaders rejects aggregate header bytes above total limit" {
     try data.appendSlice(allocator, "\r\n");
     try std.testing.expectError(error.HeadersTooLarge, parseHeaders(allocator, data.items));
 }
+
+test "fuzz: parseHeaders never panics and returned names/values pass validity checks" {
+    try std.testing.fuzz({}, fuzzParseHeaders, .{ .corpus = &.{
+        "Host: example.com\r\nContent-Type: text/html\r\n\r\n",
+        "X-Empty:\r\n\r\n",
+        "\r\n",
+        "",
+    } });
+}
+
+fn fuzzParseHeaders(_: void, smith: *std.testing.Smith) !void {
+    const allocator = std.testing.allocator;
+    var buf: [1024]u8 = undefined;
+    const len = smith.sliceWeightedBytes(&buf, &.{
+        .rangeAtMost(u8, 0x20, 0x7e, 6), // printable ASCII (most likely for real headers)
+        .value(u8, '\r', 3),
+        .value(u8, '\n', 3),
+        .value(u8, ':', 2),
+        .rangeAtMost(u8, 0x00, 0x1f, 1), // control characters
+    });
+    var result = parseHeaders(allocator, buf[0..len]) catch return;
+    defer result.headers.deinit();
+    // Invariant: every successfully parsed header name/value must pass validity checks.
+    for (result.headers.iterator()) |hdr| {
+        if (!isValidHeaderName(hdr.name)) return error.InvalidHeaderNameInOutput;
+        if (!isValidHeaderValue(hdr.value)) return error.InvalidHeaderValueInOutput;
+    }
+}

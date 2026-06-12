@@ -112,3 +112,21 @@ pub fn parseHttpDate(s: []const u8) ?i64 {
     const tm2 = parseTime(time_tok2) orelse return null;
     return toEpochSeconds(year, @as(i32, month), day, @as(i32, tm2.hour), @as(i32, tm2.min), @as(i32, tm2.sec));
 }
+
+test "fuzz: parseHttpDate never panics on arbitrary input" {
+    try std.testing.fuzz({}, fuzzParseHttpDate, .{ .corpus = &.{
+        "Thu, 01 Jan 1970 00:00:00 GMT",
+        "Sunday, 06-Nov-94 08:49:37 GMT",
+        "Sun Nov  6 08:49:37 1994",
+        "",
+    } });
+}
+
+fn fuzzParseHttpDate(_: void, smith: *std.testing.Smith) !void {
+    var buf: [64]u8 = undefined;
+    const len = smith.sliceWeightedBytes(&buf, &.{
+        .rangeAtMost(u8, 0x20, 0x7e, 6), // printable ASCII (most likely for valid date strings)
+        .rangeAtMost(u8, 0x00, 0x1f, 1), // control characters
+    });
+    _ = parseHttpDate(buf[0..len]);
+}

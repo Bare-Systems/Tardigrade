@@ -102,3 +102,24 @@ test "formatContentRange produces correct header value" {
     defer std.testing.allocator.free(hdr);
     try std.testing.expectEqualStrings("bytes 10-19/100", hdr);
 }
+
+test "fuzz: parseSingle never panics and valid results satisfy range invariants" {
+    try std.testing.fuzz({}, fuzzParseSingle, .{ .corpus = &.{
+        "bytes=0-99",
+        "bytes=-128",
+        "bytes=100-",
+        "bytes=0-0",
+        "bytes=0-9,20-29",
+        "",
+    } });
+}
+
+fn fuzzParseSingle(_: void, smith: *std.testing.Smith) !void {
+    var buf: [128]u8 = undefined;
+    const len = smith.slice(&buf);
+    const file_size: usize = smith.value(u32);
+    const result = parseSingle(buf[0..len], file_size) catch return;
+    // Invariant: start must be <= end_inclusive, and both within [0, file_size).
+    try std.testing.expect(result.start <= result.end_inclusive);
+    if (file_size > 0) try std.testing.expect(result.end_inclusive < file_size);
+}

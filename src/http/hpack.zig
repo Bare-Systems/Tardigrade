@@ -462,3 +462,21 @@ test "Decoder accumulates dynamic table across calls" {
     try std.testing.expectEqualStrings("x-hdr", r2.headers[0].name);
     try std.testing.expectEqualStrings("hello", r2.headers[0].value);
 }
+
+test "fuzz: decode never panics on arbitrary HPACK header blocks" {
+    try std.testing.fuzz({}, fuzzHpackDecode, .{ .corpus = &.{
+        "\x82",                                                         // indexed: :method GET (static index 2)
+        "\x82\x86\x84",                                                 // :method GET + :scheme http + :path /
+        "\x82\x86\x84\x41\x0f\x77\x77\x77\x2e\x65\x78\x61\x6d\x70"   // RFC 7541 §C.3.1 first request
+        ++ "\x6c\x65\x2e\x63\x6f\x6d",
+        "",
+    } });
+}
+
+fn fuzzHpackDecode(_: void, smith: *std.testing.Smith) !void {
+    const allocator = std.testing.allocator;
+    var buf: [512]u8 = undefined;
+    const len = smith.slice(&buf);
+    var result = decode(allocator, buf[0..len]) catch return;
+    deinitDecoded(allocator, &result);
+}

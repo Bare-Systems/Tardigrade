@@ -604,3 +604,26 @@ test "chunked body exceeding max body size returns BodyTooLarge" {
     const raw = "POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
     try std.testing.expectError(error.BodyTooLarge, Request.parse(allocator, raw, 3));
 }
+
+test "fuzz: Request.parse never panics on arbitrary HTTP input" {
+    try std.testing.fuzz({}, fuzzRequestParse, .{ .corpus = &.{
+        "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        "POST /api HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nhello",
+        "GET / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+        "",
+    } });
+}
+
+fn fuzzRequestParse(_: void, smith: *std.testing.Smith) !void {
+    const allocator = std.testing.allocator;
+    var buf: [4096]u8 = undefined;
+    const len = smith.sliceWeightedBytes(&buf, &.{
+        .rangeAtMost(u8, 0x20, 0x7e, 6), // printable ASCII
+        .value(u8, '\r', 3),
+        .value(u8, '\n', 3),
+        .value(u8, ':', 1),
+        .rangeAtMost(u8, 0x00, 0x1f, 1), // control characters
+    });
+    var parsed = Request.parse(allocator, buf[0..len], DEFAULT_MAX_BODY_SIZE) catch return;
+    parsed.request.deinit();
+}

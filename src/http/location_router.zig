@@ -314,3 +314,36 @@ test "equal length prefixes keep first configured block" {
     const matched = matchLocation("/api/users", &blocks).?;
     try std.testing.expectEqual(@as(usize, 0), matched.index);
 }
+
+// Static blocks used by the fuzz target below. matchLocation only reads them.
+const fuzz_router_blocks = [_]LocationBlock{
+    .{ .match_type = .exact, .pattern = "/health", .priority = 0, .action = .{ .return_response = .{ .status = 200, .body = "ok" } } },
+    .{ .match_type = .exact, .pattern = "/", .priority = 0, .action = .{ .return_response = .{ .status = 200, .body = "" } } },
+    .{ .match_type = .prefix_priority, .pattern = "/api/", .priority = 10, .action = .{ .proxy_pass = "http://backend" } },
+    .{ .match_type = .prefix, .pattern = "/static/", .priority = 0, .action = .{ .proxy_pass = "http://files" } },
+    .{ .match_type = .prefix, .pattern = "/", .priority = 0, .action = .{ .proxy_pass = "http://fallback" } },
+};
+
+test "fuzz: matchLocation never panics on arbitrary URI input" {
+    try std.testing.fuzz({}, fuzzMatchLocation, .{ .corpus = &.{
+        "/",
+        "/health",
+        "/api/users",
+        "/static/app.js",
+        "/api/../../etc/passwd",
+        "",
+    } });
+}
+
+fn fuzzMatchLocation(_: void, smith: *std.testing.Smith) !void {
+    var buf: [256]u8 = undefined;
+    const len = smith.sliceWeightedBytes(&buf, &.{
+        .value(u8, '/', 5),
+        .rangeAtMost(u8, 'a', 'z', 6),
+        .value(u8, '.', 2),
+        .value(u8, '?', 1),
+        .value(u8, '#', 1),
+        .rangeAtMost(u8, 0x00, 0x1f, 1), // control characters
+    });
+    _ = matchLocation(buf[0..len], &fuzz_router_blocks);
+}

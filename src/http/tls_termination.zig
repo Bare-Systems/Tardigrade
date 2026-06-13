@@ -353,6 +353,12 @@ pub const TlsConnection = struct {
         return if (n > 0) @intCast(n) else 0;
     }
 
+    /// Return the underlying TCP socket fd so callers can apply per-phase
+    /// socket timeouts (SO_RCVTIMEO/SO_SNDTIMEO) without going through OpenSSL.
+    pub fn rawFd(self: *const TlsConnection) std.posix.fd_t {
+        return @intCast(c.SSL_get_fd(self.ssl));
+    }
+
     pub const Writer = struct {
         conn: *TlsConnection,
 

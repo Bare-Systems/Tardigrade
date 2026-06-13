@@ -1337,6 +1337,18 @@ fn streamingRequestBodyFromHead(
     };
 }
 
+fn connRawFd(conn: anytype) ?std.posix.fd_t {
+    const T = @TypeOf(conn);
+    if (comptime std.meta.activeTag(@typeInfo(T)) == .pointer) {
+        const Child = std.meta.Child(T);
+        if (comptime @hasDecl(Child, "rawFd")) return conn.rawFd();
+        if (comptime @hasField(Child, "handle")) return conn.handle;
+    } else {
+        if (comptime @hasField(T, "handle")) return conn.handle;
+    }
+    return null;
+}
+
 fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge_config.EdgeConfig, state: *GatewayState, keep_alive_out: *bool, connection_ip: []const u8, enable_proxy_protocol: bool) !void {
     var keep_alive = false;
     keep_alive_out.* = false;
@@ -1400,6 +1412,17 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
             session.pending_len = 0;
         } else {
             head_parse.request.deinit();
+            // Switch SO_RCVTIMEO from header phase to body read phase.
+            const body_timeout_ms = cfg.request_limits.effectiveBodyTimeout();
+            if (body_timeout_ms > 0) {
+                if (connRawFd(conn)) |fd| {
+                    const write_timeout_ms = if (cfg.downstream_write_timeout_ms > 0)
+                        cfg.downstream_write_timeout_ms
+                    else
+                        cfg.request_limits.effectiveHeaderTimeout();
+                    gconn.setSocketTimeoutMs(fd, body_timeout_ms, write_timeout_ms) catch {};
+                }
+            }
             const total_read = try gconn.readHttpRequest(conn, pending_buf, &session.pending_len);
             if (total_read == 0) return;
             if (cfg.max_connection_memory_bytes > 0 and total_read > cfg.max_connection_memory_bytes) {

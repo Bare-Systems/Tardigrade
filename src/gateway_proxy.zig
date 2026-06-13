@@ -312,8 +312,9 @@ pub fn executeBoundedBufferedHttpProxyRequest(
     attempt_timeout_ms: u32,
     connect_timeout_ms: u32,
     /// If > 0, caps the time from finished request-send to first response byte.
-    /// Only enforced on Unix socket upstreams; std.http.Client does not expose
-    /// per-phase socket timeout control.
+    /// Only enforced on Unix socket upstreams; the TCP path uses std.http.Client
+    /// which does not expose per-phase socket timeout control. attempt_timeout_ms
+    /// and connect_timeout_ms are likewise unenforced on the TCP path.
     response_timeout_ms: u32,
     cancel_token: ?*const CancellationToken,
 ) !BufferedUpstreamResponse {

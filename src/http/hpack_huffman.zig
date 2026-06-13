@@ -445,14 +445,16 @@ test "huffman rejects EOS in stream" {
 }
 
 test "fuzz: decodeAlloc never panics on arbitrary byte sequences" {
-    try std.testing.fuzz({}, fuzzHuffmanDecodeAlloc, .{ .corpus = &.{
-        // RFC 7541 Appendix C: Huffman-encoded "www.example.com"
-        "\xf1\xe3\xc2\xe5\xf2\x3a\x6b\xa0\xab\x90\xf4\xff",
-        // RFC 7541 Appendix C: Huffman-encoded "no-cache"
-        "\xa8\xeb\x10\x64\x9c\xbf",
-        "\xff\xff\xff\xff", // EOS pattern (invalid)
-        "",
-    } });
+    try std.testing.fuzz({}, fuzzHuffmanDecodeAlloc, .{
+        .corpus = &.{
+            // RFC 7541 Appendix C: Huffman-encoded "www.example.com"
+            "\xf1\xe3\xc2\xe5\xf2\x3a\x6b\xa0\xab\x90\xf4\xff",
+            // RFC 7541 Appendix C: Huffman-encoded "no-cache"
+            "\xa8\xeb\x10\x64\x9c\xbf",
+            "\xff\xff\xff\xff", // EOS pattern (invalid)
+            "",
+        },
+    });
 }
 
 fn fuzzHuffmanDecodeAlloc(_: void, smith: *std.testing.Smith) !void {

@@ -449,6 +449,12 @@ fn writeConfigSummary(writer: anytype, resolved_config_path: ?[]const u8, cfg: *
         cfg.request_total_timeout_ms,
         cfg.shutdown_drain_timeout_ms,
     });
+    try writer.print("downstream_timeouts: tls_handshake_ms={d} header_ms={d} body_ms={d} write_ms={d}\n", .{
+        cfg.tls_handshake_timeout_ms,
+        cfg.request_limits.effectiveHeaderTimeout(),
+        cfg.request_limits.effectiveBodyTimeout(),
+        cfg.downstream_write_timeout_ms,
+    });
     try writer.print("upstream_timeouts: attempt_ms={d} connect_ms={d} response_ms={d} budget_ms={d}\n", .{
         cfg.upstream_timeout_ms,
         cfg.upstream_connect_timeout_ms,

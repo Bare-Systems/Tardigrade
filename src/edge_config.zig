@@ -349,6 +349,14 @@ pub const EdgeConfig = struct {
     /// Caps all downstream work (auth, upstream calls, response streaming) for a single request.
     /// Set via TARDIGRADE_REQUEST_TOTAL_TIMEOUT_MS.
     request_total_timeout_ms: u32,
+    /// TLS handshake timeout in milliseconds (TARDIGRADE_TLS_HANDSHAKE_TIMEOUT_MS).
+    /// Applied as SO_RCVTIMEO before SSL_accept to bound slow or stalled clients.
+    /// 0 falls back to keep_alive_timeout_ms. Default: 5000.
+    tls_handshake_timeout_ms: u32,
+    /// Downstream write timeout in milliseconds (TARDIGRADE_DOWNSTREAM_WRITE_TIMEOUT_MS).
+    /// Applied as SO_SNDTIMEO during response writes; distinct from read timeouts.
+    /// 0 = no explicit write deadline. Default: 30000.
+    downstream_write_timeout_ms: u32,
     /// Maximum requests served per client connection (0 = unlimited).
     max_requests_per_connection: u32,
     /// Maximum idle connection sessions cached for reuse.
@@ -913,9 +921,9 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     defer allocator.free(body_timeout_str);
     const body_timeout_ms = std.fmt.parseInt(u32, body_timeout_str, 10) catch 0;
 
-    const header_timeout_str = envOrDefault(allocator, "TARDIGRADE_HEADER_TIMEOUT_MS", "0") catch unreachable;
+    const header_timeout_str = envOrDefault(allocator, "TARDIGRADE_HEADER_TIMEOUT_MS", "10000") catch unreachable;
     defer allocator.free(header_timeout_str);
-    const header_timeout_ms = std.fmt.parseInt(u32, header_timeout_str, 10) catch 0;
+    const header_timeout_ms = std.fmt.parseInt(u32, header_timeout_str, 10) catch 10_000;
 
     // Basic auth
     const raw_basic_hashes = envOrDefault(allocator, "TARDIGRADE_BASIC_AUTH_HASHES", "") catch unreachable;
@@ -1085,6 +1093,8 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     const keep_alive_timeout_ms = std.fmt.parseInt(u32, keep_alive_timeout_str, 10) catch 5000;
 
     const request_total_timeout_ms = parseIntEnv(u32, allocator, "TARDIGRADE_REQUEST_TOTAL_TIMEOUT_MS", 0);
+    const tls_handshake_timeout_ms = parseIntEnv(u32, allocator, "TARDIGRADE_TLS_HANDSHAKE_TIMEOUT_MS", 5_000);
+    const downstream_write_timeout_ms = parseIntEnv(u32, allocator, "TARDIGRADE_DOWNSTREAM_WRITE_TIMEOUT_MS", 30_000);
 
     const max_req_conn_str = envOrDefault(allocator, "TARDIGRADE_MAX_REQUESTS_PER_CONNECTION", "100") catch unreachable;
     defer allocator.free(max_req_conn_str);
@@ -1461,6 +1471,8 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .max_in_flight_requests = max_in_flight_requests,
         .keep_alive_timeout_ms = keep_alive_timeout_ms,
         .request_total_timeout_ms = request_total_timeout_ms,
+        .tls_handshake_timeout_ms = tls_handshake_timeout_ms,
+        .downstream_write_timeout_ms = downstream_write_timeout_ms,
         .max_requests_per_connection = max_requests_per_connection,
         .connection_pool_size = connection_pool_size,
         .max_connection_memory_bytes = max_connection_memory_bytes,
@@ -2480,6 +2492,25 @@ pub fn validate(cfg: *const EdgeConfig) !void {
         std.log.err("config validation failed: TARDIGRADE_PROXY_STREAM_BUFFER_SIZE must be between 1 and 1048576 bytes", .{});
         return error.InvalidConfigValue;
     };
+
+    // Timeout relationship sanity checks — warn only, these are not hard errors
+    // because operators may have intentional unusual configurations.
+    if (cfg.upstream_timeout_budget_ms > 0 and cfg.upstream_timeout_ms > 0 and
+        cfg.upstream_timeout_budget_ms < cfg.upstream_timeout_ms)
+    {
+        std.log.warn("config: TARDIGRADE_UPSTREAM_TIMEOUT_BUDGET_MS ({d}) is less than TARDIGRADE_UPSTREAM_TIMEOUT_MS ({d}); budget expires before a single attempt can complete", .{
+            cfg.upstream_timeout_budget_ms,
+            cfg.upstream_timeout_ms,
+        });
+    }
+    if (cfg.request_total_timeout_ms > 0 and cfg.upstream_timeout_budget_ms > 0 and
+        cfg.request_total_timeout_ms < cfg.upstream_timeout_budget_ms)
+    {
+        std.log.warn("config: TARDIGRADE_REQUEST_TOTAL_TIMEOUT_MS ({d}) is less than TARDIGRADE_UPSTREAM_TIMEOUT_BUDGET_MS ({d}); request deadline fires before upstream budget is exhausted", .{
+            cfg.request_total_timeout_ms,
+            cfg.upstream_timeout_budget_ms,
+        });
+    }
 }
 
 fn validateTlsCertKeyPair(cert_path: []const u8, key_path: []const u8) !void {

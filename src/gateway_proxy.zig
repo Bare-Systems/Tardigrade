@@ -14,6 +14,7 @@ const gs = @import("gateway_state.zig");
 const gph = @import("gateway_proxy_headers.zig");
 const gpres = @import("gateway_proxy_response.zig");
 const gpt = @import("gateway_proxy_target.zig");
+const gconn = @import("gateway_connection.zig");
 
 // Re-export the header-boundary API so existing callers that import from this
 // module continue to work without change.
@@ -471,6 +472,18 @@ pub fn executeBoundedBufferedHttpsMtlsRequest(
     const tcp_stream = try compat.tcpConnectToHost(allocator, host, port);
     defer tcp_stream.close();
 
+    // Apply upstream connect timeout to bound the TLS handshake. The TCP
+    // connect itself is blocking, so this timeout bounds the handshake stall
+    // rather than the TCP SYN. Falls back to upstream_timeout_ms when the
+    // connect-specific timeout is not set.
+    const effective_connect_timeout_ms = if (cfg.upstream_connect_timeout_ms > 0)
+        cfg.upstream_connect_timeout_ms
+    else
+        cfg.upstream_timeout_ms;
+    if (effective_connect_timeout_ms > 0) {
+        gconn.setSocketTimeoutMs(tcp_stream.handle, effective_connect_timeout_ms, effective_connect_timeout_ms) catch {};
+    }
+
     var tls_conn = try http.tls_termination.UpstreamTlsConn.connect(tcp_stream.handle, host, .{
         .skip_verify = !cfg.upstream_tls_verify,
         .ca_bundle_path = cfg.upstream_tls_ca_bundle,
@@ -519,6 +532,16 @@ pub fn executeBoundedBufferedHttpsMtlsRequest(
     }
     try req_writer.writeAll("\r\n");
     if (body.len > 0) try req_writer.writeAll(body);
+
+    // After the TLS handshake, switch to the per-attempt read/write timeout for
+    // request write and response read phases.
+    if (cfg.upstream_timeout_ms > 0) {
+        const resp_timeout_ms = if (cfg.upstream_response_timeout_ms > 0)
+            cfg.upstream_response_timeout_ms
+        else
+            cfg.upstream_timeout_ms;
+        gconn.setSocketTimeoutMs(tcp_stream.handle, resp_timeout_ms, cfg.upstream_timeout_ms) catch {};
+    }
 
     try tls_conn.writeAll(req_aw.written());
 

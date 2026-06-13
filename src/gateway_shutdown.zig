@@ -199,31 +199,28 @@ fn activeHealthProbeThread(task: *HealthProbeTask) void {
     defer cfg_lease.release();
     const cfg = cfg_lease.cfg;
 
-    var probe_client = std.http.Client{ .allocator = allocator, .io = compat.io() };
-    defer probe_client.deinit();
-
     if (cfg.upstream_base_urls.len > 0) {
         for (cfg.upstream_base_urls) |base_url| {
-            probeSingleUpstream(cfg, state, &probe_client, base_url);
+            probeSingleUpstream(cfg, state, base_url);
         }
         for (cfg.upstream_backup_base_urls) |base_url| {
-            probeSingleUpstream(cfg, state, &probe_client, base_url);
+            probeSingleUpstream(cfg, state, base_url);
         }
     } else {
-        probeSingleUpstream(cfg, state, &probe_client, cfg.upstream_base_url);
+        probeSingleUpstream(cfg, state, cfg.upstream_base_url);
     }
 
     for (cfg.upstream_chat_base_urls) |base_url| {
-        probeSingleUpstream(cfg, state, &probe_client, base_url);
+        probeSingleUpstream(cfg, state, base_url);
     }
     for (cfg.upstream_chat_backup_base_urls) |base_url| {
-        probeSingleUpstream(cfg, state, &probe_client, base_url);
+        probeSingleUpstream(cfg, state, base_url);
     }
     for (cfg.upstream_commands_base_urls) |base_url| {
-        probeSingleUpstream(cfg, state, &probe_client, base_url);
+        probeSingleUpstream(cfg, state, base_url);
     }
     for (cfg.upstream_commands_backup_base_urls) |base_url| {
-        probeSingleUpstream(cfg, state, &probe_client, base_url);
+        probeSingleUpstream(cfg, state, base_url);
     }
 
     // Also probe DNS-discovered upstreams when active health checks are enabled.
@@ -236,7 +233,7 @@ fn activeHealthProbeThread(task: *HealthProbeTask) void {
         for (state.dns_discovery.urls.items[0..n], 0..) |url, i| discovered_buf[i] = url;
         state.dns_discovery.mutex.unlock();
         for (discovered_buf[0..n]) |url| {
-            probeSingleUpstream(cfg, state, &probe_client, url);
+            probeSingleUpstream(cfg, state, url);
         }
     }
 
@@ -294,7 +291,7 @@ pub fn runProxyCacheMaintenance(cfg: *const edge_config.EdgeConfig, state: *Gate
     }
 }
 
-fn probeSingleUpstream(cfg: *const edge_config.EdgeConfig, state: *GatewayState, probe_client: *std.http.Client, base_url: []const u8) void {
+fn probeSingleUpstream(cfg: *const edge_config.EdgeConfig, state: *GatewayState, base_url: []const u8) void {
     const health_cfg = activeHealthConfig(cfg, base_url);
     const probe_base = if (unixSocketPathFromEndpoint(base_url) != null) "http://localhost" else base_url;
     const probe_url = http.health_checker.buildProbeUrl(state.allocator, probe_base, health_cfg.path) catch |err| {
@@ -320,34 +317,12 @@ fn probeSingleUpstream(cfg: *const edge_config.EdgeConfig, state: *GatewayState,
         return;
     }
 
-    var header_buf: [4 * 1024]u8 = undefined;
-    var req = probe_client.request(.GET, uri, .{
-        .keep_alive = false,
-    }) catch |err| {
-        state.logger.warn(null, "active health probe open failed for {s}: {}", .{ base_url, err });
+    const status_code = probeTcpHttpUpstream(state.allocator, uri, cfg.upstream_active_health_timeout_ms) catch |err| {
+        state.logger.warn(null, "active health probe tcp request failed for {s}: {}", .{ base_url, err });
         state.recordActiveProbeResult(cfg, base_url, false);
         return;
     };
-    defer req.deinit();
-
-    req.sendBodiless() catch |err| {
-        state.logger.warn(null, "active health probe send failed for {s}: {}", .{ base_url, err });
-        state.recordActiveProbeResult(cfg, base_url, false);
-        return;
-    };
-    var probe_resp = req.receiveHead(&header_buf) catch |err| {
-        state.logger.warn(null, "active health probe wait failed for {s}: {}", .{ base_url, err });
-        state.recordActiveProbeResult(cfg, base_url, false);
-        return;
-    };
-    _ = &probe_resp;
-
-    const status_code: u16 = @intFromEnum(probe_resp.head.status);
-    if (health_cfg.statusIsHealthy(status_code)) {
-        state.recordActiveProbeResult(cfg, base_url, true);
-    } else {
-        state.recordActiveProbeResult(cfg, base_url, false);
-    }
+    state.recordActiveProbeResult(cfg, base_url, health_cfg.statusIsHealthy(status_code));
 }
 
 fn probeUnixSocketUpstream(socket_path: []const u8, uri: std.Uri, timeout_ms: u32) !u16 {
@@ -371,6 +346,47 @@ fn probeUnixSocketUpstream(socket_path: []const u8, uri: std.Uri, timeout_ms: u3
     }
 
     try stream.print("GET {s} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n", .{request_target_buf.items});
+
+    var response_buf: [256]u8 = undefined;
+    var used: usize = 0;
+    while (used < response_buf.len) {
+        const n = try stream.read(response_buf[used..]);
+        if (n == 0) break;
+        used += n;
+        if (std.mem.find(u8, response_buf[0..used], "\r\n")) |line_end| {
+            var parts = std.mem.splitScalar(u8, response_buf[0..line_end], ' ');
+            _ = parts.next() orelse return error.InvalidHttpResponse;
+            const status_str = parts.next() orelse return error.InvalidHttpResponse;
+            return std.fmt.parseInt(u16, status_str, 10);
+        }
+    }
+
+    return error.InvalidHttpResponse;
+}
+
+/// Probe a TCP/HTTP upstream with a bounded timeout, mirroring
+/// probeUnixSocketUpstream but over a regular TCP connection. Uses a raw
+/// socket so we can apply SO_RCVTIMEO and SO_SNDTIMEO before the HTTP
+/// round-trip, preventing hung probes from blocking the health-check batch.
+fn probeTcpHttpUpstream(allocator: std.mem.Allocator, uri: std.Uri, timeout_ms: u32) !u16 {
+    const host = if (uri.host) |h| switch (h) {
+        .raw => |r| r,
+        .percent_encoded => |pe| pe,
+    } else return error.InvalidHttpResponse;
+    const port: u16 = if (uri.port) |p| p else 80;
+
+    var stream = try compat.tcpConnectToHost(allocator, host, port);
+    defer stream.close();
+
+    if (timeout_ms > 0) {
+        try setSocketTimeoutMs(stream.handle, timeout_ms, timeout_ms);
+    }
+
+    const path_raw = switch (uri.path) {
+        .raw => |path| if (path.len > 0) path else "/",
+        .percent_encoded => |path| if (path.len > 0) path else "/",
+    };
+    try stream.print("GET {s} HTTP/1.1\r\nHost: {s}\r\nConnection: close\r\n\r\n", .{ path_raw, host });
 
     var response_buf: [256]u8 = undefined;
     var used: usize = 0;

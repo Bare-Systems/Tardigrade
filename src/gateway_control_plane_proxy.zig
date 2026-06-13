@@ -595,6 +595,11 @@ fn executeBoundedControlPlaneJsonProxyAttempt(
         };
     }
 
+    // NOTE: attempt_timeout_ms is passed to this function but cannot be applied
+    // here because state.upstream_client is a shared std.http.Client that does
+    // not expose per-request socket timeout control. TCP control-plane calls are
+    // unbounded by the timeout policy until this path is replaced with a bounded
+    // manual transport matching the Unix-socket path above.
     var req = try state.upstream_client.request(.POST, uri, .{
         .headers = .{ .content_type = .{ .override = "application/json" } },
         .extra_headers = extra_headers.items,

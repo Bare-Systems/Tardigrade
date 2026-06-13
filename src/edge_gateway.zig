@@ -779,16 +779,6 @@ fn startNewConnection(ctx: *WorkerContext, client_fd: std.posix.fd_t) void {
     var cfg_lease = ctx.acquireConfig();
     defer cfg_lease.release();
     const cfg = cfg_lease.cfg;
-    const idle_timeout_ms = if (cfg.keep_alive_timeout_ms > 0)
-        cfg.keep_alive_timeout_ms
-    else
-        cfg.request_limits.header_timeout_ms;
-    if (idle_timeout_ms > 0) {
-        gconn.setSocketTimeoutMs(client_fd, idle_timeout_ms, idle_timeout_ms) catch |err| {
-            ctx.state.logger.warn(null, "failed to set client socket timeout: {}", .{err});
-        };
-    }
-
     gconn.setNonBlocking(client_fd, false) catch |err| {
         ctx.state.logger.warn(null, "failed to switch client fd to blocking mode: {}", .{err});
         return;
@@ -798,7 +788,25 @@ fn startNewConnection(ctx: *WorkerContext, client_fd: std.posix.fd_t) void {
         ctx.state.logger.warn(null, "failed to set TCP_NODELAY on client fd: {}", .{err});
     };
 
+    // Effective per-phase timeouts used throughout this connection's lifetime.
+    const header_timeout_ms = cfg.request_limits.effectiveHeaderTimeout();
+    const write_timeout_ms = if (cfg.downstream_write_timeout_ms > 0) cfg.downstream_write_timeout_ms else header_timeout_ms;
+
     if (ctx.tls) |tls| {
+        // Apply the TLS handshake timeout before PROXY protocol parsing and
+        // SSL_accept. Falls back to keep_alive_timeout_ms when not explicitly
+        // configured so the old behavior is preserved for operators that haven't
+        // set the new field.
+        const handshake_timeout_ms = if (cfg.tls_handshake_timeout_ms > 0)
+            cfg.tls_handshake_timeout_ms
+        else
+            cfg.keep_alive_timeout_ms;
+        if (handshake_timeout_ms > 0) {
+            gconn.setSocketTimeoutMs(client_fd, handshake_timeout_ms, handshake_timeout_ms) catch |err| {
+                ctx.state.logger.warn(null, "failed to set client handshake timeout: {}", .{err});
+            };
+        }
+
         // Parse PROXY protocol header from the raw TCP socket before SSL_accept.
         // The PROXY header is plaintext even on TLS connections and must be
         // consumed before OpenSSL sees the TLS ClientHello.
@@ -827,6 +835,14 @@ fn startNewConnection(ctx: *WorkerContext, client_fd: std.posix.fd_t) void {
         // teardown defer (or a failed park) frees it exactly once.
         tls_to_park = tls_conn;
 
+        // Handshake complete — switch to request-phase timeouts.
+        // SO_RCVTIMEO covers header/body reads; SO_SNDTIMEO covers response writes.
+        if (header_timeout_ms > 0 or write_timeout_ms > 0) {
+            gconn.setSocketTimeoutMs(client_fd, header_timeout_ms, write_timeout_ms) catch |err| {
+                ctx.state.logger.warn(null, "failed to set post-handshake socket timeout: {}", .{err});
+            };
+        }
+
         if (tls_conn.negotiatedProtocol() == .http2 and cfg.http2_enabled) {
             // HTTP/2 multiplexes many streams over one connection internally and
             // is not parked (out of scope for #138); the teardown defer closes it.
@@ -847,6 +863,13 @@ fn startNewConnection(ctx: *WorkerContext, client_fd: std.posix.fd_t) void {
             .close => return,
         };
     } else {
+        // Plaintext path: apply read and write timeouts immediately (no separate
+        // handshake phase).
+        if (header_timeout_ms > 0 or write_timeout_ms > 0) {
+            gconn.setSocketTimeoutMs(client_fd, header_timeout_ms, write_timeout_ms) catch |err| {
+                ctx.state.logger.warn(null, "failed to set client socket timeout: {}", .{err});
+            };
+        }
         const stream = compat.netStreamFromFd(client_fd);
         var served: u32 = 0;
         while (true) switch (serveOneRequest(ctx, stream, session, connection_ip, &served, true)) {
@@ -1314,6 +1337,18 @@ fn streamingRequestBodyFromHead(
     };
 }
 
+fn connRawFd(conn: anytype) ?std.posix.fd_t {
+    const T = @TypeOf(conn);
+    if (comptime std.meta.activeTag(@typeInfo(T)) == .pointer) {
+        const Child = std.meta.Child(T);
+        if (comptime @hasDecl(Child, "rawFd")) return conn.rawFd();
+        if (comptime @hasField(Child, "handle")) return conn.handle;
+    } else {
+        if (comptime @hasField(T, "handle")) return conn.handle;
+    }
+    return null;
+}
+
 fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge_config.EdgeConfig, state: *GatewayState, keep_alive_out: *bool, connection_ip: []const u8, enable_proxy_protocol: bool) !void {
     var keep_alive = false;
     keep_alive_out.* = false;
@@ -1377,6 +1412,17 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
             session.pending_len = 0;
         } else {
             head_parse.request.deinit();
+            // Switch SO_RCVTIMEO from header phase to body read phase.
+            const body_timeout_ms = cfg.request_limits.effectiveBodyTimeout();
+            if (body_timeout_ms > 0) {
+                if (connRawFd(conn)) |fd| {
+                    const write_timeout_ms = if (cfg.downstream_write_timeout_ms > 0)
+                        cfg.downstream_write_timeout_ms
+                    else
+                        cfg.request_limits.effectiveHeaderTimeout();
+                    gconn.setSocketTimeoutMs(fd, body_timeout_ms, write_timeout_ms) catch {};
+                }
+            }
             const total_read = try gconn.readHttpRequest(conn, pending_buf, &session.pending_len);
             if (total_read == 0) return;
             if (cfg.max_connection_memory_bytes > 0 and total_read > cfg.max_connection_memory_bytes) {

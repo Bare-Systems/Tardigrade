@@ -55,6 +55,16 @@ pub const RequestLimits = struct {
     pub fn effectiveMaxHeadersTotalSize(self: RequestLimits) usize {
         return if (self.max_headers_total_size > 0) self.max_headers_total_size else default.max_headers_total_size;
     }
+
+    /// Effective header read timeout (returns default if 0).
+    pub fn effectiveHeaderTimeout(self: RequestLimits) u32 {
+        return if (self.header_timeout_ms > 0) self.header_timeout_ms else default.header_timeout_ms;
+    }
+
+    /// Effective body read timeout (returns default if 0).
+    pub fn effectiveBodyTimeout(self: RequestLimits) u32 {
+        return if (self.body_timeout_ms > 0) self.body_timeout_ms else default.body_timeout_ms;
+    }
 };
 
 /// Validation result with specific rejection reason.
@@ -309,4 +319,24 @@ test "rejectionMessage formats headers_total_too_large" {
     const msg = rejectionMessage(result, &buf);
     try std.testing.expect(std.mem.find(u8, msg, "65536") != null);
     try std.testing.expect(std.mem.find(u8, msg, "32768") != null);
+}
+
+test "effectiveHeaderTimeout returns configured value when nonzero" {
+    const limits = RequestLimits{ .max_body_size = 0, .max_uri_length = 0, .max_header_count = 0, .max_header_size = 0, .max_headers_total_size = 0, .body_timeout_ms = 0, .header_timeout_ms = 3000 };
+    try std.testing.expectEqual(@as(u32, 3000), limits.effectiveHeaderTimeout());
+}
+
+test "effectiveHeaderTimeout falls back to default when zero" {
+    const limits = RequestLimits{ .max_body_size = 0, .max_uri_length = 0, .max_header_count = 0, .max_header_size = 0, .max_headers_total_size = 0, .body_timeout_ms = 0, .header_timeout_ms = 0 };
+    try std.testing.expectEqual(RequestLimits.default.header_timeout_ms, limits.effectiveHeaderTimeout());
+}
+
+test "effectiveBodyTimeout returns configured value when nonzero" {
+    const limits = RequestLimits{ .max_body_size = 0, .max_uri_length = 0, .max_header_count = 0, .max_header_size = 0, .max_headers_total_size = 0, .body_timeout_ms = 5000, .header_timeout_ms = 0 };
+    try std.testing.expectEqual(@as(u32, 5000), limits.effectiveBodyTimeout());
+}
+
+test "effectiveBodyTimeout falls back to default when zero" {
+    const limits = RequestLimits{ .max_body_size = 0, .max_uri_length = 0, .max_header_count = 0, .max_header_size = 0, .max_headers_total_size = 0, .body_timeout_ms = 0, .header_timeout_ms = 0 };
+    try std.testing.expectEqual(RequestLimits.default.body_timeout_ms, limits.effectiveBodyTimeout());
 }

@@ -4,6 +4,9 @@ All notable user-facing changes to Tardigrade are documented here.
 
 ## [Unreleased]
 
+### Removed
+- **Docker container build removed** — `container.yml` and `Dockerfile` are deleted. Tardigrade is deployed as a native binary; the container image was never used and was burning two CI runners (amd64 + arm64) on every push to `main`. The release pipeline (`release.yml`) continues to produce `tardigrade-linux-x86_64.tar.gz` as a GitHub Release artifact.
+
 ### Fixed
 - **Autoindex directory listing no longer panics with EBADF** — root cause was that `openDir` was called with default `OpenOptions{}` (`.iterate = false`), so the resulting `Dir` handle cannot be iterated on Linux in Zig 0.16's threaded I/O backend; `dirReadLinux` panics with EBADF when iteration is attempted. Fixed by opening with `.{ .iterate = true }`. (A prior partial fix changed `dir.iterate()` to `dir.iterateAssumeFirstIteration()` to avoid the redundant `lseek`, but that alone was not sufficient without the `iterate = true` flag.)
 - **BearClaw fixture startup failures now produce visible diagnostics** — tardigrade was spawned with `.stderr = .ignore`, so any crash or panic before `configureErrorLog` redirected fd 2 to the log file was silently discarded, leaving an empty log and an opaque `error.CurlFailed` in test output. The harness now pre-creates the log file and passes it as the child's initial stderr (`.stderr = .{ .file = early_log_file }`), so all early output (panics, validation errors, OpenSSL failures) lands in the log and is printed on test failure. `configureErrorLog`'s subsequent `dup2` of the same underlying file is a no-op.

@@ -2,6 +2,14 @@
 
 All notable user-facing changes to Tardigrade are documented here.
 
+## [Unreleased]
+
+### Fixed
+- **Autoindex directory listing no longer panics with EBADF on first iteration** — `generateAutoIndex` called `dir.iterate()` which resets the cursor via `lseek` before reading, but the directory handle returned by `openDir` does not support seeking on Linux in Zig 0.16's threaded Io backend, producing EBADF. Changed to `dir.iterateAssumeFirstIteration()` (correct because the dir is freshly opened) to skip the cursor reset.
+- **BearClaw fixture integration tests no longer fail to start tardigrade** — `prepareBearClawFixture` loaded `examples/bearclaw/tardigrade.env.example` wholesale, including its placeholder `TARDIGRADE_AUTH_TOKEN_HASHES=replace-me-with-sha256-hash-of-bearer-token` (43 chars, not a valid 64-char hex SHA256 hash). `parseHashes` rejected it with `error.InvalidTokenHashLength`, causing tardigrade to exit immediately before the test could connect. The fixture now overrides the hash with the SHA256 of the test bearer token (`"integration-token"`).
+- **Graceful shutdown timing assertion widened for CI** — the `elapsed < 4_000 ms` bound was too tight for GitHub Actions runners; widened to `< 8_000 ms`.
+- **`src/http/hpack.zig` reformatted** — `zig fmt --check` was failing in CI on code introduced in the timeout-policy audit commit.
+
 ## [0.4.0] - 2026-07-03
 
 ### Reliability

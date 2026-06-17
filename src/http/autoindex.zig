@@ -28,7 +28,7 @@ pub fn generateAutoIndex(io: std.Io, allocator: std.mem.Allocator, dirPath: []co
     var items = std.ArrayList(DirItem).empty;
     defer items.deinit(allocator);
 
-    var it = dir.iterate();
+    var it = dir.iterateAssumeFirstIteration();
     while (true) {
         const entry = try it.next(io);
         if (entry == null) break;

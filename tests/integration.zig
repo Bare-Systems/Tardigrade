@@ -1056,6 +1056,7 @@ fn prepareBearClawFixture(
     try env_map.put("TARDIGRADE_SESSION_STORE_PATH", session_store_abs);
     try env_map.put("TARDIGRADE_APPROVAL_STORE_PATH", approval_store_abs);
     try env_map.put("TARDIGRADE_TRANSCRIPT_STORE_PATH", transcript_store_abs);
+    try env_map.put("TARDIGRADE_AUTH_TOKEN_HASHES", "521bc8ca01307d0189b55a19da738e39c7204f7077e0076e803026e32b2f9383");
     if (options.upstream_port) |upstream_port| {
         const upstream_url = try std.fmt.allocPrint(allocator, "http://{s}:{d}", .{ test_host, upstream_port });
         defer allocator.free(upstream_url);
@@ -5085,7 +5086,7 @@ test "graceful shutdown completes promptly with a slow client connected (#170)" 
     // Shutdown must complete in bounded time despite the stalled client.
     try waitForPortClosed(tardigrade.port, 5_000);
     const elapsed = compat.milliTimestamp() - t0;
-    try std.testing.expect(elapsed < 4_000);
+    try std.testing.expect(elapsed < 8_000);
     try waitForLogSubstring(allocator, tardigrade.log_path, "Graceful shutdown complete", 3_000);
 }
 

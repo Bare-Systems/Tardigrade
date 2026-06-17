@@ -20,7 +20,7 @@ pub fn generateAutoIndex(io: std.Io, allocator: std.mem.Allocator, dirPath: []co
     for (uriPath) |b| try out.append(allocator, b);
     for ("</h1><hr><pre>\n") |b| try out.append(allocator, b);
 
-    var dir = std.Io.Dir.cwd().openDir(io, dirPath, .{}) catch |err| {
+    var dir = std.Io.Dir.cwd().openDir(io, dirPath, .{ .iterate = true }) catch |err| {
         return err;
     };
     defer dir.close(io);

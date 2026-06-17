@@ -877,13 +877,20 @@ const TardigradeProcess = struct {
             try env_map.put(pair.name, pair.value);
         }
 
+        // Pre-create the log file and pass it as the child's initial stderr so
+        // that early startup failures (panics or config errors that occur
+        // before configureErrorLog redirects fd 2) are captured in the log
+        // and visible in test failure output.  configureErrorLog will dup2 the
+        // same file to stderr later, which is a harmless no-op.
+        const early_stderr: ?std.Io.File = std.Io.Dir.createFileAbsolute(compat.io(), log_path, .{ .truncate = true }) catch null;
         const child = try std.process.spawn(compat.io(), .{
             .argv = &argv,
             .environ_map = &env_map,
             .stdin = .ignore,
             .stdout = .ignore,
-            .stderr = .ignore,
+            .stderr = if (early_stderr) |f| .{ .file = f } else .ignore,
         });
+        if (early_stderr) |f| f.close(compat.io());
 
         var proc = TardigradeProcess{
             .allocator = allocator,
@@ -5080,13 +5087,13 @@ test "graceful shutdown completes promptly with a slow client connected (#170)" 
     try slow.writeAll(partial);
     compat.sleepNs(50 * std.time.ns_per_ms);
 
-    const t0 = compat.milliTimestamp();
     tardigrade.sendSignal(std.posix.SIG.TERM);
 
     // Shutdown must complete in bounded time despite the stalled client.
+    // waitForPortClosed is the primary timing gate (5 s); there is no separate
+    // elapsed assertion because clock skew and CI scheduler variance make the
+    // wall-clock measurement unreliable as an assertion.
     try waitForPortClosed(tardigrade.port, 5_000);
-    const elapsed = compat.milliTimestamp() - t0;
-    try std.testing.expect(elapsed < 8_000);
     try waitForLogSubstring(allocator, tardigrade.log_path, "Graceful shutdown complete", 3_000);
 }
 

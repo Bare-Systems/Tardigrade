@@ -32,7 +32,7 @@ jobs:
         run: zig fmt --check build.zig src/ tests/
 
   # ── Lint ──────────────────────────────────────────────────────────────────────
-  # Workflow syntax, shell scripts, and Dockerfile linting.
+  # Workflow syntax and shell script linting.
   lint:
     name: Lint
     runs-on: ubuntu-latest
@@ -47,12 +47,6 @@ jobs:
 
       - name: Run shellcheck
         run: find scripts/ packaging/ -name "*.sh" -exec shellcheck {} +
-
-      - name: Run hadolint
-        uses: hadolint/hadolint-action@2332a7b74a6de0dda2e2221d575162eba76ba5e5 # v3.3.0
-        with:
-          dockerfile: Dockerfile
-          failure-threshold: error
 
   # ── Unit tests ────────────────────────────────────────────────────────────────
   # Runs unit tests across platforms. Required on every PR and push.

@@ -4,7 +4,7 @@ All notable user-facing changes to Tardigrade are documented here.
 
 ## [Unreleased]
 
-## [0.4.2] - 2026-06-18
+## [0.4.3] - 2026-06-18
 
 ### Removed
 - **Docker container build removed** — `container.yml` and `Dockerfile` are deleted. Tardigrade is deployed as a native binary; the container image was never used and was burning two CI runners (amd64 + arm64) on every push to `main`. The release pipeline (`release.yml`) continues to produce `tardigrade-linux-x86_64.tar.gz` as a GitHub Release artifact.

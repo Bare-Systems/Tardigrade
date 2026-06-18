@@ -203,7 +203,9 @@ jobs:
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: ${{ runner.temp }}/publish-release/dist
-          pattern: 'tardigrade*,sbom*'
+          pattern: |
+            tardigrade*
+            sbom*
           merge-multiple: true
 
       - name: Generate checksums
@@ -212,6 +214,7 @@ jobs:
           DIST_DIR: ${{ runner.temp }}/publish-release/dist
         run: |
           set -euo pipefail
+          mkdir -p "$DIST_DIR"
           install -m 0755 scripts/install.sh "$DIST_DIR/install.sh"
           find "$DIST_DIR" -type f \( -name '*.tar.gz' -o -name 'install.sh' \) -print0 | sort -z | xargs -0 sha256sum > "$DIST_DIR/tardigrade-checksums.txt"
 

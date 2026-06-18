@@ -4,6 +4,8 @@ All notable user-facing changes to Tardigrade are documented here.
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-06-18
+
 ### Removed
 - **Docker container build removed** — `container.yml` and `Dockerfile` are deleted. Tardigrade is deployed as a native binary; the container image was never used and was burning two CI runners (amd64 + arm64) on every push to `main`. The release pipeline (`release.yml`) continues to produce `tardigrade-linux-x86_64.tar.gz` as a GitHub Release artifact.
 
@@ -14,6 +16,7 @@ All notable user-facing changes to Tardigrade are documented here.
 - **Graceful shutdown timing assertion removed** — the `elapsed < 8_000 ms` wall-clock assertion after `sendSignal(SIGTERM)` failed intermittently on GitHub Actions because `compat.milliTimestamp()` uses `CLOCK_REALTIME` (adjustable by NTP) and CI scheduler variance inflates elapsed time past the bound. `waitForPortClosed(port, 5_000)` already bounds shutdown time to 5 s and is the authoritative gate; the redundant elapsed check is removed.
 - **BearClaw fixture integration tests no longer fail to start tardigrade** — `prepareBearClawFixture` loaded `examples/bearclaw/tardigrade.env.example` wholesale, including its placeholder `TARDIGRADE_AUTH_TOKEN_HASHES=replace-me-with-sha256-hash-of-bearer-token` (43 chars, not a valid 64-char hex SHA256 hash). `parseHashes` rejected it with `error.InvalidTokenHashLength`, causing tardigrade to exit immediately before the test could connect. The fixture now overrides the hash with the SHA256 of the test bearer token (`"integration-token"`).
 - **`src/http/hpack.zig` reformatted** — `zig fmt --check` was failing in CI on code introduced in the timeout-policy audit commit.
+- **TLS test fixture private keys committed** — `tests/fixtures/tls/*.key` were excluded by the `*.key` glob in `.gitignore`, so CI runners never had the key files. `validateOptionalFile` for `tls_key_path` would fail with `InvalidConfigPath` on every bearclaw fixture test. Negation rules added to `.gitignore` (matching the existing exceptions for `src/http/testdata/`) to track these test-only self-signed keys.
 
 ## [0.4.0] - 2026-07-03
 

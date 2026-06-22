@@ -5264,3 +5264,103 @@ test "static website with binary image assets loads correctly end-to-end and acr
     try std.testing.expectEqual(@as(u16, 200), png_after.status_code);
     try std.testing.expect(std.mem.eql(u8, &png_bytes, png_after.body));
 }
+
+// ---------------------------------------------------------------------------
+// Keepalive worker starvation (#204).
+// ---------------------------------------------------------------------------
+
+test "idle keepalive connections parked off the worker pool do not starve active requests (#204)" {
+    // Before the parking implementation, each idle keepalive connection held a
+    // worker thread blocked in read(). With 2 workers and 4 idle clients only 2
+    // new requests could be served at a time; the rest queued or failed. With
+    // parking, idle connections sit in the event loop and workers are free for
+    // active requests regardless of how many clients are parked.
+    const allocator = std.testing.allocator;
+
+    var fixture = try GenericFixtureDir.create(allocator, "keepalive-starvation");
+    defer fixture.deinit();
+    try fixture.writeRel("public/index.html", "ok\n");
+    const public_abs = try fixture.joinAbs("public");
+    defer allocator.free(public_abs);
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location / {{
+        \\    root {s};
+        \\    try_files $uri /index.html;
+        \\}}
+    , .{public_abs});
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .extra_env = &.{
+            // 2 workers — deliberately fewer than the number of idle connections we'll open.
+            .{ .name = "TARDIGRADE_WORKER_THREADS", .value = "2" },
+            // Long keepalive so parked connections are never reaped during the test.
+            .{ .name = "TARDIGRADE_KEEP_ALIVE_TIMEOUT_MS", .value = "30000" },
+        },
+    });
+    defer tardigrade.stop();
+
+    // Open IDLE_COUNT keepalive connections and park them all.
+    const IDLE_COUNT = 4; // > 2 workers
+    var idle_streams: [IDLE_COUNT]compat.NetStream = undefined;
+    var idle_open: usize = 0;
+    defer {
+        var i: usize = 0;
+        while (i < idle_open) : (i += 1) idle_streams[i].close();
+    }
+
+    for (0..IDLE_COUNT) |i| {
+        idle_streams[i] = try compat.tcpConnectToHost(allocator, test_host, tardigrade.port);
+        idle_open += 1;
+        try setStreamTimeouts(&idle_streams[i], 5_000);
+        // Send one request to establish the keepalive; the connection parks after
+        // the response is written and the worker returns to the pool.
+        try sendKeepAliveGet(&idle_streams[i], allocator, tardigrade.port, "/index.html");
+        var resp = try readHttpResponse(allocator, idle_streams[i]);
+        defer resp.deinit();
+        try std.testing.expectEqual(@as(u16, 200), resp.status_code);
+    }
+
+    // Allow time for all idle connections to complete their park transition
+    // (the worker finishes writing the response, calls repark/event loop arm).
+    compat.sleepNs(150 * std.time.ns_per_ms);
+
+    // Fire ACTIVE_COUNT new requests from independent connections concurrently.
+    // In the old blocking model the 2 workers would be held by the first 2 idle
+    // connections; here all requests must complete successfully.
+    const ACTIVE_COUNT = 4;
+    const ActiveResult = struct { ok: bool = false };
+    var results: [ACTIVE_COUNT]ActiveResult = [_]ActiveResult{.{}} ** ACTIVE_COUNT;
+    const ActiveRunner = struct {
+        fn run(ctx: *ActiveResult, port: u16) void {
+            var resp = sendRequest(std.heap.page_allocator, port, .{
+                .method = "GET",
+                .path = "/index.html",
+                .body = null,
+                .headers = &.{},
+            }) catch return;
+            defer resp.deinit();
+            ctx.ok = resp.status_code == 200;
+        }
+    };
+    var threads: [ACTIVE_COUNT]std.Thread = undefined;
+    for (0..ACTIVE_COUNT) |i| {
+        threads[i] = try std.Thread.spawn(.{}, ActiveRunner.run, .{ &results[i], tardigrade.port });
+    }
+    for (0..ACTIVE_COUNT) |i| threads[i].join();
+
+    for (results) |r| {
+        try std.testing.expect(r.ok);
+    }
+
+    // Parked connections must still serve a follow-up request after the active
+    // burst — confirms the parking/resume cycle is not corrupted by concurrency.
+    for (0..IDLE_COUNT) |i| {
+        try sendKeepAliveGet(&idle_streams[i], allocator, tardigrade.port, "/index.html");
+        var resp = try readHttpResponse(allocator, idle_streams[i]);
+        defer resp.deinit();
+        try std.testing.expectEqual(@as(u16, 200), resp.status_code);
+    }
+}

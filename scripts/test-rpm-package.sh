@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Smoke-test the RPM package.
 #
-# Builds the RPM inside a Rocky Linux 9 container (where rpmbuild macros
-# and systemd-rpm-macros are defined) then installs and exercises it in
-# the same container.
+# Builds the binary from source inside a Rocky Linux 9 container so it links
+# against that platform's glibc (2.34), then builds the RPM and installs it.
+# The host Zig binary (statically linked) is mounted into the container.
 #
 # Usage: ./scripts/test-rpm-package.sh
 
@@ -23,19 +23,37 @@ if ! command -v docker >/dev/null 2>&1; then
     exit 0
 fi
 
+# Locate the Zig binary to mount into the container. Zig's official release
+# binaries are statically linked and run on any Linux regardless of glibc.
+ZIG_BIN="${ZIG_BIN:-$(command -v zig 2>/dev/null || true)}"
+if [[ -z "$ZIG_BIN" ]]; then
+    ZIG_BIN="$(find "${REPO_ROOT}/.zig" -maxdepth 4 -name zig -type f 2>/dev/null | head -1 || true)"
+fi
+if [[ -z "$ZIG_BIN" ]]; then
+    echo "error: zig binary not found; set ZIG_BIN or run scripts/install-zig.sh first" >&2
+    exit 1
+fi
+
 OUTPUT_DIR="${TMPDIR}/dist"
 mkdir -p "$OUTPUT_DIR"
 
 docker run --rm \
     --volume "${REPO_ROOT}:/repo:ro" \
     --volume "${OUTPUT_DIR}:/output" \
+    --volume "${ZIG_BIN}:/usr/local/bin/zig:ro" \
     rockylinux:9 bash -euxc '
-        dnf install -y rpm-build openssl-libs
+        dnf install -y rpm-build openssl-devel openssl-libs
+
+        # Build from source inside this container so the binary links against
+        # Rocky Linux 9'"'"'s glibc (2.34) rather than the CI runner'"'"'s.
+        cp -a /repo /tmp/tardigrade
+        cd /tmp/tardigrade
+        zig build -Doptimize=ReleaseFast
 
         /repo/packaging/rpm/build.sh \
             --version 0.0.0 \
             --arch x86_64 \
-            --binary /repo/zig-out/bin/tardigrade \
+            --binary /tmp/tardigrade/zig-out/bin/tardigrade \
             --output /output
 
         rpm_path=$(find /output -name "tardigrade-*.rpm" | head -1)

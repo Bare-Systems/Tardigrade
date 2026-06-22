@@ -4,6 +4,9 @@ All notable user-facing changes to Tardigrade are documented here.
 
 ## [Unreleased]
 
+### Performance
+- **Zero-copy static file serving via `sendfile(2)` on Linux (#206)** — raw-TCP static responses now bypass the userspace read/write loop and transfer file bytes directly from the file descriptor to the socket inside the kernel. TLS connections continue to use the existing userspace encrypt-and-write path. Portable fallback loop retained for non-Linux platforms. No change in observable HTTP behaviour (headers, status codes, content type, range handling).
+
 ### Internals
 - **Hot-path lock and cache-locality audit (#214)** — added `docs/CONCURRENCY.md` documenting every mutex, atomic, and cache-locality concern in the request hot path. Each lock is classified HOT/WARM/COLD with justification and improvement proposals. Prioritised follow-up items: replace `Metrics` plain-`u64` fields with atomics (removes `metrics_mutex` entirely), atomic round-robin for `upstream_rr_index`, move access-log `write()` outside the lock. Inline `[HOT]` markers and doc comments added to the four hot-path `GatewayState` methods (`metricsRecord`, `rateLimitAllow`, `nextUpstreamBaseUrl`, `metricsRecordLatencyMs`). No runtime changes.
 

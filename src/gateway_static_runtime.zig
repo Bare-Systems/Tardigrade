@@ -2,6 +2,7 @@
 //! location serving, try_files fallback, and static error-page resolution.
 
 const compat = @import("zig_compat.zig");
+const builtin = @import("builtin");
 const std = @import("std");
 const http = @import("http.zig");
 const edge_config = @import("edge_config.zig");
@@ -236,15 +237,21 @@ pub fn writeStaticServedResponse(
         if (@TypeOf(conn) == compat.NetStream) {
             var in_fc = try std.Io.Dir.openFileAbsolute(compat.io(), file_path, .{});
             defer in_fc.close(compat.io());
-            _ = std.c.lseek(in_fc.handle, @intCast(served.file_offset), std.c.SEEK.SET);
-            var remaining: u64 = served.file_len;
-            var xfer_buf: [65536]u8 = undefined;
-            while (remaining > 0) {
-                const to_read: usize = @intCast(@min(xfer_buf.len, remaining));
-                const n = std.c.read(in_fc.handle, &xfer_buf, to_read);
-                if (n <= 0) break;
-                try conn.writeAll(xfer_buf[0..@intCast(n)]);
-                remaining -= @intCast(n);
+            if (conn.inner == null) {
+                // Raw TCP socket: use zero-copy sendfile on Linux, userspace fallback elsewhere.
+                try sendFileFd(conn.handle, in_fc.handle, served.file_offset, served.file_len);
+            } else {
+                // TLS connection: must encrypt bytes through userspace.
+                _ = std.c.lseek(in_fc.handle, @intCast(served.file_offset), std.c.SEEK.SET);
+                var remaining: u64 = served.file_len;
+                var xfer_buf: [65536]u8 = undefined;
+                while (remaining > 0) {
+                    const to_read: usize = @intCast(@min(xfer_buf.len, remaining));
+                    const n = std.c.read(in_fc.handle, &xfer_buf, to_read);
+                    if (n <= 0) break;
+                    try conn.writeAll(xfer_buf[0..@intCast(n)]);
+                    remaining -= @intCast(n);
+                }
             }
             state.logger.debug(correlation_id, "served static file via file-backed path: {s}", .{file_path});
         } else {
@@ -256,6 +263,118 @@ pub fn writeStaticServedResponse(
     }
 
     return @intFromEnum(served.status_code);
+}
+
+/// Transfer `len` bytes from `file_fd` (starting at `offset`) to `sock_fd`.
+///
+/// On Linux the kernel sendfile(2) syscall is used — no userspace copy.
+/// On other platforms a 64 KiB read/write loop is used as a portable fallback.
+fn sendFileFd(sock_fd: std.posix.fd_t, file_fd: std.posix.fd_t, offset: u64, len: u64) !void {
+    if (builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        var off: linux.off_t = @intCast(offset);
+        var remaining: u64 = len;
+        while (remaining > 0) {
+            // Cap each call to 2 GiB - 4 KiB, the kernel's per-call maximum.
+            const to_send: usize = @intCast(@min(remaining, @as(u64, 0x7ffff000)));
+            const rc = linux.sendfile(sock_fd, file_fd, &off, to_send);
+            switch (linux.errno(rc)) {
+                .SUCCESS => {
+                    if (rc == 0) return; // peer closed
+                    remaining -= rc;
+                },
+                .INTR => continue,
+                .AGAIN => continue,
+                else => return error.SendFileFailed,
+            }
+        }
+        return;
+    }
+    // Portable fallback: read into a stack buffer then write to the socket.
+    _ = std.c.lseek(file_fd, @intCast(offset), std.c.SEEK.SET);
+    var remaining: u64 = len;
+    var xfer_buf: [65536]u8 = undefined;
+    while (remaining > 0) {
+        const to_read: usize = @intCast(@min(xfer_buf.len, remaining));
+        const n = std.c.read(file_fd, &xfer_buf, to_read);
+        if (n <= 0) break;
+        var pos: usize = 0;
+        const n_usize: usize = @intCast(n);
+        while (pos < n_usize) {
+            const w = std.c.write(sock_fd, xfer_buf[pos..].ptr, n_usize - pos);
+            if (w <= 0) return error.WriteFailed;
+            pos += @intCast(w);
+        }
+        remaining -= @intCast(n);
+    }
+}
+
+test "sendFileFd: transfers file bytes via kernel sendfile on Linux" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const data = "hello sendfile world";
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "sf_test.txt", .data = data });
+    const file_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, "sf_test.txt");
+    defer allocator.free(file_path);
+
+    const file_path_z = try std.mem.concatWithSentinel(allocator, u8, &.{file_path}, 0);
+    defer allocator.free(file_path_z);
+    const file_fd = std.c.open(file_path_z, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    if (file_fd < 0) return error.FileOpenFailed;
+    defer _ = std.c.close(file_fd);
+
+    const linux = std.os.linux;
+    var sv: [2]std.posix.fd_t = undefined;
+    const rc = linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM, 0, &sv);
+    if (linux.errno(rc) != .SUCCESS) return error.SocketPairFailed;
+    defer _ = std.c.close(sv[0]);
+    defer _ = std.c.close(sv[1]);
+
+    try sendFileFd(sv[0], file_fd, 0, data.len);
+
+    // Shut down the write side so the reader sees EOF after the payload.
+    _ = linux.shutdown(sv[0], linux.SHUT.WR);
+
+    var buf: [64]u8 = undefined;
+    const n = std.c.read(sv[1], &buf, buf.len);
+    try std.testing.expect(n > 0);
+    try std.testing.expectEqualStrings(data, buf[0..@intCast(n)]);
+}
+
+test "sendFileFd: transfers file bytes via fallback loop on non-Linux" {
+    if (builtin.os.tag == .linux) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const data = "hello fallback world";
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "fb_test.txt", .data = data });
+    const file_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, "fb_test.txt");
+    defer allocator.free(file_path);
+
+    const file_path_z = try std.mem.concatWithSentinel(allocator, u8, &.{file_path}, 0);
+    defer allocator.free(file_path_z);
+    const file_fd = std.c.open(file_path_z, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    if (file_fd < 0) return error.FileOpenFailed;
+    defer _ = std.c.close(file_fd);
+
+    var fds: [2]std.posix.fd_t = undefined;
+    try std.posix.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds);
+    defer std.posix.close(fds[0]);
+    defer std.posix.close(fds[1]);
+
+    try sendFileFd(fds[0], file_fd, 0, data.len);
+    try std.posix.shutdown(fds[0], .send);
+
+    var buf: [64]u8 = undefined;
+    const n = std.c.read(fds[1], &buf, buf.len);
+    try std.testing.expect(n > 0);
+    try std.testing.expectEqualStrings(data, buf[0..@intCast(n)]);
 }
 
 test "serveTryFilesFallback: top-level root without try_files defaults to $uri" {

@@ -128,6 +128,7 @@ fn parseCliCommand(args: []const []const u8) !CliCommand {
     }
     if (std.mem.eql(u8, first, "version")) return .version;
     if (std.mem.eql(u8, first, "run")) return try parseRunCommand(args[1..]);
+    if (std.mem.eql(u8, first, "check")) return try parseCheckCommand(args[1..]);
     if (std.mem.eql(u8, first, "validate")) return try parseValidateCommand(args[1..]);
     if (std.mem.eql(u8, first, "status")) return try parseSignalCommand(.status, args[1..]);
     if (std.mem.eql(u8, first, "print-config")) return try parsePrintConfigCommand(args[1..]);
@@ -136,6 +137,7 @@ fn parseCliCommand(args: []const []const u8) !CliCommand {
     if (std.mem.eql(u8, first, "config")) {
         if (args.len >= 2 and std.mem.eql(u8, args[1], "init")) return try parseConfigInitCommand(args[2..]);
         if (args.len >= 2 and std.mem.eql(u8, args[1], "print")) return try parsePrintConfigCommand(args[2..]);
+        if (args.len >= 2 and std.mem.eql(u8, args[1], "validate")) return try parseCheckCommand(args[2..]);
         return error.InvalidCommand;
     }
 
@@ -192,6 +194,28 @@ fn parseValidateCommand(args: []const []const u8) !CliCommand {
             if (idx + 1 >= args.len) return error.MissingOptionValue;
             options.config_path = args[idx + 1];
             idx += 1;
+            continue;
+        }
+        return error.UnknownOption;
+    }
+    return .{ .validate = options };
+}
+
+fn parseCheckCommand(args: []const []const u8) !CliCommand {
+    var options = CommonOptions{};
+    var idx: usize = 0;
+    while (idx < args.len) : (idx += 1) {
+        const arg = args[idx];
+        if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) return .help;
+        if (std.mem.eql(u8, arg, "-c") or std.mem.eql(u8, arg, "--config")) {
+            if (idx + 1 >= args.len) return error.MissingOptionValue;
+            options.config_path = args[idx + 1];
+            idx += 1;
+            continue;
+        }
+        if (!std.mem.startsWith(u8, arg, "-")) {
+            if (options.config_path != null) return error.TooManyArguments;
+            options.config_path = arg;
             continue;
         }
         return error.UnknownOption;
@@ -274,6 +298,7 @@ fn parseConfigInitCommand(args: []const []const u8) !CliCommand {
 fn printUsage(writer: anytype) !void {
     try writer.writeAll(
         \\Usage:
+        \\  tardigrade check [<config>]
         \\  tardigrade run [-c <path>] [--daemon]
         \\  tardigrade validate [-c <path>]
         \\  tardigrade status [-c <path>] [--pid-file <path> | --pid <pid>]
@@ -283,8 +308,12 @@ fn printUsage(writer: anytype) !void {
         \\  tardigrade version
         \\  tardigrade config init [<path>] [--force | --stdout]
         \\  tardigrade config print [-c <path>]
+        \\  tardigrade config validate [<config>]
         \\
         \\Notes:
+        \\  - `check [<config>]` validates a config file without starting the server.
+        \\    Accepts a positional config path or defaults to the standard search path.
+        \\    `config validate [<config>]` is a verbose alias for the same command.
         \\  - Legacy `--validate-config` remains supported.
         \\  - `status` reports process state when a pid target is available.
         \\  - `print-config` prints the effective operator-facing config summary.
@@ -1056,4 +1085,48 @@ test "writeStarterConfig returns error if file exists and force is false" {
     defer std.testing.allocator.free(out_path);
 
     try std.testing.expectError(error.PathAlreadyExists, writeStarterConfig(.{ .output_path = out_path, .stdout = false }));
+}
+
+test "parseCliCommand check with no args returns validate" {
+    const cmd = try parseCliCommand(&.{"check"});
+    switch (cmd) {
+        .validate => |options| try std.testing.expectEqual(@as(?[]const u8, null), options.config_path),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parseCliCommand check with positional config path" {
+    const cmd = try parseCliCommand(&.{ "check", "my.conf" });
+    switch (cmd) {
+        .validate => |options| try std.testing.expectEqualStrings("my.conf", options.config_path.?),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parseCliCommand check with -c flag" {
+    const cmd = try parseCliCommand(&.{ "check", "-c", "my.conf" });
+    switch (cmd) {
+        .validate => |options| try std.testing.expectEqualStrings("my.conf", options.config_path.?),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parseCliCommand check rejects multiple positional args" {
+    try std.testing.expectError(error.TooManyArguments, parseCliCommand(&.{ "check", "a.conf", "b.conf" }));
+}
+
+test "parseCliCommand config validate with no args returns validate" {
+    const cmd = try parseCliCommand(&.{ "config", "validate" });
+    switch (cmd) {
+        .validate => |options| try std.testing.expectEqual(@as(?[]const u8, null), options.config_path),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parseCliCommand config validate with positional config path" {
+    const cmd = try parseCliCommand(&.{ "config", "validate", "tardigrade.conf" });
+    switch (cmd) {
+        .validate => |options| try std.testing.expectEqualStrings("tardigrade.conf", options.config_path.?),
+        else => return error.TestUnexpectedResult,
+    }
 }

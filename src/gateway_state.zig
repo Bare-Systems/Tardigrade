@@ -362,18 +362,33 @@ fn deinitMuxResumeState(allocator: std.mem.Allocator, saved_state: *MuxResumeSta
 pub const GatewayState = struct {
     allocator: std.mem.Allocator,
     // --- Synchronization primitives (see the struct doc comment for the full
-    // mutex → field map). Each guards the fields named alongside it. ---
+    // mutex → field map, and docs/CONCURRENCY.md for hot-path classification
+    // and improvement proposals). Each guards the fields named alongside it.
+    //
+    // HOT-PATH mutexes (taken on every request — see docs/CONCURRENCY.md #214):
+    //   metrics_mutex      — taken once per response; candidate for atomic counters
+    //   rate_limiter_mutex — taken once per request when rate limiting enabled
+    //   upstream_mutex     — taken once per proxied request for LB selection
+    //   circuit_mutex      — taken once per proxied request when CB enabled
+    //
+    // WARM-PATH mutexes (taken per connection, not per request on keepalive):
+    //   connection_mutex
+    //
+    // COLD-PATH mutexes (feature-specific or control-plane only):
+    //   idempotency_mutex, proxy_cache_mutex, session_mutex, transcript_mutex,
+    //   command_mutex, approval_mutex, runtime_mutex
+    // ---
     connection_mutex: compat.Mutex = .{}, // connection accounting + fastcgi/mux-sub maps
-    rate_limiter_mutex: compat.Mutex = .{}, // rate_limiter
+    rate_limiter_mutex: compat.Mutex = .{}, // [HOT] rate_limiter
     idempotency_mutex: compat.Mutex = .{}, // idempotency_store
     proxy_cache_mutex: compat.Mutex = .{}, // proxy_cache_store + proxy_cache_locks + path/ttl
     session_mutex: compat.Mutex = .{}, // session_store
     transcript_mutex: compat.Mutex = .{}, // transcript file appends
     command_mutex: compat.Mutex = .{}, // command_lifecycle
     approval_mutex: compat.Mutex = .{}, // approvals + pending-per-identity count
-    circuit_mutex: compat.Mutex = .{}, // circuit_breaker
-    metrics_mutex: compat.Mutex = .{}, // metrics
-    upstream_mutex: compat.Mutex = .{}, // upstream_health/active_requests + LB selection state
+    circuit_mutex: compat.Mutex = .{}, // [HOT] circuit_breaker
+    metrics_mutex: compat.Mutex = .{}, // [HOT] metrics — priority candidate for atomic counters
+    upstream_mutex: compat.Mutex = .{}, // [HOT] upstream_health/active_requests + LB selection state
     runtime_mutex: compat.Mutex = .{}, // mux_resume_state + reload-time config rebinding
     rate_limiter: ?http.rate_limiter.RateLimiter, // owned; rebuilt on reload [rate_limiter_mutex]
     idempotency_store: ?http.idempotency.IdempotencyStore, // owned [idempotency_mutex]
@@ -733,6 +748,8 @@ pub const GatewayState = struct {
         _ = self.in_flight_requests.fetchSub(1, .acq_rel);
     }
 
+    /// HOT PATH: taken once per request when rate limiting is enabled.
+    /// See docs/CONCURRENCY.md §5 for improvement proposals (shard the map).
     pub fn rateLimitAllow(self: *GatewayState, descriptor: []const u8) bool {
         self.rate_limiter_mutex.lock();
         defer self.rate_limiter_mutex.unlock();
@@ -1332,6 +1349,8 @@ pub const GatewayState = struct {
         return self.circuit_breaker.stateName();
     }
 
+    /// HOT PATH: taken once per completed response (every request).
+    /// Priority candidate for removal — see docs/CONCURRENCY.md §2.
     pub fn metricsRecord(self: *GatewayState, status: u16) void {
         self.metrics_mutex.lock();
         defer self.metrics_mutex.unlock();
@@ -1486,6 +1505,8 @@ pub const GatewayState = struct {
         return combined.toOwnedSlice();
     }
 
+    /// HOT PATH (proxy mode): taken once per proxied request for LB selection.
+    /// See docs/CONCURRENCY.md §6 — upstream_rr_index is a candidate for atomic CAS.
     pub fn nextUpstreamBaseUrl(self: *GatewayState, cfg: *const edge_config.EdgeConfig, pool: UpstreamPoolView, client_ip: []const u8, hash_key: []const u8) []const u8 {
         self.upstream_mutex.lock();
         defer self.upstream_mutex.unlock();

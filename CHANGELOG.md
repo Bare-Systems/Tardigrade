@@ -4,6 +4,9 @@ All notable user-facing changes to Tardigrade are documented here.
 
 ## [Unreleased]
 
+### Reliability
+- **Idle keepalive connections no longer occupy worker threads (#204)** — added an integration test proving that a pool of idle keepalive clients parked off the worker pool does not starve concurrent active requests. The test starts Tardigrade with 2 workers, parks 4 idle keepalive connections (2× the worker count), then fires 4 concurrent active requests from fresh connections and asserts all return 200 OK. Under the old blocking model the idle holders would have exhausted the worker pool. Added a `keepalive-starvation` k6 benchmark scenario (`benchmarks/scenarios/keepalive-starvation.js`) that runs idle-holder VUs alongside an active-burst group and reports `p(99)` / `p(99.9)` latency of the burst path as the starvation signal.
+
 ## [0.4.4] - 2026-06-18
 
 ### Removed

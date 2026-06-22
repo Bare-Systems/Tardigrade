@@ -49,6 +49,7 @@
 #   static-http3        Static file serving over HTTP/3 (requires h2load with QUIC + --tls)
 #   proxy-http3         Reverse proxy over HTTP/3 (requires h2load with QUIC + --tls)
 #   keepalive           Keep-alive connection reuse
+#   keepalive-starvation  Idle keepalive holders + active burst — measures worker starvation (#204)
 #   proxy-payload-64k   Reverse proxy 64 KiB payload transfer
 #   proxy-payload-256k  Reverse proxy 256 KiB payload transfer
 #   proxy-payload-1m    Reverse proxy 1 MiB payload transfer
@@ -801,6 +802,20 @@ scenario_keepalive() {
     run_scenario "${BASE_URL}${KEEPALIVE_PATH}" "keepalive"
 }
 
+scenario_keepalive_starvation() {
+    echo "==> keepalive-starvation: idle keepalive holders + active burst — worker starvation probe (#204)"
+    if [[ "$TOOL" != "k6" ]]; then
+        echo "  Skipping — keepalive-starvation scenario requires k6"
+        return 0
+    fi
+    run_k6_scenario "keepalive-starvation" "keepalive-starvation" \
+        -e "K6_TARGET_PATH=${KEEPALIVE_PATH}" \
+        -e "IDLE_VUS=${KEEPALIVE_STARVATION_IDLE_VUS:-20}" \
+        -e "ACTIVE_VUS=${KEEPALIVE_STARVATION_ACTIVE_VUS:-10}" \
+        -e "IDLE_SLEEP_S=${KEEPALIVE_STARVATION_IDLE_SLEEP_S:-10}" \
+        -e "K6_DURATION=${DURATION}s"
+}
+
 scenario_proxy_payload_64k() {
     echo "==> proxy-payload-64k: reverse proxy 64 KiB payload (${PROXY_PAYLOAD_64K_PATH})"
     run_scenario "${BASE_URL}${PROXY_PAYLOAD_64K_PATH}" "proxy-payload-64k"
@@ -917,6 +932,7 @@ for scenario in "${SCENARIO_LIST[@]}"; do
         static-http3)       scenario_static_http3 ;;
         proxy-http3)        scenario_proxy_http3 ;;
         keepalive)          scenario_keepalive ;;
+        keepalive-starvation) scenario_keepalive_starvation ;;
         proxy-payload-64k)  scenario_proxy_payload_64k ;;
         proxy-payload-256k) scenario_proxy_payload_256k ;;
         proxy-payload-1m)   scenario_proxy_payload_1m ;;

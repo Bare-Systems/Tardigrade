@@ -26,9 +26,15 @@ const builtin = @import("builtin");
 const std = @import("std");
 
 pub const HandlerFn = *const fn (ctx: *anyopaque, fd: std.posix.fd_t) void;
+pub const WaitCallbackFn = *const fn (ctx: *anyopaque, wait_ns: i64) void;
+
+const QueueEntry = struct {
+    fd: std.posix.fd_t,
+    enqueued_ns: i128,
+};
 
 const WorkerQueue = struct {
-    items: std.Deque(std.posix.fd_t),
+    items: std.Deque(QueueEntry),
 };
 
 pub const WorkerPool = struct {
@@ -56,6 +62,10 @@ pub const WorkerPool = struct {
     /// Maximum items allowed in any single worker's local queue (0 = no per-worker limit).
     /// When the least-loaded worker queue is at this depth, new submissions return QueueFull.
     max_per_worker_queue_len: usize = 0,
+    /// Optional callback invoked after a connection is dispatched from the queue.
+    /// Receives the time the entry spent waiting in nanoseconds.
+    wait_callback: ?WaitCallbackFn = null,
+    wait_callback_ctx: ?*anyopaque = null,
 
     pub fn init(
         self: *WorkerPool,
@@ -113,6 +123,11 @@ pub const WorkerPool = struct {
         }
     }
 
+    pub fn setWaitCallback(self: *WorkerPool, cb: WaitCallbackFn, ctx: *anyopaque) void {
+        self.wait_callback = cb;
+        self.wait_callback_ctx = ctx;
+    }
+
     pub fn deinit(self: *WorkerPool) void {
         _ = self.shutdownAndJoin(30_000);
         if (!builtin.single_threaded) {
@@ -141,7 +156,10 @@ pub const WorkerPool = struct {
         if (self.max_per_worker_queue_len > 0 and
             self.worker_queues[queue_index].items.len >= self.max_per_worker_queue_len)
             return error.QueueFull;
-        try self.worker_queues[queue_index].items.pushBack(self.allocator, fd);
+        try self.worker_queues[queue_index].items.pushBack(self.allocator, .{
+            .fd = fd,
+            .enqueued_ns = compat.nanoTimestamp(),
+        });
         self.queued_jobs += 1;
         if (self.worker_queues.len > 0) {
             self.next_queue = (queue_index + 1) % self.worker_queues.len;
@@ -203,8 +221,8 @@ pub const WorkerPool = struct {
         if (drain_timeout_ms == 0) {
             // Immediate: close queued fds without waiting (configured no-drain).
             for (self.worker_queues) |*wq| {
-                while (wq.items.popFront()) |fd| {
-                    _ = std.c.close(fd);
+                while (wq.items.popFront()) |entry| {
+                    _ = std.c.close(entry.fd);
                     result.forced_closes += 1;
                 }
             }
@@ -218,8 +236,8 @@ pub const WorkerPool = struct {
                     // Timeout: force-close remaining queued fds.
                     result.timed_out = true;
                     for (self.worker_queues) |*wq| {
-                        while (wq.items.popFront()) |fd| {
-                            _ = std.c.close(fd);
+                        while (wq.items.popFront()) |entry| {
+                            _ = std.c.close(entry.fd);
                             result.forced_closes += 1;
                         }
                     }
@@ -256,14 +274,23 @@ pub const WorkerPool = struct {
                 return;
             }
 
-            const fd = self.popWorkLocked(worker_index) orelse {
+            const entry = self.popWorkLocked(worker_index) orelse {
                 self.mutex.unlock();
                 continue;
             };
             self.active_jobs += 1;
             self.mutex.unlock();
 
-            self.handler(self.handler_ctx, fd);
+            if (self.wait_callback) |cb| {
+                const dequeued_ns = compat.nanoTimestamp();
+                const wait_ns: i64 = @intCast(@min(
+                    dequeued_ns - entry.enqueued_ns,
+                    std.math.maxInt(i64),
+                ));
+                cb(self.wait_callback_ctx.?, wait_ns);
+            }
+
+            self.handler(self.handler_ctx, entry.fd);
 
             self.mutex.lock();
             self.active_jobs -= 1;
@@ -292,7 +319,7 @@ pub const WorkerPool = struct {
         return best;
     }
 
-    fn popWorkLocked(self: *WorkerPool, worker_index: usize) ?std.posix.fd_t {
+    fn popWorkLocked(self: *WorkerPool, worker_index: usize) ?QueueEntry {
         if (worker_index < self.worker_queues.len) {
             var own = &self.worker_queues[worker_index].items;
             if (own.len > 0) {
@@ -395,9 +422,9 @@ test "worker pool queue selection prefers least-loaded worker queue" {
         for (queues) |*q| q.items.deinit(std.testing.allocator);
     }
 
-    try queues[0].items.pushBack(std.testing.allocator, 10);
-    try queues[0].items.pushBack(std.testing.allocator, 11);
-    try queues[1].items.pushBack(std.testing.allocator, 20);
+    try queues[0].items.pushBack(std.testing.allocator, .{ .fd = 10, .enqueued_ns = 0 });
+    try queues[0].items.pushBack(std.testing.allocator, .{ .fd = 11, .enqueued_ns = 0 });
+    try queues[1].items.pushBack(std.testing.allocator, .{ .fd = 20, .enqueued_ns = 0 });
 
     var pool = WorkerPool{
         .allocator = std.testing.allocator,
@@ -448,7 +475,7 @@ test "worker pool popWorkLocked steals from peer queue" {
         for (queues) |*q| q.items.deinit(std.testing.allocator);
     }
 
-    try queues[1].items.pushBack(std.testing.allocator, 42);
+    try queues[1].items.pushBack(std.testing.allocator, .{ .fd = 42, .enqueued_ns = 0 });
 
     var pool = WorkerPool{
         .allocator = std.testing.allocator,
@@ -463,7 +490,7 @@ test "worker pool popWorkLocked steals from peer queue" {
     };
 
     const stolen = pool.popWorkLocked(0);
-    try std.testing.expectEqual(@as(?std.posix.fd_t, 42), stolen);
+    try std.testing.expectEqual(@as(?QueueEntry, .{ .fd = 42, .enqueued_ns = 0 }), stolen);
     try std.testing.expectEqual(@as(usize, 0), pool.queued_jobs);
 }
 
@@ -581,9 +608,9 @@ test "shutdownAndJoin counts queued connections force-closed (#170)" {
     for (queues) |*q| q.* = .{ .items = .empty };
     defer for (queues) |*q| q.items.deinit(std.testing.allocator);
 
-    try queues[0].items.pushBack(std.testing.allocator, 90001);
-    try queues[0].items.pushBack(std.testing.allocator, 90002);
-    try queues[1].items.pushBack(std.testing.allocator, 90003);
+    try queues[0].items.pushBack(std.testing.allocator, .{ .fd = 90001, .enqueued_ns = 0 });
+    try queues[0].items.pushBack(std.testing.allocator, .{ .fd = 90002, .enqueued_ns = 0 });
+    try queues[1].items.pushBack(std.testing.allocator, .{ .fd = 90003, .enqueued_ns = 0 });
 
     var pool = WorkerPool{
         .allocator = std.testing.allocator,

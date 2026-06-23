@@ -1441,6 +1441,12 @@ pub const GatewayState = struct {
         self.metrics.setWorkerPoolStats(active_jobs, queued_jobs, worker_threads, queue_capacity);
     }
 
+    pub fn metricsRecordWorkerQueueWaitNs(self: *GatewayState, wait_ns: i64) void {
+        self.metrics_mutex.lock();
+        defer self.metrics_mutex.unlock();
+        self.metrics.recordWorkerQueueWaitNs(wait_ns);
+    }
+
     pub fn metricsToJson(self: *GatewayState, allocator: std.mem.Allocator) ![]u8 {
         const mux_snapshot = try self.muxMetricsSnapshot(allocator);
         defer deinitMuxMetricsSnapshot(allocator, mux_snapshot.device_counts);

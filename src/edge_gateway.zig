@@ -330,6 +330,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         &worker_ctx,
     );
     defer worker_pool.deinit();
+    worker_pool.setWaitCallback(workerQueueWaitCallback, &state);
     state.metricsSetWorkerPoolStats(0, 0, worker_count, cfg.worker_queue_size);
 
     state.logger.info(null, "Tardigrade edge listening on {s}:{d}", .{ cfg.listen_host, cfg.listen_port });
@@ -669,6 +670,11 @@ fn applyRuntimeIdentity(cfg: *const edge_config.EdgeConfig, logger: *const http.
     if (cfg.require_unprivileged_user and c.getuid() == 0) {
         return error.RunningAsRoot;
     }
+}
+
+fn workerQueueWaitCallback(raw_ctx: *anyopaque, wait_ns: i64) void {
+    const state: *GatewayState = @ptrCast(@alignCast(raw_ctx));
+    state.metricsRecordWorkerQueueWaitNs(wait_ns);
 }
 
 fn handleAcceptedClient(raw_ctx: *anyopaque, client_fd: std.posix.fd_t) void {

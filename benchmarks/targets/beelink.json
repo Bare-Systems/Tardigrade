@@ -1,0 +1,28 @@
+{
+  "environment_name": "beelink-benchmark",
+  "canonical_target": "Beelink Mini PC — 4-core Debian LXC (isolated benchmark instance)",
+  "preferred_driver": "wrk on the Beelink against 127.0.0.1",
+  "driver_notes": "Run wrk on the same host as Tardigrade against loopback. The benchmark instance runs on a dedicated port that never touches the production Tardigrade process (port 8443). Idle the machine before each run and use --idle-check to gate on load average.",
+  "worker_count": 4,
+  "config_label": "beelink release-baseline config",
+  "policy": "Canonical performance numbers for Tardigrade. All published req/s and latency figures are captured here. Use --runs 3 minimum for release baselines to catch measurement noise. Compare each release against the previous saved baseline JSON.",
+  "hardware": {
+    "host": "beelink",
+    "cpu": "Intel N100 (4 cores, no hyperthreading)",
+    "memory_gb": 16,
+    "os": "Debian 12 LXC container on Proxmox",
+    "scheduler": "CFS (Linux real scheduler; macOS QoS does not apply)"
+  },
+  "routes": {
+    "static": "/health",
+    "proxy": "/proxy/health",
+    "proxy_payload_64k": "/proxy/payload-64k.bin",
+    "proxy_payload_256k": "/proxy/payload-256k.bin",
+    "proxy_payload_1m": "/proxy/payload-1m.bin"
+  },
+  "notes": [
+    "Results from a macOS laptop are not comparable — macOS cores are faster and the QoS scheduler produces different tail latencies.",
+    "A periodic top/ps sampler co-scheduled with wrk collapsed throughput ~5× in early experiments; use --pid-file or --pid to let the harness sample instead.",
+    "Use --runs 3 for release baselines and inspect rps_stddev; a stddev > 10% of rps_mean suggests load contamination."
+  ]
+}

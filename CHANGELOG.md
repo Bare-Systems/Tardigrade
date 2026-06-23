@@ -4,6 +4,13 @@ All notable user-facing changes to Tardigrade are documented here.
 
 ## [Unreleased]
 
+### Fixed
+- **h2load `errors` parser bug in benchmark runner** — `benchmarks/run.sh` now extracts `failed: N` specifically (was `grep "failed" | head -1`, which matched the `requests: N, ..., failed: 0` summary line and returned the total request count as the error count). Affects `run_h2load` and `run_h2load_h3`. Baselines captured before this fix have `errors` equal to the total request count, not actual failures.
+
+### Documentation
+- **Benchmark runbook in `benchmarks/README.md`** — added "Homelab benchmark workflow (Beelink)" section documenting the two-call `blink_test` process, the tool setup (h2load required — wrk not TLS-capable), and known h2load quirks (self-signed certs, null p99, errors field history).
+- **Benchmark runbook in `BLINK.md`** — added "Running benchmarks" section with the exact `blink.toml` snippet, step-by-step process, and known limitations.
+
 ## [0.4.5] - 2026-06-23
 
 ### Deploy

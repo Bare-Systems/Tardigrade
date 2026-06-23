@@ -608,7 +608,7 @@ run_h2load() {
     p95=$(extract_h2load_percentile_ms "$raw" "95")
     p99=$(extract_h2load_percentile_ms "$raw" "99")
     p999=$(extract_h2load_percentile_ms "$raw" "99.9")
-    errors=$(echo "$raw" | grep -E "failed" | grep -oE '[0-9]+' | head -1 || echo 0)
+    errors=$(echo "$raw" | grep -oE 'failed: [0-9]+' | grep -oE '[0-9]+' | head -1 || echo 0)
     rps=${rps:-0}; errors=${errors:-0}
     local tput_mbps
     tput_mbps=$(echo "$raw" | grep -E "^finished" | grep -oE '[0-9.]+[KMG]B/s' | awk '{
@@ -654,7 +654,7 @@ run_h2load_h3() {
     p95=$(extract_h2load_percentile_ms "$raw" "95")
     p99=$(extract_h2load_percentile_ms "$raw" "99")
     p999=$(extract_h2load_percentile_ms "$raw" "99.9")
-    errors=$(echo "$raw" | grep -E "failed" | grep -oE '[0-9]+' | head -1 || echo 0)
+    errors=$(echo "$raw" | grep -oE 'failed: [0-9]+' | grep -oE '[0-9]+' | head -1 || echo 0)
     rps=${rps:-0}; errors=${errors:-0}
     local tput_mbps
     tput_mbps=$(echo "$raw" | grep -E "^finished" | grep -oE '[0-9.]+[KMG]B/s' | awk '{

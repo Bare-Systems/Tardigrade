@@ -284,6 +284,39 @@ The canonical benchmark target is the **Beelink Mini PC** (4-core Debian LXC).
 Use `benchmarks/targets/beelink.json` with `--meta-file` for release baselines.
 See that file for hardware details and recommended flags.
 
+## Homelab benchmark workflow (Beelink)
+
+The Beelink is not directly SSH-accessible from the Mac. All commands run through the Blink MCP server. The recommended flow produces a release baseline in ~15 minutes with two tool calls and a wait.
+
+**Prerequisites (already done as of v0.4.5):**
+- `h2load` (`nghttp2-client 1.64.0`) is installed. `wrk` is present but **not compiled with TLS** — it cannot target the HTTPS-only port 8443.
+- `jq` is installed.
+- `blink.toml` has `benchmark` and `benchmark-collect` tagged test blocks. Because `blink.toml` is gitignored, these must be re-added each session. See `BLINK.md § Running benchmarks` for the exact TOML snippet.
+
+**Workflow:**
+
+```
+# 1. Deploy the release (skip if already running)
+blink_deploy service=tardigrade task=true
+
+# 2. Dispatch benchmark (returns immediately; runs in background on Beelink)
+blink_test service=tardigrade tags=["benchmark"]
+
+# 3. Wait ~10 minutes
+
+# 4. Collect (test "fails" with JSON = run complete; "passes" with "not-ready" = still running)
+blink_test service=tardigrade tags=["benchmark-collect"]
+```
+
+**Saving the baseline:** copy the JSON from the `message` field in the collect result to `benchmarks/baselines/<tag>.json`. The `_meta.tag` will read `"unknown"` (no `.git` in the extracted dir) — correct it to the release tag before committing.
+
+**Known Beelink-specific quirks:**
+
+- `h2load` connects to self-signed certs without `--insecure` (no flag needed or accepted).
+- `p99_ms` will be `null` in all h2load baselines — h2load outputs a CDF table rather than a single p99 value; the run.sh parser does not extract it.
+- The `errors` field was always the total request count in baselines before v0.4.5 (parser bug: `grep "failed"` matched the `requests:` summary line before `failed: 0`). Fixed in the same commit as this note. Expect `errors: 0` in all healthy post-fix runs.
+- h2load baselines (port 8443, HTTPS) are **not comparable** to wrk baselines (port 8069, HTTP). The v0.32.0-18 and earlier baselines used wrk; use the h2load series (v0.4.5+) for trend comparisons going forward.
+
 ## Measurement reliability
 
 A few pitfalls discovered through hard experience (#136):

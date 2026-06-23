@@ -4,6 +4,9 @@ All notable user-facing changes to Tardigrade are documented here.
 
 ## [Unreleased]
 
+### Fixed
+- **RPM smoke test mounts full Zig install directory** — the Rocky Linux container now mounts the host Zig install dir at `/opt/zig` (not just the binary) and installs `systemd-rpm-macros` so `zig build` and RPM spec systemd macros work in CI.
+
 ## [0.4.4] - 2026-06-18
 
 ### Removed

@@ -3,7 +3,7 @@
 #
 # Builds the binary from source inside a Rocky Linux 9 container so it links
 # against that platform's glibc (2.34), then builds the RPM and installs it.
-# The host Zig binary (statically linked) is mounted into the container.
+# The host Zig install directory is mounted into the container.
 #
 # Usage: ./scripts/test-rpm-package.sh
 
@@ -23,8 +23,8 @@ if ! command -v docker >/dev/null 2>&1; then
     exit 0
 fi
 
-# Locate the Zig binary to mount into the container. Zig's official release
-# binaries are statically linked and run on any Linux regardless of glibc.
+# Locate the Zig installation directory to mount into the container.
+# Zig's binary is statically linked, but it still needs its adjacent lib dir.
 ZIG_BIN="${ZIG_BIN:-$(command -v zig 2>/dev/null || true)}"
 if [[ -z "$ZIG_BIN" ]]; then
     ZIG_BIN="$(find "${REPO_ROOT}/.zig" -maxdepth 4 -name zig -type f 2>/dev/null | head -1 || true)"
@@ -34,15 +34,25 @@ if [[ -z "$ZIG_BIN" ]]; then
     exit 1
 fi
 
+ZIG_BIN="$(readlink -f "$ZIG_BIN")"
+ZIG_DIR="$(cd "$(dirname "$ZIG_BIN")" && pwd)"
+
+if [[ ! -x "${ZIG_DIR}/zig" || ! -d "${ZIG_DIR}/lib" ]]; then
+    echo "error: invalid Zig install directory: ${ZIG_DIR}" >&2
+    exit 1
+fi
+
 OUTPUT_DIR="${TMPDIR}/dist"
 mkdir -p "$OUTPUT_DIR"
 
 docker run --rm \
     --volume "${REPO_ROOT}:/repo:ro" \
     --volume "${OUTPUT_DIR}:/output" \
-    --volume "${ZIG_BIN}:/usr/local/bin/zig:ro" \
+    --volume "${ZIG_DIR}:/opt/zig:ro" \
     rockylinux:9 bash -euxc '
-        dnf install -y rpm-build openssl-devel openssl-libs
+        dnf install -y rpm-build openssl-devel openssl-libs systemd-rpm-macros
+
+        export PATH="/opt/zig:${PATH}"
 
         # Build from source inside this container so the binary links against
         # Rocky Linux 9'"'"'s glibc (2.34) rather than the CI runner'"'"'s.

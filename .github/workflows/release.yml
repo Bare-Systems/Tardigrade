@@ -97,8 +97,10 @@ jobs:
         include:
           - os: ubuntu-latest
             archive_name: tardigrade-linux-x86_64
+            zig_target: x86_64-linux-gnu.2.35
           - os: ubuntu-24.04-arm
             archive_name: tardigrade-linux-aarch64
+            zig_target: aarch64-linux-gnu.2.35
 
     steps:
       - name: Checkout
@@ -137,7 +139,8 @@ jobs:
       - name: Build release binary
         env:
           VERSION: ${{ needs.prepare-release.outputs.version }}
-        run: zig build -Doptimize=ReleaseFast "-Dversion=$VERSION"
+          ZIG_TARGET: ${{ matrix.zig_target }}
+        run: zig build -Doptimize=ReleaseFast "-Dtarget=$ZIG_TARGET" "-Dversion=$VERSION"
 
       - name: Package artifact
         env:

@@ -235,24 +235,13 @@ pub fn writeStaticServedResponse(
 
     if (served.file_path) |file_path| {
         if (@TypeOf(conn) == compat.NetStream) {
+            // conn is always a raw plaintext socket here: TLS connections use
+            // *TlsConnection (a different type), which fails the TypeOf check
+            // above and causes static_file.serve to return a body instead of a
+            // file_path. NetStream.inner is therefore always null at this point.
             var in_fc = try std.Io.Dir.openFileAbsolute(compat.io(), file_path, .{});
             defer in_fc.close(compat.io());
-            if (conn.inner == null) {
-                // Raw TCP socket: use zero-copy sendfile on Linux, userspace fallback elsewhere.
-                try sendFileFd(conn.handle, in_fc.handle, served.file_offset, served.file_len);
-            } else {
-                // TLS connection: must encrypt bytes through userspace.
-                _ = std.c.lseek(in_fc.handle, @intCast(served.file_offset), std.c.SEEK.SET);
-                var remaining: u64 = served.file_len;
-                var xfer_buf: [65536]u8 = undefined;
-                while (remaining > 0) {
-                    const to_read: usize = @intCast(@min(xfer_buf.len, remaining));
-                    const n = std.c.read(in_fc.handle, &xfer_buf, to_read);
-                    if (n <= 0) break;
-                    try conn.writeAll(xfer_buf[0..@intCast(n)]);
-                    remaining -= @intCast(n);
-                }
-            }
+            try sendFileFd(conn.handle, in_fc.handle, served.file_offset, served.file_len);
             state.logger.debug(correlation_id, "served static file via file-backed path: {s}", .{file_path});
         } else {
             return error.InvalidStaticTransferState;
@@ -284,7 +273,11 @@ fn sendFileFd(sock_fd: std.posix.fd_t, file_fd: std.posix.fd_t, offset: u64, len
                     remaining -= rc;
                 },
                 .INTR => continue,
-                .AGAIN => continue,
+                // EAGAIN cannot occur on blocking sockets (sockets are switched
+                // to blocking mode in the worker before any I/O — see
+                // edge_gateway.zig setNonBlocking(client_fd, false)). Treat it
+                // as an error rather than spinning silently if that ever changes.
+                .AGAIN => return error.SendFileFailed,
                 else => return error.SendFileFailed,
             }
         }

@@ -1,45 +1,97 @@
 <h1 align="center">Tardigrade</h1>
 
 <p align="center">
-  A small Zig HTTP server and edge gateway for static delivery, reverse proxying,
-  config-driven routing, TLS termination, and operator-friendly reloads.
+  <strong>A small Zig edge server for static file serving, reverse proxying, TLS termination, and operator-friendly reloads.</strong>
+</p>
+
+<p align="center">
+  <a href="https://github.com/Bare-Systems/Tardigrade/releases">Releases</a> |
+  <a href="docs/SUPPORT_MATRIX.md">Support Matrix</a> |
+  <a href="docs/OBSERVABILITY.md">Observability</a> |
+  <a href="SECURITY.md">Security</a> |
+  <a href="CONTRIBUTING.md">Contributing</a>
+</p>
+
+<p align="center">
+  <a href="https://github.com/Bare-Systems/Tardigrade/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/Bare-Systems/Tardigrade/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://github.com/Bare-Systems/Tardigrade/actions/workflows/scorecard.yml"><img alt="OSSF Scorecard" src="https://github.com/Bare-Systems/Tardigrade/actions/workflows/scorecard.yml/badge.svg"></a>
+  <a href="https://github.com/Bare-Systems/Tardigrade/releases"><img alt="GitHub release" src="https://img.shields.io/github/v/release/Bare-Systems/Tardigrade?include_prereleases"></a>
+  <a href="LICENSE"><img alt="License" src="https://img.shields.io/github/license/Bare-Systems/Tardigrade"></a>
 </p>
 
 ---
 
-Tardigrade is an early-stage Zig service runtime for lightweight edge deployments,
-internal platforms, and controlled lab environments.
+### Host-native edge serving in Zig
 
-## Support Status
+Tardigrade is a lightweight HTTP/1.1 server and reverse proxy for deployments
+that want a small native binary, config-driven routing, observable runtime
+behavior, and predictable reloads.
 
-The official Core v1 support contract lives in
-`docs/SUPPORT_MATRIX.md`.
+It is early-stage software with a deliberately narrow stable core. The official
+compatibility promise is documented in the [Core v1 support matrix](docs/SUPPORT_MATRIX.md).
 
-Stable Core v1 currently covers:
+---
 
-- static file serving
-- reverse proxying
-- config-driven routing with `server` and `location` blocks
-- TLS termination
-- config validation, reload, and graceful drain behavior
-- access logging, Prometheus metrics, request limits, rate limiting, and
-  basic upstream health checks
+### Menu
 
-Visible but non-Core-v1 surfaces such as HTTP/2, HTTP/3/QUIC, WebSocket/SSE,
-ACME, FastCGI/uWSGI/SCGI, memcached, and BearClaw-specific auth/session/
-transcript/approval flows are classified separately in the support matrix.
+- [Features](#features)
+- [Install](#install)
+- [Build from source](#build-from-source)
+- [Quick start](#quick-start)
+- [Overview](#overview)
+- [Full documentation](#full-documentation)
+- [Performance](#performance)
+- [Development](#development)
+- [Getting help](#getting-help)
+- [About](#about)
 
-Some protocol and gateway features are still experimental. Prefer the example
-configs, the support matrix, and the integration tests as the source of truth
-when evaluating a specific capability.
+## Features
 
-## Quick Start
+- Static file serving with normalized path handling, range support, cache
+  validation, and symlink escape protection.
+- Reverse proxying with config-driven `location` routing, upstream health checks,
+  retries for safe connection-drop cases, and optional bounded streaming for
+  larger HTTP transfers.
+- TLS termination for the stable HTTP/1.1 edge path.
+- Hot reloads and graceful drain behavior for operator-managed deployments.
+- JSON access logs, request IDs, W3C `traceparent` forwarding, and Prometheus
+  metrics at `/status/metrics` by default.
+- Request limits, rate limiting, security headers, and release-gated security
+  regression tests.
+- A native packaging path with release archives, DEB/RPM package builders,
+  service files, checksums, SBOMs, and provenance attestation.
 
-### Prerequisites
+HTTP/2, HTTP/3/QUIC, WebSocket/SSE, ACME, FastCGI, uWSGI, SCGI, memcached, and
+BearClaw-specific flows exist in-tree, but they are not all part of the stable
+Core v1 contract. Check the [support matrix](docs/SUPPORT_MATRIX.md) before
+depending on a specific surface.
+
+## Install
+
+The fastest way to install the latest release is the official install script:
+
+```bash
+curl -fsSL https://github.com/Bare-Systems/Tardigrade/releases/latest/download/install.sh | sh
+```
+
+The installer downloads the matching Linux release archive (`x86_64` or
+`aarch64`), verifies it against `tardigrade-checksums.txt`, and installs
+`tardigrade` into `$HOME/.local/bin` by default.
+
+Other install paths:
+
+- Download release archives directly from [GitHub Releases](https://github.com/Bare-Systems/Tardigrade/releases).
+- Build from source (see below).
+
+## Build from source
+
+Requirements:
 
 - [Zig](https://ziglang.org/) 0.16.0
+- OpenSSL development libraries on Linux, for example `libssl-dev` on Debian or
+  Ubuntu
 
-### Build and run from source
+For development:
 
 ```bash
 git clone https://github.com/Bare-Systems/Tardigrade.git
@@ -47,169 +99,113 @@ cd Tardigrade
 zig build run
 ```
 
-The default development listener starts on `http://localhost:8069`.
-
-### Install latest release
+For a release-mode binary:
 
 ```bash
-curl -fsSL https://github.com/Bare-Systems/Tardigrade/releases/latest/download/install.sh | sh
+zig build -Doptimize=ReleaseFast
+./zig-out/bin/tardigrade --help
 ```
 
-## Basic Usage
+With explicit version metadata:
 
 ```bash
-./zig-out/bin/tardigrade run
-./zig-out/bin/tardigrade validate -c /etc/tardigrade/tardigrade.conf
-./zig-out/bin/tardigrade status -c /etc/tardigrade/tardigrade.conf
-./zig-out/bin/tardigrade print-config -c /etc/tardigrade/tardigrade.conf
-./zig-out/bin/tardigrade reload -c /etc/tardigrade/tardigrade.conf
-./zig-out/bin/tardigrade stop -c /etc/tardigrade/tardigrade.conf
-./zig-out/bin/tardigrade config init
+zig build -Doptimize=ReleaseFast -Dversion="$(git describe --tags --always)"
 ```
 
-`validate` now prints the resolved config path plus a compact summary of the
-effective listener, pid file, protocol toggles, worker settings, and metrics
-path. `status` reports whether the configured pid is running when a pid or pid
-file is available, and `print-config` prints the same effective-config summary
-without starting the runtime.
+Useful build options are documented in [CONTRIBUTING.md](CONTRIBUTING.md#build-options).
 
-## Minimal Config Example
+## Quick start
+
+Create a small static root:
+
+```bash
+mkdir -p public
+printf '%s\n' '<h1>Hello from Tardigrade</h1>' > public/index.html
+```
+
+Create `tardigrade.conf`:
 
 ```nginx
-listen_port 8069;
+listen 8069;
+server_name localhost;
+
 root ./public;
 try_files $uri /index.html;
-
-location /api/ {
-    proxy_pass http://127.0.0.1:8080;
-}
 
 location = /health {
     return 200 ok;
 }
+
+location /api/ {
+    proxy_pass http://127.0.0.1:8080;
+}
 ```
 
-When proxying, Tardigrade strips hop-by-hop request headers, including headers
-named by the incoming `Connection` header, before forwarding requests upstream.
-Buffered upstream response bodies use a dedicated limit controlled by
-`TARDIGRADE_MAX_BUFFERED_UPSTREAM_RESPONSE_BYTES` (default `262144`), so
-operators can raise proxy payload ceilings without changing inbound request
-parsing limits.
-Streaming proxy mode is available for large HTTP upstream transfers:
-`TARDIGRADE_PROXY_STREAMING_MODE=off|response|full` keeps the default buffered
-behavior, streams upstream responses, or streams both upstream responses and
-eligible fixed-length client request bodies. `TARDIGRADE_PROXY_STREAM_BUFFER_SIZE`
-defaults to `16384` bytes and is capped at 1 MiB. Streaming is used on simple
-single-attempt HTTP proxy routes; Unix-socket upstreams, custom upstream mTLS,
-retry-enabled paths, rewrites, mirrors, and auth subrequests stay on the
-bounded buffered compatibility path.
-When an upstream container is replaced on the same host:port, the first request
-that hits a dead pooled keep-alive socket now evicts that stale connection so
-later requests reconnect cleanly without restarting Tardigrade. If an upstream
-closes an idle keep-alive connection just as Tardigrade reuses it (so the
-response read returns zero bytes), Tardigrade transparently retries the request
-on a fresh connection instead of returning a `502` — the request was never
-delivered, so this is safe for idempotent methods (and for any method when
-`TARDIGRADE_UPSTREAM_RETRY_IDEMPOTENT_ONLY=false`). Proxy requests
-that send an explicit zero-length `POST` body are also forwarded without
-triggering a runtime panic.
-Large buffered proxy responses now preserve the upstream body exactly instead of
-duplicating the first body chunk after the internal 8 KiB response scratch
-buffer fills.
+Build and run:
 
-Static file requests are percent-decoded and normalized before filesystem
-access. Traversal attempts and symlink escapes outside the configured root are
-rejected with `403`.
+```bash
+zig build
+./zig-out/bin/tardigrade run -c ./tardigrade.conf
+```
 
-On plain HTTP connections, static file responses use a file-backed transfer
-path when the OS supports it, while TLS and other transformed response paths
-continue to use the buffered fallback.
+Then open:
 
-When authentication credentials are present, rate limiting keys on the
-authenticated identity before routing. Requests without resolved auth context
-still fall back to client IP rate limiting.
+- `http://localhost:8069/`
+- `http://localhost:8069/health`
 
-Hot reloads now retire superseded configs after in-flight requests drain, so
-repeated `reload` or `SIGHUP` cycles do not retain old config allocations.
+Common CLI commands:
 
-Connection handling is intentionally split: the main thread runs a non-blocking
-accept/event loop, while accepted sockets move onto a bounded worker pool for
-blocking TLS, HTTP parsing, proxying, and response writes. Between requests an
-idle HTTP/1.1 keepalive connection is **parked** off the worker pool — its state
-returns to the event loop and the worker is freed — so idle clients do not
-consume worker capacity and connections far exceeding the worker count stay
-served with a low tail (HTTP/2 connections multiplex internally and are not
-parked). Because of this, `worker_threads` can be sized to CPU count rather than
-to peak concurrent connections. `/status/metrics` exports
-`tardigrade_active_connections`, `tardigrade_worker_active_jobs`,
-`tardigrade_worker_queued_jobs`, `tardigrade_worker_threads`,
-`tardigrade_event_loop_iterations_total`, and the parked-connection gauges
-`tardigrade_keepalive_parked_connections`, `tardigrade_keepalive_resumes_total`,
-`tardigrade_keepalive_timeouts_total`, and `tardigrade_keepalive_closed_total`,
-so operators can see whether load is building at the listener, the worker queue,
-parked keepalive connections, or inside active request work.
+```bash
+./zig-out/bin/tardigrade validate -c ./tardigrade.conf
+./zig-out/bin/tardigrade print-config -c ./tardigrade.conf
+./zig-out/bin/tardigrade status -c ./tardigrade.conf
+./zig-out/bin/tardigrade reload -c ./tardigrade.conf
+./zig-out/bin/tardigrade stop -c ./tardigrade.conf
+./zig-out/bin/tardigrade config init
+```
 
-Tardigrade accepts a safe inbound `X-Request-ID` or legacy
-`X-Correlation-ID`, generates one when neither is valid, echoes both response
-headers, and forwards the same ID upstream. JSON access logs include
-`request_id`, `latency_ms`, `upstream_addr`, `upstream_status`, and
-`response_bytes`.
+## Overview
 
-Prometheus metrics are available on `TARDIGRADE_METRICS_PATH` (default
-`/status/metrics`). Set the path to an empty string to disable the endpoint, or
-set `TARDIGRADE_METRICS_REQUIRE_AUTH=true` to require the configured request
-auth controls before serving metrics. The endpoint now includes a global
-`tardigrade_request_latency_ms` histogram, proxy streaming/buffered counters,
-proxy buffered-byte gauges/counters, proxy abort counters, upstream TTFB summary
-metrics, and the worker/event-loop gauges documented in
-`docs/OBSERVABILITY.md`.
+Tardigrade's stable Core v1 identity is intentionally focused: a host-native
+Zig HTTP/1.1 edge server and reverse proxy with predictable operator behavior.
+The main thread handles the non-blocking accept/event loop, while accepted
+connections move through a bounded worker pool for blocking TLS, parsing,
+proxying, and response writes.
 
-Proxy hops also propagate W3C `traceparent` in addition to Tardigrade's
-request ID headers, so upstream services can correlate the same request through
-logs, metrics, and trace context.
+Idle HTTP/1.1 keep-alive connections are parked off the worker pool between
+requests, so idle clients do not consume worker capacity. HTTP/2 multiplexes
+internally and is tracked as an experimental surface rather than part of the
+default stable release contract.
 
-Security validation is treated as a release gate. The current security program,
-corpus replay entrypoint, and internal pentest workflow are documented in
-`docs/SECURITY_TEST_PLAN.md` and `docs/PENTEST_PLAYBOOK.md`.
+Configuration is nginx-inspired and can be checked before startup with
+`tardigrade validate`. Runtime inspection commands such as `status` and
+`print-config` are designed to make package and service deployments easier to
+operate without guessing which config file or pid file is active.
 
-## Documentation
+## Full documentation
 
 | Topic | Location |
 | --- | --- |
-| Core v1 support matrix | `docs/SUPPORT_MATRIX.md` |
-| Code review checklist | `docs/CODE_REVIEW_CHECKLIST.md` |
-| Observability | `docs/OBSERVABILITY.md` |
-| Release checklist | `docs/RELEASE_CHECKLIST.md` |
-| Packaging | `packaging/README.md` |
-| Benchmarks | `benchmarks/README.md` |
-| Security test plan | `docs/SECURITY_TEST_PLAN.md` |
-| Pentest playbook | `docs/PENTEST_PLAYBOOK.md` |
-| BearClaw example | `examples/bearclaw/README.md` |
-| Security policy | `SECURITY.md` |
-| Contributing | `CONTRIBUTING.md` |
-| Release history | `CHANGELOG.md` |
-
-## Testing
-
-```bash
-# Unit tests
-zig build test --summary all --error-style verbose --multiline-errors
-
-# Security corpus replay
-zig build test-security-corpus
-
-# Integration tests (requires a running tardigrade instance and system OpenSSL)
-zig build test-integration
-```
+| Core v1 support matrix | [docs/SUPPORT_MATRIX.md](docs/SUPPORT_MATRIX.md) |
+| Concurrency & hot-path audit | [docs/CONCURRENCY.md](docs/CONCURRENCY.md) |
+| Observability | [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md) |
+| Proxy security | [docs/PROXY_SECURITY.md](docs/PROXY_SECURITY.md) |
+| Security test plan | [docs/SECURITY_TEST_PLAN.md](docs/SECURITY_TEST_PLAN.md) |
+| Pentest playbook | [docs/PENTEST_PLAYBOOK.md](docs/PENTEST_PLAYBOOK.md) |
+| Code review checklist | [docs/CODE_REVIEW_CHECKLIST.md](docs/CODE_REVIEW_CHECKLIST.md) |
+| Release checklist | [docs/RELEASE_CHECKLIST.md](docs/RELEASE_CHECKLIST.md) |
+| Packaging | [packaging/README.md](packaging/README.md) |
+| Benchmarks | [benchmarks/README.md](benchmarks/README.md) |
+| BearClaw example | [examples/bearclaw/README.md](examples/bearclaw/README.md) |
+| Security policy | [SECURITY.md](SECURITY.md) |
+| Contributing | [CONTRIBUTING.md](CONTRIBUTING.md) |
+| Release history | [CHANGELOG.md](CHANGELOG.md) |
 
 ## Performance
 
-Benchmark releases should be captured from saved JSON under `benchmarks/baselines/`
-and refreshed with `./benchmarks/report.sh <baseline.json> --update-readme README.md`.
-Canonical benchmark runs are taken from a dedicated benchmark target, not from a
-local laptop fallback run. Saved benchmark JSON now captures p50/p95/p99/p999
-latencies, and when the run is given `--pid` or `--pid-file`, sampled target
-CPU plus peak RSS for each scenario.
+Canonical benchmark runs are captured from a dedicated benchmark target, not a
+local laptop fallback run. Saved benchmark JSON records latency percentiles,
+throughput, errors, and optional target CPU/RSS samples.
 
 <!-- BENCHMARK_REPORT_START -->
 | Scenario | req/s | p50 (ms) | p95 (ms) | p99 (ms) | p999 (ms) | CPU % | Peak RSS (MiB) | MB/s | Errors |
@@ -225,16 +221,41 @@ CPU plus peak RSS for each scenario.
 > Run `./benchmarks/run.sh --save benchmarks/baselines/$(git describe --tags).json` then `./benchmarks/report.sh <file> --update-readme README.md` to refresh this table.
 <!-- BENCHMARK_REPORT_END -->
 
-## Formatting
+## Development
 
-Check formatting before committing:
+Use Zig `0.16.0` for local validation.
 
 ```bash
+# Format check
 zig fmt --check build.zig src/ tests/
+
+# Unit tests
+zig build test --summary all --error-style verbose
+
+# Security corpus replay
+zig build test-security-corpus
+
+# Integration tests
+zig build test-integration
+
+# Allocation budget report
+zig build bench-allocations
 ```
 
-Apply formatting in-place:
+See [CONTRIBUTING.md](CONTRIBUTING.md) and
+[docs/CODE_REVIEW_CHECKLIST.md](docs/CODE_REVIEW_CHECKLIST.md) before making
+larger changes.
 
-```bash
-zig fmt build.zig src/ tests/
-```
+## Getting help
+
+- Use [GitHub Issues](https://github.com/Bare-Systems/Tardigrade/issues) for
+  actionable bug reports and feature requests.
+- Use [SECURITY.md](SECURITY.md) for vulnerability reporting instructions.
+- Include the config, command, logs, platform, and whether the affected surface
+  is listed as stable or experimental in the support matrix.
+
+## About
+
+Tardigrade is developed by Bare Systems as a host-native edge component for
+small services, internal platforms, and controlled deployments. It is licensed
+under the [Apache License 2.0](LICENSE).

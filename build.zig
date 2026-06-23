@@ -177,12 +177,27 @@ fn configureSystemLibrarySearchPaths(
     compile: *std.Build.Step.Compile,
     prefer_static_system_libs: bool,
 ) void {
+    const target = compile.rootModuleTarget();
     // Always add Homebrew paths on macOS so OpenSSL (not in Apple's SDK) is found.
-    if (compile.rootModuleTarget().os.tag == .macos) {
+    if (target.os.tag == .macos) {
         compile.root_module.addSystemIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
         compile.root_module.addSystemIncludePath(.{ .cwd_relative = "/opt/homebrew/opt/openssl@3/include" });
         compile.root_module.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
         compile.root_module.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/opt/openssl@3/lib" });
+    }
+    if (target.os.tag == .linux) {
+        compile.root_module.addSystemIncludePath(.{ .cwd_relative = "/usr/include" });
+        switch (target.cpu.arch) {
+            .aarch64 => {
+                compile.root_module.addLibraryPath(.{ .cwd_relative = "/usr/lib/aarch64-linux-gnu" });
+                compile.root_module.addLibraryPath(.{ .cwd_relative = "/lib/aarch64-linux-gnu" });
+            },
+            .x86_64 => {
+                compile.root_module.addLibraryPath(.{ .cwd_relative = "/usr/lib/x86_64-linux-gnu" });
+                compile.root_module.addLibraryPath(.{ .cwd_relative = "/lib/x86_64-linux-gnu" });
+            },
+            else => {},
+        }
     }
     if (!prefer_static_system_libs) return;
     compile.root_module.addSystemIncludePath(.{ .cwd_relative = "/usr/include" });

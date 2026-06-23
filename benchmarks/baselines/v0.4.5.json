@@ -1,43 +1,43 @@
 {
   "static-http1": {
-    "rps": 8559.953,
-    "rps_stddev": 319.621,
-    "rps_min": 8365.530,
-    "rps_max": 8928.840,
+    "rps": 9145.190,
+    "rps_stddev": 472.826,
+    "rps_min": 8601.930,
+    "rps_max": 9463.890,
     "p99_ms": null,
     "p99_ms_stddev": null,
     "p99_ms_min": null,
     "p99_ms_max": null,
-    "errors": 45000,
+    "errors": 0,
     "runs": 3
   },
   "proxy-http1": {
-    "rps": 8307.727,
-    "rps_stddev": 445.685,
-    "rps_min": 7794.900,
-    "rps_max": 8601.440,
+    "rps": 9156.643,
+    "rps_stddev": 75.006,
+    "rps_min": 9107.220,
+    "rps_max": 9242.950,
     "p99_ms": null,
     "p99_ms_stddev": null,
     "p99_ms_min": null,
     "p99_ms_max": null,
-    "errors": 45000,
+    "errors": 0,
     "runs": 3
   },
   "keepalive": {
-    "rps": 8594.757,
-    "rps_stddev": 152.570,
-    "rps_min": 8437.010,
-    "rps_max": 8741.560,
+    "rps": 9479.110,
+    "rps_stddev": 41.009,
+    "rps_min": 9432.450,
+    "rps_max": 9509.430,
     "p99_ms": null,
     "p99_ms_stddev": null,
     "p99_ms_min": null,
     "p99_ms_max": null,
-    "errors": 45000,
+    "errors": 0,
     "runs": 3
   },
   "_meta": {
     "tag": "v0.4.5",
-    "timestamp": "2026-06-23T03:58:35Z",
+    "timestamp": "2026-06-23T11:55:20Z",
     "host": "127.0.0.1",
     "port": "8443",
     "tool": "h2load",
@@ -68,10 +68,11 @@
     "environment_name": "beelink-benchmark",
     "canonical_target": "Beelink Mini PC — 4-core Debian LXC (isolated benchmark instance)",
     "notes": [
-      "Tool: h2load (nghttp2-client 1.64.0, Debian 13). wrk on this host was not compiled with TLS, so h2load was used against https://127.0.0.1:8443.",
-      "p99_ms is null — h2load does not expose latency percentiles in the same format as wrk. Use h2load -D flag in future runs to capture CDF.",
-      "errors=45000 across all scenarios: likely h2load HTTP/2 ALPN negotiation artifacts against a TLS-only HTTP/1.1 endpoint. Investigate with h2load --h1 flag in future baseline runs.",
-      "tag was 'unknown' at capture time (benchmarks/ extracted without git context); corrected to v0.4.5 post-run."
+      "Tool: h2load (nghttp2-client 1.64.0, Debian). wrk on this host is not compiled with TLS; h2load used against https://127.0.0.1:8443.",
+      "p99_ms is null — h2load outputs a CDF table rather than a single p99 value; the run.sh parser does not extract it.",
+      "errors: 0 — confirmed with fixed parser (grep 'failed: N' instead of grep 'failed'). Prior v0.4.5 capture had errors=45000 due to the parser bug.",
+      "tag was 'unknown' at capture time (benchmarks/ extracted without .git); corrected to v0.4.5 post-run.",
+      "Tardigrade binary is identical to the v0.4.5 release; commits after the tag only changed benchmarks/run.sh and docs."
     ]
   }
 }

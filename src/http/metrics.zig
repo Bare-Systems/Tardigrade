@@ -55,6 +55,16 @@ pub const Metrics = struct {
     worker_threads: u64,
     /// Configured maximum queue depth for the worker pool.
     worker_queue_capacity: u64,
+    /// Worker queue wait time histogram: time from submit() to worker dispatch (microseconds).
+    worker_queue_wait_le_100us: u64,
+    worker_queue_wait_le_500us: u64,
+    worker_queue_wait_le_1ms: u64,
+    worker_queue_wait_le_5ms: u64,
+    worker_queue_wait_le_10ms: u64,
+    worker_queue_wait_le_50ms: u64,
+    worker_queue_wait_gt_50ms: u64,
+    worker_queue_wait_count: u64,
+    worker_queue_wait_sum_us: u64,
     /// Idle keepalive connections currently parked off the worker pool (#138).
     keepalive_parked: u64,
     /// Total parked-connection resume dispatches.
@@ -130,6 +140,15 @@ pub const Metrics = struct {
             .worker_queued_jobs = 0,
             .worker_threads = 0,
             .worker_queue_capacity = 0,
+            .worker_queue_wait_le_100us = 0,
+            .worker_queue_wait_le_500us = 0,
+            .worker_queue_wait_le_1ms = 0,
+            .worker_queue_wait_le_5ms = 0,
+            .worker_queue_wait_le_10ms = 0,
+            .worker_queue_wait_le_50ms = 0,
+            .worker_queue_wait_gt_50ms = 0,
+            .worker_queue_wait_count = 0,
+            .worker_queue_wait_sum_us = 0,
             .keepalive_parked = 0,
             .keepalive_resumes_total = 0,
             .keepalive_timeouts_total = 0,
@@ -293,6 +312,41 @@ pub const Metrics = struct {
         self.worker_queued_jobs = @intCast(queued_jobs);
         self.worker_threads = @intCast(worker_threads);
         self.worker_queue_capacity = @intCast(queue_capacity);
+    }
+
+    /// Record the time a connection spent in the worker queue waiting for dispatch.
+    /// `wait_ns` is the elapsed nanoseconds between submit() and worker pickup.
+    pub fn recordWorkerQueueWaitNs(self: *Metrics, wait_ns: i64) void {
+        const ns: u64 = if (wait_ns <= 0) 0 else @intCast(wait_ns);
+        const us: u64 = ns / 1000;
+        self.worker_queue_wait_count += 1;
+        self.worker_queue_wait_sum_us += us;
+        if (us <= 100) {
+            self.worker_queue_wait_le_100us += 1;
+        } else if (us <= 500) {
+            self.worker_queue_wait_le_500us += 1;
+        } else if (us <= 1_000) {
+            self.worker_queue_wait_le_1ms += 1;
+        } else if (us <= 5_000) {
+            self.worker_queue_wait_le_5ms += 1;
+        } else if (us <= 10_000) {
+            self.worker_queue_wait_le_10ms += 1;
+        } else if (us <= 50_000) {
+            self.worker_queue_wait_le_50ms += 1;
+        } else {
+            self.worker_queue_wait_gt_50ms += 1;
+        }
+    }
+
+    fn workerQueueWaitBucketCumulative(self: *const Metrics, le_us: u64) u64 {
+        var total: u64 = 0;
+        if (le_us >= 100) total += self.worker_queue_wait_le_100us;
+        if (le_us >= 500) total += self.worker_queue_wait_le_500us;
+        if (le_us >= 1_000) total += self.worker_queue_wait_le_1ms;
+        if (le_us >= 5_000) total += self.worker_queue_wait_le_5ms;
+        if (le_us >= 10_000) total += self.worker_queue_wait_le_10ms;
+        if (le_us >= 50_000) total += self.worker_queue_wait_le_50ms;
+        return total;
     }
 
     /// Snapshot of the idle keepalive parked-connection registry (#138).
@@ -483,6 +537,17 @@ pub const Metrics = struct {
             \\# HELP tardigrade_worker_queue_capacity Configured worker queue capacity
             \\# TYPE tardigrade_worker_queue_capacity gauge
             \\tardigrade_worker_queue_capacity {d}
+            \\# HELP tardigrade_worker_queue_wait_us Time a connection waited in the worker queue before dispatch (microseconds)
+            \\# TYPE tardigrade_worker_queue_wait_us histogram
+            \\tardigrade_worker_queue_wait_us_bucket{{le="100"}} {d}
+            \\tardigrade_worker_queue_wait_us_bucket{{le="500"}} {d}
+            \\tardigrade_worker_queue_wait_us_bucket{{le="1000"}} {d}
+            \\tardigrade_worker_queue_wait_us_bucket{{le="5000"}} {d}
+            \\tardigrade_worker_queue_wait_us_bucket{{le="10000"}} {d}
+            \\tardigrade_worker_queue_wait_us_bucket{{le="50000"}} {d}
+            \\tardigrade_worker_queue_wait_us_bucket{{le="+Inf"}} {d}
+            \\tardigrade_worker_queue_wait_us_sum {d}
+            \\tardigrade_worker_queue_wait_us_count {d}
             \\# HELP tardigrade_error_invalid_request_total Total invalid_request API errors
             \\# TYPE tardigrade_error_invalid_request_total counter
             \\tardigrade_error_invalid_request_total {d}
@@ -540,6 +605,15 @@ pub const Metrics = struct {
             self.worker_queued_jobs,
             self.worker_threads,
             self.worker_queue_capacity,
+            self.workerQueueWaitBucketCumulative(100),
+            self.workerQueueWaitBucketCumulative(500),
+            self.workerQueueWaitBucketCumulative(1_000),
+            self.workerQueueWaitBucketCumulative(5_000),
+            self.workerQueueWaitBucketCumulative(10_000),
+            self.workerQueueWaitBucketCumulative(50_000),
+            self.worker_queue_wait_count,
+            self.worker_queue_wait_sum_us,
+            self.worker_queue_wait_count,
             self.err_invalid_request,
             self.err_unauthorized,
             self.err_rate_limited,
@@ -613,7 +687,7 @@ pub const Metrics = struct {
             self.proxy_ttfb_ms_sum,
         });
         try out.print(
-            \\,"request_latency_ms_count":{d},"request_latency_ms_sum":{d},"worker_active_jobs":{d},"worker_queued_jobs":{d},"worker_threads":{d},"worker_queue_capacity":{d},"error_invalid_request":{d},"error_unauthorized":{d},"error_rate_limited":{d},"error_upstream_timeout":{d},"error_upstream_unavailable":{d},"error_internal_error":{d},"error_overload":{d},"error_request_timeout":{d},"mux_frame_errors":{d},"event_loop_iterations":{d},"health_probe_runs":{d},"reload_attempts_total":{d},"reload_success_total":{d},"reload_failure_total":{d},"drain_total":{d},"drain_timeouts_total":{d},"drain_forced_closes_total":{d}}}
+            \\,"request_latency_ms_count":{d},"request_latency_ms_sum":{d},"worker_active_jobs":{d},"worker_queued_jobs":{d},"worker_threads":{d},"worker_queue_capacity":{d},"worker_queue_wait_count":{d},"worker_queue_wait_sum_us":{d},"error_invalid_request":{d},"error_unauthorized":{d},"error_rate_limited":{d},"error_upstream_timeout":{d},"error_upstream_unavailable":{d},"error_internal_error":{d},"error_overload":{d},"error_request_timeout":{d},"mux_frame_errors":{d},"event_loop_iterations":{d},"health_probe_runs":{d},"reload_attempts_total":{d},"reload_success_total":{d},"reload_failure_total":{d},"drain_total":{d},"drain_timeouts_total":{d},"drain_forced_closes_total":{d}}}
         , .{
             self.latency_count,
             self.latency_sum_ms,
@@ -621,6 +695,8 @@ pub const Metrics = struct {
             self.worker_queued_jobs,
             self.worker_threads,
             self.worker_queue_capacity,
+            self.worker_queue_wait_count,
+            self.worker_queue_wait_sum_us,
             self.err_invalid_request,
             self.err_unauthorized,
             self.err_rate_limited,
@@ -872,4 +948,54 @@ test "Metrics toPrometheus includes event loop counters" {
     defer allocator.free(prom);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_event_loop_iterations_total 1") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_health_probe_runs_total 1") != null);
+}
+
+test "recordWorkerQueueWaitNs buckets correctly (#136)" {
+    var m = Metrics.init();
+    try std.testing.expectEqual(@as(u64, 0), m.worker_queue_wait_count);
+    try std.testing.expectEqual(@as(u64, 0), m.worker_queue_wait_sum_us);
+
+    // ≤100µs: 50µs
+    m.recordWorkerQueueWaitNs(50_000);
+    // ≤500µs: 300µs
+    m.recordWorkerQueueWaitNs(300_000);
+    // ≤1ms: 800µs
+    m.recordWorkerQueueWaitNs(800_000);
+    // ≤5ms: 2ms
+    m.recordWorkerQueueWaitNs(2_000_000);
+    // ≤10ms: 7ms
+    m.recordWorkerQueueWaitNs(7_000_000);
+    // ≤50ms: 20ms
+    m.recordWorkerQueueWaitNs(20_000_000);
+    // >50ms: 100ms
+    m.recordWorkerQueueWaitNs(100_000_000);
+
+    try std.testing.expectEqual(@as(u64, 7), m.worker_queue_wait_count);
+    try std.testing.expectEqual(@as(u64, 1), m.worker_queue_wait_le_100us);
+    try std.testing.expectEqual(@as(u64, 1), m.worker_queue_wait_le_500us);
+    try std.testing.expectEqual(@as(u64, 1), m.worker_queue_wait_le_1ms);
+    try std.testing.expectEqual(@as(u64, 1), m.worker_queue_wait_le_5ms);
+    try std.testing.expectEqual(@as(u64, 1), m.worker_queue_wait_le_10ms);
+    try std.testing.expectEqual(@as(u64, 1), m.worker_queue_wait_le_50ms);
+    try std.testing.expectEqual(@as(u64, 1), m.worker_queue_wait_gt_50ms);
+    // sum: 50 + 300 + 800 + 2000 + 7000 + 20000 + 100000 = 130150 µs
+    try std.testing.expectEqual(@as(u64, 130150), m.worker_queue_wait_sum_us);
+}
+
+test "worker queue wait histogram appears in Prometheus and JSON output (#136)" {
+    const allocator = std.testing.allocator;
+    var m = Metrics.init();
+    m.recordWorkerQueueWaitNs(500_000); // 500µs → ≤500µs bucket
+
+    const prom = try m.toPrometheus(allocator);
+    defer allocator.free(prom);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_worker_queue_wait_us_bucket{le=\"100\"}") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_worker_queue_wait_us_bucket{le=\"500\"} 1") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_worker_queue_wait_us_count 1") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_worker_queue_wait_us_sum 500") != null);
+
+    const json = try m.toJson(allocator);
+    defer allocator.free(json);
+    try std.testing.expect(std.mem.find(u8, json, "\"worker_queue_wait_count\":1") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"worker_queue_wait_sum_us\":500") != null);
 }

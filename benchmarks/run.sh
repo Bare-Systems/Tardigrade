@@ -39,6 +39,8 @@
 #   --save FILE         Write results JSON to this file
 #   --meta-file FILE    Merge extra JSON metadata into _meta
 #   --sample-interval-ms N  CPU/RSS sample interval in milliseconds (default: 500)
+#   --runs N            Repeat each scenario N times; output mean ± stddev (default: 1)
+#   --idle-check        Abort if load average exceeds 0.7× CPU count before starting
 #   --help              Show this message and exit
 #
 # Scenarios:
@@ -105,6 +107,8 @@ SAVE_FILE=""
 META_FILE=""
 REGRESSION_THRESHOLD=10  # percent
 SAMPLE_INTERVAL_MS=500
+RUNS=1            # repeat each scenario N times; mean/stddev reported when N>1
+IDLE_CHECK=false  # gate on machine load average before starting
 
 # ── Arg parsing ───────────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -142,6 +146,8 @@ while [[ $# -gt 0 ]]; do
         --meta-file)  META_FILE="$2";          shift 2 ;;
         --threshold)  REGRESSION_THRESHOLD="$2"; shift 2 ;;
         --sample-interval-ms) SAMPLE_INTERVAL_MS="$2"; shift 2 ;;
+        --runs)       RUNS="$2";               shift 2 ;;
+        --idle-check) IDLE_CHECK=true;         shift ;;
         --help)       sed -n '/^# Usage/,/^[^#]/p' "$0" | head -n -1; exit 0 ;;
         *) echo "Unknown option: $1" >&2; exit 1 ;;
     esac
@@ -232,6 +238,60 @@ detect_memory_mb() {
             echo "unknown"
             ;;
     esac
+}
+
+check_machine_idle() {
+    local cpu_count threshold load1
+    cpu_count=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)
+    # Gate: load average must be below 0.7 × CPU count.
+    threshold=$(awk -v n="$cpu_count" 'BEGIN { printf "%.2f", n * 0.7 }')
+    case "$(uname -s 2>/dev/null || true)" in
+        Darwin)
+            load1=$(sysctl -n vm.loadavg 2>/dev/null | awk '{print $2}')
+            ;;
+        Linux)
+            load1=$(awk '{print $1}' /proc/loadavg 2>/dev/null || echo "0")
+            ;;
+        *)
+            echo "  --idle-check: unsupported platform; skipping load check" >&2
+            return 0
+            ;;
+    esac
+    local ok
+    ok=$(awk -v l="${load1:-0}" -v t="$threshold" 'BEGIN { print (l < t) ? "yes" : "no" }')
+    if [[ "$ok" != "yes" ]]; then
+        echo "ERROR: --idle-check failed: load average ${load1} >= threshold ${threshold} (0.7 × ${cpu_count} CPUs)" >&2
+        echo "       Wait for the machine to idle or omit --idle-check for a non-canonical run." >&2
+        exit 1
+    fi
+    echo "Idle check passed: load=${load1} threshold=${threshold} (${cpu_count} CPUs)"
+}
+
+# ── Multi-run variance helpers ─────────────────────────────────────────────────
+# awk-based mean/stddev so jq is not required for the math.
+_stats_from_space_list() {
+    local values="$1"
+    awk -v vals="$values" 'BEGIN {
+        n = split(vals, a, " ")
+        if (n == 0) { print "null null null null"; exit }
+        sum = 0; sum2 = 0
+        min = a[1]; max = a[1]
+        for (i = 1; i <= n; i++) {
+            v = a[i] + 0
+            sum += v
+            sum2 += v * v
+            if (v < min) min = v
+            if (v > max) max = v
+        }
+        mean = sum / n
+        if (n > 1) {
+            variance = (sum2 - sum * sum / n) / (n - 1)
+            stddev = (variance > 0) ? sqrt(variance) : 0
+        } else {
+            stddev = 0
+        }
+        printf "%.3f %.3f %.3f %.3f", mean, stddev, min, max
+    }'
 }
 
 resolve_target_pid() {
@@ -383,14 +443,37 @@ stop_process_monitor() {
     fi
 }
 
+if $IDLE_CHECK; then
+    check_machine_idle
+fi
+
 TOOL=$(detect_tool "$PREFERRED_TOOL")
 echo "Using tool: $TOOL"
+if [[ "$RUNS" -gt 1 ]]; then
+    echo "Runs per scenario: $RUNS (mean ± stddev will be reported)"
+fi
 
 # ── Result accumulator ────────────────────────────────────────────────────────
 RESULTS_JSON="{}"
 TOOL_HEADERS=()
+
+# Per-scenario run accumulators (space-separated lists, populated by add_result
+# when RUNS>1 and cleared by flush_multirun_result at the end of each scenario).
+declare -A _run_rps_list=()
+declare -A _run_p99_list=()
+declare -A _run_errors_list=()
+
 add_result() {
     local scenario="$1" rps="$2" p50_ms="$3" p95_ms="$4" p99_ms="$5" p999_ms="$6" errors="$7" mbps="${8:-null}" cpu_pct_avg="${9:-null}" rss_mb_peak="${10:-null}"
+
+    if [[ "$RUNS" -gt 1 ]]; then
+        # Accumulate for this run; flush_multirun_result builds the final entry.
+        _run_rps_list["$scenario"]+="${rps} "
+        _run_p99_list["$scenario"]+="${p99_ms:-0} "
+        _run_errors_list["$scenario"]+="${errors} "
+        return
+    fi
+
     RESULTS_JSON=$(jq --arg s "$scenario" \
         --argjson rps "$rps" \
         --argjson p50 "$p50_ms" --argjson p95 "$p95_ms" --argjson p99 "$p99_ms" --argjson p999 "$p999_ms" \
@@ -407,6 +490,56 @@ add_result() {
             rss_mb_peak: $rss
         }' \
         <<<"$RESULTS_JSON")
+}
+
+# After all N runs of a scenario complete, compute mean/stddev/min/max and
+# write a single result entry enriched with variance fields.
+flush_multirun_result() {
+    local scenario="$1"
+    local rps_vals p99_vals err_vals
+    rps_vals="${_run_rps_list[$scenario]:-}"
+    p99_vals="${_run_p99_list[$scenario]:-}"
+    err_vals="${_run_errors_list[$scenario]:-}"
+
+    [[ -z "$rps_vals" ]] && return
+
+    local rps_stats p99_stats
+    rps_stats=$(_stats_from_space_list "${rps_vals% }")
+    p99_stats=$(_stats_from_space_list "${p99_vals% }")
+
+    local rps_mean rps_stddev rps_min rps_max
+    read -r rps_mean rps_stddev rps_min rps_max <<<"$rps_stats"
+    local p99_mean p99_stddev p99_min p99_max
+    read -r p99_mean p99_stddev p99_min p99_max <<<"$p99_stats"
+
+    local total_errors
+    total_errors=$(echo "${err_vals% }" | awk '{s=0; for(i=1;i<=NF;i++) s+=$i; print s}')
+
+    echo "  $scenario (${RUNS} runs) — rps mean=${rps_mean} stddev=${rps_stddev} min=${rps_min} max=${rps_max} | p99 mean=${p99_mean}ms stddev=${p99_stddev}ms"
+
+    RESULTS_JSON=$(jq --arg s "$scenario" \
+        --argjson rps "$rps_mean" \
+        --argjson rps_stddev "$rps_stddev" --argjson rps_min "$rps_min" --argjson rps_max "$rps_max" \
+        --argjson p99 "$p99_mean" \
+        --argjson p99_stddev "$p99_stddev" --argjson p99_min "$p99_min" --argjson p99_max "$p99_max" \
+        --argjson err "$total_errors" --argjson runs "$RUNS" \
+        '.[$s] = {
+            rps: $rps,
+            rps_stddev: $rps_stddev,
+            rps_min: $rps_min,
+            rps_max: $rps_max,
+            p99_ms: $p99,
+            p99_ms_stddev: $p99_stddev,
+            p99_ms_min: $p99_min,
+            p99_ms_max: $p99_max,
+            errors: $err,
+            runs: $runs
+        }' \
+        <<<"$RESULTS_JSON")
+
+    unset "_run_rps_list[$scenario]"
+    unset "_run_p99_list[$scenario]"
+    unset "_run_errors_list[$scenario]"
 }
 
 build_tool_headers() {
@@ -924,27 +1057,33 @@ echo ""
 
 IFS=',' read -ra SCENARIO_LIST <<< "$SCENARIOS"
 for scenario in "${SCENARIO_LIST[@]}"; do
-    case "$scenario" in
-        static-http1)       scenario_static_http1 ;;
-        proxy-http1)        scenario_proxy_http1 ;;
-        static-http2)       scenario_static_http2 ;;
-        proxy-http2)        scenario_proxy_http2 ;;
-        static-http3)       scenario_static_http3 ;;
-        proxy-http3)        scenario_proxy_http3 ;;
-        keepalive)          scenario_keepalive ;;
-        keepalive-starvation) scenario_keepalive_starvation ;;
-        proxy-payload-64k)  scenario_proxy_payload_64k ;;
-        proxy-payload-256k) scenario_proxy_payload_256k ;;
-        proxy-payload-1m)   scenario_proxy_payload_1m ;;
-        proxy-payload-16m)  scenario_proxy_payload_16m ;;
-        proxy-upload-large) scenario_proxy_upload_large ;;
-        proxy-slow-client-download) scenario_proxy_slow_client_download ;;
-        reload-under-load)  scenario_reload_under_load ;;
-        auth-enforcement)   scenario_auth_enforcement ;;
-        rate-limit)         scenario_rate_limit ;;
-        spike)              scenario_spike ;;
-        *)                  echo "Unknown scenario: $scenario" >&2 ;;
-    esac
+    for (( _run=1; _run<=RUNS; _run++ )); do
+        [[ "$RUNS" -gt 1 ]] && echo "==> $scenario (run ${_run}/${RUNS})"
+        case "$scenario" in
+            static-http1)       scenario_static_http1 ;;
+            proxy-http1)        scenario_proxy_http1 ;;
+            static-http2)       scenario_static_http2 ;;
+            proxy-http2)        scenario_proxy_http2 ;;
+            static-http3)       scenario_static_http3 ;;
+            proxy-http3)        scenario_proxy_http3 ;;
+            keepalive)          scenario_keepalive ;;
+            keepalive-starvation) scenario_keepalive_starvation ;;
+            proxy-payload-64k)  scenario_proxy_payload_64k ;;
+            proxy-payload-256k) scenario_proxy_payload_256k ;;
+            proxy-payload-1m)   scenario_proxy_payload_1m ;;
+            proxy-payload-16m)  scenario_proxy_payload_16m ;;
+            proxy-upload-large) scenario_proxy_upload_large ;;
+            proxy-slow-client-download) scenario_proxy_slow_client_download ;;
+            reload-under-load)  scenario_reload_under_load ;;
+            auth-enforcement)   scenario_auth_enforcement ;;
+            rate-limit)         scenario_rate_limit ;;
+            spike)              scenario_spike ;;
+            *)                  echo "Unknown scenario: $scenario" >&2 ;;
+        esac
+    done
+    if [[ "$RUNS" -gt 1 ]]; then
+        flush_multirun_result "$scenario"
+    fi
 done
 
 # ── Attach metadata ──────────────────────────────────────────────────────────
@@ -977,8 +1116,9 @@ RESULTS_JSON=$(jq \
     --arg cpu_threads "$CPU_THREADS" \
     --arg memory_mb "$MEMORY_MB" \
     --argjson dur "$DURATION" --argjson conn "$CONNECTIONS" --argjson sample_interval_ms "$SAMPLE_INTERVAL_MS" \
+    --argjson runs "$RUNS" \
     '. + {_meta: {tag: $tag, timestamp: $ts, host: $host, port: $port,
-          tool: $tool, duration_s: $dur, connections: $conn,
+          tool: $tool, duration_s: $dur, connections: $conn, runs: $runs,
           host_header: $host_header, driver: $driver,
           worker_count: (if $worker_count == "" then null else ($worker_count | tonumber) end),
           config_label: (if $config_label == "" then null else $config_label end),

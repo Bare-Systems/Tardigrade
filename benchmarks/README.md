@@ -191,6 +191,8 @@ Run only k6 behavioral tests: `--tool k6 --scenarios auth-enforcement,rate-limit
 --meta-file FILE      Merge extra JSON metadata into _meta
 --threshold PCT       Regression threshold percentage (default: 10)
 --sample-interval-ms N  CPU/RSS sample interval in milliseconds (default: 500)
+--runs N              Repeat each scenario N times; report mean ± stddev (default: 1)
+--idle-check          Abort if load average exceeds 0.7× CPU count before starting
 ```
 
 Exit code `2` indicates at least one scenario regressed beyond the threshold.
@@ -277,6 +279,33 @@ Benchmark results are only meaningful when the test environment is controlled:
 
 Document the test host in each baseline file's `_meta.host` field and merge the
 appropriate benchmark-context JSON with `--meta-file`.
+
+The canonical benchmark target is the **Beelink Mini PC** (4-core Debian LXC).
+Use `benchmarks/targets/beelink.json` with `--meta-file` for release baselines.
+See that file for hardware details and recommended flags.
+
+## Measurement reliability
+
+A few pitfalls discovered through hard experience (#136):
+
+1. **A dev laptop is not the deploy target.** The same binary measured ~42µs p50
+   on an M4 laptop vs ~120µs on the 4-core Beelink. Faster cores flatter every
+   number. Always capture canonical numbers on deployment-class hardware.
+
+2. **Load contamination produces phantom results.** On a shared machine, the same
+   endpoint measured 38k–195k req/s — a 5× swing — from co-scheduled work alone.
+   A periodic `top`/`ps` sampler collapsed throughput ~5× by itself. Use
+   `--idle-check` to gate on an idle machine, and `--runs 3` (or more) to expose
+   variance. If `rps_stddev > 10% of rps_mean`, treat the run as contaminated.
+
+3. **Report p90/p99/p999, not just p50.** Worker starvation and flow-control
+   failures show in the tail; p50 stays flat while p90 climbs 100×.
+
+4. **macOS ≠ Linux for scheduling.** `nice` is ignored on macOS (QoS-based
+   scheduling). Priority and scheduler experiments must be validated on Linux.
+
+5. **"req/s" is meaningless without fixed hardware + concurrency.** Record both
+   in `_meta`; the `--runs` stddev is the only guard against phantom improvements.
 
 ## CI integration
 

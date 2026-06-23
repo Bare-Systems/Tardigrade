@@ -4,6 +4,11 @@ All notable user-facing changes to Tardigrade are documented here.
 
 ## [Unreleased]
 
+### Performance
+- **Benchmark harness multi-run variance and idle check (#136)** — `benchmarks/run.sh` gains `--runs N` to repeat each scenario N times and report mean ± stddev / min / max for req/s and p99, and `--idle-check` to gate on machine load average (< 0.7 × CPU count) before starting. Both flags address the phantom-result problem documented in the issue: a 5× req/s swing from load contamination is now visible as high stddev rather than a misleading single number.
+- **Worker queue wait time histogram (#136)** — `tardigrade_worker_queue_wait_us` Prometheus histogram (buckets: ≤100µs, ≤500µs, ≤1ms, ≤5ms, ≤10ms, ≤50ms, >50ms) measures the time a connection spends in the worker pool queue before dispatch. The `worker_pool` now timestamps each submitted entry and reports the wait to a metrics callback. `worker_queue_wait_count` and `worker_queue_wait_sum_us` appear in the JSON metrics endpoint.
+- **Beelink canonical benchmark target (`benchmarks/targets/beelink.json`)** — documents the 4-core Debian LXC as the canonical performance measurement host, including hardware details, recommended flags (`--runs 3 --idle-check`), and notes on why macOS lap results are not comparable.
+
 ### Internals
 - **Hot-path lock and cache-locality audit (#214)** — added `docs/CONCURRENCY.md` documenting every mutex, atomic, and cache-locality concern in the request hot path. Each lock is classified HOT/WARM/COLD with justification and improvement proposals. Prioritised follow-up items: replace `Metrics` plain-`u64` fields with atomics (removes `metrics_mutex` entirely), atomic round-robin for `upstream_rr_index`, move access-log `write()` outside the lock. Inline `[HOT]` markers and doc comments added to the four hot-path `GatewayState` methods (`metricsRecord`, `rateLimitAllow`, `nextUpstreamBaseUrl`, `metricsRecordLatencyMs`). No runtime changes.
 

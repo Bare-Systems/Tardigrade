@@ -4,11 +4,11 @@ All notable user-facing changes to Tardigrade are documented here.
 
 ## [Unreleased]
 
-## [0.4.7] - 2026-06-23
+## [0.4.8] - 2026-06-23
 
 ### Fixed
 - **Linux release binaries target glibc 2.35** — release builds now pass explicit Zig targets (`x86_64-linux-gnu.2.35` and `aarch64-linux-gnu.2.35`) so the native Tardigrade binary runs on Ubuntu 22.04 Jetson systems instead of requiring glibc 2.36+ from the CI runner baseline.
-- **Explicit Linux release targets find OpenSSL on CI** — the Zig build now adds Debian/Ubuntu multiarch OpenSSL library paths for `x86_64` and `aarch64` Linux targets, fixing release builds that no longer use Zig's native target autodetection.
+- **Explicit Linux release targets find OpenSSL on CI** — the Zig build now adds Debian/Ubuntu multiarch OpenSSL include and library paths for `x86_64` and `aarch64` Linux targets, fixing release builds that no longer use Zig's native target autodetection.
 - **h2load `errors` parser bug in benchmark runner** — `benchmarks/run.sh` now extracts `failed: N` specifically (was `grep "failed" | head -1`, which matched the `requests: N, ..., failed: 0` summary line and returned the total request count as the error count). Affects `run_h2load` and `run_h2load_h3`. Baselines captured before this fix have `errors` equal to the total request count, not actual failures.
 
 ### Documentation

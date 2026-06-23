@@ -6,6 +6,11 @@ All notable user-facing changes to Tardigrade are documented here.
 
 ## [0.4.5] - 2026-06-23
 
+### Deploy
+- **Source tarball excludes `.zig` and `.zig-toolchain` dirs** — `blink.toml` tarball command now passes `--exclude=.zig --exclude=.zig-toolchain`, shrinking the upload from ~400 MB to ~500 KB. The Zig toolchain is installed separately on the Beelink at `$RUNTIME_DIR/.zig/` and reused across deploys.
+- **Build script cleanup uses per-entry `rm -rf` instead of `find -delete`** — `deploy/blink/build_tardigrade.sh` now runs `find -maxdepth 1 -exec rm -rf {} +` on the top-level build directory entries rather than a recursive leaf-node delete, avoiding the multi-minute stall previously caused by deleting a 1.5 GB stale `.zig/` subtree via `find -depth -delete`.
+- **v0.4.5 baseline captured on Beelink** (`benchmarks/baselines/v0.4.5.json`) — first canonical on-hardware baseline using h2load (nghttp2-client 1.64.0) against `https://127.0.0.1:8443`, 3 runs × 30 s × 50 connections. Results: static-http1 8,560 req/s (±320), proxy-http1 8,308 req/s (±446), keepalive 8,595 req/s (±153). Note: p99 not captured (h2load latency format differs from wrk); `errors` field reflects h2load HTTP/2 ALPN artifacts and is not a sign of real request failures. Tool change from wrk (no TLS) to h2load makes this baseline non-comparable with v0.32.0-18.
+
 ### Performance
 - **Benchmark harness multi-run variance and idle check (#136)** — `benchmarks/run.sh` gains `--runs N` to repeat each scenario N times and report mean ± stddev / min / max for req/s and p99, and `--idle-check` to gate on machine load average (< 0.7 × CPU count) before starting. Both flags address the phantom-result problem documented in the issue: a 5× req/s swing from load contamination is now visible as high stddev rather than a misleading single number.
 - **Worker queue wait time histogram (#136)** — `tardigrade_worker_queue_wait_us` Prometheus histogram (buckets: ≤100µs, ≤500µs, ≤1ms, ≤5ms, ≤10ms, ≤50ms, >50ms) measures the time a connection spends in the worker pool queue before dispatch. The `worker_pool` now timestamps each submitted entry and reports the wait to a metrics callback. `worker_queue_wait_count` and `worker_queue_wait_sum_us` appear in the JSON metrics endpoint.

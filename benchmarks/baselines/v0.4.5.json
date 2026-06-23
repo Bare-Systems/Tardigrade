@@ -1,0 +1,77 @@
+{
+  "static-http1": {
+    "rps": 8559.953,
+    "rps_stddev": 319.621,
+    "rps_min": 8365.530,
+    "rps_max": 8928.840,
+    "p99_ms": null,
+    "p99_ms_stddev": null,
+    "p99_ms_min": null,
+    "p99_ms_max": null,
+    "errors": 45000,
+    "runs": 3
+  },
+  "proxy-http1": {
+    "rps": 8307.727,
+    "rps_stddev": 445.685,
+    "rps_min": 7794.900,
+    "rps_max": 8601.440,
+    "p99_ms": null,
+    "p99_ms_stddev": null,
+    "p99_ms_min": null,
+    "p99_ms_max": null,
+    "errors": 45000,
+    "runs": 3
+  },
+  "keepalive": {
+    "rps": 8594.757,
+    "rps_stddev": 152.570,
+    "rps_min": 8437.010,
+    "rps_max": 8741.560,
+    "p99_ms": null,
+    "p99_ms_stddev": null,
+    "p99_ms_min": null,
+    "p99_ms_max": null,
+    "errors": 45000,
+    "runs": 3
+  },
+  "_meta": {
+    "tag": "v0.4.5",
+    "timestamp": "2026-06-23T03:58:35Z",
+    "host": "127.0.0.1",
+    "port": "8443",
+    "tool": "h2load",
+    "duration_s": 30,
+    "connections": 50,
+    "runs": 3,
+    "host_header": "",
+    "driver": "local",
+    "worker_count": 4,
+    "config_label": "beelink release-baseline config",
+    "process_metrics": {
+      "enabled": false,
+      "pid_source": "none",
+      "sample_interval_ms": 500
+    },
+    "zig_version": "0.14.1",
+    "environment": {
+      "os": "Linux",
+      "kernel": "6.17.13-2-pve",
+      "arch": "x86_64",
+      "cpu_model": "Intel(R) N150",
+      "cpu_threads": "4",
+      "memory_mb": "10240"
+    },
+    "static_path": "/health",
+    "proxy_path": "/bearclaw/health",
+    "keepalive_path": "/health",
+    "environment_name": "beelink-benchmark",
+    "canonical_target": "Beelink Mini PC — 4-core Debian LXC (isolated benchmark instance)",
+    "notes": [
+      "Tool: h2load (nghttp2-client 1.64.0, Debian 13). wrk on this host was not compiled with TLS, so h2load was used against https://127.0.0.1:8443.",
+      "p99_ms is null — h2load does not expose latency percentiles in the same format as wrk. Use h2load -D flag in future runs to capture CDF.",
+      "errors=45000 across all scenarios: likely h2load HTTP/2 ALPN negotiation artifacts against a TLS-only HTTP/1.1 endpoint. Investigate with h2load --h1 flag in future baseline runs.",
+      "tag was 'unknown' at capture time (benchmarks/ extracted without git context); corrected to v0.4.5 post-run."
+    ]
+  }
+}

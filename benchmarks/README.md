@@ -299,12 +299,13 @@ The Beelink is not directly SSH-accessible from the Mac. All commands run throug
 # 1. Deploy the release (skip if already running)
 blink_deploy service=tardigrade task=true
 
-# 2. Dispatch benchmark (returns immediately; runs in background on Beelink)
-blink_test service=tardigrade tags=["benchmark"]
+# 2. Dispatch benchmark — returns task_id immediately; benchmark runs in background (~10 min)
+blink_test service=tardigrade tags=["benchmark"] task=true
 
-# 3. Wait ~10 minutes
+# 3. Poll until task is done (or schedule a wakeup and check blink_history after ~12 min)
+blink_task_status task_id=<id>
 
-# 4. Collect (test "fails" with JSON = run complete; "passes" with "not-ready" = still running)
+# 4. Collect — test "fails" with JSON = run complete; "passes" with "not-ready" = still running
 blink_test service=tardigrade tags=["benchmark-collect"]
 ```
 

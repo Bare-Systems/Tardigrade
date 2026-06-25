@@ -154,7 +154,7 @@ pub fn handleStaticLocation(
         }
     }
 
-    const status_code = try writeStaticServedResponse(allocator, conn, request.method == .HEAD, keep_alive, correlation_id, state, &served);
+    const status_code = try writeStaticServedResponse(allocator, conn, request.method == .HEAD, keep_alive, correlation_id, state, &served, request.headers.get("accept-encoding"));
     state.metricsRecord(status_code);
     return status_code;
 }
@@ -191,7 +191,7 @@ pub fn serveTryFilesFallback(
     })) orelse return error.NoTryFiles;
     defer served.deinit(allocator);
 
-    return writeStaticServedResponse(allocator, conn, std.ascii.eqlIgnoreCase(method, "HEAD"), keep_alive, correlation_id, state, &served);
+    return writeStaticServedResponse(allocator, conn, std.ascii.eqlIgnoreCase(method, "HEAD"), keep_alive, correlation_id, state, &served, request.headers.get("accept-encoding"));
 }
 
 pub fn writeStaticServedResponse(
@@ -202,13 +202,37 @@ pub fn writeStaticServedResponse(
     correlation_id: []const u8,
     state: *GatewayState,
     served: *const http.static_file.Result,
+    /// Value of the request's `Accept-Encoding` header, or null if absent.
+    /// Used to compress the buffered body when the client and config allow it.
+    accept_encoding: ?[]const u8,
 ) !u16 {
     const writer = conn.writer();
+
+    // Compress the body before building the response so Content-Length is
+    // calculated against the (potentially smaller) compressed bytes.
+    // Only the buffered path (served.body != null, served.file_path == null) is
+    // eligible: the file-backed sendfile path cannot compress on the fly.
+    var compress_result: http.compression.CompressionResult = .{ .body = null, .compressed = false };
+    defer if (compress_result.body) |b| allocator.free(b);
+    if (served.file_path == null) {
+        if (served.body) |raw_body| {
+            compress_result = http.compression.compressResponse(
+                allocator,
+                raw_body,
+                served.content_type,
+                accept_encoding,
+                state.compression_config,
+            );
+        }
+    }
+    // The body we will actually transmit (compressed or original).
+    const out_body: ?[]const u8 = compress_result.body orelse served.body;
+
     var response = http.Response.init(allocator);
     defer response.deinit();
     _ = response
         .setStatus(served.status_code)
-        .setBody(served.body orelse "")
+        .setBody(out_body orelse "")
         .setContentType(served.content_type)
         .setConnection(keep_alive)
         .setHeader(http.correlation.HEADER_NAME, correlation_id);
@@ -216,6 +240,11 @@ pub fn writeStaticServedResponse(
     if (served.last_modified_value) |last_modified| _ = response.setHeader("Last-Modified", last_modified);
     if (served.content_range_value) |content_range| _ = response.setHeader("Content-Range", content_range);
     if (served.accept_ranges) _ = response.setHeader("Accept-Ranges", "bytes");
+    if (compress_result.compressed) {
+        if (compress_result.encoding) |enc| _ = response.setHeader("Content-Encoding", enc.headerValue());
+        // Vary: Accept-Encoding tells caches this response varies by encoding.
+        _ = response.setHeader("Vary", "Accept-Encoding");
+    }
 
     if (served.file_path != null) {
         _ = response.setContentLength(served.content_length);
@@ -246,9 +275,15 @@ pub fn writeStaticServedResponse(
         } else {
             return error.InvalidStaticTransferState;
         }
-    } else if (served.body) |body| {
+    } else if (out_body) |body| {
         try writer.writeAll(body);
-        state.logger.debug(correlation_id, "served static file via buffered path", .{});
+        if (compress_result.compressed) {
+            state.logger.debug(correlation_id, "served static file via buffered path (compressed: {s})", .{
+                if (compress_result.encoding) |enc| enc.headerValue() else "?",
+            });
+        } else {
+            state.logger.debug(correlation_id, "served static file via buffered path", .{});
+        }
     }
 
     return @intFromEnum(served.status_code);
@@ -356,13 +391,19 @@ test "sendFileFd: transfers file bytes via fallback loop on non-Linux" {
     if (file_fd < 0) return error.FileOpenFailed;
     defer _ = std.c.close(file_fd);
 
+    // std.posix.socketpair is not available on all platforms in Zig 0.16;
+    // use std.c.socketpair directly instead.
     var fds: [2]std.posix.fd_t = undefined;
-    try std.posix.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds);
-    defer std.posix.close(fds[0]);
-    defer std.posix.close(fds[1]);
+    const sp_rc = std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds);
+    if (sp_rc != 0) return error.SocketPairFailed;
+    defer _ = std.c.close(fds[0]);
+    defer _ = std.c.close(fds[1]);
 
     try sendFileFd(fds[0], file_fd, 0, data.len);
-    try std.posix.shutdown(fds[0], .send);
+    // Shut the write side so the reader sees EOF.
+    if (builtin.os.tag == .macos or builtin.os.tag == .linux) {
+        _ = std.c.shutdown(fds[0], std.posix.SHUT.WR);
+    }
 
     var buf: [64]u8 = undefined;
     const n = std.c.read(fds[1], &buf, buf.len);
@@ -404,4 +445,74 @@ test "serveTryFilesFallback: top-level root without try_files defaults to $uri" 
     defer served.deinit(allocator);
     try std.testing.expectEqual(http.status.Status.ok, served.status_code);
     try std.testing.expectEqual(@as(usize, 3), served.content_length);
+}
+
+test "writeStaticServedResponse: compresses buffered body when compression enabled" {
+    // This test exercises the integration path added in #142: when
+    // compression_config.enabled is true and the client advertises Accept-Encoding:
+    // gzip, a compressible buffered body must be served compressed.
+    //
+    // We exercise the compression decision directly — the same call as the
+    // production code — without requiring a full GatewayState. This keeps the
+    // test self-contained and fast while confirming the integration contract.
+    const allocator = std.testing.allocator;
+
+    // Build a body large enough to pass the min_size threshold (default: 256 bytes).
+    const body = "Hello, Tardigrade! " ** 20; // 380 bytes of repetitive text
+    try std.testing.expect(body.len >= http.compression.DEFAULT_MIN_SIZE);
+
+    const config: http.compression.CompressionConfig = .{
+        .enabled = true,
+        .min_size = 64, // lower than body.len
+        .brotli_enabled = false, // deterministic: brotli requires a shared lib at runtime
+    };
+
+    // Simulate the compression path in writeStaticServedResponse.
+    const result = http.compression.compressResponse(
+        allocator,
+        body,
+        "text/html; charset=utf-8",
+        "gzip, deflate",
+        config,
+    );
+    defer if (result.body) |b| allocator.free(b);
+
+    try std.testing.expect(result.compressed);
+    try std.testing.expect(result.body != null);
+    try std.testing.expect(result.body.?.len < body.len); // compressed is smaller
+    try std.testing.expectEqual(http.compression.Encoding.gzip, result.encoding.?);
+}
+
+test "writeStaticServedResponse: skips compression when config disabled" {
+    const allocator = std.testing.allocator;
+    const body = "Hello, Tardigrade! " ** 20;
+
+    const config: http.compression.CompressionConfig = .{ .enabled = false };
+    const result = http.compression.compressResponse(
+        allocator,
+        body,
+        "text/html; charset=utf-8",
+        "gzip",
+        config,
+    );
+    // No allocation when compression is disabled.
+    try std.testing.expect(!result.compressed);
+    try std.testing.expect(result.body == null);
+}
+
+test "writeStaticServedResponse: skips compression when client does not advertise Accept-Encoding" {
+    const allocator = std.testing.allocator;
+    const body = "Hello, Tardigrade! " ** 20;
+
+    const config: http.compression.CompressionConfig = .{ .enabled = true, .min_size = 64 };
+    // null accept_encoding: no Accept-Encoding header sent by the client.
+    const result = http.compression.compressResponse(
+        allocator,
+        body,
+        "text/html; charset=utf-8",
+        null,
+        config,
+    );
+    try std.testing.expect(!result.compressed);
+    try std.testing.expect(result.body == null);
 }

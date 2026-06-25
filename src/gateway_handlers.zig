@@ -1123,18 +1123,39 @@ fn handleHttp3StaticLocation(
         }
     }
 
+    // Compress the body for HTTP/3 responses (all H3 responses are buffered —
+    // no sendfile path). Compression is skipped for HEAD, 304, or when config
+    // or client do not allow it.
+    const is_head_req = std.mem.eql(u8, request.method, "HEAD");
+    const raw_body: []const u8 = if (is_head_req) "" else (served.body orelse "");
+    var compress_result: http.compression.CompressionResult = .{ .body = null, .compressed = false };
+    defer if (compress_result.body) |b| allocator.free(b);
+    if (!is_head_req and raw_body.len > 0) {
+        compress_result = http.compression.compressResponse(
+            allocator,
+            raw_body,
+            served.content_type,
+            request.headers.get("accept-encoding"),
+            ctx.state.compression_config,
+        );
+    }
+    const out_body: []const u8 = compress_result.body orelse raw_body;
     _ = response
         .setStatus(served.status_code)
-        .setBodyOwned(if (std.mem.eql(u8, request.method, "HEAD")) try allocator.dupe(u8, "") else try allocator.dupe(u8, served.body orelse ""))
+        .setBodyOwned(try allocator.dupe(u8, out_body))
         .setContentType(served.content_type)
         .setHeader(http.correlation.HEADER_NAME, correlation_id);
     if (served.etag_value) |etag_value| _ = response.setHeader("ETag", etag_value);
     if (served.last_modified_value) |last_modified| _ = response.setHeader("Last-Modified", last_modified);
     if (served.content_range_value) |content_range| _ = response.setHeader("Content-Range", content_range);
     if (served.accept_ranges) _ = response.setHeader("Accept-Ranges", "bytes");
+    if (compress_result.compressed) {
+        if (compress_result.encoding) |enc| _ = response.setHeader("Content-Encoding", enc.headerValue());
+        _ = response.setHeader("Vary", "Accept-Encoding");
+    }
     _ = response
         .setHeader("server", http.SERVER_NAME)
-        .setContentLength(served.content_length);
+        .setContentLength(out_body.len);
     applyResponseHeaders(ctx.state, response);
     ctx.state.metricsRecord(@intFromEnum(served.status_code));
     return true;
@@ -1332,4 +1353,10 @@ test "parseLastEventId handles invalid values" {
     try std.testing.expectEqual(@as(u64, 42), parseLastEventId("42"));
     try std.testing.expectEqual(@as(u64, 0), parseLastEventId("bad"));
     try std.testing.expectEqual(@as(u64, 0), parseLastEventId(null));
+}
+
+// Pull gateway_static_runtime into the unit-test runner so its tests are
+// discovered and executed as part of the gateway handler suite.
+test {
+    _ = @import("gateway_static_runtime.zig");
 }

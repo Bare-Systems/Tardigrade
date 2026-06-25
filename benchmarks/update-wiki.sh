@@ -147,13 +147,18 @@ fi
 
 # ── Prepend the new section before the first "---" divider ───────────────────
 # (i.e., before the first existing release section)
-awk -v section="$NEW_SECTION" '
+# Write section to a temp file — awk -v cannot handle multi-line strings portably.
+section_tmp=$(mktemp /tmp/tardi-wiki-section-XXXX.md)
+printf '%s\n' "$NEW_SECTION" > "$section_tmp"
+
+awk -v secfile="$section_tmp" '
     /^---$/ && !inserted {
-        print section
+        while ((getline line < secfile) > 0) print line
         inserted = 1
     }
     { print }
 ' "$HISTORY_FILE" > "${HISTORY_FILE}.tmp" && mv "${HISTORY_FILE}.tmp" "$HISTORY_FILE"
+rm -f "$section_tmp"
 
 # ── Commit and push ───────────────────────────────────────────────────────────
 cd "$WIKI_DIR"

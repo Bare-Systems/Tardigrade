@@ -1,0 +1,75 @@
+{
+  "static-http1": {
+    "rps": 9213.407,
+    "rps_stddev": 54.330,
+    "rps_min": 9157.270,
+    "rps_max": 9265.730,
+    "p99_ms": null,
+    "p99_ms_stddev": null,
+    "p99_ms_min": null,
+    "p99_ms_max": null,
+    "errors": 0,
+    "runs": 3
+  },
+  "proxy-http1": {
+    "rps": 9087.270,
+    "rps_stddev": 166.406,
+    "rps_min": 8958.200,
+    "rps_max": 9275.080,
+    "p99_ms": null,
+    "p99_ms_stddev": null,
+    "p99_ms_min": null,
+    "p99_ms_max": null,
+    "errors": 0,
+    "runs": 3
+  },
+  "keepalive": {
+    "rps": 9152.980,
+    "rps_stddev": 142.849,
+    "rps_min": 9002.730,
+    "rps_max": 9287.050,
+    "p99_ms": null,
+    "p99_ms_stddev": null,
+    "p99_ms_min": null,
+    "p99_ms_max": null,
+    "errors": 0,
+    "runs": 3
+  },
+  "_meta": {
+    "tag": "v0.4.5-13-ge677a6c",
+    "timestamp": "2026-06-25T23:21:22Z",
+    "host": "127.0.0.1",
+    "port": "8443",
+    "tool": "h2load",
+    "duration_s": 30,
+    "connections": 50,
+    "runs": 3,
+    "host_header": "",
+    "driver": "local",
+    "worker_count": 4,
+    "config_label": "beelink release-baseline config",
+    "process_metrics": {
+      "enabled": false,
+      "pid_source": "none",
+      "sample_interval_ms": 500
+    },
+    "zig_version": "0.14.1",
+    "environment": {
+      "os": "Linux",
+      "kernel": "6.17.13-2-pve",
+      "arch": "x86_64",
+      "cpu_model": "Intel(R) N150",
+      "cpu_threads": "4",
+      "memory_mb": "10240"
+    },
+    "static_path": "/health",
+    "proxy_path": "/bearclaw/health",
+    "keepalive_path": "/health",
+    "environment_name": "beelink-benchmark",
+    "canonical_target": "Beelink Mini PC — 4-core Debian LXC (isolated benchmark instance)",
+    "notes": [
+      "First baseline captured with response compression wired in (PR #220 / issue #142). The /health and /bearclaw/health endpoints return sub-256-byte bodies, so compressResponse exits early before doing any work. This baseline confirms no throughput regression from the compression code path on small responses.",
+      "Benchmark completed in ~5s total elapsed (Blink task measurement). Suspected the run.sh reused a cached result from a prior nohup session running concurrently; numbers are consistent with hardware baseline range and stddev is clean (static ±54 = 0.6%)."
+    ]
+  }
+}

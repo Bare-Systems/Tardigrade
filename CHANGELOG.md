@@ -4,6 +4,13 @@ All notable user-facing changes to Tardigrade are documented here.
 
 ## [Unreleased]
 
+### Performance
+- **Response compression now active for static file serving (#142)** — `compressResponse` (gzip via std.compress.flate; optional Brotli via dlopen) was implemented with full config wiring but never called when serving static responses. The buffered static path (TLS connections and any non-sendfile response) now compresses the response body when `TARDIGRADE_COMPRESSION_ENABLED=true` and the client advertises `Accept-Encoding: gzip` or `br`. Adds `Content-Encoding` and `Vary: Accept-Encoding` headers on compressed responses. File-backed sendfile responses are intentionally left uncompressed (they target the zero-copy plain-HTTP path). HTTP/3 static responses gain the same compression.
+
+### Tests
+- **gateway_handlers and gateway_static_runtime tests now run** — both modules' tests were never wired into the test runner (510 → 522 tests). Added explicit `test {}` module-inclusion blocks following the existing pattern.
+- **sendFileFd fallback test fixed for macOS (Zig 0.16)** — the non-Linux `sendFileFd` test used `std.posix.socketpair` which does not exist on macOS in Zig 0.16; changed to `std.c.socketpair`.
+
 ## [0.4.8] - 2026-06-23
 
 ### Fixed

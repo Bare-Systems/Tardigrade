@@ -1,0 +1,76 @@
+{
+  "static-http1": {
+    "rps": 8942.377,
+    "rps_stddev": 343.089,
+    "rps_min": 8734.890,
+    "rps_max": 9338.390,
+    "p99_ms": null,
+    "p99_ms_stddev": null,
+    "p99_ms_min": null,
+    "p99_ms_max": null,
+    "errors": 0,
+    "runs": 3
+  },
+  "proxy-http1": {
+    "rps": 8775.330,
+    "rps_stddev": 291.598,
+    "rps_min": 8582.140,
+    "rps_max": 9110.750,
+    "p99_ms": null,
+    "p99_ms_stddev": null,
+    "p99_ms_min": null,
+    "p99_ms_max": null,
+    "errors": 0,
+    "runs": 3
+  },
+  "keepalive": {
+    "rps": 9211.863,
+    "rps_stddev": 361.669,
+    "rps_min": 8810.680,
+    "rps_max": 9512.920,
+    "p99_ms": null,
+    "p99_ms_stddev": null,
+    "p99_ms_min": null,
+    "p99_ms_max": null,
+    "errors": 0,
+    "runs": 3
+  },
+  "_meta": {
+    "tag": "v0.4.5-9-gab934a1",
+    "timestamp": "2026-06-25T02:42:24Z",
+    "host": "127.0.0.1",
+    "port": "8443",
+    "tool": "h2load",
+    "duration_s": 30,
+    "connections": 50,
+    "runs": 3,
+    "host_header": "",
+    "driver": "local",
+    "worker_count": 4,
+    "config_label": "beelink release-baseline config",
+    "process_metrics": {
+      "enabled": false,
+      "pid_source": "none",
+      "sample_interval_ms": 500
+    },
+    "zig_version": "0.14.1",
+    "environment": {
+      "os": "Linux",
+      "kernel": "6.17.13-2-pve",
+      "arch": "x86_64",
+      "cpu_model": "Intel(R) N150",
+      "cpu_threads": "4",
+      "memory_mb": "10240"
+    },
+    "static_path": "/health",
+    "proxy_path": "/bearclaw/health",
+    "keepalive_path": "/health",
+    "environment_name": "beelink-benchmark",
+    "canonical_target": "Beelink Mini PC — 4-core Debian LXC (isolated benchmark instance)",
+    "notes": [
+      "tag corrected from 'unknown' — captured at commit ab934a1, 9 commits after v0.4.5 tag (docs/tooling only, no Zig source changes).",
+      "benchmark-run task errored with Encoding::CompatibilityError after run.sh completed — benchmark data was saved before the encoding error. Fix: redirect run.sh stdout to log file (applied to blink.toml).",
+      "Higher stddev on proxy-http1 and keepalive vs v0.4.5 suggests mild background load during this run."
+    ]
+  }
+}

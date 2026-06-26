@@ -1795,3 +1795,10 @@ test "return_response method enforcement — non-GET/HEAD rejected on static ret
     const is_redirect_302 = (302 >= 300 and 302 < 400);
     try std.testing.expect(is_redirect_302);
 }
+
+// Pull gateway_handlers (and its transitive imports, including
+// gateway_static_runtime) into the unit-test runner so their tests are
+// discovered and executed alongside the other edge-gateway tests.
+test {
+    _ = @import("gateway_handlers.zig");
+}

@@ -4,12 +4,16 @@ All notable user-facing changes to Tardigrade are documented here.
 
 ## [Unreleased]
 
+### Reliability
+- **Bounded manual TCP/TLS transport for buffered upstream proxying (#196)** — the data-plane buffered proxy path (`executeBoundedBufferedHttpProxyRequest`) and the control-plane JSON proxy path no longer route through a shared `std.http.Client`, which did not expose the upstream socket fd and therefore silently ignored `TARDIGRADE_UPSTREAM_TIMEOUT_MS`, `TARDIGRADE_UPSTREAM_CONNECT_TIMEOUT_MS`, and `TARDIGRADE_UPSTREAM_RESPONSE_TIMEOUT_MS` on TCP and non-mTLS HTTPS upstreams — a hung TCP origin could block a worker indefinitely. Both paths now connect a plain blocking socket (`connectBlockingTcp` / `connectBlockingUnix`), optionally wrap it in TLS, and bound the response read with `poll(2)`. (`SO_RCVTIMEO` is honored on AF_UNIX sockets but silently ignored on the AF_INET upstream sockets created via the std.Io threaded backend, so `poll` is the authoritative read deadline.) Plain and mTLS HTTPS upstreams are now unified on the timeout-enforcing OpenSSL transport. Upstream keepalive reuse is traded for timeout enforcement on the buffered path (richer pooling tracked in #141); the streaming data-plane path is unchanged.
+
 ### Performance
 - **Response compression now active for static file serving (#142)** — `compressResponse` (gzip via std.compress.flate; optional Brotli via dlopen) was implemented with full config wiring but never called when serving static responses. The buffered static path (TLS connections and any non-sendfile response) now compresses the response body when `TARDIGRADE_COMPRESSION_ENABLED=true` and the client advertises `Accept-Encoding: gzip` or `br`. Adds `Content-Encoding` and `Vary: Accept-Encoding` headers on compressed responses. File-backed sendfile responses are intentionally left uncompressed (they target the zero-copy plain-HTTP path). HTTP/3 static responses gain the same compression.
 
 ### Tests
 - **gateway_handlers and gateway_static_runtime tests now run** — both modules' tests were never wired into the test runner (510 → 522 tests). Added explicit `test {}` module-inclusion blocks following the existing pattern.
 - **sendFileFd fallback test fixed for macOS (Zig 0.16)** — the non-Linux `sendFileFd` test used `std.posix.socketpair` which does not exist on macOS in Zig 0.16; changed to `std.c.socketpair`.
+- **Bounded upstream transport tests (#196)** — added gateway_proxy unit tests covering the buffered request/response exchange, the `poll`-based response-read timeout against a silent peer, and end-to-end round-trips over a real TCP listener and a Unix-domain socket. Wired `gateway_proxy`, `gateway_proxy_runtime`, and `gateway_control_plane_proxy` into the unit-test runner so their tests execute.
 
 ## [0.4.8] - 2026-06-23
 

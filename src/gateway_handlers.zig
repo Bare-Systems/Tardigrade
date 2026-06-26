@@ -1021,7 +1021,6 @@ fn handleHttp3LocationProxyPass(
 
     var upstream_response = try executeBufferedDataPlaneProxyRequest(
         allocator,
-        &ctx.state.upstream_client,
         ctx.cfg,
         upstream_url.value,
         resolved.unix_socket_path,
@@ -1355,8 +1354,12 @@ test "parseLastEventId handles invalid values" {
     try std.testing.expectEqual(@as(u64, 0), parseLastEventId(null));
 }
 
-// Pull gateway_static_runtime into the unit-test runner so its tests are
-// discovered and executed as part of the gateway handler suite.
+// Pull gateway_static_runtime and the bounded proxy transports into the
+// unit-test runner so their tests are discovered and executed as part of the
+// gateway handler suite.
 test {
     _ = @import("gateway_static_runtime.zig");
+    _ = @import("gateway_proxy.zig");
+    _ = @import("gateway_proxy_runtime.zig");
+    _ = @import("gateway_control_plane_proxy.zig");
 }

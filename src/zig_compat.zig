@@ -179,6 +179,68 @@ pub fn connectUnixSocket(path: []const u8) !NetStream {
     };
 }
 
+/// Connect a *blocking* TCP socket to host:port via std.c, bypassing the
+/// std.Io event loop. Sockets created through `io()` are non-blocking and the
+/// threaded backend panics ("programmer bug ... AGAIN") on a SO_*TIMEO EAGAIN,
+/// so bounded transports that rely on SO_RCVTIMEO/SO_SNDTIMEO must own a plain
+/// blocking fd. On a blocking socket a timed-out recv returns EAGAIN, which
+/// std.posix.read maps to error.WouldBlock. Caller closes the fd.
+pub fn connectBlockingTcp(host: []const u8, port: u16) !std.posix.fd_t {
+    const resolved = try std.Io.net.IpAddress.resolve(io(), host, port);
+    switch (resolved) {
+        .ip4 => |ip4| {
+            // Set every field by name (including the address family, which
+            // ipAddressToSockAddr leaves zeroed) so connect() sees a valid
+            // sockaddr regardless of the platform sockaddr_in layout.
+            const sin: std.c.sockaddr.in = .{
+                .family = std.posix.AF.INET,
+                .port = std.mem.nativeToBig(u16, ip4.port),
+                // sin_addr is in network byte order; the address octets are
+                // already network-ordered, so bit-cast them directly (a
+                // host-endian readInt would byte-swap them on little-endian).
+                .addr = @bitCast(ip4.bytes),
+                .zero = [8]u8{ 0, 0, 0, 0, 0, 0, 0, 0 },
+            };
+            const sock = std.c.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, std.posix.IPPROTO.TCP);
+            if (sock < 0) return error.SocketFailed;
+            errdefer _ = std.c.close(sock);
+            if (std.c.connect(sock, @ptrCast(&sin), @sizeOf(std.c.sockaddr.in)) != 0) return error.ConnectionFailed;
+            return sock;
+        },
+        .ip6 => |ip6| {
+            const sin6: std.c.sockaddr.in6 = .{
+                .family = std.posix.AF.INET6,
+                .port = std.mem.nativeToBig(u16, ip6.port),
+                .flowinfo = 0,
+                .addr = ip6.bytes,
+                .scope_id = ip6.interface.index,
+            };
+            const sock = std.c.socket(std.posix.AF.INET6, std.posix.SOCK.STREAM, std.posix.IPPROTO.TCP);
+            if (sock < 0) return error.SocketFailed;
+            errdefer _ = std.c.close(sock);
+            if (std.c.connect(sock, @ptrCast(&sin6), @sizeOf(std.c.sockaddr.in6)) != 0) return error.ConnectionFailed;
+            return sock;
+        },
+    }
+}
+
+/// Connect a *blocking* Unix-domain socket via std.c, bypassing the std.Io
+/// event loop. See connectBlockingTcp for why bounded transports need a plain
+/// blocking fd. Caller closes the fd.
+pub fn connectBlockingUnix(path: []const u8) !std.posix.fd_t {
+    var addr = std.mem.zeroes(std.c.sockaddr.un);
+    addr.family = std.posix.AF.UNIX;
+    if (path.len >= addr.path.len) return error.NameTooLong;
+    @memcpy(addr.path[0..path.len], path);
+    addr.path[path.len] = 0;
+    const len: std.posix.socklen_t = @intCast(@offsetOf(std.c.sockaddr.un, "path") + path.len + 1);
+    const sock = std.c.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
+    if (sock < 0) return error.SocketFailed;
+    errdefer _ = std.c.close(sock);
+    if (std.c.connect(sock, @ptrCast(&addr), len) != 0) return error.ConnectionFailed;
+    return sock;
+}
+
 pub const NetConnection = struct {
     stream: NetStream,
 };

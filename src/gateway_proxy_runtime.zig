@@ -25,7 +25,6 @@ const isAbsoluteHttpUrl = gs.isAbsoluteHttpUrl;
 const executeBoundedControlPlaneJsonProxy = gcp.executeBoundedControlPlaneJsonProxy;
 const resolveProxyTarget = gp.resolveProxyTarget;
 const appendProxyQueryString = gp.appendProxyQueryString;
-const executeBoundedBufferedHttpsMtlsRequest = gp.executeBoundedBufferedHttpsMtlsRequest;
 const executeBoundedBufferedHttpProxyRequest = gp.executeBoundedBufferedHttpProxyRequest;
 const executeStreamingHttpProxyRequest = gp.executeStreamingHttpProxyRequest;
 const mapControlPlaneProxyExecutionError = gp.mapControlPlaneProxyExecutionError;
@@ -98,7 +97,6 @@ pub const DataPlaneProxyResponse = union(enum) {
 /// routing data-plane traffic through control-plane helper code.
 pub fn executeBufferedDataPlaneProxyRequest(
     allocator: std.mem.Allocator,
-    client: *std.http.Client,
     cfg: *const edge_config.EdgeConfig,
     url: []const u8,
     unix_socket_path: ?[]const u8,
@@ -117,29 +115,14 @@ pub fn executeBufferedDataPlaneProxyRequest(
     connect_timeout_ms: u32,
     response_timeout_ms: u32,
     cancel_token: ?*const http.cancellation.CancellationToken,
+    pool: ?*http.upstream_pool.UpstreamPool,
 ) !DataPlaneProxyResponse {
-    if (cfg.upstream_tls_client_cert.len > 0 and std.mem.startsWith(u8, url, "https://")) {
-        return .{ .bounded_buffered = try executeBoundedBufferedHttpsMtlsRequest(
-            allocator,
-            url,
-            method,
-            request_headers,
-            body,
-            correlation_id,
-            client_ip,
-            forwarded_proto,
-            incoming_host,
-            auth_identity,
-            auth_user_id,
-            auth_device_id,
-            auth_scopes,
-            cfg,
-        ) };
-    }
-
+    // HTTPS (plain and mTLS) and Unix/TCP HTTP are all dispatched inside
+    // executeBoundedBufferedHttpProxyRequest, which now owns transport
+    // selection, per-phase timeout enforcement (issue #196), and keep-alive
+    // pooling for plain HTTP (issue #141).
     return .{ .bounded_buffered = try executeBoundedBufferedHttpProxyRequest(
         allocator,
-        client,
         cfg,
         url,
         unix_socket_path,
@@ -158,6 +141,7 @@ pub fn executeBufferedDataPlaneProxyRequest(
         connect_timeout_ms,
         response_timeout_ms,
         cancel_token,
+        pool,
     ) };
 }
 
@@ -608,7 +592,6 @@ pub fn handleLocationProxyPass(
         const upstream_start_ms = http.event_loop.monotonicMs();
         const resp = executeBufferedDataPlaneProxyRequest(
             allocator,
-            &state.upstream_client,
             cfg,
             upstream_url.value,
             resolved.unix_socket_path,
@@ -627,6 +610,7 @@ pub fn handleLocationProxyPass(
             cfg.upstream_connect_timeout_ms,
             cfg.upstream_response_timeout_ms,
             if (ctx.lifecycle) |lc| &lc.token else null,
+            &state.upstream_pool,
         );
         state.recordUpstreamAttemptEnd(selection.base_url);
         const result = resp catch |err| {

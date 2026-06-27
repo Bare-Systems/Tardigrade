@@ -34,6 +34,12 @@ pub const Metrics = struct {
     proxy_upstream_aborts: u64,
     proxy_ttfb_ms_count: u64,
     proxy_ttfb_ms_sum: u64,
+    // Upstream keep-alive connection pool (#141). Populated from the pool's own
+    // snapshot at render time.
+    upstream_connections_new: u64,
+    upstream_connections_reused: u64,
+    upstream_connections_idle: u64,
+    upstream_stale_retries: u64,
     /// Request latency histogram bucket counts (milliseconds).
     latency_le_1ms: u64,
     latency_le_5ms: u64,
@@ -124,6 +130,10 @@ pub const Metrics = struct {
             .proxy_upstream_aborts = 0,
             .proxy_ttfb_ms_count = 0,
             .proxy_ttfb_ms_sum = 0,
+            .upstream_connections_new = 0,
+            .upstream_connections_reused = 0,
+            .upstream_connections_idle = 0,
+            .upstream_stale_retries = 0,
             .latency_le_1ms = 0,
             .latency_le_5ms = 0,
             .latency_le_10ms = 0,
@@ -481,6 +491,18 @@ pub const Metrics = struct {
             \\# TYPE tardigrade_proxy_ttfb_ms summary
             \\tardigrade_proxy_ttfb_ms_sum {d}
             \\tardigrade_proxy_ttfb_ms_count {d}
+            \\# HELP tardigrade_upstream_connections_new_total Upstream connections opened (keep-alive pool misses)
+            \\# TYPE tardigrade_upstream_connections_new_total counter
+            \\tardigrade_upstream_connections_new_total {d}
+            \\# HELP tardigrade_upstream_connections_reused_total Upstream connections served from the keep-alive pool
+            \\# TYPE tardigrade_upstream_connections_reused_total counter
+            \\tardigrade_upstream_connections_reused_total {d}
+            \\# HELP tardigrade_upstream_connections_idle Upstream connections currently held idle in the pool
+            \\# TYPE tardigrade_upstream_connections_idle gauge
+            \\tardigrade_upstream_connections_idle {d}
+            \\# HELP tardigrade_upstream_stale_retries_total Idempotent retries after a reused upstream connection was found dead
+            \\# TYPE tardigrade_upstream_stale_retries_total counter
+            \\tardigrade_upstream_stale_retries_total {d}
             \\
         , .{
             self.proxy_streaming_requests,
@@ -491,6 +513,10 @@ pub const Metrics = struct {
             self.proxy_upstream_aborts,
             self.proxy_ttfb_ms_sum,
             self.proxy_ttfb_ms_count,
+            self.upstream_connections_new,
+            self.upstream_connections_reused,
+            self.upstream_connections_idle,
+            self.upstream_stale_retries,
         });
 
         try out.print(
@@ -663,7 +689,7 @@ pub const Metrics = struct {
         var out = std.array_list.Managed(u8).init(allocator);
         errdefer out.deinit();
         try out.print(
-            \\{{"total_requests":{d},"status_2xx":{d},"status_3xx":{d},"status_4xx":{d},"status_5xx":{d},"uptime_seconds":{d},"active_connections":{d},"mux_connections":{d},"mux_subscriptions":{d},"connection_rejections":{d},"queue_rejections":{d},"upstream_unhealthy_backends":{d},"proxy_streaming_requests_total":{d},"proxy_buffered_requests_total":{d},"proxy_buffered_bytes_current":{d},"proxy_buffered_bytes_total":{d},"proxy_client_aborts_total":{d},"proxy_upstream_aborts_total":{d},"proxy_ttfb_ms_count":{d},"proxy_ttfb_ms_sum":{d}
+            \\{{"total_requests":{d},"status_2xx":{d},"status_3xx":{d},"status_4xx":{d},"status_5xx":{d},"uptime_seconds":{d},"active_connections":{d},"mux_connections":{d},"mux_subscriptions":{d},"connection_rejections":{d},"queue_rejections":{d},"upstream_unhealthy_backends":{d},"proxy_streaming_requests_total":{d},"proxy_buffered_requests_total":{d},"proxy_buffered_bytes_current":{d},"proxy_buffered_bytes_total":{d},"proxy_client_aborts_total":{d},"proxy_upstream_aborts_total":{d},"proxy_ttfb_ms_count":{d},"proxy_ttfb_ms_sum":{d},"upstream_connections_new_total":{d},"upstream_connections_reused_total":{d},"upstream_connections_idle":{d},"upstream_stale_retries_total":{d}
         , .{
             self.total_requests,
             self.status_2xx,
@@ -685,6 +711,10 @@ pub const Metrics = struct {
             self.proxy_upstream_aborts,
             self.proxy_ttfb_ms_count,
             self.proxy_ttfb_ms_sum,
+            self.upstream_connections_new,
+            self.upstream_connections_reused,
+            self.upstream_connections_idle,
+            self.upstream_stale_retries,
         });
         try out.print(
             \\,"request_latency_ms_count":{d},"request_latency_ms_sum":{d},"worker_active_jobs":{d},"worker_queued_jobs":{d},"worker_threads":{d},"worker_queue_capacity":{d},"worker_queue_wait_count":{d},"worker_queue_wait_sum_us":{d},"error_invalid_request":{d},"error_unauthorized":{d},"error_rate_limited":{d},"error_upstream_timeout":{d},"error_upstream_unavailable":{d},"error_internal_error":{d},"error_overload":{d},"error_request_timeout":{d},"mux_frame_errors":{d},"event_loop_iterations":{d},"health_probe_runs":{d},"reload_attempts_total":{d},"reload_success_total":{d},"reload_failure_total":{d},"drain_total":{d},"drain_timeouts_total":{d},"drain_forced_closes_total":{d}}}

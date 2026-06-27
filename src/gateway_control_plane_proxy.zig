@@ -26,9 +26,9 @@ const isTrustedUpstream = gp.isTrustedUpstream;
 const appendRequestIdHeaders = gp.appendRequestIdHeaders;
 const appendTrustedUpstreamHeaders = gp.appendTrustedUpstreamHeaders;
 const executeBoundedBufferedUnixSocketHttpRequest = gp.executeBoundedBufferedUnixSocketHttpRequest;
+const executeBoundedBufferedTcpHttpRequest = gp.executeBoundedBufferedTcpHttpRequest;
+const uriComponentBytes = gp.uriComponentBytes;
 const bufferedUpstreamResponseHasNoStore = gp.bufferedUpstreamResponseHasNoStore;
-const upstreamResponseHasNoStore = gp.upstreamResponseHasNoStore;
-const upstreamReasonPhrase = gp.upstreamReasonPhrase;
 const writeStreamedUpstreamResponse = gp.writeStreamedUpstreamResponse;
 const writeChunk = gp.writeChunk;
 
@@ -467,21 +467,52 @@ fn executeBoundedControlPlaneJsonProxyAttempt(
         payload,
     );
 
-    var server_header_buffer: [16 * 1024]u8 = undefined;
     const uri = try std.Uri.parse(current_url);
-    if (current_unix_socket_path) |socket_path| {
-        var buffered_resp = try executeBoundedBufferedUnixSocketHttpRequest(
-            allocator,
-            socket_path,
-            uri,
-            "POST",
-            extra_headers.items,
-            payload,
-            "application/json",
-            controlPlaneBufferedResponseLimit(cfg),
-            attempt_timeout_ms,
-            cfg.upstream_response_timeout_ms,
-        );
+    {
+        // Control-plane upstreams are reached over a bounded manual transport
+        // (Unix, TCP, or TLS) so per-phase connect/response timeouts are
+        // enforced. This previously routed TCP/HTTPS through a shared
+        // std.http.Client that could not bound a hung upstream (issue #196).
+        var buffered_resp = if (current_unix_socket_path) |socket_path|
+            try executeBoundedBufferedUnixSocketHttpRequest(
+                allocator,
+                socket_path,
+                uri,
+                "POST",
+                extra_headers.items,
+                payload,
+                "application/json",
+                controlPlaneBufferedResponseLimit(cfg),
+                attempt_timeout_ms,
+                cfg.upstream_response_timeout_ms,
+            )
+        else blk: {
+            const is_https = std.ascii.eqlIgnoreCase(uri.scheme, "https");
+            const upstream_host_name = if (uri.host) |h| uriComponentBytes(h) else return error.UpstreamProtocolError;
+            const upstream_port: u16 = uri.port orelse (if (is_https) @as(u16, 443) else 80);
+            const tls_options: ?http.tls_termination.UpstreamTlsOptions = if (is_https) .{
+                .skip_verify = !cfg.upstream_tls_verify,
+                .ca_bundle_path = cfg.upstream_tls_ca_bundle,
+                .sni_override = cfg.upstream_tls_server_name,
+                .client_cert_path = cfg.upstream_tls_client_cert,
+                .client_key_path = cfg.upstream_tls_client_key,
+            } else null;
+            break :blk try executeBoundedBufferedTcpHttpRequest(
+                allocator,
+                upstream_host_name,
+                upstream_port,
+                tls_options,
+                uri,
+                "POST",
+                extra_headers.items,
+                payload,
+                "application/json",
+                controlPlaneBufferedResponseLimit(cfg),
+                attempt_timeout_ms,
+                cfg.upstream_response_timeout_ms,
+                null, // control-plane keep-alive pooling deferred (#141)
+            );
+        };
         defer buffered_resp.deinit(allocator);
 
         const status_code = buffered_resp.status_code;
@@ -594,147 +625,6 @@ fn executeBoundedControlPlaneJsonProxyAttempt(
             },
         };
     }
-
-    // NOTE: attempt_timeout_ms is passed to this function but cannot be applied
-    // here because state.upstream_client is a shared std.http.Client that does
-    // not expose per-request socket timeout control. TCP control-plane calls are
-    // unbounded by the timeout policy until this path is replaced with a bounded
-    // manual transport matching the Unix-socket path above.
-    var req = try state.upstream_client.request(.POST, uri, .{
-        .headers = .{ .content_type = .{ .override = "application/json" } },
-        .extra_headers = extra_headers.items,
-        .keep_alive = false,
-        .redirect_behavior = .unhandled,
-    });
-    defer req.deinit();
-
-    try req.sendBodyComplete(@constCast(payload));
-    var resp = try req.receiveHead(&server_header_buffer);
-
-    const status_code: u16 = @intFromEnum(resp.head.status);
-    const upstream_reason = upstreamReasonPhrase(resp.head.status);
-    const upstream_content_type = resp.head.content_type orelse JSON_CONTENT_TYPE;
-    const upstream_content_disposition = resp.head.content_disposition;
-    const upstream_location = if (resp.head.location) |location|
-        try allocator.dupe(u8, location)
-    else
-        null;
-    errdefer if (upstream_location) |location| allocator.free(location);
-    const cacheable = !upstreamResponseHasNoStore(resp.head);
-    const stream_status = enable_streaming_success and (status_code == 200 or cfg.proxy_stream_all_statuses);
-    var resp_read_buf: [8192]u8 = undefined;
-    if (stream_status) {
-        try writeStreamedUpstreamResponse(
-            downstream_writer,
-            status_code,
-            upstream_reason,
-            upstream_content_type,
-            upstream_content_disposition,
-            correlation_id,
-            &state.security_headers,
-            sticky_set_cookie,
-        );
-
-        const read_buf = try state.relay_buffer_pool.acquire();
-        defer state.relay_buffer_pool.release(read_buf);
-        const body_reader = resp.reader(&resp_read_buf);
-        while (true) {
-            const n = try body_reader.read(read_buf);
-            if (n == 0) break;
-            try writeChunk(downstream_writer, read_buf[0..n]);
-        }
-        try downstream_writer.writeAll("0\r\n\r\n");
-        return .{ .streamed_status = .{ .status = status_code, .upstream_addr = upstream_host } };
-    }
-
-    if (status_code != 200) {
-        const buffered_content_type = try allocator.dupe(u8, upstream_content_type);
-        errdefer allocator.free(buffered_content_type);
-        const buffered_content_disposition = if (upstream_content_disposition) |cd|
-            try allocator.dupe(u8, cd)
-        else
-            null;
-        errdefer if (buffered_content_disposition) |cd| allocator.free(cd);
-        const buffered_set_cookie = if (sticky_set_cookie) |cookie|
-            try allocator.dupe(u8, cookie)
-        else
-            null;
-        errdefer if (buffered_set_cookie) |cookie| allocator.free(cookie);
-
-        const drain_buf = try state.relay_buffer_pool.acquire();
-        defer state.relay_buffer_pool.release(drain_buf);
-        const body_reader = resp.reader(&resp_read_buf);
-        while (true) {
-            const n = try body_reader.read(drain_buf);
-            if (n == 0) break;
-        }
-        state.appendTranscript(
-            upstreamScopeName(upstream_scope),
-            proxy_pass_target,
-            correlation_id,
-            auth_identity,
-            client_ip,
-            current_url,
-            payload,
-            status_code,
-            upstream_content_type,
-            "",
-            &.{},
-        );
-        return .{
-            .buffered = .{
-                .status = status_code,
-                .body = try allocator.alloc(u8, 0),
-                .content_type = buffered_content_type,
-                .content_disposition = buffered_content_disposition,
-                .location = upstream_location,
-                .set_cookie = buffered_set_cookie,
-                .cacheable = false,
-                .upstream_addr = upstream_host,
-            },
-        };
-    }
-
-    const max_buffered = controlPlaneBufferedResponseLimit(cfg);
-    const body = try resp.reader(&resp_read_buf).allocRemaining(allocator, .limited(max_buffered));
-    errdefer allocator.free(body);
-    const buffered_content_type = try allocator.dupe(u8, upstream_content_type);
-    errdefer allocator.free(buffered_content_type);
-    const buffered_content_disposition = if (upstream_content_disposition) |cd|
-        try allocator.dupe(u8, cd)
-    else
-        null;
-    errdefer if (buffered_content_disposition) |cd| allocator.free(cd);
-    const buffered_set_cookie = if (sticky_set_cookie) |cookie|
-        try allocator.dupe(u8, cookie)
-    else
-        null;
-    errdefer if (buffered_set_cookie) |cookie| allocator.free(cookie);
-    state.appendTranscript(
-        upstreamScopeName(upstream_scope),
-        proxy_pass_target,
-        correlation_id,
-        auth_identity,
-        client_ip,
-        current_url,
-        payload,
-        status_code,
-        buffered_content_type,
-        body,
-        &.{},
-    );
-    return .{
-        .buffered = .{
-            .status = status_code,
-            .body = body,
-            .content_type = buffered_content_type,
-            .content_disposition = buffered_content_disposition,
-            .location = upstream_location,
-            .set_cookie = buffered_set_cookie,
-            .cacheable = cacheable,
-            .upstream_addr = upstream_host,
-        },
-    };
 }
 
 test "control-plane buffered response limit is explicit and bounded" {

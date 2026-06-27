@@ -387,6 +387,15 @@ pub const EdgeConfig = struct {
     upstream_response_timeout_ms: u32,
     /// Total timeout budget across all upstream attempts for a request (ms, 0 = disabled).
     upstream_timeout_budget_ms: u64,
+    /// Keep-alive pooling of plain-HTTP upstream connections (#141). When false,
+    /// every proxied request opens a fresh `Connection: close` connection.
+    upstream_pool_enabled: bool,
+    /// Maximum idle upstream connections cached per origin.
+    upstream_pool_max_idle_per_host: usize,
+    /// Evict an idle upstream connection after this long unused (ms).
+    upstream_pool_idle_timeout_ms: u64,
+    /// Hard cap on total upstream connection age (ms, 0 = unlimited).
+    upstream_pool_max_lifetime_ms: u64,
     /// Passive health threshold: mark upstream as failed after this many failed attempts (0 = disabled).
     upstream_max_fails: u32,
     /// Passive health timeout (ms) for failed upstreams before retry eligibility.
@@ -1136,6 +1145,11 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     defer allocator.free(timeout_budget_str);
     const upstream_timeout_budget_ms = std.fmt.parseInt(u64, timeout_budget_str, 10) catch 0;
 
+    const upstream_pool_enabled = parseBoolEnv(allocator, "TARDIGRADE_UPSTREAM_POOL_ENABLED", true);
+    const upstream_pool_max_idle_per_host = parseIntEnv(usize, allocator, "TARDIGRADE_UPSTREAM_POOL_MAX_IDLE_PER_HOST", 32);
+    const upstream_pool_idle_timeout_ms = parseIntEnv(u64, allocator, "TARDIGRADE_UPSTREAM_POOL_IDLE_TIMEOUT_MS", 90_000);
+    const upstream_pool_max_lifetime_ms = parseIntEnv(u64, allocator, "TARDIGRADE_UPSTREAM_POOL_MAX_LIFETIME_MS", 0);
+
     const max_fails_str = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_MAX_FAILS", "0") catch unreachable;
     defer allocator.free(max_fails_str);
     const upstream_max_fails = std.fmt.parseInt(u32, max_fails_str, 10) catch 0;
@@ -1486,6 +1500,10 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .upstream_connect_timeout_ms = upstream_connect_timeout_ms,
         .upstream_response_timeout_ms = upstream_response_timeout_ms,
         .upstream_timeout_budget_ms = upstream_timeout_budget_ms,
+        .upstream_pool_enabled = upstream_pool_enabled,
+        .upstream_pool_max_idle_per_host = upstream_pool_max_idle_per_host,
+        .upstream_pool_idle_timeout_ms = upstream_pool_idle_timeout_ms,
+        .upstream_pool_max_lifetime_ms = upstream_pool_max_lifetime_ms,
         .upstream_max_fails = upstream_max_fails,
         .upstream_fail_timeout_ms = upstream_fail_timeout_ms,
         .upstream_active_health_interval_ms = upstream_active_health_interval_ms,

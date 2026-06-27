@@ -152,12 +152,22 @@ pub fn parseBufferedUpstreamResponse(allocator: std.mem.Allocator, raw: []const 
         });
     }
 
+    // Allocate everything into the arena BEFORE copying `metadata_arena` into
+    // the returned struct. A struct literal evaluates fields in order, so
+    // copying the arena first would snapshot its buffer list before these
+    // allocations — and when no headers were kept (response carried only
+    // hop-by-hop headers), the arena had no buffer node yet, so the `reason`
+    // node would be created only in the local arena and leak.
+    const reason_owned = try metadata_allocator.dupe(u8, reason);
+    const headers_owned = try resp_headers.toOwnedSlice();
+    const body_owned = try allocator.dupe(u8, resp_body);
+
     return .{
         .metadata_arena = metadata_arena,
         .status_code = status_code,
-        .reason = try metadata_allocator.dupe(u8, reason),
-        .headers = try resp_headers.toOwnedSlice(),
-        .body = try allocator.dupe(u8, resp_body),
+        .reason = reason_owned,
+        .headers = headers_owned,
+        .body = body_owned,
     };
 }
 
@@ -326,10 +336,51 @@ fn exchangeBoundedBufferedHttpRequest(
     }
     const read_deadline_ms = if (response_timeout_ms > 0) response_timeout_ms else send_timeout_ms;
 
+    // Read until the response is complete per HTTP/1.1 framing. We send
+    // `Connection: close`, but compliant keep-alive upstreams frame with
+    // Content-Length / chunked and may not close promptly, so reading until EOF
+    // would stall until the deadline. Determine the body boundary from the
+    // headers and stop there (issue #196).
     var resp_raw = std.array_list.Managed(u8).init(allocator);
     defer resp_raw.deinit();
     var read_buf: [8192]u8 = undefined;
+    var header_end: ?usize = null;
+    var framing: ResponseFraming = .close;
     while (true) {
+        if (header_end == null) {
+            if (std.mem.find(u8, resp_raw.items, "\r\n\r\n")) |he| {
+                header_end = he;
+                framing = detectResponseFraming(resp_raw.items[0..he], method);
+            }
+        }
+        if (header_end) |he| {
+            const body_start = he + 4;
+            const resp_body = resp_raw.items[body_start..];
+            switch (framing) {
+                .none => break,
+                .length => |content_length| {
+                    if (content_length > max_buffered_response_bytes) return error.StreamTooLong;
+                    if (resp_body.len >= content_length) {
+                        // Ignore any bytes past Content-Length (a kept-alive
+                        // socket may carry a following response).
+                        resp_raw.shrinkRetainingCapacity(body_start + content_length);
+                        break;
+                    }
+                },
+                .chunked => {
+                    if (try decodeChunkedBody(allocator, resp_body, max_buffered_response_bytes)) |decoded| {
+                        defer allocator.free(decoded);
+                        var rebuilt = std.array_list.Managed(u8).init(allocator);
+                        defer rebuilt.deinit();
+                        try rebuilt.appendSlice(resp_raw.items[0..body_start]);
+                        try rebuilt.appendSlice(decoded);
+                        return parseBufferedUpstreamResponse(allocator, rebuilt.items);
+                    }
+                },
+                .close => {}, // no length advertised — read until EOF
+            }
+        }
+
         if (read_deadline_ms > 0 and !try pollFdReadable(fd, read_deadline_ms)) {
             return error.Timeout;
         }
@@ -340,6 +391,84 @@ fn exchangeBoundedBufferedHttpRequest(
     }
 
     return parseBufferedUpstreamResponse(allocator, resp_raw.items);
+}
+
+/// How the upstream delimits the response body (RFC 7230 §3.3.3).
+const ResponseFraming = union(enum) {
+    none, // bodiless: HEAD request, or 1xx/204/304 status
+    length: usize, // Content-Length bytes follow the header block
+    chunked, // Transfer-Encoding: chunked
+    close, // no length advertised — body ends when the connection closes
+};
+
+fn responseStatusIsBodiless(status: u16) bool {
+    return (status >= 100 and status < 200) or status == 204 or status == 304;
+}
+
+/// Determine response framing from the header block (excluding the trailing
+/// CRLFCRLF), the request method, and the status line.
+fn detectResponseFraming(header_block: []const u8, method: []const u8) ResponseFraming {
+    const first_line_end = std.mem.find(u8, header_block, "\r\n") orelse header_block.len;
+    var status_parts = std.mem.splitScalar(u8, header_block[0..first_line_end], ' ');
+    _ = status_parts.next();
+    const status = std.fmt.parseInt(u16, status_parts.next() orelse "0", 10) catch 0;
+
+    if (std.ascii.eqlIgnoreCase(method, "HEAD")) return .none;
+    if (responseStatusIsBodiless(status)) return .none;
+
+    var content_length: ?usize = null;
+    var chunked = false;
+    var lines = std.mem.splitSequence(u8, header_block[@min(first_line_end + 2, header_block.len)..], "\r\n");
+    while (lines.next()) |line| {
+        const colon = std.mem.findScalar(u8, line, ':') orelse continue;
+        const name = std.mem.trim(u8, line[0..colon], " \t");
+        const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
+        if (std.ascii.eqlIgnoreCase(name, "transfer-encoding")) {
+            var tokens = std.mem.splitScalar(u8, value, ',');
+            while (tokens.next()) |token| {
+                if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, token, " \t"), "chunked")) chunked = true;
+            }
+        } else if (std.ascii.eqlIgnoreCase(name, "content-length")) {
+            content_length = std.fmt.parseInt(usize, value, 10) catch null;
+        }
+    }
+
+    // Transfer-Encoding takes precedence over Content-Length (RFC 7230 §3.3.3).
+    if (chunked) return .chunked;
+    if (content_length) |cl| return .{ .length = cl };
+    return .close;
+}
+
+/// Decode a chunked message body. Returns the decoded payload when the
+/// terminating zero-length chunk (and trailer section) has fully arrived, or
+/// null when more bytes are needed. The caller owns the returned slice.
+fn decodeChunkedBody(allocator: std.mem.Allocator, encoded: []const u8, max_bytes: usize) !?[]u8 {
+    var out = std.array_list.Managed(u8).init(allocator);
+    errdefer out.deinit();
+    var pos: usize = 0;
+    while (true) {
+        const line_len = std.mem.find(u8, encoded[pos..], "\r\n") orelse return null;
+        const size_line = encoded[pos .. pos + line_len];
+        // Strip optional chunk extensions (";name=value").
+        const size_str = if (std.mem.findScalar(u8, size_line, ';')) |s| size_line[0..s] else size_line;
+        const size = std.fmt.parseInt(usize, std.mem.trim(u8, size_str, " \t"), 16) catch return error.UpstreamProtocolError;
+        const data_start = pos + line_len + 2;
+        if (size == 0) {
+            // Last chunk: consume the (possibly empty) trailer section, which
+            // ends at the first blank line.
+            var tpos = data_start;
+            while (true) {
+                const tlen = std.mem.find(u8, encoded[tpos..], "\r\n") orelse return null;
+                if (tlen == 0) return try out.toOwnedSlice(); // blank line → done
+                tpos += tlen + 2;
+            }
+        }
+        const data_end = data_start + size;
+        if (data_end + 2 > encoded.len) return null; // chunk data + trailing CRLF not yet here
+        try out.appendSlice(encoded[data_start..data_end]);
+        if (out.items.len > max_bytes) return error.StreamTooLong;
+        pos = data_end + 2; // skip the CRLF after the chunk data
+    }
 }
 
 /// Wait up to `timeout_ms` for `fd` to become readable. Returns false on
@@ -1136,6 +1265,85 @@ test "exchangeBoundedBufferedHttpRequest enforces the response read timeout when
     // Returned via the 200ms poll deadline, well before any test-suite watchdog.
     try std.testing.expect(elapsed_ms >= 150);
     try std.testing.expect(elapsed_ms < 2_000);
+}
+
+/// Run an exchange against a peer that has pre-written `response` and then keeps
+/// the socket open (never closes) — simulating a keep-alive HTTP/1.1 upstream
+/// that frames its body with Content-Length/chunked. With a generous response
+/// timeout, a framing-unaware reader would block until the deadline; a correct
+/// one returns as soon as the framed body is complete.
+fn exchangeAgainstKeepAlivePeer(allocator: std.mem.Allocator, method: []const u8, response: []const u8) !BufferedUpstreamResponse {
+    const fds = try makeBlockingSocketpair();
+    const client_fd = fds[0];
+    const peer_fd = fds[1];
+    defer _ = std.c.close(client_fd);
+    defer _ = std.c.close(peer_fd);
+
+    _ = std.c.write(peer_fd, response.ptr, response.len);
+    // Deliberately do NOT close peer_fd — the body boundary must come from
+    // framing, not EOF.
+    const uri = try std.Uri.parse("http://localhost/");
+    return exchangeBoundedBufferedHttpRequest(
+        allocator,
+        compat.netStreamFromFd(client_fd),
+        client_fd,
+        uri,
+        method,
+        &.{},
+        "",
+        null,
+        1 << 20,
+        1_000,
+        1_000,
+    );
+}
+
+test "exchange stops at Content-Length on a keep-alive upstream (issue #196 regression)" {
+    const allocator = std.testing.allocator;
+    var resp = try exchangeAgainstKeepAlivePeer(
+        allocator,
+        "GET",
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\nConnection: keep-alive\r\n\r\nhello",
+    );
+    defer resp.deinit(allocator);
+    try std.testing.expectEqual(@as(u16, 200), resp.status_code);
+    try std.testing.expectEqualStrings("hello", resp.body);
+}
+
+test "exchange decodes a chunked body on a keep-alive upstream" {
+    const allocator = std.testing.allocator;
+    var resp = try exchangeAgainstKeepAlivePeer(
+        allocator,
+        "GET",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n",
+    );
+    defer resp.deinit(allocator);
+    try std.testing.expectEqual(@as(u16, 200), resp.status_code);
+    try std.testing.expectEqualStrings("hello world", resp.body);
+}
+
+test "exchange treats 204 as bodiless on a keep-alive upstream" {
+    const allocator = std.testing.allocator;
+    var resp = try exchangeAgainstKeepAlivePeer(
+        allocator,
+        "GET",
+        "HTTP/1.1 204 No Content\r\nConnection: keep-alive\r\n\r\n",
+    );
+    defer resp.deinit(allocator);
+    try std.testing.expectEqual(@as(u16, 204), resp.status_code);
+    try std.testing.expectEqual(@as(usize, 0), resp.body.len);
+}
+
+test "exchange treats a HEAD response as bodiless despite Content-Length" {
+    const allocator = std.testing.allocator;
+    var resp = try exchangeAgainstKeepAlivePeer(
+        allocator,
+        "HEAD",
+        "HTTP/1.1 200 OK\r\nContent-Length: 99\r\nConnection: keep-alive\r\n\r\n",
+    );
+    defer resp.deinit(allocator);
+    try std.testing.expectEqual(@as(u16, 200), resp.status_code);
+    try std.testing.expectEqual(@as(usize, 0), resp.body.len);
 }
 
 /// Raw blocking responder: accepts one connection, drains the request, writes a

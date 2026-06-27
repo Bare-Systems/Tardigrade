@@ -443,6 +443,7 @@ pub const GatewayState = struct {
     upstream_health: std.StringHashMap(UpstreamHealth), // owned keys [upstream_mutex]
     upstream_active_requests: std.StringHashMap(usize), // owned keys [upstream_mutex]
     fastcgi_pool: std.StringHashMap(std.ArrayList(compat.NetStream)), // owned keys+streams [connection_mutex]
+    upstream_pool: http.upstream_pool.UpstreamPool, // owned; self-synchronized keep-alive pool (#141)
     fastcgi_next_request_id: std.StringHashMap(u16), // owned keys [connection_mutex]
     proxy_cache_locks: std.StringHashMap(u32), // owned keys [proxy_cache_mutex]
     active_connections_by_ip: std.StringHashMap(u32), // owned keys [connection_mutex]
@@ -507,6 +508,7 @@ pub const GatewayState = struct {
             entry.value_ptr.deinit(self.allocator);
         }
         self.fastcgi_pool.deinit();
+        self.upstream_pool.deinit();
         var fastcgi_id_it = self.fastcgi_next_request_id.iterator();
         while (fastcgi_id_it.next()) |entry| self.allocator.free(entry.key_ptr.*);
         self.fastcgi_next_request_id.deinit();
@@ -1447,13 +1449,24 @@ pub const GatewayState = struct {
         self.metrics.recordWorkerQueueWaitNs(wait_ns);
     }
 
+    /// Copy the live upstream keep-alive pool counters into a metrics snapshot
+    /// just before rendering (the pool owns these counters, not `Metrics`).
+    fn overlayUpstreamPoolStats(self: *GatewayState, snapshot: *http.metrics.Metrics) void {
+        const ps = self.upstream_pool.snapshotStats();
+        snapshot.upstream_connections_new = ps.new_total;
+        snapshot.upstream_connections_reused = ps.reused_total;
+        snapshot.upstream_connections_idle = ps.idle;
+        snapshot.upstream_stale_retries = ps.stale_retries_total;
+    }
+
     pub fn metricsToJson(self: *GatewayState, allocator: std.mem.Allocator) ![]u8 {
         const mux_snapshot = try self.muxMetricsSnapshot(allocator);
         defer deinitMuxMetricsSnapshot(allocator, mux_snapshot.device_counts);
 
         self.metrics_mutex.lock();
-        const metrics_snapshot = self.metrics;
+        var metrics_snapshot = self.metrics;
         self.metrics_mutex.unlock();
+        self.overlayUpstreamPoolStats(&metrics_snapshot);
 
         // Delegate the counter list to the canonical serializer so the served
         // JSON can never drift from `Metrics.toJson` (mirrors how
@@ -1487,8 +1500,9 @@ pub const GatewayState = struct {
         defer deinitMuxMetricsSnapshot(allocator, mux_snapshot.device_counts);
 
         self.metrics_mutex.lock();
-        const metrics_snapshot = self.metrics;
+        var metrics_snapshot = self.metrics;
         self.metrics_mutex.unlock();
+        self.overlayUpstreamPoolStats(&metrics_snapshot);
 
         const base = try metrics_snapshot.toPrometheus(allocator);
         defer allocator.free(base);
@@ -3161,6 +3175,9 @@ fn initMetricsJsonTestState(gs: *GatewayState, allocator: std.mem.Allocator) voi
     gs.metrics_mutex = .{};
     gs.metrics = http.metrics.Metrics.init();
     gs.mux_subscriptions_by_device = std.StringHashMap(usize).init(allocator);
+    // metricsToJson/metricsToPrometheus overlay the upstream pool's live
+    // counters, so the pool must be a valid (empty) instance here.
+    gs.upstream_pool = http.upstream_pool.UpstreamPool.init(allocator, .{});
 }
 
 test "served metrics JSON exposes every counter the canonical serializer does" {

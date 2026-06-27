@@ -119,6 +119,12 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         .upstream_health = std.StringHashMap(UpstreamHealth).init(state_allocator),
         .upstream_active_requests = std.StringHashMap(usize).init(state_allocator),
         .fastcgi_pool = std.StringHashMap(std.ArrayList(compat.NetStream)).init(state_allocator),
+        .upstream_pool = http.upstream_pool.UpstreamPool.init(state_allocator, .{
+            .enabled = cfg.upstream_pool_enabled,
+            .max_idle_per_host = cfg.upstream_pool_max_idle_per_host,
+            .idle_timeout_ms = cfg.upstream_pool_idle_timeout_ms,
+            .max_lifetime_ms = cfg.upstream_pool_max_lifetime_ms,
+        }),
         .fastcgi_next_request_id = std.StringHashMap(u16).init(state_allocator),
         .proxy_cache_locks = std.StringHashMap(u32).init(state_allocator),
         .active_connections_by_ip = std.StringHashMap(u32).init(state_allocator),
@@ -603,6 +609,9 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
             // Close keepalive connections idle longer than the keepalive timeout
             // while parked off the worker pool (#138).
             _ = parked.reapIdle(http.event_loop.monotonicMs(), current_cfg.keep_alive_timeout_ms);
+            // Evict idle upstream keep-alive connections past their idle/lifetime
+            // caps (#141).
+            state.upstream_pool.reapIdle(http.event_loop.monotonicMs());
             const worker_snapshot = worker_pool.snapshot();
             state.metricsSetWorkerPoolStats(
                 worker_snapshot.active_jobs,

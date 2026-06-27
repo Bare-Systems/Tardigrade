@@ -204,17 +204,21 @@ pub fn executeBoundedBufferedUnixSocketHttpRequest(
         max_buffered_response_bytes,
         timeout_ms,
         response_timeout_ms,
+        false,
+        null,
     );
 }
 
 /// Execute a bounded buffered HTTP/1 request over a TCP socket, with optional
 /// TLS. This is the manual-transport replacement for the `std.http.Client`
 /// data-plane and control-plane proxy paths: unlike `std.http.Client` it
-/// exposes the underlying socket fd, so per-phase connect and response
-/// timeouts (`SO_SNDTIMEO`/`SO_RCVTIMEO`) are enforced. The connection is not
-/// pooled (`Connection: close`); upstream keepalive reuse on this path is
-/// traded for timeout enforcement (see issue #196; richer pooling tracked in
-/// issue #141).
+/// exposes the underlying socket fd, so per-phase connect and response timeouts
+/// (`SO_SNDTIMEO`/`SO_RCVTIMEO`/`poll`) are enforced (issue #196).
+///
+/// When `pool` is non-null and the upstream is plain HTTP, the connection is
+/// kept alive and reused across requests (issue #141 Phase 1). TLS upstreams are
+/// always `Connection: close` (TLS pooling is deferred — see
+/// `docs/UPSTREAM_POOLING.md`).
 pub fn executeBoundedBufferedTcpHttpRequest(
     allocator: std.mem.Allocator,
     host: []const u8,
@@ -234,15 +238,16 @@ pub fn executeBoundedBufferedTcpHttpRequest(
     /// If > 0, overrides `SO_RCVTIMEO` after the request is sent to bound the
     /// wait for the first response byte separately from the write phase.
     response_timeout_ms: u32,
+    /// Optional keep-alive pool for plain-HTTP upstream connection reuse.
+    pool: ?*http.upstream_pool.UpstreamPool,
 ) !BufferedUpstreamResponse {
-    const fd = try compat.connectBlockingTcp(host, port);
-    defer _ = std.c.close(fd);
-
-    if (connect_timeout_ms > 0) {
-        try setSocketTimeoutMs(fd, connect_timeout_ms, connect_timeout_ms);
-    }
-
+    // TLS upstreams: per-request connection, no pooling (Phase 1).
     if (tls_options) |opts| {
+        const fd = try compat.connectBlockingTcp(host, port);
+        defer _ = std.c.close(fd);
+        if (connect_timeout_ms > 0) {
+            try setSocketTimeoutMs(fd, connect_timeout_ms, connect_timeout_ms);
+        }
         var tls_conn = try http.tls_termination.UpstreamTlsConn.connect(fd, host, opts);
         defer tls_conn.deinit();
         return exchangeBoundedBufferedHttpRequest(
@@ -257,22 +262,76 @@ pub fn executeBoundedBufferedTcpHttpRequest(
             max_buffered_response_bytes,
             connect_timeout_ms,
             response_timeout_ms,
+            false,
+            null,
         );
     }
 
-    return exchangeBoundedBufferedHttpRequest(
-        allocator,
-        compat.netStreamFromFd(fd),
-        fd,
-        uri,
-        method,
-        extra_headers,
-        body,
-        content_type_override,
-        max_buffered_response_bytes,
-        connect_timeout_ms,
-        response_timeout_ms,
-    );
+    const active_pool: ?*http.upstream_pool.UpstreamPool = if (pool) |p| (if (p.config.enabled) p else null) else null;
+    const keep_alive = active_pool != null;
+
+    var key_buf: [262]u8 = undefined;
+    const key = std.fmt.bufPrint(&key_buf, "{s}:{d}", .{ host, port }) catch host;
+
+    // Attempt 0 uses a pooled connection when available; a reused connection the
+    // origin already closed (error.UpstreamConnectionClosed with zero bytes) is
+    // retried once on a fresh connection since the request was never delivered.
+    var attempt: usize = 0;
+    while (attempt < 2) : (attempt += 1) {
+        const now_ms = http.event_loop.monotonicMs();
+        var reused = false;
+        const fd = blk: {
+            if (attempt == 0) {
+                if (active_pool) |p| {
+                    if (p.acquire(key, now_ms)) |conn| {
+                        reused = true;
+                        break :blk conn.fd;
+                    }
+                }
+            }
+            const new_fd = try compat.connectBlockingTcp(host, port);
+            if (active_pool) |p| p.recordNew();
+            break :blk new_fd;
+        };
+
+        if (connect_timeout_ms > 0) {
+            setSocketTimeoutMs(fd, connect_timeout_ms, connect_timeout_ms) catch {};
+        }
+
+        var reusable = false;
+        const result = exchangeBoundedBufferedHttpRequest(
+            allocator,
+            compat.netStreamFromFd(fd),
+            fd,
+            uri,
+            method,
+            extra_headers,
+            body,
+            content_type_override,
+            max_buffered_response_bytes,
+            connect_timeout_ms,
+            response_timeout_ms,
+            keep_alive,
+            &reusable,
+        );
+
+        if (result) |resp| {
+            if (reusable and active_pool != null) {
+                active_pool.?.release(key, .{ .fd = fd, .created_ms = now_ms, .last_used_ms = now_ms }, http.event_loop.monotonicMs());
+            } else {
+                _ = std.c.close(fd);
+            }
+            return resp;
+        } else |err| {
+            _ = std.c.close(fd);
+            if (reused and err == error.UpstreamConnectionClosed and attempt == 0) {
+                if (active_pool) |p| p.recordStaleRetry();
+                continue; // retry once on a fresh connection
+            }
+            return err;
+        }
+    }
+    unreachable;
 }
 
 /// Send a bounded buffered HTTP/1 request over an already-connected transport
@@ -292,7 +351,15 @@ fn exchangeBoundedBufferedHttpRequest(
     max_buffered_response_bytes: usize,
     send_timeout_ms: u32,
     response_timeout_ms: u32,
+    /// When true the request omits `Connection: close`, allowing the upstream
+    /// socket to be returned to the pool for reuse.
+    keep_alive: bool,
+    /// Set (when non-null) to whether the connection may be safely reused after
+    /// this exchange: HTTP/1.1, no `Connection: close` in the response,
+    /// definitively framed body, and the socket left in sync.
+    reusable: ?*bool,
 ) !BufferedUpstreamResponse {
+    if (reusable) |r| r.* = false;
     if (send_timeout_ms > 0) {
         try setSocketTimeoutMs(fd, send_timeout_ms, send_timeout_ms);
     }
@@ -309,7 +376,9 @@ fn exchangeBoundedBufferedHttpRequest(
     }
     try req_writer.writeAll(" HTTP/1.1\r\n");
     try req_writer.print("Host: {s}\r\n", .{host});
-    try req_writer.writeAll("Connection: close\r\n");
+    if (!keep_alive) {
+        try req_writer.writeAll("Connection: close\r\n");
+    }
     if (content_type_override) |content_type| {
         try req_writer.print("Content-Type: {s}\r\n", .{content_type});
     }
@@ -336,11 +405,10 @@ fn exchangeBoundedBufferedHttpRequest(
     }
     const read_deadline_ms = if (response_timeout_ms > 0) response_timeout_ms else send_timeout_ms;
 
-    // Read until the response is complete per HTTP/1.1 framing. We send
-    // `Connection: close`, but compliant keep-alive upstreams frame with
-    // Content-Length / chunked and may not close promptly, so reading until EOF
-    // would stall until the deadline. Determine the body boundary from the
-    // headers and stop there (issue #196).
+    // Read until the response is complete per HTTP/1.1 framing. Reading until
+    // EOF would stall against keep-alive upstreams that frame with
+    // Content-Length / chunked and hold the socket open, so determine the body
+    // boundary from the headers and stop there (issue #196).
     var resp_raw = std.array_list.Managed(u8).init(allocator);
     defer resp_raw.deinit();
     var read_buf: [8192]u8 = undefined;
@@ -354,15 +422,22 @@ fn exchangeBoundedBufferedHttpRequest(
             }
         }
         if (header_end) |he| {
+            const headers_block = resp_raw.items[0..he];
             const body_start = he + 4;
             const resp_body = resp_raw.items[body_start..];
             switch (framing) {
-                .none => break,
+                .none => {
+                    // Bodiless: reusable only if nothing trailed the headers.
+                    setReusable(reusable, keep_alive, headers_block, resp_body.len == 0);
+                    break;
+                },
                 .length => |content_length| {
                     if (content_length > max_buffered_response_bytes) return error.StreamTooLong;
                     if (resp_body.len >= content_length) {
-                        // Ignore any bytes past Content-Length (a kept-alive
-                        // socket may carry a following response).
+                        // Extra bytes past Content-Length leave the socket out of
+                        // sync, so it can only be reused when the body landed
+                        // exactly on the boundary.
+                        setReusable(reusable, keep_alive, headers_block, resp_body.len == content_length);
                         resp_raw.shrinkRetainingCapacity(body_start + content_length);
                         break;
                     }
@@ -370,6 +445,7 @@ fn exchangeBoundedBufferedHttpRequest(
                 .chunked => {
                     if (try decodeChunkedBody(allocator, resp_body, max_buffered_response_bytes)) |decoded| {
                         defer allocator.free(decoded);
+                        setReusable(reusable, keep_alive, headers_block, true);
                         var rebuilt = std.array_list.Managed(u8).init(allocator);
                         defer rebuilt.deinit();
                         try rebuilt.appendSlice(resp_raw.items[0..body_start]);
@@ -377,7 +453,7 @@ fn exchangeBoundedBufferedHttpRequest(
                         return parseBufferedUpstreamResponse(allocator, rebuilt.items);
                     }
                 },
-                .close => {}, // no length advertised — read until EOF
+                .close => {}, // no length advertised — server will close; not reusable
             }
         }
 
@@ -390,7 +466,41 @@ fn exchangeBoundedBufferedHttpRequest(
         if (resp_raw.items.len > max_buffered_response_bytes) return error.StreamTooLong;
     }
 
+    // A reused keep-alive connection the origin closed while idle yields zero
+    // bytes here; surface it distinctly so the caller can retry on a fresh
+    // connection (the request was never delivered).
+    if (resp_raw.items.len == 0) return error.UpstreamConnectionClosed;
+
     return parseBufferedUpstreamResponse(allocator, resp_raw.items);
+}
+
+/// Set the caller's reusability flag: a connection may be reused only when we
+/// asked to keep it alive, the response is HTTP/1.1 without `Connection: close`,
+/// and the socket was left in sync (no bytes past the framed body).
+fn setReusable(out: ?*bool, keep_alive: bool, headers_block: []const u8, in_sync: bool) void {
+    const r = out orelse return;
+    if (!keep_alive or !in_sync) {
+        r.* = false;
+        return;
+    }
+    const first_line_end = std.mem.find(u8, headers_block, "\r\n") orelse headers_block.len;
+    if (!std.mem.startsWith(u8, headers_block[0..first_line_end], "HTTP/1.1")) {
+        r.* = false;
+        return;
+    }
+    var lines = std.mem.splitSequence(u8, headers_block[@min(first_line_end + 2, headers_block.len)..], "\r\n");
+    while (lines.next()) |line| {
+        const colon = std.mem.findScalar(u8, line, ':') orelse continue;
+        if (!std.ascii.eqlIgnoreCase(std.mem.trim(u8, line[0..colon], " \t"), "connection")) continue;
+        var tokens = std.mem.splitScalar(u8, std.mem.trim(u8, line[colon + 1 ..], " \t"), ',');
+        while (tokens.next()) |token| {
+            if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, token, " \t"), "close")) {
+                r.* = false;
+                return;
+            }
+        }
+    }
+    r.* = true;
 }
 
 /// How the upstream delimits the response body (RFC 7230 §3.3.3).
@@ -567,6 +677,8 @@ pub fn executeBoundedBufferedHttpProxyRequest(
     /// timeouts now that the path no longer routes through std.http.Client.
     response_timeout_ms: u32,
     cancel_token: ?*const CancellationToken,
+    /// Optional keep-alive pool for plain-HTTP upstream connection reuse (#141).
+    pool: ?*http.upstream_pool.UpstreamPool,
 ) !BufferedUpstreamResponse {
     // Bail out before touching the network if the request is already stopped.
     if (cancel_token) |tok| {
@@ -652,7 +764,7 @@ pub fn executeBoundedBufferedHttpProxyRequest(
     }
 
     // Plain HTTP/1 TCP upstream — manual bounded transport with per-phase
-    // timeout enforcement (issue #196). Connection is not pooled.
+    // timeout enforcement (issue #196) and optional keep-alive pooling (#141).
     const host = if (uri.host) |h| uriComponentBytes(h) else return error.UpstreamProtocolError;
     const port: u16 = uri.port orelse 80;
     const base_timeout_ms = if (attempt_timeout_ms > 0) attempt_timeout_ms else connect_timeout_ms;
@@ -677,6 +789,7 @@ pub fn executeBoundedBufferedHttpProxyRequest(
         max_buffered_response_bytes,
         effective_send_timeout_ms,
         effective_response_timeout_ms,
+        pool,
     );
 }
 
@@ -1211,6 +1324,8 @@ test "exchangeBoundedBufferedHttpRequest parses a buffered response from a peer"
         1 << 20,
         1_000,
         1_000,
+        false,
+        null,
     );
     defer resp.deinit(allocator);
 
@@ -1253,6 +1368,8 @@ test "exchangeBoundedBufferedHttpRequest enforces the response read timeout when
         1 << 20,
         1_000, // send timeout: generous
         200, // response timeout: short — this must fire on the silent peer
+        false,
+        null,
     );
     const elapsed_ms = http.event_loop.monotonicMs() - start_ms;
 
@@ -1295,6 +1412,8 @@ fn exchangeAgainstKeepAlivePeer(allocator: std.mem.Allocator, method: []const u8
         1 << 20,
         1_000,
         1_000,
+        false,
+        null,
     );
 }
 
@@ -1400,6 +1519,7 @@ test "connectBlockingTcp + exchange round-trips a real TCP origin" {
         1 << 20,
         2_000,
         2_000,
+        null,
     );
     defer resp.deinit(allocator);
 

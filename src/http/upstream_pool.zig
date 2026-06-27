@@ -5,9 +5,11 @@
 //! reuse on top of the manual bounded transport from #196. See
 //! `docs/UPSTREAM_POOLING.md` for the design rationale and deferred work.
 //!
-//! Scope: plain HTTP/1.1 TCP connections. TLS/mTLS and Unix-socket pooling are
-//! deferred. The pool stores raw fds and timestamps; the caller owns the HTTP
-//! exchange and decides reusability before calling `release`.
+//! Scope: HTTP/1.1 over TCP, plain or TLS (#141 Phase 1c). For TLS the pooled
+//! entry owns the OpenSSL connection; the key is scheme-prefixed so plain and
+//! TLS connections to the same host are never confused. Unix-socket pooling is
+//! deferred. The caller owns the HTTP exchange and decides reusability before
+//! calling `release`.
 //!
 //! Phase 1b adds per-upstream counters (new/reused/idle/active/stale), an
 //! `active` gauge (connections currently checked out), and a connect-latency
@@ -15,6 +17,7 @@
 
 const std = @import("std");
 const compat = @import("../zig_compat.zig");
+const tls_termination = @import("tls_termination.zig");
 
 pub const Config = struct {
     enabled: bool = true,
@@ -26,9 +29,13 @@ pub const Config = struct {
     max_lifetime_ms: u64 = 0,
 };
 
-/// A pooled connection: an owned socket fd plus age bookkeeping.
+/// A pooled connection: an owned socket fd plus age bookkeeping. For TLS
+/// upstreams `tls` holds the heap-owned OpenSSL connection (allocated with the
+/// pool's allocator); the pool deinits and frees it when the connection is
+/// closed. `tls` is null for plain HTTP.
 pub const PooledConn = struct {
     fd: std.posix.fd_t,
+    tls: ?*tls_termination.UpstreamTlsConn = null,
     created_ms: u64,
     last_used_ms: u64,
 };
@@ -73,10 +80,6 @@ const HostEntry = struct {
     stats: HostStats = .{},
 };
 
-fn closeFd(fd: std.posix.fd_t) void {
-    _ = std.c.close(fd);
-}
-
 pub const UpstreamPool = struct {
     allocator: std.mem.Allocator,
     mutex: compat.Mutex = .{},
@@ -97,7 +100,7 @@ pub const UpstreamPool = struct {
     pub fn deinit(self: *UpstreamPool) void {
         var it = self.hosts.iterator();
         while (it.next()) |entry| {
-            for (entry.value_ptr.idle.items) |conn| closeFd(conn.fd);
+            for (entry.value_ptr.idle.items) |conn| self.closeConn(conn);
             entry.value_ptr.idle.deinit(self.allocator);
             self.allocator.free(entry.key_ptr.*);
         }
@@ -109,6 +112,16 @@ pub const UpstreamPool = struct {
         if (self.config.idle_timeout_ms > 0 and now_ms -| conn.last_used_ms >= self.config.idle_timeout_ms) return true;
         if (self.config.max_lifetime_ms > 0 and now_ms -| conn.created_ms >= self.config.max_lifetime_ms) return true;
         return false;
+    }
+
+    /// Close a connection: tear down the owned TLS connection (if any), then
+    /// close the socket.
+    fn closeConn(self: *UpstreamPool, conn: PooledConn) void {
+        if (conn.tls) |t| {
+            t.deinit();
+            self.allocator.destroy(t);
+        }
+        _ = std.c.close(conn.fd);
     }
 
     /// Get or create the per-host entry for `key`, duping the key on insert.
@@ -136,7 +149,7 @@ pub const UpstreamPool = struct {
         const entry = self.hosts.getPtr(key) orelse return null;
         while (entry.idle.pop()) |conn| {
             if (self.isExpired(conn, now_ms)) {
-                closeFd(conn.fd);
+                self.closeConn(conn);
                 continue;
             }
             entry.stats.reused_total += 1;
@@ -163,7 +176,7 @@ pub const UpstreamPool = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         const entry = self.hostEntry(key) orelse {
-            closeFd(conn.fd);
+            self.closeConn(conn);
             return;
         };
         if (entry.stats.active > 0) entry.stats.active -= 1;
@@ -171,13 +184,13 @@ pub const UpstreamPool = struct {
         if (!self.config.enabled or !reusable or self.isExpired(conn, now_ms) or
             entry.idle.items.len >= self.config.max_idle_per_host)
         {
-            closeFd(conn.fd);
+            self.closeConn(conn);
             return;
         }
         var updated = conn;
         updated.last_used_ms = now_ms;
         entry.idle.append(self.allocator, updated) catch {
-            closeFd(conn.fd);
+            self.closeConn(conn);
             return;
         };
         entry.stats.idle = entry.idle.items.len;
@@ -215,7 +228,7 @@ pub const UpstreamPool = struct {
             var i: usize = 0;
             while (i < list.items.len) {
                 if (self.isExpired(list.items[i], now_ms)) {
-                    closeFd(list.orderedRemove(i).fd);
+                    self.closeConn(list.orderedRemove(i));
                 } else {
                     i += 1;
                 }

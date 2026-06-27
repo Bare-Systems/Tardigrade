@@ -103,15 +103,27 @@ downstream-keepalive reaper): connections past `idle_timeout_ms` or
 | `TARDIGRADE_UPSTREAM_POOL_IDLE_TIMEOUT_MS` | `90000` | Idle connection is evicted after this long unused. |
 | `TARDIGRADE_UPSTREAM_POOL_MAX_LIFETIME_MS` | `0` (unlimited) | Hard cap on total connection age. |
 
-## Metrics (Phase 1, global)
+## Metrics
 
+Global (Phase 1):
 - `tardigrade_upstream_connections_new_total`
 - `tardigrade_upstream_connections_reused_total`
 - `tardigrade_upstream_connections_idle` (gauge)
 - `tardigrade_upstream_stale_retries_total`
 
-Reuse ratio is `reused / (reused + new)`. Per-upstream labels and a connect
-latency histogram are deferred (see Deferred).
+Per-upstream labelled (`{upstream="host:port"}`, Phase 1b):
+- `tardigrade_upstream_pool_connections_new_total`
+- `tardigrade_upstream_pool_connections_reused_total`
+- `tardigrade_upstream_pool_connections_idle` (gauge)
+- `tardigrade_upstream_pool_connections_active` (gauge — connections checked out)
+- `tardigrade_upstream_pool_stale_retries_total`
+- `tardigrade_upstream_pool_reuse_ratio` (gauge — `reused / (reused + new)`)
+
+Connect-latency histogram (Phase 1b): `tardigrade_upstream_connect_latency_ms`
+(`_bucket`/`_sum`/`_count`).
+
+Still deferred: a hard `_MAX_ACTIVE_PER_HOST` cap (the `active` gauge is
+tracked, but enforcement needs backpressure semantics that couple with #140).
 
 ## Testing
 

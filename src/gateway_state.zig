@@ -76,6 +76,27 @@ pub fn maxBufferedUpstreamResponseBytes(cfg: *const edge_config.EdgeConfig) usiz
         MAX_REQUEST_SIZE;
 }
 
+/// Append `name{upstream="<escaped host>"} <value>\n` to a Prometheus buffer.
+fn appendUpstreamLabelMetric(
+    out: *std.array_list.Managed(u8),
+    name: []const u8,
+    upstream: []const u8,
+    comptime value_fmt: []const u8,
+    value_args: anytype,
+) !void {
+    try out.appendSlice(name);
+    try out.appendSlice("{upstream=\"");
+    for (upstream) |c| switch (c) {
+        '\\' => try out.appendSlice("\\\\"),
+        '"' => try out.appendSlice("\\\""),
+        '\n' => try out.appendSlice("\\n"),
+        else => try out.append(c),
+    };
+    try out.appendSlice("\"} ");
+    try out.print(value_fmt, value_args);
+    try out.appendSlice("\n");
+}
+
 pub const UpstreamPoolView = struct {
     fallback_url: []const u8,
     primary_urls: []const []const u8,
@@ -1452,11 +1473,64 @@ pub const GatewayState = struct {
     /// Copy the live upstream keep-alive pool counters into a metrics snapshot
     /// just before rendering (the pool owns these counters, not `Metrics`).
     fn overlayUpstreamPoolStats(self: *GatewayState, snapshot: *http.metrics.Metrics) void {
-        const ps = self.upstream_pool.snapshotStats();
+        const ps = self.upstream_pool.aggregateStats();
         snapshot.upstream_connections_new = ps.new_total;
         snapshot.upstream_connections_reused = ps.reused_total;
         snapshot.upstream_connections_idle = ps.idle;
         snapshot.upstream_stale_retries = ps.stale_retries_total;
+    }
+
+    /// Append per-upstream labelled pool series and the connect-latency
+    /// histogram to a Prometheus exposition buffer (#141 Phase 1b). These are
+    /// not part of the flat `Metrics` serializer because they are dynamically
+    /// keyed by origin.
+    fn appendUpstreamPoolPrometheus(self: *GatewayState, out: *std.array_list.Managed(u8)) !void {
+        const snaps = try self.upstream_pool.snapshotHosts(self.allocator);
+        defer http.upstream_pool.freeHostSnapshots(self.allocator, snaps);
+        if (snaps.len > 0) {
+            try out.appendSlice(
+                \\# HELP tardigrade_upstream_pool_connections_new_total Upstream connections opened per origin (keep-alive pool misses)
+                \\# TYPE tardigrade_upstream_pool_connections_new_total counter
+                \\# HELP tardigrade_upstream_pool_connections_reused_total Upstream connections served from the pool per origin
+                \\# TYPE tardigrade_upstream_pool_connections_reused_total counter
+                \\# HELP tardigrade_upstream_pool_connections_idle Idle upstream connections held in the pool per origin
+                \\# TYPE tardigrade_upstream_pool_connections_idle gauge
+                \\# HELP tardigrade_upstream_pool_connections_active In-flight upstream connections per origin
+                \\# TYPE tardigrade_upstream_pool_connections_active gauge
+                \\# HELP tardigrade_upstream_pool_stale_retries_total Stale-connection retries per origin
+                \\# TYPE tardigrade_upstream_pool_stale_retries_total counter
+                \\# HELP tardigrade_upstream_pool_reuse_ratio Reuse ratio (reused / (reused + new)) per origin
+                \\# TYPE tardigrade_upstream_pool_reuse_ratio gauge
+                \\
+            );
+        }
+        for (snaps) |snap| {
+            const s = snap.stats;
+            const total = s.reused_total + s.new_total;
+            const ratio: f64 = if (total == 0) 0 else @as(f64, @floatFromInt(s.reused_total)) / @as(f64, @floatFromInt(total));
+            try appendUpstreamLabelMetric(out, "tardigrade_upstream_pool_connections_new_total", snap.host, "{d}", .{s.new_total});
+            try appendUpstreamLabelMetric(out, "tardigrade_upstream_pool_connections_reused_total", snap.host, "{d}", .{s.reused_total});
+            try appendUpstreamLabelMetric(out, "tardigrade_upstream_pool_connections_idle", snap.host, "{d}", .{s.idle});
+            try appendUpstreamLabelMetric(out, "tardigrade_upstream_pool_connections_active", snap.host, "{d}", .{s.active});
+            try appendUpstreamLabelMetric(out, "tardigrade_upstream_pool_stale_retries_total", snap.host, "{d}", .{s.stale_retries_total});
+            try appendUpstreamLabelMetric(out, "tardigrade_upstream_pool_reuse_ratio", snap.host, "{d:.4}", .{ratio});
+        }
+
+        const lat = self.upstream_pool.connectLatencySnapshot();
+        try out.appendSlice(
+            \\# HELP tardigrade_upstream_connect_latency_ms Upstream TCP connect latency histogram in milliseconds
+            \\# TYPE tardigrade_upstream_connect_latency_ms histogram
+            \\
+        );
+        var cumulative: u64 = 0;
+        inline for (http.upstream_pool.connect_latency_bounds_ms, 0..) |bound, i| {
+            cumulative += lat.buckets[i];
+            try out.print("tardigrade_upstream_connect_latency_ms_bucket{{le=\"{d}\"}} {d}\n", .{ bound, cumulative });
+        }
+        cumulative += lat.buckets[http.upstream_pool.connect_latency_bounds_ms.len];
+        try out.print("tardigrade_upstream_connect_latency_ms_bucket{{le=\"+Inf\"}} {d}\n", .{cumulative});
+        try out.print("tardigrade_upstream_connect_latency_ms_sum {d}\n", .{lat.sum_ms});
+        try out.print("tardigrade_upstream_connect_latency_ms_count {d}\n", .{lat.count});
     }
 
     pub fn metricsToJson(self: *GatewayState, allocator: std.mem.Allocator) ![]u8 {
@@ -1522,6 +1596,7 @@ pub const GatewayState = struct {
                 try combined.appendSlice(line);
             }
         }
+        try self.appendUpstreamPoolPrometheus(&combined);
         return combined.toOwnedSlice();
     }
 

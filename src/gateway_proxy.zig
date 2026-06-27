@@ -215,10 +215,11 @@ pub fn executeBoundedBufferedUnixSocketHttpRequest(
 /// exposes the underlying socket fd, so per-phase connect and response timeouts
 /// (`SO_SNDTIMEO`/`SO_RCVTIMEO`/`poll`) are enforced (issue #196).
 ///
-/// When `pool` is non-null and the upstream is plain HTTP, the connection is
-/// kept alive and reused across requests (issue #141 Phase 1). TLS upstreams are
-/// always `Connection: close` (TLS pooling is deferred — see
-/// `docs/UPSTREAM_POOLING.md`).
+/// When `pool` is non-null and enabled the connection is kept alive and reused
+/// across requests (issue #141), for both plain HTTP and TLS (#141 Phase 1c).
+/// The pool key is scheme-prefixed so plain and TLS connections to the same
+/// origin are never confused. When pooling is off, a fresh `Connection: close`
+/// connection is used per request.
 pub fn executeBoundedBufferedTcpHttpRequest(
     allocator: std.mem.Allocator,
     host: []const u8,
@@ -238,40 +239,31 @@ pub fn executeBoundedBufferedTcpHttpRequest(
     /// If > 0, overrides `SO_RCVTIMEO` after the request is sent to bound the
     /// wait for the first response byte separately from the write phase.
     response_timeout_ms: u32,
-    /// Optional keep-alive pool for plain-HTTP upstream connection reuse.
+    /// Optional keep-alive pool for upstream connection reuse.
     pool: ?*http.upstream_pool.UpstreamPool,
 ) !BufferedUpstreamResponse {
-    // TLS upstreams: per-request connection, no pooling (Phase 1).
-    if (tls_options) |opts| {
+    const active_pool: ?*http.upstream_pool.UpstreamPool = if (pool) |p| (if (p.config.enabled) p else null) else null;
+
+    // No pool: a single fresh `Connection: close` connection (plain or TLS),
+    // cleaned up on return.
+    if (active_pool == null) {
         const fd = try compat.connectBlockingTcp(host, port);
         defer _ = std.c.close(fd);
         if (connect_timeout_ms > 0) {
             try setSocketTimeoutMs(fd, connect_timeout_ms, connect_timeout_ms);
         }
-        var tls_conn = try http.tls_termination.UpstreamTlsConn.connect(fd, host, opts);
-        defer tls_conn.deinit();
-        return exchangeBoundedBufferedHttpRequest(
-            allocator,
-            &tls_conn,
-            fd,
-            uri,
-            method,
-            extra_headers,
-            body,
-            content_type_override,
-            max_buffered_response_bytes,
-            connect_timeout_ms,
-            response_timeout_ms,
-            false,
-            null,
-        );
+        if (tls_options) |opts| {
+            var tls_conn = try http.tls_termination.UpstreamTlsConn.connect(fd, host, opts);
+            defer tls_conn.deinit();
+            return exchangeBoundedBufferedHttpRequest(allocator, &tls_conn, fd, uri, method, extra_headers, body, content_type_override, max_buffered_response_bytes, connect_timeout_ms, response_timeout_ms, false, null);
+        }
+        return exchangeBoundedBufferedHttpRequest(allocator, compat.netStreamFromFd(fd), fd, uri, method, extra_headers, body, content_type_override, max_buffered_response_bytes, connect_timeout_ms, response_timeout_ms, false, null);
     }
 
-    const active_pool: ?*http.upstream_pool.UpstreamPool = if (pool) |p| (if (p.config.enabled) p else null) else null;
-    const keep_alive = active_pool != null;
-
-    var key_buf: [262]u8 = undefined;
-    const key = std.fmt.bufPrint(&key_buf, "{s}:{d}", .{ host, port }) catch host;
+    const p = active_pool.?;
+    const is_tls = tls_options != null;
+    var key_buf: [268]u8 = undefined;
+    const key = std.fmt.bufPrint(&key_buf, "{s}:{s}:{d}", .{ if (is_tls) "https" else "http", host, port }) catch host;
 
     // Attempt 0 uses a pooled connection when available; a reused connection the
     // origin already closed (error.UpstreamConnectionClosed with zero bytes) is
@@ -282,21 +274,32 @@ pub fn executeBoundedBufferedTcpHttpRequest(
         var reused = false;
         var conn: http.upstream_pool.PooledConn = undefined;
         if (attempt == 0) {
-            if (active_pool) |p| {
-                if (p.acquire(key, now_ms)) |pooled| {
-                    conn = pooled;
-                    reused = true;
-                }
+            if (p.acquire(key, now_ms)) |pooled| {
+                conn = pooled;
+                reused = true;
             }
         }
         if (!reused) {
             const connect_start_ms = http.event_loop.monotonicMs();
             const new_fd = try compat.connectBlockingTcp(host, port);
-            if (active_pool) |p| {
-                p.recordConnectLatency(http.event_loop.monotonicMs() - connect_start_ms);
+            p.recordConnectLatency(http.event_loop.monotonicMs() - connect_start_ms);
+            if (is_tls) {
+                if (connect_timeout_ms > 0) setSocketTimeoutMs(new_fd, connect_timeout_ms, connect_timeout_ms) catch {};
+                const tls_ptr = p.allocator.create(http.tls_termination.UpstreamTlsConn) catch {
+                    _ = std.c.close(new_fd);
+                    return error.OutOfMemory;
+                };
+                tls_ptr.* = http.tls_termination.UpstreamTlsConn.connect(new_fd, host, tls_options.?) catch |err| {
+                    p.allocator.destroy(tls_ptr);
+                    _ = std.c.close(new_fd);
+                    return err;
+                };
                 p.noteNewConnection(key);
+                conn = .{ .fd = new_fd, .tls = tls_ptr, .created_ms = now_ms, .last_used_ms = now_ms };
+            } else {
+                p.noteNewConnection(key);
+                conn = .{ .fd = new_fd, .tls = null, .created_ms = now_ms, .last_used_ms = now_ms };
             }
-            conn = .{ .fd = new_fd, .created_ms = now_ms, .last_used_ms = now_ms };
         }
         const fd = conn.fd;
 
@@ -305,37 +308,18 @@ pub fn executeBoundedBufferedTcpHttpRequest(
         }
 
         var reusable = false;
-        const result = exchangeBoundedBufferedHttpRequest(
-            allocator,
-            compat.netStreamFromFd(fd),
-            fd,
-            uri,
-            method,
-            extra_headers,
-            body,
-            content_type_override,
-            max_buffered_response_bytes,
-            connect_timeout_ms,
-            response_timeout_ms,
-            keep_alive,
-            &reusable,
-        );
+        const result = if (conn.tls) |tls|
+            exchangeBoundedBufferedHttpRequest(allocator, tls, fd, uri, method, extra_headers, body, content_type_override, max_buffered_response_bytes, connect_timeout_ms, response_timeout_ms, true, &reusable)
+        else
+            exchangeBoundedBufferedHttpRequest(allocator, compat.netStreamFromFd(fd), fd, uri, method, extra_headers, body, content_type_override, max_buffered_response_bytes, connect_timeout_ms, response_timeout_ms, true, &reusable);
 
         if (result) |resp| {
-            if (active_pool) |p| {
-                p.release(key, conn, reusable, http.event_loop.monotonicMs());
-            } else {
-                _ = std.c.close(fd);
-            }
+            p.release(key, conn, reusable, http.event_loop.monotonicMs());
             return resp;
         } else |err| {
-            if (active_pool) |p| {
-                p.release(key, conn, false, http.event_loop.monotonicMs()); // active--, close
-            } else {
-                _ = std.c.close(fd);
-            }
+            p.release(key, conn, false, http.event_loop.monotonicMs()); // active--, close (deinits TLS)
             if (reused and err == error.UpstreamConnectionClosed and attempt == 0) {
-                if (active_pool) |p| p.recordStaleRetry(key);
+                p.recordStaleRetry(key);
                 continue; // retry once on a fresh connection
             }
             return err;
@@ -698,29 +682,6 @@ pub fn executeBoundedBufferedHttpProxyRequest(
     const max_buffered_response_bytes = maxBufferedUpstreamResponseBytes(cfg);
     const uri = try std.Uri.parse(url);
 
-    // HTTPS upstreams (plain or mTLS) use the OpenSSL transport, which exposes
-    // the underlying socket fd for timeout control and supports custom
-    // CA/SNI/client-cert config. It rebuilds proxy headers internally, so this
-    // delegation must happen before the shared header build below.
-    if (unix_socket_path == null and std.ascii.eqlIgnoreCase(uri.scheme, "https")) {
-        return executeBoundedBufferedHttpsMtlsRequest(
-            allocator,
-            url,
-            method,
-            request_headers,
-            body,
-            correlation_id,
-            client_ip,
-            forwarded_proto,
-            incoming_host,
-            auth_identity,
-            auth_user_id,
-            auth_device_id,
-            auth_scopes,
-            cfg,
-        );
-    }
-
     var extra_headers_stack = std.heap.stackFallback(2048, allocator);
     const extra_headers_allocator = extra_headers_stack.get();
     var forwarded_for = try gph.buildForwardedFor(allocator, request_headers.get("x-forwarded-for"), client_ip);
@@ -773,10 +734,19 @@ pub fn executeBoundedBufferedHttpProxyRequest(
         );
     }
 
-    // Plain HTTP/1 TCP upstream — manual bounded transport with per-phase
-    // timeout enforcement (issue #196) and optional keep-alive pooling (#141).
+    // Plain HTTP/1 or TLS TCP upstream — manual bounded transport with per-phase
+    // timeout enforcement (issue #196) and keep-alive pooling (#141). HTTPS uses
+    // the global upstream TLS config and is pooled separately from plain HTTP.
+    const is_https = std.ascii.eqlIgnoreCase(uri.scheme, "https");
     const host = if (uri.host) |h| uriComponentBytes(h) else return error.UpstreamProtocolError;
-    const port: u16 = uri.port orelse 80;
+    const port: u16 = uri.port orelse (if (is_https) @as(u16, 443) else 80);
+    const tls_options: ?http.tls_termination.UpstreamTlsOptions = if (is_https) .{
+        .skip_verify = !cfg.upstream_tls_verify,
+        .ca_bundle_path = cfg.upstream_tls_ca_bundle,
+        .sni_override = cfg.upstream_tls_server_name,
+        .client_cert_path = cfg.upstream_tls_client_cert,
+        .client_key_path = cfg.upstream_tls_client_key,
+    } else null;
     const base_timeout_ms = if (attempt_timeout_ms > 0) attempt_timeout_ms else connect_timeout_ms;
     const effective_send_timeout_ms = if (cancel_token) |tok|
         tok.effectiveTimeoutMs(base_timeout_ms)
@@ -790,7 +760,7 @@ pub fn executeBoundedBufferedHttpProxyRequest(
         allocator,
         host,
         port,
-        null,
+        tls_options,
         uri,
         method,
         extra_headers.items,
@@ -801,122 +771,6 @@ pub fn executeBoundedBufferedHttpProxyRequest(
         effective_response_timeout_ms,
         pool,
     );
-}
-
-/// Execute the bounded buffered HTTPS/mTLS compatibility transport using
-/// OpenSSL directly, supporting custom CA bundles, SNI overrides, and mutual
-/// TLS client certificates. Used when `TARDIGRADE_UPSTREAM_TLS_CLIENT_CERT`
-/// is set; not a streaming data-plane implementation.
-pub fn executeBoundedBufferedHttpsMtlsRequest(
-    allocator: std.mem.Allocator,
-    url: []const u8,
-    method: []const u8,
-    request_headers: *const http.Headers,
-    body: []const u8,
-    correlation_id: []const u8,
-    client_ip: []const u8,
-    forwarded_proto: []const u8,
-    incoming_host: ?[]const u8,
-    auth_identity: ?[]const u8,
-    auth_user_id: ?[]const u8,
-    auth_device_id: ?[]const u8,
-    auth_scopes: ?[]const u8,
-    cfg: *const edge_config.EdgeConfig,
-) !BufferedUpstreamResponse {
-    const max_buffered_response_bytes = maxBufferedUpstreamResponseBytes(cfg);
-    const uri = try std.Uri.parse(url);
-    const host = if (uri.host) |h| switch (h) {
-        .raw => |r| r,
-        .percent_encoded => |pe| pe,
-    } else return error.UnsupportedHttpMethod;
-    const port: u16 = if (uri.port) |p| p else 443;
-    const tcp_stream = try compat.tcpConnectToHost(allocator, host, port);
-    defer tcp_stream.close();
-
-    // Apply upstream connect timeout to bound the TLS handshake. The TCP
-    // connect itself is blocking, so this timeout bounds the handshake stall
-    // rather than the TCP SYN. Falls back to upstream_timeout_ms when the
-    // connect-specific timeout is not set.
-    const effective_connect_timeout_ms = if (cfg.upstream_connect_timeout_ms > 0)
-        cfg.upstream_connect_timeout_ms
-    else
-        cfg.upstream_timeout_ms;
-    if (effective_connect_timeout_ms > 0) {
-        gconn.setSocketTimeoutMs(tcp_stream.handle, effective_connect_timeout_ms, effective_connect_timeout_ms) catch {};
-    }
-
-    var tls_conn = try http.tls_termination.UpstreamTlsConn.connect(tcp_stream.handle, host, .{
-        .skip_verify = !cfg.upstream_tls_verify,
-        .ca_bundle_path = cfg.upstream_tls_ca_bundle,
-        .sni_override = cfg.upstream_tls_server_name,
-        .client_cert_path = cfg.upstream_tls_client_cert,
-        .client_key_path = cfg.upstream_tls_client_key,
-    });
-    defer tls_conn.deinit();
-
-    // Build and send HTTP/1.1 request.
-    const path_raw = switch (uri.path) {
-        .raw => |path| if (path.len > 0) path else "/",
-        .percent_encoded => |path| if (path.len > 0) path else "/",
-    };
-    var forwarded_for = try gph.buildForwardedFor(allocator, request_headers.get("x-forwarded-for"), client_ip);
-    defer forwarded_for.deinit(allocator);
-
-    var req_aw: std.Io.Writer.Allocating = .init(allocator);
-    defer req_aw.deinit();
-    const req_writer = &req_aw.writer;
-    try req_writer.print("{s} {s} HTTP/1.1\r\n", .{ method, path_raw });
-    try req_writer.print("Host: {s}\r\n", .{host});
-    try req_writer.print("Connection: close\r\n", .{});
-    if (body.len > 0) try req_writer.print("Content-Length: {d}\r\n", .{body.len});
-    try gph.writeRequestIdHeaders(req_writer, correlation_id);
-    try req_writer.print("X-Forwarded-For: {s}\r\n", .{forwarded_for.value});
-    try req_writer.print("X-Real-IP: {s}\r\n", .{client_ip});
-    try req_writer.print("X-Forwarded-Proto: {s}\r\n", .{forwarded_proto});
-    if (incoming_host) |h| {
-        const trimmed = std.mem.trim(u8, h, " \t\r\n");
-        if (trimmed.len > 0) try req_writer.print("X-Forwarded-Host: {s}\r\n", .{trimmed});
-    }
-    try gph.writeAssertedIdentityHeaders(req_writer, auth_identity, auth_user_id, auth_device_id, auth_scopes);
-    const connection_header = request_headers.get("connection");
-    for (request_headers.iterator()) |entry| {
-        if (gph.shouldSkipUpstreamRequestHeader(entry.name, connection_header)) continue;
-        try req_writer.print("{s}: {s}\r\n", .{ entry.name, entry.value });
-    }
-    // W3C Trace Context: originate when absent (inbound propagation happens via
-    // the iterator loop above since traceparent is not in the skip list).
-    if (request_headers.get("traceparent") == null) {
-        var tp_buf: [55]u8 = undefined;
-        const tc = http.trace_context.generate();
-        const tp = tc.format(&tp_buf);
-        if (tp.len > 0) try req_writer.print("traceparent: {s}\r\n", .{tp});
-    }
-    try req_writer.writeAll("\r\n");
-    if (body.len > 0) try req_writer.writeAll(body);
-
-    // After the TLS handshake, switch to the per-attempt read/write timeout for
-    // request write and response read phases.
-    if (cfg.upstream_timeout_ms > 0) {
-        const resp_timeout_ms = if (cfg.upstream_response_timeout_ms > 0)
-            cfg.upstream_response_timeout_ms
-        else
-            cfg.upstream_timeout_ms;
-        gconn.setSocketTimeoutMs(tcp_stream.handle, resp_timeout_ms, cfg.upstream_timeout_ms) catch {};
-    }
-
-    try tls_conn.writeAll(req_aw.written());
-
-    // Read the raw HTTP response.
-    var resp_raw = std.array_list.Managed(u8).init(allocator);
-    defer resp_raw.deinit();
-    var read_buf: [8192]u8 = undefined;
-    while (true) {
-        const n = tls_conn.read(&read_buf) catch 0;
-        if (n == 0) break;
-        try resp_raw.appendSlice(read_buf[0..n]);
-        if (resp_raw.items.len > max_buffered_response_bytes) return error.StreamTooLong;
-    }
-    return parseBufferedUpstreamResponse(allocator, resp_raw.items);
 }
 
 pub fn executeStreamingHttpProxyRequest(

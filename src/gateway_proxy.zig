@@ -280,19 +280,25 @@ pub fn executeBoundedBufferedTcpHttpRequest(
     while (attempt < 2) : (attempt += 1) {
         const now_ms = http.event_loop.monotonicMs();
         var reused = false;
-        const fd = blk: {
-            if (attempt == 0) {
-                if (active_pool) |p| {
-                    if (p.acquire(key, now_ms)) |conn| {
-                        reused = true;
-                        break :blk conn.fd;
-                    }
+        var conn: http.upstream_pool.PooledConn = undefined;
+        if (attempt == 0) {
+            if (active_pool) |p| {
+                if (p.acquire(key, now_ms)) |pooled| {
+                    conn = pooled;
+                    reused = true;
                 }
             }
+        }
+        if (!reused) {
+            const connect_start_ms = http.event_loop.monotonicMs();
             const new_fd = try compat.connectBlockingTcp(host, port);
-            if (active_pool) |p| p.recordNew();
-            break :blk new_fd;
-        };
+            if (active_pool) |p| {
+                p.recordConnectLatency(http.event_loop.monotonicMs() - connect_start_ms);
+                p.noteNewConnection(key);
+            }
+            conn = .{ .fd = new_fd, .created_ms = now_ms, .last_used_ms = now_ms };
+        }
+        const fd = conn.fd;
 
         if (connect_timeout_ms > 0) {
             setSocketTimeoutMs(fd, connect_timeout_ms, connect_timeout_ms) catch {};
@@ -316,16 +322,20 @@ pub fn executeBoundedBufferedTcpHttpRequest(
         );
 
         if (result) |resp| {
-            if (reusable and active_pool != null) {
-                active_pool.?.release(key, .{ .fd = fd, .created_ms = now_ms, .last_used_ms = now_ms }, http.event_loop.monotonicMs());
+            if (active_pool) |p| {
+                p.release(key, conn, reusable, http.event_loop.monotonicMs());
             } else {
                 _ = std.c.close(fd);
             }
             return resp;
         } else |err| {
-            _ = std.c.close(fd);
+            if (active_pool) |p| {
+                p.release(key, conn, false, http.event_loop.monotonicMs()); // active--, close
+            } else {
+                _ = std.c.close(fd);
+            }
             if (reused and err == error.UpstreamConnectionClosed and attempt == 0) {
-                if (active_pool) |p| p.recordStaleRetry();
+                if (active_pool) |p| p.recordStaleRetry(key);
                 continue; // retry once on a fresh connection
             }
             return err;

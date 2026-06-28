@@ -4,6 +4,9 @@ All notable user-facing changes to Tardigrade are documented here.
 
 ## [Unreleased]
 
+### Testing
+- **CI perf smoke now guards upstream connection reuse (#141)** — `benchmarks/ci-smoke.sh` scrapes the gateway metrics endpoint after the proxy run and fails if fewer than 80% of upstream connections were reused (`reused / (reused + new)`). This catches a regression to per-request connections — the exact failure mode that motivated the pool (#196 dropped reuse to zero). The smoke fixture gains a `metrics_path`.
+
 ### Documentation
 - **Archived old HTTP server patterns research (#227)** — preserved the workspace-root `tardi-perf-maxxing.md` draft in a closed GitHub archive issue and removed the stale local research file. The active Tardigrade performance work remains tracked in the existing milestone-backed GitHub issues.
 

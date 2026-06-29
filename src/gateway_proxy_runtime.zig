@@ -481,7 +481,6 @@ pub fn handleLocationProxyPass(
         state.recordUpstreamAttemptStart(selection.base_url);
         const streamed = executeStreamingHttpProxyRequest(
             allocator,
-            &state.upstream_client,
             cfg,
             upstream_url.value,
             method_str,
@@ -501,6 +500,7 @@ pub fn handleLocationProxyPass(
             &state.security_headers,
             sticky_set_cookie,
             if (ctx.lifecycle) |lc| &lc.token else null,
+            &state.upstream_pool,
         ) catch |err| {
             state.recordUpstreamAttemptEnd(selection.base_url);
             if (err == error.ClientAborted) {

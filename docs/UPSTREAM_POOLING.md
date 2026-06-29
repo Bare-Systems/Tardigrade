@@ -1,7 +1,8 @@
 # Upstream connection pooling (#141)
 
-Status: **Phase 1 implemented** (plain-HTTP keepalive reuse). Later phases tracked
-in issue #141.
+Status: **Phases 1–3 implemented** (plain-HTTP, TLS, control-plane, FastCGI, and
+the streaming path all pool on the manual transport). Later phases tracked in
+issue #141.
 
 ## Why
 
@@ -16,10 +17,19 @@ transport, so we keep both timeout enforcement **and** keepalive.
 
 ## Scope
 
-In scope (Phases 1 / 1b / 1c / 2):
+In scope (Phases 1 / 1b / 1c / 2 / 3):
 - Reuse **HTTP/1.1 TCP** upstream connections — **plain HTTP** (Phase 1) and
   **TLS** (Phase 1c) — on the data-plane buffered path (default proxy mode,
   `TARDIGRADE_PROXY_STREAMING_MODE=off`) and the **control-plane** path.
+- Reuse upstream connections on the **streaming** proxy path (Phase 3,
+  `TARDIGRADE_PROXY_STREAMING_MODE=response|full`), which now uses the same
+  manual bounded transport + pool as the buffered path instead of
+  `std.http.Client`. The upstream head and body are parsed/relayed with a
+  framing-aware streaming reader (Content-Length / chunked / bodiless /
+  close-delimited), re-chunked downstream with bounded buffering
+  (`TARDIGRADE_PROXY_STREAM_BUFFER_SIZE`, min 16 KiB). Per-phase `poll(2)`
+  timeouts are enforced here too, closing the last #196 timeout gap. With this
+  `std.http.Client` is retired from the data plane.
 - Reuse **FastCGI** connections through the same pool (Phase 2), keyed under a
   `fastcgi:` prefix. The pool stores a `compat.NetStream`, so it holds both the
   data-plane's raw-fd connections and FastCGI's connections uniformly.
@@ -39,8 +49,10 @@ Deferred (tracked on #141):
   server closes after each response), so they are *not* pooled (Phase 2 did fix
   their transport to raw blocking sockets, so they no longer stall, but each
   request still opens a fresh connection).
-- Streaming path (`executeStreamingHttpProxyRequest` still uses
-  `std.http.Client`; retiring it is Phase 3, depends on #139).
+- Stale-connection retry on the streaming path is best-effort: a dead pooled
+  connection is retried once on a fresh one, but only before any downstream
+  byte is written and only for requests without a streaming request body (a
+  partially-relayed response cannot be safely replayed).
 - Cross-worker connection stealing/sharing (Phase 4 / #147).
 - HTTP/2 upstream multiplexing (#145).
 

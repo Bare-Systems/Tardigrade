@@ -639,11 +639,6 @@ pub fn bufferedUpstreamResponseHasNoStore(response: *const BufferedUpstreamRespo
     return false;
 }
 
-fn markRequestConnectionClosing(req: *std.http.Client.Request) void {
-    if (req.connection) |connection| {
-        connection.closing = true;
-    }
-}
 
 /// Execute the current bounded buffered HTTP/1 reverse-proxy transport.
 /// `gateway_proxy_runtime.zig` owns data-plane retry/routing semantics and
@@ -773,9 +768,365 @@ pub fn executeBoundedBufferedHttpProxyRequest(
     );
 }
 
+// ---------------------------------------------------------------------------
+// Manual streaming upstream reader (#141 Phase 3)
+//
+// Replaces std.http.Client's framing-aware reader on the streaming proxy path
+// with a poll-bounded manual reader so streaming inherits the #196 timeout
+// enforcement and pooling instead of the opaque client.
+// ---------------------------------------------------------------------------
+
+/// A sliding-window read buffer over a manual transport. Holds bytes read from
+/// the socket so the response head can be parsed and the body streamed without
+/// re-reading. `buf` is caller-owned.
+const StreamReadBuf = struct {
+    buf: []u8,
+    start: usize = 0,
+    end: usize = 0,
+
+    fn available(self: *const StreamReadBuf) []u8 {
+        return self.buf[self.start..self.end];
+    }
+
+    fn consume(self: *StreamReadBuf, n: usize) void {
+        self.start += n;
+        if (self.start == self.end) {
+            self.start = 0;
+            self.end = 0;
+        }
+    }
+
+    /// Read more bytes from the transport (poll-bounded). Returns false on EOF.
+    fn fill(self: *StreamReadBuf, transport: anytype, fd: std.posix.fd_t, deadline_ms: u32) !bool {
+        if (self.start == self.end) {
+            self.start = 0;
+            self.end = 0;
+        } else if (self.end == self.buf.len) {
+            std.mem.copyForwards(u8, self.buf[0 .. self.end - self.start], self.buf[self.start..self.end]);
+            self.end -= self.start;
+            self.start = 0;
+        }
+        if (self.end == self.buf.len) return error.StreamTooLong; // window full without a delimiter
+        if (deadline_ms > 0 and !try pollFdReadable(fd, deadline_ms)) return error.Timeout;
+        const n = try transport.read(self.buf[self.end..]);
+        if (n == 0) return false;
+        self.end += n;
+        return true;
+    }
+};
+
+fn cancelStopped(tok: ?*const CancellationToken) bool {
+    if (tok) |t| return t.isStopped();
+    return false;
+}
+
+const ParsedUpstreamHead = struct {
+    status_code: u16,
+    reason: []const u8, // arena-owned
+    headers: []UpstreamHeader, // arena-owned
+    framing: ResponseFraming,
+    connection_close: bool,
+    http_1_1: bool,
+};
+
+/// Read and parse the upstream response head from `rb` (poll-bounded), leaving
+/// any already-read body bytes in `rb`. reason/headers are allocated in `arena`.
+fn readUpstreamHead(
+    arena: std.mem.Allocator,
+    rb: *StreamReadBuf,
+    transport: anytype,
+    fd: std.posix.fd_t,
+    deadline_ms: u32,
+    method: []const u8,
+) !ParsedUpstreamHead {
+    while (std.mem.find(u8, rb.available(), "\r\n\r\n") == null) {
+        if (!try rb.fill(transport, fd, deadline_ms)) {
+            return if (rb.available().len == 0) error.UpstreamConnectionClosed else error.UpstreamProtocolError;
+        }
+    }
+    const win = rb.available();
+    const head_end = std.mem.find(u8, win, "\r\n\r\n").?;
+    const header_block = win[0..head_end];
+
+    const first_line_end = std.mem.find(u8, header_block, "\r\n") orelse head_end;
+    const status_line = header_block[0..first_line_end];
+    const http_1_1 = std.mem.startsWith(u8, status_line, "HTTP/1.1");
+    var sp = std.mem.splitScalar(u8, status_line, ' ');
+    _ = sp.next();
+    const status_code = std.fmt.parseInt(u16, sp.next() orelse "0", 10) catch 0;
+    const reason = try arena.dupe(u8, sp.rest());
+
+    var headers = std.array_list.Managed(UpstreamHeader).init(arena);
+    var connection_close = false;
+    var lines = std.mem.splitSequence(u8, header_block[@min(first_line_end + 2, header_block.len)..], "\r\n");
+    while (lines.next()) |line| {
+        const colon = std.mem.findScalar(u8, line, ':') orelse continue;
+        const name = std.mem.trim(u8, line[0..colon], " \t");
+        const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
+        if (std.ascii.eqlIgnoreCase(name, "connection")) {
+            var toks = std.mem.splitScalar(u8, value, ',');
+            while (toks.next()) |t| {
+                if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, t, " \t"), "close")) connection_close = true;
+            }
+        }
+        if (gph.shouldSkipUpstreamResponseHeader(name)) continue;
+        try headers.append(.{ .name = try arena.dupe(u8, name), .value = try arena.dupe(u8, value) });
+    }
+    const framing = detectResponseFraming(header_block, method);
+    rb.consume(head_end + 4);
+    return .{
+        .status_code = status_code,
+        .reason = reason,
+        .headers = try headers.toOwnedSlice(),
+        .framing = framing,
+        .connection_close = connection_close,
+        .http_1_1 = http_1_1,
+    };
+}
+
+const RelayOutcome = struct {
+    body_bytes: usize,
+    aborted: bool, // upstream closed/failed before the framed body completed
+    reusable: bool, // connection may be returned to the pool
+};
+
+fn readChunkSize(rb: *StreamReadBuf, transport: anytype, fd: std.posix.fd_t, deadline_ms: u32) !?usize {
+    while (std.mem.find(u8, rb.available(), "\r\n") == null) {
+        if (!try rb.fill(transport, fd, deadline_ms)) return null;
+    }
+    const avail = rb.available();
+    const eol = std.mem.find(u8, avail, "\r\n").?;
+    const size_line = avail[0..eol];
+    const size_str = if (std.mem.findScalar(u8, size_line, ';')) |s| size_line[0..s] else size_line;
+    const size = std.fmt.parseInt(usize, std.mem.trim(u8, size_str, " \t"), 16) catch return error.UpstreamProtocolError;
+    rb.consume(eol + 2);
+    return size;
+}
+
+fn consumeExactCrlf(rb: *StreamReadBuf, transport: anytype, fd: std.posix.fd_t, deadline_ms: u32) !bool {
+    while (rb.available().len < 2) {
+        if (!try rb.fill(transport, fd, deadline_ms)) return false;
+    }
+    rb.consume(2);
+    return true;
+}
+
+fn consumeChunkTrailers(rb: *StreamReadBuf, transport: anytype, fd: std.posix.fd_t, deadline_ms: u32) !bool {
+    while (true) {
+        while (std.mem.find(u8, rb.available(), "\r\n") == null) {
+            if (!try rb.fill(transport, fd, deadline_ms)) return false;
+        }
+        const avail = rb.available();
+        const eol = std.mem.find(u8, avail, "\r\n").?;
+        rb.consume(eol + 2);
+        if (eol == 0) return true; // blank line terminates the trailer section
+    }
+}
+
+/// Relay the upstream response body to `downstream_writer` (re-chunked via
+/// `writeChunk`), decoding the upstream framing as it streams. Returns the
+/// number of body bytes relayed and whether the connection is reusable.
+/// Downstream write failures surface as error.ClientAborted.
+fn relayUpstreamBody(
+    rb: *StreamReadBuf,
+    transport: anytype,
+    fd: std.posix.fd_t,
+    deadline_ms: u32,
+    framing: ResponseFraming,
+    downstream_writer: anytype,
+    cancel_token: ?*const CancellationToken,
+) !RelayOutcome {
+    var total: usize = 0;
+    switch (framing) {
+        .none => return .{ .body_bytes = 0, .aborted = false, .reusable = true },
+        .length => |content_length| {
+            var remaining = content_length;
+            while (remaining > 0) {
+                if (cancelStopped(cancel_token)) return error.RequestCancelled;
+                if (rb.available().len == 0 and !try rb.fill(transport, fd, deadline_ms)) {
+                    return .{ .body_bytes = total, .aborted = true, .reusable = false };
+                }
+                const take = @min(rb.available().len, remaining);
+                gpres.writeChunk(downstream_writer, rb.available()[0..take]) catch return error.ClientAborted;
+                rb.consume(take);
+                total += take;
+                remaining -= take;
+            }
+            return .{ .body_bytes = total, .aborted = false, .reusable = true };
+        },
+        .chunked => {
+            while (true) {
+                if (cancelStopped(cancel_token)) return error.RequestCancelled;
+                const size = (try readChunkSize(rb, transport, fd, deadline_ms)) orelse
+                    return .{ .body_bytes = total, .aborted = true, .reusable = false };
+                if (size == 0) {
+                    if (!try consumeChunkTrailers(rb, transport, fd, deadline_ms)) {
+                        return .{ .body_bytes = total, .aborted = true, .reusable = false };
+                    }
+                    return .{ .body_bytes = total, .aborted = false, .reusable = true };
+                }
+                var chunk_remaining = size;
+                while (chunk_remaining > 0) {
+                    if (rb.available().len == 0 and !try rb.fill(transport, fd, deadline_ms)) {
+                        return .{ .body_bytes = total, .aborted = true, .reusable = false };
+                    }
+                    const take = @min(rb.available().len, chunk_remaining);
+                    gpres.writeChunk(downstream_writer, rb.available()[0..take]) catch return error.ClientAborted;
+                    rb.consume(take);
+                    total += take;
+                    chunk_remaining -= take;
+                }
+                if (!try consumeExactCrlf(rb, transport, fd, deadline_ms)) {
+                    return .{ .body_bytes = total, .aborted = true, .reusable = false };
+                }
+            }
+        },
+        .close => {
+            while (true) {
+                if (cancelStopped(cancel_token)) return error.RequestCancelled;
+                if (rb.available().len == 0 and !try rb.fill(transport, fd, deadline_ms)) break;
+                gpres.writeChunk(downstream_writer, rb.available()) catch return error.ClientAborted;
+                total += rb.available().len;
+                rb.consume(rb.available().len);
+            }
+            // Close-delimited responses cannot be reused (the socket is spent).
+            return .{ .body_bytes = total, .aborted = false, .reusable = false };
+        },
+    }
+}
+
+/// Send the proxied request head and body to the upstream over `transport`.
+/// `streaming_body` relays the client upload incrementally; `buffered_body` is
+/// sent in one shot. Keep-alive (no `Connection: close`) so the connection can
+/// be pooled.
+fn sendStreamingProxyRequest(
+    allocator: std.mem.Allocator,
+    transport: anytype,
+    uri: std.Uri,
+    method: []const u8,
+    extra_headers: []const std.http.Header,
+    buffered_body: []const u8,
+    streaming_body: ?StreamingRequestBody,
+    downstream_conn: anytype,
+    cancel_token: ?*const CancellationToken,
+) !void {
+    var req_aw: std.Io.Writer.Allocating = .init(allocator);
+    defer req_aw.deinit();
+    const w = &req_aw.writer;
+    var host_buf: [256]u8 = undefined;
+    const host = if (uri.host) |value| try value.toRaw(&host_buf) else "localhost";
+
+    try w.print("{s} {s}", .{ method, uriComponentBytes(uri.path) });
+    if (uri.query) |query| try w.print("?{s}", .{uriComponentBytes(query)});
+    try w.writeAll(" HTTP/1.1\r\n");
+    try w.print("Host: {s}\r\n", .{host});
+    for (extra_headers) |header| try w.print("{s}: {s}\r\n", .{ header.name, header.value });
+    if (streaming_body) |sb| {
+        try w.print("Content-Length: {d}\r\n", .{sb.content_length});
+    } else if (buffered_body.len > 0) {
+        try w.print("Content-Length: {d}\r\n", .{buffered_body.len});
+    }
+    try w.writeAll("\r\n");
+    try transport.writeAll(req_aw.written());
+
+    if (streaming_body) |sb| {
+        var relay: [16 * 1024]u8 = undefined;
+        var sent: usize = @min(sb.initial_bytes.len, sb.content_length);
+        if (sent > 0) try transport.writeAll(sb.initial_bytes[0..sent]);
+        while (sent < sb.content_length) {
+            if (cancelStopped(cancel_token)) return error.RequestCancelled;
+            const want = @min(relay.len, sb.content_length - sent);
+            const n = downstream_conn.read(relay[0..want]) catch return error.ClientAborted;
+            if (n == 0) return error.ClientAborted;
+            try transport.writeAll(relay[0..n]);
+            sent += n;
+        }
+    } else if (buffered_body.len > 0) {
+        try transport.writeAll(buffered_body);
+    }
+}
+
+/// Run one streaming proxy attempt over an already-connected `transport`: send
+/// the request, read the response head, relay the head+body downstream, and
+/// report whether the connection is reusable. `wrote_downstream` is set true the
+/// moment any response bytes are written to the client (after which the caller
+/// must not retry on a fresh connection).
+fn streamProxyOverTransport(
+    allocator: std.mem.Allocator,
+    transport: anytype,
+    fd: std.posix.fd_t,
+    read_buf: []u8,
+    uri: std.Uri,
+    method: []const u8,
+    extra_headers: []const std.http.Header,
+    buffered_body: []const u8,
+    streaming_body: ?StreamingRequestBody,
+    downstream_conn: anytype,
+    downstream_writer: anytype,
+    security: *const http.security_headers.SecurityHeaders,
+    sticky_set_cookie: ?[]const u8,
+    correlation_id: []const u8,
+    connect_timeout_ms: u32,
+    read_deadline_ms: u32,
+    cancel_token: ?*const CancellationToken,
+    wrote_downstream: *bool,
+) !struct { result: StreamingProxyResult, reusable: bool } {
+    if (connect_timeout_ms > 0) setSocketTimeoutMs(fd, connect_timeout_ms, connect_timeout_ms) catch {};
+    try sendStreamingProxyRequest(allocator, transport, uri, method, extra_headers, buffered_body, streaming_body, downstream_conn, cancel_token);
+    if (read_deadline_ms > 0) setSocketRecvTimeoutMs(fd, read_deadline_ms) catch {};
+
+    const ttfb_start_ms = http.event_loop.monotonicMs();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var rb = StreamReadBuf{ .buf = read_buf };
+    const head = try readUpstreamHead(arena.allocator(), &rb, transport, fd, read_deadline_ms, method);
+    const ttfb_ms = http.event_loop.monotonicMs() - ttfb_start_ms;
+
+    const reason = gpres.upstreamReasonPhrase(@enumFromInt(head.status_code));
+    const body_allowed = gpres.responseBodyAllowed(method, head.status_code);
+
+    gpres.writeStreamedUpstreamResponseHeadFromHeaders(
+        downstream_writer,
+        head.status_code,
+        reason,
+        head.headers,
+        body_allowed,
+        correlation_id,
+        security,
+        sticky_set_cookie,
+    ) catch return error.ClientAborted;
+    wrote_downstream.* = true;
+
+    var body_bytes: usize = 0;
+    var aborted = false;
+    var reusable = head.http_1_1 and !head.connection_close;
+    if (body_allowed) {
+        const outcome = try relayUpstreamBody(&rb, transport, fd, read_deadline_ms, head.framing, downstream_writer, cancel_token);
+        body_bytes = outcome.body_bytes;
+        aborted = outcome.aborted;
+        reusable = reusable and outcome.reusable;
+        if (!aborted) gpres.writeChunk(downstream_writer, "") catch return error.ClientAborted;
+    }
+    if (aborted) reusable = false;
+
+    return .{
+        .result = .{
+            .status_code = head.status_code,
+            .reason = reason,
+            .response_body_bytes = body_bytes,
+            .upstream_ttfb_ms = ttfb_ms,
+            .upstream_aborted = aborted,
+        },
+        .reusable = reusable,
+    };
+}
+
+/// Stream a reverse-proxy request/response over the manual bounded transport
+/// (issue #141 Phase 3), replacing `std.http.Client`. The upstream connection
+/// is pooled (plain or TLS) and per-phase reads are `poll`-bounded, so the
+/// streaming path inherits the #196 timeout enforcement and #141 reuse.
 pub fn executeStreamingHttpProxyRequest(
     allocator: std.mem.Allocator,
-    client: *std.http.Client,
     cfg: *const edge_config.EdgeConfig,
     url: []const u8,
     method: []const u8,
@@ -795,19 +1146,32 @@ pub fn executeStreamingHttpProxyRequest(
     security: *const http.security_headers.SecurityHeaders,
     sticky_set_cookie: ?[]const u8,
     cancel_token: ?*const CancellationToken,
+    pool: ?*http.upstream_pool.UpstreamPool,
 ) !StreamingProxyResult {
-    if (cancel_token) |tok| {
-        if (tok.isStopped()) return error.RequestCancelled;
-    }
+    if (cancelStopped(cancel_token)) return error.RequestCancelled;
+
     const proxy_extra_header_slack = 10;
-    const method_enum = std.meta.stringToEnum(std.http.Method, method) orelse return error.UnsupportedHttpMethod;
     const uri = try std.Uri.parse(url);
+    const is_https = std.ascii.eqlIgnoreCase(uri.scheme, "https");
+    const host = if (uri.host) |h| uriComponentBytes(h) else return error.UpstreamProtocolError;
+    const port: u16 = uri.port orelse (if (is_https) @as(u16, 443) else 80);
+    const tls_options: ?http.tls_termination.UpstreamTlsOptions = if (is_https) .{
+        .skip_verify = !cfg.upstream_tls_verify,
+        .ca_bundle_path = cfg.upstream_tls_ca_bundle,
+        .sni_override = cfg.upstream_tls_server_name,
+        .client_cert_path = cfg.upstream_tls_client_cert,
+        .client_key_path = cfg.upstream_tls_client_key,
+    } else null;
+
+    // Per-phase deadlines (closes the #196 streaming gap): bound the connect/
+    // write phase and each response read; the read deadline bounds a hung
+    // upstream stalling mid-stream.
+    const connect_timeout_ms: u32 = if (cfg.upstream_connect_timeout_ms > 0) cfg.upstream_connect_timeout_ms else cfg.upstream_timeout_ms;
+    const base_read_ms: u32 = if (cfg.upstream_response_timeout_ms > 0) cfg.upstream_response_timeout_ms else cfg.upstream_timeout_ms;
+    const read_deadline_ms: u32 = if (cancel_token) |tok| tok.effectiveTimeoutMs(base_read_ms) else base_read_ms;
+
     var forwarded_for = try buildForwardedFor(allocator, request_headers.get("x-forwarded-for"), client_ip);
     defer forwarded_for.deinit(allocator);
-    var metadata_arena = std.heap.ArenaAllocator.init(allocator);
-    defer metadata_arena.deinit();
-    const metadata_allocator = metadata_arena.allocator();
-
     var extra_headers_stack = std.heap.stackFallback(2048, allocator);
     const extra_headers_allocator = extra_headers_stack.get();
     var extra_headers = std.array_list.Managed(std.http.Header).init(extra_headers_allocator);
@@ -830,170 +1194,93 @@ pub fn executeStreamingHttpProxyRequest(
         if (tp.len > 0) try extra_headers.append(.{ .name = "traceparent", .value = tp });
     }
 
-    var server_header_buffer: [16 * 1024]u8 = undefined;
-    var req = try client.request(method_enum, uri, .{
-        .headers = .{
-            .connection = .omit,
-            .user_agent = .omit,
-            .accept_encoding = .omit,
-        },
-        .extra_headers = extra_headers.items,
-        .keep_alive = true,
-        .redirect_behavior = .unhandled,
-    });
-    defer req.deinit();
+    const read_buf = try allocator.alloc(u8, @max(cfg.proxy_stream_buffer_size, 16 * 1024));
+    defer allocator.free(read_buf);
 
-    const ttfb_start_ms = http.event_loop.monotonicMs();
-    if (streaming_body) |stream_body| {
-        req.transfer_encoding = .{ .content_length = stream_body.content_length };
-        const body_writer_buffer = try allocator.alloc(u8, cfg.proxy_stream_buffer_size);
-        defer allocator.free(body_writer_buffer);
-        const relay_buffer = try allocator.alloc(u8, cfg.proxy_stream_buffer_size);
-        defer allocator.free(relay_buffer);
-        var body_writer = req.sendBodyUnflushed(body_writer_buffer) catch |err| {
-            markRequestConnectionClosing(&req);
-            return err;
-        };
+    const active_pool: ?*http.upstream_pool.UpstreamPool = if (pool) |p| (if (p.config.enabled) p else null) else null;
+    var key_buf: [268]u8 = undefined;
+    const key = std.fmt.bufPrint(&key_buf, "{s}:{s}:{d}", .{ if (is_https) "https" else "http", host, port }) catch host;
 
-        var sent: usize = @min(stream_body.initial_bytes.len, stream_body.content_length);
-        if (sent > 0) {
-            body_writer.writer.writeAll(stream_body.initial_bytes[0..sent]) catch |err| {
-                markRequestConnectionClosing(&req);
-                return err;
-            };
-        }
-        while (sent < stream_body.content_length) {
-            if (cancel_token) |tok| {
-                if (tok.isStopped()) {
-                    markRequestConnectionClosing(&req);
-                    return error.RequestCancelled;
-                }
+    // A dead reused connection can only be retried before any response byte
+    // reaches the client, and only when the request body is re-sendable (a
+    // streamed upload has already consumed the client).
+    const retry_allowed = streaming_body == null;
+    var attempt: usize = 0;
+    while (true) : (attempt += 1) {
+        const now_ms = http.event_loop.monotonicMs();
+
+        // Acquire a connection: pooled (attempt 0) or freshly connected.
+        var reused = false;
+        var conn: http.upstream_pool.PooledConn = undefined;
+        if (attempt == 0 and active_pool != null) {
+            if (active_pool.?.acquire(key, now_ms)) |c| {
+                conn = c;
+                reused = true;
             }
-            const want = @min(relay_buffer.len, stream_body.content_length - sent);
-            const n = downstream_conn.read(relay_buffer[0..want]) catch {
-                markRequestConnectionClosing(&req);
-                return error.ClientAborted;
-            };
-            if (n == 0) {
-                markRequestConnectionClosing(&req);
-                return error.ClientAborted;
-            }
-            body_writer.writer.writeAll(relay_buffer[0..n]) catch |err| {
-                markRequestConnectionClosing(&req);
-                return err;
-            };
-            sent += n;
         }
-        body_writer.end() catch |err| {
-            markRequestConnectionClosing(&req);
-            return err;
-        };
-    } else if (buffered_body.len > 0 or method_enum.requestHasBody()) {
-        req.sendBodyComplete(@constCast(buffered_body)) catch |err| {
-            markRequestConnectionClosing(&req);
-            return err;
-        };
-    } else {
-        req.sendBodiless() catch |err| {
-            markRequestConnectionClosing(&req);
-            return err;
-        };
-    }
-
-    var resp = req.receiveHead(&server_header_buffer) catch |err| {
-        markRequestConnectionClosing(&req);
-        return err;
-    };
-    const ttfb_ms = http.event_loop.monotonicMs() - ttfb_start_ms;
-    const status_code: u16 = @intFromEnum(resp.head.status);
-    const reason = gpres.upstreamReasonPhrase(resp.head.status);
-
-    var headers = std.array_list.Managed(UpstreamHeader).init(metadata_allocator);
-    try headers.ensureUnusedCapacity(8);
-    var header_it = resp.head.iterateHeaders();
-    while (header_it.next()) |header| {
-        if (gph.shouldSkipUpstreamResponseHeader(header.name)) continue;
-        try headers.append(.{
-            .name = try metadata_allocator.dupe(u8, header.name),
-            .value = try metadata_allocator.dupe(u8, header.value),
-        });
-    }
-    const upstream_headers = try headers.toOwnedSlice();
-    const body_allowed = gpres.responseBodyAllowed(method, status_code);
-
-    gpres.writeStreamedUpstreamResponseHeadFromHeaders(
-        downstream_writer,
-        status_code,
-        reason,
-        upstream_headers,
-        body_allowed,
-        correlation_id,
-        security,
-        sticky_set_cookie,
-    ) catch {
-        markRequestConnectionClosing(&req);
-        return error.ClientAborted;
-    };
-
-    var streamed_body_bytes: usize = 0;
-    if (body_allowed) {
-        const expected_body_len = resp.head.content_length;
-        const transfer_buffer = try allocator.alloc(u8, cfg.proxy_stream_buffer_size);
-        defer allocator.free(transfer_buffer);
-        const relay_buffer = try allocator.alloc(u8, cfg.proxy_stream_buffer_size);
-        defer allocator.free(relay_buffer);
-        var body_reader = resp.reader(transfer_buffer);
-        while (true) {
-            if (cancel_token) |tok| {
-                if (tok.isStopped()) {
-                    markRequestConnectionClosing(&req);
-                    return error.RequestCancelled;
-                }
-            }
-            const n = body_reader.readSliceShort(relay_buffer) catch |err| switch (err) {
-                error.ReadFailed => {
-                    markRequestConnectionClosing(&req);
-                    return .{
-                        .status_code = status_code,
-                        .reason = reason,
-                        .response_body_bytes = streamed_body_bytes,
-                        .upstream_ttfb_ms = ttfb_ms,
-                        .upstream_aborted = true,
-                    };
-                },
-            };
-            if (n == 0) break;
-            gpres.writeChunk(downstream_writer, relay_buffer[0..n]) catch {
-                markRequestConnectionClosing(&req);
-                return error.ClientAborted;
-            };
-            streamed_body_bytes += n;
-        }
-        if (expected_body_len) |expected| {
-            if (@as(u64, @intCast(streamed_body_bytes)) < expected) {
-                markRequestConnectionClosing(&req);
-                return .{
-                    .status_code = status_code,
-                    .reason = reason,
-                    .response_body_bytes = streamed_body_bytes,
-                    .upstream_ttfb_ms = ttfb_ms,
-                    .upstream_aborted = true,
+        if (!reused) {
+            const connect_start = http.event_loop.monotonicMs();
+            const new_fd = try compat.connectBlockingTcp(host, port);
+            if (active_pool) |p| p.recordConnectLatency(http.event_loop.monotonicMs() - connect_start);
+            if (tls_options) |opts| {
+                if (connect_timeout_ms > 0) setSocketTimeoutMs(new_fd, connect_timeout_ms, connect_timeout_ms) catch {};
+                const owner = if (active_pool) |p| p.allocator else allocator;
+                const tls_ptr = owner.create(http.tls_termination.UpstreamTlsConn) catch {
+                    _ = std.c.close(new_fd);
+                    return error.OutOfMemory;
                 };
+                tls_ptr.* = http.tls_termination.UpstreamTlsConn.connect(new_fd, host, opts) catch |err| {
+                    owner.destroy(tls_ptr);
+                    _ = std.c.close(new_fd);
+                    return err;
+                };
+                if (active_pool) |p| p.noteNewConnection(key);
+                conn = .{ .stream = compat.netStreamFromFd(new_fd), .tls = tls_ptr, .created_ms = now_ms, .last_used_ms = now_ms };
+            } else {
+                if (active_pool) |p| p.noteNewConnection(key);
+                conn = .{ .stream = compat.netStreamFromFd(new_fd), .tls = null, .created_ms = now_ms, .last_used_ms = now_ms };
             }
         }
-        gpres.writeChunk(downstream_writer, "") catch {
-            markRequestConnectionClosing(&req);
-            return error.ClientAborted;
-        };
-    }
 
-    return .{
-        .status_code = status_code,
-        .reason = reason,
-        .response_body_bytes = streamed_body_bytes,
-        .upstream_ttfb_ms = ttfb_ms,
-        .upstream_aborted = false,
-    };
+        var wrote_downstream = false;
+        const fd = conn.stream.handle;
+        const res = (if (conn.tls) |tls|
+            streamProxyOverTransport(allocator, tls, fd, read_buf, uri, method, extra_headers.items, buffered_body, streaming_body, downstream_conn, downstream_writer, security, sticky_set_cookie, correlation_id, connect_timeout_ms, read_deadline_ms, cancel_token, &wrote_downstream)
+        else
+            streamProxyOverTransport(allocator, compat.netStreamFromFd(fd), fd, read_buf, uri, method, extra_headers.items, buffered_body, streaming_body, downstream_conn, downstream_writer, security, sticky_set_cookie, correlation_id, connect_timeout_ms, read_deadline_ms, cancel_token, &wrote_downstream)) catch |err| {
+            // Tear down the connection (release handles active-- and close).
+            if (active_pool) |p| {
+                p.release(key, conn, false, http.event_loop.monotonicMs());
+            } else {
+                if (conn.tls) |t| {
+                    t.deinit();
+                    allocator.destroy(t);
+                }
+                var s = conn.stream;
+                s.close();
+            }
+            if (!wrote_downstream and reused and retry_allowed and attempt == 0 and
+                (err == error.UpstreamConnectionClosed or err == error.WriteFailed))
+            {
+                if (active_pool) |p| p.recordStaleRetry(key);
+                continue;
+            }
+            return err;
+        };
+
+        // Success: pool the connection when reusable, else close it.
+        if (active_pool) |p| {
+            p.release(key, conn, res.reusable, http.event_loop.monotonicMs());
+        } else {
+            if (conn.tls) |t| {
+                t.deinit();
+                allocator.destroy(t);
+            }
+            var s = conn.stream;
+            s.close();
+        }
+        return res.result;
+    }
 }
 
 pub fn upstreamResponseHasNoStore(response: std.http.Client.Response.Head) bool {
@@ -1327,6 +1614,118 @@ test "exchange treats a HEAD response as bodiless despite Content-Length" {
     defer resp.deinit(allocator);
     try std.testing.expectEqual(@as(u16, 200), resp.status_code);
     try std.testing.expectEqual(@as(usize, 0), resp.body.len);
+}
+
+/// A capturing downstream writer for the streaming-relay tests: satisfies the
+/// `print`/`writeAll` interface `writeChunk` needs and records all bytes.
+const CaptureWriter = struct {
+    list: *std.array_list.Managed(u8),
+    pub fn writeAll(self: CaptureWriter, bytes: []const u8) !void {
+        try self.list.appendSlice(bytes);
+    }
+    pub fn print(self: CaptureWriter, comptime fmt: []const u8, args: anytype) !void {
+        var buf: [64]u8 = undefined;
+        try self.list.appendSlice(try std.fmt.bufPrint(&buf, fmt, args));
+    }
+};
+
+/// Drive readUpstreamHead + relayUpstreamBody over a socketpair preloaded with
+/// `response`. Returns the parsed head and the de-chunked relayed body. The peer
+/// stays open (length/chunked) unless `close_after` shuts it for close-framing.
+fn runStreamingRelay(
+    allocator: std.mem.Allocator,
+    method: []const u8,
+    response: []const u8,
+    close_after: bool,
+    out_body: *std.array_list.Managed(u8),
+) !struct { status: u16, framing_tag: []const u8, reusable: bool, aborted: bool, body_len: usize } {
+    const fds = try makeBlockingSocketpair();
+    const client_fd = fds[0];
+    const peer_fd = fds[1];
+    defer _ = std.c.close(client_fd);
+    defer _ = std.c.close(peer_fd);
+    _ = std.c.write(peer_fd, response.ptr, response.len);
+    if (close_after) _ = std.c.shutdown(peer_fd, std.posix.SHUT.WR);
+
+    var read_storage: [4096]u8 = undefined;
+    var rb = StreamReadBuf{ .buf = &read_storage };
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const transport = compat.netStreamFromFd(client_fd);
+
+    const head = try readUpstreamHead(arena.allocator(), &rb, transport, client_fd, 1_000, method);
+
+    var captured = std.array_list.Managed(u8).init(allocator);
+    defer captured.deinit();
+    const writer = CaptureWriter{ .list = &captured };
+    const outcome = try relayUpstreamBody(&rb, transport, client_fd, 1_000, head.framing, writer, null);
+
+    // De-chunk the captured downstream stream (relay does not emit the
+    // terminating zero chunk; append it so decodeChunkedBody can parse).
+    try captured.appendSlice("0\r\n\r\n");
+    if (try decodeChunkedBody(allocator, captured.items, 1 << 20)) |decoded| {
+        defer allocator.free(decoded);
+        try out_body.appendSlice(decoded);
+    }
+    const tag = switch (head.framing) {
+        .none => "none",
+        .length => "length",
+        .chunked => "chunked",
+        .close => "close",
+    };
+    return .{ .status = head.status_code, .framing_tag = tag, .reusable = outcome.reusable, .aborted = outcome.aborted, .body_len = outcome.body_bytes };
+}
+
+test "streaming relay streams a Content-Length body and keeps the connection reusable" {
+    const allocator = std.testing.allocator;
+    var body = std.array_list.Managed(u8).init(allocator);
+    defer body.deinit();
+    const r = try runStreamingRelay(allocator, "GET", "HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\nhello world", false, &body);
+    try std.testing.expectEqual(@as(u16, 200), r.status);
+    try std.testing.expectEqualStrings("length", r.framing_tag);
+    try std.testing.expectEqualStrings("hello world", body.items);
+    try std.testing.expect(r.reusable and !r.aborted);
+}
+
+test "streaming relay decodes a chunked body and stays reusable" {
+    const allocator = std.testing.allocator;
+    var body = std.array_list.Managed(u8).init(allocator);
+    defer body.deinit();
+    const r = try runStreamingRelay(allocator, "GET", "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n", false, &body);
+    try std.testing.expectEqualStrings("chunked", r.framing_tag);
+    try std.testing.expectEqualStrings("hello world", body.items);
+    try std.testing.expect(r.reusable and !r.aborted);
+}
+
+test "streaming relay handles a close-delimited body (not reusable)" {
+    const allocator = std.testing.allocator;
+    var body = std.array_list.Managed(u8).init(allocator);
+    defer body.deinit();
+    const r = try runStreamingRelay(allocator, "GET", "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nstreamed-to-eof", true, &body);
+    try std.testing.expectEqualStrings("close", r.framing_tag);
+    try std.testing.expectEqualStrings("streamed-to-eof", body.items);
+    try std.testing.expect(!r.reusable and !r.aborted);
+}
+
+test "streaming relay treats 204 as bodiless" {
+    const allocator = std.testing.allocator;
+    var body = std.array_list.Managed(u8).init(allocator);
+    defer body.deinit();
+    const r = try runStreamingRelay(allocator, "GET", "HTTP/1.1 204 No Content\r\n\r\n", false, &body);
+    try std.testing.expectEqual(@as(u16, 204), r.status);
+    try std.testing.expectEqualStrings("none", r.framing_tag);
+    try std.testing.expectEqual(@as(usize, 0), body.items.len);
+    try std.testing.expect(r.reusable);
+}
+
+test "streaming relay reports abort on a truncated Content-Length body" {
+    const allocator = std.testing.allocator;
+    var body = std.array_list.Managed(u8).init(allocator);
+    defer body.deinit();
+    // Promises 20 bytes but only sends 5, then closes.
+    const r = try runStreamingRelay(allocator, "GET", "HTTP/1.1 200 OK\r\nContent-Length: 20\r\n\r\nhello", true, &body);
+    try std.testing.expect(r.aborted and !r.reusable);
+    try std.testing.expectEqual(@as(usize, 5), r.body_len);
 }
 
 /// Raw blocking responder: accepts one connection, drains the request, writes a

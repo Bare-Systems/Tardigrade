@@ -128,9 +128,12 @@ pub fn execute(
 }
 
 pub fn connect(allocator: std.mem.Allocator, endpoint: []const u8) !compat.NetStream {
-    if (unixSocketPath(endpoint)) |path| return compat.connectUnixSocket(path);
+    _ = allocator;
+    // Raw blocking sockets, not std.Io event-loop streams: the threaded backend
+    // can stall on these blocking request/response exchanges (#141).
+    if (unixSocketPath(endpoint)) |path| return compat.netStreamFromFd(try compat.connectBlockingUnix(path));
     const ep = try memcached.parseEndpoint(endpoint);
-    return compat.tcpConnectToHost(allocator, ep.host, ep.port);
+    return compat.netStreamFromFd(try compat.connectBlockingTcp(ep.host, ep.port));
 }
 
 pub fn readResponse(allocator: std.mem.Allocator, stream: *compat.NetStream) !Response {

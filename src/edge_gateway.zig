@@ -118,7 +118,6 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         .health_probe_running = std.atomic.Value(bool).init(false),
         .upstream_health = std.StringHashMap(UpstreamHealth).init(state_allocator),
         .upstream_active_requests = std.StringHashMap(usize).init(state_allocator),
-        .fastcgi_pool = std.StringHashMap(std.ArrayList(compat.NetStream)).init(state_allocator),
         .upstream_pool = http.upstream_pool.UpstreamPool.init(state_allocator, .{
             .enabled = cfg.upstream_pool_enabled,
             .max_idle_per_host = cfg.upstream_pool_max_idle_per_host,

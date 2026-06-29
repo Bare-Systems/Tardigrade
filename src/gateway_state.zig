@@ -309,7 +309,7 @@ fn deinitMuxResumeState(allocator: std.mem.Allocator, saved_state: *MuxResumeSta
 /// - `connection_mutex` → `active_connections_total`, `active_connections_by_ip`,
 ///   `active_fds`, `fd_to_ip`, `active_ws_streams`, `active_sse_streams`,
 ///   `active_mux_connections`, `active_mux_subscriptions`,
-///   `mux_subscriptions_by_device`, `fastcgi_pool`, `fastcgi_next_request_id`.
+///   `mux_subscriptions_by_device`, `fastcgi_next_request_id`.
 /// - `upstream_mutex` → `upstream_health`, `upstream_active_requests`,
 ///   `upstream_rr_index`, `upstream_backup_rr_index`, `lb_random_state` (the
 ///   load-balancer selection state mutated by the `*Locked` selectors).
@@ -360,8 +360,8 @@ fn deinitMuxResumeState(allocator: std.mem.Allocator, saved_state: *MuxResumeSta
 /// ## `deinit` ordering
 /// `deinit` tears down in this order: self-managed sub-stores first (each
 /// independent), then the owned scalar buffers (`hsts_value`, `http3_alt_svc`),
-/// then every map — freeing duped keys (and, for `fastcgi_pool`, closing pooled
-/// streams; for `command_lifecycle`/`approvals`/`mux_resume_state`, freeing nested
+/// then every map — freeing duped keys (and, for
+/// `command_lifecycle`/`approvals`/`mux_resume_state`, freeing nested
 /// values) before calling the map's own `deinit`. Maps are independent of each
 /// other, so their relative order does not matter; the invariant is keys/values
 /// freed *before* the backing map is destroyed.
@@ -463,8 +463,7 @@ pub const GatewayState = struct {
     health_probe_running: std.atomic.Value(bool),
     upstream_health: std.StringHashMap(UpstreamHealth), // owned keys [upstream_mutex]
     upstream_active_requests: std.StringHashMap(usize), // owned keys [upstream_mutex]
-    fastcgi_pool: std.StringHashMap(std.ArrayList(compat.NetStream)), // owned keys+streams [connection_mutex]
-    upstream_pool: http.upstream_pool.UpstreamPool, // owned; self-synchronized keep-alive pool (#141)
+    upstream_pool: http.upstream_pool.UpstreamPool, // owned; self-synchronized keep-alive pool (#141; data-plane + FastCGI)
     fastcgi_next_request_id: std.StringHashMap(u16), // owned keys [connection_mutex]
     proxy_cache_locks: std.StringHashMap(u32), // owned keys [proxy_cache_mutex]
     active_connections_by_ip: std.StringHashMap(u32), // owned keys [connection_mutex]
@@ -519,16 +518,6 @@ pub const GatewayState = struct {
         var upstream_active_it = self.upstream_active_requests.iterator();
         while (upstream_active_it.next()) |entry| self.allocator.free(entry.key_ptr.*);
         self.upstream_active_requests.deinit();
-        var fastcgi_it = self.fastcgi_pool.iterator();
-        while (fastcgi_it.next()) |entry| {
-            self.allocator.free(entry.key_ptr.*);
-            for (entry.value_ptr.items) |stream| {
-                var owned = stream;
-                owned.close();
-            }
-            entry.value_ptr.deinit(self.allocator);
-        }
-        self.fastcgi_pool.deinit();
         self.upstream_pool.deinit();
         var fastcgi_id_it = self.fastcgi_next_request_id.iterator();
         while (fastcgi_id_it.next()) |entry| self.allocator.free(entry.key_ptr.*);
@@ -572,62 +561,38 @@ pub const GatewayState = struct {
         self.mux_resume_state.deinit();
     }
 
-    pub fn acquireFastcgiStream(self: *GatewayState, endpoint: []const u8) !struct { stream: compat.NetStream, reused: bool } {
-        self.connection_mutex.lock();
-        if (self.fastcgi_pool.getPtr(endpoint)) |pool| {
-            if (pool.items.len > 0) {
-                const stream = pool.pop().?;
-                self.connection_mutex.unlock();
-                return .{ .stream = stream, .reused = true };
-            }
-        }
-        self.connection_mutex.unlock();
-        return .{ .stream = try http.fastcgi.connect(self.allocator, endpoint), .reused = false };
+    /// A leased FastCGI upstream connection. `conn` must be handed back via
+    /// `releaseFastcgiStream` (on success with `allow_reuse=true`, otherwise
+    /// false so the pool closes it).
+    pub const FastcgiLease = struct {
+        conn: http.upstream_pool.PooledConn,
+        reused: bool,
+    };
+
+    /// FastCGI keep-alive connections share the generic upstream pool (#141
+    /// Phase 2), keyed under a `fastcgi:` prefix so they never mix with HTTP
+    /// upstream connections. This replaces the former ad-hoc fixed-size pool,
+    /// giving FastCGI idle-timeout / max-lifetime eviction and pool metrics.
+    fn fastcgiPoolKey(buf: []u8, endpoint: []const u8) []const u8 {
+        return std.fmt.bufPrint(buf, "fastcgi:{s}", .{endpoint}) catch endpoint;
     }
 
-    pub fn releaseFastcgiStream(self: *GatewayState, endpoint: []const u8, stream: compat.NetStream, allow_reuse: bool) void {
-        if (!allow_reuse) {
-            var owned = stream;
-            owned.close();
-            return;
+    pub fn acquireFastcgiStream(self: *GatewayState, endpoint: []const u8) !FastcgiLease {
+        var key_buf: [512]u8 = undefined;
+        const key = fastcgiPoolKey(&key_buf, endpoint);
+        const now = http.event_loop.monotonicMs();
+        if (self.upstream_pool.acquire(key, now)) |conn| {
+            return .{ .conn = conn, .reused = true };
         }
+        const stream = try http.fastcgi.connect(self.allocator, endpoint);
+        self.upstream_pool.noteNewConnection(key);
+        return .{ .conn = .{ .stream = stream, .tls = null, .created_ms = now, .last_used_ms = now }, .reused = false };
+    }
 
-        self.connection_mutex.lock();
-        defer self.connection_mutex.unlock();
-
-        if (self.fastcgi_pool.getPtr(endpoint)) |pool| {
-            if (pool.items.len >= 4) {
-                var owned = stream;
-                owned.close();
-                return;
-            }
-            pool.append(self.allocator, stream) catch {
-                var owned = stream;
-                owned.close();
-            };
-            return;
-        }
-
-        const owned_key = self.allocator.dupe(u8, endpoint) catch {
-            var owned = stream;
-            owned.close();
-            return;
-        };
-        var pool: std.ArrayList(compat.NetStream) = .empty;
-        pool.append(self.allocator, stream) catch {
-            self.allocator.free(owned_key);
-            var owned = stream;
-            owned.close();
-            return;
-        };
-        self.fastcgi_pool.put(owned_key, pool) catch {
-            for (pool.items) |item| {
-                var owned = item;
-                owned.close();
-            }
-            pool.deinit(self.allocator);
-            self.allocator.free(owned_key);
-        };
+    pub fn releaseFastcgiStream(self: *GatewayState, endpoint: []const u8, conn: http.upstream_pool.PooledConn, allow_reuse: bool) void {
+        var key_buf: [512]u8 = undefined;
+        const key = fastcgiPoolKey(&key_buf, endpoint);
+        self.upstream_pool.release(key, conn, allow_reuse, http.event_loop.monotonicMs());
     }
 
     pub fn nextFastcgiRequestId(self: *GatewayState, endpoint: []const u8) u16 {

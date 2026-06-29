@@ -295,13 +295,13 @@ pub fn executeBoundedBufferedTcpHttpRequest(
                     return err;
                 };
                 p.noteNewConnection(key);
-                conn = .{ .fd = new_fd, .tls = tls_ptr, .created_ms = now_ms, .last_used_ms = now_ms };
+                conn = .{ .stream = compat.netStreamFromFd(new_fd), .tls = tls_ptr, .created_ms = now_ms, .last_used_ms = now_ms };
             } else {
                 p.noteNewConnection(key);
-                conn = .{ .fd = new_fd, .tls = null, .created_ms = now_ms, .last_used_ms = now_ms };
+                conn = .{ .stream = compat.netStreamFromFd(new_fd), .tls = null, .created_ms = now_ms, .last_used_ms = now_ms };
             }
         }
-        const fd = conn.fd;
+        const fd = conn.stream.handle;
 
         if (connect_timeout_ms > 0) {
             setSocketTimeoutMs(fd, connect_timeout_ms, connect_timeout_ms) catch {};

@@ -29,12 +29,14 @@ pub const Config = struct {
     max_lifetime_ms: u64 = 0,
 };
 
-/// A pooled connection: an owned socket fd plus age bookkeeping. For TLS
-/// upstreams `tls` holds the heap-owned OpenSSL connection (allocated with the
-/// pool's allocator); the pool deinits and frees it when the connection is
-/// closed. `tls` is null for plain HTTP.
+/// A pooled connection: an owned transport plus age bookkeeping. `stream` may
+/// wrap a raw fd (data-plane, via `netStreamFromFd`) or an event-loop stream
+/// (FastCGI, via `connectUnixSocket`/`tcpConnectToHost`). For TLS upstreams
+/// `tls` holds the heap-owned OpenSSL connection (allocated with the pool's
+/// allocator); the pool deinits and frees it when the connection is closed.
+/// `tls` is null for plain HTTP and FastCGI.
 pub const PooledConn = struct {
-    fd: std.posix.fd_t,
+    stream: compat.NetStream,
     tls: ?*tls_termination.UpstreamTlsConn = null,
     created_ms: u64,
     last_used_ms: u64,
@@ -115,13 +117,13 @@ pub const UpstreamPool = struct {
     }
 
     /// Close a connection: tear down the owned TLS connection (if any), then
-    /// close the socket.
+    /// close the transport.
     fn closeConn(self: *UpstreamPool, conn: PooledConn) void {
         if (conn.tls) |t| {
             t.deinit();
             self.allocator.destroy(t);
         }
-        _ = std.c.close(conn.fd);
+        conn.stream.close();
     }
 
     /// Get or create the per-host entry for `key`, duping the key on insert.
@@ -313,7 +315,7 @@ test "new connection then release pools it; acquire reuses and tracks active" {
 
     pool.noteNewConnection("h:80");
     try testing.expectEqual(@as(u64, 1), pool.aggregateStats().active);
-    pool.release("h:80", .{ .fd = fds[0], .created_ms = 1000, .last_used_ms = 1000 }, true, 1000);
+    pool.release("h:80", .{ .stream = compat.netStreamFromFd(fds[0]), .created_ms = 1000, .last_used_ms = 1000 }, true, 1000);
 
     var agg = pool.aggregateStats();
     try testing.expectEqual(@as(u64, 0), agg.active);
@@ -321,7 +323,7 @@ test "new connection then release pools it; acquire reuses and tracks active" {
     try testing.expectEqual(@as(u64, 1), agg.new_total);
 
     const got = pool.acquire("h:80", 1500) orelse return error.TestExpectedReuse;
-    try testing.expectEqual(fds[0], got.fd);
+    try testing.expectEqual(fds[0], got.stream.handle);
     agg = pool.aggregateStats();
     try testing.expectEqual(@as(u64, 1), agg.reused_total);
     try testing.expectEqual(@as(u64, 1), agg.active);
@@ -338,7 +340,7 @@ test "release drops a connection past the idle timeout" {
 
     pool.noteNewConnection("h:80");
     // released 2s later, past the 1s idle timeout → closed, not pooled.
-    pool.release("h:80", .{ .fd = fds[0], .created_ms = 0, .last_used_ms = 0 }, true, 2000);
+    pool.release("h:80", .{ .stream = compat.netStreamFromFd(fds[0]), .created_ms = 0, .last_used_ms = 0 }, true, 2000);
     try testing.expectEqual(@as(u64, 0), pool.aggregateStats().idle);
 }
 
@@ -350,8 +352,8 @@ test "release honors max_idle_per_host" {
     defer _ = std.c.close(a[1]);
     defer _ = std.c.close(b[1]);
 
-    pool.release("h:80", .{ .fd = a[0], .created_ms = 0, .last_used_ms = 0 }, true, 0);
-    pool.release("h:80", .{ .fd = b[0], .created_ms = 0, .last_used_ms = 0 }, true, 0);
+    pool.release("h:80", .{ .stream = compat.netStreamFromFd(a[0]), .created_ms = 0, .last_used_ms = 0 }, true, 0);
+    pool.release("h:80", .{ .stream = compat.netStreamFromFd(b[0]), .created_ms = 0, .last_used_ms = 0 }, true, 0);
     try testing.expectEqual(@as(u64, 1), pool.aggregateStats().idle);
 }
 
@@ -361,7 +363,7 @@ test "reapIdle evicts aged connections and refreshes the gauge" {
     const fds = try testPair();
     defer _ = std.c.close(fds[1]);
 
-    pool.release("h:80", .{ .fd = fds[0], .created_ms = 0, .last_used_ms = 0 }, true, 0);
+    pool.release("h:80", .{ .stream = compat.netStreamFromFd(fds[0]), .created_ms = 0, .last_used_ms = 0 }, true, 0);
     pool.reapIdle(500);
     try testing.expectEqual(@as(u64, 1), pool.aggregateStats().idle);
     pool.reapIdle(2000);

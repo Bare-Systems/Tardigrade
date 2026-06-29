@@ -906,6 +906,7 @@ fn consumeExactCrlf(rb: *StreamReadBuf, transport: anytype, fd: std.posix.fd_t, 
     while (rb.available().len < 2) {
         if (!try rb.fill(transport, fd, deadline_ms)) return false;
     }
+    if (!std.mem.eql(u8, rb.available()[0..2], "\r\n")) return error.UpstreamProtocolError;
     rb.consume(2);
     return true;
 }
@@ -937,7 +938,8 @@ fn relayUpstreamBody(
 ) !RelayOutcome {
     var total: usize = 0;
     switch (framing) {
-        .none => return .{ .body_bytes = 0, .aborted = false, .reusable = true },
+        // Bodiless (HEAD/204/304/1xx): reusable only if nothing trailed the head.
+        .none => return .{ .body_bytes = 0, .aborted = false, .reusable = rb.available().len == 0 },
         .length => |content_length| {
             var remaining = content_length;
             while (remaining > 0) {
@@ -951,7 +953,8 @@ fn relayUpstreamBody(
                 total += take;
                 remaining -= take;
             }
-            return .{ .body_bytes = total, .aborted = false, .reusable = true };
+            // Reusable only if the socket is back in sync (no bytes past the body).
+            return .{ .body_bytes = total, .aborted = false, .reusable = rb.available().len == 0 };
         },
         .chunked => {
             while (true) {
@@ -962,7 +965,8 @@ fn relayUpstreamBody(
                     if (!try consumeChunkTrailers(rb, transport, fd, deadline_ms)) {
                         return .{ .body_bytes = total, .aborted = true, .reusable = false };
                     }
-                    return .{ .body_bytes = total, .aborted = false, .reusable = true };
+                    // Reusable only if nothing trailed the terminating chunk.
+                    return .{ .body_bytes = total, .aborted = false, .reusable = rb.available().len == 0 };
                 }
                 var chunk_remaining = size;
                 while (chunk_remaining > 0) {
@@ -1018,7 +1022,17 @@ fn sendStreamingProxyRequest(
     try w.print("{s} {s}", .{ method, uriComponentBytes(uri.path) });
     if (uri.query) |query| try w.print("?{s}", .{uriComponentBytes(query)});
     try w.writeAll(" HTTP/1.1\r\n");
-    try w.print("Host: {s}\r\n", .{host});
+    // Preserve a non-default upstream port in the Host header.
+    const default_port: u16 = if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) 443 else 80;
+    if (uri.port) |p| {
+        if (p != default_port) {
+            try w.print("Host: {s}:{d}\r\n", .{ host, p });
+        } else {
+            try w.print("Host: {s}\r\n", .{host});
+        }
+    } else {
+        try w.print("Host: {s}\r\n", .{host});
+    }
     for (extra_headers) |header| try w.print("{s}: {s}\r\n", .{ header.name, header.value });
     if (streaming_body) |sb| {
         try w.print("Content-Length: {d}\r\n", .{sb.content_length});
@@ -1725,6 +1739,52 @@ test "streaming relay reports abort on a truncated Content-Length body" {
     const r = try runStreamingRelay(allocator, "GET", "HTTP/1.1 200 OK\r\nContent-Length: 20\r\n\r\nhello", true, &body);
     try std.testing.expect(r.aborted and !r.reusable);
     try std.testing.expectEqual(@as(usize, 5), r.body_len);
+}
+
+test "streaming relay refuses reuse when bytes trail a Content-Length body" {
+    const allocator = std.testing.allocator;
+    var body = std.array_list.Managed(u8).init(allocator);
+    defer body.deinit();
+    // 5-byte body, but "EXTRA" remains buffered past the body boundary.
+    const r = try runStreamingRelay(allocator, "GET", "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhelloEXTRA", false, &body);
+    try std.testing.expectEqualStrings("hello", body.items);
+    try std.testing.expect(!r.aborted);
+    try std.testing.expect(!r.reusable); // socket out of sync — must not be pooled
+}
+
+test "streaming relay refuses reuse when bytes trail a 204 head" {
+    const allocator = std.testing.allocator;
+    var body = std.array_list.Managed(u8).init(allocator);
+    defer body.deinit();
+    const r = try runStreamingRelay(allocator, "GET", "HTTP/1.1 204 No Content\r\n\r\nEXTRA", false, &body);
+    try std.testing.expectEqual(@as(u16, 204), r.status);
+    try std.testing.expectEqual(@as(usize, 0), body.items.len);
+    try std.testing.expect(!r.reusable);
+}
+
+test "streaming relay refuses reuse when bytes trail a chunked body" {
+    const allocator = std.testing.allocator;
+    var body = std.array_list.Managed(u8).init(allocator);
+    defer body.deinit();
+    // Complete chunked body + trailer, then a stray "EXTRA" past the terminator.
+    const r = try runStreamingRelay(allocator, "GET", "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\nEXTRA", false, &body);
+    try std.testing.expectEqualStrings("hello", body.items);
+    try std.testing.expect(!r.aborted);
+    try std.testing.expect(!r.reusable);
+}
+
+test "streaming relay rejects a chunk not terminated by CRLF" {
+    const allocator = std.testing.allocator;
+    var body = std.array_list.Managed(u8).init(allocator);
+    defer body.deinit();
+    // Chunk data "hello" is followed by "XX" instead of CRLF.
+    try std.testing.expectError(error.UpstreamProtocolError, runStreamingRelay(
+        allocator,
+        "GET",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhelloXX0\r\n\r\n",
+        false,
+        &body,
+    ));
 }
 
 /// Raw blocking responder: accepts one connection, drains the request, writes a

@@ -369,7 +369,17 @@ fn exchangeBoundedBufferedHttpRequest(
         try req_writer.print("?{s}", .{uriComponentBytes(query)});
     }
     try req_writer.writeAll(" HTTP/1.1\r\n");
-    try req_writer.print("Host: {s}\r\n", .{host});
+    // Preserve a non-default upstream port in the Host header.
+    const default_port: u16 = if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) 443 else 80;
+    if (uri.port) |p| {
+        if (p != default_port) {
+            try req_writer.print("Host: {s}:{d}\r\n", .{ host, p });
+        } else {
+            try req_writer.print("Host: {s}\r\n", .{host});
+        }
+    } else {
+        try req_writer.print("Host: {s}\r\n", .{host});
+    }
     if (!keep_alive) {
         try req_writer.writeAll("Connection: close\r\n");
     }
@@ -1505,6 +1515,59 @@ test "exchangeBoundedBufferedHttpRequest parses a buffered response from a peer"
     const req = req_buf[0..@intCast(n)];
     try std.testing.expect(std.mem.startsWith(u8, req, "GET / HTTP/1.1\r\n"));
     try std.testing.expect(std.mem.indexOf(u8, req, "Connection: close\r\n") != null);
+}
+
+/// Run one buffered exchange against a socketpair peer and return the request
+/// bytes the client serialized (caller owns the returned slice).
+fn captureBufferedRequestBytes(allocator: std.mem.Allocator, url: []const u8) ![]u8 {
+    const fds = try makeBlockingSocketpair();
+    const client_fd = fds[0];
+    const peer_fd = fds[1];
+    defer _ = std.c.close(client_fd);
+    defer _ = std.c.close(peer_fd);
+
+    const response = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    _ = std.c.write(peer_fd, response.ptr, response.len);
+    _ = std.c.shutdown(peer_fd, std.posix.SHUT.WR);
+
+    const uri = try std.Uri.parse(url);
+    var resp = try exchangeBoundedBufferedHttpRequest(
+        allocator,
+        compat.netStreamFromFd(client_fd),
+        client_fd,
+        uri,
+        "GET",
+        &.{},
+        "",
+        null,
+        1 << 20,
+        1_000,
+        1_000,
+        false,
+        null,
+    );
+    resp.deinit(allocator);
+
+    var req_buf: [512]u8 = undefined;
+    const n = std.c.read(peer_fd, &req_buf, req_buf.len);
+    try std.testing.expect(n > 0);
+    return allocator.dupe(u8, req_buf[0..@intCast(n)]);
+}
+
+test "buffered request Host header includes a non-default upstream port" {
+    const allocator = std.testing.allocator;
+    const req = try captureBufferedRequestBytes(allocator, "http://127.0.0.1:8123/");
+    defer allocator.free(req);
+    try std.testing.expect(std.mem.indexOf(u8, req, "Host: 127.0.0.1:8123\r\n") != null);
+}
+
+test "buffered request Host header omits a default upstream port" {
+    const allocator = std.testing.allocator;
+    // Explicit default port (80) must not be echoed into the Host header.
+    const req = try captureBufferedRequestBytes(allocator, "http://127.0.0.1:80/");
+    defer allocator.free(req);
+    try std.testing.expect(std.mem.indexOf(u8, req, "Host: 127.0.0.1\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req, "127.0.0.1:80") == null);
 }
 
 test "exchangeBoundedBufferedHttpRequest enforces the response read timeout when the peer never replies" {

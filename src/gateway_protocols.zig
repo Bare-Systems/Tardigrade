@@ -113,12 +113,9 @@ pub fn handleFastcgiRoute(
         try sendApiError(allocator, writer, .bad_gateway, "tool_unavailable", "FastCGI request failed", correlation_id, keep_alive, state);
         return 502;
     };
-    errdefer {
-        var owned = leased.stream;
-        owned.close();
-    }
+    errdefer state.releaseFastcgiStream(endpoint, leased.conn, false);
 
-    var fcgi = http.fastcgi.exchange(allocator, &leased.stream, .{
+    var fcgi = http.fastcgi.exchange(allocator, &leased.conn.stream, .{
         .request_id = state.nextFastcgiRequestId(endpoint),
         .keep_conn = true,
         .method = request.method.toString(),
@@ -140,8 +137,7 @@ pub fn handleFastcgiRoute(
         .extra_env = extra_env.items,
     }, request.body orelse "") catch |err| {
         state.logger.warn(correlation_id, "fastcgi request failed for {s}: {}", .{ endpoint, err });
-        var owned = leased.stream;
-        owned.close();
+        state.releaseFastcgiStream(endpoint, leased.conn, false);
         try sendApiError(allocator, writer, .bad_gateway, "tool_unavailable", "FastCGI request failed", correlation_id, keep_alive, state);
         return 502;
     };
@@ -153,8 +149,7 @@ pub fn handleFastcgiRoute(
 
     if (fcgi.protocol_status != http.fastcgi.request_complete or fcgi.app_status != 0) {
         state.logger.warn(correlation_id, "fastcgi end_request failure from {s}: app_status={d} protocol_status={d}", .{ endpoint, fcgi.app_status, fcgi.protocol_status });
-        var owned = leased.stream;
-        owned.close();
+        state.releaseFastcgiStream(endpoint, leased.conn, false);
         try sendApiError(allocator, writer, .bad_gateway, "tool_unavailable", "FastCGI upstream failed", correlation_id, keep_alive, state);
         return 502;
     }
@@ -181,7 +176,7 @@ pub fn handleFastcgiRoute(
     applyResponseHeaders(state, &response);
     try response.write(writer);
     state.metricsRecord(fcgi.status);
-    state.releaseFastcgiStream(endpoint, leased.stream, true);
+    state.releaseFastcgiStream(endpoint, leased.conn, true);
     return fcgi.status;
 }
 

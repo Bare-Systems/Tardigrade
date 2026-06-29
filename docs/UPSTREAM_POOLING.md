@@ -16,10 +16,13 @@ transport, so we keep both timeout enforcement **and** keepalive.
 
 ## Scope
 
-In scope (Phases 1 / 1b / 1c):
+In scope (Phases 1 / 1b / 1c / 2):
 - Reuse **HTTP/1.1 TCP** upstream connections — **plain HTTP** (Phase 1) and
   **TLS** (Phase 1c) — on the data-plane buffered path (default proxy mode,
   `TARDIGRADE_PROXY_STREAMING_MODE=off`) and the **control-plane** path.
+- Reuse **FastCGI** connections through the same pool (Phase 2), keyed under a
+  `fastcgi:` prefix. The pool stores a `compat.NetStream`, so it holds both the
+  data-plane's raw-fd connections and FastCGI's connections uniformly.
 - For TLS the pooled entry owns the OpenSSL connection, so the handshake is
   amortized across requests; the key is scheme-prefixed (`http:`/`https:`).
 - Per-origin idle pool with idle-timeout, max-lifetime, and max-idle-per-host
@@ -32,7 +35,10 @@ In scope (Phases 1 / 1b / 1c):
 Deferred (tracked on #141):
 - A hard `_MAX_ACTIVE_PER_HOST` cap — `active` is a tracked gauge, but
   enforcement is backpressure that couples with #140.
-- Unix-socket pooling (cheap to connect; no TCP/TLS handshake to amortize).
+- SCGI / uWSGI pooling — these are one-request-per-connection protocols (the
+  server closes after each response), so they are *not* pooled (Phase 2 did fix
+  their transport to raw blocking sockets, so they no longer stall, but each
+  request still opens a fresh connection).
 - Streaming path (`executeStreamingHttpProxyRequest` still uses
   `std.http.Client`; retiring it is Phase 3, depends on #139).
 - Cross-worker connection stealing/sharing (Phase 4 / #147).

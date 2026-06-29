@@ -303,11 +303,16 @@ pub fn parseResponseForRequest(allocator: std.mem.Allocator, data: []const u8, r
 }
 
 fn openStream(allocator: std.mem.Allocator, endpoint: []const u8) !compat.NetStream {
+    _ = allocator;
+    // Use raw blocking sockets (not the std.Io event-loop streams) so FastCGI
+    // I/O matches the data-plane transport. The std.Io threaded backend's
+    // stream I/O can stall on these blocking request/response exchanges; raw
+    // posix read/write is what #196 settled on for upstream connections.
     if (unixSocketPath(endpoint)) |path| {
-        return compat.connectUnixSocket(path);
+        return compat.netStreamFromFd(try compat.connectBlockingUnix(path));
     }
     const ep = try memcached.parseEndpoint(endpoint);
-    return compat.tcpConnectToHost(allocator, ep.host, ep.port);
+    return compat.netStreamFromFd(try compat.connectBlockingTcp(ep.host, ep.port));
 }
 
 fn unixSocketPath(endpoint: []const u8) ?[]const u8 {

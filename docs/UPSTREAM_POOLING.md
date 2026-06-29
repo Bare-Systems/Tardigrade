@@ -14,26 +14,27 @@ accept backlog (observed as `error.ConnectionFailed` on ~4–5% of requests in t
 perf smoke). This module restores connection reuse on top of the manual
 transport, so we keep both timeout enforcement **and** keepalive.
 
-## Scope of Phase 1
+## Scope
 
-In scope:
-- Reuse **plain HTTP/1.1 TCP** upstream connections (the data-plane buffered
-  path — the default proxy mode, `TARDIGRADE_PROXY_STREAMING_MODE=off`).
+In scope (Phases 1 / 1b / 1c):
+- Reuse **HTTP/1.1 TCP** upstream connections — **plain HTTP** (Phase 1) and
+  **TLS** (Phase 1c) — on the data-plane buffered path (default proxy mode,
+  `TARDIGRADE_PROXY_STREAMING_MODE=off`) and the **control-plane** path.
+- For TLS the pooled entry owns the OpenSSL connection, so the handshake is
+  amortized across requests; the key is scheme-prefixed (`http:`/`https:`).
 - Per-origin idle pool with idle-timeout, max-lifetime, and max-idle-per-host
-  caps.
+  caps; idle reaper on the maintenance tick.
 - Safe stale-connection handling: a pooled connection the origin closed while
   idle is retried once on a fresh connection (the request was never delivered).
-- Global reuse/new/idle/stale metrics.
+- Global + per-upstream labelled metrics and a connect-latency histogram
+  (Phase 1b).
 
 Deferred (tracked on #141):
-- TLS / mTLS upstream pooling (still `Connection: close`; OpenSSL conn ownership
-  in the pool + session reuse is a follow-up).
-- Unix-socket pooling (cheap to connect; no TCP handshake to amortize).
+- A hard `_MAX_ACTIVE_PER_HOST` cap — `active` is a tracked gauge, but
+  enforcement is backpressure that couples with #140.
+- Unix-socket pooling (cheap to connect; no TCP/TLS handshake to amortize).
 - Streaming path (`executeStreamingHttpProxyRequest` still uses
   `std.http.Client`; retiring it is Phase 3, depends on #139).
-- Per-upstream **labelled** metrics (`{upstream=...}`). Phase 1 exposes global
-  counters; the metrics subsystem is flat today and labelled series are a
-  separate addition.
 - Cross-worker connection stealing/sharing (Phase 4 / #147).
 - HTTP/2 upstream multiplexing (#145).
 
@@ -61,9 +62,12 @@ is only about fairness/locality, not correctness.
 
 ## Keying
 
-Phase 1 key: `"<host>:<port>"` for plain HTTP. TLS config is global
-(`cfg.upstream_tls_*`), so when TLS pooling lands the key gains a TLS/SNI
-fingerprint; the key type is centralized so that extension is local.
+Key: `"<scheme>:<host>:<port>"` (e.g. `http:127.0.0.1:8080`, `https:api:443`).
+The scheme prefix keeps plain and TLS connections to the same origin distinct.
+TLS config is global (`cfg.upstream_tls_*`), so all TLS connections to one
+origin share config; if per-route TLS config is ever added the key should gain
+a TLS/SNI fingerprint (the key is built in one place so that extension is
+local).
 
 ## Connection lifecycle
 

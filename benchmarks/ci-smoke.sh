@@ -133,6 +133,26 @@ jq -e '
     .keepalive.p99_ms <= 250
 ' "${RESULTS_FILE}" >/dev/null
 
+# Upstream connection-reuse guard (#141). The pooled proxy path must reuse
+# upstream connections; this catches a regression to per-request connections
+# (the failure mode that motivated the pool — see #196/#141). Uses the global
+# pool counters exposed on the metrics endpoint while the gateway is still up.
+reuse_metrics="$(curl -fsS "http://127.0.0.1:${LISTEN_PORT}/status/metrics")"
+reused="$(printf '%s\n' "$reuse_metrics" | awk '/^tardigrade_upstream_connections_reused_total /{print $2; exit}')"
+new_conns="$(printf '%s\n' "$reuse_metrics" | awk '/^tardigrade_upstream_connections_new_total /{print $2; exit}')"
+reused="${reused:-0}"; new_conns="${new_conns:-0}"
+reuse_total=$((reused + new_conns))
+if [[ "$reuse_total" -le 0 ]]; then
+    echo "ERROR: no upstream connections recorded — proxy scenario did not exercise the pool" >&2
+    exit 1
+fi
+reuse_pct=$((reused * 100 / reuse_total))
+echo "Upstream connection reuse: ${reused}/${reuse_total} (${reuse_pct}%)"
+if [[ "$reuse_pct" -lt 80 ]]; then
+    echo "ERROR: upstream connection reuse ${reuse_pct}% < 80% threshold — keep-alive pooling regression?" >&2
+    exit 1
+fi
+
 if [[ -n "${SAVE_FILE}" ]]; then
     mkdir -p "$(dirname "${SAVE_FILE}")"
     cp "${RESULTS_FILE}" "${SAVE_FILE}"

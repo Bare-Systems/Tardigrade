@@ -510,7 +510,7 @@ fn executeBoundedControlPlaneJsonProxyAttempt(
                 controlPlaneBufferedResponseLimit(cfg),
                 attempt_timeout_ms,
                 cfg.upstream_response_timeout_ms,
-                null, // control-plane keep-alive pooling deferred (#141)
+                &state.upstream_pool, // keep-alive pooling for control-plane upstreams (#141 Phase 1c)
             );
         };
         defer buffered_resp.deinit(allocator);

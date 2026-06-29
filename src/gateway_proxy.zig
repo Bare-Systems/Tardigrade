@@ -639,7 +639,6 @@ pub fn bufferedUpstreamResponseHasNoStore(response: *const BufferedUpstreamRespo
     return false;
 }
 
-
 /// Execute the current bounded buffered HTTP/1 reverse-proxy transport.
 /// `gateway_proxy_runtime.zig` owns data-plane retry/routing semantics and
 /// should be the place future streaming/backpressure work swaps this out.

@@ -38,6 +38,8 @@ pub const Metrics = struct {
     // snapshot at render time.
     upstream_connections_new: u64,
     upstream_connections_reused: u64,
+    upstream_connections_reused_local: u64,
+    upstream_connections_reused_cross_worker: u64,
     upstream_connections_idle: u64,
     upstream_stale_retries: u64,
     /// Request latency histogram bucket counts (milliseconds).
@@ -132,6 +134,8 @@ pub const Metrics = struct {
             .proxy_ttfb_ms_sum = 0,
             .upstream_connections_new = 0,
             .upstream_connections_reused = 0,
+            .upstream_connections_reused_local = 0,
+            .upstream_connections_reused_cross_worker = 0,
             .upstream_connections_idle = 0,
             .upstream_stale_retries = 0,
             .latency_le_1ms = 0,
@@ -497,6 +501,12 @@ pub const Metrics = struct {
             \\# HELP tardigrade_upstream_connections_reused_total Upstream connections served from the keep-alive pool
             \\# TYPE tardigrade_upstream_connections_reused_total counter
             \\tardigrade_upstream_connections_reused_total {d}
+            \\# HELP tardigrade_upstream_connections_reused_local_total Pool reuses reclaimed by the same worker thread that parked them
+            \\# TYPE tardigrade_upstream_connections_reused_local_total counter
+            \\tardigrade_upstream_connections_reused_local_total {d}
+            \\# HELP tardigrade_upstream_connections_reused_cross_worker_total Pool reuses reclaimed by a different worker thread (shared-pool cross-worker reuse)
+            \\# TYPE tardigrade_upstream_connections_reused_cross_worker_total counter
+            \\tardigrade_upstream_connections_reused_cross_worker_total {d}
             \\# HELP tardigrade_upstream_connections_idle Upstream connections currently held idle in the pool
             \\# TYPE tardigrade_upstream_connections_idle gauge
             \\tardigrade_upstream_connections_idle {d}
@@ -515,6 +525,8 @@ pub const Metrics = struct {
             self.proxy_ttfb_ms_count,
             self.upstream_connections_new,
             self.upstream_connections_reused,
+            self.upstream_connections_reused_local,
+            self.upstream_connections_reused_cross_worker,
             self.upstream_connections_idle,
             self.upstream_stale_retries,
         });
@@ -689,7 +701,7 @@ pub const Metrics = struct {
         var out = std.array_list.Managed(u8).init(allocator);
         errdefer out.deinit();
         try out.print(
-            \\{{"total_requests":{d},"status_2xx":{d},"status_3xx":{d},"status_4xx":{d},"status_5xx":{d},"uptime_seconds":{d},"active_connections":{d},"mux_connections":{d},"mux_subscriptions":{d},"connection_rejections":{d},"queue_rejections":{d},"upstream_unhealthy_backends":{d},"proxy_streaming_requests_total":{d},"proxy_buffered_requests_total":{d},"proxy_buffered_bytes_current":{d},"proxy_buffered_bytes_total":{d},"proxy_client_aborts_total":{d},"proxy_upstream_aborts_total":{d},"proxy_ttfb_ms_count":{d},"proxy_ttfb_ms_sum":{d},"upstream_connections_new_total":{d},"upstream_connections_reused_total":{d},"upstream_connections_idle":{d},"upstream_stale_retries_total":{d}
+            \\{{"total_requests":{d},"status_2xx":{d},"status_3xx":{d},"status_4xx":{d},"status_5xx":{d},"uptime_seconds":{d},"active_connections":{d},"mux_connections":{d},"mux_subscriptions":{d},"connection_rejections":{d},"queue_rejections":{d},"upstream_unhealthy_backends":{d},"proxy_streaming_requests_total":{d},"proxy_buffered_requests_total":{d},"proxy_buffered_bytes_current":{d},"proxy_buffered_bytes_total":{d},"proxy_client_aborts_total":{d},"proxy_upstream_aborts_total":{d},"proxy_ttfb_ms_count":{d},"proxy_ttfb_ms_sum":{d},"upstream_connections_new_total":{d},"upstream_connections_reused_total":{d},"upstream_connections_reused_local_total":{d},"upstream_connections_reused_cross_worker_total":{d},"upstream_connections_idle":{d},"upstream_stale_retries_total":{d}
         , .{
             self.total_requests,
             self.status_2xx,
@@ -713,6 +725,8 @@ pub const Metrics = struct {
             self.proxy_ttfb_ms_sum,
             self.upstream_connections_new,
             self.upstream_connections_reused,
+            self.upstream_connections_reused_local,
+            self.upstream_connections_reused_cross_worker,
             self.upstream_connections_idle,
             self.upstream_stale_retries,
         });

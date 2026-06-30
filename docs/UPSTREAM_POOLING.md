@@ -130,6 +130,13 @@ Throughput was flat from 4→8 threads (upstream-bound, not lock-bound), so the
 single mutex is **not** a contention bottleneck at this scale — its critical
 sections are O(1) (LIFO pop/push + counter bumps).
 
+This is a focused Phase 4a measurement (uneven hot-route traffic + the
+local/cross split), not the full benchmark matrix #147 envisages. Still
+outstanding there: many-origins/low-per-origin traffic, one hot origin with many
+workers, an upstream-TLS-handshake scenario, and per-request CPU / p99 TTFB /
+lock-contention-overhead comparisons (ideally on Beelink hardware, not loopback).
+Those are tracked as remaining #147 work, not claimed complete here.
+
 ### Sharded-shared extension (deferred)
 
 If a future Beelink/high-core benchmark shows the single mutex limiting

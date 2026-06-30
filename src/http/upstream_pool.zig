@@ -29,13 +29,12 @@ pub const Config = struct {
     max_lifetime_ms: u64 = 0,
 };
 
-/// Identifier of the worker thread that last released a connection. Used to
-/// classify a reuse as local (same thread parked and reclaimed it) vs
+/// Identifier of the worker thread that last released a connection. Used purely
+/// to classify a reuse as local (same thread parked and reclaimed it) vs
 /// cross-worker (one thread parked it, another reclaimed it — the shared-pool
-/// behaviour #147 set out to measure). Truncated to u32: equality is all we
-/// need and live-thread id collisions are astronomically unlikely.
-pub fn currentWorkerId() u32 {
-    return @truncate(@as(u64, @intCast(std.Thread.getCurrentId())));
+/// behaviour #147 set out to measure). Not used for socket ownership.
+pub fn currentWorkerId() u64 {
+    return @intCast(std.Thread.getCurrentId());
 }
 
 /// A pooled connection: an owned transport plus age bookkeeping. `stream` may
@@ -50,7 +49,7 @@ pub const PooledConn = struct {
     tls: ?*tls_termination.UpstreamTlsConn = null,
     created_ms: u64,
     last_used_ms: u64,
-    released_by: u32 = 0,
+    released_by: u64 = 0,
 };
 
 /// Per-origin counters. `idle`/`active` are gauges; the rest are monotonic.
@@ -385,7 +384,8 @@ test "reuse after a different worker parked it counts as cross-worker" {
     pool.release("h:80", .{ .stream = compat.netStreamFromFd(fds[0]), .created_ms = 0, .last_used_ms = 0 }, true, 0);
     pool.hosts.getPtr("h:80").?.idle.items[0].released_by = currentWorkerId() +% 1;
 
-    _ = pool.acquire("h:80", 1) orelse return error.TestExpectedReuse;
+    const got = pool.acquire("h:80", 1) orelse return error.TestExpectedReuse;
+    defer pool.release("h:80", got, false, 1); // close the checked-out fd
     const agg = pool.aggregateStats();
     try testing.expectEqual(@as(u64, 1), agg.reused_cross_worker_total);
     try testing.expectEqual(@as(u64, 0), agg.reused_local_total);

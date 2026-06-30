@@ -1441,6 +1441,8 @@ pub const GatewayState = struct {
         const ps = self.upstream_pool.aggregateStats();
         snapshot.upstream_connections_new = ps.new_total;
         snapshot.upstream_connections_reused = ps.reused_total;
+        snapshot.upstream_connections_reused_local = ps.reused_local_total;
+        snapshot.upstream_connections_reused_cross_worker = ps.reused_cross_worker_total;
         snapshot.upstream_connections_idle = ps.idle;
         snapshot.upstream_stale_retries = ps.stale_retries_total;
     }
@@ -1458,6 +1460,10 @@ pub const GatewayState = struct {
                 \\# TYPE tardigrade_upstream_pool_connections_new_total counter
                 \\# HELP tardigrade_upstream_pool_connections_reused_total Upstream connections served from the pool per origin
                 \\# TYPE tardigrade_upstream_pool_connections_reused_total counter
+                \\# HELP tardigrade_upstream_pool_connections_reused_local_total Pool reuses where the same worker thread parked and reclaimed the connection
+                \\# TYPE tardigrade_upstream_pool_connections_reused_local_total counter
+                \\# HELP tardigrade_upstream_pool_connections_reused_cross_worker_total Pool reuses where a different worker thread reclaimed a parked connection (shared-pool reuse)
+                \\# TYPE tardigrade_upstream_pool_connections_reused_cross_worker_total counter
                 \\# HELP tardigrade_upstream_pool_connections_idle Idle upstream connections held in the pool per origin
                 \\# TYPE tardigrade_upstream_pool_connections_idle gauge
                 \\# HELP tardigrade_upstream_pool_connections_active In-flight upstream connections per origin
@@ -1475,6 +1481,8 @@ pub const GatewayState = struct {
             const ratio: f64 = if (total == 0) 0 else @as(f64, @floatFromInt(s.reused_total)) / @as(f64, @floatFromInt(total));
             try appendUpstreamLabelMetric(out, "tardigrade_upstream_pool_connections_new_total", snap.host, "{d}", .{s.new_total});
             try appendUpstreamLabelMetric(out, "tardigrade_upstream_pool_connections_reused_total", snap.host, "{d}", .{s.reused_total});
+            try appendUpstreamLabelMetric(out, "tardigrade_upstream_pool_connections_reused_local_total", snap.host, "{d}", .{s.reused_local_total});
+            try appendUpstreamLabelMetric(out, "tardigrade_upstream_pool_connections_reused_cross_worker_total", snap.host, "{d}", .{s.reused_cross_worker_total});
             try appendUpstreamLabelMetric(out, "tardigrade_upstream_pool_connections_idle", snap.host, "{d}", .{s.idle});
             try appendUpstreamLabelMetric(out, "tardigrade_upstream_pool_connections_active", snap.host, "{d}", .{s.active});
             try appendUpstreamLabelMetric(out, "tardigrade_upstream_pool_stale_retries_total", snap.host, "{d}", .{s.stale_retries_total});

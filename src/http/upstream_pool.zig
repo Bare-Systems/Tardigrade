@@ -29,23 +29,36 @@ pub const Config = struct {
     max_lifetime_ms: u64 = 0,
 };
 
+/// Identifier of the worker thread that last released a connection. Used purely
+/// to classify a reuse as local (same thread parked and reclaimed it) vs
+/// cross-worker (one thread parked it, another reclaimed it — the shared-pool
+/// behaviour #147 set out to measure). Not used for socket ownership.
+pub fn currentWorkerId() u64 {
+    return @intCast(std.Thread.getCurrentId());
+}
+
 /// A pooled connection: an owned transport plus age bookkeeping. `stream` may
 /// wrap a raw fd (data-plane, via `netStreamFromFd`) or an event-loop stream
 /// (FastCGI, via `connectUnixSocket`/`tcpConnectToHost`). For TLS upstreams
 /// `tls` holds the heap-owned OpenSSL connection (allocated with the pool's
 /// allocator); the pool deinits and frees it when the connection is closed.
-/// `tls` is null for plain HTTP and FastCGI.
+/// `tls` is null for plain HTTP and FastCGI. `released_by` records the worker
+/// that last parked it (set on `release`, read on `acquire`).
 pub const PooledConn = struct {
     stream: compat.NetStream,
     tls: ?*tls_termination.UpstreamTlsConn = null,
     created_ms: u64,
     last_used_ms: u64,
+    released_by: u64 = 0,
 };
 
 /// Per-origin counters. `idle`/`active` are gauges; the rest are monotonic.
+/// `reused_local_total` + `reused_cross_worker_total` partition `reused_total`.
 pub const HostStats = struct {
     new_total: u64 = 0,
     reused_total: u64 = 0,
+    reused_local_total: u64 = 0,
+    reused_cross_worker_total: u64 = 0,
     stale_retries_total: u64 = 0,
     active: u64 = 0,
     idle: u64 = 0,
@@ -55,6 +68,8 @@ pub const HostStats = struct {
 pub const Stats = struct {
     new_total: u64 = 0,
     reused_total: u64 = 0,
+    reused_local_total: u64 = 0,
+    reused_cross_worker_total: u64 = 0,
     stale_retries_total: u64 = 0,
     idle: u64 = 0,
     active: u64 = 0,
@@ -155,6 +170,11 @@ pub const UpstreamPool = struct {
                 continue;
             }
             entry.stats.reused_total += 1;
+            if (conn.released_by == currentWorkerId()) {
+                entry.stats.reused_local_total += 1;
+            } else {
+                entry.stats.reused_cross_worker_total += 1;
+            }
             entry.stats.active += 1;
             return conn;
         }
@@ -191,6 +211,7 @@ pub const UpstreamPool = struct {
         }
         var updated = conn;
         updated.last_used_ms = now_ms;
+        updated.released_by = currentWorkerId();
         entry.idle.append(self.allocator, updated) catch {
             self.closeConn(conn);
             return;
@@ -249,6 +270,8 @@ pub const UpstreamPool = struct {
             const s = entry.value_ptr.stats;
             agg.new_total += s.new_total;
             agg.reused_total += s.reused_total;
+            agg.reused_local_total += s.reused_local_total;
+            agg.reused_cross_worker_total += s.reused_cross_worker_total;
             agg.stale_retries_total += s.stale_retries_total;
             agg.active += s.active;
             agg.idle += entry.value_ptr.idle.items.len;
@@ -330,6 +353,42 @@ test "new connection then release pools it; acquire reuses and tracks active" {
     try testing.expectEqual(@as(u64, 0), agg.idle);
     pool.release("h:80", got, false, 1500); // close it
     try testing.expectEqual(@as(u64, 0), pool.aggregateStats().active);
+}
+
+test "reuse on the releasing thread counts as local" {
+    var pool = UpstreamPool.init(testing.allocator, .{});
+    defer pool.deinit();
+    const fds = try testPair();
+    defer _ = std.c.close(fds[1]);
+
+    pool.noteNewConnection("h:80");
+    pool.release("h:80", .{ .stream = compat.netStreamFromFd(fds[0]), .created_ms = 0, .last_used_ms = 0 }, true, 0);
+    // Same thread reclaims it → local reuse.
+    const got = pool.acquire("h:80", 1) orelse return error.TestExpectedReuse;
+    const agg = pool.aggregateStats();
+    try testing.expectEqual(@as(u64, 1), agg.reused_total);
+    try testing.expectEqual(@as(u64, 1), agg.reused_local_total);
+    try testing.expectEqual(@as(u64, 0), agg.reused_cross_worker_total);
+    pool.release("h:80", got, false, 1);
+}
+
+test "reuse after a different worker parked it counts as cross-worker" {
+    var pool = UpstreamPool.init(testing.allocator, .{});
+    defer pool.deinit();
+    const fds = try testPair();
+    defer _ = std.c.close(fds[1]);
+
+    // Simulate a connection parked by another worker: release stamps the current
+    // thread id, so forge a different one directly on the idle entry.
+    pool.noteNewConnection("h:80");
+    pool.release("h:80", .{ .stream = compat.netStreamFromFd(fds[0]), .created_ms = 0, .last_used_ms = 0 }, true, 0);
+    pool.hosts.getPtr("h:80").?.idle.items[0].released_by = currentWorkerId() +% 1;
+
+    const got = pool.acquire("h:80", 1) orelse return error.TestExpectedReuse;
+    defer pool.release("h:80", got, false, 1); // close the checked-out fd
+    const agg = pool.aggregateStats();
+    try testing.expectEqual(@as(u64, 1), agg.reused_cross_worker_total);
+    try testing.expectEqual(@as(u64, 0), agg.reused_local_total);
 }
 
 test "release drops a connection past the idle timeout" {

@@ -1,8 +1,9 @@
 # Upstream connection pooling (#141)
 
 Status: **Phases 1–3 implemented** (plain-HTTP, TLS, control-plane, FastCGI, and
-the streaming path all pool on the manual transport). Later phases tracked in
-issue #141.
+the streaming path all pool on the manual transport). **Phase 4a** (#147 —
+cross-worker reuse analysis + local/cross-worker metrics + benchmark) landed;
+see "Cross-worker sharing" below. Later phases tracked in issue #141.
 
 ## Why
 
@@ -78,6 +79,87 @@ Cross-worker *sharing/stealing* (Pingora-style) is a deliberate future
 extension; the single shared map already gives cross-worker reuse, so stealing
 is only about fairness/locality, not correctness.
 
+## Cross-worker sharing (#147)
+
+#147 asks whether idle upstream connections are fragmented across workers (the
+Pingora/HAProxy motivation) and to compare local-only, shared-global, sharded,
+and stealing designs. The answer for Tardigrade depends on its **hybrid worker
+model**:
+
+- **Threads within a process** share one `GatewayState`, hence one
+  `UpstreamPool`. A connection parked by thread A is immediately acquirable by
+  thread B. This is the **shared global pool** design — no per-worker
+  fragmentation.
+- **Worker processes** (`TARDIGRADE_MASTER_PROCESS=true` with
+  `worker_processes > 1`) each have their own `GatewayState` and therefore their
+  own pool. Across *processes* the pool is not shared.
+
+The **default deployment is single-process, multi-threaded**
+(`worker_processes = 1`, `worker_threads = 0` → auto = CPU count,
+`master_process = false`), so in the common case the pool is already globally
+shared and #147's fragmentation problem does not arise.
+
+### Design comparison
+
+| Design | Reuse under skew | Lock cost | Fragmentation | Status in Tardigrade |
+|---|---|---|---|---|
+| Local-only (per-worker) | Poor — idle sockets trapped per worker | None | High | Rejected |
+| **Shared global (one mutex)** | **Best** — any worker reuses any idle conn | One mutex, 2× O(1) per request | None (intra-process) | **Implemented (default)** |
+| Sharded shared (mutex per key-shard) | Best | Lower cross-origin contention | None | Documented extension (below) |
+| Stealing (thread-local + steal on miss) | Best | Lowest steady-state, complex | None | Not needed (no thread-local tier) |
+
+Because there is no thread-local tier, there is nothing to "steal" — every reuse
+already comes from the shared map. We *measure* whether a reuse crossed workers
+by stamping each parked connection with the releasing thread id
+(`PooledConn.released_by`) and comparing it on `acquire`:
+`reused_local_total` vs `reused_cross_worker_total`.
+
+### Measured behaviour
+
+`benchmarks/cross-worker.sh` drives uneven proxy traffic through an N-thread
+gateway and scrapes the split. Representative local run (6 worker threads, hot
+route, loopback Python upstream):
+
+- **6 upstream connections** opened, **~338k reuses**, reuse ratio **99%**;
+- **~48% of reuses were cross-worker** (a connection one thread parked, another
+  reclaimed).
+
+This confirms the shared pool reuses idle connections across workers and keeps
+the connection count at ~one per active worker rather than multiplying it.
+Throughput was flat from 4→8 threads (upstream-bound, not lock-bound), so the
+single mutex is **not** a contention bottleneck at this scale — its critical
+sections are O(1) (LIFO pop/push + counter bumps).
+
+This is a focused Phase 4a measurement (uneven hot-route traffic + the
+local/cross split), not the full benchmark matrix #147 envisages. Still
+outstanding there: many-origins/low-per-origin traffic, one hot origin with many
+workers, an upstream-TLS-handshake scenario, and per-request CPU / p99 TTFB /
+lock-contention-overhead comparisons (ideally on Beelink hardware, not loopback).
+Those are tracked as remaining #147 work, not claimed complete here.
+
+### Sharded-shared extension (deferred)
+
+If a future Beelink/high-core benchmark shows the single mutex limiting
+throughput (flat scaling with idle CPU and high `sys` time on the lock), shard
+the pool into `N` stripes, each `{ mutex, StringHashMap }`, mapping
+`shard = hash(key) % N`. An origin always lands in one shard, so **all workers
+still share that origin's idle connections** — sharding only removes contention
+*between* different origins, preserving cross-worker reuse. `aggregateStats`,
+`snapshotHosts`, and `reapIdle` would fan out over shards. We do not implement
+this now: it is speculative complexity unsupported by measurement.
+
+### Cross-process sharing (deferred, harder)
+
+Sharing idle connections across worker *processes* cannot use a pointer/mutex —
+it needs SCM_RIGHTS fd-passing to a broker (a dedicated connection-cache process
+or a shared-memory ring with fd transfer). That is a substantial subsystem with
+real correctness risk (cross-process socket ownership, lifecycle, shutdown).
+Given the default is single-process multi-threaded — where sharing already works
+— cross-process sharing is explicitly deferred until multi-process deployments
+become common enough to justify it. Per-process pools remain correct (each just
+keeps its own keep-alive connections); they are merely less connection-efficient
+than a single process with the same total thread count.
+
 ## Keying
 
 Key: `"<scheme>:<host>:<port>"` (e.g. `http:127.0.0.1:8080`, `https:api:443`).
@@ -130,12 +212,16 @@ downstream-keepalive reaper): connections past `idle_timeout_ms` or
 Global (Phase 1):
 - `tardigrade_upstream_connections_new_total`
 - `tardigrade_upstream_connections_reused_total`
+- `tardigrade_upstream_connections_reused_local_total` (Phase 4a / #147 — reuses reclaimed by the parking worker)
+- `tardigrade_upstream_connections_reused_cross_worker_total` (Phase 4a / #147 — reuses reclaimed by a different worker)
 - `tardigrade_upstream_connections_idle` (gauge)
 - `tardigrade_upstream_stale_retries_total`
 
 Per-upstream labelled (`{upstream="host:port"}`, Phase 1b):
 - `tardigrade_upstream_pool_connections_new_total`
 - `tardigrade_upstream_pool_connections_reused_total`
+- `tardigrade_upstream_pool_connections_reused_local_total` (#147)
+- `tardigrade_upstream_pool_connections_reused_cross_worker_total` (#147)
 - `tardigrade_upstream_pool_connections_idle` (gauge)
 - `tardigrade_upstream_pool_connections_active` (gauge — connections checked out)
 - `tardigrade_upstream_pool_stale_retries_total`

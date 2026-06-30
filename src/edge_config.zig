@@ -58,6 +58,29 @@ pub const ProxyStreamingMode = enum {
     }
 };
 
+/// Preferred application protocol for HTTPS upstream connections (#145).
+/// `http1` keeps the HTTP/1.1 path; `h2` and `auto` offer HTTP/2 via ALPN.
+/// In PR 1 `h2`/`auto` behave identically (offer h2; use it when the origin
+/// negotiates it, else fall back to HTTP/1.1). They diverge once an h2-only
+/// mode is added. Only applies to TLS upstreams (ALPN requires TLS).
+pub const UpstreamProtocol = enum {
+    http1,
+    h2,
+    auto,
+
+    pub fn parse(value: []const u8) ?UpstreamProtocol {
+        if (std.ascii.eqlIgnoreCase(value, "http1") or std.ascii.eqlIgnoreCase(value, "http/1.1") or std.ascii.eqlIgnoreCase(value, "h1")) return .http1;
+        if (std.ascii.eqlIgnoreCase(value, "h2") or std.ascii.eqlIgnoreCase(value, "http2")) return .h2;
+        if (std.ascii.eqlIgnoreCase(value, "auto")) return .auto;
+        return null;
+    }
+
+    /// Whether HTTP/2 should be offered via ALPN.
+    pub fn offersH2(self: UpstreamProtocol) bool {
+        return self != .http1;
+    }
+};
+
 pub const EdgeConfig = struct {
     pub const HealthStatusRange = struct {
         min: u16,
@@ -162,6 +185,8 @@ pub const EdgeConfig = struct {
     /// Days before certificate expiry at which renewal is triggered.
     tls_acme_renew_days_before_expiry: u32,
     http2_enabled: bool,
+    /// Preferred application protocol for HTTPS upstream connections (#145).
+    upstream_protocol: UpstreamProtocol,
     /// Verify TLS certificates presented by HTTPS upstream backends (default: true).
     upstream_tls_verify: bool,
     /// Path to a PEM CA bundle used to verify upstream TLS certificates.
@@ -727,6 +752,9 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     const tls_acme_account_key_path = envOrDefault(allocator, "TARDIGRADE_TLS_ACME_ACCOUNT_KEY_PATH", "") catch unreachable;
     errdefer allocator.free(tls_acme_account_key_path);
     const tls_acme_renew_days_before_expiry = parseIntEnv(u32, allocator, "TARDIGRADE_TLS_ACME_RENEW_DAYS_BEFORE_EXPIRY", 30);
+    const upstream_protocol_str = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_PROTOCOL", "http1") catch unreachable;
+    defer allocator.free(upstream_protocol_str);
+    const upstream_protocol = UpstreamProtocol.parse(upstream_protocol_str) orelse .http1;
     const upstream_tls_verify = parseBoolEnv(allocator, "TARDIGRADE_UPSTREAM_TLS_VERIFY", true);
     const upstream_tls_ca_bundle = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_TLS_CA_BUNDLE", "") catch unreachable;
     errdefer allocator.free(upstream_tls_ca_bundle);
@@ -1377,6 +1405,7 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .tls_acme_account_key_path = tls_acme_account_key_path,
         .tls_acme_renew_days_before_expiry = tls_acme_renew_days_before_expiry,
         .http2_enabled = http2_enabled,
+        .upstream_protocol = upstream_protocol,
         .upstream_tls_verify = upstream_tls_verify,
         .upstream_tls_ca_bundle = upstream_tls_ca_bundle,
         .upstream_tls_server_name = upstream_tls_server_name,

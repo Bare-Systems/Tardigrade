@@ -242,6 +242,18 @@ pub fn executeBoundedBufferedTcpHttpRequest(
     /// Optional keep-alive pool for upstream connection reuse.
     pool: ?*http.upstream_pool.UpstreamPool,
 ) !BufferedUpstreamResponse {
+    // HTTP/2 upstream (#145, PR 1): when the caller asked to offer h2 (TLS only),
+    // try a fresh connection and use h2 if the origin negotiates it. PR 1 is
+    // single-stream and not pooled; multiplexing/pooling lands in a later PR.
+    if (tls_options) |opts| {
+        if (opts.offer_h2) {
+            return executeBufferedH2OrH1Fresh(allocator, host, port, opts, uri, method, extra_headers, body, content_type_override, max_buffered_response_bytes, connect_timeout_ms, response_timeout_ms, pool);
+        }
+    }
+    // Every request that reaches the buffered HTTP/1.1 path counts as h1 (an h2
+    // request would have returned above). The streaming path is not yet counted.
+    if (pool) |p| p.recordProtocol(false);
+
     const active_pool: ?*http.upstream_pool.UpstreamPool = if (pool) |p| (if (p.config.enabled) p else null) else null;
 
     // No pool: a single fresh `Connection: close` connection (plain or TLS),
@@ -326,6 +338,95 @@ pub fn executeBoundedBufferedTcpHttpRequest(
         }
     }
     unreachable;
+}
+
+/// HTTP/2 upstream attempt over a fresh TLS connection (#145, PR 1). Connects,
+/// handshakes with ALPN offering h2, and — if the origin negotiated h2 — runs a
+/// single-stream h2 exchange; otherwise falls back to the HTTP/1.1 buffered
+/// exchange on the same connection. Not pooled in PR 1 (the connection is closed
+/// on return); h2 pooling/multiplexing is a later PR.
+fn executeBufferedH2OrH1Fresh(
+    allocator: std.mem.Allocator,
+    host: []const u8,
+    port: u16,
+    opts: http.tls_termination.UpstreamTlsOptions,
+    uri: std.Uri,
+    method: []const u8,
+    extra_headers: []const std.http.Header,
+    body: []const u8,
+    content_type_override: ?[]const u8,
+    max_buffered_response_bytes: usize,
+    connect_timeout_ms: u32,
+    response_timeout_ms: u32,
+    pool: ?*http.upstream_pool.UpstreamPool,
+) !BufferedUpstreamResponse {
+    const fd = try compat.connectBlockingTcp(host, port);
+    defer _ = std.c.close(fd);
+    if (connect_timeout_ms > 0) setSocketTimeoutMs(fd, connect_timeout_ms, connect_timeout_ms) catch {};
+
+    var tls_conn = try http.tls_termination.UpstreamTlsConn.connect(fd, host, opts);
+    defer tls_conn.deinit();
+
+    if (tls_conn.negotiatedProtocol() == .http2) {
+        if (pool) |p| p.recordProtocol(true);
+        const deadline_ms: u32 = if (response_timeout_ms > 0)
+            response_timeout_ms
+        else if (connect_timeout_ms > 0) connect_timeout_ms else 30_000;
+
+        var authority_buf: [300]u8 = undefined;
+        const authority = if (port == 443)
+            host
+        else
+            std.fmt.bufPrint(&authority_buf, "{s}:{d}", .{ host, port }) catch host;
+
+        var path_buf: std.Io.Writer.Allocating = .init(allocator);
+        defer path_buf.deinit();
+        const path_component = uriComponentBytes(uri.path);
+        try path_buf.writer.writeAll(if (path_component.len > 0) path_component else "/");
+        if (uri.query) |q| {
+            try path_buf.writer.writeByte('?');
+            try path_buf.writer.writeAll(uriComponentBytes(q));
+        }
+
+        var h2resp = try http.upstream_h2.exchange(allocator, &tls_conn, fd, .{
+            .method = method,
+            .scheme = "https",
+            .authority = authority,
+            .path = path_buf.written(),
+            .headers = extra_headers,
+            .body = body,
+        }, deadline_ms);
+        defer h2resp.deinit();
+        return h2ResponseToBuffered(allocator, &h2resp);
+    }
+
+    // Origin chose HTTP/1.1: run the buffered h1 exchange on this connection.
+    if (pool) |p| p.recordProtocol(false);
+    var reusable = false;
+    return exchangeBoundedBufferedHttpRequest(allocator, &tls_conn, fd, uri, method, extra_headers, body, content_type_override, max_buffered_response_bytes, connect_timeout_ms, response_timeout_ms, false, &reusable);
+}
+
+/// Convert an HTTP/2 response into the buffered-response shape the proxy path
+/// expects. Headers + reason are owned by the response's metadata arena; the
+/// body is duped with `allocator` (freed in `BufferedUpstreamResponse.deinit`).
+fn h2ResponseToBuffered(allocator: std.mem.Allocator, h2resp: *http.upstream_h2.Response) !BufferedUpstreamResponse {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const aa = arena.allocator();
+
+    const reason = try aa.dupe(u8, gpres.upstreamReasonPhrase(@enumFromInt(h2resp.status)));
+    var headers = try aa.alloc(UpstreamHeader, h2resp.headers.len);
+    for (h2resp.headers, 0..) |h, i| {
+        headers[i] = .{ .name = try aa.dupe(u8, h.name), .value = try aa.dupe(u8, h.value) };
+    }
+    const body = try allocator.dupe(u8, h2resp.body);
+    return .{
+        .metadata_arena = arena,
+        .status_code = h2resp.status,
+        .reason = reason,
+        .headers = headers,
+        .body = body,
+    };
 }
 
 /// Send a bounded buffered HTTP/1 request over an already-connected transport
@@ -750,6 +851,9 @@ pub fn executeBoundedBufferedHttpProxyRequest(
         .sni_override = cfg.upstream_tls_server_name,
         .client_cert_path = cfg.upstream_tls_client_cert,
         .client_key_path = cfg.upstream_tls_client_key,
+        // Offer HTTP/2 via ALPN when configured (#145). The streaming path does
+        // not yet speak h2, so this is set on the buffered path only.
+        .offer_h2 = cfg.upstream_protocol.offersH2(),
     } else null;
     const base_timeout_ms = if (attempt_timeout_ms > 0) attempt_timeout_ms else connect_timeout_ms;
     const effective_send_timeout_ms = if (cancel_token) |tok|

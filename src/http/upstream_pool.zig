@@ -105,6 +105,10 @@ pub const UpstreamPool = struct {
     connect_latency_buckets: [connect_latency_bounds_ms.len + 1]u64 = [_]u64{0} ** (connect_latency_bounds_ms.len + 1),
     connect_latency_count: u64 = 0,
     connect_latency_sum_ms: u64 = 0,
+    /// Upstream requests by negotiated application protocol (#145). Atomic so
+    /// the hot proxy path need not take the pool mutex just to count.
+    protocol_h1_requests: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    protocol_h2_requests: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
     pub fn init(allocator: std.mem.Allocator, config: Config) UpstreamPool {
         return .{
@@ -297,6 +301,23 @@ pub const UpstreamPool = struct {
             try out.append(.{ .host = host, .stats = stats });
         }
         return out.toOwnedSlice();
+    }
+
+    /// Count an upstream request by negotiated protocol (#145).
+    pub fn recordProtocol(self: *UpstreamPool, is_h2: bool) void {
+        if (is_h2) {
+            _ = self.protocol_h2_requests.fetchAdd(1, .monotonic);
+        } else {
+            _ = self.protocol_h1_requests.fetchAdd(1, .monotonic);
+        }
+    }
+
+    /// Total upstream requests served per negotiated protocol.
+    pub fn protocolCounts(self: *const UpstreamPool) struct { h1: u64, h2: u64 } {
+        return .{
+            .h1 = self.protocol_h1_requests.load(.monotonic),
+            .h2 = self.protocol_h2_requests.load(.monotonic),
+        };
     }
 
     pub fn connectLatencySnapshot(self: *UpstreamPool) ConnectLatencySnapshot {

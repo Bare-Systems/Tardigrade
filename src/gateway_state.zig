@@ -1504,6 +1504,15 @@ pub const GatewayState = struct {
         try out.print("tardigrade_upstream_connect_latency_ms_bucket{{le=\"+Inf\"}} {d}\n", .{cumulative});
         try out.print("tardigrade_upstream_connect_latency_ms_sum {d}\n", .{lat.sum_ms});
         try out.print("tardigrade_upstream_connect_latency_ms_count {d}\n", .{lat.count});
+
+        const proto = self.upstream_pool.protocolCounts();
+        try out.appendSlice(
+            \\# HELP tardigrade_upstream_protocol_requests_total Upstream requests by negotiated application protocol
+            \\# TYPE tardigrade_upstream_protocol_requests_total counter
+            \\
+        );
+        try out.print("tardigrade_upstream_protocol_requests_total{{protocol=\"h1\"}} {d}\n", .{proto.h1});
+        try out.print("tardigrade_upstream_protocol_requests_total{{protocol=\"h2\"}} {d}\n", .{proto.h2});
     }
 
     pub fn metricsToJson(self: *GatewayState, allocator: std.mem.Allocator) ![]u8 {

@@ -703,6 +703,9 @@ pub const UpstreamTlsOptions = struct {
     client_cert_path: []const u8 = "",
     /// PEM path to the client private key for mTLS (optional).
     client_key_path: []const u8 = "",
+    /// Offer HTTP/2 via ALPN ("h2", "http/1.1"). When false only "http/1.1"
+    /// is offered. The negotiated protocol is read via `negotiatedProtocol`.
+    offer_h2: bool = false,
 };
 
 /// An OpenSSL-backed TLS client connection to a TCP stream.
@@ -753,6 +756,10 @@ pub const UpstreamTlsConn = struct {
         defer std.heap.c_allocator.free(sni_z);
         _ = c.SSL_set_tlsext_host_name(ssl, sni_z.ptr);
 
+        // Offer ALPN. h2 must precede http/1.1 (client preference order).
+        const alpn_wire: []const u8 = if (opts.offer_h2) "\x02h2\x08http/1.1" else "\x08http/1.1";
+        _ = c.SSL_set_alpn_protos(ssl, alpn_wire.ptr, @intCast(alpn_wire.len));
+
         if (!opts.skip_verify) {
             const verify_host_z = try std.heap.c_allocator.dupeZ(u8, sni_host);
             defer std.heap.c_allocator.free(verify_host_z);
@@ -788,6 +795,24 @@ pub const UpstreamTlsConn = struct {
             if (rc <= 0) return error.TlsWriteFailed;
             offset += @intCast(rc);
         }
+    }
+
+    /// Bytes already decrypted and buffered in OpenSSL, not yet read. A `poll`
+    /// on the fd cannot see these, so callers that poll-bound their reads must
+    /// check this first.
+    pub fn pending(self: *const UpstreamTlsConn) usize {
+        const n = c.SSL_pending(self.ssl);
+        return if (n > 0) @intCast(n) else 0;
+    }
+
+    /// The ALPN protocol the handshake selected (`.http2` if the peer chose h2,
+    /// else `.http1_1`).
+    pub fn negotiatedProtocol(self: *const UpstreamTlsConn) NegotiatedProtocol {
+        var data: [*c]const u8 = null;
+        var len: c_uint = 0;
+        c.SSL_get0_alpn_selected(self.ssl, &data, &len);
+        if (data != null and len == 2 and std.mem.eql(u8, data[0..2], "h2")) return .http2;
+        return .http1_1;
     }
 };
 

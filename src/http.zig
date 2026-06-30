@@ -52,6 +52,7 @@ pub const acme_client = @import("http/acme_client.zig");
 pub const hpack = @import("http/hpack.zig");
 pub const http2_frame = @import("http/http2_frame.zig");
 pub const http2_stream = @import("http/http2_stream.zig");
+pub const upstream_h2 = @import("http/upstream_h2.zig");
 pub const ngtcp2_binding = @import("http/ngtcp2_binding.zig");
 pub const http3_handler = @import("http/http3_handler.zig");
 pub const http3_session = @import("http/http3_session.zig");

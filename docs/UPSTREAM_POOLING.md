@@ -55,7 +55,39 @@ Deferred (tracked on #141):
   byte is written and only for requests without a streaming request body (a
   partially-relayed response cannot be safely replayed).
 - Cross-worker connection stealing/sharing (Phase 4 / #147).
-- HTTP/2 upstream multiplexing (#145).
+
+## HTTP/2 upstream multiplexing (#145, Phase 4b)
+
+HTTP/1.1 pooling above is *one exclusive request per pooled connection*. HTTP/2
+instead multiplexes *many concurrent streams over one* origin connection. Because
+Tardigrade uses a thread-per-connection blocking model, this needs a different
+structure from the h1 pool:
+
+- **`upstream_h2.H2Conn`** — a per-connection actor. A dedicated **reader
+  thread** owns every socket read and all HPACK decoding (the HPACK dynamic
+  table is connection-wide, so there is exactly one decoder and it needs no
+  lock). Worker threads call the blocking `request()`, which allocates a stream
+  id, writes HEADERS/DATA under a **write mutex**, and waits on a **per-stream**
+  condition variable until the reader marks the stream done or errored.
+  - Locking: `write_mutex` serializes socket writes; `state_mutex` (+ conditions)
+    guards the streams map, flow-control windows, and connection flags. The two
+    are never held simultaneously (update state, release, then write), so there
+    is no lock-ordering deadlock. A completing stream is detached from the map
+    under the lock before its buffers are moved out, so the reader cannot race
+    the hand-off.
+  - Per-stream (not broadcast) signaling is essential: an early single-broadcast
+    design woke every waiter on every frame (a thundering herd) and collapsed
+    throughput under concurrency; per-stream conditions restored it (~25× in a
+    32-client benchmark).
+- **`upstream_h2.H2ConnPool`** — one connection per origin (keyed `h2:host:port`),
+  refcounted so an evicted/dead connection survives until its last in-flight
+  request drains. A connection-level failure evicts and retries once.
+- Enabled via `TARDIGRADE_UPSTREAM_PROTOCOL=h2|auto` on the buffered data-plane
+  path; offered through ALPN (TLS only — no cleartext h2c). Origins that select
+  `http/1.1` fall back to the HTTP/1.1 path.
+
+Deferred within #145: reset/GOAWAY counters, idle/lifetime eviction of h2
+connections, the streaming proxy path, and h1-pool-vs-h2-multiplexed benchmarks.
 
 ## Ownership & concurrency
 

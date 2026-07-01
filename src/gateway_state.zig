@@ -464,6 +464,7 @@ pub const GatewayState = struct {
     upstream_health: std.StringHashMap(UpstreamHealth), // owned keys [upstream_mutex]
     upstream_active_requests: std.StringHashMap(usize), // owned keys [upstream_mutex]
     upstream_pool: http.upstream_pool.UpstreamPool, // owned; self-synchronized keep-alive pool (#141; data-plane + FastCGI)
+    h2_pool: http.upstream_h2.H2ConnPool, // owned; per-origin HTTP/2 multiplexing pool (#145)
     fastcgi_next_request_id: std.StringHashMap(u16), // owned keys [connection_mutex]
     proxy_cache_locks: std.StringHashMap(u32), // owned keys [proxy_cache_mutex]
     active_connections_by_ip: std.StringHashMap(u32), // owned keys [connection_mutex]
@@ -519,6 +520,7 @@ pub const GatewayState = struct {
         while (upstream_active_it.next()) |entry| self.allocator.free(entry.key_ptr.*);
         self.upstream_active_requests.deinit();
         self.upstream_pool.deinit();
+        self.h2_pool.deinit();
         var fastcgi_id_it = self.fastcgi_next_request_id.iterator();
         while (fastcgi_id_it.next()) |entry| self.allocator.free(entry.key_ptr.*);
         self.fastcgi_next_request_id.deinit();
@@ -1513,6 +1515,17 @@ pub const GatewayState = struct {
         );
         try out.print("tardigrade_upstream_protocol_requests_total{{protocol=\"h1\"}} {d}\n", .{proto.h1});
         try out.print("tardigrade_upstream_protocol_requests_total{{protocol=\"h2\"}} {d}\n", .{proto.h2});
+
+        const h2 = self.h2_pool.snapshot();
+        try out.appendSlice(
+            \\# HELP tardigrade_upstream_h2_connections_active Open multiplexing HTTP/2 upstream connections
+            \\# TYPE tardigrade_upstream_h2_connections_active gauge
+            \\# HELP tardigrade_upstream_h2_streams_active In-flight HTTP/2 upstream streams across all connections
+            \\# TYPE tardigrade_upstream_h2_streams_active gauge
+            \\
+        );
+        try out.print("tardigrade_upstream_h2_connections_active {d}\n", .{h2.connections_active});
+        try out.print("tardigrade_upstream_h2_streams_active {d}\n", .{h2.streams_active});
     }
 
     pub fn metricsToJson(self: *GatewayState, allocator: std.mem.Allocator) ![]u8 {
@@ -3235,6 +3248,7 @@ fn initMetricsJsonTestState(gs: *GatewayState, allocator: std.mem.Allocator) voi
     // metricsToJson/metricsToPrometheus overlay the upstream pool's live
     // counters, so the pool must be a valid (empty) instance here.
     gs.upstream_pool = http.upstream_pool.UpstreamPool.init(allocator, .{});
+    gs.h2_pool = http.upstream_h2.H2ConnPool.init(allocator);
 }
 
 test "served metrics JSON exposes every counter the canonical serializer does" {

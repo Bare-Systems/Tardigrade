@@ -139,7 +139,14 @@ pub const EventLoop = struct {
 
         var dummy_ev: std.c.Kevent = undefined;
         const n = std.c.kevent(self.fd, @as([*]const std.c.Kevent, @ptrCast(&dummy_ev)), 0, kq_events[0..cap].ptr, @intCast(cap), timeout_ptr);
-        if (n < 0) return error.Unexpected;
+        if (n < 0) {
+            // A blocking kevent is interrupted by any signal delivered to this
+            // thread (EINTR) — common once background worker threads (e.g. the
+            // HTTP/2 upstream readers) are active. Treat it as "no events" and
+            // let the caller loop again, mirroring the epoll path.
+            if (std.posix.errno(n) == .INTR) return 0;
+            return error.Unexpected;
+        }
         for (kq_events[0..@intCast(n)], 0..) |ev, idx| {
             out_events[idx] = .{
                 .fd = @intCast(ev.ident),

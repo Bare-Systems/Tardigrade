@@ -116,6 +116,7 @@ pub fn executeBufferedDataPlaneProxyRequest(
     response_timeout_ms: u32,
     cancel_token: ?*const http.cancellation.CancellationToken,
     pool: ?*http.upstream_pool.UpstreamPool,
+    h2_pool: ?*http.upstream_h2.H2ConnPool,
 ) !DataPlaneProxyResponse {
     // HTTPS (plain and mTLS) and Unix/TCP HTTP are all dispatched inside
     // executeBoundedBufferedHttpProxyRequest, which now owns transport
@@ -142,6 +143,7 @@ pub fn executeBufferedDataPlaneProxyRequest(
         response_timeout_ms,
         cancel_token,
         pool,
+        h2_pool,
     ) };
 }
 
@@ -611,6 +613,7 @@ pub fn handleLocationProxyPass(
             cfg.upstream_response_timeout_ms,
             if (ctx.lifecycle) |lc| &lc.token else null,
             &state.upstream_pool,
+            &state.h2_pool,
         );
         state.recordUpstreamAttemptEnd(selection.base_url);
         const result = resp catch |err| {

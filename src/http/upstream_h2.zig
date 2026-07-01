@@ -26,6 +26,7 @@ const std = @import("std");
 const compat = @import("../zig_compat.zig");
 const frame = @import("http2_frame.zig");
 const hpack = @import("hpack.zig");
+const tls_termination = @import("tls_termination.zig");
 
 /// HTTP/2 client connection preface (RFC 7540 §3.5).
 pub const PREFACE = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
@@ -401,6 +402,9 @@ fn freeHeaderList(allocator: std.mem.Allocator, list: *std.ArrayList(hpack.Heade
 const Stream = struct {
     id: u31,
     send_window: i64,
+    /// Per-stream completion signal — the reader signals only the waiter for
+    /// this stream, avoiding a thundering herd across all in-flight requests.
+    cond: compat.Condition = .{},
     header_block: std.ArrayList(u8) = .empty,
     awaiting_continuation: bool = false,
     status: ?u16 = null,
@@ -423,6 +427,10 @@ pub fn H2Conn(comptime Transport: type) type {
 
         allocator: std.mem.Allocator,
         transport: Transport,
+        /// When set, `deinit` frees the heap-allocated `transport` pointer with
+        /// this allocator after closing it. Null for borrowed transports (e.g.
+        /// a stack pointer in tests).
+        transport_allocator: ?std.mem.Allocator,
         fd: std.posix.fd_t,
         deadline_ms: u32,
 
@@ -446,15 +454,22 @@ pub fn H2Conn(comptime Transport: type) type {
         rst_received: u64 = 0,
         goaway_received: u64 = 0,
 
+        /// Reference count: the pool map holds one ref per entry and each
+        /// in-flight `request()` holds one. The connection is torn down when the
+        /// count reaches zero, so an evicted connection survives until its last
+        /// in-flight request completes.
+        refs: std.atomic.Value(u32) = std.atomic.Value(u32).init(1),
+
         /// Create the actor (heap-owned so the reader thread has a stable
         /// pointer), send the preface + SETTINGS, and spawn the reader. The
         /// actor takes ownership of `transport`/`fd` and closes them in `deinit`.
-        pub fn init(allocator: std.mem.Allocator, transport: Transport, fd: std.posix.fd_t, deadline_ms: u32) !*Self {
+        pub fn init(allocator: std.mem.Allocator, transport: Transport, fd: std.posix.fd_t, deadline_ms: u32, transport_allocator: ?std.mem.Allocator) !*Self {
             const self = try allocator.create(Self);
             errdefer allocator.destroy(self);
             self.* = .{
                 .allocator = allocator,
                 .transport = transport,
+                .transport_allocator = transport_allocator,
                 .fd = fd,
                 .deadline_ms = deadline_ms,
                 .decoder = hpack.Decoder.init(),
@@ -469,6 +484,15 @@ pub fn H2Conn(comptime Transport: type) type {
 
             self.reader = try std.Thread.spawn(.{}, readerLoop, .{self});
             return self;
+        }
+
+        pub fn retain(self: *Self) void {
+            _ = self.refs.fetchAdd(1, .monotonic);
+        }
+
+        /// Drop a reference; tear down when the last one is released.
+        pub fn release(self: *Self) void {
+            if (self.refs.fetchSub(1, .acq_rel) == 1) self.deinit();
         }
 
         pub fn deinit(self: *Self) void {
@@ -486,6 +510,7 @@ pub fn H2Conn(comptime Transport: type) type {
             self.streams.deinit();
             self.decoder.deinit(self.allocator);
             self.transport.close();
+            if (self.transport_allocator) |ta| ta.destroy(self.transport);
             const a = self.allocator;
             a.destroy(self);
         }
@@ -517,7 +542,7 @@ pub fn H2Conn(comptime Transport: type) type {
             // its header/body buffers before we move them out.
             self.state_mutex.lock();
             while (!stream.done and stream.err == null and self.conn_err == null) {
-                self.cond.wait(&self.state_mutex);
+                stream.cond.wait(&self.state_mutex);
             }
             const stream_err: ?anyerror = if (stream.err != null) stream.err else self.conn_err;
             _ = self.streams.remove(stream.id);
@@ -712,12 +737,13 @@ pub fn H2Conn(comptime Transport: type) type {
                 },
                 .rst_stream => {
                     self.state_mutex.lock();
-                    if (self.streams.get(fr.stream_id)) |s| {
+                    const maybe = self.streams.get(fr.stream_id);
+                    if (maybe) |s| {
                         s.err = error.Http2StreamReset;
                         self.rst_received += 1;
                     }
                     self.state_mutex.unlock();
-                    self.cond.broadcast();
+                    if (maybe) |s| s.cond.signal();
                 },
                 .headers, .continuation => try self.handleHeaders(fr),
                 .data => try self.handleData(fr),
@@ -764,7 +790,7 @@ pub fn H2Conn(comptime Transport: type) type {
             self.state_mutex.lock();
             defer {
                 self.state_mutex.unlock();
-                self.cond.broadcast();
+                s.cond.signal();
             }
             for (decoded.headers) |h| {
                 if (std.mem.eql(u8, h.name, ":status")) {
@@ -799,7 +825,7 @@ pub fn H2Conn(comptime Transport: type) type {
                 self.writeControl(.window_update, 0, 0, &inc);
                 self.writeControl(.window_update, 0, fr.stream_id, &inc);
             }
-            if (maybe_stream != null) self.cond.broadcast();
+            if (maybe_stream) |s| s.cond.signal();
         }
 
         fn applySettings(self: *Self, payload: []const u8) void {
@@ -837,12 +863,162 @@ pub fn H2Conn(comptime Transport: type) type {
             var it = self.streams.valueIterator();
             while (it.next()) |sp| {
                 if (sp.*.err == null) sp.*.err = e;
+                sp.*.cond.signal(); // wake each response waiter
             }
             self.state_mutex.unlock();
-            self.cond.broadcast();
+            self.cond.broadcast(); // wake beginStream / window waiters
         }
     };
 }
+
+/// Concrete actor type for production (TLS upstream).
+pub const TlsH2Conn = H2Conn(*tls_termination.UpstreamTlsConn);
+
+pub const H2PoolStats = struct {
+    connections_active: u64 = 0,
+    streams_active: u64 = 0,
+};
+
+/// Result of acquiring a connection for an origin: either a multiplexing h2
+/// actor (the caller holds one ref and must `release` it), or — when the origin
+/// negotiated HTTP/1.1 over ALPN — the raw TLS connection for the caller to run
+/// an HTTP/1.1 exchange on and then `close`/free.
+pub const H2AcquireResult = union(enum) {
+    h2: *TlsH2Conn,
+    h1: *tls_termination.UpstreamTlsConn,
+};
+
+/// Per-origin pool of multiplexing h2 connections (#145, PR 2). One connection
+/// per origin carries many concurrent streams; connection lifetime is
+/// refcounted so an evicted (dead) connection survives until its last in-flight
+/// request finishes. Keyed by the scheme-qualified origin (e.g. `h2:host:443`).
+pub const H2ConnPool = struct {
+    allocator: std.mem.Allocator,
+    mutex: compat.Mutex = .{},
+    conns: std.StringHashMap(*TlsH2Conn),
+
+    pub fn init(allocator: std.mem.Allocator) H2ConnPool {
+        return .{ .allocator = allocator, .conns = std.StringHashMap(*TlsH2Conn).init(allocator) };
+    }
+
+    pub fn deinit(self: *H2ConnPool) void {
+        self.mutex.lock();
+        var it = self.conns.iterator();
+        while (it.next()) |e| {
+            self.allocator.free(e.key_ptr.*);
+            e.value_ptr.*.release(); // drop the map ref
+        }
+        self.conns.deinit();
+        self.mutex.unlock();
+    }
+
+    /// Get a healthy h2 connection for `key`, creating one if needed. On the h2
+    /// path the returned actor carries one ref for the caller (release with
+    /// `release`). On ALPN h1 the raw TLS conn is returned for the caller to own.
+    pub fn acquire(
+        self: *H2ConnPool,
+        key: []const u8,
+        host: []const u8,
+        port: u16,
+        tls_options: tls_termination.UpstreamTlsOptions,
+        deadline_ms: u32,
+    ) !H2AcquireResult {
+        // Fast path: an existing healthy connection.
+        self.mutex.lock();
+        if (self.conns.get(key)) |c| {
+            if (c.healthy()) {
+                c.retain();
+                self.mutex.unlock();
+                return .{ .h2 = c };
+            }
+        }
+        self.mutex.unlock();
+
+        // Slow path: connect + handshake (no lock held).
+        const fd = try compat.connectBlockingTcp(host, port);
+        const tls_ptr = self.allocator.create(tls_termination.UpstreamTlsConn) catch {
+            _ = std.c.close(fd);
+            return error.OutOfMemory;
+        };
+        var opts = tls_options;
+        opts.offer_h2 = true;
+        tls_ptr.* = tls_termination.UpstreamTlsConn.connect(fd, host, opts) catch |e| {
+            self.allocator.destroy(tls_ptr);
+            _ = std.c.close(fd);
+            return e;
+        };
+        // tls_ptr now owns the fd (its close() closes the socket).
+
+        if (tls_ptr.negotiatedProtocol() != .http2) {
+            return .{ .h1 = tls_ptr }; // caller owns: close() + destroy()
+        }
+
+        const conn = TlsH2Conn.init(self.allocator, tls_ptr, fd, deadline_ms, self.allocator) catch |e| {
+            tls_ptr.close();
+            self.allocator.destroy(tls_ptr);
+            return e;
+        };
+        // conn.refs == 1 (the caller's ref).
+
+        // Publish into the map, resolving a creation race.
+        self.mutex.lock();
+        if (self.conns.get(key)) |c2| {
+            if (c2.healthy()) {
+                c2.retain();
+                self.mutex.unlock();
+                conn.release(); // tear down our redundant connection
+                return .{ .h2 = c2 };
+            }
+            // Stale entry — evict it.
+            if (self.conns.fetchRemove(key)) |old| {
+                self.allocator.free(old.key);
+                old.value.release();
+            }
+        }
+        const owned_key = self.allocator.dupe(u8, key) catch {
+            self.mutex.unlock();
+            return .{ .h2 = conn }; // unpooled, but usable; caller still holds its ref
+        };
+        conn.retain(); // map ref (refs == 2)
+        self.conns.put(owned_key, conn) catch {
+            self.allocator.free(owned_key);
+            conn.release(); // undo map ref
+            self.mutex.unlock();
+            return .{ .h2 = conn };
+        };
+        self.mutex.unlock();
+        return .{ .h2 = conn };
+    }
+
+    /// Drop the caller's ref on an h2 connection.
+    pub fn release(_: *H2ConnPool, conn: *TlsH2Conn) void {
+        conn.release();
+    }
+
+    /// Remove a (presumably dead) connection from the map if it is still the
+    /// mapped entry for `key`, dropping the map ref. In-flight requests keep it
+    /// alive via their own refs until they finish.
+    pub fn evict(self: *H2ConnPool, key: []const u8, conn: *TlsH2Conn) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.conns.getEntry(key)) |e| {
+            if (e.value_ptr.* == conn) {
+                self.allocator.free(e.key_ptr.*);
+                _ = self.conns.remove(key);
+                conn.release();
+            }
+        }
+    }
+
+    pub fn snapshot(self: *H2ConnPool) H2PoolStats {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var s = H2PoolStats{ .connections_active = self.conns.count() };
+        var it = self.conns.valueIterator();
+        while (it.next()) |cp| s.streams_active += cp.*.activeStreamCount();
+        return s;
+    }
+};
 
 /// Encode a u31 window increment into a 4-byte big-endian buffer (thread-local
 /// scratch is unsafe here, so build per-call). Returned slice is a comptime
@@ -996,7 +1172,7 @@ test "h2 actor multiplexes concurrent requests over one connection" {
     const server = try std.Thread.spawn(.{}, cannedMuxServer, .{ fds[1], @as(usize, N) });
 
     var transport = PlainTransport{ .fd = fds[0] };
-    const conn = try H2Conn(*PlainTransport).init(testing.allocator, &transport, fds[0], 2000);
+    const conn = try H2Conn(*PlainTransport).init(testing.allocator, &transport, fds[0], 2000, null);
 
     var ctxs: [N]MuxClientCtx = undefined;
     var threads: [N]std.Thread = undefined;

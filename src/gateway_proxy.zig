@@ -241,12 +241,19 @@ pub fn executeBoundedBufferedTcpHttpRequest(
     response_timeout_ms: u32,
     /// Optional keep-alive pool for upstream connection reuse.
     pool: ?*http.upstream_pool.UpstreamPool,
+    /// Optional per-origin HTTP/2 multiplexing pool (#145). When present and the
+    /// caller offered h2, requests multiplex over a shared origin connection.
+    h2_pool: ?*http.upstream_h2.H2ConnPool,
 ) !BufferedUpstreamResponse {
-    // HTTP/2 upstream (#145, PR 1): when the caller asked to offer h2 (TLS only),
-    // try a fresh connection and use h2 if the origin negotiates it. PR 1 is
-    // single-stream and not pooled; multiplexing/pooling lands in a later PR.
+    // HTTP/2 upstream (#145): when the caller asked to offer h2 (TLS only),
+    // multiplex over a shared per-origin connection when an h2 pool is provided,
+    // else fall back to a fresh single-stream connection. h1 origins are
+    // detected via ALPN and handled on the HTTP/1.1 path.
     if (tls_options) |opts| {
         if (opts.offer_h2) {
+            if (h2_pool) |hp| {
+                return executeBufferedViaH2Pool(allocator, hp, host, port, opts, uri, method, extra_headers, body, content_type_override, max_buffered_response_bytes, connect_timeout_ms, response_timeout_ms, pool);
+            }
             return executeBufferedH2OrH1Fresh(allocator, host, port, opts, uri, method, extra_headers, body, content_type_override, max_buffered_response_bytes, connect_timeout_ms, response_timeout_ms, pool);
         }
     }
@@ -404,6 +411,93 @@ fn executeBufferedH2OrH1Fresh(
     if (pool) |p| p.recordProtocol(false);
     var reusable = false;
     return exchangeBoundedBufferedHttpRequest(allocator, &tls_conn, fd, uri, method, extra_headers, body, content_type_override, max_buffered_response_bytes, connect_timeout_ms, response_timeout_ms, false, &reusable);
+}
+
+/// HTTP/2 buffered request multiplexed over a shared per-origin connection
+/// (#145, PR 2). Acquires (or creates) the origin's h2 connection from the pool
+/// and issues one stream on it. A connection-level failure evicts the dead
+/// connection and retries once on a fresh one. If the origin negotiated HTTP/1.1
+/// over ALPN, the request runs on the HTTP/1.1 path over that connection.
+fn executeBufferedViaH2Pool(
+    allocator: std.mem.Allocator,
+    h2_pool: *http.upstream_h2.H2ConnPool,
+    host: []const u8,
+    port: u16,
+    opts: http.tls_termination.UpstreamTlsOptions,
+    uri: std.Uri,
+    method: []const u8,
+    extra_headers: []const std.http.Header,
+    body: []const u8,
+    content_type_override: ?[]const u8,
+    max_buffered_response_bytes: usize,
+    connect_timeout_ms: u32,
+    response_timeout_ms: u32,
+    h1_pool: ?*http.upstream_pool.UpstreamPool,
+) !BufferedUpstreamResponse {
+    const deadline_ms: u32 = if (response_timeout_ms > 0)
+        response_timeout_ms
+    else if (connect_timeout_ms > 0) connect_timeout_ms else 30_000;
+
+    var key_buf: [300]u8 = undefined;
+    const key = std.fmt.bufPrint(&key_buf, "h2:{s}:{d}", .{ host, port }) catch host;
+
+    var attempt: usize = 0;
+    while (attempt < 2) : (attempt += 1) {
+        const acq = try h2_pool.acquire(key, host, port, opts, deadline_ms);
+        switch (acq) {
+            .h1 => |tls_ptr| {
+                // ALPN negotiated HTTP/1.1: run the h1 exchange on this fresh
+                // (unpooled) connection, then tear it down.
+                defer {
+                    tls_ptr.close();
+                    h2_pool.allocator.destroy(tls_ptr);
+                }
+                if (h1_pool) |p| p.recordProtocol(false);
+                var reusable = false;
+                return exchangeBoundedBufferedHttpRequest(allocator, tls_ptr, tls_ptr.fd, uri, method, extra_headers, body, content_type_override, max_buffered_response_bytes, connect_timeout_ms, response_timeout_ms, false, &reusable);
+            },
+            .h2 => |conn| {
+                if (h1_pool) |p| p.recordProtocol(true);
+
+                var authority_buf: [300]u8 = undefined;
+                const authority = if (port == 443)
+                    host
+                else
+                    std.fmt.bufPrint(&authority_buf, "{s}:{d}", .{ host, port }) catch host;
+
+                var path_buf: std.Io.Writer.Allocating = .init(allocator);
+                defer path_buf.deinit();
+                const path_component = uriComponentBytes(uri.path);
+                try path_buf.writer.writeAll(if (path_component.len > 0) path_component else "/");
+                if (uri.query) |q| {
+                    try path_buf.writer.writeByte('?');
+                    try path_buf.writer.writeAll(uriComponentBytes(q));
+                }
+
+                var h2resp = conn.request(.{
+                    .method = method,
+                    .scheme = "https",
+                    .authority = authority,
+                    .path = path_buf.written(),
+                    .headers = extra_headers,
+                    .body = body,
+                }) catch |err| {
+                    // Connection-level failure: evict the dead connection so new
+                    // requests do not pick it, drop our ref, and retry once.
+                    h2_pool.evict(key, conn);
+                    h2_pool.release(conn);
+                    if (attempt == 0 and (err == error.Http2GoAway or err == error.Http2ConnectionClosed or err == error.Http2StreamReset)) {
+                        continue;
+                    }
+                    return err;
+                };
+                defer h2resp.deinit();
+                h2_pool.release(conn);
+                return h2ResponseToBuffered(allocator, &h2resp);
+            },
+        }
+    }
+    unreachable;
 }
 
 /// Convert an HTTP/2 response into the buffered-response shape the proxy path
@@ -778,6 +872,8 @@ pub fn executeBoundedBufferedHttpProxyRequest(
     cancel_token: ?*const CancellationToken,
     /// Optional keep-alive pool for plain-HTTP upstream connection reuse (#141).
     pool: ?*http.upstream_pool.UpstreamPool,
+    /// Optional per-origin HTTP/2 multiplexing pool (#145).
+    h2_pool: ?*http.upstream_h2.H2ConnPool,
 ) !BufferedUpstreamResponse {
     // Bail out before touching the network if the request is already stopped.
     if (cancel_token) |tok| {
@@ -878,6 +974,7 @@ pub fn executeBoundedBufferedHttpProxyRequest(
         effective_send_timeout_ms,
         effective_response_timeout_ms,
         pool,
+        h2_pool,
     );
 }
 
@@ -2008,6 +2105,7 @@ test "connectBlockingTcp + exchange round-trips a real TCP origin" {
         1 << 20,
         2_000,
         2_000,
+        null,
         null,
     );
     defer resp.deinit(allocator);

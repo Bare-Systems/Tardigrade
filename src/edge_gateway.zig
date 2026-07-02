@@ -124,7 +124,10 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
             .idle_timeout_ms = cfg.upstream_pool_idle_timeout_ms,
             .max_lifetime_ms = cfg.upstream_pool_max_lifetime_ms,
         }),
-        .h2_pool = http.upstream_h2.H2ConnPool.init(state_allocator),
+        .h2_pool = http.upstream_h2.H2ConnPool.init(state_allocator, .{
+            .idle_timeout_ms = cfg.upstream_pool_idle_timeout_ms,
+            .max_lifetime_ms = cfg.upstream_pool_max_lifetime_ms,
+        }),
         .fastcgi_next_request_id = std.StringHashMap(u16).init(state_allocator),
         .proxy_cache_locks = std.StringHashMap(u32).init(state_allocator),
         .active_connections_by_ip = std.StringHashMap(u32).init(state_allocator),
@@ -612,6 +615,9 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
             // Evict idle upstream keep-alive connections past their idle/lifetime
             // caps (#141).
             state.upstream_pool.reapIdle(http.event_loop.monotonicMs());
+            // Evict idle / aged-out / dead multiplexing HTTP/2 upstream
+            // connections (refcount-safe; skips conns with in-flight streams) (#145).
+            state.h2_pool.reapIdle(http.event_loop.monotonicMs());
             const worker_snapshot = worker_pool.snapshot();
             state.metricsSetWorkerPoolStats(
                 worker_snapshot.active_jobs,

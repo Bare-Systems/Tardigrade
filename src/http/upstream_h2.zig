@@ -34,6 +34,13 @@ pub const PREFACE = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 /// SHUT_RDWR (`std.posix.shutdown` is unavailable in this std; use `std.c`).
 const SHUT_RDWR: c_int = 2;
 
+/// Monotonic-ish wall clock in milliseconds for connection age bookkeeping.
+/// Mirrors `event_loop.monotonicMs` without importing it (avoids a cycle).
+fn nowMs() u64 {
+    const t = compat.milliTimestamp();
+    return if (t <= 0) 0 else @intCast(t);
+}
+
 const DEFAULT_MAX_FRAME: usize = 16_384;
 /// Receive window we advertise per stream (SETTINGS_INITIAL_WINDOW_SIZE).
 const OUR_INITIAL_WINDOW: u31 = 1 << 20;
@@ -439,6 +446,19 @@ pub fn H2Conn(comptime Transport: type) type {
         cond: compat.Condition = .{},
         decoder: hpack.Decoder, // reader-thread only
 
+        /// Age bookkeeping for the idle/lifetime reaper (#145, PR 3). `created_ms`
+        /// is fixed at init; `last_activity_ms` is stamped whenever a stream
+        /// starts or finishes. Both are monotonic-ms (see `nowMs`). Read
+        /// lock-free by the reaper so it need not take `state_mutex` per conn.
+        created_ms: u64 = 0,
+        last_activity_ms: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
+        /// Pool-level monotonic counters the reader bumps when it sees an
+        /// RST_STREAM / GOAWAY, so the totals survive connection teardown (a
+        /// live-conn snapshot would lose them). Null for pool-less test conns.
+        pool_rst_counter: ?*std.atomic.Value(u64) = null,
+        pool_goaway_counter: ?*std.atomic.Value(u64) = null,
+
         streams: std.AutoHashMap(u31, *Stream),
         next_stream_id: u31 = 1,
         conn_send_window: i64 = PROTOCOL_DEFAULT_WINDOW,
@@ -463,9 +483,18 @@ pub fn H2Conn(comptime Transport: type) type {
         /// Create the actor (heap-owned so the reader thread has a stable
         /// pointer), send the preface + SETTINGS, and spawn the reader. The
         /// actor takes ownership of `transport`/`fd` and closes them in `deinit`.
-        pub fn init(allocator: std.mem.Allocator, transport: Transport, fd: std.posix.fd_t, deadline_ms: u32, transport_allocator: ?std.mem.Allocator) !*Self {
+        pub fn init(
+            allocator: std.mem.Allocator,
+            transport: Transport,
+            fd: std.posix.fd_t,
+            deadline_ms: u32,
+            transport_allocator: ?std.mem.Allocator,
+            rst_counter: ?*std.atomic.Value(u64),
+            goaway_counter: ?*std.atomic.Value(u64),
+        ) !*Self {
             const self = try allocator.create(Self);
             errdefer allocator.destroy(self);
+            const now = nowMs();
             self.* = .{
                 .allocator = allocator,
                 .transport = transport,
@@ -474,6 +503,10 @@ pub fn H2Conn(comptime Transport: type) type {
                 .deadline_ms = deadline_ms,
                 .decoder = hpack.Decoder.init(),
                 .streams = std.AutoHashMap(u31, *Stream).init(allocator),
+                .created_ms = now,
+                .last_activity_ms = std.atomic.Value(u64).init(now),
+                .pool_rst_counter = rst_counter,
+                .pool_goaway_counter = goaway_counter,
             };
 
             try self.transport.writeAll(PREFACE);
@@ -549,6 +582,7 @@ pub fn H2Conn(comptime Transport: type) type {
             if (self.active_streams > 0) self.active_streams -= 1;
             detached = true;
             self.state_mutex.unlock();
+            self.last_activity_ms.store(nowMs(), .monotonic); // stamp idle-since
             self.cond.broadcast(); // free a concurrency slot
 
             if (stream_err) |e| {
@@ -581,6 +615,7 @@ pub fn H2Conn(comptime Transport: type) type {
             stream.* = .{ .id = id, .send_window = self.peer_initial_window };
             try self.streams.put(id, stream);
             self.active_streams += 1;
+            self.last_activity_ms.store(nowMs(), .monotonic);
             return stream;
         }
 
@@ -733,6 +768,7 @@ pub fn H2Conn(comptime Transport: type) type {
                     self.goaway = true;
                     self.goaway_received += 1;
                     self.state_mutex.unlock();
+                    if (self.pool_goaway_counter) |c| _ = c.fetchAdd(1, .monotonic);
                     self.cond.broadcast();
                 },
                 .rst_stream => {
@@ -743,7 +779,10 @@ pub fn H2Conn(comptime Transport: type) type {
                         self.rst_received += 1;
                     }
                     self.state_mutex.unlock();
-                    if (maybe) |s| s.cond.signal();
+                    if (maybe) |s| {
+                        if (self.pool_rst_counter) |c| _ = c.fetchAdd(1, .monotonic);
+                        s.cond.signal();
+                    }
                 },
                 .headers, .continuation => try self.handleHeaders(fr),
                 .data => try self.handleData(fr),
@@ -877,6 +916,9 @@ pub const TlsH2Conn = H2Conn(*tls_termination.UpstreamTlsConn);
 pub const H2PoolStats = struct {
     connections_active: u64 = 0,
     streams_active: u64 = 0,
+    /// Monotonic since process start (see `H2ConnPool` counters).
+    stream_resets_total: u64 = 0,
+    goaway_total: u64 = 0,
 };
 
 /// Result of acquiring a connection for an origin: either a multiplexing h2
@@ -893,12 +935,32 @@ pub const H2AcquireResult = union(enum) {
 /// refcounted so an evicted (dead) connection survives until its last in-flight
 /// request finishes. Keyed by the scheme-qualified origin (e.g. `h2:host:443`).
 pub const H2ConnPool = struct {
+    /// Idle / lifetime eviction policy for the maintenance-tick reaper (#145,
+    /// PR 3). Mirrors `upstream_pool.Config`'s idle/lifetime knobs.
+    pub const Config = struct {
+        /// Evict a connection with no in-flight streams unused this long.
+        idle_timeout_ms: u64 = 90_000,
+        /// Hard cap on total connection age (0 = unlimited).
+        max_lifetime_ms: u64 = 0,
+    };
+
     allocator: std.mem.Allocator,
     mutex: compat.Mutex = .{},
     conns: std.StringHashMap(*TlsH2Conn),
+    config: Config = .{},
 
-    pub fn init(allocator: std.mem.Allocator) H2ConnPool {
-        return .{ .allocator = allocator, .conns = std.StringHashMap(*TlsH2Conn).init(allocator) };
+    /// Pool-wide monotonic counters bumped by each connection's reader thread
+    /// (via a pointer handed to `H2Conn.init`) so RST_STREAM / GOAWAY totals
+    /// persist across connection teardown. Surfaced by `snapshot`.
+    stream_resets_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    goaway_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
+    pub fn init(allocator: std.mem.Allocator, config: Config) H2ConnPool {
+        return .{
+            .allocator = allocator,
+            .conns = std.StringHashMap(*TlsH2Conn).init(allocator),
+            .config = config,
+        };
     }
 
     pub fn deinit(self: *H2ConnPool) void {
@@ -936,6 +998,11 @@ pub const H2ConnPool = struct {
 
         // Slow path: connect + handshake (no lock held).
         const fd = try compat.connectBlockingTcp(host, port);
+        // Disable Nagle: h2 multiplexing issues many small frame writes
+        // (HEADERS / WINDOW_UPDATE) whose interaction with the peer's delayed
+        // ACK otherwise stalls each exchange ~40 ms and trips response timeouts
+        // under concurrency.
+        compat.setTcpNoDelay(fd);
         const tls_ptr = self.allocator.create(tls_termination.UpstreamTlsConn) catch {
             _ = std.c.close(fd);
             return error.OutOfMemory;
@@ -953,7 +1020,7 @@ pub const H2ConnPool = struct {
             return .{ .h1 = tls_ptr }; // caller owns: close() + destroy()
         }
 
-        const conn = TlsH2Conn.init(self.allocator, tls_ptr, fd, deadline_ms, self.allocator) catch |e| {
+        const conn = TlsH2Conn.init(self.allocator, tls_ptr, fd, deadline_ms, self.allocator, &self.stream_resets_total, &self.goaway_total) catch |e| {
             tls_ptr.close();
             self.allocator.destroy(tls_ptr);
             return e;
@@ -1013,12 +1080,87 @@ pub const H2ConnPool = struct {
     pub fn snapshot(self: *H2ConnPool) H2PoolStats {
         self.mutex.lock();
         defer self.mutex.unlock();
-        var s = H2PoolStats{ .connections_active = self.conns.count() };
+        var s = H2PoolStats{
+            .connections_active = self.conns.count(),
+            .stream_resets_total = self.stream_resets_total.load(.monotonic),
+            .goaway_total = self.goaway_total.load(.monotonic),
+        };
         var it = self.conns.valueIterator();
         while (it.next()) |cp| s.streams_active += cp.*.activeStreamCount();
         return s;
     }
+
+    /// True if `conn` should be dropped from the pool: it must have **no
+    /// in-flight streams** (refcount-safe eviction — an in-flight request keeps
+    /// the conn alive via its own ref regardless, but idle policy must not race
+    /// active work), and then either be unhealthy (dead / GOAWAY), idle past the
+    /// idle timeout, or past the max lifetime. Called under the pool mutex.
+    fn shouldEvict(self: *H2ConnPool, conn: *TlsH2Conn, now_ms: u64) bool {
+        return evictionDecision(self.config, .{
+            .active_streams = conn.activeStreamCount(),
+            .healthy = conn.healthy(),
+            .last_activity_ms = conn.last_activity_ms.load(.monotonic),
+            .created_ms = conn.created_ms,
+        }, now_ms);
+    }
+
+    /// Evict idle / aged-out / dead h2 connections. Mirrors
+    /// `upstream_pool.reapIdle`; intended to run from the gateway maintenance
+    /// tick. Removal happens under the pool mutex (so no `acquire` can retain a
+    /// victim mid-reap), but the final `release` — which may join the reader
+    /// thread in `deinit` — runs *after* unlocking so we never block the pool on
+    /// a teardown. Refcount-safe: only the map ref is dropped; any late in-flight
+    /// request that grabbed a ref before reap keeps the conn alive until it
+    /// finishes.
+    pub fn reapIdle(self: *H2ConnPool, now_ms: u64) void {
+        self.mutex.lock();
+
+        var victims: std.ArrayList(*TlsH2Conn) = .empty;
+        defer victims.deinit(self.allocator);
+        var victim_keys: std.ArrayList([]const u8) = .empty;
+        defer victim_keys.deinit(self.allocator);
+
+        var it = self.conns.iterator();
+        while (it.next()) |e| {
+            if (self.shouldEvict(e.value_ptr.*, now_ms)) {
+                // On OOM, stop collecting and reap what we have this round.
+                victim_keys.append(self.allocator, e.key_ptr.*) catch break;
+            }
+        }
+        for (victim_keys.items) |k| {
+            if (self.conns.fetchRemove(k)) |kv| {
+                self.allocator.free(kv.key);
+                victims.append(self.allocator, kv.value) catch {
+                    kv.value.release(); // no room to defer — release under lock
+                };
+            }
+        }
+        self.mutex.unlock();
+
+        for (victims.items) |c| c.release(); // drop the map ref (may tear down)
+    }
 };
+
+/// A connection's reap-relevant state, sampled under the pool mutex. Split out
+/// so the eviction policy can be unit-tested without a live TLS connection.
+const ConnReapState = struct {
+    active_streams: u32,
+    healthy: bool,
+    last_activity_ms: u64,
+    created_ms: u64,
+};
+
+/// Pure eviction policy shared by the reaper. A connection is evictable only
+/// when it has no in-flight streams, and then if it is unhealthy (dead /
+/// GOAWAY), idle past the idle timeout, or past the max lifetime. Saturating
+/// subtraction (`-|`) keeps clock skew from wrapping.
+fn evictionDecision(cfg: H2ConnPool.Config, s: ConnReapState, now_ms: u64) bool {
+    if (s.active_streams != 0) return false;
+    if (!s.healthy) return true;
+    if (cfg.idle_timeout_ms > 0 and now_ms -| s.last_activity_ms >= cfg.idle_timeout_ms) return true;
+    if (cfg.max_lifetime_ms > 0 and now_ms -| s.created_ms >= cfg.max_lifetime_ms) return true;
+    return false;
+}
 
 /// Encode a u31 window increment into a 4-byte big-endian buffer (thread-local
 /// scratch is unsafe here, so build per-call). Returned slice is a comptime
@@ -1172,7 +1314,7 @@ test "h2 actor multiplexes concurrent requests over one connection" {
     const server = try std.Thread.spawn(.{}, cannedMuxServer, .{ fds[1], @as(usize, N) });
 
     var transport = PlainTransport{ .fd = fds[0] };
-    const conn = try H2Conn(*PlainTransport).init(testing.allocator, &transport, fds[0], 2000, null);
+    const conn = try H2Conn(*PlainTransport).init(testing.allocator, &transport, fds[0], 2000, null, null, null);
 
     var ctxs: [N]MuxClientCtx = undefined;
     var threads: [N]std.Thread = undefined;
@@ -1191,6 +1333,135 @@ test "h2 actor multiplexes concurrent requests over one connection" {
     _ = std.c.close(fds[1]);
 
     try testing.expect(all_ok);
+}
+
+test "evictionDecision honours active-stream, health, idle, and lifetime gates" {
+    const cfg = H2ConnPool.Config{ .idle_timeout_ms = 1000, .max_lifetime_ms = 5000 };
+
+    // In-flight streams pin the connection regardless of age/health.
+    try testing.expect(!evictionDecision(cfg, .{
+        .active_streams = 1,
+        .healthy = false,
+        .last_activity_ms = 0,
+        .created_ms = 0,
+    }, 1_000_000));
+
+    // Idle but fresh, healthy → keep.
+    try testing.expect(!evictionDecision(cfg, .{
+        .active_streams = 0,
+        .healthy = true,
+        .last_activity_ms = 900,
+        .created_ms = 900,
+    }, 1500));
+
+    // Idle past the idle timeout → evict.
+    try testing.expect(evictionDecision(cfg, .{
+        .active_streams = 0,
+        .healthy = true,
+        .last_activity_ms = 100,
+        .created_ms = 100,
+    }, 1200));
+
+    // Recently active but past max lifetime → evict.
+    try testing.expect(evictionDecision(cfg, .{
+        .active_streams = 0,
+        .healthy = true,
+        .last_activity_ms = 5900,
+        .created_ms = 0,
+    }, 6000));
+
+    // Unhealthy (dead / GOAWAY) with no streams → evict even if fresh.
+    try testing.expect(evictionDecision(cfg, .{
+        .active_streams = 0,
+        .healthy = false,
+        .last_activity_ms = 1_000_000,
+        .created_ms = 1_000_000,
+    }, 1_000_000));
+
+    // Both caps disabled → an idle, healthy conn is never evicted on age.
+    const off = H2ConnPool.Config{ .idle_timeout_ms = 0, .max_lifetime_ms = 0 };
+    try testing.expect(!evictionDecision(off, .{
+        .active_streams = 0,
+        .healthy = true,
+        .last_activity_ms = 0,
+        .created_ms = 0,
+    }, 1_000_000_000));
+}
+
+/// Canned server: SETTINGS, wait for the request HEADERS, then RST that stream.
+fn cannedRstServer(peer_fd: std.posix.fd_t) void {
+    const a = std.heap.page_allocator;
+    var srv = PlainTransport{ .fd = peer_fd };
+    var preface: [PREFACE.len]u8 = undefined;
+    readExact(&srv, peer_fd, preface[0..], 2000) catch return;
+    frame.writeSettings(a, &srv, &[_][2]u32{}) catch return;
+    while (true) {
+        var fr = readFrameBounded(&srv, peer_fd, a, 2000) catch return;
+        const sid = fr.stream_id;
+        const is_headers = fr.typ == .headers;
+        frame.deinitFrame(a, &fr);
+        if (is_headers) {
+            const code = [_]u8{ 0, 0, 0, 8 }; // CANCEL
+            frame.writeFrame(&srv, .rst_stream, 0, sid, code[0..]) catch return;
+            return;
+        }
+    }
+}
+
+test "reader bumps the pool RST_STREAM counter on a reset stream" {
+    const fds = try makeSocketpair();
+    const server = try std.Thread.spawn(.{}, cannedRstServer, .{fds[1]});
+
+    var rst = std.atomic.Value(u64).init(0);
+    var goaway = std.atomic.Value(u64).init(0);
+    var transport = PlainTransport{ .fd = fds[0] };
+    const conn = try H2Conn(*PlainTransport).init(testing.allocator, &transport, fds[0], 2000, null, &rst, &goaway);
+
+    const res = conn.request(.{ .method = "GET", .authority = "rst.test", .path = "/" });
+    try testing.expectError(error.Http2StreamReset, res);
+
+    conn.deinit(); // joins the reader — the counter bump has happened by now
+    server.join();
+    _ = std.c.close(fds[1]);
+
+    try testing.expectEqual(@as(u64, 1), rst.load(.monotonic));
+    try testing.expectEqual(@as(u64, 0), goaway.load(.monotonic));
+}
+
+/// Canned server: SETTINGS, then an immediate connection-level GOAWAY.
+fn cannedGoawayServer(peer_fd: std.posix.fd_t) void {
+    const a = std.heap.page_allocator;
+    var srv = PlainTransport{ .fd = peer_fd };
+    var preface: [PREFACE.len]u8 = undefined;
+    readExact(&srv, peer_fd, preface[0..], 2000) catch return;
+    frame.writeSettings(a, &srv, &[_][2]u32{}) catch return;
+    const payload = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0 }; // last_stream_id=0, error=NO_ERROR
+    frame.writeFrame(&srv, .goaway, 0, 0, payload[0..]) catch return;
+    // Hold the socket so the reader observes the GOAWAY, not a peer close.
+    var scratch: [1]u8 = undefined;
+    _ = srv.read(scratch[0..]) catch {};
+}
+
+test "reader bumps the pool GOAWAY counter on a connection GOAWAY" {
+    const fds = try makeSocketpair();
+    const server = try std.Thread.spawn(.{}, cannedGoawayServer, .{fds[1]});
+
+    var rst = std.atomic.Value(u64).init(0);
+    var goaway = std.atomic.Value(u64).init(0);
+    var transport = PlainTransport{ .fd = fds[0] };
+    const conn = try H2Conn(*PlainTransport).init(testing.allocator, &transport, fds[0], 2000, null, &rst, &goaway);
+
+    // Wait (monotonic-deadline spin, no sleep-dependent assertion) until the
+    // reader has processed the GOAWAY, which flips the connection unhealthy.
+    var spins: usize = 0;
+    while (conn.healthy() and spins < 1_000_000) : (spins += 1) std.Thread.yield() catch {};
+    try testing.expect(!conn.healthy());
+    try testing.expectEqual(@as(u64, 1), goaway.load(.monotonic));
+    try testing.expectEqual(@as(u64, 0), rst.load(.monotonic));
+
+    conn.deinit();
+    server.join();
+    _ = std.c.close(fds[1]);
 }
 
 test "h2 exchange round-trips a request and response over a socketpair" {

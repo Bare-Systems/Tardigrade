@@ -85,9 +85,45 @@ structure from the h1 pool:
 - Enabled via `TARDIGRADE_UPSTREAM_PROTOCOL=h2|auto` on the buffered data-plane
   path; offered through ALPN (TLS only — no cleartext h2c). Origins that select
   `http/1.1` fall back to the HTTP/1.1 path.
+- The h2 upstream socket sets **`TCP_NODELAY`**: multiplexing issues many small
+  frame writes (HEADERS / WINDOW_UPDATE) whose interaction with the peer's
+  delayed ACK otherwise stalls each exchange ~40 ms and trips response timeouts
+  under concurrency (measured 24 → 5.4k req/s on loopback once disabled).
 
-Deferred within #145: reset/GOAWAY counters, idle/lifetime eviction of h2
-connections, the streaming proxy path, and h1-pool-vs-h2-multiplexed benchmarks.
+### Reset / GOAWAY metrics (Phase 4b PR 3)
+
+RST_STREAM and GOAWAY are counted at the **pool** level, not per live connection:
+each `H2Conn` reader holds a pointer to the pool's `stream_resets_total` /
+`goaway_total` atomics (passed to `H2Conn.init`) and bumps them when it sees the
+frame. Pool-level counters are required because a per-connection count would be
+lost when an evicted connection is torn down. Surfaced as
+`tardigrade_upstream_h2_stream_resets_total` and `…_h2_goaway_total` (counters).
+
+### Idle / lifetime eviction (Phase 4b PR 3)
+
+`H2ConnPool.reapIdle` runs on the gateway maintenance tick (next to
+`upstream_pool.reapIdle`) and closes an h2 connection that has **no in-flight
+streams** and is either idle past `idle_timeout_ms`, past `max_lifetime_ms`, or
+already unhealthy (GOAWAY/errored). It mirrors the h1 reaper but is
+refcount-aware:
+
+- The `activeStreamCount() == 0` gate means an actively multiplexing connection
+  is never reaped; each connection stamps `last_activity_ms` when a stream starts
+  and when one finishes.
+- Victims are removed from the map **under** the pool mutex (so no concurrent
+  `acquire` can retain one mid-reap), but the final `release` — which may join the
+  reader thread in `deinit` — runs **after** the mutex is dropped, so a teardown
+  never blocks the pool. Any late request that grabbed a ref before the reap keeps
+  its connection alive until it finishes (only the map ref is dropped).
+- Timeouts come from the shared `TARDIGRADE_UPSTREAM_POOL_IDLE_TIMEOUT_MS` /
+  `…_MAX_LIFETIME_MS` config (the h2 pool reuses the h1 pool's knobs).
+
+`benchmarks/h1-vs-h2-upstream.sh` drives the same concurrent load through the h1
+pool and the h2 multiplexer and reports throughput, latency, and the upstream
+connection count (h2 serves the whole load over one connection; h1 opens one per
+busy worker).
+
+Deferred within #145: the streaming proxy path over h2, and cleartext h2c.
 
 ## Ownership & concurrency
 
@@ -261,6 +297,17 @@ Per-upstream labelled (`{upstream="host:port"}`, Phase 1b):
 
 Connect-latency histogram (Phase 1b): `tardigrade_upstream_connect_latency_ms`
 (`_bucket`/`_sum`/`_count`).
+
+HTTP/2 upstream (Phase 4b, #145):
+- `tardigrade_upstream_protocol_requests_total{protocol="h1"|"h2"}` (PR 1)
+- `tardigrade_upstream_h2_connections_active` (gauge — open multiplexing conns; PR 2)
+- `tardigrade_upstream_h2_streams_active` (gauge — in-flight streams across conns; PR 2)
+- `tardigrade_upstream_h2_stream_resets_total` (counter — RST_STREAM received; PR 3)
+- `tardigrade_upstream_h2_goaway_total` (counter — GOAWAY received; PR 3)
+
+The h2 series are pool-global (not `{upstream}`-labelled) since the pool holds one
+connection per origin; per-upstream h2 labels are deferred with the multi-origin
+h2 work.
 
 Still deferred: a hard `_MAX_ACTIVE_PER_HOST` cap (the `active` gauge is
 tracked, but enforcement needs backpressure semantics that couple with #140).

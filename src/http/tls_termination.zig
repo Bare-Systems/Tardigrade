@@ -713,6 +713,7 @@ pub const UpstreamTlsOptions = struct {
 pub const UpstreamTlsConn = struct {
     ssl: *c.SSL,
     ctx: *c.SSL_CTX,
+    fd: std.posix.fd_t = -1,
 
     pub fn connect(
         fd: std.posix.fd_t,
@@ -771,7 +772,7 @@ pub const UpstreamTlsConn = struct {
         if (c.SSL_set_fd(ssl, fd) != 1) return error.HandshakeFailed;
         if (c.SSL_connect(ssl) != 1) return error.HandshakeFailed;
 
-        return .{ .ssl = ssl, .ctx = ctx };
+        return .{ .ssl = ssl, .ctx = ctx, .fd = fd };
     }
 
     pub fn deinit(self: *UpstreamTlsConn) void {
@@ -779,6 +780,16 @@ pub const UpstreamTlsConn = struct {
         c.SSL_free(self.ssl);
         c.SSL_CTX_free(self.ctx);
         self.* = undefined;
+    }
+
+    /// Full teardown for owners that also own the fd (e.g. the h2 connection
+    /// actor): SSL shutdown/free, then close the socket. Unlike `deinit`, which
+    /// leaves the fd to a separate `NetStream.close()` (the HTTP/1.1 pool's
+    /// ownership split), this closes the fd itself.
+    pub fn close(self: *UpstreamTlsConn) void {
+        const fd = self.fd;
+        self.deinit();
+        if (fd >= 0) _ = std.c.close(fd);
     }
 
     pub fn read(self: *UpstreamTlsConn, buf: []u8) TlsError!usize {

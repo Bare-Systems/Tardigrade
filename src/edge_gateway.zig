@@ -124,6 +124,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
             .idle_timeout_ms = cfg.upstream_pool_idle_timeout_ms,
             .max_lifetime_ms = cfg.upstream_pool_max_lifetime_ms,
         }),
+        .h2_pool = http.upstream_h2.H2ConnPool.init(state_allocator),
         .fastcgi_next_request_id = std.StringHashMap(u16).init(state_allocator),
         .proxy_cache_locks = std.StringHashMap(u32).init(state_allocator),
         .active_connections_by_ip = std.StringHashMap(u32).init(state_allocator),

@@ -1040,6 +1040,7 @@ fn handleHttp3LocationProxyPass(
         ctx.cfg.upstream_response_timeout_ms,
         null, // HTTP/3 path: no per-request lifecycle yet
         &ctx.state.upstream_pool,
+        &ctx.state.h2_pool,
     );
     defer upstream_response.deinit(allocator);
     const buffered_response = upstream_response.boundedBufferedForCompatibility();

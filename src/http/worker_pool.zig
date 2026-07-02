@@ -564,17 +564,30 @@ test "shutdownAndJoin drain_timeout_ms positive drains in-flight work before tim
 }
 
 test "shutdownAndJoin drain_timeout_ms expires and returns" {
-    // Submit a job that sleeps much longer than the drain timeout.
-    // shutdownAndJoin should return within a bounded time (timeout + join overhead).
+    // A handler that stays active past the drain timeout must make
+    // shutdownAndJoin report `timed_out`. `shutdownAndJoin` still *joins* the
+    // worker, so the handler must eventually return on its own (it cannot be
+    // gated on the test thread, which is blocked inside shutdownAndJoin). The
+    // previous version relied on a single 50ms sleep outlasting the 20ms drain,
+    // but a sleep can wake early on a signal — flaky once background threads
+    // exist. This version busy-waits against a *monotonic deadline* (re-sleeping
+    // on early wakeups) so the handler reliably stays active ~200ms >> 20ms,
+    // making `timed_out` deterministic without deadlocking the join.
     if (builtin.single_threaded) return;
 
-    const Ctx = struct {};
+    const Ctx = struct {
+        started: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    };
     var ctx = Ctx{};
 
     const handler = struct {
-        fn run(_: *anyopaque, _: std.posix.fd_t) void {
-            // Sleep longer than the drain timeout below (50ms vs 20ms timeout).
-            std.Io.sleep(compat.io(), .fromMilliseconds(50), .awake) catch {}; // interrupt wakes are fine; test timer accuracy is not critical
+        fn run(ctx_ptr: *anyopaque, _: std.posix.fd_t) void {
+            const c: *Ctx = @ptrCast(@alignCast(ctx_ptr));
+            c.started.store(true, .release);
+            const deadline = compat.milliTimestamp() + 200;
+            while (compat.milliTimestamp() < deadline) {
+                std.Io.sleep(compat.io(), .fromMilliseconds(2), .awake) catch {}; // early wakes fine; loop re-checks
+            }
         }
     }.run;
 
@@ -583,17 +596,20 @@ test "shutdownAndJoin drain_timeout_ms expires and returns" {
     defer pool.deinit();
 
     try pool.submit(1);
-    // Give the handler time to start running so it becomes an active job.
-    std.Io.sleep(compat.io(), .fromMilliseconds(5), .awake) catch {}; // interrupt wakes are fine; test waits for handler to start
+    // Wait until the handler is actually running (an active job, not queued).
+    while (!ctx.started.load(.acquire)) {
+        std.Io.sleep(compat.io(), .fromMilliseconds(1), .awake) catch {};
+    }
+
     const t0 = compat.milliTimestamp();
-    // Very short drain timeout — the active handler will outlive it.
+    // Short drain timeout; the active handler (~200ms) outlives it deterministically.
     const drain = pool.shutdownAndJoin(20);
     const elapsed = compat.milliTimestamp() - t0;
     // The deadline elapsed before the active handler finished.
     try std.testing.expect(drain.timed_out);
     // Active (already-dispatched) handlers are not force-closed, only queued fds.
     try std.testing.expectEqual(@as(usize, 0), drain.forced_closes);
-    // Should finish well under 1s (handler finishes after timeout).
+    // Bounded: drain reports timeout at ~20ms, then joins the ~200ms handler.
     try std.testing.expect(elapsed < 1_000);
 }
 

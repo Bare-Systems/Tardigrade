@@ -179,6 +179,16 @@ pub fn connectUnixSocket(path: []const u8) !NetStream {
     };
 }
 
+/// Disable Nagle's algorithm on a TCP socket (best-effort). Small HTTP/2 frame
+/// writes (HEADERS, WINDOW_UPDATE) otherwise interact with the peer's delayed
+/// ACK for a ~40 ms per-exchange stall on some stacks, which balloons upstream
+/// latency and trips response timeouts under concurrency. Ignored on failure
+/// (e.g. a non-TCP fd) since it is purely an optimisation.
+pub fn setTcpNoDelay(fd: std.posix.fd_t) void {
+    const one: c_int = 1;
+    _ = std.c.setsockopt(fd, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, @ptrCast(&one), @sizeOf(c_int));
+}
+
 /// Connect a *blocking* TCP socket to host:port via std.c, bypassing the
 /// std.Io event loop. Sockets created through `io()` are non-blocking and the
 /// threaded backend panics ("programmer bug ... AGAIN") on a SO_*TIMEO EAGAIN,

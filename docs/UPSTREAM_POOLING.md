@@ -95,7 +95,9 @@ structure from the h1 pool:
 RST_STREAM and GOAWAY are counted at the **pool** level, not per live connection:
 each `H2Conn` reader holds a pointer to the pool's `stream_resets_total` /
 `goaway_total` atomics (passed to `H2Conn.init`) and bumps them when it sees the
-frame. Pool-level counters are required because a per-connection count would be
+frame. Both count **frames received** (protocol-level) — a reset counts even
+when it arrives late, for a stream that already completed and left the streams
+map. Pool-level counters are required because a per-connection count would be
 lost when an evicted connection is torn down. Surfaced as
 `tardigrade_upstream_h2_stream_resets_total` and `…_h2_goaway_total` (counters).
 

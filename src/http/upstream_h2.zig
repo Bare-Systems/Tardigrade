@@ -764,25 +764,29 @@ pub fn H2Conn(comptime Transport: type) type {
                     self.cond.broadcast();
                 },
                 .goaway => {
+                    // Bump the pool counter *before* publishing the state
+                    // change: an observer that sees `goaway` set (under the
+                    // mutex) must also see the incremented counter.
+                    if (self.pool_goaway_counter) |c| _ = c.fetchAdd(1, .monotonic);
                     self.state_mutex.lock();
                     self.goaway = true;
                     self.goaway_received += 1;
                     self.state_mutex.unlock();
-                    if (self.pool_goaway_counter) |c| _ = c.fetchAdd(1, .monotonic);
                     self.cond.broadcast();
                 },
                 .rst_stream => {
+                    // Counted per frame received (protocol-level), matching the
+                    // metric help text — including late resets for streams that
+                    // already completed and were removed from the map. Bumped
+                    // *before* the stream is errored so an observer that sees
+                    // the failed stream also sees the incremented counter.
+                    if (self.pool_rst_counter) |c| _ = c.fetchAdd(1, .monotonic);
                     self.state_mutex.lock();
+                    self.rst_received += 1;
                     const maybe = self.streams.get(fr.stream_id);
-                    if (maybe) |s| {
-                        s.err = error.Http2StreamReset;
-                        self.rst_received += 1;
-                    }
+                    if (maybe) |s| s.err = error.Http2StreamReset;
                     self.state_mutex.unlock();
-                    if (maybe) |s| {
-                        if (self.pool_rst_counter) |c| _ = c.fetchAdd(1, .monotonic);
-                        s.cond.signal();
-                    }
+                    if (maybe) |s| s.cond.signal();
                 },
                 .headers, .continuation => try self.handleHeaders(fr),
                 .data => try self.handleData(fr),
@@ -1027,7 +1031,12 @@ pub const H2ConnPool = struct {
         };
         // conn.refs == 1 (the caller's ref).
 
-        // Publish into the map, resolving a creation race.
+        // Publish into the map, resolving a creation race. A displaced stale
+        // entry's map ref may be its last (release can join the reader thread
+        // in deinit), so it is dropped via this defer — after the unlock on
+        // every return path below — never under the pool mutex.
+        var stale: ?*TlsH2Conn = null;
+        defer if (stale) |s| s.release();
         self.mutex.lock();
         if (self.conns.get(key)) |c2| {
             if (c2.healthy()) {
@@ -1036,10 +1045,10 @@ pub const H2ConnPool = struct {
                 conn.release(); // tear down our redundant connection
                 return .{ .h2 = c2 };
             }
-            // Stale entry — evict it.
+            // Stale entry — evict it (released via the defer above).
             if (self.conns.fetchRemove(key)) |old| {
                 self.allocator.free(old.key);
-                old.value.release();
+                stale = old.value;
             }
         }
         const owned_key = self.allocator.dupe(u8, key) catch {
@@ -1067,14 +1076,19 @@ pub const H2ConnPool = struct {
     /// alive via their own refs until they finish.
     pub fn evict(self: *H2ConnPool, key: []const u8, conn: *TlsH2Conn) void {
         self.mutex.lock();
-        defer self.mutex.unlock();
+        var removed = false;
         if (self.conns.getEntry(key)) |e| {
             if (e.value_ptr.* == conn) {
                 self.allocator.free(e.key_ptr.*);
                 _ = self.conns.remove(key);
-                conn.release();
+                removed = true;
             }
         }
+        self.mutex.unlock();
+        // Drop the map ref outside the lock (release can join the reader thread
+        // in deinit; see reapIdle). Callers hold their own ref, so in practice
+        // this is not the last one — but the invariant is kept unconditionally.
+        if (removed) conn.release();
     }
 
     pub fn snapshot(self: *H2ConnPool) H2PoolStats {
@@ -1120,19 +1134,29 @@ pub const H2ConnPool = struct {
         var victim_keys: std.ArrayList([]const u8) = .empty;
         defer victim_keys.deinit(self.allocator);
 
+        // Reserve up front so eviction never allocates after a removal. On OOM
+        // skip the whole round (the conns are reaped on a later tick) — we must
+        // never fall back to releasing under the pool mutex.
+        const cap = self.conns.count();
+        victims.ensureTotalCapacity(self.allocator, cap) catch {
+            self.mutex.unlock();
+            return;
+        };
+        victim_keys.ensureTotalCapacity(self.allocator, cap) catch {
+            self.mutex.unlock();
+            return;
+        };
+
         var it = self.conns.iterator();
         while (it.next()) |e| {
             if (self.shouldEvict(e.value_ptr.*, now_ms)) {
-                // On OOM, stop collecting and reap what we have this round.
-                victim_keys.append(self.allocator, e.key_ptr.*) catch break;
+                victim_keys.appendAssumeCapacity(e.key_ptr.*);
             }
         }
         for (victim_keys.items) |k| {
             if (self.conns.fetchRemove(k)) |kv| {
                 self.allocator.free(kv.key);
-                victims.append(self.allocator, kv.value) catch {
-                    kv.value.release(); // no room to defer — release under lock
-                };
+                victims.appendAssumeCapacity(kv.value);
             }
         }
         self.mutex.unlock();
@@ -1388,7 +1412,9 @@ test "evictionDecision honours active-stream, health, idle, and lifetime gates" 
     }, 1_000_000_000));
 }
 
-/// Canned server: SETTINGS, wait for the request HEADERS, then RST that stream.
+/// Canned server: SETTINGS, wait for the request HEADERS, then RST an unknown
+/// stream (late/stray reset) followed by the request's stream. Both frames must
+/// count — the metric is per RST_STREAM frame received, not per known stream.
 fn cannedRstServer(peer_fd: std.posix.fd_t) void {
     const a = std.heap.page_allocator;
     var srv = PlainTransport{ .fd = peer_fd };
@@ -1402,13 +1428,14 @@ fn cannedRstServer(peer_fd: std.posix.fd_t) void {
         frame.deinitFrame(a, &fr);
         if (is_headers) {
             const code = [_]u8{ 0, 0, 0, 8 }; // CANCEL
+            frame.writeFrame(&srv, .rst_stream, 0, 99, code[0..]) catch return; // unknown stream
             frame.writeFrame(&srv, .rst_stream, 0, sid, code[0..]) catch return;
             return;
         }
     }
 }
 
-test "reader bumps the pool RST_STREAM counter on a reset stream" {
+test "reader bumps the pool RST_STREAM counter per frame received" {
     const fds = try makeSocketpair();
     const server = try std.Thread.spawn(.{}, cannedRstServer, .{fds[1]});
 
@@ -1420,11 +1447,13 @@ test "reader bumps the pool RST_STREAM counter on a reset stream" {
     const res = conn.request(.{ .method = "GET", .authority = "rst.test", .path = "/" });
     try testing.expectError(error.Http2StreamReset, res);
 
-    conn.deinit(); // joins the reader — the counter bump has happened by now
+    conn.deinit(); // joins the reader — the counter bumps have happened by now
     server.join();
     _ = std.c.close(fds[1]);
 
-    try testing.expectEqual(@as(u64, 1), rst.load(.monotonic));
+    // The single reader processes frames in order, so once the request observed
+    // its reset both RST frames (unknown stream 99 + the real one) are counted.
+    try testing.expectEqual(@as(u64, 2), rst.load(.monotonic));
     try testing.expectEqual(@as(u64, 0), goaway.load(.monotonic));
 }
 
@@ -1451,17 +1480,20 @@ test "reader bumps the pool GOAWAY counter on a connection GOAWAY" {
     var transport = PlainTransport{ .fd = fds[0] };
     const conn = try H2Conn(*PlainTransport).init(testing.allocator, &transport, fds[0], 2000, null, &rst, &goaway);
 
-    // Wait (monotonic-deadline spin, no sleep-dependent assertion) until the
-    // reader has processed the GOAWAY, which flips the connection unhealthy.
+    // Wait (bounded spin, no sleep-dependent assertion) until the reader has
+    // processed the GOAWAY — otherwise deinit's shutdown could win the race and
+    // the frame would legitimately never be counted.
     var spins: usize = 0;
     while (conn.healthy() and spins < 1_000_000) : (spins += 1) std.Thread.yield() catch {};
-    try testing.expect(!conn.healthy());
-    try testing.expectEqual(@as(u64, 1), goaway.load(.monotonic));
-    try testing.expectEqual(@as(u64, 0), rst.load(.monotonic));
+    const saw_goaway = !conn.healthy();
 
-    conn.deinit();
+    conn.deinit(); // joins the reader — all counter bumps have happened by now
     server.join();
     _ = std.c.close(fds[1]);
+
+    try testing.expect(saw_goaway);
+    try testing.expectEqual(@as(u64, 1), goaway.load(.monotonic));
+    try testing.expectEqual(@as(u64, 0), rst.load(.monotonic));
 }
 
 test "h2 exchange round-trips a request and response over a socketpair" {

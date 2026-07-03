@@ -1156,8 +1156,73 @@ pub fn H2Conn(comptime Transport: type) type {
     };
 }
 
-/// Concrete actor type for production (TLS upstream).
-pub const TlsH2Conn = H2Conn(*tls_termination.UpstreamTlsConn);
+/// Production transport for pooled h2 connections: TLS (ALPN-negotiated h2)
+/// or a plain cleartext socket (prior-knowledge h2c, #237). Heap-allocated by
+/// the pool and owned by the `H2Conn` (its `transport_allocator` destroys the
+/// union after `close`). One runtime union — rather than two `H2Conn`
+/// instantiations — keeps a single pool, lifecycle, and metrics path for both.
+pub const UpstreamH2Transport = union(enum) {
+    tls: struct {
+        conn: *tls_termination.UpstreamTlsConn,
+        /// Frees the `UpstreamTlsConn` allocation in `close` (the pool
+        /// allocated it before ALPN was known).
+        allocator: std.mem.Allocator,
+    },
+    plain: std.posix.fd_t,
+
+    pub fn read(self: *UpstreamH2Transport, buf: []u8) !usize {
+        switch (self.*) {
+            .tls => |t| return t.conn.read(buf),
+            // std.posix.read/write (not std.c) so EINTR is retried internally,
+            // mirroring compat.NetStream: on macOS, thread machinery delivers
+            // signals that interrupt blocking socket syscalls (the same class
+            // of failure the kevent EINTR fix addressed), and a surfaced EINTR
+            // here would falsely kill the shared connection.
+            .plain => |fd| return std.posix.read(fd, buf) catch error.ReadFailed,
+        }
+    }
+
+    pub fn writeAll(self: *UpstreamH2Transport, data: []const u8) !void {
+        switch (self.*) {
+            .tls => |t| return t.conn.writeAll(data),
+            .plain => |fd| {
+                var off: usize = 0;
+                while (off < data.len) {
+                    // std.posix has no write in this std; retry EINTR manually.
+                    const n = std.c.write(fd, data.ptr + off, data.len - off);
+                    if (n < 0) {
+                        if (std.posix.errno(n) == .INTR) continue;
+                        return error.WriteFailed;
+                    }
+                    if (n == 0) return error.WriteFailed;
+                    off += @intCast(n);
+                }
+            },
+        }
+    }
+
+    /// Decrypted bytes already buffered inside the transport that `poll(2)`
+    /// cannot see. Only TLS buffers; a plain socket has nothing hidden.
+    pub fn pending(self: *const UpstreamH2Transport) usize {
+        return switch (self.*) {
+            .tls => |t| t.conn.pending(),
+            .plain => 0,
+        };
+    }
+
+    pub fn close(self: *UpstreamH2Transport) void {
+        switch (self.*) {
+            .tls => |t| {
+                t.conn.close();
+                t.allocator.destroy(t.conn);
+            },
+            .plain => |fd| _ = std.c.close(fd),
+        }
+    }
+};
+
+/// Concrete actor type for production (TLS h2 and cleartext h2c upstreams).
+pub const PooledH2Conn = H2Conn(*UpstreamH2Transport);
 
 pub const H2PoolStats = struct {
     connections_active: u64 = 0,
@@ -1201,7 +1266,7 @@ pub fn freeH2OriginSnapshots(allocator: std.mem.Allocator, snaps: []H2OriginSnap
 /// negotiated HTTP/1.1 over ALPN — the raw TLS connection for the caller to run
 /// an HTTP/1.1 exchange on and then `close`/free.
 pub const H2AcquireResult = union(enum) {
-    h2: *TlsH2Conn,
+    h2: *PooledH2Conn,
     h1: *tls_termination.UpstreamTlsConn,
 };
 
@@ -1221,7 +1286,7 @@ pub const H2ConnPool = struct {
 
     allocator: std.mem.Allocator,
     mutex: compat.Mutex = .{},
-    conns: std.StringHashMap(*TlsH2Conn),
+    conns: std.StringHashMap(*PooledH2Conn),
     config: Config = .{},
 
     /// Per-origin monotonic RST_STREAM/GOAWAY counters (#238), keyed like
@@ -1236,7 +1301,7 @@ pub const H2ConnPool = struct {
     pub fn init(allocator: std.mem.Allocator, config: Config) H2ConnPool {
         return .{
             .allocator = allocator,
-            .conns = std.StringHashMap(*TlsH2Conn).init(allocator),
+            .conns = std.StringHashMap(*PooledH2Conn).init(allocator),
             .origin_counters = std.StringHashMap(*H2OriginCounters).init(allocator),
             .config = config,
         };
@@ -1281,12 +1346,17 @@ pub const H2ConnPool = struct {
     /// Get a healthy h2 connection for `key`, creating one if needed. On the h2
     /// path the returned actor carries one ref for the caller (release with
     /// `release`). On ALPN h1 the raw TLS conn is returned for the caller to own.
+    ///
+    /// `tls_options == null` selects **prior-knowledge cleartext h2c** (#237):
+    /// the connection speaks HTTP/2 immediately on the plain socket, no ALPN
+    /// and no HTTP/1.1 Upgrade — so it never returns `.h1` and must only be
+    /// used for origins explicitly configured to speak h2c.
     pub fn acquire(
         self: *H2ConnPool,
         key: []const u8,
         host: []const u8,
         port: u16,
-        tls_options: tls_termination.UpstreamTlsOptions,
+        tls_options: ?tls_termination.UpstreamTlsOptions,
         deadline_ms: u32,
     ) !H2AcquireResult {
         // Fast path: an existing healthy connection.
@@ -1300,41 +1370,56 @@ pub const H2ConnPool = struct {
         }
         self.mutex.unlock();
 
-        // Slow path: connect + handshake (no lock held).
+        // Slow path: connect (+ TLS handshake when configured), no lock held.
         const fd = try compat.connectBlockingTcp(host, port);
         // Disable Nagle: h2 multiplexing issues many small frame writes
         // (HEADERS / WINDOW_UPDATE) whose interaction with the peer's delayed
         // ACK otherwise stalls each exchange ~40 ms and trips response timeouts
         // under concurrency.
         compat.setTcpNoDelay(fd);
-        const tls_ptr = self.allocator.create(tls_termination.UpstreamTlsConn) catch {
+
+        const transport = self.allocator.create(UpstreamH2Transport) catch {
             _ = std.c.close(fd);
             return error.OutOfMemory;
         };
-        var opts = tls_options;
-        opts.offer_h2 = true;
-        tls_ptr.* = tls_termination.UpstreamTlsConn.connect(fd, host, opts) catch |e| {
-            self.allocator.destroy(tls_ptr);
-            _ = std.c.close(fd);
-            return e;
-        };
-        // tls_ptr now owns the fd (its close() closes the socket).
+        if (tls_options) |base_opts| {
+            const tls_ptr = self.allocator.create(tls_termination.UpstreamTlsConn) catch {
+                self.allocator.destroy(transport);
+                _ = std.c.close(fd);
+                return error.OutOfMemory;
+            };
+            var opts = base_opts;
+            opts.offer_h2 = true;
+            tls_ptr.* = tls_termination.UpstreamTlsConn.connect(fd, host, opts) catch |e| {
+                self.allocator.destroy(tls_ptr);
+                self.allocator.destroy(transport);
+                _ = std.c.close(fd);
+                return e;
+            };
+            // tls_ptr now owns the fd (its close() closes the socket).
 
-        if (tls_ptr.negotiatedProtocol() != .http2) {
-            return .{ .h1 = tls_ptr }; // caller owns: close() + destroy()
+            if (tls_ptr.negotiatedProtocol() != .http2) {
+                self.allocator.destroy(transport);
+                return .{ .h1 = tls_ptr }; // caller owns: close() + destroy()
+            }
+            transport.* = .{ .tls = .{ .conn = tls_ptr, .allocator = self.allocator } };
+        } else {
+            // Prior-knowledge h2c: the plain socket speaks h2 immediately.
+            transport.* = .{ .plain = fd };
         }
+        // transport now owns the fd (its close() tears down TLS and/or socket).
 
         // Per-origin counters (#238): the reader bumps its origin's entry, and
-        // the entry is only created once the origin actually negotiated h2.
+        // the entry is only created once the origin is actually speaking h2.
         const counters = self.originCounters(key) catch |e| {
-            tls_ptr.close();
-            self.allocator.destroy(tls_ptr);
+            transport.close();
+            self.allocator.destroy(transport);
             return e;
         };
 
-        const conn = TlsH2Conn.init(self.allocator, tls_ptr, fd, deadline_ms, self.allocator, &counters.stream_resets_total, &counters.goaway_total) catch |e| {
-            tls_ptr.close();
-            self.allocator.destroy(tls_ptr);
+        const conn = PooledH2Conn.init(self.allocator, transport, fd, deadline_ms, self.allocator, &counters.stream_resets_total, &counters.goaway_total) catch |e| {
+            transport.close();
+            self.allocator.destroy(transport);
             return e;
         };
         // conn.refs == 1 (the caller's ref).
@@ -1343,7 +1428,7 @@ pub const H2ConnPool = struct {
         // entry's map ref may be its last (release can join the reader thread
         // in deinit), so it is dropped via this defer — after the unlock on
         // every return path below — never under the pool mutex.
-        var stale: ?*TlsH2Conn = null;
+        var stale: ?*PooledH2Conn = null;
         defer if (stale) |s| s.release();
         self.mutex.lock();
         if (self.conns.get(key)) |c2| {
@@ -1375,14 +1460,14 @@ pub const H2ConnPool = struct {
     }
 
     /// Drop the caller's ref on an h2 connection.
-    pub fn release(_: *H2ConnPool, conn: *TlsH2Conn) void {
+    pub fn release(_: *H2ConnPool, conn: *PooledH2Conn) void {
         conn.release();
     }
 
     /// Remove a (presumably dead) connection from the map if it is still the
     /// mapped entry for `key`, dropping the map ref. In-flight requests keep it
     /// alive via their own refs until they finish.
-    pub fn evict(self: *H2ConnPool, key: []const u8, conn: *TlsH2Conn) void {
+    pub fn evict(self: *H2ConnPool, key: []const u8, conn: *PooledH2Conn) void {
         self.mutex.lock();
         var removed = false;
         if (self.conns.getEntry(key)) |e| {
@@ -1453,7 +1538,7 @@ pub const H2ConnPool = struct {
     /// the conn alive via its own ref regardless, but idle policy must not race
     /// active work), and then either be unhealthy (dead / GOAWAY), idle past the
     /// idle timeout, or past the max lifetime. Called under the pool mutex.
-    fn shouldEvict(self: *H2ConnPool, conn: *TlsH2Conn, now_ms: u64) bool {
+    fn shouldEvict(self: *H2ConnPool, conn: *PooledH2Conn, now_ms: u64) bool {
         return evictionDecision(self.config, .{
             .active_streams = conn.activeStreamCount(),
             .healthy = conn.healthy(),
@@ -1473,7 +1558,7 @@ pub const H2ConnPool = struct {
     pub fn reapIdle(self: *H2ConnPool, now_ms: u64) void {
         self.mutex.lock();
 
-        var victims: std.ArrayList(*TlsH2Conn) = .empty;
+        var victims: std.ArrayList(*PooledH2Conn) = .empty;
         defer victims.deinit(self.allocator);
         var victim_keys: std.ArrayList([]const u8) = .empty;
         defer victim_keys.deinit(self.allocator);
@@ -1572,15 +1657,18 @@ test "applyPeerSettings updates the stream send window" {
 const PlainTransport = struct {
     fd: std.posix.fd_t,
     pub fn read(self: *PlainTransport, buf: []u8) !usize {
-        const n = std.c.read(self.fd, buf.ptr, buf.len);
-        if (n < 0) return error.ReadFailed;
-        return @intCast(n);
+        // std.posix retries EINTR (see UpstreamH2Transport.plain).
+        return std.posix.read(self.fd, buf) catch error.ReadFailed;
     }
     pub fn writeAll(self: *PlainTransport, data: []const u8) !void {
         var off: usize = 0;
         while (off < data.len) {
             const n = std.c.write(self.fd, data.ptr + off, data.len - off);
-            if (n <= 0) return error.WriteFailed;
+            if (n < 0) {
+                if (std.posix.errno(n) == .INTR) continue;
+                return error.WriteFailed;
+            }
+            if (n == 0) return error.WriteFailed;
             off += @intCast(n);
         }
     }
@@ -1701,6 +1789,77 @@ test "h2 actor multiplexes concurrent requests over one connection" {
     _ = std.c.close(fds[1]);
 
     try testing.expect(all_ok);
+}
+
+/// Accept one connection on `listen_fd` and serve `n` canned h2 requests on it
+/// (prior-knowledge: the server speaks h2 immediately, no Upgrade). After
+/// serving, drain the socket until the client closes: closing a TCP socket
+/// with unread data in its receive queue (the client's SETTINGS-ACK and
+/// WINDOW_UPDATEs, which the canned server never reads) sends an RST that can
+/// discard the in-flight response — a race the AF_UNIX socketpair servers
+/// never see because unix-socket close has clean EOF delivery semantics.
+fn h2cListenerServe(listen_fd: std.posix.fd_t, n: usize) void {
+    const conn = std.c.accept(listen_fd, null, null);
+    if (conn < 0) return;
+    cannedMuxServer(conn, n);
+    var drain: [512]u8 = undefined;
+    while (true) {
+        const got = std.posix.read(conn, drain[0..]) catch break;
+        if (got == 0) break; // client closed — safe to close without RST
+    }
+    _ = std.c.close(conn);
+}
+
+test "h2c pool acquires a prior-knowledge cleartext connection and round-trips" {
+    // Raw blocking listener (no event loop), mirroring the gateway_proxy
+    // TCP-origin test setup.
+    const listen_fd = std.c.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, std.posix.IPPROTO.TCP);
+    try testing.expect(listen_fd >= 0);
+    defer _ = std.c.close(listen_fd);
+    _ = std.c.setsockopt(listen_fd, std.posix.SOL.SOCKET, std.posix.SO.REUSEADDR, std.mem.asBytes(&@as(c_int, 1)), @sizeOf(c_int));
+    const sin: std.c.sockaddr.in = .{
+        .family = std.posix.AF.INET,
+        .port = std.mem.nativeToBig(u16, 0),
+        .addr = @bitCast([4]u8{ 127, 0, 0, 1 }),
+        .zero = [8]u8{ 0, 0, 0, 0, 0, 0, 0, 0 },
+    };
+    try testing.expect(std.c.bind(listen_fd, @ptrCast(&sin), @sizeOf(std.c.sockaddr.in)) == 0);
+    try testing.expect(std.c.listen(listen_fd, 8) == 0);
+    var bound: std.c.sockaddr.in = undefined;
+    var bound_len: std.posix.socklen_t = @sizeOf(std.c.sockaddr.in);
+    try testing.expect(std.c.getsockname(listen_fd, @ptrCast(&bound), &bound_len) == 0);
+    const port = std.mem.bigToNative(u16, bound.port);
+
+    // Cleanup is all defers (LIFO) so a failing assertion cannot leak the
+    // pool/connection or leave threads unjoined: release conn -> pool.deinit
+    // (drops the map ref, joining the reader; the server then sees EOF or its
+    // own read deadline) -> server.join.
+    const server = try std.Thread.spawn(.{}, h2cListenerServe, .{ listen_fd, @as(usize, 1) });
+    defer server.join();
+
+    var pool = H2ConnPool.init(testing.allocator, .{});
+    defer pool.deinit();
+    var key_buf: [64]u8 = undefined;
+    const key = try std.fmt.bufPrint(&key_buf, "h2c:127.0.0.1:{d}", .{port});
+
+    // tls_options == null => prior-knowledge cleartext h2; never `.h1`.
+    const acq = try pool.acquire(key, "127.0.0.1", port, null, 5000);
+    const conn = switch (acq) {
+        .h2 => |c| c,
+        .h1 => return error.TestUnexpectedResult,
+    };
+    defer pool.release(conn);
+    var resp = try conn.request(.{ .method = "GET", .authority = "h2c.test", .path = "/req0" });
+    defer resp.deinit();
+    try testing.expectEqual(@as(u16, 200), resp.status);
+    try testing.expectEqualStrings("/req0", resp.body);
+
+    // The h2c origin appears in the per-origin snapshot under its `h2c:` key.
+    const snaps = try pool.snapshotOrigins(testing.allocator);
+    defer freeH2OriginSnapshots(testing.allocator, snaps);
+    try testing.expectEqual(@as(usize, 1), snaps.len);
+    try testing.expectEqualStrings(key, snaps[0].origin);
+    try testing.expectEqual(@as(u64, 1), snaps[0].connections_active);
 }
 
 test "h2 pool per-origin counters persist and feed both labelled and global snapshots" {

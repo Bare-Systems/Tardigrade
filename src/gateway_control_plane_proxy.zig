@@ -512,6 +512,7 @@ fn executeBoundedControlPlaneJsonProxyAttempt(
                 cfg.upstream_response_timeout_ms,
                 &state.upstream_pool, // keep-alive pooling for control-plane upstreams (#141 Phase 1c)
                 null, // control plane stays on HTTP/1.1 (no h2 offer)
+                false, // ... and no prior-knowledge h2c either (#237)
             );
         };
         defer buffered_resp.deinit(allocator);

@@ -1553,6 +1553,33 @@ pub const GatewayState = struct {
         try out.print("tardigrade_upstream_h2_streams_active {d}\n", .{h2.streams_active});
         try out.print("tardigrade_upstream_h2_stream_resets_total {d}\n", .{h2.stream_resets_total});
         try out.print("tardigrade_upstream_h2_goaway_total {d}\n", .{h2.goaway_total});
+
+        // Per-origin h2 series (#238), named with a `_pool_` prefix (like the
+        // labelled h1 `tardigrade_upstream_pool_*` series) so a label-blind
+        // sum() over the labelled family never double-counts the bare globals
+        // above. The label value is the pool key (`h2:host:port`), matching
+        // the scheme-prefixed h1 label convention.
+        const h2_origins = try self.h2_pool.snapshotOrigins(self.allocator);
+        defer http.upstream_h2.freeH2OriginSnapshots(self.allocator, h2_origins);
+        if (h2_origins.len > 0) {
+            try out.appendSlice(
+                \\# HELP tardigrade_upstream_h2_pool_connections_active Open multiplexing HTTP/2 upstream connections per origin
+                \\# TYPE tardigrade_upstream_h2_pool_connections_active gauge
+                \\# HELP tardigrade_upstream_h2_pool_streams_active In-flight HTTP/2 upstream streams per origin
+                \\# TYPE tardigrade_upstream_h2_pool_streams_active gauge
+                \\# HELP tardigrade_upstream_h2_pool_stream_resets_total RST_STREAM frames received per origin
+                \\# TYPE tardigrade_upstream_h2_pool_stream_resets_total counter
+                \\# HELP tardigrade_upstream_h2_pool_goaway_total GOAWAY frames received per origin
+                \\# TYPE tardigrade_upstream_h2_pool_goaway_total counter
+                \\
+            );
+            for (h2_origins) |snap| {
+                try appendUpstreamLabelMetric(out, "tardigrade_upstream_h2_pool_connections_active", snap.origin, "{d}", .{snap.connections_active});
+                try appendUpstreamLabelMetric(out, "tardigrade_upstream_h2_pool_streams_active", snap.origin, "{d}", .{snap.streams_active});
+                try appendUpstreamLabelMetric(out, "tardigrade_upstream_h2_pool_stream_resets_total", snap.origin, "{d}", .{snap.stream_resets_total});
+                try appendUpstreamLabelMetric(out, "tardigrade_upstream_h2_pool_goaway_total", snap.origin, "{d}", .{snap.goaway_total});
+            }
+        }
     }
 
     pub fn metricsToJson(self: *GatewayState, allocator: std.mem.Allocator) ![]u8 {

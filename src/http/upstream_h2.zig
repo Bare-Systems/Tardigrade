@@ -1162,10 +1162,39 @@ pub const TlsH2Conn = H2Conn(*tls_termination.UpstreamTlsConn);
 pub const H2PoolStats = struct {
     connections_active: u64 = 0,
     streams_active: u64 = 0,
-    /// Monotonic since process start (see `H2ConnPool` counters).
+    /// Monotonic since process start: sums of the per-origin counters (origin
+    /// entries are never removed while the pool lives, so the sums are
+    /// monotonic too — the exported global series stay backward-compatible).
     stream_resets_total: u64 = 0,
     goaway_total: u64 = 0,
 };
+
+/// Per-origin monotonic counters bumped by that origin's reader thread (#238).
+/// Heap-allocated for a stable address — readers hold pointers across
+/// connection teardown and map growth — and kept until pool `deinit`, so the
+/// totals survive eviction exactly like the former pool-level counters.
+/// Cardinality is bounded by the number of distinct configured origins, same
+/// as the h1 pool's per-host stats.
+pub const H2OriginCounters = struct {
+    stream_resets_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    goaway_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+};
+
+/// A copy of one origin's identity + h2 metrics for rendering. `origin` is the
+/// pool key (`h2:host:port`), owned by the caller and freed via
+/// `freeH2OriginSnapshots`.
+pub const H2OriginSnapshot = struct {
+    origin: []u8,
+    connections_active: u64,
+    streams_active: u64,
+    stream_resets_total: u64,
+    goaway_total: u64,
+};
+
+pub fn freeH2OriginSnapshots(allocator: std.mem.Allocator, snaps: []H2OriginSnapshot) void {
+    for (snaps) |snap| allocator.free(snap.origin);
+    allocator.free(snaps);
+}
 
 /// Result of acquiring a connection for an origin: either a multiplexing h2
 /// actor (the caller holds one ref and must `release` it), or — when the origin
@@ -1195,16 +1224,20 @@ pub const H2ConnPool = struct {
     conns: std.StringHashMap(*TlsH2Conn),
     config: Config = .{},
 
-    /// Pool-wide monotonic counters bumped by each connection's reader thread
-    /// (via a pointer handed to `H2Conn.init`) so RST_STREAM / GOAWAY totals
-    /// persist across connection teardown. Surfaced by `snapshot`.
-    stream_resets_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    goaway_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    /// Per-origin monotonic RST_STREAM/GOAWAY counters (#238), keyed like
+    /// `conns` (`h2:host:port`). Each origin's reader thread bumps its own
+    /// entry (via pointers handed to `H2Conn.init`), still *before* publishing
+    /// the state change the frame causes. Entries are created on first h2
+    /// connection to an origin and live until pool `deinit` — never removed —
+    /// so both the labelled series and the summed globals stay monotonic
+    /// across connection teardown.
+    origin_counters: std.StringHashMap(*H2OriginCounters),
 
     pub fn init(allocator: std.mem.Allocator, config: Config) H2ConnPool {
         return .{
             .allocator = allocator,
             .conns = std.StringHashMap(*TlsH2Conn).init(allocator),
+            .origin_counters = std.StringHashMap(*H2OriginCounters).init(allocator),
             .config = config,
         };
     }
@@ -1217,7 +1250,32 @@ pub const H2ConnPool = struct {
             e.value_ptr.*.release(); // drop the map ref
         }
         self.conns.deinit();
+        // Freed only after every connection's reader has been joined above —
+        // readers hold pointers into these counter structs.
+        var cit = self.origin_counters.iterator();
+        while (cit.next()) |e| {
+            self.allocator.free(e.key_ptr.*);
+            self.allocator.destroy(e.value_ptr.*);
+        }
+        self.origin_counters.deinit();
         self.mutex.unlock();
+    }
+
+    /// Get (or create) the persistent counter struct for `key`. The returned
+    /// pointer is stable for the pool's lifetime.
+    fn originCounters(self: *H2ConnPool, key: []const u8) !*H2OriginCounters {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const gop = try self.origin_counters.getOrPut(key);
+        if (!gop.found_existing) {
+            errdefer _ = self.origin_counters.remove(key);
+            const counters = try self.allocator.create(H2OriginCounters);
+            errdefer self.allocator.destroy(counters);
+            counters.* = .{};
+            gop.key_ptr.* = try self.allocator.dupe(u8, key);
+            gop.value_ptr.* = counters;
+        }
+        return gop.value_ptr.*;
     }
 
     /// Get a healthy h2 connection for `key`, creating one if needed. On the h2
@@ -1266,7 +1324,15 @@ pub const H2ConnPool = struct {
             return .{ .h1 = tls_ptr }; // caller owns: close() + destroy()
         }
 
-        const conn = TlsH2Conn.init(self.allocator, tls_ptr, fd, deadline_ms, self.allocator, &self.stream_resets_total, &self.goaway_total) catch |e| {
+        // Per-origin counters (#238): the reader bumps its origin's entry, and
+        // the entry is only created once the origin actually negotiated h2.
+        const counters = self.originCounters(key) catch |e| {
+            tls_ptr.close();
+            self.allocator.destroy(tls_ptr);
+            return e;
+        };
+
+        const conn = TlsH2Conn.init(self.allocator, tls_ptr, fd, deadline_ms, self.allocator, &counters.stream_resets_total, &counters.goaway_total) catch |e| {
             tls_ptr.close();
             self.allocator.destroy(tls_ptr);
             return e;
@@ -1338,12 +1404,48 @@ pub const H2ConnPool = struct {
         defer self.mutex.unlock();
         var s = H2PoolStats{
             .connections_active = self.conns.count(),
-            .stream_resets_total = self.stream_resets_total.load(.monotonic),
-            .goaway_total = self.goaway_total.load(.monotonic),
         };
         var it = self.conns.valueIterator();
         while (it.next()) |cp| s.streams_active += cp.*.activeStreamCount();
+        // The global totals are sums of the per-origin counters; origin
+        // entries are never removed, so the sums stay monotonic.
+        var cit = self.origin_counters.valueIterator();
+        while (cit.next()) |cp| {
+            s.stream_resets_total += cp.*.stream_resets_total.load(.monotonic);
+            s.goaway_total += cp.*.goaway_total.load(.monotonic);
+        }
         return s;
+    }
+
+    /// Snapshot per-origin h2 metrics for rendering (#238): monotonic
+    /// reset/GOAWAY counters plus live connection/stream gauges. Origins whose
+    /// connection has been evicted keep reporting their counters (with zeroed
+    /// gauges). Caller frees with `freeH2OriginSnapshots`.
+    pub fn snapshotOrigins(self: *H2ConnPool, allocator: std.mem.Allocator) ![]H2OriginSnapshot {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var out = std.array_list.Managed(H2OriginSnapshot).init(allocator);
+        errdefer {
+            for (out.items) |snap| allocator.free(snap.origin);
+            out.deinit();
+        }
+        var it = self.origin_counters.iterator();
+        while (it.next()) |e| {
+            var snap = H2OriginSnapshot{
+                .origin = try allocator.dupe(u8, e.key_ptr.*),
+                .connections_active = 0,
+                .streams_active = 0,
+                .stream_resets_total = e.value_ptr.*.stream_resets_total.load(.monotonic),
+                .goaway_total = e.value_ptr.*.goaway_total.load(.monotonic),
+            };
+            errdefer allocator.free(snap.origin);
+            if (self.conns.get(e.key_ptr.*)) |conn| {
+                snap.connections_active = 1;
+                snap.streams_active = conn.activeStreamCount();
+            }
+            try out.append(snap);
+        }
+        return out.toOwnedSlice();
     }
 
     /// True if `conn` should be dropped from the pool: it must have **no
@@ -1599,6 +1701,42 @@ test "h2 actor multiplexes concurrent requests over one connection" {
     _ = std.c.close(fds[1]);
 
     try testing.expect(all_ok);
+}
+
+test "h2 pool per-origin counters persist and feed both labelled and global snapshots" {
+    var pool = H2ConnPool.init(testing.allocator, .{});
+    defer pool.deinit();
+
+    // Two origins; the same key returns the same persistent entry.
+    const a = try pool.originCounters("h2:origin-a:443");
+    const b = try pool.originCounters("h2:origin-b:8443");
+    try testing.expect(a == try pool.originCounters("h2:origin-a:443"));
+
+    // Simulate reader bumps (the reader holds exactly these pointers).
+    _ = a.stream_resets_total.fetchAdd(2, .monotonic);
+    _ = b.goaway_total.fetchAdd(1, .monotonic);
+
+    // Global snapshot = sums across origins (backward-compatible series).
+    const global = pool.snapshot();
+    try testing.expectEqual(@as(u64, 2), global.stream_resets_total);
+    try testing.expectEqual(@as(u64, 1), global.goaway_total);
+    try testing.expectEqual(@as(u64, 0), global.connections_active);
+
+    // Labelled snapshot: per-origin counters, zero gauges without a live conn.
+    const snaps = try pool.snapshotOrigins(testing.allocator);
+    defer freeH2OriginSnapshots(testing.allocator, snaps);
+    try testing.expectEqual(@as(usize, 2), snaps.len);
+    for (snaps) |snap| {
+        if (std.mem.eql(u8, snap.origin, "h2:origin-a:443")) {
+            try testing.expectEqual(@as(u64, 2), snap.stream_resets_total);
+            try testing.expectEqual(@as(u64, 0), snap.goaway_total);
+        } else {
+            try testing.expectEqualStrings("h2:origin-b:8443", snap.origin);
+            try testing.expectEqual(@as(u64, 1), snap.goaway_total);
+        }
+        try testing.expectEqual(@as(u64, 0), snap.connections_active);
+        try testing.expectEqual(@as(u64, 0), snap.streams_active);
+    }
 }
 
 test "evictionDecision honours active-stream, health, idle, and lifetime gates" {

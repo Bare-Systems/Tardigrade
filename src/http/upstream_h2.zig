@@ -1173,11 +1173,12 @@ pub const UpstreamH2Transport = union(enum) {
     pub fn read(self: *UpstreamH2Transport, buf: []u8) !usize {
         switch (self.*) {
             .tls => |t| return t.conn.read(buf),
-            .plain => |fd| {
-                const n = std.c.read(fd, buf.ptr, buf.len);
-                if (n < 0) return error.ReadFailed;
-                return @intCast(n);
-            },
+            // std.posix.read/write (not std.c) so EINTR is retried internally,
+            // mirroring compat.NetStream: on macOS, thread machinery delivers
+            // signals that interrupt blocking socket syscalls (the same class
+            // of failure the kevent EINTR fix addressed), and a surfaced EINTR
+            // here would falsely kill the shared connection.
+            .plain => |fd| return std.posix.read(fd, buf) catch error.ReadFailed,
         }
     }
 
@@ -1187,8 +1188,13 @@ pub const UpstreamH2Transport = union(enum) {
             .plain => |fd| {
                 var off: usize = 0;
                 while (off < data.len) {
+                    // std.posix has no write in this std; retry EINTR manually.
                     const n = std.c.write(fd, data.ptr + off, data.len - off);
-                    if (n <= 0) return error.WriteFailed;
+                    if (n < 0) {
+                        if (std.posix.errno(n) == .INTR) continue;
+                        return error.WriteFailed;
+                    }
+                    if (n == 0) return error.WriteFailed;
                     off += @intCast(n);
                 }
             },
@@ -1651,15 +1657,18 @@ test "applyPeerSettings updates the stream send window" {
 const PlainTransport = struct {
     fd: std.posix.fd_t,
     pub fn read(self: *PlainTransport, buf: []u8) !usize {
-        const n = std.c.read(self.fd, buf.ptr, buf.len);
-        if (n < 0) return error.ReadFailed;
-        return @intCast(n);
+        // std.posix retries EINTR (see UpstreamH2Transport.plain).
+        return std.posix.read(self.fd, buf) catch error.ReadFailed;
     }
     pub fn writeAll(self: *PlainTransport, data: []const u8) !void {
         var off: usize = 0;
         while (off < data.len) {
             const n = std.c.write(self.fd, data.ptr + off, data.len - off);
-            if (n <= 0) return error.WriteFailed;
+            if (n < 0) {
+                if (std.posix.errno(n) == .INTR) continue;
+                return error.WriteFailed;
+            }
+            if (n == 0) return error.WriteFailed;
             off += @intCast(n);
         }
     }
@@ -1811,23 +1820,29 @@ test "h2c pool acquires a prior-knowledge cleartext connection and round-trips" 
     try testing.expect(std.c.getsockname(listen_fd, @ptrCast(&bound), &bound_len) == 0);
     const port = std.mem.bigToNative(u16, bound.port);
 
+    // Cleanup is all defers (LIFO) so a failing assertion cannot leak the
+    // pool/connection or leave threads unjoined: release conn -> pool.deinit
+    // (drops the map ref, joining the reader; the server then sees EOF or its
+    // own read deadline) -> server.join.
     const server = try std.Thread.spawn(.{}, h2cListenerServe, .{ listen_fd, @as(usize, 1) });
+    defer server.join();
 
     var pool = H2ConnPool.init(testing.allocator, .{});
+    defer pool.deinit();
     var key_buf: [64]u8 = undefined;
     const key = try std.fmt.bufPrint(&key_buf, "h2c:127.0.0.1:{d}", .{port});
 
     // tls_options == null => prior-knowledge cleartext h2; never `.h1`.
-    const acq = try pool.acquire(key, "127.0.0.1", port, null, 2000);
+    const acq = try pool.acquire(key, "127.0.0.1", port, null, 5000);
     const conn = switch (acq) {
         .h2 => |c| c,
         .h1 => return error.TestUnexpectedResult,
     };
+    defer pool.release(conn);
     var resp = try conn.request(.{ .method = "GET", .authority = "h2c.test", .path = "/req0" });
+    defer resp.deinit();
     try testing.expectEqual(@as(u16, 200), resp.status);
     try testing.expectEqualStrings("/req0", resp.body);
-    resp.deinit();
-    pool.release(conn);
 
     // The h2c origin appears in the per-origin snapshot under its `h2c:` key.
     const snaps = try pool.snapshotOrigins(testing.allocator);
@@ -1835,9 +1850,6 @@ test "h2c pool acquires a prior-knowledge cleartext connection and round-trips" 
     try testing.expectEqual(@as(usize, 1), snaps.len);
     try testing.expectEqualStrings(key, snaps[0].origin);
     try testing.expectEqual(@as(u64, 1), snaps[0].connections_active);
-
-    pool.deinit(); // joins the reader via the map ref
-    server.join();
 }
 
 test "h2 pool per-origin counters persist and feed both labelled and global snapshots" {

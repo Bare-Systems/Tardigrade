@@ -485,6 +485,7 @@ fn executeBoundedControlPlaneJsonProxyAttempt(
                 controlPlaneBufferedResponseLimit(cfg),
                 attempt_timeout_ms,
                 cfg.upstream_response_timeout_ms,
+                &state.upstream_pool, // unix keep-alive pooling (#239)
             )
         else blk: {
             const is_https = std.ascii.eqlIgnoreCase(uri.scheme, "https");

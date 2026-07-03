@@ -34,6 +34,12 @@ In scope (Phases 1 / 1b / 1c / 2 / 3):
 - Reuse **FastCGI** connections through the same pool (Phase 2), keyed under a
   `fastcgi:` prefix. The pool stores a `compat.NetStream`, so it holds both the
   data-plane's raw-fd connections and FastCGI's connections uniformly.
+- Reuse **Unix-socket HTTP** upstream connections (Phase 1d / #239), keyed
+  under a `unix:<path>` prefix, on the buffered data-plane and control-plane
+  paths. Unix connects are cheap (no handshake, no TIME_WAIT pressure), but
+  keep-alive still spares the origin per-request accept/fd churn and brings
+  unix upstreams under the same idle/lifetime/active-cap policy and metrics
+  as TCP.
 - For TLS the pooled entry owns the OpenSSL connection, so the handshake is
   amortized across requests; the key is scheme-prefixed (`http:`/`https:`).
 - Per-origin idle pool with idle-timeout, max-lifetime, and max-idle-per-host
@@ -380,6 +386,7 @@ downstream-keepalive reaper): connections past `idle_timeout_ms` or
 | `TARDIGRADE_UPSTREAM_POOL_MAX_IDLE_PER_HOST` | `32` | Max idle connections cached per origin. |
 | `TARDIGRADE_UPSTREAM_POOL_IDLE_TIMEOUT_MS` | `90000` | Idle connection is evicted after this long unused. |
 | `TARDIGRADE_UPSTREAM_POOL_MAX_LIFETIME_MS` | `0` (unlimited) | Hard cap on total connection age. |
+| `TARDIGRADE_UPSTREAM_POOL_MAX_ACTIVE_PER_HOST` | `0` (unlimited) | **Fail-fast** cap on concurrently checked-out connections per origin (#239): at the cap, requests are rejected with 503 `upstream_saturated` instead of opening more connections. See "Active-cap semantics" below. |
 | `TARDIGRADE_UPSTREAM_PROTOCOL` | `http1` | Upstream application protocol: `http1`; `h2`/`auto` (offer h2 via ALPN on HTTPS upstreams, h1 fallback); `h2c` (= `h2` for HTTPS, plus prior-knowledge cleartext h2 to plain-HTTP upstreams — explicit opt-in, see the h2c section). |
 
 ## Metrics
@@ -416,8 +423,39 @@ The h2 series are pool-global (not `{upstream}`-labelled) since the pool holds o
 connection per origin; per-upstream h2 labels are deferred with the multi-origin
 h2 work.
 
-Still deferred: a hard `_MAX_ACTIVE_PER_HOST` cap (the `active` gauge is
-tracked, but enforcement needs backpressure semantics that couple with #140).
+Active-cap saturation (#239): `tardigrade_upstream_pool_at_capacity_total`
+(`{upstream=...}`-labelled counter of fail-fast rejections).
+
+## Active-cap semantics (#239)
+
+`TARDIGRADE_UPSTREAM_POOL_MAX_ACTIVE_PER_HOST` is enforced **fail-fast**: a
+checkout at the cap returns `error.UpstreamAtCapacity`, which the proxy maps
+to **503 `upstream_saturated`**. The chosen semantics, out of
+queue / fail-fast / backpressure:
+
+- **Fail-fast (chosen).** In the thread-per-connection worker model, blocking
+  a worker until a slot frees would let a single slow origin absorb the entire
+  worker pool — precisely the upstream-side worker-starvation tail documented
+  early on #141. Envoy's circuit-breaker `max_connections` makes the same
+  call. Failing fast keeps workers live and pushes the shed decision to the
+  client/retry layer.
+- **Queueing / watermark backpressure (deferred to #140).** Real queueing
+  wants admission control and watermark accounting shared with the downstream
+  side; bolting a condvar wait onto the pool would double-book that design.
+
+Enforcement is race-free by construction: `checkout`/`reserveSlot` **reserve**
+the active slot under the pool mutex *before* the caller connects (a failed
+connect calls `releaseSlot`), so concurrent callers cannot exceed the cap
+during their connect/handshake window. Saturation rejections are a *local
+policy* decision: they are **not** counted against passive upstream health or
+the circuit breaker (a healthy-but-busy origin must not get ejected), and the
+buffered path does not burn its retry budget re-hitting the cap. The cap does
+not apply to the h2 pool, whose concurrency is bounded per connection by
+`MAX_CONCURRENT_STREAMS` (one multiplexed connection per origin).
+
+`benchmarks/upstream-reuse.sh` demonstrates both the reuse ratio and the cap
+(503s at saturation, `at_capacity_total`, and a follow-up request confirming
+health is untouched).
 
 ## Testing
 

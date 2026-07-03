@@ -510,6 +510,14 @@ pub fn handleLocationProxyPass(
                 state.metricsRecordProxyClientAbort();
                 return err;
             }
+            if (err == error.UpstreamAtCapacity) {
+                // Fail-fast at the per-origin active cap (#239): a local
+                // saturation rejection, not an origin failure — do not count
+                // it against upstream health / circuit-breaker state.
+                try sendApiError(allocator, writer, .service_unavailable, "upstream_saturated", "Upstream connection limit reached", correlation_id, false, state);
+                ctx.setUpstreamResult(resolved.upstream_host, @intFromEnum(http.Status.service_unavailable), 0);
+                return @intFromEnum(http.Status.service_unavailable);
+            }
             state.recordUpstreamFailure(cfg, selection.base_url);
             if (err == error.RequestCancelled) {
                 if (ctx.lifecycle) |lc| lc.logTimeout("upstream_connect");
@@ -636,6 +644,15 @@ pub fn handleLocationProxyPass(
                 stale_conn_retries += 1;
                 state.logger.warn(correlation_id, "proxy retrying on fresh connection after stale upstream keep-alive ({d}/{d})", .{ stale_conn_retries, max_stale_conn_retries });
                 continue;
+            }
+            if (err == error.UpstreamAtCapacity) {
+                // Fail-fast at the per-origin active cap (#239): a local
+                // saturation rejection, not an origin failure — do not count
+                // it against upstream health / circuit-breaker state, and do
+                // not burn retry attempts re-hitting the cap.
+                try sendApiError(allocator, writer, .service_unavailable, "upstream_saturated", "Upstream connection limit reached", correlation_id, keep_alive, state);
+                ctx.setUpstreamResult(resolved.upstream_host, @intFromEnum(http.Status.service_unavailable), 0);
+                return @intFromEnum(http.Status.service_unavailable);
             }
             state.recordUpstreamFailure(cfg, selection.base_url);
             // If the request deadline elapsed, stop retrying immediately.

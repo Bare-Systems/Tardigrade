@@ -174,6 +174,13 @@ pub fn parseBufferedUpstreamResponse(allocator: std.mem.Allocator, raw: []const 
 /// Execute a bounded buffered HTTP/1 request over a Unix socket. This is
 /// appropriate for small control-plane/internal calls and compatibility paths
 /// where the caller provides a strict response cap.
+///
+/// When `pool` is non-null and enabled, connections are kept alive and reused
+/// under `unix:<path>` keys (#239 — unix connects are cheap, but keep-alive
+/// still spares the origin per-request accept/fd churn, matters for
+/// php-fpm-style backends, and brings unix upstreams under the same
+/// idle/lifetime/active-cap policy and metrics as TCP). A reused connection
+/// the origin closed while idle is retried once on a fresh one.
 pub fn executeBoundedBufferedUnixSocketHttpRequest(
     allocator: std.mem.Allocator,
     socket_path: []const u8,
@@ -188,25 +195,77 @@ pub fn executeBoundedBufferedUnixSocketHttpRequest(
     /// separate deadline for waiting on the first response byte (distinct from
     /// the write-phase timeout above).
     response_timeout_ms: u32,
+    /// Optional keep-alive pool (#239). Null (or disabled) keeps the previous
+    /// fresh `Connection: close` connection per request.
+    pool: ?*http.upstream_pool.UpstreamPool,
 ) !BufferedUpstreamResponse {
-    const fd = try compat.connectBlockingUnix(socket_path);
-    defer _ = std.c.close(fd);
+    const active_pool: ?*http.upstream_pool.UpstreamPool = if (pool) |p| (if (p.config.enabled) p else null) else null;
 
-    return exchangeBoundedBufferedHttpRequest(
-        allocator,
-        compat.netStreamFromFd(fd),
-        fd,
-        uri,
-        method,
-        extra_headers,
-        body,
-        content_type_override,
-        max_buffered_response_bytes,
-        timeout_ms,
-        response_timeout_ms,
-        false,
-        null,
-    );
+    if (active_pool == null) {
+        const fd = try compat.connectBlockingUnix(socket_path);
+        defer _ = std.c.close(fd);
+        return exchangeBoundedBufferedHttpRequest(
+            allocator,
+            compat.netStreamFromFd(fd),
+            fd,
+            uri,
+            method,
+            extra_headers,
+            body,
+            content_type_override,
+            max_buffered_response_bytes,
+            timeout_ms,
+            response_timeout_ms,
+            false,
+            null,
+        );
+    }
+
+    const p = active_pool.?;
+    var key_buf: [512]u8 = undefined;
+    const key = std.fmt.bufPrint(&key_buf, "unix:{s}", .{socket_path}) catch socket_path;
+
+    var attempt: usize = 0;
+    while (attempt < 2) : (attempt += 1) {
+        const now_ms = http.event_loop.monotonicMs();
+        var reused = false;
+        var conn: http.upstream_pool.PooledConn = undefined;
+        if (attempt == 0) {
+            if (try p.checkout(key, now_ms)) |pooled| {
+                conn = pooled;
+                reused = true;
+            }
+        } else {
+            try p.reserveSlot(key); // stale retry: deliberately fresh, still capped
+        }
+        if (!reused) {
+            const connect_start_ms = http.event_loop.monotonicMs();
+            const new_fd = compat.connectBlockingUnix(socket_path) catch |err| {
+                p.releaseSlot(key);
+                return err;
+            };
+            p.recordConnectLatency(http.event_loop.monotonicMs() - connect_start_ms);
+            p.noteNewConnection(key);
+            conn = .{ .stream = compat.netStreamFromFd(new_fd), .tls = null, .created_ms = now_ms, .last_used_ms = now_ms };
+        }
+        const fd = conn.stream.handle;
+
+        var reusable = false;
+        const result = exchangeBoundedBufferedHttpRequest(allocator, compat.netStreamFromFd(fd), fd, uri, method, extra_headers, body, content_type_override, max_buffered_response_bytes, timeout_ms, response_timeout_ms, true, &reusable);
+
+        if (result) |resp| {
+            p.release(key, conn, reusable, http.event_loop.monotonicMs());
+            return resp;
+        } else |err| {
+            p.release(key, conn, false, http.event_loop.monotonicMs());
+            if (reused and err == error.UpstreamConnectionClosed and attempt == 0) {
+                p.recordStaleRetry(key);
+                continue; // request never delivered — retry once on a fresh conn
+            }
+            return err;
+        }
+    }
+    unreachable;
 }
 
 /// Execute a bounded buffered HTTP/1 request over a TCP socket, with optional
@@ -305,30 +364,41 @@ pub fn executeBoundedBufferedTcpHttpRequest(
     // Attempt 0 uses a pooled connection when available; a reused connection the
     // origin already closed (error.UpstreamConnectionClosed with zero bytes) is
     // retried once on a fresh connection since the request was never delivered.
+    // Checkout reserves an active slot before connecting, so the per-origin
+    // active cap (#239) cannot be raced past; a failed connect must release the
+    // reservation.
     var attempt: usize = 0;
     while (attempt < 2) : (attempt += 1) {
         const now_ms = http.event_loop.monotonicMs();
         var reused = false;
         var conn: http.upstream_pool.PooledConn = undefined;
         if (attempt == 0) {
-            if (p.acquire(key, now_ms)) |pooled| {
+            if (try p.checkout(key, now_ms)) |pooled| {
                 conn = pooled;
                 reused = true;
             }
+        } else {
+            // Stale retry: deliberately fresh, but still capped.
+            try p.reserveSlot(key);
         }
         if (!reused) {
             const connect_start_ms = http.event_loop.monotonicMs();
-            const new_fd = try compat.connectBlockingTcp(host, port);
+            const new_fd = compat.connectBlockingTcp(host, port) catch |err| {
+                p.releaseSlot(key);
+                return err;
+            };
             p.recordConnectLatency(http.event_loop.monotonicMs() - connect_start_ms);
             if (is_tls) {
                 if (connect_timeout_ms > 0) setSocketTimeoutMs(new_fd, connect_timeout_ms, connect_timeout_ms) catch {};
                 const tls_ptr = p.allocator.create(http.tls_termination.UpstreamTlsConn) catch {
                     _ = std.c.close(new_fd);
+                    p.releaseSlot(key);
                     return error.OutOfMemory;
                 };
                 tls_ptr.* = http.tls_termination.UpstreamTlsConn.connect(new_fd, host, tls_options.?) catch |err| {
                     p.allocator.destroy(tls_ptr);
                     _ = std.c.close(new_fd);
+                    p.releaseSlot(key);
                     return err;
                 };
                 p.noteNewConnection(key);
@@ -1149,6 +1219,7 @@ pub fn executeBoundedBufferedHttpProxyRequest(
             max_buffered_response_bytes,
             effective_timeout_ms,
             effective_response_timeout_ms,
+            pool,
         );
     }
 
@@ -1682,29 +1753,40 @@ pub fn executeStreamingHttpProxyRequest(
     while (true) : (attempt += 1) {
         const now_ms = http.event_loop.monotonicMs();
 
-        // Acquire a connection: pooled (attempt 0) or freshly connected.
+        // Acquire a connection: pooled (attempt 0) or freshly connected. The
+        // checkout/reserveSlot reserves an active slot before connecting so the
+        // per-origin cap (#239) is a real hard cap; failed connects release it.
         var reused = false;
         var conn: http.upstream_pool.PooledConn = undefined;
-        if (attempt == 0 and active_pool != null) {
-            if (active_pool.?.acquire(key, now_ms)) |c| {
-                conn = c;
-                reused = true;
+        if (active_pool) |p| {
+            if (attempt == 0) {
+                if (try p.checkout(key, now_ms)) |c| {
+                    conn = c;
+                    reused = true;
+                }
+            } else {
+                try p.reserveSlot(key); // stale retry: deliberately fresh, still capped
             }
         }
         if (!reused) {
             const connect_start = http.event_loop.monotonicMs();
-            const new_fd = try compat.connectBlockingTcp(host, port);
+            const new_fd = compat.connectBlockingTcp(host, port) catch |err| {
+                if (active_pool) |p| p.releaseSlot(key);
+                return err;
+            };
             if (active_pool) |p| p.recordConnectLatency(http.event_loop.monotonicMs() - connect_start);
             if (tls_options) |opts| {
                 if (connect_timeout_ms > 0) setSocketTimeoutMs(new_fd, connect_timeout_ms, connect_timeout_ms) catch {};
                 const owner = if (active_pool) |p| p.allocator else allocator;
                 const tls_ptr = owner.create(http.tls_termination.UpstreamTlsConn) catch {
                     _ = std.c.close(new_fd);
+                    if (active_pool) |p| p.releaseSlot(key);
                     return error.OutOfMemory;
                 };
                 tls_ptr.* = http.tls_termination.UpstreamTlsConn.connect(new_fd, host, opts) catch |err| {
                     owner.destroy(tls_ptr);
                     _ = std.c.close(new_fd);
+                    if (active_pool) |p| p.releaseSlot(key);
                     return err;
                 };
                 if (active_pool) |p| p.noteNewConnection(key);
@@ -1804,6 +1886,11 @@ pub fn mapControlPlaneProxyExecutionError(err: anyerror) ProxyExecMappedError {
             .status = .gateway_timeout,
             .code = "upstream_timeout",
             .message = "Upstream timeout",
+        },
+        error.UpstreamAtCapacity => .{
+            .status = .service_unavailable,
+            .code = "upstream_saturated",
+            .message = "Upstream connection limit reached",
         },
         else => .{
             .status = .gateway_timeout,
@@ -2367,6 +2454,89 @@ test "connectBlockingTcp + exchange round-trips a real TCP origin" {
     try std.testing.expectEqualStrings("text/plain", resp.headerValue("content-type").?);
 }
 
+/// Raw blocking keep-alive responder: accepts one connection and serves `n`
+/// framed responses on it (Content-Length, no `Connection: close`), so a
+/// pooled client can reuse the connection across requests.
+fn rawKeepAliveHttpResponder(listen_fd: std.posix.fd_t, n: usize) void {
+    const conn = std.c.accept(listen_fd, null, null);
+    if (conn < 0) return;
+    defer _ = std.c.close(conn);
+    var buf: [4096]u8 = undefined;
+    var served: usize = 0;
+    while (served < n) : (served += 1) {
+        const got = std.posix.read(conn, buf[0..]) catch return;
+        if (got == 0) return;
+        const response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nhello";
+        _ = std.c.write(conn, response.ptr, response.len);
+    }
+    // Drain until the client closes so our close never RSTs unread bytes.
+    while (true) {
+        const got = std.posix.read(conn, buf[0..]) catch return;
+        if (got == 0) return;
+    }
+}
+
+test "unix-socket upstream connections pool and reuse across requests (#239)" {
+    const allocator = std.testing.allocator;
+
+    var full_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var rnd: [8]u8 = undefined;
+    compat.randomBytes(&rnd);
+    const full_path = try std.fmt.bufPrint(&full_path_buf, "/tmp/tardigrade-pool-{x}.sock", .{std.mem.readInt(u64, &rnd, .little)});
+    var path_z: [std.fs.max_path_bytes]u8 = undefined;
+    @memcpy(path_z[0..full_path.len], full_path);
+    path_z[full_path.len] = 0;
+    _ = std.c.unlink(@ptrCast(&path_z));
+    defer _ = std.c.unlink(@ptrCast(&path_z));
+
+    const listen_fd = std.c.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
+    try std.testing.expect(listen_fd >= 0);
+    defer _ = std.c.close(listen_fd);
+    var un = std.mem.zeroes(std.c.sockaddr.un);
+    un.family = std.posix.AF.UNIX;
+    try std.testing.expect(full_path.len < un.path.len);
+    @memcpy(un.path[0..full_path.len], full_path);
+    const un_len: std.posix.socklen_t = @intCast(@offsetOf(std.c.sockaddr.un, "path") + full_path.len + 1);
+    try std.testing.expect(std.c.bind(listen_fd, @ptrCast(&un), un_len) == 0);
+    try std.testing.expect(std.c.listen(listen_fd, 8) == 0);
+
+    const responder = try std.Thread.spawn(.{}, rawKeepAliveHttpResponder, .{ listen_fd, @as(usize, 2) });
+    defer responder.join();
+
+    var pool = http.upstream_pool.UpstreamPool.init(allocator, .{});
+    defer pool.deinit();
+
+    const uri = try std.Uri.parse("http://localhost/");
+    var i: usize = 0;
+    while (i < 2) : (i += 1) {
+        var resp = try executeBoundedBufferedUnixSocketHttpRequest(
+            allocator,
+            full_path,
+            uri,
+            "GET",
+            &.{},
+            "",
+            null,
+            1 << 20,
+            2_000,
+            2_000,
+            &pool,
+        );
+        defer resp.deinit(allocator);
+        try std.testing.expectEqual(@as(u16, 200), resp.status_code);
+        try std.testing.expectEqualStrings("hello", resp.body);
+    }
+
+    // One connection served both requests: 1 new, 1 reused, keyed unix:<path>.
+    const agg = pool.aggregateStats();
+    try std.testing.expectEqual(@as(u64, 1), agg.new_total);
+    try std.testing.expectEqual(@as(u64, 1), agg.reused_total);
+    const snaps = try pool.snapshotHosts(allocator);
+    defer http.upstream_pool.freeHostSnapshots(allocator, snaps);
+    try std.testing.expectEqual(@as(usize, 1), snaps.len);
+    try std.testing.expect(std.mem.startsWith(u8, snaps[0].host, "unix:/tmp/tardigrade-pool-"));
+}
+
 test "connectBlockingUnix + exchange round-trips a Unix-socket origin" {
     const allocator = std.testing.allocator;
 
@@ -2407,6 +2577,7 @@ test "connectBlockingUnix + exchange round-trips a Unix-socket origin" {
         1 << 20,
         2_000,
         2_000,
+        null,
     );
     defer resp.deinit(allocator);
 

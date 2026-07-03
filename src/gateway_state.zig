@@ -583,10 +583,15 @@ pub const GatewayState = struct {
         var key_buf: [512]u8 = undefined;
         const key = fastcgiPoolKey(&key_buf, endpoint);
         const now = http.event_loop.monotonicMs();
-        if (self.upstream_pool.acquire(key, now)) |conn| {
+        // checkout reserves an active slot before connecting (per-origin cap,
+        // #239); a failed connect must release the reservation.
+        if (try self.upstream_pool.checkout(key, now)) |conn| {
             return .{ .conn = conn, .reused = true };
         }
-        const stream = try http.fastcgi.connect(self.allocator, endpoint);
+        const stream = http.fastcgi.connect(self.allocator, endpoint) catch |err| {
+            self.upstream_pool.releaseSlot(key);
+            return err;
+        };
         self.upstream_pool.noteNewConnection(key);
         return .{ .conn = .{ .stream = stream, .tls = null, .created_ms = now, .last_used_ms = now }, .reused = false };
     }
@@ -1472,6 +1477,8 @@ pub const GatewayState = struct {
                 \\# TYPE tardigrade_upstream_pool_connections_active gauge
                 \\# HELP tardigrade_upstream_pool_stale_retries_total Stale-connection retries per origin
                 \\# TYPE tardigrade_upstream_pool_stale_retries_total counter
+                \\# HELP tardigrade_upstream_pool_at_capacity_total Checkouts rejected fail-fast at the per-origin active cap
+                \\# TYPE tardigrade_upstream_pool_at_capacity_total counter
                 \\# HELP tardigrade_upstream_pool_reuse_ratio Reuse ratio (reused / (reused + new)) per origin
                 \\# TYPE tardigrade_upstream_pool_reuse_ratio gauge
                 \\
@@ -1488,6 +1495,7 @@ pub const GatewayState = struct {
             try appendUpstreamLabelMetric(out, "tardigrade_upstream_pool_connections_idle", snap.host, "{d}", .{s.idle});
             try appendUpstreamLabelMetric(out, "tardigrade_upstream_pool_connections_active", snap.host, "{d}", .{s.active});
             try appendUpstreamLabelMetric(out, "tardigrade_upstream_pool_stale_retries_total", snap.host, "{d}", .{s.stale_retries_total});
+            try appendUpstreamLabelMetric(out, "tardigrade_upstream_pool_at_capacity_total", snap.host, "{d}", .{s.at_capacity_total});
             try appendUpstreamLabelMetric(out, "tardigrade_upstream_pool_reuse_ratio", snap.host, "{d:.4}", .{ratio});
         }
 

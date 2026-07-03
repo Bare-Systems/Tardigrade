@@ -125,7 +125,71 @@ pool and the h2 multiplexer and reports throughput, latency, and the upstream
 connection count (h2 serves the whole load over one connection; h1 opens one per
 busy worker).
 
-Deferred within #145: the streaming proxy path over h2, and cleartext h2c.
+### Streaming path over h2 (Phase 4b PR 4)
+
+The streaming proxy path (`TARDIGRADE_PROXY_STREAMING_MODE=response|full`) now
+multiplexes over the same per-origin h2 connection instead of always speaking
+HTTP/1.1. `executeStreamingHttpProxyRequest` routes HTTPS targets through
+`streamViaH2Pool` when `TARDIGRADE_UPSTREAM_PROTOCOL=h2|auto`; ALPN `http/1.1`
+origins fall back to the h1 streaming relay on that (fresh, unpooled)
+connection.
+
+The actor gains a streaming request mode next to the fully-buffered
+`request()`:
+
+- **`requestStreaming()`** sends HEADERS(+body) and blocks until the response
+  headers are decoded, then returns the stream handle; the relay reads the body
+  incrementally with **`readStreamingBody()`** and must call
+  **`finishStreaming()`** exactly once (which RST_STREAMs a stream the origin
+  had not finished, so an abandoned/aborted relay frees the origin's stream
+  slot).
+- **Flow control is the crux.** For buffered streams the reader replenishes
+  both the connection- and stream-level windows immediately per DATA frame
+  (unbounded buffering into the stream's body, acceptable because the whole
+  response is size-capped and consumed at once). For streaming streams the
+  reader parks DATA in the per-stream buffer and does **not** replenish the
+  stream window — only `readStreamingBody` replenishes as the relay drains
+  downstream. The advertised initial stream window (1 MiB) therefore *is* the
+  bounded per-stream buffer, and a slow downstream client backpressures its own
+  stream: the origin stops sending once the un-replenished window is exhausted.
+  A peer that overruns the advertised window is failed with
+  `Http2FlowControlError` instead of buffering without bound.
+- **The connection-level window is always replenished promptly** by the reader
+  (and is grown to 8 MiB at connection start), so one slow stream can never
+  stall the other streams sharing the connection. Measured: a 10 KB/s
+  downstream client mid-transfer did not move the latency of 40 concurrent fast
+  requests on the same upstream connection (~7 ms each).
+- **Every worker wait is deadline-bounded** even while frames keep flowing for
+  *other* streams: a waiter registers a wait deadline on its stream and the
+  reader fails the stream with `Http2Timeout` if it passes without progress
+  (progress extends the deadline, mirroring the h1 per-read `poll` bound); a
+  fully silent connection is already bounded by the reader's frame-read
+  deadline. This closes a starvation window the buffered `request()` wait had
+  too — a stalled stream on a busy shared connection previously waited
+  indefinitely.
+- Response **trailers** are decoded (mandatory for connection-wide HPACK
+  dynamic-table consistency — skipping a block would corrupt every later
+  response on the connection) and then discarded, matching the h1 relay, which
+  consumes and drops chunked trailers.
+- Failure semantics match the h1 streaming relay: a connection-level failure
+  before any downstream byte evicts the connection and retries once; after the
+  response head is written downstream, an upstream failure surfaces as an
+  aborted relay (truncated chunked body) and evicts the connection only if the
+  connection itself died.
+
+Streaming **uploads** (`full` mode with a request body relayed from the client)
+stay on the HTTP/1.1 path: the request-body sender currently buffers the body,
+and relaying a slow client upload over the shared connection needs an
+incremental DATA-send API on the actor. Deferred within #145: streaming
+uploads over h2, and cleartext h2c.
+
+### Upstream latency by protocol
+
+`tardigrade_upstream_request_latency_ms{protocol="h1"|"h2"}` (histogram) records
+every *completed* upstream exchange — from starting the exchange on an acquired
+connection to the response fully received (buffered) or fully relayed
+(streaming) — so h1-pool and h2-multiplexed tail latency can be compared
+directly (the "upstream p99 by protocol" acceptance row on #145).
 
 ## Ownership & concurrency
 

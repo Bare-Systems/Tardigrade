@@ -258,7 +258,8 @@ pub fn executeBoundedBufferedTcpHttpRequest(
         }
     }
     // Every request that reaches the buffered HTTP/1.1 path counts as h1 (an h2
-    // request would have returned above). The streaming path is not yet counted.
+    // request would have returned above). The streaming path counts its own
+    // requests in executeStreamingHttpProxyRequest.
     if (pool) |p| p.recordProtocol(false);
 
     const active_pool: ?*http.upstream_pool.UpstreamPool = if (pool) |p| (if (p.config.enabled) p else null) else null;
@@ -266,6 +267,7 @@ pub fn executeBoundedBufferedTcpHttpRequest(
     // No pool: a single fresh `Connection: close` connection (plain or TLS),
     // cleaned up on return.
     if (active_pool == null) {
+        const start_ms = http.event_loop.monotonicMs();
         const fd = try compat.connectBlockingTcp(host, port);
         defer _ = std.c.close(fd);
         if (connect_timeout_ms > 0) {
@@ -274,9 +276,13 @@ pub fn executeBoundedBufferedTcpHttpRequest(
         if (tls_options) |opts| {
             var tls_conn = try http.tls_termination.UpstreamTlsConn.connect(fd, host, opts);
             defer tls_conn.deinit();
-            return exchangeBoundedBufferedHttpRequest(allocator, &tls_conn, fd, uri, method, extra_headers, body, content_type_override, max_buffered_response_bytes, connect_timeout_ms, response_timeout_ms, false, null);
+            const resp = try exchangeBoundedBufferedHttpRequest(allocator, &tls_conn, fd, uri, method, extra_headers, body, content_type_override, max_buffered_response_bytes, connect_timeout_ms, response_timeout_ms, false, null);
+            if (pool) |p| p.recordRequestLatency(false, http.event_loop.monotonicMs() - start_ms);
+            return resp;
         }
-        return exchangeBoundedBufferedHttpRequest(allocator, compat.netStreamFromFd(fd), fd, uri, method, extra_headers, body, content_type_override, max_buffered_response_bytes, connect_timeout_ms, response_timeout_ms, false, null);
+        const resp = try exchangeBoundedBufferedHttpRequest(allocator, compat.netStreamFromFd(fd), fd, uri, method, extra_headers, body, content_type_override, max_buffered_response_bytes, connect_timeout_ms, response_timeout_ms, false, null);
+        if (pool) |p| p.recordRequestLatency(false, http.event_loop.monotonicMs() - start_ms);
+        return resp;
     }
 
     const p = active_pool.?;
@@ -327,6 +333,7 @@ pub fn executeBoundedBufferedTcpHttpRequest(
         }
 
         var reusable = false;
+        const exchange_start_ms = http.event_loop.monotonicMs();
         const result = if (conn.tls) |tls|
             exchangeBoundedBufferedHttpRequest(allocator, tls, fd, uri, method, extra_headers, body, content_type_override, max_buffered_response_bytes, connect_timeout_ms, response_timeout_ms, true, &reusable)
         else
@@ -334,6 +341,7 @@ pub fn executeBoundedBufferedTcpHttpRequest(
 
         if (result) |resp| {
             p.release(key, conn, reusable, http.event_loop.monotonicMs());
+            p.recordRequestLatency(false, http.event_loop.monotonicMs() - exchange_start_ms);
             return resp;
         } else |err| {
             p.release(key, conn, false, http.event_loop.monotonicMs()); // active--, close (deinits TLS)
@@ -395,6 +403,7 @@ fn executeBufferedH2OrH1Fresh(
             try path_buf.writer.writeAll(uriComponentBytes(q));
         }
 
+        const start_ms = http.event_loop.monotonicMs();
         var h2resp = try http.upstream_h2.exchange(allocator, &tls_conn, fd, .{
             .method = method,
             .scheme = "https",
@@ -404,13 +413,17 @@ fn executeBufferedH2OrH1Fresh(
             .body = body,
         }, deadline_ms);
         defer h2resp.deinit();
+        if (pool) |p| p.recordRequestLatency(true, http.event_loop.monotonicMs() - start_ms);
         return h2ResponseToBuffered(allocator, &h2resp);
     }
 
     // Origin chose HTTP/1.1: run the buffered h1 exchange on this connection.
     if (pool) |p| p.recordProtocol(false);
     var reusable = false;
-    return exchangeBoundedBufferedHttpRequest(allocator, &tls_conn, fd, uri, method, extra_headers, body, content_type_override, max_buffered_response_bytes, connect_timeout_ms, response_timeout_ms, false, &reusable);
+    const start_ms = http.event_loop.monotonicMs();
+    const resp = try exchangeBoundedBufferedHttpRequest(allocator, &tls_conn, fd, uri, method, extra_headers, body, content_type_override, max_buffered_response_bytes, connect_timeout_ms, response_timeout_ms, false, &reusable);
+    if (pool) |p| p.recordRequestLatency(false, http.event_loop.monotonicMs() - start_ms);
+    return resp;
 }
 
 /// HTTP/2 buffered request multiplexed over a shared per-origin connection
@@ -454,7 +467,10 @@ fn executeBufferedViaH2Pool(
                 }
                 if (h1_pool) |p| p.recordProtocol(false);
                 var reusable = false;
-                return exchangeBoundedBufferedHttpRequest(allocator, tls_ptr, tls_ptr.fd, uri, method, extra_headers, body, content_type_override, max_buffered_response_bytes, connect_timeout_ms, response_timeout_ms, false, &reusable);
+                const start_ms = http.event_loop.monotonicMs();
+                const resp = try exchangeBoundedBufferedHttpRequest(allocator, tls_ptr, tls_ptr.fd, uri, method, extra_headers, body, content_type_override, max_buffered_response_bytes, connect_timeout_ms, response_timeout_ms, false, &reusable);
+                if (h1_pool) |p| p.recordRequestLatency(false, http.event_loop.monotonicMs() - start_ms);
+                return resp;
             },
             .h2 => |conn| {
                 if (h1_pool) |p| p.recordProtocol(true);
@@ -474,6 +490,7 @@ fn executeBufferedViaH2Pool(
                     try path_buf.writer.writeAll(uriComponentBytes(q));
                 }
 
+                const start_ms = http.event_loop.monotonicMs();
                 var h2resp = conn.request(.{
                     .method = method,
                     .scheme = "https",
@@ -493,7 +510,181 @@ fn executeBufferedViaH2Pool(
                 };
                 defer h2resp.deinit();
                 h2_pool.release(conn);
+                if (h1_pool) |p| p.recordRequestLatency(true, http.event_loop.monotonicMs() - start_ms);
                 return h2ResponseToBuffered(allocator, &h2resp);
+            },
+        }
+    }
+    unreachable;
+}
+
+/// Streaming reverse-proxy exchange over the per-origin HTTP/2 pool (#145,
+/// Phase 4b PR 4). Issues the request as one stream on the shared origin
+/// connection and relays DATA frames downstream as they arrive, with bounded
+/// per-stream buffering: the actor replenishes the stream-level flow-control
+/// window only as this relay drains, so a slow downstream client
+/// backpressures its own stream without stalling other streams on the shared
+/// connection (whose connection-level window the reader replenishes promptly).
+///
+/// A failure before any downstream byte evicts the connection and retries once
+/// on connection-level errors (matching the buffered h2 path). Once the
+/// response head has been written downstream, an upstream failure is reported
+/// as an aborted relay (truncated chunked body) rather than an error. When the
+/// origin negotiates HTTP/1.1 via ALPN, the request runs on the h1 streaming
+/// relay over that fresh (unpooled) connection instead.
+fn streamViaH2Pool(
+    allocator: std.mem.Allocator,
+    h2_pool: *http.upstream_h2.H2ConnPool,
+    h1_pool: ?*http.upstream_pool.UpstreamPool,
+    host: []const u8,
+    port: u16,
+    opts: http.tls_termination.UpstreamTlsOptions,
+    uri: std.Uri,
+    method: []const u8,
+    extra_headers: []const std.http.Header,
+    buffered_body: []const u8,
+    read_buf: []u8,
+    downstream_conn: anytype,
+    downstream_writer: anytype,
+    security: *const http.security_headers.SecurityHeaders,
+    sticky_set_cookie: ?[]const u8,
+    correlation_id: []const u8,
+    connect_timeout_ms: u32,
+    read_deadline_ms: u32,
+    cancel_token: ?*const CancellationToken,
+) !StreamingProxyResult {
+    const deadline_ms: u32 = if (read_deadline_ms > 0)
+        read_deadline_ms
+    else if (connect_timeout_ms > 0) connect_timeout_ms else 30_000;
+
+    var key_buf: [300]u8 = undefined;
+    const key = std.fmt.bufPrint(&key_buf, "h2:{s}:{d}", .{ host, port }) catch host;
+
+    var attempt: usize = 0;
+    while (attempt < 2) : (attempt += 1) {
+        const acq = try h2_pool.acquire(key, host, port, opts, deadline_ms);
+        switch (acq) {
+            .h1 => |tls_ptr| {
+                // ALPN negotiated HTTP/1.1: run the h1 streaming relay on this
+                // fresh (unpooled) connection, then tear it down.
+                defer {
+                    tls_ptr.close();
+                    h2_pool.allocator.destroy(tls_ptr);
+                }
+                if (h1_pool) |p| p.recordProtocol(false);
+                const start_ms = http.event_loop.monotonicMs();
+                var wrote_downstream = false;
+                const res = try streamProxyOverTransport(allocator, tls_ptr, tls_ptr.fd, read_buf, uri, method, extra_headers, buffered_body, null, downstream_conn, downstream_writer, security, sticky_set_cookie, correlation_id, connect_timeout_ms, read_deadline_ms, cancel_token, &wrote_downstream);
+                if (h1_pool) |p| p.recordRequestLatency(false, http.event_loop.monotonicMs() - start_ms);
+                return res.result;
+            },
+            .h2 => |conn| {
+                if (h1_pool) |p| p.recordProtocol(true);
+
+                var authority_buf: [300]u8 = undefined;
+                const authority = if (port == 443)
+                    host
+                else
+                    std.fmt.bufPrint(&authority_buf, "{s}:{d}", .{ host, port }) catch host;
+
+                var path_buf: std.Io.Writer.Allocating = .init(allocator);
+                defer path_buf.deinit();
+                const path_component = uriComponentBytes(uri.path);
+                try path_buf.writer.writeAll(if (path_component.len > 0) path_component else "/");
+                if (uri.query) |q| {
+                    try path_buf.writer.writeByte('?');
+                    try path_buf.writer.writeAll(uriComponentBytes(q));
+                }
+
+                const start_ms = http.event_loop.monotonicMs();
+                const stream = conn.requestStreaming(.{
+                    .method = method,
+                    .scheme = "https",
+                    .authority = authority,
+                    .path = path_buf.written(),
+                    .headers = extra_headers,
+                    .body = buffered_body,
+                }) catch |err| {
+                    // Nothing has reached the client yet: evict the dead
+                    // connection so new requests do not pick it, and retry
+                    // once on connection-level failures.
+                    h2_pool.evict(key, conn);
+                    h2_pool.release(conn);
+                    if (attempt == 0 and (err == error.Http2GoAway or err == error.Http2ConnectionClosed or err == error.Http2StreamReset)) {
+                        continue;
+                    }
+                    return err;
+                };
+                const ttfb_ms = http.event_loop.monotonicMs() - start_ms;
+                const status = stream.status.?; // requestStreaming guarantees a status
+
+                const reason = gpres.upstreamReasonPhrase(@enumFromInt(status));
+                const body_allowed = gpres.responseBodyAllowed(method, status);
+                gpres.writeStreamedUpstreamResponseHeadFromHeaders(
+                    downstream_writer,
+                    status,
+                    reason,
+                    stream.headers.items,
+                    body_allowed,
+                    correlation_id,
+                    security,
+                    sticky_set_cookie,
+                ) catch {
+                    conn.finishStreaming(stream); // resets the unfinished stream
+                    h2_pool.release(conn);
+                    return error.ClientAborted;
+                };
+
+                var body_bytes: usize = 0;
+                var aborted = false;
+                if (body_allowed) {
+                    while (true) {
+                        if (cancelStopped(cancel_token)) {
+                            conn.finishStreaming(stream);
+                            h2_pool.release(conn);
+                            return error.RequestCancelled;
+                        }
+                        const n = conn.readStreamingBody(stream, read_buf) catch {
+                            // Upstream failed mid-body after the head went
+                            // downstream: report an aborted relay (the client
+                            // sees the truncated chunked body); other streams
+                            // on the connection are unaffected unless the
+                            // whole connection died (handled below).
+                            aborted = true;
+                            break;
+                        };
+                        if (n == 0) break;
+                        gpres.writeChunk(downstream_writer, read_buf[0..n]) catch {
+                            conn.finishStreaming(stream);
+                            h2_pool.release(conn);
+                            return error.ClientAborted;
+                        };
+                        body_bytes += n;
+                    }
+                    if (!aborted) {
+                        gpres.writeChunk(downstream_writer, "") catch {
+                            conn.finishStreaming(stream);
+                            h2_pool.release(conn);
+                            return error.ClientAborted;
+                        };
+                    }
+                }
+                conn.finishStreaming(stream);
+                // A connection-level failure mid-relay leaves the connection
+                // unhealthy — evict it so new requests reconnect.
+                if (aborted and !conn.healthy()) h2_pool.evict(key, conn);
+                h2_pool.release(conn);
+                if (!aborted) {
+                    if (h1_pool) |p| p.recordRequestLatency(true, http.event_loop.monotonicMs() - start_ms);
+                }
+
+                return .{
+                    .status_code = status,
+                    .reason = reason,
+                    .response_body_bytes = body_bytes,
+                    .upstream_ttfb_ms = ttfb_ms,
+                    .upstream_aborted = aborted,
+                };
             },
         }
     }
@@ -947,8 +1138,9 @@ pub fn executeBoundedBufferedHttpProxyRequest(
         .sni_override = cfg.upstream_tls_server_name,
         .client_cert_path = cfg.upstream_tls_client_cert,
         .client_key_path = cfg.upstream_tls_client_key,
-        // Offer HTTP/2 via ALPN when configured (#145). The streaming path does
-        // not yet speak h2, so this is set on the buffered path only.
+        // Offer HTTP/2 via ALPN when configured (#145). The streaming path
+        // offers h2 too (executeStreamingHttpProxyRequest sets it on its own
+        // TLS options when routing through the h2 pool).
         .offer_h2 = cfg.upstream_protocol.offersH2(),
     } else null;
     const base_timeout_ms = if (attempt_timeout_ms > 0) attempt_timeout_ms else connect_timeout_ms;
@@ -1349,6 +1541,13 @@ fn streamProxyOverTransport(
 /// (issue #141 Phase 3), replacing `std.http.Client`. The upstream connection
 /// is pooled (plain or TLS) and per-phase reads are `poll`-bounded, so the
 /// streaming path inherits the #196 timeout enforcement and #141 reuse.
+///
+/// When `TARDIGRADE_UPSTREAM_PROTOCOL` offers h2 and the target is HTTPS, the
+/// response is multiplexed over the shared per-origin HTTP/2 connection
+/// (#145, Phase 4b PR 4) with bounded per-stream buffering — see
+/// `streamViaH2Pool`. Streaming request bodies (`full` mode uploads) stay on
+/// the HTTP/1.1 path: relaying a slow client upload over the shared h2
+/// connection is deferred.
 pub fn executeStreamingHttpProxyRequest(
     allocator: std.mem.Allocator,
     cfg: *const edge_config.EdgeConfig,
@@ -1371,6 +1570,8 @@ pub fn executeStreamingHttpProxyRequest(
     sticky_set_cookie: ?[]const u8,
     cancel_token: ?*const CancellationToken,
     pool: ?*http.upstream_pool.UpstreamPool,
+    /// Optional per-origin HTTP/2 multiplexing pool (#145).
+    h2_pool: ?*http.upstream_h2.H2ConnPool,
 ) !StreamingProxyResult {
     if (cancelStopped(cancel_token)) return error.RequestCancelled;
 
@@ -1421,6 +1622,21 @@ pub fn executeStreamingHttpProxyRequest(
     const read_buf = try allocator.alloc(u8, @max(cfg.proxy_stream_buffer_size, 16 * 1024));
     defer allocator.free(read_buf);
 
+    // HTTP/2 upstream (#145 PR 4): multiplex the streaming response over the
+    // shared per-origin h2 connection when configured. ALPN h1 origins fall
+    // back inside. Streaming uploads stay on the h1 path below (`offer_h2`
+    // remains false there, so ALPN cannot negotiate a protocol we then would
+    // not speak).
+    if (is_https and streaming_body == null and cfg.upstream_protocol.offersH2()) {
+        if (h2_pool) |hp| {
+            var h2_opts = tls_options.?;
+            h2_opts.offer_h2 = true;
+            return streamViaH2Pool(allocator, hp, pool, host, port, h2_opts, uri, method, extra_headers.items, buffered_body, read_buf, downstream_conn, downstream_writer, security, sticky_set_cookie, correlation_id, connect_timeout_ms, read_deadline_ms, cancel_token);
+        }
+    }
+    // Everything below runs HTTP/1.1 (counted per request, not per attempt).
+    if (pool) |p| p.recordProtocol(false);
+
     const active_pool: ?*http.upstream_pool.UpstreamPool = if (pool) |p| (if (p.config.enabled) p else null) else null;
     var key_buf: [268]u8 = undefined;
     const key = std.fmt.bufPrint(&key_buf, "{s}:{s}:{d}", .{ if (is_https) "https" else "http", host, port }) catch host;
@@ -1467,6 +1683,7 @@ pub fn executeStreamingHttpProxyRequest(
         }
 
         var wrote_downstream = false;
+        const exchange_start_ms = http.event_loop.monotonicMs();
         const fd = conn.stream.handle;
         const res = (if (conn.tls) |tls|
             streamProxyOverTransport(allocator, tls, fd, read_buf, uri, method, extra_headers.items, buffered_body, streaming_body, downstream_conn, downstream_writer, security, sticky_set_cookie, correlation_id, connect_timeout_ms, read_deadline_ms, cancel_token, &wrote_downstream)
@@ -1503,6 +1720,7 @@ pub fn executeStreamingHttpProxyRequest(
             var s = conn.stream;
             s.close();
         }
+        if (pool) |p| p.recordRequestLatency(false, http.event_loop.monotonicMs() - exchange_start_ms);
         return res.result;
     }
 }

@@ -503,6 +503,7 @@ pub fn handleLocationProxyPass(
             sticky_set_cookie,
             if (ctx.lifecycle) |lc| &lc.token else null,
             &state.upstream_pool,
+            &state.h2_pool,
         ) catch |err| {
             state.recordUpstreamAttemptEnd(selection.base_url);
             if (err == error.ClientAborted) {

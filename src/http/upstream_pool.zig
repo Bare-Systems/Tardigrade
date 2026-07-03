@@ -92,6 +92,40 @@ pub const ConnectLatencySnapshot = struct {
     sum_ms: u64,
 };
 
+/// Request-latency histogram buckets (milliseconds, cumulative `le` bounds).
+/// Wider tail than connect latency: a request includes the full response
+/// (buffered read or streaming relay), not just the TCP handshake.
+pub const request_latency_bounds_ms = [_]u64{ 1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 10_000 };
+
+/// One completed-exchange latency histogram (#145 — "upstream p99 by
+/// protocol"). Recorded per negotiated protocol on successful exchanges only,
+/// measured from starting the exchange on an acquired connection to the
+/// response being fully received (buffered path) or fully relayed downstream
+/// (streaming path).
+pub const RequestLatencyHist = struct {
+    /// Per-bucket (non-cumulative) counts; index `bounds.len` is the overflow.
+    buckets: [request_latency_bounds_ms.len + 1]u64 = [_]u64{0} ** (request_latency_bounds_ms.len + 1),
+    count: u64 = 0,
+    sum_ms: u64 = 0,
+
+    fn record(self: *RequestLatencyHist, latency_ms: u64) void {
+        self.count += 1;
+        self.sum_ms += latency_ms;
+        for (request_latency_bounds_ms, 0..) |bound, i| {
+            if (latency_ms <= bound) {
+                self.buckets[i] += 1;
+                return;
+            }
+        }
+        self.buckets[request_latency_bounds_ms.len] += 1;
+    }
+};
+
+pub const RequestLatencySnapshot = struct {
+    h1: RequestLatencyHist,
+    h2: RequestLatencyHist,
+};
+
 const HostEntry = struct {
     idle: std.ArrayList(PooledConn) = .empty,
     stats: HostStats = .{},
@@ -105,6 +139,10 @@ pub const UpstreamPool = struct {
     connect_latency_buckets: [connect_latency_bounds_ms.len + 1]u64 = [_]u64{0} ** (connect_latency_bounds_ms.len + 1),
     connect_latency_count: u64 = 0,
     connect_latency_sum_ms: u64 = 0,
+    /// Completed-exchange latency per negotiated protocol (#145), mutex-guarded
+    /// like the connect-latency histogram.
+    request_latency_h1: RequestLatencyHist = .{},
+    request_latency_h2: RequestLatencyHist = .{},
     /// Upstream requests by negotiated application protocol (#145). Atomic so
     /// the hot proxy path need not take the pool mutex just to count.
     protocol_h1_requests: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
@@ -329,6 +367,24 @@ pub const UpstreamPool = struct {
             .sum_ms = self.connect_latency_sum_ms,
         };
     }
+
+    /// Record one completed upstream exchange for the per-protocol latency
+    /// histogram (#145 — "upstream p99 by protocol").
+    pub fn recordRequestLatency(self: *UpstreamPool, is_h2: bool, latency_ms: u64) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (is_h2) {
+            self.request_latency_h2.record(latency_ms);
+        } else {
+            self.request_latency_h1.record(latency_ms);
+        }
+    }
+
+    pub fn requestLatencySnapshot(self: *UpstreamPool) RequestLatencySnapshot {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return .{ .h1 = self.request_latency_h1, .h2 = self.request_latency_h2 };
+    }
 };
 
 pub fn freeHostSnapshots(allocator: std.mem.Allocator, snaps: []HostSnapshot) void {
@@ -448,6 +504,21 @@ test "reapIdle evicts aged connections and refreshes the gauge" {
     try testing.expectEqual(@as(u64, 1), pool.aggregateStats().idle);
     pool.reapIdle(2000);
     try testing.expectEqual(@as(u64, 0), pool.aggregateStats().idle);
+}
+
+test "request-latency histogram buckets by protocol" {
+    var pool = UpstreamPool.init(testing.allocator, .{});
+    defer pool.deinit();
+    pool.recordRequestLatency(false, 3); // h1, <= 5 bucket
+    pool.recordRequestLatency(true, 40); // h2, <= 50 bucket
+    pool.recordRequestLatency(true, 99_999); // h2, overflow
+
+    const snap = pool.requestLatencySnapshot();
+    try testing.expectEqual(@as(u64, 1), snap.h1.count);
+    try testing.expectEqual(@as(u64, 3), snap.h1.sum_ms);
+    try testing.expectEqual(@as(u64, 1), snap.h1.buckets[1]); // le=5
+    try testing.expectEqual(@as(u64, 2), snap.h2.count);
+    try testing.expectEqual(@as(u64, 1), snap.h2.buckets[request_latency_bounds_ms.len]); // overflow
 }
 
 test "per-host snapshot and connect-latency histogram" {

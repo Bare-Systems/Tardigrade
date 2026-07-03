@@ -42,10 +42,23 @@ fn nowMs() u64 {
 }
 
 const DEFAULT_MAX_FRAME: usize = 16_384;
-/// Receive window we advertise per stream (SETTINGS_INITIAL_WINDOW_SIZE).
+/// Receive window we advertise per stream (SETTINGS_INITIAL_WINDOW_SIZE). For
+/// streaming streams this doubles as the bounded per-stream buffer: the reader
+/// stops replenishing it, so a well-behaved peer can have at most this many
+/// unconsumed bytes buffered per stream.
 const OUR_INITIAL_WINDOW: u31 = 1 << 20;
 /// HTTP/2 default initial flow-control window for a peer that sent no SETTINGS.
 const PROTOCOL_DEFAULT_WINDOW: i64 = 65_535;
+/// Grow the connection-level receive window to this at connection start so the
+/// default 64 KiB aggregate window does not throttle multiplexed transfers.
+/// The reader replenishes the connection window promptly per DATA frame
+/// regardless of consumers, so a slow downstream client never starves other
+/// streams on the shared connection; per-stream memory stays bounded by the
+/// (unreplenished) stream windows.
+const CONN_RECV_WINDOW: i64 = 8 << 20;
+/// How often the reader sweeps for workers blocked past their wait deadline
+/// while frames keep flowing for other streams (see `Stream.wait_deadline_ms`).
+const WAIT_SWEEP_INTERVAL_MS: u64 = 1_000;
 const STREAM_ID: u31 = 1;
 
 pub const H2Error = error{
@@ -55,6 +68,7 @@ pub const H2Error = error{
     Http2ConnectionClosed,
     Http2FrameTooLarge,
     Http2MissingStatus,
+    Http2FlowControlError,
 };
 
 pub const Request = struct {
@@ -405,23 +419,45 @@ fn freeHeaderList(allocator: std.mem.Allocator, list: *std.ArrayList(hpack.Heade
 // ---------------------------------------------------------------------------
 
 /// One in-flight request/response on an `H2Conn`. Heap-owned by the connection
-/// until `request()` reclaims it.
-const Stream = struct {
+/// until `request()` (buffered) or `finishStreaming()` (streaming) reclaims it.
+/// Public so the streaming proxy path can read `status`/`headers` off the
+/// handle returned by `requestStreaming`; all other fields are actor-internal.
+pub const Stream = struct {
     id: u31,
     send_window: i64,
     /// Per-stream completion signal — the reader signals only the waiter for
     /// this stream, avoiding a thundering herd across all in-flight requests.
     cond: compat.Condition = .{},
-    header_block: std.ArrayList(u8) = .empty,
-    awaiting_continuation: bool = false,
     status: ?u16 = null,
     headers: std.ArrayList(hpack.HeaderField) = .empty,
     body: std.ArrayList(u8) = .empty,
     done: bool = false,
     err: ?anyerror = null,
+    /// Streaming mode (#145 PR 4): the reader parks DATA in `body` as a bounded
+    /// buffer and does NOT replenish the stream-level flow-control window; the
+    /// consumer replenishes as it drains via `readStreamingBody`. Buffered
+    /// streams keep the replenish-immediately behaviour.
+    streaming: bool = false,
+    /// Response headers fully decoded (streaming: the head can be relayed; any
+    /// later HEADERS block is a trailer section, which the proxy drops).
+    headers_done: bool = false,
+    /// Consumer read offset into `body` (streaming only).
+    body_read_off: usize = 0,
+    /// Our advertised-but-unreplenished receive window (streaming only). The
+    /// peer overrunning it is a flow-control violation and errors the stream.
+    recv_window: i64 = 0,
+    /// When non-zero, a worker is blocked waiting on this stream and the reader
+    /// must fail the stream with `Http2Timeout` once `nowMs()` passes it (the
+    /// reader extends it on progress). Bounds every wait even when the shared
+    /// connection stays busy with other streams (#196 guarantee).
+    wait_deadline_ms: u64 = 0,
+    /// True once the stream's HEADERS frame reached the wire. Guards
+    /// `finishStreaming`'s RST_STREAM: resetting a stream the peer never saw
+    /// (idle state) would be a connection-level PROTOCOL_ERROR. Written and
+    /// read only by the owning worker thread.
+    wire_opened: bool = false,
 
     fn destroy(self: *Stream, allocator: std.mem.Allocator) void {
-        self.header_block.deinit(allocator);
         freeHeaderList(allocator, &self.headers);
         self.body.deinit(allocator);
         allocator.destroy(self);
@@ -445,6 +481,13 @@ pub fn H2Conn(comptime Transport: type) type {
         state_mutex: compat.Mutex = .{},
         cond: compat.Condition = .{},
         decoder: hpack.Decoder, // reader-thread only
+
+        /// In-flight header-block accumulator (reader-thread only). Blocks
+        /// never interleave across streams, so one buffer serves the whole
+        /// connection; `accum_stream_id`/`accum_end_stream` identify the block.
+        header_accum: std.ArrayList(u8) = .empty,
+        accum_stream_id: u31 = 0,
+        accum_end_stream: bool = false,
 
         /// Age bookkeeping for the idle/lifetime reaper (#145, PR 3). `created_ms`
         /// is fixed at init; `last_activity_ms` is stamped whenever a stream
@@ -514,6 +557,10 @@ pub fn H2Conn(comptime Transport: type) type {
                 .{ 0x2, 0 }, // ENABLE_PUSH = 0
                 .{ 0x4, @as(u32, OUR_INITIAL_WINDOW) },
             });
+            // Grow the connection-level receive window once up front; the
+            // reader keeps it topped up per DATA frame afterwards.
+            const conn_win_inc = windowIncrement(@intCast(CONN_RECV_WINDOW - PROTOCOL_DEFAULT_WINDOW));
+            try frame.writeFrame(self.transport, .window_update, 0, 0, &conn_win_inc);
 
             self.reader = try std.Thread.spawn(.{}, readerLoop, .{self});
             return self;
@@ -541,6 +588,7 @@ pub fn H2Conn(comptime Transport: type) type {
             var it = self.streams.iterator();
             while (it.next()) |e| e.value_ptr.*.destroy(self.allocator);
             self.streams.deinit();
+            self.header_accum.deinit(self.allocator);
             self.decoder.deinit(self.allocator);
             self.transport.close();
             if (self.transport_allocator) |ta| ta.destroy(self.transport);
@@ -564,7 +612,7 @@ pub fn H2Conn(comptime Transport: type) type {
         /// Issue one request and block until its response completes. Safe to
         /// call concurrently from many threads on the same connection.
         pub fn request(self: *Self, req: Request) !Response {
-            const stream = try self.beginStream();
+            const stream = try self.beginStream(false);
             var detached = false;
             errdefer if (!detached) self.dropStream(stream);
 
@@ -572,11 +620,15 @@ pub fn H2Conn(comptime Transport: type) type {
 
             // Wait for the reader to complete or error the stream, then detach
             // it from the map *under the lock* so the reader can no longer touch
-            // its header/body buffers before we move them out.
+            // its header/body buffers before we move them out. The wait deadline
+            // bounds a stalled stream even while the shared connection stays
+            // busy with other streams (the reader extends it on progress).
             self.state_mutex.lock();
+            stream.wait_deadline_ms = nowMs() + self.deadline_ms;
             while (!stream.done and stream.err == null and self.conn_err == null) {
                 stream.cond.wait(&self.state_mutex);
             }
+            stream.wait_deadline_ms = 0;
             const stream_err: ?anyerror = if (stream.err != null) stream.err else self.conn_err;
             _ = self.streams.remove(stream.id);
             if (self.active_streams > 0) self.active_streams -= 1;
@@ -600,7 +652,106 @@ pub fn H2Conn(comptime Transport: type) type {
             return .{ .status = status, .headers = headers, .body = body, .allocator = self.allocator };
         }
 
-        fn beginStream(self: *Self) !*Stream {
+        /// Begin a streaming request (#145 PR 4): send HEADERS(+body) and block
+        /// until the response headers are decoded, then return the stream
+        /// handle. The caller reads `stream.status.?`/`stream.headers.items`
+        /// (stable once this returns — trailers are discarded), drains the body
+        /// with `readStreamingBody`, and MUST call `finishStreaming` exactly
+        /// once when done (on every path, including errors after this returns).
+        ///
+        /// Unlike `request()`, DATA is not buffered without bound: the reader
+        /// parks frames in a per-stream buffer capped by the stream receive
+        /// window, which is only replenished as the caller drains — a slow
+        /// downstream client backpressures its own stream while the connection
+        /// window keeps other streams on the shared connection flowing.
+        pub fn requestStreaming(self: *Self, req: Request) !*Stream {
+            const stream = try self.beginStream(true);
+            errdefer self.finishStreaming(stream);
+
+            try self.sendRequest(stream, req);
+
+            self.state_mutex.lock();
+            stream.wait_deadline_ms = nowMs() + self.deadline_ms;
+            while (!stream.headers_done and !stream.done and stream.err == null and self.conn_err == null) {
+                stream.cond.wait(&self.state_mutex);
+            }
+            stream.wait_deadline_ms = 0;
+            const stream_err: ?anyerror = if (stream.err != null) stream.err else self.conn_err;
+            const status = stream.status;
+            self.state_mutex.unlock();
+
+            if (stream_err) |e| return e;
+            if (status == null) return error.Http2MissingStatus;
+            return stream;
+        }
+
+        /// Copy the next chunk of a streaming response body into `out`,
+        /// blocking (deadline-bounded) until data, end-of-stream, or an error.
+        /// Returns 0 at end of stream. Consuming bytes replenishes the
+        /// stream-level flow-control window so the origin may send more.
+        pub fn readStreamingBody(self: *Self, stream: *Stream, out: []u8) !usize {
+            self.state_mutex.lock();
+            while (true) {
+                const avail = stream.body.items.len - stream.body_read_off;
+                if (avail > 0) {
+                    const n = @min(avail, out.len);
+                    @memcpy(out[0..n], stream.body.items[stream.body_read_off..][0..n]);
+                    stream.body_read_off += n;
+                    if (stream.body_read_off == stream.body.items.len) {
+                        stream.body.clearRetainingCapacity();
+                        stream.body_read_off = 0;
+                    }
+                    stream.recv_window += @as(i64, @intCast(n));
+                    // No more data will arrive once END_STREAM was seen, so the
+                    // window only needs replenishing while the stream is open.
+                    const replenish = !stream.done;
+                    self.state_mutex.unlock();
+                    if (replenish) {
+                        const inc = windowIncrement(n);
+                        self.writeControl(.window_update, 0, stream.id, &inc);
+                    }
+                    return n;
+                }
+                if (stream.err) |e| {
+                    self.state_mutex.unlock();
+                    return e;
+                }
+                if (self.conn_err) |e| {
+                    self.state_mutex.unlock();
+                    return e;
+                }
+                if (stream.done) {
+                    self.state_mutex.unlock();
+                    return 0;
+                }
+                stream.wait_deadline_ms = nowMs() + self.deadline_ms;
+                stream.cond.wait(&self.state_mutex);
+                stream.wait_deadline_ms = 0;
+            }
+        }
+
+        /// Finish a streaming request: detach the stream from the connection,
+        /// reset it upstream if the response had not completed (so the origin
+        /// stops sending on an abandoned stream), free the concurrency slot,
+        /// and destroy the handle. Must be called exactly once per successful
+        /// `requestStreaming`.
+        pub fn finishStreaming(self: *Self, stream: *Stream) void {
+            self.state_mutex.lock();
+            const removed = self.streams.remove(stream.id);
+            if (removed and self.active_streams > 0) self.active_streams -= 1;
+            const need_rst = stream.wire_opened and stream.err == null and !stream.done and self.conn_err == null;
+            const id = stream.id;
+            self.state_mutex.unlock();
+            self.last_activity_ms.store(nowMs(), .monotonic);
+            self.cond.broadcast(); // free a concurrency slot
+            if (need_rst) {
+                const cancel_code = [4]u8{ 0, 0, 0, 8 }; // CANCEL
+                self.writeControl(.rst_stream, 0, id, &cancel_code);
+            }
+            stream.destroy(self.allocator);
+        }
+
+        fn beginStream(self: *Self, streaming: bool) !*Stream {
             self.state_mutex.lock();
             defer self.state_mutex.unlock();
             while (self.active_streams >= self.max_concurrent and self.conn_err == null and !self.goaway) {
@@ -612,7 +763,12 @@ pub fn H2Conn(comptime Transport: type) type {
             const id = self.next_stream_id;
             self.next_stream_id +%= 2;
             const stream = try self.allocator.create(Stream);
-            stream.* = .{ .id = id, .send_window = self.peer_initial_window };
+            stream.* = .{
+                .id = id,
+                .send_window = self.peer_initial_window,
+                .streaming = streaming,
+                .recv_window = if (streaming) @as(i64, OUR_INITIAL_WINDOW) else 0,
+            };
             try self.streams.put(id, stream);
             self.active_streams += 1;
             self.last_activity_ms.store(nowMs(), .monotonic);
@@ -654,11 +810,19 @@ pub fn H2Conn(comptime Transport: type) type {
             defer self.allocator.free(block);
 
             const end_stream = req.body.len == 0;
-            // HEADERS, splitting into CONTINUATION if the block exceeds a frame.
-            self.write_mutex.lock();
-            defer self.write_mutex.unlock();
-            try self.writeHeaderBlockLocked(stream.id, block, end_stream);
-            if (req.body.len > 0) try self.sendBodyLocked(stream, req.body);
+            // HEADERS (+CONTINUATION) must be contiguous on the wire, so the
+            // whole block goes out under one write_mutex hold. DATA frames may
+            // interleave with other streams, so the body sender takes the lock
+            // per frame — and, crucially, never holds it while waiting on
+            // state_mutex for flow-control window (the reader needs write_mutex
+            // for PING/SETTINGS acks; holding both would deadlock it).
+            {
+                self.write_mutex.lock();
+                defer self.write_mutex.unlock();
+                try self.writeHeaderBlockLocked(stream.id, block, end_stream);
+            }
+            stream.wire_opened = true;
+            if (req.body.len > 0) try self.sendBody(stream, req.body);
         }
 
         /// Write a header block as HEADERS (+CONTINUATION) frames. Caller holds
@@ -685,16 +849,21 @@ pub fn H2Conn(comptime Transport: type) type {
             }
         }
 
-        /// Send the request body as flow-controlled DATA frames. Caller holds
-        /// the write mutex; we briefly drop it while waiting for window so the
-        /// reader can apply peer WINDOW_UPDATEs.
-        fn sendBodyLocked(self: *Self, stream: *Stream, full_body: []const u8) !void {
+        /// Send the request body as flow-controlled DATA frames. Waits for send
+        /// window with no lock held, then takes the write mutex per frame so
+        /// concurrent streams' DATA may interleave and the reader is never
+        /// blocked on write_mutex behind a window wait.
+        fn sendBody(self: *Self, stream: *Stream, full_body: []const u8) !void {
             var off: usize = 0;
             while (off < full_body.len) {
-                const budget = self.reserveSendWindow(stream, full_body.len - off) catch |e| return e;
+                const budget = try self.reserveSendWindow(stream, full_body.len - off);
                 const is_last = (off + budget) == full_body.len;
                 const flags: u8 = if (is_last) frame.Flags.END_STREAM else 0;
-                try frame.writeFrame(self.transport, .data, flags, stream.id, full_body[off .. off + budget]);
+                {
+                    self.write_mutex.lock();
+                    defer self.write_mutex.unlock();
+                    try frame.writeFrame(self.transport, .data, flags, stream.id, full_body[off .. off + budget]);
+                }
                 off += budget;
             }
         }
@@ -709,11 +878,16 @@ pub fn H2Conn(comptime Transport: type) type {
                 if (stream.err) |e| return e;
                 const avail = @min(self.conn_send_window, stream.send_window);
                 if (avail > 0) {
+                    stream.wait_deadline_ms = 0;
                     const grant = @min(@as(i64, @intCast(@min(want, DEFAULT_MAX_FRAME))), avail);
                     self.conn_send_window -= grant;
                     stream.send_window -= grant;
                     return @intCast(grant);
                 }
+                // Bound the window wait: the reader's sweep fails this stream
+                // (and broadcasts) if the peer withholds window past the
+                // deadline while other frames keep the connection busy.
+                if (stream.wait_deadline_ms == 0) stream.wait_deadline_ms = nowMs() + self.deadline_ms;
                 self.cond.wait(&self.state_mutex);
             }
         }
@@ -721,6 +895,7 @@ pub fn H2Conn(comptime Transport: type) type {
         // ---- reader thread ----
 
         fn readerLoop(self: *Self) void {
+            var next_sweep_ms: u64 = nowMs() + WAIT_SWEEP_INTERVAL_MS;
             while (true) {
                 {
                     self.state_mutex.lock();
@@ -738,7 +913,39 @@ pub fn H2Conn(comptime Transport: type) type {
                     return;
                 };
                 frame.deinitFrame(self.allocator, &fr);
+
+                // Periodically fail streams whose waiter has been blocked past
+                // its deadline. This bounds every worker wait even when frames
+                // keep flowing for *other* streams on the shared connection (a
+                // totally silent connection is already bounded by the frame
+                // read deadline above).
+                const now = nowMs();
+                if (now >= next_sweep_ms) {
+                    next_sweep_ms = now + WAIT_SWEEP_INTERVAL_MS;
+                    self.sweepStalledWaiters(now);
+                }
             }
+        }
+
+        /// Fail (with `Http2Timeout`) every stream whose waiter registered a
+        /// deadline that has passed without progress. Skips streams that have
+        /// already completed or errored — their waiter is about to wake anyway.
+        fn sweepStalledWaiters(self: *Self, now_ms: u64) void {
+            var timed_out = false;
+            self.state_mutex.lock();
+            var it = self.streams.valueIterator();
+            while (it.next()) |sp| {
+                const s = sp.*;
+                if (s.wait_deadline_ms == 0 or now_ms < s.wait_deadline_ms) continue;
+                if (s.done or s.err != null) continue;
+                s.err = error.Http2Timeout;
+                s.cond.signal();
+                timed_out = true;
+            }
+            self.state_mutex.unlock();
+            // Send-window waiters block on the connection cond, not the stream
+            // cond — wake them so they observe the stream error.
+            if (timed_out) self.cond.broadcast();
         }
 
         fn handleFrame(self: *Self, fr: *frame.Frame) !void {
@@ -747,6 +954,9 @@ pub fn H2Conn(comptime Transport: type) type {
                     if ((fr.flags & frame.Flags.ACK) == 0) {
                         self.applySettings(fr.payload);
                         self.writeControl(.settings, frame.Flags.ACK, 0, &[_]u8{});
+                        // INITIAL_WINDOW_SIZE may have grown stream send
+                        // windows — wake any send-window waiters.
+                        self.cond.broadcast();
                     }
                 },
                 .ping => {
@@ -783,10 +993,15 @@ pub fn H2Conn(comptime Transport: type) type {
                     if (self.pool_rst_counter) |c| _ = c.fetchAdd(1, .monotonic);
                     self.state_mutex.lock();
                     self.rst_received += 1;
-                    const maybe = self.streams.get(fr.stream_id);
-                    if (maybe) |s| s.err = error.Http2StreamReset;
+                    if (self.streams.get(fr.stream_id)) |s| {
+                        s.err = error.Http2StreamReset;
+                        // Signal under the lock: once we unlock, the waiter may
+                        // detach and destroy the stream, so a signal after the
+                        // unlock could touch freed memory.
+                        s.cond.signal();
+                    }
                     self.state_mutex.unlock();
-                    if (maybe) |s| s.cond.signal();
+                    self.cond.broadcast(); // wake send-window waiters on this stream
                 },
                 .headers, .continuation => try self.handleHeaders(fr),
                 .data => try self.handleData(fr),
@@ -797,78 +1012,105 @@ pub fn H2Conn(comptime Transport: type) type {
         fn handleHeaders(self: *Self, fr: *frame.Frame) !void {
             const block = headerBlockFragment(fr.*);
             const end_headers = (fr.flags & frame.Flags.END_HEADERS) != 0;
-            const end_stream = (fr.flags & frame.Flags.END_STREAM) != 0;
 
-            // Accumulate the fragment on the stream (under state lock).
-            self.state_mutex.lock();
-            const maybe_stream = self.streams.get(fr.stream_id);
-            if (maybe_stream) |s| {
-                s.header_block.appendSlice(self.allocator, block) catch {
-                    self.state_mutex.unlock();
-                    return error.OutOfMemory;
-                };
-                s.awaiting_continuation = !end_headers;
+            // Header blocks never interleave on a connection (HEADERS and its
+            // CONTINUATIONs are contiguous, RFC 7540 §4.3), so one reader-owned
+            // accumulator serves all streams — no state lock needed for it.
+            // END_STREAM is only meaningful on the HEADERS frame, so capture it
+            // there (a CONTINUATION-terminated block must not lose it).
+            if (fr.typ == .headers) {
+                self.header_accum.clearRetainingCapacity();
+                self.accum_stream_id = fr.stream_id;
+                self.accum_end_stream = (fr.flags & frame.Flags.END_STREAM) != 0;
+            } else if (fr.stream_id != self.accum_stream_id) {
+                return; // stray CONTINUATION for a block we are not assembling
             }
-            self.state_mutex.unlock();
-            if (maybe_stream == null) return; // unknown/closed stream — ignore
-
+            try self.header_accum.appendSlice(self.allocator, block);
             if (!end_headers) return; // wait for CONTINUATION
 
-            // Decode the complete block with the connection-wide decoder (this
-            // thread is the only decoder user). Copy out the block first so we
-            // do not hold the state lock across decode.
-            const s = maybe_stream.?;
-            self.state_mutex.lock();
-            const owned_block = self.allocator.dupe(u8, s.header_block.items) catch {
-                self.state_mutex.unlock();
-                return error.OutOfMemory;
-            };
-            s.header_block.clearRetainingCapacity();
-            self.state_mutex.unlock();
-            defer self.allocator.free(owned_block);
-
-            var decoded = try self.decoder.decode(self.allocator, owned_block);
+            // Decode with the connection-wide decoder even when the stream is
+            // gone (completed/abandoned): skipping a block would desynchronize
+            // the HPACK dynamic table for every later response on this
+            // connection. This thread is the only decoder user.
+            var decoded = try self.decoder.decode(self.allocator, self.header_accum.items);
             defer hpack.deinitDecoded(self.allocator, &decoded);
+            self.header_accum.clearRetainingCapacity();
+            const stream_end = self.accum_end_stream;
 
             self.state_mutex.lock();
-            defer {
-                self.state_mutex.unlock();
-                s.cond.signal();
-            }
-            for (decoded.headers) |h| {
-                if (std.mem.eql(u8, h.name, ":status")) {
-                    if (s.status == null) s.status = std.fmt.parseInt(u16, h.value, 10) catch null;
-                    continue;
+            defer self.state_mutex.unlock();
+            const s = self.streams.get(self.accum_stream_id) orelse return;
+            if (!s.headers_done) {
+                for (decoded.headers) |h| {
+                    if (std.mem.eql(u8, h.name, ":status")) {
+                        if (s.status == null) s.status = std.fmt.parseInt(u16, h.value, 10) catch null;
+                        continue;
+                    }
+                    if (h.name.len > 0 and h.name[0] == ':') continue;
+                    s.headers.append(self.allocator, .{
+                        .name = try self.allocator.dupe(u8, h.name),
+                        .value = try self.allocator.dupe(u8, h.value),
+                    }) catch return error.OutOfMemory;
                 }
-                if (h.name.len > 0 and h.name[0] == ':') continue;
-                s.headers.append(self.allocator, .{
-                    .name = try self.allocator.dupe(u8, h.name),
-                    .value = try self.allocator.dupe(u8, h.value),
-                }) catch return error.OutOfMemory;
+                if (s.status != null) s.headers_done = true;
             }
-            if (end_stream) s.done = true;
+            // else: a trailer section — dropped (the proxy does not forward
+            // trailers), but decoded above for HPACK table consistency.
+            if (stream_end) s.done = true;
+            if (s.wait_deadline_ms != 0) s.wait_deadline_ms = nowMs() + self.deadline_ms;
+            // Signal under the lock: after unlock the waiter may detach and
+            // destroy the stream.
+            s.cond.signal();
         }
 
         fn handleData(self: *Self, fr: *frame.Frame) !void {
             const end_stream = (fr.flags & frame.Flags.END_STREAM) != 0;
             self.state_mutex.lock();
             const maybe_stream = self.streams.get(fr.stream_id);
+            var replenish_stream = true;
+            var flow_violation = false;
             if (maybe_stream) |s| {
-                if (fr.payload.len > 0) s.body.appendSlice(self.allocator, fr.payload) catch {
-                    self.state_mutex.unlock();
-                    return error.OutOfMemory;
-                };
+                var deliver = fr.payload.len > 0;
+                if (deliver and s.streaming) {
+                    // Bounded-buffer backpressure: account the bytes against
+                    // the advertised stream window; the consumer replenishes
+                    // it as it drains (`readStreamingBody`). A peer that
+                    // overruns the window is violating flow control — fail
+                    // the stream rather than buffer without bound.
+                    replenish_stream = false;
+                    s.recv_window -= @as(i64, @intCast(fr.payload.len));
+                    if (s.recv_window < 0) {
+                        if (s.err == null) s.err = error.Http2FlowControlError;
+                        flow_violation = true;
+                        deliver = false;
+                    }
+                }
+                if (deliver) {
+                    s.body.appendSlice(self.allocator, fr.payload) catch {
+                        self.state_mutex.unlock();
+                        return error.OutOfMemory;
+                    };
+                }
                 if (end_stream) s.done = true;
+                if (s.wait_deadline_ms != 0) s.wait_deadline_ms = nowMs() + self.deadline_ms;
+                // Signal under the lock: after unlock the waiter may detach and
+                // destroy the stream.
+                s.cond.signal();
             }
             self.state_mutex.unlock();
+            // Send-window waiters block on the connection cond.
+            if (flow_violation) self.cond.broadcast();
 
             if (fr.payload.len > 0) {
-                // Replenish our receive window so the origin keeps sending.
+                // Always replenish the connection window promptly — one slow
+                // consumer must never stall other streams on the shared
+                // connection. The stream window is replenished here only for
+                // buffered streams (and unknown/completed streams, harmless);
+                // streaming streams replenish on consumer drain.
                 const inc = windowIncrement(fr.payload.len);
                 self.writeControl(.window_update, 0, 0, &inc);
-                self.writeControl(.window_update, 0, fr.stream_id, &inc);
+                if (replenish_stream) self.writeControl(.window_update, 0, fr.stream_id, &inc);
             }
-            if (maybe_stream) |s| s.cond.signal();
         }
 
         fn applySettings(self: *Self, payload: []const u8) void {
@@ -1494,6 +1736,333 @@ test "reader bumps the pool GOAWAY counter on a connection GOAWAY" {
     try testing.expect(saw_goaway);
     try testing.expectEqual(@as(u64, 1), goaway.load(.monotonic));
     try testing.expectEqual(@as(u64, 0), rst.load(.monotonic));
+}
+
+/// Canned server for the streaming round-trip test: answers the first request
+/// HEADERS with response HEADERS + DATA("part1"), then *waits for a
+/// stream-level WINDOW_UPDATE* — which only the draining consumer sends on a
+/// streaming stream — before finishing with DATA("part2", END_STREAM). The
+/// client making progress past part1 therefore proves consumer-driven
+/// stream-window replenishment.
+fn cannedStreamingServer(peer_fd: std.posix.fd_t) void {
+    const a = std.heap.page_allocator;
+    var srv = PlainTransport{ .fd = peer_fd };
+    var preface: [PREFACE.len]u8 = undefined;
+    readExact(&srv, peer_fd, preface[0..], 2000) catch return;
+    frame.writeSettings(a, &srv, &[_][2]u32{}) catch return;
+
+    var req_stream: u31 = 0;
+    while (req_stream == 0) {
+        var fr = readFrameBounded(&srv, peer_fd, a, 2000) catch return;
+        if (fr.typ == .headers) req_stream = fr.stream_id;
+        frame.deinitFrame(a, &fr);
+    }
+
+    const block = hpack.encodeLiteralHeaderBlock(a, &[_]hpack.HeaderField{
+        .{ .name = ":status", .value = "200" },
+        .{ .name = "content-type", .value = "text/plain" },
+    }) catch return;
+    defer a.free(block);
+    frame.writeFrame(&srv, .headers, frame.Flags.END_HEADERS, req_stream, block) catch return;
+    frame.writeFrame(&srv, .data, 0, req_stream, "part1") catch return;
+
+    // Block until the consumer's drain replenishes the stream window.
+    while (true) {
+        var fr = readFrameBounded(&srv, peer_fd, a, 5000) catch return;
+        const is_stream_wu = fr.typ == .window_update and fr.stream_id == req_stream;
+        frame.deinitFrame(a, &fr);
+        if (is_stream_wu) break;
+    }
+    frame.writeFrame(&srv, .data, frame.Flags.END_STREAM, req_stream, "part2") catch return;
+}
+
+test "streaming request relays a multi-frame body with consumer-driven window replenishment" {
+    const fds = try makeSocketpair();
+    const server = try std.Thread.spawn(.{}, cannedStreamingServer, .{fds[1]});
+
+    var transport = PlainTransport{ .fd = fds[0] };
+    const conn = try H2Conn(*PlainTransport).init(testing.allocator, &transport, fds[0], 3000, null, null, null);
+
+    const stream = try conn.requestStreaming(.{ .method = "GET", .authority = "stream.test", .path = "/" });
+    try testing.expectEqual(@as(u16, 200), stream.status.?);
+    var saw_content_type = false;
+    for (stream.headers.items) |h| {
+        if (std.mem.eql(u8, h.name, "content-type")) saw_content_type = true;
+    }
+
+    var got: std.ArrayList(u8) = .empty;
+    defer got.deinit(testing.allocator);
+    var buf: [4]u8 = undefined; // deliberately tiny: multiple reads per frame
+    while (true) {
+        const n = try conn.readStreamingBody(stream, buf[0..]);
+        if (n == 0) break;
+        try got.appendSlice(testing.allocator, buf[0..n]);
+    }
+    conn.finishStreaming(stream);
+
+    try testing.expect(saw_content_type);
+    try testing.expectEqualStrings("part1part2", got.items);
+    try testing.expectEqual(@as(u32, 0), conn.activeStreamCount());
+    try testing.expect(conn.healthy());
+
+    conn.deinit();
+    server.join();
+    _ = std.c.close(fds[1]);
+}
+
+/// Canned server: HEADERS + DATA + a trailer HEADERS block (END_STREAM). The
+/// trailer fields must be decoded (HPACK table consistency) but discarded.
+fn cannedTrailerServer(peer_fd: std.posix.fd_t) void {
+    const a = std.heap.page_allocator;
+    var srv = PlainTransport{ .fd = peer_fd };
+    var preface: [PREFACE.len]u8 = undefined;
+    readExact(&srv, peer_fd, preface[0..], 2000) catch return;
+    frame.writeSettings(a, &srv, &[_][2]u32{}) catch return;
+
+    var req_stream: u31 = 0;
+    while (req_stream == 0) {
+        var fr = readFrameBounded(&srv, peer_fd, a, 2000) catch return;
+        if (fr.typ == .headers) req_stream = fr.stream_id;
+        frame.deinitFrame(a, &fr);
+    }
+
+    const head = hpack.encodeLiteralHeaderBlock(a, &[_]hpack.HeaderField{
+        .{ .name = ":status", .value = "200" },
+    }) catch return;
+    defer a.free(head);
+    frame.writeFrame(&srv, .headers, frame.Flags.END_HEADERS, req_stream, head) catch return;
+    frame.writeFrame(&srv, .data, 0, req_stream, "payload") catch return;
+    const trailers = hpack.encodeLiteralHeaderBlock(a, &[_]hpack.HeaderField{
+        .{ .name = "x-checksum", .value = "abc123" },
+    }) catch return;
+    defer a.free(trailers);
+    frame.writeFrame(&srv, .headers, frame.Flags.END_HEADERS | frame.Flags.END_STREAM, req_stream, trailers) catch return;
+}
+
+test "streaming response trailers end the stream and are discarded" {
+    const fds = try makeSocketpair();
+    const server = try std.Thread.spawn(.{}, cannedTrailerServer, .{fds[1]});
+
+    var transport = PlainTransport{ .fd = fds[0] };
+    const conn = try H2Conn(*PlainTransport).init(testing.allocator, &transport, fds[0], 3000, null, null, null);
+
+    const stream = try conn.requestStreaming(.{ .method = "GET", .authority = "trailer.test", .path = "/" });
+    try testing.expectEqual(@as(u16, 200), stream.status.?);
+
+    var got: std.ArrayList(u8) = .empty;
+    defer got.deinit(testing.allocator);
+    var buf: [64]u8 = undefined;
+    while (true) {
+        const n = try conn.readStreamingBody(stream, buf[0..]);
+        if (n == 0) break;
+        try got.appendSlice(testing.allocator, buf[0..n]);
+    }
+    try testing.expectEqualStrings("payload", got.items);
+    for (stream.headers.items) |h| {
+        try testing.expect(!std.mem.eql(u8, h.name, "x-checksum"));
+    }
+    conn.finishStreaming(stream);
+    conn.deinit();
+    server.join();
+    _ = std.c.close(fds[1]);
+}
+
+/// Canned server that violates flow control: sends OUR_INITIAL_WINDOW bytes of
+/// DATA (filling the advertised stream window exactly) plus one more frame
+/// beyond it without waiting for replenishment, then a PING whose ACK proves
+/// the client's reader has processed every prior frame. `saw_ack` is set once
+/// the ACK arrives so the test can start consuming deterministically.
+fn cannedFlowViolationServer(peer_fd: std.posix.fd_t, saw_ack: *std.atomic.Value(bool)) void {
+    const a = std.heap.page_allocator;
+    var srv = PlainTransport{ .fd = peer_fd };
+    var preface: [PREFACE.len]u8 = undefined;
+    readExact(&srv, peer_fd, preface[0..], 2000) catch return;
+    frame.writeSettings(a, &srv, &[_][2]u32{}) catch return;
+
+    var req_stream: u31 = 0;
+    while (req_stream == 0) {
+        var fr = readFrameBounded(&srv, peer_fd, a, 2000) catch return;
+        if (fr.typ == .headers) req_stream = fr.stream_id;
+        frame.deinitFrame(a, &fr);
+    }
+
+    const head = hpack.encodeLiteralHeaderBlock(a, &[_]hpack.HeaderField{
+        .{ .name = ":status", .value = "200" },
+    }) catch return;
+    defer a.free(head);
+    frame.writeFrame(&srv, .headers, frame.Flags.END_HEADERS, req_stream, head) catch return;
+
+    const chunk = [_]u8{'x'} ** DEFAULT_MAX_FRAME;
+    var sent: usize = 0;
+    while (sent < OUR_INITIAL_WINDOW) : (sent += chunk.len) {
+        frame.writeFrame(&srv, .data, 0, req_stream, chunk[0..]) catch return;
+    }
+    // One frame past the advertised window: a flow-control violation.
+    frame.writeFrame(&srv, .data, 0, req_stream, chunk[0..]) catch return;
+
+    const ping_payload = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    frame.writeFrame(&srv, .ping, 0, 0, ping_payload[0..]) catch return;
+    while (true) {
+        var fr = readFrameBounded(&srv, peer_fd, a, 5000) catch return;
+        const is_ack = fr.typ == .ping and (fr.flags & frame.Flags.ACK) != 0;
+        frame.deinitFrame(a, &fr);
+        if (is_ack) {
+            saw_ack.store(true, .release);
+            return;
+        }
+    }
+}
+
+test "streaming stream fails when the peer overruns the advertised window" {
+    const fds = try makeSocketpair();
+    var saw_ack = std.atomic.Value(bool).init(false);
+    const server = try std.Thread.spawn(.{}, cannedFlowViolationServer, .{ fds[1], &saw_ack });
+
+    var transport = PlainTransport{ .fd = fds[0] };
+    const conn = try H2Conn(*PlainTransport).init(testing.allocator, &transport, fds[0], 5000, null, null, null);
+
+    const stream = try conn.requestStreaming(.{ .method = "GET", .authority = "flood.test", .path = "/" });
+
+    // Wait (bounded spin) until the reader has processed every frame the
+    // server sent — including the over-window one — so the violation is
+    // recorded before we start draining (draining replenishes the window).
+    var spins: usize = 0;
+    while (!saw_ack.load(.acquire) and spins < 100_000_000) : (spins += 1) std.Thread.yield() catch {};
+    try testing.expect(saw_ack.load(.acquire));
+
+    // The in-window megabyte drains fine; the overrun then surfaces as a
+    // flow-control error rather than unbounded buffering.
+    var total: usize = 0;
+    var buf: [32 * 1024]u8 = undefined;
+    const read_err = while (true) {
+        const n = conn.readStreamingBody(stream, buf[0..]) catch |e| break e;
+        try testing.expect(n != 0); // stream must not end cleanly
+        total += n;
+    };
+    try testing.expectEqual(@as(usize, OUR_INITIAL_WINDOW), total);
+    try testing.expectError(error.Http2FlowControlError, @as(anyerror!void, read_err));
+
+    conn.finishStreaming(stream);
+    conn.deinit();
+    server.join();
+    _ = std.c.close(fds[1]);
+}
+
+/// Canned server: response HEADERS then silence on the stream while PING
+/// frames keep the connection's reader busy — the stalled stream must be
+/// failed by the wait-deadline sweep, not the whole-connection read timeout.
+fn cannedStallServer(peer_fd: std.posix.fd_t, stop: *std.atomic.Value(bool)) void {
+    const a = std.heap.page_allocator;
+    var srv = PlainTransport{ .fd = peer_fd };
+    var preface: [PREFACE.len]u8 = undefined;
+    readExact(&srv, peer_fd, preface[0..], 2000) catch return;
+    frame.writeSettings(a, &srv, &[_][2]u32{}) catch return;
+
+    var req_stream: u31 = 0;
+    while (req_stream == 0) {
+        var fr = readFrameBounded(&srv, peer_fd, a, 2000) catch return;
+        if (fr.typ == .headers) req_stream = fr.stream_id;
+        frame.deinitFrame(a, &fr);
+    }
+    const head = hpack.encodeLiteralHeaderBlock(a, &[_]hpack.HeaderField{
+        .{ .name = ":status", .value = "200" },
+    }) catch return;
+    defer a.free(head);
+    frame.writeFrame(&srv, .headers, frame.Flags.END_HEADERS, req_stream, head) catch return;
+
+    // Keep frames flowing (but never DATA for the stream) until told to stop.
+    const ping_payload = [_]u8{0} ** 8;
+    var i: usize = 0;
+    while (!stop.load(.acquire) and i < 10_000) : (i += 1) {
+        frame.writeFrame(&srv, .ping, 0, 0, ping_payload[0..]) catch return;
+        std.Io.sleep(compat.io(), .fromMilliseconds(20), .awake) catch {}; // pacing only, not asserted on
+    }
+}
+
+test "stalled streaming stream times out via the reader sweep while other frames flow" {
+    const fds = try makeSocketpair();
+    var stop = std.atomic.Value(bool).init(false);
+    const server = try std.Thread.spawn(.{}, cannedStallServer, .{ fds[1], &stop });
+
+    var transport = PlainTransport{ .fd = fds[0] };
+    // Short stream deadline; PINGs every 20ms keep the reader's frame reads
+    // alive, so only the sweep can bound the body wait.
+    const conn = try H2Conn(*PlainTransport).init(testing.allocator, &transport, fds[0], 300, null, null, null);
+
+    const stream = try conn.requestStreaming(.{ .method = "GET", .authority = "stall.test", .path = "/" });
+    var buf: [64]u8 = undefined;
+    const res = conn.readStreamingBody(stream, buf[0..]);
+    try testing.expectError(error.Http2Timeout, res);
+    // The stream timed out — the connection itself must still be healthy.
+    try testing.expect(conn.healthy());
+
+    conn.finishStreaming(stream);
+    stop.store(true, .release);
+    conn.deinit();
+    server.join();
+    _ = std.c.close(fds[1]);
+}
+
+const MuxStreamingClientCtx = struct {
+    conn: *H2Conn(*PlainTransport),
+    idx: usize,
+    ok: bool = false,
+};
+
+fn muxStreamingClientThread(ctx: *MuxStreamingClientCtx) void {
+    var path_buf: [32]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "/sreq{d}", .{ctx.idx}) catch return;
+    const stream = ctx.conn.requestStreaming(.{
+        .method = "GET",
+        .authority = "mux.test",
+        .path = path,
+    }) catch return;
+    defer ctx.conn.finishStreaming(stream);
+    if (stream.status != 200) return;
+
+    var got_buf: [64]u8 = undefined;
+    var got_len: usize = 0;
+    while (true) {
+        const n = ctx.conn.readStreamingBody(stream, got_buf[got_len..]) catch return;
+        if (n == 0) break;
+        got_len += n;
+    }
+    ctx.ok = std.mem.eql(u8, got_buf[0..got_len], path);
+}
+
+test "streaming and buffered requests multiplex together on one connection" {
+    const N_BUF = 4;
+    const N_STREAM = 4;
+    const fds = try makeSocketpair();
+    const server = try std.Thread.spawn(.{}, cannedMuxServer, .{ fds[1], @as(usize, N_BUF + N_STREAM) });
+
+    var transport = PlainTransport{ .fd = fds[0] };
+    const conn = try H2Conn(*PlainTransport).init(testing.allocator, &transport, fds[0], 3000, null, null, null);
+
+    var bctxs: [N_BUF]MuxClientCtx = undefined;
+    var sctxs: [N_STREAM]MuxStreamingClientCtx = undefined;
+    var threads: [N_BUF + N_STREAM]std.Thread = undefined;
+    for (0..N_BUF) |i| {
+        bctxs[i] = .{ .conn = conn, .idx = i };
+        threads[i] = try std.Thread.spawn(.{}, muxClientThread, .{&bctxs[i]});
+    }
+    for (0..N_STREAM) |i| {
+        sctxs[i] = .{ .conn = conn, .idx = i };
+        threads[N_BUF + i] = try std.Thread.spawn(.{}, muxStreamingClientThread, .{&sctxs[i]});
+    }
+    for (threads) |t| t.join();
+
+    var all_ok = true;
+    for (bctxs) |c| {
+        if (!c.ok) all_ok = false;
+    }
+    for (sctxs) |c| {
+        if (!c.ok) all_ok = false;
+    }
+    conn.deinit();
+    server.join();
+    _ = std.c.close(fds[1]);
+    try testing.expect(all_ok);
 }
 
 test "h2 exchange round-trips a request and response over a socketpair" {

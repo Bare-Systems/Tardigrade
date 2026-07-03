@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import socket
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
@@ -57,6 +58,23 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/health":
             body = b"ok"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "keep-alive")
+            self.end_headers()
+            if send_body:
+                self.wfile.write(body)
+                self.wfile.flush()
+            return
+
+        if path == "/slow":
+            # Hold the request for ?ms= milliseconds before answering — used by
+            # benchmarks/upstream-reuse.sh to demonstrate the per-origin active
+            # cap (#239): slow responses keep connections checked out.
+            delay_ms = int(query.get("ms", ["100"])[0] or "100")
+            time.sleep(delay_ms / 1000.0)
+            body = b"slow-ok"
             self.send_response(200)
             self.send_header("Content-Type", "text/plain")
             self.send_header("Content-Length", str(len(body)))

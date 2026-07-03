@@ -27,6 +27,13 @@ pub const Config = struct {
     idle_timeout_ms: u64 = 90_000,
     /// Hard cap on total connection age (0 = unlimited).
     max_lifetime_ms: u64 = 0,
+    /// Hard cap on concurrently checked-out connections per origin
+    /// (0 = unlimited). Enforced **fail-fast** (#239): `checkout`/`reserveSlot`
+    /// return `error.UpstreamAtCapacity` instead of queueing, and the proxy
+    /// maps it to 503 `upstream_saturated`. In the thread-per-connection
+    /// worker model, blocking here would let one slow origin absorb the whole
+    /// worker pool — queueing/watermark semantics are #140's scope.
+    max_active_per_host: usize = 0,
 };
 
 /// Identifier of the worker thread that last released a connection. Used purely
@@ -60,6 +67,8 @@ pub const HostStats = struct {
     reused_local_total: u64 = 0,
     reused_cross_worker_total: u64 = 0,
     stale_retries_total: u64 = 0,
+    /// Checkouts rejected fail-fast at `max_active_per_host` (#239).
+    at_capacity_total: u64 = 0,
     active: u64 = 0,
     idle: u64 = 0,
 };
@@ -71,6 +80,7 @@ pub const Stats = struct {
     reused_local_total: u64 = 0,
     reused_cross_worker_total: u64 = 0,
     stale_retries_total: u64 = 0,
+    at_capacity_total: u64 = 0,
     idle: u64 = 0,
     active: u64 = 0,
 };
@@ -198,14 +208,28 @@ pub const UpstreamPool = struct {
         return gop.value_ptr;
     }
 
-    /// Take a still-fresh idle connection for `key`, dropping any that have aged
-    /// out. On success the connection becomes `active` and the caller owns the
-    /// fd until it calls `release`.
-    pub fn acquire(self: *UpstreamPool, key: []const u8, now_ms: u64) ?PooledConn {
+    /// Reuse-or-reserve checkout with fail-fast active-cap enforcement (#239).
+    /// Returns a still-fresh pooled connection (now counted `active`), or null
+    /// after **reserving** an active slot for the caller to open a fresh
+    /// connection — on that path the caller MUST call `noteNewConnection` once
+    /// connected, or `releaseSlot` if the connect fails, so the reservation is
+    /// not leaked. Reserving before connecting (rather than counting after) is
+    /// what makes the cap a real hard cap: concurrent callers cannot race past
+    /// it during their connect/handshake window.
+    ///
+    /// When the pool is disabled, returns null without reserving (the caller's
+    /// fresh connection is untracked, as before). At `max_active_per_host`
+    /// the checkout fails fast with `error.UpstreamAtCapacity` instead of
+    /// queueing; see `Config.max_active_per_host` for the rationale.
+    pub fn checkout(self: *UpstreamPool, key: []const u8, now_ms: u64) error{UpstreamAtCapacity}!?PooledConn {
         if (!self.config.enabled) return null;
         self.mutex.lock();
         defer self.mutex.unlock();
-        const entry = self.hosts.getPtr(key) orelse return null;
+        const entry = self.hostEntry(key) orelse return null; // OOM: proceed untracked
+        if (self.config.max_active_per_host > 0 and entry.stats.active >= self.config.max_active_per_host) {
+            entry.stats.at_capacity_total += 1;
+            return error.UpstreamAtCapacity;
+        }
         while (entry.idle.pop()) |conn| {
             if (self.isExpired(conn, now_ms)) {
                 self.closeConn(conn);
@@ -218,19 +242,46 @@ pub const UpstreamPool = struct {
                 entry.stats.reused_cross_worker_total += 1;
             }
             entry.stats.active += 1;
+            entry.stats.idle = entry.idle.items.len;
             return conn;
         }
+        entry.stats.idle = 0;
+        entry.stats.active += 1; // reservation for the caller's fresh connection
         return null;
     }
 
-    /// Record that the caller opened a fresh connection for `key` (an idle-pool
-    /// miss). The connection is `active` until `release`.
+    /// Reserve an active slot for a fresh connection without considering idle
+    /// reuse (the stale-retry path deliberately wants a new connection). Same
+    /// contract as `checkout`'s null return: pair with `noteNewConnection` or
+    /// `releaseSlot`.
+    pub fn reserveSlot(self: *UpstreamPool, key: []const u8) error{UpstreamAtCapacity}!void {
+        if (!self.config.enabled) return;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const entry = self.hostEntry(key) orelse return;
+        if (self.config.max_active_per_host > 0 and entry.stats.active >= self.config.max_active_per_host) {
+            entry.stats.at_capacity_total += 1;
+            return error.UpstreamAtCapacity;
+        }
+        entry.stats.active += 1;
+    }
+
+    /// Undo a `checkout`/`reserveSlot` reservation after a fresh connect
+    /// failed. No-op for untracked (disabled/OOM) checkouts.
+    pub fn releaseSlot(self: *UpstreamPool, key: []const u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const entry = self.hosts.getPtr(key) orelse return;
+        if (entry.stats.active > 0) entry.stats.active -= 1;
+    }
+
+    /// Record that the caller opened a fresh connection for `key`. The active
+    /// slot was already reserved by `checkout`/`reserveSlot`; this only counts.
     pub fn noteNewConnection(self: *UpstreamPool, key: []const u8) void {
         self.mutex.lock();
         defer self.mutex.unlock();
         const entry = self.hostEntry(key) orelse return;
         entry.stats.new_total += 1;
-        entry.stats.active += 1;
     }
 
     /// Hand a checked-out connection back. It is returned to the idle pool when
@@ -315,6 +366,7 @@ pub const UpstreamPool = struct {
             agg.reused_local_total += s.reused_local_total;
             agg.reused_cross_worker_total += s.reused_cross_worker_total;
             agg.stale_retries_total += s.stale_retries_total;
+            agg.at_capacity_total += s.at_capacity_total;
             agg.active += s.active;
             agg.idle += entry.value_ptr.idle.items.len;
         }
@@ -400,11 +452,34 @@ fn testPair() ![2]std.posix.fd_t {
     return fds;
 }
 
-test "acquire returns null on an empty pool" {
+test "checkout on an empty pool reserves a slot for a fresh connection" {
     var pool = UpstreamPool.init(testing.allocator, .{});
     defer pool.deinit();
-    try testing.expect(pool.acquire("a:1", 1000) == null);
-    try testing.expectEqual(@as(u64, 0), pool.aggregateStats().reused_total);
+    try testing.expect((try pool.checkout("a:1", 1000)) == null);
+    var agg = pool.aggregateStats();
+    try testing.expectEqual(@as(u64, 0), agg.reused_total);
+    try testing.expectEqual(@as(u64, 1), agg.active); // the reservation
+    pool.releaseSlot("a:1"); // fresh connect "failed" — undo
+    agg = pool.aggregateStats();
+    try testing.expectEqual(@as(u64, 0), agg.active);
+}
+
+test "max_active_per_host fails checkout fast and counts at_capacity" {
+    var pool = UpstreamPool.init(testing.allocator, .{ .max_active_per_host = 2 });
+    defer pool.deinit();
+    try testing.expect((try pool.checkout("h:80", 0)) == null); // reserve 1
+    try pool.reserveSlot("h:80"); // reserve 2 — at the cap now
+    try testing.expectError(error.UpstreamAtCapacity, pool.checkout("h:80", 0));
+    try testing.expectError(error.UpstreamAtCapacity, pool.reserveSlot("h:80"));
+    const agg = pool.aggregateStats();
+    try testing.expectEqual(@as(u64, 2), agg.active);
+    try testing.expectEqual(@as(u64, 2), agg.at_capacity_total);
+    // Releasing one slot frees capacity again.
+    pool.releaseSlot("h:80");
+    try testing.expect((try pool.checkout("h:80", 0)) == null);
+    // Other origins are unaffected by this origin's saturation.
+    try testing.expect((try pool.checkout("other:80", 0)) == null);
+    pool.releaseSlot("other:80");
 }
 
 test "new connection then release pools it; acquire reuses and tracks active" {
@@ -413,6 +488,7 @@ test "new connection then release pools it; acquire reuses and tracks active" {
     const fds = try testPair();
     defer _ = std.c.close(fds[1]);
 
+    try testing.expect((try pool.checkout("h:80", 1000)) == null); // reserve
     pool.noteNewConnection("h:80");
     try testing.expectEqual(@as(u64, 1), pool.aggregateStats().active);
     pool.release("h:80", .{ .stream = compat.netStreamFromFd(fds[0]), .created_ms = 1000, .last_used_ms = 1000 }, true, 1000);
@@ -422,7 +498,7 @@ test "new connection then release pools it; acquire reuses and tracks active" {
     try testing.expectEqual(@as(u64, 1), agg.idle);
     try testing.expectEqual(@as(u64, 1), agg.new_total);
 
-    const got = pool.acquire("h:80", 1500) orelse return error.TestExpectedReuse;
+    const got = (try pool.checkout("h:80", 1500)) orelse return error.TestExpectedReuse;
     try testing.expectEqual(fds[0], got.stream.handle);
     agg = pool.aggregateStats();
     try testing.expectEqual(@as(u64, 1), agg.reused_total);
@@ -438,10 +514,11 @@ test "reuse on the releasing thread counts as local" {
     const fds = try testPair();
     defer _ = std.c.close(fds[1]);
 
+    try pool.reserveSlot("h:80");
     pool.noteNewConnection("h:80");
     pool.release("h:80", .{ .stream = compat.netStreamFromFd(fds[0]), .created_ms = 0, .last_used_ms = 0 }, true, 0);
     // Same thread reclaims it → local reuse.
-    const got = pool.acquire("h:80", 1) orelse return error.TestExpectedReuse;
+    const got = (try pool.checkout("h:80", 1)) orelse return error.TestExpectedReuse;
     const agg = pool.aggregateStats();
     try testing.expectEqual(@as(u64, 1), agg.reused_total);
     try testing.expectEqual(@as(u64, 1), agg.reused_local_total);
@@ -457,11 +534,12 @@ test "reuse after a different worker parked it counts as cross-worker" {
 
     // Simulate a connection parked by another worker: release stamps the current
     // thread id, so forge a different one directly on the idle entry.
+    try pool.reserveSlot("h:80");
     pool.noteNewConnection("h:80");
     pool.release("h:80", .{ .stream = compat.netStreamFromFd(fds[0]), .created_ms = 0, .last_used_ms = 0 }, true, 0);
     pool.hosts.getPtr("h:80").?.idle.items[0].released_by = currentWorkerId() +% 1;
 
-    const got = pool.acquire("h:80", 1) orelse return error.TestExpectedReuse;
+    const got = (try pool.checkout("h:80", 1)) orelse return error.TestExpectedReuse;
     defer pool.release("h:80", got, false, 1); // close the checked-out fd
     const agg = pool.aggregateStats();
     try testing.expectEqual(@as(u64, 1), agg.reused_cross_worker_total);
@@ -474,6 +552,7 @@ test "release drops a connection past the idle timeout" {
     const fds = try testPair();
     defer _ = std.c.close(fds[1]);
 
+    try pool.reserveSlot("h:80");
     pool.noteNewConnection("h:80");
     // released 2s later, past the 1s idle timeout → closed, not pooled.
     pool.release("h:80", .{ .stream = compat.netStreamFromFd(fds[0]), .created_ms = 0, .last_used_ms = 0 }, true, 2000);

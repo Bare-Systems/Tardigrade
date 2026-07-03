@@ -433,6 +433,10 @@ pub const EdgeConfig = struct {
     upstream_pool_idle_timeout_ms: u64,
     /// Hard cap on total upstream connection age (ms, 0 = unlimited).
     upstream_pool_max_lifetime_ms: u64,
+    /// Fail-fast cap on concurrently checked-out upstream connections per
+    /// origin (0 = unlimited). At the cap, requests get 503 upstream_saturated
+    /// instead of opening more connections (#239).
+    upstream_pool_max_active_per_host: usize,
     /// Passive health threshold: mark upstream as failed after this many failed attempts (0 = disabled).
     upstream_max_fails: u32,
     /// Passive health timeout (ms) for failed upstreams before retry eligibility.
@@ -1189,6 +1193,7 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     const upstream_pool_max_idle_per_host = parseIntEnv(usize, allocator, "TARDIGRADE_UPSTREAM_POOL_MAX_IDLE_PER_HOST", 32);
     const upstream_pool_idle_timeout_ms = parseIntEnv(u64, allocator, "TARDIGRADE_UPSTREAM_POOL_IDLE_TIMEOUT_MS", 90_000);
     const upstream_pool_max_lifetime_ms = parseIntEnv(u64, allocator, "TARDIGRADE_UPSTREAM_POOL_MAX_LIFETIME_MS", 0);
+    const upstream_pool_max_active_per_host = parseIntEnv(usize, allocator, "TARDIGRADE_UPSTREAM_POOL_MAX_ACTIVE_PER_HOST", 0);
 
     const max_fails_str = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_MAX_FAILS", "0") catch unreachable;
     defer allocator.free(max_fails_str);
@@ -1545,6 +1550,7 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .upstream_pool_max_idle_per_host = upstream_pool_max_idle_per_host,
         .upstream_pool_idle_timeout_ms = upstream_pool_idle_timeout_ms,
         .upstream_pool_max_lifetime_ms = upstream_pool_max_lifetime_ms,
+        .upstream_pool_max_active_per_host = upstream_pool_max_active_per_host,
         .upstream_max_fails = upstream_max_fails,
         .upstream_fail_timeout_ms = upstream_fail_timeout_ms,
         .upstream_active_health_interval_ms = upstream_active_health_interval_ms,

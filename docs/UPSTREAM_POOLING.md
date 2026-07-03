@@ -90,16 +90,34 @@ structure from the h1 pool:
   delayed ACK otherwise stalls each exchange ~40 ms and trips response timeouts
   under concurrency (measured 24 → 5.4k req/s on loopback once disabled).
 
-### Reset / GOAWAY metrics (Phase 4b PR 3)
+### Reset / GOAWAY metrics (Phase 4b PR 3; per-origin since #238)
 
-RST_STREAM and GOAWAY are counted at the **pool** level, not per live connection:
-each `H2Conn` reader holds a pointer to the pool's `stream_resets_total` /
-`goaway_total` atomics (passed to `H2Conn.init`) and bumps them when it sees the
-frame. Both count **frames received** (protocol-level) — a reset counts even
-when it arrives late, for a stream that already completed and left the streams
-map. Pool-level counters are required because a per-connection count would be
-lost when an evicted connection is torn down. Surfaced as
-`tardigrade_upstream_h2_stream_resets_total` and `…_h2_goaway_total` (counters).
+RST_STREAM and GOAWAY are counted in **persistent per-origin counters**, not per
+live connection: each `H2Conn` reader holds pointers to its origin's
+`H2OriginCounters` atomics (passed to `H2Conn.init`) and bumps them when it
+sees the frame — still *before* publishing the state change the frame causes,
+so an observer that sees the state also sees the incremented counter. Both
+count **frames received** (protocol-level) — a reset counts even when it
+arrives late, for a stream that already completed and left the streams map.
+The counter entries outlive connections (created on first h2 connection to an
+origin, never removed while the pool lives) because a per-connection count
+would be lost when an evicted connection is torn down; cardinality is bounded
+by the number of distinct configured origins, like the h1 pool's per-host
+stats.
+
+Surfaced two ways:
+
+- **Global (backward-compatible)**: `tardigrade_upstream_h2_stream_resets_total`
+  and `…_h2_goaway_total` — now sums over the per-origin counters (identical
+  values and still monotonic, since origin entries are never removed).
+- **Per-origin (#238)**: `tardigrade_upstream_h2_pool_*{upstream="h2:host:port"}`
+  for `connections_active` / `streams_active` (gauges) and
+  `stream_resets_total` / `goaway_total` (counters). The `_pool_` name prefix
+  mirrors the labelled h1 `tardigrade_upstream_pool_*` series so a label-blind
+  `sum()` over the labelled family never double-counts the bare globals; the
+  label value is the pool key, matching the scheme-prefixed h1 label
+  convention. An origin whose connection was evicted keeps reporting its
+  counters with zeroed gauges.
 
 ### Idle / lifetime eviction (Phase 4b PR 3)
 

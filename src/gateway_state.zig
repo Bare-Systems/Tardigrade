@@ -1516,6 +1516,27 @@ pub const GatewayState = struct {
         try out.print("tardigrade_upstream_protocol_requests_total{{protocol=\"h1\"}} {d}\n", .{proto.h1});
         try out.print("tardigrade_upstream_protocol_requests_total{{protocol=\"h2\"}} {d}\n", .{proto.h2});
 
+        // Completed-exchange latency by negotiated protocol (#145 — the
+        // "upstream p99 by protocol" acceptance row).
+        const req_lat = self.upstream_pool.requestLatencySnapshot();
+        try out.appendSlice(
+            \\# HELP tardigrade_upstream_request_latency_ms Completed upstream exchange latency by negotiated protocol in milliseconds
+            \\# TYPE tardigrade_upstream_request_latency_ms histogram
+            \\
+        );
+        inline for (.{ "h1", "h2" }) |label| {
+            const hist = if (comptime std.mem.eql(u8, label, "h2")) req_lat.h2 else req_lat.h1;
+            var req_cumulative: u64 = 0;
+            inline for (http.upstream_pool.request_latency_bounds_ms, 0..) |bound, i| {
+                req_cumulative += hist.buckets[i];
+                try out.print("tardigrade_upstream_request_latency_ms_bucket{{protocol=\"{s}\",le=\"{d}\"}} {d}\n", .{ label, bound, req_cumulative });
+            }
+            req_cumulative += hist.buckets[http.upstream_pool.request_latency_bounds_ms.len];
+            try out.print("tardigrade_upstream_request_latency_ms_bucket{{protocol=\"{s}\",le=\"+Inf\"}} {d}\n", .{ label, req_cumulative });
+            try out.print("tardigrade_upstream_request_latency_ms_sum{{protocol=\"{s}\"}} {d}\n", .{ label, hist.sum_ms });
+            try out.print("tardigrade_upstream_request_latency_ms_count{{protocol=\"{s}\"}} {d}\n", .{ label, hist.count });
+        }
+
         const h2 = self.h2_pool.snapshot();
         try out.appendSlice(
             \\# HELP tardigrade_upstream_h2_connections_active Open multiplexing HTTP/2 upstream connections

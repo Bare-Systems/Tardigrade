@@ -1792,11 +1792,21 @@ test "h2 actor multiplexes concurrent requests over one connection" {
 }
 
 /// Accept one connection on `listen_fd` and serve `n` canned h2 requests on it
-/// (prior-knowledge: the server speaks h2 immediately, no Upgrade).
+/// (prior-knowledge: the server speaks h2 immediately, no Upgrade). After
+/// serving, drain the socket until the client closes: closing a TCP socket
+/// with unread data in its receive queue (the client's SETTINGS-ACK and
+/// WINDOW_UPDATEs, which the canned server never reads) sends an RST that can
+/// discard the in-flight response — a race the AF_UNIX socketpair servers
+/// never see because unix-socket close has clean EOF delivery semantics.
 fn h2cListenerServe(listen_fd: std.posix.fd_t, n: usize) void {
     const conn = std.c.accept(listen_fd, null, null);
     if (conn < 0) return;
     cannedMuxServer(conn, n);
+    var drain: [512]u8 = undefined;
+    while (true) {
+        const got = std.posix.read(conn, drain[0..]) catch break;
+        if (got == 0) break; // client closed — safe to close without RST
+    }
     _ = std.c.close(conn);
 }
 

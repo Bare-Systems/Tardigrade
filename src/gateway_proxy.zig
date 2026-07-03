@@ -244,6 +244,11 @@ pub fn executeBoundedBufferedTcpHttpRequest(
     /// Optional per-origin HTTP/2 multiplexing pool (#145). When present and the
     /// caller offered h2, requests multiplex over a shared origin connection.
     h2_pool: ?*http.upstream_h2.H2ConnPool,
+    /// Speak prior-knowledge cleartext h2c to this plain-HTTP upstream (#237).
+    /// Only set when the operator explicitly configured
+    /// `TARDIGRADE_UPSTREAM_PROTOCOL=h2c` — there is no negotiation on
+    /// cleartext, so an h1-only origin would break under it. Ignored for TLS.
+    h2c_prior_knowledge: bool,
 ) !BufferedUpstreamResponse {
     // HTTP/2 upstream (#145): when the caller asked to offer h2 (TLS only),
     // multiplex over a shared per-origin connection when an h2 pool is provided,
@@ -255,6 +260,13 @@ pub fn executeBoundedBufferedTcpHttpRequest(
                 return executeBufferedViaH2Pool(allocator, hp, host, port, opts, uri, method, extra_headers, body, content_type_override, max_buffered_response_bytes, connect_timeout_ms, response_timeout_ms, pool);
             }
             return executeBufferedH2OrH1Fresh(allocator, host, port, opts, uri, method, extra_headers, body, content_type_override, max_buffered_response_bytes, connect_timeout_ms, response_timeout_ms, pool);
+        }
+    } else if (h2c_prior_knowledge) {
+        // Cleartext h2c (#237): multiplex over the shared per-origin plain h2
+        // connection. Requires the pool (always present on the data plane);
+        // without one, fall through to HTTP/1.1.
+        if (h2_pool) |hp| {
+            return executeBufferedViaH2Pool(allocator, hp, host, port, null, uri, method, extra_headers, body, content_type_override, max_buffered_response_bytes, connect_timeout_ms, response_timeout_ms, pool);
         }
     }
     // Every request that reaches the buffered HTTP/1.1 path counts as h1 (an h2
@@ -431,12 +443,16 @@ fn executeBufferedH2OrH1Fresh(
 /// and issues one stream on it. A connection-level failure evicts the dead
 /// connection and retries once on a fresh one. If the origin negotiated HTTP/1.1
 /// over ALPN, the request runs on the HTTP/1.1 path over that connection.
+///
+/// `opts == null` selects prior-knowledge cleartext h2c (#237): plain socket,
+/// `http` scheme, `h2c:`-prefixed pool key, and no `.h1` fallback (there is no
+/// negotiation to fall back from).
 fn executeBufferedViaH2Pool(
     allocator: std.mem.Allocator,
     h2_pool: *http.upstream_h2.H2ConnPool,
     host: []const u8,
     port: u16,
-    opts: http.tls_termination.UpstreamTlsOptions,
+    opts: ?http.tls_termination.UpstreamTlsOptions,
     uri: std.Uri,
     method: []const u8,
     extra_headers: []const std.http.Header,
@@ -451,8 +467,11 @@ fn executeBufferedViaH2Pool(
         response_timeout_ms
     else if (connect_timeout_ms > 0) connect_timeout_ms else 30_000;
 
+    const is_tls = opts != null;
+    const scheme: []const u8 = if (is_tls) "https" else "http";
+    const default_port: u16 = if (is_tls) 443 else 80;
     var key_buf: [300]u8 = undefined;
-    const key = std.fmt.bufPrint(&key_buf, "h2:{s}:{d}", .{ host, port }) catch host;
+    const key = std.fmt.bufPrint(&key_buf, "{s}:{s}:{d}", .{ if (is_tls) "h2" else "h2c", host, port }) catch host;
 
     var attempt: usize = 0;
     while (attempt < 2) : (attempt += 1) {
@@ -460,7 +479,8 @@ fn executeBufferedViaH2Pool(
         switch (acq) {
             .h1 => |tls_ptr| {
                 // ALPN negotiated HTTP/1.1: run the h1 exchange on this fresh
-                // (unpooled) connection, then tear it down.
+                // (unpooled) connection, then tear it down. (TLS only — the
+                // h2c path has no negotiation and never lands here.)
                 defer {
                     tls_ptr.close();
                     h2_pool.allocator.destroy(tls_ptr);
@@ -476,7 +496,7 @@ fn executeBufferedViaH2Pool(
                 if (h1_pool) |p| p.recordProtocol(true);
 
                 var authority_buf: [300]u8 = undefined;
-                const authority = if (port == 443)
+                const authority = if (port == default_port)
                     host
                 else
                     std.fmt.bufPrint(&authority_buf, "{s}:{d}", .{ host, port }) catch host;
@@ -493,7 +513,7 @@ fn executeBufferedViaH2Pool(
                 const start_ms = http.event_loop.monotonicMs();
                 var h2resp = conn.request(.{
                     .method = method,
-                    .scheme = "https",
+                    .scheme = scheme,
                     .authority = authority,
                     .path = path_buf.written(),
                     .headers = extra_headers,
@@ -532,13 +552,16 @@ fn executeBufferedViaH2Pool(
 /// as an aborted relay (truncated chunked body) rather than an error. When the
 /// origin negotiates HTTP/1.1 via ALPN, the request runs on the h1 streaming
 /// relay over that fresh (unpooled) connection instead.
+///
+/// `opts == null` selects prior-knowledge cleartext h2c (#237): plain socket,
+/// `http` scheme, `h2c:`-prefixed pool key, no `.h1` fallback.
 fn streamViaH2Pool(
     allocator: std.mem.Allocator,
     h2_pool: *http.upstream_h2.H2ConnPool,
     h1_pool: ?*http.upstream_pool.UpstreamPool,
     host: []const u8,
     port: u16,
-    opts: http.tls_termination.UpstreamTlsOptions,
+    opts: ?http.tls_termination.UpstreamTlsOptions,
     uri: std.Uri,
     method: []const u8,
     extra_headers: []const std.http.Header,
@@ -557,8 +580,11 @@ fn streamViaH2Pool(
         read_deadline_ms
     else if (connect_timeout_ms > 0) connect_timeout_ms else 30_000;
 
+    const is_tls = opts != null;
+    const scheme: []const u8 = if (is_tls) "https" else "http";
+    const default_port: u16 = if (is_tls) 443 else 80;
     var key_buf: [300]u8 = undefined;
-    const key = std.fmt.bufPrint(&key_buf, "h2:{s}:{d}", .{ host, port }) catch host;
+    const key = std.fmt.bufPrint(&key_buf, "{s}:{s}:{d}", .{ if (is_tls) "h2" else "h2c", host, port }) catch host;
 
     var attempt: usize = 0;
     while (attempt < 2) : (attempt += 1) {
@@ -582,7 +608,7 @@ fn streamViaH2Pool(
                 if (h1_pool) |p| p.recordProtocol(true);
 
                 var authority_buf: [300]u8 = undefined;
-                const authority = if (port == 443)
+                const authority = if (port == default_port)
                     host
                 else
                     std.fmt.bufPrint(&authority_buf, "{s}:{d}", .{ host, port }) catch host;
@@ -599,7 +625,7 @@ fn streamViaH2Pool(
                 const start_ms = http.event_loop.monotonicMs();
                 const stream = conn.requestStreaming(.{
                     .method = method,
-                    .scheme = "https",
+                    .scheme = scheme,
                     .authority = authority,
                     .path = path_buf.written(),
                     .headers = extra_headers,
@@ -1167,6 +1193,7 @@ pub fn executeBoundedBufferedHttpProxyRequest(
         effective_response_timeout_ms,
         pool,
         h2_pool,
+        cfg.upstream_protocol.h2cPriorKnowledge(),
     );
 }
 
@@ -1623,14 +1650,20 @@ pub fn executeStreamingHttpProxyRequest(
     defer allocator.free(read_buf);
 
     // HTTP/2 upstream (#145 PR 4): multiplex the streaming response over the
-    // shared per-origin h2 connection when configured. ALPN h1 origins fall
-    // back inside. Streaming uploads stay on the h1 path below (`offer_h2`
-    // remains false there, so ALPN cannot negotiate a protocol we then would
-    // not speak).
-    if (is_https and streaming_body == null and cfg.upstream_protocol.offersH2()) {
+    // shared per-origin h2 connection when configured — via ALPN for HTTPS
+    // (h1 origins fall back inside) or prior-knowledge h2c for plain HTTP
+    // when explicitly opted in (#237). Streaming uploads stay on the h1 path
+    // below (`offer_h2` remains false there, so ALPN cannot negotiate a
+    // protocol we then would not speak).
+    const stream_h2 = streaming_body == null and
+        (if (is_https) cfg.upstream_protocol.offersH2() else cfg.upstream_protocol.h2cPriorKnowledge());
+    if (stream_h2) {
         if (h2_pool) |hp| {
-            var h2_opts = tls_options.?;
-            h2_opts.offer_h2 = true;
+            const h2_opts: ?http.tls_termination.UpstreamTlsOptions = if (is_https) blk: {
+                var o = tls_options.?;
+                o.offer_h2 = true;
+                break :blk o;
+            } else null;
             return streamViaH2Pool(allocator, hp, pool, host, port, h2_opts, uri, method, extra_headers.items, buffered_body, read_buf, downstream_conn, downstream_writer, security, sticky_set_cookie, correlation_id, connect_timeout_ms, read_deadline_ms, cancel_token);
         }
     }
@@ -2325,6 +2358,7 @@ test "connectBlockingTcp + exchange round-trips a real TCP origin" {
         2_000,
         null,
         null,
+        false,
     );
     defer resp.deinit(allocator);
 

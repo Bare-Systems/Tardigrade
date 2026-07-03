@@ -67,17 +67,29 @@ pub const UpstreamProtocol = enum {
     http1,
     h2,
     auto,
+    /// Like `h2` for HTTPS upstreams (ALPN), and additionally speaks
+    /// **prior-knowledge cleartext h2c** to plain-HTTP upstreams (#237).
+    /// A separate explicit value because cleartext has no negotiation: an
+    /// h1-only plain origin would break under it, so `h2`/`auto` must never
+    /// imply it.
+    h2c,
 
     pub fn parse(value: []const u8) ?UpstreamProtocol {
         if (std.ascii.eqlIgnoreCase(value, "http1") or std.ascii.eqlIgnoreCase(value, "http/1.1") or std.ascii.eqlIgnoreCase(value, "h1")) return .http1;
         if (std.ascii.eqlIgnoreCase(value, "h2") or std.ascii.eqlIgnoreCase(value, "http2")) return .h2;
         if (std.ascii.eqlIgnoreCase(value, "auto")) return .auto;
+        if (std.ascii.eqlIgnoreCase(value, "h2c")) return .h2c;
         return null;
     }
 
-    /// Whether HTTP/2 should be offered via ALPN.
+    /// Whether HTTP/2 should be offered via ALPN (HTTPS upstreams).
     pub fn offersH2(self: UpstreamProtocol) bool {
         return self != .http1;
+    }
+
+    /// Whether plain-HTTP upstreams speak prior-knowledge cleartext h2c.
+    pub fn h2cPriorKnowledge(self: UpstreamProtocol) bool {
+        return self == .h2c;
     }
 };
 
@@ -2807,6 +2819,20 @@ test "parse proxy streaming mode aliases" {
     try std.testing.expect(ProxyStreamingMode.full.responseStreamingEnabled());
     try std.testing.expect(ProxyStreamingMode.full.requestStreamingEnabled());
     try std.testing.expect(ProxyStreamingMode.parse("invalid") == null);
+}
+
+test "UpstreamProtocol parses h2c and gates prior-knowledge separately from ALPN" {
+    try std.testing.expectEqual(UpstreamProtocol.h2c, UpstreamProtocol.parse("h2c").?);
+    try std.testing.expectEqual(UpstreamProtocol.h2c, UpstreamProtocol.parse("H2C").?);
+    // h2c implies ALPN h2 for HTTPS upstreams...
+    try std.testing.expect(UpstreamProtocol.h2c.offersH2());
+    try std.testing.expect(UpstreamProtocol.h2c.h2cPriorKnowledge());
+    // ...but h2/auto must never imply cleartext h2c (no negotiation exists,
+    // an h1-only plain origin would break).
+    try std.testing.expect(!UpstreamProtocol.h2.h2cPriorKnowledge());
+    try std.testing.expect(!UpstreamProtocol.auto.h2cPriorKnowledge());
+    try std.testing.expect(!UpstreamProtocol.http1.h2cPriorKnowledge());
+    try std.testing.expect(!UpstreamProtocol.http1.offersH2());
 }
 
 test "parse health status range" {

@@ -82,9 +82,10 @@ structure from the h1 pool:
 - **`upstream_h2.H2ConnPool`** — one connection per origin (keyed `h2:host:port`),
   refcounted so an evicted/dead connection survives until its last in-flight
   request drains. A connection-level failure evicts and retries once.
-- Enabled via `TARDIGRADE_UPSTREAM_PROTOCOL=h2|auto` on the buffered data-plane
-  path; offered through ALPN (TLS only — no cleartext h2c). Origins that select
-  `http/1.1` fall back to the HTTP/1.1 path.
+- Enabled via `TARDIGRADE_UPSTREAM_PROTOCOL=h2|auto` for HTTPS upstreams,
+  offered through ALPN; origins that select `http/1.1` fall back to the
+  HTTP/1.1 path. `TARDIGRADE_UPSTREAM_PROTOCOL=h2c` (#237) additionally speaks
+  **prior-knowledge cleartext h2c** to plain-HTTP upstreams — see below.
 - The h2 upstream socket sets **`TCP_NODELAY`**: multiplexing issues many small
   frame writes (HEADERS / WINDOW_UPDATE) whose interaction with the peer's
   delayed ACK otherwise stalls each exchange ~40 ms and trips response timeouts
@@ -199,7 +200,28 @@ Streaming **uploads** (`full` mode with a request body relayed from the client)
 stay on the HTTP/1.1 path: the request-body sender currently buffers the body,
 and relaying a slow client upload over the shared connection needs an
 incremental DATA-send API on the actor. Deferred within #145: streaming
-uploads over h2, and cleartext h2c.
+uploads over h2.
+
+### Cleartext h2c (#237)
+
+`TARDIGRADE_UPSTREAM_PROTOCOL=h2c` makes plain-HTTP (`http://`) upstreams speak
+HTTP/2 with **prior knowledge** (RFC 9113 §3.3): the client preface goes out
+immediately on the plain socket — no ALPN, and no HTTP/1.1 `Upgrade: h2c`
+dance (deprecated in RFC 9113, costs an extra round trip, and no major proxy
+uses it upstream). Because cleartext has no negotiation, this is a separate
+explicit opt-in: an h1-only plain origin would break under it, so `h2`/`auto`
+never imply it. For HTTPS upstreams `h2c` behaves exactly like `h2` (ALPN with
+h1 fallback).
+
+Implementation-wise there is one production connection type for both:
+`PooledH2Conn = H2Conn(*UpstreamH2Transport)`, where `UpstreamH2Transport` is
+a runtime union over the OpenSSL upstream connection and a plain socket. h2c
+connections therefore share the same pool, actor, refcount lifecycle, idle
+reaper, buffered/streaming paths, and metrics as TLS h2 — they appear under
+`h2c:host:port` keys in the per-origin series and count as `protocol="h2"` in
+the protocol/latency metrics (h2c *is* HTTP/2; the transport split is visible
+via the key prefix). `Connection: close`-era caveats do not apply; the h1
+`.h1` ALPN-fallback arm of `acquire` is unreachable for h2c.
 
 ### Upstream latency by protocol
 
@@ -358,6 +380,7 @@ downstream-keepalive reaper): connections past `idle_timeout_ms` or
 | `TARDIGRADE_UPSTREAM_POOL_MAX_IDLE_PER_HOST` | `32` | Max idle connections cached per origin. |
 | `TARDIGRADE_UPSTREAM_POOL_IDLE_TIMEOUT_MS` | `90000` | Idle connection is evicted after this long unused. |
 | `TARDIGRADE_UPSTREAM_POOL_MAX_LIFETIME_MS` | `0` (unlimited) | Hard cap on total connection age. |
+| `TARDIGRADE_UPSTREAM_PROTOCOL` | `http1` | Upstream application protocol: `http1`; `h2`/`auto` (offer h2 via ALPN on HTTPS upstreams, h1 fallback); `h2c` (= `h2` for HTTPS, plus prior-knowledge cleartext h2 to plain-HTTP upstreams — explicit opt-in, see the h2c section). |
 
 ## Metrics
 

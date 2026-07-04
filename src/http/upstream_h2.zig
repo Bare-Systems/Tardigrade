@@ -1347,6 +1347,13 @@ pub const H2ConnPool = struct {
     /// path the returned actor carries one ref for the caller (release with
     /// `release`). On ALPN h1 the raw TLS conn is returned for the caller to own.
     ///
+    /// Two distinct deadlines (#171): `connect_timeout_ms` bounds **only** the
+    /// TCP connect (`TARDIGRADE_UPSTREAM_CONNECT_TIMEOUT_MS`), while `deadline_ms`
+    /// (the response/read timeout) bounds the TLS handshake and every subsequent
+    /// h2 read/write/stream. Passing the read deadline to the connect (as an
+    /// earlier revision did) meant pooled h2/h2c connects were bounded by the
+    /// response timeout instead of the connect timeout.
+    ///
     /// `tls_options == null` selects **prior-knowledge cleartext h2c** (#237):
     /// the connection speaks HTTP/2 immediately on the plain socket, no ALPN
     /// and no HTTP/1.1 Upgrade — so it never returns `.h1` and must only be
@@ -1357,6 +1364,7 @@ pub const H2ConnPool = struct {
         host: []const u8,
         port: u16,
         tls_options: ?tls_termination.UpstreamTlsOptions,
+        connect_timeout_ms: u32,
         deadline_ms: u32,
     ) !H2AcquireResult {
         // Fast path: an existing healthy connection.
@@ -1371,13 +1379,14 @@ pub const H2ConnPool = struct {
         self.mutex.unlock();
 
         // Slow path: connect (+ TLS handshake when configured), no lock held.
-        // The connect is poll-bounded (#171) — a blocking connect() is not
-        // interruptible by SO_SNDTIMEO, so a SYN-blackholed origin would
-        // otherwise stall the worker for the kernel's own limit.
-        const fd = try compat.connectBoundedTcp(host, port, deadline_ms);
+        // The TCP connect is poll-bounded by the connect timeout (#171) — a
+        // blocking connect() is not interruptible by SO_SNDTIMEO, so a
+        // SYN-blackholed origin would otherwise stall the worker for the
+        // kernel's own limit.
+        const fd = try compat.connectBoundedTcp(host, port, connect_timeout_ms);
         // Bound the TLS handshake (and any later OpenSSL-internal writes) with
-        // socket timeouts before handing the fd to the transport (#171): the
-        // reader's poll deadline only starts once the connection exists, so
+        // the response deadline before handing the fd to the transport (#171):
+        // the reader's poll deadline only starts once the connection exists, so
         // without these a TCP-accepting-but-silent origin hangs the worker in
         // SSL_connect indefinitely.
         compat.setSocketTimeoutsMs(fd, deadline_ms, deadline_ms);
@@ -1819,14 +1828,24 @@ fn h2cListenerServe(listen_fd: std.posix.fd_t, n: usize) void {
     _ = std.c.close(conn);
 }
 
-/// Accept connections and hold them silently (never handshake, never write)
-/// until the listener closes — a TCP-accepting-but-dead TLS origin.
+/// Accept connections and hold them silently (never handshake, never write) —
+/// a TCP-accepting-but-dead TLS origin. Gated by `poll()` with a short tick so
+/// the loop re-checks `stop` and exits deterministically: `accept()` is only
+/// called once poll reports the listener readable, so it never blocks and
+/// shutdown does not depend on the unreliable "close the listening fd from
+/// another thread to wake a blocking accept()" behavior. Accepted connections
+/// are held open until the acceptor exits so the client's `SSL_connect` sees an
+/// open-but-silent peer (closing them would let the handshake fail fast on EOF,
+/// defeating the timeout test).
 fn silentAcceptor(listen_fd: std.posix.fd_t, stop: *std.atomic.Value(bool)) void {
     var held: [4]std.posix.fd_t = undefined;
     var n: usize = 0;
     while (!stop.load(.acquire) and n < held.len) {
+        var pfd = [_]std.posix.pollfd{.{ .fd = listen_fd, .events = std.posix.POLL.IN, .revents = 0 }};
+        const ready = std.posix.poll(&pfd, 50) catch break; // 50ms tick → re-check stop
+        if (ready == 0) continue;
         const conn = std.c.accept(listen_fd, null, null);
-        if (conn < 0) break;
+        if (conn < 0) continue;
         held[n] = conn;
         n += 1;
     }
@@ -1861,14 +1880,16 @@ test "h2 pool acquire is deadline-bounded against a TCP-accepting but silent TLS
     // forever without the pre-handshake socket timeouts. The acquire must
     // fail within the deadline, not the OS default.
     const start_ms = nowMs();
-    const res = pool.acquire(key, "127.0.0.1", port, .{ .skip_verify = true }, 500);
+    const res = pool.acquire(key, "127.0.0.1", port, .{ .skip_verify = true }, 500, 500);
     const elapsed_ms = nowMs() - start_ms;
     try testing.expect(std.meta.isError(res));
     try testing.expect(elapsed_ms < 5_000);
 
+    // Deterministic shutdown: the acceptor polls with a 50ms tick, so setting
+    // the flag makes it exit on its own — no cross-thread accept() wake needed.
     stop.store(true, .release);
-    _ = std.c.close(listen_fd); // unblocks accept
     server.join();
+    _ = std.c.close(listen_fd);
 }
 
 test "h2c pool acquires a prior-knowledge cleartext connection and round-trips" {
@@ -1904,7 +1925,7 @@ test "h2c pool acquires a prior-knowledge cleartext connection and round-trips" 
     const key = try std.fmt.bufPrint(&key_buf, "h2c:127.0.0.1:{d}", .{port});
 
     // tls_options == null => prior-knowledge cleartext h2; never `.h1`.
-    const acq = try pool.acquire(key, "127.0.0.1", port, null, 5000);
+    const acq = try pool.acquire(key, "127.0.0.1", port, null, 2000, 5000);
     const conn = switch (acq) {
         .h2 => |c| c,
         .h1 => return error.TestUnexpectedResult,

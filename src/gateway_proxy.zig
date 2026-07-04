@@ -545,7 +545,7 @@ fn executeBufferedViaH2Pool(
 
     var attempt: usize = 0;
     while (attempt < 2) : (attempt += 1) {
-        const acq = try h2_pool.acquire(key, host, port, opts, deadline_ms);
+        const acq = try h2_pool.acquire(key, host, port, opts, connect_timeout_ms, deadline_ms);
         switch (acq) {
             .h1 => |tls_ptr| {
                 // ALPN negotiated HTTP/1.1: run the h1 exchange on this fresh
@@ -658,7 +658,7 @@ fn streamViaH2Pool(
 
     var attempt: usize = 0;
     while (attempt < 2) : (attempt += 1) {
-        const acq = try h2_pool.acquire(key, host, port, opts, deadline_ms);
+        const acq = try h2_pool.acquire(key, host, port, opts, connect_timeout_ms, deadline_ms);
         switch (acq) {
             .h1 => |tls_ptr| {
                 // ALPN negotiated HTTP/1.1: run the h1 streaming relay on this

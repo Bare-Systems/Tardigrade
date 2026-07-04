@@ -260,7 +260,7 @@ pub const Binding = if (enabled) struct {
         server.stats.zero_rtt_packets_seen += packet.counts.zero_rtt;
         server.stats.retry_packets_seen += packet.counts.retry;
         server.stats.short_packets_seen += packet.counts.short;
-        try upsertConnection(server, packet, datagram, remote_ip, remote_addr.getPort());
+        try upsertConnection(server, packet, datagram, remote_ip, sockAddrStoragePort(remote_addr));
         if (packet.packet_type == .initial) {
             if (try findNativeConnection(server, packet) == null) {
                 if (c.ngtcp2_accept(null, datagram.ptr, datagram.len) != 0) return .{};
@@ -431,14 +431,14 @@ pub const Binding = if (enabled) struct {
         var client_scid: c.ngtcp2_cid = undefined;
         c.ngtcp2_cid_init(&client_scid, packet.scid.ptr, packet.scid.len);
         var scid_bytes: [16]u8 = undefined;
-        std.crypto.random.bytes(&scid_bytes);
+        compat.randomBytes(&scid_bytes);
         c.ngtcp2_cid_init(&native.scid, &scid_bytes, scid_bytes.len);
         c.ngtcp2_path_storage_init(
             &native.path_storage,
-            @ptrCast(&local_addr.any),
-            local_addr.getOsSockLen(),
-            @ptrCast(&remote_addr.any),
-            remote_addr.getOsSockLen(),
+            @ptrCast(&local_addr),
+            sockAddrStorageLen(local_addr),
+            @ptrCast(&remote_addr),
+            sockAddrStorageLen(remote_addr),
             null,
         );
 
@@ -475,10 +475,10 @@ pub const Binding = if (enabled) struct {
         native.remote_addr = remote_addr;
         c.ngtcp2_path_storage_init(
             &native.path_storage,
-            @ptrCast(&local_addr.any),
-            local_addr.getOsSockLen(),
-            @ptrCast(&remote_addr.any),
-            remote_addr.getOsSockLen(),
+            @ptrCast(&local_addr),
+            sockAddrStorageLen(local_addr),
+            @ptrCast(&remote_addr),
+            sockAddrStorageLen(remote_addr),
             null,
         );
         var pkt_info = std.mem.zeroes(c.ngtcp2_pkt_info);
@@ -515,10 +515,10 @@ pub const Binding = if (enabled) struct {
         if (out_buf.len == 0) return 0;
         c.ngtcp2_path_storage_init(
             &native.path_storage,
-            @ptrCast(&local_addr.any),
-            local_addr.getOsSockLen(),
-            @ptrCast(&remote_addr.any),
-            remote_addr.getOsSockLen(),
+            @ptrCast(&local_addr),
+            sockAddrStorageLen(local_addr),
+            @ptrCast(&remote_addr),
+            sockAddrStorageLen(remote_addr),
             null,
         );
         var pkt_info = std.mem.zeroes(c.ngtcp2_pkt_info);
@@ -664,6 +664,18 @@ pub const Binding = if (enabled) struct {
         }
     }
 
+    fn sockAddrStoragePort(addr: std.c.sockaddr.storage) u16 {
+        return switch (addr.family) {
+            std.posix.AF.INET => std.mem.bigToNative(u16, @as(*const std.c.sockaddr.in, @ptrCast(&addr)).port),
+            std.posix.AF.INET6 => std.mem.bigToNative(u16, @as(*const std.c.sockaddr.in6, @ptrCast(&addr)).port),
+            else => 0,
+        };
+    }
+
+    fn sockAddrStorageLen(addr: std.c.sockaddr.storage) std.posix.socklen_t {
+        return if (addr.family == std.posix.AF.INET6) @sizeOf(std.c.sockaddr.in6) else @sizeOf(std.c.sockaddr.in);
+    }
+
     fn noteStreamData(server: *@This().Server, cid: []const u8, datalen: usize, completed_request: bool) void {
         if (cid.len == 0) return;
         const cid_hex = std.fmt.allocPrint(server.allocator, "{f}", .{compat.fmtSliceHexLower(cid)}) catch return;
@@ -771,14 +783,14 @@ pub const Binding = if (enabled) struct {
     }
 
     fn randCb(dest: [*c]u8, destlen: usize, _: [*c]const c.ngtcp2_rand_ctx) callconv(.c) void {
-        std.crypto.random.bytes(dest[0..destlen]);
+        compat.randomBytes(dest[0..destlen]);
     }
 
     fn getNewConnectionIdCb(_: ?*c.ngtcp2_conn, cid: [*c]c.ngtcp2_cid, token: [*c]u8, cidlen: usize, _: ?*anyopaque) callconv(.c) c_int {
         var cid_bytes: [c.NGTCP2_MAX_CIDLEN]u8 = undefined;
-        std.crypto.random.bytes(cid_bytes[0..cidlen]);
+        compat.randomBytes(cid_bytes[0..cidlen]);
         c.ngtcp2_cid_init(cid, &cid_bytes, cidlen);
-        std.crypto.random.bytes(token[0..c.NGTCP2_STATELESS_RESET_TOKENLEN]);
+        compat.randomBytes(token[0..c.NGTCP2_STATELESS_RESET_TOKENLEN]);
         return 0;
     }
 

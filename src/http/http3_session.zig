@@ -409,7 +409,7 @@ pub const ServerSession = if (nghttp3_enabled) struct {
     }
 
     fn randCb(dest: [*c]u8, destlen: usize) callconv(.c) void {
-        std.crypto.random.bytes(dest[0..destlen]);
+        compat.randomBytes(dest[0..destlen]);
     }
 
     fn recvSettingsCb(_: ?*c.nghttp3_conn, _: ?*const c.nghttp3_proto_settings, _: ?*anyopaque) callconv(.c) c_int {

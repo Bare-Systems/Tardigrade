@@ -593,7 +593,7 @@ pub fn parseQueryParam(query: ?[]const u8, key: []const u8) ?[]const u8 {
 
 fn generateCommandId(allocator: std.mem.Allocator) ![]const u8 {
     var rnd: [16]u8 = undefined;
-    std.crypto.random.bytes(&rnd);
+    compat.randomBytes(&rnd);
     return std.fmt.allocPrint(allocator, "cmd-{d}-{f}", .{
         compat.milliTimestamp(),
         compat.fmtSliceHexLower(&rnd),

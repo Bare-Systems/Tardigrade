@@ -42,7 +42,7 @@ zig build -Doptimize=ReleaseFast
 | `-Dstatic-executable=true` | `false` | Fully static binary |
 | `-Dprefer-static-system-libs=true` | `false` | Prefer static OpenSSL/crypto |
 | `-Drequire-static-system-libs=true` | `false` | Fail if static libs are unavailable |
-| `-Denable-http3-ngtcp2=true` | `false` | Link ngtcp2/nghttp3 for HTTP/3 |
+| `-Denable-http3-ngtcp2=true` | `false` | Enable experimental HTTP/3 ngtcp2/nghttp3 system-library integration; requires the ngtcp2/nghttp3/ngtcp2_crypto_ossl system packages |
 | `-Dversion=x.y.z` | `dev` | Embed a version string in the binary |
 | `-Dhttp3-osslclient-path=<path>` | auto-detect | Path to osslclient for 0-RTT tests |
 
@@ -58,7 +58,7 @@ zig build -Doptimize=ReleaseFast
 # Static binary (Linux, requires static OpenSSL)
 zig build -Dstatic-executable=true -Drequire-static-system-libs=true
 
-# Build with HTTP/3 support
+# Build with HTTP/3 support (requires system ngtcp2/nghttp3 packages)
 zig build -Denable-http3-ngtcp2=true
 
 # Run a specific test by name filter

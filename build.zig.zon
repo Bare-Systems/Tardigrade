@@ -35,6 +35,11 @@
     // `zig build --fetch` can be used to fetch all dependencies of a package, recursively.
     // Once all dependencies are fetched, `zig build` no longer requires
     // internet connectivity.
+    //
+    // Tardigrade keeps HTTP/3 / QUIC support behind an explicit build flag and
+    // links the ngtcp2/nghttp3 system packages only when that flag is enabled.
+    // The default build has no package-manager dependency on those optional
+    // HTTP/3 libraries.
     .dependencies = .{
         // See `zig fetch --save <url>` for a command-line interface for adding dependencies.
         //.example = .{

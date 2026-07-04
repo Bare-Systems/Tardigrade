@@ -1097,7 +1097,7 @@ pub const GatewayState = struct {
             }
 
             var rnd: [16]u8 = undefined;
-            std.crypto.random.bytes(&rnd);
+            compat.randomBytes(&rnd);
             const token = try std.fmt.allocPrint(self.allocator, "apr-{d}-{f}", .{
                 compat.milliTimestamp(),
                 compat.fmtSliceHexLower(&rnd),

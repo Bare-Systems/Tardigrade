@@ -114,6 +114,28 @@ pub fn build(b: *std.Build) void {
     const integration_step = b.step("test-integration", "Run live-process integration tests");
     integration_step.dependOn(&run_integration_tests.step);
 
+    // Failure-mode / chaos harness (#169): the same live-process harness filtered
+    // to the `failure:`-prefixed tests so operators can exercise broken origins
+    // and clients in isolation.
+    const failure_mode_mod = b.createModule(.{
+        .root_source_file = b.path("tests/integration.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    failure_mode_mod.addImport("integration_options", integration_options.createModule());
+    failure_mode_mod.addImport("build_options", build_options.createModule());
+    failure_mode_mod.addImport("zig_compat", compat_mod);
+
+    const failure_mode_tests = b.addTest(.{
+        .root_module = failure_mode_mod,
+        .filters = &.{"failure:"},
+    });
+    const run_failure_mode_tests = b.addRunArtifact(failure_mode_tests);
+    run_failure_mode_tests.step.dependOn(b.getInstallStep());
+
+    const failure_mode_step = b.step("test-failure", "Run failure-mode / chaos tests against broken origins and clients");
+    failure_mode_step.dependOn(&run_failure_mode_tests.step);
+
     const security_corpus_mod = b.createModule(.{
         .root_source_file = b.path("tests/security/request_parser_corpus.zig"),
         .target = target,

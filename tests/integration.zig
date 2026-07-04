@@ -5364,3 +5364,427 @@ test "idle keepalive connections parked off the worker pool do not starve active
         try std.testing.expectEqual(@as(u16, 200), resp.status_code);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Failure-mode / chaos harness (#169)
+//
+// These tests intentionally break origins and clients, then assert that the
+// gateway fails safely: it returns a defined status (or closes the connection),
+// keeps its single worker available for unrelated requests (no starvation),
+// leaves no leaked client connections (bounded active-connection gauge), and
+// emits the relevant observability signals.  They reuse the mock-origin and
+// live-process harness above and share the `failure:` name prefix so they can
+// be run in isolation via `zig build test-failure`.
+// ---------------------------------------------------------------------------
+
+/// Config fragment used by most failure tests: a dependency-free `/healthz`
+/// route to probe worker liveness plus a `/proxy/` mount pointed at `upstream`.
+fn failureProbeConfig(allocator: std.mem.Allocator, upstream_host: []const u8, upstream_port: u16) ![]u8 {
+    return std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\
+        \\location /proxy/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+    , .{ upstream_host, upstream_port });
+}
+
+/// Assert the gateway's single worker still serves an unrelated route promptly
+/// (i.e. the failure did not wedge or starve it).
+fn assertGatewayServesHealthz(allocator: std.mem.Allocator, port: u16) !void {
+    var health = try sendRequestWithTimeout(allocator, port, .{
+        .method = "GET",
+        .path = "/healthz",
+        .body = null,
+        .headers = &.{},
+    }, 5_000);
+    defer health.deinit();
+    try std.testing.expectEqual(@as(u16, 200), health.status_code);
+    try assertContains(health.body, "alive");
+}
+
+/// Assert the metrics endpoint is scrapeable and that client connections have
+/// drained back to a small bound — a large or growing gauge would indicate a
+/// leaked socket or wedged worker.
+fn assertGatewayNotLeaking(allocator: std.mem.Allocator, port: u16) !void {
+    var metrics = try sendRequestWithTimeout(allocator, port, .{
+        .method = "GET",
+        .path = "/status/metrics",
+        .body = null,
+        .headers = &.{},
+    }, 5_000);
+    defer metrics.deinit();
+    try std.testing.expectEqual(@as(u16, 200), metrics.status_code);
+    const active = prometheusMetricValue(metrics.body, "tardigrade_active_connections") orelse
+        return error.MissingActiveConnectionsMetric;
+    // At most the in-flight metrics request plus a little slack; failures must
+    // not accumulate half-open connections.
+    try std.testing.expect(active <= 4);
+}
+
+/// Poll the metrics endpoint until `name` reaches at least `minimum`.
+fn waitForMetricAtLeast(
+    allocator: std.mem.Allocator,
+    port: u16,
+    name: []const u8,
+    minimum: u64,
+    timeout_ms: u64,
+) !void {
+    const deadline = compat.milliTimestamp() + @as(i64, @intCast(timeout_ms));
+    while (compat.milliTimestamp() < deadline) {
+        var metrics = sendRequestWithTimeout(allocator, port, .{
+            .method = "GET",
+            .path = "/status/metrics",
+            .body = null,
+            .headers = &.{},
+        }, 5_000) catch {
+            compat.sleepNs(25 * std.time.ns_per_ms);
+            continue;
+        };
+        defer metrics.deinit();
+        if (prometheusMetricValue(metrics.body, name)) |value| {
+            if (value >= minimum) return;
+        }
+        compat.sleepNs(25 * std.time.ns_per_ms);
+    }
+    return error.MetricThresholdNotReached;
+}
+
+test "failure: origin down before connect returns 5xx and gateway stays healthy" {
+    const allocator = std.testing.allocator;
+
+    // Reserve a port and never listen on it so the upstream connect is refused.
+    const dead_port = try findFreePort();
+
+    const config_text = try failureProbeConfig(allocator, test_host, dead_port);
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_UPSTREAM_CONNECT_TIMEOUT_MS", .value = "500" },
+        },
+    });
+    defer tardigrade.stop();
+
+    var response = try sendRequestWithTimeout(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/proxy/anything",
+        .body = null,
+        .headers = &.{},
+    }, 5_000);
+    defer response.deinit();
+    // A dead origin must surface as a gateway error, never a hang or a 200.
+    try std.testing.expect(response.status_code >= 502 and response.status_code <= 504);
+
+    try assertGatewayServesHealthz(allocator, tardigrade.port);
+    try assertGatewayNotLeaking(allocator, tardigrade.port);
+}
+
+test "failure: origin that accepts but never responds times out without wedging the worker" {
+    const allocator = std.testing.allocator;
+
+    // Origin accepts the connection but stalls far longer than the read budget.
+    var upstream = try UpstreamServer.start(allocator, &.{.{ .body = "too-late", .delay_ms = 1_500 }});
+    defer upstream.stop();
+    try upstream.run();
+
+    const config_text = try failureProbeConfig(allocator, test_host, upstream.port());
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .extra_env = &.{
+            // Bound the upstream read so a silent origin is force-timed-out. The
+            // per-attempt socket timeout is derived from the connect timeout.
+            .{ .name = "TARDIGRADE_UPSTREAM_CONNECT_TIMEOUT_MS", .value = "400" },
+            .{ .name = "TARDIGRADE_UPSTREAM_TIMEOUT_MS", .value = "400" },
+        },
+    });
+    defer tardigrade.stop();
+
+    var response = try sendRequestWithTimeout(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/proxy/stall",
+        .body = null,
+        .headers = &.{},
+    }, 5_000);
+    defer response.deinit();
+    // A stalled origin must map to a bounded gateway error, not a client hang.
+    try std.testing.expect(response.status_code == 502 or response.status_code == 504);
+
+    try assertGatewayServesHealthz(allocator, tardigrade.port);
+    try assertGatewayNotLeaking(allocator, tardigrade.port);
+}
+
+test "failure: origin closing mid-response never fabricates the advertised body" {
+    const allocator = std.testing.allocator;
+
+    // Advertise a full Content-Length (10) but close after emitting a 4-byte
+    // prefix.  The safety invariant the gateway must never break: it must not
+    // synthesise the missing bytes and claim a complete body.
+    var upstream = try UpstreamServer.start(allocator, &.{.{
+        .body = "abcdefghij",
+        .headers = &.{.{ .name = "Content-Type", .value = "text/plain" }},
+        .truncate_body_after = 4,
+    }});
+    defer upstream.stop();
+    try upstream.run();
+
+    const config_text = try failureProbeConfig(allocator, test_host, upstream.port());
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{ .config_text = config_text });
+    defer tardigrade.stop();
+
+    var response = try sendRequestWithTimeout(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/proxy/truncated",
+        .body = null,
+        .headers = &.{},
+    }, 5_000);
+    defer response.deinit();
+    // Current buffered behaviour forwards only the bytes actually received (a
+    // 200 with the 4-byte prefix); a future hardening may surface this as 502.
+    // Either is safe — fabricating the advertised 10 bytes would not be.
+    // Tracked for 502 hardening in #269.
+    try std.testing.expect(response.status_code == 502 or
+        (response.status_code == 200 and response.body.len < "abcdefghij".len));
+
+    try assertGatewayServesHealthz(allocator, tardigrade.port);
+    try assertGatewayNotLeaking(allocator, tardigrade.port);
+}
+
+test "failure: origin sending malformed response headers fails as a bounded 5xx" {
+    const allocator = std.testing.allocator;
+
+    // Not a valid HTTP response: garbage where a status line belongs, framed
+    // with a blank line so the gateway treats it as a complete (unparseable)
+    // head rather than waiting for more data.
+    var origin = try RawTcpServer.start(allocator, "GARBAGE not-http bytes\r\n\r\n");
+    defer origin.stop();
+    try origin.run();
+
+    const config_text = try failureProbeConfig(allocator, test_host, origin.port());
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .extra_env = &.{
+            // Bound the upstream read so a garbage response resolves to a
+            // defined gateway error promptly instead of stalling the worker.
+            .{ .name = "TARDIGRADE_UPSTREAM_CONNECT_TIMEOUT_MS", .value = "500" },
+            .{ .name = "TARDIGRADE_UPSTREAM_TIMEOUT_MS", .value = "500" },
+        },
+    });
+    defer tardigrade.stop();
+
+    var response = try sendRequestWithTimeout(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/proxy/garbage",
+        .body = null,
+        .headers = &.{},
+    }, 5_000);
+    defer response.deinit();
+    // Garbage must never be passed through as a success; it resolves to a bad
+    // gateway (502) or, when the read window elapses first, a gateway timeout
+    // (504).
+    try std.testing.expect(response.status_code == 502 or response.status_code == 504);
+
+    try assertGatewayServesHealthz(allocator, tardigrade.port);
+    try assertGatewayNotLeaking(allocator, tardigrade.port);
+}
+
+test "failure: client abort mid-upload does not wedge the worker" {
+    const allocator = std.testing.allocator;
+
+    var upstream = try UpstreamServer.start(allocator, &.{.{ .body = "{\"ok\":true}" }});
+    defer upstream.stop();
+    try upstream.run();
+
+    const config_text = try failureProbeConfig(allocator, test_host, upstream.port());
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .extra_env = &.{
+            // Bound the client read so a stalled/aborted upload is timed out and
+            // the single worker is released for the follow-up probe.
+            .{ .name = "TARDIGRADE_KEEP_ALIVE_TIMEOUT_MS", .value = "500" },
+        },
+    });
+    defer tardigrade.stop();
+
+    // Announce a large body, send only a fragment, then hang up mid-upload.
+    {
+        var abort_stream = try compat.tcpConnectToHost(allocator, test_host, tardigrade.port);
+        defer abort_stream.close();
+        const partial = try std.fmt.allocPrint(
+            allocator,
+            "POST /proxy/upload HTTP/1.1\r\nHost: {s}:{d}\r\nContent-Length: 100000\r\nConnection: close\r\n\r\npartial-body-only",
+            .{ test_host, tardigrade.port },
+        );
+        defer allocator.free(partial);
+        try abort_stream.writeAll(partial);
+        // Scope exit drops the connection without sending the promised bytes.
+    }
+
+    // The single worker must remain able to serve unrelated requests.
+    try assertGatewayServesHealthz(allocator, tardigrade.port);
+    try assertGatewayNotLeaking(allocator, tardigrade.port);
+}
+
+test "failure: client abort mid-download is cleaned up and recorded" {
+    const allocator = std.testing.allocator;
+
+    // A response far larger than any socket buffer so the gateway is still
+    // writing when the client disappears, guaranteeing an observed abort.
+    const big_len = 4 * 1024 * 1024;
+    const payload = try allocator.alloc(u8, big_len);
+    defer allocator.free(payload);
+    @memset(payload, 'z');
+
+    var upstream = try UpstreamServer.start(allocator, &.{.{
+        .body = payload,
+        .headers = &.{.{ .name = "Content-Type", .value = "application/octet-stream" }},
+    }});
+    defer upstream.stop();
+    try upstream.run();
+
+    const config_text = try failureProbeConfig(allocator, test_host, upstream.port());
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_PROXY_STREAMING_MODE", .value = "response" },
+            .{ .name = "TARDIGRADE_PROXY_STREAM_BUFFER_SIZE", .value = "4096" },
+            .{ .name = "TARDIGRADE_MAX_BUFFERED_UPSTREAM_RESPONSE_BYTES", .value = "65536" },
+        },
+    });
+    defer tardigrade.stop();
+
+    // Open a proxied download, read only a small prefix, then abandon it.
+    {
+        var stream = try openRequestStream(allocator, tardigrade.port, .{
+            .method = "GET",
+            .path = "/proxy/large.bin",
+            .body = null,
+            .headers = &.{},
+        });
+        defer stream.close();
+        try setStreamTimeouts(&stream, 5_000);
+        var sink: [1024]u8 = undefined;
+        _ = try stream.read(&sink);
+        // Scope exit closes the socket mid-stream without draining the body.
+    }
+
+    // The downstream abort must be observed and the worker must recover.
+    try waitForMetricAtLeast(allocator, tardigrade.port, "tardigrade_proxy_client_aborts_total", 1, 5_000);
+    try assertGatewayServesHealthz(allocator, tardigrade.port);
+    try assertGatewayNotLeaking(allocator, tardigrade.port);
+}
+
+test "failure: unreachable access log sink does not fail requests" {
+    const allocator = std.testing.allocator;
+
+    var upstream = try UpstreamServer.start(allocator, &.{.{
+        .body = "{\"ok\":true}",
+        .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
+    }});
+    defer upstream.stop();
+    try upstream.run();
+
+    // Point the access-log syslog sink at a closed UDP endpoint; log emission
+    // must never block or fail the request path.
+    const dead_sink_port = try findFreePort();
+    const sink = try std.fmt.allocPrint(allocator, "{s}:{d}", .{ test_host, dead_sink_port });
+    defer allocator.free(sink);
+
+    const config_text = try failureProbeConfig(allocator, test_host, upstream.port());
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_ACCESS_LOG_SYSLOG_UDP", .value = sink },
+        },
+    });
+    defer tardigrade.stop();
+
+    var response = try sendRequestWithTimeout(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/proxy/logged",
+        .body = null,
+        .headers = &.{},
+    }, 5_000);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status_code);
+    try assertContains(response.body, "\"ok\":true");
+
+    try assertGatewayNotLeaking(allocator, tardigrade.port);
+}
+
+test "failure: metrics endpoint stays responsive under concurrent proxy load" {
+    const allocator = std.testing.allocator;
+
+    var upstream = try UpstreamServer.start(allocator, &.{.{
+        .body = "{\"ok\":true}",
+        .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
+    }});
+    defer upstream.stop();
+    try upstream.run();
+
+    const config_text = try failureProbeConfig(allocator, test_host, upstream.port());
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{ .config_text = config_text });
+    defer tardigrade.stop();
+
+    const WORKERS = 6;
+    var stop_flag = std.atomic.Value(bool).init(false);
+    const LoadContext = struct {
+        port: u16,
+        stop: *std.atomic.Value(bool),
+    };
+    const LoadRunner = struct {
+        fn run(ctx: LoadContext) void {
+            while (!ctx.stop.load(.seq_cst)) {
+                var r = sendRequest(std.heap.page_allocator, ctx.port, .{
+                    .method = "GET",
+                    .path = "/proxy/ping",
+                    .body = null,
+                    .headers = &.{},
+                }) catch continue;
+                r.deinit();
+            }
+        }
+    };
+
+    var threads: [WORKERS]std.Thread = undefined;
+    for (0..WORKERS) |i| {
+        threads[i] = try std.Thread.spawn(.{}, LoadRunner.run, .{LoadContext{ .port = tardigrade.port, .stop = &stop_flag }});
+    }
+    defer {
+        stop_flag.store(true, .seq_cst);
+        for (0..WORKERS) |i| threads[i].join();
+    }
+
+    // Every scrape performed while proxy traffic is in flight must succeed and
+    // expose well-formed counters.
+    var scrape: usize = 0;
+    while (scrape < 8) : (scrape += 1) {
+        var metrics = try sendRequestWithTimeout(allocator, tardigrade.port, .{
+            .method = "GET",
+            .path = "/status/metrics",
+            .body = null,
+            .headers = &.{},
+        }, 5_000);
+        defer metrics.deinit();
+        try std.testing.expectEqual(@as(u16, 200), metrics.status_code);
+        try std.testing.expect(prometheusMetricValue(metrics.body, "tardigrade_requests_total") != null);
+        try std.testing.expect(prometheusMetricValue(metrics.body, "tardigrade_active_connections") != null);
+    }
+}

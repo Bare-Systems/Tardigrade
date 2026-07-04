@@ -430,33 +430,41 @@ pub fn fixedBufferStream(buffer: []u8) FixedBufferStream {
 }
 
 pub const CompatWriter = struct {
-    inner: std.Io.File.Writer,
+    fd: std.posix.fd_t,
 
-    pub fn writeAll(self: CompatWriter, data: []const u8) !void {
-        var s = self;
-        return s.inner.interface.writeAll(data);
+    pub fn writeAll(self: *CompatWriter, data: []const u8) !void {
+        if (builtin.is_test) return;
+        var remaining = data;
+        while (remaining.len > 0) {
+            const written = std.c.write(self.fd, remaining.ptr, remaining.len);
+            if (written <= 0) return error.WriteFailed;
+            remaining = remaining[@as(usize, @intCast(written))..];
+        }
     }
 
-    pub fn print(self: CompatWriter, comptime fmt: []const u8, args: anytype) !void {
-        var s = self;
-        return s.inner.interface.print(fmt, args);
+    pub fn print(self: *CompatWriter, comptime fmt: []const u8, args: anytype) !void {
+        var buf: [4096]u8 = undefined;
+        const rendered = try std.fmt.bufPrint(&buf, fmt, args);
+        try self.writeAll(rendered);
     }
 
-    pub fn writeByte(self: CompatWriter, byte: u8) !void {
+    pub fn writeByte(self: *CompatWriter, byte: u8) !void {
         return self.writeAll(&[_]u8{byte});
     }
 
     pub fn flush(self: *CompatWriter) !void {
-        return self.inner.flush();
+        _ = self;
     }
 };
 
 pub fn stdoutWriter(buffer: []u8) CompatWriter {
-    return .{ .inner = std.Io.File.stdout().writer(io(), buffer) };
+    _ = buffer;
+    return .{ .fd = std.Io.File.stdout().handle };
 }
 
 pub fn stderrWriter(buffer: []u8) CompatWriter {
-    return .{ .inner = std.Io.File.stderr().writer(io(), buffer) };
+    _ = buffer;
+    return .{ .fd = std.Io.File.stderr().handle };
 }
 
 pub const FileStat = struct {

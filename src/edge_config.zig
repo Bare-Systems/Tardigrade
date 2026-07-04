@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const compat = @import("zig_compat.zig");
 const http = @import("http.zig");
 
@@ -707,7 +708,7 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
 
     const listen_port_str = envOrDefault(allocator, "TARDIGRADE_LISTEN_PORT", "8069") catch unreachable;
     defer allocator.free(listen_port_str);
-    const listen_port = std.fmt.parseInt(u16, listen_port_str, 10) catch 8069;
+    const listen_port = try parseConfigPort("listen_port", listen_port_str);
 
     var tls_cert_path = envOrDefault(allocator, "TARDIGRADE_TLS_CERT_PATH", "") catch unreachable;
     errdefer allocator.free(tls_cert_path);
@@ -770,7 +771,7 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     const tls_acme_renew_days_before_expiry = parseIntEnv(u32, allocator, "TARDIGRADE_TLS_ACME_RENEW_DAYS_BEFORE_EXPIRY", 30);
     const upstream_protocol_str = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_PROTOCOL", "http1") catch unreachable;
     defer allocator.free(upstream_protocol_str);
-    const upstream_protocol = UpstreamProtocol.parse(upstream_protocol_str) orelse .http1;
+    const upstream_protocol = try parseUpstreamProtocolConfig(upstream_protocol_str);
     const upstream_tls_verify = parseBoolEnv(allocator, "TARDIGRADE_UPSTREAM_TLS_VERIFY", true);
     const upstream_tls_ca_bundle = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_TLS_CA_BUNDLE", "") catch unreachable;
     errdefer allocator.free(upstream_tls_ca_bundle);
@@ -784,13 +785,13 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     const http3_enabled = parseBoolEnv(allocator, "TARDIGRADE_HTTP3_ENABLED", false);
     const quic_port_str = envOrDefault(allocator, "TARDIGRADE_QUIC_PORT", "443") catch unreachable;
     defer allocator.free(quic_port_str);
-    const quic_port = std.fmt.parseInt(u16, quic_port_str, 10) catch 443;
+    const quic_port = try parseConfigPort("quic_port", quic_port_str);
     const http3_enable_0rtt = parseBoolEnv(allocator, "TARDIGRADE_HTTP3_ENABLE_0RTT", false);
     const http3_connection_migration = parseBoolEnv(allocator, "TARDIGRADE_HTTP3_CONNECTION_MIGRATION", false);
     const http3_max_datagram_size = parseIntEnv(usize, allocator, "TARDIGRADE_HTTP3_MAX_DATAGRAM_SIZE", 1350);
     const proxy_protocol_mode_str = envOrDefault(allocator, "TARDIGRADE_PROXY_PROTOCOL", "off") catch unreachable;
     defer allocator.free(proxy_protocol_mode_str);
-    const proxy_protocol_mode = ProxyProtocolMode.parse(proxy_protocol_mode_str) orelse .off;
+    const proxy_protocol_mode = try parseProxyProtocolModeConfig(proxy_protocol_mode_str);
     const trust_gateway_id = envOrDefault(allocator, "TARDIGRADE_TRUST_GATEWAY_ID", "tardigrade-edge") catch unreachable;
     errdefer allocator.free(trust_gateway_id);
     const trust_shared_secret = envOrDefault(allocator, "TARDIGRADE_TRUST_SHARED_SECRET", "") catch unreachable;
@@ -873,7 +874,7 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     }
     const lb_algo_str = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_LB_ALGORITHM", "round_robin") catch unreachable;
     defer allocator.free(lb_algo_str);
-    const upstream_lb_algorithm = UpstreamLbAlgorithm.parse(lb_algo_str) orelse .round_robin;
+    const upstream_lb_algorithm = try parseUpstreamLbAlgorithmConfig(lb_algo_str);
 
     const timeout_str = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_TIMEOUT_MS", "10000") catch unreachable;
     defer allocator.free(timeout_str);
@@ -1001,7 +1002,7 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     // Log level
     const log_level_str = envOrDefault(allocator, "TARDIGRADE_LOG_LEVEL", "info") catch unreachable;
     defer allocator.free(log_level_str);
-    const log_level = http.logger.Level.parse(log_level_str) orelse .info;
+    const log_level = try parseLogLevelConfig(log_level_str);
     const error_log_path = envOrDefault(allocator, "TARDIGRADE_ERROR_LOG_PATH", "") catch unreachable;
     errdefer allocator.free(error_log_path);
     const pid_file = envOrDefault(allocator, "TARDIGRADE_PID_FILE", "") catch unreachable;
@@ -1034,7 +1035,7 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     errdefer allocator.free(try_files);
     const access_log_format_str = envOrDefault(allocator, "TARDIGRADE_ACCESS_LOG_FORMAT", "json") catch unreachable;
     defer allocator.free(access_log_format_str);
-    const access_log_format = http.access_log.Format.parse(access_log_format_str) orelse .json;
+    const access_log_format = try parseAccessLogFormatConfig(access_log_format_str);
     const access_log_template = envOrDefault(allocator, "TARDIGRADE_ACCESS_LOG_TEMPLATE", "") catch unreachable;
     errdefer allocator.free(access_log_template);
     const access_log_min_status = parseIntEnv(u16, allocator, "TARDIGRADE_ACCESS_LOG_MIN_STATUS", 0);
@@ -1167,7 +1168,7 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
 
     const proxy_streaming_mode_str = envOrDefault(allocator, "TARDIGRADE_PROXY_STREAMING_MODE", "off") catch unreachable;
     defer allocator.free(proxy_streaming_mode_str);
-    const proxy_streaming_mode = ProxyStreamingMode.parse(proxy_streaming_mode_str) orelse .off;
+    const proxy_streaming_mode = try parseProxyStreamingModeConfig(proxy_streaming_mode_str);
     const proxy_stream_buffer_size = parseIntEnv(usize, allocator, "TARDIGRADE_PROXY_STREAM_BUFFER_SIZE", 16 * 1024);
 
     const max_total_conn_mem_str = envOrDefault(allocator, "TARDIGRADE_MAX_TOTAL_CONNECTION_MEMORY_BYTES", "0") catch unreachable;
@@ -1766,10 +1767,79 @@ fn applyServerBlockTlsConfig(
     tls_sni_certs.* = merged;
 }
 
+fn parseConfigPort(label: []const u8, raw: []const u8) !u16 {
+    const value = std.mem.trim(u8, raw, " \t\r\n");
+    const port = std.fmt.parseInt(u16, value, 10) catch {
+        logConfigDiagnostic("config validation failed: {s} must be an integer port between 1 and 65535", .{label});
+        return error.InvalidConfigPort;
+    };
+    if (port == 0) {
+        logConfigDiagnostic("config validation failed: {s} must be between 1 and 65535", .{label});
+        return error.InvalidConfigPort;
+    }
+    return port;
+}
+
+fn parseUpstreamProtocolConfig(raw: []const u8) !UpstreamProtocol {
+    const value = std.mem.trim(u8, raw, " \t\r\n");
+    return UpstreamProtocol.parse(value) orelse {
+        logConfigDiagnostic("config validation failed: upstream_protocol must be one of http1, h2, auto, h2c", .{});
+        return error.InvalidConfigValue;
+    };
+}
+
+fn parseProxyProtocolModeConfig(raw: []const u8) !ProxyProtocolMode {
+    const value = std.mem.trim(u8, raw, " \t\r\n");
+    return ProxyProtocolMode.parse(value) orelse {
+        logConfigDiagnostic("config validation failed: proxy_protocol must be one of off, auto, v1, v2", .{});
+        return error.InvalidConfigValue;
+    };
+}
+
+fn parseUpstreamLbAlgorithmConfig(raw: []const u8) !UpstreamLbAlgorithm {
+    const value = std.mem.trim(u8, raw, " \t\r\n");
+    return UpstreamLbAlgorithm.parse(value) orelse {
+        logConfigDiagnostic("config validation failed: upstream_lb_algorithm must be one of round_robin, least_connections, ip_hash, generic_hash, random_two_choices", .{});
+        return error.InvalidConfigValue;
+    };
+}
+
+fn parseLogLevelConfig(raw: []const u8) !http.logger.Level {
+    const value = std.mem.trim(u8, raw, " \t\r\n");
+    return http.logger.Level.parse(value) orelse {
+        logConfigDiagnostic("config validation failed: log_level must be one of debug, info, warn, error", .{});
+        return error.InvalidConfigValue;
+    };
+}
+
+fn parseAccessLogFormatConfig(raw: []const u8) !http.access_log.Format {
+    const value = std.mem.trim(u8, raw, " \t\r\n");
+    return http.access_log.Format.parse(value) orelse {
+        logConfigDiagnostic("config validation failed: access_log_format must be one of json, plain, custom", .{});
+        return error.InvalidConfigValue;
+    };
+}
+
+fn parseProxyStreamingModeConfig(raw: []const u8) !ProxyStreamingMode {
+    const value = std.mem.trim(u8, raw, " \t\r\n");
+    return ProxyStreamingMode.parse(value) orelse {
+        logConfigDiagnostic("config validation failed: proxy_streaming_mode must be one of off, buffered, response, full, request-response", .{});
+        return error.InvalidConfigValue;
+    };
+}
+
+fn logConfigDiagnostic(comptime fmt: []const u8, args: anytype) void {
+    if (!builtin.is_test) std.log.err(fmt, args);
+}
+
 fn envOrDefault(allocator: std.mem.Allocator, key: []const u8, default_value: []const u8) ![]u8 {
     if (compat.getEnvVarOwned(allocator, key)) |owned| {
         if (conflictingFileOverrideValue(key, owned)) |file_value| {
-            std.log.warn("config override conflict for {s}: env value '{s}' overrides file-config value '{s}'", .{ key, owned, file_value });
+            std.log.warn("config override conflict for {s}: env value '{s}' overrides file-config value '{s}'", .{
+                key,
+                configValueForLog(key, owned),
+                configValueForLog(key, file_value),
+            });
         }
         return owned;
     } else |_| {}
@@ -1785,6 +1855,18 @@ fn envOrDefault(allocator: std.mem.Allocator, key: []const u8, default_value: []
         }
     }
     return allocator.dupe(u8, default_value);
+}
+
+fn configValueForLog(key: []const u8, value: []const u8) []const u8 {
+    return if (isSensitiveConfigKey(key)) "<redacted>" else value;
+}
+
+fn isSensitiveConfigKey(key: []const u8) bool {
+    return std.mem.indexOf(u8, key, "SECRET") != null or
+        std.mem.indexOf(u8, key, "TOKEN") != null or
+        std.mem.indexOf(u8, key, "PASSWORD") != null or
+        std.mem.indexOf(u8, key, "PRIVATE_KEY") != null or
+        std.mem.indexOf(u8, key, "KEY_PATH") != null;
 }
 
 fn conflictingFileOverrideValue(key: []const u8, env_value: []const u8) ?[]const u8 {
@@ -2661,9 +2743,9 @@ fn validateUpstreamBaseUrlList(values: []const []const u8, label: []const u8) !v
 fn validateOptionalAbsoluteUrl(raw: []const u8, label: []const u8) !void {
     validateOptionalAbsoluteUrlChecked(raw) catch |err| {
         if (!isAbsoluteHttpUrl(raw)) {
-            std.log.err("config validation failed: {s} must be an absolute http/https URL: {s}", .{ label, raw });
+            std.log.err("config validation failed: {s} must be an absolute http/https URL", .{label});
         } else {
-            std.log.err("config validation failed: {s} is not a valid URL: {s}", .{ label, raw });
+            std.log.err("config validation failed: {s} is not a valid URL", .{label});
         }
         return err;
     };
@@ -2825,6 +2907,27 @@ test "parse proxy streaming mode aliases" {
     try std.testing.expect(ProxyStreamingMode.full.responseStreamingEnabled());
     try std.testing.expect(ProxyStreamingMode.full.requestStreamingEnabled());
     try std.testing.expect(ProxyStreamingMode.parse("invalid") == null);
+}
+
+test "config port parser rejects invalid listener values" {
+    try std.testing.expectEqual(@as(u16, 8069), try parseConfigPort("listen_port", "8069"));
+    try std.testing.expectError(error.InvalidConfigPort, parseConfigPort("listen_port", "0"));
+    try std.testing.expectError(error.InvalidConfigPort, parseConfigPort("listen_port", "not-a-port"));
+}
+
+test "config enum parsers reject invalid values" {
+    try std.testing.expectEqual(ProxyStreamingMode.full, try parseProxyStreamingModeConfig("request-response"));
+    try std.testing.expectError(error.InvalidConfigValue, parseProxyStreamingModeConfig("streaming"));
+    try std.testing.expectEqual(ProxyProtocolMode.v2, try parseProxyProtocolModeConfig("v2"));
+    try std.testing.expectError(error.InvalidConfigValue, parseProxyProtocolModeConfig("v3"));
+    try std.testing.expectEqual(UpstreamProtocol.h2c, try parseUpstreamProtocolConfig("h2c"));
+    try std.testing.expectError(error.InvalidConfigValue, parseUpstreamProtocolConfig("spdy"));
+}
+
+test "sensitive config values are redacted for logs" {
+    try std.testing.expectEqualStrings("<redacted>", configValueForLog("TARDIGRADE_JWT_SECRET", "super-secret"));
+    try std.testing.expectEqualStrings("<redacted>", configValueForLog("TARDIGRADE_AUTH_TOKEN_HASHES", "abc"));
+    try std.testing.expectEqualStrings("8069", configValueForLog("TARDIGRADE_LISTEN_PORT", "8069"));
 }
 
 test "UpstreamProtocol parses h2c and gates prior-knowledge separately from ALPN" {

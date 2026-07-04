@@ -6,9 +6,13 @@ const http = @import("http.zig");
 const runtime_allocator = @import("runtime_allocator.zig");
 
 const ENV_CONFIG_PATH = "TARDIGRADE_CONFIG_PATH";
+const CHECK_DEFAULT_CONFIG_PATH = "./tardigrade.toml";
+const EXIT_INTERNAL_ERROR: u8 = 1;
+const EXIT_CONFIG_INVALID: u8 = 2;
 
 const CliCommand = union(enum) {
     run: RunOptions,
+    check: CommonOptions,
     validate: CommonOptions,
     status: SignalOptions,
     print_config: CommonOptions,
@@ -39,6 +43,11 @@ const ConfigInitOptions = struct {
     output_path: []const u8 = "tardigrade.conf",
     force: bool = false,
     stdout: bool = false,
+};
+
+const ValidationMode = enum {
+    check,
+    legacy,
 };
 
 const starter_config =
@@ -108,10 +117,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .print_config => |options| try executePrintConfigCommand(control_allocator, options),
         .reload => |options| try executeSignalCommand(control_allocator, "reload", std.posix.SIG.HUP, options),
         .stop => |options| try executeSignalCommand(control_allocator, "stop", std.posix.SIG.TERM, options),
-        .validate => |options| try executeValidateCommand(control_allocator, options),
+        .check => |options| try executeValidationCommandOrExit(control_allocator, options, .check),
+        .validate => |options| try executeValidationCommandOrExit(control_allocator, options, .legacy),
         .run => |options| {
             if (environmentRequestsValidate()) {
-                try executeValidateCommand(control_allocator, options.common);
+                try executeValidationCommandOrExit(control_allocator, options.common, .legacy);
                 return;
             }
             try executeRunCommand(runtime_allocator.runtimeAllocator(), args, options);
@@ -220,7 +230,7 @@ fn parseCheckCommand(args: []const []const u8) !CliCommand {
         }
         return error.UnknownOption;
     }
-    return .{ .validate = options };
+    return .{ .check = options };
 }
 
 fn parseSignalCommand(comptime kind: enum { reload, stop, status }, args: []const []const u8) !CliCommand {
@@ -312,12 +322,12 @@ fn printUsage(writer: anytype) !void {
         \\
         \\Notes:
         \\  - `check [<config>]` validates a config file without starting the server.
-        \\    Accepts a positional config path or defaults to the standard search path.
+        \\    Accepts a positional config path or defaults to `./tardigrade.toml`.
         \\    `config validate [<config>]` is a verbose alias for the same command.
-        \\  - Legacy `--validate-config` remains supported.
+        \\  - Legacy `validate` and `--validate-config` remain supported.
         \\  - `status` reports process state when a pid target is available.
         \\  - `print-config` prints the effective operator-facing config summary.
-        \\  - Config discovery checks `-c/--config`, `TARDIGRADE_CONFIG_PATH`,
+        \\  - Runtime config discovery checks `-c/--config`, `TARDIGRADE_CONFIG_PATH`,
         \\    `./tardigrade.conf`, `./config/tardigrade.conf`,
         \\    `/etc/tardigrade/tardigrade.conf`, and
         \\    `$HOME/.config/tardigrade/tardigrade.conf`.
@@ -342,8 +352,18 @@ fn environmentRequestsValidate() bool {
     return std.mem.eql(u8, env, "1") or std.ascii.eqlIgnoreCase(env, "true");
 }
 
-fn executeValidateCommand(allocator: std.mem.Allocator, options: CommonOptions) !void {
-    const resolved_config_path = try resolveRuntimeConfigPath(allocator, options.config_path);
+fn executeValidationCommandOrExit(allocator: std.mem.Allocator, options: CommonOptions, mode: ValidationMode) !void {
+    executeValidateCommand(allocator, options, mode) catch |err| {
+        var stderr_buf: [2048]u8 = undefined;
+        var stderr = compat.stderrWriter(&stderr_buf);
+        try printConfigCommandError(&stderr, err, options, mode);
+        try stderr.flush();
+        std.process.exit(configCommandExitCode(err));
+    };
+}
+
+fn executeValidateCommand(allocator: std.mem.Allocator, options: CommonOptions, mode: ValidationMode) !void {
+    const resolved_config_path = try resolveValidationConfigPath(allocator, options.config_path, mode);
     defer if (resolved_config_path) |path| allocator.free(path);
     if (resolved_config_path) |path| try setProcessEnv(allocator, ENV_CONFIG_PATH, path);
 
@@ -356,6 +376,80 @@ fn executeValidateCommand(allocator: std.mem.Allocator, options: CommonOptions) 
     try stdout.writeAll("configuration valid\n");
     try writeConfigSummary(&stdout, resolved_config_path, &cfg);
     try stdout.flush();
+}
+
+fn printConfigCommandError(writer: anytype, err: anyerror, options: CommonOptions, mode: ValidationMode) !void {
+    const target = validationTargetDescription(options, mode);
+    switch (err) {
+        error.ConfigPathNotFound => try writer.print("error: configuration parse failed: config file not found: {s}\n", .{target}),
+        error.MissingConfigPath => try writer.writeAll("error: configuration parse failed: missing config path\n"),
+        error.FileNotFound => try writer.print("error: configuration parse failed for {s}: referenced file not found\n", .{target}),
+        error.InvalidConfigSyntax,
+        error.InvalidIncludePattern,
+        error.InvalidVariableInterpolation,
+        => try writer.print("error: configuration parse failed for {s}; see the line-specific diagnostic above\n", .{target}),
+        else => {
+            if (isConfigValidationError(err)) {
+                try writer.print("error: configuration validation failed for {s}: {}\n", .{ target, err });
+            } else {
+                try writer.print("error: unexpected internal error while checking configuration: {}\n", .{err});
+            }
+        },
+    }
+}
+
+fn validationTargetDescription(options: CommonOptions, mode: ValidationMode) []const u8 {
+    if (options.config_path) |path| return path;
+    return switch (mode) {
+        .check => CHECK_DEFAULT_CONFIG_PATH,
+        .legacy => "<standard config search path>",
+    };
+}
+
+fn configCommandExitCode(err: anyerror) u8 {
+    if (isConfigValidationError(err)) return EXIT_CONFIG_INVALID;
+    return EXIT_INTERNAL_ERROR;
+}
+
+fn isConfigValidationError(err: anyerror) bool {
+    return switch (err) {
+        error.ConfigPathNotFound,
+        error.MissingConfigPath,
+        error.FileNotFound,
+        error.AccessDenied,
+        error.InvalidConfigSyntax,
+        error.InvalidIncludePattern,
+        error.InvalidVariableInterpolation,
+        error.InvalidConfigPort,
+        error.InvalidConfigPath,
+        error.InvalidConfigUrl,
+        error.InvalidConfigEndpoint,
+        error.InvalidConfigValue,
+        error.InvalidConfigTlsVersion,
+        error.InvalidServerBlockFormat,
+        error.InvalidLocationBlockFormat,
+        error.InvalidRewriteRuleFormat,
+        error.InvalidRewriteRuleFlag,
+        error.InvalidReturnRuleFormat,
+        error.InvalidReturnRuleStatus,
+        error.InvalidConditionalRuleFormat,
+        error.InvalidConditionalVariable,
+        error.InvalidInternalRedirectRuleFormat,
+        error.InvalidNamedLocationFormat,
+        error.InvalidMirrorRuleFormat,
+        error.InvalidTlsSniCertFormat,
+        error.InvalidUpstreamBaseUrlWeight,
+        error.InvalidUpstreamBaseUrlWeightsCount,
+        error.InvalidGeoCountryCode,
+        error.InvalidAddHeaderFormat,
+        error.InvalidFastcgiParamFormat,
+        error.InvalidTokenHashLength,
+        error.InvalidTokenHashHex,
+        error.InvalidHealthStatusRange,
+        error.InvalidHealthStatusOverride,
+        => true,
+        else => false,
+    };
 }
 
 fn executePrintConfigCommand(allocator: std.mem.Allocator, options: CommonOptions) !void {
@@ -565,6 +659,14 @@ fn writeStarterConfig(options: ConfigInitOptions) !void {
     var stdout = compat.stdoutWriter(&stdout_buf);
     try stdout.print("wrote starter config to {s}\n", .{options.output_path});
     try stdout.flush();
+}
+
+fn resolveValidationConfigPath(allocator: std.mem.Allocator, cli_path: ?[]const u8, mode: ValidationMode) !?[]u8 {
+    if (cli_path) |path| return try requireConfigPath(allocator, path);
+    return switch (mode) {
+        .check => try requireConfigPath(allocator, CHECK_DEFAULT_CONFIG_PATH),
+        .legacy => try resolveRuntimeConfigPath(allocator, null),
+    };
 }
 
 fn resolveRuntimeConfigPath(allocator: std.mem.Allocator, cli_path: ?[]const u8) !?[]u8 {
@@ -1087,10 +1189,10 @@ test "writeStarterConfig returns error if file exists and force is false" {
     try std.testing.expectError(error.PathAlreadyExists, writeStarterConfig(.{ .output_path = out_path, .stdout = false }));
 }
 
-test "parseCliCommand check with no args returns validate" {
+test "parseCliCommand check with no args returns check" {
     const cmd = try parseCliCommand(&.{"check"});
     switch (cmd) {
-        .validate => |options| try std.testing.expectEqual(@as(?[]const u8, null), options.config_path),
+        .check => |options| try std.testing.expectEqual(@as(?[]const u8, null), options.config_path),
         else => return error.TestUnexpectedResult,
     }
 }
@@ -1098,7 +1200,7 @@ test "parseCliCommand check with no args returns validate" {
 test "parseCliCommand check with positional config path" {
     const cmd = try parseCliCommand(&.{ "check", "my.conf" });
     switch (cmd) {
-        .validate => |options| try std.testing.expectEqualStrings("my.conf", options.config_path.?),
+        .check => |options| try std.testing.expectEqualStrings("my.conf", options.config_path.?),
         else => return error.TestUnexpectedResult,
     }
 }
@@ -1106,7 +1208,7 @@ test "parseCliCommand check with positional config path" {
 test "parseCliCommand check with -c flag" {
     const cmd = try parseCliCommand(&.{ "check", "-c", "my.conf" });
     switch (cmd) {
-        .validate => |options| try std.testing.expectEqualStrings("my.conf", options.config_path.?),
+        .check => |options| try std.testing.expectEqualStrings("my.conf", options.config_path.?),
         else => return error.TestUnexpectedResult,
     }
 }
@@ -1115,10 +1217,10 @@ test "parseCliCommand check rejects multiple positional args" {
     try std.testing.expectError(error.TooManyArguments, parseCliCommand(&.{ "check", "a.conf", "b.conf" }));
 }
 
-test "parseCliCommand config validate with no args returns validate" {
+test "parseCliCommand config validate with no args returns check" {
     const cmd = try parseCliCommand(&.{ "config", "validate" });
     switch (cmd) {
-        .validate => |options| try std.testing.expectEqual(@as(?[]const u8, null), options.config_path),
+        .check => |options| try std.testing.expectEqual(@as(?[]const u8, null), options.config_path),
         else => return error.TestUnexpectedResult,
     }
 }
@@ -1126,7 +1228,16 @@ test "parseCliCommand config validate with no args returns validate" {
 test "parseCliCommand config validate with positional config path" {
     const cmd = try parseCliCommand(&.{ "config", "validate", "tardigrade.conf" });
     switch (cmd) {
-        .validate => |options| try std.testing.expectEqualStrings("tardigrade.conf", options.config_path.?),
+        .check => |options| try std.testing.expectEqualStrings("tardigrade.conf", options.config_path.?),
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "check command default path is tardigrade.toml" {
+    try std.testing.expectEqualStrings(CHECK_DEFAULT_CONFIG_PATH, validationTargetDescription(.{}, .check));
+}
+
+test "config command invalid input exits with config error code" {
+    try std.testing.expectEqual(EXIT_CONFIG_INVALID, configCommandExitCode(error.InvalidConfigSyntax));
+    try std.testing.expectEqual(EXIT_INTERNAL_ERROR, configCommandExitCode(error.OutOfMemory));
 }

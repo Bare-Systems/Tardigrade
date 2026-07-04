@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const compat = @import("../zig_compat.zig");
 
 pub const Overrides = struct {
@@ -80,6 +81,17 @@ const LocationBlockBuilder = struct {
     rewrite_flag: ?[]u8 = null,
     auth: ?[]u8 = null,
     error_pages: std.ArrayList(ErrorPageBuilder) = .empty,
+
+    fn actionKind(self: *const LocationBlockBuilder) ?[]const u8 {
+        if (self.proxy_pass != null) return "proxy_pass";
+        if (self.fastcgi_pass != null) return "fastcgi_pass";
+        if (self.scgi_pass != null) return "scgi_pass";
+        if (self.uwsgi_pass != null) return "uwsgi_pass";
+        if (self.return_status != null) return "return";
+        if (self.root != null or self.alias != null or self.autoindex != null or self.index != null or self.try_files != null) return "static";
+        if (self.rewrite_replacement != null) return "rewrite";
+        return null;
+    }
 
     fn deinit(self: *LocationBlockBuilder, allocator: std.mem.Allocator) void {
         allocator.free(self.match_type);
@@ -659,38 +671,47 @@ fn parseLocationStatement(
     defer allocator.free(value_interp);
 
     if (std.ascii.eqlIgnoreCase(directive, "proxy_pass")) {
+        try ensureLocationActionAllowed(file_path, line_no, builder, "proxy_pass");
         try replaceOptionalOwned(allocator, &builder.proxy_pass, value_interp);
         return;
     }
     if (std.ascii.eqlIgnoreCase(directive, "fastcgi_pass")) {
+        try ensureLocationActionAllowed(file_path, line_no, builder, "fastcgi_pass");
         try replaceOptionalOwned(allocator, &builder.fastcgi_pass, value_interp);
         return;
     }
     if (std.ascii.eqlIgnoreCase(directive, "scgi_pass")) {
+        try ensureLocationActionAllowed(file_path, line_no, builder, "scgi_pass");
         try replaceOptionalOwned(allocator, &builder.scgi_pass, value_interp);
         return;
     }
     if (std.ascii.eqlIgnoreCase(directive, "uwsgi_pass")) {
+        try ensureLocationActionAllowed(file_path, line_no, builder, "uwsgi_pass");
         try replaceOptionalOwned(allocator, &builder.uwsgi_pass, value_interp);
         return;
     }
     if (std.ascii.eqlIgnoreCase(directive, "root")) {
+        try ensureLocationActionAllowed(file_path, line_no, builder, "static");
         try replaceOptionalOwned(allocator, &builder.root, value_interp);
         return;
     }
     if (std.ascii.eqlIgnoreCase(directive, "alias")) {
+        try ensureLocationActionAllowed(file_path, line_no, builder, "static");
         try replaceOptionalOwned(allocator, &builder.alias, value_interp);
         return;
     }
     if (std.ascii.eqlIgnoreCase(directive, "index")) {
+        try ensureLocationActionAllowed(file_path, line_no, builder, "static");
         try replaceOptionalOwned(allocator, &builder.index, value_interp);
         return;
     }
     if (std.ascii.eqlIgnoreCase(directive, "autoindex")) {
+        try ensureLocationActionAllowed(file_path, line_no, builder, "static");
         builder.autoindex = parseOnOffBool(value_interp) orelse return error.InvalidConfigSyntax;
         return;
     }
     if (std.ascii.eqlIgnoreCase(directive, "try_files")) {
+        try ensureLocationActionAllowed(file_path, line_no, builder, "static");
         try replaceOptionalOwned(allocator, &builder.try_files, value_interp);
         return;
     }
@@ -723,6 +744,7 @@ fn parseLocationStatement(
         return;
     }
     if (std.ascii.eqlIgnoreCase(directive, "return")) {
+        try ensureLocationActionAllowed(file_path, line_no, builder, "return");
         var toks = std.mem.tokenizeAny(u8, value_raw, " \t");
         const status_raw = toks.next() orelse return error.InvalidConfigSyntax;
         const body_raw = std.mem.trim(u8, toks.rest(), " \t");
@@ -739,6 +761,7 @@ fn parseLocationStatement(
         return;
     }
     if (std.ascii.eqlIgnoreCase(directive, "rewrite")) {
+        try ensureLocationActionAllowed(file_path, line_no, builder, "rewrite");
         var toks = std.mem.tokenizeAny(u8, value_raw, " \t");
         _ = toks.next() orelse return error.InvalidConfigSyntax;
         const replacement_raw = toks.next() orelse return error.InvalidConfigSyntax;
@@ -758,6 +781,25 @@ fn parseLocationStatement(
         try replaceOptionalOwned(allocator, &builder.auth, value_interp);
         return;
     }
+}
+
+fn ensureLocationActionAllowed(
+    file_path: []const u8,
+    line_no: usize,
+    builder: *const LocationBlockBuilder,
+    requested: []const u8,
+) !void {
+    const existing = builder.actionKind() orelse return;
+    if (std.mem.eql(u8, existing, requested)) return;
+    logConfigSyntaxDiagnostic(
+        "config syntax error at {s}:{d}: location '{s}' has conflicting action directives ({s} and {s}); choose one",
+        .{ file_path, line_no, builder.pattern, existing, requested },
+    );
+    return error.InvalidConfigSyntax;
+}
+
+fn logConfigSyntaxDiagnostic(comptime fmt: []const u8, args: anytype) void {
+    if (!builtin.is_test) std.log.err(fmt, args);
 }
 
 fn buildLocationBlockEntry(allocator: std.mem.Allocator, builder: *LocationBlockBuilder) ![]u8 {
@@ -807,7 +849,10 @@ fn buildLocationBlockEntry(allocator: std.mem.Allocator, builder: *LocationBlock
 
 fn flushLocationBlock(allocator: std.mem.Allocator, overrides: *Overrides, builder: *LocationBlockBuilder) !void {
     const entry = buildLocationBlockEntry(allocator, builder) catch |err| switch (err) {
-        error.InvalidConfigSyntax => return,
+        error.InvalidConfigSyntax => {
+            logConfigSyntaxDiagnostic("config syntax error: location '{s}' has no action directive", .{builder.pattern});
+            return err;
+        },
         else => return err,
     };
     defer allocator.free(entry);
@@ -1259,6 +1304,68 @@ test "location block supports error_page serialization" {
         "prefix|/|404|/errors/404.html;prefix|/|500,502,503,504|https://example.com/50x",
         overrides.map.get("TARDIGRADE_LOCATION_ERROR_PAGES").?,
     );
+}
+
+test "location block rejects conflicting proxy and static actions" {
+    const allocator = std.testing.allocator;
+    var cfg_dir = std.testing.tmpDir(.{});
+    defer cfg_dir.cleanup();
+
+    try compat.wrapDir(cfg_dir.dir).writeFile(.{
+        .sub_path = "location-conflict.conf",
+        .data =
+        \\location / {
+        \\    proxy_pass http://127.0.0.1:9001;
+        \\    root /srv/www;
+        \\}
+        ,
+    });
+
+    const absolute = try compat.wrapDir(cfg_dir.dir).realpathAlloc(allocator, "location-conflict.conf");
+    defer allocator.free(absolute);
+
+    var overrides = Overrides.init(allocator);
+    defer overrides.deinit(allocator);
+    var vars = std.StringHashMap([]const u8).init(allocator);
+    defer vars.deinit();
+    var visited = std.StringHashMap(void).init(allocator);
+    defer {
+        var it = visited.iterator();
+        while (it.next()) |entry| allocator.free(entry.key_ptr.*);
+        visited.deinit();
+    }
+
+    try std.testing.expectError(error.InvalidConfigSyntax, parseFile(allocator, absolute, &overrides, &vars, &visited));
+}
+
+test "location block rejects missing action directive" {
+    const allocator = std.testing.allocator;
+    var cfg_dir = std.testing.tmpDir(.{});
+    defer cfg_dir.cleanup();
+
+    try compat.wrapDir(cfg_dir.dir).writeFile(.{
+        .sub_path = "location-empty.conf",
+        .data =
+        \\location /empty {
+        \\}
+        ,
+    });
+
+    const absolute = try compat.wrapDir(cfg_dir.dir).realpathAlloc(allocator, "location-empty.conf");
+    defer allocator.free(absolute);
+
+    var overrides = Overrides.init(allocator);
+    defer overrides.deinit(allocator);
+    var vars = std.StringHashMap([]const u8).init(allocator);
+    defer vars.deinit();
+    var visited = std.StringHashMap(void).init(allocator);
+    defer {
+        var it = visited.iterator();
+        while (it.next()) |entry| allocator.free(entry.key_ptr.*);
+        visited.deinit();
+    }
+
+    try std.testing.expectError(error.InvalidConfigSyntax, parseFile(allocator, absolute, &overrides, &vars, &visited));
 }
 
 test "server block supports nested location serialization" {

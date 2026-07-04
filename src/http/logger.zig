@@ -91,7 +91,7 @@ pub const Logger = struct {
         appendJsonLine(line_stream.writer(), self, level, correlation_id, ts, msg) catch {
             var stderr_buf: [1024]u8 = undefined;
             var stderr = compat.stderrWriter(&stderr_buf);
-            appendJsonLine(stderr, self, level, correlation_id, ts, msg) catch return;
+            appendJsonLine(&stderr, self, level, correlation_id, ts, msg) catch return;
             stderr.flush() catch {}; // best-effort flush; log loss on stderr is acceptable
             return;
         };

@@ -156,6 +156,8 @@ Then open:
 Common CLI commands:
 
 ```bash
+./zig-out/bin/tardigrade check ./tardigrade.conf
+./zig-out/bin/tardigrade config validate ./tardigrade.conf
 ./zig-out/bin/tardigrade validate -c ./tardigrade.conf
 ./zig-out/bin/tardigrade print-config -c ./tardigrade.conf
 ./zig-out/bin/tardigrade status -c ./tardigrade.conf
@@ -163,6 +165,11 @@ Common CLI commands:
 ./zig-out/bin/tardigrade stop -c ./tardigrade.conf
 ./zig-out/bin/tardigrade config init
 ```
+
+`check` performs a dry parse and semantic validation without starting listeners
+or connecting to upstreams. When no path is supplied, it validates
+`./tardigrade.toml`; pass the path explicitly when using the nginx-style
+`tardigrade.conf` examples.
 
 ## Overview
 
@@ -178,7 +185,7 @@ internally and is tracked as an experimental surface rather than part of the
 default stable release contract.
 
 Configuration is nginx-inspired and can be checked before startup with
-`tardigrade validate`. Runtime inspection commands such as `status` and
+`tardigrade check <config>`. Runtime inspection commands such as `status` and
 `print-config` are designed to make package and service deployments easier to
 operate without guessing which config file or pid file is active.
 

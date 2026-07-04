@@ -339,7 +339,7 @@ pub fn executeBoundedBufferedTcpHttpRequest(
     // cleaned up on return.
     if (active_pool == null) {
         const start_ms = http.event_loop.monotonicMs();
-        const fd = try compat.connectBlockingTcp(host, port);
+        const fd = try compat.connectBoundedTcp(host, port, connect_timeout_ms);
         defer _ = std.c.close(fd);
         if (connect_timeout_ms > 0) {
             try setSocketTimeoutMs(fd, connect_timeout_ms, connect_timeout_ms);
@@ -383,7 +383,7 @@ pub fn executeBoundedBufferedTcpHttpRequest(
         }
         if (!reused) {
             const connect_start_ms = http.event_loop.monotonicMs();
-            const new_fd = compat.connectBlockingTcp(host, port) catch |err| {
+            const new_fd = compat.connectBoundedTcp(host, port, connect_timeout_ms) catch |err| {
                 p.releaseSlot(key);
                 return err;
             };
@@ -457,7 +457,7 @@ fn executeBufferedH2OrH1Fresh(
     response_timeout_ms: u32,
     pool: ?*http.upstream_pool.UpstreamPool,
 ) !BufferedUpstreamResponse {
-    const fd = try compat.connectBlockingTcp(host, port);
+    const fd = try compat.connectBoundedTcp(host, port, connect_timeout_ms);
     defer _ = std.c.close(fd);
     if (connect_timeout_ms > 0) setSocketTimeoutMs(fd, connect_timeout_ms, connect_timeout_ms) catch {};
 
@@ -545,7 +545,7 @@ fn executeBufferedViaH2Pool(
 
     var attempt: usize = 0;
     while (attempt < 2) : (attempt += 1) {
-        const acq = try h2_pool.acquire(key, host, port, opts, deadline_ms);
+        const acq = try h2_pool.acquire(key, host, port, opts, connect_timeout_ms, deadline_ms);
         switch (acq) {
             .h1 => |tls_ptr| {
                 // ALPN negotiated HTTP/1.1: run the h1 exchange on this fresh
@@ -658,7 +658,7 @@ fn streamViaH2Pool(
 
     var attempt: usize = 0;
     while (attempt < 2) : (attempt += 1) {
-        const acq = try h2_pool.acquire(key, host, port, opts, deadline_ms);
+        const acq = try h2_pool.acquire(key, host, port, opts, connect_timeout_ms, deadline_ms);
         switch (acq) {
             .h1 => |tls_ptr| {
                 // ALPN negotiated HTTP/1.1: run the h1 streaming relay on this
@@ -1770,7 +1770,7 @@ pub fn executeStreamingHttpProxyRequest(
         }
         if (!reused) {
             const connect_start = http.event_loop.monotonicMs();
-            const new_fd = compat.connectBlockingTcp(host, port) catch |err| {
+            const new_fd = compat.connectBoundedTcp(host, port, connect_timeout_ms) catch |err| {
                 if (active_pool) |p| p.releaseSlot(key);
                 return err;
             };

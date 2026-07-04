@@ -61,16 +61,16 @@ zig build -Dstatic-executable=true -Drequire-static-system-libs=true
 # Build with HTTP/3 support (requires system ngtcp2/nghttp3 libraries)
 zig build -Denable-http3-ngtcp2=true
 
-HTTP/3-enabled validation is currently a manual/local build step rather than a
-required CI job because the Ubuntu runner image does not consistently provide
-the `ngtcp2` OpenSSL backend development package.
-
 # Run a specific test by name filter
 zig build test -- --test-filter "jwt"
 
 # Per-test timeout (build runner flag, not a build.zig option)
 zig build test -- --test-timeout-ns 10000000000
 ```
+
+HTTP/3-enabled validation is currently a manual/local build step rather than a
+required CI job because the Ubuntu runner image does not consistently provide
+the `ngtcp2` OpenSSL backend development package.
 
 ## Formatting
 

@@ -392,6 +392,7 @@ pub fn ipAddressToSockAddr(address: std.Io.net.IpAddress) SockAddr {
         .ip4 => |ip4| {
             const sin: *std.c.sockaddr.in = @ptrCast(&storage);
             sin.* = .{
+                .family = std.posix.AF.INET,
                 .port = std.mem.nativeToBig(u16, ip4.port),
                 .addr = std.mem.readInt(u32, &ip4.bytes, .big),
             };
@@ -403,6 +404,7 @@ pub fn ipAddressToSockAddr(address: std.Io.net.IpAddress) SockAddr {
         .ip6 => |ip6| {
             const sin6: *std.c.sockaddr.in6 = @ptrCast(&storage);
             sin6.* = .{
+                .family = std.posix.AF.INET6,
                 .port = std.mem.nativeToBig(u16, ip6.port),
                 .flowinfo = 0,
                 .addr = ip6.bytes,
@@ -478,6 +480,18 @@ pub const FmtSliceHexLower = struct {
 
 pub fn fmtSliceHexLower(bytes: []const u8) FmtSliceHexLower {
     return .{ .bytes = bytes };
+}
+
+test "ipAddressToSockAddr sets IPv4 family and length" {
+    const addr = try parseIpAddress("127.0.0.1", 8443);
+    try std.testing.expectEqual(std.posix.AF.INET, addr.storage.family);
+    try std.testing.expectEqual(@as(std.posix.socklen_t, @sizeOf(std.c.sockaddr.in)), addr.len);
+}
+
+test "ipAddressToSockAddr sets IPv6 family and length" {
+    const addr = try parseIpAddress("::1", 8443);
+    try std.testing.expectEqual(std.posix.AF.INET6, addr.storage.family);
+    try std.testing.expectEqual(@as(std.posix.socklen_t, @sizeOf(std.c.sockaddr.in6)), addr.len);
 }
 
 pub const FixedBufferStream = struct {

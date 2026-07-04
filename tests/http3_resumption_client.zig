@@ -1,5 +1,5 @@
 const std = @import("std");
-const compat = @import("../src/zig_compat.zig");
+const compat = @import("zig_compat");
 
 fn parseUrl(url: []const u8) !struct { host: []const u8, port: []const u8 } {
     const prefix = "https://";
@@ -32,32 +32,43 @@ fn countOccurrences(haystack: []const u8, needle: []const u8) usize {
     return count;
 }
 
-fn runOsslClient(allocator: std.mem.Allocator, timeout_seconds: []const u8, args: []const []const u8) !std.process.Child.RunResult {
+fn runOsslClient(allocator: std.mem.Allocator, timeout_seconds: []const u8, args: []const []const u8) !std.process.RunResult {
     var argv = std.ArrayList([]const u8).empty;
     defer argv.deinit(allocator);
     try argv.appendSlice(allocator, &.{ "perl", "-e", "alarm shift; exec @ARGV", timeout_seconds });
     try argv.appendSlice(allocator, args);
-    return try std.process.Child.run(.{
-        .allocator = allocator,
+    return try std.process.run(allocator, compat.io(), .{
         .argv = argv.items,
-        .max_output_bytes = 512 * 1024,
     });
 }
 
-pub fn main() !u8 {
-    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+pub fn main(init: std.process.Init) !u8 {
+    var arena_state = std.heap.ArenaAllocator.init(init.gpa);
     defer arena_state.deinit();
     const allocator = arena_state.allocator();
 
-    const argv = try std.process.argsAlloc(allocator);
-    if (argv.len != 4) {
-        std.debug.print("usage: {s} <osslclient_bin> <request_url> <expected_status>\n", .{argv[0]});
+    var arg_it = try std.process.Args.Iterator.initAllocator(init.minimal.args, init.gpa);
+    defer arg_it.deinit();
+
+    const argv0 = arg_it.next() orelse "http3_resumption_client";
+    const osslclient_bin = arg_it.next() orelse {
+        std.debug.print("usage: {s} <osslclient_bin> <request_url> <expected_status>\n", .{argv0});
+        return 2;
+    };
+    const request_url = arg_it.next() orelse {
+        std.debug.print("usage: {s} <osslclient_bin> <request_url> <expected_status>\n", .{argv0});
+        return 2;
+    };
+    const expected_status_str = arg_it.next() orelse {
+        std.debug.print("usage: {s} <osslclient_bin> <request_url> <expected_status>\n", .{argv0});
+        return 2;
+    };
+    if (arg_it.next() != null) {
+        std.debug.print("usage: {s} <osslclient_bin> <request_url> <expected_status>\n", .{argv0});
         return 2;
     }
 
-    const osslclient_bin = argv[1];
-    const request_url = argv[2];
-    const expected_status = try std.fmt.parseInt(u16, argv[3], 10);
+    const expected_status = try std.fmt.parseInt(u16, expected_status_str, 10);
     const parsed = try parseUrl(request_url);
 
     var rand_buf: [8]u8 = undefined;

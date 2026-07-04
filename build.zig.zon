@@ -37,7 +37,7 @@
     // internet connectivity.
     //
     // Tardigrade keeps HTTP/3 / QUIC support behind an explicit build flag and
-    // links the ngtcp2/nghttp3 system packages only when that flag is enabled.
+    // links the ngtcp2/nghttp3 system libraries only when that flag is enabled.
     // The default build has no package-manager dependency on those optional
     // HTTP/3 libraries.
     .dependencies = .{

@@ -136,6 +136,42 @@ jobs:
           OPTIMIZE: ${{ matrix.optimize }}
         run: zig build "-Doptimize=$OPTIMIZE"
 
+  # ── HTTP/3 build validation ─────────────────────────────────────────────────
+  # Exercises the optional ngtcp2/nghttp3 build path with explicit system
+  # libraries on Linux. This keeps the feature build reproducible without
+  # making the default matrix depend on optional packages.
+  http3-build:
+    name: HTTP/3 build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev libnghttp3-dev libngtcp2-dev libngtcp2-crypto-ossl-dev
+
+      - name: Install Zig
+        run: sh ./scripts/install-zig.sh 0.16.0
+
+      - name: Cache Zig build artifacts
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.cache/zig
+            .zig-cache
+          key: zig-http3-build-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig') }}-${{ github.sha }}
+          restore-keys: |
+            zig-http3-build-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig') }}-
+            zig-http3-build-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Print Zig version
+        run: zig version
+
+      - name: Build with HTTP/3 enabled
+        run: zig build -Denable-http3-ngtcp2=true --summary all
+
   # ── Packaging smoke ─────────────────────────────────────────────────────────
   # Verifies the release archive layout, install script behavior, and host-native
   # DEB package layout against a disposable Ubuntu container.

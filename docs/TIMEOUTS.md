@@ -50,7 +50,7 @@ Two principles, from the #196/#141 arc:
 | Retry wall-clock budget | `UPSTREAM_TIMEOUT_BUDGET_MS` | 0 (off) | checked between attempts in the retry loop | `error.Timeout` → 504 | ✅ |
 | FastCGI exchange | `UPSTREAM_TIMEOUT_MS` | 10000 | `SO_*TIMEO` on the leased connection before the exchange (#171) | exchange error → 502, conn not pooled | ✅ *(new — the exchange previously had **no deadline at all**: a hung php-fpm pinned the worker indefinitely)* |
 | SCGI / uWSGI exchange | `UPSTREAM_TIMEOUT_MS` | 10000 | `SO_*TIMEO` set in `execute()` (#171) | 502 | ✅ *(new — same unbounded-exchange gap as FastCGI)* |
-| FastCGI/SCGI/uWSGI TCP connect | — | — | blocking `connect()` | kernel limit | ⬜ not yet routed through `connectBoundedTcp` (endpoints are typically local/unix; follow-up) |
+| FastCGI/SCGI/uWSGI TCP connect | `UPSTREAM_CONNECT_TIMEOUT_MS` | 5000 | `compat.connectBoundedTcp` (non-blocking connect + `poll` + `SO_ERROR`) (#171) | `error.Timeout` → 502 | ✅ *(Unix-socket endpoints stay on the local blocking connect — no SYN-blackhole exposure)* |
 | Active health probes | `UPSTREAM_PROBE_TIMEOUT_MS` (alias `UPSTREAM_ACTIVE_PROBE_TIMEOUT_MS`) | 2000 | raw probes with `SO_RCVTIMEO`, unix + TCP (#138) | probe fails → backend marked | ✅ |
 | Pool idle / lifetime | `UPSTREAM_POOL_IDLE_TIMEOUT_MS` / `…_MAX_LIFETIME_MS` | 90000 / 0 | maintenance-tick reapers (h1 + h2 pools) | idle conn closed | ✅ (housekeeping, not a request deadline) |
 | Passive-health / breaker windows | `UPSTREAM_FAIL_TIMEOUT_MS`, `CB_TIMEOUT_MS` | 10000 / 30000 | policy timers | backend skipped / breaker half-open | ✅ (policy windows, not I/O deadlines) |
@@ -86,6 +86,4 @@ Two principles, from the #196/#141 arc:
    by shrinking phase budgets, not inside every blocking syscall.
 2. **Downstream HTTP/2 and HTTP/3 per-stream phase deadlines** — need
    frame-level deadline tracking; out of scope until that work is scheduled.
-3. **FastCGI/SCGI/uWSGI TCP connect** is still a blocking `connect()`
-   (exchange itself is now bounded).
-4. **Shutdown drain is a soft cap** by design; revisit with #169.
+3. **Shutdown drain is a soft cap** by design; revisit with #169.

@@ -579,7 +579,7 @@ pub const GatewayState = struct {
         return std.fmt.bufPrint(buf, "fastcgi:{s}", .{endpoint}) catch endpoint;
     }
 
-    pub fn acquireFastcgiStream(self: *GatewayState, endpoint: []const u8) !FastcgiLease {
+    pub fn acquireFastcgiStream(self: *GatewayState, endpoint: []const u8, connect_timeout_ms: u32) !FastcgiLease {
         var key_buf: [512]u8 = undefined;
         const key = fastcgiPoolKey(&key_buf, endpoint);
         const now = http.event_loop.monotonicMs();
@@ -588,7 +588,7 @@ pub const GatewayState = struct {
         if (try self.upstream_pool.checkout(key, now)) |conn| {
             return .{ .conn = conn, .reused = true };
         }
-        const stream = http.fastcgi.connect(self.allocator, endpoint) catch |err| {
+        const stream = http.fastcgi.connect(self.allocator, endpoint, connect_timeout_ms) catch |err| {
             self.upstream_pool.releaseSlot(key);
             return err;
         };

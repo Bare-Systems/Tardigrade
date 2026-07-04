@@ -1371,7 +1371,16 @@ pub const H2ConnPool = struct {
         self.mutex.unlock();
 
         // Slow path: connect (+ TLS handshake when configured), no lock held.
-        const fd = try compat.connectBlockingTcp(host, port);
+        // The connect is poll-bounded (#171) — a blocking connect() is not
+        // interruptible by SO_SNDTIMEO, so a SYN-blackholed origin would
+        // otherwise stall the worker for the kernel's own limit.
+        const fd = try compat.connectBoundedTcp(host, port, deadline_ms);
+        // Bound the TLS handshake (and any later OpenSSL-internal writes) with
+        // socket timeouts before handing the fd to the transport (#171): the
+        // reader's poll deadline only starts once the connection exists, so
+        // without these a TCP-accepting-but-silent origin hangs the worker in
+        // SSL_connect indefinitely.
+        compat.setSocketTimeoutsMs(fd, deadline_ms, deadline_ms);
         // Disable Nagle: h2 multiplexing issues many small frame writes
         // (HEADERS / WINDOW_UPDATE) whose interaction with the peer's delayed
         // ACK otherwise stalls each exchange ~40 ms and trips response timeouts
@@ -1808,6 +1817,58 @@ fn h2cListenerServe(listen_fd: std.posix.fd_t, n: usize) void {
         if (got == 0) break; // client closed — safe to close without RST
     }
     _ = std.c.close(conn);
+}
+
+/// Accept connections and hold them silently (never handshake, never write)
+/// until the listener closes — a TCP-accepting-but-dead TLS origin.
+fn silentAcceptor(listen_fd: std.posix.fd_t, stop: *std.atomic.Value(bool)) void {
+    var held: [4]std.posix.fd_t = undefined;
+    var n: usize = 0;
+    while (!stop.load(.acquire) and n < held.len) {
+        const conn = std.c.accept(listen_fd, null, null);
+        if (conn < 0) break;
+        held[n] = conn;
+        n += 1;
+    }
+    for (held[0..n]) |fd| _ = std.c.close(fd);
+}
+
+test "h2 pool acquire is deadline-bounded against a TCP-accepting but silent TLS origin (#171)" {
+    const listen_fd = std.c.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, std.posix.IPPROTO.TCP);
+    try testing.expect(listen_fd >= 0);
+    const sin: std.c.sockaddr.in = .{
+        .family = std.posix.AF.INET,
+        .port = std.mem.nativeToBig(u16, 0),
+        .addr = @bitCast([4]u8{ 127, 0, 0, 1 }),
+        .zero = [8]u8{ 0, 0, 0, 0, 0, 0, 0, 0 },
+    };
+    try testing.expect(std.c.bind(listen_fd, @ptrCast(&sin), @sizeOf(std.c.sockaddr.in)) == 0);
+    try testing.expect(std.c.listen(listen_fd, 4) == 0);
+    var bound: std.c.sockaddr.in = undefined;
+    var bound_len: std.posix.socklen_t = @sizeOf(std.c.sockaddr.in);
+    try testing.expect(std.c.getsockname(listen_fd, @ptrCast(&bound), &bound_len) == 0);
+    const port = std.mem.bigToNative(u16, bound.port);
+
+    var stop = std.atomic.Value(bool).init(false);
+    const server = try std.Thread.spawn(.{}, silentAcceptor, .{ listen_fd, &stop });
+
+    var pool = H2ConnPool.init(testing.allocator, .{});
+    defer pool.deinit();
+    var key_buf: [64]u8 = undefined;
+    const key = try std.fmt.bufPrint(&key_buf, "h2:127.0.0.1:{d}", .{port});
+
+    // The origin accepts TCP but never speaks TLS: SSL_connect would block
+    // forever without the pre-handshake socket timeouts. The acquire must
+    // fail within the deadline, not the OS default.
+    const start_ms = nowMs();
+    const res = pool.acquire(key, "127.0.0.1", port, .{ .skip_verify = true }, 500);
+    const elapsed_ms = nowMs() - start_ms;
+    try testing.expect(std.meta.isError(res));
+    try testing.expect(elapsed_ms < 5_000);
+
+    stop.store(true, .release);
+    _ = std.c.close(listen_fd); // unblocks accept
+    server.join();
 }
 
 test "h2c pool acquires a prior-knowledge cleartext connection and round-trips" {

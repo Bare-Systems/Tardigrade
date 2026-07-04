@@ -114,6 +114,13 @@ pub fn handleFastcgiRoute(
         return 502;
     };
     errdefer state.releaseFastcgiStream(endpoint, leased.conn, false);
+    // Bound the exchange (#171): without SO timeouts a hung php-fpm pins this
+    // worker indefinitely — the exchange had no deadline at all. A timed-out
+    // read surfaces as an exchange error -> 502, and the connection is not
+    // returned to the pool.
+    if (cfg.upstream_timeout_ms > 0) {
+        compat.setSocketTimeoutsMs(leased.conn.stream.handle, cfg.upstream_timeout_ms, cfg.upstream_timeout_ms);
+    }
 
     var fcgi = http.fastcgi.exchange(allocator, &leased.conn.stream, .{
         .request_id = state.nextFastcgiRequestId(endpoint),
@@ -256,7 +263,7 @@ pub fn handleScgiRoute(
         .extra_env = &.{
             .{ .name = "TARDIGRADE_CORRELATION_ID", .value = correlation_id },
         },
-    }, request.body orelse "") catch |err| {
+    }, request.body orelse "", cfg.upstream_timeout_ms) catch |err| {
         state.logger.warn(correlation_id, "scgi request failed for {s}: {}", .{ endpoint, err });
         try sendApiError(allocator, writer, .bad_gateway, "tool_unavailable", "SCGI request failed", correlation_id, keep_alive, state);
         return 502;
@@ -347,7 +354,7 @@ pub fn handleUwsgiRoute(
         .extra_env = &.{
             .{ .name = "TARDIGRADE_CORRELATION_ID", .value = correlation_id },
         },
-    }, request.body orelse "") catch |err| {
+    }, request.body orelse "", cfg.upstream_timeout_ms) catch |err| {
         state.logger.warn(correlation_id, "uwsgi request failed for {s}: {}", .{ endpoint, err });
         try sendApiError(allocator, writer, .bad_gateway, "tool_unavailable", "uWSGI request failed", correlation_id, keep_alive, state);
         return 502;

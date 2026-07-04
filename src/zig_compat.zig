@@ -196,6 +196,19 @@ pub fn setTcpNoDelay(fd: std.posix.fd_t) void {
 /// blocking fd. On a blocking socket a timed-out recv returns EAGAIN, which
 /// std.posix.read maps to error.WouldBlock. Caller closes the fd.
 pub fn connectBlockingTcp(host: []const u8, port: u16) !std.posix.fd_t {
+    return connectBoundedTcp(host, port, 0);
+}
+
+/// Like `connectBlockingTcp`, but bounds the TCP connect itself (#171): with
+/// `connect_timeout_ms > 0` the connect runs non-blocking, waits for
+/// writability with `poll(2)` up to the deadline, checks `SO_ERROR`, and then
+/// restores blocking mode. A plain blocking `connect()` is NOT interruptible
+/// by `SO_SNDTIMEO`, so without this an unreachable-but-not-refusing origin
+/// (SYN blackhole) stalls the calling worker for the kernel's own limit
+/// (typically ~2 minutes). A timed-out connect returns `error.Timeout`, which
+/// the proxy maps to 504 `upstream_timeout`. `0` preserves the old blocking
+/// behavior. Caller closes the fd.
+pub fn connectBoundedTcp(host: []const u8, port: u16, connect_timeout_ms: u32) !std.posix.fd_t {
     const resolved = try std.Io.net.IpAddress.resolve(io(), host, port);
     switch (resolved) {
         .ip4 => |ip4| {
@@ -214,7 +227,7 @@ pub fn connectBlockingTcp(host: []const u8, port: u16) !std.posix.fd_t {
             const sock = std.c.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, std.posix.IPPROTO.TCP);
             if (sock < 0) return error.SocketFailed;
             errdefer _ = std.c.close(sock);
-            if (std.c.connect(sock, @ptrCast(&sin), @sizeOf(std.c.sockaddr.in)) != 0) return error.ConnectionFailed;
+            try connectFdBounded(sock, @ptrCast(&sin), @sizeOf(std.c.sockaddr.in), connect_timeout_ms);
             return sock;
         },
         .ip6 => |ip6| {
@@ -228,10 +241,64 @@ pub fn connectBlockingTcp(host: []const u8, port: u16) !std.posix.fd_t {
             const sock = std.c.socket(std.posix.AF.INET6, std.posix.SOCK.STREAM, std.posix.IPPROTO.TCP);
             if (sock < 0) return error.SocketFailed;
             errdefer _ = std.c.close(sock);
-            if (std.c.connect(sock, @ptrCast(&sin6), @sizeOf(std.c.sockaddr.in6)) != 0) return error.ConnectionFailed;
+            try connectFdBounded(sock, @ptrCast(&sin6), @sizeOf(std.c.sockaddr.in6), connect_timeout_ms);
             return sock;
         },
     }
+}
+
+/// Connect `sock` to `addr`, bounded by `connect_timeout_ms` when non-zero
+/// (non-blocking connect + poll + SO_ERROR, then blocking mode restored).
+fn connectFdBounded(sock: std.posix.fd_t, addr: *const std.c.sockaddr, addr_len: std.posix.socklen_t, connect_timeout_ms: u32) !void {
+    if (connect_timeout_ms == 0) {
+        if (std.c.connect(sock, addr, addr_len) != 0) return error.ConnectionFailed;
+        return;
+    }
+
+    const flags = std.c.fcntl(sock, std.posix.F.GETFL, @as(c_int, 0));
+    if (flags < 0) return error.ConnectionFailed;
+    const nonblock: c_int = @bitCast(@as(u32, @bitCast(std.posix.O{ .NONBLOCK = true })));
+    if (std.c.fcntl(sock, std.posix.F.SETFL, flags | nonblock) < 0) return error.ConnectionFailed;
+
+    const rc = std.c.connect(sock, addr, addr_len);
+    if (rc != 0) {
+        switch (std.posix.errno(rc)) {
+            // EINTR: POSIX says the connect continues asynchronously — wait
+            // for the result via poll like the EINPROGRESS case.
+            .INPROGRESS, .INTR, .AGAIN => {},
+            else => return error.ConnectionFailed,
+        }
+        var pfds = [_]std.posix.pollfd{.{
+            .fd = sock,
+            .events = std.posix.POLL.OUT,
+            .revents = 0,
+        }};
+        const ready = std.posix.poll(&pfds, @intCast(@min(connect_timeout_ms, std.math.maxInt(i32)))) catch
+            return error.ConnectionFailed;
+        if (ready == 0) return error.Timeout;
+        var so_err: c_int = 0;
+        var so_len: std.posix.socklen_t = @sizeOf(c_int);
+        if (std.c.getsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.ERROR, @ptrCast(&so_err), &so_len) != 0) {
+            return error.ConnectionFailed;
+        }
+        if (so_err != 0) return error.ConnectionFailed;
+    }
+
+    if (std.c.fcntl(sock, std.posix.F.SETFL, flags) < 0) return error.ConnectionFailed;
+}
+
+/// Set SO_RCVTIMEO / SO_SNDTIMEO (0 disables the respective timeout).
+pub fn setSocketTimeoutsMs(fd: std.posix.fd_t, recv_timeout_ms: u32, send_timeout_ms: u32) void {
+    const recv_tv = std.posix.timeval{
+        .sec = @intCast(recv_timeout_ms / 1000),
+        .usec = @intCast((recv_timeout_ms % 1000) * 1000),
+    };
+    const send_tv = std.posix.timeval{
+        .sec = @intCast(send_timeout_ms / 1000),
+        .usec = @intCast((send_timeout_ms % 1000) * 1000),
+    };
+    std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&recv_tv)) catch {};
+    std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&send_tv)) catch {};
 }
 
 /// Connect a *blocking* Unix-domain socket via std.c, bypassing the std.Io
@@ -584,6 +651,87 @@ pub fn cwd() DirCompat {
 
 pub fn wrapDir(dir: std.Io.Dir) DirCompat {
     return .{ .dir = dir };
+}
+
+test "connectBoundedTcp connects, restores blocking mode, and round-trips" {
+    // Raw blocking listener.
+    const listen_fd = std.c.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, std.posix.IPPROTO.TCP);
+    try std.testing.expect(listen_fd >= 0);
+    defer _ = std.c.close(listen_fd);
+    const sin: std.c.sockaddr.in = .{
+        .family = std.posix.AF.INET,
+        .port = std.mem.nativeToBig(u16, 0),
+        .addr = @bitCast([4]u8{ 127, 0, 0, 1 }),
+        .zero = [8]u8{ 0, 0, 0, 0, 0, 0, 0, 0 },
+    };
+    try std.testing.expect(std.c.bind(listen_fd, @ptrCast(&sin), @sizeOf(std.c.sockaddr.in)) == 0);
+    try std.testing.expect(std.c.listen(listen_fd, 8) == 0);
+    var bound: std.c.sockaddr.in = undefined;
+    var bound_len: std.posix.socklen_t = @sizeOf(std.c.sockaddr.in);
+    try std.testing.expect(std.c.getsockname(listen_fd, @ptrCast(&bound), &bound_len) == 0);
+    const port = std.mem.bigToNative(u16, bound.port);
+
+    const fd = try connectBoundedTcp("127.0.0.1", port, 2_000);
+    defer _ = std.c.close(fd);
+
+    // The bounded path must hand back a *blocking* fd — the transports rely on
+    // SO_RCVTIMEO/SO_SNDTIMEO semantics that only apply to blocking sockets.
+    const flags = std.c.fcntl(fd, std.posix.F.GETFL, @as(c_int, 0));
+    try std.testing.expect(flags >= 0);
+    const nonblock: c_int = @bitCast(@as(u32, @bitCast(std.posix.O{ .NONBLOCK = true })));
+    try std.testing.expect((flags & nonblock) == 0);
+
+    // And the connection actually works end-to-end.
+    const conn = std.c.accept(listen_fd, null, null);
+    try std.testing.expect(conn >= 0);
+    defer _ = std.c.close(conn);
+    const msg = "ping";
+    try std.testing.expect(std.c.write(fd, msg.ptr, msg.len) == 4);
+    var buf: [8]u8 = undefined;
+    try std.testing.expect(std.c.read(conn, &buf, buf.len) == 4);
+    try std.testing.expectEqualStrings("ping", buf[0..4]);
+}
+
+test "connectBoundedTcp bounds a connect that would otherwise hang" {
+    // Saturate a backlog-1 listener that never accepts, so further connects
+    // sit in the SYN queue (Linux behavior; on platforms where the kernel
+    // refuses instead, the call fails fast and the bound trivially holds).
+    const listen_fd = std.c.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, std.posix.IPPROTO.TCP);
+    try std.testing.expect(listen_fd >= 0);
+    defer _ = std.c.close(listen_fd);
+    const sin: std.c.sockaddr.in = .{
+        .family = std.posix.AF.INET,
+        .port = std.mem.nativeToBig(u16, 0),
+        .addr = @bitCast([4]u8{ 127, 0, 0, 1 }),
+        .zero = [8]u8{ 0, 0, 0, 0, 0, 0, 0, 0 },
+    };
+    try std.testing.expect(std.c.bind(listen_fd, @ptrCast(&sin), @sizeOf(std.c.sockaddr.in)) == 0);
+    try std.testing.expect(std.c.listen(listen_fd, 1) == 0);
+    var bound: std.c.sockaddr.in = undefined;
+    var bound_len: std.posix.socklen_t = @sizeOf(std.c.sockaddr.in);
+    try std.testing.expect(std.c.getsockname(listen_fd, @ptrCast(&bound), &bound_len) == 0);
+    const port = std.mem.bigToNative(u16, bound.port);
+
+    var fillers: [8]std.posix.fd_t = undefined;
+    var n_fillers: usize = 0;
+    for (&fillers) |*slot| {
+        slot.* = connectBoundedTcp("127.0.0.1", port, 250) catch break;
+        n_fillers += 1;
+    }
+    defer for (fillers[0..n_fillers]) |f| {
+        _ = std.c.close(f);
+    };
+
+    // Whatever the platform does with the probe (Linux: SYN-queue hang -> our
+    // deadline; elsewhere: fast refusal or acceptance), it must return well
+    // within the bound rather than the kernel's own multi-minute limit.
+    const start_ms = milliTimestamp();
+    const probe = connectBoundedTcp("127.0.0.1", port, 500);
+    const elapsed_ms = milliTimestamp() - start_ms;
+    if (probe) |fd| {
+        _ = std.c.close(fd);
+    } else |_| {}
+    try std.testing.expect(elapsed_ms < 5_000);
 }
 
 test "milliTimestamp returns a positive value" {

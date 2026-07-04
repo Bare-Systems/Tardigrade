@@ -123,12 +123,17 @@ pub fn execute(
     endpoint: []const u8,
     opts: RequestOptions,
     body: []const u8,
+    /// Bounds the request write and each response read via
+    /// SO_SNDTIMEO/SO_RCVTIMEO (#171); 0 = unbounded (previous behavior).
+    /// Without it a hung SCGI backend pins the worker indefinitely.
+    timeout_ms: u32,
 ) !Response {
     const wire = try buildRequestWithOptions(allocator, opts, body);
     defer allocator.free(wire);
 
     var stream = try connect(allocator, endpoint);
     defer stream.close();
+    if (timeout_ms > 0) compat.setSocketTimeoutsMs(stream.handle, timeout_ms, timeout_ms);
     try stream.writeAll(wire);
     return readResponse(allocator, &stream);
 }

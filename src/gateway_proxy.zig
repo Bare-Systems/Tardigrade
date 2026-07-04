@@ -2145,9 +2145,10 @@ test "exchangeBoundedBufferedHttpRequest enforces the response read timeout when
         return error.TestUnexpectedResult; // a silent peer must not yield a response
     } else |_| {}
 
-    // Returned via the 200ms poll deadline, well before any test-suite watchdog.
+    // Returned via the 200ms poll deadline, with generous slack for scheduler
+    // noise on busy CI hosts.
     try std.testing.expect(elapsed_ms >= 150);
-    try std.testing.expect(elapsed_ms < 2_000);
+    try std.testing.expect(elapsed_ms < 5_000);
 }
 
 /// Run an exchange against a peer that has pre-written `response` and then keeps

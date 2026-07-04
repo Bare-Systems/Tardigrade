@@ -172,14 +172,16 @@ pub fn execute(
     endpoint: []const u8,
     opts: RequestOptions,
     body: []const u8,
+    /// Poll-bounds the TCP connect (#171); 0 = unbounded blocking connect.
+    connect_timeout_ms: u32,
 ) !Response {
-    var stream = try connect(allocator, endpoint);
+    var stream = try connect(allocator, endpoint, connect_timeout_ms);
     defer stream.close();
     return exchange(allocator, &stream, opts, body);
 }
 
-pub fn connect(allocator: std.mem.Allocator, endpoint: []const u8) !compat.NetStream {
-    return openStream(allocator, endpoint);
+pub fn connect(allocator: std.mem.Allocator, endpoint: []const u8, connect_timeout_ms: u32) !compat.NetStream {
+    return openStream(allocator, endpoint, connect_timeout_ms);
 }
 
 pub fn exchange(
@@ -302,7 +304,7 @@ pub fn parseResponseForRequest(allocator: std.mem.Allocator, data: []const u8, r
     };
 }
 
-fn openStream(allocator: std.mem.Allocator, endpoint: []const u8) !compat.NetStream {
+fn openStream(allocator: std.mem.Allocator, endpoint: []const u8, connect_timeout_ms: u32) !compat.NetStream {
     _ = allocator;
     // Use raw blocking sockets (not the std.Io event-loop streams) so FastCGI
     // I/O matches the data-plane transport. The std.Io threaded backend's
@@ -312,7 +314,10 @@ fn openStream(allocator: std.mem.Allocator, endpoint: []const u8) !compat.NetStr
         return compat.netStreamFromFd(try compat.connectBlockingUnix(path));
     }
     const ep = try memcached.parseEndpoint(endpoint);
-    return compat.netStreamFromFd(try compat.connectBlockingTcp(ep.host, ep.port));
+    // TCP connect is poll-bounded by the connect timeout (#171): a blocking
+    // connect() is not interruptible by SO_SNDTIMEO, so a SYN-blackholed
+    // FastCGI backend would otherwise pin the worker for the kernel's limit.
+    return compat.netStreamFromFd(try compat.connectBoundedTcp(ep.host, ep.port, connect_timeout_ms));
 }
 
 fn unixSocketPath(endpoint: []const u8) ?[]const u8 {
@@ -451,6 +456,53 @@ fn parseStatus(raw: []const u8) !u16 {
     if (trimmed.len == 0) return 200;
     const end = std.mem.findScalar(u8, trimmed, ' ') orelse trimmed.len;
     return std.fmt.parseInt(u16, trimmed[0..end], 10) catch error.InvalidStatusHeader;
+}
+
+test "connect poll-bounds the TCP connect against a saturated backlog (#171)" {
+    // A backlog-1 listener that never accepts: further connects sit in the SYN
+    // queue (Linux). connect() must return within the bound, not the kernel
+    // limit — proving the FastCGI TCP connect routes through connectBoundedTcp.
+    // (On platforms that refuse instead of queueing, the connect fails fast and
+    // the bound trivially holds.)
+    const listen_fd = std.c.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, std.posix.IPPROTO.TCP);
+    try std.testing.expect(listen_fd >= 0);
+    defer _ = std.c.close(listen_fd);
+    const sin: std.c.sockaddr.in = .{
+        .family = std.posix.AF.INET,
+        .port = std.mem.nativeToBig(u16, 0),
+        .addr = @bitCast([4]u8{ 127, 0, 0, 1 }),
+        .zero = [8]u8{ 0, 0, 0, 0, 0, 0, 0, 0 },
+    };
+    try std.testing.expect(std.c.bind(listen_fd, @ptrCast(&sin), @sizeOf(std.c.sockaddr.in)) == 0);
+    try std.testing.expect(std.c.listen(listen_fd, 1) == 0);
+    var bound: std.c.sockaddr.in = undefined;
+    var bound_len: std.posix.socklen_t = @sizeOf(std.c.sockaddr.in);
+    try std.testing.expect(std.c.getsockname(listen_fd, @ptrCast(&bound), &bound_len) == 0);
+    const port = std.mem.bigToNative(u16, bound.port);
+
+    var ep_buf: [64]u8 = undefined;
+    const endpoint = try std.fmt.bufPrint(&ep_buf, "127.0.0.1:{d}", .{port});
+
+    // Saturate the backlog so a subsequent connect has to wait.
+    var fillers: [8]compat.NetStream = undefined;
+    var n_fill: usize = 0;
+    for (&fillers) |*slot| {
+        slot.* = connect(std.testing.allocator, endpoint, 250) catch break;
+        n_fill += 1;
+    }
+    defer for (fillers[0..n_fill]) |*f| {
+        f.close();
+    };
+
+    const start_ms = compat.milliTimestamp();
+    const res = connect(std.testing.allocator, endpoint, 300);
+    const elapsed_ms = compat.milliTimestamp() - start_ms;
+    if (res) |s_ok| {
+        var st = s_ok;
+        st.close();
+    } else |_| {}
+    // Well under the OS default connect timeout (~2 min on Linux).
+    try std.testing.expect(elapsed_ms < 5_000);
 }
 
 test "buildRequestWithOptions emits known-good fcgi layout" {

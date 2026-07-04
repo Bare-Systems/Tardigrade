@@ -118,6 +118,8 @@ pub fn execute(
     endpoint: []const u8,
     opts: RequestOptions,
     body: []const u8,
+    /// Poll-bounds the TCP connect (#171); 0 = unbounded blocking connect.
+    connect_timeout_ms: u32,
     /// Bounds the request write and each response read via
     /// SO_SNDTIMEO/SO_RCVTIMEO (#171); 0 = unbounded (previous behavior).
     /// Without it a hung uWSGI backend pins the worker indefinitely.
@@ -125,20 +127,21 @@ pub fn execute(
 ) !Response {
     const wire = try buildPacketWithOptions(allocator, opts, body);
     defer allocator.free(wire);
-    var stream = try connect(allocator, endpoint);
+    var stream = try connect(allocator, endpoint, connect_timeout_ms);
     defer stream.close();
     if (timeout_ms > 0) compat.setSocketTimeoutsMs(stream.handle, timeout_ms, timeout_ms);
     try stream.writeAll(wire);
     return readResponse(allocator, &stream);
 }
 
-pub fn connect(allocator: std.mem.Allocator, endpoint: []const u8) !compat.NetStream {
+pub fn connect(allocator: std.mem.Allocator, endpoint: []const u8, connect_timeout_ms: u32) !compat.NetStream {
     _ = allocator;
     // Raw blocking sockets, not std.Io event-loop streams: the threaded backend
     // can stall on these blocking request/response exchanges (#141).
     if (unixSocketPath(endpoint)) |path| return compat.netStreamFromFd(try compat.connectBlockingUnix(path));
     const ep = try memcached.parseEndpoint(endpoint);
-    return compat.netStreamFromFd(try compat.connectBlockingTcp(ep.host, ep.port));
+    // TCP connect poll-bounded by the connect timeout (#171).
+    return compat.netStreamFromFd(try compat.connectBoundedTcp(ep.host, ep.port, connect_timeout_ms));
 }
 
 pub fn readResponse(allocator: std.mem.Allocator, stream: *compat.NetStream) !Response {

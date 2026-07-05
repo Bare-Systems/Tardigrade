@@ -947,7 +947,21 @@ fn exchangeBoundedBufferedHttpRequest(
             return error.Timeout;
         }
         const n = try transport.read(&read_buf);
-        if (n == 0) break;
+        if (n == 0) {
+            // EOF. A close-delimited body ends here, and an empty/partial header
+            // block is handled by the checks below. But a Content-Length or
+            // chunked body that has not yet reached its declared end means the
+            // origin closed mid-response: surface it as a protocol error so the
+            // caller returns 502 instead of forwarding a body shorter than the
+            // advertised length (#269).
+            if (header_end != null) {
+                switch (framing) {
+                    .length, .chunked => return error.UpstreamProtocolError,
+                    .none, .close => {},
+                }
+            }
+            break;
+        }
         try resp_raw.appendSlice(read_buf[0..n]);
         if (resp_raw.items.len > max_buffered_response_bytes) return error.StreamTooLong;
     }

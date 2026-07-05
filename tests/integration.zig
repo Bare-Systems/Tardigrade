@@ -5519,12 +5519,12 @@ test "failure: origin that accepts but never responds times out without wedging 
     try assertGatewayNotLeaking(allocator, tardigrade.port);
 }
 
-test "failure: origin closing mid-response never fabricates the advertised body" {
+test "failure: origin closing mid-response yields 502 in buffered mode (#269)" {
     const allocator = std.testing.allocator;
 
     // Advertise a full Content-Length (10) but close after emitting a 4-byte
-    // prefix.  The safety invariant the gateway must never break: it must not
-    // synthesise the missing bytes and claim a complete body.
+    // prefix. The buffered path must surface the premature close as a bad
+    // gateway rather than forwarding a body shorter than the advertised length.
     var upstream = try UpstreamServer.start(allocator, &.{.{
         .body = "abcdefghij",
         .headers = &.{.{ .name = "Content-Type", .value = "text/plain" }},
@@ -5546,12 +5546,7 @@ test "failure: origin closing mid-response never fabricates the advertised body"
         .headers = &.{},
     }, 5_000);
     defer response.deinit();
-    // Current buffered behaviour forwards only the bytes actually received (a
-    // 200 with the 4-byte prefix); a future hardening may surface this as 502.
-    // Either is safe — fabricating the advertised 10 bytes would not be.
-    // Tracked for 502 hardening in #269.
-    try std.testing.expect(response.status_code == 502 or
-        (response.status_code == 200 and response.body.len < "abcdefghij".len));
+    try std.testing.expectEqual(@as(u16, 502), response.status_code);
 
     try assertGatewayServesHealthz(allocator, tardigrade.port);
     try assertGatewayNotLeaking(allocator, tardigrade.port);
@@ -5787,4 +5782,90 @@ test "failure: metrics endpoint stays responsive under concurrent proxy load" {
         try std.testing.expect(prometheusMetricValue(metrics.body, "tardigrade_requests_total") != null);
         try std.testing.expect(prometheusMetricValue(metrics.body, "tardigrade_active_connections") != null);
     }
+}
+
+test "failure: malformed and stalled TLS handshakes are rejected without wedging the listener (#270)" {
+    const allocator = std.testing.allocator;
+
+    // Absolute paths to the shared TLS fixture; presence of both cert and key is
+    // what enables TLS termination on the listener (edge_config.hasTlsFiles).
+    const cwd = try compat.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(cwd);
+    const cert_path = try std.fmt.allocPrint(allocator, "{s}/tests/fixtures/tls/server.crt", .{cwd});
+    defer allocator.free(cert_path);
+    const key_path = try std.fmt.allocPrint(allocator, "{s}/tests/fixtures/tls/server.key", .{cwd});
+    defer allocator.free(key_path);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text =
+        \\location = /healthz {
+        \\    return 200 alive;
+        \\}
+        ,
+        // Probe readiness over TLS (curl -k), matching the enabled terminator.
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = key_path },
+            // Bound a stalled handshake tightly so the (single, harness-default)
+            // worker cannot be pinned by a peer that never finishes the
+            // handshake.
+            .{ .name = "TARDIGRADE_TLS_HANDSHAKE_TIMEOUT_MS", .value = "500" },
+        },
+    });
+    defer tardigrade.stop();
+
+    // Fire a burst of broken handshakes at the TLS port: raw non-TLS garbage and
+    // a truncated TLS record header, each closed immediately so SSL_accept fails
+    // on EOF. None of these must crash or wedge the listener.
+    const broken_payloads = [_][]const u8{
+        "this is definitely not a tls client hello\r\n\r\n",
+        // TLS handshake record (type 0x16, TLS 1.0 version) advertising a length
+        // far larger than the handful of bytes actually sent.
+        "\x16\x03\x01\x02\x00\x01\x00\x01\xfc",
+        // Bare record header, nothing else.
+        "\x16\x03\x01",
+    };
+    for (broken_payloads) |payload| {
+        var attempt: usize = 0;
+        while (attempt < 3) : (attempt += 1) {
+            var s = compat.tcpConnectToHost(allocator, test_host, tardigrade.port) catch continue;
+            s.writeAll(payload) catch {};
+            s.close();
+        }
+    }
+
+    // A partial ClientHello held open for the rest of the test. With a single
+    // worker, an unbounded handshake here would pin it and hang the valid
+    // request below — so the control request succeeding *is* the assertion that
+    // the stalled handshake is bounded by TARDIGRADE_TLS_HANDSHAKE_TIMEOUT_MS.
+    var stalled = try compat.tcpConnectToHost(allocator, test_host, tardigrade.port);
+    defer stalled.close();
+    try stalled.writeAll("\x16\x03\x01\x00\x50\x01\x00\x00\x4c\x03\x03");
+
+    // The listener still terminates a valid TLS request end-to-end.
+    var response = try sendCurlRequest(allocator, tardigrade.port, .{
+        .scheme = "https",
+        .path = "/healthz",
+        .insecure = true,
+    });
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status_code);
+    try assertContains(response.body, "alive");
+
+    // The failure is observable: broken handshakes are logged.
+    try waitForLogSubstring(allocator, tardigrade.log_path, "tls handshake error", 3_000);
+
+    // And no half-open handshakes leaked — active connections stay bounded.
+    var metrics = try sendCurlRequest(allocator, tardigrade.port, .{
+        .scheme = "https",
+        .path = "/status/metrics",
+        .insecure = true,
+    });
+    defer metrics.deinit();
+    try std.testing.expectEqual(@as(u16, 200), metrics.status_code);
+    const active = prometheusMetricValue(metrics.body, "tardigrade_active_connections") orelse
+        return error.MissingActiveConnectionsMetric;
+    try std.testing.expect(active <= 4);
 }

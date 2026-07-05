@@ -25,13 +25,44 @@ zig fmt --check build.zig src/ tests/
 # Unit tests (matches CI)
 zig build test --summary all --error-style verbose
 
-# Integration tests — requires a running tardigrade instance and system OpenSSL
-# (see tests/README.md for setup). Not required for most contributions.
+# Integration tests — builds and drives a live tardigrade process against
+# mock upstreams; requires system OpenSSL. Not required for most contributions.
 zig build test-integration
+
+# Failure-mode / chaos suite — a filtered view of the integration harness that
+# exercises broken origins and clients (see "Failure-mode harness" below).
+zig build test-failure
 
 # Release-mode build
 zig build -Doptimize=ReleaseFast
 ```
+
+## Failure-mode harness
+
+`zig build test-failure` runs the production-safety suite defined in
+`tests/integration.zig` (the `failure:`-prefixed tests). It reuses the live
+`tardigrade` process harness and mock origins to intentionally break connections
+and services, then asserts the gateway fails safely: a defined status code (or
+connection close), no starved worker, no leaked client connections (a bounded
+`tardigrade_active_connections` gauge), and the relevant metrics/log signals.
+
+Covered failure modes:
+
+- Origin down before connect, or accepting-but-never-responding (bounded 5xx).
+- Origin closing mid-response (buffered path never fabricates the advertised
+  body; streaming aborts are asserted separately).
+- Origin returning malformed response headers (bounded 5xx, never passed
+  through as success).
+- Client aborting mid-upload and mid-download (worker recovers; downstream
+  aborts are recorded via `tardigrade_proxy_client_aborts_total`).
+- Access-log sink unreachable (requests still succeed).
+- Metrics endpoint scraped under concurrent proxy load.
+
+Reload-during-active-streams and graceful-shutdown-under-load are covered by the
+`#170` tests in the same file. The suite is part of `test-integration`, so CI
+running `zig build test-integration` also runs it; use `zig build test-failure`
+locally to iterate on just these scenarios. Run a single scenario with a name
+filter, e.g. `zig build test-integration -- --test-filter "failure: client abort"`.
 
 ## Build options
 

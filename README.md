@@ -248,6 +248,9 @@ zig build test-security-corpus
 # Integration tests
 zig build test-integration
 
+# Failure-mode / chaos suite (broken origins, aborting clients, reloads)
+zig build test-failure
+
 # Allocation budget report
 zig build bench-allocations
 ```

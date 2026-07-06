@@ -49,6 +49,12 @@ New config, static-file, CLI, cache, session, transcript, ACME, and utility code
 should not call `std.posix`, `std.c`, or `std.os` directly unless it is adding a
 compatibility helper here first.
 
+Known low-level exceptions outside the socket/protocol modules are intentional:
+`logger.zig` and `access_log.zig` may use raw stderr writes for last-resort
+logging, `access_log.zig` may own its syslog UDP socket, and
+`gateway_static_runtime.zig` may own the zero-copy `sendfile` / `socketpair`
+path described below.
+
 ### Low-level socket / fd I/O
 
 Listener, gateway socket, proxy transport, HTTP/2 transport, FastCGI-style

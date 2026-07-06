@@ -10,6 +10,13 @@ All notable user-facing changes to Tardigrade are documented here.
 - **CI perf smoke now guards upstream connection reuse (#141)** — `benchmarks/ci-smoke.sh` scrapes the gateway metrics endpoint after the proxy run and fails if fewer than 80% of upstream connections were reused (`reused / (reused + new)`). This catches a regression to per-request connections — the exact failure mode that motivated the pool (#196 dropped reuse to zero). The smoke fixture gains a `metrics_path`.
 
 ### Documentation
+- **I/O abstraction boundary documented (#211)** — `docs/CONCURRENCY.md` now
+  records the intended split between high-level `std.Io` / `zig_compat.zig`
+  usage for config, files, CLI, cache, session, transcript, and utility code,
+  and raw fd / `std.posix` ownership for listener, proxy, h2, FastCGI-style, and
+  HTTP/3/UDP socket paths. The note also links the existing follow-up issues for
+  the shared stream transport, QUIC replacement boundary, UDP endpoint model,
+  and HTTP/3 foundation epic so future refactors have one target architecture.
 - **Archived old HTTP server patterns research (#227)** — preserved the workspace-root `tardi-perf-maxxing.md` draft in a closed GitHub archive issue and removed the stale local research file. The active Tardigrade performance work remains tracked in the existing milestone-backed GitHub issues.
 
 ### Reliability

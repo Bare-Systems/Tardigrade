@@ -98,6 +98,55 @@ Do not start an `io_uring` or async-runtime rewrite from this boundary. Any new
 backend must be benchmark-justified and fit behind the same socket/protocol
 ownership rules.
 
+## Pure Zig QUIC / H3 Embedding Target
+
+Pure Zig QUIC/H3 work starts upstream-first. Tardigrade should validate QUIC
+transport, stream flow control, QPACK, and proxy retry semantics as an upstream
+client before exposing a public downstream HTTP/3 UDP listener. A public listener
+adds Alt-Svc rollout, reload behavior, UDP routing, NAT rebinding at the edge,
+and load-balancer concerns that are tracked separately.
+
+The target module seams are:
+
+| Seam | Responsibility |
+|---|---|
+| `src/quic/udp.zig` | HTTP-independent UDP endpoint: send/receive datagrams, local/remote address metadata, ECN, socket buffer tuning, deterministic clock hook, and future batching/GSO/pacing extension points |
+| `src/quic/config.zig` | Internal config defaults, validation, and QUIC transport-parameter mapping |
+| `src/quic/packet.*` / `connection.*` / `stream.*` | QUIC packet codec, connection state, packet number spaces, DCID routing, timers, loss recovery, stream flow control, close/drain |
+| `src/quic/tls_adapter.*` | QUIC TLS 1.3 handshake bytes, transport parameters, traffic secrets, AEAD/header protection, ALPN, certificate state, and key updates |
+| `src/http3/` | HTTP/3 frames, control streams, SETTINGS, QPACK, and request/response mapping |
+| `src/http/stream_transport.zig` | Gateway-facing h1/h2/h3 stream/proxy contract |
+
+Incoming UDP packets are routed by parsed Destination Connection ID (DCID) to a
+connection bucket before HTTP/3 request logic runs. That routing layer owns QUIC
+connection/worker ownership; HTTP and gateway request types must not leak into
+`src/quic/udp.zig`.
+
+The initial config model is intentionally conservative and defaults off. Only
+safe rollout toggles should become operator-facing early; internal transport
+defaults can remain private until interop, benchmark, or production evidence says
+they need public control.
+
+| Config area | Transport mapping | Default | Exposure |
+|---|---|---|---|
+| Enable pure Zig QUIC/H3 | none | off | user-facing when implementation exists |
+| QUIC version set | version negotiation | QUIC v1, v2-aware but disabled | internal initially |
+| Idle timeout | `max_idle_timeout` | 30s | likely user-facing with upstream H3 |
+| Active CID limit | `active_connection_id_limit` | 4 | internal initially |
+| Max UDP payload | `max_udp_payload_size` | 1200 bytes | user-facing only if MTU tuning is needed |
+| Initial connection window | `initial_max_data` | 8 MiB | internal initially |
+| Initial stream windows | `initial_max_stream_data_*` | 1 MiB bidi, 256 KiB uni | internal initially |
+| Max streams | `initial_max_streams_*` | 100 bidi, 16 uni | internal initially |
+| Retry policy | address validation / tokens | off for upstream-first | user-facing for downstream listener work |
+| Migration policy | `disable_active_migration` | disabled | user-facing only when downstream listener exists |
+| qlog / keylog | debug artifact emission | off | local-debug toggle |
+| QPACK | SETTINGS | static-only, zero dynamic capacity | internal until dynamic QPACK lands |
+
+Allocator ownership is per connection. A QUIC connection owns packet/frame/stream
+scratch allocations and releases them on close/drain; stream buffers must not be
+owned by HTTP request objects. Deterministic timer/clock hooks belong below HTTP
+so RTT, PTO, loss recovery, and pacing tests can run without wall-clock sleeps.
+
 ---
 
 ## Lock inventory

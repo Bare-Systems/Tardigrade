@@ -14,12 +14,39 @@ pub const Ecn = enum {
     ce,
 };
 
+pub const AddressFamily = enum {
+    ip4,
+    ip6,
+};
+
 pub const Address = struct {
-    ip: []const u8,
+    family: AddressFamily,
+    bytes: [16]u8 = [_]u8{0} ** 16,
     port: u16,
+    scope_id: u32 = 0,
+
+    pub fn ip4(octets: [4]u8, port: u16) Address {
+        var address = Address{ .family = .ip4, .port = port };
+        @memcpy(address.bytes[0..4], &octets);
+        return address;
+    }
+
+    pub fn ip6(octets: [16]u8, port: u16, scope_id: u32) Address {
+        return .{ .family = .ip6, .bytes = octets, .port = port, .scope_id = scope_id };
+    }
+
+    pub fn slice(self: *const Address) []const u8 {
+        return switch (self.family) {
+            .ip4 => self.bytes[0..4],
+            .ip6 => self.bytes[0..16],
+        };
+    }
 };
 
 pub const ReceivedDatagram = struct {
+    /// Slice into the caller-provided receive scratch buffer. Valid only until
+    /// that scratch buffer is reused or the next receive call writes into it.
+    /// Connection state that outlives dispatch must copy packet bytes it needs.
     bytes: []const u8,
     local: ?Address = null,
     remote: Address,
@@ -67,15 +94,17 @@ pub const Endpoint = struct {
     ctx: *anyopaque,
     clock: Clock,
     recvFn: *const fn (*anyopaque, []u8, Clock) ReceiveError!ReceivedDatagram,
-    sendFn: *const fn (*anyopaque, SendDatagram) SendError!usize,
+    sendFn: *const fn (*anyopaque, SendDatagram) SendError!void,
     tuneBuffersFn: *const fn (*anyopaque, BufferTuning) void,
 
     pub fn receive(self: Endpoint, scratch: []u8) ReceiveError!ReceivedDatagram {
         return self.recvFn(self.ctx, scratch, self.clock);
     }
 
-    pub fn send(self: Endpoint, datagram: SendDatagram) SendError!usize {
-        return self.sendFn(self.ctx, datagram);
+    /// Send one complete UDP datagram. Short successful sends are not part of
+    /// this contract; an implementation must translate them to an error.
+    pub fn send(self: Endpoint, datagram: SendDatagram) SendError!void {
+        try self.sendFn(self.ctx, datagram);
     }
 
     pub fn tuneBuffers(self: Endpoint, tuning: BufferTuning) void {
@@ -83,13 +112,31 @@ pub const Endpoint = struct {
     }
 };
 
-pub const RouteKey = struct {
-    dcid: []const u8,
+pub const MaxConnectionIdLen = 20;
+
+pub const ConnectionId = struct {
+    bytes: [MaxConnectionIdLen]u8 = [_]u8{0} ** MaxConnectionIdLen,
+    len: u8 = 0,
+
+    pub fn init(raw: []const u8) !ConnectionId {
+        if (raw.len == 0) return error.EmptyConnectionId;
+        if (raw.len > MaxConnectionIdLen) return error.ConnectionIdTooLong;
+        var id = ConnectionId{ .len = @intCast(raw.len) };
+        @memcpy(id.bytes[0..raw.len], raw);
+        return id;
+    }
+
+    pub fn slice(self: *const ConnectionId) []const u8 {
+        return self.bytes[0..self.len];
+    }
 };
 
-pub fn routeByDcid(dcid: []const u8) ?RouteKey {
-    if (dcid.len == 0) return null;
-    return .{ .dcid = dcid };
+pub const RouteKey = struct {
+    dcid: ConnectionId,
+};
+
+pub fn routeByDcid(dcid: []const u8) !RouteKey {
+    return .{ .dcid = try ConnectionId.init(dcid) };
 }
 
 const FakeClock = struct {
@@ -120,10 +167,9 @@ const FakeEndpoint = struct {
         };
     }
 
-    fn send(ctx: *anyopaque, datagram: SendDatagram) SendError!usize {
+    fn send(ctx: *anyopaque, datagram: SendDatagram) SendError!void {
         const self: *FakeEndpoint = @ptrCast(@alignCast(ctx));
         self.last_sent_len = datagram.bytes.len;
-        return datagram.bytes.len;
     }
 
     fn tune(ctx: *anyopaque, tuning: BufferTuning) void {
@@ -146,13 +192,14 @@ test "UDP endpoint carries datagram metadata and deterministic time" {
     var fake = FakeEndpoint{
         .clock = .{ .now_us = 42_000 },
         .recv_payload = "packet",
-        .remote = .{ .ip = "127.0.0.1", .port = 4433 },
+        .remote = Address.ip4(.{ 127, 0, 0, 1 }, 4433),
     };
     const endpoint = fake.endpoint();
     var scratch: [64]u8 = undefined;
     const datagram = try endpoint.receive(&scratch);
     try std.testing.expectEqualSlices(u8, "packet", datagram.bytes);
-    try std.testing.expectEqualStrings("127.0.0.1", datagram.remote.ip);
+    try std.testing.expectEqual(AddressFamily.ip4, datagram.remote.family);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 127, 0, 0, 1 }, datagram.remote.slice());
     try std.testing.expectEqual(@as(u16, 4433), datagram.remote.port);
     try std.testing.expectEqual(Ecn.ect0, datagram.ecn);
     try std.testing.expectEqual(@as(u64, 42_000), datagram.received_at_us);
@@ -162,22 +209,24 @@ test "UDP endpoint exposes send and buffer tuning hooks" {
     var fake = FakeEndpoint{
         .clock = .{ .now_us = 1 },
         .recv_payload = "",
-        .remote = .{ .ip = "127.0.0.1", .port = 4433 },
+        .remote = Address.ip4(.{ 127, 0, 0, 1 }, 4433),
     };
     const endpoint = fake.endpoint();
-    const sent = try endpoint.send(.{
+    try endpoint.send(.{
         .bytes = "hello",
-        .remote = .{ .ip = "127.0.0.1", .port = 4433 },
+        .remote = Address.ip4(.{ 127, 0, 0, 1 }, 4433),
         .send_at_us = 100,
     });
     endpoint.tuneBuffers(.{ .recv_bytes = 4 * 1024 * 1024, .send_bytes = 1024 * 1024 });
-    try std.testing.expectEqual(@as(usize, 5), sent);
     try std.testing.expectEqual(@as(usize, 5), fake.last_sent_len);
     try std.testing.expectEqual(@as(?usize, 4 * 1024 * 1024), fake.last_tuning.recv_bytes);
 }
 
-test "DCID routing key rejects empty IDs" {
-    try std.testing.expect(routeByDcid("") == null);
-    const key = routeByDcid("abcd").?;
-    try std.testing.expectEqualSlices(u8, "abcd", key.dcid);
+test "DCID routing key owns a bounded connection ID" {
+    try std.testing.expectError(error.EmptyConnectionId, routeByDcid(""));
+    try std.testing.expectError(error.ConnectionIdTooLong, routeByDcid("012345678901234567890"));
+    var source = [_]u8{ 'a', 'b', 'c', 'd' };
+    const key = try routeByDcid(&source);
+    source[0] = 'z';
+    try std.testing.expectEqualSlices(u8, "abcd", key.dcid.slice());
 }

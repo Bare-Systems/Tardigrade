@@ -120,7 +120,17 @@ The target module seams are:
 Incoming UDP packets are routed by parsed Destination Connection ID (DCID) to a
 connection bucket before HTTP/3 request logic runs. That routing layer owns QUIC
 connection/worker ownership; HTTP and gateway request types must not leak into
-`src/quic/udp.zig`.
+`src/quic/udp.zig`. Route keys own a bounded copy of the DCID rather than a
+borrowed receive-buffer slice, so connection maps cannot accidentally retain
+packet scratch memory. Received datagram payload slices are explicitly
+short-lived: they point into caller-owned receive scratch and must be copied by
+connection code if needed after dispatch.
+
+The UDP endpoint contract is whole-datagram oriented. A successful send means
+the full datagram was handed to the socket layer; short sends are translated to
+errors by the endpoint implementation. Endpoint addresses carry binary IPv4/IPv6
+bytes plus port and scope id rather than formatted strings, avoiding hot-path
+parse/format allocation when real socket I/O lands.
 
 The initial config model is intentionally conservative and defaults off. Only
 safe rollout toggles should become operator-facing early; internal transport

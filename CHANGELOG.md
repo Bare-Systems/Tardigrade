@@ -14,7 +14,8 @@ All notable user-facing changes to Tardigrade are documented here.
   `src/quic/config.zig` now captures the internal QUIC/H3 config defaults,
   validation rules, and transport-parameter mapping, while `src/quic/udp.zig`
   defines an HTTP-independent UDP endpoint contract with datagram metadata,
-  ECN, buffer-tuning hooks, deterministic clocks, and DCID route keys.
+  ECN, buffer-tuning hooks, deterministic clocks, owned DCID route keys,
+  binary endpoint addresses, and all-or-error datagram sends.
   `docs/CONCURRENCY.md` documents the `udp`, `quic`, `tls_adapter`, `http3`,
   and gateway stream-transport seams plus the upstream-H3-first rollout model.
 - **Protocol-agnostic stream transport target defined (#241)** —

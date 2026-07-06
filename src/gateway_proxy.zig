@@ -16,36 +16,35 @@ const gpres = @import("gateway_proxy_response.zig");
 const gpt = @import("gateway_proxy_target.zig");
 const gconn = @import("gateway_connection.zig");
 
-// Re-export the header-boundary API so existing callers that import from this
-// module continue to work without change.
-pub const MaybeOwnedBytes = gph.MaybeOwnedBytes;
+// Compatibility re-exports of the split-out proxy helper APIs (headers /
+// response / target modules) so existing callers that import this module keep
+// compiling. New code should import from the owning module directly
+// (`gph` / `gpres` / `gpt`); this shim shrinks as callers migrate (#156, #152).
+// Grouped by owning module so code search points at the true owner.
+//
+// -- gateway_proxy_headers.zig (gph)
 pub const buildForwardedFor = gph.buildForwardedFor;
 pub const isTrustedUpstream = gph.isTrustedUpstream;
 pub const appendTrustedUpstreamHeaders = gph.appendTrustedUpstreamHeaders;
 pub const appendRequestIdHeaders = gph.appendRequestIdHeaders;
 pub const writeRequestIdHeaders = gph.writeRequestIdHeaders;
 pub const setRequestIdHeaders = gph.setRequestIdHeaders;
+// -- gateway_proxy_response.zig (gpres)
 pub const applyResponseHeaders = gpres.applyResponseHeaders;
 pub const writeStreamedUpstreamResponse = gpres.writeStreamedUpstreamResponse;
-pub const writeStreamedUpstreamResponseHead = gpres.writeStreamedUpstreamResponseHead;
 pub const writeStreamedUpstreamResponseHeadFromHeaders = gpres.writeStreamedUpstreamResponseHeadFromHeaders;
 pub const writeBufferedUpstreamResponse = gpres.writeBufferedUpstreamResponse;
-pub const writeBufferedUpstreamResponseHead = gpres.writeBufferedUpstreamResponseHead;
 pub const computeHstsValue = gpres.computeHstsValue;
 pub const writeSecurityHeaders = gpres.writeSecurityHeaders;
-pub const writeSecurityHeadersFiltered = gpres.writeSecurityHeadersFiltered;
 pub const writeChunk = gpres.writeChunk;
 pub const buildApiErrorJson = gpres.buildApiErrorJson;
 pub const sendApiError = gpres.sendApiError;
 pub const upstreamReasonPhrase = gpres.upstreamReasonPhrase;
+// -- gateway_proxy_target.zig (gpt)
 pub const ResolvedProxyTarget = gpt.ResolvedProxyTarget;
-pub const isRedirectStatusCode = gpt.isRedirectStatusCode;
 pub const resolveProxyTarget = gpt.resolveProxyTarget;
 pub const appendProxyQueryString = gpt.appendProxyQueryString;
-pub const resolveRedirectTargetUrl = gpt.resolveRedirectTargetUrl;
 pub const unixSocketPathFromEndpoint = gpt.unixSocketPathFromEndpoint;
-pub const combineProxyTarget = gpt.combineProxyTarget;
-pub const parseUpstreamHost = gpt.parseUpstreamHost;
 const maxBufferedUpstreamResponseBytes = gs.maxBufferedUpstreamResponseBytes;
 const CancellationToken = http.cancellation.CancellationToken;
 

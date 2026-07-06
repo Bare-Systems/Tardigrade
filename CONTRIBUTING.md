@@ -49,12 +49,15 @@ connection close), no starved worker, no leaked client connections (a bounded
 Covered failure modes:
 
 - Origin down before connect, or accepting-but-never-responding (bounded 5xx).
-- Origin closing mid-response (buffered path never fabricates the advertised
+- Origin closing mid-response (buffered path returns 502 rather than a truncated
   body; streaming aborts are asserted separately).
 - Origin returning malformed response headers (bounded 5xx, never passed
   through as success).
 - Client aborting mid-upload and mid-download (worker recovers; downstream
   aborts are recorded via `tardigrade_proxy_client_aborts_total`).
+- Malformed and stalled downstream TLS handshakes (rejected and logged without
+  wedging the listener; stalls bounded by `TARDIGRADE_TLS_HANDSHAKE_TIMEOUT_MS`).
+  Requires `curl` for the valid-TLS control request.
 - Access-log sink unreachable (requests still succeed).
 - Metrics endpoint scraped under concurrent proxy load.
 

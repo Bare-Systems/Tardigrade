@@ -21,6 +21,77 @@ The hot path for a single request therefore runs entirely on one worker thread â
 no async hand-offs, no continuation queues. Shared state is only touched at
 well-defined call sites (accept, route, upstream select, metrics emit, response).
 
+## I/O abstraction boundary
+
+Tardigrade uses two I/O layers deliberately. The layer is chosen by ownership of
+the fd and by whether the code is on the data-plane socket path, not by local
+convenience.
+
+### High-level / compatibility I/O
+
+Config parsing, config generation, static-file metadata, cache files, session
+and transcript stores, CLI file operations, subprocess spawning, clocks, random
+bytes, stdout/stderr writers, and other common utilities should go through
+`src/zig_compat.zig` or the `std.Io` APIs it wraps.
+
+`zig_compat.zig` is the compatibility boundary for the pinned Zig compiler. It
+absorbs `std.Io` churn and owns the few low-level escape hatches needed to keep
+the rest of the codebase small:
+
+- `compat.cwd()`, `compat.openFileAbsolute`, and `compat.createFileAbsolute`
+  wrap directory and file operations.
+- `compat.NetStream`, `compat.netStreamFromFd`, and the bounded connect helpers
+  keep the gateway's socket-facing transport shape stable.
+- `compat.Mutex`, `compat.Condition`, clocks, sleeps, env lookup, and writer
+  helpers keep high-level modules off raw OS APIs.
+
+New config, static-file, CLI, cache, session, transcript, ACME, and utility code
+should not call `std.posix`, `std.c`, or `std.os` directly unless it is adding a
+compatibility helper here first.
+
+### Low-level socket / fd I/O
+
+Listener, gateway socket, proxy transport, HTTP/2 transport, FastCGI-style
+protocol transport, and HTTP/3/UDP code own raw fds and may use `std.posix` /
+`std.c` directly for socket semantics that `std.Io` does not expose stably in
+Zig 0.16. This includes:
+
+- `accept`, `poll`, non-blocking toggles, `SO_*TIMEO`, `SO_REUSEADDR`,
+  `TCP_NODELAY`, `shutdown`, peer address extraction, and fd close behavior.
+- Bounded blocking upstream sockets where timeout behavior depends on
+  `SO_RCVTIMEO`, `SO_SNDTIMEO`, and `poll(2)`.
+- UDP datagram send/receive and address metadata for the current C-backed
+  HTTP/3 path and the future QUIC endpoint abstraction.
+
+The target API layer for gateway/listener/socket code is therefore raw fd
+ownership wrapped at protocol boundaries, not ad hoc high-level file/config
+helpers. Socket-specific helpers belong in `gateway_connection.zig`,
+`gateway_accept.zig`, `gateway_proxy.zig`, the h2 transport, the HTTP/3/UDP
+runtime, or `zig_compat.zig` when multiple protocols need the same behavior.
+
+### Static-file fast path
+
+Static-file selection, normalization, metadata, range calculation, and fallback
+body reads remain high-level `compat` / `std.Io` work. The plain HTTP file-backed
+send path is the intentional exception: `gateway_static_runtime.zig` may use
+Linux `sendfile(2)` behind an OS gate and falls back to a portable read/write
+loop elsewhere. TLS and compressed responses do not use that zero-copy path.
+
+### Follow-up work
+
+The remaining implementation work is already tracked:
+
+| Area | Issue |
+|---|---|
+| Shared h1/h2/h3 stream transport boundary | #241 |
+| Pure Zig QUIC and C-backend replacement boundary | #242 |
+| UDP endpoint and QUIC config model | #248 |
+| Pure Zig QUIC / HTTP/3 foundation epic | #240 |
+
+Do not start an `io_uring` or async-runtime rewrite from this boundary. Any new
+backend must be benchmark-justified and fit behind the same socket/protocol
+ownership rules.
+
 ---
 
 ## Lock inventory

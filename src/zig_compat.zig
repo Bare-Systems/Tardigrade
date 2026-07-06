@@ -1,3 +1,22 @@
+//! I/O compatibility boundary for Tardigrade (see #211 and docs/CONCURRENCY.md).
+//!
+//! This module is the seam between the gateway and the still-evolving Zig
+//! standard-library I/O (`std.Io`). High-level code — config, files, process,
+//! logging, static assets — goes through the helpers here rather than reaching
+//! into `std.Io`/`std.posix` directly, so a stdlib API churn is absorbed in one
+//! place and those modules stay free of raw syscalls. Add new shared I/O
+//! compatibility shims here before reaching into raw OS APIs from config,
+//! file, CLI, cache, session, transcript, ACME, or other utility modules.
+//!
+//! Hot socket paths (`gateway_connection.zig`, `gateway_proxy.zig`, the
+//! h2/UDP transports) deliberately use low-level `std.posix` for `poll`,
+//! `SO_*TIMEO`, `TCP_NODELAY`, and address handling; that is the sanctioned
+//! low-level layer. The only low-level calls outside those socket modules are
+//! deliberate: raw `stderr` writes in `logger.zig`/`access_log.zig`, the
+//! `access_log.zig` syslog UDP socket, and the `gateway_static_runtime.zig`
+//! zero-copy `sendfile`/`socketpair` path. New code should not add raw
+//! `std.posix` I/O to config/util modules.
+
 const std = @import("std");
 const builtin = @import("builtin");
 

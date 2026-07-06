@@ -19,6 +19,28 @@ pub const TimeoutPhase = enum {
     response_body,
 };
 
+pub const StreamError = error{
+    Timeout,
+    Cancelled,
+    StreamReset,
+    ConnectionClosed,
+    UpstreamProtocolError,
+    OutOfMemory,
+};
+
+pub const RequestFinishReason = enum {
+    sent,
+    cancelled_downstream,
+    timeout,
+    upstream_error,
+};
+
+pub const ResponseFinishReason = enum {
+    drained,
+    cancelled_downstream,
+    upstream_error,
+};
+
 pub const TransportMeta = struct {
     protocol: Protocol,
     reused_connection: bool = false,
@@ -40,10 +62,15 @@ pub const RequestHead = struct {
 
 pub const BodySource = struct {
     ctx: *anyopaque,
-    readFn: *const fn (*anyopaque, []u8) anyerror!usize,
+    readFn: *const fn (*anyopaque, []u8) StreamError!usize,
+    finishFn: *const fn (*anyopaque, RequestFinishReason) void,
 
-    pub fn read(self: BodySource, out: []u8) !usize {
+    pub fn read(self: BodySource, out: []u8) StreamError!usize {
         return self.readFn(self.ctx, out);
+    }
+
+    pub fn finish(self: BodySource, reason: RequestFinishReason) void {
+        self.finishFn(self.ctx, reason);
     }
 };
 
@@ -62,15 +89,15 @@ pub const ResponseHead = struct {
 
 pub const ResponseBody = struct {
     ctx: *anyopaque,
-    readFn: *const fn (*anyopaque, []u8) anyerror!usize,
-    finishFn: *const fn (*anyopaque) void,
+    readFn: *const fn (*anyopaque, []u8) StreamError!usize,
+    finishFn: *const fn (*anyopaque, ResponseFinishReason) void,
 
-    pub fn read(self: ResponseBody, out: []u8) !usize {
+    pub fn read(self: ResponseBody, out: []u8) StreamError!usize {
         return self.readFn(self.ctx, out);
     }
 
-    pub fn finish(self: ResponseBody) void {
-        self.finishFn(self.ctx);
+    pub fn finish(self: ResponseBody, reason: ResponseFinishReason) void {
+        self.finishFn(self.ctx, reason);
     }
 };
 
@@ -116,9 +143,10 @@ pub const OpenedResponse = struct {
 const SliceReader = struct {
     data: []const u8,
     off: usize = 0,
-    finished: bool = false,
+    request_finish: ?RequestFinishReason = null,
+    response_finish: ?ResponseFinishReason = null,
 
-    fn read(ctx: *anyopaque, out: []u8) !usize {
+    fn read(ctx: *anyopaque, out: []u8) StreamError!usize {
         const self: *SliceReader = @ptrCast(@alignCast(ctx));
         const remaining = self.data[self.off..];
         if (remaining.len == 0) return 0;
@@ -128,15 +156,24 @@ const SliceReader = struct {
         return n;
     }
 
-    fn finish(ctx: *anyopaque) void {
+    fn finishRequest(ctx: *anyopaque, reason: RequestFinishReason) void {
         const self: *SliceReader = @ptrCast(@alignCast(ctx));
-        self.finished = true;
+        self.request_finish = reason;
+    }
+
+    fn finishResponse(ctx: *anyopaque, reason: ResponseFinishReason) void {
+        const self: *SliceReader = @ptrCast(@alignCast(ctx));
+        self.response_finish = reason;
     }
 };
 
-test "BodySource drains a streaming request body" {
+test "BodySource drains and finishes a streaming request body" {
     var reader = SliceReader{ .data = "request-body" };
-    const source = BodySource{ .ctx = &reader, .readFn = SliceReader.read };
+    const source = BodySource{
+        .ctx = &reader,
+        .readFn = SliceReader.read,
+        .finishFn = SliceReader.finishRequest,
+    };
 
     var buf: [7]u8 = undefined;
     const first = try source.read(&buf);
@@ -144,9 +181,11 @@ test "BodySource drains a streaming request body" {
     const second = try source.read(&buf);
     try std.testing.expectEqualSlices(u8, "-body", buf[0..second]);
     try std.testing.expectEqual(@as(usize, 0), try source.read(&buf));
+    source.finish(.sent);
+    try std.testing.expectEqual(RequestFinishReason.sent, reader.request_finish.?);
 }
 
-test "ResponseBody exposes headers-first pull drain and explicit finish" {
+test "ResponseBody exposes headers-first pull drain and reasoned finish" {
     var reader = SliceReader{ .data = "part1part2" };
     const response = OpenedResponse{
         .head = .{
@@ -158,7 +197,7 @@ test "ResponseBody exposes headers-first pull drain and explicit finish" {
         .body = .{
             .ctx = &reader,
             .readFn = SliceReader.read,
-            .finishFn = SliceReader.finish,
+            .finishFn = SliceReader.finishResponse,
         },
         .delivery_state = .sent_no_downstream_response,
     };
@@ -170,8 +209,8 @@ test "ResponseBody exposes headers-first pull drain and explicit finish" {
     var buf: [5]u8 = undefined;
     const n = try response.body.read(&buf);
     try std.testing.expectEqualSlices(u8, "part1", buf[0..n]);
-    response.body.finish();
-    try std.testing.expect(reader.finished);
+    response.body.finish(.cancelled_downstream);
+    try std.testing.expectEqual(ResponseFinishReason.cancelled_downstream, reader.response_finish.?);
 }
 
 test "retryBoundary pins the shared retry policy states" {

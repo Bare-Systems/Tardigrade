@@ -14,9 +14,12 @@ All notable user-facing changes to Tardigrade are documented here.
   `src/http/stream_transport.zig` now defines the shared h1/h2/h3 proxy stream
   contract for request heads, buffered or streaming request bodies,
   headers-first responses, pull-based body drains, protocol metadata, and retry
-  boundaries. `docs/UPSTREAM_POOLING.md` maps the existing h1 buffered, h1
-  streaming, h2 buffered, and h2 streaming paths to that contract so future H3
-  work has a stable adapter target without a data-plane rewrite.
+  boundaries. The contract also names the stream error domain and carries
+  request/response finish reasons so adapters can distinguish clean drains from
+  downstream cancellation and upstream errors. `docs/UPSTREAM_POOLING.md` maps
+  the existing h1 buffered, h1 streaming, h2 buffered, and h2 streaming paths to
+  that contract so future H3 work has a stable adapter target without a
+  data-plane rewrite.
 - **I/O abstraction boundary documented (#211)** — `docs/CONCURRENCY.md` now
   records the intended split between high-level `std.Io` / `zig_compat.zig`
   usage for config, files, CLI, cache, session, transcript, and utility code,

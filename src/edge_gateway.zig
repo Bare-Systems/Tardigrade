@@ -1290,7 +1290,7 @@ fn readExactConn(conn: anytype, out: []u8) !void {
     }
 }
 
-fn parseRequestErrorStatus(err: anyerror) http.Status {
+fn parseRequestErrorStatus(err: http.ParseError) http.Status {
     return switch (err) {
         error.HeadersTooLarge, error.HeaderTooLarge, error.TooManyHeaders => .request_header_fields_too_large,
         error.BodyTooLarge => .payload_too_large,
@@ -1421,6 +1421,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
             return;
         }
         var head_parse = http.Request.parseHead(allocator, pending_buf[0..head_read.header_len], MAX_REQUEST_SIZE) catch |err| {
+            if (err == error.OutOfMemory) return err; // resource failure, not a client parse error
             try gp.sendApiError(allocator, conn.writer(), parseRequestErrorStatus(err), "invalid_request", "Malformed request", null, keep_alive, state);
             state.logger.warn(null, "parse error: {}", .{err});
             return;
@@ -1453,6 +1454,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
                 return;
             }
             const parse_result = http.Request.parse(allocator, pending_buf[0..total_read], MAX_REQUEST_SIZE) catch |err| {
+                if (err == error.OutOfMemory) return err; // resource failure, not a client parse error
                 try gp.sendApiError(allocator, conn.writer(), parseRequestErrorStatus(err), "invalid_request", "Malformed request", null, keep_alive, state);
                 state.logger.warn(null, "parse error: {}", .{err});
                 return;
@@ -1478,6 +1480,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         }
 
         const parse_result = http.Request.parse(allocator, pending_buf[0..total_read], MAX_REQUEST_SIZE) catch |err| {
+            if (err == error.OutOfMemory) return err; // resource failure, not a client parse error
             try gp.sendApiError(allocator, conn.writer(), parseRequestErrorStatus(err), "invalid_request", "Malformed request", null, keep_alive, state);
             state.logger.warn(null, "parse error: {}", .{err});
             return;

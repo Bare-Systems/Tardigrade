@@ -208,6 +208,38 @@ and relaying a slow client upload over the shared connection needs an
 incremental DATA-send API on the actor. Deferred within #145: streaming
 uploads over h2.
 
+## Protocol-agnostic stream transport target (#241)
+
+Future HTTP/3 work should plug into the existing proxy runtime through the
+shared contract in `src/http/stream_transport.zig` instead of creating a second
+parallel data plane. The contract models the pieces all upstream protocols must
+provide:
+
+- request head: method, scheme, authority, path, and request headers;
+- request body: none, buffered bytes, or a pull-based streaming source;
+- response head before body bytes: status, headers, and protocol metadata;
+- response body: pull-based drain plus explicit finish/cancel cleanup;
+- transport metadata: `h1` / `h2` / `h3`, connection reuse, and optional stream
+  id;
+- retry boundary: safe before delivery, maybe-safe after request send but before
+  downstream response bytes, and unsafe after response bytes have started
+  downstream.
+
+Current paths map to that contract without semantic loss:
+
+| Path | Current entry point | Contract mapping |
+|---|---|---|
+| h1 buffered | `executeBoundedBufferedHttpProxyRequest` / `exchangeBoundedBufferedHttpRequest` | `RequestBody.buffered`, materialized `ResponseHead` + bounded body; stale pooled close maps to `before_delivery` |
+| h1 streaming | `executeStreamingHttpProxyRequest` / `streamProxyOverTransport` | `RequestBody.buffered` or `RequestBody.streaming`; response head is written before pull-draining body; `wrote_downstream` maps to `response_started_downstream` |
+| h2 buffered | `upstream_h2.H2Conn.request` | `RequestBody.buffered`, `ResponseHead.meta.protocol = h2`, body materialized under the configured cap |
+| h2 streaming | `requestStreaming` / `readStreamingBody` / `finishStreaming` | headers-first `OpenedResponse`, pull body drain, explicit finish that RST_STREAMs abandoned streams |
+
+Retry policy stays in `gateway_proxy_runtime.zig`; transports expose only the
+delivery state needed to make the decision. A future h3 adapter should expose
+the same shape with `meta.protocol = h3` and a QUIC stream id, while keeping
+QUIC connection IDs, packet routing, and flow-control internals below this
+boundary.
+
 ### Cleartext h2c (#237)
 
 `TARDIGRADE_UPSTREAM_PROTOCOL=h2c` makes plain-HTTP (`http://`) upstreams speak

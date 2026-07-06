@@ -10,6 +10,13 @@ All notable user-facing changes to Tardigrade are documented here.
 - **CI perf smoke now guards upstream connection reuse (#141)** — `benchmarks/ci-smoke.sh` scrapes the gateway metrics endpoint after the proxy run and fails if fewer than 80% of upstream connections were reused (`reused / (reused + new)`). This catches a regression to per-request connections — the exact failure mode that motivated the pool (#196 dropped reuse to zero). The smoke fixture gains a `metrics_path`.
 
 ### Documentation
+- **Protocol-agnostic stream transport target defined (#241)** —
+  `src/http/stream_transport.zig` now defines the shared h1/h2/h3 proxy stream
+  contract for request heads, buffered or streaming request bodies,
+  headers-first responses, pull-based body drains, protocol metadata, and retry
+  boundaries. `docs/UPSTREAM_POOLING.md` maps the existing h1 buffered, h1
+  streaming, h2 buffered, and h2 streaming paths to that contract so future H3
+  work has a stable adapter target without a data-plane rewrite.
 - **I/O abstraction boundary documented (#211)** — `docs/CONCURRENCY.md` now
   records the intended split between high-level `std.Io` / `zig_compat.zig`
   usage for config, files, CLI, cache, session, transcript, and utility code,

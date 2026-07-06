@@ -45,6 +45,10 @@ pub const NetStream = struct {
     inner: ?std.Io.net.Stream = null,
     handle: std.posix.fd_t,
 
+    // `anyerror` because the backing std.Io stream error set is still in flux on
+    // the pinned compiler; this is the root that makes downstream socket-I/O
+    // signatures inferred-open. Narrowing these to a stable domain set is tracked
+    // in #211 (I/O boundary) and unblocks further error-set narrowing (#210).
     pub const WriteError = anyerror;
     pub const ReadError = anyerror;
 

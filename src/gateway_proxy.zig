@@ -1888,6 +1888,10 @@ pub fn mapUpstreamError(status: u16) UpstreamMappedError {
     };
 }
 
+/// Intentionally takes `anyerror`: proxy execution surfaces a heterogeneous set
+/// (the specific upstream errors below, plus allocator and compat socket I/O
+/// errors that are themselves `anyerror` until the I/O boundary is narrowed in
+/// #211). The `else` arm maps everything unrecognized to a safe gateway-timeout.
 pub fn mapControlPlaneProxyExecutionError(err: anyerror) ProxyExecMappedError {
     return switch (err) {
         error.UpstreamUntrusted => .{

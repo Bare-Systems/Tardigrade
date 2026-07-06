@@ -1290,7 +1290,7 @@ fn readExactConn(conn: anytype, out: []u8) !void {
     }
 }
 
-fn parseRequestErrorStatus(err: anyerror) http.Status {
+fn parseRequestErrorStatus(err: http.ParseError) http.Status {
     return switch (err) {
         error.HeadersTooLarge, error.HeaderTooLarge, error.TooManyHeaders => .request_header_fields_too_large,
         error.BodyTooLarge => .payload_too_large,

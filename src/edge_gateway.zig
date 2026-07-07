@@ -1554,6 +1554,11 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
                 .setHeader("Content-Type", "application/octet-stream")
                 .setConnection(keep_alive);
             try acme_response.write(writer);
+            // ACME HTTP-01 challenges are ordinary requests; keep them visible in
+            // access logs and status metrics like every other terminal (#201).
+            state.metricsRecord(200);
+            var ctx_acme = http.request_context.RequestContext.init(allocator, correlation_id, client_ip);
+            ghandlers.logAccessForRequest(state, &ctx_acme, &request, 200);
             return;
         }
     }

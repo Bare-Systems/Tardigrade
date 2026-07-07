@@ -49,18 +49,27 @@ pub const RouteDecision = union(enum) {
     unmatched,
 };
 
-/// Pure route-matching precedence — no I/O, no mutation of `state`/`request`.
-/// Mirrors the order previously inlined at the top of `routeRequest`: the
-/// reload-status path, then the configured metrics path, then location blocks.
-/// (The transcript route still matches+executes inside `routeRequest`; folding
-/// it in here is a small follow-up.)
+/// Resolve a request to its route. Convenience over `resolveRoutePath` for the
+/// h1 `http.Request`.
+///
+/// TODO(#201): the transcript route is intentionally NOT part of `RouteDecision`
+/// yet. `handleTranscriptRoute` returns null for a `/transcripts/…` path that is
+/// not a recognized transcript endpoint, letting it fall through to location
+/// matching / try_files; a `.transcript` decision variant would swallow that
+/// fall-through and change behavior. So it stays a pre-check in `routeRequest`
+/// until that matcher is split from its handler. Fold it in with the pre-route
+/// middleware stage (later #201 PR).
 pub fn resolveRoute(cfg: *const edge_config.EdgeConfig, request: *const http.Request) RouteDecision {
-    return resolveRouteFor(cfg.metrics_path, cfg.location_blocks, request.uri.path);
+    return resolveRoutePath(cfg.metrics_path, cfg.location_blocks, request.uri.path);
 }
 
-/// Pure core of route resolution, decoupled from `EdgeConfig`/`Request` so the
-/// precedence is directly unit-testable without constructing a full config.
-fn resolveRouteFor(
+/// Pure route-matching precedence — no I/O, no mutation of `state`/`request`.
+/// Decoupled from `EdgeConfig`/`Request` so h1, h3, and pure-Zig h3 can share
+/// the same precedence (h3 has `http3_session.StreamRequest`, not `http.Request`)
+/// and so it is directly unit-testable without constructing a full config.
+/// Mirrors the order previously inlined in `routeRequest`: reload-status path,
+/// then the configured metrics path, then location blocks.
+pub fn resolveRoutePath(
     metrics_path: []const u8,
     location_blocks: []const http.location_router.LocationBlock,
     path: []const u8,
@@ -73,28 +82,28 @@ fn resolveRouteFor(
     return .unmatched;
 }
 
-test "resolveRouteFor: reload-status and metrics precede location matching" {
+test "resolveRoutePath: reload-status and metrics precede location matching" {
     const blocks = [_]http.location_router.LocationBlock{
         .{ .match_type = .prefix, .pattern = "/", .priority = 0, .action = .{ .return_response = .{ .status = 200, .body = "" } } },
     };
     const Tag = std.meta.Tag(RouteDecision);
     // reload-status wins over a configured metrics path and a catch-all location.
-    try std.testing.expectEqual(Tag.reload_status, std.meta.activeTag(resolveRouteFor("/metrics", &blocks, "/tardigrade/reload/status")));
+    try std.testing.expectEqual(Tag.reload_status, std.meta.activeTag(resolveRoutePath("/metrics", &blocks, "/tardigrade/reload/status")));
     // metrics path wins over a matching location.
-    try std.testing.expectEqual(Tag.metrics, std.meta.activeTag(resolveRouteFor("/metrics", &blocks, "/metrics")));
+    try std.testing.expectEqual(Tag.metrics, std.meta.activeTag(resolveRoutePath("/metrics", &blocks, "/metrics")));
     // an empty metrics_path disables the metrics route, falling to the location.
-    try std.testing.expectEqual(Tag.location, std.meta.activeTag(resolveRouteFor("", &blocks, "/metrics")));
+    try std.testing.expectEqual(Tag.location, std.meta.activeTag(resolveRoutePath("", &blocks, "/metrics")));
 }
 
-test "resolveRouteFor: location match carries the block, else unmatched" {
+test "resolveRoutePath: location match carries the block, else unmatched" {
     const blocks = [_]http.location_router.LocationBlock{
         .{ .match_type = .exact, .pattern = "/app", .priority = 1, .action = .{ .proxy_pass = "" } },
     };
-    switch (resolveRouteFor("/status/metrics", &blocks, "/app")) {
+    switch (resolveRoutePath("/status/metrics", &blocks, "/app")) {
         .location => |m| try std.testing.expectEqualStrings("/app", m.block.pattern),
         else => try std.testing.expect(false),
     }
-    try std.testing.expectEqual(std.meta.Tag(RouteDecision).unmatched, std.meta.activeTag(resolveRouteFor("/status/metrics", &blocks, "/nope")));
+    try std.testing.expectEqual(std.meta.Tag(RouteDecision).unmatched, std.meta.activeTag(resolveRoutePath("/status/metrics", &blocks, "/nope")));
 }
 
 pub fn routeRequest(

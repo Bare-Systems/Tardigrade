@@ -4627,8 +4627,10 @@ test "security headers do not override or duplicate upstream-provided values (#1
         .body = "{\"ok\":true}",
         .headers = &.{
             .{ .name = "Content-Type", .value = "application/json" },
-            .{ .name = "X-Frame-Options", .value = "SAMEORIGIN" },
-            .{ .name = "Content-Security-Policy", .value = "default-src 'none'" },
+            // Non-canonical case on purpose: the filter must dedupe
+            // case-insensitively (no canonical-cased duplicate added).
+            .{ .name = "x-frame-options", .value = "SAMEORIGIN" },
+            .{ .name = "content-security-policy", .value = "default-src 'none'" },
         },
     }});
     defer upstream.stop();
@@ -4653,13 +4655,18 @@ test "security headers do not override or duplicate upstream-provided values (#1
     defer response.deinit();
     try std.testing.expectEqual(@as(u16, 200), response.status_code);
     // Upstream values win, each present exactly once (not the gateway defaults
-    // DENY / "default-src 'self'", and not duplicated).
+    // DENY / "default-src 'self'", and not duplicated even across header casing).
     try std.testing.expectEqualStrings("SAMEORIGIN", response.header("X-Frame-Options") orelse "");
     try std.testing.expectEqualStrings("default-src 'none'", response.header("Content-Security-Policy") orelse "");
     try std.testing.expectEqual(@as(usize, 1), countHeaderOccurrences(response.headers_raw, "X-Frame-Options"));
     try std.testing.expectEqual(@as(usize, 1), countHeaderOccurrences(response.headers_raw, "Content-Security-Policy"));
-    // A header the upstream did NOT set still gets the gateway default.
+    // Headers the upstream did NOT set are still filled with the gateway default,
+    // exactly once — proving the filter is selective, not "skip all if the
+    // upstream provided any". Covers both an early and a later default.
     try std.testing.expectEqualStrings("nosniff", response.header("X-Content-Type-Options") orelse "");
+    try std.testing.expectEqual(@as(usize, 1), countHeaderOccurrences(response.headers_raw, "X-Content-Type-Options"));
+    try std.testing.expectEqualStrings("camera=(), microphone=(), geolocation=()", response.header("Permissions-Policy") orelse "");
+    try std.testing.expectEqual(@as(usize, 1), countHeaderOccurrences(response.headers_raw, "Permissions-Policy"));
 }
 
 test "HSTS header is emitted on HTTPS responses when enabled (#175)" {

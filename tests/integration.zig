@@ -4559,7 +4559,7 @@ test "security headers are emitted with safe defaults (#175)" {
     try std.testing.expectEqualStrings("nosniff", response.header("X-Content-Type-Options") orelse "");
     try std.testing.expectEqualStrings("default-src 'self'", response.header("Content-Security-Policy") orelse "");
     try std.testing.expectEqualStrings("strict-origin-when-cross-origin", response.header("Referrer-Policy") orelse "");
-    try assertContains(response.header("Permissions-Policy") orelse "", "camera=()");
+    try std.testing.expectEqualStrings("camera=(), microphone=(), geolocation=()", response.header("Permissions-Policy") orelse "");
     // X-XSS-Protection is intentionally "0" (disabled; CSP is the modern control).
     try std.testing.expectEqualStrings("0", response.header("X-XSS-Protection") orelse "");
     try std.testing.expectEqualStrings("same-origin", response.header("Cross-Origin-Opener-Policy") orelse "");
@@ -4587,9 +4587,15 @@ test "security headers can be disabled via config (#175)" {
     });
     defer response.deinit();
     try std.testing.expectEqual(@as(u16, 200), response.status_code);
+    // The full default set must be absent when disabled.
     try std.testing.expect(response.header("X-Frame-Options") == null);
+    try std.testing.expect(response.header("X-Content-Type-Options") == null);
     try std.testing.expect(response.header("Content-Security-Policy") == null);
     try std.testing.expect(response.header("Referrer-Policy") == null);
+    try std.testing.expect(response.header("Permissions-Policy") == null);
+    try std.testing.expect(response.header("X-XSS-Protection") == null);
+    try std.testing.expect(response.header("Cross-Origin-Opener-Policy") == null);
+    try std.testing.expect(response.header("Cross-Origin-Resource-Policy") == null);
 }
 
 test "location rewrite action falls through to try_files (#201)" {

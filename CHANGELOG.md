@@ -10,6 +10,14 @@ All notable user-facing changes to Tardigrade are documented here.
 - **CI perf smoke now guards upstream connection reuse (#141)** — `benchmarks/ci-smoke.sh` scrapes the gateway metrics endpoint after the proxy run and fails if fewer than 80% of upstream connections were reused (`reused / (reused + new)`). This catches a regression to per-request connections — the exact failure mode that motivated the pool (#196 dropped reuse to zero). The smoke fixture gains a `metrics_path`.
 
 ### Documentation
+- **Pure Zig QUIC config and UDP endpoint foundation defined (#248)** —
+  `src/quic/config.zig` now captures the internal QUIC/H3 config defaults,
+  validation rules, and transport-parameter mapping, while `src/quic/udp.zig`
+  defines an HTTP-independent UDP endpoint contract with datagram metadata,
+  ECN, buffer-tuning hooks, deterministic clocks, owned DCID route keys,
+  binary endpoint addresses, and all-or-error datagram sends.
+  `docs/CONCURRENCY.md` documents the `udp`, `quic`, `tls_adapter`, `http3`,
+  and gateway stream-transport seams plus the upstream-H3-first rollout model.
 - **Protocol-agnostic stream transport target defined (#241)** —
   `src/http/stream_transport.zig` now defines the shared h1/h2/h3 proxy stream
   contract for request heads, buffered or streaming request bodies,

@@ -122,3 +122,43 @@ test "request parser corpus deterministic mutations do not crash" {
         try assertMutationsDoNotCrash(allocator, case.path);
     }
 }
+
+// Generative fuzzing (complements the fixed corpus + byte-mutation tests above):
+// throws HTTP-biased random byte sequences at the parser and asserts it never
+// panics and never leaks (via testing.allocator) — it must always return either
+// a valid Request or a member of the closed ParseError set. Under a normal test
+// run this replays the seed corpus deterministically; under `zig build` fuzzing
+// it explores far wider. (#212)
+fn fuzzRequestParse(_: void, smith: *std.testing.Smith) anyerror!void {
+    var buf: [8192]u8 = undefined;
+    const len = smith.sliceWeightedBytes(&buf, &.{
+        // Bias toward HTTP structure so the fuzzer reaches deep parser branches
+        // (header parsing, chunked/content-length framing) rather than bailing
+        // at the request line on pure noise.
+        .value(u8, '\r', 4),
+        .value(u8, '\n', 4),
+        .value(u8, ':', 3),
+        .value(u8, ' ', 3),
+        .value(u8, '/', 2),
+        .rangeAtMost(u8, 'A', 'Z', 3),
+        .rangeAtMost(u8, 'a', 'z', 4),
+        .rangeAtMost(u8, '0', '9', 2),
+        .value(u8, 0x00, 1), // embedded NULs
+        .rangeAtMost(u8, 0x00, 0xff, 1), // full byte range incl. high bytes
+    });
+    const parsed = request_mod.Request.parse(std.testing.allocator, buf[0..len], request_mod.DEFAULT_MAX_BODY_SIZE) catch return;
+    var request = parsed.request;
+    request.deinit();
+}
+
+test "fuzz: Request.parse never panics or leaks on arbitrary input" {
+    try std.testing.fuzz({}, fuzzRequestParse, .{ .corpus = &.{
+        "GET / HTTP/1.1\r\nHost: x\r\n\r\n",
+        "POST /a HTTP/1.1\r\nContent-Length: 3\r\n\r\nabc",
+        "GET / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n",
+        "GET / HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\n",
+        "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n",
+        "not a valid request line\r\n\r\n",
+        "",
+    } });
+}

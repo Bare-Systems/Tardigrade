@@ -2044,6 +2044,9 @@ const CurlRequestSpec = struct {
     http3_only: bool = false,
     ssl_sessions_path: ?[]const u8 = null,
     tls_earlydata: bool = false,
+    /// Cap the client's maximum TLS version (curl `--tls-max`), e.g. "1.1" to
+    /// verify the server rejects a below-minimum handshake.
+    tls_max: ?[]const u8 = null,
 };
 
 fn runCurl(allocator: std.mem.Allocator, port: u16, spec: CurlRequestSpec) !CurlRunResult {
@@ -2094,6 +2097,10 @@ fn runCurl(allocator: std.mem.Allocator, port: u16, spec: CurlRequestSpec) !Curl
     }
     if (spec.tls_earlydata) {
         try argv.append("--tls-earlydata");
+    }
+    if (spec.tls_max) |v| {
+        try argv.append("--tls-max");
+        try argv.append(v);
     }
     const url = try std.fmt.allocPrint(allocator, "{s}://{s}:{d}{s}", .{ spec.scheme, test_host, port, spec.path });
     defer allocator.free(url);
@@ -4596,6 +4603,98 @@ test "security headers can be disabled via config (#175)" {
     try std.testing.expect(response.header("X-XSS-Protection") == null);
     try std.testing.expect(response.header("Cross-Origin-Opener-Policy") == null);
     try std.testing.expect(response.header("Cross-Origin-Resource-Policy") == null);
+}
+
+test "HSTS header is emitted on HTTPS responses when enabled (#175)" {
+    const allocator = std.testing.allocator;
+    const cwd = try compat.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(cwd);
+    const cert_path = try std.fmt.allocPrint(allocator, "{s}/tests/fixtures/tls/server.crt", .{cwd});
+    defer allocator.free(cert_path);
+    const key_path = try std.fmt.allocPrint(allocator, "{s}/tests/fixtures/tls/server.key", .{cwd});
+    defer allocator.free(key_path);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text =
+        \\location = /healthz {
+        \\    return 200 alive;
+        \\}
+        ,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = key_path },
+            .{ .name = "TARDIGRADE_HSTS_ENABLED", .value = "true" },
+        },
+    });
+    defer tardigrade.stop();
+
+    var response = try sendCurlRequest(allocator, tardigrade.port, .{
+        .scheme = "https",
+        .path = "/healthz",
+        .insecure = true,
+    });
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status_code);
+    // Default HSTS is a 1-year max-age with includeSubDomains on (preload off).
+    // Lock the exact value so the policy can't weaken or `preload` can't turn on
+    // without an explicit config change.
+    try std.testing.expectEqualStrings("max-age=31536000; includeSubDomains", response.header("Strict-Transport-Security") orelse "");
+}
+
+test "TLS 1.1 client is rejected when the minimum version is 1.2 (#175)" {
+    const allocator = std.testing.allocator;
+    const cwd = try compat.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(cwd);
+    const cert_path = try std.fmt.allocPrint(allocator, "{s}/tests/fixtures/tls/server.crt", .{cwd});
+    defer allocator.free(cert_path);
+    const key_path = try std.fmt.allocPrint(allocator, "{s}/tests/fixtures/tls/server.key", .{cwd});
+    defer allocator.free(key_path);
+
+    // Default TARDIGRADE_TLS_MIN_VERSION is 1.2 (not overridden here).
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text =
+        \\location = /healthz {
+        \\    return 200 alive;
+        \\}
+        ,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = key_path },
+        },
+    });
+    defer tardigrade.stop();
+
+    // Positive control: a client capped at TLS 1.2 still connects. This proves
+    // curl's --tls-max path works locally, so the 1.1 failure below is the
+    // server rejecting the version rather than a client-side curl quirk.
+    var tls12 = try sendCurlRequest(allocator, tardigrade.port, .{
+        .scheme = "https",
+        .path = "/healthz",
+        .insecure = true,
+        .tls_max = "1.2",
+    });
+    defer tls12.deinit();
+    try std.testing.expectEqual(@as(u16, 200), tls12.status_code);
+
+    // Same curl option path, same listener, same route — but a client capped at
+    // TLS 1.1 has no shared version with the 1.2-minimum server, so the
+    // handshake must fail (curl exits non-zero).
+    var capped = try runCurl(allocator, tardigrade.port, .{
+        .scheme = "https",
+        .path = "/healthz",
+        .insecure = true,
+        .tls_max = "1.1",
+    });
+    defer capped.deinit();
+    const rejected = switch (capped.term) {
+        .exited => |code| code != 0,
+        else => true,
+    };
+    try std.testing.expect(rejected);
 }
 
 test "location rewrite action falls through to try_files (#201)" {

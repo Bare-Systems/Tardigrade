@@ -48,6 +48,16 @@ fn activeThreadedIo() *std.Io.Threaded {
     if (threaded_io == null) {
         threaded_io = std.Io.Threaded.init(std.heap.c_allocator, .{
             .environ = inheritedEnviron(),
+            // In test builds, run std.Io operations synchronously (no worker
+            // pool). std.Io internally memory-maps files (config/corpus/static
+            // reads) and defers the unmap onto a worker thread; a Debug-only
+            // "failed to unmap" log from that deferred unmap under memory
+            // pressure would otherwise land in an unrelated, long-running test's
+            // window (the HPACK/parser fuzz tests) and trip the test runner's
+            // error-log check. Running inline keeps the unmap on the calling
+            // thread so it can't be mis-attributed. Production keeps the default
+            // (cpu-based) worker pool. (#264)
+            .async_limit = if (builtin.is_test) .nothing else null,
         });
     }
     return &threaded_io.?;

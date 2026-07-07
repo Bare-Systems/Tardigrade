@@ -1094,6 +1094,78 @@ const Http3LocationOutcome = union(enum) {
     },
 };
 
+/// Shape an HTTP/3 `http.Response` for a return plan: status, body, content-type,
+/// correlation id, and a `Location` header for redirects. Returns the emitted
+/// status. Kept free of gateway state (metrics/security headers stay in the
+/// caller) so the h3 rendering — the part that had drifted from h1 — is
+/// unit-testable without the ngtcp2 integration backend (#201).
+fn shapeHttp3ReturnResponse(
+    allocator: std.mem.Allocator,
+    response: *http.Response,
+    correlation_id: []const u8,
+    plan: ReturnResponsePlan,
+) !u16 {
+    switch (plan) {
+        .method_not_allowed => {
+            const payload = try buildApiErrorJson(allocator, "invalid_request", "Method Not Allowed", correlation_id);
+            _ = response
+                .setStatus(.method_not_allowed)
+                .setBodyOwned(payload)
+                .setContentType("application/json")
+                .setHeader(http.correlation.HEADER_NAME, correlation_id);
+            return 405;
+        },
+        .redirect => |r| {
+            _ = response
+                .setStatus(@enumFromInt(r.status))
+                .setBody(r.location)
+                .setContentType("text/plain; charset=utf-8")
+                .setHeader(http.correlation.HEADER_NAME, correlation_id)
+                .setHeader("location", r.location);
+            return r.status;
+        },
+        .body => |b| {
+            _ = response
+                .setStatus(@enumFromInt(b.status))
+                .setBody(b.body)
+                .setContentType("text/plain; charset=utf-8")
+                .setHeader(http.correlation.HEADER_NAME, correlation_id);
+            return b.status;
+        },
+    }
+}
+
+test "shapeHttp3ReturnResponse: non-redirect return on a non-GET/HEAD method renders 405 JSON" {
+    const allocator = std.testing.allocator;
+    var response = http.Response.init(allocator);
+    defer response.deinit();
+    const status = try shapeHttp3ReturnResponse(allocator, &response, "cid", planReturnResponse(false, 200, "ok"));
+    try std.testing.expectEqual(@as(u16, 405), status);
+    try std.testing.expectEqual(@as(u16, 405), @intFromEnum(response.status));
+    try std.testing.expectEqualStrings("application/json", response.headers.get("content-type") orelse "");
+    try std.testing.expect(response.body != null);
+}
+
+test "shapeHttp3ReturnResponse: redirect sets status and Location header" {
+    const allocator = std.testing.allocator;
+    var response = http.Response.init(allocator);
+    defer response.deinit();
+    const status = try shapeHttp3ReturnResponse(allocator, &response, "cid", planReturnResponse(false, 302, "/new"));
+    try std.testing.expectEqual(@as(u16, 302), status);
+    try std.testing.expectEqual(@as(u16, 302), @intFromEnum(response.status));
+    try std.testing.expectEqualStrings("/new", response.headers.get("location") orelse "");
+}
+
+test "shapeHttp3ReturnResponse: GET body path renders the body" {
+    const allocator = std.testing.allocator;
+    var response = http.Response.init(allocator);
+    defer response.deinit();
+    const status = try shapeHttp3ReturnResponse(allocator, &response, "cid", planReturnResponse(true, 200, "ok"));
+    try std.testing.expectEqual(@as(u16, 200), status);
+    try std.testing.expectEqual(@as(u16, 200), @intFromEnum(response.status));
+    try std.testing.expectEqualStrings("ok", response.body orelse "");
+}
+
 fn finalizeHttp3Response(response: *http.Response) void {
     if (response.headers.get("x-request-id")) |request_id| {
         _ = response.setHeader(http.correlation.HEADER_NAME, request_id);
@@ -1288,47 +1360,14 @@ fn routeHttp3Location(
             return .handled;
         },
         .return_response => |ret| {
+            // h3 now enforces the same GET/HEAD guard as h1 for non-redirect
+            // returns (previously missing — h3 served `return 200` on any method).
             const is_get_or_head = std.mem.eql(u8, request.method, "GET") or std.mem.eql(u8, request.method, "HEAD");
-            switch (planReturnResponse(is_get_or_head, ret.status, ret.body)) {
-                .method_not_allowed => {
-                    // h3 now enforces the same GET/HEAD guard as h1 for non-redirect
-                    // returns (previously missing — h3 served `return 200` on any
-                    // method) (#201).
-                    const payload = try buildApiErrorJson(allocator, "invalid_request", "Method Not Allowed", correlation_id);
-                    _ = response
-                        .setStatus(.method_not_allowed)
-                        .setBodyOwned(payload)
-                        .setContentType("application/json")
-                        .setHeader(http.correlation.HEADER_NAME, correlation_id);
-                    finalizeHttp3Response(response);
-                    applyResponseHeaders(ctx.state, response);
-                    ctx.state.metricsRecord(405);
-                    return .handled;
-                },
-                .redirect => |r| {
-                    _ = response
-                        .setStatus(@enumFromInt(r.status))
-                        .setBody(r.location)
-                        .setContentType("text/plain; charset=utf-8")
-                        .setHeader(http.correlation.HEADER_NAME, correlation_id)
-                        .setHeader("location", r.location);
-                    finalizeHttp3Response(response);
-                    applyResponseHeaders(ctx.state, response);
-                    ctx.state.metricsRecord(r.status);
-                    return .handled;
-                },
-                .body => |b| {
-                    _ = response
-                        .setStatus(@enumFromInt(b.status))
-                        .setBody(b.body)
-                        .setContentType("text/plain; charset=utf-8")
-                        .setHeader(http.correlation.HEADER_NAME, correlation_id);
-                    finalizeHttp3Response(response);
-                    applyResponseHeaders(ctx.state, response);
-                    ctx.state.metricsRecord(b.status);
-                    return .handled;
-                },
-            }
+            const status = try shapeHttp3ReturnResponse(allocator, response, correlation_id, planReturnResponse(is_get_or_head, ret.status, ret.body));
+            finalizeHttp3Response(response);
+            applyResponseHeaders(ctx.state, response);
+            ctx.state.metricsRecord(status);
+            return .handled;
         },
         .rewrite => |rw| {
             const rewritten_path, const rewritten_query = splitHttp3PathAndQuery(rw.replacement);

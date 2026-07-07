@@ -1515,7 +1515,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
     if (request.version == .http11 and request.headers.get("host") == null) {
         try gp.sendApiError(allocator, writer, .bad_request, "invalid_request", "HTTP/1.1 request missing required Host header", correlation_id, false, state);
         var ctx_host = http.request_context.RequestContext.init(allocator, correlation_id, connection_ip);
-        ghandlers.logAccess(state, &ctx_host, request.method.toString(), request.uri.path, 400, request.headers.get("user-agent") orelse "");
+        ghandlers.logAccessForRequest(state, &ctx_host, &request, 400);
         return;
     }
 
@@ -1528,7 +1528,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
     if (request.method == .TRACE) {
         try gp.sendApiError(allocator, writer, .method_not_allowed, "invalid_request", "Method Not Allowed", correlation_id, keep_alive, state);
         var ctx_trace = http.request_context.RequestContext.init(allocator, correlation_id, connection_ip);
-        ghandlers.logAccess(state, &ctx_trace, "TRACE", request.uri.path, 405, request.headers.get("user-agent") orelse "");
+        ghandlers.logAccessForRequest(state, &ctx_trace, &request, 405);
         return;
     }
 
@@ -1554,6 +1554,11 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
                 .setHeader("Content-Type", "application/octet-stream")
                 .setConnection(keep_alive);
             try acme_response.write(writer);
+            // ACME HTTP-01 challenges are ordinary requests; keep them visible in
+            // access logs and status metrics like every other terminal (#201).
+            state.metricsRecord(200);
+            var ctx_acme = http.request_context.RequestContext.init(allocator, correlation_id, client_ip);
+            ghandlers.logAccessForRequest(state, &ctx_acme, &request, 200);
             return;
         }
     }
@@ -1562,13 +1567,13 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
     const effective_cfg = ga.resolveRequestConfig(cfg, request.headers.get("host"), &effective_cfg_storage) orelse {
         try gp.sendApiError(allocator, writer, .not_found, "invalid_request", "Not Found", correlation_id, keep_alive, state);
         var ctx_404 = http.request_context.RequestContext.init(allocator, correlation_id, client_ip);
-        ghandlers.logAccess(state, &ctx_404, request.method.toString(), request.uri.path, 404, request.headers.get("user-agent") orelse "");
+        ghandlers.logAccessForRequest(state, &ctx_404, &request, 404);
         return;
     };
     var ctx = http.request_context.RequestContext.init(allocator, correlation_id, client_ip);
     if (!ga.hostMatchesServerNames(effective_cfg, &request)) {
         try gp.sendApiError(allocator, writer, .not_found, "invalid_request", "Not Found", correlation_id, keep_alive, state);
-        ghandlers.logAccess(state, &ctx, request.method.toString(), request.uri.path, 404, request.headers.get("user-agent") orelse "");
+        ghandlers.logAccessForRequest(state, &ctx, &request, 404);
         return;
     }
 
@@ -1579,7 +1584,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         // Metrics label must be the canonical "overload" the metrics switch
         // accepts (recordErrorCode); the client-facing API code stays "overloaded".
         state.metricsRecordErrorCode("overload");
-        ghandlers.logAccess(state, &ctx, request.method.toString(), request.uri.path, 503, request.headers.get("user-agent") orelse "");
+        ghandlers.logAccessForRequest(state, &ctx, &request, 503);
         return;
     }
     defer state.releaseRequestSlot();
@@ -1626,7 +1631,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
                 gp.applyResponseHeaders(state, &response);
                 try response.write(writer);
                 state.metricsRecord(r.status);
-                ghandlers.logAccess(state, &ctx, request.method.toString(), request.uri.path, r.status, request.headers.get("user-agent") orelse "");
+                ghandlers.logAccessForRequest(state, &ctx, &request, r.status);
                 return;
             },
             .returned => |r| {
@@ -1637,7 +1642,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
                     gp.applyResponseHeaders(state, &response);
                     try response.write(writer);
                     state.metricsRecord(r.status);
-                    ghandlers.logAccess(state, &ctx, request.method.toString(), request.uri.path, r.status, request.headers.get("user-agent") orelse "");
+                    ghandlers.logAccessForRequest(state, &ctx, &request, r.status);
                     return;
                 }
                 var response = http.Response.init(allocator);
@@ -1650,7 +1655,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
                 gp.applyResponseHeaders(state, &response);
                 try response.write(writer);
                 state.metricsRecord(r.status);
-                ghandlers.logAccess(state, &ctx, request.method.toString(), request.uri.path, r.status, request.headers.get("user-agent") orelse "");
+                ghandlers.logAccessForRequest(state, &ctx, &request, r.status);
                 return;
             },
         }
@@ -1676,7 +1681,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
             gp.applyResponseHeaders(state, &response);
             try response.write(writer);
             state.metricsRecord(r.status);
-            ghandlers.logAccess(state, &ctx, request.method.toString(), request.uri.path, r.status, request.headers.get("user-agent") orelse "");
+            ghandlers.logAccessForRequest(state, &ctx, &request, r.status);
             return;
         },
         .returned => |r| {
@@ -1687,7 +1692,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
                 gp.applyResponseHeaders(state, &response);
                 try response.write(writer);
                 state.metricsRecord(r.status);
-                ghandlers.logAccess(state, &ctx, request.method.toString(), request.uri.path, r.status, request.headers.get("user-agent") orelse "");
+                ghandlers.logAccessForRequest(state, &ctx, &request, r.status);
                 return;
             }
             var response = http.Response.init(allocator);
@@ -1700,7 +1705,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
             gp.applyResponseHeaders(state, &response);
             try response.write(writer);
             state.metricsRecord(r.status);
-            ghandlers.logAccess(state, &ctx, request.method.toString(), request.uri.path, r.status, request.headers.get("user-agent") orelse "");
+            ghandlers.logAccessForRequest(state, &ctx, &request, r.status);
             return;
         },
     }
@@ -1739,12 +1744,12 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         try gp.sendApiError(allocator, writer, .request_timeout, "request_timeout", "Request deadline exceeded", correlation_id, keep_alive, state);
         state.metricsRecord(408);
         state.metricsRecordErrorCode("request_timeout");
-        ghandlers.logAccess(state, &ctx, request.method.toString(), request.uri.path, 408, request.headers.get("user-agent") orelse "");
+        ghandlers.logAccessForRequest(state, &ctx, &request, 408);
         return;
     }
 
     const route_status = try ghandlers.routeRequest(conn, allocator, effective_cfg, state, &ctx, &request, correlation_id, &keep_alive, client_ip, streaming_request_body);
-    ghandlers.logAccess(state, &ctx, request.method.toString(), request.uri.path, route_status, request.headers.get("user-agent") orelse "");
+    ghandlers.logAccessForRequest(state, &ctx, &request, route_status);
     return;
 }
 

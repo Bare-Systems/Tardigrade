@@ -106,6 +106,42 @@ test "resolveRoutePath: location match carries the block, else unmatched" {
     try std.testing.expectEqual(std.meta.Tag(RouteDecision).unmatched, std.meta.activeTag(resolveRoutePath("/status/metrics", &blocks, "/nope")));
 }
 
+/// The rendering decision for a location `return` directive, shared by h1 and h3
+/// (#201). A non-redirect return is GET/HEAD-only (ASVS-14.5.1) — accepting
+/// DELETE/PUT/PATCH on `return 200 ok` would mislead the client into believing a
+/// destructive op succeeded; redirects (3xx) are method-agnostic. Each protocol
+/// computes the plan, then renders it its own way (h1 to the socket writer, h3
+/// into an http.Response).
+pub const ReturnResponsePlan = union(enum) {
+    method_not_allowed,
+    redirect: struct { status: u16, location: []const u8 },
+    body: struct { status: u16, body: []const u8 },
+};
+
+pub fn planReturnResponse(request_is_get_or_head: bool, status: u16, body: []const u8) ReturnResponsePlan {
+    const is_redirect = status >= 300 and status < 400;
+    if (!is_redirect and !request_is_get_or_head) return .method_not_allowed;
+    if (is_redirect and body.len > 0) return .{ .redirect = .{ .status = status, .location = body } };
+    return .{ .body = .{ .status = status, .body = body } };
+}
+
+test "planReturnResponse: non-redirect return is GET/HEAD only" {
+    try std.testing.expect(std.meta.activeTag(planReturnResponse(true, 200, "ok")) == .body);
+    try std.testing.expect(std.meta.activeTag(planReturnResponse(false, 200, "ok")) == .method_not_allowed);
+}
+
+test "planReturnResponse: redirects are method-agnostic" {
+    switch (planReturnResponse(false, 302, "/new")) {
+        .redirect => |r| {
+            try std.testing.expectEqual(@as(u16, 302), r.status);
+            try std.testing.expectEqualStrings("/new", r.location);
+        },
+        else => try std.testing.expect(false),
+    }
+    // A redirect status with no body renders the status without a Location header.
+    try std.testing.expect(std.meta.activeTag(planReturnResponse(true, 301, "")) == .body);
+}
+
 pub fn routeRequest(
     conn: anytype,
     allocator: std.mem.Allocator,
@@ -198,39 +234,38 @@ pub fn routeRequest(
                     return try handleFastcgiRoute(allocator, writer, cfg, upstream, request, client_ip, correlation_id, keep_alive.*, state);
                 },
                 .return_response => |ret| {
-                    // Static-return directives (non-redirect) only make semantic sense
-                    // for GET and HEAD.  Accepting DELETE, PUT, or PATCH on a route like
-                    // `return 200 ok` would silently succeed and mislead the client into
-                    // believing a destructive operation completed (ASVS-14.5.1).
-                    // Redirect responses (3xx) are method-agnostic and pass through.
-                    const is_redirect = ret.status >= 300 and ret.status < 400;
-                    if (!is_redirect and !(request.method == .GET or request.method == .HEAD)) {
-                        try sendApiError(allocator, writer, .method_not_allowed, "invalid_request", "Method Not Allowed", correlation_id, keep_alive.*, state);
-                        state.metricsRecord(405);
-                        return 405;
+                    switch (planReturnResponse(request.method == .GET or request.method == .HEAD, ret.status, ret.body)) {
+                        .method_not_allowed => {
+                            try sendApiError(allocator, writer, .method_not_allowed, "invalid_request", "Method Not Allowed", correlation_id, keep_alive.*, state);
+                            state.metricsRecord(405);
+                            return 405;
+                        },
+                        .redirect => |r| {
+                            var response = http.Response.redirect(allocator, r.location, @enumFromInt(r.status));
+                            defer response.deinit();
+                            _ = response.setConnection(keep_alive.*);
+                            setRequestIdHeaders(&response, correlation_id);
+                            ctx.response_bytes = 0;
+                            applyResponseHeaders(state, &response);
+                            try response.write(writer);
+                            state.metricsRecord(r.status);
+                            return r.status;
+                        },
+                        .body => |b| {
+                            var response = http.Response.init(allocator);
+                            defer response.deinit();
+                            _ = response.setStatus(@enumFromInt(b.status))
+                                .setBody(b.body)
+                                .setContentType("text/plain; charset=utf-8")
+                                .setConnection(keep_alive.*);
+                            setRequestIdHeaders(&response, correlation_id);
+                            ctx.response_bytes = b.body.len;
+                            applyResponseHeaders(state, &response);
+                            try response.write(writer);
+                            state.metricsRecord(b.status);
+                            return b.status;
+                        },
                     }
-                    if (is_redirect and ret.body.len > 0) {
-                        var response = http.Response.redirect(allocator, ret.body, @enumFromInt(ret.status));
-                        defer response.deinit();
-                        _ = response.setConnection(keep_alive.*);
-                        setRequestIdHeaders(&response, correlation_id);
-                        ctx.response_bytes = 0;
-                        applyResponseHeaders(state, &response);
-                        try response.write(writer);
-                    } else {
-                        var response = http.Response.init(allocator);
-                        defer response.deinit();
-                        _ = response.setStatus(@enumFromInt(ret.status))
-                            .setBody(ret.body)
-                            .setContentType("text/plain; charset=utf-8")
-                            .setConnection(keep_alive.*);
-                        setRequestIdHeaders(&response, correlation_id);
-                        ctx.response_bytes = ret.body.len;
-                        applyResponseHeaders(state, &response);
-                        try response.write(writer);
-                    }
-                    state.metricsRecord(ret.status);
-                    return ret.status;
                 },
                 .rewrite => |rw| {
                     request.uri.path = rw.replacement;
@@ -1059,6 +1094,78 @@ const Http3LocationOutcome = union(enum) {
     },
 };
 
+/// Shape an HTTP/3 `http.Response` for a return plan: status, body, content-type,
+/// correlation id, and a `Location` header for redirects. Returns the emitted
+/// status. Kept free of gateway state (metrics/security headers stay in the
+/// caller) so the h3 rendering — the part that had drifted from h1 — is
+/// unit-testable without the ngtcp2 integration backend (#201).
+fn shapeHttp3ReturnResponse(
+    allocator: std.mem.Allocator,
+    response: *http.Response,
+    correlation_id: []const u8,
+    plan: ReturnResponsePlan,
+) !u16 {
+    switch (plan) {
+        .method_not_allowed => {
+            const payload = try buildApiErrorJson(allocator, "invalid_request", "Method Not Allowed", correlation_id);
+            _ = response
+                .setStatus(.method_not_allowed)
+                .setBodyOwned(payload)
+                .setContentType("application/json")
+                .setHeader(http.correlation.HEADER_NAME, correlation_id);
+            return 405;
+        },
+        .redirect => |r| {
+            _ = response
+                .setStatus(@enumFromInt(r.status))
+                .setBody(r.location)
+                .setContentType("text/plain; charset=utf-8")
+                .setHeader(http.correlation.HEADER_NAME, correlation_id)
+                .setHeader("location", r.location);
+            return r.status;
+        },
+        .body => |b| {
+            _ = response
+                .setStatus(@enumFromInt(b.status))
+                .setBody(b.body)
+                .setContentType("text/plain; charset=utf-8")
+                .setHeader(http.correlation.HEADER_NAME, correlation_id);
+            return b.status;
+        },
+    }
+}
+
+test "shapeHttp3ReturnResponse: non-redirect return on a non-GET/HEAD method renders 405 JSON" {
+    const allocator = std.testing.allocator;
+    var response = http.Response.init(allocator);
+    defer response.deinit();
+    const status = try shapeHttp3ReturnResponse(allocator, &response, "cid", planReturnResponse(false, 200, "ok"));
+    try std.testing.expectEqual(@as(u16, 405), status);
+    try std.testing.expectEqual(@as(u16, 405), @intFromEnum(response.status));
+    try std.testing.expectEqualStrings("application/json", response.headers.get("content-type") orelse "");
+    try std.testing.expect(response.body != null);
+}
+
+test "shapeHttp3ReturnResponse: redirect sets status and Location header" {
+    const allocator = std.testing.allocator;
+    var response = http.Response.init(allocator);
+    defer response.deinit();
+    const status = try shapeHttp3ReturnResponse(allocator, &response, "cid", planReturnResponse(false, 302, "/new"));
+    try std.testing.expectEqual(@as(u16, 302), status);
+    try std.testing.expectEqual(@as(u16, 302), @intFromEnum(response.status));
+    try std.testing.expectEqualStrings("/new", response.headers.get("location") orelse "");
+}
+
+test "shapeHttp3ReturnResponse: GET body path renders the body" {
+    const allocator = std.testing.allocator;
+    var response = http.Response.init(allocator);
+    defer response.deinit();
+    const status = try shapeHttp3ReturnResponse(allocator, &response, "cid", planReturnResponse(true, 200, "ok"));
+    try std.testing.expectEqual(@as(u16, 200), status);
+    try std.testing.expectEqual(@as(u16, 200), @intFromEnum(response.status));
+    try std.testing.expectEqualStrings("ok", response.body orelse "");
+}
+
 fn finalizeHttp3Response(response: *http.Response) void {
     if (response.headers.get("x-request-id")) |request_id| {
         _ = response.setHeader(http.correlation.HEADER_NAME, request_id);
@@ -1237,7 +1344,14 @@ fn routeHttp3Location(
     request_path: []const u8,
     correlation_id: []const u8,
 ) !Http3LocationOutcome {
-    const matched = http.location_router.matchLocation(request_path, ctx.cfg.location_blocks) orelse return .not_handled;
+    // Share the h1/h3 route-matching precedence (#201, PR 3). h3 serves only
+    // location routes today; the reload-status and metrics endpoints (which the
+    // shared resolver ranks ahead of locations) fall through to the caller's 404
+    // — h3 does not expose those operational endpoints yet.
+    const matched = switch (resolveRoutePath(ctx.cfg.metrics_path, ctx.cfg.location_blocks, request_path)) {
+        .location => |m| m,
+        .reload_status, .metrics, .unmatched => return .not_handled,
+    };
     const split = splitHttp3PathAndQuery(request.path);
     const request_query = split[1];
     switch (matched.block.action) {
@@ -1246,17 +1360,13 @@ fn routeHttp3Location(
             return .handled;
         },
         .return_response => |ret| {
-            _ = response
-                .setStatus(@enumFromInt(ret.status))
-                .setBody(ret.body)
-                .setContentType(if (ret.status >= 300 and ret.status < 400) "text/plain; charset=utf-8" else "text/plain; charset=utf-8")
-                .setHeader(http.correlation.HEADER_NAME, correlation_id);
-            if (ret.status >= 300 and ret.status < 400 and ret.body.len > 0) {
-                _ = response.setHeader("location", ret.body);
-            }
+            // h3 now enforces the same GET/HEAD guard as h1 for non-redirect
+            // returns (previously missing — h3 served `return 200` on any method).
+            const is_get_or_head = std.mem.eql(u8, request.method, "GET") or std.mem.eql(u8, request.method, "HEAD");
+            const status = try shapeHttp3ReturnResponse(allocator, response, correlation_id, planReturnResponse(is_get_or_head, ret.status, ret.body));
             finalizeHttp3Response(response);
             applyResponseHeaders(ctx.state, response);
-            ctx.state.metricsRecord(ret.status);
+            ctx.state.metricsRecord(status);
             return .handled;
         },
         .rewrite => |rw| {

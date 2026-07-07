@@ -16,6 +16,8 @@ const CliCommand = union(enum) {
     validate: CommonOptions,
     status: SignalOptions,
     print_config: CommonOptions,
+    routes: CommonOptions,
+    upstreams: CommonOptions,
     reload: SignalOptions,
     stop: SignalOptions,
     version,
@@ -115,6 +117,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .config_init => |options| try writeStarterConfig(options),
         .status => |options| try executeStatusCommand(control_allocator, options),
         .print_config => |options| try executePrintConfigCommand(control_allocator, options),
+        .routes => |options| try executeRoutesCommand(control_allocator, options),
+        .upstreams => |options| try executeUpstreamsCommand(control_allocator, options),
         .reload => |options| try executeSignalCommand(control_allocator, "reload", std.posix.SIG.HUP, options),
         .stop => |options| try executeSignalCommand(control_allocator, "stop", std.posix.SIG.TERM, options),
         .check => |options| try executeValidationCommandOrExit(control_allocator, options, .check),
@@ -142,6 +146,8 @@ fn parseCliCommand(args: []const []const u8) !CliCommand {
     if (std.mem.eql(u8, first, "validate")) return try parseValidateCommand(args[1..]);
     if (std.mem.eql(u8, first, "status")) return try parseSignalCommand(.status, args[1..]);
     if (std.mem.eql(u8, first, "print-config")) return try parsePrintConfigCommand(args[1..]);
+    if (std.mem.eql(u8, first, "routes")) return if (try parseInspectOptions(args[1..])) |o| .{ .routes = o } else .help;
+    if (std.mem.eql(u8, first, "upstreams")) return if (try parseInspectOptions(args[1..])) |o| .{ .upstreams = o } else .help;
     if (std.mem.eql(u8, first, "reload")) return try parseSignalCommand(.reload, args[1..]);
     if (std.mem.eql(u8, first, "stop")) return try parseSignalCommand(.stop, args[1..]);
     if (std.mem.eql(u8, first, "config")) {
@@ -284,6 +290,25 @@ fn parsePrintConfigCommand(args: []const []const u8) !CliCommand {
     return .{ .print_config = options };
 }
 
+/// Parse the `[-c <path>]` / `[-h]` options shared by the `routes` and
+/// `upstreams` inspection commands. Returns null when help was requested.
+fn parseInspectOptions(args: []const []const u8) !?CommonOptions {
+    var options = CommonOptions{};
+    var idx: usize = 0;
+    while (idx < args.len) : (idx += 1) {
+        const arg = args[idx];
+        if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) return null;
+        if (std.mem.eql(u8, arg, "-c") or std.mem.eql(u8, arg, "--config")) {
+            if (idx + 1 >= args.len) return error.MissingOptionValue;
+            options.config_path = args[idx + 1];
+            idx += 1;
+            continue;
+        }
+        return error.UnknownOption;
+    }
+    return options;
+}
+
 fn parseConfigInitCommand(args: []const []const u8) !CliCommand {
     var options = ConfigInitOptions{};
     var saw_output = false;
@@ -313,6 +338,8 @@ fn printUsage(writer: anytype) !void {
         \\  tardigrade validate [-c <path>]
         \\  tardigrade status [-c <path>] [--pid-file <path> | --pid <pid>]
         \\  tardigrade print-config [-c <path>]
+        \\  tardigrade routes [-c <path>]
+        \\  tardigrade upstreams [-c <path>]
         \\  tardigrade reload [-c <path>] [--pid-file <path> | --pid <pid>]
         \\  tardigrade stop [-c <path>] [--pid-file <path> | --pid <pid>]
         \\  tardigrade version
@@ -327,6 +354,10 @@ fn printUsage(writer: anytype) !void {
         \\  - Legacy `validate` and `--validate-config` remain supported.
         \\  - `status` reports process state when a pid target is available.
         \\  - `print-config` prints the effective operator-facing config summary.
+        \\  - `routes` prints the resolved routing table (match type, pattern,
+        \\    priority, action, auth) for the effective config.
+        \\  - `upstreams` lists the upstream targets referenced by the routes plus
+        \\    the default upstream base URL.
         \\  - Runtime config discovery checks `-c/--config`, `TARDIGRADE_CONFIG_PATH`,
         \\    `./tardigrade.conf`, `./config/tardigrade.conf`,
         \\    `/etc/tardigrade/tardigrade.conf`, and
@@ -450,6 +481,104 @@ fn isConfigValidationError(err: anyerror) bool {
         => true,
         else => false,
     };
+}
+
+/// Resolve the config path, load it from the environment, and validate it.
+/// Returns an owned `EdgeConfig` (caller calls `deinit`). Shared by the
+/// inspection commands.
+fn loadValidatedConfig(allocator: std.mem.Allocator, options: CommonOptions) !edge_config.EdgeConfig {
+    const resolved_config_path = try resolveRuntimeConfigPath(allocator, options.config_path);
+    defer if (resolved_config_path) |path| allocator.free(path);
+    if (resolved_config_path) |path| try setProcessEnv(allocator, ENV_CONFIG_PATH, path);
+    var cfg = try edge_config.loadFromEnv(allocator);
+    errdefer cfg.deinit(allocator);
+    try edge_config.validate(&cfg);
+    return cfg;
+}
+
+/// Write the resolved routing table (one line per location block) to `writer`.
+/// Pure over `location_blocks` so it is unit-testable without a full config.
+fn writeRoutesSummary(writer: anytype, location_blocks: []const http.location_router.LocationBlock) !void {
+    try writer.print("routes ({d})\n", .{location_blocks.len});
+    for (location_blocks) |block| {
+        try writer.print("  {s} {s}", .{ @tagName(block.match_type), block.pattern });
+        if (block.priority > 0) try writer.print(" [priority {d}]", .{block.priority});
+        try writer.writeAll(" -> ");
+        switch (block.action) {
+            .proxy_pass => |target| try writer.print("proxy_pass {s}", .{if (target.len > 0) target else "(upstream base url)"}),
+            .fastcgi_pass => |target| try writer.print("fastcgi_pass {s}", .{target}),
+            .return_response => |resp| try writer.print("return {d}", .{resp.status}),
+            .rewrite => |rule| try writer.print("rewrite {s} ({s})", .{ rule.replacement, @tagName(rule.flag) }),
+            .static_root => |root| try writer.print("static_root {s}", .{root.root}),
+        }
+        if (block.auth == .required) try writer.writeAll(" [auth: required]");
+        try writer.writeAll("\n");
+    }
+}
+
+/// Write the distinct upstream targets referenced by the routing table plus the
+/// default upstream base URL. Pure over its inputs for unit testing.
+fn writeUpstreamsSummary(writer: anytype, location_blocks: []const http.location_router.LocationBlock, upstream_base_url: []const u8) !void {
+    try writer.writeAll("upstreams\n");
+    if (upstream_base_url.len > 0) try writer.print("  base    {s}\n", .{upstream_base_url});
+    for (location_blocks) |block| {
+        switch (block.action) {
+            .proxy_pass => |target| {
+                if (target.len > 0) try writer.print("  proxy   {s} (route {s})\n", .{ target, block.pattern });
+            },
+            .fastcgi_pass => |target| try writer.print("  fastcgi {s} (route {s})\n", .{ target, block.pattern }),
+            else => {},
+        }
+    }
+}
+
+test "writeRoutesSummary formats match type, action, priority and auth" {
+    const blocks = [_]http.location_router.LocationBlock{
+        .{ .match_type = .exact, .pattern = "/health", .priority = 0, .action = .{ .return_response = .{ .status = 200, .body = "ok" } } },
+        .{ .match_type = .prefix_priority, .pattern = "/api/", .priority = 10, .action = .{ .proxy_pass = "http://backend:8080" }, .auth = .required },
+    };
+    var buf: [512]u8 = undefined;
+    var fbs = compat.fixedBufferStream(&buf);
+    try writeRoutesSummary(fbs.writer(), &blocks);
+    const out = fbs.getWritten();
+    try std.testing.expect(std.mem.indexOf(u8, out, "routes (2)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "exact /health -> return 200") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "prefix_priority /api/ [priority 10] -> proxy_pass http://backend:8080 [auth: required]") != null);
+}
+
+test "writeUpstreamsSummary lists base url and proxy/fastcgi targets" {
+    const blocks = [_]http.location_router.LocationBlock{
+        .{ .match_type = .prefix, .pattern = "/api/", .priority = 0, .action = .{ .proxy_pass = "http://backend:8080" } },
+        .{ .match_type = .regex, .pattern = "\\.php$", .priority = 0, .action = .{ .fastcgi_pass = "unix:/run/php.sock" } },
+        .{ .match_type = .exact, .pattern = "/", .priority = 0, .action = .{ .return_response = .{ .status = 200, .body = "" } } },
+    };
+    var buf: [512]u8 = undefined;
+    var fbs = compat.fixedBufferStream(&buf);
+    try writeUpstreamsSummary(fbs.writer(), &blocks, "http://default:9000");
+    const out = fbs.getWritten();
+    try std.testing.expect(std.mem.indexOf(u8, out, "base    http://default:9000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "proxy   http://backend:8080 (route /api/)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "fastcgi unix:/run/php.sock") != null);
+    // return_response routes are not upstreams.
+    try std.testing.expect(std.mem.indexOf(u8, out, "return") == null);
+}
+
+fn executeRoutesCommand(allocator: std.mem.Allocator, options: CommonOptions) !void {
+    var cfg = try loadValidatedConfig(allocator, options);
+    defer cfg.deinit(allocator);
+    var stdout_buf: [4096]u8 = undefined;
+    var stdout = compat.stdoutWriter(&stdout_buf);
+    try writeRoutesSummary(&stdout, cfg.location_blocks);
+    try stdout.flush();
+}
+
+fn executeUpstreamsCommand(allocator: std.mem.Allocator, options: CommonOptions) !void {
+    var cfg = try loadValidatedConfig(allocator, options);
+    defer cfg.deinit(allocator);
+    var stdout_buf: [4096]u8 = undefined;
+    var stdout = compat.stdoutWriter(&stdout_buf);
+    try writeUpstreamsSummary(&stdout, cfg.location_blocks, cfg.upstream_base_url);
+    try stdout.flush();
 }
 
 fn executePrintConfigCommand(allocator: std.mem.Allocator, options: CommonOptions) !void {

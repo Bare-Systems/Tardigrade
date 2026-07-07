@@ -1237,7 +1237,14 @@ fn routeHttp3Location(
     request_path: []const u8,
     correlation_id: []const u8,
 ) !Http3LocationOutcome {
-    const matched = http.location_router.matchLocation(request_path, ctx.cfg.location_blocks) orelse return .not_handled;
+    // Share the h1/h3 route-matching precedence (#201, PR 3). h3 serves only
+    // location routes today; the reload-status and metrics endpoints (which the
+    // shared resolver ranks ahead of locations) fall through to the caller's 404
+    // — h3 does not expose those operational endpoints yet.
+    const matched = switch (resolveRoutePath(ctx.cfg.metrics_path, ctx.cfg.location_blocks, request_path)) {
+        .location => |m| m,
+        .reload_status, .metrics, .unmatched => return .not_handled,
+    };
     const split = splitHttp3PathAndQuery(request.path);
     const request_query = split[1];
     switch (matched.block.action) {

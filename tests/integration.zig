@@ -1714,6 +1714,18 @@ fn headerValue(headers_raw: []const u8, name: []const u8) ?[]const u8 {
     return null;
 }
 
+fn countHeaderOccurrences(headers_raw: []const u8, name: []const u8) usize {
+    var count: usize = 0;
+    var lines = std.mem.splitSequence(u8, headers_raw, "\r\n");
+    _ = lines.next(); // skip the status line
+    while (lines.next()) |line| {
+        if (line.len == 0) break;
+        const sep = std.mem.findScalar(u8, line, ':') orelse continue;
+        if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, line[0..sep], " \t"), name)) count += 1;
+    }
+    return count;
+}
+
 fn cookiePairFromSetCookie(set_cookie: []const u8) []const u8 {
     const end = std.mem.findScalar(u8, set_cookie, ';') orelse set_cookie.len;
     return std.mem.trim(u8, set_cookie[0..end], " \t\r\n");
@@ -4603,6 +4615,51 @@ test "security headers can be disabled via config (#175)" {
     try std.testing.expect(response.header("X-XSS-Protection") == null);
     try std.testing.expect(response.header("Cross-Origin-Opener-Policy") == null);
     try std.testing.expect(response.header("Cross-Origin-Resource-Policy") == null);
+}
+
+test "security headers do not override or duplicate upstream-provided values (#175)" {
+    // When a proxied upstream sets its own security headers, the gateway must
+    // preserve them (setHeaderIfAbsent / writeSecurityHeadersFiltered) rather
+    // than overwrite or duplicate — while still filling in the ones the upstream
+    // omitted.
+    const allocator = std.testing.allocator;
+    var upstream = try UpstreamServer.start(allocator, &.{.{
+        .body = "{\"ok\":true}",
+        .headers = &.{
+            .{ .name = "Content-Type", .value = "application/json" },
+            .{ .name = "X-Frame-Options", .value = "SAMEORIGIN" },
+            .{ .name = "Content-Security-Policy", .value = "default-src 'none'" },
+        },
+    }});
+    defer upstream.stop();
+    try upstream.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location /proxy/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+    , .{ test_host, upstream.port() });
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{ .config_text = config_text });
+    defer tardigrade.stop();
+
+    var response = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/proxy/x",
+        .body = null,
+        .headers = &.{},
+    });
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status_code);
+    // Upstream values win, each present exactly once (not the gateway defaults
+    // DENY / "default-src 'self'", and not duplicated).
+    try std.testing.expectEqualStrings("SAMEORIGIN", response.header("X-Frame-Options") orelse "");
+    try std.testing.expectEqualStrings("default-src 'none'", response.header("Content-Security-Policy") orelse "");
+    try std.testing.expectEqual(@as(usize, 1), countHeaderOccurrences(response.headers_raw, "X-Frame-Options"));
+    try std.testing.expectEqual(@as(usize, 1), countHeaderOccurrences(response.headers_raw, "Content-Security-Policy"));
+    // A header the upstream did NOT set still gets the gateway default.
+    try std.testing.expectEqualStrings("nosniff", response.header("X-Content-Type-Options") orelse "");
 }
 
 test "HSTS header is emitted on HTTPS responses when enabled (#175)" {

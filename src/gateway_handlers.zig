@@ -40,6 +40,63 @@ const handleStaticLocation = gstatic.handleStaticLocation;
 const maybeResolveStaticErrorPage = gstatic.maybeResolveStaticErrorPage;
 const serveTryFilesFallback = gstatic.serveTryFilesFallback;
 
+/// The route a request resolves to, decided independently of executing it.
+/// Kept exhaustive so a new route kind forces a decision at every dispatch site.
+pub const RouteDecision = union(enum) {
+    reload_status,
+    metrics,
+    location: http.location_router.MatchResult,
+    unmatched,
+};
+
+/// Pure route-matching precedence — no I/O, no mutation of `state`/`request`.
+/// Mirrors the order previously inlined at the top of `routeRequest`: the
+/// reload-status path, then the configured metrics path, then location blocks.
+/// (The transcript route still matches+executes inside `routeRequest`; folding
+/// it in here is a small follow-up.)
+pub fn resolveRoute(cfg: *const edge_config.EdgeConfig, request: *const http.Request) RouteDecision {
+    return resolveRouteFor(cfg.metrics_path, cfg.location_blocks, request.uri.path);
+}
+
+/// Pure core of route resolution, decoupled from `EdgeConfig`/`Request` so the
+/// precedence is directly unit-testable without constructing a full config.
+fn resolveRouteFor(
+    metrics_path: []const u8,
+    location_blocks: []const http.location_router.LocationBlock,
+    path: []const u8,
+) RouteDecision {
+    if (std.mem.eql(u8, path, "/tardigrade/reload/status")) return .reload_status;
+    if (metrics_path.len > 0 and std.mem.eql(u8, path, metrics_path)) return .metrics;
+    if (http.location_router.matchLocation(path, location_blocks)) |matched| {
+        return .{ .location = matched };
+    }
+    return .unmatched;
+}
+
+test "resolveRouteFor: reload-status and metrics precede location matching" {
+    const blocks = [_]http.location_router.LocationBlock{
+        .{ .match_type = .prefix, .pattern = "/", .priority = 0, .action = .{ .return_response = .{ .status = 200, .body = "" } } },
+    };
+    const Tag = std.meta.Tag(RouteDecision);
+    // reload-status wins over a configured metrics path and a catch-all location.
+    try std.testing.expectEqual(Tag.reload_status, std.meta.activeTag(resolveRouteFor("/metrics", &blocks, "/tardigrade/reload/status")));
+    // metrics path wins over a matching location.
+    try std.testing.expectEqual(Tag.metrics, std.meta.activeTag(resolveRouteFor("/metrics", &blocks, "/metrics")));
+    // an empty metrics_path disables the metrics route, falling to the location.
+    try std.testing.expectEqual(Tag.location, std.meta.activeTag(resolveRouteFor("", &blocks, "/metrics")));
+}
+
+test "resolveRouteFor: location match carries the block, else unmatched" {
+    const blocks = [_]http.location_router.LocationBlock{
+        .{ .match_type = .exact, .pattern = "/app", .priority = 1, .action = .{ .proxy_pass = "" } },
+    };
+    switch (resolveRouteFor("/status/metrics", &blocks, "/app")) {
+        .location => |m| try std.testing.expectEqualStrings("/app", m.block.pattern),
+        else => try std.testing.expect(false),
+    }
+    try std.testing.expectEqual(std.meta.Tag(RouteDecision).unmatched, std.meta.activeTag(resolveRouteFor("/status/metrics", &blocks, "/nope")));
+}
+
 pub fn routeRequest(
     conn: anytype,
     allocator: std.mem.Allocator,
@@ -58,121 +115,122 @@ pub fn routeRequest(
         return status;
     }
 
-    if (std.mem.eql(u8, request.uri.path, "/tardigrade/reload/status")) {
-        const status = try handleReloadStatusRoute(allocator, writer, state, correlation_id, keep_alive.*);
-        state.metricsRecord(status);
-        return status;
-    }
-
-    if (cfg.metrics_path.len > 0 and std.mem.eql(u8, request.uri.path, cfg.metrics_path)) {
-        const status = try handleMetricsRoute(allocator, writer, cfg, state, ctx, request, correlation_id, keep_alive.*);
-        state.metricsRecord(status);
-        return status;
-    }
-
-    if (http.location_router.matchLocation(request.uri.path, cfg.location_blocks)) |matched| {
-        if (matched.block.auth == .required and !ctx.authenticated and ctx.identity == null) {
-            var auth_res = try authorizeRequest(allocator, cfg, &request.headers);
-            defer auth_res.deinit(allocator);
-            if (auth_res.ok) {
-                if (auth_res.identity) |identity| {
-                    ctx.setAuthContext(identity, auth_res.user_id, auth_res.device_id, auth_res.scopes);
-                    auth_res.identity = null;
-                    auth_res.user_id = null;
-                    auth_res.device_id = null;
-                    auth_res.scopes = null;
-                }
-            } else if (http.session.fromHeaders(&request.headers)) |session_token| {
-                if (state.validateSessionIdentity(allocator, session_token)) |identity| {
-                    ctx.setIdentity(identity);
+    switch (resolveRoute(cfg, request)) {
+        .reload_status => {
+            const status = try handleReloadStatusRoute(allocator, writer, state, correlation_id, keep_alive.*);
+            state.metricsRecord(status);
+            return status;
+        },
+        .metrics => {
+            const status = try handleMetricsRoute(allocator, writer, cfg, state, ctx, request, correlation_id, keep_alive.*);
+            state.metricsRecord(status);
+            return status;
+        },
+        .unmatched => {},
+        .location => |matched| {
+            if (matched.block.auth == .required and !ctx.authenticated and ctx.identity == null) {
+                var auth_res = try authorizeRequest(allocator, cfg, &request.headers);
+                defer auth_res.deinit(allocator);
+                if (auth_res.ok) {
+                    if (auth_res.identity) |identity| {
+                        ctx.setAuthContext(identity, auth_res.user_id, auth_res.device_id, auth_res.scopes);
+                        auth_res.identity = null;
+                        auth_res.user_id = null;
+                        auth_res.device_id = null;
+                        auth_res.scopes = null;
+                    }
+                } else if (http.session.fromHeaders(&request.headers)) |session_token| {
+                    if (state.validateSessionIdentity(allocator, session_token)) |identity| {
+                        ctx.setIdentity(identity);
+                    } else {
+                        try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, keep_alive.*, state);
+                        state.metricsRecord(401);
+                        state.metricsRecordErrorCode("unauthorized");
+                        return 401;
+                    }
+                } else if (cfg.auth_request_url.len > 0 and authorizeViaSubrequest(allocator, cfg, request, correlation_id, client_ip)) {
+                    ctx.authenticated = true;
                 } else {
-                    try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, keep_alive.*, state);
-                    state.metricsRecord(401);
-                    state.metricsRecordErrorCode("unauthorized");
-                    return 401;
+                    const auth_status: http.Status = if (auth_res.failure_reason == .invalid) .forbidden else .unauthorized;
+                    const auth_code = if (auth_res.failure_reason == .invalid) "forbidden" else "unauthorized";
+                    const auth_message = if (auth_res.failure_reason == .invalid) "Forbidden" else "Unauthorized";
+                    const auth_status_code: u16 = @intFromEnum(auth_status);
+                    try sendApiError(allocator, writer, auth_status, auth_code, auth_message, correlation_id, keep_alive.*, state);
+                    state.metricsRecord(auth_status_code);
+                    state.metricsRecordErrorCode(auth_code);
+                    return auth_status_code;
                 }
-            } else if (cfg.auth_request_url.len > 0 and authorizeViaSubrequest(allocator, cfg, request, correlation_id, client_ip)) {
-                ctx.authenticated = true;
-            } else {
-                const auth_status: http.Status = if (auth_res.failure_reason == .invalid) .forbidden else .unauthorized;
-                const auth_code = if (auth_res.failure_reason == .invalid) "forbidden" else "unauthorized";
-                const auth_message = if (auth_res.failure_reason == .invalid) "Forbidden" else "Unauthorized";
-                const auth_status_code: u16 = @intFromEnum(auth_status);
-                try sendApiError(allocator, writer, auth_status, auth_code, auth_message, correlation_id, keep_alive.*, state);
-                state.metricsRecord(auth_status_code);
-                state.metricsRecordErrorCode(auth_code);
-                return auth_status_code;
             }
-        }
-        switch (matched.block.action) {
-            .proxy_pass => |target| {
-                return try handleLocationProxyPass(
-                    allocator,
-                    conn,
-                    writer,
-                    cfg,
-                    state,
-                    ctx,
-                    request,
-                    target,
-                    proxySuffixPathForLocation(request.uri.path, matched, cfg.location_blocks),
-                    correlation_id,
-                    keep_alive.*,
-                    client_ip,
-                    ctx.identity,
-                    ctx.user_id,
-                    ctx.device_id,
-                    ctx.scopes,
-                    request.headers.get("host"),
-                    matched.block.pattern,
-                    streaming_request_body,
-                );
-            },
-            .fastcgi_pass => |upstream| {
-                return try handleFastcgiRoute(allocator, writer, cfg, upstream, request, client_ip, correlation_id, keep_alive.*, state);
-            },
-            .return_response => |ret| {
-                // Static-return directives (non-redirect) only make semantic sense
-                // for GET and HEAD.  Accepting DELETE, PUT, or PATCH on a route like
-                // `return 200 ok` would silently succeed and mislead the client into
-                // believing a destructive operation completed (ASVS-14.5.1).
-                // Redirect responses (3xx) are method-agnostic and pass through.
-                const is_redirect = ret.status >= 300 and ret.status < 400;
-                if (!is_redirect and !(request.method == .GET or request.method == .HEAD)) {
-                    try sendApiError(allocator, writer, .method_not_allowed, "invalid_request", "Method Not Allowed", correlation_id, keep_alive.*, state);
-                    state.metricsRecord(405);
-                    return 405;
-                }
-                if (is_redirect and ret.body.len > 0) {
-                    var response = http.Response.redirect(allocator, ret.body, @enumFromInt(ret.status));
-                    defer response.deinit();
-                    _ = response.setConnection(keep_alive.*);
-                    setRequestIdHeaders(&response, correlation_id);
-                    ctx.response_bytes = 0;
-                    applyResponseHeaders(state, &response);
-                    try response.write(writer);
-                } else {
-                    var response = http.Response.init(allocator);
-                    defer response.deinit();
-                    _ = response.setStatus(@enumFromInt(ret.status))
-                        .setBody(ret.body)
-                        .setContentType("text/plain; charset=utf-8")
-                        .setConnection(keep_alive.*);
-                    setRequestIdHeaders(&response, correlation_id);
-                    ctx.response_bytes = ret.body.len;
-                    applyResponseHeaders(state, &response);
-                    try response.write(writer);
-                }
-                state.metricsRecord(ret.status);
-                return ret.status;
-            },
-            .rewrite => |rw| {
-                request.uri.path = rw.replacement;
-            },
-            .static_root => |root_cfg| {
-                if (try handleStaticLocation(allocator, conn, request, matched, root_cfg, correlation_id, keep_alive.*, state)) |status| return status;
-            },
-        }
+            switch (matched.block.action) {
+                .proxy_pass => |target| {
+                    return try handleLocationProxyPass(
+                        allocator,
+                        conn,
+                        writer,
+                        cfg,
+                        state,
+                        ctx,
+                        request,
+                        target,
+                        proxySuffixPathForLocation(request.uri.path, matched, cfg.location_blocks),
+                        correlation_id,
+                        keep_alive.*,
+                        client_ip,
+                        ctx.identity,
+                        ctx.user_id,
+                        ctx.device_id,
+                        ctx.scopes,
+                        request.headers.get("host"),
+                        matched.block.pattern,
+                        streaming_request_body,
+                    );
+                },
+                .fastcgi_pass => |upstream| {
+                    return try handleFastcgiRoute(allocator, writer, cfg, upstream, request, client_ip, correlation_id, keep_alive.*, state);
+                },
+                .return_response => |ret| {
+                    // Static-return directives (non-redirect) only make semantic sense
+                    // for GET and HEAD.  Accepting DELETE, PUT, or PATCH on a route like
+                    // `return 200 ok` would silently succeed and mislead the client into
+                    // believing a destructive operation completed (ASVS-14.5.1).
+                    // Redirect responses (3xx) are method-agnostic and pass through.
+                    const is_redirect = ret.status >= 300 and ret.status < 400;
+                    if (!is_redirect and !(request.method == .GET or request.method == .HEAD)) {
+                        try sendApiError(allocator, writer, .method_not_allowed, "invalid_request", "Method Not Allowed", correlation_id, keep_alive.*, state);
+                        state.metricsRecord(405);
+                        return 405;
+                    }
+                    if (is_redirect and ret.body.len > 0) {
+                        var response = http.Response.redirect(allocator, ret.body, @enumFromInt(ret.status));
+                        defer response.deinit();
+                        _ = response.setConnection(keep_alive.*);
+                        setRequestIdHeaders(&response, correlation_id);
+                        ctx.response_bytes = 0;
+                        applyResponseHeaders(state, &response);
+                        try response.write(writer);
+                    } else {
+                        var response = http.Response.init(allocator);
+                        defer response.deinit();
+                        _ = response.setStatus(@enumFromInt(ret.status))
+                            .setBody(ret.body)
+                            .setContentType("text/plain; charset=utf-8")
+                            .setConnection(keep_alive.*);
+                        setRequestIdHeaders(&response, correlation_id);
+                        ctx.response_bytes = ret.body.len;
+                        applyResponseHeaders(state, &response);
+                        try response.write(writer);
+                    }
+                    state.metricsRecord(ret.status);
+                    return ret.status;
+                },
+                .rewrite => |rw| {
+                    request.uri.path = rw.replacement;
+                },
+                .static_root => |root_cfg| {
+                    if (try handleStaticLocation(allocator, conn, request, matched, root_cfg, correlation_id, keep_alive.*, state)) |status| return status;
+                },
+            }
+        },
     }
 
     if (serveTryFilesFallback(allocator, conn, cfg, request, correlation_id, keep_alive.*, state)) |status| {

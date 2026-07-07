@@ -488,7 +488,7 @@ pub fn runMiddlewarePipeline(
         const country = request.headers.get(cfg.geo_country_header);
         if (isGeoBlocked(cfg.geo_blocked_countries, country)) {
             try sendApiError(allocator, writer, .forbidden, "forbidden", "Geo access denied", correlation_id, keep_alive, state);
-            logAccess(state, ctx, request.method.toString(), request.uri.path, 403, request.headers.get("user-agent") orelse "");
+            logAccessForRequest(state, ctx, request, 403);
             return true;
         }
     }
@@ -500,7 +500,7 @@ pub fn runMiddlewarePipeline(
         const msg = http.request_limits.rejectionMessage(uri_check, &msg_buf);
         try sendApiError(allocator, writer, .uri_too_long, "invalid_request", msg, correlation_id, keep_alive, state);
         state.logger.warn(correlation_id, "URI too long: {d} bytes", .{request.uri.path.len});
-        logAccess(state, ctx, request.method.toString(), request.uri.path, 414, request.headers.get("user-agent") orelse "");
+        logAccessForRequest(state, ctx, request, 414);
         return true;
     }
     const header_count_check = http.request_limits.validateHeaderCount(request.headers.count(), limits);
@@ -509,7 +509,7 @@ pub fn runMiddlewarePipeline(
         const msg = http.request_limits.rejectionMessage(header_count_check, &msg_buf);
         try sendApiError(allocator, writer, .request_header_fields_too_large, "invalid_request", msg, correlation_id, keep_alive, state);
         state.logger.warn(correlation_id, "Too many headers: {d}", .{request.headers.count()});
-        logAccess(state, ctx, request.method.toString(), request.uri.path, 431, request.headers.get("user-agent") orelse "");
+        logAccessForRequest(state, ctx, request, 431);
         return true;
     }
     for (request.headers.iterator()) |h| {
@@ -520,7 +520,7 @@ pub fn runMiddlewarePipeline(
             const msg = http.request_limits.rejectionMessage(header_size_check, &msg_buf);
             try sendApiError(allocator, writer, .request_header_fields_too_large, "invalid_request", msg, correlation_id, keep_alive, state);
             state.logger.warn(correlation_id, "Header too large: {d} bytes", .{header_len});
-            logAccess(state, ctx, request.method.toString(), request.uri.path, 431, request.headers.get("user-agent") orelse "");
+            logAccessForRequest(state, ctx, request, 431);
             return true;
         }
     }
@@ -533,7 +533,7 @@ pub fn runMiddlewarePipeline(
             const msg = http.request_limits.rejectionMessage(total_check, &msg_buf);
             try sendApiError(allocator, writer, .request_header_fields_too_large, "invalid_request", msg, correlation_id, keep_alive, state);
             state.logger.warn(correlation_id, "Headers total too large: {d} bytes", .{headers_total});
-            logAccess(state, ctx, request.method.toString(), request.uri.path, 431, request.headers.get("user-agent") orelse "");
+            logAccessForRequest(state, ctx, request, 431);
             return true;
         }
     }
@@ -542,7 +542,7 @@ pub fn runMiddlewarePipeline(
         if (body_check != .ok) {
             try sendApiError(allocator, writer, .payload_too_large, "invalid_request", "Request body too large", correlation_id, keep_alive, state);
             state.logger.warn(correlation_id, "Body too large: {d} bytes", .{body.len});
-            logAccess(state, ctx, request.method.toString(), request.uri.path, 413, request.headers.get("user-agent") orelse "");
+            logAccessForRequest(state, ctx, request, 413);
             return true;
         }
     }
@@ -550,7 +550,7 @@ pub fn runMiddlewarePipeline(
     if (state.access_control) |*acl| {
         if (acl.check(client_ip) == .denied) {
             try sendApiError(allocator, writer, .forbidden, "forbidden", "Access denied", correlation_id, keep_alive, state);
-            logAccess(state, ctx, request.method.toString(), request.uri.path, 403, request.headers.get("user-agent") orelse "");
+            logAccessForRequest(state, ctx, request, 403);
             return true;
         }
     }
@@ -571,7 +571,7 @@ pub fn runMiddlewarePipeline(
         try response.write(writer);
         state.metricsRecord(429);
         state.metricsRecordErrorCode("rate_limited");
-        logAccess(state, ctx, request.method.toString(), request.uri.path, 429, request.headers.get("user-agent") orelse "");
+        logAccessForRequest(state, ctx, request, 429);
         return true;
     }
 
@@ -1352,6 +1352,13 @@ pub fn handleHttp3Request(
     var effective_ctx = ctx.*;
     effective_ctx.cfg = effective_cfg;
     try handleHttp3Connection(allocator, request, response, &effective_ctx);
+}
+
+/// Emit an access-log line pulling method/path/user-agent straight from the
+/// request — the shape repeated at every guard and terminal. Prefer this over
+/// calling `logAccess` with the four fields spelled out.
+pub fn logAccessForRequest(state: *GatewayState, ctx: *const http.request_context.RequestContext, request: *const http.Request, status: u16) void {
+    logAccess(state, ctx, request.method.toString(), request.uri.path, status, request.headers.get("user-agent") orelse "");
 }
 
 pub fn logAccess(state: *GatewayState, ctx: *const http.request_context.RequestContext, method: []const u8, path: []const u8, status: u16, user_agent: []const u8) void {

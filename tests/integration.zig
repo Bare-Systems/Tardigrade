@@ -4534,6 +4534,42 @@ test "top-level try_files serves index html and rejects encoded traversal" {
     try std.testing.expectEqual(@as(u16, 403), traversal_response.status_code);
 }
 
+test "location rewrite action falls through to try_files (#201)" {
+    // Guards the routeRequest fall-through after a location `.rewrite` action:
+    // the action mutates the path and does NOT return, so control must reach the
+    // top-level try_files fallback. A stray early-return in a pipeline refactor
+    // would break this.
+    const allocator = std.testing.allocator;
+    var fixture = try GenericFixtureDir.create(allocator, "rewrite-fallthrough");
+    defer fixture.deinit();
+    try fixture.writeRel("public/served.html", "rewritten target\n");
+    const public_abs = try fixture.joinAbs("public");
+    defer allocator.free(public_abs);
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\root {s};
+        \\location /old {{
+        \\    rewrite /old /served.html last;
+        \\}}
+        \\try_files $uri =404;
+    , .{public_abs});
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{ .config_text = config_text });
+    defer tardigrade.stop();
+
+    var response = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/old",
+        .body = null,
+        .headers = &.{},
+    });
+    defer response.deinit();
+    // Rewrote /old -> /served.html and fell through to try_files, which served it.
+    try std.testing.expectEqual(@as(u16, 200), response.status_code);
+    try assertContains(response.body, "rewritten target");
+}
+
 test "static file integration rejects symlink escape outside root" {
     const allocator = std.testing.allocator;
     var fixture = try GenericFixtureDir.create(allocator, "static-symlink-escape");

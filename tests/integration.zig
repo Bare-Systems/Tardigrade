@@ -4534,6 +4534,70 @@ test "top-level try_files serves index html and rejects encoded traversal" {
     try std.testing.expectEqual(@as(u16, 403), traversal_response.status_code);
 }
 
+test "security headers are emitted with safe defaults (#175)" {
+    // Locks in the production-safe security-header posture so a future change
+    // cannot silently weaken it. These are default-on and applied to every
+    // response (here a `return` terminal).
+    const allocator = std.testing.allocator;
+    const config_text =
+        \\location = /r {
+        \\    return 200 ok;
+        \\}
+    ;
+    var tardigrade = try TardigradeProcess.start(allocator, .{ .config_text = config_text });
+    defer tardigrade.stop();
+
+    var response = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/r",
+        .body = null,
+        .headers = &.{},
+    });
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status_code);
+    try std.testing.expectEqualStrings("DENY", response.header("X-Frame-Options") orelse "");
+    try std.testing.expectEqualStrings("nosniff", response.header("X-Content-Type-Options") orelse "");
+    try std.testing.expectEqualStrings("default-src 'self'", response.header("Content-Security-Policy") orelse "");
+    try std.testing.expectEqualStrings("strict-origin-when-cross-origin", response.header("Referrer-Policy") orelse "");
+    try std.testing.expectEqualStrings("camera=(), microphone=(), geolocation=()", response.header("Permissions-Policy") orelse "");
+    // X-XSS-Protection is intentionally "0" (disabled; CSP is the modern control).
+    try std.testing.expectEqualStrings("0", response.header("X-XSS-Protection") orelse "");
+    try std.testing.expectEqualStrings("same-origin", response.header("Cross-Origin-Opener-Policy") orelse "");
+    try std.testing.expectEqualStrings("same-origin", response.header("Cross-Origin-Resource-Policy") orelse "");
+}
+
+test "security headers can be disabled via config (#175)" {
+    const allocator = std.testing.allocator;
+    const config_text =
+        \\location = /r {
+        \\    return 200 ok;
+        \\}
+    ;
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .extra_env = &.{.{ .name = "TARDIGRADE_SECURITY_HEADERS", .value = "false" }},
+    });
+    defer tardigrade.stop();
+
+    var response = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/r",
+        .body = null,
+        .headers = &.{},
+    });
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status_code);
+    // The full default set must be absent when disabled.
+    try std.testing.expect(response.header("X-Frame-Options") == null);
+    try std.testing.expect(response.header("X-Content-Type-Options") == null);
+    try std.testing.expect(response.header("Content-Security-Policy") == null);
+    try std.testing.expect(response.header("Referrer-Policy") == null);
+    try std.testing.expect(response.header("Permissions-Policy") == null);
+    try std.testing.expect(response.header("X-XSS-Protection") == null);
+    try std.testing.expect(response.header("Cross-Origin-Opener-Policy") == null);
+    try std.testing.expect(response.header("Cross-Origin-Resource-Policy") == null);
+}
+
 test "location rewrite action falls through to try_files (#201)" {
     // Guards the routeRequest fall-through after a location `.rewrite` action:
     // the action mutates the path and does NOT return, so control must reach the

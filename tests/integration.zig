@@ -4637,8 +4637,10 @@ test "HSTS header is emitted on HTTPS responses when enabled (#175)" {
     });
     defer response.deinit();
     try std.testing.expectEqual(@as(u16, 200), response.status_code);
-    // Strict-Transport-Security is emitted on HTTPS with a max-age directive.
-    try assertContains(response.header("Strict-Transport-Security") orelse "", "max-age=");
+    // Default HSTS is a 1-year max-age with includeSubDomains on (preload off).
+    // Lock the exact value so the policy can't weaken or `preload` can't turn on
+    // without an explicit config change.
+    try std.testing.expectEqualStrings("max-age=31536000; includeSubDomains", response.header("Strict-Transport-Security") orelse "");
 }
 
 test "TLS 1.1 client is rejected when the minimum version is 1.2 (#175)" {
@@ -4666,9 +4668,21 @@ test "TLS 1.1 client is rejected when the minimum version is 1.2 (#175)" {
     });
     defer tardigrade.stop();
 
-    // A modern client (readiness already proved this) succeeds; a client capped
-    // at TLS 1.1 has no shared version with the 1.2-minimum server and must fail
-    // the handshake (curl exits non-zero).
+    // Positive control: a client capped at TLS 1.2 still connects. This proves
+    // curl's --tls-max path works locally, so the 1.1 failure below is the
+    // server rejecting the version rather than a client-side curl quirk.
+    var tls12 = try sendCurlRequest(allocator, tardigrade.port, .{
+        .scheme = "https",
+        .path = "/healthz",
+        .insecure = true,
+        .tls_max = "1.2",
+    });
+    defer tls12.deinit();
+    try std.testing.expectEqual(@as(u16, 200), tls12.status_code);
+
+    // Same curl option path, same listener, same route — but a client capped at
+    // TLS 1.1 has no shared version with the 1.2-minimum server, so the
+    // handshake must fail (curl exits non-zero).
     var capped = try runCurl(allocator, tardigrade.port, .{
         .scheme = "https",
         .path = "/healthz",

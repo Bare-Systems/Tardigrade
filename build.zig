@@ -14,6 +14,9 @@ pub fn build(b: *std.Build) void {
     if (enable_http3_ngtcp2 and enable_http3_zig) {
         std.debug.panic("Enable at most one HTTP/3 backend: -Denable-http3-ngtcp2 (C libraries) or -Denable-http3-zig (pure Zig), not both.", .{});
     }
+    if (enable_http3_ngtcp2) {
+        requireHttp3Ngtcp2Dependencies(b, target.result.os.tag, target.result.cpu.arch, prefer_static_system_libs, require_static_system_libs);
+    }
     const app_version = b.option([]const u8, "version", "Version string embedded in the tardigrade binary") orelse "dev";
     const osslclient_default_path = "/tmp/ngtcp2-upstream/build/examples/osslclient";
     const http3_osslclient_path = b.option([]const u8, "http3-osslclient-path", "Path to the ngtcp2 OpenSSL HTTP/3 example client used by 0-RTT integration tests") orelse if (pathExists(osslclient_default_path)) osslclient_default_path else "";
@@ -200,6 +203,173 @@ fn pathExists(path: []const u8) bool {
     return true;
 }
 
+const SystemDependency = struct {
+    name: []const u8,
+    headers: []const []const u8,
+};
+
+const http3_ngtcp2_deps = [_]SystemDependency{
+    .{
+        .name = "ngtcp2",
+        .headers = &.{
+            "ngtcp2/ngtcp2.h",
+            "ngtcp2/ngtcp2_crypto.h",
+        },
+    },
+    .{
+        .name = "ngtcp2_crypto_ossl",
+        .headers = &.{
+            "ngtcp2/ngtcp2_crypto_ossl.h",
+        },
+    },
+    .{
+        .name = "nghttp3",
+        .headers = &.{
+            "nghttp3/nghttp3.h",
+        },
+    },
+};
+
+fn requireHttp3Ngtcp2Dependencies(
+    b: *std.Build,
+    os_tag: std.Target.Os.Tag,
+    arch: std.Target.Cpu.Arch,
+    prefer_static: bool,
+    require_static: bool,
+) void {
+    const include_dirs = systemIncludeSearchPaths(os_tag, arch);
+    const library_dirs = systemLibrarySearchPaths(os_tag, arch, prefer_static);
+    const library_extensions = libraryExtensions(os_tag, prefer_static, require_static);
+
+    for (http3_ngtcp2_deps) |dep| {
+        for (dep.headers) |header| {
+            if (!findRelativePath(b, include_dirs, header)) {
+                std.debug.panic(
+                    \\Missing optional HTTP/3 header '{s}' required by -Denable-http3-ngtcp2.
+                    \\Install the ngtcp2/nghttp3 OpenSSL backend development packages, then retry.
+                    \\Debian/Ubuntu packages when available: libngtcp2-dev libngtcp2-crypto-ossl-dev libnghttp3-dev.
+                    \\macOS Homebrew: brew install ngtcp2 nghttp3.
+                    \\For a no-system-library build, omit -Denable-http3-ngtcp2 or use -Denable-http3-zig.
+                    \\
+                , .{header});
+            }
+        }
+        if (!findSystemLibrary(b, library_dirs, dep.name, library_extensions)) {
+            std.debug.panic(
+                \\Missing optional HTTP/3 library 'lib{s}' required by -Denable-http3-ngtcp2.
+                \\Install the ngtcp2/nghttp3 OpenSSL backend development packages, then retry.
+                \\Debian/Ubuntu packages when available: libngtcp2-dev libngtcp2-crypto-ossl-dev libnghttp3-dev.
+                \\macOS Homebrew: brew install ngtcp2 nghttp3.
+                \\For a no-system-library build, omit -Denable-http3-ngtcp2 or use -Denable-http3-zig.
+                \\
+            , .{dep.name});
+        }
+    }
+}
+
+fn findRelativePath(b: *std.Build, dirs: []const []const u8, relative_path: []const u8) bool {
+    for (dirs) |dir| {
+        const candidate = std.fs.path.join(b.allocator, &.{ dir, relative_path }) catch @panic("out of memory");
+        defer b.allocator.free(candidate);
+        if (pathExists(candidate)) return true;
+    }
+    return false;
+}
+
+fn findSystemLibrary(
+    b: *std.Build,
+    dirs: []const []const u8,
+    name: []const u8,
+    extensions: []const []const u8,
+) bool {
+    for (extensions) |extension| {
+        const file_name = std.fmt.allocPrint(b.allocator, "lib{s}{s}", .{ name, extension }) catch @panic("out of memory");
+        defer b.allocator.free(file_name);
+        if (findRelativePath(b, dirs, file_name)) return true;
+    }
+    return false;
+}
+
+fn systemIncludeSearchPaths(os_tag: std.Target.Os.Tag, arch: std.Target.Cpu.Arch) []const []const u8 {
+    return switch (os_tag) {
+        .macos => &.{
+            "/opt/homebrew/include",
+            "/usr/local/include",
+            "/opt/homebrew/opt/openssl@3/include",
+            "/usr/local/opt/openssl@3/include",
+        },
+        .linux => switch (arch) {
+            .aarch64 => &.{
+                "/usr/local/include",
+                "/usr/include",
+                "/usr/include/aarch64-linux-gnu",
+            },
+            .x86_64 => &.{
+                "/usr/local/include",
+                "/usr/include",
+                "/usr/include/x86_64-linux-gnu",
+            },
+            else => &.{
+                "/usr/local/include",
+                "/usr/include",
+            },
+        },
+        else => &.{"/usr/include"},
+    };
+}
+
+fn systemLibrarySearchPaths(os_tag: std.Target.Os.Tag, arch: std.Target.Cpu.Arch, prefer_static: bool) []const []const u8 {
+    _ = prefer_static;
+    return switch (os_tag) {
+        .macos => &.{
+            "/opt/homebrew/lib",
+            "/usr/local/lib",
+            "/opt/homebrew/opt/openssl@3/lib",
+            "/usr/local/opt/openssl@3/lib",
+        },
+        .linux => switch (arch) {
+            .aarch64 => &.{
+                "/usr/local/lib",
+                "/usr/lib/aarch64-linux-gnu",
+                "/lib/aarch64-linux-gnu",
+                "/usr/lib",
+                "/lib",
+            },
+            .x86_64 => &.{
+                "/usr/local/lib",
+                "/usr/lib/x86_64-linux-gnu",
+                "/lib/x86_64-linux-gnu",
+                "/usr/lib",
+                "/lib",
+            },
+            else => &.{
+                "/usr/local/lib",
+                "/usr/lib",
+                "/lib",
+            },
+        },
+        else => &.{
+            "/usr/local/lib",
+            "/usr/lib",
+            "/lib",
+        },
+    };
+}
+
+fn libraryExtensions(os_tag: std.Target.Os.Tag, prefer_static: bool, require_static: bool) []const []const u8 {
+    if (require_static) return &.{".a"};
+    if (prefer_static) {
+        return switch (os_tag) {
+            .macos => &.{ ".a", ".dylib" },
+            else => &.{ ".a", ".so" },
+        };
+    }
+    return switch (os_tag) {
+        .macos => &.{ ".dylib", ".a" },
+        else => &.{ ".so", ".a" },
+    };
+}
+
 /// Link OpenSSL (required) and optional HTTP/3 libraries against a compile step.
 fn configureSsl(
     compile: *std.Build.Step.Compile,
@@ -241,12 +411,18 @@ fn configureSystemLibrarySearchPaths(
     // Always add Homebrew paths on macOS so OpenSSL (not in Apple's SDK) is found.
     if (target.os.tag == .macos) {
         compile.root_module.addSystemIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
+        if (pathExists("/usr/local/include")) compile.root_module.addSystemIncludePath(.{ .cwd_relative = "/usr/local/include" });
         compile.root_module.addSystemIncludePath(.{ .cwd_relative = "/opt/homebrew/opt/openssl@3/include" });
+        if (pathExists("/usr/local/opt/openssl@3/include")) compile.root_module.addSystemIncludePath(.{ .cwd_relative = "/usr/local/opt/openssl@3/include" });
         compile.root_module.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
+        if (pathExists("/usr/local/lib")) compile.root_module.addLibraryPath(.{ .cwd_relative = "/usr/local/lib" });
         compile.root_module.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/opt/openssl@3/lib" });
+        if (pathExists("/usr/local/opt/openssl@3/lib")) compile.root_module.addLibraryPath(.{ .cwd_relative = "/usr/local/opt/openssl@3/lib" });
     }
     if (target.os.tag == .linux) {
+        if (pathExists("/usr/local/include")) compile.root_module.addSystemIncludePath(.{ .cwd_relative = "/usr/local/include" });
         compile.root_module.addSystemIncludePath(.{ .cwd_relative = "/usr/include" });
+        if (pathExists("/usr/local/lib")) compile.root_module.addLibraryPath(.{ .cwd_relative = "/usr/local/lib" });
         switch (target.cpu.arch) {
             .aarch64 => {
                 compile.root_module.addSystemIncludePath(.{ .cwd_relative = "/usr/include/aarch64-linux-gnu" });

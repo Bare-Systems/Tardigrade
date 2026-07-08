@@ -36,10 +36,11 @@
     // Once all dependencies are fetched, `zig build` no longer requires
     // internet connectivity.
     //
-    // Tardigrade keeps HTTP/3 / QUIC support behind an explicit build flag and
-    // links the ngtcp2/nghttp3 system libraries only when that flag is enabled.
-    // The default build has no package-manager dependency on those optional
-    // HTTP/3 libraries.
+    // Tardigrade keeps HTTP/3 / QUIC support behind explicit build flags. The
+    // C-backed path links ngtcp2/nghttp3 system libraries only when
+    // `-Denable-http3-ngtcp2` is enabled. The pure-Zig path uses
+    // `-Denable-http3-zig` and has no package-manager or system-library
+    // dependency on those optional HTTP/3 libraries.
     .dependencies = .{
         // See `zig fetch --save <url>` for a command-line interface for adding dependencies.
         //.example = .{

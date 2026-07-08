@@ -5,6 +5,13 @@ All notable user-facing changes to Tardigrade are documented here.
 ## [Unreleased]
 
 ### Reliability
+- **Pure Zig QUIC TLS adapter foundation (#249)** — defines the internal
+  `QuicTlsAdapter` boundary for QUIC transport parameters, ALPN, certificate
+  state, per-level traffic secrets, and raw TLS handshake I/O without leaking
+  backend TLS types above `src/quic/tls_adapter.zig`. Adds deterministic CRYPTO
+  frame reassembly and outbound offset accounting per encryption level so
+  Initial, Handshake, 0-RTT, and 1-RTT data stay isolated before later packet
+  protection work.
 - **Pure Zig QUIC recovery foundation (#244)** — adds deterministic ACK-range
   tracking, RTT/PTO calculations, packet-threshold/time-threshold loss
   detection, bytes-in-flight accounting, NewReno recovery-period guards, and

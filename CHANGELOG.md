@@ -4,6 +4,13 @@ All notable user-facing changes to Tardigrade are documented here.
 
 ## [Unreleased]
 
+### Reliability
+- **Pure Zig QUIC recovery foundation (#244)** — adds deterministic ACK-range
+  tracking, RTT/PTO calculations, packet-threshold/time-threshold loss
+  detection, bytes-in-flight accounting, NewReno recovery-period guards, and
+  pacing hints in `src/quic/recovery.zig`. ACK state is scoped per QUIC packet
+  number space so Initial, Handshake, and Application ranges cannot merge.
+
 ## [0.5.0] - 2026-07-08
 
 ### Testing

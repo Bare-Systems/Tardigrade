@@ -16,6 +16,8 @@ const CliCommand = union(enum) {
     validate: CommonOptions,
     status: SignalOptions,
     print_config: CommonOptions,
+    routes: CommonOptions,
+    upstreams: CommonOptions,
     reload: SignalOptions,
     stop: SignalOptions,
     version,
@@ -115,6 +117,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .config_init => |options| try writeStarterConfig(options),
         .status => |options| try executeStatusCommand(control_allocator, options),
         .print_config => |options| try executePrintConfigCommand(control_allocator, options),
+        .routes => |options| try executeRoutesCommand(control_allocator, options),
+        .upstreams => |options| try executeUpstreamsCommand(control_allocator, options),
         .reload => |options| try executeSignalCommand(control_allocator, "reload", std.posix.SIG.HUP, options),
         .stop => |options| try executeSignalCommand(control_allocator, "stop", std.posix.SIG.TERM, options),
         .check => |options| try executeValidationCommandOrExit(control_allocator, options, .check),
@@ -142,6 +146,8 @@ fn parseCliCommand(args: []const []const u8) !CliCommand {
     if (std.mem.eql(u8, first, "validate")) return try parseValidateCommand(args[1..]);
     if (std.mem.eql(u8, first, "status")) return try parseSignalCommand(.status, args[1..]);
     if (std.mem.eql(u8, first, "print-config")) return try parsePrintConfigCommand(args[1..]);
+    if (std.mem.eql(u8, first, "routes")) return if (try parseInspectOptions(args[1..])) |o| .{ .routes = o } else .help;
+    if (std.mem.eql(u8, first, "upstreams")) return if (try parseInspectOptions(args[1..])) |o| .{ .upstreams = o } else .help;
     if (std.mem.eql(u8, first, "reload")) return try parseSignalCommand(.reload, args[1..]);
     if (std.mem.eql(u8, first, "stop")) return try parseSignalCommand(.stop, args[1..]);
     if (std.mem.eql(u8, first, "config")) {
@@ -284,6 +290,30 @@ fn parsePrintConfigCommand(args: []const []const u8) !CliCommand {
     return .{ .print_config = options };
 }
 
+/// Parse the `[-c <path>]` / `[-h]` options shared by the `routes` and
+/// `upstreams` inspection commands. Returns null when help was requested.
+fn parseInspectOptions(args: []const []const u8) !?CommonOptions {
+    var options = CommonOptions{};
+    var saw_positional = false;
+    var idx: usize = 0;
+    while (idx < args.len) : (idx += 1) {
+        const arg = args[idx];
+        if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) return null;
+        if (std.mem.eql(u8, arg, "-c") or std.mem.eql(u8, arg, "--config")) {
+            if (idx + 1 >= args.len) return error.MissingOptionValue;
+            options.config_path = args[idx + 1];
+            idx += 1;
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "-")) return error.UnknownOption;
+        // Concise positional form, e.g. `routes ./tardigrade.conf` (like `check`).
+        if (saw_positional or options.config_path != null) return error.TooManyArguments;
+        options.config_path = arg;
+        saw_positional = true;
+    }
+    return options;
+}
+
 fn parseConfigInitCommand(args: []const []const u8) !CliCommand {
     var options = ConfigInitOptions{};
     var saw_output = false;
@@ -313,6 +343,8 @@ fn printUsage(writer: anytype) !void {
         \\  tardigrade validate [-c <path>]
         \\  tardigrade status [-c <path>] [--pid-file <path> | --pid <pid>]
         \\  tardigrade print-config [-c <path>]
+        \\  tardigrade routes [<config>] [-c <path>]
+        \\  tardigrade upstreams [<config>] [-c <path>]
         \\  tardigrade reload [-c <path>] [--pid-file <path> | --pid <pid>]
         \\  tardigrade stop [-c <path>] [--pid-file <path> | --pid <pid>]
         \\  tardigrade version
@@ -327,6 +359,10 @@ fn printUsage(writer: anytype) !void {
         \\  - Legacy `validate` and `--validate-config` remain supported.
         \\  - `status` reports process state when a pid target is available.
         \\  - `print-config` prints the effective operator-facing config summary.
+        \\  - `routes` prints the resolved routing table (match type, pattern,
+        \\    priority, action, auth) for the effective config.
+        \\  - `upstreams` lists the upstream targets referenced by the routes plus
+        \\    the default upstream base URL.
         \\  - Runtime config discovery checks `-c/--config`, `TARDIGRADE_CONFIG_PATH`,
         \\    `./tardigrade.conf`, `./config/tardigrade.conf`,
         \\    `/etc/tardigrade/tardigrade.conf`, and
@@ -450,6 +486,209 @@ fn isConfigValidationError(err: anyerror) bool {
         => true,
         else => false,
     };
+}
+
+/// Resolve the config path, load it from the environment, and validate it.
+/// Returns an owned `EdgeConfig` (caller calls `deinit`). Shared by the
+/// inspection commands.
+fn loadValidatedConfig(allocator: std.mem.Allocator, options: CommonOptions) !edge_config.EdgeConfig {
+    const resolved_config_path = try resolveRuntimeConfigPath(allocator, options.config_path);
+    defer if (resolved_config_path) |path| allocator.free(path);
+    if (resolved_config_path) |path| try setProcessEnv(allocator, ENV_CONFIG_PATH, path);
+    var cfg = try edge_config.loadFromEnv(allocator);
+    errdefer cfg.deinit(allocator);
+    try edge_config.validate(&cfg);
+    return cfg;
+}
+
+/// Write the resolved routing table (one line per location block) to `writer`.
+/// Pure over `location_blocks` so it is unit-testable without a full config.
+fn writeRoutesSummary(writer: anytype, location_blocks: []const http.location_router.LocationBlock) !void {
+    try writer.print("routes ({d})\n", .{location_blocks.len});
+    for (location_blocks) |block| {
+        try writer.print("  {s} {s}", .{ @tagName(block.match_type), block.pattern });
+        if (block.priority > 0) try writer.print(" [priority {d}]", .{block.priority});
+        try writer.writeAll(" -> ");
+        switch (block.action) {
+            .proxy_pass => |target| try writer.print("proxy_pass {s}", .{if (target.len > 0) target else "(upstream base url)"}),
+            .fastcgi_pass => |target| try writer.print("fastcgi_pass {s}", .{target}),
+            .return_response => |resp| try writer.print("return {d}", .{resp.status}),
+            .rewrite => |rule| try writer.print("rewrite {s} ({s})", .{ rule.replacement, @tagName(rule.flag) }),
+            .static_root => |root| try writer.print("static_root {s}", .{root.root}),
+        }
+        if (block.auth == .required) try writer.writeAll(" [auth: required]");
+        try writer.writeAll("\n");
+    }
+}
+
+/// Write the distinct upstream targets referenced by the routing table plus the
+/// default upstream base URL. Pure over its inputs for unit testing.
+fn writeUpstreamsSummary(writer: anytype, location_blocks: []const http.location_router.LocationBlock, upstream_base_url: []const u8) !void {
+    try writer.writeAll("upstreams\n");
+    if (upstream_base_url.len > 0) try writer.print("  base    {s}\n", .{upstream_base_url});
+    for (location_blocks) |block| {
+        switch (block.action) {
+            .proxy_pass => |target| {
+                if (target.len > 0) {
+                    try writer.print("  proxy   {s} (route {s})\n", .{ target, block.pattern });
+                } else if (upstream_base_url.len > 0) {
+                    // A relative proxy_pass forwards to the default base URL;
+                    // surface it so "which upstream does this route use?" is
+                    // answerable from this command alone.
+                    try writer.print("  proxy   {s} (route {s}, default base)\n", .{ upstream_base_url, block.pattern });
+                }
+            },
+            .fastcgi_pass => |target| try writer.print("  fastcgi {s} (route {s})\n", .{ target, block.pattern }),
+            else => {},
+        }
+    }
+}
+
+/// Compact upstream health-check + connection-pool configuration for the
+/// `upstreams` command. Pure over its inputs for unit testing.
+const UpstreamHealthInfo = struct {
+    active_interval_ms: u64,
+    active_path: []const u8,
+    active_timeout_ms: u32,
+    active_fail_threshold: u32,
+    active_success_threshold: u32,
+    passive_max_fails: u32,
+    passive_fail_timeout_ms: u64,
+    pool_enabled: bool,
+    pool_max_idle_per_host: usize,
+    pool_idle_timeout_ms: u64,
+    pool_max_lifetime_ms: u64,
+    pool_max_active_per_host: usize,
+};
+
+fn writeUpstreamHealthSummary(writer: anytype, info: UpstreamHealthInfo) !void {
+    try writer.writeAll("health\n");
+    if (info.active_interval_ms == 0) {
+        try writer.writeAll("  active  disabled\n");
+    } else {
+        try writer.print("  active  path {s} interval {d}ms timeout {d}ms fail {d} success {d}\n", .{
+            info.active_path,
+            info.active_interval_ms,
+            info.active_timeout_ms,
+            info.active_fail_threshold,
+            info.active_success_threshold,
+        });
+    }
+    if (info.passive_max_fails == 0) {
+        try writer.writeAll("  passive disabled\n");
+    } else {
+        try writer.print("  passive max_fails {d} fail_timeout {d}ms\n", .{ info.passive_max_fails, info.passive_fail_timeout_ms });
+    }
+    if (!info.pool_enabled) {
+        try writer.writeAll("  pool    disabled\n");
+    } else {
+        try writer.print("  pool    max_idle_per_host {d} idle_timeout {d}ms max_lifetime {d}ms max_active_per_host {d}\n", .{
+            info.pool_max_idle_per_host,
+            info.pool_idle_timeout_ms,
+            info.pool_max_lifetime_ms,
+            info.pool_max_active_per_host,
+        });
+    }
+}
+
+test "writeRoutesSummary formats match type, action, priority and auth" {
+    const blocks = [_]http.location_router.LocationBlock{
+        .{ .match_type = .exact, .pattern = "/health", .priority = 0, .action = .{ .return_response = .{ .status = 200, .body = "ok" } } },
+        .{ .match_type = .prefix_priority, .pattern = "/api/", .priority = 10, .action = .{ .proxy_pass = "http://backend:8080" }, .auth = .required },
+    };
+    var buf: [512]u8 = undefined;
+    var fbs = compat.fixedBufferStream(&buf);
+    try writeRoutesSummary(fbs.writer(), &blocks);
+    const out = fbs.getWritten();
+    try std.testing.expect(std.mem.indexOf(u8, out, "routes (2)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "exact /health -> return 200") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "prefix_priority /api/ [priority 10] -> proxy_pass http://backend:8080 [auth: required]") != null);
+}
+
+test "writeUpstreamsSummary lists base url and proxy/fastcgi targets" {
+    const blocks = [_]http.location_router.LocationBlock{
+        .{ .match_type = .prefix, .pattern = "/api/", .priority = 0, .action = .{ .proxy_pass = "http://backend:8080" } },
+        .{ .match_type = .regex, .pattern = "\\.php$", .priority = 0, .action = .{ .fastcgi_pass = "unix:/run/php.sock" } },
+        // Relative proxy_pass -> uses the default base URL.
+        .{ .match_type = .prefix, .pattern = "/rel/", .priority = 0, .action = .{ .proxy_pass = "" } },
+        .{ .match_type = .exact, .pattern = "/", .priority = 0, .action = .{ .return_response = .{ .status = 200, .body = "" } } },
+    };
+    var buf: [512]u8 = undefined;
+    var fbs = compat.fixedBufferStream(&buf);
+    try writeUpstreamsSummary(fbs.writer(), &blocks, "http://default:9000");
+    const out = fbs.getWritten();
+    try std.testing.expect(std.mem.indexOf(u8, out, "base    http://default:9000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "proxy   http://backend:8080 (route /api/)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "fastcgi unix:/run/php.sock") != null);
+    // A relative proxy_pass is shown resolving to the default base.
+    try std.testing.expect(std.mem.indexOf(u8, out, "proxy   http://default:9000 (route /rel/, default base)") != null);
+    // return_response routes are not upstreams.
+    try std.testing.expect(std.mem.indexOf(u8, out, "return") == null);
+}
+
+test "writeUpstreamHealthSummary shows active/passive/pool config and disabled states" {
+    var buf: [512]u8 = undefined;
+    {
+        var fbs = compat.fixedBufferStream(&buf);
+        try writeUpstreamHealthSummary(fbs.writer(), .{
+            .active_interval_ms = 30000,
+            .active_path = "/healthz",
+            .active_timeout_ms = 2000,
+            .active_fail_threshold = 3,
+            .active_success_threshold = 2,
+            .passive_max_fails = 3,
+            .passive_fail_timeout_ms = 10000,
+            .pool_enabled = true,
+            .pool_max_idle_per_host = 32,
+            .pool_idle_timeout_ms = 60000,
+            .pool_max_lifetime_ms = 300000,
+            .pool_max_active_per_host = 0,
+        });
+        const out = fbs.getWritten();
+        try std.testing.expect(std.mem.indexOf(u8, out, "active  path /healthz interval 30000ms timeout 2000ms fail 3 success 2") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "passive max_fails 3 fail_timeout 10000ms") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "pool    max_idle_per_host 32") != null);
+    }
+    {
+        var fbs = compat.fixedBufferStream(&buf);
+        try writeUpstreamHealthSummary(fbs.writer(), std.mem.zeroInit(UpstreamHealthInfo, .{ .active_path = "" }));
+        const out = fbs.getWritten();
+        try std.testing.expect(std.mem.indexOf(u8, out, "active  disabled") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "passive disabled") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "pool    disabled") != null);
+    }
+}
+
+fn executeRoutesCommand(allocator: std.mem.Allocator, options: CommonOptions) !void {
+    var cfg = try loadValidatedConfig(allocator, options);
+    defer cfg.deinit(allocator);
+    var stdout_buf: [4096]u8 = undefined;
+    var stdout = compat.stdoutWriter(&stdout_buf);
+    try writeRoutesSummary(&stdout, cfg.location_blocks);
+    try stdout.flush();
+}
+
+fn executeUpstreamsCommand(allocator: std.mem.Allocator, options: CommonOptions) !void {
+    var cfg = try loadValidatedConfig(allocator, options);
+    defer cfg.deinit(allocator);
+    var stdout_buf: [4096]u8 = undefined;
+    var stdout = compat.stdoutWriter(&stdout_buf);
+    try writeUpstreamsSummary(&stdout, cfg.location_blocks, cfg.upstream_base_url);
+    try writeUpstreamHealthSummary(&stdout, .{
+        .active_interval_ms = cfg.upstream_active_health_interval_ms,
+        .active_path = cfg.upstream_active_health_path,
+        .active_timeout_ms = cfg.upstream_active_health_timeout_ms,
+        .active_fail_threshold = cfg.upstream_active_health_fail_threshold,
+        .active_success_threshold = cfg.upstream_active_health_success_threshold,
+        .passive_max_fails = cfg.upstream_max_fails,
+        .passive_fail_timeout_ms = cfg.upstream_fail_timeout_ms,
+        .pool_enabled = cfg.upstream_pool_enabled,
+        .pool_max_idle_per_host = cfg.upstream_pool_max_idle_per_host,
+        .pool_idle_timeout_ms = cfg.upstream_pool_idle_timeout_ms,
+        .pool_max_lifetime_ms = cfg.upstream_pool_max_lifetime_ms,
+        .pool_max_active_per_host = cfg.upstream_pool_max_active_per_host,
+    });
+    try stdout.flush();
 }
 
 fn executePrintConfigCommand(allocator: std.mem.Allocator, options: CommonOptions) !void {

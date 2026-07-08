@@ -171,7 +171,6 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/quic/root.zig"),
         .target = target,
         .optimize = optimize,
-        .link_libc = true,
     });
     const quic_tests = b.addTest(.{ .root_module = quic_mod });
     const run_quic_tests = b.addRunArtifact(quic_tests);
@@ -179,6 +178,21 @@ pub fn build(b: *std.Build) void {
     quic_step.dependOn(&run_quic_tests.step);
     // Also exercise them under the default `zig build test`.
     test_step.dependOn(&run_quic_tests.step);
+
+    const http3_mod = b.createModule(.{
+        .root_source_file = b.path("src/http3/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    http3_mod.addImport("stream_transport", b.createModule(.{
+        .root_source_file = b.path("src/http/stream_transport.zig"),
+        .target = target,
+        .optimize = optimize,
+    }));
+    const http3_tests = b.addTest(.{ .root_module = http3_mod });
+    const run_http3_tests = b.addRunArtifact(http3_tests);
+    quic_step.dependOn(&run_http3_tests.step);
+    test_step.dependOn(&run_http3_tests.step);
 }
 
 fn pathExists(path: []const u8) bool {

@@ -5,6 +5,10 @@ All notable user-facing changes to Tardigrade are documented here.
 ## [Unreleased]
 
 ### Reliability
+- **Pure Zig QUIC Initial packet protection (#249)** — adds AES-128-GCM
+  sealing/opening helpers for QUIC v1 Initial payloads using the derived
+  packet-protection keys, with RFC 9001 client Initial sample coverage and
+  negative tests for wrong keys, truncated tags, and undersized output buffers.
 - **Pure Zig QUIC Initial key derivation (#249)** — derives RFC 9001 QUIC v1
   Initial client/server secrets and AES-128-GCM packet-protection/header-
   protection material from the client Initial DCID, installs read/write Initial

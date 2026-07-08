@@ -25,6 +25,7 @@ pub const max_crypto_buffer = 64 * 1024;
 pub const max_crypto_ranges = 32;
 pub const max_handshake_record = 16 * 1024;
 pub const max_secret_len = 64;
+pub const min_initial_dcid_len = 8;
 pub const max_connection_id_len = 20;
 pub const initial_salt_v1 = [_]u8{
     0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x17,
@@ -144,13 +145,17 @@ pub const SecretStore = struct {
     }
 };
 
-pub const PacketProtectionKeys = struct {
+// TODO(#249): Handshake and Application packet protection must be derived from
+// TLS-exported traffic secrets, not from QUIC v1 Initial salt/DCID material.
+pub const InitialPacketProtectionKeys = struct {
     secret: [initial_secret_len]u8,
     key: [initial_key_len]u8,
     iv: [initial_iv_len]u8,
     hp: [header_protection_key_len]u8,
 
-    pub fn nonce(self: *const PacketProtectionKeys, packet_number: u64) [initial_iv_len]u8 {
+    pub fn nonce(self: *const InitialPacketProtectionKeys, packet_number: u64) [initial_iv_len]u8 {
+        std.debug.assert(packet_number <= ((@as(u64, 1) << 62) - 1));
+
         var out = self.iv;
         var packet_number_bytes: [8]u8 = undefined;
         std.mem.writeInt(u64, &packet_number_bytes, packet_number, .big);
@@ -160,7 +165,7 @@ pub const PacketProtectionKeys = struct {
         return out;
     }
 
-    pub fn headerProtectionMask(self: *const PacketProtectionKeys, sample: [16]u8) [5]u8 {
+    pub fn headerProtectionMask(self: *const InitialPacketProtectionKeys, sample: [16]u8) [5]u8 {
         const aes = Aes128.initEnc(self.hp);
         var block: [16]u8 = undefined;
         aes.encrypt(&block, &sample);
@@ -170,12 +175,12 @@ pub const PacketProtectionKeys = struct {
 
 pub const InitialSecrets = struct {
     initial_secret: [initial_secret_len]u8,
-    client: PacketProtectionKeys,
-    server: PacketProtectionKeys,
+    client: InitialPacketProtectionKeys,
+    server: InitialPacketProtectionKeys,
 };
 
 pub fn deriveInitialSecretsV1(client_initial_dcid: []const u8) error{InvalidConnectionId}!InitialSecrets {
-    if (client_initial_dcid.len == 0 or client_initial_dcid.len > max_connection_id_len) {
+    if (client_initial_dcid.len < min_initial_dcid_len or client_initial_dcid.len > max_connection_id_len) {
         return error.InvalidConnectionId;
     }
 
@@ -189,7 +194,7 @@ pub fn deriveInitialSecretsV1(client_initial_dcid: []const u8) error{InvalidConn
     };
 }
 
-pub fn deriveInitialAes128GcmKeys(secret: [initial_secret_len]u8) PacketProtectionKeys {
+pub fn deriveInitialAes128GcmKeys(secret: [initial_secret_len]u8) InitialPacketProtectionKeys {
     return .{
         .secret = secret,
         .key = tls.hkdfExpandLabel(HkdfSha256, secret, "quic key", "", initial_key_len),
@@ -440,7 +445,7 @@ pub const QuicTlsAdapter = struct {
         return secrets;
     }
 
-    pub fn initialProtectionKeys(self: *const QuicTlsAdapter, direction: Direction) ?PacketProtectionKeys {
+    pub fn initialProtectionKeys(self: *const QuicTlsAdapter, direction: Direction) ?InitialPacketProtectionKeys {
         const installed_secret = self.secret(.initial, direction) orelse return null;
         if (installed_secret.len != initial_secret_len) return null;
         return deriveInitialAes128GcmKeys(installed_secret.bytes[0..initial_secret_len].*);
@@ -500,6 +505,11 @@ test "Initial packet protection derives nonce and header protection mask" {
 
 test "Initial secrets reject invalid destination connection IDs" {
     try testing.expectError(error.InvalidConnectionId, deriveInitialSecretsV1(""));
+    const too_short = [_]u8{0xaa} ** (min_initial_dcid_len - 1);
+    try testing.expectError(error.InvalidConnectionId, deriveInitialSecretsV1(&too_short));
+
+    const min_len = [_]u8{0xbb} ** min_initial_dcid_len;
+    _ = try deriveInitialSecretsV1(&min_len);
 
     const too_long = [_]u8{0xaa} ** (max_connection_id_len + 1);
     try testing.expectError(error.InvalidConnectionId, deriveInitialSecretsV1(&too_long));

@@ -245,6 +245,7 @@ pub const LossResult = struct {
     packet_threshold_losses: usize = 0,
     time_threshold_losses: usize = 0,
     lost_bytes: usize = 0,
+    largest_lost_time_sent_us: ?u64 = null,
 };
 
 pub const PacketTracker = struct {
@@ -301,6 +302,9 @@ pub const PacketTracker = struct {
                 result.lost_bytes += packet.size;
                 self.bytes_in_flight -= packet.size;
             }
+            if (result.largest_lost_time_sent_us == null or packet.time_sent_us > result.largest_lost_time_sent_us.?) {
+                result.largest_lost_time_sent_us = packet.time_sent_us;
+            }
             packet.lost = true;
             self.packets[index] = packet;
             self.removeAt(index);
@@ -338,19 +342,25 @@ pub const CongestionController = struct {
         self.bytes_in_flight += bytes;
     }
 
-    pub fn onPacketAcked(self: *CongestionController, bytes: usize) void {
-        self.bytes_in_flight -|= bytes;
+    pub fn onPacketAcked(self: *CongestionController, packet: SentPacket) void {
+        self.bytes_in_flight -|= packet.size;
+        if (self.recovery_start_time_us) |start| {
+            if (packet.time_sent_us <= start) return;
+        }
         if (self.congestion_window < self.ssthresh) {
-            self.congestion_window += bytes;
+            self.congestion_window += packet.size;
         } else {
-            self.congestion_window += @max(1, max_datagram_size * bytes / self.congestion_window);
+            self.congestion_window += @max(1, max_datagram_size * packet.size / self.congestion_window);
         }
     }
 
-    pub fn onPacketsLost(self: *CongestionController, lost_bytes: usize, now_us: u64) void {
+    pub fn onPacketsLost(self: *CongestionController, largest_lost_time_sent_us: u64, lost_bytes: usize, now_us: u64) void {
         if (lost_bytes == 0) return;
-        self.recovery_start_time_us = now_us;
         self.bytes_in_flight -|= lost_bytes;
+        if (self.recovery_start_time_us) |start| {
+            if (largest_lost_time_sent_us <= start) return;
+        }
+        self.recovery_start_time_us = now_us;
         self.congestion_window = @max(self.congestion_window / 2, min_congestion_window);
         self.ssthresh = self.congestion_window;
     }
@@ -377,15 +387,19 @@ pub const PacingHint = struct {
 };
 
 pub const RecoveryController = struct {
-    ack_ranges: AckRangeSet = .{},
+    ack_ranges: [3]AckRangeSet = .{ .{}, .{}, .{} },
     rtt: RttEstimator = .{},
     tracker: PacketTracker = .{},
     congestion: CongestionController = .{},
     events: EventSink = .{},
 
     pub fn onPacketReceived(self: *RecoveryController, space: PacketNumberSpace, packet_number: u64) error{TooManyAckRanges}!void {
-        try self.ack_ranges.insert(packet_number);
+        try self.ack_ranges[spaceIndex(space)].insert(packet_number);
         self.events.emit(.{ .kind = .ack_range_inserted, .space = space, .packet_number = packet_number });
+    }
+
+    pub fn ackFrameForSpace(self: *const RecoveryController, space: PacketNumberSpace, ack_delay_us: u64) ?AckFrameModel {
+        return self.ack_ranges[spaceIndex(space)].toAckFrame(ack_delay_us);
     }
 
     pub fn onPacketSent(self: *RecoveryController, packet: SentPacket) error{TooManyTrackedPackets}!void {
@@ -395,7 +409,7 @@ pub const RecoveryController = struct {
 
     pub fn onAcked(self: *RecoveryController, space: PacketNumberSpace, packet_number: u64, now_us: u64, ack_delay_us: u64) void {
         if (self.tracker.onAcked(space, packet_number, now_us)) |acked| {
-            self.congestion.onPacketAcked(acked.packet.size);
+            self.congestion.onPacketAcked(acked.packet);
             if (acked.rtt_sample_us) |sample| self.rtt.update(sample, ack_delay_us);
             self.events.emit(.{
                 .kind = .packet_acked,
@@ -411,7 +425,7 @@ pub const RecoveryController = struct {
     pub fn detectLost(self: *RecoveryController, space: PacketNumberSpace, now_us: u64) LossResult {
         const result = self.tracker.detectLost(space, now_us, self.rtt);
         if (result.lost_bytes > 0) {
-            self.congestion.onPacketsLost(result.lost_bytes, now_us);
+            self.congestion.onPacketsLost(result.largest_lost_time_sent_us.?, result.lost_bytes, now_us);
             self.events.emit(.{
                 .kind = .packet_lost,
                 .space = space,
@@ -472,6 +486,25 @@ test "ACK frame model emits QUIC gaps from descending ranges" {
     try testing.expectEqual(AckFrameRange{ .gap = 1, .length = 1 }, frame.ranges[1]);
 }
 
+test "recovery controller keeps ACK ranges per packet-number space" {
+    var recovery = RecoveryController{};
+    try recovery.onPacketReceived(.initial, 1);
+    try recovery.onPacketReceived(.application, 1);
+    try recovery.onPacketReceived(.application, 2);
+
+    const initial_ack = recovery.ackFrameForSpace(.initial, 0).?;
+    try testing.expectEqual(@as(u64, 1), initial_ack.largest_acknowledged);
+    try testing.expectEqual(@as(u64, 0), initial_ack.first_ack_range);
+    try testing.expectEqual(@as(usize, 0), initial_ack.range_count);
+
+    const application_ack = recovery.ackFrameForSpace(.application, 0).?;
+    try testing.expectEqual(@as(u64, 2), application_ack.largest_acknowledged);
+    try testing.expectEqual(@as(u64, 1), application_ack.first_ack_range);
+    try testing.expectEqual(@as(usize, 0), application_ack.range_count);
+
+    try testing.expect(recovery.ackFrameForSpace(.handshake, 0) == null);
+}
+
 test "RTT estimator caps ACK delay and maintains min RTT" {
     var rtt = RttEstimator.init(25_000);
     rtt.update(100_000, 500_000);
@@ -522,12 +555,14 @@ test "loss detection covers packet threshold and time threshold" {
     const threshold_loss = tracker.detectLost(.application, 100, rtt);
     try testing.expectEqual(@as(usize, 2), threshold_loss.packet_threshold_losses);
     try testing.expectEqual(@as(usize, 200), threshold_loss.lost_bytes);
+    try testing.expectEqual(@as(u64, 10), threshold_loss.largest_lost_time_sent_us.?);
     try testing.expectEqual(@as(usize, 200), tracker.bytes_in_flight);
 
     _ = tracker.onAcked(.application, 4, 120);
     const time_loss = tracker.detectLost(.application, 2_000, rtt);
     try testing.expectEqual(@as(usize, 1), time_loss.time_threshold_losses);
     try testing.expectEqual(@as(usize, 100), time_loss.lost_bytes);
+    try testing.expectEqual(@as(u64, 20), time_loss.largest_lost_time_sent_us.?);
     try testing.expectEqual(@as(usize, 0), tracker.bytes_in_flight);
 }
 
@@ -535,11 +570,11 @@ test "NewReno baseline halves cwnd and persistent congestion uses minimum window
     var cc = CongestionController{};
     const initial = cc.congestion_window;
     cc.onPacketSent(4_000);
-    cc.onPacketAcked(1_200);
+    cc.onPacketAcked(.{ .space = .application, .packet_number = 1, .time_sent_us = 1_000, .size = 1_200 });
     try testing.expect(cc.congestion_window > initial);
     try testing.expectEqual(@as(usize, 2_800), cc.bytes_in_flight);
 
-    cc.onPacketsLost(1_200, 50_000);
+    cc.onPacketsLost(2_000, 1_200, 50_000);
     try testing.expectEqual(@as(usize, 1_600), cc.bytes_in_flight);
     try testing.expect(cc.congestion_window >= min_congestion_window);
     try testing.expectEqual(cc.congestion_window, cc.ssthresh);
@@ -547,6 +582,29 @@ test "NewReno baseline halves cwnd and persistent congestion uses minimum window
     cc.onPersistentCongestion();
     try testing.expectEqual(@as(usize, min_congestion_window), cc.congestion_window);
     try testing.expectEqual(@as(usize, min_congestion_window), cc.ssthresh);
+}
+
+test "NewReno recovery period prevents repeated cwnd cuts and old ACK growth" {
+    var cc = CongestionController{};
+    const initial = cc.congestion_window;
+    cc.onPacketSent(6_000);
+
+    cc.onPacketsLost(2_000, 1_200, 50_000);
+    const after_first_loss = cc.congestion_window;
+    try testing.expect(after_first_loss < initial);
+    try testing.expectEqual(@as(usize, 4_800), cc.bytes_in_flight);
+
+    cc.onPacketsLost(2_000, 1_200, 60_000);
+    try testing.expectEqual(after_first_loss, cc.congestion_window);
+    try testing.expectEqual(@as(usize, 3_600), cc.bytes_in_flight);
+
+    cc.onPacketAcked(.{ .space = .application, .packet_number = 1, .time_sent_us = 1_500, .size = 1_200 });
+    try testing.expectEqual(after_first_loss, cc.congestion_window);
+    try testing.expectEqual(@as(usize, 2_400), cc.bytes_in_flight);
+
+    cc.onPacketAcked(.{ .space = .application, .packet_number = 5, .time_sent_us = 70_000, .size = 1_200 });
+    try testing.expect(cc.congestion_window > after_first_loss);
+    try testing.expectEqual(@as(usize, 1_200), cc.bytes_in_flight);
 }
 
 test "pacing hint exposes send allowance and blocked wake time" {

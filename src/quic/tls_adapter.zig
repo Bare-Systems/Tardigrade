@@ -35,6 +35,7 @@ pub const initial_secret_len = HkdfSha256.prk_length;
 pub const initial_key_len = Aes128Gcm.key_length;
 pub const initial_iv_len = Aes128Gcm.nonce_length;
 pub const header_protection_key_len = Aes128Gcm.key_length;
+pub const packet_protection_tag_len = Aes128Gcm.tag_length;
 
 pub const EncryptionLevel = enum(u2) {
     initial,
@@ -163,6 +164,52 @@ pub const InitialPacketProtectionKeys = struct {
             out[initial_iv_len - packet_number_bytes.len + index] ^= byte;
         }
         return out;
+    }
+
+    pub fn sealPayload(
+        self: *const InitialPacketProtectionKeys,
+        packet_number: u64,
+        header: []const u8,
+        plaintext: []const u8,
+        out: []u8,
+    ) error{OutputTooSmall}![]u8 {
+        if (out.len < plaintext.len + packet_protection_tag_len) return error.OutputTooSmall;
+
+        var tag: [packet_protection_tag_len]u8 = undefined;
+        Aes128Gcm.encrypt(
+            out[0..plaintext.len],
+            &tag,
+            plaintext,
+            header,
+            self.nonce(packet_number),
+            self.key,
+        );
+        @memcpy(out[plaintext.len..][0..packet_protection_tag_len], &tag);
+        return out[0 .. plaintext.len + packet_protection_tag_len];
+    }
+
+    pub fn openPayload(
+        self: *const InitialPacketProtectionKeys,
+        packet_number: u64,
+        header: []const u8,
+        protected_payload: []const u8,
+        out: []u8,
+    ) error{ ProtectedPayloadTooShort, OutputTooSmall, AuthenticationFailed }![]u8 {
+        if (protected_payload.len < packet_protection_tag_len) return error.ProtectedPayloadTooShort;
+        const ciphertext_len = protected_payload.len - packet_protection_tag_len;
+        if (out.len < ciphertext_len) return error.OutputTooSmall;
+
+        var tag: [packet_protection_tag_len]u8 = undefined;
+        @memcpy(&tag, protected_payload[ciphertext_len..][0..packet_protection_tag_len]);
+        Aes128Gcm.decrypt(
+            out[0..ciphertext_len],
+            protected_payload[0..ciphertext_len],
+            tag,
+            header,
+            self.nonce(packet_number),
+            self.key,
+        ) catch return error.AuthenticationFailed;
+        return out[0..ciphertext_len];
     }
 
     pub fn headerProtectionMask(self: *const InitialPacketProtectionKeys, sample: [16]u8) [5]u8 {
@@ -468,6 +515,12 @@ fn expectHex(comptime hex: []const u8, actual: []const u8) !void {
     try testing.expectEqualSlices(u8, &expected, actual);
 }
 
+fn hexBytes(comptime hex: []const u8) [hex.len / 2]u8 {
+    var bytes: [hex.len / 2]u8 = undefined;
+    _ = std.fmt.hexToBytes(&bytes, hex) catch unreachable;
+    return bytes;
+}
+
 test "encryption levels map to QUIC packet number spaces" {
     try testing.expectEqual(PacketNumberSpace.initial, EncryptionLevel.initial.packetNumberSpace());
     try testing.expectEqual(PacketNumberSpace.handshake, EncryptionLevel.handshake.packetNumberSpace());
@@ -501,6 +554,69 @@ test "Initial packet protection derives nonce and header protection mask" {
     var sample: [16]u8 = undefined;
     _ = try std.fmt.hexToBytes(&sample, "d1b1c98dd7689fb8ec11d242b123dc9b");
     try expectHex("437b9aec36", &secrets.client.headerProtectionMask(sample));
+}
+
+test "Initial packet protection seals RFC 9001 client Initial payload sample" {
+    var dcid: [8]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&dcid, "8394c8f03e515708");
+    const secrets = try deriveInitialSecretsV1(&dcid);
+
+    var header: [22]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&header, "c300000001088394c8f03e5157080000449e00000002");
+    const crypto_frame = hexBytes(
+        "060040f1010000ed0303ebf8fa56f129" ++
+            "39b9584a3896472ec40bb863cfd3e868" ++
+            "04fe3a47f06a2b69484c000004130113" ++
+            "02010000c000000010000e00000b6578" ++
+            "616d706c652e636f6dff01000100000a" ++
+            "00080006001d00170018001000070005" ++
+            "04616c706e0005000501000000000033" ++
+            "00260024001d00209370b2c9caa47fba" ++
+            "baf4559fedba753de171fa71f50f1ce1" ++
+            "5d43e994ec74d748002b000302030400" ++
+            "0d0010000e0403050306030203080408" ++
+            "050806002d00020101001c0002400100" ++
+            "3900320408ffffffffffffffff050480" ++
+            "00ffff07048000ffff08011001048000" ++
+            "75300901100f088394c8f03e51570806" ++
+            "048000ffff",
+    );
+    var plaintext = [_]u8{0} ** 1162;
+    @memcpy(plaintext[0..crypto_frame.len], &crypto_frame);
+
+    var protected_payload: [1178]u8 = undefined;
+    const sealed = try secrets.client.sealPayload(2, &header, &plaintext, &protected_payload);
+    try testing.expectEqual(@as(usize, plaintext.len + packet_protection_tag_len), sealed.len);
+    try expectHex("d1b1c98dd7689fb8ec11d242b123dc9b", sealed[0..16]);
+
+    var opened: [1162]u8 = undefined;
+    const unsealed = try secrets.client.openPayload(2, &header, sealed, &opened);
+    try testing.expectEqualSlices(u8, &plaintext, unsealed);
+}
+
+test "Initial packet protection rejects invalid inputs" {
+    var dcid: [8]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&dcid, "8394c8f03e515708");
+    const secrets = try deriveInitialSecretsV1(&dcid);
+    const header = "test header";
+    const plaintext = "ping";
+
+    var too_small_seal: [plaintext.len + packet_protection_tag_len - 1]u8 = undefined;
+    try testing.expectError(error.OutputTooSmall, secrets.client.sealPayload(0, header, plaintext, &too_small_seal));
+
+    var protected_payload: [plaintext.len + packet_protection_tag_len]u8 = undefined;
+    const sealed = try secrets.client.sealPayload(0, header, plaintext, &protected_payload);
+
+    var too_small_open: [plaintext.len - 1]u8 = undefined;
+    try testing.expectError(error.OutputTooSmall, secrets.client.openPayload(0, header, sealed, &too_small_open));
+    try testing.expectError(error.ProtectedPayloadTooShort, secrets.client.openPayload(0, header, sealed[0 .. packet_protection_tag_len - 1], &too_small_open));
+
+    var opened: [plaintext.len]u8 = undefined;
+    try testing.expectError(error.AuthenticationFailed, secrets.server.openPayload(0, header, sealed, &opened));
+
+    var tampered = protected_payload;
+    tampered[0] ^= 0x01;
+    try testing.expectError(error.AuthenticationFailed, secrets.client.openPayload(0, header, &tampered, &opened));
 }
 
 test "Initial secrets reject invalid destination connection IDs" {

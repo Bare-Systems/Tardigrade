@@ -16,6 +16,9 @@ pub const max_packet_number: u64 = (1 << 62) - 1;
 /// who has acknowledged up to `largest_acked` can reconstruct it. Pass null for
 /// `largest_acked` when no packet has been acknowledged yet. (RFC 9000 §A.2)
 pub fn packetNumberLength(full_pn: u64, largest_acked: ?u64) u3 {
+    std.debug.assert(full_pn <= max_packet_number);
+    // A packet being sent always has a higher number than anything acked.
+    if (largest_acked) |acked| std.debug.assert(acked < full_pn);
     const num_unacked: u64 = if (largest_acked) |acked| full_pn - acked else full_pn + 1;
     // Need enough bits so the window (2 * num_unacked) is representable.
     const min_bits: usize = @as(usize, 64) - @clz(num_unacked * 2);
@@ -26,6 +29,8 @@ pub fn packetNumberLength(full_pn: u64, largest_acked: ?u64) u3 {
 /// The `pn_length` low-order bytes of `full_pn`, big-endian, as sent on the
 /// wire. `pn_length` is 1..4.
 pub fn truncatePacketNumber(full_pn: u64, pn_length: u3) u32 {
+    std.debug.assert(full_pn <= max_packet_number);
+    std.debug.assert(pn_length >= 1 and pn_length <= 4);
     const bits: u6 = @as(u6, pn_length) * 8;
     if (bits >= 32) return @truncate(full_pn);
     const mask: u64 = (@as(u64, 1) << bits) - 1;
@@ -36,6 +41,10 @@ pub fn truncatePacketNumber(full_pn: u64, pn_length: u3) u32 {
 /// packet number successfully processed in the same space and the number of
 /// bits that were sent. (RFC 9000 §A.3)
 pub fn decodePacketNumber(largest_pn: u64, truncated_pn: u64, pn_nbits: u6) u64 {
+    std.debug.assert(largest_pn <= max_packet_number);
+    // Packet numbers are sent as 1..4 bytes.
+    std.debug.assert(pn_nbits == 8 or pn_nbits == 16 or pn_nbits == 24 or pn_nbits == 32);
+    std.debug.assert(truncated_pn < (@as(u64, 1) << pn_nbits));
     const expected_pn = largest_pn + 1;
     const pn_win: u64 = @as(u64, 1) << pn_nbits;
     const pn_hwin = pn_win / 2;
@@ -68,12 +77,16 @@ test "truncate then reconstruct round-trips across a window" {
     }
 }
 
-test "packetNumberLength grows with the unacked distance" {
-    // Small gaps fit in one byte; larger gaps need more.
+test "packetNumberLength at exact RFC threshold boundaries" {
     try testing.expectEqual(@as(u3, 1), packetNumberLength(100, 99));
     try testing.expectEqual(@as(u3, 1), packetNumberLength(0, null));
-    try testing.expect(packetNumberLength(0x1_0000, 0) >= 3);
-    try testing.expect(packetNumberLength(0xFFFF_FFFF, 0) == 4);
+    // Boundaries where the required length steps up (largest_acked = 0).
+    try testing.expectEqual(@as(u3, 1), packetNumberLength(127, 0));
+    try testing.expectEqual(@as(u3, 2), packetNumberLength(128, 0));
+    try testing.expectEqual(@as(u3, 2), packetNumberLength(32767, 0));
+    try testing.expectEqual(@as(u3, 3), packetNumberLength(32768, 0));
+    try testing.expectEqual(@as(u3, 3), packetNumberLength(8388607, 0));
+    try testing.expectEqual(@as(u3, 4), packetNumberLength(8388608, 0));
 }
 
 test "truncatePacketNumber keeps the low-order bytes" {

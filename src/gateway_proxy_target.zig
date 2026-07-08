@@ -134,7 +134,7 @@ pub fn combineProxyTarget(allocator: std.mem.Allocator, target: []const u8, suff
     }
 
     if (right_trimmed.len == 0) {
-        return allocator.dupe(u8, left_trimmed);
+        return std.fmt.allocPrint(allocator, "{s}/", .{left_trimmed});
     }
 
     return std.fmt.allocPrint(allocator, "{s}/{s}", .{ left_trimmed, right_trimmed });
@@ -161,6 +161,13 @@ test "combineProxyTarget joins prefix and suffix" {
     const joined = try combineProxyTarget(allocator, "/api", "/api/messages");
     defer allocator.free(joined);
     try std.testing.expectEqualStrings("/api/api/messages", joined);
+}
+
+test "combineProxyTarget preserves root suffix" {
+    const allocator = std.testing.allocator;
+    const joined = try combineProxyTarget(allocator, "http://127.0.0.1:8080", "/");
+    defer allocator.free(joined);
+    try std.testing.expectEqualStrings("http://127.0.0.1:8080/", joined);
 }
 
 test "resolveProxyTarget handles absolute and relative proxy_pass" {

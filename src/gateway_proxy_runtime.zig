@@ -172,7 +172,7 @@ pub fn proxySuffixPathForLocation(
     if (mountStripPrefixForLocation(request_path, matched, blocks)) |strip_prefix| {
         if (std.mem.startsWith(u8, request_path, strip_prefix)) {
             const suffix = request_path[strip_prefix.len..];
-            return if (suffix.len == 0) null else suffix;
+            return if (suffix.len == 0) "/" else suffix;
         }
     }
     return matchedLocationSuffixPath(request_path, matched);
@@ -187,7 +187,7 @@ fn matchedLocationSuffixPath(
         .prefix, .prefix_priority => blk: {
             if (std.mem.startsWith(u8, request_path, matched.block.pattern)) {
                 const suffix = request_path[matched.block.pattern.len..];
-                break :blk if (suffix.len == 0) null else suffix;
+                break :blk if (suffix.len == 0) "/" else suffix;
             }
             break :blk request_path;
         },
@@ -850,6 +850,21 @@ test "proxySuffixPathForLocation keeps mount prefix for split upstream longer pr
     const matched = http.location_router.matchLocation("/ursa/download/file.bin", &blocks).?;
     const suffix = proxySuffixPathForLocation("/ursa/download/file.bin", matched, &blocks).?;
     try std.testing.expectEqualStrings("download/file.bin", suffix);
+}
+
+test "proxySuffixPathForLocation maps split upstream mount root to slash" {
+    const blocks = [_]edge_config.EdgeConfig.LocationBlock{
+        .{
+            .match_type = .prefix,
+            .pattern = "/ursa/",
+            .priority = 0,
+            .action = .{ .proxy_pass = "http://127.0.0.1:6707" },
+        },
+    };
+
+    const matched = http.location_router.matchLocation("/ursa/", &blocks).?;
+    const suffix = proxySuffixPathForLocation("/ursa/", matched, &blocks).?;
+    try std.testing.expectEqualStrings("/", suffix);
 }
 
 test "isHttpMethodIdempotent classifies idempotent methods" {

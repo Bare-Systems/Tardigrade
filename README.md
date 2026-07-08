@@ -251,6 +251,9 @@ zig build test-integration
 # Failure-mode / chaos suite (broken origins, aborting clients, reloads)
 zig build test-failure
 
+# Pure-Zig QUIC/HTTP-3 package tests (no system libraries)
+zig build test-quic
+
 # Allocation budget report
 zig build bench-allocations
 ```

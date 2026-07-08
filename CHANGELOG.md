@@ -5,6 +5,11 @@ All notable user-facing changes to Tardigrade are documented here.
 ## [Unreleased]
 
 ### Reliability
+- **Pure Zig QUIC Initial key derivation (#249)** — derives RFC 9001 QUIC v1
+  Initial client/server secrets and AES-128-GCM packet-protection/header-
+  protection material from the client Initial DCID, installs read/write Initial
+  secrets by endpoint perspective, and verifies the RFC sample vector in
+  `src/quic/tls_adapter.zig`.
 - **Pure Zig QUIC TLS adapter foundation (#249)** — defines the internal
   `QuicTlsAdapter` boundary for QUIC transport parameters, ALPN, certificate
   state, per-level traffic secrets, and raw TLS handshake I/O without leaking

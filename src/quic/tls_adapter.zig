@@ -15,10 +15,26 @@
 const std = @import("std");
 const config = @import("config.zig");
 
+const crypto = std.crypto;
+const tls = std.crypto.tls;
+const HkdfSha256 = crypto.kdf.hkdf.HkdfSha256;
+const Aes128Gcm = crypto.aead.aes_gcm.Aes128Gcm;
+const Aes128 = crypto.core.aes.Aes128;
+
 pub const max_crypto_buffer = 64 * 1024;
 pub const max_crypto_ranges = 32;
 pub const max_handshake_record = 16 * 1024;
 pub const max_secret_len = 64;
+pub const min_initial_dcid_len = 8;
+pub const max_connection_id_len = 20;
+pub const initial_salt_v1 = [_]u8{
+    0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x17,
+    0x9a, 0xe6, 0xa4, 0xc8, 0x0c, 0xad, 0xcc, 0xbb, 0x7f, 0x0a,
+};
+pub const initial_secret_len = HkdfSha256.prk_length;
+pub const initial_key_len = Aes128Gcm.key_length;
+pub const initial_iv_len = Aes128Gcm.nonce_length;
+pub const header_protection_key_len = Aes128Gcm.key_length;
 
 pub const EncryptionLevel = enum(u2) {
     initial,
@@ -55,6 +71,11 @@ pub const PacketNumberSpace = enum {
 pub const Direction = enum {
     read,
     write,
+};
+
+pub const Perspective = enum {
+    client,
+    server,
 };
 
 pub const CertificateState = enum {
@@ -123,6 +144,64 @@ pub const SecretStore = struct {
         secret.len = 0;
     }
 };
+
+// TODO(#249): Handshake and Application packet protection must be derived from
+// TLS-exported traffic secrets, not from QUIC v1 Initial salt/DCID material.
+pub const InitialPacketProtectionKeys = struct {
+    secret: [initial_secret_len]u8,
+    key: [initial_key_len]u8,
+    iv: [initial_iv_len]u8,
+    hp: [header_protection_key_len]u8,
+
+    pub fn nonce(self: *const InitialPacketProtectionKeys, packet_number: u64) [initial_iv_len]u8 {
+        std.debug.assert(packet_number <= ((@as(u64, 1) << 62) - 1));
+
+        var out = self.iv;
+        var packet_number_bytes: [8]u8 = undefined;
+        std.mem.writeInt(u64, &packet_number_bytes, packet_number, .big);
+        for (packet_number_bytes, 0..) |byte, index| {
+            out[initial_iv_len - packet_number_bytes.len + index] ^= byte;
+        }
+        return out;
+    }
+
+    pub fn headerProtectionMask(self: *const InitialPacketProtectionKeys, sample: [16]u8) [5]u8 {
+        const aes = Aes128.initEnc(self.hp);
+        var block: [16]u8 = undefined;
+        aes.encrypt(&block, &sample);
+        return block[0..5].*;
+    }
+};
+
+pub const InitialSecrets = struct {
+    initial_secret: [initial_secret_len]u8,
+    client: InitialPacketProtectionKeys,
+    server: InitialPacketProtectionKeys,
+};
+
+pub fn deriveInitialSecretsV1(client_initial_dcid: []const u8) error{InvalidConnectionId}!InitialSecrets {
+    if (client_initial_dcid.len < min_initial_dcid_len or client_initial_dcid.len > max_connection_id_len) {
+        return error.InvalidConnectionId;
+    }
+
+    const initial_secret = HkdfSha256.extract(&initial_salt_v1, client_initial_dcid);
+    const client_secret = tls.hkdfExpandLabel(HkdfSha256, initial_secret, "client in", "", initial_secret_len);
+    const server_secret = tls.hkdfExpandLabel(HkdfSha256, initial_secret, "server in", "", initial_secret_len);
+    return .{
+        .initial_secret = initial_secret,
+        .client = deriveInitialAes128GcmKeys(client_secret),
+        .server = deriveInitialAes128GcmKeys(server_secret),
+    };
+}
+
+pub fn deriveInitialAes128GcmKeys(secret: [initial_secret_len]u8) InitialPacketProtectionKeys {
+    return .{
+        .secret = secret,
+        .key = tls.hkdfExpandLabel(HkdfSha256, secret, "quic key", "", initial_key_len),
+        .iv = tls.hkdfExpandLabel(HkdfSha256, secret, "quic iv", "", initial_iv_len),
+        .hp = tls.hkdfExpandLabel(HkdfSha256, secret, "quic hp", "", header_protection_key_len),
+    };
+}
 
 pub const ByteRange = struct {
     start: u64,
@@ -351,6 +430,27 @@ pub const QuicTlsAdapter = struct {
         return self.secrets.get(level, direction);
     }
 
+    pub fn installInitialSecrets(self: *QuicTlsAdapter, perspective: Perspective, client_initial_dcid: []const u8) error{ InvalidConnectionId, SecretTooLarge }!InitialSecrets {
+        const secrets = try deriveInitialSecretsV1(client_initial_dcid);
+        switch (perspective) {
+            .client => {
+                self.installSecret(try Secret.init(.initial, .write, &secrets.client.secret));
+                self.installSecret(try Secret.init(.initial, .read, &secrets.server.secret));
+            },
+            .server => {
+                self.installSecret(try Secret.init(.initial, .read, &secrets.client.secret));
+                self.installSecret(try Secret.init(.initial, .write, &secrets.server.secret));
+            },
+        }
+        return secrets;
+    }
+
+    pub fn initialProtectionKeys(self: *const QuicTlsAdapter, direction: Direction) ?InitialPacketProtectionKeys {
+        const installed_secret = self.secret(.initial, direction) orelse return null;
+        if (installed_secret.len != initial_secret_len) return null;
+        return deriveInitialAes128GcmKeys(installed_secret.bytes[0..initial_secret_len].*);
+    }
+
     pub fn discardSecrets(self: *QuicTlsAdapter, level: EncryptionLevel) void {
         self.secrets.discard(level);
     }
@@ -362,11 +462,76 @@ pub const QuicTlsAdapter = struct {
 
 const testing = std.testing;
 
+fn expectHex(comptime hex: []const u8, actual: []const u8) !void {
+    var expected: [hex.len / 2]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&expected, hex);
+    try testing.expectEqualSlices(u8, &expected, actual);
+}
+
 test "encryption levels map to QUIC packet number spaces" {
     try testing.expectEqual(PacketNumberSpace.initial, EncryptionLevel.initial.packetNumberSpace());
     try testing.expectEqual(PacketNumberSpace.handshake, EncryptionLevel.handshake.packetNumberSpace());
     try testing.expectEqual(PacketNumberSpace.application, EncryptionLevel.zero_rtt.packetNumberSpace());
     try testing.expectEqual(PacketNumberSpace.application, EncryptionLevel.application.packetNumberSpace());
+}
+
+test "QUIC v1 Initial secrets match RFC 9001 sample vector" {
+    var dcid: [8]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&dcid, "8394c8f03e515708");
+
+    const secrets = try deriveInitialSecretsV1(&dcid);
+    try expectHex("7db5df06e7a69e432496adedb00851923595221596ae2ae9fb8115c1e9ed0a44", &secrets.initial_secret);
+    try expectHex("c00cf151ca5be075ed0ebfb5c80323c42d6b7db67881289af4008f1f6c357aea", &secrets.client.secret);
+    try expectHex("1f369613dd76d5467730efcbe3b1a22d", &secrets.client.key);
+    try expectHex("fa044b2f42a3fd3b46fb255c", &secrets.client.iv);
+    try expectHex("9f50449e04a0e810283a1e9933adedd2", &secrets.client.hp);
+    try expectHex("3c199828fd139efd216c155ad844cc81fb82fa8d7446fa7d78be803acdda951b", &secrets.server.secret);
+    try expectHex("cf3a5331653c364c88f0f379b6067e37", &secrets.server.key);
+    try expectHex("0ac1493ca1905853b0bba03e", &secrets.server.iv);
+    try expectHex("c206b8d9b9f0f37644430b490eeaa314", &secrets.server.hp);
+}
+
+test "Initial packet protection derives nonce and header protection mask" {
+    var dcid: [8]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&dcid, "8394c8f03e515708");
+    const secrets = try deriveInitialSecretsV1(&dcid);
+
+    try expectHex("fa044b2f42a3fd3b46fb255e", &secrets.client.nonce(2));
+
+    var sample: [16]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&sample, "d1b1c98dd7689fb8ec11d242b123dc9b");
+    try expectHex("437b9aec36", &secrets.client.headerProtectionMask(sample));
+}
+
+test "Initial secrets reject invalid destination connection IDs" {
+    try testing.expectError(error.InvalidConnectionId, deriveInitialSecretsV1(""));
+    const too_short = [_]u8{0xaa} ** (min_initial_dcid_len - 1);
+    try testing.expectError(error.InvalidConnectionId, deriveInitialSecretsV1(&too_short));
+
+    const min_len = [_]u8{0xbb} ** min_initial_dcid_len;
+    _ = try deriveInitialSecretsV1(&min_len);
+
+    const too_long = [_]u8{0xaa} ** (max_connection_id_len + 1);
+    try testing.expectError(error.InvalidConnectionId, deriveInitialSecretsV1(&too_long));
+}
+
+test "adapter installs Initial secrets by endpoint perspective" {
+    var dcid: [8]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&dcid, "8394c8f03e515708");
+
+    var client = QuicTlsAdapter{};
+    const client_secrets = try client.installInitialSecrets(.client, &dcid);
+    try testing.expectEqualSlices(u8, &client_secrets.client.secret, client.secret(.initial, .write).?.slice());
+    try testing.expectEqualSlices(u8, &client_secrets.server.secret, client.secret(.initial, .read).?.slice());
+    const client_write_keys = client.initialProtectionKeys(.write).?;
+    try testing.expectEqualSlices(u8, &client_secrets.client.key, &client_write_keys.key);
+
+    var server = QuicTlsAdapter{};
+    const server_secrets = try server.installInitialSecrets(.server, &dcid);
+    try testing.expectEqualSlices(u8, &server_secrets.client.secret, server.secret(.initial, .read).?.slice());
+    try testing.expectEqualSlices(u8, &server_secrets.server.secret, server.secret(.initial, .write).?.slice());
+    const server_write_keys = server.initialProtectionKeys(.write).?;
+    try testing.expectEqualSlices(u8, &server_secrets.server.hp, &server_write_keys.hp);
 }
 
 test "CRYPTO reassembly emits only contiguous bytes by encryption level" {

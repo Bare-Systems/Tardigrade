@@ -97,10 +97,10 @@ jobs:
         include:
           - os: ubuntu-latest
             archive_name: tardigrade-linux-x86_64
-            zig_target: x86_64-linux-gnu.2.35
+            zig_target: x86_64-linux-gnu
           - os: ubuntu-24.04-arm
             archive_name: tardigrade-linux-aarch64
-            zig_target: aarch64-linux-gnu.2.35
+            zig_target: aarch64-linux-gnu
 
     steps:
       - name: Checkout

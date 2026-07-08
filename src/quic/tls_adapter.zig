@@ -8,9 +8,10 @@
 //! library type escapes this module. Initial-secret derivation and key updates
 //! also live here.
 //!
-//! Status: foundation slice — adapter contract and CRYPTO reassembly are in
-//! place. Backend TLS driving, packet/header protection, and key updates land
-//! in later #249 slices.
+//! Status: foundation slice — adapter contract, CRYPTO reassembly, and AEAD
+//! packet protection for every encryption level (Initial, Handshake, 1-RTT) are
+//! in place for the TLS_AES_128_GCM_SHA256 suite. Backend TLS driving, further
+//! cipher suites, and key updates land in later #249 slices.
 
 const std = @import("std");
 const config = @import("config.zig");
@@ -31,9 +32,11 @@ pub const initial_salt_v1 = [_]u8{
     0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x17,
     0x9a, 0xe6, 0xa4, 0xc8, 0x0c, 0xad, 0xcc, 0xbb, 0x7f, 0x0a,
 };
-pub const initial_secret_len = HkdfSha256.prk_length;
-pub const initial_key_len = Aes128Gcm.key_length;
-pub const initial_iv_len = Aes128Gcm.nonce_length;
+/// Length of a TLS-exported traffic secret for the SHA-256 based suite. QUIC
+/// uses the same length for Initial, Handshake, and 1-RTT secrets.
+pub const traffic_secret_len = HkdfSha256.prk_length;
+pub const aead_key_len = Aes128Gcm.key_length;
+pub const aead_iv_len = Aes128Gcm.nonce_length;
 pub const header_protection_key_len = Aes128Gcm.key_length;
 pub const packet_protection_tag_len = Aes128Gcm.tag_length;
 pub const max_packet_number: u64 = (@as(u64, 1) << 62) - 1;
@@ -147,28 +150,31 @@ pub const SecretStore = struct {
     }
 };
 
-// TODO(#249): Handshake and Application packet protection must be derived from
-// TLS-exported traffic secrets, not from QUIC v1 Initial salt/DCID material.
-pub const InitialPacketProtectionKeys = struct {
-    secret: [initial_secret_len]u8,
-    key: [initial_key_len]u8,
-    iv: [initial_iv_len]u8,
+/// AEAD packet-protection material for one encryption level and direction under
+/// the TLS_AES_128_GCM_SHA256 suite (RFC 9001 §5.1). Initial keys are derived
+/// from the QUIC v1 salt and client DCID; Handshake and 1-RTT keys are derived
+/// from the traffic secrets TLS exports at each level. The derivation is
+/// identical for every level, so the same type serves all of them.
+pub const PacketProtectionKeys = struct {
+    secret: [traffic_secret_len]u8,
+    key: [aead_key_len]u8,
+    iv: [aead_iv_len]u8,
     hp: [header_protection_key_len]u8,
 
-    pub fn nonce(self: *const InitialPacketProtectionKeys, packet_number: u64) [initial_iv_len]u8 {
+    pub fn nonce(self: *const PacketProtectionKeys, packet_number: u64) [aead_iv_len]u8 {
         std.debug.assert(packet_number <= max_packet_number);
 
         var out = self.iv;
         var packet_number_bytes: [8]u8 = undefined;
         std.mem.writeInt(u64, &packet_number_bytes, packet_number, .big);
         for (packet_number_bytes, 0..) |byte, index| {
-            out[initial_iv_len - packet_number_bytes.len + index] ^= byte;
+            out[aead_iv_len - packet_number_bytes.len + index] ^= byte;
         }
         return out;
     }
 
     pub fn sealPayload(
-        self: *const InitialPacketProtectionKeys,
+        self: *const PacketProtectionKeys,
         packet_number: u64,
         header: []const u8,
         plaintext: []const u8,
@@ -193,7 +199,7 @@ pub const InitialPacketProtectionKeys = struct {
     }
 
     pub fn openPayload(
-        self: *const InitialPacketProtectionKeys,
+        self: *const PacketProtectionKeys,
         packet_number: u64,
         header: []const u8,
         protected_payload: []const u8,
@@ -217,7 +223,7 @@ pub const InitialPacketProtectionKeys = struct {
         return out[0..ciphertext_len];
     }
 
-    pub fn headerProtectionMask(self: *const InitialPacketProtectionKeys, sample: [16]u8) [5]u8 {
+    pub fn headerProtectionMask(self: *const PacketProtectionKeys, sample: [16]u8) [5]u8 {
         const aes = Aes128.initEnc(self.hp);
         var block: [16]u8 = undefined;
         aes.encrypt(&block, &sample);
@@ -230,9 +236,9 @@ fn validatePacketNumber(packet_number: u64) error{InvalidPacketNumber}!void {
 }
 
 pub const InitialSecrets = struct {
-    initial_secret: [initial_secret_len]u8,
-    client: InitialPacketProtectionKeys,
-    server: InitialPacketProtectionKeys,
+    initial_secret: [traffic_secret_len]u8,
+    client: PacketProtectionKeys,
+    server: PacketProtectionKeys,
 };
 
 pub fn deriveInitialSecretsV1(client_initial_dcid: []const u8) error{InvalidConnectionId}!InitialSecrets {
@@ -241,20 +247,25 @@ pub fn deriveInitialSecretsV1(client_initial_dcid: []const u8) error{InvalidConn
     }
 
     const initial_secret = HkdfSha256.extract(&initial_salt_v1, client_initial_dcid);
-    const client_secret = tls.hkdfExpandLabel(HkdfSha256, initial_secret, "client in", "", initial_secret_len);
-    const server_secret = tls.hkdfExpandLabel(HkdfSha256, initial_secret, "server in", "", initial_secret_len);
+    const client_secret = tls.hkdfExpandLabel(HkdfSha256, initial_secret, "client in", "", traffic_secret_len);
+    const server_secret = tls.hkdfExpandLabel(HkdfSha256, initial_secret, "server in", "", traffic_secret_len);
     return .{
         .initial_secret = initial_secret,
-        .client = deriveInitialAes128GcmKeys(client_secret),
-        .server = deriveInitialAes128GcmKeys(server_secret),
+        .client = deriveAes128GcmKeys(client_secret),
+        .server = deriveAes128GcmKeys(server_secret),
     };
 }
 
-pub fn deriveInitialAes128GcmKeys(secret: [initial_secret_len]u8) InitialPacketProtectionKeys {
+/// Derive AEAD packet-protection keys for the TLS_AES_128_GCM_SHA256 suite from
+/// a traffic `secret`, per RFC 9001 §5.1. The `secret` is the Initial secret for
+/// Initial packets, or the TLS-exported Handshake / 1-RTT traffic secret for the
+/// respective levels; the "quic key" / "quic iv" / "quic hp" derivation is the
+/// same regardless of level.
+pub fn deriveAes128GcmKeys(secret: [traffic_secret_len]u8) PacketProtectionKeys {
     return .{
         .secret = secret,
-        .key = tls.hkdfExpandLabel(HkdfSha256, secret, "quic key", "", initial_key_len),
-        .iv = tls.hkdfExpandLabel(HkdfSha256, secret, "quic iv", "", initial_iv_len),
+        .key = tls.hkdfExpandLabel(HkdfSha256, secret, "quic key", "", aead_key_len),
+        .iv = tls.hkdfExpandLabel(HkdfSha256, secret, "quic iv", "", aead_iv_len),
         .hp = tls.hkdfExpandLabel(HkdfSha256, secret, "quic hp", "", header_protection_key_len),
     };
 }
@@ -501,10 +512,16 @@ pub const QuicTlsAdapter = struct {
         return secrets;
     }
 
-    pub fn initialProtectionKeys(self: *const QuicTlsAdapter, direction: Direction) ?InitialPacketProtectionKeys {
-        const installed_secret = self.secret(.initial, direction) orelse return null;
-        if (installed_secret.len != initial_secret_len) return null;
-        return deriveInitialAes128GcmKeys(installed_secret.bytes[0..initial_secret_len].*);
+    /// Derive AEAD packet-protection keys for `level` in `direction` from the
+    /// installed traffic secret. Works for Initial, Handshake, and 1-RTT
+    /// (`.application`) once the corresponding secret has been installed —
+    /// Initial via `installInitialSecrets`, later levels via `installSecret`
+    /// with the TLS-exported traffic secret. Returns null when no secret is
+    /// installed or its length does not match the SHA-256 suite.
+    pub fn protectionKeys(self: *const QuicTlsAdapter, level: EncryptionLevel, direction: Direction) ?PacketProtectionKeys {
+        const installed_secret = self.secret(level, direction) orelse return null;
+        if (installed_secret.len != traffic_secret_len) return null;
+        return deriveAes128GcmKeys(installed_secret.bytes[0..traffic_secret_len].*);
     }
 
     pub fn discardSecrets(self: *QuicTlsAdapter, level: EncryptionLevel) void {
@@ -691,15 +708,77 @@ test "adapter installs Initial secrets by endpoint perspective" {
     const client_secrets = try client.installInitialSecrets(.client, &dcid);
     try testing.expectEqualSlices(u8, &client_secrets.client.secret, client.secret(.initial, .write).?.slice());
     try testing.expectEqualSlices(u8, &client_secrets.server.secret, client.secret(.initial, .read).?.slice());
-    const client_write_keys = client.initialProtectionKeys(.write).?;
+    const client_write_keys = client.protectionKeys(.initial, .write).?;
     try testing.expectEqualSlices(u8, &client_secrets.client.key, &client_write_keys.key);
 
     var server = QuicTlsAdapter{};
     const server_secrets = try server.installInitialSecrets(.server, &dcid);
     try testing.expectEqualSlices(u8, &server_secrets.client.secret, server.secret(.initial, .read).?.slice());
     try testing.expectEqualSlices(u8, &server_secrets.server.secret, server.secret(.initial, .write).?.slice());
-    const server_write_keys = server.initialProtectionKeys(.write).?;
+    const server_write_keys = server.protectionKeys(.initial, .write).?;
     try testing.expectEqualSlices(u8, &server_secrets.server.hp, &server_write_keys.hp);
+}
+
+test "adapter derives Handshake and 1-RTT protection keys from installed traffic secrets" {
+    var adapter = QuicTlsAdapter{};
+
+    // No secret installed yet: every non-Initial level reports no keys.
+    try testing.expectEqual(@as(?PacketProtectionKeys, null), adapter.protectionKeys(.handshake, .write));
+    try testing.expectEqual(@as(?PacketProtectionKeys, null), adapter.protectionKeys(.application, .read));
+
+    var hs_secret: [traffic_secret_len]u8 = undefined;
+    for (&hs_secret, 0..) |*byte, i| byte.* = @intCast((i * 7 + 3) & 0xff);
+    var app_secret: [traffic_secret_len]u8 = undefined;
+    for (&app_secret, 0..) |*byte, i| byte.* = @intCast((i * 5 + 1) & 0xff);
+
+    adapter.installSecret(try Secret.init(.handshake, .write, &hs_secret));
+    adapter.installSecret(try Secret.init(.application, .read, &app_secret));
+
+    // The adapter path matches the standalone derivation for the same suite.
+    const hs_keys = adapter.protectionKeys(.handshake, .write).?;
+    const expected_hs = deriveAes128GcmKeys(hs_secret);
+    try testing.expectEqualSlices(u8, &expected_hs.key, &hs_keys.key);
+    try testing.expectEqualSlices(u8, &expected_hs.iv, &hs_keys.iv);
+    try testing.expectEqualSlices(u8, &expected_hs.hp, &hs_keys.hp);
+
+    const app_keys = adapter.protectionKeys(.application, .read).?;
+    try testing.expectEqualSlices(u8, &deriveAes128GcmKeys(app_secret).key, &app_keys.key);
+
+    // Direction is honored: the untouched direction stays empty.
+    try testing.expectEqual(@as(?PacketProtectionKeys, null), adapter.protectionKeys(.handshake, .read));
+    try testing.expectEqual(@as(?PacketProtectionKeys, null), adapter.protectionKeys(.application, .write));
+}
+
+test "packet protection round-trips at Handshake and 1-RTT levels" {
+    var adapter = QuicTlsAdapter{};
+    const secret = hexBytes("0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20");
+    adapter.installSecret(try Secret.init(.handshake, .write, &secret));
+    adapter.installSecret(try Secret.init(.application, .write, &secret));
+
+    const header = "\xe0\x00\x00\x00\x01";
+    const plaintext = "handshake and 1-rtt payloads use the same AEAD path";
+
+    for ([_]EncryptionLevel{ .handshake, .application }) |level| {
+        const keys = adapter.protectionKeys(level, .write).?;
+
+        var sealed: [128]u8 = undefined;
+        const protected = try keys.sealPayload(7, header, plaintext, &sealed);
+        try testing.expectEqual(plaintext.len + packet_protection_tag_len, protected.len);
+
+        var opened: [128]u8 = undefined;
+        const recovered = try keys.openPayload(7, header, protected, &opened);
+        try testing.expectEqualSlices(u8, plaintext, recovered);
+
+        // A different packet number changes the nonce and fails authentication.
+        try testing.expectError(error.AuthenticationFailed, keys.openPayload(8, header, protected, &opened));
+    }
+}
+
+test "protection keys reject a traffic secret of the wrong length" {
+    var adapter = QuicTlsAdapter{};
+    const short_secret = [_]u8{0xab} ** (traffic_secret_len - 1);
+    adapter.installSecret(try Secret.init(.application, .write, &short_secret));
+    try testing.expectEqual(@as(?PacketProtectionKeys, null), adapter.protectionKeys(.application, .write));
 }
 
 test "CRYPTO reassembly emits only contiguous bytes by encryption level" {

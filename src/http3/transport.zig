@@ -50,3 +50,37 @@ pub const Http3Transport = struct {
 test {
     std.testing.refAllDecls(@This());
 }
+
+test "Http3Transport dispatches lifecycle through the vtable" {
+    const Fake = struct {
+        started: bool = false,
+        stopped: bool = false,
+        deinitialized: bool = false,
+
+        fn start(ctx: *anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.started = true;
+        }
+        fn stop(ctx: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.stopped = true;
+        }
+        fn deinit(ctx: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.deinitialized = true;
+        }
+    };
+
+    var fake = Fake{};
+    const vt = Http3Transport.VTable{ .start = Fake.start, .stop = Fake.stop, .deinit = Fake.deinit };
+    const transport = Http3Transport{ .ptr = &fake, .vtable = &vt };
+    try transport.start();
+    transport.stop();
+    transport.deinit();
+    try std.testing.expect(fake.started and fake.stopped and fake.deinitialized);
+}
+
+test "Http3Transport.Exchange is the shared stream-transport Exchange" {
+    // Lock the boundary so #243/#246 build on the shared contract, not a copy.
+    try std.testing.expect(Exchange == stream_transport.Exchange);
+}

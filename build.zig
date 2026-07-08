@@ -171,7 +171,6 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/quic/root.zig"),
         .target = target,
         .optimize = optimize,
-        .link_libc = true,
     });
     const quic_tests = b.addTest(.{ .root_module = quic_mod });
     const run_quic_tests = b.addRunArtifact(quic_tests);
@@ -184,7 +183,6 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/http3/root.zig"),
         .target = target,
         .optimize = optimize,
-        .link_libc = true,
     });
     http3_mod.addImport("stream_transport", b.createModule(.{
         .root_source_file = b.path("src/http/stream_transport.zig"),

@@ -7,12 +7,20 @@ pub fn build(b: *std.Build) void {
     const require_static_system_libs = b.option(bool, "require-static-system-libs", "Require static linking for system libraries") orelse false;
     const static_executable = b.option(bool, "static-executable", "Build the tardigrade executable as a static binary") orelse false;
     const enable_http3_ngtcp2 = b.option(bool, "enable-http3-ngtcp2", "Enable experimental HTTP/3 ngtcp2/nghttp3 system-library integration (requires system libraries)") orelse false;
+    // Pure-Zig QUIC/HTTP-3 path (#240). Off by default and in active development;
+    // needs no system libraries. Mutually exclusive with the ngtcp2 backend —
+    // both would provide HTTP/3.
+    const enable_http3_zig = b.option(bool, "enable-http3-zig", "Enable the experimental pure-Zig QUIC/HTTP-3 path (no system libraries; off by default, in development)") orelse false;
+    if (enable_http3_ngtcp2 and enable_http3_zig) {
+        std.debug.panic("Enable at most one HTTP/3 backend: -Denable-http3-ngtcp2 (C libraries) or -Denable-http3-zig (pure Zig), not both.", .{});
+    }
     const app_version = b.option([]const u8, "version", "Version string embedded in the tardigrade binary") orelse "dev";
     const osslclient_default_path = "/tmp/ngtcp2-upstream/build/examples/osslclient";
     const http3_osslclient_path = b.option([]const u8, "http3-osslclient-path", "Path to the ngtcp2 OpenSSL HTTP/3 example client used by 0-RTT integration tests") orelse if (pathExists(osslclient_default_path)) osslclient_default_path else "";
 
     const build_options = b.addOptions();
     build_options.addOption(bool, "enable_http3_ngtcp2", enable_http3_ngtcp2);
+    build_options.addOption(bool, "enable_http3_zig", enable_http3_zig);
     build_options.addOption([]const u8, "version", app_version);
     const compat_mod = b.createModule(.{
         .root_source_file = b.path("src/zig_compat.zig"),
@@ -156,6 +164,21 @@ pub fn build(b: *std.Build) void {
     const run_security_corpus_tests = b.addRunArtifact(security_corpus_tests);
     const security_corpus_step = b.step("test-security-corpus", "Run request parser corpus regression tests");
     security_corpus_step.dependOn(&run_security_corpus_tests.step);
+
+    // Pure-Zig QUIC/HTTP-3 package (#240): a first-class test target rather than
+    // only being compiled transitively through the exe. No system libraries.
+    const quic_mod = b.createModule(.{
+        .root_source_file = b.path("src/quic/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    const quic_tests = b.addTest(.{ .root_module = quic_mod });
+    const run_quic_tests = b.addRunArtifact(quic_tests);
+    const quic_step = b.step("test-quic", "Run pure-Zig QUIC/HTTP-3 unit tests");
+    quic_step.dependOn(&run_quic_tests.step);
+    // Also exercise them under the default `zig build test`.
+    test_step.dependOn(&run_quic_tests.step);
 }
 
 fn pathExists(path: []const u8) bool {

@@ -33,6 +33,10 @@ zig build test-integration
 # exercises broken origins and clients (see "Failure-mode harness" below).
 zig build test-failure
 
+# Pure-Zig QUIC/HTTP-3 package unit tests (no system libraries). Also run under
+# `zig build test`.
+zig build test-quic
+
 # Release-mode build
 zig build -Doptimize=ReleaseFast
 ```
@@ -76,7 +80,8 @@ filter, e.g. `zig build test-integration -- --test-filter "failure: client abort
 | `-Dstatic-executable=true` | `false` | Fully static binary |
 | `-Dprefer-static-system-libs=true` | `false` | Prefer static OpenSSL/crypto |
 | `-Drequire-static-system-libs=true` | `false` | Fail if static libs are unavailable |
-| `-Denable-http3-ngtcp2=true` | `false` | Enable experimental HTTP/3 ngtcp2/nghttp3 system-library integration; requires the ngtcp2/nghttp3/ngtcp2_crypto_ossl system libraries |
+| `-Denable-http3-ngtcp2=true` | `false` | Enable experimental C-backed HTTP/3 via ngtcp2/nghttp3 system-library integration; requires the ngtcp2/nghttp3/ngtcp2_crypto_ossl system libraries |
+| `-Denable-http3-zig=true` | `false` | Enable the experimental pure-Zig QUIC/HTTP-3 path (no system libraries; in development). Mutually exclusive with `-Denable-http3-ngtcp2` |
 | `-Dversion=x.y.z` | `dev` | Embed a version string in the binary |
 | `-Dhttp3-osslclient-path=<path>` | auto-detect | Path to osslclient for 0-RTT tests |
 
@@ -102,9 +107,21 @@ zig build test -- --test-filter "jwt"
 zig build test -- --test-timeout-ns 10000000000
 ```
 
-HTTP/3-enabled validation is currently a manual/local build step rather than a
-required CI job because the Ubuntu runner image does not consistently provide
-the `ngtcp2` OpenSSL backend development package.
+### HTTP/3 backends
+
+The **default build ships no HTTP/3** and needs no HTTP/3 system libraries — a
+clean checkout builds consistently anywhere. Two mutually-exclusive backends can
+be opted into:
+
+- `-Denable-http3-ngtcp2` — the C-backed path; requires the ngtcp2/nghttp3
+  system libraries. Validation is a manual/local build step rather than a
+  required CI job because the Ubuntu runner image does not consistently provide
+  the `ngtcp2` OpenSSL backend development package.
+- `-Denable-http3-zig` — the pure-Zig QUIC/HTTP-3 path (#240); no system
+  libraries, in active development. Its package is unit-tested via
+  `zig build test-quic`.
+
+Enabling both fails the build with an actionable message.
 
 ## Formatting
 

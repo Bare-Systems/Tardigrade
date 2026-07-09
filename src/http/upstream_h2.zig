@@ -81,10 +81,14 @@ pub const Request = struct {
     /// headers (and Host) are dropped before sending.
     headers: []const std.http.Header = &.{},
     body: []const u8 = "",
-    /// Whether this request's outbound body is complete after `body`.
-    /// Streaming uploads set this false, write more DATA incrementally, then
-    /// finish with a final DATA frame carrying END_STREAM.
-    end_stream: bool = true,
+    /// Whether `body` is the complete outbound request body or the first bytes
+    /// of a request body that will continue through streaming DATA writes.
+    body_mode: BodyMode = .complete,
+};
+
+pub const BodyMode = enum {
+    complete,
+    streaming,
 };
 
 pub const Response = struct {
@@ -716,9 +720,12 @@ pub fn H2Conn(comptime Transport: type) type {
                 return;
             }
             if (!end_stream) return;
+            try self.ensureStreamWritable(stream);
+            var write_result: anyerror!void = {};
             self.write_mutex.lock();
-            defer self.write_mutex.unlock();
-            try frame.writeFrame(self.transport, .data, frame.Flags.END_STREAM, stream.id, &[_]u8{});
+            write_result = frame.writeFrame(self.transport, .data, frame.Flags.END_STREAM, stream.id, &[_]u8{});
+            self.write_mutex.unlock();
+            if (write_result) |_| {} else |err| return self.markWriteFailure(err);
         }
 
         /// Copy the next chunk of a streaming response body into `out`,
@@ -845,20 +852,20 @@ pub fn H2Conn(comptime Transport: type) type {
             const block = try hpack.encodeLiteralHeaderBlock(self.allocator, fields.items);
             defer self.allocator.free(block);
 
-            const end_stream = req.end_stream and req.body.len == 0;
+            const request_body_complete = req.body_mode == .complete;
+            const end_stream = request_body_complete and req.body.len == 0;
             // HEADERS (+CONTINUATION) must be contiguous on the wire, so the
             // whole block goes out under one write_mutex hold. DATA frames may
             // interleave with other streams, so the body sender takes the lock
             // per frame — and, crucially, never holds it while waiting on
             // state_mutex for flow-control window (the reader needs write_mutex
             // for PING/SETTINGS acks; holding both would deadlock it).
-            {
-                self.write_mutex.lock();
-                defer self.write_mutex.unlock();
-                try self.writeHeaderBlockLocked(stream.id, block, end_stream);
-            }
+            self.write_mutex.lock();
+            const write_result = self.writeHeaderBlockLocked(stream.id, block, end_stream);
+            self.write_mutex.unlock();
+            if (write_result) |_| {} else |err| return self.markWriteFailure(err);
             stream.wire_opened = true;
-            if (req.body.len > 0) try self.sendBody(stream, req.body, req.end_stream);
+            if (req.body.len > 0) try self.sendBody(stream, req.body, request_body_complete);
         }
 
         /// Write a header block as HEADERS (+CONTINUATION) frames. Caller holds
@@ -895,13 +902,24 @@ pub fn H2Conn(comptime Transport: type) type {
                 const budget = try self.reserveSendWindow(stream, full_body.len - off);
                 const is_last = end_stream and (off + budget) == full_body.len;
                 const flags: u8 = if (is_last) frame.Flags.END_STREAM else 0;
-                {
-                    self.write_mutex.lock();
-                    defer self.write_mutex.unlock();
-                    try frame.writeFrame(self.transport, .data, flags, stream.id, full_body[off .. off + budget]);
-                }
+                self.write_mutex.lock();
+                const write_result = frame.writeFrame(self.transport, .data, flags, stream.id, full_body[off .. off + budget]);
+                self.write_mutex.unlock();
+                if (write_result) |_| {} else |err| return self.markWriteFailure(err);
                 off += budget;
             }
+        }
+
+        fn ensureStreamWritable(self: *Self, stream: *Stream) !void {
+            self.state_mutex.lock();
+            defer self.state_mutex.unlock();
+            if (self.conn_err) |e| return e;
+            if (stream.err) |e| return e;
+        }
+
+        fn markWriteFailure(self: *Self, err: anyerror) anyerror {
+            self.failConnection(err);
+            return err;
         }
 
         /// Reserve up to `want` bytes of send window (connection + stream),
@@ -1734,6 +1752,43 @@ const PlainTransport = struct {
     }
 };
 
+const FailingDataTransport = struct {
+    fd: std.posix.fd_t,
+    fail_next_data_payload: bool = false,
+
+    pub fn read(self: *FailingDataTransport, buf: []u8) !usize {
+        return std.posix.read(self.fd, buf) catch error.ReadFailed;
+    }
+
+    pub fn writeAll(self: *FailingDataTransport, data: []const u8) !void {
+        if (self.fail_next_data_payload) {
+            self.fail_next_data_payload = false;
+            return error.WriteFailed;
+        }
+        if (data.len == frame.HEADER_LEN and data[3] == @intFromEnum(frame.Type.data)) {
+            self.fail_next_data_payload = true;
+        }
+        var off: usize = 0;
+        while (off < data.len) {
+            const n = std.c.write(self.fd, data.ptr + off, data.len - off);
+            if (n < 0) {
+                if (std.posix.errno(n) == .INTR) continue;
+                return error.WriteFailed;
+            }
+            if (n == 0) return error.WriteFailed;
+            off += @intCast(n);
+        }
+    }
+
+    pub fn pending(_: *const FailingDataTransport) usize {
+        return 0;
+    }
+
+    pub fn close(self: *FailingDataTransport) void {
+        _ = std.c.close(self.fd);
+    }
+};
+
 fn makeSocketpair() ![2]std.posix.fd_t {
     var fds: [2]std.posix.fd_t = undefined;
     try testing.expect(std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds) == 0);
@@ -2561,7 +2616,7 @@ test "streaming request upload sends DATA incrementally and waits for flow-contr
         .scheme = "http",
         .authority = "upload.test",
         .path = "/upload",
-        .end_stream = false,
+        .body_mode = .streaming,
     });
 
     var writer_ctx = UploadWriterCtx{
@@ -2593,6 +2648,30 @@ test "streaming request upload sends DATA incrementally and waits for flow-contr
     try testing.expect(writer_ctx.ok);
     try testing.expect(blocked_observed.load(.acquire));
     try testing.expectEqualStrings("upload-ok", got.items);
+}
+
+test "streaming request upload DATA write failure poisons the h2 connection" {
+    const fds = try makeSocketpair();
+    defer _ = std.c.close(fds[1]);
+
+    var transport = FailingDataTransport{ .fd = fds[0] };
+    const conn = try H2Conn(*FailingDataTransport).init(testing.allocator, &transport, fds[0], 3000, null, null, null);
+
+    const stream = try conn.openStreaming(.{
+        .method = "POST",
+        .scheme = "http",
+        .authority = "upload.test",
+        .path = "/upload",
+        .body_mode = .streaming,
+    });
+
+    try testing.expectError(error.WriteFailed, conn.writeStreamingRequestBody(stream, "payload", true));
+    try testing.expect(!conn.healthy());
+
+    conn.finishStreaming(stream);
+    try testing.expectEqual(@as(u32, 0), conn.activeStreamCount());
+
+    conn.deinit();
 }
 
 test "h2 exchange round-trips a request and response over a socketpair" {

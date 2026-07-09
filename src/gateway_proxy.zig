@@ -700,7 +700,7 @@ fn streamViaH2Pool(
                     .path = path_buf.written(),
                     .headers = extra_headers,
                     .body = buffered_body,
-                    .end_stream = streaming_body == null,
+                    .body_mode = if (streaming_body == null) .complete else .streaming,
                 }) catch |err| {
                     // Nothing has reached the client yet: evict the dead
                     // connection so new requests do not pick it, and retry

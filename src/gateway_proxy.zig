@@ -1739,8 +1739,11 @@ pub fn executeStreamingHttpProxyRequest(
     // when explicitly opted in (#237). Streaming uploads stay on the h1 path
     // below (`offer_h2` remains false there, so ALPN cannot negotiate a
     // protocol we then would not speak).
-    const stream_h2 = streaming_body == null and
-        (if (is_https) cfg.upstream_protocol.offersH2() else cfg.upstream_protocol.h2cPriorKnowledge());
+    const h2_requested_for_streaming = if (is_https) cfg.upstream_protocol.offersH2() else cfg.upstream_protocol.h2cPriorKnowledge();
+    if (streaming_body != null and h2_requested_for_streaming) {
+        if (pool) |p| p.recordH2StreamingUploadFallback();
+    }
+    const stream_h2 = streaming_body == null and h2_requested_for_streaming;
     if (stream_h2) {
         if (h2_pool) |hp| {
             const h2_opts: ?http.tls_termination.UpstreamTlsOptions = if (is_https) blk: {

@@ -69,6 +69,28 @@ instead multiplexes *many concurrent streams over one* origin connection. Becaus
 Tardigrade uses a thread-per-connection blocking model, this needs a different
 structure from the h1 pool:
 
+### Completion status
+
+#145's TLS/ALPN and explicit h2c upstream-multiplexing scope is complete:
+
+- buffered and streaming response paths can multiplex concurrent proxied
+  requests over one upstream h2 connection;
+- peer `MAX_CONCURRENT_STREAMS` is enforced before opening a stream;
+- RST_STREAM, GOAWAY, idle/lifetime eviction, graceful teardown, and
+  per-stream deadlines are handled by the h2 actor/pool;
+- metrics expose protocol selection, active h2 connections/streams, reset and
+  GOAWAY counters, per-origin h2 pool labels, and upstream latency by protocol;
+- `benchmarks/h1-vs-h2-upstream.sh` compares h1 pooling against h2
+  multiplexing under concurrent proxy load.
+
+The remaining HTTP/2 work is intentionally outside #145:
+
+- streaming request uploads over h2 are deferred until the actor has an
+  incremental DATA-send API for slow client bodies; fallback decisions are
+  counted in `tardigrade_upstream_h2_streaming_upload_fallback_total`;
+- canonical Beelink benchmark capture remains a benchmark-operations task; the
+  comparison harness is committed and ready to run.
+
 - **`upstream_h2.H2Conn`** — a per-connection actor. A dedicated **reader
   thread** owns every socket read and all HPACK decoding (the HPACK dynamic
   table is connection-wide, so there is exactly one decoder and it needs no

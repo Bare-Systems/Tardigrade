@@ -197,6 +197,11 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     }));
+    http3_mod.addImport("quic_varint", b.createModule(.{
+        .root_source_file = b.path("src/quic/varint.zig"),
+        .target = target,
+        .optimize = optimize,
+    }));
     const http3_tests = b.addTest(.{ .root_module = http3_mod });
     const run_http3_tests = b.addRunArtifact(http3_tests);
     quic_step.dependOn(&run_http3_tests.step);

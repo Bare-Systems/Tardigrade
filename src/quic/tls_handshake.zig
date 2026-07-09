@@ -199,9 +199,14 @@ pub const Handshake = struct {
     }
 
     /// Drain up to `buf.len` queued handshake bytes for `level`. Returns the
-    /// stream offset and the slice written into `buf`, or null when idle.
-    pub fn pollOutput(self: *Handshake, level: EncryptionLevel, buf: []u8) ?struct { offset: u64, bytes: []u8 } {
-        const output = (self.adapter.nextHandshakeOutput(level, buf.len) catch return null) orelse return null;
+    /// stream offset and the slice written into `buf`, null when no bytes are
+    /// pending, or `error.UnexpectedCryptoLevel` when asked for a level the
+    /// handshake never sends on — a caller/state-machine bug, kept distinct from
+    /// "idle".
+    pub fn pollOutput(self: *Handshake, level: EncryptionLevel, buf: []u8) HandshakeError!?struct { offset: u64, bytes: []u8 } {
+        const output = (self.adapter.nextHandshakeOutput(level, buf.len) catch |err| return self.fail(switch (err) {
+            error.InvalidCryptoLevel => error.UnexpectedCryptoLevel,
+        })) orelse return null;
         @memcpy(buf[0..output.bytes.len], output.bytes);
         return .{ .offset = output.offset, .bytes = buf[0..output.bytes.len] };
     }
@@ -333,16 +338,18 @@ pub const TestTlsBackend = struct {
         const self: *TestTlsBackend = @ptrCast(@alignCast(ptr));
         var reader = MessageReader{ .bytes = bytes };
         while (try reader.next()) |message| {
+            // Enforce the CRYPTO packet-number space each message belongs to, so
+            // the connection layer can trust this seam to catch level mistakes.
+            try expectLevel(message.kind, level);
             self.appendTranscript(message.raw);
             switch (self.role) {
-                .server => try self.onServerMessage(level, message, sink),
-                .client => try self.onClientMessage(level, message, sink),
+                .server => try self.onServerMessage(message, sink),
+                .client => try self.onClientMessage(message, sink),
             }
         }
     }
 
-    fn onServerMessage(self: *TestTlsBackend, level: EncryptionLevel, message: Message, sink: *EventSink) HandshakeError!void {
-        _ = level;
+    fn onServerMessage(self: *TestTlsBackend, message: Message, sink: *EventSink) HandshakeError!void {
         switch (message.kind) {
             .client_hello => {},
             .finished => {
@@ -376,7 +383,7 @@ pub const TestTlsBackend = struct {
         try self.emitApplicationSecrets(sink);
     }
 
-    fn onClientMessage(self: *TestTlsBackend, level: EncryptionLevel, message: Message, sink: *EventSink) HandshakeError!void {
+    fn onClientMessage(self: *TestTlsBackend, message: Message, sink: *EventSink) HandshakeError!void {
         switch (message.kind) {
             .server_hello => {
                 try sink.emitAlpn(message.alpn);
@@ -400,7 +407,6 @@ pub const TestTlsBackend = struct {
             },
             .client_hello => return error.MalformedHandshake,
         }
-        _ = level;
     }
 
     fn emitHandshakeSecrets(self: *TestTlsBackend, sink: *EventSink) HandshakeError!void {
@@ -487,6 +493,18 @@ pub const TestTlsBackend = struct {
         return offset;
     }
 };
+
+/// The CRYPTO encryption level each handshake message must arrive at. Initial
+/// carries the *Hello messages; the rest of the flight is Handshake-level.
+/// 0-RTT never carries CRYPTO and Application post-handshake messages are out of
+/// scope for this harness, so any other level is a deterministic error.
+fn expectLevel(kind: MessageType, level: EncryptionLevel) HandshakeError!void {
+    const expected: EncryptionLevel = switch (kind) {
+        .client_hello, .server_hello => .initial,
+        .encrypted_extensions, .certificate, .finished => .handshake,
+    };
+    if (level != expected) return error.UnexpectedCryptoLevel;
+}
 
 fn encodeMessage(buf: []u8, kind: MessageType, payload: []const u8) []const u8 {
     std.debug.assert(payload.len <= std.math.maxInt(u16));
@@ -612,11 +630,11 @@ const Harness = struct {
             var progressed = false;
             inline for (.{ EncryptionLevel.initial, EncryptionLevel.handshake }) |level| {
                 var buf: [2048]u8 = undefined;
-                while (self.client.pollOutput(level, &buf)) |out| {
+                while (try self.client.pollOutput(level, &buf)) |out| {
                     try self.server.onCrypto(level, out.offset, out.bytes);
                     progressed = true;
                 }
-                while (self.server.pollOutput(level, &buf)) |out| {
+                while (try self.server.pollOutput(level, &buf)) |out| {
                     try self.client.onCrypto(level, out.offset, out.bytes);
                     progressed = true;
                 }
@@ -666,10 +684,10 @@ test "handshake secrets match on both sides before they are discarded" {
 
     // ClientHello -> server.
     var buf: [2048]u8 = undefined;
-    const ch = h.client.pollOutput(.initial, &buf).?;
+    const ch = (try h.client.pollOutput(.initial, &buf)).?;
     try h.server.onCrypto(.initial, ch.offset, ch.bytes);
     // ServerHello -> client (installs Handshake secrets on both sides).
-    const sh = h.server.pollOutput(.initial, &buf).?;
+    const sh = (try h.server.pollOutput(.initial, &buf)).?;
     try h.client.onCrypto(.initial, sh.offset, sh.bytes);
 
     try expectSecretsMatch(&h.client_adapter, &h.server_adapter, .handshake);
@@ -684,7 +702,7 @@ test "peer transport parameters are withheld until the handshake completes" {
     // Deliver ClientHello: the server has received the peer params but must not
     // expose them before authentication.
     var buf: [2048]u8 = undefined;
-    const ch = h.client.pollOutput(.initial, &buf).?;
+    const ch = (try h.client.pollOutput(.initial, &buf)).?;
     try h.server.onCrypto(.initial, ch.offset, ch.bytes);
     try testing.expect(h.server_adapter.peerTransportParametersReceived());
     try testing.expectEqual(@as(?config.TransportParameters, null), h.server_adapter.peerTransportParameters());
@@ -730,6 +748,62 @@ test "malformed peer transport parameters fail the handshake deterministically" 
     h.client_backend.corrupt_transport_params = true; // illegal max_udp_payload_size
     try testing.expectError(error.InvalidTransportParameters, h.run());
     try testing.expect(!h.server.isComplete());
+}
+
+test "server omitting transport parameters fails the client deterministically" {
+    var h = Harness{};
+    try h.wire();
+    h.server_backend.include_transport_params = false; // EncryptedExtensions omits them
+    try testing.expectError(error.MissingTransportParameters, h.run());
+    try testing.expect(!h.client.isComplete());
+}
+
+test "client certificate state not_checked fails by default" {
+    var h = Harness{};
+    try h.wire();
+    h.server_backend.certificate = .not_checked;
+    try testing.expectError(error.CertificateInvalid, h.run());
+    try testing.expectEqual(CertificateState.not_checked, h.client_adapter.certificateState());
+    try testing.expect(!h.client.isComplete());
+}
+
+test "client certificate state not_checked passes only in explicit unverified mode" {
+    var h = Harness{};
+    try h.wire();
+    h.server_backend.certificate = .not_checked;
+    h.client.allow_unverified_certificate = true; // local/insecure opt-in
+    try h.run();
+    try testing.expect(h.client.isComplete());
+    try testing.expect(h.server.isComplete());
+}
+
+test "ClientHello delivered at the Handshake level is rejected" {
+    var h = Harness{};
+    try h.wire();
+    try h.client.start(defaultParams());
+
+    var buf: [2048]u8 = undefined;
+    const ch = (try h.client.pollOutput(.initial, &buf)).?;
+    // ClientHello belongs to the Initial space; delivering it as Handshake is a
+    // packet-number-space error the seam must catch.
+    try testing.expectError(error.UnexpectedCryptoLevel, h.server.onCrypto(.handshake, ch.offset, ch.bytes));
+    try testing.expect(!h.server.isComplete());
+}
+
+test "server Handshake-flight bytes delivered at the Initial level are rejected" {
+    var h = Harness{};
+    try h.wire();
+    try h.client.start(defaultParams());
+
+    var buf: [2048]u8 = undefined;
+    const ch = (try h.client.pollOutput(.initial, &buf)).?;
+    try h.server.onCrypto(.initial, ch.offset, ch.bytes);
+    // The client has not consumed any Initial bytes yet, so its Initial read
+    // stream is fresh: mis-delivering the Handshake flight (EncryptedExtensions
+    // first) at the Initial level is a deterministic level error.
+    var flight_buf: [2048]u8 = undefined;
+    const flight = (try h.server.pollOutput(.handshake, &flight_buf)).?;
+    try testing.expectError(error.UnexpectedCryptoLevel, h.client.onCrypto(.initial, flight.offset, flight.bytes));
 }
 
 test "a 0-RTT CRYPTO fragment is rejected while 0-RTT is disabled" {

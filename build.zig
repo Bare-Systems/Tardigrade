@@ -187,6 +187,11 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    http3_mod.addImport("hpack_huffman", b.createModule(.{
+        .root_source_file = b.path("src/http/hpack_huffman.zig"),
+        .target = target,
+        .optimize = optimize,
+    }));
     http3_mod.addImport("stream_transport", b.createModule(.{
         .root_source_file = b.path("src/http/stream_transport.zig"),
         .target = target,

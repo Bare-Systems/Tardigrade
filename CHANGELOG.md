@@ -18,6 +18,17 @@ All notable user-facing changes to Tardigrade are documented here.
   failures. The dynamic table and blocked-stream accounting remain #253.
 
 ### Reliability
+- **Pure Zig QUIC stream and flow-control core (#245)** — replaces the
+  `src/quic/stream.zig` skeleton with a bounded stream manager for HTTP/3:
+  QUIC stream-ID helpers, local/peer stream creation, bidi/uni send/receive
+  direction checks, stream-limit enforcement, STREAM-frame reassembly with
+  duplicate-overlap validation, final-size enforcement, stream- and
+  connection-level flow-control accounting, send grants, MAX_DATA /
+  MAX_STREAM_DATA credit updates after application reads, RESET_STREAM and
+  STOP_SENDING state propagation, and counters for blocked, credit, reset, and
+  stop-sending events. The packet layer still owns wire encoding; this exposes
+  the decoded-frame/read-write surface needed by the later connection and H3
+  session drivers.
 - **Pure Zig QUIC Retry, address validation, and anti-amplification (#250)** —
   adds the server safety mechanisms for unauthenticated UDP in `src/quic/path.zig`
   and `src/quic/cid.zig`: an `AntiAmplification` ledger enforcing the RFC 9000

@@ -6,12 +6,9 @@
 //! stream can ever be blocked. Any dynamic-table reference in an incoming block
 //! is rejected deterministically. The dynamic table, encoder/decoder streams,
 //! and blocked-stream accounting land in #253.
-//!
-//! Huffman string literals are added in a follow-up slice; until then the
-//! decoder rejects Huffman-coded strings with `error.HuffmanNotSupported` and
-//! the encoder emits raw (non-Huffman) strings.
 
 const std = @import("std");
+const huffman = @import("hpack_huffman");
 
 /// A decoded or to-be-encoded header field. Slices borrow their backing storage
 /// (the static table, the input block, or a caller scratch buffer) and stay
@@ -226,9 +223,8 @@ pub fn encode(fields: []const HeaderField, out: []u8) EncodeError![]u8 {
             pos += try encodeInto(out, pos, index, 4, 0x50);
             pos += try encodeString(field.value, out, pos);
         } else {
-            // Literal Field Line With Literal Name (001 N=0 H=0 + 3-bit name len).
-            pos += try encodeInto(out, pos, field.name.len, 3, 0x20);
-            pos += try writeAll(out, pos, field.name);
+            // Literal Field Line With Literal Name (001 N=0 H + 3-bit name len).
+            pos += try encodeStringWithPrefix(field.name, 3, 0x20, out, pos);
             pos += try encodeString(field.value, out, pos);
         }
     }
@@ -239,9 +235,20 @@ fn encodeInto(out: []u8, pos: usize, value: u64, n: u4, high_bits: u8) EncodeErr
     return encodeInteger(value, n, high_bits, out[pos..]);
 }
 
-/// Encode a string literal (H=0: 7-bit length prefix + raw bytes).
+/// Encode a string literal using Huffman coding when it is smaller than raw.
 fn encodeString(bytes: []const u8, out: []u8, pos: usize) EncodeError!usize {
-    var written = try encodeInteger(bytes.len, 7, 0x00, out[pos..]);
+    return encodeStringWithPrefix(bytes, 7, 0x00, out, pos);
+}
+
+fn encodeStringWithPrefix(bytes: []const u8, n: u4, high_bits: u8, out: []u8, pos: usize) EncodeError!usize {
+    const huffman_len = huffman.encodedLen(bytes);
+    if (huffman_len < bytes.len) {
+        var written = try encodeInteger(huffman_len, n, high_bits | (@as(u8, 1) << @intCast(n)), out[pos..]);
+        written += try huffman.encode(bytes, out[pos + written ..]);
+        return written;
+    }
+
+    var written = try encodeInteger(bytes.len, n, high_bits, out[pos..]);
     written += try writeAll(out, pos + written, bytes);
     return written;
 }
@@ -269,17 +276,21 @@ pub const DecodeError = error{
     TruncatedBlock,
     /// A prefix integer overflowed u64.
     IntegerOverflow,
-    /// A Huffman-coded string was present (not yet supported).
-    HuffmanNotSupported,
+    /// A Huffman-coded string was malformed.
+    InvalidHuffmanCode,
+    /// Caller scratch storage was too small for decoded Huffman strings.
+    ScratchOverflow,
     /// More header fields than the caller-provided output can hold.
     TooManyFields,
 };
 
 /// Decode a QPACK encoded field section into `fields_out`, returning the number
 /// of fields. Decoded name/value slices borrow the static table or the input
-/// `block`; no allocation is performed and no dynamic/blocked state exists.
-pub fn decode(block: []const u8, fields_out: []HeaderField) DecodeError!usize {
+/// `block` or `scratch`; no allocation is performed and no dynamic/blocked
+/// state exists.
+pub fn decode(block: []const u8, fields_out: []HeaderField, scratch: []u8) DecodeError!usize {
     var pos: usize = 0;
+    var scratch_pos: usize = 0;
 
     // Encoded Field Section Prefix. Static-only: RIC and Base must both be 0.
     const ric = try decodeInteger(block[pos..], 8);
@@ -305,16 +316,16 @@ pub fn decode(block: []const u8, fields_out: []HeaderField) DecodeError!usize {
             const int = try decodeInteger(block[pos..], 4);
             pos += int.len;
             const entry = staticEntry(@intCast(int.value)) orelse return error.InvalidStaticIndex;
-            const value = try decodeString(block, &pos);
+            const value = try decodeString(block, &pos, scratch, &scratch_pos);
             fields_out[count] = .{ .name = entry.name, .value = value };
         } else if (first & 0xe0 == 0x20) {
             // Literal Field Line With Literal Name (001 N H ...).
-            const huffman = first & 0x08 != 0;
+            const is_huffman = first & 0x08 != 0;
             const name_len = try decodeInteger(block[pos..], 3);
             pos += name_len.len;
-            const name = try readBytes(block, &pos, @intCast(name_len.value));
-            if (huffman) return error.HuffmanNotSupported;
-            const value = try decodeString(block, &pos);
+            const name_bytes = try readBytes(block, &pos, @intCast(name_len.value));
+            const name = if (is_huffman) try decodeHuffman(name_bytes, scratch, &scratch_pos) else name_bytes;
+            const value = try decodeString(block, &pos, scratch, &scratch_pos);
             fields_out[count] = .{ .name = name, .value = value };
         } else {
             // 0001.... post-base indexed, 0000.... post-base name ref: dynamic.
@@ -326,14 +337,23 @@ pub fn decode(block: []const u8, fields_out: []HeaderField) DecodeError!usize {
 }
 
 /// Decode a string literal at `block[pos.*]`, advancing `pos`.
-fn decodeString(block: []const u8, pos: *usize) DecodeError![]const u8 {
+fn decodeString(block: []const u8, pos: *usize, scratch: []u8, scratch_pos: *usize) DecodeError![]const u8 {
     if (pos.* >= block.len) return error.TruncatedBlock;
-    const huffman = block[pos.*] & 0x80 != 0;
+    const is_huffman = block[pos.*] & 0x80 != 0;
     const len = try decodeInteger(block[pos.*..], 7);
     pos.* += len.len;
     const bytes = try readBytes(block, pos, @intCast(len.value));
-    if (huffman) return error.HuffmanNotSupported;
-    return bytes;
+    return if (is_huffman) try decodeHuffman(bytes, scratch, scratch_pos) else bytes;
+}
+
+fn decodeHuffman(bytes: []const u8, scratch: []u8, scratch_pos: *usize) DecodeError![]const u8 {
+    const written = huffman.decode(bytes, scratch[scratch_pos.*..]) catch |err| switch (err) {
+        error.InvalidHuffmanCode => return error.InvalidHuffmanCode,
+        error.OutputOverflow => return error.ScratchOverflow,
+    };
+    const decoded = scratch[scratch_pos.*..][0..written];
+    scratch_pos.* += written;
+    return decoded;
 }
 
 fn readBytes(block: []const u8, pos: *usize, len: usize) DecodeError![]const u8 {
@@ -390,7 +410,8 @@ fn expectRoundTrip(fields: []const HeaderField) !void {
     var buf: [1024]u8 = undefined;
     const block = try encode(fields, &buf);
     var out: [64]HeaderField = undefined;
-    const count = try decode(block, &out);
+    var scratch: [1024]u8 = undefined;
+    const count = try decode(block, &out, &scratch);
     try testing.expectEqual(fields.len, count);
     for (fields, 0..) |field, i| {
         try testing.expectEqualStrings(field.name, out[i].name);
@@ -434,6 +455,40 @@ test "encoder picks the exact static index when name and value match" {
     try testing.expectEqual(@as(u8, 0xc0 | 25), block[2]);
 }
 
+test "encoder emits Huffman strings when smaller" {
+    var buf: [128]u8 = undefined;
+    const block = try encode(&.{.{ .name = ":authority", .value = "www.example.com" }}, &buf);
+
+    // Prefix (0,0), literal name-ref :authority (static index 0), then a
+    // Huffman-coded value string using the RFC 7541 C.4.1 bytes.
+    try testing.expectEqualSlices(u8, &.{ 0x00, 0x00, 0x50, 0x8c }, block[0..4]);
+    try testing.expectEqualSlices(u8, &.{ 0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b, 0xa0, 0xab, 0x90, 0xf4, 0xff }, block[4..]);
+}
+
+test "decoder accepts Huffman literal names and values" {
+    var block: [64]u8 = undefined;
+    var pos: usize = 0;
+    block[pos] = 0x00;
+    pos += 1;
+    block[pos] = 0x00;
+    pos += 1;
+    block[pos] = 0x2f; // literal name, Huffman-coded, 3-bit length extended
+    pos += 1;
+    block[pos] = 0x01; // Huffman-encoded "custom-key" is 8 bytes: 7 + 1
+    pos += 1;
+    pos += try huffman.encode("custom-key", block[pos..]);
+    block[pos] = 0x89; // Huffman-coded value length 9
+    pos += 1;
+    pos += try huffman.encode("custom-value", block[pos..]);
+
+    var out: [1]HeaderField = undefined;
+    var scratch: [64]u8 = undefined;
+    const count = try decode(block[0..pos], &out, &scratch);
+    try testing.expectEqual(@as(usize, 1), count);
+    try testing.expectEqualStrings("custom-key", out[0].name);
+    try testing.expectEqualStrings("custom-value", out[0].value);
+}
+
 test "decoder rejects an out-of-range static index" {
     // Prefix (0,0) then an indexed static line for index 99 (invalid).
     var buf: [8]u8 = undefined;
@@ -442,31 +497,36 @@ test "decoder rejects an out-of-range static index" {
     buf[0] = 0;
     buf[1] = 0;
     var out: [4]HeaderField = undefined;
-    try testing.expectError(error.InvalidStaticIndex, decode(buf[0..pos], &out));
+    var scratch: [16]u8 = undefined;
+    try testing.expectError(error.InvalidStaticIndex, decode(buf[0..pos], &out, &scratch));
 }
 
 test "decoder rejects dynamic-table references" {
     var out: [4]HeaderField = undefined;
+    var scratch: [16]u8 = undefined;
     // Indexed line with T=0 (dynamic): first byte 0x80.
-    try testing.expectError(error.DynamicTableReference, decode(&.{ 0x00, 0x00, 0x80 }, &out));
+    try testing.expectError(error.DynamicTableReference, decode(&.{ 0x00, 0x00, 0x80 }, &out, &scratch));
     // Literal with name reference, T=0 (dynamic): 0x40.
-    try testing.expectError(error.DynamicTableReference, decode(&.{ 0x00, 0x00, 0x40, 0x00 }, &out));
+    try testing.expectError(error.DynamicTableReference, decode(&.{ 0x00, 0x00, 0x40, 0x00 }, &out, &scratch));
     // Post-base indexed (0x10) is dynamic-only.
-    try testing.expectError(error.DynamicTableReference, decode(&.{ 0x00, 0x00, 0x10 }, &out));
+    try testing.expectError(error.DynamicTableReference, decode(&.{ 0x00, 0x00, 0x10 }, &out, &scratch));
 }
 
 test "decoder rejects a non-zero required insert count and base" {
     var out: [4]HeaderField = undefined;
-    try testing.expectError(error.InvalidRequiredInsertCount, decode(&.{ 0x01, 0x00 }, &out));
-    try testing.expectError(error.InvalidBase, decode(&.{ 0x00, 0x01 }, &out));
+    var scratch: [16]u8 = undefined;
+    try testing.expectError(error.InvalidRequiredInsertCount, decode(&.{ 0x01, 0x00 }, &out, &scratch));
+    try testing.expectError(error.InvalidBase, decode(&.{ 0x00, 0x01 }, &out, &scratch));
 }
 
-test "decoder rejects truncated blocks and Huffman strings without leaking" {
+test "decoder rejects truncated blocks and malformed Huffman strings without leaking" {
     var out: [4]HeaderField = undefined;
+    var scratch: [16]u8 = undefined;
     // Literal name-ref line claiming a 5-byte value but truncated.
-    try testing.expectError(error.TruncatedBlock, decode(&.{ 0x00, 0x00, 0x51, 0x05, 'a', 'b' }, &out));
-    // Value string with the Huffman bit set.
-    try testing.expectError(error.HuffmanNotSupported, decode(&.{ 0x00, 0x00, 0x51, 0x82, 0x00, 0x00 }, &out));
+    try testing.expectError(error.TruncatedBlock, decode(&.{ 0x00, 0x00, 0x51, 0x05, 'a', 'b' }, &out, &scratch));
+    // Value string with invalid Huffman padding.
+    try testing.expectError(error.InvalidHuffmanCode, decode(&.{ 0x00, 0x00, 0x51, 0x81, 0x00 }, &out, &scratch));
+    try testing.expectError(error.ScratchOverflow, decode(&.{ 0x00, 0x00, 0x51, 0x86, 0xa8, 0xeb, 0x10, 0x64, 0x9c, 0xbf }, &out, scratch[0..3]));
 }
 
 test "static-only mode keeps zero dynamic capacity and no blocked streams" {
@@ -479,7 +539,8 @@ test "static-only mode keeps zero dynamic capacity and no blocked streams" {
 test "metrics count decode failures" {
     var metrics = Metrics{};
     var out: [4]HeaderField = undefined;
-    metrics.recordDecode(decode(&.{ 0x00, 0x00, 0xc0 | 17 }, &out)); // ok (:method GET)
-    metrics.recordDecode(decode(&.{ 0x00, 0x00, 0x80 }, &out)); // dynamic ref -> failure
+    var scratch: [16]u8 = undefined;
+    metrics.recordDecode(decode(&.{ 0x00, 0x00, 0xc0 | 17 }, &out, &scratch)); // ok (:method GET)
+    metrics.recordDecode(decode(&.{ 0x00, 0x00, 0x80 }, &out, &scratch)); // dynamic ref -> failure
     try testing.expectEqual(@as(u64, 1), metrics.decode_failures);
 }

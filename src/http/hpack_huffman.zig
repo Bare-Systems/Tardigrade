@@ -358,6 +358,78 @@ pub fn decodeAlloc(allocator: std.mem.Allocator, src: []const u8) ![]u8 {
     return out.toOwnedSlice(allocator);
 }
 
+/// Decode an HPACK Huffman-encoded byte string into caller-provided storage.
+/// Returns the number of bytes written.
+pub fn decode(src: []const u8, out: []u8) error{ InvalidHuffmanCode, OutputOverflow }!usize {
+    var out_pos: usize = 0;
+    var node: u16 = 0;
+    for (src) |byte| {
+        var i: u4 = 0;
+        while (i < 8) : (i += 1) {
+            const shift: u3 = @intCast(7 - i);
+            const bit: u1 = @intCast((byte >> shift) & 1);
+            const next = huff_tree[node].children[bit];
+            if (next == NONE) return error.InvalidHuffmanCode;
+            node = next;
+            const sym = huff_tree[node].sym;
+            if (sym >= 0) {
+                if (sym == EOS_SYMBOL) return error.InvalidHuffmanCode;
+                if (out_pos >= out.len) return error.OutputOverflow;
+                out[out_pos] = @intCast(sym);
+                out_pos += 1;
+                node = 0;
+            }
+        }
+    }
+
+    if (node != 0) {
+        if (!huff_tree[node].all_ones or huff_tree[node].depth >= 8) {
+            return error.InvalidHuffmanCode;
+        }
+    }
+    return out_pos;
+}
+
+/// Return the exact number of bytes needed to Huffman-encode `src`.
+pub fn encodedLen(src: []const u8) usize {
+    var bits: usize = 0;
+    for (src) |byte| bits += huff_table[byte].nbits;
+    return (bits + 7) / 8;
+}
+
+/// Encode `src` with the RFC 7541 Appendix B static Huffman code. Padding uses
+/// the EOS all-ones prefix as required by RFC 7541 §5.2.
+pub fn encode(src: []const u8, out: []u8) error{OutputOverflow}!usize {
+    const needed = encodedLen(src);
+    if (out.len < needed) return error.OutputOverflow;
+
+    var pos: usize = 0;
+    var current: u8 = 0;
+    var used: u4 = 0;
+    for (src) |byte| {
+        const entry = huff_table[byte];
+        var bit_i: u8 = 0;
+        while (bit_i < entry.nbits) : (bit_i += 1) {
+            const bit: u1 = @intCast((entry.code >> @intCast(31 - bit_i)) & 1);
+            current = (current << 1) | bit;
+            used += 1;
+            if (used == 8) {
+                out[pos] = current;
+                pos += 1;
+                current = 0;
+                used = 0;
+            }
+        }
+    }
+
+    if (used != 0) {
+        current = (current << @intCast(8 - used)) | (@as(u8, 0xff) >> @intCast(used));
+        out[pos] = current;
+        pos += 1;
+    }
+    return pos;
+}
+
 test "huffman decode www.example.com (RFC 7541 C.4.1)" {
     const allocator = std.testing.allocator;
     const encoded = [_]u8{ 0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b, 0xa0, 0xab, 0x90, 0xf4, 0xff };
@@ -427,6 +499,16 @@ test "huffman decode empty string" {
     const decoded = try decodeAlloc(allocator, &[_]u8{});
     defer allocator.free(decoded);
     try std.testing.expectEqual(@as(usize, 0), decoded.len);
+}
+
+test "huffman encode matches RFC 7541 examples" {
+    var out: [32]u8 = undefined;
+
+    const www = try encode("www.example.com", &out);
+    try std.testing.expectEqualSlices(u8, &.{ 0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b, 0xa0, 0xab, 0x90, 0xf4, 0xff }, out[0..www]);
+
+    const no_cache = try encode("no-cache", &out);
+    try std.testing.expectEqualSlices(u8, &.{ 0xa8, 0xeb, 0x10, 0x64, 0x9c, 0xbf }, out[0..no_cache]);
 }
 
 test "huffman rejects bad padding (non-ones remainder)" {

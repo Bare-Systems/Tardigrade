@@ -4,6 +4,17 @@ All notable user-facing changes to Tardigrade are documented here.
 
 ## [Unreleased]
 
+### Features
+- **Static-table-only QPACK (#252)** — implements RFC 9204 QPACK header
+  compression in static-only mode in `src/http3/qpack.zig` for the first HTTP/3
+  path: the full 99-entry static table, RFC 7541 prefix-integer codec, and an
+  `encode`/`decode` API for the indexed, literal-with-name-reference, and
+  literal-with-literal-name field lines. Dynamic-table references, a non-zero
+  Required Insert Count/Base, out-of-range static indexes, and truncated blocks
+  all fail deterministically (no dynamic table, encoder/decoder streams, or
+  blocked-stream state exist), and a `Metrics` counter records decode failures.
+  The dynamic table and blocked-stream accounting remain #253.
+
 ### Reliability
 - **Pure Zig QUIC Retry, address validation, and anti-amplification (#250)** —
   adds the server safety mechanisms for unauthenticated UDP in `src/quic/path.zig`

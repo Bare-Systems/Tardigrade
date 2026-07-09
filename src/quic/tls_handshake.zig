@@ -1,0 +1,751 @@
+//! QUIC handshake driver (#296): the backend-agnostic state machine that drives
+//! a TLS 1.3 handshake through the `QuicTlsAdapter` seam (#249). It moves TLS
+//! handshake bytes in and out of the adapter's CRYPTO streams per encryption
+//! level, installs traffic secrets at the correct phase, authenticates peer
+//! transport parameters, enforces ALPN `h3`, reports certificate state, and
+//! surfaces typed failures — without any concrete TLS engine of its own.
+//!
+//! The concrete TLS engine is injected as a `TlsBackend` vtable, so no backend
+//! type escapes into the rest of `src/quic/`. Zig 0.16's `std.crypto.tls` is a
+//! client-only, record/stream TLS implementation with no way to pump raw
+//! handshake bytes or export QUIC traffic secrets, so it cannot back QUIC
+//! without inverting the design; a production backend (interim external engine
+//! or future pure-Zig work) is deferred. See `docs/QUIC_TLS.md`. This module
+//! ships a deterministic in-memory `TestTlsBackend` that proves the driver end
+//! to end, which also becomes the regression seam for later packet-layer work.
+
+const std = @import("std");
+const config = @import("config.zig");
+const tls_adapter = @import("tls_adapter.zig");
+
+const EncryptionLevel = tls_adapter.EncryptionLevel;
+const Direction = tls_adapter.Direction;
+const CertificateState = tls_adapter.CertificateState;
+const Secret = tls_adapter.Secret;
+const QuicTlsAdapter = tls_adapter.QuicTlsAdapter;
+const traffic_secret_len = tls_adapter.traffic_secret_len;
+
+pub const Role = enum { client, server };
+
+/// Typed, deterministic handshake failures. The connection layer maps these to
+/// the right QUIC CONNECTION_CLOSE codes later; the driver only classifies.
+pub const HandshakeError = error{
+    /// A CRYPTO fragment arrived at a level the handshake never uses (0-RTT).
+    UnexpectedCryptoLevel,
+    /// The backend could not parse the peer's TLS handshake bytes.
+    MalformedHandshake,
+    /// ALPN did not negotiate exactly `h3`.
+    AlpnMismatch,
+    /// Peer certificate was rejected by the backend.
+    CertificateInvalid,
+    /// Handshake completed without the peer's transport parameters.
+    MissingTransportParameters,
+    /// Peer transport parameters were malformed or carried an illegal value.
+    InvalidTransportParameters,
+    /// A traffic secret could not be installed (wrong length from the backend).
+    SecretExportFailed,
+    /// The backend emitted more output than the driver can buffer in one step.
+    HandshakeBufferOverflow,
+};
+
+/// Events a `TlsBackend` reports to the driver in response to `start`/`receive`.
+/// Slices borrow the backend's own storage and are consumed by the driver
+/// before the next backend call, so no allocation crosses the seam.
+pub const Event = union(enum) {
+    /// Raw TLS handshake bytes to send at `level` (queued to the CRYPTO stream).
+    crypto: struct { level: EncryptionLevel, data: []const u8 },
+    /// A traffic secret to install for `level`/`direction`.
+    secret: struct { level: EncryptionLevel, direction: Direction, data: []const u8 },
+    /// The peer's transport parameters, as carried in the handshake extension.
+    peer_transport_parameters: config.TransportParameters,
+    /// The negotiated ALPN protocol.
+    alpn: []const u8,
+    /// The peer certificate validation outcome.
+    certificate: CertificateState,
+    /// Keys for `level` are no longer needed and should be discarded.
+    discard_keys: EncryptionLevel,
+    /// The handshake authenticated and completed on this side.
+    handshake_complete,
+};
+
+/// Bounded sink the backend fills with `Event`s during a single call. Byte
+/// payloads are copied into `scratch` so the driver can apply them after the
+/// backend returns without holding backend-internal pointers.
+pub const EventSink = struct {
+    pub const max_events = 16;
+    pub const max_bytes = 16 * 1024;
+
+    items: [max_events]Event = undefined,
+    len: usize = 0,
+    scratch: [max_bytes]u8 = undefined,
+    used: usize = 0,
+
+    fn reset(self: *EventSink) void {
+        self.len = 0;
+        self.used = 0;
+    }
+
+    fn store(self: *EventSink, bytes: []const u8) HandshakeError![]const u8 {
+        if (bytes.len > self.scratch.len - self.used) return error.HandshakeBufferOverflow;
+        const start = self.used;
+        @memcpy(self.scratch[start..][0..bytes.len], bytes);
+        self.used += bytes.len;
+        return self.scratch[start..][0..bytes.len];
+    }
+
+    fn push(self: *EventSink, event: Event) HandshakeError!void {
+        if (self.len == self.items.len) return error.HandshakeBufferOverflow;
+        self.items[self.len] = event;
+        self.len += 1;
+    }
+
+    pub fn emitCrypto(self: *EventSink, level: EncryptionLevel, data: []const u8) HandshakeError!void {
+        try self.push(.{ .crypto = .{ .level = level, .data = try self.store(data) } });
+    }
+
+    pub fn emitSecret(self: *EventSink, level: EncryptionLevel, direction: Direction, data: []const u8) HandshakeError!void {
+        try self.push(.{ .secret = .{ .level = level, .direction = direction, .data = try self.store(data) } });
+    }
+
+    pub fn emitPeerTransportParameters(self: *EventSink, params: config.TransportParameters) HandshakeError!void {
+        try self.push(.{ .peer_transport_parameters = params });
+    }
+
+    pub fn emitAlpn(self: *EventSink, protocol: []const u8) HandshakeError!void {
+        try self.push(.{ .alpn = try self.store(protocol) });
+    }
+
+    pub fn emitCertificate(self: *EventSink, state: CertificateState) HandshakeError!void {
+        try self.push(.{ .certificate = state });
+    }
+
+    pub fn emitDiscardKeys(self: *EventSink, level: EncryptionLevel) HandshakeError!void {
+        try self.push(.{ .discard_keys = level });
+    }
+
+    pub fn emitHandshakeComplete(self: *EventSink) HandshakeError!void {
+        try self.push(.handshake_complete);
+    }
+};
+
+/// Runtime interface to a concrete TLS 1.3 engine. The engine consumes and
+/// produces raw handshake bytes and reports keying material / negotiation
+/// results through the `EventSink`; it never sees QUIC packets or the adapter.
+pub const TlsBackend = struct {
+    ptr: *anyopaque,
+    startFn: *const fn (ptr: *anyopaque, role: Role, params: config.TransportParameters, sink: *EventSink) HandshakeError!void,
+    receiveFn: *const fn (ptr: *anyopaque, level: EncryptionLevel, bytes: []const u8, sink: *EventSink) HandshakeError!void,
+
+    fn start(self: TlsBackend, role: Role, params: config.TransportParameters, sink: *EventSink) HandshakeError!void {
+        return self.startFn(self.ptr, role, params, sink);
+    }
+
+    fn receive(self: TlsBackend, level: EncryptionLevel, bytes: []const u8, sink: *EventSink) HandshakeError!void {
+        return self.receiveFn(self.ptr, level, bytes, sink);
+    }
+};
+
+pub const State = enum { idle, in_progress, complete, failed };
+
+/// The connection-facing QUIC handshake driver. A QUIC connection calls
+/// `start`, then pumps `onCrypto` / `pollOutput` per encryption level until
+/// `isComplete()` or `failure()` is set.
+pub const Handshake = struct {
+    adapter: *QuicTlsAdapter,
+    backend: TlsBackend,
+    role: Role,
+    /// Require ALPN to negotiate exactly `h3` (the QUIC/H3 path). Always true
+    /// for HTTP/3; exposed so future ALPNs can reuse the driver.
+    require_alpn_h3: bool = true,
+    /// Local-only escape hatch to accept `.not_checked` certificate state at
+    /// completion. Off by default; tests must opt in explicitly.
+    allow_unverified_certificate: bool = false,
+    state: State = .idle,
+    failure_reason: ?HandshakeError = null,
+    sink: EventSink = .{},
+
+    pub fn initClient(adapter: *QuicTlsAdapter, backend: TlsBackend) Handshake {
+        return .{ .adapter = adapter, .backend = backend, .role = .client };
+    }
+
+    pub fn initServer(adapter: *QuicTlsAdapter, backend: TlsBackend) Handshake {
+        return .{ .adapter = adapter, .backend = backend, .role = .server };
+    }
+
+    /// Provide local transport parameters to TLS and emit the first flight
+    /// (client) or arm the responder (server).
+    pub fn start(self: *Handshake, local_params: config.TransportParameters) HandshakeError!void {
+        self.adapter.setLocalTransportParameters(local_params);
+        self.state = .in_progress;
+        self.sink.reset();
+        self.backend.start(self.role, local_params, &self.sink) catch |err| return self.fail(err);
+        try self.applyEvents();
+    }
+
+    /// Feed a CRYPTO fragment received at `level`, reassemble it in order, and
+    /// drive the backend with any newly contiguous handshake bytes.
+    pub fn onCrypto(self: *Handshake, level: EncryptionLevel, offset: u64, bytes: []const u8) HandshakeError!void {
+        if (self.state == .failed) return self.failure_reason.?;
+        self.adapter.receiveCrypto(level, offset, bytes) catch |err| return self.fail(switch (err) {
+            error.InvalidCryptoLevel => error.UnexpectedCryptoLevel,
+            error.CryptoBufferTooLarge, error.TooManyCryptoRanges => error.MalformedHandshake,
+        });
+        while (true) {
+            const input = (self.adapter.nextHandshakeInput(level) catch return self.fail(error.UnexpectedCryptoLevel)) orelse break;
+            self.sink.reset();
+            self.backend.receive(input.level, input.bytes, &self.sink) catch |err| return self.fail(err);
+            try self.applyEvents();
+        }
+    }
+
+    /// Drain up to `buf.len` queued handshake bytes for `level`. Returns the
+    /// stream offset and the slice written into `buf`, or null when idle.
+    pub fn pollOutput(self: *Handshake, level: EncryptionLevel, buf: []u8) ?struct { offset: u64, bytes: []u8 } {
+        const output = (self.adapter.nextHandshakeOutput(level, buf.len) catch return null) orelse return null;
+        @memcpy(buf[0..output.bytes.len], output.bytes);
+        return .{ .offset = output.offset, .bytes = buf[0..output.bytes.len] };
+    }
+
+    pub fn isComplete(self: *const Handshake) bool {
+        return self.state == .complete;
+    }
+
+    pub fn failure(self: *const Handshake) ?HandshakeError {
+        return self.failure_reason;
+    }
+
+    fn fail(self: *Handshake, err: HandshakeError) HandshakeError {
+        self.state = .failed;
+        self.failure_reason = err;
+        return err;
+    }
+
+    fn applyEvents(self: *Handshake) HandshakeError!void {
+        var index: usize = 0;
+        while (index < self.sink.len) : (index += 1) {
+            switch (self.sink.items[index]) {
+                .crypto => |c| self.adapter.queueHandshakeOutput(c.level, c.data) catch |err| return self.fail(switch (err) {
+                    error.InvalidCryptoLevel => error.UnexpectedCryptoLevel,
+                    error.CryptoBufferTooLarge => error.HandshakeBufferOverflow,
+                }),
+                .secret => |s| {
+                    const secret = Secret.init(s.level, s.direction, s.data) catch return self.fail(error.SecretExportFailed);
+                    if (s.data.len != traffic_secret_len) return self.fail(error.SecretExportFailed);
+                    self.adapter.installSecret(secret);
+                },
+                .peer_transport_parameters => |params| self.adapter.setPeerTransportParameters(params),
+                .alpn => |protocol| {
+                    self.adapter.markAlpn(protocol);
+                    if (self.require_alpn_h3 and !self.adapter.negotiatedH3()) return self.fail(error.AlpnMismatch);
+                },
+                .certificate => |cert_state| {
+                    self.adapter.setCertificateState(cert_state);
+                    if (cert_state == .invalid) return self.fail(error.CertificateInvalid);
+                },
+                .discard_keys => |level| self.adapter.discardSecrets(level),
+                .handshake_complete => try self.complete(),
+            }
+        }
+    }
+
+    fn complete(self: *Handshake) HandshakeError!void {
+        if (!self.adapter.peerTransportParametersReceived()) return self.fail(error.MissingTransportParameters);
+        if (self.require_alpn_h3 and !self.adapter.negotiatedH3()) return self.fail(error.AlpnMismatch);
+        // Only the client validates a peer certificate in the server-auth QUIC/H3
+        // model; the server has no client certificate to check here.
+        if (self.role == .client and !self.allow_unverified_certificate and self.adapter.certificateState() != .valid) {
+            return self.fail(error.CertificateInvalid);
+        }
+        // Transport parameters are only exposed to connection logic now that the
+        // handshake has authenticated them.
+        self.adapter.authenticatePeerTransportParameters();
+        self.state = .complete;
+    }
+};
+
+// ===========================================================================
+// Deterministic in-memory test backend (#296 harness).
+//
+// Not a real TLS engine: it exchanges a compact, fixed message set that carries
+// exactly what the QUIC handshake driver must route — ALPN, transport
+// parameters, a certificate fixture, and per-level traffic secrets — so a
+// client and server driver can complete a handshake purely by pumping CRYPTO
+// bytes. Secrets are derived from the shared handshake transcript, so any
+// dropped or reordered byte makes the two sides' secrets diverge and fails the
+// test. This is the regression seam for later packet-layer integration; the
+// production TLS backend implements the same `TlsBackend` interface.
+// ===========================================================================
+
+const HkdfSha256 = std.crypto.kdf.hkdf.HkdfSha256;
+
+const MessageType = enum(u8) {
+    client_hello = 1,
+    server_hello = 2,
+    encrypted_extensions = 3,
+    certificate = 4,
+    finished = 5,
+};
+
+/// Wire size of an encoded `config.TransportParameters` (nine u64 + one bool).
+const transport_params_encoded_len = 9 * 8 + 1;
+
+pub const TestTlsBackend = struct {
+    role: Role = .client,
+    /// ALPN this side offers (client) or supports/selects (server).
+    alpn: []const u8 = "h3",
+    /// Certificate fixture the server presents / the client reports.
+    certificate: CertificateState = .valid,
+    include_transport_params: bool = true,
+    /// Emit deliberately illegal transport parameters (drives negative tests).
+    corrupt_transport_params: bool = false,
+    local_params: config.TransportParameters = undefined,
+    transcript: [4096]u8 = undefined,
+    transcript_len: usize = 0,
+
+    pub fn backend(self: *TestTlsBackend) TlsBackend {
+        return .{ .ptr = self, .startFn = startImpl, .receiveFn = receiveImpl };
+    }
+
+    fn appendTranscript(self: *TestTlsBackend, bytes: []const u8) void {
+        // Bounded by the small fixed message set; assert rather than error.
+        std.debug.assert(bytes.len <= self.transcript.len - self.transcript_len);
+        @memcpy(self.transcript[self.transcript_len..][0..bytes.len], bytes);
+        self.transcript_len += bytes.len;
+    }
+
+    fn deriveSecret(self: *const TestTlsBackend, comptime label: []const u8) [traffic_secret_len]u8 {
+        return HkdfSha256.extract(label, self.transcript[0..self.transcript_len]);
+    }
+
+    fn startImpl(ptr: *anyopaque, role: Role, params: config.TransportParameters, sink: *EventSink) HandshakeError!void {
+        const self: *TestTlsBackend = @ptrCast(@alignCast(ptr));
+        self.role = role;
+        self.local_params = params;
+        if (role != .client) return; // server waits for ClientHello
+
+        var buf: [256]u8 = undefined;
+        const hello = self.encodeHello(&buf, .client_hello);
+        self.appendTranscript(hello);
+        try sink.emitCrypto(.initial, hello);
+    }
+
+    fn receiveImpl(ptr: *anyopaque, level: EncryptionLevel, bytes: []const u8, sink: *EventSink) HandshakeError!void {
+        const self: *TestTlsBackend = @ptrCast(@alignCast(ptr));
+        var reader = MessageReader{ .bytes = bytes };
+        while (try reader.next()) |message| {
+            self.appendTranscript(message.raw);
+            switch (self.role) {
+                .server => try self.onServerMessage(level, message, sink),
+                .client => try self.onClientMessage(level, message, sink),
+            }
+        }
+    }
+
+    fn onServerMessage(self: *TestTlsBackend, level: EncryptionLevel, message: Message, sink: *EventSink) HandshakeError!void {
+        _ = level;
+        switch (message.kind) {
+            .client_hello => {},
+            .finished => {
+                // Client Finished confirms the handshake for the server.
+                try sink.emitDiscardKeys(.handshake);
+                try sink.emitHandshakeComplete();
+                return;
+            },
+            else => return error.MalformedHandshake,
+        }
+
+        // The client's transport parameters ride in the ClientHello.
+        if (message.transport_params) |params| {
+            try sink.emitPeerTransportParameters(params);
+        }
+
+        // ServerHello selects ALPN and unlocks Handshake keys.
+        var buf: [256]u8 = undefined;
+        const server_hello = self.encodeHello(&buf, .server_hello);
+        self.appendTranscript(server_hello);
+        try sink.emitCrypto(.initial, server_hello);
+        try sink.emitAlpn(self.alpn);
+        try self.emitHandshakeSecrets(sink);
+        try sink.emitDiscardKeys(.initial);
+
+        // Server Handshake flight: EncryptedExtensions + Certificate + Finished.
+        var flight: [512]u8 = undefined;
+        const server_flight = self.encodeServerFlight(&flight);
+        self.appendTranscript(server_flight);
+        try sink.emitCrypto(.handshake, server_flight);
+        try self.emitApplicationSecrets(sink);
+    }
+
+    fn onClientMessage(self: *TestTlsBackend, level: EncryptionLevel, message: Message, sink: *EventSink) HandshakeError!void {
+        switch (message.kind) {
+            .server_hello => {
+                try sink.emitAlpn(message.alpn);
+                try self.emitHandshakeSecrets(sink);
+                try sink.emitDiscardKeys(.initial);
+            },
+            .encrypted_extensions => {
+                if (message.transport_params) |params| try sink.emitPeerTransportParameters(params);
+            },
+            .certificate => try sink.emitCertificate(message.certificate),
+            .finished => {
+                // Server Finished closes the server flight: install 1-RTT keys,
+                // send the client Finished, and complete.
+                try self.emitApplicationSecrets(sink);
+                var buf: [8]u8 = undefined;
+                const finished = encodeMessage(&buf, .finished, &.{});
+                self.appendTranscript(finished);
+                try sink.emitCrypto(.handshake, finished);
+                try sink.emitDiscardKeys(.handshake);
+                try sink.emitHandshakeComplete();
+            },
+            .client_hello => return error.MalformedHandshake,
+        }
+        _ = level;
+    }
+
+    fn emitHandshakeSecrets(self: *TestTlsBackend, sink: *EventSink) HandshakeError!void {
+        const c2s = self.deriveSecret("quic-test hs c2s");
+        const s2c = self.deriveSecret("quic-test hs s2c");
+        switch (self.role) {
+            .client => {
+                try sink.emitSecret(.handshake, .write, &c2s);
+                try sink.emitSecret(.handshake, .read, &s2c);
+            },
+            .server => {
+                try sink.emitSecret(.handshake, .read, &c2s);
+                try sink.emitSecret(.handshake, .write, &s2c);
+            },
+        }
+    }
+
+    fn emitApplicationSecrets(self: *TestTlsBackend, sink: *EventSink) HandshakeError!void {
+        const c2s = self.deriveSecret("quic-test ap c2s");
+        const s2c = self.deriveSecret("quic-test ap s2c");
+        switch (self.role) {
+            .client => {
+                try sink.emitSecret(.application, .write, &c2s);
+                try sink.emitSecret(.application, .read, &s2c);
+            },
+            .server => {
+                try sink.emitSecret(.application, .read, &c2s);
+                try sink.emitSecret(.application, .write, &s2c);
+            },
+        }
+    }
+
+    fn encodeHello(self: *const TestTlsBackend, buf: []u8, kind: MessageType) []const u8 {
+        var payload: [1 + 64 + transport_params_encoded_len]u8 = undefined;
+        var len: usize = 0;
+        payload[len] = @intCast(self.alpn.len);
+        len += 1;
+        @memcpy(payload[len..][0..self.alpn.len], self.alpn);
+        len += self.alpn.len;
+        // ClientHello carries the client's transport parameters; ServerHello
+        // does not (the server sends them in EncryptedExtensions).
+        if (kind == .client_hello and self.include_transport_params) {
+            len += self.encodeTransportParams(payload[len..]);
+        }
+        return encodeMessage(buf, kind, payload[0..len]);
+    }
+
+    fn encodeServerFlight(self: *const TestTlsBackend, buf: []u8) []const u8 {
+        var len: usize = 0;
+        if (self.include_transport_params) {
+            var ee_payload: [transport_params_encoded_len]u8 = undefined;
+            const n = self.encodeTransportParams(&ee_payload);
+            len += encodeMessage(buf[len..], .encrypted_extensions, ee_payload[0..n]).len;
+        } else {
+            len += encodeMessage(buf[len..], .encrypted_extensions, &.{}).len;
+        }
+        const cert_payload = [_]u8{@intFromEnum(self.certificate)};
+        len += encodeMessage(buf[len..], .certificate, &cert_payload).len;
+        len += encodeMessage(buf[len..], .finished, &.{}).len;
+        return buf[0..len];
+    }
+
+    fn encodeTransportParams(self: *const TestTlsBackend, buf: []u8) usize {
+        const p = self.local_params;
+        var offset: usize = 0;
+        const fields = [_]u64{
+            p.max_idle_timeout_ms,
+            p.active_connection_id_limit,
+            // A corrupt run emits an illegal (below-minimum) UDP payload size.
+            if (self.corrupt_transport_params) 0 else p.max_udp_payload_size,
+            p.initial_max_data,
+            p.initial_max_stream_data_bidi_local,
+            p.initial_max_stream_data_bidi_remote,
+            p.initial_max_stream_data_uni,
+            p.initial_max_streams_bidi,
+            p.initial_max_streams_uni,
+        };
+        for (fields) |value| {
+            std.mem.writeInt(u64, buf[offset..][0..8], value, .big);
+            offset += 8;
+        }
+        buf[offset] = @intFromBool(p.disable_active_migration);
+        offset += 1;
+        return offset;
+    }
+};
+
+fn encodeMessage(buf: []u8, kind: MessageType, payload: []const u8) []const u8 {
+    std.debug.assert(payload.len <= std.math.maxInt(u16));
+    buf[0] = @intFromEnum(kind);
+    std.mem.writeInt(u16, buf[1..3], @intCast(payload.len), .big);
+    @memcpy(buf[3..][0..payload.len], payload);
+    return buf[0 .. 3 + payload.len];
+}
+
+const Message = struct {
+    kind: MessageType,
+    raw: []const u8,
+    alpn: []const u8 = "",
+    transport_params: ?config.TransportParameters = null,
+    certificate: CertificateState = .not_checked,
+};
+
+const MessageReader = struct {
+    bytes: []const u8,
+    offset: usize = 0,
+
+    fn next(self: *MessageReader) HandshakeError!?Message {
+        if (self.offset == self.bytes.len) return null;
+        if (self.bytes.len - self.offset < 3) return error.MalformedHandshake;
+        const kind = std.enums.fromInt(MessageType, self.bytes[self.offset]) orelse return error.MalformedHandshake;
+        const payload_len = std.mem.readInt(u16, self.bytes[self.offset + 1 ..][0..2], .big);
+        const header_end = self.offset + 3;
+        if (self.bytes.len - header_end < payload_len) return error.MalformedHandshake;
+        const payload = self.bytes[header_end..][0..payload_len];
+        const raw = self.bytes[self.offset .. header_end + payload_len];
+        self.offset = header_end + payload_len;
+
+        var message = Message{ .kind = kind, .raw = raw };
+        switch (kind) {
+            .client_hello, .server_hello => try parseHello(payload, &message),
+            .encrypted_extensions => if (payload.len > 0) {
+                message.transport_params = try parseTransportParams(payload);
+            },
+            .certificate => {
+                if (payload.len != 1) return error.MalformedHandshake;
+                message.certificate = std.enums.fromInt(CertificateState, payload[0]) orelse return error.MalformedHandshake;
+            },
+            .finished => if (payload.len != 0) return error.MalformedHandshake,
+        }
+        return message;
+    }
+};
+
+fn parseHello(payload: []const u8, message: *Message) HandshakeError!void {
+    if (payload.len < 1) return error.MalformedHandshake;
+    const alpn_len = payload[0];
+    if (payload.len < 1 + alpn_len) return error.MalformedHandshake;
+    message.alpn = payload[1 .. 1 + alpn_len];
+    const rest = payload[1 + alpn_len ..];
+    if (rest.len > 0) message.transport_params = try parseTransportParams(rest);
+}
+
+fn parseTransportParams(bytes: []const u8) HandshakeError!config.TransportParameters {
+    if (bytes.len != transport_params_encoded_len) return error.InvalidTransportParameters;
+    var offset: usize = 0;
+    var values: [9]u64 = undefined;
+    for (&values) |*value| {
+        value.* = std.mem.readInt(u64, bytes[offset..][0..8], .big);
+        offset += 8;
+    }
+    const params = config.TransportParameters{
+        .max_idle_timeout_ms = values[0],
+        .active_connection_id_limit = values[1],
+        .max_udp_payload_size = values[2],
+        .initial_max_data = values[3],
+        .initial_max_stream_data_bidi_local = values[4],
+        .initial_max_stream_data_bidi_remote = values[5],
+        .initial_max_stream_data_uni = values[6],
+        .initial_max_streams_bidi = values[7],
+        .initial_max_streams_uni = values[8],
+        .disable_active_migration = bytes[offset] != 0,
+    };
+    // Reject values QUIC forbids (RFC 9000 §18.2): a peer that advertises an
+    // unusable maximum UDP payload size is a fatal, deterministic error.
+    if (params.max_udp_payload_size < 1200) return error.InvalidTransportParameters;
+    return params;
+}
+
+// ===========================================================================
+// Tests: deterministic in-memory client<->server handshake harness.
+// Bytes move ONLY through the adapter CRYPTO APIs via pollOutput/onCrypto — no
+// UDP, packet protection, or HTTP/3 — per the #296 first-harness requirement.
+// ===========================================================================
+
+const testing = std.testing;
+
+fn defaultParams() config.TransportParameters {
+    return (config.Config{}).transportParameters() catch unreachable;
+}
+
+const Harness = struct {
+    client_adapter: QuicTlsAdapter = .{},
+    server_adapter: QuicTlsAdapter = .{},
+    client_backend: TestTlsBackend = .{},
+    server_backend: TestTlsBackend = .{},
+    client: Handshake = undefined,
+    server: Handshake = undefined,
+
+    fn wire(self: *Harness) !void {
+        // Initial secrets come from the client DCID (installed by the connection
+        // layer, not TLS). They let us prove Initial-key discard through the driver.
+        const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+        _ = try self.client_adapter.installInitialSecrets(.client, &dcid);
+        _ = try self.server_adapter.installInitialSecrets(.server, &dcid);
+        self.client = Handshake.initClient(&self.client_adapter, self.client_backend.backend());
+        self.server = Handshake.initServer(&self.server_adapter, self.server_backend.backend());
+        // Arm the responder: the server's start() emits nothing but primes its
+        // backend role and local transport parameters before the first flight.
+        try self.server.start(defaultParams());
+    }
+
+    /// Pump handshake bytes between the two sides until both complete or no side
+    /// makes progress. Returns the first deterministic failure, if any.
+    fn run(self: *Harness) HandshakeError!void {
+        try self.client.start(defaultParams());
+        var rounds: usize = 0;
+        while (rounds < 64) : (rounds += 1) {
+            var progressed = false;
+            inline for (.{ EncryptionLevel.initial, EncryptionLevel.handshake }) |level| {
+                var buf: [2048]u8 = undefined;
+                while (self.client.pollOutput(level, &buf)) |out| {
+                    try self.server.onCrypto(level, out.offset, out.bytes);
+                    progressed = true;
+                }
+                while (self.server.pollOutput(level, &buf)) |out| {
+                    try self.client.onCrypto(level, out.offset, out.bytes);
+                    progressed = true;
+                }
+            }
+            if (!progressed) break;
+        }
+    }
+};
+
+fn expectSecretsMatch(a: *const QuicTlsAdapter, b: *const QuicTlsAdapter, level: EncryptionLevel) !void {
+    // What one side writes, the other must read (RFC 9001 secrets are shared).
+    const a_write = a.protectionKeys(level, .write) orelse return error.TestUnexpectedResult;
+    const b_read = b.protectionKeys(level, .read) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualSlices(u8, &a_write.key, &b_read.key);
+}
+
+test "in-memory client<->server handshake completes and installs matching 1-RTT secrets" {
+    var h = Harness{};
+    try h.wire();
+    try h.run();
+
+    try testing.expect(h.client.isComplete());
+    try testing.expect(h.server.isComplete());
+    try testing.expectEqual(@as(?HandshakeError, null), h.client.failure());
+    try testing.expectEqual(@as(?HandshakeError, null), h.server.failure());
+
+    // 1-RTT secrets are installed and shared in both directions.
+    try expectSecretsMatch(&h.client_adapter, &h.server_adapter, .application);
+    try expectSecretsMatch(&h.server_adapter, &h.client_adapter, .application);
+
+    // Phase ordering: Initial and Handshake keys are discarded by completion,
+    // 1-RTT keys remain.
+    try testing.expectEqual(@as(?tls_adapter.PacketProtectionKeys, null), h.client_adapter.protectionKeys(.initial, .write));
+    try testing.expectEqual(@as(?tls_adapter.PacketProtectionKeys, null), h.server_adapter.protectionKeys(.handshake, .read));
+    try testing.expect(h.client_adapter.protectionKeys(.application, .write) != null);
+
+    // ALPN negotiated h3; server certificate reported valid to the client.
+    try testing.expect(h.client_adapter.negotiatedH3());
+    try testing.expect(h.server_adapter.negotiatedH3());
+    try testing.expectEqual(CertificateState.valid, h.client_adapter.certificateState());
+}
+
+test "handshake secrets match on both sides before they are discarded" {
+    var h = Harness{};
+    try h.wire();
+    try h.client.start(defaultParams());
+
+    // ClientHello -> server.
+    var buf: [2048]u8 = undefined;
+    const ch = h.client.pollOutput(.initial, &buf).?;
+    try h.server.onCrypto(.initial, ch.offset, ch.bytes);
+    // ServerHello -> client (installs Handshake secrets on both sides).
+    const sh = h.server.pollOutput(.initial, &buf).?;
+    try h.client.onCrypto(.initial, sh.offset, sh.bytes);
+
+    try expectSecretsMatch(&h.client_adapter, &h.server_adapter, .handshake);
+    try expectSecretsMatch(&h.server_adapter, &h.client_adapter, .handshake);
+}
+
+test "peer transport parameters are withheld until the handshake completes" {
+    var h = Harness{};
+    try h.wire();
+    try h.client.start(defaultParams());
+
+    // Deliver ClientHello: the server has received the peer params but must not
+    // expose them before authentication.
+    var buf: [2048]u8 = undefined;
+    const ch = h.client.pollOutput(.initial, &buf).?;
+    try h.server.onCrypto(.initial, ch.offset, ch.bytes);
+    try testing.expect(h.server_adapter.peerTransportParametersReceived());
+    try testing.expectEqual(@as(?config.TransportParameters, null), h.server_adapter.peerTransportParameters());
+
+    // After the full handshake, both sides expose authenticated peer params.
+    try h.run();
+    try testing.expect(h.client.isComplete() and h.server.isComplete());
+    const client_view = h.client_adapter.peerTransportParameters() orelse return error.TestUnexpectedResult;
+    const server_view = h.server_adapter.peerTransportParameters() orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(defaultParams().initial_max_data, client_view.initial_max_data);
+    try testing.expectEqual(defaultParams().initial_max_data, server_view.initial_max_data);
+}
+
+test "ALPN that is not h3 fails the handshake deterministically" {
+    var h = Harness{};
+    try h.wire();
+    h.server_backend.alpn = "h2"; // server selects a non-h3 protocol
+    try testing.expectError(error.AlpnMismatch, h.run());
+    try testing.expect(!h.server.isComplete());
+    try testing.expectEqual(@as(?HandshakeError, error.AlpnMismatch), h.server.failure());
+}
+
+test "an invalid server certificate fails the handshake deterministically" {
+    var h = Harness{};
+    try h.wire();
+    h.server_backend.certificate = .invalid;
+    try testing.expectError(error.CertificateInvalid, h.run());
+    try testing.expectEqual(CertificateState.invalid, h.client_adapter.certificateState());
+    try testing.expect(!h.client.isComplete());
+}
+
+test "missing peer transport parameters fail the handshake deterministically" {
+    var h = Harness{};
+    try h.wire();
+    h.client_backend.include_transport_params = false; // ClientHello omits them
+    try testing.expectError(error.MissingTransportParameters, h.run());
+    try testing.expect(!h.server.isComplete());
+}
+
+test "malformed peer transport parameters fail the handshake deterministically" {
+    var h = Harness{};
+    try h.wire();
+    h.client_backend.corrupt_transport_params = true; // illegal max_udp_payload_size
+    try testing.expectError(error.InvalidTransportParameters, h.run());
+    try testing.expect(!h.server.isComplete());
+}
+
+test "a 0-RTT CRYPTO fragment is rejected while 0-RTT is disabled" {
+    var adapter = QuicTlsAdapter{};
+    var backend = TestTlsBackend{};
+    var handshake = Handshake.initServer(&adapter, backend.backend());
+    // 0-RTT has no CRYPTO stream (RFC 9001); feeding one is a deterministic error.
+    try testing.expectError(error.UnexpectedCryptoLevel, handshake.onCrypto(.zero_rtt, 0, "early"));
+    try testing.expectEqual(@as(?HandshakeError, error.UnexpectedCryptoLevel), handshake.failure());
+}
+
+test "the connection-facing driver exposes only the backend interface, not a concrete backend" {
+    var adapter = QuicTlsAdapter{};
+    var backend = TestTlsBackend{};
+    const handshake = Handshake.initClient(&adapter, backend.backend());
+    // The driver holds the runtime TlsBackend vtable; no concrete backend type
+    // leaks into its public surface.
+    try testing.expect(@TypeOf(handshake.backend) == TlsBackend);
+}

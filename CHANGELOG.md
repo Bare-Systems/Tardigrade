@@ -5,6 +5,19 @@ All notable user-facing changes to Tardigrade are documented here.
 ## [Unreleased]
 
 ### Reliability
+- **Pure Zig QUIC handshake driver (#296)** — adds `src/quic/tls_handshake.zig`,
+  the backend-agnostic state machine that drives a TLS 1.3 handshake through the
+  `QuicTlsAdapter` seam: it routes handshake bytes through per-level CRYPTO
+  streams, installs traffic secrets at the correct Initial→Handshake→1-RTT phase
+  (discarding superseded levels), withholds peer transport parameters until the
+  handshake authenticates them, enforces ALPN `h3`, reports certificate state,
+  and classifies failures into a typed `HandshakeError`. The concrete TLS engine
+  is injected via a runtime `TlsBackend` interface (no backend type escapes into
+  `src/quic/`); Zig 0.16's client-only, record-oriented `std.crypto.tls` cannot
+  back QUIC, so a production backend is deferred (`docs/QUIC_TLS.md`). A
+  deterministic in-memory `TestTlsBackend` proves a full client↔server handshake
+  and the failure surfaces (ALPN mismatch, bad certificate, missing/invalid
+  transport parameters, 0-RTT rejection) purely by pumping CRYPTO bytes.
 - **Pure Zig QUIC TLS adapter completion — header protection, key updates,
   0-RTT guard (#249)** — finishes `QuicTlsAdapter`. Adds RFC 9001 §5.4 header
   protection (`applyHeaderProtection` / `removeHeaderProtection`) with

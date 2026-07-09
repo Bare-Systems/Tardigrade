@@ -5,6 +5,28 @@ All notable user-facing changes to Tardigrade are documented here.
 ## [Unreleased]
 
 ### Reliability
+- **Pure Zig QUIC TLS adapter completion — header protection, key updates,
+  0-RTT guard (#249)** — finishes `QuicTlsAdapter`. Adds RFC 9001 §5.4 header
+  protection (`applyHeaderProtection` / `removeHeaderProtection`) with
+  packet-number reconstruction wired through `packet.decodePacketNumber` and
+  RFC 9001 Appendix A.2 sample coverage; RFC 9001 §6 key updates
+  (`deriveNextGenerationSecret`) with direction-independent phase tracking —
+  `updateApplicationWriteKeys` rolls the local send secret and outgoing phase
+  while `nextApplicationReadKeys` / `commitApplicationReadKeyUpdate` advance the
+  receive secret only once a peer key update authenticates; peer transport
+  parameters that are only exposed after the handshake authenticates them; a
+  `config.zero_rtt_enabled` guard (default off) so the adapter refuses 0-RTT
+  keys unless an operator opts in; ALPN and certificate-validation accessors;
+  and an adapter-level `sealPacketPayload` / `openPacketPayload` seam with
+  `Metrics` counters that deterministically count AEAD deprotection failures.
+  Driving a concrete TLS 1.3 backend behind the seam is tracked in #296.
+- **Pure Zig QUIC Handshake and 1-RTT packet protection (#249)** — generalizes
+  packet protection beyond Initial. `PacketProtectionKeys` / `deriveAes128GcmKeys`
+  derive AES-128-GCM protection keys for any encryption level from a TLS traffic
+  secret, and `QuicTlsAdapter.protectionKeys(level, direction)` now serves
+  Initial, Handshake, and 1-RTT (returning null for missing or wrong-length
+  secrets), with per-level derivation, direction-selection, and seal/open
+  round-trip tests in `src/quic/tls_adapter.zig`.
 - **Pure Zig QUIC Initial packet protection (#249)** — adds AES-128-GCM
   sealing/opening helpers for QUIC v1 Initial payloads using the derived
   packet-protection keys, with RFC 9001 client Initial sample coverage and

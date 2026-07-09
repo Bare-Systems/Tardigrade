@@ -3355,3 +3355,20 @@ test "served metrics JSON exposes every counter the canonical serializer does" {
     try std.testing.expect(served_parsed.value.object.contains("event_loop_iterations"));
     try std.testing.expect(served_parsed.value.object.contains("health_probe_runs"));
 }
+
+test "served Prometheus metrics expose h2 streaming upload fallback counter" {
+    var gs: GatewayState = undefined;
+    initMetricsJsonTestState(&gs, std.testing.allocator);
+    defer gs.h2_pool.deinit();
+    defer gs.upstream_pool.deinit();
+    defer gs.mux_subscriptions_by_device.deinit();
+
+    gs.upstream_pool.recordH2StreamingUploadFallback();
+
+    const prom = try gs.metricsToPrometheus(std.testing.allocator);
+    defer std.testing.allocator.free(prom);
+
+    try std.testing.expect(std.mem.find(u8, prom, "# HELP tardigrade_upstream_h2_streaming_upload_fallback_total Streaming upload requests that requested h2/h2c upstreams but fell back to h1 because incremental h2 request-body DATA is not implemented") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "# TYPE tardigrade_upstream_h2_streaming_upload_fallback_total counter") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_upstream_h2_streaming_upload_fallback_total 1\n") != null);
+}

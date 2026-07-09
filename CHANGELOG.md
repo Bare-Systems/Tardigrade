@@ -9,9 +9,12 @@ All notable user-facing changes to Tardigrade are documented here.
   adds the server safety mechanisms for unauthenticated UDP in `src/quic/path.zig`
   and `src/quic/cid.zig`: an `AntiAmplification` ledger enforcing the RFC 9000
   §8.1 3x send budget (saturating, so certificate/handshake bytes and
-  retransmissions cannot overflow it); `RetryTokens`, AEAD-sealed
-  address-validation tokens with timestamp/expiry, peer-address binding, a
-  rotating key ring, and tamper/unknown-key rejection; the RFC 9001 §5.8 Retry
+  retransmissions cannot overflow it); `RetryTokens`, versioned AEAD-sealed
+  Retry tokens binding the original destination connection ID, QUIC version,
+  and peer address (IPv6 scope id included) with timestamp/expiry, a
+  future-issued guard, a rotating key ring, and tamper/unknown-key rejection —
+  `validateRetry` returns the recovered ODCID/version for the connection layer;
+  the RFC 9001 §5.8 Retry
   integrity tag (`retryIntegrityTag` / `verifyRetryIntegrity`), verified against
   the Appendix A.4 vector; stateless-reset token derivation and reset-packet
   construction (`statelessResetToken`, `StatelessReset`) with loop-safe sizing

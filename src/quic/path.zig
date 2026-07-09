@@ -78,15 +78,29 @@ pub const token_nonce_len = Aes128Gcm.nonce_length;
 pub const token_tag_len = Aes128Gcm.tag_length;
 pub const max_token_keys = 8;
 
-/// Encoded plaintext is `issued_at(8) + family(1) + addr_len(1) + addr(4|16) + port(2)`.
-const token_min_plaintext_len = 8 + 1 + 1 + 4 + 2;
-const token_max_plaintext_len = 8 + 1 + 1 + 16 + 2;
+/// What a token authenticates. Retry tokens are bound to a specific connection
+/// attempt (original DCID + QUIC version); the enum leaves room for the future
+/// NEW_TOKEN address-validation flow (RFC 9000 §8.1.3) without a format break.
+pub const TokenKind = enum(u8) {
+    retry = 1,
+    address_validation = 2,
+};
+
+/// Fixed-size prefix of the token plaintext: `kind(1) + version(4) +
+/// issued_at(8) + odcid_len(1)`. The connection ID, address, and port follow.
+const token_header_len = 1 + 4 + 8 + 1;
+/// Variable address suffix: `family(1) + addr_len(1) + addr(4|16) +
+/// scope_id(4, IPv6 only) + port(2)`.
+const token_addr_min_len = 1 + 1 + 4 + 2; // IPv4
+const token_addr_max_len = 1 + 1 + 16 + 4 + 2; // IPv6, with scope id
+const token_min_plaintext_len = token_header_len + 0 + token_addr_min_len;
+const token_max_plaintext_len = token_header_len + udp.MaxConnectionIdLen + token_addr_max_len;
 
 /// Largest possible encoded token (`key_id + nonce + plaintext + tag`).
 pub const max_token_len = 1 + token_nonce_len + token_max_plaintext_len + token_tag_len;
 
 pub const TokenError = error{
-    /// Token is too short/long to be well-formed.
+    /// Token is too short/long or otherwise not well-formed.
     MalformedToken,
     /// Token names a key id the server does not hold (e.g. rotated out).
     UnknownTokenKey,
@@ -94,8 +108,11 @@ pub const TokenError = error{
     TokenAuthenticationFailed,
     /// Token authenticated but was issued to a different peer address.
     TokenAddressMismatch,
-    /// Token authenticated but is older than the configured lifetime.
+    /// Token authenticated but is expired or impossibly future-dated.
     TokenExpired,
+    /// Token authenticated but is not the expected kind (e.g. NEW_TOKEN where a
+    /// Retry token was required).
+    UnexpectedTokenKind,
 };
 
 /// A rotating ring of AEAD keys used to protect address-validation tokens.
@@ -121,27 +138,44 @@ pub const RetryTokenKeyRing = struct {
     }
 };
 
-/// Issues and verifies address-validation tokens. Tokens are AEAD-sealed with a
-/// key from the ring and bind the peer address plus an issue timestamp.
+/// Context recovered from a validated Retry token. The connection layer needs
+/// the original destination connection ID and QUIC version to validate the
+/// Retry flow and populate/verify the `original_destination_connection_id`
+/// transport parameter (RFC 9000 §7.3).
+pub const RetryContext = struct {
+    original_dcid: udp.ConnectionId,
+    quic_version: u32,
+};
+
+/// Issues and verifies Retry address-validation tokens. Tokens are AEAD-sealed
+/// with a key from the ring and bind the original destination connection ID,
+/// the QUIC version, the peer address, and an issue timestamp.
 pub const RetryTokens = struct {
     keys: RetryTokenKeyRing = .{},
     /// Maximum token age, in microseconds, before verification rejects it.
     lifetime_us: u64 = 10 * std.time.us_per_s,
+    /// Tolerance for a token whose issue time is slightly ahead of the
+    /// validator's clock. Tokens further in the future are rejected.
+    allowed_clock_skew_us: u64 = 0,
 
-    /// Seal a token for `address` stamped at `issued_at_us`. `nonce` must be
-    /// unique per token under the current key (the caller supplies it so the
-    /// module stays deterministic and free of ambient randomness).
-    pub fn issue(
+    /// Seal a Retry token binding `original_dcid` + `quic_version` + `address`,
+    /// stamped at `issued_at_us`. `nonce` must be unique per token under the
+    /// current key (the caller supplies it so the module stays deterministic and
+    /// free of ambient randomness).
+    pub fn issueRetry(
         self: *const RetryTokens,
+        original_dcid: []const u8,
+        quic_version: u32,
         address: udp.Address,
         issued_at_us: u64,
         nonce: [token_nonce_len]u8,
         out: []u8,
-    ) error{ OutputTooSmall, NoTokenKey }![]u8 {
+    ) error{ OutputTooSmall, NoTokenKey, ConnectionIdTooLong }![]u8 {
+        if (original_dcid.len > udp.MaxConnectionIdLen) return error.ConnectionIdTooLong;
         const key = self.keys.get(self.keys.current) orelse return error.NoTokenKey;
 
         var plaintext: [token_max_plaintext_len]u8 = undefined;
-        const plaintext_len = encodeTokenPlaintext(address, issued_at_us, &plaintext);
+        const plaintext_len = encodeTokenPlaintext(.retry, quic_version, original_dcid, address, issued_at_us, &plaintext);
         const total = 1 + token_nonce_len + plaintext_len + token_tag_len;
         if (out.len < total) return error.OutputTooSmall;
 
@@ -154,8 +188,10 @@ pub const RetryTokens = struct {
         return out[0..total];
     }
 
-    /// Verify a token was issued by this server to `address` and is unexpired.
-    pub fn validate(self: *const RetryTokens, token: []const u8, address: udp.Address, now_us: u64) TokenError!void {
+    /// Verify a Retry token was issued by this server to `address`, is a Retry
+    /// token, and is neither expired nor impossibly future-dated. Returns the
+    /// bound original DCID and QUIC version for the connection layer.
+    pub fn validateRetry(self: *const RetryTokens, token: []const u8, address: udp.Address, now_us: u64) TokenError!RetryContext {
         if (token.len < 1 + token_nonce_len + token_min_plaintext_len + token_tag_len) return error.MalformedToken;
         if (token.len > max_token_len) return error.MalformedToken;
         const plaintext_len = token.len - 1 - token_nonce_len - token_tag_len;
@@ -171,44 +207,113 @@ pub const RetryTokens = struct {
         Aes128Gcm.decrypt(plaintext[0..plaintext_len], cipher, tag, &.{}, nonce, key) catch return error.TokenAuthenticationFailed;
 
         const decoded = decodeTokenPlaintext(plaintext[0..plaintext_len]) catch return error.MalformedToken;
+        if (decoded.kind != .retry) return error.UnexpectedTokenKind;
         if (!addressEql(decoded.address, address)) return error.TokenAddressMismatch;
+        // Reject tokens dated further in the future than the allowed skew, so a
+        // backwards clock jump cannot make a stale token look freshly issued.
+        if (decoded.issued_at_us > now_us +| self.allowed_clock_skew_us) return error.TokenExpired;
         if ((now_us -| decoded.issued_at_us) > self.lifetime_us) return error.TokenExpired;
+        return .{ .original_dcid = decoded.original_dcid, .quic_version = decoded.quic_version };
     }
 };
 
-const DecodedToken = struct { issued_at_us: u64, address: udp.Address };
+const DecodedToken = struct {
+    kind: TokenKind,
+    quic_version: u32,
+    issued_at_us: u64,
+    original_dcid: udp.ConnectionId,
+    address: udp.Address,
+};
 
-fn encodeTokenPlaintext(address: udp.Address, issued_at_us: u64, out: *[token_max_plaintext_len]u8) usize {
-    std.mem.writeInt(u64, out[0..8], issued_at_us, .big);
-    out[8] = @intFromEnum(address.family);
+fn encodeTokenPlaintext(
+    kind: TokenKind,
+    quic_version: u32,
+    original_dcid: []const u8,
+    address: udp.Address,
+    issued_at_us: u64,
+    out: *[token_max_plaintext_len]u8,
+) usize {
+    var pos: usize = 0;
+    out[pos] = @intFromEnum(kind);
+    pos += 1;
+    std.mem.writeInt(u32, out[pos..][0..4], quic_version, .big);
+    pos += 4;
+    std.mem.writeInt(u64, out[pos..][0..8], issued_at_us, .big);
+    pos += 8;
+    out[pos] = @intCast(original_dcid.len);
+    pos += 1;
+    @memcpy(out[pos..][0..original_dcid.len], original_dcid);
+    pos += original_dcid.len;
+
+    out[pos] = @intFromEnum(address.family);
+    pos += 1;
     const addr = address.slice();
-    out[9] = @intCast(addr.len);
-    @memcpy(out[10..][0..addr.len], addr);
-    std.mem.writeInt(u16, out[10 + addr.len ..][0..2], address.port, .big);
-    return 10 + addr.len + 2;
+    out[pos] = @intCast(addr.len);
+    pos += 1;
+    @memcpy(out[pos..][0..addr.len], addr);
+    pos += addr.len;
+    // Encode scope_id for IPv6 so scoped (link-local) addresses round-trip.
+    if (address.family == .ip6) {
+        std.mem.writeInt(u32, out[pos..][0..4], address.scope_id, .big);
+        pos += 4;
+    }
+    std.mem.writeInt(u16, out[pos..][0..2], address.port, .big);
+    pos += 2;
+    return pos;
 }
 
 fn decodeTokenPlaintext(bytes: []const u8) error{MalformedToken}!DecodedToken {
-    if (bytes.len < 10) return error.MalformedToken;
-    const issued_at_us = std.mem.readInt(u64, bytes[0..8], .big);
-    const family = std.enums.fromInt(udp.AddressFamily, bytes[8]) orelse return error.MalformedToken;
-    const addr_len = bytes[9];
+    var pos: usize = 0;
+    if (bytes.len < token_header_len) return error.MalformedToken;
+    const kind = std.enums.fromInt(TokenKind, bytes[pos]) orelse return error.MalformedToken;
+    pos += 1;
+    const quic_version = std.mem.readInt(u32, bytes[pos..][0..4], .big);
+    pos += 4;
+    const issued_at_us = std.mem.readInt(u64, bytes[pos..][0..8], .big);
+    pos += 8;
+    const odcid_len = bytes[pos];
+    pos += 1;
+    if (odcid_len > udp.MaxConnectionIdLen) return error.MalformedToken;
+    if (bytes.len - pos < odcid_len) return error.MalformedToken;
+    var original_dcid = udp.ConnectionId{ .len = odcid_len };
+    @memcpy(original_dcid.bytes[0..odcid_len], bytes[pos..][0..odcid_len]);
+    pos += odcid_len;
+
+    if (bytes.len - pos < 2) return error.MalformedToken;
+    const family = std.enums.fromInt(udp.AddressFamily, bytes[pos]) orelse return error.MalformedToken;
+    pos += 1;
+    const addr_len = bytes[pos];
+    pos += 1;
     const expected_addr_len: usize = switch (family) {
         .ip4 => 4,
         .ip6 => 16,
     };
     if (addr_len != expected_addr_len) return error.MalformedToken;
-    if (bytes.len != 10 + expected_addr_len + 2) return error.MalformedToken;
-    const port = std.mem.readInt(u16, bytes[10 + expected_addr_len ..][0..2], .big);
-    var address = udp.Address{ .family = family, .port = port };
-    @memcpy(address.bytes[0..expected_addr_len], bytes[10..][0..expected_addr_len]);
-    return .{ .issued_at_us = issued_at_us, .address = address };
+    if (bytes.len - pos < expected_addr_len) return error.MalformedToken;
+    var address = udp.Address{ .family = family, .port = 0 };
+    @memcpy(address.bytes[0..expected_addr_len], bytes[pos..][0..expected_addr_len]);
+    pos += expected_addr_len;
+    if (family == .ip6) {
+        if (bytes.len - pos < 4) return error.MalformedToken;
+        address.scope_id = std.mem.readInt(u32, bytes[pos..][0..4], .big);
+        pos += 4;
+    }
+    if (bytes.len - pos != 2) return error.MalformedToken;
+    address.port = std.mem.readInt(u16, bytes[pos..][0..2], .big);
+
+    return .{
+        .kind = kind,
+        .quic_version = quic_version,
+        .issued_at_us = issued_at_us,
+        .original_dcid = original_dcid,
+        .address = address,
+    };
 }
 
 fn addressEql(a: udp.Address, b: udp.Address) bool {
     if (a.family != b.family or a.port != b.port) return false;
     if (!std.mem.eql(u8, a.slice(), b.slice())) return false;
-    // scope_id only distinguishes link-local IPv6 paths.
+    // scope_id distinguishes link-local IPv6 paths and now round-trips in tokens.
     return a.scope_id == b.scope_id;
 }
 
@@ -300,8 +405,8 @@ pub const Metrics = struct {
     }
 
     /// Fold a token-validation result into the counters (invalid tokens are
-    /// counted; a success is a no-op).
-    pub fn recordTokenValidation(self: *Metrics, result: TokenError!void) void {
+    /// counted; a success is a no-op). Accepts any `TokenError!T` result.
+    pub fn recordTokenValidation(self: *Metrics, result: anytype) void {
         if (result) |_| {} else |_| self.recordInvalidToken();
     }
 };
@@ -339,18 +444,37 @@ test "anti-amplification accounting saturates instead of overflowing" {
     try testing.expect(limiter.canSend(std.math.maxInt(u64)));
 }
 
-test "retry token round-trips and binds the peer address" {
+const test_odcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+const test_version: u32 = 0x0000_0001;
+
+test "retry token round-trips and recovers the original DCID and version" {
     var tokens = RetryTokens{ .lifetime_us = 10_000_000 };
     tokens.keys.install(0, [_]u8{0xa5} ** token_key_len);
 
     var buf: [max_token_len]u8 = undefined;
-    const token = try tokens.issue(loopbackV4(4433), 1_000_000, [_]u8{0x11} ** token_nonce_len, &buf);
+    const token = try tokens.issueRetry(&test_odcid, test_version, loopbackV4(4433), 1_000_000, [_]u8{0x11} ** token_nonce_len, &buf);
 
-    try tokens.validate(token, loopbackV4(4433), 1_500_000);
-    // A different port is a different path.
-    try testing.expectError(error.TokenAddressMismatch, tokens.validate(token, loopbackV4(4434), 1_500_000));
-    // A different host is a different path.
-    try testing.expectError(error.TokenAddressMismatch, tokens.validate(token, udp.Address.ip4(.{ 10, 0, 0, 1 }, 4433), 1_500_000));
+    const ctx = try tokens.validateRetry(token, loopbackV4(4433), 1_500_000);
+    try testing.expectEqualSlices(u8, &test_odcid, ctx.original_dcid.slice());
+    try testing.expectEqual(test_version, ctx.quic_version);
+
+    // A different port or host is a different path.
+    try testing.expectError(error.TokenAddressMismatch, tokens.validateRetry(token, loopbackV4(4434), 1_500_000));
+    try testing.expectError(error.TokenAddressMismatch, tokens.validateRetry(token, udp.Address.ip4(.{ 10, 0, 0, 1 }, 4433), 1_500_000));
+}
+
+test "retry token binds scoped IPv6 addresses including the scope id" {
+    var tokens = RetryTokens{ .lifetime_us = 10_000_000 };
+    tokens.keys.install(0, [_]u8{0xa5} ** token_key_len);
+
+    const scoped = udp.Address.ip6([_]u8{0xfe} ++ [_]u8{0x80} ++ [_]u8{0} ** 13 ++ [_]u8{0x01}, 4433, 7);
+    var buf: [max_token_len]u8 = undefined;
+    const token = try tokens.issueRetry(&test_odcid, test_version, scoped, 1_000_000, [_]u8{0x66} ** token_nonce_len, &buf);
+
+    // Same address including scope id validates; a different scope id does not.
+    _ = try tokens.validateRetry(token, scoped, 1_500_000);
+    const other_scope = udp.Address.ip6(scoped.bytes, 4433, 9);
+    try testing.expectError(error.TokenAddressMismatch, tokens.validateRetry(token, other_scope, 1_500_000));
 }
 
 test "retry token expires after its lifetime" {
@@ -358,10 +482,23 @@ test "retry token expires after its lifetime" {
     tokens.keys.install(1, [_]u8{0x5a} ** token_key_len);
 
     var buf: [max_token_len]u8 = undefined;
-    const token = try tokens.issue(loopbackV4(443), 2_000_000, [_]u8{0x22} ** token_nonce_len, &buf);
+    const token = try tokens.issueRetry(&test_odcid, test_version, loopbackV4(443), 2_000_000, [_]u8{0x22} ** token_nonce_len, &buf);
 
-    try tokens.validate(token, loopbackV4(443), 7_000_000); // exactly at the limit
-    try testing.expectError(error.TokenExpired, tokens.validate(token, loopbackV4(443), 7_000_001));
+    _ = try tokens.validateRetry(token, loopbackV4(443), 7_000_000); // exactly at the limit
+    try testing.expectError(error.TokenExpired, tokens.validateRetry(token, loopbackV4(443), 7_000_001));
+}
+
+test "retry token dated in the future is rejected" {
+    var tokens = RetryTokens{ .lifetime_us = 5_000_000, .allowed_clock_skew_us = 1_000 };
+    tokens.keys.install(0, [_]u8{0x7a} ** token_key_len);
+
+    var buf: [max_token_len]u8 = undefined;
+    const token = try tokens.issueRetry(&test_odcid, test_version, loopbackV4(443), 5_000_000, [_]u8{0x77} ** token_nonce_len, &buf);
+
+    // Within the allowed skew: accepted (age saturates to zero).
+    _ = try tokens.validateRetry(token, loopbackV4(443), 4_999_500);
+    // Further in the future than the skew: rejected instead of treated as fresh.
+    try testing.expectError(error.TokenExpired, tokens.validateRetry(token, loopbackV4(443), 4_000_000));
 }
 
 test "retry token rejects tampering and unknown keys" {
@@ -369,22 +506,22 @@ test "retry token rejects tampering and unknown keys" {
     tokens.keys.install(0, [_]u8{0x01} ** token_key_len);
 
     var buf: [max_token_len]u8 = undefined;
-    const token = try tokens.issue(loopbackV4(4433), 1_000_000, [_]u8{0x33} ** token_nonce_len, &buf);
+    const token = try tokens.issueRetry(&test_odcid, test_version, loopbackV4(4433), 1_000_000, [_]u8{0x33} ** token_nonce_len, &buf);
 
     // Flip a ciphertext byte: AEAD authentication must fail.
     var tampered: [max_token_len]u8 = undefined;
     @memcpy(tampered[0..token.len], token);
     tampered[1 + token_nonce_len] ^= 0x80;
-    try testing.expectError(error.TokenAuthenticationFailed, tokens.validate(tampered[0..token.len], loopbackV4(4433), 1_000_000));
+    try testing.expectError(error.TokenAuthenticationFailed, tokens.validateRetry(tampered[0..token.len], loopbackV4(4433), 1_000_000));
 
     // Name a key id the ring never held.
     var wrong_key: [max_token_len]u8 = undefined;
     @memcpy(wrong_key[0..token.len], token);
     wrong_key[0] = 7;
-    try testing.expectError(error.UnknownTokenKey, tokens.validate(wrong_key[0..token.len], loopbackV4(4433), 1_000_000));
+    try testing.expectError(error.UnknownTokenKey, tokens.validateRetry(wrong_key[0..token.len], loopbackV4(4433), 1_000_000));
 
     // Truncated token is malformed.
-    try testing.expectError(error.MalformedToken, tokens.validate(token[0..10], loopbackV4(4433), 1_000_000));
+    try testing.expectError(error.MalformedToken, tokens.validateRetry(token[0..10], loopbackV4(4433), 1_000_000));
 }
 
 test "retry token survives key rotation while a key is retained" {
@@ -392,15 +529,15 @@ test "retry token survives key rotation while a key is retained" {
     tokens.keys.install(0, [_]u8{0x01} ** token_key_len);
 
     var buf: [max_token_len]u8 = undefined;
-    const token = try tokens.issue(loopbackV4(4433), 1_000_000, [_]u8{0x44} ** token_nonce_len, &buf);
+    const token = try tokens.issueRetry(&test_odcid, test_version, loopbackV4(4433), 1_000_000, [_]u8{0x44} ** token_nonce_len, &buf);
 
     // Rotate to a new current key; the old key still validates prior tokens.
     tokens.keys.install(1, [_]u8{0x02} ** token_key_len);
-    try tokens.validate(token, loopbackV4(4433), 1_000_000);
+    _ = try tokens.validateRetry(token, loopbackV4(4433), 1_000_000);
 
     // Retiring the issuing key invalidates its tokens.
     tokens.keys.retire(0);
-    try testing.expectError(error.UnknownTokenKey, tokens.validate(token, loopbackV4(4433), 1_000_000));
+    try testing.expectError(error.UnknownTokenKey, tokens.validateRetry(token, loopbackV4(4433), 1_000_000));
 }
 
 test "retry integrity tag matches the RFC 9001 Appendix A.4 vector" {
@@ -433,12 +570,12 @@ test "metrics distinguish invalid tokens from normal retry usage" {
     var metrics = Metrics{};
 
     var buf: [max_token_len]u8 = undefined;
-    const token = try tokens.issue(loopbackV4(4433), 1_000_000, [_]u8{0x55} ** token_nonce_len, &buf);
+    const token = try tokens.issueRetry(&test_odcid, test_version, loopbackV4(4433), 1_000_000, [_]u8{0x55} ** token_nonce_len, &buf);
     metrics.recordRetrySent();
 
-    metrics.recordTokenValidation(tokens.validate(token, loopbackV4(4433), 1_500_000)); // valid
-    metrics.recordTokenValidation(tokens.validate(token, loopbackV4(4433), 9_000_000)); // expired
-    metrics.recordTokenValidation(tokens.validate(token, loopbackV4(9999), 1_500_000)); // wrong address
+    metrics.recordTokenValidation(tokens.validateRetry(token, loopbackV4(4433), 1_500_000)); // valid
+    metrics.recordTokenValidation(tokens.validateRetry(token, loopbackV4(4433), 9_000_000)); // expired
+    metrics.recordTokenValidation(tokens.validateRetry(token, loopbackV4(9999), 1_500_000)); // wrong address
 
     try testing.expectEqual(@as(u64, 1), metrics.retry_packets_sent);
     try testing.expectEqual(@as(u64, 2), metrics.invalid_tokens);

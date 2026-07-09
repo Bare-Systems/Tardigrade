@@ -483,9 +483,10 @@ pub const CryptoOutput = struct {
 
     pub fn append(self: *CryptoOutput, bytes: []const u8) error{CryptoBufferTooLarge}!void {
         if (bytes.len == 0) return;
-        if (self.end + bytes.len > max_crypto_buffer) {
+        // Overflow-safe: never form `self.end + bytes.len` at a packet boundary.
+        if (bytes.len > max_crypto_buffer - self.end) {
             self.compact();
-            if (self.end + bytes.len > max_crypto_buffer) return error.CryptoBufferTooLarge;
+            if (bytes.len > max_crypto_buffer - self.end) return error.CryptoBufferTooLarge;
         }
         @memcpy(self.buffer[self.end .. self.end + bytes.len], bytes);
         self.end += bytes.len;
@@ -538,8 +539,11 @@ pub const QuicTlsAdapter = struct {
     certificate_state: CertificateState = .not_checked,
     /// 0-RTT is disabled unless explicitly enabled via config (RFC 9001 §4.6).
     zero_rtt_enabled: bool = false,
-    /// Current 1-RTT key phase bit (RFC 9001 §6); toggled on each key update.
-    application_key_phase: u1 = 0,
+    /// 1-RTT key phase bits (RFC 9001 §6). Write and read advance independently:
+    /// write flips when this endpoint initiates a key update, read flips when a
+    /// peer key update is observed and authenticated.
+    application_write_key_phase: u1 = 0,
+    application_read_key_phase: u1 = 0,
     metrics: Metrics = .{},
 
     pub fn setLocalTransportParameters(self: *QuicTlsAdapter, params: config.TransportParameters) void {
@@ -672,23 +676,47 @@ pub const QuicTlsAdapter = struct {
         return plaintext;
     }
 
-    /// Current 1-RTT key phase bit (RFC 9001 §6).
-    pub fn applicationKeyPhase(self: *const QuicTlsAdapter) u1 {
-        return self.application_key_phase;
+    /// Key phase bit this endpoint sets on outgoing 1-RTT packets (RFC 9001 §6).
+    pub fn applicationWriteKeyPhase(self: *const QuicTlsAdapter) u1 {
+        return self.application_write_key_phase;
     }
 
-    /// Roll the 1-RTT read and write secrets to the next generation and flip the
-    /// key phase bit (RFC 9001 §6.1). Requires both application secrets to be
-    /// installed; the derived secrets replace them in place.
-    pub fn updateApplicationKeys(self: *QuicTlsAdapter) error{ApplicationSecretsMissing}!void {
-        const read_secret = self.applicationTrafficSecret(.read) orelse return error.ApplicationSecretsMissing;
+    /// Key phase bit this endpoint currently decrypts incoming 1-RTT packets
+    /// with (RFC 9001 §6). Read and write phases advance independently.
+    pub fn applicationReadKeyPhase(self: *const QuicTlsAdapter) u1 {
+        return self.application_read_key_phase;
+    }
+
+    /// Initiate a local key update: roll the 1-RTT *write* secret to the next
+    /// generation and flip the outgoing key phase bit (RFC 9001 §6.1). Read keys
+    /// are untouched — the peer's key phase rolls only when its updated packets
+    /// are observed. Requires the application write secret to be installed.
+    pub fn updateApplicationWriteKeys(self: *QuicTlsAdapter) error{ApplicationSecretsMissing}!void {
         const write_secret = self.applicationTrafficSecret(.write) orelse return error.ApplicationSecretsMissing;
-        const next_read = deriveNextGenerationSecret(read_secret);
         const next_write = deriveNextGenerationSecret(write_secret);
         // Secrets are exactly traffic_secret_len, so Secret.init cannot overflow.
-        self.installSecret(Secret.init(.application, .read, &next_read) catch unreachable);
         self.installSecret(Secret.init(.application, .write, &next_write) catch unreachable);
-        self.application_key_phase ^= 1;
+        self.application_write_key_phase ^= 1;
+    }
+
+    /// Next-generation 1-RTT *read* keys for trial-decrypting a peer packet that
+    /// carries the opposite key phase bit (RFC 9001 §6.3), without committing to
+    /// them. Returns null when no application read secret is installed. Commit
+    /// with `commitApplicationReadKeyUpdate` only after such a packet
+    /// authenticates.
+    pub fn nextApplicationReadKeys(self: *const QuicTlsAdapter) ?PacketProtectionKeys {
+        const read_secret = self.applicationTrafficSecret(.read) orelse return null;
+        return deriveAes128GcmKeys(deriveNextGenerationSecret(read_secret));
+    }
+
+    /// Commit the next-generation 1-RTT *read* secret after a peer key update
+    /// has been authenticated, flipping the incoming key phase bit (RFC 9001
+    /// §6.3). Write keys and the outgoing phase are untouched.
+    pub fn commitApplicationReadKeyUpdate(self: *QuicTlsAdapter) error{ApplicationSecretsMissing}!void {
+        const read_secret = self.applicationTrafficSecret(.read) orelse return error.ApplicationSecretsMissing;
+        const next_read = deriveNextGenerationSecret(read_secret);
+        self.installSecret(Secret.init(.application, .read, &next_read) catch unreachable);
+        self.application_read_key_phase ^= 1;
     }
 
     fn applicationTrafficSecret(self: *const QuicTlsAdapter, direction: Direction) ?[traffic_secret_len]u8 {
@@ -1023,32 +1051,65 @@ test "key update derives chained next-generation secrets" {
     try testing.expectEqualSlices(u8, &s1, &deriveNextGenerationSecret(s0));
 }
 
-test "adapter key update rolls 1-RTT secrets and flips the phase bit" {
+test "local key update rolls only write keys and outgoing phase" {
     var adapter = QuicTlsAdapter{};
-    try testing.expectError(error.ApplicationSecretsMissing, adapter.updateApplicationKeys());
+    try testing.expectError(error.ApplicationSecretsMissing, adapter.updateApplicationWriteKeys());
 
     const read_secret = hexBytes("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff");
     const write_secret = hexBytes("ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100");
     adapter.installSecret(try Secret.init(.application, .read, &read_secret));
     adapter.installSecret(try Secret.init(.application, .write, &write_secret));
 
-    try testing.expectEqual(@as(u1, 0), adapter.applicationKeyPhase());
-    const before = adapter.protectionKeys(.application, .write).?;
+    try testing.expectEqual(@as(u1, 0), adapter.applicationWriteKeyPhase());
+    try testing.expectEqual(@as(u1, 0), adapter.applicationReadKeyPhase());
+    const read_before = adapter.protectionKeys(.application, .read).?;
 
-    try adapter.updateApplicationKeys();
-    try testing.expectEqual(@as(u1, 1), adapter.applicationKeyPhase());
+    try adapter.updateApplicationWriteKeys();
 
-    const after = adapter.protectionKeys(.application, .write).?;
-    try testing.expect(!std.mem.eql(u8, &before.key, &after.key));
-    const expected = deriveAes128GcmKeys(deriveNextGenerationSecret(write_secret));
-    try testing.expectEqualSlices(u8, &expected.key, &after.key);
+    // Only the write side advanced: outgoing phase flipped, read side untouched.
+    try testing.expectEqual(@as(u1, 1), adapter.applicationWriteKeyPhase());
+    try testing.expectEqual(@as(u1, 0), adapter.applicationReadKeyPhase());
+    const expected_write = deriveAes128GcmKeys(deriveNextGenerationSecret(write_secret));
+    try testing.expectEqualSlices(u8, &expected_write.key, &adapter.protectionKeys(.application, .write).?.key);
+    // Read keys still decrypt the peer's current (old) key phase.
+    try testing.expectEqualSlices(u8, &read_before.key, &adapter.protectionKeys(.application, .read).?.key);
+}
 
-    // A second update flips the phase bit back and chains the secret again.
-    try adapter.updateApplicationKeys();
-    try testing.expectEqual(@as(u1, 0), adapter.applicationKeyPhase());
-    const twice = adapter.protectionKeys(.application, .write).?;
-    const expected_twice = deriveAes128GcmKeys(deriveNextGenerationSecret(deriveNextGenerationSecret(write_secret)));
-    try testing.expectEqualSlices(u8, &expected_twice.key, &twice.key);
+test "peer key update advances only read keys and incoming phase" {
+    var adapter = QuicTlsAdapter{};
+    const read_secret = hexBytes("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff");
+    const write_secret = hexBytes("ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100");
+    adapter.installSecret(try Secret.init(.application, .read, &read_secret));
+    adapter.installSecret(try Secret.init(.application, .write, &write_secret));
+
+    const write_before = adapter.protectionKeys(.application, .write).?;
+
+    // Trial-decrypt keys for the next peer phase are derived without committing.
+    const next_read = adapter.nextApplicationReadKeys().?;
+    const expected_next_read = deriveAes128GcmKeys(deriveNextGenerationSecret(read_secret));
+    try testing.expectEqualSlices(u8, &expected_next_read.key, &next_read.key);
+    // Not yet committed: current read keys and phases are unchanged.
+    try testing.expectEqual(@as(u1, 0), adapter.applicationReadKeyPhase());
+    try testing.expectEqualSlices(u8, &deriveAes128GcmKeys(read_secret).key, &adapter.protectionKeys(.application, .read).?.key);
+
+    // After the peer packet authenticates, commit the read key update.
+    try adapter.commitApplicationReadKeyUpdate();
+    try testing.expectEqual(@as(u1, 1), adapter.applicationReadKeyPhase());
+    try testing.expectEqual(@as(u1, 0), adapter.applicationWriteKeyPhase());
+    try testing.expectEqualSlices(u8, &expected_next_read.key, &adapter.protectionKeys(.application, .read).?.key);
+    // Write keys and outgoing phase were not disturbed.
+    try testing.expectEqualSlices(u8, &write_before.key, &adapter.protectionKeys(.application, .write).?.key);
+
+    // Read updates chain from the now-current read secret.
+    const expected_second = deriveAes128GcmKeys(deriveNextGenerationSecret(deriveNextGenerationSecret(read_secret)));
+    try testing.expectEqualSlices(u8, &expected_second.key, &adapter.nextApplicationReadKeys().?.key);
+}
+
+test "key update helpers require the corresponding application secret" {
+    var adapter = QuicTlsAdapter{};
+    try testing.expectError(error.ApplicationSecretsMissing, adapter.updateApplicationWriteKeys());
+    try testing.expectError(error.ApplicationSecretsMissing, adapter.commitApplicationReadKeyUpdate());
+    try testing.expectEqual(@as(?PacketProtectionKeys, null), adapter.nextApplicationReadKeys());
 }
 
 test "adapter guards 0-RTT keys behind explicit config" {

@@ -10,9 +10,11 @@ All notable user-facing changes to Tardigrade are documented here.
   protection (`applyHeaderProtection` / `removeHeaderProtection`) with
   packet-number reconstruction wired through `packet.decodePacketNumber` and
   RFC 9001 Appendix A.2 sample coverage; RFC 9001 §6 key updates
-  (`deriveNextGenerationSecret`, `updateApplicationKeys`) that roll the 1-RTT
-  read/write secrets and flip the key-phase bit; peer transport parameters that
-  are only exposed after the handshake authenticates them; a
+  (`deriveNextGenerationSecret`) with direction-independent phase tracking —
+  `updateApplicationWriteKeys` rolls the local send secret and outgoing phase
+  while `nextApplicationReadKeys` / `commitApplicationReadKeyUpdate` advance the
+  receive secret only once a peer key update authenticates; peer transport
+  parameters that are only exposed after the handshake authenticates them; a
   `config.zero_rtt_enabled` guard (default off) so the adapter refuses 0-RTT
   keys unless an operator opts in; ALPN and certificate-validation accessors;
   and an adapter-level `sealPacketPayload` / `openPacketPayload` seam with

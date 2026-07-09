@@ -71,6 +71,9 @@ pub const Config = struct {
     initial_max_streams_uni: u64 = 16,
     retry_policy: RetryPolicy = .off,
     migration_policy: MigrationPolicy = .disabled,
+    /// 0-RTT is off unless an operator explicitly opts in, given its replay
+    /// exposure (RFC 9001 §9.2). The TLS adapter refuses 0-RTT keys while false.
+    zero_rtt_enabled: bool = false,
     observability: Observability = .{},
     qpack: QpackConfig = .{},
 
@@ -129,6 +132,7 @@ test "default QUIC config maps to conservative transport parameters" {
     try std.testing.expectEqual(@as(u64, 4), params.active_connection_id_limit);
     try std.testing.expectEqual(@as(u64, 1200), params.max_udp_payload_size);
     try std.testing.expect(params.disable_active_migration);
+    try std.testing.expect(!cfg.zero_rtt_enabled);
     try std.testing.expectEqual(QpackMode.static_only, cfg.qpack.mode);
 }
 

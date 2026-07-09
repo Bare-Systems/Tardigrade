@@ -8,13 +8,16 @@
 //! library type escapes this module. Initial-secret derivation and key updates
 //! also live here.
 //!
-//! Status: foundation slice — adapter contract, CRYPTO reassembly, and AEAD
-//! packet protection for every encryption level (Initial, Handshake, 1-RTT) are
-//! in place for the TLS_AES_128_GCM_SHA256 suite. Backend TLS driving, further
-//! cipher suites, and key updates land in later #249 slices.
+//! Status: the adapter contract, CRYPTO reassembly, AEAD packet protection and
+//! header protection for every encryption level (Initial, Handshake, 1-RTT),
+//! packet-number reconstruction wiring, key updates, authenticated transport
+//! parameters, ALPN/certificate reporting, and deprotection metrics are all in
+//! place for the TLS_AES_128_GCM_SHA256 suite. Driving a concrete TLS 1.3
+//! backend and adding further cipher suites remain follow-up work.
 
 const std = @import("std");
 const config = @import("config.zig");
+const packet = @import("packet.zig");
 
 const crypto = std.crypto;
 const tls = std.crypto.tls;
@@ -39,6 +42,10 @@ pub const aead_key_len = Aes128Gcm.key_length;
 pub const aead_iv_len = Aes128Gcm.nonce_length;
 pub const header_protection_key_len = Aes128Gcm.key_length;
 pub const packet_protection_tag_len = Aes128Gcm.tag_length;
+/// Ciphertext sample size for header protection (RFC 9001 §5.4.1: one AES block).
+pub const header_protection_sample_len = 16;
+/// Largest QUIC packet-number encoding (RFC 9000 §17.1: 1..4 bytes).
+pub const max_packet_number_length = 4;
 pub const max_packet_number: u64 = (@as(u64, 1) << 62) - 1;
 
 pub const EncryptionLevel = enum(u2) {
@@ -223,13 +230,68 @@ pub const PacketProtectionKeys = struct {
         return out[0..ciphertext_len];
     }
 
-    pub fn headerProtectionMask(self: *const PacketProtectionKeys, sample: [16]u8) [5]u8 {
+    pub fn headerProtectionMask(self: *const PacketProtectionKeys, sample: [header_protection_sample_len]u8) [5]u8 {
         const aes = Aes128.initEnc(self.hp);
-        var block: [16]u8 = undefined;
+        var block: [header_protection_sample_len]u8 = undefined;
         aes.encrypt(&block, &sample);
         return block[0..5].*;
     }
+
+    /// Apply QUIC header protection in place (RFC 9001 §5.4.1). `first_byte` is
+    /// the packet's first byte and `packet_number_field` the 1..4 encoded
+    /// packet-number bytes already written into the header; both are masked with
+    /// the value derived from `sample`. The long/short header form is read from
+    /// the (unprotected) high bit of `first_byte`.
+    pub fn applyHeaderProtection(
+        self: *const PacketProtectionKeys,
+        first_byte: *u8,
+        packet_number_field: []u8,
+        sample: [header_protection_sample_len]u8,
+    ) void {
+        std.debug.assert(packet_number_field.len >= 1 and packet_number_field.len <= max_packet_number_length);
+        const mask = self.headerProtectionMask(sample);
+        first_byte.* ^= mask[0] & firstByteMask(first_byte.*);
+        for (packet_number_field, 0..) |*byte, index| byte.* ^= mask[1 + index];
+    }
+
+    /// Result of removing header protection: the recovered packet-number length
+    /// (1..4) and the truncated packet number as sent on the wire. Feed
+    /// `truncated_packet_number` to `packet.decodePacketNumber` with the largest
+    /// processed packet number to reconstruct the full value.
+    pub const RemovedHeaderProtection = struct {
+        packet_number_length: usize,
+        truncated_packet_number: u64,
+    };
+
+    /// Remove QUIC header protection in place (RFC 9001 §5.4.1). `sampled_pn`
+    /// must hold the four bytes at the packet-number offset (the maximum-length
+    /// field, always present because the header-protection sample follows it);
+    /// only the recovered packet-number length is unmasked. The packet-number
+    /// length is not known until the first byte is unmasked, so it is returned.
+    pub fn removeHeaderProtection(
+        self: *const PacketProtectionKeys,
+        first_byte: *u8,
+        sampled_pn: *[max_packet_number_length]u8,
+        sample: [header_protection_sample_len]u8,
+    ) RemovedHeaderProtection {
+        const mask = self.headerProtectionMask(sample);
+        first_byte.* ^= mask[0] & firstByteMask(first_byte.*);
+        const packet_number_length: usize = @as(usize, first_byte.* & 0x03) + 1;
+        var truncated: u64 = 0;
+        var index: usize = 0;
+        while (index < packet_number_length) : (index += 1) {
+            sampled_pn[index] ^= mask[1 + index];
+            truncated = (truncated << 8) | sampled_pn[index];
+        }
+        return .{ .packet_number_length = packet_number_length, .truncated_packet_number = truncated };
+    }
 };
+
+/// Header-protection first-byte mask: 4 low bits for long headers (high bit
+/// set), 5 low bits for short headers (RFC 9001 §5.4.1).
+fn firstByteMask(first_byte: u8) u8 {
+    return if (first_byte & 0x80 != 0) 0x0f else 0x1f;
+}
 
 fn validatePacketNumber(packet_number: u64) error{InvalidPacketNumber}!void {
     if (packet_number > max_packet_number) return error.InvalidPacketNumber;
@@ -268,6 +330,13 @@ pub fn deriveAes128GcmKeys(secret: [traffic_secret_len]u8) PacketProtectionKeys 
         .iv = tls.hkdfExpandLabel(HkdfSha256, secret, "quic iv", "", aead_iv_len),
         .hp = tls.hkdfExpandLabel(HkdfSha256, secret, "quic hp", "", header_protection_key_len),
     };
+}
+
+/// Derive the next-generation application traffic secret for a key update
+/// (RFC 9001 §6.1): `secret_<n+1> = HKDF-Expand-Label(secret_<n>, "quic ku")`.
+/// Applies to the 1-RTT read and write secrets only.
+pub fn deriveNextGenerationSecret(secret: [traffic_secret_len]u8) [traffic_secret_len]u8 {
+    return tls.hkdfExpandLabel(HkdfSha256, secret, "quic ku", "", traffic_secret_len);
 }
 
 pub const ByteRange = struct {
@@ -450,21 +519,59 @@ pub const CryptoOutput = struct {
     }
 };
 
+/// Packet-protection counters exposed for observability (#255) and to satisfy
+/// the requirement that deprotection failures are reported deterministically.
+pub const Metrics = struct {
+    packets_protected: u64 = 0,
+    packets_deprotected: u64 = 0,
+    deprotection_failures: u64 = 0,
+};
+
 pub const QuicTlsAdapter = struct {
     local_transport_parameters: ?config.TransportParameters = null,
+    peer_transport_parameters: ?config.TransportParameters = null,
     peer_transport_parameters_authenticated: bool = false,
     reassembler: CryptoReassembler = .{},
     outbound: [4]CryptoOutput = .{ .{}, .{}, .{}, .{} },
     secrets: SecretStore = .{},
     alpn_h3: bool = false,
     certificate_state: CertificateState = .not_checked,
+    /// 0-RTT is disabled unless explicitly enabled via config (RFC 9001 §4.6).
+    zero_rtt_enabled: bool = false,
+    /// Current 1-RTT key phase bit (RFC 9001 §6); toggled on each key update.
+    application_key_phase: u1 = 0,
+    metrics: Metrics = .{},
 
     pub fn setLocalTransportParameters(self: *QuicTlsAdapter, params: config.TransportParameters) void {
         self.local_transport_parameters = params;
     }
 
+    /// Record the peer's transport parameters as received in the handshake.
+    /// They are not trusted until `authenticatePeerTransportParameters` marks
+    /// the handshake authenticated, so `peerTransportParameters` returns null
+    /// until then.
+    pub fn setPeerTransportParameters(self: *QuicTlsAdapter, params: config.TransportParameters) void {
+        self.peer_transport_parameters = params;
+        self.peer_transport_parameters_authenticated = false;
+    }
+
     pub fn authenticatePeerTransportParameters(self: *QuicTlsAdapter) void {
         self.peer_transport_parameters_authenticated = true;
+    }
+
+    /// The peer's transport parameters, but only once they have been
+    /// authenticated through the handshake. Returns null while unauthenticated,
+    /// so callers cannot act on unverified parameters.
+    pub fn peerTransportParameters(self: *const QuicTlsAdapter) ?config.TransportParameters {
+        if (!self.peer_transport_parameters_authenticated) return null;
+        return self.peer_transport_parameters;
+    }
+
+    /// Enable or disable 0-RTT. Off by default; callers wire this from
+    /// `config` after making the replay-safety product decision (out of scope
+    /// for #249).
+    pub fn setZeroRttEnabled(self: *QuicTlsAdapter, enabled: bool) void {
+        self.zero_rtt_enabled = enabled;
     }
 
     pub fn receiveCrypto(self: *QuicTlsAdapter, level: EncryptionLevel, offset: u64, data: []const u8) error{ CryptoBufferTooLarge, TooManyCryptoRanges, InvalidCryptoLevel }!void {
@@ -516,12 +623,78 @@ pub const QuicTlsAdapter = struct {
     /// installed traffic secret. Works for Initial, Handshake, and 1-RTT
     /// (`.application`) once the corresponding secret has been installed —
     /// Initial via `installInitialSecrets`, later levels via `installSecret`
-    /// with the TLS-exported traffic secret. Returns null when no secret is
-    /// installed or its length does not match the SHA-256 suite.
+    /// with the TLS-exported traffic secret. Returns null when 0-RTT is
+    /// requested but disabled, when no secret is installed, or when its length
+    /// does not match the SHA-256 suite.
     pub fn protectionKeys(self: *const QuicTlsAdapter, level: EncryptionLevel, direction: Direction) ?PacketProtectionKeys {
+        if (level == .zero_rtt and !self.zero_rtt_enabled) return null;
         const installed_secret = self.secret(level, direction) orelse return null;
         if (installed_secret.len != traffic_secret_len) return null;
         return deriveAes128GcmKeys(installed_secret.bytes[0..traffic_secret_len].*);
+    }
+
+    /// Seal `plaintext` for `level`/`direction` into `out`, tracking a protected
+    /// packet count. Returns error.KeysUnavailable when no usable secret is
+    /// installed for the level.
+    pub fn sealPacketPayload(
+        self: *QuicTlsAdapter,
+        level: EncryptionLevel,
+        direction: Direction,
+        packet_number: u64,
+        header: []const u8,
+        plaintext: []const u8,
+        out: []u8,
+    ) error{ KeysUnavailable, InvalidPacketNumber, OutputTooSmall }![]u8 {
+        const keys = self.protectionKeys(level, direction) orelse return error.KeysUnavailable;
+        const sealed = try keys.sealPayload(packet_number, header, plaintext, out);
+        self.metrics.packets_protected += 1;
+        return sealed;
+    }
+
+    /// Remove packet protection for `level`/`direction`, incrementing the
+    /// deprotection counters. Authentication failures are counted separately so
+    /// the connection layer can act on repeated forgery deterministically.
+    pub fn openPacketPayload(
+        self: *QuicTlsAdapter,
+        level: EncryptionLevel,
+        direction: Direction,
+        packet_number: u64,
+        header: []const u8,
+        protected_payload: []const u8,
+        out: []u8,
+    ) error{ KeysUnavailable, InvalidPacketNumber, ProtectedPayloadTooShort, OutputTooSmall, AuthenticationFailed }![]u8 {
+        const keys = self.protectionKeys(level, direction) orelse return error.KeysUnavailable;
+        const plaintext = keys.openPayload(packet_number, header, protected_payload, out) catch |err| {
+            if (err == error.AuthenticationFailed) self.metrics.deprotection_failures += 1;
+            return err;
+        };
+        self.metrics.packets_deprotected += 1;
+        return plaintext;
+    }
+
+    /// Current 1-RTT key phase bit (RFC 9001 §6).
+    pub fn applicationKeyPhase(self: *const QuicTlsAdapter) u1 {
+        return self.application_key_phase;
+    }
+
+    /// Roll the 1-RTT read and write secrets to the next generation and flip the
+    /// key phase bit (RFC 9001 §6.1). Requires both application secrets to be
+    /// installed; the derived secrets replace them in place.
+    pub fn updateApplicationKeys(self: *QuicTlsAdapter) error{ApplicationSecretsMissing}!void {
+        const read_secret = self.applicationTrafficSecret(.read) orelse return error.ApplicationSecretsMissing;
+        const write_secret = self.applicationTrafficSecret(.write) orelse return error.ApplicationSecretsMissing;
+        const next_read = deriveNextGenerationSecret(read_secret);
+        const next_write = deriveNextGenerationSecret(write_secret);
+        // Secrets are exactly traffic_secret_len, so Secret.init cannot overflow.
+        self.installSecret(Secret.init(.application, .read, &next_read) catch unreachable);
+        self.installSecret(Secret.init(.application, .write, &next_write) catch unreachable);
+        self.application_key_phase ^= 1;
+    }
+
+    fn applicationTrafficSecret(self: *const QuicTlsAdapter, direction: Direction) ?[traffic_secret_len]u8 {
+        const installed_secret = self.secret(.application, direction) orelse return null;
+        if (installed_secret.len != traffic_secret_len) return null;
+        return installed_secret.bytes[0..traffic_secret_len].*;
     }
 
     pub fn discardSecrets(self: *QuicTlsAdapter, level: EncryptionLevel) void {
@@ -530,6 +703,20 @@ pub const QuicTlsAdapter = struct {
 
     pub fn markAlpn(self: *QuicTlsAdapter, protocol: []const u8) void {
         self.alpn_h3 = std.mem.eql(u8, protocol, "h3");
+    }
+
+    /// Whether ALPN negotiated `h3` for the future HTTP/3 layer.
+    pub fn negotiatedH3(self: *const QuicTlsAdapter) bool {
+        return self.alpn_h3;
+    }
+
+    /// Report the peer certificate validation outcome from the TLS backend.
+    pub fn setCertificateState(self: *QuicTlsAdapter, state: CertificateState) void {
+        self.certificate_state = state;
+    }
+
+    pub fn certificateState(self: *const QuicTlsAdapter) CertificateState {
+        return self.certificate_state;
     }
 };
 
@@ -779,6 +966,159 @@ test "protection keys reject a traffic secret of the wrong length" {
     const short_secret = [_]u8{0xab} ** (traffic_secret_len - 1);
     adapter.installSecret(try Secret.init(.application, .write, &short_secret));
     try testing.expectEqual(@as(?PacketProtectionKeys, null), adapter.protectionKeys(.application, .write));
+}
+
+test "header protection matches the RFC 9001 client Initial sample" {
+    var dcid: [8]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&dcid, "8394c8f03e515708");
+    const secrets = try deriveInitialSecretsV1(&dcid);
+    const sample = hexBytes("d1b1c98dd7689fb8ec11d242b123dc9b");
+
+    // Apply: unprotected long header 0xc3 + 4-byte packet number 2 protect to
+    // the wire bytes shown in RFC 9001 Appendix A.2.
+    var first_byte: u8 = 0xc3;
+    var pn_field = [_]u8{ 0x00, 0x00, 0x00, 0x02 };
+    secrets.client.applyHeaderProtection(&first_byte, &pn_field, sample);
+    try testing.expectEqual(@as(u8, 0xc0), first_byte);
+    try expectHex("7b9aec34", &pn_field);
+
+    // Remove: reverse the transformation and recover the packet-number length
+    // from the unmasked first byte.
+    var protected_first: u8 = 0xc0;
+    var sampled_pn = [_]u8{ 0x7b, 0x9a, 0xec, 0x34 };
+    const removed = secrets.client.removeHeaderProtection(&protected_first, &sampled_pn, sample);
+    try testing.expectEqual(@as(u8, 0xc3), protected_first);
+    try testing.expectEqual(@as(usize, 4), removed.packet_number_length);
+    try testing.expectEqual(@as(u64, 2), removed.truncated_packet_number);
+
+    // Packet-number reconstruction is wired through the packet layer.
+    const pn_bits: u6 = @intCast(removed.packet_number_length * 8);
+    try testing.expectEqual(@as(u64, 2), packet.decodePacketNumber(1, removed.truncated_packet_number, pn_bits));
+}
+
+test "header protection round-trips for short headers" {
+    const secret = hexBytes("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
+    const keys = deriveAes128GcmKeys(secret);
+    const sample = hexBytes("101112131415161718191a1b1c1d1e1f");
+
+    // Short header (high bit clear), 1-byte packet number, key phase bit set.
+    var first_byte: u8 = 0x50;
+    var pn_field = [_]u8{0x9c};
+    keys.applyHeaderProtection(&first_byte, &pn_field, sample);
+
+    var sampled_pn = [_]u8{ pn_field[0], 0x00, 0x00, 0x00 };
+    const removed = keys.removeHeaderProtection(&first_byte, &sampled_pn, sample);
+    try testing.expectEqual(@as(u8, 0x50), first_byte);
+    try testing.expectEqual(@as(usize, 1), removed.packet_number_length);
+    try testing.expectEqual(@as(u64, 0x9c), removed.truncated_packet_number);
+}
+
+test "key update derives chained next-generation secrets" {
+    const s0 = hexBytes("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
+    const s1 = deriveNextGenerationSecret(s0);
+    const s2 = deriveNextGenerationSecret(s1);
+    try testing.expect(!std.mem.eql(u8, &s0, &s1));
+    try testing.expect(!std.mem.eql(u8, &s1, &s2));
+    // Deterministic for a given input secret.
+    try testing.expectEqualSlices(u8, &s1, &deriveNextGenerationSecret(s0));
+}
+
+test "adapter key update rolls 1-RTT secrets and flips the phase bit" {
+    var adapter = QuicTlsAdapter{};
+    try testing.expectError(error.ApplicationSecretsMissing, adapter.updateApplicationKeys());
+
+    const read_secret = hexBytes("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff");
+    const write_secret = hexBytes("ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100");
+    adapter.installSecret(try Secret.init(.application, .read, &read_secret));
+    adapter.installSecret(try Secret.init(.application, .write, &write_secret));
+
+    try testing.expectEqual(@as(u1, 0), adapter.applicationKeyPhase());
+    const before = adapter.protectionKeys(.application, .write).?;
+
+    try adapter.updateApplicationKeys();
+    try testing.expectEqual(@as(u1, 1), adapter.applicationKeyPhase());
+
+    const after = adapter.protectionKeys(.application, .write).?;
+    try testing.expect(!std.mem.eql(u8, &before.key, &after.key));
+    const expected = deriveAes128GcmKeys(deriveNextGenerationSecret(write_secret));
+    try testing.expectEqualSlices(u8, &expected.key, &after.key);
+
+    // A second update flips the phase bit back and chains the secret again.
+    try adapter.updateApplicationKeys();
+    try testing.expectEqual(@as(u1, 0), adapter.applicationKeyPhase());
+    const twice = adapter.protectionKeys(.application, .write).?;
+    const expected_twice = deriveAes128GcmKeys(deriveNextGenerationSecret(deriveNextGenerationSecret(write_secret)));
+    try testing.expectEqualSlices(u8, &expected_twice.key, &twice.key);
+}
+
+test "adapter guards 0-RTT keys behind explicit config" {
+    var adapter = QuicTlsAdapter{};
+    const secret = hexBytes("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
+    adapter.installSecret(try Secret.init(.zero_rtt, .write, &secret));
+
+    // Disabled by default: no 0-RTT keys even though a secret is installed.
+    try testing.expectEqual(@as(?PacketProtectionKeys, null), adapter.protectionKeys(.zero_rtt, .write));
+
+    adapter.setZeroRttEnabled(true);
+    try testing.expect(adapter.protectionKeys(.zero_rtt, .write) != null);
+}
+
+test "peer transport parameters require handshake authentication" {
+    var adapter = QuicTlsAdapter{};
+    try testing.expectEqual(@as(?config.TransportParameters, null), adapter.peerTransportParameters());
+
+    const params = try (config.Config{}).transportParameters();
+    adapter.setPeerTransportParameters(params);
+    // Still withheld until the handshake authenticates them.
+    try testing.expectEqual(@as(?config.TransportParameters, null), adapter.peerTransportParameters());
+
+    adapter.authenticatePeerTransportParameters();
+    const authenticated = adapter.peerTransportParameters() orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(params.max_idle_timeout_ms, authenticated.max_idle_timeout_ms);
+}
+
+test "adapter reports ALPN and certificate validation state" {
+    var adapter = QuicTlsAdapter{};
+    try testing.expect(!adapter.negotiatedH3());
+    adapter.markAlpn("h3");
+    try testing.expect(adapter.negotiatedH3());
+    adapter.markAlpn("h2");
+    try testing.expect(!adapter.negotiatedH3());
+
+    try testing.expectEqual(CertificateState.not_checked, adapter.certificateState());
+    adapter.setCertificateState(.valid);
+    try testing.expectEqual(CertificateState.valid, adapter.certificateState());
+}
+
+test "adapter packet protection tracks metrics and counts deprotection failures" {
+    var adapter = QuicTlsAdapter{};
+    var out: [64]u8 = undefined;
+
+    // No keys installed yet: deprotection is unavailable, not a failure.
+    try testing.expectError(error.KeysUnavailable, adapter.openPacketPayload(.application, .read, 0, "hdr", "0123456789abcdef", &out));
+    try testing.expectEqual(@as(u64, 0), adapter.metrics.deprotection_failures);
+
+    const secret = hexBytes("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
+    adapter.installSecret(try Secret.init(.application, .write, &secret));
+    adapter.installSecret(try Secret.init(.application, .read, &secret));
+
+    const header = "\x50\x00\x00\x00\x03";
+    const plaintext = "one-rtt payload through the adapter seam";
+    var sealed: [128]u8 = undefined;
+    const protected = try adapter.sealPacketPayload(.application, .write, 3, header, plaintext, &sealed);
+    try testing.expectEqual(@as(u64, 1), adapter.metrics.packets_protected);
+
+    var opened: [128]u8 = undefined;
+    const recovered = try adapter.openPacketPayload(.application, .read, 3, header, protected, &opened);
+    try testing.expectEqualSlices(u8, plaintext, recovered);
+    try testing.expectEqual(@as(u64, 1), adapter.metrics.packets_deprotected);
+
+    // A forged packet is rejected and counted deterministically.
+    var tampered: [128]u8 = undefined;
+    @memcpy(tampered[0..protected.len], protected);
+    tampered[0] ^= 0xff;
+    try testing.expectError(error.AuthenticationFailed, adapter.openPacketPayload(.application, .read, 3, header, tampered[0..protected.len], &opened));
+    try testing.expectEqual(@as(u64, 1), adapter.metrics.deprotection_failures);
 }
 
 test "CRYPTO reassembly emits only contiguous bytes by encryption level" {

@@ -571,6 +571,13 @@ pub const QuicTlsAdapter = struct {
         return self.peer_transport_parameters;
     }
 
+    /// Whether peer transport parameters have been received at all, regardless
+    /// of authentication. The handshake driver uses this to fail deterministically
+    /// when a peer completes the handshake without ever sending them.
+    pub fn peerTransportParametersReceived(self: *const QuicTlsAdapter) bool {
+        return self.peer_transport_parameters != null;
+    }
+
     /// Enable or disable 0-RTT. Off by default; callers wire this from
     /// `config` after making the replay-safety product decision (out of scope
     /// for #249).

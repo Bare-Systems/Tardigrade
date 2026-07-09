@@ -5,6 +5,18 @@ All notable user-facing changes to Tardigrade are documented here.
 ## [Unreleased]
 
 ### Reliability
+- **Pure Zig QUIC Retry, address validation, and anti-amplification (#250)** —
+  adds the server safety mechanisms for unauthenticated UDP in `src/quic/path.zig`
+  and `src/quic/cid.zig`: an `AntiAmplification` ledger enforcing the RFC 9000
+  §8.1 3x send budget (saturating, so certificate/handshake bytes and
+  retransmissions cannot overflow it); `RetryTokens`, AEAD-sealed
+  address-validation tokens with timestamp/expiry, peer-address binding, a
+  rotating key ring, and tamper/unknown-key rejection; the RFC 9001 §5.8 Retry
+  integrity tag (`retryIntegrityTag` / `verifyRetryIntegrity`), verified against
+  the Appendix A.4 vector; stateless-reset token derivation and reset-packet
+  construction (`statelessResetToken`, `StatelessReset`) with loop-safe sizing
+  and eligibility; and a `Metrics` struct counting Retry packets sent, invalid
+  tokens, amplification-blocked sends, stateless resets, and unknown-CID packets.
 - **Pure Zig QUIC handshake driver (#296)** — adds `src/quic/tls_handshake.zig`,
   the backend-agnostic state machine that drives a TLS 1.3 handshake through the
   `QuicTlsAdapter` seam: it routes handshake bytes through per-level CRYPTO

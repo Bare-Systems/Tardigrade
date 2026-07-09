@@ -157,9 +157,8 @@ pub const UpstreamPool = struct {
     /// the hot proxy path need not take the pool mutex just to count.
     protocol_h1_requests: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     protocol_h2_requests: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    /// Streaming uploads intentionally stay on h1 until h2 gains an
-    /// incremental request-body DATA API. Count those fallback decisions so the
-    /// deferred #145 work is visible to operators.
+    /// Count streaming uploads that requested h2/h2c but still had to use h1
+    /// because the h2 pool was unavailable for the exchange.
     h2_streaming_upload_fallbacks: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
     pub fn init(allocator: std.mem.Allocator, config: Config) UpstreamPool {

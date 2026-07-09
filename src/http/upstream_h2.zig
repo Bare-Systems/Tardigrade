@@ -81,6 +81,10 @@ pub const Request = struct {
     /// headers (and Host) are dropped before sending.
     headers: []const std.http.Header = &.{},
     body: []const u8 = "",
+    /// Whether this request's outbound body is complete after `body`.
+    /// Streaming uploads set this false, write more DATA incrementally, then
+    /// finish with a final DATA frame carrying END_STREAM.
+    end_stream: bool = true,
 };
 
 pub const Response = struct {
@@ -665,11 +669,27 @@ pub fn H2Conn(comptime Transport: type) type {
         /// downstream client backpressures its own stream while the connection
         /// window keeps other streams on the shared connection flowing.
         pub fn requestStreaming(self: *Self, req: Request) !*Stream {
+            const stream = try self.openStreaming(req);
+            errdefer self.finishStreaming(stream);
+            try self.waitStreamingResponseHead(stream);
+            return stream;
+        }
+
+        /// Start a streaming request and return immediately after the request
+        /// HEADERS and any initial `req.body` DATA have reached the wire. This
+        /// is the entry point for streaming uploads: the caller can then send
+        /// request-body DATA incrementally before waiting for response headers.
+        pub fn openStreaming(self: *Self, req: Request) !*Stream {
             const stream = try self.beginStream(true);
             errdefer self.finishStreaming(stream);
-
             try self.sendRequest(stream, req);
+            return stream;
+        }
 
+        /// Wait until response headers for an opened streaming request have
+        /// been decoded. Once this returns, `stream.status.?` and
+        /// `stream.headers.items` are stable for response-head relay.
+        pub fn waitStreamingResponseHead(self: *Self, stream: *Stream) !void {
             self.state_mutex.lock();
             stream.wait_deadline_ms = nowMs() + self.deadline_ms;
             while (!stream.headers_done and !stream.done and stream.err == null and self.conn_err == null) {
@@ -682,7 +702,23 @@ pub fn H2Conn(comptime Transport: type) type {
 
             if (stream_err) |e| return e;
             if (status == null) return error.Http2MissingStatus;
-            return stream;
+        }
+
+        /// Send one chunk of a streaming request body. `end_stream` marks the
+        /// final body chunk; when the final chunk is empty an empty DATA frame
+        /// carrying END_STREAM is sent. The method waits for connection and
+        /// stream send window with no write mutex held, preserving the actor's
+        /// lock-order invariant while backpressuring slow/flow-controlled
+        /// uploads.
+        pub fn writeStreamingRequestBody(self: *Self, stream: *Stream, chunk: []const u8, end_stream: bool) !void {
+            if (chunk.len > 0) {
+                try self.sendBody(stream, chunk, end_stream);
+                return;
+            }
+            if (!end_stream) return;
+            self.write_mutex.lock();
+            defer self.write_mutex.unlock();
+            try frame.writeFrame(self.transport, .data, frame.Flags.END_STREAM, stream.id, &[_]u8{});
         }
 
         /// Copy the next chunk of a streaming response body into `out`,
@@ -809,7 +845,7 @@ pub fn H2Conn(comptime Transport: type) type {
             const block = try hpack.encodeLiteralHeaderBlock(self.allocator, fields.items);
             defer self.allocator.free(block);
 
-            const end_stream = req.body.len == 0;
+            const end_stream = req.end_stream and req.body.len == 0;
             // HEADERS (+CONTINUATION) must be contiguous on the wire, so the
             // whole block goes out under one write_mutex hold. DATA frames may
             // interleave with other streams, so the body sender takes the lock
@@ -822,7 +858,7 @@ pub fn H2Conn(comptime Transport: type) type {
                 try self.writeHeaderBlockLocked(stream.id, block, end_stream);
             }
             stream.wire_opened = true;
-            if (req.body.len > 0) try self.sendBody(stream, req.body);
+            if (req.body.len > 0) try self.sendBody(stream, req.body, req.end_stream);
         }
 
         /// Write a header block as HEADERS (+CONTINUATION) frames. Caller holds
@@ -853,11 +889,11 @@ pub fn H2Conn(comptime Transport: type) type {
         /// window with no lock held, then takes the write mutex per frame so
         /// concurrent streams' DATA may interleave and the reader is never
         /// blocked on write_mutex behind a window wait.
-        fn sendBody(self: *Self, stream: *Stream, full_body: []const u8) !void {
+        fn sendBody(self: *Self, stream: *Stream, full_body: []const u8, end_stream: bool) !void {
             var off: usize = 0;
             while (off < full_body.len) {
                 const budget = try self.reserveSendWindow(stream, full_body.len - off);
-                const is_last = (off + budget) == full_body.len;
+                const is_last = end_stream and (off + budget) == full_body.len;
                 const flags: u8 = if (is_last) frame.Flags.END_STREAM else 0;
                 {
                     self.write_mutex.lock();
@@ -2442,6 +2478,121 @@ test "streaming and buffered requests multiplex together on one connection" {
     server.join();
     _ = std.c.close(fds[1]);
     try testing.expect(all_ok);
+}
+
+const UploadWriterCtx = struct {
+    conn: *H2Conn(*PlainTransport),
+    stream: *Stream,
+    body: []const u8,
+    done: *std.atomic.Value(bool),
+    ok: bool = false,
+};
+
+fn uploadWriterThread(ctx: *UploadWriterCtx) void {
+    ctx.conn.writeStreamingRequestBody(ctx.stream, ctx.body, true) catch return;
+    ctx.ok = true;
+    ctx.done.store(true, .release);
+}
+
+fn cannedStreamingUploadServer(peer_fd: std.posix.fd_t, writer_done: *std.atomic.Value(bool), blocked_observed: *std.atomic.Value(bool), expected_len: usize) void {
+    const a = std.heap.page_allocator;
+    var srv = PlainTransport{ .fd = peer_fd };
+    var preface: [PREFACE.len]u8 = undefined;
+    readExact(&srv, peer_fd, preface[0..], 2000) catch return;
+    frame.writeSettings(a, &srv, &[_][2]u32{}) catch return;
+
+    var req_stream: u31 = 0;
+    while (req_stream == 0) {
+        var fr = readFrameBounded(&srv, peer_fd, a, 2000) catch return;
+        if (fr.typ == .headers) req_stream = fr.stream_id;
+        frame.deinitFrame(a, &fr);
+    }
+
+    var received: usize = 0;
+    while (received < @as(usize, @intCast(PROTOCOL_DEFAULT_WINDOW))) {
+        var fr = readFrameBounded(&srv, peer_fd, a, 2000) catch return;
+        if (fr.typ == .data and fr.stream_id == req_stream) {
+            received += fr.payload.len;
+        }
+        frame.deinitFrame(a, &fr);
+    }
+
+    if (!writer_done.load(.acquire)) blocked_observed.store(true, .release);
+    const inc = windowIncrement(expected_len - received);
+    frame.writeFrame(&srv, .window_update, 0, 0, &inc) catch return;
+    frame.writeFrame(&srv, .window_update, 0, req_stream, &inc) catch return;
+
+    var saw_end = false;
+    while (!saw_end) {
+        var fr = readFrameBounded(&srv, peer_fd, a, 2000) catch return;
+        if (fr.typ == .data and fr.stream_id == req_stream) {
+            received += fr.payload.len;
+            saw_end = (fr.flags & frame.Flags.END_STREAM) != 0;
+        }
+        frame.deinitFrame(a, &fr);
+    }
+    if (received != expected_len) return;
+
+    const head = hpack.encodeLiteralHeaderBlock(a, &[_]hpack.HeaderField{
+        .{ .name = ":status", .value = "200" },
+        .{ .name = "x-uploaded-bytes", .value = "69631" },
+    }) catch return;
+    defer a.free(head);
+    frame.writeFrame(&srv, .headers, frame.Flags.END_HEADERS, req_stream, head) catch return;
+    frame.writeFrame(&srv, .data, frame.Flags.END_STREAM, req_stream, "upload-ok") catch return;
+}
+
+test "streaming request upload sends DATA incrementally and waits for flow-control window" {
+    const upload_len: usize = @as(usize, @intCast(PROTOCOL_DEFAULT_WINDOW)) + 4096;
+    const body = try testing.allocator.alloc(u8, upload_len);
+    defer testing.allocator.free(body);
+    @memset(body, 'u');
+
+    const fds = try makeSocketpair();
+    var writer_done = std.atomic.Value(bool).init(false);
+    var blocked_observed = std.atomic.Value(bool).init(false);
+    const server = try std.Thread.spawn(.{}, cannedStreamingUploadServer, .{ fds[1], &writer_done, &blocked_observed, upload_len });
+
+    var transport = PlainTransport{ .fd = fds[0] };
+    const conn = try H2Conn(*PlainTransport).init(testing.allocator, &transport, fds[0], 3000, null, null, null);
+
+    const stream = try conn.openStreaming(.{
+        .method = "POST",
+        .scheme = "http",
+        .authority = "upload.test",
+        .path = "/upload",
+        .end_stream = false,
+    });
+
+    var writer_ctx = UploadWriterCtx{
+        .conn = conn,
+        .stream = stream,
+        .body = body,
+        .done = &writer_done,
+    };
+    const writer = try std.Thread.spawn(.{}, uploadWriterThread, .{&writer_ctx});
+
+    try conn.waitStreamingResponseHead(stream);
+    try testing.expectEqual(@as(u16, 200), stream.status.?);
+
+    var got: std.ArrayList(u8) = .empty;
+    defer got.deinit(testing.allocator);
+    var buf: [32]u8 = undefined;
+    while (true) {
+        const n = try conn.readStreamingBody(stream, buf[0..]);
+        if (n == 0) break;
+        try got.appendSlice(testing.allocator, buf[0..n]);
+    }
+
+    conn.finishStreaming(stream);
+    writer.join();
+    conn.deinit();
+    server.join();
+    _ = std.c.close(fds[1]);
+
+    try testing.expect(writer_ctx.ok);
+    try testing.expect(blocked_observed.load(.acquire));
+    try testing.expectEqualStrings("upload-ok", got.items);
 }
 
 test "h2 exchange round-trips a request and response over a socketpair" {

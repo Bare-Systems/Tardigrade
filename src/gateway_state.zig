@@ -1525,7 +1525,7 @@ pub const GatewayState = struct {
         try out.print("tardigrade_upstream_protocol_requests_total{{protocol=\"h2\"}} {d}\n", .{proto.h2});
 
         try out.appendSlice(
-            \\# HELP tardigrade_upstream_h2_streaming_upload_fallback_total Streaming upload requests that requested h2/h2c upstreams but fell back to h1 because incremental h2 request-body DATA is not implemented
+            \\# HELP tardigrade_upstream_h2_streaming_upload_fallback_total Streaming upload requests that requested h2/h2c upstreams but fell back to h1 because the h2 pool was unavailable
             \\# TYPE tardigrade_upstream_h2_streaming_upload_fallback_total counter
             \\
         );
@@ -3368,7 +3368,7 @@ test "served Prometheus metrics expose h2 streaming upload fallback counter" {
     const prom = try gs.metricsToPrometheus(std.testing.allocator);
     defer std.testing.allocator.free(prom);
 
-    try std.testing.expect(std.mem.find(u8, prom, "# HELP tardigrade_upstream_h2_streaming_upload_fallback_total Streaming upload requests that requested h2/h2c upstreams but fell back to h1 because incremental h2 request-body DATA is not implemented") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "# HELP tardigrade_upstream_h2_streaming_upload_fallback_total Streaming upload requests that requested h2/h2c upstreams but fell back to h1 because the h2 pool was unavailable") != null);
     try std.testing.expect(std.mem.find(u8, prom, "# TYPE tardigrade_upstream_h2_streaming_upload_fallback_total counter") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_upstream_h2_streaming_upload_fallback_total 1\n") != null);
 }

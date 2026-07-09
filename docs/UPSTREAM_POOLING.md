@@ -85,9 +85,10 @@ structure from the h1 pool:
 
 The remaining HTTP/2 work is intentionally outside #145:
 
-- streaming request uploads over h2 are deferred until the actor has an
-  incremental DATA-send API for slow client bodies; fallback decisions are
-  counted in `tardigrade_upstream_h2_streaming_upload_fallback_total`;
+- streaming request uploads over h2 are tracked by #301 and use the actor's
+  incremental DATA-send API for slow client bodies; unexpected fallback
+  decisions remain counted in
+  `tardigrade_upstream_h2_streaming_upload_fallback_total`;
 - canonical Beelink benchmark capture remains a benchmark-operations task; the
   comparison harness is committed and ready to run.
 
@@ -225,10 +226,12 @@ The actor gains a streaming request mode next to the fully-buffered
   connection itself died.
 
 Streaming **uploads** (`full` mode with a request body relayed from the client)
-stay on the HTTP/1.1 path: the request-body sender currently buffers the body,
-and relaying a slow client upload over the shared connection needs an
-incremental DATA-send API on the actor. Deferred within #145: streaming
-uploads over h2.
+use `openStreaming()` plus incremental `writeStreamingRequestBody()` DATA
+writes before waiting for response headers. Each DATA write reserves h2
+connection and stream send window without holding `write_mutex`, then writes one
+frame under the write mutex, so slow/flow-controlled uploads backpressure the
+client relay without blocking unrelated streams or the reader's control-frame
+writes.
 
 ## Protocol-agnostic stream transport target (#241)
 

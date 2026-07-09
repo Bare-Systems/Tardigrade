@@ -635,6 +635,7 @@ fn streamViaH2Pool(
     method: []const u8,
     extra_headers: []const std.http.Header,
     buffered_body: []const u8,
+    streaming_body: ?StreamingRequestBody,
     read_buf: []u8,
     downstream_conn: anytype,
     downstream_writer: anytype,
@@ -669,7 +670,7 @@ fn streamViaH2Pool(
                 if (h1_pool) |p| p.recordProtocol(false);
                 const start_ms = http.event_loop.monotonicMs();
                 var wrote_downstream = false;
-                const res = try streamProxyOverTransport(allocator, tls_ptr, tls_ptr.fd, read_buf, uri, method, extra_headers, buffered_body, null, downstream_conn, downstream_writer, security, sticky_set_cookie, correlation_id, connect_timeout_ms, read_deadline_ms, cancel_token, &wrote_downstream);
+                const res = try streamProxyOverTransport(allocator, tls_ptr, tls_ptr.fd, read_buf, uri, method, extra_headers, buffered_body, streaming_body, downstream_conn, downstream_writer, security, sticky_set_cookie, correlation_id, connect_timeout_ms, read_deadline_ms, cancel_token, &wrote_downstream);
                 if (h1_pool) |p| p.recordRequestLatency(false, http.event_loop.monotonicMs() - start_ms);
                 return res.result;
             },
@@ -692,20 +693,76 @@ fn streamViaH2Pool(
                 }
 
                 const start_ms = http.event_loop.monotonicMs();
-                const stream = conn.requestStreaming(.{
+                const stream = conn.openStreaming(.{
                     .method = method,
                     .scheme = scheme,
                     .authority = authority,
                     .path = path_buf.written(),
                     .headers = extra_headers,
                     .body = buffered_body,
+                    .body_mode = if (streaming_body == null) .complete else .streaming,
                 }) catch |err| {
                     // Nothing has reached the client yet: evict the dead
                     // connection so new requests do not pick it, and retry
                     // once on connection-level failures.
                     h2_pool.evict(key, conn);
                     h2_pool.release(conn);
-                    if (attempt == 0 and (err == error.Http2GoAway or err == error.Http2ConnectionClosed or err == error.Http2StreamReset)) {
+                    if (streaming_body == null and attempt == 0 and (err == error.Http2GoAway or err == error.Http2ConnectionClosed or err == error.Http2StreamReset)) {
+                        continue;
+                    }
+                    return err;
+                };
+
+                if (streaming_body) |sb| {
+                    var sent: usize = @min(sb.initial_bytes.len, sb.content_length);
+                    if (sent > 0) {
+                        conn.writeStreamingRequestBody(stream, sb.initial_bytes[0..sent], sent == sb.content_length) catch |err| {
+                            conn.finishStreaming(stream);
+                            if (!conn.healthy()) h2_pool.evict(key, conn);
+                            h2_pool.release(conn);
+                            return err;
+                        };
+                    }
+                    while (sent < sb.content_length) {
+                        if (cancelStopped(cancel_token)) {
+                            conn.finishStreaming(stream);
+                            h2_pool.release(conn);
+                            return error.RequestCancelled;
+                        }
+                        const want = @min(read_buf.len, sb.content_length - sent);
+                        const n = downstream_conn.read(read_buf[0..want]) catch {
+                            conn.finishStreaming(stream);
+                            h2_pool.release(conn);
+                            return error.ClientAborted;
+                        };
+                        if (n == 0) {
+                            conn.finishStreaming(stream);
+                            h2_pool.release(conn);
+                            return error.ClientAborted;
+                        }
+                        conn.writeStreamingRequestBody(stream, read_buf[0..n], sent + n == sb.content_length) catch |err| {
+                            conn.finishStreaming(stream);
+                            if (!conn.healthy()) h2_pool.evict(key, conn);
+                            h2_pool.release(conn);
+                            return err;
+                        };
+                        sent += n;
+                    }
+                    if (sb.content_length == 0) {
+                        conn.writeStreamingRequestBody(stream, "", true) catch |err| {
+                            conn.finishStreaming(stream);
+                            if (!conn.healthy()) h2_pool.evict(key, conn);
+                            h2_pool.release(conn);
+                            return err;
+                        };
+                    }
+                }
+
+                conn.waitStreamingResponseHead(stream) catch |err| {
+                    conn.finishStreaming(stream);
+                    if (!conn.healthy()) h2_pool.evict(key, conn);
+                    h2_pool.release(conn);
+                    if (streaming_body == null and attempt == 0 and (err == error.Http2GoAway or err == error.Http2ConnectionClosed or err == error.Http2StreamReset)) {
                         continue;
                     }
                     return err;
@@ -1653,12 +1710,11 @@ fn streamProxyOverTransport(
 /// is pooled (plain or TLS) and per-phase reads are `poll`-bounded, so the
 /// streaming path inherits the #196 timeout enforcement and #141 reuse.
 ///
-/// When `TARDIGRADE_UPSTREAM_PROTOCOL` offers h2 and the target is HTTPS, the
-/// response is multiplexed over the shared per-origin HTTP/2 connection
-/// (#145, Phase 4b PR 4) with bounded per-stream buffering — see
-/// `streamViaH2Pool`. Streaming request bodies (`full` mode uploads) stay on
-/// the HTTP/1.1 path: relaying a slow client upload over the shared h2
-/// connection is deferred.
+/// When `TARDIGRADE_UPSTREAM_PROTOCOL` offers h2 and the target is HTTPS, or
+/// when h2c prior knowledge is explicitly configured for plain HTTP, the
+/// exchange is multiplexed over the shared per-origin HTTP/2 connection. Full
+/// streaming uploads relay request DATA incrementally over the h2 stream; h1 is
+/// used only when h2 is not requested or TLS ALPN negotiates HTTP/1.1.
 pub fn executeStreamingHttpProxyRequest(
     allocator: std.mem.Allocator,
     cfg: *const edge_config.EdgeConfig,
@@ -1733,17 +1789,12 @@ pub fn executeStreamingHttpProxyRequest(
     const read_buf = try allocator.alloc(u8, @max(cfg.proxy_stream_buffer_size, 16 * 1024));
     defer allocator.free(read_buf);
 
-    // HTTP/2 upstream (#145 PR 4): multiplex the streaming response over the
-    // shared per-origin h2 connection when configured — via ALPN for HTTPS
-    // (h1 origins fall back inside) or prior-knowledge h2c for plain HTTP
-    // when explicitly opted in (#237). Streaming uploads stay on the h1 path
-    // below (`offer_h2` remains false there, so ALPN cannot negotiate a
-    // protocol we then would not speak).
+    // HTTP/2 upstream (#145/#301): multiplex the streaming exchange over the
+    // shared per-origin h2 connection when configured — via ALPN for HTTPS (h1
+    // origins fall back inside) or prior-knowledge h2c for plain HTTP when
+    // explicitly opted in (#237).
     const h2_requested_for_streaming = if (is_https) cfg.upstream_protocol.offersH2() else cfg.upstream_protocol.h2cPriorKnowledge();
-    if (streaming_body != null and h2_requested_for_streaming) {
-        if (pool) |p| p.recordH2StreamingUploadFallback();
-    }
-    const stream_h2 = streaming_body == null and h2_requested_for_streaming;
+    const stream_h2 = h2_requested_for_streaming;
     if (stream_h2) {
         if (h2_pool) |hp| {
             const h2_opts: ?http.tls_termination.UpstreamTlsOptions = if (is_https) blk: {
@@ -1751,7 +1802,10 @@ pub fn executeStreamingHttpProxyRequest(
                 o.offer_h2 = true;
                 break :blk o;
             } else null;
-            return streamViaH2Pool(allocator, hp, pool, host, port, h2_opts, uri, method, extra_headers.items, buffered_body, read_buf, downstream_conn, downstream_writer, security, sticky_set_cookie, correlation_id, connect_timeout_ms, read_deadline_ms, cancel_token);
+            return streamViaH2Pool(allocator, hp, pool, host, port, h2_opts, uri, method, extra_headers.items, buffered_body, streaming_body, read_buf, downstream_conn, downstream_writer, security, sticky_set_cookie, correlation_id, connect_timeout_ms, read_deadline_ms, cancel_token);
+        }
+        if (streaming_body != null) {
+            if (pool) |p| p.recordH2StreamingUploadFallback();
         }
     }
     // Everything below runs HTTP/1.1 (counted per request, not per attempt).

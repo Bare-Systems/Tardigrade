@@ -12,6 +12,7 @@ const std = @import("std");
 /// code). The right-aligned codeword is `code >> (32 - nbits)`, which preserves
 /// leading zeros under the explicit `nbits` width.
 const HuffSym = struct { code: u32, nbits: u8 };
+const max_bit_width = 32;
 
 /// Symbol index 256 is the EOS marker; it must never appear in a decoded
 /// stream and is only used to define the padding bit pattern (all ones).
@@ -346,9 +347,10 @@ pub fn decodeAlloc(allocator: std.mem.Allocator, src: []const u8) ![]u8 {
         }
     }
 
-    // Trailing bits must be the most-significant bits of the EOS code (all
-    // ones) and shorter than a full byte (RFC 7541 §5.2). A non-ones remainder
-    // or padding of 8+ bits is malformed.
+    // RFC 7541 §5.2: padding must use the corresponding most-significant bits
+    // of the EOS symbol, which are all ones; reject malformed remainders.
+    // RFC 7541 §5.2: padding must use the corresponding most-significant bits
+    // of the EOS symbol, which are all ones; reject malformed remainders.
     if (node != 0) {
         if (!huff_tree[node].all_ones or huff_tree[node].depth >= 8) {
             return error.InvalidHuffmanCode;
@@ -410,7 +412,8 @@ pub fn encode(src: []const u8, out: []u8) error{OutputOverflow}!usize {
         const entry = huff_table[byte];
         var bit_i: u8 = 0;
         while (bit_i < entry.nbits) : (bit_i += 1) {
-            const bit: u1 = @intCast((entry.code >> @intCast(31 - bit_i)) & 1);
+            // Huffman codes are stored as left-aligned 32-bit values.
+            const bit: u1 = @intCast((entry.code >> @intCast((max_bit_width - 1) - bit_i)) & 1);
             current = (current << 1) | bit;
             used += 1;
             if (used == 8) {

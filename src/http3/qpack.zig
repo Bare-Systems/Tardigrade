@@ -171,8 +171,8 @@ fn decodeInteger(bytes: []const u8, n: u4) IntError!struct { value: u64, len: us
         const addend = @as(u64, byte & 0x7f);
         value = std.math.add(u64, value, std.math.shl(u64, addend, shift)) catch return error.IntegerOverflow;
         if (byte & 0x80 == 0) break;
+        if (shift > 56) return error.IntegerOverflow;
         shift += 7;
-        if (shift > 63) return error.IntegerOverflow;
     }
     return .{ .value = value, .len = index };
 }
@@ -296,7 +296,9 @@ pub fn decode(block: []const u8, fields_out: []HeaderField, scratch: []u8) Decod
     const ric = try decodeInteger(block[pos..], 8);
     if (ric.value != 0) return error.InvalidRequiredInsertCount;
     pos += ric.len;
-    const base = try decodeInteger(block[pos..], 7); // ignores the sign bit
+    if (pos >= block.len) return error.TruncatedBlock;
+    if (block[pos] & 0x80 != 0) return error.InvalidBase;
+    const base = try decodeInteger(block[pos..], 7);
     if (base.value != 0) return error.InvalidBase;
     pos += base.len;
 
@@ -404,6 +406,10 @@ test "prefix integer round-trips across the single/multi-byte boundary" {
             try testing.expectEqual(written, decoded.len);
         }
     }
+}
+
+test "prefix integer rejects excessive continuation bytes deterministically" {
+    try testing.expectError(error.IntegerOverflow, decodeInteger(&.{ 0x3f, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80 }, 6));
 }
 
 fn expectRoundTrip(fields: []const HeaderField) !void {
@@ -517,6 +523,7 @@ test "decoder rejects a non-zero required insert count and base" {
     var scratch: [16]u8 = undefined;
     try testing.expectError(error.InvalidRequiredInsertCount, decode(&.{ 0x01, 0x00 }, &out, &scratch));
     try testing.expectError(error.InvalidBase, decode(&.{ 0x00, 0x01 }, &out, &scratch));
+    try testing.expectError(error.InvalidBase, decode(&.{ 0x00, 0x80 }, &out, &scratch));
 }
 
 test "decoder rejects truncated blocks and malformed Huffman strings without leaking" {

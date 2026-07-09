@@ -1524,6 +1524,13 @@ pub const GatewayState = struct {
         try out.print("tardigrade_upstream_protocol_requests_total{{protocol=\"h1\"}} {d}\n", .{proto.h1});
         try out.print("tardigrade_upstream_protocol_requests_total{{protocol=\"h2\"}} {d}\n", .{proto.h2});
 
+        try out.appendSlice(
+            \\# HELP tardigrade_upstream_h2_streaming_upload_fallback_total Streaming upload requests that requested h2/h2c upstreams but fell back to h1 because incremental h2 request-body DATA is not implemented
+            \\# TYPE tardigrade_upstream_h2_streaming_upload_fallback_total counter
+            \\
+        );
+        try out.print("tardigrade_upstream_h2_streaming_upload_fallback_total {d}\n", .{self.upstream_pool.h2StreamingUploadFallbacks()});
+
         // Completed-exchange latency by negotiated protocol (#145 — the
         // "upstream p99 by protocol" acceptance row).
         const req_lat = self.upstream_pool.requestLatencySnapshot();

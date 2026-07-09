@@ -157,6 +157,10 @@ pub const UpstreamPool = struct {
     /// the hot proxy path need not take the pool mutex just to count.
     protocol_h1_requests: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     protocol_h2_requests: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    /// Streaming uploads intentionally stay on h1 until h2 gains an
+    /// incremental request-body DATA API. Count those fallback decisions so the
+    /// deferred #145 work is visible to operators.
+    h2_streaming_upload_fallbacks: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
     pub fn init(allocator: std.mem.Allocator, config: Config) UpstreamPool {
         return .{
@@ -410,6 +414,14 @@ pub const UpstreamPool = struct {
         };
     }
 
+    pub fn recordH2StreamingUploadFallback(self: *UpstreamPool) void {
+        _ = self.h2_streaming_upload_fallbacks.fetchAdd(1, .monotonic);
+    }
+
+    pub fn h2StreamingUploadFallbacks(self: *const UpstreamPool) u64 {
+        return self.h2_streaming_upload_fallbacks.load(.monotonic);
+    }
+
     pub fn connectLatencySnapshot(self: *UpstreamPool) ConnectLatencySnapshot {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -598,6 +610,15 @@ test "request-latency histogram buckets by protocol" {
     try testing.expectEqual(@as(u64, 1), snap.h1.buckets[1]); // le=5
     try testing.expectEqual(@as(u64, 2), snap.h2.count);
     try testing.expectEqual(@as(u64, 1), snap.h2.buckets[request_latency_bounds_ms.len]); // overflow
+}
+
+test "h2 streaming upload fallback counter is atomic and monotonic" {
+    var pool = UpstreamPool.init(testing.allocator, .{});
+    defer pool.deinit();
+    try testing.expectEqual(@as(u64, 0), pool.h2StreamingUploadFallbacks());
+    pool.recordH2StreamingUploadFallback();
+    pool.recordH2StreamingUploadFallback();
+    try testing.expectEqual(@as(u64, 2), pool.h2StreamingUploadFallbacks());
 }
 
 test "per-host snapshot and connect-latency histogram" {

@@ -100,3 +100,8 @@ where appropriate, but its `Client` state machine cannot drive a QUIC handshake.
   cipher suites and signature algorithms, and web-PKI certificate-chain
   validation in the pure-Zig backend.
 - Interop, fuzz, and benchmark coverage against ngtcp2/nghttp3 and quiche (#247).
+- TLS key logging for local decryption (#255): `installSecret` is the single
+  choke point where every traffic secret is installed, so the debug-only keylog
+  `Sink` (`src/quic/keylog.zig`) is invoked there when `keylog_enabled`. Initial
+  secrets are intentionally never logged. See `docs/QUIC_QLOG.md` for the
+  sensitive/debug-only handling rules.

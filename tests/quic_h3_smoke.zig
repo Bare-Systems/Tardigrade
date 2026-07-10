@@ -158,7 +158,9 @@ fn extractDcid(datagram: []const u8) HarnessError![]const u8 {
     return datagram[pos..][0..cid_len];
 }
 
-fn challengeForPath(key: quic_path.PathKey) [quic_path.path_challenge_len]u8 {
+/// Deterministic, predictable challenge bytes for this in-process smoke
+/// harness only. Production path validation must use unpredictable entropy.
+fn deterministicTestChallengeForPath(key: quic_path.PathKey) [quic_path.path_challenge_len]u8 {
     var challenge: [quic_path.path_challenge_len]u8 = undefined;
     @memcpy(challenge[0..4], key.remote.slice()[0..4]);
     std.mem.writeInt(u16, challenge[4..6], key.remote.port, .big);
@@ -389,8 +391,9 @@ const Endpoint = struct {
         }, &queue);
     }
 
-    /// Route by DCID, drive path decisions from the UDP tuple, parse and
-    /// deprotect one datagram (one packet), then process its frames.
+    /// Route by DCID, parse and deprotect one datagram (one packet), then
+    /// process path decisions and frames. Path state changes happen only after
+    /// packet authentication succeeds.
     fn onReceivedDatagram(self: *Endpoint, received: quic_udp.ReceivedDatagram, outbound: *DatagramQueue) !void {
         const dcid = try extractDcid(received.bytes);
         if (self.cid_routes.lookup(dcid) != connection_handle) return error.UnexpectedConnectionId;
@@ -399,7 +402,11 @@ const Endpoint = struct {
             .local = received.local orelse self.local_addr,
             .remote = received.remote,
         };
-        switch (self.paths.onDatagram(path_key, challengeForPath(path_key), received.received_at_us)) {
+        try self.openAndProcess(received.bytes, path_key, outbound, received.received_at_us);
+    }
+
+    fn handleAuthenticatedPath(self: *Endpoint, path_key: quic_path.PathKey, outbound: *DatagramQueue, now_us: u64) !void {
+        switch (self.paths.onDatagram(path_key, deterministicTestChallengeForPath(path_key), now_us)) {
             .on_active_path, .probing => {},
             .blocked => {},
             .probe => |challenge| {
@@ -408,8 +415,6 @@ const Endpoint = struct {
                 try self.sendPacketOnPath(.application, encoded, 0, path_key.local, path_key.remote, outbound);
             },
         }
-
-        try self.openAndProcess(received.bytes, path_key, outbound, received.received_at_us);
     }
 
     fn openAndProcess(
@@ -492,6 +497,7 @@ const Endpoint = struct {
         if (self.largest_recv_pn[space] == null or pn > self.largest_recv_pn[space].?) {
             self.largest_recv_pn[space] = pn;
         }
+        if (level == .application) try self.handleAuthenticatedPath(path_key, outbound, now_us);
         try self.processFrames(level, frames, path_key, outbound, now_us);
     }
 
@@ -940,6 +946,38 @@ test "smoke harness rejects a datagram for an unknown connection id" {
     bogus[0] = 0x40;
     @memset(bogus[1..], 0xee);
     try testing.expectError(error.UnexpectedConnectionId, smoke.server.onDatagram(&bogus));
+}
+
+test "smoke harness authenticates packets before starting path validation" {
+    const allocator = testing.allocator;
+    var smoke = try Smoke.init(allocator);
+    defer smoke.deinit();
+    try smoke.wire();
+    try smoke.completeHandshake();
+
+    const active_before = smoke.server.paths.activePath().key;
+    const rebound_client = quic_udp.Address.ip4(.{ 127, 0, 0, 1 }, 50_001);
+    try smoke.client.sendPingFrom(rebound_client, smoke.server.local_addr, smoke.to_server);
+    try testing.expectEqual(@as(usize, 1), smoke.to_server.count);
+    try testing.expectEqual(@as(usize, 0), smoke.to_client.count);
+
+    const datagram = smoke.to_server.buffers[0][0..smoke.to_server.lengths[0]];
+    datagram[datagram.len - 1] ^= 0x01;
+
+    try testing.expectError(error.AuthenticationFailed, smoke.server.onReceivedDatagram(.{
+        .bytes = datagram,
+        .local = smoke.to_server.locals[0],
+        .remote = smoke.to_server.remotes[0],
+        .received_at_us = smoke.to_server.received_at_us[0],
+    }, smoke.to_client));
+
+    try testing.expect(smoke.server.paths.activePath().key.eql(active_before));
+    try testing.expectEqual(@as(u64, 0), smoke.server.paths.metrics.path_challenges_sent);
+    try testing.expectEqual(@as(u64, 0), smoke.server.paths.metrics.nat_rebindings);
+    try testing.expectEqual(@as(u64, 0), smoke.server.paths.metrics.migrations);
+    try testing.expectEqual(@as(u64, 0), smoke.server.paths.metrics.path_validations_succeeded);
+    try testing.expectEqual(@as(usize, 0), smoke.to_client.count);
+    try testing.expectEqual(@as(u64, 1), smoke.server.adapter.metrics.deprotection_failures);
 }
 
 test "smoke harness validates NAT rebinding through protected path frames" {

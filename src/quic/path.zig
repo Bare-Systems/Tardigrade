@@ -8,12 +8,17 @@
 //!   tokens (timestamp/expiry, address binding, key rotation, tamper rejection).
 //! - `retryIntegrityTag` / `verifyRetryIntegrity` implement the RFC 9001 Retry
 //!   integrity tag. Stateless-reset tokens/packets live in `cid.zig`.
-//! - `Metrics` exposes the operator counters the issue requires.
+//! - `PathManager` (#251) owns the per-connection path table keyed by the
+//!   (local, remote) address tuple: PATH_CHALLENGE/PATH_RESPONSE validation,
+//!   NAT-rebinding vs. migration classification, the configurable migration
+//!   policy from `config.zig`, and the RFC 9000 §9.4 congestion-reset rule.
+//! - `Metrics` exposes the operator counters #250/#251 require.
 //!
-//! Packet framing and DCID parsing stay in `packet.zig` (#243); connection
-//! migration / path validation stay in #251; interop/fuzz in #247.
+//! Packet framing and DCID parsing stay in `packet.zig` (#243); CID issuance
+//! and routing live in `cid.zig`; interop/fuzz in #247.
 
 const std = @import("std");
+const config = @import("config.zig");
 const udp = @import("udp.zig");
 
 const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
@@ -383,6 +388,20 @@ pub const Metrics = struct {
     amplification_blocked_sends: u64 = 0,
     stateless_resets_sent: u64 = 0,
     unknown_connection_id_packets: u64 = 0,
+    // Path lifecycle (#251): the acceptance criteria require distinguishing
+    // rebinding, migration, validation failure, and blocked attempts.
+    path_challenges_sent: u64 = 0,
+    path_validations_succeeded: u64 = 0,
+    /// Validations that failed terminally: the challenge expired unanswered.
+    path_validations_failed: u64 = 0,
+    /// PATH_RESPONSE frames that validated nothing — wrong payload, wrong
+    /// path, or no outstanding challenge. Kept separate from
+    /// `path_validations_failed` because the probe may still succeed; a spike
+    /// here without failures suggests reordering or off-path spoofing.
+    path_response_mismatches: u64 = 0,
+    nat_rebindings: u64 = 0,
+    migrations: u64 = 0,
+    migrations_blocked: u64 = 0,
 
     pub fn recordRetrySent(self: *Metrics) void {
         self.retry_packets_sent += 1;
@@ -408,6 +427,264 @@ pub const Metrics = struct {
     /// counted; a success is a no-op). Accepts any `TokenError!T` result.
     pub fn recordTokenValidation(self: *Metrics, result: anytype) void {
         if (result) |_| {} else |_| self.recordInvalidToken();
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Path state, PATH_CHALLENGE / PATH_RESPONSE validation, and migration policy
+// (#251, RFC 9000 §8.2 / §9)
+// ---------------------------------------------------------------------------
+
+pub const path_challenge_len = 8;
+/// Most concurrently tracked paths per connection: the active path plus a
+/// small number of probes. A peer hopping addresses faster than probes
+/// resolve recycles the oldest failed/unvalidated slot.
+pub const max_paths = 4;
+/// How long a PATH_CHALLENGE may stay unanswered before the validation fails
+/// deterministically. Connection integration can override per RTT (3×PTO);
+/// the default keeps standalone use safe.
+pub const default_validation_timeout_us: u64 = 1_000_000;
+
+/// A network path keyed by the (local, remote) address tuple.
+pub const PathKey = struct {
+    local: udp.Address,
+    remote: udp.Address,
+
+    pub fn eql(self: PathKey, other: PathKey) bool {
+        return self.local.eql(other.local) and self.remote.eql(other.remote);
+    }
+};
+
+pub const PathState = enum {
+    /// Traffic seen, no validation started (policy denied or not yet probed).
+    unvalidated,
+    /// PATH_CHALLENGE outstanding.
+    validating,
+    /// PATH_RESPONSE echoed the challenge; the path is usable.
+    validated,
+    /// The challenge expired unanswered.
+    failed,
+};
+
+/// How a new remote tuple is classified against the active path.
+pub const AddressChange = enum {
+    /// Same host, different port: almost always a NAT rebinding (RFC 9308 §4.1).
+    nat_rebinding,
+    /// Different host: a real migration with likely-new path characteristics.
+    migration,
+};
+
+pub const Path = struct {
+    key: PathKey,
+    state: PathState = .unvalidated,
+    change: AddressChange,
+    challenge: [path_challenge_len]u8 = undefined,
+    challenge_deadline_us: u64 = 0,
+    anti_amplification: AntiAmplification = .{},
+};
+
+/// The action the connection takes for a datagram from a given tuple.
+pub const PathDecision = union(enum) {
+    /// Datagram arrived on the active path: nothing to do.
+    on_active_path,
+    /// A new/unvalidated tuple is being probed: send PATH_CHALLENGE with this
+    /// payload on that path (RFC 9000 §9.3: packets from the new address are
+    /// processed, but the path is validated before it becomes the active one).
+    probe: [path_challenge_len]u8,
+    /// Probe already in flight for this tuple; nothing new to send.
+    probing,
+    /// Migration policy forbids this address change: the caller drops state
+    /// changes for this tuple (packets themselves stay processed on the
+    /// active path per RFC 9000 §9.1 server behavior for disabled migration).
+    blocked,
+};
+
+/// Result of a successful path validation switch.
+pub const MigrationOutcome = struct {
+    change: AddressChange,
+    /// RFC 9000 §9.4 policy, documented here once: RTT and congestion state
+    /// reset (`recovery.RecoveryController.resetForPathMigration`) when the
+    /// peer's *host* changed — new path, unknown characteristics. A NAT
+    /// rebinding that only changed the port keeps the estimator, since the
+    /// underlying path is almost certainly the same.
+    reset_congestion: bool,
+};
+
+pub const PathManager = struct {
+    policy: config.MigrationPolicy,
+    validation_timeout_us: u64 = default_validation_timeout_us,
+    paths: [max_paths]?Path = [_]?Path{null} ** max_paths,
+    /// Index of the active (validated, in-use) path.
+    active: usize = 0,
+    metrics: Metrics = .{},
+
+    /// Start with the handshake path: it is validated by the handshake itself
+    /// (RFC 9000 §8.1).
+    pub fn init(policy: config.MigrationPolicy, handshake_path: PathKey) PathManager {
+        var manager = PathManager{ .policy = policy };
+        manager.paths[0] = .{
+            .key = handshake_path,
+            .state = .validated,
+            .change = .migration,
+        };
+        manager.paths[0].?.anti_amplification.markValidated();
+        return manager;
+    }
+
+    pub fn activePath(self: *const PathManager) *const Path {
+        return &self.paths[self.active].?;
+    }
+
+    /// Classify a datagram's tuple and drive path state. `challenge_entropy`
+    /// supplies the unpredictable PATH_CHALLENGE payload (RFC 9000 §8.2.1)
+    /// when a probe starts.
+    pub fn onDatagram(
+        self: *PathManager,
+        key: PathKey,
+        challenge_entropy: [path_challenge_len]u8,
+        now_us: u64,
+    ) PathDecision {
+        if (key.eql(self.paths[self.active].?.key)) return .on_active_path;
+
+        const change: AddressChange = if (key.remote.sameHost(self.paths[self.active].?.key.remote))
+            .nat_rebinding
+        else
+            .migration;
+
+        const allowed = switch (self.policy) {
+            .disabled => false,
+            .nat_rebinding_only => change == .nat_rebinding,
+            .full => true,
+        };
+        if (!allowed) {
+            self.metrics.migrations_blocked += 1;
+            return .blocked;
+        }
+
+        if (self.find(key)) |index| {
+            const path = &self.paths[index].?;
+            switch (path.state) {
+                .validating => return .probing,
+                // Fresh traffic on a previously failed/unvalidated tuple:
+                // start a new probe.
+                .failed, .unvalidated => {},
+                // A validated non-active path re-activates only through a new
+                // challenge round trip, keeping the switch deterministic.
+                .validated => {},
+            }
+            path.state = .validating;
+            path.change = change;
+            path.challenge = challenge_entropy;
+            path.challenge_deadline_us = now_us + self.validation_timeout_us;
+            self.metrics.path_challenges_sent += 1;
+            return .{ .probe = challenge_entropy };
+        }
+
+        const slot = self.claimSlot();
+        self.paths[slot] = .{
+            .key = key,
+            .state = .validating,
+            .change = change,
+            .challenge = challenge_entropy,
+            .challenge_deadline_us = now_us + self.validation_timeout_us,
+        };
+        self.metrics.path_challenges_sent += 1;
+        return .{ .probe = challenge_entropy };
+    }
+
+    /// PATH_CHALLENGE handling is stateless: echo the payload in a
+    /// PATH_RESPONSE on the same path (RFC 9000 §8.2.2).
+    pub fn onPathChallenge(data: [path_challenge_len]u8) [path_challenge_len]u8 {
+        return data;
+    }
+
+    /// Apply a PATH_RESPONSE received from `key`. On a match the path becomes
+    /// validated and active, and the outcome says whether congestion/RTT
+    /// state must reset. A response with no matching outstanding challenge —
+    /// wrong payload, wrong path, or expired — is ignored (null) and counted
+    /// in `path_response_mismatches`: responses do not validate paths they
+    /// were not sent on (RFC 9000 §8.2.3), but the probe itself keeps waiting
+    /// (only expiry fails it terminally).
+    pub fn onPathResponse(
+        self: *PathManager,
+        key: PathKey,
+        data: [path_challenge_len]u8,
+        now_us: u64,
+    ) ?MigrationOutcome {
+        const index = self.find(key) orelse {
+            self.metrics.path_response_mismatches += 1;
+            return null;
+        };
+        const path = &self.paths[index].?;
+        if (path.state != .validating) {
+            self.metrics.path_response_mismatches += 1;
+            return null;
+        }
+        if (now_us > path.challenge_deadline_us) {
+            self.failValidation(path);
+            return null;
+        }
+        if (!std.crypto.timing_safe.eql([path_challenge_len]u8, path.challenge, data)) {
+            self.metrics.path_response_mismatches += 1;
+            return null;
+        }
+
+        path.state = .validated;
+        path.anti_amplification.markValidated();
+        self.active = index;
+        self.metrics.path_validations_succeeded += 1;
+        switch (path.change) {
+            .nat_rebinding => self.metrics.nat_rebindings += 1,
+            .migration => self.metrics.migrations += 1,
+        }
+        return .{
+            .change = path.change,
+            .reset_congestion = path.change == .migration,
+        };
+    }
+
+    /// Fail every probe whose challenge deadline has passed. Returns how many
+    /// validations failed; callers run this off their timer wheel.
+    pub fn expireValidations(self: *PathManager, now_us: u64) usize {
+        var failed: usize = 0;
+        for (&self.paths) |*slot| {
+            const path = &(slot.* orelse continue);
+            if (path.state != .validating) continue;
+            if (now_us <= path.challenge_deadline_us) continue;
+            self.failValidation(path);
+            failed += 1;
+        }
+        return failed;
+    }
+
+    fn failValidation(self: *PathManager, path: *Path) void {
+        path.state = .failed;
+        self.metrics.path_validations_failed += 1;
+    }
+
+    fn find(self: *const PathManager, key: PathKey) ?usize {
+        for (self.paths, 0..) |slot, index| {
+            const path = slot orelse continue;
+            if (path.key.eql(key)) return index;
+        }
+        return null;
+    }
+
+    /// A free slot, or the oldest non-active failed/unvalidated slot when the
+    /// table is full — probe storms recycle probes, never the active path.
+    fn claimSlot(self: *PathManager) usize {
+        for (self.paths, 0..) |slot, index| {
+            if (slot == null) return index;
+        }
+        for (self.paths, 0..) |slot, index| {
+            if (index == self.active) continue;
+            if (slot.?.state == .failed or slot.?.state == .unvalidated) return index;
+        }
+        // All slots are live probes: recycle the first non-active one.
+        for (self.paths, 0..) |_, index| {
+            if (index != self.active) return index;
+        }
+        unreachable; // max_paths >= 2 guarantees a non-active slot
     }
 };
 
@@ -579,4 +856,157 @@ test "metrics distinguish invalid tokens from normal retry usage" {
 
     try testing.expectEqual(@as(u64, 1), metrics.retry_packets_sent);
     try testing.expectEqual(@as(u64, 2), metrics.invalid_tokens);
+}
+
+// ---------------------------------------------------------------------------
+// Path validation / migration tests (#251)
+// ---------------------------------------------------------------------------
+
+fn testKey(remote_port: u16) PathKey {
+    return .{ .local = loopbackV4(4433), .remote = udp.Address.ip4(.{ 192, 0, 2, 10 }, remote_port) };
+}
+
+fn testKeyOtherHost(remote_port: u16) PathKey {
+    return .{ .local = loopbackV4(4433), .remote = udp.Address.ip4(.{ 198, 51, 100, 7 }, remote_port) };
+}
+
+const test_challenge = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
+
+test "datagrams on the active path require no action" {
+    var manager = PathManager.init(.full, testKey(50_000));
+    try testing.expectEqual(PathDecision.on_active_path, manager.onDatagram(testKey(50_000), test_challenge, 0));
+    try testing.expectEqual(PathState.validated, manager.activePath().state);
+}
+
+test "path validation succeeds deterministically and switches the active path" {
+    var manager = PathManager.init(.full, testKey(50_000));
+    const rebound = testKey(50_001); // same host, new port: NAT rebinding
+
+    const decision = manager.onDatagram(rebound, test_challenge, 1_000);
+    try testing.expectEqualSlices(u8, &test_challenge, &decision.probe);
+    try testing.expectEqual(@as(u64, 1), manager.metrics.path_challenges_sent);
+
+    // Peer echoes the challenge (PATH_RESPONSE semantics are a pure echo).
+    const echoed = PathManager.onPathChallenge(test_challenge);
+    const outcome = manager.onPathResponse(rebound, echoed, 2_000).?;
+    try testing.expectEqual(AddressChange.nat_rebinding, outcome.change);
+    // Port-only rebinding: same underlying path, keep congestion/RTT state.
+    try testing.expect(!outcome.reset_congestion);
+    try testing.expect(manager.activePath().key.eql(rebound));
+    try testing.expectEqual(@as(u64, 1), manager.metrics.nat_rebindings);
+    try testing.expectEqual(@as(u64, 1), manager.metrics.path_validations_succeeded);
+}
+
+test "a real migration validates and requires congestion/RTT reset" {
+    var manager = PathManager.init(.full, testKey(50_000));
+    const migrated = testKeyOtherHost(50_000); // new host: real migration
+
+    _ = manager.onDatagram(migrated, test_challenge, 0);
+    const outcome = manager.onPathResponse(migrated, test_challenge, 100).?;
+    try testing.expectEqual(AddressChange.migration, outcome.change);
+    try testing.expect(outcome.reset_congestion);
+    try testing.expectEqual(@as(u64, 1), manager.metrics.migrations);
+
+    // The documented reset actually reinitializes recovery state.
+    const recovery = @import("recovery.zig");
+    var controller = recovery.RecoveryController{};
+    controller.rtt.update(50_000, 0);
+    controller.congestion.congestion_window = 3;
+    const old_path_packet = recovery.SentPacket{
+        .space = .application,
+        .packet_number = 5,
+        .time_sent_us = 10,
+        .size = 999,
+    };
+    controller.congestion.onPacketSent(old_path_packet.size);
+    controller.resetForPathMigration();
+    try testing.expect(!controller.rtt.hasSample());
+    try testing.expectEqual(recovery.CongestionController.initialWindow(recovery.max_datagram_size), controller.congestion.congestion_window);
+    // Packets in flight on the old path stay in the single send ledger...
+    try testing.expectEqual(@as(usize, 999), controller.congestion.bytes_in_flight);
+    // ...and drain through the normal ack path without corrupting accounting.
+    controller.congestion.onPacketAcked(old_path_packet);
+    try testing.expectEqual(@as(usize, 0), controller.congestion.bytes_in_flight);
+}
+
+test "a wrong PATH_RESPONSE payload does not validate the path" {
+    var manager = PathManager.init(.full, testKey(50_000));
+    const rebound = testKey(50_001);
+    _ = manager.onDatagram(rebound, test_challenge, 0);
+
+    const wrong = [_]u8{0xff} ** path_challenge_len;
+    try testing.expectEqual(@as(?MigrationOutcome, null), manager.onPathResponse(rebound, wrong, 100));
+    // A response on a different tuple does not validate the probed one either.
+    try testing.expectEqual(@as(?MigrationOutcome, null), manager.onPathResponse(testKeyOtherHost(1), test_challenge, 100));
+    // Still probing; the active path is unchanged. Both bogus responses are
+    // counted as mismatches, not as terminal validation failures — the probe
+    // can still succeed.
+    try testing.expect(manager.activePath().key.eql(testKey(50_000)));
+    try testing.expectEqual(@as(u64, 0), manager.metrics.path_validations_succeeded);
+    try testing.expectEqual(@as(u64, 0), manager.metrics.path_validations_failed);
+    try testing.expectEqual(@as(u64, 2), manager.metrics.path_response_mismatches);
+    try testing.expect(manager.onPathResponse(rebound, test_challenge, 200) != null);
+}
+
+test "path validation fails deterministically when the challenge expires" {
+    var manager = PathManager.init(.full, testKey(50_000));
+    manager.validation_timeout_us = 1_000;
+    const rebound = testKey(50_001);
+    _ = manager.onDatagram(rebound, test_challenge, 0);
+
+    // Not yet expired: nothing fails.
+    try testing.expectEqual(@as(usize, 0), manager.expireValidations(1_000));
+    // Past the deadline: the probe fails and is counted.
+    try testing.expectEqual(@as(usize, 1), manager.expireValidations(1_001));
+    try testing.expectEqual(@as(u64, 1), manager.metrics.path_validations_failed);
+    // A late response for the failed probe is ignored.
+    try testing.expectEqual(@as(?MigrationOutcome, null), manager.onPathResponse(rebound, test_challenge, 1_002));
+    // New traffic from the tuple restarts a probe.
+    const retry = manager.onDatagram(rebound, test_challenge, 2_000);
+    try testing.expectEqualSlices(u8, &test_challenge, &retry.probe);
+}
+
+test "migration policy gates rebinding and migration separately" {
+    // disabled: even a port-only rebinding is blocked.
+    var disabled = PathManager.init(.disabled, testKey(50_000));
+    try testing.expectEqual(PathDecision.blocked, disabled.onDatagram(testKey(50_001), test_challenge, 0));
+    try testing.expectEqual(@as(u64, 1), disabled.metrics.migrations_blocked);
+
+    // nat_rebinding_only: port change probes, host change is blocked.
+    var rebind_only = PathManager.init(.nat_rebinding_only, testKey(50_000));
+    const probe = rebind_only.onDatagram(testKey(50_001), test_challenge, 0);
+    try testing.expectEqualSlices(u8, &test_challenge, &probe.probe);
+    try testing.expectEqual(PathDecision.blocked, rebind_only.onDatagram(testKeyOtherHost(50_000), test_challenge, 0));
+    try testing.expectEqual(@as(u64, 1), rebind_only.metrics.migrations_blocked);
+
+    // full: both probe.
+    var full = PathManager.init(.full, testKey(50_000));
+    const rebinding_probe = full.onDatagram(testKey(50_001), test_challenge, 0);
+    try testing.expectEqualSlices(u8, &test_challenge, &rebinding_probe.probe);
+    const migration_probe = full.onDatagram(testKeyOtherHost(50_000), test_challenge, 0);
+    try testing.expectEqualSlices(u8, &test_challenge, &migration_probe.probe);
+}
+
+test "duplicate datagrams on a probing path do not restart the challenge" {
+    var manager = PathManager.init(.full, testKey(50_000));
+    const rebound = testKey(50_001);
+    _ = manager.onDatagram(rebound, test_challenge, 0);
+    const again = manager.onDatagram(rebound, [_]u8{0xee} ** path_challenge_len, 10);
+    try testing.expectEqual(PathDecision.probing, again);
+    try testing.expectEqual(@as(u64, 1), manager.metrics.path_challenges_sent);
+    // The original challenge still validates.
+    try testing.expect(manager.onPathResponse(rebound, test_challenge, 20) != null);
+}
+
+test "probe storms recycle probe slots but never the active path" {
+    var manager = PathManager.init(.full, testKey(50_000));
+    // More new tuples than slots: the oldest probes are recycled.
+    var port: u16 = 50_001;
+    while (port < 50_001 + 2 * max_paths) : (port += 1) {
+        _ = manager.onDatagram(testKey(port), test_challenge, 0);
+    }
+    // The active path survived the storm and still routes.
+    try testing.expect(manager.activePath().key.eql(testKey(50_000)));
+    try testing.expectEqual(PathState.validated, manager.activePath().state);
+    try testing.expectEqual(PathDecision.on_active_path, manager.onDatagram(testKey(50_000), test_challenge, 0));
 }

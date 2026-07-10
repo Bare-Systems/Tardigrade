@@ -5,6 +5,24 @@ All notable user-facing changes to Tardigrade are documented here.
 ## [Unreleased]
 
 ### Features
+- **QUIC CID routing, path validation, and migration policy (#251)** — the
+  pure-Zig transport gains connection-ID lifecycle and path handling:
+  `cid.zig` adds caller-entropy CID generation, a DCID→connection
+  `CidRoutingTable` (routing independent of the UDP 4-tuple, with hit/miss
+  counters), a `LocalCidRegistry` for issued CIDs (NEW_CONNECTION_ID models
+  with derived stateless-reset tokens, RETIRE_CONNECTION_ID consumption,
+  peer active-CID-limit enforcement) and a `PeerCidPool` for received CIDs
+  (RFC 9000 §19.15 validation, retire_prior_to sweeps, queued retirements,
+  and fresh-CID claims for migration). `path.zig` adds a `PathManager` keyed
+  by the (local, remote) address tuple: PATH_CHALLENGE/PATH_RESPONSE
+  validation with deterministic expiry, NAT-rebinding vs. migration
+  classification, gating by the configurable migration policy
+  (disabled / NAT-rebinding-only / full), and metrics distinguishing
+  rebinding, migration, validation failure, blocked attempts, and unknown-CID
+  traffic. Real migrations (host change) reset RTT/congestion state via the
+  new `RecoveryController.resetForPathMigration` (RFC 9000 §9.4); port-only
+  rebindings keep it. Retired CIDs stop routing immediately, and a
+  10k-iteration churn test pins the routing table against leaks.
 - **Local pure-Zig H3 connection-driver smoke harness (#314)** — the first
   stitched end-to-end path for the pure-Zig QUIC stack under the #247
   validation umbrella: `tests/quic_h3_smoke.zig` drives a deterministic

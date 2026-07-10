@@ -41,6 +41,19 @@ pub const Address = struct {
             .ip6 => self.bytes[0..16],
         };
     }
+
+    pub fn eql(self: Address, other: Address) bool {
+        return self.sameHost(other) and self.port == other.port;
+    }
+
+    /// Same IP address (family, octets, scope) regardless of port. A NAT
+    /// rebinding usually changes only the port; a host change is a real
+    /// migration (RFC 9308 §4.1).
+    pub fn sameHost(self: Address, other: Address) bool {
+        if (self.family != other.family) return false;
+        if (self.scope_id != other.scope_id) return false;
+        return std.mem.eql(u8, self.slice(), other.slice());
+    }
 };
 
 pub const ReceivedDatagram = struct {

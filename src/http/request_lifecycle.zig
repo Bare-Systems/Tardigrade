@@ -108,6 +108,13 @@ test "RequestLifecycle: timeout in the future, not yet stopped" {
 }
 
 test "RequestLifecycle: checkDeadline on past deadline cancels once and returns true" {
+    // checkDeadline logs the timeout at warn level by design; keep the expected
+    // line off stderr, where the zig build runner would render the passing step
+    // with a red "failed command:" banner.
+    const previous_log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = previous_log_level;
+
     var lc = RequestLifecycle.init("req-3", 0);
     // Manually force an already-elapsed deadline.
     lc.token.deadline_ms = 1; // epoch+1ms is always in the past

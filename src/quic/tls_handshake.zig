@@ -9,10 +9,10 @@
 //! type escapes into the rest of `src/quic/`. Zig 0.16's `std.crypto.tls` is a
 //! client-only, record/stream TLS implementation with no way to pump raw
 //! handshake bytes or export QUIC traffic secrets, so it cannot back QUIC
-//! without inverting the design; a production backend (interim external engine
-//! or future pure-Zig work) is deferred. See `docs/QUIC_TLS.md`. This module
+//! without inverting the design; the production backend is the pure-Zig TLS
+//! 1.3 engine in `tls_backend.zig`. See `docs/QUIC_TLS.md`. This module also
 //! ships a deterministic in-memory `TestTlsBackend` that proves the driver end
-//! to end, which also becomes the regression seam for later packet-layer work.
+//! to end and remains the regression seam for later packet-layer work.
 
 const std = @import("std");
 const config = @import("config.zig");

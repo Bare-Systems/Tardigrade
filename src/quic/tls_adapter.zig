@@ -12,8 +12,9 @@
 //! header protection for every encryption level (Initial, Handshake, 1-RTT),
 //! packet-number reconstruction wiring, key updates, authenticated transport
 //! parameters, ALPN/certificate reporting, and deprotection metrics are all in
-//! place for the TLS_AES_128_GCM_SHA256 suite. Driving a concrete TLS 1.3
-//! backend and adding further cipher suites remain follow-up work.
+//! place for the TLS_AES_128_GCM_SHA256 suite. A concrete TLS 1.3 engine
+//! drives this seam via `tls_handshake.zig` + `tls_backend.zig` (#296); adding
+//! further cipher suites remains follow-up work.
 
 const std = @import("std");
 const config = @import("config.zig");

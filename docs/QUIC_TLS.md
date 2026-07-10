@@ -16,7 +16,8 @@ material; the rest of `src/quic/` must never see a concrete TLS type.
 ## Decision
 
 **The QUIC handshake driver is backend-agnostic, and the production TLS engine
-is deferred behind a runtime `TlsBackend` interface.**
+is a pure-Zig TLS 1.3 implementation behind the runtime `TlsBackend`
+interface.**
 
 1. `src/quic/tls_handshake.zig` implements the connection-facing handshake
    driver (`Handshake`) plus the backend interface (`TlsBackend`) and event
@@ -26,14 +27,24 @@ is deferred behind a runtime `TlsBackend` interface.**
    parameters, enforces ALPN `h3`, reports certificate state, and classifies
    failures into a typed `HandshakeError`.
 
-2. A concrete production backend (a TLS 1.3 engine operating in "QUIC mode") is
-   **not** implemented in #296. It is injected later through `TlsBackend`, so it
-   can be an interim external engine or future pure-Zig work without touching
-   the driver, the adapter, or any other `src/quic/` module.
+2. `src/quic/tls_backend.zig` is the concrete production backend: a TLS 1.3
+   engine operating in QUIC mode, built entirely on `std.crypto` primitives
+   (no external TLS library). It consumes and produces raw handshake messages
+   per encryption level — there is no record layer; QUIC packet protection
+   covers confidentiality — and exports traffic secrets, transport parameters,
+   ALPN, and certificate state through the `EventSink`. Its first profile is
+   deliberately narrow with one interoperable code path per choice:
+   TLS_AES_128_GCM_SHA256 (the adapter's suite), X25519 key exchange, Ed25519
+   server certificates (parsed/verified via `std.crypto.Certificate`), and
+   pinned-certificate or explicit-insecure trust. The key schedule is validated
+   against the RFC 8448 trace. Entropy is caller-supplied, like the rest of
+   `src/quic/`.
 
-3. #296 ships a deterministic in-memory `TestTlsBackend` that exercises the
-   driver end to end. It is a fixture, not a TLS implementation, and it is the
-   regression seam that later packet-layer and interop work (#247) build on.
+3. A deterministic in-memory `TestTlsBackend` in `tls_handshake.zig` exercises
+   the driver end to end. It is a fixture, not a TLS implementation, and it is
+   the regression seam that later packet-layer and interop work (#247) build
+   on. `src/quic/testdata/` holds a deterministic self-signed Ed25519
+   certificate fixture for the real backend's tests.
 
 ### Why not `std.crypto.tls`
 
@@ -78,6 +89,8 @@ where appropriate, but its `Client` state machine cannot drive a QUIC handshake.
 
 ## Follow-ups
 
-- Implement a production `TlsBackend` (interim external engine or pure-Zig).
 - Integrate the driver with the packet layer and connection state machine.
+- Session resumption / 0-RTT (product decision), HelloRetryRequest, additional
+  cipher suites and signature algorithms, and web-PKI certificate-chain
+  validation in the pure-Zig backend.
 - Interop, fuzz, and benchmark coverage against ngtcp2/nghttp3 and quiche (#247).

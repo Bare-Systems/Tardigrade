@@ -22,12 +22,9 @@ const config = @import("config.zig");
 const varint = @import("quic_varint");
 const tls_adapter = @import("tls_adapter.zig");
 const tls_handshake = @import("tls_handshake.zig");
+const tls_key_schedule = @import("../tls/key_schedule.zig");
 
 const crypto = std.crypto;
-const tls = crypto.tls;
-const Sha256 = crypto.hash.sha2.Sha256;
-const HmacSha256 = crypto.auth.hmac.sha2.HmacSha256;
-const HkdfSha256 = crypto.kdf.hkdf.HkdfSha256;
 const X25519 = crypto.dh.X25519;
 const Ed25519 = crypto.sign.Ed25519;
 const Certificate = crypto.Certificate;
@@ -39,7 +36,7 @@ const EventSink = tls_handshake.EventSink;
 const TlsBackend = tls_handshake.TlsBackend;
 const Role = tls_handshake.Role;
 
-pub const hash_len = Sha256.digest_length;
+pub const hash_len = tls_key_schedule.hash_len;
 /// Largest handshake message body we accept (u24 wire limit is 16 MiB; a
 /// single-certificate Ed25519 flight is far below this).
 pub const max_message_len = 8 * 1024;
@@ -78,81 +75,10 @@ const hello_retry_request_random = [32]u8{
 };
 
 // ===========================================================================
-// TLS 1.3 key schedule (RFC 8446 §7.1), SHA-256 profile.
+// TLS 1.3 key schedule (protocol-neutral core).
 // ===========================================================================
 
-/// SHA-256 of the empty transcript, used by every "derived" key-schedule step.
-const empty_transcript_hash: [hash_len]u8 = blk: {
-    @setEvalBranchQuota(100_000);
-    var out: [hash_len]u8 = undefined;
-    Sha256.hash("", &out, .{});
-    break :blk out;
-};
-
-/// RFC 8446 §7.1 early-secret stage, folded to a compile-time constant: this
-/// profile defers PSK and 0-RTT, so the early secret is always
-/// HKDF-Extract(salt: "", IKM: 0^32) and its "derived" expansion is static.
-/// The RFC 8448 key-schedule test pins the values derived downstream of it.
-const derived_early_secret: [hash_len]u8 = blk: {
-    @setEvalBranchQuota(100_000);
-    const zeros = [_]u8{0} ** hash_len;
-    const early_secret = HkdfSha256.extract("", &zeros);
-    break :blk tls.hkdfExpandLabel(HkdfSha256, early_secret, "derived", &empty_transcript_hash, hash_len);
-};
-
-/// The key-schedule states this backend needs: handshake and application
-/// traffic secrets. Early (PSK/0-RTT) and resumption secrets are out of scope.
-pub const KeySchedule = struct {
-    handshake_secret: [hash_len]u8,
-    master_secret: [hash_len]u8,
-    client_handshake_traffic: [hash_len]u8,
-    server_handshake_traffic: [hash_len]u8,
-
-    /// Derive through the handshake stage from the ECDHE shared secret and the
-    /// transcript hash of ClientHello..ServerHello.
-    pub fn init(shared: [X25519.shared_length]u8, hello_transcript_hash: [hash_len]u8) KeySchedule {
-        const zeros = [_]u8{0} ** hash_len;
-        const handshake_secret = HkdfSha256.extract(&derived_early_secret, &shared);
-        const derived_handshake = tls.hkdfExpandLabel(HkdfSha256, handshake_secret, "derived", &empty_transcript_hash, hash_len);
-        const master_secret = HkdfSha256.extract(&derived_handshake, &zeros);
-        return .{
-            .handshake_secret = handshake_secret,
-            .master_secret = master_secret,
-            .client_handshake_traffic = tls.hkdfExpandLabel(HkdfSha256, handshake_secret, "c hs traffic", &hello_transcript_hash, hash_len),
-            .server_handshake_traffic = tls.hkdfExpandLabel(HkdfSha256, handshake_secret, "s hs traffic", &hello_transcript_hash, hash_len),
-        };
-    }
-
-    pub const ApplicationSecrets = struct {
-        client: [hash_len]u8,
-        server: [hash_len]u8,
-    };
-
-    /// Application traffic secrets from the transcript hash of
-    /// ClientHello..server Finished.
-    pub fn applicationSecrets(self: *const KeySchedule, finished_transcript_hash: [hash_len]u8) ApplicationSecrets {
-        return .{
-            .client = tls.hkdfExpandLabel(HkdfSha256, self.master_secret, "c ap traffic", &finished_transcript_hash, hash_len),
-            .server = tls.hkdfExpandLabel(HkdfSha256, self.master_secret, "s ap traffic", &finished_transcript_hash, hash_len),
-        };
-    }
-
-    pub fn finishedKey(traffic_secret: [hash_len]u8) [hash_len]u8 {
-        return tls.hkdfExpandLabel(HkdfSha256, traffic_secret, "finished", "", hash_len);
-    }
-
-    /// Finished verify_data (RFC 8446 §4.4.4) for the side owning
-    /// `traffic_secret`, over `transcript_hash`.
-    pub fn verifyData(traffic_secret: [hash_len]u8, transcript_hash: [hash_len]u8) [hash_len]u8 {
-        var mac: [HmacSha256.mac_length]u8 = undefined;
-        HmacSha256.create(&mac, &transcript_hash, &finishedKey(traffic_secret));
-        return mac;
-    }
-
-    fn wipe(self: *KeySchedule) void {
-        crypto.secureZero(u8, std.mem.asBytes(self));
-    }
-};
+pub const KeySchedule = tls_key_schedule.KeySchedule;
 
 // ===========================================================================
 // QUIC transport parameters codec (RFC 9000 §18).

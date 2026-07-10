@@ -90,6 +90,12 @@ where appropriate, but its `Client` state machine cannot drive a QUIC handshake.
 ## Follow-ups
 
 - Integrate the driver with the packet layer and connection state machine.
+  This includes the connection-binding transport parameters
+  (`initial_source_connection_id`, `original_destination_connection_id`,
+  `retry_source_connection_id`, `stateless_reset_token`): the backend's TP
+  codec covers the `config.TransportParameters` subset, and per-connection CID
+  material must be supplied by the connection layer when it wires up the
+  driver — the handshake cannot authenticate CIDs it never sees.
 - Session resumption / 0-RTT (product decision), HelloRetryRequest, additional
   cipher suites and signature algorithms, and web-PKI certificate-chain
   validation in the pure-Zig backend.

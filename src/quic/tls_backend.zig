@@ -81,6 +81,25 @@ const hello_retry_request_random = [32]u8{
 // TLS 1.3 key schedule (RFC 8446 §7.1), SHA-256 profile.
 // ===========================================================================
 
+/// SHA-256 of the empty transcript, used by every "derived" key-schedule step.
+const empty_transcript_hash: [hash_len]u8 = blk: {
+    @setEvalBranchQuota(100_000);
+    var out: [hash_len]u8 = undefined;
+    Sha256.hash("", &out, .{});
+    break :blk out;
+};
+
+/// RFC 8446 §7.1 early-secret stage, folded to a compile-time constant: this
+/// profile defers PSK and 0-RTT, so the early secret is always
+/// HKDF-Extract(salt: "", IKM: 0^32) and its "derived" expansion is static.
+/// The RFC 8448 key-schedule test pins the values derived downstream of it.
+const derived_early_secret: [hash_len]u8 = blk: {
+    @setEvalBranchQuota(100_000);
+    const zeros = [_]u8{0} ** hash_len;
+    const early_secret = HkdfSha256.extract("", &zeros);
+    break :blk tls.hkdfExpandLabel(HkdfSha256, early_secret, "derived", &empty_transcript_hash, hash_len);
+};
+
 /// The key-schedule states this backend needs: handshake and application
 /// traffic secrets. Early (PSK/0-RTT) and resumption secrets are out of scope.
 pub const KeySchedule = struct {
@@ -93,13 +112,8 @@ pub const KeySchedule = struct {
     /// transcript hash of ClientHello..ServerHello.
     pub fn init(shared: [X25519.shared_length]u8, hello_transcript_hash: [hash_len]u8) KeySchedule {
         const zeros = [_]u8{0} ** hash_len;
-        var empty_hash: [hash_len]u8 = undefined;
-        Sha256.hash("", &empty_hash, .{});
-
-        const early_secret = HkdfSha256.extract("", &zeros);
-        const derived_early = tls.hkdfExpandLabel(HkdfSha256, early_secret, "derived", &empty_hash, hash_len);
-        const handshake_secret = HkdfSha256.extract(&derived_early, &shared);
-        const derived_handshake = tls.hkdfExpandLabel(HkdfSha256, handshake_secret, "derived", &empty_hash, hash_len);
+        const handshake_secret = HkdfSha256.extract(&derived_early_secret, &shared);
+        const derived_handshake = tls.hkdfExpandLabel(HkdfSha256, handshake_secret, "derived", &empty_transcript_hash, hash_len);
         const master_secret = HkdfSha256.extract(&derived_handshake, &zeros);
         return .{
             .handshake_secret = handshake_secret,
@@ -163,6 +177,14 @@ pub const max_transport_parameters_len = 9 * (2 + 1 + 8) + 3;
 /// Encode `params` as the RFC 9000 §18 extension payload. Every parameter this
 /// stack models is emitted explicitly, so the peer never falls back to a
 /// default that disagrees with `config`.
+///
+/// Scope: this codec covers the `config.TransportParameters` subset — the
+/// connection-binding parameters QUIC v1 requires from the connection layer
+/// (`initial_source_connection_id`, and the server's
+/// `original_destination_connection_id` / `retry_source_connection_id` /
+/// `stateless_reset_token`) carry per-connection CIDs this backend never sees.
+/// Packet-layer integration passes those through a connection-supplied payload
+/// when it wires the driver into `connection.zig` (see docs/QUIC_TLS.md).
 pub fn encodeTransportParameters(params: config.TransportParameters, buf: []u8) HandshakeError![]const u8 {
     var len: usize = 0;
     const entries = [_]struct { id: u64, value: u64 }{
@@ -189,10 +211,17 @@ pub fn encodeTransportParameters(params: config.TransportParameters, buf: []u8) 
     return buf[0..len];
 }
 
+/// Most distinct transport-parameter ids accepted in one extension payload.
+/// Real stacks send ~15 known parameters plus a few GREASE entries; a peer
+/// exceeding this is pathological and fails deterministically rather than
+/// letting duplicate detection require unbounded state.
+pub const max_distinct_transport_parameters = 64;
+
 /// Decode a peer's RFC 9000 §18 extension payload. Unknown parameters are
-/// ignored (§7.4.2); duplicated known parameters, truncated encodings, and
-/// values RFC 9000 forbids fail with `InvalidTransportParameters`. Absent
-/// parameters take their RFC defaults.
+/// ignored semantically (§7.4.2), but a duplicated parameter id — known or
+/// unknown — is a protocol violation (§7.4) and fails, as do truncated
+/// encodings and values RFC 9000 forbids, all with
+/// `InvalidTransportParameters`. Absent parameters take their RFC defaults.
 pub fn decodeTransportParameters(bytes: []const u8) HandshakeError!config.TransportParameters {
     var params = config.TransportParameters{
         .max_idle_timeout_ms = 0,
@@ -206,11 +235,14 @@ pub fn decodeTransportParameters(bytes: []const u8) HandshakeError!config.Transp
         .initial_max_streams_uni = 0,
         .disable_active_migration = false,
     };
-    // Duplicate tracking for the known ids (all <= 0x0e).
-    var seen = [_]bool{false} ** 16;
+    var seen_ids: [max_distinct_transport_parameters]u64 = undefined;
+    var seen_count: usize = 0;
 
     var offset: usize = 0;
     while (offset < bytes.len) {
+        // varint.decode returns error.BufferTooShort unless the input holds the
+        // full encoding, so the returned len never exceeds the slice and the
+        // offset arithmetic below stays in bounds.
         const id = varint.decode(bytes[offset..]) catch return error.InvalidTransportParameters;
         offset += id.len;
         const value_len = varint.decode(bytes[offset..]) catch return error.InvalidTransportParameters;
@@ -219,10 +251,12 @@ pub fn decodeTransportParameters(bytes: []const u8) HandshakeError!config.Transp
         const value_bytes = bytes[offset..][0..@intCast(value_len.value)];
         offset += value_bytes.len;
 
-        if (id.value < seen.len) {
-            if (seen[@intCast(id.value)]) return error.InvalidTransportParameters;
-            seen[@intCast(id.value)] = true;
+        for (seen_ids[0..seen_count]) |seen_id| {
+            if (seen_id == id.value) return error.InvalidTransportParameters;
         }
+        if (seen_count == seen_ids.len) return error.InvalidTransportParameters;
+        seen_ids[seen_count] = id.value;
+        seen_count += 1;
 
         switch (id.value) {
             tp_max_idle_timeout => params.max_idle_timeout_ms = try integerParameter(value_bytes),
@@ -292,6 +326,27 @@ const Reader = struct {
 
     fn expectEnd(self: *const Reader) HandshakeError!void {
         if (self.remaining() != 0) return error.MalformedHandshake;
+    }
+};
+
+/// TLS forbids repeating an extension type within one extension block
+/// (RFC 8446 §4.2: "There MUST NOT be more than one extension of the same type
+/// in a given extension block"). Bounded tracker for the streaming parsers;
+/// more than `max_extensions` extensions in one block is treated as malformed
+/// rather than requiring unbounded state.
+const ExtensionGuard = struct {
+    pub const max_extensions = 64;
+
+    ids: [max_extensions]u16 = undefined,
+    len: usize = 0,
+
+    fn check(self: *ExtensionGuard, ext_id: u16) HandshakeError!void {
+        for (self.ids[0..self.len]) |seen| {
+            if (seen == ext_id) return error.MalformedHandshake;
+        }
+        if (self.len == self.ids.len) return error.MalformedHandshake;
+        self.ids[self.len] = ext_id;
+        self.len += 1;
     }
 };
 
@@ -441,9 +496,12 @@ pub const Tls13Backend = struct {
     expected_client_verify: [hash_len]u8 = undefined,
     expect: Expect = .start,
     /// Reassembled-but-unparsed handshake bytes per CRYPTO level; a message may
-    /// arrive split across CRYPTO frames and packets.
+    /// arrive split across CRYPTO frames and packets. The application-level
+    /// buffer exists because post-handshake messages (NewSessionTicket) may be
+    /// fragmented across 1-RTT CRYPTO frames like any other handshake message.
     initial_input: InputBuffer(max_message_len + 4) = .{},
     handshake_input: InputBuffer(max_message_len + 4) = .{},
+    application_input: InputBuffer(max_message_len + 4) = .{},
     /// The peer's leaf certificate (client role), kept for CertificateVerify.
     peer_certificate: [max_certificate_len]u8 = undefined,
     peer_certificate_len: usize = 0,
@@ -481,10 +539,14 @@ pub const Tls13Backend = struct {
         const input = switch (level) {
             .initial => &self.initial_input,
             .handshake => &self.handshake_input,
-            // The adapter rejects 0-RTT CRYPTO before this point; application
-            // CRYPTO carries only post-handshake messages.
+            // The adapter rejects 0-RTT CRYPTO before this point (RFC 9001:
+            // 0-RTT has no CRYPTO stream).
             .zero_rtt => return error.UnexpectedCryptoLevel,
-            .application => return self.receivePostHandshake(bytes),
+            // Application CRYPTO carries only post-handshake messages.
+            .application => blk: {
+                if (self.expect != .done) return error.UnexpectedCryptoLevel;
+                break :blk &self.application_input;
+            },
         };
         try input.append(bytes);
 
@@ -498,24 +560,10 @@ pub const Tls13Backend = struct {
             const body = raw[4..];
             try self.onMessage(kind, level, raw, body, sink);
             input.consume(message_len);
-            if (self.expect == .done) break;
-        }
-    }
-
-    /// Post-handshake CRYPTO (1-RTT). NewSessionTicket is tolerated and
-    /// ignored — this backend does not implement resumption — so a compliant
-    /// peer sending tickets does not kill the connection. Anything else is a
-    /// deterministic error.
-    fn receivePostHandshake(self: *Tls13Backend, bytes: []const u8) HandshakeError!void {
-        if (self.expect != .done) return error.UnexpectedCryptoLevel;
-        var reader = Reader{ .bytes = bytes };
-        while (reader.remaining() > 0) {
-            const kind = try reader.u8_();
-            const body_len = try reader.u24_();
-            _ = try reader.slice(body_len);
-            if (std.enums.fromInt(MessageType, kind) != MessageType.new_session_ticket) {
-                return error.MalformedHandshake;
-            }
+            // A failed or freshly completed handshake stops consuming its own
+            // levels; post-handshake application CRYPTO keeps draining (a peer
+            // may batch several NewSessionTickets).
+            if (self.expect == .done and level != .application) break;
         }
     }
 
@@ -533,9 +581,17 @@ pub const Tls13Backend = struct {
         const expected_level: EncryptionLevel = switch (kind) {
             .client_hello, .server_hello => .initial,
             .encrypted_extensions, .certificate, .certificate_verify, .finished => .handshake,
-            .new_session_ticket => return error.UnexpectedCryptoLevel,
+            .new_session_ticket => .application,
         };
         if (level != expected_level) return error.UnexpectedCryptoLevel;
+
+        if (kind == .new_session_ticket) {
+            // Tolerated and ignored: this backend does not implement
+            // resumption, and a compliant peer sending tickets after the
+            // handshake must not kill the connection. receiveImpl only routes
+            // application CRYPTO here once the handshake is done.
+            return;
+        }
 
         switch (self.expect) {
             .client_hello => {
@@ -649,10 +705,12 @@ pub const Tls13Backend = struct {
 
         var selected_version: ?u16 = null;
         var peer_share: ?[X25519.public_length]u8 = null;
+        var guard = ExtensionGuard{};
         var extensions = Reader{ .bytes = try r.slice(try r.u16_()) };
         try r.expectEnd();
         while (extensions.remaining() > 0) {
             const ext_id = try extensions.u16_();
+            try guard.check(ext_id);
             var ext = Reader{ .bytes = try extensions.slice(try extensions.u16_()) };
             switch (ext_id) {
                 ext_supported_versions => selected_version = try ext.u16_(),
@@ -679,10 +737,12 @@ pub const Tls13Backend = struct {
 
     fn onEncryptedExtensions(self: *Tls13Backend, raw: []const u8, body: []const u8, sink: *EventSink) HandshakeError!void {
         var r = Reader{ .bytes = body };
+        var guard = ExtensionGuard{};
         var extensions = Reader{ .bytes = try r.slice(try r.u16_()) };
         try r.expectEnd();
         while (extensions.remaining() > 0) {
             const ext_id = try extensions.u16_();
+            try guard.check(ext_id);
             var ext = Reader{ .bytes = try extensions.slice(try extensions.u16_()) };
             switch (ext_id) {
                 ext_alpn => {
@@ -829,10 +889,12 @@ pub const Tls13Backend = struct {
         var alpn_offered = false;
         var transport_params: ?[]const u8 = null;
 
+        var guard = ExtensionGuard{};
         var extensions = Reader{ .bytes = try r.slice(try r.u16_()) };
         try r.expectEnd();
         while (extensions.remaining() > 0) {
             const ext_id = try extensions.u16_();
+            try guard.check(ext_id);
             var ext = Reader{ .bytes = try extensions.slice(try extensions.u16_()) };
             switch (ext_id) {
                 ext_supported_versions => {
@@ -879,6 +941,15 @@ pub const Tls13Backend = struct {
         if (!offers_tls13 or !offers_x25519_group or !offers_ed25519) return error.MalformedHandshake;
         const client_share = peer_share orelse return error.MalformedHandshake;
 
+        // Validate the peer share before emitting anything: X25519.scalarmult
+        // rejects low-order/identity public keys (all-zero shared secret)
+        // rather than deriving a predictable secret.
+        const key_pair = X25519.KeyPair.generateDeterministic(self.entropy.key_share_seed) catch
+            return error.SecretExportFailed;
+        self.key_pair = key_pair;
+        const shared = X25519.scalarmult(key_pair.secret_key, client_share) catch
+            return error.MalformedHandshake;
+
         if (!alpn_match) {
             // Report what the client offered instead of silently downgrading;
             // the driver fails with AlpnMismatch before any flight is sent.
@@ -892,9 +963,6 @@ pub const Tls13Backend = struct {
         self.transcript.update(raw);
 
         // ServerHello (Initial level).
-        const key_pair = X25519.KeyPair.generateDeterministic(self.entropy.key_share_seed) catch
-            return error.SecretExportFailed;
-        self.key_pair = key_pair;
         var hello_buf: [256]u8 = undefined;
         var hello = Writer{ .buf = &hello_buf };
         try hello.u8_(@intFromEnum(MessageType.server_hello));
@@ -921,8 +989,6 @@ pub const Tls13Backend = struct {
         try sink.emitCrypto(.initial, server_hello);
         try sink.emitAlpn(self.alpn);
 
-        const shared = X25519.scalarmult(key_pair.secret_key, client_share) catch
-            return error.MalformedHandshake;
         self.schedule = KeySchedule.init(shared, self.transcript.peek());
         try self.emitHandshakeSecrets(sink);
         try sink.emitDiscardKeys(.initial);
@@ -1153,6 +1219,11 @@ test "transport parameter decoding rejects duplicates, truncation, and illegal v
     const duplicated = [_]u8{ 0x03, 0x02, 0x45, 0xac, 0x03, 0x02, 0x45, 0xac };
     try testing.expectError(error.InvalidTransportParameters, decodeTransportParameters(&duplicated));
 
+    // An unknown parameter id sent twice is still a duplicate (RFC 9000 §7.4),
+    // even though a single occurrence would be ignored.
+    const duplicated_unknown = [_]u8{ 0x2a, 0x01, 0xaa, 0x2a, 0x01, 0xbb };
+    try testing.expectError(error.InvalidTransportParameters, decodeTransportParameters(&duplicated_unknown));
+
     // Length runs past the end of the extension.
     const truncated = [_]u8{ 0x04, 0x08, 0x00 };
     try testing.expectError(error.InvalidTransportParameters, decodeTransportParameters(&truncated));
@@ -1374,6 +1445,163 @@ test "a tampered CertificateVerify signature surfaces as CertificateInvalid" {
     flight.bytes[flight.bytes.len - (4 + hash_len) - 1] ^= 0x01;
     try testing.expectError(error.CertificateInvalid, h.client.onCrypto(.handshake, flight.offset, flight.bytes));
     try testing.expectEqual(CertificateState.invalid, h.client_adapter.certificateState());
+}
+
+/// Offset of the u16 extension-block length inside a ClientHello handshake
+/// message: header, legacy_version, random, then the variable-length
+/// session id / cipher suites / compression vectors.
+fn chExtensionBlockOffset(message: []const u8) usize {
+    var offset: usize = 4 + 2 + 32;
+    offset += 1 + message[offset]; // legacy_session_id
+    offset += 2 + std.mem.readInt(u16, message[offset..][0..2], .big); // cipher_suites
+    offset += 1 + message[offset]; // legacy_compression_methods
+    return offset;
+}
+
+/// Append a duplicate copy of extension `ext_id` at the end of the extension
+/// block whose u16 length field sits at `block_len_at`, fixing up the block
+/// length and the message length of the handshake message starting at offset
+/// 0 (any following messages in `buf` are shifted intact). Returns the new
+/// total length.
+fn duplicateExtension(buf: []u8, total_len: usize, block_len_at: usize, ext_id: u16) usize {
+    const block_len = std.mem.readInt(u16, buf[block_len_at..][0..2], .big);
+    const block_start = block_len_at + 2;
+    const block_end = block_start + block_len;
+
+    var offset = block_start;
+    var found_start: usize = 0;
+    var found_len: usize = 0;
+    while (offset < block_end) {
+        const id = std.mem.readInt(u16, buf[offset..][0..2], .big);
+        const ext_len = std.mem.readInt(u16, buf[offset + 2 ..][0..2], .big);
+        const size = 4 + @as(usize, ext_len);
+        if (id == ext_id) {
+            found_start = offset;
+            found_len = size;
+        }
+        offset += size;
+    }
+    std.debug.assert(found_len != 0);
+
+    var copy: [512]u8 = undefined;
+    @memcpy(copy[0..found_len], buf[found_start..][0..found_len]);
+    std.mem.copyBackwards(u8, buf[block_end + found_len .. total_len + found_len], buf[block_end..total_len]);
+    @memcpy(buf[block_end..][0..found_len], copy[0..found_len]);
+
+    std.mem.writeInt(u16, buf[block_len_at..][0..2], @intCast(block_len + found_len), .big);
+    const body_len = std.mem.readInt(u24, buf[1..4], .big);
+    std.mem.writeInt(u24, buf[1..4], @intCast(body_len + found_len), .big);
+    return total_len + found_len;
+}
+
+test "a ClientHello with a duplicated extension is rejected" {
+    // RFC 8446 §4.2: no extension type may repeat within one extension block.
+    inline for (.{ ext_alpn, ext_quic_transport_parameters }) |ext_id| {
+        var h = Harness.init();
+        try h.wire();
+        try h.client.start(defaultParams());
+
+        var buf: [2048]u8 = undefined;
+        const ch = (try h.client.pollOutput(.initial, &buf)).?;
+        const new_len = duplicateExtension(&buf, ch.bytes.len, chExtensionBlockOffset(ch.bytes), ext_id);
+        try testing.expectError(error.MalformedHandshake, h.server.onCrypto(.initial, ch.offset, buf[0..new_len]));
+        try testing.expect(!h.server.isComplete());
+    }
+}
+
+test "EncryptedExtensions with a duplicated extension is rejected" {
+    inline for (.{ ext_alpn, ext_quic_transport_parameters }) |ext_id| {
+        var h = Harness.init();
+        try h.wire();
+        try h.client.start(defaultParams());
+
+        var buf: [2048]u8 = undefined;
+        const ch = (try h.client.pollOutput(.initial, &buf)).?;
+        try h.server.onCrypto(.initial, ch.offset, ch.bytes);
+        const sh = (try h.server.pollOutput(.initial, &buf)).?;
+        try h.client.onCrypto(.initial, sh.offset, sh.bytes);
+
+        // EncryptedExtensions is the first message of the server flight; its
+        // extension block length sits right after the 4-byte message header.
+        var flight_buf: [4096]u8 = undefined;
+        const flight = (try h.server.pollOutput(.handshake, &flight_buf)).?;
+        const new_len = duplicateExtension(&flight_buf, flight.bytes.len, 4, ext_id);
+        try testing.expectError(error.MalformedHandshake, h.client.onCrypto(.handshake, flight.offset, flight_buf[0..new_len]));
+        try testing.expect(!h.client.isComplete());
+    }
+}
+
+test "an all-zero X25519 key share fails either side deterministically" {
+    // Client share zeroed inside the ClientHello: the server must refuse to
+    // derive a predictable (all-zero) shared secret.
+    var h = Harness.init();
+    try h.wire();
+    try h.client.start(defaultParams());
+    var buf: [2048]u8 = undefined;
+    const ch = (try h.client.pollOutput(.initial, &buf)).?;
+    const client_pub = (X25519.KeyPair.generateDeterministic(clientEntropy().key_share_seed) catch unreachable).public_key;
+    const client_share_at = std.mem.indexOf(u8, ch.bytes, &client_pub) orelse return error.TestUnexpectedResult;
+    @memset(buf[client_share_at..][0..X25519.public_length], 0);
+    try testing.expectError(error.MalformedHandshake, h.server.onCrypto(.initial, ch.offset, ch.bytes));
+    try testing.expect(!h.server.isComplete());
+
+    // Server share zeroed inside the ServerHello: same on the client.
+    var h2 = Harness.init();
+    try h2.wire();
+    try h2.client.start(defaultParams());
+    const ch2 = (try h2.client.pollOutput(.initial, &buf)).?;
+    try h2.server.onCrypto(.initial, ch2.offset, ch2.bytes);
+    const sh = (try h2.server.pollOutput(.initial, &buf)).?;
+    const server_pub = (X25519.KeyPair.generateDeterministic(serverEntropy().key_share_seed) catch unreachable).public_key;
+    const server_share_at = std.mem.indexOf(u8, sh.bytes, &server_pub) orelse return error.TestUnexpectedResult;
+    @memset(buf[server_share_at..][0..X25519.public_length], 0);
+    try testing.expectError(error.MalformedHandshake, h2.client.onCrypto(.initial, sh.offset, sh.bytes));
+    try testing.expect(!h2.client.isComplete());
+}
+
+test "a fragmented NewSessionTicket after completion is tolerated and ignored" {
+    var h = Harness.init();
+    try h.wire();
+    try h.run();
+    try testing.expect(h.client.isComplete());
+
+    // NewSessionTicket (type 4) with an opaque body, split mid-header across
+    // two 1-RTT CRYPTO deliveries like any other fragmented handshake message.
+    const ticket = [_]u8{ 4, 0, 0, 5, 0xde, 0xad, 0xbe, 0xef, 0x01 };
+    try h.client.onCrypto(.application, 0, ticket[0..3]);
+    try h.client.onCrypto(.application, 3, ticket[3..]);
+    try testing.expect(h.client.isComplete());
+    try testing.expectEqual(@as(?HandshakeError, null), h.client.failure());
+
+    // A second ticket on the same stream keeps draining.
+    try h.client.onCrypto(.application, ticket.len, &ticket);
+    try testing.expect(h.client.isComplete());
+}
+
+test "post-handshake application CRYPTO other than NewSessionTicket is rejected" {
+    var h = Harness.init();
+    try h.wire();
+    try h.run();
+    try testing.expect(h.client.isComplete());
+
+    // An unknown handshake message type is malformed.
+    const bogus = [_]u8{ 99, 0, 0, 0 };
+    try testing.expectError(error.MalformedHandshake, h.client.onCrypto(.application, 0, &bogus));
+
+    // A handshake-phase message (Finished) at the 1-RTT level is a level error.
+    var h2 = Harness.init();
+    try h2.wire();
+    try h2.run();
+    const stray_finished = [_]u8{ 20, 0, 0, 0 };
+    try testing.expectError(error.UnexpectedCryptoLevel, h2.client.onCrypto(.application, 0, &stray_finished));
+}
+
+test "application CRYPTO before the handshake completes is a level error" {
+    var h = Harness.init();
+    try h.wire();
+    try h.client.start(defaultParams());
+    const ticket = [_]u8{ 4, 0, 0, 0 };
+    try testing.expectError(error.UnexpectedCryptoLevel, h.client.onCrypto(.application, 0, &ticket));
 }
 
 test "a ClientHello delivered at the Handshake level is a level error" {

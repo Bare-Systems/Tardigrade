@@ -16,9 +16,12 @@ All notable user-facing changes to Tardigrade are documented here.
   now completes end-to-end through the backend-agnostic handshake driver,
   installing matching Handshake and 1-RTT secrets on both sides, with
   deterministic typed failures for ALPN mismatch, certificate rejection,
-  missing/invalid transport parameters, tampered Finished/CertificateVerify,
-  and CRYPTO-level misuse. Session resumption, 0-RTT, HelloRetryRequest,
-  additional cipher suites, and web-PKI chain validation remain follow-ups.
+  missing/invalid/duplicated transport parameters, duplicated TLS extensions,
+  low-order X25519 key shares, tampered Finished/CertificateVerify, and
+  CRYPTO-level misuse; fragmented post-handshake NewSessionTicket is tolerated
+  and ignored. Session resumption, 0-RTT, HelloRetryRequest, additional cipher
+  suites, web-PKI chain validation, and the connection-ID transport parameters
+  (supplied by the connection layer at packet integration) remain follow-ups.
 - **Dynamic QPACK table and blocked-stream accounting (#253)** — extends
   `src/http3/qpack.zig` beyond the static-only fallback with a bounded dynamic
   table, memory/capacity enforcement, eviction accounting, encoder-stream

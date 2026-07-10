@@ -95,3 +95,27 @@ test "truncatePacketNumber keeps the low-order bytes" {
     try testing.expectEqual(@as(u32, 0xa82f9b32), truncatePacketNumber(0xa82f9b32, 4));
     try testing.expectEqual(@as(u32, 0x32), truncatePacketNumber(0xa82f9b32, 1));
 }
+
+test "fuzz: packet number truncation reconstructs recent sends" {
+    try testing.fuzz({}, fuzzPacketNumberRoundTrip, .{ .corpus = &.{
+        "\x00\x00\x00\x00\x00\x00",
+        "\x00\x00\x00\x01\x00\x01",
+        "\x00\x00\x7f\xff\x00\x01",
+        "\x00\x80\x00\x00\x00\x07",
+        "\xff\xff\xff\xff\xff\xff",
+    } });
+}
+
+fn fuzzPacketNumberRoundTrip(_: void, smith: *testing.Smith) !void {
+    const largest = @as(u64, smith.value(u32));
+    const delta = @as(u64, smith.value(u16)) + 1;
+    const full = largest + delta;
+    try testing.expect(full <= max_packet_number);
+
+    const len = packetNumberLength(full, largest);
+    try testing.expect(len >= 1 and len <= 4);
+    const truncated = truncatePacketNumber(full, len);
+    const bits: u6 = @as(u6, len) * 8;
+    try testing.expect(truncated < (@as(u64, 1) << bits));
+    try testing.expectEqual(full, decodePacketNumber(largest, truncated, bits));
+}

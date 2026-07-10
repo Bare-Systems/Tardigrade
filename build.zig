@@ -252,6 +252,18 @@ pub fn build(b: *std.Build) void {
     const run_quic_h3_smoke_tests = b.addRunArtifact(quic_h3_smoke_tests);
     quic_step.dependOn(&run_quic_h3_smoke_tests.step);
     test_step.dependOn(&run_quic_h3_smoke_tests.step);
+
+    // Pure-Zig PKI DER foundation (#339): no system libraries.
+    const pki_mod = b.createModule(.{
+        .root_source_file = b.path("src/pki/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const pki_tests = b.addTest(.{ .root_module = pki_mod });
+    const run_pki_tests = b.addRunArtifact(pki_tests);
+    const pki_step = b.step("test-pki", "Run pure-Zig PKI DER unit tests");
+    pki_step.dependOn(&run_pki_tests.step);
+    test_step.dependOn(&run_pki_tests.step);
 }
 
 fn pathExists(path: []const u8) bool {

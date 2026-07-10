@@ -5,6 +5,17 @@ All notable user-facing changes to Tardigrade are documented here.
 ## [Unreleased]
 
 ### Features
+- **Minimal pure Zig HTTP/3 frame and session layer (#246)** — adds the first
+  HTTP/3 application-layer implementation in `src/http3/`: ALPN `h3`, the
+  DATA/HEADERS/SETTINGS/GOAWAY frame codec, HTTP/3 unidirectional stream-type
+  parsing, SETTINGS decoding with duplicate/reserved-setting rejection, and
+  control-stream validation that requires SETTINGS first and rejects illegal
+  DATA/HEADERS/PUSH_PROMISE placement. Request streams now decode static-QPACK
+  HEADERS into the shared `stream_transport.Exchange` shape, append DATA chunks
+  without hidden response buffering, validate required pseudo-headers, and
+  expose response helpers for HEADERS/DATA/GOAWAY emission. Dynamic QPACK,
+  priority, external interop, and downstream listener rollout remain tracked in
+  #253, #254, #247, and #257.
 - **Static-table-only QPACK (#252)** — implements RFC 9204 QPACK header
   compression in static-only mode in `src/http3/qpack.zig` for the first HTTP/3
   path: the full 99-entry static table, RFC 7541 prefix-integer codec, bounded

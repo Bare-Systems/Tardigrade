@@ -162,6 +162,12 @@ pub const Handshake = struct {
     allow_unverified_certificate: bool = false,
     state: State = .idle,
     failure_reason: ?HandshakeError = null,
+    /// Key discards requested by the backend for levels that still have
+    /// undrained CRYPTO output. RFC 9001 §4.9: a level's write keys must
+    /// outlive the flight they protect (the server's ServerHello is queued at
+    /// the Initial level in the same event batch that discards Initial keys),
+    /// so the discard is applied once `pollOutput` drains the level.
+    pending_discard: [4]bool = .{ false, false, false, false },
     sink: EventSink = .{},
 
     pub fn initClient(adapter: *QuicTlsAdapter, backend: TlsBackend) Handshake {
@@ -204,6 +210,11 @@ pub const Handshake = struct {
     /// handshake never sends on — a caller/state-machine bug, kept distinct from
     /// "idle".
     pub fn pollOutput(self: *Handshake, level: EncryptionLevel, buf: []u8) HandshakeError!?struct { offset: u64, bytes: []u8 } {
+        // Apply a deferred key discard only once the caller comes back after
+        // sealing the level's final chunk — never in the same call that hands
+        // that chunk out, or the caller could not protect the packet carrying
+        // it.
+        self.applyDeferredDiscard(level);
         const output = (self.adapter.nextHandshakeOutput(level, buf.len) catch |err| return self.fail(switch (err) {
             error.InvalidCryptoLevel => error.UnexpectedCryptoLevel,
         })) orelse return null;
@@ -223,6 +234,22 @@ pub const Handshake = struct {
         self.state = .failed;
         self.failure_reason = err;
         return err;
+    }
+
+    fn discardOrDefer(self: *Handshake, level: EncryptionLevel) void {
+        if (level != .zero_rtt and self.adapter.outbound[level.index()].pending() > 0) {
+            self.pending_discard[level.index()] = true;
+            return;
+        }
+        self.adapter.discardSecrets(level);
+    }
+
+    fn applyDeferredDiscard(self: *Handshake, level: EncryptionLevel) void {
+        if (level == .zero_rtt) return;
+        if (!self.pending_discard[level.index()]) return;
+        if (self.adapter.outbound[level.index()].pending() != 0) return;
+        self.pending_discard[level.index()] = false;
+        self.adapter.discardSecrets(level);
     }
 
     fn applyEvents(self: *Handshake) HandshakeError!void {
@@ -247,7 +274,7 @@ pub const Handshake = struct {
                     self.adapter.setCertificateState(cert_state);
                     if (cert_state == .invalid) return self.fail(error.CertificateInvalid);
                 },
-                .discard_keys => |level| self.adapter.discardSecrets(level),
+                .discard_keys => |level| self.discardOrDefer(level),
                 .handshake_complete => try self.complete(),
             }
         }
@@ -775,6 +802,28 @@ test "client certificate state not_checked passes only in explicit unverified mo
     try h.run();
     try testing.expect(h.client.isComplete());
     try testing.expect(h.server.isComplete());
+}
+
+test "initial write keys survive until the queued ServerHello is drained" {
+    var h = Harness{};
+    try h.wire();
+    try h.client.start(defaultParams());
+
+    // Deliver the ClientHello: the server queues its ServerHello at the
+    // Initial level and requests an Initial key discard in the same event
+    // batch. The discard must not take effect while the flight is undrained —
+    // the connection layer still has to seal the ServerHello packet.
+    var buf: [2048]u8 = undefined;
+    const ch = (try h.client.pollOutput(.initial, &buf)).?;
+    try h.server.onCrypto(.initial, ch.offset, ch.bytes);
+    try testing.expect(h.server_adapter.protectionKeys(.initial, .write) != null);
+
+    // Draining hands out the final chunk with keys still live; the discard
+    // lands on the next poll.
+    while (try h.server.pollOutput(.initial, &buf)) |_| {
+        try testing.expect(h.server_adapter.protectionKeys(.initial, .write) != null);
+    }
+    try testing.expectEqual(@as(?tls_adapter.PacketProtectionKeys, null), h.server_adapter.protectionKeys(.initial, .write));
 }
 
 test "ClientHello delivered at the Handshake level is rejected" {

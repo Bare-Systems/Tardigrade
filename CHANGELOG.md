@@ -5,6 +5,21 @@ All notable user-facing changes to Tardigrade are documented here.
 ## [Unreleased]
 
 ### Features
+- **Local pure-Zig H3 connection-driver smoke harness (#314)** — the first
+  stitched end-to-end path for the pure-Zig QUIC stack under the #247
+  validation umbrella: `tests/quic_h3_smoke.zig` drives a deterministic
+  in-process client↔server exchange where a real TLS 1.3 handshake (#296)
+  completes through `QuicTlsAdapter` inside protected QUIC v1 packets (long and
+  short headers, AEAD packet protection, header protection, CRYPTO/STREAM
+  frames), ALPN negotiates `h3`, authenticated transport parameters seed the
+  stream/flow-control core (#245), and one HTTP/3 request/response (SETTINGS
+  control streams, QPACK HEADERS, DATA) round-trips through the session layer
+  (#246) with clean stream closure and drained buffers. The handshake driver
+  now defers backend-requested key discards until a level's CRYPTO output is
+  drained (RFC 9001 §4.9), so the ServerHello can be sealed with the Initial
+  keys that protect it — the first integration seam this harness was built to
+  surface. No UDP, ACK/loss recovery, timers, or migration yet; those remain
+  #247/#251 follow-ups.
 - **Pure Zig TLS 1.3 backend for QUIC (#296)** — adds
   `src/quic/tls_backend.zig`, a concrete TLS 1.3 engine operating in QUIC mode
   behind the `QuicTlsAdapter` seam: raw handshake messages per encryption level

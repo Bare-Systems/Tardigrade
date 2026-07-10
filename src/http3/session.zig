@@ -1,10 +1,12 @@
 //! HTTP/3 request/response mapping (#246): turns request stream frames into the
 //! shared `stream_transport` shape and emits response HEADERS/DATA frames.
 //!
-//! This is the minimal pure-Zig HTTP/3 session layer. It uses static-only QPACK
-//! from `qpack.zig`, buffers request bodies only inside the per-stream
-//! assembler used by unit tests and the future QUIC connection driver, and keeps
-//! dynamic QPACK, priority, and downstream listener rollout out of scope.
+//! This is the minimal pure-Zig HTTP/3 session layer. The request/response
+//! helpers still use the static-only QPACK fallback from `qpack.zig` while the
+//! dynamic table and encoder/decoder stream state are exposed separately for
+//! negotiated HTTP/3 connections. Request bodies are buffered only inside the
+//! per-stream assembler used by unit tests and the future QUIC connection
+//! driver; priority and downstream listener rollout remain out of scope.
 
 const std = @import("std");
 

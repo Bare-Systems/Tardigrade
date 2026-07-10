@@ -1446,3 +1446,53 @@ test "dynamic table memory remains bounded under repeated inserts" {
     }
     try testing.expect(table.metrics.evictions > 0);
 }
+
+test "fuzz: QPACK static decoder never panics on arbitrary field sections" {
+    try testing.fuzz({}, fuzzQpackDecode, .{ .corpus = &.{
+        "",
+        "\x00",
+        "\x00\x00",
+        "\x00\x00\xd1",
+        "\x00\x00\x51\x0btardigrade",
+        "\x01\x00",
+        "\x00\x80",
+        "\x00\x00\xff\xff\xff\xff\xff\xff\xff\xff",
+    } });
+}
+
+fn fuzzQpackDecode(_: void, smith: *testing.Smith) !void {
+    var buf: [512]u8 = undefined;
+    const len = smith.slice(&buf);
+    var fields: [16]HeaderField = undefined;
+    var scratch: [1024]u8 = undefined;
+    const count = decode(buf[0..len], &fields, &scratch) catch return;
+    try testing.expect(count <= fields.len);
+}
+
+test "fuzz: QPACK static-table selections round-trip through encoder" {
+    try testing.fuzz({}, fuzzQpackStaticRoundTrip, .{ .corpus = &.{
+        "\x00",
+        "\x01\x02\x03\x04",
+        "\x11\x17\x19\x1d",
+        "\xff\x00\x7f\x40",
+    } });
+}
+
+fn fuzzQpackStaticRoundTrip(_: void, smith: *testing.Smith) !void {
+    var fields: [4]HeaderField = undefined;
+    const count = @as(usize, smith.value(u2)) + 1;
+    for (fields[0..count]) |*field| {
+        field.* = static_table[smith.value(u8) % static_table_len];
+    }
+
+    var encoded: [512]u8 = undefined;
+    const block = try encode(fields[0..count], &encoded);
+    var decoded: [4]HeaderField = undefined;
+    var scratch: [512]u8 = undefined;
+    const decoded_count = try decode(block, &decoded, &scratch);
+    try testing.expectEqual(count, decoded_count);
+    for (fields[0..count], decoded[0..decoded_count]) |expected, actual| {
+        try testing.expectEqualStrings(expected.name, actual.name);
+        try testing.expectEqualStrings(expected.value, actual.value);
+    }
+}

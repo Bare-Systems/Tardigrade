@@ -122,3 +122,49 @@ test "malformed and boundary inputs" {
     try testing.expectError(error.BufferTooShort, encode(64, &small)); // needs 2 bytes
     try testing.expectError(error.ValueTooLarge, encode(max_value + 1, &small));
 }
+
+test "fuzz: varint decode and minimal re-encode never panic" {
+    try testing.fuzz({}, fuzzVarintDecode, .{ .corpus = &.{
+        "",
+        "\x25",
+        "\x40\x25",
+        "\x7b\xbd",
+        "\x9d\x7f\x3e\x7d",
+        "\xc2\x19\x7c\x5e\xff\x14\xe8\x8c",
+        "\xff\xff\xff\xff\xff\xff\xff\xff",
+    } });
+}
+
+fn fuzzVarintDecode(_: void, smith: *testing.Smith) !void {
+    var buf: [16]u8 = undefined;
+    const len = smith.slice(&buf);
+    const decoded = decode(buf[0..len]) catch return;
+    try testing.expect(decoded.len == 1 or decoded.len == 2 or decoded.len == 4 or decoded.len == 8);
+    try testing.expect(decoded.len <= len);
+    try testing.expect(decoded.value <= max_value);
+
+    var encoded: [8]u8 = undefined;
+    const encoded_len = try encode(decoded.value, &encoded);
+    try testing.expectEqual(try encodedLen(decoded.value), encoded_len);
+    const roundtrip = try decode(encoded[0..encoded_len]);
+    try testing.expectEqual(decoded.value, roundtrip.value);
+    try testing.expectEqual(encoded_len, roundtrip.len);
+}
+
+test "fuzz: varint encode round-trips arbitrary in-range values" {
+    try testing.fuzz({}, fuzzVarintEncodeRoundTrip, .{ .corpus = &.{
+        "\x00\x00\x00\x00\x00\x00\x00\x00",
+        "\x00\x00\x00\x00\x00\x00\x00\x3f",
+        "\x00\x00\x00\x00\x00\x00\x40\x00",
+        "\x3f\xff\xff\xff\xff\xff\xff\xff",
+    } });
+}
+
+fn fuzzVarintEncodeRoundTrip(_: void, smith: *testing.Smith) !void {
+    const value = smith.value(u64) & max_value;
+    var encoded: [8]u8 = undefined;
+    const encoded_len = try encode(value, &encoded);
+    const decoded = try decode(encoded[0..encoded_len]);
+    try testing.expectEqual(value, decoded.value);
+    try testing.expectEqual(encoded_len, decoded.len);
+}

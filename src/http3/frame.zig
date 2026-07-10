@@ -517,6 +517,75 @@ test "duplicate control stream maps to connection close error code" {
     try testing.expectEqual(ApplicationErrorCode.stream_creation_error, registry.last_error.?.code);
 }
 
+test "fuzz: frame decoder never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzDecodeFrame, .{ .corpus = &.{
+        "",
+        "\x01",
+        "\x01\x00",
+        "\x01\x03abc",
+        "\x04\x00",
+        "\x40\x21\x00",
+        "\x80\x0f\x07\x00\x00",
+    } });
+}
+
+fn fuzzDecodeFrame(_: void, smith: *testing.Smith) !void {
+    var buf: [512]u8 = undefined;
+    const len = smith.slice(&buf);
+    const raw = decodeFrame(buf[0..len]) catch return;
+    try testing.expect(raw.len <= len);
+    try testing.expect(raw.payload.len <= raw.len);
+    try testing.expectEqual(FrameType.fromValue(raw.type_value), raw.typ);
+
+    const limited = decodeFrameWithLimit(buf[0..len], raw.payload.len) catch |err| switch (err) {
+        error.FrameTooLarge => unreachable,
+        else => return,
+    };
+    try testing.expectEqual(raw.type_value, limited.type_value);
+    try testing.expectEqual(raw.len, limited.len);
+}
+
+test "fuzz: SETTINGS decoder never panics on arbitrary payloads" {
+    try testing.fuzz({}, fuzzDecodeSettings, .{ .corpus = &.{
+        "",
+        "\x01\x00",
+        "\x07\x00",
+        "\x08\x01",
+        "\x08\x02",
+        "\x02\x01",
+        "\x07\x00\x07\x01",
+    } });
+}
+
+fn fuzzDecodeSettings(_: void, smith: *testing.Smith) !void {
+    var buf: [256]u8 = undefined;
+    const len = smith.slice(&buf);
+    var scratch: [16]Setting = undefined;
+    const decoded = decodeSettings(buf[0..len], &scratch) catch return;
+    try testing.expect(decoded.count <= scratch.len);
+}
+
+test "fuzz: control stream ingestion never panics or leaks" {
+    try testing.fuzz({}, fuzzControlStreamIngest, .{ .corpus = &.{
+        "",
+        "\x00",
+        "\x00\x04\x00",
+        "\x00\x04\x02\x01\x00",
+        "\x00\x01\x00",
+        "\x02\x04\x00",
+    } });
+}
+
+fn fuzzControlStreamIngest(_: void, smith: *testing.Smith) !void {
+    const allocator = testing.allocator;
+    var buf: [512]u8 = undefined;
+    const len = smith.slice(&buf);
+    var stream = ControlStream{};
+    defer stream.deinit(allocator);
+    _ = stream.ingest(allocator, buf[0..len]) catch return;
+    stream.finish() catch {};
+}
+
 test {
     std.testing.refAllDecls(@This());
 }

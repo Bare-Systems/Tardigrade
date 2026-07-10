@@ -19,7 +19,7 @@
 
 const std = @import("std");
 const config = @import("config.zig");
-const varint = @import("varint.zig");
+const varint = @import("quic_varint");
 const tls_adapter = @import("tls_adapter.zig");
 const tls_handshake = @import("tls_handshake.zig");
 
@@ -1142,6 +1142,15 @@ fn certificateVerifyContent(signer: Role, transcript_hash: [hash_len]u8) Certifi
     return content;
 }
 
+/// Deterministic local server identity (self-signed Ed25519,
+/// CN=tardigrade.test, valid to 2036; generated with openssl, see
+/// src/quic/testdata/). For unit tests and local smoke harnesses only — never
+/// a production identity.
+pub const testdata = struct {
+    pub const certificate_der: []const u8 = @embedFile("testdata/test_server_cert.der");
+    pub const private_key_pkcs8_der: []const u8 = @embedFile("testdata/test_server_key.der");
+};
+
 // ===========================================================================
 // Tests.
 // ===========================================================================
@@ -1150,10 +1159,8 @@ const testing = std.testing;
 const QuicTlsAdapter = tls_adapter.QuicTlsAdapter;
 const Handshake = tls_handshake.Handshake;
 
-/// Deterministic local server identity (self-signed Ed25519, CN=tardigrade.test,
-/// generated with openssl; see src/quic/testdata/).
-const fixture_certificate = @embedFile("testdata/test_server_cert.der");
-const fixture_key_pkcs8 = @embedFile("testdata/test_server_key.der");
+const fixture_certificate = testdata.certificate_der;
+const fixture_key_pkcs8 = testdata.private_key_pkcs8_der;
 
 fn hexBytes(comptime hex: []const u8) [hex.len / 2]u8 {
     var bytes: [hex.len / 2]u8 = undefined;

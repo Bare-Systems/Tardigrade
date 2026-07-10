@@ -3,7 +3,7 @@
 
 pub const config = @import("config.zig");
 pub const udp = @import("udp.zig");
-pub const varint = @import("varint.zig");
+pub const varint = @import("quic_varint");
 pub const packet = @import("packet.zig");
 pub const connection = @import("connection.zig");
 pub const tls_adapter = @import("tls_adapter.zig");

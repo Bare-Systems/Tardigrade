@@ -32,6 +32,15 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
 
+    // QUIC varint codec as a shared module: it is consumed by the quic package,
+    // the http3 package, and (transitively) the exe, and a Zig source file may
+    // belong to exactly one module across a compilation graph.
+    const quic_varint_mod = b.createModule(.{
+        .root_source_file = b.path("src/quic/varint.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
@@ -39,6 +48,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     exe_mod.addImport("build_options", build_options.createModule());
+    exe_mod.addImport("quic_varint", quic_varint_mod);
 
     const exe = b.addExecutable(.{
         .name = "tardigrade",
@@ -70,6 +80,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     allocation_regression_mod.addImport("build_options", build_options.createModule());
+    allocation_regression_mod.addImport("quic_varint", quic_varint_mod);
 
     const allocation_regression_tests = b.addTest(.{
         .root_module = allocation_regression_mod,
@@ -175,15 +186,28 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    quic_mod.addImport("quic_varint", quic_varint_mod);
+    // varint.zig now lives in its own module, so its tests need their own run.
+    const quic_varint_tests = b.addTest(.{ .root_module = quic_varint_mod });
+    const run_quic_varint_tests = b.addRunArtifact(quic_varint_tests);
     const quic_tests = b.addTest(.{ .root_module = quic_mod });
     const run_quic_tests = b.addRunArtifact(quic_tests);
     const quic_step = b.step("test-quic", "Run pure-Zig QUIC/HTTP-3 unit tests");
     quic_step.dependOn(&run_quic_tests.step);
+    quic_step.dependOn(&run_quic_varint_tests.step);
     // Also exercise them under the default `zig build test`.
     test_step.dependOn(&run_quic_tests.step);
+    test_step.dependOn(&run_quic_varint_tests.step);
 
     const http3_mod = b.createModule(.{
         .root_source_file = b.path("src/http3/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    // Shared with the smoke harness below so stream_transport types (Exchange,
+    // Header) keep one module identity across the boundary.
+    const stream_transport_mod = b.createModule(.{
+        .root_source_file = b.path("src/http/stream_transport.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -192,20 +216,28 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     }));
-    http3_mod.addImport("stream_transport", b.createModule(.{
-        .root_source_file = b.path("src/http/stream_transport.zig"),
-        .target = target,
-        .optimize = optimize,
-    }));
-    http3_mod.addImport("quic_varint", b.createModule(.{
-        .root_source_file = b.path("src/quic/varint.zig"),
-        .target = target,
-        .optimize = optimize,
-    }));
+    http3_mod.addImport("stream_transport", stream_transport_mod);
+    http3_mod.addImport("quic_varint", quic_varint_mod);
     const http3_tests = b.addTest(.{ .root_module = http3_mod });
     const run_http3_tests = b.addRunArtifact(http3_tests);
     quic_step.dependOn(&run_http3_tests.step);
     test_step.dependOn(&run_http3_tests.step);
+
+    // Local pure-Zig QUIC/TLS/H3 connection-driver smoke harness (#314): the
+    // stitching layer lives outside src/quic/ and src/http3/ so neither package
+    // learns about the other; it consumes both as modules.
+    const quic_h3_smoke_mod = b.createModule(.{
+        .root_source_file = b.path("tests/quic_h3_smoke.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    quic_h3_smoke_mod.addImport("quic", quic_mod);
+    quic_h3_smoke_mod.addImport("http3", http3_mod);
+    quic_h3_smoke_mod.addImport("stream_transport", stream_transport_mod);
+    const quic_h3_smoke_tests = b.addTest(.{ .root_module = quic_h3_smoke_mod });
+    const run_quic_h3_smoke_tests = b.addRunArtifact(quic_h3_smoke_tests);
+    quic_step.dependOn(&run_quic_h3_smoke_tests.step);
+    test_step.dependOn(&run_quic_h3_smoke_tests.step);
 }
 
 fn pathExists(path: []const u8) bool {

@@ -15,7 +15,7 @@
 //!
 //! ## Default limits
 //!
-//! See `Limits`: 32 nesting depth, 1 MiB per element, 4096 elements per reader
+//! See `Limits`: 32 nesting depth, 1 MiB per element, 4096 elements per parse
 //! tree, 32 OID components, 4096 integer bytes.
 //!
 //! ## Ownership and zero-copy
@@ -154,7 +154,14 @@ pub const Error = error{
 
 pub const ParseError = struct {
     err: Error,
+    /// Absolute offset of the offending byte when known, otherwise the tag
+    /// start for the element whose parse failed.
     offset: usize,
+};
+
+pub const DiagnosticElement = union(enum) {
+    element: Element,
+    err: ParseError,
 };
 
 pub const Reader = struct {
@@ -164,6 +171,8 @@ pub const Reader = struct {
     offset: usize,
     depth: usize,
     element_count: usize,
+    shared_element_count: ?*usize,
+    last_error_offset: ?usize,
     limits: Limits,
 
     pub fn init(input: []const u8, limits: Limits) Reader {
@@ -174,11 +183,13 @@ pub const Reader = struct {
             .offset = 0,
             .depth = 0,
             .element_count = 0,
+            .shared_element_count = null,
+            .last_error_offset = null,
             .limits = limits,
         };
     }
 
-    pub fn initBounded(input: []const u8, start: usize, end: usize, depth: usize, element_count: usize, limits: Limits) Reader {
+    pub fn initBounded(input: []const u8, start: usize, end: usize, depth: usize, element_count: usize, shared_element_count: ?*usize, limits: Limits) Reader {
         return .{
             .input = input,
             .start = start,
@@ -186,6 +197,8 @@ pub const Reader = struct {
             .offset = start,
             .depth = depth,
             .element_count = element_count,
+            .shared_element_count = shared_element_count,
+            .last_error_offset = null,
             .limits = limits,
         };
     }
@@ -199,15 +212,18 @@ pub const Reader = struct {
     }
 
     pub fn readElement(self: *Reader) Error!Element {
-        if (self.element_count >= self.limits.max_elements) return error.ElementCountLimit;
+        if (self.currentElementCount() >= self.limits.max_elements) return self.fail(error.ElementCountLimit, self.offset);
         const elem_start = self.offset;
         const tag = try self.readTag();
+        if (tag.class == .universal and tag.number == @intFromEnum(UniversalTag.end_of_content)) {
+            return self.fail(error.InvalidTag, elem_start);
+        }
         const content_len = try self.readDefiniteLength();
-        if (content_len > self.remaining()) return error.LengthBeyondInput;
+        if (content_len > self.remaining()) return self.fail(error.LengthBeyondInput, self.offset);
         const content_start = self.offset;
         const content_end = content_start + content_len;
         self.offset = content_end;
-        self.element_count += 1;
+        self.incrementElementCount();
         return .{
             .tag = tag,
             .encoded = self.input[elem_start..content_end],
@@ -216,27 +232,35 @@ pub const Reader = struct {
         };
     }
 
+    /// Parse one element and capture typed error plus offset. The offset is the
+    /// offending byte when the low-level decoder can identify it; otherwise it
+    /// is the tag start for the element being parsed.
+    pub fn readElementDiagnostic(self: *Reader) DiagnosticElement {
+        const elem_start = self.offset;
+        const elem = self.readElement() catch |err| {
+            return .{ .err = .{ .err = err, .offset = self.last_error_offset orelse elem_start } };
+        };
+        return .{ .element = elem };
+    }
+
     pub fn readSequence(self: *Reader) Error!Reader {
         const elem = try self.readElement();
-        if (elem.tag.class != .universal or elem.tag.number != @intFromEnum(UniversalTag.sequence) or !elem.tag.constructed) {
-            return error.UnexpectedTag;
-        }
+        try self.expectUniversalTag(elem, .sequence, true);
         return self.childReader(elem.content_offset, elem.content.len);
     }
 
     pub fn readSet(self: *Reader) Error!Reader {
         const elem = try self.readElement();
-        if (elem.tag.class != .universal or elem.tag.number != @intFromEnum(UniversalTag.set) or !elem.tag.constructed) {
-            return error.UnexpectedTag;
-        }
+        try self.expectUniversalTag(elem, .set, true);
         return self.childReader(elem.content_offset, elem.content.len);
     }
 
-    pub fn childReader(self: *const Reader, content_offset: usize, content_len: usize) Error!Reader {
-        if (self.depth >= self.limits.max_depth) return error.NestingLimit;
+    pub fn childReader(self: *Reader, content_offset: usize, content_len: usize) Error!Reader {
+        if (self.depth >= self.limits.max_depth) return self.fail(error.NestingLimit, content_offset);
         const end = content_offset + content_len;
-        if (content_offset < self.start or end > self.end) return error.LengthBeyondInput;
-        return Reader.initBounded(self.input, content_offset, end, self.depth + 1, self.element_count, self.limits);
+        if (content_offset < self.start or end > self.end) return self.fail(error.LengthBeyondInput, content_offset);
+        const shared_count = self.shared_element_count orelse &self.element_count;
+        return Reader.initBounded(self.input, content_offset, end, self.depth + 1, self.currentElementCount(), shared_count, self.limits);
     }
 
     pub fn expectEnd(self: *const Reader) Error!void {
@@ -268,18 +292,14 @@ pub const Reader = struct {
 
     pub fn readInteger(self: *Reader) Error!IntegerView {
         const elem = try self.readElement();
-        if (elem.tag.class != .universal or elem.tag.number != @intFromEnum(UniversalTag.integer)) {
-            return error.UnexpectedTag;
-        }
+        try self.expectUniversalTag(elem, .integer, false);
         try validateInteger(elem.content, self.limits.max_integer_bytes);
         return .{ .content = elem.content };
     }
 
     pub fn readBoolean(self: *Reader) Error!bool {
         const elem = try self.readElement();
-        if (elem.tag.class != .universal or elem.tag.number != @intFromEnum(UniversalTag.boolean)) {
-            return error.UnexpectedTag;
-        }
+        try self.expectUniversalTag(elem, .boolean, false);
         if (elem.content.len != 1) return error.MalformedBoolean;
         return switch (elem.content[0]) {
             0x00 => false,
@@ -290,33 +310,25 @@ pub const Reader = struct {
 
     pub fn readNull(self: *Reader) Error!void {
         const elem = try self.readElement();
-        if (elem.tag.class != .universal or elem.tag.number != @intFromEnum(UniversalTag.null)) {
-            return error.UnexpectedTag;
-        }
+        try self.expectUniversalTag(elem, .null, false);
         if (elem.content.len != 0) return error.UnexpectedTag;
     }
 
     pub fn readOctetString(self: *Reader) Error![]const u8 {
         const elem = try self.readElement();
-        if (elem.tag.class != .universal or elem.tag.number != @intFromEnum(UniversalTag.octet_string)) {
-            return error.UnexpectedTag;
-        }
+        try self.expectUniversalTag(elem, .octet_string, false);
         return elem.content;
     }
 
     pub fn readBitString(self: *Reader) Error!BitStringView {
         const elem = try self.readElement();
-        if (elem.tag.class != .universal or elem.tag.number != @intFromEnum(UniversalTag.bit_string)) {
-            return error.UnexpectedTag;
-        }
+        try self.expectUniversalTag(elem, .bit_string, false);
         return decodeBitStringContent(elem.content);
     }
 
     pub fn readObjectIdentifier(self: *Reader) Error!oid_mod.ObjectIdentifier {
         const elem = try self.readElement();
-        if (elem.tag.class != .universal or elem.tag.number != @intFromEnum(UniversalTag.object_identifier)) {
-            return error.UnexpectedTag;
-        }
+        try self.expectUniversalTag(elem, .object_identifier, false);
         return oid_mod.decode(elem.content, self.limits.max_oid_components);
     }
 
@@ -346,30 +358,24 @@ pub const Reader = struct {
 
     pub fn readUtcTime(self: *Reader) Error!time_mod.UtcTime {
         const elem = try self.readElement();
-        if (elem.tag.class != .universal or elem.tag.number != @intFromEnum(UniversalTag.utc_time)) {
-            return error.UnexpectedTag;
-        }
+        try self.expectUniversalTag(elem, .utc_time, false);
         return time_mod.parseUtcTime(elem.content);
     }
 
     pub fn readGeneralizedTime(self: *Reader) Error!time_mod.GeneralizedTime {
         const elem = try self.readElement();
-        if (elem.tag.class != .universal or elem.tag.number != @intFromEnum(UniversalTag.generalized_time)) {
-            return error.UnexpectedTag;
-        }
+        try self.expectUniversalTag(elem, .generalized_time, false);
         return time_mod.parseGeneralizedTime(elem.content);
     }
 
     fn readStringElement(self: *Reader, tag_number: UniversalTag) Error![]const u8 {
         const elem = try self.readElement();
-        if (elem.tag.class != .universal or elem.tag.number != @intFromEnum(tag_number)) {
-            return error.UnexpectedTag;
-        }
+        try self.expectUniversalTag(elem, tag_number, false);
         return elem.content;
     }
 
     fn readTag(self: *Reader) Error!Tag {
-        if (self.remaining() == 0) return error.Truncated;
+        if (self.remaining() == 0) return self.fail(error.Truncated, self.offset);
         const first = self.input[self.offset];
         self.offset += 1;
 
@@ -381,54 +387,80 @@ pub const Reader = struct {
             number = 0;
             var continuation_bytes: usize = 0;
             while (true) {
-                if (self.remaining() == 0) return error.Truncated;
+                if (self.remaining() == 0) return self.fail(error.Truncated, self.offset);
                 const b = self.input[self.offset];
                 self.offset += 1;
-                if (continuation_bytes == 0 and b == 0x80) return error.InvalidTag;
+                if (continuation_bytes == 0 and b == 0x80) return self.fail(error.InvalidTag, self.offset - 1);
                 const chunk: u32 = b & 0x7f;
-                if (number > (std.math.maxInt(u32) >> 7)) return error.InvalidTag;
+                if (number > (std.math.maxInt(u32) >> 7)) return self.fail(error.InvalidTag, self.offset - 1);
                 number = (number << 7) | chunk;
                 if (b & 0x80 == 0) break;
                 continuation_bytes += 1;
-                if (continuation_bytes > 4) return error.InvalidTag;
+                if (continuation_bytes > 4) return self.fail(error.InvalidTag, self.offset - 1);
             }
-            if (number < 31) return error.InvalidTag;
+            if (number < 31) return self.fail(error.InvalidTag, self.offset - 1);
         }
 
         return .{ .class = class, .number = number, .constructed = constructed };
     }
 
     fn readDefiniteLength(self: *Reader) Error!usize {
-        if (self.remaining() == 0) return error.Truncated;
+        if (self.remaining() == 0) return self.fail(error.Truncated, self.offset);
         const first = self.input[self.offset];
         self.offset += 1;
 
         if (first & 0x80 == 0) {
+            if (first > self.limits.max_element_len) return self.fail(error.LengthOverflow, self.offset - 1);
             return first;
         }
 
         const num_bytes = first & 0x7f;
-        if (num_bytes == 0) return error.IndefiniteLength;
-        if (num_bytes > 8) return error.InvalidLength;
-        if (self.remaining() < num_bytes) return error.Truncated;
+        if (num_bytes == 0) return self.fail(error.IndefiniteLength, self.offset - 1);
+        if (num_bytes > 8) return self.fail(error.InvalidLength, self.offset - 1);
+        if (self.remaining() < num_bytes) return self.fail(error.Truncated, self.offset);
 
         var length: u64 = 0;
         var i: usize = 0;
         while (i < num_bytes) : (i += 1) {
             length = (length << 8) | self.input[self.offset + i];
         }
-        if (length < 128) return error.NonMinimalLength;
-        if (length > self.limits.max_element_len) return error.LengthOverflow;
+        if (length < 128) return self.fail(error.NonMinimalLength, self.offset);
+        if (length > self.limits.max_element_len) return self.fail(error.LengthOverflow, self.offset);
 
         const first_len_byte = self.input[self.offset];
-        if (num_bytes > 1 and first_len_byte == 0) return error.NonMinimalLength;
+        if (num_bytes > 1 and first_len_byte == 0) return self.fail(error.NonMinimalLength, self.offset);
         const minimal_bytes = minimalLengthBytes(length);
-        if (num_bytes != minimal_bytes) return error.NonMinimalLength;
+        if (num_bytes != minimal_bytes) return self.fail(error.NonMinimalLength, self.offset);
 
         self.offset += num_bytes;
         const len: usize = @intCast(length);
-        if (len > self.remaining()) return error.LengthBeyondInput;
+        if (len > self.remaining()) return self.fail(error.LengthBeyondInput, self.offset);
         return len;
+    }
+
+    fn currentElementCount(self: *const Reader) usize {
+        if (self.shared_element_count) |count| return count.*;
+        return self.element_count;
+    }
+
+    fn incrementElementCount(self: *Reader) void {
+        if (self.shared_element_count) |count| {
+            count.* += 1;
+        } else {
+            self.element_count += 1;
+        }
+    }
+
+    fn expectUniversalTag(self: *Reader, elem: Element, tag_number: UniversalTag, constructed: bool) Error!void {
+        if (elem.tag.class != .universal or elem.tag.number != @intFromEnum(tag_number) or elem.tag.constructed != constructed) {
+            const header_len = elem.encoded.len - elem.content.len;
+            return self.fail(error.UnexpectedTag, elem.content_offset - header_len);
+        }
+    }
+
+    fn fail(self: *Reader, err: Error, offset: usize) Error {
+        self.last_error_offset = offset;
+        return err;
     }
 };
 

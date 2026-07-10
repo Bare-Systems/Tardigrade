@@ -14,7 +14,7 @@ pub const ObjectIdentifier = struct {
     storage: [max_components]u32 = undefined,
     len: usize = 0,
 
-    pub fn components(self: ObjectIdentifier) []const u32 {
+    pub fn components(self: *const ObjectIdentifier) []const u32 {
         return self.storage[0..self.len];
     }
 
@@ -26,11 +26,11 @@ pub const ObjectIdentifier = struct {
         return oid;
     }
 
-    pub fn eql(self: ObjectIdentifier, other: ObjectIdentifier) bool {
+    pub fn eql(self: *const ObjectIdentifier, other: *const ObjectIdentifier) bool {
         return std.mem.eql(u32, self.components(), other.components());
     }
 
-    pub fn eqlComponents(self: ObjectIdentifier, values: []const u32) bool {
+    pub fn eqlComponents(self: *const ObjectIdentifier, values: []const u32) bool {
         return std.mem.eql(u32, self.components(), values);
     }
 };
@@ -38,11 +38,13 @@ pub const ObjectIdentifier = struct {
 /// Decode DER OID content (value bytes only, not the TLV wrapper).
 pub fn decode(content: []const u8, component_limit: usize) Error!ObjectIdentifier {
     if (content.len == 0) return error.MalformedOid;
+    if (component_limit < 2) return error.OidComponentLimit;
     if (component_limit > max_components) return error.OidComponentLimit;
 
     var oid: ObjectIdentifier = .{};
 
-    const first = content[0];
+    var i: usize = 0;
+    const first = try decodeBase128(content, &i);
     const first_arc: u32 = if (first < 40) 0 else if (first < 80) 1 else 2;
     const second_arc: u32 = if (first < 40) first else if (first < 80) first - 40 else first - 80;
     if (first_arc < 2 and second_arc >= 40) return error.MalformedOid;
@@ -50,7 +52,6 @@ pub fn decode(content: []const u8, component_limit: usize) Error!ObjectIdentifie
     oid.storage[1] = second_arc;
     oid.len = 2;
 
-    var i: usize = 1;
     while (i < content.len) {
         if (oid.len >= component_limit) return error.OidComponentLimit;
         const decoded = try decodeBase128(content, &i);
@@ -87,9 +88,8 @@ pub fn encodeComponents(components: []const u32, out: []u8) Error!usize {
     if (components[0] > 2) return error.MalformedOid;
     if (components[0] < 2 and components[1] >= 40) return error.MalformedOid;
 
-    if (out.len == 0) return error.MalformedOid;
-    out[0] = @intCast(components[0] * 40 + components[1]);
-    var written: usize = 1;
+    const first_combined = components[0] * 40 + components[1];
+    var written = try encodeBase128(first_combined, out);
 
     for (components[2..]) |component| {
         const n = try encodeBase128(component, out[written..]);
@@ -154,6 +154,20 @@ test "decode and encode known OIDs" {
     for (cn.components(), 0..) |component, i| {
         try testing.expectEqual(well_known.common_name[i], component);
     }
+}
+
+test "decode and encode multi-octet first subidentifier" {
+    var buf: [16]u8 = undefined;
+    const components = [_]u32{ 2, 999, 3 };
+    const n = try encodeComponents(&components, &buf);
+    try testing.expectEqualSlices(u8, &.{ 0x88, 0x37, 0x03 }, buf[0..n]);
+    const decoded = try decode(buf[0..n], 3);
+    try testing.expect(decoded.eqlComponents(&components));
+}
+
+test "decode rejects limits below mandatory first two OID arcs" {
+    try testing.expectError(error.OidComponentLimit, decode(&.{0x55}, 0));
+    try testing.expectError(error.OidComponentLimit, decode(&.{0x55}, 1));
 }
 
 test {

@@ -12,7 +12,7 @@ pub const UtcTime = struct {
     day: u8,
     hour: u8,
     minute: u8,
-    second: ?u8,
+    second: u8,
 };
 
 pub const GeneralizedTime = struct {
@@ -21,11 +21,11 @@ pub const GeneralizedTime = struct {
     day: u8,
     hour: u8,
     minute: u8,
-    second: ?u8,
+    second: u8,
 };
 
 pub fn parseUtcTime(content: []const u8) Error!UtcTime {
-    if (content.len != 11 and content.len != 13) return error.MalformedTime;
+    if (content.len != 13) return error.MalformedTime;
     if (content[content.len - 1] != 'Z') return error.MalformedTime;
 
     const yy = try parseTwoDigits(content[0..2]);
@@ -35,14 +35,14 @@ pub fn parseUtcTime(content: []const u8) Error!UtcTime {
     const hour = try parseTwoDigits(content[6..8]);
     const minute = try parseTwoDigits(content[8..10]);
 
-    const second: ?u8 = if (content.len == 13) try parseTwoDigits(content[10..12]) else null;
+    const second = try parseTwoDigits(content[10..12]);
 
     try validateDateTime(year, month, day, hour, minute, second);
     return .{ .year = year, .month = month, .day = day, .hour = hour, .minute = minute, .second = second };
 }
 
 pub fn parseGeneralizedTime(content: []const u8) Error!GeneralizedTime {
-    if (content.len != 13 and content.len != 15) return error.MalformedTime;
+    if (content.len != 15) return error.MalformedTime;
     if (content[content.len - 1] != 'Z') return error.MalformedTime;
     for (content[0 .. content.len - 1]) |c| {
         if (c < '0' or c > '9') return error.MalformedTime;
@@ -54,7 +54,7 @@ pub fn parseGeneralizedTime(content: []const u8) Error!GeneralizedTime {
     const hour = try parseTwoDigits(content[8..10]);
     const minute = try parseTwoDigits(content[10..12]);
 
-    const second: ?u8 = if (content.len == 15) try parseTwoDigits(content[12..14]) else null;
+    const second = try parseTwoDigits(content[12..14]);
 
     try validateDateTime(year, month, day, hour, minute, second);
     return .{ .year = year, .month = month, .day = day, .hour = hour, .minute = minute, .second = second };
@@ -77,14 +77,12 @@ fn parseFourDigits(digits: []const u8) Error!u16 {
     return value;
 }
 
-fn validateDateTime(year: u16, month: u8, day: u8, hour: u8, minute: u8, second: ?u8) Error!void {
+fn validateDateTime(year: u16, month: u8, day: u8, hour: u8, minute: u8, second: u8) Error!void {
     if (month < 1 or month > 12) return error.MalformedTime;
     if (day < 1 or day > daysInMonth(year, month)) return error.MalformedTime;
     if (hour > 23) return error.MalformedTime;
     if (minute > 59) return error.MalformedTime;
-    if (second) |s| {
-        if (s > 59) return error.MalformedTime;
-    }
+    if (second > 59) return error.MalformedTime;
 }
 
 fn daysInMonth(year: u16, month: u8) u8 {
@@ -118,6 +116,11 @@ test "reject invalid calendar values" {
     try testing.expectError(error.MalformedTime, parseUtcTime("240231000000Z"));
     try testing.expectError(error.MalformedTime, parseUtcTime("240101250000Z"));
     try testing.expectError(error.MalformedTime, parseGeneralizedTime("20240230000000Z"));
+}
+
+test "reject certificate times without mandatory seconds" {
+    try testing.expectError(error.MalformedTime, parseUtcTime("2401010000Z"));
+    try testing.expectError(error.MalformedTime, parseGeneralizedTime("202401010000Z"));
 }
 
 test {

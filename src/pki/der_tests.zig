@@ -256,11 +256,70 @@ test "excessive nesting and element count" {
     try testing.expectError(error.ElementCountLimit, seq.readNull());
 }
 
+test "element count limit is shared across nested sibling containers" {
+    const allocator = testing.allocator;
+
+    var first_payload = std.ArrayList(u8).empty;
+    defer first_payload.deinit(allocator);
+    var second_payload = std.ArrayList(u8).empty;
+    defer second_payload.deinit(allocator);
+    var i: usize = 0;
+    while (i < 2) : (i += 1) {
+        var item = Builder.init();
+        defer item.deinit(allocator);
+        try item.appendTlv(allocator, der.Tag.universal(@intFromEnum(der.UniversalTag.null), false), &.{});
+        try first_payload.appendSlice(allocator, item.buf.items);
+        try second_payload.appendSlice(allocator, item.buf.items);
+    }
+
+    var outer_payload = std.ArrayList(u8).empty;
+    defer outer_payload.deinit(allocator);
+    var first_seq = Builder.init();
+    defer first_seq.deinit(allocator);
+    try first_seq.appendTlv(allocator, der.Tag.universal(@intFromEnum(der.UniversalTag.sequence), true), first_payload.items);
+    try outer_payload.appendSlice(allocator, first_seq.buf.items);
+    var second_seq = Builder.init();
+    defer second_seq.deinit(allocator);
+    try second_seq.appendTlv(allocator, der.Tag.universal(@intFromEnum(der.UniversalTag.sequence), true), second_payload.items);
+    try outer_payload.appendSlice(allocator, second_seq.buf.items);
+
+    var outer = Builder.init();
+    defer outer.deinit(allocator);
+    try outer.appendTlv(allocator, der.Tag.universal(@intFromEnum(der.UniversalTag.sequence), true), outer_payload.items);
+    const encoded = try outer.toOwnedSlice(allocator);
+    defer allocator.free(encoded);
+
+    var reader = der.Reader.init(encoded, .{ .max_elements = 5 });
+    var seq = try reader.readSequence();
+    var first = try seq.readSequence();
+    try first.readNull();
+    try first.readNull();
+    try first.expectEnd();
+    var second = try seq.readSequence();
+    try testing.expectError(error.ElementCountLimit, second.readNull());
+}
+
+test "short-form lengths honor max element length" {
+    const allocator = testing.allocator;
+    try testing.expectError(error.LengthOverflow, parseOneWithLimits(allocator, &.{ 0x04, 0x05, 1, 2, 3, 4, 5 }, .{ .max_element_len = 4 }));
+}
+
 test "non-minimal INTEGER encodings rejected" {
     const allocator = testing.allocator;
     try testing.expectError(error.MalformedInteger, parseInteger(allocator, &.{ 0x00, 0x01 }));
     try testing.expectError(error.MalformedInteger, parseInteger(allocator, &.{ 0xff, 0xff }));
     try testing.expectError(error.MalformedInteger, parseInteger(allocator, &.{}));
+}
+
+test "constructed encodings for primitive universal types rejected" {
+    const allocator = testing.allocator;
+    try testing.expectError(error.UnexpectedTag, parseIntegerTlv(allocator, &.{ 0x22, 0x01, 0x01 }));
+    try testing.expectError(error.UnexpectedTag, parseBooleanTlv(allocator, &.{ 0x21, 0x01, 0xff }));
+    try testing.expectError(error.UnexpectedTag, parseBitStringTlv(allocator, &.{ 0x23, 0x02, 0x00, 0x80 }));
+    try testing.expectError(error.UnexpectedTag, parseOidTlv(allocator, &.{ 0x26, 0x03, 0x55, 0x04, 0x03 }));
+    try testing.expectError(error.UnexpectedTag, parseUtcTlv(allocator, "\x37\x0d240101000000Z"));
+    try testing.expectError(error.UnexpectedTag, parseGenTlv(allocator, "\x38\x0f20240101000000Z"));
+    try testing.expectError(error.InvalidTag, parseOne(allocator, &.{ 0x00, 0x00 }));
 }
 
 test "invalid BOOLEAN values" {
@@ -287,8 +346,28 @@ test "malformed OID and component overflow" {
 test "invalid time syntax" {
     const allocator = testing.allocator;
     try testing.expectError(error.MalformedTime, parseUtc(allocator, "24010100000"));
+    try testing.expectError(error.MalformedTime, parseUtc(allocator, "2401010000Z"));
     try testing.expectError(error.MalformedTime, parseUtc(allocator, "240101000000"));
     try testing.expectError(error.MalformedTime, parseGen(allocator, "2024010100000Z"));
+    try testing.expectError(error.MalformedTime, parseGen(allocator, "202401010000Z"));
+}
+
+test "diagnostic read captures typed error offsets" {
+    try expectDiagnostic(&.{ 0x1f, 0x00, 0x00 }, error.InvalidTag, 1);
+    try expectDiagnostic(&.{ 0x30, 0x82, 0x01 }, error.Truncated, 2);
+    try expectDiagnostic(&.{ 0x04, 0x81, 0x01, 0x00 }, error.NonMinimalLength, 2);
+
+    const child_boundary = [_]u8{ 0x30, 0x03, 0x04, 0x05, 0x00 };
+    var reader = der.Reader.init(&child_boundary, der.default_limits);
+    var child = try reader.readSequence();
+    const diag = child.readElementDiagnostic();
+    switch (diag) {
+        .element => return error.TestExpectedError,
+        .err => |parse_err| {
+            try testing.expectEqual(error.LengthBeyondInput, parse_err.err);
+            try testing.expectEqual(@as(usize, 4), parse_err.offset);
+        },
+    }
 }
 
 test "trailing bytes and child boundary escape" {
@@ -378,6 +457,11 @@ fn parseInteger(allocator: std.mem.Allocator, content: []const u8) !void {
     _ = try reader.readInteger();
 }
 
+fn parseIntegerTlv(_: std.mem.Allocator, input: []const u8) !void {
+    var reader = der.Reader.init(input, der.default_limits);
+    _ = try reader.readInteger();
+}
+
 fn parseBoolean(allocator: std.mem.Allocator, content: []const u8) !void {
     var b = Builder.init();
     defer b.deinit(allocator);
@@ -385,6 +469,11 @@ fn parseBoolean(allocator: std.mem.Allocator, content: []const u8) !void {
     const encoded = try b.toOwnedSlice(allocator);
     defer allocator.free(encoded);
     var reader = der.Reader.init(encoded, der.default_limits);
+    _ = try reader.readBoolean();
+}
+
+fn parseBooleanTlv(_: std.mem.Allocator, input: []const u8) !void {
+    var reader = der.Reader.init(input, der.default_limits);
     _ = try reader.readBoolean();
 }
 
@@ -398,6 +487,11 @@ fn parseBitString(allocator: std.mem.Allocator, content: []const u8) !void {
     _ = try reader.readBitString();
 }
 
+fn parseBitStringTlv(_: std.mem.Allocator, input: []const u8) !void {
+    var reader = der.Reader.init(input, der.default_limits);
+    _ = try reader.readBitString();
+}
+
 fn parseOid(allocator: std.mem.Allocator, content: []const u8) !void {
     var b = Builder.init();
     defer b.deinit(allocator);
@@ -405,6 +499,11 @@ fn parseOid(allocator: std.mem.Allocator, content: []const u8) !void {
     const encoded = try b.toOwnedSlice(allocator);
     defer allocator.free(encoded);
     var reader = der.Reader.init(encoded, der.default_limits);
+    _ = try reader.readObjectIdentifier();
+}
+
+fn parseOidTlv(_: std.mem.Allocator, input: []const u8) !void {
+    var reader = der.Reader.init(input, der.default_limits);
     _ = try reader.readObjectIdentifier();
 }
 
@@ -418,6 +517,11 @@ fn parseUtc(allocator: std.mem.Allocator, content: []const u8) !void {
     _ = try reader.readUtcTime();
 }
 
+fn parseUtcTlv(_: std.mem.Allocator, input: []const u8) !void {
+    var reader = der.Reader.init(input, der.default_limits);
+    _ = try reader.readUtcTime();
+}
+
 fn parseGen(allocator: std.mem.Allocator, content: []const u8) !void {
     var b = Builder.init();
     defer b.deinit(allocator);
@@ -426,4 +530,21 @@ fn parseGen(allocator: std.mem.Allocator, content: []const u8) !void {
     defer allocator.free(encoded);
     var reader = der.Reader.init(encoded, der.default_limits);
     _ = try reader.readGeneralizedTime();
+}
+
+fn parseGenTlv(_: std.mem.Allocator, input: []const u8) !void {
+    var reader = der.Reader.init(input, der.default_limits);
+    _ = try reader.readGeneralizedTime();
+}
+
+fn expectDiagnostic(input: []const u8, expected_err: der.Error, expected_offset: usize) !void {
+    var reader = der.Reader.init(input, der.default_limits);
+    const diag = reader.readElementDiagnostic();
+    switch (diag) {
+        .element => return error.TestExpectedError,
+        .err => |parse_err| {
+            try testing.expectEqual(expected_err, parse_err.err);
+            try testing.expectEqual(expected_offset, parse_err.offset);
+        },
+    }
 }

@@ -5,6 +5,23 @@ All notable user-facing changes to Tardigrade are documented here.
 ## [Unreleased]
 
 ### Features
+- **Pure Zig TLS 1.3 backend for QUIC (#296)** — adds
+  `src/quic/tls_backend.zig`, a concrete TLS 1.3 engine operating in QUIC mode
+  behind the `QuicTlsAdapter` seam: raw handshake messages per encryption level
+  (no record layer), X25519 key exchange, the TLS_AES_128_GCM_SHA256 key
+  schedule (validated against the RFC 8448 trace), Ed25519 server
+  CertificateVerify with X.509 parsing via `std.crypto.Certificate`, the RFC
+  9000 §18 `quic_transport_parameters` codec, ALPN `h3` negotiation, and
+  pinned-certificate or explicit-insecure trust. A real client↔server handshake
+  now completes end-to-end through the backend-agnostic handshake driver,
+  installing matching Handshake and 1-RTT secrets on both sides, with
+  deterministic typed failures for ALPN mismatch, certificate rejection,
+  missing/invalid/duplicated transport parameters, duplicated TLS extensions,
+  low-order X25519 key shares, tampered Finished/CertificateVerify, and
+  CRYPTO-level misuse; fragmented post-handshake NewSessionTicket is tolerated
+  and ignored. Session resumption, 0-RTT, HelloRetryRequest, additional cipher
+  suites, web-PKI chain validation, and the connection-ID transport parameters
+  (supplied by the connection layer at packet integration) remain follow-ups.
 - **Dynamic QPACK table and blocked-stream accounting (#253)** — extends
   `src/http3/qpack.zig` beyond the static-only fallback with a bounded dynamic
   table, memory/capacity enforcement, eviction accounting, encoder-stream

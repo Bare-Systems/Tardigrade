@@ -435,6 +435,18 @@ pub const RecoveryController = struct {
         }
         return result;
     }
+
+    /// Reinitialize path-dependent state after migrating to a path with new
+    /// characteristics (RFC 9000 §9.4): the RTT estimate and congestion
+    /// controller reset to their initial values, while packet/ACK tracking
+    /// continues — packets in flight on the old path are still accounted for
+    /// and can still be acknowledged or declared lost. Skip this for a NAT
+    /// rebinding that only changed the peer's port; `path.zig` documents the
+    /// policy.
+    pub fn resetForPathMigration(self: *RecoveryController) void {
+        self.rtt = RttEstimator.init(self.rtt.max_ack_delay_us);
+        self.congestion = .{ .bytes_in_flight = self.congestion.bytes_in_flight };
+    }
 };
 
 fn spaceIndex(space: PacketNumberSpace) usize {

@@ -12,10 +12,10 @@
 //! Deliberately narrow (one client, one server, one request stream, one
 //! response) and deliberately real at the QUIC boundaries: bytes cross between
 //! the endpoints only as protected QUIC packets in whole datagrams. Not a
-//! production connection driver: no ACK/loss recovery (the pump is lossless
-//! and in order), no idle timers, no migration, no key updates, no coalesced
-//! packets. Those integrate in the follow-up #247/#251 work; this harness
-//! exists so that work starts from a stitched, passing path.
+//! production connection driver: no ACK/loss recovery beyond the migration
+//! reset hook (the pump is lossless and in order), no idle timers, no key
+//! updates, no coalesced packets. Those integrate in follow-up #247 work; this
+//! harness exists so that work starts from a stitched, passing path.
 //!
 //! The harness fails with stage-specific errors (`error.HandshakeStalled`,
 //! `error.KeysUnavailableForLevel`, `error.UnexpectedFrameType`, ...) so a
@@ -34,6 +34,10 @@ const quic_stream = quic.stream;
 const quic_packet = quic.packet;
 const varint = quic.varint;
 const config = quic.config;
+const quic_cid = quic.cid;
+const quic_path = quic.path;
+const quic_recovery = quic.recovery;
+const quic_udp = quic.udp;
 
 const EncryptionLevel = tls_adapter.EncryptionLevel;
 const QuicTlsAdapter = tls_adapter.QuicTlsAdapter;
@@ -53,14 +57,17 @@ const aead_tag_len = tls_adapter.packet_protection_tag_len;
 const sample_len = tls_adapter.header_protection_sample_len;
 
 // ---------------------------------------------------------------------------
-// Minimal QUIC v1 frame codec: PADDING, PING, CRYPTO, STREAM. Everything the
-// smoke path does not send is a deterministic error on receive.
+// Minimal QUIC v1 frame codec: PADDING, PING, CRYPTO, STREAM,
+// PATH_CHALLENGE, and PATH_RESPONSE. Everything the smoke path does not send
+// is a deterministic error on receive.
 // ---------------------------------------------------------------------------
 
 const frame_padding: u64 = 0x00;
 const frame_ping: u64 = 0x01;
 const frame_crypto: u64 = 0x06;
 const frame_stream_base: u64 = 0x08; // 0x08..0x0f: OFF=0x04, LEN=0x02, FIN=0x01
+const frame_path_challenge: u64 = 0x1a;
+const frame_path_response: u64 = 0x1b;
 
 const HarnessError = error{
     HandshakeStalled,
@@ -75,6 +82,11 @@ const HarnessError = error{
     StreamsNotReady,
     BufferTooShort,
     PumpOverflow,
+};
+
+const PathFrame = union(enum) {
+    challenge: [quic_path.path_challenge_len]u8,
+    response: [quic_path.path_challenge_len]u8,
 };
 
 /// Deterministic bounds check for fixed packet-header fields: reading past the
@@ -108,6 +120,54 @@ fn encodeStreamFrame(grant: quic_stream.SendGrant, data: []const u8, out: []u8) 
     return out[0 .. pos + data.len];
 }
 
+fn encodePathFrame(frame: PathFrame, out: []u8) ![]const u8 {
+    var pos: usize = 0;
+    switch (frame) {
+        .challenge => |data| {
+            pos += try varint.encode(frame_path_challenge, out[pos..]);
+            if (out.len - pos < data.len) return error.BufferTooShort;
+            @memcpy(out[pos..][0..data.len], &data);
+            pos += data.len;
+        },
+        .response => |data| {
+            pos += try varint.encode(frame_path_response, out[pos..]);
+            if (out.len - pos < data.len) return error.BufferTooShort;
+            @memcpy(out[pos..][0..data.len], &data);
+            pos += data.len;
+        },
+    }
+    return out[0..pos];
+}
+
+fn extractDcid(datagram: []const u8) HarnessError![]const u8 {
+    if (datagram.len == 0) return error.TruncatedPacket;
+    var pos: usize = 0;
+    if (datagram[0] & 0x80 != 0) {
+        pos = 1;
+        try requireAvailable(datagram.len, pos, 4);
+        if (std.mem.readInt(u32, datagram[pos..][0..4], .big) != quic_v1) return error.UnexpectedQuicVersion;
+        pos += 4;
+        try requireAvailable(datagram.len, pos, 1);
+        const len = datagram[pos];
+        pos += 1;
+        try requireAvailable(datagram.len, pos, len);
+        return datagram[pos..][0..len];
+    }
+    pos = 1;
+    try requireAvailable(datagram.len, pos, cid_len);
+    return datagram[pos..][0..cid_len];
+}
+
+/// Deterministic, predictable challenge bytes for this in-process smoke
+/// harness only. Production path validation must use unpredictable entropy.
+fn deterministicTestChallengeForPath(key: quic_path.PathKey) [quic_path.path_challenge_len]u8 {
+    var challenge: [quic_path.path_challenge_len]u8 = undefined;
+    @memcpy(challenge[0..4], key.remote.slice()[0..4]);
+    std.mem.writeInt(u16, challenge[4..6], key.remote.port, .big);
+    std.mem.writeInt(u16, challenge[6..8], key.local.port, .big);
+    return challenge;
+}
+
 // ---------------------------------------------------------------------------
 // Deterministic in-memory datagram pump: whole datagrams, lossless, in order.
 // ---------------------------------------------------------------------------
@@ -120,22 +180,45 @@ const DatagramQueue = struct {
 
     buffers: [queue_capacity][max_datagram]u8 = undefined,
     lengths: [queue_capacity]usize = [_]usize{0} ** queue_capacity,
+    locals: [queue_capacity]quic_udp.Address = undefined,
+    remotes: [queue_capacity]quic_udp.Address = undefined,
+    received_at_us: [queue_capacity]u64 = [_]u64{0} ** queue_capacity,
     count: usize = 0,
 
-    fn push(self: *DatagramQueue, datagram: []const u8) HarnessError!void {
+    fn push(
+        self: *DatagramQueue,
+        datagram: []const u8,
+        local: quic_udp.Address,
+        remote: quic_udp.Address,
+        received_at_us: u64,
+    ) HarnessError!void {
         if (self.count == queue_capacity) return error.PumpOverflow;
         if (datagram.len > max_datagram) return error.BufferTooShort;
         @memcpy(self.buffers[self.count][0..datagram.len], datagram);
         self.lengths[self.count] = datagram.len;
+        self.locals[self.count] = local;
+        self.remotes[self.count] = remote;
+        self.received_at_us[self.count] = received_at_us;
         self.count += 1;
     }
 
     /// Deliver every queued datagram to `endpoint` in order. Returns the
     /// number delivered (zero means the peer made no progress this round).
-    fn deliverAll(self: *DatagramQueue, endpoint: *Endpoint) !usize {
+    fn deliverAll(self: *DatagramQueue, endpoint: *Endpoint, outbound: *DatagramQueue) !usize {
         const delivered = self.count;
-        for (self.buffers[0..delivered], self.lengths[0..delivered]) |*buffer, length| {
-            try endpoint.onDatagram(buffer[0..length]);
+        for (
+            self.buffers[0..delivered],
+            self.lengths[0..delivered],
+            self.locals[0..delivered],
+            self.remotes[0..delivered],
+            self.received_at_us[0..delivered],
+        ) |*buffer, length, local, remote, received_at_us| {
+            try endpoint.onReceivedDatagram(.{
+                .bytes = buffer[0..length],
+                .local = local,
+                .remote = remote,
+                .received_at_us = received_at_us,
+            }, outbound);
         }
         self.count = 0;
         return delivered;
@@ -148,16 +231,23 @@ const DatagramQueue = struct {
 // ---------------------------------------------------------------------------
 
 const Endpoint = struct {
+    const connection_handle: u64 = 1;
+
     allocator: std.mem.Allocator,
     role: tls_adapter.Perspective,
     adapter: QuicTlsAdapter = .{},
     backend: tls_backend.Tls13Backend,
     handshake: tls_handshake.Handshake = undefined,
+    cid_routes: quic_cid.CidRoutingTable,
+    paths: quic_path.PathManager,
+    recovery: *quic_recovery.RecoveryController,
     /// Created only once the peer's transport parameters are authenticated.
     streams: ?quic_stream.StreamManager = null,
     local_params: config.TransportParameters,
     local_cid: [cid_len]u8,
     peer_cid: [cid_len]u8,
+    local_addr: quic_udp.Address,
+    peer_addr: quic_udp.Address,
     /// Next packet number to send / largest received, per packet-number space.
     next_pn: [3]u64 = .{ 0, 0, 0 },
     largest_recv_pn: [3]?u64 = .{ null, null, null },
@@ -168,6 +258,16 @@ const Endpoint = struct {
 
     fn deinit(self: *Endpoint) void {
         if (self.streams) |*manager| manager.deinit();
+        self.allocator.destroy(self.recovery);
+        self.cid_routes.deinit();
+    }
+
+    fn registerLocalCid(self: *Endpoint) !void {
+        try self.cid_routes.insert(try quic_cid.ConnectionId.init(&self.local_cid), connection_handle);
+    }
+
+    fn retireLocalCid(self: *Endpoint) void {
+        self.cid_routes.remove(quic_cid.ConnectionId.init(&self.local_cid) catch unreachable);
     }
 
     /// Attach stream/flow-control state from the authenticated peer transport
@@ -191,6 +291,18 @@ const Endpoint = struct {
     /// RFC 9000 §14.1 client Initial minimum); zero pads only to the header
     /// protection sample minimum.
     fn sendPacket(self: *Endpoint, level: EncryptionLevel, frames: []const u8, pad_datagram_to: usize, queue: *DatagramQueue) !void {
+        try self.sendPacketOnPath(level, frames, pad_datagram_to, self.local_addr, self.peer_addr, queue);
+    }
+
+    fn sendPacketOnPath(
+        self: *Endpoint,
+        level: EncryptionLevel,
+        frames: []const u8,
+        pad_datagram_to: usize,
+        local_addr: quic_udp.Address,
+        remote_addr: quic_udp.Address,
+        queue: *DatagramQueue,
+    ) !void {
         const keys = self.adapter.protectionKeys(level, .write) orelse return error.KeysUnavailableForLevel;
         const space = spaceIndex(level);
         const pn = self.next_pn[space];
@@ -265,11 +377,53 @@ const Endpoint = struct {
         @memcpy(&sample, pkt[pn_offset + 4 ..][0..sample_len]);
         keys.applyHeaderProtection(&pkt[0], pkt[pn_offset..][0..pn_len], sample);
 
-        try queue.push(pkt[0 .. pos + sealed.len]);
+        try queue.push(pkt[0 .. pos + sealed.len], remote_addr, local_addr, 0);
     }
 
     /// Parse and deprotect one datagram (one packet), then process its frames.
     fn onDatagram(self: *Endpoint, datagram: []const u8) !void {
+        var queue = DatagramQueue{};
+        try self.onReceivedDatagram(.{
+            .bytes = datagram,
+            .local = self.local_addr,
+            .remote = self.peer_addr,
+            .received_at_us = 0,
+        }, &queue);
+    }
+
+    /// Route by DCID, parse and deprotect one datagram (one packet), then
+    /// process path decisions and frames. Path state changes happen only after
+    /// packet authentication succeeds.
+    fn onReceivedDatagram(self: *Endpoint, received: quic_udp.ReceivedDatagram, outbound: *DatagramQueue) !void {
+        const dcid = try extractDcid(received.bytes);
+        if (self.cid_routes.lookup(dcid) != connection_handle) return error.UnexpectedConnectionId;
+
+        const path_key = quic_path.PathKey{
+            .local = received.local orelse self.local_addr,
+            .remote = received.remote,
+        };
+        try self.openAndProcess(received.bytes, path_key, outbound, received.received_at_us);
+    }
+
+    fn handleAuthenticatedPath(self: *Endpoint, path_key: quic_path.PathKey, outbound: *DatagramQueue, now_us: u64) !void {
+        switch (self.paths.onDatagram(path_key, deterministicTestChallengeForPath(path_key), now_us)) {
+            .on_active_path, .probing => {},
+            .blocked => {},
+            .probe => |challenge| {
+                var frame_buf: [16]u8 = undefined;
+                const encoded = try encodePathFrame(.{ .challenge = challenge }, &frame_buf);
+                try self.sendPacketOnPath(.application, encoded, 0, path_key.local, path_key.remote, outbound);
+            },
+        }
+    }
+
+    fn openAndProcess(
+        self: *Endpoint,
+        datagram: []const u8,
+        path_key: quic_path.PathKey,
+        outbound: *DatagramQueue,
+        now_us: u64,
+    ) !void {
         var pkt: [max_datagram]u8 = undefined;
         if (datagram.len > pkt.len) return error.TruncatedPacket;
         @memcpy(pkt[0..datagram.len], datagram);
@@ -292,7 +446,6 @@ const Endpoint = struct {
             if (pkt[pos] != cid_len) return error.UnexpectedConnectionId;
             pos += 1;
             try requireAvailable(datagram.len, pos, cid_len);
-            if (!std.mem.eql(u8, pkt[pos..][0..cid_len], &self.local_cid)) return error.UnexpectedConnectionId;
             pos += cid_len;
             try requireAvailable(datagram.len, pos, 1);
             if (pkt[pos] != cid_len) return error.UnexpectedConnectionId;
@@ -312,7 +465,6 @@ const Endpoint = struct {
             level = .application;
             pos = 1;
             try requireAvailable(datagram.len, pos, cid_len);
-            if (!std.mem.eql(u8, pkt[pos..][0..cid_len], &self.local_cid)) return error.UnexpectedConnectionId;
             pos += cid_len;
         }
 
@@ -345,10 +497,18 @@ const Endpoint = struct {
         if (self.largest_recv_pn[space] == null or pn > self.largest_recv_pn[space].?) {
             self.largest_recv_pn[space] = pn;
         }
-        try self.processFrames(level, frames);
+        if (level == .application) try self.handleAuthenticatedPath(path_key, outbound, now_us);
+        try self.processFrames(level, frames, path_key, outbound, now_us);
     }
 
-    fn processFrames(self: *Endpoint, level: EncryptionLevel, frames: []const u8) !void {
+    fn processFrames(
+        self: *Endpoint,
+        level: EncryptionLevel,
+        frames: []const u8,
+        path_key: quic_path.PathKey,
+        outbound: *DatagramQueue,
+        now_us: u64,
+    ) !void {
         var pos: usize = 0;
         while (pos < frames.len) {
             const typ = try varint.decode(frames[pos..]);
@@ -390,6 +550,24 @@ const Endpoint = struct {
                     var manager = if (self.streams) |*m| m else return error.StreamsNotReady;
                     _ = try manager.receiveStreamFrame(.{ .id = id.value, .offset = offset, .data = data, .fin = fin });
                 },
+                frame_path_challenge => {
+                    if (level != .application) return error.UnexpectedFrameType;
+                    if (quic_path.path_challenge_len > frames.len - pos) return error.TruncatedFrame;
+                    const response = quic_path.PathManager.onPathChallenge(frames[pos..][0..quic_path.path_challenge_len].*);
+                    pos += quic_path.path_challenge_len;
+                    var frame_buf: [16]u8 = undefined;
+                    const encoded = try encodePathFrame(.{ .response = response }, &frame_buf);
+                    try self.sendPacketOnPath(.application, encoded, 0, path_key.local, path_key.remote, outbound);
+                },
+                frame_path_response => {
+                    if (level != .application) return error.UnexpectedFrameType;
+                    if (quic_path.path_challenge_len > frames.len - pos) return error.TruncatedFrame;
+                    const response = frames[pos..][0..quic_path.path_challenge_len].*;
+                    pos += quic_path.path_challenge_len;
+                    if (self.paths.onPathResponse(path_key, response, now_us)) |outcome| {
+                        if (outcome.reset_congestion) self.recovery.resetForPathMigration();
+                    }
+                },
                 else => return error.UnexpectedFrameType,
             }
         }
@@ -418,6 +596,33 @@ const Endpoint = struct {
         try self.sendPacket(.application, encoded, 0, queue);
     }
 
+    fn sendStreamBytesFrom(
+        self: *Endpoint,
+        id: quic_stream.StreamId,
+        bytes: []const u8,
+        fin: bool,
+        local_addr: quic_udp.Address,
+        remote_addr: quic_udp.Address,
+        queue: *DatagramQueue,
+    ) !void {
+        var manager = if (self.streams) |*m| m else return error.StreamsNotReady;
+        const grant = try manager.reserveSend(id, bytes.len, fin);
+        var frame_buf: [max_datagram]u8 = undefined;
+        const encoded = try encodeStreamFrame(grant, bytes, &frame_buf);
+        try self.sendPacketOnPath(.application, encoded, 0, local_addr, remote_addr, queue);
+    }
+
+    fn sendPingFrom(
+        self: *Endpoint,
+        local_addr: quic_udp.Address,
+        remote_addr: quic_udp.Address,
+        queue: *DatagramQueue,
+    ) !void {
+        var frame_buf: [8]u8 = undefined;
+        const encoded_len = try varint.encode(frame_ping, &frame_buf);
+        try self.sendPacketOnPath(.application, frame_buf[0..encoded_len], 0, local_addr, remote_addr, queue);
+    }
+
     /// Drain everything currently readable from `id` into `out`; returns
     /// whether FIN has been consumed.
     fn readStream(self: *Endpoint, id: quic_stream.StreamId, out: *std.ArrayList(u8)) !bool {
@@ -441,17 +646,33 @@ const Endpoint = struct {
 const Smoke = struct {
     client: Endpoint,
     server: Endpoint,
-    to_server: DatagramQueue,
-    to_client: DatagramQueue,
+    to_server: *DatagramQueue,
+    to_client: *DatagramQueue,
 
     /// The client's initial DCID: both sides derive Initial secrets from it
     /// (RFC 9001 §5.2) and the server adopts it as its connection ID.
     const server_cid = [cid_len]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
     const client_cid = [cid_len]u8{ 0xc1, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7, 0xc8 };
 
-    fn init(allocator: std.mem.Allocator) !Smoke {
-        const params = try (config.Config{}).transportParameters();
-        var smoke = Smoke{
+    fn init(allocator: std.mem.Allocator) !*Smoke {
+        const client_addr = quic_udp.Address.ip4(.{ 127, 0, 0, 1 }, 50_000);
+        const server_addr = quic_udp.Address.ip4(.{ 127, 0, 0, 1 }, 4433);
+        const params = try (config.Config{ .migration_policy = .full }).transportParameters();
+        const client_recovery = try allocator.create(quic_recovery.RecoveryController);
+        errdefer allocator.destroy(client_recovery);
+        client_recovery.* = .{};
+        const server_recovery = try allocator.create(quic_recovery.RecoveryController);
+        errdefer allocator.destroy(server_recovery);
+        server_recovery.* = .{};
+        const to_server = try allocator.create(DatagramQueue);
+        errdefer allocator.destroy(to_server);
+        to_server.* = .{};
+        const to_client = try allocator.create(DatagramQueue);
+        errdefer allocator.destroy(to_client);
+        to_client.* = .{};
+        const smoke = try allocator.create(Smoke);
+        errdefer allocator.destroy(smoke);
+        smoke.* = .{
             .client = .{
                 .allocator = allocator,
                 .role = .client,
@@ -459,9 +680,14 @@ const Smoke = struct {
                     .{ .hello_random = [_]u8{0xc1} ** 32, .key_share_seed = [_]u8{0x11} ** 32 },
                     .{ .pinned_certificate = tls_backend.testdata.certificate_der },
                 ),
+                .cid_routes = quic_cid.CidRoutingTable.init(allocator),
+                .paths = quic_path.PathManager.init(.full, .{ .local = client_addr, .remote = server_addr }),
+                .recovery = client_recovery,
                 .local_params = params,
                 .local_cid = client_cid,
                 .peer_cid = server_cid,
+                .local_addr = client_addr,
+                .peer_addr = server_addr,
             },
             .server = .{
                 .allocator = allocator,
@@ -473,13 +699,20 @@ const Smoke = struct {
                         tls_backend.testdata.private_key_pkcs8_der,
                     ),
                 ),
+                .cid_routes = quic_cid.CidRoutingTable.init(allocator),
+                .paths = quic_path.PathManager.init(.full, .{ .local = server_addr, .remote = client_addr }),
+                .recovery = server_recovery,
                 .local_params = params,
                 .local_cid = server_cid,
                 .peer_cid = client_cid,
+                .local_addr = server_addr,
+                .peer_addr = client_addr,
             },
-            .to_server = .{},
-            .to_client = .{},
+            .to_server = to_server,
+            .to_client = to_client,
         };
+        try smoke.client.registerLocalCid();
+        try smoke.server.registerLocalCid();
         _ = try smoke.client.adapter.installInitialSecrets(.client, &server_cid);
         _ = try smoke.server.adapter.installInitialSecrets(.server, &server_cid);
         return smoke;
@@ -493,8 +726,12 @@ const Smoke = struct {
     }
 
     fn deinit(self: *Smoke) void {
+        const allocator = self.client.allocator;
         self.client.deinit();
         self.server.deinit();
+        allocator.destroy(self.to_server);
+        allocator.destroy(self.to_client);
+        allocator.destroy(self);
     }
 
     /// Pump protected handshake packets between the endpoints until both
@@ -502,10 +739,10 @@ const Smoke = struct {
     fn completeHandshake(self: *Smoke) !void {
         var rounds: usize = 0;
         while (rounds < 16) : (rounds += 1) {
-            try self.client.flushHandshake(&self.to_server);
-            var progressed = try self.to_server.deliverAll(&self.server) > 0;
-            try self.server.flushHandshake(&self.to_client);
-            progressed = (try self.to_client.deliverAll(&self.client) > 0) or progressed;
+            try self.client.flushHandshake(self.to_server);
+            var progressed = try self.to_server.deliverAll(&self.server, self.to_client) > 0;
+            try self.server.flushHandshake(self.to_client);
+            progressed = (try self.to_client.deliverAll(&self.client, self.to_server) > 0) or progressed;
             if (self.client.handshake.isComplete() and self.server.handshake.isComplete() and !progressed) return;
         }
         if (!self.client.handshake.isComplete() or !self.server.handshake.isComplete()) return error.HandshakeStalled;
@@ -513,8 +750,13 @@ const Smoke = struct {
 
     /// Move all pending 1-RTT datagrams in both directions.
     fn pumpApplication(self: *Smoke) !void {
-        _ = try self.to_server.deliverAll(&self.server);
-        _ = try self.to_client.deliverAll(&self.client);
+        var rounds: usize = 0;
+        while (rounds < 8) : (rounds += 1) {
+            const server_progress = try self.to_server.deliverAll(&self.server, self.to_client);
+            const client_progress = try self.to_client.deliverAll(&self.client, self.to_server);
+            if (server_progress == 0 and client_progress == 0) return;
+        }
+        return error.HandshakeStalled;
     }
 };
 
@@ -569,9 +811,9 @@ test "pure-Zig QUIC/TLS/H3 local smoke: handshake, request, response, close" {
     settings_len += (try http3.frame.encodeKnownFrame(.settings, empty_settings, settings_bytes[settings_len..])).len;
 
     const client_control = try smoke.client.streams.?.openLocal(.uni);
-    try smoke.client.sendStreamBytes(client_control, settings_bytes[0..settings_len], false, &smoke.to_server);
+    try smoke.client.sendStreamBytes(client_control, settings_bytes[0..settings_len], false, smoke.to_server);
     const server_control = try smoke.server.streams.?.openLocal(.uni);
-    try smoke.server.sendStreamBytes(server_control, settings_bytes[0..settings_len], false, &smoke.to_client);
+    try smoke.server.sendStreamBytes(server_control, settings_bytes[0..settings_len], false, smoke.to_client);
     try smoke.pumpApplication();
 
     var server_control_registry = http3.frame.ControlStreamRegistry{};
@@ -608,7 +850,7 @@ test "pure-Zig QUIC/TLS/H3 local smoke: handshake, request, response, close" {
     var request_len: usize = 0;
     request_len += (try http3.frame.encodeKnownFrame(.headers, header_block, request_bytes[request_len..])).len;
     request_len += (try http3.frame.encodeKnownFrame(.data, request_body, request_bytes[request_len..])).len;
-    try smoke.client.sendStreamBytes(request_stream, request_bytes[0..request_len], true, &smoke.to_server);
+    try smoke.client.sendStreamBytes(request_stream, request_bytes[0..request_len], true, smoke.to_server);
     try smoke.pumpApplication();
 
     // --- Stage 5: server decodes the request through the H3/QPACK session. ---
@@ -639,7 +881,7 @@ test "pure-Zig QUIC/TLS/H3 local smoke: handshake, request, response, close" {
     var response_len: usize = 0;
     response_len += (try http3.session.ResponseEncoder.encodeHeaders(200, &response_headers, response_bytes[response_len..])).len;
     response_len += (try http3.session.ResponseEncoder.encodeData(response_body, response_bytes[response_len..])).len;
-    try smoke.server.sendStreamBytes(request_stream, response_bytes[0..response_len], true, &smoke.to_client);
+    try smoke.server.sendStreamBytes(request_stream, response_bytes[0..response_len], true, smoke.to_client);
     try smoke.pumpApplication();
 
     // --- Stage 7: client decodes the response HEADERS/DATA. ---
@@ -706,6 +948,128 @@ test "smoke harness rejects a datagram for an unknown connection id" {
     try testing.expectError(error.UnexpectedConnectionId, smoke.server.onDatagram(&bogus));
 }
 
+test "smoke harness authenticates packets before starting path validation" {
+    const allocator = testing.allocator;
+    var smoke = try Smoke.init(allocator);
+    defer smoke.deinit();
+    try smoke.wire();
+    try smoke.completeHandshake();
+
+    const active_before = smoke.server.paths.activePath().key;
+    const rebound_client = quic_udp.Address.ip4(.{ 127, 0, 0, 1 }, 50_001);
+    try smoke.client.sendPingFrom(rebound_client, smoke.server.local_addr, smoke.to_server);
+    try testing.expectEqual(@as(usize, 1), smoke.to_server.count);
+    try testing.expectEqual(@as(usize, 0), smoke.to_client.count);
+
+    const datagram = smoke.to_server.buffers[0][0..smoke.to_server.lengths[0]];
+    datagram[datagram.len - 1] ^= 0x01;
+
+    try testing.expectError(error.AuthenticationFailed, smoke.server.onReceivedDatagram(.{
+        .bytes = datagram,
+        .local = smoke.to_server.locals[0],
+        .remote = smoke.to_server.remotes[0],
+        .received_at_us = smoke.to_server.received_at_us[0],
+    }, smoke.to_client));
+
+    try testing.expect(smoke.server.paths.activePath().key.eql(active_before));
+    try testing.expectEqual(@as(u64, 0), smoke.server.paths.metrics.path_challenges_sent);
+    try testing.expectEqual(@as(u64, 0), smoke.server.paths.metrics.nat_rebindings);
+    try testing.expectEqual(@as(u64, 0), smoke.server.paths.metrics.migrations);
+    try testing.expectEqual(@as(u64, 0), smoke.server.paths.metrics.path_validations_succeeded);
+    try testing.expectEqual(@as(usize, 0), smoke.to_client.count);
+    try testing.expectEqual(@as(u64, 1), smoke.server.adapter.metrics.deprotection_failures);
+}
+
+test "smoke harness validates NAT rebinding through protected path frames" {
+    const allocator = testing.allocator;
+    var smoke = try Smoke.init(allocator);
+    defer smoke.deinit();
+    try smoke.wire();
+    try smoke.completeHandshake();
+
+    const rebound_client = quic_udp.Address.ip4(.{ 127, 0, 0, 1 }, 50_001);
+    try smoke.client.sendPingFrom(rebound_client, smoke.server.local_addr, smoke.to_server);
+    try smoke.pumpApplication();
+
+    try testing.expect(smoke.server.paths.activePath().key.eql(.{
+        .local = smoke.server.local_addr,
+        .remote = rebound_client,
+    }));
+    try testing.expectEqual(@as(u64, 1), smoke.server.paths.metrics.nat_rebindings);
+    try testing.expectEqual(@as(u64, 0), smoke.server.paths.metrics.migrations);
+    try testing.expectEqual(@as(u64, 1), smoke.server.paths.metrics.path_validations_succeeded);
+    try testing.expect(smoke.server.cid_routes.metrics.routing_hits > 0);
+}
+
+test "smoke harness blocks host migration when policy allows only NAT rebinding" {
+    const allocator = testing.allocator;
+    var smoke = try Smoke.init(allocator);
+    defer smoke.deinit();
+    try smoke.wire();
+    try smoke.completeHandshake();
+
+    smoke.server.paths.policy = .nat_rebinding_only;
+    const migrated_client = quic_udp.Address.ip4(.{ 198, 51, 100, 7 }, 50_000);
+    try smoke.client.sendPingFrom(migrated_client, smoke.server.local_addr, smoke.to_server);
+    try smoke.pumpApplication();
+
+    try testing.expect(smoke.server.paths.activePath().key.eql(.{
+        .local = smoke.server.local_addr,
+        .remote = smoke.server.peer_addr,
+    }));
+    try testing.expectEqual(@as(u64, 1), smoke.server.paths.metrics.migrations_blocked);
+    try testing.expectEqual(@as(u64, 0), smoke.server.paths.metrics.path_challenges_sent);
+    try testing.expectEqual(@as(u64, 0), smoke.server.paths.metrics.path_validations_succeeded);
+}
+
+test "smoke harness drops protected packets addressed to a retired CID route" {
+    const allocator = testing.allocator;
+    var smoke = try Smoke.init(allocator);
+    defer smoke.deinit();
+    try smoke.wire();
+    try smoke.completeHandshake();
+
+    try smoke.client.sendPingFrom(smoke.client.local_addr, smoke.server.local_addr, smoke.to_server);
+    try testing.expectEqual(@as(usize, 1), smoke.to_server.count);
+    smoke.server.retireLocalCid();
+
+    const datagram = smoke.to_server.buffers[0][0..smoke.to_server.lengths[0]];
+    try testing.expectError(error.UnexpectedConnectionId, smoke.server.onReceivedDatagram(.{
+        .bytes = datagram,
+        .local = smoke.to_server.locals[0],
+        .remote = smoke.to_server.remotes[0],
+        .received_at_us = smoke.to_server.received_at_us[0],
+    }, smoke.to_client));
+    try testing.expectEqual(@as(u64, 1), smoke.server.cid_routes.metrics.routing_misses);
+}
+
+test "smoke harness resets recovery when validated migration changes host" {
+    const allocator = testing.allocator;
+    var smoke = try Smoke.init(allocator);
+    defer smoke.deinit();
+    try smoke.wire();
+    try smoke.completeHandshake();
+
+    smoke.server.recovery.rtt.update(80_000, 0);
+    smoke.server.recovery.congestion.congestion_window = 3 * quic_recovery.max_datagram_size;
+    try testing.expect(smoke.server.recovery.rtt.hasSample());
+
+    const migrated_client = quic_udp.Address.ip4(.{ 198, 51, 100, 7 }, 50_000);
+    try smoke.client.sendPingFrom(migrated_client, smoke.server.local_addr, smoke.to_server);
+    try smoke.pumpApplication();
+
+    try testing.expect(smoke.server.paths.activePath().key.eql(.{
+        .local = smoke.server.local_addr,
+        .remote = migrated_client,
+    }));
+    try testing.expectEqual(@as(u64, 1), smoke.server.paths.metrics.migrations);
+    try testing.expect(!smoke.server.recovery.rtt.hasSample());
+    try testing.expectEqual(
+        quic_recovery.CongestionController.initialWindow(quic_recovery.max_datagram_size),
+        smoke.server.recovery.congestion.congestion_window,
+    );
+}
+
 test "smoke harness surfaces payload forgery as an authentication failure" {
     const allocator = testing.allocator;
     var smoke = try Smoke.init(allocator);
@@ -716,7 +1080,7 @@ test "smoke harness surfaces payload forgery as an authentication failure" {
     try smoke.server.attachStreams();
 
     const id = try smoke.client.streams.?.openLocal(.bidi);
-    try smoke.client.sendStreamBytes(id, "tamper-me", true, &smoke.to_server);
+    try smoke.client.sendStreamBytes(id, "tamper-me", true, smoke.to_server);
     // Flip one ciphertext byte in flight: deprotection must fail and count.
     const datagram = smoke.to_server.buffers[0][0..smoke.to_server.lengths[0]];
     datagram[datagram.len - 1] ^= 0x01;
@@ -734,7 +1098,7 @@ test "smoke harness fails truncated long-header packets deterministically" {
     // that cuts into the fixed header fields (version, DCID, SCID, token,
     // length) or the protected payload. Each must fail with a typed error —
     // never an out-of-bounds panic.
-    try smoke.client.flushHandshake(&smoke.to_server);
+    try smoke.client.flushHandshake(smoke.to_server);
     try testing.expectEqual(@as(usize, 1), smoke.to_server.count);
     const initial = smoke.to_server.buffers[0][0..smoke.to_server.lengths[0]];
 

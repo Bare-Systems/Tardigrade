@@ -367,6 +367,13 @@ test "AccessLog format parse" {
 }
 
 test "AccessLogEntry log does not panic" {
+    // Swallow the emitted line: anything a test writes to the real stderr makes
+    // the zig build runner print the step with a red "failed command:" banner
+    // even though the step succeeds.
+    resetSinkForTest();
+    sink_override = swallowingSink;
+    defer resetSinkForTest();
+
     const entry = AccessLogEntry{
         .method = "GET",
         .path = "/status/metrics",
@@ -383,6 +390,7 @@ test "AccessLogEntry log does not panic" {
         .error_category = "-",
     };
     entry.log();
+    try std.testing.expectEqual(@as(u64, 0), droppedLines());
 }
 
 test "formatEntry json contains required fields" {
@@ -463,6 +471,10 @@ test "formatEntryInto reuses a scratch buffer and matches formatEntry" {
 
 fn rejectingSink(_: []const u8) usize {
     return 0; // simulate a sink that accepts nothing (slow/unavailable)
+}
+
+fn swallowingSink(bytes: []const u8) usize {
+    return bytes.len; // accept everything, write nowhere
 }
 
 test "buffered access log stays bounded and counts drops when the sink stalls" {

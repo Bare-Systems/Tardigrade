@@ -95,6 +95,10 @@ pub const Record = struct {
 /// Injected emission seam — same shape as `quic.qlog.Sink`, so a composition
 /// root can hold one of each and route both into the same trace file. A default
 /// `.{}` is a no-op.
+///
+/// `emit_fn` returns `void`, so a concrete file sink cannot propagate write
+/// errors here. Same contract as the transport sink: retain the first error
+/// and/or count dropped records out-of-band so a truncated trace is detectable.
 pub const Sink = struct {
     context: ?*anyopaque = null,
     emit_fn: ?*const fn (?*anyopaque, Record) void = null,

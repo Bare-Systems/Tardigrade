@@ -101,9 +101,18 @@ pub const Sink = struct {
 };
 
 /// Format one NSS `SSLKEYLOGFILE` line (including the trailing newline) into
-/// `out`. Returns the written slice, or `error.NoSpaceLeft` if `out` is too
-/// small — a 256-byte buffer covers a 32-byte random and a 48-byte secret.
-pub fn writeLine(entry: Entry, out: []u8) error{NoSpaceLeft}![]const u8 {
+/// `out`. Returns the written slice, or:
+///   * `error.InvalidClientRandom` unless `client_random` is exactly
+///     `client_random_len` bytes — Wireshark keys every line on the 32-byte
+///     ClientHello random, so a wrong-length value produces a line no tool can
+///     match. Rejecting it loudly beats emitting silent garbage.
+///   * `error.EmptySecret` if `secret` is empty (a keyless line is useless).
+///     Secret length is otherwise unconstrained, to admit future cipher suites.
+///   * `error.NoSpaceLeft` if `out` is too small — a 256-byte buffer covers a
+///     32-byte random and a 48-byte secret.
+pub fn writeLine(entry: Entry, out: []u8) error{ InvalidClientRandom, EmptySecret, NoSpaceLeft }![]const u8 {
+    if (entry.client_random.len != client_random_len) return error.InvalidClientRandom;
+    if (entry.secret.len == 0) return error.EmptySecret;
     const label = entry.label.text();
     const needed = label.len + 1 + entry.client_random.len * 2 + 1 + entry.secret.len * 2 + 1;
     if (out.len < needed) return error.NoSpaceLeft;
@@ -171,6 +180,25 @@ test "writeLine reports NoSpaceLeft instead of overflowing" {
         .label = .client_traffic_secret_0,
         .client_random = &[_]u8{0} ** client_random_len,
         .secret = &[_]u8{0} ** 48,
+    }, &buf));
+}
+
+test "writeLine rejects a wrong-length client random" {
+    var buf: [256]u8 = undefined;
+    // One byte short of the required 32.
+    try testing.expectError(error.InvalidClientRandom, writeLine(.{
+        .label = .client_traffic_secret_0,
+        .client_random = &[_]u8{0} ** (client_random_len - 1),
+        .secret = &[_]u8{0x11},
+    }, &buf));
+}
+
+test "writeLine rejects an empty secret" {
+    var buf: [256]u8 = undefined;
+    try testing.expectError(error.EmptySecret, writeLine(.{
+        .label = .client_traffic_secret_0,
+        .client_random = &[_]u8{0} ** client_random_len,
+        .secret = &[_]u8{},
     }, &buf));
 }
 

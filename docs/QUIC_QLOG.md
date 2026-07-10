@@ -20,8 +20,11 @@ layering, and the safety rules up front so those call-sites are mechanical.
 - Make handshake, loss/PTO, path validation/migration, stream reset,
   flow-control blocking, and QPACK head-of-line blocking **distinguishable**
   from a captured trace, not just from ad-hoc `std.log` lines.
-- Produce artifacts (`*.qlog`, `*.keys`) that the interop/failure harnesses
-  (#247) can save and that qvis / Wireshark can consume directly.
+- Provide the primitives (trace-header + event-line + keylog-line writers) so
+  that, once the composition root assembles them, the interop/failure harnesses
+  (#247) save `*.qlog` / `*.keys` artifacts that qvis / Wireshark consume
+  directly. This PR ships those writers and the merged-shape test; the root
+  wiring that emits real flows is follow-up.
 - Keep everything **off by default** and cheap when off.
 - Keep HTTP/3 out of `src/quic` (the #255 layering constraint).
 
@@ -129,9 +132,26 @@ Each record is one JSON-SEQ line:
 - Writers are **allocation-free**: they format into a caller-owned buffer
   (`writeJson(record, buf)`), matching the bounded-buffer style already used by
   the TLS handshake wire writer. A 512-byte buffer covers every event.
-- A qlog file is a trace header (emitted once by the root) followed by these
-  lines. The header (vantage point, `reference_time`, ODCID group id) is the
-  root's responsibility since only it spans both packages.
+- A qlog file is a trace header followed by these event lines.
+  `qlog.writeTraceHeader(header, buf)` serializes that header (qlog version,
+  vantage point, `reference_time`, and ODCID `group_id`) as the first JSON-SEQ
+  record. The header spans both packages — the `group_id` ties transport and
+  H3 events to one connection — so the **composition root** fills it in and
+  writes it once, then appends event records from both `quic` and `http3`. The
+  `tests/quic_h3_smoke.zig` harness exercises exactly this shape (header +
+  transport record + H3 record) so the merged-file contract is locked.
+
+### Sink error handling
+
+`Sink.emit` returns `void` so transport/H3 emission stays infallible on the hot
+path — a dropped debug record must never fail a connection, mirroring
+`recovery.EventSink`. The tradeoff: a concrete file sink cannot propagate
+serialization / disk-full / permission errors back through `emit`. The
+**contract for concrete sinks** is therefore to *retain the first write error
+and/or count dropped records* and expose that out-of-band, so a truncated trace
+is detectable rather than silently lost during interop. This is a requirement on
+the composition-root sink implementation, documented here before that wiring
+lands.
 
 ## Keylog
 

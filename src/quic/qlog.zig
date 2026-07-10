@@ -247,6 +247,14 @@ pub const Record = struct {
 
 /// The injected emission seam. Mirrors `recovery.EventSink`: a default value
 /// (`.{}`) is a no-op, so wiring qlog is opt-in and free when absent.
+///
+/// `emit_fn` returns `void` so transport emission stays infallible on the hot
+/// path (a lost debug record must never fail a connection). The cost is that a
+/// concrete file sink cannot propagate serialization / disk-full / permission
+/// errors through this call. The **contract for concrete sinks** is therefore:
+/// retain the first write error (and/or count dropped records) and expose it
+/// out-of-band, so a truncated trace is detectable rather than silent. See
+/// `docs/QUIC_QLOG.md`.
 pub const Sink = struct {
     context: ?*anyopaque = null,
     emit_fn: ?*const fn (?*anyopaque, Record) void = null,
@@ -341,6 +349,36 @@ fn writeData(b: *Buf, event: Event) error{NoSpaceLeft}!void {
     }
 }
 
+/// qlog vantage point: which endpoint recorded the trace (RFC 9000 roles).
+pub const VantagePoint = enum { client, server };
+
+/// The once-per-file qlog trace header. Only the composition root can fill this
+/// in: `group_id` (the original DCID, as lowercase hex, tying every event to
+/// one connection) and the `reference_time` baseline span both packages, so the
+/// root — not the transport — owns it. `title` and `group_id` must be JSON-safe
+/// (ASCII / hex); they are emitted verbatim without escaping.
+pub const TraceHeader = struct {
+    vantage_point: VantagePoint,
+    reference_time_us: u64 = 0,
+    group_id: []const u8 = "",
+    title: []const u8 = "tardigrade-quic",
+    qlog_version: []const u8 = "0.3",
+};
+
+/// Serialize the qlog file header as the first JSON-SEQ record. A composition
+/// root writes this once, then appends `writeJson` event records (from both
+/// `quic` and `http3`) to form a complete `.qlog` file qvis can consume.
+/// Returns the written slice; a 512-byte buffer is enough.
+pub fn writeTraceHeader(header: TraceHeader, out: []u8) error{NoSpaceLeft}![]const u8 {
+    var b = Buf{ .buf = out };
+    try b.add("{c}", .{record_separator});
+    try b.add(
+        "{{\"qlog_version\":\"{s}\",\"qlog_format\":\"JSON-SEQ\",\"title\":\"{s}\",\"trace\":{{\"vantage_point\":{{\"type\":\"{s}\"}},\"common_fields\":{{\"reference_time\":{d}.{d:0>3},\"group_id\":\"{s}\"}}}}}}\n",
+        .{ header.qlog_version, header.title, @tagName(header.vantage_point), header.reference_time_us / 1000, header.reference_time_us % 1000, header.group_id },
+    );
+    return b.slice();
+}
+
 /// Serialize one `Record` into `out` as a single qlog JSON-SEQ line:
 ///
 ///     0x1E {"time":<ms>,"name":"<category>:<event>","data":{...}} \n
@@ -411,6 +449,18 @@ test "path, migration, stream reset and flow-control events serialize" {
     try expectJson(.{ .time_us = 5, .event = .{ .connection_migrated = .{ .kind = .nat_rebinding, .outcome = .accepted } } }, "connection_migrated");
     try expectJson(.{ .time_us = 5, .event = .{ .stream_reset = .{ .kind = .reset_received, .stream_id = 4, .error_code = 9 } } }, "\"stream_id\":4");
     try expectJson(.{ .time_us = 5, .event = .{ .data_blocked = .{ .scope = .stream, .stream_id = 8, .limit = 4096 } } }, "\"scope\":\"stream\"");
+}
+
+test "trace header then event forms a two-record JSON-SEQ stream" {
+    var buf: [1024]u8 = undefined;
+    const header = try writeTraceHeader(.{ .vantage_point = .server, .reference_time_us = 1_000, .group_id = "0011deadbeef" }, &buf);
+    const event = try writeJson(.{ .time_us = 2_500, .event = .{ .packet_sent = .{ .packet_type = .initial, .packet_number = 0, .length = 1200 } } }, buf[header.len..]);
+    // Exactly two record separators, one per record.
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, buf[0 .. header.len + event.len], &[_]u8{record_separator}));
+    try testing.expect(std.mem.indexOf(u8, header, "\"qlog_format\":\"JSON-SEQ\"") != null);
+    try testing.expect(std.mem.indexOf(u8, header, "\"vantage_point\":{\"type\":\"server\"}") != null);
+    try testing.expect(std.mem.indexOf(u8, header, "\"group_id\":\"0011deadbeef\"") != null);
+    try testing.expect(std.mem.indexOf(u8, event, "transport:packet_sent") != null);
 }
 
 test "default sink is a no-op and log() stamps time" {

@@ -199,6 +199,20 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_quic_tests.step);
     test_step.dependOn(&run_quic_varint_tests.step);
 
+    // Pure-Zig cryptographic-provider package (#370, epic #327): the stable
+    // provider boundary plus its first backend. Standalone test target and part
+    // of the default `zig build test`. No system libraries.
+    const crypto_mod = b.createModule(.{
+        .root_source_file = b.path("src/crypto/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const crypto_tests = b.addTest(.{ .root_module = crypto_mod });
+    const run_crypto_tests = b.addRunArtifact(crypto_tests);
+    const crypto_step = b.step("test-crypto", "Run pure-Zig cryptographic-provider unit tests");
+    crypto_step.dependOn(&run_crypto_tests.step);
+    test_step.dependOn(&run_crypto_tests.step);
+
     const http3_mod = b.createModule(.{
         .root_source_file = b.path("src/http3/root.zig"),
         .target = target,

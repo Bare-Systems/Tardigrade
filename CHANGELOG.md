@@ -5,6 +5,29 @@ All notable user-facing changes to Tardigrade are documented here.
 ## [Unreleased]
 
 ### Features
+- **Stable cryptographic-provider boundary (#370, epic #327)** — a new
+  `src/crypto/` package defines the single narrow interface every TLS, QUIC,
+  and PKI module will consume cryptography through, so protocol code never
+  names a concrete primitive or a foreign TLS type. `provider.zig` is the
+  boundary: a runtime-dispatched `CryptoProvider` (`context` + `*const VTable`,
+  the same seam shape as the QUIC `TlsBackend`) covering HKDF extract/
+  expand-label, AEAD seal/open, ECDH key-share generation and shared-secret
+  derivation, signature verification, and injected-entropy random bytes, plus
+  an opaque `SigningKey` handle (so a software key today and an HSM/remote
+  signer later present the same interface), explicit `Capabilities` discovery
+  with `select*` negotiation helpers, and a classified error taxonomy that
+  distinguishes malformed input, unsupported capability, provider failure, and
+  authentication failure. `pure_zig.zig` is the first backend, built entirely
+  on `std.crypto`: HKDF over SHA-256/384, AES-128/256-GCM and
+  ChaCha20-Poly1305, X25519, and Ed25519 (signing via `SoftwareSigningKey`),
+  with secrets borrowed for the call only and scrubbed on the way out, entropy
+  drawn from an injected source (never ambient), and declared-but-absent
+  algorithms (secp256r1, ECDSA-P256, RSA-PSS) reported through capability
+  discovery rather than silently missing. Cross-checked against
+  `std.crypto`'s own HKDF/TLS helpers and exercised by seal/open, ECDH-agreement,
+  and sign/verify round-trips under `zig build test-crypto`. The OpenSSL
+  production adapter and migrating the existing QUIC/TLS modules onto the
+  boundary are follow-ups (#323–#326); see `docs/CRYPTO_PROVIDER.md`.
 - **QUIC CID routing, path validation, and migration policy (#251)** — the
   pure-Zig transport gains connection-ID lifecycle and path handling:
   `cid.zig` adds caller-entropy CID generation, a DCID→connection

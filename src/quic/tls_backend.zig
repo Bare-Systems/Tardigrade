@@ -22,7 +22,7 @@ const config = @import("config.zig");
 const varint = @import("quic_varint");
 const tls_adapter = @import("tls_adapter.zig");
 const tls_handshake = @import("tls_handshake.zig");
-const tls_key_schedule = @import("../tls/key_schedule.zig");
+const tls_key_schedule = @import("tls_core").key_schedule;
 
 const crypto = std.crypto;
 const X25519 = crypto.dh.X25519;
@@ -37,6 +37,7 @@ const TlsBackend = tls_handshake.TlsBackend;
 const Role = tls_handshake.Role;
 
 pub const hash_len = tls_key_schedule.hash_len;
+const TranscriptHash = tls_key_schedule.TranscriptHash;
 /// Largest handshake message body we accept (u24 wire limit is 16 MiB; a
 /// single-certificate Ed25519 flight is far below this).
 pub const max_message_len = 8 * 1024;
@@ -415,7 +416,7 @@ pub const Tls13Backend = struct {
 
     local_params: config.TransportParameters = undefined,
     key_pair: ?X25519.KeyPair = null,
-    transcript: Sha256 = Sha256.init(.{}),
+    transcript: TranscriptHash = TranscriptHash.init(.{}),
     schedule: ?KeySchedule = null,
     /// The client Finished verify_data the server expects (computed when its
     /// own flight is sent).

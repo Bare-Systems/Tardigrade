@@ -13,6 +13,7 @@ const HmacSha256 = crypto.auth.hmac.sha2.HmacSha256;
 const HkdfSha256 = crypto.kdf.hkdf.HkdfSha256;
 const X25519 = crypto.dh.X25519;
 
+pub const TranscriptHash = Sha256;
 pub const hash_len = Sha256.digest_length;
 pub const shared_secret_len = X25519.shared_length;
 

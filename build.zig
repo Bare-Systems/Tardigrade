@@ -40,6 +40,11 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const tls_core_mod = b.createModule(.{
+        .root_source_file = b.path("src/tls/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
 
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -49,6 +54,7 @@ pub fn build(b: *std.Build) void {
     });
     exe_mod.addImport("build_options", build_options.createModule());
     exe_mod.addImport("quic_varint", quic_varint_mod);
+    exe_mod.addImport("tls_core", tls_core_mod);
 
     const exe = b.addExecutable(.{
         .name = "tardigrade",
@@ -81,6 +87,7 @@ pub fn build(b: *std.Build) void {
     });
     allocation_regression_mod.addImport("build_options", build_options.createModule());
     allocation_regression_mod.addImport("quic_varint", quic_varint_mod);
+    allocation_regression_mod.addImport("tls_core", tls_core_mod);
 
     const allocation_regression_tests = b.addTest(.{
         .root_module = allocation_regression_mod,
@@ -187,6 +194,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     quic_mod.addImport("quic_varint", quic_varint_mod);
+    quic_mod.addImport("tls_core", tls_core_mod);
     // varint.zig now lives in its own module, so its tests need their own run.
     const quic_varint_tests = b.addTest(.{ .root_module = quic_varint_mod });
     const run_quic_varint_tests = b.addRunArtifact(quic_varint_tests);

@@ -81,7 +81,16 @@ pub const CidRoutingTable = struct {
         self.routes.deinit();
     }
 
-    pub fn insert(self: *CidRoutingTable, cid: ConnectionId, connection: u64) !void {
+    /// Register a CID for a connection. Re-registering the same CID for the
+    /// same connection is idempotent; the same CID appearing for a *different*
+    /// connection is a deterministic error — silently stealing a route would
+    /// misdeliver protected packets and be brutal to debug (bad entropy,
+    /// duplicate issuance, or an integration bug).
+    pub fn insert(self: *CidRoutingTable, cid: ConnectionId, connection: u64) error{ CidCollision, OutOfMemory }!void {
+        if (self.routes.get(cid)) |existing| {
+            if (existing == connection) return;
+            return error.CidCollision;
+        }
         try self.routes.put(cid, connection);
     }
 
@@ -142,7 +151,7 @@ pub const LocalCidRegistry = struct {
 
     /// Register the CID chosen during the handshake as sequence 0
     /// (RFC 9000 §5.1.1). Call once, before any `issue`.
-    pub fn registerInitial(self: *LocalCidRegistry, cid: ConnectionId) error{CidLimitExceeded}!Entry {
+    pub fn registerInitial(self: *LocalCidRegistry, cid: ConnectionId) error{ CidLimitExceeded, DuplicateCid }!Entry {
         std.debug.assert(self.next_sequence == 0);
         return self.store(cid);
     }
@@ -163,8 +172,15 @@ pub const LocalCidRegistry = struct {
         };
     }
 
-    fn store(self: *LocalCidRegistry, cid: ConnectionId) error{CidLimitExceeded}!Entry {
+    fn store(self: *LocalCidRegistry, cid: ConnectionId) error{ CidLimitExceeded, DuplicateCid }!Entry {
         if (self.activeCount() >= self.active_limit) return error.CidLimitExceeded;
+        // Repeated caller entropy must not mint the same CID twice under
+        // different sequence numbers.
+        for (self.entries) |existing| {
+            if (existing) |entry| {
+                if (std.mem.eql(u8, entry.cid.slice(), cid.slice())) return error.DuplicateCid;
+            }
+        }
         const slot = for (&self.entries) |*entry| {
             if (entry.* == null) break entry;
         } else return error.CidLimitExceeded;
@@ -226,6 +242,9 @@ pub const PeerCidPool = struct {
         sequence: u64,
         cid: ConnectionId,
         stateless_reset_token: ?[stateless_reset_token_len]u8,
+        /// The retire_prior_to the frame that introduced this sequence
+        /// carried, kept to verify that a "retransmit" really is one.
+        announced_retire_prior_to: u64 = 0,
         /// A CID already used on some path; migration wants a fresh one
         /// (RFC 9000 §9.5, linkability).
         used: bool = false,
@@ -265,14 +284,23 @@ pub const PeerCidPool = struct {
     pub fn onNewConnectionId(self: *PeerCidPool, frame: NewConnectionIdFrame) error{ ProtocolViolation, CidLimitExceeded, RetireQueueFull }!void {
         if (frame.retire_prior_to > frame.sequence) return error.ProtocolViolation;
 
-        // Same sequence must always carry the same CID and token.
+        // A repeated sequence number must be an exact retransmit: same CID,
+        // same stateless reset token, and same retire_prior_to (RFC 9000
+        // §19.15 — reuse with different contents is a protocol violation).
         for (self.entries) |existing| {
             const entry = existing orelse continue;
             const same_sequence = entry.sequence == frame.sequence;
             const same_cid = std.mem.eql(u8, entry.cid.slice(), frame.cid.slice());
-            if (same_sequence and !same_cid) return error.ProtocolViolation;
             if (!same_sequence and same_cid) return error.ProtocolViolation;
-            if (same_sequence) return; // exact retransmit
+            if (!same_sequence) continue;
+            if (!same_cid) return error.ProtocolViolation;
+            const same_token = if (entry.stateless_reset_token) |token|
+                std.mem.eql(u8, &token, &frame.stateless_reset_token)
+            else
+                false;
+            if (!same_token) return error.ProtocolViolation;
+            if (entry.announced_retire_prior_to != frame.retire_prior_to) return error.ProtocolViolation;
+            return; // exact retransmit
         }
 
         if (frame.retire_prior_to > self.retire_prior_to) {
@@ -291,6 +319,7 @@ pub const PeerCidPool = struct {
             .sequence = frame.sequence,
             .cid = frame.cid,
             .stateless_reset_token = frame.stateless_reset_token,
+            .announced_retire_prior_to = frame.retire_prior_to,
         });
     }
 
@@ -580,6 +609,61 @@ test "peer pool enforces the advertised active CID limit" {
     try testing.expectError(error.CidLimitExceeded, pool.onNewConnectionId(.{ .sequence = 2, .retire_prior_to = 0, .cid = try ConnectionId.init(&.{ 2, 0, 0, 2 }), .stateless_reset_token = token }));
 }
 
+test "routing table rejects CID collisions across connections" {
+    var table = CidRoutingTable.init(testing.allocator);
+    defer table.deinit();
+    const cid = try ConnectionId.init(&.{ 6, 6, 6, 6 });
+    try table.insert(cid, 1);
+    // Re-registering for the same connection is idempotent.
+    try table.insert(cid, 1);
+    try testing.expectEqual(@as(usize, 1), table.count());
+    // The same CID must never silently route to a different connection.
+    try testing.expectError(error.CidCollision, table.insert(cid, 2));
+    try testing.expectEqual(@as(?u64, 1), table.lookup(cid.slice()));
+}
+
+test "local registry rejects duplicate CIDs from repeated entropy" {
+    var registry = LocalCidRegistry.init(4, [_]u8{0x42} ** 32);
+    _ = try registry.registerInitial(try ConnectionId.init(&.{ 1, 2, 3, 4, 5, 6, 7, 8 }));
+    var entropy = [_]u8{0x99} ** 8;
+    _ = try registry.issue(&entropy, 8);
+    // Same entropy again would mint the same CID under a new sequence.
+    try testing.expectError(error.DuplicateCid, registry.issue(&entropy, 8));
+    // And so would re-registering the handshake CID.
+    try testing.expectError(error.DuplicateCid, registry.issue(&[_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 }, 8));
+}
+
+test "NEW_CONNECTION_ID sequence reuse must be an exact retransmit" {
+    var pool = PeerCidPool.init(4);
+    const cid = try ConnectionId.init(&.{ 8, 8, 8, 8 });
+    const token = [_]u8{0x08} ** stateless_reset_token_len;
+    try pool.onNewConnectionId(.{ .sequence = 1, .retire_prior_to = 1, .cid = cid, .stateless_reset_token = token });
+
+    // Same sequence and CID with a different stateless reset token: violation.
+    const other_token = [_]u8{0x09} ** stateless_reset_token_len;
+    try testing.expectError(error.ProtocolViolation, pool.onNewConnectionId(.{ .sequence = 1, .retire_prior_to = 1, .cid = cid, .stateless_reset_token = other_token }));
+    // Same sequence, CID, and token but a different retire_prior_to: also not
+    // a retransmit of the same frame.
+    try testing.expectError(error.ProtocolViolation, pool.onNewConnectionId(.{ .sequence = 1, .retire_prior_to = 0, .cid = cid, .stateless_reset_token = token }));
+    // The true retransmit still passes.
+    try pool.onNewConnectionId(.{ .sequence = 1, .retire_prior_to = 1, .cid = cid, .stateless_reset_token = token });
+}
+
+test "a stale retire_prior_to below the current threshold is a clean no-op" {
+    var pool = PeerCidPool.init(8);
+    const token = [_]u8{0x0a} ** stateless_reset_token_len;
+    try pool.onNewConnectionId(.{ .sequence = 3, .retire_prior_to = 3, .cid = try ConnectionId.init(&.{ 3, 0, 0, 3 }), .stateless_reset_token = token });
+    try testing.expectEqual(@as(u64, 3), pool.retire_prior_to);
+    const retired_before = pool.metrics.peer_cids_retired;
+
+    // A late frame carrying a lower retire_prior_to sweeps nothing and queues
+    // nothing extra: the threshold never regresses.
+    try pool.onNewConnectionId(.{ .sequence = 4, .retire_prior_to = 1, .cid = try ConnectionId.init(&.{ 4, 0, 0, 4 }), .stateless_reset_token = token });
+    try testing.expectEqual(@as(u64, 3), pool.retire_prior_to);
+    try testing.expectEqual(retired_before, pool.metrics.peer_cids_retired);
+    try testing.expectEqual(@as(usize, 2), pool.activeCount());
+}
+
 test "migration claims only fresh peer CIDs" {
     var pool = PeerCidPool.init(4);
     try pool.registerInitial(try ConnectionId.init(&.{ 9, 9, 9, 9 }));
@@ -599,7 +683,7 @@ test "CID issue/retire churn does not leak routing table entries" {
     var table = CidRoutingTable.init(testing.allocator);
     defer table.deinit();
     var registry = LocalCidRegistry.init(4, [_]u8{0x55} ** 32);
-    _ = try registry.registerInitial(try ConnectionId.init(&.{ 0, 0, 0, 0, 0, 0, 0, 1 }));
+    _ = try registry.registerInitial(try ConnectionId.init(&.{ 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa }));
 
     // Long-running rotation: issue a fresh CID and retire the previous one,
     // thousands of times. Table and registry stay bounded throughout.

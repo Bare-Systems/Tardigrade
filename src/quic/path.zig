@@ -392,7 +392,13 @@ pub const Metrics = struct {
     // rebinding, migration, validation failure, and blocked attempts.
     path_challenges_sent: u64 = 0,
     path_validations_succeeded: u64 = 0,
+    /// Validations that failed terminally: the challenge expired unanswered.
     path_validations_failed: u64 = 0,
+    /// PATH_RESPONSE frames that validated nothing — wrong payload, wrong
+    /// path, or no outstanding challenge. Kept separate from
+    /// `path_validations_failed` because the probe may still succeed; a spike
+    /// here without failures suggests reordering or off-path spoofing.
+    path_response_mismatches: u64 = 0,
     nat_rebindings: u64 = 0,
     migrations: u64 = 0,
     migrations_blocked: u64 = 0,
@@ -595,22 +601,33 @@ pub const PathManager = struct {
     /// Apply a PATH_RESPONSE received from `key`. On a match the path becomes
     /// validated and active, and the outcome says whether congestion/RTT
     /// state must reset. A response with no matching outstanding challenge —
-    /// wrong payload, wrong path, or expired — is ignored (null): responses
-    /// do not validate paths they were not sent on (RFC 9000 §8.2.3).
+    /// wrong payload, wrong path, or expired — is ignored (null) and counted
+    /// in `path_response_mismatches`: responses do not validate paths they
+    /// were not sent on (RFC 9000 §8.2.3), but the probe itself keeps waiting
+    /// (only expiry fails it terminally).
     pub fn onPathResponse(
         self: *PathManager,
         key: PathKey,
         data: [path_challenge_len]u8,
         now_us: u64,
     ) ?MigrationOutcome {
-        const index = self.find(key) orelse return null;
+        const index = self.find(key) orelse {
+            self.metrics.path_response_mismatches += 1;
+            return null;
+        };
         const path = &self.paths[index].?;
-        if (path.state != .validating) return null;
+        if (path.state != .validating) {
+            self.metrics.path_response_mismatches += 1;
+            return null;
+        }
         if (now_us > path.challenge_deadline_us) {
             self.failValidation(path);
             return null;
         }
-        if (!std.crypto.timing_safe.eql([path_challenge_len]u8, path.challenge, data)) return null;
+        if (!std.crypto.timing_safe.eql([path_challenge_len]u8, path.challenge, data)) {
+            self.metrics.path_response_mismatches += 1;
+            return null;
+        }
 
         path.state = .validated;
         path.anti_amplification.markValidated();
@@ -895,12 +912,21 @@ test "a real migration validates and requires congestion/RTT reset" {
     var controller = recovery.RecoveryController{};
     controller.rtt.update(50_000, 0);
     controller.congestion.congestion_window = 3;
-    controller.congestion.bytes_in_flight = 999;
+    const old_path_packet = recovery.SentPacket{
+        .space = .application,
+        .packet_number = 5,
+        .time_sent_us = 10,
+        .size = 999,
+    };
+    controller.congestion.onPacketSent(old_path_packet.size);
     controller.resetForPathMigration();
     try testing.expect(!controller.rtt.hasSample());
     try testing.expectEqual(recovery.CongestionController.initialWindow(recovery.max_datagram_size), controller.congestion.congestion_window);
-    // Packets in flight on the old path are still accounted for.
+    // Packets in flight on the old path stay in the single send ledger...
     try testing.expectEqual(@as(usize, 999), controller.congestion.bytes_in_flight);
+    // ...and drain through the normal ack path without corrupting accounting.
+    controller.congestion.onPacketAcked(old_path_packet);
+    try testing.expectEqual(@as(usize, 0), controller.congestion.bytes_in_flight);
 }
 
 test "a wrong PATH_RESPONSE payload does not validate the path" {
@@ -912,9 +938,14 @@ test "a wrong PATH_RESPONSE payload does not validate the path" {
     try testing.expectEqual(@as(?MigrationOutcome, null), manager.onPathResponse(rebound, wrong, 100));
     // A response on a different tuple does not validate the probed one either.
     try testing.expectEqual(@as(?MigrationOutcome, null), manager.onPathResponse(testKeyOtherHost(1), test_challenge, 100));
-    // Still probing; the active path is unchanged.
+    // Still probing; the active path is unchanged. Both bogus responses are
+    // counted as mismatches, not as terminal validation failures — the probe
+    // can still succeed.
     try testing.expect(manager.activePath().key.eql(testKey(50_000)));
     try testing.expectEqual(@as(u64, 0), manager.metrics.path_validations_succeeded);
+    try testing.expectEqual(@as(u64, 0), manager.metrics.path_validations_failed);
+    try testing.expectEqual(@as(u64, 2), manager.metrics.path_response_mismatches);
+    try testing.expect(manager.onPathResponse(rebound, test_challenge, 200) != null);
 }
 
 test "path validation fails deterministically when the challenge expires" {

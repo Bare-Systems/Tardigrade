@@ -443,6 +443,14 @@ pub const RecoveryController = struct {
     /// and can still be acknowledged or declared lost. Skip this for a NAT
     /// rebinding that only changed the peer's port; `path.zig` documents the
     /// policy.
+    ///
+    /// `bytes_in_flight` deliberately carries over: this endpoint has one
+    /// send ledger, and old-path packets drain from it through the normal
+    /// ack/loss paths (zeroing it would double-count capacity now and
+    /// mis-decrement later). The cost is that a large old-path backlog can
+    /// briefly gate sends on the fresh window until it drains — true
+    /// per-path congestion isolation during concurrent validation needs
+    /// per-path controllers, which is multipath-adjacent work outside #251.
     pub fn resetForPathMigration(self: *RecoveryController) void {
         self.rtt = RttEstimator.init(self.rtt.max_ack_delay_us);
         self.congestion = .{ .bytes_in_flight = self.congestion.bytes_in_flight };

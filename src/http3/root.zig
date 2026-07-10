@@ -8,6 +8,7 @@ pub const frame = @import("frame.zig");
 pub const qpack = @import("qpack.zig");
 pub const session = @import("session.zig");
 pub const qlog = @import("qlog.zig");
+pub const priority = @import("priority.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());

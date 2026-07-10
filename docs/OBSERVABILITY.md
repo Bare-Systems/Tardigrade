@@ -238,3 +238,12 @@ A healthy reload increments `reload_attempts_total` and `reload_success_total`
 together; a rejected reload increments `reload_attempts_total` and
 `reload_failure_total` while the reload-status endpoint reports `ok: false` with
 the rejection reason.
+
+## QUIC / HTTP-3 (pure-Zig backend)
+
+The pure-Zig QUIC/H3 stack (#240) has its own transport-level observability
+seam — qlog event tracing, TLS key logging for local decryption, and planned
+Prometheus counters — designed in [`QUIC_QLOG.md`](QUIC_QLOG.md). Unlike the
+stable HTTP/1.1 contract above, these paths are **disabled by default** and are
+**sensitive/debug-only**: a key log decrypts the connection. They are for local
+debugging and the interop harness (#247), never a production default.

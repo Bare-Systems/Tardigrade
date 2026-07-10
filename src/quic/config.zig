@@ -46,6 +46,12 @@ pub const QpackMode = enum {
     dynamic,
 };
 
+/// qlog/keylog toggles for the pure-Zig QUIC/H3 stack (#255). Both default off
+/// and are sensitive/debug-only: qlog reveals connection internals and keylog
+/// reveals the TLS traffic secrets that decrypt the connection. See
+/// `docs/QUIC_QLOG.md` for the event model and safe-handling rules. The event
+/// seam lives in `src/quic/qlog.zig` (+ `keylog.zig`) and `src/http3/qlog.zig`;
+/// destinations are supplied by the composition root, not this config.
 pub const Observability = struct {
     qlog_enabled: bool = false,
     keylog_enabled: bool = false,

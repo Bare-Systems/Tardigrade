@@ -1114,3 +1114,43 @@ test "smoke harness fails truncated long-header packets deterministically" {
     try smoke.server.onDatagram(initial);
     try testing.expect(smoke.server.adapter.metrics.packets_deprotected == 1);
 }
+
+// The composition root owns the qlog file: it writes one trace header, then
+// interleaves transport records (src/quic) and HTTP/3 records (src/http3) into
+// a single JSON-SEQ stream. This test locks that intended file shape — the seam
+// #255 designs — without either package importing the other.
+test "qlog composition root interleaves transport and h3 records under one header" {
+    const qlog = quic.qlog;
+    const h3qlog = http3.qlog;
+
+    var file: [1024]u8 = undefined;
+    var len: usize = 0;
+
+    const header = try qlog.writeTraceHeader(.{
+        .vantage_point = .server,
+        .reference_time_us = 0,
+        .group_id = "0011223344556677",
+    }, file[len..]);
+    len += header.len;
+
+    const transport_rec = try qlog.writeJson(.{
+        .time_us = 1_000,
+        .event = .{ .packet_received = .{ .packet_type = .initial, .packet_number = 0, .length = 1200 } },
+    }, file[len..]);
+    len += transport_rec.len;
+
+    const h3_rec = try h3qlog.writeJson(.{
+        .time_us = 2_000,
+        .event = .{ .qpack_state_updated = .{ .state = .blocked, .stream_id = 0 } },
+    }, file[len..]);
+    len += h3_rec.len;
+
+    const stream = file[0..len];
+    // Three records: header + one transport + one h3, each JSON-SEQ delimited.
+    try testing.expectEqual(@as(usize, 3), std.mem.count(u8, stream, &[_]u8{qlog.record_separator}));
+    try testing.expect(std.mem.indexOf(u8, stream, "\"qlog_format\":\"JSON-SEQ\"") != null);
+    try testing.expect(std.mem.indexOf(u8, stream, "transport:packet_received") != null);
+    try testing.expect(std.mem.indexOf(u8, stream, "qpack:stream_state_updated") != null);
+    // Both writers frame identically, so the merged stream is uniform.
+    try testing.expectEqual(qlog.record_separator, h3qlog.record_separator);
+}

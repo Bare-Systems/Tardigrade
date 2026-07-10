@@ -113,8 +113,9 @@ pub const HkdfError = InputError || CapabilityError;
 pub const SealError = InputError || CapabilityError;
 /// AEAD open additionally authenticates, so it adds `AuthenticationFailed`.
 pub const OpenError = InputError || CapabilityError || AuthError;
-/// Key-share generation draws entropy and can reject an unsupported group.
-pub const KeyShareError = CapabilityError || ProviderError;
+/// Key-share generation draws entropy, can reject an unsupported group, and
+/// rejects wrong-sized caller output buffers as `InvalidInput`.
+pub const KeyShareError = InputError || CapabilityError || ProviderError;
 /// Shared-secret derivation validates the peer's public value (`InvalidInput`
 /// covers a low-order / all-zero point) and can reject an unsupported group.
 pub const DeriveError = InputError || CapabilityError;
@@ -367,8 +368,10 @@ pub const CryptoProvider = struct {
         ) SealError!void,
 
         /// AEAD open. Authenticates `tag` over `ciphertext` + `associated_data`
-        /// and writes `plaintext` on success; leaves `plaintext` untouched and
-        /// returns `error.AuthenticationFailed` otherwise.
+        /// and writes `plaintext` on success. On `error.AuthenticationFailed`
+        /// the `plaintext` buffer is zeroed/invalidated — a provider must never
+        /// leave partially decrypted, unauthenticated output for the caller to
+        /// read.
         aeadOpen: *const fn (
             context: *anyopaque,
             aead: Aead,
@@ -502,10 +505,13 @@ pub const CryptoProvider = struct {
 /// lengths the running time is independent of where — or whether — the bytes
 /// differ. Use this for MACs, Finished values, and any secret-derived tag.
 pub fn constantTimeEqual(a: []const u8, b: []const u8) bool {
+    // Lengths are not secret, so the mismatch short-circuits. The content
+    // comparison is delegated to the standard library's dedicated timing-safe
+    // primitive rather than a hand-rolled loop. `timing_safe.eql` needs a
+    // comptime-fixed length; `timing_safe.compare` is its slice-based sibling
+    // and runs in constant time for equal-length inputs.
     if (a.len != b.len) return false;
-    var diff: u8 = 0;
-    for (a, b) |x, y| diff |= x ^ y;
-    return diff == 0;
+    return crypto.timing_safe.compare(u8, a, b, .big) == .eq;
 }
 
 /// Overwrite `buffer` with zeros in a way the optimiser may not elide. Call

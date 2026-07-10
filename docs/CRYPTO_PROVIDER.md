@@ -84,11 +84,14 @@ Every slice handed to the provider — keys, IKM, plaintext, private scalars,
 peer public values — is valid only for the duration of the call. A backend must
 not retain a pointer to borrowed secret material after it returns. The only
 provider-owned secret is a `SigningKey`'s private key, which lives behind the
-opaque handle and is released by whatever created it (for the pure-Zig backend,
-a `SoftwareSigningKey` value that holds no heap allocation). Internally, backends
-copy secrets into fixed buffers only as long as a primitive needs them and
-`secureZero` those buffers on the way out; AEAD-open scrubs any partial
-plaintext on authentication failure.
+opaque handle; its owner scrubs it explicitly when retiring the key (for the
+pure-Zig backend, `SoftwareSigningKey.deinit` — a Zig value is not zeroed just
+by going out of scope). Internally, backends copy secrets into fixed buffers
+only as long as a primitive needs them and `secureZero` those buffers on the
+way out — including HKDF's per-block temporaries, the X25519 seed, ephemeral
+private scalar, and shared-secret copies. AEAD-open zeroes its output buffer on
+authentication failure so no unauthenticated plaintext is ever left for the
+caller to read.
 
 ### Entropy is injected
 

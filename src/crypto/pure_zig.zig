@@ -177,8 +177,12 @@ fn expandLabelWith(
     defer crypto.secureZero(u8, &prk);
 
     // HKDF-Expand: T(i) = HMAC(PRK, T(i-1) || info || i), truncated to out.len.
+    // Both `block` (a raw output block) and `message` (which carries T(i-1))
+    // hold secret-derived material, so wipe them on every exit path.
     var block: [mac_len]u8 = undefined;
     var message: [mac_len + info.len + 1]u8 = undefined;
+    defer crypto.secureZero(u8, &block);
+    defer crypto.secureZero(u8, &message);
     var have_previous = false;
     var counter: usize = 1;
     var written: usize = 0;
@@ -198,7 +202,6 @@ fn expandLabelWith(
         written += take;
         have_previous = true;
     }
-    crypto.secureZero(u8, &block);
 }
 
 // ---------------------------------------------------------------------------
@@ -308,16 +311,22 @@ fn generateKeyShareImpl(
     const self: *Provider = @ptrCast(@alignCast(context));
     switch (group) {
         .x25519 => {
-            // Wrong-sized output buffers are a caller sizing bug, not peer
-            // input; the caller sizes against Group.publicKeyLength().
-            if (public_out.len != X25519.public_length) return error.ProviderFailure;
-            if (private_out.len != X25519.secret_length) return error.ProviderFailure;
+            // A wrong-sized caller output buffer violates the output-slice
+            // contract (see InputError); it is a caller bug, not an internal
+            // provider failure, so classify it as InvalidInput.
+            if (public_out.len != X25519.public_length) return error.InvalidInput;
+            if (private_out.len != X25519.secret_length) return error.InvalidInput;
 
             var seed: [X25519.seed_length]u8 = undefined;
-            self.entropy.fill(&seed) catch return error.EntropyFailure;
+            // Register the wipe before filling, so a source that partially
+            // fills and then fails does not leave seed bytes on the stack.
             defer crypto.secureZero(u8, &seed);
+            self.entropy.fill(&seed) catch return error.EntropyFailure;
 
-            const key_pair = X25519.KeyPair.generateDeterministic(seed) catch return error.ProviderFailure;
+            var key_pair = X25519.KeyPair.generateDeterministic(seed) catch return error.ProviderFailure;
+            // The local key pair keeps a copy of the private scalar after it is
+            // handed to the caller; scrub it on return.
+            defer crypto.secureZero(u8, &key_pair.secret_key);
             @memcpy(public_out, &key_pair.public_key);
             @memcpy(private_out, &key_pair.secret_key);
         },
@@ -347,7 +356,10 @@ fn deriveSharedSecretImpl(
 
             // scalarmult rejects the low-order / all-zero points that would
             // yield an all-zero (identity) shared secret: peer input error.
-            const shared = X25519.scalarmult(scalar, point) catch return error.InvalidInput;
+            var shared = X25519.scalarmult(scalar, point) catch return error.InvalidInput;
+            // The shared secret is a backend-created temporary; scrub our copy
+            // once it has been handed to the caller.
+            defer crypto.secureZero(u8, &shared);
             @memcpy(out, &shared);
         },
         .secp256r1 => return error.UnsupportedCapability,
@@ -385,9 +397,10 @@ fn verifyImpl(
 
 /// A software Ed25519 signing key. Produces a `provider.SigningKey` whose
 /// private material lives inside this value; keep it alive for as long as the
-/// handle is used, and let it go out of scope (it holds no heap allocation) to
-/// discard the key. A future HSM/remote signer implements the same
-/// `provider.SigningKey` vtable without the TLS engine noticing.
+/// handle is used, and call `deinit` to erase the private key when retiring it
+/// — Zig does not zero a value's bytes on scope exit, so dropping it is not
+/// enough. A future HSM/remote signer implements the same `provider.SigningKey`
+/// vtable without the TLS engine noticing.
 pub const SoftwareSigningKey = struct {
     key_pair: Ed25519.KeyPair,
 
@@ -395,6 +408,13 @@ pub const SoftwareSigningKey = struct {
     pub fn fromSeed(seed: [Ed25519.KeyPair.seed_length]u8) provider.SignError!SoftwareSigningKey {
         const key_pair = Ed25519.KeyPair.generateDeterministic(seed) catch return error.ProviderFailure;
         return .{ .key_pair = key_pair };
+    }
+
+    /// Securely erase the private key material. Callers must invoke this when
+    /// the key is no longer needed; letting the value go out of scope does not
+    /// scrub its bytes.
+    pub fn deinit(self: *SoftwareSigningKey) void {
+        crypto.secureZero(u8, &self.key_pair.secret_key.bytes);
     }
 
     /// Raw 32-byte Ed25519 public key, for pinning or CertificateVerify checks.
@@ -558,13 +578,16 @@ test "AEAD seal then open round-trips for every supported cipher" {
         try cp.aeadOpen(aead, key[0..aead.keyLength()], &nonce, associated_data, &ciphertext, &tag, &recovered);
         try testing.expectEqualSlices(u8, plaintext, &recovered);
 
-        // A single flipped ciphertext bit must fail authentication.
+        // A single flipped ciphertext bit must fail authentication, and the
+        // output buffer must be zeroed rather than left holding unauthenticated
+        // plaintext (the documented open contract).
         var tampered = ciphertext;
         tampered[0] ^= 0x01;
         try testing.expectError(
             error.AuthenticationFailed,
             cp.aeadOpen(aead, key[0..aead.keyLength()], &nonce, associated_data, &tampered, &tag, &recovered),
         );
+        for (recovered) |byte| try testing.expectEqual(@as(u8, 0), byte);
 
         // Mismatched associated data must also fail.
         try testing.expectError(
@@ -610,6 +633,19 @@ test "X25519 rejects an all-zero (low-order) peer point as InvalidInput" {
     try testing.expectError(error.InvalidInput, cp.deriveSharedSecret(.x25519, &a_priv, &zero_point, &out));
 }
 
+test "key-share generation rejects wrong-sized output buffers as InvalidInput" {
+    var det = DeterministicEntropy.init(8);
+    var p = Provider.init(det.entropy());
+    const cp = p.cryptoProvider();
+
+    // A wrong-sized caller buffer is a contract violation, not a provider
+    // failure — protocol code must not map it to an internal crypto error.
+    var full: [32]u8 = undefined;
+    var too_small: [16]u8 = undefined;
+    try testing.expectError(error.InvalidInput, cp.generateKeyShare(.x25519, &too_small, &full));
+    try testing.expectError(error.InvalidInput, cp.generateKeyShare(.x25519, &full, &too_small));
+}
+
 test "Ed25519 sign then verify, with tamper and wrong-key rejection" {
     var det = DeterministicEntropy.init(7);
     var p = Provider.init(det.entropy());
@@ -618,6 +654,7 @@ test "Ed25519 sign then verify, with tamper and wrong-key rejection" {
     var seed: [32]u8 = undefined;
     try cp.randomBytes(&seed);
     var software_key = try SoftwareSigningKey.fromSeed(seed);
+    defer software_key.deinit();
     const signer = software_key.signingKey();
     try testing.expectEqual(provider.SignatureScheme.ed25519, signer.scheme());
 
@@ -638,6 +675,7 @@ test "Ed25519 sign then verify, with tamper and wrong-key rejection" {
     var other_seed: [32]u8 = undefined;
     try cp.randomBytes(&other_seed);
     var other_key = try SoftwareSigningKey.fromSeed(other_seed);
+    defer other_key.deinit();
     const other_public = other_key.publicKey();
     try testing.expectError(error.AuthenticationFailed, cp.verify(.ed25519, &other_public, message, &signature));
 }

@@ -74,7 +74,14 @@ const HarnessError = error{
     TruncatedPacket,
     StreamsNotReady,
     BufferTooShort,
+    PumpOverflow,
 };
+
+/// Deterministic bounds check for fixed packet-header fields: reading past the
+/// datagram is a `TruncatedPacket` error, never an out-of-bounds panic.
+fn requireAvailable(total: usize, pos: usize, need: usize) HarnessError!void {
+    if (pos > total or need > total - pos) return error.TruncatedPacket;
+}
 
 fn encodeCryptoFrame(offset: u64, data: []const u8, out: []u8) ![]const u8 {
     var pos: usize = 0;
@@ -106,33 +113,31 @@ fn encodeStreamFrame(grant: quic_stream.SendGrant, data: []const u8, out: []u8) 
 // ---------------------------------------------------------------------------
 
 const DatagramQueue = struct {
-    allocator: std.mem.Allocator,
-    items: std.ArrayList([]u8) = .empty,
+    /// Largest burst either side produces in one round is three datagrams
+    /// (ServerHello + handshake flight + 1-RTT); sixteen leaves headroom while
+    /// keeping overflow a deterministic error instead of unbounded growth.
+    const queue_capacity = 16;
 
-    fn init(allocator: std.mem.Allocator) DatagramQueue {
-        return .{ .allocator = allocator };
-    }
+    buffers: [queue_capacity][max_datagram]u8 = undefined,
+    lengths: [queue_capacity]usize = [_]usize{0} ** queue_capacity,
+    count: usize = 0,
 
-    fn deinit(self: *DatagramQueue) void {
-        for (self.items.items) |datagram| self.allocator.free(datagram);
-        self.items.deinit(self.allocator);
-    }
-
-    fn push(self: *DatagramQueue, datagram: []const u8) !void {
-        const owned = try self.allocator.dupe(u8, datagram);
-        errdefer self.allocator.free(owned);
-        try self.items.append(self.allocator, owned);
+    fn push(self: *DatagramQueue, datagram: []const u8) HarnessError!void {
+        if (self.count == queue_capacity) return error.PumpOverflow;
+        if (datagram.len > max_datagram) return error.BufferTooShort;
+        @memcpy(self.buffers[self.count][0..datagram.len], datagram);
+        self.lengths[self.count] = datagram.len;
+        self.count += 1;
     }
 
     /// Deliver every queued datagram to `endpoint` in order. Returns the
     /// number delivered (zero means the peer made no progress this round).
     fn deliverAll(self: *DatagramQueue, endpoint: *Endpoint) !usize {
-        const delivered = self.items.items.len;
-        for (self.items.items) |datagram| {
-            defer self.allocator.free(datagram);
-            try endpoint.onDatagram(datagram);
+        const delivered = self.count;
+        for (self.buffers[0..delivered], self.lengths[0..delivered]) |*buffer, length| {
+            try endpoint.onDatagram(buffer[0..length]);
         }
-        self.items.clearRetainingCapacity();
+        self.count = 0;
         return delivered;
     }
 };
@@ -157,15 +162,8 @@ const Endpoint = struct {
     next_pn: [3]u64 = .{ 0, 0, 0 },
     largest_recv_pn: [3]?u64 = .{ null, null, null },
 
-    fn spaceIndex(level: EncryptionLevel) usize {
+    inline fn spaceIndex(level: EncryptionLevel) usize {
         return @intFromEnum(level.packetNumberSpace());
-    }
-
-    fn tlsRole(self: *const Endpoint) tls_handshake.Role {
-        return switch (self.role) {
-            .client => .client,
-            .server => .server,
-        };
     }
 
     fn deinit(self: *Endpoint) void {
@@ -276,6 +274,7 @@ const Endpoint = struct {
         if (datagram.len > pkt.len) return error.TruncatedPacket;
         @memcpy(pkt[0..datagram.len], datagram);
 
+        if (datagram.len == 0) return error.TruncatedPacket;
         var pos: usize = 0;
         var level: EncryptionLevel = undefined;
         var packet_end: usize = datagram.len;
@@ -286,29 +285,35 @@ const Endpoint = struct {
                 else => return error.UnexpectedPacketType,
             };
             pos = 1;
-            if (datagram.len < pos + 4) return error.TruncatedPacket;
+            try requireAvailable(datagram.len, pos, 4);
             if (std.mem.readInt(u32, pkt[pos..][0..4], .big) != quic_v1) return error.UnexpectedQuicVersion;
             pos += 4;
+            try requireAvailable(datagram.len, pos, 1);
             if (pkt[pos] != cid_len) return error.UnexpectedConnectionId;
             pos += 1;
+            try requireAvailable(datagram.len, pos, cid_len);
             if (!std.mem.eql(u8, pkt[pos..][0..cid_len], &self.local_cid)) return error.UnexpectedConnectionId;
             pos += cid_len;
+            try requireAvailable(datagram.len, pos, 1);
             if (pkt[pos] != cid_len) return error.UnexpectedConnectionId;
-            pos += 1 + cid_len; // peer's source CID
+            pos += 1;
+            try requireAvailable(datagram.len, pos, cid_len); // peer's source CID
+            pos += cid_len;
             if (level == .initial) {
-                const token_len = try varint.decode(pkt[pos..datagram.len]);
+                const token_len = varint.decode(pkt[pos..datagram.len]) catch return error.TruncatedPacket;
                 if (token_len.value != 0) return error.UnexpectedToken;
                 pos += token_len.len;
             }
-            const length = try varint.decode(pkt[pos..datagram.len]);
+            const length = varint.decode(pkt[pos..datagram.len]) catch return error.TruncatedPacket;
             pos += length.len;
             if (length.value > datagram.len - pos) return error.TruncatedPacket;
             packet_end = pos + @as(usize, @intCast(length.value));
         } else {
             level = .application;
-            pos = 1 + cid_len;
-            if (datagram.len < pos) return error.TruncatedPacket;
-            if (!std.mem.eql(u8, pkt[1..][0..cid_len], &self.local_cid)) return error.UnexpectedConnectionId;
+            pos = 1;
+            try requireAvailable(datagram.len, pos, cid_len);
+            if (!std.mem.eql(u8, pkt[pos..][0..cid_len], &self.local_cid)) return error.UnexpectedConnectionId;
+            pos += cid_len;
         }
 
         const keys = self.adapter.protectionKeys(level, .read) orelse return error.KeysUnavailableForLevel;
@@ -418,8 +423,8 @@ const Endpoint = struct {
     fn readStream(self: *Endpoint, id: quic_stream.StreamId, out: *std.ArrayList(u8)) !bool {
         var manager = if (self.streams) |*m| m else return error.StreamsNotReady;
         var fin = false;
+        var buf: [1024]u8 = undefined;
         while (true) {
-            var buf: [1024]u8 = undefined;
             const result = try manager.read(id, &buf);
             if (result.len > 0) try out.appendSlice(self.allocator, buf[0..result.len]);
             fin = fin or result.fin;
@@ -472,8 +477,8 @@ const Smoke = struct {
                 .local_cid = server_cid,
                 .peer_cid = client_cid,
             },
-            .to_server = DatagramQueue.init(allocator),
-            .to_client = DatagramQueue.init(allocator),
+            .to_server = .{},
+            .to_client = .{},
         };
         _ = try smoke.client.adapter.installInitialSecrets(.client, &server_cid);
         _ = try smoke.server.adapter.installInitialSecrets(.server, &server_cid);
@@ -490,8 +495,6 @@ const Smoke = struct {
     fn deinit(self: *Smoke) void {
         self.client.deinit();
         self.server.deinit();
-        self.to_server.deinit();
-        self.to_client.deinit();
     }
 
     /// Pump protected handshake packets between the endpoints until both
@@ -538,10 +541,13 @@ test "pure-Zig QUIC/TLS/H3 local smoke: handshake, request, response, close" {
     try testing.expect(smoke.server.adapter.negotiatedH3());
     try testing.expectEqual(tls_adapter.CertificateState.valid, smoke.client.adapter.certificateState());
 
-    // Key lifecycle: Initial and Handshake keys are gone, 1-RTT keys usable.
+    // Key lifecycle: Initial and Handshake keys are gone in both directions on
+    // both adapters, 1-RTT keys usable.
     inline for (.{ EncryptionLevel.initial, EncryptionLevel.handshake }) |level| {
-        try testing.expectEqual(@as(?tls_adapter.PacketProtectionKeys, null), smoke.client.adapter.protectionKeys(level, .write));
-        try testing.expectEqual(@as(?tls_adapter.PacketProtectionKeys, null), smoke.server.adapter.protectionKeys(level, .read));
+        inline for (.{ tls_adapter.Direction.read, tls_adapter.Direction.write }) |direction| {
+            try testing.expectEqual(@as(?tls_adapter.PacketProtectionKeys, null), smoke.client.adapter.protectionKeys(level, direction));
+            try testing.expectEqual(@as(?tls_adapter.PacketProtectionKeys, null), smoke.server.adapter.protectionKeys(level, direction));
+        }
     }
     try testing.expect(smoke.client.adapter.protectionKeys(.application, .write) != null);
     try testing.expect(smoke.server.adapter.protectionKeys(.application, .write) != null);
@@ -675,8 +681,8 @@ test "pure-Zig QUIC/TLS/H3 local smoke: handshake, request, response, close" {
     }
     const client_read = try smoke.client.streams.?.read(request_stream, &drain_buf);
     try testing.expectEqual(@as(usize, 0), client_read.len);
-    try testing.expectEqual(@as(usize, 0), smoke.to_server.items.items.len);
-    try testing.expectEqual(@as(usize, 0), smoke.to_client.items.items.len);
+    try testing.expectEqual(@as(usize, 0), smoke.to_server.count);
+    try testing.expectEqual(@as(usize, 0), smoke.to_client.count);
 
     // Packet protection saw real traffic in both directions and nothing was
     // forged along the way.
@@ -712,8 +718,35 @@ test "smoke harness surfaces payload forgery as an authentication failure" {
     const id = try smoke.client.streams.?.openLocal(.bidi);
     try smoke.client.sendStreamBytes(id, "tamper-me", true, &smoke.to_server);
     // Flip one ciphertext byte in flight: deprotection must fail and count.
-    const datagram = smoke.to_server.items.items[0];
+    const datagram = smoke.to_server.buffers[0][0..smoke.to_server.lengths[0]];
     datagram[datagram.len - 1] ^= 0x01;
     try testing.expectError(error.AuthenticationFailed, smoke.server.onDatagram(datagram));
     try testing.expectEqual(@as(u64, 1), smoke.server.adapter.metrics.deprotection_failures);
+}
+
+test "smoke harness fails truncated long-header packets deterministically" {
+    const allocator = testing.allocator;
+    var smoke = try Smoke.init(allocator);
+    defer smoke.deinit();
+    try smoke.wire();
+
+    // Produce a real client Initial, then truncate it at every prefix length
+    // that cuts into the fixed header fields (version, DCID, SCID, token,
+    // length) or the protected payload. Each must fail with a typed error —
+    // never an out-of-bounds panic.
+    try smoke.client.flushHandshake(&smoke.to_server);
+    try testing.expectEqual(@as(usize, 1), smoke.to_server.count);
+    const initial = smoke.to_server.buffers[0][0..smoke.to_server.lengths[0]];
+
+    var cut: usize = 0;
+    while (cut < initial.len) : (cut += 1) {
+        const result = smoke.server.onDatagram(initial[0..cut]);
+        try testing.expectError(error.TruncatedPacket, result);
+    }
+    // The empty datagram is truncated too.
+    try testing.expectError(error.TruncatedPacket, smoke.server.onDatagram(initial[0..0]));
+
+    // The untouched packet still parses and advances the handshake.
+    try smoke.server.onDatagram(initial);
+    try testing.expect(smoke.server.adapter.metrics.packets_deprotected == 1);
 }

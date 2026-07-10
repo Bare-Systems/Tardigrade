@@ -552,7 +552,9 @@ test "fuzz: SETTINGS decoder never panics on arbitrary payloads" {
         "\x07\x00",
         "\x08\x01",
         "\x08\x02",
+        "\x40\x08\x40\x01",
         "\x02\x01",
+        "\x40\x02\x40\x01",
         "\x07\x00\x07\x01",
     } });
 }
@@ -563,6 +565,36 @@ fn fuzzDecodeSettings(_: void, smith: *testing.Smith) !void {
     var scratch: [16]Setting = undefined;
     const decoded = decodeSettings(buf[0..len], &scratch) catch return;
     try testing.expect(decoded.count <= scratch.len);
+    try expectUniqueSettings(scratch[0..decoded.count]);
+    try expectCanonicalBooleanSettings(scratch[0..decoded.count]);
+
+    var reencoded_buf: [256]u8 = undefined;
+    const reencoded = encodeSettings(scratch[0..decoded.count], &reencoded_buf) catch return;
+    var roundtrip_scratch: [16]Setting = undefined;
+    const roundtrip = try decodeSettings(reencoded, &roundtrip_scratch);
+    try testing.expectEqual(decoded.count, roundtrip.count);
+    try testing.expectEqual(decoded.parsed.qpack_max_table_capacity, roundtrip.parsed.qpack_max_table_capacity);
+    try testing.expectEqual(decoded.parsed.qpack_blocked_streams, roundtrip.parsed.qpack_blocked_streams);
+    try testing.expectEqual(decoded.parsed.max_field_section_size, roundtrip.parsed.max_field_section_size);
+    try testing.expectEqual(decoded.parsed.enable_connect_protocol, roundtrip.parsed.enable_connect_protocol);
+    try testing.expectEqual(decoded.parsed.h3_datagram, roundtrip.parsed.h3_datagram);
+}
+
+fn expectUniqueSettings(settings: []const Setting) !void {
+    for (settings, 0..) |setting, index| {
+        for (settings[0..index]) |prior| {
+            try testing.expect(setting.id_value != prior.id_value);
+        }
+    }
+}
+
+fn expectCanonicalBooleanSettings(settings: []const Setting) !void {
+    for (settings) |setting| {
+        switch (setting.id) {
+            .enable_connect_protocol, .h3_datagram => try testing.expect(setting.value == 0 or setting.value == 1),
+            else => {},
+        }
+    }
 }
 
 test "fuzz: control stream ingestion never panics or leaks" {
@@ -571,6 +603,9 @@ test "fuzz: control stream ingestion never panics or leaks" {
         "\x00",
         "\x00\x04\x00",
         "\x00\x04\x02\x01\x00",
+        "\x00\x04\x04\x01\x00\x07\x00",
+        "\x00\x04\x02\x40\x07",
+        "\x00\x40\x04\x40\x00",
         "\x00\x01\x00",
         "\x02\x04\x00",
     } });
@@ -580,10 +615,70 @@ fn fuzzControlStreamIngest(_: void, smith: *testing.Smith) !void {
     const allocator = testing.allocator;
     var buf: [512]u8 = undefined;
     const len = smith.slice(&buf);
-    var stream = ControlStream{};
-    defer stream.deinit(allocator);
-    _ = stream.ingest(allocator, buf[0..len]) catch return;
-    stream.finish() catch {};
+
+    var whole = ControlStream{};
+    defer whole.deinit(allocator);
+    const whole_result = whole.ingest(allocator, buf[0..len]);
+    const whole_state = controlStreamState(&whole);
+
+    var fragmented = ControlStream{};
+    defer fragmented.deinit(allocator);
+    var pos: usize = 0;
+    var failed = false;
+    while (pos < len) {
+        const remaining = len - pos;
+        var chunk_len = @as(usize, smith.value(u8)) % remaining + 1;
+        if (smith.value(u1) == 1) chunk_len = 1;
+        const before = controlStreamState(&fragmented);
+        const result = fragmented.ingest(allocator, buf[pos..][0..chunk_len]);
+        if (result) |_| {
+            const after = controlStreamState(&fragmented);
+            try expectControlStateMonotonic(before, after);
+            pos += chunk_len;
+        } else |_| {
+            failed = true;
+            break;
+        }
+    }
+
+    if (whole_result) |_| {
+        try testing.expect(!failed);
+        try testing.expectEqual(whole_state.saw_type, fragmented.saw_type);
+        try testing.expectEqual(whole_state.saw_settings, fragmented.saw_settings);
+        try testing.expectEqual(whole_state.pending_len, fragmented.pending.items.len);
+        if (whole.saw_settings and whole.pending.items.len == 0) {
+            try whole.finish();
+            try fragmented.finish();
+            try testing.expect(whole.closed);
+            try testing.expect(fragmented.closed);
+        } else {
+            try testing.expectError(error.MissingSettings, whole.finish());
+        }
+    } else |_| {
+        if (!failed) {
+            try testing.expect(fragmented.saw_type == whole_state.saw_type or !fragmented.saw_type);
+            try testing.expect(fragmented.saw_settings == whole_state.saw_settings or !fragmented.saw_settings);
+        }
+    }
+}
+
+const ControlState = struct {
+    saw_type: bool,
+    saw_settings: bool,
+    pending_len: usize,
+};
+
+fn controlStreamState(stream: *const ControlStream) ControlState {
+    return .{
+        .saw_type = stream.saw_type,
+        .saw_settings = stream.saw_settings,
+        .pending_len = stream.pending.items.len,
+    };
+}
+
+fn expectControlStateMonotonic(before: ControlState, after: ControlState) !void {
+    if (before.saw_type) try testing.expect(after.saw_type);
+    if (before.saw_settings) try testing.expect(after.saw_settings);
 }
 
 test {

@@ -1,13 +1,14 @@
-//! QPACK header compression — static-table-only mode (#252, RFC 9204).
+//! QPACK header compression (#252/#253, RFC 9204).
 //!
 //! Encodes/decodes the HEADERS payloads carried by `frame.zig` for the first
-//! pure Zig HTTP/3 path. This mode uses the static table only: the dynamic
-//! table capacity is zero, no encoder/decoder-stream state exists, and no
-//! stream can ever be blocked. Any dynamic-table reference in an incoming block
-//! is rejected deterministically. The dynamic table, encoder/decoder streams,
-//! and blocked-stream accounting land in #253.
+//! pure Zig HTTP/3 path. The simple `encode`/`decode` functions remain
+//! static-table-only safe fallbacks. `DynamicTable`, `EncoderStream`, and
+//! `DynamicDecoder` add bounded dynamic-table support, encoder/decoder stream
+//! accounting, and blocked-stream handling for peers that negotiate non-zero
+//! QPACK settings.
 
 const std = @import("std");
+const http3_frame = @import("frame.zig");
 const huffman = @import("hpack_huffman");
 
 /// A decoded or to-be-encoded header field. Slices borrow their backing storage
@@ -276,12 +277,24 @@ pub const DecodeError = error{
     TruncatedBlock,
     /// A prefix integer overflowed u64.
     IntegerOverflow,
+    /// A dynamic-table reference points below the eviction frontier.
+    InvalidDynamicIndex,
+    /// Decoding needs encoder-stream instructions that have not arrived yet.
+    Blocked,
+    /// A new blocked stream would exceed SETTINGS_QPACK_BLOCKED_STREAMS.
+    BlockedStreamLimitExceeded,
+    /// Dynamic table capacity would be exceeded by a single entry.
+    EntryTooLarge,
+    /// Encoder/decoder stream instruction was malformed.
+    MalformedInstruction,
     /// A Huffman-coded string was malformed.
     InvalidHuffmanCode,
     /// Caller scratch storage was too small for decoded Huffman strings.
     ScratchOverflow,
     /// More header fields than the caller-provided output can hold.
     TooManyFields,
+    /// Allocator failed while owning dynamic table/header data.
+    OutOfMemory,
 };
 
 /// Decode a QPACK encoded field section into `fields_out`, returning the number
@@ -364,6 +377,430 @@ fn readBytes(block: []const u8, pos: *usize, len: usize) DecodeError![]const u8 
     pos.* += len;
     return bytes;
 }
+
+// ---------------------------------------------------------------------------
+// Dynamic table and streams (#253)
+// ---------------------------------------------------------------------------
+
+pub const DynamicEntry = struct {
+    absolute_index: u64,
+    name: []u8,
+    value: []u8,
+
+    pub fn size(self: DynamicEntry) u64 {
+        return 32 + self.name.len + self.value.len;
+    }
+
+    fn field(self: DynamicEntry) HeaderField {
+        return .{ .name = self.name, .value = self.value };
+    }
+
+    fn deinit(self: DynamicEntry, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        allocator.free(self.value);
+    }
+};
+
+pub const DynamicMetrics = struct {
+    insertions: u64 = 0,
+    evictions: u64 = 0,
+    blocked_streams: u64 = 0,
+    unblocked_streams: u64 = 0,
+    cancelled_streams: u64 = 0,
+    table_bytes: u64 = 0,
+    decode_failures: u64 = 0,
+};
+
+pub const DynamicSettings = struct {
+    max_table_capacity: u64 = 0,
+    blocked_streams: u64 = 0,
+
+    pub fn fromHttp3(settings: http3_frame.Settings) DynamicSettings {
+        return .{
+            .max_table_capacity = settings.qpack_max_table_capacity,
+            .blocked_streams = settings.qpack_blocked_streams,
+        };
+    }
+
+    pub fn initTable(self: DynamicSettings, allocator: std.mem.Allocator) DynamicTable {
+        return DynamicTable.init(allocator, self.max_table_capacity);
+    }
+
+    pub fn initDecoder(self: DynamicSettings, allocator: std.mem.Allocator, table: *DynamicTable) DynamicDecoder {
+        return DynamicDecoder.init(allocator, table, self.blocked_streams);
+    }
+};
+
+pub const DynamicTable = struct {
+    allocator: std.mem.Allocator,
+    capacity: u64,
+    entries: std.ArrayList(DynamicEntry) = .empty,
+    bytes_used: u64 = 0,
+    inserted_count: u64 = 0,
+    evicted_count: u64 = 0,
+    metrics: DynamicMetrics = .{},
+
+    pub fn init(allocator: std.mem.Allocator, capacity: u64) DynamicTable {
+        return .{ .allocator = allocator, .capacity = capacity };
+    }
+
+    pub fn deinit(self: *DynamicTable) void {
+        for (self.entries.items) |entry| entry.deinit(self.allocator);
+        self.entries.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    pub fn setCapacity(self: *DynamicTable, capacity: u64) !void {
+        self.capacity = capacity;
+        try self.evictToCapacity();
+    }
+
+    pub fn insert(self: *DynamicTable, name: []const u8, value: []const u8) !u64 {
+        const entry_size = 32 + name.len + value.len;
+        if (entry_size > self.capacity) return error.EntryTooLarge;
+
+        const owned_name = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(owned_name);
+        const owned_value = try self.allocator.dupe(u8, value);
+        errdefer self.allocator.free(owned_value);
+
+        while (self.bytes_used + entry_size > self.capacity) {
+            try self.evictOldest();
+        }
+
+        self.inserted_count += 1;
+        try self.entries.append(self.allocator, .{
+            .absolute_index = self.inserted_count,
+            .name = owned_name,
+            .value = owned_value,
+        });
+        self.bytes_used += entry_size;
+        self.metrics.insertions += 1;
+        self.metrics.table_bytes = self.bytes_used;
+        return self.inserted_count;
+    }
+
+    pub fn duplicate(self: *DynamicTable, absolute_index: u64) !u64 {
+        const entry = try self.getAbsolute(absolute_index);
+        return self.insert(entry.name, entry.value);
+    }
+
+    pub fn getAbsolute(self: *const DynamicTable, absolute_index: u64) !HeaderField {
+        if (absolute_index <= self.evicted_count) return error.InvalidDynamicIndex;
+        if (absolute_index == 0 or absolute_index > self.inserted_count) return error.Blocked;
+        for (self.entries.items) |entry| {
+            if (entry.absolute_index == absolute_index) return entry.field();
+        }
+        return error.InvalidDynamicIndex;
+    }
+
+    pub fn getRelative(self: *const DynamicTable, base: u64, relative_index: u64) !HeaderField {
+        if (relative_index > base) return error.InvalidDynamicIndex;
+        return self.getAbsolute(base - relative_index);
+    }
+
+    pub fn getPostBase(self: *const DynamicTable, base: u64, post_base_index: u64) !HeaderField {
+        return self.getAbsolute(base + post_base_index + 1);
+    }
+
+    fn evictToCapacity(self: *DynamicTable) !void {
+        while (self.bytes_used > self.capacity) try self.evictOldest();
+        self.metrics.table_bytes = self.bytes_used;
+    }
+
+    fn evictOldest(self: *DynamicTable) !void {
+        if (self.entries.items.len == 0) return;
+        const removed = self.entries.orderedRemove(0);
+        self.bytes_used -= removed.size();
+        self.evicted_count = removed.absolute_index;
+        self.metrics.evictions += 1;
+        removed.deinit(self.allocator);
+    }
+};
+
+pub const BlockedStream = struct {
+    stream_id: u64,
+    required_insert_count: u64,
+};
+
+pub const BlockedStreams = struct {
+    allocator: std.mem.Allocator,
+    max_blocked: u64,
+    streams: std.AutoHashMap(u64, BlockedStream),
+
+    pub fn init(allocator: std.mem.Allocator, max_blocked: u64) BlockedStreams {
+        return .{
+            .allocator = allocator,
+            .max_blocked = max_blocked,
+            .streams = std.AutoHashMap(u64, BlockedStream).init(allocator),
+        };
+    }
+
+    pub fn deinit(self: *BlockedStreams) void {
+        self.streams.deinit();
+    }
+
+    pub fn waitFor(self: *BlockedStreams, stream_id: u64, required_insert_count: u64, metrics: *DynamicMetrics) !void {
+        if (self.streams.get(stream_id)) |blocked| {
+            if (required_insert_count > blocked.required_insert_count) {
+                try self.streams.put(stream_id, .{ .stream_id = stream_id, .required_insert_count = required_insert_count });
+            }
+            return;
+        }
+        if (self.streams.count() >= self.max_blocked) return error.BlockedStreamLimitExceeded;
+        try self.streams.put(stream_id, .{ .stream_id = stream_id, .required_insert_count = required_insert_count });
+        metrics.blocked_streams += 1;
+    }
+
+    pub fn cancel(self: *BlockedStreams, stream_id: u64, metrics: *DynamicMetrics) void {
+        if (self.streams.fetchRemove(stream_id) != null) metrics.cancelled_streams += 1;
+    }
+
+    pub fn unblockAvailable(self: *BlockedStreams, inserted_count: u64, out: []u64, metrics: *DynamicMetrics) usize {
+        var count: usize = 0;
+        var it = self.streams.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.required_insert_count <= inserted_count) {
+                if (count < out.len) out[count] = entry.key_ptr.*;
+                count += 1;
+            }
+        }
+        const remove_count = @min(count, out.len);
+        for (out[0..remove_count]) |stream_id| {
+            _ = self.streams.remove(stream_id);
+            metrics.unblocked_streams += 1;
+        }
+        return remove_count;
+    }
+};
+
+pub const DynamicDecodeResult = union(enum) {
+    decoded: usize,
+    blocked: u64,
+};
+
+pub const DynamicDecoder = struct {
+    table: *DynamicTable,
+    blocked: BlockedStreams,
+
+    pub fn init(allocator: std.mem.Allocator, table: *DynamicTable, max_blocked: u64) DynamicDecoder {
+        return .{ .table = table, .blocked = BlockedStreams.init(allocator, max_blocked) };
+    }
+
+    pub fn deinit(self: *DynamicDecoder) void {
+        self.blocked.deinit();
+    }
+
+    pub fn decodeOrBlock(self: *DynamicDecoder, stream_id: u64, block: []const u8, fields_out: []HeaderField, scratch: []u8) !DynamicDecodeResult {
+        const prefix = try decodeFieldSectionPrefix(block);
+        if (prefix.required_insert_count > self.table.inserted_count) {
+            try self.blocked.waitFor(stream_id, prefix.required_insert_count, &self.table.metrics);
+            return .{ .blocked = prefix.required_insert_count };
+        }
+        const count = decodeDynamicWithPrefix(block[prefix.len..], prefix, self.table, fields_out, scratch) catch |err| {
+            self.table.metrics.decode_failures += 1;
+            return err;
+        };
+        self.blocked.cancel(stream_id, &self.table.metrics);
+        return .{ .decoded = count };
+    }
+};
+
+const FieldSectionPrefix = struct {
+    required_insert_count: u64,
+    base: u64,
+    len: usize,
+};
+
+fn decodeFieldSectionPrefix(block: []const u8) DecodeError!FieldSectionPrefix {
+    var pos: usize = 0;
+    const ric = try decodeInteger(block[pos..], 8);
+    pos += ric.len;
+    if (pos >= block.len) return error.TruncatedBlock;
+    const base_sign = block[pos] & 0x80 != 0;
+    const base_delta = try decodeInteger(block[pos..], 7);
+    pos += base_delta.len;
+    if (!base_sign and base_delta.value > ric.value) return error.InvalidBase;
+    const base = if (base_sign) ric.value + base_delta.value else ric.value - base_delta.value;
+    return .{ .required_insert_count = ric.value, .base = base, .len = pos };
+}
+
+fn decodeDynamicWithPrefix(block: []const u8, prefix: FieldSectionPrefix, table: *const DynamicTable, fields_out: []HeaderField, scratch: []u8) DecodeError!usize {
+    var pos: usize = 0;
+    var scratch_pos: usize = 0;
+    var count: usize = 0;
+    while (pos < block.len) {
+        if (count >= fields_out.len) return error.TooManyFields;
+        const first = block[pos];
+        if (first & 0x80 != 0) {
+            const int = try decodeInteger(block[pos..], 6);
+            pos += int.len;
+            fields_out[count] = if (first & 0x40 != 0)
+                staticEntry(@intCast(int.value)) orelse return error.InvalidStaticIndex
+            else
+                try table.getRelative(prefix.base, int.value);
+        } else if (first & 0xc0 == 0x40) {
+            const int = try decodeInteger(block[pos..], 4);
+            pos += int.len;
+            const name = if (first & 0x10 != 0)
+                (staticEntry(@intCast(int.value)) orelse return error.InvalidStaticIndex).name
+            else
+                (try table.getRelative(prefix.base, int.value)).name;
+            const value = try decodeString(block, &pos, scratch, &scratch_pos);
+            fields_out[count] = .{ .name = name, .value = value };
+        } else if (first & 0xe0 == 0x20) {
+            const is_huffman = first & 0x08 != 0;
+            const name_len = try decodeInteger(block[pos..], 3);
+            pos += name_len.len;
+            const name_bytes = try readBytes(block, &pos, @intCast(name_len.value));
+            const name = if (is_huffman) try decodeHuffman(name_bytes, scratch, &scratch_pos) else name_bytes;
+            const value = try decodeString(block, &pos, scratch, &scratch_pos);
+            fields_out[count] = .{ .name = name, .value = value };
+        } else if (first & 0xf0 == 0x10) {
+            const int = try decodeInteger(block[pos..], 4);
+            pos += int.len;
+            fields_out[count] = try table.getPostBase(prefix.base, int.value);
+        } else {
+            const int = try decodeInteger(block[pos..], 3);
+            pos += int.len;
+            const name = (try table.getPostBase(prefix.base, int.value)).name;
+            const value = try decodeString(block, &pos, scratch, &scratch_pos);
+            fields_out[count] = .{ .name = name, .value = value };
+        }
+        count += 1;
+    }
+    return count;
+}
+
+pub fn encodeDynamicIndexed(table: *const DynamicTable, absolute_index: u64, out: []u8) ![]u8 {
+    if (absolute_index == 0 or absolute_index > table.inserted_count) return error.InvalidDynamicIndex;
+    var pos: usize = 0;
+    pos += try encodeInteger(table.inserted_count, 8, 0x00, out[pos..]);
+    pos += try encodeInteger(0, 7, 0x00, out[pos..]);
+    pos += try encodeInteger(table.inserted_count - absolute_index, 6, 0x80, out[pos..]);
+    return out[0..pos];
+}
+
+pub const EncoderStream = struct {
+    pub fn encodeSetCapacity(capacity: u64, out: []u8) ![]u8 {
+        const len = try encodeInteger(capacity, 5, 0x20, out);
+        return out[0..len];
+    }
+
+    pub fn encodeInsertNameRefStatic(static_index: u64, value: []const u8, out: []u8) ![]u8 {
+        var pos: usize = 0;
+        pos += try encodeInteger(static_index, 6, 0xc0, out[pos..]);
+        pos += try encodeString(value, out, pos);
+        return out[0..pos];
+    }
+
+    pub fn encodeInsertNameRefDynamic(relative_index: u64, value: []const u8, out: []u8) ![]u8 {
+        var pos: usize = 0;
+        pos += try encodeInteger(relative_index, 6, 0x80, out[pos..]);
+        pos += try encodeString(value, out, pos);
+        return out[0..pos];
+    }
+
+    pub fn encodeInsertLiteral(name: []const u8, value: []const u8, out: []u8) ![]u8 {
+        var pos: usize = 0;
+        pos += try encodeStringWithPrefix(name, 5, 0x40, out, pos);
+        pos += try encodeString(value, out, pos);
+        return out[0..pos];
+    }
+
+    pub fn encodeDuplicate(relative_index: u64, out: []u8) ![]u8 {
+        const len = try encodeInteger(relative_index, 5, 0x00, out);
+        return out[0..len];
+    }
+
+    pub fn apply(table: *DynamicTable, bytes: []const u8) !usize {
+        var pos: usize = 0;
+        while (pos < bytes.len) {
+            const first = bytes[pos];
+            if (first & 0x80 != 0) {
+                const is_static = first & 0x40 != 0;
+                const name_ref = try decodeInteger(bytes[pos..], 6);
+                pos += name_ref.len;
+                const name = if (is_static)
+                    (staticEntry(@intCast(name_ref.value)) orelse return error.InvalidStaticIndex).name
+                else
+                    (try table.getRelative(table.inserted_count, name_ref.value)).name;
+                var value_scratch: [1024]u8 = undefined;
+                var value_scratch_pos: usize = 0;
+                const value = try decodeString(bytes, &pos, &value_scratch, &value_scratch_pos);
+                _ = try table.insert(name, value);
+            } else if (first & 0xe0 == 0x20) {
+                const cap = try decodeInteger(bytes[pos..], 5);
+                pos += cap.len;
+                try table.setCapacity(cap.value);
+            } else if (first & 0xc0 == 0x40) {
+                const is_huffman = first & 0x20 != 0;
+                const name_len = try decodeInteger(bytes[pos..], 5);
+                pos += name_len.len;
+                const name_bytes = try readBytes(bytes, &pos, @intCast(name_len.value));
+                var name_scratch: [512]u8 = undefined;
+                var name_scratch_pos: usize = 0;
+                const name = if (is_huffman) try decodeHuffman(name_bytes, &name_scratch, &name_scratch_pos) else name_bytes;
+                var value_scratch: [1024]u8 = undefined;
+                var value_scratch_pos: usize = 0;
+                const value = try decodeString(bytes, &pos, &value_scratch, &value_scratch_pos);
+                _ = try table.insert(name, value);
+            } else if (first & 0xe0 == 0x00) {
+                const rel = try decodeInteger(bytes[pos..], 5);
+                pos += rel.len;
+                const absolute = table.inserted_count - rel.value;
+                _ = try table.duplicate(absolute);
+            } else {
+                return error.MalformedInstruction;
+            }
+        }
+        return pos;
+    }
+};
+
+pub const DecoderInstruction = union(enum) {
+    section_ack: u64,
+    stream_cancel: u64,
+    insert_count_increment: u64,
+};
+
+pub const DecoderStream = struct {
+    known_received_count: u64 = 0,
+    section_acks: u64 = 0,
+    stream_cancellations: u64 = 0,
+
+    pub fn encode(instruction: DecoderInstruction, out: []u8) ![]u8 {
+        const len = switch (instruction) {
+            .section_ack => |stream_id| try encodeInteger(stream_id, 7, 0x80, out),
+            .stream_cancel => |stream_id| try encodeInteger(stream_id, 6, 0x40, out),
+            .insert_count_increment => |increment| try encodeInteger(increment, 6, 0x00, out),
+        };
+        return out[0..len];
+    }
+
+    pub fn apply(self: *DecoderStream, bytes: []const u8) !usize {
+        var pos: usize = 0;
+        while (pos < bytes.len) {
+            const first = bytes[pos];
+            if (first & 0x80 != 0) {
+                const stream_id = try decodeInteger(bytes[pos..], 7);
+                _ = stream_id.value;
+                pos += stream_id.len;
+                self.section_acks += 1;
+            } else if (first & 0xc0 == 0x40) {
+                const stream_id = try decodeInteger(bytes[pos..], 6);
+                _ = stream_id.value;
+                pos += stream_id.len;
+                self.stream_cancellations += 1;
+            } else {
+                const inc = try decodeInteger(bytes[pos..], 6);
+                pos += inc.len;
+                self.known_received_count += inc.value;
+            }
+        }
+        return pos;
+    }
+};
 
 // ---------------------------------------------------------------------------
 // Metrics
@@ -537,10 +974,11 @@ test "decoder rejects truncated blocks and malformed Huffman strings without lea
 }
 
 test "static-only mode keeps zero dynamic capacity and no blocked streams" {
-    // These invariants are structural: there is no dynamic table state to grow
-    // and no blocked-stream accounting in this module.
-    try testing.expect(!@hasDecl(@This(), "DynamicTable"));
-    try testing.expect(!@hasDecl(@This(), "BlockedStreams"));
+    // The simple decode API remains the safe static-only fallback: dynamic refs
+    // still fail deterministically unless callers opt into DynamicDecoder.
+    var out: [4]HeaderField = undefined;
+    var scratch: [16]u8 = undefined;
+    try testing.expectError(error.DynamicTableReference, decode(&.{ 0x00, 0x00, 0x80 }, &out, &scratch));
 }
 
 test "metrics count decode failures" {
@@ -550,4 +988,176 @@ test "metrics count decode failures" {
     metrics.recordDecode(decode(&.{ 0x00, 0x00, 0xc0 | 17 }, &out, &scratch)); // ok (:method GET)
     metrics.recordDecode(decode(&.{ 0x00, 0x00, 0x80 }, &out, &scratch)); // dynamic ref -> failure
     try testing.expectEqual(@as(u64, 1), metrics.decode_failures);
+}
+
+test "dynamic table inserts evicts and enforces capacity" {
+    var table = DynamicTable.init(testing.allocator, 96);
+    defer table.deinit();
+
+    const first = try table.insert("a", "one");
+    const second = try table.insert("b", "two");
+    try testing.expectEqual(@as(u64, 1), first);
+    try testing.expectEqual(@as(u64, 2), second);
+    try testing.expectEqual(@as(u64, 2), table.inserted_count);
+    try testing.expectEqualStrings("one", (try table.getAbsolute(first)).value);
+
+    _ = try table.insert("c", "three");
+    try testing.expectError(error.InvalidDynamicIndex, table.getAbsolute(first));
+    try testing.expectEqual(@as(u64, 1), table.metrics.evictions);
+    try testing.expect(table.bytes_used <= table.capacity);
+
+    try testing.expectError(error.EntryTooLarge, table.insert("oversized", "this-value-is-larger-than-the-small-table-capacity-by-a-wide-margin"));
+}
+
+test "dynamic settings initialize table capacity and blocked-stream limit" {
+    var payload: [32]u8 = undefined;
+    const encoded = try http3_frame.encodeSettings(&.{
+        .{ .id = .qpack_max_table_capacity, .id_value = 0x01, .value = 128 },
+        .{ .id = .qpack_blocked_streams, .id_value = 0x07, .value = 2 },
+    }, &payload);
+    var scratch_settings: [4]http3_frame.Setting = undefined;
+    const decoded = try http3_frame.decodeSettings(encoded, &scratch_settings);
+
+    const settings = DynamicSettings.fromHttp3(decoded.parsed);
+    var table = settings.initTable(testing.allocator);
+    defer table.deinit();
+    var decoder = settings.initDecoder(testing.allocator, &table);
+    defer decoder.deinit();
+
+    try testing.expectEqual(@as(u64, 128), table.capacity);
+    try testing.expectEqual(@as(u64, 2), decoder.blocked.max_blocked);
+}
+
+test "encoder stream applies capacity insert and duplicate instructions" {
+    var table = DynamicTable.init(testing.allocator, 128);
+    defer table.deinit();
+
+    var stream: [256]u8 = undefined;
+    var pos: usize = 0;
+    pos += (try EncoderStream.encodeSetCapacity(128, stream[pos..])).len;
+    pos += (try EncoderStream.encodeInsertLiteral("x-test", "one", stream[pos..])).len;
+    pos += (try EncoderStream.encodeDuplicate(0, stream[pos..])).len;
+
+    try testing.expectEqual(pos, try EncoderStream.apply(&table, stream[0..pos]));
+    try testing.expectEqual(@as(u64, 2), table.inserted_count);
+    try testing.expectEqualStrings("one", (try table.getAbsolute(2)).value);
+}
+
+test "encoder stream inserts entries with static and dynamic name references" {
+    var table = DynamicTable.init(testing.allocator, 256);
+    defer table.deinit();
+
+    var stream: [256]u8 = undefined;
+    var pos: usize = 0;
+    pos += (try EncoderStream.encodeInsertNameRefStatic(0, "https", stream[pos..])).len;
+    pos += (try EncoderStream.encodeInsertNameRefDynamic(0, "https-alt", stream[pos..])).len;
+
+    try testing.expectEqual(pos, try EncoderStream.apply(&table, stream[0..pos]));
+    const static_ref = try table.getAbsolute(1);
+    try testing.expectEqualStrings(":authority", static_ref.name);
+    try testing.expectEqualStrings("https", static_ref.value);
+    const dynamic_ref = try table.getAbsolute(2);
+    try testing.expectEqualStrings(":authority", dynamic_ref.name);
+    try testing.expectEqualStrings("https-alt", dynamic_ref.value);
+}
+
+test "dynamic indexed field section decodes once encoder stream arrives" {
+    var table = DynamicTable.init(testing.allocator, 128);
+    defer table.deinit();
+    const absolute = try table.insert("x-dyn", "value");
+
+    var block_buf: [64]u8 = undefined;
+    const block = try encodeDynamicIndexed(&table, absolute, &block_buf);
+    var out: [4]HeaderField = undefined;
+    var scratch: [64]u8 = undefined;
+    var decoder = DynamicDecoder.init(testing.allocator, &table, 4);
+    defer decoder.deinit();
+
+    const result = try decoder.decodeOrBlock(1, block, &out, &scratch);
+    try testing.expectEqual(DynamicDecodeResult{ .decoded = 1 }, result);
+    try testing.expectEqualStrings("x-dyn", out[0].name);
+    try testing.expectEqualStrings("value", out[0].value);
+}
+
+test "dynamic decoder blocks then unblocks delayed encoder instructions" {
+    var table = DynamicTable.init(testing.allocator, 128);
+    defer table.deinit();
+    var decoder = DynamicDecoder.init(testing.allocator, &table, 1);
+    defer decoder.deinit();
+
+    // Required Insert Count 1, Base 1, relative dynamic index 0.
+    const block = [_]u8{ 0x01, 0x00, 0x80 };
+    var out: [4]HeaderField = undefined;
+    var scratch: [64]u8 = undefined;
+    const blocked = try decoder.decodeOrBlock(9, &block, &out, &scratch);
+    try testing.expectEqual(DynamicDecodeResult{ .blocked = 1 }, blocked);
+    try testing.expectEqual(@as(u64, 1), table.metrics.blocked_streams);
+
+    _ = try table.insert("late", "arrived");
+    var unblocked: [4]u64 = undefined;
+    try testing.expectEqual(@as(usize, 1), decoder.blocked.unblockAvailable(table.inserted_count, &unblocked, &table.metrics));
+    try testing.expectEqual(@as(u64, 9), unblocked[0]);
+
+    const decoded = try decoder.decodeOrBlock(9, &block, &out, &scratch);
+    try testing.expectEqual(DynamicDecodeResult{ .decoded = 1 }, decoded);
+    try testing.expectEqualStrings("late", out[0].name);
+    try testing.expectEqualStrings("arrived", out[0].value);
+}
+
+test "dynamic decoder rejects invalid base delta before blocking" {
+    var table = DynamicTable.init(testing.allocator, 128);
+    defer table.deinit();
+    var decoder = DynamicDecoder.init(testing.allocator, &table, 1);
+    defer decoder.deinit();
+
+    // Required Insert Count 1 with a negative base delta larger than RIC.
+    const block = [_]u8{ 0x01, 0x02, 0x80 };
+    var out: [4]HeaderField = undefined;
+    var scratch: [64]u8 = undefined;
+    try testing.expectError(error.InvalidBase, decoder.decodeOrBlock(9, &block, &out, &scratch));
+    try testing.expectEqual(@as(u64, 0), decoder.blocked.streams.count());
+}
+
+test "blocked stream limit and cancellation are enforced" {
+    var table = DynamicTable.init(testing.allocator, 128);
+    defer table.deinit();
+    var decoder = DynamicDecoder.init(testing.allocator, &table, 1);
+    defer decoder.deinit();
+
+    const block = [_]u8{ 0x02, 0x00, 0x80 };
+    var out: [4]HeaderField = undefined;
+    var scratch: [64]u8 = undefined;
+    _ = try decoder.decodeOrBlock(1, &block, &out, &scratch);
+    try testing.expectError(error.BlockedStreamLimitExceeded, decoder.decodeOrBlock(2, &block, &out, &scratch));
+
+    decoder.blocked.cancel(1, &table.metrics);
+    try testing.expectEqual(@as(u64, 1), table.metrics.cancelled_streams);
+    _ = try decoder.decodeOrBlock(2, &block, &out, &scratch);
+}
+
+test "decoder stream instructions update acknowledgement state" {
+    var buf: [32]u8 = undefined;
+    var pos: usize = 0;
+    pos += (try DecoderStream.encode(.{ .section_ack = 11 }, buf[pos..])).len;
+    pos += (try DecoderStream.encode(.{ .stream_cancel = 13 }, buf[pos..])).len;
+    pos += (try DecoderStream.encode(.{ .insert_count_increment = 3 }, buf[pos..])).len;
+
+    var stream = DecoderStream{};
+    try testing.expectEqual(pos, try stream.apply(buf[0..pos]));
+    try testing.expectEqual(@as(u64, 1), stream.section_acks);
+    try testing.expectEqual(@as(u64, 1), stream.stream_cancellations);
+    try testing.expectEqual(@as(u64, 3), stream.known_received_count);
+}
+
+test "dynamic table memory remains bounded under repeated inserts" {
+    var table = DynamicTable.init(testing.allocator, 160);
+    defer table.deinit();
+
+    for (0..20) |i| {
+        var name_buf: [16]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buf, "x-{d}", .{i});
+        _ = try table.insert(name, "payload");
+        try testing.expect(table.bytes_used <= table.capacity);
+    }
+    try testing.expect(table.metrics.evictions > 0);
 }

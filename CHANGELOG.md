@@ -5,6 +5,14 @@ All notable user-facing changes to Tardigrade are documented here.
 ## [Unreleased]
 
 ### Features
+- **Dynamic QPACK table and blocked-stream accounting (#253)** — extends
+  `src/http3/qpack.zig` beyond the static-only fallback with a bounded dynamic
+  table, memory/capacity enforcement, eviction accounting, encoder-stream
+  capacity/insert/duplicate instructions, decoder-stream section
+  ack/cancel/insert-count instructions, dynamic field-section decoding, and
+  explicit blocked-stream tracking/unblocking when Required Insert Count is
+  ahead of received encoder instructions. The existing `encode`/`decode` API
+  remains static-only and still rejects dynamic references deterministically.
 - **Minimal pure Zig HTTP/3 frame and session layer (#246)** — adds the first
   HTTP/3 application-layer implementation in `src/http3/`: ALPN `h3`, the
   DATA/HEADERS/SETTINGS/GOAWAY frame codec, HTTP/3 unidirectional stream-type

@@ -252,6 +252,22 @@ pub fn build(b: *std.Build) void {
     const run_quic_h3_smoke_tests = b.addRunArtifact(quic_h3_smoke_tests);
     quic_step.dependOn(&run_quic_h3_smoke_tests.step);
     test_step.dependOn(&run_quic_h3_smoke_tests.step);
+
+    // Deterministic native QUIC/H3 end-to-end harness (#247): the connection
+    // driver and H3 glue over a simulated network with controlled loss,
+    // reordering, duplication, and delay.
+    const quic_h3_e2e_mod = b.createModule(.{
+        .root_source_file = b.path("tests/quic_h3_e2e.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    quic_h3_e2e_mod.addImport("quic", quic_mod);
+    quic_h3_e2e_mod.addImport("http3", http3_mod);
+    quic_h3_e2e_mod.addImport("stream_transport", stream_transport_mod);
+    const quic_h3_e2e_tests = b.addTest(.{ .root_module = quic_h3_e2e_mod });
+    const run_quic_h3_e2e_tests = b.addRunArtifact(quic_h3_e2e_tests);
+    quic_step.dependOn(&run_quic_h3_e2e_tests.step);
+    test_step.dependOn(&run_quic_h3_e2e_tests.step);
 }
 
 fn pathExists(path: []const u8) bool {

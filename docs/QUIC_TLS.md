@@ -99,6 +99,33 @@ where appropriate, but its `Client` state machine cannot drive a QUIC handshake.
   `valid` / `invalid` / `not_checked`; `not_checked` is accepted at completion
   only when a caller explicitly opts into a local/insecure mode.
 
+## Failure taxonomy and alert mapping
+
+Every handshake failure is a typed `HandshakeError` value so it maps to exactly
+one fatal TLS alert (`src/tls/alerts.zig`, RFC 8446 §6) and, in QUIC mode, one
+`CRYPTO_ERROR` code (`0x0100 + alert`, RFC 9001 §4.8). Two distinct failure
+classes must never collapse into one:
+
+- **`MalformedHandshake` → `decode_error` (CRYPTO_ERROR + 0x32).** The peer's
+  bytes could not be parsed: a bad length, an invalid encoding, an unknown
+  message or field value, a truncated message, or a duplicated extension. The
+  wire data itself is wrong.
+- **`UnexpectedHandshakeMessage` → `unexpected_message` (CRYPTO_ERROR + 0x0a).**
+  A syntactically valid handshake message arrived in the wrong state, for the
+  wrong role, or after the handshake finished — the bytes decode cleanly, but
+  the ordering is illegal (for example a ServerHello where a Certificate was
+  expected, or a second ClientHello once the server has moved on).
+
+These are separate from the QUIC-local encryption-level failures. A CRYPTO
+fragment delivered at a packet-number space a message never uses — 0-RTT, or a
+handshake-flight message at the Initial level — is a `UnexpectedCryptoLevel`
+error (a QUIC seam violation, RFC 9001 §4.1.3), not a TLS ordering error, and it
+never becomes a `decode_error`/`unexpected_message` alert. Other typed cases —
+`AlpnMismatch` → `no_application_protocol`, `CertificateInvalid` →
+`bad_certificate`, and the transport-parameter failures → the QUIC
+`TRANSPORT_PARAMETER_ERROR` code — keep their own mappings. No generic
+catch-all `MalformedHandshake` is returned for a known ordering failure.
+
 ## Follow-ups
 
 - Integrate the driver with the packet layer and connection state machine.

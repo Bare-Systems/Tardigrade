@@ -17,9 +17,17 @@ pub const CertificateState = enum { not_checked, valid, invalid };
 /// Typed, deterministic TLS handshake failures. Transport layers translate
 /// these into their own close/error surfaces without losing the TLS reason.
 pub const HandshakeError = error{
-    /// The peer's TLS handshake bytes were malformed or arrived in an illegal
-    /// order.
+    /// The peer's TLS handshake bytes could not be parsed: bad lengths, invalid
+    /// encoding, unknown message or field values, or otherwise malformed wire
+    /// data. Maps to the `decode_error` alert (RFC 8446 §6).
     MalformedHandshake,
+    /// A syntactically valid handshake message arrived in the wrong state or at
+    /// the wrong epoch — a legal message the peer sent out of order (for
+    /// example a ServerHello where a Certificate was expected, or any handshake
+    /// message once the handshake is finished). Distinct from
+    /// `MalformedHandshake`: the bytes decode fine, the ordering does not. Maps
+    /// to the `unexpected_message` alert (RFC 8446 §6).
+    UnexpectedHandshakeMessage,
     /// ALPN did not negotiate an acceptable application protocol.
     AlpnMismatch,
     /// The peer certificate was rejected by local policy or failed proof of key
@@ -60,4 +68,15 @@ test "shared handshake errors include TLS-level failure cases" {
 
     const err: HandshakeError = error.MalformedHandshake;
     try std.testing.expectEqual(error.MalformedHandshake, err);
+}
+
+test "malformed bytes and out-of-order messages are distinct failure cases" {
+    const std = @import("std");
+
+    // Parse/decode failures and legal-but-misordered messages must be separate
+    // errors so transports can map them to `decode_error` versus
+    // `unexpected_message` respectively.
+    const malformed: HandshakeError = error.MalformedHandshake;
+    const unexpected: HandshakeError = error.UnexpectedHandshakeMessage;
+    try std.testing.expect(malformed != unexpected);
 }

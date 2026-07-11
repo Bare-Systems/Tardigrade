@@ -732,35 +732,42 @@ pub const Tls13Backend = struct {
             return;
         }
 
+        // The message decoded cleanly (valid type, self-consistent length): any
+        // mismatch against the expected next message is an ordering violation,
+        // not malformed bytes, so it maps to `unexpected_message` (RFC 8446 §6),
+        // not `decode_error`.
         switch (self.expect) {
             .client_hello => {
-                if (kind != .client_hello) return error.MalformedHandshake;
+                if (kind != .client_hello) return error.UnexpectedHandshakeMessage;
                 try self.onClientHello(raw, body, sink);
             },
             .server_hello => {
-                if (kind != .server_hello) return error.MalformedHandshake;
+                if (kind != .server_hello) return error.UnexpectedHandshakeMessage;
                 try self.onServerHello(raw, body, sink);
             },
             .encrypted_extensions => {
-                if (kind != .encrypted_extensions) return error.MalformedHandshake;
+                if (kind != .encrypted_extensions) return error.UnexpectedHandshakeMessage;
                 try self.onEncryptedExtensions(raw, body, sink);
             },
             .certificate => {
-                if (kind != .certificate) return error.MalformedHandshake;
+                if (kind != .certificate) return error.UnexpectedHandshakeMessage;
                 try self.onCertificate(raw, body);
             },
             .certificate_verify => {
-                if (kind != .certificate_verify) return error.MalformedHandshake;
+                if (kind != .certificate_verify) return error.UnexpectedHandshakeMessage;
                 try self.onCertificateVerify(raw, body, sink);
             },
             .finished => {
-                if (kind != .finished) return error.MalformedHandshake;
+                if (kind != .finished) return error.UnexpectedHandshakeMessage;
                 switch (self.role) {
                     .client => try self.onServerFinished(raw, body, sink),
                     .server => try self.onClientFinished(raw, body, sink),
                 }
             },
-            .start, .done => return error.MalformedHandshake,
+            // No handshake message is legal before `start` or after `done`
+            // (post-handshake NewSessionTicket is handled above), so any message
+            // here is unexpected rather than malformed.
+            .start, .done => return error.UnexpectedHandshakeMessage,
         }
     }
 
@@ -1798,6 +1805,28 @@ test "a ClientHello delivered at the Handshake level is a level error" {
     const ch = (try h.client.pollOutput(.initial, &buf)).?;
     try testing.expectError(error.UnexpectedCryptoLevel, h.server.onCrypto(.handshake, ch.offset, ch.bytes));
     try testing.expect(!h.server.isComplete());
+}
+
+test "a well-formed but out-of-order handshake message is an unexpected_message error" {
+    // A server armed for a ClientHello that instead receives a well-formed
+    // Finished at its correct (Handshake) level: the bytes decode fine, but the
+    // message is illegal in this state. That is `unexpected_message`
+    // (CRYPTO_ERROR + 10), not the `decode_error` reserved for malformed bytes.
+    var server = Harness.init();
+    try server.wire();
+    const finished = [_]u8{ @intFromEnum(MessageType.finished), 0, 0, 0 };
+    try testing.expectError(error.UnexpectedHandshakeMessage, server.server.onCrypto(.handshake, 0, &finished));
+    try testing.expect(!server.server.isComplete());
+    try testing.expectEqual(@as(?HandshakeError, error.UnexpectedHandshakeMessage), server.server.failure());
+
+    // Mirror on the client: after ClientHello it awaits a ServerHello; a
+    // well-formed ClientHello arriving at the Initial level is out of order.
+    var client = Harness.init();
+    try client.wire();
+    try client.client.start(defaultParams());
+    const client_hello = [_]u8{ @intFromEnum(MessageType.client_hello), 0, 0, 0 };
+    try testing.expectError(error.UnexpectedHandshakeMessage, client.client.onCrypto(.initial, 0, &client_hello));
+    try testing.expect(!client.client.isComplete());
 }
 
 test "a ClientHello without transport parameters fails the server at completion" {

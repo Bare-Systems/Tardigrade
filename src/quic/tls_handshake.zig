@@ -339,7 +339,9 @@ pub const TestTlsBackend = struct {
                 try sink.emitHandshakeComplete();
                 return;
             },
-            else => return error.MalformedHandshake,
+            // A well-formed server-flight message (ServerHello, etc.) that only
+            // a client should receive: legal bytes, wrong role/state.
+            else => return error.UnexpectedHandshakeMessage,
         }
 
         // The client's transport parameters ride in the ClientHello.
@@ -386,7 +388,8 @@ pub const TestTlsBackend = struct {
                 try sink.emitDiscardKeys(.handshake);
                 try sink.emitHandshakeComplete();
             },
-            .client_hello => return error.MalformedHandshake,
+            // A ClientHello is well-formed but only a server may receive one.
+            .client_hello => return error.UnexpectedHandshakeMessage,
         }
     }
 
@@ -807,6 +810,20 @@ test "server Handshake-flight bytes delivered at the Initial level are rejected"
     var flight_buf: [2048]u8 = undefined;
     const flight = (try h.server.pollOutput(.handshake, &flight_buf)).?;
     try testing.expectError(error.UnexpectedCryptoLevel, h.client.onCrypto(.initial, flight.offset, flight.bytes));
+}
+
+test "a well-formed message for the wrong role is an unexpected_message error" {
+    // A server that receives a well-formed ServerHello (a message only a client
+    // consumes): the bytes decode, but the message is illegal for this role.
+    // That is `unexpected_message`, distinct from the `decode_error` reserved
+    // for malformed bytes.
+    var h = Harness{};
+    try h.wire();
+    // ServerHello (type 2) with a zero-length ALPN payload: valid framing.
+    const server_hello = [_]u8{ 2, 0, 1, 0 };
+    try testing.expectError(error.UnexpectedHandshakeMessage, h.server.onCrypto(.initial, 0, &server_hello));
+    try testing.expectEqual(@as(?HandshakeError, error.UnexpectedHandshakeMessage), h.server.failure());
+    try testing.expect(!h.server.isComplete());
 }
 
 test "a 0-RTT CRYPTO fragment is rejected while 0-RTT is disabled" {

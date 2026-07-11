@@ -1221,6 +1221,7 @@ pub const Connection = struct {
             error.AlpnMismatch => error_crypto_base + 120, // no_application_protocol
             error.CertificateInvalid => error_crypto_base + 42, // bad_certificate
             error.MissingTransportParameters, error.InvalidTransportParameters => error_transport_parameter,
+            error.UnexpectedHandshakeMessage => error_crypto_base + 10, // unexpected_message
             error.MalformedHandshake => error_crypto_base + 50, // decode_error
             else => error_crypto_base + 80, // internal_error
         };
@@ -2250,6 +2251,16 @@ test "driver: timers are armed while handshaking" {
     var buf: [2048]u8 = undefined;
     _ = pair.client.pollTransmit(&buf, pair.now_us);
     try testing.expect(pair.client.nextTimeoutUs() != null);
+}
+
+test "handshake failures map to their RFC 9001 CRYPTO_ERROR alert codes" {
+    // RFC 9001 §4.8: a TLS alert is carried as CRYPTO_ERROR (0x0100 + alert).
+    // Ordering failures and malformed bytes are distinct alerts and must not
+    // collapse to the same code.
+    try testing.expectEqual(error_crypto_base + 10, Connection.cryptoErrorCode(error.UnexpectedHandshakeMessage));
+    try testing.expectEqual(error_crypto_base + 50, Connection.cryptoErrorCode(error.MalformedHandshake));
+    try testing.expectEqual(error_crypto_base + 120, Connection.cryptoErrorCode(error.AlpnMismatch));
+    try testing.expectEqual(error_crypto_base + 42, Connection.cryptoErrorCode(error.CertificateInvalid));
 }
 
 test {

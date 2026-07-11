@@ -58,6 +58,16 @@ pub const Config = struct {
     request_handler_ctx: ?*anyopaque = null,
 };
 
+/// Half-open admission limits (#328 review). The native stack does not send
+/// Retry, so an off-path spoofer can forge Initial packets. Rather than
+/// implement address validation now, we bound the state a spoofer can pin: a
+/// global connection cap, a per-source-IP cap, immediate teardown of an Initial
+/// that authenticates nothing, and a handshake deadline well under the idle
+/// timeout so half-open connections are reaped promptly.
+const max_connections: usize = 1024;
+const max_connections_per_source: u32 = 32;
+const handshake_timeout_us: u64 = 10 * std.time.us_per_s;
+
 pub const Snapshot = struct {
     quic_port: u16 = 0,
     server_bootstrapped: bool = false,
@@ -92,8 +102,15 @@ const ConnEntry = struct {
     conn: *Connection,
     h3: H3,
     h3_started: bool = false,
+    /// Source address of the Initial that opened the connection. Fixed for the
+    /// connection's lifetime: migration is unsupported (the native stack
+    /// advertises `disable_active_migration`), so replies always target this
+    /// address regardless of later packet sources.
     peer: std.c.sockaddr.in,
     cid_len: usize,
+    /// Monotonic microseconds when the connection was accepted; used to reap
+    /// connections that never complete the handshake.
+    accepted_at_us: u64,
 
     fn deinit(self: *ConnEntry, allocator: std.mem.Allocator) void {
         self.h3.deinit();
@@ -111,6 +128,7 @@ pub const Runtime = struct {
     request_handler: ?RequestHandler,
     request_handler_ctx: ?*anyopaque,
     identity: ?quic.tls_backend.Identity,
+    quic_config: quic.config.Config,
     cert_der: []u8,
     key_der: []u8,
     snapshot_mutex: compat.Mutex = .{},
@@ -143,6 +161,7 @@ pub const Runtime = struct {
             .request_handler = cfg.request_handler,
             .request_handler_ctx = cfg.request_handler_ctx,
             .identity = null,
+            .quic_config = quicConfigFrom(cfg),
             .cert_der = &.{},
             .key_der = &.{},
             .snapshot_state = .{ .quic_port = cfg.quic_port },
@@ -151,6 +170,12 @@ pub const Runtime = struct {
 
         if (cfg.enable_0rtt) {
             logger.warn(null, "http3: 0-RTT is not supported by the native QUIC stack; continuing without it", .{});
+        }
+        if (cfg.connection_migration) {
+            logger.warn(null, "http3: connection migration is not supported by the native QUIC stack; disable_active_migration stays advertised", .{});
+        }
+        if (!std.mem.eql(u8, cfg.tls_min_version, "1.3") or !std.mem.eql(u8, cfg.tls_max_version, "1.3")) {
+            logger.warn(null, "http3: native QUIC requires TLS 1.3; ignoring tls_min_version={s}/tls_max_version={s}", .{ cfg.tls_min_version, cfg.tls_max_version });
         }
         if (cfg.tls_cert_path.len > 0 and cfg.tls_key_path.len > 0) {
             runtime.loadIdentity(cfg.tls_cert_path, cfg.tls_key_path) catch |err| {
@@ -214,6 +239,8 @@ pub const Runtime = struct {
         const allocator = self.allocator;
         var connections = std.AutoHashMap(u64, *ConnEntry).init(allocator);
         var routes = quic.cid.CidRoutingTable.init(allocator);
+        // Half-open admission accounting, keyed on the source IPv4 address.
+        var per_ip = std.AutoHashMap(u32, u32).init(allocator);
         var next_handle: u64 = 1;
         defer {
             var it = connections.valueIterator();
@@ -223,6 +250,7 @@ pub const Runtime = struct {
             }
             connections.deinit();
             routes.deinit();
+            per_ip.deinit();
         }
 
         while (!self.stopping.load(.acquire) and !shutdown.isShutdownRequested()) {
@@ -245,7 +273,10 @@ pub const Runtime = struct {
                     while (entry.conn.pollTransmit(&out, now)) |datagram| {
                         self.sendDatagram(entry.peer, datagram);
                     }
-                    if (entry.conn.state() == .closed) {
+                    // Reap closed connections and half-open connections that
+                    // blew the handshake deadline (spoofed/stalled Initials).
+                    const stalled = !entry.conn.isEstablished() and now -| entry.accepted_at_us > handshake_timeout_us;
+                    if (entry.conn.state() == .closed or stalled) {
                         if (reap_count < reap.len) {
                             reap[reap_count] = kv.key_ptr.*;
                             reap_count += 1;
@@ -255,12 +286,7 @@ pub const Runtime = struct {
                     if (entry.conn.nextTimeoutUs()) |deadline| wake_us = @min(wake_us, deadline);
                 }
                 for (reap[0..reap_count]) |handle| {
-                    if (connections.fetchRemove(handle)) |kv| {
-                        routes.remove(quic.cid.ConnectionId.init(kv.value.conn.localCid()) catch unreachable);
-                        kv.value.deinit(allocator);
-                        allocator.destroy(kv.value);
-                        self.noteConnectionClosed();
-                    }
+                    self.removeConnection(&connections, &routes, &per_ip, handle);
                 }
             }
 
@@ -287,7 +313,7 @@ pub const Runtime = struct {
                 const datagram = buf[0..@intCast(n)];
                 if (from.family != posix.AF.INET) continue;
                 const peer: *const std.c.sockaddr.in = @ptrCast(&from);
-                self.ingest(&connections, &routes, &next_handle, datagram, peer.*, nowUs());
+                self.ingest(&connections, &routes, &per_ip, &next_handle, datagram, peer.*, nowUs());
             }
         }
     }
@@ -296,6 +322,7 @@ pub const Runtime = struct {
         self: *Runtime,
         connections: *std.AutoHashMap(u64, *ConnEntry),
         routes: *quic.cid.CidRoutingTable,
+        per_ip: *std.AutoHashMap(u32, u32),
         next_handle: *u64,
         datagram: []const u8,
         peer: std.c.sockaddr.in,
@@ -307,11 +334,13 @@ pub const Runtime = struct {
         // need the connection's own CID length, which the client chose per
         // connection — try each active length.
         var handle: ?u64 = null;
+        var freshly_accepted = false;
         if (datagram.len > 0 and datagram[0] & 0x80 != 0) {
             if (quic.packet.parsePacket(datagram, 0)) |parsed| {
                 handle = routes.lookup(parsed.dcid);
                 if (handle == null and parsed.kind == .initial) {
-                    handle = self.accept(connections, routes, next_handle, parsed, peer, now);
+                    handle = self.accept(connections, routes, per_ip, next_handle, parsed, peer, now);
+                    freshly_accepted = handle != null;
                 }
                 if (parsed.kind == .zero_rtt) self.noteZeroRtt();
             } else |_| {
@@ -332,8 +361,32 @@ pub const Runtime = struct {
         const entry = connections.get(found) orelse return;
 
         const was_established = entry.conn.isEstablished();
-        entry.peer = peer; // reply to the packet's source (NAT rebinding)
-        entry.conn.ingest(datagram, now) catch return;
+        // `packets_received` only advances after AEAD open succeeds, so its
+        // delta tells us whether this datagram authenticated — without trusting
+        // its source address.
+        const packets_before = entry.conn.metrics.packets_received;
+        entry.conn.ingest(datagram, now) catch {
+            if (freshly_accepted) self.removeConnection(connections, routes, per_ip, found);
+            return;
+        };
+        const authenticated = entry.conn.metrics.packets_received > packets_before;
+
+        // A just-accepted connection whose first datagram authenticates nothing
+        // is an unsolicited or spoofed Initial: drop the half-open state now
+        // instead of holding it until the handshake deadline.
+        if (freshly_accepted and !authenticated) {
+            self.removeConnection(connections, routes, per_ip, found);
+            return;
+        }
+
+        // An authenticated packet from a source other than the one that opened
+        // the connection is a migration attempt. The native stack does not
+        // rebind (disable_active_migration is advertised), so record it and
+        // keep replying on the original path rather than following the source.
+        if (authenticated and !freshly_accepted and !sockaddrInEqual(peer, entry.peer)) {
+            self.noteMigrationEvent();
+        }
+
         if (!was_established and entry.conn.isEstablished()) {
             self.noteHandshakeComplete();
         }
@@ -352,6 +405,7 @@ pub const Runtime = struct {
         self: *Runtime,
         connections: *std.AutoHashMap(u64, *ConnEntry),
         routes: *quic.cid.CidRoutingTable,
+        per_ip: *std.AutoHashMap(u32, u32),
         next_handle: *u64,
         parsed: quic.packet.ParsedPacket,
         peer: std.c.sockaddr.in,
@@ -360,6 +414,9 @@ pub const Runtime = struct {
         const identity = self.identity orelse return null;
         if (parsed.version != quic.packet.quic_v1) return null;
         if (parsed.dcid.len < 8 or parsed.scid.len == 0) return null;
+        // Bound half-open state before allocating anything for this Initial.
+        if (connections.count() >= max_connections) return null;
+        if ((per_ip.get(peer.addr) orelse 0) >= max_connections_per_source) return null;
         const allocator = self.allocator;
 
         const backend = allocator.create(quic.tls_backend.Tls13Backend) catch return null;
@@ -370,6 +427,7 @@ pub const Runtime = struct {
 
         const conn = Connection.init(allocator, .{
             .role = .server,
+            .config = self.quic_config,
             .local_cid = parsed.dcid,
             .original_dcid = parsed.dcid,
             .peer_cid = parsed.scid,
@@ -391,6 +449,7 @@ pub const Runtime = struct {
             .h3 = H3.init(allocator, .server),
             .peer = peer,
             .cid_len = parsed.dcid.len,
+            .accepted_at_us = now,
         };
 
         const handle = next_handle.*;
@@ -411,8 +470,33 @@ pub const Runtime = struct {
             allocator.destroy(entry);
             return null;
         };
+        incPerIp(per_ip, peer.addr) catch {
+            _ = connections.remove(handle);
+            routes.remove(cid);
+            entry.deinit(allocator);
+            allocator.destroy(entry);
+            return null;
+        };
         self.noteConnectionAccepted();
         return handle;
+    }
+
+    /// Remove a tracked connection: drop its CID route, release its per-source
+    /// admission slot, and free its state. Safe to call with a stale handle.
+    fn removeConnection(
+        self: *Runtime,
+        connections: *std.AutoHashMap(u64, *ConnEntry),
+        routes: *quic.cid.CidRoutingTable,
+        per_ip: *std.AutoHashMap(u32, u32),
+        handle: u64,
+    ) void {
+        if (connections.fetchRemove(handle)) |kv| {
+            routes.remove(quic.cid.ConnectionId.init(kv.value.conn.localCid()) catch unreachable);
+            decPerIp(per_ip, kv.value.peer.addr);
+            kv.value.deinit(self.allocator);
+            self.allocator.destroy(kv.value);
+            self.noteConnectionClosed();
+        }
     }
 
     fn pumpH3(self: *Runtime, entry: *ConnEntry, now: u64) void {
@@ -517,6 +601,12 @@ pub const Runtime = struct {
         self.snapshot_state.requests_completed += 1;
     }
 
+    fn noteMigrationEvent(self: *Runtime) void {
+        self.snapshot_mutex.lock();
+        defer self.snapshot_mutex.unlock();
+        self.snapshot_state.migration_events += 1;
+    }
+
     fn noteDatagram(self: *Runtime, len: usize) void {
         self.snapshot_mutex.lock();
         defer self.snapshot_mutex.unlock();
@@ -561,6 +651,33 @@ fn buildStreamRequest(allocator: std.mem.Allocator, exchange: stream_transport.E
         else => {},
     }
     return assembler.finish();
+}
+
+/// Map the operator-facing runtime config onto the native QUIC transport
+/// config. Only `max_datagram_size` is honored today (clamped to the range the
+/// 2048-byte work buffers can carry); the remaining transport knobs keep their
+/// conservative defaults, including `migration_policy = .disabled`.
+fn quicConfigFrom(cfg: Config) quic.config.Config {
+    return .{
+        .max_udp_payload_size = std.math.clamp(cfg.max_datagram_size, 1200, 2048),
+    };
+}
+
+fn sockaddrInEqual(a: std.c.sockaddr.in, b: std.c.sockaddr.in) bool {
+    return a.addr == b.addr and a.port == b.port;
+}
+
+fn incPerIp(per_ip: *std.AutoHashMap(u32, u32), addr: u32) !void {
+    const gop = try per_ip.getOrPut(addr);
+    if (!gop.found_existing) gop.value_ptr.* = 0;
+    gop.value_ptr.* += 1;
+}
+
+fn decPerIp(per_ip: *std.AutoHashMap(u32, u32), addr: u32) void {
+    if (per_ip.getPtr(addr)) |count| {
+        count.* -= 1;
+        if (count.* == 0) _ = per_ip.remove(addr);
+    }
 }
 
 fn readSmallFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
@@ -637,6 +754,39 @@ test "stream request bridge maps exchange fields and Host" {
     try testing.expectEqualStrings("example.com", request.headers.get("Host").?);
     try testing.expectEqualStrings("application/json", request.headers.get("content-type").?);
     try testing.expectEqualStrings("{}", request.body);
+}
+
+test "quicConfigFrom clamps datagram size into the work-buffer range" {
+    // Below the QUIC minimum snaps up to 1200.
+    try testing.expectEqual(@as(u64, 1200), quicConfigFrom(.{
+        .listen_host = "::",
+        .quic_port = 443,
+        .max_datagram_size = 512,
+    }).max_udp_payload_size);
+    // Above the 2048-byte work buffer snaps down.
+    try testing.expectEqual(@as(u64, 2048), quicConfigFrom(.{
+        .listen_host = "::",
+        .quic_port = 443,
+        .max_datagram_size = 9000,
+    }).max_udp_payload_size);
+    // An in-range value passes through, and migration stays disabled.
+    const mid = quicConfigFrom(.{ .listen_host = "::", .quic_port = 443, .max_datagram_size = 1350 });
+    try testing.expectEqual(@as(u64, 1350), mid.max_udp_payload_size);
+    try testing.expectEqual(quic.config.MigrationPolicy.disabled, mid.migration_policy);
+}
+
+test "per-source admission counter increments and prunes to empty" {
+    var per_ip = std.AutoHashMap(u32, u32).init(testing.allocator);
+    defer per_ip.deinit();
+    try incPerIp(&per_ip, 0x0100007f);
+    try incPerIp(&per_ip, 0x0100007f);
+    try testing.expectEqual(@as(u32, 2), per_ip.get(0x0100007f).?);
+    decPerIp(&per_ip, 0x0100007f);
+    try testing.expectEqual(@as(u32, 1), per_ip.get(0x0100007f).?);
+    decPerIp(&per_ip, 0x0100007f);
+    try testing.expect(per_ip.get(0x0100007f) == null);
+    // Decrementing an unknown address is a no-op, not a crash.
+    decPerIp(&per_ip, 0xdeadbeef);
 }
 
 test {

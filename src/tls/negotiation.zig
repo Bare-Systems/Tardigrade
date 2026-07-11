@@ -16,9 +16,10 @@ pub const Error = messages.Error || error{
     NoMutualSignatureScheme,
     NoMutualAlpn,
     MissingServerName,
+    OfferVectorTooLarge,
 };
 
-pub const max_offers = 16;
+pub const max_offers = 64;
 
 pub const KeyShareOffer = struct {
     group: algorithms.NamedGroup,
@@ -41,37 +42,37 @@ pub const ClientHelloOffers = struct {
     server_name: ?[]const u8 = null,
 
     fn appendVersion(self: *ClientHelloOffers, value: algorithms.ProtocolVersion) Error!void {
-        if (self.versions_len == self.versions.len) return error.MalformedExtension;
+        if (self.versions_len == self.versions.len) return error.OfferVectorTooLarge;
         self.versions[self.versions_len] = value;
         self.versions_len += 1;
     }
 
     fn appendCipherSuite(self: *ClientHelloOffers, value: algorithms.CipherSuite) Error!void {
-        if (self.cipher_suites_len == self.cipher_suites.len) return error.MalformedExtension;
+        if (self.cipher_suites_len == self.cipher_suites.len) return error.OfferVectorTooLarge;
         self.cipher_suites[self.cipher_suites_len] = value;
         self.cipher_suites_len += 1;
     }
 
     fn appendSupportedGroup(self: *ClientHelloOffers, value: algorithms.NamedGroup) Error!void {
-        if (self.supported_groups_len == self.supported_groups.len) return error.MalformedExtension;
+        if (self.supported_groups_len == self.supported_groups.len) return error.OfferVectorTooLarge;
         self.supported_groups[self.supported_groups_len] = value;
         self.supported_groups_len += 1;
     }
 
     fn appendKeyShare(self: *ClientHelloOffers, value: KeyShareOffer) Error!void {
-        if (self.key_shares_len == self.key_shares.len) return error.MalformedExtension;
+        if (self.key_shares_len == self.key_shares.len) return error.OfferVectorTooLarge;
         self.key_shares[self.key_shares_len] = value;
         self.key_shares_len += 1;
     }
 
     fn appendSignatureScheme(self: *ClientHelloOffers, value: algorithms.SignatureScheme) Error!void {
-        if (self.signature_schemes_len == self.signature_schemes.len) return error.MalformedExtension;
+        if (self.signature_schemes_len == self.signature_schemes.len) return error.OfferVectorTooLarge;
         self.signature_schemes[self.signature_schemes_len] = value;
         self.signature_schemes_len += 1;
     }
 
     fn appendAlpn(self: *ClientHelloOffers, value: algorithms.ProtocolName) Error!void {
-        if (self.alpn_protocols_len == self.alpn_protocols.len) return error.MalformedExtension;
+        if (self.alpn_protocols_len == self.alpn_protocols.len) return error.OfferVectorTooLarge;
         self.alpn_protocols[self.alpn_protocols_len] = value;
         self.alpn_protocols_len += 1;
     }
@@ -318,6 +319,23 @@ test "configured provider capabilities change negotiated tuples" {
     try testing.expectEqual(algorithms.CipherSuite.tls_chacha20_poly1305_sha256, selected.cipher_suite);
 }
 
+test "identity-constrained policy selects the active certificate signature scheme" {
+    const alpns = [_]algorithms.ProtocolName{algorithms.alpn.h3};
+    const p256_policy = try policy_mod.Policy.fromIdentity(.quic, .{}, &alpns, .ecdsa_secp256r1);
+
+    var offers = ClientHelloOffers{};
+    try offers.appendVersion(.tls13);
+    try offers.appendCipherSuite(.tls_aes_128_gcm_sha256);
+    try offers.appendSupportedGroup(.x25519);
+    try offers.appendKeyShare(.{ .group = .x25519, .key_exchange = "share" });
+    try offers.appendSignatureScheme(.ed25519);
+    try offers.appendSignatureScheme(.ecdsa_secp256r1_sha256);
+    try offers.appendAlpn(algorithms.alpn.h3);
+
+    const selected = try negotiateServer(p256_policy, &offers);
+    try testing.expectEqual(algorithms.SignatureScheme.ecdsa_secp256r1_sha256, selected.signature_scheme);
+}
+
 test "ClientHello parser feeds policy negotiation with ALPN and SNI offers" {
     var body: [256]u8 = undefined;
     var w = messages.Writer{ .buf = &body };
@@ -381,6 +399,16 @@ test "ClientHello parser feeds policy negotiation with ALPN and SNI offers" {
     try testing.expect(selected.alpn.eql(algorithms.alpn.h2));
     try testing.expectEqualStrings("example.test", selected.server_name.?);
     try testing.expectEqualStrings("share", selected.key_share);
+}
+
+test "recognized offer vectors allow general-purpose client sizes" {
+    var offers = ClientHelloOffers{};
+    try offers.appendVersion(.tls13);
+    for (0..max_offers) |_| {
+        try offers.appendSignatureScheme(.rsa_pkcs1_sha256);
+    }
+    try testing.expectEqual(@as(usize, max_offers), offers.signature_schemes_len);
+    try testing.expectError(error.OfferVectorTooLarge, offers.appendSignatureScheme(.ed25519));
 }
 
 test "negotiation reports no-overlap failures without logging offer contents" {

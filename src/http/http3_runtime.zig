@@ -370,21 +370,20 @@ pub const Runtime = struct {
             return;
         };
         const authenticated = entry.conn.metrics.packets_received > packets_before;
-
-        // A just-accepted connection whose first datagram authenticates nothing
-        // is an unsolicited or spoofed Initial: drop the half-open state now
-        // instead of holding it until the handshake deadline.
-        if (freshly_accepted and !authenticated) {
-            self.removeConnection(connections, routes, per_ip, found);
-            return;
-        }
-
-        // An authenticated packet from a source other than the one that opened
-        // the connection is a migration attempt. The native stack does not
-        // rebind (disable_active_migration is advertised), so record it and
-        // keep replying on the original path rather than following the source.
-        if (authenticated and !freshly_accepted and !sockaddrInEqual(peer, entry.peer)) {
-            self.noteMigrationEvent();
+        switch (classifyIngest(freshly_accepted, authenticated, !sockaddrInEqual(peer, entry.peer))) {
+            // A just-accepted connection whose first datagram authenticates
+            // nothing is an unsolicited or spoofed Initial: drop the half-open
+            // state now instead of holding it until the handshake deadline.
+            .drop_unauthenticated => {
+                self.removeConnection(connections, routes, per_ip, found);
+                return;
+            },
+            // An authenticated packet from a source other than the one that
+            // opened the connection is a migration attempt. The native stack
+            // does not rebind (disable_active_migration is advertised), so
+            // record it and keep replying on the original path.
+            .migrated => self.noteMigrationEvent(),
+            .keep => {},
         }
 
         if (!was_established and entry.conn.isEstablished()) {
@@ -415,8 +414,7 @@ pub const Runtime = struct {
         if (parsed.version != quic.packet.quic_v1) return null;
         if (parsed.dcid.len < 8 or parsed.scid.len == 0) return null;
         // Bound half-open state before allocating anything for this Initial.
-        if (connections.count() >= max_connections) return null;
-        if ((per_ip.get(peer.addr) orelse 0) >= max_connections_per_source) return null;
+        if (!admissionAllowed(connections.count(), per_ip.get(peer.addr) orelse 0)) return null;
         const allocator = self.allocator;
 
         const backend = allocator.create(quic.tls_backend.Tls13Backend) catch return null;
@@ -667,6 +665,34 @@ fn sockaddrInEqual(a: std.c.sockaddr.in, b: std.c.sockaddr.in) bool {
     return a.addr == b.addr and a.port == b.port;
 }
 
+/// Whether a new half-open connection may be admitted given the current global
+/// and per-source connection counts. Bounds the state an off-path spoofer can
+/// pin with forged Initials (the native stack sends no Retry).
+fn admissionAllowed(total: usize, per_source: u32) bool {
+    return total < max_connections and per_source < max_connections_per_source;
+}
+
+/// What to do with a tracked connection after ingesting a datagram, decided
+/// purely from whether the datagram authenticated (the post-AEAD
+/// `packets_received` delta), whether the connection was just accepted for this
+/// datagram, and whether the source address differs from the connection's.
+const IngestOutcome = enum {
+    /// Process normally (transmit, pump H3).
+    keep,
+    /// A freshly accepted connection whose first datagram authenticated
+    /// nothing — an unsolicited or spoofed Initial. Tear it down.
+    drop_unauthenticated,
+    /// An authenticated packet arrived from a new source. Record the migration
+    /// event; the runtime does not follow it.
+    migrated,
+};
+
+fn classifyIngest(freshly_accepted: bool, authenticated: bool, source_changed: bool) IngestOutcome {
+    if (freshly_accepted and !authenticated) return .drop_unauthenticated;
+    if (authenticated and !freshly_accepted and source_changed) return .migrated;
+    return .keep;
+}
+
 fn incPerIp(per_ip: *std.AutoHashMap(u32, u32), addr: u32) !void {
     const gop = try per_ip.getOrPut(addr);
     if (!gop.found_existing) gop.value_ptr.* = 0;
@@ -773,6 +799,44 @@ test "quicConfigFrom clamps datagram size into the work-buffer range" {
     const mid = quicConfigFrom(.{ .listen_host = "::", .quic_port = 443, .max_datagram_size = 1350 });
     try testing.expectEqual(@as(u64, 1350), mid.max_udp_payload_size);
     try testing.expectEqual(quic.config.MigrationPolicy.disabled, mid.migration_policy);
+}
+
+test "admissionAllowed enforces global and per-source caps at the boundary" {
+    // Under both caps: admitted.
+    try testing.expect(admissionAllowed(0, 0));
+    try testing.expect(admissionAllowed(max_connections - 1, max_connections_per_source - 1));
+    // At the global cap: rejected regardless of per-source count.
+    try testing.expect(!admissionAllowed(max_connections, 0));
+    try testing.expect(!admissionAllowed(max_connections + 1, 0));
+    // At the per-source cap: rejected regardless of global room.
+    try testing.expect(!admissionAllowed(0, max_connections_per_source));
+    try testing.expect(!admissionAllowed(0, max_connections_per_source + 1));
+    // Either cap alone is sufficient to reject.
+    try testing.expect(!admissionAllowed(max_connections, max_connections_per_source));
+}
+
+test "classifyIngest routes spoofed Initials, migration, and normal traffic" {
+    // Freshly accepted + first datagram authenticates nothing -> spoofed
+    // Initial, torn down. The source-changed flag never overrides this: a
+    // freshly accepted entry's peer is exactly the datagram's source.
+    try testing.expectEqual(IngestOutcome.drop_unauthenticated, classifyIngest(true, false, false));
+    try testing.expectEqual(IngestOutcome.drop_unauthenticated, classifyIngest(true, false, true));
+
+    // Freshly accepted + authenticated (a legitimate Initial) -> keep and let
+    // the handshake proceed.
+    try testing.expectEqual(IngestOutcome.keep, classifyIngest(true, true, false));
+
+    // Established connection, authenticated packet from a new source -> counted
+    // as a migration attempt, not followed.
+    try testing.expectEqual(IngestOutcome.migrated, classifyIngest(false, true, true));
+
+    // Authenticated packet from the same source -> ordinary traffic.
+    try testing.expectEqual(IngestOutcome.keep, classifyIngest(false, true, false));
+
+    // Unauthenticated packet from a new source on an existing connection is
+    // ignored (never promoted to a migration event): the source is untrusted.
+    try testing.expectEqual(IngestOutcome.keep, classifyIngest(false, false, true));
+    try testing.expectEqual(IngestOutcome.keep, classifyIngest(false, false, false));
 }
 
 test "per-source admission counter increments and prunes to empty" {

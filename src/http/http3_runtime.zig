@@ -141,7 +141,7 @@ pub const Runtime = struct {
             return error.BindFailed;
         };
         const sa_family = @as(*const std.c.sockaddr, @ptrCast(&address.storage)).family;
-        const fd = std.c.socket(@intCast(sa_family), posix.SOCK.DGRAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK, posix.IPPROTO.UDP);
+        const fd = openUdpSocket(sa_family);
         if (fd < 0) return error.BindFailed;
         errdefer _ = std.c.close(fd);
 
@@ -704,6 +704,21 @@ fn decPerIp(per_ip: *std.AutoHashMap(u32, u32), addr: u32) void {
         count.* -= 1;
         if (count.* == 0) _ = per_ip.remove(addr);
     }
+}
+
+/// Create a non-blocking, close-on-exec UDP socket for `sa_family`. Returns a
+/// negative fd on failure (caller inspects `errno`). macOS/BSD reject
+/// `SOCK_CLOEXEC`/`SOCK_NONBLOCK` in the socket `type` argument (EPROTOTYPE),
+/// unlike Linux, so the flags are applied with `fcntl` after creation to keep
+/// the listener working on both platforms.
+fn openUdpSocket(sa_family: u32) std.c.fd_t {
+    const fd = std.c.socket(@intCast(sa_family), posix.SOCK.DGRAM, posix.IPPROTO.UDP);
+    if (fd < 0) return fd;
+    const descriptor_flags = std.c.fcntl(fd, std.c.F.GETFD, @as(c_int, 0));
+    if (descriptor_flags >= 0) _ = std.c.fcntl(fd, std.c.F.SETFD, descriptor_flags | std.c.FD_CLOEXEC);
+    const status_flags = std.c.fcntl(fd, std.c.F.GETFL, @as(c_int, 0));
+    if (status_flags >= 0) _ = std.c.fcntl(fd, std.c.F.SETFL, status_flags | @as(c_int, @bitCast(posix.O{ .NONBLOCK = true })));
+    return fd;
 }
 
 fn readSmallFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {

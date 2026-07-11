@@ -129,13 +129,15 @@ const UdpSocket = struct {
     fd: std.c.fd_t,
 
     fn open(bind_port: u16) !UdpSocket {
-        const fd = std.c.socket(
-            posix.AF.INET,
-            posix.SOCK.DGRAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK,
-            posix.IPPROTO.UDP,
-        );
+        // macOS/BSD reject SOCK_CLOEXEC/SOCK_NONBLOCK in the socket type
+        // (EPROTOTYPE); apply them via fcntl after creation instead.
+        const fd = std.c.socket(posix.AF.INET, posix.SOCK.DGRAM, posix.IPPROTO.UDP);
         if (fd < 0) return error.SocketFailed;
         errdefer _ = std.c.close(fd);
+        const descriptor_flags = std.c.fcntl(fd, std.c.F.GETFD, @as(c_int, 0));
+        if (descriptor_flags >= 0) _ = std.c.fcntl(fd, std.c.F.SETFD, descriptor_flags | std.c.FD_CLOEXEC);
+        const status_flags = std.c.fcntl(fd, std.c.F.GETFL, @as(c_int, 0));
+        if (status_flags >= 0) _ = std.c.fcntl(fd, std.c.F.SETFL, status_flags | @as(c_int, @bitCast(posix.O{ .NONBLOCK = true })));
         var bind_addr = std.c.sockaddr.in{
             .family = posix.AF.INET,
             .port = std.mem.nativeToBig(u16, bind_port),

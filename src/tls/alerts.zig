@@ -31,6 +31,8 @@ pub const AlertDescription = enum(u8) {
 pub fn fromHandshakeError(err: events.HandshakeError) AlertDescription {
     return switch (err) {
         error.MalformedHandshake => .decode_error,
+        error.IllegalParameter => .illegal_parameter,
+        error.UnexpectedHandshakeMessage => .unexpected_message,
         error.CertificateInvalid => .bad_certificate,
         error.SecretExportFailed => .internal_error,
         error.AlpnMismatch => .no_application_protocol,
@@ -41,6 +43,14 @@ const testing = @import("std").testing;
 
 test "malformed handshake bytes map to decode_error" {
     try testing.expectEqual(AlertDescription.decode_error, fromHandshakeError(error.MalformedHandshake));
+}
+
+test "an out-of-order handshake message maps to unexpected_message" {
+    try testing.expectEqual(AlertDescription.unexpected_message, fromHandshakeError(error.UnexpectedHandshakeMessage));
+}
+
+test "a semantically invalid field value maps to illegal_parameter" {
+    try testing.expectEqual(AlertDescription.illegal_parameter, fromHandshakeError(error.IllegalParameter));
 }
 
 test "invalid peer certificate maps to bad_certificate" {

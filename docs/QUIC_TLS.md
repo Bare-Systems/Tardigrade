@@ -99,6 +99,47 @@ where appropriate, but its `Client` state machine cannot drive a QUIC handshake.
   `valid` / `invalid` / `not_checked`; `not_checked` is accepted at completion
   only when a caller explicitly opts into a local/insecure mode.
 
+## Failure taxonomy and alert mapping
+
+Every handshake failure is a typed `HandshakeError` value so it maps to exactly
+one fatal TLS alert (`src/tls/alerts.zig`, RFC 8446 §6) and, in QUIC mode, one
+`CRYPTO_ERROR` code (`0x0100 + alert`, RFC 9001 §4.8). Two distinct failure
+classes must never collapse into one:
+
+- **`MalformedHandshake` → `decode_error` (CRYPTO_ERROR + 0x32).** The bytes
+  could not be decoded: a length was wrong or out of range, the message was
+  truncated, or a field could not be parsed at all. This is a syntax/framing
+  failure — the wire data itself is wrong.
+- **`IllegalParameter` → `illegal_parameter` (CRYPTO_ERROR + 0x2f).** A field
+  decoded cleanly but carries a value that is incorrect or inconsistent with
+  other fields: a bad `legacy_version`, an unsupported cipher suite or named
+  group, a non-null compression method, a key share of the wrong length or a
+  low-order point, a HelloRetryRequest this profile never asks for, or a
+  repeated extension type (RFC 8446 §4.2). The bytes conform to the formal
+  syntax but are otherwise wrong.
+- **`UnexpectedHandshakeMessage` → `unexpected_message` (CRYPTO_ERROR + 0x0a).**
+  A syntactically valid handshake message arrived in the wrong state or for the
+  wrong role — the bytes decode cleanly, but the ordering is illegal (for
+  example a ServerHello where a Certificate was expected, a ClientHello a client
+  should never receive, a second ClientHello once the server has moved on, or a
+  server-only NewSessionTicket delivered to a server).
+
+The line between the first two is exactly RFC 8446 §6's split between
+`decode_error` (syntax/length) and `illegal_parameter` (syntactically valid but
+semantically wrong).
+
+These are all separate from the QUIC-local encryption-level failures. A CRYPTO
+fragment delivered at a packet-number space a message never uses — 0-RTT, or a
+handshake-flight message at the Initial level — is a `UnexpectedCryptoLevel`
+error (a QUIC seam violation, RFC 9001 §4.1.3), owned by the QUIC handshake
+driver rather than the TLS taxonomy; it never becomes a `decode_error`,
+`illegal_parameter`, or `unexpected_message` alert. Other typed cases —
+`AlpnMismatch` → `no_application_protocol`, `CertificateInvalid` →
+`bad_certificate`, and the transport-parameter failures → the QUIC
+`TRANSPORT_PARAMETER_ERROR` code — keep their own mappings. No generic
+catch-all `MalformedHandshake` is returned for a known ordering or
+illegal-value failure.
+
 ## Follow-ups
 
 - Integrate the driver with the packet layer and connection state machine.

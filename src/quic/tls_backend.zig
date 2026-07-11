@@ -637,9 +637,11 @@ pub const Tls13Backend = struct {
 
     pub fn backend(self: *Tls13Backend) TlsBackend {
         return .{
-            .ptr = self,
-            .startFn = startImpl,
-            .receiveFn = receiveImpl,
+            .transport = .{
+                .ptr = self,
+                .startFn = startImpl,
+                .receiveFn = receiveImpl,
+            },
             .setCidBindingFn = setCidBindingImpl,
             .peerCidBindingFn = peerCidBindingImpl,
         };

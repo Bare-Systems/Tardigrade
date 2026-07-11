@@ -7,6 +7,7 @@ pub const key_schedule = @import("key_schedule.zig");
 pub const messages = @import("messages.zig");
 pub const negotiation = @import("negotiation.zig");
 pub const policy = @import("policy.zig");
+pub const record_transport = @import("record_transport.zig");
 pub const transcript = @import("transcript.zig");
 pub const transport = @import("transport.zig");
 

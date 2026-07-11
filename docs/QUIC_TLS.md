@@ -30,10 +30,13 @@ CRYPTO-frame transport and packet-key installation.**
 2. `src/tls/` is the protocol-neutral TLS 1.3 core. `state.zig` defines roles,
    handshake states, and the explicit `quic` versus `record` transport modes;
    `events.zig` defines transport-neutral handshake byte, traffic-secret,
-   certificate, ALPN, discard, and completion events; `key_schedule.zig` owns
+   certificate, ALPN, discard, completion, and TLS-level typed failure
+   vocabulary shared by QUIC and future record mode; `key_schedule.zig` owns
    the SHA-256 TLS 1.3 key schedule with no QUIC, HTTP, socket, or record-layer
    imports; and `engine.zig` is the shared shell that can be instantiated for
-   record mode before records exist.
+   record mode before records exist. QUIC-only failures, such as CRYPTO-level
+   misuse or missing QUIC transport parameters, stay in the QUIC handshake
+   driver.
 
 3. `src/quic/tls_backend.zig` is the concrete production adapter from that core
    to QUIC mode. It consumes and produces raw handshake messages per encryption

@@ -20,3 +20,10 @@ pub const HandshakeState = enum {
     finished,
     complete,
 };
+
+pub const DriverState = enum {
+    idle,
+    in_progress,
+    complete,
+    failed,
+};

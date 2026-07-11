@@ -1222,6 +1222,7 @@ pub const Connection = struct {
             error.CertificateInvalid => error_crypto_base + 42, // bad_certificate
             error.MissingTransportParameters, error.InvalidTransportParameters => error_transport_parameter,
             error.UnexpectedHandshakeMessage => error_crypto_base + 10, // unexpected_message
+            error.IllegalParameter => error_crypto_base + 47, // illegal_parameter
             error.MalformedHandshake => error_crypto_base + 50, // decode_error
             else => error_crypto_base + 80, // internal_error
         };
@@ -2258,6 +2259,7 @@ test "handshake failures map to their RFC 9001 CRYPTO_ERROR alert codes" {
     // Ordering failures and malformed bytes are distinct alerts and must not
     // collapse to the same code.
     try testing.expectEqual(error_crypto_base + 10, Connection.cryptoErrorCode(error.UnexpectedHandshakeMessage));
+    try testing.expectEqual(error_crypto_base + 47, Connection.cryptoErrorCode(error.IllegalParameter));
     try testing.expectEqual(error_crypto_base + 50, Connection.cryptoErrorCode(error.MalformedHandshake));
     try testing.expectEqual(error_crypto_base + 120, Connection.cryptoErrorCode(error.AlpnMismatch));
     try testing.expectEqual(error_crypto_base + 42, Connection.cryptoErrorCode(error.CertificateInvalid));

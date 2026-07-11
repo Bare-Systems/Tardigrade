@@ -17,16 +17,29 @@ pub const CertificateState = enum { not_checked, valid, invalid };
 /// Typed, deterministic TLS handshake failures. Transport layers translate
 /// these into their own close/error surfaces without losing the TLS reason.
 pub const HandshakeError = error{
-    /// The peer's TLS handshake bytes could not be parsed: bad lengths, invalid
-    /// encoding, unknown message or field values, or otherwise malformed wire
-    /// data. Maps to the `decode_error` alert (RFC 8446 §6).
+    /// The peer's TLS handshake bytes could not be decoded: a length was wrong
+    /// or out of range, the message was truncated, or a field could not be
+    /// parsed at all. This is a *syntax/framing* failure — the wire data itself
+    /// is wrong. Semantically-valid-but-incorrect field values are
+    /// `IllegalParameter`, not this. Maps to the `decode_error` alert
+    /// (RFC 8446 §6).
     MalformedHandshake,
-    /// A syntactically valid handshake message arrived in the wrong state or at
-    /// the wrong epoch — a legal message the peer sent out of order (for
-    /// example a ServerHello where a Certificate was expected, or any handshake
-    /// message once the handshake is finished). Distinct from
-    /// `MalformedHandshake`: the bytes decode fine, the ordering does not. Maps
-    /// to the `unexpected_message` alert (RFC 8446 §6).
+    /// A handshake field decoded cleanly but carries a value that is incorrect
+    /// or inconsistent with other fields: a bad `legacy_version`, an
+    /// unsupported cipher suite or named group, a non-null compression method,
+    /// a key share that is the wrong length for its group or a low-order/
+    /// identity point, or a repeated extension type (RFC 8446 §4.2). The bytes
+    /// conform to the formal syntax but are otherwise wrong. Maps to the
+    /// `illegal_parameter` alert (RFC 8446 §6).
+    IllegalParameter,
+    /// A syntactically valid handshake message arrived in the wrong state or
+    /// for the wrong role — a legal message the peer sent out of order (for
+    /// example a ServerHello where a Certificate was expected, a ClientHello a
+    /// client should never receive, or any handshake message once the handshake
+    /// is finished). Distinct from `MalformedHandshake`: the bytes decode fine,
+    /// the ordering does not. Wrong-*epoch* CRYPTO delivery is a QUIC-local
+    /// concern (`UnexpectedCryptoLevel`), not this. Maps to the
+    /// `unexpected_message` alert (RFC 8446 §6).
     UnexpectedHandshakeMessage,
     /// ALPN did not negotiate an acceptable application protocol.
     AlpnMismatch,
@@ -70,13 +83,17 @@ test "shared handshake errors include TLS-level failure cases" {
     try std.testing.expectEqual(error.MalformedHandshake, err);
 }
 
-test "malformed bytes and out-of-order messages are distinct failure cases" {
+test "syntax, semantic, and ordering failures are distinct cases" {
     const std = @import("std");
 
-    // Parse/decode failures and legal-but-misordered messages must be separate
-    // errors so transports can map them to `decode_error` versus
-    // `unexpected_message` respectively.
+    // Decode failures, semantically-invalid field values, and legal-but-
+    // misordered messages must be separate errors so transports can map them to
+    // `decode_error`, `illegal_parameter`, and `unexpected_message`
+    // respectively.
     const malformed: HandshakeError = error.MalformedHandshake;
+    const illegal: HandshakeError = error.IllegalParameter;
     const unexpected: HandshakeError = error.UnexpectedHandshakeMessage;
+    try std.testing.expect(malformed != illegal);
     try std.testing.expect(malformed != unexpected);
+    try std.testing.expect(illegal != unexpected);
 }

@@ -347,8 +347,12 @@ const ExtensionGuard = struct {
 
     fn check(self: *ExtensionGuard, ext_id: u16) HandshakeError!void {
         for (self.ids[0..self.len]) |seen| {
-            if (seen == ext_id) return error.MalformedHandshake;
+            // A repeated extension type is well-formed but illegal
+            // (RFC 8446 §4.2: abort with illegal_parameter).
+            if (seen == ext_id) return error.IllegalParameter;
         }
+        // Exceeding the bounded tracker is a resource/parse limit, not a
+        // semantic field error, so it stays a decode failure.
         if (self.len == self.ids.len) return error.MalformedHandshake;
         self.ids[self.len] = ext_id;
         self.len += 1;
@@ -725,10 +729,15 @@ pub const Tls13Backend = struct {
         if (level != expected_level) return error.UnexpectedCryptoLevel;
 
         if (kind == .new_session_ticket) {
-            // Tolerated and ignored: this backend does not implement
-            // resumption, and a compliant peer sending tickets after the
-            // handshake must not kill the connection. receiveImpl only routes
-            // application CRYPTO here once the handshake is done.
+            // NewSessionTicket travels server->client only (RFC 8446 §4.6.1); a
+            // server that receives one has been sent a message it must never
+            // get, which is an ordering violation, not malformed bytes.
+            if (self.role != .client) return error.UnexpectedHandshakeMessage;
+            // This backend does not implement resumption, so the ticket is
+            // ignored — but a compliant peer must still send a structurally
+            // valid one. Validate the framing so malformed wire data is
+            // rejected as `decode_error` rather than silently accepted.
+            try validateNewSessionTicket(body);
             return;
         }
 
@@ -769,6 +778,30 @@ pub const Tls13Backend = struct {
             // here is unexpected rather than malformed.
             .start, .done => return error.UnexpectedHandshakeMessage,
         }
+    }
+
+    /// Minimally validate a NewSessionTicket's framing (RFC 8446 §4.6.1):
+    ///
+    ///   struct {
+    ///     uint32 ticket_lifetime;
+    ///     uint32 ticket_age_add;
+    ///     opaque ticket_nonce<0..255>;
+    ///     opaque ticket<1..2^16-1>;
+    ///     Extension extensions<0..2^16-2>;
+    ///   } NewSessionTicket;
+    ///
+    /// This backend does not implement resumption and ignores the ticket, but a
+    /// structurally invalid one is still malformed wire data. Any framing error
+    /// (including an empty `ticket`, which the spec forbids, or trailing bytes)
+    /// is a `MalformedHandshake` / `decode_error`.
+    fn validateNewSessionTicket(body: []const u8) HandshakeError!void {
+        var r = Reader{ .bytes = body };
+        _ = try r.slice(4); // ticket_lifetime
+        _ = try r.slice(4); // ticket_age_add
+        _ = try r.slice(try r.u8_()); // ticket_nonce
+        if ((try r.slice(try r.u16_())).len == 0) return error.MalformedHandshake; // ticket<1..>
+        _ = try r.slice(try r.u16_()); // extensions
+        try r.expectEnd();
     }
 
     // -----------------------------------------------------------------------
@@ -842,13 +875,13 @@ pub const Tls13Backend = struct {
 
     fn onServerHello(self: *Tls13Backend, raw: []const u8, body: []const u8, sink: *EventSink) HandshakeError!void {
         var r = Reader{ .bytes = body };
-        if (try r.u16_() != legacy_version) return error.MalformedHandshake;
+        if (try r.u16_() != legacy_version) return error.IllegalParameter;
         const random = try r.slice(32);
-        if (std.mem.eql(u8, random, &hello_retry_request_random)) return error.MalformedHandshake;
+        if (std.mem.eql(u8, random, &hello_retry_request_random)) return error.IllegalParameter;
         const session_id_len = try r.u8_();
         _ = try r.slice(session_id_len);
-        if (try r.u16_() != cipher_tls_aes_128_gcm_sha256) return error.MalformedHandshake;
-        if (try r.u8_() != 0) return error.MalformedHandshake;
+        if (try r.u16_() != cipher_tls_aes_128_gcm_sha256) return error.IllegalParameter;
+        if (try r.u8_() != 0) return error.IllegalParameter;
 
         var selected_version: ?u16 = null;
         var peer_share: ?[X25519.public_length]u8 = null;
@@ -862,19 +895,22 @@ pub const Tls13Backend = struct {
             switch (ext_id) {
                 ext_supported_versions => selected_version = try ext.u16_(),
                 ext_key_share => {
-                    if (try ext.u16_() != group_x25519) return error.MalformedHandshake;
-                    if (try ext.u16_() != X25519.public_length) return error.MalformedHandshake;
+                    if (try ext.u16_() != group_x25519) return error.IllegalParameter;
+                    if (try ext.u16_() != X25519.public_length) return error.IllegalParameter;
                     peer_share = (try ext.slice(X25519.public_length))[0..X25519.public_length].*;
                     try ext.expectEnd();
                 },
                 else => {},
             }
         }
-        if (selected_version != tls13_version) return error.MalformedHandshake;
+        if (selected_version != tls13_version) return error.IllegalParameter;
         const share = peer_share orelse return error.MalformedHandshake;
 
+        // A low-order/identity peer share is a well-formed 32-byte field with an
+        // illegal value (predictable all-zero shared secret), not malformed wire
+        // data.
         const shared = X25519.scalarmult(self.key_pair.?.secret_key, share) catch
-            return error.MalformedHandshake;
+            return error.IllegalParameter;
         self.transcript.update(raw);
         self.schedule = KeySchedule.init(shared, self.transcript.peek());
         try self.emitHandshakeSecrets(sink);
@@ -1024,7 +1060,7 @@ pub const Tls13Backend = struct {
 
     fn onClientHello(self: *Tls13Backend, raw: []const u8, body: []const u8, sink: *EventSink) HandshakeError!void {
         var r = Reader{ .bytes = body };
-        if (try r.u16_() != legacy_version) return error.MalformedHandshake;
+        if (try r.u16_() != legacy_version) return error.IllegalParameter;
         _ = try r.slice(32); // client random (already covered by the transcript)
         const session_id = try r.slice(try r.u8_());
 
@@ -1109,7 +1145,7 @@ pub const Tls13Backend = struct {
             return error.SecretExportFailed;
         self.key_pair = key_pair;
         const shared = X25519.scalarmult(key_pair.secret_key, client_share) catch
-            return error.MalformedHandshake;
+            return error.IllegalParameter;
 
         if (!alpn_match) {
             // Report what the client offered instead of silently downgrading;
@@ -1687,7 +1723,9 @@ fn duplicateExtension(buf: []u8, total_len: usize, block_len_at: usize, ext_id: 
 }
 
 test "a ClientHello with a duplicated extension is rejected" {
-    // RFC 8446 §4.2: no extension type may repeat within one extension block.
+    // RFC 8446 §4.2: no extension type may repeat within one extension block,
+    // and receipt of a repeated type aborts with illegal_parameter — the block
+    // is well-formed, the value is illegal.
     inline for (.{ ext_alpn, ext_quic_transport_parameters }) |ext_id| {
         var h = Harness.init();
         try h.wire();
@@ -1696,7 +1734,7 @@ test "a ClientHello with a duplicated extension is rejected" {
         var buf: [2048]u8 = undefined;
         const ch = (try h.client.pollOutput(.initial, &buf)).?;
         const new_len = duplicateExtension(&buf, ch.bytes.len, chExtensionBlockOffset(ch.bytes), ext_id);
-        try testing.expectError(error.MalformedHandshake, h.server.onCrypto(.initial, ch.offset, buf[0..new_len]));
+        try testing.expectError(error.IllegalParameter, h.server.onCrypto(.initial, ch.offset, buf[0..new_len]));
         try testing.expect(!h.server.isComplete());
     }
 }
@@ -1718,14 +1756,15 @@ test "EncryptedExtensions with a duplicated extension is rejected" {
         var flight_buf: [4096]u8 = undefined;
         const flight = (try h.server.pollOutput(.handshake, &flight_buf)).?;
         const new_len = duplicateExtension(&flight_buf, flight.bytes.len, 4, ext_id);
-        try testing.expectError(error.MalformedHandshake, h.client.onCrypto(.handshake, flight.offset, flight_buf[0..new_len]));
+        try testing.expectError(error.IllegalParameter, h.client.onCrypto(.handshake, flight.offset, flight_buf[0..new_len]));
         try testing.expect(!h.client.isComplete());
     }
 }
 
 test "an all-zero X25519 key share fails either side deterministically" {
-    // Client share zeroed inside the ClientHello: the server must refuse to
-    // derive a predictable (all-zero) shared secret.
+    // A zeroed (low-order) share is a well-formed 32-byte field with an illegal
+    // value — the peer would derive a predictable all-zero secret — so it is
+    // `illegal_parameter`, not a decode failure.
     var h = Harness.init();
     try h.wire();
     try h.client.start(defaultParams());
@@ -1734,7 +1773,7 @@ test "an all-zero X25519 key share fails either side deterministically" {
     const client_pub = (X25519.KeyPair.generateDeterministic(clientEntropy().key_share_seed) catch unreachable).public_key;
     const client_share_at = std.mem.indexOf(u8, ch.bytes, &client_pub) orelse return error.TestUnexpectedResult;
     @memset(buf[client_share_at..][0..X25519.public_length], 0);
-    try testing.expectError(error.MalformedHandshake, h.server.onCrypto(.initial, ch.offset, ch.bytes));
+    try testing.expectError(error.IllegalParameter, h.server.onCrypto(.initial, ch.offset, ch.bytes));
     try testing.expect(!h.server.isComplete());
 
     // Server share zeroed inside the ServerHello: same on the client.
@@ -1747,7 +1786,7 @@ test "an all-zero X25519 key share fails either side deterministically" {
     const server_pub = (X25519.KeyPair.generateDeterministic(serverEntropy().key_share_seed) catch unreachable).public_key;
     const server_share_at = std.mem.indexOf(u8, sh.bytes, &server_pub) orelse return error.TestUnexpectedResult;
     @memset(buf[server_share_at..][0..X25519.public_length], 0);
-    try testing.expectError(error.MalformedHandshake, h2.client.onCrypto(.initial, sh.offset, sh.bytes));
+    try testing.expectError(error.IllegalParameter, h2.client.onCrypto(.initial, sh.offset, sh.bytes));
     try testing.expect(!h2.client.isComplete());
 }
 
@@ -1757,9 +1796,18 @@ test "a fragmented NewSessionTicket after completion is tolerated and ignored" {
     try h.run();
     try testing.expect(h.client.isComplete());
 
-    // NewSessionTicket (type 4) with an opaque body, split mid-header across
-    // two 1-RTT CRYPTO deliveries like any other fragmented handshake message.
-    const ticket = [_]u8{ 4, 0, 0, 5, 0xde, 0xad, 0xbe, 0xef, 0x01 };
+    // A structurally valid NewSessionTicket (type 4): 4-byte lifetime, 4-byte
+    // age_add, empty nonce, a 1-byte ticket, and empty extensions (RFC 8446
+    // §4.6.1). Split mid-header across two 1-RTT CRYPTO deliveries like any
+    // other fragmented handshake message.
+    const ticket = [_]u8{
+        4, 0, 0, 14, // header: type + u24 length
+        0, 0, 0, 0, // ticket_lifetime
+        0, 0, 0, 0, // ticket_age_add
+        0, // ticket_nonce<0..255>
+        0, 1, 0xaa, // ticket<1..>
+        0, 0, // extensions<0..>
+    };
     try h.client.onCrypto(.application, 0, ticket[0..3]);
     try h.client.onCrypto(.application, 3, ticket[3..]);
     try testing.expect(h.client.isComplete());
@@ -1768,6 +1816,47 @@ test "a fragmented NewSessionTicket after completion is tolerated and ignored" {
     // A second ticket on the same stream keeps draining.
     try h.client.onCrypto(.application, ticket.len, &ticket);
     try testing.expect(h.client.isComplete());
+}
+
+test "a malformed NewSessionTicket after completion is a decode error" {
+    var h = Harness.init();
+    try h.wire();
+    try h.run();
+    try testing.expect(h.client.isComplete());
+
+    // A NewSessionTicket whose declared body length is self-consistent but
+    // whose contents cannot be parsed as the RFC 8446 §4.6.1 structure (here
+    // the ticket<1..> length runs past the body) is malformed wire data, not a
+    // tolerated ticket: it must surface as `decode_error`, not be ignored.
+    const bad_ticket = [_]u8{
+        4, 0, 0, 11, // header: type + u24 length (11-byte body)
+        0, 0, 0, 0, // ticket_lifetime
+        0, 0, 0, 0, // ticket_age_add
+        0, // ticket_nonce<0..255>
+        0xff, 0xff, // ticket length 65535 with no bytes following
+    };
+    try testing.expectError(error.MalformedHandshake, h.client.onCrypto(.application, 0, &bad_ticket));
+    try testing.expect(!h.client.isComplete());
+}
+
+test "a server that receives a NewSessionTicket rejects it as unexpected" {
+    // NewSessionTicket is server->client only (RFC 8446 §4.6.1); a completed
+    // server that is sent one must treat it as an illegal post-handshake
+    // message (`unexpected_message`), not tolerate it like a client does.
+    var h = Harness.init();
+    try h.wire();
+    try h.run();
+    try testing.expect(h.server.isComplete());
+
+    const ticket = [_]u8{
+        4, 0, 0, 14,
+        0, 0, 0, 0,
+        0, 0, 0, 0,
+        0, 0, 1, 0xaa,
+        0, 0,
+    };
+    try testing.expectError(error.UnexpectedHandshakeMessage, h.server.onCrypto(.application, 0, &ticket));
+    try testing.expectEqual(@as(?HandshakeError, error.UnexpectedHandshakeMessage), h.server.failure());
 }
 
 test "post-handshake application CRYPTO other than NewSessionTicket is rejected" {
@@ -1808,25 +1897,45 @@ test "a ClientHello delivered at the Handshake level is a level error" {
 }
 
 test "a well-formed but out-of-order handshake message is an unexpected_message error" {
-    // A server armed for a ClientHello that instead receives a well-formed
-    // Finished at its correct (Handshake) level: the bytes decode fine, but the
-    // message is illegal in this state. That is `unexpected_message`
-    // (CRYPTO_ERROR + 10), not the `decode_error` reserved for malformed bytes.
-    var server = Harness.init();
-    try server.wire();
-    const finished = [_]u8{ @intFromEnum(MessageType.finished), 0, 0, 0 };
-    try testing.expectError(error.UnexpectedHandshakeMessage, server.server.onCrypto(.handshake, 0, &finished));
-    try testing.expect(!server.server.isComplete());
-    try testing.expectEqual(@as(?HandshakeError, error.UnexpectedHandshakeMessage), server.server.failure());
+    // Capture genuinely well-formed, fully-encoded messages from a real
+    // handshake, then replay each into a peer where it is legal syntax but
+    // illegal ordering. This proves the distinction claimed by the taxonomy:
+    // the bytes decode fine (a stub with a wrong-sized body would be rejected
+    // earlier as malformed), yet the message is `unexpected_message`, not
+    // `decode_error`.
+    var gen = Harness.init();
+    try gen.wire();
+    try gen.client.start(defaultParams());
 
-    // Mirror on the client: after ClientHello it awaits a ServerHello; a
-    // well-formed ClientHello arriving at the Initial level is out of order.
-    var client = Harness.init();
-    try client.wire();
-    try client.client.start(defaultParams());
-    const client_hello = [_]u8{ @intFromEnum(MessageType.client_hello), 0, 0, 0 };
-    try testing.expectError(error.UnexpectedHandshakeMessage, client.client.onCrypto(.initial, 0, &client_hello));
-    try testing.expect(!client.client.isComplete());
+    var buf: [4096]u8 = undefined;
+    const ch = (try gen.client.pollOutput(.initial, &buf)).?;
+    var client_hello: [2048]u8 = undefined;
+    @memcpy(client_hello[0..ch.bytes.len], ch.bytes);
+    const client_hello_len = ch.bytes.len;
+
+    // Drive the server with the real ClientHello so it emits a real ServerHello.
+    try gen.server.onCrypto(.initial, ch.offset, ch.bytes);
+    const sh = (try gen.server.pollOutput(.initial, &buf)).?;
+    var server_hello: [2048]u8 = undefined;
+    @memcpy(server_hello[0..sh.bytes.len], sh.bytes);
+    const server_hello_len = sh.bytes.len;
+
+    // A server, armed for a ClientHello, that receives a well-formed ServerHello
+    // (a client-only message) at the ServerHello's own Initial level.
+    var target_server = Harness.init();
+    try target_server.wire();
+    try testing.expectError(error.UnexpectedHandshakeMessage, target_server.server.onCrypto(.initial, 0, server_hello[0..server_hello_len]));
+    try testing.expectEqual(@as(?HandshakeError, error.UnexpectedHandshakeMessage), target_server.server.failure());
+    try testing.expect(!target_server.server.isComplete());
+
+    // A client, awaiting a ServerHello after sending its ClientHello, that
+    // instead receives a well-formed ClientHello at the Initial level.
+    var target_client = Harness.init();
+    try target_client.wire();
+    try target_client.client.start(defaultParams());
+    try testing.expectError(error.UnexpectedHandshakeMessage, target_client.client.onCrypto(.initial, 0, client_hello[0..client_hello_len]));
+    try testing.expectEqual(@as(?HandshakeError, error.UnexpectedHandshakeMessage), target_client.client.failure());
+    try testing.expect(!target_client.client.isComplete());
 }
 
 test "a ClientHello without transport parameters fails the server at completion" {

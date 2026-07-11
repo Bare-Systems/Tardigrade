@@ -126,6 +126,48 @@ pub const TransportParameters = struct {
     initial_max_streams_bidi: u64,
     initial_max_streams_uni: u64,
     disable_active_migration: bool,
+    /// RFC 9000 §18.2 ACK interpretation parameters; both default to the RFC
+    /// values when a peer omits them.
+    ack_delay_exponent: u8 = 3,
+    max_ack_delay_ms: u64 = 25,
+};
+
+/// Largest connection ID QUIC v1 allows (RFC 9000 §17.2).
+pub const max_cid_len = 20;
+
+/// A connection ID value carried in a transport parameter. Fixed storage so
+/// the TLS layer never borrows connection-layer memory.
+pub const CidValue = struct {
+    bytes: [max_cid_len]u8 = [_]u8{0} ** max_cid_len,
+    len: u8 = 0,
+
+    pub fn init(raw: []const u8) error{InvalidConnectionId}!CidValue {
+        if (raw.len > max_cid_len) return error.InvalidConnectionId;
+        var value = CidValue{ .len = @intCast(raw.len) };
+        @memcpy(value.bytes[0..raw.len], raw);
+        return value;
+    }
+
+    pub fn slice(self: *const CidValue) []const u8 {
+        return self.bytes[0..self.len];
+    }
+};
+
+/// The authentication-binding transport parameters of RFC 9000 §7.3: the
+/// connection IDs (and server stateless reset token) each side commits to in
+/// the TLS handshake so an attacker cannot splice packet flows. The connection
+/// layer supplies the local values before the handshake starts and validates
+/// the peer's values when it completes.
+pub const CidBinding = struct {
+    /// Sent by both peers; must match the Source Connection ID field of the
+    /// sender's packets.
+    initial_source_connection_id: ?CidValue = null,
+    /// Server only; must match the DCID of the client's first Initial.
+    original_destination_connection_id: ?CidValue = null,
+    /// Server only, after Retry; must match the Retry packet's SCID.
+    retry_source_connection_id: ?CidValue = null,
+    /// Server only.
+    stateless_reset_token: ?[16]u8 = null,
 };
 
 test "default QUIC config maps to conservative transport parameters" {

@@ -312,6 +312,27 @@ pub const PacketTracker = struct {
         return result;
     }
 
+    /// RFC 9002 §6.4: when a space's keys are discarded, its packets stop
+    /// counting toward bytes in flight and will never be acked or declared
+    /// lost. Returns the in-flight bytes removed.
+    pub fn dropSpace(self: *PacketTracker, space: PacketNumberSpace) usize {
+        var removed: usize = 0;
+        var index: usize = 0;
+        while (index < self.count) {
+            const packet = self.packets[index];
+            if (packet.space != space) {
+                index += 1;
+                continue;
+            }
+            if (packet.in_flight) {
+                removed += packet.size;
+                self.bytes_in_flight -= packet.size;
+            }
+            self.removeAt(index);
+        }
+        return removed;
+    }
+
     fn noteLargestAcked(self: *PacketTracker, space: PacketNumberSpace, packet_number: u64) void {
         const index = spaceIndex(space);
         if (self.largest_acked[index] == null or packet_number > self.largest_acked[index].?) {
@@ -454,6 +475,15 @@ pub const RecoveryController = struct {
     pub fn resetForPathMigration(self: *RecoveryController) void {
         self.rtt = RttEstimator.init(self.rtt.max_ack_delay_us);
         self.congestion = .{ .bytes_in_flight = self.congestion.bytes_in_flight };
+    }
+
+    /// RFC 9002 §6.4: drop a packet-number space's tracked packets and ACK
+    /// state when its keys are discarded. Returns the in-flight bytes removed.
+    pub fn onKeysDiscarded(self: *RecoveryController, space: PacketNumberSpace) usize {
+        const removed = self.tracker.dropSpace(space);
+        self.congestion.bytes_in_flight -|= removed;
+        self.ack_ranges[spaceIndex(space)].clear();
+        return removed;
     }
 };
 

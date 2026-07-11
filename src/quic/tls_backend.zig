@@ -168,11 +168,18 @@ const tp_initial_max_streams_bidi: u64 = 0x08;
 const tp_initial_max_streams_uni: u64 = 0x09;
 const tp_disable_active_migration: u64 = 0x0c;
 const tp_active_connection_id_limit: u64 = 0x0e;
+const tp_original_destination_connection_id: u64 = 0x00;
+const tp_stateless_reset_token: u64 = 0x02;
+const tp_ack_delay_exponent: u64 = 0x0a;
+const tp_max_ack_delay: u64 = 0x0b;
+const tp_initial_source_connection_id: u64 = 0x0f;
+const tp_retry_source_connection_id: u64 = 0x10;
 
 /// Upper bound of the encoding produced by `encodeTransportParameters`:
-/// nine integer parameters (2-byte id + 1-byte length + 8-byte varint) plus the
-/// zero-length disable_active_migration flag.
-pub const max_transport_parameters_len = 9 * (2 + 1 + 8) + 3;
+/// eleven integer parameters (2-byte id + 1-byte length + 8-byte varint), the
+/// zero-length disable_active_migration flag, three connection IDs, and the
+/// stateless reset token.
+pub const max_transport_parameters_len = 11 * (2 + 1 + 8) + 3 + 3 * (2 + 1 + config.max_cid_len) + (2 + 1 + 16);
 
 /// Encode `params` as the RFC 9000 §18 extension payload. Every parameter this
 /// stack models is emitted explicitly, so the peer never falls back to a
@@ -186,6 +193,16 @@ pub const max_transport_parameters_len = 9 * (2 + 1 + 8) + 3;
 /// Packet-layer integration passes those through a connection-supplied payload
 /// when it wires the driver into `connection.zig` (see docs/QUIC_TLS.md).
 pub fn encodeTransportParameters(params: config.TransportParameters, buf: []u8) HandshakeError![]const u8 {
+    return encodeTransportParametersBound(params, .{}, buf);
+}
+
+/// Encode `params` plus the RFC 9000 §7.3 authentication-binding connection
+/// IDs the connection layer committed to for this handshake.
+pub fn encodeTransportParametersBound(
+    params: config.TransportParameters,
+    binding: config.CidBinding,
+    buf: []u8,
+) HandshakeError![]const u8 {
     var len: usize = 0;
     const entries = [_]struct { id: u64, value: u64 }{
         .{ .id = tp_max_idle_timeout, .value = params.max_idle_timeout_ms },
@@ -197,6 +214,8 @@ pub fn encodeTransportParameters(params: config.TransportParameters, buf: []u8) 
         .{ .id = tp_initial_max_streams_bidi, .value = params.initial_max_streams_bidi },
         .{ .id = tp_initial_max_streams_uni, .value = params.initial_max_streams_uni },
         .{ .id = tp_active_connection_id_limit, .value = params.active_connection_id_limit },
+        .{ .id = tp_ack_delay_exponent, .value = params.ack_delay_exponent },
+        .{ .id = tp_max_ack_delay, .value = params.max_ack_delay_ms },
     };
     for (entries) |entry| {
         len += varint.encode(entry.id, buf[len..]) catch return error.HandshakeBufferOverflow;
@@ -207,6 +226,26 @@ pub fn encodeTransportParameters(params: config.TransportParameters, buf: []u8) 
     if (params.disable_active_migration) {
         len += varint.encode(tp_disable_active_migration, buf[len..]) catch return error.HandshakeBufferOverflow;
         len += varint.encode(0, buf[len..]) catch return error.HandshakeBufferOverflow;
+    }
+    const cid_entries = [_]struct { id: u64, value: ?config.CidValue }{
+        .{ .id = tp_initial_source_connection_id, .value = binding.initial_source_connection_id },
+        .{ .id = tp_original_destination_connection_id, .value = binding.original_destination_connection_id },
+        .{ .id = tp_retry_source_connection_id, .value = binding.retry_source_connection_id },
+    };
+    for (cid_entries) |entry| {
+        const value = entry.value orelse continue;
+        len += varint.encode(entry.id, buf[len..]) catch return error.HandshakeBufferOverflow;
+        len += varint.encode(value.len, buf[len..]) catch return error.HandshakeBufferOverflow;
+        if (value.len > buf.len - len) return error.HandshakeBufferOverflow;
+        @memcpy(buf[len..][0..value.len], value.slice());
+        len += value.len;
+    }
+    if (binding.stateless_reset_token) |token| {
+        len += varint.encode(tp_stateless_reset_token, buf[len..]) catch return error.HandshakeBufferOverflow;
+        len += varint.encode(token.len, buf[len..]) catch return error.HandshakeBufferOverflow;
+        if (token.len > buf.len - len) return error.HandshakeBufferOverflow;
+        @memcpy(buf[len..][0..token.len], &token);
+        len += token.len;
     }
     return buf[0..len];
 }
@@ -223,6 +262,17 @@ pub const max_distinct_transport_parameters = 64;
 /// encodings and values RFC 9000 forbids, all with
 /// `InvalidTransportParameters`. Absent parameters take their RFC defaults.
 pub fn decodeTransportParameters(bytes: []const u8) HandshakeError!config.TransportParameters {
+    var binding = config.CidBinding{};
+    return decodeTransportParametersBound(bytes, &binding);
+}
+
+/// Decode a peer's extension payload, capturing the RFC 9000 §7.3
+/// authentication-binding connection IDs into `binding` for the connection
+/// layer to validate once the handshake authenticates them.
+pub fn decodeTransportParametersBound(
+    bytes: []const u8,
+    binding: *config.CidBinding,
+) HandshakeError!config.TransportParameters {
     var params = config.TransportParameters{
         .max_idle_timeout_ms = 0,
         .active_connection_id_limit = 2,
@@ -272,6 +322,32 @@ pub fn decodeTransportParameters(bytes: []const u8) HandshakeError!config.Transp
                 params.disable_active_migration = true;
             },
             tp_active_connection_id_limit => params.active_connection_id_limit = try integerParameter(value_bytes),
+            tp_ack_delay_exponent => {
+                const value = try integerParameter(value_bytes);
+                if (value > 20) return error.InvalidTransportParameters;
+                params.ack_delay_exponent = @intCast(value);
+            },
+            tp_max_ack_delay => {
+                const value = try integerParameter(value_bytes);
+                if (value >= 1 << 14) return error.InvalidTransportParameters;
+                params.max_ack_delay_ms = value;
+            },
+            tp_initial_source_connection_id => {
+                binding.initial_source_connection_id =
+                    config.CidValue.init(value_bytes) catch return error.InvalidTransportParameters;
+            },
+            tp_original_destination_connection_id => {
+                binding.original_destination_connection_id =
+                    config.CidValue.init(value_bytes) catch return error.InvalidTransportParameters;
+            },
+            tp_retry_source_connection_id => {
+                binding.retry_source_connection_id =
+                    config.CidValue.init(value_bytes) catch return error.InvalidTransportParameters;
+            },
+            tp_stateless_reset_token => {
+                if (value_bytes.len != 16) return error.InvalidTransportParameters;
+                binding.stateless_reset_token = value_bytes[0..16].*;
+            },
             else => {},
         }
     }
@@ -487,6 +563,14 @@ pub const Tls13Backend = struct {
     /// through a real handshake. Never set outside tests.
     omit_transport_parameters: bool = false,
 
+    /// RFC 9000 §7.3 authentication-binding parameters for this side, set by
+    /// the connection layer before the handshake starts (the TLS engine never
+    /// invents connection IDs).
+    cid_binding: config.CidBinding = .{},
+    /// The peer's §7.3 binding, captured while decoding its transport
+    /// parameters; the connection layer validates it at handshake completion.
+    peer_cid_binding: config.CidBinding = .{},
+
     local_params: config.TransportParameters = undefined,
     key_pair: ?X25519.KeyPair = null,
     transcript: Sha256 = Sha256.init(.{}),
@@ -515,7 +599,23 @@ pub const Tls13Backend = struct {
     }
 
     pub fn backend(self: *Tls13Backend) TlsBackend {
-        return .{ .ptr = self, .startFn = startImpl, .receiveFn = receiveImpl };
+        return .{
+            .ptr = self,
+            .startFn = startImpl,
+            .receiveFn = receiveImpl,
+            .setCidBindingFn = setCidBindingImpl,
+            .peerCidBindingFn = peerCidBindingImpl,
+        };
+    }
+
+    fn setCidBindingImpl(ptr: *anyopaque, binding: config.CidBinding) void {
+        const self: *Tls13Backend = @ptrCast(@alignCast(ptr));
+        self.cid_binding = binding;
+    }
+
+    fn peerCidBindingImpl(ptr: *anyopaque) config.CidBinding {
+        const self: *Tls13Backend = @ptrCast(@alignCast(ptr));
+        return self.peer_cid_binding;
     }
 
     fn startImpl(ptr: *anyopaque, role: Role, params: config.TransportParameters, sink: *EventSink) HandshakeError!void {
@@ -680,7 +780,7 @@ pub const Tls13Backend = struct {
         if (!self.omit_transport_parameters) {
             try w.u16_(ext_quic_transport_parameters);
             var params_buf: [max_transport_parameters_len]u8 = undefined;
-            const params = try encodeTransportParameters(self.local_params, &params_buf);
+            const params = try encodeTransportParametersBound(self.local_params, self.cid_binding, &params_buf);
             try w.u16_(@intCast(params.len));
             try w.bytes(params);
         }
@@ -753,7 +853,7 @@ pub const Tls13Backend = struct {
                     try sink.emitAlpn(name);
                 },
                 ext_quic_transport_parameters => {
-                    try sink.emitPeerTransportParameters(try decodeTransportParameters(ext.bytes));
+                    try sink.emitPeerTransportParameters(try decodeTransportParametersBound(ext.bytes, &self.peer_cid_binding));
                 },
                 else => {},
             }
@@ -958,7 +1058,7 @@ pub const Tls13Backend = struct {
             return;
         }
         if (transport_params) |tp| {
-            try sink.emitPeerTransportParameters(try decodeTransportParameters(tp));
+            try sink.emitPeerTransportParameters(try decodeTransportParametersBound(tp, &self.peer_cid_binding));
         }
         self.transcript.update(raw);
 
@@ -1019,7 +1119,7 @@ pub const Tls13Backend = struct {
         if (!self.omit_transport_parameters) {
             try w.u16_(ext_quic_transport_parameters);
             var params_buf: [max_transport_parameters_len]u8 = undefined;
-            const params = try encodeTransportParameters(self.local_params, &params_buf);
+            const params = try encodeTransportParametersBound(self.local_params, self.cid_binding, &params_buf);
             try w.u16_(@intCast(params.len));
             try w.bytes(params);
         }

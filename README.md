@@ -183,8 +183,9 @@ proxying, and response writes.
 
 Idle HTTP/1.1 keep-alive connections are parked off the worker pool between
 requests, so idle clients do not consume worker capacity. HTTP/2 multiplexes
-internally and is tracked as an experimental surface rather than part of the
-default stable release contract.
+internally, and HTTP/3 is served over a built-in native Zig QUIC/H3 stack that
+needs no external QUIC libraries. Both HTTP/2 and HTTP/3 are tracked as
+experimental surfaces rather than part of the default stable release contract.
 
 Configuration is nginx-inspired and can be checked before startup with
 `tardigrade check <config>`. Runtime inspection commands such as `status` and

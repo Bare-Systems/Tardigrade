@@ -22,6 +22,7 @@ const config = @import("config.zig");
 const varint = @import("quic_varint");
 const tls_adapter = @import("tls_adapter.zig");
 const tls_handshake = @import("tls_handshake.zig");
+const tls_algorithms = @import("tls_core").algorithms;
 const tls_key_schedule = @import("tls_core").key_schedule;
 
 const crypto = std.crypto;
@@ -43,17 +44,17 @@ const TranscriptHash = tls_key_schedule.TranscriptHash;
 pub const max_message_len = 8 * 1024;
 pub const max_certificate_len = 2048;
 
-const tls13_version: u16 = 0x0304;
-const legacy_version: u16 = 0x0303;
-const cipher_tls_aes_128_gcm_sha256: u16 = 0x1301;
-const group_x25519: u16 = 0x001d;
-const sigalg_ed25519: u16 = 0x0807;
+const tls13_version: u16 = @intFromEnum(tls_algorithms.ProtocolVersion.tls13);
+const legacy_version: u16 = tls_algorithms.legacy_version;
+const cipher_tls_aes_128_gcm_sha256: u16 = @intFromEnum(tls_algorithms.CipherSuite.tls_aes_128_gcm_sha256);
+const group_x25519: u16 = @intFromEnum(tls_algorithms.NamedGroup.x25519);
+const sigalg_ed25519: u16 = @intFromEnum(tls_algorithms.SignatureScheme.ed25519);
 
-const ext_supported_groups: u16 = 10;
-const ext_signature_algorithms: u16 = 13;
-const ext_alpn: u16 = 16;
-const ext_supported_versions: u16 = 43;
-const ext_key_share: u16 = 51;
+const ext_supported_groups: u16 = @intFromEnum(tls_algorithms.ExtensionType.supported_groups);
+const ext_signature_algorithms: u16 = @intFromEnum(tls_algorithms.ExtensionType.signature_algorithms);
+const ext_alpn: u16 = @intFromEnum(tls_algorithms.ExtensionType.application_layer_protocol_negotiation);
+const ext_supported_versions: u16 = @intFromEnum(tls_algorithms.ExtensionType.supported_versions);
+const ext_key_share: u16 = @intFromEnum(tls_algorithms.ExtensionType.key_share);
 /// RFC 9001 §8.2.
 const ext_quic_transport_parameters: u16 = 57;
 

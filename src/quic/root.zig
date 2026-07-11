@@ -15,6 +15,7 @@ pub const path = @import("path.zig");
 pub const stream = @import("stream.zig");
 pub const qlog = @import("qlog.zig");
 pub const keylog = @import("keylog.zig");
+pub const tls_core = @import("tls_core");
 
 test {
     @import("std").testing.refAllDecls(@This());

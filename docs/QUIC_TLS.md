@@ -1,4 +1,4 @@
-# QUIC TLS 1.3 backend strategy (#296)
+# QUIC TLS 1.3 backend strategy (#296, #329)
 
 This note records the decision for how Tardigrade's pure-Zig QUIC stack drives a
 TLS 1.3 handshake, and the staged migration behind the `QuicTlsAdapter` seam
@@ -15,9 +15,9 @@ material; the rest of `src/quic/` must never see a concrete TLS type.
 
 ## Decision
 
-**The QUIC handshake driver is backend-agnostic, and the production TLS engine
-is a pure-Zig TLS 1.3 implementation behind the runtime `TlsBackend`
-interface.**
+**The QUIC handshake driver is backend-agnostic, and reusable TLS 1.3 state now
+lives under a protocol-neutral `src/tls/` core while the QUIC adapter keeps
+CRYPTO-frame transport and packet-key installation.**
 
 1. `src/quic/tls_handshake.zig` implements the connection-facing handshake
    driver (`Handshake`) plus the backend interface (`TlsBackend`) and event
@@ -27,20 +27,27 @@ interface.**
    parameters, enforces ALPN `h3`, reports certificate state, and classifies
    failures into a typed `HandshakeError`.
 
-2. `src/quic/tls_backend.zig` is the concrete production backend: a TLS 1.3
-   engine operating in QUIC mode, built entirely on `std.crypto` primitives
-   (no external TLS library). It consumes and produces raw handshake messages
-   per encryption level — there is no record layer; QUIC packet protection
-   covers confidentiality — and exports traffic secrets, transport parameters,
-   ALPN, and certificate state through the `EventSink`. Its first profile is
+2. `src/tls/` is the protocol-neutral TLS 1.3 core. `state.zig` defines roles,
+   handshake states, and the explicit `quic` versus `record` transport modes;
+   `events.zig` defines transport-neutral handshake byte, traffic-secret,
+   certificate, ALPN, discard, and completion events; `key_schedule.zig` owns
+   the SHA-256 TLS 1.3 key schedule with no QUIC, HTTP, socket, or record-layer
+   imports; and `engine.zig` is the shared shell that can be instantiated for
+   record mode before records exist.
+
+3. `src/quic/tls_backend.zig` is the concrete production adapter from that core
+   to QUIC mode. It consumes and produces raw handshake messages per encryption
+   level — there is no record layer; QUIC packet protection covers
+   confidentiality — and exports traffic secrets, transport parameters, ALPN,
+   and certificate state through the `EventSink`. Its first profile is
    deliberately narrow with one interoperable code path per choice:
    TLS_AES_128_GCM_SHA256 (the adapter's suite), X25519 key exchange, Ed25519
    server certificates (parsed/verified via `std.crypto.Certificate`), and
-   pinned-certificate or explicit-insecure trust. The key schedule is validated
-   against the RFC 8448 trace. Entropy is caller-supplied, like the rest of
-   `src/quic/`.
+   pinned-certificate or explicit-insecure trust. The shared key schedule is
+   validated against the RFC 8448 trace. Entropy is caller-supplied, like the
+   rest of `src/quic/`.
 
-3. A deterministic in-memory `TestTlsBackend` in `tls_handshake.zig` exercises
+4. A deterministic in-memory `TestTlsBackend` in `tls_handshake.zig` exercises
    the driver end to end. It is a fixture, not a TLS implementation, and it is
    the regression seam that later packet-layer and interop work (#247) build
    on. `src/quic/testdata/` holds a deterministic self-signed Ed25519

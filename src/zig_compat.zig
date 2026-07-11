@@ -427,7 +427,11 @@ pub fn ipAddressToSockAddr(address: std.Io.net.IpAddress) SockAddr {
             sin.* = .{
                 .family = std.posix.AF.INET,
                 .port = std.mem.nativeToBig(u16, ip4.port),
-                .addr = std.mem.readInt(u32, &ip4.bytes, .big),
+                // sin_addr is in network byte order and the address octets are
+                // already network-ordered, so bit-cast them directly — a
+                // host-endian readInt would byte-swap them on little-endian
+                // (binding "127.0.0.1" to 1.0.0.127, EADDRNOTAVAIL).
+                .addr = @bitCast(ip4.bytes),
             };
             return .{
                 .storage = storage,

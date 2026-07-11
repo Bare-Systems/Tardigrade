@@ -128,8 +128,9 @@ pub const Runtime = struct {
         errdefer _ = std.c.close(fd);
 
         posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&@as(c_int, 1))) catch {}; // REUSEADDR is advisory; bind proceeds regardless
-        if (std.c.bind(fd, @ptrCast(&address.storage), @intCast(address.len)) < 0) {
-            logger.warn(null, "http3: udp bind failed: errno={d}", .{@intFromEnum(posix.errno(@as(isize, -1)))});
+        const bind_rc = std.c.bind(fd, @ptrCast(&address.storage), @intCast(address.len));
+        if (bind_rc != 0) {
+            logger.warn(null, "http3: udp bind failed: {s}", .{@tagName(posix.errno(bind_rc))});
             return error.BindFailed;
         }
 

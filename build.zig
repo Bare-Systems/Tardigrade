@@ -25,6 +25,11 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const tls_core_mod = b.createModule(.{
+        .root_source_file = b.path("src/tls/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
 
     // Shared leaf modules. A Zig source file belongs to exactly one module,
     // so anything consumed by both the exe tree and the quic/http3 packages
@@ -49,6 +54,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     quic_mod.addImport("quic_varint", quic_varint_mod);
+    quic_mod.addImport("tls_core", tls_core_mod);
     const http3_mod = b.createModule(.{
         .root_source_file = b.path("src/http3/root.zig"),
         .target = target,
@@ -70,6 +76,7 @@ pub fn build(b: *std.Build) void {
     exe_mod.addImport("stream_transport", stream_transport_mod);
     exe_mod.addImport("quic", quic_mod);
     exe_mod.addImport("http3", http3_mod);
+    exe_mod.addImport("tls_core", tls_core_mod);
 
     const exe = b.addExecutable(.{
         .name = "tardigrade",
@@ -94,6 +101,12 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_exe_unit_tests.step);
 
+    const tls_core_tests = b.addTest(.{ .root_module = tls_core_mod });
+    const run_tls_core_tests = b.addRunArtifact(tls_core_tests);
+    const tls_step = b.step("test-tls", "Run pure-Zig TLS core unit tests");
+    tls_step.dependOn(&run_tls_core_tests.step);
+    test_step.dependOn(&run_tls_core_tests.step);
+
     const allocation_regression_mod = b.createModule(.{
         .root_source_file = b.path("src/allocation_regression.zig"),
         .target = target,
@@ -106,6 +119,7 @@ pub fn build(b: *std.Build) void {
     allocation_regression_mod.addImport("stream_transport", stream_transport_mod);
     allocation_regression_mod.addImport("quic", quic_mod);
     allocation_regression_mod.addImport("http3", http3_mod);
+    allocation_regression_mod.addImport("tls_core", tls_core_mod);
 
     const allocation_regression_tests = b.addTest(.{
         .root_module = allocation_regression_mod,
@@ -286,6 +300,18 @@ pub fn build(b: *std.Build) void {
     const h3_interop_install = b.addInstallArtifact(h3_interop_tool, .{});
     const h3_interop_step = b.step("build-h3-interop", "Build the native HTTP/3 interop client/server tool");
     h3_interop_step.dependOn(&h3_interop_install.step);
+
+    // Pure-Zig PKI DER foundation (#339): no system libraries.
+    const pki_mod = b.createModule(.{
+        .root_source_file = b.path("src/pki/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const pki_tests = b.addTest(.{ .root_module = pki_mod });
+    const run_pki_tests = b.addRunArtifact(pki_tests);
+    const pki_step = b.step("test-pki", "Run pure-Zig PKI DER unit tests");
+    pki_step.dependOn(&run_pki_tests.step);
+    test_step.dependOn(&run_pki_tests.step);
 }
 
 fn pathExists(path: []const u8) bool {

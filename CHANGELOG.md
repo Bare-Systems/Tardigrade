@@ -28,6 +28,15 @@ All notable user-facing changes to Tardigrade are documented here.
   and sign/verify round-trips under `zig build test-crypto`. The OpenSSL
   production adapter and migrating the existing QUIC/TLS modules onto the
   boundary are follow-ups (#323–#326); see `docs/CRYPTO_PROVIDER.md`.
+- **Bounded ASN.1 DER decoder for X.509 (#339)** — adds `src/pki/` with a
+  strict, allocation-aware DER foundation for the #324 Web PKI epic:
+  `der.zig` provides a bounded `Reader` with typed decoders (SEQUENCE/SET,
+  INTEGER, BOOLEAN, BIT/OCTET STRING, NULL, OID, string types, UTCTime,
+  GeneralizedTime, and context-specific explicit/implicit tags), configurable
+  limits, zero-copy content views, complete-consumption checks, typed errors,
+  and a `fuzzParseInput` entrypoint for #376; `oid.zig` and `time.zig` cover
+  OBJECT IDENTIFIER and time parsing. `zig build test-pki` runs the regression
+  and adversarial corpora.
 - **QUIC CID routing, path validation, and migration policy (#251)** — the
   pure-Zig transport gains connection-ID lifecycle and path handling:
   `cid.zig` adds caller-entropy CID generation, a DCID→connection

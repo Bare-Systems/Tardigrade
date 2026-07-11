@@ -19,6 +19,7 @@
 const std = @import("std");
 const config = @import("config.zig");
 const packet = @import("packet.zig");
+const tls_core = @import("tls_core");
 
 const crypto = std.crypto;
 const tls = std.crypto.tls;
@@ -81,21 +82,14 @@ pub const PacketNumberSpace = enum {
     application,
 };
 
-pub const Direction = enum {
-    read,
-    write,
-};
+pub const Direction = tls_core.events.SecretDirection;
 
 pub const Perspective = enum {
     client,
     server,
 };
 
-pub const CertificateState = enum {
-    not_checked,
-    valid,
-    invalid,
-};
+pub const CertificateState = tls_core.events.CertificateState;
 
 pub const KeyPhase = enum {
     current,

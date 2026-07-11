@@ -17,6 +17,7 @@
 const std = @import("std");
 const config = @import("config.zig");
 const tls_adapter = @import("tls_adapter.zig");
+const tls_core = @import("tls_core");
 
 const EncryptionLevel = tls_adapter.EncryptionLevel;
 const Direction = tls_adapter.Direction;
@@ -25,26 +26,16 @@ const Secret = tls_adapter.Secret;
 const QuicTlsAdapter = tls_adapter.QuicTlsAdapter;
 const traffic_secret_len = tls_adapter.traffic_secret_len;
 
-pub const Role = enum { client, server };
+pub const Role = tls_core.state.Role;
 
-/// Typed, deterministic handshake failures. The connection layer maps these to
-/// the right QUIC CONNECTION_CLOSE codes later; the driver only classifies.
-pub const HandshakeError = error{
+pub const HandshakeError = tls_core.events.HandshakeError || error{
     /// A CRYPTO fragment arrived at a level the handshake never uses (0-RTT).
     UnexpectedCryptoLevel,
-    /// The backend could not parse the peer's TLS handshake bytes.
-    MalformedHandshake,
-    /// ALPN did not negotiate exactly `h3`.
-    AlpnMismatch,
-    /// Peer certificate was rejected by the backend.
-    CertificateInvalid,
-    /// Handshake completed without the peer's transport parameters.
+    /// Handshake completed without the peer's QUIC transport parameters.
     MissingTransportParameters,
-    /// Peer transport parameters were malformed or carried an illegal value.
+    /// Peer QUIC transport parameters were malformed or carried an illegal value.
     InvalidTransportParameters,
-    /// A traffic secret could not be installed (wrong length from the backend).
-    SecretExportFailed,
-    /// The backend emitted more output than the driver can buffer in one step.
+    /// The backend or driver emitted more output than this bounded QUIC seam can buffer.
     HandshakeBufferOverflow,
 };
 
@@ -159,7 +150,7 @@ pub const TlsBackend = struct {
     }
 };
 
-pub const State = enum { idle, in_progress, complete, failed };
+pub const State = tls_core.state.DriverState;
 
 /// The connection-facing QUIC handshake driver. A QUIC connection calls
 /// `start`, then pumps `onCrypto` / `pollOutput` per encryption level until

@@ -268,6 +268,22 @@ pub fn build(b: *std.Build) void {
     const run_quic_h3_e2e_tests = b.addRunArtifact(quic_h3_e2e_tests);
     quic_step.dependOn(&run_quic_h3_e2e_tests.step);
     test_step.dependOn(&run_quic_h3_e2e_tests.step);
+
+    // Real-UDP smoke test (#247 phase 4): the same native stack over actual
+    // loopback sockets with poll(2)-driven timers and DCID routing.
+    const quic_h3_udp_mod = b.createModule(.{
+        .root_source_file = b.path("tests/quic_h3_udp_smoke.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    quic_h3_udp_mod.addImport("quic", quic_mod);
+    quic_h3_udp_mod.addImport("http3", http3_mod);
+    quic_h3_udp_mod.addImport("stream_transport", stream_transport_mod);
+    const quic_h3_udp_tests = b.addTest(.{ .root_module = quic_h3_udp_mod });
+    const run_quic_h3_udp_tests = b.addRunArtifact(quic_h3_udp_tests);
+    quic_step.dependOn(&run_quic_h3_udp_tests.step);
+    test_step.dependOn(&run_quic_h3_udp_tests.step);
 }
 
 fn pathExists(path: []const u8) bool {

@@ -39,93 +39,25 @@ pub const HandshakeError = tls_core.events.HandshakeError || error{
     HandshakeBufferOverflow,
 };
 
-/// Events a `TlsBackend` reports to the driver in response to `start`/`receive`.
-/// Slices borrow the backend's own storage and are consumed by the driver
-/// before the next backend call, so no allocation crosses the seam.
-pub const Event = union(enum) {
-    /// Raw TLS handshake bytes to send at `level` (queued to the CRYPTO stream).
-    crypto: struct { level: EncryptionLevel, data: []const u8 },
-    /// A traffic secret to install for `level`/`direction`.
-    secret: struct { level: EncryptionLevel, direction: Direction, data: []const u8 },
-    /// The peer's transport parameters, as carried in the handshake extension.
-    peer_transport_parameters: config.TransportParameters,
-    /// The negotiated ALPN protocol.
-    alpn: []const u8,
-    /// The peer certificate validation outcome.
-    certificate: CertificateState,
-    /// Keys for `level` are no longer needed and should be discarded.
-    discard_keys: EncryptionLevel,
-    /// The handshake authenticated and completed on this side.
-    handshake_complete,
-};
+const TransportContract = tls_core.transport.ContractWithOptions(
+    config.TransportParameters,
+    EncryptionLevel,
+    HandshakeError,
+    16,
+    16 * 1024,
+    error.HandshakeBufferOverflow,
+);
 
-/// Bounded sink the backend fills with `Event`s during a single call. Byte
-/// payloads are copied into `scratch` so the driver can apply them after the
-/// backend returns without holding backend-internal pointers.
-pub const EventSink = struct {
-    pub const max_events = 16;
-    pub const max_bytes = 16 * 1024;
-
-    items: [max_events]Event = undefined,
-    len: usize = 0,
-    scratch: [max_bytes]u8 = undefined,
-    used: usize = 0,
-
-    fn reset(self: *EventSink) void {
-        self.len = 0;
-        self.used = 0;
-    }
-
-    fn store(self: *EventSink, bytes: []const u8) HandshakeError![]const u8 {
-        if (bytes.len > self.scratch.len - self.used) return error.HandshakeBufferOverflow;
-        const start = self.used;
-        @memcpy(self.scratch[start..][0..bytes.len], bytes);
-        self.used += bytes.len;
-        return self.scratch[start..][0..bytes.len];
-    }
-
-    fn push(self: *EventSink, event: Event) HandshakeError!void {
-        if (self.len == self.items.len) return error.HandshakeBufferOverflow;
-        self.items[self.len] = event;
-        self.len += 1;
-    }
-
-    pub fn emitCrypto(self: *EventSink, level: EncryptionLevel, data: []const u8) HandshakeError!void {
-        try self.push(.{ .crypto = .{ .level = level, .data = try self.store(data) } });
-    }
-
-    pub fn emitSecret(self: *EventSink, level: EncryptionLevel, direction: Direction, data: []const u8) HandshakeError!void {
-        try self.push(.{ .secret = .{ .level = level, .direction = direction, .data = try self.store(data) } });
-    }
-
-    pub fn emitPeerTransportParameters(self: *EventSink, params: config.TransportParameters) HandshakeError!void {
-        try self.push(.{ .peer_transport_parameters = params });
-    }
-
-    pub fn emitAlpn(self: *EventSink, protocol: []const u8) HandshakeError!void {
-        try self.push(.{ .alpn = try self.store(protocol) });
-    }
-
-    pub fn emitCertificate(self: *EventSink, state: CertificateState) HandshakeError!void {
-        try self.push(.{ .certificate = state });
-    }
-
-    pub fn emitDiscardKeys(self: *EventSink, level: EncryptionLevel) HandshakeError!void {
-        try self.push(.{ .discard_keys = level });
-    }
-
-    pub fn emitHandshakeComplete(self: *EventSink) HandshakeError!void {
-        try self.push(.handshake_complete);
-    }
-};
+pub const Event = TransportContract.Event;
+pub const EventSink = TransportContract.EventSink;
+pub const TlsTransportBackend = TransportContract.Backend;
 
 /// Runtime interface to a concrete TLS 1.3 engine. The engine consumes and
 /// produces raw handshake bytes and reports keying material / negotiation
-/// results through the `EventSink`; it never sees QUIC packets or the adapter.
+/// results through the shared transport `EventSink`; it never sees QUIC packets
+/// or the adapter. QUIC connection-ID binding hooks stay local to this wrapper.
 pub const TlsBackend = struct {
-    ptr: *anyopaque,
-    startFn: *const fn (ptr: *anyopaque, role: Role, params: config.TransportParameters, sink: *EventSink) HandshakeError!void,
-    receiveFn: *const fn (ptr: *anyopaque, level: EncryptionLevel, bytes: []const u8, sink: *EventSink) HandshakeError!void,
+    transport: TlsTransportBackend,
     /// Optional RFC 9000 §7.3 authentication-binding hooks. A backend that
     /// carries connection IDs in its transport parameters implements both; the
     /// in-memory test backend leaves them null.
@@ -133,19 +65,19 @@ pub const TlsBackend = struct {
     peerCidBindingFn: ?*const fn (ptr: *anyopaque) config.CidBinding = null,
 
     fn start(self: TlsBackend, role: Role, params: config.TransportParameters, sink: *EventSink) HandshakeError!void {
-        return self.startFn(self.ptr, role, params, sink);
+        return self.transport.start(role, params, sink);
     }
 
     fn receive(self: TlsBackend, level: EncryptionLevel, bytes: []const u8, sink: *EventSink) HandshakeError!void {
-        return self.receiveFn(self.ptr, level, bytes, sink);
+        return self.transport.receive(level, bytes, sink);
     }
 
     pub fn setCidBinding(self: TlsBackend, binding: config.CidBinding) void {
-        if (self.setCidBindingFn) |set| set(self.ptr, binding);
+        if (self.setCidBindingFn) |set| set(self.transport.ptr, binding);
     }
 
     pub fn peerCidBinding(self: TlsBackend) config.CidBinding {
-        if (self.peerCidBindingFn) |get| return get(self.ptr);
+        if (self.peerCidBindingFn) |get| return get(self.transport.ptr);
         return .{};
     }
 };
@@ -280,12 +212,12 @@ pub const Handshake = struct {
         var index: usize = 0;
         while (index < self.sink.len) : (index += 1) {
             switch (self.sink.items[index]) {
-                .crypto => |c| self.adapter.queueHandshakeOutput(c.level, c.data) catch |err| return self.fail(switch (err) {
+                .handshake_bytes => |c| self.adapter.queueHandshakeOutput(c.epoch, c.data) catch |err| return self.fail(switch (err) {
                     error.InvalidCryptoLevel => error.UnexpectedCryptoLevel,
                     error.CryptoBufferTooLarge => error.HandshakeBufferOverflow,
                 }),
-                .secret => |s| {
-                    const secret = Secret.init(s.level, s.direction, s.data) catch return self.fail(error.SecretExportFailed);
+                .traffic_secret => |s| {
+                    const secret = Secret.init(s.epoch, s.direction, s.data) catch return self.fail(error.SecretExportFailed);
                     if (s.data.len != traffic_secret_len) return self.fail(error.SecretExportFailed);
                     self.adapter.installSecret(secret);
                 },
@@ -298,7 +230,7 @@ pub const Handshake = struct {
                     self.adapter.setCertificateState(cert_state);
                     if (cert_state == .invalid) return self.fail(error.CertificateInvalid);
                 },
-                .discard_keys => |level| self.discardOrDefer(level),
+                .discard_epoch => |level| self.discardOrDefer(level),
                 .handshake_complete => try self.complete(),
             }
         }
@@ -359,7 +291,13 @@ pub const TestTlsBackend = struct {
     transcript_len: usize = 0,
 
     pub fn backend(self: *TestTlsBackend) TlsBackend {
-        return .{ .ptr = self, .startFn = startImpl, .receiveFn = receiveImpl };
+        return .{
+            .transport = .{
+                .ptr = self,
+                .startFn = startImpl,
+                .receiveFn = receiveImpl,
+            },
+        };
     }
 
     fn appendTranscript(self: *TestTlsBackend, bytes: []const u8) void {

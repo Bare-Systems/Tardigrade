@@ -8,6 +8,7 @@ pub const messages = @import("messages.zig");
 pub const negotiation = @import("negotiation.zig");
 pub const policy = @import("policy.zig");
 pub const transcript = @import("transcript.zig");
+pub const transport = @import("transport.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());

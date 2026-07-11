@@ -20,23 +20,25 @@ lives under a protocol-neutral `src/tls/` core while the QUIC adapter keeps
 CRYPTO-frame transport and packet-key installation.**
 
 1. `src/quic/tls_handshake.zig` implements the connection-facing handshake
-   driver (`Handshake`) plus the backend interface (`TlsBackend`) and event
-   contract (`EventSink`). The driver owns none of the TLS cryptography; it only
-   routes handshake bytes through the adapter's CRYPTO streams, installs the
-   secrets the backend exports at the correct phase, authenticates transport
-   parameters, enforces ALPN `h3`, reports certificate state, and classifies
-   failures into a typed `HandshakeError`.
+   driver (`Handshake`) over the shared transport backend contract. The driver
+   owns none of the TLS cryptography; it only routes handshake bytes through the
+   adapter's CRYPTO streams, installs the secrets the backend exports at the
+   correct phase, authenticates transport parameters, enforces ALPN `h3`,
+   reports certificate state, and classifies failures into a typed
+   `HandshakeError`.
 
 2. `src/tls/` is the protocol-neutral TLS 1.3 core. `state.zig` defines roles,
    handshake states, and the explicit `quic` versus `record` transport modes;
    `events.zig` defines transport-neutral handshake byte, traffic-secret,
    certificate, ALPN, discard, completion, and TLS-level typed failure
-   vocabulary shared by QUIC and future record mode; `key_schedule.zig` owns
-   the SHA-256 TLS 1.3 key schedule with no QUIC, HTTP, socket, or record-layer
-   imports; and `engine.zig` is the shared shell that can be instantiated for
-   record mode before records exist. QUIC-only failures, such as CRYPTO-level
-   misuse or missing QUIC transport parameters, stay in the QUIC handshake
-   driver.
+   vocabulary shared by QUIC and future record mode; `transport.zig` defines
+   the generic backend vtable and bounded event sink that carriers instantiate
+   with their own epoch and transport-parameter payload types; `key_schedule.zig`
+   owns the SHA-256 TLS 1.3 key schedule with no QUIC, HTTP, socket, or
+   record-layer imports; and `engine.zig` is the shared shell that can be
+   instantiated for record mode before records exist. QUIC-only failures and
+   hooks, such as CRYPTO-level misuse, missing QUIC transport parameters, and
+   connection-ID binding, stay in the QUIC handshake driver.
 
 3. `src/quic/tls_backend.zig` is the concrete production adapter from that core
    to QUIC mode. It consumes and produces raw handshake messages per encryption

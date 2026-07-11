@@ -55,7 +55,7 @@ test "event vocabulary covers QUIC and record-mode TLS lifecycles" {
     try std.testing.expectEqual(CertificateState.valid, cert_event.certificate);
 }
 
-test "shared handshake errors include transport-required failure cases" {
+test "shared handshake errors include TLS-level failure cases" {
     const std = @import("std");
 
     const err: HandshakeError = error.MalformedHandshake;

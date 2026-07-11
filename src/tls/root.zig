@@ -1,3 +1,4 @@
+pub const alerts = @import("alerts.zig");
 pub const engine = @import("engine.zig");
 pub const state = @import("state.zig");
 pub const events = @import("events.zig");

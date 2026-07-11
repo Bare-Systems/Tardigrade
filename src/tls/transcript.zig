@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const key_schedule = @import("key_schedule.zig");
+const messages = @import("messages.zig");
 
 pub const Hash = key_schedule.TranscriptHash;
 pub const digest_len = key_schedule.hash_len;
@@ -24,8 +25,13 @@ pub const Transcript = struct {
     }
 
     pub fn replace(self: *Transcript, digest: [digest_len]u8) void {
+        var synthetic: [4 + digest_len]u8 = undefined;
+        synthetic[0] = @intFromEnum(messages.MessageType.message_hash);
+        std.mem.writeInt(u24, synthetic[1..4], digest_len, .big);
+        @memcpy(synthetic[4..], &digest);
+
         self.hash = Hash.init(.{});
-        self.hash.update(&digest);
+        self.hash.update(&synthetic);
     }
 };
 
@@ -41,6 +47,7 @@ test "transcript hash matches direct SHA-256 and supports HRR-style replacement"
 
     transcript.replace(expected);
     var rebound_expected: [digest_len]u8 = undefined;
-    Hash.hash(&expected, &rebound_expected, .{});
+    const synthetic = [_]u8{ 254, 0, 0, digest_len } ++ expected;
+    Hash.hash(&synthetic, &rebound_expected, .{});
     try testing.expectEqualSlices(u8, &rebound_expected, &transcript.peek());
 }

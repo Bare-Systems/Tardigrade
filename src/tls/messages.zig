@@ -21,10 +21,14 @@ pub const MessageType = enum(u8) {
     client_hello = 1,
     server_hello = 2,
     new_session_ticket = 4,
+    end_of_early_data = 5,
     encrypted_extensions = 8,
     certificate = 11,
+    certificate_request = 13,
     certificate_verify = 15,
     finished = 20,
+    key_update = 24,
+    message_hash = 254,
 };
 
 pub const HandshakeMessage = struct {
@@ -215,6 +219,25 @@ test "encode and decode exact handshake bytes" {
     try testing.expectEqual(MessageType.finished, msg.kind);
     try testing.expectEqualSlices(u8, raw, msg.raw);
     try testing.expectEqualSlices(u8, &.{ 1, 2, 3 }, msg.body);
+}
+
+test "decode accepts TLS 1.3 handshake types used outside the common flight" {
+    const message_hash = [_]u8{ 254, 0, 0, 32 } ++ ([_]u8{0} ** 32);
+    const cases = [_]struct {
+        raw: []const u8,
+        kind: MessageType,
+    }{
+        .{ .raw = &.{ 5, 0, 0, 0 }, .kind = .end_of_early_data },
+        .{ .raw = &.{ 13, 0, 0, 0 }, .kind = .certificate_request },
+        .{ .raw = &.{ 24, 0, 0, 0 }, .kind = .key_update },
+        .{ .raw = &message_hash, .kind = .message_hash },
+    };
+
+    for (cases) |case| {
+        const msg = try decode(case.raw);
+        try testing.expectEqual(case.kind, msg.kind);
+        try testing.expectEqualSlices(u8, case.raw, msg.raw);
+    }
 }
 
 test "fragmented and coalesced messages reassemble without losing transcript bytes" {

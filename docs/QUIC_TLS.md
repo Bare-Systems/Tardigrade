@@ -92,14 +92,14 @@ where appropriate, but its `Client` state machine cannot drive a QUIC handshake.
 - Integrate the driver with the packet layer and connection state machine.
   This includes the connection-binding transport parameters
   (`initial_source_connection_id`, `original_destination_connection_id`,
-  `retry_source_connection_id`, `stateless_reset_token`): the backend's TP
-  codec covers the `config.TransportParameters` subset, and per-connection CID
-  material must be supplied by the connection layer when it wires up the
-  driver — the handshake cannot authenticate CIDs it never sees.
+  `retry_source_connection_id`, `stateless_reset_token`): carried through
+  `config.CidBinding` — the connection driver commits its CIDs via
+  `TlsBackend.setCidBinding` before the first flight and validates the peer's
+  binding at handshake completion (RFC 9000 §7.3).
 - Session resumption / 0-RTT (product decision), HelloRetryRequest, additional
   cipher suites and signature algorithms, and web-PKI certificate-chain
   validation in the pure-Zig backend.
-- Interop, fuzz, and benchmark coverage against ngtcp2/nghttp3 and quiche (#247).
+- Fuzz and benchmark coverage (#247); external interop against ngtcp2/nghttp3, quiche, and aioquic runs out of process via `scripts/interop/run-interop.sh`.
 - TLS key logging for local decryption (#255): `installSecret` is the single
   choke point where every traffic secret is installed, so the debug-only keylog
   `Sink` (`src/quic/keylog.zig`) is invoked there when `keylog_enabled`. Initial

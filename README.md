@@ -90,11 +90,8 @@ Requirements:
 - [Zig](https://ziglang.org/) 0.16.0
 - OpenSSL development libraries on Linux, for example `libssl-dev` on Debian or
   Ubuntu
-- Optional C-backed HTTP/3 support additionally requires the `ngtcp2`,
-  `nghttp3`, and `ngtcp2_crypto_ossl` system libraries. Enable it explicitly
-  with `-Denable-http3-ngtcp2=true`.
-- The experimental pure-Zig QUIC/HTTP-3 path is enabled with
-  `-Denable-http3-zig=true` and does not require those system libraries.
+- HTTP/3 is served by the built-in native Zig QUIC/H3 stack and requires no
+  additional system libraries.
 
 For development:
 

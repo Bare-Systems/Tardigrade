@@ -1,19 +1,14 @@
-//! `Http3Transport` — the C-backend replacement boundary (#242).
+//! `Http3Transport` — the backend-neutral HTTP/3 listener boundary (#242).
 //!
-//! Both HTTP/3 backends implement this vtable, selected at build time:
-//!   * `-Denable-http3-ngtcp2` — the current ngtcp2/nghttp3 C-backed path.
-//!   * `-Denable-http3-zig`    — the pure-Zig `src/quic` + `src/http3` path.
-//!
-//! The boundary sits *at the transport*: above the QUIC/ngtcp2 machinery and
-//! below `http3_handler` / `handleHttp3Request`, so pseudo-header mapping,
-//! response encoding, and the gateway bridge are reused by both backends. No
-//! backend-specific type (ngtcp2 handle, `src/quic` connection) escapes this
-//! interface. The gateway itself drives h1/h2/h3 through the shared
+//! The boundary sits *at the transport*: above the QUIC machinery and below
+//! `http3_handler` / `handleHttp3Request`, so pseudo-header mapping, response
+//! encoding, and the gateway bridge stay independent of the transport
+//! implementation. No transport-specific type (`src/quic` connection) escapes
+//! this interface. The gateway itself drives h1/h2/h3 through the shared
 //! `stream_transport` contract; this seam is only the h3 listener lifecycle.
 //!
-//! Status: interface defined (#242). Retrofitting the existing ngtcp2 runtime
-//! onto this vtable, and implementing the pure-Zig backend, are tracked
-//! follow-ups (#246 and the QUIC implementation issues).
+//! Since #328 the only in-process implementation is the native Zig stack
+//! (`src/quic` + `src/http3`, wired up by `src/http/http3_runtime.zig`).
 
 const std = @import("std");
 const stream_transport = @import("stream_transport");

@@ -6,24 +6,9 @@ pub fn build(b: *std.Build) void {
     const prefer_static_system_libs = b.option(bool, "prefer-static-system-libs", "Prefer static linking for system libraries") orelse false;
     const require_static_system_libs = b.option(bool, "require-static-system-libs", "Require static linking for system libraries") orelse false;
     const static_executable = b.option(bool, "static-executable", "Build the tardigrade executable as a static binary") orelse false;
-    const enable_http3_ngtcp2 = b.option(bool, "enable-http3-ngtcp2", "Enable experimental HTTP/3 ngtcp2/nghttp3 system-library integration (requires system libraries)") orelse false;
-    // Pure-Zig QUIC/HTTP-3 path (#240). Off by default and in active development;
-    // needs no system libraries. Mutually exclusive with the ngtcp2 backend —
-    // both would provide HTTP/3.
-    const enable_http3_zig = b.option(bool, "enable-http3-zig", "Enable the experimental pure-Zig QUIC/HTTP-3 path (no system libraries; off by default, in development)") orelse false;
-    if (enable_http3_ngtcp2 and enable_http3_zig) {
-        std.debug.panic("Enable at most one HTTP/3 backend: -Denable-http3-ngtcp2 (C libraries) or -Denable-http3-zig (pure Zig), not both.", .{});
-    }
-    if (enable_http3_ngtcp2) {
-        requireHttp3Ngtcp2Dependencies(b, target.result.os.tag, target.result.cpu.arch, prefer_static_system_libs, require_static_system_libs);
-    }
     const app_version = b.option([]const u8, "version", "Version string embedded in the tardigrade binary") orelse "dev";
-    const osslclient_default_path = "/tmp/ngtcp2-upstream/build/examples/osslclient";
-    const http3_osslclient_path = b.option([]const u8, "http3-osslclient-path", "Path to the ngtcp2 OpenSSL HTTP/3 example client used by 0-RTT integration tests") orelse if (pathExists(osslclient_default_path)) osslclient_default_path else "";
 
     const build_options = b.addOptions();
-    build_options.addOption(bool, "enable_http3_ngtcp2", enable_http3_ngtcp2);
-    build_options.addOption(bool, "enable_http3_zig", enable_http3_zig);
     build_options.addOption([]const u8, "version", app_version);
     const compat_mod = b.createModule(.{
         .root_source_file = b.path("src/zig_compat.zig"),
@@ -41,6 +26,38 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // Shared leaf modules. A Zig source file belongs to exactly one module,
+    // so anything consumed by both the exe tree and the quic/http3 packages
+    // (varint, huffman tables, the protocol-neutral stream contract) is a
+    // named module everywhere.
+    const hpack_huffman_mod = b.createModule(.{
+        .root_source_file = b.path("src/http/hpack_huffman.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const stream_transport_mod = b.createModule(.{
+        .root_source_file = b.path("src/http/stream_transport.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Native QUIC transport and HTTP/3 packages (#240): the production
+    // HTTP/3 backend since #328. No system libraries.
+    const quic_mod = b.createModule(.{
+        .root_source_file = b.path("src/quic/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    quic_mod.addImport("quic_varint", quic_varint_mod);
+    const http3_mod = b.createModule(.{
+        .root_source_file = b.path("src/http3/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    http3_mod.addImport("hpack_huffman", hpack_huffman_mod);
+    http3_mod.addImport("stream_transport", stream_transport_mod);
+    http3_mod.addImport("quic_varint", quic_varint_mod);
+
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
@@ -49,13 +66,17 @@ pub fn build(b: *std.Build) void {
     });
     exe_mod.addImport("build_options", build_options.createModule());
     exe_mod.addImport("quic_varint", quic_varint_mod);
+    exe_mod.addImport("hpack_huffman", hpack_huffman_mod);
+    exe_mod.addImport("stream_transport", stream_transport_mod);
+    exe_mod.addImport("quic", quic_mod);
+    exe_mod.addImport("http3", http3_mod);
 
     const exe = b.addExecutable(.{
         .name = "tardigrade",
         .root_module = exe_mod,
         .linkage = if (static_executable) .static else null,
     });
-    configureSsl(exe, enable_http3_ngtcp2, prefer_static_system_libs, require_static_system_libs);
+    configureSsl(exe, prefer_static_system_libs, require_static_system_libs);
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
@@ -67,7 +88,7 @@ pub fn build(b: *std.Build) void {
     const exe_unit_tests = b.addTest(.{
         .root_module = exe_mod,
     });
-    configureSsl(exe_unit_tests, enable_http3_ngtcp2, prefer_static_system_libs, require_static_system_libs);
+    configureSsl(exe_unit_tests, prefer_static_system_libs, require_static_system_libs);
 
     const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);
     const test_step = b.step("test", "Run unit tests");
@@ -81,12 +102,16 @@ pub fn build(b: *std.Build) void {
     });
     allocation_regression_mod.addImport("build_options", build_options.createModule());
     allocation_regression_mod.addImport("quic_varint", quic_varint_mod);
+    allocation_regression_mod.addImport("hpack_huffman", hpack_huffman_mod);
+    allocation_regression_mod.addImport("stream_transport", stream_transport_mod);
+    allocation_regression_mod.addImport("quic", quic_mod);
+    allocation_regression_mod.addImport("http3", http3_mod);
 
     const allocation_regression_tests = b.addTest(.{
         .root_module = allocation_regression_mod,
         .filters = &.{"allocation"},
     });
-    configureSsl(allocation_regression_tests, enable_http3_ngtcp2, prefer_static_system_libs, require_static_system_libs);
+    configureSsl(allocation_regression_tests, prefer_static_system_libs, require_static_system_libs);
     const run_allocation_regression_tests = b.addRunArtifact(allocation_regression_tests);
     test_step.dependOn(&run_allocation_regression_tests.step);
 
@@ -94,29 +119,13 @@ pub fn build(b: *std.Build) void {
         .name = "allocation_regression",
         .root_module = allocation_regression_mod,
     });
-    configureSsl(allocation_regression_exe, enable_http3_ngtcp2, prefer_static_system_libs, require_static_system_libs);
+    configureSsl(allocation_regression_exe, prefer_static_system_libs, require_static_system_libs);
     const run_allocation_regression = b.addRunArtifact(allocation_regression_exe);
     const allocation_regression_step = b.step("bench-allocations", "Report hot-path allocation budgets as JSON");
     allocation_regression_step.dependOn(&run_allocation_regression.step);
 
     const integration_options = b.addOptions();
     integration_options.addOption([]const u8, "tardigrade_bin_path", b.getInstallPath(.bin, "tardigrade"));
-    integration_options.addOption([]const u8, "http3_resumption_client_bin_path", if (enable_http3_ngtcp2) b.getInstallPath(.bin, "http3_resumption_client") else "");
-    integration_options.addOption([]const u8, "http3_osslclient_bin_path", http3_osslclient_path);
-
-    if (enable_http3_ngtcp2) {
-        const resumption_client_mod = b.createModule(.{
-            .root_source_file = b.path("tests/http3_resumption_client.zig"),
-            .target = target,
-            .optimize = optimize,
-        });
-        resumption_client_mod.addImport("zig_compat", compat_mod);
-        const resumption_client = b.addExecutable(.{
-            .name = "http3_resumption_client",
-            .root_module = resumption_client_mod,
-        });
-        b.installArtifact(resumption_client);
-    }
 
     const integration_mod = b.createModule(.{
         .root_source_file = b.path("tests/integration.zig"),
@@ -179,15 +188,7 @@ pub fn build(b: *std.Build) void {
     const security_corpus_step = b.step("test-security-corpus", "Run request parser corpus regression tests");
     security_corpus_step.dependOn(&run_security_corpus_tests.step);
 
-    // Pure-Zig QUIC/HTTP-3 package (#240): a first-class test target rather than
-    // only being compiled transitively through the exe. No system libraries.
-    const quic_mod = b.createModule(.{
-        .root_source_file = b.path("src/quic/root.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    quic_mod.addImport("quic_varint", quic_varint_mod);
-    // varint.zig now lives in its own module, so its tests need their own run.
+    // varint.zig lives in its own module, so its tests need their own run.
     const quic_varint_tests = b.addTest(.{ .root_module = quic_varint_mod });
     const run_quic_varint_tests = b.addRunArtifact(quic_varint_tests);
     const quic_tests = b.addTest(.{ .root_module = quic_mod });
@@ -213,25 +214,6 @@ pub fn build(b: *std.Build) void {
     crypto_step.dependOn(&run_crypto_tests.step);
     test_step.dependOn(&run_crypto_tests.step);
 
-    const http3_mod = b.createModule(.{
-        .root_source_file = b.path("src/http3/root.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    // Shared with the smoke harness below so stream_transport types (Exchange,
-    // Header) keep one module identity across the boundary.
-    const stream_transport_mod = b.createModule(.{
-        .root_source_file = b.path("src/http/stream_transport.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    http3_mod.addImport("hpack_huffman", b.createModule(.{
-        .root_source_file = b.path("src/http/hpack_huffman.zig"),
-        .target = target,
-        .optimize = optimize,
-    }));
-    http3_mod.addImport("stream_transport", stream_transport_mod);
-    http3_mod.addImport("quic_varint", quic_varint_mod);
     const http3_tests = b.addTest(.{ .root_module = http3_mod });
     const run_http3_tests = b.addRunArtifact(http3_tests);
     quic_step.dependOn(&run_http3_tests.step);
@@ -311,188 +293,15 @@ fn pathExists(path: []const u8) bool {
     return true;
 }
 
-const SystemDependency = struct {
-    name: []const u8,
-    headers: []const []const u8,
-};
-
-const http3_ngtcp2_deps = [_]SystemDependency{
-    .{
-        .name = "ngtcp2",
-        .headers = &.{
-            "ngtcp2/ngtcp2.h",
-            "ngtcp2/ngtcp2_crypto.h",
-        },
-    },
-    .{
-        .name = "ngtcp2_crypto_ossl",
-        .headers = &.{
-            "ngtcp2/ngtcp2_crypto_ossl.h",
-        },
-    },
-    .{
-        .name = "nghttp3",
-        .headers = &.{
-            "nghttp3/nghttp3.h",
-        },
-    },
-};
-
-fn requireHttp3Ngtcp2Dependencies(
-    b: *std.Build,
-    os_tag: std.Target.Os.Tag,
-    arch: std.Target.Cpu.Arch,
-    prefer_static: bool,
-    require_static: bool,
-) void {
-    const include_dirs = systemIncludeSearchPaths(os_tag, arch);
-    const library_dirs = systemLibrarySearchPaths(os_tag, arch, prefer_static);
-    const library_extensions = libraryExtensions(os_tag, prefer_static, require_static);
-
-    for (http3_ngtcp2_deps) |dep| {
-        for (dep.headers) |header| {
-            if (!findRelativePath(b, include_dirs, header)) {
-                std.debug.panic(
-                    \\Missing optional HTTP/3 header '{s}' required by -Denable-http3-ngtcp2.
-                    \\Install the ngtcp2/nghttp3 OpenSSL backend development packages, then retry.
-                    \\Debian/Ubuntu packages when available: libngtcp2-dev libngtcp2-crypto-ossl-dev libnghttp3-dev.
-                    \\macOS Homebrew: brew install ngtcp2 nghttp3.
-                    \\For a no-system-library build, omit -Denable-http3-ngtcp2 or use -Denable-http3-zig.
-                    \\
-                , .{header});
-            }
-        }
-        if (!findSystemLibrary(b, library_dirs, dep.name, library_extensions)) {
-            std.debug.panic(
-                \\Missing optional HTTP/3 library 'lib{s}' required by -Denable-http3-ngtcp2.
-                \\Install the ngtcp2/nghttp3 OpenSSL backend development packages, then retry.
-                \\Debian/Ubuntu packages when available: libngtcp2-dev libngtcp2-crypto-ossl-dev libnghttp3-dev.
-                \\macOS Homebrew: brew install ngtcp2 nghttp3.
-                \\For a no-system-library build, omit -Denable-http3-ngtcp2 or use -Denable-http3-zig.
-                \\
-            , .{dep.name});
-        }
-    }
-}
-
-fn findRelativePath(b: *std.Build, dirs: []const []const u8, relative_path: []const u8) bool {
-    for (dirs) |dir| {
-        const candidate = std.fs.path.join(b.allocator, &.{ dir, relative_path }) catch @panic("out of memory");
-        defer b.allocator.free(candidate);
-        if (pathExists(candidate)) return true;
-    }
-    return false;
-}
-
-fn findSystemLibrary(
-    b: *std.Build,
-    dirs: []const []const u8,
-    name: []const u8,
-    extensions: []const []const u8,
-) bool {
-    for (extensions) |extension| {
-        const file_name = std.fmt.allocPrint(b.allocator, "lib{s}{s}", .{ name, extension }) catch @panic("out of memory");
-        defer b.allocator.free(file_name);
-        if (findRelativePath(b, dirs, file_name)) return true;
-    }
-    return false;
-}
-
-fn systemIncludeSearchPaths(os_tag: std.Target.Os.Tag, arch: std.Target.Cpu.Arch) []const []const u8 {
-    return switch (os_tag) {
-        .macos => &.{
-            "/opt/homebrew/include",
-            "/usr/local/include",
-            "/opt/homebrew/opt/openssl@3/include",
-            "/usr/local/opt/openssl@3/include",
-        },
-        .linux => switch (arch) {
-            .aarch64 => &.{
-                "/usr/local/include",
-                "/usr/include",
-                "/usr/include/aarch64-linux-gnu",
-            },
-            .x86_64 => &.{
-                "/usr/local/include",
-                "/usr/include",
-                "/usr/include/x86_64-linux-gnu",
-            },
-            else => &.{
-                "/usr/local/include",
-                "/usr/include",
-            },
-        },
-        else => &.{"/usr/include"},
-    };
-}
-
-fn systemLibrarySearchPaths(os_tag: std.Target.Os.Tag, arch: std.Target.Cpu.Arch, prefer_static: bool) []const []const u8 {
-    _ = prefer_static;
-    return switch (os_tag) {
-        .macos => &.{
-            "/opt/homebrew/lib",
-            "/usr/local/lib",
-            "/opt/homebrew/opt/openssl@3/lib",
-            "/usr/local/opt/openssl@3/lib",
-        },
-        .linux => switch (arch) {
-            .aarch64 => &.{
-                "/usr/local/lib",
-                "/usr/lib/aarch64-linux-gnu",
-                "/lib/aarch64-linux-gnu",
-                "/usr/lib",
-                "/lib",
-            },
-            .x86_64 => &.{
-                "/usr/local/lib",
-                "/usr/lib/x86_64-linux-gnu",
-                "/lib/x86_64-linux-gnu",
-                "/usr/lib",
-                "/lib",
-            },
-            else => &.{
-                "/usr/local/lib",
-                "/usr/lib",
-                "/lib",
-            },
-        },
-        else => &.{
-            "/usr/local/lib",
-            "/usr/lib",
-            "/lib",
-        },
-    };
-}
-
-fn libraryExtensions(os_tag: std.Target.Os.Tag, prefer_static: bool, require_static: bool) []const []const u8 {
-    if (require_static) return &.{".a"};
-    if (prefer_static) {
-        return switch (os_tag) {
-            .macos => &.{ ".a", ".dylib" },
-            else => &.{ ".a", ".so" },
-        };
-    }
-    return switch (os_tag) {
-        .macos => &.{ ".dylib", ".a" },
-        else => &.{ ".so", ".a" },
-    };
-}
-
-/// Link OpenSSL (required) and optional HTTP/3 libraries against a compile step.
+/// Link OpenSSL against a compile step.
 fn configureSsl(
     compile: *std.Build.Step.Compile,
-    enable_http3_ngtcp2: bool,
     prefer_static: bool,
     require_static: bool,
 ) void {
     configureSystemLibrarySearchPaths(compile, prefer_static);
     linkSystemLibrary(compile, "ssl", prefer_static, require_static);
     linkSystemLibrary(compile, "crypto", prefer_static, require_static);
-    if (enable_http3_ngtcp2) {
-        linkSystemLibrary(compile, "ngtcp2", prefer_static, require_static);
-        linkSystemLibrary(compile, "ngtcp2_crypto_ossl", prefer_static, require_static);
-        linkSystemLibrary(compile, "nghttp3", prefer_static, require_static);
-    }
 }
 
 fn linkSystemLibrary(

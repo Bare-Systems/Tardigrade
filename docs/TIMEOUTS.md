@@ -36,7 +36,7 @@ Two principles, from the #196/#141 arc:
 | WebSocket idle | `WEBSOCKET_IDLE_TIMEOUT_MS` | 30000 | relay loop idle check | connection closed | ✅ |
 | SSE idle | `SSE_IDLE_TIMEOUT_MS` | 30000 | send-loop idle check | stream ended | ✅ |
 | HTTP/2 downstream per-stream phases | — | — | lifecycle checkpoint at stream start only | — | ⬜ frame-level per-stream deadlines need downstream-h2 work; connection inherits socket timeouts only |
-| HTTP/3 / QUIC | — | (idle hardcoded in `ngtcp2_binding`) | QUIC transport internal | — | ⬜ experimental; not yet mapped to this policy |
+| HTTP/3 / QUIC | — | 30s idle (`src/quic/config.zig` `idle_timeout_ms`) | QUIC transport internal | — | ⬜ experimental; not yet mapped to this policy |
 
 ## Upstream (origin side)
 

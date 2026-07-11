@@ -378,6 +378,9 @@ pub fn Conn(comptime Transport: type) type {
         }
 
         /// Encode and send a response with optional body, closing the stream.
+        /// The body is framed in bounded DATA chunks; if the transport's send
+        /// buffer fills before everything is queued, `error.StreamBackpressure`
+        /// is returned (streamed responses over H3 arrive with #257).
         pub fn sendResponse(
             self: *Self,
             transport: *Transport,
@@ -387,16 +390,33 @@ pub fn Conn(comptime Transport: type) type {
             body: []const u8,
         ) !void {
             var wire: [8192]u8 = undefined;
-            var len: usize = 0;
-            len += (try session.ResponseEncoder.encodeHeaders(status, headers, wire[len..])).len;
-            if (body.len > 0) {
-                len += (try session.ResponseEncoder.encodeData(body, wire[len..])).len;
-            }
-            var written: usize = 0;
-            while (written < len) {
-                written += try transport.writeStream(stream_id, wire[written..len], true);
+            const header_frame = try session.ResponseEncoder.encodeHeaders(status, headers, &wire);
+            try self.writeAll(transport, stream_id, header_frame, body.len == 0);
+
+            var offset: usize = 0;
+            while (offset < body.len) {
+                const chunk_len = @min(body.len - offset, 4096);
+                const chunk = try session.ResponseEncoder.encodeData(body[offset..][0..chunk_len], &wire);
+                offset += chunk_len;
+                try self.writeAll(transport, stream_id, chunk, offset == body.len);
             }
             self.finishRequest(stream_id);
+        }
+
+        fn writeAll(self: *Self, transport: *Transport, stream_id: u64, bytes: []const u8, fin: bool) !void {
+            _ = self;
+            // The transport records FIN only when it accepts the whole slice
+            // of a fin-marked write, so passing `fin` per attempt is exact.
+            if (bytes.len == 0) {
+                if (fin) _ = try transport.writeStream(stream_id, "", true);
+                return;
+            }
+            var written: usize = 0;
+            while (written < bytes.len) {
+                const n = try transport.writeStream(stream_id, bytes[written..], fin);
+                if (n == 0) return error.StreamBackpressure;
+                written += n;
+            }
         }
 
         pub fn finishRequest(self: *Self, stream_id: u64) void {

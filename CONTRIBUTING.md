@@ -80,10 +80,7 @@ filter, e.g. `zig build test-integration -- --test-filter "failure: client abort
 | `-Dstatic-executable=true` | `false` | Fully static binary |
 | `-Dprefer-static-system-libs=true` | `false` | Prefer static OpenSSL/crypto |
 | `-Drequire-static-system-libs=true` | `false` | Fail if static libs are unavailable |
-| `-Denable-http3-ngtcp2=true` | `false` | Enable experimental C-backed HTTP/3 via ngtcp2/nghttp3 system-library integration; requires the ngtcp2/nghttp3/ngtcp2_crypto_ossl system libraries |
-| `-Denable-http3-zig=true` | `false` | Enable the experimental pure-Zig QUIC/HTTP-3 path (no system libraries; in development). Mutually exclusive with `-Denable-http3-ngtcp2` |
 | `-Dversion=x.y.z` | `dev` | Embed a version string in the binary |
-| `-Dhttp3-osslclient-path=<path>` | auto-detect | Path to osslclient for 0-RTT tests |
 
 ## Common workflows
 
@@ -97,9 +94,6 @@ zig build -Doptimize=ReleaseFast
 # Static binary (Linux, requires static OpenSSL)
 zig build -Dstatic-executable=true -Drequire-static-system-libs=true
 
-# Build with HTTP/3 support (requires system ngtcp2/nghttp3 libraries)
-zig build -Denable-http3-ngtcp2=true
-
 # Run a specific test by name filter
 zig build test -- --test-filter "jwt"
 
@@ -107,21 +101,17 @@ zig build test -- --test-filter "jwt"
 zig build test -- --test-timeout-ns 10000000000
 ```
 
-### HTTP/3 backends
+### HTTP/3
 
-The **default build ships no HTTP/3** and needs no HTTP/3 system libraries — a
-clean checkout builds consistently anywhere. Two mutually-exclusive backends can
-be opted into:
-
-- `-Denable-http3-ngtcp2` — the C-backed path; requires the ngtcp2/nghttp3
-  system libraries. Validation is a manual/local build step rather than a
-  required CI job because the Ubuntu runner image does not consistently provide
-  the `ngtcp2` OpenSSL backend development package.
-- `-Denable-http3-zig` — the pure-Zig QUIC/HTTP-3 path (#240); no system
-  libraries, in active development. Its package is unit-tested via
-  `zig build test-quic`.
-
-Enabling both fails the build with an actionable message.
+HTTP/3 is served by the native Zig QUIC/H3 stack in `src/quic/` and
+`src/http3/` (#240/#328). It needs **no HTTP/3 system libraries** and is
+always compiled; the listener activates at runtime with `--http3` plus a
+QUIC-compatible TLS identity (Ed25519 or ECDSA P-256 certificate). The stack
+is unit- and integration-tested via `zig build test-quic`, and validated
+against external implementations (ngtcp2/nghttp3, quiche, aioquic — run as
+separate processes) via `scripts/interop/run-interop.sh`. Rollback path for
+the pre-native C-backed implementation is past tagged releases, not a build
+flag.
 
 ## Formatting
 

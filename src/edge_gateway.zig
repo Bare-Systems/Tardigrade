@@ -281,12 +281,9 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
             .max_datagram_size = cfg.http3_max_datagram_size,
             .request_handler = ghandlers.handleHttp3Request,
             .request_handler_ctx = &http3_dispatch_ctx,
-        }) catch |err| switch (err) {
-            error.DependencyUnavailable => blk: {
-                state.logger.warn(null, "HTTP/3 requested but ngtcp2/nghttp3 integration is not enabled in this build", .{});
-                break :blk null;
-            },
-            else => return err,
+        }) catch |err| blk: {
+            state.logger.warn(null, "HTTP/3 listener failed to initialize: {s}", .{@errorName(err)});
+            break :blk null;
         };
         if (http3_runtime) |*runtime| runtime.start();
     }

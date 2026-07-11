@@ -1098,7 +1098,7 @@ const Http3LocationOutcome = union(enum) {
 /// correlation id, and a `Location` header for redirects. Returns the emitted
 /// status. Kept free of gateway state (metrics/security headers stay in the
 /// caller) so the h3 rendering — the part that had drifted from h1 — is
-/// unit-testable without the ngtcp2 integration backend (#201).
+/// unit-testable without a live QUIC listener (#201).
 fn shapeHttp3ReturnResponse(
     allocator: std.mem.Allocator,
     response: *http.Response,

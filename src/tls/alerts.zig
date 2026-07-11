@@ -18,22 +18,22 @@ pub const AlertDescription = enum(u8) {
     decrypt_error = 51,
     missing_extension = 109,
     unsupported_extension = 110,
+    no_application_protocol = 120,
     certificate_required = 116,
     internal_error = 80,
 };
 
 /// Maps a `tls_core.events.HandshakeError` to the fatal alert a peer must be
-/// sent, or `null` if the error is not a TLS protocol violation. ALPN
-/// mismatch is a local negotiation policy failure, not a TLS-level protocol
-/// error, so it is intentionally left unmapped here; transports that need an
-/// alert-like code for it (e.g. QUIC's `no_application_protocol`) define
-/// their own translation.
-pub fn fromHandshakeError(err: events.HandshakeError) ?AlertDescription {
+/// sent. Per RFC 7301 §3.2, a server that cannot negotiate a mutually
+/// supported application protocol sends fatal `no_application_protocol`;
+/// RFC 9001 §4.1.1 has QUIC translate that same TLS alert into its
+/// CRYPTO_ERROR space rather than defining a separate close reason.
+pub fn fromHandshakeError(err: events.HandshakeError) AlertDescription {
     return switch (err) {
         error.MalformedHandshake => .decode_error,
         error.CertificateInvalid => .bad_certificate,
         error.SecretExportFailed => .internal_error,
-        error.AlpnMismatch => null,
+        error.AlpnMismatch => .no_application_protocol,
     };
 }
 
@@ -51,11 +51,11 @@ test "secret export failure maps to internal_error" {
     try testing.expectEqual(AlertDescription.internal_error, fromHandshakeError(error.SecretExportFailed));
 }
 
-test "ALPN mismatch is not a TLS protocol alert" {
-    try testing.expectEqual(@as(?AlertDescription, null), fromHandshakeError(error.AlpnMismatch));
+test "ALPN mismatch maps to no_application_protocol" {
+    try testing.expectEqual(AlertDescription.no_application_protocol, fromHandshakeError(error.AlpnMismatch));
 }
 
-test "alert description values match RFC 8446 section 6" {
+test "alert description values match RFC 8446 section 6 and RFC 7301 section 3.2" {
     try testing.expectEqual(@as(u8, 0), @intFromEnum(AlertDescription.close_notify));
     try testing.expectEqual(@as(u8, 10), @intFromEnum(AlertDescription.unexpected_message));
     try testing.expectEqual(@as(u8, 42), @intFromEnum(AlertDescription.bad_certificate));
@@ -66,5 +66,6 @@ test "alert description values match RFC 8446 section 6" {
     try testing.expectEqual(@as(u8, 109), @intFromEnum(AlertDescription.missing_extension));
     try testing.expectEqual(@as(u8, 110), @intFromEnum(AlertDescription.unsupported_extension));
     try testing.expectEqual(@as(u8, 116), @intFromEnum(AlertDescription.certificate_required));
+    try testing.expectEqual(@as(u8, 120), @intFromEnum(AlertDescription.no_application_protocol));
     try testing.expectEqual(@as(u8, 80), @intFromEnum(AlertDescription.internal_error));
 }

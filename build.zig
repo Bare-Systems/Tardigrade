@@ -79,6 +79,12 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_exe_unit_tests.step);
 
+    const tls_core_tests = b.addTest(.{ .root_module = tls_core_mod });
+    const run_tls_core_tests = b.addRunArtifact(tls_core_tests);
+    const tls_step = b.step("test-tls", "Run pure-Zig TLS core unit tests");
+    tls_step.dependOn(&run_tls_core_tests.step);
+    test_step.dependOn(&run_tls_core_tests.step);
+
     const allocation_regression_mod = b.createModule(.{
         .root_source_file = b.path("src/allocation_regression.zig"),
         .target = target,

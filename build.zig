@@ -284,6 +284,26 @@ pub fn build(b: *std.Build) void {
     const run_quic_h3_udp_tests = b.addRunArtifact(quic_h3_udp_tests);
     quic_step.dependOn(&run_quic_h3_udp_tests.step);
     test_step.dependOn(&run_quic_h3_udp_tests.step);
+
+    // Out-of-process interop client/server for #247 phase 5. Built on the
+    // native driver only; external peers (ngtcp2/nghttp3, quiche, aioquic)
+    // run as separate processes — see scripts/interop/README.md.
+    const h3_interop_mod = b.createModule(.{
+        .root_source_file = b.path("tests/h3_interop_tool.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    h3_interop_mod.addImport("quic", quic_mod);
+    h3_interop_mod.addImport("http3", http3_mod);
+    h3_interop_mod.addImport("stream_transport", stream_transport_mod);
+    const h3_interop_tool = b.addExecutable(.{
+        .name = "h3_interop_tool",
+        .root_module = h3_interop_mod,
+    });
+    const h3_interop_install = b.addInstallArtifact(h3_interop_tool, .{});
+    const h3_interop_step = b.step("build-h3-interop", "Build the native HTTP/3 interop client/server tool");
+    h3_interop_step.dependOn(&h3_interop_install.step);
 }
 
 fn pathExists(path: []const u8) bool {

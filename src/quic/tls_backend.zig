@@ -30,6 +30,7 @@ const HmacSha256 = crypto.auth.hmac.sha2.HmacSha256;
 const HkdfSha256 = crypto.kdf.hkdf.HkdfSha256;
 const X25519 = crypto.dh.X25519;
 const Ed25519 = crypto.sign.Ed25519;
+const EcdsaP256 = crypto.sign.ecdsa.EcdsaP256Sha256;
 const Certificate = crypto.Certificate;
 
 const EncryptionLevel = tls_adapter.EncryptionLevel;
@@ -50,6 +51,7 @@ const legacy_version: u16 = 0x0303;
 const cipher_tls_aes_128_gcm_sha256: u16 = 0x1301;
 const group_x25519: u16 = 0x001d;
 const sigalg_ed25519: u16 = 0x0807;
+const sigalg_ecdsa_secp256r1_sha256: u16 = 0x0403;
 
 const ext_supported_groups: u16 = 10;
 const ext_signature_algorithms: u16 = 13;
@@ -467,20 +469,128 @@ const Writer = struct {
 // Server identity and client trust.
 // ===========================================================================
 
-/// The server's certificate and Ed25519 signing key. `initPkcs8` loads the
-/// standard PKCS#8 DER encoding (RFC 8410) produced by e.g.
-/// `openssl genpkey -algorithm ed25519`.
+/// The server's certificate and signing key: Ed25519 (RFC 8410) or ECDSA
+/// P-256 (RFC 5915/5480). `initPkcs8` loads standard PKCS#8 DER as produced
+/// by `openssl genpkey -algorithm ed25519` or
+/// `openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256`. Two key
+/// types because deployed TLS stacks disagree on defaults: GnuTLS/OpenSSL
+/// accept Ed25519 out of the box while BoringSSL's default verifier
+/// (quiche/Chromium) requires ECDSA/RSA — P-256 is the interoperable floor.
 pub const Identity = struct {
     certificate_der: []const u8,
-    key_pair: Ed25519.KeyPair,
+    key: Key,
+
+    pub const Key = union(enum) {
+        ed25519: Ed25519.KeyPair,
+        ecdsa_p256: EcdsaP256.KeyPair,
+    };
 
     pub const InitError = error{InvalidPrivateKey};
 
     pub fn initPkcs8(certificate_der: []const u8, pkcs8_key_der: []const u8) InitError!Identity {
-        const seed = try ed25519SeedFromPkcs8(pkcs8_key_der);
-        const key_pair = Ed25519.KeyPair.generateDeterministic(seed) catch return error.InvalidPrivateKey;
-        return .{ .certificate_der = certificate_der, .key_pair = key_pair };
+        if (ed25519SeedFromPkcs8(pkcs8_key_der)) |seed| {
+            const key_pair = Ed25519.KeyPair.generateDeterministic(seed) catch return error.InvalidPrivateKey;
+            return .{ .certificate_der = certificate_der, .key = .{ .ed25519 = key_pair } };
+        } else |_| {}
+        const scalar = try ecdsaP256KeyFromPkcs8(pkcs8_key_der);
+        const secret = EcdsaP256.SecretKey.fromBytes(scalar) catch return error.InvalidPrivateKey;
+        const key_pair = EcdsaP256.KeyPair.fromSecretKey(secret) catch return error.InvalidPrivateKey;
+        return .{ .certificate_der = certificate_der, .key = .{ .ecdsa_p256 = key_pair } };
     }
+
+    /// The TLS SignatureScheme this identity signs CertificateVerify with.
+    pub fn signatureAlgorithm(self: *const Identity) u16 {
+        return switch (self.key) {
+            .ed25519 => sigalg_ed25519,
+            .ecdsa_p256 => sigalg_ecdsa_secp256r1_sha256,
+        };
+    }
+
+    /// Extract the P-256 private scalar from PKCS#8 DER (RFC 5915 inside
+    /// RFC 5958): SEQUENCE { INTEGER 0, SEQUENCE { OID id-ecPublicKey, OID
+    /// prime256v1 }, OCTET STRING { SEQUENCE { INTEGER 1, OCTET STRING(32)
+    /// privateKey, ... } } }. Bounded, no allocation.
+    fn ecdsaP256KeyFromPkcs8(der: []const u8) InitError![32]u8 {
+        const oid_ec_public_key = [_]u8{ 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01 };
+        const oid_prime256v1 = [_]u8{ 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07 };
+        var walker = DerWalker{ .bytes = der };
+        var outer = try walker.sequence();
+        // Both encodings openssl produces: PKCS#8 (RFC 5958, version 0)
+        // wrapping ECPrivateKey, or a bare SEC1/RFC 5915 ECPrivateKey
+        // (version 1) as written by `openssl pkey -outform DER`.
+        var probe = outer;
+        const version = try probe.integer();
+        if (version == 1) {
+            return ecPrivateKeyScalar(&outer);
+        }
+        try outer.expectInteger(0);
+        var alg = try outer.sequence();
+        try alg.expectBytes(&oid_ec_public_key);
+        try alg.expectBytes(&oid_prime256v1);
+        const key_octets = try outer.octetString();
+        var inner_walker = DerWalker{ .bytes = key_octets };
+        var ec_key = try inner_walker.sequence();
+        return ecPrivateKeyScalar(&ec_key);
+    }
+
+    /// RFC 5915 ECPrivateKey body: INTEGER 1, OCTET STRING privateKey, ...
+    fn ecPrivateKeyScalar(ec_key: *DerWalker) InitError![32]u8 {
+        try ec_key.expectInteger(1);
+        const scalar = try ec_key.octetString();
+        if (scalar.len != 32) return error.InvalidPrivateKey;
+        return scalar[0..32].*;
+    }
+
+    const DerWalker = struct {
+        bytes: []const u8,
+        pos: usize = 0,
+
+        fn tagged(self: *DerWalker, tag: u8) InitError![]const u8 {
+            if (self.pos + 2 > self.bytes.len) return error.InvalidPrivateKey;
+            if (self.bytes[self.pos] != tag) return error.InvalidPrivateKey;
+            var len: usize = self.bytes[self.pos + 1];
+            var header: usize = 2;
+            if (len == 0x81) {
+                if (self.pos + 3 > self.bytes.len) return error.InvalidPrivateKey;
+                len = self.bytes[self.pos + 2];
+                header = 3;
+            } else if (len == 0x82) {
+                if (self.pos + 4 > self.bytes.len) return error.InvalidPrivateKey;
+                len = (@as(usize, self.bytes[self.pos + 2]) << 8) | self.bytes[self.pos + 3];
+                header = 4;
+            } else if (len > 0x80) {
+                return error.InvalidPrivateKey;
+            }
+            if (self.pos + header + len > self.bytes.len) return error.InvalidPrivateKey;
+            const content = self.bytes[self.pos + header ..][0..len];
+            self.pos += header + len;
+            return content;
+        }
+
+        fn sequence(self: *DerWalker) InitError!DerWalker {
+            return .{ .bytes = try self.tagged(0x30) };
+        }
+
+        fn octetString(self: *DerWalker) InitError![]const u8 {
+            return self.tagged(0x04);
+        }
+
+        fn integer(self: *DerWalker) InitError!u8 {
+            const content = try self.tagged(0x02);
+            if (content.len != 1) return error.InvalidPrivateKey;
+            return content[0];
+        }
+
+        fn expectInteger(self: *DerWalker, value: u8) InitError!void {
+            if (try self.integer() != value) return error.InvalidPrivateKey;
+        }
+
+        fn expectBytes(self: *DerWalker, expected: []const u8) InitError!void {
+            if (self.pos + expected.len > self.bytes.len) return error.InvalidPrivateKey;
+            if (!std.mem.eql(u8, self.bytes[self.pos..][0..expected.len], expected)) return error.InvalidPrivateKey;
+            self.pos += expected.len;
+        }
+    };
 
     /// Extract the 32-byte Ed25519 seed from a PKCS#8 `OneAsymmetricKey` DER
     /// (RFC 8410 §7): SEQUENCE { version 0, AlgorithmIdentifier id-Ed25519,
@@ -758,9 +868,10 @@ pub const Tls13Backend = struct {
         try w.u16_(group_x25519);
 
         try w.u16_(ext_signature_algorithms);
+        try w.u16_(6);
         try w.u16_(4);
-        try w.u16_(2);
         try w.u16_(sigalg_ed25519);
+        try w.u16_(sigalg_ecdsa_secp256r1_sha256);
 
         try w.u16_(ext_key_share);
         try w.u16_(2 + 2 + 2 + X25519.public_length);
@@ -907,19 +1018,32 @@ pub const Tls13Backend = struct {
     }
 
     fn verifyServerCertificate(self: *Tls13Backend, algorithm: u16, signature: []const u8, content: []const u8) CertificateState {
-        if (algorithm != sigalg_ed25519) return .invalid;
-        if (signature.len != Ed25519.Signature.encoded_length) return .invalid;
         const leaf = self.peer_certificate[0..self.peer_certificate_len];
 
         // Proof of key possession: the CertificateVerify signature must check
         // out against the certificate's public key in every trust mode.
         const parsed = (Certificate{ .buffer = leaf, .index = 0 }).parse() catch return .invalid;
-        if (parsed.pub_key_algo != .curveEd25519) return .invalid;
-        const pub_key_bytes = parsed.pubKey();
-        if (pub_key_bytes.len != Ed25519.PublicKey.encoded_length) return .invalid;
-        const public_key = Ed25519.PublicKey.fromBytes(pub_key_bytes[0..Ed25519.PublicKey.encoded_length].*) catch return .invalid;
-        const sig = Ed25519.Signature.fromBytes(signature[0..Ed25519.Signature.encoded_length].*);
-        sig.verify(content, public_key) catch return .invalid;
+        switch (algorithm) {
+            sigalg_ed25519 => {
+                if (signature.len != Ed25519.Signature.encoded_length) return .invalid;
+                if (parsed.pub_key_algo != .curveEd25519) return .invalid;
+                const pub_key_bytes = parsed.pubKey();
+                if (pub_key_bytes.len != Ed25519.PublicKey.encoded_length) return .invalid;
+                const public_key = Ed25519.PublicKey.fromBytes(pub_key_bytes[0..Ed25519.PublicKey.encoded_length].*) catch return .invalid;
+                const sig = Ed25519.Signature.fromBytes(signature[0..Ed25519.Signature.encoded_length].*);
+                sig.verify(content, public_key) catch return .invalid;
+            },
+            sigalg_ecdsa_secp256r1_sha256 => {
+                switch (parsed.pub_key_algo) {
+                    .X9_62_id_ecPublicKey => |curve| if (curve != .X9_62_prime256v1) return .invalid,
+                    else => return .invalid,
+                }
+                const public_key = EcdsaP256.PublicKey.fromSec1(parsed.pubKey()) catch return .invalid;
+                const sig = EcdsaP256.Signature.fromDer(signature) catch return .invalid;
+                sig.verify(content, public_key) catch return .invalid;
+            },
+            else => return .invalid,
+        }
 
         return switch (self.trust) {
             .pinned_certificate => |pin| if (std.mem.eql(u8, leaf, pin)) .valid else .invalid,
@@ -980,9 +1104,10 @@ pub const Tls13Backend = struct {
         }
         if (!offers_cipher or !offers_null_compression) return error.MalformedHandshake;
 
+        const required_sigalg = self.identity.?.signatureAlgorithm();
         var offers_tls13 = false;
         var offers_x25519_group = false;
-        var offers_ed25519 = false;
+        var offers_our_sigalg = false;
         var peer_share: ?[X25519.public_length]u8 = null;
         var alpn_match = false;
         var first_alpn: []const u8 = "";
@@ -1012,7 +1137,7 @@ pub const Tls13Backend = struct {
                 ext_signature_algorithms => {
                     var algorithms = Reader{ .bytes = try ext.slice(try ext.u16_()) };
                     while (algorithms.remaining() > 0) {
-                        if (try algorithms.u16_() == sigalg_ed25519) offers_ed25519 = true;
+                        if (try algorithms.u16_() == required_sigalg) offers_our_sigalg = true;
                     }
                 },
                 ext_key_share => {
@@ -1038,7 +1163,7 @@ pub const Tls13Backend = struct {
                 else => {},
             }
         }
-        if (!offers_tls13 or !offers_x25519_group or !offers_ed25519) return error.MalformedHandshake;
+        if (!offers_tls13 or !offers_x25519_group or !offers_our_sigalg) return error.MalformedHandshake;
         const client_share = peer_share orelse return error.MalformedHandshake;
 
         // Validate the peer share before emitting anything: X25519.scalarmult
@@ -1141,14 +1266,26 @@ pub const Tls13Backend = struct {
         // CertificateVerify signs the transcript through Certificate.
         self.transcript.update(buf[0..w.len]);
         const content = certificateVerifyContent(.server, self.transcript.peek());
-        const signature = identity.key_pair.sign(content.slice(), null) catch
-            return error.SecretExportFailed;
         const verify_start = w.len;
         try w.u8_(@intFromEnum(MessageType.certificate_verify));
         const verify_len = try w.reserve(3);
-        try w.u16_(sigalg_ed25519);
-        try w.u16_(Ed25519.Signature.encoded_length);
-        try w.bytes(&signature.toBytes());
+        try w.u16_(identity.signatureAlgorithm());
+        switch (identity.key) {
+            .ed25519 => |key_pair| {
+                const signature = key_pair.sign(content.slice(), null) catch
+                    return error.SecretExportFailed;
+                try w.u16_(Ed25519.Signature.encoded_length);
+                try w.bytes(&signature.toBytes());
+            },
+            .ecdsa_p256 => |key_pair| {
+                const signature = key_pair.sign(content.slice(), null) catch
+                    return error.SecretExportFailed;
+                var der_buf: [EcdsaP256.Signature.der_encoded_length_max]u8 = undefined;
+                const der = signature.toDer(&der_buf);
+                try w.u16_(@intCast(der.len));
+                try w.bytes(der);
+            },
+        }
         w.patch(3, verify_len);
         self.transcript.update(buf[verify_start..w.len]);
 
@@ -1352,7 +1489,19 @@ test "fixture identity loads and its key pair matches the certificate public key
     const identity = fixtureIdentity();
     const parsed = try (Certificate{ .buffer = fixture_certificate, .index = 0 }).parse();
     try testing.expect(parsed.pub_key_algo == .curveEd25519);
-    try testing.expectEqualSlices(u8, parsed.pubKey(), &identity.key_pair.public_key.toBytes());
+    try testing.expectEqualSlices(u8, parsed.pubKey(), &identity.key.ed25519.public_key.toBytes());
+}
+
+test "PKCS#8 parsing loads an ECDSA P-256 key" {
+    // openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256, DER.
+    const p256_pkcs8 = [_]u8{
+        0x30, 0x41, 0x02, 0x01, 0x00, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48,
+        0xce, 0x3d, 0x02, 0x01, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03,
+        0x01, 0x07, 0x04, 0x27, 0x30, 0x25, 0x02, 0x01, 0x01, 0x04, 0x20,
+    } ++ [_]u8{0x11} ** 32;
+    const identity = try Identity.initPkcs8(fixture_certificate, &p256_pkcs8);
+    try testing.expect(identity.key == .ecdsa_p256);
+    try testing.expectEqual(sigalg_ecdsa_secp256r1_sha256, identity.signatureAlgorithm());
 }
 
 test "PKCS#8 parsing rejects non-Ed25519 and malformed keys" {

@@ -32,6 +32,10 @@ pub fn ContractWithOptions(
     comptime buffer_overflow_error: ErrorSet,
 ) type {
     return struct {
+        pub const TransportParametersType = TransportParameters;
+        pub const EpochType = Epoch;
+        pub const Error = ErrorSet;
+
         pub const Event = union(enum) {
             /// Raw TLS handshake bytes to send at `epoch`.
             handshake_bytes: struct { epoch: Epoch, data: []const u8 },

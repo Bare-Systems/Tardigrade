@@ -422,14 +422,16 @@ pub const Runtime = struct {
             entry.h3_started = true;
         }
         entry.h3.pump(entry.conn) catch |err| {
-            // An H3-level protocol error closes the connection (RFC 9114 §8).
-            self.logger.warn(null, "http3: session error {s}; closing connection", .{@errorName(err)});
-            entry.conn.close(0x0101, "h3 protocol error", now); // H3_GENERAL_PROTOCOL_ERROR
+            // An H3-level protocol error closes the connection with the
+            // specific RFC 9114 §8.1 code the session layer recorded.
+            const code = entry.h3.closeCode();
+            self.logger.warn(null, "http3: session error {s} (close code 0x{x}); closing connection", .{ @errorName(err), code });
+            entry.conn.close(code, "h3 protocol error", now);
             return;
         };
         while (true) {
             const incoming = entry.h3.pollRequest() catch {
-                entry.conn.close(0x0101, "h3 request error", now);
+                entry.conn.close(entry.h3.closeCode(), "h3 request error", now);
                 return;
             } orelse break;
             self.serveRequest(entry, incoming, now);

@@ -27,6 +27,27 @@ pub const H3Error = error{
     UnknownStream,
 };
 
+/// HTTP/3 wire error codes (RFC 9114 §8.1). Zig errors carry no payload, so
+/// when a method returns `error.ProtocolError` the connection-close code
+/// travels via `Conn.closeCode()`.
+pub const ErrorCode = enum(u64) {
+    no_error = 0x0100,
+    general_protocol_error = 0x0101,
+    internal_error = 0x0102,
+    stream_creation_error = 0x0103,
+    closed_critical_stream = 0x0104,
+    frame_unexpected = 0x0105,
+    frame_error = 0x0106,
+    id_error = 0x0108,
+    settings_error = 0x0109,
+    missing_settings = 0x010a,
+    message_error = 0x010e,
+
+    pub fn wire(self: ErrorCode) u64 {
+        return @intFromEnum(self);
+    }
+};
+
 /// Hard bound for one accumulated response (headers + body) on the client
 /// side; mirrors `session.RequestStream.max_frame_payload_len`.
 pub const max_response_len: usize = 1024 * 1024;
@@ -66,6 +87,9 @@ pub fn Conn(comptime Transport: type) type {
         responses: std.AutoHashMap(u64, *ClientResponse),
         /// Bidirectional streams the peer opened that we haven't classified.
         metrics: Metrics = .{},
+        /// The RFC 9114 code to close the QUIC connection with after a
+        /// method returned `error.ProtocolError`; see `closeCode`.
+        close_code: ?ErrorCode = null,
 
         pub const Metrics = struct {
             requests_decoded: u64 = 0,
@@ -118,6 +142,46 @@ pub fn Conn(comptime Transport: type) type {
             self.responses.deinit();
         }
 
+        /// The RFC 9114 §8.1 code to close the QUIC connection with after a
+        /// method returned `error.ProtocolError`.
+        pub fn closeCode(self: *const Self) u64 {
+            const code = self.close_code orelse ErrorCode.general_protocol_error;
+            return code.wire();
+        }
+
+        /// Record the wire close code (first failure wins) and produce the
+        /// generic protocol error the H3Error set carries.
+        fn fail(self: *Self, code: ErrorCode) H3Error {
+            if (self.close_code == null) self.close_code = code;
+            return error.ProtocolError;
+        }
+
+        fn failControl(self: *Self, err: frame.DecodeError) H3Error {
+            return switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.MissingSettings => self.fail(.missing_settings),
+                error.DuplicateSettings => self.fail(.frame_unexpected),
+                error.InvalidControlFrame => self.fail(.frame_unexpected),
+                error.ReservedSetting,
+                error.DuplicateSetting,
+                error.InvalidSettingValue,
+                error.MalformedSettings,
+                => self.fail(.settings_error),
+                error.BufferTooShort,
+                error.FrameLengthOverflow,
+                error.FrameTooLarge,
+                => self.fail(.frame_error),
+                error.ControlStreamClosed => self.fail(.closed_critical_stream),
+                error.InvalidUnidirectionalStreamType,
+                error.DuplicateControlStream,
+                => self.fail(.stream_creation_error),
+            };
+        }
+
+        fn isCriticalUniType(typ: frame.StreamType) bool {
+            return typ == .control or typ == .qpack_encoder or typ == .qpack_decoder;
+        }
+
         /// Open the control stream and send SETTINGS. Call once the QUIC
         /// connection is established.
         pub fn start(self: *Self, transport: *Transport) !void {
@@ -151,9 +215,10 @@ pub fn Conn(comptime Transport: type) type {
                         return error.OutOfMemory;
                     };
                 } else {
-                    // A server must not open bidirectional streams (RFC 9114
-                    // §6.1); flag and ignore.
-                    self.metrics.unknown_uni_streams += 1;
+                    // A server must not open bidirectional streams: without a
+                    // negotiated extension this is a connection error of type
+                    // H3_STREAM_CREATION_ERROR (RFC 9114 §6.1).
+                    return self.fail(.stream_creation_error);
                 }
             }
             try self.pumpUniStreams(transport);
@@ -168,7 +233,14 @@ pub fn Conn(comptime Transport: type) type {
                 const state = entry.value_ptr;
                 var buf: [2048]u8 = undefined;
                 while (true) {
-                    const result = transport.readStream(id, &buf) catch break;
+                    const result = transport.readStream(id, &buf) catch |err| {
+                        // A reset of a critical stream closes it just as a FIN
+                        // does (RFC 9114 §6.2.1, RFC 9204 §4.2).
+                        if (err == error.StreamReset and isCriticalUniType(state.typ)) {
+                            return self.fail(.closed_critical_stream);
+                        }
+                        break;
+                    };
                     if (result.len == 0 and !result.fin) break;
                     var bytes: []const u8 = buf[0..result.len];
                     if (!state.classified and bytes.len > 0) {
@@ -178,30 +250,51 @@ pub fn Conn(comptime Transport: type) type {
                         // The control-stream view consumes its own stream-type
                         // varint; strip it only for the other types.
                         if (decoded.typ != .control) bytes = bytes[decoded.len..];
+                        // Only one peer control stream and one of each QPACK
+                        // stream is allowed; a duplicate is a connection error
+                        // of type H3_STREAM_CREATION_ERROR (RFC 9114 §6.2.1,
+                        // RFC 9204 §4.2).
                         switch (decoded.typ) {
                             .control => {
-                                if (self.peer_control != null) return error.ProtocolError;
+                                if (self.peer_control != null) return self.fail(.stream_creation_error);
                                 self.peer_control = id;
                             },
-                            .qpack_encoder => self.peer_qpack_encoder = id,
-                            .qpack_decoder => self.peer_qpack_decoder = id,
+                            .qpack_encoder => {
+                                if (self.peer_qpack_encoder != null) return self.fail(.stream_creation_error);
+                                self.peer_qpack_encoder = id;
+                            },
+                            .qpack_decoder => {
+                                if (self.peer_qpack_decoder != null) return self.fail(.stream_creation_error);
+                                self.peer_qpack_decoder = id;
+                            },
                             .push => {
-                                // We never send MAX_PUSH_ID, so any push
-                                // stream is a protocol error (RFC 9114 §7.2.3).
-                                if (self.role == .client) return error.ProtocolError;
-                                self.metrics.unknown_uni_streams += 1;
+                                // Only servers push, and we never send
+                                // MAX_PUSH_ID, so a push stream at the client
+                                // exceeds the push ID space (H3_ID_ERROR, RFC
+                                // 9114 §7.2.3) and one at the server is a
+                                // stream the peer may not create (§6.2.2).
+                                if (self.role == .client) return self.fail(.id_error);
+                                return self.fail(.stream_creation_error);
                             },
                             .unknown => self.metrics.unknown_uni_streams += 1,
                         }
                     }
                     if (bytes.len > 0 and state.typ == .control) {
-                        _ = self.peer_control_view.ingest(self.allocator, bytes) catch return error.ProtocolError;
+                        _ = self.peer_control_view.ingest(self.allocator, bytes) catch |err| {
+                            return self.failControl(err);
+                        };
                         if (self.peer_control_view.saw_settings) self.metrics.settings_received = true;
                     }
                     // QPACK encoder/decoder instructions: with a zero-capacity
                     // dynamic table the peer sends none that affect state;
                     // unknown streams are drained and dropped.
-                    if (result.fin) break;
+                    if (result.fin) {
+                        // Closing the control or either QPACK stream is a
+                        // connection error of type H3_CLOSED_CRITICAL_STREAM
+                        // (RFC 9114 §6.2.1, RFC 9204 §4.2).
+                        if (isCriticalUniType(state.typ)) return self.fail(.closed_critical_stream);
+                        break;
+                    }
                 }
             }
         }
@@ -217,7 +310,9 @@ pub fn Conn(comptime Transport: type) type {
                 while (true) {
                     const result = transport.readStream(id, &buf) catch break;
                     if (result.len > 0) {
-                        _ = request.stream.ingestBytes(buf[0..result.len], &qpack_scratch) catch return error.ProtocolError;
+                        _ = request.stream.ingestBytes(buf[0..result.len], &qpack_scratch) catch {
+                            return self.fail(.message_error);
+                        };
                     }
                     if (result.fin) {
                         request.finished = true;
@@ -370,7 +465,7 @@ pub fn Conn(comptime Transport: type) type {
             while (it.next()) |entry| {
                 const request = entry.value_ptr.*;
                 if (!request.finished or request.stream.finished) continue;
-                const exchange = request.stream.finish() catch return error.ProtocolError;
+                const exchange = request.stream.finish() catch return self.fail(.message_error);
                 self.metrics.requests_decoded += 1;
                 return .{ .stream_id = entry.key_ptr.*, .exchange = exchange };
             }
@@ -560,6 +655,74 @@ test "H3 conn: SETTINGS exchange and request/response over a mock transport" {
     try testing.expectEqualStrings("pong", response.body);
     try testing.expectEqualStrings("server", response.headers[0].name);
     client.releaseResponse(id);
+}
+
+test "H3 conn: duplicate QPACK encoder stream is a stream creation error" {
+    const allocator = testing.allocator;
+    var client_transport = MockTransport.init(allocator, true);
+    defer client_transport.deinit();
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+    client_transport.peer = &server_transport;
+    server_transport.peer = &client_transport;
+
+    const H3 = Conn(MockTransport);
+    var client = H3.init(allocator, .client);
+    defer client.deinit();
+
+    // The "server" opens two uni streams that both declare the QPACK encoder
+    // stream type (0x02).
+    const first = try server_transport.openStream(.uni);
+    _ = try server_transport.writeStream(first, "\x02", false);
+    const second = try server_transport.openStream(.uni);
+    _ = try server_transport.writeStream(second, "\x02", false);
+
+    try testing.expectError(error.ProtocolError, client.pump(&client_transport));
+    try testing.expectEqual(ErrorCode.stream_creation_error.wire(), client.closeCode());
+}
+
+test "H3 conn: server-initiated bidirectional stream is a connection error at the client" {
+    const allocator = testing.allocator;
+    var client_transport = MockTransport.init(allocator, true);
+    defer client_transport.deinit();
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+    client_transport.peer = &server_transport;
+    server_transport.peer = &client_transport;
+
+    const H3 = Conn(MockTransport);
+    var client = H3.init(allocator, .client);
+    defer client.deinit();
+
+    _ = try server_transport.openStream(.bidi);
+    try testing.expectError(error.ProtocolError, client.pump(&client_transport));
+    try testing.expectEqual(ErrorCode.stream_creation_error.wire(), client.closeCode());
+}
+
+test "H3 conn: FIN on the peer control stream closes the connection" {
+    const allocator = testing.allocator;
+    var client_transport = MockTransport.init(allocator, true);
+    defer client_transport.deinit();
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+    client_transport.peer = &server_transport;
+    server_transport.peer = &client_transport;
+
+    const H3 = Conn(MockTransport);
+    var client = H3.init(allocator, .client);
+    defer client.deinit();
+    var server = H3.init(allocator, .server);
+    defer server.deinit();
+
+    // A well-formed control stream (type + SETTINGS) that then ends.
+    try server.start(&server_transport);
+    const control = server.control_out.?;
+    _ = try server_transport.writeStream(control, "", true);
+
+    try testing.expectError(error.ProtocolError, client.pump(&client_transport));
+    try testing.expectEqual(ErrorCode.closed_critical_stream.wire(), client.closeCode());
+    // SETTINGS were still processed before the close.
+    try testing.expect(client.metrics.settings_received);
 }
 
 test {

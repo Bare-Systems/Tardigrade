@@ -99,6 +99,9 @@ pub const Event = union(enum) {
     close_sent: struct { error_code: u64 },
     close_received: struct { error_code: u64, is_application: bool },
     idle_timeout,
+    /// A PATH_RESPONSE echoed the outstanding PATH_CHALLENGE: the path is
+    /// validated (RFC 9000 §8.2.3).
+    path_validated: [frame.path_data_len]u8,
 };
 
 pub const DropReason = enum {
@@ -314,6 +317,10 @@ const SentRecord = struct {
     carried_handshake_done: bool = false,
     carried_reset_stream: ?quic_stream.ResetStreamFrame = null,
     carried_stop_sending: ?quic_stream.StopSendingFrame = null,
+    /// PATH_CHALLENGE re-arms on loss; PATH_RESPONSE does not (the peer
+    /// re-challenges, RFC 9000 §8.2.2). Both force datagram expansion.
+    carried_path_challenge: bool = false,
+    carried_path_response: bool = false,
     carried_ack_largest: ?u64 = null,
 
     const StreamRange = struct {
@@ -392,6 +399,13 @@ pub const Connection = struct {
     pending_stop_sending: std.ArrayList(quic_stream.StopSendingFrame) = .empty,
     pending_retires: std.ArrayList(u64) = .empty,
     pending_path_responses: std.ArrayList([frame.path_data_len]u8) = .empty,
+    /// Path validation we initiated (RFC 9000 §8.2): the challenge data that
+    /// must come back in a PATH_RESPONSE. `needs_send` re-arms transmission
+    /// (initially and when the carrying packet is lost); completion is
+    /// surfaced via `consumePathValidated` and the `path_validated` event.
+    path_challenge_data: ?[frame.path_data_len]u8 = null,
+    path_challenge_needs_send: bool = false,
+    path_validated_data: ?[frame.path_data_len]u8 = null,
 
     idle_deadline_us: ?u64 = null,
     last_activity_us: u64,
@@ -852,7 +866,19 @@ pub const Connection = struct {
                     try self.pending_path_responses.append(self.allocator, data);
                 }
             },
-            .path_response => {},
+            .path_response => |data| {
+                // Validation completes only when the response echoes the
+                // outstanding challenge (RFC 9000 §8.2.3). Anything else is a
+                // response to an abandoned challenge; ignoring it is permitted
+                // (§19.18 makes the connection error optional).
+                if (level != .application) return;
+                const expected = self.path_challenge_data orelse return;
+                if (!std.mem.eql(u8, &data, &expected)) return;
+                self.path_challenge_data = null;
+                self.path_challenge_needs_send = false;
+                self.path_validated_data = data;
+                self.events.emit(.{ .path_validated = data });
+            },
             .connection_close => |cc| {
                 self.events.emit(.{ .close_received = .{ .error_code = cc.error_code, .is_application = cc.is_application } });
                 self.close_info = .{ .error_code = cc.error_code, .is_application = cc.is_application, .local = false };
@@ -985,6 +1011,9 @@ pub const Connection = struct {
         }
         if (record.carried_stop_sending) |stop| {
             self.pending_stop_sending.append(self.allocator, stop) catch {};
+        }
+        if (record.carried_path_challenge and self.path_challenge_data != null) {
+            self.path_challenge_needs_send = true;
         }
     }
 
@@ -1412,6 +1441,39 @@ pub const Connection = struct {
         }
     }
 
+    // -- path validation --------------------------------------------------------
+
+    /// Begin path validation (RFC 9000 §8.2): queue a PATH_CHALLENGE carrying
+    /// `data` — caller-supplied randomness, since the driver is sans-I/O. The
+    /// challenge is retransmitted if the packet carrying it is lost;
+    /// validation completes when the peer echoes the data, surfaced through
+    /// `consumePathValidated` and the `path_validated` event. One validation
+    /// runs at a time: a new call replaces an unanswered challenge.
+    pub fn startPathValidation(self: *Connection, data: [frame.path_data_len]u8) void {
+        self.path_challenge_data = data;
+        self.path_challenge_needs_send = true;
+    }
+
+    /// True while a PATH_CHALLENGE is outstanding.
+    pub fn pathValidationInFlight(self: *const Connection) bool {
+        return self.path_challenge_data != null;
+    }
+
+    /// Give up on an unanswered challenge (the embedder's validation timer
+    /// expired, RFC 9000 §8.2.4). Late responses are then ignored.
+    pub fn abandonPathValidation(self: *Connection) void {
+        self.path_challenge_data = null;
+        self.path_challenge_needs_send = false;
+    }
+
+    /// The echoed data of a completed path validation, delivered once. The
+    /// embedder must not switch traffic to a migrated path before this fires
+    /// (RFC 9000 §9.3).
+    pub fn consumePathValidated(self: *Connection) ?[frame.path_data_len]u8 {
+        defer self.path_validated_data = null;
+        return self.path_validated_data;
+    }
+
     pub fn stopSending(self: *Connection, id: StreamId, app_error_code: u64) !void {
         var manager = self.streamManager() orelse return error.NotEstablished;
         const stop = try manager.sendStopSending(id, app_error_code);
@@ -1655,8 +1717,13 @@ pub const Connection = struct {
             @memset(plain[plain_len..sample_min], 0);
             plain_len = sample_min;
         }
-        if (ctx.datagram_has_initial and ctx.is_last_level) {
-            const target = min_initial_datagram - ctx.datagram_so_far;
+        // Datagrams carrying Initial packets pad to 1200 (§14.1); so do
+        // datagrams carrying PATH_CHALLENGE or PATH_RESPONSE (§8.2.1-2, to
+        // validate the path's MTU). `plain_budget` already reflects the
+        // anti-amplification allowance, which §8.2.1 lets cap the expansion.
+        const expand_for_path = record.carried_path_challenge or record.carried_path_response;
+        if ((ctx.datagram_has_initial and ctx.is_last_level) or expand_for_path) {
+            const target = min_initial_datagram -| ctx.datagram_so_far;
             const packet_overhead = pn_offset + pn_len + aead_tag_len;
             if (packet_overhead + plain_len < target and target <= plain_budget + packet_overhead) {
                 const padded = target - packet_overhead;
@@ -1724,6 +1791,7 @@ pub const Connection = struct {
         if (self.pending_stop_sending.items.len > 0) return true;
         if (self.pending_retires.items.len > 0) return true;
         if (self.pending_path_responses.items.len > 0) return true;
+        if (self.path_challenge_needs_send and self.path_challenge_data != null) return true;
         var it = self.send_queues.iterator();
         while (it.next()) |entry| {
             const queue = entry.value_ptr.*;
@@ -1794,7 +1862,18 @@ pub const Connection = struct {
             const n = frame.encodePathResponse(data, plain[plain_len..budget]) catch break;
             plain_len += n;
             record.ack_eliciting = true;
+            record.carried_path_response = true;
             _ = self.pending_path_responses.orderedRemove(0);
+        }
+        if (self.path_challenge_needs_send) {
+            if (self.path_challenge_data) |data| {
+                if (frame.encodePathChallenge(data, plain[plain_len..budget])) |n| {
+                    plain_len += n;
+                    record.ack_eliciting = true;
+                    record.carried_path_challenge = true;
+                    self.path_challenge_needs_send = false;
+                } else |_| {}
+            } else self.path_challenge_needs_send = false;
         }
 
         // Stream data: retransmissions first, then new bytes.
@@ -2108,6 +2187,47 @@ test "driver: stream reset propagates" {
 
     var buf: [16]u8 = undefined;
     try testing.expectError(error.StreamReset, pair.server.readStream(id, &buf));
+}
+
+test "driver: path validation completes when the peer echoes the challenge" {
+    const allocator = testing.allocator;
+    var pair = try TestPair.init(allocator);
+    defer pair.deinit(allocator);
+    try pair.pump();
+
+    const data = [frame.path_data_len]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    pair.client.startPathValidation(data);
+    try testing.expect(pair.client.pathValidationInFlight());
+    try pair.pump();
+
+    try testing.expect(!pair.client.pathValidationInFlight());
+    try testing.expectEqual(@as(?[frame.path_data_len]u8, data), pair.client.consumePathValidated());
+    // Delivered exactly once.
+    try testing.expectEqual(@as(?[frame.path_data_len]u8, null), pair.client.consumePathValidated());
+}
+
+test "driver: a mismatched PATH_RESPONSE does not validate the path" {
+    const allocator = testing.allocator;
+    var pair = try TestPair.init(allocator);
+    defer pair.deinit(allocator);
+    try pair.pump();
+
+    // The server answers a challenge the client has already replaced: the
+    // stale echo must not complete the new validation.
+    pair.client.startPathValidation([_]u8{0xaa} ** frame.path_data_len);
+    var buf: [2048]u8 = undefined;
+    while (pair.client.pollTransmit(&buf, pair.now_us)) |datagram| {
+        try pair.server.ingest(datagram, pair.now_us);
+    }
+    pair.client.startPathValidation([_]u8{0xbb} ** frame.path_data_len);
+    try pair.pump();
+
+    // The first challenge's response is ignored; the second completes.
+    try testing.expect(!pair.client.pathValidationInFlight());
+    try testing.expectEqual(
+        @as(?[frame.path_data_len]u8, [_]u8{0xbb} ** frame.path_data_len),
+        pair.client.consumePathValidated(),
+    );
 }
 
 test "driver: idle timeout closes silently" {

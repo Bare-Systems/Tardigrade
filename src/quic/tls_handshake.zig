@@ -29,6 +29,8 @@ const traffic_secret_len = tls_adapter.traffic_secret_len;
 pub const Role = tls_core.state.Role;
 
 pub const HandshakeError = tls_core.events.HandshakeError || error{
+    /// The generic TLS driver was called in an invalid lifecycle state.
+    InvalidHandshakeState,
     /// A CRYPTO fragment arrived at a level the handshake never uses (0-RTT).
     UnexpectedCryptoLevel,
     /// Handshake completed without the peer's QUIC transport parameters.
@@ -51,6 +53,7 @@ const TransportContract = tls_core.transport.ContractWithOptions(
 pub const Event = TransportContract.Event;
 pub const EventSink = TransportContract.EventSink;
 pub const TlsTransportBackend = TransportContract.Backend;
+pub const CoreDriver = tls_core.engine.Driver(TransportContract);
 
 /// Runtime interface to a concrete TLS 1.3 engine. The engine consumes and
 /// produces raw handshake bytes and reports keying material / negotiation
@@ -89,16 +92,13 @@ pub const State = tls_core.state.DriverState;
 /// `isComplete()` or `failure()` is set.
 pub const Handshake = struct {
     adapter: *QuicTlsAdapter,
-    backend: TlsBackend,
-    role: Role,
+    driver: CoreDriver,
     /// Require ALPN to negotiate exactly `h3` (the QUIC/H3 path). Always true
     /// for HTTP/3; exposed so future ALPNs can reuse the driver.
     require_alpn_h3: bool = true,
     /// Local-only escape hatch to accept `.not_checked` certificate state at
     /// completion. Off by default; tests must opt in explicitly.
     allow_unverified_certificate: bool = false,
-    state: State = .idle,
-    failure_reason: ?HandshakeError = null,
     /// When true, the connection driver owns key-discard timing (RFC 9001
     /// §4.9 / RFC 9002 §6.4): backend discard events only mark the level in
     /// `discard_requested`, and the driver applies them through the adapter
@@ -113,39 +113,33 @@ pub const Handshake = struct {
     /// the Initial level in the same event batch that discards Initial keys),
     /// so the discard is applied once `pollOutput` drains the level.
     pending_discard: [4]bool = .{ false, false, false, false },
-    sink: EventSink = .{},
 
     pub fn initClient(adapter: *QuicTlsAdapter, backend: TlsBackend) Handshake {
-        return .{ .adapter = adapter, .backend = backend, .role = .client };
+        return .{ .adapter = adapter, .driver = CoreDriver.init(.client, backend.transport) };
     }
 
     pub fn initServer(adapter: *QuicTlsAdapter, backend: TlsBackend) Handshake {
-        return .{ .adapter = adapter, .backend = backend, .role = .server };
+        return .{ .adapter = adapter, .driver = CoreDriver.init(.server, backend.transport) };
     }
 
     /// Provide local transport parameters to TLS and emit the first flight
     /// (client) or arm the responder (server).
     pub fn start(self: *Handshake, local_params: config.TransportParameters) HandshakeError!void {
         self.adapter.setLocalTransportParameters(local_params);
-        self.state = .in_progress;
-        self.sink.reset();
-        self.backend.start(self.role, local_params, &self.sink) catch |err| return self.fail(err);
-        try self.applyEvents();
+        try self.applyEvents(try self.driver.start(local_params));
     }
 
     /// Feed a CRYPTO fragment received at `level`, reassemble it in order, and
     /// drive the backend with any newly contiguous handshake bytes.
     pub fn onCrypto(self: *Handshake, level: EncryptionLevel, offset: u64, bytes: []const u8) HandshakeError!void {
-        if (self.state == .failed) return self.failure_reason.?;
+        if (self.driver.state == .failed) return self.driver.failure().?;
         self.adapter.receiveCrypto(level, offset, bytes) catch |err| return self.fail(switch (err) {
             error.InvalidCryptoLevel => error.UnexpectedCryptoLevel,
             error.CryptoBufferTooLarge, error.TooManyCryptoRanges => error.MalformedHandshake,
         });
         while (true) {
             const input = (self.adapter.nextHandshakeInput(level) catch return self.fail(error.UnexpectedCryptoLevel)) orelse break;
-            self.sink.reset();
-            self.backend.receive(input.level, input.bytes, &self.sink) catch |err| return self.fail(err);
-            try self.applyEvents();
+            try self.applyEvents(try self.driver.receive(input.level, input.bytes));
         }
     }
 
@@ -168,17 +162,15 @@ pub const Handshake = struct {
     }
 
     pub fn isComplete(self: *const Handshake) bool {
-        return self.state == .complete;
+        return self.driver.isComplete();
     }
 
     pub fn failure(self: *const Handshake) ?HandshakeError {
-        return self.failure_reason;
+        return self.driver.failure();
     }
 
     fn fail(self: *Handshake, err: HandshakeError) HandshakeError {
-        self.state = .failed;
-        self.failure_reason = err;
-        return err;
+        return self.driver.fail(err);
     }
 
     /// True once the backend has signalled that keys for `level` are no
@@ -208,10 +200,10 @@ pub const Handshake = struct {
         self.adapter.discardSecrets(level);
     }
 
-    fn applyEvents(self: *Handshake) HandshakeError!void {
+    fn applyEvents(self: *Handshake, sink: *EventSink) HandshakeError!void {
         var index: usize = 0;
-        while (index < self.sink.len) : (index += 1) {
-            switch (self.sink.items[index]) {
+        while (index < sink.len) : (index += 1) {
+            switch (sink.items[index]) {
                 .handshake_bytes => |c| self.adapter.queueHandshakeOutput(c.epoch, c.data) catch |err| return self.fail(switch (err) {
                     error.InvalidCryptoLevel => error.UnexpectedCryptoLevel,
                     error.CryptoBufferTooLarge => error.HandshakeBufferOverflow,
@@ -241,13 +233,13 @@ pub const Handshake = struct {
         if (self.require_alpn_h3 and !self.adapter.negotiatedH3()) return self.fail(error.AlpnMismatch);
         // Only the client validates a peer certificate in the server-auth QUIC/H3
         // model; the server has no client certificate to check here.
-        if (self.role == .client and !self.allow_unverified_certificate and self.adapter.certificateState() != .valid) {
+        if (self.driver.role == .client and !self.allow_unverified_certificate and self.adapter.certificateState() != .valid) {
             return self.fail(error.CertificateInvalid);
         }
         // Transport parameters are only exposed to connection logic now that the
         // handshake has authenticated them.
         self.adapter.authenticatePeerTransportParameters();
-        self.state = .complete;
+        self.driver.complete();
     }
 };
 
@@ -613,7 +605,7 @@ const Harness = struct {
     /// Pump handshake bytes between the two sides until both complete or no side
     /// makes progress. Returns the first deterministic failure, if any.
     fn run(self: *Harness) HandshakeError!void {
-        try self.client.start(defaultParams());
+        if (self.client.driver.state == .idle) try self.client.start(defaultParams());
         var rounds: usize = 0;
         while (rounds < 64) : (rounds += 1) {
             var progressed = false;
@@ -830,7 +822,8 @@ test "the connection-facing driver exposes only the backend interface, not a con
     var adapter = QuicTlsAdapter{};
     var backend = TestTlsBackend{};
     const handshake = Handshake.initClient(&adapter, backend.backend());
-    // The driver holds the runtime TlsBackend vtable; no concrete backend type
-    // leaks into its public surface.
-    try testing.expect(@TypeOf(handshake.backend) == TlsBackend);
+    // The wrapper holds the protocol-neutral core driver over the runtime
+    // transport vtable; no concrete backend type leaks into its public surface.
+    try testing.expect(@TypeOf(handshake.driver) == CoreDriver);
+    try testing.expect(@TypeOf(handshake.driver.backend) == TlsTransportBackend);
 }

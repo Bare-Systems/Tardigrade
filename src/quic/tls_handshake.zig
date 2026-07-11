@@ -135,6 +135,11 @@ pub const TlsBackend = struct {
     ptr: *anyopaque,
     startFn: *const fn (ptr: *anyopaque, role: Role, params: config.TransportParameters, sink: *EventSink) HandshakeError!void,
     receiveFn: *const fn (ptr: *anyopaque, level: EncryptionLevel, bytes: []const u8, sink: *EventSink) HandshakeError!void,
+    /// Optional RFC 9000 §7.3 authentication-binding hooks. A backend that
+    /// carries connection IDs in its transport parameters implements both; the
+    /// in-memory test backend leaves them null.
+    setCidBindingFn: ?*const fn (ptr: *anyopaque, binding: config.CidBinding) void = null,
+    peerCidBindingFn: ?*const fn (ptr: *anyopaque) config.CidBinding = null,
 
     fn start(self: TlsBackend, role: Role, params: config.TransportParameters, sink: *EventSink) HandshakeError!void {
         return self.startFn(self.ptr, role, params, sink);
@@ -142,6 +147,15 @@ pub const TlsBackend = struct {
 
     fn receive(self: TlsBackend, level: EncryptionLevel, bytes: []const u8, sink: *EventSink) HandshakeError!void {
         return self.receiveFn(self.ptr, level, bytes, sink);
+    }
+
+    pub fn setCidBinding(self: TlsBackend, binding: config.CidBinding) void {
+        if (self.setCidBindingFn) |set| set(self.ptr, binding);
+    }
+
+    pub fn peerCidBinding(self: TlsBackend) config.CidBinding {
+        if (self.peerCidBindingFn) |get| return get(self.ptr);
+        return .{};
     }
 };
 
@@ -162,6 +176,14 @@ pub const Handshake = struct {
     allow_unverified_certificate: bool = false,
     state: State = .idle,
     failure_reason: ?HandshakeError = null,
+    /// When true, the connection driver owns key-discard timing (RFC 9001
+    /// §4.9 / RFC 9002 §6.4): backend discard events only mark the level in
+    /// `discard_requested`, and the driver applies them through the adapter
+    /// once its retransmission obligations for that level have ended. Without
+    /// a driver (crypto-only harnesses), discards apply as soon as the level's
+    /// queued output drains.
+    manual_key_discard: bool = false,
+    discard_requested: [4]bool = .{ false, false, false, false },
     /// Key discards requested by the backend for levels that still have
     /// undrained CRYPTO output. RFC 9001 §4.9: a level's write keys must
     /// outlive the flight they protect (the server's ServerHello is queued at
@@ -236,7 +258,18 @@ pub const Handshake = struct {
         return err;
     }
 
+    /// True once the backend has signalled that keys for `level` are no
+    /// longer needed by TLS; in manual mode the connection driver applies the
+    /// actual discard when retransmission rules allow.
+    pub fn discardRequested(self: *const Handshake, level: EncryptionLevel) bool {
+        return self.discard_requested[level.index()];
+    }
+
     fn discardOrDefer(self: *Handshake, level: EncryptionLevel) void {
+        if (self.manual_key_discard) {
+            self.discard_requested[level.index()] = true;
+            return;
+        }
         if (level != .zero_rtt and self.adapter.outbound[level.index()].pending() > 0) {
             self.pending_discard[level.index()] = true;
             return;

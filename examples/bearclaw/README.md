@@ -44,7 +44,7 @@ Copy this into your deployment environment and replace placeholder values before
 - The intended mobile and pairing auth path is bearer-token based. Set `TARDIGRADE_AUTH_TOKEN_HASHES` to SHA-256 hashes of the raw bearer tokens your upstream issues.
 - Session state, approval state, and request transcripts can be persisted independently with `TARDIGRADE_SESSION_STORE_PATH`, `TARDIGRADE_APPROVAL_STORE_PATH`, and `TARDIGRADE_TRANSCRIPT_STORE_PATH`.
 - HTTP/2, HTTP/3, and realtime paths are outside the stable Core v1 contract unless the support matrix says otherwise.
-- If you run HTTP/3, build with `-Denable-http3-ngtcp2=true` and provide a QUIC-capable client.
+- If you run HTTP/3, provide a QUIC-capable client and a QUIC-compatible TLS identity (Ed25519 or ECDSA P-256 certificate); the native stack is built in.
 
 ## Edge Contract
 

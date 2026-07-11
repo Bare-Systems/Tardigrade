@@ -7,6 +7,7 @@ pub const transport = @import("transport.zig");
 pub const frame = @import("frame.zig");
 pub const qpack = @import("qpack.zig");
 pub const session = @import("session.zig");
+pub const conn = @import("conn.zig");
 pub const qlog = @import("qlog.zig");
 pub const priority = @import("priority.zig");
 

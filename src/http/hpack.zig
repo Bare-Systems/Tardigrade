@@ -1,5 +1,5 @@
 const std = @import("std");
-const huffman = @import("hpack_huffman.zig");
+const huffman = @import("hpack_huffman");
 
 pub const HeaderField = struct {
     name: []const u8,

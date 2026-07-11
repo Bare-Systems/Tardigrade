@@ -61,7 +61,7 @@ surfaces that should not be marketed as generic operator-facing capabilities.
 | Feature | Representative surface | Maturity | Why it is not Core v1 |
 | --- | --- | --- | --- |
 | HTTP/2 | `tls_termination` HTTP/2 path, `hpack`, `http2_frame` | `experimental` | Present in-tree, but not documented or release-gated at the same level as the HTTP/1.1 core. |
-| HTTP/3 / QUIC | `http3_handler`, `http3_session`, `http3_runtime`, `ngtcp2_binding`, `quic_stub`, `quic`, `http3` | `experimental` | Disabled by default; enable the C-backed path explicitly with `-Denable-http3-ngtcp2=true` and install the `ngtcp2`, `nghttp3`, and `ngtcp2_crypto_ossl` system libraries, or enable the pure-Zig path with `-Denable-http3-zig=true` while it remains in development. |
+| HTTP/3 / QUIC | `http3_handler`, `http3_session`, `http3_runtime`, `quic`, `http3` | `experimental` | Served by the native Zig QUIC/H3 stack (no system libraries); enable at runtime with `--http3` and a QUIC-compatible TLS identity (Ed25519 or ECDSA P-256). ngtcp2/nghttp3 removed under #328; they remain out-of-process interop peers only. |
 | WebSocket, SSE, and mux realtime paths | `websocket`, `event_hub`, mux counters in `metrics` | `experimental` | Integration coverage exists, but the public operator docs are still example-scoped rather than Core v1. |
 | ACME automation | `acme_client` | `experimental` | Useful feature surface, but not part of the stable release/install promise yet. |
 | Auth and identity extensions | `auth`, `basic_auth`, `jwt`, `access_control` | `experimental` | Operators can use these paths, but they are not the defining Core v1 server contract. |

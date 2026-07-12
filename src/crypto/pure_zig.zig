@@ -32,6 +32,7 @@
 const std = @import("std");
 const crypto = std.crypto;
 const provider = @import("provider.zig");
+const profile = @import("profile.zig");
 
 const HmacSha256 = crypto.auth.hmac.sha2.HmacSha256;
 const HmacSha384 = crypto.auth.hmac.sha2.HmacSha384;
@@ -493,6 +494,11 @@ const testing = std.testing;
 
 test "capabilities advertise exactly the implemented profile" {
     const caps = Provider.capabilities();
+    const profiled = profile.capabilities(.pure_zig);
+    try testing.expectEqual(caps.hashes, profiled.hashes);
+    try testing.expectEqual(caps.aeads, profiled.aeads);
+    try testing.expectEqual(caps.groups, profiled.groups);
+    try testing.expectEqual(caps.signatures, profiled.signatures);
     try testing.expect(caps.supportsHash(.sha256));
     try testing.expect(caps.supportsHash(.sha384));
     try testing.expect(caps.supportsAead(.aes_128_gcm));

@@ -29,6 +29,11 @@ boundary is what keeps the two from coupling to each other.
   discovery, the error taxonomy, the injected `Entropy` source, the opaque
   `SigningKey` handle, and the `CryptoProvider` interface (a `context` pointer
   plus a `*const VTable`, the same seam shape as the QUIC `TlsBackend`).
+- `src/crypto/profile.zig` — the checked-in capability matrix: every
+  TLS/QUIC/PKI algorithm name, implementation family, pure-Zig/OpenSSL status,
+  tests, consumers, and Zig version floor.
+- `src/tls/crypto_profile.zig` — the TLS-side adapter that maps provider
+  capabilities to TLS policy capabilities without making crypto import TLS.
 - `src/crypto/secrets.zig` — fixed-size and bounded dynamic secret containers,
   shared secure-zero and constant-time comparison helpers, and the non-formatting
   convention for secret-bearing values.
@@ -60,6 +65,37 @@ algorithms are named by the interface so protocol and negotiation code is
 written once; capability discovery reports them absent and every entry point
 returns `error.UnsupportedCapability` until a backend provides them.
 
+## Supported profile matrix
+
+The source of truth is `src/crypto/profile.zig`, not prose in this document.
+The table below summarizes the checked-in profile for review:
+
+| Capability | Pure-Zig status | Pure-Zig implementation | OpenSSL status | Consumers |
+| --- | --- | --- | --- | --- |
+| SHA-256, SHA-384 | supported | `std.crypto` | provider deferred | TLS transcript, HKDF, QUIC TLS bridge |
+| HKDF-SHA256, HKDF-SHA384 | supported | `std.crypto` HMAC/TLS label code | provider deferred | TLS 1.3 key schedule, QUIC packet protection |
+| AES-128-GCM, AES-256-GCM, ChaCha20-Poly1305 | supported | `std.crypto` | provider deferred | TLS records, QUIC packet protection |
+| X25519 | supported | `std.crypto` | provider deferred | TLS key share, QUIC TLS bridge |
+| secp256r1 / P-256 | provider deferred | unavailable | provider deferred | TLS key share, PKI |
+| Ed25519 | supported | `std.crypto` | provider deferred | CertificateVerify, PKI |
+| ECDSA-P256-SHA256, RSA-PSS-RSAE-SHA256 | provider deferred | unavailable | provider deferred | CertificateVerify, PKI |
+| DER parser, chain builder, WebPKI validation | provider deferred | project code / unavailable | provider deferred | PKI |
+| injected random bytes, secure zero, constant-time compare | supported | project code | provider deferred / project code | all secret-bearing paths |
+
+The Zig compatibility floor for this matrix is `0.16.0`; when the project moves
+to a newer compiler or starts carrying compatibility shims for crypto APIs, the
+floor and each affected row must be updated together.
+
+Protocol configuration must not hand-write provider-derived TLS capabilities.
+Use `tls.crypto_profile.fromProvider(provider.capabilities())`, then pass the
+returned `asPolicyCapabilities()` slice set to `tls.Policy`. That path filters
+cipher suites, named groups, and signature schemes through the selected
+provider's typed support, so pure-Zig configuration advertises Ed25519 and
+X25519 but not ECDSA or P-256 until a backend actually implements them. When a
+call site must accept hand-written TLS capability lists, it should preflight
+them with `tls.crypto_profile.validateAgainstProvider` before handshake
+execution.
+
 ## Design rules
 
 ### Capability discovery is explicit
@@ -70,6 +106,11 @@ only from that set with the `select*` helpers, and every operation re-checks
 membership. An unsupported algorithm is therefore always a typed
 `error.UnsupportedCapability` — never a call into a primitive that cannot handle
 it, and never undefined behaviour.
+
+Every algorithm addition or status change must update `src/crypto/profile.zig`
+in the same PR as the implementation. Reviewers should check that the row names
+the implementation family, provider status, test coverage, consumers, and
+security assumptions before accepting a new negotiated algorithm.
 
 ### Errors are classified
 

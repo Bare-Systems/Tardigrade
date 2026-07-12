@@ -1,5 +1,15 @@
 const std = @import("std");
 
+/// TLS/crypto build profile (#379, epic #327). `general` links the single
+/// approved OpenSSL adapter as a compatibility backend; `appliance` is the
+/// Bare Systems profile: no OpenSSL configuration, import, or linkage — the
+/// OpenSSL adapter module is replaced with a native stub at the build graph
+/// level, so `@cImport("openssl/...")` is never analyzed and `libssl`/
+/// `libcrypto` are never linked. There is no runtime fallback between
+/// profiles; the selection is embedded in the binary and reported by
+/// `tardigrade version`. See docs/TLS_DEPENDENCY_POLICY.md.
+const TlsProfile = enum { general, appliance };
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -7,9 +17,17 @@ pub fn build(b: *std.Build) void {
     const require_static_system_libs = b.option(bool, "require-static-system-libs", "Require static linking for system libraries") orelse false;
     const static_executable = b.option(bool, "static-executable", "Build the tardigrade executable as a static binary") orelse false;
     const app_version = b.option([]const u8, "version", "Version string embedded in the tardigrade binary") orelse "dev";
+    const tls_profile = b.option(
+        TlsProfile,
+        "tls-profile",
+        "TLS/crypto profile: 'general' (default) links the approved OpenSSL adapter; 'appliance' forbids all foreign TLS/crypto linkage (#379)",
+    ) orelse .general;
+    const link_openssl_adapter = tls_profile == .general;
 
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", app_version);
+    build_options.addOption([]const u8, "tls_profile", @tagName(tls_profile));
+    build_options.addOption(bool, "tls_openssl_adapter", link_openssl_adapter);
     const compat_mod = b.createModule(.{
         .root_source_file = b.path("src/zig_compat.zig"),
         .target = target,
@@ -90,7 +108,7 @@ pub fn build(b: *std.Build) void {
         .root_module = exe_mod,
         .linkage = if (static_executable) .static else null,
     });
-    configureSsl(exe, prefer_static_system_libs, require_static_system_libs);
+    if (link_openssl_adapter) configureSsl(exe, prefer_static_system_libs, require_static_system_libs);
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
@@ -102,7 +120,7 @@ pub fn build(b: *std.Build) void {
     const exe_unit_tests = b.addTest(.{
         .root_module = exe_mod,
     });
-    configureSsl(exe_unit_tests, prefer_static_system_libs, require_static_system_libs);
+    if (link_openssl_adapter) configureSsl(exe_unit_tests, prefer_static_system_libs, require_static_system_libs);
 
     const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);
     const test_step = b.step("test", "Run unit tests");
@@ -132,7 +150,7 @@ pub fn build(b: *std.Build) void {
         .root_module = allocation_regression_mod,
         .filters = &.{"allocation"},
     });
-    configureSsl(allocation_regression_tests, prefer_static_system_libs, require_static_system_libs);
+    if (link_openssl_adapter) configureSsl(allocation_regression_tests, prefer_static_system_libs, require_static_system_libs);
     const run_allocation_regression_tests = b.addRunArtifact(allocation_regression_tests);
     test_step.dependOn(&run_allocation_regression_tests.step);
 
@@ -140,7 +158,7 @@ pub fn build(b: *std.Build) void {
         .name = "allocation_regression",
         .root_module = allocation_regression_mod,
     });
-    configureSsl(allocation_regression_exe, prefer_static_system_libs, require_static_system_libs);
+    if (link_openssl_adapter) configureSsl(allocation_regression_exe, prefer_static_system_libs, require_static_system_libs);
     const run_allocation_regression = b.addRunArtifact(allocation_regression_exe);
     const allocation_regression_step = b.step("bench-allocations", "Report hot-path allocation budgets as JSON");
     allocation_regression_step.dependOn(&run_allocation_regression.step);

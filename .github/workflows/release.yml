@@ -132,12 +132,25 @@ jobs:
             echo "artifact_dir=$artifact_dir"
             echo "archive_path=$artifact_dir/$ARCHIVE_NAME.tar.gz"
             echo "sbom_path=$artifact_dir/sbom-$ARCHIVE_NAME.spdx.json"
+            echo "inventory_path=$artifact_dir/dependency-inventory-$ARCHIVE_NAME.json"
           } >> "$GITHUB_OUTPUT"
+
+      - name: Source and configuration audit
+        run: ./scripts/audit-dependencies.sh
 
       - name: Build release binary
         env:
           VERSION: ${{ needs.prepare-release.outputs.version }}
         run: zig build -Doptimize=ReleaseFast "-Dversion=$VERSION"
+
+      - name: Audit release binary linkage and record inventory
+        env:
+          INVENTORY_PATH: ${{ steps.archive_artifacts.outputs.inventory_path }}
+        run: |
+          ./scripts/audit-release-binary.sh \
+            --binary zig-out/bin/tardigrade \
+            --profile general \
+            --output "$INVENTORY_PATH"
 
       - name: Package artifact
         env:
@@ -178,6 +191,14 @@ jobs:
           path: ${{ steps.archive_artifacts.outputs.sbom_path }}
           if-no-files-found: error
           retention-days: 1
+
+      - name: Upload dependency inventory artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dependency-inventory-${{ matrix.archive_name }}
+          path: ${{ steps.archive_artifacts.outputs.inventory_path }}
+          if-no-files-found: error
+          retention-days: 14
 
   publish-release:
     name: Publish GitHub release assets
@@ -238,6 +259,7 @@ jobs:
           files: |
             ${{ runner.temp }}/publish-release/dist/*.tar.gz
             ${{ runner.temp }}/publish-release/dist/*.spdx.json
+            ${{ runner.temp }}/publish-release/dist/dependency-inventory-*.json
             ${{ runner.temp }}/publish-release/dist/install.sh
             ${{ runner.temp }}/publish-release/dist/tardigrade-checksums.txt
           fail_on_unmatched_files: true

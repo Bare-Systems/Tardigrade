@@ -10,9 +10,12 @@
 const std = @import("std");
 const crypto = @import("crypto");
 const algorithms = @import("algorithms.zig");
+const engine = @import("engine.zig");
 const events = @import("events.zig");
 const record_codec = @import("record_codec.zig");
 const record_protection = @import("record_protection.zig");
+const tls_state = @import("state.zig");
+const transport = @import("transport.zig");
 
 const provider = crypto.provider;
 
@@ -438,4 +441,130 @@ test "record epoch bridge rejects wrong content at otherwise valid epochs" {
     const record = try client.sealApplicationData("not handshake", &protected);
     const parsed = try parseSingleRecord(.ciphertext, record);
     try testing.expectError(error.UnexpectedRecordContent, server.openHandshake(.application, parsed, &plaintext));
+}
+
+test "record epoch bridge shuttles protocol-neutral driver events through records" {
+    const DriverError = Error || error{ InvalidHandshakeState, TransportBufferOverflow };
+    const T = transport.Contract(void, events.EncryptionEpoch, DriverError);
+    const D = engine.Driver(T);
+
+    const ScriptedBackend = struct {
+        const Self = @This();
+
+        role: tls_state.Role,
+        client_hs: [32]u8 = secret(0x81),
+        server_hs: [32]u8 = secret(0x82),
+        client_app: [32]u8 = secret(0x83),
+        server_app: [32]u8 = secret(0x84),
+
+        fn backend(self: *Self) T.Backend {
+            return .{ .ptr = self, .startFn = start, .receiveFn = receive };
+        }
+
+        fn start(ptr: *anyopaque, role: tls_state.Role, _: void, sink: *T.EventSink) DriverError!void {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            if (self.role != role) return error.InvalidEpochTransition;
+            if (role == .client) try sink.emitHandshakeBytes(.initial, "client hello");
+        }
+
+        fn receive(ptr: *anyopaque, epoch: events.EncryptionEpoch, bytes: []const u8, sink: *T.EventSink) DriverError!void {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            switch (self.role) {
+                .server => {
+                    if (epoch == .initial and std.mem.eql(u8, bytes, "client hello")) {
+                        try sink.emitHandshakeBytes(.initial, "server hello");
+                        try sink.emitSecret(.handshake, .read, &self.client_hs);
+                        try sink.emitSecret(.handshake, .write, &self.server_hs);
+                        try sink.emitHandshakeBytes(.handshake, "server finished");
+                    } else if (epoch == .handshake and std.mem.eql(u8, bytes, "client finished")) {
+                        try sink.emitSecret(.application, .read, &self.client_app);
+                        try sink.emitSecret(.application, .write, &self.server_app);
+                        try sink.emitHandshakeComplete();
+                        try sink.emitHandshakeBytes(.application, "new session ticket");
+                    } else {
+                        return error.UnexpectedRecordContent;
+                    }
+                },
+                .client => {
+                    if (epoch == .initial and std.mem.eql(u8, bytes, "server hello")) {
+                        try sink.emitSecret(.handshake, .write, &self.client_hs);
+                        try sink.emitSecret(.handshake, .read, &self.server_hs);
+                    } else if (epoch == .handshake and std.mem.eql(u8, bytes, "server finished")) {
+                        try sink.emitSecret(.application, .write, &self.client_app);
+                        try sink.emitSecret(.application, .read, &self.server_app);
+                        try sink.emitHandshakeComplete();
+                        try sink.emitHandshakeBytes(.handshake, "client finished");
+                    } else if (epoch == .application and std.mem.eql(u8, bytes, "new session ticket")) {
+                        try sink.emitAlpn("h3");
+                    } else {
+                        return error.UnexpectedRecordContent;
+                    }
+                },
+            }
+        }
+    };
+
+    const Harness = struct {
+        fn pump(
+            sender_driver: *D,
+            sender_bridge: *Bridge,
+            receiver_driver: *D,
+            receiver_bridge: *Bridge,
+            sink: *T.EventSink,
+        ) DriverError!void {
+            var sealed: [record_codec.max_ciphertext_record_len]u8 = undefined;
+            var opened: [record_codec.max_ciphertext_fragment_len]u8 = undefined;
+
+            for (sink.items[0..sink.len]) |event| {
+                switch (event) {
+                    .handshake_bytes => |handshake| {
+                        const bytes = (try sender_bridge.applyEvent(.{ .handshake_bytes = .{ .epoch = handshake.epoch, .data = handshake.data } }, &sealed)).?;
+                        const mode: record_codec.RecordMode = if (handshake.epoch == .initial) .plaintext else .ciphertext;
+                        const record = try parseSingleRecord(mode, bytes);
+                        const message = try receiver_bridge.openHandshake(handshake.epoch, record, &opened);
+                        const next = try receiver_driver.receive(message.epoch, message.inner.content);
+                        try pump(receiver_driver, receiver_bridge, sender_driver, sender_bridge, next);
+                    },
+                    .traffic_secret => |traffic_secret| {
+                        _ = try sender_bridge.applyEvent(.{ .traffic_secret = .{
+                            .epoch = traffic_secret.epoch,
+                            .direction = traffic_secret.direction,
+                            .data = traffic_secret.data,
+                        } }, &sealed);
+                    },
+                    .discard_epoch => |epoch| {
+                        _ = try sender_bridge.applyEvent(.{ .discard_epoch = epoch }, &sealed);
+                    },
+                    .handshake_complete => {
+                        _ = try sender_bridge.applyEvent(.handshake_complete, &sealed);
+                        sender_driver.complete();
+                    },
+                    .peer_transport_parameters,
+                    .alpn,
+                    .certificate,
+                    => {},
+                }
+            }
+        }
+    };
+
+    const cp = testProvider();
+    var client_backend = ScriptedBackend{ .role = .client };
+    var server_backend = ScriptedBackend{ .role = .server };
+    var client_driver = D.init(.client, client_backend.backend());
+    var server_driver = D.init(.server, server_backend.backend());
+    var client_bridge = Bridge.init(cp, .tls_aes_128_gcm_sha256);
+    defer client_bridge.deinit();
+    var server_bridge = Bridge.init(cp, .tls_aes_128_gcm_sha256);
+    defer server_bridge.deinit();
+
+    const initial = try client_driver.start({});
+    try Harness.pump(&client_driver, &client_bridge, &server_driver, &server_bridge, initial);
+
+    try testing.expect(client_driver.isComplete());
+    try testing.expect(server_driver.isComplete());
+    try testing.expectEqual(@as(u64, 1), client_bridge.write_handshake.?.sequence);
+    try testing.expectEqual(@as(u64, 1), server_bridge.read_handshake.?.sequence);
+    try testing.expectEqual(@as(u64, 1), server_bridge.write_application.?.sequence);
+    try testing.expectEqual(@as(u64, 1), client_bridge.read_application.?.sequence);
 }

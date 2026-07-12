@@ -32,8 +32,14 @@ pub fn FixedSecret(comptime capacity: usize) type {
 
         pub fn replace(self: *Self, value: []const u8) Error!void {
             if (value.len > self.bytes.len) return error.SecretTooLarge;
-            self.clear();
-            @memcpy(self.bytes[0..value.len], value);
+            const old_len = self.len;
+            if (overlaps(self.bytes[0..], value)) {
+                std.mem.copyForwards(u8, self.bytes[0..value.len], value);
+                if (old_len > value.len) secureZero(self.bytes[value.len..old_len]);
+            } else {
+                self.clear();
+                @memcpy(self.bytes[0..value.len], value);
+            }
             self.len = value.len;
         }
 
@@ -72,27 +78,33 @@ pub fn FixedSecret(comptime capacity: usize) type {
 }
 
 pub const BoundedSecret = struct {
-    allocator: std.mem.Allocator,
-    bytes: []u8,
+    allocator: ?std.mem.Allocator = null,
+    bytes: []u8 = &.{},
     len: usize = 0,
 
-    pub fn initCapacity(allocator: std.mem.Allocator, capacity: usize) !BoundedSecret {
-        const bytes = try allocator.alloc(u8, capacity);
-        @memset(bytes, 0);
-        return .{ .allocator = allocator, .bytes = bytes };
+    pub fn initCapacity(self: *BoundedSecret, allocator: std.mem.Allocator, capacity: usize) !void {
+        std.debug.assert(self.bytes.len == 0);
+        self.bytes = try allocator.alloc(u8, capacity);
+        self.allocator = allocator;
+        @memset(self.bytes, 0);
     }
 
-    pub fn init(allocator: std.mem.Allocator, capacity: usize, value: []const u8) !BoundedSecret {
-        var secret = try initCapacity(allocator, capacity);
-        errdefer secret.deinit();
-        try secret.replace(value);
-        return secret;
+    pub fn init(self: *BoundedSecret, allocator: std.mem.Allocator, capacity: usize, value: []const u8) !void {
+        try self.initCapacity(allocator, capacity);
+        errdefer self.deinit();
+        try self.replace(value);
     }
 
     pub fn replace(self: *BoundedSecret, value: []const u8) Error!void {
         if (value.len > self.bytes.len) return error.SecretTooLarge;
-        self.clear();
-        @memcpy(self.bytes[0..value.len], value);
+        const old_len = self.len;
+        if (overlaps(self.bytes, value)) {
+            std.mem.copyForwards(u8, self.bytes[0..value.len], value);
+            if (old_len > value.len) secureZero(self.bytes[value.len..old_len]);
+        } else {
+            self.clear();
+            @memcpy(self.bytes[0..value.len], value);
+        }
         self.len = value.len;
     }
 
@@ -106,7 +118,9 @@ pub const BoundedSecret = struct {
 
     pub fn deinit(self: *BoundedSecret) void {
         self.clearAll();
-        self.allocator.free(self.bytes);
+        const allocator = self.allocator orelse return;
+        allocator.free(self.bytes);
+        self.allocator = null;
         self.bytes = self.bytes[0..0];
         self.len = 0;
     }
@@ -130,6 +144,15 @@ pub const BoundedSecret = struct {
         @compileError("secret values must not be formatted or logged");
     }
 };
+
+fn overlaps(storage: []const u8, value: []const u8) bool {
+    if (storage.len == 0 or value.len == 0) return false;
+    const storage_start = @intFromPtr(storage.ptr);
+    const storage_end = storage_start + storage.len;
+    const value_start = @intFromPtr(value.ptr);
+    const value_end = value_start + value.len;
+    return value_start < storage_end and storage_start < value_end;
+}
 
 const testing = std.testing;
 
@@ -158,6 +181,15 @@ test "fixed secret replace clears old tail before reuse" {
     secret.deinit();
 }
 
+test "fixed secret replace handles self-overlapping input" {
+    const Secret8 = FixedSecret(8);
+    var secret = try Secret8.init("abcdef");
+    try secret.replace(secret.slice()[1..4]);
+    try testing.expectEqualStrings("bcd", secret.slice());
+    try testing.expectEqual(@as(u8, 0), secret.bytes[3]);
+    secret.deinit();
+}
+
 test "fixed secret rejects oversized input without clobbering current value" {
     const Secret4 = FixedSecret(4);
     var secret = try Secret4.init("keep");
@@ -169,7 +201,8 @@ test "fixed secret rejects oversized input without clobbering current value" {
 test "bounded secret clears allocator backing storage before free" {
     var backing = [_]u8{0xcc} ** 128;
     var fba = std.heap.FixedBufferAllocator.init(&backing);
-    var secret = try BoundedSecret.init(fba.allocator(), 32, &([_]u8{0xab} ** 16));
+    var secret = BoundedSecret{};
+    try secret.init(fba.allocator(), 32, &([_]u8{0xab} ** 16));
     try testing.expectEqual(@as(usize, 16), secret.len);
 
     secret.clearAll();
@@ -184,7 +217,8 @@ test "bounded secret errdefer cleanup zeroizes early returns" {
 
     const Helper = struct {
         fn failAfterInit(allocator: std.mem.Allocator) !void {
-            var secret = try BoundedSecret.init(allocator, 32, &([_]u8{0xdd} ** 16));
+            var secret = BoundedSecret{};
+            try secret.init(allocator, 32, &([_]u8{0xdd} ** 16));
             errdefer secret.deinit();
             return error.TestExpectedError;
         }
@@ -192,6 +226,18 @@ test "bounded secret errdefer cleanup zeroizes early returns" {
 
     try testing.expectError(error.TestExpectedError, Helper.failAfterInit(fba.allocator()));
     try testing.expect(std.mem.indexOfScalar(u8, &backing, 0xdd) == null);
+}
+
+test "bounded secret replace handles self-overlapping input" {
+    var backing = [_]u8{0xcc} ** 128;
+    var fba = std.heap.FixedBufferAllocator.init(&backing);
+    var secret = BoundedSecret{};
+    try secret.init(fba.allocator(), 32, "abcdef");
+    defer secret.deinit();
+
+    try secret.replace(secret.slice()[1..4]);
+    try testing.expectEqualStrings("bcd", secret.slice());
+    try testing.expectEqual(@as(u8, 0), secret.bytes[3]);
 }
 
 test "secret helpers expose non-formatting APIs" {

@@ -104,7 +104,9 @@ storage with an explicit upper bound. These types copy input into owned memory,
 return borrowed slices through `slice`, wipe replaced contents before reuse, and
 must be `deinit`ed before the owning connection/key object is discarded. Secret
 containers deliberately provide a `format` method that fails compilation so
-accidental `{}` logging does not expose key material.
+accidental `{}` logging does not expose key material. `BoundedSecret` is
+initialized in place so callers do not receive an owning heap allocation by
+value; any ownership transfer must be explicit at the call site.
 
 ### Entropy is injected
 

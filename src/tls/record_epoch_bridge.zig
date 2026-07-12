@@ -23,12 +23,20 @@ pub const Error = record_codec.Error || record_protection.Error || error{
     MissingWriteKeys,
     MissingApplicationKeys,
     HandshakeNotComplete,
+    InvalidEpochTransition,
     UnexpectedRecordContent,
 };
 
 pub const OpenedRecord = struct {
     epoch: events.EncryptionEpoch,
     inner: record_codec.InnerPlaintext,
+};
+
+const DirectionPhase = enum {
+    initial,
+    handshake,
+    application,
+    complete,
 };
 
 pub const Bridge = struct {
@@ -38,6 +46,12 @@ pub const Bridge = struct {
     write_handshake: ?record_protection.WriteState = null,
     read_application: ?record_protection.ReadState = null,
     write_application: ?record_protection.WriteState = null,
+    read_phase: DirectionPhase = .initial,
+    write_phase: DirectionPhase = .initial,
+    read_handshake_discarded: bool = false,
+    write_handshake_discarded: bool = false,
+    read_application_discarded: bool = false,
+    write_application_discarded: bool = false,
     handshake_complete: bool = false,
 
     pub fn init(crypto_provider: provider.CryptoProvider, cipher_suite: algorithms.CipherSuite) Bridge {
@@ -50,16 +64,17 @@ pub const Bridge = struct {
         self.handshake_complete = false;
     }
 
-    pub fn applyEvent(self: *Bridge, event: events.Event) Error!void {
+    pub fn applyEvent(self: *Bridge, event: events.Event, out: []u8) Error!?[]const u8 {
         switch (event) {
+            .handshake_bytes => |bytes| return try self.sealHandshake(bytes.epoch, bytes.data, out),
             .traffic_secret => |traffic_secret| try self.installTrafficSecret(traffic_secret.epoch, traffic_secret.direction, traffic_secret.data),
             .discard_epoch => |epoch| self.discardEpoch(epoch),
             .handshake_complete => try self.markHandshakeComplete(),
-            .handshake_bytes,
             .alpn,
             .certificate,
             => {},
         }
+        return null;
     }
 
     pub fn installTrafficSecret(
@@ -70,12 +85,28 @@ pub const Bridge = struct {
     ) Error!void {
         switch (epoch) {
             .handshake => switch (direction) {
-                .read => try self.installRead(&self.read_handshake, traffic_secret),
-                .write => try self.installWrite(&self.write_handshake, traffic_secret),
+                .read => {
+                    if (self.read_phase != .initial or self.read_handshake_discarded) return error.InvalidEpochTransition;
+                    try self.installRead(&self.read_handshake, traffic_secret);
+                    self.read_phase = .handshake;
+                },
+                .write => {
+                    if (self.write_phase != .initial or self.write_handshake_discarded) return error.InvalidEpochTransition;
+                    try self.installWrite(&self.write_handshake, traffic_secret);
+                    self.write_phase = .handshake;
+                },
             },
             .application => switch (direction) {
-                .read => try self.installRead(&self.read_application, traffic_secret),
-                .write => try self.installWrite(&self.write_application, traffic_secret),
+                .read => {
+                    if (self.read_phase != .handshake or self.read_handshake_discarded or self.read_application_discarded) return error.InvalidEpochTransition;
+                    try self.installRead(&self.read_application, traffic_secret);
+                    self.read_phase = .application;
+                },
+                .write => {
+                    if (self.write_phase != .handshake or self.write_handshake_discarded or self.write_application_discarded) return error.InvalidEpochTransition;
+                    try self.installWrite(&self.write_application, traffic_secret);
+                    self.write_phase = .application;
+                },
             },
             .initial,
             .zero_rtt,
@@ -88,10 +119,16 @@ pub const Bridge = struct {
             .handshake => {
                 clearRead(&self.read_handshake);
                 clearWrite(&self.write_handshake);
+                self.read_handshake_discarded = true;
+                self.write_handshake_discarded = true;
             },
             .application => {
                 clearRead(&self.read_application);
                 clearWrite(&self.write_application);
+                self.read_application_discarded = true;
+                self.write_application_discarded = true;
+                self.read_phase = .initial;
+                self.write_phase = .initial;
                 self.handshake_complete = false;
             },
             .initial,
@@ -101,8 +138,12 @@ pub const Bridge = struct {
     }
 
     pub fn markHandshakeComplete(self: *Bridge) Error!void {
+        if (self.handshake_complete) return error.InvalidEpochTransition;
+        if (self.read_phase != .application or self.write_phase != .application) return error.InvalidEpochTransition;
         if (self.read_application == null or self.write_application == null) return error.MissingApplicationKeys;
         self.handshake_complete = true;
+        self.read_phase = .complete;
+        self.write_phase = .complete;
     }
 
     pub fn sealHandshake(self: *Bridge, epoch: events.EncryptionEpoch, bytes: []const u8, out: []u8) Error![]const u8 {
@@ -257,9 +298,18 @@ fn secret(comptime fill: u8) [32]u8 {
     return [_]u8{fill} ** 32;
 }
 
+fn expectAes128TrafficKeys(traffic_secret: [32]u8, keys: record_protection.TrafficKeys) !void {
+    const std_crypto = std.crypto;
+    const HkdfSha256 = std_crypto.kdf.hkdf.HkdfSha256;
+    const expected_key = std_crypto.tls.hkdfExpandLabel(HkdfSha256, traffic_secret, "key", "", 16);
+    const expected_iv = std_crypto.tls.hkdfExpandLabel(HkdfSha256, traffic_secret, "iv", "", provider.aead_nonce_len);
+    try testing.expectEqualSlices(u8, &expected_key, keys.key.slice());
+    try testing.expectEqualSlices(u8, &expected_iv, keys.iv.slice());
+}
+
 const testing = std.testing;
 
-test "record epoch bridge drives plaintext handshake, encrypted handshake, application data, and post-handshake routing" {
+test "record epoch bridge drives event loopback across plaintext, handshake, application, and post-handshake records" {
     const cp = testProvider();
     var client = Bridge.init(cp, .tls_aes_128_gcm_sha256);
     defer client.deinit();
@@ -274,30 +324,32 @@ test "record epoch bridge drives plaintext handshake, encrypted handshake, appli
     var protected: [record_codec.max_ciphertext_record_len]u8 = undefined;
     var plaintext: [record_codec.max_ciphertext_fragment_len]u8 = undefined;
 
-    const client_hello = try client.sealHandshake(.initial, "client hello", &protected);
+    const client_hello = (try client.applyEvent(.{ .handshake_bytes = .{ .epoch = .initial, .data = "client hello" } }, &protected)).?;
     const client_hello_record = try parseSingleRecord(.plaintext, client_hello);
     const opened_client_hello = try server.openHandshake(.initial, client_hello_record, &plaintext);
     try testing.expectEqual(events.EncryptionEpoch.initial, opened_client_hello.epoch);
     try testing.expectEqualStrings("client hello", opened_client_hello.inner.content);
 
-    try client.applyEvent(.{ .traffic_secret = .{ .epoch = .handshake, .direction = .write, .data = &client_hs } });
-    try client.applyEvent(.{ .traffic_secret = .{ .epoch = .handshake, .direction = .read, .data = &server_hs } });
-    try server.applyEvent(.{ .traffic_secret = .{ .epoch = .handshake, .direction = .read, .data = &client_hs } });
-    try server.applyEvent(.{ .traffic_secret = .{ .epoch = .handshake, .direction = .write, .data = &server_hs } });
+    try testing.expectEqual(@as(?[]const u8, null), try client.applyEvent(.{ .traffic_secret = .{ .epoch = .handshake, .direction = .write, .data = &client_hs } }, &protected));
+    try testing.expectEqual(@as(?[]const u8, null), try client.applyEvent(.{ .traffic_secret = .{ .epoch = .handshake, .direction = .read, .data = &server_hs } }, &protected));
+    try testing.expectEqual(@as(?[]const u8, null), try server.applyEvent(.{ .traffic_secret = .{ .epoch = .handshake, .direction = .read, .data = &client_hs } }, &protected));
+    try testing.expectEqual(@as(?[]const u8, null), try server.applyEvent(.{ .traffic_secret = .{ .epoch = .handshake, .direction = .write, .data = &server_hs } }, &protected));
+    try expectAes128TrafficKeys(client_hs, client.write_handshake.?.keys);
+    try testing.expectEqual(@as(u64, 0), client.write_handshake.?.sequence);
 
-    const encrypted_finished = try client.sealHandshake(.handshake, "client finished", &protected);
+    const encrypted_finished = (try client.applyEvent(.{ .handshake_bytes = .{ .epoch = .handshake, .data = "client finished" } }, &protected)).?;
     const encrypted_finished_record = try parseSingleRecord(.ciphertext, encrypted_finished);
     const opened_finished = try server.openHandshake(.handshake, encrypted_finished_record, &plaintext);
     try testing.expectEqualStrings("client finished", opened_finished.inner.content);
     try testing.expectEqual(@as(u64, 1), client.write_handshake.?.sequence);
     try testing.expectEqual(@as(u64, 1), server.read_handshake.?.sequence);
 
-    try client.applyEvent(.{ .traffic_secret = .{ .epoch = .application, .direction = .write, .data = &client_app } });
-    try client.applyEvent(.{ .traffic_secret = .{ .epoch = .application, .direction = .read, .data = &server_app } });
-    try server.applyEvent(.{ .traffic_secret = .{ .epoch = .application, .direction = .read, .data = &client_app } });
-    try server.applyEvent(.{ .traffic_secret = .{ .epoch = .application, .direction = .write, .data = &server_app } });
-    try client.applyEvent(.handshake_complete);
-    try server.applyEvent(.handshake_complete);
+    try testing.expectEqual(@as(?[]const u8, null), try client.applyEvent(.{ .traffic_secret = .{ .epoch = .application, .direction = .write, .data = &client_app } }, &protected));
+    try testing.expectEqual(@as(?[]const u8, null), try client.applyEvent(.{ .traffic_secret = .{ .epoch = .application, .direction = .read, .data = &server_app } }, &protected));
+    try testing.expectEqual(@as(?[]const u8, null), try server.applyEvent(.{ .traffic_secret = .{ .epoch = .application, .direction = .read, .data = &client_app } }, &protected));
+    try testing.expectEqual(@as(?[]const u8, null), try server.applyEvent(.{ .traffic_secret = .{ .epoch = .application, .direction = .write, .data = &server_app } }, &protected));
+    try testing.expectEqual(@as(?[]const u8, null), try client.applyEvent(.handshake_complete, &protected));
+    try testing.expectEqual(@as(?[]const u8, null), try server.applyEvent(.handshake_complete, &protected));
 
     const application_record = try client.sealApplicationData("GET / HTTP/3", &protected);
     const parsed_application = try parseSingleRecord(.ciphertext, application_record);
@@ -307,7 +359,7 @@ test "record epoch bridge drives plaintext handshake, encrypted handshake, appli
     try testing.expectEqual(@as(u64, 1), client.write_application.?.sequence);
     try testing.expectEqual(@as(u64, 1), server.read_application.?.sequence);
 
-    const post_handshake = try server.sealHandshake(.application, "new session ticket", &protected);
+    const post_handshake = (try server.applyEvent(.{ .handshake_bytes = .{ .epoch = .application, .data = "new session ticket" } }, &protected)).?;
     const parsed_post_handshake = try parseSingleRecord(.ciphertext, post_handshake);
     const opened_post_handshake = try client.openHandshake(.application, parsed_post_handshake, &plaintext);
     try testing.expectEqualStrings("new session ticket", opened_post_handshake.inner.content);
@@ -327,13 +379,14 @@ test "record epoch bridge rejects early, duplicate, missing, and unsupported tra
     try testing.expectError(error.MissingWriteKeys, bridge.sealHandshake(.handshake, "finished", &protected));
     try testing.expectError(error.HandshakeNotComplete, bridge.sealApplicationData("data", &protected));
     try testing.expectError(error.UnsupportedRecordEpoch, bridge.installTrafficSecret(.initial, .write, &hs));
+    try testing.expectError(error.InvalidEpochTransition, bridge.installTrafficSecret(.application, .write, &app));
 
     try bridge.installTrafficSecret(.handshake, .write, &hs);
-    try testing.expectError(error.DuplicateTrafficSecret, bridge.installTrafficSecret(.handshake, .write, &hs));
-    try testing.expectError(error.MissingApplicationKeys, bridge.markHandshakeComplete());
+    try testing.expectError(error.InvalidEpochTransition, bridge.installTrafficSecret(.handshake, .write, &hs));
+    try testing.expectError(error.InvalidEpochTransition, bridge.markHandshakeComplete());
 
     try bridge.installTrafficSecret(.application, .write, &app);
-    try testing.expectError(error.MissingApplicationKeys, bridge.markHandshakeComplete());
+    try testing.expectError(error.InvalidEpochTransition, bridge.markHandshakeComplete());
 }
 
 test "record epoch bridge discards prior epoch keys and fails closed after discard" {
@@ -354,6 +407,8 @@ test "record epoch bridge discards prior epoch keys and fails closed after disca
 
     var protected: [record_codec.max_ciphertext_record_len]u8 = undefined;
     try testing.expectError(error.MissingWriteKeys, bridge.sealHandshake(.handshake, "late finished", &protected));
+    try testing.expectError(error.InvalidEpochTransition, bridge.installTrafficSecret(.handshake, .write, &hs_write));
+    try testing.expectError(error.InvalidEpochTransition, bridge.installTrafficSecret(.application, .write, &hs_write));
 }
 
 test "record epoch bridge rejects wrong content at otherwise valid epochs" {
@@ -365,6 +420,12 @@ test "record epoch bridge rejects wrong content at otherwise valid epochs" {
 
     const client_app = secret(0x71);
     const server_app = secret(0x72);
+    const client_hs = secret(0x73);
+    const server_hs = secret(0x74);
+    try client.installTrafficSecret(.handshake, .write, &client_hs);
+    try client.installTrafficSecret(.handshake, .read, &server_hs);
+    try server.installTrafficSecret(.handshake, .read, &client_hs);
+    try server.installTrafficSecret(.handshake, .write, &server_hs);
     try client.installTrafficSecret(.application, .write, &client_app);
     try client.installTrafficSecret(.application, .read, &server_app);
     try server.installTrafficSecret(.application, .read, &client_app);

@@ -565,6 +565,149 @@ test "malformed structures fail deterministically" {
     try testing.expectError(error.MalformedPublicKeyInfo, x509.Certificate.parse(testing.allocator, bad_spki_cert, .{}));
 }
 
+test "constructed encodings of known directory-string tags fail typed" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    // A constructed UTF8String (0x0c | 0x20) wrapping a primitive segment is
+    // valid BER but not DER; the value must not be retained as unknown.
+    const constructed_utf8 = try tlv(arena, 0x2c, &.{try tlv(arena, 0x0c, &.{"CN"})});
+    const atv = try tlv(arena, 0x30, &.{
+        try oidTlv(arena, &oid.well_known.common_name),
+        constructed_utf8,
+    });
+    const bad_name = try tlv(arena, 0x30, &.{try tlv(arena, 0x31, &.{atv})});
+    const bad_cert = blk: {
+        var list: std.ArrayList([]const u8) = .empty;
+        defer list.deinit(arena);
+        try list.append(arena, try versionTlv(arena, 2));
+        try list.append(arena, try tlv(arena, 0x02, &.{&[_]u8{0x01}}));
+        try list.append(arena, try algorithmEd25519(arena));
+        try list.append(arena, try nameWithCn(arena, "Synthetic Issuer"));
+        try list.append(arena, try utcValidity(arena));
+        try list.append(arena, bad_name);
+        try list.append(arena, try spkiEd25519(arena));
+        const bad_tbs = try tlv(arena, 0x30, list.items);
+        break :blk try tlv(arena, 0x30, &.{
+            bad_tbs,
+            try algorithmEd25519(arena),
+            try signatureBits(arena),
+        });
+    };
+    try testing.expectError(error.MalformedName, x509.Certificate.parse(testing.allocator, bad_cert, .{}));
+
+    // A genuinely unknown attribute-value tag is still retained raw, even
+    // when constructed (e.g. a SEQUENCE-valued attribute).
+    const seq_value = try tlv(arena, 0x30, &.{try tlv(arena, 0x0c, &.{"inner"})});
+    const seq_atv = try tlv(arena, 0x30, &.{
+        try oidTlv(arena, &oid.well_known.common_name),
+        seq_value,
+    });
+    const seq_name = try tlv(arena, 0x30, &.{try tlv(arena, 0x31, &.{seq_atv})});
+    const seq_cert = blk: {
+        var list: std.ArrayList([]const u8) = .empty;
+        defer list.deinit(arena);
+        try list.append(arena, try versionTlv(arena, 2));
+        try list.append(arena, try tlv(arena, 0x02, &.{&[_]u8{0x01}}));
+        try list.append(arena, try algorithmEd25519(arena));
+        try list.append(arena, try nameWithCn(arena, "Synthetic Issuer"));
+        try list.append(arena, try utcValidity(arena));
+        try list.append(arena, seq_name);
+        try list.append(arena, try spkiEd25519(arena));
+        const seq_tbs = try tlv(arena, 0x30, list.items);
+        break :blk try tlv(arena, 0x30, &.{
+            seq_tbs,
+            try algorithmEd25519(arena),
+            try signatureBits(arena),
+        });
+    };
+    var cert = try x509.Certificate.parse(testing.allocator, seq_cert, .{});
+    defer cert.deinit(testing.allocator);
+    try testing.expect(cert.subject.rdns[0].attributes[0].value_tag.constructed);
+}
+
+test "DistributionPoint fields must be ordered, unique, and well-formed" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    const uri_name = try tlv(arena, 0x86, &.{"http://crl.example.com/ca.crl"});
+    const dp_name = try tlv(arena, 0xa0, &.{try tlv(arena, 0xa0, &.{uri_name})});
+    const valid_reasons = try tlv(arena, 0x81, &.{&[_]u8{ 0x01, 0x40 }});
+    const valid_issuer = try tlv(arena, 0xa2, &.{uri_name});
+
+    const CaseExpectation = enum { parses, fails };
+    const cases = [_]struct {
+        parts: []const []const u8,
+        expected: CaseExpectation,
+    }{
+        // All three fields in order.
+        .{ .parts = &.{ dp_name, valid_reasons, valid_issuer }, .expected = .parses },
+        // cRLIssuer alone satisfies the presence rule.
+        .{ .parts = &.{valid_issuer}, .expected = .parses },
+        // Duplicate [0].
+        .{ .parts = &.{ dp_name, dp_name }, .expected = .fails },
+        // Out of order: [1] before [0].
+        .{ .parts = &.{ valid_reasons, dp_name }, .expected = .fails },
+        // reasons alone (RFC 5280 §4.2.1.13).
+        .{ .parts = &.{valid_reasons}, .expected = .fails },
+        // Empty DistributionPoint.
+        .{ .parts = &.{}, .expected = .fails },
+    };
+
+    for (cases) |case| {
+        const point = try tlv(arena, 0x30, case.parts);
+        const value = try tlv(arena, 0x30, &.{point});
+        const bytes = try buildCertificate(arena, .{
+            .version = try versionTlv(arena, 2),
+            .extensions_wrapper = try extensionsWrapper(arena, &.{
+                try extensionTlv(arena, &oid.well_known.crl_distribution_points, false, value),
+            }),
+        });
+        const result = x509.Certificate.parse(testing.allocator, bytes, .{});
+        switch (case.expected) {
+            .parses => {
+                var cert = try result;
+                cert.deinit(testing.allocator);
+            },
+            .fails => try testing.expectError(error.MalformedExtension, result),
+        }
+    }
+
+    // Malformed reasons payload: unused-bit count above 7.
+    const bad_reasons = try tlv(arena, 0x81, &.{&[_]u8{ 0x08, 0xff }});
+    // Constructed reasons field.
+    const constructed_reasons = try tlv(arena, 0xa1, &.{&[_]u8{ 0x01, 0x40 }});
+    // cRLIssuer containing a non-GeneralName element.
+    const bad_issuer = try tlv(arena, 0xa2, &.{try tlv(arena, 0x0c, &.{"nope"})});
+    // Primitive cRLIssuer field.
+    const primitive_issuer = try tlv(arena, 0x82, &.{"nope"});
+    // Empty cRLIssuer violates GeneralNames SIZE (1..MAX).
+    const empty_issuer = try tlv(arena, 0xa2, &.{});
+    // Primitive distributionPoint wrapper.
+    const primitive_dp = try tlv(arena, 0x80, &.{"nope"});
+
+    for ([_][]const []const u8{
+        &.{ dp_name, bad_reasons },
+        &.{ dp_name, constructed_reasons },
+        &.{ dp_name, valid_reasons, bad_issuer },
+        &.{ dp_name, valid_reasons, primitive_issuer },
+        &.{ dp_name, valid_reasons, empty_issuer },
+        &.{primitive_dp},
+    }) |parts| {
+        const point = try tlv(arena, 0x30, parts);
+        const value = try tlv(arena, 0x30, &.{point});
+        const bytes = try buildCertificate(arena, .{
+            .version = try versionTlv(arena, 2),
+            .extensions_wrapper = try extensionsWrapper(arena, &.{
+                try extensionTlv(arena, &oid.well_known.crl_distribution_points, false, value),
+            }),
+        });
+        try testing.expectError(error.MalformedExtension, x509.Certificate.parse(testing.allocator, bytes, .{}));
+    }
+}
+
 test "directoryName SAN entries retain the Name TLV for later parsing" {
     var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_inst.deinit();

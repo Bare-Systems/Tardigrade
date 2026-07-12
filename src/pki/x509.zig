@@ -927,13 +927,21 @@ const Parser = struct {
             var point_reader = inner.childReader(point_elem.content_offset, point_elem.content.len) catch return error.MalformedExtension;
 
             var full_names: []const GeneralName = &.{};
+            var has_distribution_point = false;
+            var has_crl_issuer = false;
+            var last_tag: i64 = -1;
             while (point_reader.remaining() > 0) {
                 const elem = point_reader.readElement() catch return error.MalformedExtension;
                 if (elem.tag.class != .context_specific) return error.MalformedExtension;
+                // OPTIONAL fields appear at most once, in ascending tag order.
+                if (elem.tag.number <= last_tag) return error.MalformedExtension;
+                last_tag = elem.tag.number;
                 switch (elem.tag.number) {
                     0 => {
                         // distributionPoint [0] { fullName [0] GeneralNames |
                         // nameRelativeToCRLIssuer [1] RDN }
+                        if (!elem.tag.constructed) return error.MalformedExtension;
+                        has_distribution_point = true;
                         var choice_reader = point_reader.childReader(elem.content_offset, elem.content.len) catch return error.MalformedExtension;
                         const choice = choice_reader.readElement() catch return error.MalformedExtension;
                         choice_reader.expectEnd() catch return error.MalformedExtension;
@@ -941,15 +949,32 @@ const Parser = struct {
                         if (choice.tag.number == 0) {
                             var names_reader = choice_reader.childReader(choice.content_offset, choice.content.len) catch return error.MalformedExtension;
                             full_names = try self.parseGeneralNameList(&names_reader, .host);
+                            if (full_names.len == 0) return error.MalformedExtension;
                         } else if (choice.tag.number != 1) {
                             return error.MalformedExtension;
                         }
                     },
-                    // reasons [1] and cRLIssuer [2] are retained via `raw`.
-                    1, 2 => {},
+                    1 => {
+                        // reasons [1] IMPLICIT BIT STRING: validated, then
+                        // retained via `raw` only.
+                        if (elem.tag.constructed) return error.MalformedExtension;
+                        _ = der.decodeBitStringContent(elem.content) catch return error.MalformedExtension;
+                    },
+                    2 => {
+                        // cRLIssuer [2] IMPLICIT GeneralNames: validated,
+                        // then retained via `raw` only.
+                        if (!elem.tag.constructed) return error.MalformedExtension;
+                        has_crl_issuer = true;
+                        var issuer_reader = point_reader.childReader(elem.content_offset, elem.content.len) catch return error.MalformedExtension;
+                        const issuer_names = try self.parseGeneralNameList(&issuer_reader, .host);
+                        if (issuer_names.len == 0) return error.MalformedExtension;
+                    },
                     else => return error.MalformedExtension,
                 }
             }
+            // RFC 5280 §4.2.1.13: a DistributionPoint must carry a
+            // distributionPoint or a cRLIssuer; reasons alone is invalid.
+            if (!has_distribution_point and !has_crl_issuer) return error.MalformedExtension;
             try points.append(self.arena, .{ .raw = point_elem.encoded, .full_names = full_names });
         }
         if (points.items.len == 0) return error.MalformedExtension;
@@ -1089,12 +1114,27 @@ fn parseTime(reader: *der.Reader) Error!Time {
 }
 
 fn validateDirectoryString(elem: der.Element) Error!void {
-    if (elem.tag.class != .universal or elem.tag.constructed) return;
+    if (elem.tag.class != .universal) return;
+    // DER string encodings must be primitive; a constructed form of a
+    // recognized string tag is non-canonical, not an unknown type. Genuinely
+    // unknown attribute-value tags are retained raw.
     switch (elem.tag.number) {
-        @intFromEnum(der.UniversalTag.utf8_string) => der.validateUtf8(elem.content) catch return error.MalformedName,
-        @intFromEnum(der.UniversalTag.printable_string) => der.validatePrintableString(elem.content) catch return error.MalformedName,
-        @intFromEnum(der.UniversalTag.ia5_string) => der.validateIa5String(elem.content) catch return error.MalformedName,
-        @intFromEnum(der.UniversalTag.bmp_string) => der.validateBmpString(elem.content) catch return error.MalformedName,
+        @intFromEnum(der.UniversalTag.utf8_string) => {
+            if (elem.tag.constructed) return error.MalformedName;
+            der.validateUtf8(elem.content) catch return error.MalformedName;
+        },
+        @intFromEnum(der.UniversalTag.printable_string) => {
+            if (elem.tag.constructed) return error.MalformedName;
+            der.validatePrintableString(elem.content) catch return error.MalformedName;
+        },
+        @intFromEnum(der.UniversalTag.ia5_string) => {
+            if (elem.tag.constructed) return error.MalformedName;
+            der.validateIa5String(elem.content) catch return error.MalformedName;
+        },
+        @intFromEnum(der.UniversalTag.bmp_string) => {
+            if (elem.tag.constructed) return error.MalformedName;
+            der.validateBmpString(elem.content) catch return error.MalformedName;
+        },
         else => {},
     }
 }

@@ -105,17 +105,21 @@ pub fn dnsReference(host: []const u8) Error!Reference {
     return .{ .dns_name = name };
 }
 
-/// Parse an IPv4/IPv6 literal (brackets accepted) into a reference
-/// identity, or null when the input is not an IP literal.
+/// Parse an IPv4/IPv6 literal into a reference identity, or null when the
+/// input is not an IP literal. Brackets are URI host syntax for IPv6 only:
+/// `[::1]` is accepted, `[127.0.0.1]` is not an IP literal.
 pub fn ipReference(literal: []const u8) ?Reference {
-    var text = literal;
-    if (text.len >= 2 and text[0] == '[' and text[text.len - 1] == ']') {
-        text = text[1 .. text.len - 1];
+    if (literal.len >= 2 and literal[0] == '[' and literal[literal.len - 1] == ']') {
+        const inner = literal[1 .. literal.len - 1];
+        if (net.Ip6Address.parse(inner, 0)) |v6| {
+            return .{ .ip_address = .{ .v6 = v6.bytes } };
+        } else |_| {}
+        return null;
     }
-    if (net.Ip4Address.parse(text, 0)) |v4| {
+    if (net.Ip4Address.parse(literal, 0)) |v4| {
         return .{ .ip_address = .{ .v4 = v4.bytes } };
     } else |_| {}
-    if (net.Ip6Address.parse(text, 0)) |v6| {
+    if (net.Ip6Address.parse(literal, 0)) |v6| {
         return .{ .ip_address = .{ .v6 = v6.bytes } };
     } else |_| {}
     return null;
@@ -173,12 +177,16 @@ pub fn verifyHost(certificate: *const x509.Certificate, host: []const u8) Error!
     return verify(certificate, ref);
 }
 
-/// Whether one presented DNS-ID matches a validated DNS reference name.
-/// `presented` comes from an untrusted SAN entry: identifiers with invalid
-/// label syntax or non-conforming wildcards match nothing (the certificate
-/// may still match through another entry). Exposed for TLS-layer reuse;
-/// `reference_name` must come from `dnsReference`.
-pub fn presentedDnsIdMatches(presented: []const u8, reference_name: []const u8) bool {
+/// Whether one presented DNS-ID matches a DNS reference name. `presented`
+/// comes from an untrusted SAN entry: identifiers with invalid label syntax
+/// or non-conforming wildcards match nothing (the certificate may still
+/// match through another entry). Exposed for TLS-layer reuse. The reference
+/// is re-validated here rather than trusted from the caller — a malformed
+/// reference (e.g. one with an empty leading label a wildcard could
+/// swallow) matches nothing.
+pub fn presentedDnsIdMatches(presented: []const u8, raw_reference_name: []const u8) bool {
+    const reference_name = validateDnsReference(raw_reference_name) catch return false;
+
     const name = trimOneTrailingDot(presented);
     if (name.len == 0 or name.len > max_dns_name_len) return false;
 

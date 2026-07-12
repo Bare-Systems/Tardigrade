@@ -142,6 +142,13 @@ test "reference parsing enforces the A-label contract and LDH syntax" {
     try testing.expect(identity.ipReference("[2001:db8::1]") != null);
     try testing.expect(identity.ipReference("leaf.example.com") == null);
 
+    // Brackets are IPv6-only host syntax: bracketed IPv4 is neither an IP
+    // literal nor a valid DNS reference.
+    try testing.expect(identity.ipReference("[127.0.0.1]") == null);
+    try testing.expect(identity.ipReference("[]") == null);
+    try testing.expect(identity.ipReference("[leaf.example.com]") == null);
+    try testing.expectError(error.MalformedDnsReference, identity.reference("[127.0.0.1]"));
+
     // Valid DNS references normalize the trailing dot.
     const ref = try identity.reference("Leaf.Example.COM.");
     try testing.expectEqualStrings("Leaf.Example.COM", ref.dns_name);
@@ -204,6 +211,21 @@ test "presented DNS-ID matching is conservative about wildcards" {
         const ref = try identity.dnsReference(case.reference);
         try testing.expectEqual(case.matches, identity.presentedDnsIdMatches(case.presented, ref.dns_name));
     }
+}
+
+test "presentedDnsIdMatches re-validates raw reference input" {
+    // A malformed reference with an empty leading label must not be
+    // swallowed by the wildcard.
+    try testing.expect(!identity.presentedDnsIdMatches("*.example.com", ".example.com"));
+    try testing.expect(!identity.presentedDnsIdMatches("*.example.com", "..example.com"));
+    try testing.expect(!identity.presentedDnsIdMatches("example.com", ""));
+    try testing.expect(!identity.presentedDnsIdMatches("*.example.com", "*.example.com"));
+    try testing.expect(!identity.presentedDnsIdMatches("bücher.example", "bücher.example"));
+
+    // Raw (not pre-normalized) references still work: one trailing dot is
+    // normalized during re-validation.
+    try testing.expect(identity.presentedDnsIdMatches("leaf.example.com", "leaf.example.com."));
+    try testing.expect(identity.presentedDnsIdMatches("*.example.com", "www.example.com."));
 }
 
 test "hostile presented identifiers in real SANs never match" {

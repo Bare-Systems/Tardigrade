@@ -1,4 +1,5 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const compat = @import("zig_compat.zig");
 const edge_config = @import("edge_config.zig");
 const edge_gateway = @import("edge_gateway.zig");
@@ -109,9 +110,16 @@ pub fn main(init: std.process.Init.Minimal) !void {
             try stdout.flush();
         },
         .version => {
-            var stdout_buf: [128]u8 = undefined;
+            var stdout_buf: [256]u8 = undefined;
             var stdout = compat.stdoutWriter(&stdout_buf);
-            try stdout.print("{s}\n", .{http.SERVER_VERSION});
+            // The selected TLS profile is part of the artifact's identity
+            // (#379): operators and release audits verify from this line
+            // which backend a binary was built with.
+            try stdout.print("{s} (tls-profile={s}, tls-backend={s})\n", .{
+                http.SERVER_VERSION,
+                build_options.tls_profile,
+                if (build_options.tls_openssl_adapter) "openssl-adapter" else "native",
+            });
             try stdout.flush();
         },
         .config_init => |options| try writeStarterConfig(options),

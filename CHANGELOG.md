@@ -5,6 +5,30 @@ All notable user-facing changes to Tardigrade are documented here.
 ## [Unreleased]
 
 ### Features
+- **TLS dependency audit and pure-Zig cutover enforcement (#379, epic #327)** —
+  Tardigrade's external-library policy is now enforced in source, build
+  configuration, CI, and release artifacts rather than only documented. A new
+  `-Dtls-profile` build option selects between two profiles: `general` (the
+  default) links the single approved OpenSSL adapter as a compatibility
+  backend, while `appliance` (the Bare Systems profile) forbids all foreign
+  TLS/crypto linkage — `src/http/tls_backend.zig` swaps the OpenSSL adapter for
+  a no-OpenSSL stub (`src/http/tls_termination_stub.zig`) at the module graph,
+  so an appliance binary never analyzes `@cImport("openssl/...")`, never links
+  `libssl`/`libcrypto`, and has no runtime fallback (the stub fails closed until
+  the native TLS path lands under #391). `tardigrade version` now reports the
+  built-in profile and backend so an artifact is self-identifying. Two audit
+  scripts enforce the policy: `scripts/audit-dependencies.sh` fails if a
+  forbidden dependency (ngtcp2, nghttp3, quiche, BoringSSL, mbedTLS, …) is
+  configured, if an OpenSSL include escapes the adapter boundary, or if any
+  `@cImport` appears in a native path (`src/tls`, `src/pki`, `src/quic`,
+  `src/crypto`, `src/http3`); `scripts/audit-release-binary.sh` inspects a
+  built binary's dynamic dependencies (`ldd`/`otool -L`), fails a forbidden
+  linkage, and emits a machine-readable dependency inventory. CI gains a
+  required `TLS dependency audit` job that builds and audits both profiles, and
+  the release workflow audits each published binary and ships its inventory
+  alongside the SBOM. See `docs/TLS_DEPENDENCY_POLICY.md` for the policy and the
+  appliance/general cutover checklist. The stale `build.zig.zon` note about an
+  optional ngtcp2/nghttp3 link path (removed in #328) is corrected.
 - **Stable cryptographic-provider boundary (#370, epic #327)** — a new
   `src/crypto/` package defines the single narrow interface every TLS, QUIC,
   and PKI module will consume cryptography through, so protocol code never

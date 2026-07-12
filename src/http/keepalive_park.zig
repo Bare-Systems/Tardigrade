@@ -28,7 +28,7 @@
 const std = @import("std");
 const compat = @import("../zig_compat.zig");
 const gateway_state = @import("../gateway_state.zig");
-const tls_termination = @import("tls_termination.zig");
+const tls_termination = @import("tls_backend.zig");
 
 const ConnectionSession = gateway_state.ConnectionSession;
 const ConnectionSessionPool = gateway_state.ConnectionSessionPool;

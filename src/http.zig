@@ -47,8 +47,16 @@ pub const worker_pool = @import("http/worker_pool.zig");
 pub const buffer_pool = @import("http/buffer_pool.zig");
 pub const keepalive_park = @import("http/keepalive_park.zig");
 pub const upstream_pool = @import("http/upstream_pool.zig");
-pub const tls_termination = @import("http/tls_termination.zig");
-pub const acme_client = @import("http/acme_client.zig");
+/// TLS termination backend selected by `-Dtls-profile` (#379): the OpenSSL
+/// adapter in the general profile, a no-OpenSSL stub in the Bare Systems
+/// appliance profile. The swap happens in `http/tls_backend.zig` — at the
+/// module graph, not at runtime — so an appliance binary never analyzes
+/// `@cImport("openssl/...")` and cannot silently fall back to the C adapter.
+pub const tls_termination = @import("http/tls_backend.zig");
+/// ACME client backend selected by `-Dtls-profile` (#379): OpenSSL-backed in
+/// the general profile, a no-OpenSSL stub in the appliance profile. Selected
+/// at the module graph so the appliance never links OpenSSL through ACME.
+pub const acme_client = @import("http/acme_backend.zig");
 pub const hpack = @import("http/hpack.zig");
 pub const http2_frame = @import("http/http2_frame.zig");
 pub const http2_stream = @import("http/http2_stream.zig");

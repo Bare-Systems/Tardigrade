@@ -48,6 +48,61 @@ jobs:
       - name: Run shellcheck
         run: find scripts/ packaging/ -name "*.sh" -exec shellcheck {} +
 
+  # ── TLS dependency audit ──────────────────────────────────────────────────────
+  # Enforces the external-library policy (#379): forbidden TLS/crypto/QUIC/H3
+  # dependency names must not be configured, OpenSSL must stay behind the
+  # adapter boundary, native paths must be @cImport-free, and produced
+  # appliance/general artifacts must have the expected linkage. This is a
+  # required v0.5 release gate for the Bare Systems appliance (#391).
+  dependency-audit:
+    name: TLS dependency audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Source and configuration audit
+        run: ./scripts/audit-dependencies.sh
+
+      - name: Install system dependencies (general profile)
+        run: sudo apt-get install -y libssl-dev
+
+      - name: Install Zig
+        run: sh ./scripts/install-zig.sh 0.16.0
+
+      - name: Build appliance profile (no OpenSSL)
+        run: zig build -Doptimize=ReleaseFast -Dtls-profile=appliance
+
+      - name: Audit appliance artifact linkage
+        run: |
+          ./scripts/audit-release-binary.sh \
+            --binary zig-out/bin/tardigrade \
+            --profile appliance \
+            --output "$RUNNER_TEMP/dependency-inventory-appliance.json"
+
+      - name: Build general profile (OpenSSL adapter)
+        run: zig build -Doptimize=ReleaseFast -Dtls-profile=general
+
+      - name: Audit general artifact linkage
+        run: |
+          ./scripts/audit-release-binary.sh \
+            --binary zig-out/bin/tardigrade \
+            --profile general \
+            --output "$RUNNER_TEMP/dependency-inventory-general.json"
+
+      - name: Upload dependency inventories
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dependency-inventory
+          path: ${{ runner.temp }}/dependency-inventory-*.json
+          if-no-files-found: error
+          retention-days: 14
+
   # ── Unit tests ────────────────────────────────────────────────────────────────
   # Runs unit tests across platforms. Required on every PR and push.
   test:

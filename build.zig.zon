@@ -36,11 +36,12 @@
     // Once all dependencies are fetched, `zig build` no longer requires
     // internet connectivity.
     //
-    // Tardigrade keeps HTTP/3 / QUIC support behind explicit build flags. The
-    // C-backed path links ngtcp2/nghttp3 system libraries only when
-    // `-Denable-http3-ngtcp2` is enabled. The pure-Zig path uses
-    // `-Denable-http3-zig` and has no package-manager or system-library
-    // dependency on those optional HTTP/3 libraries.
+    // Tardigrade has no package-manager dependencies. HTTP/3 and QUIC run on
+    // the pure-Zig transport (#328 removed the former C-backed ngtcp2/nghttp3
+    // path); TLS/crypto is either the pure-Zig native path or the single
+    // approved OpenSSL adapter, selected by `-Dtls-profile` and enforced by
+    // scripts/audit-dependencies.sh (#379). External TLS/QUIC/H3
+    // implementations may run only as out-of-process interoperability peers.
     .dependencies = .{
         // See `zig fetch --save <url>` for a command-line interface for adding dependencies.
         //.example = .{

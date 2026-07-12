@@ -234,12 +234,54 @@ test "strict base64 rejects malformed data" {
         "====\n",
         // Bare CR inside a base64 line is not a line terminator.
         "MAMC\rAQE=\n",
+        // Doubled CR before LF: only one CR belongs to the CRLF terminator.
+        "MAMCAQE=\r\r\n",
     };
     for (cases) |body| {
         const text = try std.mem.concat(allocator, u8, &.{ prefix, body, suffix });
         defer allocator.free(text);
         try testing.expectError(error.InvalidPemBase64, pem.loadChainPem(allocator, text, .{}));
     }
+}
+
+test "doubled CR before LF on a boundary line fails typed" {
+    const allocator = testing.allocator;
+    try testing.expectError(error.MalformedPemBoundary, pem.loadChainPem(
+        allocator,
+        "-----BEGIN CERTIFICATE-----\r\r\nMAMCAQE=\r\n-----END CERTIFICATE-----\r\n",
+        .{},
+    ));
+}
+
+test "extreme caller-supplied limits do not overflow bound computation" {
+    const allocator = testing.allocator;
+    const cert = minimalCertDer(1);
+    const text = try certPem(allocator, &cert, "\n");
+    defer allocator.free(text);
+
+    // max_certificate_len at maxInt must not wrap in the base64 bound; the
+    // input is still bounded by max_input_len.
+    var chain = try pem.loadChainPem(allocator, text, .{
+        .max_certificate_len = std.math.maxInt(usize),
+        .max_input_len = std.math.maxInt(usize),
+        .max_certificates = std.math.maxInt(usize),
+    });
+    defer chain.deinit(allocator);
+    try testing.expectEqualSlices(u8, &cert, chain.certificates[0].der);
+
+    // Values just below the multiplication saturation point behave the same.
+    var chain2 = try pem.loadChainPem(allocator, text, .{
+        .max_certificate_len = std.math.maxInt(usize) / 4 * 3 + 1,
+    });
+    defer chain2.deinit(allocator);
+    try testing.expectEqual(@as(usize, 1), chain2.certificates.len);
+
+    var single = try pem.loadCertificateDer(allocator, &cert, .{
+        .max_certificate_len = std.math.maxInt(usize),
+        .max_input_len = std.math.maxInt(usize),
+    });
+    defer single.deinit(allocator);
+    try testing.expectEqualSlices(u8, &cert, single.der);
 }
 
 test "empty certificate block fails typed" {

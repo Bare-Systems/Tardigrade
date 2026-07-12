@@ -127,7 +127,12 @@ pub fn loadChainPem(allocator: std.mem.Allocator, pem_text: []const u8, limits: 
 
     var lines = std.mem.splitScalar(u8, pem_text, '\n');
     while (lines.next()) |raw_line| {
-        const line = std.mem.trimEnd(u8, raw_line, "\r");
+        // Strip exactly one CR from a CRLF terminator. Any further CR stays
+        // in the line and fails validation; bare CR is not a terminator.
+        const line = if (raw_line.len > 0 and raw_line[raw_line.len - 1] == '\r')
+            raw_line[0 .. raw_line.len - 1]
+        else
+            raw_line;
         // A trailing newline at EOF yields one final empty segment; that is
         // end-of-input, not a blank line inside a block.
         if (line.len == 0 and lines.peek() == null) break;
@@ -157,7 +162,9 @@ pub fn loadChainPem(allocator: std.mem.Allocator, pem_text: []const u8, limits: 
                     state = .outside;
                 } else {
                     try validateBase64Line(line);
-                    if (base64_buf.items.len + line.len > max_base64_len) return error.CertificateTooLarge;
+                    // items.len <= max_base64_len is an invariant, so the
+                    // subtraction cannot underflow and the check cannot wrap.
+                    if (line.len > max_base64_len - base64_buf.items.len) return error.CertificateTooLarge;
                     try base64_buf.appendSlice(allocator, line);
                 }
             },
@@ -309,9 +316,13 @@ fn validateCertificateDer(bytes: []const u8, limits: Limits) Error!void {
     reader.expectEnd() catch return error.MalformedCertificateDer;
 }
 
-/// Base64 length (with padding) for `len` raw bytes.
+/// Base64 length (with padding) for `len` raw bytes. `Limits` is
+/// caller-controlled, so this must not overflow for extreme values;
+/// saturating at maxInt just means the accumulation bound defers to
+/// `max_input_len`.
 fn base64EncodedLen(len: usize) usize {
-    return ((len + 2) / 3) * 4;
+    const groups = len / 3 + @intFromBool(len % 3 != 0);
+    return groups *| 4;
 }
 
 /// Fuzz and regression entrypoint (#327-G): parse arbitrary bytes as a PEM

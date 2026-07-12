@@ -28,6 +28,24 @@ All notable user-facing changes to Tardigrade are documented here.
   and sign/verify round-trips under `zig build test-crypto`. The OpenSSL
   production adapter and migrating the existing QUIC/TLS modules onto the
   boundary are follow-ups (#323–#326); see `docs/CRYPTO_PROVIDER.md`.
+- **Pure-Zig PEM and certificate-chain loader (#340, epic #324)** — adds
+  `src/pki/pem.zig`, which loads X.509 certificates and ordered certificate
+  chains from PEM or DER buffers/files without constructing OpenSSL objects.
+  `CERTIFICATE` blocks are decoded with strict RFC 7468 handling — standard
+  base64 alphabet only, canonical padding, zero trailing bits, no data after
+  padding, and well-formed encapsulation boundaries — while surrounding text
+  and non-certificate blocks (private keys, parameters) are tolerated the way
+  real bundle files require, and LF/CRLF line endings both load. Every
+  decoded certificate must be exactly one definite-length DER SEQUENCE
+  (validated via `der.Reader`), exact DER bytes and input order are preserved
+  for #341, and configurable limits bound input size, per-certificate size,
+  and certificate count before any attacker-controlled allocation. Malformed
+  labels, base64, padding, trailing junk, empty chains, and oversized input
+  fail with typed errors; returned certificates own their DER copies and are
+  freed with explicit `deinit`. Memory-buffer APIs come first with thin
+  `std.Io`-based file helpers on top, plus a `fuzzLoadChainPem` entrypoint
+  for #327-G. Mixed-text, line-ending, multi-block, hostile-input, and
+  allocation-failure coverage runs under `zig build test-pki`.
 - **Bounded ASN.1 DER decoder for X.509 (#339)** — adds `src/pki/` with a
   strict, allocation-aware DER foundation for the #324 Web PKI epic:
   `der.zig` provides a bounded `Reader` with typed decoders (SEQUENCE/SET,

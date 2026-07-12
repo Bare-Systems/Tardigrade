@@ -11,6 +11,7 @@
 //! - `time` — UTCTime and GeneralizedTime validation
 //! - `pem` — strict PEM decoding and DER certificate-chain loading
 //! - `x509` — policy-neutral certificate model with typed extensions
+//! - `identity` — SAN-only DNS/IP service identity matching (RFC 9525)
 //!
 //! ## Policy summary
 //!
@@ -32,10 +33,12 @@ pub const oid = @import("oid.zig");
 pub const time = @import("time.zig");
 pub const pem = @import("pem.zig");
 pub const x509 = @import("x509.zig");
+pub const identity = @import("identity.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());
     _ = @import("der_tests.zig");
     _ = @import("pem_tests.zig");
     _ = @import("x509_tests.zig");
+    _ = @import("identity_tests.zig");
 }

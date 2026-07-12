@@ -28,6 +28,25 @@ All notable user-facing changes to Tardigrade are documented here.
   and sign/verify round-trips under `zig build test-crypto`. The OpenSSL
   production adapter and migrating the existing QUIC/TLS modules onto the
   boundary are follow-ups (#323–#326); see `docs/CRYPTO_PROVIDER.md`.
+- **SAN-only DNS and IP identity matching (#342, epic #324)** — adds
+  `src/pki/identity.zig`, RFC 9525-style service identity verification over
+  the #341 certificate model. DNS references match only DNS-ID
+  `subjectAltName` entries and IP references only IP-address entries, with
+  Common Name fallback disabled so CN-only certificates always fail.
+  Wildcards are conservative: honored only as the complete left-most label,
+  matching exactly one label, requiring at least two literal labels after
+  the wildcard (`*.com` never matches), with partial-label and interior
+  wildcards matching nothing. DNS references carry an explicit A-label/IDNA
+  input contract — non-ASCII input is rejected rather than transformed —
+  and are validated against LDH label syntax with consistent case and
+  single-trailing-dot normalization on both sides; IPv4-shaped names that
+  fail strict IP-literal parsing (octal, out-of-range) are rejected to
+  prevent address confusion. Matching is a pure, allocation-free function
+  independent of chain construction and signature validation; mismatches
+  report only the caller's reference identity and a typed mismatch class
+  (`no_subject_alt_name`, `no_entries_of_reference_type`,
+  `no_matching_entry`). Tested against the #341 OpenSSL fixtures and
+  synthetic hostile SANs under `zig build test-pki`.
 - **Typed X.509 certificate model (#341, epic #324)** — adds
   `src/pki/x509.zig`, a policy-neutral parser that decodes a DER certificate
   into every field needed for identity matching, signature verification, path

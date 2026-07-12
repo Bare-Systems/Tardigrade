@@ -105,12 +105,20 @@ pub const Parser = struct {
     /// Feed arbitrary TCP bytes into the parser. Completed records are copied
     /// into `sink`; incomplete headers/bodies stay buffered for the next feed.
     pub fn feed(self: *Parser, bytes: []const u8, sink: anytype) Error!void {
+        try self.drain(sink);
         for (bytes) |byte| {
             if (self.len == self.pending.len) return error.RecordBufferOverflow;
             self.pending[self.len] = byte;
             self.len += 1;
             try self.drain(sink);
         }
+    }
+
+    /// Retry emission of already-buffered complete records after the caller has
+    /// made room in `sink`. This supports bounded sink/backpressure loops
+    /// without appending unrelated bytes first.
+    pub fn drainReady(self: *Parser, sink: anytype) Error!void {
+        try self.drain(sink);
     }
 
     pub fn finish(self: *const Parser) Error!void {
@@ -182,7 +190,8 @@ fn encodeRecord(content_type: ContentType, payload: []const u8, out: []u8) Error
 pub fn encodeInnerPlaintext(content_type: ContentType, content: []const u8, padding_len: usize, out: []u8) Error![]const u8 {
     if (content_type == .change_cipher_spec) return error.InvalidRecordType;
     if (content.len > max_plaintext_fragment_len) return error.RecordTooLarge;
-    const total = content.len + 1 + padding_len;
+    const content_and_type = std.math.add(usize, content.len, 1) catch return error.RecordTooLarge;
+    const total = std.math.add(usize, content_and_type, padding_len) catch return error.RecordTooLarge;
     if (total > max_ciphertext_fragment_len) return error.RecordTooLarge;
     if (out.len < total) return error.RecordBufferOverflow;
     @memcpy(out[0..content.len], content);
@@ -316,6 +325,24 @@ test "record sink bounds copied payload storage" {
     try testing.expectError(error.RecordSinkOverflow, parser.feed(record, &sink));
 }
 
+test "parser can retry buffered record after sink backpressure" {
+    var parser = Parser.init(.plaintext);
+    var sink = RecordSink(1, 32){};
+    var encoded: [64]u8 = undefined;
+    const first = try encodePlaintextRecord(.handshake, "one", encoded[0..]);
+    const second = try encodePlaintextRecord(.alert, "two", encoded[first.len..]);
+
+    try testing.expectError(error.RecordSinkOverflow, parser.feed(encoded[0 .. first.len + second.len], &sink));
+    try testing.expectEqual(@as(usize, 1), sink.len);
+    try testing.expectEqualStrings("one", sink.items[0].payload);
+
+    sink.reset();
+    try parser.drainReady(&sink);
+    try testing.expectEqual(@as(usize, 1), sink.len);
+    try testing.expectEqualStrings("two", sink.items[0].payload);
+    try parser.finish();
+}
+
 test "plaintext and ciphertext serializers enforce limits and envelope type" {
     var out: [header_len + 4]u8 = undefined;
     const plain = try encodePlaintextRecord(.handshake, "abcd", &out);
@@ -346,6 +373,7 @@ test "inner plaintext rejects all-zero, invalid type, and oversized content" {
 
     var out: [4]u8 = undefined;
     try testing.expectError(error.InvalidRecordType, encodeInnerPlaintext(.change_cipher_spec, "", 0, &out));
+    try testing.expectError(error.RecordTooLarge, encodeInnerPlaintext(.handshake, "", std.math.maxInt(usize), &out));
 }
 
 test "fuzz entrypoint accepts arbitrary bytes without escaping errors" {

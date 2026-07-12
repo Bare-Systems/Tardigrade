@@ -29,6 +29,9 @@ boundary is what keeps the two from coupling to each other.
   discovery, the error taxonomy, the injected `Entropy` source, the opaque
   `SigningKey` handle, and the `CryptoProvider` interface (a `context` pointer
   plus a `*const VTable`, the same seam shape as the QUIC `TlsBackend`).
+- `src/crypto/secrets.zig` — fixed-size and bounded dynamic secret containers,
+  shared secure-zero and constant-time comparison helpers, and the non-formatting
+  convention for secret-bearing values.
 - `src/crypto/pure_zig.zig` — the first concrete backend, built entirely on
   `std.crypto`. Implements the narrow first profile and advertises exactly that.
 - `src/crypto/root.zig` — the package aggregator.
@@ -47,6 +50,8 @@ changes when it lands.
 - **Signatures** — verification, and signing through the opaque `SigningKey`
   handle, for Ed25519 and (declared) ECDSA-P256 and RSA-PSS.
 - **Random bytes**, **constant-time comparison**, and **secure zeroing**.
+- **Secret containers** for fixed-size stack material and bounded heap material,
+  with explicit replacement and deinitialization rules.
 - **Opaque private-key handles** and **capability discovery**.
 
 The pure-Zig backend implements the overlap the TLS/QUIC engines need today:
@@ -92,6 +97,16 @@ way out — including HKDF's per-block temporaries, the X25519 seed, ephemeral
 private scalar, and shared-secret copies. AEAD-open zeroes its output buffer on
 authentication failure so no unauthenticated plaintext is ever left for the
 caller to read.
+
+Secret-bearing protocol state should use `crypto.secrets.FixedSecret(N)` for
+fixed-capacity storage and `crypto.secrets.BoundedSecret` for heap-backed
+storage with an explicit upper bound. These types copy input into owned memory,
+return borrowed slices through `slice`, wipe replaced contents before reuse, and
+must be `deinit`ed before the owning connection/key object is discarded. Secret
+containers deliberately provide a `format` method that fails compilation so
+accidental `{}` logging does not expose key material. `BoundedSecret` is
+initialized in place so callers do not receive an owning heap allocation by
+value; any ownership transfer must be explicit at the call site.
 
 ### Entropy is injected
 

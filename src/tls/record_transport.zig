@@ -16,6 +16,7 @@
 
 const std = @import("std");
 const alerts = @import("alerts.zig");
+const crypto_secrets = @import("crypto_secrets");
 const engine = @import("engine.zig");
 const events = @import("events.zig");
 const state = @import("state.zig");
@@ -84,7 +85,7 @@ pub const EventSink = struct {
     }
 
     fn zeroUsedScratch(self: *EventSink) void {
-        if (self.used > 0) std.crypto.secureZero(u8, self.scratch[0..self.used]);
+        if (self.used > 0) crypto_secrets.secureZero(self.scratch[0..self.used]);
     }
 
     fn store(self: *EventSink, bytes: []const u8) Error![]const u8 {

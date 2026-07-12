@@ -7,6 +7,7 @@
 
 pub const provider = @import("provider.zig");
 pub const pure_zig = @import("pure_zig.zig");
+pub const secrets = @import("crypto_secrets");
 
 test {
     @import("std").testing.refAllDecls(@This());

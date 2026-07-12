@@ -25,11 +25,17 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const crypto_secrets_mod = b.createModule(.{
+        .root_source_file = b.path("src/crypto/secrets.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const tls_core_mod = b.createModule(.{
         .root_source_file = b.path("src/tls/root.zig"),
         .target = target,
         .optimize = optimize,
     });
+    tls_core_mod.addImport("crypto_secrets", crypto_secrets_mod);
 
     // Shared leaf modules. A Zig source file belongs to exactly one module,
     // so anything consumed by both the exe tree and the quic/http3 packages
@@ -55,6 +61,7 @@ pub fn build(b: *std.Build) void {
     });
     quic_mod.addImport("quic_varint", quic_varint_mod);
     quic_mod.addImport("tls_core", tls_core_mod);
+    quic_mod.addImport("crypto_secrets", crypto_secrets_mod);
     const http3_mod = b.createModule(.{
         .root_source_file = b.path("src/http3/root.zig"),
         .target = target,
@@ -222,11 +229,16 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    crypto_mod.addImport("crypto_secrets", crypto_secrets_mod);
     const crypto_tests = b.addTest(.{ .root_module = crypto_mod });
     const run_crypto_tests = b.addRunArtifact(crypto_tests);
+    const crypto_secret_tests = b.addTest(.{ .root_module = crypto_secrets_mod });
+    const run_crypto_secret_tests = b.addRunArtifact(crypto_secret_tests);
     const crypto_step = b.step("test-crypto", "Run pure-Zig cryptographic-provider unit tests");
     crypto_step.dependOn(&run_crypto_tests.step);
+    crypto_step.dependOn(&run_crypto_secret_tests.step);
     test_step.dependOn(&run_crypto_tests.step);
+    test_step.dependOn(&run_crypto_secret_tests.step);
 
     const http3_tests = b.addTest(.{ .root_module = http3_mod });
     const run_http3_tests = b.addRunArtifact(http3_tests);

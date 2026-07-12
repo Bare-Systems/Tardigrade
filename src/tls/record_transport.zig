@@ -3,8 +3,9 @@
 //! This module is deliberately below any socket, readiness, ciphertext-buffer,
 //! or record-codec layer. A future record implementation decrypts TLS records,
 //! supplies the resulting handshake bytes to `Driver.receive`, and consumes the
-//! events emitted here to write plaintext handshake bytes, install traffic keys,
-//! surface negotiated metadata, send fatal alerts, and observe completion.
+//! events emitted here to write handshake bytes at their required protection
+//! epoch, install traffic keys, surface negotiated metadata, send fatal alerts,
+//! and observe completion.
 //!
 //! Ownership rules are narrow and testable:
 //! - All byte slices in emitted events are copied into the driver's `EventSink`.
@@ -41,9 +42,14 @@ pub const TrafficKeys = struct {
     secret: []const u8,
 };
 
+pub const PlaintextOutput = struct {
+    epoch: RecordEpoch,
+    data: []const u8,
+};
+
 pub const RecordHandshakeEvent = union(enum) {
-    /// Plaintext handshake bytes the record layer must frame and write.
-    emit_plaintext: []const u8,
+    /// Handshake bytes the record layer must frame and write at `epoch`.
+    emit_plaintext: PlaintextOutput,
     /// Activate read protection for records at `epoch`.
     install_read_keys: TrafficKeys,
     /// Activate write protection for records at `epoch`.
@@ -95,8 +101,8 @@ pub const EventSink = struct {
         self.len += 1;
     }
 
-    pub fn emitPlaintext(self: *EventSink, bytes: []const u8) Error!void {
-        try self.push(.{ .emit_plaintext = try self.store(bytes) });
+    pub fn emitPlaintext(self: *EventSink, epoch: RecordEpoch, bytes: []const u8) Error!void {
+        try self.push(.{ .emit_plaintext = .{ .epoch = epoch, .data = try self.store(bytes) } });
     }
 
     pub fn installReadKeys(self: *EventSink, epoch: RecordEpoch, secret: []const u8) Error!void {
@@ -121,6 +127,13 @@ pub const EventSink = struct {
 
     pub fn emitComplete(self: *EventSink) Error!void {
         try self.push(.complete);
+    }
+
+    pub fn hasFatalAlert(self: *const EventSink) bool {
+        for (self.items[0..self.len]) |event| {
+            if (event == .fatal_alert) return true;
+        }
+        return false;
     }
 };
 
@@ -150,19 +163,81 @@ pub const Contract = struct {
     pub const Backend = record_transport.Backend;
 };
 
-pub const Driver = engine.Driver(Contract);
+const CoreDriver = engine.Driver(Contract);
+
+pub const ReceiveResult = struct {
+    sink: *EventSink,
+    terminal_error: ?Error = null,
+};
+
+pub const Driver = struct {
+    core: CoreDriver,
+
+    pub fn init(role: state.Role, backend: Backend) Driver {
+        return .{ .core = CoreDriver.init(role, backend) };
+    }
+
+    pub fn start(self: *Driver, params: void) Error!*EventSink {
+        return self.core.start(params);
+    }
+
+    pub fn receive(self: *Driver, epoch: RecordEpoch, bytes: []const u8) Error!ReceiveResult {
+        if (self.core.state == .failed) return self.core.failure_reason.?;
+        self.core.sink.reset();
+        self.core.backend.receive(epoch, bytes, &self.core.sink) catch |err| {
+            if (!self.core.sink.hasFatalAlert()) {
+                if (fatalAlertForError(err)) |alert| try self.core.sink.emitFatalAlert(alert);
+            }
+            self.core.state = .failed;
+            self.core.failure_reason = err;
+            return .{ .sink = &self.core.sink, .terminal_error = err };
+        };
+        return .{ .sink = &self.core.sink };
+    }
+
+    pub fn complete(self: *Driver) void {
+        self.core.complete();
+    }
+
+    pub fn isComplete(self: *const Driver) bool {
+        return self.core.isComplete();
+    }
+
+    pub fn failure(self: *const Driver) ?Error {
+        return self.core.failure();
+    }
+
+    pub fn deinit(self: *Driver) void {
+        self.core.sink.deinit();
+    }
+};
+
+fn fatalAlertForError(err: Error) ?alerts.AlertDescription {
+    return switch (err) {
+        error.MalformedHandshake => alerts.fromHandshakeError(error.MalformedHandshake),
+        error.IllegalParameter => alerts.fromHandshakeError(error.IllegalParameter),
+        error.UnexpectedHandshakeMessage => alerts.fromHandshakeError(error.UnexpectedHandshakeMessage),
+        error.AlpnMismatch => alerts.fromHandshakeError(error.AlpnMismatch),
+        error.CertificateInvalid => alerts.fromHandshakeError(error.CertificateInvalid),
+        error.SecretExportFailed => alerts.fromHandshakeError(error.SecretExportFailed),
+        error.InvalidHandshakeState,
+        error.RecordTransportBufferOverflow,
+        => null,
+    };
+}
 
 const record_transport = @This();
 const testing = std.testing;
 
 test "record transport sink copies payloads and zeroizes used storage on reset" {
     var sink = EventSink{};
-    try sink.emitPlaintext("client hello");
+    try sink.emitPlaintext(.plaintext, "client hello");
     try sink.installReadKeys(.handshake_protected, "read secret");
     try sink.installWriteKeys(.application_protected, "write secret");
 
     try testing.expectEqual(@as(usize, 3), sink.len);
-    try testing.expectEqualStrings("client hello", sink.items[0].emit_plaintext);
+    try testing.expectEqual(RecordEpoch.plaintext, sink.items[0].emit_plaintext.epoch);
+    try testing.expectEqualStrings("client hello", sink.items[0].emit_plaintext.data);
     try testing.expectEqual(RecordEpoch.handshake_protected, sink.items[1].install_read_keys.epoch);
     try testing.expectEqualStrings("read secret", sink.items[1].install_read_keys.secret);
     try testing.expect(sink.used > 0);
@@ -177,7 +252,7 @@ test "record transport sink copies payloads and zeroizes used storage on reset" 
 test "record transport sink enforces bounded event and byte storage" {
     var sink = EventSink{};
     const oversized = [_]u8{0xaa} ** (EventSink.max_bytes + 1);
-    try testing.expectError(error.RecordTransportBufferOverflow, sink.emitPlaintext(&oversized));
+    try testing.expectError(error.RecordTransportBufferOverflow, sink.emitPlaintext(.plaintext, &oversized));
 
     for (0..EventSink.max_events) |_| try sink.emitFatalAlert(.internal_error);
     try testing.expectError(error.RecordTransportBufferOverflow, sink.emitFatalAlert(.internal_error));
@@ -193,7 +268,7 @@ test "record transport driver fixture completes with asymmetric key transitions"
 
         fn start(_: *anyopaque, role: state.Role, _: void, sink: *EventSink) Error!void {
             switch (role) {
-                .client => try sink.emitPlaintext("client hello"),
+                .client => try sink.emitPlaintext(.plaintext, "client hello"),
                 .server => {},
             }
         }
@@ -202,7 +277,7 @@ test "record transport driver fixture completes with asymmetric key transitions"
             if (epoch == .plaintext and std.mem.eql(u8, bytes, "client hello")) {
                 try sink.installReadKeys(.handshake_protected, "server read handshake");
                 try sink.installWriteKeys(.handshake_protected, "server write handshake");
-                try sink.emitPlaintext("server hello");
+                try sink.emitPlaintext(.plaintext, "server hello");
                 try sink.emitAlpn("h2");
                 try sink.emitPeerCertificate(.valid);
                 return;
@@ -211,7 +286,7 @@ test "record transport driver fixture completes with asymmetric key transitions"
             if (epoch == .plaintext and std.mem.eql(u8, bytes, "server hello")) {
                 try sink.installReadKeys(.handshake_protected, "client read handshake");
                 try sink.installWriteKeys(.application_protected, "client write application");
-                try sink.emitPlaintext("client finished");
+                try sink.emitPlaintext(.handshake_protected, "client finished");
                 return;
             }
 
@@ -234,22 +309,76 @@ test "record transport driver fixture completes with asymmetric key transitions"
 
     const client_start = try client.start({});
     try testing.expectEqual(@as(usize, 1), client_start.len);
-    try testing.expectEqualStrings("client hello", client_start.items[0].emit_plaintext);
+    try testing.expectEqual(RecordEpoch.plaintext, client_start.items[0].emit_plaintext.epoch);
+    try testing.expectEqualStrings("client hello", client_start.items[0].emit_plaintext.data);
 
-    const server_flight = try server.receive(.plaintext, client_start.items[0].emit_plaintext);
+    const server_result = try server.receive(.plaintext, client_start.items[0].emit_plaintext.data);
+    try testing.expectEqual(@as(?Error, null), server_result.terminal_error);
+    const server_flight = server_result.sink;
     try testing.expectEqual(RecordEpoch.handshake_protected, server_flight.items[0].install_read_keys.epoch);
     try testing.expectEqual(RecordEpoch.handshake_protected, server_flight.items[1].install_write_keys.epoch);
-    try testing.expectEqualStrings("server hello", server_flight.items[2].emit_plaintext);
+    try testing.expectEqual(RecordEpoch.plaintext, server_flight.items[2].emit_plaintext.epoch);
+    try testing.expectEqualStrings("server hello", server_flight.items[2].emit_plaintext.data);
     try testing.expectEqualStrings("h2", server_flight.items[3].negotiated_alpn);
     try testing.expectEqual(events.CertificateState.valid, server_flight.items[4].peer_certificate);
 
-    const client_finished = try client.receive(.plaintext, server_flight.items[2].emit_plaintext);
+    const client_result = try client.receive(.plaintext, server_flight.items[2].emit_plaintext.data);
+    try testing.expectEqual(@as(?Error, null), client_result.terminal_error);
+    const client_finished = client_result.sink;
     try testing.expectEqual(RecordEpoch.handshake_protected, client_finished.items[0].install_read_keys.epoch);
     try testing.expectEqual(RecordEpoch.application_protected, client_finished.items[1].install_write_keys.epoch);
-    try testing.expectEqualStrings("client finished", client_finished.items[2].emit_plaintext);
+    try testing.expectEqual(RecordEpoch.handshake_protected, client_finished.items[2].emit_plaintext.epoch);
+    try testing.expectEqualStrings("client finished", client_finished.items[2].emit_plaintext.data);
 
-    const server_complete = try server.receive(.handshake_protected, client_finished.items[2].emit_plaintext);
+    const complete_result = try server.receive(.handshake_protected, client_finished.items[2].emit_plaintext.data);
+    try testing.expectEqual(@as(?Error, null), complete_result.terminal_error);
+    const server_complete = complete_result.sink;
     try testing.expectEqual(RecordEpoch.application_protected, server_complete.items[0].install_read_keys.epoch);
     try testing.expectEqual(RecordEpoch.application_protected, server_complete.items[1].install_write_keys.epoch);
     try testing.expectEqual(RecordHandshakeEvent.complete, server_complete.items[2]);
+}
+
+test "record transport driver exposes fatal alert when receive fails" {
+    const Fixture = struct {
+        fn backend(self: *@This()) Backend {
+            return .{ .ptr = self, .startFn = start, .receiveFn = receive };
+        }
+
+        fn start(_: *anyopaque, _: state.Role, _: void, _: *EventSink) Error!void {}
+
+        fn receive(_: *anyopaque, _: RecordEpoch, _: []const u8, _: *EventSink) Error!void {
+            return error.UnexpectedHandshakeMessage;
+        }
+    };
+
+    var fixture = Fixture{};
+    var driver = Driver.init(.server, fixture.backend());
+    const result = try driver.receive(.plaintext, "finished");
+    try testing.expectEqual(error.UnexpectedHandshakeMessage, result.terminal_error.?);
+    try testing.expectEqual(alerts.AlertDescription.unexpected_message, result.sink.items[0].fatal_alert);
+    try testing.expectEqual(error.UnexpectedHandshakeMessage, driver.failure().?);
+}
+
+test "record transport driver deinit zeroizes last emitted traffic secrets" {
+    const Fixture = struct {
+        fn backend(self: *@This()) Backend {
+            return .{ .ptr = self, .startFn = start, .receiveFn = receive };
+        }
+
+        fn start(_: *anyopaque, _: state.Role, _: void, sink: *EventSink) Error!void {
+            try sink.installWriteKeys(.handshake_protected, "last secret");
+        }
+
+        fn receive(_: *anyopaque, _: RecordEpoch, _: []const u8, _: *EventSink) Error!void {}
+    };
+
+    var fixture = Fixture{};
+    var driver = Driver.init(.client, fixture.backend());
+    const sink = try driver.start({});
+    try testing.expect(sink.used > 0);
+    const used = sink.used;
+
+    driver.deinit();
+    try testing.expectEqual(@as(usize, 0), driver.core.sink.used);
+    for (driver.core.sink.scratch[0..used]) |byte| try testing.expectEqual(@as(u8, 0), byte);
 }

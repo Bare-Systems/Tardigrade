@@ -1,8 +1,8 @@
-//! Pure-Zig PKI foundation (#324, #339, #340): bounded ASN.1 DER decoding and
-//! PEM/certificate-chain loading for X.509.
+//! Pure-Zig PKI foundation (#324, #339, #340, #341): bounded ASN.1 DER
+//! decoding, PEM/certificate-chain loading, and the typed X.509 model.
 //!
-//! This package is the DER and PEM foundation for the Web PKI epic (#324). It
-//! does not parse complete certificates (#341) or verify signatures.
+//! This package is the parsing foundation for the Web PKI epic (#324). It
+//! does not verify signatures or apply validation policy (#324-D onward).
 //!
 //! ## Modules
 //!
@@ -10,6 +10,7 @@
 //! - `oid` — OBJECT IDENTIFIER component decoding
 //! - `time` — UTCTime and GeneralizedTime validation
 //! - `pem` — strict PEM decoding and DER certificate-chain loading
+//! - `x509` — policy-neutral certificate model with typed extensions
 //!
 //! ## Policy summary
 //!
@@ -21,17 +22,20 @@
 //!
 //! ## Downstream usage
 //!
-//! #341 should map TBSCertificate, Name, and Extension sequences using child
-//! readers and the typed decoders exported here, consuming exact DER bytes
-//! from `pem.CertificateChain`.
+//! #324-D through #324-G consume `x509.Certificate` views: `tbs_raw` and
+//! `signature_value` for signature verification, `Name.raw` for byte-exact
+//! chain building, and typed extensions for RFC 5280 validation. DER input
+//! comes from `pem.CertificateChain`, which owns the backing bytes.
 
 pub const der = @import("der.zig");
 pub const oid = @import("oid.zig");
 pub const time = @import("time.zig");
 pub const pem = @import("pem.zig");
+pub const x509 = @import("x509.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());
     _ = @import("der_tests.zig");
     _ = @import("pem_tests.zig");
+    _ = @import("x509_tests.zig");
 }

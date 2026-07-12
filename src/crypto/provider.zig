@@ -45,6 +45,7 @@
 
 const std = @import("std");
 const crypto = std.crypto;
+const secrets = @import("crypto_secrets");
 
 // ---------------------------------------------------------------------------
 // Fixed capacities
@@ -505,20 +506,14 @@ pub const CryptoProvider = struct {
 /// lengths the running time is independent of where — or whether — the bytes
 /// differ. Use this for MACs, Finished values, and any secret-derived tag.
 pub fn constantTimeEqual(a: []const u8, b: []const u8) bool {
-    // Lengths are not secret, so the mismatch short-circuits. The content
-    // comparison is delegated to the standard library's dedicated timing-safe
-    // primitive rather than a hand-rolled loop. `timing_safe.eql` needs a
-    // comptime-fixed length; `timing_safe.compare` is its slice-based sibling
-    // and runs in constant time for equal-length inputs.
-    if (a.len != b.len) return false;
-    return crypto.timing_safe.compare(u8, a, b, .big) == .eq;
+    return secrets.constantTimeEqual(a, b);
 }
 
 /// Overwrite `buffer` with zeros in a way the optimiser may not elide. Call
 /// this on any stack or heap copy of secret material before it goes out of
 /// scope.
 pub fn secureZero(buffer: []u8) void {
-    crypto.secureZero(u8, buffer);
+    secrets.secureZero(buffer);
 }
 
 // ---------------------------------------------------------------------------

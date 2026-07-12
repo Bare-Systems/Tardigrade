@@ -18,6 +18,7 @@
 
 const std = @import("std");
 const config = @import("config.zig");
+const crypto_secrets = @import("crypto_secrets");
 const packet = @import("packet.zig");
 const tls_core = @import("tls_core");
 
@@ -100,19 +101,16 @@ pub const Secret = struct {
     level: EncryptionLevel,
     direction: Direction,
     phase: KeyPhase = .current,
-    bytes: [max_secret_len]u8 = [_]u8{0} ** max_secret_len,
-    len: usize = 0,
+    material: crypto_secrets.FixedSecret(max_secret_len) = .{},
 
     pub fn init(level: EncryptionLevel, direction: Direction, bytes: []const u8) error{SecretTooLarge}!Secret {
-        if (bytes.len > max_secret_len) return error.SecretTooLarge;
         var secret = Secret{ .level = level, .direction = direction };
-        @memcpy(secret.bytes[0..bytes.len], bytes);
-        secret.len = bytes.len;
+        secret.material.replace(bytes) catch return error.SecretTooLarge;
         return secret;
     }
 
     pub fn slice(self: *const Secret) []const u8 {
-        return self.bytes[0..self.len];
+        return self.material.slice();
     }
 };
 
@@ -147,8 +145,7 @@ pub const SecretStore = struct {
     }
 
     fn wipe(secret: *Secret) void {
-        @memset(secret.bytes[0..], 0);
-        secret.len = 0;
+        secret.material.deinit();
     }
 };
 
@@ -635,8 +632,9 @@ pub const QuicTlsAdapter = struct {
     pub fn protectionKeys(self: *const QuicTlsAdapter, level: EncryptionLevel, direction: Direction) ?PacketProtectionKeys {
         if (level == .zero_rtt and !self.zero_rtt_enabled) return null;
         const installed_secret = self.secret(level, direction) orelse return null;
-        if (installed_secret.len != traffic_secret_len) return null;
-        return deriveAes128GcmKeys(installed_secret.bytes[0..traffic_secret_len].*);
+        const secret_bytes = installed_secret.slice();
+        if (secret_bytes.len != traffic_secret_len) return null;
+        return deriveAes128GcmKeys(secret_bytes[0..traffic_secret_len].*);
     }
 
     /// Seal `plaintext` for `level`/`direction` into `out`, tracking a protected
@@ -723,8 +721,9 @@ pub const QuicTlsAdapter = struct {
 
     fn applicationTrafficSecret(self: *const QuicTlsAdapter, direction: Direction) ?[traffic_secret_len]u8 {
         const installed_secret = self.secret(.application, direction) orelse return null;
-        if (installed_secret.len != traffic_secret_len) return null;
-        return installed_secret.bytes[0..traffic_secret_len].*;
+        const secret_bytes = installed_secret.slice();
+        if (secret_bytes.len != traffic_secret_len) return null;
+        return secret_bytes[0..traffic_secret_len].*;
     }
 
     pub fn discardSecrets(self: *QuicTlsAdapter, level: EncryptionLevel) void {
@@ -1302,8 +1301,8 @@ test "secret store returns pointers and wipes discarded secret bytes" {
 
     var standalone = try Secret.init(.application, .write, "wipe-me");
     SecretStore.wipe(&standalone);
-    try testing.expectEqual(@as(usize, 0), standalone.len);
-    for (standalone.bytes) |byte| try testing.expectEqual(@as(u8, 0), byte);
+    try testing.expectEqual(@as(usize, 0), standalone.material.len);
+    for (standalone.material.bytes) |byte| try testing.expectEqual(@as(u8, 0), byte);
 
     store.discard(.application);
     try testing.expect(store.get(.application, .write) == null);

@@ -120,17 +120,62 @@ fn encodeBase128(value: u32, out: []u8) Error!usize {
     return count;
 }
 
-/// Well-known directory / PKIX OIDs used in tests and later #341.
+/// Well-known directory / PKIX OIDs used in tests and #341.
 pub const well_known = struct {
+    // Public-key algorithms.
     pub const rsa_encryption = [_]u32{ 1, 2, 840, 113549, 1, 1, 1 };
+    pub const ec_public_key = [_]u32{ 1, 2, 840, 10045, 2, 1 };
+    pub const ed25519 = [_]u32{ 1, 3, 101, 112 };
+
+    // Named curves.
+    pub const secp256r1 = [_]u32{ 1, 2, 840, 10045, 3, 1, 7 };
+    pub const secp384r1 = [_]u32{ 1, 3, 132, 0, 34 };
+    pub const secp521r1 = [_]u32{ 1, 3, 132, 0, 35 };
+
+    // Signature algorithms.
+    pub const sha256_with_rsa = [_]u32{ 1, 2, 840, 113549, 1, 1, 11 };
+    pub const sha384_with_rsa = [_]u32{ 1, 2, 840, 113549, 1, 1, 12 };
+    pub const sha512_with_rsa = [_]u32{ 1, 2, 840, 113549, 1, 1, 13 };
+    pub const rsa_pss = [_]u32{ 1, 2, 840, 113549, 1, 1, 10 };
+    pub const ecdsa_with_sha256 = [_]u32{ 1, 2, 840, 10045, 4, 3, 2 };
+    pub const ecdsa_with_sha384 = [_]u32{ 1, 2, 840, 10045, 4, 3, 3 };
+    pub const ecdsa_with_sha512 = [_]u32{ 1, 2, 840, 10045, 4, 3, 4 };
+
+    // Directory name attributes.
     pub const common_name = [_]u32{ 2, 5, 4, 3 };
-    pub const organization = [_]u32{ 2, 5, 4, 10 };
+    pub const serial_number_attr = [_]u32{ 2, 5, 4, 5 };
     pub const country = [_]u32{ 2, 5, 4, 6 };
+    pub const locality = [_]u32{ 2, 5, 4, 7 };
+    pub const state_or_province = [_]u32{ 2, 5, 4, 8 };
+    pub const organization = [_]u32{ 2, 5, 4, 10 };
+    pub const organizational_unit = [_]u32{ 2, 5, 4, 11 };
+    pub const email_address = [_]u32{ 1, 2, 840, 113549, 1, 9, 1 };
+    pub const domain_component = [_]u32{ 0, 9, 2342, 19200300, 100, 1, 25 };
+
+    // Certificate extensions.
+    pub const subject_key_identifier = [_]u32{ 2, 5, 29, 14 };
+    pub const key_usage = [_]u32{ 2, 5, 29, 15 };
     pub const subject_alt_name = [_]u32{ 2, 5, 29, 17 };
     pub const basic_constraints = [_]u32{ 2, 5, 29, 19 };
-    pub const key_usage = [_]u32{ 2, 5, 29, 15 };
+    pub const name_constraints = [_]u32{ 2, 5, 29, 30 };
+    pub const crl_distribution_points = [_]u32{ 2, 5, 29, 31 };
+    pub const certificate_policies = [_]u32{ 2, 5, 29, 32 };
+    pub const authority_key_identifier = [_]u32{ 2, 5, 29, 35 };
     pub const ext_key_usage = [_]u32{ 2, 5, 29, 37 };
+    pub const authority_info_access = [_]u32{ 1, 3, 6, 1, 5, 5, 7, 1, 1 };
+
+    // Extended key usage purposes.
     pub const server_auth = [_]u32{ 1, 3, 6, 1, 5, 5, 7, 3, 1 };
+    pub const client_auth = [_]u32{ 1, 3, 6, 1, 5, 5, 7, 3, 2 };
+    pub const code_signing = [_]u32{ 1, 3, 6, 1, 5, 5, 7, 3, 3 };
+    pub const email_protection = [_]u32{ 1, 3, 6, 1, 5, 5, 7, 3, 4 };
+    pub const time_stamping = [_]u32{ 1, 3, 6, 1, 5, 5, 7, 3, 8 };
+    pub const ocsp_signing = [_]u32{ 1, 3, 6, 1, 5, 5, 7, 3, 9 };
+    pub const any_ext_key_usage = [_]u32{ 2, 5, 29, 37, 0 };
+
+    // Authority information access methods.
+    pub const aia_ocsp = [_]u32{ 1, 3, 6, 1, 5, 5, 7, 48, 1 };
+    pub const aia_ca_issuers = [_]u32{ 1, 3, 6, 1, 5, 5, 7, 48, 2 };
 };
 
 const testing = std.testing;

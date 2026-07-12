@@ -28,6 +28,32 @@ All notable user-facing changes to Tardigrade are documented here.
   and sign/verify round-trips under `zig build test-crypto`. The OpenSSL
   production adapter and migrating the existing QUIC/TLS modules onto the
   boundary are follow-ups (#323–#326); see `docs/CRYPTO_PROVIDER.md`.
+- **Typed X.509 certificate model (#341, epic #324)** — adds
+  `src/pki/x509.zig`, a policy-neutral parser that decodes a DER certificate
+  into every field needed for identity matching, signature verification, path
+  building, and RFC 5280 validation (#324-D through #324-G): version, serial,
+  inner/outer signature algorithms (encoding-identity enforced per RFC 5280
+  §4.1.2.3), issuer/subject names with structured RDNs and byte-exact `raw`
+  views, validity times (UTCTime/GeneralizedTime with the 2050 cutoff), SPKI
+  with RSA/P-256/P-384/P-521/Ed25519 key-type identification, unique
+  identifiers, and the signature value. Exact TBSCertificate bytes are
+  preserved for signature verification. Extensions decode into typed
+  representations — SAN (with GeneralName variants), Basic Constraints, Key
+  Usage (DER named-bit canonicality enforced), EKU, SKI, AKI, Name
+  Constraints, AIA, CRL Distribution Points, and certificate policies —
+  while unknown extensions are retained with criticality tracked and
+  `hasUnhandledCriticalExtension` surfaces unknown critical extensions for
+  fail-closed validation. Duplicate extension OIDs, DER-default violations
+  (explicit v1, `critical FALSE`, `cA FALSE`), version/field mismatches
+  (extensions on v1/v2, unique IDs on v1), and malformed names, times, SPKI,
+  algorithms, and extensions fail with typed errors under configurable count
+  limits. Certificates borrow the caller's DER and free internal collections
+  through one arena-backed `deinit`; a `fuzzParseCertificate` entrypoint
+  feeds #327-G. Tested against real OpenSSL-generated RSA-2048 CA (name
+  constraints, GeneralizedTime expiry), P-256 leaf (SAN/EKU/AKI/AIA/CRLDP/
+  policies), Ed25519, and v1 fixtures plus synthetic corpora for v1/v3 edge
+  cases, inner/outer algorithm mismatch, duplicates, truncation sweeps, and
+  allocation-failure leak checks under `zig build test-pki`.
 - **Pure-Zig PEM and certificate-chain loader (#340, epic #324)** — adds
   `src/pki/pem.zig`, which loads X.509 certificates and ordered certificate
   chains from PEM or DER buffers/files without constructing OpenSSL objects.

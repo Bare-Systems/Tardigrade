@@ -7,8 +7,8 @@
 #      configuration, workflows, scripts, or packaging metadata. External
 #      implementations are allowed only as out-of-process interoperability
 #      peers (scripts/interop/), never in the link graph.
-#   2. OpenSSL headers may be included only inside the approved
-#      general-profile adapter boundary.
+#   2. OpenSSL may be referenced only inside the approved general-profile
+#      adapter boundary.
 #   3. Native implementation paths (TLS, PKI, QUIC, crypto, HTTP/3) must not
 #      contain any @cImport at all.
 #
@@ -27,35 +27,101 @@ fail() {
     failures=$((failures + 1))
 }
 
+# Strip comments from a line stream while respecting string literals, so a
+# forbidden name inside a real declaration (e.g. a `.url = "https://.../ngtcp2"`
+# dependency, whose `//` would otherwise be mistaken for a comment) is never
+# hidden, while a mention in prose is ignored. `style` is `zig` (// comments,
+# " and ' string/char literals, \\ multiline-string lines kept verbatim) or
+# `hash` (# comments that start a token, ' and " strings).
+strip_comments() {
+    awk -v style="$2" '
+    BEGIN { dq = sprintf("%c", 34); sq = sprintf("%c", 39) }
+    {
+        line = $0
+        if (style == "zig") {
+            tmp = line
+            sub(/^[ \t]+/, "", tmp)
+            if (substr(tmp, 1, 2) == "\\\\") { print line; next }
+        }
+        out = ""; inq = ""; n = length(line); i = 1
+        while (i <= n) {
+            ch = substr(line, i, 1)
+            if (inq != "") {
+                out = out ch
+                if (ch == "\\") { i++; if (i <= n) out = out substr(line, i, 1); i++; continue }
+                if (ch == inq) inq = ""
+                i++; continue
+            }
+            if (ch == dq || ch == sq) { inq = ch; out = out ch; i++; continue }
+            if (style == "zig" && ch == "/" && substr(line, i + 1, 1) == "/") break
+            if (style == "hash" && ch == "#") {
+                prev = (i == 1) ? " " : substr(line, i - 1, 1)
+                if (prev == " " || prev == "\t") break
+            }
+            out = out ch; i++
+        }
+        print out
+    }' "$1"
+}
+
+comment_style_for() {
+    case "$1" in
+    *.zig | *.zon) echo zig ;;
+    *.sh | *.yml | *.yaml | *.toml | *Dockerfile* | *.spec | *.control) echo hash ;;
+    *) echo none ;;
+    esac
+}
+
+stripped() {
+    local style
+    style="$(comment_style_for "$1")"
+    if [ "$style" = none ]; then
+        cat "$1"
+    else
+        strip_comments "$1" "$style"
+    fi
+}
+
+# Resolve build.zig's transitive `@import("*.zig")` closure so linkage moved
+# into an imported build helper (e.g. `build/dependencies.zig`) is still
+# audited, rather than trusting the root file to hold every declaration.
+resolve_build_sources() {
+    local -a queue=("build.zig")
+    local -A seen=()
+    local f dir imp target
+    while [ "${#queue[@]}" -gt 0 ]; do
+        f="${queue[0]}"
+        queue=("${queue[@]:1}")
+        [ -n "${seen[$f]:-}" ] && continue
+        seen[$f]=1
+        [ -f "$f" ] || continue
+        printf '%s\n' "$f"
+        dir="$(dirname "$f")"
+        while IFS= read -r imp; do
+            [ -z "$imp" ] && continue
+            target="$(realpath -m --relative-to="$REPO_ROOT" "$REPO_ROOT/$dir/$imp" 2>/dev/null || true)"
+            case "$target" in
+            "" | ../*) continue ;; # outside the repo
+            esac
+            queue+=("$target")
+        done < <(grep -oE '@import\("[^"]+\.zig"\)' "$f" 2>/dev/null | sed -E 's/.*@import\("([^"]+)"\).*/\1/')
+    done
+}
+
 # ── 1. Forbidden dependency identifiers in build/config surfaces ─────────────
 # openssl itself is not in this list: the general profile's adapter is the
 # single approved exception, enforced separately by checks 2 and 3 and by the
 # binary audit (scripts/audit-release-binary.sh).
-#
-# The check targets configuration that would actually pull a dependency into
-# the build or link graph, so comments are stripped before matching: policy
-# permits naming these libraries in prose (e.g. documenting that external
-# peers run out-of-process). A real dependency declaration is never inside a
-# comment.
 FORBIDDEN_NAMES='ngtcp2|nghttp3|quiche|boringssl|mbedtls|wolfssl|gnutls|libressl|rustls|s2n-tls|libtls|botan'
 
-# Strip comments from a file according to its type, then print the result.
-# .zig/.zon use `//`; shell/yaml/toml/Dockerfiles use `#`. Stripping is
-# type-scoped so a URL scheme's `//` in a shell script is preserved.
-strip_comments() {
-    local file="$1"
-    case "$file" in
-    *.zig | *.zon) sed 's://.*$::' "$file" ;;
-    *.sh | *.yml | *.yaml | *.toml | *Dockerfile* | *.spec | *.control) sed 's:#.*$::' "$file" ;;
-    *) cat "$file" ;;
-    esac
-}
-
-# Build configuration, automation, and packaging surfaces. Interop tooling
-# (scripts/interop/) is excluded by policy: it drives external peers as
-# separate processes and must name them. The audit scripts are excluded
-# because they define the deny list.
-scan_files=(build.zig build.zig.zon)
+# Build configuration (the resolved build-graph sources plus the manifest),
+# automation, and packaging surfaces. Interop tooling (scripts/interop/) is
+# excluded by policy: it drives external peers as separate processes and must
+# name them. The audit scripts are excluded because they define the deny list.
+scan_files=("build.zig.zon")
+while IFS= read -r f; do
+    scan_files+=("$f")
+done < <(resolve_build_sources)
 while IFS= read -r f; do
     scan_files+=("$f")
 done < <(find .github/workflows packaging -type f 2>/dev/null | sort)
@@ -72,9 +138,13 @@ while IFS= read -r dockerfile; do
     scan_files+=("$dockerfile")
 done < <(find . -path ./.zig-cache -prune -o -path ./zig-out -prune -o -name 'Dockerfile*' -type f -print | sed 's|^\./||' | sort)
 
+# De-duplicate (build.zig may already appear via the graph and via a glob).
+declare -A scanned=()
 for file in "${scan_files[@]}"; do
     [ -f "$file" ] || continue
-    if matches="$(strip_comments "$file" | grep -niE "$FORBIDDEN_NAMES" 2>/dev/null)"; then
+    [ -n "${scanned[$file]:-}" ] && continue
+    scanned[$file]=1
+    if matches="$(stripped "$file" | grep -niE "$FORBIDDEN_NAMES" 2>/dev/null)"; then
         while IFS= read -r line; do
             [ -z "$line" ] && continue
             fail "forbidden dependency configuration in $file: $line"
@@ -82,38 +152,45 @@ for file in "${scan_files[@]}"; do
     fi
 done
 
-# ── 2. OpenSSL includes restricted to the approved adapter boundary ──────────
-OPENSSL_INCLUDE_ALLOWLIST=(
+# ── 2. OpenSSL references restricted to the approved adapter boundary ─────────
+# Match the literal `openssl/` header path anywhere in comment-stripped source
+# rather than one exact @cInclude spelling, so whitespace variants and
+# reformatted includes cannot escape the allowlist.
+OPENSSL_ALLOWLIST=(
     src/http/tls_termination.zig
     src/http/acme_client.zig
 )
 
-if matches="$(grep -rn '@cInclude("openssl/' src/ 2>/dev/null)"; then
-    while IFS= read -r line; do
-        file="${line%%:*}"
-        allowed=false
-        for allowed_file in "${OPENSSL_INCLUDE_ALLOWLIST[@]}"; do
-            if [ "$file" = "$allowed_file" ]; then
-                allowed=true
-                break
-            fi
-        done
-        if [ "$allowed" = false ]; then
-            fail "OpenSSL include outside the approved adapter boundary: $line"
+while IFS= read -r zigfile; do
+    allowed=false
+    for allowed_file in "${OPENSSL_ALLOWLIST[@]}"; do
+        if [ "$zigfile" = "$allowed_file" ]; then
+            allowed=true
+            break
         fi
-    done <<<"$matches"
-fi
+    done
+    [ "$allowed" = true ] && continue
+    if matches="$(stripped "$zigfile" | grep -niE 'openssl/' 2>/dev/null)"; then
+        while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            fail "OpenSSL reference outside the approved adapter boundary in $zigfile: $line"
+        done <<<"$matches"
+    fi
+done < <(find src -name '*.zig' -type f | sort)
 
 # ── 3. Native implementation paths must be free of @cImport entirely ─────────
 NATIVE_PATHS=(src/tls src/pki src/quic src/crypto src/http3)
 
 for path in "${NATIVE_PATHS[@]}"; do
     [ -d "$path" ] || continue
-    if matches="$(grep -rn '@cImport' "$path" 2>/dev/null)"; then
-        while IFS= read -r line; do
-            fail "@cImport in native implementation path: $line"
-        done <<<"$matches"
-    fi
+    while IFS= read -r zigfile; do
+        if matches="$(stripped "$zigfile" | grep -niE '@cImport' 2>/dev/null)"; then
+            while IFS= read -r line; do
+                [ -z "$line" ] && continue
+                fail "@cImport in native implementation path $zigfile: $line"
+            done <<<"$matches"
+        fi
+    done < <(find "$path" -name '*.zig' -type f | sort)
 done
 
 # ── Result ────────────────────────────────────────────────────────────────────

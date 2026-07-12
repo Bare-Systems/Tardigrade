@@ -75,30 +75,61 @@ esac
 FORBIDDEN_LIB_PATTERNS='ngtcp2|nghttp3|quiche|boringssl|mbedtls|wolfssl|gnutls|libtls|libressl|botan|s2n'
 
 # ── Collect dynamic dependencies across platforms ────────────────────────────
+#
+# The inspection must distinguish two very different outcomes: a binary with no
+# dynamic dependencies (a valid, fully static build — an empty dependency list)
+# from a failed inspection (missing tool, unreadable/corrupt binary, wrong
+# architecture). The former is legitimate; the latter must never be reported as
+# a clean, dependency-free appliance artifact, so it exits with an error rather
+# than an empty list. On Linux we read the ELF dynamic section directly
+# (readelf/objdump) instead of executing the binary through `ldd`.
 os="$(uname -s)"
 deps=""
 inspection_tool=""
 case "$os" in
 Linux)
-    inspection_tool="ldd"
-    # ldd returns nonzero for a static binary ("not a dynamic executable");
-    # that is a valid, dependency-free result, so tolerate the failure.
-    deps="$(ldd "$BINARY" 2>/dev/null || true)"
+    if command -v readelf >/dev/null 2>&1; then
+        inspection_tool="readelf -d"
+        if ! deps="$(readelf -d "$BINARY" 2>/dev/null)"; then
+            echo "inspection failed: readelf could not read '$BINARY' (not an ELF object, corrupt, or wrong architecture)" >&2
+            exit 2
+        fi
+    elif command -v objdump >/dev/null 2>&1; then
+        inspection_tool="objdump -p"
+        if ! deps="$(objdump -p "$BINARY" 2>/dev/null)"; then
+            echo "inspection failed: objdump could not read '$BINARY'" >&2
+            exit 2
+        fi
+    else
+        echo "inspection failed: no ELF inspection tool (readelf or objdump) available" >&2
+        exit 2
+    fi
+    # readelf/objdump both render NEEDED entries as "[libfoo.so.N]"; a static
+    # binary simply has none. No match therefore means static, not a failure.
+    dep_names="$(printf '%s\n' "$deps" |
+        grep -E 'NEEDED' |
+        grep -oE '\[[^][]+\]' |
+        tr -d '[]' |
+        sort -u || true)"
     ;;
 Darwin)
     inspection_tool="otool -L"
-    deps="$(otool -L "$BINARY" 2>/dev/null || true)"
+    if ! deps="$(otool -L "$BINARY" 2>/dev/null)"; then
+        echo "inspection failed: otool could not read '$BINARY' (not a Mach-O object, corrupt, or wrong architecture)" >&2
+        exit 2
+    fi
+    # otool -L lists the binary path on the first line, then one dependency
+    # path per indented line; keep the shared-library leaf names.
+    dep_names="$(printf '%s\n' "$deps" |
+        tail -n +2 |
+        grep -oE '(lib[a-zA-Z0-9._+-]+\.dylib)' |
+        sort -u || true)"
     ;;
 *)
     echo "unsupported host OS for binary inspection: $os" >&2
     exit 2
     ;;
 esac
-
-# Normalize to one shared-object name per line for scanning and inventory.
-dep_names="$(printf '%s\n' "$deps" |
-    grep -oE '(lib[a-zA-Z0-9._+-]+\.(so|dylib)[0-9.]*)' |
-    sort -u || true)"
 
 links_openssl=false
 if printf '%s\n' "$dep_names" | grep -qiE 'libssl|libcrypto'; then
@@ -108,12 +139,18 @@ fi
 forbidden_hits="$(printf '%s\n' "$dep_names" | grep -iE "$FORBIDDEN_LIB_PATTERNS" || true)"
 
 # ── Binary self-report (the version line records the built-in profile) ───────
+# Both the profile and the backend are parsed and checked: the requested
+# --profile must match the profile compiled into the artifact, and the backend
+# must be consistent with it. A binary that cannot report its profile is a
+# violation, not a pass.
 self_report="$("$BINARY" version 2>/dev/null || true)"
 reported_backend="unknown"
 case "$self_report" in
 *"tls-backend=native"*) reported_backend="native" ;;
 *"tls-backend=openssl-adapter"*) reported_backend="openssl-adapter" ;;
 esac
+reported_profile="$(printf '%s' "$self_report" | sed -nE 's/.*tls-profile=([a-zA-Z0-9_-]+).*/\1/p')"
+[ -n "$reported_profile" ] || reported_profile="unknown"
 
 # ── Policy evaluation ────────────────────────────────────────────────────────
 status="pass"
@@ -124,6 +161,13 @@ if [ -n "$forbidden_hits" ]; then
         [ -z "$hit" ] && continue
         violations+=("forbidden foreign TLS/crypto/QUIC library linked: $hit")
     done <<<"$forbidden_hits"
+fi
+
+# The artifact must actually be the profile it is being audited as, regardless
+# of profile: a native appliance binary audited as general (or vice versa) is a
+# mismatch, not a pass.
+if [ "$reported_profile" != "$PROFILE" ]; then
+    violations+=("artifact self-reports tls-profile '$reported_profile' but was audited as '$PROFILE'")
 fi
 
 if [ "$PROFILE" = "appliance" ]; then
@@ -155,6 +199,7 @@ emit_inventory() {
     printf '  "profile": %s,\n' "$(json_string "$PROFILE")"
     printf '  "host_os": %s,\n' "$(json_string "$os")"
     printf '  "inspection_tool": %s,\n' "$(json_string "$inspection_tool")"
+    printf '  "reported_profile": %s,\n' "$(json_string "$reported_profile")"
     printf '  "reported_backend": %s,\n' "$(json_string "$reported_backend")"
     printf '  "self_report": %s,\n' "$(json_string "$self_report")"
     printf '  "links_openssl": %s,\n' "$links_openssl"

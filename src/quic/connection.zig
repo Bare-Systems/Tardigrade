@@ -486,6 +486,7 @@ pub const Connection = struct {
     }
 
     fn deinitPartial(self: *Connection) void {
+        self.handshake.deinit();
         if (self.streams) |*manager| manager.deinit();
         var it = self.send_queues.valueIterator();
         while (it.next()) |queue| {

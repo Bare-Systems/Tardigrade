@@ -5,6 +5,7 @@
 //! payload types, then translate the emitted events into their local framing.
 
 const std = @import("std");
+const crypto_secrets = @import("crypto_secrets");
 const events = @import("events.zig");
 const state = @import("state.zig");
 
@@ -62,27 +63,68 @@ pub fn ContractWithOptions(
             scratch: [max_bytes]u8 = undefined,
             used: usize = 0,
 
+            /// Clear all events and securely wipe the scratch range copied
+            /// traffic secrets (and other emitted bytes) occupied, so they do
+            /// not survive past the event lifetime documented on `Backend`.
             pub fn reset(self: *EventSink) void {
+                self.zeroUsedScratch();
                 self.len = 0;
                 self.used = 0;
             }
 
-            fn store(self: *EventSink, bytes: []const u8) ErrorSet![]const u8 {
-                if (bytes.len > self.scratch.len - self.used) return buffer_overflow_error;
+            /// Final teardown: identical to `reset`, exposed under its own
+            /// name so callers that only tear down once (rather than reset
+            /// between `start`/`receive` calls) have an explicit, self-
+            /// documenting call site. Every `Driver` calls this from its own
+            /// `deinit`.
+            pub fn deinit(self: *EventSink) void {
+                self.reset();
+            }
+
+            fn zeroUsedScratch(self: *EventSink) void {
+                if (self.used > 0) crypto_secrets.secureZero(self.scratch[0..self.used]);
+            }
+
+            /// True when `len` bytes can be copied into `scratch` without
+            /// mutating any state. Callers must check this (and event-slot
+            /// capacity) *before* copying, so a rejected emit never leaves a
+            /// partial payload behind -- see `storeUnchecked`.
+            fn hasByteCapacity(self: *const EventSink, len: usize) bool {
+                return len <= self.scratch.len - self.used;
+            }
+
+            fn hasEventCapacity(self: *const EventSink) bool {
+                return self.len < self.items.len;
+            }
+
+            /// Copy `bytes` into `scratch`. The caller must have already
+            /// verified capacity with `hasByteCapacity`; this never fails.
+            fn storeUnchecked(self: *EventSink, bytes: []const u8) []const u8 {
                 const start = self.used;
                 @memcpy(self.scratch[start..][0..bytes.len], bytes);
                 self.used += bytes.len;
                 return self.scratch[start..][0..bytes.len];
             }
 
-            fn push(self: *EventSink, event: Event) ErrorSet!void {
-                if (self.len == self.items.len) return buffer_overflow_error;
+            /// Append `event`. The caller must have already verified capacity
+            /// with `hasEventCapacity`; this never fails.
+            fn pushUnchecked(self: *EventSink, event: Event) void {
                 self.items[self.len] = event;
                 self.len += 1;
             }
 
+            /// Reserve room for one event and `byte_len` scratch bytes without
+            /// mutating anything, so the emit functions below can copy and
+            /// push only after both capacities are known to be available --
+            /// on any overflow, the sink is left exactly as it was.
+            fn reserve(self: *const EventSink, byte_len: usize) ErrorSet!void {
+                if (!self.hasEventCapacity() or !self.hasByteCapacity(byte_len)) return buffer_overflow_error;
+            }
+
             pub fn emitHandshakeBytes(self: *EventSink, epoch: Epoch, data: []const u8) ErrorSet!void {
-                try self.push(.{ .handshake_bytes = .{ .epoch = epoch, .data = try self.store(data) } });
+                try self.reserve(data.len);
+                const stored = self.storeUnchecked(data);
+                self.pushUnchecked(.{ .handshake_bytes = .{ .epoch = epoch, .data = stored } });
             }
 
             /// Compatibility spelling for QUIC callers, where handshake bytes
@@ -92,23 +134,30 @@ pub fn ContractWithOptions(
             }
 
             pub fn emitSecret(self: *EventSink, epoch: Epoch, direction: events.SecretDirection, data: []const u8) ErrorSet!void {
-                try self.push(.{ .traffic_secret = .{ .epoch = epoch, .direction = direction, .data = try self.store(data) } });
+                try self.reserve(data.len);
+                const stored = self.storeUnchecked(data);
+                self.pushUnchecked(.{ .traffic_secret = .{ .epoch = epoch, .direction = direction, .data = stored } });
             }
 
             pub fn emitPeerTransportParameters(self: *EventSink, params: TransportParameters) ErrorSet!void {
-                try self.push(.{ .peer_transport_parameters = params });
+                try self.reserve(0);
+                self.pushUnchecked(.{ .peer_transport_parameters = params });
             }
 
             pub fn emitAlpn(self: *EventSink, protocol: []const u8) ErrorSet!void {
-                try self.push(.{ .alpn = try self.store(protocol) });
+                try self.reserve(protocol.len);
+                const stored = self.storeUnchecked(protocol);
+                self.pushUnchecked(.{ .alpn = stored });
             }
 
             pub fn emitCertificate(self: *EventSink, cert_state: events.CertificateState) ErrorSet!void {
-                try self.push(.{ .certificate = cert_state });
+                try self.reserve(0);
+                self.pushUnchecked(.{ .certificate = cert_state });
             }
 
             pub fn emitDiscardEpoch(self: *EventSink, epoch: Epoch) ErrorSet!void {
-                try self.push(.{ .discard_epoch = epoch });
+                try self.reserve(0);
+                self.pushUnchecked(.{ .discard_epoch = epoch });
             }
 
             /// Compatibility spelling for QUIC callers.
@@ -117,7 +166,8 @@ pub fn ContractWithOptions(
             }
 
             pub fn emitHandshakeComplete(self: *EventSink) ErrorSet!void {
-                try self.push(.handshake_complete);
+                try self.reserve(0);
+                self.pushUnchecked(.handshake_complete);
             }
         };
 
@@ -173,4 +223,86 @@ test "generic transport sink accepts caller-owned limits and overflow error name
     try std.testing.expectError(error.CallerBufferFull, sink.emitHandshakeBytes(.initial, "hello"));
     try sink.emitHandshakeBytes(.initial, "ok");
     try std.testing.expectError(error.CallerBufferFull, sink.emitHandshakeBytes(.initial, ""));
+}
+
+test "reset securely zeroes the used scratch range, leaving unused bytes untouched" {
+    const ErrorSet = error{TransportBufferOverflow};
+    const Epoch = enum { handshake };
+    const T = Contract(void, Epoch, ErrorSet);
+
+    var sink = T.EventSink{};
+    try sink.emitSecret(.handshake, .write, "top secret traffic key material");
+    const used = sink.used;
+    try std.testing.expect(used > 0);
+    // The bytes beyond `used` are never written by an emit call; poison them
+    // so the test can tell "left alone" from "reset zeroed the whole buffer".
+    sink.scratch[used] = 0xaa;
+
+    sink.reset();
+    try std.testing.expectEqual(@as(usize, 0), sink.len);
+    try std.testing.expectEqual(@as(usize, 0), sink.used);
+    for (sink.scratch[0..used]) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+    try std.testing.expectEqual(@as(u8, 0xaa), sink.scratch[used]);
+}
+
+test "deinit securely zeroes the final sink contents" {
+    const ErrorSet = error{TransportBufferOverflow};
+    const Epoch = enum { application };
+    const T = Contract(void, Epoch, ErrorSet);
+
+    var sink = T.EventSink{};
+    try sink.emitSecret(.application, .read, "application traffic secret");
+    const used = sink.used;
+    try std.testing.expect(used > 0);
+
+    sink.deinit();
+    try std.testing.expectEqual(@as(usize, 0), sink.used);
+    for (sink.scratch[0..used]) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+}
+
+test "event emission is atomic: a full event array leaves scratch untouched on overflow" {
+    const ErrorSet = error{TransportBufferOverflow};
+    const Epoch = enum { handshake };
+    // One event slot, ample scratch: fill the only slot, then a further emit
+    // must fail on the event-count check before it ever copies bytes.
+    const T = ContractWithOptions(void, Epoch, ErrorSet, 1, 64, error.TransportBufferOverflow);
+
+    var sink = T.EventSink{};
+    try sink.emitHandshakeBytes(.handshake, "first");
+    const used_before = sink.used;
+
+    try std.testing.expectError(error.TransportBufferOverflow, sink.emitSecret(.handshake, .write, "second traffic secret"));
+    try std.testing.expectEqual(@as(usize, 1), sink.len);
+    try std.testing.expectEqual(used_before, sink.used);
+    // No trace of the rejected secret was copied into scratch.
+    try std.testing.expect(std.mem.indexOf(u8, sink.scratch[0..sink.used], "second") == null);
+}
+
+test "event emission is atomic: insufficient scratch leaves the event count untouched" {
+    const ErrorSet = error{TransportBufferOverflow};
+    const Epoch = enum { handshake };
+    // Ample event slots, tiny scratch: the first emit consumes most of it, a
+    // second oversized emit must fail on the byte check without pushing a
+    // phantom event that would reference a partially-copied payload.
+    const T = ContractWithOptions(void, Epoch, ErrorSet, 8, 8, error.TransportBufferOverflow);
+
+    var sink = T.EventSink{};
+    try sink.emitHandshakeBytes(.handshake, "abcd");
+    try std.testing.expectEqual(@as(usize, 1), sink.len);
+
+    try std.testing.expectError(error.TransportBufferOverflow, sink.emitSecret(.handshake, .write, "too big for what remains"));
+    try std.testing.expectEqual(@as(usize, 1), sink.len);
+    try std.testing.expectEqual(@as(usize, 4), sink.used);
+}
+
+test "non-byte-bearing events also fail atomically on a full event array" {
+    const ErrorSet = error{TransportBufferOverflow};
+    const Epoch = enum { handshake };
+    const T = ContractWithOptions(void, Epoch, ErrorSet, 1, 64, error.TransportBufferOverflow);
+
+    var sink = T.EventSink{};
+    try sink.emitHandshakeComplete();
+    try std.testing.expectError(error.TransportBufferOverflow, sink.emitDiscardEpoch(.handshake));
+    try std.testing.expectEqual(@as(usize, 1), sink.len);
+    try std.testing.expectEqual(T.Event.handshake_complete, sink.items[0]);
 }

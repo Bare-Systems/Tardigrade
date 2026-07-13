@@ -88,6 +88,15 @@ pub fn Driver(comptime Transport: type) type {
             self.failure_reason = err;
             return err;
         }
+
+        /// Final teardown: securely wipes any traffic secrets still copied
+        /// into the internal sink from the last `start`/`receive` call. Every
+        /// owner of a `Driver` -- QUIC's handshake adapter and record mode
+        /// alike -- must call this exactly once when the handshake object is
+        /// discarded, whether it completed, failed, or was abandoned mid-flight.
+        pub fn deinit(self: *Self) void {
+            self.sink.deinit();
+        }
     };
 }
 
@@ -184,4 +193,51 @@ test "generic driver rejects start after completion" {
     _ = try driver.start({});
     driver.complete();
     try std.testing.expectError(error.InvalidHandshakeState, driver.start({}));
+}
+
+test "driver deinit securely wipes the last emitted traffic secret" {
+    const T = @import("transport.zig").Contract(void, enum { handshake }, error{ InvalidHandshakeState, TransportBufferOverflow });
+    const D = Driver(T);
+    const Backend = struct {
+        fn start(_: *anyopaque, _: state.Role, _: void, sink: *T.EventSink) T.Error!void {
+            try sink.emitSecret(.handshake, .write, "last traffic secret before teardown");
+        }
+        fn receive(_: *anyopaque, _: T.EpochType, _: []const u8, _: *T.EventSink) T.Error!void {}
+    };
+
+    var context: u8 = 0;
+    var driver = D.init(.client, .{
+        .ptr = &context,
+        .startFn = Backend.start,
+        .receiveFn = Backend.receive,
+    });
+    const sink = try driver.start({});
+    try std.testing.expect(sink.used > 0);
+    const used = sink.used;
+
+    driver.deinit();
+    try std.testing.expectEqual(@as(usize, 0), driver.sink.used);
+    for (driver.sink.scratch[0..used]) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+}
+
+test "driver deinit is safe after a failed handshake" {
+    const T = @import("transport.zig").Contract(void, enum { initial }, error{ InvalidHandshakeState, TransportBufferOverflow });
+    const D = Driver(T);
+    const Backend = struct {
+        fn start(_: *anyopaque, _: state.Role, _: void, sink: *T.EventSink) T.Error!void {
+            try sink.emitHandshakeBytes(.initial, "partial before failure");
+            return error.TransportBufferOverflow;
+        }
+        fn receive(_: *anyopaque, _: T.EpochType, _: []const u8, _: *T.EventSink) T.Error!void {}
+    };
+
+    var context: u8 = 0;
+    var driver = D.init(.server, .{
+        .ptr = &context,
+        .startFn = Backend.start,
+        .receiveFn = Backend.receive,
+    });
+    try std.testing.expectError(error.TransportBufferOverflow, driver.start({}));
+    driver.deinit();
+    try std.testing.expectEqual(@as(usize, 0), driver.sink.used);
 }

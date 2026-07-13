@@ -145,6 +145,7 @@ pub const PureZigRecordStream = struct {
     }
 
     pub fn initWithCarrier(crypto_provider: provider.CryptoProvider, cipher_suite: algorithms.CipherSuite, carrier: Carrier) PureZigRecordStream {
+        std.debug.assert(!carrier.owns_handle or carrier.closeFn != null);
         var stream_state = init(crypto_provider, cipher_suite);
         stream_state.carrier = carrier;
         return stream_state;
@@ -413,6 +414,7 @@ pub const PureZigRecordStream = struct {
         if (self.lifecycle != .closing or self.close_notify_queued or self.outbound_ciphertext.len > 0) return false;
         if (!self.bridge.handshake_complete) {
             self.lifecycle = .closed;
+            self.closeCarrier();
             return true;
         }
         if (self.outbound_ciphertext.available() < record_codec.max_ciphertext_record_len) return false;
@@ -442,6 +444,7 @@ pub const PureZigRecordStream = struct {
 
     fn closeCarrier(self: *PureZigRecordStream) void {
         if (self.carrier) |carrier| {
+            std.debug.assert(!carrier.owns_handle or carrier.closeFn != null);
             if (carrier.owns_handle) carrier.close();
             self.carrier = null;
         }
@@ -1057,6 +1060,42 @@ test "encrypted stream close sends close_notify before closing owned carrier" {
     try feedAllCiphertext(&peer, carrier.written.slice());
     var buf: [8]u8 = undefined;
     try testing.expectError(error.EndOfStream, peer.stream().read(&buf));
+}
+
+test "encrypted stream close during handshake releases owned carrier once" {
+    const CountingCarrier = struct {
+        close_count: usize = 0,
+
+        fn carrier(self: *@This()) Carrier {
+            return .{ .ptr = self, .readFn = read, .writeFn = write, .closeFn = close, .owns_handle = true };
+        }
+
+        fn read(_: *anyopaque, _: []u8) Error!usize {
+            return error.WouldBlock;
+        }
+
+        fn write(_: *anyopaque, _: []const u8) Error!usize {
+            return error.WouldBlock;
+        }
+
+        fn close(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.close_count += 1;
+        }
+    };
+
+    const cp = testProvider();
+    var carrier = CountingCarrier{};
+    var stream_state = PureZigRecordStream.initWithCarrier(cp, .tls_aes_128_gcm_sha256, carrier.carrier());
+
+    stream_state.stream().close();
+    const result = try stream_state.stream().drive();
+    try testing.expect(result.made_progress);
+    try testing.expectEqual(Lifecycle.closed, stream_state.lifecycle);
+    try testing.expectEqual(@as(usize, 1), carrier.close_count);
+
+    stream_state.deinit();
+    try testing.expectEqual(@as(usize, 1), carrier.close_count);
 }
 
 test "encrypted stream close flushes queued app data before close_notify" {

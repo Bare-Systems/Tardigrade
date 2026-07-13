@@ -93,8 +93,8 @@ pub const rows = [_]Row{
     row(.{ .group = .x25519 }, "X25519", .zig_std_crypto, .supported, .openssl_provider, .provider_deferred, "std.crypto scalar multiplication parity, low-order rejection", .{ .tls_handshake, .quic_tls_bridge }, "Group additions require key-share and shared-secret vectors."),
     row(.{ .group = .secp256r1 }, "secp256r1 (P-256)", .unavailable, .provider_deferred, .openssl_provider, .provider_deferred, "capability rejection tests", .{ .tls_handshake, .quic_tls_bridge, .pki }, "P-256 support requires explicit provider implementation and ECDH vectors."),
     row(.{ .signature = .ed25519 }, "Ed25519", .zig_std_crypto, .supported, .openssl_provider, .provider_deferred, "sign/verify, tamper rejection, wrong-key rejection", .{ .tls_handshake, .pki }, "Signature additions require CertificateVerify vectors."),
-    row(.{ .signature = .ecdsa_secp256r1_sha256 }, "ECDSA-P256-SHA256", .unavailable, .provider_deferred, .openssl_provider, .provider_deferred, "capability rejection tests", .{ .tls_handshake, .pki }, "ECDSA support requires DER/raw signature format tests."),
-    row(.{ .signature = .rsa_pss_rsae_sha256 }, "RSA-PSS-RSAE-SHA256", .unavailable, .provider_deferred, .openssl_provider, .provider_deferred, "capability rejection tests", .{ .tls_handshake, .pki }, "RSA-PSS support requires salt-length and padding-negative vectors."),
+    row(.{ .signature = .ecdsa_secp256r1_sha256 }, "ECDSA-P256-SHA256", .zig_std_crypto, .supported, .openssl_provider, .provider_deferred, "SEC1 key/DER signature verify, tamper, wrong-key, non-canonical-signature rejection (#343)", .{ .tls_handshake, .pki }, "ECDSA verification only; the secp256r1 ECDH group remains deferred."),
+    row(.{ .signature = .rsa_pss_rsae_sha256 }, "RSA-PSS-RSAE-SHA256", .unavailable, .provider_deferred, .openssl_provider, .provider_deferred, "capability rejection tests", .{ .tls_handshake, .pki }, "Deferred: Zig 0.16 std EMSA-PSS-VERIFY does not validate the full PS zero-padding region (RFC 8017); re-enable with a conformant verifier (#343)."),
     row(.{ .certificate_helper = .der_parser }, "DER/X.509 parser helpers", .project_code, .provider_deferred, .openssl_provider, .provider_deferred, "module-local parser fixtures", .{.pki}, "Certificate helpers require malformed-input and corpus tests."),
     row(.{ .certificate_helper = .chain_builder }, "certificate chain builder", .unavailable, .provider_deferred, .openssl_provider, .provider_deferred, "tracked by PKI stories", .{.pki}, "Chain validation requires path-building fixtures."),
     row(.{ .certificate_helper = .webpki_validation }, "WebPKI validation", .unavailable, .provider_deferred, .openssl_provider, .provider_deferred, "tracked by PKI stories", .{.pki}, "WebPKI support requires policy and time-validation review."),
@@ -209,6 +209,7 @@ test "pure-Zig profile capabilities are queryable" {
     try std.testing.expect(caps.supportsGroup(.x25519));
     try std.testing.expect(!caps.supportsGroup(.secp256r1));
     try std.testing.expect(caps.supportsSignature(.ed25519));
-    try std.testing.expect(!caps.supportsSignature(.ecdsa_secp256r1_sha256));
+    try std.testing.expect(caps.supportsSignature(.ecdsa_secp256r1_sha256));
+    // RSA-PSS verification is deferred pending a conformant PSS verifier.
     try std.testing.expect(!caps.supportsSignature(.rsa_pss_rsae_sha256));
 }

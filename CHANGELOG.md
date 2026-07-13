@@ -5,6 +5,38 @@ All notable user-facing changes to Tardigrade are documented here.
 ## [Unreleased]
 
 ### Features
+- **Certificate signature verification matrix (#343, epic #324)** — adds
+  `src/pki/verify.zig`, which verifies an X.509 certificate's signature under
+  an issuer's public key through the #327 crypto-provider seam and the #341
+  parsed views, with no primitive named in PKI code and no OpenSSL fallback.
+  It maps the certificate's `signatureAlgorithm` and issuer
+  SubjectPublicKeyInfo to a provider signature scheme, enforcing conformant
+  algorithm parameters (Ed25519/ECDSA signature parameters absent per RFC
+  8410/5758; Ed25519 and rsaEncryption SPKI parameters), SEC1 EC points, DER
+  `RSAPublicKey` structure with strictly-positive modulus and exponent,
+  canonical ECDSA `SEQUENCE {r,s}` bounded to a P-256 scalar, RSASSA-PSS
+  parameters (SHA-256/MGF1-SHA-256/salt-32), and BIT STRING octet-alignment
+  before delegating to `CryptoProvider.verify`. Outcomes are typed and fail
+  closed: unsupported algorithm/parameters/curve
+  (`UnsupportedSignatureAlgorithm`), algorithm/key disagreement
+  (`IssuerKeyMismatch`), malformed key or signature encodings, and
+  cryptographically invalid signatures (`InvalidSignature`) are all distinct,
+  and a capability check precedes any key handling. Identity matching and path
+  policy stay in their own layers. To back the matrix through the provider
+  boundary, the pure-Zig provider (`src/crypto/pure_zig.zig`) gains
+  **ECDSA-P256/SHA-256** verification over `std.crypto`, and the codified
+  capability profile (`src/crypto/profile.zig`) promotes that row from
+  unavailable to supported (joining Ed25519). **RSA-PSS verification is
+  deferred**: Zig 0.16's `std.crypto` EMSA-PSS-VERIFY does not validate the
+  full PS zero-padding region (RFC 8017), so a crafted encoding could be
+  accepted where OpenSSL rejects it; the PKI layer classifies RSA-PSS
+  certificates but fails them closed until a conformant verifier backs the
+  scheme. The secp256r1 ECDH group also remains deferred. Tested against
+  OpenSSL-generated Ed25519 and P-256 fixtures (a differential check against
+  OpenSSL's signer) plus tamper, wrong-key, issuer-key-mismatch, absent/NULL
+  parameter, non-positive RSA key, oversized/non-canonical ECDSA, and
+  RSA-PSS-parameter corpora under `zig build test-pki` and `zig build
+  test-crypto`.
 - **TLS dependency audit and pure-Zig cutover enforcement (#379, epic #327)** —
   Tardigrade's external-library policy is now enforced in source, build
   configuration, CI, and release artifacts rather than only documented. A new

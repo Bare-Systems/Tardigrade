@@ -12,6 +12,7 @@
 //! - `pem` — strict PEM decoding and DER certificate-chain loading
 //! - `x509` — policy-neutral certificate model with typed extensions
 //! - `identity` — SAN-only DNS/IP service identity matching (RFC 9525)
+//! - `verify` — certificate signature verification via the crypto provider
 //!
 //! ## Policy summary
 //!
@@ -34,6 +35,7 @@ pub const time = @import("time.zig");
 pub const pem = @import("pem.zig");
 pub const x509 = @import("x509.zig");
 pub const identity = @import("identity.zig");
+pub const verify = @import("verify.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());
@@ -41,4 +43,5 @@ test {
     _ = @import("pem_tests.zig");
     _ = @import("x509_tests.zig");
     _ = @import("identity_tests.zig");
+    _ = @import("verify_tests.zig");
 }

@@ -5,6 +5,42 @@ All notable user-facing changes to Tardigrade are documented here.
 ## [Unreleased]
 
 ### Features
+- **TLS record-layer foundation audit remediation (#408, epic #325)** —
+  resolves seven confirmed findings from a retrospective audit of the merged
+  record-mode foundation (#393, #395, #397, #398, #404, #406), surfaced while
+  integrating the encrypted stream (#407). `record_transport.zig`, a
+  record-specific handshake transport contract that duplicated
+  `tls.transport.Contract`'s guarantees without a production consumer, is
+  removed; `tls.transport.Contract`/`ContractWithOptions` is now the single
+  canonical contract QUIC and TCP record mode both instantiate, and it gained
+  the ability to carry a terminal fatal alert
+  (`Event.fatal_alert`/`emitFatalAlert`). `transport.EventSink` now securely
+  zeroes its scratch range on `reset`/`deinit` (not just the counters), every
+  `Driver` gained a `deinit()` that wipes its sink, and byte-bearing event
+  emitters preflight capacity before copying so a rejected emit never leaves
+  secret bytes in scratch. `record_codec.Parser` gained a first-class
+  `feedOne`/`drainReady` exact-consumption API (`consumed` byte count plus
+  emitted-record state) so record-stream callers no longer need a
+  byte-at-a-time workaround under sink backpressure. `record_codec.parseHeader`
+  now accepts the RFC 8446 §5.1 `0x0301` compatibility version, but only for
+  the very first record a server-role initial-epoch parser consumes, never
+  after. `record_epoch_bridge.Bridge.discardEpoch` is now a validated
+  one-way state transition per epoch (initial/handshake/application) instead
+  of a silent no-op: early, late, and duplicate discards are rejected,
+  `markHandshakeComplete` requires the initial epoch to already be
+  discarded, and the record-mode byte stream clears its initial-epoch parser
+  state in lockstep with the discard event. `record_protection`'s
+  known-answer coverage now includes vectors independently computed by a
+  separate implementation (RFC 5869/RFC 8446 §7.1 HKDF from Python's stdlib
+  `hmac`/`hashlib`, AEAD sealing via `pycryptodome`) for all three supported
+  cipher suites, so a bug shared between the seal and open paths can no
+  longer hide behind a self-consistent round trip. Finally, a new
+  `src/quic/record_mode_handshake_test.zig` drives a real client/server TLS
+  1.3 handshake (the production `Tls13Backend` engine, not a scripted
+  fabricated backend) end-to-end through the merged record stack, with
+  independently cross-checked first-record keys, sequence numbers, epoch
+  discards, and cleanup on both the success and authentication-failure
+  paths.
 - **Certificate signature verification matrix (#343, epic #324)** — adds
   `src/pki/verify.zig`, which verifies an X.509 certificate's signature under
   an issuer's public key through the #327 crypto-provider seam and the #341

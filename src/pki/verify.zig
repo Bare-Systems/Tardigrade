@@ -127,16 +127,16 @@ fn resolveScheme(algorithm: *const x509.AlgorithmIdentifier) Error!Resolved {
 
 /// Enforce the issuer SubjectPublicKeyInfo `AlgorithmIdentifier` parameters
 /// beyond the OID/key-type classification `x509` performs: Ed25519 keys carry
-/// no parameters (RFC 8410 §3), rsaEncryption keys carry explicit NULL or
-/// none (RFC 3279 §2.3.1; arbitrary values are rejected), and the ECDSA
-/// named-curve is already pinned to P-256 by the `ecdsa_p256` key type.
+/// no parameters (RFC 8410 §3), rsaEncryption keys carry explicit NULL
+/// (RFC 4055 §1.2), and the ECDSA named-curve is already pinned to P-256 by the
+/// `ecdsa_p256` key type.
 fn validateIssuerKeyParameters(scheme: provider.SignatureScheme, issuer: *const x509.SubjectPublicKeyInfo) Error!void {
     switch (scheme) {
         .ed25519 => {
             if (issuer.algorithm.parameters_raw != null) return error.MalformedPublicKey;
         },
         .rsa_pss_rsae_sha256 => {
-            if (issuer.algorithm.parameters_raw != null and !issuer.algorithm.parameters_null) {
+            if (issuer.algorithm.parameters_raw == null or !issuer.algorithm.parameters_null) {
                 return error.MalformedPublicKey;
             }
         },
@@ -250,10 +250,10 @@ const oid_sha256 = [_]u32{ 2, 16, 840, 1, 101, 3, 4, 2, 1 };
 const oid_mgf1 = [_]u32{ 1, 2, 840, 113549, 1, 1, 8 };
 
 /// Enforce that RSASSA-PSS parameters select SHA-256, MGF1 over SHA-256, and a
-/// 32-byte salt — the single PSS configuration this matrix supports. Any other
-/// (including the SHA-1 DEFAULTs when a field is absent) is unsupported; a
-/// structurally broken parameter block is malformed. Exposed for direct
-/// testing of the parameter rules.
+/// 32-byte salt — the single PSS configuration this matrix recognizes. Any
+/// other configuration (including the SHA-1 DEFAULTs when a field is absent)
+/// is unsupported; a structurally broken parameter block is malformed.
+/// Exposed for direct testing of the parameter rules.
 pub fn validatePssSha256(algorithm: *const x509.AlgorithmIdentifier) Error!void {
     const params = algorithm.parameters_raw orelse return error.UnsupportedSignatureAlgorithm;
     var reader = der.Reader.init(params, .{});
@@ -275,8 +275,19 @@ pub fn validatePssSha256(algorithm: *const x509.AlgorithmIdentifier) Error!void 
     }
     if (salt_elem.content.len != 1 or salt_elem.content[0] != 32) return error.UnsupportedSignatureAlgorithm;
 
-    // trailerField [3] is DEFAULT 1; reject any explicit override we would not honor.
-    if (seq.remaining() > 0) return error.UnsupportedSignatureAlgorithm;
+    // trailerField [3] defaults to 1. RFC 4055 §3.1 requires validators to
+    // accept both the omitted default and an explicitly encoded value of 1.
+    if (seq.remaining() > 0) {
+        const trailer_elem = seq.readExplicitContext(3) catch return error.MalformedSignature;
+        if (!trailer_elem.tag.eql(der.Tag.universal(@intFromEnum(der.UniversalTag.integer), false))) {
+            return error.MalformedSignature;
+        }
+        der.validateInteger(trailer_elem.content, 1) catch return error.MalformedSignature;
+        if (trailer_elem.content.len != 1 or trailer_elem.content[0] != 1) {
+            return error.UnsupportedSignatureAlgorithm;
+        }
+    }
+    seq.expectEnd() catch return error.MalformedSignature;
 }
 
 fn isAlgorithmIdentifier(elem: der.Element) bool {
@@ -317,6 +328,61 @@ fn expectMgf1Sha256(elem: der.Element) Error!void {
 }
 
 const testing = std.testing;
+
+const pss_sha256_params_with_explicit_trailer_one = [_]u8{
+    0x30, 0x39, 0xa0, 0x0f, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86,
+    0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05, 0x00, 0xa1,
+    0x1c, 0x30, 0x1a, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7,
+    0x0d, 0x01, 0x01, 0x08, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86,
+    0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05, 0x00, 0xa2,
+    0x03, 0x02, 0x01, 0x20, 0xa3, 0x03, 0x02, 0x01, 0x01,
+};
+
+const pss_sha256_params_with_unsupported_trailer_two = [_]u8{
+    0x30, 0x39, 0xa0, 0x0f, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86,
+    0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05, 0x00, 0xa1,
+    0x1c, 0x30, 0x1a, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7,
+    0x0d, 0x01, 0x01, 0x08, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86,
+    0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05, 0x00, 0xa2,
+    0x03, 0x02, 0x01, 0x20, 0xa3, 0x03, 0x02, 0x01, 0x02,
+};
+
+test "PSS trailerField accepts explicit one and rejects other values" {
+    var algorithm = x509.AlgorithmIdentifier{
+        .raw = &.{},
+        .oid = try oid.ObjectIdentifier.fromComponents(&wk.rsa_pss),
+        .parameters_raw = &pss_sha256_params_with_explicit_trailer_one,
+        .parameters_null = false,
+    };
+    try validatePssSha256(&algorithm);
+
+    algorithm.parameters_raw = &pss_sha256_params_with_unsupported_trailer_two;
+    try testing.expectError(error.UnsupportedSignatureAlgorithm, validatePssSha256(&algorithm));
+}
+
+test "rsaEncryption issuer keys require explicit NULL parameters" {
+    var issuer = x509.SubjectPublicKeyInfo{
+        .raw = &.{},
+        .algorithm = .{
+            .raw = &.{},
+            .oid = try oid.ObjectIdentifier.fromComponents(&wk.rsa_encryption),
+            .parameters_raw = null,
+            .parameters_null = false,
+        },
+        .subject_public_key = .{ .unused_bits = 0, .data = &.{} },
+        .key_type = .rsa,
+        .named_curve = null,
+    };
+
+    try testing.expectError(
+        error.MalformedPublicKey,
+        validateIssuerKeyParameters(.rsa_pss_rsae_sha256, &issuer),
+    );
+
+    issuer.algorithm.parameters_raw = &[_]u8{ 0x05, 0x00 };
+    issuer.algorithm.parameters_null = true;
+    try validateIssuerKeyParameters(.rsa_pss_rsae_sha256, &issuer);
+}
 
 test {
     testing.refAllDecls(@This());

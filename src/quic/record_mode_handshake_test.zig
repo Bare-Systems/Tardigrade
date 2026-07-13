@@ -294,6 +294,12 @@ const Harness = struct {
     /// Guards deinit()'s driver cleanup: client_driver/server_driver start
     /// as `undefined` and only become valid once `run()` constructs them.
     drivers_ready: bool = false,
+    /// Guards against calling deinit() more than once. The bridge/driver
+    /// contracts document exactly one deinit() call per owner; tests that
+    /// both `defer h.deinit()` and call it explicitly to inspect
+    /// post-teardown state must still honor that, so a second call is a
+    /// no-op rather than relying on today's incidental idempotency.
+    deinitialized: bool = false,
 
     fn init() Harness {
         var client_backend = tls_backend.Tls13Backend.initClient(clientEntropy(), .{ .pinned_certificate = tls_backend.testdata.certificate_der });
@@ -330,6 +336,8 @@ const Harness = struct {
     }
 
     fn deinit(self: *Harness) void {
+        if (self.deinitialized) return;
+        self.deinitialized = true;
         self.client_bridge.deinit();
         self.server_bridge.deinit();
         // The generic Driver's own teardown (#408 finding 2): it wipes

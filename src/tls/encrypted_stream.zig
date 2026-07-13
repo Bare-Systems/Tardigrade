@@ -1502,15 +1502,28 @@ test "server-role stream accepts the 0x0301 ClientHello compatibility version on
 
     var server = PureZigRecordStream.init(.server, cp, .tls_aes_128_gcm_sha256);
     defer server.deinit();
+    // A real (unfragmented) ClientHello handshake message: msg_type=1, a
+    // 3-byte big-endian length, then the body -- the compatibility window
+    // tracks this length across records, so a payload without a real
+    // length field would either falsely close or falsely hold the window
+    // open.
+    const client_hello_body = "client hello";
+    var client_hello_message: [4 + client_hello_body.len]u8 = undefined;
+    client_hello_message[0] = 1;
+    client_hello_message[1] = 0;
+    client_hello_message[2] = 0;
+    client_hello_message[3] = client_hello_body.len;
+    @memcpy(client_hello_message[4..], client_hello_body);
+
     var compat_client_hello: [64]u8 = undefined;
-    const record = try record_codec.encodePlaintextRecord(.handshake, "\x01client hello", &compat_client_hello);
+    const record = try record_codec.encodePlaintextRecord(.handshake, &client_hello_message, &compat_client_hello);
     compat_client_hello[1] = 0x03;
     compat_client_hello[2] = 0x01;
     const consumed = try server.feedHandshakeCiphertext(.initial, compat_client_hello[0..record.len]);
     try testing.expectEqual(record.len, consumed);
     var out: [32]u8 = undefined;
     const n = try server.readHandshake(&out);
-    try testing.expectEqualStrings("\x01client hello", out[0..n]);
+    try testing.expectEqualSlices(u8, &client_hello_message, out[0..n]);
 
     // A second plaintext record on the same server stream must be strict.
     var strict_record: [64]u8 = undefined;

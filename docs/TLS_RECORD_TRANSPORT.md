@@ -22,17 +22,37 @@ transport-owned peer parameters, negotiated ALPN, peer certificate state,
 epoch discard, completion, and a fatal alert.
 
 Event byte slices are copied into the driver-owned `EventSink`. They remain
-valid only until the next `Driver.start` or `Driver.receive` call, both of
-which reset the sink. Resetting or deinitializing the sink securely zeroes the
-used scratch range, so a copied traffic secret does not survive past that
-event lifetime. Event emission is atomic: a rejected emit (event-count or byte
-overflow) never leaves a partial payload in scratch or a phantom event in
-`items`.
+valid only until the next drive call — `Driver.start`, `Driver.receive`,
+`Driver.startOutcome`, or `Driver.receiveOutcome` — all four reset the sink
+before invoking the backend. Resetting or deinitializing the sink securely
+zeroes the used scratch range, so a copied traffic secret does not survive
+past that event lifetime. Event emission is atomic: a rejected emit
+(event-count or byte overflow) never leaves a partial payload in scratch or a
+phantom event in `items`.
 
 `Driver.deinit()` wipes the sink's final contents. Every owner of a `Driver`
 must call it exactly once at teardown, regardless of whether the handshake
 completed, failed, or was abandoned mid-flight — QUIC's `Connection.deinitPartial`
 does this via `Handshake.deinit()`.
+
+## Terminal error plus events
+
+`Driver.start`/`Driver.receive` return `Transport.Error!*EventSink`: on
+backend failure they return only the error, discarding whatever the backend
+already emitted into the sink before failing (for example a fatal alert, or
+handshake bytes queued ahead of it). That is the right shape for QUIC's
+`try`-based happy path, where a failure always tears the connection down
+regardless of what else was emitted.
+
+A caller that needs the backend's terminal output — for example TCP record
+mode, which must still serialize a fatal alert the backend emitted right
+before failing — uses `Driver.startOutcome`/`Driver.receiveOutcome` instead.
+Both return `Driver.Outcome`, `{ sink: *EventSink, terminal_error: ?Transport.Error }`,
+so the sink and the error are always available together rather than one
+discarding the other. This restores the terminal-error-plus-events guarantee
+the removed `record_transport.zig` carried (#408 finding 1); once a driver has
+failed, repeated `startOutcome`/`receiveOutcome` calls keep returning the same
+terminal error and sink contents without re-invoking the backend.
 
 ## Fatal alerts
 

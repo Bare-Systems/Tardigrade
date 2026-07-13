@@ -284,6 +284,11 @@ pub const PureZigRecordStream = struct {
             return .{ .made_progress = false, .readiness = self.readiness() };
         }
 
+        if (self.lifecycle == .closing and !self.bridge.handshake_complete) {
+            if (try self.queueCloseNotify()) made_progress = true;
+            return .{ .made_progress = made_progress, .readiness = self.readiness() };
+        }
+
         if (self.carrier) |carrier| {
             var written_total: usize = 0;
             while (self.outbound_ciphertext.len > 0 and written_total < drive_write_budget) {
@@ -1134,6 +1139,50 @@ test "encrypted stream close during handshake drops queued output before closing
     try testing.expect(result.made_progress);
     try testing.expectEqual(Lifecycle.closed, stream_state.lifecycle);
     try testing.expectEqual(@as(usize, 0), stream_state.queuedCiphertextLen());
+    try testing.expectEqual(@as(usize, 1), carrier.close_count);
+
+    stream_state.deinit();
+    try testing.expectEqual(@as(usize, 1), carrier.close_count);
+}
+
+test "encrypted stream close during handshake does not write queued output" {
+    const WritableCarrier = struct {
+        written: usize = 0,
+        close_count: usize = 0,
+
+        fn carrier(self: *@This()) Carrier {
+            return .{ .ptr = self, .readFn = read, .writeFn = write, .closeFn = close, .owns_handle = true };
+        }
+
+        fn read(_: *anyopaque, _: []u8) Error!usize {
+            return error.WouldBlock;
+        }
+
+        fn write(ptr: *anyopaque, bytes: []const u8) Error!usize {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.written += bytes.len;
+            return bytes.len;
+        }
+
+        fn close(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.close_count += 1;
+        }
+    };
+
+    const cp = testProvider();
+    var carrier = WritableCarrier{};
+    var stream_state = PureZigRecordStream.initWithCarrier(cp, .tls_aes_128_gcm_sha256, carrier.carrier());
+
+    try stream_state.applyEvent(.{ .handshake_bytes = .{ .epoch = .initial, .data = "queued client hello" } });
+    try testing.expect(stream_state.queuedCiphertextLen() > 0);
+
+    stream_state.stream().close();
+    const result = try stream_state.stream().drive();
+    try testing.expect(result.made_progress);
+    try testing.expectEqual(Lifecycle.closed, stream_state.lifecycle);
+    try testing.expectEqual(@as(usize, 0), stream_state.queuedCiphertextLen());
+    try testing.expectEqual(@as(usize, 0), carrier.written);
     try testing.expectEqual(@as(usize, 1), carrier.close_count);
 
     stream_state.deinit();

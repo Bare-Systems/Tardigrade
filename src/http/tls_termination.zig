@@ -23,6 +23,7 @@ extern fn SSL_CTX_set_alpn_select_cb(
 
 const ssl_op_no_ticket: c_ulong = @as(c_ulong, 1) << @as(u6, 14);
 const openssl_npn_negotiated: c_int = 1;
+const openssl_stream_mode: c_long = c.SSL_MODE_ENABLE_PARTIAL_WRITE | c.SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER;
 const embedded_server_crt = @embedFile("testdata/test_server.crt");
 const embedded_server_key = @embedFile("testdata/test_server.key");
 const embedded_alt_server_crt = @embedFile("testdata/test_alt_server.crt");
@@ -308,6 +309,7 @@ pub const TlsTerminator = struct {
     pub fn accept(self: *TlsTerminator, fd: std.posix.fd_t) TlsError!TlsConnection {
         const ssl = c.SSL_new(self.ctx) orelse return error.ContextInitFailed;
         errdefer c.SSL_free(ssl);
+        _ = c.SSL_ctrl(ssl, c.SSL_CTRL_MODE, openssl_stream_mode, null);
         if (c.SSL_set_fd(ssl, fd) != 1) return error.HandshakeFailed;
 
         if (self.state.ocsp_enabled) {
@@ -329,10 +331,16 @@ pub const TlsTerminator = struct {
 
 pub const TlsConnection = struct {
     ssl: *c.SSL,
-    closed: bool = false,
+    stream_lifecycle: OpenSslStreamLifecycle = .open,
+    retry_direction: OpenSslRetryDirection = .none,
+    peer_closed: bool = false,
+    stream_failure: ?encrypted_stream.Error = null,
 
     pub fn deinit(self: *TlsConnection) void {
-        _ = c.SSL_shutdown(self.ssl);
+        if (self.stream_failure == null and self.stream_lifecycle != .closed) {
+            c.ERR_clear_error();
+            _ = c.SSL_shutdown(self.ssl);
+        }
         c.SSL_free(self.ssl);
         self.* = undefined;
     }
@@ -408,58 +416,165 @@ pub const TlsConnection = struct {
     }
 };
 
+const OpenSslStreamLifecycle = enum {
+    open,
+    closing,
+    closed,
+    failed,
+};
+
+const OpenSslRetryDirection = enum {
+    none,
+    read,
+    write,
+};
+
+fn opensslStreamFail(self: *TlsConnection, err: encrypted_stream.Error) encrypted_stream.Error {
+    self.stream_lifecycle = .failed;
+    self.retry_direction = .none;
+    self.stream_failure = err;
+    return err;
+}
+
+fn opensslRefreshPeerClosed(self: *TlsConnection) void {
+    self.peer_closed = self.peer_closed or (c.SSL_get_shutdown(self.ssl) & c.SSL_RECEIVED_SHUTDOWN) != 0;
+}
+
+fn opensslSetRetry(self: *TlsConnection, ssl_error: c_int) void {
+    self.retry_direction = switch (ssl_error) {
+        c.SSL_ERROR_WANT_READ => .read,
+        c.SSL_ERROR_WANT_WRITE => .write,
+        else => .none,
+    };
+}
+
 fn opensslStreamBackend(_: *anyopaque) encrypted_stream.BackendKind {
     return .openssl;
 }
 
 fn opensslStreamRead(ptr: *anyopaque, out: []u8) encrypted_stream.Error!usize {
     const self: *TlsConnection = @ptrCast(@alignCast(ptr));
-    if (self.closed) return error.StreamClosed;
+    if (self.stream_failure) |err| return err;
+    if (self.stream_lifecycle != .open) return error.StreamClosed;
+    c.ERR_clear_error();
     const rc = c.SSL_read(self.ssl, out.ptr, @intCast(out.len));
-    if (rc > 0) return @intCast(rc);
-    return switch (c.SSL_get_error(self.ssl, rc)) {
-        c.SSL_ERROR_WANT_READ, c.SSL_ERROR_WANT_WRITE => error.WouldBlock,
-        c.SSL_ERROR_ZERO_RETURN => error.EndOfStream,
-        else => error.SocketReadFailed,
+    if (rc > 0) {
+        self.retry_direction = .none;
+        opensslRefreshPeerClosed(self);
+        return @intCast(rc);
+    }
+    const ssl_error = c.SSL_get_error(self.ssl, rc);
+    return switch (ssl_error) {
+        c.SSL_ERROR_WANT_READ, c.SSL_ERROR_WANT_WRITE => blocked: {
+            opensslSetRetry(self, ssl_error);
+            break :blocked error.WouldBlock;
+        },
+        c.SSL_ERROR_ZERO_RETURN => eof: {
+            self.retry_direction = .none;
+            self.peer_closed = true;
+            break :eof error.EndOfStream;
+        },
+        else => opensslStreamFail(self, error.SocketReadFailed),
     };
 }
 
 fn opensslStreamWrite(ptr: *anyopaque, bytes: []const u8) encrypted_stream.Error!usize {
     const self: *TlsConnection = @ptrCast(@alignCast(ptr));
-    if (self.closed) return error.StreamClosed;
+    if (self.stream_failure) |err| return err;
+    if (self.stream_lifecycle != .open or self.peer_closed) return error.StreamClosed;
     if (bytes.len == 0) return 0;
+    c.ERR_clear_error();
     const rc = c.SSL_write(self.ssl, bytes.ptr, @intCast(bytes.len));
-    if (rc > 0) return @intCast(rc);
-    return switch (c.SSL_get_error(self.ssl, rc)) {
-        c.SSL_ERROR_WANT_READ, c.SSL_ERROR_WANT_WRITE => error.WouldBlock,
-        c.SSL_ERROR_ZERO_RETURN => error.EndOfStream,
-        else => error.SocketWriteFailed,
+    if (rc > 0) {
+        self.retry_direction = .none;
+        opensslRefreshPeerClosed(self);
+        return @intCast(rc);
+    }
+    const ssl_error = c.SSL_get_error(self.ssl, rc);
+    return switch (ssl_error) {
+        c.SSL_ERROR_WANT_READ, c.SSL_ERROR_WANT_WRITE => blocked: {
+            opensslSetRetry(self, ssl_error);
+            break :blocked error.WouldBlock;
+        },
+        c.SSL_ERROR_ZERO_RETURN => eof: {
+            self.retry_direction = .none;
+            self.peer_closed = true;
+            break :eof error.EndOfStream;
+        },
+        else => opensslStreamFail(self, error.SocketWriteFailed),
+    };
+}
+
+fn opensslAdvanceShutdown(self: *TlsConnection) encrypted_stream.Error!bool {
+    if (self.stream_failure) |err| return err;
+    if (self.stream_lifecycle == .closed) return false;
+
+    self.stream_lifecycle = .closing;
+    c.ERR_clear_error();
+    const rc = c.SSL_shutdown(self.ssl);
+    opensslRefreshPeerClosed(self);
+    if (rc == 1) {
+        self.stream_lifecycle = .closed;
+        self.retry_direction = .none;
+        return true;
+    }
+    if (rc == 0) {
+        self.retry_direction = .read;
+        return true;
+    }
+
+    const ssl_error = c.SSL_get_error(self.ssl, rc);
+    return switch (ssl_error) {
+        c.SSL_ERROR_WANT_READ, c.SSL_ERROR_WANT_WRITE => blocked: {
+            opensslSetRetry(self, ssl_error);
+            break :blocked false;
+        },
+        c.SSL_ERROR_ZERO_RETURN => peer_closed: {
+            self.peer_closed = true;
+            self.retry_direction = .write;
+            break :peer_closed true;
+        },
+        else => opensslStreamFail(self, error.SocketWriteFailed),
     };
 }
 
 fn opensslStreamClose(ptr: *anyopaque) void {
     const self: *TlsConnection = @ptrCast(@alignCast(ptr));
-    if (self.closed) return;
-    _ = c.SSL_shutdown(self.ssl);
-    self.closed = true;
+    if (self.stream_lifecycle == .closed or self.stream_lifecycle == .failed) return;
+    _ = opensslAdvanceShutdown(self) catch {};
 }
 
 fn opensslStreamReadiness(ptr: *anyopaque) encrypted_stream.Readiness {
     const self: *TlsConnection = @ptrCast(@alignCast(ptr));
-    if (self.closed) {
-        return .{ .peer_closed = true };
+    opensslRefreshPeerClosed(self);
+    if (self.stream_lifecycle == .failed or self.stream_lifecycle == .closed) {
+        return .{ .peer_closed = self.peer_closed };
     }
+    if (self.stream_lifecycle == .closing) {
+        return .{
+            .wants_read = self.retry_direction == .read,
+            .wants_write = self.retry_direction == .write,
+            .peer_closed = self.peer_closed,
+        };
+    }
+    const pending = self.pending();
     return .{
-        .wants_read = self.pending() == 0,
-        .wants_write = false,
-        .can_read_plaintext = self.pending() > 0,
-        .can_write_plaintext = true,
-        .peer_closed = false,
+        .wants_read = self.retry_direction == .read or (self.retry_direction == .none and pending == 0 and !self.peer_closed),
+        .wants_write = self.retry_direction == .write,
+        .can_read_plaintext = pending > 0,
+        .can_write_plaintext = self.retry_direction == .none and !self.peer_closed,
+        .peer_closed = self.peer_closed,
     };
 }
 
 fn opensslStreamDrive(ptr: *anyopaque) encrypted_stream.Error!encrypted_stream.DriveResult {
-    return .{ .made_progress = false, .readiness = opensslStreamReadiness(ptr) };
+    const self: *TlsConnection = @ptrCast(@alignCast(ptr));
+    if (self.stream_failure) |err| return err;
+    const made_progress = if (self.stream_lifecycle == .closing)
+        try opensslAdvanceShutdown(self)
+    else
+        false;
+    return .{ .made_progress = made_progress, .readiness = opensslStreamReadiness(ptr) };
 }
 
 const openssl_stream_vtable = encrypted_stream.EncryptedStream.VTable{
@@ -1003,6 +1118,18 @@ fn clientReadExact(ssl: *c.SSL, out: []u8) !void {
     }
 }
 
+const ClientReadContext = struct {
+    ssl: *c.SSL,
+    out: []u8,
+    err: ?anyerror = null,
+};
+
+fn clientReadThread(ctx: *ClientReadContext) void {
+    clientReadExact(ctx.ssl, ctx.out) catch |err| {
+        ctx.err = err;
+    };
+}
+
 test "openssl init" {
     try std.testing.expect(c.OPENSSL_init_ssl(0, null) == 1);
 }
@@ -1052,15 +1179,9 @@ test "openssl encrypted stream adapter conforms over production connection" {
     defer pair.deinit();
 
     const stream = pair.server.stream();
-    try std.testing.expectEqual(encrypted_stream.BackendKind.openssl, stream.backend());
-    try std.testing.expect(stream.readiness().wants_read);
-    try std.testing.expect(stream.readiness().can_write_plaintext);
+    try encrypted_stream.expectOpenIdleConformance(stream, .openssl);
 
     var scratch: [32]u8 = undefined;
-    try std.testing.expectError(error.WouldBlock, stream.read(&scratch));
-    const idle = try stream.drive();
-    try std.testing.expect(!idle.made_progress);
-
     try clientWriteAll(pair.client_ssl, "client-payload");
     const partial = try stream.read(scratch[0..6]);
     try std.testing.expectEqualStrings("client", scratch[0..partial]);
@@ -1075,10 +1196,104 @@ test "openssl encrypted stream adapter conforms over production connection" {
     var client_buf: ["server-reply".len]u8 = undefined;
     try clientReadExact(pair.client_ssl, &client_buf);
     try std.testing.expectEqualStrings("server-reply", &client_buf);
+}
 
+test "openssl encrypted stream preserves write retry direction under socket backpressure" {
+    const allocator = std.testing.allocator;
+    var pair = try makeTestTlsPair(allocator);
+    defer pair.deinit();
+
+    const send_buffer: c_int = 4096;
+    try std.posix.setsockopt(pair.server_fd, std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, std.mem.asBytes(&send_buffer));
+
+    const stream = pair.server.stream();
+    var expected: std.ArrayList(u8) = .empty;
+    defer expected.deinit(allocator);
+    var chunk: [16 * 1024]u8 = undefined;
+    var blocked_bytes: ?[]const u8 = null;
+
+    write_until_blocked: for (0..1024) |sequence| {
+        for (&chunk, 0..) |*byte, index| byte.* = @truncate(sequence + index);
+        var remaining: []const u8 = &chunk;
+        while (remaining.len > 0) {
+            const written = stream.write(remaining) catch |err| switch (err) {
+                error.WouldBlock => {
+                    blocked_bytes = remaining;
+                    break :write_until_blocked;
+                },
+                else => return err,
+            };
+            try std.testing.expect(written > 0);
+            try expected.appendSlice(allocator, remaining[0..written]);
+            remaining = remaining[written..];
+        }
+    }
+
+    const retry_bytes = blocked_bytes orelse return error.TestUnexpectedResult;
+    const blocked_readiness = stream.readiness();
+    try std.testing.expect(!blocked_readiness.wants_read);
+    try std.testing.expect(blocked_readiness.wants_write);
+    try std.testing.expect(!blocked_readiness.can_write_plaintext);
+    const blocked_drive = try stream.drive();
+    try std.testing.expect(!blocked_drive.made_progress);
+    try std.testing.expect(blocked_drive.readiness.wants_write);
+
+    const target = try allocator.alloc(u8, expected.items.len + retry_bytes.len);
+    defer allocator.free(target);
+    @memcpy(target[0..expected.items.len], expected.items);
+    @memcpy(target[expected.items.len..], retry_bytes);
+    const received = try allocator.alloc(u8, target.len);
+    defer allocator.free(received);
+    var read_ctx = ClientReadContext{ .ssl = pair.client_ssl, .out = received };
+    const reader = try std.Thread.spawn(.{}, clientReadThread, .{&read_ctx});
+
+    var remaining = retry_bytes;
+    while (remaining.len > 0) {
+        const written = stream.write(remaining) catch |err| switch (err) {
+            error.WouldBlock => {
+                std.Thread.yield() catch {};
+                continue;
+            },
+            else => return err,
+        };
+        try std.testing.expect(written > 0);
+        remaining = remaining[written..];
+    }
+    reader.join();
+    if (read_ctx.err) |err| return err;
+
+    try std.testing.expectEqualSlices(u8, target, received);
+    try std.testing.expect(!stream.readiness().wants_write);
+    try std.testing.expect(stream.readiness().can_write_plaintext);
+}
+
+test "openssl encrypted stream drives graceful bidirectional shutdown" {
+    const allocator = std.testing.allocator;
+    var pair = try makeTestTlsPair(allocator);
+    defer pair.deinit();
+
+    const stream = pair.server.stream();
     stream.close();
-    try std.testing.expectError(error.StreamClosed, stream.write("after-close"));
-    try std.testing.expect(stream.readiness().peer_closed);
+    const closing = stream.readiness();
+    try std.testing.expect(closing.wants_read);
+    try std.testing.expect(!closing.peer_closed);
+    try std.testing.expect(!closing.can_write_plaintext);
+
+    var byte: [1]u8 = undefined;
+    c.ERR_clear_error();
+    const read_rc = c.SSL_read(pair.client_ssl, &byte, byte.len);
+    try std.testing.expectEqual(@as(c_int, 0), read_rc);
+    try std.testing.expectEqual(c.SSL_ERROR_ZERO_RETURN, c.SSL_get_error(pair.client_ssl, read_rc));
+    try std.testing.expect((c.SSL_get_shutdown(pair.client_ssl) & c.SSL_RECEIVED_SHUTDOWN) != 0);
+
+    c.ERR_clear_error();
+    try std.testing.expectEqual(@as(c_int, 1), c.SSL_shutdown(pair.client_ssl));
+    const driven = try stream.drive();
+    try std.testing.expect(driven.made_progress);
+    try std.testing.expect(driven.readiness.peer_closed);
+    try std.testing.expect(!driven.readiness.wants_read);
+    try std.testing.expect(!driven.readiness.wants_write);
+    try encrypted_stream.expectClosedConformance(stream);
 }
 
 test "openssl encrypted stream adapter reports peer EOF" {
@@ -1102,5 +1317,10 @@ test "openssl encrypted stream adapter latches fatal wire failures" {
     try std.testing.expectEqual(@as(isize, @intCast(malformed.len)), std.c.write(pair.client_fd, malformed.ptr, malformed.len));
 
     var scratch: [32]u8 = undefined;
-    try std.testing.expectError(error.SocketReadFailed, pair.server.stream().read(&scratch));
+    const stream = pair.server.stream();
+    try std.testing.expectError(error.SocketReadFailed, stream.read(&scratch));
+    try encrypted_stream.expectLatchedFailureConformance(stream, error.SocketReadFailed);
+    stream.close();
+    try std.testing.expectEqual(OpenSslStreamLifecycle.failed, pair.server.stream_lifecycle);
+    try std.testing.expectEqual(@as(c_int, 0), c.SSL_get_shutdown(pair.server.ssl) & c.SSL_SENT_SHUTDOWN);
 }

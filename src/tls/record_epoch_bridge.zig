@@ -150,28 +150,50 @@ pub const Bridge = struct {
     }
 
     pub fn sealHandshake(self: *Bridge, epoch: events.EncryptionEpoch, bytes: []const u8, out: []u8) Error![]const u8 {
+        return self.sealProtected(epoch, .handshake, bytes, out);
+    }
+
+    pub fn sealProtected(
+        self: *Bridge,
+        epoch: events.EncryptionEpoch,
+        content_type: record_codec.ContentType,
+        bytes: []const u8,
+        out: []u8,
+    ) Error![]const u8 {
         return switch (epoch) {
-            .initial => record_codec.encodePlaintextRecord(.handshake, bytes, out),
+            .initial => if (content_type == .handshake)
+                record_codec.encodePlaintextRecord(.handshake, bytes, out)
+            else
+                error.UnsupportedRecordEpoch,
             .handshake => blk: {
                 const write = self.writeHandshake() orelse return error.MissingWriteKeys;
-                break :blk try write.seal(.handshake, bytes, 0, out);
+                break :blk try write.seal(content_type, bytes, 0, out);
             },
             .application => blk: {
                 if (!self.handshake_complete) return error.HandshakeNotComplete;
                 const write = self.writeApplication() orelse return error.MissingWriteKeys;
-                break :blk try write.seal(.handshake, bytes, 0, out);
+                break :blk try write.seal(content_type, bytes, 0, out);
             },
             .zero_rtt => error.UnsupportedRecordEpoch,
         };
     }
 
     pub fn sealApplicationData(self: *Bridge, bytes: []const u8, out: []u8) Error![]const u8 {
-        if (!self.handshake_complete) return error.HandshakeNotComplete;
-        const write = self.writeApplication() orelse return error.MissingWriteKeys;
-        return write.seal(.application_data, bytes, 0, out);
+        return self.sealProtected(.application, .application_data, bytes, out);
     }
 
     pub fn openHandshake(
+        self: *Bridge,
+        epoch: events.EncryptionEpoch,
+        record: record_codec.Record,
+        out: []u8,
+    ) Error!OpenedRecord {
+        const opened = try self.openProtected(epoch, record, out);
+        if (opened.inner.content_type != .handshake) return error.UnexpectedRecordContent;
+        return opened;
+    }
+
+    pub fn openProtected(
         self: *Bridge,
         epoch: events.EncryptionEpoch,
         record: record_codec.Record,
@@ -197,16 +219,13 @@ pub const Bridge = struct {
             },
             .zero_rtt => return error.UnsupportedRecordEpoch,
         };
-        if (inner.content_type != .handshake) return error.UnexpectedRecordContent;
         return .{ .epoch = epoch, .inner = inner };
     }
 
     pub fn openApplicationData(self: *Bridge, record: record_codec.Record, out: []u8) Error!OpenedRecord {
-        if (!self.handshake_complete) return error.HandshakeNotComplete;
-        const read = self.readApplication() orelse return error.MissingReadKeys;
-        const inner = try read.open(record, out);
-        if (inner.content_type != .application_data) return error.UnexpectedRecordContent;
-        return .{ .epoch = .application, .inner = inner };
+        const opened = try self.openProtected(.application, record, out);
+        if (opened.inner.content_type != .application_data) return error.UnexpectedRecordContent;
+        return opened;
     }
 
     pub fn hasReadKeys(self: *const Bridge, epoch: events.EncryptionEpoch) bool {

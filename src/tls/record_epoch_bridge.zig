@@ -28,6 +28,8 @@ pub const Error = record_codec.Error || record_protection.Error || error{
     HandshakeNotComplete,
     InvalidEpochTransition,
     UnexpectedRecordContent,
+    EpochAlreadyDiscarded,
+    EpochDiscardTooEarly,
 };
 
 pub const OpenedRecord = struct {
@@ -51,19 +53,28 @@ pub const Bridge = struct {
     write_application: ?record_protection.WriteState = null,
     read_phase: DirectionPhase = .initial,
     write_phase: DirectionPhase = .initial,
-    read_handshake_discarded: bool = false,
-    write_handshake_discarded: bool = false,
-    read_application_discarded: bool = false,
-    write_application_discarded: bool = false,
+    initial_discarded: bool = false,
+    handshake_discarded: bool = false,
+    application_discarded: bool = false,
     handshake_complete: bool = false,
 
     pub fn init(crypto_provider: provider.CryptoProvider, cipher_suite: algorithms.CipherSuite) Bridge {
         return .{ .crypto_provider = crypto_provider, .cipher_suite = cipher_suite };
     }
 
+    /// Unconditionally wipes all traffic secret material, regardless of
+    /// whether the handshake reached a state where `discardEpoch` would
+    /// have accepted an orderly discard. Teardown on an abandoned or
+    /// failed handshake must still zero any installed keys, so this does
+    /// not route through the ordering checks in `discardEpoch`.
     pub fn deinit(self: *Bridge) void {
-        self.discardEpoch(.handshake);
-        self.discardEpoch(.application);
+        clearRead(&self.read_handshake);
+        clearWrite(&self.write_handshake);
+        clearRead(&self.read_application);
+        clearWrite(&self.write_application);
+        self.initial_discarded = true;
+        self.handshake_discarded = true;
+        self.application_discarded = true;
         self.handshake_complete = false;
     }
 
@@ -71,7 +82,7 @@ pub const Bridge = struct {
         switch (event) {
             .handshake_bytes => |bytes| return try self.sealHandshake(bytes.epoch, bytes.data, out),
             .traffic_secret => |traffic_secret| try self.installTrafficSecret(traffic_secret.epoch, traffic_secret.direction, traffic_secret.data),
-            .discard_epoch => |epoch| self.discardEpoch(epoch),
+            .discard_epoch => |epoch| try self.discardEpoch(epoch),
             .handshake_complete => try self.markHandshakeComplete(),
             .alpn,
             .certificate,
@@ -89,24 +100,24 @@ pub const Bridge = struct {
         switch (epoch) {
             .handshake => switch (direction) {
                 .read => {
-                    if (self.read_phase != .initial or self.read_handshake_discarded) return error.InvalidEpochTransition;
+                    if (self.read_phase != .initial or self.handshake_discarded) return error.InvalidEpochTransition;
                     try self.installRead(&self.read_handshake, traffic_secret);
                     self.read_phase = .handshake;
                 },
                 .write => {
-                    if (self.write_phase != .initial or self.write_handshake_discarded) return error.InvalidEpochTransition;
+                    if (self.write_phase != .initial or self.handshake_discarded) return error.InvalidEpochTransition;
                     try self.installWrite(&self.write_handshake, traffic_secret);
                     self.write_phase = .handshake;
                 },
             },
             .application => switch (direction) {
                 .read => {
-                    if (self.read_phase != .handshake or self.read_handshake_discarded or self.read_application_discarded) return error.InvalidEpochTransition;
+                    if (self.read_phase != .handshake or self.handshake_discarded or self.application_discarded) return error.InvalidEpochTransition;
                     try self.installRead(&self.read_application, traffic_secret);
                     self.read_phase = .application;
                 },
                 .write => {
-                    if (self.write_phase != .handshake or self.write_handshake_discarded or self.write_application_discarded) return error.InvalidEpochTransition;
+                    if (self.write_phase != .handshake or self.handshake_discarded or self.application_discarded) return error.InvalidEpochTransition;
                     try self.installWrite(&self.write_application, traffic_secret);
                     self.write_phase = .application;
                 },
@@ -117,31 +128,41 @@ pub const Bridge = struct {
         }
     }
 
-    pub fn discardEpoch(self: *Bridge, epoch: events.EncryptionEpoch) void {
+    /// Discards `epoch`'s key material as a validated one-way state
+    /// transition: each epoch may be discarded at most once, and the
+    /// handshake and initial epochs may only be discarded once the
+    /// handshake has actually progressed past them, so a premature or
+    /// duplicate discard fails closed instead of silently no-op'ing.
+    pub fn discardEpoch(self: *Bridge, epoch: events.EncryptionEpoch) Error!void {
         switch (epoch) {
+            .initial => {
+                if (self.initial_discarded) return error.EpochAlreadyDiscarded;
+                if (self.read_phase == .initial or self.write_phase == .initial) return error.EpochDiscardTooEarly;
+                self.initial_discarded = true;
+            },
             .handshake => {
+                if (self.handshake_discarded) return error.EpochAlreadyDiscarded;
+                if (self.read_phase != .application or self.write_phase != .application) return error.EpochDiscardTooEarly;
                 clearRead(&self.read_handshake);
                 clearWrite(&self.write_handshake);
-                self.read_handshake_discarded = true;
-                self.write_handshake_discarded = true;
+                self.handshake_discarded = true;
             },
             .application => {
+                if (self.application_discarded) return error.EpochAlreadyDiscarded;
                 clearRead(&self.read_application);
                 clearWrite(&self.write_application);
-                self.read_application_discarded = true;
-                self.write_application_discarded = true;
+                self.application_discarded = true;
                 self.read_phase = .initial;
                 self.write_phase = .initial;
                 self.handshake_complete = false;
             },
-            .initial,
-            .zero_rtt,
-            => {},
+            .zero_rtt => return error.UnsupportedRecordEpoch,
         }
     }
 
     pub fn markHandshakeComplete(self: *Bridge) Error!void {
         if (self.handshake_complete) return error.InvalidEpochTransition;
+        if (!self.initial_discarded) return error.InvalidEpochTransition;
         if (self.read_phase != .application or self.write_phase != .application) return error.InvalidEpochTransition;
         if (self.read_application == null or self.write_application == null) return error.MissingApplicationKeys;
         self.handshake_complete = true;
@@ -161,7 +182,9 @@ pub const Bridge = struct {
         out: []u8,
     ) Error![]const u8 {
         return switch (epoch) {
-            .initial => if (content_type == .handshake)
+            .initial => if (self.initial_discarded)
+                error.UnsupportedRecordEpoch
+            else if (content_type == .handshake)
                 record_codec.encodePlaintextRecord(.handshake, bytes, out)
             else
                 error.UnsupportedRecordEpoch,
@@ -201,6 +224,7 @@ pub const Bridge = struct {
     ) Error!OpenedRecord {
         const inner = switch (epoch) {
             .initial => blk: {
+                if (self.initial_discarded) return error.UnsupportedRecordEpoch;
                 if (record.content_type != .handshake) return error.UnexpectedRecordContent;
                 break :blk record_codec.InnerPlaintext{
                     .content_type = record.content_type,
@@ -359,6 +383,14 @@ test "record epoch bridge drives event loopback across plaintext, handshake, app
     try expectAes128TrafficKeys(client_hs, client.write_handshake.?.keys);
     try testing.expectEqual(@as(u64, 0), client.write_handshake.?.sequence);
 
+    // Both directions now have handshake traffic keys installed, so the
+    // initial epoch's plaintext keys (there were none to begin with, but
+    // the epoch itself) are no longer needed on either side.
+    _ = try client.applyEvent(.{ .discard_epoch = .initial }, &protected);
+    _ = try server.applyEvent(.{ .discard_epoch = .initial }, &protected);
+    try testing.expectError(error.UnsupportedRecordEpoch, client.sealHandshake(.initial, "too late", &protected));
+    try testing.expectError(error.UnsupportedRecordEpoch, server.openHandshake(.initial, client_hello_record, &plaintext));
+
     const encrypted_finished = (try client.applyEvent(.{ .handshake_bytes = .{ .epoch = .handshake, .data = "client finished" } }, &protected)).?;
     const encrypted_finished_record = try parseSingleRecord(.ciphertext, encrypted_finished);
     const opened_finished = try server.openHandshake(.handshake, encrypted_finished_record, &plaintext);
@@ -402,10 +434,13 @@ test "record epoch bridge rejects early, duplicate, missing, and unsupported tra
     try testing.expectError(error.HandshakeNotComplete, bridge.sealApplicationData("data", &protected));
     try testing.expectError(error.UnsupportedRecordEpoch, bridge.installTrafficSecret(.initial, .write, &hs));
     try testing.expectError(error.InvalidEpochTransition, bridge.installTrafficSecret(.application, .write, &app));
+    try testing.expectError(error.EpochDiscardTooEarly, bridge.discardEpoch(.initial));
+    try testing.expectError(error.UnsupportedRecordEpoch, bridge.discardEpoch(.zero_rtt));
 
     try bridge.installTrafficSecret(.handshake, .write, &hs);
     try testing.expectError(error.InvalidEpochTransition, bridge.installTrafficSecret(.handshake, .write, &hs));
     try testing.expectError(error.InvalidEpochTransition, bridge.markHandshakeComplete());
+    try testing.expectError(error.EpochDiscardTooEarly, bridge.discardEpoch(.handshake));
 
     try bridge.installTrafficSecret(.application, .write, &app);
     try testing.expectError(error.InvalidEpochTransition, bridge.markHandshakeComplete());
@@ -418,19 +453,85 @@ test "record epoch bridge discards prior epoch keys and fails closed after disca
 
     const hs_read = secret(0x61);
     const hs_write = secret(0x62);
+    const app_read = secret(0x63);
+    const app_write = secret(0x64);
     try bridge.installTrafficSecret(.handshake, .read, &hs_read);
     try bridge.installTrafficSecret(.handshake, .write, &hs_write);
     try testing.expect(bridge.hasReadKeys(.handshake));
     try testing.expect(bridge.hasWriteKeys(.handshake));
 
-    bridge.discardEpoch(.handshake);
+    // The handshake epoch cannot be discarded until both directions have
+    // moved on to application keys.
+    try testing.expectError(error.EpochDiscardTooEarly, bridge.discardEpoch(.handshake));
+
+    try bridge.installTrafficSecret(.application, .read, &app_read);
+    try bridge.installTrafficSecret(.application, .write, &app_write);
+
+    try bridge.discardEpoch(.handshake);
     try testing.expect(!bridge.hasReadKeys(.handshake));
     try testing.expect(!bridge.hasWriteKeys(.handshake));
+    try testing.expectError(error.EpochAlreadyDiscarded, bridge.discardEpoch(.handshake));
 
     var protected: [record_codec.max_ciphertext_record_len]u8 = undefined;
     try testing.expectError(error.MissingWriteKeys, bridge.sealHandshake(.handshake, "late finished", &protected));
     try testing.expectError(error.InvalidEpochTransition, bridge.installTrafficSecret(.handshake, .write, &hs_write));
     try testing.expectError(error.InvalidEpochTransition, bridge.installTrafficSecret(.application, .write, &hs_write));
+}
+
+test "record epoch bridge treats the initial epoch as a validated one-way transition" {
+    const cp = testProvider();
+    var bridge = Bridge.init(cp, .tls_aes_128_gcm_sha256);
+    defer bridge.deinit();
+
+    const hs = secret(0x65);
+    try testing.expectError(error.EpochDiscardTooEarly, bridge.discardEpoch(.initial));
+
+    try bridge.installTrafficSecret(.handshake, .read, &hs);
+    try bridge.installTrafficSecret(.handshake, .write, &hs);
+    try bridge.discardEpoch(.initial);
+    try testing.expectError(error.EpochAlreadyDiscarded, bridge.discardEpoch(.initial));
+
+    var protected: [record_codec.max_ciphertext_record_len]u8 = undefined;
+    var plaintext: [record_codec.max_ciphertext_fragment_len]u8 = undefined;
+    try testing.expectError(error.UnsupportedRecordEpoch, bridge.sealHandshake(.initial, "too late", &protected));
+    try testing.expectError(error.UnsupportedRecordEpoch, bridge.openHandshake(.initial, .{
+        .content_type = .handshake,
+        .legacy_version = 0x0303,
+        .payload = "late client hello",
+    }, &plaintext));
+}
+
+test "record epoch bridge requires the initial epoch to be discarded before completion" {
+    const cp = testProvider();
+    var bridge = Bridge.init(cp, .tls_aes_128_gcm_sha256);
+    defer bridge.deinit();
+
+    const hs = secret(0x66);
+    const app = secret(0x67);
+    try bridge.installTrafficSecret(.handshake, .read, &hs);
+    try bridge.installTrafficSecret(.handshake, .write, &hs);
+    try bridge.installTrafficSecret(.application, .read, &app);
+    try bridge.installTrafficSecret(.application, .write, &app);
+
+    try testing.expectError(error.InvalidEpochTransition, bridge.markHandshakeComplete());
+
+    try bridge.discardEpoch(.initial);
+    try bridge.markHandshakeComplete();
+}
+
+test "record epoch bridge deinit wipes secrets even when no epoch was ever discarded" {
+    const cp = testProvider();
+    var bridge = Bridge.init(cp, .tls_aes_128_gcm_sha256);
+
+    const hs = secret(0x68);
+    try bridge.installTrafficSecret(.handshake, .read, &hs);
+    try bridge.installTrafficSecret(.handshake, .write, &hs);
+    try testing.expect(bridge.hasReadKeys(.handshake));
+    try testing.expect(bridge.hasWriteKeys(.handshake));
+
+    bridge.deinit();
+    try testing.expect(!bridge.hasReadKeys(.handshake));
+    try testing.expect(!bridge.hasWriteKeys(.handshake));
 }
 
 test "record epoch bridge rejects wrong content at otherwise valid epochs" {
@@ -452,6 +553,8 @@ test "record epoch bridge rejects wrong content at otherwise valid epochs" {
     try client.installTrafficSecret(.application, .read, &server_app);
     try server.installTrafficSecret(.application, .read, &client_app);
     try server.installTrafficSecret(.application, .write, &server_app);
+    try client.discardEpoch(.initial);
+    try server.discardEpoch(.initial);
     try client.markHandshakeComplete();
     try server.markHandshakeComplete();
 
@@ -494,6 +597,7 @@ test "record epoch bridge shuttles protocol-neutral driver events through record
                         try sink.emitHandshakeBytes(.initial, "server hello");
                         try sink.emitSecret(.handshake, .read, &self.client_hs);
                         try sink.emitSecret(.handshake, .write, &self.server_hs);
+                        try sink.emitDiscardEpoch(.initial);
                         try sink.emitHandshakeBytes(.handshake, "server finished");
                     } else if (epoch == .handshake and std.mem.eql(u8, bytes, "client finished")) {
                         try sink.emitSecret(.application, .read, &self.client_app);
@@ -508,6 +612,7 @@ test "record epoch bridge shuttles protocol-neutral driver events through record
                     if (epoch == .initial and std.mem.eql(u8, bytes, "server hello")) {
                         try sink.emitSecret(.handshake, .write, &self.client_hs);
                         try sink.emitSecret(.handshake, .read, &self.server_hs);
+                        try sink.emitDiscardEpoch(.initial);
                     } else if (epoch == .handshake and std.mem.eql(u8, bytes, "server finished")) {
                         try sink.emitSecret(.application, .write, &self.client_app);
                         try sink.emitSecret(.application, .read, &self.server_app);

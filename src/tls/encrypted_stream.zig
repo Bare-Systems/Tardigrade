@@ -190,6 +190,16 @@ pub const PureZigRecordStream = struct {
         if (self.bridge.applyEvent(event, &record_buf) catch |err| return self.fail(err)) |record| {
             self.outbound_ciphertext.append(record) catch |err| return self.fail(err);
         }
+        // The initial epoch's plaintext parser is only safe to keep once
+        // its keys are gone: nothing should ever arrive at that epoch
+        // again after discard, so drop any partially-buffered state along
+        // with it. Never do this for `.handshake` discard: the ciphertext
+        // parser is shared across the handshake and application epochs,
+        // and bytes already buffered there may belong to the next
+        // (application) record.
+        if (event == .discard_epoch and event.discard_epoch == .initial) {
+            self.initial_parser.reset();
+        }
         if (event == .handshake_complete) self.lifecycle = .open;
     }
 
@@ -597,6 +607,8 @@ fn establish(client: *PureZigRecordStream, server: *PureZigRecordStream) !void {
     try client.applyEvent(.{ .traffic_secret = .{ .epoch = .application, .direction = .read, .data = &server_app } });
     try server.applyEvent(.{ .traffic_secret = .{ .epoch = .application, .direction = .read, .data = &client_app } });
     try server.applyEvent(.{ .traffic_secret = .{ .epoch = .application, .direction = .write, .data = &server_app } });
+    try client.applyEvent(.{ .discard_epoch = .initial });
+    try server.applyEvent(.{ .discard_epoch = .initial });
     try client.applyEvent(.handshake_complete);
     try server.applyEvent(.handshake_complete);
 }

@@ -379,6 +379,32 @@ test "parser feedOne reports exact consumption for coalesced records" {
     try testing.expectEqualStrings("two", sink.items[0].payload);
 }
 
+test "parser feedOne against an already-saturated sink consumes nothing" {
+    var parser = Parser.init(.plaintext);
+    var encoded: [32]u8 = undefined;
+    const record = try encodePlaintextRecord(.handshake, "one", &encoded);
+
+    // Simulate a caller that has not yet drained a previous feedOne result:
+    // the sink already holds an item before this call.
+    var sink = RecordSink(1, max_plaintext_fragment_len){};
+    try sink.push(.{ .content_type = .handshake, .legacy_version = legacy_record_version, .payload = "stale" });
+
+    const result = try parser.feedOne(record, &sink);
+    try testing.expectEqual(@as(usize, 0), result.consumed);
+    try testing.expect(result.emitted);
+    // The stale entry is untouched, and none of `record`'s bytes were
+    // absorbed into the parser's internal buffer -- the caller can retry
+    // the exact same slice once the sink is drained.
+    try testing.expectEqualStrings("stale", sink.items[0].payload);
+    try testing.expectEqual(@as(usize, 0), parser.len);
+
+    sink.reset();
+    const retry = try parser.feedOne(record, &sink);
+    try testing.expectEqual(record.len, retry.consumed);
+    try testing.expect(retry.emitted);
+    try testing.expectEqualStrings("one", sink.items[0].payload);
+}
+
 test "plaintext parser emits multiple coalesced records" {
     var parser = Parser.init(.plaintext);
     var sink = DefaultSink{};

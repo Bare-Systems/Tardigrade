@@ -103,8 +103,12 @@ test "TLS policy capabilities are derived from provider support" {
     try std.testing.expectEqual(policy_mod.CipherSuite.tls_chacha20_poly1305_sha256, tls_caps.cipher_suites[2]);
     try std.testing.expectEqual(@as(usize, 1), tls_caps.named_groups_len);
     try std.testing.expectEqual(policy_mod.NamedGroup.x25519, tls_caps.named_groups[0]);
-    try std.testing.expectEqual(@as(usize, 1), tls_caps.signature_schemes_len);
+    // Ed25519, ECDSA-P256/SHA-256, and RSA-PSS-RSAE/SHA-256 verification are
+    // all provider-backed since #343.
+    try std.testing.expectEqual(@as(usize, 3), tls_caps.signature_schemes_len);
     try std.testing.expectEqual(policy_mod.SignatureScheme.ed25519, tls_caps.signature_schemes[0]);
+    try std.testing.expectEqual(policy_mod.SignatureScheme.ecdsa_secp256r1_sha256, tls_caps.signature_schemes[1]);
+    try std.testing.expectEqual(policy_mod.SignatureScheme.rsa_pss_rsae_sha256, tls_caps.signature_schemes[2]);
 }
 
 test "hand-written TLS policy capabilities are rejected when provider cannot support them" {
@@ -112,12 +116,12 @@ test "hand-written TLS policy capabilities are rejected when provider cannot sup
     const derived = fromProvider(caps);
     try validateAgainstProvider(caps, derived.asPolicyCapabilities());
 
+    // The secp256r1 ECDH group is still provider-deferred (only the signature
+    // scheme over that curve is implemented).
     const bad_groups = [_]policy_mod.NamedGroup{.secp256r1};
     try std.testing.expectError(error.UnsupportedCapability, validateAgainstProvider(caps, .{ .named_groups = &bad_groups }));
 
-    const bad_signatures = [_]policy_mod.SignatureScheme{.ecdsa_secp256r1_sha256};
-    try std.testing.expectError(error.UnsupportedCapability, validateAgainstProvider(caps, .{ .signature_schemes = &bad_signatures }));
-
+    // RSA PKCS#1 v1.5 remains unsupported (RSA-PSS is the supported RSA scheme).
     const bad_rsa = [_]policy_mod.SignatureScheme{.rsa_pkcs1_sha256};
     try std.testing.expectError(error.UnsupportedCapability, validateAgainstProvider(caps, .{ .signature_schemes = &bad_rsa }));
 }

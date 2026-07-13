@@ -332,12 +332,14 @@ pub fn build(b: *std.Build) void {
     const h3_interop_step = b.step("build-h3-interop", "Build the native HTTP/3 interop client/server tool");
     h3_interop_step.dependOn(&h3_interop_install.step);
 
-    // Pure-Zig PKI DER foundation (#339): no system libraries.
+    // Pure-Zig PKI foundation (#339): no system libraries. Consumes the
+    // crypto-provider seam for certificate signature verification (#343).
     const pki_mod = b.createModule(.{
         .root_source_file = b.path("src/pki/root.zig"),
         .target = target,
         .optimize = optimize,
     });
+    pki_mod.addImport("crypto", crypto_mod);
     const pki_tests = b.addTest(.{ .root_module = pki_mod });
     const run_pki_tests = b.addRunArtifact(pki_tests);
     const pki_step = b.step("test-pki", "Run pure-Zig PKI DER unit tests");

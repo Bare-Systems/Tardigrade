@@ -53,6 +53,27 @@ pub const InnerPlaintext = struct {
 
 pub const TLSInnerPlaintext = InnerPlaintext;
 
+/// Legacy record-version acceptance policy for one header parse.
+///
+/// RFC 8446 SS5.1: `legacy_record_version` MUST be `0x0303` for every record a
+/// TLS 1.3 implementation sends or expects, *except* an initial ClientHello
+/// (one not generated after a HelloRetryRequest), which MAY use `0x0301` for
+/// middlebox compatibility. `record_codec` never inspects handshake message
+/// types, so it cannot itself recognize "this is a ClientHello" — the caller,
+/// which knows its own role and which parser instance owns the initial epoch,
+/// supplies this policy per parse.
+pub const VersionPolicy = enum {
+    /// Only `0x0303` is accepted. Used for every record after the first, and
+    /// for any parser that never legitimately sees the compatibility version
+    /// (a client's view of the server's records, and every ciphertext record).
+    strict,
+    /// `0x0301` or `0x0303` is accepted. Scoped by the caller to exactly the
+    /// first record a server-role initial-epoch parser observes.
+    allow_initial_client_hello_compat,
+};
+
+const compat_client_hello_version: u16 = 0x0301;
+
 pub fn RecordSink(comptime max_record_count: usize, comptime max_payload_bytes: usize) type {
     return struct {
         items: [max_record_count]Record = undefined,
@@ -93,13 +114,27 @@ pub const Parser = struct {
     mode: RecordMode,
     pending: [max_ciphertext_record_len]u8 = undefined,
     len: usize = 0,
+    /// Policy applied only to the very first record this parser instance
+    /// successfully consumes; every subsequent record is `.strict` regardless
+    /// of this setting. See `VersionPolicy`.
+    first_record_version_policy: VersionPolicy = .strict,
+    parsed_first_record: bool = false,
 
     pub fn init(mode: RecordMode) Parser {
         return .{ .mode = mode };
     }
 
+    /// Construct a parser whose first successfully-consumed record may use
+    /// `policy` instead of the default strict `0x0303`-only acceptance. Only a
+    /// server-role parser dedicated to the initial (plaintext) epoch should
+    /// pass `.allow_initial_client_hello_compat`.
+    pub fn initWithVersionPolicy(mode: RecordMode, policy: VersionPolicy) Parser {
+        return .{ .mode = mode, .first_record_version_policy = policy };
+    }
+
     pub fn reset(self: *Parser) void {
         self.len = 0;
+        self.parsed_first_record = false;
     }
 
     /// Feed arbitrary TCP bytes into the parser. Completed records are copied
@@ -150,7 +185,7 @@ pub const Parser = struct {
 
     fn drain(self: *Parser, sink: anytype) Error!void {
         while (self.len >= header_len) {
-            const header = try parseHeader(self.pending[0..header_len], self.mode);
+            const header = try parseHeader(self.pending[0..header_len], self.mode, self.currentVersionPolicy());
             const record_len = header_len + header.payload_len;
             if (self.len < record_len) return;
             try sink.push(.{
@@ -159,12 +194,13 @@ pub const Parser = struct {
                 .payload = self.pending[header_len..record_len],
             });
             self.discard(record_len);
+            self.parsed_first_record = true;
         }
     }
 
     fn drainOne(self: *Parser, sink: anytype) Error!void {
         if (self.len < header_len) return;
-        const header = try parseHeader(self.pending[0..header_len], self.mode);
+        const header = try parseHeader(self.pending[0..header_len], self.mode, self.currentVersionPolicy());
         const record_len = header_len + header.payload_len;
         if (self.len < record_len) return;
         try sink.push(.{
@@ -173,6 +209,15 @@ pub const Parser = struct {
             .payload = self.pending[header_len..record_len],
         });
         self.discard(record_len);
+        self.parsed_first_record = true;
+    }
+
+    /// The very first record this parser consumes may use its configured
+    /// compatibility policy; every record after that is always `.strict`,
+    /// matching the RFC 8446 SS5.1 scoping to an initial (non-post-HRR)
+    /// ClientHello.
+    fn currentVersionPolicy(self: *const Parser) VersionPolicy {
+        return if (self.parsed_first_record) .strict else self.first_record_version_policy;
     }
 
     fn discard(self: *Parser, count: usize) void {
@@ -188,11 +233,17 @@ pub const RecordHeader = struct {
     payload_len: usize,
 };
 
-pub fn parseHeader(bytes: []const u8, mode: RecordMode) Error!RecordHeader {
+pub fn parseHeader(bytes: []const u8, mode: RecordMode, version_policy: VersionPolicy) Error!RecordHeader {
     if (bytes.len != header_len) return error.TruncatedRecord;
     const content_type = parseContentType(bytes[0]) catch return error.InvalidRecordType;
     const version = std.mem.readInt(u16, bytes[1..3], .big);
-    if (version != legacy_record_version) return error.InvalidRecordVersion;
+    // The compatibility version has no meaning once records are encrypted: a
+    // ciphertext-mode parser always requires exactly 0x0303, regardless of
+    // the caller-supplied policy, so a misconfigured parser instance still
+    // fails closed rather than accepting it on the wrong record stream.
+    const version_ok = version == legacy_record_version or
+        (mode == .plaintext and version_policy == .allow_initial_client_hello_compat and version == compat_client_hello_version);
+    if (!version_ok) return error.InvalidRecordVersion;
     const payload_len: usize = std.mem.readInt(u16, bytes[3..5], .big);
     const max_len: usize = switch (mode) {
         .plaintext => max_plaintext_fragment_len,
@@ -352,6 +403,64 @@ test "record parser rejects oversized and invalid headers deterministically" {
 
     parser.reset();
     try testing.expectError(error.RecordTooLarge, parser.feed(&.{ 22, 3, 3, 0x40, 0x01 }, &sink));
+}
+
+test "strict parser rejects the 0x0301 ClientHello compatibility version by default" {
+    var parser = Parser.init(.plaintext);
+    var sink = DefaultSink{};
+    var encoded: [32]u8 = undefined;
+    const record = try encodePlaintextRecord(.handshake, "client hello", &encoded);
+    var compat_record: [64]u8 = undefined;
+    @memcpy(compat_record[0..record.len], record);
+    compat_record[1] = 0x03;
+    compat_record[2] = 0x01;
+
+    try testing.expectError(error.InvalidRecordVersion, parser.feed(compat_record[0..record.len], &sink));
+}
+
+test "server initial parser accepts 0x0301 only for the first record, then requires 0x0303" {
+    var parser = Parser.initWithVersionPolicy(.plaintext, .allow_initial_client_hello_compat);
+    var sink = DefaultSink{};
+    var encoded: [64]u8 = undefined;
+    const client_hello = try encodePlaintextRecord(.handshake, "client hello", &encoded);
+    var compat_client_hello: [64]u8 = undefined;
+    @memcpy(compat_client_hello[0..client_hello.len], client_hello);
+    compat_client_hello[1] = 0x03;
+    compat_client_hello[2] = 0x01;
+
+    try parser.feed(compat_client_hello[0..client_hello.len], &sink);
+    try testing.expectEqual(@as(usize, 1), sink.len);
+    try testing.expectEqual(@as(u16, 0x0301), sink.items[0].legacy_version);
+    try testing.expectEqualStrings("client hello", sink.items[0].payload);
+
+    // A second post-HRR ClientHello (or any later record) MUST be 0x0303;
+    // the compatibility window closes after the first consumed record.
+    sink.reset();
+    var second_encoded: [64]u8 = undefined;
+    const second_client_hello = try encodePlaintextRecord(.handshake, "second client hello", &second_encoded);
+    var compat_second: [64]u8 = undefined;
+    @memcpy(compat_second[0..second_client_hello.len], second_client_hello);
+    compat_second[1] = 0x03;
+    compat_second[2] = 0x01;
+    try testing.expectError(error.InvalidRecordVersion, parser.feed(compat_second[0..second_client_hello.len], &sink));
+}
+
+test "compat policy still rejects legacy versions other than 0x0301 and 0x0303" {
+    var parser = Parser.initWithVersionPolicy(.plaintext, .allow_initial_client_hello_compat);
+    var sink = DefaultSink{};
+    // 0x0300 (SSLv3) and 0x0302 (TLS 1.1) are not in the permitted set even
+    // during the first-record compatibility window.
+    try testing.expectError(error.InvalidRecordVersion, parser.feed(&.{ 22, 3, 0, 0, 0 }, &sink));
+    parser.reset();
+    try testing.expectError(error.InvalidRecordVersion, parser.feed(&.{ 22, 3, 2, 0, 0 }, &sink));
+}
+
+test "compat policy does not apply to the ciphertext parser" {
+    var parser = Parser.initWithVersionPolicy(.ciphertext, .allow_initial_client_hello_compat);
+    var sink = RecordSink(1, max_ciphertext_fragment_len){};
+    // Even with the compat policy set, a ciphertext-mode header must still be
+    // application_data at 0x0303; 0x0301 has no meaning post-encryption.
+    try testing.expectError(error.InvalidRecordVersion, parser.feed(&.{ 23, 3, 1, 0, 0 }, &sink));
 }
 
 test "ciphertext parser requires application_data envelope and allows TLS 1.3 expansion" {

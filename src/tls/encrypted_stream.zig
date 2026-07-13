@@ -13,6 +13,7 @@ const algorithms = @import("algorithms.zig");
 const events = @import("events.zig");
 const record_codec = @import("record_codec.zig");
 const record_epoch_bridge = @import("record_epoch_bridge.zig");
+const tls_state = @import("state.zig");
 
 const provider = crypto.provider;
 
@@ -140,13 +141,24 @@ pub const PureZigRecordStream = struct {
     close_notify_queued: bool = false,
     failed: ?Error = null,
 
-    pub fn init(crypto_provider: provider.CryptoProvider, cipher_suite: algorithms.CipherSuite) PureZigRecordStream {
-        return .{ .bridge = record_epoch_bridge.Bridge.init(crypto_provider, cipher_suite) };
+    pub fn init(role: tls_state.Role, crypto_provider: provider.CryptoProvider, cipher_suite: algorithms.CipherSuite) PureZigRecordStream {
+        // Only a server's initial-epoch parser may ever legally see the
+        // RFC 8446 SS5.1 ClientHello compatibility version (0x0301), and only
+        // for the first record it consumes; every other parser instance stays
+        // strict. See record_codec.VersionPolicy.
+        const initial_policy: record_codec.VersionPolicy = if (role == .server)
+            .allow_initial_client_hello_compat
+        else
+            .strict;
+        return .{
+            .bridge = record_epoch_bridge.Bridge.init(crypto_provider, cipher_suite),
+            .initial_parser = record_codec.Parser.initWithVersionPolicy(.plaintext, initial_policy),
+        };
     }
 
-    pub fn initWithCarrier(crypto_provider: provider.CryptoProvider, cipher_suite: algorithms.CipherSuite, carrier: Carrier) PureZigRecordStream {
+    pub fn initWithCarrier(role: tls_state.Role, crypto_provider: provider.CryptoProvider, cipher_suite: algorithms.CipherSuite, carrier: Carrier) PureZigRecordStream {
         std.debug.assert(!carrier.owns_handle or carrier.closeFn != null);
-        var stream_state = init(crypto_provider, cipher_suite);
+        var stream_state = init(role, crypto_provider, cipher_suite);
         stream_state.carrier = carrier;
         return stream_state;
     }
@@ -742,9 +754,9 @@ const testing = std.testing;
 
 test "pure Zig encrypted stream carries fragmented handshake and application data" {
     const cp = testProvider();
-    var client = PureZigRecordStream.init(cp, .tls_aes_128_gcm_sha256);
+    var client = PureZigRecordStream.init(.client, cp, .tls_aes_128_gcm_sha256);
     defer client.deinit();
-    var server = PureZigRecordStream.init(cp, .tls_aes_128_gcm_sha256);
+    var server = PureZigRecordStream.init(.server, cp, .tls_aes_128_gcm_sha256);
     defer server.deinit();
 
     try client.applyEvent(.{ .handshake_bytes = .{ .epoch = .initial, .data = "client hello" } });
@@ -783,9 +795,9 @@ test "pure Zig encrypted stream carries fragmented handshake and application dat
 
 test "encrypted stream backpressure is atomic around record protection state" {
     const cp = testProvider();
-    var client = PureZigRecordStream.init(cp, .tls_aes_128_gcm_sha256);
+    var client = PureZigRecordStream.init(.client, cp, .tls_aes_128_gcm_sha256);
     defer client.deinit();
-    var server = PureZigRecordStream.init(cp, .tls_aes_128_gcm_sha256);
+    var server = PureZigRecordStream.init(.server, cp, .tls_aes_128_gcm_sha256);
     defer server.deinit();
     try establish(&client, &server);
 
@@ -807,9 +819,9 @@ test "encrypted stream backpressure is atomic around record protection state" {
 
 test "encrypted stream coalesced record backpressure consumes only retry-safe records" {
     const cp = testProvider();
-    var client = PureZigRecordStream.init(cp, .tls_aes_128_gcm_sha256);
+    var client = PureZigRecordStream.init(.client, cp, .tls_aes_128_gcm_sha256);
     defer client.deinit();
-    var server = PureZigRecordStream.init(cp, .tls_aes_128_gcm_sha256);
+    var server = PureZigRecordStream.init(.server, cp, .tls_aes_128_gcm_sha256);
     defer server.deinit();
     try establish(&client, &server);
 
@@ -831,9 +843,9 @@ test "encrypted stream coalesced record backpressure consumes only retry-safe re
 
 test "encrypted stream callers preserve partial feed suffixes across record boundaries" {
     const cp = testProvider();
-    var client = PureZigRecordStream.init(cp, .tls_aes_128_gcm_sha256);
+    var client = PureZigRecordStream.init(.client, cp, .tls_aes_128_gcm_sha256);
     defer client.deinit();
-    var server = PureZigRecordStream.init(cp, .tls_aes_128_gcm_sha256);
+    var server = PureZigRecordStream.init(.server, cp, .tls_aes_128_gcm_sha256);
     defer server.deinit();
     try establish(&client, &server);
 
@@ -860,9 +872,9 @@ test "pure Zig encrypted stream exchanges application data over nonblocking sock
     defer closeFd(fds[1]);
 
     const cp = testProvider();
-    var client = PureZigRecordStream.init(cp, .tls_aes_128_gcm_sha256);
+    var client = PureZigRecordStream.init(.client, cp, .tls_aes_128_gcm_sha256);
     defer client.deinit();
-    var server = PureZigRecordStream.init(cp, .tls_aes_128_gcm_sha256);
+    var server = PureZigRecordStream.init(.server, cp, .tls_aes_128_gcm_sha256);
     defer server.deinit();
     try establish(&client, &server);
 
@@ -907,9 +919,9 @@ test "encrypted stream drive retains ciphertext across partial carrier writes" {
 
     const cp = testProvider();
     var carrier = MemoryCarrier{};
-    var stream_state = PureZigRecordStream.initWithCarrier(cp, .tls_aes_128_gcm_sha256, carrier.carrier());
+    var stream_state = PureZigRecordStream.initWithCarrier(.client, cp, .tls_aes_128_gcm_sha256, carrier.carrier());
     defer stream_state.deinit();
-    var peer = PureZigRecordStream.init(cp, .tls_aes_128_gcm_sha256);
+    var peer = PureZigRecordStream.init(.server, cp, .tls_aes_128_gcm_sha256);
     defer peer.deinit();
     try establish(&stream_state, &peer);
 
@@ -955,9 +967,9 @@ test "encrypted stream drive routes pre-application carrier records by epoch" {
     };
 
     const cp = testProvider();
-    var client = PureZigRecordStream.init(cp, .tls_aes_128_gcm_sha256);
+    var client = PureZigRecordStream.init(.client, cp, .tls_aes_128_gcm_sha256);
     defer client.deinit();
-    var server = PureZigRecordStream.init(cp, .tls_aes_128_gcm_sha256);
+    var server = PureZigRecordStream.init(.server, cp, .tls_aes_128_gcm_sha256);
     defer server.deinit();
 
     try client.applyEvent(.{ .handshake_bytes = .{ .epoch = .initial, .data = "client hello" } });
@@ -1008,7 +1020,7 @@ test "encrypted stream drive treats zero-length carrier read as EOF" {
 
     const cp = testProvider();
     var carrier = EofCarrier{};
-    var stream_state = PureZigRecordStream.initWithCarrier(cp, .tls_aes_128_gcm_sha256, carrier.carrier());
+    var stream_state = PureZigRecordStream.initWithCarrier(.client, cp, .tls_aes_128_gcm_sha256, carrier.carrier());
     defer stream_state.deinit();
 
     const result = try stream_state.stream().drive();
@@ -1049,9 +1061,9 @@ test "encrypted stream close sends close_notify before closing owned carrier" {
 
     const cp = testProvider();
     var carrier = ClosingCarrier{};
-    var stream_state = PureZigRecordStream.initWithCarrier(cp, .tls_aes_128_gcm_sha256, carrier.carrier());
+    var stream_state = PureZigRecordStream.initWithCarrier(.client, cp, .tls_aes_128_gcm_sha256, carrier.carrier());
     defer stream_state.deinit();
-    var peer = PureZigRecordStream.init(cp, .tls_aes_128_gcm_sha256);
+    var peer = PureZigRecordStream.init(.server, cp, .tls_aes_128_gcm_sha256);
     defer peer.deinit();
     try establish(&stream_state, &peer);
 
@@ -1093,7 +1105,7 @@ test "encrypted stream close during handshake releases owned carrier once" {
 
     const cp = testProvider();
     var carrier = CountingCarrier{};
-    var stream_state = PureZigRecordStream.initWithCarrier(cp, .tls_aes_128_gcm_sha256, carrier.carrier());
+    var stream_state = PureZigRecordStream.initWithCarrier(.client, cp, .tls_aes_128_gcm_sha256, carrier.carrier());
 
     stream_state.stream().close();
     const result = try stream_state.stream().drive();
@@ -1129,7 +1141,7 @@ test "encrypted stream close during handshake drops queued output before closing
 
     const cp = testProvider();
     var carrier = BlockingCarrier{};
-    var stream_state = PureZigRecordStream.initWithCarrier(cp, .tls_aes_128_gcm_sha256, carrier.carrier());
+    var stream_state = PureZigRecordStream.initWithCarrier(.client, cp, .tls_aes_128_gcm_sha256, carrier.carrier());
 
     try stream_state.applyEvent(.{ .handshake_bytes = .{ .epoch = .initial, .data = "queued client hello" } });
     try testing.expect(stream_state.queuedCiphertextLen() > 0);
@@ -1172,7 +1184,7 @@ test "encrypted stream close during handshake does not write queued output" {
 
     const cp = testProvider();
     var carrier = WritableCarrier{};
-    var stream_state = PureZigRecordStream.initWithCarrier(cp, .tls_aes_128_gcm_sha256, carrier.carrier());
+    var stream_state = PureZigRecordStream.initWithCarrier(.client, cp, .tls_aes_128_gcm_sha256, carrier.carrier());
 
     try stream_state.applyEvent(.{ .handshake_bytes = .{ .epoch = .initial, .data = "queued client hello" } });
     try testing.expect(stream_state.queuedCiphertextLen() > 0);
@@ -1220,9 +1232,9 @@ test "encrypted stream close flushes queued app data before close_notify" {
     const cp = testProvider();
     inline for (.{ record_codec.max_ciphertext_record_len, 3 }) |max_write| {
         var carrier = ClosingCarrier{ .max_write = max_write };
-        var stream_state = PureZigRecordStream.initWithCarrier(cp, .tls_aes_128_gcm_sha256, carrier.carrier());
+        var stream_state = PureZigRecordStream.initWithCarrier(.client, cp, .tls_aes_128_gcm_sha256, carrier.carrier());
         defer stream_state.deinit();
-        var peer = PureZigRecordStream.init(cp, .tls_aes_128_gcm_sha256);
+        var peer = PureZigRecordStream.init(.server, cp, .tls_aes_128_gcm_sha256);
         defer peer.deinit();
         try establish(&stream_state, &peer);
 
@@ -1245,9 +1257,9 @@ test "encrypted stream close flushes queued app data before close_notify" {
 
 test "encrypted stream manual close drains one close_notify and becomes closed" {
     const cp = testProvider();
-    var client = PureZigRecordStream.init(cp, .tls_aes_128_gcm_sha256);
+    var client = PureZigRecordStream.init(.client, cp, .tls_aes_128_gcm_sha256);
     defer client.deinit();
-    var server = PureZigRecordStream.init(cp, .tls_aes_128_gcm_sha256);
+    var server = PureZigRecordStream.init(.server, cp, .tls_aes_128_gcm_sha256);
     defer server.deinit();
     try establish(&client, &server);
 
@@ -1291,7 +1303,7 @@ test "encrypted stream fatal parser errors latch and close owned carrier" {
 
     const cp = testProvider();
     var carrier = ClosingCarrier{};
-    var stream_state = PureZigRecordStream.initWithCarrier(cp, .tls_aes_128_gcm_sha256, carrier.carrier());
+    var stream_state = PureZigRecordStream.initWithCarrier(.client, cp, .tls_aes_128_gcm_sha256, carrier.carrier());
     defer stream_state.deinit();
 
     try testing.expectError(error.InvalidRecordType, stream_state.feedCiphertext(&.{ 0xff, 0x03, 0x03, 0x00, 0x00 }));
@@ -1307,9 +1319,9 @@ test "encrypted stream fatal parser errors latch and close owned carrier" {
 
 test "encrypted stream fatal failure clears queued handshake and ciphertext helpers" {
     const cp = testProvider();
-    var client = PureZigRecordStream.init(cp, .tls_aes_128_gcm_sha256);
+    var client = PureZigRecordStream.init(.client, cp, .tls_aes_128_gcm_sha256);
     defer client.deinit();
-    var server = PureZigRecordStream.init(cp, .tls_aes_128_gcm_sha256);
+    var server = PureZigRecordStream.init(.server, cp, .tls_aes_128_gcm_sha256);
     defer server.deinit();
 
     try client.applyEvent(.{ .handshake_bytes = .{ .epoch = .initial, .data = "queued hello" } });
@@ -1351,9 +1363,9 @@ test "encrypted stream authentication failures latch and close owned carrier" {
     };
 
     const cp = testProvider();
-    var client = PureZigRecordStream.init(cp, .tls_aes_128_gcm_sha256);
+    var client = PureZigRecordStream.init(.client, cp, .tls_aes_128_gcm_sha256);
     defer client.deinit();
-    var server = PureZigRecordStream.init(cp, .tls_aes_128_gcm_sha256);
+    var server = PureZigRecordStream.init(.server, cp, .tls_aes_128_gcm_sha256);
     defer server.deinit();
     try establish(&client, &server);
 
@@ -1372,7 +1384,7 @@ test "encrypted stream authentication failures latch and close owned carrier" {
 
 test "encrypted stream reports would-block and stable readiness without busy-loop progress" {
     const cp = testProvider();
-    var stream_state = PureZigRecordStream.init(cp, .tls_aes_128_gcm_sha256);
+    var stream_state = PureZigRecordStream.init(.client, cp, .tls_aes_128_gcm_sha256);
     defer stream_state.deinit();
     const stream = stream_state.stream();
 
@@ -1465,8 +1477,40 @@ test "encrypted stream interface accepts vtable-shaped and pure-Zig backends" {
     try testing.expect(!streams[0].readiness().can_write_plaintext);
 
     const cp = testProvider();
-    var native = PureZigRecordStream.init(cp, .tls_aes_128_gcm_sha256);
+    var native = PureZigRecordStream.init(.client, cp, .tls_aes_128_gcm_sha256);
     defer native.deinit();
     streams[0] = native.stream();
     try testing.expectEqual(BackendKind.pure_zig_record, streams[0].backend());
+}
+
+test "server-role stream accepts the 0x0301 ClientHello compatibility version once, client-role does not" {
+    const cp = testProvider();
+
+    var server = PureZigRecordStream.init(.server, cp, .tls_aes_128_gcm_sha256);
+    defer server.deinit();
+    var compat_client_hello: [64]u8 = undefined;
+    const record = try record_codec.encodePlaintextRecord(.handshake, "client hello", &compat_client_hello);
+    compat_client_hello[1] = 0x03;
+    compat_client_hello[2] = 0x01;
+    const consumed = try server.feedHandshakeCiphertext(.initial, compat_client_hello[0..record.len]);
+    try testing.expectEqual(record.len, consumed);
+    var out: [32]u8 = undefined;
+    const n = try server.readHandshake(&out);
+    try testing.expectEqualStrings("client hello", out[0..n]);
+
+    // A second plaintext record on the same server stream must be strict.
+    var strict_record: [64]u8 = undefined;
+    const second = try record_codec.encodePlaintextRecord(.handshake, "second", &strict_record);
+    strict_record[1] = 0x03;
+    strict_record[2] = 0x01;
+    try testing.expectError(error.InvalidRecordVersion, server.feedHandshakeCiphertext(.initial, strict_record[0..second.len]));
+
+    // A client-role stream never accepts 0x0301, including on its first record.
+    var client = PureZigRecordStream.init(.client, cp, .tls_aes_128_gcm_sha256);
+    defer client.deinit();
+    var compat_server_hello: [64]u8 = undefined;
+    const third = try record_codec.encodePlaintextRecord(.handshake, "server hello", &compat_server_hello);
+    compat_server_hello[1] = 0x03;
+    compat_server_hello[2] = 0x01;
+    try testing.expectError(error.InvalidRecordVersion, client.feedHandshakeCiphertext(.initial, compat_server_hello[0..third.len]));
 }

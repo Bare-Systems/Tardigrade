@@ -189,7 +189,7 @@ fn nonceFor(iv: []const u8, sequence: u64) [provider.aead_nonce_len]u8 {
 
 fn parsedCiphertext(bytes: []const u8) !record_codec.TLSCiphertext {
     if (bytes.len < record_codec.header_len) return error.TruncatedRecord;
-    const header = try record_codec.parseHeader(bytes[0..record_codec.header_len], .ciphertext);
+    const header = try record_codec.parseHeader(bytes[0..record_codec.header_len], .ciphertext, .strict);
     const record_len = record_codec.header_len + header.payload_len;
     if (bytes.len != record_len) return error.TruncatedRecord;
     return .{

@@ -297,7 +297,7 @@ fn clearWrite(slot: *?record_protection.WriteState) void {
 
 fn parseSingleRecord(mode: record_codec.RecordMode, bytes: []const u8) Error!record_codec.Record {
     if (bytes.len < record_codec.header_len) return error.TruncatedRecord;
-    const header = try record_codec.parseHeader(bytes[0..record_codec.header_len], mode);
+    const header = try record_codec.parseHeader(bytes[0..record_codec.header_len], mode, .strict);
     const record_len = record_codec.header_len + header.payload_len;
     if (bytes.len != record_len) return error.TruncatedRecord;
     return .{

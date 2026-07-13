@@ -80,7 +80,7 @@ test "RSA-PSS is classified but deferred, so it fails closed" {
     try testing.expectError(error.UnsupportedSignatureAlgorithm, verify.verifySelfSignature(cp, &rp.cert));
 }
 
-test "the three supported schemes classify to the right key types" {
+test "the three matrix schemes classify to the right key types" {
     const allocator = testing.allocator;
 
     var ed = try Loaded.init(allocator, ed25519_crt);

@@ -279,22 +279,21 @@ pub fn validatePssSha256(algorithm: *const x509.AlgorithmIdentifier) Error!void 
     if (seq.remaining() > 0) return error.UnsupportedSignatureAlgorithm;
 }
 
-/// A child reader over an `AlgorithmIdentifier` SEQUENCE element's content.
-/// `elem.encoded` is a complete TLV, so re-reading it as a sequence descends
-/// into its fields without depending on the parent buffer's offsets.
-fn algorithmIdentifierFields(elem: der.Element) Error!der.Reader {
-    if (!elem.tag.eql(der.Tag.universal(@intFromEnum(der.UniversalTag.sequence), true))) {
-        return error.MalformedSignature;
-    }
-    var outer = der.Reader.init(elem.encoded, .{});
-    const fields = outer.readSequence() catch return error.MalformedSignature;
-    return fields;
+fn isAlgorithmIdentifier(elem: der.Element) bool {
+    return elem.tag.eql(der.Tag.universal(@intFromEnum(der.UniversalTag.sequence), true));
 }
 
 /// Verify that `elem` is an `AlgorithmIdentifier` SEQUENCE whose OID matches
 /// `expected` and whose parameters are absent or explicit NULL.
+///
+/// The parent reader (`outer`) is a named local so the child reader it yields
+/// — which shares the parent's element counter by pointer — cannot outlive the
+/// backing storage. `elem.encoded` is a complete TLV, so re-reading it as a
+/// sequence descends into its fields without depending on the caller's offsets.
 fn expectAlgorithmOid(elem: der.Element, expected: []const u32) Error!void {
-    var inner = try algorithmIdentifierFields(elem);
+    if (!isAlgorithmIdentifier(elem)) return error.MalformedSignature;
+    var outer = der.Reader.init(elem.encoded, .{});
+    var inner = outer.readSequence() catch return error.MalformedSignature;
     const alg_oid = inner.readObjectIdentifier() catch return error.MalformedSignature;
     if (!alg_oid.eqlComponents(expected)) return error.UnsupportedSignatureAlgorithm;
     // Optional parameters: only absent or NULL are acceptable for these hashes.
@@ -306,7 +305,9 @@ fn expectAlgorithmOid(elem: der.Element, expected: []const u32) Error!void {
 
 /// Verify `elem` is `AlgorithmIdentifier` = { mgf1, AlgorithmIdentifier{ sha256 } }.
 fn expectMgf1Sha256(elem: der.Element) Error!void {
-    var inner = try algorithmIdentifierFields(elem);
+    if (!isAlgorithmIdentifier(elem)) return error.MalformedSignature;
+    var outer = der.Reader.init(elem.encoded, .{});
+    var inner = outer.readSequence() catch return error.MalformedSignature;
     const mgf_oid = inner.readObjectIdentifier() catch return error.MalformedSignature;
     if (!mgf_oid.eqlComponents(&oid_mgf1)) return error.UnsupportedSignatureAlgorithm;
     // MGF1's parameter is the underlying hash AlgorithmIdentifier.

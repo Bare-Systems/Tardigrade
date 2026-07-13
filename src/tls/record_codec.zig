@@ -114,6 +114,29 @@ pub const Parser = struct {
         }
     }
 
+    pub const FeedOneResult = struct {
+        consumed: usize,
+        emitted: bool,
+    };
+
+    /// Feed bytes until at most one complete record is emitted. The returned
+    /// `consumed` count is exact, so callers can retain `bytes[consumed..]`
+    /// without replaying or dropping carrier input.
+    pub fn feedOne(self: *Parser, bytes: []const u8, sink: anytype) Error!FeedOneResult {
+        try self.drainOne(sink);
+        if (sink.len > 0) return .{ .consumed = 0, .emitted = true };
+
+        var consumed: usize = 0;
+        while (consumed < bytes.len and sink.len == 0) {
+            if (self.len == self.pending.len) return error.RecordBufferOverflow;
+            self.pending[self.len] = bytes[consumed];
+            self.len += 1;
+            consumed += 1;
+            try self.drainOne(sink);
+        }
+        return .{ .consumed = consumed, .emitted = sink.len > 0 };
+    }
+
     /// Retry emission of already-buffered complete records after the caller has
     /// made room in `sink`. This supports bounded sink/backpressure loops
     /// without appending unrelated bytes first.
@@ -137,6 +160,19 @@ pub const Parser = struct {
             });
             self.discard(record_len);
         }
+    }
+
+    fn drainOne(self: *Parser, sink: anytype) Error!void {
+        if (self.len < header_len) return;
+        const header = try parseHeader(self.pending[0..header_len], self.mode);
+        const record_len = header_len + header.payload_len;
+        if (self.len < record_len) return;
+        try sink.push(.{
+            .content_type = header.content_type,
+            .legacy_version = header.legacy_version,
+            .payload = self.pending[header_len..record_len],
+        });
+        self.discard(record_len);
     }
 
     fn discard(self: *Parser, count: usize) void {
@@ -266,6 +302,30 @@ test "plaintext parser accepts byte-at-a-time input" {
     try testing.expectEqual(ContentType.alert, sink.items[0].content_type);
     try testing.expectEqualSlices(u8, &.{ 2, 50 }, sink.items[0].payload);
     try parser.finish();
+}
+
+test "parser feedOne reports exact consumption for coalesced records" {
+    var parser = Parser.init(.plaintext);
+    var first_encoded: [32]u8 = undefined;
+    var second_encoded: [32]u8 = undefined;
+    const first = try encodePlaintextRecord(.handshake, "one", &first_encoded);
+    const second = try encodePlaintextRecord(.handshake, "two", &second_encoded);
+
+    var coalesced: [64]u8 = undefined;
+    @memcpy(coalesced[0..first.len], first);
+    @memcpy(coalesced[first.len..][0..second.len], second);
+
+    var sink = RecordSink(1, max_plaintext_fragment_len){};
+    const first_result = try parser.feedOne(coalesced[0 .. first.len + second.len], &sink);
+    try testing.expect(first_result.emitted);
+    try testing.expectEqual(first.len, first_result.consumed);
+    try testing.expectEqualStrings("one", sink.items[0].payload);
+
+    sink.reset();
+    const second_result = try parser.feedOne(coalesced[first_result.consumed .. first.len + second.len], &sink);
+    try testing.expect(second_result.emitted);
+    try testing.expectEqual(second.len, second_result.consumed);
+    try testing.expectEqualStrings("two", sink.items[0].payload);
 }
 
 test "plaintext parser emits multiple coalesced records" {

@@ -249,6 +249,7 @@ pub fn build(b: *std.Build) void {
     });
     crypto_mod.addImport("crypto_secrets", crypto_secrets_mod);
     tls_core_mod.addImport("crypto", crypto_mod);
+    quic_mod.addImport("crypto", crypto_mod);
     const crypto_tests = b.addTest(.{ .root_module = crypto_mod });
     const run_crypto_tests = b.addRunArtifact(crypto_tests);
     const crypto_secret_tests = b.addTest(.{ .root_module = crypto_secrets_mod });

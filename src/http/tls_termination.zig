@@ -23,7 +23,7 @@ extern fn SSL_CTX_set_alpn_select_cb(
 
 const ssl_op_no_ticket: c_ulong = @as(c_ulong, 1) << @as(u6, 14);
 const openssl_npn_negotiated: c_int = 1;
-const openssl_stream_mode: c_long = c.SSL_MODE_ENABLE_PARTIAL_WRITE | c.SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER;
+const openssl_stream_mode: c_long = c.SSL_MODE_ENABLE_PARTIAL_WRITE;
 const embedded_server_crt = @embedFile("testdata/test_server.crt");
 const embedded_server_key = @embedFile("testdata/test_server.key");
 const embedded_alt_server_crt = @embedFile("testdata/test_alt_server.crt");
@@ -333,6 +333,7 @@ pub const TlsConnection = struct {
     ssl: *c.SSL,
     stream_lifecycle: OpenSslStreamLifecycle = .open,
     retry_direction: OpenSslRetryDirection = .none,
+    pending_write: ?OpenSslPendingWrite = null,
     peer_closed: bool = false,
     stream_failure: ?encrypted_stream.Error = null,
 
@@ -429,9 +430,27 @@ const OpenSslRetryDirection = enum {
     write,
 };
 
+const OpenSslPendingWrite = struct {
+    ptr_addr: usize,
+    len: usize,
+
+    fn init(bytes: []const u8) OpenSslPendingWrite {
+        return .{ .ptr_addr = @intFromPtr(bytes.ptr), .len = bytes.len };
+    }
+
+    fn matches(self: OpenSslPendingWrite, bytes: []const u8) bool {
+        return self.ptr_addr == @intFromPtr(bytes.ptr) and self.len == bytes.len;
+    }
+};
+
+fn opensslClearRetry(self: *TlsConnection) void {
+    self.retry_direction = .none;
+    self.pending_write = null;
+}
+
 fn opensslStreamFail(self: *TlsConnection, err: encrypted_stream.Error) encrypted_stream.Error {
     self.stream_lifecycle = .failed;
-    self.retry_direction = .none;
+    opensslClearRetry(self);
     self.stream_failure = err;
     return err;
 }
@@ -448,6 +467,11 @@ fn opensslSetRetry(self: *TlsConnection, ssl_error: c_int) void {
     };
 }
 
+fn opensslSetWriteRetry(self: *TlsConnection, bytes: []const u8, ssl_error: c_int) void {
+    opensslSetRetry(self, ssl_error);
+    self.pending_write = OpenSslPendingWrite.init(bytes);
+}
+
 fn opensslStreamBackend(_: *anyopaque) encrypted_stream.BackendKind {
     return .openssl;
 }
@@ -456,10 +480,11 @@ fn opensslStreamRead(ptr: *anyopaque, out: []u8) encrypted_stream.Error!usize {
     const self: *TlsConnection = @ptrCast(@alignCast(ptr));
     if (self.stream_failure) |err| return err;
     if (self.stream_lifecycle != .open) return error.StreamClosed;
+    if (self.pending_write != null) return error.RetryOperationPending;
     c.ERR_clear_error();
     const rc = c.SSL_read(self.ssl, out.ptr, @intCast(out.len));
     if (rc > 0) {
-        self.retry_direction = .none;
+        opensslClearRetry(self);
         opensslRefreshPeerClosed(self);
         return @intCast(rc);
     }
@@ -470,7 +495,7 @@ fn opensslStreamRead(ptr: *anyopaque, out: []u8) encrypted_stream.Error!usize {
             break :blocked error.WouldBlock;
         },
         c.SSL_ERROR_ZERO_RETURN => eof: {
-            self.retry_direction = .none;
+            opensslClearRetry(self);
             self.peer_closed = true;
             break :eof error.EndOfStream;
         },
@@ -482,22 +507,26 @@ fn opensslStreamWrite(ptr: *anyopaque, bytes: []const u8) encrypted_stream.Error
     const self: *TlsConnection = @ptrCast(@alignCast(ptr));
     if (self.stream_failure) |err| return err;
     if (self.stream_lifecycle != .open or self.peer_closed) return error.StreamClosed;
-    if (bytes.len == 0) return 0;
+    if (self.pending_write) |pending| {
+        if (!pending.matches(bytes)) return error.RetryOperationPending;
+    } else {
+        if (bytes.len == 0) return 0;
+    }
     c.ERR_clear_error();
     const rc = c.SSL_write(self.ssl, bytes.ptr, @intCast(bytes.len));
     if (rc > 0) {
-        self.retry_direction = .none;
+        opensslClearRetry(self);
         opensslRefreshPeerClosed(self);
         return @intCast(rc);
     }
     const ssl_error = c.SSL_get_error(self.ssl, rc);
     return switch (ssl_error) {
         c.SSL_ERROR_WANT_READ, c.SSL_ERROR_WANT_WRITE => blocked: {
-            opensslSetRetry(self, ssl_error);
+            opensslSetWriteRetry(self, bytes, ssl_error);
             break :blocked error.WouldBlock;
         },
         c.SSL_ERROR_ZERO_RETURN => eof: {
-            self.retry_direction = .none;
+            opensslClearRetry(self);
             self.peer_closed = true;
             break :eof error.EndOfStream;
         },
@@ -508,6 +537,7 @@ fn opensslStreamWrite(ptr: *anyopaque, bytes: []const u8) encrypted_stream.Error
 fn opensslAdvanceShutdown(self: *TlsConnection) encrypted_stream.Error!bool {
     if (self.stream_failure) |err| return err;
     if (self.stream_lifecycle == .closed) return false;
+    if (self.pending_write != null) return error.RetryOperationPending;
 
     self.stream_lifecycle = .closing;
     c.ERR_clear_error();
@@ -515,7 +545,7 @@ fn opensslAdvanceShutdown(self: *TlsConnection) encrypted_stream.Error!bool {
     opensslRefreshPeerClosed(self);
     if (rc == 1) {
         self.stream_lifecycle = .closed;
-        self.retry_direction = .none;
+        opensslClearRetry(self);
         return true;
     }
     if (rc == 0) {
@@ -558,6 +588,13 @@ fn opensslStreamReadiness(ptr: *anyopaque) encrypted_stream.Readiness {
         };
     }
     const pending = self.pending();
+    if (self.pending_write != null) {
+        return .{
+            .wants_read = self.retry_direction == .read,
+            .wants_write = self.retry_direction == .write,
+            .peer_closed = self.peer_closed,
+        };
+    }
     return .{
         .wants_read = self.retry_direction == .read or (self.retry_direction == .none and pending == 0 and !self.peer_closed),
         .wants_write = self.retry_direction == .write,
@@ -1237,6 +1274,15 @@ test "openssl encrypted stream preserves write retry direction under socket back
     const blocked_drive = try stream.drive();
     try std.testing.expect(!blocked_drive.made_progress);
     try std.testing.expect(blocked_drive.readiness.wants_write);
+
+    var interleaved_read: [1]u8 = undefined;
+    try std.testing.expectError(error.RetryOperationPending, stream.read(&interleaved_read));
+    const changed_retry = try allocator.dupe(u8, retry_bytes);
+    defer allocator.free(changed_retry);
+    changed_retry[0] +%= 1;
+    try std.testing.expectError(error.RetryOperationPending, stream.write(changed_retry));
+    try std.testing.expect(stream.readiness().wants_write);
+    try std.testing.expect(!stream.readiness().can_write_plaintext);
 
     const target = try allocator.alloc(u8, expected.items.len + retry_bytes.len);
     defer allocator.free(target);

@@ -28,6 +28,7 @@ pub const Error = record_epoch_bridge.Error || error{
     FcntlFailed,
     SocketReadFailed,
     SocketWriteFailed,
+    RetryOperationPending,
 };
 
 const Lifecycle = enum {
@@ -77,6 +78,9 @@ pub const EncryptedStream = struct {
         return self.vtable.readFn(self.ptr, out);
     }
 
+    /// Attempts to write plaintext. After a nonblocking write returns
+    /// `WouldBlock`, backends that depend on same-operation retries may require
+    /// the original write slice to be retried before any other plaintext I/O.
     pub fn write(self: EncryptedStream, bytes: []const u8) Error!usize {
         return self.vtable.writeFn(self.ptr, bytes);
     }

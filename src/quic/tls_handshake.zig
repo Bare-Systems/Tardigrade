@@ -233,6 +233,12 @@ pub const Handshake = struct {
                 },
                 .discard_epoch => |level| self.discardOrDefer(level),
                 .handshake_complete => try self.complete(),
+                // QUIC never emits this: RFC 9001 SS4.8 has the connection
+                // derive its own CRYPTO_ERROR close from the returned
+                // HandshakeError rather than a record-layer alert. The
+                // contract carries the variant so record mode can use it
+                // (#408 finding 1); QUIC's backend does not populate it.
+                .fatal_alert => {},
             }
         }
     }

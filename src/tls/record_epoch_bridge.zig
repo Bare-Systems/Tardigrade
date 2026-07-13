@@ -561,6 +561,10 @@ test "record epoch bridge shuttles protocol-neutral driver events through record
                     .peer_transport_parameters,
                     .alpn,
                     .certificate,
+                    // Whether/when to synthesize one is transport policy
+                    // (#354); this harness only proves the contract can carry
+                    // it, not that record mode acts on it yet.
+                    .fatal_alert,
                     => {},
                 }
             }

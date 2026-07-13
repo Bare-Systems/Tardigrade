@@ -3,9 +3,31 @@
 //! TLS does not own QUIC CRYPTO streams or TCP record buffering here. Callers
 //! instantiate this contract with their own epoch and transport-parameter
 //! payload types, then translate the emitted events into their local framing.
+//!
+//! This is the single canonical handshake transport contract: QUIC's adapter
+//! (`quic/tls_handshake.zig`) and TCP record mode (`record_epoch_bridge.zig`)
+//! both instantiate `Contract`/`ContractWithOptions` directly rather than each
+//! owning a parallel copy of the event/sink/driver machinery (#408 finding 1;
+//! an earlier record-mode-only `record_transport.zig` duplicated this and has
+//! been removed). Ownership rules are narrow and testable:
+//!
+//! - Every byte slice in an emitted event is copied into the driver-owned
+//!   `EventSink`. Slices borrow the sink and remain valid only until the next
+//!   `Driver.start`/`Driver.receive` call, both of which reset the sink.
+//! - `EventSink.reset` and `EventSink.deinit` securely zero the scratch range
+//!   a copied traffic secret occupied, so it does not survive past the event
+//!   lifetime above. `Driver.deinit` calls the latter; every owner of a
+//!   `Driver` must call it exactly once at teardown.
+//! - Event emission is atomic: a rejected emit (event-count or byte overflow)
+//!   never leaves a partial payload in scratch or a phantom event in `items`.
+//! - The contract can carry terminal alert output (`Event.fatal_alert`) so a
+//!   transport can serialize a fatal alert before closing, but deciding *when*
+//!   to synthesize one from a handshake failure is transport policy, not
+//!   defined here (record mode's alert/`close_notify` policy is #354).
 
 const std = @import("std");
 const crypto_secrets = @import("crypto_secrets");
+const alerts = @import("alerts.zig");
 const events = @import("events.zig");
 const state = @import("state.zig");
 
@@ -52,6 +74,11 @@ pub fn ContractWithOptions(
             discard_epoch: Epoch,
             /// The handshake authenticated and completed on this side.
             handshake_complete,
+            /// A fatal alert the transport must send before closing. Whether
+            /// and when to emit one from a handshake error is transport
+            /// policy (record mode's is #354); this variant only lets the
+            /// contract carry it once a caller decides to.
+            fatal_alert: alerts.AlertDescription,
         };
 
         pub const EventSink = struct {
@@ -168,6 +195,18 @@ pub fn ContractWithOptions(
             pub fn emitHandshakeComplete(self: *EventSink) ErrorSet!void {
                 try self.reserve(0);
                 self.pushUnchecked(.handshake_complete);
+            }
+
+            pub fn emitFatalAlert(self: *EventSink, alert: alerts.AlertDescription) ErrorSet!void {
+                try self.reserve(0);
+                self.pushUnchecked(.{ .fatal_alert = alert });
+            }
+
+            pub fn hasFatalAlert(self: *const EventSink) bool {
+                for (self.items[0..self.len]) |event| {
+                    if (event == .fatal_alert) return true;
+                }
+                return false;
             }
         };
 
@@ -305,4 +344,17 @@ test "non-byte-bearing events also fail atomically on a full event array" {
     try std.testing.expectError(error.TransportBufferOverflow, sink.emitDiscardEpoch(.handshake));
     try std.testing.expectEqual(@as(usize, 1), sink.len);
     try std.testing.expectEqual(T.Event.handshake_complete, sink.items[0]);
+}
+
+test "the canonical contract carries terminal alert output" {
+    const ErrorSet = error{TransportBufferOverflow};
+    const Epoch = enum { initial };
+    const T = Contract(void, Epoch, ErrorSet);
+
+    var sink = T.EventSink{};
+    try std.testing.expect(!sink.hasFatalAlert());
+    try sink.emitHandshakeBytes(.initial, "partial flight before failure");
+    try sink.emitFatalAlert(alerts.fromHandshakeError(error.UnexpectedHandshakeMessage));
+    try std.testing.expect(sink.hasFatalAlert());
+    try std.testing.expectEqual(alerts.AlertDescription.unexpected_message, sink.items[1].fatal_alert);
 }

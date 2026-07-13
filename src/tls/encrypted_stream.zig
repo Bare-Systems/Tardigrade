@@ -609,6 +609,8 @@ fn establish(client: *PureZigRecordStream, server: *PureZigRecordStream) !void {
     try server.applyEvent(.{ .traffic_secret = .{ .epoch = .application, .direction = .write, .data = &server_app } });
     try client.applyEvent(.{ .discard_epoch = .initial });
     try server.applyEvent(.{ .discard_epoch = .initial });
+    try client.applyEvent(.{ .discard_epoch = .handshake });
+    try server.applyEvent(.{ .discard_epoch = .handshake });
     try client.applyEvent(.handshake_complete);
     try server.applyEvent(.handshake_complete);
 }
@@ -1501,14 +1503,14 @@ test "server-role stream accepts the 0x0301 ClientHello compatibility version on
     var server = PureZigRecordStream.init(.server, cp, .tls_aes_128_gcm_sha256);
     defer server.deinit();
     var compat_client_hello: [64]u8 = undefined;
-    const record = try record_codec.encodePlaintextRecord(.handshake, "client hello", &compat_client_hello);
+    const record = try record_codec.encodePlaintextRecord(.handshake, "\x01client hello", &compat_client_hello);
     compat_client_hello[1] = 0x03;
     compat_client_hello[2] = 0x01;
     const consumed = try server.feedHandshakeCiphertext(.initial, compat_client_hello[0..record.len]);
     try testing.expectEqual(record.len, consumed);
     var out: [32]u8 = undefined;
     const n = try server.readHandshake(&out);
-    try testing.expectEqualStrings("client hello", out[0..n]);
+    try testing.expectEqualStrings("\x01client hello", out[0..n]);
 
     // A second plaintext record on the same server stream must be strict.
     var strict_record: [64]u8 = undefined;

@@ -104,6 +104,15 @@ fn parseSingleRecord(mode: record_codec.RecordMode, bytes: []const u8) Error!rec
     };
 }
 
+/// Confirms a Driver's own teardown guarantee (#408 finding 2): after
+/// `deinit()`, the sink reports no used bytes, and every byte that was
+/// copied into scratch before teardown (per `used_before`, captured prior
+/// to calling `deinit()`) has been securely zeroed.
+fn expectDriverSinkWiped(driver: *const tls_handshake.CoreDriver, used_before: usize) !void {
+    try std.testing.expectEqual(@as(usize, 0), driver.sink.used);
+    for (driver.sink.scratch[0..used_before]) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+}
+
 const KeySnapshot = struct {
     key: [crypto.provider.max_aead_key_len]u8 = undefined,
     key_len: usize = 0,
@@ -282,6 +291,9 @@ const Harness = struct {
     client_bridge: Bridge,
     server_bridge: Bridge,
     observed: Observed = .{},
+    /// Guards deinit()'s driver cleanup: client_driver/server_driver start
+    /// as `undefined` and only become valid once `run()` constructs them.
+    drivers_ready: bool = false,
 
     fn init() Harness {
         var client_backend = tls_backend.Tls13Backend.initClient(clientEntropy(), .{ .pinned_certificate = tls_backend.testdata.certificate_der });
@@ -305,6 +317,7 @@ const Harness = struct {
     fn run(self: *Harness) Error!void {
         self.client_driver = tls_handshake.CoreDriver.init(.client, self.client_backend.backend().transport);
         self.server_driver = tls_handshake.CoreDriver.init(.server, self.server_backend.backend().transport);
+        self.drivers_ready = true;
 
         // The server backend only transitions out of its default `.start`
         // expectation once its own driver's `start` runs (it emits no
@@ -319,6 +332,15 @@ const Harness = struct {
     fn deinit(self: *Harness) void {
         self.client_bridge.deinit();
         self.server_bridge.deinit();
+        // The generic Driver's own teardown (#408 finding 2): it wipes
+        // whatever traffic-secret bytes are still copied into its sink from
+        // the final start/receive call. Every Driver owner must call this
+        // exactly once, alongside (not instead of) the Bridge's own
+        // secret wipe -- they own separate scratch buffers.
+        if (self.drivers_ready) {
+            self.client_driver.deinit();
+            self.server_driver.deinit();
+        }
     }
 };
 
@@ -383,12 +405,23 @@ test "a real TLS 1.3 handshake completes end to end through the merged record st
     try std.testing.expectEqualStrings("HTTP/1.1 200 OK\r\n\r\n", opened_response.inner.content);
     try std.testing.expectEqual(@as(u64, 1), h.client_bridge.read_application.?.sequence);
 
-    // Cleanup on success: deinit wipes every remaining key on both sides.
+    // Cleanup on success: deinit wipes every remaining key on both sides,
+    // *and* the drivers' own event sinks. The client driver's last receive
+    // (the server's flight) copied fresh application traffic secrets into
+    // its sink, so its scratch is provably nonempty before teardown; the
+    // server driver's last receive (the client's Finished) only carried
+    // non-byte-bearing discard/complete events, so its scratch may already
+    // be empty -- the post-teardown check still holds either way.
+    const client_driver_used = h.client_driver.sink.used;
+    const server_driver_used = h.server_driver.sink.used;
+    try std.testing.expect(client_driver_used > 0);
     h.deinit();
     try std.testing.expect(!h.client_bridge.hasReadKeys(.application));
     try std.testing.expect(!h.client_bridge.hasWriteKeys(.application));
     try std.testing.expect(!h.server_bridge.hasReadKeys(.application));
     try std.testing.expect(!h.server_bridge.hasWriteKeys(.application));
+    try expectDriverSinkWiped(&h.client_driver, client_driver_used);
+    try expectDriverSinkWiped(&h.server_driver, server_driver_used);
 }
 
 test "a tampered application record fails closed and cleanup still wipes secrets" {
@@ -410,10 +443,16 @@ test "a tampered application record fails closed and cleanup still wipes secrets
     try std.testing.expectError(error.AuthenticationFailed, h.server_bridge.openApplicationData(parsed, &plaintext));
 
     // Fail-closed does not mean fail-dirty: teardown after the failure still
-    // wipes both sides' remaining live key material.
+    // wipes both sides' remaining live key material, including the drivers'
+    // own event sinks.
+    const client_driver_used = h.client_driver.sink.used;
+    const server_driver_used = h.server_driver.sink.used;
+    try std.testing.expect(client_driver_used > 0);
     h.deinit();
     try std.testing.expect(!h.client_bridge.hasReadKeys(.application));
     try std.testing.expect(!h.client_bridge.hasWriteKeys(.application));
     try std.testing.expect(!h.server_bridge.hasReadKeys(.application));
     try std.testing.expect(!h.server_bridge.hasWriteKeys(.application));
+    try expectDriverSinkWiped(&h.client_driver, client_driver_used);
+    try expectDriverSinkWiped(&h.server_driver, server_driver_used);
 }

@@ -441,6 +441,17 @@ pub const Connection = struct {
             .known_streams = std.AutoHashMap(StreamId, void).init(allocator),
             .last_activity_us = options.now_us,
         };
+        // Construct the handshake before `errdefer conn.deinitPartial()` is
+        // installed: deinitPartial() unconditionally calls
+        // `self.handshake.deinit()`, so any fallible operation between the
+        // errdefer and this assignment would otherwise run deinit() against
+        // undefined storage. Handshake.initClient/initServer are plain
+        // constructors (no I/O, no dependency on installed secrets), so
+        // this reordering is free.
+        conn.handshake = switch (options.role) {
+            .client => tls_handshake.Handshake.initClient(&conn.adapter, options.tls),
+            .server => tls_handshake.Handshake.initServer(&conn.adapter, options.tls),
+        };
         errdefer conn.deinitPartial();
 
         // RFC 9000 §7.3 binding: commit our CIDs into the TLS transport
@@ -467,10 +478,6 @@ pub const Connection = struct {
             },
             conn.original_dcid.slice(),
         );
-        conn.handshake = switch (options.role) {
-            .client => tls_handshake.Handshake.initClient(&conn.adapter, options.tls),
-            .server => tls_handshake.Handshake.initServer(&conn.adapter, options.tls),
-        };
         conn.handshake.manual_key_discard = true;
         conn.handshake.allow_unverified_certificate = options.allow_unverified_certificate;
         conn.handshake.start(params) catch |err| {
@@ -2106,6 +2113,27 @@ const TestPair = struct {
         return error.PumpStalled;
     }
 };
+
+test "Connection.init failure before the handshake is assigned does not deinit undefined storage" {
+    const allocator = testing.allocator;
+    // An original_dcid shorter than min_initial_dcid_len makes
+    // installInitialSecrets fail, which used to run before conn.handshake
+    // was assigned -- deinitPartial()'s errdefer would then call
+    // .deinit() on undefined storage. This must fail cleanly instead.
+    const too_short_dcid = [_]u8{0xaa} ** (tls_adapter.min_initial_dcid_len - 1);
+    var backend = tls_backend_mod.Tls13Backend.initClient(
+        .{ .hello_random = [_]u8{0xc1} ** 32, .key_share_seed = [_]u8{0x11} ** 32 },
+        .{ .pinned_certificate = tls_backend_mod.testdata.certificate_der },
+    );
+    try testing.expectError(error.InvalidConnectionId, Connection.init(allocator, .{
+        .role = .client,
+        .local_cid = &TestPair.client_cid,
+        .original_dcid = &too_short_dcid,
+        .peer_cid = &too_short_dcid,
+        .tls = backend.backend(),
+        .now_us = 1_000_000,
+    }));
+}
 
 test "driver: client and server complete the handshake over protected packets" {
     const allocator = testing.allocator;

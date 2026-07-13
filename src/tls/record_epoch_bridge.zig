@@ -149,6 +149,13 @@ pub const Bridge = struct {
             },
             .application => {
                 if (self.application_discarded) return error.EpochAlreadyDiscarded;
+                // Orderly application-epoch discard represents session
+                // teardown after a completed handshake, not abandonment --
+                // that path is `deinit`, which wipes unconditionally
+                // regardless of how far the handshake got.
+                if (!self.handshake_complete or self.read_phase != .complete or self.write_phase != .complete) {
+                    return error.EpochDiscardTooEarly;
+                }
                 clearRead(&self.read_application);
                 clearWrite(&self.write_application);
                 self.application_discarded = true;
@@ -162,7 +169,7 @@ pub const Bridge = struct {
 
     pub fn markHandshakeComplete(self: *Bridge) Error!void {
         if (self.handshake_complete) return error.InvalidEpochTransition;
-        if (!self.initial_discarded) return error.InvalidEpochTransition;
+        if (!self.initial_discarded or !self.handshake_discarded) return error.InvalidEpochTransition;
         if (self.read_phase != .application or self.write_phase != .application) return error.InvalidEpochTransition;
         if (self.read_application == null or self.write_application == null) return error.MissingApplicationKeys;
         self.handshake_complete = true;
@@ -402,6 +409,8 @@ test "record epoch bridge drives event loopback across plaintext, handshake, app
     try testing.expectEqual(@as(?[]const u8, null), try client.applyEvent(.{ .traffic_secret = .{ .epoch = .application, .direction = .read, .data = &server_app } }, &protected));
     try testing.expectEqual(@as(?[]const u8, null), try server.applyEvent(.{ .traffic_secret = .{ .epoch = .application, .direction = .read, .data = &client_app } }, &protected));
     try testing.expectEqual(@as(?[]const u8, null), try server.applyEvent(.{ .traffic_secret = .{ .epoch = .application, .direction = .write, .data = &server_app } }, &protected));
+    _ = try client.applyEvent(.{ .discard_epoch = .handshake }, &protected);
+    _ = try server.applyEvent(.{ .discard_epoch = .handshake }, &protected);
     try testing.expectEqual(@as(?[]const u8, null), try client.applyEvent(.handshake_complete, &protected));
     try testing.expectEqual(@as(?[]const u8, null), try server.applyEvent(.handshake_complete, &protected));
 
@@ -501,7 +510,7 @@ test "record epoch bridge treats the initial epoch as a validated one-way transi
     }, &plaintext));
 }
 
-test "record epoch bridge requires the initial epoch to be discarded before completion" {
+test "record epoch bridge requires both the initial and handshake epochs to be discarded before completion" {
     const cp = testProvider();
     var bridge = Bridge.init(cp, .tls_aes_128_gcm_sha256);
     defer bridge.deinit();
@@ -513,10 +522,52 @@ test "record epoch bridge requires the initial epoch to be discarded before comp
     try bridge.installTrafficSecret(.application, .read, &app);
     try bridge.installTrafficSecret(.application, .write, &app);
 
+    // Neither the initial nor the handshake epoch has been discarded yet.
     try testing.expectError(error.InvalidEpochTransition, bridge.markHandshakeComplete());
 
     try bridge.discardEpoch(.initial);
+    // Completion must still prove prior handshake keys were released, not
+    // just that the initial epoch was: the handshake epoch's read/write
+    // states are still live here.
+    try testing.expect(bridge.hasReadKeys(.handshake));
+    try testing.expect(bridge.hasWriteKeys(.handshake));
+    try testing.expectError(error.InvalidEpochTransition, bridge.markHandshakeComplete());
+
+    try bridge.discardEpoch(.handshake);
     try bridge.markHandshakeComplete();
+}
+
+test "record epoch bridge rejects early application discard before and after handshake completion" {
+    const cp = testProvider();
+    var bridge = Bridge.init(cp, .tls_aes_128_gcm_sha256);
+    defer bridge.deinit();
+
+    // A fresh bridge: no keys of any kind installed yet.
+    try testing.expectError(error.EpochDiscardTooEarly, bridge.discardEpoch(.application));
+
+    const hs = secret(0x69);
+    const app = secret(0x6a);
+    try bridge.installTrafficSecret(.handshake, .read, &hs);
+    try bridge.installTrafficSecret(.handshake, .write, &hs);
+    try bridge.installTrafficSecret(.application, .read, &app);
+    try bridge.installTrafficSecret(.application, .write, &app);
+
+    // Application keys are installed, but the handshake has not completed
+    // (initial/handshake discard and markHandshakeComplete were never
+    // called) -- discarding now would tear down live session state under
+    // the guise of orderly teardown.
+    try testing.expectError(error.EpochDiscardTooEarly, bridge.discardEpoch(.application));
+    try testing.expect(bridge.hasReadKeys(.application));
+    try testing.expect(bridge.hasWriteKeys(.application));
+
+    try bridge.discardEpoch(.initial);
+    try bridge.discardEpoch(.handshake);
+    try bridge.markHandshakeComplete();
+
+    try bridge.discardEpoch(.application);
+    try testing.expect(!bridge.hasReadKeys(.application));
+    try testing.expect(!bridge.hasWriteKeys(.application));
+    try testing.expectError(error.EpochAlreadyDiscarded, bridge.discardEpoch(.application));
 }
 
 test "record epoch bridge deinit wipes secrets even when no epoch was ever discarded" {
@@ -555,6 +606,8 @@ test "record epoch bridge rejects wrong content at otherwise valid epochs" {
     try server.installTrafficSecret(.application, .write, &server_app);
     try client.discardEpoch(.initial);
     try server.discardEpoch(.initial);
+    try client.discardEpoch(.handshake);
+    try server.discardEpoch(.handshake);
     try client.markHandshakeComplete();
     try server.markHandshakeComplete();
 
@@ -602,6 +655,7 @@ test "record epoch bridge shuttles protocol-neutral driver events through record
                     } else if (epoch == .handshake and std.mem.eql(u8, bytes, "client finished")) {
                         try sink.emitSecret(.application, .read, &self.client_app);
                         try sink.emitSecret(.application, .write, &self.server_app);
+                        try sink.emitDiscardEpoch(.handshake);
                         try sink.emitHandshakeComplete();
                         try sink.emitHandshakeBytes(.application, "new session ticket");
                     } else {
@@ -616,8 +670,11 @@ test "record epoch bridge shuttles protocol-neutral driver events through record
                     } else if (epoch == .handshake and std.mem.eql(u8, bytes, "server finished")) {
                         try sink.emitSecret(.application, .write, &self.client_app);
                         try sink.emitSecret(.application, .read, &self.server_app);
-                        try sink.emitHandshakeComplete();
+                        // The client's own Finished message must be sealed with
+                        // the handshake write key before that key is discarded.
                         try sink.emitHandshakeBytes(.handshake, "client finished");
+                        try sink.emitDiscardEpoch(.handshake);
+                        try sink.emitHandshakeComplete();
                     } else if (epoch == .application and std.mem.eql(u8, bytes, "new session ticket")) {
                         try sink.emitAlpn("h3");
                     } else {
@@ -636,31 +693,53 @@ test "record epoch bridge shuttles protocol-neutral driver events through record
             receiver_bridge: *Bridge,
             sink: *T.EventSink,
         ) DriverError!void {
-            var sealed: [record_codec.max_ciphertext_record_len]u8 = undefined;
             var opened: [record_codec.max_ciphertext_fragment_len]u8 = undefined;
+
+            // Sealing must happen in the sink's own order (an event later in
+            // the same sink may discard the key a handshake-bytes event was
+            // just sealed with). Delivering to the peer must not happen
+            // inline: the peer's cascading response can require this side's
+            // own later same-sink events -- notably `handshake_complete` --
+            // to already be applied (a receiver cannot open a post-handshake
+            // application-epoch message from a cascaded delivery before its
+            // own handshake_complete has been applied). So seal in-line, in
+            // order, but queue delivery/recursion for a second pass once the
+            // whole sink is drained.
+            const max_queued = 4;
+            const QueuedMessage = struct {
+                epoch: events.EncryptionEpoch,
+                mode: record_codec.RecordMode,
+                buf: [1024]u8 = undefined,
+                len: usize,
+            };
+            var queued: [max_queued]QueuedMessage = undefined;
+            var queued_len: usize = 0;
 
             for (sink.items[0..sink.len]) |event| {
                 switch (event) {
                     .handshake_bytes => |handshake| {
-                        const bytes = (try sender_bridge.applyEvent(.{ .handshake_bytes = .{ .epoch = handshake.epoch, .data = handshake.data } }, &sealed)).?;
-                        const mode: record_codec.RecordMode = if (handshake.epoch == .initial) .plaintext else .ciphertext;
-                        const record = try parseSingleRecord(mode, bytes);
-                        const message = try receiver_bridge.openHandshake(handshake.epoch, record, &opened);
-                        const next = try receiver_driver.receive(message.epoch, message.inner.content);
-                        try pump(receiver_driver, receiver_bridge, sender_driver, sender_bridge, next);
+                        std.debug.assert(queued_len < max_queued);
+                        const slot = &queued[queued_len];
+                        queued_len += 1;
+                        slot.* = .{ .epoch = handshake.epoch, .mode = if (handshake.epoch == .initial) .plaintext else .ciphertext, .len = 0 };
+                        const bytes = (try sender_bridge.applyEvent(.{ .handshake_bytes = .{ .epoch = handshake.epoch, .data = handshake.data } }, &slot.buf)).?;
+                        slot.len = bytes.len;
                     },
                     .traffic_secret => |traffic_secret| {
+                        var scratch: [1]u8 = undefined;
                         _ = try sender_bridge.applyEvent(.{ .traffic_secret = .{
                             .epoch = traffic_secret.epoch,
                             .direction = traffic_secret.direction,
                             .data = traffic_secret.data,
-                        } }, &sealed);
+                        } }, &scratch);
                     },
                     .discard_epoch => |epoch| {
-                        _ = try sender_bridge.applyEvent(.{ .discard_epoch = epoch }, &sealed);
+                        var scratch: [1]u8 = undefined;
+                        _ = try sender_bridge.applyEvent(.{ .discard_epoch = epoch }, &scratch);
                     },
                     .handshake_complete => {
-                        _ = try sender_bridge.applyEvent(.handshake_complete, &sealed);
+                        var scratch: [1]u8 = undefined;
+                        _ = try sender_bridge.applyEvent(.handshake_complete, &scratch);
                         sender_driver.complete();
                     },
                     .peer_transport_parameters,
@@ -672,6 +751,13 @@ test "record epoch bridge shuttles protocol-neutral driver events through record
                     .fatal_alert,
                     => {},
                 }
+            }
+
+            for (queued[0..queued_len]) |msg| {
+                const record = try parseSingleRecord(msg.mode, msg.buf[0..msg.len]);
+                const message = try receiver_bridge.openHandshake(msg.epoch, record, &opened);
+                const next = try receiver_driver.receive(message.epoch, message.inner.content);
+                try pump(receiver_driver, receiver_bridge, sender_driver, sender_bridge, next);
             }
         }
     };
@@ -691,8 +777,11 @@ test "record epoch bridge shuttles protocol-neutral driver events through record
 
     try testing.expect(client_driver.isComplete());
     try testing.expect(server_driver.isComplete());
-    try testing.expectEqual(@as(u64, 1), client_bridge.write_handshake.?.sequence);
-    try testing.expectEqual(@as(u64, 1), server_bridge.read_handshake.?.sequence);
+    // The handshake epoch was discarded as part of completing (finding 5),
+    // so its keys -- and the sequence counters that went with them -- are
+    // gone on both sides.
+    try testing.expect(!client_bridge.hasWriteKeys(.handshake));
+    try testing.expect(!server_bridge.hasReadKeys(.handshake));
     try testing.expectEqual(@as(u64, 1), server_bridge.write_application.?.sequence);
     try testing.expectEqual(@as(u64, 1), client_bridge.read_application.?.sequence);
 }

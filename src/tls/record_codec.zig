@@ -73,6 +73,9 @@ pub const VersionPolicy = enum {
 };
 
 const compat_client_hello_version: u16 = 0x0301;
+/// RFC 8446 Handshake.msg_type value for client_hello -- the only message
+/// the `0x0301` compatibility version may legally accompany.
+const client_hello_msg_type: u8 = 1;
 
 pub fn RecordSink(comptime max_record_count: usize, comptime max_payload_bytes: usize) type {
     return struct {
@@ -188,10 +191,12 @@ pub const Parser = struct {
             const header = try parseHeader(self.pending[0..header_len], self.mode, self.currentVersionPolicy());
             const record_len = header_len + header.payload_len;
             if (self.len < record_len) return;
+            const payload = self.pending[header_len..record_len];
+            try checkCompatVersionCarriesClientHello(header, payload);
             try sink.push(.{
                 .content_type = header.content_type,
                 .legacy_version = header.legacy_version,
-                .payload = self.pending[header_len..record_len],
+                .payload = payload,
             });
             self.discard(record_len);
             self.parsed_first_record = true;
@@ -203,10 +208,12 @@ pub const Parser = struct {
         const header = try parseHeader(self.pending[0..header_len], self.mode, self.currentVersionPolicy());
         const record_len = header_len + header.payload_len;
         if (self.len < record_len) return;
+        const payload = self.pending[header_len..record_len];
+        try checkCompatVersionCarriesClientHello(header, payload);
         try sink.push(.{
             .content_type = header.content_type,
             .legacy_version = header.legacy_version,
-            .payload = self.pending[header_len..record_len],
+            .payload = payload,
         });
         self.discard(record_len);
         self.parsed_first_record = true;
@@ -241,8 +248,16 @@ pub fn parseHeader(bytes: []const u8, mode: RecordMode, version_policy: VersionP
     // ciphertext-mode parser always requires exactly 0x0303, regardless of
     // the caller-supplied policy, so a misconfigured parser instance still
     // fails closed rather than accepting it on the wrong record stream.
+    // The compatibility exception is RFC 8446 SS5.1's initial-ClientHello
+    // allowance specifically -- not a blanket pass for any first plaintext
+    // record -- so it is further scoped to handshake-content-type records
+    // here. `parseHeader` cannot see the payload, so this only rules out a
+    // same-header-shaped alert/change_cipher_spec; whether the payload is
+    // actually a ClientHello (and not some other handshake message) is
+    // checked once the full record is assembled, in `Parser.drain`/`drainOne`.
     const version_ok = version == legacy_record_version or
-        (mode == .plaintext and version_policy == .allow_initial_client_hello_compat and version == compat_client_hello_version);
+        (mode == .plaintext and version_policy == .allow_initial_client_hello_compat and
+            version == compat_client_hello_version and content_type == .handshake);
     if (!version_ok) return error.InvalidRecordVersion;
     const payload_len: usize = std.mem.readInt(u16, bytes[3..5], .big);
     const max_len: usize = switch (mode) {
@@ -252,6 +267,17 @@ pub fn parseHeader(bytes: []const u8, mode: RecordMode, version_policy: VersionP
     if (payload_len > max_len) return error.RecordTooLarge;
     if (mode == .ciphertext and content_type != .application_data) return error.InvalidRecordType;
     return .{ .content_type = content_type, .legacy_version = version, .payload_len = payload_len };
+}
+
+/// `parseHeader` can only confirm a `0x0301`-tagged record is
+/// handshake-content-type; it never sees the payload. Once the full record
+/// is assembled, reject it here unless the payload actually begins with a
+/// ClientHello handshake message -- RFC 8446 SS5.1 permits the
+/// compatibility version for the initial ClientHello only, not for
+/// whichever handshake message happens to arrive first.
+fn checkCompatVersionCarriesClientHello(header: RecordHeader, payload: []const u8) Error!void {
+    if (header.legacy_version != compat_client_hello_version) return;
+    if (payload.len == 0 or payload[0] != client_hello_msg_type) return error.InvalidRecordVersion;
 }
 
 pub fn encodePlaintextRecord(content_type: ContentType, payload: []const u8, out: []u8) Error![]const u8 {
@@ -448,7 +474,7 @@ test "server initial parser accepts 0x0301 only for the first record, then requi
     var parser = Parser.initWithVersionPolicy(.plaintext, .allow_initial_client_hello_compat);
     var sink = DefaultSink{};
     var encoded: [64]u8 = undefined;
-    const client_hello = try encodePlaintextRecord(.handshake, "client hello", &encoded);
+    const client_hello = try encodePlaintextRecord(.handshake, "\x01client hello", &encoded);
     var compat_client_hello: [64]u8 = undefined;
     @memcpy(compat_client_hello[0..client_hello.len], client_hello);
     compat_client_hello[1] = 0x03;
@@ -457,18 +483,52 @@ test "server initial parser accepts 0x0301 only for the first record, then requi
     try parser.feed(compat_client_hello[0..client_hello.len], &sink);
     try testing.expectEqual(@as(usize, 1), sink.len);
     try testing.expectEqual(@as(u16, 0x0301), sink.items[0].legacy_version);
-    try testing.expectEqualStrings("client hello", sink.items[0].payload);
+    try testing.expectEqualStrings("\x01client hello", sink.items[0].payload);
 
     // A second post-HRR ClientHello (or any later record) MUST be 0x0303;
     // the compatibility window closes after the first consumed record.
     sink.reset();
     var second_encoded: [64]u8 = undefined;
-    const second_client_hello = try encodePlaintextRecord(.handshake, "second client hello", &second_encoded);
+    const second_client_hello = try encodePlaintextRecord(.handshake, "\x01second client hello", &second_encoded);
     var compat_second: [64]u8 = undefined;
     @memcpy(compat_second[0..second_client_hello.len], second_client_hello);
     compat_second[1] = 0x03;
     compat_second[2] = 0x01;
     try testing.expectError(error.InvalidRecordVersion, parser.feed(compat_second[0..second_client_hello.len], &sink));
+}
+
+test "server initial parser rejects 0x0301 on a non-handshake first record" {
+    var sink = DefaultSink{};
+
+    // An alert record shaped exactly like the accepted ClientHello case
+    // above, but content_type = alert (21) instead of handshake (22):
+    // parseHeader must reject this before ever looking at the payload.
+    {
+        var parser = Parser.initWithVersionPolicy(.plaintext, .allow_initial_client_hello_compat);
+        try testing.expectError(error.InvalidRecordVersion, parser.feed(&.{ 21, 3, 1, 0, 2, 1, 0 }, &sink));
+    }
+    sink.reset();
+    // Same for change_cipher_spec (20).
+    {
+        var parser = Parser.initWithVersionPolicy(.plaintext, .allow_initial_client_hello_compat);
+        try testing.expectError(error.InvalidRecordVersion, parser.feed(&.{ 20, 3, 1, 0, 1, 1 }, &sink));
+    }
+}
+
+test "server initial parser rejects 0x0301 on a handshake record that is not a ClientHello" {
+    var parser = Parser.initWithVersionPolicy(.plaintext, .allow_initial_client_hello_compat);
+    var sink = DefaultSink{};
+    var encoded: [64]u8 = undefined;
+    // Handshake content type, compat version, but the payload's first byte
+    // (the Handshake.msg_type) is 2 (server_hello), not 1 (client_hello).
+    const record = try encodePlaintextRecord(.handshake, "\x02not a client hello", &encoded);
+    var compat_record: [64]u8 = undefined;
+    @memcpy(compat_record[0..record.len], record);
+    compat_record[1] = 0x03;
+    compat_record[2] = 0x01;
+
+    try testing.expectError(error.InvalidRecordVersion, parser.feed(compat_record[0..record.len], &sink));
+    try testing.expectEqual(@as(usize, 0), sink.len);
 }
 
 test "compat policy still rejects legacy versions other than 0x0301 and 0x0303" {

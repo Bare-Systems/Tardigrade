@@ -99,6 +99,9 @@ pub const Carrier = struct {
     readFn: *const fn (*anyopaque, []u8) Error!usize,
     writeFn: *const fn (*anyopaque, []const u8) Error!usize,
     closeFn: ?*const fn (*anyopaque) void = null,
+    /// When false, the caller owns the carrier handle and must close it. When
+    /// true, `PureZigRecordStream.deinit`, fatal failure, and completed close
+    /// call `closeFn` exactly once through the stream.
     owns_handle: bool = false,
 
     pub fn read(self: Carrier, out: []u8) Error!usize {
@@ -1265,7 +1268,9 @@ test "encrypted stream reports would-block and stable readiness without busy-loo
     try testing.expectEqual(before, drive.readiness);
 }
 
-test "encrypted stream interface accepts OpenSSL-like and pure-Zig backends" {
+test "encrypted stream interface accepts vtable-shaped and pure-Zig backends" {
+    // This is only a vtable contract smoke test. Production OpenSSL adapter
+    // conformance is tracked separately by #411.
     const FakeOpenSsl = struct {
         inbound: ByteQueue(64, error.PlaintextBufferFull) = .{},
         outbound: ByteQueue(64, error.CiphertextBufferFull) = .{},

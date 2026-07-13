@@ -14,8 +14,8 @@
 //!   * AEAD seal/open for AES-128-GCM, AES-256-GCM, ChaCha20-Poly1305
 //!   * X25519 key-share generation and shared-secret derivation
 //!   * Ed25519 signing (via `SoftwareSigningKey`) and verification
-//!   * ECDSA-P256/SHA-256 and RSA-PSS-RSAE/SHA-256 signature verification
-//!     (certificate and CertificateVerify signatures; #343)
+//!   * ECDSA-P256/SHA-256 signature verification (certificate and
+//!     CertificateVerify signatures; #343)
 //!   * injected-entropy random bytes, constant-time compare, secure zero
 //!
 //! Declared by the interface but not yet implemented here — capability
@@ -25,6 +25,9 @@
 //!   * secp256r1 (P-256) ECDH key-share generation and shared-secret
 //!     derivation (the signature scheme over the same curve is implemented;
 //!     the ECDH group is not)
+//!   * RSA-PSS-RSAE/SHA-256 verification — deferred until a PSS verifier
+//!     that fully validates the EMSA-PSS zero-padding region (RFC 8017)
+//!     backs it; Zig 0.16's std verifier does not (see #343)
 //!
 //! These arrive with the OpenSSL adapter and later pure-Zig work; the seam
 //! already names them so protocol code and negotiation are written once.
@@ -46,8 +49,6 @@ const ChaCha20Poly1305 = crypto.aead.chacha_poly.ChaCha20Poly1305;
 const X25519 = crypto.dh.X25519;
 const Ed25519 = crypto.sign.Ed25519;
 const EcdsaP256Sha256 = crypto.sign.ecdsa.EcdsaP256Sha256;
-const Sha256 = crypto.hash.sha2.Sha256;
-const rsa = crypto.Certificate.rsa;
 
 /// The pure-Zig provider. Construct with an entropy source, then hand the
 /// interface view to protocol code via `cryptoProvider`.
@@ -75,7 +76,6 @@ pub const Provider = struct {
         caps.groups.insert(.x25519);
         caps.signatures.insert(.ed25519);
         caps.signatures.insert(.ecdsa_secp256r1_sha256);
-        caps.signatures.insert(.rsa_pss_rsae_sha256);
         return caps;
     }
 
@@ -408,24 +408,16 @@ fn verifyImpl(
             sig.verify(message, pk) catch return error.AuthenticationFailed;
         },
         .rsa_pss_rsae_sha256 => {
-            // `public_key` is the DER `RSAPublicKey` (SEQUENCE { modulus,
-            // publicExponent }) carried in the SPKI subjectPublicKey;
-            // `signature` is the raw EMSA-PSS signature, one modulus in
-            // length. SHA-256 is both the message hash and the MGF1 hash,
-            // with the salt length equal to the digest length (rsae).
-            const components = rsa.PublicKey.parseDer(public_key) catch return error.InvalidInput;
-            if (components.exponent.len > components.modulus.len) return error.InvalidInput;
-            if (signature.len != components.modulus.len) return error.InvalidInput;
-            const pk = rsa.PublicKey.fromBytes(components.exponent, components.modulus) catch return error.InvalidInput;
-            switch (components.modulus.len) {
-                inline 256, 384, 512 => |modulus_len| {
-                    rsa.PSSSignature.verify(modulus_len, signature[0..modulus_len].*, message, pk, Sha256) catch
-                        return error.AuthenticationFailed;
-                },
-                // Reject moduli outside the supported 2048/3072/4096-bit set
-                // as unsupported rather than treating them as malformed.
-                else => return error.UnsupportedCapability,
-            }
+            // RSA-PSS verification is deferred: Zig 0.16's
+            // `std.crypto.Certificate.rsa.PSSSignature` EMSA-PSS-VERIFY checks
+            // only the final octet of the PS zero-padding region, not the whole
+            // region as RFC 8017 requires, so a private-key holder could craft
+            // an encoding it accepts but OpenSSL rejects. Rather than ship a
+            // verifier that disagrees with the differential baseline (or
+            // hand-roll EMSA-PSS in project code), the capability stays absent
+            // and fails closed here. Re-enable once a conformant PSS verifier
+            // (hardened std or the OpenSSL adapter) backs it. See #343.
+            return error.UnsupportedCapability;
         },
     }
 }
@@ -546,7 +538,8 @@ test "capabilities advertise exactly the implemented profile" {
     try testing.expect(!caps.supportsGroup(.secp256r1));
     try testing.expect(caps.supportsSignature(.ed25519));
     try testing.expect(caps.supportsSignature(.ecdsa_secp256r1_sha256));
-    try testing.expect(caps.supportsSignature(.rsa_pss_rsae_sha256));
+    // RSA-PSS verification is deferred pending a conformant PSS verifier.
+    try testing.expect(!caps.supportsSignature(.rsa_pss_rsae_sha256));
 }
 
 test "unsupported algorithms return UnsupportedCapability, not undefined behaviour" {
@@ -561,6 +554,13 @@ test "unsupported algorithms return UnsupportedCapability, not undefined behavio
     var priv_buf: [32]u8 = undefined;
     try testing.expectError(error.UnsupportedCapability, cp.generateKeyShare(.secp256r1, &pub_buf, &priv_buf));
     try testing.expectError(error.UnsupportedCapability, cp.deriveSharedSecret(.secp256r1, &priv_buf, pub_buf[0..32], priv_buf[0..32]));
+
+    // RSA-PSS verification is deferred, and fails closed for any input —
+    // including short slices that a non-total DER parser could fault on.
+    var sig: [8]u8 = @splat(0);
+    try testing.expectError(error.UnsupportedCapability, cp.verify(.rsa_pss_rsae_sha256, &sig, "m", &sig));
+    try testing.expectError(error.UnsupportedCapability, cp.verify(.rsa_pss_rsae_sha256, "", "m", ""));
+    try testing.expectError(error.UnsupportedCapability, cp.verify(.rsa_pss_rsae_sha256, "\x30", "m", "\x00"));
 }
 
 test "ECDSA-P256 verification round-trips and rejects tamper and wrong key" {
@@ -587,7 +587,7 @@ test "ECDSA-P256 verification round-trips and rejects tamper and wrong key" {
     try testing.expectError(error.AuthenticationFailed, cp.verify(.ecdsa_secp256r1_sha256, &other_sec1, message, der_sig));
 }
 
-test "ECDSA-P256 and RSA-PSS verification reject malformed encodings" {
+test "ECDSA-P256 verification rejects malformed encodings" {
     var det = DeterministicEntropy.init(1);
     var p = Provider.init(det.entropy());
     const cp = p.cryptoProvider();
@@ -595,8 +595,9 @@ test "ECDSA-P256 and RSA-PSS verification reject malformed encodings" {
     // Not a valid SEC1 point / DER signature.
     var junk: [8]u8 = @splat(0);
     try testing.expectError(error.InvalidInput, cp.verify(.ecdsa_secp256r1_sha256, &junk, "m", &junk));
-    // Not a valid DER RSAPublicKey.
-    try testing.expectError(error.InvalidInput, cp.verify(.rsa_pss_rsae_sha256, &junk, "m", &junk));
+    // Empty and one-byte slices must not fault the underlying parsers.
+    try testing.expectError(error.InvalidInput, cp.verify(.ecdsa_secp256r1_sha256, "", "m", ""));
+    try testing.expectError(error.InvalidInput, cp.verify(.ecdsa_secp256r1_sha256, "\x04", "m", "\x30"));
 }
 
 test "HKDF-Extract matches std.crypto.kdf.hkdf" {

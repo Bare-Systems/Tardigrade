@@ -52,17 +52,32 @@ const Loaded = struct {
     }
 };
 
-test "self-signed Ed25519, ECDSA-P256, and RSA-PSS certificates verify" {
+test "self-signed Ed25519 and ECDSA-P256 certificates verify" {
     const allocator = testing.allocator;
     var det: crypto.pure_zig.DeterministicEntropy = undefined;
     var prov: crypto.pure_zig.Provider = undefined;
     const cp = testProvider(&det, &prov);
 
-    inline for (.{ ed25519_crt, ecdsa_p256_ca_crt, rsa_pss_crt }) |fixture| {
+    inline for (.{ ed25519_crt, ecdsa_p256_ca_crt }) |fixture| {
         var loaded = try Loaded.init(allocator, fixture);
         defer loaded.deinit(allocator);
         try verify.verifySelfSignature(cp, &loaded.cert);
     }
+}
+
+test "RSA-PSS is classified but deferred, so it fails closed" {
+    const allocator = testing.allocator;
+    var det: crypto.pure_zig.DeterministicEntropy = undefined;
+    var prov: crypto.pure_zig.Provider = undefined;
+    const cp = testProvider(&det, &prov);
+
+    // A valid RSA-PSS certificate: the algorithm and parameters resolve, but
+    // the provider does not yet offer PSS verification, so the capability gate
+    // fails it closed rather than mis-verifying it.
+    var rp = try Loaded.init(allocator, rsa_pss_crt);
+    defer rp.deinit(allocator);
+    try testing.expectEqual(x509.SignatureAlgorithm.rsa_pss, rp.cert.signatureAlgorithm());
+    try testing.expectError(error.UnsupportedSignatureAlgorithm, verify.verifySelfSignature(cp, &rp.cert));
 }
 
 test "the three supported schemes classify to the right key types" {
@@ -100,13 +115,13 @@ fn tamperedSerialCopy(allocator: std.mem.Allocator, loaded: *const Loaded) ![]u8
     return copy;
 }
 
-test "tampered TBS bytes fail with InvalidSignature for every algorithm" {
+test "tampered TBS bytes fail with InvalidSignature for every supported algorithm" {
     const allocator = testing.allocator;
     var det: crypto.pure_zig.DeterministicEntropy = undefined;
     var prov: crypto.pure_zig.Provider = undefined;
     const cp = testProvider(&det, &prov);
 
-    inline for (.{ ed25519_crt, ecdsa_p256_ca_crt, rsa_pss_crt }) |fixture| {
+    inline for (.{ ed25519_crt, ecdsa_p256_ca_crt }) |fixture| {
         var loaded = try Loaded.init(allocator, fixture);
         defer loaded.deinit(allocator);
 
@@ -308,4 +323,79 @@ test "non-canonical ECDSA signatures are rejected as malformed" {
     // Non-minimal INTEGER (leading 0x00 with clear high bit) is non-canonical DER.
     const nonmin = try tlv(arena, 0x30, &.{ try tlv(arena, 0x02, &.{&[_]u8{ 0x00, 0x01 }}), try intTlv(arena, 1) });
     try testing.expectError(error.MalformedSignature, verify.validateEcdsaDerSignature(nonmin));
+
+    // A canonical but oversized scalar (33 magnitude bytes) exceeds a P-256
+    // scalar and must be malformed, not passed through to the provider.
+    var big: [33]u8 = undefined;
+    @memset(&big, 0x11); // high bit clear, no sign padding => 33 magnitude bytes
+    const oversized = try tlv(arena, 0x30, &.{ try tlv(arena, 0x02, &.{&big}), try intTlv(arena, 1) });
+    try testing.expectError(error.MalformedSignature, verify.validateEcdsaDerSignature(oversized));
+
+    // 33 content bytes are allowed only as a 0x00 sign byte plus 32 magnitude.
+    var padded: [33]u8 = undefined;
+    padded[0] = 0x00;
+    @memset(padded[1..], 0xaa); // top bit set, so the sign byte is required
+    const padded_ok = try tlv(arena, 0x30, &.{ try tlv(arena, 0x02, &.{&padded}), try intTlv(arena, 1) });
+    try verify.validateEcdsaDerSignature(padded_ok);
+}
+
+fn rsaPublicKeyDer(arena: std.mem.Allocator, modulus: []const u8, exponent: []const u8) ![]u8 {
+    return tlv(arena, 0x30, &.{
+        try tlv(arena, 0x02, &.{modulus}),
+        try tlv(arena, 0x02, &.{exponent}),
+    });
+}
+
+test "RSA public keys with non-positive modulus or exponent are malformed" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    // A well-formed positive RSAPublicKey parses and reports its modulus length.
+    var modulus: [256]u8 = undefined;
+    @memset(&modulus, 0xff);
+    modulus[0] = 0x00; // sign byte: 2048-bit modulus with the top bit set
+    _ = try verify.rsaModulusLen(try rsaPublicKeyDer(arena, &modulus, &[_]u8{ 0x01, 0x00, 0x01 }));
+
+    // Negative modulus (minimal encoding, top bit set) is rejected.
+    var neg_mod: [256]u8 = undefined;
+    @memset(&neg_mod, 0x00);
+    neg_mod[0] = 0x80;
+    try testing.expectError(error.MalformedPublicKey, verify.rsaModulusLen(try rsaPublicKeyDer(arena, &neg_mod, &[_]u8{ 0x01, 0x00, 0x01 })));
+
+    // Zero modulus and zero exponent are rejected.
+    try testing.expectError(error.MalformedPublicKey, verify.rsaModulusLen(try rsaPublicKeyDer(arena, &[_]u8{0x00}, &[_]u8{ 0x01, 0x00, 0x01 })));
+    try testing.expectError(error.MalformedPublicKey, verify.rsaModulusLen(try rsaPublicKeyDer(arena, &modulus, &[_]u8{0x00})));
+
+    // Negative exponent (top bit set) is rejected.
+    try testing.expectError(error.MalformedPublicKey, verify.rsaModulusLen(try rsaPublicKeyDer(arena, &modulus, &[_]u8{0x80})));
+}
+
+test "signature-algorithm parameters must be absent for Ed25519 and ECDSA" {
+    const allocator = testing.allocator;
+    var det: crypto.pure_zig.DeterministicEntropy = undefined;
+    var prov: crypto.pure_zig.Provider = undefined;
+    const cp = testProvider(&det, &prov);
+
+    inline for (.{ ed25519_crt, ecdsa_p256_ca_crt }) |fixture| {
+        var loaded = try Loaded.init(allocator, fixture);
+        defer loaded.deinit(allocator);
+        // Inject an explicit NULL parameter into the signatureAlgorithm; RFCs
+        // 8410/5758 require it absent, so verification must refuse it.
+        loaded.cert.signature_algorithm.parameters_raw = &[_]u8{ 0x05, 0x00 };
+        try testing.expectError(error.UnsupportedSignatureAlgorithm, verify.verifySelfSignature(cp, &loaded.cert));
+    }
+}
+
+test "issuer Ed25519 SPKI parameters must be absent" {
+    const allocator = testing.allocator;
+    var det: crypto.pure_zig.DeterministicEntropy = undefined;
+    var prov: crypto.pure_zig.Provider = undefined;
+    const cp = testProvider(&det, &prov);
+
+    var ed = try Loaded.init(allocator, ed25519_crt);
+    defer ed.deinit(allocator);
+    // RFC 8410 forbids parameters on an Ed25519 SubjectPublicKeyInfo.
+    ed.cert.subject_public_key_info.algorithm.parameters_raw = &[_]u8{ 0x05, 0x00 };
+    try testing.expectError(error.MalformedPublicKey, verify.verifySelfSignature(cp, &ed.cert));
 }

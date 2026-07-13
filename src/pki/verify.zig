@@ -68,6 +68,10 @@ pub fn verifyCertificateSignature(
     // Individually-supported algorithm and key, but inconsistent pairing.
     if (issuer.key_type != resolved.required_key_type) return error.IssuerKeyMismatch;
 
+    // The issuer key's algorithm parameters must conform, independent of the
+    // OID-only classification.
+    try validateIssuerKeyParameters(resolved.scheme, issuer);
+
     // Fail closed before touching key material if the provider cannot perform
     // the scheme, so an unsupported algorithm is never a silent no-op.
     if (!crypto_provider.capabilities().supportsSignature(resolved.scheme)) {
@@ -98,8 +102,17 @@ pub fn verifySelfSignature(
 
 fn resolveScheme(algorithm: *const x509.AlgorithmIdentifier) Error!Resolved {
     return switch (x509.SignatureAlgorithm.classify(algorithm)) {
-        .ed25519 => .{ .scheme = .ed25519, .required_key_type = .ed25519 },
-        .ecdsa_sha256 => .{ .scheme = .ecdsa_secp256r1_sha256, .required_key_type = .ecdsa_p256 },
+        .ed25519 => blk: {
+            // RFC 8410 §3: the Ed25519 signatureAlgorithm parameters MUST be
+            // absent. `classify` only matches the OID, so enforce it here.
+            if (algorithm.parameters_raw != null) return error.UnsupportedSignatureAlgorithm;
+            break :blk .{ .scheme = .ed25519, .required_key_type = .ed25519 };
+        },
+        .ecdsa_sha256 => blk: {
+            // RFC 5758 §3.2: ecdsa-with-SHA256 parameters MUST be absent.
+            if (algorithm.parameters_raw != null) return error.UnsupportedSignatureAlgorithm;
+            break :blk .{ .scheme = .ecdsa_secp256r1_sha256, .required_key_type = .ecdsa_p256 };
+        },
         .rsa_pss => blk: {
             // RSASSA-PSS carries its hash/MGF/salt in parameters; only the
             // SHA-256/MGF1-SHA-256/salt-32 (rsae) configuration is supported.
@@ -110,6 +123,25 @@ fn resolveScheme(algorithm: *const x509.AlgorithmIdentifier) Error!Resolved {
         // parser did not recognize are outside the matrix.
         else => error.UnsupportedSignatureAlgorithm,
     };
+}
+
+/// Enforce the issuer SubjectPublicKeyInfo `AlgorithmIdentifier` parameters
+/// beyond the OID/key-type classification `x509` performs: Ed25519 keys carry
+/// no parameters (RFC 8410 §3), rsaEncryption keys carry explicit NULL or
+/// none (RFC 3279 §2.3.1; arbitrary values are rejected), and the ECDSA
+/// named-curve is already pinned to P-256 by the `ecdsa_p256` key type.
+fn validateIssuerKeyParameters(scheme: provider.SignatureScheme, issuer: *const x509.SubjectPublicKeyInfo) Error!void {
+    switch (scheme) {
+        .ed25519 => {
+            if (issuer.algorithm.parameters_raw != null) return error.MalformedPublicKey;
+        },
+        .rsa_pss_rsae_sha256 => {
+            if (issuer.algorithm.parameters_raw != null and !issuer.algorithm.parameters_null) {
+                return error.MalformedPublicKey;
+            }
+        },
+        .ecdsa_secp256r1_sha256 => {},
+    }
 }
 
 fn issuerPublicKey(scheme: provider.SignatureScheme, issuer: *const x509.SubjectPublicKeyInfo) Error![]const u8 {
@@ -172,19 +204,39 @@ pub fn validateEcdsaDerSignature(sig: []const u8) Error!void {
     const r = seq.readInteger() catch return error.MalformedSignature;
     const s = seq.readInteger() catch return error.MalformedSignature;
     seq.expectEnd() catch return error.MalformedSignature;
-    // ECDSA r and s are positive.
-    if (r.isNegative() or s.isNegative()) return error.MalformedSignature;
+    // ECDSA r and s are positive and, over P-256, fit in a 32-byte scalar.
+    // Bounding the magnitude here keeps an oversized-but-canonical integer
+    // (which the provider would reject as InvalidInput, blurring the error
+    // taxonomy) a precise MalformedSignature.
+    try validateP256Scalar(r);
+    try validateP256Scalar(s);
+}
+
+/// A P-256 scalar INTEGER is positive and at most 32 magnitude bytes; a
+/// leading 0x00 sign byte is allowed only when the value's top bit is set
+/// (33-byte content).
+fn validateP256Scalar(view: der.IntegerView) Error!void {
+    if (view.isNegative()) return error.MalformedSignature;
+    var magnitude = view.content;
+    if (magnitude.len >= 1 and magnitude[0] == 0x00) magnitude = magnitude[1..];
+    if (magnitude.len == 0 or magnitude.len > 32) return error.MalformedSignature;
 }
 
 /// Return the RSA modulus length in bytes (minimal, leading-zero stripped)
-/// from a DER `RSAPublicKey`, validating the two-INTEGER structure.
-fn rsaModulusLen(rsa_public_key_der: []const u8) Error!usize {
+/// from a DER `RSAPublicKey`, validating the two-INTEGER structure and that
+/// both the modulus and the public exponent are strictly positive. `readInteger`
+/// enforces minimal DER but not sign; a negative or zero modulus/exponent that
+/// the unsigned `std.crypto` RSA parser would misinterpret is rejected here.
+/// Exposed for direct testing of the key-encoding rules.
+pub fn rsaModulusLen(rsa_public_key_der: []const u8) Error!usize {
     var reader = der.Reader.init(rsa_public_key_der, .{});
     var seq = reader.readSequence() catch return error.MalformedPublicKey;
     reader.expectEnd() catch return error.MalformedPublicKey;
     const modulus = seq.readInteger() catch return error.MalformedPublicKey;
-    _ = seq.readInteger() catch return error.MalformedPublicKey; // publicExponent
+    const exponent = seq.readInteger() catch return error.MalformedPublicKey;
     seq.expectEnd() catch return error.MalformedPublicKey;
+    if (modulus.isNegative() or modulus.isZero()) return error.MalformedPublicKey;
+    if (exponent.isNegative() or exponent.isZero()) return error.MalformedPublicKey;
     // DER INTEGER may carry a single leading 0x00 to keep it positive; the
     // effective modulus length excludes it.
     var content = modulus.content;

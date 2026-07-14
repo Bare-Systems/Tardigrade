@@ -1439,10 +1439,16 @@ test "openssl encrypted stream preserves close requested during pending write re
         if (pair.server.stream_lifecycle == .closed) break;
         std.Thread.yield() catch {};
     }
-    try std.testing.expectEqual(OpenSslStreamLifecycle.closed, pair.server.stream_lifecycle);
 
     reader.join();
     if (read_ctx.err) |err| return err;
+
+    for (0..1024) |_| {
+        _ = try stream.drive();
+        if (pair.server.stream_lifecycle == .closed) break;
+        std.Thread.yield() catch {};
+    }
+    try std.testing.expectEqual(OpenSslStreamLifecycle.closed, pair.server.stream_lifecycle);
     try std.testing.expectEqualSlices(u8, blocked.expected.items, read_ctx.out.items);
     try encrypted_stream.expectClosedConformance(stream);
 }

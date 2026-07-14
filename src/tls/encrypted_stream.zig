@@ -432,7 +432,7 @@ pub const PureZigRecordStream = struct {
                 const maybe_read_len = carrier.read(buf[0..read_cap]) catch |err| switch (err) {
                     error.WouldBlock => null,
                     error.EndOfStream => eof: {
-                        try self.handleCarrierEof();
+                        if (try self.handleCarrierEof()) made_progress = true;
                         made_progress = true;
                         break :eof null;
                     },
@@ -440,7 +440,7 @@ pub const PureZigRecordStream = struct {
                 };
                 if (maybe_read_len) |read_len| {
                     if (read_len == 0) {
-                        try self.handleCarrierEof();
+                        if (try self.handleCarrierEof()) made_progress = true;
                         made_progress = true;
                     } else {
                         self.inbound_carrier.append(buf[0..read_len]) catch |err| return self.fail(err);
@@ -487,26 +487,36 @@ pub const PureZigRecordStream = struct {
     fn openHandshakeSink(self: *PureZigRecordStream, epoch: events.EncryptionEpoch, sink: anytype) Error!void {
         var plaintext_buf: [record_codec.max_ciphertext_fragment_len]u8 = undefined;
         for (sink.items[0..sink.len]) |record| {
-            const opened = try self.bridge.openHandshake(epoch, record, &plaintext_buf);
-            try self.inbound_handshake.append(opened.inner.content);
+            const opened = try self.bridge.openProtected(epoch, record, &plaintext_buf);
+            switch (opened.inner.content_type) {
+                .handshake => try self.inbound_handshake.append(opened.inner.content),
+                .alert => try self.handleAlert(opened.inner.content),
+                .application_data,
+                .change_cipher_spec,
+                => return self.fail(error.UnexpectedRecordContent),
+            }
         }
     }
 
     fn handleAlert(self: *PureZigRecordStream, alert: []const u8) Error!void {
         if (alert.len != 2) return self.fail(error.MalformedAlert);
-        const level = alert[0];
         const description: alerts.AlertDescription = std.enums.fromInt(alerts.AlertDescription, alert[1]) orelse return self.fail(error.PeerFatalAlert);
-        if (level == 1 and description == .close_notify) {
+        if (description == .close_notify) {
             self.peer_closed = true;
             return;
         }
-        if (level == 1) return self.fail(error.MalformedAlert);
-        if (level != 2) return self.fail(error.MalformedAlert);
         return self.fail(error.PeerFatalAlert);
     }
 
-    fn handleCarrierEof(self: *PureZigRecordStream) Error!void {
-        if (self.peer_closed) return;
+    fn handleCarrierEof(self: *PureZigRecordStream) Error!bool {
+        if (self.peer_closed) return false;
+        var made_progress = false;
+        while (self.inbound_carrier.len > 0 and !self.peer_closed) {
+            const before = self.inbound_carrier.len;
+            if (try self.processCarrierInput(drive_record_budget)) made_progress = true;
+            if (self.inbound_carrier.len == before) break;
+        }
+        if (self.peer_closed) return made_progress;
         return self.fail(error.TruncatedStream);
     }
 
@@ -1148,12 +1158,68 @@ test "encrypted stream accepts EOF after close_notify" {
     try testing.expectError(error.EndOfStream, stream_state.stream().read(&buf));
 }
 
+test "encrypted stream drains buffered records before truncation decision" {
+    const SourceThenEofCarrier = struct {
+        bytes: []const u8,
+        offset: usize = 0,
+
+        fn carrier(self: *@This()) Carrier {
+            return .{ .ptr = self, .readFn = read, .writeFn = write };
+        }
+
+        fn read(ptr: *anyopaque, out: []u8) Error!usize {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.offset == self.bytes.len) return 0;
+            const n = @min(out.len, self.bytes.len - self.offset);
+            @memcpy(out[0..n], self.bytes[self.offset..][0..n]);
+            self.offset += n;
+            return n;
+        }
+
+        fn write(_: *anyopaque, _: []const u8) Error!usize {
+            return error.WouldBlock;
+        }
+    };
+
+    const cp = testProvider();
+    var client = PureZigRecordStream.init(.client, cp, .tls_aes_128_gcm_sha256);
+    defer client.deinit();
+    var server = PureZigRecordStream.init(.server, cp, .tls_aes_128_gcm_sha256);
+    defer server.deinit();
+    try establish(&client, &server);
+
+    var records: [4096]u8 = undefined;
+    var len: usize = 0;
+    for (0..9) |i| {
+        var plaintext: [1]u8 = .{@intCast('a' + i)};
+        try testing.expectEqual(@as(usize, 1), try server.stream().write(&plaintext));
+        len += try server.drainCiphertext(records[len..]);
+    }
+    var alert_buf: [record_codec.max_ciphertext_record_len]u8 = undefined;
+    const close_notify = try server.bridge.sealProtected(.application, .alert, &.{ 1, 0 }, &alert_buf);
+    @memcpy(records[len..][0..close_notify.len], close_notify);
+    len += close_notify.len;
+
+    var carrier = SourceThenEofCarrier{ .bytes = records[0..len] };
+    client.carrier = carrier.carrier();
+
+    const result = try client.stream().drive();
+    try testing.expect(result.made_progress);
+    try testing.expect(client.stream().readiness().peer_closed);
+    try testing.expectEqual(@as(usize, len), carrier.offset);
+
+    var plaintext: [16]u8 = undefined;
+    const read = try client.stream().read(&plaintext);
+    try testing.expectEqualStrings("abcdefghi", plaintext[0..read]);
+    try testing.expectError(error.EndOfStream, client.stream().read(&plaintext));
+}
+
 test "encrypted stream fatal and malformed alerts latch terminal failure" {
     const cp = testProvider();
     inline for (.{
         .{ .payload = &.{ 2, @intFromEnum(alerts.AlertDescription.unexpected_message) }, .expected = error.PeerFatalAlert },
+        .{ .payload = &.{ 1, @intFromEnum(alerts.AlertDescription.unexpected_message) }, .expected = error.PeerFatalAlert },
         .{ .payload = &.{1}, .expected = error.MalformedAlert },
-        .{ .payload = &.{ 1, @intFromEnum(alerts.AlertDescription.unexpected_message) }, .expected = error.MalformedAlert },
         .{ .payload = &.{ 2, 0xff }, .expected = error.PeerFatalAlert },
     }) |case| {
         var client = PureZigRecordStream.init(.client, cp, .tls_aes_128_gcm_sha256);
@@ -1168,6 +1234,40 @@ test "encrypted stream fatal and malformed alerts latch terminal failure" {
         try testing.expectEqual(Lifecycle.failed, client.lifecycle);
         try expectLatchedFailureConformance(client.stream(), case.expected);
     }
+}
+
+test "encrypted stream treats close_notify as close regardless of alert level" {
+    const cp = testProvider();
+    var client = PureZigRecordStream.init(.client, cp, .tls_aes_128_gcm_sha256);
+    defer client.deinit();
+    var server = PureZigRecordStream.init(.server, cp, .tls_aes_128_gcm_sha256);
+    defer server.deinit();
+    try establish(&client, &server);
+
+    var alert_buf: [record_codec.max_ciphertext_record_len]u8 = undefined;
+    const close_notify = try server.bridge.sealProtected(.application, .alert, &.{ 2, @intFromEnum(alerts.AlertDescription.close_notify) }, &alert_buf);
+    try feedAllCiphertext(&client, close_notify);
+
+    var buf: [8]u8 = undefined;
+    try testing.expectError(error.EndOfStream, client.stream().read(&buf));
+}
+
+test "encrypted stream routes handshake epoch alerts through alert handling" {
+    const cp = testProvider();
+    var client = PureZigRecordStream.init(.client, cp, .tls_aes_128_gcm_sha256);
+    defer client.deinit();
+    var server = PureZigRecordStream.init(.server, cp, .tls_aes_128_gcm_sha256);
+    defer server.deinit();
+
+    const server_hs = secret(0x22);
+    try client.applyEvent(.{ .traffic_secret = .{ .epoch = .handshake, .direction = .read, .data = &server_hs } });
+    try server.applyEvent(.{ .traffic_secret = .{ .epoch = .handshake, .direction = .write, .data = &server_hs } });
+
+    var alert_buf: [record_codec.max_ciphertext_record_len]u8 = undefined;
+    const fatal_alert = try server.bridge.sealProtected(.handshake, .alert, &.{ 2, @intFromEnum(alerts.AlertDescription.unexpected_message) }, &alert_buf);
+    try testing.expectError(error.PeerFatalAlert, feedAllHandshake(&client, .handshake, fatal_alert));
+    try testing.expectEqual(Lifecycle.failed, client.lifecycle);
+    try expectLatchedFailureConformance(client.stream(), error.PeerFatalAlert);
 }
 
 test "encrypted stream duplicate close_notify and data after close are ignored" {

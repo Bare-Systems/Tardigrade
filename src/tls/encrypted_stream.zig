@@ -29,6 +29,9 @@ pub const Error = record_epoch_bridge.Error || error{
     FcntlFailed,
     SocketReadFailed,
     SocketWriteFailed,
+    /// A `.handshake` epoch discard landed with a not-yet-complete record
+    /// still buffered in `ciphertext_parser`. See `applyEvent`.
+    PartialRecordAtEpochTransition,
 };
 
 const Lifecycle = enum {
@@ -193,12 +196,25 @@ pub const PureZigRecordStream = struct {
         // The initial epoch's plaintext parser is only safe to keep once
         // its keys are gone: nothing should ever arrive at that epoch
         // again after discard, so drop any partially-buffered state along
-        // with it. Never do this for `.handshake` discard: the ciphertext
-        // parser is shared across the handshake and application epochs,
-        // and bytes already buffered there may belong to the next
-        // (application) record.
+        // with it. Never reset `ciphertext_parser` here: it is shared
+        // across the handshake and application epochs, and bytes already
+        // buffered there may belong to the next (application) record.
         if (event == .discard_epoch and event.discard_epoch == .initial) {
             self.initial_parser.reset();
+        }
+        // `ciphertext_parser` is fed through `feedOne`'s exact-consumption
+        // contract, so it only ever holds a genuinely incomplete record --
+        // any legitimate next-record suffix stays in the caller/carrier
+        // buffer instead. A nonzero `len` here at the `.handshake` epoch
+        // boundary therefore means a record started under handshake keys
+        // and has not finished, and its remaining bytes are about to be
+        // fed and opened under application keys instead. That is exactly
+        // the stale partial-record state the epoch transition must clear
+        // or reject; there is no way to safely resume mid-record across a
+        // key change, so fail the stream closed rather than silently
+        // reinterpreting those bytes under the wrong epoch.
+        if (event == .discard_epoch and event.discard_epoch == .handshake and self.ciphertext_parser.len != 0) {
+            return self.fail(error.PartialRecordAtEpochTransition);
         }
         if (event == .handshake_complete) self.lifecycle = .open;
     }
@@ -1540,4 +1556,29 @@ test "server-role stream accepts the 0x0301 ClientHello compatibility version on
     compat_server_hello[1] = 0x03;
     compat_server_hello[2] = 0x01;
     try testing.expectError(error.InvalidRecordVersion, client.feedHandshakeCiphertext(.initial, compat_server_hello[0..third.len]));
+}
+
+test "handshake epoch discard fails closed when ciphertext_parser still holds a partial record" {
+    const cp = testProvider();
+    var server = PureZigRecordStream.init(.server, cp, .tls_aes_128_gcm_sha256);
+    defer server.deinit();
+
+    const client_hs = secret(0x51);
+    const server_hs = secret(0x52);
+    const client_app = secret(0x53);
+    const server_app = secret(0x54);
+    try server.applyEvent(.{ .traffic_secret = .{ .epoch = .handshake, .direction = .read, .data = &client_hs } });
+    try server.applyEvent(.{ .traffic_secret = .{ .epoch = .handshake, .direction = .write, .data = &server_hs } });
+    try server.applyEvent(.{ .traffic_secret = .{ .epoch = .application, .direction = .read, .data = &client_app } });
+    try server.applyEvent(.{ .traffic_secret = .{ .epoch = .application, .direction = .write, .data = &server_app } });
+
+    // A record header declaring 10 payload bytes, with only 3 delivered:
+    // ciphertext_parser buffers it (feedOne's exact-consumption contract
+    // means this can only be a genuinely incomplete record, never a
+    // legitimate next-record suffix) and never completes it.
+    _ = try server.feedHandshakeCiphertext(.handshake, &.{ 23, 3, 3, 0, 10, 1, 2, 3 });
+
+    try testing.expectError(error.PartialRecordAtEpochTransition, server.applyEvent(.{ .discard_epoch = .handshake }));
+    // The stream is latched failed with that same error afterward.
+    try testing.expectError(error.PartialRecordAtEpochTransition, server.applyEvent(.handshake_complete));
 }

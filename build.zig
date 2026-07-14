@@ -249,7 +249,6 @@ pub fn build(b: *std.Build) void {
     });
     crypto_mod.addImport("crypto_secrets", crypto_secrets_mod);
     tls_core_mod.addImport("crypto", crypto_mod);
-    quic_mod.addImport("crypto", crypto_mod);
     const crypto_tests = b.addTest(.{ .root_module = crypto_mod });
     const run_crypto_tests = b.addRunArtifact(crypto_tests);
     const crypto_secret_tests = b.addTest(.{ .root_module = crypto_secrets_mod });
@@ -259,6 +258,26 @@ pub fn build(b: *std.Build) void {
     crypto_step.dependOn(&run_crypto_secret_tests.step);
     test_step.dependOn(&run_crypto_tests.step);
     test_step.dependOn(&run_crypto_secret_tests.step);
+
+    // Test-only: a real client/server TLS 1.3 handshake through the merged
+    // record stack (#408 finding 6). This needs the "crypto" module (to
+    // build a pure-Zig CryptoProvider for the record_epoch_bridge.Bridge
+    // instances it drives) purely for its own test assertions, so it is its
+    // own module rather than folding "crypto" into production quic_mod or
+    // exporting a test file from quic/root.zig's public namespace.
+    const record_mode_handshake_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/quic/record_mode_handshake_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    record_mode_handshake_test_mod.addImport("quic_varint", quic_varint_mod);
+    record_mode_handshake_test_mod.addImport("tls_core", tls_core_mod);
+    record_mode_handshake_test_mod.addImport("crypto_secrets", crypto_secrets_mod);
+    record_mode_handshake_test_mod.addImport("crypto", crypto_mod);
+    const record_mode_handshake_tests = b.addTest(.{ .root_module = record_mode_handshake_test_mod });
+    const run_record_mode_handshake_tests = b.addRunArtifact(record_mode_handshake_tests);
+    quic_step.dependOn(&run_record_mode_handshake_tests.step);
+    test_step.dependOn(&run_record_mode_handshake_tests.step);
 
     const http3_tests = b.addTest(.{ .root_module = http3_mod });
     const run_http3_tests = b.addRunArtifact(http3_tests);

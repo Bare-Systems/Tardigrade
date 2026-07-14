@@ -10,7 +10,6 @@ pub const connection = @import("connection.zig");
 pub const tls_adapter = @import("tls_adapter.zig");
 pub const tls_handshake = @import("tls_handshake.zig");
 pub const tls_backend = @import("tls_backend.zig");
-pub const record_mode_handshake_test = @import("record_mode_handshake_test.zig");
 pub const recovery = @import("recovery.zig");
 pub const cid = @import("cid.zig");
 pub const path = @import("path.zig");

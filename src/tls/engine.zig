@@ -76,7 +76,14 @@ pub fn Driver(comptime Transport: type) type {
         /// terminal output (e.g. a fatal alert emitted just before failing) can
         /// still reach it.
         pub fn startOutcome(self: *Self, params: Transport.TransportParametersType) Outcome {
+            if (self.state == .failed) return .{ .sink = &self.sink, .terminal_error = self.failure_reason };
             if (self.state != .idle) {
+                // Not already failed, but calling start() again is still
+                // invalid (in progress or complete). Reset the sink before
+                // marking failed so this invalid call cannot surface a
+                // stale event batch -- including a copied traffic
+                // secret -- from whatever the driver was doing before it.
+                self.sink.reset();
                 self.markFailed(error.InvalidHandshakeState);
                 return .{ .sink = &self.sink, .terminal_error = self.failure_reason };
             }
@@ -290,6 +297,67 @@ test "receiveOutcome carries a fatal alert emitted just before the backend fails
     const again = driver.receiveOutcome(.initial, "more");
     try std.testing.expectEqual(error.UnexpectedHandshakeMessage, again.terminal_error.?);
     try std.testing.expect(again.sink.hasFatalAlert());
+}
+
+test "startOutcome after backend failure keeps returning the same terminal error without re-invoking the backend" {
+    const alerts = @import("alerts.zig");
+    const T = @import("transport.zig").Contract(void, enum { initial }, error{ InvalidHandshakeState, TransportBufferOverflow, UnexpectedHandshakeMessage });
+    const D = Driver(T);
+    const Backend = struct {
+        calls: usize = 0,
+
+        fn start(ptr: *anyopaque, _: state.Role, _: void, sink: *T.EventSink) T.Error!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try sink.emitFatalAlert(alerts.fromHandshakeError(error.UnexpectedHandshakeMessage));
+            return error.UnexpectedHandshakeMessage;
+        }
+        fn receive(_: *anyopaque, _: T.EpochType, _: []const u8, _: *T.EventSink) T.Error!void {}
+    };
+
+    var backend = Backend{};
+    var driver = D.init(.client, .{
+        .ptr = &backend,
+        .startFn = Backend.start,
+        .receiveFn = Backend.receive,
+    });
+
+    const first = driver.startOutcome({});
+    try std.testing.expectEqual(error.UnexpectedHandshakeMessage, first.terminal_error.?);
+    try std.testing.expect(first.sink.hasFatalAlert());
+    try std.testing.expectEqual(@as(usize, 1), backend.calls);
+
+    const second = driver.startOutcome({});
+    try std.testing.expectEqual(error.UnexpectedHandshakeMessage, second.terminal_error.?);
+    try std.testing.expect(second.sink.hasFatalAlert());
+    try std.testing.expectEqual(@as(usize, 1), backend.calls);
+}
+
+test "a second startOutcome after a successful start does not leak the prior event batch" {
+    const T = @import("transport.zig").Contract(void, enum { handshake }, error{ InvalidHandshakeState, TransportBufferOverflow });
+    const D = Driver(T);
+    const Backend = struct {
+        fn start(_: *anyopaque, _: state.Role, _: void, sink: *T.EventSink) T.Error!void {
+            try sink.emitSecret(.handshake, .write, "should not survive a second start");
+        }
+        fn receive(_: *anyopaque, _: T.EpochType, _: []const u8, _: *T.EventSink) T.Error!void {}
+    };
+
+    var context: u8 = 0;
+    var driver = D.init(.client, .{
+        .ptr = &context,
+        .startFn = Backend.start,
+        .receiveFn = Backend.receive,
+    });
+
+    const first = driver.startOutcome({});
+    try std.testing.expectEqual(@as(?T.Error, null), first.terminal_error);
+    try std.testing.expectEqual(@as(usize, 1), first.sink.len);
+
+    const second = driver.startOutcome({});
+    try std.testing.expectEqual(error.InvalidHandshakeState, second.terminal_error.?);
+    try std.testing.expectEqual(@as(usize, 0), second.sink.len);
+    try std.testing.expectEqual(@as(usize, 0), second.sink.used);
 }
 
 test "driver deinit is safe after a failed handshake" {

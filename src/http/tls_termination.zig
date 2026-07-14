@@ -461,6 +461,15 @@ fn opensslStreamFail(self: *TlsConnection, err: encrypted_stream.Error) encrypte
     return err;
 }
 
+fn opensslSawUnexpectedEof() bool {
+    const err = c.ERR_peek_error();
+    if (err == 0) return true;
+    if (@hasDecl(c, "ERR_GET_REASON") and @hasDecl(c, "SSL_R_UNEXPECTED_EOF_WHILE_READING")) {
+        return c.ERR_GET_REASON(err) == c.SSL_R_UNEXPECTED_EOF_WHILE_READING;
+    }
+    return false;
+}
+
 fn opensslRefreshPeerClosed(self: *TlsConnection) void {
     self.peer_closed = self.peer_closed or (c.SSL_get_shutdown(self.ssl) & c.SSL_RECEIVED_SHUTDOWN) != 0;
 }
@@ -505,6 +514,14 @@ fn opensslStreamRead(ptr: *anyopaque, out: []u8) encrypted_stream.Error!usize {
             opensslClearRetry(self);
             self.peer_closed = true;
             break :eof error.EndOfStream;
+        },
+        c.SSL_ERROR_SYSCALL => {
+            if (rc == 0 and opensslSawUnexpectedEof()) return opensslStreamFail(self, error.TruncatedStream);
+            return opensslStreamFail(self, error.SocketReadFailed);
+        },
+        c.SSL_ERROR_SSL => {
+            if (opensslSawUnexpectedEof()) return opensslStreamFail(self, error.TruncatedStream);
+            return opensslStreamFail(self, error.SocketReadFailed);
         },
         else => opensslStreamFail(self, error.SocketReadFailed),
     };
@@ -1506,6 +1523,19 @@ test "openssl encrypted stream adapter reports peer EOF" {
 
     var scratch: [8]u8 = undefined;
     try std.testing.expectError(error.EndOfStream, stream.read(&scratch));
+}
+
+test "openssl encrypted stream reports truncation without peer close_notify" {
+    const allocator = std.testing.allocator;
+    var pair = try makeTestTlsPair(allocator);
+    defer pair.deinit();
+
+    try std.testing.expectEqual(@as(c_int, 0), std.c.shutdown(pair.client_fd, std.posix.SHUT.WR));
+
+    var scratch: [8]u8 = undefined;
+    const stream = pair.server.stream();
+    try std.testing.expectError(error.TruncatedStream, stream.read(&scratch));
+    try encrypted_stream.expectLatchedFailureConformance(stream, error.TruncatedStream);
 }
 
 test "openssl encrypted stream adapter latches fatal wire failures" {

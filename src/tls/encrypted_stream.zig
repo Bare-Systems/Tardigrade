@@ -28,6 +28,7 @@ pub const Error = record_epoch_bridge.Error || error{
     FcntlFailed,
     SocketReadFailed,
     SocketWriteFailed,
+    RetryOperationPending,
 };
 
 const Lifecycle = enum {
@@ -77,6 +78,9 @@ pub const EncryptedStream = struct {
         return self.vtable.readFn(self.ptr, out);
     }
 
+    /// Attempts to write plaintext. After a nonblocking write returns
+    /// `WouldBlock`, backends that depend on same-operation retries may require
+    /// the original write slice to be retried before any other plaintext I/O.
     pub fn write(self: EncryptedStream, bytes: []const u8) Error!usize {
         return self.vtable.writeFn(self.ptr, bytes);
     }
@@ -93,6 +97,56 @@ pub const EncryptedStream = struct {
         return self.vtable.driveFn(self.ptr);
     }
 };
+
+/// Shared open-stream assertions used by each production backend's tests.
+pub fn expectOpenIdleConformance(stream: EncryptedStream, expected_backend: BackendKind) !void {
+    try std.testing.expectEqual(expected_backend, stream.backend());
+
+    const readiness = stream.readiness();
+    try std.testing.expect(readiness.wants_read);
+    try std.testing.expect(!readiness.wants_write);
+    try std.testing.expect(!readiness.can_read_plaintext);
+    try std.testing.expect(readiness.can_write_plaintext);
+    try std.testing.expect(!readiness.peer_closed);
+
+    var scratch: [8]u8 = undefined;
+    try std.testing.expectError(error.WouldBlock, stream.read(&scratch));
+    const blocked = stream.readiness();
+    try std.testing.expect(blocked.wants_read);
+    try std.testing.expect(!blocked.wants_write);
+    try std.testing.expect(!blocked.can_read_plaintext);
+    try std.testing.expect(!blocked.peer_closed);
+
+    const driven = try stream.drive();
+    try std.testing.expect(!driven.made_progress);
+    try std.testing.expectEqual(blocked, driven.readiness);
+}
+
+pub fn expectClosedConformance(stream: EncryptedStream) !void {
+    var scratch: [8]u8 = undefined;
+    try std.testing.expectError(error.StreamClosed, stream.read(&scratch));
+    try std.testing.expectError(error.StreamClosed, stream.write("after-close"));
+    const readiness = stream.readiness();
+    try std.testing.expect(!readiness.wants_read);
+    try std.testing.expect(!readiness.wants_write);
+    try std.testing.expect(!readiness.can_read_plaintext);
+    try std.testing.expect(!readiness.can_write_plaintext);
+    const driven = try stream.drive();
+    try std.testing.expect(!driven.made_progress);
+    try std.testing.expectEqual(readiness, driven.readiness);
+}
+
+pub fn expectLatchedFailureConformance(stream: EncryptedStream, expected_error: anyerror) !void {
+    var scratch: [8]u8 = undefined;
+    try std.testing.expectError(expected_error, stream.read(&scratch));
+    try std.testing.expectError(expected_error, stream.write("after-failure"));
+    try std.testing.expectError(expected_error, stream.drive());
+    const readiness = stream.readiness();
+    try std.testing.expect(!readiness.wants_read);
+    try std.testing.expect(!readiness.wants_write);
+    try std.testing.expect(!readiness.can_read_plaintext);
+    try std.testing.expect(!readiness.can_write_plaintext);
+}
 
 pub const Carrier = struct {
     ptr: *anyopaque,
@@ -1063,6 +1117,7 @@ test "encrypted stream close sends close_notify before closing owned carrier" {
     try testing.expectEqual(Lifecycle.closed, stream_state.lifecycle);
     try testing.expect(carrier.closed);
     try testing.expect(carrier.written.len > 0);
+    try expectClosedConformance(stream_state.stream());
 
     try feedAllCiphertext(&peer, carrier.written.slice());
     var buf: [8]u8 = undefined;
@@ -1297,12 +1352,7 @@ test "encrypted stream fatal parser errors latch and close owned carrier" {
     try testing.expectError(error.InvalidRecordType, stream_state.feedCiphertext(&.{ 0xff, 0x03, 0x03, 0x00, 0x00 }));
     try testing.expectEqual(Lifecycle.failed, stream_state.lifecycle);
     try testing.expect(carrier.closed);
-    try testing.expectError(error.InvalidRecordType, stream_state.stream().write("x"));
-    var buf: [8]u8 = undefined;
-    try testing.expectError(error.InvalidRecordType, stream_state.stream().read(&buf));
-    const readiness = stream_state.stream().readiness();
-    try testing.expect(!readiness.wants_read);
-    try testing.expect(!readiness.wants_write);
+    try expectLatchedFailureConformance(stream_state.stream(), error.InvalidRecordType);
 }
 
 test "encrypted stream fatal failure clears queued handshake and ciphertext helpers" {
@@ -1398,9 +1448,20 @@ test "encrypted stream reports would-block and stable readiness without busy-loo
     try testing.expectEqual(before, drive.readiness);
 }
 
+test "pure-Zig encrypted stream satisfies shared open-idle conformance" {
+    const cp = testProvider();
+    var client = PureZigRecordStream.init(cp, .tls_aes_128_gcm_sha256);
+    defer client.deinit();
+    var server = PureZigRecordStream.init(cp, .tls_aes_128_gcm_sha256);
+    defer server.deinit();
+    try establish(&client, &server);
+
+    try expectOpenIdleConformance(client.stream(), .pure_zig_record);
+}
+
 test "encrypted stream interface accepts vtable-shaped and pure-Zig backends" {
-    // This is only a vtable contract smoke test. Production OpenSSL adapter
-    // conformance is tracked separately by #411.
+    // This remains a vtable shape smoke test; production backends run the
+    // shared conformance helpers above and in the OpenSSL adapter tests.
     const FakeOpenSsl = struct {
         inbound: ByteQueue(64, error.PlaintextBufferFull) = .{},
         outbound: ByteQueue(64, error.CiphertextBufferFull) = .{},

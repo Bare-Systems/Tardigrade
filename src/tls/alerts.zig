@@ -16,6 +16,8 @@ pub const AlertDescription = enum(u8) {
     illegal_parameter = 47,
     decode_error = 50,
     decrypt_error = 51,
+    protocol_version = 70,
+    user_canceled = 90,
     missing_extension = 109,
     unsupported_extension = 110,
     no_application_protocol = 120,
@@ -73,6 +75,8 @@ test "alert description values match RFC 8446 section 6 and RFC 7301 section 3.2
     try testing.expectEqual(@as(u8, 47), @intFromEnum(AlertDescription.illegal_parameter));
     try testing.expectEqual(@as(u8, 50), @intFromEnum(AlertDescription.decode_error));
     try testing.expectEqual(@as(u8, 51), @intFromEnum(AlertDescription.decrypt_error));
+    try testing.expectEqual(@as(u8, 70), @intFromEnum(AlertDescription.protocol_version));
+    try testing.expectEqual(@as(u8, 90), @intFromEnum(AlertDescription.user_canceled));
     try testing.expectEqual(@as(u8, 109), @intFromEnum(AlertDescription.missing_extension));
     try testing.expectEqual(@as(u8, 110), @intFromEnum(AlertDescription.unsupported_extension));
     try testing.expectEqual(@as(u8, 116), @intFromEnum(AlertDescription.certificate_required));

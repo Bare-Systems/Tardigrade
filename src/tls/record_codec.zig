@@ -313,7 +313,7 @@ pub const Parser = struct {
         const record_len = header_len + header.payload_len;
         if (self.len < record_len) return;
         const payload = self.pending[header_len..record_len];
-        const next_client_hello_state = try nextClientHelloState(self.client_hello_state, header, payload);
+        const next_client_hello_state = try self.nextClientHelloStateForRecord(header, payload);
         try sink.push(.{
             .content_type = header.content_type,
             .legacy_version = header.legacy_version,
@@ -549,6 +549,47 @@ test "parser feedOne against an already-saturated sink consumes nothing" {
     try testing.expectEqual(record.len, retry.consumed);
     try testing.expect(retry.emitted);
     try testing.expectEqualStrings("one", sink.items[0].payload);
+}
+
+test "strict parser feed and feedOne ignore ClientHello compatibility tracking identically" {
+    var message_buf: [32]u8 = undefined;
+    const message = clientHelloMessage("hello", &message_buf);
+
+    var handshake_encoded: [32]u8 = undefined;
+    const handshake_fragment = try encodePlaintextRecord(.handshake, message[0..1], &handshake_encoded);
+    var alert_encoded: [16]u8 = undefined;
+    const alert = try encodePlaintextRecord(.alert, &.{ 1, 0 }, &alert_encoded);
+
+    var coalesced: [64]u8 = undefined;
+    @memcpy(coalesced[0..handshake_fragment.len], handshake_fragment);
+    @memcpy(coalesced[handshake_fragment.len..][0..alert.len], alert);
+    const stream = coalesced[0 .. handshake_fragment.len + alert.len];
+
+    var feed_parser = Parser.init(.plaintext);
+    var feed_sink = DefaultSink{};
+    try feed_parser.feed(stream, &feed_sink);
+    try testing.expectEqual(@as(usize, 2), feed_sink.len);
+    try testing.expectEqual(ContentType.handshake, feed_sink.items[0].content_type);
+    try testing.expectEqualSlices(u8, message[0..1], feed_sink.items[0].payload);
+    try testing.expectEqual(ContentType.alert, feed_sink.items[1].content_type);
+    try testing.expectEqualSlices(u8, &.{ 1, 0 }, feed_sink.items[1].payload);
+    try feed_parser.finish();
+
+    var feed_one_parser = Parser.init(.plaintext);
+    var feed_one_sink = RecordSink(1, max_plaintext_fragment_len){};
+    const first = try feed_one_parser.feedOne(stream, &feed_one_sink);
+    try testing.expect(first.emitted);
+    try testing.expectEqual(handshake_fragment.len, first.consumed);
+    try testing.expectEqual(ContentType.handshake, feed_one_sink.items[0].content_type);
+    try testing.expectEqualSlices(u8, message[0..1], feed_one_sink.items[0].payload);
+
+    feed_one_sink.reset();
+    const second = try feed_one_parser.feedOne(stream[first.consumed..], &feed_one_sink);
+    try testing.expect(second.emitted);
+    try testing.expectEqual(alert.len, second.consumed);
+    try testing.expectEqual(ContentType.alert, feed_one_sink.items[0].content_type);
+    try testing.expectEqualSlices(u8, &.{ 1, 0 }, feed_one_sink.items[0].payload);
+    try feed_one_parser.finish();
 }
 
 test "plaintext parser emits multiple coalesced records" {

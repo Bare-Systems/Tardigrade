@@ -12,7 +12,6 @@ pub const policy = @import("policy.zig");
 pub const record_codec = @import("record_codec.zig");
 pub const record_epoch_bridge = @import("record_epoch_bridge.zig");
 pub const record_protection = @import("record_protection.zig");
-pub const record_transport = @import("record_transport.zig");
 pub const transcript = @import("transcript.zig");
 pub const transport = @import("transport.zig");
 

@@ -45,6 +45,16 @@ pub fn Driver(comptime Transport: type) type {
 
         const Self = @This();
 
+        /// The result of `startOutcome`/`receiveOutcome`: unlike `start`/
+        /// `receive`, a terminal error does not discard whatever the backend
+        /// already emitted into the sink before failing (for example a fatal
+        /// alert, or handshake bytes queued ahead of it) -- both are always
+        /// available together.
+        pub const Outcome = struct {
+            sink: *Transport.EventSink,
+            terminal_error: ?Transport.Error,
+        };
+
         pub fn init(role: state.Role, backend: Transport.Backend) Self {
             return .{ .role = role, .backend = backend };
         }
@@ -61,6 +71,28 @@ pub fn Driver(comptime Transport: type) type {
             return &self.sink;
         }
 
+        /// Like `start`, but on backend failure returns the sink alongside the
+        /// error instead of discarding it, so a caller that needs the backend's
+        /// terminal output (e.g. a fatal alert emitted just before failing) can
+        /// still reach it.
+        pub fn startOutcome(self: *Self, params: Transport.TransportParametersType) Outcome {
+            if (self.state == .failed) return .{ .sink = &self.sink, .terminal_error = self.failure_reason };
+            if (self.state != .idle) {
+                // Not already failed, but calling start() again is still
+                // invalid (in progress or complete). Reset the sink before
+                // marking failed so this invalid call cannot surface a
+                // stale event batch -- including a copied traffic
+                // secret -- from whatever the driver was doing before it.
+                self.sink.reset();
+                self.markFailed(error.InvalidHandshakeState);
+                return .{ .sink = &self.sink, .terminal_error = self.failure_reason };
+            }
+            self.state = .in_progress;
+            self.sink.reset();
+            self.backend.start(self.role, params, &self.sink) catch |err| self.markFailed(err);
+            return .{ .sink = &self.sink, .terminal_error = self.failure_reason };
+        }
+
         /// Drive the backend with received handshake bytes and return the
         /// driver's internal event sink. The returned pointer and payload slices
         /// are borrowed only until the next `start` or `receive` call.
@@ -69,6 +101,15 @@ pub fn Driver(comptime Transport: type) type {
             self.sink.reset();
             self.backend.receive(epoch, bytes, &self.sink) catch |err| return self.fail(err);
             return &self.sink;
+        }
+
+        /// Like `receive`, but on backend failure returns the sink alongside
+        /// the error instead of discarding it. See `startOutcome`.
+        pub fn receiveOutcome(self: *Self, epoch: Transport.EpochType, bytes: []const u8) Outcome {
+            if (self.state == .failed) return .{ .sink = &self.sink, .terminal_error = self.failure_reason };
+            self.sink.reset();
+            self.backend.receive(epoch, bytes, &self.sink) catch |err| self.markFailed(err);
+            return .{ .sink = &self.sink, .terminal_error = self.failure_reason };
         }
 
         pub fn complete(self: *Self) void {
@@ -84,9 +125,22 @@ pub fn Driver(comptime Transport: type) type {
         }
 
         pub fn fail(self: *Self, err: Transport.Error) Transport.Error {
+            self.markFailed(err);
+            return err;
+        }
+
+        fn markFailed(self: *Self, err: Transport.Error) void {
             self.state = .failed;
             self.failure_reason = err;
-            return err;
+        }
+
+        /// Final teardown: securely wipes any traffic secrets still copied
+        /// into the internal sink from the last `start`/`receive` call. Every
+        /// owner of a `Driver` -- QUIC's handshake adapter and record mode
+        /// alike -- must call this exactly once when the handshake object is
+        /// discarded, whether it completed, failed, or was abandoned mid-flight.
+        pub fn deinit(self: *Self) void {
+            self.sink.deinit();
         }
     };
 }
@@ -184,4 +238,146 @@ test "generic driver rejects start after completion" {
     _ = try driver.start({});
     driver.complete();
     try std.testing.expectError(error.InvalidHandshakeState, driver.start({}));
+}
+
+test "driver deinit securely wipes the last emitted traffic secret" {
+    const T = @import("transport.zig").Contract(void, enum { handshake }, error{ InvalidHandshakeState, TransportBufferOverflow });
+    const D = Driver(T);
+    const Backend = struct {
+        fn start(_: *anyopaque, _: state.Role, _: void, sink: *T.EventSink) T.Error!void {
+            try sink.emitSecret(.handshake, .write, "last traffic secret before teardown");
+        }
+        fn receive(_: *anyopaque, _: T.EpochType, _: []const u8, _: *T.EventSink) T.Error!void {}
+    };
+
+    var context: u8 = 0;
+    var driver = D.init(.client, .{
+        .ptr = &context,
+        .startFn = Backend.start,
+        .receiveFn = Backend.receive,
+    });
+    const sink = try driver.start({});
+    try std.testing.expect(sink.used > 0);
+    const used = sink.used;
+
+    driver.deinit();
+    try std.testing.expectEqual(@as(usize, 0), driver.sink.used);
+    for (driver.sink.scratch[0..used]) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+}
+
+test "receiveOutcome carries a fatal alert emitted just before the backend fails" {
+    const alerts = @import("alerts.zig");
+    const T = @import("transport.zig").Contract(void, enum { initial }, error{ InvalidHandshakeState, TransportBufferOverflow, UnexpectedHandshakeMessage });
+    const D = Driver(T);
+    const Backend = struct {
+        fn start(_: *anyopaque, _: state.Role, _: void, _: *T.EventSink) T.Error!void {}
+        fn receive(_: *anyopaque, _: T.EpochType, _: []const u8, sink: *T.EventSink) T.Error!void {
+            try sink.emitHandshakeBytes(.initial, "queued before failure");
+            try sink.emitFatalAlert(alerts.fromHandshakeError(error.UnexpectedHandshakeMessage));
+            return error.UnexpectedHandshakeMessage;
+        }
+    };
+
+    var context: u8 = 0;
+    var driver = D.init(.server, .{
+        .ptr = &context,
+        .startFn = Backend.start,
+        .receiveFn = Backend.receive,
+    });
+    _ = try driver.start({});
+
+    const outcome = driver.receiveOutcome(.initial, "malformed");
+    try std.testing.expectEqual(error.UnexpectedHandshakeMessage, outcome.terminal_error.?);
+    try std.testing.expect(outcome.sink.hasFatalAlert());
+    try std.testing.expectEqualStrings("queued before failure", outcome.sink.items[0].handshake_bytes.data);
+    try std.testing.expectEqual(state.DriverState.failed, driver.state);
+
+    // Once failed, further calls keep surfacing the same terminal error and
+    // sink contents rather than re-invoking the backend.
+    const again = driver.receiveOutcome(.initial, "more");
+    try std.testing.expectEqual(error.UnexpectedHandshakeMessage, again.terminal_error.?);
+    try std.testing.expect(again.sink.hasFatalAlert());
+}
+
+test "startOutcome after backend failure keeps returning the same terminal error without re-invoking the backend" {
+    const alerts = @import("alerts.zig");
+    const T = @import("transport.zig").Contract(void, enum { initial }, error{ InvalidHandshakeState, TransportBufferOverflow, UnexpectedHandshakeMessage });
+    const D = Driver(T);
+    const Backend = struct {
+        calls: usize = 0,
+
+        fn start(ptr: *anyopaque, _: state.Role, _: void, sink: *T.EventSink) T.Error!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try sink.emitFatalAlert(alerts.fromHandshakeError(error.UnexpectedHandshakeMessage));
+            return error.UnexpectedHandshakeMessage;
+        }
+        fn receive(_: *anyopaque, _: T.EpochType, _: []const u8, _: *T.EventSink) T.Error!void {}
+    };
+
+    var backend = Backend{};
+    var driver = D.init(.client, .{
+        .ptr = &backend,
+        .startFn = Backend.start,
+        .receiveFn = Backend.receive,
+    });
+
+    const first = driver.startOutcome({});
+    try std.testing.expectEqual(error.UnexpectedHandshakeMessage, first.terminal_error.?);
+    try std.testing.expect(first.sink.hasFatalAlert());
+    try std.testing.expectEqual(@as(usize, 1), backend.calls);
+
+    const second = driver.startOutcome({});
+    try std.testing.expectEqual(error.UnexpectedHandshakeMessage, second.terminal_error.?);
+    try std.testing.expect(second.sink.hasFatalAlert());
+    try std.testing.expectEqual(@as(usize, 1), backend.calls);
+}
+
+test "a second startOutcome after a successful start does not leak the prior event batch" {
+    const T = @import("transport.zig").Contract(void, enum { handshake }, error{ InvalidHandshakeState, TransportBufferOverflow });
+    const D = Driver(T);
+    const Backend = struct {
+        fn start(_: *anyopaque, _: state.Role, _: void, sink: *T.EventSink) T.Error!void {
+            try sink.emitSecret(.handshake, .write, "should not survive a second start");
+        }
+        fn receive(_: *anyopaque, _: T.EpochType, _: []const u8, _: *T.EventSink) T.Error!void {}
+    };
+
+    var context: u8 = 0;
+    var driver = D.init(.client, .{
+        .ptr = &context,
+        .startFn = Backend.start,
+        .receiveFn = Backend.receive,
+    });
+
+    const first = driver.startOutcome({});
+    try std.testing.expectEqual(@as(?T.Error, null), first.terminal_error);
+    try std.testing.expectEqual(@as(usize, 1), first.sink.len);
+
+    const second = driver.startOutcome({});
+    try std.testing.expectEqual(error.InvalidHandshakeState, second.terminal_error.?);
+    try std.testing.expectEqual(@as(usize, 0), second.sink.len);
+    try std.testing.expectEqual(@as(usize, 0), second.sink.used);
+}
+
+test "driver deinit is safe after a failed handshake" {
+    const T = @import("transport.zig").Contract(void, enum { initial }, error{ InvalidHandshakeState, TransportBufferOverflow });
+    const D = Driver(T);
+    const Backend = struct {
+        fn start(_: *anyopaque, _: state.Role, _: void, sink: *T.EventSink) T.Error!void {
+            try sink.emitHandshakeBytes(.initial, "partial before failure");
+            return error.TransportBufferOverflow;
+        }
+        fn receive(_: *anyopaque, _: T.EpochType, _: []const u8, _: *T.EventSink) T.Error!void {}
+    };
+
+    var context: u8 = 0;
+    var driver = D.init(.server, .{
+        .ptr = &context,
+        .startFn = Backend.start,
+        .receiveFn = Backend.receive,
+    });
+    try std.testing.expectError(error.TransportBufferOverflow, driver.start({}));
+    driver.deinit();
+    try std.testing.expectEqual(@as(usize, 0), driver.sink.used);
 }

@@ -122,6 +122,15 @@ pub const Handshake = struct {
         return .{ .adapter = adapter, .driver = CoreDriver.init(.server, backend.transport) };
     }
 
+    /// Securely wipe any traffic secret still copied into the driver's
+    /// internal event sink from the last `start`/`onCrypto` call. The owning
+    /// `Connection` calls this exactly once during its own teardown,
+    /// regardless of whether the handshake completed, failed, or was
+    /// abandoned mid-flight (#408 finding 2).
+    pub fn deinit(self: *Handshake) void {
+        self.driver.deinit();
+    }
+
     /// Provide local transport parameters to TLS and emit the first flight
     /// (client) or arm the responder (server).
     pub fn start(self: *Handshake, local_params: config.TransportParameters) HandshakeError!void {
@@ -224,6 +233,12 @@ pub const Handshake = struct {
                 },
                 .discard_epoch => |level| self.discardOrDefer(level),
                 .handshake_complete => try self.complete(),
+                // QUIC never emits this: RFC 9001 SS4.8 has the connection
+                // derive its own CRYPTO_ERROR close from the returned
+                // HandshakeError rather than a record-layer alert. The
+                // contract carries the variant so record mode can use it
+                // (#408 finding 1); QUIC's backend does not populate it.
+                .fatal_alert => {},
             }
         }
     }

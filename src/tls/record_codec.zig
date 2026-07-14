@@ -80,6 +80,73 @@ const client_hello_msg_type: u8 = 1;
 /// 1-byte type tag followed by a 3-byte big-endian length.
 const handshake_header_len = 4;
 
+/// Progress of an RFC 8446 SS5.1 compatibility-window ClientHello handshake
+/// message, which may fragment at *any* byte boundary -- including inside
+/// its own 4-byte `msg_type`+length header, not just inside the body.
+const ClientHelloState = union(enum) {
+    /// Not currently inside a compatibility-window ClientHello.
+    idle,
+    /// Accumulating the 4-byte handshake header itself; `len` of `buf`'s
+    /// bytes are filled so far.
+    collecting_header: struct { buf: [handshake_header_len]u8, len: usize },
+    /// Header complete and validated; this many more body bytes are owed.
+    collecting_body: usize,
+};
+
+/// Computes the next `ClientHelloState` for one record without mutating
+/// `Parser` -- `sink.push` can still fail after this and leave the record
+/// buffered for a later retry, so the caller only commits the result once
+/// the record has actually been emitted (see `Parser.drain`/`drainOne`).
+///
+/// - `.collecting_body`: this record is a raw continuation, not a new
+///   handshake message, so it is not re-checked against `msg_type`.
+///   Consume up to the declared remainder.
+/// - `.collecting_header`: still assembling the 4-byte handshake header
+///   itself (it may split at any byte boundary too); accumulate more of it
+///   and, once complete, fall through to decoding the declared length.
+/// - `.idle`: a fresh record. If it does not claim the compatibility
+///   version, the window stays closed. Otherwise RFC 8446 SS5.1 permits the
+///   version for the initial ClientHello only, not for whichever handshake
+///   message happens to arrive first, so accumulation starts by validating
+///   the first available byte is `msg_type = client_hello`.
+///
+/// In every case, once the 4-byte header is complete, the declared length
+/// decides whether the window closes now (the message fits, with or
+/// without trailing bytes belonging to something else) or stays open for a
+/// further `.collecting_body` record.
+fn nextClientHelloState(current: ClientHelloState, header: RecordHeader, payload: []const u8) Error!ClientHelloState {
+    var header_buf: [handshake_header_len]u8 = undefined;
+    var header_have: usize = 0;
+
+    switch (current) {
+        .idle => {
+            if (header.legacy_version != compat_client_hello_version) return .idle;
+            if (payload.len == 0) return error.InvalidRecordVersion;
+        },
+        .collecting_header => |progress| {
+            header_buf = progress.buf;
+            header_have = progress.len;
+        },
+        .collecting_body => |remaining| {
+            const left = remaining - @min(payload.len, remaining);
+            return if (left == 0) .idle else ClientHelloState{ .collecting_body = left };
+        },
+    }
+
+    const take = @min(payload.len, handshake_header_len - header_have);
+    @memcpy(header_buf[header_have..][0..take], payload[0..take]);
+    header_have += take;
+    if (header_buf[0] != client_hello_msg_type) return error.InvalidRecordVersion;
+    if (header_have < handshake_header_len) {
+        return ClientHelloState{ .collecting_header = .{ .buf = header_buf, .len = header_have } };
+    }
+
+    const declared_len = (@as(usize, header_buf[1]) << 16) | (@as(usize, header_buf[2]) << 8) | header_buf[3];
+    const payload_after_header = payload.len - take;
+    const body_remaining = if (declared_len > payload_after_header) declared_len - payload_after_header else 0;
+    return if (body_remaining == 0) .idle else ClientHelloState{ .collecting_body = body_remaining };
+}
+
 pub fn RecordSink(comptime max_record_count: usize, comptime max_payload_bytes: usize) type {
     return struct {
         items: [max_record_count]Record = undefined,
@@ -125,11 +192,10 @@ pub const Parser = struct {
     /// of this setting. See `VersionPolicy`.
     first_record_version_policy: VersionPolicy = .strict,
     parsed_first_record: bool = false,
-    /// Bytes of an in-progress compatibility-window ClientHello handshake
-    /// message still to be consumed in a future record. Nonzero only while
-    /// that ClientHello is fragmenting across record boundaries -- see
-    /// `advanceClientHelloCompatWindow`.
-    client_hello_remaining: usize = 0,
+    /// Progress of an in-progress compatibility-window ClientHello
+    /// handshake message that is fragmenting across record boundaries --
+    /// see `ClientHelloState` and `nextClientHelloState`.
+    client_hello_state: ClientHelloState = .idle,
 
     pub fn init(mode: RecordMode) Parser {
         return .{ .mode = mode };
@@ -146,7 +212,7 @@ pub const Parser = struct {
     pub fn reset(self: *Parser) void {
         self.len = 0;
         self.parsed_first_record = false;
-        self.client_hello_remaining = 0;
+        self.client_hello_state = .idle;
     }
 
     /// Feed arbitrary TCP bytes into the parser. Completed records are copied
@@ -201,14 +267,20 @@ pub const Parser = struct {
             const record_len = header_len + header.payload_len;
             if (self.len < record_len) return;
             const payload = self.pending[header_len..record_len];
-            const still_fragmenting = try self.advanceClientHelloCompatWindow(header, payload);
+            // Compute the next compatibility-window state without mutating
+            // `self` yet: `sink.push` can still fail (RecordSinkOverflow),
+            // in which case this record stays buffered and `drain`/`drainOne`
+            // must be retried later against the *same* bytes. Committing the
+            // state here unconditionally would double-count that retry.
+            const next_client_hello_state = try nextClientHelloState(self.client_hello_state, header, payload);
             try sink.push(.{
                 .content_type = header.content_type,
                 .legacy_version = header.legacy_version,
                 .payload = payload,
             });
+            self.client_hello_state = next_client_hello_state;
+            self.parsed_first_record = (next_client_hello_state == .idle);
             self.discard(record_len);
-            self.parsed_first_record = !still_fragmenting;
         }
     }
 
@@ -218,14 +290,15 @@ pub const Parser = struct {
         const record_len = header_len + header.payload_len;
         if (self.len < record_len) return;
         const payload = self.pending[header_len..record_len];
-        const still_fragmenting = try self.advanceClientHelloCompatWindow(header, payload);
+        const next_client_hello_state = try nextClientHelloState(self.client_hello_state, header, payload);
         try sink.push(.{
             .content_type = header.content_type,
             .legacy_version = header.legacy_version,
             .payload = payload,
         });
+        self.client_hello_state = next_client_hello_state;
+        self.parsed_first_record = (next_client_hello_state == .idle);
         self.discard(record_len);
-        self.parsed_first_record = !still_fragmenting;
     }
 
     /// The compatibility window covers every record of the initial
@@ -233,38 +306,8 @@ pub const Parser = struct {
     /// closes for good once that message is fully consumed, matching the
     /// RFC 8446 SS5.1 scoping to an initial (non-post-HRR) ClientHello.
     fn currentVersionPolicy(self: *const Parser) VersionPolicy {
-        if (self.client_hello_remaining > 0) return self.first_record_version_policy;
+        if (self.client_hello_state != .idle) return self.first_record_version_policy;
         return if (self.parsed_first_record) .strict else self.first_record_version_policy;
-    }
-
-    /// Advances the compatibility window one record at a time and reports
-    /// whether it must stay open past this record. `parseHeader` can only
-    /// confirm a `0x0301`-tagged record is handshake-content-type; it never
-    /// sees the payload, so the deeper checks live here, once the full
-    /// record is assembled:
-    ///
-    /// - Already mid-ClientHello (`client_hello_remaining > 0`): this
-    ///   record is a raw continuation, not a new handshake message, so it
-    ///   is not re-checked against `msg_type`. Consume up to the declared
-    ///   remainder; the window stays open only if bytes are still owed.
-    /// - A fresh record claiming the compatibility version: RFC 8446 SS5.1
-    ///   permits it for the initial ClientHello only, not for whichever
-    ///   handshake message happens to arrive first, so the payload must
-    ///   begin a ClientHello (`msg_type` then a 3-byte length). If the
-    ///   record does not carry the whole declared message, the window
-    ///   stays open until a later record supplies the rest.
-    fn advanceClientHelloCompatWindow(self: *Parser, header: RecordHeader, payload: []const u8) Error!bool {
-        if (self.client_hello_remaining > 0) {
-            self.client_hello_remaining -= @min(payload.len, self.client_hello_remaining);
-            return self.client_hello_remaining > 0;
-        }
-        if (header.legacy_version != compat_client_hello_version) return false;
-        if (payload.len < handshake_header_len or payload[0] != client_hello_msg_type) return error.InvalidRecordVersion;
-        const declared_len = (@as(usize, payload[1]) << 16) | (@as(usize, payload[2]) << 8) | payload[3];
-        const message_len = handshake_header_len + declared_len;
-        if (payload.len >= message_len) return false;
-        self.client_hello_remaining = message_len - payload.len;
-        return true;
     }
 
     fn discard(self: *Parser, count: usize) void {
@@ -596,6 +639,100 @@ test "server initial parser keeps the compatibility window open across a fragmen
     compat_third[1] = 0x03;
     compat_third[2] = 0x01;
     try testing.expectError(error.InvalidRecordVersion, parser.feed(compat_third[0..third_record.len], &sink));
+}
+
+test "server initial parser keeps the compatibility window open across a fragmented ClientHello header" {
+    // The 4-byte msg_type+length handshake header may itself split at any
+    // record boundary, not just the body after it -- split after 1, 2, and
+    // 3 header bytes.
+    for ([_]usize{ 1, 2, 3 }) |split_at| {
+        var parser = Parser.initWithVersionPolicy(.plaintext, .allow_initial_client_hello_compat);
+        var sink = DefaultSink{};
+
+        var message_buf: [32]u8 = undefined;
+        const message = clientHelloMessage("hello", &message_buf);
+
+        const first_part = message[0..split_at];
+        var first_encoded: [32]u8 = undefined;
+        const first_record = try encodePlaintextRecord(.handshake, first_part, &first_encoded);
+        var compat_first: [32]u8 = undefined;
+        @memcpy(compat_first[0..first_record.len], first_record);
+        compat_first[1] = 0x03;
+        compat_first[2] = 0x01;
+
+        try parser.feed(compat_first[0..first_record.len], &sink);
+        try testing.expectEqual(@as(usize, 1), sink.len);
+        try testing.expectEqual(@as(u16, 0x0301), sink.items[0].legacy_version);
+
+        const second_part = message[split_at..];
+        var second_encoded: [32]u8 = undefined;
+        const second_record = try encodePlaintextRecord(.handshake, second_part, &second_encoded);
+        var compat_second: [32]u8 = undefined;
+        @memcpy(compat_second[0..second_record.len], second_record);
+        compat_second[1] = 0x03;
+        compat_second[2] = 0x01;
+
+        sink.reset();
+        try parser.feed(compat_second[0..second_record.len], &sink);
+        try testing.expectEqual(@as(usize, 1), sink.len);
+        try testing.expectEqual(@as(u16, 0x0301), sink.items[0].legacy_version);
+        try testing.expectEqualSlices(u8, second_part, sink.items[0].payload);
+
+        // Fully consumed: a further compat-versioned record is rejected.
+        sink.reset();
+        try testing.expectError(error.InvalidRecordVersion, parser.feed(&.{ 22, 3, 1, 0, 1, 1 }, &sink));
+    }
+}
+
+test "sink overflow during a compatibility fragment does not double-count the retried record" {
+    var parser = Parser.initWithVersionPolicy(.plaintext, .allow_initial_client_hello_compat);
+    // Capacity for only one record at a time, forcing an overflow-then-retry.
+    var sink = RecordSink(1, 64){};
+
+    var body: [20]u8 = undefined;
+    for (&body, 0..) |*b, i| b.* = @intCast(i);
+    var message_buf: [32]u8 = undefined;
+    const message = clientHelloMessage(&body, &message_buf);
+
+    const first_part = message[0..8];
+    var first_encoded: [32]u8 = undefined;
+    const first_record = try encodePlaintextRecord(.handshake, first_part, &first_encoded);
+    var compat_first: [32]u8 = undefined;
+    @memcpy(compat_first[0..first_record.len], first_record);
+    compat_first[1] = 0x03;
+    compat_first[2] = 0x01;
+
+    const second_part = message[8..];
+    var second_encoded: [32]u8 = undefined;
+    const second_record = try encodePlaintextRecord(.handshake, second_part, &second_encoded);
+    var compat_second: [32]u8 = undefined;
+    @memcpy(compat_second[0..second_record.len], second_record);
+    compat_second[1] = 0x03;
+    compat_second[2] = 0x01;
+
+    // Fill the sink before feeding anything, so the very first fragment's
+    // `sink.push` overflows and the record is left buffered -- the
+    // compatibility state must not have advanced past that failed push.
+    try sink.push(.{ .content_type = .alert, .legacy_version = legacy_record_version, .payload = "x" });
+    try testing.expectError(error.RecordSinkOverflow, parser.feed(compat_first[0..first_record.len], &sink));
+
+    // Drain the blocker and retry: this must process the *same* first
+    // fragment exactly once, not re-consume it as if it were a second
+    // fragment (which would desynchronize the declared-length accounting
+    // and either reject the real continuation or accept bytes beyond it).
+    sink.reset();
+    try parser.drainReady(&sink);
+    try testing.expectEqual(@as(usize, 1), sink.len);
+    try testing.expectEqualSlices(u8, first_part, sink.items[0].payload);
+
+    sink.reset();
+    try parser.feed(compat_second[0..second_record.len], &sink);
+    try testing.expectEqual(@as(usize, 1), sink.len);
+    try testing.expectEqualSlices(u8, second_part, sink.items[0].payload);
+
+    // Fully consumed: the window is closed for good.
+    sink.reset();
+    try testing.expectError(error.InvalidRecordVersion, parser.feed(&.{ 22, 3, 1, 0, 1, 1 }, &sink));
 }
 
 test "server initial parser rejects 0x0301 on a non-handshake first record" {

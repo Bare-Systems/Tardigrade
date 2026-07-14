@@ -14,6 +14,7 @@
 //! I/O-bearing types are inert.
 
 const std = @import("std");
+const encrypted_stream = @import("tls_core").encrypted_stream;
 
 pub const TlsError = error{
     OutOfMemory,
@@ -152,10 +153,45 @@ pub const TlsConnection = struct {
         return .{ .conn = self };
     }
 
+    pub fn stream(self: *TlsConnection) encrypted_stream.EncryptedStream {
+        return .{ .ptr = self, .vtable = &stub_stream_vtable };
+    }
+
     pub fn negotiatedProtocol(self: *const TlsConnection) NegotiatedProtocol {
         _ = self;
         return .http1_1;
     }
+};
+
+fn stubStreamBackend(_: *anyopaque) encrypted_stream.BackendKind {
+    return .openssl;
+}
+
+fn stubStreamRead(_: *anyopaque, _: []u8) encrypted_stream.Error!usize {
+    return error.StreamClosed;
+}
+
+fn stubStreamWrite(_: *anyopaque, _: []const u8) encrypted_stream.Error!usize {
+    return error.StreamClosed;
+}
+
+fn stubStreamClose(_: *anyopaque) void {}
+
+fn stubStreamReadiness(_: *anyopaque) encrypted_stream.Readiness {
+    return .{ .peer_closed = true };
+}
+
+fn stubStreamDrive(ptr: *anyopaque) encrypted_stream.Error!encrypted_stream.DriveResult {
+    return .{ .made_progress = false, .readiness = stubStreamReadiness(ptr) };
+}
+
+const stub_stream_vtable = encrypted_stream.EncryptedStream.VTable{
+    .backendFn = stubStreamBackend,
+    .readFn = stubStreamRead,
+    .writeFn = stubStreamWrite,
+    .closeFn = stubStreamClose,
+    .readinessFn = stubStreamReadiness,
+    .driveFn = stubStreamDrive,
 };
 
 /// In the OpenSSL adapter this drains the error queue; here it reports why

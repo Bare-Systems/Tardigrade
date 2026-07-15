@@ -1679,27 +1679,9 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
                 return;
             },
             .returned => |r| {
-                if (r.status >= 300 and r.status < 400 and r.body.len > 0) {
-                    var response = http.Response.redirect(allocator, r.body, @enumFromInt(r.status));
-                    defer response.deinit();
-                    _ = response.setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
-                    gp.applyResponseHeaders(state, &response);
-                    try response.write(writer);
-                    state.metricsRecord(r.status);
-                    ghandlers.logAccessForRequest(state, &ctx, &request, r.status);
-                    return;
-                }
-                var response = http.Response.init(allocator);
-                defer response.deinit();
-                _ = response.setStatus(@enumFromInt(r.status))
-                    .setBody(r.body)
-                    .setContentType("text/plain; charset=utf-8")
-                    .setConnection(keep_alive)
-                    .setHeader(http.correlation.HEADER_NAME, correlation_id);
-                gp.applyResponseHeaders(state, &response);
-                try response.write(writer);
-                state.metricsRecord(r.status);
-                ghandlers.logAccessForRequest(state, &ctx, &request, r.status);
+                const status = try ghandlers.writeReturnResponsePlan(allocator, writer, state, &ctx, ghandlers.planDirectResponse(r.status, r.body), correlation_id, keep_alive);
+                state.metricsRecord(status);
+                ghandlers.logAccessForRequest(state, &ctx, &request, status);
                 return;
             },
         }
@@ -1729,27 +1711,9 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
             return;
         },
         .returned => |r| {
-            if (r.status >= 300 and r.status < 400 and r.body.len > 0) {
-                var response = http.Response.redirect(allocator, r.body, @enumFromInt(r.status));
-                defer response.deinit();
-                _ = response.setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
-                gp.applyResponseHeaders(state, &response);
-                try response.write(writer);
-                state.metricsRecord(r.status);
-                ghandlers.logAccessForRequest(state, &ctx, &request, r.status);
-                return;
-            }
-            var response = http.Response.init(allocator);
-            defer response.deinit();
-            _ = response.setStatus(@enumFromInt(r.status))
-                .setBody(r.body)
-                .setContentType("text/plain; charset=utf-8")
-                .setConnection(keep_alive)
-                .setHeader(http.correlation.HEADER_NAME, correlation_id);
-            gp.applyResponseHeaders(state, &response);
-            try response.write(writer);
-            state.metricsRecord(r.status);
-            ghandlers.logAccessForRequest(state, &ctx, &request, r.status);
+            const status = try ghandlers.writeReturnResponsePlan(allocator, writer, state, &ctx, ghandlers.planDirectResponse(r.status, r.body), correlation_id, keep_alive);
+            state.metricsRecord(status);
+            ghandlers.logAccessForRequest(state, &ctx, &request, status);
             return;
         },
     }

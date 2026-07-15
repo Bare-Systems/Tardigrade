@@ -339,6 +339,7 @@ pub const PureZigRecordStream = struct {
     pub fn writePlaintext(self: *PureZigRecordStream, bytes: []const u8) Error!usize {
         if (self.failed) |err| return err;
         if (self.lifecycle == .closing or self.lifecycle == .closed or self.lifecycle == .failed) return error.StreamClosed;
+        if (self.pending_terminal_read_error) |err| return err;
         if (bytes.len == 0) return 0;
         if (self.lifecycle != .open or !self.bridge.handshake_complete) return error.WouldBlock;
         if (self.outbound_ciphertext.available() < record_codec.max_ciphertext_record_len) return error.WouldBlock;
@@ -374,11 +375,12 @@ pub const PureZigRecordStream = struct {
         if (self.failed != null or self.lifecycle == .failed or self.lifecycle == .closed) {
             return .{ .peer_closed = self.peer_closed };
         }
+        const pending_terminal_read_ready = self.pending_terminal_read_error != null and !self.hasBufferedInboundContent();
         return .{
             .wants_read = !self.carrier_eof and self.canAcceptCarrierRead(),
             .wants_write = self.outbound_ciphertext.len > 0 or (self.lifecycle == .closing and !self.close_notify_queued),
-            .can_read_plaintext = self.inbound_plaintext.len > 0,
-            .can_write_plaintext = self.lifecycle == .open and self.bridge.handshake_complete and self.outbound_ciphertext.available() >= record_codec.max_ciphertext_record_len,
+            .can_read_plaintext = self.inbound_plaintext.len > 0 or pending_terminal_read_ready,
+            .can_write_plaintext = self.pending_terminal_read_error == null and self.lifecycle == .open and self.bridge.handshake_complete and self.outbound_ciphertext.available() >= record_codec.max_ciphertext_record_len,
             .peer_closed = self.peer_closed,
         };
     }
@@ -1208,10 +1210,17 @@ test "encrypted stream preserves caller-fed plaintext before deferred truncation
     try feedAllCiphertext(&client, record[0..record_len]);
 
     try client.markPeerEof();
+    const pending = client.stream().readiness();
+    try testing.expect(pending.can_read_plaintext);
+    try testing.expect(!pending.can_write_plaintext);
+    try testing.expectError(error.TruncatedStream, client.stream().write("after EOF"));
 
     var plaintext: [32]u8 = undefined;
     const read = try client.stream().read(&plaintext);
     try testing.expectEqualStrings("authenticated", plaintext[0..read]);
+    const drained = client.stream().readiness();
+    try testing.expect(drained.can_read_plaintext);
+    try testing.expect(!drained.can_write_plaintext);
     try testing.expectError(error.TruncatedStream, client.stream().read(&plaintext));
     try testing.expectEqual(Lifecycle.failed, client.lifecycle);
 }
@@ -1260,6 +1269,10 @@ test "encrypted stream carrier EOF exposes deferred truncation after plaintext r
     var plaintext: [32]u8 = undefined;
     const read = try client.stream().read(&plaintext);
     try testing.expectEqualStrings("carrier-data", plaintext[0..read]);
+    const drained = client.stream().readiness();
+    try testing.expect(drained.can_read_plaintext);
+    try testing.expect(!drained.can_write_plaintext);
+    try testing.expectError(error.TruncatedStream, client.stream().write("after EOF"));
     try testing.expectError(error.TruncatedStream, client.stream().read(&plaintext));
     try testing.expectEqual(Lifecycle.failed, client.lifecycle);
 }

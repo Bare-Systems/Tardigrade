@@ -531,7 +531,7 @@ pub const Metrics = struct {
             \\# HELP tardigrade_proxy_upstream_aborts_total Total proxied transfers aborted by upstream origins
             \\# TYPE tardigrade_proxy_upstream_aborts_total counter
             \\tardigrade_proxy_upstream_aborts_total {d}
-            \\# HELP tardigrade_proxy_streaming_fallback_total Total proxied requests that used the buffered path after streaming eligibility checks
+            \\# HELP tardigrade_proxy_streaming_fallback_total Total streaming eligibility fallback events by reason
             \\# TYPE tardigrade_proxy_streaming_fallback_total counter
             \\tardigrade_proxy_streaming_fallback_total{{reason="policy_disabled"}} {d}
             \\tardigrade_proxy_streaming_fallback_total{{reason="retries_configured"}} {d}

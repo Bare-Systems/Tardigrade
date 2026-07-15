@@ -1338,10 +1338,9 @@ fn streamingUploadEligibilityBeforeBodyRead(
     request: *const http.Request,
 ) RequestUploadStreamingEligibility {
     if (!request.method.hasRequestBody()) return .not_applicable;
-    if (request.hasTransferEncoding()) return .{ .fallback = .chunked_request_upload };
-    const content_length = request.contentLength() orelse return .{ .fallback = .missing_content_length };
-    if (content_length == 0) return .not_applicable;
-    if (content_length > cfg.request_limits.effectiveMaxBodySize()) return .{ .fallback = .body_too_large };
+
+    const matched = http.location_router.matchLocation(request.uri.path, cfg.location_blocks) orelse return .{ .fallback = .unsupported_route_type };
+    if (!matched.block.proxy_streaming_policy.requestStreamingEnabled(cfg.proxy_streaming_mode.requestStreamingEnabled())) return .{ .fallback = .policy_disabled };
 
     if (cfg.rewrite_rules.len > 0 or cfg.return_rules.len > 0 or
         cfg.conditional_rules.len > 0 or cfg.internal_redirect_rules.len > 0 or
@@ -1354,8 +1353,11 @@ fn streamingUploadEligibilityBeforeBodyRead(
         if (request.method.isIdempotent()) return .{ .fallback = .retries_configured };
     }
 
-    const matched = http.location_router.matchLocation(request.uri.path, cfg.location_blocks) orelse return .{ .fallback = .unsupported_route_type };
-    if (!matched.block.proxy_streaming_policy.requestStreamingEnabled(cfg.proxy_streaming_mode.requestStreamingEnabled())) return .{ .fallback = .policy_disabled };
+    if (request.hasTransferEncoding()) return .{ .fallback = .chunked_request_upload };
+    const content_length = request.contentLength() orelse return .{ .fallback = .missing_content_length };
+    if (content_length == 0) return .not_applicable;
+    if (content_length > cfg.request_limits.effectiveMaxBodySize()) return .{ .fallback = .body_too_large };
+
     return switch (matched.block.action) {
         .proxy_pass => |target| if (targetStreamingFallbackReason(cfg, target)) |reason| .{ .fallback = reason } else .stream,
         else => .{ .fallback = .unsupported_route_type },
@@ -1366,6 +1368,11 @@ fn mayNeedStreamingRequestBodyPreRead(cfg: *const edge_config.EdgeConfig) bool {
     if (cfg.proxy_streaming_mode.requestStreamingEnabled()) return true;
     for (cfg.location_blocks) |block| {
         if (block.proxy_streaming_policy.requestStreamingEnabled(false)) return true;
+    }
+    for (cfg.server_blocks) |server_block| {
+        for (server_block.location_blocks) |block| {
+            if (block.proxy_streaming_policy.requestStreamingEnabled(false)) return true;
+        }
     }
     return false;
 }
@@ -1869,6 +1876,7 @@ fn initUploadEligibilityTestConfig(blocks: []edge_config.EdgeConfig.LocationBloc
     cfg.upstream_retry_attempts = 1;
     cfg.upstream_retry_idempotent_only = true;
     cfg.location_blocks = blocks;
+    cfg.server_blocks = &.{};
     cfg.upstream_base_url = "http://127.0.0.1:9001";
     cfg.upstream_tls_client_cert = "";
     return cfg;
@@ -1918,8 +1926,55 @@ test "streaming upload eligibility reports typed fallback reasons" {
     defer compat_head.request.deinit();
     try std.testing.expectEqual(RequestUploadStreamingEligibility{ .fallback = .policy_disabled }, streamingUploadEligibilityBeforeBodyRead(&cfg, &compat_head.request));
 
+    var compat_chunked_head = try http.Request.parseHead(
+        allocator,
+        "POST /compat/body HTTP/1.1\r\nHost: example.test\r\nTransfer-Encoding: chunked\r\n\r\n",
+        MAX_REQUEST_SIZE,
+    );
+    defer compat_chunked_head.request.deinit();
+    try std.testing.expectEqual(RequestUploadStreamingEligibility{ .fallback = .policy_disabled }, streamingUploadEligibilityBeforeBodyRead(&cfg, &compat_chunked_head.request));
+
     cfg.auth_request_url = "http://auth.example.test/check";
     try std.testing.expectEqual(RequestUploadStreamingEligibility{ .fallback = .body_dependent_middleware }, streamingUploadEligibilityBeforeBodyRead(&cfg, &upload_head.request));
+}
+
+test "streaming upload pre-read scan includes server block routes" {
+    var base_blocks = [_]edge_config.EdgeConfig.LocationBlock{
+        .{
+            .match_type = .prefix,
+            .pattern = "/",
+            .priority = 0,
+            .action = .{ .proxy_pass = "http://127.0.0.1:9001" },
+            .proxy_streaming_policy = .inherit,
+        },
+    };
+    var server_blocks = [_]edge_config.EdgeConfig.LocationBlock{
+        .{
+            .match_type = .prefix,
+            .pattern = "/upload/",
+            .priority = 0,
+            .action = .{ .proxy_pass = "http://127.0.0.1:9002" },
+            .proxy_streaming_policy = .full,
+        },
+    };
+    var server_names = [_][]const u8{"api.example.test"};
+    var server_block_entries = [_]edge_config.EdgeConfig.ServerBlock{
+        .{
+            .server_names = &server_names,
+            .doc_root = "",
+            .try_files = "",
+            .location_blocks = &server_blocks,
+            .tls_cert_path = "",
+            .tls_key_path = "",
+            .upstream_base_url = "",
+            .proxy_pass_chat = "",
+            .proxy_pass_commands_prefix = "",
+        },
+    };
+    var cfg = initUploadEligibilityTestConfig(&base_blocks);
+    cfg.server_blocks = &server_block_entries;
+
+    try std.testing.expect(mayNeedStreamingRequestBodyPreRead(&cfg));
 }
 
 // Pull gateway_handlers (and its transitive imports, including

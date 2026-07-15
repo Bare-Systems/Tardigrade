@@ -227,6 +227,7 @@ pub fn routeRequest(
                         ctx.scopes,
                         request.headers.get("host"),
                         matched.block.pattern,
+                        matched.block,
                         streaming_request_body,
                     );
                 },

@@ -177,10 +177,22 @@ busy worker).
 
 The streaming proxy path (`TARDIGRADE_PROXY_STREAMING_MODE=response|full`) now
 multiplexes over the same per-origin h2 connection instead of always speaking
-HTTP/1.1. `executeStreamingHttpProxyRequest` routes HTTPS targets through
+HTTP/1.1. Individual `location` blocks may override the global mode with
+`proxy_streaming inherit|off|response|full`; omitted route policy inherits the
+global setting. `executeStreamingHttpProxyRequest` routes HTTPS targets through
 `streamViaH2Pool` when `TARDIGRADE_UPSTREAM_PROTOCOL=h2|auto`; ALPN `http/1.1`
 origins fall back to the h1 streaming relay on that (fresh, unpooled)
 connection.
+
+Streaming eligibility is deterministic and observable. An eligibility check that
+falls back to the bounded buffered path increments
+`tardigrade_proxy_streaming_fallback_total{reason=...}` with one of:
+`policy_disabled`, `retries_configured`, `unix_socket_target`, or
+`upstream_mtls_target`. Full-mode upload eligibility uses the same metric for
+upload-specific fallbacks: `chunked_request_upload`, `missing_content_length`,
+`body_too_large`, `body_dependent_middleware`, and `unsupported_route_type`.
+The metric counts fallback events, not unique requests, because upload and
+response eligibility are evaluated at different phases.
 
 The actor gains a streaming request mode next to the fully-buffered
 `request()`:

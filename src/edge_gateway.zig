@@ -1311,33 +1311,70 @@ fn targetSupportsStdHttpStreaming(cfg: *const edge_config.EdgeConfig, target: []
     return !(cfg.upstream_tls_client_cert.len > 0 and std.mem.startsWith(u8, cfg.upstream_base_url, "https://"));
 }
 
-fn streamingUploadAllowedBeforeBodyRead(
+const RequestUploadStreamingEligibility = union(enum) {
+    stream,
+    fallback: gproxy_runtime.StreamingFallbackReason,
+    not_applicable,
+};
+
+fn targetStreamingFallbackReason(
+    cfg: *const edge_config.EdgeConfig,
+    target: []const u8,
+) ?gproxy_runtime.StreamingFallbackReason {
+    const trimmed = std.mem.trim(u8, target, " \t\r\n");
+    if (trimmed.len == 0) return .unsupported_route_type;
+    if (gp.unixSocketPathFromEndpoint(trimmed) != null) return .unix_socket_target;
+    if (isHttpUrl(trimmed)) {
+        if (cfg.upstream_tls_client_cert.len > 0 and std.mem.startsWith(u8, trimmed, "https://")) return .upstream_mtls_target;
+        return null;
+    }
+    if (gp.unixSocketPathFromEndpoint(cfg.upstream_base_url) != null) return .unix_socket_target;
+    if (cfg.upstream_tls_client_cert.len > 0 and std.mem.startsWith(u8, cfg.upstream_base_url, "https://")) return .upstream_mtls_target;
+    return null;
+}
+
+fn streamingUploadEligibilityBeforeBodyRead(
     cfg: *const edge_config.EdgeConfig,
     request: *const http.Request,
-) bool {
-    if (!cfg.proxy_streaming_mode.requestStreamingEnabled()) return false;
-    if (!request.method.hasRequestBody()) return false;
-    if (request.hasTransferEncoding()) return false;
-    const content_length = request.contentLength() orelse return false;
-    if (content_length == 0) return false;
-    if (content_length > cfg.request_limits.effectiveMaxBodySize()) return false;
+) RequestUploadStreamingEligibility {
+    if (!request.method.hasRequestBody()) return .not_applicable;
+
+    const matched = http.location_router.matchLocation(request.uri.path, cfg.location_blocks) orelse return .{ .fallback = .unsupported_route_type };
+    if (!matched.block.proxy_streaming_policy.requestStreamingEnabled(cfg.proxy_streaming_mode.requestStreamingEnabled())) return .{ .fallback = .policy_disabled };
 
     if (cfg.rewrite_rules.len > 0 or cfg.return_rules.len > 0 or
         cfg.conditional_rules.len > 0 or cfg.internal_redirect_rules.len > 0 or
         cfg.mirror_rules.len > 0 or cfg.auth_request_url.len > 0)
     {
-        return false;
+        return .{ .fallback = .body_dependent_middleware };
     }
     if (cfg.upstream_retry_attempts > 1) {
-        if (!cfg.upstream_retry_idempotent_only) return false;
-        if (request.method.isIdempotent()) return false;
+        if (!cfg.upstream_retry_idempotent_only) return .{ .fallback = .retries_configured };
+        if (request.method.isIdempotent()) return .{ .fallback = .retries_configured };
     }
 
-    const matched = http.location_router.matchLocation(request.uri.path, cfg.location_blocks) orelse return false;
+    if (request.hasTransferEncoding()) return .{ .fallback = .chunked_request_upload };
+    const content_length = request.contentLength() orelse return .{ .fallback = .missing_content_length };
+    if (content_length == 0) return .not_applicable;
+    if (content_length > cfg.request_limits.effectiveMaxBodySize()) return .{ .fallback = .body_too_large };
+
     return switch (matched.block.action) {
-        .proxy_pass => |target| targetSupportsStdHttpStreaming(cfg, target),
-        else => false,
+        .proxy_pass => |target| if (targetStreamingFallbackReason(cfg, target)) |reason| .{ .fallback = reason } else .stream,
+        else => .{ .fallback = .unsupported_route_type },
     };
+}
+
+fn mayNeedStreamingRequestBodyPreRead(cfg: *const edge_config.EdgeConfig) bool {
+    if (cfg.proxy_streaming_mode.requestStreamingEnabled()) return true;
+    for (cfg.location_blocks) |block| {
+        if (block.proxy_streaming_policy.requestStreamingEnabled(false)) return true;
+    }
+    for (cfg.server_blocks) |server_block| {
+        for (server_block.location_blocks) |block| {
+            if (block.proxy_streaming_policy.requestStreamingEnabled(false)) return true;
+        }
+    }
+    return false;
 }
 
 fn streamingRequestBodyFromHead(
@@ -1409,7 +1446,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
     var request_initialized = false;
     defer if (request_initialized) request.deinit();
 
-    if (cfg.proxy_streaming_mode.requestStreamingEnabled()) {
+    if (mayNeedStreamingRequestBodyPreRead(cfg)) {
         const head_read = try gconn.readHttpRequestHead(conn, pending_buf, &session.pending_len);
         if (head_read.total_read == 0) return;
         if (cfg.max_connection_memory_bytes > 0 and head_read.total_read > cfg.max_connection_memory_bytes) {
@@ -1425,47 +1462,56 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         };
         var pre_effective_cfg_storage = cfg.*;
         const pre_effective_cfg = ga.resolveRequestConfig(cfg, head_parse.request.headers.get("host"), &pre_effective_cfg_storage) orelse cfg;
-        if (streamingUploadAllowedBeforeBodyRead(pre_effective_cfg, &head_parse.request)) {
-            streaming_request_body = streamingRequestBodyFromHead(&head_parse.request, pending_buf, head_read, head_parse.bytes_consumed);
-            request = head_parse.request;
-            request_initialized = true;
-            session.pending_len = 0;
-        } else {
-            head_parse.request.deinit();
-            // Switch SO_RCVTIMEO from header phase to body read phase.
-            const body_timeout_ms = cfg.request_limits.effectiveBodyTimeout();
-            if (body_timeout_ms > 0) {
-                if (connRawFd(conn)) |fd| {
-                    const write_timeout_ms = if (cfg.downstream_write_timeout_ms > 0)
-                        cfg.downstream_write_timeout_ms
-                    else
-                        cfg.request_limits.effectiveHeaderTimeout();
-                    gconn.setSocketTimeoutMs(fd, body_timeout_ms, write_timeout_ms) catch {};
+        const upload_eligibility = streamingUploadEligibilityBeforeBodyRead(pre_effective_cfg, &head_parse.request);
+        switch (upload_eligibility) {
+            .stream => {
+                streaming_request_body = streamingRequestBodyFromHead(&head_parse.request, pending_buf, head_read, head_parse.bytes_consumed);
+                request = head_parse.request;
+                request_initialized = true;
+                session.pending_len = 0;
+            },
+            .fallback, .not_applicable => {
+                if (upload_eligibility == .fallback) {
+                    const reason = upload_eligibility.fallback;
+                    state.metricsRecordProxyStreamingFallback(reason.metricLabel());
+                    state.logger.debug(null, "proxy upload streaming fallback: {s}", .{reason.metricLabel()});
                 }
-            }
-            const total_read = try gconn.readHttpRequest(conn, pending_buf, &session.pending_len);
-            if (total_read == 0) return;
-            if (cfg.max_connection_memory_bytes > 0 and total_read > cfg.max_connection_memory_bytes) {
-                session.pending_len = 0;
-                try gp.sendApiError(allocator, conn.writer(), .payload_too_large, "invalid_request", "Connection memory limit exceeded", null, false, state);
-                return;
-            }
-            const parse_result = http.Request.parse(allocator, pending_buf[0..total_read], MAX_REQUEST_SIZE) catch |err| {
-                if (err == error.OutOfMemory) return err; // resource failure, not a client parse error
-                try gp.sendApiError(allocator, conn.writer(), parseRequestErrorStatus(err), "invalid_request", "Malformed request", null, keep_alive, state);
-                state.logger.warn(null, "parse error: {}", .{err});
-                return;
-            };
-            const bytes_consumed = parse_result.bytes_consumed;
-            if (bytes_consumed < total_read) {
-                const remaining = total_read - bytes_consumed;
-                std.mem.copyForwards(u8, pending_buf[0..remaining], pending_buf[bytes_consumed..total_read]);
-                session.pending_len = remaining;
-            } else {
-                session.pending_len = 0;
-            }
-            request = parse_result.request;
-            request_initialized = true;
+                head_parse.request.deinit();
+                // Switch SO_RCVTIMEO from header phase to body read phase.
+                const body_timeout_ms = cfg.request_limits.effectiveBodyTimeout();
+                if (body_timeout_ms > 0) {
+                    if (connRawFd(conn)) |fd| {
+                        const write_timeout_ms = if (cfg.downstream_write_timeout_ms > 0)
+                            cfg.downstream_write_timeout_ms
+                        else
+                            cfg.request_limits.effectiveHeaderTimeout();
+                        gconn.setSocketTimeoutMs(fd, body_timeout_ms, write_timeout_ms) catch {};
+                    }
+                }
+                const total_read = try gconn.readHttpRequest(conn, pending_buf, &session.pending_len);
+                if (total_read == 0) return;
+                if (cfg.max_connection_memory_bytes > 0 and total_read > cfg.max_connection_memory_bytes) {
+                    session.pending_len = 0;
+                    try gp.sendApiError(allocator, conn.writer(), .payload_too_large, "invalid_request", "Connection memory limit exceeded", null, false, state);
+                    return;
+                }
+                const parse_result = http.Request.parse(allocator, pending_buf[0..total_read], MAX_REQUEST_SIZE) catch |err| {
+                    if (err == error.OutOfMemory) return err; // resource failure, not a client parse error
+                    try gp.sendApiError(allocator, conn.writer(), parseRequestErrorStatus(err), "invalid_request", "Malformed request", null, keep_alive, state);
+                    state.logger.warn(null, "parse error: {}", .{err});
+                    return;
+                };
+                const bytes_consumed = parse_result.bytes_consumed;
+                if (bytes_consumed < total_read) {
+                    const remaining = total_read - bytes_consumed;
+                    std.mem.copyForwards(u8, pending_buf[0..remaining], pending_buf[bytes_consumed..total_read]);
+                    session.pending_len = remaining;
+                } else {
+                    session.pending_len = 0;
+                }
+                request = parse_result.request;
+                request_initialized = true;
+            },
         }
     } else {
         const total_read = try gconn.readHttpRequest(conn, pending_buf, &session.pending_len);
@@ -1815,6 +1861,120 @@ test "return_response method enforcement — non-GET/HEAD rejected on static ret
     // Redirect: method enforcement is skipped
     const is_redirect_302 = (302 >= 300 and 302 < 400);
     try std.testing.expect(is_redirect_302);
+}
+
+fn initUploadEligibilityTestConfig(blocks: []edge_config.EdgeConfig.LocationBlock) edge_config.EdgeConfig {
+    var cfg: edge_config.EdgeConfig = undefined;
+    cfg.proxy_streaming_mode = .off;
+    cfg.request_limits = http.request_limits.RequestLimits.default;
+    cfg.rewrite_rules = &.{};
+    cfg.return_rules = &.{};
+    cfg.conditional_rules = &.{};
+    cfg.internal_redirect_rules = &.{};
+    cfg.mirror_rules = &.{};
+    cfg.auth_request_url = "";
+    cfg.upstream_retry_attempts = 1;
+    cfg.upstream_retry_idempotent_only = true;
+    cfg.location_blocks = blocks;
+    cfg.server_blocks = &.{};
+    cfg.upstream_base_url = "http://127.0.0.1:9001";
+    cfg.upstream_tls_client_cert = "";
+    return cfg;
+}
+
+test "streaming upload eligibility reports typed fallback reasons" {
+    const allocator = std.testing.allocator;
+    var blocks = [_]edge_config.EdgeConfig.LocationBlock{
+        .{
+            .match_type = .prefix,
+            .pattern = "/upload/",
+            .priority = 0,
+            .action = .{ .proxy_pass = "http://127.0.0.1:9001" },
+            .proxy_streaming_policy = .full,
+        },
+        .{
+            .match_type = .prefix,
+            .pattern = "/compat/",
+            .priority = 1,
+            .action = .{ .proxy_pass = "http://127.0.0.1:9001" },
+            .proxy_streaming_policy = .off,
+        },
+    };
+    var cfg = initUploadEligibilityTestConfig(&blocks);
+
+    var upload_head = try http.Request.parseHead(
+        allocator,
+        "POST /upload/body HTTP/1.1\r\nHost: example.test\r\nContent-Length: 4\r\n\r\n",
+        MAX_REQUEST_SIZE,
+    );
+    defer upload_head.request.deinit();
+    try std.testing.expectEqual(RequestUploadStreamingEligibility.stream, streamingUploadEligibilityBeforeBodyRead(&cfg, &upload_head.request));
+
+    var chunked_head = try http.Request.parseHead(
+        allocator,
+        "POST /upload/body HTTP/1.1\r\nHost: example.test\r\nTransfer-Encoding: chunked\r\n\r\n",
+        MAX_REQUEST_SIZE,
+    );
+    defer chunked_head.request.deinit();
+    try std.testing.expectEqual(RequestUploadStreamingEligibility{ .fallback = .chunked_request_upload }, streamingUploadEligibilityBeforeBodyRead(&cfg, &chunked_head.request));
+
+    var compat_head = try http.Request.parseHead(
+        allocator,
+        "POST /compat/body HTTP/1.1\r\nHost: example.test\r\nContent-Length: 4\r\n\r\n",
+        MAX_REQUEST_SIZE,
+    );
+    defer compat_head.request.deinit();
+    try std.testing.expectEqual(RequestUploadStreamingEligibility{ .fallback = .policy_disabled }, streamingUploadEligibilityBeforeBodyRead(&cfg, &compat_head.request));
+
+    var compat_chunked_head = try http.Request.parseHead(
+        allocator,
+        "POST /compat/body HTTP/1.1\r\nHost: example.test\r\nTransfer-Encoding: chunked\r\n\r\n",
+        MAX_REQUEST_SIZE,
+    );
+    defer compat_chunked_head.request.deinit();
+    try std.testing.expectEqual(RequestUploadStreamingEligibility{ .fallback = .policy_disabled }, streamingUploadEligibilityBeforeBodyRead(&cfg, &compat_chunked_head.request));
+
+    cfg.auth_request_url = "http://auth.example.test/check";
+    try std.testing.expectEqual(RequestUploadStreamingEligibility{ .fallback = .body_dependent_middleware }, streamingUploadEligibilityBeforeBodyRead(&cfg, &upload_head.request));
+}
+
+test "streaming upload pre-read scan includes server block routes" {
+    var base_blocks = [_]edge_config.EdgeConfig.LocationBlock{
+        .{
+            .match_type = .prefix,
+            .pattern = "/",
+            .priority = 0,
+            .action = .{ .proxy_pass = "http://127.0.0.1:9001" },
+            .proxy_streaming_policy = .inherit,
+        },
+    };
+    var server_blocks = [_]edge_config.EdgeConfig.LocationBlock{
+        .{
+            .match_type = .prefix,
+            .pattern = "/upload/",
+            .priority = 0,
+            .action = .{ .proxy_pass = "http://127.0.0.1:9002" },
+            .proxy_streaming_policy = .full,
+        },
+    };
+    var server_names = [_][]const u8{"api.example.test"};
+    var server_block_entries = [_]edge_config.EdgeConfig.ServerBlock{
+        .{
+            .server_names = &server_names,
+            .doc_root = "",
+            .try_files = "",
+            .location_blocks = &server_blocks,
+            .tls_cert_path = "",
+            .tls_key_path = "",
+            .upstream_base_url = "",
+            .proxy_pass_chat = "",
+            .proxy_pass_commands_prefix = "",
+        },
+    };
+    var cfg = initUploadEligibilityTestConfig(&base_blocks);
+    cfg.server_blocks = &server_block_entries;
+
+    try std.testing.expect(mayNeedStreamingRequestBodyPreRead(&cfg));
 }
 
 // Pull gateway_handlers (and its transitive imports, including

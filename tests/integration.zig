@@ -3350,6 +3350,101 @@ test "proxy streaming mode relays upstream body beyond buffered cap" {
     try std.testing.expectEqual(@as(u64, 0), buffered);
 }
 
+test "proxy route streaming policy overrides global mode" {
+    const allocator = std.testing.allocator;
+    const payload_len = 256 * 1024;
+    const payload = try allocator.alloc(u8, payload_len);
+    defer allocator.free(payload);
+    @memset(payload, 'x');
+
+    var streaming_upstream = try UpstreamServer.start(allocator, &.{.{
+        .body = payload,
+        .headers = &.{.{ .name = "Content-Type", .value = "application/octet-stream" }},
+    }});
+    defer streaming_upstream.stop();
+    try streaming_upstream.run();
+
+    const streaming_config = try std.fmt.allocPrint(allocator,
+        \\location /stream/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\    proxy_streaming response;
+        \\}}
+    , .{ test_host, streaming_upstream.port() });
+    defer allocator.free(streaming_config);
+
+    var streaming_tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = streaming_config,
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_PROXY_STREAMING_MODE", .value = "off" },
+            .{ .name = "TARDIGRADE_PROXY_STREAM_BUFFER_SIZE", .value = "4096" },
+            .{ .name = "TARDIGRADE_MAX_BUFFERED_UPSTREAM_RESPONSE_BYTES", .value = "65536" },
+        },
+    });
+    defer streaming_tardigrade.stop();
+
+    var streamed_response = try sendRequest(allocator, streaming_tardigrade.port, .{
+        .method = "GET",
+        .path = "/stream/large.bin",
+        .body = null,
+        .headers = &.{},
+    });
+    defer streamed_response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), streamed_response.status_code);
+    try std.testing.expectEqual(@as(usize, payload_len), streamed_response.body.len);
+
+    var streaming_metrics = try sendRequest(allocator, streaming_tardigrade.port, .{
+        .method = "GET",
+        .path = "/status/metrics",
+        .body = null,
+        .headers = &.{},
+    });
+    defer streaming_metrics.deinit();
+    const streamed = prometheusMetricValue(streaming_metrics.body, "tardigrade_proxy_streaming_requests_total") orelse return error.InvalidHttpResponse;
+    try std.testing.expect(streamed >= 1);
+
+    var buffered_upstream = try UpstreamServer.start(allocator, &.{.{
+        .body = "small buffered response",
+        .headers = &.{.{ .name = "Content-Type", .value = "text/plain" }},
+    }});
+    defer buffered_upstream.stop();
+    try buffered_upstream.run();
+
+    const buffered_config = try std.fmt.allocPrint(allocator,
+        \\location /compat/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\    proxy_streaming off;
+        \\}}
+    , .{ test_host, buffered_upstream.port() });
+    defer allocator.free(buffered_config);
+
+    var buffered_tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = buffered_config,
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_PROXY_STREAMING_MODE", .value = "full" },
+        },
+    });
+    defer buffered_tardigrade.stop();
+
+    var buffered_response = try sendRequest(allocator, buffered_tardigrade.port, .{
+        .method = "POST",
+        .path = "/compat/small.txt",
+        .body = "request body",
+        .headers = &.{.{ .name = "Content-Type", .value = "text/plain" }},
+    });
+    defer buffered_response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), buffered_response.status_code);
+    try std.testing.expectEqualStrings("small buffered response", buffered_response.body);
+
+    var buffered_metrics = try sendRequest(allocator, buffered_tardigrade.port, .{
+        .method = "GET",
+        .path = "/status/metrics",
+        .body = null,
+        .headers = &.{},
+    });
+    defer buffered_metrics.deinit();
+    try std.testing.expect(std.mem.find(u8, buffered_metrics.body, "tardigrade_proxy_streaming_fallback_total{reason=\"policy_disabled\"} 2") != null);
+}
+
 test "proxy streaming mode handles chunked and no-body upstream responses" {
     const allocator = std.testing.allocator;
 
@@ -3525,6 +3620,60 @@ test "proxy full streaming mode relays fixed-length upload beyond request buffer
     defer response.deinit();
     try std.testing.expectEqual(@as(u16, 200), response.status_code);
     try std.testing.expectEqualStrings("uploaded", response.body);
+
+    const captured = try upstream.capturedBody(allocator);
+    defer allocator.free(captured);
+    try std.testing.expectEqual(@as(usize, payload_len), captured.len);
+    try std.testing.expectEqualStrings(payload, captured);
+}
+
+test "proxy full streaming upload works for server block route override" {
+    const allocator = std.testing.allocator;
+    const payload_len = 384 * 1024;
+    const payload = try allocator.alloc(u8, payload_len);
+    defer allocator.free(payload);
+    @memset(payload, 'v');
+
+    var upstream = try UpstreamServer.start(allocator, &.{.{
+        .body = "vhost uploaded",
+        .headers = &.{.{ .name = "Content-Type", .value = "text/plain" }},
+    }});
+    defer upstream.stop();
+    try upstream.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\server {{
+        \\    server_name uploads.example.test;
+        \\    location /upload {{
+        \\        proxy_pass http://{s}:{d}/upload;
+        \\        proxy_streaming full;
+        \\    }}
+        \\}}
+    , .{ test_host, upstream.port() });
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_PROXY_STREAMING_MODE", .value = "off" },
+            .{ .name = "TARDIGRADE_PROXY_STREAM_BUFFER_SIZE", .value = "4096" },
+            .{ .name = "TARDIGRADE_MAX_BODY_SIZE", .value = "524288" },
+        },
+    });
+    defer tardigrade.stop();
+
+    var response = try sendRequest(allocator, tardigrade.port, .{
+        .method = "POST",
+        .path = "/upload",
+        .body = payload,
+        .headers = &.{
+            .{ .name = "Host", .value = "uploads.example.test" },
+            .{ .name = "Content-Type", .value = "application/octet-stream" },
+        },
+    });
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status_code);
+    try std.testing.expectEqualStrings("vhost uploaded", response.body);
 
     const captured = try upstream.capturedBody(allocator);
     defer allocator.free(captured);

@@ -36,6 +36,14 @@ logs are written through `src/http/logger.zig`.
 - reverse-proxy abort counters:
   `tardigrade_proxy_client_aborts_total` and
   `tardigrade_proxy_upstream_aborts_total`
+- reverse-proxy streaming fallback event counter:
+  `tardigrade_proxy_streaming_fallback_total{reason=...}` with fixed reasons
+  `policy_disabled`, `retries_configured`, `unix_socket_target`, and
+  `upstream_mtls_target` for response-path eligibility plus
+  `chunked_request_upload`, `missing_content_length`, `body_too_large`,
+  `body_dependent_middleware`, and `unsupported_route_type` for request-upload
+  eligibility. Upload and response eligibility are evaluated separately, so one
+  request can contribute more than one fallback event.
 - reverse-proxy upstream TTFB summary: `tardigrade_proxy_ttfb_ms`
 
 The latency histogram is intentionally global rather than route-labeled to keep

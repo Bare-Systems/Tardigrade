@@ -2329,11 +2329,16 @@ fn parseLocationBlocks(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeCon
         }
 
         var auth: http.location_router.AuthMode = .off;
-        if (fields.next()) |auth_raw| {
-            const trimmed_auth = std.mem.trim(u8, auth_raw, " \t\r\n");
-            if (!std.mem.startsWith(u8, trimmed_auth, "auth:")) return error.InvalidLocationBlockFormat;
-            auth = http.location_router.AuthMode.parse(trimmed_auth["auth:".len..]) orelse return error.InvalidLocationBlockFormat;
-            if (fields.next() != null) return error.InvalidLocationBlockFormat;
+        var proxy_streaming_policy: http.location_router.ProxyStreamingPolicy = .inherit;
+        while (fields.next()) |option_raw| {
+            const option = std.mem.trim(u8, option_raw, " \t\r\n");
+            if (std.mem.startsWith(u8, option, "auth:")) {
+                auth = http.location_router.AuthMode.parse(option["auth:".len..]) orelse return error.InvalidLocationBlockFormat;
+            } else if (std.mem.startsWith(u8, option, "stream:")) {
+                proxy_streaming_policy = http.location_router.ProxyStreamingPolicy.parse(option["stream:".len..]) orelse return error.InvalidLocationBlockFormat;
+            } else {
+                return error.InvalidLocationBlockFormat;
+            }
         }
 
         try out.append(allocator, .{
@@ -2343,6 +2348,7 @@ fn parseLocationBlocks(allocator: std.mem.Allocator, raw: []const u8) ![]EdgeCon
             .action = action,
             .error_pages = &.{},
             .auth = auth,
+            .proxy_streaming_policy = proxy_streaming_policy,
         });
     }
 
@@ -2909,6 +2915,17 @@ test "parse proxy streaming mode aliases" {
     try std.testing.expect(ProxyStreamingMode.parse("invalid") == null);
 }
 
+test "parse route proxy streaming policy aliases" {
+    try std.testing.expectEqual(http.location_router.ProxyStreamingPolicy.inherit, http.location_router.ProxyStreamingPolicy.parse("inherit").?);
+    try std.testing.expectEqual(http.location_router.ProxyStreamingPolicy.off, http.location_router.ProxyStreamingPolicy.parse("buffered").?);
+    try std.testing.expectEqual(http.location_router.ProxyStreamingPolicy.response, http.location_router.ProxyStreamingPolicy.parse("responses").?);
+    try std.testing.expectEqual(http.location_router.ProxyStreamingPolicy.full, http.location_router.ProxyStreamingPolicy.parse("request-response").?);
+    try std.testing.expect(!http.location_router.ProxyStreamingPolicy.off.responseStreamingEnabled(true));
+    try std.testing.expect(http.location_router.ProxyStreamingPolicy.inherit.responseStreamingEnabled(true));
+    try std.testing.expect(http.location_router.ProxyStreamingPolicy.full.requestStreamingEnabled(false));
+    try std.testing.expect(http.location_router.ProxyStreamingPolicy.parse("sometimes") == null);
+}
+
 test "config port parser rejects invalid listener values" {
     try std.testing.expectEqual(@as(u16, 8069), try parseConfigPort("listen_port", "8069"));
     try std.testing.expectError(error.InvalidConfigPort, parseConfigPort("listen_port", "0"));
@@ -3151,6 +3168,25 @@ test "parse location blocks csv" {
         },
         else => return error.UnexpectedTestResult,
     }
+}
+
+test "parse location blocks include route streaming policy option" {
+    const allocator = std.testing.allocator;
+    const blocks = try parseLocationBlocks(
+        allocator,
+        "prefix|/buffered/|proxy_pass|http://127.0.0.1:9001|stream:off;prefix|/full/|proxy_pass|http://127.0.0.1:9002|auth:required|stream:full",
+    );
+    defer {
+        for (blocks) |*block| {
+            block.deinit(allocator);
+        }
+        allocator.free(blocks);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), blocks.len);
+    try std.testing.expectEqual(http.location_router.ProxyStreamingPolicy.off, blocks[0].proxy_streaming_policy);
+    try std.testing.expectEqual(http.location_router.ProxyStreamingPolicy.full, blocks[1].proxy_streaming_policy);
+    try std.testing.expectEqual(http.location_router.AuthMode.required, blocks[1].auth);
 }
 
 test "apply location error pages csv" {

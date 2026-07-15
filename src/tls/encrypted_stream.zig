@@ -1452,6 +1452,39 @@ test "encrypted stream duplicate close_notify and data after close are ignored" 
     try testing.expectError(error.EndOfStream, client.stream().read(&buf));
 }
 
+test "encrypted stream keeps write side open after peer close_notify" {
+    const cp = testProvider();
+    var client = PureZigRecordStream.init(.client, cp, .tls_aes_128_gcm_sha256);
+    defer client.deinit();
+    var server = PureZigRecordStream.init(.server, cp, .tls_aes_128_gcm_sha256);
+    defer server.deinit();
+    try establish(&client, &server);
+
+    var client_close_buf: [record_codec.max_ciphertext_record_len]u8 = undefined;
+    const client_close = try client.bridge.sealProtected(.application, .alert, &.{ 1, 0 }, &client_close_buf);
+    try feedAllCiphertext(&server, client_close);
+
+    var scratch: [8]u8 = undefined;
+    try testing.expectError(error.EndOfStream, server.stream().read(&scratch));
+    const one_sided = server.stream().readiness();
+    try testing.expect(one_sided.peer_closed);
+    try testing.expect(one_sided.can_write_plaintext);
+
+    const final_payload = "server-final";
+    try testing.expectEqual(@as(usize, final_payload.len), try server.stream().write(final_payload));
+    _ = try pumpCiphertext(&server, &client, 7);
+    var client_plaintext: [final_payload.len]u8 = undefined;
+    const client_read = try client.stream().read(&client_plaintext);
+    try testing.expectEqualStrings(final_payload, client_plaintext[0..client_read]);
+
+    server.stream().close();
+    _ = try server.stream().drive();
+    var server_close: [record_codec.max_ciphertext_record_len]u8 = undefined;
+    const close_len = try server.drainCiphertext(&server_close);
+    try feedAllCiphertext(&client, server_close[0..close_len]);
+    try testing.expectError(error.EndOfStream, client.stream().read(&scratch));
+}
+
 test "encrypted stream close sends close_notify before closing owned carrier" {
     const ClosingCarrier = struct {
         written: ByteQueue(record_codec.max_ciphertext_record_len, error.CiphertextBufferFull) = .{},

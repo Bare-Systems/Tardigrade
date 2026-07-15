@@ -530,7 +530,7 @@ fn opensslStreamRead(ptr: *anyopaque, out: []u8) encrypted_stream.Error!usize {
 fn opensslStreamWrite(ptr: *anyopaque, bytes: []const u8) encrypted_stream.Error!usize {
     const self: *TlsConnection = @ptrCast(@alignCast(ptr));
     if (self.stream_failure) |err| return err;
-    if (self.stream_lifecycle != .open or self.peer_closed) return error.StreamClosed;
+    if (self.stream_lifecycle != .open) return error.StreamClosed;
     if (self.pending_write) |pending| {
         if (!pending.matches(bytes)) return error.RetryOperationPending;
     } else {
@@ -633,7 +633,7 @@ fn opensslStreamReadiness(ptr: *anyopaque) encrypted_stream.Readiness {
         .wants_read = self.retry_direction == .read or (self.retry_direction == .none and pending == 0 and !self.peer_closed),
         .wants_write = self.retry_direction == .write,
         .can_read_plaintext = pending > 0,
-        .can_write_plaintext = self.retry_direction == .none and !self.peer_closed,
+        .can_write_plaintext = self.retry_direction == .none,
         .peer_closed = self.peer_closed,
     };
 }
@@ -1510,6 +1510,41 @@ test "openssl encrypted stream drives graceful bidirectional shutdown" {
     try std.testing.expect(driven.readiness.peer_closed);
     try std.testing.expect(!driven.readiness.wants_read);
     try std.testing.expect(!driven.readiness.wants_write);
+    try encrypted_stream.expectClosedConformance(stream);
+}
+
+test "openssl encrypted stream keeps write side open after peer close_notify" {
+    const allocator = std.testing.allocator;
+    var pair = try makeTestTlsPair(allocator);
+    defer pair.deinit();
+
+    const stream = pair.server.stream();
+    try std.testing.expectEqual(@as(c_int, 0), c.SSL_shutdown(pair.client_ssl));
+
+    var scratch: [32]u8 = undefined;
+    try std.testing.expectError(error.EndOfStream, stream.read(&scratch));
+    const one_sided = stream.readiness();
+    try std.testing.expect(one_sided.peer_closed);
+    try std.testing.expect(!one_sided.wants_read);
+    try std.testing.expect(one_sided.can_write_plaintext);
+
+    const final_payload = "server-final";
+    try std.testing.expectEqual(final_payload.len, try stream.write(final_payload));
+    var client_buf: [final_payload.len]u8 = undefined;
+    try clientReadExact(pair.client_ssl, &client_buf);
+    try std.testing.expectEqualStrings(final_payload, &client_buf);
+
+    stream.close();
+    for (0..1024) |_| {
+        _ = try stream.drive();
+        if (pair.server.stream_lifecycle == .closed) break;
+        std.Thread.yield() catch {};
+    }
+
+    c.ERR_clear_error();
+    try std.testing.expectEqual(@as(c_int, 1), c.SSL_shutdown(pair.client_ssl));
+    const driven = try stream.drive();
+    try std.testing.expect(driven.readiness.peer_closed);
     try encrypted_stream.expectClosedConformance(stream);
 }
 

@@ -137,6 +137,27 @@ fn requireCase(id: []const u8) error{MissingCaseMetadata}!*const CaseMeta {
     return error.MissingCaseMetadata;
 }
 
+const ExecutionLog = struct {
+    ids: [case_registry.len][]const u8 = undefined,
+    len: usize = 0,
+
+    fn execute(self: *ExecutionLog, id: []const u8) !*const CaseMeta {
+        const meta = try requireCase(id);
+        if (!self.hasId(id)) {
+            self.ids[self.len] = id;
+            self.len += 1;
+        }
+        return meta;
+    }
+
+    fn hasId(self: *const ExecutionLog, id: []const u8) bool {
+        for (self.ids[0..self.len]) |executed| {
+            if (std.mem.eql(u8, executed, id)) return true;
+        }
+        return false;
+    }
+};
+
 fn algorithmEql(a: profile.Algorithm, b: profile.Algorithm) bool {
     return switch (a) {
         .hash => |value| b == .hash and b.hash == value,
@@ -149,8 +170,9 @@ fn algorithmEql(a: profile.Algorithm, b: profile.Algorithm) bool {
     };
 }
 
-fn hasCase(provider_kind: ProviderKind, algorithm: profile.Algorithm, class: CaseClass) bool {
-    for (case_registry) |entry| {
+fn executedCase(log: *const ExecutionLog, provider_kind: ProviderKind, algorithm: profile.Algorithm, class: CaseClass) bool {
+    for (log.ids[0..log.len]) |id| {
+        const entry = requireCase(id) catch unreachable;
         const entry_algorithm = entry.algorithm orelse continue;
         if (entry.class == class and entry.providers.has(provider_kind) and algorithmEql(entry_algorithm, algorithm)) return true;
     }
@@ -181,12 +203,13 @@ fn requiresNegativeCase(algorithm: profile.Algorithm) bool {
     };
 }
 
-test "vector manifest records provenance and licensing" {
+fn validateManifest(log: *const ExecutionLog) !void {
     for (case_registry) |entry| {
         try testing.expect(entry.id.len > 0);
         try testing.expect(entry.source.len > 0);
         try testing.expect(entry.license.len > 0);
         try testing.expect(entry.reproduction.len > 0);
+        try testing.expect(log.hasId(entry.id));
     }
     for (waivers) |waiver| {
         try testing.expect(waiver.reason.len > 0);
@@ -198,28 +221,29 @@ test "vector manifest records provenance and licensing" {
     }
 }
 
-test "capability matrix has vector coverage or explicit waivers" {
+fn validateCapabilityMatrix(log: *const ExecutionLog) !void {
     for (profile.rows) |row| {
         inline for (.{ ProviderKind.pure_zig, ProviderKind.openssl }) |provider_kind| {
             switch (rowStatus(provider_kind, row)) {
                 .supported => {
-                    try testing.expect(hasCase(provider_kind, row.algorithm, .positive) or hasWaiver(provider_kind, row.algorithm));
+                    try testing.expect(executedCase(log, provider_kind, row.algorithm, .positive) or hasWaiver(provider_kind, row.algorithm));
                     if (requiresNegativeCase(row.algorithm)) {
-                        try testing.expect(hasCase(provider_kind, row.algorithm, .negative) or hasWaiver(provider_kind, row.algorithm));
+                        try testing.expect(executedCase(log, provider_kind, row.algorithm, .negative) or hasWaiver(provider_kind, row.algorithm));
                     }
                 },
-                .provider_deferred, .unsupported => try testing.expect(hasCase(provider_kind, row.algorithm, .negative) or hasWaiver(provider_kind, row.algorithm)),
+                .provider_deferred, .unsupported => try testing.expect(executedCase(log, provider_kind, row.algorithm, .negative) or hasWaiver(provider_kind, row.algorithm)),
             }
         }
     }
 }
 
-test "provider HKDF stages match RFC 5869 and TLS expand-label vectors" {
-    _ = try requireCase("hkdf-rfc5869-extract-sha256");
-    _ = try requireCase("hkdf-expand-label-sha256-fixed");
-    _ = try requireCase("hkdf-expand-label-sha384-fixed");
-    _ = try requireCase("hkdf-invalid-secret-length");
-    _ = try requireCase("hkdf-invalid-secret-length-sha384");
+fn runHkdfVectors(log: *ExecutionLog) !void {
+    _ = try log.execute("hkdf-rfc5869-extract-sha256");
+    _ = try log.execute("hkdf-expand-label-sha256-fixed");
+    _ = try log.execute("hkdf-expand-label-sha384-fixed");
+    _ = try log.execute("sha384-expand-label-fixed");
+    _ = try log.execute("hkdf-invalid-secret-length");
+    _ = try log.execute("hkdf-invalid-secret-length-sha384");
     const cp = cryptoProvider();
 
     const ikm = hexBytes("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b");
@@ -252,8 +276,8 @@ test "provider HKDF stages match RFC 5869 and TLS expand-label vectors" {
     try testing.expectError(error.InvalidInput, cp.hkdfExpandLabel(.sha384, "short", "derived", "", &invalid));
 }
 
-test "TLS 1.3 key schedule KAT matches RFC 8448 precomputed hashes" {
-    _ = try requireCase("tls13-key-schedule-rfc8448");
+fn runTlsKeyScheduleVector(log: *ExecutionLog) !void {
+    _ = try log.execute("tls13-key-schedule-rfc8448");
     const KeySchedule = tls_core.key_schedule.KeySchedule;
 
     const shared = hexBytes("8bd4054fb55b9d63fdfbacf9f04b9f0d35e6d63f537563efd46272900f89492d");
@@ -274,8 +298,8 @@ test "TLS 1.3 key schedule KAT matches RFC 8448 precomputed hashes" {
     try expectStage("tls13 server Finished verify_data / RFC 8448", &hexBytes("c5486af1426697c43c18dab6a79ef816a2188023ea743133b7e3b15a2c05c955"), &KeySchedule.verifyData(schedule.server_handshake_traffic, finished_hash));
 }
 
-test "TLS transcript helper hashes encoded handshake bytes and HRR message_hash" {
-    _ = try requireCase("sha256-transcript-hrr-rewrite");
+fn runTranscriptVector(log: *ExecutionLog) !void {
+    _ = try log.execute("sha256-transcript-hrr-rewrite");
     const Transcript = tls_core.transcript.Transcript;
 
     const client_hello_1 = hexBytes("01000003aabbcc");
@@ -297,8 +321,8 @@ test "TLS transcript helper hashes encoded handshake bytes and HRR message_hash"
     try expectStage("tls transcript after ClientHello2", &hexBytes("7ec9461d8bac7434b8ae63e99899d1ef75ce0b716c9ee12aadd5f5837e51d182"), &transcript.peek());
 }
 
-test "TLS 1.3 record-protection keys and ciphertext match independent vector" {
-    _ = try requireCase("tls13-record-aes128-gcm-independent");
+fn runTlsRecordVector(log: *ExecutionLog) !void {
+    _ = try log.execute("tls13-record-aes128-gcm-independent");
     const cp = cryptoProvider();
     const record_protection = tls_core.record_protection;
     const record_codec = tls_core.record_codec;
@@ -330,9 +354,9 @@ test "TLS 1.3 record-protection keys and ciphertext match independent vector" {
     try testing.expectEqual(@as(usize, 4), inner.padding_len);
 }
 
-test "QUIC v1 initial secrets and packet-protection material match RFC 9001" {
-    _ = try requireCase("quic-v1-initial-rfc9001");
-    _ = try requireCase("quic-v1-initial-auth-failure");
+fn runQuicInitialVector(log: *ExecutionLog) !void {
+    _ = try log.execute("quic-v1-initial-rfc9001");
+    _ = try log.execute("quic-v1-initial-auth-failure");
     const dcid = hexBytes("8394c8f03e515708");
     const secrets = try quic.tls_adapter.deriveInitialSecretsV1(&dcid);
 
@@ -382,17 +406,17 @@ test "QUIC v1 initial secrets and packet-protection material match RFC 9001" {
     return error.ExpectedAuthenticationFailure;
 }
 
-test "provider AEAD vectors seal, open, and reject authentication failures" {
+fn runAeadVectors(log: *ExecutionLog) !void {
     const cp = cryptoProvider();
 
-    _ = try requireCase("aes-128-gcm-nist-zero-block");
-    _ = try requireCase("aes-128-gcm-tag-rejection");
+    _ = try log.execute("aes-128-gcm-nist-zero-block");
+    _ = try log.execute("aes-128-gcm-tag-rejection");
     try runAeadVector(.aes_128_gcm, &hexBytes("00000000000000000000000000000000"), &hexBytes("000000000000000000000000"), "", &hexBytes("00000000000000000000000000000000"), &hexBytes("0388dace60b6a392f328c2b971b2fe78"), &hexBytes("ab6e47d42cec13bdf53a67b21257bddf"), "aes-128-gcm NIST zero-block", cp);
-    _ = try requireCase("aes-256-gcm-nist-zero-block");
-    _ = try requireCase("aes-256-gcm-tag-rejection");
+    _ = try log.execute("aes-256-gcm-nist-zero-block");
+    _ = try log.execute("aes-256-gcm-tag-rejection");
     try runAeadVector(.aes_256_gcm, &hexBytes("0000000000000000000000000000000000000000000000000000000000000000"), &hexBytes("000000000000000000000000"), "", &hexBytes("00000000000000000000000000000000"), &hexBytes("cea7403d4d606b6e074ec5d3baf39d18"), &hexBytes("d0d1c8a799996bf0265b98b5d48ab919"), "aes-256-gcm NIST zero-block", cp);
-    _ = try requireCase("chacha20-poly1305-rfc8439");
-    _ = try requireCase("chacha20-poly1305-tag-rejection");
+    _ = try log.execute("chacha20-poly1305-rfc8439");
+    _ = try log.execute("chacha20-poly1305-tag-rejection");
     try runAeadVector(
         .chacha20_poly1305,
         &hexBytes("808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f"),
@@ -438,11 +462,11 @@ fn runAeadVector(
     return error.ExpectedAuthenticationFailure;
 }
 
-test "provider key exchange and signature vectors match RFC sources" {
-    _ = try requireCase("x25519-rfc7748-alice-bob");
-    _ = try requireCase("x25519-low-order-rejection");
-    _ = try requireCase("ed25519-rfc8032-test-1");
-    _ = try requireCase("ed25519-signature-rejection");
+fn runKeyExchangeAndSignatureVectors(log: *ExecutionLog) !void {
+    _ = try log.execute("x25519-rfc7748-alice-bob");
+    _ = try log.execute("x25519-low-order-rejection");
+    _ = try log.execute("ed25519-rfc8032-test-1");
+    _ = try log.execute("ed25519-signature-rejection");
     const cp = cryptoProvider();
 
     const alice_private = hexBytes("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a");
@@ -475,10 +499,10 @@ test "provider key exchange and signature vectors match RFC sources" {
     try testing.expectError(error.AuthenticationFailed, cp.verify(.ed25519, &ed_public, "", &bad_signature));
 }
 
-test "provider entropy and secret helpers are executable vector cases" {
-    _ = try requireCase("deterministic-entropy-positive");
-    _ = try requireCase("secure-zero-positive");
-    _ = try requireCase("constant-time-compare-positive");
+fn runEntropyAndSecretHelperVectors(log: *ExecutionLog) !void {
+    _ = try log.execute("deterministic-entropy-positive");
+    _ = try log.execute("secure-zero-positive");
+    _ = try log.execute("constant-time-compare-positive");
     var det = pure_zig.DeterministicEntropy.init(0x373);
     var p = pure_zig.Provider.init(det.entropy());
     const cp = p.cryptoProvider();
@@ -496,13 +520,28 @@ test "provider entropy and secret helpers are executable vector cases" {
     try testing.expect(!provider.constantTimeEqual("vector", "vextor"));
 }
 
-test "unsupported provider capabilities are negative cases, not silent skips" {
-    _ = try requireCase("secp256r1-unsupported");
-    _ = try requireCase("rsa-pss-unsupported");
+fn runUnsupportedCapabilityVectors(log: *ExecutionLog) !void {
+    _ = try log.execute("secp256r1-unsupported");
+    _ = try log.execute("rsa-pss-unsupported");
     const cp = cryptoProvider();
     var scalar: [32]u8 = undefined;
     var public: [65]u8 = undefined;
     try testing.expectError(error.UnsupportedCapability, cp.generateKeyShare(.secp256r1, &public, &scalar));
     try testing.expectError(error.UnsupportedCapability, cp.deriveSharedSecret(.secp256r1, &scalar, public[0..32], &scalar));
     try testing.expectError(error.UnsupportedCapability, cp.verify(.rsa_pss_rsae_sha256, "", "", ""));
+}
+
+test "crypto vector suite executes registered coverage" {
+    var log = ExecutionLog{};
+    try runHkdfVectors(&log);
+    try runTlsKeyScheduleVector(&log);
+    try runTranscriptVector(&log);
+    try runTlsRecordVector(&log);
+    try runQuicInitialVector(&log);
+    try runAeadVectors(&log);
+    try runKeyExchangeAndSignatureVectors(&log);
+    try runEntropyAndSecretHelperVectors(&log);
+    try runUnsupportedCapabilityVectors(&log);
+    try validateManifest(&log);
+    try validateCapabilityMatrix(&log);
 }

@@ -259,6 +259,24 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_crypto_tests.step);
     test_step.dependOn(&run_crypto_secret_tests.step);
 
+    // Deterministic crypto vector harness (#373): provider-neutral test
+    // vectors, TLS 1.3 key schedule values, QUIC packet-protection material,
+    // and explicit negative coverage for deferred capabilities.
+    const crypto_vector_mod = b.createModule(.{
+        .root_source_file = b.path("tests/crypto_vectors.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    crypto_vector_mod.addImport("crypto", crypto_mod);
+    crypto_vector_mod.addImport("tls_core", tls_core_mod);
+    crypto_vector_mod.addImport("quic", quic_mod);
+    const crypto_vector_tests = b.addTest(.{ .root_module = crypto_vector_mod });
+    const run_crypto_vector_tests = b.addRunArtifact(crypto_vector_tests);
+    const crypto_vector_step = b.step("test-crypto-vectors", "Run deterministic TLS/QUIC cryptographic vector harness");
+    crypto_vector_step.dependOn(&run_crypto_vector_tests.step);
+    crypto_step.dependOn(&run_crypto_vector_tests.step);
+    test_step.dependOn(&run_crypto_vector_tests.step);
+
     // Test-only: a real client/server TLS 1.3 handshake through the merged
     // record stack (#408 finding 6). This needs the "crypto" module (to
     // build a pure-Zig CryptoProvider for the record_epoch_bridge.Bridge

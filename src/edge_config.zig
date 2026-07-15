@@ -2659,6 +2659,10 @@ pub fn validate(cfg: *const EdgeConfig) !void {
         std.log.err("config validation failed: TARDIGRADE_PROXY_STREAM_BUFFER_SIZE must be between 1 and 1048576 bytes", .{});
         return error.InvalidConfigValue;
     };
+    validateProxyBufferLimitsCoverRelayAllocations(cfg.proxy_buffer_limits, cfg.proxy_stream_buffer_size) catch {
+        std.log.err("config validation failed: TARDIGRADE_PROXY_BUFFER_PER_STREAM_HARD_LIMIT_BYTES must be at least the effective streaming relay allocation", .{});
+        return error.InvalidConfigValue;
+    };
 
     // Timeout relationship sanity checks — warn only, these are not hard errors
     // because operators may have intentional unusual configurations.
@@ -2706,6 +2710,11 @@ fn validateBufferedUpstreamResponseLimit(limit: usize) !void {
 
 fn validateProxyStreamBufferSize(size: usize) !void {
     if (size == 0 or size > 1024 * 1024) return error.InvalidConfigValue;
+}
+
+fn validateProxyBufferLimitsCoverRelayAllocations(limits: http.proxy_buffer_account.Limits, proxy_stream_buffer_size: usize) !void {
+    const effective_relay_bytes = @max(proxy_stream_buffer_size, 16 * 1024);
+    if (limits.per_stream_hard_limit < effective_relay_bytes) return error.InvalidConfigValue;
 }
 
 /// Emit log warnings for configurations that are valid but operationally risky.
@@ -3343,6 +3352,17 @@ test "validate proxy stream buffer size rejects zero and oversized buffers" {
     try validateProxyStreamBufferSize(1024 * 1024);
     try std.testing.expectError(error.InvalidConfigValue, validateProxyStreamBufferSize(0));
     try std.testing.expectError(error.InvalidConfigValue, validateProxyStreamBufferSize(1024 * 1024 + 1));
+}
+
+test "proxy buffer hard limit covers effective streaming relay allocation" {
+    const limits = http.proxy_buffer_account.Limits{
+        .per_stream_low_watermark = 1024,
+        .per_stream_high_watermark = 2048,
+        .per_stream_hard_limit = 4096,
+        .per_origin_hard_limit = 0,
+        .global_hard_limit = 0,
+    };
+    try std.testing.expectError(error.InvalidConfigValue, validateProxyBufferLimitsCoverRelayAllocations(limits, 16 * 1024));
 }
 
 test "proxy buffer limits validate low high hard ordering" {

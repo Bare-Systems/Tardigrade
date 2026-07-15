@@ -1437,22 +1437,46 @@ pub const GatewayState = struct {
         self.metrics.recordProxyStreamingFallback(reason);
     }
 
-    pub fn metricsRecordProxyBufferBytes(self: *GatewayState, direction: http.proxy_buffer_account.Direction, scope: http.proxy_buffer_account.Scope, bytes: usize) void {
+    pub fn metricsRecordProxyBufferReservation(
+        self: *GatewayState,
+        direction: http.proxy_buffer_account.Direction,
+        bytes: usize,
+        high_watermark: bool,
+        limit_exceeded: bool,
+    ) void {
         self.metrics_mutex.lock();
         defer self.metrics_mutex.unlock();
-        self.metrics.recordProxyBufferBytes(direction, scope, bytes);
+        self.metrics.recordProxyBufferReservation(direction, bytes, high_watermark, limit_exceeded);
     }
 
-    pub fn metricsReleaseProxyBufferBytes(self: *GatewayState, direction: http.proxy_buffer_account.Direction, scope: http.proxy_buffer_account.Scope, bytes: usize) void {
+    pub fn metricsReleaseProxyBufferReservation(self: *GatewayState, direction: http.proxy_buffer_account.Direction, bytes: usize) void {
         self.metrics_mutex.lock();
         defer self.metrics_mutex.unlock();
-        self.metrics.releaseProxyBufferBytes(direction, scope, bytes) catch unreachable;
+        self.metrics.releaseProxyBufferReservation(direction, bytes) catch unreachable;
     }
 
-    pub fn metricsRecordProxyBufferHighWatermark(self: *GatewayState, direction: http.proxy_buffer_account.Direction, scope: http.proxy_buffer_account.Scope) void {
-        self.metrics_mutex.lock();
-        defer self.metrics_mutex.unlock();
-        self.metrics.recordProxyBufferHighWatermark(direction, scope);
+    pub fn proxyBufferObserver(self: *GatewayState) http.proxy_buffer_account.Observer {
+        return .{
+            .context = self,
+            .recordReservationFn = recordProxyBufferReservationObserved,
+            .releaseReservationFn = releaseProxyBufferReservationObserved,
+        };
+    }
+
+    fn recordProxyBufferReservationObserved(
+        context: *anyopaque,
+        direction: http.proxy_buffer_account.Direction,
+        bytes: usize,
+        high_watermark: bool,
+        limit_exceeded: bool,
+    ) void {
+        const self: *GatewayState = @ptrCast(@alignCast(context));
+        self.metricsRecordProxyBufferReservation(direction, bytes, high_watermark, limit_exceeded);
+    }
+
+    fn releaseProxyBufferReservationObserved(context: *anyopaque, direction: http.proxy_buffer_account.Direction, bytes: usize) void {
+        const self: *GatewayState = @ptrCast(@alignCast(context));
+        self.metricsReleaseProxyBufferReservation(direction, bytes);
     }
 
     pub fn metricsSetWorkerPoolStats(self: *GatewayState, active_jobs: usize, queued_jobs: usize, worker_threads: usize, queue_capacity: usize) void {

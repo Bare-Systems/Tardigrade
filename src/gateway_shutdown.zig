@@ -102,7 +102,7 @@ pub fn hotReloadConfig(
     state.logger.info(null, "configuration hot-reload applied", .{});
 }
 
-fn applyReloadedRuntimeConfig(cfg: *const edge_config.EdgeConfig, state: *GatewayState) void {
+pub fn applyReloadedRuntimeConfig(cfg: *const edge_config.EdgeConfig, state: *GatewayState) void {
     // Warn when restart-only path/URL fields differ; they are NOT rebound here.
     if (!std.mem.eql(u8, state.session_store_path, cfg.session_store_path))
         state.logger.warn(null, "TARDIGRADE_SESSION_STORE_PATH changed on reload; restart required for new path to take effect (active: '{s}', new: '{s}')", .{ state.session_store_path, cfg.session_store_path });
@@ -177,6 +177,66 @@ pub fn runDnsDiscoveryRefresh(_: *const edge_config.EdgeConfig, state: *GatewayS
     if (state.dns_discovery.needsRefresh(now_ms)) {
         state.dns_discovery.refresh(now_ms);
     }
+}
+
+test "applyReloadedRuntimeConfig updates exported proxy buffer limits" {
+    const allocator = std.testing.allocator;
+    var cfg = try edge_config.loadFromEnv(allocator);
+    defer cfg.deinit(allocator);
+    cfg.proxy_buffer_limits = .{
+        .per_stream_low_watermark = 128 * 1024,
+        .per_stream_high_watermark = 384 * 1024,
+        .per_stream_hard_limit = 512 * 1024,
+        .per_origin_hard_limit = 2 * 1024 * 1024,
+        .global_hard_limit = 4 * 1024 * 1024,
+    };
+
+    var state: GatewayState = undefined;
+    state.allocator = allocator;
+    state.rate_limiter_mutex = .{};
+    state.rate_limiter = null;
+    state.proxy_cache_mutex = .{};
+    state.proxy_cache_store = null;
+    state.proxy_cache_path = "";
+    state.proxy_cache_ttl_seconds = 0;
+    state.runtime_mutex = .{};
+    state.metrics_mutex = .{};
+    state.metrics = http.metrics.Metrics.init();
+    state.add_headers = &.{};
+    state.http3_alt_svc = null;
+    state.hsts_value = "";
+    state.security_headers = http.security_headers.SecurityHeaders.api;
+    state.max_connections_per_ip = 0;
+    state.max_active_connections = 0;
+    state.max_in_flight_requests = 0;
+    state.max_total_connection_memory_bytes = 0;
+    state.connection_memory_estimate_bytes = MAX_REQUEST_SIZE;
+    state.proxy_buffer_limits = .{
+        .per_stream_low_watermark = 256 * 1024,
+        .per_stream_high_watermark = 768 * 1024,
+        .per_stream_hard_limit = 1024 * 1024,
+        .per_origin_hard_limit = 0,
+        .global_hard_limit = 0,
+    };
+    state.compression_config = .{};
+    state.logger = http.logger.Logger.init(.info, "test");
+    state.upstream_pool = http.upstream_pool.UpstreamPool.init(allocator, .{});
+    defer state.upstream_pool.deinit();
+    state.h2_pool = http.upstream_h2.H2ConnPool.init(allocator, .{});
+    defer state.h2_pool.deinit();
+    state.mux_subscriptions_by_device = std.StringHashMap(usize).init(allocator);
+    defer state.mux_subscriptions_by_device.deinit();
+    state.session_store_path = "";
+    state.approval_store_path = "";
+    state.approval_escalation_webhook = "";
+    state.transcript_store_path = "";
+
+    applyReloadedRuntimeConfig(&cfg, &state);
+
+    const prom = try state.metricsToPrometheus(allocator);
+    defer allocator.free(prom);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_buffer_config_limit_bytes{direction=\"upstream_to_downstream\",scope=\"stream\",limit=\"high\"} 393216\n") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_buffer_config_limit_bytes{direction=\"upstream_to_downstream\",scope=\"global\",limit=\"hard\"} 4194304\n") != null);
 }
 
 /// Context passed to the background health-probe thread.

@@ -196,8 +196,8 @@ response eligibility are evaluated at different phases.
 
 Proxy buffer accounting is exposed separately from upstream pool reuse metrics.
 `tardigrade_buffered_bytes_current{direction,scope}` reports application-owned
-body bytes retained by the proxy for bounded buffered responses and HTTP/1
-streaming relay buffers in this first implementation slice, while
+body bytes retained by the proxy for bounded buffered responses, HTTP/1
+streaming relay buffers, and HTTP/2 streaming response queues, while
 `tardigrade_buffer_config_limit_bytes{direction,scope,limit}` exposes the
 configured low/high/hard limits operators need to interpret those gauges.
 

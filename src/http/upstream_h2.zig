@@ -27,6 +27,7 @@ const compat = @import("../zig_compat.zig");
 const frame = @import("http2_frame.zig");
 const hpack = @import("hpack.zig");
 const tls_termination = @import("tls_backend.zig");
+const proxy_buffer_account = @import("proxy_buffer_account.zig");
 
 /// HTTP/2 client connection preface (RFC 7540 §3.5).
 pub const PREFACE = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
@@ -84,6 +85,8 @@ pub const Request = struct {
     /// Whether `body` is the complete outbound request body or the first bytes
     /// of a request body that will continue through streaming DATA writes.
     body_mode: BodyMode = .complete,
+    proxy_buffer_limits: ?proxy_buffer_account.Limits = null,
+    proxy_buffer_observer: ?proxy_buffer_account.Observer = null,
 };
 
 pub const BodyMode = enum {
@@ -464,11 +467,55 @@ pub const Stream = struct {
     /// (idle state) would be a connection-level PROTOCOL_ERROR. Written and
     /// read only by the owning worker thread.
     wire_opened: bool = false,
+    proxy_body_account: ?proxy_buffer_account.Account = null,
+    proxy_buffer_observer: ?proxy_buffer_account.Observer = null,
 
     fn destroy(self: *Stream, allocator: std.mem.Allocator) void {
+        self.releaseQueuedBodyAccounting();
         freeHeaderList(allocator, &self.headers);
         self.body.deinit(allocator);
         allocator.destroy(self);
+    }
+
+    fn recordQueuedBody(self: *Stream, bytes: usize) !void {
+        if (self.proxy_body_account) |*account| {
+            const before = account.snapshot();
+            account.reserve(bytes) catch |err| {
+                const after = account.snapshot();
+                if (self.proxy_buffer_observer) |observer| {
+                    if (after.limit_exceeded_events > before.limit_exceeded_events) {
+                        observer.recordReservation(account.direction, 0, false, true);
+                    }
+                }
+                return err;
+            };
+            const after = account.snapshot();
+            if (self.proxy_buffer_observer) |observer| {
+                observer.recordReservation(
+                    account.direction,
+                    bytes,
+                    after.high_watermark_events > before.high_watermark_events,
+                    after.limit_exceeded_events > before.limit_exceeded_events,
+                );
+            }
+        }
+    }
+
+    fn releaseQueuedBody(self: *Stream, bytes: usize) void {
+        if (bytes == 0) return;
+        if (self.proxy_body_account) |*account| {
+            account.release(bytes) catch unreachable;
+            if (self.proxy_buffer_observer) |observer| {
+                observer.releaseReservation(account.direction, bytes);
+            }
+        }
+    }
+
+    fn releaseQueuedBodyAccounting(self: *Stream) void {
+        if (self.proxy_body_account) |*account| {
+            const current = account.snapshot().current;
+            if (current > 0) self.releaseQueuedBody(current);
+        }
     }
 };
 
@@ -686,6 +733,10 @@ pub fn H2Conn(comptime Transport: type) type {
         pub fn openStreaming(self: *Self, req: Request) !*Stream {
             const stream = try self.beginStream(true);
             errdefer self.finishStreaming(stream);
+            if (req.proxy_buffer_limits) |limits| {
+                stream.proxy_body_account = proxy_buffer_account.Account.init(.upstream_to_downstream, .stream, limits);
+                stream.proxy_buffer_observer = req.proxy_buffer_observer;
+            }
             try self.sendRequest(stream, req);
             return stream;
         }
@@ -740,6 +791,7 @@ pub fn H2Conn(comptime Transport: type) type {
                     const n = @min(avail, out.len);
                     @memcpy(out[0..n], stream.body.items[stream.body_read_off..][0..n]);
                     stream.body_read_off += n;
+                    stream.releaseQueuedBody(n);
                     if (stream.body_read_off == stream.body.items.len) {
                         stream.body.clearRetainingCapacity();
                         stream.body_read_off = 0;
@@ -1138,6 +1190,17 @@ pub fn H2Conn(comptime Transport: type) type {
                         flow_violation = true;
                         deliver = false;
                     }
+                }
+                if (deliver) {
+                    s.recordQueuedBody(fr.payload.len) catch |err| {
+                        if (err == error.BufferLimitExceeded) {
+                            if (s.err == null) s.err = err;
+                            deliver = false;
+                        } else {
+                            self.state_mutex.unlock();
+                            return err;
+                        }
+                    };
                 }
                 if (deliver) {
                     s.body.appendSlice(self.allocator, fr.payload) catch {

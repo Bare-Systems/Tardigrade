@@ -63,6 +63,20 @@ pub const Snapshot = struct {
     above_high_watermark: bool,
 };
 
+pub const Observer = struct {
+    context: *anyopaque,
+    recordReservationFn: *const fn (*anyopaque, Direction, usize, bool, bool) void,
+    releaseReservationFn: *const fn (*anyopaque, Direction, usize) void,
+
+    pub fn recordReservation(self: Observer, direction: Direction, bytes: usize, high_watermark: bool, limit_exceeded: bool) void {
+        self.recordReservationFn(self.context, direction, bytes, high_watermark, limit_exceeded);
+    }
+
+    pub fn releaseReservation(self: Observer, direction: Direction, bytes: usize) void {
+        self.releaseReservationFn(self.context, direction, bytes);
+    }
+};
+
 /// Small owner-local accounting primitive for bytes currently retained by a
 /// proxy body buffer or queue. Shared aggregate accounting remains outside this
 /// type; callers record this object's transitions into the process metrics.
@@ -76,6 +90,7 @@ pub const Account = struct {
     above_high_watermark: bool = false,
 
     pub fn init(direction: Direction, scope: Scope, limits: Limits) Account {
+        std.debug.assert(scope == .stream);
         return .{
             .direction = direction,
             .scope = scope,
@@ -99,8 +114,9 @@ pub const Account = struct {
         }
     }
 
-    pub fn release(self: *Account, bytes: usize) void {
-        self.current = if (bytes >= self.current) 0 else self.current - bytes;
+    pub fn release(self: *Account, bytes: usize) !void {
+        if (bytes > self.current) return error.BufferAccountingUnderflow;
+        self.current -= bytes;
         if (self.above_high_watermark and self.current <= self.limits.per_stream_low_watermark) {
             self.above_high_watermark = false;
         }
@@ -165,13 +181,28 @@ test "proxy buffer account tracks high low transitions and release" {
     try std.testing.expect(account.snapshot().above_high_watermark);
     try std.testing.expectEqual(@as(u64, 1), account.snapshot().high_watermark_events);
 
-    account.release(3);
+    try account.release(3);
     try std.testing.expect(account.snapshot().above_high_watermark);
-    account.release(1);
+    try account.release(1);
     try std.testing.expect(!account.snapshot().above_high_watermark);
 
     try std.testing.expectError(error.BufferLimitExceeded, account.reserve(17));
     try std.testing.expectEqual(@as(u64, 1), account.snapshot().limit_exceeded_events);
     account.releaseAll();
     try std.testing.expectEqual(@as(usize, 0), account.snapshot().current);
+}
+
+test "proxy buffer account reports over-release without changing current" {
+    const limits = Limits{
+        .per_stream_low_watermark = 4,
+        .per_stream_high_watermark = 8,
+        .per_stream_hard_limit = 16,
+        .per_origin_hard_limit = 0,
+        .global_hard_limit = 0,
+    };
+    var account = Account.init(.upstream_to_downstream, .stream, limits);
+
+    try account.reserve(6);
+    try std.testing.expectError(error.BufferAccountingUnderflow, account.release(7));
+    try std.testing.expectEqual(@as(usize, 6), account.snapshot().current);
 }

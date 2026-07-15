@@ -522,16 +522,7 @@ pub fn handleLocationProxyPass(
     const fallback_reason: StreamingFallbackReason = switch (streamingEligibilityForDataPlaneProxyRequest(cfg, matched_block, &resolved, upstream_url.value, max_attempts)) {
         .stream => {
             state.recordUpstreamAttemptStart(selection.base_url);
-            const relay_buffer_bytes = @max(cfg.proxy_stream_buffer_size, 16 * 1024);
-            state.metricsRecordProxyBufferBytes(.upstream_to_downstream, .stream, relay_buffer_bytes);
-            state.metricsRecordProxyBufferBytes(.upstream_to_downstream, .global, relay_buffer_bytes);
-            if (relay_buffer_bytes >= cfg.proxy_buffer_limits.per_stream_high_watermark) {
-                state.metricsRecordProxyBufferHighWatermark(.upstream_to_downstream, .stream);
-            }
-            defer {
-                state.metricsReleaseProxyBufferBytes(.upstream_to_downstream, .stream, relay_buffer_bytes);
-                state.metricsReleaseProxyBufferBytes(.upstream_to_downstream, .global, relay_buffer_bytes);
-            }
+            const proxy_buffer_observer = state.proxyBufferObserver();
             const streamed = executeStreamingHttpProxyRequest(
                 allocator,
                 cfg,
@@ -553,6 +544,7 @@ pub fn handleLocationProxyPass(
                 &state.security_headers,
                 sticky_set_cookie,
                 if (ctx.lifecycle) |lc| &lc.token else null,
+                proxy_buffer_observer,
                 &state.upstream_pool,
                 &state.h2_pool,
             ) catch |err| {

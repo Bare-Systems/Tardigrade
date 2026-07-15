@@ -15,28 +15,91 @@ const provider = crypto_pkg.provider;
 const profile = crypto_pkg.profile;
 const pure_zig = crypto_pkg.pure_zig;
 
-const Coverage = enum {
+const ProviderKind = enum {
+    pure_zig,
+    openssl,
+};
+
+const ProviderSet = struct {
+    pure_zig: bool = false,
+    openssl: bool = false,
+
+    fn has(self: ProviderSet, kind: ProviderKind) bool {
+        return switch (kind) {
+            .pure_zig => self.pure_zig,
+            .openssl => self.openssl,
+        };
+    }
+};
+
+const CaseClass = enum {
     positive,
     negative,
-    waived,
 };
 
-const VectorMeta = struct {
-    name: []const u8,
+const CaseMeta = struct {
+    id: []const u8,
+    algorithm: ?profile.Algorithm,
+    providers: ProviderSet,
+    class: CaseClass,
     source: []const u8,
     license: []const u8,
+    reproduction: []const u8,
 };
 
-const vector_meta = [_]VectorMeta{
-    .{ .name = "hkdf-rfc5869-case-1", .source = "RFC 5869 Appendix A.1", .license = "IETF Trust" },
-    .{ .name = "tls13-rfc8448-simple-1rtt", .source = "RFC 8448 Section 3", .license = "IETF Trust" },
-    .{ .name = "tls13-record-protection-aes128-gcm", .source = "Independently computed with Python hmac/hashlib and pycryptodome", .license = "project fixture" },
-    .{ .name = "quic-v1-initial-rfc9001-a1", .source = "RFC 9001 Appendix A.1", .license = "IETF Trust" },
-    .{ .name = "aes-128-gcm-nist-zero-block", .source = "NIST SP 800-38D / CAVP GCM zero-block vector", .license = "public domain" },
-    .{ .name = "aes-256-gcm-nist-zero-block", .source = "NIST SP 800-38D / CAVP GCM zero-block vector", .license = "public domain" },
-    .{ .name = "chacha20-poly1305-rfc8439", .source = "RFC 8439 Section 2.8.2", .license = "IETF Trust" },
-    .{ .name = "x25519-rfc7748-alice-bob", .source = "RFC 7748 Section 6.1", .license = "IETF Trust" },
-    .{ .name = "ed25519-rfc8032-test-1", .source = "RFC 8032 Section 7.1", .license = "IETF Trust" },
+const pure_zig_only: ProviderSet = .{ .pure_zig = true };
+
+const case_registry = [_]CaseMeta{
+    .{ .id = "hkdf-rfc5869-extract-sha256", .algorithm = .{ .hkdf = .sha256 }, .providers = pure_zig_only, .class = .positive, .source = "RFC 5869 Appendix A.1", .license = "IETF Trust", .reproduction = "tests/vectors/generate_crypto_vectors.js" },
+    .{ .id = "hkdf-expand-label-sha256-fixed", .algorithm = .{ .hkdf = .sha256 }, .providers = pure_zig_only, .class = .positive, .source = "tests/vectors/generate_crypto_vectors.js", .license = "project fixture", .reproduction = "node tests/vectors/generate_crypto_vectors.js" },
+    .{ .id = "hkdf-expand-label-sha384-fixed", .algorithm = .{ .hkdf = .sha384 }, .providers = pure_zig_only, .class = .positive, .source = "tests/vectors/generate_crypto_vectors.js", .license = "project fixture", .reproduction = "node tests/vectors/generate_crypto_vectors.js" },
+    .{ .id = "hkdf-invalid-secret-length", .algorithm = .{ .hkdf = .sha256 }, .providers = pure_zig_only, .class = .negative, .source = "provider contract", .license = "project fixture", .reproduction = "zig build test-crypto-vectors" },
+    .{ .id = "hkdf-invalid-secret-length-sha384", .algorithm = .{ .hkdf = .sha384 }, .providers = pure_zig_only, .class = .negative, .source = "provider contract", .license = "project fixture", .reproduction = "zig build test-crypto-vectors" },
+    .{ .id = "sha256-transcript-hrr-rewrite", .algorithm = .{ .hash = .sha256 }, .providers = pure_zig_only, .class = .positive, .source = "RFC 8446 Section 4.4.1 transcript_hash and message_hash", .license = "IETF Trust", .reproduction = "tests/vectors/generate_crypto_vectors.js" },
+    .{ .id = "sha384-expand-label-fixed", .algorithm = .{ .hash = .sha384 }, .providers = pure_zig_only, .class = .positive, .source = "tests/vectors/generate_crypto_vectors.js", .license = "project fixture", .reproduction = "node tests/vectors/generate_crypto_vectors.js" },
+    .{ .id = "tls13-key-schedule-rfc8448", .algorithm = null, .providers = pure_zig_only, .class = .positive, .source = "RFC 8448 Section 3", .license = "IETF Trust", .reproduction = "fixed literals from RFC 8448 plus HMAC-SHA256 Finished MAC" },
+    .{ .id = "tls13-record-aes128-gcm-independent", .algorithm = .{ .aead = .aes_128_gcm }, .providers = pure_zig_only, .class = .positive, .source = "tests/vectors/generate_crypto_vectors.js", .license = "project fixture", .reproduction = "node tests/vectors/generate_crypto_vectors.js" },
+    .{ .id = "quic-v1-initial-rfc9001", .algorithm = .{ .aead = .aes_128_gcm }, .providers = pure_zig_only, .class = .positive, .source = "RFC 9001 Appendix A.1/A.3", .license = "IETF Trust", .reproduction = "fixed RFC literals plus tests/vectors/generate_crypto_vectors.js small packet" },
+    .{ .id = "quic-v1-initial-auth-failure", .algorithm = .{ .aead = .aes_128_gcm }, .providers = pure_zig_only, .class = .negative, .source = "provider contract", .license = "project fixture", .reproduction = "zig build test-crypto-vectors" },
+    .{ .id = "aes-128-gcm-nist-zero-block", .algorithm = .{ .aead = .aes_128_gcm }, .providers = pure_zig_only, .class = .positive, .source = "NIST SP 800-38D / CAVP GCM zero-block vector", .license = "public domain", .reproduction = "published NIST vector" },
+    .{ .id = "aes-128-gcm-tag-rejection", .algorithm = .{ .aead = .aes_128_gcm }, .providers = pure_zig_only, .class = .negative, .source = "provider contract", .license = "project fixture", .reproduction = "zig build test-crypto-vectors" },
+    .{ .id = "aes-256-gcm-nist-zero-block", .algorithm = .{ .aead = .aes_256_gcm }, .providers = pure_zig_only, .class = .positive, .source = "NIST SP 800-38D / CAVP GCM zero-block vector", .license = "public domain", .reproduction = "published NIST vector" },
+    .{ .id = "aes-256-gcm-tag-rejection", .algorithm = .{ .aead = .aes_256_gcm }, .providers = pure_zig_only, .class = .negative, .source = "provider contract", .license = "project fixture", .reproduction = "zig build test-crypto-vectors" },
+    .{ .id = "chacha20-poly1305-rfc8439", .algorithm = .{ .aead = .chacha20_poly1305 }, .providers = pure_zig_only, .class = .positive, .source = "RFC 8439 Section 2.8.2", .license = "IETF Trust", .reproduction = "published RFC vector" },
+    .{ .id = "chacha20-poly1305-tag-rejection", .algorithm = .{ .aead = .chacha20_poly1305 }, .providers = pure_zig_only, .class = .negative, .source = "provider contract", .license = "project fixture", .reproduction = "zig build test-crypto-vectors" },
+    .{ .id = "x25519-rfc7748-alice-bob", .algorithm = .{ .group = .x25519 }, .providers = pure_zig_only, .class = .positive, .source = "RFC 7748 Section 6.1", .license = "IETF Trust", .reproduction = "published RFC vector" },
+    .{ .id = "x25519-low-order-rejection", .algorithm = .{ .group = .x25519 }, .providers = pure_zig_only, .class = .negative, .source = "RFC 7748 low-order input rejection", .license = "IETF Trust", .reproduction = "zig build test-crypto-vectors" },
+    .{ .id = "secp256r1-unsupported", .algorithm = .{ .group = .secp256r1 }, .providers = pure_zig_only, .class = .negative, .source = "provider capability matrix", .license = "project fixture", .reproduction = "zig build test-crypto-vectors" },
+    .{ .id = "ed25519-rfc8032-test-1", .algorithm = .{ .signature = .ed25519 }, .providers = pure_zig_only, .class = .positive, .source = "RFC 8032 Section 7.1", .license = "IETF Trust", .reproduction = "published RFC vector" },
+    .{ .id = "ed25519-signature-rejection", .algorithm = .{ .signature = .ed25519 }, .providers = pure_zig_only, .class = .negative, .source = "provider contract", .license = "project fixture", .reproduction = "zig build test-crypto-vectors" },
+    .{ .id = "rsa-pss-unsupported", .algorithm = .{ .signature = .rsa_pss_rsae_sha256 }, .providers = pure_zig_only, .class = .negative, .source = "provider capability matrix", .license = "project fixture", .reproduction = "zig build test-crypto-vectors" },
+    .{ .id = "deterministic-entropy-positive", .algorithm = .{ .entropy = .injected_random_bytes }, .providers = pure_zig_only, .class = .positive, .source = "provider contract", .license = "project fixture", .reproduction = "zig build test-crypto-vectors" },
+    .{ .id = "secure-zero-positive", .algorithm = .{ .entropy = .secure_zero }, .providers = pure_zig_only, .class = .positive, .source = "provider contract", .license = "project fixture", .reproduction = "zig build test-crypto-vectors" },
+    .{ .id = "constant-time-compare-positive", .algorithm = .{ .entropy = .constant_time_compare }, .providers = pure_zig_only, .class = .positive, .source = "provider contract", .license = "project fixture", .reproduction = "zig build test-crypto-vectors" },
+};
+
+const Waiver = struct {
+    provider_kind: ProviderKind,
+    algorithm: profile.Algorithm,
+    reason: []const u8,
+    tracking_issue: []const u8,
+};
+
+const ProviderWaiver = struct {
+    provider_kind: ProviderKind,
+    reason: []const u8,
+    tracking_issue: []const u8,
+};
+
+const provider_waivers = [_]ProviderWaiver{
+    .{ .provider_kind = .openssl, .reason = "The OpenSSL CryptoProvider adapter is documented as future work; this PR only registers the pure-Zig executable vector harness and leaves dual-provider execution open.", .tracking_issue = "#373" },
+};
+
+const waivers = [_]Waiver{
+    .{ .provider_kind = .pure_zig, .algorithm = .{ .signature = .ecdsa_secp256r1_sha256 }, .reason = "ECDSA verification exists in provider unit tests, but this top-level vector harness does not yet carry an independent DER fixture.", .tracking_issue = "#373" },
+    .{ .provider_kind = .pure_zig, .algorithm = .{ .certificate_helper = .der_parser }, .reason = "Certificate parser corpus coverage is owned by PKI stories; this crypto-provider slice does not add X.509 fixtures.", .tracking_issue = "#373" },
+    .{ .provider_kind = .pure_zig, .algorithm = .{ .certificate_helper = .chain_builder }, .reason = "Chain building is provider-deferred and covered by future PKI work.", .tracking_issue = "#373" },
+    .{ .provider_kind = .pure_zig, .algorithm = .{ .certificate_helper = .webpki_validation }, .reason = "WebPKI validation is provider-deferred and covered by future PKI work.", .tracking_issue = "#373" },
 };
 
 fn hexBytes(comptime hex: []const u8) [hex.len / 2]u8 {
@@ -67,62 +130,96 @@ fn cryptoProvider() provider.CryptoProvider {
     return Holder.provider_instance.cryptoProvider();
 }
 
-fn coverageForAlgorithm(algorithm: profile.Algorithm) Coverage {
+fn requireCase(id: []const u8) error{MissingCaseMetadata}!*const CaseMeta {
+    for (&case_registry) |*entry| {
+        if (std.mem.eql(u8, entry.id, id)) return entry;
+    }
+    return error.MissingCaseMetadata;
+}
+
+fn algorithmEql(a: profile.Algorithm, b: profile.Algorithm) bool {
+    return switch (a) {
+        .hash => |value| b == .hash and b.hash == value,
+        .hkdf => |value| b == .hkdf and b.hkdf == value,
+        .aead => |value| b == .aead and b.aead == value,
+        .group => |value| b == .group and b.group == value,
+        .signature => |value| b == .signature and b.signature == value,
+        .certificate_helper => |value| b == .certificate_helper and b.certificate_helper == value,
+        .entropy => |value| b == .entropy and b.entropy == value,
+    };
+}
+
+fn hasCase(provider_kind: ProviderKind, algorithm: profile.Algorithm, class: CaseClass) bool {
+    for (case_registry) |entry| {
+        const entry_algorithm = entry.algorithm orelse continue;
+        if (entry.class == class and entry.providers.has(provider_kind) and algorithmEql(entry_algorithm, algorithm)) return true;
+    }
+    return false;
+}
+
+fn hasWaiver(provider_kind: ProviderKind, algorithm: profile.Algorithm) bool {
+    for (provider_waivers) |waiver| {
+        if (waiver.provider_kind == provider_kind and waiver.reason.len > 0 and waiver.tracking_issue.len > 0) return true;
+    }
+    for (waivers) |waiver| {
+        if (waiver.provider_kind == provider_kind and algorithmEql(waiver.algorithm, algorithm)) return true;
+    }
+    return false;
+}
+
+fn rowStatus(kind: ProviderKind, row: profile.Row) profile.Status {
+    return switch (kind) {
+        .pure_zig => row.pure_zig_status,
+        .openssl => row.openssl_status,
+    };
+}
+
+fn requiresNegativeCase(algorithm: profile.Algorithm) bool {
     return switch (algorithm) {
-        .hash => |hash| switch (hash) {
-            .sha256 => .positive,
-            .sha384 => .positive,
-        },
-        .hkdf => |hash| switch (hash) {
-            .sha256 => .positive,
-            .sha384 => .positive,
-        },
-        .aead => |aead| switch (aead) {
-            .aes_128_gcm => .positive,
-            .aes_256_gcm => .positive,
-            .chacha20_poly1305 => .positive,
-        },
-        .group => |group| switch (group) {
-            .x25519 => .positive,
-            .secp256r1 => .negative,
-        },
-        .signature => |scheme| switch (scheme) {
-            .ed25519 => .positive,
-            .ecdsa_secp256r1_sha256 => .positive,
-            .rsa_pss_rsae_sha256 => .negative,
-        },
-        .certificate_helper => |helper| switch (helper) {
-            .der_parser => .waived,
-            .chain_builder => .waived,
-            .webpki_validation => .waived,
-        },
-        .entropy => |capability| switch (capability) {
-            .injected_random_bytes => .positive,
-            .secure_zero => .positive,
-            .constant_time_compare => .positive,
-        },
+        .aead, .group, .signature, .hkdf => true,
+        .hash, .certificate_helper, .entropy => false,
     };
 }
 
 test "vector manifest records provenance and licensing" {
-    for (vector_meta) |entry| {
-        try testing.expect(entry.name.len > 0);
+    for (case_registry) |entry| {
+        try testing.expect(entry.id.len > 0);
         try testing.expect(entry.source.len > 0);
         try testing.expect(entry.license.len > 0);
+        try testing.expect(entry.reproduction.len > 0);
+    }
+    for (waivers) |waiver| {
+        try testing.expect(waiver.reason.len > 0);
+        try testing.expect(waiver.tracking_issue.len > 0);
+    }
+    for (provider_waivers) |waiver| {
+        try testing.expect(waiver.reason.len > 0);
+        try testing.expect(waiver.tracking_issue.len > 0);
     }
 }
 
 test "capability matrix has vector coverage or explicit waivers" {
     for (profile.rows) |row| {
-        const coverage = coverageForAlgorithm(row.algorithm);
-        switch (row.pure_zig_status) {
-            .supported => try testing.expectEqual(Coverage.positive, coverage),
-            .provider_deferred, .unsupported => try testing.expect(coverage == .negative or coverage == .waived),
+        inline for (.{ ProviderKind.pure_zig, ProviderKind.openssl }) |provider_kind| {
+            switch (rowStatus(provider_kind, row)) {
+                .supported => {
+                    try testing.expect(hasCase(provider_kind, row.algorithm, .positive) or hasWaiver(provider_kind, row.algorithm));
+                    if (requiresNegativeCase(row.algorithm)) {
+                        try testing.expect(hasCase(provider_kind, row.algorithm, .negative) or hasWaiver(provider_kind, row.algorithm));
+                    }
+                },
+                .provider_deferred, .unsupported => try testing.expect(hasCase(provider_kind, row.algorithm, .negative) or hasWaiver(provider_kind, row.algorithm)),
+            }
         }
     }
 }
 
 test "provider HKDF stages match RFC 5869 and TLS expand-label vectors" {
+    _ = try requireCase("hkdf-rfc5869-extract-sha256");
+    _ = try requireCase("hkdf-expand-label-sha256-fixed");
+    _ = try requireCase("hkdf-expand-label-sha384-fixed");
+    _ = try requireCase("hkdf-invalid-secret-length");
+    _ = try requireCase("hkdf-invalid-secret-length-sha384");
     const cp = cryptoProvider();
 
     const ikm = hexBytes("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b");
@@ -133,21 +230,30 @@ test "provider HKDF stages match RFC 5869 and TLS expand-label vectors" {
     try cp.hkdfExtract(.sha256, &salt, &ikm, &prk);
     try expectStage("hkdf extract sha256 / RFC 5869 A.1", &expected_prk, &prk);
 
-    const HkdfSha256 = std.crypto.kdf.hkdf.HkdfSha256;
-    const expected_okm = std.crypto.tls.hkdfExpandLabel(HkdfSha256, prk, "derived", &info, 42);
+    const expected_okm = hexBytes("e29ebe58889156b196d8f9c31e3a4658a71eabdc113c50e4bf9d7a97ed3af464e6286979f53caa6fba0c");
     var okm: [42]u8 = undefined;
     try cp.hkdfExpandLabel(.sha256, &prk, "derived", &info, &okm);
     try expectStage("hkdf expand-label sha256 / TLS label", &expected_okm, &okm);
+    const HkdfSha256 = std.crypto.kdf.hkdf.HkdfSha256;
+    const differential_okm = std.crypto.tls.hkdfExpandLabel(HkdfSha256, prk, "derived", &info, 42);
+    try expectStage("hkdf expand-label sha256 / stdlib differential", &expected_okm, &differential_okm);
 
     const secret384 = [_]u8{0x42} ** provider.Hash.sha384.digestLength();
-    const HkdfSha384 = std.crypto.kdf.hkdf.Hkdf(std.crypto.auth.hmac.sha2.HmacSha384);
-    const expected384 = std.crypto.tls.hkdfExpandLabel(HkdfSha384, secret384, "c hs traffic", "", 48);
+    const expected384 = hexBytes("dd8cacbd8b266f33a9d8cfc8484747d2de2b19084df353b4c6bfc7525d2ac301616e00d9bdc509cd9ac09d1d5384347e");
     var out384: [48]u8 = undefined;
     try cp.hkdfExpandLabel(.sha384, &secret384, "c hs traffic", "", &out384);
     try expectStage("hkdf expand-label sha384 / TLS label", &expected384, &out384);
+    const HkdfSha384 = std.crypto.kdf.hkdf.Hkdf(std.crypto.auth.hmac.sha2.HmacSha384);
+    const differential384 = std.crypto.tls.hkdfExpandLabel(HkdfSha384, secret384, "c hs traffic", "", 48);
+    try expectStage("hkdf expand-label sha384 / stdlib differential", &expected384, &differential384);
+
+    var invalid: [16]u8 = undefined;
+    try testing.expectError(error.InvalidInput, cp.hkdfExpandLabel(.sha256, "short", "derived", "", &invalid));
+    try testing.expectError(error.InvalidInput, cp.hkdfExpandLabel(.sha384, "short", "derived", "", &invalid));
 }
 
-test "TLS 1.3 key schedule and Finished value match RFC 8448" {
+test "TLS 1.3 key schedule KAT matches RFC 8448 precomputed hashes" {
+    _ = try requireCase("tls13-key-schedule-rfc8448");
     const KeySchedule = tls_core.key_schedule.KeySchedule;
 
     const shared = hexBytes("8bd4054fb55b9d63fdfbacf9f04b9f0d35e6d63f537563efd46272900f89492d");
@@ -168,7 +274,31 @@ test "TLS 1.3 key schedule and Finished value match RFC 8448" {
     try expectStage("tls13 server Finished verify_data / RFC 8448", &hexBytes("c5486af1426697c43c18dab6a79ef816a2188023ea743133b7e3b15a2c05c955"), &KeySchedule.verifyData(schedule.server_handshake_traffic, finished_hash));
 }
 
+test "TLS transcript helper hashes encoded handshake bytes and HRR message_hash" {
+    _ = try requireCase("sha256-transcript-hrr-rewrite");
+    const Transcript = tls_core.transcript.Transcript;
+
+    const client_hello_1 = hexBytes("01000003aabbcc");
+    const hello_retry_request = hexBytes("02000002cf21");
+    const client_hello_2 = hexBytes("01000002ddee");
+
+    var transcript = Transcript{};
+    transcript.update(&client_hello_1);
+    const ch1_hash = hexBytes("93e26e55d8fd5b5236e00556a269142fc88e0d9616836ca9b8607841ac0287a0");
+    try expectStage("tls transcript ClientHello1 hash", &ch1_hash, &transcript.peek());
+
+    transcript.replace(ch1_hash);
+    try expectStage("tls transcript HRR synthetic message_hash", &hexBytes("42a5f8938f2b4f45f63df268cf67218045831c80b841bdb54f46afefceee6218"), &transcript.peek());
+
+    transcript.update(&hello_retry_request);
+    try expectStage("tls transcript after HelloRetryRequest", &hexBytes("cb0a3fbd3c60144a08852ceb18f319fd65f5b352026cb23036f568a209d6a036"), &transcript.peek());
+
+    transcript.update(&client_hello_2);
+    try expectStage("tls transcript after ClientHello2", &hexBytes("7ec9461d8bac7434b8ae63e99899d1ef75ce0b716c9ee12aadd5f5837e51d182"), &transcript.peek());
+}
+
 test "TLS 1.3 record-protection keys and ciphertext match independent vector" {
+    _ = try requireCase("tls13-record-aes128-gcm-independent");
     const cp = cryptoProvider();
     const record_protection = tls_core.record_protection;
     const record_codec = tls_core.record_codec;
@@ -201,6 +331,8 @@ test "TLS 1.3 record-protection keys and ciphertext match independent vector" {
 }
 
 test "QUIC v1 initial secrets and packet-protection material match RFC 9001" {
+    _ = try requireCase("quic-v1-initial-rfc9001");
+    _ = try requireCase("quic-v1-initial-auth-failure");
     const dcid = hexBytes("8394c8f03e515708");
     const secrets = try quic.tls_adapter.deriveInitialSecretsV1(&dcid);
 
@@ -219,10 +351,26 @@ test "QUIC v1 initial secrets and packet-protection material match RFC 9001" {
     const sample = hexBytes("d1b1c98dd7689fb8ec11d242b123dc9b");
     try expectStage("quic header-protection mask / RFC 9001 A.3", &hexBytes("437b9aec36"), &secrets.client.headerProtectionMask(sample));
 
-    var header = hexBytes("c300000001088394c8f03e5157080000449e00000002");
+    var header = hexBytes("c300000001088394c8f03e5157080000403400000002");
     var plaintext = [_]u8{0} ** 32;
     var sealed: [plaintext.len + quic.tls_adapter.packet_protection_tag_len]u8 = undefined;
     const protected = try secrets.client.sealPayload(2, &header, &plaintext, &sealed);
+    try expectStage("quic small packet ciphertext / independent vector", &hexBytes("d7b1897cd6689f55ef1239ba4b752db2e103e17c8cebd5c2f167b3c8b2267f05"), protected[0..plaintext.len]);
+    try expectStage("quic small packet tag / independent vector", &hexBytes("52eb613c653b62fcc087fefe0e5479f9"), protected[plaintext.len..]);
+
+    var protected_header = header;
+    const pn_offset = protected_header.len - 4;
+    const hp_sample = protected[0..quic.tls_adapter.header_protection_sample_len].*;
+    const hp_mask = secrets.client.headerProtectionMask(hp_sample);
+    protected_header[0] ^= hp_mask[0] & 0x0f;
+    for (protected_header[pn_offset..], hp_mask[1..]) |*byte, mask_byte| byte.* ^= mask_byte;
+    try expectStage("quic small packet protected header / independent vector", &hexBytes("c300000001088394c8f03e515708000040340dabc95a"), &protected_header);
+
+    var final_packet: [header.len + sealed.len]u8 = undefined;
+    @memcpy(final_packet[0..header.len], &protected_header);
+    @memcpy(final_packet[header.len..], protected);
+    try expectStage("quic small packet final bytes / independent vector", &hexBytes("c300000001088394c8f03e515708000040340dabc95ad7b1897cd6689f55ef1239ba4b752db2e103e17c8cebd5c2f167b3c8b2267f0552eb613c653b62fcc087fefe0e5479f9"), &final_packet);
+
     var opened: [plaintext.len]u8 = undefined;
     try expectStage("quic packet-protection open after seal", &plaintext, try secrets.client.openPayload(2, &header, protected, &opened));
 
@@ -237,8 +385,14 @@ test "QUIC v1 initial secrets and packet-protection material match RFC 9001" {
 test "provider AEAD vectors seal, open, and reject authentication failures" {
     const cp = cryptoProvider();
 
+    _ = try requireCase("aes-128-gcm-nist-zero-block");
+    _ = try requireCase("aes-128-gcm-tag-rejection");
     try runAeadVector(.aes_128_gcm, &hexBytes("00000000000000000000000000000000"), &hexBytes("000000000000000000000000"), "", &hexBytes("00000000000000000000000000000000"), &hexBytes("0388dace60b6a392f328c2b971b2fe78"), &hexBytes("ab6e47d42cec13bdf53a67b21257bddf"), "aes-128-gcm NIST zero-block", cp);
+    _ = try requireCase("aes-256-gcm-nist-zero-block");
+    _ = try requireCase("aes-256-gcm-tag-rejection");
     try runAeadVector(.aes_256_gcm, &hexBytes("0000000000000000000000000000000000000000000000000000000000000000"), &hexBytes("000000000000000000000000"), "", &hexBytes("00000000000000000000000000000000"), &hexBytes("cea7403d4d606b6e074ec5d3baf39d18"), &hexBytes("d0d1c8a799996bf0265b98b5d48ab919"), "aes-256-gcm NIST zero-block", cp);
+    _ = try requireCase("chacha20-poly1305-rfc8439");
+    _ = try requireCase("chacha20-poly1305-tag-rejection");
     try runAeadVector(
         .chacha20_poly1305,
         &hexBytes("808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f"),
@@ -285,6 +439,10 @@ fn runAeadVector(
 }
 
 test "provider key exchange and signature vectors match RFC sources" {
+    _ = try requireCase("x25519-rfc7748-alice-bob");
+    _ = try requireCase("x25519-low-order-rejection");
+    _ = try requireCase("ed25519-rfc8032-test-1");
+    _ = try requireCase("ed25519-signature-rejection");
     const cp = cryptoProvider();
 
     const alice_private = hexBytes("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a");
@@ -295,9 +453,9 @@ test "provider key exchange and signature vectors match RFC sources" {
     try expectStage("x25519 shared secret / RFC 7748", &expected_shared, &shared);
 
     const zero_point = [_]u8{0} ** 32;
-    cp.deriveSharedSecret(.x25519, &alice_private, &zero_point, &shared) catch |err| {
-        try expectVectorError("x25519 low-order point rejection", error.InvalidInput, err);
-    };
+    @memset(&shared, 0xa5);
+    try testing.expectError(error.InvalidInput, cp.deriveSharedSecret(.x25519, &alice_private, &zero_point, &shared));
+    try testing.expect(!std.mem.allEqual(u8, &shared, 0));
 
     const ed_seed = hexBytes("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60");
     const ed_public = hexBytes("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a");
@@ -311,9 +469,36 @@ test "provider key exchange and signature vectors match RFC sources" {
     try testing.expectEqual(@as(usize, 64), len);
     try expectStage("ed25519 signature / RFC 8032", &ed_signature, &actual_signature);
     try cp.verify(.ed25519, &ed_public, "", &ed_signature);
+
+    var bad_signature = ed_signature;
+    bad_signature[0] ^= 0x80;
+    try testing.expectError(error.AuthenticationFailed, cp.verify(.ed25519, &ed_public, "", &bad_signature));
+}
+
+test "provider entropy and secret helpers are executable vector cases" {
+    _ = try requireCase("deterministic-entropy-positive");
+    _ = try requireCase("secure-zero-positive");
+    _ = try requireCase("constant-time-compare-positive");
+    var det = pure_zig.DeterministicEntropy.init(0x373);
+    var p = pure_zig.Provider.init(det.entropy());
+    const cp = p.cryptoProvider();
+
+    var bytes: [8]u8 = undefined;
+    try cp.randomBytes(&bytes);
+    try expectStage("deterministic entropy stream", &hexBytes("ae642de1b6769772"), &bytes);
+
+    var secret = [_]u8{0xab} ** 8;
+    provider.secureZero(&secret);
+    try expectStage("secure zero", &[_]u8{0} ** 8, &secret);
+
+    try testing.expect(provider.constantTimeEqual("vector", "vector"));
+    try testing.expect(!provider.constantTimeEqual("vector", "vectors"));
+    try testing.expect(!provider.constantTimeEqual("vector", "vextor"));
 }
 
 test "unsupported provider capabilities are negative cases, not silent skips" {
+    _ = try requireCase("secp256r1-unsupported");
+    _ = try requireCase("rsa-pss-unsupported");
     const cp = cryptoProvider();
     var scalar: [32]u8 = undefined;
     var public: [65]u8 = undefined;

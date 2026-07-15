@@ -148,7 +148,7 @@ jobs:
           INVENTORY_PATH: ${{ steps.archive_artifacts.outputs.inventory_path }}
         run: |
           ./scripts/audit-release-binary.sh \
-            --binary zig-out/bin/tardigrade \
+            --binary zig-out/bin/tardi \
             --profile general \
             --output "$INVENTORY_PATH"
 
@@ -159,7 +159,7 @@ jobs:
         run: |
           ./scripts/package-release-archive.sh \
             --archive-name "$ARCHIVE_NAME" \
-            --binary zig-out/bin/tardigrade \
+            --binary zig-out/bin/tardi \
             --staging-dir dist \
             --output-dir "$ARTIFACT_DIR"
 

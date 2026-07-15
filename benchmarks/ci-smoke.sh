@@ -8,7 +8,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BENCH_DIR="${REPO_ROOT}/benchmarks"
-BINARY="${REPO_ROOT}/zig-out/bin/tardigrade"
+BINARY="${REPO_ROOT}/zig-out/bin/tardi"
 LISTEN_PORT="18069"
 UPSTREAM_PORT="18080"
 DURATION="30"

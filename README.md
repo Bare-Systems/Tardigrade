@@ -105,7 +105,7 @@ For a release-mode binary:
 
 ```bash
 zig build -Doptimize=ReleaseFast
-./zig-out/bin/tardigrade --help
+./zig-out/bin/tardi --help
 ```
 
 With explicit version metadata:
@@ -147,7 +147,7 @@ Build and run:
 
 ```bash
 zig build
-./zig-out/bin/tardigrade run -c ./tardigrade.conf
+./zig-out/bin/tardi run -c ./tardigrade.conf
 ```
 
 Then open:
@@ -158,14 +158,14 @@ Then open:
 Common CLI commands:
 
 ```bash
-./zig-out/bin/tardigrade check ./tardigrade.conf
-./zig-out/bin/tardigrade config validate ./tardigrade.conf
-./zig-out/bin/tardigrade validate -c ./tardigrade.conf
-./zig-out/bin/tardigrade print-config -c ./tardigrade.conf
-./zig-out/bin/tardigrade status -c ./tardigrade.conf
-./zig-out/bin/tardigrade reload -c ./tardigrade.conf
-./zig-out/bin/tardigrade stop -c ./tardigrade.conf
-./zig-out/bin/tardigrade config init
+./zig-out/bin/tardi check ./tardigrade.conf
+./zig-out/bin/tardi config validate ./tardigrade.conf
+./zig-out/bin/tardi validate -c ./tardigrade.conf
+./zig-out/bin/tardi print-config -c ./tardigrade.conf
+./zig-out/bin/tardi status -c ./tardigrade.conf
+./zig-out/bin/tardi reload -c ./tardigrade.conf
+./zig-out/bin/tardi stop -c ./tardigrade.conf
+./zig-out/bin/tardi config init
 ```
 
 `check` performs a dry parse and semantic validation without starting listeners
@@ -188,7 +188,7 @@ needs no external QUIC libraries. Both HTTP/2 and HTTP/3 are tracked as
 experimental surfaces rather than part of the default stable release contract.
 
 Configuration is nginx-inspired and can be checked before startup with
-`tardigrade check <config>`. Runtime inspection commands such as `status` and
+`tardi check <config>`. Runtime inspection commands such as `status` and
 `print-config` are designed to make package and service deployments easier to
 operate without guessing which config file or pid file is active.
 

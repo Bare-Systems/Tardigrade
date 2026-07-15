@@ -7,7 +7,7 @@ const std = @import("std");
 /// level, so `@cImport("openssl/...")` is never analyzed and `libssl`/
 /// `libcrypto` are never linked. There is no runtime fallback between
 /// profiles; the selection is embedded in the binary and reported by
-/// `tardigrade version`. See docs/TLS_DEPENDENCY_POLICY.md.
+/// `tardi version`. See docs/TLS_DEPENDENCY_POLICY.md.
 const TlsProfile = enum { general, appliance };
 
 pub fn build(b: *std.Build) void {
@@ -15,8 +15,8 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const prefer_static_system_libs = b.option(bool, "prefer-static-system-libs", "Prefer static linking for system libraries") orelse false;
     const require_static_system_libs = b.option(bool, "require-static-system-libs", "Require static linking for system libraries") orelse false;
-    const static_executable = b.option(bool, "static-executable", "Build the tardigrade executable as a static binary") orelse false;
-    const app_version = b.option([]const u8, "version", "Version string embedded in the tardigrade binary") orelse "dev";
+    const static_executable = b.option(bool, "static-executable", "Build the tardi executable as a static binary") orelse false;
+    const app_version = b.option([]const u8, "version", "Version string embedded in the tardi binary") orelse "dev";
     const tls_profile = b.option(
         TlsProfile,
         "tls-profile",
@@ -104,7 +104,7 @@ pub fn build(b: *std.Build) void {
     exe_mod.addImport("tls_core", tls_core_mod);
 
     const exe = b.addExecutable(.{
-        .name = "tardigrade",
+        .name = "tardi",
         .root_module = exe_mod,
         .linkage = if (static_executable) .static else null,
     });
@@ -164,7 +164,7 @@ pub fn build(b: *std.Build) void {
     allocation_regression_step.dependOn(&run_allocation_regression.step);
 
     const integration_options = b.addOptions();
-    integration_options.addOption([]const u8, "tardigrade_bin_path", b.getInstallPath(.bin, "tardigrade"));
+    integration_options.addOption([]const u8, "tardigrade_bin_path", b.getInstallPath(.bin, "tardi"));
 
     const integration_mod = b.createModule(.{
         .root_source_file = b.path("tests/integration.zig"),

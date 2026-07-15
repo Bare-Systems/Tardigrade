@@ -7,19 +7,19 @@
 # Options:
 #   --version VERSION   Package version (default: inferred from `git describe`)
 #   --arch ARCH         Target architecture: amd64 or arm64 (default: host arch)
-#   --binary PATH       Path to pre-built tardigrade binary (default: zig-out/bin/tardigrade)
+#   --binary PATH       Path to pre-built tardi binary (default: zig-out/bin/tardi)
 #   --output DIR        Output directory for .deb file (default: dist/)
 #
 # Prerequisites:
 #   dpkg-deb (part of dpkg, available on Debian/Ubuntu)
-#   A pre-built tardigrade binary for the target architecture
+#   A pre-built tardi binary for the target architecture
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 VERSION=""
 ARCH=""
-BINARY="${REPO_ROOT}/zig-out/bin/tardigrade"
+BINARY="${REPO_ROOT}/zig-out/bin/tardi"
 OUTPUT_DIR="${REPO_ROOT}/dist"
 
 while [[ $# -gt 0 ]]; do
@@ -64,7 +64,8 @@ DEBIAN_DIR="${PKG_DIR}/DEBIAN"
 mkdir -p "$BIN_DIR" "$CONF_DIR" "$SYSTEMD_DIR" "$LOGROTATE_DIR" "$STATE_DIR" "$LOG_DIR" "$DEBIAN_DIR"
 
 # Binary
-install -m 0755 "$BINARY" "${BIN_DIR}/tardigrade"
+install -m 0755 "$BINARY" "${BIN_DIR}/tardi"
+ln -s tardi "${BIN_DIR}/tardigrade"
 
 # Default config
 cat > "${CONF_DIR}/tardigrade.env" <<'ENVEOF'

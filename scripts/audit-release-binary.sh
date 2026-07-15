@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # TLS/crypto binary linkage audit and dependency inventory (#379, epic #327).
 #
-# Inspects a produced tardigrade binary's dynamic dependencies and emits a
+# Inspects a produced tardi binary's dynamic dependencies and emits a
 # machine-readable inventory. For the Bare Systems appliance profile it fails
 # if the binary links OpenSSL, libcrypto, or any other foreign TLS/crypto/
 # QUIC/H3/certificate library, and confirms the binary self-reports the

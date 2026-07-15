@@ -48,7 +48,7 @@ surfaces that should not be marketed as generic operator-facing capabilities.
 | Static file serving | `static_file`, `autoindex`, `etag`, `range` | `stable` | Covered by public docs and integration tests for path normalization, ranges, cache validation, and symlink safety. |
 | Reverse proxying and config-driven routing | `location_router`, `rewrite`, `request_context`, `config_file`; README `server` / `location` examples; `TARDIGRADE_PROXY_STREAMING_MODE` | `stable` | Core HTTP/1.1 reverse-proxy path, route matching, and opt-in bounded streaming policy are part of the product identity. |
 | TLS termination | `tls_termination` | `stable` | Core public edge capability with operator docs, config knobs, and release validation. |
-| Config loading and validation | `config_file`; `tardigrade check`; README config examples | `stable` | Part of the operator workflow and startup contract. |
+| Config loading and validation | `config_file`; `tardi check`; README config examples | `stable` | Part of the operator workflow and startup contract. |
 | Hot reload and graceful drain | runtime reload path, drain behavior, `shutdown` | `stable` | Public CLI/runtime behavior; documented and integration-tested. |
 | Access logging and request IDs | `access_log`, `correlation_id` | `stable` | Public operational surface used in README and integration coverage. |
 | Prometheus metrics endpoint | `metrics` | `stable` | Public operator docs and integration coverage exist for `/status/metrics`. |

@@ -50,7 +50,10 @@ docker run --rm \
     --volume "${OUTPUT_DIR}:/output" \
     --volume "${ZIG_DIR}:/opt/zig:ro" \
     rockylinux:9 bash -euxc '
-        dnf install -y rpm-build openssl-devel openssl-libs systemd-rpm-macros
+        # Rocky minor repos can briefly offer a newer best candidate before all
+        # matching dependency packages are mirrored. The smoke test only needs a
+        # coherent distro-provided OpenSSL development stack.
+        dnf --nobest install -y rpm-build openssl-devel openssl-libs systemd-rpm-macros
 
         export PATH="/opt/zig:${PATH}"
 

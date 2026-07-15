@@ -522,6 +522,7 @@ pub fn handleLocationProxyPass(
     const fallback_reason: StreamingFallbackReason = switch (streamingEligibilityForDataPlaneProxyRequest(cfg, matched_block, &resolved, upstream_url.value, max_attempts)) {
         .stream => {
             state.recordUpstreamAttemptStart(selection.base_url);
+            const proxy_buffer_observer = state.proxyBufferObserver();
             const streamed = executeStreamingHttpProxyRequest(
                 allocator,
                 cfg,
@@ -543,6 +544,7 @@ pub fn handleLocationProxyPass(
                 &state.security_headers,
                 sticky_set_cookie,
                 if (ctx.lifecycle) |lc| &lc.token else null,
+                proxy_buffer_observer,
                 &state.upstream_pool,
                 &state.h2_pool,
             ) catch |err| {

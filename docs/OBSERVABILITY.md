@@ -33,6 +33,21 @@ logs are written through `src/http/logger.zig`.
 - reverse-proxy buffered byte gauges/counters:
   `tardigrade_proxy_buffered_bytes_current` and
   `tardigrade_proxy_buffered_bytes_total`
+- shared proxy buffer accounting gauges/counters:
+  `tardigrade_buffered_bytes_current{direction,scope}`,
+  `tardigrade_buffer_high_watermark_events_total{direction,scope}`,
+  `tardigrade_buffer_read_pauses_total{side}`,
+  `tardigrade_buffer_read_resumes_total{side}`, and
+  `tardigrade_buffer_limit_exceeded_total{direction,scope}`. Labels are fixed
+  to protocol-independent directions, scopes, and sides; they never include
+  URLs, request IDs, or stream IDs. Current byte gauges cover bounded buffered
+  responses, HTTP/1 streaming relay buffers, and HTTP/2 streaming response queues.
+  Pause/resume counters are exported as reserved zero-valued series until a later
+  backpressure slice adds production pause/resume transition sites.
+- configured proxy buffer limits:
+  `tardigrade_buffer_config_limit_bytes{direction,scope,limit}` for the
+  per-stream low/high/hard watermarks plus per-origin/global hard-limit
+  settings.
 - reverse-proxy abort counters:
   `tardigrade_proxy_client_aborts_total` and
   `tardigrade_proxy_upstream_aborts_total`
@@ -97,6 +112,11 @@ Two outcome shapes exist:
 | Single header too large | `TARDIGRADE_MAX_HEADER_SIZE` | 8 KiB | `request_limits.validateHeaderSize` | `431`-class rejection |
 | All headers too large | `TARDIGRADE_MAX_HEADERS_TOTAL_SIZE` | 32 KiB | `request_limits.validateHeadersTotalSize` | `431` before body allocation |
 | Request body too large | `TARDIGRADE_MAX_BODY_SIZE` | 1 MiB | `request_limits.validateBodySize` | `413`-class rejection |
+| Proxy per-stream buffer low watermark | `TARDIGRADE_PROXY_BUFFER_PER_STREAM_LOW_WATERMARK_BYTES` | 256 KiB | proxy buffer accounting | Paired with high watermark for pause/resume decisions; must satisfy `low < high <= hard` |
+| Proxy per-stream buffer high watermark | `TARDIGRADE_PROXY_BUFFER_PER_STREAM_HIGH_WATERMARK_BYTES` | 768 KiB | proxy buffer accounting | High-watermark transition is observable through `tardigrade_buffer_high_watermark_events_total` |
+| Proxy per-stream buffer hard limit | `TARDIGRADE_PROXY_BUFFER_PER_STREAM_HARD_LIMIT_BYTES` | 1 MiB | proxy buffer accounting | Hard-limit exceedance is observable through `tardigrade_buffer_limit_exceeded_total`; enforcement lands per proxy path as backpressure work expands |
+| Proxy per-origin buffer hard limit | `TARDIGRADE_PROXY_BUFFER_PER_ORIGIN_HARD_LIMIT_BYTES` | 0 (not enforced yet) | future aggregate proxy buffer accounting | When non-zero, must be at least the per-stream hard limit |
+| Proxy global buffer hard limit | `TARDIGRADE_PROXY_BUFFER_GLOBAL_HARD_LIMIT_BYTES` | 0 (not enforced yet) | future aggregate proxy buffer accounting | When non-zero, must be at least the per-stream hard limit |
 | Parked keepalive backlog | idle-park timeout / `max_requests_per_connection` | — | `keepalive_park.ParkedRegistry` | Idle parked connections reaped on the timer tick (`timeouts_total`); none hold a worker while idle |
 
 The request-size limits are enforced in two layers: the HTTP parser

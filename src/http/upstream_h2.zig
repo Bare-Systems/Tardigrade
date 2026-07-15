@@ -27,6 +27,7 @@ const compat = @import("../zig_compat.zig");
 const frame = @import("http2_frame.zig");
 const hpack = @import("hpack.zig");
 const tls_termination = @import("tls_backend.zig");
+const proxy_buffer_account = @import("proxy_buffer_account.zig");
 
 /// HTTP/2 client connection preface (RFC 7540 §3.5).
 pub const PREFACE = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
@@ -84,6 +85,8 @@ pub const Request = struct {
     /// Whether `body` is the complete outbound request body or the first bytes
     /// of a request body that will continue through streaming DATA writes.
     body_mode: BodyMode = .complete,
+    proxy_buffer_limits: ?proxy_buffer_account.Limits = null,
+    proxy_buffer_observer: ?proxy_buffer_account.Observer = null,
 };
 
 pub const BodyMode = enum {
@@ -464,11 +467,69 @@ pub const Stream = struct {
     /// (idle state) would be a connection-level PROTOCOL_ERROR. Written and
     /// read only by the owning worker thread.
     wire_opened: bool = false,
+    local_abort: bool = false,
+    proxy_body_account: ?proxy_buffer_account.Account = null,
+    proxy_buffer_observer: ?proxy_buffer_account.Observer = null,
 
     fn destroy(self: *Stream, allocator: std.mem.Allocator) void {
+        self.releaseQueuedBodyAccounting();
         freeHeaderList(allocator, &self.headers);
         self.body.deinit(allocator);
         allocator.destroy(self);
+    }
+
+    fn recordQueuedBody(self: *Stream, bytes: usize) !void {
+        if (self.proxy_body_account) |*account| {
+            const before = account.snapshot();
+            account.reserve(bytes) catch |err| {
+                const after = account.snapshot();
+                if (self.proxy_buffer_observer) |observer| {
+                    if (after.limit_exceeded_events > before.limit_exceeded_events) {
+                        observer.recordReservation(account.direction, 0, false, true);
+                    }
+                }
+                return err;
+            };
+            const after = account.snapshot();
+            if (self.proxy_buffer_observer) |observer| {
+                observer.recordReservation(
+                    account.direction,
+                    bytes,
+                    after.high_watermark_events > before.high_watermark_events,
+                    after.limit_exceeded_events > before.limit_exceeded_events,
+                );
+            }
+        }
+    }
+
+    fn releaseQueuedBody(self: *Stream, bytes: usize) void {
+        if (bytes == 0) return;
+        if (self.proxy_body_account) |*account| {
+            account.release(bytes) catch unreachable;
+            if (self.proxy_buffer_observer) |observer| {
+                observer.releaseReservation(account.direction, bytes);
+            }
+        }
+    }
+
+    fn compactAcknowledgedBody(self: *Stream, bytes: usize) void {
+        if (bytes == 0) return;
+        std.debug.assert(bytes <= self.body_read_off);
+        std.debug.assert(bytes <= self.body.items.len);
+        const remaining = self.body.items.len - bytes;
+        if (remaining > 0) {
+            std.mem.copyForwards(u8, self.body.items[0..remaining], self.body.items[bytes..]);
+        }
+        self.body.shrinkRetainingCapacity(remaining);
+        self.body_read_off -= bytes;
+        if (self.body.items.len == 0) self.body_read_off = 0;
+    }
+
+    fn releaseQueuedBodyAccounting(self: *Stream) void {
+        if (self.proxy_body_account) |*account| {
+            const current = account.snapshot().current;
+            if (current > 0) self.releaseQueuedBody(current);
+        }
     }
 };
 
@@ -686,6 +747,10 @@ pub fn H2Conn(comptime Transport: type) type {
         pub fn openStreaming(self: *Self, req: Request) !*Stream {
             const stream = try self.beginStream(true);
             errdefer self.finishStreaming(stream);
+            if (req.proxy_buffer_limits) |limits| {
+                stream.proxy_body_account = proxy_buffer_account.Account.init(.upstream_to_downstream, .stream, limits);
+                stream.proxy_buffer_observer = req.proxy_buffer_observer;
+            }
             try self.sendRequest(stream, req);
             return stream;
         }
@@ -730,8 +795,9 @@ pub fn H2Conn(comptime Transport: type) type {
 
         /// Copy the next chunk of a streaming response body into `out`,
         /// blocking (deadline-bounded) until data, end-of-stream, or an error.
-        /// Returns 0 at end of stream. Consuming bytes replenishes the
-        /// stream-level flow-control window so the origin may send more.
+        /// Returns 0 at end of stream. The caller must acknowledge each
+        /// non-zero read with `acknowledgeStreamingBody` only after the copied
+        /// bytes have been durably consumed downstream.
         pub fn readStreamingBody(self: *Self, stream: *Stream, out: []u8) !usize {
             self.state_mutex.lock();
             while (true) {
@@ -740,19 +806,7 @@ pub fn H2Conn(comptime Transport: type) type {
                     const n = @min(avail, out.len);
                     @memcpy(out[0..n], stream.body.items[stream.body_read_off..][0..n]);
                     stream.body_read_off += n;
-                    if (stream.body_read_off == stream.body.items.len) {
-                        stream.body.clearRetainingCapacity();
-                        stream.body_read_off = 0;
-                    }
-                    stream.recv_window += @as(i64, @intCast(n));
-                    // No more data will arrive once END_STREAM was seen, so the
-                    // window only needs replenishing while the stream is open.
-                    const replenish = !stream.done;
                     self.state_mutex.unlock();
-                    if (replenish) {
-                        const inc = windowIncrement(n);
-                        self.writeControl(.window_update, 0, stream.id, &inc);
-                    }
                     return n;
                 }
                 if (stream.err) |e| {
@@ -773,6 +827,25 @@ pub fn H2Conn(comptime Transport: type) type {
             }
         }
 
+        /// Acknowledge bytes returned by `readStreamingBody` after the caller
+        /// has written them downstream. This is the ownership transfer point:
+        /// accounting is released, consumed queue prefixes are compacted, and
+        /// stream credit is replenished only after downstream consumption.
+        pub fn acknowledgeStreamingBody(self: *Self, stream: *Stream, bytes: usize) void {
+            if (bytes == 0) return;
+            self.state_mutex.lock();
+            stream.releaseQueuedBody(bytes);
+            stream.compactAcknowledgedBody(bytes);
+            stream.recv_window += @as(i64, @intCast(bytes));
+            const replenish = !stream.done;
+            const id = stream.id;
+            self.state_mutex.unlock();
+            if (replenish) {
+                const inc = windowIncrement(bytes);
+                self.writeControl(.window_update, 0, id, &inc);
+            }
+        }
+
         /// Finish a streaming request: detach the stream from the connection,
         /// reset it upstream if the response had not completed (so the origin
         /// stops sending on an abandoned stream), free the concurrency slot,
@@ -782,7 +855,7 @@ pub fn H2Conn(comptime Transport: type) type {
             self.state_mutex.lock();
             const removed = self.streams.remove(stream.id);
             if (removed and self.active_streams > 0) self.active_streams -= 1;
-            const need_rst = stream.wire_opened and stream.err == null and !stream.done and self.conn_err == null;
+            const need_rst = stream.wire_opened and (stream.err == null or stream.local_abort) and !stream.done and self.conn_err == null;
             const id = stream.id;
             self.state_mutex.unlock();
             self.last_activity_ms.store(nowMs(), .monotonic);
@@ -1121,7 +1194,7 @@ pub fn H2Conn(comptime Transport: type) type {
             const end_stream = (fr.flags & frame.Flags.END_STREAM) != 0;
             self.state_mutex.lock();
             const maybe_stream = self.streams.get(fr.stream_id);
-            var replenish_stream = true;
+            var replenish_stream = false;
             var flow_violation = false;
             if (maybe_stream) |s| {
                 var deliver = fr.payload.len > 0;
@@ -1138,6 +1211,20 @@ pub fn H2Conn(comptime Transport: type) type {
                         flow_violation = true;
                         deliver = false;
                     }
+                } else if (deliver) {
+                    replenish_stream = true;
+                }
+                if (deliver) {
+                    s.recordQueuedBody(fr.payload.len) catch |err| {
+                        if (err == error.BufferLimitExceeded) {
+                            if (s.err == null) s.err = err;
+                            s.local_abort = true;
+                            deliver = false;
+                        } else {
+                            self.state_mutex.unlock();
+                            return err;
+                        }
+                    };
                 }
                 if (deliver) {
                     s.body.appendSlice(self.allocator, fr.payload) catch {
@@ -1697,6 +1784,40 @@ fn windowIncrement(n: usize) [4]u8 {
 }
 
 const testing = std.testing;
+
+const TestProxyBufferObserver = struct {
+    current: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    limit_exceeded: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
+    fn observer(self: *TestProxyBufferObserver) proxy_buffer_account.Observer {
+        return .{
+            .context = self,
+            .recordReservationFn = record,
+            .releaseReservationFn = release,
+        };
+    }
+
+    fn record(context: *anyopaque, _: proxy_buffer_account.Direction, bytes: usize, _: bool, limit_exceeded: bool) void {
+        const self: *TestProxyBufferObserver = @ptrCast(@alignCast(context));
+        if (bytes > 0) _ = self.current.fetchAdd(bytes, .monotonic);
+        if (limit_exceeded) _ = self.limit_exceeded.fetchAdd(1, .monotonic);
+    }
+
+    fn release(context: *anyopaque, _: proxy_buffer_account.Direction, bytes: usize) void {
+        const self: *TestProxyBufferObserver = @ptrCast(@alignCast(context));
+        if (bytes > 0) _ = self.current.fetchSub(bytes, .monotonic);
+    }
+};
+
+fn smallProxyBufferLimits(hard: usize) proxy_buffer_account.Limits {
+    return .{
+        .per_stream_low_watermark = 1,
+        .per_stream_high_watermark = @max(2, @min(hard, 8)),
+        .per_stream_hard_limit = hard,
+        .per_origin_hard_limit = 0,
+        .global_hard_limit = 0,
+    };
+}
 
 test "isConnectionSpecific filters hop-by-hop and Host headers" {
     try testing.expect(isConnectionSpecific("Connection"));
@@ -2267,6 +2388,7 @@ test "streaming request relays a multi-frame body with consumer-driven window re
         const n = try conn.readStreamingBody(stream, buf[0..]);
         if (n == 0) break;
         try got.appendSlice(testing.allocator, buf[0..n]);
+        conn.acknowledgeStreamingBody(stream, n);
     }
     conn.finishStreaming(stream);
 
@@ -2278,6 +2400,125 @@ test "streaming request relays a multi-frame body with consumer-driven window re
     conn.deinit();
     server.join();
     _ = std.c.close(fds[1]);
+}
+
+fn cannedSingleDataStreamingServer(peer_fd: std.posix.fd_t, body: []const u8, end_stream: bool) void {
+    const a = std.heap.page_allocator;
+    var srv = PlainTransport{ .fd = peer_fd };
+    var preface: [PREFACE.len]u8 = undefined;
+    readExact(&srv, peer_fd, preface[0..], 2000) catch return;
+    frame.writeSettings(a, &srv, &[_][2]u32{}) catch return;
+
+    var req_stream: u31 = 0;
+    while (req_stream == 0) {
+        var fr = readFrameBounded(&srv, peer_fd, a, 2000) catch return;
+        if (fr.typ == .headers) req_stream = fr.stream_id;
+        frame.deinitFrame(a, &fr);
+    }
+
+    const block = hpack.encodeLiteralHeaderBlock(a, &[_]hpack.HeaderField{
+        .{ .name = ":status", .value = "200" },
+    }) catch return;
+    defer a.free(block);
+    frame.writeFrame(&srv, .headers, frame.Flags.END_HEADERS, req_stream, block) catch return;
+    frame.writeFrame(&srv, .data, if (end_stream) frame.Flags.END_STREAM else 0, req_stream, body) catch return;
+
+    var scratch: [1]u8 = undefined;
+    _ = srv.read(scratch[0..]) catch {};
+}
+
+test "streaming body accounting releases only after consumer acknowledgement and compacts queue" {
+    const fds = try makeSocketpair();
+    const server = try std.Thread.spawn(.{}, cannedSingleDataStreamingServer, .{ fds[1], "payload", false });
+
+    var observer = TestProxyBufferObserver{};
+    var transport = PlainTransport{ .fd = fds[0] };
+    const conn = try H2Conn(*PlainTransport).init(testing.allocator, &transport, fds[0], 3000, null, null, null);
+
+    const stream = try conn.requestStreaming(.{
+        .method = "GET",
+        .authority = "account.test",
+        .path = "/",
+        .proxy_buffer_limits = smallProxyBufferLimits(64),
+        .proxy_buffer_observer = observer.observer(),
+    });
+    var buf: [16]u8 = undefined;
+    const n = try conn.readStreamingBody(stream, buf[0..]);
+    try testing.expectEqualStrings("payload", buf[0..n]);
+    try testing.expectEqual(@as(usize, 7), observer.current.load(.monotonic));
+    try testing.expectEqual(@as(usize, 7), stream.body.items.len);
+    try testing.expectEqual(@as(usize, 7), stream.body_read_off);
+
+    conn.acknowledgeStreamingBody(stream, n);
+    try testing.expectEqual(@as(usize, 0), observer.current.load(.monotonic));
+    try testing.expectEqual(@as(usize, 0), stream.body.items.len);
+    try testing.expectEqual(@as(usize, 0), stream.body_read_off);
+
+    conn.finishStreaming(stream);
+    conn.deinit();
+    server.join();
+    _ = std.c.close(fds[1]);
+}
+
+fn cannedLimitExceededStreamingServer(peer_fd: std.posix.fd_t, saw_rst: *std.atomic.Value(bool)) void {
+    const a = std.heap.page_allocator;
+    var srv = PlainTransport{ .fd = peer_fd };
+    var preface: [PREFACE.len]u8 = undefined;
+    readExact(&srv, peer_fd, preface[0..], 2000) catch return;
+    frame.writeSettings(a, &srv, &[_][2]u32{}) catch return;
+
+    var req_stream: u31 = 0;
+    while (req_stream == 0) {
+        var fr = readFrameBounded(&srv, peer_fd, a, 2000) catch return;
+        if (fr.typ == .headers) req_stream = fr.stream_id;
+        frame.deinitFrame(a, &fr);
+    }
+
+    const block = hpack.encodeLiteralHeaderBlock(a, &[_]hpack.HeaderField{
+        .{ .name = ":status", .value = "200" },
+    }) catch return;
+    defer a.free(block);
+    frame.writeFrame(&srv, .headers, frame.Flags.END_HEADERS, req_stream, block) catch return;
+    frame.writeFrame(&srv, .data, 0, req_stream, "0123456789abcdef") catch return;
+
+    while (true) {
+        var fr = readFrameBounded(&srv, peer_fd, a, 5000) catch return;
+        const is_rst = fr.typ == .rst_stream and fr.stream_id == req_stream;
+        frame.deinitFrame(a, &fr);
+        if (is_rst) {
+            saw_rst.store(true, .release);
+            return;
+        }
+    }
+}
+
+test "streaming body hard-limit abort resets stream and releases accounting" {
+    const fds = try makeSocketpair();
+    var saw_rst = std.atomic.Value(bool).init(false);
+    const server = try std.Thread.spawn(.{}, cannedLimitExceededStreamingServer, .{ fds[1], &saw_rst });
+
+    var observer = TestProxyBufferObserver{};
+    var transport = PlainTransport{ .fd = fds[0] };
+    const conn = try H2Conn(*PlainTransport).init(testing.allocator, &transport, fds[0], 3000, null, null, null);
+
+    const stream = try conn.requestStreaming(.{
+        .method = "GET",
+        .authority = "limit.test",
+        .path = "/",
+        .proxy_buffer_limits = smallProxyBufferLimits(8),
+        .proxy_buffer_observer = observer.observer(),
+    });
+    var buf: [16]u8 = undefined;
+    try testing.expectError(error.BufferLimitExceeded, conn.readStreamingBody(stream, buf[0..]));
+    conn.finishStreaming(stream);
+
+    conn.deinit();
+    server.join();
+    _ = std.c.close(fds[1]);
+
+    try testing.expect(saw_rst.load(.acquire));
+    try testing.expectEqual(@as(usize, 0), observer.current.load(.monotonic));
+    try testing.expectEqual(@as(u64, 1), observer.limit_exceeded.load(.monotonic));
 }
 
 /// Canned server: HEADERS + DATA + a trailer HEADERS block (END_STREAM). The
@@ -2326,6 +2567,7 @@ test "streaming response trailers end the stream and are discarded" {
         const n = try conn.readStreamingBody(stream, buf[0..]);
         if (n == 0) break;
         try got.appendSlice(testing.allocator, buf[0..n]);
+        conn.acknowledgeStreamingBody(stream, n);
     }
     try testing.expectEqualStrings("payload", got.items);
     for (stream.headers.items) |h| {
@@ -2408,6 +2650,7 @@ test "streaming stream fails when the peer overruns the advertised window" {
         const n = conn.readStreamingBody(stream, buf[0..]) catch |e| break e;
         try testing.expect(n != 0); // stream must not end cleanly
         total += n;
+        conn.acknowledgeStreamingBody(stream, n);
     };
     try testing.expectEqual(@as(usize, OUR_INITIAL_WINDOW), total);
     try testing.expectError(error.Http2FlowControlError, @as(anyerror!void, read_err));
@@ -2496,6 +2739,7 @@ fn muxStreamingClientThread(ctx: *MuxStreamingClientCtx) void {
         const n = ctx.conn.readStreamingBody(stream, got_buf[got_len..]) catch return;
         if (n == 0) break;
         got_len += n;
+        ctx.conn.acknowledgeStreamingBody(stream, n);
     }
     ctx.ok = std.mem.eql(u8, got_buf[0..got_len], path);
 }
@@ -2637,6 +2881,7 @@ test "streaming request upload sends DATA incrementally and waits for flow-contr
         const n = try conn.readStreamingBody(stream, buf[0..]);
         if (n == 0) break;
         try got.appendSlice(testing.allocator, buf[0..n]);
+        conn.acknowledgeStreamingBody(stream, n);
     }
 
     conn.finishStreaming(stream);

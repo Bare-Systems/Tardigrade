@@ -15,6 +15,7 @@ const gph = @import("gateway_proxy_headers.zig");
 const gpres = @import("gateway_proxy_response.zig");
 const gpt = @import("gateway_proxy_target.zig");
 const gconn = @import("gateway_connection.zig");
+const proxy_buffer_account = http.proxy_buffer_account;
 
 // Compatibility re-exports of the split-out proxy helper APIs (headers /
 // response / target modules) so existing callers that import this module keep
@@ -99,6 +100,55 @@ pub const BufferedUpstreamResponse = struct {
 pub const StreamingRequestBody = struct {
     content_length: usize,
     initial_bytes: []const u8 = &.{},
+};
+
+const ProxyBufferReservation = struct {
+    account: proxy_buffer_account.Account,
+    observer: proxy_buffer_account.Observer,
+    active: bool = false,
+
+    fn init(
+        direction: proxy_buffer_account.Direction,
+        limits: proxy_buffer_account.Limits,
+        observer: proxy_buffer_account.Observer,
+    ) ProxyBufferReservation {
+        return .{
+            .account = proxy_buffer_account.Account.init(direction, .stream, limits),
+            .observer = observer,
+        };
+    }
+
+    fn reserve(self: *ProxyBufferReservation, bytes: usize) !void {
+        const before = self.account.snapshot();
+        self.account.reserve(bytes) catch |err| {
+            const after = self.account.snapshot();
+            if (after.limit_exceeded_events > before.limit_exceeded_events) {
+                self.observer.recordReservation(self.account.direction, 0, false, true);
+            }
+            return err;
+        };
+        const after = self.account.snapshot();
+        self.observer.recordReservation(
+            self.account.direction,
+            bytes,
+            after.high_watermark_events > before.high_watermark_events,
+            after.limit_exceeded_events > before.limit_exceeded_events,
+        );
+        self.active = true;
+    }
+
+    fn release(self: *ProxyBufferReservation, bytes: usize) void {
+        if (!self.active) return;
+        self.account.release(bytes) catch unreachable;
+        self.observer.releaseReservation(self.account.direction, bytes);
+        self.active = self.account.snapshot().current != 0;
+    }
+
+    fn releaseAll(self: *ProxyBufferReservation) void {
+        const current = self.account.snapshot().current;
+        if (current == 0) return;
+        self.release(current);
+    }
 };
 
 pub const StreamingProxyResult = struct {
@@ -645,6 +695,8 @@ fn streamViaH2Pool(
     connect_timeout_ms: u32,
     read_deadline_ms: u32,
     cancel_token: ?*const CancellationToken,
+    proxy_buffer_limits: proxy_buffer_account.Limits,
+    proxy_buffer_observer: proxy_buffer_account.Observer,
 ) !StreamingProxyResult {
     const deadline_ms: u32 = if (read_deadline_ms > 0)
         read_deadline_ms
@@ -670,7 +722,7 @@ fn streamViaH2Pool(
                 if (h1_pool) |p| p.recordProtocol(false);
                 const start_ms = http.event_loop.monotonicMs();
                 var wrote_downstream = false;
-                const res = try streamProxyOverTransport(allocator, tls_ptr, tls_ptr.fd, read_buf, uri, method, extra_headers, buffered_body, streaming_body, downstream_conn, downstream_writer, security, sticky_set_cookie, correlation_id, connect_timeout_ms, read_deadline_ms, cancel_token, &wrote_downstream);
+                const res = try streamProxyOverTransport(allocator, tls_ptr, tls_ptr.fd, read_buf, uri, method, extra_headers, buffered_body, streaming_body, downstream_conn, downstream_writer, security, sticky_set_cookie, correlation_id, connect_timeout_ms, read_deadline_ms, cancel_token, &wrote_downstream, proxy_buffer_limits, proxy_buffer_observer);
                 if (h1_pool) |p| p.recordRequestLatency(false, http.event_loop.monotonicMs() - start_ms);
                 return res.result;
             },
@@ -701,6 +753,8 @@ fn streamViaH2Pool(
                     .headers = extra_headers,
                     .body = buffered_body,
                     .body_mode = if (streaming_body == null) .complete else .streaming,
+                    .proxy_buffer_limits = proxy_buffer_limits,
+                    .proxy_buffer_observer = proxy_buffer_observer,
                 }) catch |err| {
                     // Nothing has reached the client yet: evict the dead
                     // connection so new requests do not pick it, and retry
@@ -716,12 +770,20 @@ fn streamViaH2Pool(
                 if (streaming_body) |sb| {
                     var sent: usize = @min(sb.initial_bytes.len, sb.content_length);
                     if (sent > 0) {
+                        var initial_reservation = ProxyBufferReservation.init(.downstream_to_upstream, proxy_buffer_limits, proxy_buffer_observer);
+                        initial_reservation.reserve(sent) catch |err| {
+                            conn.finishStreaming(stream);
+                            h2_pool.release(conn);
+                            return err;
+                        };
                         conn.writeStreamingRequestBody(stream, sb.initial_bytes[0..sent], sent == sb.content_length) catch |err| {
+                            initial_reservation.releaseAll();
                             conn.finishStreaming(stream);
                             if (!conn.healthy()) h2_pool.evict(key, conn);
                             h2_pool.release(conn);
                             return err;
                         };
+                        initial_reservation.releaseAll();
                     }
                     while (sent < sb.content_length) {
                         if (cancelStopped(cancel_token)) {
@@ -740,12 +802,20 @@ fn streamViaH2Pool(
                             h2_pool.release(conn);
                             return error.ClientAborted;
                         }
+                        var upload_reservation = ProxyBufferReservation.init(.downstream_to_upstream, proxy_buffer_limits, proxy_buffer_observer);
+                        upload_reservation.reserve(n) catch |err| {
+                            conn.finishStreaming(stream);
+                            h2_pool.release(conn);
+                            return err;
+                        };
                         conn.writeStreamingRequestBody(stream, read_buf[0..n], sent + n == sb.content_length) catch |err| {
+                            upload_reservation.releaseAll();
                             conn.finishStreaming(stream);
                             if (!conn.healthy()) h2_pool.evict(key, conn);
                             h2_pool.release(conn);
                             return err;
                         };
+                        upload_reservation.releaseAll();
                         sent += n;
                     }
                     if (sb.content_length == 0) {
@@ -811,6 +881,7 @@ fn streamViaH2Pool(
                             h2_pool.release(conn);
                             return error.ClientAborted;
                         };
+                        conn.acknowledgeStreamingBody(stream, n);
                         body_bytes += n;
                     }
                     if (!aborted) {
@@ -1583,6 +1654,8 @@ fn sendStreamingProxyRequest(
     streaming_body: ?StreamingRequestBody,
     downstream_conn: anytype,
     cancel_token: ?*const CancellationToken,
+    proxy_buffer_limits: proxy_buffer_account.Limits,
+    proxy_buffer_observer: proxy_buffer_account.Observer,
 ) !void {
     var req_aw: std.Io.Writer.Allocating = .init(allocator);
     defer req_aw.deinit();
@@ -1615,8 +1688,18 @@ fn sendStreamingProxyRequest(
 
     if (streaming_body) |sb| {
         var relay: [16 * 1024]u8 = undefined;
+        var upload_reservation = ProxyBufferReservation.init(.downstream_to_upstream, proxy_buffer_limits, proxy_buffer_observer);
         var sent: usize = @min(sb.initial_bytes.len, sb.content_length);
-        if (sent > 0) try transport.writeAll(sb.initial_bytes[0..sent]);
+        try upload_reservation.reserve(relay.len);
+        defer upload_reservation.releaseAll();
+        if (sent > 0) {
+            try upload_reservation.reserve(sent);
+            transport.writeAll(sb.initial_bytes[0..sent]) catch |err| {
+                upload_reservation.release(sent);
+                return err;
+            };
+            upload_reservation.release(sent);
+        }
         while (sent < sb.content_length) {
             if (cancelStopped(cancel_token)) return error.RequestCancelled;
             const want = @min(relay.len, sb.content_length - sent);
@@ -1654,9 +1737,23 @@ fn streamProxyOverTransport(
     read_deadline_ms: u32,
     cancel_token: ?*const CancellationToken,
     wrote_downstream: *bool,
+    proxy_buffer_limits: proxy_buffer_account.Limits,
+    proxy_buffer_observer: proxy_buffer_account.Observer,
 ) !struct { result: StreamingProxyResult, reusable: bool } {
     if (connect_timeout_ms > 0) setSocketTimeoutMs(fd, connect_timeout_ms, connect_timeout_ms) catch {};
-    try sendStreamingProxyRequest(allocator, transport, uri, method, extra_headers, buffered_body, streaming_body, downstream_conn, cancel_token);
+    try sendStreamingProxyRequest(
+        allocator,
+        transport,
+        uri,
+        method,
+        extra_headers,
+        buffered_body,
+        streaming_body,
+        downstream_conn,
+        cancel_token,
+        proxy_buffer_limits,
+        proxy_buffer_observer,
+    );
     if (read_deadline_ms > 0) setSocketRecvTimeoutMs(fd, read_deadline_ms) catch {};
 
     const ttfb_start_ms = http.event_loop.monotonicMs();
@@ -1668,6 +1765,12 @@ fn streamProxyOverTransport(
 
     const reason = gpres.upstreamReasonPhrase(@enumFromInt(head.status_code));
     const body_allowed = gpres.responseBodyAllowed(method, head.status_code);
+    var response_reservation: ?ProxyBufferReservation = null;
+    if (body_allowed) {
+        response_reservation = ProxyBufferReservation.init(.upstream_to_downstream, proxy_buffer_limits, proxy_buffer_observer);
+        try response_reservation.?.reserve(read_buf.len);
+    }
+    defer if (response_reservation) |*reservation| reservation.releaseAll();
 
     gpres.writeStreamedUpstreamResponseHeadFromHeaders(
         downstream_writer,
@@ -1736,6 +1839,7 @@ pub fn executeStreamingHttpProxyRequest(
     security: *const http.security_headers.SecurityHeaders,
     sticky_set_cookie: ?[]const u8,
     cancel_token: ?*const CancellationToken,
+    proxy_buffer_observer: proxy_buffer_account.Observer,
     pool: ?*http.upstream_pool.UpstreamPool,
     /// Optional per-origin HTTP/2 multiplexing pool (#145).
     h2_pool: ?*http.upstream_h2.H2ConnPool,
@@ -1802,7 +1906,7 @@ pub fn executeStreamingHttpProxyRequest(
                 o.offer_h2 = true;
                 break :blk o;
             } else null;
-            return streamViaH2Pool(allocator, hp, pool, host, port, h2_opts, uri, method, extra_headers.items, buffered_body, streaming_body, read_buf, downstream_conn, downstream_writer, security, sticky_set_cookie, correlation_id, connect_timeout_ms, read_deadline_ms, cancel_token);
+            return streamViaH2Pool(allocator, hp, pool, host, port, h2_opts, uri, method, extra_headers.items, buffered_body, streaming_body, read_buf, downstream_conn, downstream_writer, security, sticky_set_cookie, correlation_id, connect_timeout_ms, read_deadline_ms, cancel_token, cfg.proxy_buffer_limits, proxy_buffer_observer);
         }
         if (streaming_body != null) {
             if (pool) |p| p.recordH2StreamingUploadFallback();
@@ -1871,9 +1975,9 @@ pub fn executeStreamingHttpProxyRequest(
         const exchange_start_ms = http.event_loop.monotonicMs();
         const fd = conn.stream.handle;
         const res = (if (conn.tls) |tls|
-            streamProxyOverTransport(allocator, tls, fd, read_buf, uri, method, extra_headers.items, buffered_body, streaming_body, downstream_conn, downstream_writer, security, sticky_set_cookie, correlation_id, connect_timeout_ms, read_deadline_ms, cancel_token, &wrote_downstream)
+            streamProxyOverTransport(allocator, tls, fd, read_buf, uri, method, extra_headers.items, buffered_body, streaming_body, downstream_conn, downstream_writer, security, sticky_set_cookie, correlation_id, connect_timeout_ms, read_deadline_ms, cancel_token, &wrote_downstream, cfg.proxy_buffer_limits, proxy_buffer_observer)
         else
-            streamProxyOverTransport(allocator, compat.netStreamFromFd(fd), fd, read_buf, uri, method, extra_headers.items, buffered_body, streaming_body, downstream_conn, downstream_writer, security, sticky_set_cookie, correlation_id, connect_timeout_ms, read_deadline_ms, cancel_token, &wrote_downstream)) catch |err| {
+            streamProxyOverTransport(allocator, compat.netStreamFromFd(fd), fd, read_buf, uri, method, extra_headers.items, buffered_body, streaming_body, downstream_conn, downstream_writer, security, sticky_set_cookie, correlation_id, connect_timeout_ms, read_deadline_ms, cancel_token, &wrote_downstream, cfg.proxy_buffer_limits, proxy_buffer_observer)) catch |err| {
             // Tear down the connection (release handles active-- and close).
             if (active_pool) |p| {
                 p.release(key, conn, false, http.event_loop.monotonicMs());

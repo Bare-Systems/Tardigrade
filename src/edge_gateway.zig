@@ -110,6 +110,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         .active_mux_subscriptions = 0,
         .connection_memory_estimate_bytes = if (cfg.max_connection_memory_bytes > 0) cfg.max_connection_memory_bytes else MAX_REQUEST_SIZE,
         .max_total_connection_memory_bytes = cfg.max_total_connection_memory_bytes,
+        .proxy_buffer_limits = cfg.proxy_buffer_limits,
         .upstream_rr_index = 0,
         .upstream_backup_rr_index = 0,
         .lb_random_state = 0x9e3779b97f4a7c15 ^ @as(u64, @intCast(http.event_loop.monotonicMs())),

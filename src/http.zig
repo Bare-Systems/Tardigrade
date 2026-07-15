@@ -45,6 +45,7 @@ pub const access_log = @import("http/access_log.zig");
 pub const event_loop = @import("http/event_loop.zig");
 pub const worker_pool = @import("http/worker_pool.zig");
 pub const buffer_pool = @import("http/buffer_pool.zig");
+pub const proxy_buffer_account = @import("http/proxy_buffer_account.zig");
 pub const keepalive_park = @import("http/keepalive_park.zig");
 pub const upstream_pool = @import("http/upstream_pool.zig");
 /// TLS termination backend selected by `-Dtls-profile` (#379): the OpenSSL

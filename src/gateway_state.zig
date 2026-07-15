@@ -452,6 +452,7 @@ pub const GatewayState = struct {
     active_mux_subscriptions: usize, // runtime accounting [connection_mutex]
     connection_memory_estimate_bytes: usize, // cfg-derived; updated on reload [runtime_mutex]
     max_total_connection_memory_bytes: usize, // cfg snapshot; updated on reload [runtime_mutex]
+    proxy_buffer_limits: http.proxy_buffer_account.Limits, // cfg snapshot; updated on reload [runtime_mutex]
     upstream_rr_index: usize, // LB selection state [upstream_mutex]
     upstream_backup_rr_index: usize, // LB selection state [upstream_mutex]
     lb_random_state: u64, // LB selection state [upstream_mutex]
@@ -1436,6 +1437,24 @@ pub const GatewayState = struct {
         self.metrics.recordProxyStreamingFallback(reason);
     }
 
+    pub fn metricsRecordProxyBufferBytes(self: *GatewayState, direction: http.proxy_buffer_account.Direction, scope: http.proxy_buffer_account.Scope, bytes: usize) void {
+        self.metrics_mutex.lock();
+        defer self.metrics_mutex.unlock();
+        self.metrics.recordProxyBufferBytes(direction, scope, bytes);
+    }
+
+    pub fn metricsReleaseProxyBufferBytes(self: *GatewayState, direction: http.proxy_buffer_account.Direction, scope: http.proxy_buffer_account.Scope, bytes: usize) void {
+        self.metrics_mutex.lock();
+        defer self.metrics_mutex.unlock();
+        self.metrics.releaseProxyBufferBytes(direction, scope, bytes);
+    }
+
+    pub fn metricsRecordProxyBufferHighWatermark(self: *GatewayState, direction: http.proxy_buffer_account.Direction, scope: http.proxy_buffer_account.Scope) void {
+        self.metrics_mutex.lock();
+        defer self.metrics_mutex.unlock();
+        self.metrics.recordProxyBufferHighWatermark(direction, scope);
+    }
+
     pub fn metricsSetWorkerPoolStats(self: *GatewayState, active_jobs: usize, queued_jobs: usize, worker_threads: usize, queue_capacity: usize) void {
         self.metrics_mutex.lock();
         defer self.metrics_mutex.unlock();
@@ -1654,6 +1673,7 @@ pub const GatewayState = struct {
         var combined = std.array_list.Managed(u8).init(allocator);
         errdefer combined.deinit();
         try combined.appendSlice(base);
+        try self.appendProxyBufferConfigPrometheus(&combined);
         if (mux_snapshot.device_counts.len > 0) {
             try combined.appendSlice(
                 \\# HELP tardigrade_mux_device_channels Current active mux channels by device
@@ -1668,6 +1688,22 @@ pub const GatewayState = struct {
         }
         try self.appendUpstreamPoolPrometheus(&combined);
         return combined.toOwnedSlice();
+    }
+
+    fn appendProxyBufferConfigPrometheus(self: *GatewayState, out: *std.array_list.Managed(u8)) !void {
+        const limits = self.proxy_buffer_limits;
+        try out.appendSlice(
+            \\# HELP tardigrade_buffer_config_limit_bytes Configured proxy buffer accounting limits in bytes
+            \\# TYPE tardigrade_buffer_config_limit_bytes gauge
+            \\
+        );
+        inline for (.{ "downstream_to_upstream", "upstream_to_downstream" }) |direction| {
+            try out.print("tardigrade_buffer_config_limit_bytes{{direction=\"{s}\",scope=\"stream\",limit=\"low\"}} {d}\n", .{ direction, limits.per_stream_low_watermark });
+            try out.print("tardigrade_buffer_config_limit_bytes{{direction=\"{s}\",scope=\"stream\",limit=\"high\"}} {d}\n", .{ direction, limits.per_stream_high_watermark });
+            try out.print("tardigrade_buffer_config_limit_bytes{{direction=\"{s}\",scope=\"stream\",limit=\"hard\"}} {d}\n", .{ direction, limits.per_stream_hard_limit });
+            try out.print("tardigrade_buffer_config_limit_bytes{{direction=\"{s}\",scope=\"origin\",limit=\"hard\"}} {d}\n", .{ direction, limits.per_origin_hard_limit });
+            try out.print("tardigrade_buffer_config_limit_bytes{{direction=\"{s}\",scope=\"global\",limit=\"hard\"}} {d}\n", .{ direction, limits.global_hard_limit });
+        }
     }
 
     /// HOT PATH (proxy mode): taken once per proxied request for LB selection.
@@ -3067,6 +3103,13 @@ fn initSlotTestState(gs: *GatewayState, allocator: std.mem.Allocator) void {
     gs.in_flight_requests = std.atomic.Value(u32).init(0);
     gs.connection_memory_estimate_bytes = 0;
     gs.max_total_connection_memory_bytes = 0;
+    gs.proxy_buffer_limits = .{
+        .per_stream_low_watermark = 256 * 1024,
+        .per_stream_high_watermark = 768 * 1024,
+        .per_stream_hard_limit = 1024 * 1024,
+        .per_origin_hard_limit = 0,
+        .global_hard_limit = 0,
+    };
     gs.active_connections_by_ip = std.StringHashMap(u32).init(allocator);
     gs.active_fds = std.AutoHashMap(std.posix.fd_t, void).init(allocator);
     gs.fd_to_ip = std.AutoHashMap(std.posix.fd_t, []u8).init(allocator);
@@ -3324,6 +3367,13 @@ fn initMetricsJsonTestState(gs: *GatewayState, allocator: std.mem.Allocator) voi
     // counters, so the pool must be a valid (empty) instance here.
     gs.upstream_pool = http.upstream_pool.UpstreamPool.init(allocator, .{});
     gs.h2_pool = http.upstream_h2.H2ConnPool.init(allocator, .{});
+    gs.proxy_buffer_limits = .{
+        .per_stream_low_watermark = 256 * 1024,
+        .per_stream_high_watermark = 768 * 1024,
+        .per_stream_hard_limit = 1024 * 1024,
+        .per_origin_hard_limit = 0,
+        .global_hard_limit = 0,
+    };
 }
 
 test "served metrics JSON exposes every counter the canonical serializer does" {
@@ -3377,4 +3427,5 @@ test "served Prometheus metrics expose h2 streaming upload fallback counter" {
     try std.testing.expect(std.mem.find(u8, prom, "# HELP tardigrade_upstream_h2_streaming_upload_fallback_total Streaming upload requests that requested h2/h2c upstreams but fell back to h1 because the h2 pool was unavailable") != null);
     try std.testing.expect(std.mem.find(u8, prom, "# TYPE tardigrade_upstream_h2_streaming_upload_fallback_total counter") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_upstream_h2_streaming_upload_fallback_total 1\n") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_buffer_config_limit_bytes{direction=\"upstream_to_downstream\",scope=\"stream\",limit=\"high\"} 786432\n") != null);
 }

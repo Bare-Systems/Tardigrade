@@ -403,6 +403,8 @@ pub const EdgeConfig = struct {
     max_connection_memory_bytes: usize,
     /// Maximum buffered bytes accepted from an upstream HTTP response body.
     max_buffered_upstream_response_bytes: usize,
+    /// Shared proxy body-buffer watermarks and future aggregate hard limits.
+    proxy_buffer_limits: http.proxy_buffer_account.Limits,
     /// Proxy streaming policy for data-plane HTTP proxy routes.
     proxy_streaming_mode: ProxyStreamingMode,
     /// Maximum relay buffer used per direction for streaming proxy transfers.
@@ -1165,6 +1167,13 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     const max_buffered_upstream_resp_str = envOrDefault(allocator, "TARDIGRADE_MAX_BUFFERED_UPSTREAM_RESPONSE_BYTES", "262144") catch unreachable;
     defer allocator.free(max_buffered_upstream_resp_str);
     const max_buffered_upstream_response_bytes = std.fmt.parseInt(usize, max_buffered_upstream_resp_str, 10) catch 256 * 1024;
+    const proxy_buffer_limits = http.proxy_buffer_account.Limits{
+        .per_stream_low_watermark = parseIntEnv(usize, allocator, "TARDIGRADE_PROXY_BUFFER_PER_STREAM_LOW_WATERMARK_BYTES", 256 * 1024),
+        .per_stream_high_watermark = parseIntEnv(usize, allocator, "TARDIGRADE_PROXY_BUFFER_PER_STREAM_HIGH_WATERMARK_BYTES", 768 * 1024),
+        .per_stream_hard_limit = parseIntEnv(usize, allocator, "TARDIGRADE_PROXY_BUFFER_PER_STREAM_HARD_LIMIT_BYTES", 1024 * 1024),
+        .per_origin_hard_limit = parseIntEnv(usize, allocator, "TARDIGRADE_PROXY_BUFFER_PER_ORIGIN_HARD_LIMIT_BYTES", 0),
+        .global_hard_limit = parseIntEnv(usize, allocator, "TARDIGRADE_PROXY_BUFFER_GLOBAL_HARD_LIMIT_BYTES", 0),
+    };
 
     const proxy_streaming_mode_str = envOrDefault(allocator, "TARDIGRADE_PROXY_STREAMING_MODE", "off") catch unreachable;
     defer allocator.free(proxy_streaming_mode_str);
@@ -1538,6 +1547,7 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .connection_pool_size = connection_pool_size,
         .max_connection_memory_bytes = max_connection_memory_bytes,
         .max_buffered_upstream_response_bytes = max_buffered_upstream_response_bytes,
+        .proxy_buffer_limits = proxy_buffer_limits,
         .proxy_streaming_mode = proxy_streaming_mode,
         .proxy_stream_buffer_size = proxy_stream_buffer_size,
         .max_total_connection_memory_bytes = max_total_connection_memory_bytes,
@@ -2641,6 +2651,10 @@ pub fn validate(cfg: *const EdgeConfig) !void {
         std.log.err("config validation failed: TARDIGRADE_MAX_BUFFERED_UPSTREAM_RESPONSE_BYTES must be at least 1", .{});
         return error.InvalidConfigValue;
     };
+    cfg.proxy_buffer_limits.validate() catch {
+        std.log.err("config validation failed: proxy buffer watermarks must satisfy low < high <= hard and aggregate hard limits must be 0 or at least the per-stream hard limit", .{});
+        return error.InvalidConfigValue;
+    };
     validateProxyStreamBufferSize(cfg.proxy_stream_buffer_size) catch {
         std.log.err("config validation failed: TARDIGRADE_PROXY_STREAM_BUFFER_SIZE must be between 1 and 1048576 bytes", .{});
         return error.InvalidConfigValue;
@@ -3329,4 +3343,30 @@ test "validate proxy stream buffer size rejects zero and oversized buffers" {
     try validateProxyStreamBufferSize(1024 * 1024);
     try std.testing.expectError(error.InvalidConfigValue, validateProxyStreamBufferSize(0));
     try std.testing.expectError(error.InvalidConfigValue, validateProxyStreamBufferSize(1024 * 1024 + 1));
+}
+
+test "proxy buffer limits validate low high hard ordering" {
+    try (http.proxy_buffer_account.Limits{
+        .per_stream_low_watermark = 256 * 1024,
+        .per_stream_high_watermark = 768 * 1024,
+        .per_stream_hard_limit = 1024 * 1024,
+        .per_origin_hard_limit = 0,
+        .global_hard_limit = 0,
+    }).validate();
+
+    try std.testing.expectError(error.InvalidBufferLimits, (http.proxy_buffer_account.Limits{
+        .per_stream_low_watermark = 768 * 1024,
+        .per_stream_high_watermark = 256 * 1024,
+        .per_stream_hard_limit = 1024 * 1024,
+        .per_origin_hard_limit = 0,
+        .global_hard_limit = 0,
+    }).validate());
+
+    try std.testing.expectError(error.InvalidBufferLimits, (http.proxy_buffer_account.Limits{
+        .per_stream_low_watermark = 256 * 1024,
+        .per_stream_high_watermark = 768 * 1024,
+        .per_stream_hard_limit = 1024 * 1024,
+        .per_origin_hard_limit = 512 * 1024,
+        .global_hard_limit = 0,
+    }).validate());
 }

@@ -522,6 +522,26 @@ pub fn handleLocationProxyPass(
     const fallback_reason: StreamingFallbackReason = switch (streamingEligibilityForDataPlaneProxyRequest(cfg, matched_block, &resolved, upstream_url.value, max_attempts)) {
         .stream => {
             state.recordUpstreamAttemptStart(selection.base_url);
+            const relay_buffer_bytes = @max(cfg.proxy_stream_buffer_size, 16 * 1024);
+            state.metricsRecordProxyBufferBytes(.upstream_to_downstream, .stream, relay_buffer_bytes);
+            state.metricsRecordProxyBufferBytes(.upstream_to_downstream, .global, relay_buffer_bytes);
+            const account_upload_relay = streaming_request_body != null;
+            if (account_upload_relay) {
+                state.metricsRecordProxyBufferBytes(.downstream_to_upstream, .stream, relay_buffer_bytes);
+                state.metricsRecordProxyBufferBytes(.downstream_to_upstream, .global, relay_buffer_bytes);
+            }
+            if (relay_buffer_bytes >= cfg.proxy_buffer_limits.per_stream_high_watermark) {
+                state.metricsRecordProxyBufferHighWatermark(.upstream_to_downstream, .stream);
+                if (account_upload_relay) state.metricsRecordProxyBufferHighWatermark(.downstream_to_upstream, .stream);
+            }
+            defer {
+                state.metricsReleaseProxyBufferBytes(.upstream_to_downstream, .stream, relay_buffer_bytes);
+                state.metricsReleaseProxyBufferBytes(.upstream_to_downstream, .global, relay_buffer_bytes);
+                if (account_upload_relay) {
+                    state.metricsReleaseProxyBufferBytes(.downstream_to_upstream, .stream, relay_buffer_bytes);
+                    state.metricsReleaseProxyBufferBytes(.downstream_to_upstream, .global, relay_buffer_bytes);
+                }
+            }
             const streamed = executeStreamingHttpProxyRequest(
                 allocator,
                 cfg,

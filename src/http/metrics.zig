@@ -1,5 +1,6 @@
 const std = @import("std");
 const compat = @import("../zig_compat.zig");
+const proxy_buffer_account = @import("proxy_buffer_account.zig");
 
 /// Server-wide metrics counters.
 ///
@@ -30,6 +31,18 @@ pub const Metrics = struct {
     proxy_buffered_requests: u64,
     proxy_buffered_bytes_current: u64,
     proxy_buffered_bytes_total: u64,
+    proxy_buffer_downstream_to_upstream_stream_current: u64,
+    proxy_buffer_downstream_to_upstream_global_current: u64,
+    proxy_buffer_upstream_to_downstream_stream_current: u64,
+    proxy_buffer_upstream_to_downstream_global_current: u64,
+    proxy_buffer_high_watermark_downstream_to_upstream_stream: u64,
+    proxy_buffer_high_watermark_upstream_to_downstream_stream: u64,
+    proxy_buffer_limit_exceeded_downstream_to_upstream_stream: u64,
+    proxy_buffer_limit_exceeded_upstream_to_downstream_stream: u64,
+    proxy_buffer_read_pauses_downstream: u64,
+    proxy_buffer_read_pauses_upstream: u64,
+    proxy_buffer_read_resumes_downstream: u64,
+    proxy_buffer_read_resumes_upstream: u64,
     proxy_client_aborts: u64,
     proxy_upstream_aborts: u64,
     proxy_streaming_fallback_policy_disabled: u64,
@@ -137,6 +150,18 @@ pub const Metrics = struct {
             .proxy_buffered_requests = 0,
             .proxy_buffered_bytes_current = 0,
             .proxy_buffered_bytes_total = 0,
+            .proxy_buffer_downstream_to_upstream_stream_current = 0,
+            .proxy_buffer_downstream_to_upstream_global_current = 0,
+            .proxy_buffer_upstream_to_downstream_stream_current = 0,
+            .proxy_buffer_upstream_to_downstream_global_current = 0,
+            .proxy_buffer_high_watermark_downstream_to_upstream_stream = 0,
+            .proxy_buffer_high_watermark_upstream_to_downstream_stream = 0,
+            .proxy_buffer_limit_exceeded_downstream_to_upstream_stream = 0,
+            .proxy_buffer_limit_exceeded_upstream_to_downstream_stream = 0,
+            .proxy_buffer_read_pauses_downstream = 0,
+            .proxy_buffer_read_pauses_upstream = 0,
+            .proxy_buffer_read_resumes_downstream = 0,
+            .proxy_buffer_read_resumes_upstream = 0,
             .proxy_client_aborts = 0,
             .proxy_upstream_aborts = 0,
             .proxy_streaming_fallback_policy_disabled = 0,
@@ -290,12 +315,81 @@ pub const Metrics = struct {
         self.proxy_buffered_requests += 1;
         self.proxy_buffered_bytes_current += bytes;
         self.proxy_buffered_bytes_total += bytes;
+        self.recordProxyBufferBytes(.upstream_to_downstream, .stream, buffered_bytes);
+        self.recordProxyBufferBytes(.upstream_to_downstream, .global, buffered_bytes);
         self.recordProxyTtfbMs(ttfb_ms);
     }
 
     pub fn releaseProxyBufferedBytes(self: *Metrics, buffered_bytes: usize) void {
         const bytes: u64 = @intCast(buffered_bytes);
         self.proxy_buffered_bytes_current = if (bytes >= self.proxy_buffered_bytes_current) 0 else self.proxy_buffered_bytes_current - bytes;
+        self.releaseProxyBufferBytes(.upstream_to_downstream, .stream, buffered_bytes);
+        self.releaseProxyBufferBytes(.upstream_to_downstream, .global, buffered_bytes);
+    }
+
+    pub fn recordProxyBufferBytes(self: *Metrics, direction: proxy_buffer_account.Direction, scope: proxy_buffer_account.Scope, bytes: usize) void {
+        const value: u64 = @intCast(bytes);
+        switch (direction) {
+            .downstream_to_upstream => switch (scope) {
+                .stream => self.proxy_buffer_downstream_to_upstream_stream_current += value,
+                .global => self.proxy_buffer_downstream_to_upstream_global_current += value,
+                else => {},
+            },
+            .upstream_to_downstream => switch (scope) {
+                .stream => self.proxy_buffer_upstream_to_downstream_stream_current += value,
+                .global => self.proxy_buffer_upstream_to_downstream_global_current += value,
+                else => {},
+            },
+        }
+    }
+
+    pub fn releaseProxyBufferBytes(self: *Metrics, direction: proxy_buffer_account.Direction, scope: proxy_buffer_account.Scope, bytes: usize) void {
+        const value: u64 = @intCast(bytes);
+        const slot = switch (direction) {
+            .downstream_to_upstream => switch (scope) {
+                .stream => &self.proxy_buffer_downstream_to_upstream_stream_current,
+                .global => &self.proxy_buffer_downstream_to_upstream_global_current,
+                else => return,
+            },
+            .upstream_to_downstream => switch (scope) {
+                .stream => &self.proxy_buffer_upstream_to_downstream_stream_current,
+                .global => &self.proxy_buffer_upstream_to_downstream_global_current,
+                else => return,
+            },
+        };
+        slot.* = if (value >= slot.*) 0 else slot.* - value;
+    }
+
+    pub fn recordProxyBufferHighWatermark(self: *Metrics, direction: proxy_buffer_account.Direction, scope: proxy_buffer_account.Scope) void {
+        if (scope != .stream) return;
+        switch (direction) {
+            .downstream_to_upstream => self.proxy_buffer_high_watermark_downstream_to_upstream_stream += 1,
+            .upstream_to_downstream => self.proxy_buffer_high_watermark_upstream_to_downstream_stream += 1,
+        }
+    }
+
+    pub fn recordProxyBufferLimitExceeded(self: *Metrics, direction: proxy_buffer_account.Direction, scope: proxy_buffer_account.Scope) void {
+        if (scope != .stream) return;
+        switch (direction) {
+            .downstream_to_upstream => self.proxy_buffer_limit_exceeded_downstream_to_upstream_stream += 1,
+            .upstream_to_downstream => self.proxy_buffer_limit_exceeded_upstream_to_downstream_stream += 1,
+        }
+    }
+
+    pub fn recordProxyBufferReadPause(self: *Metrics, side: []const u8) void {
+        if (std.mem.eql(u8, side, "downstream")) {
+            self.proxy_buffer_read_pauses_downstream += 1;
+        } else if (std.mem.eql(u8, side, "upstream")) {
+            self.proxy_buffer_read_pauses_upstream += 1;
+        }
+    }
+
+    pub fn recordProxyBufferReadResume(self: *Metrics, side: []const u8) void {
+        if (std.mem.eql(u8, side, "downstream")) {
+            self.proxy_buffer_read_resumes_downstream += 1;
+        } else if (std.mem.eql(u8, side, "upstream")) {
+            self.proxy_buffer_read_resumes_upstream += 1;
+        }
     }
 
     pub fn recordProxyClientAbort(self: *Metrics) void {
@@ -525,6 +619,54 @@ pub const Metrics = struct {
             \\# HELP tardigrade_proxy_buffered_bytes_total Total response bytes retained by buffered proxy requests
             \\# TYPE tardigrade_proxy_buffered_bytes_total counter
             \\tardigrade_proxy_buffered_bytes_total {d}
+            \\
+        , .{
+            self.proxy_streaming_requests,
+            self.proxy_buffered_requests,
+            self.proxy_buffered_bytes_current,
+            self.proxy_buffered_bytes_total,
+        });
+
+        try out.print(
+            \\# HELP tardigrade_buffered_bytes_current Current proxy-owned body bytes by direction and accounting scope
+            \\# TYPE tardigrade_buffered_bytes_current gauge
+            \\tardigrade_buffered_bytes_current{{direction="downstream_to_upstream",scope="stream"}} {d}
+            \\tardigrade_buffered_bytes_current{{direction="downstream_to_upstream",scope="global"}} {d}
+            \\tardigrade_buffered_bytes_current{{direction="upstream_to_downstream",scope="stream"}} {d}
+            \\tardigrade_buffered_bytes_current{{direction="upstream_to_downstream",scope="global"}} {d}
+            \\# HELP tardigrade_buffer_high_watermark_events_total Proxy buffer high-watermark transitions by direction and scope
+            \\# TYPE tardigrade_buffer_high_watermark_events_total counter
+            \\tardigrade_buffer_high_watermark_events_total{{direction="downstream_to_upstream",scope="stream"}} {d}
+            \\tardigrade_buffer_high_watermark_events_total{{direction="upstream_to_downstream",scope="stream"}} {d}
+            \\# HELP tardigrade_buffer_read_pauses_total Proxy reads paused by stalled buffer pressure side
+            \\# TYPE tardigrade_buffer_read_pauses_total counter
+            \\tardigrade_buffer_read_pauses_total{{side="downstream"}} {d}
+            \\tardigrade_buffer_read_pauses_total{{side="upstream"}} {d}
+            \\# HELP tardigrade_buffer_read_resumes_total Proxy reads resumed after buffer pressure drops
+            \\# TYPE tardigrade_buffer_read_resumes_total counter
+            \\tardigrade_buffer_read_resumes_total{{side="downstream"}} {d}
+            \\tardigrade_buffer_read_resumes_total{{side="upstream"}} {d}
+            \\# HELP tardigrade_buffer_limit_exceeded_total Proxy buffer hard-limit exceedance events by direction and scope
+            \\# TYPE tardigrade_buffer_limit_exceeded_total counter
+            \\tardigrade_buffer_limit_exceeded_total{{direction="downstream_to_upstream",scope="stream"}} {d}
+            \\tardigrade_buffer_limit_exceeded_total{{direction="upstream_to_downstream",scope="stream"}} {d}
+            \\
+        , .{
+            self.proxy_buffer_downstream_to_upstream_stream_current,
+            self.proxy_buffer_downstream_to_upstream_global_current,
+            self.proxy_buffer_upstream_to_downstream_stream_current,
+            self.proxy_buffer_upstream_to_downstream_global_current,
+            self.proxy_buffer_high_watermark_downstream_to_upstream_stream,
+            self.proxy_buffer_high_watermark_upstream_to_downstream_stream,
+            self.proxy_buffer_read_pauses_downstream,
+            self.proxy_buffer_read_pauses_upstream,
+            self.proxy_buffer_read_resumes_downstream,
+            self.proxy_buffer_read_resumes_upstream,
+            self.proxy_buffer_limit_exceeded_downstream_to_upstream_stream,
+            self.proxy_buffer_limit_exceeded_upstream_to_downstream_stream,
+        });
+
+        try out.print(
             \\# HELP tardigrade_proxy_client_aborts_total Total proxied transfers aborted by downstream clients
             \\# TYPE tardigrade_proxy_client_aborts_total counter
             \\tardigrade_proxy_client_aborts_total {d}
@@ -566,10 +708,6 @@ pub const Metrics = struct {
             \\tardigrade_upstream_stale_retries_total {d}
             \\
         , .{
-            self.proxy_streaming_requests,
-            self.proxy_buffered_requests,
-            self.proxy_buffered_bytes_current,
-            self.proxy_buffered_bytes_total,
             self.proxy_client_aborts,
             self.proxy_upstream_aborts,
             self.proxy_streaming_fallback_policy_disabled,
@@ -976,6 +1114,10 @@ test "Metrics toPrometheus produces valid Prometheus text" {
     m.recordRequest(500);
     m.recordProxyStreamingRequest(3);
     m.recordProxyBufferedRequest(42, 4);
+    m.recordProxyBufferHighWatermark(.upstream_to_downstream, .stream);
+    m.recordProxyBufferReadPause("upstream");
+    m.recordProxyBufferReadResume("upstream");
+    m.recordProxyBufferLimitExceeded(.upstream_to_downstream, .stream);
 
     const prom = try m.toPrometheus(allocator);
     defer allocator.free(prom);
@@ -992,6 +1134,11 @@ test "Metrics toPrometheus produces valid Prometheus text" {
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_proxy_streaming_requests_total 1") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_proxy_buffered_requests_total 1") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_proxy_buffered_bytes_current 42") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_buffered_bytes_current{direction=\"upstream_to_downstream\",scope=\"stream\"} 42") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_buffer_high_watermark_events_total{direction=\"upstream_to_downstream\",scope=\"stream\"} 1") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_buffer_read_pauses_total{side=\"upstream\"} 1") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_buffer_read_resumes_total{side=\"upstream\"} 1") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_buffer_limit_exceeded_total{direction=\"upstream_to_downstream\",scope=\"stream\"} 1") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_proxy_ttfb_ms_count 2") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_worker_active_jobs") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_worker_queued_jobs") != null);

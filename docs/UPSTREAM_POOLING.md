@@ -194,6 +194,12 @@ upload-specific fallbacks: `chunked_request_upload`, `missing_content_length`,
 The metric counts fallback events, not unique requests, because upload and
 response eligibility are evaluated at different phases.
 
+Proxy buffer accounting is exposed separately from upstream pool reuse metrics.
+`tardigrade_buffered_bytes_current{direction,scope}` reports application-owned
+body bytes retained by the proxy, while
+`tardigrade_buffer_config_limit_bytes{direction,scope,limit}` exposes the
+configured low/high/hard limits operators need to interpret those gauges.
+
 The actor gains a streaming request mode next to the fully-buffered
 `request()`:
 

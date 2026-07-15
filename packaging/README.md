@@ -31,7 +31,7 @@ sudo systemctl enable --now tardigrade
 ```
 
 The DEB package:
-- Installs the binary to `/usr/bin/tardigrade`
+- Installs the binary to `/usr/bin/tardi`
 - Installs a starter config at `/etc/tardigrade/tardigrade.conf`
 - Creates a `tardigrade` system user
 - Installs a systemd service unit at `/lib/systemd/system/tardigrade.service`

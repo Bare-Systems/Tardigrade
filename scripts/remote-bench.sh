@@ -54,7 +54,7 @@ if ! command -v wrk >/dev/null 2>&1; then
 fi
 command -v wrk >/dev/null 2>&1 || { echo "wrk not found and could not be installed; please install wrk on the remote"; exit 1; }
 "$ZIG" build -Doptimize=ReleaseFast 2>&1 | tail -2
-test -x "$REMOTE_DIR/zig-out/bin/tardigrade" || { echo "BUILD FAILED"; exit 1; }
+test -x "$REMOTE_DIR/zig-out/bin/tardi" || { echo "BUILD FAILED"; exit 1; }
 echo "  built OK"
 REMOTE
 
@@ -65,13 +65,13 @@ echo "[4/4] running benchmark on $TARGET"
 ssh "$TARGET" bash -s "$REMOTE_DIR" "$FRONT_PORT" "$UP_PORT" "$DURATION" <<'REMOTE'
 set -e
 REMOTE_DIR="$1"; FRONT_PORT="$2"; UP_PORT="$3"; DURATION="$4"
-BIN="$REMOTE_DIR/zig-out/bin/tardigrade"
+BIN="$REMOTE_DIR/zig-out/bin/tardi"
 D="$REMOTE_DIR/run"; mkdir -p "$D"
 printf 'pid %s/up.pid;\nlisten %s;\nlocation = /health {\n    return 200 ok;\n}\n' "$D" "$UP_PORT" > "$D/up.conf"
 printf 'pid %s/fr.pid;\nlisten %s;\nlocation = /health {\n    return 200 ok;\n}\nlocation = /proxy/health {\n    proxy_pass http://127.0.0.1:%s/health;\n}\n' "$D" "$FRONT_PORT" "$UP_PORT" > "$D/fr.conf"
 
 start() { # $1=worker_threads (0 = default to CPU count)
-  pkill -f "tardigrade run -c $D" 2>/dev/null || true; sleep 1
+  pkill -f "tardi run -c $D" 2>/dev/null || true; sleep 1
   TARDIGRADE_RATE_LIMIT_RPS=0 TARDIGRADE_WORKER_THREADS="$1" setsid "$BIN" run -c "$D/up.conf" >/dev/null 2>&1 </dev/null &
   TARDIGRADE_RATE_LIMIT_RPS=0 TARDIGRADE_WORKER_THREADS="$1" setsid "$BIN" run -c "$D/fr.conf" >/dev/null 2>&1 </dev/null &
   for i in $(seq 1 40); do curl -fsS "http://127.0.0.1:$FRONT_PORT/health" >/dev/null 2>&1 && break; sleep 0.2; done
@@ -91,7 +91,7 @@ bench /health 50 4 "static c50"
 bench /health 100 4 "static c100"
 bench /proxy/health 10 2 "proxy  c10"
 echo "  parked metrics: $(curl -s "http://127.0.0.1:$FRONT_PORT/status/metrics" | grep -E '^tardigrade_keepalive_(parked|resumes)' | tr '\n' ' ')"
-pkill -f "tardigrade run -c $D" 2>/dev/null || true
+pkill -f "tardi run -c $D" 2>/dev/null || true
 echo ""
 echo "Done (test instances on ports $FRONT_PORT/$UP_PORT torn down)."
 REMOTE

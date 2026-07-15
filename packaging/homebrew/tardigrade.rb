@@ -41,11 +41,12 @@ class Tardigrade < Formula
   end
 
   def install
-    bin.install "tardigrade"
+    bin.install "tardi"
+    bin.install_symlink "tardi" => "tardigrade"
   end
 
   service do
-    run [opt_bin/"tardigrade"]
+    run [opt_bin/"tardi"]
     keep_alive true
     log_path var/"log/tardigrade.log"
     error_log_path var/"log/tardigrade.log"
@@ -54,7 +55,7 @@ class Tardigrade < Formula
 
   test do
     pid = fork do
-      exec bin/"tardigrade", "--version"
+      exec bin/"tardi", "--version"
     end
     Process.wait pid
     assert_equal 0, $CHILD_STATUS.exitstatus

@@ -224,26 +224,26 @@ download_file "$checksum_url" "$checksums_path"
 verify_checksum "$archive_path" "$checksums_path" "$asset_name"
 
 tar -xzf "$archive_path" -C "$tmpdir"
-[ -f "$tmpdir/tardigrade" ] || {
-  echo "release archive did not contain a tardigrade binary" >&2
+[ -f "$tmpdir/tardi" ] || {
+  echo "release archive did not contain a tardi binary" >&2
   exit 1
 }
 
 mkdir -p "$INSTALL_DIR"
-stage_binary="$INSTALL_DIR/.tardigrade.$$"
-stage_alias="$INSTALL_DIR/.tardi.$$"
-install_binary "$tmpdir/tardigrade" "$stage_binary"
-install_alias "$stage_binary" "tardigrade" "$stage_alias"
-mv -f "$stage_binary" "$INSTALL_DIR/tardigrade"
+stage_binary="$INSTALL_DIR/.tardi.$$"
+stage_alias="$INSTALL_DIR/.tardigrade.$$"
+install_binary "$tmpdir/tardi" "$stage_binary"
+install_alias "$stage_binary" "tardi" "$stage_alias"
+mv -f "$stage_binary" "$INSTALL_DIR/tardi"
 stage_binary=""
-mv -f "$stage_alias" "$INSTALL_DIR/tardi"
+mv -f "$stage_alias" "$INSTALL_DIR/tardigrade"
 stage_alias=""
 
-printf 'Installed tardigrade to %s/tardigrade\n' "$INSTALL_DIR"
-printf 'Installed alias to %s/tardi\n' "$INSTALL_DIR"
+printf 'Installed tardi to %s/tardi\n' "$INSTALL_DIR"
+printf 'Installed compatibility alias to %s/tardigrade\n' "$INSTALL_DIR"
 case ":$PATH:" in
   *":$INSTALL_DIR:"*) ;;
   *)
-    printf 'Add %s to PATH to invoke tardigrade directly.\n' "$INSTALL_DIR"
+    printf 'Add %s to PATH to invoke tardi directly.\n' "$INSTALL_DIR"
     ;;
 esac

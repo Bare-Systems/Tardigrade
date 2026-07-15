@@ -64,13 +64,13 @@ the binary. There is no runtime switch and no fallback between profiles.
 
 ## How the binary reports its profile
 
-`tardigrade version` prints the profile and backend, so operators and release
+`tardi version` prints the profile and backend, so operators and release
 audits can verify an artifact without inspecting its link graph:
 
 ```
-$ tardigrade version
+$ tardi version
 0.5.0 (tls-profile=appliance, tls-backend=native)
-$ tardigrade version
+$ tardi version
 0.5.0 (tls-profile=general, tls-backend=openssl-adapter)
 ```
 

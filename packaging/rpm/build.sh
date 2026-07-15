@@ -7,14 +7,14 @@
 # ARCH accepts Debian-style names (amd64, arm64) or RPM-style (x86_64, aarch64).
 # Prerequisites:
 #   rpm-build (dnf install rpm-build / apt-get install rpm-build)
-#   A pre-built tardigrade binary
+#   A pre-built tardi binary
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 VERSION=""
 ARCH=""
-BINARY="${REPO_ROOT}/zig-out/bin/tardigrade"
+BINARY="${REPO_ROOT}/zig-out/bin/tardi"
 OUTPUT_DIR="${REPO_ROOT}/dist"
 
 while [[ $# -gt 0 ]]; do
@@ -46,7 +46,7 @@ trap 'rm -rf "$WORK_DIR"' EXIT
 
 mkdir -p "${WORK_DIR}"/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
 
-cp "$BINARY"                                                  "${WORK_DIR}/SOURCES/tardigrade"
+cp "$BINARY"                                                  "${WORK_DIR}/SOURCES/tardi"
 cp "${REPO_ROOT}/LICENSE"                                     "${WORK_DIR}/SOURCES/LICENSE"
 cp "${REPO_ROOT}/packaging/systemd/tardigrade.service"        "${WORK_DIR}/SOURCES/tardigrade.service"
 cp "${REPO_ROOT}/packaging/rpm/tardigrade.spec"               "${WORK_DIR}/SPECS/tardigrade.spec"

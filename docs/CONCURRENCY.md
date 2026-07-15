@@ -467,7 +467,7 @@ Before acting on any item above, establish a baseline with:
 ./benchmarks/run.sh --scenarios static-http1,proxy-http1,keepalive --save benchmarks/baselines/pre-lock-opt.json
 ```
 
-Profile with `perf record -g ./zig-out/bin/tardigrade ...` and inspect
+Profile with `perf record -g ./zig-out/bin/tardi ...` and inspect
 `perf report` for lock-related symbols (`__lll_lock_wait`, `futex_wait`, mutex
 spin). Each improvement should show a measurable reduction in the benchmark
 before being merged.

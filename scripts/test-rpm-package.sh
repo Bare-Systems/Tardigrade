@@ -63,7 +63,7 @@ docker run --rm \
         /repo/packaging/rpm/build.sh \
             --version 0.0.0 \
             --arch x86_64 \
-            --binary /tmp/tardigrade/zig-out/bin/tardigrade \
+            --binary /tmp/tardigrade/zig-out/bin/tardi \
             --output /output
 
         rpm_path=$(find /output -name "tardigrade-*.rpm" | head -1)
@@ -72,18 +72,18 @@ docker run --rm \
 
         dnf install -y "$rpm_path"
 
-        test -x /usr/bin/tardigrade
-        /usr/bin/tardigrade version >/dev/null
+        test -x /usr/bin/tardi
+        /usr/bin/tardi version >/dev/null
         test -f /etc/tardigrade/tardigrade.env
         test -f /usr/lib/systemd/system/tardigrade.service
         test -f /usr/share/licenses/tardigrade/LICENSE
         test -d /var/log/tardigrade
         test "$(stat -c "%a %U %G" /etc/tardigrade/tardigrade.env)" = "640 root tardigrade"
         grep -F "EnvironmentFile=-/etc/tardigrade/tardigrade.env" /usr/lib/systemd/system/tardigrade.service
-        grep -F "ExecStart=/usr/bin/tardigrade run -c /etc/tardigrade/tardigrade.conf" /usr/lib/systemd/system/tardigrade.service
+        grep -F "ExecStart=/usr/bin/tardi run -c /etc/tardigrade/tardigrade.conf" /usr/lib/systemd/system/tardigrade.service
 
         dnf remove -y tardigrade
-        test ! -e /usr/bin/tardigrade
+        test ! -e /usr/bin/tardi
     '
 
 printf 'rpm smoke test passed\n'

@@ -40,7 +40,10 @@ logs are written through `src/http/logger.zig`.
   `tardigrade_buffer_read_resumes_total{side}`, and
   `tardigrade_buffer_limit_exceeded_total{direction,scope}`. Labels are fixed
   to protocol-independent directions, scopes, and sides; they never include
-  URLs, request IDs, or stream IDs.
+  URLs, request IDs, or stream IDs. In the first implementation slice, current
+  byte gauges cover bounded buffered responses and HTTP/1 streaming relay
+  buffers. HTTP/2 per-stream queue accounting remains a follow-up enforcement
+  slice.
 - configured proxy buffer limits:
   `tardigrade_buffer_config_limit_bytes{direction,scope,limit}` for the
   per-stream low/high/hard watermarks plus per-origin/global hard-limit

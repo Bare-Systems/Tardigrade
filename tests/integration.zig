@@ -3606,6 +3606,9 @@ test "proxy full streaming mode relays fixed-length upload beyond request buffer
         .extra_env = &.{
             .{ .name = "TARDIGRADE_PROXY_STREAMING_MODE", .value = "full" },
             .{ .name = "TARDIGRADE_PROXY_STREAM_BUFFER_SIZE", .value = "4096" },
+            .{ .name = "TARDIGRADE_PROXY_BUFFER_PER_STREAM_LOW_WATERMARK_BYTES", .value = "1024" },
+            .{ .name = "TARDIGRADE_PROXY_BUFFER_PER_STREAM_HIGH_WATERMARK_BYTES", .value = "2048" },
+            .{ .name = "TARDIGRADE_PROXY_BUFFER_PER_STREAM_HARD_LIMIT_BYTES", .value = "4096" },
             .{ .name = "TARDIGRADE_MAX_BODY_SIZE", .value = "1048576" },
         },
     });
@@ -3625,6 +3628,18 @@ test "proxy full streaming mode relays fixed-length upload beyond request buffer
     defer allocator.free(captured);
     try std.testing.expectEqual(@as(usize, payload_len), captured.len);
     try std.testing.expectEqualStrings(payload, captured);
+
+    var metrics = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/status/metrics",
+        .body = "",
+        .headers = &.{},
+    });
+    defer metrics.deinit();
+    try std.testing.expect(std.mem.find(u8, metrics.body, "tardigrade_buffer_high_watermark_events_total{direction=\"upstream_to_downstream\",scope=\"stream\"} 1") != null);
+    try std.testing.expect(std.mem.find(u8, metrics.body, "tardigrade_buffer_high_watermark_events_total{direction=\"downstream_to_upstream\",scope=\"stream\"} 0") != null);
+    try std.testing.expect(std.mem.find(u8, metrics.body, "tardigrade_buffered_bytes_current{direction=\"upstream_to_downstream\",scope=\"global\"} 0") != null);
+    try std.testing.expect(std.mem.find(u8, metrics.body, "tardigrade_buffered_bytes_current{direction=\"downstream_to_upstream\",scope=\"global\"} 0") != null);
 }
 
 test "proxy full streaming upload works for server block route override" {

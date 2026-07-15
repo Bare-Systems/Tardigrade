@@ -320,11 +320,12 @@ pub const Metrics = struct {
         self.recordProxyTtfbMs(ttfb_ms);
     }
 
-    pub fn releaseProxyBufferedBytes(self: *Metrics, buffered_bytes: usize) void {
+    pub fn releaseProxyBufferedBytes(self: *Metrics, buffered_bytes: usize) !void {
         const bytes: u64 = @intCast(buffered_bytes);
-        self.proxy_buffered_bytes_current = if (bytes >= self.proxy_buffered_bytes_current) 0 else self.proxy_buffered_bytes_current - bytes;
-        self.releaseProxyBufferBytes(.upstream_to_downstream, .stream, buffered_bytes);
-        self.releaseProxyBufferBytes(.upstream_to_downstream, .global, buffered_bytes);
+        if (bytes > self.proxy_buffered_bytes_current) return error.BufferAccountingUnderflow;
+        self.proxy_buffered_bytes_current -= bytes;
+        try self.releaseProxyBufferBytes(.upstream_to_downstream, .stream, buffered_bytes);
+        try self.releaseProxyBufferBytes(.upstream_to_downstream, .global, buffered_bytes);
     }
 
     pub fn recordProxyBufferBytes(self: *Metrics, direction: proxy_buffer_account.Direction, scope: proxy_buffer_account.Scope, bytes: usize) void {
@@ -343,7 +344,7 @@ pub const Metrics = struct {
         }
     }
 
-    pub fn releaseProxyBufferBytes(self: *Metrics, direction: proxy_buffer_account.Direction, scope: proxy_buffer_account.Scope, bytes: usize) void {
+    pub fn releaseProxyBufferBytes(self: *Metrics, direction: proxy_buffer_account.Direction, scope: proxy_buffer_account.Scope, bytes: usize) !void {
         const value: u64 = @intCast(bytes);
         const slot = switch (direction) {
             .downstream_to_upstream => switch (scope) {
@@ -357,7 +358,8 @@ pub const Metrics = struct {
                 else => return,
             },
         };
-        slot.* = if (value >= slot.*) 0 else slot.* - value;
+        if (value > slot.*) return error.BufferAccountingUnderflow;
+        slot.* -= value;
     }
 
     pub fn recordProxyBufferHighWatermark(self: *Metrics, direction: proxy_buffer_account.Direction, scope: proxy_buffer_account.Scope) void {
@@ -628,7 +630,7 @@ pub const Metrics = struct {
         });
 
         try out.print(
-            \\# HELP tardigrade_buffered_bytes_current Current proxy-owned body bytes by direction and accounting scope
+            \\# HELP tardigrade_buffered_bytes_current Current proxy-owned body bytes by direction and accounting scope (buffered responses and HTTP/1 relay buffers in this PR)
             \\# TYPE tardigrade_buffered_bytes_current gauge
             \\tardigrade_buffered_bytes_current{{direction="downstream_to_upstream",scope="stream"}} {d}
             \\tardigrade_buffered_bytes_current{{direction="downstream_to_upstream",scope="global"}} {d}
@@ -1012,7 +1014,7 @@ test "Metrics tracks active connections and rejections" {
     m.recordMuxFrameError();
     m.recordProxyStreamingRequest(12);
     m.recordProxyBufferedRequest(128, 8);
-    m.releaseProxyBufferedBytes(64);
+    try m.releaseProxyBufferedBytes(64);
     m.recordProxyClientAbort();
     m.recordProxyUpstreamAbort();
 
@@ -1042,6 +1044,19 @@ test "Metrics tracks active connections and rejections" {
     m.recordErrorCode("overload");
     try std.testing.expectEqual(@as(u64, 1), m.err_invalid_request);
     try std.testing.expectEqual(@as(u64, 1), m.err_overload);
+}
+
+test "Metrics proxy buffer release reports accounting underflow" {
+    var m = Metrics.init();
+    m.recordProxyBufferBytes(.upstream_to_downstream, .stream, 32);
+    try m.releaseProxyBufferBytes(.upstream_to_downstream, .stream, 16);
+    try std.testing.expectEqual(@as(u64, 16), m.proxy_buffer_upstream_to_downstream_stream_current);
+    try std.testing.expectError(error.BufferAccountingUnderflow, m.releaseProxyBufferBytes(.upstream_to_downstream, .stream, 17));
+    try std.testing.expectEqual(@as(u64, 16), m.proxy_buffer_upstream_to_downstream_stream_current);
+
+    m.recordProxyBufferedRequest(8, 0);
+    try std.testing.expectError(error.BufferAccountingUnderflow, m.releaseProxyBufferedBytes(9));
+    try std.testing.expectEqual(@as(u64, 8), m.proxy_buffered_bytes_current);
 }
 
 test "recordErrorCode counts only the canonical overload label" {

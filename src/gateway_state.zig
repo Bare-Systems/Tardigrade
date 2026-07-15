@@ -1416,7 +1416,7 @@ pub const GatewayState = struct {
     pub fn metricsReleaseProxyBufferedBytes(self: *GatewayState, buffered_bytes: usize) void {
         self.metrics_mutex.lock();
         defer self.metrics_mutex.unlock();
-        self.metrics.releaseProxyBufferedBytes(buffered_bytes);
+        self.metrics.releaseProxyBufferedBytes(buffered_bytes) catch unreachable;
     }
 
     pub fn metricsRecordProxyClientAbort(self: *GatewayState) void {
@@ -1446,7 +1446,7 @@ pub const GatewayState = struct {
     pub fn metricsReleaseProxyBufferBytes(self: *GatewayState, direction: http.proxy_buffer_account.Direction, scope: http.proxy_buffer_account.Scope, bytes: usize) void {
         self.metrics_mutex.lock();
         defer self.metrics_mutex.unlock();
-        self.metrics.releaseProxyBufferBytes(direction, scope, bytes);
+        self.metrics.releaseProxyBufferBytes(direction, scope, bytes) catch unreachable;
     }
 
     pub fn metricsRecordProxyBufferHighWatermark(self: *GatewayState, direction: http.proxy_buffer_account.Direction, scope: http.proxy_buffer_account.Scope) void {
@@ -1673,7 +1673,10 @@ pub const GatewayState = struct {
         var combined = std.array_list.Managed(u8).init(allocator);
         errdefer combined.deinit();
         try combined.appendSlice(base);
-        try self.appendProxyBufferConfigPrometheus(&combined);
+        self.runtime_mutex.lock();
+        const proxy_buffer_limits = self.proxy_buffer_limits;
+        self.runtime_mutex.unlock();
+        try appendProxyBufferConfigPrometheus(&combined, proxy_buffer_limits);
         if (mux_snapshot.device_counts.len > 0) {
             try combined.appendSlice(
                 \\# HELP tardigrade_mux_device_channels Current active mux channels by device
@@ -1690,8 +1693,7 @@ pub const GatewayState = struct {
         return combined.toOwnedSlice();
     }
 
-    fn appendProxyBufferConfigPrometheus(self: *GatewayState, out: *std.array_list.Managed(u8)) !void {
-        const limits = self.proxy_buffer_limits;
+    fn appendProxyBufferConfigPrometheus(out: *std.array_list.Managed(u8), limits: http.proxy_buffer_account.Limits) !void {
         try out.appendSlice(
             \\# HELP tardigrade_buffer_config_limit_bytes Configured proxy buffer accounting limits in bytes
             \\# TYPE tardigrade_buffer_config_limit_bytes gauge
@@ -3095,6 +3097,7 @@ fn initSlotTestState(gs: *GatewayState, allocator: std.mem.Allocator) void {
     gs.allocator = allocator;
     gs.connection_mutex = .{};
     gs.metrics_mutex = .{};
+    gs.runtime_mutex = .{};
     gs.metrics = http.metrics.Metrics.init();
     gs.active_connections_total = 0;
     gs.max_active_connections = 0;
@@ -3361,6 +3364,7 @@ fn initMetricsJsonTestState(gs: *GatewayState, allocator: std.mem.Allocator) voi
     gs.allocator = allocator;
     gs.connection_mutex = .{};
     gs.metrics_mutex = .{};
+    gs.runtime_mutex = .{};
     gs.metrics = http.metrics.Metrics.init();
     gs.mux_subscriptions_by_device = std.StringHashMap(usize).init(allocator);
     // metricsToJson/metricsToPrometheus overlay the upstream pool's live
@@ -3428,4 +3432,28 @@ test "served Prometheus metrics expose h2 streaming upload fallback counter" {
     try std.testing.expect(std.mem.find(u8, prom, "# TYPE tardigrade_upstream_h2_streaming_upload_fallback_total counter") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_upstream_h2_streaming_upload_fallback_total 1\n") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_buffer_config_limit_bytes{direction=\"upstream_to_downstream\",scope=\"stream\",limit=\"high\"} 786432\n") != null);
+}
+
+test "served Prometheus metrics reflect updated proxy buffer limit snapshot" {
+    var gs: GatewayState = undefined;
+    initMetricsJsonTestState(&gs, std.testing.allocator);
+    defer gs.h2_pool.deinit();
+    defer gs.upstream_pool.deinit();
+    defer gs.mux_subscriptions_by_device.deinit();
+
+    gs.runtime_mutex.lock();
+    gs.proxy_buffer_limits = .{
+        .per_stream_low_watermark = 128 * 1024,
+        .per_stream_high_watermark = 384 * 1024,
+        .per_stream_hard_limit = 512 * 1024,
+        .per_origin_hard_limit = 2 * 1024 * 1024,
+        .global_hard_limit = 4 * 1024 * 1024,
+    };
+    gs.runtime_mutex.unlock();
+
+    const prom = try gs.metricsToPrometheus(std.testing.allocator);
+    defer std.testing.allocator.free(prom);
+
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_buffer_config_limit_bytes{direction=\"upstream_to_downstream\",scope=\"stream\",limit=\"high\"} 393216\n") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_buffer_config_limit_bytes{direction=\"downstream_to_upstream\",scope=\"global\",limit=\"hard\"} 4194304\n") != null);
 }

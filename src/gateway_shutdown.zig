@@ -150,6 +150,7 @@ fn applyReloadedRuntimeConfig(cfg: *const edge_config.EdgeConfig, state: *Gatewa
     state.max_in_flight_requests = cfg.max_in_flight_requests;
     state.max_total_connection_memory_bytes = cfg.max_total_connection_memory_bytes;
     state.connection_memory_estimate_bytes = if (cfg.max_connection_memory_bytes > 0) cfg.max_connection_memory_bytes else MAX_REQUEST_SIZE;
+    state.proxy_buffer_limits = cfg.proxy_buffer_limits;
     state.compression_config = .{
         .enabled = cfg.compression_enabled,
         .min_size = cfg.compression_min_size,

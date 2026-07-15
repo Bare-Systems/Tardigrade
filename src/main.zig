@@ -346,19 +346,19 @@ fn parseConfigInitCommand(args: []const []const u8) !CliCommand {
 fn printUsage(writer: anytype) !void {
     try writer.writeAll(
         \\Usage:
-        \\  tardigrade check [<config>]
-        \\  tardigrade run [-c <path>] [--daemon]
-        \\  tardigrade validate [-c <path>]
-        \\  tardigrade status [-c <path>] [--pid-file <path> | --pid <pid>]
-        \\  tardigrade print-config [-c <path>]
-        \\  tardigrade routes [<config>] [-c <path>]
-        \\  tardigrade upstreams [<config>] [-c <path>]
-        \\  tardigrade reload [-c <path>] [--pid-file <path> | --pid <pid>]
-        \\  tardigrade stop [-c <path>] [--pid-file <path> | --pid <pid>]
-        \\  tardigrade version
-        \\  tardigrade config init [<path>] [--force | --stdout]
-        \\  tardigrade config print [-c <path>]
-        \\  tardigrade config validate [<config>]
+        \\  tardi check [<config>]
+        \\  tardi run [-c <path>] [--daemon]
+        \\  tardi validate [-c <path>]
+        \\  tardi status [-c <path>] [--pid-file <path> | --pid <pid>]
+        \\  tardi print-config [-c <path>]
+        \\  tardi routes [<config>] [-c <path>]
+        \\  tardi upstreams [<config>] [-c <path>]
+        \\  tardi reload [-c <path>] [--pid-file <path> | --pid <pid>]
+        \\  tardi stop [-c <path>] [--pid-file <path> | --pid <pid>]
+        \\  tardi version
+        \\  tardi config init [<path>] [--force | --stdout]
+        \\  tardi config print [-c <path>]
+        \\  tardi config validate [<config>]
         \\
         \\Notes:
         \\  - `check [<config>]` validates a config file without starting the server.
@@ -979,7 +979,7 @@ fn spawnDaemonizedProcess(allocator: std.mem.Allocator, config_path: ?[]const u8
     });
     var stdout_buf: [256]u8 = undefined;
     var stdout = compat.stdoutWriter(&stdout_buf);
-    try stdout.print("started tardigrade in background (pid {d})\n", .{child.id.?});
+    try stdout.print("started tardi in background (pid {d})\n", .{child.id.?});
     try stdout.flush();
 }
 
@@ -1346,6 +1346,17 @@ test "rotateLogFiles with max_files=1 evicts oldest generation" {
     try std.testing.expectEqualStrings("new", rotated);
     // There must be no .2 file (max_files=1 means only one backup)
     try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(compat.io(), "app.log.2", .{}));
+}
+
+
+test "printUsage documents canonical tardi CLI" {
+    var buf: [4096]u8 = undefined;
+    var stream = compat.fixedBufferStream(&buf);
+    try printUsage(stream.writer());
+    const usage = stream.getWritten();
+    try std.testing.expect(std.mem.indexOf(u8, usage, "  tardi run [-c <path>] [--daemon]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, usage, "  tardi version") != null);
+    try std.testing.expect(std.mem.indexOf(u8, usage, "  tardigrade run") == null);
 }
 
 test "parseCliCommand default (no args) returns run command" {

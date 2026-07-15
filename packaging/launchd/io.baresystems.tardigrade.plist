@@ -7,7 +7,7 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/local/bin/tardigrade</string>
+        <string>/usr/local/bin/tardi</string>
         <string>run</string>
         <string>-c</string>
         <string>/usr/local/etc/tardigrade/tardigrade.conf</string>

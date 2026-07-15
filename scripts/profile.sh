@@ -32,7 +32,7 @@ if ! command -v "$ZIG" &>/dev/null; then
   done
 fi
 
-PROFILE_BIN="./zig-out/bin/tardigrade"
+PROFILE_BIN="./zig-out/bin/tardi"
 COMMAND="${1:-help}"
 
 build_profile() {
@@ -58,18 +58,18 @@ CPU Profiling on Linux (perf)
      ./scripts/profile.sh build
 
 2. Start Tardigrade:
-     ./zig-out/bin/tardigrade run
+     ./zig-out/bin/tardi run
 
 3. In a second terminal, start the benchmark load:
      ./benchmarks/run.sh --host 127.0.0.1 --port 8069 \
        --duration 60 --connections 100
 
 4. Attach perf while the benchmark is running (replace PID):
-     perf record -g -F 997 -p $(pgrep tardigrade) -- sleep 30
+     perf record -g -F 997 -p $(pgrep tardi) -- sleep 30
      perf report --no-children
 
    Or profile the entire run from the start:
-     perf record -g -F 997 ./zig-out/bin/tardigrade run
+     perf record -g -F 997 ./zig-out/bin/tardi run
      perf report --no-children
 
 5. Generate a flamegraph (requires FlameGraph scripts):
@@ -80,7 +80,7 @@ CPU Profiling on Linux (perf)
 
 Tips:
   - Add --call-graph=dwarf if frame-pointer unwind does not work.
-  - perf top -g -p $(pgrep tardigrade) for live per-function view.
+  - perf top -g -p $(pgrep tardi) for live per-function view.
   - To profile a specific path (e.g. TLS), filter the benchmark to TLS:
       ./benchmarks/run.sh --tls --static-path /health --scenarios static-http1
 EOF
@@ -96,7 +96,7 @@ CPU Profiling on macOS (sample / Instruments)
      ./scripts/profile.sh build
 
 2. Start Tardigrade:
-     ./zig-out/bin/tardigrade run &
+     ./zig-out/bin/tardi run &
 
 3. While the benchmark runs, sample the process:
      ./benchmarks/run.sh --duration 60 &
@@ -108,7 +108,7 @@ CPU Profiling on macOS (sample / Instruments)
    Or use Instruments directly:
      instruments -t "Time Profiler" \
        -D /tmp/tardigrade.trace \
-       ./zig-out/bin/tardigrade run
+       ./zig-out/bin/tardi run
      open /tmp/tardigrade.trace
 
 4. Inspect the Time Profiler trace for the heaviest call stacks.
@@ -128,20 +128,20 @@ Memory / Allocation Profiling on Linux
 
 Option A — Valgrind massif (allocation-heavy path identification):
   valgrind --tool=massif --pages-as-heap=yes \
-    ./zig-out/bin/tardigrade run
+    ./zig-out/bin/tardi run
   # After exit:
   ms_print massif.out.* | head -100
 
 Option B — heaptrack (lower overhead, live view):
-  heaptrack ./zig-out/bin/tardigrade run
+  heaptrack ./zig-out/bin/tardi run
   # Analyse the output:
-  heaptrack_gui heaptrack.tardigrade.*.gz
+  heaptrack_gui heaptrack.tardi.*.gz
 
 Option C — Zig Debug build + ASAN (AddressSanitizer):
   # Rebuild in Debug mode for maximum allocation detail:
   zig build -Doptimize=Debug
   # Run under ASAN (requires clang/GCC asan runtime):
-  ASAN_OPTIONS=detect_leaks=1 ./zig-out/bin/tardigrade run
+  ASAN_OPTIONS=detect_leaks=1 ./zig-out/bin/tardi run
 
 Tips:
   - Valgrind slows the process ~30×; use a low-concurrency benchmark.
@@ -157,7 +157,7 @@ Memory / Allocation Profiling on macOS
 ──────────────────────────────────────────────────────────────────
 
 Option A — leaks command (post-mortem):
-  ./zig-out/bin/tardigrade run &
+  ./zig-out/bin/tardi run &
   PID=$!
   ./benchmarks/run.sh --duration 30
   leaks $PID
@@ -166,14 +166,14 @@ Option A — leaks command (post-mortem):
 Option B — Instruments Allocations instrument:
   instruments -t "Allocations" \
     -D /tmp/tardigrade-alloc.trace \
-    ./zig-out/bin/tardigrade run
+    ./zig-out/bin/tardi run
   open /tmp/tardigrade-alloc.trace
   # Filter by "Generation" to find long-lived allocations.
 
 Option C — Instruments Leaks instrument:
   instruments -t "Leaks" \
     -D /tmp/tardigrade-leaks.trace \
-    ./zig-out/bin/tardigrade run
+    ./zig-out/bin/tardi run
   open /tmp/tardigrade-leaks.trace
 
 Tips:

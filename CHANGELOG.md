@@ -4,6 +4,9 @@ All notable user-facing changes to Tardigrade are documented here.
 
 ## [Unreleased]
 
+### Changed
+- Made `tardi` the canonical CLI binary while retaining `tardigrade` as a compatibility alias across source builds, release archives, the installer, Homebrew, DEB, and RPM packages.
+
 ### Features
 - **TLS record-layer foundation audit remediation (#408, epic #325)** —
   resolves seven confirmed findings from a retrospective audit of the merged
@@ -83,7 +86,7 @@ All notable user-facing changes to Tardigrade are documented here.
   a no-OpenSSL stub (`src/http/tls_termination_stub.zig`) at the module graph,
   so an appliance binary never analyzes `@cImport("openssl/...")`, never links
   `libssl`/`libcrypto`, and has no runtime fallback (the stub fails closed until
-  the native TLS path lands under #391). `tardigrade version` now reports the
+  the native TLS path lands under #391). `tardi version` now reports the
   built-in profile and backend so an artifact is self-identifying. Two audit
   scripts enforce the policy: `scripts/audit-dependencies.sh` fails if a
   forbidden dependency (ngtcp2, nghttp3, quiche, BoringSSL, mbedTLS, …) is

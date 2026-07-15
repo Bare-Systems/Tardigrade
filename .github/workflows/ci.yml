@@ -80,7 +80,7 @@ jobs:
       - name: Audit appliance artifact linkage
         run: |
           ./scripts/audit-release-binary.sh \
-            --binary zig-out/bin/tardigrade \
+            --binary zig-out/bin/tardi \
             --profile appliance \
             --output "$RUNNER_TEMP/dependency-inventory-appliance.json"
 
@@ -90,7 +90,7 @@ jobs:
       - name: Audit general artifact linkage
         run: |
           ./scripts/audit-release-binary.sh \
-            --binary zig-out/bin/tardigrade \
+            --binary zig-out/bin/tardi \
             --profile general \
             --output "$RUNNER_TEMP/dependency-inventory-general.json"
 
@@ -219,6 +219,9 @@ jobs:
           restore-keys: |
             zig-packaging-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig') }}-
             zig-packaging-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Verify source CLI outputs
+        run: ./scripts/test-source-cli.sh
 
       - name: Build ReleaseFast binary
         run: zig build -Doptimize=ReleaseFast

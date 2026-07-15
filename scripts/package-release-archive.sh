@@ -3,7 +3,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-BINARY="${REPO_ROOT}/zig-out/bin/tardigrade"
+BINARY="${REPO_ROOT}/zig-out/bin/tardi"
 ARCHIVE_NAME=""
 OUTPUT_DIR="${REPO_ROOT}"
 STAGING_DIR=""
@@ -53,8 +53,8 @@ trap cleanup EXIT
 
 mkdir -p "$OUTPUT_DIR"
 
-install -m 0755 "$BINARY" "${STAGING_DIR}/tardigrade"
-ln -s tardigrade "${STAGING_DIR}/tardi"
+install -m 0755 "$BINARY" "${STAGING_DIR}/tardi"
+ln -s tardi "${STAGING_DIR}/tardigrade"
 install -m 0644 "${REPO_ROOT}/LICENSE" "${STAGING_DIR}/LICENSE"
 install -m 0644 "${REPO_ROOT}/README.md" "${STAGING_DIR}/README.md"
 install -m 0644 "${REPO_ROOT}/CHANGELOG.md" "${STAGING_DIR}/CHANGELOG.md"
@@ -62,8 +62,8 @@ install -m 0644 "${REPO_ROOT}/packaging/README.md" "${STAGING_DIR}/PACKAGING.md"
 
 archive_path="${OUTPUT_DIR}/${ARCHIVE_NAME}.tar.gz"
 tar -C "$STAGING_DIR" -czf "$archive_path" \
-    tardigrade \
     tardi \
+    tardigrade \
     LICENSE \
     README.md \
     CHANGELOG.md \

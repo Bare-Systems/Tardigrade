@@ -174,7 +174,7 @@ worker starvation.
 
 Tardigrade supports zero-downtime configuration reload and graceful shutdown.
 Both are driven by POSIX signals delivered to the running process (the
-`tardigrade reload` / `tardigrade stop` CLI commands send these for you).
+`tardi reload` / `tardi stop` CLI commands send these for you).
 
 | Signal | Effect |
 |---|---|

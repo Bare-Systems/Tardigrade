@@ -4,7 +4,7 @@ Release:        1%{?dist}
 Summary:        Tardigrade edge gateway — TLS termination, reverse proxying, and realtime transport
 License:        Apache-2.0
 URL:            https://github.com/Bare-Systems/Tardigrade
-Source0:        tardigrade
+Source0:        tardi
 Source1:        tardigrade.service
 Source2:        tardigrade.env
 Source3:        LICENSE
@@ -17,7 +17,8 @@ High-performance Zig edge gateway and HTTP server for TLS termination,
 reverse proxying, protocol bridging, and realtime event transport.
 
 %install
-install -D -m 0755 %{SOURCE0} %{buildroot}%{_bindir}/tardigrade
+install -D -m 0755 %{SOURCE0} %{buildroot}%{_bindir}/tardi
+ln -s tardi %{buildroot}%{_bindir}/tardigrade
 install -D -m 0644 %{SOURCE1} %{buildroot}%{_unitdir}/tardigrade.service
 install -D -m 0640 %{SOURCE2} %{buildroot}%{_sysconfdir}/tardigrade/tardigrade.env
 install -D -m 0644 %{SOURCE3} %{buildroot}%{_datadir}/licenses/%{name}/LICENSE
@@ -43,6 +44,7 @@ exit 0
 
 %files
 %{_datadir}/licenses/%{name}/LICENSE
+%{_bindir}/tardi
 %{_bindir}/tardigrade
 %{_unitdir}/tardigrade.service
 %config(noreplace) %{_sysconfdir}/tardigrade/tardigrade.env

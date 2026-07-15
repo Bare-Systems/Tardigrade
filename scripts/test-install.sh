@@ -33,7 +33,7 @@ mkdir -p "${RELEASE_ROOT}/latest/download" "${RELEASE_ROOT}/download/${VERSION}"
 
 "${REPO_ROOT}/scripts/package-release-archive.sh" \
     --archive-name "tardigrade-${host_platform}" \
-    --binary "${REPO_ROOT}/zig-out/bin/tardigrade" \
+    --binary "${REPO_ROOT}/zig-out/bin/tardi" \
     --output-dir "${RELEASE_ROOT}/download/${VERSION}"
 
 cp "${RELEASE_ROOT}/download/${VERSION}/tardigrade-${host_platform}.tar.gz" \
@@ -69,9 +69,10 @@ grep -F "unsupported architecture: sparc64" "${TMPDIR}/unsupported.log" >/dev/nu
 TARDIGRADE_RELEASE_BASE_URL="file://${RELEASE_ROOT}" \
     "${REPO_ROOT}/scripts/install.sh" --version "$VERSION" --dir "$INSTALL_DIR"
 
+test -x "${INSTALL_DIR}/tardi"
 test -x "${INSTALL_DIR}/tardigrade"
-test -e "${INSTALL_DIR}/tardi"
 "${INSTALL_DIR}/tardi" version >/dev/null
+"${INSTALL_DIR}/tardigrade" version >/dev/null
 
 mkdir -p "${TMPDIR}/bad-release/download/${VERSION}"
 cp "${RELEASE_ROOT}/download/${VERSION}/tardigrade-${host_platform}.tar.gz" "${TMPDIR}/bad-release/download/${VERSION}/"
@@ -82,7 +83,7 @@ if TARDIGRADE_RELEASE_BASE_URL="file://${TMPDIR}/bad-release" "${REPO_ROOT}/scri
     exit 1
 fi
 grep -F "checksum mismatch for tardigrade-${host_platform}.tar.gz" "${TMPDIR}/checksum.log" >/dev/null
-test ! -e "${TMPDIR}/bad-install/tardigrade"
 test ! -e "${TMPDIR}/bad-install/tardi"
+test ! -e "${TMPDIR}/bad-install/tardigrade"
 
 printf 'install smoke test passed\n'

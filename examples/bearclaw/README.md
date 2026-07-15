@@ -29,7 +29,7 @@ BearClaw-facing edge shape.
 Use this as the runtime config file:
 
 ```bash
-TARDIGRADE_CONFIG_PATH=examples/bearclaw/tardigrade.conf ./zig-out/bin/tardigrade
+TARDIGRADE_CONFIG_PATH=examples/bearclaw/tardigrade.conf ./zig-out/bin/tardi
 ```
 
 ### `tardigrade.env.example`
@@ -199,5 +199,5 @@ source examples/bearclaw/tardigrade.env.example
 set +a
 
 zig build
-./zig-out/bin/tardigrade
+./zig-out/bin/tardi
 ```

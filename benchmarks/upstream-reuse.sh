@@ -25,7 +25,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BENCH_DIR="${REPO_ROOT}/benchmarks"
-BINARY="${REPO_ROOT}/zig-out/bin/tardigrade"
+BINARY="${REPO_ROOT}/zig-out/bin/tardi"
 LISTEN_PORT="18091"
 ORIGIN_PORT="18090"
 DURATION="10"
@@ -52,7 +52,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ ! -x "$BINARY" ]]; then
-    echo "tardigrade binary not found at ${BINARY} (run: zig build -Doptimize=ReleaseFast)" >&2
+    echo "tardi binary not found at ${BINARY} (run: zig build -Doptimize=ReleaseFast)" >&2
     exit 1
 fi
 for tool in wrk curl python3 awk; do

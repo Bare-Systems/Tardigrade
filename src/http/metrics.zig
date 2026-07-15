@@ -106,6 +106,7 @@ pub const Metrics = struct {
     /// Error category counters.
     err_invalid_request: u64,
     err_unauthorized: u64,
+    err_forbidden: u64,
     err_rate_limited: u64,
     err_upstream_timeout: u64,
     err_upstream_unavailable: u64,
@@ -212,6 +213,7 @@ pub const Metrics = struct {
             .keepalive_closed_total = 0,
             .err_invalid_request = 0,
             .err_unauthorized = 0,
+            .err_forbidden = 0,
             .err_rate_limited = 0,
             .err_upstream_timeout = 0,
             .err_upstream_unavailable = 0,
@@ -557,6 +559,8 @@ pub const Metrics = struct {
             self.err_invalid_request += 1;
         } else if (std.mem.eql(u8, code, "unauthorized")) {
             self.err_unauthorized += 1;
+        } else if (std.mem.eql(u8, code, "forbidden")) {
+            self.err_forbidden += 1;
         } else if (std.mem.eql(u8, code, "rate_limited")) {
             self.err_rate_limited += 1;
         } else if (std.mem.eql(u8, code, "upstream_timeout")) {
@@ -823,6 +827,9 @@ pub const Metrics = struct {
             \\# HELP tardigrade_error_unauthorized_total Total unauthorized API errors
             \\# TYPE tardigrade_error_unauthorized_total counter
             \\tardigrade_error_unauthorized_total {d}
+            \\# HELP tardigrade_error_forbidden_total Total forbidden API errors
+            \\# TYPE tardigrade_error_forbidden_total counter
+            \\tardigrade_error_forbidden_total {d}
             \\# HELP tardigrade_error_rate_limited_total Total rate_limited API errors
             \\# TYPE tardigrade_error_rate_limited_total counter
             \\tardigrade_error_rate_limited_total {d}
@@ -885,6 +892,7 @@ pub const Metrics = struct {
             self.worker_queue_wait_count,
             self.err_invalid_request,
             self.err_unauthorized,
+            self.err_forbidden,
             self.err_rate_limited,
             self.err_upstream_timeout,
             self.err_upstream_unavailable,
@@ -962,7 +970,7 @@ pub const Metrics = struct {
             self.upstream_stale_retries,
         });
         try out.print(
-            \\,"request_latency_ms_count":{d},"request_latency_ms_sum":{d},"worker_active_jobs":{d},"worker_queued_jobs":{d},"worker_threads":{d},"worker_queue_capacity":{d},"worker_queue_wait_count":{d},"worker_queue_wait_sum_us":{d},"error_invalid_request":{d},"error_unauthorized":{d},"error_rate_limited":{d},"error_upstream_timeout":{d},"error_upstream_unavailable":{d},"error_internal_error":{d},"error_overload":{d},"error_request_timeout":{d},"mux_frame_errors":{d},"event_loop_iterations":{d},"health_probe_runs":{d},"reload_attempts_total":{d},"reload_success_total":{d},"reload_failure_total":{d},"drain_total":{d},"drain_timeouts_total":{d},"drain_forced_closes_total":{d}}}
+            \\,"request_latency_ms_count":{d},"request_latency_ms_sum":{d},"worker_active_jobs":{d},"worker_queued_jobs":{d},"worker_threads":{d},"worker_queue_capacity":{d},"worker_queue_wait_count":{d},"worker_queue_wait_sum_us":{d},"error_invalid_request":{d},"error_unauthorized":{d},"error_forbidden":{d},"error_rate_limited":{d},"error_upstream_timeout":{d},"error_upstream_unavailable":{d},"error_internal_error":{d},"error_overload":{d},"error_request_timeout":{d},"mux_frame_errors":{d},"event_loop_iterations":{d},"health_probe_runs":{d},"reload_attempts_total":{d},"reload_success_total":{d},"reload_failure_total":{d},"drain_total":{d},"drain_timeouts_total":{d},"drain_forced_closes_total":{d}}}
         , .{
             self.latency_count,
             self.latency_sum_ms,
@@ -974,6 +982,7 @@ pub const Metrics = struct {
             self.worker_queue_wait_sum_us,
             self.err_invalid_request,
             self.err_unauthorized,
+            self.err_forbidden,
             self.err_rate_limited,
             self.err_upstream_timeout,
             self.err_upstream_unavailable,
@@ -1072,8 +1081,10 @@ test "Metrics tracks active connections and rejections" {
     m.setUpstreamUnhealthyBackends(3);
     try std.testing.expectEqual(@as(u64, 3), m.upstream_unhealthy_backends);
     m.recordErrorCode("invalid_request");
+    m.recordErrorCode("forbidden");
     m.recordErrorCode("overload");
     try std.testing.expectEqual(@as(u64, 1), m.err_invalid_request);
+    try std.testing.expectEqual(@as(u64, 1), m.err_forbidden);
     try std.testing.expectEqual(@as(u64, 1), m.err_overload);
 }
 

@@ -118,11 +118,91 @@ pub const ReturnResponsePlan = union(enum) {
     body: struct { status: u16, body: []const u8 },
 };
 
+pub const ReturnResponseWriteResult = struct {
+    status: u16,
+    error_code: ?[]const u8 = null,
+};
+
 pub fn planReturnResponse(request_is_get_or_head: bool, status: u16, body: []const u8) ReturnResponsePlan {
     const is_redirect = status >= 300 and status < 400;
     if (!is_redirect and !request_is_get_or_head) return .method_not_allowed;
     if (is_redirect and body.len > 0) return .{ .redirect = .{ .status = status, .location = body } };
     return .{ .body = .{ .status = status, .body = body } };
+}
+
+pub fn planDirectResponse(status: u16, body: []const u8) ReturnResponsePlan {
+    return planReturnResponse(true, status, body);
+}
+
+/// Render a configured direct response for HTTP/1.x routes and rewrite stages.
+///
+/// Route matching, rewrite evaluation, and metrics/logging stay with the caller;
+/// this stage owns shared status/header/body shaping for the socket response.
+pub fn writeReturnResponsePlan(
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    state: *GatewayState,
+    ctx: *http.request_context.RequestContext,
+    plan: ReturnResponsePlan,
+    correlation_id: []const u8,
+    keep_alive: bool,
+) !ReturnResponseWriteResult {
+    switch (plan) {
+        .method_not_allowed => {
+            const payload = try buildApiErrorJson(allocator, "invalid_request", "Method Not Allowed", correlation_id);
+            defer allocator.free(payload);
+            var response = http.Response.json(allocator, payload);
+            defer response.deinit();
+            _ = response.setStatus(.method_not_allowed).setConnection(keep_alive);
+            setRequestIdHeaders(&response, correlation_id);
+            ctx.response_bytes = payload.len;
+            applyResponseHeaders(state, &response);
+            try response.write(writer);
+            return .{ .status = 405, .error_code = "invalid_request" };
+        },
+        .redirect => |r| {
+            var response = http.Response.redirect(allocator, r.location, @enumFromInt(r.status));
+            defer response.deinit();
+            _ = response.setConnection(keep_alive);
+            setRequestIdHeaders(&response, correlation_id);
+            ctx.response_bytes = 0;
+            applyResponseHeaders(state, &response);
+            try response.write(writer);
+            return .{ .status = r.status };
+        },
+        .body => |b| {
+            var response = http.Response.init(allocator);
+            defer response.deinit();
+            _ = response.setStatus(@enumFromInt(b.status))
+                .setBody(b.body)
+                .setContentType("text/plain; charset=utf-8")
+                .setConnection(keep_alive);
+            setRequestIdHeaders(&response, correlation_id);
+            ctx.response_bytes = b.body.len;
+            applyResponseHeaders(state, &response);
+            try response.write(writer);
+            return .{ .status = b.status };
+        },
+    }
+}
+
+pub fn writeReturnResponse(
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    state: *GatewayState,
+    ctx: *http.request_context.RequestContext,
+    request_is_get_or_head: bool,
+    status: u16,
+    body: []const u8,
+    correlation_id: []const u8,
+    keep_alive: bool,
+) !ReturnResponseWriteResult {
+    return writeReturnResponsePlan(allocator, writer, state, ctx, planReturnResponse(request_is_get_or_head, status, body), correlation_id, keep_alive);
+}
+
+fn recordReturnResponseMetrics(state: *GatewayState, result: ReturnResponseWriteResult) void {
+    state.metricsRecord(result.status);
+    if (result.error_code) |code| state.metricsRecordErrorCode(code);
 }
 
 test "planReturnResponse: non-redirect return is GET/HEAD only" {
@@ -140,6 +220,123 @@ test "planReturnResponse: redirects are method-agnostic" {
     }
     // A redirect status with no body renders the status without a Location header.
     try std.testing.expect(std.meta.activeTag(planReturnResponse(true, 301, "")) == .body);
+}
+
+test "planDirectResponse preserves configured rewrite return behavior" {
+    try std.testing.expect(std.meta.activeTag(planDirectResponse(200, "ok")) == .body);
+    switch (planDirectResponse(302, "/new")) {
+        .redirect => |r| try std.testing.expectEqualStrings("/new", r.location),
+        else => {
+            try std.testing.expect(false);
+        },
+    }
+}
+
+fn initHandlerTestState(state: *GatewayState, allocator: std.mem.Allocator, add_headers: []const edge_config.EdgeConfig.HeaderPair) void {
+    state.allocator = allocator;
+    state.metrics_mutex = .{};
+    state.session_mutex = .{};
+    state.metrics = http.metrics.Metrics.init();
+    state.security_headers = .{
+        .x_frame_options = "DENY",
+        .x_content_type_options = "nosniff",
+        .content_security_policy = "",
+        .strict_transport_security = "",
+        .referrer_policy = "",
+        .permissions_policy = "",
+        .x_xss_protection = "",
+        .cross_origin_opener_policy = "",
+        .cross_origin_resource_policy = "",
+    };
+    state.add_headers = add_headers;
+    state.http3_alt_svc = null;
+    state.session_store = null;
+}
+
+fn minimalAuthConfig(blocks: []http.location_router.LocationBlock, token_hashes: [][]const u8) edge_config.EdgeConfig {
+    var cfg: edge_config.EdgeConfig = undefined;
+    cfg.basic_auth_hashes = &.{};
+    cfg.auth_token_hashes = token_hashes;
+    cfg.jwt_secret = "";
+    cfg.jwt_issuer = "";
+    cfg.jwt_audience = "";
+    cfg.auth_request_url = "";
+    cfg.location_blocks = blocks;
+    cfg.metrics_path = "/status/metrics";
+    return cfg;
+}
+
+fn recordTestReturnMetrics(state: *GatewayState, result: ReturnResponseWriteResult) void {
+    state.metricsRecord(result.status);
+    if (result.error_code) |code| state.metricsRecordErrorCode(code);
+}
+
+test "writeReturnResponsePlan writes body response headers bytes and caller-owned metrics" {
+    const allocator = std.testing.allocator;
+    const add_headers = [_]edge_config.EdgeConfig.HeaderPair{.{ .name = "X-Test-Header", .value = "stage" }};
+    var state: GatewayState = undefined;
+    initHandlerTestState(&state, allocator, add_headers[0..]);
+    var ctx = http.request_context.RequestContext.init(allocator, "req-body", "127.0.0.1");
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+
+    const result = try writeReturnResponsePlan(allocator, &output.writer, &state, &ctx, planDirectResponse(200, "ok"), "req-body", true);
+    recordTestReturnMetrics(&state, result);
+
+    const raw = output.written();
+    try std.testing.expect(std.mem.startsWith(u8, raw, "HTTP/1.1 200 OK\r\n"));
+    try std.testing.expect(std.mem.indexOf(u8, raw, "X-Request-ID: req-body\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "X-Correlation-ID: req-body\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "x-frame-options: DENY\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "x-test-header: stage\r\n") != null);
+    try std.testing.expect(std.mem.endsWith(u8, raw, "\r\n\r\nok"));
+    try std.testing.expectEqual(@as(usize, 2), ctx.response_bytes);
+    try std.testing.expectEqual(@as(u64, 1), state.metrics.total_requests);
+    try std.testing.expectEqual(@as(u64, 1), state.metrics.status_2xx);
+}
+
+test "writeReturnResponsePlan writes redirects with zero response bytes" {
+    const allocator = std.testing.allocator;
+    var state: GatewayState = undefined;
+    initHandlerTestState(&state, allocator, &.{});
+    var ctx = http.request_context.RequestContext.init(allocator, "req-redirect", "127.0.0.1");
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+
+    const result = try writeReturnResponsePlan(allocator, &output.writer, &state, &ctx, planDirectResponse(302, "/new"), "req-redirect", false);
+    recordTestReturnMetrics(&state, result);
+
+    const raw = output.written();
+    try std.testing.expect(std.mem.startsWith(u8, raw, "HTTP/1.1 302 Found\r\n"));
+    try std.testing.expect(std.mem.indexOf(u8, raw, "location: /new\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "Content-Length: 0\r\n") != null);
+    try std.testing.expect(std.mem.endsWith(u8, raw, "\r\n\r\n"));
+    try std.testing.expectEqual(@as(usize, 0), ctx.response_bytes);
+    try std.testing.expectEqual(@as(u64, 1), state.metrics.total_requests);
+    try std.testing.expectEqual(@as(u64, 1), state.metrics.status_3xx);
+}
+
+test "writeReturnResponsePlan reports 405 metrics ownership to caller" {
+    const allocator = std.testing.allocator;
+    var state: GatewayState = undefined;
+    initHandlerTestState(&state, allocator, &.{});
+    var ctx = http.request_context.RequestContext.init(allocator, "req-405", "127.0.0.1");
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+
+    const result = try writeReturnResponsePlan(allocator, &output.writer, &state, &ctx, planReturnResponse(false, 200, "ok"), "req-405", false);
+    try std.testing.expectEqual(@as(u64, 0), state.metrics.total_requests);
+    recordTestReturnMetrics(&state, result);
+
+    const raw = output.written();
+    try std.testing.expect(std.mem.startsWith(u8, raw, "HTTP/1.1 405 Method Not Allowed\r\n"));
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\"code\":\"invalid_request\"") != null);
+    try std.testing.expect(ctx.response_bytes > 0);
+    try std.testing.expectEqual(@as(u16, 405), result.status);
+    try std.testing.expectEqualStrings("invalid_request", result.error_code.?);
+    try std.testing.expectEqual(@as(u64, 1), state.metrics.total_requests);
+    try std.testing.expectEqual(@as(u64, 1), state.metrics.status_4xx);
+    try std.testing.expectEqual(@as(u64, 1), state.metrics.err_invalid_request);
 }
 
 pub fn routeRequest(
@@ -173,107 +370,23 @@ pub fn routeRequest(
         },
         .unmatched => {},
         .location => |matched| {
-            if (matched.block.auth == .required and !ctx.authenticated and ctx.identity == null) {
-                var auth_res = try authorizeRequest(allocator, cfg, &request.headers);
-                defer auth_res.deinit(allocator);
-                if (auth_res.ok) {
-                    if (auth_res.identity) |identity| {
-                        ctx.setAuthContext(identity, auth_res.user_id, auth_res.device_id, auth_res.scopes);
-                        auth_res.identity = null;
-                        auth_res.user_id = null;
-                        auth_res.device_id = null;
-                        auth_res.scopes = null;
-                    }
-                } else if (http.session.fromHeaders(&request.headers)) |session_token| {
-                    if (state.validateSessionIdentity(allocator, session_token)) |identity| {
-                        ctx.setIdentity(identity);
-                    } else {
-                        try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, keep_alive.*, state);
-                        state.metricsRecord(401);
-                        state.metricsRecordErrorCode("unauthorized");
-                        return 401;
-                    }
-                } else if (cfg.auth_request_url.len > 0 and authorizeViaSubrequest(allocator, cfg, request, correlation_id, client_ip)) {
-                    ctx.authenticated = true;
-                } else {
-                    const auth_status: http.Status = if (auth_res.failure_reason == .invalid) .forbidden else .unauthorized;
-                    const auth_code = if (auth_res.failure_reason == .invalid) "forbidden" else "unauthorized";
-                    const auth_message = if (auth_res.failure_reason == .invalid) "Forbidden" else "Unauthorized";
-                    const auth_status_code: u16 = @intFromEnum(auth_status);
-                    try sendApiError(allocator, writer, auth_status, auth_code, auth_message, correlation_id, keep_alive.*, state);
-                    state.metricsRecord(auth_status_code);
-                    state.metricsRecordErrorCode(auth_code);
-                    return auth_status_code;
-                }
+            if (try enforceLocationAuth(allocator, writer, cfg, state, ctx, request, matched, correlation_id, keep_alive.*, client_ip)) |status| {
+                return status;
             }
-            switch (matched.block.action) {
-                .proxy_pass => |target| {
-                    return try handleLocationProxyPass(
-                        allocator,
-                        conn,
-                        writer,
-                        cfg,
-                        state,
-                        ctx,
-                        request,
-                        target,
-                        proxySuffixPathForLocation(request.uri.path, matched, cfg.location_blocks),
-                        correlation_id,
-                        keep_alive.*,
-                        client_ip,
-                        ctx.identity,
-                        ctx.user_id,
-                        ctx.device_id,
-                        ctx.scopes,
-                        request.headers.get("host"),
-                        matched.block.pattern,
-                        matched.block,
-                        streaming_request_body,
-                    );
-                },
-                .fastcgi_pass => |upstream| {
-                    return try handleFastcgiRoute(allocator, writer, cfg, upstream, request, client_ip, correlation_id, keep_alive.*, state);
-                },
-                .return_response => |ret| {
-                    switch (planReturnResponse(request.method == .GET or request.method == .HEAD, ret.status, ret.body)) {
-                        .method_not_allowed => {
-                            try sendApiError(allocator, writer, .method_not_allowed, "invalid_request", "Method Not Allowed", correlation_id, keep_alive.*, state);
-                            state.metricsRecord(405);
-                            return 405;
-                        },
-                        .redirect => |r| {
-                            var response = http.Response.redirect(allocator, r.location, @enumFromInt(r.status));
-                            defer response.deinit();
-                            _ = response.setConnection(keep_alive.*);
-                            setRequestIdHeaders(&response, correlation_id);
-                            ctx.response_bytes = 0;
-                            applyResponseHeaders(state, &response);
-                            try response.write(writer);
-                            state.metricsRecord(r.status);
-                            return r.status;
-                        },
-                        .body => |b| {
-                            var response = http.Response.init(allocator);
-                            defer response.deinit();
-                            _ = response.setStatus(@enumFromInt(b.status))
-                                .setBody(b.body)
-                                .setContentType("text/plain; charset=utf-8")
-                                .setConnection(keep_alive.*);
-                            setRequestIdHeaders(&response, correlation_id);
-                            ctx.response_bytes = b.body.len;
-                            applyResponseHeaders(state, &response);
-                            try response.write(writer);
-                            state.metricsRecord(b.status);
-                            return b.status;
-                        },
-                    }
-                },
-                .rewrite => |rw| {
-                    request.uri.path = rw.replacement;
-                },
-                .static_root => |root_cfg| {
-                    if (try handleStaticLocation(allocator, conn, request, matched, root_cfg, correlation_id, keep_alive.*, state)) |status| return status;
-                },
+            if (try executeLocationAction(
+                conn,
+                allocator,
+                cfg,
+                state,
+                ctx,
+                request,
+                matched,
+                correlation_id,
+                keep_alive,
+                client_ip,
+                streaming_request_body,
+            )) |status| {
+                return status;
             }
         },
     }
@@ -286,6 +399,192 @@ pub fn routeRequest(
     try sendApiError(allocator, writer, .not_found, "invalid_request", "Not Found", correlation_id, keep_alive.*, state);
     state.metricsRecord(404);
     return 404;
+}
+
+fn enforceLocationAuth(
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    cfg: *const edge_config.EdgeConfig,
+    state: *GatewayState,
+    ctx: *http.request_context.RequestContext,
+    request: *const http.Request,
+    matched: http.location_router.MatchResult,
+    correlation_id: []const u8,
+    keep_alive: bool,
+    client_ip: []const u8,
+) !?u16 {
+    if (matched.block.auth != .required or ctx.authenticated or ctx.identity != null) return null;
+
+    var auth_res = try authorizeRequest(allocator, cfg, &request.headers);
+    defer auth_res.deinit(allocator);
+    if (auth_res.ok) {
+        if (auth_res.identity) |identity| {
+            ctx.setAuthContext(identity, auth_res.user_id, auth_res.device_id, auth_res.scopes);
+            auth_res.identity = null;
+            auth_res.user_id = null;
+            auth_res.device_id = null;
+            auth_res.scopes = null;
+        }
+        return null;
+    }
+
+    if (http.session.fromHeaders(&request.headers)) |session_token| {
+        if (state.validateSessionIdentity(allocator, session_token)) |identity| {
+            ctx.setIdentity(identity);
+            return null;
+        }
+        try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, keep_alive, state);
+        return 401;
+    }
+
+    if (cfg.auth_request_url.len > 0 and authorizeViaSubrequest(allocator, cfg, request, correlation_id, client_ip)) {
+        ctx.authenticated = true;
+        return null;
+    }
+
+    const auth_status: http.Status = if (auth_res.failure_reason == .invalid) .forbidden else .unauthorized;
+    const auth_code = if (auth_res.failure_reason == .invalid) "forbidden" else "unauthorized";
+    const auth_message = if (auth_res.failure_reason == .invalid) "Forbidden" else "Unauthorized";
+    const auth_status_code: u16 = @intFromEnum(auth_status);
+    try sendApiError(allocator, writer, auth_status, auth_code, auth_message, correlation_id, keep_alive, state);
+    return auth_status_code;
+}
+
+test "enforceLocationAuth records invalid session rejection exactly once" {
+    const allocator = std.testing.allocator;
+    var state: GatewayState = undefined;
+    initHandlerTestState(&state, allocator, &.{});
+    var ctx = http.request_context.RequestContext.init(allocator, "req-session", "127.0.0.1");
+    var blocks = [_]http.location_router.LocationBlock{.{
+        .match_type = .exact,
+        .pattern = "/private",
+        .priority = 0,
+        .action = .{ .return_response = .{ .status = 200, .body = "ok" } },
+        .auth = .required,
+    }};
+    var token_hashes = [_][]const u8{};
+    var cfg = minimalAuthConfig(blocks[0..], token_hashes[0..]);
+    const parsed = try http.Request.parse(
+        allocator,
+        "GET /private HTTP/1.1\r\nHost: example.test\r\nX-Session-Token: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n\r\n",
+        MAX_REQUEST_SIZE,
+    );
+    var request = parsed.request;
+    defer request.deinit();
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    const matched = http.location_router.matchLocation(request.uri.path, cfg.location_blocks).?;
+
+    const status = (try enforceLocationAuth(allocator, &output.writer, &cfg, &state, &ctx, &request, matched, "req-session", false, "127.0.0.1")).?;
+
+    try std.testing.expectEqual(@as(u16, 401), status);
+    try std.testing.expectEqual(@as(u64, 1), state.metrics.total_requests);
+    try std.testing.expectEqual(@as(u64, 1), state.metrics.status_4xx);
+    try std.testing.expectEqual(@as(u64, 1), state.metrics.err_unauthorized);
+}
+
+test "enforceLocationAuth records invalid authorization rejection exactly once" {
+    const allocator = std.testing.allocator;
+    var state: GatewayState = undefined;
+    initHandlerTestState(&state, allocator, &.{});
+    var ctx = http.request_context.RequestContext.init(allocator, "req-auth", "127.0.0.1");
+    const allowed_hashes = [_][]const u8{"0000000000000000000000000000000000000000000000000000000000000000"};
+    var blocks = [_]http.location_router.LocationBlock{.{
+        .match_type = .exact,
+        .pattern = "/private",
+        .priority = 0,
+        .action = .{ .return_response = .{ .status = 200, .body = "ok" } },
+        .auth = .required,
+    }};
+    var mutable_allowed_hashes = allowed_hashes;
+    var cfg = minimalAuthConfig(blocks[0..], mutable_allowed_hashes[0..]);
+    const parsed = try http.Request.parse(
+        allocator,
+        "GET /private HTTP/1.1\r\nHost: example.test\r\nAuthorization: Bearer wrong-token\r\n\r\n",
+        MAX_REQUEST_SIZE,
+    );
+    var request = parsed.request;
+    defer request.deinit();
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    const matched = http.location_router.matchLocation(request.uri.path, cfg.location_blocks).?;
+
+    const status = (try enforceLocationAuth(allocator, &output.writer, &cfg, &state, &ctx, &request, matched, "req-auth", false, "127.0.0.1")).?;
+
+    try std.testing.expectEqual(@as(u16, 403), status);
+    try std.testing.expectEqual(@as(u64, 1), state.metrics.total_requests);
+    try std.testing.expectEqual(@as(u64, 1), state.metrics.status_4xx);
+    try std.testing.expectEqual(@as(u64, 1), state.metrics.err_forbidden);
+}
+
+fn executeLocationAction(
+    conn: anytype,
+    allocator: std.mem.Allocator,
+    cfg: *const edge_config.EdgeConfig,
+    state: *GatewayState,
+    ctx: *http.request_context.RequestContext,
+    request: *http.Request,
+    matched: http.location_router.MatchResult,
+    correlation_id: []const u8,
+    keep_alive: *bool,
+    client_ip: []const u8,
+    streaming_request_body: ?gproxy_runtime.StreamingRequestBody,
+) !?u16 {
+    const writer = conn.writer();
+    switch (matched.block.action) {
+        .proxy_pass => |target| {
+            return try handleLocationProxyPass(
+                allocator,
+                conn,
+                writer,
+                cfg,
+                state,
+                ctx,
+                request,
+                target,
+                proxySuffixPathForLocation(request.uri.path, matched, cfg.location_blocks),
+                correlation_id,
+                keep_alive.*,
+                client_ip,
+                ctx.identity,
+                ctx.user_id,
+                ctx.device_id,
+                ctx.scopes,
+                request.headers.get("host"),
+                matched.block.pattern,
+                matched.block,
+                streaming_request_body,
+            );
+        },
+        .fastcgi_pass => |upstream| {
+            return try handleFastcgiRoute(allocator, writer, cfg, upstream, request, client_ip, correlation_id, keep_alive.*, state);
+        },
+        .return_response => |ret| {
+            const result = try writeReturnResponse(
+                allocator,
+                writer,
+                state,
+                ctx,
+                request.method == .GET or request.method == .HEAD,
+                ret.status,
+                ret.body,
+                correlation_id,
+                keep_alive.*,
+            );
+            recordReturnResponseMetrics(state, result);
+            return result.status;
+        },
+        .rewrite => |rw| {
+            request.uri.path = rw.replacement;
+            return null;
+        },
+        .static_root => |root_cfg| {
+            if (try handleStaticLocation(allocator, conn, request, matched, root_cfg, correlation_id, keep_alive.*, state)) |status| {
+                return status;
+            }
+            return null;
+        },
+    }
 }
 
 pub fn primeRequestAuthContext(
@@ -1337,6 +1636,24 @@ fn handleHttp3StaticLocation(
     return true;
 }
 
+fn rejectHttp3AuthRequiredLocation(
+    allocator: std.mem.Allocator,
+    response: *http.Response,
+    ctx: *Http3DispatchContext,
+    correlation_id: []const u8,
+) !void {
+    const payload = try buildApiErrorJson(allocator, "unauthorized", "Unauthorized", correlation_id);
+    _ = response
+        .setStatus(.unauthorized)
+        .setBodyOwned(payload)
+        .setContentType("application/json")
+        .setHeader(http.correlation.HEADER_NAME, correlation_id);
+    finalizeHttp3Response(response);
+    applyResponseHeaders(ctx.state, response);
+    ctx.state.metricsRecord(401);
+    ctx.state.metricsRecordErrorCode("unauthorized");
+}
+
 fn routeHttp3Location(
     allocator: std.mem.Allocator,
     request: *const http.http3_session.StreamRequest,
@@ -1355,6 +1672,10 @@ fn routeHttp3Location(
     };
     const split = splitHttp3PathAndQuery(request.path);
     const request_query = split[1];
+    if (matched.block.auth == .required) {
+        try rejectHttp3AuthRequiredLocation(allocator, response, ctx, correlation_id);
+        return .handled;
+    }
     switch (matched.block.action) {
         .proxy_pass => |target| {
             try handleHttp3LocationProxyPass(allocator, request, response, ctx, matched, request_path, request_query, target, correlation_id);
@@ -1382,6 +1703,48 @@ fn routeHttp3Location(
         },
         .fastcgi_pass => return .not_handled,
     }
+}
+
+test "routeHttp3Location rejects auth-required locations before action execution" {
+    const allocator = std.testing.allocator;
+    var state: GatewayState = undefined;
+    initHandlerTestState(&state, allocator, &.{});
+    var blocks = [_]http.location_router.LocationBlock{.{
+        .match_type = .exact,
+        .pattern = "/private",
+        .priority = 0,
+        .action = .{ .return_response = .{ .status = 200, .body = "secret" } },
+        .auth = .required,
+    }};
+    var token_hashes = [_][]const u8{};
+    var cfg = minimalAuthConfig(blocks[0..], token_hashes[0..]);
+    var config_store: ReloadableConfigStore = undefined;
+    var dispatch_ctx = Http3DispatchContext{
+        .config_store = &config_store,
+        .cfg = &cfg,
+        .state = &state,
+    };
+    var request = http.http3_session.StreamRequest{
+        .allocator = allocator,
+        .method = try allocator.dupe(u8, "GET"),
+        .path = try allocator.dupe(u8, "/private"),
+        .authority = null,
+        .headers = http.Headers.init(allocator),
+        .body = try allocator.alloc(u8, 0),
+    };
+    defer request.deinit();
+    var response = http.Response.init(allocator);
+    defer response.deinit();
+
+    const outcome = try routeHttp3Location(allocator, &request, &response, &dispatch_ctx, "/private", "h3-auth");
+
+    try std.testing.expectEqual(std.meta.Tag(Http3LocationOutcome).handled, std.meta.activeTag(outcome));
+    try std.testing.expectEqual(@as(u16, 401), @intFromEnum(response.status));
+    try std.testing.expectEqualStrings("application/json", response.headers.get("content-type") orelse "");
+    try std.testing.expect(std.mem.indexOf(u8, response.body orelse "", "\"code\":\"unauthorized\"") != null);
+    try std.testing.expectEqual(@as(u64, 1), state.metrics.total_requests);
+    try std.testing.expectEqual(@as(u64, 1), state.metrics.status_4xx);
+    try std.testing.expectEqual(@as(u64, 1), state.metrics.err_unauthorized);
 }
 
 fn handleHttp3Connection(

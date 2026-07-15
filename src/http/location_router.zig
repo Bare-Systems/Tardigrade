@@ -75,6 +75,37 @@ pub const AuthMode = enum {
     }
 };
 
+pub const ProxyStreamingPolicy = enum {
+    inherit,
+    off,
+    response,
+    full,
+
+    pub fn parse(value: []const u8) ?ProxyStreamingPolicy {
+        if (std.ascii.eqlIgnoreCase(value, "inherit")) return .inherit;
+        if (std.ascii.eqlIgnoreCase(value, "off") or std.ascii.eqlIgnoreCase(value, "buffered")) return .off;
+        if (std.ascii.eqlIgnoreCase(value, "response") or std.ascii.eqlIgnoreCase(value, "responses")) return .response;
+        if (std.ascii.eqlIgnoreCase(value, "full") or std.ascii.eqlIgnoreCase(value, "request_response") or std.ascii.eqlIgnoreCase(value, "request-response")) return .full;
+        return null;
+    }
+
+    pub fn responseStreamingEnabled(self: ProxyStreamingPolicy, inherited_enabled: bool) bool {
+        return switch (self) {
+            .inherit => inherited_enabled,
+            .off => false,
+            .response, .full => true,
+        };
+    }
+
+    pub fn requestStreamingEnabled(self: ProxyStreamingPolicy, inherited_enabled: bool) bool {
+        return switch (self) {
+            .inherit => inherited_enabled,
+            .off, .response => false,
+            .full => true,
+        };
+    }
+};
+
 pub const LocationBlock = struct {
     match_type: MatchType,
     pattern: []const u8,
@@ -82,6 +113,7 @@ pub const LocationBlock = struct {
     action: Action,
     error_pages: []ErrorPageRule = &.{},
     auth: AuthMode = .off,
+    proxy_streaming_policy: ProxyStreamingPolicy = .inherit,
 
     pub fn deinit(self: *LocationBlock, allocator: std.mem.Allocator) void {
         allocator.free(self.pattern);

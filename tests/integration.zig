@@ -3350,6 +3350,101 @@ test "proxy streaming mode relays upstream body beyond buffered cap" {
     try std.testing.expectEqual(@as(u64, 0), buffered);
 }
 
+test "proxy route streaming policy overrides global mode" {
+    const allocator = std.testing.allocator;
+    const payload_len = 256 * 1024;
+    const payload = try allocator.alloc(u8, payload_len);
+    defer allocator.free(payload);
+    @memset(payload, 'x');
+
+    var streaming_upstream = try UpstreamServer.start(allocator, &.{.{
+        .body = payload,
+        .headers = &.{.{ .name = "Content-Type", .value = "application/octet-stream" }},
+    }});
+    defer streaming_upstream.stop();
+    try streaming_upstream.run();
+
+    const streaming_config = try std.fmt.allocPrint(allocator,
+        \\location /stream/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\    proxy_streaming response;
+        \\}}
+    , .{ test_host, streaming_upstream.port() });
+    defer allocator.free(streaming_config);
+
+    var streaming_tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = streaming_config,
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_PROXY_STREAMING_MODE", .value = "off" },
+            .{ .name = "TARDIGRADE_PROXY_STREAM_BUFFER_SIZE", .value = "4096" },
+            .{ .name = "TARDIGRADE_MAX_BUFFERED_UPSTREAM_RESPONSE_BYTES", .value = "65536" },
+        },
+    });
+    defer streaming_tardigrade.stop();
+
+    var streamed_response = try sendRequest(allocator, streaming_tardigrade.port, .{
+        .method = "GET",
+        .path = "/stream/large.bin",
+        .body = null,
+        .headers = &.{},
+    });
+    defer streamed_response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), streamed_response.status_code);
+    try std.testing.expectEqual(@as(usize, payload_len), streamed_response.body.len);
+
+    var streaming_metrics = try sendRequest(allocator, streaming_tardigrade.port, .{
+        .method = "GET",
+        .path = "/status/metrics",
+        .body = null,
+        .headers = &.{},
+    });
+    defer streaming_metrics.deinit();
+    const streamed = prometheusMetricValue(streaming_metrics.body, "tardigrade_proxy_streaming_requests_total") orelse return error.InvalidHttpResponse;
+    try std.testing.expect(streamed >= 1);
+
+    var buffered_upstream = try UpstreamServer.start(allocator, &.{.{
+        .body = "small buffered response",
+        .headers = &.{.{ .name = "Content-Type", .value = "text/plain" }},
+    }});
+    defer buffered_upstream.stop();
+    try buffered_upstream.run();
+
+    const buffered_config = try std.fmt.allocPrint(allocator,
+        \\location /compat/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\    proxy_streaming off;
+        \\}}
+    , .{ test_host, buffered_upstream.port() });
+    defer allocator.free(buffered_config);
+
+    var buffered_tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = buffered_config,
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_PROXY_STREAMING_MODE", .value = "response" },
+        },
+    });
+    defer buffered_tardigrade.stop();
+
+    var buffered_response = try sendRequest(allocator, buffered_tardigrade.port, .{
+        .method = "GET",
+        .path = "/compat/small.txt",
+        .body = null,
+        .headers = &.{},
+    });
+    defer buffered_response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), buffered_response.status_code);
+    try std.testing.expectEqualStrings("small buffered response", buffered_response.body);
+
+    var buffered_metrics = try sendRequest(allocator, buffered_tardigrade.port, .{
+        .method = "GET",
+        .path = "/status/metrics",
+        .body = null,
+        .headers = &.{},
+    });
+    defer buffered_metrics.deinit();
+    try std.testing.expect(std.mem.find(u8, buffered_metrics.body, "tardigrade_proxy_streaming_fallback_total{reason=\"policy_disabled\"} 1") != null);
+}
+
 test "proxy streaming mode handles chunked and no-body upstream responses" {
     const allocator = std.testing.allocator;
 

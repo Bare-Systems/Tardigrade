@@ -1430,6 +1430,12 @@ pub const GatewayState = struct {
         self.metrics.recordProxyUpstreamAbort();
     }
 
+    pub fn metricsRecordProxyStreamingFallback(self: *GatewayState, reason: []const u8) void {
+        self.metrics_mutex.lock();
+        defer self.metrics_mutex.unlock();
+        self.metrics.recordProxyStreamingFallback(reason);
+    }
+
     pub fn metricsSetWorkerPoolStats(self: *GatewayState, active_jobs: usize, queued_jobs: usize, worker_threads: usize, queue_capacity: usize) void {
         self.metrics_mutex.lock();
         defer self.metrics_mutex.unlock();

@@ -80,6 +80,7 @@ const LocationBlockBuilder = struct {
     rewrite_replacement: ?[]u8 = null,
     rewrite_flag: ?[]u8 = null,
     auth: ?[]u8 = null,
+    proxy_streaming: ?[]u8 = null,
     error_pages: std.ArrayList(ErrorPageBuilder) = .empty,
 
     fn actionKind(self: *const LocationBlockBuilder) ?[]const u8 {
@@ -108,6 +109,7 @@ const LocationBlockBuilder = struct {
         if (self.rewrite_replacement) |value| allocator.free(value);
         if (self.rewrite_flag) |value| allocator.free(value);
         if (self.auth) |value| allocator.free(value);
+        if (self.proxy_streaming) |value| allocator.free(value);
         for (self.error_pages.items) |entry| {
             allocator.free(entry.status_codes_csv);
             allocator.free(entry.target);
@@ -781,6 +783,25 @@ fn parseLocationStatement(
         try replaceOptionalOwned(allocator, &builder.auth, value_interp);
         return;
     }
+    if (std.ascii.eqlIgnoreCase(directive, "proxy_streaming") or std.ascii.eqlIgnoreCase(directive, "proxy_streaming_mode")) {
+        if (!isLocationProxyStreamingPolicy(value_interp)) {
+            std.log.err("config syntax error at {s}:{d}: proxy_streaming must be one of inherit, off, response, full", .{ file_path, line_no });
+            return error.InvalidConfigSyntax;
+        }
+        try replaceOptionalOwned(allocator, &builder.proxy_streaming, value_interp);
+        return;
+    }
+}
+
+fn isLocationProxyStreamingPolicy(value: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(value, "inherit") or
+        std.ascii.eqlIgnoreCase(value, "off") or
+        std.ascii.eqlIgnoreCase(value, "buffered") or
+        std.ascii.eqlIgnoreCase(value, "response") or
+        std.ascii.eqlIgnoreCase(value, "responses") or
+        std.ascii.eqlIgnoreCase(value, "full") or
+        std.ascii.eqlIgnoreCase(value, "request_response") or
+        std.ascii.eqlIgnoreCase(value, "request-response");
 }
 
 fn ensureLocationActionAllowed(
@@ -842,6 +863,13 @@ fn buildLocationBlockEntry(allocator: std.mem.Allocator, builder: *LocationBlock
             const with_auth = try std.fmt.allocPrint(allocator, "{s}|auth:{s}", .{ entry, auth_mode });
             allocator.free(entry);
             entry = with_auth;
+        }
+    }
+    if (builder.proxy_streaming) |mode| {
+        if (!std.ascii.eqlIgnoreCase(mode, "inherit")) {
+            const with_stream_policy = try std.fmt.allocPrint(allocator, "{s}|stream:{s}", .{ entry, mode });
+            allocator.free(entry);
+            entry = with_stream_policy;
         }
     }
     return entry;
@@ -1224,6 +1252,47 @@ test "location blocks accumulate into location block env" {
 
     try std.testing.expectEqualStrings(
         "exact|/health|return|200|ok;prefix_priority|/api/private/|proxy_pass|http://127.0.0.1:9001;regex_case_insensitive|^/assets/.*$|static_root|/srv/www|off|off|index.html|$uri /index.html",
+        overrides.map.get("TARDIGRADE_LOCATION_BLOCKS").?,
+    );
+}
+
+test "location block serializes proxy streaming policy" {
+    const allocator = std.testing.allocator;
+    var cfg_dir = std.testing.tmpDir(.{});
+    defer cfg_dir.cleanup();
+
+    try compat.wrapDir(cfg_dir.dir).writeFile(.{
+        .sub_path = "location-streaming.conf",
+        .data =
+        \\location /bulk/ {
+        \\    proxy_pass http://127.0.0.1:9001;
+        \\    proxy_streaming full;
+        \\}
+        \\location /compat/ {
+        \\    proxy_pass http://127.0.0.1:9002;
+        \\    proxy_streaming_mode off;
+        \\}
+        ,
+    });
+
+    const absolute = try compat.wrapDir(cfg_dir.dir).realpathAlloc(allocator, "location-streaming.conf");
+    defer allocator.free(absolute);
+
+    var overrides = Overrides.init(allocator);
+    defer overrides.deinit(allocator);
+    var vars = std.StringHashMap([]const u8).init(allocator);
+    defer vars.deinit();
+    var visited = std.StringHashMap(void).init(allocator);
+    defer {
+        var it = visited.iterator();
+        while (it.next()) |entry| allocator.free(entry.key_ptr.*);
+        visited.deinit();
+    }
+
+    try parseFile(allocator, absolute, &overrides, &vars, &visited);
+
+    try std.testing.expectEqualStrings(
+        "prefix|/bulk/|proxy_pass|http://127.0.0.1:9001|stream:full;prefix|/compat/|proxy_pass|http://127.0.0.1:9002|stream:off",
         overrides.map.get("TARDIGRADE_LOCATION_BLOCKS").?,
     );
 }

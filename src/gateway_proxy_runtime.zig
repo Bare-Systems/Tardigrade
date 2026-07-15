@@ -35,6 +35,37 @@ const writeBufferedUpstreamResponse = gp.writeBufferedUpstreamResponse;
 
 pub const StreamingRequestBody = gp.StreamingRequestBody;
 
+pub const StreamingFallbackReason = enum {
+    policy_disabled,
+    retries_configured,
+    unix_socket_target,
+    upstream_mtls_target,
+    chunked_request_upload,
+    missing_content_length,
+    body_too_large,
+    body_dependent_middleware,
+    unsupported_route_type,
+
+    pub fn metricLabel(self: StreamingFallbackReason) []const u8 {
+        return switch (self) {
+            .policy_disabled => "policy_disabled",
+            .retries_configured => "retries_configured",
+            .unix_socket_target => "unix_socket_target",
+            .upstream_mtls_target => "upstream_mtls_target",
+            .chunked_request_upload => "chunked_request_upload",
+            .missing_content_length => "missing_content_length",
+            .body_too_large => "body_too_large",
+            .body_dependent_middleware => "body_dependent_middleware",
+            .unsupported_route_type => "unsupported_route_type",
+        };
+    }
+};
+
+const StreamingEligibility = union(enum) {
+    stream,
+    fallback: StreamingFallbackReason,
+};
+
 pub const DataPlaneProxyResponse = union(enum) {
     bounded_buffered: BufferedUpstreamResponse,
 
@@ -147,17 +178,25 @@ pub fn executeBufferedDataPlaneProxyRequest(
     ) };
 }
 
-fn canStreamDataPlaneProxyRequest(
+fn routeResponseStreamingEnabled(
     cfg: *const edge_config.EdgeConfig,
+    block: *const edge_config.EdgeConfig.LocationBlock,
+) bool {
+    return block.proxy_streaming_policy.responseStreamingEnabled(cfg.proxy_streaming_mode.responseStreamingEnabled());
+}
+
+fn streamingEligibilityForDataPlaneProxyRequest(
+    cfg: *const edge_config.EdgeConfig,
+    block: *const edge_config.EdgeConfig.LocationBlock,
     resolved: *const gp.ResolvedProxyTarget,
     url: []const u8,
     max_attempts: usize,
-) bool {
-    if (!cfg.proxy_streaming_mode.responseStreamingEnabled()) return false;
-    if (max_attempts != 1) return false;
-    if (resolved.unix_socket_path != null) return false;
-    if (cfg.upstream_tls_client_cert.len > 0 and std.mem.startsWith(u8, url, "https://")) return false;
-    return true;
+) StreamingEligibility {
+    if (!routeResponseStreamingEnabled(cfg, block)) return .{ .fallback = .policy_disabled };
+    if (max_attempts != 1) return .{ .fallback = .retries_configured };
+    if (resolved.unix_socket_path != null) return .{ .fallback = .unix_socket_target };
+    if (cfg.upstream_tls_client_cert.len > 0 and std.mem.startsWith(u8, url, "https://")) return .{ .fallback = .upstream_mtls_target };
+    return .stream;
 }
 
 pub fn dataPlaneBufferedCompatibilityResponseLimit(cfg: *const edge_config.EdgeConfig) usize {
@@ -436,6 +475,7 @@ pub fn handleLocationProxyPass(
     auth_scopes: ?[]const u8,
     incoming_host: ?[]const u8,
     location_id: []const u8,
+    matched_block: *const edge_config.EdgeConfig.LocationBlock,
     streaming_request_body: ?StreamingRequestBody,
 ) !u16 {
     const upstream_scope = .global;
@@ -479,99 +519,104 @@ pub fn handleLocationProxyPass(
     const max_attempts = proxyRetryAttemptLimit(cfg.upstream_retry_attempts, cfg.upstream_retry_idempotent_only, method_str);
     const budget_start_ms = http.event_loop.monotonicMs();
 
-    if (canStreamDataPlaneProxyRequest(cfg, &resolved, upstream_url.value, max_attempts)) {
-        state.recordUpstreamAttemptStart(selection.base_url);
-        const streamed = executeStreamingHttpProxyRequest(
-            allocator,
-            cfg,
-            upstream_url.value,
-            method_str,
-            &request.headers,
-            body,
-            streaming_request_body,
-            downstream_conn,
-            writer,
-            correlation_id,
-            client_ip,
-            forwarded_proto,
-            request.headers.get("host"),
-            auth_identity,
-            auth_user_id,
-            auth_device_id,
-            auth_scopes,
-            &state.security_headers,
-            sticky_set_cookie,
-            if (ctx.lifecycle) |lc| &lc.token else null,
-            &state.upstream_pool,
-            &state.h2_pool,
-        ) catch |err| {
-            state.recordUpstreamAttemptEnd(selection.base_url);
-            if (err == error.ClientAborted) {
-                state.metricsRecordProxyClientAbort();
-                return err;
-            }
-            if (err == error.UpstreamAtCapacity) {
-                // Fail-fast at the per-origin active cap (#239): a local
-                // saturation rejection, not an origin failure — do not count
-                // it against upstream health / circuit-breaker state.
-                try sendApiError(allocator, writer, .service_unavailable, "upstream_saturated", "Upstream connection limit reached", correlation_id, false, state);
-                ctx.setUpstreamResult(resolved.upstream_host, @intFromEnum(http.Status.service_unavailable), 0);
-                return @intFromEnum(http.Status.service_unavailable);
-            }
-            state.recordUpstreamFailure(cfg, selection.base_url);
-            if (err == error.RequestCancelled) {
-                if (ctx.lifecycle) |lc| lc.logTimeout("upstream_connect");
-                try sendApiError(allocator, writer, .gateway_timeout, "upstream_timeout", "Upstream request timed out", correlation_id, false, state);
-                ctx.setUpstreamResult(resolved.upstream_host, @intFromEnum(http.Status.gateway_timeout), 0);
-                return @intFromEnum(http.Status.gateway_timeout);
-            }
-            if (err == error.OutOfMemory) return error.OutOfMemory;
-            const err_status: http.Status = switch (err) {
-                error.Timeout, error.WouldBlock => .gateway_timeout,
-                else => .bad_gateway,
-            };
-            const err_code = if (err_status == .gateway_timeout) "upstream_timeout" else "upstream_error";
-            const err_msg = if (err_status == .gateway_timeout) "Upstream request timed out" else "Upstream connection failed";
-            state.logger.warn(correlation_id, "streaming upstream request failed: {}", .{err});
-            try sendApiError(allocator, writer, err_status, err_code, err_msg, correlation_id, false, state);
-            ctx.setUpstreamResult(resolved.upstream_host, @intFromEnum(err_status), 0);
-            return @intFromEnum(err_status);
-        };
-        state.recordUpstreamAttemptEnd(selection.base_url);
-
-        const transcript_redactions: []const []const u8 = if (request.headers.get("authorization")) |raw_auth|
-            if (http.auth.parseBearerToken(raw_auth)) |token| &.{token} else &.{}
-        else
-            &.{};
-        state.appendTranscript(
-            upstreamScopeName(proxyScopeForPath(request.uri.path)),
-            request.uri.path,
-            correlation_id,
-            auth_identity,
-            client_ip,
-            upstream_url.value,
-            if (streaming_request_body == null) body else "",
-            streamed.status_code,
-            "application/octet-stream",
-            "",
-            transcript_redactions,
-        );
-        if (!isAbsoluteHttpUrl(std.mem.trim(u8, target, " \t\r\n"))) {
-            if (streamed.status_code >= 500 or streamed.upstream_aborted) {
+    const fallback_reason: StreamingFallbackReason = switch (streamingEligibilityForDataPlaneProxyRequest(cfg, matched_block, &resolved, upstream_url.value, max_attempts)) {
+        .stream => {
+            state.recordUpstreamAttemptStart(selection.base_url);
+            const streamed = executeStreamingHttpProxyRequest(
+                allocator,
+                cfg,
+                upstream_url.value,
+                method_str,
+                &request.headers,
+                body,
+                streaming_request_body,
+                downstream_conn,
+                writer,
+                correlation_id,
+                client_ip,
+                forwarded_proto,
+                request.headers.get("host"),
+                auth_identity,
+                auth_user_id,
+                auth_device_id,
+                auth_scopes,
+                &state.security_headers,
+                sticky_set_cookie,
+                if (ctx.lifecycle) |lc| &lc.token else null,
+                &state.upstream_pool,
+                &state.h2_pool,
+            ) catch |err| {
+                state.recordUpstreamAttemptEnd(selection.base_url);
+                if (err == error.ClientAborted) {
+                    state.metricsRecordProxyClientAbort();
+                    return err;
+                }
+                if (err == error.UpstreamAtCapacity) {
+                    // Fail-fast at the per-origin active cap (#239): a local
+                    // saturation rejection, not an origin failure — do not count
+                    // it against upstream health / circuit-breaker state.
+                    try sendApiError(allocator, writer, .service_unavailable, "upstream_saturated", "Upstream connection limit reached", correlation_id, false, state);
+                    ctx.setUpstreamResult(resolved.upstream_host, @intFromEnum(http.Status.service_unavailable), 0);
+                    return @intFromEnum(http.Status.service_unavailable);
+                }
                 state.recordUpstreamFailure(cfg, selection.base_url);
-            } else {
-                state.recordUpstreamSuccess(cfg, selection.base_url);
+                if (err == error.RequestCancelled) {
+                    if (ctx.lifecycle) |lc| lc.logTimeout("upstream_connect");
+                    try sendApiError(allocator, writer, .gateway_timeout, "upstream_timeout", "Upstream request timed out", correlation_id, false, state);
+                    ctx.setUpstreamResult(resolved.upstream_host, @intFromEnum(http.Status.gateway_timeout), 0);
+                    return @intFromEnum(http.Status.gateway_timeout);
+                }
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                const err_status: http.Status = switch (err) {
+                    error.Timeout, error.WouldBlock => .gateway_timeout,
+                    else => .bad_gateway,
+                };
+                const err_code = if (err_status == .gateway_timeout) "upstream_timeout" else "upstream_error";
+                const err_msg = if (err_status == .gateway_timeout) "Upstream request timed out" else "Upstream connection failed";
+                state.logger.warn(correlation_id, "streaming upstream request failed: {}", .{err});
+                try sendApiError(allocator, writer, err_status, err_code, err_msg, correlation_id, false, state);
+                ctx.setUpstreamResult(resolved.upstream_host, @intFromEnum(err_status), 0);
+                return @intFromEnum(err_status);
+            };
+            state.recordUpstreamAttemptEnd(selection.base_url);
+
+            const transcript_redactions: []const []const u8 = if (request.headers.get("authorization")) |raw_auth|
+                if (http.auth.parseBearerToken(raw_auth)) |token| &.{token} else &.{}
+            else
+                &.{};
+            state.appendTranscript(
+                upstreamScopeName(proxyScopeForPath(request.uri.path)),
+                request.uri.path,
+                correlation_id,
+                auth_identity,
+                client_ip,
+                upstream_url.value,
+                if (streaming_request_body == null) body else "",
+                streamed.status_code,
+                "application/octet-stream",
+                "",
+                transcript_redactions,
+            );
+            if (!isAbsoluteHttpUrl(std.mem.trim(u8, target, " \t\r\n"))) {
+                if (streamed.status_code >= 500 or streamed.upstream_aborted) {
+                    state.recordUpstreamFailure(cfg, selection.base_url);
+                } else {
+                    state.recordUpstreamSuccess(cfg, selection.base_url);
+                }
             }
-        }
-        if (streamed.upstream_aborted) state.metricsRecordProxyUpstreamAbort();
-        state.metricsRecordProxyStreamingRequest(streamed.upstream_ttfb_ms);
-        ctx.setUpstreamResult(resolved.upstream_host, streamed.status_code, streamed.response_body_bytes);
-        state.metricsRecord(streamed.status_code);
-        return streamed.status_code;
-    }
+            if (streamed.upstream_aborted) state.metricsRecordProxyUpstreamAbort();
+            state.metricsRecordProxyStreamingRequest(streamed.upstream_ttfb_ms);
+            ctx.setUpstreamResult(resolved.upstream_host, streamed.status_code, streamed.response_body_bytes);
+            state.metricsRecord(streamed.status_code);
+            return streamed.status_code;
+        },
+        .fallback => |reason| reason,
+    };
+    state.metricsRecordProxyStreamingFallback(fallback_reason.metricLabel());
+    state.logger.debug(correlation_id, "proxy streaming fallback: {s}", .{fallback_reason.metricLabel()});
 
     if (streaming_request_body != null) {
-        state.logger.warn(correlation_id, "streaming upload could not use streaming proxy path after routing", .{});
+        state.logger.warn(correlation_id, "streaming upload could not use streaming proxy path after routing: {s}", .{fallback_reason.metricLabel()});
         try sendApiError(allocator, writer, .bad_gateway, "upstream_error", "Streaming upload could not be proxied", correlation_id, false, state);
         ctx.setUpstreamResult(resolved.upstream_host, @intFromEnum(http.Status.bad_gateway), 0);
         return @intFromEnum(http.Status.bad_gateway);
@@ -808,6 +853,60 @@ test "data-plane buffered compatibility response limit uses dedicated upstream c
 
     cfg.max_buffered_upstream_response_bytes = 768 * 1024;
     try std.testing.expectEqual(@as(usize, 768 * 1024), dataPlaneBufferedCompatibilityResponseLimit(&cfg));
+}
+
+test "streaming eligibility returns typed fallback reasons" {
+    var cfg: edge_config.EdgeConfig = undefined;
+    cfg.proxy_streaming_mode = .response;
+    cfg.upstream_tls_client_cert = "";
+
+    const block = edge_config.EdgeConfig.LocationBlock{
+        .match_type = .prefix,
+        .pattern = "/",
+        .priority = 0,
+        .action = .{ .proxy_pass = "http://127.0.0.1:9001" },
+        .proxy_streaming_policy = .inherit,
+    };
+    const url: []const u8 = "http://127.0.0.1:9001/";
+    const resolved = gp.ResolvedProxyTarget{
+        .url = @constCast(url),
+        .upstream_host = "127.0.0.1:9001",
+    };
+
+    try std.testing.expectEqual(StreamingEligibility.stream, streamingEligibilityForDataPlaneProxyRequest(&cfg, &block, &resolved, url, 1));
+
+    var off_block = block;
+    off_block.proxy_streaming_policy = .off;
+    try std.testing.expectEqual(StreamingEligibility{ .fallback = .policy_disabled }, streamingEligibilityForDataPlaneProxyRequest(&cfg, &off_block, &resolved, url, 1));
+    try std.testing.expectEqual(StreamingEligibility{ .fallback = .retries_configured }, streamingEligibilityForDataPlaneProxyRequest(&cfg, &block, &resolved, url, 2));
+
+    var unix_resolved = resolved;
+    unix_resolved.unix_socket_path = "/tmp/upstream.sock";
+    try std.testing.expectEqual(StreamingEligibility{ .fallback = .unix_socket_target }, streamingEligibilityForDataPlaneProxyRequest(&cfg, &block, &unix_resolved, url, 1));
+
+    cfg.upstream_tls_client_cert = "/cert.pem";
+    try std.testing.expectEqual(StreamingEligibility{ .fallback = .upstream_mtls_target }, streamingEligibilityForDataPlaneProxyRequest(&cfg, &block, &resolved, "https://127.0.0.1:9001/", 1));
+}
+
+test "route streaming policy can override global mode" {
+    var cfg: edge_config.EdgeConfig = undefined;
+    cfg.proxy_streaming_mode = .off;
+    cfg.upstream_tls_client_cert = "";
+
+    const block = edge_config.EdgeConfig.LocationBlock{
+        .match_type = .prefix,
+        .pattern = "/bulk/",
+        .priority = 0,
+        .action = .{ .proxy_pass = "http://127.0.0.1:9001" },
+        .proxy_streaming_policy = .response,
+    };
+    const url: []const u8 = "http://127.0.0.1:9001/";
+    const resolved = gp.ResolvedProxyTarget{
+        .url = @constCast(url),
+        .upstream_host = "127.0.0.1:9001",
+    };
+
+    try std.testing.expectEqual(StreamingEligibility.stream, streamingEligibilityForDataPlaneProxyRequest(&cfg, &block, &resolved, url, 1));
 }
 
 test "proxySuffixPathForLocation uses mount prefix for split upstream exact route" {

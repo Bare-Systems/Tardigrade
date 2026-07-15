@@ -769,8 +769,9 @@ pub fn H2Conn(comptime Transport: type) type {
             const status = stream.status;
             self.state_mutex.unlock();
 
+            if (status != null) return;
             if (stream_err) |e| return e;
-            if (status == null) return error.Http2MissingStatus;
+            return error.Http2MissingStatus;
         }
 
         /// Send one chunk of a streaming request body. `end_stream` marks the

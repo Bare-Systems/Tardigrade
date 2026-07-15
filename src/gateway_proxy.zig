@@ -771,7 +771,11 @@ fn streamViaH2Pool(
                     var sent: usize = @min(sb.initial_bytes.len, sb.content_length);
                     if (sent > 0) {
                         var initial_reservation = ProxyBufferReservation.init(.downstream_to_upstream, proxy_buffer_limits, proxy_buffer_observer);
-                        try initial_reservation.reserve(sent);
+                        initial_reservation.reserve(sent) catch |err| {
+                            conn.finishStreaming(stream);
+                            h2_pool.release(conn);
+                            return err;
+                        };
                         conn.writeStreamingRequestBody(stream, sb.initial_bytes[0..sent], sent == sb.content_length) catch |err| {
                             initial_reservation.releaseAll();
                             conn.finishStreaming(stream);
@@ -799,7 +803,11 @@ fn streamViaH2Pool(
                             return error.ClientAborted;
                         }
                         var upload_reservation = ProxyBufferReservation.init(.downstream_to_upstream, proxy_buffer_limits, proxy_buffer_observer);
-                        try upload_reservation.reserve(n);
+                        upload_reservation.reserve(n) catch |err| {
+                            conn.finishStreaming(stream);
+                            h2_pool.release(conn);
+                            return err;
+                        };
                         conn.writeStreamingRequestBody(stream, read_buf[0..n], sent + n == sb.content_length) catch |err| {
                             upload_reservation.releaseAll();
                             conn.finishStreaming(stream);
@@ -1682,9 +1690,16 @@ fn sendStreamingProxyRequest(
         var relay: [16 * 1024]u8 = undefined;
         var upload_reservation = ProxyBufferReservation.init(.downstream_to_upstream, proxy_buffer_limits, proxy_buffer_observer);
         var sent: usize = @min(sb.initial_bytes.len, sb.content_length);
-        try upload_reservation.reserve(@max(relay.len, sent));
+        try upload_reservation.reserve(relay.len);
         defer upload_reservation.releaseAll();
-        if (sent > 0) try transport.writeAll(sb.initial_bytes[0..sent]);
+        if (sent > 0) {
+            try upload_reservation.reserve(sent);
+            transport.writeAll(sb.initial_bytes[0..sent]) catch |err| {
+                upload_reservation.release(sent);
+                return err;
+            };
+            upload_reservation.release(sent);
+        }
         while (sent < sb.content_length) {
             if (cancelStopped(cancel_token)) return error.RequestCancelled;
             const want = @min(relay.len, sb.content_length - sent);

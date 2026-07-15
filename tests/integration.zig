@@ -3640,8 +3640,8 @@ test "proxy full streaming mode relays fixed-length upload beyond request buffer
         });
         defer active_metrics.deinit();
         saw_active_upload =
-            std.mem.find(u8, active_metrics.body, "tardigrade_buffered_bytes_current{direction=\"downstream_to_upstream\",scope=\"stream\"} 32768") != null and
-            std.mem.find(u8, active_metrics.body, "tardigrade_buffered_bytes_current{direction=\"downstream_to_upstream\",scope=\"global\"} 32768") != null and
+            std.mem.find(u8, active_metrics.body, "tardigrade_buffered_bytes_current{direction=\"downstream_to_upstream\",scope=\"stream\"} 16384") != null and
+            std.mem.find(u8, active_metrics.body, "tardigrade_buffered_bytes_current{direction=\"downstream_to_upstream\",scope=\"global\"} 16384") != null and
             std.mem.find(u8, active_metrics.body, "tardigrade_buffered_bytes_current{direction=\"upstream_to_downstream\",scope=\"stream\"} 0") != null;
         if (!saw_active_upload) compat.sleepNs(25 * std.time.ns_per_ms);
     }

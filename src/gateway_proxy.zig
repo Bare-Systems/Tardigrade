@@ -770,12 +770,16 @@ fn streamViaH2Pool(
                 if (streaming_body) |sb| {
                     var sent: usize = @min(sb.initial_bytes.len, sb.content_length);
                     if (sent > 0) {
+                        var initial_reservation = ProxyBufferReservation.init(.downstream_to_upstream, proxy_buffer_limits, proxy_buffer_observer);
+                        try initial_reservation.reserve(sent);
                         conn.writeStreamingRequestBody(stream, sb.initial_bytes[0..sent], sent == sb.content_length) catch |err| {
+                            initial_reservation.releaseAll();
                             conn.finishStreaming(stream);
                             if (!conn.healthy()) h2_pool.evict(key, conn);
                             h2_pool.release(conn);
                             return err;
                         };
+                        initial_reservation.releaseAll();
                     }
                     while (sent < sb.content_length) {
                         if (cancelStopped(cancel_token)) {
@@ -869,6 +873,7 @@ fn streamViaH2Pool(
                             h2_pool.release(conn);
                             return error.ClientAborted;
                         };
+                        conn.acknowledgeStreamingBody(stream, n);
                         body_bytes += n;
                     }
                     if (!aborted) {
@@ -1676,9 +1681,9 @@ fn sendStreamingProxyRequest(
     if (streaming_body) |sb| {
         var relay: [16 * 1024]u8 = undefined;
         var upload_reservation = ProxyBufferReservation.init(.downstream_to_upstream, proxy_buffer_limits, proxy_buffer_observer);
-        try upload_reservation.reserve(relay.len);
-        defer upload_reservation.releaseAll();
         var sent: usize = @min(sb.initial_bytes.len, sb.content_length);
+        try upload_reservation.reserve(@max(relay.len, sent));
+        defer upload_reservation.releaseAll();
         if (sent > 0) try transport.writeAll(sb.initial_bytes[0..sent]);
         while (sent < sb.content_length) {
             if (cancelStopped(cancel_token)) return error.RequestCancelled;
@@ -1745,6 +1750,12 @@ fn streamProxyOverTransport(
 
     const reason = gpres.upstreamReasonPhrase(@enumFromInt(head.status_code));
     const body_allowed = gpres.responseBodyAllowed(method, head.status_code);
+    var response_reservation: ?ProxyBufferReservation = null;
+    if (body_allowed) {
+        response_reservation = ProxyBufferReservation.init(.upstream_to_downstream, proxy_buffer_limits, proxy_buffer_observer);
+        try response_reservation.?.reserve(read_buf.len);
+    }
+    defer if (response_reservation) |*reservation| reservation.releaseAll();
 
     gpres.writeStreamedUpstreamResponseHeadFromHeaders(
         downstream_writer,
@@ -1762,9 +1773,6 @@ fn streamProxyOverTransport(
     var aborted = false;
     var reusable = head.http_1_1 and !head.connection_close;
     if (body_allowed) {
-        var response_reservation = ProxyBufferReservation.init(.upstream_to_downstream, proxy_buffer_limits, proxy_buffer_observer);
-        try response_reservation.reserve(read_buf.len);
-        defer response_reservation.releaseAll();
         const outcome = try relayUpstreamBody(&rb, transport, fd, read_deadline_ms, head.framing, downstream_writer, cancel_token);
         body_bytes = outcome.body_bytes;
         aborted = outcome.aborted;

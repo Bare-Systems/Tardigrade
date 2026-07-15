@@ -3609,7 +3609,7 @@ test "proxy full streaming mode relays fixed-length upload beyond request buffer
             .{ .name = "TARDIGRADE_PROXY_STREAM_BUFFER_SIZE", .value = "4096" },
             .{ .name = "TARDIGRADE_PROXY_BUFFER_PER_STREAM_LOW_WATERMARK_BYTES", .value = "1024" },
             .{ .name = "TARDIGRADE_PROXY_BUFFER_PER_STREAM_HIGH_WATERMARK_BYTES", .value = "2048" },
-            .{ .name = "TARDIGRADE_PROXY_BUFFER_PER_STREAM_HARD_LIMIT_BYTES", .value = "16384" },
+            .{ .name = "TARDIGRADE_PROXY_BUFFER_PER_STREAM_HARD_LIMIT_BYTES", .value = "65536" },
             .{ .name = "TARDIGRADE_MAX_BODY_SIZE", .value = "1048576" },
         },
     });
@@ -3624,7 +3624,10 @@ test "proxy full streaming mode relays fixed-length upload beyond request buffer
         .{ test_host, tardigrade.port, payload.len },
     );
     defer allocator.free(upload_head);
-    try upload_stream.writeAll(upload_head);
+    const initial_prefix_len = 32 * 1024;
+    const initial_request = try std.mem.concat(allocator, u8, &.{ upload_head, payload[0..initial_prefix_len] });
+    defer allocator.free(initial_request);
+    try upload_stream.writeAll(initial_request);
 
     var saw_active_upload = false;
     var metrics_attempt: usize = 0;
@@ -3637,14 +3640,14 @@ test "proxy full streaming mode relays fixed-length upload beyond request buffer
         });
         defer active_metrics.deinit();
         saw_active_upload =
-            std.mem.find(u8, active_metrics.body, "tardigrade_buffered_bytes_current{direction=\"downstream_to_upstream\",scope=\"stream\"} 16384") != null and
-            std.mem.find(u8, active_metrics.body, "tardigrade_buffered_bytes_current{direction=\"downstream_to_upstream\",scope=\"global\"} 16384") != null and
+            std.mem.find(u8, active_metrics.body, "tardigrade_buffered_bytes_current{direction=\"downstream_to_upstream\",scope=\"stream\"} 32768") != null and
+            std.mem.find(u8, active_metrics.body, "tardigrade_buffered_bytes_current{direction=\"downstream_to_upstream\",scope=\"global\"} 32768") != null and
             std.mem.find(u8, active_metrics.body, "tardigrade_buffered_bytes_current{direction=\"upstream_to_downstream\",scope=\"stream\"} 0") != null;
         if (!saw_active_upload) compat.sleepNs(25 * std.time.ns_per_ms);
     }
     try std.testing.expect(saw_active_upload);
 
-    try upload_stream.writeAll(payload);
+    try upload_stream.writeAll(payload[initial_prefix_len..]);
     var response = try readHttpResponse(allocator, upload_stream);
     defer response.deinit();
     try std.testing.expectEqual(@as(u16, 200), response.status_code);

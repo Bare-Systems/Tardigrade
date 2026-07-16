@@ -37,6 +37,7 @@ pub fn fromHandshakeError(err: events.HandshakeError) AlertDescription {
         error.UnexpectedHandshakeMessage => .unexpected_message,
         error.CertificateInvalid => .bad_certificate,
         error.SecretExportFailed => .internal_error,
+        error.InvalidHandshakeState => .internal_error,
         error.AlpnMismatch => .no_application_protocol,
     };
 }

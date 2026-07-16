@@ -15,6 +15,19 @@ pub const Error = error{
     MessageTooLarge,
     DuplicateExtension,
     TooManyExtensions,
+    IncompleteHandshake,
+};
+
+pub const ReadError = error{MalformedHandshake};
+pub const WriteError = error{HandshakeBufferOverflow};
+
+pub const ReassemblerError = error{
+    MalformedHandshake,
+    HandshakeBufferOverflow,
+    MessageTooLarge,
+    DuplicateExtension,
+    TooManyExtensions,
+    IncompleteHandshake,
 };
 
 pub const MessageType = enum(u8) {
@@ -50,6 +63,15 @@ pub fn decode(raw: []const u8) Error!HandshakeMessage {
     };
 }
 
+pub fn frameLength(bytes: []const u8) ReassemblerError!?usize {
+    if (bytes.len < 4) return null;
+    const body_len: usize = @intCast(std.mem.readInt(u24, bytes[1..4], .big));
+    if (body_len > max_message_len) return error.MessageTooLarge;
+    const length = 4 + body_len;
+    if (length > bytes.len) return null;
+    return length;
+}
+
 pub fn encode(kind: MessageType, body: []const u8, out: []u8) Error![]const u8 {
     if (body.len > max_message_len) return error.MessageTooLarge;
     if (out.len < 4 + body.len) return error.HandshakeBufferOverflow;
@@ -72,31 +94,31 @@ pub const Reader = struct {
         return self.bytes.len - self.offset;
     }
 
-    pub fn u8_(self: *Reader) Error!u8 {
+    pub fn u8_(self: *Reader) ReadError!u8 {
         if (self.remaining() < 1) return error.MalformedHandshake;
         defer self.offset += 1;
         return self.bytes[self.offset];
     }
 
-    pub fn u16_(self: *Reader) Error!u16 {
+    pub fn u16_(self: *Reader) ReadError!u16 {
         if (self.remaining() < 2) return error.MalformedHandshake;
         defer self.offset += 2;
         return std.mem.readInt(u16, self.bytes[self.offset..][0..2], .big);
     }
 
-    pub fn u24_(self: *Reader) Error!u24 {
+    pub fn u24_(self: *Reader) ReadError!u24 {
         if (self.remaining() < 3) return error.MalformedHandshake;
         defer self.offset += 3;
         return std.mem.readInt(u24, self.bytes[self.offset..][0..3], .big);
     }
 
-    pub fn slice(self: *Reader, len: usize) Error![]const u8 {
+    pub fn slice(self: *Reader, len: usize) ReadError![]const u8 {
         if (self.remaining() < len) return error.MalformedHandshake;
         defer self.offset += len;
         return self.bytes[self.offset..][0..len];
     }
 
-    pub fn expectEnd(self: *const Reader) Error!void {
+    pub fn expectEnd(self: *const Reader) ReadError!void {
         if (self.remaining() != 0) return error.MalformedHandshake;
     }
 };
@@ -105,23 +127,23 @@ pub const Writer = struct {
     buf: []u8,
     len: usize = 0,
 
-    pub fn u8_(self: *Writer, value: u8) Error!void {
+    pub fn u8_(self: *Writer, value: u8) WriteError!void {
         try self.bytes(&[_]u8{value});
     }
 
-    pub fn u16_(self: *Writer, value: u16) Error!void {
+    pub fn u16_(self: *Writer, value: u16) WriteError!void {
         var encoded: [2]u8 = undefined;
         std.mem.writeInt(u16, &encoded, value, .big);
         try self.bytes(&encoded);
     }
 
-    pub fn bytes(self: *Writer, data: []const u8) Error!void {
+    pub fn bytes(self: *Writer, data: []const u8) WriteError!void {
         if (data.len > self.buf.len - self.len) return error.HandshakeBufferOverflow;
         @memcpy(self.buf[self.len..][0..data.len], data);
         self.len += data.len;
     }
 
-    pub fn reserve(self: *Writer, comptime width: usize) Error!usize {
+    pub fn reserve(self: *Writer, comptime width: usize) WriteError!usize {
         const index = self.len;
         try self.bytes(&([_]u8{0} ** width));
         return index;
@@ -185,23 +207,20 @@ pub fn Reassembler(comptime capacity: usize) type {
 
         const Self = @This();
 
-        pub fn append(self: *Self, bytes: []const u8) Error!void {
+        pub fn append(self: *Self, bytes: []const u8) ReassemblerError!void {
             if (bytes.len > self.data.len - self.len) return error.HandshakeBufferOverflow;
             @memcpy(self.data[self.len..][0..bytes.len], bytes);
             self.len += bytes.len;
         }
 
-        pub fn peek(self: *Self) Error!?HandshakeMessage {
-            if (self.len < 4) return null;
-            const body_len: usize = @intCast(std.mem.readInt(u24, self.data[1..4], .big));
-            if (body_len > max_message_len) return error.MessageTooLarge;
-            const message_len = 4 + body_len;
+        pub fn peek(self: *Self) ReassemblerError!?HandshakeMessage {
+            const message_len = (try frameLength(self.data[0..self.len])) orelse return null;
             if (message_len > self.data.len) return error.HandshakeBufferOverflow;
             if (self.len < message_len) return null;
             return try decode(self.data[0..message_len]);
         }
 
-        pub fn discard(self: *Self, count: usize) Error!void {
+        pub fn discard(self: *Self, count: usize) ReassemblerError!void {
             if (count > self.len) return error.MalformedHandshake;
             std.mem.copyForwards(u8, self.data[0 .. self.len - count], self.data[count..self.len]);
             self.len -= count;

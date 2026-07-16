@@ -14,6 +14,11 @@ pub const EncryptionEpoch = enum {
 pub const SecretDirection = enum { read, write };
 pub const CertificateState = enum { not_checked, valid, invalid };
 
+pub const SecretLifecycleError = error{
+    SecretAlreadyDiscarded,
+    SecretNotInstalled,
+};
+
 /// Typed, deterministic TLS handshake failures. Transport layers translate
 /// these into their own close/error surfaces without losing the TLS reason.
 pub const HandshakeError = error{
@@ -48,6 +53,8 @@ pub const HandshakeError = error{
     CertificateInvalid,
     /// A traffic secret could not be exported or installed.
     SecretExportFailed,
+    /// A local caller attempted an invalid handshake lifecycle transition.
+    InvalidHandshakeState,
 };
 
 pub const Event = union(enum) {

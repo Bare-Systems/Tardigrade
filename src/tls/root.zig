@@ -1,6 +1,7 @@
 pub const alerts = @import("alerts.zig");
 pub const engine = @import("engine.zig");
 pub const encrypted_stream = @import("encrypted_stream.zig");
+pub const handshake = @import("handshake.zig");
 pub const state = @import("state.zig");
 pub const events = @import("events.zig");
 pub const algorithms = @import("algorithms.zig");

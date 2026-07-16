@@ -28,7 +28,7 @@ const traffic_secret_len = tls_adapter.traffic_secret_len;
 
 pub const Role = tls_core.state.Role;
 
-pub const HandshakeError = tls_core.events.HandshakeError || error{
+pub const HandshakeError = tls_core.events.HandshakeError || tls_core.messages.ReadError || tls_core.messages.WriteError || error{
     /// The generic TLS driver was called in an invalid lifecycle state.
     InvalidHandshakeState,
     /// A CRYPTO fragment arrived at a level the handshake never uses (0-RTT).
@@ -61,6 +61,7 @@ pub const CoreDriver = tls_core.engine.Driver(TransportContract);
 /// or the adapter. QUIC connection-ID binding hooks stay local to this wrapper.
 pub const TlsBackend = struct {
     transport: TlsTransportBackend,
+    deinitFn: ?*const fn (ptr: *anyopaque) void = null,
     /// Optional RFC 9000 §7.3 authentication-binding hooks. A backend that
     /// carries connection IDs in its transport parameters implements both; the
     /// in-memory test backend leaves them null.
@@ -82,6 +83,10 @@ pub const TlsBackend = struct {
     pub fn peerCidBinding(self: TlsBackend) config.CidBinding {
         if (self.peerCidBindingFn) |get| return get(self.transport.ptr);
         return .{};
+    }
+
+    pub fn deinit(self: TlsBackend) void {
+        self.transport.deinit();
     }
 };
 

@@ -8,6 +8,7 @@
 const std = @import("std");
 pub const state = @import("state.zig");
 pub const events = @import("events.zig");
+pub const handshake = @import("handshake.zig");
 pub const key_schedule = @import("key_schedule.zig");
 
 pub const EngineConfig = struct {
@@ -17,17 +18,34 @@ pub const EngineConfig = struct {
 
 pub const Engine = struct {
     config: EngineConfig,
-    handshake_state: state.HandshakeState = .idle,
+    core: handshake.Core,
+    input: handshake.Reassembler(16 * 1024),
 
     pub fn init(config: EngineConfig) Engine {
-        return .{ .config = config };
+        return .{ .config = config, .core = handshake.Core.init(config.role), .input = .{} };
     }
 
-    pub fn start(self: *Engine) void {
-        self.handshake_state = switch (self.config.role) {
-            .client => .client_hello,
-            .server => .idle,
-        };
+    pub fn start(self: *Engine) handshake.Error!void {
+        try self.core.start();
+    }
+
+    pub fn receiveHandshake(self: *Engine, raw: []const u8) handshake.Error!usize {
+        try self.input.append(raw);
+        var processed: usize = 0;
+        while (try self.input.peek()) |message| {
+            _ = try self.core.acceptReceived(message.raw);
+            try self.input.discard(message.raw.len);
+            processed += 1;
+        }
+        return processed;
+    }
+
+    pub fn handshakeState(self: *const Engine) state.HandshakeState {
+        return self.core.handshake_state;
+    }
+
+    pub fn transcriptHash(self: *const Engine) [key_schedule.hash_len]u8 {
+        return self.core.transcriptHash();
     }
 
     pub fn canUseRecordLayer(self: *const Engine) bool {
@@ -141,6 +159,7 @@ pub fn Driver(comptime Transport: type) type {
         /// discarded, whether it completed, failed, or was abandoned mid-flight.
         pub fn deinit(self: *Self) void {
             self.sink.deinit();
+            self.backend.deinit();
         }
     };
 }
@@ -148,8 +167,49 @@ pub fn Driver(comptime Transport: type) type {
 test "core engine can be instantiated for record mode without record framing" {
     var engine = Engine.init(.{ .role = .server, .transport_mode = .record });
     try std.testing.expect(engine.canUseRecordLayer());
-    engine.start();
-    try std.testing.expectEqual(state.HandshakeState.idle, engine.handshake_state);
+    try engine.start();
+    try std.testing.expectEqual(state.HandshakeState.idle, engine.handshakeState());
+}
+
+test "engine drives protocol-neutral handshake state" {
+    var engine = Engine.init(.{ .role = .server, .transport_mode = .record });
+    try engine.start();
+
+    var buffer: [32]u8 = undefined;
+    var writer = handshake.Writer{ .buf = &buffer };
+    try writer.u8_(@intFromEnum(handshake.MessageType.client_hello));
+    const length = try writer.reserve(3);
+    writer.patch(3, length);
+    _ = try engine.receiveHandshake(writer.written());
+    try std.testing.expectEqual(state.HandshakeState.server_hello, engine.handshakeState());
+    const transcript_hash = engine.transcriptHash();
+    try std.testing.expect(!std.mem.eql(u8, &transcript_hash, &([_]u8{0} ** key_schedule.hash_len)));
+}
+
+test "engine retains fragmented input and drains coalesced messages" {
+    const valid_client_hello = [_]u8{ 1, 0, 0, 0 };
+    const duplicate_client_hello = [_]u8{ 1, 0, 0, 0 };
+
+    for (0..valid_client_hello.len + 1) |split| {
+        var engine = Engine.init(.{ .role = .server, .transport_mode = .record });
+        try engine.start();
+        const first_count: usize = if (split == valid_client_hello.len) 1 else 0;
+        const second_count: usize = if (split == valid_client_hello.len) 0 else 1;
+        try std.testing.expectEqual(first_count, try engine.receiveHandshake(valid_client_hello[0..split]));
+        try std.testing.expectEqual(second_count, try engine.receiveHandshake(valid_client_hello[split..]));
+        try std.testing.expectEqual(state.HandshakeState.server_hello, engine.handshakeState());
+    }
+
+    var engine = Engine.init(.{ .role = .server, .transport_mode = .record });
+    try engine.start();
+    try std.testing.expectEqual(@as(usize, 1), try engine.receiveHandshake(&valid_client_hello));
+    try std.testing.expectError(error.UnexpectedHandshakeMessage, engine.receiveHandshake(&duplicate_client_hello));
+
+    var coalesced = Engine.init(.{ .role = .server, .transport_mode = .record });
+    try coalesced.start();
+    const complete_plus_partial = valid_client_hello ++ duplicate_client_hello[0..3].*;
+    try std.testing.expectEqual(@as(usize, 1), try coalesced.receiveHandshake(&complete_plus_partial));
+    try std.testing.expectError(error.UnexpectedHandshakeMessage, coalesced.receiveHandshake(duplicate_client_hello[3..]));
 }
 
 test "generic driver starts backend and stores emitted events" {

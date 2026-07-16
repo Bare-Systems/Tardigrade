@@ -151,9 +151,29 @@ test "protocol-neutral core reassembles messages and owns transcript updates" {
 
 test "secret lifecycle rejects use after discard" {
     var lifecycle = SecretLifecycle{};
+    try std.testing.expectError(error.SecretExportFailed, lifecycle.discard(.handshake));
     try lifecycle.install(.handshake);
     try std.testing.expect(lifecycle.isLive(.handshake));
     try lifecycle.discard(.handshake);
     try std.testing.expect(!lifecycle.isLive(.handshake));
     try std.testing.expectError(error.SecretExportFailed, lifecycle.install(.handshake));
+}
+
+test "reassembler discards complete messages and rejects out-of-range removal" {
+    var first_buf: [16]u8 = undefined;
+    var second_buf: [16]u8 = undefined;
+    const first = try messages.encode(.client_hello, "one", &first_buf);
+    const second = try messages.encode(.finished, "two", &second_buf);
+
+    var reassembler = Reassembler(64){};
+    try reassembler.append(first);
+    try reassembler.append(second);
+    const first_message = (try reassembler.next()).?;
+    try reassembler.discard(first_message.raw.len);
+    try std.testing.expectEqual(@as(usize, second.len), reassembler.len);
+    try std.testing.expectEqual(MessageType.finished, (try reassembler.next()).?.kind);
+    try reassembler.discard(second.len);
+    try std.testing.expectEqual(@as(usize, 0), reassembler.len);
+    try reassembler.discard(0);
+    try std.testing.expectError(error.MalformedHandshake, reassembler.discard(1));
 }

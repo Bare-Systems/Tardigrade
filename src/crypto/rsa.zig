@@ -103,10 +103,8 @@ fn verifyPss(em: []const u8, em_bits: usize, message: []const u8) Error!void {
     const masked_db = em[0..db_len];
     const h = em[db_len .. db_len + h_len];
     const unused_bits = 8 * em.len - em_bits;
-    const unused_shift: u3 = switch (unused_bits) {
-        0...7 => |bits| @intCast(bits),
-        else => return error.InvalidInput,
-    };
+    if (unused_bits > 7) return error.InvalidInput;
+    const unused_shift: u3 = @intCast(unused_bits);
     // This mask preserves the meaningful low bits and excludes the unused
     // high-order bits required to be zero by RFC 8017. With zero unused bits
     // it is intentionally 0xff.
@@ -160,6 +158,7 @@ pub fn verifyPssSha256(public_key_der: []const u8, message: []const u8, signatur
 }
 
 fn appendDerLength(out: []u8, index: *usize, length: usize) void {
+    if (length > 0xffff) @panic("test DER length exceeds encoder limit");
     if (length <= 0x7f) {
         out[index.*] = @intCast(length);
         index.* += 1;
@@ -168,8 +167,6 @@ fn appendDerLength(out: []u8, index: *usize, length: usize) void {
         out[index.* + 1] = @intCast(length);
         index.* += 2;
     } else {
-        // This test-only encoder emits at most a two-byte long-form length.
-        std.debug.assert(length <= 0xffff);
         out[index.*] = 0x82;
         out[index.* + 1] = @intCast(length >> 8);
         out[index.* + 2] = @intCast(length);

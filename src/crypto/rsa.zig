@@ -291,6 +291,7 @@ test "RSA public-key DER enforces exponent range and parity" {
         try std.testing.expectError(error.InvalidInput, parsePublicKey(makeTestPublicKey(&der, exponent, max_modulus_bytes, 0x80)));
     }
 
+    // 257 bytes is one byte longer than the 2048-bit modulus value.
     var large_exponent: [257]u8 = [_]u8{0} ** 257;
     large_exponent[1] = 0x80;
     var der: [600]u8 = undefined;

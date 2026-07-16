@@ -80,6 +80,7 @@ test "RSA-PSS certificate verifies with the pure-Zig provider" {
     var out_of_range = try allocator.dupe(u8, rp.cert.signature_value.data);
     defer allocator.free(out_of_range);
     try testing.expectEqual(@as(usize, 256), out_of_range.len);
+    // RSAPublicKey DER: 4-byte sequence header, 4-byte INTEGER header, and 257-byte INTEGER.
     try testing.expect(rsa_key.len >= 265);
     @memcpy(out_of_range, rsa_key[9..265]);
     var invalid = rp.cert;

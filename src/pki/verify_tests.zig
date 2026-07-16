@@ -76,14 +76,18 @@ test "RSA-PSS certificate verifies with the pure-Zig provider" {
     try testing.expectEqual(x509.SignatureAlgorithm.rsa_pss, rp.cert.signatureAlgorithm());
     try verify.verifySelfSignature(cp, &rp.cert);
 
-    const rsa_key = rp.cert.subject_public_key_info.subject_public_key.data;
     var out_of_range = try allocator.dupe(u8, rp.cert.signature_value.data);
     defer allocator.free(out_of_range);
     try testing.expectEqual(@as(usize, 256), out_of_range.len);
-    // RSAPublicKey DER: 4-byte sequence header, 4-byte INTEGER header, and 257-byte INTEGER.
-    try testing.expect(rsa_key.len >= 265);
-    // The modulus content starts at offset 9: 4 + 4 bytes of headers + 1 sign pad.
-    @memcpy(out_of_range, rsa_key[9..265]);
+    var key_reader = der.Reader.init(rp.cert.subject_public_key_info.subject_public_key.data, .{});
+    var key_sequence = try key_reader.readSequence();
+    const modulus = try key_sequence.readInteger();
+    _ = try key_sequence.readInteger();
+    try key_sequence.expectEnd();
+    try key_reader.expectEnd();
+    try testing.expectEqual(@as(usize, 257), modulus.content.len);
+    try testing.expectEqual(@as(u8, 0), modulus.content[0]);
+    @memcpy(out_of_range, modulus.content[1..]);
     var invalid = rp.cert;
     invalid.signature_value = .{ .unused_bits = 0, .data = out_of_range };
     try testing.expectError(error.InvalidSignature, verify.verifySelfSignature(cp, &invalid));

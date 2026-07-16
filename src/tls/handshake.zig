@@ -19,6 +19,7 @@ pub const Writer = messages.Writer;
 pub const ExtensionIterator = messages.ExtensionIterator;
 pub const ExtensionGuard = messages.ExtensionGuard;
 pub const Reassembler = messages.Reassembler;
+pub const frameLength = messages.frameLength;
 const epoch_count = @typeInfo(events.EncryptionEpoch).@"enum".fields.len;
 
 pub const SecretLifecycle = struct {

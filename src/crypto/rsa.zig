@@ -5,6 +5,7 @@ const crypto = std.crypto;
 const ff = crypto.ff;
 
 const Sha256 = crypto.hash.sha2.Sha256;
+const max_modulus_bytes = 4096 / 8;
 
 const Error = error{InvalidInput};
 
@@ -87,21 +88,23 @@ fn verifyPss(em: []const u8, em_bits: usize, message: []const u8) Error!void {
     if (em[em.len - 1] != 0xbc) return error.InvalidInput;
 
     const db_len = em.len - h_len - 1;
-    if (db_len > 512) return error.InvalidInput;
+    if (db_len > max_modulus_bytes) return error.InvalidInput;
     const masked_db = em[0..db_len];
     const h = em[db_len .. db_len + h_len];
     const unused_bits = 8 * em.len - em_bits;
+    // RFC 8017 requires the unused high bits of maskedDB to be zero.
     if (unused_bits > 7 or masked_db[0] & (@as(u8, 0xff) << @as(u3, @intCast(8 - unused_bits))) != 0) {
         return error.InvalidInput;
     }
 
     var m_hash: [h_len]u8 = undefined;
     Sha256.hash(message, &m_hash, .{});
-    var db: [512]u8 = undefined;
-    var mask: [512]u8 = undefined;
+    var db: [max_modulus_bytes]u8 = undefined;
+    var mask: [max_modulus_bytes]u8 = undefined;
     const h_array = h[0..h_len].*;
     mgf1(&h_array, mask[0..db_len]);
     for (db[0..db_len], masked_db, mask[0..db_len]) |*out, masked, mask_byte| out.* = masked ^ mask_byte;
+    // Clear the unused high bits of DB before checking its zero-padding PS.
     db[0] &= @as(u8, @intCast(0xff >> unused_bits));
 
     const ps_len = db_len - salt_len - 1;
@@ -124,7 +127,7 @@ pub fn verifyPssSha256(public_key_der: []const u8, message: []const u8, signatur
     var modulus = ff.Modulus(4096).fromBytes(key.modulus, .big) catch return error.InvalidInput;
     const signature_fe = ff.Modulus(4096).Fe.fromBytes(modulus, signature, .big) catch return error.InvalidInput;
     const recovered = modulus.powWithEncodedPublicExponent(signature_fe, key.exponent, .big) catch return error.InvalidInput;
-    var encoded: [512]u8 = undefined;
+    var encoded: [max_modulus_bytes]u8 = undefined;
     recovered.toBytes(encoded[0..key.modulus.len], .big) catch return error.InvalidInput;
     verifyPss(encoded[0..key.modulus.len], key.bits - 1, message) catch return error.AuthenticationFailed;
 }

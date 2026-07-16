@@ -72,7 +72,6 @@ pub const Core = struct {
             .client => .server_hello,
             .server => .client_hello,
         };
-
     }
 
     pub fn acceptReceived(self: *Core, raw: []const u8) Error!Message {
@@ -110,7 +109,9 @@ pub const Core = struct {
     }
 
     fn acceptsClientFinished(self: *const Core, kind: MessageType) bool {
-        return self.role == .server and self.handshake_state == .finished and kind == .finished;
+        const is_server = self.role == .server;
+        const awaiting_finished = self.handshake_state == .finished;
+        return is_server and awaiting_finished and kind == .finished;
     }
 
     fn validOutbound(self: *const Core, kind: MessageType) bool {

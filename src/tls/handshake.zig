@@ -18,6 +18,8 @@ pub const Reader = messages.Reader;
 pub const Writer = messages.Writer;
 pub const ExtensionIterator = messages.ExtensionIterator;
 pub const ExtensionGuard = messages.ExtensionGuard;
+const handshake_header_len = 4;
+const epoch_count = @typeInfo(events.EncryptionEpoch).@"enum".fields.len;
 
 pub fn Reassembler(comptime capacity: usize) type {
     return struct {
@@ -33,11 +35,11 @@ pub fn Reassembler(comptime capacity: usize) type {
         }
 
         pub fn next(self: *Self) Error!?Message {
-            if (self.len < 4) return null;
+            if (self.len < handshake_header_len) return null;
             const body_len = std.mem.readInt(u24, self.data[1..4], .big);
-            if (@as(usize, body_len) > self.data.len - 4)
+            if (@as(usize, body_len) > self.data.len - handshake_header_len)
                 return error.MalformedHandshake;
-            const message_len = 4 + @as(usize, body_len);
+            const message_len = handshake_header_len + @as(usize, body_len);
             if (self.len < message_len) return null;
             return messages.decode(self.data[0..message_len]) catch
                 return error.MalformedHandshake;
@@ -52,8 +54,8 @@ pub fn Reassembler(comptime capacity: usize) type {
 }
 
 pub const SecretLifecycle = struct {
-    installed: [4]bool = .{ false, false, false, false },
-    discarded: [4]bool = .{ false, false, false, false },
+    installed: [epoch_count]bool = .{false} ** epoch_count,
+    discarded: [epoch_count]bool = .{false} ** epoch_count,
 
     pub fn install(self: *SecretLifecycle, epoch: events.EncryptionEpoch) Error!void {
         const index = @intFromEnum(epoch);

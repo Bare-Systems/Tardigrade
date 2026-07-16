@@ -18,9 +18,6 @@ pub const EngineConfig = struct {
 
 pub const Engine = struct {
     config: EngineConfig,
-    /// Kept as a stable public snapshot for callers that inspect the engine
-    /// directly; `core.handshake_state` is the authoritative state.
-    handshake_state: state.HandshakeState = .idle,
     core: handshake.Core,
 
     pub fn init(config: EngineConfig) Engine {
@@ -29,13 +26,14 @@ pub const Engine = struct {
 
     pub fn start(self: *Engine) void {
         self.core.start();
-        self.handshake_state = self.core.handshake_state;
     }
 
     pub fn receiveHandshake(self: *Engine, raw: []const u8) handshake.Error!handshake.Message {
-        const message = try self.core.accept(raw);
-        self.handshake_state = self.core.handshake_state;
-        return message;
+        return self.core.accept(raw);
+    }
+
+    pub fn handshakeState(self: *const Engine) state.HandshakeState {
+        return self.core.handshake_state;
     }
 
     pub fn transcriptHash(self: *const Engine) [key_schedule.hash_len]u8 {
@@ -161,7 +159,7 @@ test "core engine can be instantiated for record mode without record framing" {
     var engine = Engine.init(.{ .role = .server, .transport_mode = .record });
     try std.testing.expect(engine.canUseRecordLayer());
     engine.start();
-    try std.testing.expectEqual(state.HandshakeState.idle, engine.handshake_state);
+    try std.testing.expectEqual(state.HandshakeState.idle, engine.handshakeState());
 }
 
 test "engine drives protocol-neutral handshake state" {
@@ -174,7 +172,7 @@ test "engine drives protocol-neutral handshake state" {
     const length = try writer.reserve(3);
     writer.patch(3, length);
     _ = try engine.receiveHandshake(writer.written());
-    try std.testing.expectEqual(state.HandshakeState.server_hello, engine.handshake_state);
+    try std.testing.expectEqual(state.HandshakeState.server_hello, engine.handshakeState());
 }
 
 test "generic driver starts backend and stores emitted events" {

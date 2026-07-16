@@ -15,12 +15,14 @@ pub const Error = error{
     MessageTooLarge,
     DuplicateExtension,
     TooManyExtensions,
+    IncompleteHandshake,
 };
 
 pub const ReassemblerError = error{
     MalformedHandshake,
     HandshakeBufferOverflow,
     MessageTooLarge,
+    IncompleteHandshake,
 };
 
 pub const MessageType = enum(u8) {

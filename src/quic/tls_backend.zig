@@ -1220,9 +1220,11 @@ pub const Tls13Backend = struct {
 
         var message_offset: usize = 0;
         while (message_offset < w.len) {
-            const sent_len = (tls_handshake_codec.frameLength(buf[message_offset..w.len]) catch
-                return error.MalformedHandshake) orelse return error.MalformedHandshake;
-            const message = tls_handshake_codec.decode(buf[message_offset..][0..sent_len]) catch
+            const remaining = buf[message_offset..w.len];
+            const sent_len = (tls_handshake_codec.frameLength(remaining) catch
+                return error.MalformedHandshake) orelse return error.IncompleteHandshake;
+            const raw = remaining[0..sent_len];
+            const message = tls_handshake_codec.decode(raw) catch
                 return error.MalformedHandshake;
             try self.core.recordSent(message.raw);
             message_offset += sent_len;

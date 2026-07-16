@@ -53,10 +53,12 @@ pub const SecretLifecycle = struct {
     }
 };
 
+pub const HandshakeLifecycle = enum { idle, running, complete, failed };
+
 pub const Core = struct {
     role: state.Role,
     handshake_state: state.HandshakeState = .idle,
-    handshake_lifecycle: enum { idle, running, complete, failed } = .idle,
+    handshake_lifecycle: HandshakeLifecycle = .idle,
     expected_inbound: ?MessageType = null,
     transcript: transcript_mod.Transcript = .{},
     secrets: SecretLifecycle = .{},
@@ -84,7 +86,7 @@ pub const Core = struct {
             self.transcript.update(message.raw);
             return message;
         }
-        if (!self.shouldAcceptClientFinished(message.kind)) {
+        if (!self.isExpectedClientFinished(message.kind)) {
             if (self.expected_inbound != message.kind)
                 return error.UnexpectedHandshakeMessage;
         }
@@ -109,7 +111,7 @@ pub const Core = struct {
         return self.transcript.peek();
     }
 
-    fn shouldAcceptClientFinished(self: *const Core, kind: MessageType) bool {
+    fn isExpectedClientFinished(self: *const Core, kind: MessageType) bool {
         const is_server = self.role == .server;
         const awaiting_finished = self.handshake_state == .finished;
         return is_server and awaiting_finished and kind == .finished;

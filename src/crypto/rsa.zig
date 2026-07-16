@@ -65,15 +65,15 @@ fn parsePublicKey(der: []const u8) Error!PublicKey {
     return .{ .modulus = modulus, .exponent = if (exponent_encoded[0] == 0) exponent_encoded[1..] else exponent_encoded, .bits = bits };
 }
 
-fn mgf1(seed: []const u8, out: []u8) void {
+fn mgf1(seed: *const [Sha256.digest_length]u8, out: []u8) void {
     var counter: u32 = 0;
     var offset: usize = 0;
     var input: [Sha256.digest_length + 4]u8 = undefined;
     while (offset < out.len) : (counter += 1) {
-        @memcpy(input[0..seed.len], seed);
-        std.mem.writeInt(u32, input[seed.len..][0..4], counter, .big);
+        @memcpy(input[0..Sha256.digest_length], seed);
+        std.mem.writeInt(u32, input[Sha256.digest_length..][0..4], counter, .big);
         var digest: [Sha256.digest_length]u8 = undefined;
-        Sha256.hash(input[0 .. seed.len + 4], &digest, .{});
+        Sha256.hash(&input, &digest, .{});
         const count = @min(digest.len, out.len - offset);
         @memcpy(out[offset .. offset + count], digest[0..count]);
         offset += count;
@@ -87,6 +87,7 @@ fn verifyPss(em: []const u8, em_bits: usize, message: []const u8) Error!void {
     if (em[em.len - 1] != 0xbc) return error.InvalidInput;
 
     const db_len = em.len - h_len - 1;
+    if (db_len > 512) return error.InvalidInput;
     const masked_db = em[0..db_len];
     const h = em[db_len .. db_len + h_len];
     const unused_bits = 8 * em.len - em_bits;
@@ -98,7 +99,8 @@ fn verifyPss(em: []const u8, em_bits: usize, message: []const u8) Error!void {
     Sha256.hash(message, &m_hash, .{});
     var db: [512]u8 = undefined;
     var mask: [512]u8 = undefined;
-    mgf1(h, mask[0..db_len]);
+    const h_array = h[0..h_len].*;
+    mgf1(&h_array, mask[0..db_len]);
     for (db[0..db_len], masked_db, mask[0..db_len]) |*out, masked, mask_byte| out.* = masked ^ mask_byte;
     db[0] &= @as(u8, @intCast(0xff >> unused_bits));
 
@@ -112,7 +114,7 @@ fn verifyPss(em: []const u8, em_bits: usize, message: []const u8) Error!void {
     @memcpy(hash_input[8 + h_len ..], db[ps_len + 1 ..]);
     var expected: [h_len]u8 = undefined;
     Sha256.hash(&hash_input, &expected, .{});
-    if (!crypto.timing_safe.eql([h_len]u8, expected, h[0..h_len].*)) return error.InvalidInput;
+    if (!crypto.timing_safe.eql([h_len]u8, expected, h_array)) return error.InvalidInput;
 }
 
 pub fn verifyPssSha256(public_key_der: []const u8, message: []const u8, signature: []const u8) (error{InvalidInput, AuthenticationFailed})!void {

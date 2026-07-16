@@ -221,11 +221,30 @@ fn algorithmEd25519(arena: std.mem.Allocator) ![]u8 {
 }
 
 fn nameWithCn(arena: std.mem.Allocator, cn: []const u8) ![]u8 {
+    return nameWithCnTag(arena, 0x0c, cn);
+}
+
+fn nameWithCnTag(arena: std.mem.Allocator, value_tag: u8, cn: []const u8) ![]u8 {
     const atv = try tlv(arena, 0x30, &.{
         try oidTlv(arena, &oid.well_known.common_name),
-        try tlv(arena, 0x0c, &.{cn}),
+        try tlv(arena, value_tag, &.{cn}),
     });
     return tlv(arena, 0x30, &.{try tlv(arena, 0x31, &.{atv})});
+}
+
+/// A Name with one domainComponent RDN per label, e.g. `["EXAMPLE", "COM"]`
+/// for `DC=EXAMPLE,DC=COM`.
+fn dnWithDomainComponents(arena: std.mem.Allocator, labels: []const []const u8, value_tag: u8) ![]u8 {
+    var rdns: std.ArrayList([]const u8) = .empty;
+    defer rdns.deinit(arena);
+    for (labels) |label| {
+        const atv = try tlv(arena, 0x30, &.{
+            try oidTlv(arena, &oid.well_known.domain_component),
+            try tlv(arena, value_tag, &.{label}),
+        });
+        try rdns.append(arena, try tlv(arena, 0x31, &.{atv}));
+    }
+    return tlv(arena, 0x30, rdns.items);
 }
 
 fn utcValidity(arena: std.mem.Allocator) ![]u8 {
@@ -749,6 +768,217 @@ test "extension count limit fails typed" {
     var limits: x509.Limits = .{};
     limits.max_extensions = 1;
     try testing.expectError(error.CountLimitExceeded, x509.Certificate.parse(testing.allocator, bytes, limits));
+}
+
+test "name chaining unifies PrintableString and UTF8String with case and space folding" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    // RFC 5280 §7.1: the same value in different DirectoryString encodings
+    // must chain even though the encodings differ byte-for-byte.
+    const utf8_name = try x509.parseNameRaw(arena, try nameWithCnTag(arena, 0x0c, "Example CA"), .{});
+    const printable_name = try x509.parseNameRaw(arena, try nameWithCnTag(arena, 0x13, "Example CA"), .{});
+    try testing.expect(utf8_name.eqlForChaining(&printable_name));
+    try testing.expect(!utf8_name.eqlEncoding(&printable_name));
+
+    // Rules (c)/(d): case-insensitive, leading/trailing white space dropped,
+    // internal runs collapsed.
+    const noisy_name = try x509.parseNameRaw(arena, try nameWithCnTag(arena, 0x13, "  EXAMPLE   ca "), .{});
+    try testing.expect(utf8_name.eqlForChaining(&noisy_name));
+
+    // Different values do not chain.
+    const different_name = try x509.parseNameRaw(arena, try nameWithCnTag(arena, 0x0c, "Example CA 2"), .{});
+    try testing.expect(!utf8_name.eqlForChaining(&different_name));
+
+    // BMPString sits outside the caseIgnore class: exact bytes under its
+    // own tag, so the same text does not chain with the UTF8String form.
+    const bmp_text = [_]u8{ 0, 'E', 0, 'x', 0, 'a', 0, 'm', 0, 'p', 0, 'l', 0, 'e', 0, ' ', 0, 'C', 0, 'A' };
+    const bmp_name = try x509.parseNameRaw(arena, try nameWithCnTag(arena, 0x1e, &bmp_text), .{});
+    try testing.expect(!utf8_name.eqlForChaining(&bmp_name));
+}
+
+test "name chaining uses RFC 4518 DirectoryString preparation" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    const sharp_s = try x509.parseNameRaw(arena, try nameWithCnTag(arena, 0x0c, "Straße"), .{});
+    const ss = try x509.parseNameRaw(arena, try nameWithCnTag(arena, 0x0c, "STRASSE"), .{});
+    try testing.expect(sharp_s.eqlForChaining(&ss));
+    try testing.expect(!sharp_s.eqlEncoding(&ss));
+
+    const soft_hyphen = try x509.parseNameRaw(arena, try nameWithCnTag(arena, 0x0c, "soft\u{00AD}hyphen"), .{});
+    const no_hyphen = try x509.parseNameRaw(arena, try nameWithCnTag(arena, 0x0c, "softhyphen"), .{});
+    try testing.expect(soft_hyphen.eqlForChaining(&no_hyphen));
+
+    const composed = try x509.parseNameRaw(arena, try nameWithCnTag(arena, 0x0c, "\u{00E9}"), .{});
+    const decomposed = try x509.parseNameRaw(arena, try nameWithCnTag(arena, 0x0c, "e\u{0301}"), .{});
+    try testing.expect(composed.eqlForChaining(&decomposed));
+
+    const full_width = try x509.parseNameRaw(arena, try nameWithCnTag(arena, 0x0c, "\u{FF21}\u{FF23}\u{FF2D}\u{FF25}"), .{});
+    const ascii = try x509.parseNameRaw(arena, try nameWithCnTag(arena, 0x0c, "ACME"), .{});
+    try testing.expect(full_width.eqlForChaining(&ascii));
+
+    const nbsp_name = try x509.parseNameRaw(arena, try nameWithCnTag(arena, 0x0c, "Example\u{00A0}CA"), .{});
+    const space_name = try x509.parseNameRaw(arena, try nameWithCnTag(arena, 0x0c, "Example CA"), .{});
+    try testing.expect(nbsp_name.eqlForChaining(&space_name));
+
+    const spaced_mn = try x509.parseNameRaw(arena, try nameWithCnTag(arena, 0x0c, " \u{0301}A"), .{});
+    const bare_mn = try x509.parseNameRaw(arena, try nameWithCnTag(arena, 0x0c, "\u{0301}A"), .{});
+    try testing.expect(!spaced_mn.eqlForChaining(&bare_mn));
+
+    const spaced_mc_ccc0 = try x509.parseNameRaw(arena, try nameWithCnTag(arena, 0x0c, " \u{093E}A"), .{});
+    const bare_mc_ccc0 = try x509.parseNameRaw(arena, try nameWithCnTag(arena, 0x0c, "\u{093E}A"), .{});
+    try testing.expect(!spaced_mc_ccc0.eqlForChaining(&bare_mc_ccc0));
+
+    // RFC 4518 Appendix A is the definitive combining-mark table. U+05BD is
+    // classified Mn by Unicode 3.2 but intentionally absent from Appendix A,
+    // so a preceding U+0020 remains an insignificant leading space.
+    const spaced_non_appendix_a_mark = try x509.parseNameRaw(arena, try nameWithCnTag(arena, 0x0c, " \u{05BD}A"), .{});
+    const bare_non_appendix_a_mark = try x509.parseNameRaw(arena, try nameWithCnTag(arena, 0x0c, "\u{05BD}A"), .{});
+    try testing.expect(spaced_non_appendix_a_mark.eqlForChaining(&bare_non_appendix_a_mark));
+
+    const different = try x509.parseNameRaw(arena, try nameWithCnTag(arena, 0x0c, "STRASZE"), .{});
+    try testing.expect(!sharp_s.eqlForChaining(&different));
+}
+
+test "name chaining accepts Unicode 3.2 assigned values absent from RFC 3454 B.2" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    _ = try x509.parseNameRaw(arena, try nameWithCnTag(arena, 0x0c, "\u{10A0}"), .{});
+    _ = try x509.parseNameRaw(arena, try nameWithCnTag(arena, 0x0c, "\u{04C0}"), .{});
+
+    try testing.expectError(
+        error.NamePreparationFailed,
+        x509.parseNameRaw(arena, try nameWithCnTag(arena, 0x0c, "\u{2D00}"), .{}),
+    );
+    try testing.expectError(
+        error.NamePreparationFailed,
+        x509.parseNameRaw(arena, try nameWithCnTag(arena, 0x0c, "\u{04CF}"), .{}),
+    );
+}
+
+test "name chaining rejects undefined RFC 4518 stored DirectoryString preparation" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    try testing.expectError(
+        error.NamePreparationFailed,
+        x509.parseNameRaw(arena, try nameWithCnTag(arena, 0x0c, "\u{E000}"), .{}),
+    );
+    try testing.expectError(
+        error.NamePreparationFailed,
+        x509.parseNameRaw(arena, try nameWithCnTag(arena, 0x0c, "\u{0221}"), .{}),
+    );
+    try testing.expectError(
+        error.NamePreparationFailed,
+        x509.parseNameRaw(arena, try nameWithCnTag(arena, 0x0c, "\u{1C90}"), .{}),
+    );
+    try testing.expectError(
+        error.NamePreparationFailed,
+        x509.parseNameRaw(arena, try nameWithCnTag(arena, 0x0c, "\u{1E900}"), .{}),
+    );
+    try testing.expectError(
+        error.NamePreparationFailed,
+        x509.parseNameRaw(arena, try nameWithCnTag(arena, 0x0c, "\u{A7B0}"), .{}),
+    );
+}
+
+test "domainComponent RDN values compare with caseIgnoreIA5Match" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    // RFC 5280 §7.1 / RFC 4517 §4.2.3: domainComponent (IA5String) chains
+    // case-insensitively — DC=EXAMPLE,DC=COM must chain to dc=example,dc=com.
+    const upper = try x509.parseNameRaw(arena, try dnWithDomainComponents(arena, &.{ "EXAMPLE", "COM" }, 0x16), .{});
+    const lower = try x509.parseNameRaw(arena, try dnWithDomainComponents(arena, &.{ "example", "com" }, 0x16), .{});
+    try testing.expect(upper.eqlForChaining(&lower));
+    try testing.expect(!upper.eqlEncoding(&lower));
+
+    const different = try x509.parseNameRaw(arena, try dnWithDomainComponents(arena, &.{ "example", "net" }, 0x16), .{});
+    try testing.expect(!upper.eqlForChaining(&different));
+}
+
+test "isSelfIssued uses RFC 4518 name chaining, not encoding equality" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    // RFC 5280 defines self-issued via §7.1 name chaining, not encoding
+    // identity. This pair depends on RFC 3454 B.2 one-to-many mapping.
+    var list: std.ArrayList([]const u8) = .empty;
+    defer list.deinit(arena);
+    try list.append(arena, try versionTlv(arena, 2));
+    try list.append(arena, try tlv(arena, 0x02, &.{&[_]u8{0x01}}));
+    try list.append(arena, try algorithmEd25519(arena));
+    try list.append(arena, try nameWithCnTag(arena, 0x0c, "Straße CA"));
+    try list.append(arena, try utcValidity(arena));
+    try list.append(arena, try nameWithCnTag(arena, 0x0c, "STRASSE CA"));
+    try list.append(arena, try spkiEd25519(arena));
+    const tbs = try tlv(arena, 0x30, list.items);
+    const bytes = try tlv(arena, 0x30, &.{ tbs, try algorithmEd25519(arena), try signatureBits(arena) });
+
+    var cert = try x509.Certificate.parse(testing.allocator, bytes, .{});
+    defer cert.deinit(testing.allocator);
+    try testing.expect(!cert.issuer.eqlEncoding(&cert.subject));
+    try testing.expect(cert.issuer.eqlForChaining(&cert.subject));
+    try testing.expect(cert.isSelfIssued());
+}
+
+test "name chaining keys are structure-sensitive" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    const cn_atv = try tlv(arena, 0x30, &.{
+        try oidTlv(arena, &oid.well_known.common_name),
+        try tlv(arena, 0x0c, &.{"A"}),
+    });
+    const org_atv = try tlv(arena, 0x30, &.{
+        try oidTlv(arena, &oid.well_known.organization),
+        try tlv(arena, 0x0c, &.{"B"}),
+    });
+
+    // One RDN holding both attributes is distinct from two single-attribute
+    // RDNs carrying the same values (the count prefixes keep the flat key
+    // injective).
+    const multi_attribute = try tlv(arena, 0x30, &.{try tlv(arena, 0x31, &.{ cn_atv, org_atv })});
+    const multi_rdn = try tlv(arena, 0x30, &.{
+        try tlv(arena, 0x31, &.{cn_atv}),
+        try tlv(arena, 0x31, &.{org_atv}),
+    });
+    const combined = try x509.parseNameRaw(arena, multi_attribute, .{});
+    const sequential = try x509.parseNameRaw(arena, multi_rdn, .{});
+    try testing.expect(!combined.eqlForChaining(&sequential));
+
+    // Same structure, same values: chains regardless of value encodings.
+    const printable_cn_atv = try tlv(arena, 0x30, &.{
+        try oidTlv(arena, &oid.well_known.common_name),
+        try tlv(arena, 0x13, &.{"A"}),
+    });
+    const multi_attribute_printable = try tlv(arena, 0x30, &.{try tlv(arena, 0x31, &.{ printable_cn_atv, org_atv })});
+    const combined_printable = try x509.parseNameRaw(arena, multi_attribute_printable, .{});
+    try testing.expect(combined.eqlForChaining(&combined_printable));
+}
+
+test "name chaining key construction is leak-free across allocation failure points" {
+    var fixture_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer fixture_arena.deinit();
+    const fixture_allocator = fixture_arena.allocator();
+    const name_der = try nameWithCnTag(fixture_allocator, 0x0c, "Straße \u{00AD} \u{FF21}\u{FF23}\u{FF2D}\u{FF25}");
+
+    try testing.checkAllAllocationFailures(testing.allocator, struct {
+        fn run(inner_allocator: std.mem.Allocator, der_bytes: []const u8) !void {
+            var arena_inst = std.heap.ArenaAllocator.init(inner_allocator);
+            defer arena_inst.deinit();
+            _ = try x509.parseNameRaw(arena_inst.allocator(), der_bytes, .{});
+        }
+    }.run, .{name_der});
 }
 
 test "parser is leak-free across allocation failure points" {

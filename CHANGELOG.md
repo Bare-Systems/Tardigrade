@@ -5,6 +5,39 @@ All notable user-facing changes to Tardigrade are documented here.
 ## [Unreleased]
 
 ### Features
+- **Deterministic X.509 candidate-path construction (#344, epic #324)** — adds
+  `src/pki/path_builder.zig`, which builds candidate certification paths from
+  a leaf certificate, peer-supplied intermediates, and configured trust
+  anchors, strictly separated from RFC 5280 policy validation (#324-G): no
+  signature is verified and no path is accepted, only enumerated. Pools are
+  deduplicated by exact DER and indexed by RFC 5280 §7.1 name chaining via a
+  new canonical `x509.Name.chaining_key` (with `eqlForChaining`, also now
+  used by `Certificate.isSelfIssued`) that compares RDN attribute sets,
+  matches `domainComponent` case-insensitively per RFC 4517 §4.2.3
+  (`caseIgnoreIA5Match`), and unifies primitive PrintableString/UTF8String
+  values under one caseIgnore class using RFC 4518 stored-value
+  preparation: RFC 3454 B.2 full case mapping (including one-to-many
+  mappings), Unicode 3.2 Form KC normalization, mappings to nothing,
+  prohibited/unassigned rejection, and RFC 4518 §2.6.1 insignificant-space
+  handling. Every other value type is kept exact-bytes under its own tag.
+  AKI/SKI key identifiers rank candidate issuers
+  (RFC 4158-style hints) but never veto them. Enumeration
+  is a documented total order — key-identifier agreement, then anchors
+  before intermediates, then input index, walked depth-first without
+  recursion — so straight, cross-signed, ambiguous, duplicate, cyclic, and
+  incomplete chains all behave deterministically, anchors terminate paths
+  rather than being traversed as intermediates, and a certificate never
+  appears twice in one path. Search work is bounded by configurable
+  path-length, per-node fanout, returned-path, and global candidate-visit
+  limits that defeat adversarial chain explosions (the visit budget is
+  charged per ranked candidate the traversal attempts, after sorting and
+  fanout, so scan order can never starve a better-ranked candidate);
+  truncated enumeration is reported distinctly
+  (`truncated` flag, `SearchLimitExceeded`) from a provably exhausted search
+  (`NoCandidatePath`), and the error set contains no parser/signature/policy
+  variants by construction. Covered by straight/cross-signed/ambiguous/
+  duplicate/cyclic/incomplete fixtures, determinism replays, limit
+  enforcement, and allocation-failure leak checks under `zig build test-pki`.
 - **TLS record-layer foundation audit remediation (#408, epic #325)** —
   resolves seven confirmed findings from a retrospective audit of the merged
   record-mode foundation (#393, #395, #397, #398, #404, #406), surfaced while

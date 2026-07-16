@@ -32,6 +32,7 @@
 const std = @import("std");
 const der = @import("der.zig");
 const oid_mod = @import("oid.zig");
+const rfc4518_data = @import("rfc4518_data.zig");
 const time_mod = @import("time.zig");
 
 const wk = oid_mod.well_known;
@@ -65,6 +66,7 @@ pub const Error = error{
     MalformedSignature,
     MalformedExtension,
     DuplicateExtension,
+    NamePreparationFailed,
     CountLimitExceeded,
     OutOfMemory,
 };
@@ -141,15 +143,41 @@ pub const RelativeDistinguishedName = struct {
     attributes: []const AttributeTypeAndValue,
 };
 
-/// Name ::= RDNSequence. Comparison across certificates is byte-exact on
-/// `raw` (RFC 5280 binary comparison); looser matching rules are policy.
+/// Name ::= RDNSequence. Two comparisons exist: `eqlEncoding` is byte-exact
+/// on `raw` (encoding identity), and `eqlForChaining` implements the
+/// RFC 5280 §7.1 name-chaining rules via the precomputed `chaining_key`.
 pub const Name = struct {
     /// Full TLV bytes of the Name SEQUENCE.
     raw: []const u8,
     rdns: []const RelativeDistinguishedName,
+    /// Canonical name-chaining key (RFC 5280 §7.1), arena-owned: RDNs in
+    /// sequence order, each RDN's attributes compared as a set (sorted
+    /// canonical forms), attribute types by decoded OID. Three matching
+    /// classes select the per-attribute normalization:
+    ///
+    /// - `domainComponent` (id-domainComponent) values carried in a
+    ///   primitive IA5String are compared with `caseIgnoreIA5Match`
+    ///   (RFC 4517 §4.2.3): ASCII case folded. IA5String is ASCII-only, so
+    ///   this is an exact implementation of the rule, not an approximation.
+    /// - Primitive PrintableString/UTF8String values (the required
+    ///   DirectoryString forms) are unified into one caseIgnore class using
+    ///   RFC 4518 stored-value preparation with RFC 3454 B.2 case mapping,
+    ///   Unicode 3.2 Form KC normalization, prohibited/unassigned rejection,
+    ///   and RFC 4518 §2.6.1 insignificant-space handling.
+    /// - Every other value type (including BMPString, which RFC 5280
+    ///   permits but is legacy and rare) compares as exact bytes under its
+    ///   own tag.
+    ///
+    /// Two names chain exactly when their keys are byte-equal.
+    chaining_key: []const u8,
 
     pub fn eqlEncoding(self: *const Name, other: *const Name) bool {
         return std.mem.eql(u8, self.raw, other.raw);
+    }
+
+    /// RFC 5280 §7.1 name-chaining equality (see `chaining_key`).
+    pub fn eqlForChaining(self: *const Name, other: *const Name) bool {
+        return std.mem.eql(u8, self.chaining_key, other.chaining_key);
     }
 
     pub fn isEmpty(self: *const Name) bool {
@@ -378,8 +406,13 @@ pub const Certificate = struct {
         return SignatureAlgorithm.classify(&self.signature_algorithm);
     }
 
+    /// RFC 5280 defines self-issued as the issuer and subject DNs matching
+    /// under §7.1 name-chaining rules, not encoding identity: a CA that
+    /// re-encodes its own name between issuer and subject fields (a
+    /// PrintableString subject, UTF8String issuer, for example) is still
+    /// self-issued.
     pub fn isSelfIssued(self: *const Certificate) bool {
-        return self.issuer.eqlEncoding(&self.subject);
+        return self.issuer.eqlForChaining(&self.subject);
     }
 
     pub fn findExtension(self: *const Certificate, components: []const u32) ?*const Extension {
@@ -614,7 +647,62 @@ const Parser = struct {
         }
         rdn_reader.expectEnd() catch return error.MalformedName;
 
-        return .{ .raw = name_elem.encoded, .rdns = rdns.items };
+        return .{
+            .raw = name_elem.encoded,
+            .rdns = rdns.items,
+            .chaining_key = try self.buildChainingKey(rdns.items),
+        };
+    }
+
+    /// Serialize the canonical `Name.chaining_key`. Every piece is
+    /// length/count-prefixed, so the flat concatenation is injective: two
+    /// keys are byte-equal exactly when the names chain under the documented
+    /// RFC 5280 §7.1 rules.
+    fn buildChainingKey(self: *Parser, rdns: []const RelativeDistinguishedName) Error![]const u8 {
+        var key: std.ArrayList(u8) = .empty;
+        try appendCount(&key, self.arena, rdns.len);
+        for (rdns) |rdn| {
+            try appendCount(&key, self.arena, rdn.attributes.len);
+            // SET semantics: attribute order inside an RDN must not affect
+            // the key, and canonicalization can reorder attributes relative
+            // to their DER encoding, so sort the canonical forms.
+            const blobs = try self.arena.alloc([]const u8, rdn.attributes.len);
+            for (rdn.attributes, blobs) |*attribute, *blob| {
+                blob.* = try self.attributeChainingBlob(attribute);
+            }
+            std.mem.sort([]const u8, blobs, {}, sliceLessThan);
+            for (blobs) |blob| try key.appendSlice(self.arena, blob);
+        }
+        return key.items;
+    }
+
+    fn attributeChainingBlob(self: *Parser, attribute: *const AttributeTypeAndValue) Error![]const u8 {
+        var blob: std.ArrayList(u8) = .empty;
+        const components = attribute.type.components();
+        try appendCount(&blob, self.arena, components.len);
+        for (components) |component| try appendBe32(&blob, self.arena, component);
+        if (attribute.type.eqlComponents(&wk.domain_component) and isPrimitiveIa5(attribute.value_tag)) {
+            // RFC 5280 §7.1 / RFC 4517 §4.2.3 caseIgnoreIA5Match: exact, not
+            // an approximation, since IA5String content is ASCII-only.
+            try blob.append(self.arena, 0x02);
+            const normalized = try self.arena.alloc(u8, attribute.value.len);
+            for (attribute.value, normalized) |byte, *out| out.* = std.ascii.toLower(byte);
+            try appendCount(&blob, self.arena, normalized.len);
+            try blob.appendSlice(self.arena, normalized);
+        } else if (isCaseIgnoreStringTag(attribute.value_tag)) {
+            try blob.append(self.arena, 0x00);
+            const normalized = try normalizeDirectoryString(self.arena, attribute.value);
+            try appendCount(&blob, self.arena, normalized.len);
+            try blob.appendSlice(self.arena, normalized);
+        } else {
+            try blob.append(self.arena, 0x01);
+            const class_bits: u8 = @intFromEnum(attribute.value_tag.class);
+            try blob.append(self.arena, (class_bits << 1) | @intFromBool(attribute.value_tag.constructed));
+            try appendBe32(&blob, self.arena, attribute.value_tag.number);
+            try appendCount(&blob, self.arena, attribute.value.len);
+            try blob.appendSlice(self.arena, attribute.value);
+        }
+        return blob.items;
     }
 
     fn parseValidity(self: *Parser, reader: *der.Reader) Error!Validity {
@@ -1139,6 +1227,348 @@ fn validateDirectoryString(elem: der.Element) Error!void {
     }
 }
 
+/// The RFC 5280 §7.1 caseIgnore class: primitive PrintableString and
+/// UTF8String values are normalized and compared as one class so encoding
+/// migrations (a CA re-encoding `CN=Example CA` from PrintableString to
+/// UTF8String) still chain.
+fn isCaseIgnoreStringTag(tag: der.Tag) bool {
+    if (tag.class != .universal or tag.constructed) return false;
+    return tag.number == @intFromEnum(der.UniversalTag.utf8_string) or
+        tag.number == @intFromEnum(der.UniversalTag.printable_string);
+}
+
+fn isPrimitiveIa5(tag: der.Tag) bool {
+    return tag.class == .universal and !tag.constructed and
+        tag.number == @intFromEnum(der.UniversalTag.ia5_string);
+}
+
+/// RFC 5280 §7.1 DirectoryString preparation for caseIgnoreMatch. Inputs are
+/// already validated as PrintableString/UTF8String by RDN parsing. Generated
+/// tables are pinned to RFC 3454 / Unicode 3.2, which is the stringprep
+/// repertoire RFC 4518 uses for stored values.
+fn normalizeDirectoryString(arena: std.mem.Allocator, content: []const u8) Error![]const u8 {
+    var mapped: std.ArrayList(u21) = .empty;
+    var view = std.unicode.Utf8View.init(content) catch return error.MalformedName;
+    var iterator = view.iterator();
+    while (iterator.nextCodepoint()) |codepoint| {
+        if (containsRange(rfc4518_data.unassigned[0..], codepoint)) return error.NamePreparationFailed;
+        if (try mappingFor(rfc4518_data.map[0..], rfc4518_data.map_data[0..], codepoint)) |replacement| {
+            try appendScalars(&mapped, arena, replacement);
+        } else {
+            try appendScalar(&mapped, arena, codepoint);
+        }
+    }
+
+    var decomposed: std.ArrayList(u21) = .empty;
+    for (mapped.items) |codepoint| try appendNfkd(&decomposed, arena, codepoint);
+    try canonicalOrder(arena, decomposed.items);
+
+    const normalized = try composeNfkc(arena, decomposed.items);
+    for (normalized) |codepoint| {
+        if (containsRange(rfc4518_data.unassigned[0..], codepoint) or
+            containsRange(rfc4518_data.prohibited[0..], codepoint))
+        {
+            return error.NamePreparationFailed;
+        }
+    }
+
+    return encodeCaseIgnoreAttributeValue(arena, normalized);
+}
+
+fn mappingFor(
+    table: []const rfc4518_data.ScalarMapping,
+    data: []const u21,
+    codepoint: u21,
+) Error!?[]const u21 {
+    var low: usize = 0;
+    var high: usize = table.len;
+    while (low < high) {
+        const mid = low + (high - low) / 2;
+        const entry = table[mid];
+        if (codepoint < entry.scalar) {
+            high = mid;
+        } else if (codepoint > entry.scalar) {
+            low = mid + 1;
+        } else {
+            const start: usize = entry.offset;
+            const end = std.math.add(usize, start, entry.len) catch return error.NamePreparationFailed;
+            if (end > data.len) return error.NamePreparationFailed;
+            return data[start..end];
+        }
+    }
+    return null;
+}
+
+fn appendNfkd(list: *std.ArrayList(u21), arena: std.mem.Allocator, codepoint: u21) Error!void {
+    const s_base = 0xac00;
+    const l_base = 0x1100;
+    const v_base = 0x1161;
+    const t_base = 0x11a7;
+    const l_count = 19;
+    const v_count = 21;
+    const t_count = 28;
+    const n_count = v_count * t_count;
+    const s_count = l_count * n_count;
+
+    if (codepoint >= s_base and codepoint < s_base + s_count) {
+        const s_index = codepoint - s_base;
+        try appendScalar(list, arena, l_base + s_index / n_count);
+        try appendScalar(list, arena, v_base + (s_index % n_count) / t_count);
+        const t_index = s_index % t_count;
+        if (t_index != 0) try appendScalar(list, arena, t_base + t_index);
+        return;
+    }
+
+    if (try mappingFor(rfc4518_data.nfkd[0..], rfc4518_data.nfkd_data[0..], codepoint)) |replacement| {
+        try appendScalars(list, arena, replacement);
+    } else {
+        try appendScalar(list, arena, codepoint);
+    }
+}
+
+fn canonicalOrder(arena: std.mem.Allocator, codepoints: []u21) Error!void {
+    return canonicalOrderCounting(arena, codepoints, null);
+}
+
+fn canonicalOrderCounting(arena: std.mem.Allocator, codepoints: []u21, lookup_counter: ?*usize) Error!void {
+    if (codepoints.len < 2) return;
+    const scratch = try arena.alloc(u21, codepoints.len);
+    const ccc_scratch = try arena.alloc(u8, codepoints.len);
+
+    var segment_start: usize = 0;
+    while (segment_start < codepoints.len) {
+        const first_ccc = combiningClassCounting(codepoints[segment_start], lookup_counter);
+        const sortable_start = segment_start + @intFromBool(first_ccc == 0);
+
+        var segment_end = sortable_start;
+        while (segment_end < codepoints.len and
+            combiningClassCounting(codepoints[segment_end], lookup_counter) != 0)
+        {
+            segment_end += 1;
+        }
+
+        try stableOrderByCombiningClass(
+            codepoints[sortable_start..segment_end],
+            scratch[0 .. segment_end - sortable_start],
+            ccc_scratch[0 .. segment_end - sortable_start],
+            lookup_counter,
+        );
+
+        segment_start = segment_end;
+    }
+}
+
+fn stableOrderByCombiningClass(
+    values: []u21,
+    scratch: []u21,
+    ccc_scratch: []u8,
+    lookup_counter: ?*usize,
+) Error!void {
+    if (values.len < 2) return;
+
+    var counts = [_]usize{0} ** 256;
+    for (values, ccc_scratch) |codepoint, *ccc_out| {
+        const ccc = combiningClassCounting(codepoint, lookup_counter);
+        if (ccc == 0) return error.NamePreparationFailed;
+        ccc_out.* = ccc;
+        counts[ccc] = std.math.add(usize, counts[ccc], 1) catch return error.NamePreparationFailed;
+    }
+
+    var offsets = [_]usize{0} ** 256;
+    var next: usize = 0;
+    for (1..256) |ccc| {
+        offsets[ccc] = next;
+        next = std.math.add(usize, next, counts[ccc]) catch return error.NamePreparationFailed;
+    }
+
+    var cursors = offsets;
+    for (values, ccc_scratch) |codepoint, ccc| {
+        const slot = cursors[ccc];
+        if (slot >= scratch.len) return error.NamePreparationFailed;
+        scratch[slot] = codepoint;
+        cursors[ccc] = std.math.add(usize, cursors[ccc], 1) catch return error.NamePreparationFailed;
+    }
+
+    @memcpy(values, scratch[0..values.len]);
+}
+
+fn composeNfkc(arena: std.mem.Allocator, input: []const u21) Error![]const u21 {
+    var output: std.ArrayList(u21) = .empty;
+    if (input.len == 0) return output.items;
+
+    try appendScalar(&output, arena, input[0]);
+    var starter_index: ?usize = if (combiningClass(input[0]) == 0) 0 else null;
+    var last_ccc = combiningClass(input[0]);
+
+    for (input[1..]) |codepoint| {
+        const ccc = combiningClass(codepoint);
+        var composed = false;
+        if (starter_index) |starter| {
+            if (last_ccc < ccc or last_ccc == 0) {
+                if (composePair(output.items[starter], codepoint)) |composite| {
+                    output.items[starter] = composite;
+                    composed = true;
+                }
+            }
+        }
+
+        if (!composed) {
+            try appendScalar(&output, arena, codepoint);
+            if (ccc == 0) starter_index = output.items.len - 1;
+            last_ccc = ccc;
+        }
+    }
+
+    return output.items;
+}
+
+fn composePair(first: u21, second: u21) ?u21 {
+    const l_base = 0x1100;
+    const v_base = 0x1161;
+    const t_base = 0x11a7;
+    const s_base = 0xac00;
+    const l_count = 19;
+    const v_count = 21;
+    const t_count = 28;
+    const n_count = v_count * t_count;
+    const s_count = l_count * n_count;
+
+    if (first >= l_base and first < l_base + l_count and second >= v_base and second < v_base + v_count) {
+        return s_base + ((first - l_base) * n_count) + ((second - v_base) * t_count);
+    }
+    if (first >= s_base and first < s_base + s_count and (first - s_base) % t_count == 0 and
+        second > t_base and second < t_base + t_count)
+    {
+        return first + (second - t_base);
+    }
+
+    var low: usize = 0;
+    var high: usize = rfc4518_data.compositions.len;
+    while (low < high) {
+        const mid = low + (high - low) / 2;
+        const entry = rfc4518_data.compositions[mid];
+        if (first < entry.first or (first == entry.first and second < entry.second)) {
+            high = mid;
+        } else if (first > entry.first or (first == entry.first and second > entry.second)) {
+            low = mid + 1;
+        } else {
+            return entry.composite;
+        }
+    }
+    return null;
+}
+
+fn encodeCaseIgnoreAttributeValue(arena: std.mem.Allocator, codepoints: []const u21) Error![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var index: usize = 0;
+    var wrote_run = false;
+
+    while (index < codepoints.len and isInsignificantSpaceAt(codepoints, index)) : (index += 1) {}
+    if (index == codepoints.len) {
+        try appendUtf8(&out, arena, ' ');
+        try appendUtf8(&out, arena, ' ');
+        return out.items;
+    }
+
+    try appendUtf8(&out, arena, ' ');
+    while (index < codepoints.len) {
+        while (index < codepoints.len and isInsignificantSpaceAt(codepoints, index)) : (index += 1) {}
+        if (index == codepoints.len) break;
+        if (wrote_run) {
+            try appendUtf8(&out, arena, ' ');
+            try appendUtf8(&out, arena, ' ');
+        }
+        while (index < codepoints.len and !isInsignificantSpaceAt(codepoints, index)) : (index += 1) {
+            try appendUtf8(&out, arena, codepoints[index]);
+        }
+        wrote_run = true;
+    }
+    try appendUtf8(&out, arena, ' ');
+    return out.items;
+}
+
+fn isInsignificantSpaceAt(codepoints: []const u21, index: usize) bool {
+    if (codepoints[index] != ' ') return false;
+    return index + 1 == codepoints.len or !isCombiningMark(codepoints[index + 1]);
+}
+
+fn isCombiningMark(codepoint: u21) bool {
+    return containsRange(rfc4518_data.combining_marks[0..], codepoint);
+}
+
+fn combiningClass(codepoint: u21) u8 {
+    return combiningClassCounting(codepoint, null);
+}
+
+fn combiningClassCounting(codepoint: u21, lookup_counter: ?*usize) u8 {
+    if (lookup_counter) |counter| counter.* += 1;
+    var low: usize = 0;
+    var high: usize = rfc4518_data.combining_classes.len;
+    while (low < high) {
+        const mid = low + (high - low) / 2;
+        const range = rfc4518_data.combining_classes[mid];
+        if (codepoint < range.first) {
+            high = mid;
+        } else if (codepoint > range.last) {
+            low = mid + 1;
+        } else {
+            return range.ccc;
+        }
+    }
+    return 0;
+}
+
+fn containsRange(ranges: []const rfc4518_data.Range, codepoint: u21) bool {
+    var low: usize = 0;
+    var high: usize = ranges.len;
+    while (low < high) {
+        const mid = low + (high - low) / 2;
+        const range = ranges[mid];
+        if (codepoint < range.first) {
+            high = mid;
+        } else if (codepoint > range.last) {
+            low = mid + 1;
+        } else {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn appendScalar(list: *std.ArrayList(u21), arena: std.mem.Allocator, scalar: u21) Error!void {
+    _ = std.math.add(usize, list.items.len, 1) catch return error.NamePreparationFailed;
+    try list.append(arena, scalar);
+}
+
+fn appendScalars(list: *std.ArrayList(u21), arena: std.mem.Allocator, scalars: []const u21) Error!void {
+    _ = std.math.add(usize, list.items.len, scalars.len) catch return error.NamePreparationFailed;
+    try list.appendSlice(arena, scalars);
+}
+
+fn appendUtf8(list: *std.ArrayList(u8), arena: std.mem.Allocator, codepoint: u21) Error!void {
+    const encoded_len = std.unicode.utf8CodepointSequenceLength(codepoint) catch return error.NamePreparationFailed;
+    const new_len = std.math.add(usize, list.items.len, encoded_len) catch return error.NamePreparationFailed;
+    try list.ensureTotalCapacity(arena, new_len);
+    list.items.len += encoded_len;
+    _ = std.unicode.utf8Encode(codepoint, list.items[list.items.len - encoded_len ..]) catch return error.NamePreparationFailed;
+}
+
+fn appendCount(list: *std.ArrayList(u8), arena: std.mem.Allocator, count: usize) error{OutOfMemory}!void {
+    var buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &buf, count, .big);
+    try list.appendSlice(arena, &buf);
+}
+
+fn appendBe32(list: *std.ArrayList(u8), arena: std.mem.Allocator, value: u32) error{OutOfMemory}!void {
+    var buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &buf, value, .big);
+    try list.appendSlice(arena, &buf);
+}
+
+fn sliceLessThan(_: void, a: []const u8, b: []const u8) bool {
+    return std.mem.order(u8, a, b) == .lt;
+}
+
 fn integerToU32(view: der.IntegerView) ?u32 {
     var value: u64 = 0;
     for (view.content) |byte| {
@@ -1172,6 +1602,45 @@ pub fn fuzzParseCertificate(allocator: std.mem.Allocator, input: []const u8) voi
     };
     var certificate = Certificate.parse(allocator, input, limits) catch return;
     certificate.deinit(allocator);
+}
+
+test "RFC 4518 canonical ordering handles adversarial runs in bounded work" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    const run_len = 4096;
+    const total = 1 + run_len * 2;
+    const codepoints = try arena.alloc(u21, total);
+    codepoints[0] = 'A';
+    @memset(codepoints[1 .. 1 + run_len], 0x0315);
+    @memset(codepoints[1 + run_len ..], 0x0300);
+
+    var lookups: usize = 0;
+    try canonicalOrderCounting(arena, codepoints, &lookups);
+
+    try testing.expectEqual(@as(u21, 'A'), codepoints[0]);
+    for (codepoints[1 .. 1 + run_len]) |codepoint| try testing.expectEqual(@as(u21, 0x0300), codepoint);
+    for (codepoints[1 + run_len ..]) |codepoint| try testing.expectEqual(@as(u21, 0x0315), codepoint);
+    try testing.expect(lookups <= total * 3);
+}
+
+test "RFC 4518 canonical ordering is stable and respects starters" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var equal_ccc = [_]u21{ 'A', 0x0301, 0x0300 };
+    try canonicalOrder(arena, &equal_ccc);
+    try testing.expectEqualSlices(u21, &[_]u21{ 'A', 0x0301, 0x0300 }, &equal_ccc);
+
+    var starter_boundaries = [_]u21{ 'A', 0x0315, 0x0300, 'B', 0x0315, 0x0300 };
+    try canonicalOrder(arena, &starter_boundaries);
+    try testing.expectEqualSlices(u21, &[_]u21{ 'A', 0x0300, 0x0315, 'B', 0x0300, 0x0315 }, &starter_boundaries);
+
+    var leading_nonstarters = [_]u21{ 0x0315, 0x0300, 'A' };
+    try canonicalOrder(arena, &leading_nonstarters);
+    try testing.expectEqualSlices(u21, &[_]u21{ 0x0300, 0x0315, 'A' }, &leading_nonstarters);
 }
 
 const testing = std.testing;

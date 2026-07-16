@@ -300,7 +300,7 @@ test "RSA public-key DER enforces exponent range and parity" {
         try std.testing.expectError(error.InvalidInput, parsePublicKey(makeTestPublicKey(&der, exponent, max_modulus_bytes, 0x80)));
     }
 
-    // 257 bytes is one byte longer than the 2048-bit modulus value.
+    // 257 bytes matches the encoded 2048-bit modulus with its sign byte.
     var equal_size_exponent: [257]u8 = [_]u8{0} ** 257;
     // The leading sign byte makes this exponent equal in encoded size to n.
     equal_size_exponent[1] = 0x80;
@@ -319,7 +319,7 @@ test "RSA-PSS rejects short, long, and out-of-range signatures" {
     const exponent = [_]u8{ 1, 0, 1 };
     var der: [300]u8 = undefined;
     const key = makeTestPublicKey(&der, &exponent, max_modulus_bytes, 0x80);
-    // The minimum valid modulus has only its high bit set.
+    // This signature equals the minimum valid modulus used by the test key.
     const signature_equal_to_modulus = [_]u8{0x80} ++ ([_]u8{0} ** (max_modulus_bytes - 1));
     const signature_greater_than_modulus = [_]u8{0xff} ** max_modulus_bytes;
     try std.testing.expectError(error.AuthenticationFailed, verifyPssSha256(key, "message", &signature_equal_to_modulus));

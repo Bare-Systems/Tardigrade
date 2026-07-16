@@ -51,7 +51,8 @@ pub fn Reassembler(comptime capacity: usize) type {
 
         pub fn discard(self: *Self, count: usize) Error!void {
             if (count > self.len) return error.MalformedHandshake;
-            std.mem.copyForwards(u8, self.data[0 .. self.len - count], self.data[count..self.len]);
+            const remaining = self.len - count;
+            std.mem.copyForwards(u8, self.data[0..remaining], self.data[count..][0..remaining]);
             self.len -= count;
         }
     };

@@ -5,11 +5,14 @@ const crypto = @import("crypto");
 const der = @import("der.zig");
 const oid = @import("oid.zig");
 const path_builder = @import("path_builder.zig");
+const pem = @import("pem.zig");
 const validator = @import("path_validator.zig");
 const x509 = @import("x509.zig");
 
 const testing = std.testing;
 const validation_time: i64 = 1_782_864_000; // 2026-07-01T00:00:00Z
+const openssl_root_pem = @embedFile("testdata/path_validator_ed25519_root.crt");
+const openssl_leaf_pem = @embedFile("testdata/path_validator_ed25519_leaf.crt");
 
 fn tlv(arena: std.mem.Allocator, tag: u8, parts: []const []const u8) ![]u8 {
     var total: usize = 0;
@@ -350,6 +353,31 @@ test "valid three-certificate and direct-anchor paths pass" {
     var direct = try validateBuilt(testing.allocator, &fx.certs.items[3], &.{}, fx.certs.items[2..3], policy(fx.certs.items[2..3]), cp);
     defer direct.deinit(testing.allocator);
     try expectAccepted(&direct, 2);
+}
+
+test "OpenSSL-generated Ed25519 leaf and anchor validate independently" {
+    var root_pem = try pem.loadCertificatePem(testing.allocator, openssl_root_pem, .{});
+    defer root_pem.deinit(testing.allocator);
+    var leaf_pem = try pem.loadCertificatePem(testing.allocator, openssl_leaf_pem, .{});
+    defer leaf_pem.deinit(testing.allocator);
+    var root = try x509.Certificate.parse(testing.allocator, root_pem.der, .{});
+    defer root.deinit(testing.allocator);
+    var leaf = try x509.Certificate.parse(testing.allocator, leaf_pem.der, .{});
+    defer leaf.deinit(testing.allocator);
+
+    const elements = [_]path_builder.Element{
+        .{ .certificate = &leaf, .source = .leaf, .input_index = 0 },
+        .{ .certificate = &root, .source = .anchor, .input_index = 0 },
+    };
+    var entropy: crypto.pure_zig.DeterministicEntropy = undefined;
+    var provider: crypto.pure_zig.Provider = undefined;
+    const cp = cryptoProvider(&entropy, &provider);
+    var validation_policy = policy((&root)[0..1]);
+    validation_policy.validation_time = 1_784_332_800; // 2026-07-18T00:00:00Z
+    validation_policy.expected_dns_name = "openssl.example.com";
+    var result = validator.validatePath(testing.allocator, .{ .elements = &elements }, validation_policy, cp);
+    defer result.deinit(testing.allocator);
+    try expectAccepted(&result, 2);
 }
 
 test "validity windows reject early and late certificates and include exact boundaries" {

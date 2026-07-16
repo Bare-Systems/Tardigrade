@@ -22,8 +22,9 @@ All notable user-facing changes to Tardigrade are documented here.
   #345: any Name Constraints extension fails closed, noncritical
   certificatePolicies use the implicit any-policy policy, and critical policy
   extensions are rejected until full processing is implemented.
-  Deterministic, real-signature Ed25519 fixtures cover valid/direct and
-  alternate chains, signature defect classes, time boundaries, CA/KU/EKU,
+  Deterministic, real-signature Ed25519 fixtures plus an independently
+  OpenSSL-generated leaf/anchor chain cover valid/direct and alternate paths,
+  signature defect classes, time boundaries, CA/KU/EKU,
   pathLen/self-issued behavior, extension criticality/duplicates, identity,
   malformed paths, configured-anchor provenance, bounds, and allocation
   failure under `zig build test-pki`.

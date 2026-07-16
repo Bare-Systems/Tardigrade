@@ -1463,7 +1463,7 @@ fn encodeCaseIgnoreAttributeValue(arena: std.mem.Allocator, codepoints: []const 
     var index: usize = 0;
     var wrote_run = false;
 
-    while (index < codepoints.len and codepoints[index] == ' ') : (index += 1) {}
+    while (index < codepoints.len and isInsignificantSpaceAt(codepoints, index)) : (index += 1) {}
     if (index == codepoints.len) {
         try appendUtf8(&out, arena, ' ');
         try appendUtf8(&out, arena, ' ');
@@ -1472,19 +1472,28 @@ fn encodeCaseIgnoreAttributeValue(arena: std.mem.Allocator, codepoints: []const 
 
     try appendUtf8(&out, arena, ' ');
     while (index < codepoints.len) {
-        while (index < codepoints.len and codepoints[index] == ' ') : (index += 1) {}
+        while (index < codepoints.len and isInsignificantSpaceAt(codepoints, index)) : (index += 1) {}
         if (index == codepoints.len) break;
         if (wrote_run) {
             try appendUtf8(&out, arena, ' ');
             try appendUtf8(&out, arena, ' ');
         }
-        while (index < codepoints.len and codepoints[index] != ' ') : (index += 1) {
+        while (index < codepoints.len and !isInsignificantSpaceAt(codepoints, index)) : (index += 1) {
             try appendUtf8(&out, arena, codepoints[index]);
         }
         wrote_run = true;
     }
     try appendUtf8(&out, arena, ' ');
     return out.items;
+}
+
+fn isInsignificantSpaceAt(codepoints: []const u21, index: usize) bool {
+    if (codepoints[index] != ' ') return false;
+    return index + 1 == codepoints.len or !isCombiningMark(codepoints[index + 1]);
+}
+
+fn isCombiningMark(codepoint: u21) bool {
+    return containsRange(rfc4518_data.combining_marks[0..], codepoint);
 }
 
 fn combiningClass(codepoint: u21) u8 {

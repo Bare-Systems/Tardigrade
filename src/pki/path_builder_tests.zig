@@ -272,6 +272,23 @@ test "issuer matching uses RFC 4518 DirectoryString transformations" {
     try testing.expectEqual(path_builder.Source.anchor, result.paths[0].anchor().source);
 }
 
+test "issuer matching preserves significant SPACE followed by combining mark" {
+    var fx = Fixtures.init(testing.allocator);
+    defer fx.deinit();
+    // RFC 4518 §2.6.1 treats U+0020 as an insignificant space only when it
+    // is not followed by a combining mark. These two names must not collapse
+    // into the same issuer bucket.
+    try fx.add(.{ .subject_cn = "leaf", .issuer_cn = " \u{0301}A" });
+    try fx.add(.{ .subject_cn = "\u{0301}A", .issuer_cn = "\u{0301}A" });
+
+    const certs = fx.certs.items;
+    try testing.expect(!certs[0].issuer.eqlForChaining(&certs[1].subject));
+    try testing.expectError(
+        error.NoCandidatePath,
+        path_builder.build(testing.allocator, &certs[0], &.{}, certs[1..2], .{}),
+    );
+}
+
 // --- Cross-signed roots ------------------------------------------------------
 
 test "cross-signed root enumerates the anchor path before the cross path" {

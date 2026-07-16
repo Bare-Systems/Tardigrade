@@ -824,8 +824,34 @@ test "name chaining uses RFC 4518 DirectoryString preparation" {
     const space_name = try x509.parseNameRaw(arena, try nameWithCnTag(arena, 0x0c, "Example CA"), .{});
     try testing.expect(nbsp_name.eqlForChaining(&space_name));
 
+    const spaced_mn = try x509.parseNameRaw(arena, try nameWithCnTag(arena, 0x0c, " \u{0301}A"), .{});
+    const bare_mn = try x509.parseNameRaw(arena, try nameWithCnTag(arena, 0x0c, "\u{0301}A"), .{});
+    try testing.expect(!spaced_mn.eqlForChaining(&bare_mn));
+
+    const spaced_mc_ccc0 = try x509.parseNameRaw(arena, try nameWithCnTag(arena, 0x0c, " \u{093E}A"), .{});
+    const bare_mc_ccc0 = try x509.parseNameRaw(arena, try nameWithCnTag(arena, 0x0c, "\u{093E}A"), .{});
+    try testing.expect(!spaced_mc_ccc0.eqlForChaining(&bare_mc_ccc0));
+
     const different = try x509.parseNameRaw(arena, try nameWithCnTag(arena, 0x0c, "STRASZE"), .{});
     try testing.expect(!sharp_s.eqlForChaining(&different));
+}
+
+test "name chaining accepts Unicode 3.2 assigned values absent from RFC 3454 B.2" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    _ = try x509.parseNameRaw(arena, try nameWithCnTag(arena, 0x0c, "\u{10A0}"), .{});
+    _ = try x509.parseNameRaw(arena, try nameWithCnTag(arena, 0x0c, "\u{04C0}"), .{});
+
+    try testing.expectError(
+        error.NamePreparationFailed,
+        x509.parseNameRaw(arena, try nameWithCnTag(arena, 0x0c, "\u{2D00}"), .{}),
+    );
+    try testing.expectError(
+        error.NamePreparationFailed,
+        x509.parseNameRaw(arena, try nameWithCnTag(arena, 0x0c, "\u{04CF}"), .{}),
+    );
 }
 
 test "name chaining rejects undefined RFC 4518 stored DirectoryString preparation" {

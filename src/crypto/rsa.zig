@@ -103,8 +103,10 @@ fn verifyPss(em: []const u8, em_bits: usize, message: []const u8) Error!void {
     const masked_db = em[0..db_len];
     const h = em[db_len .. db_len + h_len];
     const unused_bits = 8 * em.len - em_bits;
-    if (unused_bits > 7) return error.InvalidInput;
-    const unused_shift: u3 = @intCast(unused_bits);
+    const unused_shift: u3 = switch (unused_bits) {
+        0...7 => |bits| @intCast(bits),
+        else => return error.InvalidInput,
+    };
     // This mask preserves the meaningful low bits and excludes the unused
     // high-order bits required to be zero by RFC 8017. With zero unused bits
     // it is intentionally 0xff.
@@ -159,13 +161,16 @@ pub fn verifyPssSha256(public_key_der: []const u8, message: []const u8, signatur
 
 fn appendDerLength(out: []u8, index: *usize, length: usize) void {
     if (length <= 0x7f) {
+        std.debug.assert(length <= 0x7f);
         out[index.*] = @intCast(length);
         index.* += 1;
     } else if (length <= 0xff) {
+        std.debug.assert(length <= 0xff);
         out[index.*] = 0x81;
         out[index.* + 1] = @intCast(length);
         index.* += 2;
     } else {
+        std.debug.assert(length <= 0xffff);
         out[index.*] = 0x82;
         out[index.* + 1] = @intCast(length >> 8);
         out[index.* + 2] = @intCast(length);
@@ -173,7 +178,7 @@ fn appendDerLength(out: []u8, index: *usize, length: usize) void {
     }
 }
 
-fn testPublicKey(modulus: []const u8, exponent: []const u8, out: []u8) []const u8 {
+fn encodePublicKeyDer(modulus: []const u8, exponent: []const u8, out: []u8) []const u8 {
     var index: usize = 0;
     const modulus_sign = modulus[0] & 0x80 != 0;
     const exponent_sign = exponent[0] & 0x80 != 0;
@@ -301,14 +306,14 @@ test "RSA-PSS rejects invalid public exponents" {
         [_]u8{4},
     };
     inline for (invalid_exponents) |exponent| {
-        const encoded = testPublicKey(key.modulus, &exponent, &der);
+        const encoded = encodePublicKeyDer(key.modulus, &exponent, &der);
         try std.testing.expectError(error.InvalidInput, parsePublicKey(encoded));
     }
     var equal_to_modulus: [257]u8 = undefined;
     equal_to_modulus[0] = 0;
     @memcpy(equal_to_modulus[1..], key.modulus);
-    try std.testing.expectError(error.InvalidInput, parsePublicKey(testPublicKey(key.modulus, &equal_to_modulus, &der)));
+    try std.testing.expectError(error.InvalidInput, parsePublicKey(encodePublicKeyDer(key.modulus, &equal_to_modulus, &der)));
     var longer: [258]u8 = undefined;
     @memset(&longer, 0xff);
-    try std.testing.expectError(error.InvalidInput, parsePublicKey(testPublicKey(key.modulus, &longer, &der)));
+    try std.testing.expectError(error.InvalidInput, parsePublicKey(encodePublicKeyDer(key.modulus, &longer, &der)));
 }

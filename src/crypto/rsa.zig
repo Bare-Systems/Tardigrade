@@ -158,6 +158,8 @@ pub fn verifyPssSha256(public_key_der: []const u8, message: []const u8, signatur
     verifyPss(encoded[0..key.modulus.len], key.bits - 1, message) catch return error.AuthenticationFailed;
 }
 
+/// Encode a DER length for the short form or two-octet long form used by the
+/// synthetic RSA keys below.
 fn writeTestLength(out: []u8, offset: *usize, length: usize) void {
     // DER uses one length octet for values up to and including 127.
     if (length <= 0x7f) {
@@ -171,6 +173,9 @@ fn writeTestLength(out: []u8, offset: *usize, length: usize) void {
     }
 }
 
+/// Build an RSAPublicKey with a zero-filled modulus and the requested top byte.
+/// `modulus_bytes` excludes the DER sign-padding byte; `modulus_top` controls
+/// the high byte for valid-size and low-top-bit rejection cases.
 fn makeTestPublicKey(out: []u8, exponent: []const u8, modulus_bytes: usize, modulus_top: u8) []const u8 {
     var offset: usize = 4;
     out[0] = 0x30;
@@ -195,6 +200,10 @@ fn makeTestPublicKey(out: []u8, exponent: []const u8, modulus_bytes: usize, modu
     return out[0..offset];
 }
 
+/// Build a deterministic EMSA-PSS-SHA256 encoded message for direct decoder
+/// tests. `out.len` determines the encoded-message size and `em_bits` selects
+/// the number of meaningful high-order bits; the output must fit the fixed
+/// maximum modulus buffer and leave room for the hash and salt.
 fn encodePssForTest(message: []const u8, salt: [Sha256.digest_length]u8, out: []u8, em_bits: usize) void {
     const h_len = Sha256.digest_length;
     const db_len = out.len - h_len - 1;

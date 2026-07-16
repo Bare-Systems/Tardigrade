@@ -86,7 +86,6 @@ const waivers = [_]Waiver{
     .{ .kind = .signature_sign, .algorithm = .{ .signature = .ed25519 }, .class = .positive, .reason = "OpenSSL CLI raw Ed25519 signing fixtures require the dedicated EVP oracle follow-up.", .tracking_issue = "#431" },
     .{ .kind = .signature_verify, .algorithm = .{ .signature = .ed25519 }, .class = .positive, .reason = "Raw-key Ed25519 verify parity requires the dedicated EVP oracle follow-up.", .tracking_issue = "#431" },
     .{ .kind = .signature_verify, .algorithm = .{ .signature = .ed25519 }, .class = .negative, .reason = "Invalid-signature Ed25519 parity requires the same raw-key EVP oracle.", .tracking_issue = "#431" },
-    .{ .kind = .signature_sign, .algorithm = .{ .signature = .ecdsa_secp256r1_sha256 }, .class = .positive, .reason = "The provider seam exposes ECDSA-P256 verification only; signing support needs a separate provider story before differential coverage can run.", .tracking_issue = "#343" },
     .{ .kind = .signature_verify, .algorithm = .{ .signature = .ecdsa_secp256r1_sha256 }, .class = .positive, .reason = "SEC1-key ECDSA verification parity requires the dedicated EVP oracle follow-up.", .tracking_issue = "#431" },
     .{ .kind = .signature_verify, .algorithm = .{ .signature = .ecdsa_secp256r1_sha256 }, .class = .negative, .reason = "Invalid-signature ECDSA parity requires the same SEC1-key EVP oracle.", .tracking_issue = "#431" },
     .{ .kind = .psk_binder, .algorithm = .{ .hkdf = .sha256 }, .class = .negative, .reason = "Pure-Zig PSK binder generation/verification is not implemented yet.", .tracking_issue = "#362" },
@@ -806,7 +805,6 @@ test "OpenSSL differential coverage registry has explicit coverage or waivers" {
     try expectCoverageOrWaiver(.signature_sign, .{ .signature = .ed25519 }, .positive);
     try expectCoverageOrWaiver(.signature_verify, .{ .signature = .ed25519 }, .positive);
     try expectCoverageOrWaiver(.signature_verify, .{ .signature = .ed25519 }, .negative);
-    try expectCoverageOrWaiver(.signature_sign, .{ .signature = .ecdsa_secp256r1_sha256 }, .positive);
     try expectCoverageOrWaiver(.signature_verify, .{ .signature = .ecdsa_secp256r1_sha256 }, .positive);
     try expectCoverageOrWaiver(.signature_verify, .{ .signature = .ecdsa_secp256r1_sha256 }, .negative);
     try expectCoverageOrWaiver(.psk_binder, .{ .hkdf = .sha256 }, .negative);

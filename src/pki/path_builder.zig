@@ -13,10 +13,10 @@
 //! A certificate C is a candidate issuer of X exactly when C's subject Name
 //! chains to X's issuer Name under the RFC 5280 §7.1 rules — pools are
 //! indexed by the canonical `x509.Name.chaining_key`, so semantically equal
-//! names that differ in encoding (PrintableString vs UTF8String), ASCII
-//! case, or insignificant white space still chain. AKI/SKI key identifiers
-//! never veto a candidate (real-world AKIs are wrong often enough that
-//! RFC 4158 §2.4.2 treats them as sorting hints); they only rank it.
+//! DirectoryString values that differ by RFC 4518 preparation still chain.
+//! AKI/SKI key identifiers never veto a candidate (real-world AKIs are
+//! wrong often enough that RFC 4158 §2.4.2 treats them as sorting hints);
+//! they only rank it.
 //! Sibling candidates are tried in this documented, total order:
 //!
 //! 1. Key-identifier agreement: X's AKI keyIdentifier equals C's SKI, then

@@ -250,6 +250,28 @@ test "issuer matching uses RFC 5280 name chaining, not encoding equality" {
     try testing.expectEqual(path_builder.Source.anchor, result.paths[0].anchor().source);
 }
 
+test "issuer matching uses RFC 4518 DirectoryString transformations" {
+    var fx = Fixtures.init(testing.allocator);
+    defer fx.deinit();
+    // RFC 3454 B.2 maps U+00DF to "ss"; path discovery must not return
+    // NoCandidatePath before the validator can evaluate this otherwise
+    // discoverable candidate.
+    try fx.add(.{ .subject_cn = "leaf", .issuer_cn = "Straße CA" });
+    try fx.add(.{ .subject_cn = "STRASSE CA", .issuer_cn = "STRASSE CA" });
+
+    const certs = fx.certs.items;
+    try testing.expect(!certs[0].issuer.eqlEncoding(&certs[1].subject));
+    try testing.expect(certs[0].issuer.eqlForChaining(&certs[1].subject));
+
+    var result = try path_builder.build(testing.allocator, &certs[0], &.{}, certs[1..2], .{});
+    defer result.deinit(testing.allocator);
+
+    try testing.expect(!result.truncated);
+    try testing.expectEqual(@as(usize, 1), result.paths.len);
+    try expectPathCns(result.paths[0], &.{ "leaf", "STRASSE CA" });
+    try testing.expectEqual(path_builder.Source.anchor, result.paths[0].anchor().source);
+}
+
 // --- Cross-signed roots ------------------------------------------------------
 
 test "cross-signed root enumerates the anchor path before the cross path" {

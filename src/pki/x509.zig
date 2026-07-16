@@ -32,6 +32,7 @@
 const std = @import("std");
 const der = @import("der.zig");
 const oid_mod = @import("oid.zig");
+const rfc4518_data = @import("rfc4518_data.zig");
 const time_mod = @import("time.zig");
 
 const wk = oid_mod.well_known;
@@ -65,6 +66,7 @@ pub const Error = error{
     MalformedSignature,
     MalformedExtension,
     DuplicateExtension,
+    NamePreparationFailed,
     CountLimitExceeded,
     OutOfMemory,
 };
@@ -158,18 +160,10 @@ pub const Name = struct {
     ///   (RFC 4517 §4.2.3): ASCII case folded. IA5String is ASCII-only, so
     ///   this is an exact implementation of the rule, not an approximation.
     /// - Primitive PrintableString/UTF8String values (the required
-    ///   DirectoryString forms) are unified into one caseIgnore class,
-    ///   normalized by collapsing space-equivalent runs (ASCII white space
-    ///   plus U+00A0 NO-BREAK SPACE) to a single space with leading/trailing
-    ///   space dropped, and case-folding ASCII and Latin-1 Supplement
-    ///   letters (U+0041-U+005A, U+00C0-U+00DE excluding the U+00D7
-    ///   multiplication sign). This is a deliberately bounded approximation
-    ///   of RFC 5280 §7.1's RFC 4518 StringPrep requirement: it covers ASCII
-    ///   and Latin-1 scripts exactly but does not perform full Unicode
-    ///   simple case folding, NFKC normalization, or prohibited-codepoint
-    ///   rejection for other scripts. A CA-issued name using non-Latin-1
-    ///   case variation (e.g. Cyrillic or Greek case pairs) will not chain
-    ///   to an otherwise-equal name that differs only in case.
+    ///   DirectoryString forms) are unified into one caseIgnore class using
+    ///   RFC 4518 stored-value preparation with RFC 3454 B.2 case mapping,
+    ///   Unicode 3.2 Form KC normalization, prohibited/unassigned rejection,
+    ///   and RFC 4518 §2.6.1 insignificant-space handling.
     /// - Every other value type (including BMPString, which RFC 5280
     ///   permits but is legacy and rare) compares as exact bytes under its
     ///   own tag.
@@ -1248,60 +1242,246 @@ fn isPrimitiveIa5(tag: der.Tag) bool {
         tag.number == @intFromEnum(der.UniversalTag.ia5_string);
 }
 
-/// RFC 5280 §7.1 rules (c)/(d): drop leading/trailing space-equivalent runs,
-/// collapse internal runs to one space, fold case — see `Name.chaining_key`
-/// for the exact, deliberately bounded scope (ASCII plus Latin-1 Supplement;
-/// U+00A0 NO-BREAK SPACE folds to space; full RFC 4518 StringPrep, including
-/// Unicode case folding beyond Latin-1 and NFKC normalization, is out of
-/// scope). `content` is valid UTF-8 by construction: this is only called for
-/// a tag `isCaseIgnoreStringTag` accepted, and every such value already
-/// passed `der.validateUtf8` (UTF8String) or `der.validatePrintableString`
-/// (PrintableString, an ASCII subset and hence trivially valid UTF-8) during
-/// RDN attribute parsing, which happens before `buildChainingKey` runs.
-fn normalizeDirectoryString(arena: std.mem.Allocator, content: []const u8) error{OutOfMemory}![]const u8 {
-    // Folding never grows a codepoint's UTF-8 length (ASCII and Latin-1
-    // Supplement fold within the same encoded width; NBSP folds from 2
-    // bytes to a 1-byte space), so the input length is a valid upper bound.
-    const out = try arena.alloc(u8, content.len);
-    var len: usize = 0;
-    var pending_space = false;
-    var iterator = std.unicode.Utf8View.initUnchecked(content).iterator();
+/// RFC 5280 §7.1 DirectoryString preparation for caseIgnoreMatch. Inputs are
+/// already validated as PrintableString/UTF8String by RDN parsing. Generated
+/// tables are pinned to RFC 3454 / Unicode 3.2, which is the stringprep
+/// repertoire RFC 4518 uses for stored values.
+fn normalizeDirectoryString(arena: std.mem.Allocator, content: []const u8) Error![]const u8 {
+    var mapped: std.ArrayList(u21) = .empty;
+    var view = std.unicode.Utf8View.init(content) catch return error.MalformedName;
+    var iterator = view.iterator();
     while (iterator.nextCodepoint()) |codepoint| {
-        if (isChainingSpace(codepoint)) {
-            if (len > 0) pending_space = true;
-            continue;
+        if (try mappingFor(rfc4518_data.map[0..], rfc4518_data.map_data[0..], codepoint)) |replacement| {
+            try appendScalars(&mapped, arena, replacement);
+        } else {
+            try appendScalar(&mapped, arena, codepoint);
         }
-        if (pending_space) {
-            out[len] = ' ';
-            len += 1;
-            pending_space = false;
-        }
-        // Folded codepoints stay within the encodable range validated
-        // above, so re-encoding cannot fail.
-        len += std.unicode.utf8Encode(foldCaseIgnoreCodepoint(codepoint), out[len..]) catch unreachable;
     }
-    return out[0..len];
+
+    var decomposed: std.ArrayList(u21) = .empty;
+    for (mapped.items) |codepoint| try appendNfkd(&decomposed, arena, codepoint);
+    canonicalOrder(decomposed.items);
+
+    const normalized = try composeNfkc(arena, decomposed.items);
+    for (normalized) |codepoint| {
+        if (containsRange(rfc4518_data.unassigned[0..], codepoint) or
+            containsRange(rfc4518_data.prohibited[0..], codepoint))
+        {
+            return error.NamePreparationFailed;
+        }
+    }
+
+    return encodeCaseIgnoreAttributeValue(arena, normalized);
 }
 
-/// Space-equivalent codepoints for insignificant-space handling: ASCII
-/// white space plus U+00A0 NO-BREAK SPACE (RFC 4518 §2.6.1 treats NBSP as a
-/// space character; the wider RFC 4518 §2.2/C.1.2 non-ASCII space table is
-/// out of scope — see `Name.chaining_key`).
-fn isChainingSpace(codepoint: u21) bool {
-    return switch (codepoint) {
-        ' ', '\t', '\n', 0x0b, 0x0c, '\r', 0xa0 => true,
-        else => false,
-    };
+fn mappingFor(
+    table: []const rfc4518_data.ScalarMapping,
+    data: []const u21,
+    codepoint: u21,
+) Error!?[]const u21 {
+    var low: usize = 0;
+    var high: usize = table.len;
+    while (low < high) {
+        const mid = low + (high - low) / 2;
+        const entry = table[mid];
+        if (codepoint < entry.scalar) {
+            high = mid;
+        } else if (codepoint > entry.scalar) {
+            low = mid + 1;
+        } else {
+            const start: usize = entry.offset;
+            const end = std.math.add(usize, start, entry.len) catch return error.NamePreparationFailed;
+            if (end > data.len) return error.NamePreparationFailed;
+            return data[start..end];
+        }
+    }
+    return null;
 }
 
-/// Case-fold one codepoint for the caseIgnore class: ASCII and Latin-1
-/// Supplement letters only (see `Name.chaining_key`). U+00D7 MULTIPLICATION
-/// SIGN sits inside the Latin-1 uppercase-letter range but is not a letter
-/// and has no lowercase counterpart, so it is excluded.
-fn foldCaseIgnoreCodepoint(codepoint: u21) u21 {
-    if (codepoint >= 'A' and codepoint <= 'Z') return codepoint + 0x20;
-    if (codepoint >= 0xc0 and codepoint <= 0xde and codepoint != 0xd7) return codepoint + 0x20;
-    return codepoint;
+fn appendNfkd(list: *std.ArrayList(u21), arena: std.mem.Allocator, codepoint: u21) Error!void {
+    const s_base = 0xac00;
+    const l_base = 0x1100;
+    const v_base = 0x1161;
+    const t_base = 0x11a7;
+    const l_count = 19;
+    const v_count = 21;
+    const t_count = 28;
+    const n_count = v_count * t_count;
+    const s_count = l_count * n_count;
+
+    if (codepoint >= s_base and codepoint < s_base + s_count) {
+        const s_index = codepoint - s_base;
+        try appendScalar(list, arena, l_base + s_index / n_count);
+        try appendScalar(list, arena, v_base + (s_index % n_count) / t_count);
+        const t_index = s_index % t_count;
+        if (t_index != 0) try appendScalar(list, arena, t_base + t_index);
+        return;
+    }
+
+    if (try mappingFor(rfc4518_data.nfkd[0..], rfc4518_data.nfkd_data[0..], codepoint)) |replacement| {
+        try appendScalars(list, arena, replacement);
+    } else {
+        try appendScalar(list, arena, codepoint);
+    }
+}
+
+fn canonicalOrder(codepoints: []u21) void {
+    var index: usize = 1;
+    while (index < codepoints.len) : (index += 1) {
+        const ccc = combiningClass(codepoints[index]);
+        if (ccc == 0) continue;
+        var swap_index = index;
+        while (swap_index > 0 and combiningClass(codepoints[swap_index - 1]) > ccc) : (swap_index -= 1) {
+            std.mem.swap(u21, &codepoints[swap_index], &codepoints[swap_index - 1]);
+        }
+    }
+}
+
+fn composeNfkc(arena: std.mem.Allocator, input: []const u21) Error![]const u21 {
+    var output: std.ArrayList(u21) = .empty;
+    if (input.len == 0) return output.items;
+
+    try appendScalar(&output, arena, input[0]);
+    var starter_index: ?usize = if (combiningClass(input[0]) == 0) 0 else null;
+    var last_ccc = combiningClass(input[0]);
+
+    for (input[1..]) |codepoint| {
+        const ccc = combiningClass(codepoint);
+        var composed = false;
+        if (starter_index) |starter| {
+            if (last_ccc < ccc or last_ccc == 0) {
+                if (composePair(output.items[starter], codepoint)) |composite| {
+                    output.items[starter] = composite;
+                    composed = true;
+                }
+            }
+        }
+
+        if (!composed) {
+            try appendScalar(&output, arena, codepoint);
+            if (ccc == 0) starter_index = output.items.len - 1;
+            last_ccc = ccc;
+        }
+    }
+
+    return output.items;
+}
+
+fn composePair(first: u21, second: u21) ?u21 {
+    const l_base = 0x1100;
+    const v_base = 0x1161;
+    const t_base = 0x11a7;
+    const s_base = 0xac00;
+    const l_count = 19;
+    const v_count = 21;
+    const t_count = 28;
+    const n_count = v_count * t_count;
+    const s_count = l_count * n_count;
+
+    if (first >= l_base and first < l_base + l_count and second >= v_base and second < v_base + v_count) {
+        return s_base + ((first - l_base) * n_count) + ((second - v_base) * t_count);
+    }
+    if (first >= s_base and first < s_base + s_count and (first - s_base) % t_count == 0 and
+        second > t_base and second < t_base + t_count)
+    {
+        return first + (second - t_base);
+    }
+
+    var low: usize = 0;
+    var high: usize = rfc4518_data.compositions.len;
+    while (low < high) {
+        const mid = low + (high - low) / 2;
+        const entry = rfc4518_data.compositions[mid];
+        if (first < entry.first or (first == entry.first and second < entry.second)) {
+            high = mid;
+        } else if (first > entry.first or (first == entry.first and second > entry.second)) {
+            low = mid + 1;
+        } else {
+            return entry.composite;
+        }
+    }
+    return null;
+}
+
+fn encodeCaseIgnoreAttributeValue(arena: std.mem.Allocator, codepoints: []const u21) Error![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var index: usize = 0;
+    var wrote_run = false;
+
+    while (index < codepoints.len and codepoints[index] == ' ') : (index += 1) {}
+    if (index == codepoints.len) {
+        try appendUtf8(&out, arena, ' ');
+        try appendUtf8(&out, arena, ' ');
+        return out.items;
+    }
+
+    try appendUtf8(&out, arena, ' ');
+    while (index < codepoints.len) {
+        while (index < codepoints.len and codepoints[index] == ' ') : (index += 1) {}
+        if (index == codepoints.len) break;
+        if (wrote_run) {
+            try appendUtf8(&out, arena, ' ');
+            try appendUtf8(&out, arena, ' ');
+        }
+        while (index < codepoints.len and codepoints[index] != ' ') : (index += 1) {
+            try appendUtf8(&out, arena, codepoints[index]);
+        }
+        wrote_run = true;
+    }
+    try appendUtf8(&out, arena, ' ');
+    return out.items;
+}
+
+fn combiningClass(codepoint: u21) u8 {
+    var low: usize = 0;
+    var high: usize = rfc4518_data.combining_classes.len;
+    while (low < high) {
+        const mid = low + (high - low) / 2;
+        const range = rfc4518_data.combining_classes[mid];
+        if (codepoint < range.first) {
+            high = mid;
+        } else if (codepoint > range.last) {
+            low = mid + 1;
+        } else {
+            return range.ccc;
+        }
+    }
+    return 0;
+}
+
+fn containsRange(ranges: []const rfc4518_data.Range, codepoint: u21) bool {
+    var low: usize = 0;
+    var high: usize = ranges.len;
+    while (low < high) {
+        const mid = low + (high - low) / 2;
+        const range = ranges[mid];
+        if (codepoint < range.first) {
+            high = mid;
+        } else if (codepoint > range.last) {
+            low = mid + 1;
+        } else {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn appendScalar(list: *std.ArrayList(u21), arena: std.mem.Allocator, scalar: u21) Error!void {
+    _ = std.math.add(usize, list.items.len, 1) catch return error.NamePreparationFailed;
+    try list.append(arena, scalar);
+}
+
+fn appendScalars(list: *std.ArrayList(u21), arena: std.mem.Allocator, scalars: []const u21) Error!void {
+    _ = std.math.add(usize, list.items.len, scalars.len) catch return error.NamePreparationFailed;
+    try list.appendSlice(arena, scalars);
+}
+
+fn appendUtf8(list: *std.ArrayList(u8), arena: std.mem.Allocator, codepoint: u21) Error!void {
+    const encoded_len = std.unicode.utf8CodepointSequenceLength(codepoint) catch return error.NamePreparationFailed;
+    const new_len = std.math.add(usize, list.items.len, encoded_len) catch return error.NamePreparationFailed;
+    try list.ensureTotalCapacity(arena, new_len);
+    list.items.len += encoded_len;
+    _ = std.unicode.utf8Encode(codepoint, list.items[list.items.len - encoded_len ..]) catch return error.NamePreparationFailed;
 }
 
 fn appendCount(list: *std.ArrayList(u8), arena: std.mem.Allocator, count: usize) error{OutOfMemory}!void {

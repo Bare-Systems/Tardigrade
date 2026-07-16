@@ -15,14 +15,12 @@ All notable user-facing changes to Tardigrade are documented here.
   used by `Certificate.isSelfIssued`) that compares RDN attribute sets,
   matches `domainComponent` case-insensitively per RFC 4517 §4.2.3
   (`caseIgnoreIA5Match`), and unifies primitive PrintableString/UTF8String
-  values under one caseIgnore class — case-folding ASCII and Latin-1
-  Supplement letters and collapsing insignificant space, including
-  NO-BREAK SPACE — with every other value type kept exact-bytes. This
-  covers the ASCII and Latin-1 scripts exactly but is a deliberately
-  bounded approximation of RFC 5280 §7.1's full RFC 4518 StringPrep
-  requirement: it does not perform Unicode case folding beyond Latin-1,
-  NFKC normalization, or prohibited-codepoint rejection (documented on
-  `x509.Name.chaining_key`). AKI/SKI key identifiers rank candidate issuers
+  values under one caseIgnore class using RFC 4518 stored-value
+  preparation: RFC 3454 B.2 full case mapping (including one-to-many
+  mappings), Unicode 3.2 Form KC normalization, mappings to nothing,
+  prohibited/unassigned rejection, and RFC 4518 §2.6.1 insignificant-space
+  handling. Every other value type is kept exact-bytes under its own tag.
+  AKI/SKI key identifiers rank candidate issuers
   (RFC 4158-style hints) but never veto them. Enumeration
   is a documented total order — key-identifier agreement, then anchors
   before intermediates, then input index, walked depth-first without

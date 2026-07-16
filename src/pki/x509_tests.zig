@@ -798,24 +798,49 @@ test "name chaining unifies PrintableString and UTF8String with case and space f
     try testing.expect(!utf8_name.eqlForChaining(&bmp_name));
 }
 
-test "name chaining folds Latin-1 Supplement case and NO-BREAK SPACE" {
+test "name chaining uses RFC 4518 DirectoryString preparation" {
     var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_inst.deinit();
     const arena = arena_inst.allocator();
 
-    // Latin-1 Supplement letters fold within the caseIgnore class, covering
-    // the required DirectoryString forms beyond plain ASCII.
-    const upper = try x509.parseNameRaw(arena, try nameWithCnTag(arena, 0x0c, "ÉCOLE"), .{});
-    const lower = try x509.parseNameRaw(arena, try nameWithCnTag(arena, 0x0c, "école"), .{});
-    try testing.expect(upper.eqlForChaining(&lower));
-    try testing.expect(!upper.eqlEncoding(&lower));
+    const sharp_s = try x509.parseNameRaw(arena, try nameWithCnTag(arena, 0x0c, "Straße"), .{});
+    const ss = try x509.parseNameRaw(arena, try nameWithCnTag(arena, 0x0c, "STRASSE"), .{});
+    try testing.expect(sharp_s.eqlForChaining(&ss));
+    try testing.expect(!sharp_s.eqlEncoding(&ss));
 
-    // U+00A0 NO-BREAK SPACE folds to a plain space for insignificant-space
-    // handling, the same as the ASCII white-space case above.
+    const soft_hyphen = try x509.parseNameRaw(arena, try nameWithCnTag(arena, 0x0c, "soft\u{00AD}hyphen"), .{});
+    const no_hyphen = try x509.parseNameRaw(arena, try nameWithCnTag(arena, 0x0c, "softhyphen"), .{});
+    try testing.expect(soft_hyphen.eqlForChaining(&no_hyphen));
+
+    const composed = try x509.parseNameRaw(arena, try nameWithCnTag(arena, 0x0c, "\u{00E9}"), .{});
+    const decomposed = try x509.parseNameRaw(arena, try nameWithCnTag(arena, 0x0c, "e\u{0301}"), .{});
+    try testing.expect(composed.eqlForChaining(&decomposed));
+
+    const full_width = try x509.parseNameRaw(arena, try nameWithCnTag(arena, 0x0c, "\u{FF21}\u{FF23}\u{FF2D}\u{FF25}"), .{});
+    const ascii = try x509.parseNameRaw(arena, try nameWithCnTag(arena, 0x0c, "ACME"), .{});
+    try testing.expect(full_width.eqlForChaining(&ascii));
+
     const nbsp_name = try x509.parseNameRaw(arena, try nameWithCnTag(arena, 0x0c, "Example\u{00A0}CA"), .{});
     const space_name = try x509.parseNameRaw(arena, try nameWithCnTag(arena, 0x0c, "Example CA"), .{});
     try testing.expect(nbsp_name.eqlForChaining(&space_name));
-    try testing.expect(!nbsp_name.eqlEncoding(&space_name));
+
+    const different = try x509.parseNameRaw(arena, try nameWithCnTag(arena, 0x0c, "STRASZE"), .{});
+    try testing.expect(!sharp_s.eqlForChaining(&different));
+}
+
+test "name chaining rejects undefined RFC 4518 stored DirectoryString preparation" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    try testing.expectError(
+        error.NamePreparationFailed,
+        x509.parseNameRaw(arena, try nameWithCnTag(arena, 0x0c, "\u{E000}"), .{}),
+    );
+    try testing.expectError(
+        error.NamePreparationFailed,
+        x509.parseNameRaw(arena, try nameWithCnTag(arena, 0x0c, "\u{0221}"), .{}),
+    );
 }
 
 test "domainComponent RDN values compare with caseIgnoreIA5Match" {
@@ -834,22 +859,21 @@ test "domainComponent RDN values compare with caseIgnoreIA5Match" {
     try testing.expect(!upper.eqlForChaining(&different));
 }
 
-test "isSelfIssued uses name chaining, not encoding equality" {
+test "isSelfIssued uses RFC 4518 name chaining, not encoding equality" {
     var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_inst.deinit();
     const arena = arena_inst.allocator();
 
-    // Issuer and subject carry the same value under different
-    // DirectoryString encodings, case, and insignificant space; RFC 5280
-    // defines self-issued via §7.1 name chaining, not encoding identity.
+    // RFC 5280 defines self-issued via §7.1 name chaining, not encoding
+    // identity. This pair depends on RFC 3454 B.2 one-to-many mapping.
     var list: std.ArrayList([]const u8) = .empty;
     defer list.deinit(arena);
     try list.append(arena, try versionTlv(arena, 2));
     try list.append(arena, try tlv(arena, 0x02, &.{&[_]u8{0x01}}));
     try list.append(arena, try algorithmEd25519(arena));
-    try list.append(arena, try nameWithCnTag(arena, 0x0c, "  Example   CA "));
+    try list.append(arena, try nameWithCnTag(arena, 0x0c, "Straße CA"));
     try list.append(arena, try utcValidity(arena));
-    try list.append(arena, try nameWithCnTag(arena, 0x13, "example ca"));
+    try list.append(arena, try nameWithCnTag(arena, 0x0c, "STRASSE CA"));
     try list.append(arena, try spkiEd25519(arena));
     const tbs = try tlv(arena, 0x30, list.items);
     const bytes = try tlv(arena, 0x30, &.{ tbs, try algorithmEd25519(arena), try signatureBits(arena) });
@@ -895,6 +919,21 @@ test "name chaining keys are structure-sensitive" {
     const multi_attribute_printable = try tlv(arena, 0x30, &.{try tlv(arena, 0x31, &.{ printable_cn_atv, org_atv })});
     const combined_printable = try x509.parseNameRaw(arena, multi_attribute_printable, .{});
     try testing.expect(combined.eqlForChaining(&combined_printable));
+}
+
+test "name chaining key construction is leak-free across allocation failure points" {
+    var fixture_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer fixture_arena.deinit();
+    const fixture_allocator = fixture_arena.allocator();
+    const name_der = try nameWithCnTag(fixture_allocator, 0x0c, "Straße \u{00AD} \u{FF21}\u{FF23}\u{FF2D}\u{FF25}");
+
+    try testing.checkAllAllocationFailures(testing.allocator, struct {
+        fn run(inner_allocator: std.mem.Allocator, der_bytes: []const u8) !void {
+            var arena_inst = std.heap.ArenaAllocator.init(inner_allocator);
+            defer arena_inst.deinit();
+            _ = try x509.parseNameRaw(arena_inst.allocator(), der_bytes, .{});
+        }
+    }.run, .{name_der});
 }
 
 test "parser is leak-free across allocation failure points" {

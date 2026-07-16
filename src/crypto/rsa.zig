@@ -231,6 +231,12 @@ fn encodePssForTest(message: []const u8, salt: [Sha256.digest_length]u8, out: []
     out[out.len - 1] = 0xbc;
 }
 
+fn minimumTestModulus() [max_modulus_bytes]u8 {
+    var modulus = [_]u8{0} ** max_modulus_bytes;
+    modulus[0] = 0x80;
+    return modulus;
+}
+
 test "EMSA-PSS rejects every nonzero PS byte and structural corruption" {
     var encoded: [256]u8 = undefined;
     encodePssForTest("message", [_]u8{0x42} ** Sha256.digest_length, &encoded, 2047);
@@ -306,6 +312,11 @@ test "RSA public-key DER enforces exponent range and parity" {
     equal_size_exponent[1] = 0x80;
     var equal_size_der: [600]u8 = undefined;
     try std.testing.expectError(error.InvalidInput, parsePublicKey(makeTestPublicKey(&equal_size_der, &equal_size_exponent, max_modulus_bytes, 0x80)));
+    var valid_large_exponent: [257]u8 = [_]u8{0} ** 257;
+    valid_large_exponent[1] = 0x7f;
+    @memset(valid_large_exponent[2..], 0xff);
+    var valid_large_der: [600]u8 = undefined;
+    _ = try parsePublicKey(makeTestPublicKey(&valid_large_der, &valid_large_exponent, max_modulus_bytes, 0x80));
     equal_size_exponent[1] = 0xff;
     var greater_size_der: [600]u8 = undefined;
     try std.testing.expectError(error.InvalidInput, parsePublicKey(makeTestPublicKey(&greater_size_der, &equal_size_exponent, max_modulus_bytes, 0x80)));
@@ -320,7 +331,7 @@ test "RSA-PSS rejects short, long, and out-of-range signatures" {
     var der: [300]u8 = undefined;
     const key = makeTestPublicKey(&der, &exponent, max_modulus_bytes, 0x80);
     // This signature equals the minimum valid modulus used by the test key.
-    const signature_equal_to_modulus = [_]u8{0x80} ++ ([_]u8{0} ** (max_modulus_bytes - 1));
+    const signature_equal_to_modulus = minimumTestModulus();
     const signature_greater_than_modulus = [_]u8{0xff} ** max_modulus_bytes;
     try std.testing.expectError(error.AuthenticationFailed, verifyPssSha256(key, "message", &signature_equal_to_modulus));
     try std.testing.expectError(error.AuthenticationFailed, verifyPssSha256(key, "message", &signature_greater_than_modulus));

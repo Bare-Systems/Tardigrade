@@ -366,6 +366,8 @@ pub fn build(b: *std.Build) void {
     quic_h3_e2e_mod.addImport("stream_transport", stream_transport_mod);
     const quic_h3_e2e_tests = b.addTest(.{ .root_module = quic_h3_e2e_mod });
     const run_quic_h3_e2e_tests = b.addRunArtifact(quic_h3_e2e_tests);
+    const quic_h3_driver_step = b.step("test-quic-h3-driver", "Run deterministic native QUIC/H3 driver scenarios");
+    quic_h3_driver_step.dependOn(&run_quic_h3_e2e_tests.step);
     quic_step.dependOn(&run_quic_h3_e2e_tests.step);
     test_step.dependOn(&run_quic_h3_e2e_tests.step);
 

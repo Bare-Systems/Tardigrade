@@ -103,7 +103,8 @@ fn verifyPss(em: []const u8, em_bits: usize, message: []const u8) Error!void {
     const masked_db = em[0..db_len];
     const h = em[db_len .. db_len + h_len];
     const unused_bits = 8 * em.len - em_bits;
-    const unused_shift: u3 = if (unused_bits <= 7) @intCast(unused_bits) else return error.InvalidInput;
+    if (unused_bits > 7) return error.InvalidInput;
+    const unused_shift: u3 = @intCast(unused_bits);
     // This mask preserves the meaningful low bits and excludes the unused
     // high-order bits required to be zero by RFC 8017. With zero unused bits
     // it is intentionally 0xff.
@@ -221,13 +222,13 @@ test "RSA-PSS accepts fixed 2048, 3072, and 4096-bit fixtures" {
     inline for (vectors) |vector| try verifyPssSha256(vector[0], message, vector[1]);
 }
 
-test "RSA-PSS rejects signature mutations and representative range failures" {
+test "RSA-PSS rejects signature mutations and out-of-range representatives" {
     const public_key = @embedFile("../../tests/vectors/rsa_pss/public-2048.der");
     const valid_signature = @embedFile("../../tests/vectors/rsa_pss/signature-2048.bin");
     const message = @embedFile("../../tests/vectors/rsa_pss/message.txt");
-    var mutated = [_]u8{0} ** 256;
+    var mutated: [valid_signature.len]u8 = undefined;
     @memcpy(&mutated, valid_signature);
-    for (0..256) |index| {
+    for (0..mutated.len) |index| {
         mutated[index] ^= 1;
         try std.testing.expectError(error.AuthenticationFailed, verifyPssSha256(public_key, message, &mutated));
         mutated[index] ^= 1;
@@ -237,13 +238,13 @@ test "RSA-PSS rejects signature mutations and representative range failures" {
     var modulus_fe = ff.Modulus(max_modulus_bits).fromBytes(key.modulus, .big) catch unreachable;
     const signature_fe = ff.Modulus(max_modulus_bits).Fe.fromBytes(modulus_fe, valid_signature, .big) catch unreachable;
     const recovered = modulus_fe.powWithEncodedPublicExponent(signature_fe, key.exponent, .big) catch unreachable;
-    var encoded: [256]u8 = undefined;
+    var encoded: [valid_signature.len]u8 = undefined;
     recovered.toBytes(encoded[0..], .big) catch unreachable;
     const db_len = encoded.len - Sha256.digest_length - 1;
     const ps_len = db_len - Sha256.digest_length - 1;
     const h = encoded[db_len .. db_len + Sha256.digest_length].*;
-    var mask: [256]u8 = undefined;
-    var db: [256]u8 = undefined;
+    var mask: [valid_signature.len]u8 = undefined;
+    var db: [valid_signature.len]u8 = undefined;
     mgf1(&h, mask[0..db_len]);
     for (db[0..db_len], encoded[0..db_len], mask[0..db_len]) |*out, masked, mask_byte| out.* = masked ^ mask_byte;
     for (0..ps_len) |ps_index| {
@@ -271,8 +272,10 @@ test "RSA-PSS rejects signature mutations and representative range failures" {
     encoded[encoded.len - 1] ^= 1;
     encoded[0] |= 0x80;
     try std.testing.expectError(error.InvalidInput, verifyPss(&encoded, key.bits - 1, message));
-    var equal = [_]u8{0} ** 256;
-    var greater = [_]u8{0} ** 256;
+    var equal: [valid_signature.len]u8 = undefined;
+    var greater: [valid_signature.len]u8 = undefined;
+    @memset(&equal, 0);
+    @memset(&greater, 0);
     @memcpy(&equal, key.modulus);
     @memcpy(&greater, key.modulus);
     var carry: u8 = 1;

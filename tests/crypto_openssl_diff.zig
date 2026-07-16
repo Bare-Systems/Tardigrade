@@ -8,10 +8,12 @@
 const std = @import("std");
 const compat = @import("zig_compat");
 const crypto_pkg = @import("crypto");
+const quic = @import("quic");
 const tls_core = @import("tls_core");
 
 const testing = std.testing;
 const provider = crypto_pkg.provider;
+const profile = crypto_pkg.profile;
 const pure_zig = crypto_pkg.pure_zig;
 
 const OpenSslError = error{
@@ -20,10 +22,105 @@ const OpenSslError = error{
     DifferentialMismatch,
 };
 
+const CoverageKind = enum {
+    hkdf_extract,
+    hkdf_expand_label,
+    tls_record_keys,
+    quic_initial,
+    transcript_hash,
+    finished_hmac,
+    aead,
+    key_exchange,
+    signature_verify,
+};
+
+const CoverageClass = enum {
+    positive,
+    negative,
+};
+
+const CoverageCase = struct {
+    kind: CoverageKind,
+    algorithm: ?profile.Algorithm,
+    class: CoverageClass,
+    rationale: []const u8,
+};
+
+const Waiver = struct {
+    kind: CoverageKind,
+    algorithm: profile.Algorithm,
+    class: CoverageClass,
+    reason: []const u8,
+    tracking_issue: []const u8,
+};
+
+const executed_cases = [_]CoverageCase{
+    .{ .kind = .hkdf_extract, .algorithm = .{ .hkdf = .sha256 }, .class = .positive, .rationale = "provider HKDF-Extract compared to OpenSSL EXTRACT_ONLY" },
+    .{ .kind = .hkdf_extract, .algorithm = .{ .hkdf = .sha384 }, .class = .positive, .rationale = "provider HKDF-Extract compared to OpenSSL EXTRACT_ONLY" },
+    .{ .kind = .hkdf_expand_label, .algorithm = .{ .hkdf = .sha256 }, .class = .positive, .rationale = "provider TLS HKDF-Expand-Label compared to OpenSSL EXPAND_ONLY" },
+    .{ .kind = .hkdf_expand_label, .algorithm = .{ .hkdf = .sha384 }, .class = .positive, .rationale = "provider TLS HKDF-Expand-Label compared to OpenSSL EXPAND_ONLY" },
+    .{ .kind = .tls_record_keys, .algorithm = .{ .aead = .aes_128_gcm }, .class = .positive, .rationale = "TrafficKeys.derive compared to OpenSSL key/iv labels" },
+    .{ .kind = .tls_record_keys, .algorithm = .{ .aead = .aes_256_gcm }, .class = .positive, .rationale = "TrafficKeys.derive compared to OpenSSL key/iv labels" },
+    .{ .kind = .tls_record_keys, .algorithm = .{ .aead = .chacha20_poly1305 }, .class = .positive, .rationale = "TrafficKeys.derive compared to OpenSSL key/iv labels" },
+    .{ .kind = .quic_initial, .algorithm = .{ .aead = .aes_128_gcm }, .class = .positive, .rationale = "deriveInitialSecretsV1 compared to OpenSSL HKDF extract/labels" },
+    .{ .kind = .transcript_hash, .algorithm = .{ .hash = .sha256 }, .class = .positive, .rationale = "Transcript update/HRR replacement compared to OpenSSL SHA-256" },
+    .{ .kind = .transcript_hash, .algorithm = .{ .hash = .sha256 }, .class = .negative, .rationale = "mutated transcript hash produces different Finished verify_data" },
+    .{ .kind = .finished_hmac, .algorithm = .{ .hkdf = .sha256 }, .class = .positive, .rationale = "KeySchedule Finished HMAC compared to OpenSSL HMAC" },
+    .{ .kind = .finished_hmac, .algorithm = .{ .hkdf = .sha256 }, .class = .negative, .rationale = "transcript mutation changes Finished verify_data" },
+};
+
+const waivers = [_]Waiver{
+    .{ .kind = .aead, .algorithm = .{ .aead = .aes_128_gcm }, .class = .positive, .reason = "OpenSSL CLI cannot seal/open AEAD with tags portably; add test-only EVP oracle executable.", .tracking_issue = "#377" },
+    .{ .kind = .aead, .algorithm = .{ .aead = .aes_128_gcm }, .class = .negative, .reason = "Invalid-tag parity requires the same test-only EVP oracle executable.", .tracking_issue = "#377" },
+    .{ .kind = .aead, .algorithm = .{ .aead = .aes_256_gcm }, .class = .positive, .reason = "OpenSSL CLI cannot seal/open AEAD with tags portably; add test-only EVP oracle executable.", .tracking_issue = "#377" },
+    .{ .kind = .aead, .algorithm = .{ .aead = .aes_256_gcm }, .class = .negative, .reason = "Invalid-tag parity requires the same test-only EVP oracle executable.", .tracking_issue = "#377" },
+    .{ .kind = .aead, .algorithm = .{ .aead = .chacha20_poly1305 }, .class = .positive, .reason = "OpenSSL CLI cannot seal/open AEAD with tags portably; add test-only EVP oracle executable.", .tracking_issue = "#377" },
+    .{ .kind = .aead, .algorithm = .{ .aead = .chacha20_poly1305 }, .class = .negative, .reason = "Invalid-tag parity requires the same test-only EVP oracle executable.", .tracking_issue = "#377" },
+    .{ .kind = .key_exchange, .algorithm = .{ .group = .x25519 }, .class = .positive, .reason = "X25519 parity needs a stable out-of-process EVP derive oracle, not ad hoc CLI files.", .tracking_issue = "#377" },
+    .{ .kind = .key_exchange, .algorithm = .{ .group = .x25519 }, .class = .negative, .reason = "Low-order/invalid-key parity needs the same EVP derive oracle.", .tracking_issue = "#377" },
+    .{ .kind = .signature_verify, .algorithm = .{ .signature = .ed25519 }, .class = .positive, .reason = "Signature parity needs a stable out-of-process EVP verify oracle.", .tracking_issue = "#377" },
+    .{ .kind = .signature_verify, .algorithm = .{ .signature = .ed25519 }, .class = .negative, .reason = "Invalid-signature parity needs the same EVP verify oracle.", .tracking_issue = "#377" },
+    .{ .kind = .signature_verify, .algorithm = .{ .signature = .ecdsa_secp256r1_sha256 }, .class = .positive, .reason = "ECDSA parity needs a stable out-of-process EVP verify oracle.", .tracking_issue = "#377" },
+    .{ .kind = .signature_verify, .algorithm = .{ .signature = .ecdsa_secp256r1_sha256 }, .class = .negative, .reason = "Invalid-signature parity needs the same EVP verify oracle.", .tracking_issue = "#377" },
+};
+
 fn hexBytes(comptime hex: []const u8) [hex.len / 2]u8 {
     var bytes: [hex.len / 2]u8 = undefined;
     _ = std.fmt.hexToBytes(&bytes, hex) catch unreachable;
     return bytes;
+}
+
+fn algorithmEql(a: profile.Algorithm, b: profile.Algorithm) bool {
+    return switch (a) {
+        .hash => |value| b == .hash and b.hash == value,
+        .hkdf => |value| b == .hkdf and b.hkdf == value,
+        .aead => |value| b == .aead and b.aead == value,
+        .group => |value| b == .group and b.group == value,
+        .signature => |value| b == .signature and b.signature == value,
+        .certificate_helper => |value| b == .certificate_helper and b.certificate_helper == value,
+        .entropy => |value| b == .entropy and b.entropy == value,
+    };
+}
+
+fn hasCoverage(kind: CoverageKind, algorithm: profile.Algorithm, class: CoverageClass) bool {
+    for (executed_cases) |case| {
+        const case_algorithm = case.algorithm orelse continue;
+        if (case.kind == kind and case.class == class and algorithmEql(case_algorithm, algorithm)) return true;
+    }
+    return false;
+}
+
+fn hasWaiver(kind: CoverageKind, algorithm: profile.Algorithm, class: CoverageClass) bool {
+    for (waivers) |waiver| {
+        if (waiver.kind == kind and waiver.class == class and algorithmEql(waiver.algorithm, algorithm)) return true;
+    }
+    return false;
+}
+
+fn expectCoverageOrWaiver(kind: CoverageKind, algorithm: profile.Algorithm, class: CoverageClass) !void {
+    if (hasCoverage(kind, algorithm, class) or hasWaiver(kind, algorithm, class)) return;
+    std.debug.print("missing OpenSSL differential coverage or waiver: kind={s} class={s} algorithm={any}\n", .{ @tagName(kind), @tagName(class), algorithm });
+    return error.MissingDifferentialCoverage;
 }
 
 fn cryptoProvider() provider.CryptoProvider {
@@ -173,6 +270,48 @@ fn runOpenSsl(allocator: std.mem.Allocator, stage: []const u8, argv: []const []c
     return error.OpenSslOracleFailed;
 }
 
+fn opensslHkdfExtract(
+    allocator: std.mem.Allocator,
+    stage: []const u8,
+    hash: provider.Hash,
+    salt: []const u8,
+    ikm: []const u8,
+) ![]u8 {
+    const salt_hex = try hexAlloc(allocator, salt);
+    defer allocator.free(salt_hex);
+    const ikm_hex = try hexAlloc(allocator, ikm);
+    defer allocator.free(ikm_hex);
+    const salt_opt = try std.fmt.allocPrint(allocator, "hexsalt:{s}", .{salt_hex});
+    defer allocator.free(salt_opt);
+    const key_opt = try std.fmt.allocPrint(allocator, "hexkey:{s}", .{ikm_hex});
+    defer allocator.free(key_opt);
+    const key_len = try std.fmt.allocPrint(allocator, "{d}", .{hash.digestLength()});
+    defer allocator.free(key_len);
+    const digest = switch (hash) {
+        .sha256 => "digest:SHA256",
+        .sha384 => "digest:SHA384",
+    };
+    const openssl = try opensslBinary(allocator);
+    defer openssl.deinit(allocator);
+
+    return runOpenSsl(allocator, stage, &.{
+        openssl.path,
+        "kdf",
+        "-keylen",
+        key_len,
+        "-binary",
+        "-kdfopt",
+        digest,
+        "-kdfopt",
+        "mode:EXTRACT_ONLY",
+        "-kdfopt",
+        salt_opt,
+        "-kdfopt",
+        key_opt,
+        "HKDF",
+    });
+}
+
 fn opensslHkdfExpandLabel(
     allocator: std.mem.Allocator,
     stage: []const u8,
@@ -250,11 +389,41 @@ fn opensslHmacSha256File(
     });
 }
 
-test "OpenSSL HKDF oracle matches TLS 1.3 and QUIC label derivations" {
+fn expectTlsTrafficKeys(
+    allocator: std.mem.Allocator,
+    stage: []const u8,
+    cp: provider.CryptoProvider,
+    suite: tls_core.algorithms.CipherSuite,
+    traffic_secret: []const u8,
+) !void {
+    const record_protection = tls_core.record_protection;
+    const suite_profile = record_protection.suiteProfile(suite);
+    var keys = try record_protection.TrafficKeys.derive(cp, suite, traffic_secret);
+    defer keys.deinit();
+
+    const openssl_key = try opensslHkdfExpandLabel(allocator, stage, suite_profile.hash, traffic_secret, "key", "", suite_profile.aead.keyLength());
+    defer allocator.free(openssl_key);
+    try expectStage(stage, keys.key.slice(), openssl_key);
+
+    const iv_stage = try std.fmt.allocPrint(allocator, "{s} iv", .{stage});
+    defer allocator.free(iv_stage);
+    const openssl_iv = try opensslHkdfExpandLabel(allocator, iv_stage, suite_profile.hash, traffic_secret, "iv", "", provider.aead_nonce_len);
+    defer allocator.free(openssl_iv);
+    try expectStage(iv_stage, keys.iv.slice(), openssl_iv);
+}
+
+test "OpenSSL HKDF oracle matches provider and TLS record derivations" {
     const allocator = testing.allocator;
     const cp = cryptoProvider();
 
-    const prk = hexBytes("077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5");
+    const ikm = hexBytes("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b");
+    const salt = hexBytes("000102030405060708090a0b0c");
+    var prk: [provider.Hash.sha256.digestLength()]u8 = undefined;
+    try cp.hkdfExtract(.sha256, &salt, &ikm, &prk);
+    const openssl_prk = try opensslHkdfExtract(allocator, "hkdf extract sha256 / RFC 5869 A.1", .sha256, &salt, &ikm);
+    defer allocator.free(openssl_prk);
+    try expectStage("hkdf extract sha256 / RFC 5869 A.1", &prk, openssl_prk);
+
     const context = hexBytes("f0f1f2f3f4f5f6f7f8f9");
     var pure_sha256: [42]u8 = undefined;
     try cp.hkdfExpandLabel(.sha256, &prk, "derived", &context, &pure_sha256);
@@ -263,6 +432,12 @@ test "OpenSSL HKDF oracle matches TLS 1.3 and QUIC label derivations" {
     try expectStage("hkdf expand-label sha256 / TLS derived", &pure_sha256, openssl_sha256);
 
     const secret384 = [_]u8{0x42} ** provider.Hash.sha384.digestLength();
+    var prk384: [provider.Hash.sha384.digestLength()]u8 = undefined;
+    try cp.hkdfExtract(.sha384, &secret384, &ikm, &prk384);
+    const openssl_prk384 = try opensslHkdfExtract(allocator, "hkdf extract sha384 / fixed fixture", .sha384, &secret384, &ikm);
+    defer allocator.free(openssl_prk384);
+    try expectStage("hkdf extract sha384 / fixed fixture", &prk384, openssl_prk384);
+
     var pure_sha384: [48]u8 = undefined;
     try cp.hkdfExpandLabel(.sha384, &secret384, "c hs traffic", "", &pure_sha384);
     const openssl_sha384 = try opensslHkdfExpandLabel(allocator, "hkdf expand-label sha384 / client handshake traffic", .sha384, &secret384, "c hs traffic", "", pure_sha384.len);
@@ -270,30 +445,53 @@ test "OpenSSL HKDF oracle matches TLS 1.3 and QUIC label derivations" {
     try expectStage("hkdf expand-label sha384 / client handshake traffic", &pure_sha384, openssl_sha384);
 
     const tls_record_secret = hexBytes("0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20");
-    var pure_record_key: [16]u8 = undefined;
-    try cp.hkdfExpandLabel(.sha256, &tls_record_secret, "key", "", &pure_record_key);
-    const openssl_record_key = try opensslHkdfExpandLabel(allocator, "tls record aes128 key", .sha256, &tls_record_secret, "key", "", pure_record_key.len);
-    defer allocator.free(openssl_record_key);
-    try expectStage("tls record aes128 key", &pure_record_key, openssl_record_key);
+    try expectTlsTrafficKeys(allocator, "tls record aes128 key", cp, .tls_aes_128_gcm_sha256, &tls_record_secret);
+    try expectTlsTrafficKeys(allocator, "tls record aes256 key", cp, .tls_aes_256_gcm_sha384, &secret384);
 
-    var pure_record_iv: [provider.aead_nonce_len]u8 = undefined;
-    try cp.hkdfExpandLabel(.sha256, &tls_record_secret, "iv", "", &pure_record_iv);
-    const openssl_record_iv = try opensslHkdfExpandLabel(allocator, "tls record aes128 iv", .sha256, &tls_record_secret, "iv", "", pure_record_iv.len);
-    defer allocator.free(openssl_record_iv);
-    try expectStage("tls record aes128 iv", &pure_record_iv, openssl_record_iv);
+    const chacha_secret = [_]u8{0x33} ** provider.Hash.sha256.digestLength();
+    try expectTlsTrafficKeys(allocator, "tls record chacha20 key", cp, .tls_chacha20_poly1305_sha256, &chacha_secret);
+}
 
-    const quic_initial_secret = hexBytes("7db5df06e7a69e432496adedb00851923595221596ae2ae9fb8115c1e9ed0a44");
-    var pure_client_initial: [32]u8 = undefined;
-    try cp.hkdfExpandLabel(.sha256, &quic_initial_secret, "client in", "", &pure_client_initial);
-    const openssl_client_initial = try opensslHkdfExpandLabel(allocator, "quic client initial traffic secret", .sha256, &quic_initial_secret, "client in", "", pure_client_initial.len);
-    defer allocator.free(openssl_client_initial);
-    try expectStage("quic client initial traffic secret", &pure_client_initial, openssl_client_initial);
+test "OpenSSL HKDF oracle matches QUIC production initial derivation" {
+    const allocator = testing.allocator;
+    const dcid = hexBytes("8394c8f03e515708");
+    const zig_initial = try quic.tls_adapter.deriveInitialSecretsV1(&dcid);
 
-    var pure_quic_key: [16]u8 = undefined;
-    try cp.hkdfExpandLabel(.sha256, &pure_client_initial, "quic key", "", &pure_quic_key);
-    const openssl_quic_key = try opensslHkdfExpandLabel(allocator, "quic client initial key", .sha256, &pure_client_initial, "quic key", "", pure_quic_key.len);
-    defer allocator.free(openssl_quic_key);
-    try expectStage("quic client initial key", &pure_quic_key, openssl_quic_key);
+    const openssl_initial = try opensslHkdfExtract(allocator, "quic v1 initial secret", .sha256, &quic.tls_adapter.initial_salt_v1, &dcid);
+    defer allocator.free(openssl_initial);
+    try expectStage("quic v1 initial secret", &zig_initial.initial_secret, openssl_initial);
+
+    const openssl_client_secret = try opensslHkdfExpandLabel(allocator, "quic client initial secret", .sha256, &zig_initial.initial_secret, "client in", "", quic.tls_adapter.traffic_secret_len);
+    defer allocator.free(openssl_client_secret);
+    try expectStage("quic client initial secret", &zig_initial.client.secret, openssl_client_secret);
+
+    const openssl_server_secret = try opensslHkdfExpandLabel(allocator, "quic server initial secret", .sha256, &zig_initial.initial_secret, "server in", "", quic.tls_adapter.traffic_secret_len);
+    defer allocator.free(openssl_server_secret);
+    try expectStage("quic server initial secret", &zig_initial.server.secret, openssl_server_secret);
+
+    const openssl_client_key = try opensslHkdfExpandLabel(allocator, "quic client initial key", .sha256, &zig_initial.client.secret, "quic key", "", quic.tls_adapter.aead_key_len);
+    defer allocator.free(openssl_client_key);
+    try expectStage("quic client initial key", &zig_initial.client.key, openssl_client_key);
+
+    const openssl_client_iv = try opensslHkdfExpandLabel(allocator, "quic client initial iv", .sha256, &zig_initial.client.secret, "quic iv", "", quic.tls_adapter.aead_iv_len);
+    defer allocator.free(openssl_client_iv);
+    try expectStage("quic client initial iv", &zig_initial.client.iv, openssl_client_iv);
+
+    const openssl_client_hp = try opensslHkdfExpandLabel(allocator, "quic client initial hp", .sha256, &zig_initial.client.secret, "quic hp", "", quic.tls_adapter.header_protection_key_len);
+    defer allocator.free(openssl_client_hp);
+    try expectStage("quic client initial hp", &zig_initial.client.hp, openssl_client_hp);
+
+    const openssl_server_key = try opensslHkdfExpandLabel(allocator, "quic server initial key", .sha256, &zig_initial.server.secret, "quic key", "", quic.tls_adapter.aead_key_len);
+    defer allocator.free(openssl_server_key);
+    try expectStage("quic server initial key", &zig_initial.server.key, openssl_server_key);
+
+    const openssl_server_iv = try opensslHkdfExpandLabel(allocator, "quic server initial iv", .sha256, &zig_initial.server.secret, "quic iv", "", quic.tls_adapter.aead_iv_len);
+    defer allocator.free(openssl_server_iv);
+    try expectStage("quic server initial iv", &zig_initial.server.iv, openssl_server_iv);
+
+    const openssl_server_hp = try opensslHkdfExpandLabel(allocator, "quic server initial hp", .sha256, &zig_initial.server.secret, "quic hp", "", quic.tls_adapter.header_protection_key_len);
+    defer allocator.free(openssl_server_hp);
+    try expectStage("quic server initial hp", &zig_initial.server.hp, openssl_server_hp);
 }
 
 test "OpenSSL digest and HMAC oracles match transcript and Finished values" {
@@ -309,18 +507,83 @@ test "OpenSSL digest and HMAC oracles match transcript and Finished values" {
     const client_hello_path = try tmp.dir.realPathFileAlloc(io, "client_hello_1.bin", allocator);
     defer allocator.free(client_hello_path);
 
+    var transcript = tls_core.transcript.Transcript{};
+    transcript.update(&client_hello_1);
+    const zig_ch1_hash = transcript.peek();
     const openssl_ch1_hash = try opensslSha256File(allocator, "tls transcript ClientHello1 hash", client_hello_path);
     defer allocator.free(openssl_ch1_hash);
-    try expectStage("tls transcript ClientHello1 hash", &hexBytes("93e26e55d8fd5b5236e00556a269142fc88e0d9616836ca9b8607841ac0287a0"), openssl_ch1_hash);
+    try expectStage("tls transcript ClientHello1 hash", &zig_ch1_hash, openssl_ch1_hash);
+
+    const hello_retry_request = hexBytes("02000002cf21");
+    const client_hello_2 = hexBytes("01000002ddee");
+    transcript.replace(zig_ch1_hash);
+    transcript.update(&hello_retry_request);
+    transcript.update(&client_hello_2);
+    const zig_hrr_hash = transcript.peek();
+
+    var synthetic_and_hrr: [4 + tls_core.transcript.digest_len + hello_retry_request.len + client_hello_2.len]u8 = undefined;
+    synthetic_and_hrr[0] = 0xfe;
+    std.mem.writeInt(u24, synthetic_and_hrr[1..4], tls_core.transcript.digest_len, .big);
+    @memcpy(synthetic_and_hrr[4..][0..tls_core.transcript.digest_len], &zig_ch1_hash);
+    var offset: usize = 4 + tls_core.transcript.digest_len;
+    @memcpy(synthetic_and_hrr[offset..][0..hello_retry_request.len], &hello_retry_request);
+    offset += hello_retry_request.len;
+    @memcpy(synthetic_and_hrr[offset..][0..client_hello_2.len], &client_hello_2);
+    try tmp.dir.writeFile(io, .{ .sub_path = "synthetic_hrr.bin", .data = &synthetic_and_hrr });
+    const synthetic_hrr_path = try tmp.dir.realPathFileAlloc(io, "synthetic_hrr.bin", allocator);
+    defer allocator.free(synthetic_hrr_path);
+    const openssl_hrr_hash = try opensslSha256File(allocator, "tls transcript HRR hash", synthetic_hrr_path);
+    defer allocator.free(openssl_hrr_hash);
+    try expectStage("tls transcript HRR hash", &zig_hrr_hash, openssl_hrr_hash);
 
     const traffic_secret = hexBytes("b67b7d690cc16c4e75e54213cb2d37b4e9c912bcded9105d42befd59d391ad38");
-    const finished_hash = hexBytes("9608102a0f1ccc6db6250b7b7e417b1a000eaada3daae4777a7686c9ff83df13");
-    try tmp.dir.writeFile(io, .{ .sub_path = "finished_hash.bin", .data = &finished_hash });
+    try tmp.dir.writeFile(io, .{ .sub_path = "finished_hash.bin", .data = &zig_hrr_hash });
     const finished_hash_path = try tmp.dir.realPathFileAlloc(io, "finished_hash.bin", allocator);
     defer allocator.free(finished_hash_path);
 
     const finished_key = KeySchedule.finishedKey(traffic_secret);
     const openssl_verify_data = try opensslHmacSha256File(allocator, "tls13 server Finished verify_data", &finished_key, finished_hash_path);
     defer allocator.free(openssl_verify_data);
-    try expectStage("tls13 server Finished verify_data", &KeySchedule.verifyData(traffic_secret, finished_hash), openssl_verify_data);
+    try expectStage("tls13 server Finished verify_data", &KeySchedule.verifyData(traffic_secret, zig_hrr_hash), openssl_verify_data);
+
+    var mutated_hash = zig_hrr_hash;
+    mutated_hash[0] ^= 0x01;
+    try testing.expect(!std.mem.eql(u8, &KeySchedule.verifyData(traffic_secret, zig_hrr_hash), &KeySchedule.verifyData(traffic_secret, mutated_hash)));
+}
+
+test "OpenSSL differential coverage registry has explicit coverage or waivers" {
+    for (executed_cases) |case| {
+        try testing.expect(case.rationale.len > 0);
+    }
+    for (waivers) |waiver| {
+        try testing.expect(waiver.reason.len > 0);
+        try testing.expect(waiver.tracking_issue.len > 0);
+    }
+
+    try expectCoverageOrWaiver(.hkdf_extract, .{ .hkdf = .sha256 }, .positive);
+    try expectCoverageOrWaiver(.hkdf_extract, .{ .hkdf = .sha384 }, .positive);
+    try expectCoverageOrWaiver(.hkdf_expand_label, .{ .hkdf = .sha256 }, .positive);
+    try expectCoverageOrWaiver(.hkdf_expand_label, .{ .hkdf = .sha384 }, .positive);
+
+    try expectCoverageOrWaiver(.tls_record_keys, .{ .aead = .aes_128_gcm }, .positive);
+    try expectCoverageOrWaiver(.tls_record_keys, .{ .aead = .aes_256_gcm }, .positive);
+    try expectCoverageOrWaiver(.tls_record_keys, .{ .aead = .chacha20_poly1305 }, .positive);
+    try expectCoverageOrWaiver(.quic_initial, .{ .aead = .aes_128_gcm }, .positive);
+    try expectCoverageOrWaiver(.transcript_hash, .{ .hash = .sha256 }, .positive);
+    try expectCoverageOrWaiver(.transcript_hash, .{ .hash = .sha256 }, .negative);
+    try expectCoverageOrWaiver(.finished_hmac, .{ .hkdf = .sha256 }, .positive);
+    try expectCoverageOrWaiver(.finished_hmac, .{ .hkdf = .sha256 }, .negative);
+
+    try expectCoverageOrWaiver(.aead, .{ .aead = .aes_128_gcm }, .positive);
+    try expectCoverageOrWaiver(.aead, .{ .aead = .aes_128_gcm }, .negative);
+    try expectCoverageOrWaiver(.aead, .{ .aead = .aes_256_gcm }, .positive);
+    try expectCoverageOrWaiver(.aead, .{ .aead = .aes_256_gcm }, .negative);
+    try expectCoverageOrWaiver(.aead, .{ .aead = .chacha20_poly1305 }, .positive);
+    try expectCoverageOrWaiver(.aead, .{ .aead = .chacha20_poly1305 }, .negative);
+    try expectCoverageOrWaiver(.key_exchange, .{ .group = .x25519 }, .positive);
+    try expectCoverageOrWaiver(.key_exchange, .{ .group = .x25519 }, .negative);
+    try expectCoverageOrWaiver(.signature_verify, .{ .signature = .ed25519 }, .positive);
+    try expectCoverageOrWaiver(.signature_verify, .{ .signature = .ed25519 }, .negative);
+    try expectCoverageOrWaiver(.signature_verify, .{ .signature = .ecdsa_secp256r1_sha256 }, .positive);
+    try expectCoverageOrWaiver(.signature_verify, .{ .signature = .ecdsa_secp256r1_sha256 }, .negative);
 }

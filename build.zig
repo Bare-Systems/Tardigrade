@@ -287,6 +287,7 @@ pub fn build(b: *std.Build) void {
         });
         crypto_openssl_diff_mod.addImport("crypto", crypto_mod);
         crypto_openssl_diff_mod.addImport("tls_core", tls_core_mod);
+        crypto_openssl_diff_mod.addImport("quic", quic_mod);
         crypto_openssl_diff_mod.addImport("zig_compat", compat_mod);
         const crypto_openssl_diff_tests = b.addTest(.{ .root_module = crypto_openssl_diff_mod });
         const run_crypto_openssl_diff_tests = b.addRunArtifact(crypto_openssl_diff_tests);

@@ -51,17 +51,22 @@ a release gate, not a best-effort activity.
 
 ## Commands
 
-Use the repo-pinned Zig toolchain, not the shell default `zig`.
+Use Zig `0.16.0` (see `CONTRIBUTING.md`). If it is not already on `PATH`,
+bootstrap it first:
+
+```bash
+sh ./scripts/install-zig.sh 0.16.0
+```
 
 ```bash
 # Unit + parser/path/auth hardening coverage
-./.zig-toolchain/0.16.0/zig-aarch64-macos-0.16.0/zig build test
+zig build test
 
 # Seed corpus replay + deterministic mutation pass
-./.zig-toolchain/0.16.0/zig-aarch64-macos-0.16.0/zig build test-security-corpus
+zig build test-security-corpus
 
 # Live-process integration coverage
-./.zig-toolchain/0.16.0/zig-aarch64-macos-0.16.0/zig build test-integration
+zig build test-integration
 ```
 
 ## Release Gate
@@ -113,6 +118,14 @@ IDs against the `tg-<decimal>-<lowercase-hex>` format. Arbitrary client values
 are discarded and a fresh ID is generated. Covered by unit tests in
 `correlation_id.zig`.
 
+**F-07 — Static file serving via catch-all `location /` non-functional** ✅ ROOT-CAUSED, TRACKED SEPARATELY
+Root-caused by code trace: a `location` block with `root` but no `index` or
+`try_files` directive 404s on directory requests because static serving has
+no default index value (unlike nginx's implicit `index index.html;`). The
+fix requires a maintainer decision (default index vs. fail-fast config
+validation vs. document as intentional), so it now has its own tracked issue,
+#437, with the full reproduction and code references.
+
 ### Open Gaps
 
 **F-05 — TLS surface pass still pending**
@@ -122,11 +135,6 @@ yet been completed with `tls_scan`. Run against an isolated lab target.
 **F-06 — Auth enforcement pass still pending**
 Bearer auth bypass, malformed bearer, token replay, and method-change bypass
 have not been probed against a live edge with auth configured.
-
-**F-07 — Static file serving via catch-all `location /` non-functional**
-Files in a configured `doc_root` return 404 despite `root` directive in
-`location /`. Investigate whether this is a static-serving bug or intentional;
-add integration test for static root fallback.
 
 ## Proxy Security Behavior Reference
 

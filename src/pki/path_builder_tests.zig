@@ -45,10 +45,10 @@ fn algorithmEd25519(arena: std.mem.Allocator) ![]u8 {
     return tlv(arena, 0x30, &.{try oidTlv(arena, &ed25519_components)});
 }
 
-fn nameWithCn(arena: std.mem.Allocator, cn: []const u8) ![]u8 {
+fn nameWithCn(arena: std.mem.Allocator, cn: []const u8, value_tag: u8) ![]u8 {
     const atv = try tlv(arena, 0x30, &.{
         try oidTlv(arena, &oid.well_known.common_name),
-        try tlv(arena, 0x0c, &.{cn}),
+        try tlv(arena, value_tag, &.{cn}),
     });
     return tlv(arena, 0x30, &.{try tlv(arena, 0x31, &.{atv})});
 }
@@ -90,6 +90,10 @@ const Spec = struct {
     ski: ?[]const u8 = null,
     /// AuthorityKeyIdentifier keyIdentifier content when present.
     aki: ?[]const u8 = null,
+    /// DER string tags for the CN values (UTF8String by default;
+    /// 0x13 = PrintableString).
+    subject_cn_tag: u8 = 0x0c,
+    issuer_cn_tag: u8 = 0x0c,
 };
 
 /// Build one certificate's DER: v1 when no key identifiers are requested,
@@ -114,9 +118,9 @@ fn buildDer(arena: std.mem.Allocator, spec: Spec) ![]u8 {
     }
     try parts.append(arena, try tlv(arena, 0x02, &.{&[_]u8{spec.serial}}));
     try parts.append(arena, try algorithmEd25519(arena));
-    try parts.append(arena, try nameWithCn(arena, spec.issuer_cn));
+    try parts.append(arena, try nameWithCn(arena, spec.issuer_cn, spec.issuer_cn_tag));
     try parts.append(arena, try utcValidity(arena));
-    try parts.append(arena, try nameWithCn(arena, spec.subject_cn));
+    try parts.append(arena, try nameWithCn(arena, spec.subject_cn, spec.subject_cn_tag));
     try parts.append(arena, try spkiEd25519(arena));
     if (extensions.items.len > 0) {
         try parts.append(arena, try tlv(arena, 0xa3, &.{try tlv(arena, 0x30, extensions.items)}));
@@ -216,6 +220,34 @@ test "leaf issued directly by an anchor builds a two-element path" {
     try testing.expect(!result.truncated);
     try testing.expectEqual(@as(usize, 1), result.paths.len);
     try expectPathCns(result.paths[0], &.{ "leaf", "Root CA" });
+}
+
+test "issuer matching uses RFC 5280 name chaining, not encoding equality" {
+    var fx = Fixtures.init(testing.allocator);
+    defer fx.deinit();
+    // The leaf's issuer is a UTF8String with case and white-space noise;
+    // the anchor's subject is a canonical PrintableString. RFC 5280 §7.1
+    // chaining must still connect them even though the Name encodings
+    // differ byte-for-byte.
+    try fx.add(.{ .subject_cn = "leaf", .issuer_cn = "  EXAMPLE   ca " });
+    try fx.add(.{
+        .subject_cn = "Example CA",
+        .issuer_cn = "Example CA",
+        .subject_cn_tag = 0x13,
+        .issuer_cn_tag = 0x13,
+    });
+
+    const certs = fx.certs.items;
+    try testing.expect(!certs[0].issuer.eqlEncoding(&certs[1].subject));
+    try testing.expect(certs[0].issuer.eqlForChaining(&certs[1].subject));
+
+    var result = try path_builder.build(testing.allocator, &certs[0], &.{}, certs[1..2], .{});
+    defer result.deinit(testing.allocator);
+
+    try testing.expect(!result.truncated);
+    try testing.expectEqual(@as(usize, 1), result.paths.len);
+    try expectPathCns(result.paths[0], &.{ "leaf", "Example CA" });
+    try testing.expectEqual(path_builder.Source.anchor, result.paths[0].anchor().source);
 }
 
 // --- Cross-signed roots ------------------------------------------------------
@@ -507,6 +539,62 @@ test "visit budget bounds adversarial fanout without losing found paths" {
         error.SearchLimitExceeded,
         path_builder.build(testing.allocator, &certs[0], intermediates, anchors, limits),
     );
+}
+
+test "tight budget cannot starve the best-ranked candidate" {
+    var fx = Fixtures.init(testing.allocator);
+    defer fx.deinit();
+    // Several mismatching same-subject anchors compete with one AKI/SKI-
+    // matching intermediate. The visit budget is charged per candidate the
+    // traversal attempts — after ranking and fanout — so scanning the
+    // mismatching anchors while building the candidate list must not spend
+    // the budget needed to walk the documented best-ranked path.
+    try fx.add(.{ .subject_cn = "leaf", .issuer_cn = "CA X", .aki = "good" });
+    try fx.add(.{ .subject_cn = "CA X", .issuer_cn = "Root CA", .serial = 2, .ski = "good" });
+    try fx.add(.{ .subject_cn = "CA X", .issuer_cn = "CA X", .serial = 3, .ski = "bad1" });
+    try fx.add(.{ .subject_cn = "CA X", .issuer_cn = "CA X", .serial = 4, .ski = "bad2" });
+    try fx.add(.{ .subject_cn = "CA X", .issuer_cn = "CA X", .serial = 5, .ski = "bad3" });
+    try fx.add(.{ .subject_cn = "Root CA", .issuer_cn = "Root CA" });
+
+    const certs = fx.certs.items;
+    var limits: path_builder.Limits = .{};
+    limits.max_fanout = 1;
+    limits.max_candidate_visits = 2; // exactly the two edges of the best path
+    var result = try path_builder.build(testing.allocator, &certs[0], certs[1..2], certs[2..6], limits);
+    defer result.deinit(testing.allocator);
+
+    try testing.expect(result.truncated); // fanout dropped the anchors
+    try testing.expectEqual(@as(usize, 1), result.paths.len);
+    try expectPathCns(result.paths[0], &.{ "leaf", "CA X", "Root CA" });
+    try testing.expectEqual(path_builder.Source.intermediate, result.paths[0].elements[1].source);
+}
+
+test "fanout-discarded candidates do not consume the traversal budget" {
+    var fx = Fixtures.init(testing.allocator);
+    defer fx.deinit();
+    // A wide first node: five same-subject decoys are collected and then
+    // discarded by max_fanout. Only attempted candidates may be charged, so
+    // a budget covering exactly the retained path must still succeed.
+    try fx.add(.{ .subject_cn = "leaf", .issuer_cn = "CA X" });
+    try fx.add(.{ .subject_cn = "CA X", .issuer_cn = "Root CA", .serial = 2 });
+    try fx.add(.{ .subject_cn = "CA X", .issuer_cn = "Nowhere", .serial = 3 });
+    try fx.add(.{ .subject_cn = "CA X", .issuer_cn = "Nowhere", .serial = 4 });
+    try fx.add(.{ .subject_cn = "CA X", .issuer_cn = "Nowhere", .serial = 5 });
+    try fx.add(.{ .subject_cn = "CA X", .issuer_cn = "Nowhere", .serial = 6 });
+    try fx.add(.{ .subject_cn = "CA X", .issuer_cn = "Nowhere", .serial = 7 });
+    try fx.add(.{ .subject_cn = "Root CA", .issuer_cn = "Root CA" });
+
+    const certs = fx.certs.items;
+    var limits: path_builder.Limits = .{};
+    limits.max_fanout = 1;
+    limits.max_candidate_visits = 2;
+    var result = try path_builder.build(testing.allocator, &certs[0], certs[1..7], certs[7..8], limits);
+    defer result.deinit(testing.allocator);
+
+    try testing.expect(result.truncated); // fanout dropped the decoys
+    try testing.expectEqual(@as(usize, 1), result.paths.len);
+    try expectPathCns(result.paths[0], &.{ "leaf", "CA X", "Root CA" });
+    try testing.expectEqual(@as(usize, 0), result.paths[0].elements[1].input_index);
 }
 
 test "fanout and path caps truncate enumeration deterministically" {

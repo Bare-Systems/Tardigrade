@@ -141,15 +141,32 @@ pub const RelativeDistinguishedName = struct {
     attributes: []const AttributeTypeAndValue,
 };
 
-/// Name ::= RDNSequence. Comparison across certificates is byte-exact on
-/// `raw` (RFC 5280 binary comparison); looser matching rules are policy.
+/// Name ::= RDNSequence. Two comparisons exist: `eqlEncoding` is byte-exact
+/// on `raw` (encoding identity), and `eqlForChaining` implements the
+/// RFC 5280 §7.1 name-chaining rules via the precomputed `chaining_key`.
 pub const Name = struct {
     /// Full TLV bytes of the Name SEQUENCE.
     raw: []const u8,
     rdns: []const RelativeDistinguishedName,
+    /// Canonical name-chaining key (RFC 5280 §7.1), arena-owned: RDNs in
+    /// sequence order, each RDN's attributes compared as a set (sorted
+    /// canonical forms), attribute types by decoded OID, and primitive
+    /// PrintableString/UTF8String values unified into one caseIgnore class
+    /// normalized by trimming leading/trailing white space, collapsing
+    /// internal white-space runs to a single space, and folding ASCII case
+    /// (rules (c)/(d) of §7.1; full RFC 4518 StringPrep is intentionally out
+    /// of scope, matching common validator behavior). All other value types
+    /// compare as exact bytes under their own tag (rules (a)/(b)). Two names
+    /// chain exactly when their keys are byte-equal.
+    chaining_key: []const u8,
 
     pub fn eqlEncoding(self: *const Name, other: *const Name) bool {
         return std.mem.eql(u8, self.raw, other.raw);
+    }
+
+    /// RFC 5280 §7.1 name-chaining equality (see `chaining_key`).
+    pub fn eqlForChaining(self: *const Name, other: *const Name) bool {
+        return std.mem.eql(u8, self.chaining_key, other.chaining_key);
     }
 
     pub fn isEmpty(self: *const Name) bool {
@@ -614,7 +631,54 @@ const Parser = struct {
         }
         rdn_reader.expectEnd() catch return error.MalformedName;
 
-        return .{ .raw = name_elem.encoded, .rdns = rdns.items };
+        return .{
+            .raw = name_elem.encoded,
+            .rdns = rdns.items,
+            .chaining_key = try self.buildChainingKey(rdns.items),
+        };
+    }
+
+    /// Serialize the canonical `Name.chaining_key`. Every piece is
+    /// length/count-prefixed, so the flat concatenation is injective: two
+    /// keys are byte-equal exactly when the names chain under the documented
+    /// RFC 5280 §7.1 rules.
+    fn buildChainingKey(self: *Parser, rdns: []const RelativeDistinguishedName) Error![]const u8 {
+        var key: std.ArrayList(u8) = .empty;
+        try appendCount(&key, self.arena, rdns.len);
+        for (rdns) |rdn| {
+            try appendCount(&key, self.arena, rdn.attributes.len);
+            // SET semantics: attribute order inside an RDN must not affect
+            // the key, and canonicalization can reorder attributes relative
+            // to their DER encoding, so sort the canonical forms.
+            const blobs = try self.arena.alloc([]const u8, rdn.attributes.len);
+            for (rdn.attributes, blobs) |*attribute, *blob| {
+                blob.* = try self.attributeChainingBlob(attribute);
+            }
+            std.mem.sort([]const u8, blobs, {}, sliceLessThan);
+            for (blobs) |blob| try key.appendSlice(self.arena, blob);
+        }
+        return key.items;
+    }
+
+    fn attributeChainingBlob(self: *Parser, attribute: *const AttributeTypeAndValue) Error![]const u8 {
+        var blob: std.ArrayList(u8) = .empty;
+        const components = attribute.type.components();
+        try appendCount(&blob, self.arena, components.len);
+        for (components) |component| try appendBe32(&blob, self.arena, component);
+        if (isCaseIgnoreStringTag(attribute.value_tag)) {
+            try blob.append(self.arena, 0x00);
+            const normalized = try normalizeDirectoryString(self.arena, attribute.value);
+            try appendCount(&blob, self.arena, normalized.len);
+            try blob.appendSlice(self.arena, normalized);
+        } else {
+            try blob.append(self.arena, 0x01);
+            const class_bits: u8 = @intFromEnum(attribute.value_tag.class);
+            try blob.append(self.arena, (class_bits << 1) | @intFromBool(attribute.value_tag.constructed));
+            try appendBe32(&blob, self.arena, attribute.value_tag.number);
+            try appendCount(&blob, self.arena, attribute.value.len);
+            try blob.appendSlice(self.arena, attribute.value);
+        }
+        return blob.items;
     }
 
     fn parseValidity(self: *Parser, reader: *der.Reader) Error!Validity {
@@ -1137,6 +1201,56 @@ fn validateDirectoryString(elem: der.Element) Error!void {
         },
         else => {},
     }
+}
+
+/// The RFC 5280 §7.1 caseIgnore class: primitive PrintableString and
+/// UTF8String values are normalized and compared as one class so encoding
+/// migrations (a CA re-encoding `CN=Example CA` from PrintableString to
+/// UTF8String) still chain.
+fn isCaseIgnoreStringTag(tag: der.Tag) bool {
+    if (tag.class != .universal or tag.constructed) return false;
+    return tag.number == @intFromEnum(der.UniversalTag.utf8_string) or
+        tag.number == @intFromEnum(der.UniversalTag.printable_string);
+}
+
+/// RFC 5280 §7.1 rules (c)/(d): drop leading/trailing white space, collapse
+/// internal runs to one space, fold case. Folding is ASCII-only, which is
+/// UTF-8-safe (multi-byte sequences have the high bit set) and matches the
+/// OpenSSL canonical-name baseline; full RFC 4518 StringPrep is out of scope.
+fn normalizeDirectoryString(arena: std.mem.Allocator, content: []const u8) error{OutOfMemory}![]const u8 {
+    const out = try arena.alloc(u8, content.len);
+    var len: usize = 0;
+    var pending_space = false;
+    for (content) |byte| {
+        if (std.ascii.isWhitespace(byte)) {
+            if (len > 0) pending_space = true;
+            continue;
+        }
+        if (pending_space) {
+            out[len] = ' ';
+            len += 1;
+            pending_space = false;
+        }
+        out[len] = std.ascii.toLower(byte);
+        len += 1;
+    }
+    return out[0..len];
+}
+
+fn appendCount(list: *std.ArrayList(u8), arena: std.mem.Allocator, count: usize) error{OutOfMemory}!void {
+    var buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &buf, count, .big);
+    try list.appendSlice(arena, &buf);
+}
+
+fn appendBe32(list: *std.ArrayList(u8), arena: std.mem.Allocator, value: u32) error{OutOfMemory}!void {
+    var buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &buf, value, .big);
+    try list.appendSlice(arena, &buf);
+}
+
+fn sliceLessThan(_: void, a: []const u8, b: []const u8) bool {
+    return std.mem.order(u8, a, b) == .lt;
 }
 
 fn integerToU32(view: der.IntegerView) ?u32 {

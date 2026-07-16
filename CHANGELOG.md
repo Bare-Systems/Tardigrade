@@ -10,17 +10,23 @@ All notable user-facing changes to Tardigrade are documented here.
   a leaf certificate, peer-supplied intermediates, and configured trust
   anchors, strictly separated from RFC 5280 policy validation (#324-G): no
   signature is verified and no path is accepted, only enumerated. Pools are
-  deduplicated by exact DER and indexed by byte-exact subject/issuer `Name`
-  comparison (RFC 5280 §7.1); AKI/SKI key identifiers rank candidate issuers
-  (RFC 4158-style hints) but never veto them. Enumeration is a documented
-  total order — key-identifier agreement, then anchors before intermediates,
-  then input index, walked depth-first without recursion — so straight,
-  cross-signed, ambiguous, duplicate, cyclic, and incomplete chains all
-  behave deterministically, anchors terminate paths rather than being
-  traversed as intermediates, and a certificate never appears twice in one
-  path. Search work is bounded by configurable path-length, per-node fanout,
-  returned-path, and global candidate-visit limits that defeat adversarial
-  chain explosions; truncated enumeration is reported distinctly
+  deduplicated by exact DER and indexed by RFC 5280 §7.1 name chaining via a
+  new canonical `x509.Name.chaining_key` (with `eqlForChaining`) that
+  unifies primitive PrintableString/UTF8String values under caseIgnore
+  matching with insignificant-space folding, compares RDN attribute sets,
+  and keeps all other value types exact-bytes; AKI/SKI key identifiers rank
+  candidate issuers (RFC 4158-style hints) but never veto them. Enumeration
+  is a documented total order — key-identifier agreement, then anchors
+  before intermediates, then input index, walked depth-first without
+  recursion — so straight, cross-signed, ambiguous, duplicate, cyclic, and
+  incomplete chains all behave deterministically, anchors terminate paths
+  rather than being traversed as intermediates, and a certificate never
+  appears twice in one path. Search work is bounded by configurable
+  path-length, per-node fanout, returned-path, and global candidate-visit
+  limits that defeat adversarial chain explosions (the visit budget is
+  charged per ranked candidate the traversal attempts, after sorting and
+  fanout, so scan order can never starve a better-ranked candidate);
+  truncated enumeration is reported distinctly
   (`truncated` flag, `SearchLimitExceeded`) from a provably exhausted search
   (`NoCandidatePath`), and the error set contains no parser/signature/policy
   variants by construction. Covered by straight/cross-signed/ambiguous/

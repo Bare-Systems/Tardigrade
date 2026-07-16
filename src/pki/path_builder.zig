@@ -11,8 +11,10 @@
 //! ## Matching and ranking rules
 //!
 //! A certificate C is a candidate issuer of X exactly when C's subject Name
-//! equals X's issuer Name byte-for-byte (`Name.raw`, RFC 5280 §7.1 binary
-//! comparison — DER makes this the normalized form). AKI/SKI key identifiers
+//! chains to X's issuer Name under the RFC 5280 §7.1 rules — pools are
+//! indexed by the canonical `x509.Name.chaining_key`, so semantically equal
+//! names that differ in encoding (PrintableString vs UTF8String), ASCII
+//! case, or insignificant white space still chain. AKI/SKI key identifiers
 //! never veto a candidate (real-world AKIs are wrong often enough that
 //! RFC 4158 §2.4.2 treats them as sorting hints); they only rank it.
 //! Sibling candidates are tried in this documented, total order:
@@ -38,8 +40,9 @@
 //!
 //! `Limits` caps input pool sizes, path length, per-node fanout (applied
 //! after ranking, so the kept candidates are the best-ranked ones), the
-//! total number of issuer candidates examined, and the number of returned
-//! paths. Exceeding a search bound never aborts work already done: found
+//! total number of ranked candidates the traversal attempts (charged after
+//! ranking and fanout, so scan order never starves a better-ranked
+//! candidate), and the number of returned paths. Exceeding a search bound never aborts work already done: found
 //! paths are returned with `truncated = true`. With zero paths found,
 //! `error.NoCandidatePath` means the bounded search space was provably
 //! exhausted, while `error.SearchLimitExceeded` means a limit stopped
@@ -62,8 +65,12 @@ pub const Limits = struct {
     max_anchors: usize = 256,
     /// Maximum candidate issuers kept per certificate after ranking.
     max_fanout: usize = 8,
-    /// Total issuer candidates examined across the whole search — the
-    /// global work bound that defeats adversarial chain explosions.
+    /// Total ranked candidates the traversal may attempt across the whole
+    /// search — the global work bound that defeats adversarial chain
+    /// explosions. Charged when a sorted, fanout-bounded candidate is
+    /// actually tried, never while scanning pools, so scan order cannot
+    /// starve better-ranked candidates. Index scans themselves are bounded
+    /// by the (deduplicated) pool sizes per attempted expansion.
     max_candidate_visits: usize = 256,
 };
 
@@ -178,6 +185,14 @@ pub fn build(
             _ = path.pop();
             continue;
         }
+        // The work budget is charged per ranked candidate the traversal
+        // actually attempts — after sorting and fanout — so pool scan order
+        // can never starve a better-ranked candidate out of the budget.
+        if (search.visit_budget == 0) {
+            search.truncated = true;
+            break;
+        }
+        search.visit_budget -= 1;
         const candidate = frame.candidates[frame.next];
         frame.next += 1;
 
@@ -245,7 +260,8 @@ const Entry = struct {
 
 /// A deduplicated certificate pool indexed by subject for issuer lookup.
 const Pool = struct {
-    /// Sorted by (subject `Name.raw`, input index); unique by exact DER.
+    /// Sorted by (subject `Name.chaining_key`, input index); unique by
+    /// exact DER.
     entries: []const Entry,
 
     fn build(arena: std.mem.Allocator, certificates: []const x509.Certificate) Error!Pool {
@@ -263,20 +279,21 @@ const Pool = struct {
     }
 
     fn entryLessThan(_: void, a: Entry, b: Entry) bool {
-        return switch (std.mem.order(u8, a.certificate.subject.raw, b.certificate.subject.raw)) {
+        return switch (std.mem.order(u8, a.certificate.subject.chaining_key, b.certificate.subject.chaining_key)) {
             .lt => true,
             .gt => false,
             .eq => a.input_index < b.input_index,
         };
     }
 
-    /// All entries whose subject equals `issuer_raw`, in input order.
-    fn matchSubject(self: *const Pool, issuer_raw: []const u8) []const Entry {
+    /// All entries whose subject chains to `issuer_key` (an
+    /// `x509.Name.chaining_key`), in input order.
+    fn matchSubject(self: *const Pool, issuer_key: []const u8) []const Entry {
         var low: usize = 0;
         var high: usize = self.entries.len;
         while (low < high) {
             const mid = low + (high - low) / 2;
-            if (std.mem.order(u8, self.entries[mid].certificate.subject.raw, issuer_raw) == .lt) {
+            if (std.mem.order(u8, self.entries[mid].certificate.subject.chaining_key, issuer_key) == .lt) {
                 low = mid + 1;
             } else {
                 high = mid;
@@ -284,7 +301,7 @@ const Pool = struct {
         }
         var end = low;
         while (end < self.entries.len and
-            std.mem.eql(u8, self.entries[end].certificate.subject.raw, issuer_raw))
+            std.mem.eql(u8, self.entries[end].certificate.subject.chaining_key, issuer_key))
         {
             end += 1;
         }
@@ -316,7 +333,7 @@ const Search = struct {
     limits: Limits,
     anchor_pool: Pool,
     intermediate_pool: Pool,
-    /// Remaining issuer candidates this search may examine.
+    /// Remaining ranked candidates the traversal may attempt.
     visit_budget: usize,
     truncated: bool = false,
 
@@ -353,12 +370,7 @@ const Search = struct {
         child_keyid: ?[]const u8,
         current_path: []const Element,
     ) Error!void {
-        for (pool.matchSubject(child.issuer.raw)) |entry| {
-            if (self.visit_budget == 0) {
-                self.truncated = true;
-                return;
-            }
-            self.visit_budget -= 1;
+        for (pool.matchSubject(child.issuer.chaining_key)) |entry| {
             if (onPath(current_path, entry.certificate)) continue;
             try out.append(self.arena, .{
                 .entry = entry,

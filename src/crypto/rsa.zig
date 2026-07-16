@@ -161,15 +161,14 @@ pub fn verifyPssSha256(public_key_der: []const u8, message: []const u8, signatur
 
 fn appendDerLength(out: []u8, index: *usize, length: usize) void {
     if (length <= 0x7f) {
-        std.debug.assert(length <= 0x7f);
         out[index.*] = @intCast(length);
         index.* += 1;
     } else if (length <= 0xff) {
-        std.debug.assert(length <= 0xff);
         out[index.*] = 0x81;
         out[index.* + 1] = @intCast(length);
         index.* += 2;
     } else {
+        // This test-only encoder emits at most a two-byte long-form length.
         std.debug.assert(length <= 0xffff);
         out[index.*] = 0x82;
         out[index.* + 1] = @intCast(length >> 8);

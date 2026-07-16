@@ -25,3 +25,9 @@ Use this checklist before tagging and distributing a Tardigrade release.
 - [ ] Run `./scripts/test-deb-package.sh` on a Linux host with Docker
 - [ ] Verify release packaging paths and checksums
 - [ ] Confirm changelog entries for operator-visible changes are complete
+
+## Branch Hygiene
+
+- [ ] After each PR merges (squash merge is standard for this repo), delete its head branch. Prefer enabling "Automatically delete head branches" in repo settings so this happens without a manual step.
+- [ ] Periodically (at least once per release cycle), diff open remote branches against merged PRs and closed issues; delete or archive any branch whose work already landed on `main` or was abandoned in favor of a different branch.
+- [ ] Never delete a branch backing an open PR, or the branch currently checked out for active work.

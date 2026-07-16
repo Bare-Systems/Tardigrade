@@ -406,7 +406,7 @@ fn verifyImpl(
             sig.verify(message, pk) catch return error.AuthenticationFailed;
         },
         .rsa_pss_rsae_sha256 => {
-            rsa.verifyPssSha256(public_key, message, signature) catch |err| return err;
+            try rsa.verifyPssSha256(public_key, message, signature);
         },
     }
 }

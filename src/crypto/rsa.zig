@@ -92,10 +92,10 @@ fn verifyPss(em: []const u8, em_bits: usize, message: []const u8) Error!void {
     const masked_db = em[0..db_len];
     const h = em[db_len .. db_len + h_len];
     const unused_bits = 8 * em.len - em_bits;
+    if (unused_bits > 7) return error.InvalidInput;
+    const unused_mask: u8 = @intCast(0xff >> unused_bits);
     // RFC 8017 requires the unused high bits of maskedDB to be zero.
-    if (unused_bits > 7 or masked_db[0] & (@as(u8, 0xff) << @as(u3, @intCast(8 - unused_bits))) != 0) {
-        return error.InvalidInput;
-    }
+    if (masked_db[0] & ~unused_mask != 0) return error.InvalidInput;
 
     var m_hash: [h_len]u8 = undefined;
     Sha256.hash(message, &m_hash, .{});
@@ -105,7 +105,7 @@ fn verifyPss(em: []const u8, em_bits: usize, message: []const u8) Error!void {
     mgf1(&h_array, mask[0..db_len]);
     for (db[0..db_len], masked_db, mask[0..db_len]) |*out, masked, mask_byte| out.* = masked ^ mask_byte;
     // Clear the unused high bits of DB before checking its zero-padding PS.
-    db[0] &= @as(u8, @intCast(0xff >> unused_bits));
+    db[0] &= unused_mask;
 
     const ps_len = db_len - salt_len - 1;
     for (db[0..ps_len]) |byte| if (byte != 0) return error.InvalidInput;

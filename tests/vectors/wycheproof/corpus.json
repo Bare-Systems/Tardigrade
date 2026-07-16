@@ -1,0 +1,260 @@
+{
+  "schema": "tardigrade-wycheproof-reduced-v1",
+  "source": {
+    "name": "C2SP Project Wycheproof",
+    "repository": "https://github.com/C2SP/wycheproof",
+    "commit": "fc24cd5b787d8e496bff31b0468af693a652b0f2",
+    "license": "Apache-2.0",
+    "reducedBy": "tests/vectors/wycheproof/README.md"
+  },
+  "allowlist": [
+    "AES-128-GCM",
+    "AES-256-GCM",
+    "CHACHA20-POLY1305",
+    "X25519",
+    "ED25519"
+  ],
+  "skippedSuites": [
+    {
+      "algorithm": "RSA-PSS",
+      "reason": "Provider capability remains deferred for issue #374 follow-up; pure-Zig provider currently returns UnsupportedCapability.",
+      "trackingIssue": "#374"
+    },
+    {
+      "algorithm": "ECDSA-P256-SHA256",
+      "reason": "Supported provider operation, but outside this first merge-sized #374 corpus slice.",
+      "trackingIssue": "#374"
+    },
+    {
+      "algorithm": "X448",
+      "reason": "Unsupported by the current provider capability matrix.",
+      "trackingIssue": "#374"
+    }
+  ],
+  "suites": [
+    {
+      "id": "wycheproof-aes-128-gcm-reduced",
+      "algorithm": "AES-128-GCM",
+      "operation": "aead-open",
+      "sourceFile": "testvectors_v1/aes_gcm_test.json",
+      "groups": [
+        {
+          "id": "aes-gcm-128-96-128",
+          "upstreamGroupIndex": 0,
+          "cases": [
+            {
+              "id": "aes-128-gcm-1",
+              "upstreamTcId": 1,
+              "classification": "valid",
+              "expected": "success",
+              "comment": "",
+              "flags": ["Ktv"],
+              "key": "5b9604fe14eadba931b0ccf34843dab9",
+              "nonce": "028318abc1824029138141a2",
+              "aad": "",
+              "message": "001d0c231287c1182784554ca3a21908",
+              "ciphertext": "26073cc1d851beff176384dc9896d5ff",
+              "tag": "0a3ea7a5487cb5f7d70fb6c58d038554"
+            },
+            {
+              "id": "aes-128-gcm-41",
+              "upstreamTcId": 41,
+              "classification": "invalid",
+              "expected": "authentication-failed",
+              "comment": "Flipped bit 0 in tag",
+              "flags": ["ModifiedTag"],
+              "key": "000102030405060708090a0b0c0d0e0f",
+              "nonce": "505152535455565758595a5b",
+              "aad": "",
+              "message": "202122232425262728292a2b2c2d2e2f",
+              "ciphertext": "eb156d081ed6b6b55f4612f021d87b39",
+              "tag": "d9847dbc326a06e988c77ad3863e6083"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "wycheproof-aes-256-gcm-reduced",
+      "algorithm": "AES-256-GCM",
+      "operation": "aead-open",
+      "sourceFile": "testvectors_v1/aes_gcm_test.json",
+      "groups": [
+        {
+          "id": "aes-gcm-256-96-128",
+          "upstreamGroupIndex": 3,
+          "cases": [
+            {
+              "id": "aes-256-gcm-91",
+              "upstreamTcId": 91,
+              "classification": "valid",
+              "expected": "success",
+              "comment": "",
+              "flags": ["Ktv"],
+              "key": "92ace3e348cd821092cd921aa3546374299ab46209691bc28b8752d17f123c20",
+              "nonce": "00112233445566778899aabb",
+              "aad": "00000000ffffffff",
+              "message": "00010203040506070809",
+              "ciphertext": "e27abdd2d2a53d2f136b",
+              "tag": "9a4a2579529301bcfb71c78d4060f52c"
+            },
+            {
+              "id": "aes-256-gcm-130",
+              "upstreamTcId": 130,
+              "classification": "invalid",
+              "expected": "authentication-failed",
+              "comment": "Flipped bit 0 in tag",
+              "flags": ["ModifiedTag"],
+              "key": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+              "nonce": "505152535455565758595a5b",
+              "aad": "",
+              "message": "202122232425262728292a2b2c2d2e2f",
+              "ciphertext": "b2061457c0759fc1749f174ee1ccadfa",
+              "tag": "9de8fef6d8ab1bf1bf887232eab590dd"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "wycheproof-chacha20-poly1305-reduced",
+      "algorithm": "CHACHA20-POLY1305",
+      "operation": "aead-open",
+      "sourceFile": "testvectors_v1/chacha20_poly1305_test.json",
+      "groups": [
+        {
+          "id": "chacha20-poly1305-96-128",
+          "upstreamGroupIndex": 0,
+          "cases": [
+            {
+              "id": "chacha20-poly1305-1",
+              "upstreamTcId": 1,
+              "classification": "valid",
+              "expected": "success",
+              "comment": "RFC 7539",
+              "flags": ["Ktv"],
+              "key": "808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f",
+              "nonce": "070000004041424344454647",
+              "aad": "50515253c0c1c2c3c4c5c6c7",
+              "message": "4c616469657320616e642047656e746c656d656e206f662074686520636c617373206f66202739393a204966204920636f756c64206f6666657220796f75206f6e6c79206f6e652074697020666f7220746865206675747572652c2073756e73637265656e20776f756c642062652069742e",
+              "ciphertext": "d31a8d34648e60db7b86afbc53ef7ec2a4aded51296e08fea9e2b5a736ee62d63dbea45e8ca9671282fafb69da92728b1a71de0a9e060b2905d6a5b67ecd3b3692ddbd7f2d778b8c9803aee328091b58fab324e4fad675945585808b4831d7bc3ff4def08e4b7a9de576d26586cec64b6116",
+              "tag": "1ae10b594f09e26a7e902ecbd0600691"
+            },
+            {
+              "id": "chacha20-poly1305-146",
+              "upstreamTcId": 146,
+              "classification": "invalid",
+              "expected": "authentication-failed",
+              "comment": "Flipped bit 0 in tag expected tag:f4409bb729039d0814ac514054323f44",
+              "flags": ["ModifiedTag"],
+              "key": "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+              "nonce": "000102030405060708090a0b",
+              "aad": "000102",
+              "message": "",
+              "ciphertext": "",
+              "tag": "f5409bb729039d0814ac514054323f44"
+            }
+          ]
+        },
+        {
+          "id": "chacha20-poly1305-invalid-nonce",
+          "upstreamGroupIndex": 2,
+          "cases": [
+            {
+              "id": "chacha20-poly1305-318",
+              "upstreamTcId": 318,
+              "classification": "invalid",
+              "expected": "invalid-input",
+              "comment": "nonce has size 8.",
+              "flags": ["InvalidNonceSize"],
+              "key": "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+              "nonce": "0001020304050607",
+              "aad": "",
+              "message": "",
+              "ciphertext": "",
+              "tag": ""
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "wycheproof-x25519-reduced",
+      "algorithm": "X25519",
+      "operation": "derive-shared-secret",
+      "sourceFile": "testvectors_v1/x25519_test.json",
+      "groups": [
+        {
+          "id": "x25519-comp",
+          "upstreamGroupIndex": 0,
+          "cases": [
+            {
+              "id": "x25519-1",
+              "upstreamTcId": 1,
+              "classification": "valid",
+              "expected": "success",
+              "comment": "normal case",
+              "flags": ["Normal"],
+              "private": "c8a9d5a91091ad851c668b0736c1c9a02936c0d3ad62670858088047ba057475",
+              "public": "504a36999f489cd2fdbc08baff3d88fa00569ba986cba22548ffde80f9806829",
+              "shared": "436a2c040cf45fea9b29a0cb81b1f41458f863d0d61b453d0a982720d6d61320"
+            },
+            {
+              "id": "x25519-32",
+              "upstreamTcId": 32,
+              "classification": "acceptable",
+              "expected": "invalid-input",
+              "comment": "public key = 0",
+              "flags": ["SmallPublicKey", "LowOrderPublic", "SpecialPublicKey", "ZeroSharedSecret"],
+              "private": "88227494038f2bb811d47805bcdf04a2ac585ada7f2f23389bfd4658f9ddd45e",
+              "public": "0000000000000000000000000000000000000000000000000000000000000000",
+              "shared": "0000000000000000000000000000000000000000000000000000000000000000"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "wycheproof-ed25519-verify-reduced",
+      "algorithm": "ED25519",
+      "operation": "verify",
+      "sourceFile": "testvectors_v1/ed25519_test.json",
+      "groups": [
+        {
+          "id": "ed25519-valid-group",
+          "upstreamGroupIndex": 0,
+          "cases": [
+            {
+              "id": "ed25519-1",
+              "upstreamTcId": 1,
+              "classification": "valid",
+              "expected": "success",
+              "comment": "",
+              "flags": ["Valid"],
+              "publicKey": "7d4d0e7f6153a69b6242b522abbee685fda4420f8834b108c3bdae369ef549fa",
+              "message": "",
+              "signature": "d4fbdb52bfa726b44d1786a8c0d171c3e62ca83c9e5bbe63de0bb2483f8fd6cc1429ab72cafc41ab56af02ff8fcc43b99bfe4c7ae940f60f38ebaa9d311c4007"
+            }
+          ]
+        },
+        {
+          "id": "ed25519-invalid-signature-group",
+          "upstreamGroupIndex": 1,
+          "cases": [
+            {
+              "id": "ed25519-10",
+              "upstreamTcId": 10,
+              "classification": "invalid",
+              "expected": "authentication-failed",
+              "comment": "special values for r and s",
+              "flags": ["InvalidSignature"],
+              "publicKey": "7d4d0e7f6153a69b6242b522abbee685fda4420f8834b108c3bdae369ef549fa",
+              "message": "3f",
+              "signature": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

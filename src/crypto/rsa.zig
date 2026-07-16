@@ -5,7 +5,8 @@ const crypto = std.crypto;
 const ff = crypto.ff;
 
 const Sha256 = crypto.hash.sha2.Sha256;
-const max_modulus_bytes = 4096 / 8;
+const max_modulus_bits = 4096;
+const max_modulus_bytes = max_modulus_bits / 8;
 
 const Error = error{InvalidInput};
 
@@ -93,6 +94,8 @@ fn verifyPss(em: []const u8, em_bits: usize, message: []const u8) Error!void {
     const h = em[db_len .. db_len + h_len];
     const unused_bits = 8 * em.len - em_bits;
     if (unused_bits > 7) return error.InvalidInput;
+    // This mask preserves the meaningful low bits and excludes the unused
+    // high-order bits required to be zero by RFC 8017.
     const unused_mask: u8 = 0xff >> unused_bits;
     // RFC 8017 requires the unused high bits of maskedDB to be zero.
     if (masked_db[0] & ~unused_mask != 0) return error.InvalidInput;
@@ -120,12 +123,18 @@ fn verifyPss(em: []const u8, em_bits: usize, message: []const u8) Error!void {
     if (!crypto.timing_safe.eql([h_len]u8, expected, h_array)) return error.InvalidInput;
 }
 
+/// Verify an RSA-PSS-RSAE-SHA256 signature.
+///
+/// `public_key_der` is a DER `RSAPublicKey` with a 2048-, 3072-, or 4096-bit
+/// modulus. `signature` must be exactly one modulus wide. Malformed keys and
+/// wrong-sized signatures return `error.InvalidInput`; a structurally valid
+/// signature with invalid EMSA-PSS encoding returns `error.AuthenticationFailed`.
 pub fn verifyPssSha256(public_key_der: []const u8, message: []const u8, signature: []const u8) (error{InvalidInput, AuthenticationFailed})!void {
     const key = parsePublicKey(public_key_der) catch return error.InvalidInput;
     if (signature.len != key.modulus.len) return error.InvalidInput;
 
-    var modulus_fe = ff.Modulus(4096).fromBytes(key.modulus, .big) catch return error.InvalidInput;
-    const signature_fe = ff.Modulus(4096).Fe.fromBytes(modulus_fe, signature, .big) catch return error.InvalidInput;
+    var modulus_fe = ff.Modulus(max_modulus_bits).fromBytes(key.modulus, .big) catch return error.InvalidInput;
+    const signature_fe = ff.Modulus(max_modulus_bits).Fe.fromBytes(modulus_fe, signature, .big) catch return error.InvalidInput;
     const recovered = modulus_fe.powWithEncodedPublicExponent(signature_fe, key.exponent, .big) catch return error.InvalidInput;
     var encoded: [max_modulus_bytes]u8 = undefined;
     recovered.toBytes(encoded[0..key.modulus.len], .big) catch return error.InvalidInput;

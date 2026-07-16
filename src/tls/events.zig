@@ -48,6 +48,10 @@ pub const HandshakeError = error{
     CertificateInvalid,
     /// A traffic secret could not be exported or installed.
     SecretExportFailed,
+    /// A caller attempted to install a secret after its epoch was discarded.
+    SecretAlreadyDiscarded,
+    /// A caller attempted to discard an epoch that has no installed secret.
+    SecretNotInstalled,
 };
 
 pub const Event = union(enum) {

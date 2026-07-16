@@ -29,6 +29,7 @@ pub fn Reassembler(comptime capacity: usize) type {
         const Self = @This();
 
         pub fn append(self: *Self, bytes: []const u8) Error!void {
+            if (self.len > self.data.len) return error.MalformedHandshake;
             if (bytes.len > self.data.len - self.len) return error.MalformedHandshake;
             @memcpy(self.data[self.len..][0..bytes.len], bytes);
             self.len += bytes.len;
@@ -41,6 +42,9 @@ pub fn Reassembler(comptime capacity: usize) type {
                 return error.MalformedHandshake;
             const message_len = handshake_header_len + @as(usize, body_len);
             if (self.len < message_len) return null;
+            // The carrier only calls `next` after enough bytes are buffered.
+            // All codec failures therefore describe an invalid TLS wire
+            // message at this boundary and intentionally map to decode_error.
             return messages.decode(self.data[0..message_len]) catch
                 return error.MalformedHandshake;
         }
@@ -59,13 +63,13 @@ pub const SecretLifecycle = struct {
 
     pub fn install(self: *SecretLifecycle, epoch: events.EncryptionEpoch) Error!void {
         const index = @intFromEnum(epoch);
-        if (self.discarded[index]) return error.SecretExportFailed;
+        if (self.discarded[index]) return error.SecretAlreadyDiscarded;
         self.installed[index] = true;
     }
 
     pub fn discard(self: *SecretLifecycle, epoch: events.EncryptionEpoch) Error!void {
         const index = @intFromEnum(epoch);
-        if (!self.installed[index]) return error.SecretExportFailed;
+        if (!self.installed[index]) return error.SecretNotInstalled;
         self.discarded[index] = true;
     }
 
@@ -151,12 +155,12 @@ test "protocol-neutral core reassembles messages and owns transcript updates" {
 
 test "secret lifecycle rejects use after discard" {
     var lifecycle = SecretLifecycle{};
-    try std.testing.expectError(error.SecretExportFailed, lifecycle.discard(.handshake));
+    try std.testing.expectError(error.SecretNotInstalled, lifecycle.discard(.handshake));
     try lifecycle.install(.handshake);
     try std.testing.expect(lifecycle.isLive(.handshake));
     try lifecycle.discard(.handshake);
     try std.testing.expect(!lifecycle.isLive(.handshake));
-    try std.testing.expectError(error.SecretExportFailed, lifecycle.install(.handshake));
+    try std.testing.expectError(error.SecretAlreadyDiscarded, lifecycle.install(.handshake));
 }
 
 test "reassembler discards complete messages and rejects out-of-range removal" {
@@ -180,4 +184,9 @@ test "reassembler discards complete messages and rejects out-of-range removal" {
 
     var small = Reassembler(4){};
     try std.testing.expectError(error.MalformedHandshake, small.append(&([_]u8{0} ** 5)));
+
+    var partial = Reassembler(64){};
+    try partial.append(first);
+    try partial.discard(1);
+    try std.testing.expectError(error.MalformedHandshake, partial.next());
 }

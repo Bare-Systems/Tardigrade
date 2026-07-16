@@ -50,6 +50,14 @@ const CaseMeta = struct {
 
 const pure_zig_only: ProviderSet = .{ .pure_zig = true };
 
+const rsa_pss_message = @embedFile("vectors/rsa_pss/message.txt");
+const rsa_pss_public_2048 = @embedFile("vectors/rsa_pss/public-2048.der");
+const rsa_pss_public_3072 = @embedFile("vectors/rsa_pss/public-3072.der");
+const rsa_pss_public_4096 = @embedFile("vectors/rsa_pss/public-4096.der");
+const rsa_pss_signature_2048 = @embedFile("vectors/rsa_pss/signature-2048.bin");
+const rsa_pss_signature_3072 = @embedFile("vectors/rsa_pss/signature-3072.bin");
+const rsa_pss_signature_4096 = @embedFile("vectors/rsa_pss/signature-4096.bin");
+
 const case_registry = [_]CaseMeta{
     .{ .id = "hkdf-rfc5869-extract-sha256", .algorithm = .{ .hkdf = .sha256 }, .providers = pure_zig_only, .class = .positive, .source = "RFC 5869 Appendix A.1", .license = "IETF Trust", .reproduction = "tests/vectors/generate_crypto_vectors.js" },
     .{ .id = "hkdf-expand-label-sha256-fixed", .algorithm = .{ .hkdf = .sha256 }, .providers = pure_zig_only, .class = .positive, .source = "tests/vectors/generate_crypto_vectors.js", .license = "project fixture", .reproduction = "node tests/vectors/generate_crypto_vectors.js" },
@@ -73,6 +81,10 @@ const case_registry = [_]CaseMeta{
     .{ .id = "secp256r1-unsupported", .algorithm = .{ .group = .secp256r1 }, .providers = pure_zig_only, .class = .negative, .source = "provider capability matrix", .license = "project fixture", .reproduction = "zig build test-crypto-vectors" },
     .{ .id = "ed25519-rfc8032-test-1", .algorithm = .{ .signature = .ed25519 }, .providers = pure_zig_only, .class = .positive, .source = "RFC 8032 Section 7.1", .license = "IETF Trust", .reproduction = "published RFC vector" },
     .{ .id = "ed25519-signature-rejection", .algorithm = .{ .signature = .ed25519 }, .providers = pure_zig_only, .class = .negative, .source = "provider contract", .license = "project fixture", .reproduction = "zig build test-crypto-vectors" },
+    .{ .id = "rsa-pss-sha256-openssl-2048", .algorithm = .{ .signature = .rsa_pss_rsae_sha256 }, .providers = pure_zig_only, .class = .positive, .source = "OpenSSL 3.0.13 fixed fixture", .license = "project fixture", .reproduction = "openssl genrsa -traditional -3 2048; openssl dgst -sha256 -sigopt rsa_padding_mode:pss -sigopt rsa_pss_saltlen:32" },
+    .{ .id = "rsa-pss-sha256-openssl-3072", .algorithm = .{ .signature = .rsa_pss_rsae_sha256 }, .providers = pure_zig_only, .class = .positive, .source = "OpenSSL 3.0.13 fixed fixture", .license = "project fixture", .reproduction = "openssl genrsa -traditional -3 3072; openssl dgst -sha256 -sigopt rsa_padding_mode:pss -sigopt rsa_pss_saltlen:32" },
+    .{ .id = "rsa-pss-sha256-openssl-4096", .algorithm = .{ .signature = .rsa_pss_rsae_sha256 }, .providers = pure_zig_only, .class = .positive, .source = "OpenSSL 3.0.13 fixed fixture", .license = "project fixture", .reproduction = "openssl genrsa -traditional -3 4096; openssl dgst -sha256 -sigopt rsa_padding_mode:pss -sigopt rsa_pss_saltlen:32" },
+    .{ .id = "rsa-pss-sha256-signature-corruption", .algorithm = .{ .signature = .rsa_pss_rsae_sha256 }, .providers = pure_zig_only, .class = .negative, .source = "OpenSSL 3.0.13 fixed fixture with signature mutation", .license = "project fixture", .reproduction = "zig build test-crypto-vectors" },
     .{ .id = "wycheproof-aes-128-gcm-reduced", .algorithm = .{ .aead = .aes_128_gcm }, .providers = pure_zig_only, .class = .negative, .source = "tests/vectors/wycheproof/corpus.json", .license = "Apache-2.0", .reproduction = "zig build test-crypto-corpus" },
     .{ .id = "wycheproof-aes-256-gcm-reduced", .algorithm = .{ .aead = .aes_256_gcm }, .providers = pure_zig_only, .class = .negative, .source = "tests/vectors/wycheproof/corpus.json", .license = "Apache-2.0", .reproduction = "zig build test-crypto-corpus" },
     .{ .id = "wycheproof-chacha20-poly1305-reduced", .algorithm = .{ .aead = .chacha20_poly1305 }, .providers = pure_zig_only, .class = .negative, .source = "tests/vectors/wycheproof/corpus.json", .license = "Apache-2.0", .reproduction = "zig build test-crypto-corpus" },
@@ -500,6 +512,23 @@ fn runKeyExchangeAndSignatureVectors(log: *ExecutionLog) !void {
     var bad_signature = ed_signature;
     bad_signature[0] ^= 0x80;
     try testing.expectError(error.AuthenticationFailed, cp.verify(.ed25519, &ed_public, "", &bad_signature));
+
+    _ = try log.execute("rsa-pss-sha256-openssl-2048");
+    _ = try log.execute("rsa-pss-sha256-openssl-3072");
+    _ = try log.execute("rsa-pss-sha256-openssl-4096");
+    _ = try log.execute("rsa-pss-sha256-signature-corruption");
+    inline for (.{
+        .{ rsa_pss_public_2048, rsa_pss_signature_2048 },
+        .{ rsa_pss_public_3072, rsa_pss_signature_3072 },
+        .{ rsa_pss_public_4096, rsa_pss_signature_4096 },
+    }) |vector| {
+        try cp.verify(.rsa_pss_rsae_sha256, vector[0], rsa_pss_message, vector[1]);
+        const corrupted = try testing.allocator.dupe(u8, vector[1]);
+        defer testing.allocator.free(corrupted);
+        corrupted[0] ^= 1;
+        try testing.expectError(error.AuthenticationFailed, cp.verify(.rsa_pss_rsae_sha256, vector[0], rsa_pss_message, &corrupted));
+        try testing.expectError(error.AuthenticationFailed, cp.verify(.rsa_pss_rsae_sha256, vector[0], "wrong message", vector[1]));
+    }
 }
 
 fn runEntropyAndSecretHelperVectors(log: *ExecutionLog) !void {

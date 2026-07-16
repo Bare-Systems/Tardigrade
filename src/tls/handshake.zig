@@ -35,6 +35,7 @@ pub fn Reassembler(comptime capacity: usize) type {
         }
 
         pub fn next(self: *Self) Error!?Message {
+            if (self.data.len < handshake_header_len) return error.MalformedHandshake;
             if (self.len < handshake_header_len) return null;
             const body_len = std.mem.readInt(u24, self.data[1..4], .big);
             if (@as(usize, body_len) > self.data.len - handshake_header_len)
@@ -171,7 +172,8 @@ test "reassembler discards complete messages and rejects out-of-range removal" {
     const first_message = (try reassembler.next()).?;
     try reassembler.discard(first_message.raw.len);
     try std.testing.expectEqual(@as(usize, second.len), reassembler.len);
-    try std.testing.expectEqual(MessageType.finished, (try reassembler.next()).?.kind);
+    const second_message = (try reassembler.next()).?;
+    try std.testing.expectEqual(MessageType.finished, second_message.kind);
     try reassembler.discard(second.len);
     try std.testing.expectEqual(@as(usize, 0), reassembler.len);
     try reassembler.discard(0);

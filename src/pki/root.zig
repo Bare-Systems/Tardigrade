@@ -13,6 +13,7 @@
 //! - `x509` — policy-neutral certificate model with typed extensions
 //! - `identity` — SAN-only DNS/IP service identity matching (RFC 9525)
 //! - `verify` — certificate signature verification via the crypto provider
+//! - `path_builder` — deterministic candidate certification-path construction
 //!
 //! ## Policy summary
 //!
@@ -36,6 +37,7 @@ pub const pem = @import("pem.zig");
 pub const x509 = @import("x509.zig");
 pub const identity = @import("identity.zig");
 pub const verify = @import("verify.zig");
+pub const path_builder = @import("path_builder.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());
@@ -44,4 +46,5 @@ test {
     _ = @import("x509_tests.zig");
     _ = @import("identity_tests.zig");
     _ = @import("verify_tests.zig");
+    _ = @import("path_builder_tests.zig");
 }

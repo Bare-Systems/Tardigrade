@@ -305,6 +305,7 @@ test "RSA-PSS rejects short, long, and out-of-range signatures" {
     const exponent = [_]u8{ 1, 0, 1 };
     var der: [300]u8 = undefined;
     const key = makeTestPublicKey(&der, &exponent, max_modulus_bytes, 0x80);
+    // The minimum valid modulus has only its high bit set.
     const equal_modulus = [_]u8{0x80} ++ ([_]u8{0} ** (max_modulus_bytes - 1));
     const greater_modulus = [_]u8{0xff} ** max_modulus_bytes;
     try std.testing.expectError(error.AuthenticationFailed, verifyPssSha256(key, "message", &equal_modulus));

@@ -21,7 +21,7 @@ Only the most recent tagged release is supported. If you are running an older re
 
 Report privately using one of the following channels:
 
-- **GitHub private advisory**: [Security → Report a Vulnerability](https://github.com/Bare-Labs/Tardigrade/security/advisories/new) (preferred)
+- **GitHub private advisory**: [Security → Report a Vulnerability](https://github.com/Bare-Systems/Tardigrade/security/advisories/new) (preferred)
 - **Email**: `security@baresystems.dev`
 
 Include as much of the following as possible:
@@ -89,6 +89,6 @@ Out of scope:
 ## Baseline Security Expectations
 
 - Keep the core runtime generic and policy-driven; avoid product-specific coupling in security-sensitive code paths.
-- Public-edge behavior must be documented in `README.md` and `BLINK.md`.
+- Public-edge behavior must be documented in `README.md`.
 - Auth, routing, and approval behavior changes require documentation updates before merge.
 - Secrets (tokens, JWTs, raw credentials) must be redacted before logging or transcript write.

@@ -537,7 +537,9 @@ fn runUnsupportedCapabilityVectors(log: *ExecutionLog) !void {
 
 fn registerWycheproofCorpusSuites(log: *ExecutionLog) !void {
     for (corpus_manifest.suites) |suite| {
-        _ = try log.execute(suite.id);
+        const meta = try log.execute(suite.id);
+        const algorithm = meta.algorithm orelse return error.MissingCaseMetadata;
+        try testing.expect(algorithmEql(algorithm, suite.algorithm));
         try testing.expect(suite.case_count > 0);
     }
     for (corpus_manifest.skipped_suites) |suite| {

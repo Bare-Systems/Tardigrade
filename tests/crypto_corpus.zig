@@ -5,6 +5,7 @@ const crypto_pkg = @import("crypto");
 const corpus_manifest = @import("crypto_corpus_manifest.zig");
 
 const provider = crypto_pkg.provider;
+const profile = crypto_pkg.profile;
 const pure_zig = crypto_pkg.pure_zig;
 const testing = std.testing;
 
@@ -74,6 +75,22 @@ const Expected = enum {
             .success => "success",
             .authentication_failed => "authentication-failed",
             .invalid_input => "invalid-input",
+        };
+    }
+};
+
+const Observed = enum {
+    success,
+    authentication_failed,
+    invalid_input,
+    output_mismatch,
+
+    fn name(self: Observed) []const u8 {
+        return switch (self) {
+            .success => "success",
+            .authentication_failed => "authentication-failed",
+            .invalid_input => "invalid-input",
+            .output_mismatch => "output-mismatch",
         };
     }
 };
@@ -331,7 +348,7 @@ fn parseCases(
 
         const classification = try parseClassification(try requireString(obj, "classification", limits));
         const expected = try parseExpected(try requireString(obj, "expected", limits));
-        if (classification == .acceptable and expected == .success) return error.AcceptableCaseNeedsPolicy;
+        try validateExpected(classification, expected);
 
         var parsed_case = Case{
             .id = id,
@@ -356,6 +373,11 @@ fn parseCases(
                 parsed_case.private_key = try requireHex(allocator, obj, "private", decoded_total, limits);
                 parsed_case.public_key = try requireHex(allocator, obj, "public", decoded_total, limits);
                 parsed_case.shared = try requireHex(allocator, obj, "shared", decoded_total, limits);
+                if (algorithm == .x25519) {
+                    if (parsed_case.private_key.len != provider.Group.x25519.sharedSecretLength()) return error.InvalidCorpus;
+                    if (parsed_case.public_key.len != provider.Group.x25519.publicKeyLength()) return error.InvalidCorpus;
+                    if (parsed_case.shared.len != provider.Group.x25519.sharedSecretLength()) return error.InvalidCorpus;
+                }
             },
             .verify => {
                 parsed_case.public_key = try requireHex(allocator, obj, "publicKey", decoded_total, limits);
@@ -400,7 +422,7 @@ fn executeCase(cp: provider.CryptoProvider, suite: Suite, group: Group, case: Ca
         .derive_shared_secret => try executeX25519(cp, case),
         .verify => try executeEd25519Verify(cp, case),
     };
-    if (observed != case.expected) {
+    if (observed != expectedObserved(case.expected)) {
         std.debug.print(
             "crypto corpus mismatch file={s} group={s} case={s} upstreamTcId={d} algorithm={s} classification={s} expected={s} observed={s}\n",
             .{
@@ -418,38 +440,47 @@ fn executeCase(cp: provider.CryptoProvider, suite: Suite, group: Group, case: Ca
     }
 }
 
-fn executeAeadOpen(cp: provider.CryptoProvider, aead: provider.Aead, case: Case) !Expected {
+fn executeAeadOpen(cp: provider.CryptoProvider, aead: provider.Aead, case: Case) !Observed {
     const plaintext = try testing.allocator.alloc(u8, case.ciphertext.len);
     defer testing.allocator.free(plaintext);
     cp.aeadOpen(aead, case.key, case.nonce, case.aad, case.ciphertext, case.tag, plaintext) catch |err| {
         return try observedFromError(err);
     };
-    if (!std.mem.eql(u8, plaintext, case.message)) return .authentication_failed;
+    if (!std.mem.eql(u8, plaintext, case.message)) return .output_mismatch;
     return .success;
 }
 
-fn executeX25519(cp: provider.CryptoProvider, case: Case) !Expected {
+fn executeX25519(cp: provider.CryptoProvider, case: Case) !Observed {
+    const shared_len = provider.Group.x25519.sharedSecretLength();
+    if (case.shared.len != shared_len) return error.InvalidCorpus;
     var out: [provider.max_shared_secret_len]u8 = undefined;
-    if (case.shared.len > out.len) return .invalid_input;
-    cp.deriveSharedSecret(.x25519, case.private_key, case.public_key, out[0..case.shared.len]) catch |err| {
+    cp.deriveSharedSecret(.x25519, case.private_key, case.public_key, out[0..shared_len]) catch |err| {
         return try observedFromError(err);
     };
-    if (!std.mem.eql(u8, out[0..case.shared.len], case.shared)) return .authentication_failed;
+    if (!std.mem.eql(u8, out[0..shared_len], case.shared)) return .output_mismatch;
     return .success;
 }
 
-fn executeEd25519Verify(cp: provider.CryptoProvider, case: Case) !Expected {
+fn executeEd25519Verify(cp: provider.CryptoProvider, case: Case) !Observed {
     cp.verify(.ed25519, case.public_key, case.message, case.signature) catch |err| {
         return try observedFromError(err);
     };
     return .success;
 }
 
-fn observedFromError(err: anyerror) !Expected {
+fn observedFromError(err: anyerror) !Observed {
     return switch (err) {
         error.AuthenticationFailed => .authentication_failed,
         error.InvalidInput => .invalid_input,
         else => err,
+    };
+}
+
+fn expectedObserved(expected: Expected) Observed {
+    return switch (expected) {
+        .success => .success,
+        .authentication_failed => .authentication_failed,
+        .invalid_input => .invalid_input,
     };
 }
 
@@ -463,6 +494,7 @@ fn validateManifestCoverage(corpus: *const Corpus, report: Report) !void {
             matched = true;
             try testing.expectEqual(expected_suite.case_count, countCases(actual_suite));
             try testing.expectEqualStrings(expected_suite.source_file, actual_suite.source_file);
+            try testing.expect(std.meta.eql(expected_suite.algorithm, profileAlgorithm(actual_suite.algorithm)));
         }
         if (!matched) return error.UnexecutedRegisteredSuite;
     }
@@ -477,6 +509,16 @@ fn validateManifestCoverage(corpus: *const Corpus, report: Report) !void {
         }
         if (!matched) return error.MissingSkippedSuite;
     }
+}
+
+fn profileAlgorithm(algorithm: Algorithm) profile.Algorithm {
+    return switch (algorithm) {
+        .aes_128_gcm => .{ .aead = .aes_128_gcm },
+        .aes_256_gcm => .{ .aead = .aes_256_gcm },
+        .chacha20_poly1305 => .{ .aead = .chacha20_poly1305 },
+        .x25519 => .{ .group = .x25519 },
+        .ed25519 => .{ .signature = .ed25519 },
+    };
 }
 
 fn countCases(suite: Suite) usize {
@@ -521,6 +563,14 @@ fn parseExpected(raw: []const u8) !Expected {
     if (std.mem.eql(u8, raw, "authentication-failed")) return .authentication_failed;
     if (std.mem.eql(u8, raw, "invalid-input")) return .invalid_input;
     return error.UnknownExpectedOutcome;
+}
+
+fn validateExpected(classification: Classification, expected: Expected) !void {
+    switch (classification) {
+        .valid => if (expected != .success) return error.InvalidExpectedOutcome,
+        .invalid => if (expected == .success) return error.InvalidExpectedOutcome,
+        .acceptable => {},
+    }
 }
 
 fn algorithmAllowed(algorithm: Algorithm, allowlist: []const Algorithm) bool {
@@ -682,6 +732,7 @@ test "crypto corpus parser rejects bounded failure paths" {
     try testing.expectError(error.UnknownField, parseCorpus(testing.allocator, minimalCorpus(.unknown_field), .{}));
     try testing.expectError(error.TooManyCases, parseCorpus(testing.allocator, twoGroupCorpus(), .{ .max_cases = 1 }));
     try testing.expectError(error.UnsupportedCapability, observedFromError(error.UnsupportedCapability));
+    try testing.expectError(error.InvalidCorpus, parseCorpus(testing.allocator, x25519ShortSharedCorpus(), .{}));
 }
 
 test "crypto corpus executes through provider and registered manifest" {
@@ -694,6 +745,44 @@ test "crypto corpus executes through provider and registered manifest" {
     try testing.expectEqual(@as(usize, 5), report.invalid);
     try testing.expectEqual(@as(usize, 1), report.acceptable);
     try testing.expectEqual(@as(usize, 3), report.skipped_suites);
+}
+
+test "crypto corpus validates classification policy" {
+    try validateExpected(.valid, .success);
+    try testing.expectError(error.InvalidExpectedOutcome, validateExpected(.valid, .authentication_failed));
+    try testing.expectError(error.InvalidExpectedOutcome, validateExpected(.valid, .invalid_input));
+
+    try testing.expectError(error.InvalidExpectedOutcome, validateExpected(.invalid, .success));
+    try validateExpected(.invalid, .authentication_failed);
+    try validateExpected(.invalid, .invalid_input);
+
+    try validateExpected(.acceptable, .success);
+    try validateExpected(.acceptable, .authentication_failed);
+    try validateExpected(.acceptable, .invalid_input);
+}
+
+test "crypto corpus runner rejects provider success with mismatched AEAD output" {
+    const key = [_]u8{0} ** provider.Aead.aes_128_gcm.keyLength();
+    const nonce = [_]u8{0} ** provider.aead_nonce_len;
+    const ciphertext = [_]u8{0};
+    const message = [_]u8{0};
+    const tag = [_]u8{0} ** provider.aead_tag_len;
+    const case = Case{
+        .id = "fake-case",
+        .upstream_tc_id = 1,
+        .classification = .invalid,
+        .expected = .authentication_failed,
+        .comment = "",
+        .flags = &.{},
+        .key = &key,
+        .nonce = &nonce,
+        .message = &message,
+        .ciphertext = &ciphertext,
+        .tag = &tag,
+    };
+    const observed = try executeAeadOpen(BadAeadProvider.cryptoProvider(), .aes_128_gcm, case);
+    try testing.expectEqual(Observed.output_mismatch, observed);
+    try testing.expect(observed != expectedObserved(case.expected));
 }
 
 const MinimalKind = enum {
@@ -826,3 +915,139 @@ fn twoGroupCorpus() []const u8 {
         \\}}
     , .{schema_version});
 }
+
+fn x25519ShortSharedCorpus() []const u8 {
+    return std.fmt.comptimePrint(
+        \\{{
+        \\  "schema": "{s}",
+        \\  "source": {{"name": "x", "repository": "x", "commit": "x", "license": "x", "reducedBy": "x"}},
+        \\  "allowlist": ["X25519"],
+        \\  "skippedSuites": [],
+        \\  "suites": [{{
+        \\    "id": "suite-1",
+        \\    "algorithm": "X25519",
+        \\    "operation": "derive-shared-secret",
+        \\    "sourceFile": "source.json",
+        \\    "groups": [{{
+        \\      "id": "group-1",
+        \\      "upstreamGroupIndex": 0,
+        \\      "cases": [{{
+        \\        "id": "x25519-short-shared",
+        \\        "upstreamTcId": 1,
+        \\        "classification": "valid",
+        \\        "expected": "success",
+        \\        "comment": "",
+        \\        "flags": [],
+        \\        "private": "c8a9d5a91091ad851c668b0736c1c9a02936c0d3ad62670858088047ba057475",
+        \\        "public": "504a36999f489cd2fdbc08baff3d88fa00569ba986cba22548ffde80f9806829",
+        \\        "shared": ""
+        \\      }}]
+        \\    }}]
+        \\  }}]
+        \\}}
+    , .{schema_version});
+}
+
+const BadAeadProvider = struct {
+    var context: u8 = 0;
+    var entropy_context: u8 = 0;
+
+    const vtable = provider.CryptoProvider.VTable{
+        .capabilities = capabilities,
+        .hkdfExtract = hkdfExtract,
+        .hkdfExpandLabel = hkdfExpandLabel,
+        .aeadSeal = aeadSeal,
+        .aeadOpen = aeadOpen,
+        .generateKeyShare = generateKeyShare,
+        .deriveSharedSecret = deriveSharedSecret,
+        .verify = verify,
+    };
+
+    fn cryptoProvider() provider.CryptoProvider {
+        return .{
+            .context = &context,
+            .vtable = &vtable,
+            .entropy = .{ .context = &entropy_context, .fillFn = fillEntropy },
+        };
+    }
+
+    fn capabilities(ctx: *anyopaque) provider.Capabilities {
+        _ = ctx;
+        var caps = provider.Capabilities{};
+        caps.aeads.insert(.aes_128_gcm);
+        return caps;
+    }
+
+    fn hkdfExtract(ctx: *anyopaque, hash: provider.Hash, salt: []const u8, ikm: []const u8, out: []u8) provider.HkdfError!void {
+        _ = ctx;
+        _ = hash;
+        _ = salt;
+        _ = ikm;
+        _ = out;
+        return error.UnsupportedCapability;
+    }
+
+    fn hkdfExpandLabel(ctx: *anyopaque, hash: provider.Hash, secret: []const u8, label: []const u8, hash_context: []const u8, out: []u8) provider.HkdfError!void {
+        _ = ctx;
+        _ = hash;
+        _ = secret;
+        _ = label;
+        _ = hash_context;
+        _ = out;
+        return error.UnsupportedCapability;
+    }
+
+    fn aeadSeal(ctx: *anyopaque, aead: provider.Aead, key: []const u8, nonce: []const u8, aad: []const u8, plaintext: []const u8, ciphertext: []u8, tag: []u8) provider.SealError!void {
+        _ = ctx;
+        _ = aead;
+        _ = key;
+        _ = nonce;
+        _ = aad;
+        _ = plaintext;
+        _ = ciphertext;
+        _ = tag;
+        return error.UnsupportedCapability;
+    }
+
+    fn aeadOpen(ctx: *anyopaque, aead: provider.Aead, key: []const u8, nonce: []const u8, aad: []const u8, ciphertext: []const u8, tag: []const u8, plaintext: []u8) provider.OpenError!void {
+        _ = ctx;
+        _ = aead;
+        _ = key;
+        _ = nonce;
+        _ = aad;
+        _ = ciphertext;
+        _ = tag;
+        @memset(plaintext, 0x42);
+    }
+
+    fn generateKeyShare(ctx: *anyopaque, group: provider.Group, public_out: []u8, private_out: []u8) provider.KeyShareError!void {
+        _ = ctx;
+        _ = group;
+        _ = public_out;
+        _ = private_out;
+        return error.UnsupportedCapability;
+    }
+
+    fn deriveSharedSecret(ctx: *anyopaque, group: provider.Group, private_scalar: []const u8, peer_public: []const u8, out: []u8) provider.DeriveError!void {
+        _ = ctx;
+        _ = group;
+        _ = private_scalar;
+        _ = peer_public;
+        _ = out;
+        return error.UnsupportedCapability;
+    }
+
+    fn verify(ctx: *anyopaque, scheme: provider.SignatureScheme, public_key: []const u8, message: []const u8, signature: []const u8) provider.VerifyError!void {
+        _ = ctx;
+        _ = scheme;
+        _ = public_key;
+        _ = message;
+        _ = signature;
+        return error.UnsupportedCapability;
+    }
+
+    fn fillEntropy(ctx: *anyopaque, buffer: []u8) provider.EntropyError!void {
+        _ = ctx;
+        @memset(buffer, 0);
+    }
+};

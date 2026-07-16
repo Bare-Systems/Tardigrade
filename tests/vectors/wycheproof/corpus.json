@@ -221,7 +221,7 @@
       "sourceFile": "testvectors_v1/ed25519_test.json",
       "groups": [
         {
-          "id": "ed25519-verify-valid-and-invalid",
+          "id": "ed25519-valid-group",
           "upstreamGroupIndex": 0,
           "cases": [
             {
@@ -234,7 +234,13 @@
               "publicKey": "7d4d0e7f6153a69b6242b522abbee685fda4420f8834b108c3bdae369ef549fa",
               "message": "",
               "signature": "d4fbdb52bfa726b44d1786a8c0d171c3e62ca83c9e5bbe63de0bb2483f8fd6cc1429ab72cafc41ab56af02ff8fcc43b99bfe4c7ae940f60f38ebaa9d311c4007"
-            },
+            }
+          ]
+        },
+        {
+          "id": "ed25519-invalid-signature-group",
+          "upstreamGroupIndex": 1,
+          "cases": [
             {
               "id": "ed25519-10",
               "upstreamTcId": 10,

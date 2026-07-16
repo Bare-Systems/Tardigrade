@@ -22,6 +22,7 @@ const config = @import("config.zig");
 const varint = @import("quic_varint");
 const tls_adapter = @import("tls_adapter.zig");
 const tls_handshake = @import("tls_handshake.zig");
+const tls_core = @import("tls_core");
 const tls_key_schedule = @import("tls_core").key_schedule;
 const tls_handshake_codec = @import("tls_core").handshake;
 

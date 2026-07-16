@@ -22,6 +22,8 @@ pub const ReassemblerError = error{
     MalformedHandshake,
     HandshakeBufferOverflow,
     MessageTooLarge,
+    DuplicateExtension,
+    TooManyExtensions,
     IncompleteHandshake,
 };
 

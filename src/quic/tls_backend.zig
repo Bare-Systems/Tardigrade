@@ -1220,7 +1220,6 @@ pub const Tls13Backend = struct {
 
         var sent_offset: usize = 0;
         while (sent_offset < w.len) {
-            if (sent_offset >= w.len) return error.MalformedHandshake;
             const sent_len = (tls_handshake_codec.frameLength(buf[sent_offset..w.len]) catch
                 return error.MalformedHandshake) orelse return error.HandshakeBufferOverflow;
             const message = tls_handshake_codec.decode(buf[sent_offset..][0..sent_len]) catch

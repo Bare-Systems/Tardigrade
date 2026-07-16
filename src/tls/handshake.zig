@@ -84,9 +84,10 @@ pub const Core = struct {
             self.transcript.update(message.raw);
             return message;
         }
-        const expected = self.expected_inbound;
-        if (expected != message.kind and !self.acceptsClientFinished(message.kind))
-            return error.UnexpectedHandshakeMessage;
+        if (!self.acceptsClientFinished(message.kind)) {
+            if (self.expected_inbound != message.kind)
+                return error.UnexpectedHandshakeMessage;
+        }
         self.transcript.update(message.raw);
         self.advanceAfterReceive(message.kind);
         return message;

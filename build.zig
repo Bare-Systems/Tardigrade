@@ -277,6 +277,26 @@ pub fn build(b: *std.Build) void {
     crypto_step.dependOn(&run_crypto_vector_tests.step);
     test_step.dependOn(&run_crypto_vector_tests.step);
 
+    // Differential OpenSSL oracle checks (#377): spawn the system `openssl`
+    // command out-of-process for deterministic TLS/QUIC derivation stages.
+    if (link_openssl_adapter) {
+        const crypto_openssl_diff_mod = b.createModule(.{
+            .root_source_file = b.path("tests/crypto_openssl_diff.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        crypto_openssl_diff_mod.addImport("crypto", crypto_mod);
+        crypto_openssl_diff_mod.addImport("tls_core", tls_core_mod);
+        crypto_openssl_diff_mod.addImport("quic", quic_mod);
+        crypto_openssl_diff_mod.addImport("zig_compat", compat_mod);
+        const crypto_openssl_diff_tests = b.addTest(.{ .root_module = crypto_openssl_diff_mod });
+        const run_crypto_openssl_diff_tests = b.addRunArtifact(crypto_openssl_diff_tests);
+        const crypto_openssl_diff_step = b.step("test-crypto-openssl", "Run out-of-process OpenSSL differential crypto checks");
+        crypto_openssl_diff_step.dependOn(&run_crypto_openssl_diff_tests.step);
+        crypto_step.dependOn(&run_crypto_openssl_diff_tests.step);
+        test_step.dependOn(&run_crypto_openssl_diff_tests.step);
+    }
+
     // Bounded checked-in Wycheproof-style corpus (#374): reduced offline
     // negative/edge vectors for provider-supported pure-Zig operations.
     const crypto_corpus_mod = b.createModule(.{

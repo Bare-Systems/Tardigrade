@@ -7,6 +7,7 @@ const ff = crypto.ff;
 const Sha256 = crypto.hash.sha2.Sha256;
 const max_modulus_bits = 4096;
 const max_modulus_bytes = max_modulus_bits / 8;
+const test_modulus_bytes = 256;
 
 const Error = error{InvalidInput};
 
@@ -168,7 +169,7 @@ fn writeTestLength(out: []u8, offset: *usize, length: usize) void {
     } else {
         out[offset.*] = 0x82;
         out[offset.* + 1] = @intCast(length >> 8);
-        out[offset.* + 2] = @intCast(length);
+        out[offset.* + 2] = @intCast(length & 0xff);
         offset.* += 3;
     }
 }
@@ -188,6 +189,7 @@ fn makeTestPublicKey(out: []u8, exponent: []const u8, modulus_bytes: usize, modu
     out[offset] = 0;
     out[offset + 1] = modulus_top;
     @memset(out[offset + 2 .. offset + modulus_bytes + 1], 0);
+    out[offset + modulus_bytes] = 1;
     offset += modulus_bytes + 1;
     out[offset] = 0x02;
     offset += 1;
@@ -196,7 +198,7 @@ fn makeTestPublicKey(out: []u8, exponent: []const u8, modulus_bytes: usize, modu
     offset += exponent.len;
     const sequence_len = offset - 4;
     out[2] = @intCast(sequence_len >> 8);
-    out[3] = @intCast(sequence_len);
+    out[3] = @intCast(sequence_len & 0xff);
     return out[0..offset];
 }
 
@@ -231,9 +233,10 @@ fn encodePssForTest(message: []const u8, salt: [Sha256.digest_length]u8, out: []
     out[out.len - 1] = 0xbc;
 }
 
-fn minimumTestModulus() [max_modulus_bytes]u8 {
-    var modulus = [_]u8{0} ** max_modulus_bytes;
+fn minimumTestModulus() [test_modulus_bytes]u8 {
+    var modulus = [_]u8{0} ** test_modulus_bytes;
     modulus[0] = 0x80;
+    modulus[modulus.len - 1] = 1;
     return modulus;
 }
 
@@ -271,7 +274,7 @@ test "EMSA-PSS rejects every nonzero PS byte and structural corruption" {
 test "RSA public-key DER rejects malformed encodings and unsupported moduli" {
     const exponent = [_]u8{ 1, 0, 1 };
     var der: [300]u8 = undefined;
-    const key = makeTestPublicKey(&der, &exponent, max_modulus_bytes, 0x80);
+    const key = makeTestPublicKey(&der, &exponent, test_modulus_bytes, 0x80);
     _ = try parsePublicKey(key);
     try std.testing.expectError(error.InvalidInput, parsePublicKey(&[_]u8{}));
     try std.testing.expectError(error.InvalidInput, parsePublicKey(&[_]u8{0x30}));
@@ -303,39 +306,39 @@ test "RSA public-key DER enforces exponent range and parity" {
     };
     for (cases) |exponent| {
         var der: [300]u8 = undefined;
-        try std.testing.expectError(error.InvalidInput, parsePublicKey(makeTestPublicKey(&der, exponent, max_modulus_bytes, 0x80)));
+        try std.testing.expectError(error.InvalidInput, parsePublicKey(makeTestPublicKey(&der, exponent, test_modulus_bytes, 0x80)));
     }
 
     // 257 bytes matches the encoded 2048-bit modulus with its sign byte.
     var equal_size_exponent: [257]u8 = [_]u8{0} ** 257;
     // The leading sign byte makes this exponent equal in encoded size to n.
     equal_size_exponent[1] = 0x80;
+    equal_size_exponent[equal_size_exponent.len - 1] = 1;
     var equal_size_der: [600]u8 = undefined;
-    try std.testing.expectError(error.InvalidInput, parsePublicKey(makeTestPublicKey(&equal_size_der, &equal_size_exponent, max_modulus_bytes, 0x80)));
-    var valid_large_exponent: [257]u8 = [_]u8{0} ** 257;
-    valid_large_exponent[1] = 0x7f;
-    @memset(valid_large_exponent[2..], 0xff);
+    try std.testing.expectError(error.InvalidInput, parsePublicKey(makeTestPublicKey(&equal_size_der, &equal_size_exponent, test_modulus_bytes, 0x80)));
+    var valid_large_exponent: [256]u8 = [_]u8{0xff} ** 256;
+    valid_large_exponent[0] = 0x7f;
     var valid_large_der: [600]u8 = undefined;
-    _ = try parsePublicKey(makeTestPublicKey(&valid_large_der, &valid_large_exponent, max_modulus_bytes, 0x80));
+    _ = try parsePublicKey(makeTestPublicKey(&valid_large_der, &valid_large_exponent, test_modulus_bytes, 0x80));
     equal_size_exponent[1] = 0xff;
     var greater_size_der: [600]u8 = undefined;
-    try std.testing.expectError(error.InvalidInput, parsePublicKey(makeTestPublicKey(&greater_size_der, &equal_size_exponent, max_modulus_bytes, 0x80)));
+    try std.testing.expectError(error.InvalidInput, parsePublicKey(makeTestPublicKey(&greater_size_der, &equal_size_exponent, test_modulus_bytes, 0x80)));
     var exponent_too_long: [258]u8 = [_]u8{0} ** 258;
     exponent_too_long[1] = 0x80;
     var longer_der: [600]u8 = undefined;
-    try std.testing.expectError(error.InvalidInput, parsePublicKey(makeTestPublicKey(&longer_der, &exponent_too_long, max_modulus_bytes, 0x80)));
+    try std.testing.expectError(error.InvalidInput, parsePublicKey(makeTestPublicKey(&longer_der, &exponent_too_long, test_modulus_bytes, 0x80)));
 }
 
 test "RSA-PSS rejects short, long, and out-of-range signatures" {
     const exponent = [_]u8{ 1, 0, 1 };
     var der: [300]u8 = undefined;
-    const key = makeTestPublicKey(&der, &exponent, max_modulus_bytes, 0x80);
-    // This signature equals the minimum valid modulus used by the test key.
+    const key = makeTestPublicKey(&der, &exponent, test_modulus_bytes, 0x80);
+    // This signature equals the minimum odd modulus used by the test key.
     const signature_equal_to_modulus = minimumTestModulus();
-    const signature_greater_than_modulus = [_]u8{0xff} ** max_modulus_bytes;
+    const signature_greater_than_modulus = [_]u8{0xff} ** test_modulus_bytes;
     try std.testing.expectError(error.AuthenticationFailed, verifyPssSha256(key, "message", &signature_equal_to_modulus));
     try std.testing.expectError(error.AuthenticationFailed, verifyPssSha256(key, "message", &signature_greater_than_modulus));
     try std.testing.expectError(error.InvalidInput, verifyPssSha256(key, "message", signature_equal_to_modulus[0 .. signature_equal_to_modulus.len - 1]));
-    var long_signature: [max_modulus_bytes + 1]u8 = undefined;
+    var long_signature: [test_modulus_bytes + 1]u8 = undefined;
     try std.testing.expectError(error.InvalidInput, verifyPssSha256(key, "message", &long_signature));
 }

@@ -159,7 +159,9 @@ pub fn verifyPssSha256(public_key_der: []const u8, message: []const u8, signatur
 }
 
 fn appendDerLength(out: []u8, index: *usize, length: usize) void {
-    if (length > 0xffff) std.debug.panic("DER length {d} exceeds encoder limit of 0xffff", .{length});
+    if (length > 0xffff) {
+        std.debug.panic("DER length {d} exceeds encoder limit of 0xffff", .{length});
+    }
     if (length <= 0x7f) {
         out[index.*] = @intCast(length);
         index.* += 1;

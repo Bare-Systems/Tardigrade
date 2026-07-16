@@ -157,7 +157,7 @@ pub fn verifyPssSha256(public_key_der: []const u8, message: []const u8, signatur
 }
 
 fn appendDerLength(out: []u8, index: *usize, length: usize) void {
-    if (length < 0x80) {
+    if (length <= 0x7f) {
         out[index.*] = @intCast(length);
         index.* += 1;
     } else if (length <= 0xff) {
@@ -223,7 +223,7 @@ test "RSA-PSS rejects signature mutations and representative range failures" {
     const message = @embedFile("../../tests/vectors/rsa_pss/message.txt");
     var mutated = [_]u8{0} ** 256;
     @memcpy(&mutated, valid_signature);
-    inline for (0..256) |index| {
+    for (0..256) |index| {
         mutated[index] ^= 1;
         try std.testing.expectError(error.AuthenticationFailed, verifyPssSha256(public_key, message, &mutated));
         mutated[index] ^= 1;
@@ -242,7 +242,7 @@ test "RSA-PSS rejects signature mutations and representative range failures" {
     var db: [256]u8 = undefined;
     mgf1(&h, mask[0..db_len]);
     for (db[0..db_len], encoded[0..db_len], mask[0..db_len]) |*out, masked, mask_byte| out.* = masked ^ mask_byte;
-    inline for (0..190) |ps_index| {
+    for (0..190) |ps_index| {
         db[ps_index] ^= 1;
         for (encoded[0..db_len], db[0..db_len], mask[0..db_len]) |*masked, plain, mask_byte| masked.* = plain ^ mask_byte;
         try std.testing.expectError(error.InvalidInput, verifyPss(&encoded, key.bits - 1, message));

@@ -103,11 +103,11 @@ fn verifyPss(em: []const u8, em_bits: usize, message: []const u8) Error!void {
     const masked_db = em[0..db_len];
     const h = em[db_len .. db_len + h_len];
     const unused_bits = 8 * em.len - em_bits;
-    if (unused_bits > 7) return error.InvalidInput;
+    const unused_shift: u3 = if (unused_bits <= 7) @intCast(unused_bits) else return error.InvalidInput;
     // This mask preserves the meaningful low bits and excludes the unused
     // high-order bits required to be zero by RFC 8017. With zero unused bits
     // it is intentionally 0xff.
-    const unused_mask: u8 = @as(u8, 0xff) >> @as(u3, @intCast(unused_bits));
+    const unused_mask: u8 = @as(u8, 0xff) >> unused_shift;
     // RFC 8017 requires the unused high bits of maskedDB to be zero.
     if (masked_db[0] & ~unused_mask != 0) return error.InvalidInput;
 
@@ -180,7 +180,7 @@ fn testPublicKey(modulus: []const u8, exponent: []const u8, out: []u8) []const u
     const exponent_length = exponent.len + @intFromBool(exponent_sign);
     out[index] = 0x30;
     index += 1;
-    const sequence_length = 1 + derLengthSize(modulus_length) + modulus_length + 1 + derLengthSize(exponent_length) + exponent_length;
+    const sequence_length = derTlvSize(modulus_length) + derTlvSize(exponent_length);
     appendDerLength(out, &index, sequence_length);
     out[index] = 0x02;
     index += 1;
@@ -205,6 +205,10 @@ fn testPublicKey(modulus: []const u8, exponent: []const u8, out: []u8) []const u
 
 fn derLengthSize(length: usize) usize {
     return if (length < 0x80) 1 else if (length <= 0xff) 2 else 3;
+}
+
+fn derTlvSize(length: usize) usize {
+    return 1 + derLengthSize(length) + length;
 }
 
 test "RSA-PSS accepts fixed 2048, 3072, and 4096-bit fixtures" {
@@ -242,7 +246,7 @@ test "RSA-PSS rejects signature mutations and representative range failures" {
     var db: [256]u8 = undefined;
     mgf1(&h, mask[0..db_len]);
     for (db[0..db_len], encoded[0..db_len], mask[0..db_len]) |*out, masked, mask_byte| out.* = masked ^ mask_byte;
-    for (0..190) |ps_index| {
+    for (0..ps_len) |ps_index| {
         db[ps_index] ^= 1;
         for (encoded[0..db_len], db[0..db_len], mask[0..db_len]) |*masked, plain, mask_byte| masked.* = plain ^ mask_byte;
         try std.testing.expectError(error.InvalidInput, verifyPss(&encoded, key.bits - 1, message));

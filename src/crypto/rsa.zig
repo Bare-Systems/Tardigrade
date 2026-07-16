@@ -103,6 +103,7 @@ fn verifyPss(em: []const u8, em_bits: usize, message: []const u8) Error!void {
     const masked_db = em[0..db_len];
     const h = em[db_len .. db_len + h_len];
     const unused_bits = 8 * em.len - em_bits;
+    // The guard makes the following cast safe because u3 represents 0..7.
     if (unused_bits > 7) return error.InvalidInput;
     const unused_shift: u3 = @intCast(unused_bits);
     // This mask preserves the meaningful low bits and excludes the unused
@@ -158,7 +159,7 @@ pub fn verifyPssSha256(public_key_der: []const u8, message: []const u8, signatur
 }
 
 fn appendDerLength(out: []u8, index: *usize, length: usize) void {
-    if (length > 0xffff) @panic("test DER length exceeds encoder limit");
+    if (length > 0xffff) @panic("DER length exceeds encoder limit");
     if (length <= 0x7f) {
         out[index.*] = @intCast(length);
         index.* += 1;
@@ -273,10 +274,8 @@ test "RSA-PSS rejects signature mutations and out-of-range representatives" {
     encoded[encoded.len - 1] ^= 1;
     encoded[0] |= 0x80;
     try std.testing.expectError(error.InvalidInput, verifyPss(&encoded, key.bits - 1, message));
-    var equal: [valid_signature.len]u8 = undefined;
-    var greater: [valid_signature.len]u8 = undefined;
-    @memset(&equal, 0);
-    @memset(&greater, 0);
+    var equal = [_]u8{0} ** valid_signature.len;
+    var greater = [_]u8{0} ** valid_signature.len;
     @memcpy(&equal, key.modulus);
     @memcpy(&greater, key.modulus);
     var carry: u8 = 1;

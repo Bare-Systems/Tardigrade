@@ -479,6 +479,45 @@ test "explicit critical FALSE and explicit cA FALSE fail typed" {
     try testing.expectError(error.MalformedExtension, x509.Certificate.parse(testing.allocator, bc_bytes, .{}));
 }
 
+test "pathLen without cA and unknown Key Usage bits fail typed" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    // pathLenConstraint is forbidden unless cA is asserted TRUE.
+    const path_len_without_ca = try tlv(arena, 0x30, &.{try tlv(arena, 0x02, &.{&[_]u8{0}})});
+    const bad_path_len = try buildCertificate(arena, .{
+        .version = try versionTlv(arena, 2),
+        .extensions_wrapper = try extensionsWrapper(arena, &.{
+            try extensionTlv(arena, &oid.well_known.basic_constraints, true, path_len_without_ca),
+        }),
+    });
+    try testing.expectError(error.MalformedExtension, x509.Certificate.parse(testing.allocator, bad_path_len, .{}));
+
+    // Key Usage assigns only bits 0..8. Bit 9 is canonically encoded here
+    // but unknown to RFC 5280 and therefore rejected by the strict parser.
+    const unknown_key_usage = try tlv(arena, 0x03, &.{&[_]u8{ 6, 0, 0x40 }});
+    const bad_key_usage = try buildCertificate(arena, .{
+        .version = try versionTlv(arena, 2),
+        .extensions_wrapper = try extensionsWrapper(arena, &.{
+            try extensionTlv(arena, &oid.well_known.key_usage, true, unknown_key_usage),
+        }),
+    });
+    try testing.expectError(error.MalformedExtension, x509.Certificate.parse(testing.allocator, bad_key_usage, .{}));
+
+    const empty_key_usage = try tlv(arena, 0x03, &.{&[_]u8{0}});
+    const empty_key_usage_certificate = try buildCertificate(arena, .{
+        .version = try versionTlv(arena, 2),
+        .extensions_wrapper = try extensionsWrapper(arena, &.{
+            try extensionTlv(arena, &oid.well_known.key_usage, true, empty_key_usage),
+        }),
+    });
+    try testing.expectError(
+        error.MalformedExtension,
+        x509.Certificate.parse(testing.allocator, empty_key_usage_certificate, .{}),
+    );
+}
+
 test "malformed structures fail deterministically" {
     var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_inst.deinit();

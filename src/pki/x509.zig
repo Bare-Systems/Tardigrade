@@ -845,6 +845,9 @@ const Parser = struct {
             max_path_len = integerToU32(path_len) orelse return error.MalformedExtension;
         }
         inner.expectEnd() catch return error.MalformedExtension;
+        // RFC 5280 §4.2.1.9: pathLenConstraint is meaningful, and permitted,
+        // only when cA is asserted TRUE.
+        if (max_path_len != null and !is_ca) return error.MalformedExtension;
         return .{ .is_ca = is_ca, .max_path_len = max_path_len };
     }
 
@@ -852,7 +855,9 @@ const Parser = struct {
         var reader = der.Reader.init(value, self.limits.der);
         const bits = reader.readBitString() catch return error.MalformedExtension;
         reader.expectEnd() catch return error.MalformedExtension;
-        if (bits.data.len > 2) return error.MalformedExtension;
+        // RFC 5280 §4.2.1.3: when Key Usage is present, at least one bit MUST
+        // be set. An empty BIT STRING would otherwise become an all-false KU.
+        if (bits.data.len == 0 or bits.data.len > 2) return error.MalformedExtension;
         // DER named bits: trailing zero bits are removed, so the final data
         // byte's lowest used bit must be set.
         if (bits.data.len > 0) {
@@ -860,6 +865,10 @@ const Parser = struct {
             if (last == 0) return error.MalformedExtension;
             if ((last >> bits.unused_bits) & 1 == 0) return error.MalformedExtension;
         }
+        // Only bits 0..8 are assigned by RFC 5280. The low seven bits of a
+        // second content octet are unknown and fail the parser's strict,
+        // policy-neutral encoding profile.
+        if (bits.data.len == 2 and bits.data[1] & 0x7f != 0) return error.MalformedExtension;
 
         var usage = KeyUsage{};
         const fields = [_]*bool{

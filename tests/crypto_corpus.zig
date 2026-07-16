@@ -726,12 +726,16 @@ test "crypto corpus parser rejects bounded failure paths" {
     try testing.expectError(error.MissingField, parseCorpus(testing.allocator, minimalCorpus(.missing_required), .{}));
     try testing.expectError(error.UnsupportedAlgorithm, parseCorpus(testing.allocator, minimalCorpus(.unknown_algorithm), .{}));
     try testing.expectError(error.UnknownClassification, parseCorpus(testing.allocator, minimalCorpus(.unknown_classification), .{}));
+    try testing.expectError(error.UnknownExpectedOutcome, parseCorpus(testing.allocator, minimalCorpus(.unknown_expected), .{}));
+    try testing.expectError(error.UnsupportedOperation, parseCorpus(testing.allocator, minimalCorpus(.unsupported_operation), .{}));
     try testing.expectError(error.MalformedHex, parseCorpus(testing.allocator, minimalCorpus(.malformed_hex), .{}));
     try testing.expectError(error.OversizedValue, parseCorpus(testing.allocator, minimalCorpus(.oversized_id), .{}));
     try testing.expectError(error.DuplicateCaseId, parseCorpus(testing.allocator, minimalCorpus(.duplicate_case_id), .{}));
     try testing.expectError(error.UnknownField, parseCorpus(testing.allocator, minimalCorpus(.unknown_field), .{}));
+    try testing.expectError(error.TooManyGroups, parseCorpus(testing.allocator, twoGroupCorpus(), .{ .max_groups = 1 }));
     try testing.expectError(error.TooManyCases, parseCorpus(testing.allocator, twoGroupCorpus(), .{ .max_cases = 1 }));
-    try testing.expectError(error.UnsupportedCapability, observedFromError(error.UnsupportedCapability));
+    try testing.expectError(error.TooManyFlags, parseCorpus(testing.allocator, minimalCorpus(.too_many_flags), .{}));
+    try testing.expectError(error.DecodedByteLimitExceeded, parseCorpus(testing.allocator, minimalCorpus(.valid), .{ .max_decoded_total = 0 }));
     try testing.expectError(error.InvalidCorpus, parseCorpus(testing.allocator, x25519ShortSharedCorpus(), .{}));
 }
 
@@ -747,18 +751,24 @@ test "crypto corpus executes through provider and registered manifest" {
     try testing.expectEqual(@as(usize, 3), report.skipped_suites);
 }
 
-test "crypto corpus validates classification policy" {
-    try validateExpected(.valid, .success);
-    try testing.expectError(error.InvalidExpectedOutcome, validateExpected(.valid, .authentication_failed));
-    try testing.expectError(error.InvalidExpectedOutcome, validateExpected(.valid, .invalid_input));
+test "crypto corpus validates classification policy through parser" {
+    var valid_success = try parseCorpus(testing.allocator, policyCorpus("valid", "success"), .{});
+    valid_success.deinit();
+    try testing.expectError(error.InvalidExpectedOutcome, parseCorpus(testing.allocator, policyCorpus("valid", "authentication-failed"), .{}));
+    try testing.expectError(error.InvalidExpectedOutcome, parseCorpus(testing.allocator, policyCorpus("valid", "invalid-input"), .{}));
 
-    try testing.expectError(error.InvalidExpectedOutcome, validateExpected(.invalid, .success));
-    try validateExpected(.invalid, .authentication_failed);
-    try validateExpected(.invalid, .invalid_input);
+    try testing.expectError(error.InvalidExpectedOutcome, parseCorpus(testing.allocator, policyCorpus("invalid", "success"), .{}));
+    var invalid_auth = try parseCorpus(testing.allocator, policyCorpus("invalid", "authentication-failed"), .{});
+    invalid_auth.deinit();
+    var invalid_input = try parseCorpus(testing.allocator, policyCorpus("invalid", "invalid-input"), .{});
+    invalid_input.deinit();
 
-    try validateExpected(.acceptable, .success);
-    try validateExpected(.acceptable, .authentication_failed);
-    try validateExpected(.acceptable, .invalid_input);
+    var acceptable_success = try parseCorpus(testing.allocator, policyCorpus("acceptable", "success"), .{});
+    acceptable_success.deinit();
+    var acceptable_auth = try parseCorpus(testing.allocator, policyCorpus("acceptable", "authentication-failed"), .{});
+    acceptable_auth.deinit();
+    var acceptable_input = try parseCorpus(testing.allocator, policyCorpus("acceptable", "invalid-input"), .{});
+    acceptable_input.deinit();
 }
 
 test "crypto corpus runner rejects provider success with mismatched AEAD output" {
@@ -785,15 +795,63 @@ test "crypto corpus runner rejects provider success with mismatched AEAD output"
     try testing.expect(observed != expectedObserved(case.expected));
 }
 
+test "crypto corpus runner propagates unexpected provider errors" {
+    const key = [_]u8{0} ** provider.Aead.aes_128_gcm.keyLength();
+    const nonce = [_]u8{0} ** provider.aead_nonce_len;
+    const tag = [_]u8{0} ** provider.aead_tag_len;
+    const suite = Suite{
+        .id = "fake-aead",
+        .algorithm = .aes_128_gcm,
+        .operation = .aead_open,
+        .source_file = "fake.json",
+        .groups = &.{},
+    };
+    const group = Group{
+        .id = "fake-group",
+        .upstream_group_index = 0,
+        .cases = &.{},
+    };
+    const case = Case{
+        .id = "fake-case",
+        .upstream_tc_id = 1,
+        .classification = .invalid,
+        .expected = .invalid_input,
+        .comment = "",
+        .flags = &.{},
+        .key = &key,
+        .nonce = &nonce,
+        .tag = &tag,
+    };
+    try testing.expectError(error.UnsupportedCapability, executeCase(UnsupportedAeadProvider.cryptoProvider(), suite, group, case));
+}
+
+test "crypto corpus manifest rejects algorithm mismatch" {
+    var corpus = try parseCorpus(testing.allocator, corpus_bytes, .{});
+    defer corpus.deinit();
+    corpus.suites[0].algorithm = .chacha20_poly1305;
+    try testing.expectError(error.TestUnexpectedResult, validateManifestCoverage(&corpus, .{
+        .executed_suites = corpus_manifest.suites.len,
+        .executed_cases = 11,
+        .valid = 5,
+        .invalid = 5,
+        .acceptable = 1,
+        .skipped_suites = corpus_manifest.skipped_suites.len,
+    }));
+}
+
 const MinimalKind = enum {
+    valid,
     schema_bad,
     missing_required,
     unknown_algorithm,
     unknown_classification,
+    unknown_expected,
+    unsupported_operation,
     malformed_hex,
     oversized_id,
     duplicate_case_id,
     unknown_field,
+    too_many_flags,
 };
 
 fn minimalCorpus(comptime kind: MinimalKind) []const u8 {
@@ -802,9 +860,12 @@ fn minimalCorpus(comptime kind: MinimalKind) []const u8 {
         else => "case-1",
     };
     const classification = if (kind == .unknown_classification) "legacy" else "valid";
+    const expected = if (kind == .unknown_expected) "maybe" else "success";
     const key_hex = if (kind == .malformed_hex) "0" else "00000000000000000000000000000000";
     const algorithm = if (kind == .unknown_algorithm) "AES-192-GCM" else "AES-128-GCM";
+    const operation = if (kind == .unsupported_operation) "verify" else "aead-open";
     const schema = if (kind == .schema_bad) "bad-schema" else schema_version;
+    const flags = if (kind == .too_many_flags) "[\"a\", \"b\", \"c\", \"d\", \"e\", \"f\", \"g\", \"h\", \"i\"]" else "[]";
     const second_case = if (kind == .duplicate_case_id)
         \\,{
         \\  "id": "case-1",
@@ -836,7 +897,7 @@ fn minimalCorpus(comptime kind: MinimalKind) []const u8 {
         \\  "suites": [{{
         \\    "id": "suite-1",
         \\    "algorithm": "{s}",
-        \\    "operation": "aead-open",
+        \\    "operation": "{s}",
         \\    "sourceFile": "source.json",
         \\    "groups": [{{
         \\      "id": "group-1",
@@ -845,9 +906,9 @@ fn minimalCorpus(comptime kind: MinimalKind) []const u8 {
         \\        "id": "{s}",
         \\        "upstreamTcId": 1,
         \\        "classification": "{s}",
-        \\        "expected": "success",
+        \\        "expected": "{s}",
         \\        "comment": "",
-        \\        "flags": [],
+        \\        "flags": {s},
         \\        "key": "{s}",
         \\        "nonce": "000000000000000000000000",
         \\        "aad": "",
@@ -858,7 +919,42 @@ fn minimalCorpus(comptime kind: MinimalKind) []const u8 {
         \\    }}]
         \\  }}]
         \\}}
-    , .{ schema, source, algorithm, case_id, classification, key_hex, extra, second_case });
+    , .{ schema, source, algorithm, operation, case_id, classification, expected, flags, key_hex, extra, second_case });
+}
+
+fn policyCorpus(comptime classification: []const u8, comptime expected: []const u8) []const u8 {
+    return std.fmt.comptimePrint(
+        \\{{
+        \\  "schema": "{s}",
+        \\  "source": {{"name": "x", "repository": "x", "commit": "x", "license": "x", "reducedBy": "x"}},
+        \\  "allowlist": ["AES-128-GCM"],
+        \\  "skippedSuites": [],
+        \\  "suites": [{{
+        \\    "id": "suite-1",
+        \\    "algorithm": "AES-128-GCM",
+        \\    "operation": "aead-open",
+        \\    "sourceFile": "source.json",
+        \\    "groups": [{{
+        \\      "id": "group-1",
+        \\      "upstreamGroupIndex": 0,
+        \\      "cases": [{{
+        \\        "id": "case-1",
+        \\        "upstreamTcId": 1,
+        \\        "classification": "{s}",
+        \\        "expected": "{s}",
+        \\        "comment": "",
+        \\        "flags": [],
+        \\        "key": "00000000000000000000000000000000",
+        \\        "nonce": "000000000000000000000000",
+        \\        "aad": "",
+        \\        "message": "",
+        \\        "ciphertext": "",
+        \\        "tag": "00000000000000000000000000000000"
+        \\      }}]
+        \\    }}]
+        \\  }}]
+        \\}}
+    , .{ schema_version, classification, expected });
 }
 
 fn twoGroupCorpus() []const u8 {
@@ -1049,5 +1145,41 @@ const BadAeadProvider = struct {
     fn fillEntropy(ctx: *anyopaque, buffer: []u8) provider.EntropyError!void {
         _ = ctx;
         @memset(buffer, 0);
+    }
+};
+
+const UnsupportedAeadProvider = struct {
+    var context: u8 = 0;
+    var entropy_context: u8 = 0;
+
+    const vtable = provider.CryptoProvider.VTable{
+        .capabilities = BadAeadProvider.capabilities,
+        .hkdfExtract = BadAeadProvider.hkdfExtract,
+        .hkdfExpandLabel = BadAeadProvider.hkdfExpandLabel,
+        .aeadSeal = BadAeadProvider.aeadSeal,
+        .aeadOpen = aeadOpen,
+        .generateKeyShare = BadAeadProvider.generateKeyShare,
+        .deriveSharedSecret = BadAeadProvider.deriveSharedSecret,
+        .verify = BadAeadProvider.verify,
+    };
+
+    fn cryptoProvider() provider.CryptoProvider {
+        return .{
+            .context = &context,
+            .vtable = &vtable,
+            .entropy = .{ .context = &entropy_context, .fillFn = BadAeadProvider.fillEntropy },
+        };
+    }
+
+    fn aeadOpen(ctx: *anyopaque, aead: provider.Aead, key: []const u8, nonce: []const u8, aad: []const u8, ciphertext: []const u8, tag: []const u8, plaintext: []u8) provider.OpenError!void {
+        _ = ctx;
+        _ = aead;
+        _ = key;
+        _ = nonce;
+        _ = aad;
+        _ = ciphertext;
+        _ = tag;
+        _ = plaintext;
+        return error.UnsupportedCapability;
     }
 };

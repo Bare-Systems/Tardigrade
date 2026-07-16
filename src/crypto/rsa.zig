@@ -301,17 +301,17 @@ test "RSA public-key DER enforces exponent range and parity" {
     }
 
     // 257 bytes is one byte longer than the 2048-bit modulus value.
-    var large_exponent: [257]u8 = [_]u8{0} ** 257;
-    large_exponent[1] = 0x80;
+    var exponent_test_data: [257]u8 = [_]u8{0} ** 257;
+    exponent_test_data[1] = 0x80;
     var equal_size_der: [600]u8 = undefined;
-    try std.testing.expectError(error.InvalidInput, parsePublicKey(makeTestPublicKey(&equal_size_der, &large_exponent, max_modulus_bytes, 0x80)));
-    large_exponent[1] = 0xff;
+    try std.testing.expectError(error.InvalidInput, parsePublicKey(makeTestPublicKey(&equal_size_der, &exponent_test_data, max_modulus_bytes, 0x80)));
+    exponent_test_data[1] = 0xff;
     var greater_size_der: [600]u8 = undefined;
-    try std.testing.expectError(error.InvalidInput, parsePublicKey(makeTestPublicKey(&greater_size_der, &large_exponent, max_modulus_bytes, 0x80)));
-    var longer_exponent: [258]u8 = [_]u8{0} ** 258;
-    longer_exponent[1] = 0x80;
+    try std.testing.expectError(error.InvalidInput, parsePublicKey(makeTestPublicKey(&greater_size_der, &exponent_test_data, max_modulus_bytes, 0x80)));
+    var exponent_too_long: [258]u8 = [_]u8{0} ** 258;
+    exponent_too_long[1] = 0x80;
     var longer_der: [600]u8 = undefined;
-    try std.testing.expectError(error.InvalidInput, parsePublicKey(makeTestPublicKey(&longer_der, &longer_exponent, max_modulus_bytes, 0x80)));
+    try std.testing.expectError(error.InvalidInput, parsePublicKey(makeTestPublicKey(&longer_der, &exponent_too_long, max_modulus_bytes, 0x80)));
 }
 
 test "RSA-PSS rejects short, long, and out-of-range signatures" {

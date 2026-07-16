@@ -150,14 +150,31 @@ pub const Name = struct {
     rdns: []const RelativeDistinguishedName,
     /// Canonical name-chaining key (RFC 5280 §7.1), arena-owned: RDNs in
     /// sequence order, each RDN's attributes compared as a set (sorted
-    /// canonical forms), attribute types by decoded OID, and primitive
-    /// PrintableString/UTF8String values unified into one caseIgnore class
-    /// normalized by trimming leading/trailing white space, collapsing
-    /// internal white-space runs to a single space, and folding ASCII case
-    /// (rules (c)/(d) of §7.1; full RFC 4518 StringPrep is intentionally out
-    /// of scope, matching common validator behavior). All other value types
-    /// compare as exact bytes under their own tag (rules (a)/(b)). Two names
-    /// chain exactly when their keys are byte-equal.
+    /// canonical forms), attribute types by decoded OID. Three matching
+    /// classes select the per-attribute normalization:
+    ///
+    /// - `domainComponent` (id-domainComponent) values carried in a
+    ///   primitive IA5String are compared with `caseIgnoreIA5Match`
+    ///   (RFC 4517 §4.2.3): ASCII case folded. IA5String is ASCII-only, so
+    ///   this is an exact implementation of the rule, not an approximation.
+    /// - Primitive PrintableString/UTF8String values (the required
+    ///   DirectoryString forms) are unified into one caseIgnore class,
+    ///   normalized by collapsing space-equivalent runs (ASCII white space
+    ///   plus U+00A0 NO-BREAK SPACE) to a single space with leading/trailing
+    ///   space dropped, and case-folding ASCII and Latin-1 Supplement
+    ///   letters (U+0041-U+005A, U+00C0-U+00DE excluding the U+00D7
+    ///   multiplication sign). This is a deliberately bounded approximation
+    ///   of RFC 5280 §7.1's RFC 4518 StringPrep requirement: it covers ASCII
+    ///   and Latin-1 scripts exactly but does not perform full Unicode
+    ///   simple case folding, NFKC normalization, or prohibited-codepoint
+    ///   rejection for other scripts. A CA-issued name using non-Latin-1
+    ///   case variation (e.g. Cyrillic or Greek case pairs) will not chain
+    ///   to an otherwise-equal name that differs only in case.
+    /// - Every other value type (including BMPString, which RFC 5280
+    ///   permits but is legacy and rare) compares as exact bytes under its
+    ///   own tag.
+    ///
+    /// Two names chain exactly when their keys are byte-equal.
     chaining_key: []const u8,
 
     pub fn eqlEncoding(self: *const Name, other: *const Name) bool {
@@ -395,8 +412,13 @@ pub const Certificate = struct {
         return SignatureAlgorithm.classify(&self.signature_algorithm);
     }
 
+    /// RFC 5280 defines self-issued as the issuer and subject DNs matching
+    /// under §7.1 name-chaining rules, not encoding identity: a CA that
+    /// re-encodes its own name between issuer and subject fields (a
+    /// PrintableString subject, UTF8String issuer, for example) is still
+    /// self-issued.
     pub fn isSelfIssued(self: *const Certificate) bool {
-        return self.issuer.eqlEncoding(&self.subject);
+        return self.issuer.eqlForChaining(&self.subject);
     }
 
     pub fn findExtension(self: *const Certificate, components: []const u32) ?*const Extension {
@@ -665,7 +687,15 @@ const Parser = struct {
         const components = attribute.type.components();
         try appendCount(&blob, self.arena, components.len);
         for (components) |component| try appendBe32(&blob, self.arena, component);
-        if (isCaseIgnoreStringTag(attribute.value_tag)) {
+        if (attribute.type.eqlComponents(&wk.domain_component) and isPrimitiveIa5(attribute.value_tag)) {
+            // RFC 5280 §7.1 / RFC 4517 §4.2.3 caseIgnoreIA5Match: exact, not
+            // an approximation, since IA5String content is ASCII-only.
+            try blob.append(self.arena, 0x02);
+            const normalized = try self.arena.alloc(u8, attribute.value.len);
+            for (attribute.value, normalized) |byte, *out| out.* = std.ascii.toLower(byte);
+            try appendCount(&blob, self.arena, normalized.len);
+            try blob.appendSlice(self.arena, normalized);
+        } else if (isCaseIgnoreStringTag(attribute.value_tag)) {
             try blob.append(self.arena, 0x00);
             const normalized = try normalizeDirectoryString(self.arena, attribute.value);
             try appendCount(&blob, self.arena, normalized.len);
@@ -1213,16 +1243,31 @@ fn isCaseIgnoreStringTag(tag: der.Tag) bool {
         tag.number == @intFromEnum(der.UniversalTag.printable_string);
 }
 
-/// RFC 5280 §7.1 rules (c)/(d): drop leading/trailing white space, collapse
-/// internal runs to one space, fold case. Folding is ASCII-only, which is
-/// UTF-8-safe (multi-byte sequences have the high bit set) and matches the
-/// OpenSSL canonical-name baseline; full RFC 4518 StringPrep is out of scope.
+fn isPrimitiveIa5(tag: der.Tag) bool {
+    return tag.class == .universal and !tag.constructed and
+        tag.number == @intFromEnum(der.UniversalTag.ia5_string);
+}
+
+/// RFC 5280 §7.1 rules (c)/(d): drop leading/trailing space-equivalent runs,
+/// collapse internal runs to one space, fold case — see `Name.chaining_key`
+/// for the exact, deliberately bounded scope (ASCII plus Latin-1 Supplement;
+/// U+00A0 NO-BREAK SPACE folds to space; full RFC 4518 StringPrep, including
+/// Unicode case folding beyond Latin-1 and NFKC normalization, is out of
+/// scope). `content` is valid UTF-8 by construction: this is only called for
+/// a tag `isCaseIgnoreStringTag` accepted, and every such value already
+/// passed `der.validateUtf8` (UTF8String) or `der.validatePrintableString`
+/// (PrintableString, an ASCII subset and hence trivially valid UTF-8) during
+/// RDN attribute parsing, which happens before `buildChainingKey` runs.
 fn normalizeDirectoryString(arena: std.mem.Allocator, content: []const u8) error{OutOfMemory}![]const u8 {
+    // Folding never grows a codepoint's UTF-8 length (ASCII and Latin-1
+    // Supplement fold within the same encoded width; NBSP folds from 2
+    // bytes to a 1-byte space), so the input length is a valid upper bound.
     const out = try arena.alloc(u8, content.len);
     var len: usize = 0;
     var pending_space = false;
-    for (content) |byte| {
-        if (std.ascii.isWhitespace(byte)) {
+    var iterator = std.unicode.Utf8View.initUnchecked(content).iterator();
+    while (iterator.nextCodepoint()) |codepoint| {
+        if (isChainingSpace(codepoint)) {
             if (len > 0) pending_space = true;
             continue;
         }
@@ -1231,10 +1276,32 @@ fn normalizeDirectoryString(arena: std.mem.Allocator, content: []const u8) error
             len += 1;
             pending_space = false;
         }
-        out[len] = std.ascii.toLower(byte);
-        len += 1;
+        // Folded codepoints stay within the encodable range validated
+        // above, so re-encoding cannot fail.
+        len += std.unicode.utf8Encode(foldCaseIgnoreCodepoint(codepoint), out[len..]) catch unreachable;
     }
     return out[0..len];
+}
+
+/// Space-equivalent codepoints for insignificant-space handling: ASCII
+/// white space plus U+00A0 NO-BREAK SPACE (RFC 4518 §2.6.1 treats NBSP as a
+/// space character; the wider RFC 4518 §2.2/C.1.2 non-ASCII space table is
+/// out of scope — see `Name.chaining_key`).
+fn isChainingSpace(codepoint: u21) bool {
+    return switch (codepoint) {
+        ' ', '\t', '\n', 0x0b, 0x0c, '\r', 0xa0 => true,
+        else => false,
+    };
+}
+
+/// Case-fold one codepoint for the caseIgnore class: ASCII and Latin-1
+/// Supplement letters only (see `Name.chaining_key`). U+00D7 MULTIPLICATION
+/// SIGN sits inside the Latin-1 uppercase-letter range but is not a letter
+/// and has no lowercase counterpart, so it is excluded.
+fn foldCaseIgnoreCodepoint(codepoint: u21) u21 {
+    if (codepoint >= 'A' and codepoint <= 'Z') return codepoint + 0x20;
+    if (codepoint >= 0xc0 and codepoint <= 0xde and codepoint != 0xd7) return codepoint + 0x20;
+    return codepoint;
 }
 
 fn appendCount(list: *std.ArrayList(u8), arena: std.mem.Allocator, count: usize) error{OutOfMemory}!void {

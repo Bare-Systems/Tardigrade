@@ -11,11 +11,19 @@ All notable user-facing changes to Tardigrade are documented here.
   anchors, strictly separated from RFC 5280 policy validation (#324-G): no
   signature is verified and no path is accepted, only enumerated. Pools are
   deduplicated by exact DER and indexed by RFC 5280 §7.1 name chaining via a
-  new canonical `x509.Name.chaining_key` (with `eqlForChaining`) that
-  unifies primitive PrintableString/UTF8String values under caseIgnore
-  matching with insignificant-space folding, compares RDN attribute sets,
-  and keeps all other value types exact-bytes; AKI/SKI key identifiers rank
-  candidate issuers (RFC 4158-style hints) but never veto them. Enumeration
+  new canonical `x509.Name.chaining_key` (with `eqlForChaining`, also now
+  used by `Certificate.isSelfIssued`) that compares RDN attribute sets,
+  matches `domainComponent` case-insensitively per RFC 4517 §4.2.3
+  (`caseIgnoreIA5Match`), and unifies primitive PrintableString/UTF8String
+  values under one caseIgnore class — case-folding ASCII and Latin-1
+  Supplement letters and collapsing insignificant space, including
+  NO-BREAK SPACE — with every other value type kept exact-bytes. This
+  covers the ASCII and Latin-1 scripts exactly but is a deliberately
+  bounded approximation of RFC 5280 §7.1's full RFC 4518 StringPrep
+  requirement: it does not perform Unicode case folding beyond Latin-1,
+  NFKC normalization, or prohibited-codepoint rejection (documented on
+  `x509.Name.chaining_key`). AKI/SKI key identifiers rank candidate issuers
+  (RFC 4158-style hints) but never veto them. Enumeration
   is a documented total order — key-identifier agreement, then anchors
   before intermediates, then input index, walked depth-first without
   recursion — so straight, cross-signed, ambiguous, duplicate, cyclic, and

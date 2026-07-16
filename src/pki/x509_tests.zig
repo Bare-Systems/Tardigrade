@@ -232,6 +232,21 @@ fn nameWithCnTag(arena: std.mem.Allocator, value_tag: u8, cn: []const u8) ![]u8 
     return tlv(arena, 0x30, &.{try tlv(arena, 0x31, &.{atv})});
 }
 
+/// A Name with one domainComponent RDN per label, e.g. `["EXAMPLE", "COM"]`
+/// for `DC=EXAMPLE,DC=COM`.
+fn dnWithDomainComponents(arena: std.mem.Allocator, labels: []const []const u8, value_tag: u8) ![]u8 {
+    var rdns: std.ArrayList([]const u8) = .empty;
+    defer rdns.deinit(arena);
+    for (labels) |label| {
+        const atv = try tlv(arena, 0x30, &.{
+            try oidTlv(arena, &oid.well_known.domain_component),
+            try tlv(arena, value_tag, &.{label}),
+        });
+        try rdns.append(arena, try tlv(arena, 0x31, &.{atv}));
+    }
+    return tlv(arena, 0x30, rdns.items);
+}
+
 fn utcValidity(arena: std.mem.Allocator) ![]u8 {
     return tlv(arena, 0x30, &.{
         try tlv(arena, 0x17, &.{"260101000000Z"}),
@@ -781,6 +796,69 @@ test "name chaining unifies PrintableString and UTF8String with case and space f
     const bmp_text = [_]u8{ 0, 'E', 0, 'x', 0, 'a', 0, 'm', 0, 'p', 0, 'l', 0, 'e', 0, ' ', 0, 'C', 0, 'A' };
     const bmp_name = try x509.parseNameRaw(arena, try nameWithCnTag(arena, 0x1e, &bmp_text), .{});
     try testing.expect(!utf8_name.eqlForChaining(&bmp_name));
+}
+
+test "name chaining folds Latin-1 Supplement case and NO-BREAK SPACE" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    // Latin-1 Supplement letters fold within the caseIgnore class, covering
+    // the required DirectoryString forms beyond plain ASCII.
+    const upper = try x509.parseNameRaw(arena, try nameWithCnTag(arena, 0x0c, "ÉCOLE"), .{});
+    const lower = try x509.parseNameRaw(arena, try nameWithCnTag(arena, 0x0c, "école"), .{});
+    try testing.expect(upper.eqlForChaining(&lower));
+    try testing.expect(!upper.eqlEncoding(&lower));
+
+    // U+00A0 NO-BREAK SPACE folds to a plain space for insignificant-space
+    // handling, the same as the ASCII white-space case above.
+    const nbsp_name = try x509.parseNameRaw(arena, try nameWithCnTag(arena, 0x0c, "Example\u{00A0}CA"), .{});
+    const space_name = try x509.parseNameRaw(arena, try nameWithCnTag(arena, 0x0c, "Example CA"), .{});
+    try testing.expect(nbsp_name.eqlForChaining(&space_name));
+    try testing.expect(!nbsp_name.eqlEncoding(&space_name));
+}
+
+test "domainComponent RDN values compare with caseIgnoreIA5Match" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    // RFC 5280 §7.1 / RFC 4517 §4.2.3: domainComponent (IA5String) chains
+    // case-insensitively — DC=EXAMPLE,DC=COM must chain to dc=example,dc=com.
+    const upper = try x509.parseNameRaw(arena, try dnWithDomainComponents(arena, &.{ "EXAMPLE", "COM" }, 0x16), .{});
+    const lower = try x509.parseNameRaw(arena, try dnWithDomainComponents(arena, &.{ "example", "com" }, 0x16), .{});
+    try testing.expect(upper.eqlForChaining(&lower));
+    try testing.expect(!upper.eqlEncoding(&lower));
+
+    const different = try x509.parseNameRaw(arena, try dnWithDomainComponents(arena, &.{ "example", "net" }, 0x16), .{});
+    try testing.expect(!upper.eqlForChaining(&different));
+}
+
+test "isSelfIssued uses name chaining, not encoding equality" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    // Issuer and subject carry the same value under different
+    // DirectoryString encodings, case, and insignificant space; RFC 5280
+    // defines self-issued via §7.1 name chaining, not encoding identity.
+    var list: std.ArrayList([]const u8) = .empty;
+    defer list.deinit(arena);
+    try list.append(arena, try versionTlv(arena, 2));
+    try list.append(arena, try tlv(arena, 0x02, &.{&[_]u8{0x01}}));
+    try list.append(arena, try algorithmEd25519(arena));
+    try list.append(arena, try nameWithCnTag(arena, 0x0c, "  Example   CA "));
+    try list.append(arena, try utcValidity(arena));
+    try list.append(arena, try nameWithCnTag(arena, 0x13, "example ca"));
+    try list.append(arena, try spkiEd25519(arena));
+    const tbs = try tlv(arena, 0x30, list.items);
+    const bytes = try tlv(arena, 0x30, &.{ tbs, try algorithmEd25519(arena), try signatureBits(arena) });
+
+    var cert = try x509.Certificate.parse(testing.allocator, bytes, .{});
+    defer cert.deinit(testing.allocator);
+    try testing.expect(!cert.issuer.eqlEncoding(&cert.subject));
+    try testing.expect(cert.issuer.eqlForChaining(&cert.subject));
+    try testing.expect(cert.isSelfIssued());
 }
 
 test "name chaining keys are structure-sensitive" {

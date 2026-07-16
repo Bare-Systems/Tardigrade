@@ -855,7 +855,9 @@ const Parser = struct {
         var reader = der.Reader.init(value, self.limits.der);
         const bits = reader.readBitString() catch return error.MalformedExtension;
         reader.expectEnd() catch return error.MalformedExtension;
-        if (bits.data.len > 2) return error.MalformedExtension;
+        // RFC 5280 §4.2.1.3: when Key Usage is present, at least one bit MUST
+        // be set. An empty BIT STRING would otherwise become an all-false KU.
+        if (bits.data.len == 0 or bits.data.len > 2) return error.MalformedExtension;
         // DER named bits: trailing zero bits are removed, so the final data
         // byte's lowest used bit must be set.
         if (bits.data.len > 0) {

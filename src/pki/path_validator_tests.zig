@@ -13,6 +13,9 @@ const testing = std.testing;
 const validation_time: i64 = 1_782_864_000; // 2026-07-01T00:00:00Z
 const openssl_root_pem = @embedFile("testdata/path_validator_ed25519_root.crt");
 const openssl_leaf_pem = @embedFile("testdata/path_validator_ed25519_leaf.crt");
+const rsa_root_pem = @embedFile("testdata/path_validator_rsa_root.crt");
+const rsa_key_encipherment_leaf_pem = @embedFile("testdata/path_validator_rsa_key_encipherment_leaf.crt");
+const rsa_digital_signature_leaf_pem = @embedFile("testdata/path_validator_rsa_digital_signature_leaf.crt");
 
 fn tlv(arena: std.mem.Allocator, tag: u8, parts: []const []const u8) ![]u8 {
     var total: usize = 0;
@@ -380,6 +383,49 @@ test "OpenSSL-generated Ed25519 leaf and anchor validate independently" {
     try expectAccepted(&result, 2);
 }
 
+test "TLS 1.3 RSA leaf requires digitalSignature rather than keyEncipherment" {
+    var root_pem = try pem.loadCertificatePem(testing.allocator, rsa_root_pem, .{});
+    defer root_pem.deinit(testing.allocator);
+    var key_encipherment_pem = try pem.loadCertificatePem(testing.allocator, rsa_key_encipherment_leaf_pem, .{});
+    defer key_encipherment_pem.deinit(testing.allocator);
+    var digital_signature_pem = try pem.loadCertificatePem(testing.allocator, rsa_digital_signature_leaf_pem, .{});
+    defer digital_signature_pem.deinit(testing.allocator);
+    var root = try x509.Certificate.parse(testing.allocator, root_pem.der, .{});
+    defer root.deinit(testing.allocator);
+    var key_encipherment_leaf = try x509.Certificate.parse(testing.allocator, key_encipherment_pem.der, .{});
+    defer key_encipherment_leaf.deinit(testing.allocator);
+    var digital_signature_leaf = try x509.Certificate.parse(testing.allocator, digital_signature_pem.der, .{});
+    defer digital_signature_leaf.deinit(testing.allocator);
+
+    try testing.expectEqual(x509.PublicKeyType.rsa, key_encipherment_leaf.subject_public_key_info.key_type);
+    try testing.expect(key_encipherment_leaf.keyUsage().?.key_encipherment);
+    try testing.expect(!key_encipherment_leaf.keyUsage().?.digital_signature);
+    try testing.expectEqual(x509.PublicKeyType.rsa, digital_signature_leaf.subject_public_key_info.key_type);
+    try testing.expect(digital_signature_leaf.keyUsage().?.digital_signature);
+
+    var entropy: crypto.pure_zig.DeterministicEntropy = undefined;
+    var provider: crypto.pure_zig.Provider = undefined;
+    const cp = cryptoProvider(&entropy, &provider);
+    var validation_policy = policy((&root)[0..1]);
+    validation_policy.validation_time = 1_784_332_800; // 2026-07-18T00:00:00Z
+
+    const key_encipherment_elements = [_]path_builder.Element{
+        .{ .certificate = &key_encipherment_leaf, .source = .leaf, .input_index = 0 },
+        .{ .certificate = &root, .source = .anchor, .input_index = 0 },
+    };
+    var key_encipherment_result = validator.validatePath(testing.allocator, .{ .elements = &key_encipherment_elements }, validation_policy, cp);
+    defer key_encipherment_result.deinit(testing.allocator);
+    try expectRejected(&key_encipherment_result, .key_usage_violation, 0);
+
+    const digital_signature_elements = [_]path_builder.Element{
+        .{ .certificate = &digital_signature_leaf, .source = .leaf, .input_index = 0 },
+        .{ .certificate = &root, .source = .anchor, .input_index = 0 },
+    };
+    var digital_signature_result = validator.validatePath(testing.allocator, .{ .elements = &digital_signature_elements }, validation_policy, cp);
+    defer digital_signature_result.deinit(testing.allocator);
+    try expectAccepted(&digital_signature_result, 2);
+}
+
 test "validity windows reject early and late certificates and include exact boundaries" {
     var fx = Fixtures.init(testing.allocator);
     defer fx.deinit();
@@ -539,26 +585,42 @@ test "non-CA and missing keyCertSign issuers fail at the issuing certificate" {
     defer not_ca.deinit(testing.allocator);
     try expectRejected(&not_ca, .issuer_is_not_ca, 1);
 
-    try fx.add(.{ .subject = "KU Issuer", .issuer = "KU Issuer", .subject_key = 4, .issuer_key = 4, .ca = true, .key_usage = 0x80 });
-    try fx.add(.{ .subject = "leaf2", .issuer = "KU Issuer", .subject_key = 5, .issuer_key = 4, .ca = false, .key_usage = 0x80 });
-    var bad_ku = try validateBuilt(testing.allocator, &fx.certs.items[4], &.{}, fx.certs.items[3..4], policy(fx.certs.items[3..4]), cp);
+    try fx.add(.{ .subject = "leaf2", .issuer = "KU Issuer", .subject_key = 4, .issuer_key = 5, .ca = false, .key_usage = 0x80 });
+    try fx.add(.{ .subject = "KU Issuer", .issuer = "Root2", .subject_key = 5, .issuer_key = 6, .ca = true, .key_usage = 0x80 });
+    try fx.add(.{ .subject = "Root2", .issuer = "Root2", .subject_key = 6, .issuer_key = 6, .ca = true, .key_usage = 0x04 });
+    var bad_ku = try validateBuilt(testing.allocator, &fx.certs.items[3], fx.certs.items[4..5], fx.certs.items[5..6], policy(fx.certs.items[5..6]), cp);
     defer bad_ku.deinit(testing.allocator);
     try expectRejected(&bad_ku, .key_usage_violation, 1);
 
-    // Missing Basic Constraints never grants issuing authority.
-    try fx.add(.{ .subject = "No BC", .issuer = "No BC", .subject_key = 6, .issuer_key = 6 });
-    try fx.add(.{ .subject = "leaf3", .issuer = "No BC", .subject_key = 7, .issuer_key = 6, .ca = false, .key_usage = 0x80 });
-    var missing_bc = try validateBuilt(testing.allocator, &fx.certs.items[6], &.{}, fx.certs.items[5..6], policy(fx.certs.items[5..6]), cp);
+    // Missing Basic Constraints never grants intermediate issuing authority.
+    try fx.add(.{ .subject = "leaf3", .issuer = "No BC", .subject_key = 7, .issuer_key = 8, .ca = false, .key_usage = 0x80 });
+    try fx.add(.{ .subject = "No BC", .issuer = "Root3", .subject_key = 8, .issuer_key = 9 });
+    try fx.add(.{ .subject = "Root3", .issuer = "Root3", .subject_key = 9, .issuer_key = 9, .ca = true, .key_usage = 0x04 });
+    var missing_bc = try validateBuilt(testing.allocator, &fx.certs.items[6], fx.certs.items[7..8], fx.certs.items[8..9], policy(fx.certs.items[8..9]), cp);
     defer missing_bc.deinit(testing.allocator);
     try expectRejected(&missing_bc, .issuer_is_not_ca, 1);
 
-    // Absent issuer KU is unrestricted; only a present KU must assert
+    // A configured legacy anchor needs no certificate Basic Constraints or
+    // KU, both for direct and intermediate paths.
+    try fx.add(.{ .subject = "Legacy Root", .issuer = "Legacy Root", .subject_key = 10, .issuer_key = 10 });
+    try fx.add(.{ .subject = "direct legacy", .issuer = "Legacy Root", .subject_key = 11, .issuer_key = 10, .ca = false, .key_usage = 0x80 });
+    try fx.add(.{ .subject = "Legacy Intermediate", .issuer = "Legacy Root", .subject_key = 12, .issuer_key = 10, .ca = true, .key_usage = 0x04 });
+    try fx.add(.{ .subject = "legacy chain leaf", .issuer = "Legacy Intermediate", .subject_key = 13, .issuer_key = 12, .ca = false, .key_usage = 0x80 });
+    var direct_legacy = try validateBuilt(testing.allocator, &fx.certs.items[10], &.{}, fx.certs.items[9..10], policy(fx.certs.items[9..10]), cp);
+    defer direct_legacy.deinit(testing.allocator);
+    try expectAccepted(&direct_legacy, 2);
+    var chained_legacy = try validateBuilt(testing.allocator, &fx.certs.items[12], fx.certs.items[11..12], fx.certs.items[9..10], policy(fx.certs.items[9..10]), cp);
+    defer chained_legacy.deinit(testing.allocator);
+    try expectAccepted(&chained_legacy, 3);
+
+    // Absent intermediate KU is unrestricted; only a present KU must assert
     // keyCertSign.
-    try fx.add(.{ .subject = "No KU", .issuer = "No KU", .subject_key = 8, .issuer_key = 8, .ca = true });
-    try fx.add(.{ .subject = "leaf4", .issuer = "No KU", .subject_key = 9, .issuer_key = 8, .ca = false, .key_usage = 0x80 });
-    var absent_ku = try validateBuilt(testing.allocator, &fx.certs.items[8], &.{}, fx.certs.items[7..8], policy(fx.certs.items[7..8]), cp);
+    try fx.add(.{ .subject = "leaf4", .issuer = "No KU", .subject_key = 14, .issuer_key = 15, .ca = false, .key_usage = 0x80 });
+    try fx.add(.{ .subject = "No KU", .issuer = "Root4", .subject_key = 15, .issuer_key = 16, .ca = true });
+    try fx.add(.{ .subject = "Root4", .issuer = "Root4", .subject_key = 16, .issuer_key = 16 });
+    var absent_ku = try validateBuilt(testing.allocator, &fx.certs.items[13], fx.certs.items[14..15], fx.certs.items[15..16], policy(fx.certs.items[15..16]), cp);
     defer absent_ku.deinit(testing.allocator);
-    try expectAccepted(&absent_ku, 2);
+    try expectAccepted(&absent_ku, 3);
 }
 
 test "pathLenConstraint handles zero, exact limits, and self-issued CAs" {
@@ -569,28 +631,42 @@ test "pathLenConstraint handles zero, exact limits, and self-issued CAs" {
     var entropy: crypto.pure_zig.DeterministicEntropy = undefined;
     var provider: crypto.pure_zig.Provider = undefined;
     const cp = cryptoProvider(&entropy, &provider);
-    var over = try validateBuilt(testing.allocator, &fx.certs.items[0], fx.certs.items[1..2], fx.certs.items[2..3], policy(fx.certs.items[2..3]), cp);
+    var exact = try validateBuilt(testing.allocator, &fx.certs.items[0], fx.certs.items[1..2], fx.certs.items[2..3], policy(fx.certs.items[2..3]), cp);
+    defer exact.deinit(testing.allocator);
+    try expectAccepted(&exact, 3);
+
+    // A constrained intermediate with one non-self-issued CA below exceeds
+    // pathLen=0. Anchor pathLen is deliberately not trust policy.
+    try fx.add(.{ .subject = "over leaf", .issuer = "Lower CA", .subject_key = 4, .issuer_key = 5, .ca = false, .key_usage = 0x80 });
+    try fx.add(.{ .subject = "Lower CA", .issuer = "Constrained CA", .subject_key = 5, .issuer_key = 6, .ca = true, .key_usage = 0x04 });
+    try fx.add(.{ .subject = "Constrained CA", .issuer = "Root2", .subject_key = 6, .issuer_key = 7, .ca = true, .path_len = 0, .key_usage = 0x04 });
+    try fx.add(.{ .subject = "Root2", .issuer = "Root2", .subject_key = 7, .issuer_key = 7 });
+    var over = try validateBuilt(testing.allocator, &fx.certs.items[3], fx.certs.items[4..6], fx.certs.items[6..7], policy(fx.certs.items[6..7]), cp);
     defer over.deinit(testing.allocator);
     try expectRejected(&over, .path_length_exceeded, 2);
 
-    // Direct leaf -> pathLen=0 anchor has no subordinate CA and passes.
-    try fx.add(.{ .subject = "direct", .issuer = "Root", .subject_key = 4, .issuer_key = 3, .ca = false, .key_usage = 0x80 });
-    var zero = try validateBuilt(testing.allocator, &fx.certs.items[3], &.{}, fx.certs.items[2..3], policy(fx.certs.items[2..3]), cp);
+    // The configured anchor's certificate pathLen is not inherited as trust
+    // policy, so a direct leaf also passes.
+    try fx.add(.{ .subject = "direct", .issuer = "Root", .subject_key = 8, .issuer_key = 3, .ca = false, .key_usage = 0x80 });
+    var zero = try validateBuilt(testing.allocator, &fx.certs.items[7], &.{}, fx.certs.items[2..3], policy(fx.certs.items[2..3]), cp);
     defer zero.deinit(testing.allocator);
     try expectAccepted(&zero, 2);
 
-    // A self-issued rollover CA does not consume the anchor's pathLen budget.
-    try fx.add(.{ .subject = "Self CA", .issuer = "Self CA", .subject_key = 5, .issuer_key = 6, .ca = true, .path_len = 0, .key_usage = 0x04 });
-    try fx.add(.{ .subject = "Self CA", .issuer = "Self CA", .subject_key = 6, .issuer_key = 6, .ca = true, .path_len = 0, .key_usage = 0x04 });
-    try fx.add(.{ .subject = "self leaf", .issuer = "Self CA", .subject_key = 7, .issuer_key = 5, .ca = false, .key_usage = 0x80 });
+    // A self-issued rollover CA does not consume the constrained
+    // intermediate's pathLen budget.
+    try fx.add(.{ .subject = "Self CA", .issuer = "Self CA", .subject_key = 9, .issuer_key = 10, .ca = true, .key_usage = 0x04 });
+    try fx.add(.{ .subject = "Self CA", .issuer = "Root3", .subject_key = 10, .issuer_key = 11, .ca = true, .path_len = 0, .key_usage = 0x04 });
+    try fx.add(.{ .subject = "Root3", .issuer = "Root3", .subject_key = 11, .issuer_key = 11 });
+    try fx.add(.{ .subject = "self leaf", .issuer = "Self CA", .subject_key = 12, .issuer_key = 9, .ca = false, .key_usage = 0x80 });
     const self_elements = [_]path_builder.Element{
-        .{ .certificate = &fx.certs.items[6], .source = .leaf, .input_index = 0 },
-        .{ .certificate = &fx.certs.items[4], .source = .intermediate, .input_index = 0 },
-        .{ .certificate = &fx.certs.items[5], .source = .anchor, .input_index = 0 },
+        .{ .certificate = &fx.certs.items[11], .source = .leaf, .input_index = 0 },
+        .{ .certificate = &fx.certs.items[8], .source = .intermediate, .input_index = 0 },
+        .{ .certificate = &fx.certs.items[9], .source = .intermediate, .input_index = 1 },
+        .{ .certificate = &fx.certs.items[10], .source = .anchor, .input_index = 0 },
     };
-    var self_issued = validator.validatePath(testing.allocator, .{ .elements = &self_elements }, policy(fx.certs.items[5..6]), cp);
+    var self_issued = validator.validatePath(testing.allocator, .{ .elements = &self_elements }, policy(fx.certs.items[10..11]), cp);
     defer self_issued.deinit(testing.allocator);
-    try expectAccepted(&self_issued, 3);
+    try expectAccepted(&self_issued, 4);
 }
 
 test "leaf KU and EKU server-auth policy accept absent or compatible values" {
@@ -663,16 +739,25 @@ test "critical and duplicate extensions fail closed while unknown noncritical pa
 test "deferred Name Constraints fail closed even when noncritical" {
     var fx = Fixtures.init(testing.allocator);
     defer fx.deinit();
-    try fx.add(.{ .subject = "Root", .issuer = "Root", .subject_key = 3, .issuer_key = 3, .ca = true, .key_usage = 0x04, .name_constraints = true });
-    try fx.add(.{ .subject = "leaf", .issuer = "Root", .subject_key = 1, .issuer_key = 3, .ca = false, .key_usage = 0x80 });
+    try fx.add(.{ .subject = "leaf", .issuer = "Constrained", .subject_key = 1, .issuer_key = 2, .ca = false, .key_usage = 0x80 });
+    try fx.add(.{ .subject = "Constrained", .issuer = "Root", .subject_key = 2, .issuer_key = 3, .ca = true, .key_usage = 0x04, .name_constraints = true });
+    try fx.add(.{ .subject = "Root", .issuer = "Root", .subject_key = 3, .issuer_key = 3 });
 
     var entropy: crypto.pure_zig.DeterministicEntropy = undefined;
     var provider: crypto.pure_zig.Provider = undefined;
     const cp = cryptoProvider(&entropy, &provider);
-    var result = try validateBuilt(testing.allocator, &fx.certs.items[1], &.{}, fx.certs.items[0..1], policy(fx.certs.items[0..1]), cp);
+    var result = try validateBuilt(testing.allocator, &fx.certs.items[0], fx.certs.items[1..2], fx.certs.items[2..3], policy(fx.certs.items[2..3]), cp);
     defer result.deinit(testing.allocator);
     try expectRejected(&result, .name_constraints_unsupported, 1);
     try testing.expect(result.rejected.extension_oid.?.eqlComponents(&oid.well_known.name_constraints));
+
+    // The same extension on configured trust input is not inherited as local
+    // policy by default.
+    try fx.add(.{ .subject = "NC Anchor", .issuer = "NC Anchor", .subject_key = 4, .issuer_key = 4, .name_constraints = true, .unknown_critical = true });
+    try fx.add(.{ .subject = "anchor leaf", .issuer = "NC Anchor", .subject_key = 5, .issuer_key = 4, .ca = false, .key_usage = 0x80 });
+    var anchor_extensions_ignored = try validateBuilt(testing.allocator, &fx.certs.items[4], &.{}, fx.certs.items[3..4], policy(fx.certs.items[3..4]), cp);
+    defer anchor_extensions_ignored.deinit(testing.allocator);
+    try expectAccepted(&anchor_extensions_ignored, 2);
 }
 
 test "hostname verification is delegated and runs after path authentication" {

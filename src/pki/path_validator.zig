@@ -7,7 +7,8 @@
 //!
 //! Policy choices in this first slice:
 //! - configured anchors are authenticated by their `path_builder` input index
-//!   and exact DER, and their self-signatures are not verified;
+//!   and exact DER. Their self-signatures and certificate extensions are not
+//!   validation inputs; anchor restrictions require explicit local policy;
 //! - anchor validity is ignored by default (it is trust configuration), but
 //!   can be enabled explicitly;
 //! - absent Key Usage and Extended Key Usage permit the requested use, as in
@@ -109,7 +110,12 @@ pub fn validatePath(
 ) ValidationResult {
     if (checkStructure(path, policy)) |validation_failure| return .{ .rejected = validation_failure };
 
-    for (path.elements, 0..) |element, certificate_index| {
+    const anchor_index = path.elements.len - 1;
+
+    // The target and intermediates form the prospective certification path.
+    // The configured anchor is trust input: its certificate extensions do not
+    // silently become local anchor policy (RFC 5280 §§6.1, 6.2).
+    for (path.elements[0..anchor_index], 0..) |element, certificate_index| {
         if (element.certificate.extensions.len > policy.maximum_extensions_per_certificate) {
             return reject(.validation_resource_limit_exceeded, certificate_index);
         }
@@ -142,8 +148,9 @@ pub fn validatePath(
         }
     }
 
-    // Every element above the leaf issues the certificate below it.
-    for (path.elements[1..], 1..) |element, certificate_index| {
+    // Every intermediate issues the certificate below it. The terminal trust
+    // anchor supplies the trusted name and key but is not a path certificate.
+    for (path.elements[1..anchor_index], 1..) |element, certificate_index| {
         const constraints = element.certificate.basicConstraints() orelse
             return reject(.issuer_is_not_ca, certificate_index);
         if (!constraints.is_ca) return reject(.issuer_is_not_ca, certificate_index);
@@ -165,11 +172,10 @@ pub fn validatePath(
 
     const leaf = path.elements[0].certificate;
     if (leaf.keyUsage()) |usage| {
-        const permits_tls_server = switch (leaf.subject_public_key_info.key_type) {
-            .rsa => usage.digital_signature or usage.key_encipherment,
-            else => usage.digital_signature,
-        };
-        if (!permits_tls_server) return rejectOid(.key_usage_violation, 0, &wk.key_usage);
+        // Tardigrade's TLS stack is TLS 1.3: CertificateVerify always signs,
+        // including with RSA. keyEncipherment alone describes legacy RSA key
+        // transport and cannot authorize this authentication operation.
+        if (!usage.digital_signature) return rejectOid(.key_usage_violation, 0, &wk.key_usage);
     }
 
     if (policy.require_server_auth_eku) {

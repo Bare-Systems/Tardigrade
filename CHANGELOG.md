@@ -10,14 +10,16 @@ All notable user-facing changes to Tardigrade are documented here.
   `path_builder` candidate paths. It authenticates terminal anchors against
   the configured anchor source, verifies every child signature through the
   crypto-provider seam (without requiring an anchor self-signature), applies
-  injected-time validity checks, enforces CA Basic Constraints, self-issued
-  path-length accounting, issuer/leaf Key Usage, server-auth EKU, and
-  fail-closed critical-extension handling, then delegates leaf DNS identity
+  injected-time validity checks, enforces intermediate CA Basic Constraints,
+  self-issued path-length accounting, issuer/leaf Key Usage, server-auth EKU,
+  and fail-closed critical-extension handling, then delegates leaf DNS identity
   to the existing SAN matcher. Outcomes identify the leaf-first certificate,
   extension OID where relevant, and a stable reason rather than collapsing
   failures into one certificate error; alternate candidates continue until
   one validates, and accepted element slices have explicit ownership. Anchor
-  validity is opt-in, while absent KU/EKU is unrestricted per RFC 5280.
+  validity is opt-in, while anchor certificate extensions are ignored as trust
+  input and absent KU/EKU is unrestricted per RFC 5280. TLS 1.3 leaf KU, when
+  present, must authorize `digitalSignature` even for RSA keys.
   Name Constraints and certificate-policy processing remain deferred under
   #345: any Name Constraints extension fails closed, noncritical
   certificatePolicies use the implicit any-policy policy, and critical policy

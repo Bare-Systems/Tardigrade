@@ -504,6 +504,18 @@ test "pathLen without cA and unknown Key Usage bits fail typed" {
         }),
     });
     try testing.expectError(error.MalformedExtension, x509.Certificate.parse(testing.allocator, bad_key_usage, .{}));
+
+    const empty_key_usage = try tlv(arena, 0x03, &.{&[_]u8{0}});
+    const empty_key_usage_certificate = try buildCertificate(arena, .{
+        .version = try versionTlv(arena, 2),
+        .extensions_wrapper = try extensionsWrapper(arena, &.{
+            try extensionTlv(arena, &oid.well_known.key_usage, true, empty_key_usage),
+        }),
+    });
+    try testing.expectError(
+        error.MalformedExtension,
+        x509.Certificate.parse(testing.allocator, empty_key_usage_certificate, .{}),
+    );
 }
 
 test "malformed structures fail deterministically" {

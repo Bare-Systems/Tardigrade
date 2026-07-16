@@ -614,7 +614,7 @@ pub const Tls13Backend = struct {
         std.debug.assert(role == self.role);
         std.debug.assert(self.expect == .start);
         self.local_params = params;
-        try self.core.start();
+        self.core.start() catch |err| return mapCoreError(err);
         switch (self.role) {
             .client => {
                 try self.sendClientHello(sink);
@@ -648,7 +648,8 @@ pub const Tls13Backend = struct {
             const kind = std.enums.fromInt(MessageType, input.data[0]) orelse return error.MalformedHandshake;
             const raw = input.data[0..message_len];
             const body = raw[4..];
-            _ = try self.core.acceptReceived(raw);
+            if (level != expectedLevel(kind)) return error.UnexpectedCryptoLevel;
+            _ = self.core.acceptReceived(raw) catch |err| return mapCoreError(err);
             try self.onMessage(kind, level, raw, body, sink);
             input.consume(message_len);
             // A failed or freshly completed handshake stops consuming its own
@@ -656,6 +657,32 @@ pub const Tls13Backend = struct {
             // may batch several NewSessionTickets).
             if (self.expect == .done and level != .application) break;
         }
+    }
+
+    fn expectedLevel(kind: MessageType) EncryptionLevel {
+        return switch (kind) {
+            .client_hello, .server_hello => .initial,
+            .encrypted_extensions, .certificate, .certificate_verify, .finished => .handshake,
+            .new_session_ticket => .application,
+        };
+    }
+
+    fn mapCoreError(err: tls_core.handshake.Error) HandshakeError {
+        return switch (err) {
+            error.MalformedHandshake,
+            error.IncompleteHandshake,
+            error.MessageTooLarge,
+            error.DuplicateExtension,
+            error.TooManyExtensions,
+            => error.MalformedHandshake,
+            error.HandshakeBufferOverflow => error.HandshakeBufferOverflow,
+            error.IllegalParameter => error.IllegalParameter,
+            error.UnexpectedHandshakeMessage => error.UnexpectedHandshakeMessage,
+            error.AlpnMismatch => error.AlpnMismatch,
+            error.CertificateInvalid => error.CertificateInvalid,
+            error.SecretExportFailed => error.SecretExportFailed,
+            error.InvalidHandshakeState => error.InvalidHandshakeState,
+        };
     }
 
     fn onMessage(
@@ -669,11 +696,7 @@ pub const Tls13Backend = struct {
         // Enforce the CRYPTO level each message belongs to (RFC 9001 §4.1.3)
         // before anything else, so packet-number-space mistakes surface as
         // level errors rather than parse errors.
-        const expected_level: EncryptionLevel = switch (kind) {
-            .client_hello, .server_hello => .initial,
-            .encrypted_extensions, .certificate, .certificate_verify, .finished => .handshake,
-            .new_session_ticket => .application,
-        };
+        const expected_level = expectedLevel(kind);
         if (level != expected_level) return error.UnexpectedCryptoLevel;
 
         if (kind == .new_session_ticket) {
@@ -817,7 +840,7 @@ pub const Tls13Backend = struct {
         w.patch(3, message_len);
 
         const message = buf[0..w.len];
-        try self.core.recordSent(message);
+        self.core.recordSent(message) catch |err| return mapCoreError(err);
         self.transcript.update(message);
         try sink.emitCrypto(.initial, message);
     }
@@ -995,6 +1018,7 @@ pub const Tls13Backend = struct {
         try w.bytes(&KeySchedule.verifyData(schedule.client_handshake_traffic, finished_hash));
         w.patch(3, message_len);
         const message = buf[0..w.len];
+        self.core.recordSent(message) catch |err| return mapCoreError(err);
         self.transcript.update(message);
         try sink.emitCrypto(.handshake, message);
 
@@ -1131,7 +1155,7 @@ pub const Tls13Backend = struct {
         hello.patch(2, hello_extensions);
         hello.patch(3, hello_len);
         const server_hello = hello_buf[0..hello.len];
-        try self.core.recordSent(server_hello);
+        self.core.recordSent(server_hello) catch |err| return mapCoreError(err);
         self.transcript.update(server_hello);
         try sink.emitCrypto(.initial, server_hello);
         try sink.emitAlpn(self.alpn);
@@ -1223,11 +1247,11 @@ pub const Tls13Backend = struct {
         while (message_offset < w.len) {
             const remaining = buf[message_offset..w.len];
             const sent_len = (tls_handshake_codec.frameLength(remaining) catch
-                return error.MalformedHandshake) orelse return error.IncompleteHandshake;
+                return error.MalformedHandshake) orelse return error.MalformedHandshake;
             const raw = remaining[0..sent_len];
             const message = tls_handshake_codec.decode(raw) catch
                 return error.MalformedHandshake;
-            try self.core.recordSent(message.raw);
+            self.core.recordSent(message.raw) catch |err| return mapCoreError(err);
             message_offset += sent_len;
         }
         try sink.emitCrypto(.handshake, buf[0..w.len]);

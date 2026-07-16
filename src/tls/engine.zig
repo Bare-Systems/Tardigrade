@@ -187,15 +187,29 @@ test "engine drives protocol-neutral handshake state" {
 }
 
 test "engine retains fragmented input and drains coalesced messages" {
-    var engine = Engine.init(.{ .role = .server, .transport_mode = .record });
-    try engine.start();
     const valid_client_hello = [_]u8{ 1, 0, 0, 0 };
     const duplicate_client_hello = [_]u8{ 1, 0, 0, 0 };
-    try std.testing.expectEqual(@as(usize, 0), try engine.receiveHandshake(valid_client_hello[0..1]));
-    try std.testing.expectEqual(@as(usize, 0), try engine.receiveHandshake(valid_client_hello[1..2]));
-    try std.testing.expectEqual(@as(usize, 0), try engine.receiveHandshake(valid_client_hello[2..3]));
-    try std.testing.expectEqual(@as(usize, 1), try engine.receiveHandshake(valid_client_hello[3..]));
+
+    for (0..valid_client_hello.len + 1) |split| {
+        var engine = Engine.init(.{ .role = .server, .transport_mode = .record });
+        try engine.start();
+        const first_count: usize = if (split == valid_client_hello.len) 1 else 0;
+        const second_count: usize = if (split == valid_client_hello.len) 0 else 1;
+        try std.testing.expectEqual(first_count, try engine.receiveHandshake(valid_client_hello[0..split]));
+        try std.testing.expectEqual(second_count, try engine.receiveHandshake(valid_client_hello[split..]));
+        try std.testing.expectEqual(state.HandshakeState.server_hello, engine.handshakeState());
+    }
+
+    var engine = Engine.init(.{ .role = .server, .transport_mode = .record });
+    try engine.start();
+    try std.testing.expectEqual(@as(usize, 1), try engine.receiveHandshake(&valid_client_hello));
     try std.testing.expectError(error.UnexpectedHandshakeMessage, engine.receiveHandshake(&duplicate_client_hello));
+
+    var coalesced = Engine.init(.{ .role = .server, .transport_mode = .record });
+    try coalesced.start();
+    const complete_plus_partial = valid_client_hello ++ duplicate_client_hello[0..3].*;
+    try std.testing.expectEqual(@as(usize, 1), try coalesced.receiveHandshake(&complete_plus_partial));
+    try std.testing.expectError(error.UnexpectedHandshakeMessage, coalesced.receiveHandshake(duplicate_client_hello[3..]));
 }
 
 test "generic driver starts backend and stores emitted events" {

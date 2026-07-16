@@ -277,6 +277,21 @@ pub fn build(b: *std.Build) void {
     crypto_step.dependOn(&run_crypto_vector_tests.step);
     test_step.dependOn(&run_crypto_vector_tests.step);
 
+    // Bounded checked-in Wycheproof-style corpus (#374): reduced offline
+    // negative/edge vectors for provider-supported pure-Zig operations.
+    const crypto_corpus_mod = b.createModule(.{
+        .root_source_file = b.path("tests/crypto_corpus.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    crypto_corpus_mod.addImport("crypto", crypto_mod);
+    const crypto_corpus_tests = b.addTest(.{ .root_module = crypto_corpus_mod });
+    const run_crypto_corpus_tests = b.addRunArtifact(crypto_corpus_tests);
+    const crypto_corpus_step = b.step("test-crypto-corpus", "Run bounded checked-in crypto corpus");
+    crypto_corpus_step.dependOn(&run_crypto_corpus_tests.step);
+    crypto_step.dependOn(&run_crypto_corpus_tests.step);
+    test_step.dependOn(&run_crypto_corpus_tests.step);
+
     // Test-only: a real client/server TLS 1.3 handshake through the merged
     // record stack (#408 finding 6). This needs the "crypto" module (to
     // build a pure-Zig CryptoProvider for the record_epoch_bridge.Bridge

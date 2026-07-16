@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const crypto_pkg = @import("crypto");
+const corpus_manifest = @import("crypto_corpus_manifest.zig");
 const quic = @import("quic");
 const tls_core = @import("tls_core");
 
@@ -72,6 +73,11 @@ const case_registry = [_]CaseMeta{
     .{ .id = "secp256r1-unsupported", .algorithm = .{ .group = .secp256r1 }, .providers = pure_zig_only, .class = .negative, .source = "provider capability matrix", .license = "project fixture", .reproduction = "zig build test-crypto-vectors" },
     .{ .id = "ed25519-rfc8032-test-1", .algorithm = .{ .signature = .ed25519 }, .providers = pure_zig_only, .class = .positive, .source = "RFC 8032 Section 7.1", .license = "IETF Trust", .reproduction = "published RFC vector" },
     .{ .id = "ed25519-signature-rejection", .algorithm = .{ .signature = .ed25519 }, .providers = pure_zig_only, .class = .negative, .source = "provider contract", .license = "project fixture", .reproduction = "zig build test-crypto-vectors" },
+    .{ .id = "wycheproof-aes-128-gcm-reduced", .algorithm = .{ .aead = .aes_128_gcm }, .providers = pure_zig_only, .class = .negative, .source = "tests/vectors/wycheproof/corpus.json", .license = "Apache-2.0", .reproduction = "zig build test-crypto-corpus" },
+    .{ .id = "wycheproof-aes-256-gcm-reduced", .algorithm = .{ .aead = .aes_256_gcm }, .providers = pure_zig_only, .class = .negative, .source = "tests/vectors/wycheproof/corpus.json", .license = "Apache-2.0", .reproduction = "zig build test-crypto-corpus" },
+    .{ .id = "wycheproof-chacha20-poly1305-reduced", .algorithm = .{ .aead = .chacha20_poly1305 }, .providers = pure_zig_only, .class = .negative, .source = "tests/vectors/wycheproof/corpus.json", .license = "Apache-2.0", .reproduction = "zig build test-crypto-corpus" },
+    .{ .id = "wycheproof-x25519-reduced", .algorithm = .{ .group = .x25519 }, .providers = pure_zig_only, .class = .negative, .source = "tests/vectors/wycheproof/corpus.json", .license = "Apache-2.0", .reproduction = "zig build test-crypto-corpus" },
+    .{ .id = "wycheproof-ed25519-verify-reduced", .algorithm = .{ .signature = .ed25519 }, .providers = pure_zig_only, .class = .negative, .source = "tests/vectors/wycheproof/corpus.json", .license = "Apache-2.0", .reproduction = "zig build test-crypto-corpus" },
     .{ .id = "deterministic-entropy-positive", .algorithm = .{ .entropy = .injected_random_bytes }, .providers = pure_zig_only, .class = .positive, .source = "provider contract", .license = "project fixture", .reproduction = "zig build test-crypto-vectors" },
     .{ .id = "secure-zero-positive", .algorithm = .{ .entropy = .secure_zero }, .providers = pure_zig_only, .class = .positive, .source = "provider contract", .license = "project fixture", .reproduction = "zig build test-crypto-vectors" },
     .{ .id = "constant-time-compare-positive", .algorithm = .{ .entropy = .constant_time_compare }, .providers = pure_zig_only, .class = .positive, .source = "provider contract", .license = "project fixture", .reproduction = "zig build test-crypto-vectors" },
@@ -527,6 +533,19 @@ fn runUnsupportedCapabilityVectors(log: *ExecutionLog) !void {
     try testing.expectError(error.InvalidInput, cp.verify(.rsa_pss_rsae_sha256, "", "", ""));
 }
 
+fn registerWycheproofCorpusSuites(log: *ExecutionLog) !void {
+    for (corpus_manifest.suites) |suite| {
+        const meta = try log.execute(suite.id);
+        const algorithm = meta.algorithm orelse return error.MissingCaseMetadata;
+        try testing.expect(algorithmEql(algorithm, suite.algorithm));
+        try testing.expect(suite.case_count > 0);
+    }
+    for (corpus_manifest.skipped_suites) |suite| {
+        try testing.expect(suite.reason.len > 0);
+        try testing.expect(suite.tracking_issue.len > 0);
+    }
+}
+
 test "crypto vector suite executes registered coverage" {
     var log = ExecutionLog{};
     try runHkdfVectors(&log);
@@ -538,6 +557,7 @@ test "crypto vector suite executes registered coverage" {
     try runKeyExchangeAndSignatureVectors(&log);
     try runEntropyAndSecretHelperVectors(&log);
     try runUnsupportedCapabilityVectors(&log);
+    try registerWycheproofCorpusSuites(&log);
     try validateManifest(&log);
     try validateCapabilityMatrix(&log);
 }

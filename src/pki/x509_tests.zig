@@ -841,6 +841,18 @@ test "name chaining rejects undefined RFC 4518 stored DirectoryString preparatio
         error.NamePreparationFailed,
         x509.parseNameRaw(arena, try nameWithCnTag(arena, 0x0c, "\u{0221}"), .{}),
     );
+    try testing.expectError(
+        error.NamePreparationFailed,
+        x509.parseNameRaw(arena, try nameWithCnTag(arena, 0x0c, "\u{1C90}"), .{}),
+    );
+    try testing.expectError(
+        error.NamePreparationFailed,
+        x509.parseNameRaw(arena, try nameWithCnTag(arena, 0x0c, "\u{1E900}"), .{}),
+    );
+    try testing.expectError(
+        error.NamePreparationFailed,
+        x509.parseNameRaw(arena, try nameWithCnTag(arena, 0x0c, "\u{A7B0}"), .{}),
+    );
 }
 
 test "domainComponent RDN values compare with caseIgnoreIA5Match" {

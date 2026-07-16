@@ -1251,6 +1251,7 @@ fn normalizeDirectoryString(arena: std.mem.Allocator, content: []const u8) Error
     var view = std.unicode.Utf8View.init(content) catch return error.MalformedName;
     var iterator = view.iterator();
     while (iterator.nextCodepoint()) |codepoint| {
+        if (containsRange(rfc4518_data.unassigned[0..], codepoint)) return error.NamePreparationFailed;
         if (try mappingFor(rfc4518_data.map[0..], rfc4518_data.map_data[0..], codepoint)) |replacement| {
             try appendScalars(&mapped, arena, replacement);
         } else {
@@ -1260,7 +1261,7 @@ fn normalizeDirectoryString(arena: std.mem.Allocator, content: []const u8) Error
 
     var decomposed: std.ArrayList(u21) = .empty;
     for (mapped.items) |codepoint| try appendNfkd(&decomposed, arena, codepoint);
-    canonicalOrder(decomposed.items);
+    try canonicalOrder(arena, decomposed.items);
 
     const normalized = try composeNfkc(arena, decomposed.items);
     for (normalized) |codepoint| {
@@ -1325,16 +1326,70 @@ fn appendNfkd(list: *std.ArrayList(u21), arena: std.mem.Allocator, codepoint: u2
     }
 }
 
-fn canonicalOrder(codepoints: []u21) void {
-    var index: usize = 1;
-    while (index < codepoints.len) : (index += 1) {
-        const ccc = combiningClass(codepoints[index]);
-        if (ccc == 0) continue;
-        var swap_index = index;
-        while (swap_index > 0 and combiningClass(codepoints[swap_index - 1]) > ccc) : (swap_index -= 1) {
-            std.mem.swap(u21, &codepoints[swap_index], &codepoints[swap_index - 1]);
+fn canonicalOrder(arena: std.mem.Allocator, codepoints: []u21) Error!void {
+    return canonicalOrderCounting(arena, codepoints, null);
+}
+
+fn canonicalOrderCounting(arena: std.mem.Allocator, codepoints: []u21, lookup_counter: ?*usize) Error!void {
+    if (codepoints.len < 2) return;
+    const scratch = try arena.alloc(u21, codepoints.len);
+    const ccc_scratch = try arena.alloc(u8, codepoints.len);
+
+    var segment_start: usize = 0;
+    while (segment_start < codepoints.len) {
+        const first_ccc = combiningClassCounting(codepoints[segment_start], lookup_counter);
+        const sortable_start = segment_start + @intFromBool(first_ccc == 0);
+
+        var segment_end = sortable_start;
+        while (segment_end < codepoints.len and
+            combiningClassCounting(codepoints[segment_end], lookup_counter) != 0)
+        {
+            segment_end += 1;
         }
+
+        try stableOrderByCombiningClass(
+            codepoints[sortable_start..segment_end],
+            scratch[0 .. segment_end - sortable_start],
+            ccc_scratch[0 .. segment_end - sortable_start],
+            lookup_counter,
+        );
+
+        segment_start = segment_end;
     }
+}
+
+fn stableOrderByCombiningClass(
+    values: []u21,
+    scratch: []u21,
+    ccc_scratch: []u8,
+    lookup_counter: ?*usize,
+) Error!void {
+    if (values.len < 2) return;
+
+    var counts = [_]usize{0} ** 256;
+    for (values, ccc_scratch) |codepoint, *ccc_out| {
+        const ccc = combiningClassCounting(codepoint, lookup_counter);
+        if (ccc == 0) return error.NamePreparationFailed;
+        ccc_out.* = ccc;
+        counts[ccc] = std.math.add(usize, counts[ccc], 1) catch return error.NamePreparationFailed;
+    }
+
+    var offsets = [_]usize{0} ** 256;
+    var next: usize = 0;
+    for (1..256) |ccc| {
+        offsets[ccc] = next;
+        next = std.math.add(usize, next, counts[ccc]) catch return error.NamePreparationFailed;
+    }
+
+    var cursors = offsets;
+    for (values, ccc_scratch) |codepoint, ccc| {
+        const slot = cursors[ccc];
+        if (slot >= scratch.len) return error.NamePreparationFailed;
+        scratch[slot] = codepoint;
+        cursors[ccc] = std.math.add(usize, cursors[ccc], 1) catch return error.NamePreparationFailed;
+    }
+
+    @memcpy(values, scratch[0..values.len]);
 }
 
 fn composeNfkc(arena: std.mem.Allocator, input: []const u21) Error![]const u21 {
@@ -1433,6 +1488,11 @@ fn encodeCaseIgnoreAttributeValue(arena: std.mem.Allocator, codepoints: []const 
 }
 
 fn combiningClass(codepoint: u21) u8 {
+    return combiningClassCounting(codepoint, null);
+}
+
+fn combiningClassCounting(codepoint: u21, lookup_counter: ?*usize) u8 {
+    if (lookup_counter) |counter| counter.* += 1;
     var low: usize = 0;
     var high: usize = rfc4518_data.combining_classes.len;
     while (low < high) {
@@ -1533,6 +1593,45 @@ pub fn fuzzParseCertificate(allocator: std.mem.Allocator, input: []const u8) voi
     };
     var certificate = Certificate.parse(allocator, input, limits) catch return;
     certificate.deinit(allocator);
+}
+
+test "RFC 4518 canonical ordering handles adversarial runs in bounded work" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    const run_len = 4096;
+    const total = 1 + run_len * 2;
+    const codepoints = try arena.alloc(u21, total);
+    codepoints[0] = 'A';
+    @memset(codepoints[1 .. 1 + run_len], 0x0315);
+    @memset(codepoints[1 + run_len ..], 0x0300);
+
+    var lookups: usize = 0;
+    try canonicalOrderCounting(arena, codepoints, &lookups);
+
+    try testing.expectEqual(@as(u21, 'A'), codepoints[0]);
+    for (codepoints[1 .. 1 + run_len]) |codepoint| try testing.expectEqual(@as(u21, 0x0300), codepoint);
+    for (codepoints[1 + run_len ..]) |codepoint| try testing.expectEqual(@as(u21, 0x0315), codepoint);
+    try testing.expect(lookups <= total * 3);
+}
+
+test "RFC 4518 canonical ordering is stable and respects starters" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var equal_ccc = [_]u21{ 'A', 0x0301, 0x0300 };
+    try canonicalOrder(arena, &equal_ccc);
+    try testing.expectEqualSlices(u21, &[_]u21{ 'A', 0x0301, 0x0300 }, &equal_ccc);
+
+    var starter_boundaries = [_]u21{ 'A', 0x0315, 0x0300, 'B', 0x0315, 0x0300 };
+    try canonicalOrder(arena, &starter_boundaries);
+    try testing.expectEqualSlices(u21, &[_]u21{ 'A', 0x0300, 0x0315, 'B', 0x0300, 0x0315 }, &starter_boundaries);
+
+    var leading_nonstarters = [_]u21{ 0x0315, 0x0300, 'A' };
+    try canonicalOrder(arena, &leading_nonstarters);
+    try testing.expectEqualSlices(u21, &[_]u21{ 0x0300, 0x0315, 'A' }, &leading_nonstarters);
 }
 
 const testing = std.testing;

@@ -95,7 +95,10 @@ def rfc4518_map(cp: int) -> list[int]:
         return [0x20]
     if map_to_nothing(cp):
         return []
-    return chars_to_scalars(stringprep.map_table_b2(chr(cp)))
+    ch = chr(cp)
+    if stringprep.in_table_a1(ch):
+        return [cp]
+    return chars_to_scalars(stringprep.map_table_b2(ch))
 
 
 def is_hangul_syllable(cp: int) -> bool:
@@ -170,6 +173,11 @@ def main() -> None:
         if not valid_scalar(cp):
             continue
         mapped = rfc4518_map(cp)
+        if stringprep.in_table_a1(chr(cp)) and not map_to_space(cp) and not map_to_nothing(cp):
+            assert mapped == [cp], (
+                f"Unicode 3.2 unassigned U+{cp:04X} was mapped to "
+                f"{[f'U+{value:04X}' for value in mapped]}"
+            )
         if mapped != [cp]:
             map_entries.append((cp, mapped))
 

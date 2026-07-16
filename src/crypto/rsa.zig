@@ -143,7 +143,7 @@ fn verifyPss(em: []const u8, em_bits: usize, message: []const u8) Error!void {
 /// modulus. `signature` must be exactly one modulus wide. Malformed keys and
 /// wrong-sized signatures return `error.InvalidInput`; a structurally valid
 /// signature with invalid EMSA-PSS encoding returns `error.AuthenticationFailed`.
-pub fn verifyPssSha256(public_key_der: []const u8, message: []const u8, signature: []const u8) (error{InvalidInput, AuthenticationFailed})!void {
+pub fn verifyPssSha256(public_key_der: []const u8, message: []const u8, signature: []const u8) (error{ InvalidInput, AuthenticationFailed })!void {
     const key = parsePublicKey(public_key_der) catch return error.InvalidInput;
     if (signature.len != key.modulus.len) return error.InvalidInput;
 

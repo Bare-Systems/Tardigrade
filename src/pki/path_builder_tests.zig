@@ -289,6 +289,27 @@ test "issuer matching preserves significant SPACE followed by combining mark" {
     );
 }
 
+test "issuer matching uses definitive RFC 4518 Appendix A combining marks" {
+    var fx = Fixtures.init(testing.allocator);
+    defer fx.deinit();
+    // U+05BD is a Unicode 3.2 Mn mark but is absent from RFC 4518 Appendix A's
+    // definitive combining-mark table. The leading U+0020 is therefore
+    // insignificant, and the issuer must find the bare-subject anchor.
+    try fx.add(.{ .subject_cn = "leaf", .issuer_cn = " \u{05BD}A" });
+    try fx.add(.{ .subject_cn = "\u{05BD}A", .issuer_cn = "\u{05BD}A" });
+
+    const certs = fx.certs.items;
+    try testing.expect(certs[0].issuer.eqlForChaining(&certs[1].subject));
+
+    var result = try path_builder.build(testing.allocator, &certs[0], &.{}, certs[1..2], .{});
+    defer result.deinit(testing.allocator);
+
+    try testing.expect(!result.truncated);
+    try testing.expectEqual(@as(usize, 1), result.paths.len);
+    try expectPathCns(result.paths[0], &.{ "leaf", "\u{05BD}A" });
+    try testing.expectEqual(path_builder.Source.anchor, result.paths[0].anchor().source);
+}
+
 // --- Cross-signed roots ------------------------------------------------------
 
 test "cross-signed root enumerates the anchor path before the cross path" {

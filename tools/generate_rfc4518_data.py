@@ -5,6 +5,9 @@ The generated module is intentionally data-only.  It derives stringprep
 classification tables from Python's bundled RFC 3454 `stringprep` module and
 Unicode 3.2 database, with B.3 fallback case mappings pinned to
 tools/unicode/UnicodeData-3.2.0.txt instead of the host Python Unicode version.
+RFC 4518 Appendix A combining marks are encoded as the literal normative
+Appendix A ranges because RFC 4518 makes that table definitive for
+implementation, including its intentional deltas from Unicode 3.2 categories.
 """
 
 from __future__ import annotations
@@ -18,6 +21,125 @@ UCD = unicodedata.ucd_3_2_0
 MAX_SCALAR = 0x10FFFF
 OUT = Path("src/pki/rfc4518_data.zig")
 UNICODE_DATA = Path(__file__).resolve().parent / "unicode" / "UnicodeData-3.2.0.txt"
+
+# RFC 4518 Appendix A, "Combining Marks".  Appendix A is normative and says
+# this list is definitive for implementations.  Do not replace it with a
+# Unicode general-category query: Unicode 3.2's Mn/Mc/Me set differs by U+05BD
+# and U+094E..U+094F.
+RFC4518_COMBINING_MARK_RANGES = (
+    (0x0300, 0x034F),
+    (0x0360, 0x036F),
+    (0x0483, 0x0486),
+    (0x0488, 0x0489),
+    (0x0591, 0x05A1),
+    (0x05A3, 0x05B9),
+    (0x05BB, 0x05BC),
+    (0x05BF, 0x05BF),
+    (0x05C1, 0x05C2),
+    (0x05C4, 0x05C4),
+    (0x064B, 0x0655),
+    (0x0670, 0x0670),
+    (0x06D6, 0x06DC),
+    (0x06DE, 0x06E4),
+    (0x06E7, 0x06E8),
+    (0x06EA, 0x06ED),
+    (0x0711, 0x0711),
+    (0x0730, 0x074A),
+    (0x07A6, 0x07B0),
+    (0x0901, 0x0903),
+    (0x093C, 0x093C),
+    (0x093E, 0x094F),
+    (0x0951, 0x0954),
+    (0x0962, 0x0963),
+    (0x0981, 0x0983),
+    (0x09BC, 0x09BC),
+    (0x09BE, 0x09C4),
+    (0x09C7, 0x09C8),
+    (0x09CB, 0x09CD),
+    (0x09D7, 0x09D7),
+    (0x09E2, 0x09E3),
+    (0x0A02, 0x0A02),
+    (0x0A3C, 0x0A3C),
+    (0x0A3E, 0x0A42),
+    (0x0A47, 0x0A48),
+    (0x0A4B, 0x0A4D),
+    (0x0A70, 0x0A71),
+    (0x0A81, 0x0A83),
+    (0x0ABC, 0x0ABC),
+    (0x0ABE, 0x0AC5),
+    (0x0AC7, 0x0AC9),
+    (0x0ACB, 0x0ACD),
+    (0x0B01, 0x0B03),
+    (0x0B3C, 0x0B3C),
+    (0x0B3E, 0x0B43),
+    (0x0B47, 0x0B48),
+    (0x0B4B, 0x0B4D),
+    (0x0B56, 0x0B57),
+    (0x0B82, 0x0B82),
+    (0x0BBE, 0x0BC2),
+    (0x0BC6, 0x0BC8),
+    (0x0BCA, 0x0BCD),
+    (0x0BD7, 0x0BD7),
+    (0x0C01, 0x0C03),
+    (0x0C3E, 0x0C44),
+    (0x0C46, 0x0C48),
+    (0x0C4A, 0x0C4D),
+    (0x0C55, 0x0C56),
+    (0x0C82, 0x0C83),
+    (0x0CBE, 0x0CC4),
+    (0x0CC6, 0x0CC8),
+    (0x0CCA, 0x0CCD),
+    (0x0CD5, 0x0CD6),
+    (0x0D02, 0x0D03),
+    (0x0D3E, 0x0D43),
+    (0x0D46, 0x0D48),
+    (0x0D4A, 0x0D4D),
+    (0x0D57, 0x0D57),
+    (0x0D82, 0x0D83),
+    (0x0DCA, 0x0DCA),
+    (0x0DCF, 0x0DD4),
+    (0x0DD6, 0x0DD6),
+    (0x0DD8, 0x0DDF),
+    (0x0DF2, 0x0DF3),
+    (0x0E31, 0x0E31),
+    (0x0E34, 0x0E3A),
+    (0x0E47, 0x0E4E),
+    (0x0EB1, 0x0EB1),
+    (0x0EB4, 0x0EB9),
+    (0x0EBB, 0x0EBC),
+    (0x0EC8, 0x0ECD),
+    (0x0F18, 0x0F19),
+    (0x0F35, 0x0F35),
+    (0x0F37, 0x0F37),
+    (0x0F39, 0x0F39),
+    (0x0F3E, 0x0F3F),
+    (0x0F71, 0x0F84),
+    (0x0F86, 0x0F87),
+    (0x0F90, 0x0F97),
+    (0x0F99, 0x0FBC),
+    (0x0FC6, 0x0FC6),
+    (0x102C, 0x1032),
+    (0x1036, 0x1039),
+    (0x1056, 0x1059),
+    (0x1712, 0x1714),
+    (0x1732, 0x1734),
+    (0x1752, 0x1753),
+    (0x1772, 0x1773),
+    (0x17B4, 0x17D3),
+    (0x180B, 0x180D),
+    (0x18A9, 0x18A9),
+    (0x20D0, 0x20EA),
+    (0x302A, 0x302F),
+    (0x3099, 0x309A),
+    (0xFB1E, 0xFB1E),
+    (0xFE00, 0xFE0F),
+    (0xFE20, 0xFE23),
+    (0x1D165, 0x1D169),
+    (0x1D16D, 0x1D172),
+    (0x1D17B, 0x1D182),
+    (0x1D185, 0x1D18B),
+    (0x1D1AA, 0x1D1AD),
+)
 
 
 def valid_scalar(cp: int) -> bool:
@@ -60,6 +182,10 @@ def coalesce_ranges(values: list[int]) -> list[tuple[int, int]]:
         start = prev = value
     ranges.append((start, prev))
     return ranges
+
+
+def expand_ranges(ranges: tuple[tuple[int, int], ...]) -> list[int]:
+    return [cp for first, last in ranges for cp in range(first, last + 1)]
 
 
 def coalesce_ccc(values: list[tuple[int, int]]) -> list[tuple[int, int, int]]:
@@ -208,7 +334,8 @@ def main() -> None:
     map_entries: list[tuple[int, list[int]]] = []
     nfkd_entries: list[tuple[int, list[int]]] = []
     ccc_values: list[tuple[int, int]] = []
-    combining_mark_values: list[int] = []
+    combining_mark_values = expand_ranges(RFC4518_COMBINING_MARK_RANGES)
+    ucd_mark_values: list[int] = []
     unassigned_values: list[int] = []
     prohibited_values: list[int] = []
 
@@ -232,7 +359,7 @@ def main() -> None:
         if ccc != 0:
             ccc_values.append((cp, ccc))
         if UCD.category(chr(cp)) in ("Mn", "Mc", "Me"):
-            combining_mark_values.append(cp)
+            ucd_mark_values.append(cp)
 
         if stringprep.in_table_a1(chr(cp)):
             unassigned_values.append(cp)
@@ -242,10 +369,18 @@ def main() -> None:
     assert rfc4518_map(0x10A0) == [0x10A0]
     assert rfc4518_map(0x04C0) == [0x04C0]
     assert rfc4518_map(0x00DF) == [0x0073, 0x0073]
+    rfc_marks = set(combining_mark_values)
+    ucd_marks = set(ucd_mark_values)
+    assert ucd_marks - rfc_marks == {0x05BD}
+    assert rfc_marks - ucd_marks == {0x094E, 0x094F}
+    assert 0x05BD not in rfc_marks
+    assert 0x0301 in rfc_marks
+    assert 0x093E in rfc_marks
 
     lines: list[str] = [
         "//! Generated by tools/generate_rfc4518_data.py from Python's RFC 3454",
-        "//! stringprep module plus tools/unicode/UnicodeData-3.2.0.txt.",
+        "//! stringprep module, tools/unicode/UnicodeData-3.2.0.txt, and",
+        "//! the literal RFC 4518 Appendix A combining-mark ranges.",
         "//! Do not edit by hand.",
         "",
         "pub const ScalarMapping = struct { scalar: u21, offset: u32, len: u8 };",

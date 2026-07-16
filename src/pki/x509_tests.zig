@@ -832,6 +832,13 @@ test "name chaining uses RFC 4518 DirectoryString preparation" {
     const bare_mc_ccc0 = try x509.parseNameRaw(arena, try nameWithCnTag(arena, 0x0c, "\u{093E}A"), .{});
     try testing.expect(!spaced_mc_ccc0.eqlForChaining(&bare_mc_ccc0));
 
+    // RFC 4518 Appendix A is the definitive combining-mark table. U+05BD is
+    // classified Mn by Unicode 3.2 but intentionally absent from Appendix A,
+    // so a preceding U+0020 remains an insignificant leading space.
+    const spaced_non_appendix_a_mark = try x509.parseNameRaw(arena, try nameWithCnTag(arena, 0x0c, " \u{05BD}A"), .{});
+    const bare_non_appendix_a_mark = try x509.parseNameRaw(arena, try nameWithCnTag(arena, 0x0c, "\u{05BD}A"), .{});
+    try testing.expect(spaced_non_appendix_a_mark.eqlForChaining(&bare_non_appendix_a_mark));
+
     const different = try x509.parseNameRaw(arena, try nameWithCnTag(arena, 0x0c, "STRASZE"), .{});
     try testing.expect(!sharp_s.eqlForChaining(&different));
 }

@@ -86,8 +86,7 @@ pub const Core = struct {
             return message;
         }
         const expected = self.expected_inbound;
-        if (expected != message.kind and
-            !(self.role == .server and self.handshake_state == .finished and message.kind == .finished))
+        if (expected != message.kind and !self.acceptsClientFinished(message.kind))
             return error.UnexpectedHandshakeMessage;
         self.transcript.update(message.raw);
         self.advanceAfterReceive(message.kind);
@@ -108,6 +107,10 @@ pub const Core = struct {
 
     pub fn transcriptHash(self: *const Core) [transcript_mod.digest_len]u8 {
         return self.transcript.peek();
+    }
+
+    fn acceptsClientFinished(self: *const Core, kind: MessageType) bool {
+        return self.role == .server and self.handshake_state == .finished and kind == .finished;
     }
 
     fn validOutbound(self: *const Core, kind: MessageType) bool {
@@ -160,22 +163,22 @@ pub const Core = struct {
 
     fn advanceAfterSend(self: *Core, kind: MessageType) void {
         switch (self.role) {
-            .client => if (kind == .client_hello) {
-                self.handshake_state = .client_hello;
-                self.expected_inbound = .server_hello;
-            } else if (kind == .finished) {
-                self.lifecycle = .complete;
+            .client => switch (kind) {
+                .client_hello => {
+                    self.handshake_state = .client_hello;
+                    self.expected_inbound = .server_hello;
+                },
+                .finished => self.lifecycle = .complete,
+                else => {},
             },
-            .server => self.expected_inbound = null,
+            .server => switch (kind) {
+                .server_hello => self.handshake_state = .encrypted_extensions,
+                .encrypted_extensions => self.handshake_state = .certificate,
+                .certificate => self.handshake_state = .certificate_verify,
+                .certificate_verify, .finished => self.handshake_state = .finished,
+                else => {},
+            },
         }
-        self.handshake_state = switch (kind) {
-            .client_hello => .server_hello,
-            .server_hello => .encrypted_extensions,
-            .encrypted_extensions => .certificate,
-            .certificate => .certificate_verify,
-            .certificate_verify, .finished => .finished,
-            else => self.handshake_state,
-        };
     }
 };
 

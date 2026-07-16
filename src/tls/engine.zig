@@ -173,6 +173,8 @@ test "engine drives protocol-neutral handshake state" {
     writer.patch(3, length);
     _ = try engine.receiveHandshake(writer.written());
     try std.testing.expectEqual(state.HandshakeState.server_hello, engine.handshakeState());
+    const transcript_hash = engine.transcriptHash();
+    try std.testing.expect(!std.mem.eql(u8, &transcript_hash, &([_]u8{0} ** key_schedule.hash_len)));
 }
 
 test "generic driver starts backend and stores emitted events" {

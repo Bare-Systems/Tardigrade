@@ -52,7 +52,7 @@ pub const suites = [_]Suite{
 pub const skipped_suites = [_]SkippedSuite{
     .{
         .algorithm = "RSA-PSS",
-        .reason = "Provider capability remains deferred for issue #374 follow-up; pure-Zig provider currently returns UnsupportedCapability.",
+        .reason = "Dedicated RSA-PSS project fixtures cover the supported verifier; broad Wycheproof RSA-PSS corpus import remains outside this #374 slice.",
         .tracking_issue = "#374",
     },
     .{

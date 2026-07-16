@@ -526,7 +526,7 @@ fn runKeyExchangeAndSignatureVectors(log: *ExecutionLog) !void {
         const corrupted = try testing.allocator.dupe(u8, vector[1]);
         defer testing.allocator.free(corrupted);
         corrupted[0] ^= 1;
-        try testing.expectError(error.AuthenticationFailed, cp.verify(.rsa_pss_rsae_sha256, vector[0], rsa_pss_message, &corrupted));
+        try testing.expectError(error.AuthenticationFailed, cp.verify(.rsa_pss_rsae_sha256, vector[0], rsa_pss_message, corrupted));
         try testing.expectError(error.AuthenticationFailed, cp.verify(.rsa_pss_rsae_sha256, vector[0], "wrong message", vector[1]));
     }
 }

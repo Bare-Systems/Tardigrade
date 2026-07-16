@@ -234,7 +234,7 @@ test "RSA-PSS rejects signature mutations and representative range failures" {
     const signature_fe = ff.Modulus(max_modulus_bits).Fe.fromBytes(modulus_fe, valid_signature, .big) catch unreachable;
     const recovered = modulus_fe.powWithEncodedPublicExponent(signature_fe, key.exponent, .big) catch unreachable;
     var encoded: [256]u8 = undefined;
-    recovered.toBytes(&encoded, .big) catch unreachable;
+    recovered.toBytes(encoded[0..], .big) catch unreachable;
     const db_len = encoded.len - Sha256.digest_length - 1;
     const ps_len = db_len - Sha256.digest_length - 1;
     const h = encoded[db_len .. db_len + Sha256.digest_length].*;

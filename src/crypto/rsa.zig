@@ -130,7 +130,7 @@ fn verifyPss(em: []const u8, em_bits: usize, message: []const u8) Error!void {
     var hash_input: [8 + h_len + salt_len]u8 = undefined;
     @memset(hash_input[0..8], 0);
     @memcpy(hash_input[8 .. 8 + h_len], &m_hash);
-    const salt = db[ps_len + 1 .. db_len];
+    const salt = db[ps_len + 1 ..][0..salt_len];
     @memcpy(hash_input[8 + h_len ..], salt);
     var expected: [h_len]u8 = undefined;
     Sha256.hash(&hash_input, &expected, .{});

@@ -167,7 +167,6 @@ pub const Core = struct {
         switch (self.role) {
             .client => switch (kind) {
                 .client_hello => {
-                    self.handshake_state = .client_hello;
                     self.expected_inbound = .server_hello;
                 },
                 .finished => self.lifecycle = .complete,

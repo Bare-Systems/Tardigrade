@@ -15,6 +15,7 @@ const provider = crypto_pkg.provider;
 const pure_zig = crypto_pkg.pure_zig;
 
 const OpenSslError = error{
+    MissingOpenSslKdfOracle,
     OpenSslOracleFailed,
     DifferentialMismatch,
 };
@@ -69,6 +70,91 @@ fn tlsHkdfLabel(allocator: std.mem.Allocator, out_len: usize, label: []const u8,
     return encoded;
 }
 
+fn runOpenSslProbe(allocator: std.mem.Allocator, argv: []const []const u8) !bool {
+    const result = std.process.run(allocator, compat.io(), .{
+        .argv = argv,
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    }) catch return false;
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    return switch (result.term) {
+        .exited => |code| code == 0,
+        else => false,
+    };
+}
+
+fn runOpenSslOutputProbe(allocator: std.mem.Allocator, argv: []const []const u8, expected: []const u8) !bool {
+    const result = std.process.run(allocator, compat.io(), .{
+        .argv = argv,
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    }) catch return false;
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    switch (result.term) {
+        .exited => |code| if (code != 0) return false,
+        else => return false,
+    }
+    return std.mem.eql(u8, expected, result.stdout);
+}
+
+fn opensslMatchesHkdfOracle(allocator: std.mem.Allocator, path: []const u8) !bool {
+    if (!try runOpenSslProbe(allocator, &.{ path, "kdf", "-help" })) return false;
+    return runOpenSslOutputProbe(
+        allocator,
+        &.{
+            path,
+            "kdf",
+            "-keylen",
+            "42",
+            "-binary",
+            "-kdfopt",
+            "digest:SHA256",
+            "-kdfopt",
+            "mode:EXPAND_ONLY",
+            "-kdfopt",
+            "hexkey:077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5",
+            "-kdfopt",
+            "hexinfo:002a0d746c73313320646572697665640af0f1f2f3f4f5f6f7f8f9",
+            "HKDF",
+        },
+        &hexBytes("e29ebe58889156b196d8f9c31e3a4658a71eabdc113c50e4bf9d7a97ed3af464e6286979f53caa6fba0c"),
+    );
+}
+
+const OpenSslBinary = struct {
+    path: []const u8,
+    owned: bool = false,
+
+    fn deinit(self: OpenSslBinary, allocator: std.mem.Allocator) void {
+        if (self.owned) allocator.free(self.path);
+    }
+};
+
+fn opensslBinary(allocator: std.mem.Allocator) !OpenSslBinary {
+    if (compat.getEnvVarOwned(allocator, "OPENSSL_BIN")) |path| {
+        if (try opensslMatchesHkdfOracle(allocator, path)) return .{ .path = path, .owned = true };
+        allocator.free(path);
+    } else |_| {}
+
+    const candidates = [_][]const u8{
+        "/opt/homebrew/opt/openssl@3/bin/openssl",
+        "/usr/local/opt/openssl@3/bin/openssl",
+        "/opt/homebrew/bin/openssl",
+        "/usr/local/bin/openssl",
+        "openssl",
+    };
+    for (candidates) |candidate| {
+        if (try opensslMatchesHkdfOracle(allocator, candidate)) {
+            return .{ .path = candidate };
+        }
+    }
+    return error.MissingOpenSslKdfOracle;
+}
+
 fn runOpenSsl(allocator: std.mem.Allocator, stage: []const u8, argv: []const []const u8) ![]u8 {
     const result = try std.process.run(allocator, compat.io(), .{
         .argv = argv,
@@ -112,9 +198,11 @@ fn opensslHkdfExpandLabel(
         .sha256 => "digest:SHA256",
         .sha384 => "digest:SHA384",
     };
+    const openssl = try opensslBinary(allocator);
+    defer openssl.deinit(allocator);
 
     return runOpenSsl(allocator, stage, &.{
-        "openssl",
+        openssl.path,
         "kdf",
         "-keylen",
         key_len,
@@ -132,7 +220,9 @@ fn opensslHkdfExpandLabel(
 }
 
 fn opensslSha256File(allocator: std.mem.Allocator, stage: []const u8, path: []const u8) ![]u8 {
-    return runOpenSsl(allocator, stage, &.{ "openssl", "dgst", "-sha256", "-binary", path });
+    const openssl = try opensslBinary(allocator);
+    defer openssl.deinit(allocator);
+    return runOpenSsl(allocator, stage, &.{ openssl.path, "dgst", "-sha256", "-binary", path });
 }
 
 fn opensslHmacSha256File(
@@ -145,8 +235,10 @@ fn opensslHmacSha256File(
     defer allocator.free(key_hex);
     const key_opt = try std.fmt.allocPrint(allocator, "hexkey:{s}", .{key_hex});
     defer allocator.free(key_opt);
+    const openssl = try opensslBinary(allocator);
+    defer openssl.deinit(allocator);
     return runOpenSsl(allocator, stage, &.{
-        "openssl",
+        openssl.path,
         "dgst",
         "-sha256",
         "-mac",

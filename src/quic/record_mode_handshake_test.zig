@@ -464,3 +464,410 @@ test "a tampered application record fails closed and cleanup still wipes secrets
     try expectDriverSinkWiped(&h.client_driver, client_driver_used);
     try expectDriverSinkWiped(&h.server_driver, server_driver_used);
 }
+
+// ===========================================================================
+// #410: PureZigRecordStream drives a real TLS 1.3 handshake over a nonblocking
+// socket-pair carrier.
+//
+// The pieces above proved the record stack in-memory by hand-pumping the
+// driver. Here the *stream* owns the driver end to end: `drive()` starts the
+// handshake, does nonblocking carrier I/O, parses/protects records, applies
+// every emitted event, installs and discards keys, completes, and shuts down --
+// with no test-only `establish()`, fabricated secrets, or hand-applied events.
+//
+// The real engine (`tls_backend.Tls13Backend`) is QUIC-shaped, so a thin
+// `RecordModeBackend` wrapper translates its QUIC-typed event batch into the
+// record-mode contract `PureZigRecordStream` owns. This wrapper is the
+// "smallest wrapper needed to instantiate the shared TLS backend in record
+// mode" the issue calls for; production HTTP dispatch over it is #356.
+// ===========================================================================
+
+const builtin = @import("builtin");
+const es = tls_core.encrypted_stream;
+
+const suite: tls_core.algorithms.CipherSuite = .tls_aes_128_gcm_sha256;
+
+/// Adapts the pure-Zig TLS 1.3 engine to the record-mode handshake backend the
+/// stream owns: it runs the engine into a private QUIC-typed sink, then
+/// translates each event into the record contract's epoch vocabulary, dropping
+/// the QUIC-only transport parameters. The engine must have
+/// `omit_transport_parameters = true`.
+const RecordModeBackend = struct {
+    engine: *tls_backend.Tls13Backend,
+    scratch: tls_handshake.EventSink = .{},
+
+    fn init(engine_ptr: *tls_backend.Tls13Backend) RecordModeBackend {
+        return .{ .engine = engine_ptr };
+    }
+
+    fn backend(self: *RecordModeBackend) es.RecordHandshakeBackend {
+        return .{ .ptr = self, .startFn = start, .receiveFn = receive, .deinitFn = deinit };
+    }
+
+    fn start(ptr: *anyopaque, role: tls_core.state.Role, _: void, sink: *es.RecordTransport.EventSink) es.RecordHandshakeError!void {
+        const self: *RecordModeBackend = @ptrCast(@alignCast(ptr));
+        self.scratch.reset();
+        const result = self.engine.backend().transport.start(role, dummy_params, &self.scratch);
+        try translate(&self.scratch, sink);
+        result catch |err| return mapError(err);
+    }
+
+    fn receive(ptr: *anyopaque, epoch: events.EncryptionEpoch, bytes: []const u8, sink: *es.RecordTransport.EventSink) es.RecordHandshakeError!void {
+        const self: *RecordModeBackend = @ptrCast(@alignCast(ptr));
+        self.scratch.reset();
+        const result = self.engine.backend().transport.receive(toLevel(epoch), bytes, &self.scratch);
+        try translate(&self.scratch, sink);
+        result catch |err| return mapError(err);
+    }
+
+    /// Securely wipe the last batch's copied secrets from the private sink. The
+    /// engine itself is owned (and deinitialized) by the harness, not here.
+    fn deinit(ptr: *anyopaque) void {
+        const self: *RecordModeBackend = @ptrCast(@alignCast(ptr));
+        self.scratch.deinit();
+    }
+
+    fn translate(qsink: *const tls_handshake.EventSink, rsink: *es.RecordTransport.EventSink) es.RecordHandshakeError!void {
+        for (qsink.items[0..qsink.len]) |event| {
+            switch (event) {
+                .handshake_bytes => |c| try rsink.emitHandshakeBytes(toEpoch(c.epoch), c.data),
+                .traffic_secret => |s| try rsink.emitSecret(toEpoch(s.epoch), s.direction, s.data),
+                .peer_transport_parameters => {}, // QUIC-only; record mode ignores it
+                .alpn => |protocol| try rsink.emitAlpn(protocol),
+                .certificate => |cert_state| try rsink.emitCertificate(cert_state),
+                .discard_epoch => |level| try rsink.emitDiscardEpoch(toEpoch(level)),
+                .handshake_complete => try rsink.emitHandshakeComplete(),
+                .fatal_alert => |alert| try rsink.emitFatalAlert(alert),
+            }
+        }
+    }
+
+    /// Every engine error except the three QUIC-transport-only ones (which
+    /// `omit_transport_parameters` + correct epoch mapping prevent here) is
+    /// already a member of the record error set.
+    fn mapError(err: tls_handshake.HandshakeError) es.RecordHandshakeError {
+        switch (err) {
+            error.UnexpectedCryptoLevel,
+            error.MissingTransportParameters,
+            error.InvalidTransportParameters,
+            => return error.MalformedHandshake,
+            else => {},
+        }
+        return @errorCast(err);
+    }
+
+    fn toEpoch(level: tls_adapter.EncryptionLevel) events.EncryptionEpoch {
+        return switch (level) {
+            .initial => .initial,
+            .zero_rtt => .zero_rtt,
+            .handshake => .handshake,
+            .application => .application,
+        };
+    }
+
+    fn toLevel(epoch: events.EncryptionEpoch) tls_adapter.EncryptionLevel {
+        return switch (epoch) {
+            .initial => .initial,
+            .zero_rtt => .zero_rtt,
+            .handshake => .handshake,
+            .application => .application,
+        };
+    }
+};
+
+// ── Nonblocking socket-pair carrier ─────────────────────────────────────────
+
+fn testSocketPair() ![2]std.posix.fd_t {
+    var fds: [2]std.posix.fd_t = undefined;
+    if (builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        const rc = linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM, 0, &fds);
+        if (linux.errno(rc) != .SUCCESS) return error.SocketPairFailed;
+    } else {
+        if (std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds) != 0) return error.SocketPairFailed;
+    }
+    errdefer closeFd(fds[0]);
+    errdefer closeFd(fds[1]);
+    try setNonBlocking(fds[0]);
+    try setNonBlocking(fds[1]);
+    return fds;
+}
+
+fn closeFd(fd: std.posix.fd_t) void {
+    if (builtin.os.tag == .linux) {
+        _ = std.os.linux.close(fd);
+    } else {
+        _ = std.c.close(fd);
+    }
+}
+
+fn setNonBlocking(fd: std.posix.fd_t) !void {
+    if (builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        const status_flags = linux.fcntl(fd, linux.F.GETFL, 0);
+        if (linux.errno(status_flags) != .SUCCESS) return error.FcntlFailed;
+        const nonblock: usize = @intCast(@as(u32, @bitCast(linux.O{ .NONBLOCK = true })));
+        const rc = linux.fcntl(fd, linux.F.SETFL, status_flags | nonblock);
+        if (linux.errno(rc) != .SUCCESS) return error.FcntlFailed;
+    } else {
+        const status_flags = std.c.fcntl(fd, std.c.F.GETFL, @as(c_int, 0));
+        if (status_flags < 0) return error.FcntlFailed;
+        const nonblock = @as(c_int, @bitCast(std.posix.O{ .NONBLOCK = true }));
+        if (std.c.fcntl(fd, std.c.F.SETFL, status_flags | nonblock) < 0) return error.FcntlFailed;
+    }
+}
+
+fn readFd(fd: std.posix.fd_t, out: []u8) es.Error!usize {
+    if (builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        const rc = linux.read(fd, out.ptr, out.len);
+        return switch (linux.errno(rc)) {
+            .SUCCESS => rc,
+            .AGAIN => error.WouldBlock,
+            else => error.SocketReadFailed,
+        };
+    }
+    const rc = std.c.read(fd, out.ptr, out.len);
+    if (rc < 0) {
+        if (std.posix.errno(rc) == .AGAIN) return error.WouldBlock;
+        return error.SocketReadFailed;
+    }
+    return @intCast(rc);
+}
+
+fn writeFd(fd: std.posix.fd_t, bytes: []const u8) es.Error!usize {
+    if (builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        const rc = linux.write(fd, bytes.ptr, bytes.len);
+        return switch (linux.errno(rc)) {
+            .SUCCESS => rc,
+            .AGAIN => error.WouldBlock,
+            else => error.SocketWriteFailed,
+        };
+    }
+    const rc = std.c.write(fd, bytes.ptr, bytes.len);
+    if (rc < 0) {
+        if (std.posix.errno(rc) == .AGAIN) return error.WouldBlock;
+        return error.SocketWriteFailed;
+    }
+    return @intCast(rc);
+}
+
+/// A nonblocking fd carrier with an optional per-call chunk cap (to force
+/// fragmented reads and partial writes) and an optional one-shot byte flip on
+/// the read path (to corrupt a message in flight).
+const FdCarrier = struct {
+    fd: std.posix.fd_t,
+    max_chunk: usize = std.math.maxInt(usize),
+    read_offset: usize = 0,
+    corrupt_at: ?usize = null,
+
+    fn carrier(self: *FdCarrier) es.Carrier {
+        return .{ .ptr = self, .readFn = read, .writeFn = write };
+    }
+
+    fn read(ptr: *anyopaque, out: []u8) es.Error!usize {
+        const self: *FdCarrier = @ptrCast(@alignCast(ptr));
+        const cap = @min(out.len, self.max_chunk);
+        if (cap == 0) return error.WouldBlock;
+        const n = try readFd(self.fd, out[0..cap]);
+        if (self.corrupt_at) |target| {
+            if (target >= self.read_offset and target < self.read_offset + n) {
+                out[target - self.read_offset] ^= 0xff;
+                self.corrupt_at = null;
+            }
+        }
+        self.read_offset += n;
+        return n;
+    }
+
+    fn write(ptr: *anyopaque, bytes: []const u8) es.Error!usize {
+        const self: *FdCarrier = @ptrCast(@alignCast(ptr));
+        const cap = @min(bytes.len, self.max_chunk);
+        if (cap == 0) return error.WouldBlock;
+        return writeFd(self.fd, bytes[0..cap]);
+    }
+};
+
+/// Owns the two engines, wrappers, carriers, and streams for one socket-pair
+/// handshake. Heap-allocated so the self-referential carrier/backend vtables
+/// keep stable pointers.
+const SocketHarness = struct {
+    fds: [2]std.posix.fd_t,
+    client_engine: tls_backend.Tls13Backend,
+    server_engine: tls_backend.Tls13Backend,
+    client_wrapper: RecordModeBackend = undefined,
+    server_wrapper: RecordModeBackend = undefined,
+    client_carrier: FdCarrier,
+    server_carrier: FdCarrier,
+    client: es.PureZigRecordStream = undefined,
+    server: es.PureZigRecordStream = undefined,
+
+    fn create(client_chunk: usize, server_chunk: usize) !*SocketHarness {
+        const self = try std.testing.allocator.create(SocketHarness);
+        errdefer std.testing.allocator.destroy(self);
+        self.fds = try testSocketPair();
+
+        self.client_engine = tls_backend.Tls13Backend.initClient(clientEntropy(), .{ .pinned_certificate = tls_backend.testdata.certificate_der });
+        self.client_engine.omit_transport_parameters = true;
+        self.server_engine = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity());
+        self.server_engine.omit_transport_parameters = true;
+
+        self.client_wrapper = RecordModeBackend.init(&self.client_engine);
+        self.server_wrapper = RecordModeBackend.init(&self.server_engine);
+        self.client_carrier = .{ .fd = self.fds[0], .max_chunk = client_chunk };
+        self.server_carrier = .{ .fd = self.fds[1], .max_chunk = server_chunk };
+
+        self.client = es.PureZigRecordStream.initWithCarrierAndBackend(.client, clientProvider(), suite, self.client_carrier.carrier(), self.client_wrapper.backend());
+        self.server = es.PureZigRecordStream.initWithCarrierAndBackend(.server, serverProvider(), suite, self.server_carrier.carrier(), self.server_wrapper.backend());
+        return self;
+    }
+
+    fn destroy(self: *SocketHarness) void {
+        self.client.deinit();
+        self.server.deinit();
+        self.client_engine.deinit();
+        self.server_engine.deinit();
+        closeFd(self.fds[0]);
+        closeFd(self.fds[1]);
+        std.testing.allocator.destroy(self);
+    }
+
+    /// Drive both streams until `done` holds, either fails, or progress stalls.
+    fn driveUntil(self: *SocketHarness, done: *const fn (*SocketHarness) bool) !void {
+        var rounds: usize = 0;
+        while (rounds < 5000) : (rounds += 1) {
+            const c = self.client.stream().drive() catch |err| return err;
+            const s = self.server.stream().drive() catch |err| return err;
+            if (done(self)) return;
+            if (!c.made_progress and !s.made_progress) return error.Stalled;
+        }
+        return error.Stalled;
+    }
+
+    fn bothComplete(self: *SocketHarness) bool {
+        return self.client.bridge.handshake_complete and self.server.bridge.handshake_complete;
+    }
+};
+
+test "record stream completes a real TLS 1.3 handshake over a nonblocking socket pair" {
+    // Fragmentation matrix: every practical carrier chunk size, from a
+    // one-byte trickle (each socket read/write splits records at arbitrary
+    // boundaries, including inside the initial record header) up to whole
+    // records at once, plus asymmetric client/server chunking.
+    const chunks = [_][2]usize{
+        .{ 1, 1 },
+        .{ 2, 3 },
+        .{ 3, 2 },
+        .{ 5, 5 },
+        .{ 7, 64 },
+        .{ 64, 7 },
+        .{ record_codec.max_ciphertext_record_len, record_codec.max_ciphertext_record_len },
+    };
+    for (chunks) |chunk| {
+        const h = try SocketHarness.create(chunk[0], chunk[1]);
+        defer h.destroy();
+
+        try h.driveUntil(SocketHarness.bothComplete);
+        try std.testing.expect(h.client.bridge.handshake_complete);
+        try std.testing.expect(h.server.bridge.handshake_complete);
+
+        // Both sides installed genuine derived 1-RTT secrets (client- and
+        // server-derived, from separate ECDH shares) -- proven by the peer
+        // being able to open what this side sealed, below.
+        try std.testing.expect(h.client.bridge.hasWriteKeys(.application));
+        try std.testing.expect(h.server.bridge.hasReadKeys(.application));
+        // Handshake keys were discarded on both sides by completion.
+        try std.testing.expect(!h.client.bridge.hasWriteKeys(.handshake));
+        try std.testing.expect(!h.server.bridge.hasReadKeys(.handshake));
+        // ALPN and certificate negotiation were captured through the same
+        // event contract records use.
+        try std.testing.expectEqualStrings("h3", h.client.negotiatedAlpn().?);
+        try std.testing.expectEqual(events.CertificateState.valid, h.client.certificateState());
+
+        // Application plaintext flows both ways after the real handshake.
+        try std.testing.expectEqual(@as(usize, 16), try h.client.stream().write("client to server"));
+        try h.driveUntil(struct {
+            fn done(hh: *SocketHarness) bool {
+                return hh.server.readiness().can_read_plaintext;
+            }
+        }.done);
+        var buf: [64]u8 = undefined;
+        try std.testing.expectEqualStrings("client to server", buf[0..try h.server.stream().read(&buf)]);
+
+        try std.testing.expectEqual(@as(usize, 16), try h.server.stream().write("server to client"));
+        try h.driveUntil(struct {
+            fn done(hh: *SocketHarness) bool {
+                return hh.client.readiness().can_read_plaintext;
+            }
+        }.done);
+        try std.testing.expectEqualStrings("server to client", buf[0..try h.client.stream().read(&buf)]);
+
+        // Orderly close_notify shutdown.
+        h.client.stream().close();
+        try h.driveUntil(struct {
+            fn done(hh: *SocketHarness) bool {
+                return hh.client.lifecycle == .closed and hh.server.readiness().peer_closed;
+            }
+        }.done);
+        try std.testing.expectError(error.EndOfStream, h.server.stream().read(&buf));
+    }
+}
+
+test "record stream handshake fails closed when a ClientHello is corrupted in flight" {
+    const h = try SocketHarness.create(std.math.maxInt(usize), std.math.maxInt(usize));
+    defer h.destroy();
+    // Flip a byte inside the ClientHello's 32-byte random (past the 5-byte
+    // record header, 4-byte handshake header, and 2-byte legacy_version) as the
+    // server reads it. The X25519 key_share is untouched, so both sides derive
+    // the same ECDH secret but a *different* transcript hash -- exactly the
+    // "bad Finished / authentication failure" case: the server seals its flight
+    // under keys the client (correct-transcript) cannot open.
+    h.server_carrier.corrupt_at = record_codec.header_len + 4 + 2 + 4;
+
+    var client_error: ?anyerror = null;
+    var server_error: ?anyerror = null;
+    var rounds: usize = 0;
+    while (rounds < 500) : (rounds += 1) {
+        _ = h.client.stream().drive() catch |err| {
+            client_error = err;
+            break;
+        };
+        _ = h.server.stream().drive() catch |err| {
+            server_error = err;
+            break;
+        };
+        if (h.client.lifecycle == .failed or h.server.lifecycle == .failed) break;
+    }
+    // Neither side completes, and the tamper surfaces as a stable AEAD
+    // authentication failure on whichever side first opens a record sealed
+    // under the diverged transcript (the client, opening the server flight).
+    try std.testing.expect(!h.client.bridge.handshake_complete);
+    try std.testing.expect(!h.server.bridge.handshake_complete);
+    try std.testing.expect(h.client.lifecycle == .failed or h.server.lifecycle == .failed);
+    const failure: ?anyerror = if (client_error) |e| e else server_error;
+    try std.testing.expect(failure != null);
+    try std.testing.expect(failure.? == error.AuthenticationFailed);
+}
+
+test "record stream handshake treats carrier EOF before close_notify as truncation" {
+    const h = try SocketHarness.create(std.math.maxInt(usize), std.math.maxInt(usize));
+    defer h.destroy();
+
+    // Complete the handshake, then the server abruptly closes its socket
+    // instead of sending close_notify.
+    try h.driveUntil(SocketHarness.bothComplete);
+    closeFd(h.fds[1]);
+    h.server.stream().close();
+
+    var client_error: ?anyerror = null;
+    var rounds: usize = 0;
+    while (rounds < 500) : (rounds += 1) {
+        _ = h.client.stream().drive() catch |err| {
+            client_error = err;
+            break;
+        };
+    }
+    try std.testing.expectEqual(@as(?anyerror, error.TruncatedStream), client_error);
+    try std.testing.expect(h.client.lifecycle == .failed);
+}

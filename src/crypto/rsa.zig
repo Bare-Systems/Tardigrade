@@ -93,7 +93,7 @@ fn verifyPss(em: []const u8, em_bits: usize, message: []const u8) Error!void {
     const h = em[db_len .. db_len + h_len];
     const unused_bits = 8 * em.len - em_bits;
     if (unused_bits > 7) return error.InvalidInput;
-    const unused_mask: u8 = @intCast(0xff >> unused_bits);
+    const unused_mask: u8 = 0xff >> unused_bits;
     // RFC 8017 requires the unused high bits of maskedDB to be zero.
     if (masked_db[0] & ~unused_mask != 0) return error.InvalidInput;
 
@@ -124,9 +124,9 @@ pub fn verifyPssSha256(public_key_der: []const u8, message: []const u8, signatur
     const key = parsePublicKey(public_key_der) catch return error.InvalidInput;
     if (signature.len != key.modulus.len) return error.InvalidInput;
 
-    var modulus = ff.Modulus(4096).fromBytes(key.modulus, .big) catch return error.InvalidInput;
-    const signature_fe = ff.Modulus(4096).Fe.fromBytes(modulus, signature, .big) catch return error.InvalidInput;
-    const recovered = modulus.powWithEncodedPublicExponent(signature_fe, key.exponent, .big) catch return error.InvalidInput;
+    var modulus_fe = ff.Modulus(4096).fromBytes(key.modulus, .big) catch return error.InvalidInput;
+    const signature_fe = ff.Modulus(4096).Fe.fromBytes(modulus_fe, signature, .big) catch return error.InvalidInput;
+    const recovered = modulus_fe.powWithEncodedPublicExponent(signature_fe, key.exponent, .big) catch return error.InvalidInput;
     var encoded: [max_modulus_bytes]u8 = undefined;
     recovered.toBytes(encoded[0..key.modulus.len], .big) catch return error.InvalidInput;
     verifyPss(encoded[0..key.modulus.len], key.bits - 1, message) catch return error.AuthenticationFailed;

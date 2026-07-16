@@ -159,7 +159,7 @@ pub fn verifyPssSha256(public_key_der: []const u8, message: []const u8, signatur
 }
 
 fn writeTestLength(out: []u8, offset: *usize, length: usize) void {
-    if (length < 0x80) {
+    if (length <= 0x7f) {
         out[offset.*] = @intCast(length);
         offset.* += 1;
     } else {
@@ -290,12 +290,12 @@ test "RSA public-key DER enforces exponent range and parity" {
         try std.testing.expectError(error.InvalidInput, parsePublicKey(makeTestPublicKey(&der, exponent, max_modulus_bytes, 0x80)));
     }
 
-    var modulus_exponent: [257]u8 = [_]u8{0} ** 257;
-    modulus_exponent[1] = 0x80;
+    var large_exponent: [257]u8 = [_]u8{0} ** 257;
+    large_exponent[1] = 0x80;
     var der: [600]u8 = undefined;
-    try std.testing.expectError(error.InvalidInput, parsePublicKey(makeTestPublicKey(&der, &modulus_exponent, max_modulus_bytes, 0x80)));
-    modulus_exponent[1] = 0xff;
-    try std.testing.expectError(error.InvalidInput, parsePublicKey(makeTestPublicKey(&der, &modulus_exponent, max_modulus_bytes, 0x80)));
+    try std.testing.expectError(error.InvalidInput, parsePublicKey(makeTestPublicKey(&der, &large_exponent, max_modulus_bytes, 0x80)));
+    large_exponent[1] = 0xff;
+    try std.testing.expectError(error.InvalidInput, parsePublicKey(makeTestPublicKey(&der, &large_exponent, max_modulus_bytes, 0x80)));
     var longer_exponent: [258]u8 = [_]u8{0} ** 258;
     longer_exponent[1] = 0x80;
     try std.testing.expectError(error.InvalidInput, parsePublicKey(makeTestPublicKey(&der, &longer_exponent, max_modulus_bytes, 0x80)));

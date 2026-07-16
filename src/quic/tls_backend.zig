@@ -1218,14 +1218,14 @@ pub const Tls13Backend = struct {
         w.patch(3, finished_len);
         self.transcript.update(buf[finished_start..w.len]);
 
-        var sent_offset: usize = 0;
-        while (sent_offset < w.len) {
-            const sent_len = (tls_handshake_codec.frameLength(buf[sent_offset..w.len]) catch
+        var message_offset: usize = 0;
+        while (message_offset < w.len) {
+            const sent_len = (tls_handshake_codec.frameLength(buf[message_offset..w.len]) catch
                 return error.MalformedHandshake) orelse return error.MalformedHandshake;
-            const message = tls_handshake_codec.decode(buf[sent_offset..][0..sent_len]) catch
+            const message = tls_handshake_codec.decode(buf[message_offset..][0..sent_len]) catch
                 return error.MalformedHandshake;
             try self.core.recordSent(message.raw);
-            sent_offset += sent_len;
+            message_offset += sent_len;
         }
         try sink.emitCrypto(.handshake, buf[0..w.len]);
 

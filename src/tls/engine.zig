@@ -192,7 +192,7 @@ test "engine retains fragmented input and drains coalesced messages" {
     const valid_client_hello = [_]u8{ 1, 0, 0, 0 };
     const duplicate_client_hello = [_]u8{ 1, 0, 0, 0 };
     try std.testing.expectEqual(@as(usize, 0), try engine.receiveHandshake(valid_client_hello[0..1]));
-    try std.testing.expectEqual(@as(usize, 0), try engine.receiveHandshake(valid_client_hello[1..]));
+    try std.testing.expectEqual(@as(usize, 0), try engine.receiveHandshake(valid_client_hello[1..2]));
     try std.testing.expectEqual(@as(usize, 0), try engine.receiveHandshake(valid_client_hello[2..3]));
     try std.testing.expectEqual(@as(usize, 1), try engine.receiveHandshake(valid_client_hello[3..]));
     try std.testing.expectError(error.UnexpectedHandshakeMessage, engine.receiveHandshake(&duplicate_client_hello));

@@ -56,7 +56,7 @@ pub const SecretLifecycle = struct {
 pub const Core = struct {
     role: state.Role,
     handshake_state: state.HandshakeState = .idle,
-    lifecycle: enum { idle, running, complete, failed } = .idle,
+    handshake_lifecycle: enum { idle, running, complete, failed } = .idle,
     expected_inbound: ?MessageType = null,
     transcript: transcript_mod.Transcript = .{},
     secrets: SecretLifecycle = .{},
@@ -66,8 +66,8 @@ pub const Core = struct {
     }
 
     pub fn start(self: *Core) Error!void {
-        if (self.lifecycle != .idle) return error.InvalidHandshakeState;
-        self.lifecycle = .running;
+        if (self.handshake_lifecycle != .idle) return error.InvalidHandshakeState;
+        self.handshake_lifecycle = .running;
         self.expected_inbound = switch (self.role) {
             .client => .server_hello,
             .server => .client_hello,
@@ -75,16 +75,16 @@ pub const Core = struct {
     }
 
     pub fn acceptReceived(self: *Core, raw: []const u8) Error!Message {
-        if (self.lifecycle != .running and self.lifecycle != .complete)
+        if (self.handshake_lifecycle != .running and self.handshake_lifecycle != .complete)
             return error.InvalidHandshakeState;
         const message = messages.decode(raw) catch return error.MalformedHandshake;
         if (message.kind == .new_session_ticket) {
-            if (self.lifecycle != .complete or self.role != .client)
+            if (self.handshake_lifecycle != .complete or self.role != .client)
                 return error.UnexpectedHandshakeMessage;
             self.transcript.update(message.raw);
             return message;
         }
-        if (!self.acceptsClientFinished(message.kind)) {
+        if (!self.shouldAcceptClientFinished(message.kind)) {
             if (self.expected_inbound != message.kind)
                 return error.UnexpectedHandshakeMessage;
         }
@@ -94,7 +94,7 @@ pub const Core = struct {
     }
 
     pub fn recordSent(self: *Core, raw: []const u8) Error!void {
-        if (self.lifecycle != .running) return error.InvalidHandshakeState;
+        if (self.handshake_lifecycle != .running) return error.InvalidHandshakeState;
         const message = messages.decode(raw) catch return error.MalformedHandshake;
         if (!self.validOutbound(message.kind)) return error.UnexpectedHandshakeMessage;
         self.transcript.update(message.raw);
@@ -109,7 +109,7 @@ pub const Core = struct {
         return self.transcript.peek();
     }
 
-    fn acceptsClientFinished(self: *const Core, kind: MessageType) bool {
+    fn shouldAcceptClientFinished(self: *const Core, kind: MessageType) bool {
         const is_server = self.role == .server;
         const awaiting_finished = self.handshake_state == .finished;
         return is_server and awaiting_finished and kind == .finished;
@@ -137,7 +137,7 @@ pub const Core = struct {
                     self.handshake_state = .server_hello;
                     self.expected_inbound = null;
                 },
-                .finished => self.lifecycle = .complete,
+                .finished => self.handshake_lifecycle = .complete,
                 else => {},
             },
             .client => switch (kind) {
@@ -169,7 +169,7 @@ pub const Core = struct {
                 .client_hello => {
                     self.expected_inbound = .server_hello;
                 },
-                .finished => self.lifecycle = .complete,
+                .finished => self.handshake_lifecycle = .complete,
                 else => {},
             },
             .server => switch (kind) {
@@ -211,8 +211,8 @@ test "core records both directions of a client and server flight" {
     const cf = try messages.encode(.finished, "", &bytes);
     try client.recordSent(cf);
     _ = try server.acceptReceived(cf);
-    try std.testing.expectEqual(.complete, client.lifecycle);
-    try std.testing.expectEqual(.complete, server.lifecycle);
+    try std.testing.expectEqual(.complete, client.handshake_lifecycle);
+    try std.testing.expectEqual(.complete, server.handshake_lifecycle);
     const client_hash = client.transcriptHash();
     const server_hash = server.transcriptHash();
     try std.testing.expectEqualSlices(u8, &client_hash, &server_hash);

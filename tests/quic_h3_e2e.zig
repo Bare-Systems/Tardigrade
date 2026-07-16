@@ -735,25 +735,25 @@ fn expectFailureSnapshot(sim: *Sim, expected: anyerror, scenario: []const u8, se
     try testing.expectEqual(sim.timer_events, failure.timer_events);
 }
 
+fn initialWireImage(scenario: []const u8, seed: u64) !InFlight {
+    var sim = try Sim.init(testing.allocator, .{
+        .scenario = scenario,
+        .seed = seed,
+    });
+    defer sim.deinit();
+    errdefer |err| sim.recordFailure(err);
+
+    try testing.expect(try sim.step());
+    try testing.expectEqual(@as(usize, 1), sim.network.to_server.queue.items.len);
+    return sim.network.to_server.queue.items[0];
+}
+
 test "e2e harness: scenario seed reproduces the protected wire image" {
     const seed = 0x247_d37e;
-    var first = try Sim.init(testing.allocator, .{ .scenario = "seed-first", .seed = seed });
-    defer first.deinit();
-    errdefer |err| first.recordFailure(err);
-    var second = try Sim.init(testing.allocator, .{ .scenario = "seed-second", .seed = seed });
-    defer second.deinit();
-    errdefer |err| second.recordFailure(err);
-    var different = try Sim.init(testing.allocator, .{ .scenario = "seed-different", .seed = seed + 1 });
-    defer different.deinit();
-    errdefer |err| different.recordFailure(err);
+    const first_initial = try initialWireImage("seed-first", seed);
+    const second_initial = try initialWireImage("seed-second", seed);
+    const different_initial = try initialWireImage("seed-different", seed + 1);
 
-    try testing.expect(try first.step());
-    try testing.expect(try second.step());
-    try testing.expect(try different.step());
-    try testing.expectEqual(@as(usize, 1), first.network.to_server.queue.items.len);
-    try testing.expectEqual(@as(usize, 1), second.network.to_server.queue.items.len);
-    const first_initial = first.network.to_server.queue.items[0];
-    const second_initial = second.network.to_server.queue.items[0];
     try testing.expectEqual(first_initial.len, second_initial.len);
     try testing.expectEqualSlices(
         u8,
@@ -761,7 +761,6 @@ test "e2e harness: scenario seed reproduces the protected wire image" {
         second_initial.bytes[0..second_initial.len],
     );
 
-    const different_initial = different.network.to_server.queue.items[0];
     try testing.expect(
         first_initial.len != different_initial.len or
             !std.mem.eql(
@@ -770,6 +769,11 @@ test "e2e harness: scenario seed reproduces the protected wire image" {
                 different_initial.bytes[0..different_initial.len],
             ),
     );
+}
+
+fn returnCapturedOrdinaryError(sim: *Sim) !void {
+    errdefer |err| sim.recordFailure(err);
+    return error.QpackRegression;
 }
 
 test "e2e harness: ordinary scenario errors retain deterministic context" {
@@ -781,11 +785,10 @@ test "e2e harness: ordinary scenario errors retain deterministic context" {
         .log_failures = false,
     });
     defer sim.deinit();
-    errdefer |err| sim.recordFailure(err);
 
     const client_state = sim.client.state();
     const server_state = sim.server.state();
-    sim.recordFailure(error.QpackRegression);
+    try testing.expectError(error.QpackRegression, returnCapturedOrdinaryError(sim));
     sim.recordFailure(error.LaterFailureMustNotOverwrite);
 
     try expectFailureSnapshot(sim, error.QpackRegression, scenario, seed);

@@ -75,6 +75,16 @@ test "RSA-PSS certificate verifies with the pure-Zig provider" {
     defer rp.deinit(allocator);
     try testing.expectEqual(x509.SignatureAlgorithm.rsa_pss, rp.cert.signatureAlgorithm());
     try verify.verifySelfSignature(cp, &rp.cert);
+
+    const rsa_key = rp.cert.subject_public_key_info.subject_public_key.data;
+    var out_of_range = try allocator.dupe(u8, rp.cert.signature_value.data);
+    defer allocator.free(out_of_range);
+    try testing.expectEqual(@as(usize, 256), out_of_range.len);
+    try testing.expectEqual(@as(usize, 265), rsa_key.len);
+    @memcpy(out_of_range, rsa_key[9..265]);
+    var invalid = rp.cert;
+    invalid.signature_value = .{ .unused_bits = 0, .data = out_of_range };
+    try testing.expectError(error.InvalidSignature, verify.verifySelfSignature(cp, &invalid));
 }
 
 test "the three matrix schemes classify to the right key types" {

@@ -157,3 +157,159 @@ pub fn verifyPssSha256(public_key_der: []const u8, message: []const u8, signatur
     recovered.toBytes(encoded[0..key.modulus.len], .big) catch return error.InvalidInput;
     verifyPss(encoded[0..key.modulus.len], key.bits - 1, message) catch return error.AuthenticationFailed;
 }
+
+fn writeTestLength(out: []u8, offset: *usize, length: usize) void {
+    if (length < 0x80) {
+        out[offset.*] = @intCast(length);
+        offset.* += 1;
+    } else {
+        out[offset.*] = 0x82;
+        out[offset.* + 1] = @intCast(length >> 8);
+        out[offset.* + 2] = @intCast(length);
+        offset.* += 3;
+    }
+}
+
+fn makeTestPublicKey(out: []u8, exponent: []const u8, modulus_bytes: usize, modulus_top: u8) []const u8 {
+    var offset: usize = 4;
+    out[0] = 0x30;
+    out[1] = 0x82;
+    out[2] = 0;
+    out[3] = 0;
+    out[offset] = 0x02;
+    offset += 1;
+    writeTestLength(out, &offset, modulus_bytes + 1);
+    out[offset] = 0;
+    out[offset + 1] = modulus_top;
+    @memset(out[offset + 2 .. offset + modulus_bytes + 1], 0);
+    offset += modulus_bytes + 1;
+    out[offset] = 0x02;
+    offset += 1;
+    writeTestLength(out, &offset, exponent.len);
+    @memcpy(out[offset .. offset + exponent.len], exponent);
+    offset += exponent.len;
+    const sequence_len = offset - 4;
+    out[2] = @intCast(sequence_len >> 8);
+    out[3] = @intCast(sequence_len);
+    return out[0..offset];
+}
+
+fn encodePssForTest(message: []const u8, salt: [Sha256.digest_length]u8, out: []u8, em_bits: usize) void {
+    const h_len = Sha256.digest_length;
+    const db_len = out.len - h_len - 1;
+    const ps_len = db_len - h_len - 1;
+    var m_hash: [h_len]u8 = undefined;
+    Sha256.hash(message, &m_hash, .{});
+    var db: [max_modulus_bytes]u8 = undefined;
+    @memset(db[0..db_len], 0);
+    db[ps_len] = 1;
+    @memcpy(db[ps_len + 1 .. db_len], &salt);
+    var hash_input: [8 + h_len + h_len]u8 = undefined;
+    @memset(hash_input[0..8], 0);
+    @memcpy(hash_input[8 .. 8 + h_len], &m_hash);
+    @memcpy(hash_input[8 + h_len ..], &salt);
+    var h: [h_len]u8 = undefined;
+    Sha256.hash(&hash_input, &h, .{});
+    var mask: [max_modulus_bytes]u8 = undefined;
+    mgf1(&h, mask[0..db_len]);
+    for (out[0..db_len], db[0..db_len], mask[0..db_len]) |*dst, value, mask_byte| {
+        dst.* = value ^ mask_byte;
+    }
+    const unused_bits: u3 = @intCast(8 * out.len - em_bits);
+    out[0] &= @as(u8, 0xff) >> unused_bits;
+    @memcpy(out[db_len .. db_len + h_len], &h);
+    out[out.len - 1] = 0xbc;
+}
+
+test "EMSA-PSS rejects every nonzero PS byte and structural corruption" {
+    var encoded: [256]u8 = undefined;
+    encodePssForTest("message", [_]u8{0x42} ** Sha256.digest_length, &encoded, 2047);
+    try verifyPss(&encoded, 2047, "message");
+
+    const db_len = encoded.len - Sha256.digest_length - 1;
+    const ps_len = db_len - Sha256.digest_length - 1;
+    for (0..ps_len) |position| {
+        var corrupted = encoded;
+        corrupted[position] ^= 1;
+        try std.testing.expectError(error.InvalidInput, verifyPss(&corrupted, 2047, "message"));
+    }
+
+    var corrupted = encoded;
+    corrupted[0] |= 0x80;
+    try std.testing.expectError(error.InvalidInput, verifyPss(&corrupted, 2047, "message"));
+    corrupted = encoded;
+    corrupted[ps_len] ^= 1;
+    try std.testing.expectError(error.InvalidInput, verifyPss(&corrupted, 2047, "message"));
+    corrupted = encoded;
+    corrupted[db_len] ^= 1;
+    try std.testing.expectError(error.InvalidInput, verifyPss(&corrupted, 2047, "message"));
+    corrupted = encoded;
+    corrupted[ps_len + 1] ^= 1;
+    try std.testing.expectError(error.InvalidInput, verifyPss(&corrupted, 2047, "message"));
+    corrupted = encoded;
+    corrupted[corrupted.len - 1] ^= 1;
+    try std.testing.expectError(error.InvalidInput, verifyPss(&corrupted, 2047, "message"));
+    try std.testing.expectError(error.InvalidInput, verifyPss(&encoded, 2047, "wrong message"));
+}
+
+test "RSA public-key DER rejects malformed encodings and unsupported moduli" {
+    const exponent = [_]u8{ 1, 0, 1 };
+    var der: [300]u8 = undefined;
+    const key = makeTestPublicKey(&der, &exponent, max_modulus_bytes, 0x80);
+    _ = try parsePublicKey(key);
+    try std.testing.expectError(error.InvalidInput, parsePublicKey(&[_]u8{}));
+    try std.testing.expectError(error.InvalidInput, parsePublicKey(&[_]u8{0x30}));
+    try std.testing.expectError(error.InvalidInput, parsePublicKey(&[_]u8{ 0x30, 0x82, 0x01 }));
+    try std.testing.expectError(error.InvalidInput, parsePublicKey(key[0 .. key.len - 1]));
+
+    var nonminimal_length = der;
+    nonminimal_length[2] = 0;
+    try std.testing.expectError(error.InvalidInput, parsePublicKey(nonminimal_length[0..key.len]));
+    var nonminimal_integer = der;
+    nonminimal_integer[9] = 0;
+    try std.testing.expectError(error.InvalidInput, parsePublicKey(nonminimal_integer[0..key.len]));
+
+    var low_top_bit = der;
+    low_top_bit[9] = 0x7f;
+    try std.testing.expectError(error.InvalidInput, parsePublicKey(low_top_bit[0..key.len]));
+
+    var unsupported_size: [300]u8 = undefined;
+    const short_key = makeTestPublicKey(&unsupported_size, &exponent, 255, 0x80);
+    try std.testing.expectError(error.InvalidInput, parsePublicKey(short_key));
+}
+
+test "RSA public-key DER enforces exponent range and parity" {
+    const cases = [_][]const u8{
+        &[_]u8{0},
+        &[_]u8{1},
+        &[_]u8{2},
+        &[_]u8{4},
+    };
+    for (cases) |exponent| {
+        var der: [300]u8 = undefined;
+        try std.testing.expectError(error.InvalidInput, parsePublicKey(makeTestPublicKey(&der, exponent, max_modulus_bytes, 0x80)));
+    }
+
+    var modulus_exponent: [257]u8 = [_]u8{0} ** 257;
+    modulus_exponent[1] = 0x80;
+    var der: [600]u8 = undefined;
+    try std.testing.expectError(error.InvalidInput, parsePublicKey(makeTestPublicKey(&der, &modulus_exponent, max_modulus_bytes, 0x80)));
+    modulus_exponent[1] = 0xff;
+    try std.testing.expectError(error.InvalidInput, parsePublicKey(makeTestPublicKey(&der, &modulus_exponent, max_modulus_bytes, 0x80)));
+    var longer_exponent: [258]u8 = [_]u8{0} ** 258;
+    longer_exponent[1] = 0x80;
+    try std.testing.expectError(error.InvalidInput, parsePublicKey(makeTestPublicKey(&der, &longer_exponent, max_modulus_bytes, 0x80)));
+}
+
+test "RSA-PSS rejects short, long, and out-of-range signatures" {
+    const exponent = [_]u8{ 1, 0, 1 };
+    var der: [300]u8 = undefined;
+    const key = makeTestPublicKey(&der, &exponent, max_modulus_bytes, 0x80);
+    const equal_modulus = [_]u8{0x80} ++ ([_]u8{0} ** (max_modulus_bytes - 1));
+    const greater_modulus = [_]u8{0xff} ** max_modulus_bytes;
+    try std.testing.expectError(error.AuthenticationFailed, verifyPssSha256(key, "message", &equal_modulus));
+    try std.testing.expectError(error.AuthenticationFailed, verifyPssSha256(key, "message", &greater_modulus));
+    try std.testing.expectError(error.InvalidInput, verifyPssSha256(key, "message", equal_modulus[0 .. equal_modulus.len - 1]));
+    var long_signature: [max_modulus_bytes + 1]u8 = undefined;
+    try std.testing.expectError(error.InvalidInput, verifyPssSha256(key, "message", &long_signature));
+}

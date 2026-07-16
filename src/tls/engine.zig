@@ -18,6 +18,8 @@ pub const EngineConfig = struct {
 
 pub const Engine = struct {
     config: EngineConfig,
+    /// Kept as a stable public snapshot for callers that inspect the engine
+    /// directly; `core.handshake_state` is the authoritative state.
     handshake_state: state.HandshakeState = .idle,
     core: handshake.Core,
 

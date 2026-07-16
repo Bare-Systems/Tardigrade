@@ -296,9 +296,10 @@ fn integerParameter(value_bytes: []const u8) HandshakeError!u64 {
     return decoded.value;
 }
 
-// TLS forbids repeating an extension type within one extension block. The
-// tracker stays local because the QUIC backend maps duplicates to its
-// handshake-specific semantic error.
+// TLS forbids repeating an extension type within one extension block. Reader
+// and Writer are shared with record mode, but this tracker stays local because
+// the QUIC backend maps duplicate extensions to its handshake-specific
+// `IllegalParameter` error.
 const ExtensionGuard = struct {
     pub const max_extensions = 64;
 

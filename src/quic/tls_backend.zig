@@ -572,7 +572,6 @@ pub const Tls13Backend = struct {
                 .receiveFn = receiveImpl,
                 .deinitFn = deinitImpl,
             },
-            .deinitFn = deinitImpl,
             .setCidBindingFn = setCidBindingImpl,
             .peerCidBindingFn = peerCidBindingImpl,
         };
@@ -1221,9 +1220,8 @@ pub const Tls13Backend = struct {
 
         var sent_offset: usize = 0;
         while (sent_offset < w.len) {
-            if (w.len - sent_offset < 4) return error.MalformedHandshake;
-            const sent_len = 4 + @as(usize, std.mem.readInt(u24, buf[sent_offset + 1 ..][0..3], .big));
-            if (sent_len > w.len - sent_offset) return error.MalformedHandshake;
+            const sent_len = (tls_handshake_codec.frameLength(buf[sent_offset..w.len]) catch
+                return error.MalformedHandshake) orelse return error.MalformedHandshake;
             const message = tls_handshake_codec.decode(buf[sent_offset..][0..sent_len]) catch
                 return error.MalformedHandshake;
             try self.core.recordSent(message.raw);

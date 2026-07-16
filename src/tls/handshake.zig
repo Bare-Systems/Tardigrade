@@ -85,7 +85,10 @@ pub const Core = struct {
             self.transcript.update(message.raw);
             return message;
         }
-        if (self.expected_inbound != message.kind) return error.UnexpectedHandshakeMessage;
+        const expected = self.expected_inbound;
+        if (expected != message.kind and
+            !(self.role == .server and self.handshake_state == .finished and message.kind == .finished))
+            return error.UnexpectedHandshakeMessage;
         self.transcript.update(message.raw);
         self.advanceAfterReceive(message.kind);
         return message;
@@ -124,9 +127,13 @@ pub const Core = struct {
 
     fn advanceAfterReceive(self: *Core, kind: MessageType) void {
         switch (self.role) {
-            .server => if (kind == .client_hello) {
-                self.handshake_state = .server_hello;
-                self.expected_inbound = .server_hello;
+            .server => switch (kind) {
+                .client_hello => {
+                    self.handshake_state = .server_hello;
+                    self.expected_inbound = null;
+                },
+                .finished => self.lifecycle = .complete,
+                else => {},
             },
             .client => switch (kind) {
                 .server_hello => {
@@ -159,14 +166,7 @@ pub const Core = struct {
             } else if (kind == .finished) {
                 self.lifecycle = .complete;
             },
-            .server => switch (kind) {
-                .server_hello => self.expected_inbound = .encrypted_extensions,
-                .encrypted_extensions => self.expected_inbound = .certificate,
-                .certificate => self.expected_inbound = .certificate_verify,
-                .certificate_verify => self.expected_inbound = .finished,
-                .finished => self.expected_inbound = .finished,
-                else => {},
-            },
+            .server => self.expected_inbound = null,
         }
         self.handshake_state = switch (kind) {
             .client_hello => .server_hello,

@@ -56,6 +56,15 @@ pub fn decode(raw: []const u8) Error!HandshakeMessage {
     };
 }
 
+pub fn frameLength(bytes: []const u8) ReassemblerError!?usize {
+    if (bytes.len < 4) return null;
+    const body_len: usize = @intCast(std.mem.readInt(u24, bytes[1..4], .big));
+    if (body_len > max_message_len) return error.MessageTooLarge;
+    const length = 4 + body_len;
+    if (length > bytes.len) return null;
+    return length;
+}
+
 pub fn encode(kind: MessageType, body: []const u8, out: []u8) Error![]const u8 {
     if (body.len > max_message_len) return error.MessageTooLarge;
     if (out.len < 4 + body.len) return error.HandshakeBufferOverflow;
@@ -198,10 +207,7 @@ pub fn Reassembler(comptime capacity: usize) type {
         }
 
         pub fn peek(self: *Self) ReassemblerError!?HandshakeMessage {
-            if (self.len < 4) return null;
-            const body_len: usize = @intCast(std.mem.readInt(u24, self.data[1..4], .big));
-            if (body_len > max_message_len) return error.MessageTooLarge;
-            const message_len = 4 + body_len;
+            const message_len = (try frameLength(self.data[0..self.len])) orelse return null;
             if (message_len > self.data.len) return error.HandshakeBufferOverflow;
             if (self.len < message_len) return null;
             return try decode(self.data[0..message_len]);

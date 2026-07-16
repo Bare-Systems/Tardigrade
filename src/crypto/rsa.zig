@@ -159,6 +159,7 @@ pub fn verifyPssSha256(public_key_der: []const u8, message: []const u8, signatur
 }
 
 fn writeTestLength(out: []u8, offset: *usize, length: usize) void {
+    // DER uses one length octet for values up to and including 127.
     if (length <= 0x7f) {
         out[offset.*] = @intCast(length);
         offset.* += 1;
@@ -306,11 +307,11 @@ test "RSA-PSS rejects short, long, and out-of-range signatures" {
     var der: [300]u8 = undefined;
     const key = makeTestPublicKey(&der, &exponent, max_modulus_bytes, 0x80);
     // The minimum valid modulus has only its high bit set.
-    const equal_modulus = [_]u8{0x80} ++ ([_]u8{0} ** (max_modulus_bytes - 1));
-    const greater_modulus = [_]u8{0xff} ** max_modulus_bytes;
-    try std.testing.expectError(error.AuthenticationFailed, verifyPssSha256(key, "message", &equal_modulus));
-    try std.testing.expectError(error.AuthenticationFailed, verifyPssSha256(key, "message", &greater_modulus));
-    try std.testing.expectError(error.InvalidInput, verifyPssSha256(key, "message", equal_modulus[0 .. equal_modulus.len - 1]));
+    const signature_equal_to_modulus = [_]u8{0x80} ++ ([_]u8{0} ** (max_modulus_bytes - 1));
+    const signature_greater_than_modulus = [_]u8{0xff} ** max_modulus_bytes;
+    try std.testing.expectError(error.AuthenticationFailed, verifyPssSha256(key, "message", &signature_equal_to_modulus));
+    try std.testing.expectError(error.AuthenticationFailed, verifyPssSha256(key, "message", &signature_greater_than_modulus));
+    try std.testing.expectError(error.InvalidInput, verifyPssSha256(key, "message", signature_equal_to_modulus[0 .. signature_equal_to_modulus.len - 1]));
     var long_signature: [max_modulus_bytes + 1]u8 = undefined;
     try std.testing.expectError(error.InvalidInput, verifyPssSha256(key, "message", &long_signature));
 }

@@ -61,6 +61,7 @@ pub const CoreDriver = tls_core.engine.Driver(TransportContract);
 /// or the adapter. QUIC connection-ID binding hooks stay local to this wrapper.
 pub const TlsBackend = struct {
     transport: TlsTransportBackend,
+    deinitFn: ?*const fn (ptr: *anyopaque) void = null,
     /// Optional RFC 9000 §7.3 authentication-binding hooks. A backend that
     /// carries connection IDs in its transport parameters implements both; the
     /// in-memory test backend leaves them null.
@@ -82,6 +83,10 @@ pub const TlsBackend = struct {
     pub fn peerCidBinding(self: TlsBackend) config.CidBinding {
         if (self.peerCidBindingFn) |get| return get(self.transport.ptr);
         return .{};
+    }
+
+    pub fn deinit(self: TlsBackend) void {
+        self.transport.deinit();
     }
 };
 

@@ -538,6 +538,7 @@ pub const Tls13Backend = struct {
 
     local_params: config.TransportParameters = undefined,
     key_pair: ?X25519.KeyPair = null,
+    core: tls_core.handshake.Core,
     transcript: TranscriptHash = TranscriptHash.init(.{}),
     schedule: ?KeySchedule = null,
     /// The client Finished verify_data the server expects (computed when its
@@ -556,11 +557,11 @@ pub const Tls13Backend = struct {
     peer_certificate_len: usize = 0,
 
     pub fn initClient(entropy: Entropy, trust: Trust) Tls13Backend {
-        return .{ .role = .client, .entropy = entropy, .trust = trust };
+        return .{ .role = .client, .entropy = entropy, .trust = trust, .core = tls_core.handshake.Core.init(.client) };
     }
 
     pub fn initServer(entropy: Entropy, identity: Identity) Tls13Backend {
-        return .{ .role = .server, .entropy = entropy, .identity = identity };
+        return .{ .role = .server, .entropy = entropy, .identity = identity, .core = tls_core.handshake.Core.init(.server) };
     }
 
     pub fn backend(self: *Tls13Backend) TlsBackend {
@@ -569,10 +570,31 @@ pub const Tls13Backend = struct {
                 .ptr = self,
                 .startFn = startImpl,
                 .receiveFn = receiveImpl,
+                .deinitFn = deinitImpl,
             },
+            .deinitFn = deinitImpl,
             .setCidBindingFn = setCidBindingImpl,
             .peerCidBindingFn = peerCidBindingImpl,
         };
+    }
+
+    fn deinitImpl(ptr: *anyopaque) void {
+        const self: *Tls13Backend = @ptrCast(@alignCast(ptr));
+        self.deinit();
+    }
+
+    pub fn deinit(self: *Tls13Backend) void {
+        if (self.schedule) |*schedule| schedule.wipe();
+        self.schedule = null;
+        crypto.secureZero(u8, &self.expected_client_verify);
+        if (self.key_pair) |*key_pair| {
+            crypto.secureZero(u8, &key_pair.secret_key);
+            crypto.secureZero(u8, &key_pair.public_key);
+        }
+        self.key_pair = null;
+        crypto.secureZero(u8, &self.peer_certificate);
+        self.peer_certificate_len = 0;
+        self.expect = .done;
     }
 
     fn setCidBindingImpl(ptr: *anyopaque, binding: config.CidBinding) void {
@@ -592,6 +614,7 @@ pub const Tls13Backend = struct {
         std.debug.assert(role == self.role);
         std.debug.assert(self.expect == .start);
         self.local_params = params;
+        try self.core.start();
         switch (self.role) {
             .client => {
                 try self.sendClientHello(sink);
@@ -625,6 +648,7 @@ pub const Tls13Backend = struct {
             const kind = std.enums.fromInt(MessageType, input.data[0]) orelse return error.MalformedHandshake;
             const raw = input.data[0..message_len];
             const body = raw[4..];
+            _ = try self.core.acceptReceived(raw);
             try self.onMessage(kind, level, raw, body, sink);
             input.consume(message_len);
             // A failed or freshly completed handshake stops consuming its own
@@ -793,6 +817,7 @@ pub const Tls13Backend = struct {
         w.patch(3, message_len);
 
         const message = buf[0..w.len];
+        try self.core.recordSent(message);
         self.transcript.update(message);
         try sink.emitCrypto(.initial, message);
     }
@@ -1106,6 +1131,7 @@ pub const Tls13Backend = struct {
         hello.patch(2, hello_extensions);
         hello.patch(3, hello_len);
         const server_hello = hello_buf[0..hello.len];
+        try self.core.recordSent(server_hello);
         self.transcript.update(server_hello);
         try sink.emitCrypto(.initial, server_hello);
         try sink.emitAlpn(self.alpn);
@@ -1193,6 +1219,16 @@ pub const Tls13Backend = struct {
         w.patch(3, finished_len);
         self.transcript.update(buf[finished_start..w.len]);
 
+        var sent_offset: usize = 0;
+        while (sent_offset < w.len) {
+            if (w.len - sent_offset < 4) return error.MalformedHandshake;
+            const sent_len = 4 + @as(usize, std.mem.readInt(u24, buf[sent_offset + 1 ..][0..3], .big));
+            if (sent_len > w.len - sent_offset) return error.MalformedHandshake;
+            const message = tls_handshake_codec.decode(buf[sent_offset..][0..sent_len]) catch
+                return error.MalformedHandshake;
+            try self.core.recordSent(message.raw);
+            sent_offset += sent_len;
+        }
         try sink.emitCrypto(.handshake, buf[0..w.len]);
 
         // 1-RTT secrets from the transcript through server Finished; the

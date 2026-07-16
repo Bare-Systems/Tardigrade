@@ -214,6 +214,7 @@ pub fn ContractWithOptions(
             ptr: *anyopaque,
             startFn: *const fn (ptr: *anyopaque, role: state.Role, params: TransportParameters, sink: *EventSink) ErrorSet!void,
             receiveFn: *const fn (ptr: *anyopaque, epoch: Epoch, bytes: []const u8, sink: *EventSink) ErrorSet!void,
+            deinitFn: ?*const fn (ptr: *anyopaque) void = null,
 
             pub fn start(self: Backend, role: state.Role, params: TransportParameters, sink: *EventSink) ErrorSet!void {
                 return self.startFn(self.ptr, role, params, sink);
@@ -221,6 +222,10 @@ pub fn ContractWithOptions(
 
             pub fn receive(self: Backend, epoch: Epoch, bytes: []const u8, sink: *EventSink) ErrorSet!void {
                 return self.receiveFn(self.ptr, epoch, bytes, sink);
+            }
+
+            pub fn deinit(self: Backend) void {
+                if (self.deinitFn) |deinitFn| deinitFn(self.ptr);
             }
         };
     };

@@ -17,6 +17,12 @@ pub const Error = error{
     TooManyExtensions,
 };
 
+pub const ReassemblerError = error{
+    MalformedHandshake,
+    HandshakeBufferOverflow,
+    MessageTooLarge,
+};
+
 pub const MessageType = enum(u8) {
     client_hello = 1,
     server_hello = 2,
@@ -185,13 +191,13 @@ pub fn Reassembler(comptime capacity: usize) type {
 
         const Self = @This();
 
-        pub fn append(self: *Self, bytes: []const u8) Error!void {
+        pub fn append(self: *Self, bytes: []const u8) ReassemblerError!void {
             if (bytes.len > self.data.len - self.len) return error.HandshakeBufferOverflow;
             @memcpy(self.data[self.len..][0..bytes.len], bytes);
             self.len += bytes.len;
         }
 
-        pub fn peek(self: *Self) Error!?HandshakeMessage {
+        pub fn peek(self: *Self) ReassemblerError!?HandshakeMessage {
             if (self.len < 4) return null;
             const body_len: usize = @intCast(std.mem.readInt(u24, self.data[1..4], .big));
             if (body_len > max_message_len) return error.MessageTooLarge;
@@ -201,7 +207,7 @@ pub fn Reassembler(comptime capacity: usize) type {
             return try decode(self.data[0..message_len]);
         }
 
-        pub fn discard(self: *Self, count: usize) Error!void {
+        pub fn discard(self: *Self, count: usize) ReassemblerError!void {
             if (count > self.len) return error.MalformedHandshake;
             std.mem.copyForwards(u8, self.data[0 .. self.len - count], self.data[count..self.len]);
             self.len -= count;

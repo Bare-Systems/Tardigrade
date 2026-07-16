@@ -11,78 +11,53 @@ const messages = @import("messages.zig");
 const state = @import("state.zig");
 const transcript_mod = @import("transcript.zig");
 
-pub const Error = events.HandshakeError;
+pub const Error = events.HandshakeError || messages.ReassemblerError;
 pub const Message = messages.HandshakeMessage;
 pub const MessageType = messages.MessageType;
 pub const Reader = messages.Reader;
 pub const Writer = messages.Writer;
 pub const ExtensionIterator = messages.ExtensionIterator;
 pub const ExtensionGuard = messages.ExtensionGuard;
-const handshake_header_len = 4;
+pub const Reassembler = messages.Reassembler;
 const epoch_count = @typeInfo(events.EncryptionEpoch).@"enum".fields.len;
 
-pub fn Reassembler(comptime capacity: usize) type {
-    return struct {
-        data: [capacity]u8 = undefined,
-        len: usize = 0,
-
-        const Self = @This();
-
-        pub fn append(self: *Self, bytes: []const u8) Error!void {
-            if (self.len > self.data.len) return error.MalformedHandshake;
-            if (bytes.len > self.data.len - self.len) return error.MalformedHandshake;
-            @memcpy(self.data[self.len..][0..bytes.len], bytes);
-            self.len += bytes.len;
-        }
-
-        pub fn next(self: *Self) Error!?Message {
-            if (self.len < handshake_header_len) return null;
-            const body_len = std.mem.readInt(u24, self.data[1..4], .big);
-            if (@as(usize, body_len) > self.data.len - handshake_header_len)
-                return error.MalformedHandshake;
-            const message_len = handshake_header_len + @as(usize, body_len);
-            if (self.len < message_len) return null;
-            // The carrier only calls `next` after enough bytes are buffered.
-            // All codec failures therefore describe an invalid TLS wire
-            // message at this boundary and intentionally map to decode_error.
-            return messages.decode(self.data[0..message_len]) catch
-                return error.MalformedHandshake;
-        }
-
-        pub fn discard(self: *Self, count: usize) Error!void {
-            if (count > self.len) return error.MalformedHandshake;
-            const remaining = self.len - count;
-            std.mem.copyForwards(u8, self.data[0..remaining], self.data[count..][0..remaining]);
-            self.len -= count;
-        }
-    };
-}
-
 pub const SecretLifecycle = struct {
-    installed: [epoch_count]bool = .{false} ** epoch_count,
-    discarded: [epoch_count]bool = .{false} ** epoch_count,
+    const direction_count = @typeInfo(events.SecretDirection).@"enum".fields.len;
+    const SecretState = enum { absent, live, discarded };
+    state: [epoch_count][direction_count]SecretState =
+        .{.{.absent} ** direction_count} ** epoch_count,
 
-    pub fn install(self: *SecretLifecycle, epoch: events.EncryptionEpoch) Error!void {
-        const index = @intFromEnum(epoch);
-        if (self.discarded[index]) return error.SecretAlreadyDiscarded;
-        self.installed[index] = true;
+    pub fn install(
+        self: *SecretLifecycle,
+        epoch: events.EncryptionEpoch,
+        direction: events.SecretDirection,
+    ) events.SecretLifecycleError!void {
+        const slot = &self.state[@intFromEnum(epoch)][@intFromEnum(direction)];
+        if (slot.* == .discarded) return error.SecretAlreadyDiscarded;
+        slot.* = .live;
     }
 
-    pub fn discard(self: *SecretLifecycle, epoch: events.EncryptionEpoch) Error!void {
-        const index = @intFromEnum(epoch);
-        if (!self.installed[index]) return error.SecretNotInstalled;
-        self.discarded[index] = true;
+    pub fn discardEpoch(self: *SecretLifecycle, epoch: events.EncryptionEpoch) events.SecretLifecycleError!void {
+        var found_live = false;
+        for (&self.state[@intFromEnum(epoch)]) |*slot| {
+            if (slot.* == .live) {
+                slot.* = .discarded;
+                found_live = true;
+            }
+        }
+        if (!found_live) return error.SecretNotInstalled;
     }
 
-    pub fn isLive(self: *const SecretLifecycle, epoch: events.EncryptionEpoch) bool {
-        const index = @intFromEnum(epoch);
-        return self.installed[index] and !self.discarded[index];
+    pub fn isLive(self: *const SecretLifecycle, epoch: events.EncryptionEpoch, direction: events.SecretDirection) bool {
+        return self.state[@intFromEnum(epoch)][@intFromEnum(direction)] == .live;
     }
 };
 
 pub const Core = struct {
     role: state.Role,
     handshake_state: state.HandshakeState = .idle,
+    lifecycle: enum { idle, running, complete, failed } = .idle,
+    expected_inbound: ?MessageType = null,
     transcript: transcript_mod.Transcript = .{},
     secrets: SecretLifecycle = .{},
 
@@ -90,104 +65,162 @@ pub const Core = struct {
         return .{ .role = role };
     }
 
-    pub fn start(self: *Core) void {
-        self.handshake_state = switch (self.role) {
-            .client => .client_hello,
-            .server => .idle,
+    pub fn start(self: *Core) Error!void {
+        if (self.lifecycle != .idle) return error.InvalidHandshakeState;
+        self.lifecycle = .running;
+        self.expected_inbound = switch (self.role) {
+            .client => .server_hello,
+            .server => .client_hello,
         };
+
     }
 
-    /// Accept one complete handshake message from the carrier. The carrier
-    /// remains responsible for selecting the encryption epoch; this method only
-    /// handles TLS message ordering and transcript ownership.
-    pub fn accept(self: *Core, raw: []const u8) Error!Message {
+    pub fn acceptReceived(self: *Core, raw: []const u8) Error!Message {
+        if (self.lifecycle != .running and self.lifecycle != .complete)
+            return error.InvalidHandshakeState;
         const message = messages.decode(raw) catch return error.MalformedHandshake;
-        if (!self.accepts(message.kind)) return error.UnexpectedHandshakeMessage;
+        if (message.kind == .new_session_ticket) {
+            if (self.lifecycle != .complete or self.role != .client)
+                return error.UnexpectedHandshakeMessage;
+            self.transcript.update(message.raw);
+            return message;
+        }
+        if (self.expected_inbound != message.kind) return error.UnexpectedHandshakeMessage;
         self.transcript.update(message.raw);
-        self.advance(message.kind);
+        self.advanceAfterReceive(message.kind);
         return message;
+    }
+
+    pub fn recordSent(self: *Core, raw: []const u8) Error!void {
+        if (self.lifecycle != .running) return error.InvalidHandshakeState;
+        const message = messages.decode(raw) catch return error.MalformedHandshake;
+        if (!self.validOutbound(message.kind)) return error.UnexpectedHandshakeMessage;
+        self.transcript.update(message.raw);
+        self.advanceAfterSend(message.kind);
+    }
+
+    pub fn accept(self: *Core, raw: []const u8) Error!Message {
+        return self.acceptReceived(raw);
     }
 
     pub fn transcriptHash(self: *const Core) [transcript_mod.digest_len]u8 {
         return self.transcript.peek();
     }
 
-    fn accepts(self: *const Core, kind: MessageType) bool {
-        return switch (self.handshake_state) {
-            .client_hello => self.role == .server and kind == .client_hello,
-            .server_hello => self.role == .client and kind == .server_hello,
-            .encrypted_extensions => self.role == .client and kind == .encrypted_extensions,
-            .certificate => self.role == .client and kind == .certificate,
-            .certificate_verify => self.role == .client and kind == .certificate_verify,
-            .finished => kind == .finished,
-            .idle, .complete => false,
+    fn validOutbound(self: *const Core, kind: MessageType) bool {
+        return switch (self.role) {
+            .client => (self.handshake_state == .idle and kind == .client_hello) or
+                (self.handshake_state == .finished and self.expected_inbound == null and kind == .finished),
+            .server => switch (self.handshake_state) {
+                .server_hello => kind == .server_hello,
+                .encrypted_extensions => kind == .encrypted_extensions,
+                .certificate => kind == .certificate,
+                .certificate_verify => kind == .certificate_verify,
+                .finished => kind == .finished,
+                else => false,
+            },
         };
     }
 
-    fn advance(self: *Core, kind: MessageType) void {
+    fn advanceAfterReceive(self: *Core, kind: MessageType) void {
+        switch (self.role) {
+            .server => if (kind == .client_hello) {
+                self.handshake_state = .server_hello;
+                self.expected_inbound = .server_hello;
+            },
+            .client => switch (kind) {
+                .server_hello => {
+                    self.handshake_state = .encrypted_extensions;
+                    self.expected_inbound = .encrypted_extensions;
+                },
+                .encrypted_extensions => {
+                    self.handshake_state = .certificate;
+                    self.expected_inbound = .certificate;
+                },
+                .certificate => {
+                    self.handshake_state = .certificate_verify;
+                    self.expected_inbound = .certificate_verify;
+                },
+                .certificate_verify => {
+                    self.handshake_state = .finished;
+                    self.expected_inbound = .finished;
+                },
+                .finished => self.expected_inbound = null,
+                else => {},
+            },
+        }
+    }
+
+    fn advanceAfterSend(self: *Core, kind: MessageType) void {
+        switch (self.role) {
+            .client => if (kind == .client_hello) {
+                self.handshake_state = .client_hello;
+                self.expected_inbound = .server_hello;
+            } else if (kind == .finished) {
+                self.lifecycle = .complete;
+            },
+            .server => switch (kind) {
+                .server_hello => self.expected_inbound = .encrypted_extensions,
+                .encrypted_extensions => self.expected_inbound = .certificate,
+                .certificate => self.expected_inbound = .certificate_verify,
+                .certificate_verify => self.expected_inbound = .finished,
+                .finished => self.expected_inbound = .finished,
+                else => {},
+            },
+        }
         self.handshake_state = switch (kind) {
             .client_hello => .server_hello,
             .server_hello => .encrypted_extensions,
             .encrypted_extensions => .certificate,
             .certificate => .certificate_verify,
-            .certificate_verify => .finished,
-            .finished => .complete,
+            .certificate_verify, .finished => .finished,
             else => self.handshake_state,
         };
     }
 };
 
-test "protocol-neutral core reassembles messages and owns transcript updates" {
-    var bytes: [32]u8 = undefined;
-    const raw = try messages.encode(.client_hello, "hello", &bytes);
-    var reassembler = Reassembler(64){};
-    try reassembler.append(raw[0..2]);
-    try std.testing.expect(try reassembler.next() == null);
-    try reassembler.append(raw[2..]);
+test "core records both directions of a client and server flight" {
+    var client = Core.init(.client);
+    var server = Core.init(.server);
+    try client.start();
+    try server.start();
 
-    var core = Core.init(.server);
-    core.start();
-    const message = try core.accept((try reassembler.next()).?.raw);
-    try std.testing.expectEqual(MessageType.client_hello, message.kind);
-    try std.testing.expectEqual(state.HandshakeState.server_hello, core.handshake_state);
-    const hash = core.transcriptHash();
-    try std.testing.expect(!std.mem.eql(u8, &hash, &([_]u8{0} ** transcript_mod.digest_len)));
+    var bytes: [8]u8 = undefined;
+    const ch = try messages.encode(.client_hello, "", &bytes);
+    try client.recordSent(ch);
+    _ = try server.acceptReceived(ch);
+    const sh = try messages.encode(.server_hello, "", &bytes);
+    try server.recordSent(sh);
+    _ = try client.acceptReceived(sh);
+    const ee = try messages.encode(.encrypted_extensions, "", &bytes);
+    try server.recordSent(ee);
+    _ = try client.acceptReceived(ee);
+    const cert = try messages.encode(.certificate, "", &bytes);
+    try server.recordSent(cert);
+    _ = try client.acceptReceived(cert);
+    const cv = try messages.encode(.certificate_verify, "", &bytes);
+    try server.recordSent(cv);
+    _ = try client.acceptReceived(cv);
+    const sf = try messages.encode(.finished, "", &bytes);
+    try server.recordSent(sf);
+    _ = try client.acceptReceived(sf);
+    const cf = try messages.encode(.finished, "", &bytes);
+    try client.recordSent(cf);
+    _ = try server.acceptReceived(cf);
+    try std.testing.expectEqual(.complete, client.lifecycle);
+    try std.testing.expectEqual(.complete, server.lifecycle);
+    const client_hash = client.transcriptHash();
+    const server_hash = server.transcriptHash();
+    try std.testing.expectEqualSlices(u8, &client_hash, &server_hash);
 }
 
-test "secret lifecycle rejects use after discard" {
+test "secret lifecycle tracks directions and rejects repeated discard" {
     var lifecycle = SecretLifecycle{};
-    try std.testing.expectError(error.SecretNotInstalled, lifecycle.discard(.handshake));
-    try lifecycle.install(.handshake);
-    try std.testing.expect(lifecycle.isLive(.handshake));
-    try lifecycle.discard(.handshake);
-    try std.testing.expect(!lifecycle.isLive(.handshake));
-    try std.testing.expectError(error.SecretAlreadyDiscarded, lifecycle.install(.handshake));
-}
-
-test "reassembler discards complete messages and rejects out-of-range removal" {
-    var first_buf: [16]u8 = undefined;
-    var second_buf: [16]u8 = undefined;
-    const first = try messages.encode(.client_hello, "one", &first_buf);
-    const second = try messages.encode(.finished, "two", &second_buf);
-
-    var reassembler = Reassembler(64){};
-    try reassembler.append(first);
-    try reassembler.append(second);
-    const first_message = (try reassembler.next()).?;
-    try reassembler.discard(first_message.raw.len);
-    try std.testing.expectEqual(@as(usize, second.len), reassembler.len);
-    const second_message = (try reassembler.next()).?;
-    try std.testing.expectEqual(MessageType.finished, second_message.kind);
-    try reassembler.discard(second.len);
-    try std.testing.expectEqual(@as(usize, 0), reassembler.len);
-    try reassembler.discard(0);
-    try std.testing.expectError(error.MalformedHandshake, reassembler.discard(1));
-
-    var small = Reassembler(4){};
-    try std.testing.expectError(error.MalformedHandshake, small.append(&([_]u8{0} ** 5)));
-
-    var partial = Reassembler(64){};
-    try partial.append(first);
-    try partial.discard(1);
-    try std.testing.expectError(error.MalformedHandshake, partial.next());
+    try std.testing.expectError(error.SecretNotInstalled, lifecycle.discardEpoch(.handshake));
+    try lifecycle.install(.handshake, .read);
+    try std.testing.expect(lifecycle.isLive(.handshake, .read));
+    try std.testing.expect(!lifecycle.isLive(.handshake, .write));
+    try lifecycle.discardEpoch(.handshake);
+    try std.testing.expectError(error.SecretNotInstalled, lifecycle.discardEpoch(.handshake));
+    try std.testing.expectError(error.SecretAlreadyDiscarded, lifecycle.install(.handshake, .read));
 }

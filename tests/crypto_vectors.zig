@@ -72,7 +72,6 @@ const case_registry = [_]CaseMeta{
     .{ .id = "secp256r1-unsupported", .algorithm = .{ .group = .secp256r1 }, .providers = pure_zig_only, .class = .negative, .source = "provider capability matrix", .license = "project fixture", .reproduction = "zig build test-crypto-vectors" },
     .{ .id = "ed25519-rfc8032-test-1", .algorithm = .{ .signature = .ed25519 }, .providers = pure_zig_only, .class = .positive, .source = "RFC 8032 Section 7.1", .license = "IETF Trust", .reproduction = "published RFC vector" },
     .{ .id = "ed25519-signature-rejection", .algorithm = .{ .signature = .ed25519 }, .providers = pure_zig_only, .class = .negative, .source = "provider contract", .license = "project fixture", .reproduction = "zig build test-crypto-vectors" },
-    .{ .id = "rsa-pss-unsupported", .algorithm = .{ .signature = .rsa_pss_rsae_sha256 }, .providers = pure_zig_only, .class = .negative, .source = "provider capability matrix", .license = "project fixture", .reproduction = "zig build test-crypto-vectors" },
     .{ .id = "deterministic-entropy-positive", .algorithm = .{ .entropy = .injected_random_bytes }, .providers = pure_zig_only, .class = .positive, .source = "provider contract", .license = "project fixture", .reproduction = "zig build test-crypto-vectors" },
     .{ .id = "secure-zero-positive", .algorithm = .{ .entropy = .secure_zero }, .providers = pure_zig_only, .class = .positive, .source = "provider contract", .license = "project fixture", .reproduction = "zig build test-crypto-vectors" },
     .{ .id = "constant-time-compare-positive", .algorithm = .{ .entropy = .constant_time_compare }, .providers = pure_zig_only, .class = .positive, .source = "provider contract", .license = "project fixture", .reproduction = "zig build test-crypto-vectors" },
@@ -520,13 +519,12 @@ fn runEntropyAndSecretHelperVectors(log: *ExecutionLog) !void {
 
 fn runUnsupportedCapabilityVectors(log: *ExecutionLog) !void {
     _ = try log.execute("secp256r1-unsupported");
-    _ = try log.execute("rsa-pss-unsupported");
     const cp = cryptoProvider();
     var scalar: [32]u8 = undefined;
     var public: [65]u8 = undefined;
     try testing.expectError(error.UnsupportedCapability, cp.generateKeyShare(.secp256r1, &public, &scalar));
     try testing.expectError(error.UnsupportedCapability, cp.deriveSharedSecret(.secp256r1, &scalar, public[0..32], &scalar));
-    try testing.expectError(error.UnsupportedCapability, cp.verify(.rsa_pss_rsae_sha256, "", "", ""));
+    try testing.expectError(error.InvalidInput, cp.verify(.rsa_pss_rsae_sha256, "", "", ""));
 }
 
 test "crypto vector suite executes registered coverage" {

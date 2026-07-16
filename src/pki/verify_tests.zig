@@ -65,19 +65,16 @@ test "self-signed Ed25519 and ECDSA-P256 certificates verify" {
     }
 }
 
-test "RSA-PSS is classified but deferred, so it fails closed" {
+test "RSA-PSS certificate verifies with the pure-Zig provider" {
     const allocator = testing.allocator;
     var det: crypto.pure_zig.DeterministicEntropy = undefined;
     var prov: crypto.pure_zig.Provider = undefined;
     const cp = testProvider(&det, &prov);
 
-    // A valid RSA-PSS certificate: the algorithm and parameters resolve, but
-    // the provider does not yet offer PSS verification, so the capability gate
-    // fails it closed rather than mis-verifying it.
     var rp = try Loaded.init(allocator, rsa_pss_crt);
     defer rp.deinit(allocator);
     try testing.expectEqual(x509.SignatureAlgorithm.rsa_pss, rp.cert.signatureAlgorithm());
-    try testing.expectError(error.UnsupportedSignatureAlgorithm, verify.verifySelfSignature(cp, &rp.cert));
+    try verify.verifySelfSignature(cp, &rp.cert);
 }
 
 test "the three matrix schemes classify to the right key types" {

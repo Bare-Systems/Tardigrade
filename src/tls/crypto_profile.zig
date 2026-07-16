@@ -103,11 +103,10 @@ test "TLS policy capabilities are derived from provider support" {
     try std.testing.expectEqual(policy_mod.CipherSuite.tls_chacha20_poly1305_sha256, tls_caps.cipher_suites[2]);
     try std.testing.expectEqual(@as(usize, 1), tls_caps.named_groups_len);
     try std.testing.expectEqual(policy_mod.NamedGroup.x25519, tls_caps.named_groups[0]);
-    // Ed25519 and ECDSA-P256/SHA-256 verification are provider-backed since
-    // #343; RSA-PSS is deferred pending a conformant PSS verifier.
-    try std.testing.expectEqual(@as(usize, 2), tls_caps.signature_schemes_len);
+    try std.testing.expectEqual(@as(usize, 3), tls_caps.signature_schemes_len);
     try std.testing.expectEqual(policy_mod.SignatureScheme.ed25519, tls_caps.signature_schemes[0]);
     try std.testing.expectEqual(policy_mod.SignatureScheme.ecdsa_secp256r1_sha256, tls_caps.signature_schemes[1]);
+    try std.testing.expectEqual(policy_mod.SignatureScheme.rsa_pss_rsae_sha256, tls_caps.signature_schemes[2]);
 }
 
 test "hand-written TLS policy capabilities are rejected when provider cannot support them" {
@@ -120,10 +119,7 @@ test "hand-written TLS policy capabilities are rejected when provider cannot sup
     const bad_groups = [_]policy_mod.NamedGroup{.secp256r1};
     try std.testing.expectError(error.UnsupportedCapability, validateAgainstProvider(caps, .{ .named_groups = &bad_groups }));
 
-    // RSA schemes remain unsupported: PKCS#1 v1.5 is out of scope, and RSA-PSS
-    // is deferred pending a conformant PSS verifier.
+    // PKCS#1 v1.5 remains outside the provider profile.
     const bad_pkcs1 = [_]policy_mod.SignatureScheme{.rsa_pkcs1_sha256};
     try std.testing.expectError(error.UnsupportedCapability, validateAgainstProvider(caps, .{ .signature_schemes = &bad_pkcs1 }));
-    const bad_pss = [_]policy_mod.SignatureScheme{.rsa_pss_rsae_sha256};
-    try std.testing.expectError(error.UnsupportedCapability, validateAgainstProvider(caps, .{ .signature_schemes = &bad_pss }));
 }

@@ -14,6 +14,7 @@
 //! - `identity` — SAN-only DNS/IP service identity matching (RFC 9525)
 //! - `verify` — certificate signature verification via the crypto provider
 //! - `path_builder` — deterministic candidate certification-path construction
+//! - `path_validator` — deterministic RFC 5280 candidate-path validation
 //!
 //! ## Policy summary
 //!
@@ -38,6 +39,7 @@ pub const x509 = @import("x509.zig");
 pub const identity = @import("identity.zig");
 pub const verify = @import("verify.zig");
 pub const path_builder = @import("path_builder.zig");
+pub const path_validator = @import("path_validator.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());
@@ -47,4 +49,5 @@ test {
     _ = @import("identity_tests.zig");
     _ = @import("verify_tests.zig");
     _ = @import("path_builder_tests.zig");
+    _ = @import("path_validator_tests.zig");
 }

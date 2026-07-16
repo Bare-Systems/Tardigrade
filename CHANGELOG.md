@@ -5,6 +5,28 @@ All notable user-facing changes to Tardigrade are documented here.
 ## [Unreleased]
 
 ### Features
+- **Deterministic RFC 5280 path-validation core (#345, epic #324)** — adds
+  `src/pki/path_validator.zig`, an iterative, offline validator for
+  `path_builder` candidate paths. It authenticates terminal anchors against
+  the configured anchor source, verifies every child signature through the
+  crypto-provider seam (without requiring an anchor self-signature), applies
+  injected-time validity checks, enforces CA Basic Constraints, self-issued
+  path-length accounting, issuer/leaf Key Usage, server-auth EKU, and
+  fail-closed critical-extension handling, then delegates leaf DNS identity
+  to the existing SAN matcher. Outcomes identify the leaf-first certificate,
+  extension OID where relevant, and a stable reason rather than collapsing
+  failures into one certificate error; alternate candidates continue until
+  one validates, and accepted element slices have explicit ownership. Anchor
+  validity is opt-in, while absent KU/EKU is unrestricted per RFC 5280.
+  Name Constraints and certificate-policy processing remain deferred under
+  #345: any Name Constraints extension fails closed, noncritical
+  certificatePolicies use the implicit any-policy policy, and critical policy
+  extensions are rejected until full processing is implemented.
+  Deterministic, real-signature Ed25519 fixtures cover valid/direct and
+  alternate chains, signature defect classes, time boundaries, CA/KU/EKU,
+  pathLen/self-issued behavior, extension criticality/duplicates, identity,
+  malformed paths, configured-anchor provenance, bounds, and allocation
+  failure under `zig build test-pki`.
 - **Deterministic X.509 candidate-path construction (#344, epic #324)** — adds
   `src/pki/path_builder.zig`, which builds candidate certification paths from
   a leaf certificate, peer-supplied intermediates, and configured trust

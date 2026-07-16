@@ -174,12 +174,14 @@ fn parseCorpus(backing_allocator: std.mem.Allocator, input: []const u8, limits: 
     const skipped_suites = try parseSkippedSuites(allocator, try requireArray(root_object, "skippedSuites"), limits);
 
     var seen_cases = std.StringHashMap(void).init(allocator);
+    var parsed_cases: usize = 0;
     var decoded_total: usize = 0;
     const suites = try parseSuites(
         allocator,
         try requireArray(root_object, "suites"),
         allowlist,
         &seen_cases,
+        &parsed_cases,
         &decoded_total,
         limits,
     );
@@ -234,6 +236,7 @@ fn parseSuites(
     array: std.json.Array,
     allowlist: []const Algorithm,
     seen_cases: *std.StringHashMap(void),
+    parsed_cases: *usize,
     decoded_total: *usize,
     limits: Limits,
 ) ![]Suite {
@@ -252,6 +255,7 @@ fn parseSuites(
             algorithm,
             operation,
             seen_cases,
+            parsed_cases,
             decoded_total,
             limits,
         );
@@ -272,6 +276,7 @@ fn parseGroups(
     algorithm: Algorithm,
     operation: Operation,
     seen_cases: *std.StringHashMap(void),
+    parsed_cases: *usize,
     decoded_total: *usize,
     limits: Limits,
 ) ![]Group {
@@ -289,6 +294,7 @@ fn parseGroups(
                 algorithm,
                 operation,
                 seen_cases,
+                parsed_cases,
                 decoded_total,
                 limits,
             ),
@@ -303,6 +309,7 @@ fn parseCases(
     algorithm: Algorithm,
     operation: Operation,
     seen_cases: *std.StringHashMap(void),
+    parsed_cases: *usize,
     decoded_total: *usize,
     limits: Limits,
 ) ![]Case {
@@ -318,6 +325,8 @@ fn parseCases(
 
         const id = try requireId(obj, "id", limits);
         if (seen_cases.contains(id)) return error.DuplicateCaseId;
+        if (parsed_cases.* >= limits.max_cases) return error.TooManyCases;
+        parsed_cases.* += 1;
         try seen_cases.put(id, {});
 
         const classification = try parseClassification(try requireString(obj, "classification", limits));
@@ -387,9 +396,9 @@ fn runCorpus(corpus: *const Corpus) !Report {
 
 fn executeCase(cp: provider.CryptoProvider, suite: Suite, group: Group, case: Case) !void {
     const observed = switch (suite.operation) {
-        .aead_open => executeAeadOpen(cp, suite.algorithm.aead().?, case),
-        .derive_shared_secret => executeX25519(cp, case),
-        .verify => executeEd25519Verify(cp, case),
+        .aead_open => try executeAeadOpen(cp, suite.algorithm.aead().?, case),
+        .derive_shared_secret => try executeX25519(cp, case),
+        .verify => try executeEd25519Verify(cp, case),
     };
     if (observed != case.expected) {
         std.debug.print(
@@ -409,38 +418,38 @@ fn executeCase(cp: provider.CryptoProvider, suite: Suite, group: Group, case: Ca
     }
 }
 
-fn executeAeadOpen(cp: provider.CryptoProvider, aead: provider.Aead, case: Case) Expected {
-    const plaintext = testing.allocator.alloc(u8, case.ciphertext.len) catch return .invalid_input;
+fn executeAeadOpen(cp: provider.CryptoProvider, aead: provider.Aead, case: Case) !Expected {
+    const plaintext = try testing.allocator.alloc(u8, case.ciphertext.len);
     defer testing.allocator.free(plaintext);
     cp.aeadOpen(aead, case.key, case.nonce, case.aad, case.ciphertext, case.tag, plaintext) catch |err| {
-        return observedFromError(err);
+        return try observedFromError(err);
     };
     if (!std.mem.eql(u8, plaintext, case.message)) return .authentication_failed;
     return .success;
 }
 
-fn executeX25519(cp: provider.CryptoProvider, case: Case) Expected {
+fn executeX25519(cp: provider.CryptoProvider, case: Case) !Expected {
     var out: [provider.max_shared_secret_len]u8 = undefined;
     if (case.shared.len > out.len) return .invalid_input;
     cp.deriveSharedSecret(.x25519, case.private_key, case.public_key, out[0..case.shared.len]) catch |err| {
-        return observedFromError(err);
+        return try observedFromError(err);
     };
     if (!std.mem.eql(u8, out[0..case.shared.len], case.shared)) return .authentication_failed;
     return .success;
 }
 
-fn executeEd25519Verify(cp: provider.CryptoProvider, case: Case) Expected {
+fn executeEd25519Verify(cp: provider.CryptoProvider, case: Case) !Expected {
     cp.verify(.ed25519, case.public_key, case.message, case.signature) catch |err| {
-        return observedFromError(err);
+        return try observedFromError(err);
     };
     return .success;
 }
 
-fn observedFromError(err: anyerror) Expected {
+fn observedFromError(err: anyerror) !Expected {
     return switch (err) {
         error.AuthenticationFailed => .authentication_failed,
         error.InvalidInput => .invalid_input,
-        else => .invalid_input,
+        else => err,
     };
 }
 
@@ -671,6 +680,8 @@ test "crypto corpus parser rejects bounded failure paths" {
     try testing.expectError(error.OversizedValue, parseCorpus(testing.allocator, minimalCorpus(.oversized_id), .{}));
     try testing.expectError(error.DuplicateCaseId, parseCorpus(testing.allocator, minimalCorpus(.duplicate_case_id), .{}));
     try testing.expectError(error.UnknownField, parseCorpus(testing.allocator, minimalCorpus(.unknown_field), .{}));
+    try testing.expectError(error.TooManyCases, parseCorpus(testing.allocator, twoGroupCorpus(), .{ .max_cases = 1 }));
+    try testing.expectError(error.UnsupportedCapability, observedFromError(error.UnsupportedCapability));
 }
 
 test "crypto corpus executes through provider and registered manifest" {
@@ -759,4 +770,59 @@ fn minimalCorpus(comptime kind: MinimalKind) []const u8 {
         \\  }}]
         \\}}
     , .{ schema, source, algorithm, case_id, classification, key_hex, extra, second_case });
+}
+
+fn twoGroupCorpus() []const u8 {
+    return std.fmt.comptimePrint(
+        \\{{
+        \\  "schema": "{s}",
+        \\  "source": {{"name": "x", "repository": "x", "commit": "x", "license": "x", "reducedBy": "x"}},
+        \\  "allowlist": ["AES-128-GCM"],
+        \\  "skippedSuites": [],
+        \\  "suites": [{{
+        \\    "id": "suite-1",
+        \\    "algorithm": "AES-128-GCM",
+        \\    "operation": "aead-open",
+        \\    "sourceFile": "source.json",
+        \\    "groups": [
+        \\      {{
+        \\        "id": "group-1",
+        \\        "upstreamGroupIndex": 0,
+        \\        "cases": [{{
+        \\          "id": "case-1",
+        \\          "upstreamTcId": 1,
+        \\          "classification": "valid",
+        \\          "expected": "success",
+        \\          "comment": "",
+        \\          "flags": [],
+        \\          "key": "00000000000000000000000000000000",
+        \\          "nonce": "000000000000000000000000",
+        \\          "aad": "",
+        \\          "message": "",
+        \\          "ciphertext": "",
+        \\          "tag": "00000000000000000000000000000000"
+        \\        }}]
+        \\      }},
+        \\      {{
+        \\        "id": "group-2",
+        \\        "upstreamGroupIndex": 1,
+        \\        "cases": [{{
+        \\          "id": "case-2",
+        \\          "upstreamTcId": 2,
+        \\          "classification": "valid",
+        \\          "expected": "success",
+        \\          "comment": "",
+        \\          "flags": [],
+        \\          "key": "00000000000000000000000000000000",
+        \\          "nonce": "000000000000000000000000",
+        \\          "aad": "",
+        \\          "message": "",
+        \\          "ciphertext": "",
+        \\          "tag": "00000000000000000000000000000000"
+        \\        }}]
+        \\      }}
+        \\    ]
+        \\  }}]
+        \\}}
+    , .{schema_version});
 }

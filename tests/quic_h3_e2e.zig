@@ -244,7 +244,7 @@ const Sim = struct {
     };
 
     const FailureSnapshot = struct {
-        reason: HarnessFailure,
+        reason: anyerror,
         scenario: []const u8,
         seed: u64,
         now_us: u64,
@@ -327,39 +327,44 @@ const Sim = struct {
         self.allocator.destroy(self);
     }
 
-    fn fail(self: *Sim, reason: HarnessFailure) HarnessFailure {
-        if (self.last_failure == null) {
-            self.last_failure = .{
-                .reason = reason,
-                .scenario = self.scenario,
-                .seed = self.seed,
-                .now_us = self.now_us,
-                .iterations = self.iterations,
-                .timer_events = self.timer_events,
-                .queued_datagrams = self.network.queuedDatagrams(),
-                .queued_bytes = self.network.queuedBytes(),
-                .client_state = self.client.state(),
-                .server_state = self.server.state(),
-            };
-            if (self.log_failures) {
-                const failure = self.last_failure.?;
-                std.log.err(
-                    "QUIC/H3 scenario '{s}' seed=0x{x} failed: {s}; now_us={d} iterations={d} timer_events={d} queued={d}/{d}B client={s} server={s}",
-                    .{
-                        failure.scenario,
-                        failure.seed,
-                        @errorName(failure.reason),
-                        failure.now_us,
-                        failure.iterations,
-                        failure.timer_events,
-                        failure.queued_datagrams,
-                        failure.queued_bytes,
-                        @tagName(failure.client_state),
-                        @tagName(failure.server_state),
-                    },
-                );
-            }
-        }
+    fn recordFailure(self: *Sim, reason: anyerror) void {
+        if (self.last_failure != null) return;
+        self.last_failure = .{
+            .reason = reason,
+            .scenario = self.scenario,
+            .seed = self.seed,
+            .now_us = self.now_us,
+            .iterations = self.iterations,
+            .timer_events = self.timer_events,
+            .queued_datagrams = self.network.queuedDatagrams(),
+            .queued_bytes = self.network.queuedBytes(),
+            .client_state = self.client.state(),
+            .server_state = self.server.state(),
+        };
+        if (self.log_failures) self.logFailure();
+    }
+
+    fn logFailure(self: *const Sim) void {
+        const failure = self.last_failure.?;
+        std.log.err(
+            "QUIC/H3 scenario '{s}' seed=0x{x} failed: {s}; now_us={d} iterations={d} timer_events={d} queued={d}/{d}B client={s} server={s}",
+            .{
+                failure.scenario,
+                failure.seed,
+                @errorName(failure.reason),
+                failure.now_us,
+                failure.iterations,
+                failure.timer_events,
+                failure.queued_datagrams,
+                failure.queued_bytes,
+                @tagName(failure.client_state),
+                @tagName(failure.server_state),
+            },
+        );
+    }
+
+    fn fail(self: *Sim, reason: anyerror) anyerror {
+        self.recordFailure(reason);
         return reason;
     }
 
@@ -377,6 +382,16 @@ const Sim = struct {
         self.client.onTimeout(self.now_us);
         self.server.onTimeout(self.now_us);
         self.timer_events += 1;
+    }
+
+    fn advanceAndFireTimers(self: *Sim, delta_us: u64) !void {
+        const target = std.math.add(u64, self.now_us, delta_us) catch
+            return self.fail(error.SimulatedTimeLimit);
+        if (target - self.started_at_us > self.limits.max_simulated_time_us) {
+            return self.fail(error.SimulatedTimeLimit);
+        }
+        self.now_us = target;
+        try self.fireTimers();
     }
 
     /// One simulation step: flush transmit queues, deliver due datagrams,
@@ -420,9 +435,7 @@ const Sim = struct {
             try self.fireTimers();
             return true;
         }
-        self.now_us = target;
-        if (self.now_us - self.started_at_us > self.limits.max_simulated_time_us) return self.fail(error.SimulatedTimeLimit);
-        try self.fireTimers();
+        try self.advanceAndFireTimers(target - self.now_us);
         return true;
     }
 
@@ -517,6 +530,7 @@ fn runH3Exchange(sim: *Sim) !void {
 test "e2e: lossless handshake, SETTINGS, request/response, clean close" {
     var sim = try Sim.init(testing.allocator, .{ .scenario = "lossless" });
     defer sim.deinit();
+    errdefer |err| sim.recordFailure(err);
     try runH3Exchange(sim);
 
     // Clean close: client closes, server drains, both reach closed.
@@ -526,9 +540,7 @@ test "e2e: lossless handshake, SETTINGS, request/response, clean close" {
         if (!try sim.step()) break;
     }
     // Force the 3×PTO close/drain timers if the pipes went quiet first.
-    sim.now_us += 10_000_000;
-    sim.client.onTimeout(sim.now_us);
-    sim.server.onTimeout(sim.now_us);
+    try sim.advanceAndFireTimers(10_000_000);
     try testing.expectEqual(connection.State.closed, sim.client.state());
     try testing.expectEqual(connection.State.closed, sim.server.state());
     const info = sim.server.closeInfo().?;
@@ -543,6 +555,7 @@ test "e2e: lost client Initial recovers via PTO" {
         .to_server = .{ .drop = &.{0} },
     });
     defer sim.deinit();
+    errdefer |err| sim.recordFailure(err);
     try runH3Exchange(sim);
     try testing.expect(sim.client.metrics.pto_count_total > 0);
 }
@@ -554,6 +567,7 @@ test "e2e: lost server handshake flight recovers" {
         .to_client = .{ .drop = &.{1} },
     });
     defer sim.deinit();
+    errdefer |err| sim.recordFailure(err);
     try runH3Exchange(sim);
 }
 
@@ -565,6 +579,7 @@ test "e2e: lost 1-RTT request datagram recovers" {
         .to_server = .{ .drop = &.{ 3, 4 } },
     });
     defer sim.deinit();
+    errdefer |err| sim.recordFailure(err);
     try runH3Exchange(sim);
 }
 
@@ -575,6 +590,7 @@ test "e2e: reordered datagrams still complete the exchange" {
         .to_client = .{ .swap = &.{3} },
     });
     defer sim.deinit();
+    errdefer |err| sim.recordFailure(err);
     try runH3Exchange(sim);
 }
 
@@ -585,6 +601,7 @@ test "e2e: duplicated datagrams are idempotent" {
         .to_client = .{ .duplicate = &.{ 1, 2 } },
     });
     defer sim.deinit();
+    errdefer |err| sim.recordFailure(err);
     try runH3Exchange(sim);
 }
 
@@ -595,12 +612,14 @@ test "e2e: loss in both directions during the handshake" {
         .to_client = .{ .drop = &.{0} },
     });
     defer sim.deinit();
+    errdefer |err| sim.recordFailure(err);
     try runH3Exchange(sim);
 }
 
 test "e2e: stream reset propagates across the simulated network" {
     var sim = try Sim.init(testing.allocator, .{ .scenario = "stream-reset" });
     defer sim.deinit();
+    errdefer |err| sim.recordFailure(err);
     try sim.runUntil(Sim.bothEstablished, 30_000_000);
 
     const id = try sim.client.openStream(.bidi);
@@ -628,6 +647,7 @@ test "e2e: flow-control blocking then resumed progress under tiny windows" {
         },
     });
     defer sim.deinit();
+    errdefer |err| sim.recordFailure(err);
     try sim.runUntil(Sim.bothEstablished, 30_000_000);
 
     const id = try sim.client.openStream(.bidi);
@@ -660,6 +680,7 @@ test "e2e: flow-control blocking then resumed progress under tiny windows" {
 test "e2e: repeated request/response loop on one connection" {
     var sim = try Sim.init(testing.allocator, .{ .scenario = "repeated-requests" });
     defer sim.deinit();
+    errdefer |err| sim.recordFailure(err);
     try sim.runUntil(Sim.bothEstablished, 30_000_000);
 
     var client_h3 = H3.init(sim.allocator, .client);
@@ -705,7 +726,7 @@ test "e2e: repeated request/response loop on one connection" {
     try testing.expectEqual(@as(u64, 12), client_h3.metrics.responses_decoded);
 }
 
-fn expectFailureSnapshot(sim: *Sim, expected: HarnessFailure, scenario: []const u8, seed: u64) !void {
+fn expectFailureSnapshot(sim: *Sim, expected: anyerror, scenario: []const u8, seed: u64) !void {
     const failure = sim.last_failure orelse return error.MissingFailureSnapshot;
     try testing.expectEqual(expected, failure.reason);
     try testing.expectEqualStrings(scenario, failure.scenario);
@@ -718,11 +739,17 @@ test "e2e harness: scenario seed reproduces the protected wire image" {
     const seed = 0x247_d37e;
     var first = try Sim.init(testing.allocator, .{ .scenario = "seed-first", .seed = seed });
     defer first.deinit();
+    errdefer |err| first.recordFailure(err);
     var second = try Sim.init(testing.allocator, .{ .scenario = "seed-second", .seed = seed });
     defer second.deinit();
+    errdefer |err| second.recordFailure(err);
+    var different = try Sim.init(testing.allocator, .{ .scenario = "seed-different", .seed = seed + 1 });
+    defer different.deinit();
+    errdefer |err| different.recordFailure(err);
 
     try testing.expect(try first.step());
     try testing.expect(try second.step());
+    try testing.expect(try different.step());
     try testing.expectEqual(@as(usize, 1), first.network.to_server.queue.items.len);
     try testing.expectEqual(@as(usize, 1), second.network.to_server.queue.items.len);
     const first_initial = first.network.to_server.queue.items[0];
@@ -733,6 +760,71 @@ test "e2e harness: scenario seed reproduces the protected wire image" {
         first_initial.bytes[0..first_initial.len],
         second_initial.bytes[0..second_initial.len],
     );
+
+    const different_initial = different.network.to_server.queue.items[0];
+    try testing.expect(
+        first_initial.len != different_initial.len or
+            !std.mem.eql(
+                u8,
+                first_initial.bytes[0..first_initial.len],
+                different_initial.bytes[0..different_initial.len],
+            ),
+    );
+}
+
+test "e2e harness: ordinary scenario errors retain deterministic context" {
+    const scenario = "ordinary-protocol-error";
+    const seed = 0x247_fa11;
+    var sim = try Sim.init(testing.allocator, .{
+        .scenario = scenario,
+        .seed = seed,
+        .log_failures = false,
+    });
+    defer sim.deinit();
+    errdefer |err| sim.recordFailure(err);
+
+    const client_state = sim.client.state();
+    const server_state = sim.server.state();
+    sim.recordFailure(error.QpackRegression);
+    sim.recordFailure(error.LaterFailureMustNotOverwrite);
+
+    try expectFailureSnapshot(sim, error.QpackRegression, scenario, seed);
+    try testing.expectEqual(client_state, sim.last_failure.?.client_state);
+    try testing.expectEqual(server_state, sim.last_failure.?.server_state);
+}
+
+test "e2e network: datagram limit is aggregate across directions" {
+    var network = TestNetwork{
+        .to_server = .{ .rules = .{} },
+        .to_client = .{ .rules = .{} },
+        .limits = .{ .max_queued_datagrams = 1 },
+    };
+    defer network.deinit(testing.allocator);
+
+    const byte = [_]u8{0xaa};
+    try network.enqueue(testing.allocator, .to_server, &byte, 0);
+    try testing.expectError(
+        error.QueueDatagramLimit,
+        network.enqueue(testing.allocator, .to_client, &byte, 0),
+    );
+    try testing.expectEqual(@as(usize, 1), network.queuedDatagrams());
+}
+
+test "e2e network: byte limit is aggregate across directions" {
+    var network = TestNetwork{
+        .to_server = .{ .rules = .{} },
+        .to_client = .{ .rules = .{} },
+        .limits = .{ .max_queued_bytes = 1 },
+    };
+    defer network.deinit(testing.allocator);
+
+    const byte = [_]u8{0xbb};
+    try network.enqueue(testing.allocator, .to_server, &byte, 0);
+    try testing.expectError(
+        error.QueueByteLimit,
+        network.enqueue(testing.allocator, .to_client, &byte, 0),
+    );
+    try testing.expectEqual(@as(usize, 1), network.queuedBytes());
 }
 
 test "e2e harness: queued datagram limit bounds duplication" {
@@ -746,6 +838,7 @@ test "e2e harness: queued datagram limit bounds duplication" {
         .log_failures = false,
     });
     defer sim.deinit();
+    errdefer |err| sim.recordFailure(err);
 
     try testing.expectError(error.QueueDatagramLimit, sim.step());
     try expectFailureSnapshot(sim, error.QueueDatagramLimit, scenario, seed);
@@ -763,6 +856,7 @@ test "e2e harness: queued byte limit rejects oversized aggregate" {
         .log_failures = false,
     });
     defer sim.deinit();
+    errdefer |err| sim.recordFailure(err);
 
     try testing.expectError(error.QueueByteLimit, sim.step());
     try expectFailureSnapshot(sim, error.QueueByteLimit, scenario, seed);
@@ -778,6 +872,7 @@ test "e2e harness: packet production per iteration is bounded" {
         .log_failures = false,
     });
     defer sim.deinit();
+    errdefer |err| sim.recordFailure(err);
 
     try testing.expectError(error.PacketProductionLimit, sim.step());
     try expectFailureSnapshot(sim, error.PacketProductionLimit, scenario, seed);
@@ -793,6 +888,7 @@ test "e2e harness: iteration limit fails at an exact boundary" {
         .log_failures = false,
     });
     defer sim.deinit();
+    errdefer |err| sim.recordFailure(err);
 
     try testing.expectError(error.IterationLimit, sim.step());
     try expectFailureSnapshot(sim, error.IterationLimit, scenario, seed);
@@ -810,6 +906,7 @@ test "e2e harness: timer event limit bounds repeated PTO work" {
         .log_failures = false,
     });
     defer sim.deinit();
+    errdefer |err| sim.recordFailure(err);
 
     try testing.expect(try sim.step()); // Produce and deterministically drop Initial.
     try testing.expectError(error.TimerEventLimit, sim.step());
@@ -828,6 +925,7 @@ test "e2e harness: simulated elapsed time is bounded without sleeping" {
         .log_failures = false,
     });
     defer sim.deinit();
+    errdefer |err| sim.recordFailure(err);
 
     try testing.expect(try sim.step()); // Queue the Initial for delayed delivery.
     try testing.expectError(error.SimulatedTimeLimit, sim.step());
@@ -843,10 +941,10 @@ test "e2e harness: unexpected closure records endpoint states" {
         .log_failures = false,
     });
     defer sim.deinit();
+    errdefer |err| sim.recordFailure(err);
 
     sim.client.close(0x247, "closed before establishment", sim.now_us);
-    sim.now_us += 10_000_000;
-    sim.client.onTimeout(sim.now_us);
+    try sim.advanceAndFireTimers(10_000_000);
     try testing.expectEqual(connection.State.closed, sim.client.state());
     try testing.expectError(error.UnexpectedConnectionClosure, sim.runUntil(Sim.bothEstablished, 1_000_000));
     try expectFailureSnapshot(sim, error.UnexpectedConnectionClosure, scenario, seed);

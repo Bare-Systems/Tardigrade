@@ -26,7 +26,7 @@
 //!     derivation (the signature scheme over the same curve is implemented;
 //!     the ECDH group is not)
 //! RSA-PSS-RSAE/SHA-256 verification is implemented in `rsa.zig` with strict
-//! DER, RSA key-size, and EMSA-PSS validation.
+//! DER, 2048/3072/4096-bit RSA key-size, and EMSA-PSS validation.
 //!
 //! The provider never draws ambient randomness: it fills key-share scalars and
 //! any per-signature noise from the `provider.Entropy` handed in at

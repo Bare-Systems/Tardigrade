@@ -95,7 +95,8 @@ fn verifyPss(em: []const u8, em_bits: usize, message: []const u8) Error!void {
     const unused_bits = 8 * em.len - em_bits;
     if (unused_bits > 7) return error.InvalidInput;
     // This mask preserves the meaningful low bits and excludes the unused
-    // high-order bits required to be zero by RFC 8017.
+    // high-order bits required to be zero by RFC 8017. With zero unused bits
+    // it is intentionally 0xff.
     const unused_mask: u8 = 0xff >> unused_bits;
     // RFC 8017 requires the unused high bits of maskedDB to be zero.
     if (masked_db[0] & ~unused_mask != 0) return error.InvalidInput;
@@ -106,7 +107,7 @@ fn verifyPss(em: []const u8, em_bits: usize, message: []const u8) Error!void {
     var mask: [max_modulus_bytes]u8 = undefined;
     const h_array = h[0..h_len].*;
     mgf1(&h_array, mask[0..db_len]);
-    for (db[0..db_len], masked_db, mask[0..db_len]) |*out, masked, mask_byte| out.* = masked ^ mask_byte;
+    for (db[0..db_len], masked_db, mask[0..db_len]) |*out, masked, mask_val| out.* = masked ^ mask_val;
     // Clear the unused high bits of DB before checking its zero-padding PS.
     db[0] &= unused_mask;
 
@@ -117,7 +118,8 @@ fn verifyPss(em: []const u8, em_bits: usize, message: []const u8) Error!void {
     var hash_input: [8 + h_len + salt_len]u8 = undefined;
     @memset(hash_input[0..8], 0);
     @memcpy(hash_input[8 .. 8 + h_len], &m_hash);
-    @memcpy(hash_input[8 + h_len ..], db[ps_len + 1 ..]);
+    const salt = db[ps_len + 1 ..];
+    @memcpy(hash_input[8 + h_len ..], salt);
     var expected: [h_len]u8 = undefined;
     Sha256.hash(&hash_input, &expected, .{});
     if (!crypto.timing_safe.eql([h_len]u8, expected, h_array)) return error.InvalidInput;

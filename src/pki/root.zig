@@ -15,6 +15,7 @@
 //! - `verify` — certificate signature verification via the crypto provider
 //! - `path_builder` — deterministic candidate certification-path construction
 //! - `path_validator` — deterministic RFC 5280 candidate-path validation
+//! - `name_constraints` — bounded RFC 5280 permitted/excluded subtree state
 //!
 //! ## Policy summary
 //!
@@ -39,6 +40,7 @@ pub const x509 = @import("x509.zig");
 pub const identity = @import("identity.zig");
 pub const verify = @import("verify.zig");
 pub const path_builder = @import("path_builder.zig");
+pub const name_constraints = @import("name_constraints.zig");
 pub const path_validator = @import("path_validator.zig");
 
 test {

@@ -420,6 +420,22 @@ pub fn build(b: *std.Build) void {
     const pki_step = b.step("test-pki", "Run pure-Zig PKI DER unit tests");
     pki_step.dependOn(&run_pki_tests.step);
     test_step.dependOn(&run_pki_tests.step);
+
+    // Optional out-of-process OpenSSL differential checks for the fixed Name
+    // Constraints fixture matrix.  This is intentionally not part of the
+    // ordinary offline `test` or `test-pki` targets.
+    const pki_openssl_diff_mod = b.createModule(.{
+        .root_source_file = b.path("tests/pki_openssl_diff.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    pki_openssl_diff_mod.addImport("crypto", crypto_mod);
+    pki_openssl_diff_mod.addImport("pki", pki_mod);
+    pki_openssl_diff_mod.addImport("zig_compat", compat_mod);
+    const pki_openssl_diff_tests = b.addTest(.{ .root_module = pki_openssl_diff_mod });
+    const run_pki_openssl_diff_tests = b.addRunArtifact(pki_openssl_diff_tests);
+    const pki_openssl_diff_step = b.step("test-pki-openssl", "Compare Name Constraints fixtures with OpenSSL");
+    pki_openssl_diff_step.dependOn(&run_pki_openssl_diff_tests.step);
 }
 
 fn pathExists(path: []const u8) bool {

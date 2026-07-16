@@ -943,6 +943,21 @@ test "domainComponent RDN values compare with caseIgnoreIA5Match" {
     try testing.expect(!upper.eqlForChaining(&different));
 }
 
+test "directoryName subtree matching reuses canonical RDN prefix keys" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    const base = try x509.parseNameRaw(arena, try dnWithDomainComponents(arena, &.{"EXAMPLE"}, 0x16), .{});
+    const descendant = try x509.parseNameRaw(arena, try dnWithDomainComponents(arena, &.{ "example", "COM" }, 0x16), .{});
+    const sibling = try x509.parseNameRaw(arena, try dnWithDomainComponents(arena, &.{ "other", "COM" }, 0x16), .{});
+
+    try testing.expect(descendant.isWithinSubtree(&base));
+    try testing.expect(base.isWithinSubtree(&base));
+    try testing.expect(!base.isWithinSubtree(&descendant));
+    try testing.expect(!sibling.isWithinSubtree(&base));
+}
+
 test "isSelfIssued uses RFC 4518 name chaining, not encoding equality" {
     var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_inst.deinit();

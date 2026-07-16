@@ -29,8 +29,10 @@ CRYPTO-frame transport and packet-key installation.**
 
 2. `src/tls/` is the protocol-neutral TLS 1.3 core. `state.zig` defines roles,
    handshake states, and the explicit `quic` versus `record` transport modes;
-   `handshake.zig` owns bounded handshake reassembly, transcript updates,
-   message ordering, and explicit traffic-secret epoch lifecycle;
+   `handshake.zig` owns bounded handshake reassembly, the shared reader/writer,
+   transcript updates, message ordering, and explicit traffic-secret epoch
+   lifecycle; the QUIC backend consumes those codecs rather than defining a
+   second wire-helper implementation;
    `events.zig` defines transport-neutral handshake byte, traffic-secret,
    certificate, ALPN, discard, completion, and TLS-level typed failure
    vocabulary shared by QUIC and future record mode; `transport.zig` defines

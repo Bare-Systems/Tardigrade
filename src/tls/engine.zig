@@ -162,6 +162,19 @@ test "core engine can be instantiated for record mode without record framing" {
     try std.testing.expectEqual(state.HandshakeState.idle, engine.handshake_state);
 }
 
+test "engine drives protocol-neutral handshake state" {
+    var engine = Engine.init(.{ .role = .server, .transport_mode = .record });
+    engine.start();
+
+    var buffer: [32]u8 = undefined;
+    var writer = handshake.Writer{ .buf = &buffer };
+    try writer.u8_(@intFromEnum(handshake.MessageType.client_hello));
+    const length = try writer.reserve(3);
+    writer.patch(3, length);
+    _ = try engine.receiveHandshake(writer.written());
+    try std.testing.expectEqual(state.HandshakeState.server_hello, engine.handshake_state);
+}
+
 test "generic driver starts backend and stores emitted events" {
     const T = @import("transport.zig").Contract(void, enum { initial }, error{ InvalidHandshakeState, TransportBufferOverflow });
     const D = Driver(T);

@@ -23,6 +23,7 @@ const varint = @import("quic_varint");
 const tls_adapter = @import("tls_adapter.zig");
 const tls_handshake = @import("tls_handshake.zig");
 const tls_key_schedule = @import("tls_core").key_schedule;
+const tls_handshake_codec = @import("tls_core").handshake;
 
 const crypto = std.crypto;
 const X25519 = crypto.dh.X25519;
@@ -36,6 +37,8 @@ const HandshakeError = tls_handshake.HandshakeError;
 const EventSink = tls_handshake.EventSink;
 const TlsBackend = tls_handshake.TlsBackend;
 const Role = tls_handshake.Role;
+const Reader = tls_handshake_codec.Reader;
+const Writer = tls_handshake_codec.Writer;
 
 pub const hash_len = tls_key_schedule.hash_len;
 const TranscriptHash = tls_key_schedule.TranscriptHash;
@@ -293,52 +296,9 @@ fn integerParameter(value_bytes: []const u8) HandshakeError!u64 {
     return decoded.value;
 }
 
-// ===========================================================================
-// Bounded wire readers/writers for handshake messages.
-// ===========================================================================
-
-const Reader = struct {
-    bytes: []const u8,
-    offset: usize = 0,
-
-    fn remaining(self: *const Reader) usize {
-        return self.bytes.len - self.offset;
-    }
-
-    fn u8_(self: *Reader) HandshakeError!u8 {
-        if (self.remaining() < 1) return error.MalformedHandshake;
-        defer self.offset += 1;
-        return self.bytes[self.offset];
-    }
-
-    fn u16_(self: *Reader) HandshakeError!u16 {
-        if (self.remaining() < 2) return error.MalformedHandshake;
-        defer self.offset += 2;
-        return std.mem.readInt(u16, self.bytes[self.offset..][0..2], .big);
-    }
-
-    fn u24_(self: *Reader) HandshakeError!u24 {
-        if (self.remaining() < 3) return error.MalformedHandshake;
-        defer self.offset += 3;
-        return std.mem.readInt(u24, self.bytes[self.offset..][0..3], .big);
-    }
-
-    fn slice(self: *Reader, len: usize) HandshakeError![]const u8 {
-        if (self.remaining() < len) return error.MalformedHandshake;
-        defer self.offset += len;
-        return self.bytes[self.offset..][0..len];
-    }
-
-    fn expectEnd(self: *const Reader) HandshakeError!void {
-        if (self.remaining() != 0) return error.MalformedHandshake;
-    }
-};
-
-/// TLS forbids repeating an extension type within one extension block
-/// (RFC 8446 §4.2: "There MUST NOT be more than one extension of the same type
-/// in a given extension block"). Bounded tracker for the streaming parsers;
-/// more than `max_extensions` extensions in one block is treated as malformed
-/// rather than requiring unbounded state.
+// TLS forbids repeating an extension type within one extension block. The
+// tracker stays local because the QUIC backend maps duplicates to its
+// handshake-specific semantic error.
 const ExtensionGuard = struct {
     pub const max_extensions = 64;
 
@@ -356,43 +316,6 @@ const ExtensionGuard = struct {
         if (self.len == self.ids.len) return error.MalformedHandshake;
         self.ids[self.len] = ext_id;
         self.len += 1;
-    }
-};
-
-const Writer = struct {
-    buf: []u8,
-    len: usize = 0,
-
-    fn u8_(self: *Writer, value: u8) HandshakeError!void {
-        try self.bytes(&[_]u8{value});
-    }
-
-    fn u16_(self: *Writer, value: u16) HandshakeError!void {
-        var encoded: [2]u8 = undefined;
-        std.mem.writeInt(u16, &encoded, value, .big);
-        try self.bytes(&encoded);
-    }
-
-    fn bytes(self: *Writer, data: []const u8) HandshakeError!void {
-        if (data.len > self.buf.len - self.len) return error.HandshakeBufferOverflow;
-        @memcpy(self.buf[self.len..][0..data.len], data);
-        self.len += data.len;
-    }
-
-    /// Reserve a big-endian length field of `width` bytes; `patch` writes the
-    /// number of bytes appended since the reservation into it.
-    fn reserve(self: *Writer, comptime width: usize) HandshakeError!usize {
-        const index = self.len;
-        try self.bytes(&([_]u8{0} ** width));
-        return index;
-    }
-
-    fn patch(self: *Writer, comptime width: usize, index: usize) void {
-        const value = self.len - index - width;
-        var encoded: [width]u8 = undefined;
-        const IntT = std.meta.Int(.unsigned, width * 8);
-        std.mem.writeInt(IntT, &encoded, @intCast(value), .big);
-        @memcpy(self.buf[index..][0..width], &encoded);
     }
 };
 

@@ -28,7 +28,7 @@ const traffic_secret_len = tls_adapter.traffic_secret_len;
 
 pub const Role = tls_core.state.Role;
 
-pub const HandshakeError = tls_core.events.HandshakeError || error{
+pub const HandshakeError = tls_core.events.HandshakeError || tls_core.messages.Error || error{
     /// The generic TLS driver was called in an invalid lifecycle state.
     InvalidHandshakeState,
     /// A CRYPTO fragment arrived at a level the handshake never uses (0-RTT).

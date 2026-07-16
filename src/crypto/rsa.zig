@@ -103,8 +103,8 @@ fn verifyPss(em: []const u8, em_bits: usize, message: []const u8) Error!void {
     const masked_db = em[0..db_len];
     const h = em[db_len .. db_len + h_len];
     const unused_bits = 8 * em.len - em_bits;
-    // The guard makes the following cast safe because u3 represents 0..7.
     if (unused_bits > 7) return error.InvalidInput;
+    // The guard makes the following cast safe because u3 represents 0..7.
     const unused_shift: u3 = @intCast(unused_bits);
     // This mask preserves the meaningful low bits and excludes the unused
     // high-order bits required to be zero by RFC 8017. With zero unused bits
@@ -159,7 +159,7 @@ pub fn verifyPssSha256(public_key_der: []const u8, message: []const u8, signatur
 }
 
 fn appendDerLength(out: []u8, index: *usize, length: usize) void {
-    if (length > 0xffff) @panic("DER length exceeds encoder limit");
+    if (length > 0xffff) std.debug.panic("DER length {d} exceeds encoder limit of 0xffff", .{length});
     if (length <= 0x7f) {
         out[index.*] = @intCast(length);
         index.* += 1;
@@ -282,9 +282,9 @@ test "RSA-PSS rejects signature mutations and out-of-range representatives" {
     var index = greater.len;
     while (index > 0) {
         index -= 1;
-        const sum = @as(u16, greater[index]) + carry;
-        greater[index] = @intCast(sum);
-        carry = @intCast(sum >> 8);
+        const incremented_byte = @as(u16, greater[index]) + carry;
+        greater[index] = @intCast(incremented_byte);
+        carry = @intCast(incremented_byte >> 8);
     }
     try std.testing.expectError(error.AuthenticationFailed, verifyPssSha256(public_key, message, &equal));
     try std.testing.expectError(error.AuthenticationFailed, verifyPssSha256(public_key, message, &greater));

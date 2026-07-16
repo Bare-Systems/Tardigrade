@@ -364,6 +364,12 @@ fn opensslSha256File(allocator: std.mem.Allocator, stage: []const u8, path: []co
     return runOpenSsl(allocator, stage, &.{ openssl.path, "dgst", "-sha256", "-binary", path });
 }
 
+fn expectOpenSslSha256File(allocator: std.mem.Allocator, stage: []const u8, expected: []const u8, path: []const u8) !void {
+    const actual = try opensslSha256File(allocator, stage, path);
+    defer allocator.free(actual);
+    try expectStage(stage, expected, actual);
+}
+
 fn opensslHmacSha256File(
     allocator: std.mem.Allocator,
     stage: []const u8,
@@ -510,9 +516,7 @@ test "OpenSSL digest and HMAC oracles match transcript and Finished values" {
     var transcript = tls_core.transcript.Transcript{};
     transcript.update(&client_hello_1);
     const zig_ch1_hash = transcript.peek();
-    const openssl_ch1_hash = try opensslSha256File(allocator, "tls transcript ClientHello1 hash", client_hello_path);
-    defer allocator.free(openssl_ch1_hash);
-    try expectStage("tls transcript ClientHello1 hash", &zig_ch1_hash, openssl_ch1_hash);
+    try expectOpenSslSha256File(allocator, "tls transcript ClientHello1 hash", &zig_ch1_hash, client_hello_path);
 
     const hello_retry_request = hexBytes("02000002cf21");
     const client_hello_2 = hexBytes("01000002ddee");
@@ -532,9 +536,7 @@ test "OpenSSL digest and HMAC oracles match transcript and Finished values" {
     try tmp.dir.writeFile(io, .{ .sub_path = "synthetic_hrr.bin", .data = &synthetic_and_hrr });
     const synthetic_hrr_path = try tmp.dir.realPathFileAlloc(io, "synthetic_hrr.bin", allocator);
     defer allocator.free(synthetic_hrr_path);
-    const openssl_hrr_hash = try opensslSha256File(allocator, "tls transcript HRR hash", synthetic_hrr_path);
-    defer allocator.free(openssl_hrr_hash);
-    try expectStage("tls transcript HRR hash", &zig_hrr_hash, openssl_hrr_hash);
+    try expectOpenSslSha256File(allocator, "tls transcript HRR hash", &zig_hrr_hash, synthetic_hrr_path);
 
     const traffic_secret = hexBytes("b67b7d690cc16c4e75e54213cb2d37b4e9c912bcded9105d42befd59d391ad38");
     try tmp.dir.writeFile(io, .{ .sub_path = "finished_hash.bin", .data = &zig_hrr_hash });

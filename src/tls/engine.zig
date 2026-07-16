@@ -8,6 +8,7 @@
 const std = @import("std");
 pub const state = @import("state.zig");
 pub const events = @import("events.zig");
+pub const handshake = @import("handshake.zig");
 pub const key_schedule = @import("key_schedule.zig");
 
 pub const EngineConfig = struct {
@@ -18,16 +19,25 @@ pub const EngineConfig = struct {
 pub const Engine = struct {
     config: EngineConfig,
     handshake_state: state.HandshakeState = .idle,
+    core: handshake.Core,
 
     pub fn init(config: EngineConfig) Engine {
-        return .{ .config = config };
+        return .{ .config = config, .core = handshake.Core.init(config.role) };
     }
 
     pub fn start(self: *Engine) void {
-        self.handshake_state = switch (self.config.role) {
-            .client => .client_hello,
-            .server => .idle,
-        };
+        self.core.start();
+        self.handshake_state = self.core.handshake_state;
+    }
+
+    pub fn receiveHandshake(self: *Engine, raw: []const u8) handshake.Error!handshake.Message {
+        const message = try self.core.accept(raw);
+        self.handshake_state = self.core.handshake_state;
+        return message;
+    }
+
+    pub fn transcriptHash(self: *const Engine) [key_schedule.hash_len]u8 {
+        return self.core.transcriptHash();
     }
 
     pub fn canUseRecordLayer(self: *const Engine) bool {

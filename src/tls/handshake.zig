@@ -35,7 +35,7 @@ pub fn Reassembler(comptime capacity: usize) type {
         pub fn next(self: *Self) Error!?Message {
             if (self.len < 4) return null;
             const body_len = std.mem.readInt(u24, self.data[1..4], .big);
-            if (self.data.len < 4 or @as(usize, body_len) > self.data.len - 4)
+            if (@as(usize, body_len) > self.data.len - 4)
                 return error.MalformedHandshake;
             const message_len = 4 + @as(usize, body_len);
             if (self.len < message_len) return null;

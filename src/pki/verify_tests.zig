@@ -65,19 +65,45 @@ test "self-signed Ed25519 and ECDSA-P256 certificates verify" {
     }
 }
 
-test "RSA-PSS is classified but deferred, so it fails closed" {
+test "RSA-PSS certificate verifies with the pure-Zig provider" {
     const allocator = testing.allocator;
     var det: crypto.pure_zig.DeterministicEntropy = undefined;
     var prov: crypto.pure_zig.Provider = undefined;
     const cp = testProvider(&det, &prov);
 
-    // A valid RSA-PSS certificate: the algorithm and parameters resolve, but
-    // the provider does not yet offer PSS verification, so the capability gate
-    // fails it closed rather than mis-verifying it.
     var rp = try Loaded.init(allocator, rsa_pss_crt);
     defer rp.deinit(allocator);
     try testing.expectEqual(x509.SignatureAlgorithm.rsa_pss, rp.cert.signatureAlgorithm());
-    try testing.expectError(error.UnsupportedSignatureAlgorithm, verify.verifySelfSignature(cp, &rp.cert));
+    try verify.verifySelfSignature(cp, &rp.cert);
+
+    const out_of_range = try allocator.dupe(u8, rp.cert.signature_value.data);
+    defer allocator.free(out_of_range);
+    try testing.expectEqual(@as(usize, 256), out_of_range.len);
+    var key_reader = der.Reader.init(rp.cert.subject_public_key_info.subject_public_key.data, .{});
+    var key_sequence = try key_reader.readSequence();
+    const modulus = try key_sequence.readInteger();
+    _ = try key_sequence.readInteger();
+    try key_sequence.expectEnd();
+    try key_reader.expectEnd();
+    try testing.expectEqual(@as(usize, 257), modulus.content.len);
+    try testing.expectEqual(@as(u8, 0), modulus.content[0]);
+    @memcpy(out_of_range, modulus.content[1..]);
+    var invalid = rp.cert;
+    invalid.signature_value = .{ .unused_bits = 0, .data = out_of_range };
+    try testing.expectError(error.InvalidSignature, verify.verifySelfSignature(cp, &invalid));
+
+    var greater_than_modulus = try allocator.dupe(u8, out_of_range);
+    defer allocator.free(greater_than_modulus);
+    var index = greater_than_modulus.len;
+    while (index > 0) {
+        index -= 1;
+        if (greater_than_modulus[index] != 0xff) {
+            greater_than_modulus[index] += 1;
+            break;
+        }
+    } else unreachable;
+    invalid.signature_value = .{ .unused_bits = 0, .data = greater_than_modulus };
+    try testing.expectError(error.InvalidSignature, verify.verifySelfSignature(cp, &invalid));
 }
 
 test "the three matrix schemes classify to the right key types" {

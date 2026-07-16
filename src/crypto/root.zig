@@ -8,6 +8,7 @@
 pub const provider = @import("provider.zig");
 pub const profile = @import("profile.zig");
 pub const pure_zig = @import("pure_zig.zig");
+pub const rsa = @import("rsa.zig");
 pub const secrets = @import("crypto_secrets");
 
 test {

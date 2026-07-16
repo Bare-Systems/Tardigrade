@@ -25,12 +25,8 @@
 //!   * secp256r1 (P-256) ECDH key-share generation and shared-secret
 //!     derivation (the signature scheme over the same curve is implemented;
 //!     the ECDH group is not)
-//!   * RSA-PSS-RSAE/SHA-256 verification — deferred until a PSS verifier
-//!     that fully validates the EMSA-PSS zero-padding region (RFC 8017)
-//!     backs it; Zig 0.16's std verifier does not (see #343)
-//!
-//! These arrive with the OpenSSL adapter and later pure-Zig work; the seam
-//! already names them so protocol code and negotiation are written once.
+//! RSA-PSS-RSAE/SHA-256 verification is implemented in `rsa.zig` with strict
+//! DER, 2048/3072/4096-bit RSA key-size, and EMSA-PSS validation.
 //!
 //! The provider never draws ambient randomness: it fills key-share scalars and
 //! any per-signature noise from the `provider.Entropy` handed in at
@@ -40,6 +36,7 @@ const std = @import("std");
 const crypto = std.crypto;
 const provider = @import("provider.zig");
 const profile = @import("profile.zig");
+const rsa = @import("rsa.zig");
 
 const HmacSha256 = crypto.auth.hmac.sha2.HmacSha256;
 const HmacSha384 = crypto.auth.hmac.sha2.HmacSha384;
@@ -76,6 +73,7 @@ pub const Provider = struct {
         caps.groups.insert(.x25519);
         caps.signatures.insert(.ed25519);
         caps.signatures.insert(.ecdsa_secp256r1_sha256);
+        caps.signatures.insert(.rsa_pss_rsae_sha256);
         return caps;
     }
 
@@ -408,16 +406,7 @@ fn verifyImpl(
             sig.verify(message, pk) catch return error.AuthenticationFailed;
         },
         .rsa_pss_rsae_sha256 => {
-            // RSA-PSS verification is deferred: Zig 0.16's
-            // `std.crypto.Certificate.rsa.PSSSignature` EMSA-PSS-VERIFY checks
-            // only the final octet of the PS zero-padding region, not the whole
-            // region as RFC 8017 requires, so a private-key holder could craft
-            // an encoding it accepts but OpenSSL rejects. Rather than ship a
-            // verifier that disagrees with the differential baseline (or
-            // hand-roll EMSA-PSS in project code), the capability stays absent
-            // and fails closed here. Re-enable once a conformant PSS verifier
-            // (hardened std or the OpenSSL adapter) backs it. See #343.
-            return error.UnsupportedCapability;
+            try rsa.verifyPssSha256(public_key, message, signature);
         },
     }
 }
@@ -538,8 +527,7 @@ test "capabilities advertise exactly the implemented profile" {
     try testing.expect(!caps.supportsGroup(.secp256r1));
     try testing.expect(caps.supportsSignature(.ed25519));
     try testing.expect(caps.supportsSignature(.ecdsa_secp256r1_sha256));
-    // RSA-PSS verification is deferred pending a conformant PSS verifier.
-    try testing.expect(!caps.supportsSignature(.rsa_pss_rsae_sha256));
+    try testing.expect(caps.supportsSignature(.rsa_pss_rsae_sha256));
 }
 
 test "unsupported algorithms return UnsupportedCapability, not undefined behaviour" {
@@ -555,12 +543,11 @@ test "unsupported algorithms return UnsupportedCapability, not undefined behavio
     try testing.expectError(error.UnsupportedCapability, cp.generateKeyShare(.secp256r1, &pub_buf, &priv_buf));
     try testing.expectError(error.UnsupportedCapability, cp.deriveSharedSecret(.secp256r1, &priv_buf, pub_buf[0..32], priv_buf[0..32]));
 
-    // RSA-PSS verification is deferred, and fails closed for any input —
-    // including short slices that a non-total DER parser could fault on.
+    // Malformed RSA-PSS inputs are rejected as ordinary input errors.
     var sig: [8]u8 = @splat(0);
-    try testing.expectError(error.UnsupportedCapability, cp.verify(.rsa_pss_rsae_sha256, &sig, "m", &sig));
-    try testing.expectError(error.UnsupportedCapability, cp.verify(.rsa_pss_rsae_sha256, "", "m", ""));
-    try testing.expectError(error.UnsupportedCapability, cp.verify(.rsa_pss_rsae_sha256, "\x30", "m", "\x00"));
+    try testing.expectError(error.InvalidInput, cp.verify(.rsa_pss_rsae_sha256, &sig, "m", &sig));
+    try testing.expectError(error.InvalidInput, cp.verify(.rsa_pss_rsae_sha256, "", "m", ""));
+    try testing.expectError(error.InvalidInput, cp.verify(.rsa_pss_rsae_sha256, "\x30", "m", "\x00"));
 }
 
 test "ECDSA-P256 verification round-trips and rejects tamper and wrong key" {

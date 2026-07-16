@@ -17,7 +17,7 @@
   "skippedSuites": [
     {
       "algorithm": "RSA-PSS",
-      "reason": "Provider capability remains deferred for issue #374 follow-up; pure-Zig provider currently returns UnsupportedCapability.",
+      "reason": "Dedicated RSA-PSS project fixtures cover the supported verifier; broad Wycheproof RSA-PSS corpus import remains outside this #374 slice.",
       "trackingIssue": "#374"
     },
     {

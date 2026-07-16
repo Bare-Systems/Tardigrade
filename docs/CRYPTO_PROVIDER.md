@@ -52,18 +52,19 @@ changes when it lands.
 - **AEAD** seal/open for AES-128-GCM, AES-256-GCM, and ChaCha20-Poly1305.
 - **Key exchange** — ephemeral key-share generation and shared-secret derivation
   for X25519 and (declared, not yet implemented in pure Zig) secp256r1.
-- **Signatures** — verification, and signing through the opaque `SigningKey`
-  handle, for Ed25519 and (declared) ECDSA-P256 and RSA-PSS.
+- **Signatures** — verification for Ed25519, ECDSA-P256, and RSA-PSS, plus
+  signing through the opaque `SigningKey` handle for Ed25519.
 - **Random bytes**, **constant-time comparison**, and **secure zeroing**.
 - **Secret containers** for fixed-size stack material and bounded heap material,
   with explicit replacement and deinitialization rules.
 - **Opaque private-key handles** and **capability discovery**.
 
 The pure-Zig backend implements the overlap the TLS/QUIC engines need today:
-HKDF (SHA-256/384), all three AEADs, X25519, and Ed25519. The remaining
-algorithms are named by the interface so protocol and negotiation code is
-written once; capability discovery reports them absent and every entry point
-returns `error.UnsupportedCapability` until a backend provides them.
+HKDF (SHA-256/384), all three AEADs, X25519, Ed25519, ECDSA-P256
+verification, and RSA-PSS verification. The remaining algorithms are named by
+the interface so protocol and negotiation code is written once; capability
+discovery reports them absent and every entry point returns
+`error.UnsupportedCapability` until a backend provides them.
 
 ## Supported profile matrix
 
@@ -78,7 +79,8 @@ The table below summarizes the checked-in profile for review:
 | X25519 | supported | `std.crypto` | provider deferred | TLS key share, QUIC TLS bridge |
 | secp256r1 / P-256 | provider deferred | unavailable | provider deferred | TLS key share, PKI |
 | Ed25519 | supported | `std.crypto` | provider deferred | CertificateVerify, PKI |
-| ECDSA-P256-SHA256, RSA-PSS-RSAE-SHA256 | provider deferred | unavailable | provider deferred | CertificateVerify, PKI |
+| ECDSA-P256-SHA256 | supported | `std.crypto` verification | provider deferred | CertificateVerify, PKI |
+| RSA-PSS-RSAE-SHA256 | supported | project verifier | provider deferred | CertificateVerify, PKI |
 | DER parser, chain builder, WebPKI validation | provider deferred | project code / unavailable | provider deferred | PKI |
 | injected random bytes, secure zero, constant-time compare | supported | project code | provider deferred / project code | all secret-bearing paths |
 
@@ -90,11 +92,11 @@ Protocol configuration must not hand-write provider-derived TLS capabilities.
 Use `tls.crypto_profile.fromProvider(provider.capabilities())`, then pass the
 returned `asPolicyCapabilities()` slice set to `tls.Policy`. That path filters
 cipher suites, named groups, and signature schemes through the selected
-provider's typed support, so pure-Zig configuration advertises Ed25519 and
-X25519 but not ECDSA or P-256 until a backend actually implements them. When a
-call site must accept hand-written TLS capability lists, it should preflight
-them with `tls.crypto_profile.validateAgainstProvider` before handshake
-execution.
+provider's typed support, so pure-Zig configuration advertises Ed25519,
+ECDSA-P256, RSA-PSS, and X25519, but not P-256 ECDH until a backend actually
+implements it. When a call site must accept hand-written TLS capability lists,
+it should preflight them with `tls.crypto_profile.validateAgainstProvider`
+before handshake execution.
 
 ## Design rules
 

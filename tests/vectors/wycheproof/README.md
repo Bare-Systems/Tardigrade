@@ -28,7 +28,8 @@ only operations currently supported through the shared provider boundary.
 
 ## Skipped Suites
 
-- RSA-PSS: provider capability remains deferred for issue `#374` follow-up.
+- RSA-PSS: dedicated project fixtures cover the supported verifier; broad
+  Wycheproof corpus import remains outside this `#374` slice.
 - ECDSA-P256-SHA256: supported provider operation, but outside this first
   merge-sized `#374` corpus slice.
 - X448 and broader asymmetric formats: unsupported by the current provider
@@ -79,4 +80,3 @@ unknown classifications, and oversized values are rejected.
 When a corpus case exposes a bug, reduce it into a permanent focused regression
 fixture near the provider or protocol code that owns the behavior, then keep or
 add the corpus case as the broader provenance-backed guard.
-

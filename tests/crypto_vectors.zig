@@ -299,7 +299,7 @@ fn runTlsKeyScheduleVector(log: *ExecutionLog) !void {
 
     const shared = hexBytes("8bd4054fb55b9d63fdfbacf9f04b9f0d35e6d63f537563efd46272900f89492d");
     const hello_hash = hexBytes("860c06edc07858ee8e78f0e7428c58edd6b43f2ca3e6e95f02ed063cf0e1cad8");
-    var schedule = KeySchedule.init(shared, hello_hash);
+    var schedule = KeySchedule.init(&shared, hello_hash);
     defer schedule.wipe();
 
     try expectStage("tls13 handshake secret / RFC 8448", &hexBytes("1dc826e93606aa6fdc0aadc12f741b01046aa6b99f691ed221a9f0ca043fbeac"), &schedule.handshake_secret);
@@ -308,11 +308,16 @@ fn runTlsKeyScheduleVector(log: *ExecutionLog) !void {
     try expectStage("tls13 master secret / RFC 8448", &hexBytes("18df06843d13a08bf2a449844c5f8a478001bc4d4c627984d5a41da8d0402919"), &schedule.master_secret);
 
     const finished_hash = hexBytes("9608102a0f1ccc6db6250b7b7e417b1a000eaada3daae4777a7686c9ff83df13");
-    const app = schedule.applicationSecrets(finished_hash);
+    var app = schedule.applicationSecrets(finished_hash);
+    defer app.wipe();
     try expectStage("tls13 client application traffic secret / RFC 8448", &hexBytes("9e40646ce79a7f9dc05af8889bce6552875afa0b06df0087f792ebb7c17504a5"), &app.client);
     try expectStage("tls13 server application traffic secret / RFC 8448", &hexBytes("a11af9f05531f856ad47116b45a950328204b4f44bfb6b3a4b4f1f3fcb631643"), &app.server);
-    try expectStage("tls13 server Finished key / RFC 8448", &hexBytes("008d3b66f816ea559f96b537e885c31fc068bf492c652f01f288a1d8cdc19fc8"), &KeySchedule.finishedKey(schedule.server_handshake_traffic));
-    try expectStage("tls13 server Finished verify_data / RFC 8448", &hexBytes("c5486af1426697c43c18dab6a79ef816a2188023ea743133b7e3b15a2c05c955"), &KeySchedule.verifyData(schedule.server_handshake_traffic, finished_hash));
+    var finished_key = KeySchedule.finishedKey(&schedule.server_handshake_traffic);
+    defer std.crypto.secureZero(u8, &finished_key);
+    try expectStage("tls13 server Finished key / RFC 8448", &hexBytes("008d3b66f816ea559f96b537e885c31fc068bf492c652f01f288a1d8cdc19fc8"), &finished_key);
+    var verify_data = KeySchedule.verifyData(&schedule.server_handshake_traffic, finished_hash);
+    defer std.crypto.secureZero(u8, &verify_data);
+    try expectStage("tls13 server Finished verify_data / RFC 8448", &hexBytes("c5486af1426697c43c18dab6a79ef816a2188023ea743133b7e3b15a2c05c955"), &verify_data);
 }
 
 fn runTranscriptVector(log: *ExecutionLog) !void {

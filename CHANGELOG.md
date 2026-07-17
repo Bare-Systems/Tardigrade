@@ -5,6 +5,19 @@ All notable user-facing changes to Tardigrade are documented here.
 ## [Unreleased]
 
 ### Features
+- **TLS-owned reusable TLS 1.3 engine (#442, epic #325)** — relocates the
+  concrete native handshake engine from `src/quic/` to
+  `src/tls/tls13_backend.zig`. An explicit transport profile now separates
+  record mode from opaque transport extensions: TLS-over-TCP constructs the
+  backend directly with configurable `h2` / `http/1.1` ALPN and never emits or
+  parses QUIC transport parameters, while the thin QUIC adapter retains RFC
+  9000 transport-parameter encoding/decoding, CID binding, `h3` policy, epoch
+  translation, and QUIC error mapping. The former record-mode translation
+  wrapper and mutable `omit_transport_parameters` test switch are removed;
+  both transports use the same ClientHello/ServerHello, certificate,
+  CertificateVerify, Finished, transcript, key-schedule, traffic-secret, and
+  zeroization implementation. Direct socket-pair record tests now live under
+  `src/tls/` and compile without importing QUIC.
 - **Three-way hostile Web PKI differential harness foundation (#348, epic #324)** —
   adds a bounded, provenance-backed certificate corpus that compares the
   pure-Zig parser, path builder, identity matcher, and RFC 5280 validator with

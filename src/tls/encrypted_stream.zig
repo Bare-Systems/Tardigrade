@@ -13,26 +13,21 @@ const algorithms = @import("algorithms.zig");
 const alerts = @import("alerts.zig");
 const engine = @import("engine.zig");
 const events = @import("events.zig");
-const messages = @import("messages.zig");
 const record_codec = @import("record_codec.zig");
 const record_epoch_bridge = @import("record_epoch_bridge.zig");
 const tls_state = @import("state.zig");
-const transport = @import("transport.zig");
+const tls13_transport = @import("tls13_transport.zig");
 
 const provider = crypto.provider;
 
-/// Error set the record-mode handshake driver/backend contract carries. It is a
-/// superset of every error the shared engine `Driver`, the `EventSink`, and the
-/// `record_epoch_bridge` can surface, so a concrete TLS backend wired in from a
-/// higher layer (#410) can report handshake failures without a lossy remap.
-pub const RecordHandshakeError = record_epoch_bridge.Error || events.HandshakeError ||
-    messages.ReadError || messages.WriteError || error{TransportBufferOverflow};
+/// Error set carried by the transport-neutral TLS 1.3 engine contract.
+pub const RecordHandshakeError = tls13_transport.Error;
 
 /// The canonical record-mode handshake transport contract (#408): protocol
-/// events keyed on `events.EncryptionEpoch`, no transport-parameter payload
-/// (that is a QUIC concern), reusing the shared `transport.Contract`/
+/// events keyed on `events.EncryptionEpoch`, no decoded transport-parameter
+/// payload, reusing the shared transport-neutral contract and
 /// `engine.Driver` rather than a parallel driver of its own.
-pub const RecordTransport = transport.Contract(void, events.EncryptionEpoch, RecordHandshakeError);
+pub const RecordTransport = tls13_transport.Contract;
 /// The injected backend seam: a concrete TLS 1.3 engine (wired from a module
 /// above `tls_core`, e.g. the pure-Zig engine wrapped for record mode) drives
 /// the handshake through this vtable and reports keying/negotiation results
@@ -42,7 +37,7 @@ pub const RecordHandshakeBackend = RecordTransport.Backend;
 /// owns one of these and progresses it inside `drive()`.
 pub const RecordHandshakeDriver = engine.Driver(RecordTransport);
 
-pub const Error = RecordHandshakeError || error{
+pub const Error = RecordHandshakeError || record_epoch_bridge.Error || error{
     WouldBlock,
     EndOfStream,
     StreamClosed,

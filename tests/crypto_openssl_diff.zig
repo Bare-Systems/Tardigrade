@@ -550,7 +550,7 @@ fn runTlsKeySchedule(allocator: std.mem.Allocator) !void {
     const KeySchedule = tls_core.key_schedule.KeySchedule;
     const shared = hexBytes("8bd4054fb55b9d63fdfbacf9f04b9f0d35e6d63f537563efd46272900f89492d");
     const hello_hash = hexBytes("860c06edc07858ee8e78f0e7428c58edd6b43f2ca3e6e95f02ed063cf0e1cad8");
-    var schedule = KeySchedule.init(shared, hello_hash);
+    var schedule = KeySchedule.init(&shared, hello_hash);
     defer schedule.wipe();
 
     const zero = [_]u8{0} ** provider.Hash.sha256.digestLength();
@@ -578,7 +578,8 @@ fn runTlsKeySchedule(allocator: std.mem.Allocator) !void {
     try expectStage("tls13 master secret", &schedule.master_secret, master_secret);
 
     const finished_hash = hexBytes("9608102a0f1ccc6db6250b7b7e417b1a000eaada3daae4777a7686c9ff83df13");
-    const app = schedule.applicationSecrets(finished_hash);
+    var app = schedule.applicationSecrets(finished_hash);
+    defer app.wipe();
     const client_app = try opensslHkdfExpandLabel(allocator, "tls13 client application traffic secret", .sha256, master_secret, "c ap traffic", &finished_hash, provider.Hash.sha256.digestLength());
     defer allocator.free(client_app);
     try expectStage("tls13 client application traffic secret", &app.client, client_app);
@@ -728,14 +729,17 @@ fn runTranscriptAndFinished(allocator: std.mem.Allocator) !void {
     const finished_hash_path = try tmp.dir.realPathFileAlloc(io, "finished_hash.bin", allocator);
     defer allocator.free(finished_hash_path);
 
-    const zig_finished_key = KeySchedule.finishedKey(traffic_secret);
+    var zig_finished_key = KeySchedule.finishedKey(&traffic_secret);
+    defer std.crypto.secureZero(u8, &zig_finished_key);
     const openssl_finished_key = try opensslHkdfExpandLabel(allocator, "tls13 server Finished key", .sha256, &traffic_secret, "finished", "", provider.Hash.sha256.digestLength());
     defer allocator.free(openssl_finished_key);
     try expectStage("tls13 server Finished key", &zig_finished_key, openssl_finished_key);
 
     const openssl_verify_data = try opensslHmacSha256File(allocator, "tls13 server Finished verify_data", openssl_finished_key, finished_hash_path);
     defer allocator.free(openssl_verify_data);
-    try expectStage("tls13 server Finished verify_data", &KeySchedule.verifyData(traffic_secret, zig_hrr_hash), openssl_verify_data);
+    var zig_verify_data = KeySchedule.verifyData(&traffic_secret, zig_hrr_hash);
+    defer std.crypto.secureZero(u8, &zig_verify_data);
+    try expectStage("tls13 server Finished verify_data", &zig_verify_data, openssl_verify_data);
 
     client_hello_2[client_hello_2.len - 1] ^= 0x01;
     var mutated_transcript = tls_core.transcript.Transcript{};
@@ -758,9 +762,12 @@ fn runTranscriptAndFinished(allocator: std.mem.Allocator) !void {
     defer allocator.free(finished_hash_mutated_path);
     const openssl_mutated_verify_data = try opensslHmacSha256File(allocator, "tls13 server Finished mutated verify_data", openssl_finished_key, finished_hash_mutated_path);
     defer allocator.free(openssl_mutated_verify_data);
-    const zig_mutated_verify_data = KeySchedule.verifyData(traffic_secret, zig_mutated_hrr_hash);
+    var zig_mutated_verify_data = KeySchedule.verifyData(&traffic_secret, zig_mutated_hrr_hash);
+    defer std.crypto.secureZero(u8, &zig_mutated_verify_data);
     try expectStage("tls13 server Finished mutated verify_data", &zig_mutated_verify_data, openssl_mutated_verify_data);
-    try testing.expect(!std.mem.eql(u8, &KeySchedule.verifyData(traffic_secret, zig_hrr_hash), &zig_mutated_verify_data));
+    var stable_verify_data = KeySchedule.verifyData(&traffic_secret, zig_hrr_hash);
+    defer std.crypto.secureZero(u8, &stable_verify_data);
+    try testing.expect(!std.mem.eql(u8, &stable_verify_data, &zig_mutated_verify_data));
 }
 
 test "OpenSSL digest and HMAC oracles match transcript and Finished values" {

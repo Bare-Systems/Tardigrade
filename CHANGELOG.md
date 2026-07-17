@@ -22,12 +22,13 @@ All notable user-facing changes to Tardigrade are documented here.
   every unexplained differential mismatch now runs bounded deterministic
   delta debugging (`tests/pki_reduce.zig`) over each chain component — leaf,
   intermediates, and trust anchors — preserving Tardigrade's exact
-  classification under one shared mismatch budget. Component candidates are
-  re-verified against OpenSSL and Go `crypto/x509` before selection, so the
-  artifact keeps the largest shrink that preserves the full observed tuple; if
-  none preserve it, the emitted fixture reverts to original bytes so it still
-  reproduces the disagreement. The schema-v3 artifact records the component,
-  sizes, oracle budget and total calls,
+  classification under one shared mismatch budget with per-component
+  allowance so the leaf cannot monopolize the search. Component candidates are
+  re-verified against OpenSSL and Go `crypto/x509` before selection, and
+  immediately promotable reproductions outrank larger partial reductions; if
+  none preserve the full observed tuple, the emitted fixture reverts to
+  original bytes so it still reproduces the disagreement. The schema-v3
+  artifact records the component, sizes, oracle budget and total calls,
   `budget_exhausted`/`one_minimal` flags, SHA-256, per-validator reduced
   decisions, the reverted candidate's decisions when applicable, and a
   `promotable` verdict, with deterministic offline serialization tests. A

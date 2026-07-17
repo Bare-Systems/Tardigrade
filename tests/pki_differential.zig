@@ -592,6 +592,41 @@ const ReductionCandidate = struct {
     }
 };
 
+fn componentReductionAllowance(total_oracle_calls: usize, component_index: usize, component_count: usize) usize {
+    if (total_oracle_calls >= max_total_reduction_oracle_calls) return 0;
+    const remaining = max_total_reduction_oracle_calls - total_oracle_calls;
+    const components_left = component_count - component_index;
+    if (components_left == 0) return 0;
+    return @max(remaining / components_left, 1);
+}
+
+fn candidateIsPromotionReady(candidate: *const ReductionCandidate) bool {
+    return candidate.shrink() > 0 and candidate.one_minimal and !candidate.budget_exhausted;
+}
+
+fn candidateBeatsCurrent(
+    current_index: ?usize,
+    next_index: usize,
+    candidates: []const ReductionCandidate,
+) bool {
+    const current = if (current_index) |index| &candidates[index] else return true;
+    const next = &candidates[next_index];
+    const current_promotable = candidateIsPromotionReady(current);
+    const next_promotable = candidateIsPromotionReady(next);
+    if (current_promotable != next_promotable) return next_promotable;
+    return next.shrink() > current.shrink();
+}
+
+fn selectVerifiedCandidate(candidates: []const ReductionCandidate, preserves: []const bool) ?usize {
+    std.debug.assert(candidates.len == preserves.len);
+    var best_index: ?usize = null;
+    for (preserves, 0..) |preserves_target, index| {
+        if (!preserves_target) continue;
+        if (candidateBeatsCurrent(best_index, index, candidates)) best_index = index;
+    }
+    return best_index;
+}
+
 const Reduction = struct {
     inputs: CaseInputs,
     candidates: []ReductionCandidate,
@@ -685,9 +720,9 @@ fn minimizeCase(
     }
     var total_oracle_calls: usize = 0;
     var components_tried: usize = 0;
-    for (components[0..component_count]) |component| {
-        const remaining = max_total_reduction_oracle_calls - total_oracle_calls;
-        if (remaining == 0) break;
+    for (components[0..component_count], 0..) |component, component_index| {
+        const allowance = componentReductionAllowance(total_oracle_calls, component_index, component_count);
+        if (allowance == 0) break;
         components_tried += 1;
         const original = inputs.componentDer(component);
         const oracle = ComponentOracle{
@@ -702,7 +737,7 @@ fn minimizeCase(
             original,
             &oracle,
             ComponentOracle.keeps,
-            .{ .max_oracle_calls = remaining },
+            .{ .max_oracle_calls = allowance },
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             // The file-based observation cannot be reproduced in memory (e.g.
@@ -1009,7 +1044,8 @@ fn verifyAndPersistReduced(
     original_statuses: [3]Status,
 ) !ReducedVerification {
     var best_index: ?usize = null;
-    var best_shrink: usize = 0;
+    var best_verification: ?ReducedVerification = null;
+    errdefer if (best_verification) |*verification| verification.deinit(allocator);
     var fallback_index: ?usize = null;
     var fallback_shrink: usize = 0;
     var fallback_tardigrade: ?Observation = null;
@@ -1022,8 +1058,15 @@ fn verifyAndPersistReduced(
     for (r.candidates, 0..) |*candidate, index| {
         try r.selectCandidate(allocator, candidate);
         var paths = try persistReducedCase(allocator, dir, artifact_dir, case, r);
-        defer paths.deinit(allocator);
+        var owns_paths = true;
+        errdefer if (owns_paths) paths.deinit(allocator);
         var tardigrade, var openssl, var go = try verifyReducedCase(allocator, case, &paths);
+        var owns_observations = true;
+        errdefer if (owns_observations) {
+            tardigrade.deinit(allocator);
+            openssl.deinit(allocator);
+            go.deinit(allocator);
+        };
         const preserves = try observationsPreserveTarget(
             allocator,
             tardigrade,
@@ -1034,13 +1077,26 @@ fn verifyAndPersistReduced(
         );
         const shrink = candidate.shrink();
         if (preserves) {
-            if (best_index == null or shrink > best_shrink) {
+            if (candidateBeatsCurrent(best_index, index, r.candidates)) {
+                if (best_verification) |*verification| verification.deinit(allocator);
                 best_index = index;
-                best_shrink = shrink;
+                best_verification = .{
+                    .paths = paths,
+                    .tardigrade = tardigrade,
+                    .openssl = openssl,
+                    .go = go,
+                    .preserves = true,
+                };
+                owns_paths = false;
+                owns_observations = false;
+            } else {
+                paths.deinit(allocator);
+                tardigrade.deinit(allocator);
+                openssl.deinit(allocator);
+                go.deinit(allocator);
+                owns_paths = false;
+                owns_observations = false;
             }
-            tardigrade.deinit(allocator);
-            openssl.deinit(allocator);
-            go.deinit(allocator);
             continue;
         }
         if (fallback_index == null or shrink > fallback_shrink) {
@@ -1052,10 +1108,16 @@ fn verifyAndPersistReduced(
             fallback_tardigrade = tardigrade;
             fallback_openssl = openssl;
             fallback_go = go;
+            paths.deinit(allocator);
+            owns_paths = false;
+            owns_observations = false;
         } else {
+            paths.deinit(allocator);
             tardigrade.deinit(allocator);
             openssl.deinit(allocator);
             go.deinit(allocator);
+            owns_paths = false;
+            owns_observations = false;
         }
     }
 
@@ -1073,26 +1135,9 @@ fn verifyAndPersistReduced(
             fallback_go = null;
         }
         try r.selectCandidate(allocator, &r.candidates[index]);
-        var paths = try persistReducedCase(allocator, dir, artifact_dir, case, r);
-        errdefer paths.deinit(allocator);
-        var tardigrade, var openssl, var go = try verifyReducedCase(allocator, case, &paths);
-        errdefer tardigrade.deinit(allocator);
-        errdefer openssl.deinit(allocator);
-        errdefer go.deinit(allocator);
-        return .{
-            .paths = paths,
-            .tardigrade = tardigrade,
-            .openssl = openssl,
-            .go = go,
-            .preserves = try observationsPreserveTarget(
-                allocator,
-                tardigrade,
-                openssl,
-                go,
-                original_statuses,
-                r.target_class,
-            ),
-        };
+        const verification = best_verification.?;
+        best_verification = null;
+        return verification;
     }
 
     const index = fallback_index orelse 0;
@@ -1608,6 +1653,86 @@ fn drillReduction(
         .one_minimal = one_minimal,
         .target_class = try allocator.dupe(u8, "reject|OriginalReject"),
     };
+}
+
+test "pki reduce: shared component budget leaves room for later components" {
+    const component_count = 3;
+    const leaf_allowance = componentReductionAllowance(0, 0, component_count);
+    try testing.expect(leaf_allowance > 0);
+    try testing.expect(leaf_allowance < max_total_reduction_oracle_calls);
+
+    const intermediate_allowance = componentReductionAllowance(leaf_allowance, 1, component_count);
+    try testing.expect(intermediate_allowance > 0);
+    try testing.expect(leaf_allowance + intermediate_allowance < max_total_reduction_oracle_calls);
+
+    const root_allowance = componentReductionAllowance(leaf_allowance + intermediate_allowance, 2, component_count);
+    try testing.expect(root_allowance > 0);
+    try testing.expectEqual(max_total_reduction_oracle_calls, leaf_allowance + intermediate_allowance + root_allowance);
+}
+
+test "pki reduce: candidate policy prefers promotable reproductions before larger partials" {
+    var partial_bytes: [80]u8 = undefined;
+    var promotable_bytes: [85]u8 = undefined;
+    var divergent_bytes: [70]u8 = undefined;
+    const candidates = [_]ReductionCandidate{
+        .{
+            .component = .leaf,
+            .reduced_der = partial_bytes[0..],
+            .original_size = 100,
+            .candidate_size = partial_bytes.len,
+            .oracle_calls = 170,
+            .budget_exhausted = true,
+            .one_minimal = false,
+        },
+        .{
+            .component = .{ .intermediate = 0 },
+            .reduced_der = promotable_bytes[0..],
+            .original_size = 100,
+            .candidate_size = promotable_bytes.len,
+            .oracle_calls = 42,
+            .budget_exhausted = false,
+            .one_minimal = true,
+        },
+        .{
+            .component = .{ .root = 0 },
+            .reduced_der = divergent_bytes[0..],
+            .original_size = 100,
+            .candidate_size = divergent_bytes.len,
+            .oracle_calls = 12,
+            .budget_exhausted = false,
+            .one_minimal = true,
+        },
+    };
+
+    try testing.expect(candidateIsPromotionReady(&candidates[1]));
+    try testing.expect(!candidateIsPromotionReady(&candidates[0]));
+    try testing.expectEqual(@as(?usize, 1), selectVerifiedCandidate(&candidates, &.{ true, true, false }));
+    try testing.expectEqual(@as(?usize, null), selectVerifiedCandidate(&candidates, &.{ false, false, false }));
+}
+
+test "pki reduce: observation comparison cleanup is leak-free on allocation failure" {
+    try testing.checkAllAllocationFailures(testing.allocator, struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var tardigrade = try fabricatedObservation(allocator, .reject, "OriginalReject");
+            errdefer tardigrade.deinit(allocator);
+            var openssl = try fabricatedObservation(allocator, .reject, "openssl reduced");
+            errdefer openssl.deinit(allocator);
+            var go = try fabricatedObservation(allocator, .accept, "go reduced");
+            errdefer go.deinit(allocator);
+
+            try testing.expect(try observationsPreserveTarget(
+                allocator,
+                tardigrade,
+                openssl,
+                go,
+                .{ .reject, .reject, .accept },
+                "reject|OriginalReject",
+            ));
+            tardigrade.deinit(allocator);
+            openssl.deinit(allocator);
+            go.deinit(allocator);
+        }
+    }.run, .{});
 }
 
 test "pki reduce: schema-v3 artifact is complete and reproducible" {

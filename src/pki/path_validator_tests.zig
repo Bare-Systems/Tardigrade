@@ -2844,3 +2844,201 @@ test "policy validation allocation failures are structured and leak-free" {
         .crypto_provider = cp,
     }});
 }
+
+test "a DNS identity match cannot accept a path whose policy processing failed" {
+    var fx = Fixtures.init(testing.allocator);
+    defer fx.deinit();
+    try fx.add(.{ .subject = "Root", .issuer = "Root", .subject_key = 3, .issuer_key = 3, .ca = true, .key_usage = 0x04 });
+    try fx.add(.{ .subject = "Intermediate", .issuer = "Root", .subject_key = 2, .issuer_key = 3, .ca = true, .key_usage = 0x04 });
+    try fx.add(.{
+        .subject = "leaf",
+        .issuer = "Intermediate",
+        .subject_key = 1,
+        .issuer_key = 2,
+        .ca = false,
+        .key_usage = 0x80,
+        .san = "leaf.example.com",
+    });
+
+    var entropy: crypto.pure_zig.DeterministicEntropy = undefined;
+    var provider: crypto.pure_zig.Provider = undefined;
+    const cp = cryptoProvider(&entropy, &provider);
+    var validation_policy = policy(fx.certs.items[0..1]);
+    validation_policy.expected_dns_name = "leaf.example.com";
+    validation_policy.certificate_policy.initial_explicit_policy = true;
+    // The SAN matches exactly, but the policy-free intermediate nulls the
+    // graph while explicit policy is required: identity runs after policy
+    // processing and must not resurrect the path.
+    var result = try validateBuilt(testing.allocator, &fx.certs.items[2], fx.certs.items[1..2], fx.certs.items[0..1], validation_policy, cp);
+    defer result.deinit(testing.allocator);
+    try expectRejected(&result, .certificate_policy_required, 1);
+}
+
+test "the RFC 9618 Cartesian mapping chain stays linear across depths" {
+    // The attack that motivated RFC 9618 (§3.2): every CA asserts two
+    // policies and maps their full Cartesian product, doubling the RFC 5280
+    // valid_policy_tree at each level.  The policy graph must instead keep
+    // exactly one node per policy per depth, and repeated validation must
+    // produce identical resource accounting.
+    var fx = Fixtures.init(testing.allocator);
+    defer fx.deinit();
+    const both = [_]PolicySpec{ .{ .policy = &policy_a }, .{ .policy = &policy_b } };
+    const cartesian = [_]PolicyMappingSpec{
+        .{ .issuer = &policy_a, .subject = &policy_a },
+        .{ .issuer = &policy_a, .subject = &policy_b },
+        .{ .issuer = &policy_b, .subject = &policy_a },
+        .{ .issuer = &policy_b, .subject = &policy_b },
+    };
+    try fx.add(.{ .subject = "Root", .issuer = "Root", .subject_key = 6, .issuer_key = 6, .ca = true, .key_usage = 0x04 });
+    try fx.add(.{ .subject = "CA1", .issuer = "Root", .subject_key = 5, .issuer_key = 6, .ca = true, .key_usage = 0x04, .certificate_policies = &both, .policy_mappings = &cartesian });
+    try fx.add(.{ .subject = "CA2", .issuer = "CA1", .subject_key = 4, .issuer_key = 5, .ca = true, .key_usage = 0x04, .certificate_policies = &both, .policy_mappings = &cartesian });
+    try fx.add(.{ .subject = "CA3", .issuer = "CA2", .subject_key = 3, .issuer_key = 4, .ca = true, .key_usage = 0x04, .certificate_policies = &both, .policy_mappings = &cartesian });
+    try fx.add(.{ .subject = "CA4", .issuer = "CA3", .subject_key = 2, .issuer_key = 3, .ca = true, .key_usage = 0x04, .certificate_policies = &both, .policy_mappings = &cartesian });
+    try fx.add(.{ .subject = "leaf", .issuer = "CA4", .subject_key = 1, .issuer_key = 2, .ca = false, .key_usage = 0x80, .certificate_policies = &both });
+
+    var entropy: crypto.pure_zig.DeterministicEntropy = undefined;
+    var provider: crypto.pure_zig.Provider = undefined;
+    const cp = cryptoProvider(&entropy, &provider);
+    var validation_policy = policy(fx.certs.items[0..1]);
+    validation_policy.certificate_policy.initial_explicit_policy = true;
+    var first = try validateBuilt(testing.allocator, &fx.certs.items[5], fx.certs.items[1..5], fx.certs.items[0..1], validation_policy, cp);
+    defer first.deinit(testing.allocator);
+    try expectAccepted(&first, 6);
+    try testing.expectEqual(@as(usize, 2), first.accepted.policies.authority_constrained.len);
+    try testing.expect(first.accepted.policies.authority_constrained[0].eqlComponents(&policy_a));
+    try testing.expect(first.accepted.policies.authority_constrained[1].eqlComponents(&policy_b));
+    // Linear, not exponential: the anyPolicy root plus two nodes per
+    // certificate depth (a 2^5-leaf policy tree would need 63 nodes).
+    try testing.expectEqual(@as(usize, 11), first.accepted.policies.resource_usage.graph_nodes);
+    try testing.expectEqual(@as(usize, 18), first.accepted.policies.resource_usage.graph_edges);
+
+    var second = try validateBuilt(testing.allocator, &fx.certs.items[5], fx.certs.items[1..5], fx.certs.items[0..1], validation_policy, cp);
+    defer second.deinit(testing.allocator);
+    try expectAccepted(&second, 6);
+    try testing.expectEqualDeep(first.accepted.policies.resource_usage, second.accepted.policies.resource_usage);
+}
+
+test "self-issued certificates may assert anyPolicy while inhibit-anyPolicy is exhausted" {
+    // RFC 5280 §6.1.3 (d)(2): anyPolicy is processed when inhibit_anyPolicy
+    // is zero if the certificate is self-issued and not the target.  A
+    // non-self-issued certificate in the same position is inhibited.
+    var fx = Fixtures.init(testing.allocator);
+    defer fx.deinit();
+    try fx.add(.{ .subject = "Root", .issuer = "Root", .subject_key = 5, .issuer_key = 5, .ca = true, .key_usage = 0x04 });
+    try fx.add(.{
+        .subject = "Issuer",
+        .issuer = "Root",
+        .subject_key = 4,
+        .issuer_key = 5,
+        .ca = true,
+        .key_usage = 0x04,
+        .certificate_policies = &.{.{ .policy = &oid.well_known.any_policy }},
+        .inhibit_any_policy = 0,
+    });
+    try fx.add(.{
+        .subject = "Issuer",
+        .issuer = "Issuer",
+        .subject_key = 3,
+        .issuer_key = 4,
+        .ca = true,
+        .key_usage = 0x04,
+        .certificate_policies = &.{.{ .policy = &oid.well_known.any_policy }},
+    });
+    try fx.add(.{
+        .subject = "leaf",
+        .issuer = "Issuer",
+        .subject_key = 1,
+        .issuer_key = 3,
+        .ca = false,
+        .key_usage = 0x80,
+        .certificate_policies = &.{.{ .policy = &policy_a }},
+    });
+    try fx.add(.{
+        .subject = "Other",
+        .issuer = "Issuer",
+        .subject_key = 2,
+        .issuer_key = 4,
+        .ca = true,
+        .key_usage = 0x04,
+        .certificate_policies = &.{.{ .policy = &oid.well_known.any_policy }},
+    });
+    try fx.add(.{
+        .subject = "other leaf",
+        .issuer = "Other",
+        .subject_key = 1,
+        .issuer_key = 2,
+        .ca = false,
+        .key_usage = 0x80,
+        .certificate_policies = &.{.{ .policy = &policy_a }},
+    });
+
+    const requested = [_]oid.ObjectIdentifier{try policyObject(&policy_a)};
+    var validation_policy = policy(fx.certs.items[0..1]);
+    validation_policy.certificate_policy.user_initial_policy_set = .{ .explicit = &requested };
+    validation_policy.certificate_policy.initial_explicit_policy = true;
+    var entropy: crypto.pure_zig.DeterministicEntropy = undefined;
+    var provider: crypto.pure_zig.Provider = undefined;
+    const cp = cryptoProvider(&entropy, &provider);
+
+    const self_issued_elements = [_]path_builder.Element{
+        .{ .certificate = &fx.certs.items[3], .source = .leaf, .input_index = 0 },
+        .{ .certificate = &fx.certs.items[2], .source = .intermediate, .input_index = 0 },
+        .{ .certificate = &fx.certs.items[1], .source = .intermediate, .input_index = 1 },
+        .{ .certificate = &fx.certs.items[0], .source = .anchor, .input_index = 0 },
+    };
+    var accepted = validator.validatePath(testing.allocator, .{ .elements = &self_issued_elements }, validation_policy, cp);
+    defer accepted.deinit(testing.allocator);
+    try expectAccepted(&accepted, 4);
+    try testing.expect(accepted.accepted.policies.user_constrained[0].eqlComponents(&policy_a));
+
+    const renamed_elements = [_]path_builder.Element{
+        .{ .certificate = &fx.certs.items[5], .source = .leaf, .input_index = 0 },
+        .{ .certificate = &fx.certs.items[4], .source = .intermediate, .input_index = 0 },
+        .{ .certificate = &fx.certs.items[1], .source = .intermediate, .input_index = 1 },
+        .{ .certificate = &fx.certs.items[0], .source = .anchor, .input_index = 0 },
+    };
+    var rejected = validator.validatePath(testing.allocator, .{ .elements = &renamed_elements }, validation_policy, cp);
+    defer rejected.deinit(testing.allocator);
+    try expectRejected(&rejected, .certificate_policy_required, 1);
+}
+
+test "policy mappings apply through an asserted anyPolicy" {
+    // RFC 9618 §5.4 (b)(2): when a CA maps an issuerDomainPolicy it does not
+    // assert directly but anyPolicy is present, the mapping materializes a
+    // node under the previous depth's anyPolicy node.
+    var fx = Fixtures.init(testing.allocator);
+    defer fx.deinit();
+    try fx.add(.{ .subject = "Root", .issuer = "Root", .subject_key = 3, .issuer_key = 3, .ca = true, .key_usage = 0x04 });
+    try fx.add(.{
+        .subject = "Mapping CA",
+        .issuer = "Root",
+        .subject_key = 2,
+        .issuer_key = 3,
+        .ca = true,
+        .key_usage = 0x04,
+        .certificate_policies = &.{.{ .policy = &oid.well_known.any_policy }},
+        .policy_mappings = &.{.{ .issuer = &policy_a, .subject = &policy_b }},
+    });
+    try fx.add(.{
+        .subject = "leaf",
+        .issuer = "Mapping CA",
+        .subject_key = 1,
+        .issuer_key = 2,
+        .ca = false,
+        .key_usage = 0x80,
+        .certificate_policies = &.{.{ .policy = &policy_b }},
+    });
+
+    const requested = [_]oid.ObjectIdentifier{try policyObject(&policy_a)};
+    var validation_policy = policy(fx.certs.items[0..1]);
+    validation_policy.certificate_policy.user_initial_policy_set = .{ .explicit = &requested };
+    validation_policy.certificate_policy.initial_explicit_policy = true;
+    var entropy: crypto.pure_zig.DeterministicEntropy = undefined;
+    var provider: crypto.pure_zig.Provider = undefined;
+    const cp = cryptoProvider(&entropy, &provider);
+    var result = try validateBuilt(testing.allocator, &fx.certs.items[2], fx.certs.items[1..2], fx.certs.items[0..1], validation_policy, cp);
+    defer result.deinit(testing.allocator);
+    try expectAccepted(&result, 3);
+    try testing.expectEqual(@as(usize, 1), result.accepted.policies.user_constrained.len);
+    try testing.expect(result.accepted.policies.user_constrained[0].eqlComponents(&policy_a));
+}

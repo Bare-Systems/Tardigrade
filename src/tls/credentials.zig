@@ -168,9 +168,11 @@ pub const SelectedCredential = struct {
         /// only until `release` (or the end of the current engine call).
         chain: *const fn (handle: *anyopaque) CertificateChain,
         /// Sign `input` with `scheme`, writing the signature into `out` and
-        /// returning its length. Must not write past `out`; report
-        /// `SignatureOutputOverflow` when it would not fit.
-        sign: *const fn (handle: *anyopaque, scheme: SignatureScheme, input: []const u8, out: []u8) SignError!usize,
+        /// completing with its length. Must not write past `out`; report
+        /// `SignatureOutputOverflow` when it would not fit. May return `pending`
+        /// (an async signer); the pending operation must keep `out` and a
+        /// snapshot of `input` until it completes.
+        sign: *const fn (handle: *anyopaque, scheme: SignatureScheme, input: []const u8, out: []u8) SignError!Progress(usize),
         /// Release the handle and any storage it produced. Called exactly once.
         release: *const fn (handle: *anyopaque) void,
     };
@@ -179,13 +181,16 @@ pub const SelectedCredential = struct {
         return self.vtable.chain(self.handle);
     }
 
-    /// Sign through the provider, defensively enforcing the output bound: a
-    /// provider that reports writing more than `out.len` has violated the
-    /// contract and is reported as such rather than trusted.
-    pub fn sign(self: SelectedCredential, input: []const u8, out: []u8) SignError!usize {
-        const written = try self.vtable.sign(self.handle, self.scheme, input, out);
-        if (written > out.len) return error.InvalidCallbackBehavior;
-        return written;
+    /// Sign through the provider, defensively enforcing the output bound on a
+    /// synchronous completion: a provider that reports writing more than
+    /// `out.len` has violated the contract and is reported as such.
+    pub fn sign(self: SelectedCredential, input: []const u8, out: []u8) SignError!Progress(usize) {
+        const progress = try self.vtable.sign(self.handle, self.scheme, input, out);
+        switch (progress) {
+            .complete => |written| if (written > out.len) return error.InvalidCallbackBehavior,
+            .pending => {},
+        }
+        return progress;
     }
 
     pub fn release(self: SelectedCredential) void {
@@ -214,11 +219,13 @@ pub const CredentialProvider = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
-        select: *const fn (ctx: *anyopaque, selection: *const SelectionContext, out: *SelectedCredential) SelectError!void,
+        /// Select a credential, completing with it synchronously or returning a
+        /// pending operation (e.g. an SNI lookup that must go async).
+        select: *const fn (ctx: *anyopaque, selection: *const SelectionContext) SelectError!Progress(SelectedCredential),
     };
 
-    pub fn selectCredential(self: CredentialProvider, selection: *const SelectionContext, out: *SelectedCredential) SelectError!void {
-        return self.vtable.select(self.ctx, selection, out);
+    pub fn selectCredential(self: CredentialProvider, selection: *const SelectionContext) SelectError!Progress(SelectedCredential) {
+        return self.vtable.select(self.ctx, selection);
     }
 };
 
@@ -261,13 +268,76 @@ pub const PeerVerifier = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
-        verify: *const fn (ctx: *anyopaque, context: *const VerificationContext) VerifyError!Verdict,
+        verify: *const fn (ctx: *anyopaque, context: *const VerificationContext) VerifyError!Progress(Verdict),
     };
 
-    pub fn verifyPeer(self: PeerVerifier, context: *const VerificationContext) VerifyError!Verdict {
+    pub fn verifyPeer(self: PeerVerifier, context: *const VerificationContext) VerifyError!Progress(Verdict) {
         return self.vtable.verify(self.ctx, context);
     }
 };
+
+// ===========================================================================
+// Asynchronous / event-driven progression.
+// ===========================================================================
+
+/// Errors a pending authentication operation may report while resolving.
+pub const OperationError = error{
+    /// The underlying async operation failed (signer/verifier/selector fault).
+    OperationFailed,
+    /// The operation violated its contract (completed with an out-of-range or
+    /// wrong-kind result).
+    InvalidCallbackBehavior,
+};
+
+/// The value an in-flight `PendingOperation` yields on completion, tagged by
+/// the operation kind it resolves.
+pub const Completion = union(enum) {
+    credential: SelectedCredential,
+    signature_len: usize,
+    verdict: Verdict,
+};
+
+/// A handle to an authentication operation that did not complete synchronously
+/// — an HSM round-trip, a remote signer, an async verifier. The engine parks it
+/// and drives `poll` when the caller signals progress, `cancel` if the
+/// handshake is abandoned before it resolves, and `release` exactly once at the
+/// end (after completion or cancellation). While pending, the operation owns a
+/// snapshot of whatever input it needs; the engine's stack buffers may vanish.
+pub const PendingOperation = struct {
+    handle: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        /// Poll for completion: returns true and fills `out` when done, false
+        /// while still pending. An error terminates the operation.
+        poll: *const fn (handle: *anyopaque, out: *Completion) OperationError!bool,
+        /// Abandon an in-flight operation (handshake cancelled or failed).
+        cancel: *const fn (handle: *anyopaque) void,
+        /// Release operation resources. Called exactly once.
+        release: *const fn (handle: *anyopaque) void,
+    };
+
+    pub fn poll(self: PendingOperation, out: *Completion) OperationError!bool {
+        return self.vtable.poll(self.handle, out);
+    }
+    pub fn cancel(self: PendingOperation) void {
+        self.vtable.cancel(self.handle);
+    }
+    pub fn release(self: PendingOperation) void {
+        self.vtable.release(self.handle);
+    }
+};
+
+/// The result of an authentication callback: `complete` synchronously with a
+/// value, or `pending` with an operation the engine resumes later. A
+/// synchronous provider always returns `complete` and never allocates a
+/// `PendingOperation`; the contract does not force private-key work to block.
+pub fn Progress(comptime T: type) type {
+    return union(enum) {
+        complete: T,
+        pending: PendingOperation,
+    };
+}
 
 // ===========================================================================
 // Typed failures and deterministic alert mapping.
@@ -601,7 +671,7 @@ pub const FixedCredentialProvider = struct {
 
     const vtable = CredentialProvider.VTable{ .select = select };
 
-    fn select(ctx: *anyopaque, selection: *const SelectionContext, out: *SelectedCredential) SelectError!void {
+    fn select(ctx: *anyopaque, selection: *const SelectionContext) SelectError!Progress(SelectedCredential) {
         const self: *FixedCredentialProvider = @ptrCast(@alignCast(ctx));
         if (self.identity.certificate_der.len == 0) return error.MalformedCredentialChain;
         const scheme = self.identity.signatureScheme();
@@ -610,7 +680,7 @@ pub const FixedCredentialProvider = struct {
         // richer selection would try alternate credentials; a fixed provider
         // has only this one).
         if (!selection.offersScheme(scheme)) return error.NoCompatibleSignatureAlgorithm;
-        out.* = .{ .handle = self, .scheme = scheme, .vtable = &credential_vtable };
+        return .{ .complete = .{ .handle = self, .scheme = scheme, .vtable = &credential_vtable } };
     }
 
     const credential_vtable = SelectedCredential.VTable{
@@ -624,12 +694,12 @@ pub const FixedCredentialProvider = struct {
         return .{ .entries = self.chain_entry[0..] };
     }
 
-    fn credentialSign(handle: *anyopaque, scheme: SignatureScheme, input: []const u8, out: []u8) SignError!usize {
+    fn credentialSign(handle: *anyopaque, scheme: SignatureScheme, input: []const u8, out: []u8) SignError!Progress(usize) {
         const self: *FixedCredentialProvider = @ptrCast(@alignCast(handle));
         // The engine signs with the scheme the credential reported; a mismatch
         // would be an engine bug, guarded here defensively.
         if (scheme != self.identity.signatureScheme()) return error.InvalidCallbackBehavior;
-        return self.identity.sign(input, out);
+        return .{ .complete = try self.identity.sign(input, out) };
     }
 
     fn credentialRelease(handle: *anyopaque) void {
@@ -668,13 +738,14 @@ pub const FixedVerifier = struct {
 
     const vtable = PeerVerifier.VTable{ .verify = verify };
 
-    fn verify(ctx: *anyopaque, context: *const VerificationContext) VerifyError!Verdict {
+    fn verify(ctx: *anyopaque, context: *const VerificationContext) VerifyError!Progress(Verdict) {
         const self: *FixedVerifier = @ptrCast(@alignCast(ctx));
         const leaf = context.chain.leaf() orelse return error.InvalidPeerCertificateChain;
-        return switch (self.trust) {
+        const verdict: Verdict = switch (self.trust) {
             .pinned_certificate => |pin| if (std.mem.eql(u8, leaf, pin)) .accepted else .rejected,
             .insecure_no_verification => .not_checked,
         };
+        return .{ .complete = verdict };
     }
 };
 
@@ -741,6 +812,22 @@ pub const MockCredentialProvider = struct {
     /// CertificateVerify does not check out (proof-of-possession failure).
     flip_signature: bool = false,
     chain_storage: [16][]const u8 = undefined,
+    /// Async modelling: when set, `select`/`sign` return `pending`, and the
+    /// pending operation reports `pending` for `pending_polls` polls before
+    /// completing (or failing, when `pending_fails`).
+    async_select: bool = false,
+    async_sign: bool = false,
+    pending_polls: usize = 1,
+    pending_fails: bool = false,
+    poll_count: usize = 0,
+    cancel_count: usize = 0,
+    op_release_count: usize = 0,
+    // Snapshot of the signing job captured when a pending sign is issued.
+    pending_kind: enum { none, select, sign } = .none,
+    pending_out: []u8 = &.{},
+    pending_input: [256]u8 = undefined,
+    pending_input_len: usize = 0,
+    remaining_polls: usize = 0,
 
     select_count: usize = 0,
     sign_count: usize = 0,
@@ -768,9 +855,13 @@ pub const MockCredentialProvider = struct {
         return if (self.last_server_name_present) self.last_server_name_buf[0..self.last_server_name_len] else null;
     }
 
+    pub fn selectedCredential(self: *MockCredentialProvider) SelectedCredential {
+        return .{ .handle = self, .scheme = self.identity.signatureScheme(), .vtable = &credential_vtable };
+    }
+
     const vtable = CredentialProvider.VTable{ .select = select };
 
-    fn select(ctx: *anyopaque, selection: *const SelectionContext, out: *SelectedCredential) SelectError!void {
+    fn select(ctx: *anyopaque, selection: *const SelectionContext) SelectError!Progress(SelectedCredential) {
         const self: *MockCredentialProvider = @ptrCast(@alignCast(ctx));
         self.select_count += 1;
         self.last_role = selection.role;
@@ -787,7 +878,49 @@ pub const MockCredentialProvider = struct {
         if (self.force_select_error) |err| return err;
         const scheme = self.identity.signatureScheme();
         if (!self.ignore_offer and !selection.offersScheme(scheme)) return error.NoCompatibleSignatureAlgorithm;
-        out.* = .{ .handle = self, .scheme = scheme, .vtable = &credential_vtable };
+        if (self.async_select) {
+            self.pending_kind = .select;
+            self.remaining_polls = self.pending_polls;
+            return .{ .pending = self.pendingOp() };
+        }
+        return .{ .complete = self.selectedCredential() };
+    }
+
+    fn pendingOp(self: *MockCredentialProvider) PendingOperation {
+        return .{ .handle = self, .vtable = &op_vtable };
+    }
+
+    const op_vtable = PendingOperation.VTable{ .poll = opPoll, .cancel = opCancel, .release = opRelease };
+
+    fn opPoll(handle: *anyopaque, out: *Completion) OperationError!bool {
+        const self: *MockCredentialProvider = @ptrCast(@alignCast(handle));
+        self.poll_count += 1;
+        if (self.remaining_polls > 0) {
+            self.remaining_polls -= 1;
+            return false;
+        }
+        if (self.pending_fails) return error.OperationFailed;
+        switch (self.pending_kind) {
+            .select => out.* = .{ .credential = self.selectedCredential() },
+            .sign => {
+                self.sign_count += 1;
+                const written = self.identity.sign(self.pending_input[0..self.pending_input_len], self.pending_out) catch
+                    return error.OperationFailed;
+                out.* = .{ .signature_len = written };
+            },
+            .none => return error.InvalidCallbackBehavior,
+        }
+        return true;
+    }
+
+    fn opCancel(handle: *anyopaque) void {
+        const self: *MockCredentialProvider = @ptrCast(@alignCast(handle));
+        self.cancel_count += 1;
+    }
+
+    fn opRelease(handle: *anyopaque) void {
+        const self: *MockCredentialProvider = @ptrCast(@alignCast(handle));
+        self.op_release_count += 1;
     }
 
     const credential_vtable = SelectedCredential.VTable{
@@ -805,15 +938,26 @@ pub const MockCredentialProvider = struct {
         return .{ .entries = self.chain_storage[0..n] };
     }
 
-    fn credentialSign(handle: *anyopaque, scheme: SignatureScheme, input: []const u8, out: []u8) SignError!usize {
+    fn credentialSign(handle: *anyopaque, scheme: SignatureScheme, input: []const u8, out: []u8) SignError!Progress(usize) {
         const self: *MockCredentialProvider = @ptrCast(@alignCast(handle));
+        _ = scheme;
+        if (self.async_sign) {
+            // Snapshot the transcript-derived input and capture the (stable,
+            // engine-owned) output buffer; complete on a later poll.
+            self.pending_kind = .sign;
+            self.remaining_polls = self.pending_polls;
+            const n = @min(input.len, self.pending_input.len);
+            @memcpy(self.pending_input[0..n], input[0..n]);
+            self.pending_input_len = n;
+            self.pending_out = out;
+            return .{ .pending = self.pendingOp() };
+        }
         self.sign_count += 1;
         if (self.force_sign_error) |err| return err;
-        if (self.force_sign_len) |forced| return forced; // may exceed out.len on purpose
-        _ = scheme;
+        if (self.force_sign_len) |forced| return .{ .complete = forced }; // may exceed out.len on purpose
         const written = try self.identity.sign(input, out);
         if (self.flip_signature and written > 0) out[0] ^= 0xff;
-        return written;
+        return .{ .complete = written };
     }
 
     fn credentialRelease(handle: *anyopaque) void {
@@ -836,6 +980,14 @@ pub const MockVerifier = struct {
     last_server_name_buf: [256]u8 = undefined,
     last_server_name_len: usize = 0,
     last_server_name_present: bool = false,
+    /// Async modelling: return `pending`, resolving to `result` after
+    /// `pending_polls` polls.
+    async_mode: bool = false,
+    pending_polls: usize = 1,
+    remaining_polls: usize = 0,
+    poll_count: usize = 0,
+    cancel_count: usize = 0,
+    op_release_count: usize = 0,
 
     pub fn init(result: VerifyError!Verdict) MockVerifier {
         return .{ .result = result };
@@ -851,7 +1003,7 @@ pub const MockVerifier = struct {
 
     const vtable = PeerVerifier.VTable{ .verify = verify };
 
-    fn verify(ctx: *anyopaque, context: *const VerificationContext) VerifyError!Verdict {
+    fn verify(ctx: *anyopaque, context: *const VerificationContext) VerifyError!Progress(Verdict) {
         const self: *MockVerifier = @ptrCast(@alignCast(ctx));
         self.verify_count += 1;
         self.last_chain_len = context.chain.count();
@@ -866,7 +1018,35 @@ pub const MockVerifier = struct {
             self.last_server_name_present = false;
             self.last_server_name_len = 0;
         }
-        return self.result;
+        if (self.async_mode) {
+            self.remaining_polls = self.pending_polls;
+            return .{ .pending = .{ .handle = self, .vtable = &op_vtable } };
+        }
+        return .{ .complete = try self.result };
+    }
+
+    const op_vtable = PendingOperation.VTable{ .poll = opPoll, .cancel = opCancel, .release = opRelease };
+
+    fn opPoll(handle: *anyopaque, out: *Completion) OperationError!bool {
+        const self: *MockVerifier = @ptrCast(@alignCast(handle));
+        self.poll_count += 1;
+        if (self.remaining_polls > 0) {
+            self.remaining_polls -= 1;
+            return false;
+        }
+        const verdict = self.result catch return error.OperationFailed;
+        out.* = .{ .verdict = verdict };
+        return true;
+    }
+
+    fn opCancel(handle: *anyopaque) void {
+        const self: *MockVerifier = @ptrCast(@alignCast(handle));
+        self.cancel_count += 1;
+    }
+
+    fn opRelease(handle: *anyopaque) void {
+        const self: *MockVerifier = @ptrCast(@alignCast(handle));
+        self.op_release_count += 1;
     }
 };
 
@@ -889,14 +1069,34 @@ fn testSelection(schemes: []const u16) SelectionContext {
     };
 }
 
+// Synchronous unwrap helpers for the contract tests: assert the callback
+// completed rather than returning `pending`.
+fn syncSelect(provider: CredentialProvider, selection: *const SelectionContext) !SelectedCredential {
+    return switch (try provider.selectCredential(selection)) {
+        .complete => |credential| credential,
+        .pending => error.TestUnexpectedPending,
+    };
+}
+fn syncSign(credential: SelectedCredential, input: []const u8, out: []u8) !usize {
+    return switch (try credential.sign(input, out)) {
+        .complete => |written| written,
+        .pending => error.TestUnexpectedPending,
+    };
+}
+fn syncVerify(v: PeerVerifier, context: *const VerificationContext) !Verdict {
+    return switch (try v.verifyPeer(context)) {
+        .complete => |verdict| verdict,
+        .pending => error.TestUnexpectedPending,
+    };
+}
+
 test "fixed provider selects and exposes its public chain without private-key bytes" {
     var fixed = FixedCredentialProvider.init(testdata.identity());
     defer fixed.deinit();
     const provider = fixed.provider();
 
     const selection = testSelection(&.{ 0x0807, 0x0403 });
-    var credential: SelectedCredential = undefined;
-    try provider.selectCredential(&selection, &credential);
+    const credential = try syncSelect(provider, &selection);
     try testing.expectEqual(SignatureScheme.ed25519, credential.scheme);
 
     const chain = credential.certificateChain();
@@ -910,13 +1110,12 @@ test "fixed provider signs a bounded output the certificate can verify" {
     defer fixed.deinit();
     const provider = fixed.provider();
     const selection = testSelection(&.{0x0807});
-    var credential: SelectedCredential = undefined;
-    try provider.selectCredential(&selection, &credential);
+    const credential = try syncSelect(provider, &selection);
     defer credential.release();
 
     const message = "TLS 1.3 CertificateVerify transcript-derived signing input";
     var sig_buf: [128]u8 = undefined;
-    const written = try credential.sign(message, &sig_buf);
+    const written = try syncSign(credential, message, &sig_buf);
     try testing.expectEqual(Ed25519.Signature.encoded_length, written);
 
     // The signature verifies against the certificate's Ed25519 public key.
@@ -931,8 +1130,7 @@ test "fixed provider rejects an output buffer too small for the signature" {
     defer fixed.deinit();
     const provider = fixed.provider();
     const selection = testSelection(&.{0x0807});
-    var credential: SelectedCredential = undefined;
-    try provider.selectCredential(&selection, &credential);
+    const credential = try syncSelect(provider, &selection);
     defer credential.release();
 
     var tiny: [16]u8 = undefined;
@@ -946,12 +1144,11 @@ test "fixed provider filters on the peer's offered signature algorithms" {
 
     // Peer offers only ECDSA P-256; the Ed25519 credential is not compatible.
     const ecdsa_only = testSelection(&.{0x0403});
-    var credential: SelectedCredential = undefined;
-    try testing.expectError(error.NoCompatibleSignatureAlgorithm, provider.selectCredential(&ecdsa_only, &credential));
+    try testing.expectError(error.NoCompatibleSignatureAlgorithm, provider.selectCredential(&ecdsa_only));
 
     // With no schemes offered at all, still no compatible scheme.
     const none = testSelection(&.{});
-    try testing.expectError(error.NoCompatibleSignatureAlgorithm, provider.selectCredential(&none, &credential));
+    try testing.expectError(error.NoCompatibleSignatureAlgorithm, provider.selectCredential(&none));
 }
 
 test "selection context preserves the exact SNI and absent SNI deterministically" {
@@ -969,8 +1166,7 @@ test "mock provider selects the compatible preferred scheme among several offers
     const provider = mock.provider();
     // Peer offers ECDSA first, then Ed25519; the Ed25519 credential still binds.
     const selection = testSelection(&.{ 0x0403, 0x0807 });
-    var credential: SelectedCredential = undefined;
-    try provider.selectCredential(&selection, &credential);
+    const credential = try syncSelect(provider, &selection);
     try testing.expectEqual(SignatureScheme.ed25519, credential.scheme);
     try testing.expectEqual(@as(usize, 1), mock.select_count);
     try testing.expectEqual(@as(usize, 2), mock.last_offered_scheme_count);
@@ -983,8 +1179,7 @@ test "SelectedCredential.sign catches a provider that overreports its length" {
     mock.force_sign_len = 999; // claim a write far past the buffer
     const provider = mock.provider();
     const selection = testSelection(&.{0x0807});
-    var credential: SelectedCredential = undefined;
-    try provider.selectCredential(&selection, &credential);
+    const credential = try syncSelect(provider, &selection);
     defer credential.release();
 
     var out: [128]u8 = undefined;
@@ -996,8 +1191,7 @@ test "mock provider reports a scripted signing failure" {
     mock.force_sign_error = error.SigningProviderFailure;
     const provider = mock.provider();
     const selection = testSelection(&.{0x0807});
-    var credential: SelectedCredential = undefined;
-    try provider.selectCredential(&selection, &credential);
+    const credential = try syncSelect(provider, &selection);
     defer credential.release();
     var out: [128]u8 = undefined;
     try testing.expectError(error.SigningProviderFailure, credential.sign("input", &out));
@@ -1016,14 +1210,14 @@ test "fixed verifier accepts a matching pin and rejects a mismatch" {
     };
 
     var pinned = FixedVerifier.init(.{ .pinned_certificate = testdata.certificate_der });
-    try testing.expectEqual(Verdict.accepted, try pinned.verifier().verifyPeer(&context));
+    try testing.expectEqual(Verdict.accepted, try syncVerify(pinned.verifier(), &context));
 
     var wrong = [_]u8{0} ** 4;
     var mismatched = FixedVerifier.init(.{ .pinned_certificate = &wrong });
-    try testing.expectEqual(Verdict.rejected, try mismatched.verifier().verifyPeer(&context));
+    try testing.expectEqual(Verdict.rejected, try syncVerify(mismatched.verifier(), &context));
 
     var insecure = FixedVerifier.init(.insecure_no_verification);
-    try testing.expectEqual(Verdict.not_checked, try insecure.verifier().verifyPeer(&context));
+    try testing.expectEqual(Verdict.not_checked, try syncVerify(insecure.verifier(), &context));
 }
 
 test "fixed verifier reports an empty chain as an invalid peer chain" {
@@ -1054,7 +1248,7 @@ test "mock verifier can reject, error, and report a scripted verdict with call c
     };
 
     var rejecting = MockVerifier.init(.rejected);
-    try testing.expectEqual(Verdict.rejected, try rejecting.verifier().verifyPeer(&context));
+    try testing.expectEqual(Verdict.rejected, try syncVerify(rejecting.verifier(), &context));
     try testing.expectEqual(@as(usize, 1), rejecting.verify_count);
     try testing.expectEqual(@as(usize, 1), rejecting.last_chain_len);
     try testing.expectEqual(Role.client, rejecting.last_role.?);

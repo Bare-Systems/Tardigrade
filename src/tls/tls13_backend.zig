@@ -261,8 +261,21 @@ pub const Tls13Backend = struct {
     peer_chain_entries: [max_peer_chain_entries]Slice = undefined,
     peer_chain_count: usize = 0,
     peer_chain_len: usize = 0,
+    /// A parked asynchronous authentication operation (an external signer,
+    /// verifier, or async selector that returned `pending`). While set, the
+    /// handshake is suspended: the receive loop stops consuming and the driver
+    /// must call `resumeAuth` when the operation signals progress.
+    pending_op: ?credentials.PendingOperation = null,
+    pending_stage: PendingStage = undefined,
+    /// The selected credential held across a pending signature (released when
+    /// the signature completes, or cancelled at teardown).
+    pending_credential: ?credentials.SelectedCredential = null,
+    /// Stable, engine-owned signature output buffer. An async signer keeps a
+    /// pointer to this across the suspend; the engine reads it on completion.
+    pending_signature: [max_signature_len]u8 = undefined,
 
     const Slice = struct { start: usize, len: usize };
+    const PendingStage = enum { server_select, server_sign, client_verify };
 
     /// Options for a client that verifies its peer through an external verifier:
     /// the exact intended server name (emitted as SNI and handed to the
@@ -400,6 +413,10 @@ pub const Tls13Backend = struct {
     }
 
     pub fn deinit(self: *Tls13Backend) void {
+        // Cancel and release any parked async operation (and held credential)
+        // exactly once before tearing down the rest.
+        self.cancelPendingAuth();
+        crypto.secureZero(u8, &self.pending_signature);
         if (self.schedule) |*schedule| schedule.wipe();
         self.schedule = null;
         crypto.secureZero(u8, &self.expected_client_verify);
@@ -480,6 +497,10 @@ pub const Tls13Backend = struct {
             _ = self.core.acceptReceived(message.raw) catch |err| return mapCoreError(err);
             try self.onMessage(message, level, transcript_before, sink);
             input.discard(message.raw.len) catch |err| return mapCoreError(err);
+            // A parked async authentication operation suspends the handshake:
+            // stop consuming buffered messages until the driver resumes it (any
+            // remaining bytes stay buffered and are drained on the next drive).
+            if (self.pending_op != null) break;
             // A failed or freshly completed handshake stops consuming its own
             // epochs; post-handshake application input keeps draining (a peer
             // may batch several NewSessionTickets).
@@ -851,8 +872,19 @@ pub const Tls13Backend = struct {
             .application_protocol = self.alpn(),
             .auth_policy = self.auth_policy,
         };
-        const verdict = verifier.verifyPeer(&context) catch |err|
-            return self.failCredential(credentials.classifyVerifyError(err));
+        // The verifier may resolve synchronously or return a pending operation
+        // (an async Web-PKI/OCSP lookup); park the latter and resume later.
+        switch (verifier.verifyPeer(&context) catch |err|
+            return self.failCredential(credentials.classifyVerifyError(err)))
+        {
+            .complete => |verdict| return self.applyClientVerdict(verdict, sink),
+            .pending => |op| return self.parkAuth(op, .client_verify),
+        }
+    }
+
+    /// Apply a peer-verification verdict: emit the certificate state and fail
+    /// closed on rejection. Reachable synchronously and after resume.
+    fn applyClientVerdict(self: *Tls13Backend, verdict: credentials.Verdict, sink: *EventSink) HandshakeError!void {
         const state: CertificateState = switch (verdict) {
             .accepted => .valid,
             .not_checked => .not_checked,
@@ -1121,8 +1153,6 @@ pub const Tls13Backend = struct {
     /// EncryptedExtensions + Certificate + CertificateVerify + Finished at the
     /// Handshake level, followed by the 1-RTT secrets.
     fn sendServerFlight(self: *Tls13Backend, sink: *EventSink) HandshakeError!void {
-        const schedule = &self.schedule.?;
-
         // Resolve the credential provider — an external one, or the fixed
         // identity wrapped in the identical production contract — and select a
         // credential for the negotiated parameters. There is one path.
@@ -1142,18 +1172,28 @@ pub const Tls13Backend = struct {
         };
 
         var selection = self.serverSelectionContext();
-        var credential: credentials.SelectedCredential = undefined;
-        provider.selectCredential(&selection, &credential) catch |err|
-            return self.failCredential(credentials.classifySelectError(err));
-        // The selected handle is released exactly once — after the flight is
-        // signed, or immediately on any failure below (cancellation included).
-        defer credential.release();
+        // Selection may complete synchronously or return a pending operation
+        // (e.g. an async SNI lookup); park the latter and resume later.
+        switch (provider.selectCredential(&selection) catch |err|
+            return self.failCredential(credentials.classifySelectError(err)))
+        {
+            .complete => |credential| return self.emitServerAuthFlight(credential, sink),
+            .pending => |op| return self.parkAuth(op, .server_select),
+        }
+    }
 
-        // Validate provider output before trusting it. A buggy or hostile
-        // provider must not make the engine emit a CertificateVerify scheme the
-        // client never offered, nor a chain that overflows the flight buffer as
-        // a generic writer error. Every violation is a local provider fault, and
-        // signing never happens when validation fails.
+    /// Validate the selected credential, emit EncryptedExtensions+Certificate,
+    /// then sign CertificateVerify — synchronously, or by parking a pending
+    /// signer. On any failure the handle is released exactly once.
+    fn emitServerAuthFlight(self: *Tls13Backend, credential: credentials.SelectedCredential, sink: *EventSink) HandshakeError!void {
+        var owned = true;
+        errdefer if (owned) credential.release();
+
+        // Validate provider output before trusting it: the returned scheme must
+        // have been offered (else the CertificateVerify carries an algorithm the
+        // client never advertised), and the chain must fit the flight bounds. A
+        // violation is a local provider fault; signing never happens.
+        const selection = self.serverSelectionContext();
         if (!selection.offersScheme(credential.scheme))
             return self.failCredential(.invalid_callback_behavior);
         const chain = credential.certificateChain();
@@ -1198,7 +1238,7 @@ pub const Tls13Backend = struct {
         const encrypted_extensions = buf[0..w.len];
 
         // Certificate: the selected credential's validated public DER chain,
-        // valid until `release`. The chain was bounds-checked above.
+        // valid until `release`.
         const cert_start = w.len;
         try w.u8_(@intFromEnum(MessageType.certificate));
         const cert_len = try w.reserve(3);
@@ -1214,27 +1254,48 @@ pub const Tls13Backend = struct {
         w.patch(3, cert_len);
         const certificate = buf[cert_start..w.len];
 
-        // CertificateVerify signs the transcript through Certificate. Signing
-        // goes through the credential's opaque handle into a bounded, caller-
-        // owned scratch buffer; the private key never enters the engine.
         self.core.recordSent(encrypted_extensions) catch |err| return mapCoreError(err);
         self.core.recordSent(certificate) catch |err| return mapCoreError(err);
+        try sink.emitCrypto(.handshake, buf[0..w.len]);
+
+        // CertificateVerify signs the transcript through Certificate, into the
+        // engine-owned buffer. Signing goes through the opaque handle; the
+        // private key never enters the engine. An async signer parks here.
         const content = certificateVerifyContent(.server, self.core.transcriptHash());
-        const verify_start = w.len;
+        switch (credential.sign(content.slice(), &self.pending_signature) catch |err|
+            return self.failCredential(credentials.classifySignError(err)))
+        {
+            .complete => |len| {
+                owned = false; // ownership passes to serverFinishFlight
+                return self.serverFinishFlight(credential, len, sink);
+            },
+            .pending => |op| {
+                owned = false; // ownership passes to the parked operation
+                self.pending_credential = credential;
+                return self.parkAuth(op, .server_sign);
+            },
+        }
+    }
+
+    /// Emit CertificateVerify (with the completed signature) and Finished, then
+    /// the 1-RTT secrets. Releases the credential exactly once. Reachable both
+    /// synchronously and after resuming a pending signature.
+    fn serverFinishFlight(self: *Tls13Backend, credential: credentials.SelectedCredential, sig_len: usize, sink: *EventSink) HandshakeError!void {
+        defer credential.release();
+        const schedule = &self.schedule.?;
+        if (sig_len > self.pending_signature.len) return self.failCredential(.signature_output_overflow);
+
+        var buf: [max_message_len]u8 = undefined;
+        var w = Writer{ .buf = &buf };
         try w.u8_(@intFromEnum(MessageType.certificate_verify));
         const verify_len = try w.reserve(3);
         try w.u16_(credential.scheme.code());
         const sig_len_slot = try w.reserve(2);
-        var sig_scratch: [max_signature_len]u8 = undefined;
-        // Signature scratch is transcript-derived, not secret key material, but
-        // wipe it after use as a matter of hygiene.
-        defer crypto.secureZero(u8, &sig_scratch);
-        const sig_written = credential.sign(content.slice(), &sig_scratch) catch |err|
-            return self.failCredential(credentials.classifySignError(err));
-        try w.bytes(sig_scratch[0..sig_written]);
+        try w.bytes(self.pending_signature[0..sig_len]);
         w.patch(2, sig_len_slot);
         w.patch(3, verify_len);
-        const certificate_verify = buf[verify_start..w.len];
+        const certificate_verify = buf[0..w.len];
+        crypto.secureZero(u8, &self.pending_signature);
         self.core.recordSent(certificate_verify) catch |err| return mapCoreError(err);
 
         // Finished covers the transcript through CertificateVerify.
@@ -1247,6 +1308,8 @@ pub const Tls13Backend = struct {
         w.patch(3, finished_len);
         const finished = buf[finished_start..w.len];
         self.core.recordSent(finished) catch |err| return mapCoreError(err);
+        // Emit CertificateVerify and Finished together (the second half of the
+        // flight; EncryptedExtensions+Certificate were emitted before signing).
         try sink.emitCrypto(.handshake, buf[0..w.len]);
 
         // 1-RTT secrets from the transcript through server Finished; the
@@ -1259,6 +1322,78 @@ pub const Tls13Backend = struct {
         var client_verify = KeySchedule.verifyData(&schedule.client_handshake_traffic, finished_hash);
         defer crypto.secureZero(u8, &client_verify);
         self.expected_client_verify = client_verify;
+    }
+
+    // -----------------------------------------------------------------------
+    // Asynchronous authentication (parking / resume / cancel).
+    // -----------------------------------------------------------------------
+
+    /// True while an authentication operation is parked; the driver must call
+    /// `resumeAuth` when it signals progress, and stop feeding new bytes.
+    pub fn authPending(self: *const Tls13Backend) bool {
+        return self.pending_op != null;
+    }
+
+    fn parkAuth(self: *Tls13Backend, op: credentials.PendingOperation, stage: PendingStage) void {
+        self.pending_op = op;
+        self.pending_stage = stage;
+    }
+
+    /// Poll a parked authentication operation. When it is still pending this is
+    /// a no-op; when it completes the handshake resumes exactly where it
+    /// suspended, recording no handshake message twice; when it fails the typed
+    /// failure is latched.
+    pub fn resumeAuth(self: *Tls13Backend, sink: *EventSink) HandshakeError!void {
+        const op = self.pending_op orelse return error.InvalidHandshakeState;
+        const stage = self.pending_stage;
+        var completion: credentials.Completion = undefined;
+        const done = op.poll(&completion) catch {
+            self.cancelPendingAuth();
+            return self.failCredential(pendingFailureClass(stage));
+        };
+        if (!done) return; // still pending; the driver polls again later
+        op.release();
+        self.pending_op = null;
+        switch (stage) {
+            .server_select => {
+                if (completion != .credential) return self.failCredential(.provider_internal_failure);
+                return self.emitServerAuthFlight(completion.credential, sink);
+            },
+            .server_sign => {
+                if (completion != .signature_len) return self.failCredential(.invalid_callback_behavior);
+                const credential = self.pending_credential orelse return error.InvalidHandshakeState;
+                self.pending_credential = null;
+                return self.serverFinishFlight(credential, completion.signature_len, sink);
+            },
+            .client_verify => {
+                if (completion != .verdict) return self.failCredential(.verifier_internal_failure);
+                return self.applyClientVerdict(completion.verdict, sink);
+            },
+        }
+    }
+
+    /// The failure class for a pending operation that reported an error, by
+    /// the stage it was resolving.
+    fn pendingFailureClass(stage: PendingStage) CredentialFailure {
+        return switch (stage) {
+            .server_select => .provider_internal_failure,
+            .server_sign => .signing_provider_failure,
+            .client_verify => .verifier_internal_failure,
+        };
+    }
+
+    /// Cancel and release a parked operation (and any held credential) exactly
+    /// once, on handshake teardown or failure.
+    fn cancelPendingAuth(self: *Tls13Backend) void {
+        if (self.pending_op) |op| {
+            op.cancel();
+            op.release();
+            self.pending_op = null;
+        }
+        if (self.pending_credential) |credential| {
+            credential.release();
+            self.pending_credential = null;
+        }
     }
 
     fn onClientFinished(self: *Tls13Backend, body: []const u8, sink: *EventSink) HandshakeError!void {

@@ -87,11 +87,18 @@ const Group = struct {
 
 const Presented = union(Form) {
     directory_name: *const x509.Name,
-    dns_name: []const u8,
+    dns_name: PresentedDns,
     rfc822_name: []const u8,
     /// Parsed DNS host, not the complete URI.
     uri: []const u8,
     ip_address: []const u8,
+};
+
+const PresentedDns = union(enum) {
+    exact: []const u8,
+    /// Base below a complete left-most wildcard label. For
+    /// `*.example.com`, this stores `example.com`.
+    wildcard: []const u8,
 };
 
 const State = struct {
@@ -275,7 +282,8 @@ const State = struct {
             if (self.checkPresented(.{ .directory_name = &certificate.subject }, certificate_index)) |failed| return failed;
         }
 
-        if (self.hasState(.rfc822_name)) {
+        const subject_alt_names = certificate.subjectAltName();
+        if (subject_alt_names == null and self.hasState(.rfc822_name)) {
             for (certificate.subject.rdns) |rdn| {
                 for (rdn.attributes) |*attribute| {
                     if (!attribute.type.eqlComponents(&wk.email_address)) continue;
@@ -289,7 +297,7 @@ const State = struct {
             }
         }
 
-        if (certificate.subjectAltName()) |names| {
+        if (subject_alt_names) |names| {
             for (names) |name| {
                 const form = formOf(name) orelse continue;
                 if (!self.hasState(form)) continue;
@@ -319,8 +327,7 @@ const State = struct {
                 break :blk .{ .directory_name = stored };
             },
             .dns_name => |value| blk: {
-                validateDnsName(value) catch return error.Malformed;
-                break :blk .{ .dns_name = value };
+                break :blk .{ .dns_name = parsePresentedDns(value) catch return error.Malformed };
             },
             .rfc822_name => |value| blk: {
                 validateMailbox(value) catch return error.Malformed;
@@ -351,7 +358,7 @@ const State = struct {
         for (self.excluded.items) |entry| {
             if (std.meta.activeTag(entry.constraint) != form) continue;
             if (self.consumeComparison(certificate_index)) |failed| return failed;
-            if (matches(presented, entry.constraint)) {
+            if (matches(presented, entry.constraint, .excluded)) {
                 return violation(certificate_index, form, .excluded, entry.introduced_by);
             }
         }
@@ -361,7 +368,7 @@ const State = struct {
             var matched = false;
             for (self.permitted.items[group.start .. group.start + group.len]) |entry| {
                 if (self.consumeComparison(certificate_index)) |failed| return failed;
-                if (matches(presented, entry.constraint)) {
+                if (matches(presented, entry.constraint, .permitted)) {
                     matched = true;
                     break;
                 }
@@ -443,10 +450,10 @@ fn violation(
     };
 }
 
-fn matches(name: Presented, constraint: Constraint) bool {
+fn matches(name: Presented, constraint: Constraint, kind: ConstraintKind) bool {
     return switch (name) {
         .directory_name => |subject| subject.isWithinSubtree(&constraint.directory_name),
-        .dns_name => |dns| dnsWithin(dns, constraint.dns_name),
+        .dns_name => |dns| dnsConstraintMatches(dns, constraint.dns_name, kind),
         .rfc822_name => |mailbox| emailWithin(mailbox, constraint.rfc822_name),
         .uri => |host| uriHostWithin(host, constraint.uri),
         .ip_address => |address| ipWithin(address, constraint.ip_address),
@@ -479,6 +486,53 @@ fn validateDnsConstraint(constraint: []const u8) NameError!void {
     try validateDnsName(domain);
 }
 
+fn parsePresentedDns(raw: []const u8) NameError!PresentedDns {
+    const name = if (raw.len > 0 and raw[raw.len - 1] == '.') raw[0 .. raw.len - 1] else raw;
+    if (std.mem.startsWith(u8, name, "*.")) {
+        const base = name[2..];
+        try validateDnsName(base);
+        var labels = std.mem.splitScalar(u8, base, '.');
+        var label_count: usize = 0;
+        while (labels.next()) |_| label_count += 1;
+        if (label_count < 2) return error.Malformed;
+        return .{ .wildcard = base };
+    }
+    if (std.mem.indexOfScalar(u8, name, '*') != null) return error.Malformed;
+    try validateDnsName(name);
+    return .{ .exact = name };
+}
+
+fn dnsConstraintMatches(name: PresentedDns, constraint: []const u8, kind: ConstraintKind) bool {
+    return switch (name) {
+        .exact => |exact| dnsWithin(exact, constraint),
+        .wildcard => |base| wildcardDnsMatches(base, constraint, kind),
+    };
+}
+
+fn wildcardDnsMatches(base: []const u8, constraint: []const u8, kind: ConstraintKind) bool {
+    const leading_dot = constraint[0] == '.';
+    const domain = if (leading_dot) constraint[1..] else constraint;
+    return switch (kind) {
+        // Every name represented by `*.base` must be inside a permitted
+        // subtree. That holds exactly when the wildcard base is the subtree
+        // base or one of its descendants; leading-dot constraints still
+        // include the wildcard's one-label descendants when the bases match.
+        .permitted => dnsWithin(base, domain),
+        // An exclusion rejects when its set intersects any name represented
+        // by the wildcard. A strict leading-dot exclusion rooted at a direct
+        // child does not intersect: the wildcard contains that child itself,
+        // but not names below it.
+        .excluded => dnsWithin(base, domain) or
+            (isDirectDnsChild(domain, base) and !leading_dot),
+    };
+}
+
+fn isDirectDnsChild(child: []const u8, parent: []const u8) bool {
+    if (child.len <= parent.len or child[child.len - parent.len - 1] != '.') return false;
+    if (!std.ascii.eqlIgnoreCase(child[child.len - parent.len ..], parent)) return false;
+    return std.mem.indexOfScalar(u8, child[0 .. child.len - parent.len - 1], '.') == null;
+}
+
 fn dnsWithin(name: []const u8, constraint: []const u8) bool {
     // RFC 5280's ordinary dNSName subtree includes the base and descendants.
     // For OpenSSL compatibility, a leading dot means descendants only; this
@@ -491,17 +545,113 @@ fn dnsWithin(name: []const u8, constraint: []const u8) bool {
         std.ascii.eqlIgnoreCase(name[name.len - domain.len ..], domain);
 }
 
-fn splitMailbox(value: []const u8) NameError!struct { local: []const u8, host: []const u8 } {
-    const at = std.mem.lastIndexOfScalar(u8, value, '@') orelse return error.Malformed;
-    if (at == 0 or at + 1 == value.len) return error.Malformed;
-    const local = value[0..at];
-    if (std.mem.indexOfScalar(u8, local, '@') != null) return error.Malformed;
-    for (local) |byte| {
-        if (byte < 0x21 or byte > 0x7e) return error.Malformed;
+const LocalPart = union(enum) {
+    dot_string: []const u8,
+    /// Content between the quotes, with quoted-pair escapes retained. They
+    /// are decoded only by `LocalPartIterator`, so parsing allocates nothing.
+    quoted_string: []const u8,
+};
+
+const Mailbox = struct {
+    local: LocalPart,
+    host: []const u8,
+};
+
+fn splitMailbox(value: []const u8) NameError!Mailbox {
+    if (value.len < 3) return error.Malformed;
+
+    var local: LocalPart = undefined;
+    var at: usize = undefined;
+    if (value[0] == '"') {
+        var index: usize = 1;
+        while (index < value.len) {
+            const byte = value[index];
+            if (byte == '\\') {
+                if (index + 1 >= value.len or !isQuotedPairByte(value[index + 1])) return error.Malformed;
+                index += 2;
+                continue;
+            }
+            if (byte == '"') {
+                at = index + 1;
+                if (at >= value.len or value[at] != '@') return error.Malformed;
+                local = .{ .quoted_string = value[1..index] };
+                break;
+            }
+            if (!isQtextSmtp(byte)) return error.Malformed;
+            index += 1;
+        } else return error.Malformed;
+    } else {
+        at = std.mem.indexOfScalar(u8, value, '@') orelse return error.Malformed;
+        const raw_local = value[0..at];
+        try validateDotString(raw_local);
+        local = .{ .dot_string = raw_local };
     }
+
+    if (at + 1 >= value.len) return error.Malformed;
     const host = value[at + 1 ..];
+    // A second raw '@' is invalid in both the host and an unquoted local part.
+    if (std.mem.indexOfScalar(u8, host, '@') != null) return error.Malformed;
     try validateDnsName(host);
     return .{ .local = local, .host = host };
+}
+
+fn validateDotString(local: []const u8) NameError!void {
+    if (local.len == 0) return error.Malformed;
+    var atoms = std.mem.splitScalar(u8, local, '.');
+    while (atoms.next()) |atom| {
+        if (atom.len == 0) return error.Malformed;
+        for (atom) |byte| if (!isAtext(byte)) return error.Malformed;
+    }
+}
+
+fn isAtext(byte: u8) bool {
+    return std.ascii.isAlphanumeric(byte) or switch (byte) {
+        '!', '#', '$', '%', '&', '\'', '*', '+', '-', '/', '=', '?', '^', '_', '`', '{', '|', '}', '~' => true,
+        else => false,
+    };
+}
+
+fn isQtextSmtp(byte: u8) bool {
+    return (byte >= 32 and byte <= 33) or (byte >= 35 and byte <= 91) or (byte >= 93 and byte <= 126);
+}
+
+fn isQuotedPairByte(byte: u8) bool {
+    return byte >= 32 and byte <= 126;
+}
+
+const LocalPartIterator = struct {
+    raw: []const u8,
+    quoted: bool,
+    index: usize = 0,
+
+    fn init(local: LocalPart) LocalPartIterator {
+        return switch (local) {
+            .dot_string => |raw| .{ .raw = raw, .quoted = false },
+            .quoted_string => |raw| .{ .raw = raw, .quoted = true },
+        };
+    }
+
+    fn next(self: *LocalPartIterator) ?u8 {
+        if (self.index >= self.raw.len) return null;
+        var byte = self.raw[self.index];
+        self.index += 1;
+        if (self.quoted and byte == '\\') {
+            byte = self.raw[self.index];
+            self.index += 1;
+        }
+        return byte;
+    }
+};
+
+fn localPartsEqual(a: LocalPart, b: LocalPart) bool {
+    var a_iterator = LocalPartIterator.init(a);
+    var b_iterator = LocalPartIterator.init(b);
+    while (true) {
+        const a_byte = a_iterator.next();
+        const b_byte = b_iterator.next();
+        if (a_byte != b_byte) return false;
+        if (a_byte == null) return true;
+    }
 }
 
 fn validateMailbox(value: []const u8) NameError!void {
@@ -520,7 +670,7 @@ fn emailWithin(mailbox: []const u8, constraint: []const u8) bool {
     const parsed = splitMailbox(mailbox) catch return false;
     if (std.mem.indexOfScalar(u8, constraint, '@') != null) {
         const expected = splitMailbox(constraint) catch return false;
-        return std.mem.eql(u8, parsed.local, expected.local) and std.ascii.eqlIgnoreCase(parsed.host, expected.host);
+        return localPartsEqual(parsed.local, expected.local) and std.ascii.eqlIgnoreCase(parsed.host, expected.host);
     }
     if (constraint[0] == '.') {
         const domain = constraint[1..];
@@ -557,7 +707,11 @@ fn uriHost(uri: []const u8, maximum_length: usize) UriError![]const u8 {
     }
     var authority = uri[authority_start..authority_end];
     if (authority.len == 0) return error.Malformed;
-    if (std.mem.lastIndexOfScalar(u8, authority, '@')) |at| authority = authority[at + 1 ..];
+    if (std.mem.indexOfScalar(u8, authority, '@')) |at| {
+        if (std.mem.indexOfScalar(u8, authority[at + 1 ..], '@') != null) return error.Malformed;
+        validateUserinfo(authority[0..at]) catch return error.Malformed;
+        authority = authority[at + 1 ..];
+    }
     if (authority.len == 0 or authority[0] == '[') return error.Malformed;
 
     var host = authority;
@@ -570,6 +724,26 @@ fn uriHost(uri: []const u8, maximum_length: usize) UriError![]const u8 {
     if (isIpv4Literal(host)) return error.Malformed;
     validateDnsName(host) catch return error.Malformed;
     return host;
+}
+
+fn validateUserinfo(userinfo: []const u8) NameError!void {
+    var index: usize = 0;
+    while (index < userinfo.len) {
+        const byte = userinfo[index];
+        if (byte == '%') {
+            if (index + 2 >= userinfo.len or
+                !std.ascii.isHex(userinfo[index + 1]) or
+                !std.ascii.isHex(userinfo[index + 2])) return error.Malformed;
+            index += 3;
+            continue;
+        }
+        const allowed = std.ascii.isAlphanumeric(byte) or switch (byte) {
+            '-', '.', '_', '~', '!', '$', '&', '\'', '(', ')', '*', '+', ',', ';', '=', ':' => true,
+            else => false,
+        };
+        if (!allowed) return error.Malformed;
+        index += 1;
+    }
 }
 
 fn isIpv4Literal(host: []const u8) bool {
@@ -635,6 +809,21 @@ test "DNS constraints use label boundaries and leading-dot subdomains only" {
     try std.testing.expect(dnsWithin("WWW.Example.COM", "example.com"));
 }
 
+test "wildcard DNS constraints use permitted-subset and excluded-intersection semantics" {
+    const wildcard = try parsePresentedDns("*.example.com");
+    try std.testing.expect(dnsConstraintMatches(wildcard, "example.com", .permitted));
+    try std.testing.expect(dnsConstraintMatches(wildcard, ".example.com", .permitted));
+    try std.testing.expect(!dnsConstraintMatches(wildcard, "foo.example.com", .permitted));
+    try std.testing.expect(dnsConstraintMatches(wildcard, "foo.example.com", .excluded));
+    try std.testing.expect(!dnsConstraintMatches(wildcard, ".foo.example.com", .excluded));
+    try std.testing.expect(dnsConstraintMatches(wildcard, ".example.com", .excluded));
+
+    try std.testing.expectError(error.Malformed, parsePresentedDns("*"));
+    try std.testing.expectError(error.Malformed, parsePresentedDns("a.*.example.com"));
+    try std.testing.expectError(error.Malformed, parsePresentedDns("f*o.example.com"));
+    try std.testing.expectError(error.Malformed, parsePresentedDns("*.com"));
+}
+
 test "email constraints preserve local-part case and distinguish host from domain" {
     try std.testing.expect(emailWithin("root@example.com", "root@example.com"));
     try std.testing.expect(!emailWithin("ROOT@example.com", "root@example.com"));
@@ -642,16 +831,26 @@ test "email constraints preserve local-part case and distinguish host from domai
     try std.testing.expect(!emailWithin("any@sub.example.com", "example.com"));
     try std.testing.expect(emailWithin("any@sub.example.com", ".example.com"));
     try std.testing.expect(!emailWithin("any@example.com", ".example.com"));
+    try std.testing.expect(emailWithin("\"root\"@example.com", "root@example.com"));
+    try std.testing.expect(emailWithin("\"a@b\"@example.com", "example.com"));
+    try std.testing.expectError(error.Malformed, validateMailbox(".a@example.com"));
+    try std.testing.expectError(error.Malformed, validateMailbox("a..b@example.com"));
+    try std.testing.expectError(error.Malformed, validateMailbox("a.@example.com"));
+    try std.testing.expectError(error.Malformed, validateMailbox("a(b)@example.com"));
 }
 
 test "URI host parsing is bounded and constraints distinguish exact hosts from domains" {
     try std.testing.expectEqualStrings("api.example.com", try uriHost("https://user@api.example.com:8443/a?b#c", 256));
+    try std.testing.expectEqualStrings("api.example.com", try uriHost("https://user:pa%73s@api.example.com/a", 256));
     try std.testing.expect(uriHostWithin("api.example.com", "api.example.com"));
     try std.testing.expect(!uriHostWithin("sub.api.example.com", "api.example.com"));
     try std.testing.expect(uriHostWithin("sub.example.com", ".example.com"));
     try std.testing.expectError(error.Malformed, uriHost("urn:example:test", 256));
     try std.testing.expectError(error.Malformed, uriHost("https://[2001:db8::1]/", 256));
     try std.testing.expectError(error.Malformed, uriHost("https://192.0.2.1/", 256));
+    try std.testing.expectError(error.Malformed, uriHost("https://bad@@api.example.com/", 256));
+    try std.testing.expectError(error.Malformed, uriHost("https://bad user@api.example.com/", 256));
+    try std.testing.expectError(error.Malformed, uriHost("https://bad%ZZ@api.example.com/", 256));
     try std.testing.expectError(error.ResourceLimit, uriHost("https://example.com/", 4));
 }
 

@@ -1102,6 +1102,213 @@ test "directory, email, URI, IPv4, and IPv6 constraints validate through signed 
     try expectRejected(&uri_bound, .name_constraints_resource_limit_exceeded, 0);
 }
 
+test "wildcard DNS names apply set semantics through signed paths" {
+    const Case = struct {
+        constraint: []const u8,
+        excluded: bool,
+        accepted: bool,
+    };
+    inline for ([_]Case{
+        .{ .constraint = "example.com", .excluded = false, .accepted = true },
+        .{ .constraint = ".example.com", .excluded = false, .accepted = true },
+        .{ .constraint = "foo.example.com", .excluded = false, .accepted = false },
+        .{ .constraint = "foo.example.com", .excluded = true, .accepted = false },
+        .{ .constraint = ".foo.example.com", .excluded = true, .accepted = true },
+        .{ .constraint = ".example.com", .excluded = true, .accepted = false },
+    }) |case| {
+        var fx = Fixtures.init(testing.allocator);
+        defer fx.deinit();
+        try fx.add(.{ .subject = "Root", .issuer = "Root", .subject_key = 3, .issuer_key = 3 });
+        try fx.add(.{
+            .subject = "Constrained",
+            .issuer = "Root",
+            .subject_key = 2,
+            .issuer_key = 3,
+            .ca = true,
+            .key_usage = 0x04,
+            .name_constraints = if (case.excluded)
+                .{ .excluded = &.{.{ .dns = case.constraint }} }
+            else
+                .{ .permitted = &.{.{ .dns = case.constraint }} },
+        });
+        try fx.add(.{
+            .subject = "wildcard leaf",
+            .issuer = "Constrained",
+            .subject_key = 4,
+            .issuer_key = 2,
+            .ca = false,
+            .key_usage = 0x80,
+            .san = "*.example.com",
+        });
+
+        var entropy: crypto.pure_zig.DeterministicEntropy = undefined;
+        var provider: crypto.pure_zig.Provider = undefined;
+        const cp = cryptoProvider(&entropy, &provider);
+        var result = try validateBuilt(testing.allocator, &fx.certs.items[2], fx.certs.items[1..2], fx.certs.items[0..1], policy(fx.certs.items[0..1]), cp);
+        defer result.deinit(testing.allocator);
+        if (case.accepted) {
+            try expectAccepted(&result, 3);
+        } else {
+            try expectRejected(&result, .name_constraints_violation, 0);
+            try testing.expectEqual(name_constraints.Form.dns_name, result.rejected.name_form.?);
+        }
+    }
+
+    inline for ([_][]const u8{ "*", "a.*.example.com", "f*o.example.com", "*.com" }) |malformed| {
+        var fx = Fixtures.init(testing.allocator);
+        defer fx.deinit();
+        try fx.add(.{ .subject = "Root", .issuer = "Root", .subject_key = 3, .issuer_key = 3 });
+        try fx.add(.{
+            .subject = "Constrained",
+            .issuer = "Root",
+            .subject_key = 2,
+            .issuer_key = 3,
+            .ca = true,
+            .key_usage = 0x04,
+            .name_constraints = .{ .permitted = &.{.{ .dns = "example.com" }} },
+        });
+        try fx.add(.{
+            .subject = "malformed wildcard leaf",
+            .issuer = "Constrained",
+            .subject_key = 4,
+            .issuer_key = 2,
+            .ca = false,
+            .key_usage = 0x80,
+            .san = malformed,
+        });
+
+        var entropy: crypto.pure_zig.DeterministicEntropy = undefined;
+        var provider: crypto.pure_zig.Provider = undefined;
+        const cp = cryptoProvider(&entropy, &provider);
+        var result = try validateBuilt(testing.allocator, &fx.certs.items[2], fx.certs.items[1..2], fx.certs.items[0..1], policy(fx.certs.items[0..1]), cp);
+        defer result.deinit(testing.allocator);
+        try expectRejected(&result, .name_constraints_violation, 0);
+        try testing.expectEqual(name_constraints.Form.dns_name, result.rejected.name_form.?);
+    }
+}
+
+test "mailbox and URI syntax is enforced through signed paths" {
+    var fx = Fixtures.init(testing.allocator);
+    defer fx.deinit();
+    try fx.add(.{ .subject = "Root", .issuer = "Root", .subject_key = 3, .issuer_key = 3 });
+    try fx.add(.{
+        .subject = "Constrained",
+        .issuer = "Root",
+        .subject_key = 2,
+        .issuer_key = 3,
+        .ca = true,
+        .key_usage = 0x04,
+        .name_constraints = .{ .permitted = &.{
+            .{ .email = "root@example.com" },
+            .{ .email = ".example.com" },
+            .{ .uri = ".example.com" },
+        } },
+    });
+    try fx.add(.{
+        .subject = "quoted forms",
+        .issuer = "Constrained",
+        .subject_key = 4,
+        .issuer_key = 2,
+        .ca = false,
+        .key_usage = 0x80,
+        .san_names = &.{
+            .{ .email = "\"root\"@example.com" },
+            .{ .email = "\"a@b\"@sub.example.com" },
+            .{ .uri = "https://user:pa%73s@api.example.com/path" },
+        },
+    });
+    try fx.add(.{
+        .subject = "legacy ignored",
+        .subject_email = "legacy@outside.invalid",
+        .issuer = "Constrained",
+        .subject_key = 5,
+        .issuer_key = 2,
+        .ca = false,
+        .key_usage = 0x80,
+        .san_names = &.{.{ .dns = "outside.invalid" }},
+    });
+    try fx.add(.{
+        .subject = "legacy constrained",
+        .subject_email = "legacy@outside.invalid",
+        .issuer = "Constrained",
+        .subject_key = 6,
+        .issuer_key = 2,
+        .ca = false,
+        .key_usage = 0x80,
+    });
+    try fx.add(.{
+        .subject = "SAN email constrained",
+        .subject_email = "legacy@sub.example.com",
+        .issuer = "Constrained",
+        .subject_key = 7,
+        .issuer_key = 2,
+        .ca = false,
+        .key_usage = 0x80,
+        .san_names = &.{.{ .email = "legacy@outside.invalid" }},
+    });
+
+    const malformed_mailboxes = [_][]const u8{
+        ".a@sub.example.com",
+        "a..b@sub.example.com",
+        "a.@sub.example.com",
+        "a(b)@sub.example.com",
+    };
+    inline for (malformed_mailboxes, 0..) |mailbox, offset| {
+        try fx.add(.{
+            .subject = "malformed mailbox",
+            .issuer = "Constrained",
+            .subject_key = 8 + offset,
+            .issuer_key = 2,
+            .ca = false,
+            .key_usage = 0x80,
+            .san_names = &.{.{ .email = mailbox }},
+        });
+    }
+    const malformed_uris = [_][]const u8{
+        "https://bad@@api.example.com/",
+        "https://bad user@api.example.com/",
+        "https://bad%ZZ@api.example.com/",
+    };
+    inline for (malformed_uris, 0..) |uri, offset| {
+        try fx.add(.{
+            .subject = "malformed URI",
+            .issuer = "Constrained",
+            .subject_key = 12 + offset,
+            .issuer_key = 2,
+            .ca = false,
+            .key_usage = 0x80,
+            .san_names = &.{.{ .uri = uri }},
+        });
+    }
+
+    var entropy: crypto.pure_zig.DeterministicEntropy = undefined;
+    var provider: crypto.pure_zig.Provider = undefined;
+    const cp = cryptoProvider(&entropy, &provider);
+    inline for (.{ @as(usize, 2), 3 }) |index| {
+        var accepted = try validateBuilt(testing.allocator, &fx.certs.items[index], fx.certs.items[1..2], fx.certs.items[0..1], policy(fx.certs.items[0..1]), cp);
+        defer accepted.deinit(testing.allocator);
+        try expectAccepted(&accepted, 3);
+    }
+    inline for (.{ @as(usize, 4), 5 }) |index| {
+        var rejected = try validateBuilt(testing.allocator, &fx.certs.items[index], fx.certs.items[1..2], fx.certs.items[0..1], policy(fx.certs.items[0..1]), cp);
+        defer rejected.deinit(testing.allocator);
+        try expectRejected(&rejected, .name_constraints_violation, 0);
+        try testing.expectEqual(name_constraints.Form.rfc822_name, rejected.rejected.name_form.?);
+    }
+    inline for (6..10) |index| {
+        var rejected = try validateBuilt(testing.allocator, &fx.certs.items[index], fx.certs.items[1..2], fx.certs.items[0..1], policy(fx.certs.items[0..1]), cp);
+        defer rejected.deinit(testing.allocator);
+        try expectRejected(&rejected, .name_constraints_violation, 0);
+        try testing.expectEqual(name_constraints.Form.rfc822_name, rejected.rejected.name_form.?);
+    }
+    inline for (10..13) |index| {
+        var rejected = try validateBuilt(testing.allocator, &fx.certs.items[index], fx.certs.items[1..2], fx.certs.items[0..1], policy(fx.certs.items[0..1]), cp);
+        defer rejected.deinit(testing.allocator);
+        try expectRejected(&rejected, .name_constraints_violation, 0);
+        try testing.expectEqual(name_constraints.Form.uri, rejected.rejected.name_form.?);
+    }
+}
+
 test "leaf, noncritical, unsupported-form, and resource-limit policies fail closed" {
     var fx = Fixtures.init(testing.allocator);
     defer fx.deinit();

@@ -1076,15 +1076,26 @@ test "reduced differential corpus is bounded and documented" {
     try testing.expect(reduced_corpus.entries.len <= 64);
     for (reduced_corpus.entries, 0..) |entry, index| {
         try testing.expect(entry.name.len > 0 and entry.name.len <= 96);
+        // Strict kebab-case: lower/digit runs joined by single hyphens, never
+        // leading, trailing, or doubled.
+        try testing.expect(entry.name[0] != '-' and entry.name[entry.name.len - 1] != '-');
+        var previous: u8 = 0;
         for (entry.name) |byte| {
             try testing.expect(std.ascii.isLower(byte) or std.ascii.isDigit(byte) or byte == '-');
+            try testing.expect(!(byte == '-' and previous == '-'));
+            previous = byte;
         }
         try testing.expect(entry.seed.len > 0 and entry.seed.len <= 64 * 1024);
         try testing.expect(entry.source_case.len > 0);
         try testing.expect(entry.provenance.len > 0);
         try testing.expect(entry.license.len > 0);
+        switch (entry.expected) {
+            .parse_error => |name| try testing.expect(name.len > 0),
+            .tardigrade_class => |class| try testing.expect(class.len > 0),
+        }
         for (reduced_corpus.entries[0..index]) |earlier| {
             try testing.expect(!std.mem.eql(u8, earlier.name, entry.name));
+            try testing.expect(!std.mem.eql(u8, earlier.seed, entry.seed));
         }
     }
 }
@@ -1096,10 +1107,14 @@ test "reduced differential seeds keep their recorded parse outcome" {
         if (x509.Certificate.parse(allocator, entry.seed, .{})) |parsed| {
             var certificate = parsed;
             defer certificate.deinit(allocator);
-            try testing.expect(entry.expected_parse_error == null);
+            // A parse-error seed must not parse; a pipeline-class seed must
+            // (its class is replayed by tests/pki_differential.zig).
+            try testing.expect(entry.expected == .tardigrade_class);
         } else |err| {
-            const expected = entry.expected_parse_error orelse return error.TestUnexpectedResult;
-            try testing.expectEqualStrings(expected, @errorName(err));
+            switch (entry.expected) {
+                .parse_error => |expected| try testing.expectEqualStrings(expected, @errorName(err)),
+                .tardigrade_class => return error.TestUnexpectedResult,
+            }
         }
         // Every promoted seed also exercises the fuzz entrypoint's limits.
         x509.fuzzParseCertificate(allocator, entry.seed);

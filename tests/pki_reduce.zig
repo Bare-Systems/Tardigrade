@@ -30,6 +30,12 @@ pub const Outcome = struct {
     data: []u8,
     /// Oracle invocations consumed, never above `Options.max_oracle_calls`.
     oracle_calls: usize,
+    /// The budget ran out while deletion candidates were still untried;
+    /// `data` is the best reduction found so far, not a completed search.
+    budget_exhausted: bool,
+    /// Proven 1-minimal: a complete single-byte deletion sweep accepted no
+    /// candidate (or `data` is empty). Never true when `budget_exhausted`.
+    one_minimal: bool,
 
     pub fn deinit(self: *Outcome, allocator: std.mem.Allocator) void {
         allocator.free(self.data);
@@ -62,6 +68,8 @@ pub fn reduce(
 
     var current: usize = 0;
     var len: usize = input.len;
+    var budget_exhausted = false;
+    var one_minimal = len == 0;
 
     var chunk: usize = len / 2;
     if (chunk == 0) chunk = len; // 1-byte inputs still get one deletion try
@@ -69,7 +77,10 @@ pub fn reduce(
         var removed_any = false;
         var start: usize = 0;
         while (start < len) {
-            if (calls == options.max_oracle_calls) break :budget;
+            if (calls == options.max_oracle_calls) {
+                budget_exhausted = true;
+                break :budget;
+            }
             const end = @min(start + chunk, len);
             const candidate_len = len - (end - start);
             const scratch = buffers[1 - current];
@@ -86,9 +97,17 @@ pub fn reduce(
                 start = end;
             }
         }
-        if (len == 0) break;
+        if (len == 0) {
+            one_minimal = true;
+            break;
+        }
         if (!removed_any) {
-            if (chunk == 1) break;
+            if (chunk == 1) {
+                // A full pass at byte granularity accepted nothing: proven
+                // 1-minimal within the consumed budget.
+                one_minimal = true;
+                break;
+            }
             chunk = chunk / 2;
         } else if (chunk > len) {
             chunk = @max(len / 2, 1);
@@ -98,7 +117,12 @@ pub fn reduce(
     const data = try allocator.dupe(u8, buffers[current][0..len]);
     allocator.free(buffers[0]);
     allocator.free(buffers[1]);
-    return .{ .data = data, .oracle_calls = calls };
+    return .{
+        .data = data,
+        .oracle_calls = calls,
+        .budget_exhausted = budget_exhausted,
+        .one_minimal = one_minimal,
+    };
 }
 
 const testing = std.testing;
@@ -109,7 +133,7 @@ const MarkerOracle = struct {
 
     fn keeps(self: *MarkerOracle, candidate: []const u8) error{OutOfMemory}!bool {
         self.calls += 1;
-        return std.mem.indexOf(u8, candidate, self.marker) != null;
+        return std.mem.find(u8, candidate, self.marker) != null;
     }
 };
 
@@ -125,6 +149,8 @@ test "pki reduce: marker oracle converges to the marker" {
 
     try testing.expectEqualStrings(marker, outcome.data);
     try testing.expect(outcome.oracle_calls <= 2048);
+    try testing.expect(!outcome.budget_exhausted);
+    try testing.expect(outcome.one_minimal);
 }
 
 test "pki reduce: identical inputs reduce to identical bytes" {
@@ -158,6 +184,8 @@ test "pki reduce: budget exhaustion returns a valid partial reduction" {
 
     try testing.expect(outcome.oracle_calls <= 5);
     try testing.expect(outcome.data.len <= padded.len);
+    try testing.expect(outcome.budget_exhausted);
+    try testing.expect(!outcome.one_minimal);
     var check = MarkerOracle{ .marker = marker };
     try testing.expect(try check.keeps(outcome.data));
 }
@@ -182,6 +210,8 @@ test "pki reduce: fully removable input reduces to empty" {
     var outcome = try reduce(testing.allocator, "delete me entirely", &oracle, AlwaysInteresting.keeps, .{});
     defer outcome.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 0), outcome.data.len);
+    try testing.expect(outcome.one_minimal);
+    try testing.expect(!outcome.budget_exhausted);
 }
 
 test "pki reduce: empty input stays empty" {
@@ -189,4 +219,6 @@ test "pki reduce: empty input stays empty" {
     var outcome = try reduce(testing.allocator, "", &oracle, AlwaysInteresting.keeps, .{});
     defer outcome.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 0), outcome.data.len);
+    try testing.expect(outcome.one_minimal);
+    try testing.expect(!outcome.budget_exhausted);
 }

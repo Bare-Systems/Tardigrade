@@ -20,18 +20,24 @@ All notable user-facing changes to Tardigrade are documented here.
   `src/tls/` and compile without importing QUIC.
 - **Automated PKI mismatch minimization and reduced-corpus promotion (#348, epic #324)** —
   every unexplained differential mismatch now runs bounded deterministic
-  delta debugging (`tests/pki_reduce.zig`) that shrinks the disagreeing leaf
-  input while preserving Tardigrade's exact classification, re-verifies the
-  reduced input against OpenSSL and Go `crypto/x509`, and persists the
-  reduced DER/PEM next to the JSON artifact (schema v3) with sizes, oracle
-  budget, SHA-256, per-validator reduced decisions, and a
-  `preserves_observed_statuses` verdict. A new promotion registry
-  (`tests/vectors/pki/reduced/manifest.zig`) feeds every promoted seed into
-  the DER and X.509 fuzz corpora automatically and pins its recorded parse
-  outcome with a regression test; `zig build test-pki-reduce` (also part of
-  `zig build test`) regenerates each seed from its documented source and
-  requires byte-for-byte equality, proving seeds stay reproducible and
-  1-minimal. CI mismatch uploads now include the reduced inputs.
+  delta debugging (`tests/pki_reduce.zig`) over each chain component — leaf,
+  intermediates, and trust anchors — preserving Tardigrade's exact
+  classification and keeping the largest shrink. The reduced case is
+  re-verified against OpenSSL and Go `crypto/x509`; a candidate whose
+  observed statuses diverge from the original tuple is reverted to the
+  original bytes so every emitted fixture reproduces the disagreement. The
+  schema-v3 artifact records the component, sizes, oracle budget,
+  `budget_exhausted`/`one_minimal` flags, SHA-256, per-validator reduced
+  decisions, the reverted candidate's decisions when applicable, and a
+  `promotable` verdict, with deterministic offline serialization tests. A
+  new promotion registry (`tests/vectors/pki/reduced/manifest.zig`) feeds
+  every promoted seed into the DER and X.509 fuzz corpora automatically and
+  pins its recorded outcome — exact parse error, or the full-pipeline class
+  replayed in the source case's chain context; `zig build test-pki-reduce`
+  (also part of `zig build test`) regenerates each seed from its documented
+  source, requiring byte-for-byte equality and a completed 1-minimality
+  proof. The reduced corpus is a closed directory enforced by
+  `generate.sh`, and CI mismatch uploads now include the reduced inputs.
 - **Three-way hostile Web PKI differential harness foundation (#348, epic #324)** —
   adds a bounded, provenance-backed certificate corpus that compares the
   pure-Zig parser, path builder, identity matcher, and RFC 5280 validator with

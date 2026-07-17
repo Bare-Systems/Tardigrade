@@ -473,6 +473,9 @@ pub fn build(b: *std.Build) void {
     pki_differential_mod.addAnonymousImport("pki_duplicate_extension_crt", .{
         .root_source_file = b.path("tests/vectors/pki/duplicate-extension-leaf.crt"),
     });
+    pki_differential_mod.addAnonymousImport("pki_signature_corrupt_crt", .{
+        .root_source_file = b.path("tests/vectors/pki/signature-corrupt-leaf.crt"),
+    });
     pki_differential_mod.addImport("pki_reduced_corpus", pki_reduced_corpus_mod);
     const pki_differential_core_tests = b.addTest(.{
         .root_module = pki_differential_mod,

@@ -133,31 +133,48 @@ for certificate_file in "$out"/*.crt; do
   fi
 done
 
-# The reduced regression corpus is likewise closed: every file must be the
-# registry itself or a `.der` seed registered in manifest.zig, with no
-# private-key material.
+# The reduced regression corpus is likewise closed: only `manifest.zig` and
+# kebab-case `.der` seeds registered as entry names in it, all immediate
+# regular files (no nesting, no symlinks), none containing private-key
+# material.
 reduced_dir="$script_dir/reduced"
 if [[ -d "$reduced_dir" ]]; then
-  while IFS= read -r -d '' seed; do
-    name="${seed##*/}"
-    if [[ "$name" != manifest.zig ]]; then
-      case "$name" in
-        *.der) ;;
-        *)
-          echo "unexpected file in reduced corpus: $name" >&2
-          exit 1
-          ;;
-      esac
-      if ! grep -qF -- "\"${name%.der}\"" "$reduced_dir/manifest.zig"; then
-        echo "reduced seed missing from manifest.zig: $name" >&2
+  while IFS= read -r -d '' entry; do
+    rel="${entry#"$reduced_dir/"}"
+    if [[ "$rel" == */* || -L "$entry" || ! -f "$entry" ]]; then
+      echo "unexpected nested, symlinked, or non-file entry in reduced corpus: $rel" >&2
+      exit 1
+    fi
+    if [[ "$rel" != manifest.zig ]]; then
+      if [[ "$rel" != *.der ]]; then
+        echo "unexpected file in reduced corpus: $rel" >&2
+        exit 1
+      fi
+      base="${rel%.der}"
+      if [[ ! "$base" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]]; then
+        echo "reduced seed name is not kebab-case: $rel" >&2
+        exit 1
+      fi
+      # Match the structured registration line, not any string occurrence.
+      if ! grep -Eq "^[[:space:]]*entry\(\"$base\", \.\{\$" "$reduced_dir/manifest.zig"; then
+        echo "reduced seed is not registered as an entry in manifest.zig: $rel" >&2
         exit 1
       fi
     fi
-    if grep -aEq -- '-----BEGIN ([A-Z0-9 ]+ )?PRIVATE KEY-----' "$seed"; then
-      echo "private-key material found in reduced corpus: $name" >&2
+    if grep -aEq -- '-----BEGIN ([A-Z0-9 ]+ )?PRIVATE KEY-----' "$entry"; then
+      echo "private-key material found in reduced corpus: $rel" >&2
       exit 1
     fi
-  done < <(find "$reduced_dir" -maxdepth 1 -type f -print0)
+  done < <(find "$reduced_dir" -mindepth 1 -print0)
+  # Reverse direction: every registered entry must have its seed file (the
+  # registry derives the embed path from the entry name, so a matching file
+  # must exist).
+  while IFS= read -r registered; do
+    if [[ ! -f "$reduced_dir/$registered.der" ]]; then
+      echo "manifest.zig entry has no seed file: $registered" >&2
+      exit 1
+    fi
+  done < <(grep -Eo '^[[:space:]]*entry\("[a-z0-9-]+", \.\{$' "$reduced_dir/manifest.zig" | sed -E 's/.*"([a-z0-9-]+)".*/\1/')
 fi
 
 # Publish only after both generators and both validators agree.

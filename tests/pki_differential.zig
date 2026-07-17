@@ -338,16 +338,10 @@ const GoDecision = struct {
 };
 
 fn goDecision(allocator: std.mem.Allocator, case: manifest.Case, deadline_ms: u32) !Observation {
-    const go_binary = compat.getEnvVarOwned(allocator, "GO_BIN") catch
-        try allocator.dupe(u8, "go");
-    defer allocator.free(go_binary);
-
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(allocator);
     try argv.appendSlice(allocator, &.{
-        go_binary,
-        "run",
-        "tests/pki_go_validator.go",
+        pki_diff_options.go_validator_path,
         "--root",
         case.root_file,
     });
@@ -1529,9 +1523,19 @@ fn expectOutcomeTag(result: bounded_process.Result, expected: std.meta.Tag(bound
 }
 
 fn parseHelperPid(stdout: []const u8) !std.posix.pid_t {
-    const trimmed = std.mem.trim(u8, stdout, " \t\r\n");
-    if (!std.mem.startsWith(u8, trimmed, "pid=")) return error.InvalidPidLine;
-    return try std.fmt.parseInt(std.posix.pid_t, trimmed["pid=".len..], 10);
+    return parsePidField(stdout, "pid");
+}
+
+fn parsePidField(stdout: []const u8, field: []const u8) !std.posix.pid_t {
+    var lines = std.mem.splitScalar(u8, stdout, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (trimmed.len <= field.len + 1) continue;
+        if (!std.mem.startsWith(u8, trimmed, field)) continue;
+        if (trimmed[field.len] != '=') continue;
+        return std.fmt.parseInt(std.posix.pid_t, trimmed[field.len + 1 ..], 10);
+    }
+    return error.InvalidPidLine;
 }
 
 fn expectNoProcess(allocator: std.mem.Allocator, pid: std.posix.pid_t) !void {
@@ -1634,6 +1638,34 @@ test "pki reduce: bounded process timeout kills and reaps child" {
     try expectOutcomeTag(result, .timeout);
     const pid = try parseHelperPid(result.stdout);
     try expectNoProcess(testing.allocator, pid);
+    try expectDirEmptyPath(tmp.rel_path);
+}
+
+test "pki reduce: bounded process deadline covers wait after pipe EOF" {
+    var result = try bounded_process.run(testing.allocator, .{
+        .argv = &.{ pki_diff_options.process_helper_path, "close-stdio-hang" },
+        .stdout_limit = 64,
+        .stderr_limit = 64,
+        .deadline_ms = 100,
+    });
+    defer result.deinit(testing.allocator);
+    try expectOutcomeTag(result, .timeout);
+    try expectNoProcess(testing.allocator, try parseHelperPid(result.stdout));
+}
+
+test "pki reduce: bounded process timeout terminates process group" {
+    var tmp = try ProcessTempDir.init(testing.allocator, "process-group");
+    defer tmp.deinit(testing.allocator);
+    var result = try bounded_process.run(testing.allocator, .{
+        .argv = &.{ pki_diff_options.process_helper_path, "spawn-grandchild-and-hang", tmp.abs_path },
+        .stdout_limit = 256,
+        .stderr_limit = 256,
+        .deadline_ms = 100,
+    });
+    defer result.deinit(testing.allocator);
+    try expectOutcomeTag(result, .timeout);
+    try expectNoProcess(testing.allocator, try parsePidField(result.stdout, "pid"));
+    try expectNoProcess(testing.allocator, try parsePidField(result.stdout, "grandchild_pid"));
     try expectDirEmptyPath(tmp.rel_path);
 }
 

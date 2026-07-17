@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const compat = @import("zig_compat");
 
 pub const default_deadline_ms: u32 = 10_000;
@@ -59,12 +60,17 @@ pub const Result = struct {
 
 pub fn run(allocator: std.mem.Allocator, options: Options) std.mem.Allocator.Error!Result {
     const io = compat.io();
+    const deadline_end_ms: ?i64 = if (options.deadline_ms == 0)
+        null
+    else
+        compat.milliTimestamp() + @as(i64, @intCast(options.deadline_ms));
     var child = std.process.spawn(io, .{
         .argv = options.argv,
         .stdin = .ignore,
         .stdout = .pipe,
         .stderr = .pipe,
         .cwd = options.cwd,
+        .pgid = 0,
     }) catch |err| {
         return launchFailureResult(allocator, "launch failed: {s}", .{@errorName(err)});
     };
@@ -147,7 +153,7 @@ pub fn run(allocator: std.mem.Allocator, options: Options) std.mem.Allocator.Err
         ),
     };
 
-    const term = child.wait(io) catch |err| {
+    const term = waitForExit(&child, deadline_end_ms) catch |err| {
         return failureFromBuffered(
             allocator,
             &multi_reader,
@@ -157,7 +163,16 @@ pub fn run(allocator: std.mem.Allocator, options: Options) std.mem.Allocator.Err
             "wait failed: {s}",
             .{@errorName(err)},
         );
-    };
+    } orelse return killedResult(
+        allocator,
+        &child,
+        &reaped,
+        &multi_reader,
+        &reader_active,
+        .timeout,
+        options.stdout_limit,
+        options.stderr_limit,
+    );
     reaped = true;
 
     const outcome: Outcome = switch (term) {
@@ -183,6 +198,70 @@ pub fn run(allocator: std.mem.Allocator, options: Options) std.mem.Allocator.Err
         .stderr = stderr,
         .diagnostic = try diagnosticFor(allocator, outcome, stdout, stderr),
     };
+}
+
+fn waitForExit(child: *std.process.Child, deadline_end_ms: ?i64) !?std.process.Child.Term {
+    const pid = child.id.?;
+    if (deadline_end_ms == null) {
+        const term = try child.wait(compat.io());
+        terminateProcessGroup(pid);
+        return term;
+    }
+
+    while (true) {
+        var status: if (builtin.link_libc) c_int else u32 = undefined;
+        const waited = waitPidNoHang(pid, &status) catch |err| switch (err) {
+            error.Interrupted => continue,
+            else => return err,
+        };
+        if (waited == pid) {
+            child.id = null;
+            closeChildPipes(child);
+            terminateProcessGroup(pid);
+            return statusToTerm(@bitCast(status));
+        }
+        if (compat.milliTimestamp() >= deadline_end_ms.?) return null;
+        compat.sleepNs(10 * std.time.ns_per_ms);
+    }
+}
+
+fn waitPidNoHang(
+    pid: std.posix.pid_t,
+    status: *if (builtin.link_libc) c_int else u32,
+) error{ Interrupted, WaitFailed }!std.posix.pid_t {
+    const raw = std.posix.system.waitpid(pid, status, std.posix.W.NOHANG);
+    return switch (std.posix.errno(raw)) {
+        .SUCCESS => @intCast(raw),
+        .INTR => error.Interrupted,
+        else => error.WaitFailed,
+    };
+}
+
+fn statusToTerm(status: u32) std.process.Child.Term {
+    return if (std.posix.W.IFEXITED(status))
+        .{ .exited = std.posix.W.EXITSTATUS(status) }
+    else if (std.posix.W.IFSIGNALED(status))
+        .{ .signal = std.posix.W.TERMSIG(status) }
+    else if (std.posix.W.IFSTOPPED(status))
+        .{ .stopped = std.posix.W.STOPSIG(status) }
+    else
+        .{ .unknown = status };
+}
+
+fn closeChildPipes(child: *std.process.Child) void {
+    const io = compat.io();
+    if (child.stdin) |stdin| {
+        stdin.close(io);
+        child.stdin = null;
+    }
+    if (child.stdout) |stdout| {
+        stdout.close(io);
+        child.stdout = null;
+    }
+    if (child.stderr) |stderr| {
+        stderr.close(io);
+        child.stderr = null;
+    }
 }
 
 fn launchFailureResult(
@@ -218,6 +297,7 @@ fn killedResult(
     errdefer allocator.free(stderr);
     reader_active.* = false;
     multi_reader.deinit();
+    terminateProcessGroup(child.id.?);
     child.kill(compat.io());
     reaped.* = true;
     return .{
@@ -225,6 +305,14 @@ fn killedResult(
         .stdout = stdout,
         .stderr = stderr,
         .diagnostic = try diagnosticFor(allocator, outcome, stdout, stderr),
+    };
+}
+
+fn terminateProcessGroup(pid: std.posix.pid_t) void {
+    std.posix.kill(-pid, .KILL) catch |err| switch (err) {
+        error.ProcessNotFound => {},
+        error.PermissionDenied => {},
+        else => {},
     };
 }
 

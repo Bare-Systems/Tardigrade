@@ -17,6 +17,7 @@ pub fn build(b: *std.Build) void {
     const require_static_system_libs = b.option(bool, "require-static-system-libs", "Require static linking for system libraries") orelse false;
     const static_executable = b.option(bool, "static-executable", "Build the tardi executable as a static binary") orelse false;
     const app_version = b.option([]const u8, "version", "Version string embedded in the tardi binary") orelse "dev";
+    const go_bin = b.option([]const u8, "go-bin", "Go command used to build the PKI crypto/x509 oracle") orelse "go";
     const tls_profile = b.option(
         TlsProfile,
         "tls-profile",
@@ -467,8 +468,13 @@ pub fn build(b: *std.Build) void {
         .root_module = pki_process_helper_mod,
     });
     const pki_process_helper_install = b.addInstallArtifact(pki_process_helper, .{});
+    const pki_go_validator_build = b.addSystemCommand(&.{ go_bin, "build", "-trimpath", "-o" });
+    const pki_go_validator_output = pki_go_validator_build.addOutputFileArg("pki_go_validator");
+    pki_go_validator_build.addFileArg(b.path("tests/pki_go_validator.go"));
+    const pki_go_validator_install = b.addInstallBinFile(pki_go_validator_output, "pki_go_validator");
     const pki_diff_options = b.addOptions();
     pki_diff_options.addOption([]const u8, "process_helper_path", b.getInstallPath(.bin, "pki_process_helper"));
+    pki_diff_options.addOption([]const u8, "go_validator_path", b.getInstallPath(.bin, "pki_go_validator"));
     pki_diff_options.addOption(u32, "stable_validator_deadline_ms", 10_000);
     pki_diff_options.addOption(u32, "extended_validator_deadline_ms", 30_000);
 
@@ -499,6 +505,7 @@ pub fn build(b: *std.Build) void {
         .filters = &.{"pki differential core corpus"},
     });
     const run_pki_differential_core_tests = b.addRunArtifact(pki_differential_core_tests);
+    run_pki_differential_core_tests.step.dependOn(&pki_go_validator_install.step);
     const pki_differential_step = b.step("test-pki-differential", "Run stable PKI differential corpus against OpenSSL and Go");
     pki_differential_step.dependOn(&run_pki_differential_core_tests.step);
 
@@ -507,6 +514,7 @@ pub fn build(b: *std.Build) void {
         .filters = &.{"pki differential full corpus"},
     });
     const run_pki_differential_full_tests = b.addRunArtifact(pki_differential_full_tests);
+    run_pki_differential_full_tests.step.dependOn(&pki_go_validator_install.step);
     const pki_differential_extended_step = b.step("test-pki-differential-extended", "Run full PKI differential corpus against OpenSSL and Go");
     pki_differential_extended_step.dependOn(&run_pki_differential_full_tests.step);
 

@@ -56,7 +56,10 @@ processes. Stable corpus runs enforce a 10 second per-validator deadline with
 bounded stdout/stderr capture; the extended target uses a separately bounded
 30 second deadline for larger hostile-corpus cases. Child timeouts, crashes,
 launch failures, malformed validator output, or output-limit violations are
-harness failures, not ordinary certificate rejections.
+harness failures, not ordinary certificate rejections. The Go crypto/x509
+oracle is built once as a test helper and invoked directly; use
+`zig build -Dgo-bin=/path/to/go test-pki-differential` when a non-default Go
+tool is required.
 
 ## Failure-mode harness
 

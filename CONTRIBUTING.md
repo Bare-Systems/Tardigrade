@@ -51,6 +51,13 @@ zig build test-quic
 zig build -Doptimize=ReleaseFast
 ```
 
+The PKI differential harness invokes OpenSSL and Go as argv-spawned child
+processes. Stable corpus runs enforce a 10 second per-validator deadline with
+bounded stdout/stderr capture; the extended target uses a separately bounded
+30 second deadline for larger hostile-corpus cases. Child timeouts, crashes,
+launch failures, malformed validator output, or output-limit violations are
+harness failures, not ordinary certificate rejections.
+
 ## Failure-mode harness
 
 `zig build test-failure` runs the production-safety suite defined in

@@ -456,6 +456,22 @@ pub fn build(b: *std.Build) void {
     // OpenSSL and Go crypto/x509 are invoked as independent processes. These
     // targets stay opt-in because the external validators are test tools, not
     // production dependencies.
+    const pki_process_helper_mod = b.createModule(.{
+        .root_source_file = b.path("tests/pki_process_helper.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    const pki_process_helper = b.addExecutable(.{
+        .name = "pki_process_helper",
+        .root_module = pki_process_helper_mod,
+    });
+    const pki_process_helper_install = b.addInstallArtifact(pki_process_helper, .{});
+    const pki_diff_options = b.addOptions();
+    pki_diff_options.addOption([]const u8, "process_helper_path", b.getInstallPath(.bin, "pki_process_helper"));
+    pki_diff_options.addOption(u32, "stable_validator_deadline_ms", 10_000);
+    pki_diff_options.addOption(u32, "extended_validator_deadline_ms", 30_000);
+
     const pki_differential_mod = b.createModule(.{
         .root_source_file = b.path("tests/pki_differential.zig"),
         .target = target,
@@ -464,6 +480,7 @@ pub fn build(b: *std.Build) void {
     pki_differential_mod.addImport("crypto", crypto_mod);
     pki_differential_mod.addImport("pki", pki_mod);
     pki_differential_mod.addImport("zig_compat", compat_mod);
+    pki_differential_mod.addImport("pki_diff_options", pki_diff_options.createModule());
     pki_differential_mod.addAnonymousImport("pki_root_crt", .{
         .root_source_file = b.path("tests/vectors/pki/root.crt"),
     });
@@ -501,6 +518,7 @@ pub fn build(b: *std.Build) void {
         .filters = &.{"pki reduce"},
     });
     const run_pki_reduce_tests = b.addRunArtifact(pki_reduce_tests);
+    run_pki_reduce_tests.step.dependOn(&pki_process_helper_install.step);
     const pki_reduce_step = b.step("test-pki-reduce", "Run offline PKI mismatch-minimization tests");
     pki_reduce_step.dependOn(&run_pki_reduce_tests.step);
     test_step.dependOn(&run_pki_reduce_tests.step);

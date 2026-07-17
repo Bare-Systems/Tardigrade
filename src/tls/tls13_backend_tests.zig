@@ -1391,3 +1391,212 @@ test "an absent intended hostname reaches the verifier as null" {
     try h.driveUntil(SocketHarness.bothComplete);
     try std.testing.expect(verifier.lastServerName() == null);
 }
+
+// --------------------------------------------------------------------------
+// Review round 2 (#334) finding 2: asynchronous / event-driven progression.
+// The engine parks a pending select / sign / verify, resumes without recording
+// any handshake message twice, and cancels + releases exactly once on
+// teardown. These drive the parking machinery directly.
+// --------------------------------------------------------------------------
+
+/// Concatenate all handshake-epoch crypto bytes an engine emitted into `out`.
+fn collectHandshakeCrypto(sink: *const DirectSink, out: []u8) []const u8 {
+    var len: usize = 0;
+    for (sink.items[0..sink.len]) |event| {
+        switch (event) {
+            .handshake_bytes => |hb| if (hb.epoch == .handshake) {
+                @memcpy(out[len..][0..hb.data.len], hb.data);
+                len += hb.data.len;
+            },
+            else => {},
+        }
+    }
+    return out[0..len];
+}
+
+fn certificateStateIn(sink: *const DirectSink) ?events.CertificateState {
+    var found: ?events.CertificateState = null;
+    for (sink.items[0..sink.len]) |event| {
+        switch (event) {
+            .certificate => |state| found = state,
+            else => {},
+        }
+    }
+    return found;
+}
+
+fn firstInitialCrypto(sink: *const DirectSink, out: []u8) []const u8 {
+    for (sink.items[0..sink.len]) |event| {
+        switch (event) {
+            .handshake_bytes => |hb| if (hb.epoch == .initial) {
+                @memcpy(out[0..hb.data.len], hb.data);
+                return out[0..hb.data.len];
+            },
+            else => {},
+        }
+    }
+    return out[0..0];
+}
+
+test "an async credential selection suspends the handshake and resumes to completion" {
+    var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
+    mock.async_select = true;
+    mock.pending_polls = 2;
+    var server = serverWithProvider(&mock);
+    defer server.deinit();
+    var sink = DirectSink{};
+    defer sink.deinit();
+    try server.backend().start(.server, {}, &sink);
+    var buf: [1024]u8 = undefined;
+    const hello = try buildClientHello(&buf, .{});
+    try server.backend().receive(.initial, hello, &sink);
+
+    // Parked awaiting the async selection; nothing signed yet.
+    try std.testing.expect(server.authPending());
+    try std.testing.expectEqual(@as(usize, 1), mock.select_count);
+    try std.testing.expectEqual(@as(usize, 0), mock.sign_count);
+
+    try server.resumeAuth(&sink); // poll #1: still pending
+    try std.testing.expect(server.authPending());
+    try server.resumeAuth(&sink); // poll #2: still pending
+    try std.testing.expect(server.authPending());
+    try server.resumeAuth(&sink); // poll #3: completes, runs the rest of the flight
+    try std.testing.expect(!server.authPending());
+
+    try std.testing.expectEqual(@as(usize, 3), mock.poll_count);
+    try std.testing.expectEqual(@as(usize, 1), mock.op_release_count);
+    try std.testing.expectEqual(@as(usize, 1), mock.sign_count);
+    try std.testing.expectEqual(@as(usize, 1), mock.release_count);
+    try std.testing.expect(server.credentialFailure() == null);
+}
+
+test "an async signature suspends after the certificate and resumes to completion" {
+    var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
+    mock.async_sign = true;
+    mock.pending_polls = 1;
+    var server = serverWithProvider(&mock);
+    defer server.deinit();
+    var sink = DirectSink{};
+    defer sink.deinit();
+    try server.backend().start(.server, {}, &sink);
+    var buf: [1024]u8 = undefined;
+    const hello = try buildClientHello(&buf, .{});
+    try server.backend().receive(.initial, hello, &sink);
+
+    try std.testing.expect(server.authPending()); // parked awaiting the signature
+    try std.testing.expectEqual(@as(usize, 1), mock.select_count);
+    try server.resumeAuth(&sink); // poll #1: still pending
+    try std.testing.expect(server.authPending());
+    try server.resumeAuth(&sink); // poll #2: completes
+    try std.testing.expect(!server.authPending());
+    try std.testing.expectEqual(@as(usize, 1), mock.sign_count);
+    try std.testing.expectEqual(@as(usize, 1), mock.release_count);
+    try std.testing.expectEqual(@as(usize, 1), mock.op_release_count);
+    try std.testing.expect(server.credentialFailure() == null);
+}
+
+test "a cancelled async signature releases the operation and credential exactly once" {
+    var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
+    mock.async_sign = true;
+    mock.pending_polls = 5; // never completes before teardown
+    var server = serverWithProvider(&mock);
+    var sink = DirectSink{};
+    try server.backend().start(.server, {}, &sink);
+    var buf: [1024]u8 = undefined;
+    const hello = try buildClientHello(&buf, .{});
+    try server.backend().receive(.initial, hello, &sink);
+    try std.testing.expect(server.authPending());
+
+    sink.deinit();
+    server.deinit(); // cancels the parked op and releases the held credential
+
+    try std.testing.expectEqual(@as(usize, 1), mock.cancel_count);
+    try std.testing.expectEqual(@as(usize, 1), mock.op_release_count);
+    try std.testing.expectEqual(@as(usize, 1), mock.release_count);
+}
+
+test "an async signing failure latches the typed signing-provider failure" {
+    var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
+    mock.async_sign = true;
+    mock.pending_polls = 0;
+    mock.pending_fails = true;
+    var server = serverWithProvider(&mock);
+    defer server.deinit();
+    var sink = DirectSink{};
+    defer sink.deinit();
+    try server.backend().start(.server, {}, &sink);
+    var buf: [1024]u8 = undefined;
+    const hello = try buildClientHello(&buf, .{});
+    try server.backend().receive(.initial, hello, &sink);
+    try std.testing.expect(server.authPending());
+
+    try std.testing.expectError(error.CredentialProviderFailed, server.resumeAuth(&sink));
+    try std.testing.expectEqual(tls_backend.CredentialFailure.signing_provider_failure, server.credentialFailure().?);
+    try std.testing.expectEqual(@as(usize, 1), mock.cancel_count);
+    try std.testing.expectEqual(@as(usize, 1), mock.op_release_count);
+}
+
+/// Drive a client backend up to (and through) CertificateVerify against a
+/// cooperating fixed-identity server backend, so the client's peer verifier is
+/// exercised. Leaves the client parked if its verifier went async.
+fn driveClientThroughCertificateVerify(client: *tls_backend.Tls13Backend, client_sink: *DirectSink) !void {
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .{ .record = .{ .alpn = "h2" } });
+    defer server.deinit();
+    var server_sink = DirectSink{};
+    defer server_sink.deinit();
+
+    try client.backend().start(.client, {}, client_sink);
+    var ch_buf: [1024]u8 = undefined;
+    const client_hello = firstInitialCrypto(client_sink, &ch_buf);
+
+    try server.backend().start(.server, {}, &server_sink);
+    try server.backend().receive(.initial, client_hello, &server_sink);
+
+    var sh_buf: [512]u8 = undefined;
+    const server_hello = firstInitialCrypto(&server_sink, &sh_buf);
+    var flight_buf: [4096]u8 = undefined;
+    const flight = collectHandshakeCrypto(&server_sink, &flight_buf);
+
+    client_sink.reset();
+    try client.backend().receive(.initial, server_hello, client_sink);
+    // Feed the server's EncryptedExtensions..Finished; the client parks at
+    // CertificateVerify if its verifier is asynchronous.
+    try client.backend().receive(.handshake, flight, client_sink);
+}
+
+test "an async peer verification suspends the client and resumes to acceptance" {
+    var verifier = credentials.MockVerifier.init(.accepted);
+    verifier.async_mode = true;
+    verifier.pending_polls = 2;
+    var client = tls_backend.Tls13Backend.initClientWithVerifier(clientEntropy(), verifier.verifier(), .{ .record = .{ .alpn = "h2" } }, .{ .server_name = "tardigrade.test" });
+    defer client.deinit();
+    var sink = DirectSink{};
+    defer sink.deinit();
+    try driveClientThroughCertificateVerify(&client, &sink);
+
+    try std.testing.expect(client.authPending());
+    try std.testing.expectEqual(@as(usize, 1), verifier.verify_count);
+    try client.resumeAuth(&sink); // poll #1
+    try std.testing.expect(client.authPending());
+    try client.resumeAuth(&sink); // poll #2
+    try std.testing.expect(client.authPending());
+    try client.resumeAuth(&sink); // completes -> accepted
+    try std.testing.expect(!client.authPending());
+    try std.testing.expectEqual(events.CertificateState.valid, certificateStateIn(&sink).?);
+    try std.testing.expect(client.credentialFailure() == null);
+}
+
+test "a cancelled async peer verification cancels and releases the operation once" {
+    var verifier = credentials.MockVerifier.init(.accepted);
+    verifier.async_mode = true;
+    verifier.pending_polls = 5;
+    var client = tls_backend.Tls13Backend.initClientWithVerifier(clientEntropy(), verifier.verifier(), .{ .record = .{ .alpn = "h2" } }, .{});
+    var sink = DirectSink{};
+    try driveClientThroughCertificateVerify(&client, &sink);
+    try std.testing.expect(client.authPending());
+
+    sink.deinit();
+    client.deinit();
+    try std.testing.expectEqual(@as(usize, 1), verifier.cancel_count);
+    try std.testing.expectEqual(@as(usize, 1), verifier.op_release_count);
+}

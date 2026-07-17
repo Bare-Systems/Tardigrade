@@ -56,6 +56,49 @@ never accept it.
 `CERTIFICATE` block so every differential validator can consume one file
 format. The byte-identical raw DER remains available for parser fuzzing.
 
+## Mismatch minimization and the reduced regression corpus
+
+Every unexplained differential mismatch triggers bounded automated
+minimization (`tests/pki_reduce.zig`): deterministic greedy delta debugging
+under a hard per-component oracle-call budget. The mismatch can live anywhere
+in the chain, so every component — the leaf, each intermediate, and each
+trust anchor — gets its own reduction pass that substitutes only that
+certificate's DER while Tardigrade's exact classification (status plus
+diagnostic, never just accept/reject) must be preserved; the component with
+the largest shrink wins deterministically.
+
+An emitted reduced fixture is always a reproduction of the observed
+disagreement. The harness writes the reduced component
+(`<case-id>.reduced.der`/`.crt`, plus a substituted bundle file when the
+component is an intermediate or root) and re-verifies the reduced case
+against all three validators. If any validator's status diverges from the
+original tuple, the reduction is reverted to the original component bytes and
+the disqualifying decisions are recorded (`candidate_observed`,
+`reverted_external_divergence`). The schema-v3 artifact records the
+component, sizes, oracle budget spent, `budget_exhausted` and `one_minimal`
+flags (1-minimality is only claimed after a completed single-byte sweep),
+SHA-256, per-validator reduced decisions, and a `promotable` verdict that
+requires the observed statuses to survive.
+
+Promotable inputs land in `reduced/manifest.zig`, the registry the build
+embeds into the PKI unit-test module. Every seed automatically joins the DER
+and X.509 fuzz corpora and gets a regression test for its recorded outcome:
+`parse_error` seeds assert the exact parse failure
+(`src/pki/x509_tests.zig`), while `tardigrade_class` seeds parse successfully
+and replay the recorded full-pipeline class — path building, RFC 5280
+validation, identity matching — in their source case's chain context
+(`tests/pki_differential.zig`). Promotion is auditable: each entry records
+its source case (which must resolve in the differential manifest), placement
+in the chain, provenance, and license; the registry derives each embedded
+seed path from the entry name; and `zig build test-pki-reduce` regenerates
+each seed from its documented source, requiring byte-for-byte equality and a
+completed 1-minimality proof.
+
+Byte-level deletion respects DER framing implicitly: structurally valid
+hostile certificates typically cannot shrink (their checked-in seed doubles
+as a minimality proof), while malformed inputs converge to the smallest
+input reproducing the same rejection class.
+
 ## Regeneration
 
 Run from any directory:

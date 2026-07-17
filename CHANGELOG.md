@@ -18,6 +18,29 @@ All notable user-facing changes to Tardigrade are documented here.
   CertificateVerify, Finished, transcript, key-schedule, traffic-secret, and
   zeroization implementation. Direct socket-pair record tests now live under
   `src/tls/` and compile without importing QUIC.
+- **Automated PKI mismatch minimization and reduced-corpus promotion (#348, epic #324)** —
+  every unexplained differential mismatch now runs bounded deterministic
+  delta debugging (`tests/pki_reduce.zig`) over each chain component — leaf,
+  intermediates, and trust anchors — preserving Tardigrade's exact
+  classification under one shared mismatch budget with per-component
+  allowance so the leaf cannot monopolize the search. Component candidates are
+  re-verified against OpenSSL and Go `crypto/x509` before selection, and
+  immediately promotable reproductions outrank larger partial reductions; if
+  none preserve the full observed tuple, the emitted fixture reverts to
+  original bytes so it still reproduces the disagreement. The schema-v3
+  artifact records the component, sizes, oracle budget and total calls,
+  `budget_exhausted`/`one_minimal` flags, SHA-256, per-validator reduced
+  decisions, the reverted candidate's decisions when applicable, and a
+  `promotable` verdict, with deterministic offline serialization tests. A
+  new promotion registry (`tests/vectors/pki/reduced/manifest.zig`) feeds
+  every promoted seed into the DER and X.509 fuzz corpora automatically and
+  pins its recorded outcome — exact parse error, or the full-pipeline class
+  replayed in the source case's chain context; `zig build test-pki-reduce`
+  (also part of `zig build test`) regenerates each seed from its documented
+  source, requiring byte-for-byte equality and a completed 1-minimality
+  proof. The reduced corpus is a closed directory enforced by
+  `generate.sh`, and CI mismatch uploads now include the reduced inputs plus
+  substituted root/intermediate bundles.
 - **Three-way hostile Web PKI differential harness foundation (#348, epic #324)** —
   adds a bounded, provenance-backed certificate corpus that compares the
   pure-Zig parser, path builder, identity matcher, and RFC 5280 validator with

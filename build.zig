@@ -415,6 +415,14 @@ pub fn build(b: *std.Build) void {
     pki_mod.addAnonymousImport("pki_malformed_der", .{
         .root_source_file = b.path("tests/vectors/pki/malformed-truncated.der"),
     });
+    // Shared between the PKI unit tests and the differential harness; a single
+    // module instance because one source file may only belong to one module.
+    const pki_reduced_corpus_mod = b.createModule(.{
+        .root_source_file = b.path("tests/vectors/pki/reduced/manifest.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    pki_mod.addImport("pki_reduced_corpus", pki_reduced_corpus_mod);
     const pki_tests = b.addTest(.{ .root_module = pki_mod });
     const run_pki_tests = b.addRunArtifact(pki_tests);
     const pki_step = b.step("test-pki", "Run pure-Zig PKI DER unit tests");
@@ -456,6 +464,19 @@ pub fn build(b: *std.Build) void {
     pki_differential_mod.addImport("crypto", crypto_mod);
     pki_differential_mod.addImport("pki", pki_mod);
     pki_differential_mod.addImport("zig_compat", compat_mod);
+    pki_differential_mod.addAnonymousImport("pki_root_crt", .{
+        .root_source_file = b.path("tests/vectors/pki/root.crt"),
+    });
+    pki_differential_mod.addAnonymousImport("pki_intermediate_crt", .{
+        .root_source_file = b.path("tests/vectors/pki/intermediate.crt"),
+    });
+    pki_differential_mod.addAnonymousImport("pki_duplicate_extension_crt", .{
+        .root_source_file = b.path("tests/vectors/pki/duplicate-extension-leaf.crt"),
+    });
+    pki_differential_mod.addAnonymousImport("pki_signature_corrupt_crt", .{
+        .root_source_file = b.path("tests/vectors/pki/signature-corrupt-leaf.crt"),
+    });
+    pki_differential_mod.addImport("pki_reduced_corpus", pki_reduced_corpus_mod);
     const pki_differential_core_tests = b.addTest(.{
         .root_module = pki_differential_mod,
         .filters = &.{"pki differential core corpus"},
@@ -471,6 +492,18 @@ pub fn build(b: *std.Build) void {
     const run_pki_differential_full_tests = b.addRunArtifact(pki_differential_full_tests);
     const pki_differential_extended_step = b.step("test-pki-differential-extended", "Run full PKI differential corpus against OpenSSL and Go");
     pki_differential_extended_step.dependOn(&run_pki_differential_full_tests.step);
+
+    // Offline mismatch-minimization tests (#348): the reducer itself plus the
+    // harness oracle run fully in process, so they belong to the ordinary
+    // `test` target even though they live in the differential module.
+    const pki_reduce_tests = b.addTest(.{
+        .root_module = pki_differential_mod,
+        .filters = &.{"pki reduce"},
+    });
+    const run_pki_reduce_tests = b.addRunArtifact(pki_reduce_tests);
+    const pki_reduce_step = b.step("test-pki-reduce", "Run offline PKI mismatch-minimization tests");
+    pki_reduce_step.dependOn(&run_pki_reduce_tests.step);
+    test_step.dependOn(&run_pki_reduce_tests.step);
 }
 
 fn pathExists(path: []const u8) bool {

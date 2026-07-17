@@ -178,6 +178,12 @@ pub const SelectionContext = credentials.SelectionContext;
 pub const VerificationContext = credentials.VerificationContext;
 pub const CredentialFailure = credentials.FailureClass;
 
+/// Whether a server requests handshake-time client authentication (#334).
+/// `optional` accepts an empty client Certificate; `required` fails closed with
+/// `certificate_required` when the client presents none. Post-handshake client
+/// authentication is explicitly deferred.
+pub const ClientAuthMode = enum { disabled, optional, required };
+
 /// Largest peer certificate chain (total DER bytes and entry count) the engine
 /// reassembles and surfaces to a `PeerVerifier` as immutable views. A chain
 /// exceeding either bound fails closed (peer-attributed) rather than being
@@ -215,8 +221,15 @@ pub const Tls13Backend = struct {
     /// vtable's `ctx` points to caller-owned storage that must outlive the
     /// handshake. When null, the engine wraps the fixed identity/trust in the
     /// same production contract, so there is one authentication path.
+    /// The local credential provider — my own certificate. Server: the server
+    /// cert (or the fixed identity). Client: the client cert for handshake-time
+    /// client authentication, when configured.
     external_provider: ?CredentialProvider = null,
+    /// How I verify the peer. Client: verify the server. Server: verify the
+    /// client's certificate during handshake-time client authentication.
     external_verifier: ?PeerVerifier = null,
+    /// Server: whether to request client authentication.
+    client_auth: ClientAuthMode = .disabled,
     /// Explicit local authentication policy, passed to selection and
     /// verification. Set at construction from the caller's intent, never
     /// re-derived from a defaulted field (an external verifier must not silently
@@ -360,6 +373,24 @@ pub const Tls13Backend = struct {
             self.server_name_present = true;
         }
         return self;
+    }
+
+    /// Server: request handshake-time client authentication, verifying the
+    /// client's certificate through `verifier` (role `.server`). Must be called
+    /// before `start`. `optional` accepts an empty client Certificate;
+    /// `required` fails closed when the client presents none.
+    pub fn requestClientAuthentication(self: *Tls13Backend, mode: ClientAuthMode, verifier: PeerVerifier) void {
+        std.debug.assert(self.role == .server);
+        self.client_auth = mode;
+        self.external_verifier = verifier;
+    }
+
+    /// Client: supply the credential provider for the client's own certificate,
+    /// used to authenticate when the server sends a CertificateRequest. Must be
+    /// called before `start`.
+    pub fn setLocalCredentialProvider(self: *Tls13Backend, provider: CredentialProvider) void {
+        std.debug.assert(self.role == .client);
+        self.external_provider = provider;
     }
 
     pub fn backend(self: *Tls13Backend) TlsBackend {
@@ -1211,6 +1242,12 @@ pub const Tls13Backend = struct {
                 return self.failCredential(.malformed_credential_chain);
         }
 
+        // Ask the client to authenticate (handshake-time client auth, #334)
+        // before recording the flight, so the Core inserts CertificateRequest
+        // after EncryptedExtensions and expects the client certificate flight
+        // after the server Finished.
+        if (self.client_auth != .disabled) self.core.requestClientCertificate();
+
         var buf: [max_message_len]u8 = undefined;
         var w = Writer{ .buf = &buf };
 
@@ -1237,6 +1274,26 @@ pub const Tls13Backend = struct {
         w.patch(3, ee_len);
         const encrypted_extensions = buf[0..w.len];
 
+        // CertificateRequest (RFC 8446 §4.3.2), when requesting client auth:
+        // empty context, a signature_algorithms extension listing accepted
+        // client-auth schemes.
+        var certificate_request: []const u8 = &.{};
+        if (self.client_auth != .disabled) {
+            const cr_start = w.len;
+            try w.u8_(@intFromEnum(MessageType.certificate_request));
+            const cr_len = try w.reserve(3);
+            try w.u8_(0); // certificate_request_context<0..255>: empty
+            const cr_exts = try w.reserve(2);
+            try w.u16_(ext_signature_algorithms);
+            try w.u16_(2 + 2 * 2); // extension_data length
+            try w.u16_(2 * 2); // supported_signature_algorithms list length
+            try w.u16_(sigalg_ed25519);
+            try w.u16_(sigalg_ecdsa_secp256r1_sha256);
+            w.patch(2, cr_exts);
+            w.patch(3, cr_len);
+            certificate_request = buf[cr_start..w.len];
+        }
+
         // Certificate: the selected credential's validated public DER chain,
         // valid until `release`.
         const cert_start = w.len;
@@ -1255,6 +1312,8 @@ pub const Tls13Backend = struct {
         const certificate = buf[cert_start..w.len];
 
         self.core.recordSent(encrypted_extensions) catch |err| return mapCoreError(err);
+        if (certificate_request.len > 0)
+            self.core.recordSent(certificate_request) catch |err| return mapCoreError(err);
         self.core.recordSent(certificate) catch |err| return mapCoreError(err);
         try sink.emitCrypto(.handshake, buf[0..w.len]);
 

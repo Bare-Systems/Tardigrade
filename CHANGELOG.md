@@ -18,6 +18,20 @@ All notable user-facing changes to Tardigrade are documented here.
   CertificateVerify, Finished, transcript, key-schedule, traffic-secret, and
   zeroization implementation. Direct socket-pair record tests now live under
   `src/tls/` and compile without importing QUIC.
+- **Automated PKI mismatch minimization and reduced-corpus promotion (#348, epic #324)** —
+  every unexplained differential mismatch now runs bounded deterministic
+  delta debugging (`tests/pki_reduce.zig`) that shrinks the disagreeing leaf
+  input while preserving Tardigrade's exact classification, re-verifies the
+  reduced input against OpenSSL and Go `crypto/x509`, and persists the
+  reduced DER/PEM next to the JSON artifact (schema v3) with sizes, oracle
+  budget, SHA-256, per-validator reduced decisions, and a
+  `preserves_observed_statuses` verdict. A new promotion registry
+  (`tests/vectors/pki/reduced/manifest.zig`) feeds every promoted seed into
+  the DER and X.509 fuzz corpora automatically and pins its recorded parse
+  outcome with a regression test; `zig build test-pki-reduce` (also part of
+  `zig build test`) regenerates each seed from its documented source and
+  requires byte-for-byte equality, proving seeds stay reproducible and
+  1-minimal. CI mismatch uploads now include the reduced inputs.
 - **Three-way hostile Web PKI differential harness foundation (#348, epic #324)** —
   adds a bounded, provenance-backed certificate corpus that compares the
   pure-Zig parser, path builder, identity matcher, and RFC 5280 validator with

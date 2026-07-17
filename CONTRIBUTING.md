@@ -31,6 +31,10 @@ zig build test-pki-differential --summary all --error-style verbose
 # Full core + extended PKI corpus used by the scheduled/manual CI job
 zig build test-pki-differential-extended --summary all --error-style verbose
 
+# Offline PKI mismatch-minimization tests (also run under `zig build test`);
+# verifies the reducer and regenerates every promoted seed byte-for-byte
+zig build test-pki-reduce --summary all --error-style verbose
+
 # Integration tests — builds and drives a live tardigrade process against
 # mock upstreams; requires system OpenSSL. Not required for most contributions.
 zig build test-integration

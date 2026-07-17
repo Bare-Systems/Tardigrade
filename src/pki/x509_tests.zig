@@ -1069,3 +1069,39 @@ test "fuzz entrypoint tolerates arbitrary and hostile input" {
         mutated[index] ^= 0x40;
     }
 }
+
+test "reduced differential corpus is bounded and documented" {
+    const reduced_corpus = @import("pki_reduced_corpus");
+    try testing.expect(reduced_corpus.entries.len >= 1);
+    try testing.expect(reduced_corpus.entries.len <= 64);
+    for (reduced_corpus.entries, 0..) |entry, index| {
+        try testing.expect(entry.name.len > 0 and entry.name.len <= 96);
+        for (entry.name) |byte| {
+            try testing.expect(std.ascii.isLower(byte) or std.ascii.isDigit(byte) or byte == '-');
+        }
+        try testing.expect(entry.seed.len > 0 and entry.seed.len <= 64 * 1024);
+        try testing.expect(entry.source_case.len > 0);
+        try testing.expect(entry.provenance.len > 0);
+        try testing.expect(entry.license.len > 0);
+        for (reduced_corpus.entries[0..index]) |earlier| {
+            try testing.expect(!std.mem.eql(u8, earlier.name, entry.name));
+        }
+    }
+}
+
+test "reduced differential seeds keep their recorded parse outcome" {
+    const allocator = testing.allocator;
+    const reduced_corpus = @import("pki_reduced_corpus");
+    for (reduced_corpus.entries) |entry| {
+        if (x509.Certificate.parse(allocator, entry.seed, .{})) |parsed| {
+            var certificate = parsed;
+            defer certificate.deinit(allocator);
+            try testing.expect(entry.expected_parse_error == null);
+        } else |err| {
+            const expected = entry.expected_parse_error orelse return error.TestUnexpectedResult;
+            try testing.expectEqualStrings(expected, @errorName(err));
+        }
+        // Every promoted seed also exercises the fuzz entrypoint's limits.
+        x509.fuzzParseCertificate(allocator, entry.seed);
+    }
+}

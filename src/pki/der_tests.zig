@@ -427,8 +427,17 @@ test "length encode/decode round-trip" {
     }
 }
 
+// Seeds promoted from PKI differential mismatch minimization (#348) join the
+// hand-written corpus automatically.
+const reduced_corpus_seeds = blk: {
+    const reduced_corpus = @import("pki_reduced_corpus");
+    var seeds: [reduced_corpus.entries.len][]const u8 = undefined;
+    for (reduced_corpus.entries, &seeds) |entry, *seed| seed.* = entry.seed;
+    break :blk seeds;
+};
+
 test "fuzz: DER parser never panics or leaks on arbitrary input" {
-    try testing.fuzz({}, fuzzDerParse, .{ .corpus = &.{
+    try testing.fuzz({}, fuzzDerParse, .{ .corpus = &([_][]const u8{
         "",
         "\x30\x00",
         "\x02\x01\x01",
@@ -439,7 +448,7 @@ test "fuzz: DER parser never panics or leaks on arbitrary input" {
         "\x18\x0f\x32\x30\x32\x34\x30\x36\x30\x31\x30\x30\x30\x30\x30\x30\x5a",
         "\xa0\x03\x02\x01\x2a",
         @embedFile("pki_malformed_der"),
-    } });
+    } ++ reduced_corpus_seeds) });
 }
 
 fn fuzzDerParse(_: void, smith: *testing.Smith) !void {

@@ -5,6 +5,12 @@
 //! checked-in manifest records every expected decision and requires an
 //! explicit normalization rationale before validators may intentionally
 //! disagree.
+//!
+//! Every mismatch additionally runs bounded automated minimization: the
+//! disagreeing leaf input is shrunk while Tardigrade's exact classification is
+//! preserved, the reduced input is re-verified against all three validators,
+//! and the reduced bytes are persisted next to the JSON artifact for promotion
+//! into `tests/vectors/pki/reduced/manifest.zig`.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -12,6 +18,7 @@ const compat = @import("zig_compat");
 const crypto = @import("crypto");
 const pki = @import("pki");
 const manifest = @import("pki_differential_manifest.zig");
+const reduce_mod = @import("pki_reduce.zig");
 
 const testing = std.testing;
 const validation_time: i64 = 1_784_332_800; // 2026-07-18T00:00:00Z
@@ -19,6 +26,8 @@ const validation_time_argument = std.fmt.comptimePrint("{d}", .{validation_time}
 const max_oracle_output = 64 * 1024;
 const max_fixture_size = 1024 * 1024;
 const default_artifact_dir = "zig-out/pki-differential-artifacts";
+const max_reduction_oracle_calls = 512;
+const promotion_registry = "tests/vectors/pki/reduced/manifest.zig";
 
 const Status = enum { accept, reject, tool_failure };
 
@@ -54,7 +63,16 @@ const ParsedChain = struct {
     fn load(allocator: std.mem.Allocator, path: []const u8) !ParsedChain {
         var owned = try pki.pem.loadChainPemFile(allocator, compat.io(), .cwd(), path, .{});
         errdefer owned.deinit(allocator);
+        return fromChain(allocator, &owned);
+    }
 
+    fn fromPemText(allocator: std.mem.Allocator, pem_text: []const u8) !ParsedChain {
+        var owned = try pki.pem.loadChainPem(allocator, pem_text, .{});
+        errdefer owned.deinit(allocator);
+        return fromChain(allocator, &owned);
+    }
+
+    fn fromChain(allocator: std.mem.Allocator, owned: *pki.pem.CertificateChain) !ParsedChain {
         const certificates = try allocator.alloc(pki.x509.Certificate, owned.certificates.len);
         errdefer allocator.free(certificates);
         var initialized: usize = 0;
@@ -64,7 +82,7 @@ const ParsedChain = struct {
             certificate.* = try pki.x509.Certificate.parse(allocator, pem_certificate.der, .{});
             initialized += 1;
         }
-        return .{ .owned = owned, .certificates = certificates };
+        return .{ .owned = owned.*, .certificates = certificates };
     }
 
     fn deinit(self: *ParsedChain, allocator: std.mem.Allocator) void {
@@ -127,7 +145,7 @@ fn tardigradeDecision(allocator: std.mem.Allocator, case: manifest.Case) !Observ
     ) catch |err| return rejectionFromError(allocator, err);
     defer anchors.deinit(allocator);
 
-    var leaf_chain = ParsedChain.load(allocator, case.leaf_file) catch |err|
+    var leaf_chain = pki.pem.loadChainPemFile(allocator, compat.io(), .cwd(), case.leaf_file, .{}) catch |err|
         return rejectionFromError(allocator, err);
     defer leaf_chain.deinit(allocator);
     if (leaf_chain.certificates.len != 1) {
@@ -142,11 +160,35 @@ fn tardigradeDecision(allocator: std.mem.Allocator, case: manifest.Case) !Observ
     defer if (intermediates) |*chain| chain.deinit(allocator);
     const intermediate_certificates = if (intermediates) |*chain| chain.certificates else &.{};
 
+    return tardigradeLeafObservation(
+        allocator,
+        anchors.anchors(),
+        intermediate_certificates,
+        case.dns_name,
+        leaf_chain.certificates[0].der,
+    );
+}
+
+/// In-process classification of one leaf DER against already-loaded trust
+/// anchors and intermediates. This is both the file-based decision above and
+/// the minimization oracle, so a reduced input is classified by exactly the
+/// production pipeline that produced the original disagreement.
+fn tardigradeLeafObservation(
+    allocator: std.mem.Allocator,
+    anchors: []const pki.x509.Certificate,
+    intermediates: []const pki.x509.Certificate,
+    dns_name: ?[]const u8,
+    leaf_der: []const u8,
+) error{OutOfMemory}!Observation {
+    var leaf = pki.x509.Certificate.parse(allocator, leaf_der, .{}) catch |err|
+        return rejectionFromError(allocator, err);
+    defer leaf.deinit(allocator);
+
     var candidates = pki.path_builder.build(
         allocator,
-        &leaf_chain.certificates[0],
-        intermediate_certificates,
-        anchors.anchors(),
+        &leaf,
+        intermediates,
+        anchors,
         .{},
     ) catch |err| return rejectionFromError(allocator, err);
     defer candidates.deinit(allocator);
@@ -158,8 +200,8 @@ fn tardigradeDecision(allocator: std.mem.Allocator, case: manifest.Case) !Observ
         candidates,
         .{
             .validation_time = validation_time,
-            .expected_dns_name = case.dns_name,
-            .trust_anchors = anchors.anchors(),
+            .expected_dns_name = dns_name,
+            .trust_anchors = anchors,
         },
         provider.cryptoProvider(),
     );
@@ -349,6 +391,160 @@ fn expectedStatus(decision: manifest.Decision) Status {
     };
 }
 
+/// One stable string per observation class: status plus the deterministic
+/// diagnostic. Minimization preserves this exact class, never just the
+/// accept/reject bit, so a reduced input reproduces the same failure path.
+fn classString(allocator: std.mem.Allocator, obs: Observation) error{OutOfMemory}![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}|{s}", .{ @tagName(obs.status), obs.diagnostic });
+}
+
+const LeafOracle = struct {
+    allocator: std.mem.Allocator,
+    anchors: []const pki.x509.Certificate,
+    intermediates: []const pki.x509.Certificate,
+    dns_name: ?[]const u8,
+    target_class: []const u8,
+
+    fn keeps(self: *const LeafOracle, candidate: []const u8) error{OutOfMemory}!bool {
+        var obs = try tardigradeLeafObservation(
+            self.allocator,
+            self.anchors,
+            self.intermediates,
+            self.dns_name,
+            candidate,
+        );
+        defer obs.deinit(self.allocator);
+        const class = try classString(self.allocator, obs);
+        defer self.allocator.free(class);
+        return std.mem.eql(u8, class, self.target_class);
+    }
+};
+
+const Reduction = struct {
+    reduced_der: []u8,
+    original_size: usize,
+    oracle_calls: usize,
+    target_class: []u8,
+
+    fn deinit(self: *Reduction, allocator: std.mem.Allocator) void {
+        allocator.free(self.reduced_der);
+        allocator.free(self.target_class);
+        self.* = undefined;
+    }
+};
+
+/// Bounded automated minimization of a mismatching case's leaf input. Returns
+/// null when the supporting inputs cannot be loaded (the artifact still
+/// records the unreduced disagreement); intermediates and the trust anchor
+/// are kept fixed while only the leaf shrinks.
+fn minimizeLeaf(
+    allocator: std.mem.Allocator,
+    case: manifest.Case,
+    tardigrade_obs: Observation,
+) error{OutOfMemory}!?Reduction {
+    var leaf_chain = pki.pem.loadChainPemFile(allocator, compat.io(), .cwd(), case.leaf_file, .{}) catch |err|
+        return if (err == error.OutOfMemory) error.OutOfMemory else null;
+    defer leaf_chain.deinit(allocator);
+    if (leaf_chain.certificates.len != 1) return null;
+
+    const anchor_inputs = [_]pki.trust_store.FileInput{.{ .pem = case.root_file }};
+    var anchors = pki.trust_store.Snapshot.loadFiles(
+        allocator,
+        compat.io(),
+        .cwd(),
+        &anchor_inputs,
+        .{},
+    ) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else null;
+    defer anchors.deinit(allocator);
+
+    var intermediates: ?ParsedChain = null;
+    if (case.intermediate_file) |path| {
+        intermediates = ParsedChain.load(allocator, path) catch |err|
+            return if (err == error.OutOfMemory) error.OutOfMemory else null;
+    }
+    defer if (intermediates) |*chain| chain.deinit(allocator);
+
+    const target_class = try classString(allocator, tardigrade_obs);
+    errdefer allocator.free(target_class);
+
+    const oracle = LeafOracle{
+        .allocator = allocator,
+        .anchors = anchors.anchors(),
+        .intermediates = if (intermediates) |*chain| chain.certificates else &.{},
+        .dns_name = case.dns_name,
+        .target_class = target_class,
+    };
+    const outcome = reduce_mod.reduce(
+        allocator,
+        leaf_chain.certificates[0].der,
+        &oracle,
+        LeafOracle.keeps,
+        .{ .max_oracle_calls = max_reduction_oracle_calls },
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        // The file-based observation disagreed with the in-memory pipeline
+        // (e.g. it came from an anchor-load failure); nothing to preserve.
+        error.UninterestingInput => {
+            allocator.free(target_class);
+            return null;
+        },
+    };
+    return .{
+        .reduced_der = outcome.data,
+        .original_size = leaf_chain.certificates[0].der.len,
+        .oracle_calls = outcome.oracle_calls,
+        .target_class = target_class,
+    };
+}
+
+fn pemEncodeCertificate(allocator: std.mem.Allocator, der_bytes: []const u8) error{OutOfMemory}![]u8 {
+    const encoder = std.base64.standard.Encoder;
+    const b64 = try allocator.alloc(u8, encoder.calcSize(der_bytes.len));
+    defer allocator.free(b64);
+    _ = encoder.encode(b64, der_bytes);
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "-----BEGIN CERTIFICATE-----\n");
+    var rest: []const u8 = b64;
+    while (rest.len > 0) {
+        const line = rest[0..@min(rest.len, 64)];
+        try out.appendSlice(allocator, line);
+        try out.append(allocator, '\n');
+        rest = rest[line.len..];
+    }
+    try out.appendSlice(allocator, "-----END CERTIFICATE-----\n");
+    return out.toOwnedSlice(allocator);
+}
+
+const ObservationView = struct {
+    status: Status,
+    diagnostic: []const u8,
+
+    fn of(obs: Observation) ObservationView {
+        return .{ .status = obs.status, .diagnostic = obs.diagnostic };
+    }
+};
+
+const ReductionJson = struct {
+    original_size: usize,
+    reduced_size: usize,
+    oracle_calls: usize,
+    max_oracle_calls: usize,
+    target_class: []const u8,
+    reduced_der_file: []const u8,
+    reduced_pem_file: []const u8,
+    reduced_sha256: []const u8,
+    observed_reduced: struct {
+        tardigrade: ObservationView,
+        openssl: ObservationView,
+        go: ObservationView,
+    },
+    preserves_observed_statuses: bool,
+    promotion_registry: []const u8,
+    regression_target: []const u8,
+};
+
 fn writeArtifact(
     allocator: std.mem.Allocator,
     runtime_identity: RuntimeIdentity,
@@ -356,6 +552,7 @@ fn writeArtifact(
     tardigrade: Observation,
     openssl: Observation,
     go: Observation,
+    reduction: ?*const Reduction,
 ) ![]u8 {
     const artifact_dir = compat.getEnvVarOwned(allocator, "TARDIGRADE_PKI_DIFF_ARTIFACT_DIR") catch
         try allocator.dupe(u8, default_artifact_dir);
@@ -364,6 +561,61 @@ fn writeArtifact(
 
     const path = try std.fmt.allocPrint(allocator, "{s}/{s}.json", .{ artifact_dir, case.id });
     errdefer allocator.free(path);
+
+    var reduced_der_path: ?[]u8 = null;
+    defer if (reduced_der_path) |p| allocator.free(p);
+    var reduced_pem_path: ?[]u8 = null;
+    defer if (reduced_pem_path) |p| allocator.free(p);
+    var reduced_tardigrade: ?Observation = null;
+    defer if (reduced_tardigrade) |*obs| obs.deinit(allocator);
+    var reduced_openssl: ?Observation = null;
+    defer if (reduced_openssl) |*obs| obs.deinit(allocator);
+    var reduced_go: ?Observation = null;
+    defer if (reduced_go) |*obs| obs.deinit(allocator);
+    var reduced_sha256_hex: [64]u8 = undefined;
+    var reduction_json: ?ReductionJson = null;
+    if (reduction) |r| {
+        reduced_der_path = try std.fmt.allocPrint(allocator, "{s}/{s}.reduced.der", .{ artifact_dir, case.id });
+        try compat.cwd().writeFile(.{ .sub_path = reduced_der_path.?, .data = r.reduced_der });
+        reduced_pem_path = try std.fmt.allocPrint(allocator, "{s}/{s}.reduced.crt", .{ artifact_dir, case.id });
+        const reduced_pem = try pemEncodeCertificate(allocator, r.reduced_der);
+        defer allocator.free(reduced_pem);
+        try compat.cwd().writeFile(.{ .sub_path = reduced_pem_path.?, .data = reduced_pem });
+
+        // Re-verify the reduced input three-way so the artifact records
+        // whether the disagreement survived minimization.
+        var reduced_case = case;
+        reduced_case.leaf_file = reduced_pem_path.?;
+        reduced_tardigrade = try tardigradeDecision(allocator, reduced_case);
+        reduced_openssl = try opensslDecision(allocator, reduced_case);
+        reduced_go = try goDecision(allocator, reduced_case);
+
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(r.reduced_der, &digest, .{});
+        const hex = try std.fmt.bufPrint(&reduced_sha256_hex, "{x}", .{&digest});
+        std.debug.assert(hex.len == reduced_sha256_hex.len);
+
+        reduction_json = .{
+            .original_size = r.original_size,
+            .reduced_size = r.reduced_der.len,
+            .oracle_calls = r.oracle_calls,
+            .max_oracle_calls = max_reduction_oracle_calls,
+            .target_class = r.target_class,
+            .reduced_der_file = reduced_der_path.?,
+            .reduced_pem_file = reduced_pem_path.?,
+            .reduced_sha256 = &reduced_sha256_hex,
+            .observed_reduced = .{
+                .tardigrade = .of(reduced_tardigrade.?),
+                .openssl = .of(reduced_openssl.?),
+                .go = .of(reduced_go.?),
+            },
+            .preserves_observed_statuses = reduced_tardigrade.?.status == tardigrade.status and
+                reduced_openssl.?.status == openssl.status and
+                reduced_go.?.status == go.status,
+            .promotion_registry = promotion_registry,
+            .regression_target = case.regression_target,
+        };
+    }
     const build_step = if (case.profile == .extended)
         "test-pki-differential-extended"
     else
@@ -375,7 +627,7 @@ fn writeArtifact(
     );
     defer allocator.free(reproduce);
     const payload = try compat.stringifyAlloc(allocator, .{
-        .schema_version = 2,
+        .schema_version = 3,
         .case_id = case.id,
         .profile = case.profile,
         .category = case.category,
@@ -401,6 +653,7 @@ fn writeArtifact(
             .openssl = openssl,
             .go = go,
         },
+        .reduction = reduction_json,
     }, .{ .whitespace = .indent_2 });
     defer allocator.free(payload);
     try compat.cwd().writeFile(.{ .sub_path = path, .data = payload });
@@ -420,11 +673,21 @@ fn runCase(allocator: std.mem.Allocator, runtime_identity: RuntimeIdentity, case
         go.status == expectedStatus(case.expected.go);
     if (matches) return;
 
-    const artifact_path = writeArtifact(allocator, runtime_identity, case, tardigrade, openssl, go) catch |err| {
+    var reduction = try minimizeLeaf(allocator, case, tardigrade);
+    defer if (reduction) |*r| r.deinit(allocator);
+    const reduction_ptr: ?*const Reduction = if (reduction) |*r| r else null;
+
+    const artifact_path = writeArtifact(allocator, runtime_identity, case, tardigrade, openssl, go, reduction_ptr) catch |err| {
         std.debug.print("failed to persist PKI differential artifact for {s}: {s}\n", .{ case.id, @errorName(err) });
         return error.TestUnexpectedResult;
     };
     defer allocator.free(artifact_path);
+    if (reduction) |r| {
+        std.debug.print(
+            "PKI differential minimized case={s} leaf {d} -> {d} bytes in {d} oracle calls\n",
+            .{ case.id, r.original_size, r.reduced_der.len, r.oracle_calls },
+        );
+    }
     std.debug.print(
         "PKI differential mismatch case={s} expected=({s},{s},{s}) observed=({s},{s},{s}) artifact={s}\n",
         .{
@@ -498,6 +761,129 @@ fn runCorpus(include_extended: bool) !void {
 
 test "pki differential manifest is bounded and fully normalized" {
     try validateManifest();
+}
+
+// The "pki reduce" tests below are offline: they classify with the in-process
+// pipeline only, using embedded fixtures, so they run without OpenSSL or Go.
+
+/// Parse-level oracle used for seeds promoted into the reduced regression
+/// corpus: interesting means `pki.x509.Certificate.parse` under default
+/// limits fails with exactly the recorded error name.
+const ParseOracle = struct {
+    allocator: std.mem.Allocator,
+    expected_error: []const u8,
+
+    fn keeps(self: *const ParseOracle, candidate: []const u8) error{OutOfMemory}!bool {
+        if (pki.x509.Certificate.parse(self.allocator, candidate, .{})) |parsed| {
+            var certificate = parsed;
+            certificate.deinit(self.allocator);
+            return false;
+        } else |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            return std.mem.eql(u8, @errorName(err), self.expected_error);
+        }
+    }
+};
+
+test "pki reduce: promoted registry seeds reproduce byte-for-byte" {
+    const allocator = testing.allocator;
+    const reduced_corpus = @import("pki_reduced_corpus");
+
+    // Sources for every documented seed reduction, keyed by seed name. A
+    // promoted seed must be regenerable from its source: same reducer, same
+    // oracle, identical bytes.
+    const sources = [_]struct {
+        name: []const u8,
+        source_pem: []const u8,
+    }{
+        .{
+            .name = "duplicate-critical-extension",
+            .source_pem = @embedFile("pki_duplicate_extension_crt"),
+        },
+    };
+    comptime std.debug.assert(sources.len == reduced_corpus.entries.len);
+
+    for (reduced_corpus.entries) |entry| {
+        const source_pem = for (sources) |source| {
+            if (std.mem.eql(u8, source.name, entry.name)) break source.source_pem;
+        } else return error.TestUnexpectedResult;
+
+        var source_chain = try pki.pem.loadChainPem(allocator, source_pem, .{});
+        defer source_chain.deinit(allocator);
+        try testing.expectEqual(@as(usize, 1), source_chain.certificates.len);
+
+        const expected_error = entry.expected_parse_error orelse return error.TestUnexpectedResult;
+        const oracle = ParseOracle{ .allocator = allocator, .expected_error = expected_error };
+        // A budget generous enough to complete the chunk=1 sweep, so equality
+        // with the checked-in seed also proves the seed is 1-minimal: no
+        // single deletion preserves its recorded classification.
+        var outcome = try reduce_mod.reduce(
+            allocator,
+            source_chain.certificates[0].der,
+            &oracle,
+            ParseOracle.keeps,
+            .{ .max_oracle_calls = 4096 },
+        );
+        defer outcome.deinit(allocator);
+        try testing.expectEqualSlices(u8, entry.seed, outcome.data);
+    }
+}
+
+test "pki reduce: harness minimization preserves the tardigrade classification" {
+    const allocator = testing.allocator;
+    var anchors = try pki.trust_store.Snapshot.loadBuffers(
+        allocator,
+        &.{.{ .pem = @embedFile("pki_root_crt") }},
+        .{},
+    );
+    defer anchors.deinit(allocator);
+    var intermediates = try ParsedChain.fromPemText(allocator, @embedFile("pki_intermediate_crt"));
+    defer intermediates.deinit(allocator);
+    var leaf_chain = try pki.pem.loadChainPem(allocator, @embedFile("pki_duplicate_extension_crt"), .{});
+    defer leaf_chain.deinit(allocator);
+    try testing.expectEqual(@as(usize, 1), leaf_chain.certificates.len);
+    const leaf_der = leaf_chain.certificates[0].der;
+
+    var obs = try tardigradeLeafObservation(
+        allocator,
+        anchors.anchors(),
+        intermediates.certificates,
+        "duplicate.example.test",
+        leaf_der,
+    );
+    defer obs.deinit(allocator);
+    try testing.expectEqual(Status.reject, obs.status);
+    const target_class = try classString(allocator, obs);
+    defer allocator.free(target_class);
+
+    const oracle = LeafOracle{
+        .allocator = allocator,
+        .anchors = anchors.anchors(),
+        .intermediates = intermediates.certificates,
+        .dns_name = "duplicate.example.test",
+        .target_class = target_class,
+    };
+    var outcome = try reduce_mod.reduce(
+        allocator,
+        leaf_der,
+        &oracle,
+        LeafOracle.keeps,
+        .{ .max_oracle_calls = max_reduction_oracle_calls },
+    );
+    defer outcome.deinit(allocator);
+    try testing.expect(outcome.data.len <= leaf_der.len);
+    try testing.expect(outcome.oracle_calls <= max_reduction_oracle_calls);
+    try testing.expect(try oracle.keeps(outcome.data));
+
+    var second = try reduce_mod.reduce(
+        allocator,
+        leaf_der,
+        &oracle,
+        LeafOracle.keeps,
+        .{ .max_oracle_calls = max_reduction_oracle_calls },
+    );
+    defer second.deinit(allocator);
+    try testing.expectEqualSlices(u8, outcome.data, second.data);
 }
 
 test "pki differential core corpus" {

@@ -56,6 +56,34 @@ never accept it.
 `CERTIFICATE` block so every differential validator can consume one file
 format. The byte-identical raw DER remains available for parser fuzzing.
 
+## Mismatch minimization and the reduced regression corpus
+
+Every unexplained differential mismatch triggers bounded automated
+minimization (`tests/pki_reduce.zig`): the disagreeing leaf input is shrunk
+by deterministic greedy delta debugging while Tardigrade's exact
+classification — status plus diagnostic, never just accept/reject — is
+preserved, under a hard oracle-call budget. The harness writes the reduced
+input as `<case-id>.reduced.der` and `<case-id>.reduced.crt` next to the JSON
+artifact, re-verifies the reduced input against OpenSSL and Go, and records
+in the artifact whether every validator's observed status survived the
+reduction (`preserves_observed_statuses`).
+
+Reduced inputs are promoted into `reduced/manifest.zig`, the registry that
+the build embeds into the PKI unit-test module. Every registry seed
+automatically joins the DER and X.509 fuzz corpora and gets a decision
+regression test asserting its recorded parse outcome
+(`src/pki/x509_tests.zig`, `src/pki/der_tests.zig`). Promotion is auditable:
+each seed records its source case, provenance, license, and expected outcome,
+and `zig build test-pki-reduce` regenerates each seed from its documented
+source and requires byte-for-byte equality — which also proves the seed is
+1-minimal, since the reducer's final pass shows no single deletion preserves
+the classification.
+
+Byte-level deletion respects DER framing implicitly: structurally valid
+hostile certificates typically cannot shrink (their checked-in seed doubles
+as a minimality proof), while malformed inputs converge to the smallest
+input reproducing the same rejection class.
+
 ## Regeneration
 
 Run from any directory:

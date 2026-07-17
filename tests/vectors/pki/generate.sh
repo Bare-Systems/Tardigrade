@@ -133,6 +133,33 @@ for certificate_file in "$out"/*.crt; do
   fi
 done
 
+# The reduced regression corpus is likewise closed: every file must be the
+# registry itself or a `.der` seed registered in manifest.zig, with no
+# private-key material.
+reduced_dir="$script_dir/reduced"
+if [[ -d "$reduced_dir" ]]; then
+  while IFS= read -r -d '' seed; do
+    name="${seed##*/}"
+    if [[ "$name" != manifest.zig ]]; then
+      case "$name" in
+        *.der) ;;
+        *)
+          echo "unexpected file in reduced corpus: $name" >&2
+          exit 1
+          ;;
+      esac
+      if ! grep -qF -- "\"${name%.der}\"" "$reduced_dir/manifest.zig"; then
+        echo "reduced seed missing from manifest.zig: $name" >&2
+        exit 1
+      fi
+    fi
+    if grep -aEq -- '-----BEGIN ([A-Z0-9 ]+ )?PRIVATE KEY-----' "$seed"; then
+      echo "private-key material found in reduced corpus: $name" >&2
+      exit 1
+    fi
+  done < <(find "$reduced_dir" -maxdepth 1 -type f -print0)
+fi
+
 # Publish only after both generators and both validators agree.
 for fixture in "${fixtures[@]}"; do
   install -m 0644 "$out/$fixture" "$script_dir/$fixture.new"

@@ -579,6 +579,7 @@ const ReductionCandidate = struct {
     original_size: usize,
     candidate_size: usize,
     oracle_calls: usize,
+    max_oracle_calls: usize,
     budget_exhausted: bool,
     one_minimal: bool,
 
@@ -639,6 +640,7 @@ const Reduction = struct {
     /// Size the in-process search reached before any revert.
     candidate_size: usize,
     oracle_calls: usize,
+    max_oracle_calls: usize,
     total_oracle_calls: usize,
     max_total_oracle_calls: usize,
     components_tried: usize,
@@ -659,6 +661,7 @@ const Reduction = struct {
         self.original_size = candidate.original_size;
         self.candidate_size = candidate.candidate_size;
         self.oracle_calls = candidate.oracle_calls;
+        self.max_oracle_calls = candidate.max_oracle_calls;
         self.budget_exhausted = candidate.budget_exhausted;
         self.one_minimal = candidate.one_minimal;
         self.reverted_external_divergence = false;
@@ -755,6 +758,7 @@ fn minimizeCase(
             .original_size = original.len,
             .candidate_size = outcome.data.len,
             .oracle_calls = outcome.oracle_calls,
+            .max_oracle_calls = allowance,
             .budget_exhausted = outcome.budget_exhausted,
             .one_minimal = outcome.one_minimal,
         });
@@ -770,6 +774,7 @@ fn minimizeCase(
         .original_size = initial.original_size,
         .candidate_size = initial.candidate_size,
         .oracle_calls = initial.oracle_calls,
+        .max_oracle_calls = initial.max_oracle_calls,
         .total_oracle_calls = total_oracle_calls,
         .max_total_oracle_calls = max_total_reduction_oracle_calls,
         .components_tried = components_tried,
@@ -927,12 +932,18 @@ fn persistReducedCase(
     artifact_dir: []const u8,
     case: manifest.Case,
     r: *const Reduction,
+    probe_suffix: ?[]const u8,
 ) !ReducedPaths {
     try dir.makePath(artifact_dir);
-    const der_path = try std.fmt.allocPrint(allocator, "{s}/{s}.reduced.der", .{ artifact_dir, case.id });
+    const stem = if (probe_suffix) |suffix|
+        try std.fmt.allocPrint(allocator, "{s}/{s}.{s}.candidate", .{ artifact_dir, case.id, suffix })
+    else
+        try std.fmt.allocPrint(allocator, "{s}/{s}.reduced", .{ artifact_dir, case.id });
+    defer allocator.free(stem);
+    const der_path = try std.fmt.allocPrint(allocator, "{s}.der", .{stem});
     errdefer allocator.free(der_path);
     try dir.writeFile(.{ .sub_path = der_path, .data = r.reduced_der });
-    const pem_path = try std.fmt.allocPrint(allocator, "{s}/{s}.reduced.crt", .{ artifact_dir, case.id });
+    const pem_path = try std.fmt.allocPrint(allocator, "{s}.crt", .{stem});
     errdefer allocator.free(pem_path);
     const reduced_pem = try pemEncodeCertificate(allocator, r.reduced_der);
     defer allocator.free(reduced_pem);
@@ -953,8 +964,8 @@ fn persistReducedCase(
         .intermediate => |index| {
             const bundle_path = try std.fmt.allocPrint(
                 allocator,
-                "{s}/{s}.reduced-intermediates.crt",
-                .{ artifact_dir, case.id },
+                "{s}-intermediates.crt",
+                .{stem},
             );
             errdefer allocator.free(bundle_path);
             const bundle = try pemEncodeBundleWithReplacement(allocator, r.inputs.intermediates, index, r.reduced_der);
@@ -967,8 +978,8 @@ fn persistReducedCase(
         .root => |index| {
             const bundle_path = try std.fmt.allocPrint(
                 allocator,
-                "{s}/{s}.reduced-roots.crt",
-                .{ artifact_dir, case.id },
+                "{s}-roots.crt",
+                .{stem},
             );
             errdefer allocator.free(bundle_path);
             const bundle = try pemEncodeBundleWithReplacement(allocator, r.inputs.roots, index, r.reduced_der);
@@ -1013,9 +1024,11 @@ const ReducedVerification = struct {
 
 fn verifyReducedCase(
     allocator: std.mem.Allocator,
+    dir: compat.DirCompat,
     case: manifest.Case,
     paths: *const ReducedPaths,
 ) !struct { Observation, Observation, Observation } {
+    _ = dir;
     var reduced_case = case;
     reduced_case.root_file = paths.root_file;
     reduced_case.intermediate_file = paths.intermediate_file;
@@ -1032,9 +1045,10 @@ fn verifyReducedCase(
 /// mismatch. All retained component candidates are externally verified before
 /// selection, so the emitted reduction is the largest full-tuple reproduction
 /// already found by the bounded in-process passes. If no candidate preserves the
-/// tuple, fall back to original bytes — an emitted fixture must always be a
-/// reproduction, never a lossy artifact — with one disqualifying candidate kept
-/// for the record.
+/// tuple, fall back to original bytes. The fallback must reproduce too; an
+/// emitted fixture is either a reproduction or this path fails without returning
+/// reduced-artifact metadata. One disqualifying candidate is kept for the
+/// record when fallback succeeds.
 fn verifyAndPersistReduced(
     allocator: std.mem.Allocator,
     dir: compat.DirCompat,
@@ -1043,9 +1057,25 @@ fn verifyAndPersistReduced(
     r: *Reduction,
     original_statuses: [3]Status,
 ) !ReducedVerification {
+    return verifyAndPersistReducedWithVerifier(verifyReducedCase, allocator, dir, artifact_dir, case, r, original_statuses);
+}
+
+fn verifyAndPersistReducedWithVerifier(
+    comptime verifier: fn (std.mem.Allocator, compat.DirCompat, manifest.Case, *const ReducedPaths) anyerror!struct { Observation, Observation, Observation },
+    allocator: std.mem.Allocator,
+    dir: compat.DirCompat,
+    artifact_dir: []const u8,
+    case: manifest.Case,
+    r: *Reduction,
+    original_statuses: [3]Status,
+) !ReducedVerification {
     var best_index: ?usize = null;
-    var best_verification: ?ReducedVerification = null;
-    errdefer if (best_verification) |*verification| verification.deinit(allocator);
+    var best_tardigrade: ?Observation = null;
+    errdefer if (best_tardigrade) |*obs| obs.deinit(allocator);
+    var best_openssl: ?Observation = null;
+    errdefer if (best_openssl) |*obs| obs.deinit(allocator);
+    var best_go: ?Observation = null;
+    errdefer if (best_go) |*obs| obs.deinit(allocator);
     var fallback_index: ?usize = null;
     var fallback_shrink: usize = 0;
     var fallback_tardigrade: ?Observation = null;
@@ -1057,10 +1087,12 @@ fn verifyAndPersistReduced(
 
     for (r.candidates, 0..) |*candidate, index| {
         try r.selectCandidate(allocator, candidate);
-        var paths = try persistReducedCase(allocator, dir, artifact_dir, case, r);
+        const probe_suffix = try std.fmt.allocPrint(allocator, "candidate-{d}", .{index});
+        defer allocator.free(probe_suffix);
+        var paths = try persistReducedCase(allocator, dir, artifact_dir, case, r, probe_suffix);
         var owns_paths = true;
         errdefer if (owns_paths) paths.deinit(allocator);
-        var tardigrade, var openssl, var go = try verifyReducedCase(allocator, case, &paths);
+        var tardigrade, var openssl, var go = try verifier(allocator, dir, case, &paths);
         var owns_observations = true;
         errdefer if (owns_observations) {
             tardigrade.deinit(allocator);
@@ -1078,15 +1110,14 @@ fn verifyAndPersistReduced(
         const shrink = candidate.shrink();
         if (preserves) {
             if (candidateBeatsCurrent(best_index, index, r.candidates)) {
-                if (best_verification) |*verification| verification.deinit(allocator);
+                if (best_tardigrade) |*obs| obs.deinit(allocator);
+                if (best_openssl) |*obs| obs.deinit(allocator);
+                if (best_go) |*obs| obs.deinit(allocator);
                 best_index = index;
-                best_verification = .{
-                    .paths = paths,
-                    .tardigrade = tardigrade,
-                    .openssl = openssl,
-                    .go = go,
-                    .preserves = true,
-                };
+                best_tardigrade = tardigrade;
+                best_openssl = openssl;
+                best_go = go;
+                paths.deinit(allocator);
                 owns_paths = false;
                 owns_observations = false;
             } else {
@@ -1135,33 +1166,47 @@ fn verifyAndPersistReduced(
             fallback_go = null;
         }
         try r.selectCandidate(allocator, &r.candidates[index]);
-        const verification = best_verification.?;
-        best_verification = null;
+        var paths = try persistReducedCase(allocator, dir, artifact_dir, case, r, null);
+        errdefer paths.deinit(allocator);
+        const verification = ReducedVerification{
+            .paths = paths,
+            .tardigrade = best_tardigrade.?,
+            .openssl = best_openssl.?,
+            .go = best_go.?,
+            .preserves = true,
+        };
+        best_tardigrade = null;
+        best_openssl = null;
+        best_go = null;
         return verification;
     }
 
     const index = fallback_index orelse 0;
     try r.selectCandidate(allocator, &r.candidates[index]);
     try r.revertToOriginal(allocator);
-    var reverted_paths = try persistReducedCase(allocator, dir, artifact_dir, case, r);
-    errdefer reverted_paths.deinit(allocator);
-    var reverted_tardigrade, var reverted_openssl, var reverted_go = try verifyReducedCase(allocator, case, &reverted_paths);
+    var probe_paths = try persistReducedCase(allocator, dir, artifact_dir, case, r, "fallback-original");
+    defer probe_paths.deinit(allocator);
+    var reverted_tardigrade, var reverted_openssl, var reverted_go = try verifier(allocator, dir, case, &probe_paths);
     errdefer reverted_tardigrade.deinit(allocator);
     errdefer reverted_openssl.deinit(allocator);
     errdefer reverted_go.deinit(allocator);
+    const preserves = try observationsPreserveTarget(
+        allocator,
+        reverted_tardigrade,
+        reverted_openssl,
+        reverted_go,
+        original_statuses,
+        r.target_class,
+    );
+    if (!preserves) return error.TestUnexpectedResult;
+    var reverted_paths = try persistReducedCase(allocator, dir, artifact_dir, case, r, null);
+    errdefer reverted_paths.deinit(allocator);
     return .{
         .paths = reverted_paths,
         .tardigrade = reverted_tardigrade,
         .openssl = reverted_openssl,
         .go = reverted_go,
-        .preserves = try observationsPreserveTarget(
-            allocator,
-            reverted_tardigrade,
-            reverted_openssl,
-            reverted_go,
-            original_statuses,
-            r.target_class,
-        ),
+        .preserves = true,
         .candidate_tardigrade = fallback_tardigrade,
         .candidate_openssl = fallback_openssl,
         .candidate_go = fallback_go,
@@ -1209,7 +1254,7 @@ fn writeArtifact(
             .reduced_size = r.reduced_der.len,
             .candidate_size = r.candidate_size,
             .oracle_calls = r.oracle_calls,
-            .max_oracle_calls = r.max_total_oracle_calls,
+            .max_oracle_calls = r.max_oracle_calls,
             .total_oracle_calls = r.total_oracle_calls,
             .max_total_oracle_calls = r.max_total_oracle_calls,
             .components_tried = r.components_tried,
@@ -1615,6 +1660,58 @@ const drill_leaf_reduced = "\x30\x03\x02\x01\x01";
 const drill_intermediate_original = "\x30\x06\x02\x01\x07\x02\x01\x08";
 const drill_intermediate_candidate = "\x30\x03\x02\x01\x07";
 
+const DrillCandidate = struct {
+    component: Component,
+    reduced_der: []const u8,
+    original_size: usize,
+    oracle_calls: usize,
+    max_oracle_calls: usize,
+    budget_exhausted: bool,
+    one_minimal: bool,
+};
+
+fn drillReductionFromCandidates(
+    allocator: std.mem.Allocator,
+    inputs: CaseInputs,
+    candidate_configs: []const DrillCandidate,
+    total_oracle_calls: usize,
+) !Reduction {
+    const candidates = try allocator.alloc(ReductionCandidate, candidate_configs.len);
+    errdefer allocator.free(candidates);
+    var initialized: usize = 0;
+    errdefer for (candidates[0..initialized]) |*candidate| candidate.deinit(allocator);
+    for (candidate_configs, candidates) |config, *candidate| {
+        candidate.* = .{
+            .component = config.component,
+            .reduced_der = try allocator.dupe(u8, config.reduced_der),
+            .original_size = config.original_size,
+            .candidate_size = config.reduced_der.len,
+            .oracle_calls = config.oracle_calls,
+            .max_oracle_calls = config.max_oracle_calls,
+            .budget_exhausted = config.budget_exhausted,
+            .one_minimal = config.one_minimal,
+        };
+        initialized += 1;
+    }
+    const initial = candidates[0];
+    return .{
+        .inputs = inputs,
+        .candidates = candidates,
+        .component = initial.component,
+        .reduced_der = try allocator.dupe(u8, initial.reduced_der),
+        .original_size = initial.original_size,
+        .candidate_size = initial.candidate_size,
+        .oracle_calls = initial.oracle_calls,
+        .max_oracle_calls = initial.max_oracle_calls,
+        .total_oracle_calls = total_oracle_calls,
+        .max_total_oracle_calls = max_total_reduction_oracle_calls,
+        .components_tried = candidate_configs.len,
+        .budget_exhausted = initial.budget_exhausted,
+        .one_minimal = initial.one_minimal,
+        .target_class = try allocator.dupe(u8, "reject|OriginalReject"),
+    };
+}
+
 fn drillReduction(
     allocator: std.mem.Allocator,
     inputs: CaseInputs,
@@ -1622,36 +1719,42 @@ fn drillReduction(
     reduced_der: []const u8,
     original_size: usize,
     oracle_calls: usize,
+    max_oracle_calls: usize,
     total_oracle_calls: usize,
     budget_exhausted: bool,
     one_minimal: bool,
 ) !Reduction {
-    const candidates = try allocator.alloc(ReductionCandidate, 1);
-    errdefer allocator.free(candidates);
-    candidates[0] = .{
+    return drillReductionFromCandidates(allocator, inputs, &.{.{
         .component = component,
-        .reduced_der = try allocator.dupe(u8, reduced_der),
+        .reduced_der = reduced_der,
         .original_size = original_size,
-        .candidate_size = reduced_der.len,
         .oracle_calls = oracle_calls,
+        .max_oracle_calls = max_oracle_calls,
         .budget_exhausted = budget_exhausted,
         .one_minimal = one_minimal,
-    };
-    errdefer candidates[0].deinit(allocator);
+    }}, total_oracle_calls);
+}
+
+fn fabricatedReducedVerifier(
+    allocator: std.mem.Allocator,
+    dir: compat.DirCompat,
+    case: manifest.Case,
+    paths: *const ReducedPaths,
+) !struct { Observation, Observation, Observation } {
+    const raw = try dir.readFileAlloc(allocator, paths.der_path, 1024);
+    defer allocator.free(raw);
+    const preserves = !std.mem.eql(u8, case.id, "artifact-policy-fallback-fails") and
+        std.mem.eql(u8, raw, drill_leaf_reduced);
+    const diagnostic = if (preserves) "OriginalReject" else "DifferentReject";
+    var tardigrade = try fabricatedObservation(allocator, .reject, diagnostic);
+    errdefer tardigrade.deinit(allocator);
+    var openssl = try fabricatedObservation(allocator, .reject, "openssl reduced");
+    errdefer openssl.deinit(allocator);
+    const go = try fabricatedObservation(allocator, .accept, "go reduced");
     return .{
-        .inputs = inputs,
-        .candidates = candidates,
-        .component = component,
-        .reduced_der = try allocator.dupe(u8, reduced_der),
-        .original_size = original_size,
-        .candidate_size = reduced_der.len,
-        .oracle_calls = oracle_calls,
-        .total_oracle_calls = total_oracle_calls,
-        .max_total_oracle_calls = max_total_reduction_oracle_calls,
-        .components_tried = 1,
-        .budget_exhausted = budget_exhausted,
-        .one_minimal = one_minimal,
-        .target_class = try allocator.dupe(u8, "reject|OriginalReject"),
+        tardigrade,
+        openssl,
+        go,
     };
 }
 
@@ -1681,6 +1784,7 @@ test "pki reduce: candidate policy prefers promotable reproductions before large
             .original_size = 100,
             .candidate_size = partial_bytes.len,
             .oracle_calls = 170,
+            .max_oracle_calls = 170,
             .budget_exhausted = true,
             .one_minimal = false,
         },
@@ -1690,6 +1794,7 @@ test "pki reduce: candidate policy prefers promotable reproductions before large
             .original_size = 100,
             .candidate_size = promotable_bytes.len,
             .oracle_calls = 42,
+            .max_oracle_calls = 42,
             .budget_exhausted = false,
             .one_minimal = true,
         },
@@ -1699,6 +1804,7 @@ test "pki reduce: candidate policy prefers promotable reproductions before large
             .original_size = 100,
             .candidate_size = divergent_bytes.len,
             .oracle_calls = 12,
+            .max_oracle_calls = 12,
             .budget_exhausted = false,
             .one_minimal = true,
         },
@@ -1733,6 +1839,167 @@ test "pki reduce: observation comparison cleanup is leak-free on allocation fail
             go.deinit(allocator);
         }
     }.run, .{});
+}
+
+test "pki reduce: verification materializes the winning candidate to canonical artifact files" {
+    const allocator = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = compat.wrapDir(tmp.dir);
+
+    const case = manifest.Case{
+        .id = "artifact-policy-winner",
+        .profile = .core,
+        .category = .malformed_der,
+        .root_file = "tests/vectors/pki/root.crt",
+        .intermediate_file = "tests/vectors/pki/intermediate.crt",
+        .leaf_file = "tests/vectors/pki/drill-leaf.crt",
+        .dns_name = "drill.example.test",
+        .expected = .all(.reject),
+        .provenance = "fabricated artifact-policy drill",
+        .license = "Apache-2.0",
+        .regression_target = "src/pki/x509_tests.zig",
+    };
+    var inputs = CaseInputs{
+        .roots = try allocator.alloc([]u8, 1),
+        .intermediates = try allocator.alloc([]u8, 1),
+        .leaf = try allocator.dupe(u8, drill_leaf_original),
+    };
+    inputs.roots[0] = try allocator.dupe(u8, "ROOT-BYTES");
+    inputs.intermediates[0] = try allocator.dupe(u8, drill_intermediate_original);
+    var reduction = try drillReductionFromCandidates(
+        allocator,
+        inputs,
+        &.{
+            .{
+                .component = .leaf,
+                .reduced_der = drill_leaf_reduced,
+                .original_size = drill_leaf_original.len,
+                .oracle_calls = 7,
+                .max_oracle_calls = 11,
+                .budget_exhausted = false,
+                .one_minimal = true,
+            },
+            .{
+                .component = .{ .intermediate = 0 },
+                .reduced_der = drill_intermediate_candidate,
+                .original_size = drill_intermediate_original.len,
+                .oracle_calls = 19,
+                .max_oracle_calls = 31,
+                .budget_exhausted = false,
+                .one_minimal = true,
+            },
+        },
+        26,
+    );
+    defer reduction.deinit(allocator);
+
+    var verification = try verifyAndPersistReducedWithVerifier(
+        fabricatedReducedVerifier,
+        allocator,
+        dir,
+        "artifacts",
+        case,
+        &reduction,
+        .{ .reject, .reject, .accept },
+    );
+    defer verification.deinit(allocator);
+    try testing.expect(verification.preserves);
+    try testing.expectEqual(Component.leaf, reduction.component);
+    try testing.expectEqual(@as(usize, 11), reduction.max_oracle_calls);
+    try testing.expectEqualStrings("artifacts/artifact-policy-winner.reduced.der", verification.paths.der_path);
+    const raw = try dir.readFileAlloc(allocator, verification.paths.der_path, 1024);
+    defer allocator.free(raw);
+    try testing.expectEqualSlices(u8, drill_leaf_reduced, raw);
+
+    var runtime_identity = RuntimeIdentity{
+        .git_sha = try allocator.dupe(u8, "drill-sha"),
+        .openssl_version = try allocator.dupe(u8, "drill-openssl"),
+        .go_version = try allocator.dupe(u8, "drill-go"),
+        .zig_version = try allocator.dupe(u8, "drill-zig"),
+    };
+    defer runtime_identity.deinit(allocator);
+    var tardigrade = try fabricatedObservation(allocator, .reject, "OriginalReject");
+    defer tardigrade.deinit(allocator);
+    var openssl = try fabricatedObservation(allocator, .reject, "openssl original");
+    defer openssl.deinit(allocator);
+    var go = try fabricatedObservation(allocator, .accept, "go original");
+    defer go.deinit(allocator);
+    const artifact_path = try writeArtifact(
+        allocator,
+        dir,
+        "artifacts",
+        runtime_identity,
+        case,
+        tardigrade,
+        openssl,
+        go,
+        &reduction,
+        &verification,
+    );
+    defer allocator.free(artifact_path);
+    const payload = try dir.readFileAlloc(allocator, artifact_path, 64 * 1024);
+    defer allocator.free(payload);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+    defer parsed.deinit();
+    const reduction_json = parsed.value.object.get("reduction").?.object;
+    try testing.expectEqual(@as(i64, 11), reduction_json.get("max_oracle_calls").?.integer);
+    var expected_sha: [64]u8 = undefined;
+    sha256Hex(drill_leaf_reduced, &expected_sha);
+    try testing.expectEqualStrings(&expected_sha, reduction_json.get("reduced_sha256").?.string);
+}
+
+test "pki reduce: non-reproducing original fallback fails instead of returning an artifact" {
+    const allocator = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = compat.wrapDir(tmp.dir);
+
+    const case = manifest.Case{
+        .id = "artifact-policy-fallback-fails",
+        .profile = .core,
+        .category = .malformed_der,
+        .root_file = "tests/vectors/pki/root.crt",
+        .intermediate_file = "tests/vectors/pki/intermediate.crt",
+        .leaf_file = "tests/vectors/pki/drill-leaf.crt",
+        .dns_name = "drill.example.test",
+        .expected = .all(.reject),
+        .provenance = "fabricated artifact-policy fallback drill",
+        .license = "Apache-2.0",
+        .regression_target = "src/pki/x509_tests.zig",
+    };
+    var inputs = CaseInputs{
+        .roots = try allocator.alloc([]u8, 1),
+        .intermediates = try allocator.alloc([]u8, 1),
+        .leaf = try allocator.dupe(u8, drill_leaf_original),
+    };
+    inputs.roots[0] = try allocator.dupe(u8, "ROOT-BYTES");
+    inputs.intermediates[0] = try allocator.dupe(u8, drill_intermediate_original);
+    var reduction = try drillReductionFromCandidates(
+        allocator,
+        inputs,
+        &.{.{
+            .component = .leaf,
+            .reduced_der = drill_intermediate_candidate,
+            .original_size = drill_leaf_original.len,
+            .oracle_calls = 7,
+            .max_oracle_calls = 11,
+            .budget_exhausted = false,
+            .one_minimal = true,
+        }},
+        7,
+    );
+    defer reduction.deinit(allocator);
+
+    try testing.expectError(error.TestUnexpectedResult, verifyAndPersistReducedWithVerifier(
+        fabricatedReducedVerifier,
+        allocator,
+        dir,
+        "artifacts",
+        case,
+        &reduction,
+        .{ .reject, .reject, .accept },
+    ));
 }
 
 test "pki reduce: schema-v3 artifact is complete and reproducible" {
@@ -1786,6 +2053,7 @@ test "pki reduce: schema-v3 artifact is complete and reproducible" {
             drill_leaf_reduced,
             drill_leaf_original.len,
             7,
+            11,
             19,
             false,
             true,
@@ -1793,7 +2061,7 @@ test "pki reduce: schema-v3 artifact is complete and reproducible" {
         defer reduction.deinit(allocator);
 
         var verification = ReducedVerification{
-            .paths = try persistReducedCase(allocator, dir, "artifacts", case, &reduction),
+            .paths = try persistReducedCase(allocator, dir, "artifacts", case, &reduction, null),
             .tardigrade = try fabricatedObservation(allocator, .reject, "OriginalReject"),
             .openssl = try fabricatedObservation(allocator, .reject, "openssl reduced"),
             .go = try fabricatedObservation(allocator, .accept, "go reduced"),
@@ -1842,6 +2110,7 @@ test "pki reduce: schema-v3 artifact is complete and reproducible" {
         try testing.expectEqual(@as(i64, drill_leaf_original.len), reduction_json.get("original_size").?.integer);
         try testing.expectEqual(@as(i64, drill_leaf_reduced.len), reduction_json.get("reduced_size").?.integer);
         try testing.expectEqual(@as(i64, 7), reduction_json.get("oracle_calls").?.integer);
+        try testing.expectEqual(@as(i64, 11), reduction_json.get("max_oracle_calls").?.integer);
         try testing.expectEqual(@as(i64, 19), reduction_json.get("total_oracle_calls").?.integer);
         try testing.expectEqual(@as(i64, max_total_reduction_oracle_calls), reduction_json.get("max_total_oracle_calls").?.integer);
         try testing.expectEqual(true, reduction_json.get("one_minimal").?.bool);
@@ -1880,6 +2149,7 @@ test "pki reduce: schema-v3 artifact is complete and reproducible" {
             drill_intermediate_original.len,
             512,
             512,
+            512,
             true,
             false,
         );
@@ -1888,7 +2158,7 @@ test "pki reduce: schema-v3 artifact is complete and reproducible" {
         try testing.expectEqualSlices(u8, drill_intermediate_original, reduction.reduced_der);
 
         var verification = ReducedVerification{
-            .paths = try persistReducedCase(allocator, dir, "artifacts", reverted_case, &reduction),
+            .paths = try persistReducedCase(allocator, dir, "artifacts", reverted_case, &reduction, null),
             .tardigrade = try fabricatedObservation(allocator, .reject, "OriginalReject"),
             .openssl = try fabricatedObservation(allocator, .reject, "openssl reduced"),
             .go = try fabricatedObservation(allocator, .accept, "go reduced"),
@@ -1969,13 +2239,14 @@ test "pki reduce: schema-v3 artifact is complete and reproducible" {
             drill_leaf_original.len,
             512,
             512,
+            512,
             true,
             false,
         );
         defer reduction.deinit(allocator);
 
         var verification = ReducedVerification{
-            .paths = try persistReducedCase(allocator, dir, "artifacts", partial_case, &reduction),
+            .paths = try persistReducedCase(allocator, dir, "artifacts", partial_case, &reduction, null),
             .tardigrade = try fabricatedObservation(allocator, .reject, "OriginalReject"),
             .openssl = try fabricatedObservation(allocator, .reject, "openssl reduced"),
             .go = try fabricatedObservation(allocator, .accept, "go reduced"),

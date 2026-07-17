@@ -7,6 +7,7 @@
 //! disagree.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const compat = @import("zig_compat");
 const crypto = @import("crypto");
 const pki = @import("pki");
@@ -20,6 +21,21 @@ const max_fixture_size = 1024 * 1024;
 const default_artifact_dir = "zig-out/pki-differential-artifacts";
 
 const Status = enum { accept, reject, tool_failure };
+
+const RuntimeIdentity = struct {
+    git_sha: []u8,
+    openssl_version: []u8,
+    go_version: []u8,
+    zig_version: []u8,
+
+    fn deinit(self: *RuntimeIdentity, allocator: std.mem.Allocator) void {
+        allocator.free(self.git_sha);
+        allocator.free(self.openssl_version);
+        allocator.free(self.go_version);
+        allocator.free(self.zig_version);
+        self.* = undefined;
+    }
+};
 
 const Observation = struct {
     status: Status,
@@ -170,6 +186,53 @@ fn externalDiagnostic(allocator: std.mem.Allocator, stdout: []const u8, stderr: 
     return allocator.dupe(u8, bounded);
 }
 
+fn commandSummary(allocator: std.mem.Allocator, argv: []const []const u8) ![]u8 {
+    const result = std.process.run(allocator, compat.io(), .{
+        .argv = argv,
+        .stdout_limit = .limited(2048),
+        .stderr_limit = .limited(2048),
+    }) catch |err| return std.fmt.allocPrint(allocator, "unavailable: {s}", .{@errorName(err)});
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    return switch (result.term) {
+        .exited => |code| if (code == 0)
+            externalDiagnostic(allocator, result.stdout, result.stderr)
+        else
+            std.fmt.allocPrint(
+                allocator,
+                "exited {d}: {s}",
+                .{ code, std.mem.trim(u8, if (result.stderr.len != 0) result.stderr else result.stdout, " \t\r\n") },
+            ),
+        else => allocator.dupe(u8, "terminated before producing a version string"),
+    };
+}
+
+fn loadRuntimeIdentity(allocator: std.mem.Allocator) !RuntimeIdentity {
+    const git_sha = compat.getEnvVarOwned(allocator, "GITHUB_SHA") catch
+        try commandSummary(allocator, &.{ "git", "rev-parse", "HEAD" });
+    errdefer allocator.free(git_sha);
+
+    const openssl = compat.getEnvVarOwned(allocator, "OPENSSL_BIN") catch
+        try allocator.dupe(u8, "openssl");
+    defer allocator.free(openssl);
+    const openssl_version = try commandSummary(allocator, &.{ openssl, "version" });
+    errdefer allocator.free(openssl_version);
+
+    const go_binary = compat.getEnvVarOwned(allocator, "GO_BIN") catch
+        try allocator.dupe(u8, "go");
+    defer allocator.free(go_binary);
+    const go_version = try commandSummary(allocator, &.{ go_binary, "version" });
+    errdefer allocator.free(go_version);
+
+    return .{
+        .git_sha = git_sha,
+        .openssl_version = openssl_version,
+        .go_version = go_version,
+        .zig_version = try allocator.dupe(u8, builtin.zig_version_string),
+    };
+}
+
 fn opensslDecision(allocator: std.mem.Allocator, case: manifest.Case) !Observation {
     const openssl = compat.getEnvVarOwned(allocator, "OPENSSL_BIN") catch
         try allocator.dupe(u8, "openssl");
@@ -184,7 +247,7 @@ fn opensslDecision(allocator: std.mem.Allocator, case: manifest.Case) !Observati
         validation_time_argument,
         "-purpose",
         "sslserver",
-        "-CAfile",
+        "-trusted",
         case.root_file,
     });
     if (case.intermediate_file) |path| try argv.appendSlice(allocator, &.{ "-untrusted", path });
@@ -288,6 +351,7 @@ fn expectedStatus(decision: manifest.Decision) Status {
 
 fn writeArtifact(
     allocator: std.mem.Allocator,
+    runtime_identity: RuntimeIdentity,
     case: manifest.Case,
     tardigrade: Observation,
     openssl: Observation,
@@ -311,11 +375,17 @@ fn writeArtifact(
     );
     defer allocator.free(reproduce);
     const payload = try compat.stringifyAlloc(allocator, .{
-        .schema_version = 1,
+        .schema_version = 2,
         .case_id = case.id,
         .profile = case.profile,
         .category = case.category,
         .validation_time = validation_time,
+        .runtime = .{
+            .git_sha = runtime_identity.git_sha,
+            .openssl_version = runtime_identity.openssl_version,
+            .go_version = runtime_identity.go_version,
+            .zig_version = runtime_identity.zig_version,
+        },
         .root_file = case.root_file,
         .intermediate_file = case.intermediate_file,
         .leaf_file = case.leaf_file,
@@ -337,7 +407,7 @@ fn writeArtifact(
     return path;
 }
 
-fn runCase(allocator: std.mem.Allocator, case: manifest.Case) !void {
+fn runCase(allocator: std.mem.Allocator, runtime_identity: RuntimeIdentity, case: manifest.Case) !void {
     var tardigrade = try tardigradeDecision(allocator, case);
     defer tardigrade.deinit(allocator);
     var openssl = try opensslDecision(allocator, case);
@@ -350,7 +420,7 @@ fn runCase(allocator: std.mem.Allocator, case: manifest.Case) !void {
         go.status == expectedStatus(case.expected.go);
     if (matches) return;
 
-    const artifact_path = writeArtifact(allocator, case, tardigrade, openssl, go) catch |err| {
+    const artifact_path = writeArtifact(allocator, runtime_identity, case, tardigrade, openssl, go) catch |err| {
         std.debug.print("failed to persist PKI differential artifact for {s}: {s}\n", .{ case.id, @errorName(err) });
         return error.TestUnexpectedResult;
     };
@@ -408,6 +478,8 @@ fn expectFixtureBounded(path: []const u8) !void {
 
 fn runCorpus(include_extended: bool) !void {
     try validateManifest();
+    var runtime_identity = try loadRuntimeIdentity(testing.allocator);
+    defer runtime_identity.deinit(testing.allocator);
     const requested_case = compat.getEnvVarOwned(testing.allocator, "TARDIGRADE_PKI_DIFF_CASE") catch null;
     defer if (requested_case) |id| testing.allocator.free(id);
 
@@ -418,7 +490,7 @@ fn runCorpus(include_extended: bool) !void {
             if (!std.mem.eql(u8, id, case.id)) continue;
         }
         errdefer std.debug.print("failed PKI differential case: {s}\n", .{case.id});
-        try runCase(testing.allocator, case);
+        try runCase(testing.allocator, runtime_identity, case);
         executed += 1;
     }
     try testing.expect(executed > 0);

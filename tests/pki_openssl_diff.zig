@@ -54,7 +54,7 @@ fn opensslDecision(allocator: std.mem.Allocator, case: Case) !bool {
     const openssl = compat.getEnvVarOwned(allocator, "OPENSSL_BIN") catch try allocator.dupe(u8, "openssl");
     defer allocator.free(openssl);
     const result = try std.process.run(allocator, compat.io(), .{
-        .argv = &.{ openssl, "verify", "-attime", validation_time_argument, "-CAfile", root_path, "-untrusted", intermediate_path, leaf_path },
+        .argv = &.{ openssl, "verify", "-attime", validation_time_argument, "-trusted", root_path, "-untrusted", intermediate_path, leaf_path },
         .stdout_limit = .limited(1024 * 1024),
         .stderr_limit = .limited(1024 * 1024),
     });
@@ -173,7 +173,7 @@ fn opensslPolicyDecision(allocator: std.mem.Allocator, case: PolicyCase) !bool {
     defer allocator.free(openssl);
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(allocator);
-    try argv.appendSlice(allocator, &.{ openssl, "verify", "-attime", validation_time_argument, "-CAfile", paths.root, "-untrusted", paths.untrusted, "-policy", "1.3.6.1.4.1.55555.1", "-policy_check" });
+    try argv.appendSlice(allocator, &.{ openssl, "verify", "-attime", validation_time_argument, "-trusted", paths.root, "-untrusted", paths.untrusted, "-policy", "1.3.6.1.4.1.55555.1", "-policy_check" });
     if (case.explicit_policy) try argv.append(allocator, "-explicit_policy");
     if (case.inhibit_any) try argv.append(allocator, "-inhibit_any");
     if (case.inhibit_mapping) try argv.append(allocator, "-inhibit_map");

@@ -61,26 +61,26 @@ openssl_reject() {
 }
 
 out="$tmp/first"
-openssl_accept -CAfile "$out/root.crt" -untrusted "$out/intermediate.crt" \
+openssl_accept -trusted "$out/root.crt" -untrusted "$out/intermediate.crt" \
   -verify_hostname api.example.test "$out/valid-leaf.crt"
-openssl_accept -CAfile "$out/root.crt" -untrusted "$out/intermediate.crt" \
+openssl_accept -trusted "$out/root.crt" -untrusted "$out/intermediate.crt" \
   -verify_hostname api.example.test "$out/wildcard-leaf.crt"
-openssl_reject -CAfile "$out/root.crt" -untrusted "$out/intermediate.crt" \
+openssl_reject -trusted "$out/root.crt" -untrusted "$out/intermediate.crt" \
   -verify_hostname example.test "$out/wildcard-leaf.crt"
-openssl_reject -CAfile "$out/root.crt" -untrusted "$out/intermediate.crt" \
+openssl_reject -trusted "$out/root.crt" -untrusted "$out/intermediate.crt" \
   -verify_hostname deep.api.example.test "$out/wildcard-leaf.crt"
-openssl_reject -CAfile "$out/root.crt" -untrusted "$out/intermediate.crt" \
+openssl_reject -trusted "$out/root.crt" -untrusted "$out/intermediate.crt" \
   -verify_hostname critical.example.test "$out/unknown-critical-leaf.crt"
-openssl_reject -CAfile "$out/root.crt" -untrusted "$out/intermediate.crt" \
+openssl_reject -trusted "$out/root.crt" -untrusted "$out/intermediate.crt" \
   -verify_hostname api.example.test "$out/signature-corrupt-leaf.crt"
-openssl_reject -CAfile "$out/root.crt" -untrusted "$out/pathlen-chain.crt" \
+openssl_reject -trusted "$out/root.crt" -untrusted "$out/pathlen-chain.crt" \
   -verify_hostname pathlen.example.test "$out/pathlen-leaf.crt"
-openssl_accept -CAfile "$out/cross-roots.crt" -untrusted "$out/cross-untrusted-b-first.crt" \
+openssl_accept -trusted "$out/cross-roots.crt" -untrusted "$out/cross-untrusted-b-first.crt" \
   -verify_hostname cross.example.test "$out/cross-leaf.crt"
 
 # Duplicate extensions must be rejected either by the parser or by validation.
 if openssl x509 -in "$out/duplicate-extension-leaf.crt" -noout >/dev/null 2>&1; then
-  openssl_reject -CAfile "$out/root.crt" -untrusted "$out/intermediate.crt" \
+  openssl_reject -trusted "$out/root.crt" -untrusted "$out/intermediate.crt" \
     -verify_hostname duplicate.example.test "$out/duplicate-extension-leaf.crt"
 fi
 if openssl x509 -inform DER -in "$out/malformed-truncated.der" -noout >/dev/null 2>&1; then

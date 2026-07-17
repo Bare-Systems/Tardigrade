@@ -46,7 +46,7 @@ jobs:
         uses: rhysd/actionlint@914e7df21a07ef503a81201c76d2b11c789d3fca # v1.7.12
 
       - name: Run shellcheck
-        run: find scripts/ packaging/ -name "*.sh" -exec shellcheck {} +
+        run: find scripts/ packaging/ tests/vectors/pki -name "*.sh" -exec shellcheck {} +
 
   # ── TLS dependency audit ──────────────────────────────────────────────────────
   # Enforces the external-library policy (#379): forbidden TLS/crypto/QUIC/H3
@@ -178,6 +178,11 @@ jobs:
           zig version
           openssl version
           go version
+
+      - name: Verify deterministic PKI fixtures
+        run: |
+          tests/vectors/pki/generate.sh
+          git diff --exit-code -- tests/vectors/pki
 
       - name: Run stable differential corpus
         env:

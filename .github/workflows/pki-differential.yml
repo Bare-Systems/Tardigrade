@@ -42,6 +42,11 @@ jobs:
           openssl version
           go version
 
+      - name: Verify deterministic PKI fixtures
+        run: |
+          tests/vectors/pki/generate.sh
+          git diff --exit-code -- tests/vectors/pki
+
       - name: Run extended differential corpus
         env:
           TARDIGRADE_PKI_DIFF_ARTIFACT_DIR: pki-differential-artifacts

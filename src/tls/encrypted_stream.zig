@@ -228,6 +228,14 @@ pub const PureZigRecordStream = struct {
     const max_terminal_flush_attempts = 16;
 
     bridge: record_epoch_bridge.Bridge,
+    /// Handshake role retained for record-mode authentication policy. Clients
+    /// require an explicitly verified server certificate by default; servers
+    /// do not require client authentication in the current profile.
+    role: tls_state.Role,
+    /// Explicit opt-in for backends configured without certificate
+    /// verification. This mirrors the QUIC driver's policy and keeps
+    /// `.certificate(.not_checked)` from silently opening a client stream.
+    allow_unverified_certificate: bool = false,
     /// The shared TLS handshake driver, present only when a concrete backend was
     /// injected (`initWithBackend`/`initWithCarrierAndBackend`). Absent for the
     /// lower-level record-plumbing paths that drive events in by hand.
@@ -283,6 +291,7 @@ pub const PureZigRecordStream = struct {
             .strict;
         return .{
             .bridge = record_epoch_bridge.Bridge.init(crypto_provider, cipher_suite),
+            .role = role,
             .initial_parser = record_codec.Parser.initWithVersionPolicy(.plaintext, initial_policy),
         };
     }
@@ -493,7 +502,11 @@ pub const PureZigRecordStream = struct {
                     // would stall in `.handshaking` forever. Stop applying later
                     // success events in the same batch so a bogus
                     // `handshake_complete` after it can never open the stream.
-                    if (cert_state == .invalid) {
+                    if (cert_state == .invalid or
+                        (self.role == .client and
+                            cert_state == .not_checked and
+                            !self.allow_unverified_certificate))
+                    {
                         self.deferHandshakeFailure(error.CertificateInvalid, fatal_alert);
                         break;
                     }
@@ -503,6 +516,13 @@ pub const PureZigRecordStream = struct {
                     try self.applyDiscardSideEffects(epoch);
                 },
                 .handshake_complete => {
+                    if (self.role == .client and
+                        !self.allow_unverified_certificate and
+                        self.certificate_state != .valid)
+                    {
+                        self.deferHandshakeFailure(error.CertificateInvalid, fatal_alert);
+                        break;
+                    }
                     self.bridge.markHandshakeComplete() catch |err| return self.fail(err);
                     self.read_epoch = .application;
                     self.write_epoch = .application;
@@ -550,10 +570,27 @@ pub const PureZigRecordStream = struct {
     /// `drive()` then flushes that output within a bounded write budget and
     /// latches the preserved error only once it drains (or the flush deadline
     /// fires) -- never by a hidden synchronous retry-and-discard.
-    fn deferHandshakeFailure(self: *PureZigRecordStream, err: Error, maybe_alert: ?alerts.AlertDescription) void {
-        if (maybe_alert) |desc| self.queueFatalAlert(desc);
+    fn deferHandshakeFailure(self: *PureZigRecordStream, err: Error, emitted_alert: ?alerts.AlertDescription) void {
+        const alert = emitted_alert orelse mappedFatalAlert(err);
+        if (alert) |desc| self.queueFatalAlert(desc);
         self.pending_terminal = err;
         self.terminal_flush_attempts = 0;
+    }
+
+    /// Convert record-transport handshake policy failures into their canonical
+    /// TLS fatal alerts when a backend did not emit a more specific alert.
+    fn mappedFatalAlert(err: Error) ?alerts.AlertDescription {
+        return switch (err) {
+            error.MalformedHandshake,
+            error.IllegalParameter,
+            error.UnexpectedHandshakeMessage,
+            error.CertificateInvalid,
+            error.AlpnMismatch,
+            error.SecretExportFailed,
+            error.InvalidHandshakeState,
+            => alerts.fromHandshakeError(@errorCast(err)),
+            else => null,
+        };
     }
 
     /// Best-effort: seal a fatal alert at the current write epoch into the
@@ -699,8 +736,13 @@ pub const PureZigRecordStream = struct {
         // drives us back when the carrier is writable, rather than a hidden
         // synchronous retry that would discard the alert on `WouldBlock`.
         if (self.pending_terminal) |root| {
-            if (self.flushPendingAlert() > 0) made_progress = true;
-            self.terminal_flush_attempts += 1;
+            const flushed = self.flushPendingAlert();
+            if (flushed > 0) {
+                made_progress = true;
+                self.terminal_flush_attempts = 0;
+            } else {
+                self.terminal_flush_attempts += 1;
+            }
             if (self.outbound_ciphertext.len == 0 or self.terminal_flush_attempts >= max_terminal_flush_attempts) {
                 return self.fail(root);
             }
@@ -2455,6 +2497,9 @@ const ScriptedRecordBackend = struct {
                 } else if (epoch == .handshake and std.mem.eql(u8, bytes, "SF")) {
                     try sink.emitSecret(.application, .write, &app_c2s);
                     try sink.emitSecret(.application, .read, &app_s2c);
+                    // The secure record-stream default requires a client-side
+                    // certificate decision before authenticated completion.
+                    try sink.emitCertificate(.valid);
                     try sink.emitHandshakeBytes(.handshake, "CF");
                     try sink.emitDiscardEpoch(.handshake);
                     try sink.emitHandshakeComplete();
@@ -2692,6 +2737,35 @@ const CountingOwnedCarrier = struct {
     }
 };
 
+/// A deterministic carrier that accepts exactly one byte after each explicit
+/// re-arm, then returns `WouldBlock` until the next `drive()`. This models an
+/// edge-triggered event loop delivering repeated writable notifications while
+/// forcing a protected alert to span many drive calls.
+const OneBytePerDriveCarrier = struct {
+    captured: ByteQueue(PureZigRecordStream.max_ciphertext_queue, error.CiphertextBufferFull) = .{},
+    armed: bool = false,
+
+    fn carrier(self: *OneBytePerDriveCarrier) Carrier {
+        return .{ .ptr = self, .readFn = read, .writeFn = write };
+    }
+
+    fn rearm(self: *OneBytePerDriveCarrier) void {
+        self.armed = true;
+    }
+
+    fn read(_: *anyopaque, _: []u8) Error!usize {
+        return error.WouldBlock;
+    }
+
+    fn write(ptr: *anyopaque, bytes: []const u8) Error!usize {
+        const self: *OneBytePerDriveCarrier = @ptrCast(@alignCast(ptr));
+        if (!self.armed or bytes.len == 0) return error.WouldBlock;
+        self.armed = false;
+        self.captured.append(bytes[0..1]) catch return error.WouldBlock;
+        return 1;
+    }
+};
+
 test "driver-owned cancellation releases owned carrier, driver, and secrets exactly once" {
     const cp = testProvider();
     inline for (.{ true, false }) |install_keys| {
@@ -2792,6 +2866,53 @@ test "driver-owned handshake preserves a pending fatal alert across write backpr
         };
     }
     try testing.expectEqual(@as(?anyerror, error.PeerFatalAlert), client_error);
+}
+
+test "terminal alert flush deadline resets on partial-write progress" {
+    const cp = testProvider();
+    const hs_secret = secret(0x5a);
+    var carrier = OneBytePerDriveCarrier{};
+    var sender = PureZigRecordStream.initWithCarrier(.client, cp, .tls_aes_128_gcm_sha256, carrier.carrier());
+    defer sender.deinit();
+    var peer = PureZigRecordStream.init(.server, cp, .tls_aes_128_gcm_sha256);
+    defer peer.deinit();
+
+    try sender.bridge.installTrafficSecret(.handshake, .write, &hs_secret);
+    sender.write_epoch = .handshake;
+    try peer.bridge.installTrafficSecret(.handshake, .read, &hs_secret);
+
+    // Put a protected handshake record ahead of the synthesized alert so the
+    // queue takes substantially more than the 16-attempt no-progress deadline
+    // to drain at one byte per writable notification.
+    var record_buf: [record_codec.max_ciphertext_record_len]u8 = undefined;
+    const earlier = try sender.bridge.sealHandshake(.handshake, "queued-before-alert", &record_buf);
+    try sender.outbound_ciphertext.append(earlier);
+    sender.deferHandshakeFailure(error.CertificateInvalid, null);
+    try testing.expectEqual(alerts.AlertDescription.bad_certificate, PureZigRecordStream.mappedFatalAlert(error.CertificateInvalid).?);
+    try testing.expect(sender.queuedCiphertextLen() > PureZigRecordStream.max_terminal_flush_attempts);
+
+    var drives: usize = 0;
+    while (drives < PureZigRecordStream.max_ciphertext_queue) : (drives += 1) {
+        carrier.rearm();
+        const result = sender.stream().drive() catch |err| {
+            try testing.expectEqual(error.CertificateInvalid, err);
+            break;
+        };
+        try testing.expect(result.made_progress);
+        try testing.expectEqual(@as(usize, 0), sender.terminal_flush_attempts);
+        try testing.expect(sender.pending_terminal != null);
+    }
+    try testing.expect(drives > PureZigRecordStream.max_terminal_flush_attempts);
+    try testing.expectEqual(Lifecycle.failed, sender.lifecycle);
+    try expectLatchedFailureConformance(sender.stream(), error.CertificateInvalid);
+
+    // The peer can consume the complete earlier handshake record and then
+    // opens the following protected fatal alert rather than seeing truncation.
+    const captured = carrier.captured.slice();
+    const consumed = try peer.feedHandshakeCiphertext(.handshake, captured);
+    var plaintext: [64]u8 = undefined;
+    try testing.expectEqualStrings("queued-before-alert", plaintext[0..try peer.readHandshake(&plaintext)]);
+    try testing.expectError(error.PeerFatalAlert, peer.feedHandshakeCiphertext(.handshake, captured[consumed..]));
 }
 
 test "driver-owned handshake latches on the flush deadline when a fatal alert can never be sent" {

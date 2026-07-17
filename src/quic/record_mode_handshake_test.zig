@@ -680,9 +680,15 @@ const FdCarrier = struct {
     max_chunk: usize = std.math.maxInt(usize),
     read_offset: usize = 0,
     corrupt_at: ?usize = null,
+    one_write_per_drive: bool = false,
+    write_armed: bool = true,
 
     fn carrier(self: *FdCarrier) es.Carrier {
         return .{ .ptr = self, .readFn = read, .writeFn = write };
+    }
+
+    fn rearmWrite(self: *FdCarrier) void {
+        if (self.one_write_per_drive) self.write_armed = true;
     }
 
     fn read(ptr: *anyopaque, out: []u8) es.Error!usize {
@@ -702,9 +708,12 @@ const FdCarrier = struct {
 
     fn write(ptr: *anyopaque, bytes: []const u8) es.Error!usize {
         const self: *FdCarrier = @ptrCast(@alignCast(ptr));
+        if (self.one_write_per_drive and !self.write_armed) return error.WouldBlock;
         const cap = @min(bytes.len, self.max_chunk);
         if (cap == 0) return error.WouldBlock;
-        return writeFd(self.fd, bytes[0..cap]);
+        const written = try writeFd(self.fd, bytes[0..cap]);
+        if (self.one_write_per_drive and written > 0) self.write_armed = false;
+        return written;
     }
 };
 
@@ -729,6 +738,7 @@ const SocketHarness = struct {
         client_trust: tls_backend.Trust = .{ .pinned_certificate = tls_backend.testdata.certificate_der },
         client_alpn: []const u8 = "h3",
         server_alpn: []const u8 = "h3",
+        one_write_per_drive: bool = false,
     };
 
     fn create(opts: Options) !*SocketHarness {
@@ -746,8 +756,8 @@ const SocketHarness = struct {
 
         self.client_wrapper = RecordModeBackend.init(&self.client_engine);
         self.server_wrapper = RecordModeBackend.init(&self.server_engine);
-        self.client_carrier = .{ .fd = self.fds[0], .max_chunk = opts.client_chunk };
-        self.server_carrier = .{ .fd = self.fds[1], .max_chunk = opts.server_chunk };
+        self.client_carrier = .{ .fd = self.fds[0], .max_chunk = opts.client_chunk, .one_write_per_drive = opts.one_write_per_drive };
+        self.server_carrier = .{ .fd = self.fds[1], .max_chunk = opts.server_chunk, .one_write_per_drive = opts.one_write_per_drive };
 
         self.client = es.PureZigRecordStream.initWithCarrierAndBackend(.client, clientProvider(), suite, self.client_carrier.carrier(), self.client_wrapper.backend());
         self.server = es.PureZigRecordStream.initWithCarrierAndBackend(.server, serverProvider(), suite, self.server_carrier.carrier(), self.server_wrapper.backend());
@@ -778,12 +788,22 @@ const SocketHarness = struct {
     fn driveUntil(self: *SocketHarness, done: *const fn (*SocketHarness) bool) !void {
         var rounds: usize = 0;
         while (rounds < 5000) : (rounds += 1) {
-            const c = self.client.stream().drive() catch |err| return err;
-            const s = self.server.stream().drive() catch |err| return err;
+            const c = self.driveClient() catch |err| return err;
+            const s = self.driveServer() catch |err| return err;
             if (done(self)) return;
             if (!c.made_progress and !s.made_progress) return error.Stalled;
         }
         return error.Stalled;
+    }
+
+    fn driveClient(self: *SocketHarness) es.Error!es.DriveResult {
+        self.client_carrier.rearmWrite();
+        return self.client.stream().drive();
+    }
+
+    fn driveServer(self: *SocketHarness) es.Error!es.DriveResult {
+        self.server_carrier.rearmWrite();
+        return self.server.stream().drive();
     }
 
     fn bothComplete(self: *SocketHarness) bool {
@@ -919,8 +939,8 @@ test "record stream handshake treats carrier EOF before close_notify as truncati
 fn driveUntilError(h: *SocketHarness) ?anyerror {
     var rounds: usize = 0;
     while (rounds < 500) : (rounds += 1) {
-        const c = h.client.stream().drive() catch |err| return err;
-        const s = h.server.stream().drive() catch |err| return err;
+        const c = h.driveClient() catch |err| return err;
+        const s = h.driveServer() catch |err| return err;
         if (h.client.lifecycle == .failed or h.server.lifecycle == .failed) {
             // Give the failing side one more drive to surface its latched error.
             _ = h.client.stream().drive() catch |err| return err;
@@ -930,6 +950,32 @@ fn driveUntilError(h: *SocketHarness) ?anyerror {
         if (!c.made_progress and !s.made_progress) return null;
     }
     return null;
+}
+
+const PairErrors = struct {
+    client: ?anyerror = null,
+    server: ?anyerror = null,
+};
+
+/// Keep driving the non-failed peer after the policy-failing side latches its
+/// root error, so the test proves the complete synthesized-alert delivery path.
+fn driveUntilBothErrors(h: *SocketHarness) PairErrors {
+    var errors = PairErrors{};
+    var rounds: usize = 0;
+    while (rounds < 20_000) : (rounds += 1) {
+        if (errors.client == null) {
+            _ = h.driveClient() catch |err| {
+                errors.client = err;
+            };
+        }
+        if (errors.server == null) {
+            _ = h.driveServer() catch |err| {
+                errors.server = err;
+            };
+        }
+        if (errors.client != null and errors.server != null) return errors;
+    }
+    return errors;
 }
 
 test "record stream handshake fails closed with CertificateInvalid on a wrong pinned certificate" {
@@ -942,15 +988,20 @@ test "record stream handshake fails closed with CertificateInvalid on a wrong pi
     @memcpy(&wrong_pin, tls_backend.testdata.certificate_der);
     wrong_pin[wrong_pin.len / 2] ^= 0xff;
 
-    const h = try SocketHarness.create(.{ .client_trust = .{ .pinned_certificate = &wrong_pin } });
+    const h = try SocketHarness.create(.{
+        .client_chunk = 1,
+        .server_chunk = 1,
+        .client_trust = .{ .pinned_certificate = &wrong_pin },
+        .one_write_per_drive = true,
+    });
     defer h.destroy();
 
-    const failure = driveUntilError(h);
+    const failures = driveUntilBothErrors(h);
     try std.testing.expect(!h.client.bridge.handshake_complete);
     try std.testing.expect(!h.server.bridge.handshake_complete);
     try std.testing.expect(h.client.lifecycle == .failed);
-    try std.testing.expect(failure != null);
-    try std.testing.expect(failure.? == error.CertificateInvalid);
+    try std.testing.expectEqual(@as(?anyerror, error.CertificateInvalid), failures.client);
+    try std.testing.expectEqual(@as(?anyerror, error.PeerFatalAlert), failures.server);
     // A repeated drive returns the stable, latched terminal error, and the
     // fatal failure wiped the captured negotiation metadata.
     try std.testing.expectError(error.CertificateInvalid, h.client.stream().drive());
@@ -961,14 +1012,38 @@ test "record stream handshake fails closed with AlpnMismatch when the server sel
     // The client offers h3; the server supports only h2. The engine reports the
     // offered protocol, marks its core failed, and returns success, deferring
     // the AlpnMismatch decision to record mode.
-    const h = try SocketHarness.create(.{ .server_alpn = "h2" });
+    const h = try SocketHarness.create(.{
+        .client_chunk = 1,
+        .server_chunk = 1,
+        .server_alpn = "h2",
+        .one_write_per_drive = true,
+    });
     defer h.destroy();
 
-    const failure = driveUntilError(h);
+    const failures = driveUntilBothErrors(h);
     try std.testing.expect(!h.client.bridge.handshake_complete);
     try std.testing.expect(!h.server.bridge.handshake_complete);
     try std.testing.expect(h.server.lifecycle == .failed);
-    try std.testing.expect(failure != null);
-    try std.testing.expect(failure.? == error.AlpnMismatch);
+    try std.testing.expectEqual(@as(?anyerror, error.PeerFatalAlert), failures.client);
+    try std.testing.expectEqual(@as(?anyerror, error.AlpnMismatch), failures.server);
     try std.testing.expectError(error.AlpnMismatch, h.server.stream().drive());
+}
+
+test "record stream requires explicit opt-in for an unverified client certificate policy" {
+    const strict = try SocketHarness.create(.{ .client_trust = .insecure_no_verification });
+    defer strict.destroy();
+
+    const strict_failures = driveUntilBothErrors(strict);
+    try std.testing.expectEqual(@as(?anyerror, error.CertificateInvalid), strict_failures.client);
+    try std.testing.expectEqual(@as(?anyerror, error.PeerFatalAlert), strict_failures.server);
+    try std.testing.expect(!strict.client.bridge.handshake_complete);
+
+    const opted_in = try SocketHarness.create(.{ .client_trust = .insecure_no_verification });
+    defer opted_in.destroy();
+    opted_in.client.allow_unverified_certificate = true;
+
+    try opted_in.driveUntil(SocketHarness.bothComplete);
+    try std.testing.expect(opted_in.client.bridge.handshake_complete);
+    try std.testing.expect(opted_in.server.bridge.handshake_complete);
+    try std.testing.expectEqual(events.CertificateState.not_checked, opted_in.client.certificateState());
 }

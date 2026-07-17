@@ -1,0 +1,59 @@
+name: PKI differential extended
+
+on:
+  schedule:
+    - cron: "23 5 * * 2"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pki-differential-extended-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  extended:
+    name: PKI differential (extended)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install OpenSSL
+        run: sudo apt-get install -y openssl
+
+      - name: Install Zig
+        run: sh ./scripts/install-zig.sh 0.16.0
+
+      - name: Install Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: "1.26.5"
+          cache: false
+
+      - name: Print validator versions
+        run: |
+          zig version
+          openssl version
+          go version
+
+      - name: Run extended differential corpus
+        env:
+          TARDIGRADE_PKI_DIFF_ARTIFACT_DIR: pki-differential-artifacts
+        run: >-
+          zig build test-pki-differential-extended test-pki-policy-openssl
+          --summary all --error-style verbose --test-timeout 10m
+
+      - name: Upload differential mismatch artifacts
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: pki-differential-extended-mismatches
+          path: pki-differential-artifacts/*.json
+          if-no-files-found: ignore
+          retention-days: 30

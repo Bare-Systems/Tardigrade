@@ -242,6 +242,9 @@ zig fmt --check build.zig src/ tests/
 # Unit tests
 zig build test --summary all --error-style verbose
 
+# Stable Web PKI differential corpus (requires OpenSSL and Go)
+zig build test-pki-differential --summary all --error-style verbose
+
 # Security corpus replay
 zig build test-security-corpus
 

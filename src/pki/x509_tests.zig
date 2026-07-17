@@ -1053,6 +1053,7 @@ test "fuzz entrypoint tolerates arbitrary and hostile input" {
     x509.fuzzParseCertificate(allocator, "");
     x509.fuzzParseCertificate(allocator, "\x30\x03\x02\x01\x01");
     x509.fuzzParseCertificate(allocator, "\x30\x82\xff\xff" ++ "\x00" ** 32);
+    x509.fuzzParseCertificate(allocator, @embedFile("pki_malformed_der"));
 
     var fixture = try loadFixture(allocator, rsa_ca_pem);
     defer fixture.deinit(allocator);

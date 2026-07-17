@@ -5,6 +5,20 @@ All notable user-facing changes to Tardigrade are documented here.
 ## [Unreleased]
 
 ### Features
+- **Three-way hostile Web PKI differential harness foundation (#348, epic #324)** —
+  adds a bounded, provenance-backed certificate corpus that compares the
+  pure-Zig parser, path builder, identity matcher, and RFC 5280 validator with
+  out-of-process OpenSSL and Go `crypto/x509`. Thirteen stable CI cases and
+  four extended cases cover valid and ambiguous cross-signed paths, malformed
+  DER, duplicate and unknown critical extensions, wildcard identity edges,
+  Name Constraints, path-length violations, and corrupt signatures. Every
+  validator decision is explicit in an executable manifest; intentional
+  policy differences require a written normalization, while unexplained
+  mismatches persist bounded JSON artifacts with exact fixture paths and a
+  one-case reproduction command. The core corpus runs on every PR and `main`
+  push, with a weekly/manual extended workflow, deterministic project-owned
+  Ed25519 fixtures, no checked-in private keys, and a reduced malformed DER
+  seed wired into the PKI fuzz regression suite.
 - **Provider-neutral PKI trust-store snapshots and bundle loading (#346, epic #324)** —
   adds `src/pki/trust_store.zig`, a pure-Zig trust-anchor store that loads
   configured PEM and DER root bundles, deduplicates anchors by exact DER with

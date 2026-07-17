@@ -5,6 +5,20 @@ All notable user-facing changes to Tardigrade are documented here.
 ## [Unreleased]
 
 ### Features
+- **Provider-neutral PKI trust-store snapshots and bundle loading (#346, epic #324)** —
+  adds `src/pki/trust_store.zig`, a pure-Zig trust-anchor store that loads
+  configured PEM and DER root bundles, deduplicates anchors by exact DER with
+  first-occurrence wins, rejects malformed or non-CA anchors typed, and hands
+  immutable `[]const x509.Certificate` snapshots to the existing path builder
+  and validator without exposing any OpenSSL or platform-native trust-store
+  object. Reload swaps the active bundle without invalidating already-acquired
+  snapshots, so in-flight validations keep their owned anchor bytes while the
+  next validation can observe the updated store. A small provider-vtable seam
+  is included so later system-store adapters can materialize the same owned
+  snapshot contract without changing PKI callers. Covered under
+  `zig build test-pki` with mixed PEM/DER loading, file-backed bundles,
+  exact-DER dedup, typed malformed/non-CA rejection, and reload-safe
+  validation against the RFC 5280 path-validation fixtures.
 - **Deterministic RFC 5280 path-validation core (#345, epic #324)** — adds
   `src/pki/path_validator.zig`, an iterative, offline validator for
   `path_builder` candidate paths. It authenticates terminal anchors against

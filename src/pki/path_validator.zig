@@ -14,11 +14,13 @@
 //! - absent Key Usage and Extended Key Usage permit the requested use, as in
 //!   RFC 5280; when present they restrict it;
 //! - Name Constraints are processed by the bounded RFC 5280 engine for the
-//!   directoryName, dNSName, rfc822Name, URI, and IP forms. Certificate-policy
-//!   processing remains deferred: noncritical certificatePolicies are accepted
-//!   under the implicit any-policy policy, while critical instances fail closed.
+//!   directoryName, dNSName, rfc822Name, URI, and IP forms;
+//! - certificate policies use the bounded RFC 9618 policy graph. The default
+//!   user policy is anyPolicy with no initial inhibition, preserving ordinary
+//!   validation compatibility while returning deterministic constrained sets.
 
 const std = @import("std");
+const certificate_policy = @import("certificate_policy.zig");
 const crypto = @import("crypto");
 const identity = @import("identity.zig");
 const name_constraints = @import("name_constraints.zig");
@@ -40,6 +42,7 @@ pub const ValidationPolicy = struct {
     /// caller-constructed certificate view. The parser default is also 64.
     maximum_extensions_per_certificate: usize = 64,
     name_constraints: name_constraints.Limits = .{},
+    certificate_policy: certificate_policy.Configuration = .{},
     /// Anchors passed to `path_builder.build`, in the same order. Borrowed for
     /// the call only. The terminal element's input index and DER must match.
     trust_anchors: []const x509.Certificate,
@@ -69,6 +72,13 @@ pub const FailureReason = enum {
     name_constraints_violation,
     name_constraints_unsupported,
     name_constraints_resource_limit_exceeded,
+    certificate_policy_invalid,
+    certificate_policy_required,
+    certificate_policy_unsupported_qualifier,
+    policy_mapping_invalid,
+    policy_constraints_invalid,
+    inhibit_any_policy_invalid,
+    certificate_policy_resource_limit_exceeded,
     identity_mismatch,
     invalid_identity_reference,
     validation_resource_limit_exceeded,
@@ -85,12 +95,17 @@ pub const ValidationFailure = struct {
     name_constraint_kind: ?name_constraints.ConstraintKind = null,
     name_form: ?name_constraints.Form = null,
     constraint_certificate_index: ?usize = null,
+    policy_oid: ?oid.ObjectIdentifier = null,
+    policy_graph_depth: ?usize = null,
+    policy_stage: ?certificate_policy.Stage = null,
 };
 
 pub const AcceptedPath = struct {
     /// Owned shallow copy of the path elements. Certificate pointers remain
     /// borrowed from the parsed inputs and must outlive this result.
     accepted_path: []const path_builder.Element,
+    /// Owned RFC 9618 policy outputs. Qualifiers are intentionally omitted.
+    policies: certificate_policy.PolicyResult,
 };
 
 pub const ValidationResult = union(enum) {
@@ -99,7 +114,11 @@ pub const ValidationResult = union(enum) {
 
     pub fn deinit(self: *ValidationResult, allocator: std.mem.Allocator) void {
         switch (self.*) {
-            .accepted => |accepted| allocator.free(accepted.accepted_path),
+            .accepted => |accepted_value| {
+                allocator.free(accepted_value.accepted_path);
+                var policies = accepted_value.policies;
+                policies.deinit(allocator);
+            },
             .rejected => {},
         }
         self.* = undefined;
@@ -201,17 +220,29 @@ pub fn validatePath(
         return .{ .rejected = nameConstraintsFailure(name_failure) };
     }
 
+    var policies = switch (certificate_policy.validatePath(allocator, path, policy.certificate_policy)) {
+        .success => |result| result,
+        .failure => |policy_failure| return .{ .rejected = certificatePolicyFailure(policy_failure) },
+    };
+
     // Identity is intentionally last: no path is accepted based on a name
     // match before its signatures and RFC 5280 policy checks succeed.
     if (policy.expected_dns_name) |expected| {
-        const verdict = identity.verifyHost(leaf, expected) catch
+        const verdict = identity.verifyHost(leaf, expected) catch {
+            policies.deinit(allocator);
             return reject(.invalid_identity_reference, 0);
-        if (!verdict.isMatch()) return reject(.identity_mismatch, 0);
+        };
+        if (!verdict.isMatch()) {
+            policies.deinit(allocator);
+            return reject(.identity_mismatch, 0);
+        }
     }
 
-    const owned = allocator.dupe(path_builder.Element, path.elements) catch
+    const owned = allocator.dupe(path_builder.Element, path.elements) catch {
+        policies.deinit(allocator);
         return rejectWithoutCertificate(.out_of_memory);
-    return .{ .accepted = .{ .accepted_path = owned } };
+    };
+    return .{ .accepted = .{ .accepted_path = owned, .policies = policies } };
 }
 
 /// Validate candidates in builder order and return the first accepted path.
@@ -317,8 +348,33 @@ fn criticalExtensionHandled(extension_oid: *const oid.ObjectIdentifier) bool {
         extension_oid.eqlComponents(&wk.subject_alt_name) or
         extension_oid.eqlComponents(&wk.ext_key_usage) or
         extension_oid.eqlComponents(&wk.name_constraints) or
+        extension_oid.eqlComponents(&wk.certificate_policies) or
+        extension_oid.eqlComponents(&wk.policy_mappings) or
+        extension_oid.eqlComponents(&wk.policy_constraints) or
+        extension_oid.eqlComponents(&wk.inhibit_any_policy) or
         extension_oid.eqlComponents(&wk.subject_key_identifier) or
         extension_oid.eqlComponents(&wk.authority_key_identifier);
+}
+
+fn certificatePolicyFailure(policy_failure: certificate_policy.Failure) ValidationFailure {
+    const reason: FailureReason = switch (policy_failure.reason) {
+        .certificate_policy_invalid => .certificate_policy_invalid,
+        .certificate_policy_required => .certificate_policy_required,
+        .certificate_policy_unsupported_qualifier => .certificate_policy_unsupported_qualifier,
+        .policy_mapping_invalid => .policy_mapping_invalid,
+        .policy_constraints_invalid => .policy_constraints_invalid,
+        .inhibit_any_policy_invalid => .inhibit_any_policy_invalid,
+        .resource_limit_exceeded => .certificate_policy_resource_limit_exceeded,
+        .out_of_memory => .out_of_memory,
+    };
+    return .{
+        .reason = reason,
+        .certificate_index = policy_failure.certificate_index,
+        .extension_oid = policy_failure.extension_oid,
+        .policy_oid = policy_failure.policy_oid,
+        .policy_graph_depth = policy_failure.graph_depth,
+        .policy_stage = policy_failure.stage,
+    };
 }
 
 fn nameConstraintsFailure(name_failure: name_constraints.Failure) ValidationFailure {

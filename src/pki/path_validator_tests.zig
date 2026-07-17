@@ -176,6 +176,97 @@ const NameConstraintsSpec = struct {
     critical: bool = true,
 };
 
+const PolicyQualifierSpec = union(enum) {
+    cps: []const u8,
+    user_notice: []const u8,
+    unsupported: []const u32,
+};
+
+const PolicySpec = struct {
+    policy: []const u32,
+    qualifiers: []const PolicyQualifierSpec = &.{},
+};
+
+fn certificatePoliciesValue(arena: std.mem.Allocator, policies: []const PolicySpec) ![]u8 {
+    var policy_parts: std.ArrayList([]const u8) = .empty;
+    defer policy_parts.deinit(arena);
+    for (policies) |policy_spec| {
+        var info_parts: std.ArrayList([]const u8) = .empty;
+        defer info_parts.deinit(arena);
+        try info_parts.append(arena, try oidTlv(arena, policy_spec.policy));
+        if (policy_spec.qualifiers.len != 0) {
+            var qualifier_parts: std.ArrayList([]const u8) = .empty;
+            defer qualifier_parts.deinit(arena);
+            for (policy_spec.qualifiers) |qualifier| {
+                const qualifier_oid: []const u32 = switch (qualifier) {
+                    .cps => &oid.well_known.policy_qualifier_cps,
+                    .user_notice => &oid.well_known.policy_qualifier_user_notice,
+                    .unsupported => |components| components,
+                };
+                const value = switch (qualifier) {
+                    .cps => |uri| try tlv(arena, 0x16, &.{uri}),
+                    .user_notice => |text| try tlv(arena, 0x30, &.{try tlv(arena, 0x0c, &.{text})}),
+                    .unsupported => try tlv(arena, 0x05, &.{}),
+                };
+                try qualifier_parts.append(arena, try tlv(arena, 0x30, &.{
+                    try oidTlv(arena, qualifier_oid),
+                    value,
+                }));
+            }
+            try info_parts.append(arena, try tlv(arena, 0x30, qualifier_parts.items));
+        }
+        try policy_parts.append(arena, try tlv(arena, 0x30, info_parts.items));
+    }
+    return tlv(arena, 0x30, policy_parts.items);
+}
+
+const PolicyMappingSpec = struct {
+    issuer: []const u32,
+    subject: []const u32,
+};
+
+fn policyMappingsValue(arena: std.mem.Allocator, mappings: []const PolicyMappingSpec) ![]u8 {
+    var parts: std.ArrayList([]const u8) = .empty;
+    defer parts.deinit(arena);
+    for (mappings) |mapping| {
+        try parts.append(arena, try tlv(arena, 0x30, &.{
+            try oidTlv(arena, mapping.issuer),
+            try oidTlv(arena, mapping.subject),
+        }));
+    }
+    return tlv(arena, 0x30, parts.items);
+}
+
+const PolicyConstraintsSpec = struct {
+    require_explicit_policy: ?u32 = null,
+    inhibit_policy_mapping: ?u32 = null,
+    critical: bool = true,
+};
+
+fn nonNegativeIntegerContent(arena: std.mem.Allocator, value: u32) ![]const u8 {
+    var encoded: [5]u8 = undefined;
+    std.mem.writeInt(u32, encoded[1..5], value, .big);
+    var first: usize = 1;
+    while (first < 4 and encoded[first] == 0) first += 1;
+    if (encoded[first] & 0x80 != 0) {
+        first -= 1;
+        encoded[first] = 0;
+    }
+    return arena.dupe(u8, encoded[first..]);
+}
+
+fn policyConstraintsValue(arena: std.mem.Allocator, constraints: PolicyConstraintsSpec) ![]u8 {
+    var parts: std.ArrayList([]const u8) = .empty;
+    defer parts.deinit(arena);
+    if (constraints.require_explicit_policy) |value| {
+        try parts.append(arena, try tlv(arena, 0x80, &.{try nonNegativeIntegerContent(arena, value)}));
+    }
+    if (constraints.inhibit_policy_mapping) |value| {
+        try parts.append(arena, try tlv(arena, 0x81, &.{try nonNegativeIntegerContent(arena, value)}));
+    }
+    return tlv(arena, 0x30, parts.items);
+}
+
 fn nameConstraintsValue(arena: std.mem.Allocator, spec: NameConstraintsSpec) ![]u8 {
     var parts: std.ArrayList([]const u8) = .empty;
     defer parts.deinit(arena);
@@ -216,6 +307,17 @@ const Spec = struct {
     san_names: []const GeneralNameSpec = &.{},
     san_critical: bool = false,
     name_constraints: ?NameConstraintsSpec = null,
+    certificate_policies: ?[]const PolicySpec = null,
+    raw_certificate_policies: ?[]const u8 = null,
+    certificate_policies_critical: bool = false,
+    policy_mappings: ?[]const PolicyMappingSpec = null,
+    raw_policy_mappings: ?[]const u8 = null,
+    policy_mappings_critical: bool = true,
+    policy_constraints: ?PolicyConstraintsSpec = null,
+    raw_policy_constraints: ?[]const u8 = null,
+    inhibit_any_policy: ?u32 = null,
+    raw_inhibit_any_policy: ?[]const u8 = null,
+    inhibit_any_policy_critical: bool = true,
     unknown_critical: bool = false,
     unknown_noncritical: bool = false,
 };
@@ -288,6 +390,50 @@ const Fixtures = struct {
                 constraints.critical,
                 try nameConstraintsValue(arena, constraints),
             ));
+        }
+        if (spec.certificate_policies) |policies| {
+            try extensions.append(arena, try extensionTlv(
+                arena,
+                &oid.well_known.certificate_policies,
+                spec.certificate_policies_critical,
+                try certificatePoliciesValue(arena, policies),
+            ));
+        }
+        if (spec.raw_certificate_policies) |value| {
+            try extensions.append(arena, try extensionTlv(arena, &oid.well_known.certificate_policies, spec.certificate_policies_critical, value));
+        }
+        if (spec.policy_mappings) |mappings| {
+            try extensions.append(arena, try extensionTlv(
+                arena,
+                &oid.well_known.policy_mappings,
+                spec.policy_mappings_critical,
+                try policyMappingsValue(arena, mappings),
+            ));
+        }
+        if (spec.raw_policy_mappings) |value| {
+            try extensions.append(arena, try extensionTlv(arena, &oid.well_known.policy_mappings, spec.policy_mappings_critical, value));
+        }
+        if (spec.policy_constraints) |constraints| {
+            try extensions.append(arena, try extensionTlv(
+                arena,
+                &oid.well_known.policy_constraints,
+                constraints.critical,
+                try policyConstraintsValue(arena, constraints),
+            ));
+        }
+        if (spec.raw_policy_constraints) |value| {
+            try extensions.append(arena, try extensionTlv(arena, &oid.well_known.policy_constraints, true, value));
+        }
+        if (spec.inhibit_any_policy) |count| {
+            try extensions.append(arena, try extensionTlv(
+                arena,
+                &oid.well_known.inhibit_any_policy,
+                spec.inhibit_any_policy_critical,
+                try tlv(arena, 0x02, &.{try nonNegativeIntegerContent(arena, count)}),
+            ));
+        }
+        if (spec.raw_inhibit_any_policy) |value| {
+            try extensions.append(arena, try extensionTlv(arena, &oid.well_known.inhibit_any_policy, true, value));
         }
         const unknown_oid = [_]u32{ 1, 2, 3, 4 };
         if (spec.unknown_critical) {
@@ -1644,4 +1790,945 @@ test "maximum supported path length accepts the boundary and rejects one-lower p
     var rejected = validator.validateCandidates(testing.allocator, candidates, limited, cp);
     defer rejected.deinit(testing.allocator);
     try expectRejected(&rejected, .validation_resource_limit_exceeded, null);
+}
+
+const policy_a = [_]u32{ 1, 3, 6, 1, 4, 1, 55555, 1 };
+const policy_b = [_]u32{ 1, 3, 6, 1, 4, 1, 55555, 2 };
+const policy_c = [_]u32{ 1, 3, 6, 1, 4, 1, 55555, 3 };
+const policy_d = [_]u32{ 1, 3, 6, 1, 4, 1, 55555, 4 };
+
+fn policyObject(components: []const u32) !oid.ObjectIdentifier {
+    return oid.ObjectIdentifier.fromComponents(components);
+}
+
+test "certificate policy intersection and user policy inputs validate through signed paths" {
+    var fx = Fixtures.init(testing.allocator);
+    defer fx.deinit();
+    try fx.add(.{
+        .subject = "Root",
+        .issuer = "Root",
+        .subject_key = 3,
+        .issuer_key = 3,
+        // Anchor extensions are trust metadata only and must not constrain
+        // the prospective path.
+        .certificate_policies = &.{.{ .policy = &policy_d }},
+    });
+    try fx.add(.{
+        .subject = "Policy CA",
+        .issuer = "Root",
+        .subject_key = 2,
+        .issuer_key = 3,
+        .ca = true,
+        .key_usage = 0x04,
+        .certificate_policies = &.{ .{ .policy = &policy_a }, .{ .policy = &policy_b } },
+    });
+    try fx.add(.{
+        .subject = "leaf",
+        .issuer = "Policy CA",
+        .subject_key = 1,
+        .issuer_key = 2,
+        .ca = false,
+        .key_usage = 0x80,
+        .certificate_policies = &.{ .{ .policy = &policy_a }, .{ .policy = &policy_c } },
+    });
+
+    var entropy: crypto.pure_zig.DeterministicEntropy = undefined;
+    var provider: crypto.pure_zig.Provider = undefined;
+    const cp = cryptoProvider(&entropy, &provider);
+
+    var any_result = try validateBuilt(testing.allocator, &fx.certs.items[2], fx.certs.items[1..2], fx.certs.items[0..1], policy(fx.certs.items[0..1]), cp);
+    defer any_result.deinit(testing.allocator);
+    try expectAccepted(&any_result, 3);
+    try testing.expectEqual(@as(usize, 1), any_result.accepted.policies.authority_constrained.len);
+    try testing.expect(any_result.accepted.policies.authority_constrained[0].eqlComponents(&policy_a));
+    try testing.expectEqual(@as(usize, 1), any_result.accepted.policies.user_constrained.len);
+    try testing.expect(any_result.accepted.policies.user_constrained[0].eqlComponents(&policy_a));
+
+    const requested = [_]oid.ObjectIdentifier{try policyObject(&policy_b)};
+    var requested_policy = policy(fx.certs.items[0..1]);
+    requested_policy.certificate_policy.user_initial_policy_set = .{ .explicit = &requested };
+    var absent = try validateBuilt(testing.allocator, &fx.certs.items[2], fx.certs.items[1..2], fx.certs.items[0..1], requested_policy, cp);
+    defer absent.deinit(testing.allocator);
+    try expectAccepted(&absent, 3);
+    try testing.expectEqual(@as(usize, 1), absent.accepted.policies.authority_constrained.len);
+    try testing.expectEqual(@as(usize, 0), absent.accepted.policies.user_constrained.len);
+
+    requested_policy.certificate_policy.initial_explicit_policy = true;
+    var required = try validateBuilt(testing.allocator, &fx.certs.items[2], fx.certs.items[1..2], fx.certs.items[0..1], requested_policy, cp);
+    defer required.deinit(testing.allocator);
+    try expectRejected(&required, .certificate_policy_required, 0);
+}
+
+test "missing policies null the graph while explicit policy controls rejection" {
+    var fx = Fixtures.init(testing.allocator);
+    defer fx.deinit();
+    try fx.add(.{ .subject = "Root", .issuer = "Root", .subject_key = 3, .issuer_key = 3 });
+    try fx.add(.{
+        .subject = "Policy CA",
+        .issuer = "Root",
+        .subject_key = 2,
+        .issuer_key = 3,
+        .ca = true,
+        .key_usage = 0x04,
+        .certificate_policies = &.{.{ .policy = &policy_a }},
+    });
+    try fx.add(.{ .subject = "leaf", .issuer = "Policy CA", .subject_key = 1, .issuer_key = 2, .ca = false, .key_usage = 0x80 });
+
+    var entropy: crypto.pure_zig.DeterministicEntropy = undefined;
+    var provider: crypto.pure_zig.Provider = undefined;
+    const cp = cryptoProvider(&entropy, &provider);
+    var permissive = try validateBuilt(testing.allocator, &fx.certs.items[2], fx.certs.items[1..2], fx.certs.items[0..1], policy(fx.certs.items[0..1]), cp);
+    defer permissive.deinit(testing.allocator);
+    try expectAccepted(&permissive, 3);
+    try testing.expectEqual(@as(usize, 0), permissive.accepted.policies.authority_constrained.len);
+
+    var strict_policy = policy(fx.certs.items[0..1]);
+    strict_policy.certificate_policy.initial_explicit_policy = true;
+    var strict = try validateBuilt(testing.allocator, &fx.certs.items[2], fx.certs.items[1..2], fx.certs.items[0..1], strict_policy, cp);
+    defer strict.deinit(testing.allocator);
+    try expectRejected(&strict, .certificate_policy_required, 0);
+}
+
+test "anyPolicy propagates and expands the requested user set deterministically" {
+    var fx = Fixtures.init(testing.allocator);
+    defer fx.deinit();
+    try fx.add(.{ .subject = "Root", .issuer = "Root", .subject_key = 3, .issuer_key = 3 });
+    try fx.add(.{
+        .subject = "Any CA",
+        .issuer = "Root",
+        .subject_key = 2,
+        .issuer_key = 3,
+        .ca = true,
+        .key_usage = 0x04,
+        .certificate_policies = &.{.{ .policy = &oid.well_known.any_policy }},
+    });
+    try fx.add(.{
+        .subject = "leaf",
+        .issuer = "Any CA",
+        .subject_key = 1,
+        .issuer_key = 2,
+        .ca = false,
+        .key_usage = 0x80,
+        .certificate_policies = &.{.{ .policy = &oid.well_known.any_policy }},
+    });
+
+    const requested = [_]oid.ObjectIdentifier{ try policyObject(&policy_b), try policyObject(&policy_a) };
+    var validation_policy = policy(fx.certs.items[0..1]);
+    validation_policy.certificate_policy.user_initial_policy_set = .{ .explicit = &requested };
+    validation_policy.certificate_policy.initial_explicit_policy = true;
+    var entropy: crypto.pure_zig.DeterministicEntropy = undefined;
+    var provider: crypto.pure_zig.Provider = undefined;
+    const cp = cryptoProvider(&entropy, &provider);
+    var result = try validateBuilt(testing.allocator, &fx.certs.items[2], fx.certs.items[1..2], fx.certs.items[0..1], validation_policy, cp);
+    defer result.deinit(testing.allocator);
+    try expectAccepted(&result, 3);
+    try testing.expectEqual(@as(usize, 1), result.accepted.policies.authority_constrained.len);
+    try testing.expect(result.accepted.policies.authority_constrained[0].eqlComponents(&oid.well_known.any_policy));
+    try testing.expectEqual(@as(usize, 2), result.accepted.policies.user_constrained.len);
+    try testing.expect(result.accepted.policies.user_constrained[0].eqlComponents(&policy_a));
+    try testing.expect(result.accepted.policies.user_constrained[1].eqlComponents(&policy_b));
+}
+
+test "critical policy qualifiers are supported or rejected safely" {
+    var fx = Fixtures.init(testing.allocator);
+    defer fx.deinit();
+    try fx.add(.{ .subject = "Root", .issuer = "Root", .subject_key = 3, .issuer_key = 3 });
+    const supported = [_]PolicyQualifierSpec{
+        .{ .cps = "https://ca.example/cps" },
+        .{ .user_notice = "appliance policy" },
+    };
+    try fx.add(.{
+        .subject = "Supported",
+        .issuer = "Root",
+        .subject_key = 1,
+        .issuer_key = 3,
+        .ca = false,
+        .key_usage = 0x80,
+        .certificate_policies = &.{.{ .policy = &policy_a, .qualifiers = &supported }},
+        .certificate_policies_critical = true,
+    });
+    const unsupported_oid = [_]u32{ 1, 3, 6, 1, 4, 1, 55555, 99 };
+    const unsupported = [_]PolicyQualifierSpec{.{ .unsupported = &unsupported_oid }};
+    try fx.add(.{
+        .subject = "Unsupported",
+        .issuer = "Root",
+        .subject_key = 2,
+        .issuer_key = 3,
+        .ca = false,
+        .key_usage = 0x80,
+        .certificate_policies = &.{.{ .policy = &policy_a, .qualifiers = &unsupported }},
+        .certificate_policies_critical = true,
+    });
+
+    var entropy: crypto.pure_zig.DeterministicEntropy = undefined;
+    var provider: crypto.pure_zig.Provider = undefined;
+    const cp = cryptoProvider(&entropy, &provider);
+    var accepted = try validateBuilt(testing.allocator, &fx.certs.items[1], &.{}, fx.certs.items[0..1], policy(fx.certs.items[0..1]), cp);
+    defer accepted.deinit(testing.allocator);
+    try expectAccepted(&accepted, 2);
+
+    var rejected = try validateBuilt(testing.allocator, &fx.certs.items[2], &.{}, fx.certs.items[0..1], policy(fx.certs.items[0..1]), cp);
+    defer rejected.deinit(testing.allocator);
+    try expectRejected(&rejected, .certificate_policy_unsupported_qualifier, 0);
+}
+
+test "duplicate user and certificate policy OIDs fail deterministically" {
+    var fx = Fixtures.init(testing.allocator);
+    defer fx.deinit();
+    try fx.add(.{ .subject = "Root", .issuer = "Root", .subject_key = 3, .issuer_key = 3 });
+    try testing.expectError(error.MalformedExtension, fx.add(.{
+        .subject = "duplicate policies",
+        .issuer = "Root",
+        .subject_key = 1,
+        .issuer_key = 3,
+        .ca = false,
+        .key_usage = 0x80,
+        .certificate_policies = &.{ .{ .policy = &policy_a }, .{ .policy = &policy_a } },
+    }));
+    try fx.add(.{
+        .subject = "leaf",
+        .issuer = "Root",
+        .subject_key = 2,
+        .issuer_key = 3,
+        .ca = false,
+        .key_usage = 0x80,
+        .certificate_policies = &.{.{ .policy = &policy_a }},
+    });
+
+    const duplicate = try policyObject(&policy_a);
+    const requested = [_]oid.ObjectIdentifier{ duplicate, duplicate };
+    var validation_policy = policy(fx.certs.items[0..1]);
+    validation_policy.certificate_policy.user_initial_policy_set = .{ .explicit = &requested };
+    var entropy: crypto.pure_zig.DeterministicEntropy = undefined;
+    var provider: crypto.pure_zig.Provider = undefined;
+    const cp = cryptoProvider(&entropy, &provider);
+    var result = try validateBuilt(testing.allocator, &fx.certs.items[1], &.{}, fx.certs.items[0..1], validation_policy, cp);
+    defer result.deinit(testing.allocator);
+    try expectRejected(&result, .certificate_policy_invalid, null);
+}
+
+test "policy graph merges one-to-many and many-to-one mappings without duplicate outputs" {
+    var fx = Fixtures.init(testing.allocator);
+    defer fx.deinit();
+    try fx.add(.{ .subject = "Root", .issuer = "Root", .subject_key = 4, .issuer_key = 4 });
+    try fx.add(.{
+        .subject = "Mapping CA",
+        .issuer = "Root",
+        .subject_key = 3,
+        .issuer_key = 4,
+        .ca = true,
+        .key_usage = 0x04,
+        .certificate_policies = &.{ .{ .policy = &policy_a }, .{ .policy = &policy_d } },
+        .policy_mappings = &.{
+            .{ .issuer = &policy_a, .subject = &policy_b },
+            .{ .issuer = &policy_a, .subject = &policy_c },
+            .{ .issuer = &policy_d, .subject = &policy_b },
+        },
+    });
+    try fx.add(.{
+        .subject = "leaf",
+        .issuer = "Mapping CA",
+        .subject_key = 2,
+        .issuer_key = 3,
+        .ca = false,
+        .key_usage = 0x80,
+        .certificate_policies = &.{ .{ .policy = &policy_b }, .{ .policy = &policy_c } },
+    });
+
+    const requested = [_]oid.ObjectIdentifier{ try policyObject(&policy_d), try policyObject(&policy_a) };
+    var validation_policy = policy(fx.certs.items[0..1]);
+    validation_policy.certificate_policy.user_initial_policy_set = .{ .explicit = &requested };
+    validation_policy.certificate_policy.initial_explicit_policy = true;
+    var entropy: crypto.pure_zig.DeterministicEntropy = undefined;
+    var provider: crypto.pure_zig.Provider = undefined;
+    const cp = cryptoProvider(&entropy, &provider);
+    var result = try validateBuilt(testing.allocator, &fx.certs.items[2], fx.certs.items[1..2], fx.certs.items[0..1], validation_policy, cp);
+    defer result.deinit(testing.allocator);
+    try expectAccepted(&result, 3);
+    try testing.expectEqual(@as(usize, 2), result.accepted.policies.authority_constrained.len);
+    try testing.expect(result.accepted.policies.authority_constrained[0].eqlComponents(&policy_a));
+    try testing.expect(result.accepted.policies.authority_constrained[1].eqlComponents(&policy_d));
+    try testing.expectEqual(@as(usize, 5), result.accepted.policies.resource_usage.graph_nodes);
+    try testing.expectEqual(@as(usize, 5), result.accepted.policies.resource_usage.graph_edges);
+    try testing.expectEqual(
+        result.accepted.policies.resource_usage.graph_edges,
+        result.accepted.policies.resource_usage.parent_references,
+    );
+    try testing.expectEqual(@as(usize, 2), result.accepted.policies.user_constrained.len);
+
+    validation_policy.certificate_policy.initial_policy_mapping_inhibit = true;
+    var inhibited = try validateBuilt(testing.allocator, &fx.certs.items[2], fx.certs.items[1..2], fx.certs.items[0..1], validation_policy, cp);
+    defer inhibited.deinit(testing.allocator);
+    try expectRejected(&inhibited, .certificate_policy_required, 0);
+}
+
+test "multi-level mappings process from anchor toward target" {
+    var fx = Fixtures.init(testing.allocator);
+    defer fx.deinit();
+    try fx.add(.{ .subject = "Root", .issuer = "Root", .subject_key = 5, .issuer_key = 5 });
+    try fx.add(.{
+        .subject = "Upper",
+        .issuer = "Root",
+        .subject_key = 4,
+        .issuer_key = 5,
+        .ca = true,
+        .key_usage = 0x04,
+        .certificate_policies = &.{.{ .policy = &policy_a }},
+        .policy_mappings = &.{.{ .issuer = &policy_a, .subject = &policy_b }},
+    });
+    try fx.add(.{
+        .subject = "Lower",
+        .issuer = "Upper",
+        .subject_key = 3,
+        .issuer_key = 4,
+        .ca = true,
+        .key_usage = 0x04,
+        .certificate_policies = &.{.{ .policy = &policy_b }},
+        .policy_mappings = &.{.{ .issuer = &policy_b, .subject = &policy_c }},
+    });
+    try fx.add(.{
+        .subject = "leaf",
+        .issuer = "Lower",
+        .subject_key = 2,
+        .issuer_key = 3,
+        .ca = false,
+        .key_usage = 0x80,
+        .certificate_policies = &.{.{ .policy = &policy_c }},
+    });
+
+    const requested = [_]oid.ObjectIdentifier{try policyObject(&policy_a)};
+    var validation_policy = policy(fx.certs.items[0..1]);
+    validation_policy.certificate_policy.user_initial_policy_set = .{ .explicit = &requested };
+    validation_policy.certificate_policy.initial_explicit_policy = true;
+    var entropy: crypto.pure_zig.DeterministicEntropy = undefined;
+    var provider: crypto.pure_zig.Provider = undefined;
+    const cp = cryptoProvider(&entropy, &provider);
+    var result = try validateBuilt(testing.allocator, &fx.certs.items[3], fx.certs.items[1..3], fx.certs.items[0..1], validation_policy, cp);
+    defer result.deinit(testing.allocator);
+    try expectAccepted(&result, 4);
+    try testing.expectEqual(@as(usize, 1), result.accepted.policies.user_constrained.len);
+    try testing.expect(result.accepted.policies.user_constrained[0].eqlComponents(&policy_a));
+}
+
+test "policy mapping counters apply after the issuing certificate" {
+    inline for (.{ @as(u8, 0), 1 }) |inhibit_count| {
+        var fx = Fixtures.init(testing.allocator);
+        defer fx.deinit();
+        try fx.add(.{ .subject = "Root", .issuer = "Root", .subject_key = 5, .issuer_key = 5 });
+        try fx.add(.{
+            .subject = "Upper",
+            .issuer = "Root",
+            .subject_key = 4,
+            .issuer_key = 5,
+            .ca = true,
+            .key_usage = 0x04,
+            .certificate_policies = &.{.{ .policy = &policy_a }},
+            .policy_constraints = .{ .inhibit_policy_mapping = inhibit_count },
+        });
+        try fx.add(.{
+            .subject = "Lower",
+            .issuer = "Upper",
+            .subject_key = 3,
+            .issuer_key = 4,
+            .ca = true,
+            .key_usage = 0x04,
+            .certificate_policies = &.{.{ .policy = &policy_a }},
+            .policy_mappings = &.{.{ .issuer = &policy_a, .subject = &policy_b }},
+        });
+        try fx.add(.{
+            .subject = "leaf",
+            .issuer = "Lower",
+            .subject_key = 2,
+            .issuer_key = 3,
+            .ca = false,
+            .key_usage = 0x80,
+            .certificate_policies = &.{.{ .policy = &policy_b }},
+        });
+
+        const requested = [_]oid.ObjectIdentifier{try policyObject(&policy_a)};
+        var validation_policy = policy(fx.certs.items[0..1]);
+        validation_policy.certificate_policy.user_initial_policy_set = .{ .explicit = &requested };
+        validation_policy.certificate_policy.initial_explicit_policy = true;
+        var entropy: crypto.pure_zig.DeterministicEntropy = undefined;
+        var provider: crypto.pure_zig.Provider = undefined;
+        const cp = cryptoProvider(&entropy, &provider);
+        var result = try validateBuilt(testing.allocator, &fx.certs.items[3], fx.certs.items[1..3], fx.certs.items[0..1], validation_policy, cp);
+        defer result.deinit(testing.allocator);
+        if (inhibit_count == 0) {
+            try expectRejected(&result, .certificate_policy_required, 0);
+        } else {
+            try expectAccepted(&result, 4);
+        }
+    }
+}
+
+test "invalid anyPolicy mappings and target mappings fail closed" {
+    var fx = Fixtures.init(testing.allocator);
+    defer fx.deinit();
+    try fx.add(.{ .subject = "Root", .issuer = "Root", .subject_key = 4, .issuer_key = 4 });
+    try fx.add(.{
+        .subject = "Bad CA",
+        .issuer = "Root",
+        .subject_key = 3,
+        .issuer_key = 4,
+        .ca = true,
+        .key_usage = 0x04,
+        .certificate_policies = &.{.{ .policy = &policy_a }},
+        .policy_mappings = &.{.{ .issuer = &oid.well_known.any_policy, .subject = &policy_b }},
+    });
+    try fx.add(.{
+        .subject = "leaf",
+        .issuer = "Bad CA",
+        .subject_key = 2,
+        .issuer_key = 3,
+        .ca = false,
+        .key_usage = 0x80,
+        .certificate_policies = &.{.{ .policy = &policy_b }},
+    });
+    try fx.add(.{
+        .subject = "mapped leaf",
+        .issuer = "Root",
+        .subject_key = 1,
+        .issuer_key = 4,
+        .ca = false,
+        .key_usage = 0x80,
+        .certificate_policies = &.{.{ .policy = &policy_a }},
+        .policy_mappings = &.{.{ .issuer = &policy_a, .subject = &policy_b }},
+    });
+    try fx.add(.{
+        .subject = "Bad To CA",
+        .issuer = "Root",
+        .subject_key = 6,
+        .issuer_key = 4,
+        .ca = true,
+        .key_usage = 0x04,
+        .certificate_policies = &.{.{ .policy = &policy_a }},
+        .policy_mappings = &.{.{ .issuer = &policy_a, .subject = &oid.well_known.any_policy }},
+    });
+    try fx.add(.{
+        .subject = "bad to leaf",
+        .issuer = "Bad To CA",
+        .subject_key = 5,
+        .issuer_key = 6,
+        .ca = false,
+        .key_usage = 0x80,
+        .certificate_policies = &.{.{ .policy = &policy_a }},
+    });
+
+    var entropy: crypto.pure_zig.DeterministicEntropy = undefined;
+    var provider: crypto.pure_zig.Provider = undefined;
+    const cp = cryptoProvider(&entropy, &provider);
+    var any_mapping = try validateBuilt(testing.allocator, &fx.certs.items[2], fx.certs.items[1..2], fx.certs.items[0..1], policy(fx.certs.items[0..1]), cp);
+    defer any_mapping.deinit(testing.allocator);
+    try expectRejected(&any_mapping, .policy_mapping_invalid, 1);
+
+    var leaf_mapping = try validateBuilt(testing.allocator, &fx.certs.items[3], &.{}, fx.certs.items[0..1], policy(fx.certs.items[0..1]), cp);
+    defer leaf_mapping.deinit(testing.allocator);
+    try expectRejected(&leaf_mapping, .policy_mapping_invalid, 0);
+
+    var to_any = try validateBuilt(testing.allocator, &fx.certs.items[5], fx.certs.items[4..5], fx.certs.items[0..1], policy(fx.certs.items[0..1]), cp);
+    defer to_any.deinit(testing.allocator);
+    try expectRejected(&to_any, .policy_mapping_invalid, 1);
+}
+
+test "policy constraint and inhibit-any counters honor zero and one boundaries" {
+    var fx = Fixtures.init(testing.allocator);
+    defer fx.deinit();
+    try fx.add(.{ .subject = "Root", .issuer = "Root", .subject_key = 12, .issuer_key = 12, .ca = true, .key_usage = 0x04 });
+    try fx.add(.{
+        .subject = "Upper0",
+        .issuer = "Root",
+        .subject_key = 3,
+        .issuer_key = 12,
+        .ca = true,
+        .key_usage = 0x04,
+        .certificate_policies = &.{.{ .policy = &policy_a }},
+        .policy_constraints = .{ .require_explicit_policy = 0 },
+    });
+    try fx.add(.{
+        .subject = "Lower0",
+        .issuer = "Upper0",
+        .subject_key = 2,
+        .issuer_key = 3,
+        .ca = true,
+        .key_usage = 0x04,
+        .certificate_policies = &.{.{ .policy = &policy_a }},
+    });
+    try fx.add(.{ .subject = "leaf0", .issuer = "Lower0", .subject_key = 1, .issuer_key = 2, .ca = false, .key_usage = 0x80 });
+    try fx.add(.{
+        .subject = "Upper1",
+        .issuer = "Root",
+        .subject_key = 7,
+        .issuer_key = 12,
+        .ca = true,
+        .key_usage = 0x04,
+        .certificate_policies = &.{.{ .policy = &policy_a }},
+        .policy_constraints = .{ .require_explicit_policy = 1 },
+    });
+    try fx.add(.{ .subject = "Lower1", .issuer = "Upper1", .subject_key = 6, .issuer_key = 7, .ca = true, .key_usage = 0x04 });
+    try fx.add(.{
+        .subject = "leaf1",
+        .issuer = "Lower1",
+        .subject_key = 5,
+        .issuer_key = 6,
+        .ca = false,
+        .key_usage = 0x80,
+        .certificate_policies = &.{.{ .policy = &policy_a }},
+    });
+    try fx.add(.{
+        .subject = "Any0",
+        .issuer = "Root",
+        .subject_key = 9,
+        .issuer_key = 12,
+        .ca = true,
+        .key_usage = 0x04,
+        .certificate_policies = &.{.{ .policy = &oid.well_known.any_policy }},
+        .inhibit_any_policy = 0,
+    });
+    try fx.add(.{
+        .subject = "any leaf 0",
+        .issuer = "Any0",
+        .subject_key = 8,
+        .issuer_key = 9,
+        .ca = false,
+        .key_usage = 0x80,
+        .certificate_policies = &.{.{ .policy = &oid.well_known.any_policy }},
+    });
+    try fx.add(.{
+        .subject = "Any1",
+        .issuer = "Root",
+        .subject_key = 11,
+        .issuer_key = 12,
+        .ca = true,
+        .key_usage = 0x04,
+        .certificate_policies = &.{.{ .policy = &oid.well_known.any_policy }},
+        .inhibit_any_policy = 1,
+    });
+    try fx.add(.{
+        .subject = "any leaf 1",
+        .issuer = "Any1",
+        .subject_key = 10,
+        .issuer_key = 11,
+        .ca = false,
+        .key_usage = 0x80,
+        .certificate_policies = &.{.{ .policy = &oid.well_known.any_policy }},
+    });
+
+    var entropy: crypto.pure_zig.DeterministicEntropy = undefined;
+    var provider: crypto.pure_zig.Provider = undefined;
+    const cp = cryptoProvider(&entropy, &provider);
+    var require_zero = try validateBuilt(testing.allocator, &fx.certs.items[3], fx.certs.items[1..3], fx.certs.items[0..1], policy(fx.certs.items[0..1]), cp);
+    defer require_zero.deinit(testing.allocator);
+    try expectRejected(&require_zero, .certificate_policy_required, 0);
+    var require_one = try validateBuilt(testing.allocator, &fx.certs.items[6], fx.certs.items[4..6], fx.certs.items[0..1], policy(fx.certs.items[0..1]), cp);
+    defer require_one.deinit(testing.allocator);
+    try expectRejected(&require_one, .certificate_policy_required, 0);
+
+    const requested = [_]oid.ObjectIdentifier{try policyObject(&policy_a)};
+    var strict = policy(fx.certs.items[0..1]);
+    strict.certificate_policy.user_initial_policy_set = .{ .explicit = &requested };
+    strict.certificate_policy.initial_explicit_policy = true;
+    var inhibit_zero = try validateBuilt(testing.allocator, &fx.certs.items[8], fx.certs.items[7..8], fx.certs.items[0..1], strict, cp);
+    defer inhibit_zero.deinit(testing.allocator);
+    try expectRejected(&inhibit_zero, .certificate_policy_required, 0);
+    var inhibit_one = try validateBuilt(testing.allocator, &fx.certs.items[10], fx.certs.items[9..10], fx.certs.items[0..1], strict, cp);
+    defer inhibit_one.deinit(testing.allocator);
+    try expectAccepted(&inhibit_one, 3);
+    try testing.expect(inhibit_one.accepted.policies.user_constrained[0].eqlComponents(&policy_a));
+
+    strict.certificate_policy.initial_any_policy_inhibit = true;
+    var initially_inhibited = try validateBuilt(testing.allocator, &fx.certs.items[10], fx.certs.items[9..10], fx.certs.items[0..1], strict, cp);
+    defer initially_inhibited.deinit(testing.allocator);
+    try expectRejected(&initially_inhibited, .certificate_policy_required, 1);
+}
+
+test "self-issued rollover certificates do not decrement policy counters" {
+    var fx = Fixtures.init(testing.allocator);
+    defer fx.deinit();
+    try fx.add(.{ .subject = "Root", .issuer = "Root", .subject_key = 4, .issuer_key = 4, .ca = true, .key_usage = 0x04 });
+    try fx.add(.{
+        .subject = "Issuer",
+        .issuer = "Root",
+        .subject_key = 3,
+        .issuer_key = 4,
+        .ca = true,
+        .key_usage = 0x04,
+        .certificate_policies = &.{.{ .policy = &oid.well_known.any_policy }},
+        .inhibit_any_policy = 1,
+    });
+    try fx.add(.{
+        .subject = "Issuer",
+        .issuer = "Issuer",
+        .subject_key = 2,
+        .issuer_key = 3,
+        .ca = true,
+        .key_usage = 0x04,
+        .certificate_policies = &.{.{ .policy = &oid.well_known.any_policy }},
+    });
+    try fx.add(.{
+        .subject = "leaf",
+        .issuer = "Issuer",
+        .subject_key = 1,
+        .issuer_key = 2,
+        .ca = false,
+        .key_usage = 0x80,
+        .certificate_policies = &.{.{ .policy = &oid.well_known.any_policy }},
+    });
+    const elements = [_]path_builder.Element{
+        .{ .certificate = &fx.certs.items[3], .source = .leaf, .input_index = 0 },
+        .{ .certificate = &fx.certs.items[2], .source = .intermediate, .input_index = 0 },
+        .{ .certificate = &fx.certs.items[1], .source = .intermediate, .input_index = 1 },
+        .{ .certificate = &fx.certs.items[0], .source = .anchor, .input_index = 0 },
+    };
+    const requested = [_]oid.ObjectIdentifier{try policyObject(&policy_a)};
+    var validation_policy = policy(fx.certs.items[0..1]);
+    validation_policy.certificate_policy.user_initial_policy_set = .{ .explicit = &requested };
+    validation_policy.certificate_policy.initial_explicit_policy = true;
+    var entropy: crypto.pure_zig.DeterministicEntropy = undefined;
+    var provider: crypto.pure_zig.Provider = undefined;
+    const cp = cryptoProvider(&entropy, &provider);
+    var result = validator.validatePath(testing.allocator, .{ .elements = &elements }, validation_policy, cp);
+    defer result.deinit(testing.allocator);
+    try expectAccepted(&result, 4);
+    try testing.expect(result.accepted.policies.user_constrained[0].eqlComponents(&policy_a));
+}
+
+test "policy extension profiles require critical CA-only constraints" {
+    var fx = Fixtures.init(testing.allocator);
+    defer fx.deinit();
+    try fx.add(.{ .subject = "Root", .issuer = "Root", .subject_key = 4, .issuer_key = 4, .ca = true, .key_usage = 0x04 });
+    try fx.add(.{
+        .subject = "Noncritical constraints",
+        .issuer = "Root",
+        .subject_key = 2,
+        .issuer_key = 4,
+        .ca = true,
+        .key_usage = 0x04,
+        .policy_constraints = .{ .require_explicit_policy = 0, .critical = false },
+    });
+    try fx.add(.{ .subject = "leaf c", .issuer = "Noncritical constraints", .subject_key = 1, .issuer_key = 2, .ca = false, .key_usage = 0x80 });
+    try fx.add(.{
+        .subject = "Noncritical inhibit",
+        .issuer = "Root",
+        .subject_key = 6,
+        .issuer_key = 4,
+        .ca = true,
+        .key_usage = 0x04,
+        .inhibit_any_policy = std.math.maxInt(u32),
+        .inhibit_any_policy_critical = false,
+    });
+    try fx.add(.{ .subject = "leaf i", .issuer = "Noncritical inhibit", .subject_key = 5, .issuer_key = 6, .ca = false, .key_usage = 0x80 });
+
+    var entropy: crypto.pure_zig.DeterministicEntropy = undefined;
+    var provider: crypto.pure_zig.Provider = undefined;
+    const cp = cryptoProvider(&entropy, &provider);
+    var constraints = try validateBuilt(testing.allocator, &fx.certs.items[2], fx.certs.items[1..2], fx.certs.items[0..1], policy(fx.certs.items[0..1]), cp);
+    defer constraints.deinit(testing.allocator);
+    try expectRejected(&constraints, .policy_constraints_invalid, 1);
+    var inhibit = try validateBuilt(testing.allocator, &fx.certs.items[4], fx.certs.items[3..4], fx.certs.items[0..1], policy(fx.certs.items[0..1]), cp);
+    defer inhibit.deinit(testing.allocator);
+    try expectRejected(&inhibit, .inhibit_any_policy_invalid, 1);
+}
+
+test "policy graph resource accounting and limits are deterministic" {
+    var fx = Fixtures.init(testing.allocator);
+    defer fx.deinit();
+    try fx.add(.{ .subject = "Root", .issuer = "Root", .subject_key = 2, .issuer_key = 2, .ca = true, .key_usage = 0x04 });
+    try fx.add(.{
+        .subject = "leaf",
+        .issuer = "Root",
+        .subject_key = 1,
+        .issuer_key = 2,
+        .ca = false,
+        .key_usage = 0x80,
+        .certificate_policies = &.{.{ .policy = &policy_a }},
+    });
+    var entropy: crypto.pure_zig.DeterministicEntropy = undefined;
+    var provider: crypto.pure_zig.Provider = undefined;
+    const cp = cryptoProvider(&entropy, &provider);
+    var first = try validateBuilt(testing.allocator, &fx.certs.items[1], &.{}, fx.certs.items[0..1], policy(fx.certs.items[0..1]), cp);
+    defer first.deinit(testing.allocator);
+    var second = try validateBuilt(testing.allocator, &fx.certs.items[1], &.{}, fx.certs.items[0..1], policy(fx.certs.items[0..1]), cp);
+    defer second.deinit(testing.allocator);
+    try expectAccepted(&first, 2);
+    try expectAccepted(&second, 2);
+    try testing.expectEqualDeep(first.accepted.policies.resource_usage, second.accepted.policies.resource_usage);
+    try testing.expectEqual(@as(usize, 2), first.accepted.policies.resource_usage.graph_nodes);
+    try testing.expectEqual(@as(usize, 1), first.accepted.policies.resource_usage.graph_edges);
+
+    var limited = policy(fx.certs.items[0..1]);
+    limited.certificate_policy.limits.maximum_total_nodes = 1;
+    var nodes = try validateBuilt(testing.allocator, &fx.certs.items[1], &.{}, fx.certs.items[0..1], limited, cp);
+    defer nodes.deinit(testing.allocator);
+    try expectRejected(&nodes, .certificate_policy_resource_limit_exceeded, 0);
+    limited = policy(fx.certs.items[0..1]);
+    limited.certificate_policy.limits.maximum_parent_references = 0;
+    var parents = try validateBuilt(testing.allocator, &fx.certs.items[1], &.{}, fx.certs.items[0..1], limited, cp);
+    defer parents.deinit(testing.allocator);
+    try expectRejected(&parents, .certificate_policy_resource_limit_exceeded, 0);
+    limited = policy(fx.certs.items[0..1]);
+    limited.certificate_policy.limits.maximum_operations = 0;
+    var operations = try validateBuilt(testing.allocator, &fx.certs.items[1], &.{}, fx.certs.items[0..1], limited, cp);
+    defer operations.deinit(testing.allocator);
+    try expectRejected(&operations, .certificate_policy_resource_limit_exceeded, 0);
+    limited = policy(fx.certs.items[0..1]);
+    limited.certificate_policy.limits.maximum_output_policies = 0;
+    var outputs = try validateBuilt(testing.allocator, &fx.certs.items[1], &.{}, fx.certs.items[0..1], limited, cp);
+    defer outputs.deinit(testing.allocator);
+    try expectRejected(&outputs, .certificate_policy_resource_limit_exceeded, 0);
+}
+
+test "alternate candidates continue after a policy-profile rejection" {
+    var fx = Fixtures.init(testing.allocator);
+    defer fx.deinit();
+    try fx.add(.{
+        .subject = "leaf",
+        .issuer = "Shared",
+        .subject_key = 1,
+        .issuer_key = 2,
+        .ca = false,
+        .key_usage = 0x80,
+        .certificate_policies = &.{.{ .policy = &policy_a }},
+    });
+    try fx.add(.{
+        .subject = "Shared",
+        .issuer = "Root",
+        .subject_key = 2,
+        .issuer_key = 3,
+        .ca = true,
+        .key_usage = 0x04,
+        .certificate_policies = &.{.{ .policy = &policy_a }},
+        .policy_mappings = &.{.{ .issuer = &oid.well_known.any_policy, .subject = &policy_b }},
+    });
+    try fx.add(.{
+        .subject = "Shared",
+        .issuer = "Root",
+        .subject_key = 2,
+        .issuer_key = 3,
+        .ca = true,
+        .key_usage = 0x04,
+        .certificate_policies = &.{.{ .policy = &policy_a }},
+    });
+    try fx.add(.{ .subject = "Root", .issuer = "Root", .subject_key = 3, .issuer_key = 3, .ca = true, .key_usage = 0x04 });
+    var candidates = try path_builder.build(testing.allocator, &fx.certs.items[0], fx.certs.items[1..3], fx.certs.items[3..4], .{});
+    defer candidates.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), candidates.paths.len);
+    var entropy: crypto.pure_zig.DeterministicEntropy = undefined;
+    var provider: crypto.pure_zig.Provider = undefined;
+    const cp = cryptoProvider(&entropy, &provider);
+    var result = validator.validateCandidates(testing.allocator, candidates, policy(fx.certs.items[3..4]), cp);
+    defer result.deinit(testing.allocator);
+    try expectAccepted(&result, 3);
+    try testing.expectEqual(@as(usize, 1), result.accepted.accepted_path[1].input_index);
+}
+
+test "alternate candidates continue after explicit policy eliminates a graph" {
+    var fx = Fixtures.init(testing.allocator);
+    defer fx.deinit();
+    try fx.add(.{
+        .subject = "leaf",
+        .issuer = "Shared explicit",
+        .subject_key = 1,
+        .issuer_key = 2,
+        .ca = false,
+        .key_usage = 0x80,
+        .certificate_policies = &.{.{ .policy = &policy_a }},
+    });
+    try fx.add(.{ .subject = "Shared explicit", .issuer = "Root", .subject_key = 2, .issuer_key = 3, .ca = true, .key_usage = 0x04 });
+    try fx.add(.{
+        .subject = "Shared explicit",
+        .issuer = "Root",
+        .subject_key = 2,
+        .issuer_key = 3,
+        .ca = true,
+        .key_usage = 0x04,
+        .certificate_policies = &.{.{ .policy = &policy_a }},
+    });
+    try fx.add(.{ .subject = "Root", .issuer = "Root", .subject_key = 3, .issuer_key = 3, .ca = true, .key_usage = 0x04 });
+    var candidates = try path_builder.build(testing.allocator, &fx.certs.items[0], fx.certs.items[1..3], fx.certs.items[3..4], .{});
+    defer candidates.deinit(testing.allocator);
+    const requested = [_]oid.ObjectIdentifier{try policyObject(&policy_a)};
+    var validation_policy = policy(fx.certs.items[3..4]);
+    validation_policy.certificate_policy.user_initial_policy_set = .{ .explicit = &requested };
+    validation_policy.certificate_policy.initial_explicit_policy = true;
+    var entropy: crypto.pure_zig.DeterministicEntropy = undefined;
+    var provider: crypto.pure_zig.Provider = undefined;
+    const cp = cryptoProvider(&entropy, &provider);
+    var result = validator.validateCandidates(testing.allocator, candidates, validation_policy, cp);
+    defer result.deinit(testing.allocator);
+    try expectAccepted(&result, 3);
+    try testing.expectEqual(@as(usize, 1), result.accepted.accepted_path[1].input_index);
+    try testing.expect(result.accepted.policies.user_constrained[0].eqlComponents(&policy_a));
+}
+
+test "policy parser rejects empty extension sequences" {
+    var policies = Fixtures.init(testing.allocator);
+    defer policies.deinit();
+    try testing.expectError(error.MalformedExtension, policies.add(.{
+        .subject = "empty policies",
+        .issuer = "empty policies",
+        .subject_key = 1,
+        .issuer_key = 1,
+        .certificate_policies = &.{},
+    }));
+    var mappings = Fixtures.init(testing.allocator);
+    defer mappings.deinit();
+    try testing.expectError(error.MalformedExtension, mappings.add(.{
+        .subject = "empty mappings",
+        .issuer = "empty mappings",
+        .subject_key = 2,
+        .issuer_key = 2,
+        .policy_mappings = &.{},
+    }));
+    var constraints = Fixtures.init(testing.allocator);
+    defer constraints.deinit();
+    try testing.expectError(error.MalformedExtension, constraints.add(.{
+        .subject = "empty constraints",
+        .issuer = "empty constraints",
+        .subject_key = 3,
+        .issuer_key = 3,
+        .policy_constraints = .{},
+    }));
+}
+
+test "policy parser rejects malformed qualifiers mappings and counter integers" {
+    const malformed_values = [_]struct { constraints: ?[]const u8 = null, inhibit: ?[]const u8 = null }{
+        .{ .constraints = &.{ 0x30, 0x03, 0x80, 0x01, 0xff } },
+        .{ .constraints = &.{ 0x30, 0x04, 0x80, 0x02, 0x00, 0x01 } },
+        .{ .constraints = &.{ 0x30, 0x06, 0x80, 0x01, 0x00, 0x80, 0x01, 0x00 } },
+        .{ .constraints = &.{ 0x30, 0x06, 0x81, 0x01, 0x01, 0x80, 0x01, 0x01 } },
+        .{ .constraints = &.{ 0x30, 0x07, 0x80, 0x05, 0x01, 0x00, 0x00, 0x00, 0x00 } },
+        .{ .inhibit = &.{ 0x02, 0x01, 0xff } },
+        .{ .inhibit = &.{ 0x02, 0x02, 0x00, 0x01 } },
+        .{ .inhibit = &.{ 0x02, 0x05, 0x01, 0x00, 0x00, 0x00, 0x00 } },
+    };
+    for (malformed_values, 0..) |value, index| {
+        var fx = Fixtures.init(testing.allocator);
+        defer fx.deinit();
+        try testing.expectError(error.MalformedExtension, fx.add(.{
+            .subject = "malformed counter",
+            .issuer = "malformed counter",
+            .subject_key = @intCast(index + 1),
+            .issuer_key = @intCast(index + 1),
+            .raw_policy_constraints = value.constraints,
+            .raw_inhibit_any_policy = value.inhibit,
+        }));
+    }
+
+    var mappings = Fixtures.init(testing.allocator);
+    defer mappings.deinit();
+    try testing.expectError(error.MalformedExtension, mappings.add(.{
+        .subject = "duplicate mapping",
+        .issuer = "duplicate mapping",
+        .subject_key = 20,
+        .issuer_key = 20,
+        .policy_mappings = &.{
+            .{ .issuer = &policy_a, .subject = &policy_b },
+            .{ .issuer = &policy_a, .subject = &policy_b },
+        },
+    }));
+
+    var qualifiers = Fixtures.init(testing.allocator);
+    defer qualifiers.deinit();
+    const arena = qualifiers.arena.allocator();
+    const empty_qualifiers = try tlv(arena, 0x30, &.{try tlv(arena, 0x30, &.{
+        try oidTlv(arena, &policy_a),
+        try tlv(arena, 0x30, &.{}),
+    })});
+    try testing.expectError(error.MalformedExtension, qualifiers.add(.{
+        .subject = "empty qualifiers",
+        .issuer = "empty qualifiers",
+        .subject_key = 21,
+        .issuer_key = 21,
+        .raw_certificate_policies = empty_qualifiers,
+    }));
+}
+
+test "empty user policy sets and target wrap-up constraints are explicit" {
+    var fx = Fixtures.init(testing.allocator);
+    defer fx.deinit();
+    try fx.add(.{ .subject = "Root", .issuer = "Root", .subject_key = 3, .issuer_key = 3, .ca = true, .key_usage = 0x04 });
+    try fx.add(.{
+        .subject = "any leaf",
+        .issuer = "Root",
+        .subject_key = 1,
+        .issuer_key = 3,
+        .ca = false,
+        .key_usage = 0x80,
+        .certificate_policies = &.{.{ .policy = &oid.well_known.any_policy }},
+    });
+    try fx.add(.{
+        .subject = "target CA",
+        .issuer = "Root",
+        .subject_key = 2,
+        .issuer_key = 3,
+        .ca = true,
+        .key_usage = 0x84,
+        .certificate_policies = &.{.{ .policy = &policy_a }},
+        .policy_constraints = .{ .require_explicit_policy = 0 },
+    });
+    var entropy: crypto.pure_zig.DeterministicEntropy = undefined;
+    var provider: crypto.pure_zig.Provider = undefined;
+    const cp = cryptoProvider(&entropy, &provider);
+    var empty_policy = policy(fx.certs.items[0..1]);
+    empty_policy.certificate_policy.user_initial_policy_set = .{ .explicit = &.{} };
+    var permissive = try validateBuilt(testing.allocator, &fx.certs.items[1], &.{}, fx.certs.items[0..1], empty_policy, cp);
+    defer permissive.deinit(testing.allocator);
+    try expectAccepted(&permissive, 2);
+    try testing.expectEqual(@as(usize, 0), permissive.accepted.policies.user_constrained.len);
+    empty_policy.certificate_policy.initial_explicit_policy = true;
+    var required = try validateBuilt(testing.allocator, &fx.certs.items[1], &.{}, fx.certs.items[0..1], empty_policy, cp);
+    defer required.deinit(testing.allocator);
+    try expectRejected(&required, .certificate_policy_required, 0);
+
+    const requested_b = [_]oid.ObjectIdentifier{try policyObject(&policy_b)};
+    var wrap_policy = policy(fx.certs.items[0..1]);
+    wrap_policy.certificate_policy.user_initial_policy_set = .{ .explicit = &requested_b };
+    var target = try validateBuilt(testing.allocator, &fx.certs.items[2], &.{}, fx.certs.items[0..1], wrap_policy, cp);
+    defer target.deinit(testing.allocator);
+    try expectRejected(&target, .certificate_policy_required, 0);
+}
+
+test "policy validation allocation failures are structured and leak-free" {
+    var fx = Fixtures.init(testing.allocator);
+    defer fx.deinit();
+    try fx.add(.{ .subject = "Root", .issuer = "Root", .subject_key = 2, .issuer_key = 2, .ca = true, .key_usage = 0x04 });
+    try fx.add(.{
+        .subject = "leaf",
+        .issuer = "Root",
+        .subject_key = 1,
+        .issuer_key = 2,
+        .ca = false,
+        .key_usage = 0x80,
+        .certificate_policies = &.{ .{ .policy = &policy_a }, .{ .policy = &policy_b } },
+    });
+    const elements = [_]path_builder.Element{
+        .{ .certificate = &fx.certs.items[1], .source = .leaf, .input_index = 0 },
+        .{ .certificate = &fx.certs.items[0], .source = .anchor, .input_index = 0 },
+    };
+    var entropy: crypto.pure_zig.DeterministicEntropy = undefined;
+    var provider: crypto.pure_zig.Provider = undefined;
+    const cp = cryptoProvider(&entropy, &provider);
+    const Context = struct {
+        path: path_builder.Path,
+        validation_policy: validator.ValidationPolicy,
+        crypto_provider: crypto.provider.CryptoProvider,
+
+        fn run(allocator: std.mem.Allocator, context: @This()) !void {
+            var result = validator.validatePath(allocator, context.path, context.validation_policy, context.crypto_provider);
+            defer result.deinit(allocator);
+            switch (result) {
+                .accepted => {},
+                .rejected => |rejected| {
+                    if (rejected.reason == .out_of_memory) return error.OutOfMemory;
+                    return error.TestUnexpectedResult;
+                },
+            }
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Context.run, .{Context{
+        .path = .{ .elements = &elements },
+        .validation_policy = policy(fx.certs.items[0..1]),
+        .crypto_provider = cp,
+    }});
 }

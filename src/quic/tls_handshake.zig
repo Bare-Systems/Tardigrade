@@ -10,7 +10,8 @@
 //! client-only, record/stream TLS implementation with no way to pump raw
 //! handshake bytes or export QUIC traffic secrets, so it cannot back QUIC
 //! without inverting the design; the production backend is the pure-Zig TLS
-//! 1.3 engine in `tls_backend.zig`. See `docs/QUIC_TLS.md`. This module also
+//! TLS-owned 1.3 engine in `../tls/tls13_backend.zig`, adapted by
+//! `tls_backend.zig`. See `docs/QUIC_TLS.md`. This module also
 //! ships a deterministic in-memory `TestTlsBackend` that proves the driver end
 //! to end and remains the regression seam for later packet-layer work.
 

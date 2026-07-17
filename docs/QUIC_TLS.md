@@ -39,17 +39,20 @@ CRYPTO-frame transport and packet-key installation.**
    the generic backend vtable and bounded event sink that carriers instantiate
    with their own epoch and transport-parameter payload types; `engine.zig`
    owns generic backend start/receive progression, lifecycle state, and failure
-   capture over that contract; `key_schedule.zig` owns the SHA-256 TLS 1.3 key
-   schedule with no QUIC, HTTP, socket, or record-layer imports. QUIC-only
-   failures and hooks, such as CRYPTO-level misuse, missing QUIC transport
-   parameters, and connection-ID binding, stay in the QUIC handshake driver.
+   capture over that contract; `tls13_backend.zig` owns the concrete reusable
+   ClientHello, ServerHello, certificate, CertificateVerify, Finished,
+   transcript, traffic-secret, and zeroization implementation; and
+   `key_schedule.zig` owns the SHA-256 TLS 1.3 key schedule. None imports QUIC,
+   HTTP, sockets, or OpenSSL. The concrete backend takes an explicit `.record`
+   profile or an opaque extension profile, so record mode selects `h2` /
+   `http/1.1` without seeing QUIC types or transport parameters.
 
-3. `src/quic/tls_backend.zig` is the concrete production adapter from that core
-   to QUIC mode. It consumes and produces raw handshake messages per encryption
-   level — there is no record layer; QUIC packet protection covers
-   confidentiality — and exports traffic secrets, transport parameters, ALPN,
-   and certificate state through the `EventSink`. Its first profile is
-   deliberately narrow with one interoperable code path per choice:
+3. `src/quic/tls_backend.zig` is a thin adapter from the TLS-owned engine to
+   QUIC mode. It owns the RFC 9000 transport-parameter codec, CID binding,
+   QUIC/shared epoch conversion, and QUIC error mapping. It configures the
+   shared engine with opaque extension type 57 and ALPN `h3`; no TLS message,
+   certificate, Finished, transcript, or key-schedule logic is duplicated in
+   QUIC. The shared engine's first profile remains deliberately narrow:
    TLS_AES_128_GCM_SHA256 (the adapter's suite), X25519 key exchange, Ed25519
    server certificates (parsed/verified via `std.crypto.Certificate`), and
    pinned-certificate or explicit-insecure trust. The shared key schedule is
@@ -59,8 +62,10 @@ CRYPTO-frame transport and packet-key installation.**
 4. A deterministic in-memory `TestTlsBackend` in `tls_handshake.zig` exercises
    the driver end to end. It is a fixture, not a TLS implementation, and it is
    the regression seam that later packet-layer and interop work (#247) build
-   on. `src/quic/testdata/` holds a deterministic self-signed Ed25519
-   certificate fixture for the real backend's tests.
+   on. `src/tls/tls13_backend_tests.zig` separately constructs the concrete
+   backend directly in `.record` mode and drives `PureZigRecordStream` across
+   fragmented nonblocking socket pairs with ALPN `h2`, no QUIC import, and no
+   transport-extension payload.
 
 ### Why not `std.crypto.tls`
 
@@ -93,7 +98,8 @@ where appropriate, but its `Client` state machine cannot drive a QUIC handshake.
 
 ## Transport parameters, ALPN, certificates
 
-- Local transport parameters are provided to the backend before the first flight.
+- Local transport parameters are encoded by the QUIC adapter before the first
+  flight and supplied to the TLS engine as an opaque extension payload.
 - Peer transport parameters are withheld from connection logic until the
   handshake authenticates them; missing, malformed, or illegal values fail with
   a typed `MissingTransportParameters` / `InvalidTransportParameters`.

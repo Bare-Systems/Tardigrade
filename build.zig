@@ -312,23 +312,20 @@ pub fn build(b: *std.Build) void {
     crypto_step.dependOn(&run_crypto_corpus_tests.step);
     test_step.dependOn(&run_crypto_corpus_tests.step);
 
-    // Test-only: a real client/server TLS 1.3 handshake through the merged
-    // record stack (#408 finding 6). This needs the "crypto" module (to
-    // build a pure-Zig CryptoProvider for the record_epoch_bridge.Bridge
-    // instances it drives) purely for its own test assertions, so it is its
-    // own module rather than folding "crypto" into production quic_mod or
-    // exporting a test file from quic/root.zig's public namespace.
+    // A direct TLS-owned backend handshake through the record stack. This is a
+    // standalone module because it uses socket-pair carriers and the concrete
+    // pure-Zig crypto provider in addition to the reusable tls_core module.
     const record_mode_handshake_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/quic/record_mode_handshake_test.zig"),
+        .root_source_file = b.path("src/tls/tls13_backend_tests.zig"),
         .target = target,
         .optimize = optimize,
     });
-    record_mode_handshake_test_mod.addImport("quic_varint", quic_varint_mod);
     record_mode_handshake_test_mod.addImport("tls_core", tls_core_mod);
     record_mode_handshake_test_mod.addImport("crypto_secrets", crypto_secrets_mod);
     record_mode_handshake_test_mod.addImport("crypto", crypto_mod);
     const record_mode_handshake_tests = b.addTest(.{ .root_module = record_mode_handshake_test_mod });
     const run_record_mode_handshake_tests = b.addRunArtifact(record_mode_handshake_tests);
+    tls_step.dependOn(&run_record_mode_handshake_tests.step);
     quic_step.dependOn(&run_record_mode_handshake_tests.step);
     test_step.dependOn(&run_record_mode_handshake_tests.step);
 

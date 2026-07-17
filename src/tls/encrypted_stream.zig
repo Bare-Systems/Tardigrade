@@ -26,7 +26,15 @@ const provider = crypto.provider;
 /// `record_epoch_bridge` can surface, so a concrete TLS backend wired in from a
 /// higher layer (#410) can report handshake failures without a lossy remap.
 pub const RecordHandshakeError = record_epoch_bridge.Error || events.HandshakeError ||
-    messages.ReadError || messages.WriteError || error{TransportBufferOverflow};
+    messages.ReadError || messages.WriteError || error{
+    TransportBufferOverflow,
+    /// A transport profile delivered handshake bytes in an epoch where the
+    /// shared TLS engine cannot consume them.
+    UnexpectedTransportEpoch,
+    /// A transport profile that requires an extension (currently QUIC) did
+    /// not receive it. Record mode never enables such an extension.
+    MissingTransportExtension,
+};
 
 /// The canonical record-mode handshake transport contract (#408): protocol
 /// events keyed on `events.EncryptionEpoch`, no transport-parameter payload

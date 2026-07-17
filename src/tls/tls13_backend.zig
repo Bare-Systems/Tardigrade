@@ -179,11 +179,15 @@ pub const VerificationContext = credentials.VerificationContext;
 pub const CredentialFailure = credentials.FailureClass;
 
 /// Largest peer certificate chain (total DER bytes and entry count) the engine
-/// reassembles and surfaces to a `PeerVerifier` as immutable views.
-pub const max_peer_chain_bytes = 8 * 1024;
+/// reassembles and surfaces to a `PeerVerifier` as immutable views. A chain
+/// exceeding either bound fails closed (peer-attributed) rather than being
+/// truncated, so a verifier never sees a partial chain.
+pub const max_peer_chain_bytes = 16 * 1024;
 pub const max_peer_chain_entries = credentials.max_chain_entries;
 /// Largest set of peer-offered signature schemes captured for selection.
-const max_peer_sig_schemes = 16;
+/// Generous versus real ClientHellos (~a dozen); a larger offer fails closed
+/// rather than being silently truncated.
+const max_peer_sig_schemes = 64;
 /// Largest SNI host_name captured for selection (RFC 6066 caps names well
 /// under this).
 const max_server_name_len = 256;
@@ -213,14 +217,22 @@ pub const Tls13Backend = struct {
     /// same production contract, so there is one authentication path.
     external_provider: ?CredentialProvider = null,
     external_verifier: ?PeerVerifier = null,
+    /// Explicit local authentication policy, passed to selection and
+    /// verification. Set at construction from the caller's intent, never
+    /// re-derived from a defaulted field (an external verifier must not silently
+    /// inherit the insecure default).
+    auth_policy: credentials.AuthPolicy = .{},
     /// The last typed credential/verification failure. Set on failure and
     /// deliberately preserved across `deinit` (it is diagnostic, not secret) so
     /// terminal cleanup does not erase the underlying reason (#334).
     credential_failure: ?CredentialFailure = null,
-    /// Peer-offered signature schemes and SNI captured from ClientHello, passed
+    /// Peer-offered signature schemes captured from ClientHello, passed
     /// immutably into credential selection.
     peer_sig_schemes: [max_peer_sig_schemes]u16 = undefined,
     peer_sig_scheme_count: usize = 0,
+    /// SNI host_name. Server: the value parsed from ClientHello. Client: the
+    /// intended server name, configured at construction, emitted as ClientHello
+    /// SNI and passed to the verifier so a Web-PKI verifier can check hostname.
     server_name: [max_server_name_len]u8 = undefined,
     server_name_len: usize = 0,
     server_name_present: bool = false,
@@ -252,10 +264,36 @@ pub const Tls13Backend = struct {
 
     const Slice = struct { start: usize, len: usize };
 
+    /// Options for a client that verifies its peer through an external verifier:
+    /// the exact intended server name (emitted as SNI and handed to the
+    /// verifier) and the explicit authentication policy.
+    pub const ClientOptions = struct {
+        server_name: ?[]const u8 = null,
+        /// Defaults to strict: an external verifier is assumed to require a
+        /// valid peer certificate unless the caller opts out.
+        policy: credentials.AuthPolicy = .{ .require_peer_authentication = true },
+    };
+
+    /// The authentication policy implied by a fixed `Trust`: insecure mode
+    /// explicitly allows an unverified peer, pinning requires a match.
+    fn policyFromTrust(trust: Trust) credentials.AuthPolicy {
+        return switch (trust) {
+            .insecure_no_verification => .{ .allow_unverified_peer = true },
+            .pinned_certificate => .{ .require_peer_authentication = true },
+        };
+    }
+
     /// Allocation-free. The returned backend owns its copied entropy until
     /// `deinit`, which securely clears all private material.
     pub fn initClient(entropy: Entropy, trust: Trust, profile: TransportProfile) Tls13Backend {
-        return .{ .role = .client, .profile = profile, .entropy = entropy, .trust = trust, .core = tls_handshake_codec.Core.init(.client) };
+        return .{
+            .role = .client,
+            .profile = profile,
+            .entropy = entropy,
+            .trust = trust,
+            .auth_policy = policyFromTrust(trust),
+            .core = tls_handshake_codec.Core.init(.client),
+        };
     }
 
     /// Allocation-free. The returned backend owns its copy of `identity` and
@@ -288,15 +326,27 @@ pub const Tls13Backend = struct {
 
     /// Client construction against an external peer verifier (#324 Web-PKI, a
     /// custom trust store, ...). The verifier's storage must outlive the
-    /// handshake.
-    pub fn initClientWithVerifier(entropy: Entropy, verifier: PeerVerifier, profile: TransportProfile) Tls13Backend {
-        return .{
+    /// handshake. `options` carries the intended server name (emitted as SNI and
+    /// passed to the verifier for hostname verification) and the explicit
+    /// policy — the verifier never inherits the insecure trust default.
+    pub fn initClientWithVerifier(entropy: Entropy, verifier: PeerVerifier, profile: TransportProfile, options: ClientOptions) Tls13Backend {
+        var self: Tls13Backend = .{
             .role = .client,
             .profile = profile,
             .entropy = entropy,
             .external_verifier = verifier,
+            .auth_policy = options.policy,
             .core = tls_handshake_codec.Core.init(.client),
         };
+        if (options.server_name) |name| {
+            // A name too long for the bounded buffer is a caller error; clamp
+            // defensively (callers pass real hostnames, well under the bound).
+            const n = @min(name.len, self.server_name.len);
+            @memcpy(self.server_name[0..n], name[0..n]);
+            self.server_name_len = n;
+            self.server_name_present = true;
+        }
+        return self;
     }
 
     pub fn backend(self: *Tls13Backend) TlsBackend {
@@ -593,6 +643,19 @@ pub const Tls13Backend = struct {
         w.patch(2, alpn_list_len);
         w.patch(2, alpn_ext_len);
 
+        // server_name (RFC 6066): the configured intended host, so the server
+        // can select on SNI and the same value reaches this side's verifier.
+        if (self.serverNameSlice()) |name| {
+            try w.u16_(ext_server_name);
+            const sni_ext_len = try w.reserve(2);
+            const sni_list_len = try w.reserve(2);
+            try w.u8_(0); // name_type host_name
+            try w.u16_(@intCast(name.len));
+            try w.bytes(name);
+            w.patch(2, sni_list_len);
+            w.patch(2, sni_ext_len);
+        }
+
         if (self.profile.extensionType()) |extension_type| {
             const payload = self.profile.localExtension() orelse return error.MissingTransportExtension;
             try w.u16_(extension_type);
@@ -691,33 +754,32 @@ pub const Tls13Backend = struct {
         var list = Reader{ .bytes = try r.slice(try r.u24_()) };
         try r.expectEnd();
 
-        // Reassemble the full chain into engine-owned storage. The verifier
-        // later sees each entry as an immutable DER view into `peer_chain`; the
-        // leaf (entry 0) additionally anchors proof-of-possession. Bounds keep
-        // a hostile peer from exhausting memory.
+        // Reassemble the *complete* chain into engine-owned storage. A verifier
+        // (especially a #324 path builder) must decide trust over exactly what
+        // the peer sent, never a prefix that happened to fit — so a chain that
+        // exceeds our bounds fails closed with a peer-attributed error rather
+        // than being silently truncated. Every CertificateEntry, leaf and
+        // intermediate, must be non-empty and within `max_certificate_len`.
         self.peer_chain_count = 0;
         self.peer_chain_len = 0;
-        const leaf_len = try list.u24_();
-        if (leaf_len == 0 or leaf_len > max_certificate_len) return error.CertificateInvalid;
-        try self.appendPeerCertificate(try list.slice(leaf_len));
-        _ = try list.slice(try list.u16_()); // leaf extensions
+        var first = true;
         while (list.remaining() > 0) {
-            const entry = try list.slice(try list.u24_());
+            const entry_len = try list.u24_();
+            if (entry_len == 0 or entry_len > max_certificate_len) return self.failCredential(.invalid_peer_certificate_chain);
+            const entry = try list.slice(entry_len);
             _ = try list.slice(try list.u16_()); // per-certificate extensions
-            // Additional chain certificates beyond our bound are framed-checked
-            // above but not retained; the leaf is what pinning verifies and a
-            // #324 verifier receives what fits.
-            self.appendPeerCertificate(entry) catch |err| switch (err) {
-                error.CertificateInvalid => {},
-                else => return err,
-            };
+            self.appendPeerCertificate(entry) catch return self.failCredential(.invalid_peer_certificate_chain);
+            first = false;
         }
+        // An empty CertificateList is only legal for client auth (an empty
+        // client Certificate); a server that presents none is malformed here.
+        if (first and self.role == .client) return self.failCredential(.invalid_peer_certificate_chain);
     }
 
     /// Copy one peer DER certificate into the bounded chain storage, recording
-    /// its view. Returns `CertificateInvalid` when the entry or the chain would
-    /// exceed the engine's bounds.
-    fn appendPeerCertificate(self: *Tls13Backend, der: []const u8) HandshakeError!void {
+    /// its view. Returns `CertificateInvalid` when the entry or the aggregate
+    /// chain would exceed the engine's bounds — the caller fails closed.
+    fn appendPeerCertificate(self: *Tls13Backend, der: []const u8) error{CertificateInvalid}!void {
         if (self.peer_chain_count >= self.peer_chain_entries.len) return error.CertificateInvalid;
         if (self.peer_chain_len + der.len > self.peer_chain.len) return error.CertificateInvalid;
         const start = self.peer_chain_len;
@@ -741,22 +803,18 @@ pub const Tls13Backend = struct {
     fn serverSelectionContext(self: *const Tls13Backend) credentials.SelectionContext {
         return .{
             .role = .server,
-            .server_name = if (self.server_name_present) self.server_name[0..self.server_name_len] else null,
+            .server_name = self.serverNameSlice(),
             .peer_signature_schemes = self.peer_sig_schemes[0..self.peer_sig_scheme_count],
             .negotiated_version = tls13_version,
             .cipher_suite = cipher_tls_aes_128_gcm_sha256,
             .application_protocol = self.alpn(),
-            .auth_policy = self.authPolicy(),
+            .auth_policy = self.auth_policy,
         };
     }
 
-    fn authPolicy(self: *const Tls13Backend) credentials.AuthPolicy {
-        return .{
-            .allow_unverified_peer = switch (self.trust) {
-                .insecure_no_verification => true,
-                .pinned_certificate => false,
-            },
-        };
+    /// The intended/parsed SNI as a borrowed slice, or null when absent.
+    fn serverNameSlice(self: *const Tls13Backend) ?[]const u8 {
+        return if (self.server_name_present) self.server_name[0..self.server_name_len] else null;
     }
 
     fn onCertificateVerify(self: *Tls13Backend, transcript_before: [hash_len]u8, body: []const u8, sink: *EventSink) HandshakeError!void {
@@ -772,7 +830,7 @@ pub const Tls13Backend = struct {
         const content = certificateVerifyContent(.server, transcript_before);
         if (!self.checkProofOfPossession(algorithm, signature, content.slice())) {
             try sink.emitCertificate(.invalid);
-            return self.failCredential(.invalid_peer_certificate_chain);
+            return self.failCredential(.certificate_verify_invalid);
         }
 
         // Delegate the trust verdict to the peer verifier — the fixed pin/
@@ -786,12 +844,12 @@ pub const Tls13Backend = struct {
         };
         const context = credentials.VerificationContext{
             .role = .client,
-            .server_name = null,
+            .server_name = self.serverNameSlice(),
             .chain = self.peerChainView(&views),
             .negotiated_version = tls13_version,
             .cipher_suite = cipher_tls_aes_128_gcm_sha256,
             .application_protocol = self.alpn(),
-            .auth_policy = self.authPolicy(),
+            .auth_policy = self.auth_policy,
         };
         const verdict = verifier.verifyPeer(&context) catch |err|
             return self.failCredential(credentials.classifyVerifyError(err));
@@ -902,6 +960,7 @@ pub const Tls13Backend = struct {
         self.server_name_len = 0;
         var offers_tls13 = false;
         var offers_x25519_group = false;
+        var saw_signature_algorithms = false;
         var peer_share: ?[X25519.public_length]u8 = null;
         var alpn_match = false;
         var first_alpn: []const u8 = "";
@@ -929,30 +988,41 @@ pub const Tls13Backend = struct {
                     }
                 },
                 ext_signature_algorithms => {
+                    saw_signature_algorithms = true;
                     var algorithms = Reader{ .bytes = try ext.slice(try ext.u16_()) };
+                    // Preserve the peer's *complete* offer in order — truncating
+                    // it would silently turn a compatible scheme in a high slot
+                    // into a false local "no compatible credential". If the offer
+                    // is larger than our bounded vector, fail rather than lie to
+                    // the selector about what the peer supports.
                     while (algorithms.remaining() > 0) {
                         const scheme = try algorithms.u16_();
-                        // Capture the peer's offers (in order) for credential
-                        // selection; ignore any past our bounded capacity.
-                        if (self.peer_sig_scheme_count < self.peer_sig_schemes.len) {
-                            self.peer_sig_schemes[self.peer_sig_scheme_count] = scheme;
-                            self.peer_sig_scheme_count += 1;
-                        }
+                        if (self.peer_sig_scheme_count >= self.peer_sig_schemes.len) return error.MalformedHandshake;
+                        self.peer_sig_schemes[self.peer_sig_scheme_count] = scheme;
+                        self.peer_sig_scheme_count += 1;
                     }
+                    try ext.expectEnd();
                 },
                 ext_server_name => {
                     // RFC 6066 §3: ServerNameList<1..>, each { name_type, name<..> }.
-                    // Preserve the first host_name (type 0) exactly as received.
+                    // Distinguish absent (no extension / no host_name) from valid
+                    // and from malformed: an empty, over-bound, or duplicated
+                    // host_name is rejected deterministically rather than being
+                    // collapsed into the default-certificate path, so a selector
+                    // never serves the default cert for an invalid SNI.
                     var names = Reader{ .bytes = try ext.slice(try ext.u16_()) };
                     while (names.remaining() > 0) {
                         const name_type = try names.u8_();
                         const name = try names.slice(try names.u16_());
-                        if (name_type == 0 and !self.server_name_present and name.len <= self.server_name.len) {
-                            @memcpy(self.server_name[0..name.len], name);
-                            self.server_name_len = name.len;
-                            self.server_name_present = true;
-                        }
+                        if (name_type != 0) continue; // only host_name is defined
+                        // RFC 6066: a given name_type must appear at most once.
+                        if (self.server_name_present) return error.IllegalParameter;
+                        if (name.len == 0 or name.len > self.server_name.len) return error.IllegalParameter;
+                        @memcpy(self.server_name[0..name.len], name);
+                        self.server_name_len = name.len;
+                        self.server_name_present = true;
                     }
+                    try ext.expectEnd();
                 },
                 ext_key_share => {
                     var shares = Reader{ .bytes = try ext.slice(try ext.u16_()) };
@@ -981,6 +1051,11 @@ pub const Tls13Backend = struct {
             }
         }
         if (!offers_tls13 or !offers_x25519_group) return error.MalformedHandshake;
+        // signature_algorithms is required whenever the server authenticates
+        // with a certificate (RFC 8446 §9.2). A missing or empty list is a
+        // malformed/missing required *peer* extension — attribute it to the
+        // peer (decode_error), not to local credential configuration.
+        if (!saw_signature_algorithms or self.peer_sig_scheme_count == 0) return error.MalformedHandshake;
         const client_share = peer_share orelse return error.MalformedHandshake;
 
         // Validate the peer share before emitting anything: X25519.scalarmult
@@ -1074,6 +1149,28 @@ pub const Tls13Backend = struct {
         // signed, or immediately on any failure below (cancellation included).
         defer credential.release();
 
+        // Validate provider output before trusting it. A buggy or hostile
+        // provider must not make the engine emit a CertificateVerify scheme the
+        // client never offered, nor a chain that overflows the flight buffer as
+        // a generic writer error. Every violation is a local provider fault, and
+        // signing never happens when validation fails.
+        if (!selection.offersScheme(credential.scheme))
+            return self.failCredential(.invalid_callback_behavior);
+        const chain = credential.certificateChain();
+        if (chain.count() == 0 or chain.count() > credentials.max_chain_entries)
+            return self.failCredential(.malformed_credential_chain);
+        var encoded_len: usize = 0;
+        for (chain.entries) |entry| {
+            if (entry.len == 0 or entry.len > max_certificate_len)
+                return self.failCredential(.malformed_credential_chain);
+            // CertificateEntry framing overhead: 3-byte cert_data length +
+            // 2-byte extensions length.
+            encoded_len = std.math.add(usize, encoded_len, entry.len + 5) catch
+                return self.failCredential(.malformed_credential_chain);
+            if (encoded_len > max_message_len)
+                return self.failCredential(.malformed_credential_chain);
+        }
+
         var buf: [max_message_len]u8 = undefined;
         var w = Writer{ .buf = &buf };
 
@@ -1100,17 +1197,14 @@ pub const Tls13Backend = struct {
         w.patch(3, ee_len);
         const encrypted_extensions = buf[0..w.len];
 
-        // Certificate: the selected credential's public DER chain. The views
-        // are borrowed for this call only and never retained past it.
-        const chain = credential.certificateChain();
-        if (chain.count() == 0) return self.failCredential(.malformed_credential_chain);
+        // Certificate: the selected credential's validated public DER chain,
+        // valid until `release`. The chain was bounds-checked above.
         const cert_start = w.len;
         try w.u8_(@intFromEnum(MessageType.certificate));
         const cert_len = try w.reserve(3);
         try w.u8_(0); // certificate_request_context
         const list_len = try w.reserve(3);
         for (chain.entries) |entry| {
-            if (entry.len == 0 or entry.len > max_certificate_len) return self.failCredential(.malformed_credential_chain);
             const entry_len = try w.reserve(3);
             try w.bytes(entry);
             w.patch(3, entry_len);

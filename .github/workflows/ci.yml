@@ -199,7 +199,7 @@ jobs:
           path: |
             pki-differential-artifacts/*.json
             pki-differential-artifacts/*.reduced.der
-            pki-differential-artifacts/*.reduced.crt
+            pki-differential-artifacts/*.reduced*.crt
           if-no-files-found: ignore
           retention-days: 14
 

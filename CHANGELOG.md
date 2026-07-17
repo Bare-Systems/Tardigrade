@@ -22,11 +22,12 @@ All notable user-facing changes to Tardigrade are documented here.
   every unexplained differential mismatch now runs bounded deterministic
   delta debugging (`tests/pki_reduce.zig`) over each chain component — leaf,
   intermediates, and trust anchors — preserving Tardigrade's exact
-  classification and keeping the largest shrink. The reduced case is
-  re-verified against OpenSSL and Go `crypto/x509`; a candidate whose
-  observed statuses diverge from the original tuple is reverted to the
-  original bytes so every emitted fixture reproduces the disagreement. The
-  schema-v3 artifact records the component, sizes, oracle budget,
+  classification under one shared mismatch budget. Component candidates are
+  re-verified against OpenSSL and Go `crypto/x509` before selection, so the
+  artifact keeps the largest shrink that preserves the full observed tuple; if
+  none preserve it, the emitted fixture reverts to original bytes so it still
+  reproduces the disagreement. The schema-v3 artifact records the component,
+  sizes, oracle budget and total calls,
   `budget_exhausted`/`one_minimal` flags, SHA-256, per-validator reduced
   decisions, the reverted candidate's decisions when applicable, and a
   `promotable` verdict, with deterministic offline serialization tests. A
@@ -37,7 +38,8 @@ All notable user-facing changes to Tardigrade are documented here.
   (also part of `zig build test`) regenerates each seed from its documented
   source, requiring byte-for-byte equality and a completed 1-minimality
   proof. The reduced corpus is a closed directory enforced by
-  `generate.sh`, and CI mismatch uploads now include the reduced inputs.
+  `generate.sh`, and CI mismatch uploads now include the reduced inputs plus
+  substituted root/intermediate bundles.
 - **Three-way hostile Web PKI differential harness foundation (#348, epic #324)** —
   adds a bounded, provenance-backed certificate corpus that compares the
   pure-Zig parser, path builder, identity matcher, and RFC 5280 validator with

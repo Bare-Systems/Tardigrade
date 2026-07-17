@@ -28,9 +28,20 @@ All notable user-facing changes to Tardigrade are documented here.
   noncritical CA constraints, and constraints on leaves fail closed. Fixed
   OpenSSL-generated fixtures and an opt-in `test-pki-openssl` differential
   target cover DNS, IP, directoryName, and leading-dot compatibility.
-  Certificate-policy processing remains deferred: noncritical
-  certificatePolicies use the implicit any-policy policy, and critical policy
-  extensions are rejected until full processing is implemented.
+  Certificate-policy validation now parses `certificatePolicies`,
+  `policyMappings`, `policyConstraints`, and `inhibitAnyPolicy` and processes
+  them in anchor-to-target order with the bounded RFC 9618 policy graph rather
+  than the obsolete exponential policy tree. Callers can configure an initial
+  policy set and explicit-policy, mapping, or anyPolicy inhibition; accepted
+  paths return deterministic authority- and user-constrained OID sets plus
+  graph resource accounting. One node per OID/depth, shared parent edges,
+  checked counters, configurable node/edge/operation/qualifier bounds, and
+  structured failures keep adversarial mappings deterministic. CPS Pointer
+  and User Notice qualifiers are syntax-checked but never fetched or shown;
+  unsupported critical qualifiers fail closed. Signed synthetic chains and
+  fixed OpenSSL fixtures cover intersections, mappings, constraints,
+  self-issued rollover, final wrap-up, malformed DER, allocation failure, and
+  OpenSSL differential decisions under `test-pki-policy-openssl`.
   Deterministic, real-signature Ed25519 fixtures plus independently
   OpenSSL-generated leaf/anchor chain cover valid/direct and alternate paths,
   signature defect classes, time boundaries, CA/KU/EKU,

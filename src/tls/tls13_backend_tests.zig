@@ -16,6 +16,7 @@ const tls_backend = tls_core.tls13_backend;
 
 const record_codec = tls_core.record_codec;
 const events = tls_core.events;
+const credentials = tls_core.credentials;
 
 fn clientEntropy() tls_backend.Entropy {
     return .{ .hello_random = [_]u8{0xc1} ** 32, .key_share_seed = [_]u8{0x11} ** 32 };
@@ -621,6 +622,11 @@ const SocketHarness = struct {
         client_alpn: []const u8 = "h2",
         server_alpn: []const u8 = "h2",
         one_write_per_drive: bool = false,
+        /// Optional external credential provider / peer verifier (mocks). Their
+        /// storage must outlive the harness. When null, the fixed identity/trust
+        /// is used through the same production contract.
+        server_provider: ?tls_backend.CredentialProvider = null,
+        client_verifier: ?tls_backend.PeerVerifier = null,
     };
 
     fn create(opts: Options) !*SocketHarness {
@@ -634,8 +640,14 @@ const SocketHarness = struct {
         self.fds = try testSocketPair();
         self.fds_closed = .{ false, false };
 
-        self.client_engine = tls_backend.Tls13Backend.initClient(clientEntropy(), opts.client_trust, .{ .record = .{ .alpn = opts.client_alpn } });
-        self.server_engine = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .{ .record = .{ .alpn = opts.server_alpn } });
+        self.client_engine = if (opts.client_verifier) |verifier|
+            tls_backend.Tls13Backend.initClientWithVerifier(clientEntropy(), verifier, .{ .record = .{ .alpn = opts.client_alpn } })
+        else
+            tls_backend.Tls13Backend.initClient(clientEntropy(), opts.client_trust, .{ .record = .{ .alpn = opts.client_alpn } });
+        self.server_engine = if (opts.server_provider) |provider|
+            tls_backend.Tls13Backend.initServerWithProvider(serverEntropy(), provider, .{ .record = .{ .alpn = opts.server_alpn } })
+        else
+            tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .{ .record = .{ .alpn = opts.server_alpn } });
         self.client_carrier = .{ .fd = self.fds[0], .max_chunk = opts.client_chunk, .one_write_per_drive = opts.one_write_per_drive };
         self.server_carrier = .{ .fd = self.fds[1], .max_chunk = opts.server_chunk, .one_write_per_drive = opts.one_write_per_drive };
 
@@ -936,4 +948,297 @@ test "record stream requires explicit opt-in for an unverified client certificat
     try std.testing.expect(opted_in.client.bridge.handshake_complete);
     try std.testing.expect(opted_in.server.bridge.handshake_complete);
     try std.testing.expectEqual(events.CertificateState.not_checked, opted_in.client.certificateState());
+}
+// ==========================================================================
+// Credential provider / peer verifier contract integration (#334). These
+// drive the production engine through the new provider and verifier seams and
+// assert callback invocation counts and exact lifetime transitions, not merely
+// final success/failure.
+// ==========================================================================
+
+const HsWriter = tls_core.handshake.Writer;
+const HsMessageType = tls_core.handshake.MessageType;
+const X25519 = std.crypto.dh.X25519;
+
+const ClientHelloOptions = struct {
+    sni: ?[]const u8 = null,
+    sig_schemes: []const u16 = &.{ 0x0807, 0x0403 },
+    alpn: []const u8 = "h2",
+};
+
+/// Build a minimal, well-formed TLS 1.3 ClientHello the server engine accepts,
+/// with an optional SNI and a caller-chosen signature_algorithms list. Returns
+/// the message slice into `buf`.
+fn buildClientHello(buf: []u8, opts: ClientHelloOptions) ![]const u8 {
+    const seed: [X25519.seed_length]u8 = [_]u8{0x33} ** X25519.seed_length;
+    const key_pair = try X25519.KeyPair.generateDeterministic(seed);
+    var w = HsWriter{ .buf = buf };
+    try w.u8_(@intFromEnum(HsMessageType.client_hello));
+    const message_len = try w.reserve(3);
+    try w.u16_(0x0303); // legacy_version
+    try w.bytes(&([_]u8{0x77} ** 32)); // random
+    try w.u8_(0); // session_id
+    try w.u16_(2); // cipher_suites
+    try w.u16_(0x1301);
+    try w.u8_(1); // compression methods
+    try w.u8_(0);
+
+    const extensions_len = try w.reserve(2);
+    // supported_versions
+    try w.u16_(43);
+    try w.u16_(3);
+    try w.u8_(2);
+    try w.u16_(0x0304);
+    // supported_groups
+    try w.u16_(10);
+    try w.u16_(4);
+    try w.u16_(2);
+    try w.u16_(0x001d);
+    // signature_algorithms
+    try w.u16_(13);
+    try w.u16_(@intCast(2 + 2 * opts.sig_schemes.len));
+    try w.u16_(@intCast(2 * opts.sig_schemes.len));
+    for (opts.sig_schemes) |scheme| try w.u16_(scheme);
+    // key_share
+    try w.u16_(51);
+    try w.u16_(2 + 2 + 2 + X25519.public_length);
+    try w.u16_(2 + 2 + X25519.public_length);
+    try w.u16_(0x001d);
+    try w.u16_(X25519.public_length);
+    try w.bytes(&key_pair.public_key);
+    // alpn
+    try w.u16_(16);
+    const alpn_ext = try w.reserve(2);
+    const alpn_list = try w.reserve(2);
+    try w.u8_(@intCast(opts.alpn.len));
+    try w.bytes(opts.alpn);
+    w.patch(2, alpn_list);
+    w.patch(2, alpn_ext);
+    // server_name (optional)
+    if (opts.sni) |sni| {
+        try w.u16_(0);
+        const sni_ext = try w.reserve(2);
+        const sni_list = try w.reserve(2);
+        try w.u8_(0); // name_type host_name
+        try w.u16_(@intCast(sni.len));
+        try w.bytes(sni);
+        w.patch(2, sni_list);
+        w.patch(2, sni_ext);
+    }
+    w.patch(2, extensions_len);
+    w.patch(3, message_len);
+    return buf[0..w.len];
+}
+
+/// Drive a server engine through selection by feeding it one ClientHello.
+fn driveServerSelection(server: *tls_backend.Tls13Backend, opts: ClientHelloOptions) !void {
+    var sink = DirectSink{};
+    defer sink.deinit();
+    try server.backend().start(.server, {}, &sink);
+    var buf: [1024]u8 = undefined;
+    const hello = try buildClientHello(&buf, opts);
+    try server.backend().receive(.initial, hello, &sink);
+}
+
+test "exact SNI reaches credential selection through a mock provider" {
+    var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
+    var server = tls_backend.Tls13Backend.initServerWithProvider(serverEntropy(), mock.provider(), .{ .record = .{ .alpn = "h2" } });
+    defer server.deinit();
+
+    try driveServerSelection(&server, .{ .sni = "exact.example.test" });
+    try std.testing.expectEqual(@as(usize, 1), mock.select_count);
+    try std.testing.expect(mock.last_server_name != null);
+    try std.testing.expectEqualStrings("exact.example.test", mock.last_server_name.?);
+    // A selected credential is signed with exactly once and released exactly once.
+    try std.testing.expectEqual(@as(usize, 1), mock.sign_count);
+    try std.testing.expectEqual(@as(usize, 1), mock.release_count);
+}
+
+test "absent SNI reaches selection deterministically as null" {
+    var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
+    var server = tls_backend.Tls13Backend.initServerWithProvider(serverEntropy(), mock.provider(), .{ .record = .{ .alpn = "h2" } });
+    defer server.deinit();
+
+    try driveServerSelection(&server, .{ .sni = null });
+    try std.testing.expectEqual(@as(usize, 1), mock.select_count);
+    try std.testing.expect(mock.last_server_name == null);
+}
+
+test "selection sees the peer's offered schemes and picks a compatible credential" {
+    // Fixed Ed25519 identity; the peer offers ECDSA first then Ed25519. The
+    // fixed provider still binds, proving order-independent compatibility.
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .{ .record = .{ .alpn = "h2" } });
+    defer server.deinit();
+    try driveServerSelection(&server, .{ .sig_schemes = &.{ 0x0403, 0x0807 } });
+    try std.testing.expect(server.credentialFailure() == null);
+}
+
+test "no compatible signature algorithm fails with handshake_failure attribution" {
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .{ .record = .{ .alpn = "h2" } });
+    defer server.deinit();
+    var sink = DirectSink{};
+    defer sink.deinit();
+    try server.backend().start(.server, {}, &sink);
+    var buf: [1024]u8 = undefined;
+    // Peer offers only ECDSA; the Ed25519 fixed credential is incompatible.
+    const hello = try buildClientHello(&buf, .{ .sig_schemes = &.{0x0403} });
+    try std.testing.expectError(error.NoApplicableCredential, server.backend().receive(.initial, hello, &sink));
+    try std.testing.expectEqual(tls_backend.CredentialFailure.no_compatible_signature_algorithm, server.credentialFailure().?);
+    try std.testing.expectEqual(
+        tls_core.alerts.AlertDescription.handshake_failure,
+        server.credentialFailure().?.alert(),
+    );
+}
+
+test "no credential available fails deterministically and preserves the failure" {
+    var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
+    mock.force_select_error = error.NoCredentialAvailable;
+    var server = tls_backend.Tls13Backend.initServerWithProvider(serverEntropy(), mock.provider(), .{ .record = .{ .alpn = "h2" } });
+    defer server.deinit();
+    var sink = DirectSink{};
+    defer sink.deinit();
+    try server.backend().start(.server, {}, &sink);
+    var buf: [1024]u8 = undefined;
+    const hello = try buildClientHello(&buf, .{});
+    try std.testing.expectError(error.NoApplicableCredential, server.backend().receive(.initial, hello, &sink));
+    try std.testing.expectEqual(tls_backend.CredentialFailure.no_credential_available, server.credentialFailure().?);
+    try std.testing.expectEqual(@as(usize, 0), mock.sign_count);
+    try std.testing.expectEqual(@as(usize, 0), mock.release_count);
+    // Terminal cleanup preserves the underlying typed failure (#334).
+    server.deinit();
+    try std.testing.expectEqual(tls_backend.CredentialFailure.no_credential_available, server.credentialFailure().?);
+}
+
+test "an empty local credential chain is rejected before signing" {
+    var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
+    mock.empty_chain = true;
+    var server = tls_backend.Tls13Backend.initServerWithProvider(serverEntropy(), mock.provider(), .{ .record = .{ .alpn = "h2" } });
+    defer server.deinit();
+    var sink = DirectSink{};
+    defer sink.deinit();
+    try server.backend().start(.server, {}, &sink);
+    var buf: [1024]u8 = undefined;
+    const hello = try buildClientHello(&buf, .{});
+    try std.testing.expectError(error.CredentialProviderFailed, server.backend().receive(.initial, hello, &sink));
+    try std.testing.expectEqual(tls_backend.CredentialFailure.malformed_credential_chain, server.credentialFailure().?);
+    // The handle was released exactly once even on the failure path.
+    try std.testing.expectEqual(@as(usize, 1), mock.release_count);
+}
+
+test "a signing provider failure maps to internal_error and releases the handle" {
+    var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
+    mock.force_sign_error = error.SigningProviderFailure;
+    var server = tls_backend.Tls13Backend.initServerWithProvider(serverEntropy(), mock.provider(), .{ .record = .{ .alpn = "h2" } });
+    defer server.deinit();
+    var sink = DirectSink{};
+    defer sink.deinit();
+    try server.backend().start(.server, {}, &sink);
+    var buf: [1024]u8 = undefined;
+    const hello = try buildClientHello(&buf, .{});
+    try std.testing.expectError(error.CredentialProviderFailed, server.backend().receive(.initial, hello, &sink));
+    try std.testing.expectEqual(tls_backend.CredentialFailure.signing_provider_failure, server.credentialFailure().?);
+    try std.testing.expectEqual(@as(usize, 1), mock.sign_count);
+    try std.testing.expectEqual(@as(usize, 1), mock.release_count);
+}
+
+test "an over-length reported signature is caught as a provider contract violation" {
+    var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
+    mock.force_sign_len = 4096; // far beyond the engine's bounded scratch
+    var server = tls_backend.Tls13Backend.initServerWithProvider(serverEntropy(), mock.provider(), .{ .record = .{ .alpn = "h2" } });
+    defer server.deinit();
+    var sink = DirectSink{};
+    defer sink.deinit();
+    try server.backend().start(.server, {}, &sink);
+    var buf: [1024]u8 = undefined;
+    const hello = try buildClientHello(&buf, .{});
+    try std.testing.expectError(error.CredentialProviderFailed, server.backend().receive(.initial, hello, &sink));
+    try std.testing.expectEqual(tls_backend.CredentialFailure.invalid_callback_behavior, server.credentialFailure().?);
+}
+
+test "successful server handshake and peer verification through mock provider and verifier" {
+    var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
+    var verifier = credentials.MockVerifier.init(.accepted);
+    const h = try SocketHarness.create(.{
+        .server_provider = mock.provider(),
+        .client_verifier = verifier.verifier(),
+    });
+    defer h.destroy();
+
+    try h.driveUntil(SocketHarness.bothComplete);
+    try std.testing.expect(h.client.bridge.handshake_complete);
+    try std.testing.expect(h.server.bridge.handshake_complete);
+    // Exact lifetime transitions: one selection, one signature, one release,
+    // one verification.
+    try std.testing.expectEqual(@as(usize, 1), mock.select_count);
+    try std.testing.expectEqual(@as(usize, 1), mock.sign_count);
+    try std.testing.expectEqual(@as(usize, 1), mock.release_count);
+    try std.testing.expectEqual(@as(usize, 1), verifier.verify_count);
+    try std.testing.expectEqual(@as(usize, 1), verifier.last_chain_len);
+    try std.testing.expectEqual(events.CertificateState.valid, h.client.certificateState());
+}
+
+test "peer verifier rejection fails the client as a peer authentication failure" {
+    var verifier = credentials.MockVerifier.init(.rejected);
+    const h = try SocketHarness.create(.{ .client_verifier = verifier.verifier() });
+    defer h.destroy();
+
+    const failures = driveUntilBothErrors(h);
+    try std.testing.expectEqual(@as(?anyerror, error.CertificateInvalid), failures.client);
+    try std.testing.expect(!h.client.bridge.handshake_complete);
+    try std.testing.expectEqual(tls_backend.CredentialFailure.peer_verification_rejected, h.client_engine.credentialFailure().?);
+    try std.testing.expectEqual(@as(usize, 1), verifier.verify_count);
+}
+
+test "a peer verifier internal failure is a local fault, not a peer rejection" {
+    var verifier = credentials.MockVerifier.init(error.VerifierInternalFailure);
+    const h = try SocketHarness.create(.{ .client_verifier = verifier.verifier() });
+    defer h.destroy();
+
+    const failures = driveUntilBothErrors(h);
+    try std.testing.expectEqual(@as(?anyerror, error.CredentialProviderFailed), failures.client);
+    try std.testing.expectEqual(tls_backend.CredentialFailure.verifier_internal_failure, h.client_engine.credentialFailure().?);
+    try std.testing.expectEqual(
+        tls_core.alerts.AlertDescription.internal_error,
+        h.client_engine.credentialFailure().?.alert(),
+    );
+}
+
+test "a bad CertificateVerify signature fails proof of possession at the client" {
+    var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
+    mock.flip_signature = true;
+    const h = try SocketHarness.create(.{ .server_provider = mock.provider() });
+    defer h.destroy();
+
+    const failures = driveUntilBothErrors(h);
+    try std.testing.expectEqual(@as(?anyerror, error.CertificateInvalid), failures.client);
+    try std.testing.expect(!h.client.bridge.handshake_complete);
+    try std.testing.expectEqual(tls_backend.CredentialFailure.invalid_peer_certificate_chain, h.client_engine.credentialFailure().?);
+}
+
+test "the fixed provider replaces the previous hard-coded identity with no engine change" {
+    // The default harness uses initServer(fixtureIdentity) -> the fixed
+    // provider, driving the same engine path a mock or external provider does.
+    const h = try SocketHarness.create(.{});
+    defer h.destroy();
+    try h.driveUntil(SocketHarness.bothComplete);
+    try std.testing.expect(h.client.bridge.handshake_complete);
+    try std.testing.expect(h.server.bridge.handshake_complete);
+    try std.testing.expectEqual(events.CertificateState.valid, h.client.certificateState());
+    // No credential failure was latched on the success path.
+    try std.testing.expect(h.server_engine.credentialFailure() == null);
+    try std.testing.expect(h.client_engine.credentialFailure() == null);
+}
+
+test "provider and verifier mocks under allocation failure clean up" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
+            var verifier = credentials.MockVerifier.init(.accepted);
+            const harness = try SocketHarness.createWithAllocator(allocator, .{
+                .server_provider = mock.provider(),
+                .client_verifier = verifier.verifier(),
+            });
+            harness.destroy();
+        }
+    }.run, .{});
 }

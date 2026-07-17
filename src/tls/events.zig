@@ -55,6 +55,17 @@ pub const HandshakeError = error{
     SecretExportFailed,
     /// A local caller attempted an invalid handshake lifecycle transition.
     InvalidHandshakeState,
+    /// This side cannot authenticate itself for the negotiated parameters: no
+    /// local credential is available, or none is compatible with the peer's
+    /// offered signature algorithms. A *local* configuration/selection failure,
+    /// distinct from a peer-certificate rejection (`CertificateInvalid`). Maps
+    /// to the `handshake_failure` alert (RFC 8446 §4.4.2.2).
+    NoApplicableCredential,
+    /// A local credential provider, signer, or peer verifier failed
+    /// deterministically (malformed local chain, signing fault, output
+    /// overflow, verifier internal error, or an invalid callback contract).
+    /// Our own fault, never the peer's — maps to the `internal_error` alert.
+    CredentialProviderFailed,
 };
 
 pub const Event = union(enum) {

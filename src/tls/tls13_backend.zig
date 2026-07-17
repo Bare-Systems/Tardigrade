@@ -18,6 +18,7 @@
 
 const std = @import("std");
 const events = @import("events.zig");
+const credentials = @import("credentials.zig");
 const tls_handshake_codec = @import("handshake.zig");
 const tls_key_schedule = @import("key_schedule.zig");
 const tls_state = @import("state.zig");
@@ -44,6 +45,11 @@ pub const hash_len = tls_key_schedule.hash_len;
 /// single-certificate Ed25519 flight is far below this).
 pub const max_message_len = 8 * 1024;
 pub const max_certificate_len = 2048;
+/// Caller-owned bound on a CertificateVerify signature. The engine hands the
+/// signing provider a buffer this size; a provider whose signature would not
+/// fit reports overflow rather than exceeding the bound (#334). Comfortably
+/// above Ed25519 (64) and DER-encoded ECDSA P-256 (~72).
+pub const max_signature_len = 256;
 
 const tls13_version: u16 = 0x0304;
 const legacy_version: u16 = 0x0303;
@@ -52,6 +58,7 @@ const group_x25519: u16 = 0x001d;
 const sigalg_ed25519: u16 = 0x0807;
 const sigalg_ecdsa_secp256r1_sha256: u16 = 0x0403;
 
+const ext_server_name: u16 = 0;
 const ext_supported_groups: u16 = 10;
 const ext_signature_algorithms: u16 = 13;
 const ext_alpn: u16 = 16;
@@ -159,155 +166,27 @@ const ExtensionGuard = struct {
 // Server identity and client trust.
 // ===========================================================================
 
-/// The server's certificate and signing key: Ed25519 (RFC 8410) or ECDSA
-/// P-256 (RFC 5915/5480). `initPkcs8` loads standard PKCS#8 DER as produced
-/// by `openssl genpkey -algorithm ed25519` or
-/// `openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256`. Two key
-/// types because deployed TLS stacks disagree on defaults: GnuTLS/OpenSSL
-/// accept Ed25519 out of the box while BoringSSL's default verifier
-/// (quiche/Chromium) requires ECDSA/RSA — P-256 is the interoperable floor.
-pub const Identity = struct {
-    certificate_der: []const u8,
-    key: Key,
+/// The provider-neutral credential and verification contracts live in
+/// `credentials.zig` (#334). The fixed server identity and pin/insecure trust
+/// are re-exported here for callers and served through the same contract the
+/// engine uses for any provider — there is a single authentication path.
+pub const Identity = credentials.Identity;
+pub const Trust = credentials.Trust;
+pub const CredentialProvider = credentials.CredentialProvider;
+pub const PeerVerifier = credentials.PeerVerifier;
+pub const SelectionContext = credentials.SelectionContext;
+pub const VerificationContext = credentials.VerificationContext;
+pub const CredentialFailure = credentials.FailureClass;
 
-    pub const Key = union(enum) {
-        ed25519: Ed25519.KeyPair,
-        ecdsa_p256: EcdsaP256.KeyPair,
-    };
-
-    pub const InitError = error{InvalidPrivateKey};
-
-    pub fn initPkcs8(certificate_der: []const u8, pkcs8_key_der: []const u8) InitError!Identity {
-        if (ed25519SeedFromPkcs8(pkcs8_key_der)) |seed| {
-            const key_pair = Ed25519.KeyPair.generateDeterministic(seed) catch return error.InvalidPrivateKey;
-            return .{ .certificate_der = certificate_der, .key = .{ .ed25519 = key_pair } };
-        } else |_| {}
-        const scalar = try ecdsaP256KeyFromPkcs8(pkcs8_key_der);
-        const secret = EcdsaP256.SecretKey.fromBytes(scalar) catch return error.InvalidPrivateKey;
-        const key_pair = EcdsaP256.KeyPair.fromSecretKey(secret) catch return error.InvalidPrivateKey;
-        return .{ .certificate_der = certificate_der, .key = .{ .ecdsa_p256 = key_pair } };
-    }
-
-    /// The TLS SignatureScheme this identity signs CertificateVerify with.
-    pub fn signatureAlgorithm(self: *const Identity) u16 {
-        return switch (self.key) {
-            .ed25519 => sigalg_ed25519,
-            .ecdsa_p256 => sigalg_ecdsa_secp256r1_sha256,
-        };
-    }
-
-    /// Extract the P-256 private scalar from PKCS#8 DER (RFC 5915 inside
-    /// RFC 5958): SEQUENCE { INTEGER 0, SEQUENCE { OID id-ecPublicKey, OID
-    /// prime256v1 }, OCTET STRING { SEQUENCE { INTEGER 1, OCTET STRING(32)
-    /// privateKey, ... } } }. Bounded, no allocation.
-    fn ecdsaP256KeyFromPkcs8(der: []const u8) InitError![32]u8 {
-        const oid_ec_public_key = [_]u8{ 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01 };
-        const oid_prime256v1 = [_]u8{ 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07 };
-        var walker = DerWalker{ .bytes = der };
-        var outer = try walker.sequence();
-        // Both encodings openssl produces: PKCS#8 (RFC 5958, version 0)
-        // wrapping ECPrivateKey, or a bare SEC1/RFC 5915 ECPrivateKey
-        // (version 1) as written by `openssl pkey -outform DER`.
-        var probe = outer;
-        const version = try probe.integer();
-        if (version == 1) {
-            return ecPrivateKeyScalar(&outer);
-        }
-        try outer.expectInteger(0);
-        var alg = try outer.sequence();
-        try alg.expectBytes(&oid_ec_public_key);
-        try alg.expectBytes(&oid_prime256v1);
-        const key_octets = try outer.octetString();
-        var inner_walker = DerWalker{ .bytes = key_octets };
-        var ec_key = try inner_walker.sequence();
-        return ecPrivateKeyScalar(&ec_key);
-    }
-
-    /// RFC 5915 ECPrivateKey body: INTEGER 1, OCTET STRING privateKey, ...
-    fn ecPrivateKeyScalar(ec_key: *DerWalker) InitError![32]u8 {
-        try ec_key.expectInteger(1);
-        const scalar = try ec_key.octetString();
-        if (scalar.len != 32) return error.InvalidPrivateKey;
-        return scalar[0..32].*;
-    }
-
-    const DerWalker = struct {
-        bytes: []const u8,
-        pos: usize = 0,
-
-        fn tagged(self: *DerWalker, tag: u8) InitError![]const u8 {
-            if (self.pos + 2 > self.bytes.len) return error.InvalidPrivateKey;
-            if (self.bytes[self.pos] != tag) return error.InvalidPrivateKey;
-            var len: usize = self.bytes[self.pos + 1];
-            var header: usize = 2;
-            if (len == 0x81) {
-                if (self.pos + 3 > self.bytes.len) return error.InvalidPrivateKey;
-                len = self.bytes[self.pos + 2];
-                header = 3;
-            } else if (len == 0x82) {
-                if (self.pos + 4 > self.bytes.len) return error.InvalidPrivateKey;
-                len = (@as(usize, self.bytes[self.pos + 2]) << 8) | self.bytes[self.pos + 3];
-                header = 4;
-            } else if (len > 0x80) {
-                return error.InvalidPrivateKey;
-            }
-            if (self.pos + header + len > self.bytes.len) return error.InvalidPrivateKey;
-            const content = self.bytes[self.pos + header ..][0..len];
-            self.pos += header + len;
-            return content;
-        }
-
-        fn sequence(self: *DerWalker) InitError!DerWalker {
-            return .{ .bytes = try self.tagged(0x30) };
-        }
-
-        fn octetString(self: *DerWalker) InitError![]const u8 {
-            return self.tagged(0x04);
-        }
-
-        fn integer(self: *DerWalker) InitError!u8 {
-            const content = try self.tagged(0x02);
-            if (content.len != 1) return error.InvalidPrivateKey;
-            return content[0];
-        }
-
-        fn expectInteger(self: *DerWalker, value: u8) InitError!void {
-            if (try self.integer() != value) return error.InvalidPrivateKey;
-        }
-
-        fn expectBytes(self: *DerWalker, expected: []const u8) InitError!void {
-            if (self.pos + expected.len > self.bytes.len) return error.InvalidPrivateKey;
-            if (!std.mem.eql(u8, self.bytes[self.pos..][0..expected.len], expected)) return error.InvalidPrivateKey;
-            self.pos += expected.len;
-        }
-    };
-
-    /// Extract the 32-byte Ed25519 seed from a PKCS#8 `OneAsymmetricKey` DER
-    /// (RFC 8410 §7): SEQUENCE { version 0, AlgorithmIdentifier id-Ed25519,
-    /// privateKey OCTET STRING { OCTET STRING(32) } }.
-    fn ed25519SeedFromPkcs8(der: []const u8) InitError![Ed25519.KeyPair.seed_length]u8 {
-        const prefix = [_]u8{
-            0x30, 0x2e, // SEQUENCE, 46 bytes
-            0x02, 0x01, 0x00, // INTEGER version 0
-            0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, // AlgorithmIdentifier { 1.3.101.112 }
-            0x04, 0x22, 0x04, 0x20, // OCTET STRING { OCTET STRING (32 bytes) }
-        };
-        if (der.len != prefix.len + Ed25519.KeyPair.seed_length) return error.InvalidPrivateKey;
-        if (!std.mem.eql(u8, der[0..prefix.len], &prefix)) return error.InvalidPrivateKey;
-        return der[prefix.len..][0..Ed25519.KeyPair.seed_length].*;
-    }
-};
-
-/// How the client decides the server certificate's validity. Web-PKI chain
-/// building is a follow-up; the deterministic modes below cover local
-/// handshakes, tests, and deployment pinning.
-pub const Trust = union(enum) {
-    /// The presented leaf must byte-equal this DER certificate.
-    pinned_certificate: []const u8,
-    /// Report `not_checked`; completes only when the driver explicitly opts
-    /// into `allow_unverified_certificate`.
-    insecure_no_verification,
-};
+/// Largest peer certificate chain (total DER bytes and entry count) the engine
+/// reassembles and surfaces to a `PeerVerifier` as immutable views.
+pub const max_peer_chain_bytes = 8 * 1024;
+pub const max_peer_chain_entries = credentials.max_chain_entries;
+/// Largest set of peer-offered signature schemes captured for selection.
+const max_peer_sig_schemes = 16;
+/// Largest SNI host_name captured for selection (RFC 6066 caps names well
+/// under this).
+const max_server_name_len = 256;
 
 /// Caller-supplied entropy for one handshake, consistent with the rest of
 /// `src/quic/` where unpredictable bytes always come from the caller.
@@ -327,6 +206,24 @@ pub const Tls13Backend = struct {
     identity: Identity = undefined,
     identity_present: bool = false,
     trust: Trust = .insecure_no_verification,
+    /// An externally supplied credential provider (server) / peer verifier
+    /// (client or server). When set, it overrides the fixed identity/trust; the
+    /// vtable's `ctx` points to caller-owned storage that must outlive the
+    /// handshake. When null, the engine wraps the fixed identity/trust in the
+    /// same production contract, so there is one authentication path.
+    external_provider: ?CredentialProvider = null,
+    external_verifier: ?PeerVerifier = null,
+    /// The last typed credential/verification failure. Set on failure and
+    /// deliberately preserved across `deinit` (it is diagnostic, not secret) so
+    /// terminal cleanup does not erase the underlying reason (#334).
+    credential_failure: ?CredentialFailure = null,
+    /// Peer-offered signature schemes and SNI captured from ClientHello, passed
+    /// immutably into credential selection.
+    peer_sig_schemes: [max_peer_sig_schemes]u16 = undefined,
+    peer_sig_scheme_count: usize = 0,
+    server_name: [max_server_name_len]u8 = undefined,
+    server_name_len: usize = 0,
+    server_name_present: bool = false,
     peer_transport_extension: [max_transport_extension_len]u8 = undefined,
     peer_transport_extension_len: usize = 0,
     peer_transport_extension_pending: bool = false,
@@ -346,9 +243,14 @@ pub const Tls13Backend = struct {
     initial_input: tls_handshake_codec.Reassembler(max_message_len + 4) = .{},
     handshake_input: tls_handshake_codec.Reassembler(max_message_len + 4) = .{},
     application_input: tls_handshake_codec.Reassembler(max_message_len + 4) = .{},
-    /// The peer's leaf certificate (client role), kept for CertificateVerify.
-    peer_certificate: [max_certificate_len]u8 = undefined,
-    peer_certificate_len: usize = 0,
+    /// The peer's reassembled certificate chain (immutable DER, surfaced to the
+    /// verifier as views). `entries` index into `peer_chain`.
+    peer_chain: [max_peer_chain_bytes]u8 = undefined,
+    peer_chain_entries: [max_peer_chain_entries]Slice = undefined,
+    peer_chain_count: usize = 0,
+    peer_chain_len: usize = 0,
+
+    const Slice = struct { start: usize, len: usize };
 
     /// Allocation-free. The returned backend owns its copied entropy until
     /// `deinit`, which securely clears all private material.
@@ -357,7 +259,9 @@ pub const Tls13Backend = struct {
     }
 
     /// Allocation-free. The returned backend owns its copy of `identity` and
-    /// securely clears the private signing key in `deinit`.
+    /// securely clears the private signing key in `deinit`. The fixed identity
+    /// is served to the engine through the production `CredentialProvider`
+    /// contract, identical to an external provider.
     pub fn initServer(entropy: Entropy, identity: Identity, profile: TransportProfile) Tls13Backend {
         return .{
             .role = .server,
@@ -366,6 +270,32 @@ pub const Tls13Backend = struct {
             .identity = identity,
             .identity_present = true,
             .core = tls_handshake_codec.Core.init(.server),
+        };
+    }
+
+    /// Server construction against an external credential provider (SNI
+    /// selector, external/asynchronous signer, ...). The provider's storage
+    /// must outlive the handshake. No fixed identity is held.
+    pub fn initServerWithProvider(entropy: Entropy, provider: CredentialProvider, profile: TransportProfile) Tls13Backend {
+        return .{
+            .role = .server,
+            .profile = profile,
+            .entropy = entropy,
+            .external_provider = provider,
+            .core = tls_handshake_codec.Core.init(.server),
+        };
+    }
+
+    /// Client construction against an external peer verifier (#324 Web-PKI, a
+    /// custom trust store, ...). The verifier's storage must outlive the
+    /// handshake.
+    pub fn initClientWithVerifier(entropy: Entropy, verifier: PeerVerifier, profile: TransportProfile) Tls13Backend {
+        return .{
+            .role = .client,
+            .profile = profile,
+            .entropy = entropy,
+            .external_verifier = verifier,
+            .core = tls_handshake_codec.Core.init(.client),
         };
     }
 
@@ -392,6 +322,20 @@ pub const Tls13Backend = struct {
         self.profile = profile;
     }
 
+    /// The typed credential/verification failure this handshake latched, if
+    /// any. Survives `deinit` so a failed handshake's reason stays queryable.
+    pub fn credentialFailure(self: *const Tls13Backend) ?CredentialFailure {
+        return self.credential_failure;
+    }
+
+    /// Record a typed failure, mark the core failed, and return the engine-level
+    /// error whose alert mapping matches the failure's origin (#334).
+    fn failCredential(self: *Tls13Backend, class: CredentialFailure) HandshakeError {
+        self.credential_failure = class;
+        self.core.handshake_lifecycle = .failed;
+        return class.engineError();
+    }
+
     /// Returns a newly received opaque transport extension once. The caller
     /// must consume/copy it before the next backend call.
     pub fn takePeerTransportExtension(self: *Tls13Backend) ?[]const u8 {
@@ -411,8 +355,19 @@ pub const Tls13Backend = struct {
         crypto.secureZero(u8, &self.expected_client_verify);
         self.wipeEphemeral();
         self.wipeIdentity();
-        crypto.secureZero(u8, &self.peer_certificate);
-        self.peer_certificate_len = 0;
+        crypto.secureZero(u8, &self.peer_chain);
+        self.peer_chain_count = 0;
+        self.peer_chain_len = 0;
+        crypto.secureZero(u8, std.mem.asBytes(&self.peer_sig_schemes));
+        self.peer_sig_scheme_count = 0;
+        crypto.secureZero(u8, &self.server_name);
+        self.server_name_len = 0;
+        self.server_name_present = false;
+        // `credential_failure` is intentionally *not* cleared: terminal cleanup
+        // must preserve the underlying typed failure (#334). The external
+        // provider/verifier vtables borrow caller storage; drop the references.
+        self.external_provider = null;
+        self.external_verifier = null;
         crypto.secureZero(u8, &self.peer_transport_extension);
         self.peer_transport_extension_len = 0;
         self.peer_transport_extension_pending = false;
@@ -506,6 +461,10 @@ pub const Tls13Backend = struct {
             error.CertificateInvalid => error.CertificateInvalid,
             error.SecretExportFailed => error.SecretExportFailed,
             error.InvalidHandshakeState => error.InvalidHandshakeState,
+            // Surfaced only by this backend's credential/verification path, not
+            // the codec core, but they are part of the shared error set.
+            error.NoApplicableCredential => error.NoApplicableCredential,
+            error.CredentialProviderFailed => error.CredentialProviderFailed,
         };
     }
 
@@ -732,19 +691,72 @@ pub const Tls13Backend = struct {
         var list = Reader{ .bytes = try r.slice(try r.u24_()) };
         try r.expectEnd();
 
+        // Reassemble the full chain into engine-owned storage. The verifier
+        // later sees each entry as an immutable DER view into `peer_chain`; the
+        // leaf (entry 0) additionally anchors proof-of-possession. Bounds keep
+        // a hostile peer from exhausting memory.
+        self.peer_chain_count = 0;
+        self.peer_chain_len = 0;
         const leaf_len = try list.u24_();
         if (leaf_len == 0 or leaf_len > max_certificate_len) return error.CertificateInvalid;
-        const leaf = try list.slice(leaf_len);
+        try self.appendPeerCertificate(try list.slice(leaf_len));
         _ = try list.slice(try list.u16_()); // leaf extensions
-        // Validate the framing of any additional chain certificates; the trust
-        // decision here is pin-based, so only the leaf is retained.
         while (list.remaining() > 0) {
-            _ = try list.slice(try list.u24_());
-            _ = try list.slice(try list.u16_());
+            const entry = try list.slice(try list.u24_());
+            _ = try list.slice(try list.u16_()); // per-certificate extensions
+            // Additional chain certificates beyond our bound are framed-checked
+            // above but not retained; the leaf is what pinning verifies and a
+            // #324 verifier receives what fits.
+            self.appendPeerCertificate(entry) catch |err| switch (err) {
+                error.CertificateInvalid => {},
+                else => return err,
+            };
         }
+    }
 
-        @memcpy(self.peer_certificate[0..leaf.len], leaf);
-        self.peer_certificate_len = leaf.len;
+    /// Copy one peer DER certificate into the bounded chain storage, recording
+    /// its view. Returns `CertificateInvalid` when the entry or the chain would
+    /// exceed the engine's bounds.
+    fn appendPeerCertificate(self: *Tls13Backend, der: []const u8) HandshakeError!void {
+        if (self.peer_chain_count >= self.peer_chain_entries.len) return error.CertificateInvalid;
+        if (self.peer_chain_len + der.len > self.peer_chain.len) return error.CertificateInvalid;
+        const start = self.peer_chain_len;
+        @memcpy(self.peer_chain[start..][0..der.len], der);
+        self.peer_chain_entries[self.peer_chain_count] = .{ .start = start, .len = der.len };
+        self.peer_chain_count += 1;
+        self.peer_chain_len += der.len;
+    }
+
+    /// Build the immutable peer chain view over engine storage into `out`. The
+    /// returned slices are valid only until `peer_chain` is next mutated or the
+    /// backend is torn down; a verifier must not retain them.
+    fn peerChainView(self: *const Tls13Backend, out: *[max_peer_chain_entries][]const u8) credentials.CertificateChain {
+        for (0..self.peer_chain_count) |i| {
+            const e = self.peer_chain_entries[i];
+            out[i] = self.peer_chain[e.start..][0..e.len];
+        }
+        return .{ .entries = out[0..self.peer_chain_count] };
+    }
+
+    fn serverSelectionContext(self: *const Tls13Backend) credentials.SelectionContext {
+        return .{
+            .role = .server,
+            .server_name = if (self.server_name_present) self.server_name[0..self.server_name_len] else null,
+            .peer_signature_schemes = self.peer_sig_schemes[0..self.peer_sig_scheme_count],
+            .negotiated_version = tls13_version,
+            .cipher_suite = cipher_tls_aes_128_gcm_sha256,
+            .application_protocol = self.alpn(),
+            .auth_policy = self.authPolicy(),
+        };
+    }
+
+    fn authPolicy(self: *const Tls13Backend) credentials.AuthPolicy {
+        return .{
+            .allow_unverified_peer = switch (self.trust) {
+                .insecure_no_verification => true,
+                .pinned_certificate => false,
+            },
+        };
     }
 
     fn onCertificateVerify(self: *Tls13Backend, transcript_before: [hash_len]u8, body: []const u8, sink: *EventSink) HandshakeError!void {
@@ -754,48 +766,75 @@ pub const Tls13Backend = struct {
         try r.expectEnd();
 
         // The signature covers the transcript through Certificate (RFC 8446
-        // §4.4.3) — before this message is added.
+        // §4.4.3) — before this message is added. Proof of key possession is
+        // transcript crypto, not PKI policy, so it stays in the engine; a
+        // failure is peer-originated (bad_certificate).
         const content = certificateVerifyContent(.server, transcript_before);
-        const state = self.verifyServerCertificate(algorithm, signature, content.slice());
-        try sink.emitCertificate(state);
-        if (state == .invalid) {
-            self.core.handshake_lifecycle = .failed;
-            return error.CertificateInvalid;
+        if (!self.checkProofOfPossession(algorithm, signature, content.slice())) {
+            try sink.emitCertificate(.invalid);
+            return self.failCredential(.invalid_peer_certificate_chain);
         }
+
+        // Delegate the trust verdict to the peer verifier — the fixed pin/
+        // insecure policy or an external #324 Web-PKI verifier — over immutable
+        // DER views it must not retain.
+        var views: [max_peer_chain_entries][]const u8 = undefined;
+        var verifier_storage: credentials.FixedVerifier = undefined;
+        const verifier = if (self.external_verifier) |v| v else blk: {
+            verifier_storage = credentials.FixedVerifier.init(self.trust);
+            break :blk verifier_storage.verifier();
+        };
+        const context = credentials.VerificationContext{
+            .role = .client,
+            .server_name = null,
+            .chain = self.peerChainView(&views),
+            .negotiated_version = tls13_version,
+            .cipher_suite = cipher_tls_aes_128_gcm_sha256,
+            .application_protocol = self.alpn(),
+            .auth_policy = self.authPolicy(),
+        };
+        const verdict = verifier.verifyPeer(&context) catch |err|
+            return self.failCredential(credentials.classifyVerifyError(err));
+        const state: CertificateState = switch (verdict) {
+            .accepted => .valid,
+            .not_checked => .not_checked,
+            .rejected => .invalid,
+        };
+        try sink.emitCertificate(state);
+        if (state == .invalid) return self.failCredential(.peer_verification_rejected);
     }
 
-    fn verifyServerCertificate(self: *Tls13Backend, algorithm: u16, signature: []const u8, content: []const u8) CertificateState {
-        const leaf = self.peer_certificate[0..self.peer_certificate_len];
-
-        // Proof of key possession: the CertificateVerify signature must check
-        // out against the certificate's public key in every trust mode.
-        const parsed = (Certificate{ .buffer = leaf, .index = 0 }).parse() catch return .invalid;
+    /// Verify the CertificateVerify signature against the peer leaf's public
+    /// key: proof that the peer holds the private key for the presented
+    /// certificate. Returns false on any mismatch. This is not a trust decision
+    /// — that is the verifier's job.
+    fn checkProofOfPossession(self: *const Tls13Backend, algorithm: u16, signature: []const u8, content: []const u8) bool {
+        if (self.peer_chain_count == 0) return false;
+        const e = self.peer_chain_entries[0];
+        const leaf = self.peer_chain[e.start..][0..e.len];
+        const parsed = (Certificate{ .buffer = leaf, .index = 0 }).parse() catch return false;
         switch (algorithm) {
             sigalg_ed25519 => {
-                if (signature.len != Ed25519.Signature.encoded_length) return .invalid;
-                if (parsed.pub_key_algo != .curveEd25519) return .invalid;
+                if (signature.len != Ed25519.Signature.encoded_length) return false;
+                if (parsed.pub_key_algo != .curveEd25519) return false;
                 const pub_key_bytes = parsed.pubKey();
-                if (pub_key_bytes.len != Ed25519.PublicKey.encoded_length) return .invalid;
-                const public_key = Ed25519.PublicKey.fromBytes(pub_key_bytes[0..Ed25519.PublicKey.encoded_length].*) catch return .invalid;
+                if (pub_key_bytes.len != Ed25519.PublicKey.encoded_length) return false;
+                const public_key = Ed25519.PublicKey.fromBytes(pub_key_bytes[0..Ed25519.PublicKey.encoded_length].*) catch return false;
                 const sig = Ed25519.Signature.fromBytes(signature[0..Ed25519.Signature.encoded_length].*);
-                sig.verify(content, public_key) catch return .invalid;
+                sig.verify(content, public_key) catch return false;
             },
             sigalg_ecdsa_secp256r1_sha256 => {
                 switch (parsed.pub_key_algo) {
-                    .X9_62_id_ecPublicKey => |curve| if (curve != .X9_62_prime256v1) return .invalid,
-                    else => return .invalid,
+                    .X9_62_id_ecPublicKey => |curve| if (curve != .X9_62_prime256v1) return false,
+                    else => return false,
                 }
-                const public_key = EcdsaP256.PublicKey.fromSec1(parsed.pubKey()) catch return .invalid;
-                const sig = EcdsaP256.Signature.fromDer(signature) catch return .invalid;
-                sig.verify(content, public_key) catch return .invalid;
+                const public_key = EcdsaP256.PublicKey.fromSec1(parsed.pubKey()) catch return false;
+                const sig = EcdsaP256.Signature.fromDer(signature) catch return false;
+                sig.verify(content, public_key) catch return false;
             },
-            else => return .invalid,
+            else => return false,
         }
-
-        return switch (self.trust) {
-            .pinned_certificate => |pin| if (std.mem.eql(u8, leaf, pin)) .valid else .invalid,
-            .insecure_no_verification => .not_checked,
-        };
+        return true;
     }
 
     fn onServerFinished(self: *Tls13Backend, transcript_before: [hash_len]u8, body: []const u8, sink: *EventSink) HandshakeError!void {
@@ -854,11 +893,15 @@ pub const Tls13Backend = struct {
         }
         if (!offers_cipher or !offers_null_compression) return error.MalformedHandshake;
 
-        if (!self.identity_present) return error.InvalidHandshakeState;
-        const required_sigalg = self.identity.signatureAlgorithm();
+        // A server needs a credential source: the fixed identity or an external
+        // provider. Which signature scheme is usable is decided later by
+        // credential selection against the peer's advertised algorithms.
+        if (!self.identity_present and self.external_provider == null) return error.InvalidHandshakeState;
+        self.peer_sig_scheme_count = 0;
+        self.server_name_present = false;
+        self.server_name_len = 0;
         var offers_tls13 = false;
         var offers_x25519_group = false;
-        var offers_our_sigalg = false;
         var peer_share: ?[X25519.public_length]u8 = null;
         var alpn_match = false;
         var first_alpn: []const u8 = "";
@@ -888,7 +931,27 @@ pub const Tls13Backend = struct {
                 ext_signature_algorithms => {
                     var algorithms = Reader{ .bytes = try ext.slice(try ext.u16_()) };
                     while (algorithms.remaining() > 0) {
-                        if (try algorithms.u16_() == required_sigalg) offers_our_sigalg = true;
+                        const scheme = try algorithms.u16_();
+                        // Capture the peer's offers (in order) for credential
+                        // selection; ignore any past our bounded capacity.
+                        if (self.peer_sig_scheme_count < self.peer_sig_schemes.len) {
+                            self.peer_sig_schemes[self.peer_sig_scheme_count] = scheme;
+                            self.peer_sig_scheme_count += 1;
+                        }
+                    }
+                },
+                ext_server_name => {
+                    // RFC 6066 §3: ServerNameList<1..>, each { name_type, name<..> }.
+                    // Preserve the first host_name (type 0) exactly as received.
+                    var names = Reader{ .bytes = try ext.slice(try ext.u16_()) };
+                    while (names.remaining() > 0) {
+                        const name_type = try names.u8_();
+                        const name = try names.slice(try names.u16_());
+                        if (name_type == 0 and !self.server_name_present and name.len <= self.server_name.len) {
+                            @memcpy(self.server_name[0..name.len], name);
+                            self.server_name_len = name.len;
+                            self.server_name_present = true;
+                        }
                     }
                 },
                 ext_key_share => {
@@ -917,7 +980,7 @@ pub const Tls13Backend = struct {
                 },
             }
         }
-        if (!offers_tls13 or !offers_x25519_group or !offers_our_sigalg) return error.MalformedHandshake;
+        if (!offers_tls13 or !offers_x25519_group) return error.MalformedHandshake;
         const client_share = peer_share orelse return error.MalformedHandshake;
 
         // Validate the peer share before emitting anything: X25519.scalarmult
@@ -983,9 +1046,34 @@ pub const Tls13Backend = struct {
     /// EncryptedExtensions + Certificate + CertificateVerify + Finished at the
     /// Handshake level, followed by the 1-RTT secrets.
     fn sendServerFlight(self: *Tls13Backend, sink: *EventSink) HandshakeError!void {
-        if (!self.identity_present) return error.InvalidHandshakeState;
-        const identity = &self.identity;
         const schedule = &self.schedule.?;
+
+        // Resolve the credential provider — an external one, or the fixed
+        // identity wrapped in the identical production contract — and select a
+        // credential for the negotiated parameters. There is one path.
+        var fixed_provider: credentials.FixedCredentialProvider = undefined;
+        var using_fixed = false;
+        const provider = if (self.external_provider) |p| p else blk: {
+            if (!self.identity_present) return self.failCredential(.no_credential_available);
+            fixed_provider = credentials.FixedCredentialProvider.init(self.identity);
+            using_fixed = true;
+            break :blk fixed_provider.provider();
+        };
+        // Wipe the fixed key material (stack copy and stored identity) on the
+        // way out, whatever the outcome.
+        defer if (using_fixed) {
+            fixed_provider.deinit();
+            self.wipeIdentity();
+        };
+
+        var selection = self.serverSelectionContext();
+        var credential: credentials.SelectedCredential = undefined;
+        provider.selectCredential(&selection, &credential) catch |err|
+            return self.failCredential(credentials.classifySelectError(err));
+        // The selected handle is released exactly once — after the flight is
+        // signed, or immediately on any failure below (cancellation included).
+        defer credential.release();
+
         var buf: [max_message_len]u8 = undefined;
         var w = Writer{ .buf = &buf };
 
@@ -1012,47 +1100,45 @@ pub const Tls13Backend = struct {
         w.patch(3, ee_len);
         const encrypted_extensions = buf[0..w.len];
 
-        // Certificate.
+        // Certificate: the selected credential's public DER chain. The views
+        // are borrowed for this call only and never retained past it.
+        const chain = credential.certificateChain();
+        if (chain.count() == 0) return self.failCredential(.malformed_credential_chain);
         const cert_start = w.len;
         try w.u8_(@intFromEnum(MessageType.certificate));
         const cert_len = try w.reserve(3);
         try w.u8_(0); // certificate_request_context
         const list_len = try w.reserve(3);
-        const entry_len = try w.reserve(3);
-        try w.bytes(identity.certificate_der);
-        w.patch(3, entry_len);
-        try w.u16_(0); // per-certificate extensions
+        for (chain.entries) |entry| {
+            if (entry.len == 0 or entry.len > max_certificate_len) return self.failCredential(.malformed_credential_chain);
+            const entry_len = try w.reserve(3);
+            try w.bytes(entry);
+            w.patch(3, entry_len);
+            try w.u16_(0); // per-certificate extensions
+        }
         w.patch(3, list_len);
         w.patch(3, cert_len);
         const certificate = buf[cert_start..w.len];
 
-        // CertificateVerify signs the transcript through Certificate.
+        // CertificateVerify signs the transcript through Certificate. Signing
+        // goes through the credential's opaque handle into a bounded, caller-
+        // owned scratch buffer; the private key never enters the engine.
         self.core.recordSent(encrypted_extensions) catch |err| return mapCoreError(err);
         self.core.recordSent(certificate) catch |err| return mapCoreError(err);
         const content = certificateVerifyContent(.server, self.core.transcriptHash());
         const verify_start = w.len;
         try w.u8_(@intFromEnum(MessageType.certificate_verify));
         const verify_len = try w.reserve(3);
-        try w.u16_(identity.signatureAlgorithm());
-        switch (identity.key) {
-            .ed25519 => {
-                const key_pair = &identity.key.ed25519;
-                const signature = key_pair.sign(content.slice(), null) catch
-                    return error.SecretExportFailed;
-                try w.u16_(Ed25519.Signature.encoded_length);
-                try w.bytes(&signature.toBytes());
-            },
-            .ecdsa_p256 => {
-                const key_pair = &identity.key.ecdsa_p256;
-                const signature = key_pair.sign(content.slice(), null) catch
-                    return error.SecretExportFailed;
-                var der_buf: [EcdsaP256.Signature.der_encoded_length_max]u8 = undefined;
-                const der = signature.toDer(&der_buf);
-                try w.u16_(@intCast(der.len));
-                try w.bytes(der);
-            },
-        }
-        self.wipeIdentity();
+        try w.u16_(credential.scheme.code());
+        const sig_len_slot = try w.reserve(2);
+        var sig_scratch: [max_signature_len]u8 = undefined;
+        // Signature scratch is transcript-derived, not secret key material, but
+        // wipe it after use as a matter of hygiene.
+        defer crypto.secureZero(u8, &sig_scratch);
+        const sig_written = credential.sign(content.slice(), &sig_scratch) catch |err|
+            return self.failCredential(credentials.classifySignError(err));
+        try w.bytes(sig_scratch[0..sig_written]);
+        w.patch(2, sig_len_slot);
         w.patch(3, verify_len);
         const certificate_verify = buf[verify_start..w.len];
         self.core.recordSent(certificate_verify) catch |err| return mapCoreError(err);
@@ -1176,41 +1262,9 @@ fn certificateVerifyContent(signer: Role, transcript_hash: [hash_len]u8) Certifi
     return content;
 }
 
-/// Deterministic local server identity (self-signed Ed25519,
-/// CN=tardigrade.test, valid to 2036; generated with openssl, see
-/// src/quic/testdata/). For unit tests and local smoke harnesses only — never
-/// a production identity.
-pub const testdata = struct {
-    const certificate_bytes = hexBytes(
-        "308201483081fba00302010202146c8bf2251dd4fceda024f44e82cbfaeaa9da082a300506032b6570031a3118301606035504030c0f746172646967726164652e74657374301e170d3236303731303033303535325a170d3336303730373033303535325a301a3118301606035504030c0f746172646967726164652e74657374302a300506032b65700321007487dbf1f35e41d63ee2c907330660439af5fa63ca7f70a9f1484c12f8d4666fa3533051301d0603551d0e0416041494fd70298293687f12c2f46d00fba451fd3c6143301f0603551d2304183016801494fd70298293687f12c2f46d00fba451fd3c6143300f0603551d130101ff040530030101ff300506032b657003410070eb127814436ca43322b688fd6643507d5c2346f7c176a155ddf5350db941acccefceb29f0ea66e9842159f2fece42b67d935b255f2a4224df68182b646e201",
-    );
-    const private_key_bytes = hexBytes(
-        "302e020100300506032b65700422042099132d0957fdbc8235285b25bd8dd5101d7941408adb068ded6de7ada191251f",
-    );
-
-    pub const certificate_der: []const u8 = &certificate_bytes;
-    pub const private_key_pkcs8_der: []const u8 = &private_key_bytes;
-};
-
-fn hexBytes(comptime hex: []const u8) [hex.len / 2]u8 {
-    var bytes: [hex.len / 2]u8 = undefined;
-    _ = std.fmt.hexToBytes(&bytes, hex) catch unreachable;
-    return bytes;
-}
-
-test "TLS-owned identity fixture loads without QUIC or OpenSSL" {
-    const identity = try Identity.initPkcs8(testdata.certificate_der, testdata.private_key_pkcs8_der);
-    const parsed = try (Certificate{ .buffer = testdata.certificate_der, .index = 0 }).parse();
-    try std.testing.expect(parsed.pub_key_algo == .curveEd25519);
-    try std.testing.expectEqualSlices(u8, parsed.pubKey(), &identity.key.ed25519.public_key.toBytes());
-}
-
-test "TLS-owned identity parser rejects malformed PKCS#8" {
-    try std.testing.expectError(
-        error.InvalidPrivateKey,
-        Identity.initPkcs8(testdata.certificate_der, testdata.private_key_pkcs8_der[0 .. testdata.private_key_pkcs8_der.len - 1]),
-    );
-}
+/// Deterministic local server identity fixture — see `credentials.testdata`.
+/// Re-exported here so existing callers and tests keep their spelling.
+pub const testdata = credentials.testdata;
 
 test "TLS-owned backend teardown clears transcript-adjacent and peer scratch" {
     var backend = Tls13Backend.initClient(
@@ -1220,16 +1274,19 @@ test "TLS-owned backend teardown clears transcript-adjacent and peer scratch" {
     );
     backend.core.transcript.update("transcript-adjacent state");
     @memset(&backend.expected_client_verify, 0xa5);
-    @memset(&backend.peer_certificate, 0x5a);
-    backend.peer_certificate_len = 32;
+    @memset(&backend.peer_chain, 0x5a);
+    backend.peer_chain_entries[0] = .{ .start = 0, .len = 32 };
+    backend.peer_chain_count = 1;
+    backend.peer_chain_len = 32;
     backend.deinit();
 
     try std.testing.expect(std.mem.allEqual(u8, &backend.expected_client_verify, 0));
-    try std.testing.expect(std.mem.allEqual(u8, &backend.peer_certificate, 0));
+    try std.testing.expect(std.mem.allEqual(u8, &backend.peer_chain, 0));
     try std.testing.expect(std.mem.allEqual(u8, &backend.entropy.key_share_seed, 0));
     try std.testing.expect(!backend.key_pair_present);
     try std.testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&backend.key_pair), 0));
-    try std.testing.expectEqual(@as(usize, 0), backend.peer_certificate_len);
+    try std.testing.expectEqual(@as(usize, 0), backend.peer_chain_count);
+    try std.testing.expectEqual(@as(usize, 0), backend.peer_chain_len);
     try std.testing.expectEqual(tls_handshake_codec.HandshakeLifecycle.failed, backend.core.handshake_lifecycle);
 }
 

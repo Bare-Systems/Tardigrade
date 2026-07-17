@@ -510,6 +510,7 @@ const RecordModeBackend = struct {
         const result = self.engine.backend().transport.start(role, dummy_params, &self.scratch);
         try translate(&self.scratch, sink);
         result catch |err| return mapError(err);
+        if (self.deferredPolicyError()) |err| return err;
     }
 
     fn receive(ptr: *anyopaque, epoch: events.EncryptionEpoch, bytes: []const u8, sink: *es.RecordTransport.EventSink) es.RecordHandshakeError!void {
@@ -518,6 +519,24 @@ const RecordModeBackend = struct {
         const result = self.engine.backend().transport.receive(toLevel(epoch), bytes, &self.scratch);
         try translate(&self.scratch, sink);
         result catch |err| return mapError(err);
+        if (self.deferredPolicyError()) |err| return err;
+    }
+
+    /// The concrete engine reports ALPN/certificate policy results as events and
+    /// marks its own core failed while returning success -- it expects its
+    /// driver to convert those into terminal errors (the QUIC driver does the
+    /// same via `AlpnMismatch`/`CertificateInvalid`). Surface that here so the
+    /// record handshake fails closed instead of stalling with the peer's
+    /// `Finished` still buffered and no further record ever arriving.
+    fn deferredPolicyError(self: *RecordModeBackend) ?es.RecordHandshakeError {
+        if (self.engine.core.handshake_lifecycle != .failed) return null;
+        for (self.scratch.items[0..self.scratch.len]) |event| {
+            if (event == .certificate and event.certificate == .invalid) return error.CertificateInvalid;
+        }
+        for (self.scratch.items[0..self.scratch.len]) |event| {
+            if (event == .alpn) return error.AlpnMismatch;
+        }
+        return error.UnexpectedHandshakeMessage;
     }
 
     /// Securely wipe the last batch's copied secrets from the private sink. The
@@ -694,6 +713,7 @@ const FdCarrier = struct {
 /// keep stable pointers.
 const SocketHarness = struct {
     fds: [2]std.posix.fd_t,
+    fds_closed: [2]bool,
     client_engine: tls_backend.Tls13Backend,
     server_engine: tls_backend.Tls13Backend,
     client_wrapper: RecordModeBackend = undefined,
@@ -703,24 +723,45 @@ const SocketHarness = struct {
     client: es.PureZigRecordStream = undefined,
     server: es.PureZigRecordStream = undefined,
 
-    fn create(client_chunk: usize, server_chunk: usize) !*SocketHarness {
+    const Options = struct {
+        client_chunk: usize = std.math.maxInt(usize),
+        server_chunk: usize = std.math.maxInt(usize),
+        client_trust: tls_backend.Trust = .{ .pinned_certificate = tls_backend.testdata.certificate_der },
+        client_alpn: []const u8 = "h3",
+        server_alpn: []const u8 = "h3",
+    };
+
+    fn create(opts: Options) !*SocketHarness {
         const self = try std.testing.allocator.create(SocketHarness);
         errdefer std.testing.allocator.destroy(self);
         self.fds = try testSocketPair();
+        self.fds_closed = .{ false, false };
 
-        self.client_engine = tls_backend.Tls13Backend.initClient(clientEntropy(), .{ .pinned_certificate = tls_backend.testdata.certificate_der });
+        self.client_engine = tls_backend.Tls13Backend.initClient(clientEntropy(), opts.client_trust);
         self.client_engine.omit_transport_parameters = true;
+        self.client_engine.alpn = opts.client_alpn;
         self.server_engine = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity());
         self.server_engine.omit_transport_parameters = true;
+        self.server_engine.alpn = opts.server_alpn;
 
         self.client_wrapper = RecordModeBackend.init(&self.client_engine);
         self.server_wrapper = RecordModeBackend.init(&self.server_engine);
-        self.client_carrier = .{ .fd = self.fds[0], .max_chunk = client_chunk };
-        self.server_carrier = .{ .fd = self.fds[1], .max_chunk = server_chunk };
+        self.client_carrier = .{ .fd = self.fds[0], .max_chunk = opts.client_chunk };
+        self.server_carrier = .{ .fd = self.fds[1], .max_chunk = opts.server_chunk };
 
         self.client = es.PureZigRecordStream.initWithCarrierAndBackend(.client, clientProvider(), suite, self.client_carrier.carrier(), self.client_wrapper.backend());
         self.server = es.PureZigRecordStream.initWithCarrierAndBackend(.server, serverProvider(), suite, self.server_carrier.carrier(), self.server_wrapper.backend());
         return self;
+    }
+
+    /// Close one endpoint exactly once (idempotent), so a test can close an
+    /// endpoint early to model peer EOF without `destroy` double-closing a
+    /// potentially-recycled descriptor.
+    fn closeEndpoint(self: *SocketHarness, index: usize) void {
+        if (!self.fds_closed[index]) {
+            closeFd(self.fds[index]);
+            self.fds_closed[index] = true;
+        }
     }
 
     fn destroy(self: *SocketHarness) void {
@@ -728,8 +769,8 @@ const SocketHarness = struct {
         self.server.deinit();
         self.client_engine.deinit();
         self.server_engine.deinit();
-        closeFd(self.fds[0]);
-        closeFd(self.fds[1]);
+        self.closeEndpoint(0);
+        self.closeEndpoint(1);
         std.testing.allocator.destroy(self);
     }
 
@@ -765,7 +806,7 @@ test "record stream completes a real TLS 1.3 handshake over a nonblocking socket
         .{ record_codec.max_ciphertext_record_len, record_codec.max_ciphertext_record_len },
     };
     for (chunks) |chunk| {
-        const h = try SocketHarness.create(chunk[0], chunk[1]);
+        const h = try SocketHarness.create(.{ .client_chunk = chunk[0], .server_chunk = chunk[1] });
         defer h.destroy();
 
         try h.driveUntil(SocketHarness.bothComplete);
@@ -815,7 +856,7 @@ test "record stream completes a real TLS 1.3 handshake over a nonblocking socket
 }
 
 test "record stream handshake fails closed when a ClientHello is corrupted in flight" {
-    const h = try SocketHarness.create(std.math.maxInt(usize), std.math.maxInt(usize));
+    const h = try SocketHarness.create(.{});
     defer h.destroy();
     // Flip a byte inside the ClientHello's 32-byte random (past the 5-byte
     // record header, 4-byte handshake header, and 2-byte legacy_version) as the
@@ -851,13 +892,14 @@ test "record stream handshake fails closed when a ClientHello is corrupted in fl
 }
 
 test "record stream handshake treats carrier EOF before close_notify as truncation" {
-    const h = try SocketHarness.create(std.math.maxInt(usize), std.math.maxInt(usize));
+    const h = try SocketHarness.create(.{});
     defer h.destroy();
 
     // Complete the handshake, then the server abruptly closes its socket
-    // instead of sending close_notify.
+    // instead of sending close_notify. `closeEndpoint` makes the harness the
+    // sole owner of each descriptor, so `destroy` never double-closes it.
     try h.driveUntil(SocketHarness.bothComplete);
-    closeFd(h.fds[1]);
+    h.closeEndpoint(1);
     h.server.stream().close();
 
     var client_error: ?anyerror = null;
@@ -870,4 +912,63 @@ test "record stream handshake treats carrier EOF before close_notify as truncati
     }
     try std.testing.expectEqual(@as(?anyerror, error.TruncatedStream), client_error);
     try std.testing.expect(h.client.lifecycle == .failed);
+}
+
+/// Drive both streams until one returns a terminal error or progress stalls,
+/// returning the first error observed (client checked before server each round).
+fn driveUntilError(h: *SocketHarness) ?anyerror {
+    var rounds: usize = 0;
+    while (rounds < 500) : (rounds += 1) {
+        const c = h.client.stream().drive() catch |err| return err;
+        const s = h.server.stream().drive() catch |err| return err;
+        if (h.client.lifecycle == .failed or h.server.lifecycle == .failed) {
+            // Give the failing side one more drive to surface its latched error.
+            _ = h.client.stream().drive() catch |err| return err;
+            _ = h.server.stream().drive() catch |err| return err;
+            return null;
+        }
+        if (!c.made_progress and !s.made_progress) return null;
+    }
+    return null;
+}
+
+test "record stream handshake fails closed with CertificateInvalid on a wrong pinned certificate" {
+    // The client pins a certificate that does not byte-equal the one the server
+    // presents. Proof-of-possession still checks out, so the engine emits
+    // `.certificate(.invalid)`, marks its core failed, and returns success --
+    // record mode must convert that into a terminal `CertificateInvalid` rather
+    // than stalling with the server `Finished` still buffered.
+    var wrong_pin: [tls_backend.testdata.certificate_der.len]u8 = undefined;
+    @memcpy(&wrong_pin, tls_backend.testdata.certificate_der);
+    wrong_pin[wrong_pin.len / 2] ^= 0xff;
+
+    const h = try SocketHarness.create(.{ .client_trust = .{ .pinned_certificate = &wrong_pin } });
+    defer h.destroy();
+
+    const failure = driveUntilError(h);
+    try std.testing.expect(!h.client.bridge.handshake_complete);
+    try std.testing.expect(!h.server.bridge.handshake_complete);
+    try std.testing.expect(h.client.lifecycle == .failed);
+    try std.testing.expect(failure != null);
+    try std.testing.expect(failure.? == error.CertificateInvalid);
+    // A repeated drive returns the stable, latched terminal error, and the
+    // fatal failure wiped the captured negotiation metadata.
+    try std.testing.expectError(error.CertificateInvalid, h.client.stream().drive());
+    try std.testing.expectEqual(events.CertificateState.not_checked, h.client.certificateState());
+}
+
+test "record stream handshake fails closed with AlpnMismatch when the server selects a different protocol" {
+    // The client offers h3; the server supports only h2. The engine reports the
+    // offered protocol, marks its core failed, and returns success, deferring
+    // the AlpnMismatch decision to record mode.
+    const h = try SocketHarness.create(.{ .server_alpn = "h2" });
+    defer h.destroy();
+
+    const failure = driveUntilError(h);
+    try std.testing.expect(!h.client.bridge.handshake_complete);
+    try std.testing.expect(!h.server.bridge.handshake_complete);
+    try std.testing.expect(h.server.lifecycle == .failed);
+    try std.testing.expect(failure != null);
+    try std.testing.expect(failure.? == error.AlpnMismatch);
+    try std.testing.expectError(error.AlpnMismatch, h.server.stream().drive());
 }

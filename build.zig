@@ -415,6 +415,9 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     pki_mod.addImport("crypto", crypto_mod);
+    pki_mod.addAnonymousImport("pki_malformed_der", .{
+        .root_source_file = b.path("tests/vectors/pki/malformed-truncated.der"),
+    });
     const pki_tests = b.addTest(.{ .root_module = pki_mod });
     const run_pki_tests = b.addRunArtifact(pki_tests);
     const pki_step = b.step("test-pki", "Run pure-Zig PKI DER unit tests");
@@ -443,6 +446,34 @@ pub fn build(b: *std.Build) void {
     const run_pki_policy_openssl_diff_tests = b.addRunArtifact(pki_policy_openssl_diff_tests);
     const pki_policy_openssl_diff_step = b.step("test-pki-policy-openssl", "Compare certificate-policy fixtures with OpenSSL");
     pki_policy_openssl_diff_step.dependOn(&run_pki_policy_openssl_diff_tests.step);
+
+    // Three-way hostile-corpus validation (#348): Tardigrade runs in process;
+    // OpenSSL and Go crypto/x509 are invoked as independent processes. These
+    // targets stay opt-in because the external validators are test tools, not
+    // production dependencies.
+    const pki_differential_mod = b.createModule(.{
+        .root_source_file = b.path("tests/pki_differential.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    pki_differential_mod.addImport("crypto", crypto_mod);
+    pki_differential_mod.addImport("pki", pki_mod);
+    pki_differential_mod.addImport("zig_compat", compat_mod);
+    const pki_differential_core_tests = b.addTest(.{
+        .root_module = pki_differential_mod,
+        .filters = &.{"pki differential core corpus"},
+    });
+    const run_pki_differential_core_tests = b.addRunArtifact(pki_differential_core_tests);
+    const pki_differential_step = b.step("test-pki-differential", "Run stable PKI differential corpus against OpenSSL and Go");
+    pki_differential_step.dependOn(&run_pki_differential_core_tests.step);
+
+    const pki_differential_full_tests = b.addTest(.{
+        .root_module = pki_differential_mod,
+        .filters = &.{"pki differential full corpus"},
+    });
+    const run_pki_differential_full_tests = b.addRunArtifact(pki_differential_full_tests);
+    const pki_differential_extended_step = b.step("test-pki-differential-extended", "Run full PKI differential corpus against OpenSSL and Go");
+    pki_differential_extended_step.dependOn(&run_pki_differential_full_tests.step);
 }
 
 fn pathExists(path: []const u8) bool {

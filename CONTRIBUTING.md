@@ -25,6 +25,12 @@ zig fmt --check build.zig src/ tests/
 # Unit tests (matches CI)
 zig build test --summary all --error-style verbose
 
+# Stable Web PKI differential corpus (requires OpenSSL and Go)
+zig build test-pki-differential --summary all --error-style verbose
+
+# Full core + extended PKI corpus used by the scheduled/manual CI job
+zig build test-pki-differential-extended --summary all --error-style verbose
+
 # Integration tests — builds and drives a live tardigrade process against
 # mock upstreams; requires system OpenSSL. Not required for most contributions.
 zig build test-integration
@@ -97,8 +103,8 @@ zig build -Dstatic-executable=true -Drequire-static-system-libs=true
 # Run a specific test by name filter
 zig build test -- --test-filter "jwt"
 
-# Per-test timeout (build runner flag, not a build.zig option)
-zig build test -- --test-timeout-ns 10000000000
+# Per-test timeout (Zig build-runner flag)
+zig build test --test-timeout 10s
 ```
 
 ### HTTP/3

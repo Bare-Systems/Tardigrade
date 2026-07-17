@@ -170,6 +170,10 @@ pub const Name = struct {
     ///
     /// Two names chain exactly when their keys are byte-equal.
     chaining_key: []const u8,
+    /// Per-RDN canonical keys built by the same RFC 4518/4517 machinery as
+    /// `chaining_key`.  They permit RFC 5280 directoryName subtree matching
+    /// without reparsing or implementing a second normalization path.
+    rdn_chaining_keys: []const []const u8,
 
     pub fn eqlEncoding(self: *const Name, other: *const Name) bool {
         return std.mem.eql(u8, self.raw, other.raw);
@@ -182,6 +186,18 @@ pub const Name = struct {
 
     pub fn isEmpty(self: *const Name) bool {
         return self.rdns.len == 0;
+    }
+
+    /// RFC 5280 §7.1 directoryName subtree membership.  A subject is
+    /// within a constraint when the constraint's RDN sequence is a canonical
+    /// prefix of the subject's sequence.  RDN equality uses exactly the same
+    /// matching rules as issuer/subject chaining.
+    pub fn isWithinSubtree(self: *const Name, constraint: *const Name) bool {
+        if (constraint.rdn_chaining_keys.len > self.rdn_chaining_keys.len) return false;
+        for (constraint.rdn_chaining_keys, self.rdn_chaining_keys[0..constraint.rdn_chaining_keys.len]) |expected, actual| {
+            if (!std.mem.eql(u8, expected, actual)) return false;
+        }
+        return true;
     }
 
     /// First attribute value with the given type OID, in RDN order.
@@ -647,22 +663,20 @@ const Parser = struct {
         }
         rdn_reader.expectEnd() catch return error.MalformedName;
 
+        const rdn_chaining_keys = try self.buildRdnChainingKeys(rdns.items);
         return .{
             .raw = name_elem.encoded,
             .rdns = rdns.items,
-            .chaining_key = try self.buildChainingKey(rdns.items),
+            .chaining_key = try self.buildChainingKey(rdn_chaining_keys),
+            .rdn_chaining_keys = rdn_chaining_keys,
         };
     }
 
-    /// Serialize the canonical `Name.chaining_key`. Every piece is
-    /// length/count-prefixed, so the flat concatenation is injective: two
-    /// keys are byte-equal exactly when the names chain under the documented
-    /// RFC 5280 §7.1 rules.
-    fn buildChainingKey(self: *Parser, rdns: []const RelativeDistinguishedName) Error![]const u8 {
-        var key: std.ArrayList(u8) = .empty;
-        try appendCount(&key, self.arena, rdns.len);
-        for (rdns) |rdn| {
-            try appendCount(&key, self.arena, rdn.attributes.len);
+    fn buildRdnChainingKeys(self: *Parser, rdns: []const RelativeDistinguishedName) Error![]const []const u8 {
+        const keys = try self.arena.alloc([]const u8, rdns.len);
+        for (rdns, keys) |rdn, *key| {
+            var bytes: std.ArrayList(u8) = .empty;
+            try appendCount(&bytes, self.arena, rdn.attributes.len);
             // SET semantics: attribute order inside an RDN must not affect
             // the key, and canonicalization can reorder attributes relative
             // to their DER encoding, so sort the canonical forms.
@@ -671,8 +685,20 @@ const Parser = struct {
                 blob.* = try self.attributeChainingBlob(attribute);
             }
             std.mem.sort([]const u8, blobs, {}, sliceLessThan);
-            for (blobs) |blob| try key.appendSlice(self.arena, blob);
+            for (blobs) |blob| try bytes.appendSlice(self.arena, blob);
+            key.* = bytes.items;
         }
+        return keys;
+    }
+
+    /// Serialize the canonical `Name.chaining_key`. Every piece is
+    /// length/count-prefixed, so the flat concatenation is injective: two
+    /// keys are byte-equal exactly when the names chain under the documented
+    /// RFC 5280 §7.1 rules.
+    fn buildChainingKey(self: *Parser, rdn_keys: []const []const u8) Error![]const u8 {
+        var key: std.ArrayList(u8) = .empty;
+        try appendCount(&key, self.arena, rdn_keys.len);
+        for (rdn_keys) |rdn_key| try key.appendSlice(self.arena, rdn_key);
         return key.items;
     }
 

@@ -13,14 +13,15 @@
 //!   can be enabled explicitly;
 //! - absent Key Usage and Extended Key Usage permit the requested use, as in
 //!   RFC 5280; when present they restrict it;
-//! - Name Constraints processing is deferred, so any constrained path fails
-//!   closed rather than silently bypassing the constraint. Certificate-policy
-//!   processing is also deferred: noncritical certificatePolicies are accepted
+//! - Name Constraints are processed by the bounded RFC 5280 engine for the
+//!   directoryName, dNSName, rfc822Name, URI, and IP forms. Certificate-policy
+//!   processing remains deferred: noncritical certificatePolicies are accepted
 //!   under the implicit any-policy policy, while critical instances fail closed.
 
 const std = @import("std");
 const crypto = @import("crypto");
 const identity = @import("identity.zig");
+const name_constraints = @import("name_constraints.zig");
 const oid = @import("oid.zig");
 const path_builder = @import("path_builder.zig");
 const verify = @import("verify.zig");
@@ -38,6 +39,7 @@ pub const ValidationPolicy = struct {
     /// Bounds the validator's duplicate-extension scan even for a malformed
     /// caller-constructed certificate view. The parser default is also 64.
     maximum_extensions_per_certificate: usize = 64,
+    name_constraints: name_constraints.Limits = .{},
     /// Anchors passed to `path_builder.build`, in the same order. Borrowed for
     /// the call only. The terminal element's input index and DER must match.
     trust_anchors: []const x509.Certificate,
@@ -64,7 +66,9 @@ pub const FailureReason = enum {
     extended_key_usage_violation,
     unknown_critical_extension,
     duplicate_extension,
+    name_constraints_violation,
     name_constraints_unsupported,
+    name_constraints_resource_limit_exceeded,
     identity_mismatch,
     invalid_identity_reference,
     validation_resource_limit_exceeded,
@@ -78,6 +82,9 @@ pub const ValidationFailure = struct {
     certificate_index: ?usize,
     /// A value copy, never a borrowed attacker-controlled string.
     extension_oid: ?oid.ObjectIdentifier = null,
+    name_constraint_kind: ?name_constraints.ConstraintKind = null,
+    name_form: ?name_constraints.Form = null,
+    constraint_certificate_index: ?usize = null,
 };
 
 pub const AcceptedPath = struct {
@@ -190,6 +197,10 @@ pub fn validatePath(
         }
     }
 
+    if (name_constraints.validatePath(allocator, path, policy.name_constraints)) |name_failure| {
+        return .{ .rejected = nameConstraintsFailure(name_failure) };
+    }
+
     // Identity is intentionally last: no path is accepted based on a name
     // match before its signatures and RFC 5280 policy checks succeed.
     if (policy.expected_dns_name) |expected| {
@@ -289,13 +300,6 @@ fn checkExtensions(certificate: *const x509.Certificate, certificate_index: usiz
         }
     }
     for (certificate.extensions) |extension| {
-        if (extension.oid.eqlComponents(&wk.name_constraints)) {
-            return .{
-                .reason = .name_constraints_unsupported,
-                .certificate_index = certificate_index,
-                .extension_oid = extension.oid,
-            };
-        }
         if (extension.critical and !criticalExtensionHandled(&extension.oid)) {
             return .{
                 .reason = .unknown_critical_extension,
@@ -312,8 +316,26 @@ fn criticalExtensionHandled(extension_oid: *const oid.ObjectIdentifier) bool {
         extension_oid.eqlComponents(&wk.key_usage) or
         extension_oid.eqlComponents(&wk.subject_alt_name) or
         extension_oid.eqlComponents(&wk.ext_key_usage) or
+        extension_oid.eqlComponents(&wk.name_constraints) or
         extension_oid.eqlComponents(&wk.subject_key_identifier) or
         extension_oid.eqlComponents(&wk.authority_key_identifier);
+}
+
+fn nameConstraintsFailure(name_failure: name_constraints.Failure) ValidationFailure {
+    const reason: FailureReason = switch (name_failure.reason) {
+        .violation => .name_constraints_violation,
+        .unsupported => .name_constraints_unsupported,
+        .resource_limit_exceeded => .name_constraints_resource_limit_exceeded,
+        .out_of_memory => .out_of_memory,
+    };
+    return .{
+        .reason = reason,
+        .certificate_index = name_failure.certificate_index,
+        .extension_oid = oid.ObjectIdentifier.fromComponents(&wk.name_constraints) catch unreachable,
+        .name_constraint_kind = name_failure.constraint_kind,
+        .name_form = name_failure.name_form,
+        .constraint_certificate_index = name_failure.constraint_certificate_index,
+    };
 }
 
 fn signatureFailure(err: verify.Error, certificate_index: usize) ValidationFailure {

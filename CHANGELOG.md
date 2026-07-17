@@ -20,11 +20,18 @@ All notable user-facing changes to Tardigrade are documented here.
   validity is opt-in, while anchor certificate extensions are ignored as trust
   input and absent KU/EKU is unrestricted per RFC 5280. TLS 1.3 leaf KU, when
   present, must authorize `digitalSignature` even for RSA keys.
-  Name Constraints and certificate-policy processing remain deferred under
-  #345: any Name Constraints extension fails closed, noncritical
+  Name Constraints now process directoryName, dNSName, rfc822Name, URI-host,
+  IPv4, and IPv6 subtrees with bounded permitted-group intersection,
+  cumulative exclusions, correct self-issued rollover handling, stable
+  diagnostics, and explicit limits on paths, names, subtrees, comparisons,
+  directory parsing, and URI work. Unsupported forms, malformed masks,
+  noncritical CA constraints, and constraints on leaves fail closed. Fixed
+  OpenSSL-generated fixtures and an opt-in `test-pki-openssl` differential
+  target cover DNS, IP, directoryName, and leading-dot compatibility.
+  Certificate-policy processing remains deferred: noncritical
   certificatePolicies use the implicit any-policy policy, and critical policy
   extensions are rejected until full processing is implemented.
-  Deterministic, real-signature Ed25519 fixtures plus an independently
+  Deterministic, real-signature Ed25519 fixtures plus independently
   OpenSSL-generated leaf/anchor chain cover valid/direct and alternate paths,
   signature defect classes, time boundaries, CA/KU/EKU,
   pathLen/self-issued behavior, extension criticality/duplicates, identity,

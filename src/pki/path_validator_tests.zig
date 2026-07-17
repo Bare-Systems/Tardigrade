@@ -3,6 +3,7 @@
 const std = @import("std");
 const crypto = @import("crypto");
 const der = @import("der.zig");
+const name_constraints = @import("name_constraints.zig");
 const oid = @import("oid.zig");
 const path_builder = @import("path_builder.zig");
 const pem = @import("pem.zig");
@@ -49,6 +50,21 @@ fn nameWithCn(arena: std.mem.Allocator, common_name: []const u8) ![]u8 {
         try tlv(arena, 0x0c, &.{common_name}),
     });
     return tlv(arena, 0x30, &.{try tlv(arena, 0x31, &.{attribute})});
+}
+
+fn nameWithCnAndEmail(arena: std.mem.Allocator, common_name: []const u8, email: []const u8) ![]u8 {
+    const common_name_attribute = try tlv(arena, 0x30, &.{
+        try oidTlv(arena, &oid.well_known.common_name),
+        try tlv(arena, 0x0c, &.{common_name}),
+    });
+    const email_attribute = try tlv(arena, 0x30, &.{
+        try oidTlv(arena, &oid.well_known.email_address),
+        try tlv(arena, 0x16, &.{email}),
+    });
+    return tlv(arena, 0x30, &.{
+        try tlv(arena, 0x31, &.{common_name_attribute}),
+        try tlv(arena, 0x31, &.{email_attribute}),
+    });
 }
 
 fn validity(arena: std.mem.Allocator, not_before: []const u8, not_after: []const u8) ![]u8 {
@@ -123,13 +139,63 @@ fn ekuValue(arena: std.mem.Allocator, eku: Eku) ![]u8 {
     return tlv(arena, 0x30, &.{try oidTlv(arena, components)});
 }
 
-fn sanValue(arena: std.mem.Allocator, dns_name: []const u8) ![]u8 {
-    return tlv(arena, 0x30, &.{try tlv(arena, 0x82, &.{dns_name})});
+const GeneralNameSpec = union(enum) {
+    dns: []const u8,
+    email: []const u8,
+    uri: []const u8,
+    ip: []const u8,
+    directory_cn: []const u8,
+    registered_id: []const u32,
+};
+
+fn generalNameValue(arena: std.mem.Allocator, name: GeneralNameSpec) ![]const u8 {
+    return switch (name) {
+        .dns => |value| tlv(arena, 0x82, &.{value}),
+        .email => |value| tlv(arena, 0x81, &.{value}),
+        .uri => |value| tlv(arena, 0x86, &.{value}),
+        .ip => |value| tlv(arena, 0x87, &.{value}),
+        .directory_cn => |value| tlv(arena, 0xa4, &.{try nameWithCn(arena, value)}),
+        .registered_id => |components| blk: {
+            var buffer: [64]u8 = undefined;
+            const len = try oid.encodeComponents(components, &buffer);
+            break :blk tlv(arena, 0x88, &.{buffer[0..len]});
+        },
+    };
 }
 
-fn nameConstraintsValue(arena: std.mem.Allocator) ![]u8 {
-    const subtree = try tlv(arena, 0x30, &.{try tlv(arena, 0x82, &.{".example.com"})});
-    return tlv(arena, 0x30, &.{try tlv(arena, 0xa0, &.{subtree})});
+fn sanValue(arena: std.mem.Allocator, names: []const GeneralNameSpec) ![]u8 {
+    var parts: std.ArrayList([]const u8) = .empty;
+    defer parts.deinit(arena);
+    for (names) |name| try parts.append(arena, try generalNameValue(arena, name));
+    return tlv(arena, 0x30, parts.items);
+}
+
+const NameConstraintsSpec = struct {
+    permitted: []const GeneralNameSpec = &.{},
+    excluded: []const GeneralNameSpec = &.{},
+    critical: bool = true,
+};
+
+fn nameConstraintsValue(arena: std.mem.Allocator, spec: NameConstraintsSpec) ![]u8 {
+    var parts: std.ArrayList([]const u8) = .empty;
+    defer parts.deinit(arena);
+    if (spec.permitted.len != 0) {
+        var subtrees: std.ArrayList([]const u8) = .empty;
+        defer subtrees.deinit(arena);
+        for (spec.permitted) |name| {
+            try subtrees.append(arena, try tlv(arena, 0x30, &.{try generalNameValue(arena, name)}));
+        }
+        try parts.append(arena, try tlv(arena, 0xa0, subtrees.items));
+    }
+    if (spec.excluded.len != 0) {
+        var subtrees: std.ArrayList([]const u8) = .empty;
+        defer subtrees.deinit(arena);
+        for (spec.excluded) |name| {
+            try subtrees.append(arena, try tlv(arena, 0x30, &.{try generalNameValue(arena, name)}));
+        }
+        try parts.append(arena, try tlv(arena, 0xa1, subtrees.items));
+    }
+    return tlv(arena, 0x30, parts.items);
 }
 
 const Spec = struct {
@@ -145,8 +211,11 @@ const Spec = struct {
     /// keyEncipherment=0x20, keyCertSign=0x04.
     key_usage: ?u8 = null,
     eku: Eku = .absent,
+    subject_email: ?[]const u8 = null,
     san: ?[]const u8 = null,
-    name_constraints: bool = false,
+    san_names: []const GeneralNameSpec = &.{},
+    san_critical: bool = false,
+    name_constraints: ?NameConstraintsSpec = null,
     unknown_critical: bool = false,
     unknown_noncritical: bool = false,
 };
@@ -200,16 +269,24 @@ const Fixtures = struct {
             try extensions.append(arena, try extensionTlv(
                 arena,
                 &oid.well_known.subject_alt_name,
-                false,
-                try sanValue(arena, dns_name),
+                spec.san_critical,
+                try sanValue(arena, &.{.{ .dns = dns_name }}),
             ));
         }
-        if (spec.name_constraints) {
+        if (spec.san_names.len != 0) {
+            try extensions.append(arena, try extensionTlv(
+                arena,
+                &oid.well_known.subject_alt_name,
+                spec.san_critical,
+                try sanValue(arena, spec.san_names),
+            ));
+        }
+        if (spec.name_constraints) |constraints| {
             try extensions.append(arena, try extensionTlv(
                 arena,
                 &oid.well_known.name_constraints,
-                false,
-                try nameConstraintsValue(arena),
+                constraints.critical,
+                try nameConstraintsValue(arena, constraints),
             ));
         }
         const unknown_oid = [_]u32{ 1, 2, 3, 4 };
@@ -228,7 +305,13 @@ const Fixtures = struct {
         try tbs_parts.append(arena, try algorithmEd25519(arena));
         try tbs_parts.append(arena, try nameWithCn(arena, spec.issuer));
         try tbs_parts.append(arena, try validity(arena, spec.not_before, spec.not_after));
-        try tbs_parts.append(arena, try nameWithCn(arena, spec.subject));
+        const subject_name = if (spec.subject_email) |email|
+            try nameWithCnAndEmail(arena, spec.subject, email)
+        else if (spec.subject.len == 0)
+            try tlv(arena, 0x30, &.{})
+        else
+            try nameWithCn(arena, spec.subject);
+        try tbs_parts.append(arena, subject_name);
         try tbs_parts.append(arena, try spkiEd25519(arena, spec.subject_key));
         if (extensions.items.len > 0) {
             try tbs_parts.append(arena, try tlv(arena, 0xa3, &.{try tlv(arena, 0x30, extensions.items)}));
@@ -736,11 +819,19 @@ test "critical and duplicate extensions fail closed while unknown noncritical pa
     try expectRejected(&duplicate, .duplicate_extension, 0);
 }
 
-test "deferred Name Constraints fail closed even when noncritical" {
+test "noncritical Name Constraints fail closed while anchor extensions stay local policy" {
     var fx = Fixtures.init(testing.allocator);
     defer fx.deinit();
     try fx.add(.{ .subject = "leaf", .issuer = "Constrained", .subject_key = 1, .issuer_key = 2, .ca = false, .key_usage = 0x80 });
-    try fx.add(.{ .subject = "Constrained", .issuer = "Root", .subject_key = 2, .issuer_key = 3, .ca = true, .key_usage = 0x04, .name_constraints = true });
+    try fx.add(.{
+        .subject = "Constrained",
+        .issuer = "Root",
+        .subject_key = 2,
+        .issuer_key = 3,
+        .ca = true,
+        .key_usage = 0x04,
+        .name_constraints = .{ .permitted = &.{.{ .dns = ".example.com" }}, .critical = false },
+    });
     try fx.add(.{ .subject = "Root", .issuer = "Root", .subject_key = 3, .issuer_key = 3 });
 
     var entropy: crypto.pure_zig.DeterministicEntropy = undefined;
@@ -753,11 +844,666 @@ test "deferred Name Constraints fail closed even when noncritical" {
 
     // The same extension on configured trust input is not inherited as local
     // policy by default.
-    try fx.add(.{ .subject = "NC Anchor", .issuer = "NC Anchor", .subject_key = 4, .issuer_key = 4, .name_constraints = true, .unknown_critical = true });
+    try fx.add(.{
+        .subject = "NC Anchor",
+        .issuer = "NC Anchor",
+        .subject_key = 4,
+        .issuer_key = 4,
+        .name_constraints = .{ .permitted = &.{.{ .dns = ".example.com" }} },
+        .unknown_critical = true,
+    });
     try fx.add(.{ .subject = "anchor leaf", .issuer = "NC Anchor", .subject_key = 5, .issuer_key = 4, .ca = false, .key_usage = 0x80 });
     var anchor_extensions_ignored = try validateBuilt(testing.allocator, &fx.certs.items[4], &.{}, fx.certs.items[3..4], policy(fx.certs.items[3..4]), cp);
     defer anchor_extensions_ignored.deinit(testing.allocator);
     try expectAccepted(&anchor_extensions_ignored, 2);
+}
+
+test "Name Constraints propagate permitted and excluded DNS subtrees to every SAN" {
+    var fx = Fixtures.init(testing.allocator);
+    defer fx.deinit();
+    try fx.add(.{ .subject = "Root", .issuer = "Root", .subject_key = 3, .issuer_key = 3 });
+    try fx.add(.{
+        .subject = "Constrained",
+        .issuer = "Root",
+        .subject_key = 2,
+        .issuer_key = 3,
+        .ca = true,
+        .key_usage = 0x04,
+        .name_constraints = .{
+            .permitted = &.{.{ .dns = "example.com" }},
+            .excluded = &.{.{ .dns = "blocked.example.com" }},
+        },
+    });
+    try fx.add(.{ .subject = "good", .issuer = "Constrained", .subject_key = 4, .issuer_key = 2, .ca = false, .key_usage = 0x80, .san = "api.example.com" });
+    try fx.add(.{ .subject = "blocked", .issuer = "Constrained", .subject_key = 5, .issuer_key = 2, .ca = false, .key_usage = 0x80, .san = "blocked.example.com" });
+    try fx.add(.{
+        .subject = "mixed",
+        .issuer = "Constrained",
+        .subject_key = 6,
+        .issuer_key = 2,
+        .ca = false,
+        .key_usage = 0x80,
+        .san_names = &.{ .{ .dns = "api.example.com" }, .{ .dns = "blocked.example.com" } },
+    });
+    try fx.add(.{ .subject = "", .issuer = "Constrained", .subject_key = 7, .issuer_key = 2, .ca = false, .key_usage = 0x80, .san = "api.example.com", .san_critical = true });
+    try fx.add(.{ .subject = "", .issuer = "Constrained", .subject_key = 8, .issuer_key = 2, .ca = false, .key_usage = 0x80, .san = "blocked.example.com", .san_critical = true });
+    try fx.add(.{ .subject = "blocked.example.com", .issuer = "Constrained", .subject_key = 9, .issuer_key = 2, .ca = false, .key_usage = 0x80 });
+
+    var entropy: crypto.pure_zig.DeterministicEntropy = undefined;
+    var provider: crypto.pure_zig.Provider = undefined;
+    const cp = cryptoProvider(&entropy, &provider);
+    var good = try validateBuilt(testing.allocator, &fx.certs.items[2], fx.certs.items[1..2], fx.certs.items[0..1], policy(fx.certs.items[0..1]), cp);
+    defer good.deinit(testing.allocator);
+    try expectAccepted(&good, 3);
+
+    var empty_subject = try validateBuilt(testing.allocator, &fx.certs.items[5], fx.certs.items[1..2], fx.certs.items[0..1], policy(fx.certs.items[0..1]), cp);
+    defer empty_subject.deinit(testing.allocator);
+    try expectAccepted(&empty_subject, 3);
+
+    // A constrained form that is absent is acceptable, and subject CN is not
+    // synthesized into a dNSName.
+    var absent_dns = try validateBuilt(testing.allocator, &fx.certs.items[7], fx.certs.items[1..2], fx.certs.items[0..1], policy(fx.certs.items[0..1]), cp);
+    defer absent_dns.deinit(testing.allocator);
+    try expectAccepted(&absent_dns, 3);
+
+    inline for (.{ @as(usize, 3), 4, 6 }) |index| {
+        var rejected = try validateBuilt(testing.allocator, &fx.certs.items[index], fx.certs.items[1..2], fx.certs.items[0..1], policy(fx.certs.items[0..1]), cp);
+        defer rejected.deinit(testing.allocator);
+        try expectRejected(&rejected, .name_constraints_violation, 0);
+        try testing.expectEqual(name_constraints.ConstraintKind.excluded, rejected.rejected.name_constraint_kind.?);
+        try testing.expectEqual(name_constraints.Form.dns_name, rejected.rejected.name_form.?);
+        try testing.expectEqual(@as(?usize, 1), rejected.rejected.constraint_certificate_index);
+    }
+}
+
+test "permitted groups from successive CAs intersect and excluded sets accumulate" {
+    var fx = Fixtures.init(testing.allocator);
+    defer fx.deinit();
+    try fx.add(.{ .subject = "Root", .issuer = "Root", .subject_key = 4, .issuer_key = 4 });
+    try fx.add(.{
+        .subject = "Upper",
+        .issuer = "Root",
+        .subject_key = 3,
+        .issuer_key = 4,
+        .ca = true,
+        .key_usage = 0x04,
+        .name_constraints = .{
+            .permitted = &.{ .{ .dns = "example.com" }, .{ .dns = "example.net" } },
+            .excluded = &.{.{ .dns = "blocked.example.com" }},
+        },
+    });
+    try fx.add(.{
+        .subject = "Lower",
+        .issuer = "Upper",
+        .subject_key = 2,
+        .issuer_key = 3,
+        .ca = true,
+        .key_usage = 0x04,
+        .name_constraints = .{
+            .permitted = &.{.{ .dns = "service.example.com" }},
+            .excluded = &.{.{ .dns = "private.service.example.com" }},
+        },
+    });
+    try fx.add(.{ .subject = "good", .issuer = "Lower", .subject_key = 5, .issuer_key = 2, .ca = false, .key_usage = 0x80, .san = "api.service.example.com" });
+    try fx.add(.{ .subject = "outside lower", .issuer = "Lower", .subject_key = 6, .issuer_key = 2, .ca = false, .key_usage = 0x80, .san = "api.example.com" });
+    try fx.add(.{ .subject = "excluded upper", .issuer = "Lower", .subject_key = 7, .issuer_key = 2, .ca = false, .key_usage = 0x80, .san = "blocked.example.com" });
+    try fx.add(.{ .subject = "excluded lower", .issuer = "Lower", .subject_key = 8, .issuer_key = 2, .ca = false, .key_usage = 0x80, .san = "private.service.example.com" });
+
+    var entropy: crypto.pure_zig.DeterministicEntropy = undefined;
+    var provider: crypto.pure_zig.Provider = undefined;
+    const cp = cryptoProvider(&entropy, &provider);
+    var good = try validateBuilt(testing.allocator, &fx.certs.items[3], fx.certs.items[1..3], fx.certs.items[0..1], policy(fx.certs.items[0..1]), cp);
+    defer good.deinit(testing.allocator);
+    try expectAccepted(&good, 4);
+
+    inline for (.{ @as(usize, 4), 5, 6 }) |index| {
+        var rejected = try validateBuilt(testing.allocator, &fx.certs.items[index], fx.certs.items[1..3], fx.certs.items[0..1], policy(fx.certs.items[0..1]), cp);
+        defer rejected.deinit(testing.allocator);
+        try expectRejected(&rejected, .name_constraints_violation, 0);
+    }
+}
+
+test "self-issued rollover skips inherited checking but contributes constraints" {
+    var fx = Fixtures.init(testing.allocator);
+    defer fx.deinit();
+    try fx.add(.{ .subject = "Root", .issuer = "Root", .subject_key = 4, .issuer_key = 4 });
+    try fx.add(.{
+        .subject = "Rollover",
+        .issuer = "Root",
+        .subject_key = 3,
+        .issuer_key = 4,
+        .ca = true,
+        .key_usage = 0x04,
+        .name_constraints = .{ .permitted = &.{.{ .dns = "example.com" }} },
+    });
+    try fx.add(.{
+        .subject = "Rollover",
+        .issuer = "Rollover",
+        .subject_key = 2,
+        .issuer_key = 3,
+        .ca = true,
+        .key_usage = 0x04,
+        .san = "outside.invalid",
+        .name_constraints = .{ .permitted = &.{.{ .dns = "service.example.com" }} },
+    });
+    try fx.add(.{ .subject = "leaf", .issuer = "Rollover", .subject_key = 5, .issuer_key = 2, .ca = false, .key_usage = 0x80, .san = "api.service.example.com" });
+    try fx.add(.{ .subject = "Rollover", .issuer = "Rollover", .subject_key = 6, .issuer_key = 2, .ca = false, .key_usage = 0x80, .san = "outside.invalid" });
+
+    var entropy: crypto.pure_zig.DeterministicEntropy = undefined;
+    var provider: crypto.pure_zig.Provider = undefined;
+    const cp = cryptoProvider(&entropy, &provider);
+    var rollover = try validateBuilt(testing.allocator, &fx.certs.items[3], fx.certs.items[1..3], fx.certs.items[0..1], policy(fx.certs.items[0..1]), cp);
+    defer rollover.deinit(testing.allocator);
+    try expectAccepted(&rollover, 4);
+
+    const final_self_issued_elements = [_]path_builder.Element{
+        .{ .certificate = &fx.certs.items[4], .source = .leaf, .input_index = 0 },
+        .{ .certificate = &fx.certs.items[2], .source = .intermediate, .input_index = 0 },
+        .{ .certificate = &fx.certs.items[1], .source = .intermediate, .input_index = 1 },
+        .{ .certificate = &fx.certs.items[0], .source = .anchor, .input_index = 0 },
+    };
+    var final_self_issued = validator.validatePath(testing.allocator, .{ .elements = &final_self_issued_elements }, policy(fx.certs.items[0..1]), cp);
+    defer final_self_issued.deinit(testing.allocator);
+    try expectRejected(&final_self_issued, .name_constraints_violation, 0);
+}
+
+test "directory, email, URI, IPv4, and IPv6 constraints validate through signed paths" {
+    var fx = Fixtures.init(testing.allocator);
+    defer fx.deinit();
+    try fx.add(.{ .subject = "Root", .issuer = "Root", .subject_key = 3, .issuer_key = 3 });
+    const v4_network = [_]u8{ 192, 0, 2, 0, 255, 255, 255, 0 };
+    const v6_network = [_]u8{ 0x20, 0x01, 0x0d, 0xb8 } ++ [_]u8{0} ** 12 ++ [_]u8{0xff} ** 4 ++ [_]u8{0} ** 12;
+    try fx.add(.{
+        .subject = "Constrained",
+        .issuer = "Root",
+        .subject_key = 2,
+        .issuer_key = 3,
+        .ca = true,
+        .key_usage = 0x04,
+        .name_constraints = .{ .permitted = &.{
+            .{ .directory_cn = "Allowed" },
+            .{ .email = ".example.com" },
+            .{ .uri = ".example.com" },
+            .{ .ip = &v4_network },
+            .{ .ip = &v6_network },
+        } },
+    });
+    const v4_good = [_]u8{ 192, 0, 2, 255 };
+    const v6_good = [_]u8{ 0x20, 0x01, 0x0d, 0xb8 } ++ [_]u8{0xaa} ** 12;
+    try fx.add(.{
+        .subject = "Allowed",
+        .issuer = "Constrained",
+        .subject_key = 4,
+        .issuer_key = 2,
+        .ca = false,
+        .key_usage = 0x80,
+        .san_names = &.{
+            .{ .email = "user@sub.example.com" },
+            .{ .uri = "https://api.example.com:8443/path" },
+            .{ .ip = &v4_good },
+            .{ .ip = &v6_good },
+            .{ .directory_cn = "Allowed" },
+        },
+    });
+    const v4_bad = [_]u8{ 192, 0, 3, 1 };
+    try fx.add(.{
+        .subject = "Allowed",
+        .issuer = "Constrained",
+        .subject_key = 5,
+        .issuer_key = 2,
+        .ca = false,
+        .key_usage = 0x80,
+        .san_names = &.{.{ .ip = &v4_bad }},
+    });
+    try fx.add(.{
+        .subject = "Allowed",
+        .subject_email = "legacy@sub.example.com",
+        .issuer = "Constrained",
+        .subject_key = 6,
+        .issuer_key = 2,
+        .ca = false,
+        .key_usage = 0x80,
+    });
+    try fx.add(.{
+        .subject = "Allowed",
+        .subject_email = "legacy@example.com",
+        .issuer = "Constrained",
+        .subject_key = 7,
+        .issuer_key = 2,
+        .ca = false,
+        .key_usage = 0x80,
+    });
+
+    var entropy: crypto.pure_zig.DeterministicEntropy = undefined;
+    var provider: crypto.pure_zig.Provider = undefined;
+    const cp = cryptoProvider(&entropy, &provider);
+    var good = try validateBuilt(testing.allocator, &fx.certs.items[2], fx.certs.items[1..2], fx.certs.items[0..1], policy(fx.certs.items[0..1]), cp);
+    defer good.deinit(testing.allocator);
+    try expectAccepted(&good, 3);
+
+    var bad = try validateBuilt(testing.allocator, &fx.certs.items[3], fx.certs.items[1..2], fx.certs.items[0..1], policy(fx.certs.items[0..1]), cp);
+    defer bad.deinit(testing.allocator);
+    try expectRejected(&bad, .name_constraints_violation, 0);
+    try testing.expectEqual(name_constraints.Form.ip_address, bad.rejected.name_form.?);
+
+    var legacy_good = try validateBuilt(testing.allocator, &fx.certs.items[4], fx.certs.items[1..2], fx.certs.items[0..1], policy(fx.certs.items[0..1]), cp);
+    defer legacy_good.deinit(testing.allocator);
+    try expectAccepted(&legacy_good, 3);
+
+    var legacy_bad = try validateBuilt(testing.allocator, &fx.certs.items[5], fx.certs.items[1..2], fx.certs.items[0..1], policy(fx.certs.items[0..1]), cp);
+    defer legacy_bad.deinit(testing.allocator);
+    try expectRejected(&legacy_bad, .name_constraints_violation, 0);
+    try testing.expectEqual(name_constraints.Form.rfc822_name, legacy_bad.rejected.name_form.?);
+
+    var uri_bound_policy = policy(fx.certs.items[0..1]);
+    uri_bound_policy.name_constraints.maximum_uri_length = 8;
+    var uri_bound = try validateBuilt(testing.allocator, &fx.certs.items[2], fx.certs.items[1..2], fx.certs.items[0..1], uri_bound_policy, cp);
+    defer uri_bound.deinit(testing.allocator);
+    try expectRejected(&uri_bound, .name_constraints_resource_limit_exceeded, 0);
+}
+
+test "wildcard DNS names apply set semantics through signed paths" {
+    const Case = struct {
+        constraint: []const u8,
+        excluded: bool,
+        accepted: bool,
+    };
+    inline for ([_]Case{
+        .{ .constraint = "example.com", .excluded = false, .accepted = true },
+        .{ .constraint = ".example.com", .excluded = false, .accepted = true },
+        .{ .constraint = "foo.example.com", .excluded = false, .accepted = false },
+        .{ .constraint = "foo.example.com", .excluded = true, .accepted = false },
+        .{ .constraint = ".foo.example.com", .excluded = true, .accepted = true },
+        .{ .constraint = ".example.com", .excluded = true, .accepted = false },
+    }) |case| {
+        var fx = Fixtures.init(testing.allocator);
+        defer fx.deinit();
+        try fx.add(.{ .subject = "Root", .issuer = "Root", .subject_key = 3, .issuer_key = 3 });
+        try fx.add(.{
+            .subject = "Constrained",
+            .issuer = "Root",
+            .subject_key = 2,
+            .issuer_key = 3,
+            .ca = true,
+            .key_usage = 0x04,
+            .name_constraints = if (case.excluded)
+                .{ .excluded = &.{.{ .dns = case.constraint }} }
+            else
+                .{ .permitted = &.{.{ .dns = case.constraint }} },
+        });
+        try fx.add(.{
+            .subject = "wildcard leaf",
+            .issuer = "Constrained",
+            .subject_key = 4,
+            .issuer_key = 2,
+            .ca = false,
+            .key_usage = 0x80,
+            .san = "*.example.com",
+        });
+
+        var entropy: crypto.pure_zig.DeterministicEntropy = undefined;
+        var provider: crypto.pure_zig.Provider = undefined;
+        const cp = cryptoProvider(&entropy, &provider);
+        var result = try validateBuilt(testing.allocator, &fx.certs.items[2], fx.certs.items[1..2], fx.certs.items[0..1], policy(fx.certs.items[0..1]), cp);
+        defer result.deinit(testing.allocator);
+        if (case.accepted) {
+            try expectAccepted(&result, 3);
+        } else {
+            try expectRejected(&result, .name_constraints_violation, 0);
+            try testing.expectEqual(name_constraints.Form.dns_name, result.rejected.name_form.?);
+        }
+    }
+
+    inline for ([_][]const u8{ "*", "a.*.example.com", "f*o.example.com", "*.com" }) |malformed| {
+        var fx = Fixtures.init(testing.allocator);
+        defer fx.deinit();
+        try fx.add(.{ .subject = "Root", .issuer = "Root", .subject_key = 3, .issuer_key = 3 });
+        try fx.add(.{
+            .subject = "Constrained",
+            .issuer = "Root",
+            .subject_key = 2,
+            .issuer_key = 3,
+            .ca = true,
+            .key_usage = 0x04,
+            .name_constraints = .{ .permitted = &.{.{ .dns = "example.com" }} },
+        });
+        try fx.add(.{
+            .subject = "malformed wildcard leaf",
+            .issuer = "Constrained",
+            .subject_key = 4,
+            .issuer_key = 2,
+            .ca = false,
+            .key_usage = 0x80,
+            .san = malformed,
+        });
+
+        var entropy: crypto.pure_zig.DeterministicEntropy = undefined;
+        var provider: crypto.pure_zig.Provider = undefined;
+        const cp = cryptoProvider(&entropy, &provider);
+        var result = try validateBuilt(testing.allocator, &fx.certs.items[2], fx.certs.items[1..2], fx.certs.items[0..1], policy(fx.certs.items[0..1]), cp);
+        defer result.deinit(testing.allocator);
+        try expectRejected(&result, .name_constraints_violation, 0);
+        try testing.expectEqual(name_constraints.Form.dns_name, result.rejected.name_form.?);
+    }
+}
+
+test "mailbox and URI syntax is enforced through signed paths" {
+    var fx = Fixtures.init(testing.allocator);
+    defer fx.deinit();
+    try fx.add(.{ .subject = "Root", .issuer = "Root", .subject_key = 3, .issuer_key = 3 });
+    try fx.add(.{
+        .subject = "Constrained",
+        .issuer = "Root",
+        .subject_key = 2,
+        .issuer_key = 3,
+        .ca = true,
+        .key_usage = 0x04,
+        .name_constraints = .{ .permitted = &.{
+            .{ .email = "root@example.com" },
+            .{ .email = ".example.com" },
+            .{ .uri = ".example.com" },
+        } },
+    });
+    try fx.add(.{
+        .subject = "quoted forms",
+        .issuer = "Constrained",
+        .subject_key = 4,
+        .issuer_key = 2,
+        .ca = false,
+        .key_usage = 0x80,
+        .san_names = &.{
+            .{ .email = "\"root\"@example.com" },
+            .{ .email = "\"a@b\"@sub.example.com" },
+            .{ .uri = "https://user:pa%73s@api.example.com/path" },
+        },
+    });
+    try fx.add(.{
+        .subject = "legacy ignored",
+        .subject_email = "legacy@outside.invalid",
+        .issuer = "Constrained",
+        .subject_key = 5,
+        .issuer_key = 2,
+        .ca = false,
+        .key_usage = 0x80,
+        .san_names = &.{.{ .dns = "outside.invalid" }},
+    });
+    try fx.add(.{
+        .subject = "legacy constrained",
+        .subject_email = "legacy@outside.invalid",
+        .issuer = "Constrained",
+        .subject_key = 6,
+        .issuer_key = 2,
+        .ca = false,
+        .key_usage = 0x80,
+    });
+    try fx.add(.{
+        .subject = "SAN email constrained",
+        .subject_email = "legacy@sub.example.com",
+        .issuer = "Constrained",
+        .subject_key = 7,
+        .issuer_key = 2,
+        .ca = false,
+        .key_usage = 0x80,
+        .san_names = &.{.{ .email = "legacy@outside.invalid" }},
+    });
+
+    const malformed_mailboxes = [_][]const u8{
+        ".a@sub.example.com",
+        "a..b@sub.example.com",
+        "a.@sub.example.com",
+        "a(b)@sub.example.com",
+    };
+    inline for (malformed_mailboxes, 0..) |mailbox, offset| {
+        try fx.add(.{
+            .subject = "malformed mailbox",
+            .issuer = "Constrained",
+            .subject_key = 8 + offset,
+            .issuer_key = 2,
+            .ca = false,
+            .key_usage = 0x80,
+            .san_names = &.{.{ .email = mailbox }},
+        });
+    }
+    const malformed_uris = [_][]const u8{
+        "https://bad@@api.example.com/",
+        "https://bad user@api.example.com/",
+        "https://bad%ZZ@api.example.com/",
+    };
+    inline for (malformed_uris, 0..) |uri, offset| {
+        try fx.add(.{
+            .subject = "malformed URI",
+            .issuer = "Constrained",
+            .subject_key = 12 + offset,
+            .issuer_key = 2,
+            .ca = false,
+            .key_usage = 0x80,
+            .san_names = &.{.{ .uri = uri }},
+        });
+    }
+
+    var entropy: crypto.pure_zig.DeterministicEntropy = undefined;
+    var provider: crypto.pure_zig.Provider = undefined;
+    const cp = cryptoProvider(&entropy, &provider);
+    inline for (.{ @as(usize, 2), 3 }) |index| {
+        var accepted = try validateBuilt(testing.allocator, &fx.certs.items[index], fx.certs.items[1..2], fx.certs.items[0..1], policy(fx.certs.items[0..1]), cp);
+        defer accepted.deinit(testing.allocator);
+        try expectAccepted(&accepted, 3);
+    }
+    inline for (.{ @as(usize, 4), 5 }) |index| {
+        var rejected = try validateBuilt(testing.allocator, &fx.certs.items[index], fx.certs.items[1..2], fx.certs.items[0..1], policy(fx.certs.items[0..1]), cp);
+        defer rejected.deinit(testing.allocator);
+        try expectRejected(&rejected, .name_constraints_violation, 0);
+        try testing.expectEqual(name_constraints.Form.rfc822_name, rejected.rejected.name_form.?);
+    }
+    inline for (6..10) |index| {
+        var rejected = try validateBuilt(testing.allocator, &fx.certs.items[index], fx.certs.items[1..2], fx.certs.items[0..1], policy(fx.certs.items[0..1]), cp);
+        defer rejected.deinit(testing.allocator);
+        try expectRejected(&rejected, .name_constraints_violation, 0);
+        try testing.expectEqual(name_constraints.Form.rfc822_name, rejected.rejected.name_form.?);
+    }
+    inline for (10..13) |index| {
+        var rejected = try validateBuilt(testing.allocator, &fx.certs.items[index], fx.certs.items[1..2], fx.certs.items[0..1], policy(fx.certs.items[0..1]), cp);
+        defer rejected.deinit(testing.allocator);
+        try expectRejected(&rejected, .name_constraints_violation, 0);
+        try testing.expectEqual(name_constraints.Form.uri, rejected.rejected.name_form.?);
+    }
+}
+
+test "leaf, noncritical, unsupported-form, and resource-limit policies fail closed" {
+    var fx = Fixtures.init(testing.allocator);
+    defer fx.deinit();
+    try fx.add(.{ .subject = "Root", .issuer = "Root", .subject_key = 3, .issuer_key = 3 });
+    try fx.add(.{
+        .subject = "Constrained",
+        .issuer = "Root",
+        .subject_key = 2,
+        .issuer_key = 3,
+        .ca = true,
+        .key_usage = 0x04,
+        .name_constraints = .{
+            .permitted = &.{ .{ .directory_cn = "leaf" }, .{ .dns = "example.com" } },
+            .excluded = &.{.{ .dns = "invalid.example.com" }},
+        },
+    });
+    try fx.add(.{ .subject = "leaf", .issuer = "Constrained", .subject_key = 4, .issuer_key = 2, .ca = false, .key_usage = 0x80, .san = "api.example.com" });
+    try fx.add(.{
+        .subject = "leaf nc",
+        .issuer = "Root",
+        .subject_key = 5,
+        .issuer_key = 3,
+        .ca = false,
+        .key_usage = 0x80,
+        .name_constraints = .{ .permitted = &.{.{ .dns = "example.com" }} },
+    });
+    try fx.add(.{
+        .subject = "Unsupported",
+        .issuer = "Root",
+        .subject_key = 6,
+        .issuer_key = 3,
+        .ca = true,
+        .key_usage = 0x04,
+        .name_constraints = .{ .permitted = &.{.{ .registered_id = &.{ 1, 2, 3, 4 } }} },
+    });
+    try fx.add(.{ .subject = "unsupported leaf", .issuer = "Unsupported", .subject_key = 7, .issuer_key = 6, .ca = false, .key_usage = 0x80 });
+    const malformed_mask = [_]u8{ 192, 0, 2, 0, 255, 0, 255, 0 };
+    try fx.add(.{
+        .subject = "Malformed mask",
+        .issuer = "Root",
+        .subject_key = 8,
+        .issuer_key = 3,
+        .ca = true,
+        .key_usage = 0x04,
+        .name_constraints = .{ .permitted = &.{.{ .ip = &malformed_mask }} },
+    });
+    try fx.add(.{ .subject = "malformed mask leaf", .issuer = "Malformed mask", .subject_key = 9, .issuer_key = 8, .ca = false, .key_usage = 0x80 });
+
+    var entropy: crypto.pure_zig.DeterministicEntropy = undefined;
+    var provider: crypto.pure_zig.Provider = undefined;
+    const cp = cryptoProvider(&entropy, &provider);
+    var resource_policy = policy(fx.certs.items[0..1]);
+    resource_policy.name_constraints.maximum_comparisons = 0;
+    var exhausted = try validateBuilt(testing.allocator, &fx.certs.items[2], fx.certs.items[1..2], fx.certs.items[0..1], resource_policy, cp);
+    defer exhausted.deinit(testing.allocator);
+    try expectRejected(&exhausted, .name_constraints_resource_limit_exceeded, 0);
+
+    var groups_policy = policy(fx.certs.items[0..1]);
+    groups_policy.name_constraints.maximum_permitted_groups_per_form = 0;
+    var groups = try validateBuilt(testing.allocator, &fx.certs.items[2], fx.certs.items[1..2], fx.certs.items[0..1], groups_policy, cp);
+    defer groups.deinit(testing.allocator);
+    try expectRejected(&groups, .name_constraints_resource_limit_exceeded, 1);
+
+    var permitted_policy = policy(fx.certs.items[0..1]);
+    permitted_policy.name_constraints.maximum_permitted_subtrees = 1;
+    var permitted = try validateBuilt(testing.allocator, &fx.certs.items[2], fx.certs.items[1..2], fx.certs.items[0..1], permitted_policy, cp);
+    defer permitted.deinit(testing.allocator);
+    try expectRejected(&permitted, .name_constraints_resource_limit_exceeded, 1);
+
+    var excluded_policy = policy(fx.certs.items[0..1]);
+    excluded_policy.name_constraints.maximum_excluded_subtrees = 0;
+    var excluded = try validateBuilt(testing.allocator, &fx.certs.items[2], fx.certs.items[1..2], fx.certs.items[0..1], excluded_policy, cp);
+    defer excluded.deinit(testing.allocator);
+    try expectRejected(&excluded, .name_constraints_resource_limit_exceeded, 1);
+
+    var names_policy = policy(fx.certs.items[0..1]);
+    names_policy.name_constraints.maximum_names_per_certificate = 0;
+    var names = try validateBuilt(testing.allocator, &fx.certs.items[2], fx.certs.items[1..2], fx.certs.items[0..1], names_policy, cp);
+    defer names.deinit(testing.allocator);
+    try expectRejected(&names, .name_constraints_resource_limit_exceeded, 0);
+
+    var directory_policy = policy(fx.certs.items[0..1]);
+    directory_policy.name_constraints.maximum_directory_name_parses = 0;
+    var directory = try validateBuilt(testing.allocator, &fx.certs.items[2], fx.certs.items[1..2], fx.certs.items[0..1], directory_policy, cp);
+    defer directory.deinit(testing.allocator);
+    try expectRejected(&directory, .name_constraints_resource_limit_exceeded, 1);
+
+    var rdn_policy = policy(fx.certs.items[0..1]);
+    rdn_policy.name_constraints.maximum_directory_name_rdns = 0;
+    var rdns = try validateBuilt(testing.allocator, &fx.certs.items[2], fx.certs.items[1..2], fx.certs.items[0..1], rdn_policy, cp);
+    defer rdns.deinit(testing.allocator);
+    try expectRejected(&rdns, .name_constraints_resource_limit_exceeded, 1);
+
+    var attribute_policy = policy(fx.certs.items[0..1]);
+    attribute_policy.name_constraints.maximum_directory_name_attributes_per_rdn = 0;
+    var attributes = try validateBuilt(testing.allocator, &fx.certs.items[2], fx.certs.items[1..2], fx.certs.items[0..1], attribute_policy, cp);
+    defer attributes.deinit(testing.allocator);
+    try expectRejected(&attributes, .name_constraints_resource_limit_exceeded, 1);
+
+    var path_policy = policy(fx.certs.items[0..1]);
+    path_policy.name_constraints.maximum_path_length = 2;
+    var path_bound = try validateBuilt(testing.allocator, &fx.certs.items[2], fx.certs.items[1..2], fx.certs.items[0..1], path_policy, cp);
+    defer path_bound.deinit(testing.allocator);
+    try expectRejected(&path_bound, .name_constraints_resource_limit_exceeded, null);
+
+    var leaf_nc = try validateBuilt(testing.allocator, &fx.certs.items[3], &.{}, fx.certs.items[0..1], policy(fx.certs.items[0..1]), cp);
+    defer leaf_nc.deinit(testing.allocator);
+    try expectRejected(&leaf_nc, .name_constraints_unsupported, 0);
+
+    var unsupported = try validateBuilt(testing.allocator, &fx.certs.items[5], fx.certs.items[4..5], fx.certs.items[0..1], policy(fx.certs.items[0..1]), cp);
+    defer unsupported.deinit(testing.allocator);
+    try expectRejected(&unsupported, .name_constraints_unsupported, 1);
+
+    var malformed = try validateBuilt(testing.allocator, &fx.certs.items[7], fx.certs.items[6..7], fx.certs.items[0..1], policy(fx.certs.items[0..1]), cp);
+    defer malformed.deinit(testing.allocator);
+    try expectRejected(&malformed, .name_constraints_unsupported, 1);
+}
+
+test "Name Constraints allocation failures clean up every partial state" {
+    var fx = Fixtures.init(testing.allocator);
+    defer fx.deinit();
+    try fx.add(.{ .subject = "Root", .issuer = "Root", .subject_key = 3, .issuer_key = 3 });
+    try fx.add(.{
+        .subject = "Constrained",
+        .issuer = "Root",
+        .subject_key = 2,
+        .issuer_key = 3,
+        .ca = true,
+        .key_usage = 0x04,
+        .name_constraints = .{
+            .permitted = &.{ .{ .directory_cn = "leaf" }, .{ .dns = "example.com" } },
+            .excluded = &.{.{ .dns = "blocked.example.com" }},
+        },
+    });
+    try fx.add(.{ .subject = "leaf", .issuer = "Constrained", .subject_key = 4, .issuer_key = 2, .ca = false, .key_usage = 0x80, .san = "api.example.com" });
+
+    var entropy: crypto.pure_zig.DeterministicEntropy = undefined;
+    var provider: crypto.pure_zig.Provider = undefined;
+    const cp = cryptoProvider(&entropy, &provider);
+    const elements = [_]path_builder.Element{
+        .{ .certificate = &fx.certs.items[2], .source = .leaf, .input_index = 0 },
+        .{ .certificate = &fx.certs.items[1], .source = .intermediate, .input_index = 0 },
+        .{ .certificate = &fx.certs.items[0], .source = .anchor, .input_index = 0 },
+    };
+    const Context = struct {
+        path: path_builder.Path,
+        validation_policy: validator.ValidationPolicy,
+        crypto_provider: crypto.provider.CryptoProvider,
+
+        fn run(allocator: std.mem.Allocator, context: @This()) !void {
+            var result = validator.validatePath(allocator, context.path, context.validation_policy, context.crypto_provider);
+            defer result.deinit(allocator);
+            switch (result) {
+                .accepted => {},
+                .rejected => |rejected| {
+                    if (rejected.reason == .out_of_memory) return error.OutOfMemory;
+                    std.debug.print("unexpected allocation sweep rejection: {s}\n", .{@tagName(rejected.reason)});
+                    return error.TestUnexpectedResult;
+                },
+            }
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Context.run, .{Context{
+        .path = .{ .elements = &elements },
+        .validation_policy = policy(fx.certs.items[0..1]),
+        .crypto_provider = cp,
+    }});
+}
+
+test "alternate candidate validation continues after a Name Constraints violation" {
+    var fx = Fixtures.init(testing.allocator);
+    defer fx.deinit();
+    try fx.add(.{ .subject = "leaf", .issuer = "Shared", .subject_key = 1, .issuer_key = 2, .ca = false, .key_usage = 0x80, .san = "api.example.com" });
+    try fx.add(.{
+        .subject = "Shared",
+        .issuer = "Root",
+        .subject_key = 2,
+        .issuer_key = 3,
+        .ca = true,
+        .key_usage = 0x04,
+        .name_constraints = .{ .excluded = &.{.{ .dns = "example.com" }} },
+    });
+    try fx.add(.{ .subject = "Shared", .issuer = "Root", .subject_key = 2, .issuer_key = 3, .ca = true, .key_usage = 0x04 });
+    try fx.add(.{ .subject = "Root", .issuer = "Root", .subject_key = 3, .issuer_key = 3 });
+
+    var entropy: crypto.pure_zig.DeterministicEntropy = undefined;
+    var provider: crypto.pure_zig.Provider = undefined;
+    const cp = cryptoProvider(&entropy, &provider);
+    var candidates = try path_builder.build(testing.allocator, &fx.certs.items[0], fx.certs.items[1..3], fx.certs.items[3..4], .{});
+    defer candidates.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), candidates.paths.len);
+    var result = validator.validateCandidates(testing.allocator, candidates, policy(fx.certs.items[3..4]), cp);
+    defer result.deinit(testing.allocator);
+    try expectAccepted(&result, 3);
+    try testing.expectEqual(@as(usize, 1), result.accepted.accepted_path[1].input_index);
 }
 
 test "hostname verification is delegated and runs after path authentication" {

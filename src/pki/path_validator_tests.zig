@@ -179,6 +179,8 @@ const NameConstraintsSpec = struct {
 const PolicyQualifierSpec = union(enum) {
     cps: []const u8,
     user_notice: []const u8,
+    user_notice_negative_number: []const u8,
+    user_notice_nonminimal_number: []const u8,
     unsupported: []const u32,
 };
 
@@ -201,11 +203,21 @@ fn certificatePoliciesValue(arena: std.mem.Allocator, policies: []const PolicySp
                 const qualifier_oid: []const u32 = switch (qualifier) {
                     .cps => &oid.well_known.policy_qualifier_cps,
                     .user_notice => &oid.well_known.policy_qualifier_user_notice,
+                    .user_notice_negative_number => &oid.well_known.policy_qualifier_user_notice,
+                    .user_notice_nonminimal_number => &oid.well_known.policy_qualifier_user_notice,
                     .unsupported => |components| components,
                 };
                 const value = switch (qualifier) {
                     .cps => |uri| try tlv(arena, 0x16, &.{uri}),
                     .user_notice => |text| try tlv(arena, 0x30, &.{try tlv(arena, 0x0c, &.{text})}),
+                    .user_notice_negative_number => |organization| try tlv(arena, 0x30, &.{try tlv(arena, 0x30, &.{
+                        try tlv(arena, 0x0c, &.{organization}),
+                        try tlv(arena, 0x30, &.{try tlv(arena, 0x02, &.{&[_]u8{0xff}})}),
+                    })}),
+                    .user_notice_nonminimal_number => |organization| try tlv(arena, 0x30, &.{try tlv(arena, 0x30, &.{
+                        try tlv(arena, 0x0c, &.{organization}),
+                        try tlv(arena, 0x30, &.{try tlv(arena, 0x02, &.{&[_]u8{ 0xff, 0xff }})}),
+                    })}),
                     .unsupported => try tlv(arena, 0x05, &.{}),
                 };
                 try qualifier_parts.append(arena, try tlv(arena, 0x30, &.{
@@ -1936,6 +1948,7 @@ test "critical policy qualifiers are supported or rejected safely" {
     const supported = [_]PolicyQualifierSpec{
         .{ .cps = "https://ca.example/cps" },
         .{ .user_notice = "appliance policy" },
+        .{ .user_notice_negative_number = "legacy notice numbers" },
     };
     try fx.add(.{
         .subject = "Supported",
@@ -2597,10 +2610,8 @@ test "policy parser rejects malformed qualifiers mappings and counter integers" 
         .{ .constraints = &.{ 0x30, 0x04, 0x80, 0x02, 0x00, 0x01 } },
         .{ .constraints = &.{ 0x30, 0x06, 0x80, 0x01, 0x00, 0x80, 0x01, 0x00 } },
         .{ .constraints = &.{ 0x30, 0x06, 0x81, 0x01, 0x01, 0x80, 0x01, 0x01 } },
-        .{ .constraints = &.{ 0x30, 0x07, 0x80, 0x05, 0x01, 0x00, 0x00, 0x00, 0x00 } },
         .{ .inhibit = &.{ 0x02, 0x01, 0xff } },
         .{ .inhibit = &.{ 0x02, 0x02, 0x00, 0x01 } },
-        .{ .inhibit = &.{ 0x02, 0x05, 0x01, 0x00, 0x00, 0x00, 0x00 } },
     };
     for (malformed_values, 0..) |value, index| {
         var fx = Fixtures.init(testing.allocator);
@@ -2642,6 +2653,107 @@ test "policy parser rejects malformed qualifiers mappings and counter integers" 
         .issuer_key = 21,
         .raw_certificate_policies = empty_qualifiers,
     }));
+
+    var notice = Fixtures.init(testing.allocator);
+    defer notice.deinit();
+    const nonminimal_notice = [_]PolicyQualifierSpec{.{ .user_notice_nonminimal_number = "nonminimal" }};
+    try testing.expectError(error.MalformedExtension, notice.add(.{
+        .subject = "nonminimal notice number",
+        .issuer = "nonminimal notice number",
+        .subject_key = 22,
+        .issuer_key = 22,
+        .certificate_policies = &.{.{ .policy = &policy_a, .qualifiers = &nonminimal_notice }},
+        .certificate_policies_critical = true,
+    }));
+}
+
+test "SkipCerts values above u32 saturate without inhibiting bounded paths" {
+    const require_large = [_]u8{ 0x30, 0x07, 0x80, 0x05, 0x01, 0x00, 0x00, 0x00, 0x00 };
+    const mapping_large = [_]u8{ 0x30, 0x07, 0x81, 0x05, 0x01, 0x00, 0x00, 0x00, 0x00 };
+    const any_large = [_]u8{ 0x02, 0x05, 0x01, 0x00, 0x00, 0x00, 0x00 };
+    var fx = Fixtures.init(testing.allocator);
+    defer fx.deinit();
+    try fx.add(.{ .subject = "Root", .issuer = "Root", .subject_key = 8, .issuer_key = 8, .ca = true, .key_usage = 0x04 });
+    try fx.add(.{
+        .subject = "Require large",
+        .issuer = "Root",
+        .subject_key = 2,
+        .issuer_key = 8,
+        .ca = true,
+        .key_usage = 0x04,
+        .certificate_policies = &.{.{ .policy = &policy_a }},
+        .raw_policy_constraints = &require_large,
+    });
+    try fx.add(.{ .subject = "missing leaf", .issuer = "Require large", .subject_key = 1, .issuer_key = 2, .ca = false, .key_usage = 0x80 });
+    try fx.add(.{
+        .subject = "Mapping upper",
+        .issuer = "Root",
+        .subject_key = 5,
+        .issuer_key = 8,
+        .ca = true,
+        .key_usage = 0x04,
+        .certificate_policies = &.{.{ .policy = &policy_a }},
+        .raw_policy_constraints = &mapping_large,
+    });
+    try fx.add(.{
+        .subject = "Mapping lower",
+        .issuer = "Mapping upper",
+        .subject_key = 4,
+        .issuer_key = 5,
+        .ca = true,
+        .key_usage = 0x04,
+        .certificate_policies = &.{.{ .policy = &policy_a }},
+        .policy_mappings = &.{.{ .issuer = &policy_a, .subject = &policy_b }},
+    });
+    try fx.add(.{
+        .subject = "mapped leaf",
+        .issuer = "Mapping lower",
+        .subject_key = 3,
+        .issuer_key = 4,
+        .ca = false,
+        .key_usage = 0x80,
+        .certificate_policies = &.{.{ .policy = &policy_b }},
+    });
+    try fx.add(.{
+        .subject = "Any large",
+        .issuer = "Root",
+        .subject_key = 7,
+        .issuer_key = 8,
+        .ca = true,
+        .key_usage = 0x04,
+        .certificate_policies = &.{.{ .policy = &oid.well_known.any_policy }},
+        .raw_inhibit_any_policy = &any_large,
+    });
+    try fx.add(.{
+        .subject = "any leaf",
+        .issuer = "Any large",
+        .subject_key = 6,
+        .issuer_key = 7,
+        .ca = false,
+        .key_usage = 0x80,
+        .certificate_policies = &.{.{ .policy = &oid.well_known.any_policy }},
+    });
+
+    try testing.expect(fx.certs.items[1].policyConstraints().?.require_explicit_policy.? > 3);
+    try testing.expect(fx.certs.items[3].policyConstraints().?.inhibit_policy_mapping.? > 3);
+    try testing.expect(fx.certs.items[6].inhibitAnyPolicy().? > 3);
+    var entropy: crypto.pure_zig.DeterministicEntropy = undefined;
+    var provider: crypto.pure_zig.Provider = undefined;
+    const cp = cryptoProvider(&entropy, &provider);
+    var require_result = try validateBuilt(testing.allocator, &fx.certs.items[2], fx.certs.items[1..2], fx.certs.items[0..1], policy(fx.certs.items[0..1]), cp);
+    defer require_result.deinit(testing.allocator);
+    try expectAccepted(&require_result, 3);
+
+    const requested = [_]oid.ObjectIdentifier{try policyObject(&policy_a)};
+    var strict = policy(fx.certs.items[0..1]);
+    strict.certificate_policy.user_initial_policy_set = .{ .explicit = &requested };
+    strict.certificate_policy.initial_explicit_policy = true;
+    var mapping_result = try validateBuilt(testing.allocator, &fx.certs.items[5], fx.certs.items[3..5], fx.certs.items[0..1], strict, cp);
+    defer mapping_result.deinit(testing.allocator);
+    try expectAccepted(&mapping_result, 4);
+    var any_result = try validateBuilt(testing.allocator, &fx.certs.items[7], fx.certs.items[6..7], fx.certs.items[0..1], strict, cp);
+    defer any_result.deinit(testing.allocator);
+    try expectAccepted(&any_result, 3);
 }
 
 test "empty user policy sets and target wrap-up constraints are explicit" {

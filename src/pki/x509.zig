@@ -36,6 +36,8 @@ const rfc4518_data = @import("rfc4518_data.zig");
 const time_mod = @import("time.zig");
 
 const wk = oid_mod.well_known;
+/// ASN.1 VisibleString is universal tag 26 (X.680, clause 8.23).
+const visible_string_tag_number: u32 = 26;
 
 /// Configurable parser resource bounds, applied on top of `der.Limits`.
 pub const Limits = struct {
@@ -370,8 +372,11 @@ pub const PolicyMapping = struct {
 };
 
 pub const PolicyConstraints = struct {
-    require_explicit_policy: ?u32,
-    inhibit_policy_mapping: ?u32,
+    /// RFC 5280 SkipCerts values are unbounded non-negative INTEGERs. Values
+    /// larger than this platform can represent saturate because validation
+    /// only compares them with the much smaller bounded path counters.
+    require_explicit_policy: ?usize,
+    inhibit_policy_mapping: ?usize,
 };
 
 pub const Extension = struct {
@@ -394,7 +399,7 @@ pub const Extension = struct {
         certificate_policies: []const PolicyInformation,
         policy_mappings: []const PolicyMapping,
         policy_constraints: PolicyConstraints,
-        inhibit_any_policy: u32,
+        inhibit_any_policy: usize,
         unrecognized: void,
     };
 };
@@ -522,7 +527,7 @@ pub const Certificate = struct {
         return extension.parsed.policy_constraints;
     }
 
-    pub fn inhibitAnyPolicy(self: *const Certificate) ?u32 {
+    pub fn inhibitAnyPolicy(self: *const Certificate) ?usize {
         const extension = self.findExtension(&wk.inhibit_any_policy) orelse return null;
         return extension.parsed.inhibit_any_policy;
     }
@@ -1248,8 +1253,7 @@ const Parser = struct {
         try self.validateDisplayText(organization);
         var numbers = notice_ref.readSequence() catch return error.MalformedExtension;
         while (numbers.remaining() > 0) {
-            const number = numbers.readInteger() catch return error.MalformedExtension;
-            if (number.isNegative()) return error.MalformedExtension;
+            _ = numbers.readInteger() catch return error.MalformedExtension;
         }
         numbers.expectEnd() catch return error.MalformedExtension;
         notice_ref.expectEnd() catch return error.MalformedExtension;
@@ -1264,7 +1268,7 @@ const Parser = struct {
                 der.validateIa5String(elem.content) catch return error.MalformedExtension;
                 character_count = elem.content.len;
             },
-            26 => {
+            visible_string_tag_number => {
                 for (elem.content) |byte| if (byte < 0x20 or byte > 0x7e) return error.MalformedExtension;
                 character_count = elem.content.len;
             },
@@ -1343,7 +1347,7 @@ const Parser = struct {
             der.validateInteger(elem.content, self.limits.der.max_integer_bytes) catch return error.MalformedExtension;
             const integer = der.IntegerView{ .content = elem.content };
             if (integer.isNegative()) return error.MalformedExtension;
-            const count = integerToU32(integer) orelse return error.MalformedExtension;
+            const count = integerToSaturatingUsize(integer);
             if (elem.tag.number == 0) {
                 constraints.require_explicit_policy = count;
             } else {
@@ -1357,12 +1361,12 @@ const Parser = struct {
         return constraints;
     }
 
-    fn parseInhibitAnyPolicy(self: *Parser, value: []const u8) Error!u32 {
+    fn parseInhibitAnyPolicy(self: *Parser, value: []const u8) Error!usize {
         var reader = der.Reader.init(value, self.limits.der);
         const integer = reader.readInteger() catch return error.MalformedExtension;
         reader.expectEnd() catch return error.MalformedExtension;
         if (integer.isNegative()) return error.MalformedExtension;
-        return integerToU32(integer) orelse error.MalformedExtension;
+        return integerToSaturatingUsize(integer);
     }
 
     /// Wrap a SEQUENCE OF GeneralName held in `value` (SAN payload).
@@ -1850,6 +1854,23 @@ fn integerToU32(view: der.IntegerView) ?u32 {
     }
     if (value > std.math.maxInt(u32)) return null;
     return @intCast(value);
+}
+
+fn integerToSaturatingUsize(view: der.IntegerView) usize {
+    var value: usize = 0;
+    for (view.content) |byte| {
+        value = std.math.mul(usize, value, 256) catch return std.math.maxInt(usize);
+        value = std.math.add(usize, value, @as(usize, byte)) catch return std.math.maxInt(usize);
+    }
+    return value;
+}
+
+test "SkipCerts conversion saturates values wider than usize" {
+    const wider_than_usize = [_]u8{0x01} ++ ([_]u8{0x00} ** @sizeOf(usize));
+    try std.testing.expectEqual(
+        std.math.maxInt(usize),
+        integerToSaturatingUsize(.{ .content = &wider_than_usize }),
+    );
 }
 
 fn isSequence(elem: der.Element) bool {

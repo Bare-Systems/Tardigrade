@@ -12,6 +12,7 @@ const testing = std.testing;
 const fixture_dir = "src/pki/testdata/name_constraints";
 const policy_fixture_dir = "src/pki/testdata/policy";
 const validation_time: i64 = 1_784_332_800; // 2026-07-18T00:00:00Z
+const validation_time_argument = std.fmt.comptimePrint("{d}", .{validation_time});
 const policy_a = [_]u32{ 1, 3, 6, 1, 4, 1, 55555, 1 };
 
 const Case = struct {
@@ -53,7 +54,7 @@ fn opensslDecision(allocator: std.mem.Allocator, case: Case) !bool {
     const openssl = compat.getEnvVarOwned(allocator, "OPENSSL_BIN") catch try allocator.dupe(u8, "openssl");
     defer allocator.free(openssl);
     const result = try std.process.run(allocator, compat.io(), .{
-        .argv = &.{ openssl, "verify", "-attime", "1784332800", "-CAfile", root_path, "-untrusted", intermediate_path, leaf_path },
+        .argv = &.{ openssl, "verify", "-attime", validation_time_argument, "-CAfile", root_path, "-untrusted", intermediate_path, leaf_path },
         .stdout_limit = .limited(1024 * 1024),
         .stderr_limit = .limited(1024 * 1024),
     });
@@ -172,7 +173,7 @@ fn opensslPolicyDecision(allocator: std.mem.Allocator, case: PolicyCase) !bool {
     defer allocator.free(openssl);
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(allocator);
-    try argv.appendSlice(allocator, &.{ openssl, "verify", "-attime", "1784332800", "-CAfile", paths.root, "-untrusted", paths.untrusted, "-policy", "1.3.6.1.4.1.55555.1", "-policy_check" });
+    try argv.appendSlice(allocator, &.{ openssl, "verify", "-attime", validation_time_argument, "-CAfile", paths.root, "-untrusted", paths.untrusted, "-policy", "1.3.6.1.4.1.55555.1", "-policy_check" });
     if (case.explicit_policy) try argv.append(allocator, "-explicit_policy");
     if (case.inhibit_any) try argv.append(allocator, "-inhibit_any");
     if (case.inhibit_mapping) try argv.append(allocator, "-inhibit_map");

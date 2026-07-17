@@ -125,9 +125,10 @@ pub const ValidationResult = union(enum) {
     }
 };
 
-/// Validate one leaf-first, anchor-last candidate path. The only allocation is
-/// the owned element slice returned on success; allocation failure is itself a
-/// structured rejection. No certificate bytes or provider objects are owned.
+/// Validate one leaf-first, anchor-last candidate path. Policy processing uses
+/// bounded temporary arena state; success owns the returned element and policy
+/// output slices. Allocation failure is a structured rejection. No certificate
+/// bytes or provider objects are owned.
 pub fn validatePath(
     allocator: std.mem.Allocator,
     path: path_builder.Path,

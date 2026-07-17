@@ -26,27 +26,40 @@
 //! Certificate chains are surfaced as `CertificateChain`: an immutable view
 //! over a slice of DER byte slices.
 //!
-//!   - The outer `entries` collection is owned by whoever built the chain: the
-//!     engine's bounded reassembly buffer for *peer* chains, the provider's own
-//!     storage for *local* chains. `CertificateChain` never owns or frees it.
-//!   - Each inner DER byte slice is likewise borrowed, never copied by the view.
-//!   - A view handed to a callback (peer DER into `PeerVerifier.verify`, local
-//!     DER out of `SelectedCredential.chain`) is valid ONLY for the duration of
-//!     that single call. A callback MUST NOT retain any slice past its return;
-//!     it copies out anything it needs. The engine may reuse or wipe the
-//!     backing storage immediately afterward.
-//!   - A `SelectedCredential` handle is released exactly once, via `release`,
-//!     after the local flight has been signed and emitted, or immediately on
-//!     any failure encountered after selection (cancellation included). After
-//!     `release` the handle and every slice it produced are invalid.
+//! over a slice of DER byte slices. The `entries` collection and every inner
+//! DER slice are borrowed; `CertificateChain` never owns or frees them. Three
+//! distinct lifetime rules apply depending on which chain it is:
 //!
-//! ## Non-blocking compatibility
+//!   - **Selection-context inputs** (`SelectionContext.server_name`,
+//!     `.peer_signature_schemes`) are valid ONLY during the `select` call. A
+//!     provider that suspends (returns `pending`) or wants to keep any of them
+//!     MUST copy into its own storage first.
+//!   - **Peer-chain views** (`VerificationContext.chain`) are valid ONLY during
+//!     the `verify` call. A verifier MUST NOT retain a slice past its return;
+//!     the engine may reuse or wipe the reassembly buffer immediately after,
+//!     and any pending verify operation owns its own snapshot.
+//!   - **A selected local credential's chain** (`SelectedCredential.chain`) is
+//!     immutable and valid until `SelectedCredential.release()`. The engine
+//!     calls `chain()`, then serializes those slices into the flight, so the
+//!     provider MUST keep them stable for the whole selected lifetime — a
+//!     reloadable provider snapshots them at selection, not per-call.
 //!
-//! Every callback takes its inputs by argument and writes outputs into
-//! caller-owned buffers; none require global state or blocking filesystem or
-//! network access. A synchronous fixed provider and a future event-driven
-//! external signer satisfy the same signatures — the contract does not force
-//! private-key work to block.
+//! A `SelectedCredential` handle is released exactly once, via `release`, after
+//! the local flight has been signed and emitted, or immediately on any failure
+//! after selection (cancellation included). After `release` the handle and
+//! every slice it produced are invalid.
+//!
+//! ## Non-blocking / event-driven compatibility
+//!
+//! `select`, `sign`, and `verify` each return a progress value: `complete`
+//! now, or `pending` with a `PendingOperation` the engine drives via
+//! `poll`/`cancel`/`release`. An HSM, remote signer, or asynchronous verifier
+//! returns `pending`, wakes the driver later, and the engine resumes without
+//! recording any handshake message twice; a pending operation snapshots any
+//! input it needs (the transcript-derived signing bytes, the peer chain) so the
+//! caller-owned stack buffers may disappear. Synchronous providers return
+//! `complete` and never allocate a `PendingOperation`. Every operation is
+//! cancelled and released exactly once, including on handshake teardown.
 
 const std = @import("std");
 const crypto = std.crypto;
@@ -277,7 +290,14 @@ pub const FailureClass = enum {
     malformed_credential_chain,
     signing_provider_failure,
     signature_output_overflow,
+    /// The local credential provider itself failed (distinct from a *verifier*
+    /// failure, so diagnostics name the right subsystem).
+    provider_internal_failure,
     invalid_peer_certificate_chain,
+    /// The peer's CertificateVerify signature did not check out against its
+    /// presented leaf (proof-of-possession failure). Peer-originated, but a
+    /// distinct reason from a structurally invalid chain.
+    certificate_verify_invalid,
     peer_verification_rejected,
     verifier_internal_failure,
     invalid_callback_behavior,
@@ -285,6 +305,7 @@ pub const FailureClass = enum {
     pub fn origin(self: FailureClass) Origin {
         return switch (self) {
             .invalid_peer_certificate_chain,
+            .certificate_verify_invalid,
             .peer_verification_rejected,
             => .peer,
             .no_credential_available,
@@ -292,6 +313,7 @@ pub const FailureClass = enum {
             .malformed_credential_chain,
             .signing_provider_failure,
             .signature_output_overflow,
+            .provider_internal_failure,
             .verifier_internal_failure,
             .invalid_callback_behavior,
             => .local,
@@ -312,11 +334,13 @@ pub const FailureClass = enum {
             .malformed_credential_chain,
             .signing_provider_failure,
             .signature_output_overflow,
+            .provider_internal_failure,
             .verifier_internal_failure,
             .invalid_callback_behavior,
             => .internal_error,
             // Peer-originated authentication failure.
             .invalid_peer_certificate_chain,
+            .certificate_verify_invalid,
             .peer_verification_rejected,
             => .bad_certificate,
         };
@@ -328,6 +352,7 @@ pub const FailureClass = enum {
     pub fn engineError(self: FailureClass) events.HandshakeError {
         return switch (self) {
             .invalid_peer_certificate_chain,
+            .certificate_verify_invalid,
             .peer_verification_rejected,
             => error.CertificateInvalid,
             .no_credential_available,
@@ -336,6 +361,7 @@ pub const FailureClass = enum {
             .malformed_credential_chain,
             .signing_provider_failure,
             .signature_output_overflow,
+            .provider_internal_failure,
             .verifier_internal_failure,
             .invalid_callback_behavior,
             => error.CredentialProviderFailed,
@@ -349,7 +375,7 @@ pub fn classifySelectError(err: SelectError) FailureClass {
         error.NoCredentialAvailable => .no_credential_available,
         error.NoCompatibleSignatureAlgorithm => .no_compatible_signature_algorithm,
         error.MalformedCredentialChain => .malformed_credential_chain,
-        error.ProviderInternalFailure => .verifier_internal_failure,
+        error.ProviderInternalFailure => .provider_internal_failure,
         error.InvalidCallbackBehavior => .invalid_callback_behavior,
     };
 }
@@ -704,15 +730,29 @@ pub const MockCredentialProvider = struct {
     /// Return an empty certificate chain from selection, to model a malformed
     /// local credential the engine must reject before signing.
     empty_chain: bool = false,
+    /// Return the leaf repeated this many times, to model a provider whose
+    /// chain exceeds the engine's entry/size bounds.
+    chain_repeat: usize = 1,
+    /// Skip the peer-offer compatibility check and return the credential's
+    /// scheme regardless, to model a provider that hands back an algorithm the
+    /// peer never advertised.
+    ignore_offer: bool = false,
     /// Sign normally, then flip a signature byte, to model a peer whose
     /// CertificateVerify does not check out (proof-of-possession failure).
     flip_signature: bool = false,
+    chain_storage: [16][]const u8 = undefined,
 
     select_count: usize = 0,
     sign_count: usize = 0,
     release_count: usize = 0,
-    last_server_name: ?[]const u8 = null,
+    /// The last SNI selection saw, copied into mock-owned storage — the
+    /// `SelectionContext.server_name` slice is only valid during `select`, so a
+    /// mock that wants to remember it MUST NOT retain the borrowed slice.
+    last_server_name_buf: [256]u8 = undefined,
+    last_server_name_len: usize = 0,
+    last_server_name_present: bool = false,
     last_offered_scheme_count: usize = 0,
+    last_role: ?Role = null,
 
     pub fn init(identity: Identity) MockCredentialProvider {
         return .{ .identity = identity, .chain_entry = .{identity.certificate_der} };
@@ -722,16 +762,31 @@ pub const MockCredentialProvider = struct {
         return .{ .ctx = self, .vtable = &vtable };
     }
 
+    /// The remembered SNI as a slice into mock-owned storage (valid for the
+    /// mock's lifetime), or null when the last selection carried no SNI.
+    pub fn lastServerName(self: *const MockCredentialProvider) ?[]const u8 {
+        return if (self.last_server_name_present) self.last_server_name_buf[0..self.last_server_name_len] else null;
+    }
+
     const vtable = CredentialProvider.VTable{ .select = select };
 
     fn select(ctx: *anyopaque, selection: *const SelectionContext, out: *SelectedCredential) SelectError!void {
         const self: *MockCredentialProvider = @ptrCast(@alignCast(ctx));
         self.select_count += 1;
-        self.last_server_name = selection.server_name;
+        self.last_role = selection.role;
+        if (selection.server_name) |name| {
+            const n = @min(name.len, self.last_server_name_buf.len);
+            @memcpy(self.last_server_name_buf[0..n], name[0..n]);
+            self.last_server_name_len = n;
+            self.last_server_name_present = true;
+        } else {
+            self.last_server_name_present = false;
+            self.last_server_name_len = 0;
+        }
         self.last_offered_scheme_count = selection.peer_signature_schemes.len;
         if (self.force_select_error) |err| return err;
         const scheme = self.identity.signatureScheme();
-        if (!selection.offersScheme(scheme)) return error.NoCompatibleSignatureAlgorithm;
+        if (!self.ignore_offer and !selection.offersScheme(scheme)) return error.NoCompatibleSignatureAlgorithm;
         out.* = .{ .handle = self, .scheme = scheme, .vtable = &credential_vtable };
     }
 
@@ -743,7 +798,11 @@ pub const MockCredentialProvider = struct {
 
     fn credentialChain(handle: *anyopaque) CertificateChain {
         const self: *MockCredentialProvider = @ptrCast(@alignCast(handle));
-        return .{ .entries = if (self.empty_chain) self.chain_entry[0..0] else self.chain_entry[0..] };
+        if (self.empty_chain) return .{ .entries = self.chain_entry[0..0] };
+        if (self.chain_repeat == 1) return .{ .entries = self.chain_entry[0..] };
+        const n = @min(self.chain_repeat, self.chain_storage.len);
+        for (0..n) |i| self.chain_storage[i] = self.identity.certificate_der;
+        return .{ .entries = self.chain_storage[0..n] };
     }
 
     fn credentialSign(handle: *anyopaque, scheme: SignatureScheme, input: []const u8, out: []u8) SignError!usize {
@@ -770,6 +829,13 @@ pub const MockVerifier = struct {
     verify_count: usize = 0,
     last_chain_len: usize = 0,
     last_role: ?Role = null,
+    last_policy: AuthPolicy = .{},
+    /// The server name the verifier last observed, copied into mock-owned
+    /// storage — the `VerificationContext.server_name` slice is only valid
+    /// during the `verify` call.
+    last_server_name_buf: [256]u8 = undefined,
+    last_server_name_len: usize = 0,
+    last_server_name_present: bool = false,
 
     pub fn init(result: VerifyError!Verdict) MockVerifier {
         return .{ .result = result };
@@ -779,6 +845,10 @@ pub const MockVerifier = struct {
         return .{ .ctx = self, .vtable = &vtable };
     }
 
+    pub fn lastServerName(self: *const MockVerifier) ?[]const u8 {
+        return if (self.last_server_name_present) self.last_server_name_buf[0..self.last_server_name_len] else null;
+    }
+
     const vtable = PeerVerifier.VTable{ .verify = verify };
 
     fn verify(ctx: *anyopaque, context: *const VerificationContext) VerifyError!Verdict {
@@ -786,6 +856,16 @@ pub const MockVerifier = struct {
         self.verify_count += 1;
         self.last_chain_len = context.chain.count();
         self.last_role = context.role;
+        self.last_policy = context.auth_policy;
+        if (context.server_name) |name| {
+            const n = @min(name.len, self.last_server_name_buf.len);
+            @memcpy(self.last_server_name_buf[0..n], name[0..n]);
+            self.last_server_name_len = n;
+            self.last_server_name_present = true;
+        } else {
+            self.last_server_name_present = false;
+            self.last_server_name_len = 0;
+        }
         return self.result;
     }
 };
@@ -985,7 +1065,7 @@ test "mock verifier can reject, error, and report a scripted verdict with call c
 
 test "every failure class maps to a deterministic alert, origin, and engine error" {
     // Peer-originated authentication failures blame the peer's certificate.
-    for ([_]FailureClass{ .invalid_peer_certificate_chain, .peer_verification_rejected }) |class| {
+    for ([_]FailureClass{ .invalid_peer_certificate_chain, .certificate_verify_invalid, .peer_verification_rejected }) |class| {
         try testing.expectEqual(Origin.peer, class.origin());
         try testing.expectEqual(alerts.AlertDescription.bad_certificate, class.alert());
         try testing.expectEqual(@as(events.HandshakeError, error.CertificateInvalid), class.engineError());
@@ -996,11 +1076,14 @@ test "every failure class maps to a deterministic alert, origin, and engine erro
         try testing.expectEqual(alerts.AlertDescription.handshake_failure, class.alert());
         try testing.expectEqual(@as(events.HandshakeError, error.NoApplicableCredential), class.engineError());
     }
-    // Local provider/verifier faults are our internal errors.
+    // Local provider/verifier faults are our internal errors. `provider` and
+    // `verifier` internal failures are distinct classes so diagnostics name the
+    // right subsystem, even though both map to the same wire alert.
     for ([_]FailureClass{
         .malformed_credential_chain,
         .signing_provider_failure,
         .signature_output_overflow,
+        .provider_internal_failure,
         .verifier_internal_failure,
         .invalid_callback_behavior,
     }) |class| {
@@ -1008,13 +1091,16 @@ test "every failure class maps to a deterministic alert, origin, and engine erro
         try testing.expectEqual(alerts.AlertDescription.internal_error, class.alert());
         try testing.expectEqual(@as(events.HandshakeError, error.CredentialProviderFailed), class.engineError());
     }
+    try testing.expect(FailureClass.provider_internal_failure != FailureClass.verifier_internal_failure);
+    try testing.expect(FailureClass.certificate_verify_invalid != FailureClass.invalid_peer_certificate_chain);
+    try testing.expectEqual(FailureClass.provider_internal_failure, classifySelectError(error.ProviderInternalFailure));
 }
 
 test "error classifiers cover every select, sign, and verify error" {
     try testing.expectEqual(FailureClass.no_credential_available, classifySelectError(error.NoCredentialAvailable));
     try testing.expectEqual(FailureClass.no_compatible_signature_algorithm, classifySelectError(error.NoCompatibleSignatureAlgorithm));
     try testing.expectEqual(FailureClass.malformed_credential_chain, classifySelectError(error.MalformedCredentialChain));
-    try testing.expectEqual(FailureClass.verifier_internal_failure, classifySelectError(error.ProviderInternalFailure));
+    try testing.expectEqual(FailureClass.provider_internal_failure, classifySelectError(error.ProviderInternalFailure));
     try testing.expectEqual(FailureClass.invalid_callback_behavior, classifySelectError(error.InvalidCallbackBehavior));
 
     try testing.expectEqual(FailureClass.signing_provider_failure, classifySignError(error.SigningProviderFailure));

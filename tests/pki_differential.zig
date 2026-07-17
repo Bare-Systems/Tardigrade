@@ -922,6 +922,22 @@ const ReducedPaths = struct {
     }
 };
 
+fn deleteIfCandidatePath(dir: compat.DirCompat, path: []const u8) !void {
+    if (std.mem.find(u8, path, ".candidate") == null) return;
+    dir.deleteFile(path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+}
+
+fn deleteProbeFiles(dir: compat.DirCompat, paths: *const ReducedPaths) !void {
+    try deleteIfCandidatePath(dir, paths.der_path);
+    try deleteIfCandidatePath(dir, paths.pem_path);
+    try deleteIfCandidatePath(dir, paths.root_file);
+    if (paths.intermediate_file) |path| try deleteIfCandidatePath(dir, path);
+    try deleteIfCandidatePath(dir, paths.leaf_file);
+}
+
 /// Write the reduced component (raw DER plus PEM) and whichever substituted
 /// bundle the external validators need, under `artifact_dir` inside `dir`.
 /// Pure persistence: no external processes, so offline tests can drive it
@@ -1091,7 +1107,10 @@ fn verifyAndPersistReducedWithVerifier(
         defer allocator.free(probe_suffix);
         var paths = try persistReducedCase(allocator, dir, artifact_dir, case, r, probe_suffix);
         var owns_paths = true;
-        errdefer if (owns_paths) paths.deinit(allocator);
+        errdefer if (owns_paths) {
+            deleteProbeFiles(dir, &paths) catch {};
+            paths.deinit(allocator);
+        };
         var tardigrade, var openssl, var go = try verifier(allocator, dir, case, &paths);
         var owns_observations = true;
         errdefer if (owns_observations) {
@@ -1117,10 +1136,12 @@ fn verifyAndPersistReducedWithVerifier(
                 best_tardigrade = tardigrade;
                 best_openssl = openssl;
                 best_go = go;
+                try deleteProbeFiles(dir, &paths);
                 paths.deinit(allocator);
                 owns_paths = false;
                 owns_observations = false;
             } else {
+                try deleteProbeFiles(dir, &paths);
                 paths.deinit(allocator);
                 tardigrade.deinit(allocator);
                 openssl.deinit(allocator);
@@ -1139,10 +1160,12 @@ fn verifyAndPersistReducedWithVerifier(
             fallback_tardigrade = tardigrade;
             fallback_openssl = openssl;
             fallback_go = go;
+            try deleteProbeFiles(dir, &paths);
             paths.deinit(allocator);
             owns_paths = false;
             owns_observations = false;
         } else {
+            try deleteProbeFiles(dir, &paths);
             paths.deinit(allocator);
             tardigrade.deinit(allocator);
             openssl.deinit(allocator);
@@ -1186,6 +1209,7 @@ fn verifyAndPersistReducedWithVerifier(
     try r.revertToOriginal(allocator);
     var probe_paths = try persistReducedCase(allocator, dir, artifact_dir, case, r, "fallback-original");
     defer probe_paths.deinit(allocator);
+    defer deleteProbeFiles(dir, &probe_paths) catch {};
     var reverted_tardigrade, var reverted_openssl, var reverted_go = try verifier(allocator, dir, case, &probe_paths);
     errdefer reverted_tardigrade.deinit(allocator);
     errdefer reverted_openssl.deinit(allocator);
@@ -1743,8 +1767,11 @@ fn fabricatedReducedVerifier(
 ) !struct { Observation, Observation, Observation } {
     const raw = try dir.readFileAlloc(allocator, paths.der_path, 1024);
     defer allocator.free(raw);
-    const preserves = !std.mem.eql(u8, case.id, "artifact-policy-fallback-fails") and
-        std.mem.eql(u8, raw, drill_leaf_reduced);
+    const preserves = if (std.mem.eql(u8, case.id, "artifact-policy-fallback-succeeds"))
+        std.mem.eql(u8, raw, drill_leaf_original)
+    else
+        !std.mem.eql(u8, case.id, "artifact-policy-fallback-fails") and
+            std.mem.eql(u8, raw, drill_leaf_reduced);
     const diagnostic = if (preserves) "OriginalReject" else "DifferentReject";
     var tardigrade = try fabricatedObservation(allocator, .reject, diagnostic);
     errdefer tardigrade.deinit(allocator);
@@ -1756,6 +1783,10 @@ fn fabricatedReducedVerifier(
         openssl,
         go,
     };
+}
+
+fn expectMissing(dir: compat.DirCompat, path: []const u8) !void {
+    try testing.expectError(error.FileNotFound, dir.access(path, .{}));
 }
 
 test "pki reduce: shared component budget leaves room for later components" {
@@ -1911,6 +1942,11 @@ test "pki reduce: verification materializes the winning candidate to canonical a
     const raw = try dir.readFileAlloc(allocator, verification.paths.der_path, 1024);
     defer allocator.free(raw);
     try testing.expectEqualSlices(u8, drill_leaf_reduced, raw);
+    try expectMissing(dir, "artifacts/artifact-policy-winner.candidate-0.candidate.der");
+    try expectMissing(dir, "artifacts/artifact-policy-winner.candidate-0.candidate.crt");
+    try expectMissing(dir, "artifacts/artifact-policy-winner.candidate-1.candidate.der");
+    try expectMissing(dir, "artifacts/artifact-policy-winner.candidate-1.candidate.crt");
+    try expectMissing(dir, "artifacts/artifact-policy-winner.candidate-1.candidate-intermediates.crt");
 
     var runtime_identity = RuntimeIdentity{
         .git_sha = try allocator.dupe(u8, "drill-sha"),
@@ -2000,6 +2036,129 @@ test "pki reduce: non-reproducing original fallback fails instead of returning a
         &reduction,
         .{ .reject, .reject, .accept },
     ));
+    try expectMissing(dir, "artifacts/artifact-policy-fallback-fails.candidate-0.candidate.der");
+    try expectMissing(dir, "artifacts/artifact-policy-fallback-fails.candidate-0.candidate.crt");
+    try expectMissing(dir, "artifacts/artifact-policy-fallback-fails.fallback-original.candidate.der");
+    try expectMissing(dir, "artifacts/artifact-policy-fallback-fails.fallback-original.candidate.crt");
+}
+
+test "pki reduce: successful original fallback uses the real verification state machine" {
+    const allocator = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = compat.wrapDir(tmp.dir);
+
+    const case = manifest.Case{
+        .id = "artifact-policy-fallback-succeeds",
+        .profile = .core,
+        .category = .malformed_der,
+        .root_file = "tests/vectors/pki/root.crt",
+        .intermediate_file = "tests/vectors/pki/intermediate.crt",
+        .leaf_file = "tests/vectors/pki/drill-leaf.crt",
+        .dns_name = "drill.example.test",
+        .expected = .all(.reject),
+        .provenance = "fabricated artifact-policy fallback drill",
+        .license = "Apache-2.0",
+        .regression_target = "src/pki/x509_tests.zig",
+    };
+    var inputs = CaseInputs{
+        .roots = try allocator.alloc([]u8, 1),
+        .intermediates = try allocator.alloc([]u8, 1),
+        .leaf = try allocator.dupe(u8, drill_leaf_original),
+    };
+    inputs.roots[0] = try allocator.dupe(u8, "ROOT-BYTES");
+    inputs.intermediates[0] = try allocator.dupe(u8, drill_intermediate_original);
+    var reduction = try drillReductionFromCandidates(
+        allocator,
+        inputs,
+        &.{.{
+            .component = .leaf,
+            .reduced_der = drill_intermediate_candidate,
+            .original_size = drill_leaf_original.len,
+            .oracle_calls = 7,
+            .max_oracle_calls = 11,
+            .budget_exhausted = false,
+            .one_minimal = true,
+        }},
+        7,
+    );
+    defer reduction.deinit(allocator);
+
+    var verification = try verifyAndPersistReducedWithVerifier(
+        fabricatedReducedVerifier,
+        allocator,
+        dir,
+        "artifacts",
+        case,
+        &reduction,
+        .{ .reject, .reject, .accept },
+    );
+    defer verification.deinit(allocator);
+    try testing.expect(verification.preserves);
+    try testing.expect(reduction.reverted_external_divergence);
+    try testing.expect(!reduction.one_minimal);
+    try testing.expect(!reductionIsPromotable(&reduction, &verification));
+    try testing.expect(verification.candidate_tardigrade != null);
+    try testing.expectEqualStrings(
+        "DifferentReject",
+        verification.candidate_tardigrade.?.diagnostic,
+    );
+    try testing.expectEqualStrings(
+        "artifacts/artifact-policy-fallback-succeeds.reduced.der",
+        verification.paths.der_path,
+    );
+    const raw = try dir.readFileAlloc(allocator, verification.paths.der_path, 1024);
+    defer allocator.free(raw);
+    try testing.expectEqualSlices(u8, drill_leaf_original, raw);
+    try expectMissing(dir, "artifacts/artifact-policy-fallback-succeeds.candidate-0.candidate.der");
+    try expectMissing(dir, "artifacts/artifact-policy-fallback-succeeds.candidate-0.candidate.crt");
+    try expectMissing(dir, "artifacts/artifact-policy-fallback-succeeds.fallback-original.candidate.der");
+    try expectMissing(dir, "artifacts/artifact-policy-fallback-succeeds.fallback-original.candidate.crt");
+
+    var runtime_identity = RuntimeIdentity{
+        .git_sha = try allocator.dupe(u8, "drill-sha"),
+        .openssl_version = try allocator.dupe(u8, "drill-openssl"),
+        .go_version = try allocator.dupe(u8, "drill-go"),
+        .zig_version = try allocator.dupe(u8, "drill-zig"),
+    };
+    defer runtime_identity.deinit(allocator);
+    var tardigrade = try fabricatedObservation(allocator, .reject, "OriginalReject");
+    defer tardigrade.deinit(allocator);
+    var openssl = try fabricatedObservation(allocator, .reject, "openssl original");
+    defer openssl.deinit(allocator);
+    var go = try fabricatedObservation(allocator, .accept, "go original");
+    defer go.deinit(allocator);
+    const artifact_path = try writeArtifact(
+        allocator,
+        dir,
+        "artifacts",
+        runtime_identity,
+        case,
+        tardigrade,
+        openssl,
+        go,
+        &reduction,
+        &verification,
+    );
+    defer allocator.free(artifact_path);
+    const payload = try dir.readFileAlloc(allocator, artifact_path, 64 * 1024);
+    defer allocator.free(payload);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+    defer parsed.deinit();
+    const reduction_json = parsed.value.object.get("reduction").?.object;
+    try testing.expectEqual(true, reduction_json.get("reverted_external_divergence").?.bool);
+    try testing.expectEqual(false, reduction_json.get("one_minimal").?.bool);
+    try testing.expectEqual(false, reduction_json.get("promotable").?.bool);
+    try testing.expectEqual(@as(i64, drill_leaf_original.len), reduction_json.get("reduced_size").?.integer);
+    try testing.expectEqual(@as(i64, drill_intermediate_candidate.len), reduction_json.get("candidate_size").?.integer);
+    var expected_sha: [64]u8 = undefined;
+    sha256Hex(drill_leaf_original, &expected_sha);
+    try testing.expectEqualStrings(&expected_sha, reduction_json.get("reduced_sha256").?.string);
+    const candidate_observed = reduction_json.get("candidate_observed").?.object;
+    try testing.expectEqualStrings(
+        "DifferentReject",
+        candidate_observed.get("tardigrade").?.object.get("diagnostic").?.string,
+    );
 }
 
 test "pki reduce: schema-v3 artifact is complete and reproducible" {

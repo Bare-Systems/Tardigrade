@@ -60,10 +60,13 @@ pub const Result = struct {
 
 pub fn run(allocator: std.mem.Allocator, options: Options) std.mem.Allocator.Error!Result {
     const io = compat.io();
-    const deadline_end_ms: ?i64 = if (options.deadline_ms == 0)
+    const deadline_end: ?std.Io.Clock.Timestamp = if (options.deadline_ms == 0)
         null
     else
-        compat.milliTimestamp() + @as(i64, @intCast(options.deadline_ms));
+        std.Io.Clock.Timestamp.fromNow(io, .{
+            .raw = .fromMilliseconds(options.deadline_ms),
+            .clock = .awake,
+        });
     var child = std.process.spawn(io, .{
         .argv = options.argv,
         .stdin = .ignore,
@@ -74,8 +77,9 @@ pub fn run(allocator: std.mem.Allocator, options: Options) std.mem.Allocator.Err
     }) catch |err| {
         return launchFailureResult(allocator, "launch failed: {s}", .{@errorName(err)});
     };
+    const pgid = child.id.?;
     var reaped = false;
-    defer if (!reaped) child.kill(io);
+    defer if (!reaped) reapProcessGroup(&child, pgid);
 
     var multi_reader_buffer: std.Io.File.MultiReader.Buffer(2) = undefined;
     var multi_reader: std.Io.File.MultiReader = undefined;
@@ -85,16 +89,17 @@ pub fn run(allocator: std.mem.Allocator, options: Options) std.mem.Allocator.Err
 
     const stdout_reader = multi_reader.reader(0);
     const stderr_reader = multi_reader.reader(1);
-    const deadline = if (options.deadline_ms == 0)
-        std.Io.Timeout.none
+    const deadline: std.Io.Timeout = if (deadline_end) |timestamp|
+        .{ .deadline = timestamp }
     else
-        (std.Io.Timeout{ .duration = .{ .raw = .fromMilliseconds(options.deadline_ms), .clock = .awake } }).toDeadline(io);
+        std.Io.Timeout.none;
 
     while (multi_reader.fill(64, deadline)) |_| {
         if (stdout_reader.buffered().len > options.stdout_limit) {
             return killedResult(
                 allocator,
                 &child,
+                pgid,
                 &reaped,
                 &multi_reader,
                 &reader_active,
@@ -107,6 +112,7 @@ pub fn run(allocator: std.mem.Allocator, options: Options) std.mem.Allocator.Err
             return killedResult(
                 allocator,
                 &child,
+                pgid,
                 &reaped,
                 &multi_reader,
                 &reader_active,
@@ -120,6 +126,7 @@ pub fn run(allocator: std.mem.Allocator, options: Options) std.mem.Allocator.Err
         error.Timeout => return killedResult(
             allocator,
             &child,
+            pgid,
             &reaped,
             &multi_reader,
             &reader_active,
@@ -130,6 +137,7 @@ pub fn run(allocator: std.mem.Allocator, options: Options) std.mem.Allocator.Err
         else => return killedResult(
             allocator,
             &child,
+            pgid,
             &reaped,
             &multi_reader,
             &reader_active,
@@ -144,6 +152,7 @@ pub fn run(allocator: std.mem.Allocator, options: Options) std.mem.Allocator.Err
         else => return killedResult(
             allocator,
             &child,
+            pgid,
             &reaped,
             &multi_reader,
             &reader_active,
@@ -153,7 +162,9 @@ pub fn run(allocator: std.mem.Allocator, options: Options) std.mem.Allocator.Err
         ),
     };
 
-    const term = waitForExit(&child, deadline_end_ms) catch |err| {
+    const term = waitForExit(&child, pgid, deadline_end) catch |err| {
+        reapProcessGroup(&child, pgid);
+        reaped = true;
         return failureFromBuffered(
             allocator,
             &multi_reader,
@@ -166,6 +177,7 @@ pub fn run(allocator: std.mem.Allocator, options: Options) std.mem.Allocator.Err
     } orelse return killedResult(
         allocator,
         &child,
+        pgid,
         &reaped,
         &multi_reader,
         &reader_active,
@@ -200,11 +212,15 @@ pub fn run(allocator: std.mem.Allocator, options: Options) std.mem.Allocator.Err
     };
 }
 
-fn waitForExit(child: *std.process.Child, deadline_end_ms: ?i64) !?std.process.Child.Term {
+fn waitForExit(
+    child: *std.process.Child,
+    pgid: std.posix.pid_t,
+    deadline_end: ?std.Io.Clock.Timestamp,
+) !?std.process.Child.Term {
     const pid = child.id.?;
-    if (deadline_end_ms == null) {
+    if (deadline_end == null) {
         const term = try child.wait(compat.io());
-        terminateProcessGroup(pid);
+        terminateProcessGroup(pgid);
         return term;
     }
 
@@ -217,10 +233,10 @@ fn waitForExit(child: *std.process.Child, deadline_end_ms: ?i64) !?std.process.C
         if (waited == pid) {
             child.id = null;
             closeChildPipes(child);
-            terminateProcessGroup(pid);
+            terminateProcessGroup(pgid);
             return statusToTerm(@bitCast(status));
         }
-        if (compat.milliTimestamp() >= deadline_end_ms.?) return null;
+        if (std.Io.Clock.Timestamp.now(compat.io(), .awake).compare(.gte, deadline_end.?)) return null;
         compat.sleepNs(10 * std.time.ns_per_ms);
     }
 }
@@ -284,6 +300,7 @@ fn launchFailureResult(
 fn killedResult(
     allocator: std.mem.Allocator,
     child: *std.process.Child,
+    pgid: std.posix.pid_t,
     reaped: *bool,
     multi_reader: *std.Io.File.MultiReader,
     reader_active: *bool,
@@ -291,21 +308,26 @@ fn killedResult(
     stdout_limit: usize,
     stderr_limit: usize,
 ) std.mem.Allocator.Error!Result {
+    reapProcessGroup(child, pgid);
+    reaped.* = true;
+
     const stdout = try boundedDupe(allocator, multi_reader.reader(0).buffered(), stdout_limit);
     errdefer allocator.free(stdout);
     const stderr = try boundedDupe(allocator, multi_reader.reader(1).buffered(), stderr_limit);
     errdefer allocator.free(stderr);
     reader_active.* = false;
     multi_reader.deinit();
-    terminateProcessGroup(child.id.?);
-    child.kill(compat.io());
-    reaped.* = true;
     return .{
         .outcome = outcome,
         .stdout = stdout,
         .stderr = stderr,
         .diagnostic = try diagnosticFor(allocator, outcome, stdout, stderr),
     };
+}
+
+fn reapProcessGroup(child: *std.process.Child, pgid: std.posix.pid_t) void {
+    terminateProcessGroup(pgid);
+    child.kill(compat.io());
 }
 
 fn terminateProcessGroup(pid: std.posix.pid_t) void {

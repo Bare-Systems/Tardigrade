@@ -475,6 +475,7 @@ pub fn build(b: *std.Build) void {
     const pki_diff_options = b.addOptions();
     pki_diff_options.addOption([]const u8, "process_helper_path", b.getInstallPath(.bin, "pki_process_helper"));
     pki_diff_options.addOption([]const u8, "go_validator_path", b.getInstallPath(.bin, "pki_go_validator"));
+    pki_diff_options.addOption([]const u8, "go_bin", go_bin);
     pki_diff_options.addOption(u32, "stable_validator_deadline_ms", 10_000);
     pki_diff_options.addOption(u32, "extended_validator_deadline_ms", 30_000);
 

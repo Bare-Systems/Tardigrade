@@ -62,6 +62,19 @@ pub fn main(init: std.process.Init.Minimal) !void {
         }
         hangForever();
     }
+    if (std.mem.eql(u8, mode, "spawn-grandchild-record-and-hang")) {
+        const tmp_dir = args.next() orelse return error.MissingTempDir;
+        const pid = std.c.getpid();
+        try writePidFile(tmp_dir, "parent.pid", pid);
+
+        const child_pid = std.c.fork();
+        if (child_pid < 0) return error.ForkFailed;
+        if (child_pid == 0) {
+            try writePidFile(tmp_dir, "grandchild.pid", std.c.getpid());
+            hangForever();
+        }
+        hangForever();
+    }
     if (std.mem.eql(u8, mode, "abort")) {
         switch (@import("builtin").os.tag) {
             .windows => @panic("abnormal termination"),
@@ -87,6 +100,16 @@ fn touchAndRemoveMarker(tmp_dir: []const u8, name: []const u8) !void {
     var file = try dir.createFile(io, name, .{});
     file.close(io);
     try dir.deleteFile(io, name);
+}
+
+fn writePidFile(tmp_dir: []const u8, name: []const u8, pid: std.posix.pid_t) !void {
+    var dir = try std.Io.Dir.cwd().openDir(io, tmp_dir, .{});
+    defer dir.close(io);
+    var file = try dir.createFile(io, name, .{ .truncate = true });
+    defer file.close(io);
+    var buf: [64]u8 = undefined;
+    const text = try std.fmt.bufPrint(&buf, "{d}\n", .{pid});
+    try file.writeStreamingAll(io, text);
 }
 
 fn writeRepeated(fd: c_int, byte: u8, len: usize) !void {

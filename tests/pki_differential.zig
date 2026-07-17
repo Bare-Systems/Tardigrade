@@ -270,10 +270,11 @@ fn loadRuntimeIdentity(allocator: std.mem.Allocator) !RuntimeIdentity {
     const openssl_version = try commandSummary(allocator, &.{ openssl, "version" });
     errdefer allocator.free(openssl_version);
 
-    const go_binary = compat.getEnvVarOwned(allocator, "GO_BIN") catch
-        try allocator.dupe(u8, "go");
-    defer allocator.free(go_binary);
-    const go_version = try commandSummary(allocator, &.{ go_binary, "version" });
+    const go_version = try commandSummary(allocator, &.{
+        pki_diff_options.go_bin,
+        "version",
+        pki_diff_options.go_validator_path,
+    });
     errdefer allocator.free(go_version);
 
     return .{
@@ -1588,6 +1589,31 @@ fn expectDirEmptyPath(path: []const u8) !void {
     }
 }
 
+fn readRecordedPid(allocator: std.mem.Allocator, tmp_path: []const u8, file_name: []const u8) !?std.posix.pid_t {
+    const path = try std.fs.path.join(allocator, &.{ tmp_path, file_name });
+    defer allocator.free(path);
+    const raw = compat.cwd().readFileAlloc(allocator, path, 128) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer allocator.free(raw);
+    return try std.fmt.parseInt(std.posix.pid_t, std.mem.trim(u8, raw, " \t\r\n"), 10);
+}
+
+fn deleteRecordedPidFiles(tmp_path: []const u8) void {
+    var dir = compat.cwd().openDir(tmp_path, .{}) catch return;
+    defer dir.close();
+    dir.deleteFile("parent.pid") catch {};
+    dir.deleteFile("grandchild.pid") catch {};
+}
+
+fn expectRecordedProcessesGone(allocator: std.mem.Allocator, tmp_path: []const u8) !void {
+    const parent_pid = try readRecordedPid(allocator, tmp_path, "parent.pid");
+    const grandchild_pid = try readRecordedPid(allocator, tmp_path, "grandchild.pid");
+    if (parent_pid) |pid| try expectNoProcess(allocator, pid);
+    if (grandchild_pid) |pid| try expectNoProcess(allocator, pid);
+}
+
 test "pki reduce: bounded process captures successful output" {
     var result = try bounded_process.run(testing.allocator, .{
         .argv = &.{ pki_diff_options.process_helper_path, "success" },
@@ -1770,14 +1796,27 @@ test "pki reduce: bounded process classification is deterministic" {
 test "pki reduce: bounded process allocation failures clean up child state" {
     try testing.checkAllAllocationFailures(testing.allocator, struct {
         fn run(allocator: std.mem.Allocator) !void {
-            var result = try bounded_process.run(allocator, .{
-                .argv = &.{ pki_diff_options.process_helper_path, "success" },
+            var tmp = try ProcessTempDir.init(testing.allocator, "allocation-process-group");
+            defer tmp.deinit(testing.allocator);
+
+            var result = bounded_process.run(allocator, .{
+                .argv = &.{ pki_diff_options.process_helper_path, "spawn-grandchild-record-and-hang", tmp.abs_path },
                 .stdout_limit = 64,
                 .stderr_limit = 64,
-                .deadline_ms = 1000,
-            });
+                .deadline_ms = 100,
+            }) catch |err| {
+                if (err == error.OutOfMemory) {
+                    try expectRecordedProcessesGone(testing.allocator, tmp.rel_path);
+                    deleteRecordedPidFiles(tmp.rel_path);
+                    try expectDirEmptyPath(tmp.rel_path);
+                }
+                return err;
+            };
             defer result.deinit(allocator);
-            try expectNormalExit(result, 0);
+            try expectOutcomeTag(result, .timeout);
+            try expectRecordedProcessesGone(testing.allocator, tmp.rel_path);
+            deleteRecordedPidFiles(tmp.rel_path);
+            try expectDirEmptyPath(tmp.rel_path);
         }
     }.run, .{});
 }

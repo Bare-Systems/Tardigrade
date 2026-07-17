@@ -13,7 +13,7 @@ const tls_handshake = @import("tls_handshake.zig");
 const tls_core = @import("tls_core");
 
 const shared = tls_core.tls13_backend;
-const RecordSink = tls_core.encrypted_stream.RecordTransport.EventSink;
+const RecordSink = tls_core.tls13_transport.EventSink;
 const HandshakeError = tls_handshake.HandshakeError;
 const EventSink = tls_handshake.EventSink;
 const EncryptionLevel = tls_adapter.EncryptionLevel;
@@ -288,34 +288,12 @@ fn translate(source: *const RecordSink, destination: *EventSink) HandshakeError!
     }
 }
 
-fn mapError(err: tls_core.encrypted_stream.RecordHandshakeError) HandshakeError {
+fn mapError(err: tls_core.tls13_transport.Error) HandshakeError {
     return switch (err) {
         error.UnexpectedTransportEpoch => error.UnexpectedCryptoLevel,
         error.MissingTransportExtension => error.MissingTransportParameters,
         error.TransportBufferOverflow => error.HandshakeBufferOverflow,
-        error.AuthenticationFailed,
-        error.UnsupportedRecordEpoch,
-        error.DuplicateTrafficSecret,
-        error.MissingReadKeys,
-        error.MissingWriteKeys,
-        error.MissingApplicationKeys,
-        error.HandshakeNotComplete,
-        error.InvalidEpochTransition,
-        error.UnexpectedRecordContent,
-        error.EpochAlreadyDiscarded,
-        error.EpochDiscardTooEarly,
-        error.InvalidInput,
-        error.InvalidRecordType,
-        error.InvalidRecordVersion,
-        error.InvalidTrafficSecretLength,
-        error.MalformedInnerPlaintext,
-        error.RecordBufferOverflow,
-        error.RecordSinkOverflow,
-        error.RecordTooLarge,
-        error.SequenceExhausted,
-        error.TruncatedRecord,
-        error.UnsupportedCapability,
-        => error.SecretExportFailed,
+        error.InvalidTransportProfile => error.InvalidHandshakeState,
         else => @errorCast(err),
     };
 }
@@ -384,4 +362,133 @@ test "QUIC adapter owns CID binding round trip" {
     var peer = config.CidBinding{};
     _ = try decodeTransportParametersBound(encoded, &peer);
     try std.testing.expectEqualDeep(local, peer);
+}
+
+test "QUIC adapter teardown wipes private scratch, parameters, and shared engine ownership" {
+    const entropy = Entropy{ .hello_random = [_]u8{0x31} ** 32, .key_share_seed = [_]u8{0x32} ** 32 };
+    var backend = Tls13Backend.initServer(
+        entropy,
+        try Identity.initPkcs8(testdata.certificate_der, testdata.private_key_pkcs8_der),
+    );
+    @memset(&backend.local_transport_parameters, 0xa5);
+    const secret = [_]u8{0x5a} ** hash_len;
+    try backend.scratch.emitSecret(.handshake, .write, &secret);
+    const used = backend.scratch.used;
+    try std.testing.expect(used > 0);
+
+    backend.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), backend.scratch.used);
+    try std.testing.expect(std.mem.allEqual(u8, backend.scratch.scratch[0..used], 0));
+    try std.testing.expect(std.mem.allEqual(u8, &backend.local_transport_parameters, 0));
+    try std.testing.expect(std.mem.allEqual(u8, &backend.engine.entropy.key_share_seed, 0));
+    try std.testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&backend.engine.identity), 0));
+    try std.testing.expect(std.mem.allEqual(u8, &backend.engine.peer_transport_extension, 0));
+}
+
+const RealHandshakeHarness = struct {
+    client_adapter: tls_adapter.QuicTlsAdapter = .{},
+    server_adapter: tls_adapter.QuicTlsAdapter = .{},
+    client_backend: Tls13Backend,
+    server_backend: Tls13Backend,
+    client: tls_handshake.Handshake = undefined,
+    server: tls_handshake.Handshake = undefined,
+    wired: bool = false,
+    deinitialized: bool = false,
+
+    fn init() !RealHandshakeHarness {
+        return .{
+            .client_backend = Tls13Backend.initClient(
+                .{ .hello_random = [_]u8{0xc1} ** 32, .key_share_seed = [_]u8{0x11} ** 32 },
+                .{ .pinned_certificate = testdata.certificate_der },
+            ),
+            .server_backend = Tls13Backend.initServer(
+                .{ .hello_random = [_]u8{0x51} ** 32, .key_share_seed = [_]u8{0x22} ** 32 },
+                try Identity.initPkcs8(testdata.certificate_der, testdata.private_key_pkcs8_der),
+            ),
+        };
+    }
+
+    fn wire(self: *RealHandshakeHarness) !void {
+        self.client = tls_handshake.Handshake.initClient(&self.client_adapter, self.client_backend.backend());
+        self.server = tls_handshake.Handshake.initServer(&self.server_adapter, self.server_backend.backend());
+        self.wired = true;
+        try self.server.start((config.Config{}).transportParameters() catch unreachable);
+    }
+
+    fn run(self: *RealHandshakeHarness) HandshakeError!void {
+        if (self.client.driver.state == .idle) {
+            try self.client.start((config.Config{}).transportParameters() catch unreachable);
+        }
+        var rounds: usize = 0;
+        while (rounds < 64) : (rounds += 1) {
+            var progressed = false;
+            inline for (.{ EncryptionLevel.initial, EncryptionLevel.handshake }) |level| {
+                var buf: [2048]u8 = undefined;
+                while (try self.client.pollOutput(level, &buf)) |out| {
+                    try self.server.onCrypto(level, out.offset, out.bytes);
+                    progressed = true;
+                }
+                while (try self.server.pollOutput(level, &buf)) |out| {
+                    try self.client.onCrypto(level, out.offset, out.bytes);
+                    progressed = true;
+                }
+            }
+            if (!progressed) return;
+        }
+        return error.InvalidHandshakeState;
+    }
+
+    fn deinit(self: *RealHandshakeHarness) void {
+        if (self.deinitialized) return;
+        self.deinitialized = true;
+        if (self.wired) {
+            self.client.deinit();
+            self.server.deinit();
+        } else {
+            self.client_backend.deinit();
+            self.server_backend.deinit();
+        }
+    }
+};
+
+fn expectQuicBackendWiped(backend: *const Tls13Backend) !void {
+    try std.testing.expectEqual(@as(usize, 0), backend.scratch.used);
+    try std.testing.expect(std.mem.allEqual(u8, &backend.local_transport_parameters, 0));
+    try std.testing.expect(std.mem.allEqual(u8, &backend.engine.entropy.key_share_seed, 0));
+    try std.testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&backend.engine.key_pair), 0));
+    try std.testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&backend.engine.identity), 0));
+    try std.testing.expect(std.mem.allEqual(u8, &backend.engine.peer_transport_extension, 0));
+}
+
+test "QUIC handshake owner tears down shared and adapter storage on success" {
+    var harness = try RealHandshakeHarness.init();
+    defer harness.deinit();
+    try harness.wire();
+    try harness.run();
+    try std.testing.expect(harness.client.isComplete());
+    try std.testing.expect(harness.server.isComplete());
+    harness.deinit();
+    try expectQuicBackendWiped(&harness.client_backend);
+    try expectQuicBackendWiped(&harness.server_backend);
+}
+
+test "QUIC handshake owner tears down shared and adapter storage on failure" {
+    var harness = try RealHandshakeHarness.init();
+    defer harness.deinit();
+    harness.server_backend.alpn = "h2";
+    try harness.wire();
+    try std.testing.expectError(error.AlpnMismatch, harness.run());
+    harness.deinit();
+    try expectQuicBackendWiped(&harness.client_backend);
+    try expectQuicBackendWiped(&harness.server_backend);
+}
+
+test "QUIC handshake owner tears down shared and adapter storage when abandoned" {
+    var harness = try RealHandshakeHarness.init();
+    defer harness.deinit();
+    try harness.wire();
+    harness.deinit();
+    try expectQuicBackendWiped(&harness.client_backend);
+    try expectQuicBackendWiped(&harness.server_backend);
 }

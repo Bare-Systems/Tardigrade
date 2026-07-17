@@ -50,6 +50,414 @@ fn serverProvider() crypto.provider.CryptoProvider {
     return State.provider_state.cryptoProvider();
 }
 
+// ==========================================================================
+// Direct transport-neutral driver coverage. This keeps key derivation,
+// record sequencing, epoch discard, and teardown assertions at the engine
+// seam rather than relying only on the higher-level socket stream.
+// ==========================================================================
+
+const tls13_transport = tls_core.tls13_transport;
+const DirectDriver = tls_core.engine.Driver(tls13_transport.Contract);
+const DirectSink = tls13_transport.EventSink;
+const Bridge = tls_core.record_epoch_bridge.Bridge;
+const DirectError = tls13_transport.Error || tls_core.record_epoch_bridge.Error;
+
+fn parseSingleRecord(mode: record_codec.RecordMode, bytes: []const u8) DirectError!record_codec.Record {
+    if (bytes.len < record_codec.header_len) return error.TruncatedRecord;
+    const header = try record_codec.parseHeader(bytes[0..record_codec.header_len], mode, .strict);
+    const record_len = record_codec.header_len + header.payload_len;
+    if (bytes.len != record_len) return error.TruncatedRecord;
+    return .{
+        .content_type = header.content_type,
+        .legacy_version = header.legacy_version,
+        .payload = bytes[record_codec.header_len..record_len],
+    };
+}
+
+const KeySnapshot = struct {
+    key: [crypto.provider.max_aead_key_len]u8 = undefined,
+    key_len: usize = 0,
+    iv: [crypto.provider.aead_nonce_len]u8 = undefined,
+
+    fn capture(keys: *const tls_core.record_protection.TrafficKeys) KeySnapshot {
+        var snapshot = KeySnapshot{};
+        const key = keys.key.slice();
+        snapshot.key_len = key.len;
+        @memcpy(snapshot.key[0..key.len], key);
+        @memcpy(&snapshot.iv, keys.iv.slice());
+        return snapshot;
+    }
+
+    fn eql(a: KeySnapshot, b: KeySnapshot) bool {
+        return a.key_len == b.key_len and
+            std.mem.eql(u8, a.key[0..a.key_len], b.key[0..b.key_len]) and
+            std.mem.eql(u8, &a.iv, &b.iv);
+    }
+};
+
+const SecretSnapshot = struct {
+    bytes: [tls_backend.hash_len]u8,
+
+    fn capture(secret: []const u8) SecretSnapshot {
+        std.debug.assert(secret.len == tls_backend.hash_len);
+        return .{ .bytes = secret[0..tls_backend.hash_len].* };
+    }
+};
+
+const DirectSide = enum { client, server };
+
+const DirectObserved = struct {
+    handshake_write: [2]?KeySnapshot = .{ null, null },
+    handshake_read: [2]?KeySnapshot = .{ null, null },
+    application_write: [2]?KeySnapshot = .{ null, null },
+    application_read: [2]?KeySnapshot = .{ null, null },
+    handshake_write_secret: [2]?SecretSnapshot = .{ null, null },
+    application_write_secret: [2]?SecretSnapshot = .{ null, null },
+    handshake_write_seq_after_first_record: [2]?u64 = .{ null, null },
+    alpn: [32]u8 = undefined,
+    alpn_len: usize = 0,
+    certificate_state: ?events.CertificateState = null,
+    initial_discarded: [2]bool = .{ false, false },
+    handshake_discarded: [2]bool = .{ false, false },
+
+    fn captureSecret(
+        self: *DirectObserved,
+        side: DirectSide,
+        epoch: events.EncryptionEpoch,
+        direction: events.SecretDirection,
+        secret: []const u8,
+        keys: *const tls_core.record_protection.TrafficKeys,
+    ) void {
+        const index = @intFromEnum(side);
+        const slot: *?KeySnapshot = switch (epoch) {
+            .handshake => switch (direction) {
+                .write => &self.handshake_write[index],
+                .read => &self.handshake_read[index],
+            },
+            .application => switch (direction) {
+                .write => &self.application_write[index],
+                .read => &self.application_read[index],
+            },
+            .initial, .zero_rtt => return,
+        };
+        slot.* = KeySnapshot.capture(keys);
+        if (direction == .write) switch (epoch) {
+            .handshake => self.handshake_write_secret[index] = SecretSnapshot.capture(secret),
+            .application => self.application_write_secret[index] = SecretSnapshot.capture(secret),
+            .initial, .zero_rtt => {},
+        };
+    }
+
+    fn noteAlpn(self: *DirectObserved, protocol: []const u8) void {
+        self.alpn_len = protocol.len;
+        @memcpy(self.alpn[0..protocol.len], protocol);
+    }
+
+    fn noteDiscard(self: *DirectObserved, side: DirectSide, epoch: events.EncryptionEpoch) void {
+        const index = @intFromEnum(side);
+        switch (epoch) {
+            .initial => self.initial_discarded[index] = true,
+            .handshake => self.handshake_discarded[index] = true,
+            .application, .zero_rtt => {},
+        }
+    }
+};
+
+fn pumpDirect(
+    sender_driver: *DirectDriver,
+    sender_bridge: *Bridge,
+    sender_side: DirectSide,
+    receiver_driver: *DirectDriver,
+    receiver_bridge: *Bridge,
+    receiver_side: DirectSide,
+    sink: *DirectSink,
+    observed: *DirectObserved,
+) DirectError!void {
+    var opened: [record_codec.max_ciphertext_fragment_len]u8 = undefined;
+    const QueuedMessage = struct {
+        epoch: events.EncryptionEpoch,
+        mode: record_codec.RecordMode,
+        buf: [4096]u8 = undefined,
+        len: usize,
+    };
+    var queued: [4]QueuedMessage = undefined;
+    var queued_len: usize = 0;
+
+    for (sink.items[0..sink.len]) |event| switch (event) {
+        .handshake_bytes => |handshake_bytes| {
+            std.debug.assert(queued_len < queued.len);
+            const slot = &queued[queued_len];
+            queued_len += 1;
+            slot.* = .{
+                .epoch = handshake_bytes.epoch,
+                .mode = if (handshake_bytes.epoch == .initial) .plaintext else .ciphertext,
+                .len = 0,
+            };
+            const bytes = (try sender_bridge.applyEvent(
+                .{ .handshake_bytes = .{ .epoch = handshake_bytes.epoch, .data = handshake_bytes.data } },
+                &slot.buf,
+            )).?;
+            slot.len = bytes.len;
+            if (handshake_bytes.epoch == .handshake and
+                observed.handshake_write_seq_after_first_record[@intFromEnum(sender_side)] == null)
+            {
+                observed.handshake_write_seq_after_first_record[@intFromEnum(sender_side)] = sender_bridge.write_handshake.?.sequence;
+            }
+        },
+        .traffic_secret => |traffic_secret| {
+            var scratch: [1]u8 = undefined;
+            _ = try sender_bridge.applyEvent(.{ .traffic_secret = .{
+                .epoch = traffic_secret.epoch,
+                .direction = traffic_secret.direction,
+                .data = traffic_secret.data,
+            } }, &scratch);
+            const keys: *const tls_core.record_protection.TrafficKeys = switch (traffic_secret.epoch) {
+                .handshake => switch (traffic_secret.direction) {
+                    .write => &sender_bridge.write_handshake.?.keys,
+                    .read => &sender_bridge.read_handshake.?.keys,
+                },
+                .application => switch (traffic_secret.direction) {
+                    .write => &sender_bridge.write_application.?.keys,
+                    .read => &sender_bridge.read_application.?.keys,
+                },
+                .initial, .zero_rtt => continue,
+            };
+            observed.captureSecret(sender_side, traffic_secret.epoch, traffic_secret.direction, traffic_secret.data, keys);
+        },
+        .discard_epoch => |epoch| {
+            var scratch: [1]u8 = undefined;
+            _ = try sender_bridge.applyEvent(.{ .discard_epoch = epoch }, &scratch);
+            observed.noteDiscard(sender_side, epoch);
+        },
+        .handshake_complete => {
+            var scratch: [1]u8 = undefined;
+            _ = try sender_bridge.applyEvent(.handshake_complete, &scratch);
+            sender_driver.complete();
+        },
+        .peer_transport_parameters => {},
+        .alpn => |protocol| observed.noteAlpn(protocol),
+        .certificate => |state| observed.certificate_state = state,
+        .fatal_alert => {},
+    };
+
+    for (queued[0..queued_len]) |message| {
+        const record = try parseSingleRecord(message.mode, message.buf[0..message.len]);
+        const opened_message = try receiver_bridge.openHandshake(message.epoch, record, &opened);
+        const next = try receiver_driver.receive(message.epoch, opened_message.inner.content);
+        try pumpDirect(receiver_driver, receiver_bridge, receiver_side, sender_driver, sender_bridge, sender_side, next, observed);
+    }
+}
+
+const DirectHarness = struct {
+    client_backend: tls_backend.Tls13Backend,
+    server_backend: tls_backend.Tls13Backend,
+    client_driver: DirectDriver = undefined,
+    server_driver: DirectDriver = undefined,
+    client_bridge: Bridge,
+    server_bridge: Bridge,
+    observed: DirectObserved = .{},
+    drivers_ready: bool = false,
+    deinitialized: bool = false,
+
+    fn init() DirectHarness {
+        return initProfiles(
+            .{ .record = .{ .alpn = "h2" } },
+            .{ .record = .{ .alpn = "h2" } },
+        );
+    }
+
+    fn initExtension() DirectHarness {
+        return initProfiles(
+            .{ .extension = .{ .alpn = "h3", .extension_type = 57, .local = "client transport parameters" } },
+            .{ .extension = .{ .alpn = "h3", .extension_type = 57, .local = "server transport parameters" } },
+        );
+    }
+
+    fn initProfiles(client_profile: tls_backend.TransportProfile, server_profile: tls_backend.TransportProfile) DirectHarness {
+        return .{
+            .client_backend = tls_backend.Tls13Backend.initClient(
+                clientEntropy(),
+                .{ .pinned_certificate = tls_backend.testdata.certificate_der },
+                client_profile,
+            ),
+            .server_backend = tls_backend.Tls13Backend.initServer(
+                serverEntropy(),
+                fixtureIdentity(),
+                server_profile,
+            ),
+            .client_bridge = Bridge.init(clientProvider(), .tls_aes_128_gcm_sha256),
+            .server_bridge = Bridge.init(serverProvider(), .tls_aes_128_gcm_sha256),
+        };
+    }
+
+    fn run(self: *DirectHarness) DirectError!void {
+        self.client_driver = DirectDriver.init(.client, self.client_backend.backend());
+        self.server_driver = DirectDriver.init(.server, self.server_backend.backend());
+        self.drivers_ready = true;
+        _ = try self.server_driver.start({});
+        const initial = try self.client_driver.start({});
+        try pumpDirect(
+            &self.client_driver,
+            &self.client_bridge,
+            .client,
+            &self.server_driver,
+            &self.server_bridge,
+            .server,
+            initial,
+            &self.observed,
+        );
+    }
+
+    fn deinit(self: *DirectHarness) void {
+        if (self.deinitialized) return;
+        self.deinitialized = true;
+        self.client_bridge.deinit();
+        self.server_bridge.deinit();
+        if (self.drivers_ready) {
+            self.client_driver.deinit();
+            self.server_driver.deinit();
+        } else {
+            self.client_backend.deinit();
+            self.server_backend.deinit();
+        }
+    }
+};
+
+fn expectDirectSinkWiped(driver: *const DirectDriver, used_before: usize) !void {
+    try std.testing.expectEqual(@as(usize, 0), driver.sink.used);
+    try std.testing.expect(std.mem.allEqual(u8, driver.sink.scratch[0..used_before], 0));
+}
+
+test "direct shared driver preserves derivation, sequence, discard, and teardown invariants" {
+    var harness = DirectHarness.init();
+    defer harness.deinit();
+    try harness.run();
+
+    try std.testing.expect(harness.client_driver.isComplete());
+    try std.testing.expect(harness.server_driver.isComplete());
+    try std.testing.expectEqualStrings("h2", harness.observed.alpn[0..harness.observed.alpn_len]);
+    try std.testing.expectEqual(events.CertificateState.valid, harness.observed.certificate_state.?);
+
+    const client = @intFromEnum(DirectSide.client);
+    const server = @intFromEnum(DirectSide.server);
+    try std.testing.expect(harness.observed.handshake_write[client].?.eql(harness.observed.handshake_read[server].?));
+    try std.testing.expect(harness.observed.handshake_read[client].?.eql(harness.observed.handshake_write[server].?));
+    try std.testing.expect(harness.observed.application_write[client].?.eql(harness.observed.application_read[server].?));
+    try std.testing.expect(harness.observed.application_read[client].?.eql(harness.observed.application_write[server].?));
+    try std.testing.expectEqual(@as(u64, 1), harness.observed.handshake_write_seq_after_first_record[client].?);
+    try std.testing.expectEqual(@as(u64, 1), harness.observed.handshake_write_seq_after_first_record[server].?);
+    try std.testing.expect(harness.observed.initial_discarded[client]);
+    try std.testing.expect(harness.observed.initial_discarded[server]);
+    try std.testing.expect(harness.observed.handshake_discarded[client]);
+    try std.testing.expect(harness.observed.handshake_discarded[server]);
+    try std.testing.expect(!harness.client_bridge.hasReadKeys(.handshake));
+    try std.testing.expect(!harness.client_bridge.hasWriteKeys(.handshake));
+    try std.testing.expect(!harness.server_bridge.hasReadKeys(.handshake));
+    try std.testing.expect(!harness.server_bridge.hasWriteKeys(.handshake));
+
+    var protected: [record_codec.max_ciphertext_record_len]u8 = undefined;
+    var plaintext: [record_codec.max_ciphertext_fragment_len]u8 = undefined;
+    const request = try harness.client_bridge.sealApplicationData("client application", &protected);
+    try std.testing.expectEqual(@as(u64, 1), harness.client_bridge.write_application.?.sequence);
+    const opened_request = try harness.server_bridge.openApplicationData(try parseSingleRecord(.ciphertext, request), &plaintext);
+    try std.testing.expectEqualStrings("client application", opened_request.inner.content);
+    try std.testing.expectEqual(@as(u64, 1), harness.server_bridge.read_application.?.sequence);
+
+    const response = try harness.server_bridge.sealApplicationData("server application", &protected);
+    try std.testing.expectEqual(@as(u64, 1), harness.server_bridge.write_application.?.sequence);
+    const opened_response = try harness.client_bridge.openApplicationData(try parseSingleRecord(.ciphertext, response), &plaintext);
+    try std.testing.expectEqualStrings("server application", opened_response.inner.content);
+    try std.testing.expectEqual(@as(u64, 1), harness.client_bridge.read_application.?.sequence);
+
+    const client_used = harness.client_driver.sink.used;
+    const server_used = harness.server_driver.sink.used;
+    try std.testing.expect(client_used > 0);
+    harness.deinit();
+    try std.testing.expect(!harness.client_bridge.hasReadKeys(.application));
+    try std.testing.expect(!harness.client_bridge.hasWriteKeys(.application));
+    try std.testing.expect(!harness.server_bridge.hasReadKeys(.application));
+    try std.testing.expect(!harness.server_bridge.hasWriteKeys(.application));
+    try expectDirectSinkWiped(&harness.client_driver, client_used);
+    try expectDirectSinkWiped(&harness.server_driver, server_used);
+    try std.testing.expect(std.mem.allEqual(u8, &harness.client_backend.entropy.key_share_seed, 0));
+    try std.testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&harness.server_backend.identity), 0));
+}
+
+test "direct shared driver cleanup wipes secrets after record authentication failure" {
+    var harness = DirectHarness.init();
+    defer harness.deinit();
+    try harness.run();
+
+    var protected: [record_codec.max_ciphertext_record_len]u8 = undefined;
+    var plaintext: [record_codec.max_ciphertext_fragment_len]u8 = undefined;
+    const request = try harness.client_bridge.sealApplicationData("tampered", &protected);
+    protected[request.len - 1] ^= 0x80;
+    try std.testing.expectError(
+        error.AuthenticationFailed,
+        harness.server_bridge.openApplicationData(try parseSingleRecord(.ciphertext, protected[0..request.len]), &plaintext),
+    );
+
+    const client_used = harness.client_driver.sink.used;
+    harness.deinit();
+    try std.testing.expect(!harness.client_bridge.hasWriteKeys(.application));
+    try std.testing.expect(!harness.server_bridge.hasReadKeys(.application));
+    try expectDirectSinkWiped(&harness.client_driver, client_used);
+    try std.testing.expect(std.mem.allEqual(u8, &harness.client_backend.entropy.key_share_seed, 0));
+    try std.testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&harness.server_backend.identity), 0));
+}
+
+fn secretGolden(comptime hex: []const u8) [tls_backend.hash_len]u8 {
+    var bytes: [tls_backend.hash_len]u8 = undefined;
+    _ = std.fmt.hexToBytes(&bytes, hex) catch unreachable;
+    return bytes;
+}
+
+test "record and extension profiles preserve independent traffic-secret goldens" {
+    var record = DirectHarness.init();
+    defer record.deinit();
+    try record.run();
+    var extension = DirectHarness.initExtension();
+    defer extension.deinit();
+    try extension.run();
+
+    const record_goldens = [_][tls_backend.hash_len]u8{
+        secretGolden("fa4c75e9e45a4efa0a3d4a9efa07f385fa982a11e840809a630da05e9e64cf42"),
+        secretGolden("fef9a2a33efb498bc4c6944aeab79acbf94c0a3fd150f3b698fc85f768d4bf9c"),
+        secretGolden("fd142b50d9b3f191db764952ad7b4ba31619b9402edbffbf232a1734533b07c0"),
+        secretGolden("f836781ca88477bc429739cd0a56c429b8013b3977294e4a1418f1049f0c33c2"),
+    };
+    const extension_goldens = [_][tls_backend.hash_len]u8{
+        secretGolden("b8fe711917084a6c2ebcea0b47366ea8e2f87787b5a8ce11a43f9b689a174650"),
+        secretGolden("2455663e8808188978de2877d7dbc598e6ea066e94070149025504279a562d3d"),
+        secretGolden("04e00eb271f91edc7a64290adc6ad7095169ee95e1a41334b4c604cd6b7d1af3"),
+        secretGolden("a5807cb6724439c34856eba3c50763d7c3bfef08afb428d403994a87a828737c"),
+    };
+    const record_actual = [_][tls_backend.hash_len]u8{
+        record.observed.handshake_write_secret[0].?.bytes,
+        record.observed.handshake_write_secret[1].?.bytes,
+        record.observed.application_write_secret[0].?.bytes,
+        record.observed.application_write_secret[1].?.bytes,
+    };
+    const extension_actual = [_][tls_backend.hash_len]u8{
+        extension.observed.handshake_write_secret[0].?.bytes,
+        extension.observed.handshake_write_secret[1].?.bytes,
+        extension.observed.application_write_secret[0].?.bytes,
+        extension.observed.application_write_secret[1].?.bytes,
+    };
+    for (record_goldens, record_actual) |expected, actual| {
+        try std.testing.expectEqualSlices(u8, &expected, &actual);
+    }
+    for (extension_goldens, extension_actual) |expected, actual| {
+        try std.testing.expectEqualSlices(u8, &expected, &actual);
+    }
+    try std.testing.expectEqualStrings("server transport parameters", recordOrEmpty(extension.client_backend.takePeerTransportExtension()));
+    try std.testing.expectEqualStrings("client transport parameters", recordOrEmpty(extension.server_backend.takePeerTransportExtension()));
+}
+
+fn recordOrEmpty(bytes: ?[]const u8) []const u8 {
+    return bytes orelse "";
+}
+
 // ===========================================================================
 // #410: PureZigRecordStream drives a real TLS 1.3 handshake over a nonblocking
 // socket-pair carrier.
@@ -196,6 +604,7 @@ const FdCarrier = struct {
 /// handshake. Heap-allocated so the self-referential carrier/backend vtables
 /// keep stable pointers.
 const SocketHarness = struct {
+    allocator: std.mem.Allocator,
     fds: [2]std.posix.fd_t,
     fds_closed: [2]bool,
     client_engine: tls_backend.Tls13Backend,
@@ -215,8 +624,13 @@ const SocketHarness = struct {
     };
 
     fn create(opts: Options) !*SocketHarness {
-        const self = try std.testing.allocator.create(SocketHarness);
-        errdefer std.testing.allocator.destroy(self);
+        return createWithAllocator(std.testing.allocator, opts);
+    }
+
+    fn createWithAllocator(allocator: std.mem.Allocator, opts: Options) !*SocketHarness {
+        const self = try allocator.create(SocketHarness);
+        errdefer allocator.destroy(self);
+        self.allocator = allocator;
         self.fds = try testSocketPair();
         self.fds_closed = .{ false, false };
 
@@ -246,7 +660,7 @@ const SocketHarness = struct {
         self.server.deinit();
         self.closeEndpoint(0);
         self.closeEndpoint(1);
-        std.testing.allocator.destroy(self);
+        self.allocator.destroy(self);
     }
 
     /// Drive both streams until `done` holds, either fails, or progress stalls.
@@ -275,6 +689,15 @@ const SocketHarness = struct {
         return self.client.bridge.handshake_complete and self.server.bridge.handshake_complete;
     }
 };
+
+test "allocating record owner cleans up across every allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            const harness = try SocketHarness.createWithAllocator(allocator, .{});
+            harness.destroy();
+        }
+    }.run, .{});
+}
 
 test "record stream completes a real TLS 1.3 handshake over a nonblocking socket pair" {
     // Fragmentation matrix: every practical carrier chunk size, from a

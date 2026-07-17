@@ -17,11 +17,11 @@
 //! rest of the native transport stack — no ambient RNG.
 
 const std = @import("std");
-const encrypted_stream = @import("encrypted_stream.zig");
 const events = @import("events.zig");
 const tls_handshake_codec = @import("handshake.zig");
 const tls_key_schedule = @import("key_schedule.zig");
 const tls_state = @import("state.zig");
+const tls13_transport = @import("tls13_transport.zig");
 
 const crypto = std.crypto;
 const X25519 = crypto.dh.X25519;
@@ -31,9 +31,9 @@ const Certificate = crypto.Certificate;
 
 const EncryptionLevel = events.EncryptionEpoch;
 const CertificateState = events.CertificateState;
-const HandshakeError = encrypted_stream.RecordHandshakeError;
-const EventSink = encrypted_stream.RecordTransport.EventSink;
-const TlsBackend = encrypted_stream.RecordHandshakeBackend;
+const HandshakeError = tls13_transport.Error;
+const EventSink = tls13_transport.EventSink;
+const TlsBackend = tls13_transport.Backend;
 const Role = tls_state.Role;
 const MessageType = tls_handshake_codec.MessageType;
 const Reader = tls_handshake_codec.Reader;
@@ -98,6 +98,26 @@ pub const TransportProfile = union(enum) {
             .record => null,
             .extension => |options| options.local,
         };
+    }
+
+    fn validate(self: TransportProfile) HandshakeError!void {
+        const negotiated_alpn = self.alpn();
+        if (negotiated_alpn.len == 0 or negotiated_alpn.len > std.math.maxInt(u8)) {
+            return error.InvalidTransportProfile;
+        }
+        if (self == .extension) {
+            const options = self.extension;
+            if (options.local.len > max_transport_extension_len) return error.InvalidTransportProfile;
+            switch (options.extension_type) {
+                ext_supported_groups,
+                ext_signature_algorithms,
+                ext_alpn,
+                ext_supported_versions,
+                ext_key_share,
+                => return error.InvalidTransportProfile,
+                else => {},
+            }
+        }
     }
 };
 
@@ -328,10 +348,14 @@ pub const Tls13Backend = struct {
     peer_certificate: [max_certificate_len]u8 = undefined,
     peer_certificate_len: usize = 0,
 
+    /// Allocation-free. The returned backend owns its copied entropy until
+    /// `deinit`, which securely clears all private material.
     pub fn initClient(entropy: Entropy, trust: Trust, profile: TransportProfile) Tls13Backend {
         return .{ .role = .client, .profile = profile, .entropy = entropy, .trust = trust, .core = tls_handshake_codec.Core.init(.client) };
     }
 
+    /// Allocation-free. The returned backend owns its copy of `identity` and
+    /// securely clears the private signing key in `deinit`.
     pub fn initServer(entropy: Entropy, identity: Identity, profile: TransportProfile) Tls13Backend {
         return .{ .role = .server, .profile = profile, .entropy = entropy, .identity = identity, .core = tls_handshake_codec.Core.init(.server) };
     }
@@ -350,12 +374,13 @@ pub const Tls13Backend = struct {
     }
 
     pub fn setExtensionProfile(self: *Tls13Backend, extension_type: u16, local: []const u8) HandshakeError!void {
-        if (local.len > max_transport_extension_len) return error.TransportBufferOverflow;
-        self.profile = .{ .extension = .{
+        const profile: TransportProfile = .{ .extension = .{
             .alpn = self.profile.alpn(),
             .extension_type = extension_type,
             .local = local,
         } };
+        try profile.validate();
+        self.profile = profile;
     }
 
     /// Returns a newly received opaque transport extension once. The caller
@@ -375,11 +400,8 @@ pub const Tls13Backend = struct {
         if (self.schedule) |*schedule| schedule.wipe();
         self.schedule = null;
         crypto.secureZero(u8, &self.expected_client_verify);
-        if (self.key_pair) |*key_pair| {
-            crypto.secureZero(u8, &key_pair.secret_key);
-            crypto.secureZero(u8, &key_pair.public_key);
-        }
-        self.key_pair = null;
+        self.wipeEphemeral();
+        self.wipeIdentity();
         crypto.secureZero(u8, &self.peer_certificate);
         self.peer_certificate_len = 0;
         crypto.secureZero(u8, &self.peer_transport_extension);
@@ -396,12 +418,27 @@ pub const Tls13Backend = struct {
         self.core.handshake_lifecycle = .failed;
     }
 
+    fn wipeEphemeral(self: *Tls13Backend) void {
+        crypto.secureZero(u8, &self.entropy.key_share_seed);
+        if (self.key_pair) |*key_pair| {
+            crypto.secureZero(u8, &key_pair.secret_key);
+            crypto.secureZero(u8, &key_pair.public_key);
+        }
+        self.key_pair = null;
+    }
+
+    fn wipeIdentity(self: *Tls13Backend) void {
+        crypto.secureZero(u8, std.mem.asBytes(&self.identity));
+        self.identity = null;
+    }
+
     fn startImpl(ptr: *anyopaque, role: Role, _: void, sink: *EventSink) HandshakeError!void {
         const self: *Tls13Backend = @ptrCast(@alignCast(ptr));
         // The driver's role comes from Handshake.initClient/initServer and must
         // match how this backend was constructed; a mismatch is a wiring bug.
         std.debug.assert(role == self.role);
         std.debug.assert(self.core.handshake_lifecycle == .idle);
+        try self.profile.validate();
         self.core.start() catch |err| return mapCoreError(err);
         switch (self.role) {
             .client => {
@@ -540,8 +577,9 @@ pub const Tls13Backend = struct {
     // -----------------------------------------------------------------------
 
     fn sendClientHello(self: *Tls13Backend, sink: *EventSink) HandshakeError!void {
-        const key_pair = X25519.KeyPair.generateDeterministic(self.entropy.key_share_seed) catch
+        var key_pair = X25519.KeyPair.generateDeterministic(self.entropy.key_share_seed) catch
             return error.SecretExportFailed;
+        defer crypto.secureZero(u8, &key_pair.secret_key);
         self.key_pair = key_pair;
 
         var buf: [1024]u8 = undefined;
@@ -640,8 +678,11 @@ pub const Tls13Backend = struct {
         // A low-order/identity peer share is a well-formed 32-byte field with an
         // illegal value (predictable all-zero shared secret), not malformed wire
         // data.
-        const shared = X25519.scalarmult(self.key_pair.?.secret_key, share) catch
+        if (self.key_pair == null) return error.InvalidHandshakeState;
+        var shared = X25519.scalarmult(self.key_pair.?.secret_key, share) catch
             return error.IllegalParameter;
+        defer crypto.secureZero(u8, &shared);
+        self.wipeEphemeral();
         self.schedule = KeySchedule.init(shared, self.core.transcriptHash());
         try self.emitHandshakeSecrets(sink);
         try sink.emitDiscardKeys(.initial);
@@ -870,11 +911,15 @@ pub const Tls13Backend = struct {
         // Validate the peer share before emitting anything: X25519.scalarmult
         // rejects low-order/identity public keys (all-zero shared secret)
         // rather than deriving a predictable secret.
-        const key_pair = X25519.KeyPair.generateDeterministic(self.entropy.key_share_seed) catch
+        var key_pair = X25519.KeyPair.generateDeterministic(self.entropy.key_share_seed) catch
             return error.SecretExportFailed;
+        defer crypto.secureZero(u8, &key_pair.secret_key);
         self.key_pair = key_pair;
-        const shared = X25519.scalarmult(key_pair.secret_key, client_share) catch
+        var shared = X25519.scalarmult(key_pair.secret_key, client_share) catch
             return error.IllegalParameter;
+        defer crypto.secureZero(u8, &shared);
+        crypto.secureZero(u8, &key_pair.secret_key);
+        self.wipeEphemeral();
 
         if (!alpn_match) {
             // Report what the client offered instead of silently downgrading;
@@ -925,7 +970,8 @@ pub const Tls13Backend = struct {
     /// EncryptedExtensions + Certificate + CertificateVerify + Finished at the
     /// Handshake level, followed by the 1-RTT secrets.
     fn sendServerFlight(self: *Tls13Backend, sink: *EventSink) HandshakeError!void {
-        const identity = self.identity.?;
+        if (self.identity == null) return error.InvalidHandshakeState;
+        const identity = &self.identity.?;
         const schedule = &self.schedule.?;
         var buf: [max_message_len]u8 = undefined;
         var w = Writer{ .buf = &buf };
@@ -976,13 +1022,15 @@ pub const Tls13Backend = struct {
         const verify_len = try w.reserve(3);
         try w.u16_(identity.signatureAlgorithm());
         switch (identity.key) {
-            .ed25519 => |key_pair| {
+            .ed25519 => {
+                const key_pair = &identity.key.ed25519;
                 const signature = key_pair.sign(content.slice(), null) catch
                     return error.SecretExportFailed;
                 try w.u16_(Ed25519.Signature.encoded_length);
                 try w.bytes(&signature.toBytes());
             },
-            .ecdsa_p256 => |key_pair| {
+            .ecdsa_p256 => {
+                const key_pair = &identity.key.ecdsa_p256;
                 const signature = key_pair.sign(content.slice(), null) catch
                     return error.SecretExportFailed;
                 var der_buf: [EcdsaP256.Signature.der_encoded_length_max]u8 = undefined;
@@ -991,6 +1039,7 @@ pub const Tls13Backend = struct {
                 try w.bytes(der);
             },
         }
+        self.wipeIdentity();
         w.patch(3, verify_len);
         const certificate_verify = buf[verify_start..w.len];
         self.core.recordSent(certificate_verify) catch |err| return mapCoreError(err);
@@ -1159,6 +1208,80 @@ test "TLS-owned backend teardown clears transcript-adjacent and peer scratch" {
 
     try std.testing.expect(std.mem.allEqual(u8, &backend.expected_client_verify, 0));
     try std.testing.expect(std.mem.allEqual(u8, &backend.peer_certificate, 0));
+    try std.testing.expect(std.mem.allEqual(u8, &backend.entropy.key_share_seed, 0));
+    try std.testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&backend.key_pair), 0));
     try std.testing.expectEqual(@as(usize, 0), backend.peer_certificate_len);
     try std.testing.expectEqual(tls_handshake_codec.HandshakeLifecycle.failed, backend.core.handshake_lifecycle);
+}
+
+test "transport profile validation fails before lifecycle or transcript advance" {
+    const entropy = Entropy{ .hello_random = [_]u8{0x41} ** 32, .key_share_seed = [_]u8{0x42} ** 32 };
+    const invalid_alpns = [_][]const u8{ "", &([_]u8{'a'} ** 256) };
+    for (invalid_alpns) |alpn_value| {
+        var backend = Tls13Backend.initClient(
+            entropy,
+            .{ .pinned_certificate = testdata.certificate_der },
+            .{ .record = .{ .alpn = alpn_value } },
+        );
+        var sink = EventSink{};
+        defer sink.deinit();
+        try std.testing.expectError(error.InvalidTransportProfile, backend.backend().start(.client, {}, &sink));
+        try std.testing.expectEqual(tls_handshake_codec.HandshakeLifecycle.idle, backend.core.handshake_lifecycle);
+        try std.testing.expectEqual(@as(usize, 0), sink.len);
+        try std.testing.expect(backend.key_pair == null);
+        try std.testing.expectEqualSlices(u8, &entropy.key_share_seed, &backend.entropy.key_share_seed);
+        backend.deinit();
+    }
+
+    var oversized = [_]u8{0xa5} ** (max_transport_extension_len + 1);
+    var extension_backend = Tls13Backend.initClient(
+        entropy,
+        .{ .pinned_certificate = testdata.certificate_der },
+        .{ .extension = .{ .alpn = "h3", .extension_type = 57, .local = &oversized } },
+    );
+    var extension_sink = EventSink{};
+    defer extension_sink.deinit();
+    try std.testing.expectError(error.InvalidTransportProfile, extension_backend.backend().start(.client, {}, &extension_sink));
+    try std.testing.expectEqual(tls_handshake_codec.HandshakeLifecycle.idle, extension_backend.core.handshake_lifecycle);
+    try std.testing.expectEqual(@as(usize, 0), extension_sink.len);
+    try std.testing.expectError(error.InvalidTransportProfile, extension_backend.setExtensionProfile(ext_alpn, "valid"));
+    extension_backend.deinit();
+
+    var collision_backend = Tls13Backend.initClient(
+        entropy,
+        .{ .pinned_certificate = testdata.certificate_der },
+        .{ .extension = .{ .alpn = "h3", .extension_type = ext_supported_versions, .local = "valid" } },
+    );
+    var collision_sink = EventSink{};
+    defer collision_sink.deinit();
+    try std.testing.expectError(error.InvalidTransportProfile, collision_backend.backend().start(.client, {}, &collision_sink));
+    try std.testing.expectEqual(tls_handshake_codec.HandshakeLifecycle.idle, collision_backend.core.handshake_lifecycle);
+    try std.testing.expectEqual(@as(usize, 0), collision_sink.len);
+    collision_backend.deinit();
+}
+
+test "abandoned backend teardown wipes ephemeral and server identity storage" {
+    const entropy = Entropy{ .hello_random = [_]u8{0x31} ** 32, .key_share_seed = [_]u8{0x32} ** 32 };
+    var client = Tls13Backend.initClient(
+        entropy,
+        .{ .pinned_certificate = testdata.certificate_der },
+        .{ .record = .{ .alpn = "h2" } },
+    );
+    var sink = EventSink{};
+    defer sink.deinit();
+    try client.backend().start(.client, {}, &sink);
+    try std.testing.expect(client.key_pair != null);
+    client.deinit();
+    try std.testing.expect(std.mem.allEqual(u8, &client.entropy.key_share_seed, 0));
+    try std.testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&client.key_pair), 0));
+
+    var server = Tls13Backend.initServer(
+        entropy,
+        try Identity.initPkcs8(testdata.certificate_der, testdata.private_key_pkcs8_der),
+        .{ .record = .{ .alpn = "h2" } },
+    );
+    server.deinit();
+    try std.testing.expect(server.identity == null);
+    try std.testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&server.identity), 0));
+    try std.testing.expect(std.mem.allEqual(u8, &server.entropy.key_share_seed, 0));
 }

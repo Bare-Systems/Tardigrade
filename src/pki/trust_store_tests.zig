@@ -15,7 +15,6 @@ const name_constraints_leaf_pem = @embedFile("testdata/name_constraints/dns-good
 const openssl_root_pem = @embedFile("testdata/path_validator_ed25519_root.crt");
 const openssl_leaf_pem = @embedFile("testdata/path_validator_ed25519_leaf.crt");
 const validation_time_name_constraints: i64 = 1_784_332_800; // 2026-07-18T00:00:00Z
-const validation_time_direct_anchor: i64 = 1_782_864_000; // 2026-07-01T00:00:00Z
 
 const LoadedCertificate = struct {
     pem_certificate: pem.Certificate,
@@ -100,6 +99,10 @@ fn minimalCertDer(n: u8) [5]u8 {
     return .{ 0x30, 0x03, 0x02, 0x01, n };
 }
 
+fn concatPemBundle(allocator: std.mem.Allocator, parts: []const []const u8) ![]u8 {
+    return std.mem.concat(allocator, u8, parts);
+}
+
 test "snapshot loads mixed PEM and DER bundles with exact-DER dedup" {
     var primary_root = try loadFixture(testing.allocator, name_constraints_root_pem);
     defer primary_root.deinit(testing.allocator);
@@ -144,6 +147,42 @@ test "snapshot rejects malformed, non-CA, and empty anchor sets typed" {
         testing.allocator,
         &empty_inputs,
         .{},
+    ));
+}
+
+test "multi-certificate PEM bundle returns NonCaAnchor without leaking trailing entries" {
+    const bundle = try concatPemBundle(testing.allocator, &.{
+        name_constraints_root_pem,
+        openssl_leaf_pem,
+        openssl_root_pem,
+    });
+    defer testing.allocator.free(bundle);
+
+    const inputs = [_]trust_store.BufferInput{
+        .{ .pem = bundle },
+    };
+    try testing.expectError(error.NonCaAnchor, trust_store.Snapshot.loadBuffers(
+        testing.allocator,
+        &inputs,
+        .{},
+    ));
+}
+
+test "multi-certificate PEM bundle returns TooManyAnchors without leaking trailing entries" {
+    const bundle = try concatPemBundle(testing.allocator, &.{
+        name_constraints_root_pem,
+        openssl_root_pem,
+        name_constraints_root_pem,
+    });
+    defer testing.allocator.free(bundle);
+
+    const inputs = [_]trust_store.BufferInput{
+        .{ .pem = bundle },
+    };
+    try testing.expectError(error.TooManyAnchors, trust_store.Snapshot.loadBuffers(
+        testing.allocator,
+        &inputs,
+        .{ .max_anchors = 1 },
     ));
 }
 

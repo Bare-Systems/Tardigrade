@@ -56,17 +56,8 @@ pub const Snapshot = struct {
         for (inputs) |input| {
             switch (input) {
                 .pem => |pem_text| {
-                    const chain = try pem.loadChainPem(allocator, pem_text, limits.loader);
-                    defer allocator.free(chain.certificates);
-                    for (chain.certificates) |certificate| {
-                        try appendOwnedCertificate(
-                            allocator,
-                            &owned_certs,
-                            &parsed_anchors,
-                            certificate,
-                            limits,
-                        );
-                    }
+                    var chain = try pem.loadChainPem(allocator, pem_text, limits.loader);
+                    try appendPemChain(allocator, &owned_certs, &parsed_anchors, &chain, limits);
                 },
                 .der => |der_bytes| {
                     const certificate = try pem.loadCertificateDer(allocator, der_bytes, limits.loader);
@@ -100,17 +91,8 @@ pub const Snapshot = struct {
         for (inputs) |input| {
             switch (input) {
                 .pem => |sub_path| {
-                    const chain = try pem.loadChainPemFile(allocator, io, dir, sub_path, limits.loader);
-                    defer allocator.free(chain.certificates);
-                    for (chain.certificates) |certificate| {
-                        try appendOwnedCertificate(
-                            allocator,
-                            &owned_certs,
-                            &parsed_anchors,
-                            certificate,
-                            limits,
-                        );
-                    }
+                    var chain = try pem.loadChainPemFile(allocator, io, dir, sub_path, limits.loader);
+                    try appendPemChain(allocator, &owned_certs, &parsed_anchors, &chain, limits);
                 },
                 .der => |sub_path| {
                     const certificate = try pem.loadCertificateDerFile(allocator, io, dir, sub_path, limits.loader);
@@ -288,6 +270,29 @@ fn appendOwnedCertificate(
         parsed.deinit(allocator);
         return err;
     };
+}
+
+fn appendPemChain(
+    allocator: std.mem.Allocator,
+    owned_certs: *std.ArrayList(pem.Certificate),
+    parsed_anchors: *std.ArrayList(x509.Certificate),
+    chain: *pem.CertificateChain,
+    limits: Limits,
+) Error!void {
+    var transferred: usize = 0;
+    errdefer {
+        for (chain.certificates[transferred..]) |*certificate| certificate.deinit(allocator);
+        allocator.free(chain.certificates);
+    }
+
+    for (chain.certificates, 0..) |*certificate, index| {
+        const owned = certificate.*;
+        certificate.* = undefined;
+        transferred = index + 1;
+        try appendOwnedCertificate(allocator, owned_certs, parsed_anchors, owned, limits);
+    }
+
+    allocator.free(chain.certificates);
 }
 
 fn containsDer(owned_certs: []const pem.Certificate, der_bytes: []const u8) bool {

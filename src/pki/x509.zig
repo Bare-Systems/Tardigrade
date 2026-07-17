@@ -46,6 +46,11 @@ pub const Limits = struct {
     max_general_names: usize = 64,
     max_eku_purposes: usize = 32,
     max_policies: usize = 32,
+    max_policy_qualifiers: usize = 8,
+    /// Bounds the encoded TLV bytes of one policy qualifier value.
+    max_policy_qualifier_len: usize = 1024,
+    max_policy_mappings: usize = 32,
+    max_user_notice_numbers: usize = 32,
     max_distribution_points: usize = 16,
     max_access_descriptions: usize = 16,
     max_name_constraint_subtrees: usize = 64,
@@ -347,10 +352,40 @@ pub const DistributionPoint = struct {
     full_names: []const GeneralName,
 };
 
+/// Identification of the standard policy qualifier forms (RFC 5280
+/// §4.2.1.4). `unrecognized` records an unknown qualifier type; whether that
+/// is acceptable is validation policy (it is rejected when the extension is
+/// critical).
+pub const PolicyQualifierForm = enum { cps_uri, user_notice, unrecognized };
+
+pub const PolicyQualifier = struct {
+    oid: oid_mod.ObjectIdentifier,
+    form: PolicyQualifierForm,
+    /// Full TLV bytes of the qualifier value, bounded by
+    /// `Limits.max_policy_qualifier_len`. Recognized forms are structurally
+    /// validated; CPS URIs are never fetched and user notices never shown.
+    value_raw: []const u8,
+};
+
 pub const PolicyInformation = struct {
     policy: oid_mod.ObjectIdentifier,
-    /// Full TLV bytes of the policyQualifiers SEQUENCE when present.
-    qualifiers_raw: ?[]const u8,
+    /// True when `policy` is the special anyPolicy OID (2.5.29.32.0).
+    is_any_policy: bool,
+    /// Empty when the optional policyQualifiers SEQUENCE is absent.
+    qualifiers: []const PolicyQualifier,
+};
+
+/// One policyMappings pair (RFC 5280 §4.2.1.5). anyPolicy is rejected on
+/// both sides at parse time.
+pub const PolicyMapping = struct {
+    issuer_domain_policy: oid_mod.ObjectIdentifier,
+    subject_domain_policy: oid_mod.ObjectIdentifier,
+};
+
+/// policyConstraints (RFC 5280 §4.2.1.11); at least one field is present.
+pub const PolicyConstraints = struct {
+    require_explicit_policy: ?u32,
+    inhibit_policy_mapping: ?u32,
 };
 
 pub const Extension = struct {
@@ -371,6 +406,9 @@ pub const Extension = struct {
         authority_info_access: []const AccessDescription,
         crl_distribution_points: []const DistributionPoint,
         certificate_policies: []const PolicyInformation,
+        policy_mappings: []const PolicyMapping,
+        policy_constraints: PolicyConstraints,
+        inhibit_any_policy: u32,
         unrecognized: void,
     };
 };
@@ -481,6 +519,26 @@ pub const Certificate = struct {
     pub fn nameConstraints(self: *const Certificate) ?NameConstraints {
         const extension = self.findExtension(&wk.name_constraints) orelse return null;
         return extension.parsed.name_constraints;
+    }
+
+    pub fn certificatePolicies(self: *const Certificate) ?[]const PolicyInformation {
+        const extension = self.findExtension(&wk.certificate_policies) orelse return null;
+        return extension.parsed.certificate_policies;
+    }
+
+    pub fn policyMappings(self: *const Certificate) ?[]const PolicyMapping {
+        const extension = self.findExtension(&wk.policy_mappings) orelse return null;
+        return extension.parsed.policy_mappings;
+    }
+
+    pub fn policyConstraints(self: *const Certificate) ?PolicyConstraints {
+        const extension = self.findExtension(&wk.policy_constraints) orelse return null;
+        return extension.parsed.policy_constraints;
+    }
+
+    pub fn inhibitAnyPolicy(self: *const Certificate) ?u32 {
+        const extension = self.findExtension(&wk.inhibit_any_policy) orelse return null;
+        return extension.parsed.inhibit_any_policy;
     }
 };
 
@@ -844,6 +902,12 @@ const Parser = struct {
             return .{ .crl_distribution_points = try self.parseCrlDistributionPoints(value) };
         } else if (ext_oid.eqlComponents(&wk.certificate_policies)) {
             return .{ .certificate_policies = try self.parseCertificatePolicies(value) };
+        } else if (ext_oid.eqlComponents(&wk.policy_mappings)) {
+            return .{ .policy_mappings = try self.parsePolicyMappings(value) };
+        } else if (ext_oid.eqlComponents(&wk.policy_constraints)) {
+            return .{ .policy_constraints = try self.parsePolicyConstraints(value) };
+        } else if (ext_oid.eqlComponents(&wk.inhibit_any_policy)) {
+            return .{ .inhibit_any_policy = try self.parseInhibitAnyPolicy(value) };
         }
         return .unrecognized;
     }
@@ -1114,17 +1178,160 @@ const Parser = struct {
             if (policies.items.len >= self.limits.max_policies) return error.CountLimitExceeded;
             var info_reader = inner.readSequence() catch return error.MalformedExtension;
             const policy = info_reader.readObjectIdentifier() catch return error.MalformedExtension;
-            var qualifiers_raw: ?[]const u8 = null;
+            // RFC 5280 §4.2.1.4: a policy OID appears at most once per
+            // extension; duplicates (including duplicate anyPolicy) fail.
+            for (policies.items) |*existing| {
+                if (existing.policy.eql(&policy)) return error.MalformedExtension;
+            }
+            var qualifiers: []const PolicyQualifier = &.{};
             if (info_reader.remaining() > 0) {
-                const qualifiers = info_reader.readElement() catch return error.MalformedExtension;
-                if (!isSequence(qualifiers)) return error.MalformedExtension;
-                qualifiers_raw = qualifiers.encoded;
+                qualifiers = try self.parsePolicyQualifiers(&info_reader);
             }
             info_reader.expectEnd() catch return error.MalformedExtension;
-            try policies.append(self.arena, .{ .policy = policy, .qualifiers_raw = qualifiers_raw });
+            try policies.append(self.arena, .{
+                .policy = policy,
+                .is_any_policy = policy.eqlComponents(&wk.any_policy),
+                .qualifiers = qualifiers,
+            });
         }
         if (policies.items.len == 0) return error.MalformedExtension;
         return policies.items;
+    }
+
+    fn parsePolicyQualifiers(self: *Parser, reader: *der.Reader) Error![]const PolicyQualifier {
+        var list_reader = reader.readSequence() catch return error.MalformedExtension;
+        var qualifiers: std.ArrayList(PolicyQualifier) = .empty;
+        while (list_reader.remaining() > 0) {
+            if (qualifiers.items.len >= self.limits.max_policy_qualifiers) return error.CountLimitExceeded;
+            // PolicyQualifierInfo ::= SEQUENCE { policyQualifierId OID,
+            // qualifier ANY } — exactly one identifier and one value.
+            var qualifier_reader = list_reader.readSequence() catch return error.MalformedExtension;
+            const qualifier_oid = qualifier_reader.readObjectIdentifier() catch return error.MalformedExtension;
+            const value_elem = qualifier_reader.readElement() catch return error.MalformedExtension;
+            qualifier_reader.expectEnd() catch return error.MalformedExtension;
+            if (value_elem.encoded.len > self.limits.max_policy_qualifier_len) {
+                return error.CountLimitExceeded;
+            }
+
+            var form: PolicyQualifierForm = .unrecognized;
+            if (qualifier_oid.eqlComponents(&wk.qualifier_cps)) {
+                // CPSuri ::= IA5String. Validated only; never fetched.
+                if (!value_elem.tag.eql(der.Tag.universal(@intFromEnum(der.UniversalTag.ia5_string), false))) {
+                    return error.MalformedExtension;
+                }
+                der.validateIa5String(value_elem.content) catch return error.MalformedExtension;
+                form = .cps_uri;
+            } else if (qualifier_oid.eqlComponents(&wk.qualifier_user_notice)) {
+                if (!isSequence(value_elem)) return error.MalformedExtension;
+                var notice_reader = qualifier_reader.childReader(value_elem.content_offset, value_elem.content.len) catch return error.MalformedExtension;
+                try self.validateUserNotice(&notice_reader);
+                form = .user_notice;
+            }
+            try qualifiers.append(self.arena, .{
+                .oid = qualifier_oid,
+                .form = form,
+                .value_raw = value_elem.encoded,
+            });
+        }
+        // RFC 5280 §4.2.1.4: a present policyQualifiers SEQUENCE is nonempty.
+        if (qualifiers.items.len == 0) return error.MalformedExtension;
+        list_reader.expectEnd() catch return error.MalformedExtension;
+        return qualifiers.items;
+    }
+
+    /// UserNotice ::= SEQUENCE { noticeRef NoticeReference OPTIONAL,
+    /// explicitText DisplayText OPTIONAL }; NoticeReference ::= SEQUENCE {
+    /// organization DisplayText, noticeNumbers SEQUENCE OF INTEGER }.
+    /// Structure is validated and bounded; the text is never displayed.
+    fn validateUserNotice(self: *Parser, reader: *der.Reader) Error!void {
+        if (reader.remaining() > 0) {
+            var probe = reader.*;
+            const first = probe.readElement() catch return error.MalformedExtension;
+            if (isSequence(first)) {
+                var reference_reader = reader.readSequence() catch return error.MalformedExtension;
+                try validateDisplayText(&reference_reader);
+                var numbers_reader = reference_reader.readSequence() catch return error.MalformedExtension;
+                var count: usize = 0;
+                while (numbers_reader.remaining() > 0) {
+                    if (count >= self.limits.max_user_notice_numbers) return error.CountLimitExceeded;
+                    _ = numbers_reader.readInteger() catch return error.MalformedExtension;
+                    count += 1;
+                }
+                numbers_reader.expectEnd() catch return error.MalformedExtension;
+                reference_reader.expectEnd() catch return error.MalformedExtension;
+            }
+        }
+        if (reader.remaining() > 0) {
+            try validateDisplayText(reader);
+        }
+        reader.expectEnd() catch return error.MalformedExtension;
+    }
+
+    fn parsePolicyMappings(self: *Parser, value: []const u8) Error![]const PolicyMapping {
+        var reader = der.Reader.init(value, self.limits.der);
+        var inner = reader.readSequence() catch return error.MalformedExtension;
+        reader.expectEnd() catch return error.MalformedExtension;
+
+        var mappings: std.ArrayList(PolicyMapping) = .empty;
+        while (inner.remaining() > 0) {
+            if (mappings.items.len >= self.limits.max_policy_mappings) return error.CountLimitExceeded;
+            var pair_reader = inner.readSequence() catch return error.MalformedExtension;
+            const issuer_policy = pair_reader.readObjectIdentifier() catch return error.MalformedExtension;
+            const subject_policy = pair_reader.readObjectIdentifier() catch return error.MalformedExtension;
+            pair_reader.expectEnd() catch return error.MalformedExtension;
+            // RFC 5280 §4.2.1.5: policies MUST NOT be mapped to or from
+            // anyPolicy.
+            if (issuer_policy.eqlComponents(&wk.any_policy) or
+                subject_policy.eqlComponents(&wk.any_policy))
+            {
+                return error.MalformedExtension;
+            }
+            try mappings.append(self.arena, .{
+                .issuer_domain_policy = issuer_policy,
+                .subject_domain_policy = subject_policy,
+            });
+        }
+        if (mappings.items.len == 0) return error.MalformedExtension;
+        return mappings.items;
+    }
+
+    fn parsePolicyConstraints(self: *Parser, value: []const u8) Error!PolicyConstraints {
+        var reader = der.Reader.init(value, self.limits.der);
+        var inner = reader.readSequence() catch return error.MalformedExtension;
+        reader.expectEnd() catch return error.MalformedExtension;
+
+        var result = PolicyConstraints{
+            .require_explicit_policy = null,
+            .inhibit_policy_mapping = null,
+        };
+        // requireExplicitPolicy [0] and inhibitPolicyMapping [1] are
+        // IMPLICIT primitive SkipCerts; each appears at most once, in
+        // ascending tag order.
+        var last_tag: i64 = -1;
+        while (inner.remaining() > 0) {
+            const elem = inner.readElement() catch return error.MalformedExtension;
+            if (elem.tag.class != .context_specific or elem.tag.constructed) return error.MalformedExtension;
+            if (elem.tag.number > 1) return error.MalformedExtension;
+            if (elem.tag.number <= last_tag) return error.MalformedExtension;
+            last_tag = elem.tag.number;
+            const skip = try validateSkipCerts(elem.content, self.limits.der.max_integer_bytes);
+            switch (elem.tag.number) {
+                0 => result.require_explicit_policy = skip,
+                else => result.inhibit_policy_mapping = skip,
+            }
+        }
+        // RFC 5280 §4.2.1.11: an empty policyConstraints SEQUENCE is invalid.
+        if (result.require_explicit_policy == null and result.inhibit_policy_mapping == null) {
+            return error.MalformedExtension;
+        }
+        return result;
+    }
+
+    fn parseInhibitAnyPolicy(self: *Parser, value: []const u8) Error!u32 {
+        var reader = der.Reader.init(value, self.limits.der);
+        const elem = reader.expectTag(der.Tag.universal(@intFromEnum(der.UniversalTag.integer), false)) catch return error.MalformedExtension;
+        reader.expectEnd() catch return error.MalformedExtension;
+        return validateSkipCerts(elem.content, self.limits.der.max_integer_bytes);
     }
 
     /// Wrap a SEQUENCE OF GeneralName held in `value` (SAN payload).
@@ -1234,6 +1441,43 @@ fn parseTime(reader: *der.Reader) Error!Time {
         },
         else => return error.MalformedValidity,
     }
+}
+
+/// DisplayText ::= CHOICE { ia5String, visibleString, bmpString, utf8String },
+/// each SIZE (1..200) characters (RFC 5280 §4.2.1.4).
+fn validateDisplayText(reader: *der.Reader) Error!void {
+    const elem = reader.readElement() catch return error.MalformedExtension;
+    if (elem.tag.class != .universal or elem.tag.constructed) return error.MalformedExtension;
+    if (elem.content.len == 0) return error.MalformedExtension;
+    switch (elem.tag.number) {
+        @intFromEnum(der.UniversalTag.ia5_string) => {
+            der.validateIa5String(elem.content) catch return error.MalformedExtension;
+            if (elem.content.len > 200) return error.MalformedExtension;
+        },
+        @intFromEnum(der.UniversalTag.visible_string) => {
+            der.validateVisibleString(elem.content) catch return error.MalformedExtension;
+            if (elem.content.len > 200) return error.MalformedExtension;
+        },
+        @intFromEnum(der.UniversalTag.bmp_string) => {
+            der.validateBmpString(elem.content) catch return error.MalformedExtension;
+            if (elem.content.len > 200 * 2) return error.MalformedExtension;
+        },
+        @intFromEnum(der.UniversalTag.utf8_string) => {
+            der.validateUtf8(elem.content) catch return error.MalformedExtension;
+            const codepoints = std.unicode.utf8CountCodepoints(elem.content) catch return error.MalformedExtension;
+            if (codepoints > 200) return error.MalformedExtension;
+        },
+        else => return error.MalformedExtension,
+    }
+}
+
+/// SkipCerts ::= INTEGER (0..MAX): validated minimal DER, nonnegative, and
+/// bounded to u32.
+fn validateSkipCerts(content: []const u8, max_integer_bytes: usize) Error!u32 {
+    der.validateInteger(content, max_integer_bytes) catch return error.MalformedExtension;
+    const view = der.IntegerView{ .content = content };
+    if (view.isNegative()) return error.MalformedExtension;
+    return integerToU32(view) orelse error.MalformedExtension;
 }
 
 fn validateDirectoryString(elem: der.Element) Error!void {

@@ -5,6 +5,30 @@ All notable user-facing changes to Tardigrade are documented here.
 ## [Unreleased]
 
 ### Features
+- **Bounded RFC 9618 certificate-policy validation (#345, epic #324)** — adds
+  `src/pki/certificate_policies.zig`, a deterministic policy engine that
+  processes certificatePolicies, policyMappings, policyConstraints, and
+  inhibitAnyPolicy over `path_builder` candidate paths using the RFC 9618
+  valid_policy_graph (one node per policy OID per depth with merged parents)
+  instead of the obsolete exponential valid_policy_tree. The #341 parser now
+  types all four policy extensions with strict DER enforcement: duplicate
+  policy OIDs, empty sequences, anyPolicy mappings, unconsumed pairs,
+  non-minimal or negative SkipCerts, and malformed CPS/UserNotice qualifier
+  structure fail closed at parse time. `ValidationPolicy` gains an RFC 5280
+  §6.1.1 policy configuration (user-initial-policy-set, explicit-policy,
+  mapping-inhibit, anyPolicy-inhibit, and explicit graph/operation limits),
+  and accepted paths return owned, sorted, unique authority- and
+  user-constrained policy OID sets; qualifiers are validated but never
+  returned, fetched, or displayed. Processing runs anchor-to-target with the
+  RFC self-issued counter and anyPolicy exceptions, after Name Constraints
+  and before leaf identity, with structured stage/index/OID/depth
+  diagnostics. Noncritical policyConstraints and inhibitAnyPolicy, mappings
+  on the target certificate, and unrecognized qualifiers under a critical
+  extension are rejected. Synthetic fixtures cover the mapping, constraint,
+  counter, graph-safety, and alternate-candidate matrices including the
+  RFC 9618 Cartesian-mapping attack with proven-linear node counts, and an
+  opt-in `test-pki-policy-openssl` target compares fixed OpenSSL-generated
+  policy chains against `openssl verify` policy flags.
 - **Deterministic RFC 5280 path-validation core (#345, epic #324)** — adds
   `src/pki/path_validator.zig`, an iterative, offline validator for
   `path_builder` candidate paths. It authenticates terminal anchors against
@@ -28,9 +52,8 @@ All notable user-facing changes to Tardigrade are documented here.
   noncritical CA constraints, and constraints on leaves fail closed. Fixed
   OpenSSL-generated fixtures and an opt-in `test-pki-openssl` differential
   target cover DNS, IP, directoryName, and leading-dot compatibility.
-  Certificate-policy processing remains deferred: noncritical
-  certificatePolicies use the implicit any-policy policy, and critical policy
-  extensions are rejected until full processing is implemented.
+  Certificate-policy processing is provided by the bounded RFC 9618 engine
+  described in the entry above.
   Deterministic, real-signature Ed25519 fixtures plus independently
   OpenSSL-generated leaf/anchor chain cover valid/direct and alternate paths,
   signature defect classes, time boundaries, CA/KU/EKU,

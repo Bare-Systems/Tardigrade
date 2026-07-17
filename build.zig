@@ -436,6 +436,21 @@ pub fn build(b: *std.Build) void {
     const run_pki_openssl_diff_tests = b.addRunArtifact(pki_openssl_diff_tests);
     const pki_openssl_diff_step = b.step("test-pki-openssl", "Compare Name Constraints fixtures with OpenSSL");
     pki_openssl_diff_step.dependOn(&run_pki_openssl_diff_tests.step);
+
+    // Optional out-of-process OpenSSL differential checks for the fixed
+    // certificate-policy fixture matrix (#345); also opt-in only.
+    const pki_policy_diff_mod = b.createModule(.{
+        .root_source_file = b.path("tests/pki_policy_openssl_diff.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    pki_policy_diff_mod.addImport("crypto", crypto_mod);
+    pki_policy_diff_mod.addImport("pki", pki_mod);
+    pki_policy_diff_mod.addImport("zig_compat", compat_mod);
+    const pki_policy_diff_tests = b.addTest(.{ .root_module = pki_policy_diff_mod });
+    const run_pki_policy_diff_tests = b.addRunArtifact(pki_policy_diff_tests);
+    const pki_policy_diff_step = b.step("test-pki-policy-openssl", "Compare certificate-policy fixtures with OpenSSL");
+    pki_policy_diff_step.dependOn(&run_pki_policy_diff_tests.step);
 }
 
 fn pathExists(path: []const u8) bool {

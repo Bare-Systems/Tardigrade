@@ -81,6 +81,7 @@ pub const UniversalTag = enum(u32) {
     ia5_string = 22,
     utc_time = 23,
     generalized_time = 24,
+    visible_string = 26,
     bmp_string = 30,
 };
 
@@ -522,6 +523,13 @@ fn isPrintableChar(c: u8) bool {
 pub fn validateIa5String(content: []const u8) Error!void {
     for (content) |c| {
         if (c > 0x7f) return error.MalformedString;
+    }
+}
+
+/// ISO 646 VisibleString: printing characters plus space, no controls.
+pub fn validateVisibleString(content: []const u8) Error!void {
+    for (content) |c| {
+        if (c < 0x20 or c > 0x7e) return error.MalformedString;
     }
 }
 

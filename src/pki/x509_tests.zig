@@ -148,7 +148,8 @@ test "ECDSA P-256 leaf fixture parses SAN, EKU, AKI, AIA, CRLDP, and policies" {
     const policies = policies_ext.parsed.certificate_policies;
     try testing.expectEqual(@as(usize, 1), policies.len);
     try testing.expect(policies[0].policy.eqlComponents(&.{ 1, 3, 6, 1, 4, 1, 99999, 1 }));
-    try testing.expectEqual(@as(?[]const u8, null), policies[0].qualifiers_raw);
+    try testing.expect(!policies[0].is_any_policy);
+    try testing.expectEqual(@as(usize, 0), policies[0].qualifiers.len);
 }
 
 test "Ed25519 fixture parses" {

@@ -160,9 +160,17 @@ pub const well_known = struct {
     pub const name_constraints = [_]u32{ 2, 5, 29, 30 };
     pub const crl_distribution_points = [_]u32{ 2, 5, 29, 31 };
     pub const certificate_policies = [_]u32{ 2, 5, 29, 32 };
+    pub const policy_mappings = [_]u32{ 2, 5, 29, 33 };
     pub const authority_key_identifier = [_]u32{ 2, 5, 29, 35 };
+    pub const policy_constraints = [_]u32{ 2, 5, 29, 36 };
     pub const ext_key_usage = [_]u32{ 2, 5, 29, 37 };
+    pub const inhibit_any_policy = [_]u32{ 2, 5, 29, 54 };
     pub const authority_info_access = [_]u32{ 1, 3, 6, 1, 5, 5, 7, 1, 1 };
+
+    // Certificate policies (RFC 5280 §4.2.1.4).
+    pub const any_policy = [_]u32{ 2, 5, 29, 32, 0 };
+    pub const qualifier_cps = [_]u32{ 1, 3, 6, 1, 5, 5, 7, 2, 1 };
+    pub const qualifier_user_notice = [_]u32{ 1, 3, 6, 1, 5, 5, 7, 2, 2 };
 
     // Extended key usage purposes.
     pub const server_auth = [_]u32{ 1, 3, 6, 1, 5, 5, 7, 3, 1 };

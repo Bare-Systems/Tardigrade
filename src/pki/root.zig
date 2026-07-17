@@ -16,6 +16,7 @@
 //! - `path_builder` — deterministic candidate certification-path construction
 //! - `path_validator` — deterministic RFC 5280 candidate-path validation
 //! - `name_constraints` — bounded RFC 5280 permitted/excluded subtree state
+//! - `certificate_policies` — bounded RFC 9618 policy-graph processing
 //!
 //! ## Policy summary
 //!
@@ -41,6 +42,7 @@ pub const identity = @import("identity.zig");
 pub const verify = @import("verify.zig");
 pub const path_builder = @import("path_builder.zig");
 pub const name_constraints = @import("name_constraints.zig");
+pub const certificate_policies = @import("certificate_policies.zig");
 pub const path_validator = @import("path_validator.zig");
 
 test {
@@ -52,4 +54,5 @@ test {
     _ = @import("verify_tests.zig");
     _ = @import("path_builder_tests.zig");
     _ = @import("path_validator_tests.zig");
+    _ = @import("certificate_policies_tests.zig");
 }

@@ -832,6 +832,7 @@ test "email constraints preserve local-part case and distinguish host from domai
     try std.testing.expect(emailWithin("any@sub.example.com", ".example.com"));
     try std.testing.expect(!emailWithin("any@example.com", ".example.com"));
     try std.testing.expect(emailWithin("\"root\"@example.com", "root@example.com"));
+    try std.testing.expect(emailWithin("\"ro\\ot\"@example.com", "root@example.com"));
     try std.testing.expect(emailWithin("\"a@b\"@example.com", "example.com"));
     try std.testing.expectError(error.Malformed, validateMailbox(".a@example.com"));
     try std.testing.expectError(error.Malformed, validateMailbox("a..b@example.com"));
@@ -850,6 +851,7 @@ test "URI host parsing is bounded and constraints distinguish exact hosts from d
     try std.testing.expectError(error.Malformed, uriHost("https://192.0.2.1/", 256));
     try std.testing.expectError(error.Malformed, uriHost("https://bad@@api.example.com/", 256));
     try std.testing.expectError(error.Malformed, uriHost("https://bad user@api.example.com/", 256));
+    try std.testing.expectError(error.Malformed, uriHost("https://bad\x1fuser@api.example.com/", 256));
     try std.testing.expectError(error.Malformed, uriHost("https://bad%ZZ@api.example.com/", 256));
     try std.testing.expectError(error.ResourceLimit, uriHost("https://example.com/", 4));
 }

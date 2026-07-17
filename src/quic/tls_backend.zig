@@ -383,6 +383,7 @@ test "QUIC adapter teardown wipes private scratch, parameters, and shared engine
     try std.testing.expect(std.mem.allEqual(u8, &backend.local_transport_parameters, 0));
     try std.testing.expect(std.mem.allEqual(u8, &backend.engine.entropy.key_share_seed, 0));
     try std.testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&backend.engine.identity), 0));
+    try std.testing.expect(!backend.engine.identity_present);
     try std.testing.expect(std.mem.allEqual(u8, &backend.engine.peer_transport_extension, 0));
 }
 
@@ -458,6 +459,8 @@ fn expectQuicBackendWiped(backend: *const Tls13Backend) !void {
     try std.testing.expect(std.mem.allEqual(u8, &backend.engine.entropy.key_share_seed, 0));
     try std.testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&backend.engine.key_pair), 0));
     try std.testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&backend.engine.identity), 0));
+    try std.testing.expect(!backend.engine.key_pair_present);
+    try std.testing.expect(!backend.engine.identity_present);
     try std.testing.expect(std.mem.allEqual(u8, &backend.engine.peer_transport_extension, 0));
 }
 

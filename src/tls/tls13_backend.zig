@@ -324,12 +324,14 @@ pub const Tls13Backend = struct {
     role: Role,
     profile: TransportProfile,
     entropy: Entropy,
-    identity: ?Identity = null,
+    identity: Identity = undefined,
+    identity_present: bool = false,
     trust: Trust = .insecure_no_verification,
     peer_transport_extension: [max_transport_extension_len]u8 = undefined,
     peer_transport_extension_len: usize = 0,
     peer_transport_extension_pending: bool = false,
-    key_pair: ?X25519.KeyPair = null,
+    key_pair: X25519.KeyPair = undefined,
+    key_pair_present: bool = false,
     core: tls_handshake_codec.Core,
     schedule: ?KeySchedule = null,
     /// The client Finished verify_data the server expects (computed when its
@@ -357,7 +359,14 @@ pub const Tls13Backend = struct {
     /// Allocation-free. The returned backend owns its copy of `identity` and
     /// securely clears the private signing key in `deinit`.
     pub fn initServer(entropy: Entropy, identity: Identity, profile: TransportProfile) Tls13Backend {
-        return .{ .role = .server, .profile = profile, .entropy = entropy, .identity = identity, .core = tls_handshake_codec.Core.init(.server) };
+        return .{
+            .role = .server,
+            .profile = profile,
+            .entropy = entropy,
+            .identity = identity,
+            .identity_present = true,
+            .core = tls_handshake_codec.Core.init(.server),
+        };
     }
 
     pub fn backend(self: *Tls13Backend) TlsBackend {
@@ -420,16 +429,13 @@ pub const Tls13Backend = struct {
 
     fn wipeEphemeral(self: *Tls13Backend) void {
         crypto.secureZero(u8, &self.entropy.key_share_seed);
-        if (self.key_pair) |*key_pair| {
-            crypto.secureZero(u8, &key_pair.secret_key);
-            crypto.secureZero(u8, &key_pair.public_key);
-        }
-        self.key_pair = null;
+        crypto.secureZero(u8, std.mem.asBytes(&self.key_pair));
+        self.key_pair_present = false;
     }
 
     fn wipeIdentity(self: *Tls13Backend) void {
         crypto.secureZero(u8, std.mem.asBytes(&self.identity));
-        self.identity = null;
+        self.identity_present = false;
     }
 
     fn startImpl(ptr: *anyopaque, role: Role, _: void, sink: *EventSink) HandshakeError!void {
@@ -581,6 +587,7 @@ pub const Tls13Backend = struct {
             return error.SecretExportFailed;
         defer crypto.secureZero(u8, &key_pair.secret_key);
         self.key_pair = key_pair;
+        self.key_pair_present = true;
 
         var buf: [1024]u8 = undefined;
         var w = Writer{ .buf = &buf };
@@ -678,8 +685,8 @@ pub const Tls13Backend = struct {
         // A low-order/identity peer share is a well-formed 32-byte field with an
         // illegal value (predictable all-zero shared secret), not malformed wire
         // data.
-        if (self.key_pair == null) return error.InvalidHandshakeState;
-        var shared = X25519.scalarmult(self.key_pair.?.secret_key, share) catch
+        if (!self.key_pair_present) return error.InvalidHandshakeState;
+        var shared = X25519.scalarmult(self.key_pair.secret_key, share) catch
             return error.IllegalParameter;
         defer crypto.secureZero(u8, &shared);
         self.wipeEphemeral();
@@ -843,7 +850,8 @@ pub const Tls13Backend = struct {
         }
         if (!offers_cipher or !offers_null_compression) return error.MalformedHandshake;
 
-        const required_sigalg = self.identity.?.signatureAlgorithm();
+        if (!self.identity_present) return error.InvalidHandshakeState;
+        const required_sigalg = self.identity.signatureAlgorithm();
         var offers_tls13 = false;
         var offers_x25519_group = false;
         var offers_our_sigalg = false;
@@ -915,6 +923,7 @@ pub const Tls13Backend = struct {
             return error.SecretExportFailed;
         defer crypto.secureZero(u8, &key_pair.secret_key);
         self.key_pair = key_pair;
+        self.key_pair_present = true;
         var shared = X25519.scalarmult(key_pair.secret_key, client_share) catch
             return error.IllegalParameter;
         defer crypto.secureZero(u8, &shared);
@@ -970,8 +979,8 @@ pub const Tls13Backend = struct {
     /// EncryptedExtensions + Certificate + CertificateVerify + Finished at the
     /// Handshake level, followed by the 1-RTT secrets.
     fn sendServerFlight(self: *Tls13Backend, sink: *EventSink) HandshakeError!void {
-        if (self.identity == null) return error.InvalidHandshakeState;
-        const identity = &self.identity.?;
+        if (!self.identity_present) return error.InvalidHandshakeState;
+        const identity = &self.identity;
         const schedule = &self.schedule.?;
         var buf: [max_message_len]u8 = undefined;
         var w = Writer{ .buf = &buf };
@@ -1209,6 +1218,7 @@ test "TLS-owned backend teardown clears transcript-adjacent and peer scratch" {
     try std.testing.expect(std.mem.allEqual(u8, &backend.expected_client_verify, 0));
     try std.testing.expect(std.mem.allEqual(u8, &backend.peer_certificate, 0));
     try std.testing.expect(std.mem.allEqual(u8, &backend.entropy.key_share_seed, 0));
+    try std.testing.expect(!backend.key_pair_present);
     try std.testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&backend.key_pair), 0));
     try std.testing.expectEqual(@as(usize, 0), backend.peer_certificate_len);
     try std.testing.expectEqual(tls_handshake_codec.HandshakeLifecycle.failed, backend.core.handshake_lifecycle);
@@ -1228,7 +1238,7 @@ test "transport profile validation fails before lifecycle or transcript advance"
         try std.testing.expectError(error.InvalidTransportProfile, backend.backend().start(.client, {}, &sink));
         try std.testing.expectEqual(tls_handshake_codec.HandshakeLifecycle.idle, backend.core.handshake_lifecycle);
         try std.testing.expectEqual(@as(usize, 0), sink.len);
-        try std.testing.expect(backend.key_pair == null);
+        try std.testing.expect(!backend.key_pair_present);
         try std.testing.expectEqualSlices(u8, &entropy.key_share_seed, &backend.entropy.key_share_seed);
         backend.deinit();
     }
@@ -1270,10 +1280,11 @@ test "abandoned backend teardown wipes ephemeral and server identity storage" {
     var sink = EventSink{};
     defer sink.deinit();
     try client.backend().start(.client, {}, &sink);
-    try std.testing.expect(client.key_pair != null);
+    try std.testing.expect(client.key_pair_present);
     client.deinit();
     try std.testing.expect(std.mem.allEqual(u8, &client.entropy.key_share_seed, 0));
     try std.testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&client.key_pair), 0));
+    try std.testing.expect(!client.key_pair_present);
 
     var server = Tls13Backend.initServer(
         entropy,
@@ -1281,7 +1292,7 @@ test "abandoned backend teardown wipes ephemeral and server identity storage" {
         .{ .record = .{ .alpn = "h2" } },
     );
     server.deinit();
-    try std.testing.expect(server.identity == null);
+    try std.testing.expect(!server.identity_present);
     try std.testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&server.identity), 0));
     try std.testing.expect(std.mem.allEqual(u8, &server.entropy.key_share_seed, 0));
 }

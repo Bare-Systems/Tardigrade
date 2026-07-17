@@ -37,11 +37,14 @@ pub const KeySchedule = struct {
     client_handshake_traffic: [hash_len]u8,
     server_handshake_traffic: [hash_len]u8,
 
-    pub fn init(shared: [shared_secret_len]u8, hello_transcript_hash: [hash_len]u8) KeySchedule {
+    pub fn init(shared: *const [shared_secret_len]u8, hello_transcript_hash: [hash_len]u8) KeySchedule {
         const zeros = [_]u8{0} ** hash_len;
-        const handshake_secret = HkdfSha256.extract(&derived_early_secret, &shared);
-        const derived_handshake = tls.hkdfExpandLabel(HkdfSha256, handshake_secret, "derived", &empty_transcript_hash, hash_len);
-        const master_secret = HkdfSha256.extract(&derived_handshake, &zeros);
+        var handshake_secret = HkdfSha256.extract(&derived_early_secret, shared);
+        defer crypto.secureZero(u8, &handshake_secret);
+        var derived_handshake = tls.hkdfExpandLabel(HkdfSha256, handshake_secret, "derived", &empty_transcript_hash, hash_len);
+        defer crypto.secureZero(u8, &derived_handshake);
+        var master_secret = HkdfSha256.extract(&derived_handshake, &zeros);
+        defer crypto.secureZero(u8, &master_secret);
         return .{
             .handshake_secret = handshake_secret,
             .master_secret = master_secret,
@@ -50,7 +53,14 @@ pub const KeySchedule = struct {
         };
     }
 
-    pub const ApplicationSecrets = struct { client: [hash_len]u8, server: [hash_len]u8 };
+    pub const ApplicationSecrets = struct {
+        client: [hash_len]u8,
+        server: [hash_len]u8,
+
+        pub fn wipe(self: *ApplicationSecrets) void {
+            crypto.secureZero(u8, std.mem.asBytes(self));
+        }
+    };
 
     pub fn applicationSecrets(self: *const KeySchedule, finished_transcript_hash: [hash_len]u8) ApplicationSecrets {
         return .{
@@ -59,13 +69,15 @@ pub const KeySchedule = struct {
         };
     }
 
-    pub fn finishedKey(traffic_secret: [hash_len]u8) [hash_len]u8 {
-        return tls.hkdfExpandLabel(HkdfSha256, traffic_secret, "finished", "", hash_len);
+    pub fn finishedKey(traffic_secret: *const [hash_len]u8) [hash_len]u8 {
+        return tls.hkdfExpandLabel(HkdfSha256, traffic_secret.*, "finished", "", hash_len);
     }
 
-    pub fn verifyData(traffic_secret: [hash_len]u8, transcript_hash: [hash_len]u8) [hash_len]u8 {
+    pub fn verifyData(traffic_secret: *const [hash_len]u8, transcript_hash: [hash_len]u8) [hash_len]u8 {
+        var finished_key = finishedKey(traffic_secret);
+        defer crypto.secureZero(u8, &finished_key);
         var mac: [HmacSha256.mac_length]u8 = undefined;
-        HmacSha256.create(&mac, &transcript_hash, &finishedKey(traffic_secret));
+        HmacSha256.create(&mac, &transcript_hash, &finished_key);
         return mac;
     }
 
@@ -77,16 +89,18 @@ pub const KeySchedule = struct {
 test "record-mode users can instantiate the protocol-neutral key schedule" {
     const shared = [_]u8{0x42} ** shared_secret_len;
     const transcript = [_]u8{0x24} ** hash_len;
-    var schedule = KeySchedule.init(shared, transcript);
+    var schedule = KeySchedule.init(&shared, transcript);
     defer schedule.wipe();
-    const app = schedule.applicationSecrets(transcript);
+    var app = schedule.applicationSecrets(transcript);
+    defer app.wipe();
     try std.testing.expect(!std.mem.eql(u8, &app.client, &app.server));
 }
 
 test "shared TLS 1.3 key schedule matches the RFC 8448 simple 1-RTT trace" {
     const shared = hexBytes("8bd4054fb55b9d63fdfbacf9f04b9f0d35e6d63f537563efd46272900f89492d");
     const hello_hash = hexBytes("860c06edc07858ee8e78f0e7428c58edd6b43f2ca3e6e95f02ed063cf0e1cad8");
-    const schedule = KeySchedule.init(shared, hello_hash);
+    var schedule = KeySchedule.init(&shared, hello_hash);
+    defer schedule.wipe();
 
     try std.testing.expectEqualSlices(u8, &hexBytes("1dc826e93606aa6fdc0aadc12f741b01046aa6b99f691ed221a9f0ca043fbeac"), &schedule.handshake_secret);
     try std.testing.expectEqualSlices(u8, &hexBytes("b3eddb126e067f35a780b3abf45e2d8f3b1a950738f52e9600746a0e27a55a21"), &schedule.client_handshake_traffic);
@@ -94,10 +108,24 @@ test "shared TLS 1.3 key schedule matches the RFC 8448 simple 1-RTT trace" {
     try std.testing.expectEqualSlices(u8, &hexBytes("18df06843d13a08bf2a449844c5f8a478001bc4d4c627984d5a41da8d0402919"), &schedule.master_secret);
 
     const finished_hash = hexBytes("9608102a0f1ccc6db6250b7b7e417b1a000eaada3daae4777a7686c9ff83df13");
-    const app = schedule.applicationSecrets(finished_hash);
+    var app = schedule.applicationSecrets(finished_hash);
+    defer app.wipe();
     try std.testing.expectEqualSlices(u8, &hexBytes("9e40646ce79a7f9dc05af8889bce6552875afa0b06df0087f792ebb7c17504a5"), &app.client);
     try std.testing.expectEqualSlices(u8, &hexBytes("a11af9f05531f856ad47116b45a950328204b4f44bfb6b3a4b4f1f3fcb631643"), &app.server);
-    try std.testing.expectEqualSlices(u8, &hexBytes("008d3b66f816ea559f96b537e885c31fc068bf492c652f01f288a1d8cdc19fc8"), &KeySchedule.finishedKey(schedule.server_handshake_traffic));
+    var finished_key = KeySchedule.finishedKey(&schedule.server_handshake_traffic);
+    defer crypto.secureZero(u8, &finished_key);
+    try std.testing.expectEqualSlices(u8, &hexBytes("008d3b66f816ea559f96b537e885c31fc068bf492c652f01f288a1d8cdc19fc8"), &finished_key);
+}
+
+test "application traffic secret storage has explicit cleanup" {
+    const shared = [_]u8{0x42} ** shared_secret_len;
+    const transcript = [_]u8{0x24} ** hash_len;
+    var schedule = KeySchedule.init(&shared, transcript);
+    defer schedule.wipe();
+    var app = schedule.applicationSecrets(transcript);
+    try std.testing.expect(!std.mem.allEqual(u8, std.mem.asBytes(&app), 0));
+    app.wipe();
+    try std.testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&app), 0));
 }
 
 fn hexBytes(comptime hex: []const u8) [hex.len / 2]u8 {

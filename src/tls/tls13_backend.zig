@@ -690,7 +690,7 @@ pub const Tls13Backend = struct {
             return error.IllegalParameter;
         defer crypto.secureZero(u8, &shared);
         self.wipeEphemeral();
-        self.schedule = KeySchedule.init(shared, self.core.transcriptHash());
+        self.schedule = KeySchedule.init(&shared, self.core.transcriptHash());
         try self.emitHandshakeSecrets(sink);
         try sink.emitDiscardKeys(.initial);
     }
@@ -801,14 +801,16 @@ pub const Tls13Backend = struct {
     fn onServerFinished(self: *Tls13Backend, transcript_before: [hash_len]u8, body: []const u8, sink: *EventSink) HandshakeError!void {
         const schedule = &self.schedule.?;
         if (body.len != hash_len) return error.MalformedHandshake;
-        const expected = KeySchedule.verifyData(schedule.server_handshake_traffic, transcript_before);
+        var expected = KeySchedule.verifyData(&schedule.server_handshake_traffic, transcript_before);
+        defer crypto.secureZero(u8, &expected);
         if (!crypto.timing_safe.eql([hash_len]u8, expected, body[0..hash_len].*)) {
             return error.MalformedHandshake;
         }
 
         // 1-RTT secrets exist from the transcript through server Finished.
         const finished_hash = self.core.transcriptHash();
-        const app = schedule.applicationSecrets(finished_hash);
+        var app = schedule.applicationSecrets(finished_hash);
+        defer app.wipe();
         try self.emitSecret(sink, .application, .write, &app.client);
         try self.emitSecret(sink, .application, .read, &app.server);
 
@@ -817,7 +819,9 @@ pub const Tls13Backend = struct {
         var w = Writer{ .buf = &buf };
         try w.u8_(@intFromEnum(MessageType.finished));
         const message_len = try w.reserve(3);
-        try w.bytes(&KeySchedule.verifyData(schedule.client_handshake_traffic, finished_hash));
+        var client_verify = KeySchedule.verifyData(&schedule.client_handshake_traffic, finished_hash);
+        defer crypto.secureZero(u8, &client_verify);
+        try w.bytes(&client_verify);
         w.patch(3, message_len);
         const message = buf[0..w.len];
         self.core.recordSent(message) catch |err| return mapCoreError(err);
@@ -969,7 +973,7 @@ pub const Tls13Backend = struct {
         try sink.emitCrypto(.initial, server_hello);
         try sink.emitAlpn(self.alpn());
 
-        self.schedule = KeySchedule.init(shared, self.core.transcriptHash());
+        self.schedule = KeySchedule.init(&shared, self.core.transcriptHash());
         try self.emitHandshakeSecrets(sink);
         try sink.emitDiscardKeys(.initial);
 
@@ -1057,7 +1061,9 @@ pub const Tls13Backend = struct {
         const finished_start = w.len;
         try w.u8_(@intFromEnum(MessageType.finished));
         const finished_len = try w.reserve(3);
-        try w.bytes(&KeySchedule.verifyData(schedule.server_handshake_traffic, self.core.transcriptHash()));
+        var server_verify = KeySchedule.verifyData(&schedule.server_handshake_traffic, self.core.transcriptHash());
+        defer crypto.secureZero(u8, &server_verify);
+        try w.bytes(&server_verify);
         w.patch(3, finished_len);
         const finished = buf[finished_start..w.len];
         self.core.recordSent(finished) catch |err| return mapCoreError(err);
@@ -1066,10 +1072,13 @@ pub const Tls13Backend = struct {
         // 1-RTT secrets from the transcript through server Finished; the
         // client Finished we will require is fixed by the same hash.
         const finished_hash = self.core.transcriptHash();
-        const app = schedule.applicationSecrets(finished_hash);
+        var app = schedule.applicationSecrets(finished_hash);
+        defer app.wipe();
         try self.emitSecret(sink, .application, .read, &app.client);
         try self.emitSecret(sink, .application, .write, &app.server);
-        self.expected_client_verify = KeySchedule.verifyData(schedule.client_handshake_traffic, finished_hash);
+        var client_verify = KeySchedule.verifyData(&schedule.client_handshake_traffic, finished_hash);
+        defer crypto.secureZero(u8, &client_verify);
+        self.expected_client_verify = client_verify;
     }
 
     fn onClientFinished(self: *Tls13Backend, body: []const u8, sink: *EventSink) HandshakeError!void {

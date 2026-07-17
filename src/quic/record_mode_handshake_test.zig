@@ -761,6 +761,7 @@ const SocketHarness = struct {
 
         self.client = es.PureZigRecordStream.initWithCarrierAndBackend(.client, clientProvider(), suite, self.client_carrier.carrier(), self.client_wrapper.backend());
         self.server = es.PureZigRecordStream.initWithCarrierAndBackend(.server, serverProvider(), suite, self.server_carrier.carrier(), self.server_wrapper.backend());
+        self.client.setExpectedAlpn(opts.client_alpn) catch unreachable;
         return self;
     }
 

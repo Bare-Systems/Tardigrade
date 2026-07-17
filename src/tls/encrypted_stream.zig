@@ -265,6 +265,12 @@ pub const PureZigRecordStream = struct {
     alpn_storage: [max_alpn_len]u8 = undefined,
     alpn_len: usize = 0,
     alpn_captured: bool = false,
+    /// Optional stream-owned client ALPN policy. Negotiated metadata alone is
+    /// insufficient: a client that requires a protocol must reject both a
+    /// different server selection and a missing ALPN extension.
+    expected_alpn_storage: [max_alpn_len]u8 = undefined,
+    expected_alpn_len: usize = 0,
+    require_alpn: bool = false,
     certificate_state: events.CertificateState = .not_checked,
     /// A terminal handshake failure whose emitted fatal alert is being flushed
     /// to the carrier before the stream latches closed (`drive()` step 13). The
@@ -338,6 +344,18 @@ pub const PureZigRecordStream = struct {
         return self.alpn_storage[0..self.alpn_len];
     }
 
+    /// Require the peer to negotiate exactly `protocol`. Configure this before
+    /// the handshake starts; the value is copied because caller storage need
+    /// not outlive construction.
+    pub fn setExpectedAlpn(self: *PureZigRecordStream, protocol: []const u8) Error!void {
+        if (self.handshake_started) return error.InvalidHandshakeState;
+        if (protocol.len == 0 or protocol.len > max_alpn_len) return error.MalformedHandshake;
+        if (self.expected_alpn_len > 0) @memset(self.expected_alpn_storage[0..self.expected_alpn_len], 0);
+        @memcpy(self.expected_alpn_storage[0..protocol.len], protocol);
+        self.expected_alpn_len = protocol.len;
+        self.require_alpn = true;
+    }
+
     /// The peer certificate validation outcome the backend reported.
     pub fn certificateState(self: *const PureZigRecordStream) events.CertificateState {
         return self.certificate_state;
@@ -382,6 +400,9 @@ pub const PureZigRecordStream = struct {
         if (self.alpn_len > 0) @memset(self.alpn_storage[0..self.alpn_len], 0);
         self.alpn_len = 0;
         self.alpn_captured = false;
+        if (self.expected_alpn_len > 0) @memset(self.expected_alpn_storage[0..self.expected_alpn_len], 0);
+        self.expected_alpn_len = 0;
+        self.require_alpn = false;
         self.certificate_state = .not_checked;
         self.read_epoch = .initial;
         self.write_epoch = .initial;
@@ -480,6 +501,15 @@ pub const PureZigRecordStream = struct {
     fn applyDriverOutcome(self: *PureZigRecordStream, outcome: RecordHandshakeDriver.Outcome) Error!void {
         var fatal_alert: ?alerts.AlertDescription = null;
         const sink = outcome.sink;
+        // A completion batch may contain application secrets, Client Finished,
+        // and handshake-key discard before `handshake_complete`. Validate the
+        // batch's final authentication/ALPN state first so policy failure sends
+        // its alert with the existing handshake keys and applies none of those
+        // success effects.
+        if (self.completionPolicyError(sink)) |err| {
+            self.deferHandshakeFailure(err, findEmittedFatalAlert(sink));
+            return;
+        }
         for (sink.items[0..sink.len]) |event| {
             switch (event) {
                 .handshake_bytes => |hb| {
@@ -491,7 +521,13 @@ pub const PureZigRecordStream = struct {
                     self.bridge.installTrafficSecret(ts.epoch, ts.direction, ts.data) catch |err| return self.fail(err);
                     self.advanceEpochOnSecret(ts.epoch, ts.direction);
                 },
-                .alpn => |protocol| try self.captureAlpn(protocol),
+                .alpn => |protocol| {
+                    try self.captureAlpn(protocol);
+                    if (self.alpnPolicyError(protocol)) |err| {
+                        self.deferHandshakeFailure(err, fatal_alert);
+                        break;
+                    }
+                },
                 .certificate => |cert_state| {
                     self.certificate_state = cert_state;
                     // The concrete backend emits the certificate result and
@@ -516,13 +552,6 @@ pub const PureZigRecordStream = struct {
                     try self.applyDiscardSideEffects(epoch);
                 },
                 .handshake_complete => {
-                    if (self.role == .client and
-                        !self.allow_unverified_certificate and
-                        self.certificate_state != .valid)
-                    {
-                        self.deferHandshakeFailure(error.CertificateInvalid, fatal_alert);
-                        break;
-                    }
                     self.bridge.markHandshakeComplete() catch |err| return self.fail(err);
                     self.read_epoch = .application;
                     self.write_epoch = .application;
@@ -540,6 +569,48 @@ pub const PureZigRecordStream = struct {
         if (self.pending_terminal == null) {
             if (outcome.terminal_error) |err| self.deferHandshakeFailure(err, fatal_alert);
         }
+    }
+
+    /// Validate the final policy state represented by a completion batch before
+    /// applying any event from it. Event payloads are borrowed from `sink` and
+    /// are used only during this synchronous preflight.
+    fn completionPolicyError(self: *const PureZigRecordStream, sink: *const RecordTransport.EventSink) ?Error {
+        var certificate = self.certificate_state;
+        var selected_alpn = self.negotiatedAlpn();
+        var completes = false;
+
+        for (sink.items[0..sink.len]) |event| switch (event) {
+            .certificate => |state| certificate = state,
+            .alpn => |protocol| {
+                if (protocol.len > max_alpn_len) return error.MalformedHandshake;
+                selected_alpn = protocol;
+            },
+            .handshake_complete => completes = true,
+            else => {},
+        };
+
+        if (!completes) return null;
+        if (self.role == .client and !self.allow_unverified_certificate and certificate != .valid) {
+            return error.CertificateInvalid;
+        }
+        return self.alpnPolicyError(selected_alpn);
+    }
+
+    fn alpnPolicyError(self: *const PureZigRecordStream, selected: ?[]const u8) ?Error {
+        if (!self.require_alpn) return null;
+        const protocol = selected orelse return error.AlpnMismatch;
+        if (!std.mem.eql(u8, protocol, self.expected_alpn_storage[0..self.expected_alpn_len])) {
+            return error.AlpnMismatch;
+        }
+        return null;
+    }
+
+    fn findEmittedFatalAlert(sink: *const RecordTransport.EventSink) ?alerts.AlertDescription {
+        var emitted: ?alerts.AlertDescription = null;
+        for (sink.items[0..sink.len]) |event| {
+            if (event == .fatal_alert) emitted = event.fatal_alert;
+        }
+        return emitted;
     }
 
     /// Handshake secrets advance the explicit record epoch one step. Application
@@ -2448,6 +2519,11 @@ const ScriptedRecordBackend = struct {
     role: tls_state.Role,
     /// Send a hello the server will reject, to drive the failure path.
     bad_hello: bool = false,
+    /// Client-side adversarial knobs used to prove record-mode policy rather
+    /// than trusting an injected backend's event stream.
+    selected_alpn: ?[]const u8 = "h1",
+    emit_certificate: bool = true,
+    received_client_finished: bool = false,
 
     const hs_c2s = secret(0x11);
     const hs_s2c = secret(0x22);
@@ -2478,6 +2554,7 @@ const ScriptedRecordBackend = struct {
                     try sink.emitSecret(.application, .read, &app_c2s);
                     try sink.emitSecret(.application, .write, &app_s2c);
                 } else if (epoch == .handshake and std.mem.eql(u8, bytes, "CF")) {
+                    self.received_client_finished = true;
                     try sink.emitDiscardEpoch(.handshake);
                     try sink.emitHandshakeComplete();
                 } else {
@@ -2493,13 +2570,13 @@ const ScriptedRecordBackend = struct {
                     try sink.emitSecret(.handshake, .write, &hs_c2s);
                     try sink.emitSecret(.handshake, .read, &hs_s2c);
                     try sink.emitDiscardEpoch(.initial);
-                    try sink.emitAlpn("h1");
+                    if (self.selected_alpn) |protocol| try sink.emitAlpn(protocol);
                 } else if (epoch == .handshake and std.mem.eql(u8, bytes, "SF")) {
                     try sink.emitSecret(.application, .write, &app_c2s);
                     try sink.emitSecret(.application, .read, &app_s2c);
                     // The secure record-stream default requires a client-side
                     // certificate decision before authenticated completion.
-                    try sink.emitCertificate(.valid);
+                    if (self.emit_certificate) try sink.emitCertificate(.valid);
                     try sink.emitHandshakeBytes(.handshake, "CF");
                     try sink.emitDiscardEpoch(.handshake);
                     try sink.emitHandshakeComplete();
@@ -2585,6 +2662,30 @@ fn bothComplete(client: *PureZigRecordStream, server: *PureZigRecordStream) bool
     return client.bridge.handshake_complete and server.bridge.handshake_complete;
 }
 
+const DriverPairErrors = struct {
+    client: ?anyerror = null,
+    server: ?anyerror = null,
+};
+
+fn driveDriverPairUntilBothErrors(client: *PureZigRecordStream, server: *PureZigRecordStream) DriverPairErrors {
+    var errors = DriverPairErrors{};
+    var rounds: usize = 0;
+    while (rounds < 1000) : (rounds += 1) {
+        if (errors.client == null) {
+            _ = client.stream().drive() catch |err| {
+                errors.client = err;
+            };
+        }
+        if (errors.server == null) {
+            _ = server.stream().drive() catch |err| {
+                errors.server = err;
+            };
+        }
+        if (errors.client != null and errors.server != null) return errors;
+    }
+    return errors;
+}
+
 test "pure-Zig encrypted stream completes a driver-owned handshake over a fragmented duplex carrier" {
     const cp = testProvider();
     inline for (.{ 1, 2, 3, 7, 64, record_codec.max_ciphertext_record_len }) |chunk| {
@@ -2593,6 +2694,7 @@ test "pure-Zig encrypted stream completes a driver-owned handshake over a fragme
         var server_backend = ScriptedRecordBackend{ .role = .server };
         var client = PureZigRecordStream.initWithCarrierAndBackend(.client, cp, .tls_aes_128_gcm_sha256, duplex.clientCarrier(), client_backend.recordBackend());
         defer client.deinit();
+        try client.setExpectedAlpn("h1");
         var server = PureZigRecordStream.initWithCarrierAndBackend(.server, cp, .tls_aes_128_gcm_sha256, duplex.serverCarrier(), server_backend.recordBackend());
         defer server.deinit();
 
@@ -2633,6 +2735,67 @@ test "pure-Zig encrypted stream completes a driver-owned handshake over a fragme
         }.done);
         try testing.expectError(error.EndOfStream, server.stream().read(&buf));
     }
+}
+
+test "driver-owned client rejects an unoffered ALPN before sending Finished" {
+    const cp = testProvider();
+    var duplex = Duplex{ .max_chunk = record_codec.max_ciphertext_record_len };
+    var client_backend = ScriptedRecordBackend{ .role = .client, .selected_alpn = "h2" };
+    var server_backend = ScriptedRecordBackend{ .role = .server };
+    var client = PureZigRecordStream.initWithCarrierAndBackend(.client, cp, .tls_aes_128_gcm_sha256, duplex.clientCarrier(), client_backend.recordBackend());
+    defer client.deinit();
+    try client.setExpectedAlpn("h1");
+    var server = PureZigRecordStream.initWithCarrierAndBackend(.server, cp, .tls_aes_128_gcm_sha256, duplex.serverCarrier(), server_backend.recordBackend());
+    defer server.deinit();
+
+    const errors = driveDriverPairUntilBothErrors(&client, &server);
+    try testing.expectEqual(@as(?anyerror, error.AlpnMismatch), errors.client);
+    try testing.expectEqual(@as(?anyerror, error.PeerFatalAlert), errors.server);
+    try testing.expectEqual(alerts.AlertDescription.no_application_protocol, PureZigRecordStream.mappedFatalAlert(error.AlpnMismatch).?);
+    try testing.expect(!client.bridge.handshake_complete);
+    try testing.expect(!server.bridge.handshake_complete);
+    try testing.expect(!server_backend.received_client_finished);
+    try expectLatchedFailureConformance(client.stream(), error.AlpnMismatch);
+}
+
+test "driver-owned client requires ALPN before completion" {
+    const cp = testProvider();
+    var duplex = Duplex{ .max_chunk = record_codec.max_ciphertext_record_len };
+    var client_backend = ScriptedRecordBackend{ .role = .client, .selected_alpn = null };
+    var server_backend = ScriptedRecordBackend{ .role = .server };
+    var client = PureZigRecordStream.initWithCarrierAndBackend(.client, cp, .tls_aes_128_gcm_sha256, duplex.clientCarrier(), client_backend.recordBackend());
+    defer client.deinit();
+    try client.setExpectedAlpn("h1");
+    var server = PureZigRecordStream.initWithCarrierAndBackend(.server, cp, .tls_aes_128_gcm_sha256, duplex.serverCarrier(), server_backend.recordBackend());
+    defer server.deinit();
+
+    const errors = driveDriverPairUntilBothErrors(&client, &server);
+    try testing.expectEqual(@as(?anyerror, error.AlpnMismatch), errors.client);
+    try testing.expectEqual(@as(?anyerror, error.PeerFatalAlert), errors.server);
+    try testing.expect(!client.bridge.handshake_complete);
+    try testing.expect(!server.bridge.handshake_complete);
+    try testing.expect(!server_backend.received_client_finished);
+    try expectLatchedFailureConformance(client.stream(), error.AlpnMismatch);
+}
+
+test "completion policy preflight rejects a missing certificate before sending Finished" {
+    const cp = testProvider();
+    var duplex = Duplex{ .max_chunk = record_codec.max_ciphertext_record_len };
+    var client_backend = ScriptedRecordBackend{ .role = .client, .emit_certificate = false };
+    var server_backend = ScriptedRecordBackend{ .role = .server };
+    var client = PureZigRecordStream.initWithCarrierAndBackend(.client, cp, .tls_aes_128_gcm_sha256, duplex.clientCarrier(), client_backend.recordBackend());
+    defer client.deinit();
+    try client.setExpectedAlpn("h1");
+    var server = PureZigRecordStream.initWithCarrierAndBackend(.server, cp, .tls_aes_128_gcm_sha256, duplex.serverCarrier(), server_backend.recordBackend());
+    defer server.deinit();
+
+    const errors = driveDriverPairUntilBothErrors(&client, &server);
+    try testing.expectEqual(@as(?anyerror, error.CertificateInvalid), errors.client);
+    try testing.expectEqual(@as(?anyerror, error.PeerFatalAlert), errors.server);
+    try testing.expect(!client.bridge.handshake_complete);
+    try testing.expect(!server.bridge.handshake_complete);
+    try testing.expect(!server_backend.received_client_finished);
+    try expectLatchedFailureConformance(client.stream(), error.CertificateInvalid);
 }
 
 test "driver-owned handshake latches a terminal failure and flushes its fatal alert to the peer" {

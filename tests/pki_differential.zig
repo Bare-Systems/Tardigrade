@@ -1548,16 +1548,40 @@ fn expectNoProcess(allocator: std.mem.Allocator, pid: std.posix.pid_t) !void {
     try expectNormalExit(result, 1);
 }
 
-fn expectDirEmpty(dir: std.Io.Dir) !void {
+const ProcessTempDir = struct {
+    rel_path: []u8,
+    abs_path: []u8,
+
+    fn init(allocator: std.mem.Allocator, label: []const u8) !ProcessTempDir {
+        const rel_path = try std.fmt.allocPrint(
+            allocator,
+            ".zig-cache/pki-process-{s}-{d}",
+            .{ label, compat.nanoTimestamp() },
+        );
+        errdefer allocator.free(rel_path);
+        try compat.cwd().makePath(rel_path);
+        errdefer compat.cwd().deleteTree(rel_path) catch {};
+        const abs_path = try compat.cwd().realpathAlloc(allocator, rel_path);
+        errdefer allocator.free(abs_path);
+        return .{ .rel_path = rel_path, .abs_path = abs_path };
+    }
+
+    fn deinit(self: *ProcessTempDir, allocator: std.mem.Allocator) void {
+        compat.cwd().deleteTree(self.rel_path) catch {};
+        allocator.free(self.rel_path);
+        allocator.free(self.abs_path);
+        self.* = undefined;
+    }
+};
+
+fn expectDirEmptyPath(path: []const u8) !void {
+    var dir = try compat.cwd().openDir(path, .{ .iterate = true });
+    defer dir.close();
     var it = dir.iterate();
     while (try it.next(compat.io())) |entry| {
         std.debug.print("unexpected temp entry left by bounded process runner: {s}\n", .{entry.name});
         return error.TestUnexpectedResult;
     }
-}
-
-fn tmpDirPath(allocator: std.mem.Allocator, tmp: *std.testing.TmpDir) ![]u8 {
-    return compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
 }
 
 test "pki reduce: bounded process captures successful output" {
@@ -1597,22 +1621,20 @@ test "pki reduce: bounded process reports launch failure" {
 }
 
 test "pki reduce: bounded process timeout kills and reaps child" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const tmp_path = try tmpDirPath(testing.allocator, &tmp);
-    defer testing.allocator.free(tmp_path);
+    var tmp = try ProcessTempDir.init(testing.allocator, "timeout");
+    defer tmp.deinit(testing.allocator);
     var result = try bounded_process.run(testing.allocator, .{
         .argv = &.{ pki_diff_options.process_helper_path, "hang" },
         .stdout_limit = 64,
         .stderr_limit = 64,
         .deadline_ms = 100,
-        .cwd = .{ .path = tmp_path },
+        .cwd = .{ .path = tmp.abs_path },
     });
     defer result.deinit(testing.allocator);
     try expectOutcomeTag(result, .timeout);
     const pid = try parseHelperPid(result.stdout);
     try expectNoProcess(testing.allocator, pid);
-    try expectDirEmpty(tmp.dir);
+    try expectDirEmptyPath(tmp.rel_path);
 }
 
 test "pki reduce: bounded process reports abnormal signal termination" {
@@ -1651,20 +1673,18 @@ test "pki reduce: bounded process kills stderr overflow and keeps bounded output
 }
 
 fn expectFailureModeLeavesTmpEmpty(argv: []const []const u8, expected: std.meta.Tag(bounded_process.Outcome)) !void {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const tmp_path = try tmpDirPath(testing.allocator, &tmp);
-    defer testing.allocator.free(tmp_path);
+    var tmp = try ProcessTempDir.init(testing.allocator, @tagName(expected));
+    defer tmp.deinit(testing.allocator);
     var result = try bounded_process.run(testing.allocator, .{
         .argv = argv,
         .stdout_limit = 32,
         .stderr_limit = 32,
         .deadline_ms = 100,
-        .cwd = .{ .path = tmp_path },
+        .cwd = .{ .path = tmp.abs_path },
     });
     defer result.deinit(testing.allocator);
     try expectOutcomeTag(result, expected);
-    try expectDirEmpty(tmp.dir);
+    try expectDirEmptyPath(tmp.rel_path);
 }
 
 test "pki reduce: bounded process leaves no temp files after failure modes" {

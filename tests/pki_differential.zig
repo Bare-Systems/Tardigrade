@@ -911,6 +911,7 @@ const ReducedPaths = struct {
     root_file: []u8,
     intermediate_file: ?[]u8,
     leaf_file: []u8,
+    generated_bundle_file: ?[]const u8,
 
     fn deinit(self: *ReducedPaths, allocator: std.mem.Allocator) void {
         allocator.free(self.der_path);
@@ -922,8 +923,7 @@ const ReducedPaths = struct {
     }
 };
 
-fn deleteIfCandidatePath(dir: compat.DirCompat, path: []const u8) !void {
-    if (std.mem.find(u8, path, ".candidate") == null) return;
+fn deleteGeneratedProbeFile(dir: compat.DirCompat, path: []const u8) !void {
     dir.deleteFile(path) catch |err| switch (err) {
         error.FileNotFound => {},
         else => return err,
@@ -931,11 +931,9 @@ fn deleteIfCandidatePath(dir: compat.DirCompat, path: []const u8) !void {
 }
 
 fn deleteProbeFiles(dir: compat.DirCompat, paths: *const ReducedPaths) !void {
-    try deleteIfCandidatePath(dir, paths.der_path);
-    try deleteIfCandidatePath(dir, paths.pem_path);
-    try deleteIfCandidatePath(dir, paths.root_file);
-    if (paths.intermediate_file) |path| try deleteIfCandidatePath(dir, path);
-    try deleteIfCandidatePath(dir, paths.leaf_file);
+    try deleteGeneratedProbeFile(dir, paths.der_path);
+    try deleteGeneratedProbeFile(dir, paths.pem_path);
+    if (paths.generated_bundle_file) |path| try deleteGeneratedProbeFile(dir, path);
 }
 
 /// Write the reduced component (raw DER plus PEM) and whichever substituted
@@ -971,6 +969,7 @@ fn persistReducedCase(
     errdefer if (intermediate_file) |path| allocator.free(path);
     var leaf_file: ?[]u8 = null;
     errdefer if (leaf_file) |path| allocator.free(path);
+    var generated_bundle_file: ?[]const u8 = null;
     switch (r.component) {
         .leaf => {
             root_file = try allocator.dupe(u8, case.root_file);
@@ -989,6 +988,7 @@ fn persistReducedCase(
             try dir.writeFile(.{ .sub_path = bundle_path, .data = bundle });
             root_file = try allocator.dupe(u8, case.root_file);
             intermediate_file = bundle_path;
+            generated_bundle_file = intermediate_file;
             leaf_file = try allocator.dupe(u8, case.leaf_file);
         },
         .root => |index| {
@@ -1002,6 +1002,7 @@ fn persistReducedCase(
             defer allocator.free(bundle);
             try dir.writeFile(.{ .sub_path = bundle_path, .data = bundle });
             root_file = bundle_path;
+            generated_bundle_file = root_file;
             if (case.intermediate_file) |path| intermediate_file = try allocator.dupe(u8, path);
             leaf_file = try allocator.dupe(u8, case.leaf_file);
         },
@@ -1012,6 +1013,7 @@ fn persistReducedCase(
         .root_file = root_file.?,
         .intermediate_file = intermediate_file,
         .leaf_file = leaf_file.?,
+        .generated_bundle_file = generated_bundle_file,
     };
 }
 
@@ -1878,11 +1880,14 @@ test "pki reduce: verification materializes the winning candidate to canonical a
     defer tmp.cleanup();
     const dir = compat.wrapDir(tmp.dir);
 
+    const source_root_fixture = "fixtures/root.candidate.crt";
+    try dir.makePath("fixtures");
+    try dir.writeFile(.{ .sub_path = source_root_fixture, .data = "SOURCE ROOT" });
     const case = manifest.Case{
         .id = "artifact-policy-winner",
         .profile = .core,
         .category = .malformed_der,
-        .root_file = "tests/vectors/pki/root.crt",
+        .root_file = source_root_fixture,
         .intermediate_file = "tests/vectors/pki/intermediate.crt",
         .leaf_file = "tests/vectors/pki/drill-leaf.crt",
         .dns_name = "drill.example.test",
@@ -1947,6 +1952,9 @@ test "pki reduce: verification materializes the winning candidate to canonical a
     try expectMissing(dir, "artifacts/artifact-policy-winner.candidate-1.candidate.der");
     try expectMissing(dir, "artifacts/artifact-policy-winner.candidate-1.candidate.crt");
     try expectMissing(dir, "artifacts/artifact-policy-winner.candidate-1.candidate-intermediates.crt");
+    const source_root = try dir.readFileAlloc(allocator, source_root_fixture, 1024);
+    defer allocator.free(source_root);
+    try testing.expectEqualStrings("SOURCE ROOT", source_root);
 
     var runtime_identity = RuntimeIdentity{
         .git_sha = try allocator.dupe(u8, "drill-sha"),

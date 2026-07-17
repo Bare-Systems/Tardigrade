@@ -654,6 +654,8 @@ pub const PureZigRecordStream = struct {
             error.AlpnMismatch,
             error.SecretExportFailed,
             error.InvalidHandshakeState,
+            error.NoApplicableCredential,
+            error.CredentialProviderFailed,
             => alerts.fromHandshakeError(@errorCast(err)),
             else => null,
         };

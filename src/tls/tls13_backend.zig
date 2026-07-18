@@ -288,7 +288,7 @@ pub const Tls13Backend = struct {
     pending_signature: [max_signature_len]u8 = undefined,
 
     const Slice = struct { start: usize, len: usize };
-    const PendingStage = enum { server_select, server_sign, peer_verify };
+    const PendingStage = enum { server_select, server_sign, client_select, client_sign, peer_verify };
 
     /// Options for a client that verifies its peer through an external verifier:
     /// the exact intended server name (emitted as SNI and handed to the
@@ -529,7 +529,20 @@ pub const Tls13Backend = struct {
             },
         };
         input.append(bytes) catch |err| return mapCoreError(err);
+        try self.drainInput(input, level, sink);
+    }
 
+    /// Consume whole handshake messages from a reassembly buffer, dispatching
+    /// each. Stops early when an async authentication operation parks (so the
+    /// suspend point is never crossed) or when the handshake completes or fails.
+    /// Shared by `receiveImpl` and `resumeAuth`, so buffered messages behind a
+    /// suspend point are drained automatically once the operation resolves.
+    fn drainInput(
+        self: *Tls13Backend,
+        input: *tls_handshake_codec.Reassembler(max_message_len + 4),
+        level: EncryptionLevel,
+        sink: *EventSink,
+    ) HandshakeError!void {
         while (input.peek() catch |err| return mapCoreError(err)) |message| {
             if (level != try expectedLevel(message.kind)) return error.UnexpectedTransportEpoch;
             const transcript_before = self.core.transcriptHash();
@@ -1059,16 +1072,15 @@ pub const Tls13Backend = struct {
 
         // When the server requested handshake-time client authentication
         // (#334) the client answers with Certificate, an optional
-        // CertificateVerify, and Finished; otherwise it sends just Finished.
+        // CertificateVerify, and Finished. That flight owns its own completion
+        // because asynchronous credential selection or signing may suspend it
+        // mid-way; on resume it finishes and completes the handshake.
         if (self.core.client_certificate_requested) {
-            try self.sendClientAuthFlight(sink);
-        } else {
-            try self.sendClientFinished(finished_hash, sink);
+            return self.beginClientAuthFlight(sink);
         }
 
-        try self.emitDiscardKeys(sink, .handshake);
-        try sink.emitHandshakeComplete();
-        self.finish();
+        try self.sendClientFinished(finished_hash, sink);
+        try self.completeClientHandshake(sink);
     }
 
     /// Emit a lone client Finished (no client authentication) covering the
@@ -1088,6 +1100,14 @@ pub const Tls13Backend = struct {
         try sink.emitCrypto(.handshake, message);
     }
 
+    /// Terminal steps shared by every client completion path: discard the
+    /// handshake epoch, signal completion, and wipe the key schedule.
+    fn completeClientHandshake(self: *Tls13Backend, sink: *EventSink) HandshakeError!void {
+        try self.emitDiscardKeys(sink, .handshake);
+        try sink.emitHandshakeComplete();
+        self.finish();
+    }
+
     /// The immutable selection context for choosing the client's own
     /// credential, honoring the schemes the server offered in its
     /// CertificateRequest and the intended server name.
@@ -1103,50 +1123,52 @@ pub const Tls13Backend = struct {
         };
     }
 
-    /// Handshake-time client authentication flight (#334, synchronous):
-    /// Certificate, an optional CertificateVerify, and Finished, all emitted as
-    /// one handshake-epoch chunk. The client Finished MAC covers the transcript
-    /// through the last preceding message — its CertificateVerify, or its
-    /// Certificate when it declines with an empty one. Asynchronous client
-    /// credential selection and signing are a later checkpoint.
-    fn sendClientAuthFlight(self: *Tls13Backend, sink: *EventSink) HandshakeError!void {
-        const schedule = &self.schedule.?;
+    /// Begin the handshake-time client authentication flight (#334):
+    /// Certificate, an optional CertificateVerify, and Finished. With no
+    /// provider the client declines with an empty Certificate. A configured
+    /// provider selects against the schemes the server advertised in its
+    /// CertificateRequest; selection may complete synchronously or suspend
+    /// (`client_select`), in which case the flight resumes from `resumeAuth`.
+    fn beginClientAuthFlight(self: *Tls13Backend, sink: *EventSink) HandshakeError!void {
         self.core.beginClientCertificateFlight();
-
-        // Resolve the local client credential. With no provider the client
-        // legitimately declines with an empty Certificate (no CertificateVerify
-        // follows). A configured provider selects against the schemes the
-        // server advertised in its CertificateRequest.
-        var credential: ?credentials.SelectedCredential = null;
-        // The selected handle is released exactly once, on every exit path.
-        defer if (credential) |c| c.release();
-        if (self.external_provider) |provider| {
-            var selection = self.clientSelectionContext();
-            switch (provider.selectCredential(&selection) catch |err|
-                return self.failCredential(credentials.classifySelectError(err))) {
-                .complete => |c| credential = c,
-                // Asynchronous client credential selection is deferred (#334);
-                // a provider that suspends here is unsupported for now.
-                .pending => |op| {
-                    op.cancel();
-                    op.release();
-                    return self.failCredential(.provider_internal_failure);
-                },
-            }
-            // The provider must return a scheme the server actually offered,
-            // else the CertificateVerify would carry an unadvertised algorithm.
-            if (!selection.offersScheme(credential.?.scheme))
-                return self.failCredential(.invalid_callback_behavior);
+        const provider = self.external_provider orelse
+            return self.emitClientCertificate(null, sink);
+        var selection = self.clientSelectionContext();
+        switch (provider.selectCredential(&selection) catch |err|
+            return self.failCredential(credentials.classifySelectError(err))) {
+            .complete => |credential| return self.emitSelectedClientCertificate(credential, sink),
+            .pending => |op| return self.parkAuth(op, .client_select),
         }
+    }
+
+    /// Validate a freshly selected client credential (synchronously or after a
+    /// resumed `client_select`) and continue emitting its Certificate.
+    fn emitSelectedClientCertificate(self: *Tls13Backend, credential: credentials.SelectedCredential, sink: *EventSink) HandshakeError!void {
+        var owned = true;
+        errdefer if (owned) credential.release();
+        // The provider must return a scheme the server actually offered, else
+        // the CertificateVerify would carry an unadvertised algorithm.
+        const selection = self.clientSelectionContext();
+        if (!selection.offersScheme(credential.scheme))
+            return self.failCredential(.invalid_callback_behavior);
+        owned = false; // ownership passes to emitClientCertificate
+        return self.emitClientCertificate(credential, sink);
+    }
+
+    /// Emit the client Certificate (the credential's validated chain, or an
+    /// empty list when declining) and record it, then sign CertificateVerify —
+    /// synchronously, or by parking a pending signer (`client_sign`). Owns the
+    /// credential handle and releases it exactly once on any failure before
+    /// ownership passes on.
+    fn emitClientCertificate(self: *Tls13Backend, credential: ?credentials.SelectedCredential, sink: *EventSink) HandshakeError!void {
+        var owned = credential != null;
+        errdefer if (owned) if (credential) |c| c.release();
 
         var buf: [max_message_len]u8 = undefined;
         var w = Writer{ .buf = &buf };
-
-        // Certificate: the credential's validated chain, or an empty list when
-        // declining. The empty context echoes the (empty) request context.
         try w.u8_(@intFromEnum(MessageType.certificate));
         const cert_len = try w.reserve(3);
-        try w.u8_(0); // certificate_request_context
+        try w.u8_(0); // certificate_request_context: empty (echoes the request)
         const list_len = try w.reserve(3);
         if (credential) |c| {
             const chain = c.certificateChain();
@@ -1164,25 +1186,40 @@ pub const Tls13Backend = struct {
         w.patch(3, list_len);
         w.patch(3, cert_len);
         self.core.recordSent(buf[0..w.len]) catch |err| return mapCoreError(err);
+        try sink.emitCrypto(.handshake, buf[0..w.len]);
 
-        // CertificateVerify, only when a certificate was actually presented; it
-        // signs the transcript through the client Certificate (RFC 8446 §4.4.3)
-        // with the client context string.
+        // Declining (empty Certificate) skips CertificateVerify entirely.
+        const c = credential orelse return self.finishClientAuthFlight(null, 0, sink);
+
+        // CertificateVerify signs the transcript through the client Certificate
+        // (RFC 8446 §4.4.3) with the client context string, into the engine's
+        // stable signature buffer. An async signer parks here.
+        const content = certificateVerifyContent(.client, self.core.transcriptHash());
+        switch (c.sign(content.slice(), &self.pending_signature) catch |err|
+            return self.failCredential(credentials.classifySignError(err))) {
+            .complete => |len| {
+                owned = false; // ownership passes to finishClientAuthFlight
+                return self.finishClientAuthFlight(c, len, sink);
+            },
+            .pending => |op| {
+                owned = false; // ownership passes to the parked operation
+                self.pending_credential = c;
+                return self.parkAuth(op, .client_sign);
+            },
+        }
+    }
+
+    /// Emit CertificateVerify (when a certificate was presented) and the client
+    /// Finished, then complete the handshake. Releases the credential exactly
+    /// once. Reachable synchronously and after a resumed `client_sign`.
+    fn finishClientAuthFlight(self: *Tls13Backend, credential: ?credentials.SelectedCredential, sig_len: usize, sink: *EventSink) HandshakeError!void {
+        defer if (credential) |c| c.release();
+        const schedule = &self.schedule.?;
+
+        var buf: [max_message_len]u8 = undefined;
+        var w = Writer{ .buf = &buf };
         if (credential) |c| {
-            const content = certificateVerifyContent(.client, self.core.transcriptHash());
-            const sig_len = switch (c.sign(content.slice(), &self.pending_signature) catch |err|
-                return self.failCredential(credentials.classifySignError(err))) {
-                .complete => |len| len,
-                // Asynchronous client signing is deferred (#334).
-                .pending => |op| {
-                    op.cancel();
-                    op.release();
-                    return self.failCredential(.signing_provider_failure);
-                },
-            };
             if (sig_len > self.pending_signature.len) return self.failCredential(.signature_output_overflow);
-
-            const cv_start = w.len;
             try w.u8_(@intFromEnum(MessageType.certificate_verify));
             const verify_len = try w.reserve(3);
             try w.u16_(c.scheme.code());
@@ -1191,7 +1228,7 @@ pub const Tls13Backend = struct {
             w.patch(2, sig_slot);
             w.patch(3, verify_len);
             crypto.secureZero(u8, &self.pending_signature);
-            self.core.recordSent(buf[cv_start..w.len]) catch |err| return mapCoreError(err);
+            self.core.recordSent(buf[0..w.len]) catch |err| return mapCoreError(err);
         }
 
         // Finished over the transcript through the last message above.
@@ -1203,8 +1240,11 @@ pub const Tls13Backend = struct {
         try w.bytes(&client_verify);
         w.patch(3, finished_len);
         self.core.recordSent(buf[finished_start..w.len]) catch |err| return mapCoreError(err);
-
+        // Emit CertificateVerify (when present) and Finished together; the
+        // Certificate was already emitted before signing.
         try sink.emitCrypto(.handshake, buf[0..w.len]);
+
+        try self.completeClientHandshake(sink);
     }
 
     // -----------------------------------------------------------------------
@@ -1627,6 +1667,21 @@ pub const Tls13Backend = struct {
         if (!done) return; // still pending; the driver polls again later
         op.release();
         self.pending_op = null;
+        try self.dispatchResume(stage, completion, sink);
+
+        // If the resume finished the stage without re-parking or failing, drain
+        // any handshake-epoch messages that arrived coalesced with — and were
+        // buffered behind — the message that triggered the suspend (e.g. a
+        // server that suspended verifying the client CertificateVerify still has
+        // the client Finished waiting in its handshake buffer).
+        if (self.pending_op == null and self.core.handshake_lifecycle == .running)
+            try self.drainInput(&self.handshake_input, .handshake, sink);
+    }
+
+    /// Continue the suspended stage from its completion value. Each arm resumes
+    /// exactly where the synchronous path would have continued, recording no
+    /// handshake message twice.
+    fn dispatchResume(self: *Tls13Backend, stage: PendingStage, completion: credentials.Completion, sink: *EventSink) HandshakeError!void {
         switch (stage) {
             .server_select => {
                 if (completion != .credential) return self.failCredential(.provider_internal_failure);
@@ -1637,6 +1692,16 @@ pub const Tls13Backend = struct {
                 const credential = self.pending_credential orelse return error.InvalidHandshakeState;
                 self.pending_credential = null;
                 return self.serverFinishFlight(credential, completion.signature_len, sink);
+            },
+            .client_select => {
+                if (completion != .credential) return self.failCredential(.provider_internal_failure);
+                return self.emitSelectedClientCertificate(completion.credential, sink);
+            },
+            .client_sign => {
+                if (completion != .signature_len) return self.failCredential(.invalid_callback_behavior);
+                const credential = self.pending_credential orelse return error.InvalidHandshakeState;
+                self.pending_credential = null;
+                return self.finishClientAuthFlight(credential, completion.signature_len, sink);
             },
             .peer_verify => {
                 if (completion != .verdict) return self.failCredential(.verifier_internal_failure);
@@ -1649,8 +1714,8 @@ pub const Tls13Backend = struct {
     /// the stage it was resolving.
     fn pendingFailureClass(stage: PendingStage) CredentialFailure {
         return switch (stage) {
-            .server_select => .provider_internal_failure,
-            .server_sign => .signing_provider_failure,
+            .server_select, .client_select => .provider_internal_failure,
+            .server_sign, .client_sign => .signing_provider_failure,
             .peer_verify => .verifier_internal_failure,
         };
     }

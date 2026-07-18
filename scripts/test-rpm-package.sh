@@ -78,12 +78,17 @@ docker run --rm \
         test -x /usr/bin/tardi
         /usr/bin/tardi version >/dev/null
         test -f /etc/tardigrade/tardigrade.env
+        test -f /etc/tardigrade/tardigrade.conf
         test -f /usr/lib/systemd/system/tardigrade.service
         test -f /usr/share/licenses/tardigrade/LICENSE
         test -d /var/log/tardigrade
+        test -d /var/lib/tardigrade
         test "$(stat -c "%a %U %G" /etc/tardigrade/tardigrade.env)" = "640 root tardigrade"
+        test "$(stat -c "%a %U %G" /etc/tardigrade/tardigrade.conf)" = "644 root root"
+        test "$(stat -c "%a %U %G" /var/lib/tardigrade)" = "755 tardigrade tardigrade"
         grep -F "EnvironmentFile=-/etc/tardigrade/tardigrade.env" /usr/lib/systemd/system/tardigrade.service
         grep -F "ExecStart=/usr/bin/tardi run -c /etc/tardigrade/tardigrade.conf" /usr/lib/systemd/system/tardigrade.service
+        grep -F "WorkingDirectory=/var/lib/tardigrade" /usr/lib/systemd/system/tardigrade.service
 
         dnf remove -y tardigrade
         test ! -e /usr/bin/tardi

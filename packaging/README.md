@@ -129,15 +129,10 @@ sudo rpm -i dist/tardigrade-0.50-1.x86_64.rpm
 sudo systemctl enable --now tardigrade
 ```
 
-The RPM package, unlike the DEB package, does **not** install a starter
-`/etc/tardigrade/tardigrade.conf` or create `/var/lib/tardigrade` (the
-systemd unit's `WorkingDirectory`). Create both before starting the service
-for the first time:
-
-```bash
-sudo install -d -o tardigrade -g tardigrade /var/lib/tardigrade
-sudo install -m 0644 packaging/tardigrade.conf /etc/tardigrade/tardigrade.conf
-```
+Like the DEB package, the RPM installs a starter
+`/etc/tardigrade/tardigrade.conf` and creates `/var/lib/tardigrade` (the
+systemd unit's `WorkingDirectory`) on install, so `systemctl enable --now
+tardigrade` works immediately after a fresh install.
 
 ## Upgrading
 
@@ -155,9 +150,9 @@ sudo systemctl reload tardigrade   # or: restart, if reload is insufficient
   declared in `DEBIAN/conffiles`; `dpkg`/`apt` will prompt on conflicting
   local edits rather than silently overwriting them.
 - RPM upgrades (`sudo rpm -U` or `dnf upgrade`) preserve
-  `/etc/tardigrade/tardigrade.env` via `%config(noreplace)`; since the RPM
-  does not package `tardigrade.conf` at all, there is nothing for `rpm` to
-  manage there — it is entirely operator-owned.
+  `/etc/tardigrade/tardigrade.env` and `/etc/tardigrade/tardigrade.conf` via
+  `%config(noreplace)`; an upgrade with local edits saves the new packaged
+  version alongside as `.rpmnew` rather than overwriting your changes.
 - For the plain release archive / `install.sh` path, replace the `tardi`
   binary, then run `tardi check <config>` against the existing config before
   restarting whatever process supervisor you are using.

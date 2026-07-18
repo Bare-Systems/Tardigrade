@@ -285,6 +285,32 @@ pub const Parser = struct {
         if (self.len != 0) return error.TruncatedRecord;
     }
 
+    /// Returns the number of bytes still needed to complete the buffered
+    /// record. A partial header needs only its remaining header bytes; once a
+    /// header is complete this is the exact encoded-record remainder.
+    pub fn pendingRecordBytesNeeded(self: *const Parser) Error!usize {
+        if (self.len < header_len) return header_len - self.len;
+        const header = try parseHeader(self.pending[0..header_len], self.mode, self.currentVersionPolicy());
+        return header_len + header.payload_len - self.len;
+    }
+
+    /// Returns the declared payload length when `bytes` completes the pending
+    /// header, without consuming either the parser or caller-owned input.
+    pub fn pendingRecordPayloadLenWith(self: *const Parser, bytes: []const u8) Error!?usize {
+        if (self.len >= header_len) {
+            const header = try parseHeader(self.pending[0..header_len], self.mode, self.currentVersionPolicy());
+            return header.payload_len;
+        }
+        if (self.len + bytes.len < header_len) return null;
+
+        var header_bytes: [header_len]u8 = undefined;
+        @memcpy(header_bytes[0..self.len], self.pending[0..self.len]);
+        const needed = header_len - self.len;
+        @memcpy(header_bytes[self.len..], bytes[0..needed]);
+        const header = try parseHeader(&header_bytes, self.mode, self.currentVersionPolicy());
+        return header.payload_len;
+    }
+
     fn drain(self: *Parser, sink: anytype) Error!void {
         while (self.len >= header_len) {
             const header = try parseHeader(self.pending[0..header_len], self.mode, self.currentVersionPolicy());

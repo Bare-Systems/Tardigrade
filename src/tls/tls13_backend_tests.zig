@@ -1410,6 +1410,15 @@ test "malformed SNI is rejected rather than collapsed into the default path" {
         const dup = [_]u8{ 0x00, 0x08, 0x00, 0x00, 0x01, 'a', 0x00, 0x00, 0x01, 'b' };
         try expectServerReceiveError(&server, .{ .sni_raw = &dup }, error.IllegalParameter);
     }
+    // Empty ServerNameList (RFC 6066 §3: ServerNameList<1..>). Must be rejected,
+    // not silently treated as "no host_name present" and routed to the default
+    // credential.
+    {
+        var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .{ .record = .{ .alpn = "h2" } });
+        defer server.deinit();
+        const empty_list = [_]u8{ 0x00, 0x00 }; // ServerNameList<len=0>{}
+        try expectServerReceiveError(&server, .{ .sni_raw = &empty_list }, error.IllegalParameter);
+    }
 }
 
 test "a provider returning an unoffered scheme is rejected before signing" {
@@ -1630,8 +1639,58 @@ test "an async signing failure latches the typed signing-provider failure" {
 
     try std.testing.expectError(error.CredentialProviderFailed, server.resumeAuth(&sink));
     try std.testing.expectEqual(tls_backend.CredentialFailure.signing_provider_failure, server.credentialFailure().?);
-    try std.testing.expectEqual(@as(usize, 1), mock.cancel_count);
+    // `poll` returning an error means the operation already terminated: it must
+    // not be cancelled (cancel is for abandoning an operation before it
+    // resolves), only released.
+    try std.testing.expectEqual(@as(usize, 0), mock.cancel_count);
     try std.testing.expectEqual(@as(usize, 1), mock.op_release_count);
+}
+
+test "a poll error reports InvalidCallbackBehavior distinctly from an ordinary operation failure" {
+    var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
+    mock.async_select = true;
+    mock.pending_polls = 0;
+    mock.pending_fails = true;
+    mock.pending_fail_invalid_callback = true;
+    var server = serverWithProvider(&mock);
+    defer server.deinit();
+    var sink = DirectSink{};
+    defer sink.deinit();
+    try server.backend().start(.server, {}, &sink);
+    var buf: [1024]u8 = undefined;
+    const hello = try buildClientHello(&buf, .{});
+    try server.backend().receive(.initial, hello, &sink);
+    try std.testing.expect(server.authPending());
+
+    try std.testing.expectError(error.CredentialProviderFailed, server.resumeAuth(&sink));
+    // `InvalidCallbackBehavior` is a distinct, stage-independent contract
+    // violation, not the stage's ordinary "operation failed" classification.
+    try std.testing.expectEqual(tls_backend.CredentialFailure.invalid_callback_behavior, server.credentialFailure().?);
+    try std.testing.expectEqual(@as(usize, 0), mock.cancel_count);
+    try std.testing.expectEqual(@as(usize, 1), mock.op_release_count);
+}
+
+test "resumeAuth is a safe no-op before any suspend and after completion" {
+    var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
+    var server = serverWithProvider(&mock);
+    defer server.deinit();
+    var driver = DirectDriver.init(.server, server.backend());
+    defer driver.deinit();
+
+    // Before any suspend: nothing pending, must not fail.
+    _ = try driver.resumeAuth();
+    try std.testing.expect(!driver.authPending());
+
+    _ = try driver.start({});
+    var buf: [1024]u8 = undefined;
+    const hello = try buildClientHello(&buf, .{});
+    _ = try driver.receive(.initial, hello);
+    // The synchronous fixed provider never parks: mid-handshake, with nothing
+    // pending, a call still must not fail.
+    try std.testing.expect(!driver.authPending());
+    const sink = try driver.resumeAuth();
+    try std.testing.expectEqual(@as(usize, 0), sink.len);
+    try std.testing.expect(!driver.authPending());
 }
 
 /// Drive a client backend up to (and through) CertificateVerify against a
@@ -2004,6 +2063,32 @@ test "an oversized configured server name is rejected at start rather than trunc
     try std.testing.expectError(error.InvalidHandshakeState, client.backend().start(.client, {}, &sink));
     try std.testing.expectEqual(@as(usize, 0), sink.len);
     try std.testing.expect(!client.key_pair_present);
+}
+
+test "a ClientHello combining maximum ALPN, SNI, and transport extension serializes successfully" {
+    // #334 review: with maximum-length ALPN (255, the largest a u8 length
+    // prefix allows), SNI (256, max_server_name_len), and a maximum transport
+    // extension (tls_backend.max_transport_extension_len = 512), the encoded
+    // ClientHello is roughly 1.15 KiB. The buffer that serializes it must be
+    // sized for this combination, not just the common case.
+    const max_alpn = [_]u8{'a'} ** 255;
+    const max_sni = [_]u8{'s'} ** 256;
+    var max_transport_ext = [_]u8{0xab} ** tls_backend.max_transport_extension_len;
+    var client = tls_backend.Tls13Backend.initClient(
+        clientEntropy(),
+        .{ .pinned_certificate = tls_backend.testdata.certificate_der },
+        .{ .extension = .{ .alpn = &max_alpn, .extension_type = 57, .local = &max_transport_ext } },
+    );
+    client.server_name_len = max_sni.len;
+    @memcpy(client.server_name[0..max_sni.len], &max_sni);
+    client.server_name_present = true;
+    defer client.deinit();
+    var sink = DirectSink{};
+    defer sink.deinit();
+    try client.backend().start(.client, {}, &sink);
+    try std.testing.expect(client.key_pair_present);
+    try std.testing.expectEqual(@as(usize, 1), sink.len);
+    try std.testing.expectEqualStrings("h2", "h2"); // profile untouched; explicit no-op to document intent
 }
 
 // ===========================================================================

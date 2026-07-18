@@ -841,6 +841,10 @@ pub const MockCredentialProvider = struct {
     /// that violates the callback contract, to prove the engine releases every
     /// owned handle exactly once.
     sign_returns_credential: bool = false,
+    /// When set alongside `pending_fails`, the poll error is
+    /// `InvalidCallbackBehavior` rather than `OperationFailed`, modelling a
+    /// provider that violates the callback contract rather than merely failing.
+    pending_fail_invalid_callback: bool = false,
     pending_polls: usize = 1,
     pending_fails: bool = false,
     poll_count: usize = 0,
@@ -923,7 +927,7 @@ pub const MockCredentialProvider = struct {
             self.remaining_polls -= 1;
             return false;
         }
-        if (self.pending_fails) return error.OperationFailed;
+        if (self.pending_fails) return if (self.pending_fail_invalid_callback) error.InvalidCallbackBehavior else error.OperationFailed;
         switch (self.pending_kind) {
             .select => out.* = if (self.async_no_credential) .no_credential else .{ .credential = self.selectedCredential() },
             .sign => {

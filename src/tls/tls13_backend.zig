@@ -721,7 +721,16 @@ pub const Tls13Backend = struct {
         self.key_pair = key_pair;
         self.key_pair_present = true;
 
-        var buf: [1024]u8 = undefined;
+        // Sized for the worst case, not the common one: maximum ALPN (255,
+        // bounded by `TransportProfile.validate`), maximum SNI
+        // (`max_server_name_len` = 256), and a maximum transport extension
+        // (`max_transport_extension_len` = 512) together encode to roughly
+        // 1.15 KiB — a 1024-byte buffer could overflow for a legitimate
+        // configuration, and by the time the writer reported that, `start` had
+        // already advanced the core and generated/stored the key pair. Using
+        // the same bound as every other flight buffer makes that structurally
+        // impossible rather than requiring a separate exact-size preflight.
+        var buf: [max_message_len]u8 = undefined;
         var w = Writer{ .buf = &buf };
         try w.u8_(@intFromEnum(MessageType.client_hello));
         const message_len = try w.reserve(3);
@@ -1415,7 +1424,13 @@ pub const Tls13Backend = struct {
                     // host_name is rejected deterministically rather than being
                     // collapsed into the default-certificate path, so a selector
                     // never serves the default cert for an invalid SNI.
-                    var names = Reader{ .bytes = try ext.slice(try ext.u16_()) };
+                    const list_len = try ext.u16_();
+                    // RFC 6066 §3: ServerNameList<1..2^16-1> — an empty list is
+                    // malformed, not "no host_name present"; accepting it would
+                    // silently route to the default credential exactly like the
+                    // metadata-collapse behavior this parser otherwise rejects.
+                    if (list_len == 0) return error.IllegalParameter;
+                    var names = Reader{ .bytes = try ext.slice(list_len) };
                     while (names.remaining() > 0) {
                         const name_type = try names.u8_();
                         const name = try names.slice(try names.u16_());
@@ -1755,28 +1770,53 @@ pub const Tls13Backend = struct {
         self.pending_stage = stage;
     }
 
-    /// Poll a parked authentication operation. When it is still pending this is
-    /// a no-op; when it completes the handshake resumes exactly where it
+    /// Poll a parked authentication operation. When nothing is parked this is a
+    /// safe no-op (the documented `transport.Backend.resumeAuth` contract: a
+    /// caller may call it opportunistically). When it is still pending this is
+    /// also a no-op; when it completes the handshake resumes exactly where it
     /// suspended, recording no handshake message twice; when it fails the typed
     /// failure is latched.
     pub fn resumeAuth(self: *Tls13Backend, sink: *EventSink) HandshakeError!void {
-        const op = self.pending_op orelse return error.InvalidHandshakeState;
+        const op = self.pending_op orelse return;
         const stage = self.pending_stage;
         var completion: credentials.Completion = undefined;
-        const done = op.poll(&completion) catch {
-            self.cancelPendingAuth();
-            return self.failCredential(pendingFailureClass(stage));
+        const done = op.poll(&completion) catch |err| {
+            // `poll` returning an error means the operation has already
+            // terminated (per its documented contract), so it must not be
+            // cancelled — `cancel` is for abandoning an operation that has not
+            // yet resolved. Release it (and any held signing credential)
+            // exactly once, then classify the typed callback failure: an
+            // `InvalidCallbackBehavior` is a distinct, stage-independent
+            // contract violation, never conflated with an ordinary operation
+            // failure.
+            op.release();
+            self.pending_op = null;
+            if (self.pending_credential) |credential| {
+                credential.release();
+                self.pending_credential = null;
+            }
+            return self.failCredential(switch (err) {
+                error.InvalidCallbackBehavior => .invalid_callback_behavior,
+                error.OperationFailed => pendingFailureClass(stage),
+            });
         };
         if (!done) return; // still pending; the driver polls again later
         op.release();
         self.pending_op = null;
         try self.dispatchResume(stage, completion, sink);
 
-        // If the resume finished the stage without re-parking or failing, drain
-        // any handshake-epoch messages that arrived coalesced with — and were
-        // buffered behind — the message that triggered the suspend (e.g. a
-        // server that suspended verifying the client CertificateVerify still has
-        // the client Finished waiting in its handshake buffer).
+        // Drain buffered input in protocol order once the resume itself did not
+        // re-park or fail. A parked operation may have suspended while draining
+        // either buffer — server credential selection/signing while processing
+        // the ClientHello in `initial_input`, or client selection/signing and
+        // peer verification while processing the handshake flight in
+        // `handshake_input` — and further bytes for either epoch may have
+        // arrived and been buffered (not just coalesced within the same
+        // message) while it was pending. Draining both, in protocol order,
+        // guarantees every accepted transport byte is eventually parsed or
+        // deterministically rejected rather than silently ignored.
+        if (self.pending_op == null and self.core.handshake_lifecycle == .running)
+            try self.drainInput(&self.initial_input, .initial, sink);
         if (self.pending_op == null and self.core.handshake_lifecycle == .running)
             try self.drainInput(&self.handshake_input, .handshake, sink);
     }
@@ -1788,6 +1828,15 @@ pub const Tls13Backend = struct {
         switch (stage) {
             .server_select => switch (completion) {
                 .credential => |c| return self.emitServerAuthFlight(c, sink),
+                // Unlike the client, the server MUST authenticate itself in
+                // this profile: "no credential" from an async selector is the
+                // same normal-but-unusable outcome the synchronous path reports
+                // via `NoCredentialAvailable`/`NoCompatibleSignatureAlgorithm`
+                // (`NoApplicableCredential`/handshake_failure), not a provider
+                // fault. `Completion.no_credential` does not distinguish
+                // "unavailable" from "incompatible", so both collapse to the
+                // single canonical class here; the wire alert is unaffected.
+                .no_credential => return self.failCredential(.no_credential_available),
                 else => {
                     releaseCompletionCredentials(completion, null);
                     return self.failCredential(.provider_internal_failure);

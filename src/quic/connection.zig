@@ -27,6 +27,7 @@ const packet = @import("packet.zig");
 const frame = @import("frame.zig");
 const tls_adapter = @import("tls_adapter.zig");
 const tls_handshake = @import("tls_handshake.zig");
+const tls_core = @import("tls_core");
 const recovery = @import("recovery.zig");
 const quic_stream = @import("stream.zig");
 const quic_cid = @import("cid.zig");
@@ -1260,19 +1261,21 @@ pub const Connection = struct {
         self.events.emit(.{ .keys_discarded = space });
     }
 
+    /// TLS alert mapping (RFC 9001 §4.8). QUIC-only failures (not part of the
+    /// shared protocol-neutral vocabulary) are mapped explicitly; every other
+    /// error is a member of `tls_core.events.HandshakeError` and is delegated to
+    /// the canonical `alerts.fromHandshakeError` mapper, so this table cannot
+    /// silently drift from the shared one the way it previously did for
+    /// `NoApplicableCredential` (missing here meant every credential-selection
+    /// failure surfaced as `internal_error` instead of `handshake_failure`).
     fn cryptoErrorCode(err: tls_handshake.HandshakeError) u64 {
-        // TLS alert mapping (RFC 9001 §4.8).
-        return switch (err) {
-            error.AlpnMismatch => error_crypto_base + 120, // no_application_protocol
-            error.CertificateInvalid => error_crypto_base + 42, // bad_certificate
-            error.ClientCertificateRequired => error_crypto_base + 116, // certificate_required
-            error.DecryptError => error_crypto_base + 51, // decrypt_error
-            error.MissingTransportParameters, error.InvalidTransportParameters => error_transport_parameter,
-            error.UnexpectedHandshakeMessage => error_crypto_base + 10, // unexpected_message
-            error.IllegalParameter => error_crypto_base + 47, // illegal_parameter
-            error.MalformedHandshake => error_crypto_base + 50, // decode_error
-            else => error_crypto_base + 80, // internal_error
-        };
+        switch (err) {
+            error.MissingTransportParameters, error.InvalidTransportParameters => return error_transport_parameter,
+            error.UnexpectedCryptoLevel, error.HandshakeBufferOverflow => return error_crypto_base + 80, // internal_error
+            else => {},
+        }
+        const shared_err: tls_core.events.HandshakeError = @errorCast(err);
+        return error_crypto_base + @as(u64, @intFromEnum(tls_core.alerts.fromHandshakeError(shared_err)));
     }
 
     // -- close ----------------------------------------------------------------
@@ -2344,6 +2347,66 @@ test "handshake failures map to their RFC 9001 CRYPTO_ERROR alert codes" {
     try testing.expectEqual(error_crypto_base + 50, Connection.cryptoErrorCode(error.MalformedHandshake));
     try testing.expectEqual(error_crypto_base + 120, Connection.cryptoErrorCode(error.AlpnMismatch));
     try testing.expectEqual(error_crypto_base + 42, Connection.cryptoErrorCode(error.CertificateInvalid));
+    // #334 review: NoApplicableCredential was missing from this table and fell
+    // through to the generic internal_error(80) code instead of the canonical
+    // handshake_failure(40) `alerts.fromHandshakeError` maps it to.
+    try testing.expectEqual(error_crypto_base + 40, Connection.cryptoErrorCode(error.NoApplicableCredential));
+    try testing.expectEqual(error_crypto_base + 116, Connection.cryptoErrorCode(error.ClientCertificateRequired));
+    try testing.expectEqual(error_crypto_base + 51, Connection.cryptoErrorCode(error.DecryptError));
+}
+
+test "a real Connection closes with handshake_failure when the server has no applicable credential" {
+    // #334 review: exercise NoApplicableCredential through an actual
+    // Connection, both synchronously and via an asynchronous selector, rather
+    // than only the direct-backend/handshake-adapter tests.
+    const allocator = testing.allocator;
+    const credentials = tls_core.credentials;
+    for ([_]bool{ false, true }) |async_select| {
+        var mock = credentials.MockCredentialProvider.init(
+            try tls_backend_mod.Identity.initPkcs8(tls_backend_mod.testdata.certificate_der, tls_backend_mod.testdata.private_key_pkcs8_der),
+        );
+        mock.force_select_error = error.NoCredentialAvailable;
+        mock.async_select = async_select;
+        mock.pending_polls = 1;
+
+        const pair = try allocator.create(TestPair);
+        pair.* = .{
+            .client_backend = tls_backend_mod.Tls13Backend.initClient(
+                .{ .hello_random = [_]u8{0xc1} ** 32, .key_share_seed = [_]u8{0x11} ** 32 },
+                .{ .pinned_certificate = tls_backend_mod.testdata.certificate_der },
+            ),
+            .server_backend = tls_backend_mod.Tls13Backend.initServer(
+                .{ .hello_random = [_]u8{0x51} ** 32, .key_share_seed = [_]u8{0x22} ** 32 },
+                try tls_backend_mod.Identity.initPkcs8(tls_backend_mod.testdata.certificate_der, tls_backend_mod.testdata.private_key_pkcs8_der),
+            ),
+        };
+        pair.server_backend.engine.external_provider = mock.provider();
+        defer pair.deinit(allocator);
+        pair.client = try Connection.init(allocator, .{
+            .role = .client,
+            .local_cid = &TestPair.client_cid,
+            .original_dcid = &TestPair.odcid,
+            .peer_cid = &TestPair.odcid,
+            .tls = pair.client_backend.backend(),
+            .now_us = pair.now_us,
+        });
+        pair.server = try Connection.init(allocator, .{
+            .role = .server,
+            .local_cid = &TestPair.odcid,
+            .original_dcid = &TestPair.odcid,
+            .peer_cid = &TestPair.client_cid,
+            .tls = pair.server_backend.backend(),
+            .now_us = pair.now_us,
+        });
+
+        try pair.pump();
+        // The client observes the server's synthesized close with the correct
+        // wire alert; the server latches the typed NoApplicableCredential
+        // failure it maps from.
+        const info = pair.client.closeInfo() orelse return error.TestExpectedCloseInfo;
+        try testing.expectEqual(@as(u64, error_crypto_base + 40), info.error_code);
+        try testing.expectEqual(tls_handshake.HandshakeError.NoApplicableCredential, pair.server.handshakeFailure().?);
+    }
 }
 
 test {

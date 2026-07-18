@@ -1324,6 +1324,52 @@ test "a bad CertificateVerify signature fails proof of possession at the client"
     try std.testing.expectEqual(tls_backend.CredentialFailure.certificate_verify_invalid, h.client_engine.credentialFailure().?);
 }
 
+test "CertificateVerify with a supported but incompatible certificate key is decrypt_error" {
+    var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
+    mock.scheme_override = .ecdsa_secp256r1_sha256;
+    var verifier = credentials.MockVerifier.init(.accepted);
+    const h = try SocketHarness.create(.{ .server_provider = mock.provider(), .client_verifier = verifier.verifier() });
+    defer h.destroy();
+
+    const failures = driveUntilBothErrors(h);
+    try std.testing.expectEqual(@as(?anyerror, error.DecryptError), failures.client);
+    try std.testing.expectEqual(@as(?anyerror, error.PeerFatalAlert), failures.server);
+    try std.testing.expectEqual(tls_backend.CredentialFailure.certificate_verify_invalid, h.client_engine.credentialFailure().?);
+    try std.testing.expectEqual(
+        tls_core.alerts.AlertDescription.decrypt_error,
+        h.client_engine.credentialFailure().?.alert(),
+    );
+}
+
+fn malformedEd25519PublicKeyCertificate(out: *[tls_backend.testdata.certificate_der.len]u8) []const u8 {
+    @memcpy(out, tls_backend.testdata.certificate_der);
+    const parsed = (std.crypto.Certificate{ .buffer = out, .index = 0 }).parse() catch unreachable;
+    const pub_key = parsed.pubKey();
+    const offset = @intFromPtr(pub_key.ptr) - @intFromPtr(out);
+    @memset(out[offset..][0..pub_key.len], 0xff);
+    return out[0..];
+}
+
+test "malformed supported Ed25519 public key is bad_certificate" {
+    var cert: [tls_backend.testdata.certificate_der.len]u8 = undefined;
+    const malformed = malformedEd25519PublicKeyCertificate(&cert);
+    var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
+    mock.chain_entry = .{malformed};
+    var verifier = credentials.MockVerifier.init(.accepted);
+    const h = try SocketHarness.create(.{ .server_provider = mock.provider(), .client_verifier = verifier.verifier() });
+    defer h.destroy();
+
+    const failures = driveUntilBothErrors(h);
+    try std.testing.expectEqual(@as(?anyerror, error.CertificateInvalid), failures.client);
+    try std.testing.expectEqual(@as(?anyerror, error.PeerFatalAlert), failures.server);
+    try std.testing.expectEqual(tls_backend.CredentialFailure.invalid_peer_certificate_chain, h.client_engine.credentialFailure().?);
+    try std.testing.expectEqual(
+        tls_core.alerts.AlertDescription.bad_certificate,
+        h.client_engine.credentialFailure().?.alert(),
+    );
+    try std.testing.expectEqual(@as(usize, 0), verifier.verify_count);
+}
+
 test "the fixed provider replaces the previous hard-coded identity with no engine change" {
     // The default harness uses initServer(fixtureIdentity) -> the fixed
     // provider, driving the same engine path a mock or external provider does.
@@ -1977,6 +2023,63 @@ test "async client signing suspends after the client Certificate and resumes to 
     try std.testing.expect(server.credentialFailure() == null);
 }
 
+test "pending client credential selection rejects later handshake bytes and cancels once" {
+    var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
+    mock.async_select = true;
+    mock.pending_polls = 5;
+    var client = clientWithLocalCredential(mock.provider());
+    defer client.deinit();
+    var verifier = credentials.MockVerifier.init(.accepted);
+    var server = serverRequestingClientAuth(.required, verifier.verifier());
+    defer server.deinit();
+
+    var client_sink = DirectSink{};
+    defer client_sink.deinit();
+    var server_sink = DirectSink{};
+    defer server_sink.deinit();
+
+    try deliverServerFlightToClient(&client, &server, &client_sink, &server_sink);
+    try std.testing.expect(client.authPending());
+    client_sink.reset();
+
+    const stray = [_]u8{@intFromEnum(HsMessageType.finished)};
+    try std.testing.expectError(error.UnexpectedHandshakeMessage, client.backend().receive(.handshake, &stray, &client_sink));
+    try std.testing.expect(!client.authPending());
+    try std.testing.expect(!handshakeCompleteIn(&client_sink));
+    try std.testing.expectEqual(@as(usize, 1), mock.cancel_count);
+    try std.testing.expectEqual(@as(usize, 1), mock.op_release_count);
+    try std.testing.expectEqual(@as(usize, 0), mock.release_count);
+    try std.testing.expectEqual(@as(usize, 0), mock.sign_count);
+}
+
+test "pending client signing rejects later handshake bytes and releases the held credential once" {
+    var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
+    mock.async_sign = true;
+    mock.pending_polls = 5;
+    var client = clientWithLocalCredential(mock.provider());
+    defer client.deinit();
+    var verifier = credentials.MockVerifier.init(.accepted);
+    var server = serverRequestingClientAuth(.required, verifier.verifier());
+    defer server.deinit();
+
+    var client_sink = DirectSink{};
+    defer client_sink.deinit();
+    var server_sink = DirectSink{};
+    defer server_sink.deinit();
+
+    try deliverServerFlightToClient(&client, &server, &client_sink, &server_sink);
+    try std.testing.expect(client.authPending());
+    client_sink.reset();
+
+    const stray = [_]u8{@intFromEnum(HsMessageType.certificate)};
+    try std.testing.expectError(error.UnexpectedHandshakeMessage, client.backend().receive(.handshake, &stray, &client_sink));
+    try std.testing.expect(!client.authPending());
+    try std.testing.expect(!handshakeCompleteIn(&client_sink));
+    try std.testing.expectEqual(@as(usize, 1), mock.cancel_count);
+    try std.testing.expectEqual(@as(usize, 1), mock.op_release_count);
+    try std.testing.expectEqual(@as(usize, 1), mock.release_count);
+}
+
 test "async server verification of a coalesced client flight drains the buffered Finished on resume" {
     var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
     var client = clientWithLocalCredential(mock.provider());
@@ -2172,7 +2275,7 @@ test "the record stream production driver resumes async client authentication en
     // over a real socket pair.
     var client_credential = credentials.MockCredentialProvider.init(fixtureIdentity());
     client_credential.async_sign = true;
-    client_credential.pending_polls = 2;
+    client_credential.pending_polls = 0;
     var server_verifier = credentials.MockVerifier.init(.accepted);
     var client_verifier = credentials.MockVerifier.init(.accepted);
 

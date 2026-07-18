@@ -852,15 +852,17 @@ pub const PureZigRecordStream = struct {
     /// whatever the backend emits — the client's certificate flight, the
     /// server's, or a peer-verification verdict. A no-op unless the backend has
     /// suspended; requires output headroom so an emitted flight serializes
-    /// atomically. Returns true if it polled (progress toward resolution).
+    /// atomically. Returns true only for observable progress: terminal failure,
+    /// emitted events, or a pending operation resolving.
     fn resumeAuthIfPending(self: *PureZigRecordStream) Error!bool {
         if (!self.driverPresent()) return false;
         const driver = &self.handshake_driver.?;
         if (!driver.authPending()) return false;
-        if (self.outbound_ciphertext.available() < handshake_output_reserve) return false;
+        if (!self.canReserveHandshakeOutputBatch()) return false;
         const outcome = driver.resumeAuthOutcome();
+        const emitted_or_failed = outcome.sink.len != 0 or outcome.terminal_error != null;
         try self.applyDriverOutcome(outcome);
-        return true;
+        return emitted_or_failed or !driver.authPending();
     }
 
     /// Apply one borrowed driver event batch. Every payload slice is consumed,
@@ -1216,8 +1218,9 @@ pub const PureZigRecordStream = struct {
             return .{ .wants_write = self.outbound_ciphertext.len != 0, .peer_closed = self.peer_closed };
         }
         const pending_terminal_read_ready = self.pending_terminal_read_error != null and !self.hasBufferedInboundContent();
+        const auth_pending = self.authStillPending();
         return .{
-            .wants_read = !self.carrier_eof and self.canAcceptCarrierRead(),
+            .wants_read = !auth_pending and !self.carrier_eof and self.canAcceptCarrierRead(),
             .wants_write = self.outbound_ciphertext.len > 0 or (self.lifecycle == .closing and !self.close_notify_queued),
             .can_read_plaintext = self.inbound_plaintext.len > 0 or pending_terminal_read_ready,
             .can_write_plaintext = self.pending_terminal_read_error == null and self.lifecycle == .open and self.bridge.handshake_complete and !self.write_backpressured and self.canReserveOutboundRecord(),
@@ -3475,6 +3478,31 @@ test "encrypted stream reports would-block and stable readiness without busy-loo
     try testing.expectEqual(before, drive.readiness);
 }
 
+test "pending authentication empty poll suppresses read readiness and makes no progress" {
+    const cp = testProvider();
+    var duplex = Duplex{ .max_chunk = record_codec.max_ciphertext_record_len };
+    try duplex.s2c.append("peer bytes waiting");
+    var backend = ScriptedRecordBackend{ .role = .client, .auth_pending = true, .auth_pending_polls = 10 };
+    var stream_state = PureZigRecordStream.initWithCarrierAndBackend(.client, cp, .tls_aes_128_gcm_sha256, duplex.clientCarrier(), backend.recordBackend());
+    defer stream_state.deinit();
+    stream_state.handshake_started = true;
+    const stream = stream_state.stream();
+
+    const before = stream.readiness();
+    try testing.expect(!before.wants_read);
+    try testing.expect(!before.wants_write);
+
+    const driven = try stream.drive();
+    try testing.expect(!driven.made_progress);
+    try testing.expect(!driven.readiness.wants_read);
+    try testing.expectEqual(@as(usize, 1), backend.auth_poll_count);
+    try testing.expectEqual(@as(usize, "peer bytes waiting".len), duplex.s2c.len);
+
+    backend.auth_pending = false;
+    const ready = stream.readiness();
+    try testing.expect(ready.wants_read);
+}
+
 test "pure-Zig encrypted stream satisfies shared open-idle conformance" {
     const cp = testProvider();
     var client = PureZigRecordStream.init(.client, cp, .tls_aes_128_gcm_sha256);
@@ -3763,6 +3791,9 @@ const ScriptedRecordBackend = struct {
     selected_alpn: ?[]const u8 = "h1",
     emit_certificate: bool = true,
     received_client_finished: bool = false,
+    auth_pending: bool = false,
+    auth_pending_polls: usize = 0,
+    auth_poll_count: usize = 0,
 
     const hs_c2s = secret(0x11);
     const hs_s2c = secret(0x22);
@@ -3770,7 +3801,7 @@ const ScriptedRecordBackend = struct {
     const app_s2c = secret(0x44);
 
     fn recordBackend(self: *ScriptedRecordBackend) RecordHandshakeBackend {
-        return .{ .ptr = self, .startFn = start, .receiveFn = receive };
+        return .{ .ptr = self, .startFn = start, .receiveFn = receive, .authPendingFn = authPending, .resumeFn = resumeAuth };
     }
 
     fn start(ptr: *anyopaque, role: tls_state.Role, _: void, sink: *RecordTransport.EventSink) RecordHandshakeError!void {
@@ -3825,6 +3856,22 @@ const ScriptedRecordBackend = struct {
                 }
             },
         }
+    }
+
+    fn authPending(ptr: *anyopaque) bool {
+        const self: *ScriptedRecordBackend = @ptrCast(@alignCast(ptr));
+        return self.auth_pending;
+    }
+
+    fn resumeAuth(ptr: *anyopaque, _: *RecordTransport.EventSink) RecordHandshakeError!void {
+        const self: *ScriptedRecordBackend = @ptrCast(@alignCast(ptr));
+        if (!self.auth_pending) return;
+        self.auth_poll_count += 1;
+        if (self.auth_pending_polls > 0) {
+            self.auth_pending_polls -= 1;
+            return;
+        }
+        self.auth_pending = false;
     }
 };
 

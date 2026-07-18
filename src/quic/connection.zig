@@ -2146,6 +2146,48 @@ const TestPair = struct {
         return pair;
     }
 
+    fn initClientAuth(
+        allocator: std.mem.Allocator,
+        client_provider: tls_core.credentials.CredentialProvider,
+        server_verifier: tls_core.credentials.PeerVerifier,
+    ) !*TestPair {
+        const pair = try allocator.create(TestPair);
+        pair.* = .{
+            .client_backend = tls_backend_mod.Tls13Backend.initClient(
+                .{ .hello_random = [_]u8{0xc1} ** 32, .key_share_seed = [_]u8{0x11} ** 32 },
+                .{ .pinned_certificate = tls_backend_mod.testdata.certificate_der },
+            ),
+            .server_backend = tls_backend_mod.Tls13Backend.initServer(
+                .{ .hello_random = [_]u8{0x51} ** 32, .key_share_seed = [_]u8{0x22} ** 32 },
+                try tls_backend_mod.Identity.initPkcs8(
+                    tls_backend_mod.testdata.certificate_der,
+                    tls_backend_mod.testdata.private_key_pkcs8_der,
+                ),
+            ),
+        };
+        errdefer allocator.destroy(pair);
+        pair.client_backend.engine.setLocalCredentialProvider(client_provider);
+        pair.server_backend.engine.requestClientAuthentication(.required, server_verifier);
+        pair.client = try Connection.init(allocator, .{
+            .role = .client,
+            .local_cid = &client_cid,
+            .original_dcid = &odcid,
+            .peer_cid = &odcid,
+            .tls = pair.client_backend.backend(),
+            .now_us = pair.now_us,
+        });
+        errdefer pair.client.deinit();
+        pair.server = try Connection.init(allocator, .{
+            .role = .server,
+            .local_cid = &odcid,
+            .original_dcid = &odcid,
+            .peer_cid = &client_cid,
+            .tls = pair.server_backend.backend(),
+            .now_us = pair.now_us,
+        });
+        return pair;
+    }
+
     fn deinit(self: *TestPair, allocator: std.mem.Allocator) void {
         self.client.deinit();
         self.server.deinit();
@@ -2379,6 +2421,50 @@ test "driver: 1-RTT packets are dropped before deprotection until TLS handshake 
     try pair.server.ingest(one_rtt, pair.now_us);
     try testing.expectEqual(received_before, pair.server.metrics.packets_received);
     try testing.expectEqual(dropped_before + 1, pair.server.metrics.packets_dropped);
+}
+
+fn expectConnectionRejectsExtraCryptoWhileClientAuthPending(async_sign: bool) !void {
+    const allocator = testing.allocator;
+    const credentials = tls_core.credentials;
+    var mock = credentials.MockCredentialProvider.init(
+        try tls_backend_mod.Identity.initPkcs8(tls_backend_mod.testdata.certificate_der, tls_backend_mod.testdata.private_key_pkcs8_der),
+    );
+    mock.pending_polls = 64;
+    if (async_sign) {
+        mock.async_sign = true;
+    } else {
+        mock.async_select = true;
+    }
+    var verifier = credentials.MockVerifier.init(.accepted);
+    const pair = try TestPair.initClientAuth(allocator, mock.provider(), verifier.verifier());
+    defer pair.deinit(allocator);
+
+    try pair.pump();
+    try testing.expect(pair.client.authPending());
+    try testing.expect(!pair.client.isEstablished());
+
+    const stray = [_]u8{@intFromEnum(tls_core.handshake.MessageType.finished)};
+    const handshake_index = @intFromEnum(EncryptionLevel.handshake);
+    const offset = pair.client.adapter.reassembler.streams[handshake_index].consumed_offset;
+    try pair.client.applyFrame(.handshake, .{ .crypto = .{ .offset = offset, .data = &stray } }, pair.now_us);
+
+    try testing.expect(!pair.client.authPending());
+    try testing.expectEqual(tls_handshake.HandshakeError.UnexpectedHandshakeMessage, pair.client.handshakeFailure().?);
+    const info = pair.client.closeInfo() orelse return error.TestExpectedCloseInfo;
+    try testing.expect(info.local);
+    try testing.expect(!info.is_application);
+    try testing.expectEqual(@as(u64, error_crypto_base + 10), info.error_code);
+    try testing.expectEqual(@as(usize, 1), mock.cancel_count);
+    try testing.expectEqual(@as(usize, 1), mock.op_release_count);
+    if (async_sign) try testing.expectEqual(@as(usize, 1), mock.release_count);
+}
+
+test "a real Connection rejects extra Handshake CRYPTO while client credential selection is pending" {
+    try expectConnectionRejectsExtraCryptoWhileClientAuthPending(false);
+}
+
+test "a real Connection rejects extra Handshake CRYPTO while client signing is pending" {
+    try expectConnectionRejectsExtraCryptoWhileClientAuthPending(true);
 }
 
 test "a real Connection closes with handshake_failure when the server has no applicable credential" {

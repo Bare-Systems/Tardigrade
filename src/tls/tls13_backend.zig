@@ -564,6 +564,10 @@ pub const Tls13Backend = struct {
         if (level != .application and self.core.handshake_lifecycle == .complete) {
             return error.UnexpectedHandshakeMessage;
         }
+        if (self.rejectPeerHandshakeWhileClientAuthPending(level, bytes.len)) {
+            self.cancelPendingAuth();
+            return error.UnexpectedHandshakeMessage;
+        }
         input.append(bytes) catch |err| return mapCoreError(err);
         // Never begin dispatching while an authentication operation is parked:
         // buffer the freshly received bytes and wait for `resumeAuth`. Without
@@ -620,6 +624,11 @@ pub const Tls13Backend = struct {
             .new_session_ticket => .application,
             else => error.UnexpectedHandshakeMessage,
         };
+    }
+
+    fn rejectPeerHandshakeWhileClientAuthPending(self: *const Tls13Backend, level: EncryptionLevel, byte_len: usize) bool {
+        if (byte_len == 0 or self.pending_op == null or self.role != .client or level == .application) return false;
+        return self.pending_stage == .client_select or self.pending_stage == .client_sign;
     }
 
     fn mapCoreError(err: tls_handshake_codec.Error) HandshakeError {
@@ -1122,19 +1131,25 @@ pub const Tls13Backend = struct {
         switch (algorithm) {
             sigalg_ed25519 => {
                 if (signature.len != Ed25519.Signature.encoded_length) return .invalid_signature;
-                if (parsed.pub_key_algo != .curveEd25519) return .unsupported_certificate;
+                if (parsed.pub_key_algo != .curveEd25519) {
+                    return switch (parsed.pub_key_algo) {
+                        .X9_62_id_ecPublicKey => |curve| if (curve == .X9_62_prime256v1) .invalid_signature else .unsupported_certificate,
+                        else => .unsupported_certificate,
+                    };
+                }
                 const pub_key_bytes = parsed.pubKey();
-                if (pub_key_bytes.len != Ed25519.PublicKey.encoded_length) return .unsupported_certificate;
-                const public_key = Ed25519.PublicKey.fromBytes(pub_key_bytes[0..Ed25519.PublicKey.encoded_length].*) catch return .unsupported_certificate;
+                if (pub_key_bytes.len != Ed25519.PublicKey.encoded_length) return .invalid_certificate;
+                const public_key = Ed25519.PublicKey.fromBytes(pub_key_bytes[0..Ed25519.PublicKey.encoded_length].*) catch return .invalid_certificate;
                 const sig = Ed25519.Signature.fromBytes(signature[0..Ed25519.Signature.encoded_length].*);
                 sig.verify(content, public_key) catch return .invalid_signature;
             },
             sigalg_ecdsa_secp256r1_sha256 => {
                 switch (parsed.pub_key_algo) {
                     .X9_62_id_ecPublicKey => |curve| if (curve != .X9_62_prime256v1) return .unsupported_certificate,
+                    .curveEd25519 => return .invalid_signature,
                     else => return .unsupported_certificate,
                 }
-                const public_key = EcdsaP256.PublicKey.fromSec1(parsed.pubKey()) catch return .unsupported_certificate;
+                const public_key = EcdsaP256.PublicKey.fromSec1(parsed.pubKey()) catch return .invalid_certificate;
                 const sig = EcdsaP256.Signature.fromDer(signature) catch return .invalid_signature;
                 sig.verify(content, public_key) catch return .invalid_signature;
             },

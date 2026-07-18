@@ -827,6 +827,9 @@ pub const MockCredentialProvider = struct {
     /// scheme regardless, to model a provider that hands back an algorithm the
     /// peer never advertised.
     ignore_offer: bool = false,
+    /// Test-only scheme override for modelling a provider that advertises an
+    /// algorithm inconsistent with the certificate's public key.
+    scheme_override: ?SignatureScheme = null,
     /// Sign normally, then flip a signature byte, to model a peer whose
     /// CertificateVerify does not check out (proof-of-possession failure).
     flip_signature: bool = false,
@@ -888,7 +891,11 @@ pub const MockCredentialProvider = struct {
     }
 
     pub fn selectedCredential(self: *MockCredentialProvider) SelectedCredential {
-        return .{ .handle = self, .scheme = self.identity.signatureScheme(), .vtable = &credential_vtable };
+        return .{ .handle = self, .scheme = self.selectedScheme(), .vtable = &credential_vtable };
+    }
+
+    fn selectedScheme(self: *const MockCredentialProvider) SignatureScheme {
+        return self.scheme_override orelse self.identity.signatureScheme();
     }
 
     const vtable = CredentialProvider.VTable{ .select = select };
@@ -908,7 +915,7 @@ pub const MockCredentialProvider = struct {
         }
         self.last_offered_scheme_count = selection.peer_signature_schemes.len;
         if (self.force_select_error) |err| return err;
-        const scheme = self.identity.signatureScheme();
+        const scheme = self.selectedScheme();
         if (!self.ignore_offer and !selection.offersScheme(scheme)) return error.NoCompatibleSignatureAlgorithm;
         if (self.async_select) {
             self.pending_kind = .select;

@@ -248,6 +248,13 @@ fn resolvePath(allocator: std.mem.Allocator, opts: Options) !ResolvedPath {
                 switch (resolved) {
                     .file => return .{ .kind = resolved, .root_real = root_real },
                     .directory => |path| {
+                        // `path` is an owned allocation from here on; guard
+                        // every error exit below (the PathEscapesRoot arm
+                        // below returns a normal `.forbidden` value rather
+                        // than an error, so errdefer does not cover it and
+                        // still needs its own explicit free).
+                        errdefer allocator.free(path);
+
                         // Try the directory-relative index before honoring
                         // autoindex, so an existing index.html takes priority
                         // over a directory listing (#437).

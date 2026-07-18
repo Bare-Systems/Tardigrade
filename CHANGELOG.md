@@ -507,9 +507,9 @@ All notable user-facing changes to Tardigrade are documented here.
 
 ### Fixed
 - **Default static `index` fallback for `root`/`alias` locations (#437)** — a
-  `location` block with `root` (or `alias`) set but no explicit `index` or
-  `try_files` directive now defaults `index` to `index.html`
-  (nginx-compatible) instead of 404ing on directory-style requests. The
+  `location` block with `root` (or `alias`) set but no explicit `index`
+  directive now defaults `index` to `index.html` (nginx-compatible) instead
+  of 404ing on directory-style requests. The
   index candidate is resolved relative to the requested directory, not just
   the location root, so `GET /docs/` correctly checks `docs/index.html`
   rather than falling back to the root's `index.html`; a request for a

@@ -289,9 +289,18 @@ pub const Parser = struct {
     /// record. A partial header needs only its remaining header bytes; once a
     /// header is complete this is the exact encoded-record remainder.
     pub fn pendingRecordBytesNeeded(self: *const Parser) Error!usize {
-        if (self.len < header_len) return header_len - self.len;
-        const header = try parseHeader(self.pending[0..header_len], self.mode, self.currentVersionPolicy());
-        return header_len + header.payload_len - self.len;
+        return self.pendingRecordBytesNeededWith(&.{});
+    }
+
+    /// Like `pendingRecordBytesNeeded`, but includes a caller-owned queued
+    /// prefix when determining how many *additional socket bytes* could still
+    /// advance this record. The queued prefix is not consumed or retained.
+    pub fn pendingRecordBytesNeededWith(self: *const Parser, queued: []const u8) Error!usize {
+        if (self.len + queued.len < header_len) return header_len - (self.len + queued.len);
+        const payload_len = try self.pendingRecordPayloadLenWith(queued) orelse unreachable;
+        const record_len = header_len + payload_len;
+        const already_owned = @min(record_len, self.len + queued.len);
+        return record_len - already_owned;
     }
 
     /// Returns the declared payload length when `bytes` completes the pending

@@ -255,24 +255,33 @@ A `location` block that sets `root` (or `alias`) is served through
 request path is empty after stripping the location prefix, or ends in `/`):
 
 1. **`try_files`**, if configured — each candidate is tried in order; `$uri`
-   resolves to the request path.
-2. **`index`** — tried next if no `try_files` candidate resolved to a file.
-   If `index` is not explicitly configured, it **defaults to `index.html`**
-   (nginx-compatible), so `location / { root ...; }` alone serves
-   `index.html` from that root instead of 404ing.
-3. **`autoindex`**, if `on` — a directory listing is generated as a final
-   fallback when neither of the above resolved to a file.
+   resolves to the request path. A candidate that resolves to a directory
+   falls through to step 2 (the directory-relative index) before step 3.
+2. **`index`**, resolved *relative to the requested directory* — not just the
+   location root. `GET /docs/` checks `docs/index.html`, not the root's
+   `index.html`; a nonexistent directory still 404s. If `index` is not
+   explicitly configured, it **defaults to `index.html`** (nginx-compatible),
+   so `location / { root ...; }` alone serves `index.html` instead of
+   404ing. This applies identically after stripping an `alias` prefix.
+3. **`autoindex`**, if `on` — a directory listing is generated only after
+   steps 1–2 fail to resolve a file, so an existing `index.html` always takes
+   priority over a directory listing.
 
 To opt out of the default index fallback entirely (e.g. to rely solely on
 `autoindex` or a custom `error_page`), set an explicit empty index:
 `index "";`.
 
 Implementation: `buildLocationBlockEntry()` in `src/http/config_file.zig`
-(default applied at config-parse time) and `resolvePath()` in
-`src/http/static_file.zig` (fallback resolution order).
+(default applied at config-parse time) and `resolveDirectoryIndex()` /
+`resolvePath()` in `src/http/static_file.zig` (directory-relative resolution
+and fallback order).
 Tests: `location block with root and no index or try_files defaults index to
-index.html` in `src/http/config_file.zig`, and `static file integration
-serves default index.html when root is set without index or try_files
+index.html` in `src/http/config_file.zig`; `static file integration serves
+default index.html when root is set without index or try_files (#437)`,
+`static file integration resolves nested directory index relative to the
+requested directory (#437)`, `static file integration does not fall back to
+the root index for a nonexistent directory (#437)`, and `static file
+integration prefers an existing index over autoindex when both are enabled
 (#437)` in `tests/integration.zig`.
 
 ## 13. TRACE Method Rejection

@@ -248,6 +248,20 @@ fn resolvePath(allocator: std.mem.Allocator, opts: Options) !ResolvedPath {
                 switch (resolved) {
                     .file => return .{ .kind = resolved, .root_real = root_real },
                     .directory => |path| {
+                        // Try the directory-relative index before honoring
+                        // autoindex, so an existing index.html takes priority
+                        // over a directory listing (#437).
+                        const maybe_index = resolveDirectoryIndex(allocator, root_real, rel, opts.index) catch |err| switch (err) {
+                            error.PathEscapesRoot => {
+                                allocator.free(path);
+                                return .{ .kind = .forbidden, .root_real = root_real };
+                            },
+                            else => return err,
+                        };
+                        if (maybe_index) |index_path| {
+                            allocator.free(path);
+                            return .{ .kind = .{ .file = index_path }, .root_real = root_real };
+                        }
                         if (opts.autoindex) return .{ .kind = resolved, .root_real = root_real };
                         allocator.free(path);
                     },
@@ -257,16 +271,26 @@ fn resolvePath(allocator: std.mem.Allocator, opts: Options) !ResolvedPath {
         }
     }
 
-    const fallback_rel = if (rel_path.len == 0 or std.mem.endsWith(u8, opts.request_path, "/"))
-        opts.index
-    else
-        rel_path;
-    const maybe_fallback = resolveExistingCandidate(allocator, root_real, fallback_rel) catch |err| switch (err) {
-        error.PathEscapesRoot => return .{ .kind = .forbidden, .root_real = root_real },
-        else => return err,
-    };
-    if (maybe_fallback) |resolved| {
-        return .{ .kind = resolved, .root_real = root_real };
+    // Directory-style requests (empty relative path, or a trailing slash)
+    // resolve their index relative to the *requested* directory, not just the
+    // location root — `GET /docs/` must check `docs/index.html`, not fall
+    // back to the root's `index.html` (#437).
+    if (rel_path.len == 0 or std.mem.endsWith(u8, opts.request_path, "/")) {
+        const maybe_index = resolveDirectoryIndex(allocator, root_real, rel_path, opts.index) catch |err| switch (err) {
+            error.PathEscapesRoot => return .{ .kind = .forbidden, .root_real = root_real },
+            else => return err,
+        };
+        if (maybe_index) |index_path| {
+            return .{ .kind = .{ .file = index_path }, .root_real = root_real };
+        }
+    } else {
+        const maybe_fallback = resolveExistingCandidate(allocator, root_real, rel_path) catch |err| switch (err) {
+            error.PathEscapesRoot => return .{ .kind = .forbidden, .root_real = root_real },
+            else => return err,
+        };
+        if (maybe_fallback) |resolved| {
+            return .{ .kind = resolved, .root_real = root_real };
+        }
     }
 
     if (opts.autoindex) {
@@ -303,6 +327,24 @@ pub fn resolveFileCandidate(
         };
     }
     return null;
+}
+
+/// Resolves `index_name` relative to `dir_rel` (a directory-relative path,
+/// possibly with a trailing slash or empty for the root) and returns it only
+/// if it exists as a file. Returns null if `index_name` is empty (explicit
+/// opt-out via `index "";`) or no such file exists.
+fn resolveDirectoryIndex(
+    allocator: std.mem.Allocator,
+    root_real: []const u8,
+    dir_rel: []const u8,
+    index_name: []const u8,
+) !?[]u8 {
+    if (index_name.len == 0) return null;
+    const trimmed_dir = std.mem.trimEnd(u8, dir_rel, "/");
+    if (trimmed_dir.len == 0) return resolveFileCandidate(allocator, root_real, index_name);
+    const index_rel = try std.Io.Dir.path.join(allocator, &[_][]const u8{ trimmed_dir, index_name });
+    defer allocator.free(index_rel);
+    return resolveFileCandidate(allocator, root_real, index_rel);
 }
 
 fn resolveExistingCandidate(
@@ -404,6 +446,133 @@ fn formatHttpDateAlloc(allocator: std.mem.Allocator, timestamp_secs: i64) ![]u8 
         day_secs.getMinutesIntoHour(),
         day_secs.getSecondsIntoMinute(),
     });
+}
+
+test "serve resolves nested directory index relative to the requested directory" {
+    // Regression test for #437: the default (and any explicit) index must be
+    // resolved relative to the requested directory, not just the location
+    // root, so `GET /docs/` checks `docs/index.html` rather than falling
+    // back to the root's `index.html`.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "index.html", .data = "root index" });
+    try compat.wrapDir(tmp.dir).makePath("docs");
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "docs/index.html", .data = "docs index" });
+    const root_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+
+    var hdrs = headers_mod.Headers.init(allocator);
+    defer hdrs.deinit();
+
+    var root_served = (try serve(allocator, .{
+        .root = root_path,
+        .request_path = "/",
+        .matched_pattern = "/",
+        .alias = false,
+        .index = "index.html",
+        .try_files = "",
+        .headers = &hdrs,
+    })).?;
+    defer root_served.deinit(allocator);
+    try std.testing.expectEqual(status.Status.ok, root_served.status_code);
+    try std.testing.expectEqualStrings("root index", root_served.body.?);
+
+    var docs_served = (try serve(allocator, .{
+        .root = root_path,
+        .request_path = "/docs/",
+        .matched_pattern = "/",
+        .alias = false,
+        .index = "index.html",
+        .try_files = "",
+        .headers = &hdrs,
+    })).?;
+    defer docs_served.deinit(allocator);
+    try std.testing.expectEqual(status.Status.ok, docs_served.status_code);
+    try std.testing.expectEqualStrings("docs index", docs_served.body.?);
+}
+
+test "serve returns not found for a nonexistent directory even when the root index exists" {
+    // Regression test for #437: a directory-style request for a path that
+    // does not exist must not fall back to the root's index file.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "index.html", .data = "root index" });
+    const root_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+
+    var hdrs = headers_mod.Headers.init(allocator);
+    defer hdrs.deinit();
+
+    const result = try serve(allocator, .{
+        .root = root_path,
+        .request_path = "/missing/",
+        .matched_pattern = "/",
+        .alias = false,
+        .index = "index.html",
+        .try_files = "",
+        .headers = &hdrs,
+    });
+    try std.testing.expect(result == null);
+}
+
+test "serve prefers directory-relative index over autoindex listing" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "index.html", .data = "index wins" });
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "other.txt", .data = "other" });
+    const root_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+
+    var hdrs = headers_mod.Headers.init(allocator);
+    defer hdrs.deinit();
+
+    var served = (try serve(allocator, .{
+        .root = root_path,
+        .request_path = "/",
+        .matched_pattern = "/",
+        .alias = false,
+        .index = "index.html",
+        .try_files = "$uri",
+        .autoindex = true,
+        .headers = &hdrs,
+    })).?;
+    defer served.deinit(allocator);
+    try std.testing.expectEqual(status.Status.ok, served.status_code);
+    try std.testing.expectEqualStrings("index wins", served.body.?);
+}
+
+test "serve falls back to autoindex when index is explicitly disabled" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "index.html", .data = "should not be served" });
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "other.txt", .data = "other" });
+    const root_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+
+    var hdrs = headers_mod.Headers.init(allocator);
+    defer hdrs.deinit();
+
+    var served = (try serve(allocator, .{
+        .root = root_path,
+        .request_path = "/",
+        .matched_pattern = "/",
+        .alias = false,
+        .index = "",
+        .try_files = "",
+        .autoindex = true,
+        .headers = &hdrs,
+    })).?;
+    defer served.deinit(allocator);
+    try std.testing.expectEqual(status.Status.ok, served.status_code);
+    try std.testing.expect(std.mem.find(u8, served.body.?, "other.txt") != null);
 }
 
 test "serve rejects traversal escaping root" {

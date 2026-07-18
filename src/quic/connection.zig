@@ -1131,6 +1131,34 @@ pub const Connection = struct {
         }
     }
 
+    /// True while the TLS handshake has suspended awaiting an asynchronous
+    /// authentication operation (#334). The event loop can poll this to know
+    /// the connection is waiting on an external signer/verifier/selector; each
+    /// `pollTransmit` (or an explicit `driveAuthentication`) advances it.
+    pub fn authPending(self: *const Connection) bool {
+        return self.handshake.authPending();
+    }
+
+    /// Drive a parked asynchronous authentication operation forward without
+    /// requiring another inbound CRYPTO frame: poll it, queue any handshake
+    /// output it produced, and complete the handshake if it resolved. Safe to
+    /// call unconditionally; a no-op unless the backend is suspended.
+    pub fn driveAuthentication(self: *Connection, now_us: u64) void {
+        if (self.state_ == .closed or self.state_ == .draining or self.state_ == .closing) return;
+        if (!self.handshake.authPending()) return;
+        self.handshake.resumeAuth() catch |err| {
+            self.failHandshake(err);
+            self.startClose(.{ .error_code = cryptoErrorCode(err), .is_application = false, .local = true }, @errorName(err), now_us);
+            return;
+        };
+        self.collectCryptoOutput() catch {
+            self.failHandshake(error.HandshakeBufferOverflow);
+            self.startClose(.{ .error_code = error_crypto_buffer_exceeded, .is_application = false, .local = true }, "crypto buffer", now_us);
+            return;
+        };
+        self.afterHandshakeProgress(now_us);
+    }
+
     fn afterHandshakeProgress(self: *Connection, now_us: u64) void {
         if (self.handshake_complete or !self.handshake.isComplete()) return;
         self.handshake_complete = true;
@@ -1536,6 +1564,19 @@ pub const Connection = struct {
             self.close_needs_send = false;
             self.close_resend_allowed_at_us = now_us + self.ptoDurationNow() / 2;
             return self.buildCloseDatagram(out, now_us);
+        }
+
+        // Advance any parked asynchronous authentication (#334) before building
+        // packets, so a resolved external signer/verifier/selector emits its
+        // next flight here even when no further peer CRYPTO frame will arrive.
+        self.driveAuthentication(now_us);
+        if (self.state_ == .closing or self.state_ == .closed or self.state_ == .draining) {
+            if (self.state_ == .closing and self.close_needs_send) {
+                self.close_needs_send = false;
+                self.close_resend_allowed_at_us = now_us + self.ptoDurationNow() / 2;
+                return self.buildCloseDatagram(out, now_us);
+            }
+            return null;
         }
 
         // Force the delayed app-space ACK when its timer expired.

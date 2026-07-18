@@ -293,6 +293,12 @@ pub const OperationError = error{
 /// the operation kind it resolves.
 pub const Completion = union(enum) {
     credential: SelectedCredential,
+    /// A credential selection that deterministically resolved to "no suitable
+    /// credential" (#334). For a client answering a CertificateRequest this is a
+    /// normal decline — the engine sends an empty Certificate — not a failure,
+    /// so an asynchronous selector can report it faithfully rather than being
+    /// forced into a provider-internal error.
+    no_credential,
     signature_len: usize,
     verdict: Verdict,
 };
@@ -826,6 +832,15 @@ pub const MockCredentialProvider = struct {
     /// completing (or failing, when `pending_fails`).
     async_select: bool = false,
     async_sign: bool = false,
+    /// When set, an asynchronous selection resolves to the "no suitable
+    /// credential" completion rather than a credential, modelling a selector
+    /// that decides to decline (empty Certificate) only after suspending.
+    async_no_credential: bool = false,
+    /// When set, an asynchronous signature completes with the wrong Completion
+    /// kind (a credential instead of a signature length), modelling a provider
+    /// that violates the callback contract, to prove the engine releases every
+    /// owned handle exactly once.
+    sign_returns_credential: bool = false,
     pending_polls: usize = 1,
     pending_fails: bool = false,
     poll_count: usize = 0,
@@ -910,8 +925,14 @@ pub const MockCredentialProvider = struct {
         }
         if (self.pending_fails) return error.OperationFailed;
         switch (self.pending_kind) {
-            .select => out.* = .{ .credential = self.selectedCredential() },
+            .select => out.* = if (self.async_no_credential) .no_credential else .{ .credential = self.selectedCredential() },
             .sign => {
+                if (self.sign_returns_credential) {
+                    // Contract violation: hand back a credential where a
+                    // signature length is required.
+                    out.* = .{ .credential = self.selectedCredential() };
+                    return true;
+                }
                 self.sign_count += 1;
                 const written = self.identity.sign(self.pending_input[0..self.pending_input_len], self.pending_out) catch
                     return error.OperationFailed;

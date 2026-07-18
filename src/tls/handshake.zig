@@ -133,7 +133,13 @@ pub const Core = struct {
         // the client is still expecting the server's Certificate; the client
         // remembers it and will authenticate after the server Finished.
         if (message.kind == .certificate_request) {
-            if (self.role != .client or self.expected_inbound != .certificate)
+            // At most one CertificateRequest may appear in this position of the
+            // server flight (RFC 8446 §4.3.2). `expected_inbound` stays
+            // `.certificate` after the first, so the remembered flag is what
+            // rejects a duplicate rather than accepting and re-hashing it.
+            if (self.role != .client or
+                self.expected_inbound != .certificate or
+                self.client_certificate_requested)
                 return error.UnexpectedHandshakeMessage;
             self.client_certificate_requested = true;
             self.transcript.update(message.raw);
@@ -332,6 +338,25 @@ test "core records both directions of a client and server flight" {
     const client_hash = client.transcriptHash();
     const server_hash = server.transcriptHash();
     try std.testing.expectEqualSlices(u8, &client_hash, &server_hash);
+}
+
+test "a duplicate CertificateRequest in the server flight is rejected" {
+    var client = Core.init(.client);
+    try client.start();
+    var bytes: [8]u8 = undefined;
+    const ch = try messages.encode(.client_hello, "", &bytes);
+    try client.recordSent(ch);
+    const sh = try messages.encode(.server_hello, "", &bytes);
+    _ = try client.acceptReceived(sh);
+    const ee = try messages.encode(.encrypted_extensions, "", &bytes);
+    _ = try client.acceptReceived(ee);
+
+    // The first CertificateRequest is accepted (client auth requested).
+    const cr = try messages.encode(.certificate_request, "", &bytes);
+    _ = try client.acceptReceived(cr);
+    try std.testing.expect(client.client_certificate_requested);
+    // A second one in the same position is illegal (RFC 8446 §4.3.2).
+    try std.testing.expectError(error.UnexpectedHandshakeMessage, client.acceptReceived(cr));
 }
 
 test "secret lifecycle tracks directions and rejects repeated discard" {

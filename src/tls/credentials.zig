@@ -210,6 +210,8 @@ pub const SelectError = error{
     ProviderInternalFailure,
     /// The provider returned a handle that violates the contract.
     InvalidCallbackBehavior,
+    /// The provider could not allocate a selected-handle or operation.
+    OutOfMemory,
 };
 
 /// Selects a local credential for one handshake. Implementations are the fixed
@@ -466,6 +468,7 @@ pub fn classifySelectError(err: SelectError) FailureClass {
         error.MalformedCredentialChain => .malformed_credential_chain,
         error.ProviderInternalFailure => .provider_internal_failure,
         error.InvalidCallbackBehavior => .invalid_callback_behavior,
+        error.OutOfMemory => .provider_internal_failure,
     };
 }
 

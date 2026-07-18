@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const algorithms = @import("algorithms.zig");
+const dns_name = @import("dns_name.zig");
 const messages = @import("messages.zig");
 const policy_mod = @import("policy.zig");
 
@@ -226,12 +227,18 @@ fn parseKeyShares(bytes: []const u8, offers: *ClientHelloOffers) Error!void {
 
 fn parseServerName(bytes: []const u8, offers: *ClientHelloOffers) Error!void {
     var r = messages.Reader{ .bytes = bytes };
-    var names = messages.Reader{ .bytes = try r.slice(try r.u16_()) };
+    const list_len = try r.u16_();
+    if (list_len == 0) return error.MalformedExtension;
+    var names = messages.Reader{ .bytes = try r.slice(list_len) };
     try r.expectEnd();
     while (names.remaining() > 0) {
         const name_type = try names.u8_();
         const name = try names.slice(try names.u16_());
-        if (name_type == 0 and offers.server_name == null) offers.server_name = name;
+        if (name_type == 0) {
+            if (offers.server_name != null) return error.MalformedExtension;
+            dns_name.validateHostName(name) catch return error.MalformedExtension;
+            offers.server_name = name;
+        }
     }
 }
 
@@ -399,6 +406,71 @@ test "ClientHello parser feeds policy negotiation with ALPN and SNI offers" {
     try testing.expect(selected.alpn.eql(algorithms.alpn.h2));
     try testing.expectEqualStrings("example.test", selected.server_name.?);
     try testing.expectEqualStrings("share", selected.key_share);
+}
+
+fn clientHelloWithServerNameExtension(buf: []u8, server_name_payload: []const u8) ![]const u8 {
+    var w = messages.Writer{ .buf = buf };
+    try w.u16_(algorithms.legacy_version);
+    try w.bytes(&([_]u8{0} ** 32));
+    try w.u8_(0);
+    try w.u16_(2);
+    try w.u16_(@intFromEnum(algorithms.CipherSuite.tls_aes_128_gcm_sha256));
+    try w.u8_(1);
+    try w.u8_(0);
+
+    const extensions_len = try w.reserve(2);
+    try w.u16_(@intFromEnum(algorithms.ExtensionType.supported_versions));
+    try w.u16_(3);
+    try w.u8_(2);
+    try w.u16_(@intFromEnum(algorithms.ProtocolVersion.tls13));
+
+    try w.u16_(@intFromEnum(algorithms.ExtensionType.supported_groups));
+    try w.u16_(4);
+    try w.u16_(2);
+    try w.u16_(@intFromEnum(algorithms.NamedGroup.x25519));
+
+    try w.u16_(@intFromEnum(algorithms.ExtensionType.signature_algorithms));
+    try w.u16_(4);
+    try w.u16_(2);
+    try w.u16_(@intFromEnum(algorithms.SignatureScheme.ed25519));
+
+    try w.u16_(@intFromEnum(algorithms.ExtensionType.key_share));
+    const key_share_ext = try w.reserve(2);
+    const key_shares = try w.reserve(2);
+    try w.u16_(@intFromEnum(algorithms.NamedGroup.x25519));
+    try w.u16_(5);
+    try w.bytes("share");
+    w.patch(2, key_shares);
+    w.patch(2, key_share_ext);
+
+    try w.u16_(@intFromEnum(algorithms.ExtensionType.server_name));
+    try w.u16_(@intCast(server_name_payload.len));
+    try w.bytes(server_name_payload);
+    w.patch(2, extensions_len);
+    return w.written();
+}
+
+test "ClientHello parser rejects empty SNI ServerNameList" {
+    var body: [192]u8 = undefined;
+    const empty_server_name_list = [_]u8{ 0, 0 };
+    const hello = try clientHelloWithServerNameExtension(&body, &empty_server_name_list);
+    try testing.expectError(error.MalformedExtension, parseClientHello(hello));
+}
+
+test "ClientHello parser rejects duplicate SNI host_name entries" {
+    var sni_payload: [2 + 2 * (1 + 2 + 12)]u8 = undefined;
+    var sni = messages.Writer{ .buf = &sni_payload };
+    const list_len = try sni.reserve(2);
+    inline for (0..2) |_| {
+        try sni.u8_(0);
+        try sni.u16_(12);
+        try sni.bytes("example.test");
+    }
+    sni.patch(2, list_len);
+
+    var body: [256]u8 = undefined;
+    const hello = try clientHelloWithServerNameExtension(&body, sni.written());
+    try testing.expectError(error.MalformedExtension, parseClientHello(hello));
 }
 
 test "recognized offer vectors allow general-purpose client sizes" {

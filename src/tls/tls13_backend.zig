@@ -17,6 +17,7 @@
 //! rest of the native transport stack — no ambient RNG.
 
 const std = @import("std");
+const dns_name = @import("dns_name.zig");
 const events = @import("events.zig");
 const credentials = @import("credentials.zig");
 const tls_handshake_codec = @import("handshake.zig");
@@ -296,6 +297,10 @@ pub const Tls13Backend = struct {
     /// Stable, engine-owned signature output buffer. An async signer keeps a
     /// pointer to this across the suspend; the engine reads it on completion.
     pending_signature: [max_signature_len]u8 = undefined,
+    pending_client_session_id: [32]u8 = undefined,
+    pending_client_session_id_len: usize = 0,
+    pending_client_share: [X25519.public_length]u8 = undefined,
+    pending_client_hello_ready: bool = false,
 
     const Slice = struct { start: usize, len: usize };
     const PendingStage = enum { server_select, server_sign, client_select, client_sign, peer_verify };
@@ -322,7 +327,13 @@ pub const Tls13Backend = struct {
     /// Allocation-free. The returned backend owns its copied entropy until
     /// `deinit`, which securely clears all private material.
     pub fn initClient(entropy: Entropy, trust: Trust, profile: TransportProfile) Tls13Backend {
-        return .{
+        return initClientWithOptions(entropy, trust, profile, .{});
+    }
+
+    /// Client construction with the built-in fixed trust policy plus explicit
+    /// client options such as intended SNI.
+    pub fn initClientWithOptions(entropy: Entropy, trust: Trust, profile: TransportProfile, options: ClientOptions) Tls13Backend {
+        var self: Tls13Backend = .{
             .role = .client,
             .profile = profile,
             .entropy = entropy,
@@ -330,6 +341,22 @@ pub const Tls13Backend = struct {
             .auth_policy = policyFromTrust(trust),
             .core = tls_handshake_codec.Core.init(.client),
         };
+        self.applyClientOptions(options);
+        return self;
+    }
+
+    fn applyClientOptions(self: *Tls13Backend, options: ClientOptions) void {
+        if (options.server_name) |name| {
+            // Invalid configured SNI is a caller error. Record it and reject at
+            // `start` rather than emitting malformed or truncated host_name.
+            if (dns_name.validateHostName(name)) |_| {
+                @memcpy(self.server_name[0..name.len], name);
+                self.server_name_len = name.len;
+                self.server_name_present = true;
+            } else |_| {
+                self.server_name_overflow = true;
+            }
+        }
     }
 
     /// Allocation-free. The returned backend owns its copy of `identity` and
@@ -374,18 +401,7 @@ pub const Tls13Backend = struct {
             .auth_policy = options.policy,
             .core = tls_handshake_codec.Core.init(.client),
         };
-        if (options.server_name) |name| {
-            // A name too long for the bounded buffer is a caller error. Record
-            // the overflow and reject at `start` rather than truncating it to a
-            // different host (see `server_name_overflow`).
-            if (name.len == 0 or name.len > self.server_name.len) {
-                self.server_name_overflow = true;
-            } else {
-                @memcpy(self.server_name[0..name.len], name);
-                self.server_name_len = name.len;
-                self.server_name_present = true;
-            }
-        }
+        self.applyClientOptions(options);
         return self;
     }
 
@@ -485,6 +501,10 @@ pub const Tls13Backend = struct {
         // exactly once before tearing down the rest.
         self.cancelPendingAuth();
         crypto.secureZero(u8, &self.pending_signature);
+        crypto.secureZero(u8, &self.pending_client_session_id);
+        self.pending_client_session_id_len = 0;
+        crypto.secureZero(u8, &self.pending_client_share);
+        self.pending_client_hello_ready = false;
         if (self.schedule) |*schedule| schedule.wipe();
         self.schedule = null;
         crypto.secureZero(u8, &self.expected_client_verify);
@@ -1475,6 +1495,7 @@ pub const Tls13Backend = struct {
                         // RFC 6066: a given name_type must appear at most once.
                         if (self.server_name_present) return error.IllegalParameter;
                         if (name.len == 0 or name.len > self.server_name.len) return error.IllegalParameter;
+                        dns_name.validateHostName(name) catch return error.IllegalParameter;
                         @memcpy(self.server_name[0..name.len], name);
                         self.server_name_len = name.len;
                         self.server_name_present = true;
@@ -1516,6 +1537,69 @@ pub const Tls13Backend = struct {
         if (self.peer_sig_scheme_count == 0) return error.MalformedHandshake;
         const client_share = peer_share orelse return error.MalformedHandshake;
 
+        if (!alpn_match) {
+            // Report what the client offered instead of silently downgrading;
+            // the driver fails with AlpnMismatch before any flight is sent.
+            try sink.emitAlpn(first_alpn);
+            self.core.handshake_lifecycle = .failed;
+            return error.AlpnMismatch;
+        }
+        if (self.profile.extensionType() != null) {
+            const extension = transport_params orelse return error.MissingTransportExtension;
+            try self.capturePeerTransportExtension(extension);
+        }
+
+        try self.beginServerSelection(session_id, client_share, sink);
+    }
+
+    fn beginServerSelection(
+        self: *Tls13Backend,
+        session_id: []const u8,
+        client_share: [X25519.public_length]u8,
+        sink: *EventSink,
+    ) HandshakeError!void {
+        if (session_id.len > self.pending_client_session_id.len) return error.IllegalParameter;
+        var fixed_provider: credentials.FixedCredentialProvider = undefined;
+        var using_fixed = false;
+        const provider = if (self.external_provider) |p| p else blk: {
+            if (!self.identity_present) return self.failCredential(.no_credential_available);
+            fixed_provider = credentials.FixedCredentialProvider.init(self.identity);
+            using_fixed = true;
+            break :blk fixed_provider.provider();
+        };
+        // Wipe the fixed key material (stack copy and stored identity) on the
+        // way out, whatever the outcome.
+        defer if (using_fixed) {
+            fixed_provider.deinit();
+            self.wipeIdentity();
+        };
+
+        var selection = self.serverSelectionContext();
+        // Selection may complete synchronously or return a pending operation
+        // (e.g. an async SNI lookup); park the latter and resume later.
+        switch (provider.selectCredential(&selection) catch |err|
+            return self.failCredential(credentials.classifySelectError(err))) {
+            .complete => |credential| return self.emitServerHelloAndAuthFlight(session_id, client_share, credential, sink),
+            .pending => |op| {
+                @memcpy(self.pending_client_session_id[0..session_id.len], session_id);
+                self.pending_client_session_id_len = session_id.len;
+                self.pending_client_share = client_share;
+                self.pending_client_hello_ready = true;
+                return self.parkAuth(op, .server_select);
+            },
+        }
+    }
+
+    fn emitServerHelloAndAuthFlight(
+        self: *Tls13Backend,
+        session_id: []const u8,
+        client_share: [X25519.public_length]u8,
+        credential: credentials.SelectedCredential,
+        sink: *EventSink,
+    ) HandshakeError!void {
+        var owned = true;
+        errdefer if (owned) credential.release();
+
         // Validate the peer share before emitting anything: X25519.scalarmult
         // rejects low-order/identity public keys (all-zero shared secret)
         // rather than deriving a predictable secret.
@@ -1529,18 +1613,6 @@ pub const Tls13Backend = struct {
         defer crypto.secureZero(u8, &shared);
         crypto.secureZero(u8, &key_pair.secret_key);
         self.wipeEphemeral();
-
-        if (!alpn_match) {
-            // Report what the client offered instead of silently downgrading;
-            // the driver fails with AlpnMismatch before any flight is sent.
-            try sink.emitAlpn(first_alpn);
-            self.core.handshake_lifecycle = .failed;
-            return error.AlpnMismatch;
-        }
-        if (self.profile.extensionType() != null) {
-            const extension = transport_params orelse return error.MissingTransportExtension;
-            try self.capturePeerTransportExtension(extension);
-        }
 
         // ServerHello (Initial level).
         var hello_buf: [256]u8 = undefined;
@@ -1573,38 +1645,8 @@ pub const Tls13Backend = struct {
         try self.emitHandshakeSecrets(sink);
         try sink.emitDiscardKeys(.initial);
 
-        try self.sendServerFlight(sink);
-    }
-
-    /// EncryptedExtensions + Certificate + CertificateVerify + Finished at the
-    /// Handshake level, followed by the 1-RTT secrets.
-    fn sendServerFlight(self: *Tls13Backend, sink: *EventSink) HandshakeError!void {
-        // Resolve the credential provider — an external one, or the fixed
-        // identity wrapped in the identical production contract — and select a
-        // credential for the negotiated parameters. There is one path.
-        var fixed_provider: credentials.FixedCredentialProvider = undefined;
-        var using_fixed = false;
-        const provider = if (self.external_provider) |p| p else blk: {
-            if (!self.identity_present) return self.failCredential(.no_credential_available);
-            fixed_provider = credentials.FixedCredentialProvider.init(self.identity);
-            using_fixed = true;
-            break :blk fixed_provider.provider();
-        };
-        // Wipe the fixed key material (stack copy and stored identity) on the
-        // way out, whatever the outcome.
-        defer if (using_fixed) {
-            fixed_provider.deinit();
-            self.wipeIdentity();
-        };
-
-        var selection = self.serverSelectionContext();
-        // Selection may complete synchronously or return a pending operation
-        // (e.g. an async SNI lookup); park the latter and resume later.
-        switch (provider.selectCredential(&selection) catch |err|
-            return self.failCredential(credentials.classifySelectError(err))) {
-            .complete => |credential| return self.emitServerAuthFlight(credential, sink),
-            .pending => |op| return self.parkAuth(op, .server_select),
-        }
+        owned = false;
+        try self.emitServerAuthFlight(credential, sink);
     }
 
     /// Validate the selected credential, emit EncryptedExtensions+Certificate,
@@ -1865,7 +1907,17 @@ pub const Tls13Backend = struct {
     fn dispatchResume(self: *Tls13Backend, stage: PendingStage, completion: credentials.Completion, sink: *EventSink) HandshakeError!void {
         switch (stage) {
             .server_select => switch (completion) {
-                .credential => |c| return self.emitServerAuthFlight(c, sink),
+                .credential => |c| {
+                    if (!self.pending_client_hello_ready) {
+                        c.release();
+                        return error.InvalidHandshakeState;
+                    }
+                    const session_id = self.pending_client_session_id[0..self.pending_client_session_id_len];
+                    const client_share = self.pending_client_share;
+                    self.pending_client_hello_ready = false;
+                    self.pending_client_session_id_len = 0;
+                    return self.emitServerHelloAndAuthFlight(session_id, client_share, c, sink);
+                },
                 // Unlike the client, the server MUST authenticate itself in
                 // this profile: "no credential" from an async selector is the
                 // same normal-but-unusable outcome the synchronous path reports

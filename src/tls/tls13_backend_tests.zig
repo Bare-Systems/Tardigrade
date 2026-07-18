@@ -17,6 +17,7 @@ const tls_backend = tls_core.tls13_backend;
 const record_codec = tls_core.record_codec;
 const events = tls_core.events;
 const credentials = tls_core.credentials;
+const sni_provider = tls_core.sni_provider;
 
 fn clientEntropy() tls_backend.Entropy {
     return .{ .hello_random = [_]u8{0xc1} ** 32, .key_share_seed = [_]u8{0x11} ** 32 };
@@ -869,6 +870,110 @@ test "record stream completes a real TLS 1.3 handshake over a nonblocking socket
         }.done);
         try std.testing.expectError(error.EndOfStream, h.server.stream().read(&buf));
     }
+}
+
+fn sniIdentityConfig(patterns: []const []const u8, chain: []const []const u8, default: bool) sni_provider.CredentialBundleConfig {
+    return .{
+        .chain = chain,
+        .patterns = patterns,
+        .signer = sni_provider.SignAdapter.fromIdentity(fixtureIdentity()),
+        .key_kind = .ed25519,
+        .is_default = default,
+    };
+}
+
+test "record stream uses reloadable SNI provider for exact wildcard and default classes" {
+    var provider = sni_provider.ReloadableProvider.init(std.testing.allocator);
+    defer provider.deinit();
+
+    const chain_one = [_][]const u8{tls_backend.testdata.certificate_der};
+    const chain_two = [_][]const u8{ tls_backend.testdata.certificate_der, tls_backend.testdata.certificate_der };
+    const chain_three = [_][]const u8{ tls_backend.testdata.certificate_der, tls_backend.testdata.certificate_der, tls_backend.testdata.certificate_der };
+    const configs = [_]sni_provider.CredentialBundleConfig{
+        sniIdentityConfig(&.{"api.example.test"}, chain_one[0..], false),
+        sniIdentityConfig(&.{"*.example.test"}, chain_two[0..], false),
+        sniIdentityConfig(&.{"default.example.test"}, chain_three[0..], true),
+    };
+    try provider.reload(&configs, .{ .unknown_sni_policy = .use_default });
+
+    {
+        var verifier = credentials.MockVerifier.init(.accepted);
+        const h = try SocketHarness.create(.{
+            .server_provider = provider.provider(),
+            .client_verifier = verifier.verifier(),
+            .client_options = .{ .server_name = "API.Example.Test", .policy = .{ .require_peer_authentication = true } },
+        });
+        defer h.destroy();
+        try h.driveUntil(SocketHarness.bothComplete);
+        try std.testing.expectEqual(@as(usize, 1), verifier.last_chain_len);
+    }
+    {
+        var verifier = credentials.MockVerifier.init(.accepted);
+        const h = try SocketHarness.create(.{
+            .server_provider = provider.provider(),
+            .client_verifier = verifier.verifier(),
+            .client_options = .{ .server_name = "www.example.test", .policy = .{ .require_peer_authentication = true } },
+        });
+        defer h.destroy();
+        try h.driveUntil(SocketHarness.bothComplete);
+        try std.testing.expectEqual(@as(usize, 2), verifier.last_chain_len);
+    }
+    {
+        var verifier = credentials.MockVerifier.init(.accepted);
+        const h = try SocketHarness.create(.{
+            .server_provider = provider.provider(),
+            .client_verifier = verifier.verifier(),
+            .client_options = .{ .policy = .{ .require_peer_authentication = true } },
+        });
+        defer h.destroy();
+        try h.driveUntil(SocketHarness.bothComplete);
+        try std.testing.expectEqual(@as(usize, 3), verifier.last_chain_len);
+    }
+}
+
+test "record stream fails unknown SNI before application data is possible" {
+    var provider = sni_provider.ReloadableProvider.init(std.testing.allocator);
+    defer provider.deinit();
+
+    const chain = [_][]const u8{tls_backend.testdata.certificate_der};
+    const config = sniIdentityConfig(&.{"known.example.test"}, chain[0..], true);
+    try provider.reload(&.{config}, .{ .unknown_sni_policy = .fail_handshake });
+
+    var verifier = credentials.MockVerifier.init(.accepted);
+    const h = try SocketHarness.create(.{
+        .server_provider = provider.provider(),
+        .client_verifier = verifier.verifier(),
+        .client_options = .{ .server_name = "missing.example.test", .policy = .{ .require_peer_authentication = true } },
+    });
+    defer h.destroy();
+
+    try std.testing.expectError(error.NoApplicableCredential, h.driveUntil(SocketHarness.bothComplete));
+    try std.testing.expect(!h.client.bridge.handshake_complete);
+    try std.testing.expect(!h.client.readiness().can_write_plaintext);
+    try std.testing.expectEqual(tls_backend.CredentialFailure.no_credential_available, h.server_engine.credentialFailure().?);
+    try std.testing.expectEqual(@as(usize, 0), verifier.verify_count);
+}
+
+test "record stream SNI provider fails exact incompatible signature without wildcard fallback" {
+    var provider = sni_provider.ReloadableProvider.init(std.testing.allocator);
+    defer provider.deinit();
+    const chain = [_][]const u8{tls_backend.testdata.certificate_der};
+    const configs = [_]sni_provider.CredentialBundleConfig{
+        sniIdentityConfig(&.{"api.example.test"}, chain[0..], false),
+        sniIdentityConfig(&.{"*.example.test"}, chain[0..], true),
+    };
+    try provider.reload(&configs, .{});
+
+    var server = tls_backend.Tls13Backend.initServerWithProvider(serverEntropy(), provider.provider(), .{ .record = .{ .alpn = "h2" } });
+    defer server.deinit();
+    var sink = DirectSink{};
+    defer sink.deinit();
+    try server.backend().start(.server, {}, &sink);
+
+    var buf: [1024]u8 = undefined;
+    const hello = try buildClientHello(&buf, .{ .sni = "api.example.test", .sig_schemes = &.{0x0403} });
+    try std.testing.expectError(error.NoApplicableCredential, server.backend().receive(.initial, hello, &sink));
+    try std.testing.expectEqual(tls_backend.CredentialFailure.no_compatible_signature_algorithm, server.credentialFailure().?);
 }
 
 test "record stream handshake fails closed when a ClientHello is corrupted in flight" {

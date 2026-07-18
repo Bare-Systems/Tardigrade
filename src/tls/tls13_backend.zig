@@ -322,7 +322,13 @@ pub const Tls13Backend = struct {
     /// Allocation-free. The returned backend owns its copied entropy until
     /// `deinit`, which securely clears all private material.
     pub fn initClient(entropy: Entropy, trust: Trust, profile: TransportProfile) Tls13Backend {
-        return .{
+        return initClientWithOptions(entropy, trust, profile, .{});
+    }
+
+    /// Client construction with the built-in fixed trust policy plus explicit
+    /// client options such as intended SNI.
+    pub fn initClientWithOptions(entropy: Entropy, trust: Trust, profile: TransportProfile, options: ClientOptions) Tls13Backend {
+        var self: Tls13Backend = .{
             .role = .client,
             .profile = profile,
             .entropy = entropy,
@@ -330,6 +336,23 @@ pub const Tls13Backend = struct {
             .auth_policy = policyFromTrust(trust),
             .core = tls_handshake_codec.Core.init(.client),
         };
+        self.applyClientOptions(options);
+        return self;
+    }
+
+    fn applyClientOptions(self: *Tls13Backend, options: ClientOptions) void {
+        if (options.server_name) |name| {
+            // A name too long for the bounded buffer is a caller error. Record
+            // the overflow and reject at `start` rather than truncating it to a
+            // different host (see `server_name_overflow`).
+            if (name.len == 0 or name.len > self.server_name.len) {
+                self.server_name_overflow = true;
+            } else {
+                @memcpy(self.server_name[0..name.len], name);
+                self.server_name_len = name.len;
+                self.server_name_present = true;
+            }
+        }
     }
 
     /// Allocation-free. The returned backend owns its copy of `identity` and
@@ -374,18 +397,7 @@ pub const Tls13Backend = struct {
             .auth_policy = options.policy,
             .core = tls_handshake_codec.Core.init(.client),
         };
-        if (options.server_name) |name| {
-            // A name too long for the bounded buffer is a caller error. Record
-            // the overflow and reject at `start` rather than truncating it to a
-            // different host (see `server_name_overflow`).
-            if (name.len == 0 or name.len > self.server_name.len) {
-                self.server_name_overflow = true;
-            } else {
-                @memcpy(self.server_name[0..name.len], name);
-                self.server_name_len = name.len;
-                self.server_name_present = true;
-            }
-        }
+        self.applyClientOptions(options);
         return self;
     }
 

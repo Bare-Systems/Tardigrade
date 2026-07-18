@@ -97,8 +97,12 @@ jobs:
         include:
           - os: ubuntu-latest
             archive_name: tardigrade-linux-x86_64
+            deb_arch: amd64
+            rpm_arch: x86_64
           - os: ubuntu-24.04-arm
             archive_name: tardigrade-linux-aarch64
+            deb_arch: arm64
+            rpm_arch: aarch64
 
     steps:
       - name: Checkout
@@ -113,6 +117,9 @@ jobs:
 
       - name: Install dependencies
         run: sudo apt-get install -y libssl-dev
+
+      - name: Install packaging prerequisites
+        run: sudo apt-get install -y rpm
 
       - name: Install Zig
         run: sh ./scripts/install-zig.sh 0.16.0
@@ -176,6 +183,30 @@ jobs:
         with:
           subject-path: ${{ steps.archive_artifacts.outputs.archive_path }}
 
+      - name: Build DEB package
+        env:
+          VERSION: ${{ needs.prepare-release.outputs.version }}
+          DEB_ARCH: ${{ matrix.deb_arch }}
+          ARTIFACT_DIR: ${{ steps.archive_artifacts.outputs.artifact_dir }}
+        run: |
+          ./packaging/deb/build.sh \
+            --version "$VERSION" \
+            --arch "$DEB_ARCH" \
+            --binary zig-out/bin/tardi \
+            --output "$ARTIFACT_DIR"
+
+      - name: Build RPM package
+        env:
+          VERSION: ${{ needs.prepare-release.outputs.version }}
+          RPM_ARCH: ${{ matrix.rpm_arch }}
+          ARTIFACT_DIR: ${{ steps.archive_artifacts.outputs.artifact_dir }}
+        run: |
+          ./packaging/rpm/build.sh \
+            --version "$VERSION" \
+            --arch "$RPM_ARCH" \
+            --binary zig-out/bin/tardi \
+            --output "$ARTIFACT_DIR"
+
       - name: Upload archive artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -199,6 +230,22 @@ jobs:
           path: ${{ steps.archive_artifacts.outputs.inventory_path }}
           if-no-files-found: error
           retention-days: 14
+
+      - name: Upload DEB artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: deb-${{ matrix.archive_name }}
+          path: ${{ steps.archive_artifacts.outputs.artifact_dir }}/*.deb
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload RPM artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: rpm-${{ matrix.archive_name }}
+          path: ${{ steps.archive_artifacts.outputs.artifact_dir }}/*.rpm
+          if-no-files-found: error
+          retention-days: 1
 
   publish-release:
     name: Publish GitHub release assets
@@ -234,7 +281,7 @@ jobs:
           set -euo pipefail
           mkdir -p "$DIST_DIR"
           install -m 0755 scripts/install.sh "$DIST_DIR/install.sh"
-          find "$DIST_DIR" -type f \( -name '*.tar.gz' -o -name 'install.sh' \) -print0 | sort -z | xargs -0 sha256sum > "$DIST_DIR/tardigrade-checksums.txt"
+          find "$DIST_DIR" -type f \( -name '*.tar.gz' -o -name '*.deb' -o -name '*.rpm' -o -name 'install.sh' \) -print0 | sort -z | xargs -0 sha256sum > "$DIST_DIR/tardigrade-checksums.txt"
 
       - name: Verify checksums
         env:
@@ -258,6 +305,8 @@ jobs:
           body_path: ${{ runner.temp }}/publish-release/release-notes/release-notes.md
           files: |
             ${{ runner.temp }}/publish-release/dist/*.tar.gz
+            ${{ runner.temp }}/publish-release/dist/*.deb
+            ${{ runner.temp }}/publish-release/dist/*.rpm
             ${{ runner.temp }}/publish-release/dist/*.spdx.json
             ${{ runner.temp }}/publish-release/dist/dependency-inventory-*.json
             ${{ runner.temp }}/publish-release/dist/install.sh

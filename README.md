@@ -58,7 +58,7 @@ compatibility promise is documented in the [Core v1 support matrix](docs/SUPPORT
   metrics at `/status/metrics` by default.
 - Request limits, rate limiting, security headers, and release-gated security
   regression tests.
-- A native packaging path with release archives, DEB/RPM package builders,
+- A native packaging path with release archives, published DEB/RPM packages,
   service files, checksums, SBOMs, and provenance attestation.
 
 HTTP/2, HTTP/3/QUIC, WebSocket/SSE, ACME, FastCGI, uWSGI, SCGI, memcached, and
@@ -89,9 +89,10 @@ runtime dependency the DEB/RPM packages declare explicitly.
 Other install paths:
 
 - Download release archives directly from [GitHub Releases](https://github.com/Bare-Systems/Tardigrade/releases).
-- Native DEB/RPM packages, systemd/launchd service files, and a Homebrew
-  formula — see [packaging/README.md](packaging/README.md) for current
-  status and build instructions.
+- Native DEB/RPM packages (published on every release), systemd/launchd
+  service files, and a Homebrew formula — see
+  [packaging/README.md](packaging/README.md) for current status and
+  install/build instructions.
 - Build from source (see below).
 
 ## Build from source

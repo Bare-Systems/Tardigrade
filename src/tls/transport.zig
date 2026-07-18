@@ -215,6 +215,14 @@ pub fn ContractWithOptions(
             startFn: *const fn (ptr: *anyopaque, role: state.Role, params: TransportParameters, sink: *EventSink) ErrorSet!void,
             receiveFn: *const fn (ptr: *anyopaque, epoch: Epoch, bytes: []const u8, sink: *EventSink) ErrorSet!void,
             deinitFn: ?*const fn (ptr: *anyopaque) void = null,
+            /// Asynchronous authentication progression (#334). A backend that can
+            /// suspend for an external signer/verifier/selector wires these; one
+            /// that never suspends leaves them null, and `authPending` is
+            /// always false. `authPendingFn` reports whether an operation is
+            /// parked; `resumeFn` polls it, emitting into `sink` and resuming the
+            /// handshake when it resolves.
+            authPendingFn: ?*const fn (ptr: *anyopaque) bool = null,
+            resumeFn: ?*const fn (ptr: *anyopaque, sink: *EventSink) ErrorSet!void = null,
 
             pub fn start(self: Backend, role: state.Role, params: TransportParameters, sink: *EventSink) ErrorSet!void {
                 return self.startFn(self.ptr, role, params, sink);
@@ -222,6 +230,19 @@ pub fn ContractWithOptions(
 
             pub fn receive(self: Backend, epoch: Epoch, bytes: []const u8, sink: *EventSink) ErrorSet!void {
                 return self.receiveFn(self.ptr, epoch, bytes, sink);
+            }
+
+            /// True while the backend has an authentication operation parked and
+            /// awaiting `resumeAuth`. False for backends that never suspend.
+            pub fn authPending(self: Backend) bool {
+                return if (self.authPendingFn) |f| f(self.ptr) else false;
+            }
+
+            /// Poll a parked authentication operation, emitting progress into
+            /// `sink`. A no-op (and a safe call) when nothing is parked or the
+            /// backend does not support suspension.
+            pub fn resumeAuth(self: Backend, sink: *EventSink) ErrorSet!void {
+                if (self.resumeFn) |f| return f(self.ptr, sink);
             }
 
             pub fn deinit(self: Backend) void {

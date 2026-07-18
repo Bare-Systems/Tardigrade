@@ -1311,7 +1311,9 @@ test "a bad CertificateVerify signature fails proof of possession at the client"
     defer h.destroy();
 
     const failures = driveUntilBothErrors(h);
-    try std.testing.expectEqual(@as(?anyerror, error.CertificateInvalid), failures.client);
+    // A CertificateVerify proof-of-possession failure is a decrypt_error
+    // (RFC 8446 §4.4.3), distinct from a trust rejection.
+    try std.testing.expectEqual(@as(?anyerror, error.DecryptError), failures.client);
     try std.testing.expect(!h.client.bridge.handshake_complete);
     try std.testing.expectEqual(tls_backend.CredentialFailure.certificate_verify_invalid, h.client_engine.credentialFailure().?);
 }
@@ -1980,4 +1982,82 @@ test "a malformed async client selection completion is rejected as a provider fa
     try std.testing.expectError(error.CredentialProviderFailed, client.resumeAuth(&client_sink));
     try std.testing.expectEqual(tls_backend.CredentialFailure.provider_internal_failure, client.credentialFailure().?);
     try std.testing.expectEqual(@as(usize, 1), wrong.release_count);
+}
+
+test "an oversized configured server name is rejected at start rather than truncated" {
+    var verifier = credentials.MockVerifier.init(.accepted);
+    // One byte past the bounded SNI buffer (max_server_name_len is 256).
+    const too_long = [_]u8{'a'} ** 257;
+    var client = tls_backend.Tls13Backend.initClientWithVerifier(
+        clientEntropy(),
+        verifier.verifier(),
+        .{ .record = .{ .alpn = "h2" } },
+        .{ .server_name = &too_long },
+    );
+    defer client.deinit();
+    var sink = DirectSink{};
+    defer sink.deinit();
+    // Fails closed before any ClientHello is emitted; nothing is truncated.
+    try std.testing.expectError(error.InvalidHandshakeState, client.backend().start(.client, {}, &sink));
+    try std.testing.expectEqual(@as(usize, 0), sink.len);
+    try std.testing.expect(!client.key_pair_present);
+}
+
+// ===========================================================================
+// #334 checkpoint 4: pending/resume progression is reachable through the
+// production drivers (the record stream and the generic engine Driver), not
+// only the concrete backend.
+// ===========================================================================
+
+test "the record stream production driver resumes async client authentication end to end" {
+    // The client's own credential signs asynchronously; the shared record
+    // stream must poll resume across drive() ticks and complete mutual auth
+    // over a real socket pair.
+    var client_credential = credentials.MockCredentialProvider.init(fixtureIdentity());
+    client_credential.async_sign = true;
+    client_credential.pending_polls = 2;
+    var server_verifier = credentials.MockVerifier.init(.accepted);
+    var client_verifier = credentials.MockVerifier.init(.accepted);
+
+    const h = try SocketHarness.create(.{ .client_verifier = client_verifier.verifier() });
+    defer h.destroy();
+    // Configure handshake-time client authentication on the heap-stable engines
+    // before the first drive starts either handshake.
+    h.client_engine.setLocalCredentialProvider(client_credential.provider());
+    h.server_engine.requestClientAuthentication(.required, server_verifier.verifier());
+
+    try h.driveUntil(SocketHarness.bothComplete);
+    try std.testing.expect(h.client.bridge.handshake_complete);
+    try std.testing.expect(h.server.bridge.handshake_complete);
+    // The async signature was polled to completion through the driver, and the
+    // server verified the client certificate.
+    try std.testing.expectEqual(@as(usize, 1), client_credential.sign_count);
+    try std.testing.expectEqual(@as(usize, 1), client_credential.op_release_count);
+    try std.testing.expectEqual(@as(usize, 1), server_verifier.verify_count);
+    try std.testing.expect(h.client_engine.credentialFailure() == null);
+    try std.testing.expect(h.server_engine.credentialFailure() == null);
+}
+
+test "the generic engine driver exposes authPending and resumeAuth for the concrete backend" {
+    // Drive a server backend through the generic Driver (not the concrete
+    // backend) and prove the async credential selection suspends and resumes
+    // through the Driver's own authPending/resumeAuth surface.
+    var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
+    mock.async_select = true;
+    mock.pending_polls = 1;
+    var server = serverWithProvider(&mock);
+    var driver = DirectDriver.init(.server, server.backend());
+    defer driver.deinit();
+
+    _ = try driver.start({});
+    var buf: [1024]u8 = undefined;
+    const hello = try buildClientHello(&buf, .{});
+    _ = try driver.receive(.initial, hello);
+    try std.testing.expect(driver.authPending());
+
+    _ = try driver.resumeAuth(); // poll #1: still pending
+    try std.testing.expect(driver.authPending());
+    _ = try driver.resumeAuth(); // poll #2: completes the flight
+    try std.testing.expect(!driver.authPending());
+    try std.testing.expect(server.credentialFailure() == null);
 }

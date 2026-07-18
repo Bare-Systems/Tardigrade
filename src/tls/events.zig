@@ -72,6 +72,11 @@ pub const HandshakeError = error{
     /// a certificate was mandatory. Maps to the `certificate_required` alert
     /// (RFC 8446 §4.4.2.4).
     ClientCertificateRequired,
+    /// A peer's CertificateVerify signature did not validate against its
+    /// presented leaf (proof-of-possession failure). RFC 8446 §4.4.3 mandates
+    /// terminating with the `decrypt_error` alert, distinct from a trust
+    /// rejection (`CertificateInvalid`/bad_certificate).
+    DecryptError,
 };
 
 pub const Event = union(enum) {

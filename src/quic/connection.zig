@@ -776,6 +776,15 @@ pub const Connection = struct {
                     self.startClose(.{ .error_code = cryptoErrorCode(err), .is_application = false, .local = true }, @errorName(err), now_us);
                     return;
                 };
+                // Poll any parked asynchronous authentication (#334) so a
+                // resolved external signer/verifier/selector progresses the
+                // handshake as this packet is processed. A no-op when nothing is
+                // suspended.
+                self.handshake.resumeAuth() catch |err| {
+                    self.failHandshake(err);
+                    self.startClose(.{ .error_code = cryptoErrorCode(err), .is_application = false, .local = true }, @errorName(err), now_us);
+                    return;
+                };
                 self.collectCryptoOutput() catch {
                     self.failHandshake(error.HandshakeBufferOverflow);
                     self.startClose(.{ .error_code = error_crypto_buffer_exceeded, .is_application = false, .local = true }, "crypto buffer", now_us);
@@ -1229,6 +1238,7 @@ pub const Connection = struct {
             error.AlpnMismatch => error_crypto_base + 120, // no_application_protocol
             error.CertificateInvalid => error_crypto_base + 42, // bad_certificate
             error.ClientCertificateRequired => error_crypto_base + 116, // certificate_required
+            error.DecryptError => error_crypto_base + 51, // decrypt_error
             error.MissingTransportParameters, error.InvalidTransportParameters => error_transport_parameter,
             error.UnexpectedHandshakeMessage => error_crypto_base + 10, // unexpected_message
             error.IllegalParameter => error_crypto_base + 47, // illegal_parameter

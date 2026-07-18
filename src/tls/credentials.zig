@@ -414,9 +414,11 @@ pub const FailureClass = enum {
             => .internal_error,
             // Peer-originated authentication failure.
             .invalid_peer_certificate_chain,
-            .certificate_verify_invalid,
             .peer_verification_rejected,
             => .bad_certificate,
+            // A CertificateVerify signature that fails proof of possession is a
+            // decrypt_error, not a trust rejection (RFC 8446 §4.4.3).
+            .certificate_verify_invalid => .decrypt_error,
             // The client declined mandatory authentication.
             .client_certificate_required => .certificate_required,
         };
@@ -428,9 +430,9 @@ pub const FailureClass = enum {
     pub fn engineError(self: FailureClass) events.HandshakeError {
         return switch (self) {
             .invalid_peer_certificate_chain,
-            .certificate_verify_invalid,
             .peer_verification_rejected,
             => error.CertificateInvalid,
+            .certificate_verify_invalid => error.DecryptError,
             .client_certificate_required => error.ClientCertificateRequired,
             .no_credential_available,
             .no_compatible_signature_algorithm,
@@ -1266,11 +1268,16 @@ test "mock verifier can reject, error, and report a scripted verdict with call c
 
 test "every failure class maps to a deterministic alert, origin, and engine error" {
     // Peer-originated authentication failures blame the peer's certificate.
-    for ([_]FailureClass{ .invalid_peer_certificate_chain, .certificate_verify_invalid, .peer_verification_rejected }) |class| {
+    for ([_]FailureClass{ .invalid_peer_certificate_chain, .peer_verification_rejected }) |class| {
         try testing.expectEqual(Origin.peer, class.origin());
         try testing.expectEqual(alerts.AlertDescription.bad_certificate, class.alert());
         try testing.expectEqual(@as(events.HandshakeError, error.CertificateInvalid), class.engineError());
     }
+    // A CertificateVerify proof-of-possession failure is peer-originated but
+    // carries the distinct decrypt_error alert (RFC 8446 §4.4.3).
+    try testing.expectEqual(Origin.peer, FailureClass.certificate_verify_invalid.origin());
+    try testing.expectEqual(alerts.AlertDescription.decrypt_error, FailureClass.certificate_verify_invalid.alert());
+    try testing.expectEqual(@as(events.HandshakeError, error.DecryptError), FailureClass.certificate_verify_invalid.engineError());
     // A client that declines mandatory authentication is peer-attributed but
     // carries the distinct certificate_required alert (RFC 8446 §4.4.2.4).
     try testing.expectEqual(Origin.peer, FailureClass.client_certificate_required.origin());

@@ -337,6 +337,10 @@ pub const TlsConnection = struct {
     close_requested: bool = false,
     peer_closed: bool = false,
     stream_failure: ?encrypted_stream.Error = null,
+    stream_buffer_peaks: encrypted_stream.QueueBytes = .{},
+    stream_peak_total: usize = 0,
+    stream_pause_state: encrypted_stream.PauseState = .{},
+    stream_buffer_counters: encrypted_stream.BufferCounters = .{},
 
     pub fn deinit(self: *TlsConnection) void {
         if (opensslShouldShutdownOnDeinit(self)) {
@@ -447,6 +451,7 @@ const OpenSslPendingWrite = struct {
 fn opensslClearRetry(self: *TlsConnection) void {
     self.retry_direction = .none;
     self.pending_write = null;
+    if (self.stream_lifecycle == .open and !self.close_requested) opensslObserveBackpressure(self);
 }
 
 fn opensslShouldShutdownOnDeinit(self: *const TlsConnection) bool {
@@ -457,6 +462,7 @@ fn opensslStreamFail(self: *TlsConnection, err: encrypted_stream.Error) encrypte
     self.stream_lifecycle = .failed;
     opensslClearRetry(self);
     self.close_requested = false;
+    self.stream_pause_state = .{};
     self.stream_failure = err;
     return err;
 }
@@ -480,11 +486,53 @@ fn opensslSetRetry(self: *TlsConnection, ssl_error: c_int) void {
         c.SSL_ERROR_WANT_WRITE => .write,
         else => .none,
     };
+    if (self.stream_lifecycle == .open and !self.close_requested) opensslObserveBackpressure(self);
 }
 
 fn opensslSetWriteRetry(self: *TlsConnection, bytes: []const u8, ssl_error: c_int) void {
-    opensslSetRetry(self, ssl_error);
+    self.retry_direction = switch (ssl_error) {
+        c.SSL_ERROR_WANT_READ => .read,
+        c.SSL_ERROR_WANT_WRITE => .write,
+        else => .none,
+    };
     self.pending_write = OpenSslPendingWrite.init(bytes);
+    if (self.stream_lifecycle == .open and !self.close_requested) opensslObserveBackpressure(self);
+}
+
+fn opensslCurrentBufferUsage(self: *const TlsConnection) encrypted_stream.QueueBytes {
+    return .{
+        .inbound_plaintext = if (self.stream_lifecycle == .failed or self.stream_lifecycle == .closed) 0 else self.pending(),
+    };
+}
+
+fn opensslObserveBufferUsage(self: *TlsConnection) encrypted_stream.QueueBytes {
+    const current = opensslCurrentBufferUsage(self);
+    self.stream_buffer_peaks.inbound_plaintext = @max(self.stream_buffer_peaks.inbound_plaintext, current.inbound_plaintext);
+    self.stream_peak_total = @max(self.stream_peak_total, current.total());
+    return current;
+}
+
+fn opensslDerivedPauseState(self: *TlsConnection) encrypted_stream.PauseState {
+    const readiness = opensslStreamReadiness(self);
+    return .{
+        .inbound_read_paused = self.stream_lifecycle == .open and !self.peer_closed and !readiness.wants_read and !readiness.can_read_plaintext,
+        .plaintext_write_paused = self.stream_lifecycle == .open and !readiness.can_write_plaintext,
+    };
+}
+
+fn opensslObserveBackpressure(self: *TlsConnection) void {
+    const next = opensslDerivedPauseState(self);
+    if (!self.stream_pause_state.inbound_read_paused and next.inbound_read_paused) {
+        self.stream_buffer_counters.inbound_read_pauses += 1;
+    } else if (self.stream_pause_state.inbound_read_paused and !next.inbound_read_paused) {
+        self.stream_buffer_counters.inbound_read_resumes += 1;
+    }
+    if (!self.stream_pause_state.plaintext_write_paused and next.plaintext_write_paused) {
+        self.stream_buffer_counters.plaintext_write_pauses += 1;
+    } else if (self.stream_pause_state.plaintext_write_paused and !next.plaintext_write_paused) {
+        self.stream_buffer_counters.plaintext_write_resumes += 1;
+    }
+    self.stream_pause_state = next;
 }
 
 fn opensslStreamBackend(_: *anyopaque) encrypted_stream.BackendKind {
@@ -497,11 +545,14 @@ fn opensslStreamRead(ptr: *anyopaque, out: []u8) encrypted_stream.Error!usize {
     if (self.stream_lifecycle != .open) return error.StreamClosed;
     if (self.pending_write != null) return error.RetryOperationPending;
     if (self.close_requested) return error.StreamClosed;
+    _ = opensslObserveBufferUsage(self);
     c.ERR_clear_error();
     const rc = c.SSL_read(self.ssl, out.ptr, @intCast(out.len));
+    _ = opensslObserveBufferUsage(self);
     if (rc > 0) {
         opensslClearRetry(self);
         opensslRefreshPeerClosed(self);
+        _ = opensslObserveBufferUsage(self);
         return @intCast(rc);
     }
     const ssl_error = c.SSL_get_error(self.ssl, rc);
@@ -566,6 +617,7 @@ fn opensslAdvanceShutdown(self: *TlsConnection) encrypted_stream.Error!bool {
     if (self.pending_write != null) return error.RetryOperationPending;
 
     self.stream_lifecycle = .closing;
+    self.stream_pause_state = .{};
     c.ERR_clear_error();
     const rc = c.SSL_shutdown(self.ssl);
     opensslRefreshPeerClosed(self);
@@ -645,7 +697,23 @@ fn opensslStreamDrive(ptr: *anyopaque) encrypted_stream.Error!encrypted_stream.D
         try opensslAdvanceShutdown(self)
     else
         false;
+    if (!made_progress and (self.stream_pause_state.inbound_read_paused or self.stream_pause_state.plaintext_write_paused)) {
+        self.stream_buffer_counters.stalled_drives += 1;
+    }
     return .{ .made_progress = made_progress, .readiness = opensslStreamReadiness(ptr) };
+}
+
+fn opensslStreamBufferSnapshot(ptr: *anyopaque) encrypted_stream.BufferSnapshot {
+    const self: *TlsConnection = @ptrCast(@alignCast(ptr));
+    const current = opensslObserveBufferUsage(self);
+    return .{
+        .current = current,
+        .peak = self.stream_buffer_peaks,
+        .peak_total = self.stream_peak_total,
+        .pause_state = self.stream_pause_state,
+        .counters = self.stream_buffer_counters,
+        .accounting_boundary = .backend_opaque,
+    };
 }
 
 const openssl_stream_vtable = encrypted_stream.EncryptedStream.VTable{
@@ -655,6 +723,7 @@ const openssl_stream_vtable = encrypted_stream.EncryptedStream.VTable{
     .closeFn = opensslStreamClose,
     .readinessFn = opensslStreamReadiness,
     .driveFn = opensslStreamDrive,
+    .bufferSnapshotFn = opensslStreamBufferSnapshot,
 };
 
 pub fn lastOpenSslError(allocator: std.mem.Allocator) ?[]u8 {
@@ -1339,13 +1408,23 @@ test "openssl encrypted stream adapter conforms over production connection" {
 
     var scratch: [32]u8 = undefined;
     try clientWriteAll(pair.client_ssl, "client-payload");
+    const pending_snapshot = stream.bufferSnapshot();
+    try std.testing.expectEqual(encrypted_stream.AccountingBoundary.backend_opaque, pending_snapshot.accounting_boundary);
+    try std.testing.expect(!pending_snapshot.limits_enforced);
+    try std.testing.expect(pending_snapshot.limits == null);
     const partial = try stream.read(scratch[0..6]);
     try std.testing.expectEqualStrings("client", scratch[0..partial]);
     try std.testing.expect(stream.readiness().can_read_plaintext);
+    var buffered_snapshot = stream.bufferSnapshot();
+    try std.testing.expect(buffered_snapshot.current.inbound_plaintext > 0);
+    try std.testing.expect(buffered_snapshot.peak.inbound_plaintext >= buffered_snapshot.current.inbound_plaintext);
 
     const rest = try stream.read(scratch[0..16]);
     try std.testing.expectEqualStrings("-payload", scratch[0..rest]);
     try std.testing.expect(!stream.readiness().can_read_plaintext);
+    buffered_snapshot = stream.bufferSnapshot();
+    try std.testing.expectEqual(@as(usize, 0), buffered_snapshot.current.inbound_plaintext);
+    try std.testing.expect(buffered_snapshot.peak.inbound_plaintext > 0);
 
     const written = try stream.write("server-reply");
     try std.testing.expectEqual(@as(usize, "server-reply".len), written);
@@ -1371,6 +1450,20 @@ test "openssl encrypted stream preserves write retry direction under socket back
     const blocked_drive = try stream.drive();
     try std.testing.expect(!blocked_drive.made_progress);
     try std.testing.expect(blocked_drive.readiness.wants_write);
+    const blocked_snapshot = stream.bufferSnapshot();
+    try std.testing.expectEqual(encrypted_stream.AccountingBoundary.backend_opaque, blocked_snapshot.accounting_boundary);
+    try std.testing.expect(!blocked_snapshot.limits_enforced);
+    try std.testing.expect(blocked_snapshot.limits == null);
+    try std.testing.expect(blocked_snapshot.pause_state.plaintext_write_paused);
+    try std.testing.expectEqual(@as(u64, 1), blocked_snapshot.counters.plaintext_write_pauses);
+    try std.testing.expectEqual(@as(u64, 0), blocked_snapshot.counters.plaintext_write_resumes);
+    try std.testing.expectEqual(@as(u64, 1), blocked_snapshot.counters.stalled_drives);
+    const repeated_blocked_drive = try stream.drive();
+    try std.testing.expect(!repeated_blocked_drive.made_progress);
+    const repeated_blocked_snapshot = stream.bufferSnapshot();
+    try std.testing.expectEqual(@as(u64, 1), repeated_blocked_snapshot.counters.plaintext_write_pauses);
+    try std.testing.expectEqual(@as(u64, 0), repeated_blocked_snapshot.counters.plaintext_write_resumes);
+    try std.testing.expectEqual(@as(u64, 2), repeated_blocked_snapshot.counters.stalled_drives);
 
     var interleaved_read: [1]u8 = undefined;
     try std.testing.expectError(error.RetryOperationPending, stream.read(&interleaved_read));
@@ -1408,6 +1501,33 @@ test "openssl encrypted stream preserves write retry direction under socket back
     try std.testing.expectEqualSlices(u8, target, received);
     try std.testing.expect(!stream.readiness().wants_write);
     try std.testing.expect(stream.readiness().can_write_plaintext);
+    const resumed_snapshot = stream.bufferSnapshot();
+    try std.testing.expect(!resumed_snapshot.pause_state.plaintext_write_paused);
+    try std.testing.expectEqual(@as(u64, 1), resumed_snapshot.counters.plaintext_write_resumes);
+}
+
+test "openssl encrypted stream records pending plaintext peak before first snapshot" {
+    const allocator = std.testing.allocator;
+    var pair = try makeTestTlsPair(allocator);
+    defer pair.deinit();
+
+    const stream = pair.server.stream();
+    try clientWriteAll(pair.client_ssl, "client-payload");
+
+    var scratch: [6]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 6), try stream.read(&scratch));
+    try std.testing.expectEqualStrings("client", &scratch);
+
+    var rest: [16]u8 = undefined;
+    const rest_len = try stream.read(&rest);
+    try std.testing.expectEqualStrings("-payload", rest[0..rest_len]);
+
+    const snapshot = stream.bufferSnapshot();
+    try std.testing.expectEqual(@as(usize, 0), snapshot.current.inbound_plaintext);
+    try std.testing.expect(snapshot.peak.inbound_plaintext >= "-payload".len);
+    try std.testing.expect(snapshot.peak_total >= "-payload".len);
+    try std.testing.expect(!snapshot.limits_enforced);
+    try std.testing.expect(snapshot.limits == null);
 }
 
 test "openssl encrypted stream preserves close requested during pending write retry" {
@@ -1468,6 +1588,48 @@ test "openssl encrypted stream preserves close requested during pending write re
     try std.testing.expectEqual(OpenSslStreamLifecycle.closed, pair.server.stream_lifecycle);
     try std.testing.expectEqualSlices(u8, blocked.expected.items, read_ctx.out.items);
     try encrypted_stream.expectClosedConformance(stream);
+}
+
+test "openssl encrypted stream close does not synthesize pause transitions" {
+    const allocator = std.testing.allocator;
+
+    {
+        var pair = try makeTestTlsPair(allocator);
+        defer pair.deinit();
+        const stream = pair.server.stream();
+
+        const before = stream.bufferSnapshot();
+        try std.testing.expectEqual(@as(u64, 0), before.counters.inbound_read_pauses);
+        try std.testing.expectEqual(@as(u64, 0), before.counters.plaintext_write_pauses);
+
+        stream.close();
+        const after = stream.bufferSnapshot();
+        try std.testing.expect(!after.pause_state.inbound_read_paused);
+        try std.testing.expect(!after.pause_state.plaintext_write_paused);
+        try std.testing.expectEqual(@as(u64, 0), after.counters.inbound_read_pauses);
+        try std.testing.expectEqual(@as(u64, 0), after.counters.inbound_read_resumes);
+        try std.testing.expectEqual(@as(u64, 0), after.counters.plaintext_write_pauses);
+        try std.testing.expectEqual(@as(u64, 0), after.counters.plaintext_write_resumes);
+    }
+
+    {
+        var pair = try makeTestTlsPair(allocator);
+        defer pair.deinit();
+        const stream = pair.server.stream();
+        var blocked: ForcedWriteBlock = .{};
+        defer blocked.deinit(allocator);
+        try forceOpenSslWriteBackpressure(allocator, &pair, stream, &blocked);
+
+        const before_close = stream.bufferSnapshot();
+        try std.testing.expect(before_close.pause_state.plaintext_write_paused);
+        try std.testing.expectEqual(@as(u64, 1), before_close.counters.plaintext_write_pauses);
+
+        stream.close();
+        const after_close = stream.bufferSnapshot();
+        try std.testing.expect(after_close.pause_state.plaintext_write_paused);
+        try std.testing.expectEqual(@as(u64, 1), after_close.counters.plaintext_write_pauses);
+        try std.testing.expectEqual(@as(u64, 0), after_close.counters.plaintext_write_resumes);
+    }
 }
 
 test "openssl encrypted stream cleanup skips shutdown with pending write retry" {

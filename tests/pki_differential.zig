@@ -1597,7 +1597,11 @@ fn readRecordedPid(allocator: std.mem.Allocator, tmp_path: []const u8, file_name
         else => return err,
     };
     defer allocator.free(raw);
-    return try std.fmt.parseInt(std.posix.pid_t, std.mem.trim(u8, raw, " \t\r\n"), 10);
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    return std.fmt.parseInt(std.posix.pid_t, trimmed, 10) catch |err| switch (err) {
+        error.InvalidCharacter, error.Overflow => null,
+    };
 }
 
 fn deleteRecordedPidFiles(tmp_path: []const u8) void {

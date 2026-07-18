@@ -233,6 +233,7 @@ pub const Parser = struct {
     }
 
     pub fn reset(self: *Parser) void {
+        @memset(self.pending[0..], 0);
         self.len = 0;
         self.parsed_first_record = false;
         self.client_hello_state = .idle;
@@ -282,6 +283,41 @@ pub const Parser = struct {
 
     pub fn finish(self: *const Parser) Error!void {
         if (self.len != 0) return error.TruncatedRecord;
+    }
+
+    /// Returns the number of bytes still needed to complete the buffered
+    /// record. A partial header needs only its remaining header bytes; once a
+    /// header is complete this is the exact encoded-record remainder.
+    pub fn pendingRecordBytesNeeded(self: *const Parser) Error!usize {
+        return self.pendingRecordBytesNeededWith(&.{});
+    }
+
+    /// Like `pendingRecordBytesNeeded`, but includes a caller-owned queued
+    /// prefix when determining how many *additional socket bytes* could still
+    /// advance this record. The queued prefix is not consumed or retained.
+    pub fn pendingRecordBytesNeededWith(self: *const Parser, queued: []const u8) Error!usize {
+        if (self.len + queued.len < header_len) return header_len - (self.len + queued.len);
+        const payload_len = try self.pendingRecordPayloadLenWith(queued) orelse unreachable;
+        const record_len = header_len + payload_len;
+        const already_owned = @min(record_len, self.len + queued.len);
+        return record_len - already_owned;
+    }
+
+    /// Returns the declared payload length when `bytes` completes the pending
+    /// header, without consuming either the parser or caller-owned input.
+    pub fn pendingRecordPayloadLenWith(self: *const Parser, bytes: []const u8) Error!?usize {
+        if (self.len >= header_len) {
+            const header = try parseHeader(self.pending[0..header_len], self.mode, self.currentVersionPolicy());
+            return header.payload_len;
+        }
+        if (self.len + bytes.len < header_len) return null;
+
+        var header_bytes: [header_len]u8 = undefined;
+        @memcpy(header_bytes[0..self.len], self.pending[0..self.len]);
+        const needed = header_len - self.len;
+        @memcpy(header_bytes[self.len..], bytes[0..needed]);
+        const header = try parseHeader(&header_bytes, self.mode, self.currentVersionPolicy());
+        return header.payload_len;
     }
 
     fn drain(self: *Parser, sink: anytype) Error!void {
@@ -347,8 +383,11 @@ pub const Parser = struct {
 
     fn discard(self: *Parser, count: usize) void {
         std.debug.assert(count <= self.len);
-        std.mem.copyForwards(u8, self.pending[0 .. self.len - count], self.pending[count..self.len]);
-        self.len -= count;
+        const old_len = self.len;
+        const remaining = old_len - count;
+        std.mem.copyForwards(u8, self.pending[0..remaining], self.pending[count..old_len]);
+        @memset(self.pending[remaining..old_len], 0);
+        self.len = remaining;
     }
 };
 
@@ -958,6 +997,27 @@ test "ciphertext parser requires application_data envelope and allows TLS 1.3 ex
 
     var bad_parser = Parser.init(.ciphertext);
     try testing.expectError(error.InvalidRecordType, bad_parser.feed(&.{ 22, 3, 3, 0, 0 }, &sink));
+}
+
+test "parser reset and discard wipe vacated pending bytes" {
+    var parser = Parser.init(.plaintext);
+    var sink = DefaultSink{};
+    var encoded: [64]u8 = undefined;
+    const record = try encodePlaintextRecord(.handshake, "secret", &encoded);
+
+    try testing.expectEqual(@as(usize, 4), (try parser.feedOne(record[0..4], &sink)).consumed);
+    try testing.expectEqual(@as(usize, 4), parser.len);
+    try testing.expect(std.mem.indexOf(u8, parser.pending[0..parser.len], record[0..4]) != null);
+    try testing.expectError(error.TruncatedRecord, parser.finish());
+
+    parser.reset();
+    try testing.expectEqual(@as(usize, 0), parser.len);
+    try testing.expect(std.mem.allEqual(u8, parser.pending[0..], 0));
+
+    try parser.feed(record, &sink);
+    try testing.expectEqual(@as(usize, 1), sink.len);
+    try testing.expectEqual(@as(usize, 0), parser.len);
+    try testing.expect(std.mem.indexOf(u8, parser.pending[0..], "secret") == null);
 }
 
 test "finish reports truncated records" {

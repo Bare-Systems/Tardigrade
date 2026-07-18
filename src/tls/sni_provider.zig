@@ -232,7 +232,7 @@ pub const Snapshot = struct {
 
         var default_count: usize = 0;
         for (configs, 0..) |config, index| {
-            bundles[index] = try buildBundle(allocator, config, index, bundles[0..initialized]);
+            bundles[index] = try buildBundle(allocator, config, index);
             initialized += 1;
             if (bundles[index].is_default) default_count += 1;
         }
@@ -265,12 +265,12 @@ pub const Snapshot = struct {
         self.bundles = &.{};
     }
 
-    fn select(self: *Snapshot, allocator: std.mem.Allocator, selection: *const credentials.SelectionContext) credentials.SelectError!credentials.SelectedCredential {
+    fn select(self: *Snapshot, selection: *const credentials.SelectionContext) credentials.SelectError!credentials.SelectedCredential {
         const class = self.resolveClass(selection.server_name) orelse return error.NoCredentialAvailable;
         for (self.bundles, 0..) |*bundle, index| {
             if (!bundle.matchesPattern(class)) continue;
             const scheme = chooseCompatibleScheme(bundle, selection.peer_signature_schemes) orelse continue;
-            const handle = allocator.create(SelectedHandle) catch return error.OutOfMemory;
+            const handle = self.allocator.create(SelectedHandle) catch return error.OutOfMemory;
             handle.* = .{
                 .snapshot = self,
                 .bundle_index = index,
@@ -380,7 +380,7 @@ pub const ReloadableProvider = struct {
         const self: *ReloadableProvider = @ptrCast(@alignCast(ctx));
         const snapshot = self.acquireCurrent() orelse return error.NoCredentialAvailable;
         errdefer snapshot.release();
-        const selected = try snapshot.select(self.allocator, selection);
+        const selected = try snapshot.select(selection);
         return .{ .complete = selected };
     }
 };
@@ -435,7 +435,6 @@ fn buildBundle(
     allocator: std.mem.Allocator,
     config: CredentialBundleConfig,
     install_order: usize,
-    previous: []const CredentialBundle,
 ) BuildError!CredentialBundle {
     var signer = config.signer;
     var signer_owned = true;
@@ -473,7 +472,7 @@ fn buildBundle(
     for (config.patterns, 0..) |raw, i| {
         patterns[i] = try parseHostPattern(allocator, raw);
         copied_patterns += 1;
-        if (hasDuplicatePattern(previous, patterns[i]) or hasDuplicatePatternIn(patterns[0..i], patterns[i]))
+        if (hasDuplicatePatternIn(patterns[0..i], patterns[i]))
             return error.DuplicateHostPattern;
     }
 
@@ -605,13 +604,6 @@ fn isDnsLabelByte(ch: u8) bool {
         ch == '-';
 }
 
-fn hasDuplicatePattern(previous: []const CredentialBundle, candidate: HostPattern) bool {
-    for (previous) |bundle| {
-        if (hasDuplicatePatternIn(bundle.patterns, candidate)) return true;
-    }
-    return false;
-}
-
 fn hasDuplicatePatternIn(patterns: []const HostPattern, candidate: HostPattern) bool {
     for (patterns) |pattern| {
         if (@as(std.meta.Tag(HostPattern), pattern) != @as(std.meta.Tag(HostPattern), candidate)) continue;
@@ -696,6 +688,20 @@ fn tlsToProviderScheme(scheme: credentials.SignatureScheme) ?crypto_provider.Sig
 
 const testing = std.testing;
 
+const p256_test_certificate_pem =
+    \\-----BEGIN CERTIFICATE-----
+    \\MIIBmzCCAUGgAwIBAgIURydPBx1vjDTJUssyVTi74k48qnIwCgYIKoZIzj0EAwIw
+    \\IzEhMB8GA1UEAwwYVGFyZGlncmFkZSBUZXN0IEVDRFNBIENBMB4XDTI2MDcxMzAy
+    \\MDUxOFoXDTM0MDkyOTAyMDUxOFowIzEhMB8GA1UEAwwYVGFyZGlncmFkZSBUZXN0
+    \\IEVDRFNBIENBMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEFjO2x/y3R5vvZdls
+    \\KPVExKzZR9mdUMqPOXp/SfN4Z7of1ddxFWzxLFOdHLTzlQb09zZT5V5WoQXrhTA3
+    \\pmhI0aNTMFEwHQYDVR0OBBYEFKe7pGrj6TrDR8CnvdL6MNPwkdKbMB8GA1UdIwQY
+    \\MBaAFKe7pGrj6TrDR8CnvdL6MNPwkdKbMA8GA1UdEwEB/wQFMAMBAf8wCgYIKoZI
+    \\zj0EAwIDSAAwRQIhAKPR86FA40f3W8x1OOMGerLsB4jN61BdmM4HRZGj9syMAiAc
+    \\i+PZtkI67r6m/9cgMaix6IarU20mIJdvt0bM4+4uqA==
+    \\-----END CERTIFICATE-----
+;
+
 fn testSelection(name: ?[]const u8, schemes: []const u16) credentials.SelectionContext {
     return .{
         .role = .server,
@@ -714,6 +720,17 @@ fn identityConfig(patterns: []const []const u8, default: bool) CredentialBundleC
         .patterns = patterns,
         .signer = SignAdapter.fromIdentity(credentials.testdata.identity()),
         .key_kind = .ed25519,
+        .is_default = default,
+    };
+}
+
+fn p256ExternalConfig(patterns: []const []const u8, chain: []const []const u8, default: bool) CredentialBundleConfig {
+    return .{
+        .chain = chain,
+        .patterns = patterns,
+        .signer = SignAdapter.fromExternal(@ptrCast(@constCast(&noop_external_context)), noopExternalSign, noopExternalRelease),
+        .key_kind = .ecdsa_p256,
+        .supported_schemes = &.{.ecdsa_secp256r1_sha256},
         .is_default = default,
     };
 }
@@ -739,7 +756,7 @@ test "wildcard matcher consumes exactly one label" {
     try testing.expect(wildcardMatchesSuffix("A.Example.Test", ".example.test"));
 }
 
-test "snapshot rejects invalid wildcards and duplicate normalized patterns" {
+test "snapshot rejects invalid wildcards and duplicate normalized patterns inside one bundle" {
     const invalid = [_][]const u8{
         "foo*.example.test",
         "*foo.example.test",
@@ -753,9 +770,48 @@ test "snapshot rejects invalid wildcards and duplicate normalized patterns" {
         try testing.expectError(error.InvalidWildcardPattern, Snapshot.build(testing.allocator, &.{config}, .{}, 1));
     }
 
-    const a = identityConfig(&.{"API.Example.Test"}, false);
-    const b = identityConfig(&.{"api.example.test"}, true);
-    try testing.expectError(error.DuplicateHostPattern, Snapshot.build(testing.allocator, &.{ a, b }, .{}, 1));
+    const exact = identityConfig(&.{ "API.Example.Test", "api.example.test" }, true);
+    try testing.expectError(error.DuplicateHostPattern, Snapshot.build(testing.allocator, &.{exact}, .{}, 1));
+
+    const wildcard = identityConfig(&.{ "*.Example.Test", "*.example.test" }, true);
+    try testing.expectError(error.DuplicateHostPattern, Snapshot.build(testing.allocator, &.{wildcard}, .{}, 1));
+}
+
+test "same SNI pattern can select among bundles by signature compatibility" {
+    const ecdsa_der = try decodeSinglePemCertificate(testing.allocator, p256_test_certificate_pem);
+    defer testing.allocator.free(ecdsa_der);
+    const ecdsa_chain = [_][]const u8{ecdsa_der};
+
+    {
+        var provider = ReloadableProvider.init(testing.allocator);
+        defer provider.deinit();
+        const ed_exact = identityConfig(&.{"api.example.test"}, false);
+        const p256_exact = p256ExternalConfig(&.{"API.Example.Test"}, ecdsa_chain[0..], false);
+        try provider.reload(&.{ ed_exact, p256_exact }, .{ .absent_sni_policy = .fail_handshake });
+
+        var ecdsa_only = testSelection("api.example.test", &.{0x0403});
+        const selected_p256 = try syncSelect(provider.provider(), &ecdsa_only);
+        defer selected_p256.release();
+        try testing.expectEqual(credentials.SignatureScheme.ecdsa_secp256r1_sha256, selected_p256.scheme);
+
+        var both = testSelection("api.example.test", &.{ 0x0403, 0x0807 });
+        const selected_ed = try syncSelect(provider.provider(), &both);
+        defer selected_ed.release();
+        try testing.expectEqual(credentials.SignatureScheme.ed25519, selected_ed.scheme);
+    }
+
+    {
+        var provider = ReloadableProvider.init(testing.allocator);
+        defer provider.deinit();
+        const ed_wildcard = identityConfig(&.{"*.example.test"}, false);
+        const p256_wildcard = p256ExternalConfig(&.{"*.Example.Test"}, ecdsa_chain[0..], false);
+        try provider.reload(&.{ ed_wildcard, p256_wildcard }, .{ .absent_sni_policy = .fail_handshake });
+
+        var ecdsa_only = testSelection("www.example.test", &.{0x0403});
+        const selected_p256 = try syncSelect(provider.provider(), &ecdsa_only);
+        defer selected_p256.release();
+        try testing.expectEqual(credentials.SignatureScheme.ecdsa_secp256r1_sha256, selected_p256.scheme);
+    }
 }
 
 test "snapshot build rejects invalid bundles before publication" {
@@ -834,10 +890,18 @@ test "signature compatibility follows peer order and exact class does not fall t
 
     var exact = identityConfig(&.{"api.example.test"}, false);
     exact.supported_schemes = &.{.ed25519};
-    try provider.reload(&.{ exact, wildcard }, .{});
+    const ecdsa_der = try decodeSinglePemCertificate(testing.allocator, p256_test_certificate_pem);
+    defer testing.allocator.free(ecdsa_der);
+    const ecdsa_chain = [_][]const u8{ecdsa_der};
+    const compatible_wildcard = p256ExternalConfig(&.{"*.example.test"}, ecdsa_chain[0..], true);
+    try provider.reload(&.{ exact, compatible_wildcard }, .{});
 
     var selection = testSelection("api.example.test", &.{0x0403});
     try testing.expectError(error.NoCompatibleSignatureAlgorithm, provider.provider().selectCredential(&selection));
+
+    var wildcard_selection = testSelection("www.example.test", &.{0x0403});
+    const wildcard_selected = try syncSelect(provider.provider(), &wildcard_selection);
+    wildcard_selected.release();
 
     selection.peer_signature_schemes = &.{ 0xffff, 0x0807 };
     const selected = try syncSelect(provider.provider(), &selection);
@@ -913,6 +977,23 @@ test "failed reload leaves current snapshot usable" {
     try testing.expectError(error.EmptyChain, provider.reload(&.{bad}, .{}));
 
     var selection = testSelection("ok.example.test", &.{0x0807});
+    const selected = try syncSelect(provider.provider(), &selection);
+    selected.release();
+}
+
+test "selected handle release uses snapshot allocator after external install" {
+    var snapshot_debug: std.heap.DebugAllocator(.{}) = .init;
+    defer std.debug.assert(snapshot_debug.deinit() == .ok);
+    const snapshot_allocator = snapshot_debug.allocator();
+
+    var provider = ReloadableProvider.init(testing.allocator);
+    defer provider.deinit();
+
+    const config = identityConfig(&.{"allocator.example.test"}, true);
+    const snapshot = try Snapshot.build(snapshot_allocator, &.{config}, .{}, 1);
+    provider.install(snapshot);
+
+    var selection = testSelection("allocator.example.test", &.{0x0807});
     const selected = try syncSelect(provider.provider(), &selection);
     selected.release();
 }
@@ -1033,20 +1114,7 @@ fn sniIdentityConfigForFuzz(patterns: []const []const u8, chain: []const []const
 }
 
 test "ECDSA P-256 certificate metadata is selectable with a P-256 signer handle" {
-    const ecdsa_pem =
-        \\-----BEGIN CERTIFICATE-----
-        \\MIIBmzCCAUGgAwIBAgIURydPBx1vjDTJUssyVTi74k48qnIwCgYIKoZIzj0EAwIw
-        \\IzEhMB8GA1UEAwwYVGFyZGlncmFkZSBUZXN0IEVDRFNBIENBMB4XDTI2MDcxMzAy
-        \\MDUxOFoXDTM0MDkyOTAyMDUxOFowIzEhMB8GA1UEAwwYVGFyZGlncmFkZSBUZXN0
-        \\IEVDRFNBIENBMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEFjO2x/y3R5vvZdls
-        \\KPVExKzZR9mdUMqPOXp/SfN4Z7of1ddxFWzxLFOdHLTzlQb09zZT5V5WoQXrhTA3
-        \\pmhI0aNTMFEwHQYDVR0OBBYEFKe7pGrj6TrDR8CnvdL6MNPwkdKbMB8GA1UdIwQY
-        \\MBaAFKe7pGrj6TrDR8CnvdL6MNPwkdKbMA8GA1UdEwEB/wQFMAMBAf8wCgYIKoZI
-        \\zj0EAwIDSAAwRQIhAKPR86FA40f3W8x1OOMGerLsB4jN61BdmM4HRZGj9syMAiAc
-        \\i+PZtkI67r6m/9cgMaix6IarU20mIJdvt0bM4+4uqA==
-        \\-----END CERTIFICATE-----
-    ;
-    const ecdsa_der = try decodeSinglePemCertificate(testing.allocator, ecdsa_pem);
+    const ecdsa_der = try decodeSinglePemCertificate(testing.allocator, p256_test_certificate_pem);
     defer testing.allocator.free(ecdsa_der);
 
     var ext = CountingExternal{};

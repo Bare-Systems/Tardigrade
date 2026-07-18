@@ -168,6 +168,13 @@ pub const CredentialBundleConfig = struct {
     is_default: bool = false,
 };
 
+fn releaseConfiguredSigners(configs: []const CredentialBundleConfig) void {
+    for (configs) |config| {
+        var signer = config.signer;
+        signer.release();
+    }
+}
+
 const CredentialBundle = struct {
     chain: []const []const u8,
     patterns: []const HostPattern,
@@ -229,10 +236,7 @@ pub const Snapshot = struct {
     ) BuildError!*Snapshot {
         var consumed: usize = 0;
         errdefer {
-            for (configs[consumed..]) |config| {
-                var signer = config.signer;
-                signer.release();
-            }
+            releaseConfiguredSigners(configs[consumed..]);
         }
 
         if (configs.len == 0) return error.EmptyCredentialSet;
@@ -379,6 +383,7 @@ pub const ReloadableProvider = struct {
         self.mutex.lock();
         if (self.next_generation == std.math.maxInt(u64)) {
             self.mutex.unlock();
+            releaseConfiguredSigners(configs);
             return error.GenerationOverflow;
         }
         const generation = self.next_generation;
@@ -1039,6 +1044,19 @@ test "external high generation install advances later reload generation" {
     var reload_selection = testSelection("reload.example.test", &.{0x0807});
     const selected = try syncSelect(provider.provider(), &reload_selection);
     selected.release();
+}
+
+test "generation overflow reload releases configured signers" {
+    var provider = ReloadableProvider.init(testing.allocator);
+    defer provider.deinit();
+
+    const terminal = try Snapshot.build(testing.allocator, &.{identityConfig(&.{"terminal.example.test"}, true)}, .{}, std.math.maxInt(u64) - 1);
+    try provider.install(terminal);
+
+    var ext = CountingExternal{};
+    const replacement = countedExternalConfig(&ext, &.{"replacement.example.test"}, true);
+    try testing.expectError(error.GenerationOverflow, provider.reload(&.{replacement}, .{}));
+    try testing.expectEqual(@as(usize, 1), ext.release_count);
 }
 
 test "failed reload leaves current snapshot usable" {

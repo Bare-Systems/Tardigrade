@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security Vulnerability Reporting
+    url: https://github.com/Bare-Systems/Tardigrade/security/advisories/new
+    about: Do not open a public issue for security vulnerabilities. Report them privately per SECURITY.md.

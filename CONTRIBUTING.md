@@ -1,5 +1,27 @@
 # Contributing
 
+## Reporting bugs and requesting features
+
+GitHub Issues is the public intake path for Tardigrade bug reports and
+feature requests — anyone is welcome to open one. When you open a new issue,
+please pick the template that fits:
+
+- **Bug Report** — something is broken or behaving unexpectedly.
+- **Feature Request** — propose a new capability or improvement.
+
+A few things to keep in mind:
+
+- **Security vulnerabilities do not go here.** Please follow
+  [SECURITY.md](SECURITY.md) instead of opening a public issue, so the report
+  isn't visible before a fix is available.
+- **Questions and support requests** are welcome as issues too (there isn't a
+  separate chat/forum yet) — use whichever template is the closest fit, or
+  the Feature Request template if it's more of a "how do I..." than a bug.
+- **Never include secrets** in a public report — private keys, certificates
+  with sensitive identity information, tokens, credentials, production
+  secrets, or unredacted private configuration. Sanitize config excerpts and
+  logs before pasting them.
+
 ## Before You Start
 
 Read the review checklist before making changes:

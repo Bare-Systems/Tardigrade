@@ -22,6 +22,7 @@ pub const Identity = shared.Identity;
 pub const Trust = shared.Trust;
 pub const Entropy = shared.Entropy;
 pub const ClientOptions = shared.Tls13Backend.ClientOptions;
+pub const CredentialProvider = tls_core.credentials.CredentialProvider;
 pub const KeySchedule = shared.KeySchedule;
 pub const hash_len = shared.hash_len;
 pub const max_message_len = shared.max_message_len;
@@ -213,6 +214,14 @@ pub const Tls13Backend = struct {
 
     pub fn initServer(entropy: Entropy, identity: Identity) Tls13Backend {
         return .{ .engine = shared.Tls13Backend.initServer(entropy, identity, .{ .extension = .{
+            .alpn = "h3",
+            .extension_type = ext_quic_transport_parameters,
+            .local = "",
+        } }) };
+    }
+
+    pub fn initServerWithProvider(entropy: Entropy, provider: CredentialProvider) Tls13Backend {
+        return .{ .engine = shared.Tls13Backend.initServerWithProvider(entropy, provider, .{ .extension = .{
             .alpn = "h3",
             .extension_type = ext_quic_transport_parameters,
             .local = "",
@@ -440,18 +449,17 @@ const RealHandshakeHarness = struct {
     }
 
     fn initWithSniProvider(server_name: []const u8, provider: tls_core.credentials.CredentialProvider) !RealHandshakeHarness {
-        var harness = RealHandshakeHarness{
+        const harness = RealHandshakeHarness{
             .client_backend = Tls13Backend.initClientWithOptions(
                 .{ .hello_random = [_]u8{0xc1} ** 32, .key_share_seed = [_]u8{0x11} ** 32 },
                 .{ .pinned_certificate = testdata.certificate_der },
                 .{ .server_name = server_name },
             ),
-            .server_backend = Tls13Backend.initServer(
+            .server_backend = Tls13Backend.initServerWithProvider(
                 .{ .hello_random = [_]u8{0x51} ** 32, .key_share_seed = [_]u8{0x22} ** 32 },
-                try Identity.initPkcs8(testdata.certificate_der, testdata.private_key_pkcs8_der),
+                provider,
             ),
         };
-        harness.server_backend.engine.external_provider = provider;
         return harness;
     }
 

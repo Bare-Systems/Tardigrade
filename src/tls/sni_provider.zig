@@ -67,6 +67,13 @@ pub const BuildError = error{
     OutOfMemory,
 };
 
+pub const PublicationError = error{
+    StaleSnapshotGeneration,
+    GenerationOverflow,
+};
+
+pub const ReloadError = BuildError || PublicationError;
+
 pub const SignAdapter = union(enum) {
     identity: credentials.Identity,
     external: ExternalSigner,
@@ -368,34 +375,49 @@ pub const ReloadableProvider = struct {
         if (retired) |snapshot| snapshot.release();
     }
 
-    pub fn buildSnapshot(self: *ReloadableProvider, configs: []const CredentialBundleConfig, options: SnapshotOptions) BuildError!*Snapshot {
+    pub fn buildSnapshot(self: *ReloadableProvider, configs: []const CredentialBundleConfig, options: SnapshotOptions) ReloadError!*Snapshot {
         self.mutex.lock();
+        if (self.next_generation == std.math.maxInt(u64)) {
+            self.mutex.unlock();
+            return error.GenerationOverflow;
+        }
         const generation = self.next_generation;
         self.next_generation += 1;
         self.mutex.unlock();
         return Snapshot.build(self.allocator, configs, options, generation);
     }
 
-    pub fn reload(self: *ReloadableProvider, configs: []const CredentialBundleConfig, options: SnapshotOptions) BuildError!void {
+    pub fn reload(self: *ReloadableProvider, configs: []const CredentialBundleConfig, options: SnapshotOptions) ReloadError!void {
         const replacement = try self.buildSnapshot(configs, options);
-        self.install(replacement);
+        try self.install(replacement);
     }
 
-    pub fn install(self: *ReloadableProvider, replacement: *Snapshot) void {
+    pub fn install(self: *ReloadableProvider, replacement: *Snapshot) PublicationError!void {
         self.mutex.lock();
         if (self.current) |current| {
             if (current == replacement) {
+                if (replacement.generation == std.math.maxInt(u64)) {
+                    self.mutex.unlock();
+                    return error.GenerationOverflow;
+                }
+                self.next_generation = @max(self.next_generation, replacement.generation + 1);
                 self.mutex.unlock();
                 return;
             }
             if (replacement.generation <= current.generation) {
                 self.mutex.unlock();
                 replacement.release();
-                return;
+                return error.StaleSnapshotGeneration;
             }
+        }
+        if (replacement.generation == std.math.maxInt(u64)) {
+            self.mutex.unlock();
+            replacement.release();
+            return error.GenerationOverflow;
         }
         const retired = self.current;
         self.current = replacement;
+        self.next_generation = @max(self.next_generation, replacement.generation + 1);
         self.mutex.unlock();
         if (retired) |snapshot| snapshot.release();
     }
@@ -959,7 +981,7 @@ test "reload keeps selected generation alive until handle release" {
 
     var first = try provider.buildSnapshot(&.{identityConfig(&.{"first.example.test"}, true)}, .{});
     first.deinit_count = &first_deinit;
-    provider.install(first);
+    try provider.install(first);
 
     var selection = testSelection("first.example.test", &.{0x0807});
     const selected = try syncSelect(provider.provider(), &selection);
@@ -967,7 +989,7 @@ test "reload keeps selected generation alive until handle release" {
 
     var second = try provider.buildSnapshot(&.{identityConfig(&.{"second.example.test"}, true)}, .{});
     second.deinit_count = &second_deinit;
-    provider.install(second);
+    try provider.install(second);
     try testing.expectEqual(@as(usize, 0), first_deinit.load(.monotonic));
 
     var old_sig: [128]u8 = undefined;
@@ -989,8 +1011,8 @@ test "install rejects stale generations without rolling back current snapshot" {
     const stale = try Snapshot.build(testing.allocator, &.{identityConfig(&.{"stale.example.test"}, true)}, .{}, 1);
     stale.deinit_count = &stale_deinit;
     const current = try Snapshot.build(testing.allocator, &.{identityConfig(&.{"current.example.test"}, true)}, .{}, 2);
-    provider.install(current);
-    provider.install(stale);
+    try provider.install(current);
+    try testing.expectError(error.StaleSnapshotGeneration, provider.install(stale));
     try testing.expectEqual(@as(usize, 1), stale_deinit.load(.monotonic));
 
     var old_selection = testSelection("stale.example.test", &.{0x0807});
@@ -998,6 +1020,24 @@ test "install rejects stale generations without rolling back current snapshot" {
 
     var current_selection = testSelection("current.example.test", &.{0x0807});
     const selected = try syncSelect(provider.provider(), &current_selection);
+    selected.release();
+}
+
+test "external high generation install advances later reload generation" {
+    var provider = ReloadableProvider.init(testing.allocator);
+    defer provider.deinit();
+
+    const external = try Snapshot.build(testing.allocator, &.{identityConfig(&.{"external.example.test"}, true)}, .{}, 100);
+    try provider.install(external);
+
+    try provider.reload(&.{identityConfig(&.{"reload.example.test"}, true)}, .{});
+    try testing.expectEqual(@as(u64, 101), provider.current.?.generation);
+
+    var external_selection = testSelection("external.example.test", &.{0x0807});
+    try testing.expectError(error.NoCredentialAvailable, provider.provider().selectCredential(&external_selection));
+
+    var reload_selection = testSelection("reload.example.test", &.{0x0807});
+    const selected = try syncSelect(provider.provider(), &reload_selection);
     selected.release();
 }
 
@@ -1026,7 +1066,7 @@ test "selected handle release uses snapshot allocator after external install" {
 
     const config = identityConfig(&.{"allocator.example.test"}, true);
     const snapshot = try Snapshot.build(snapshot_allocator, &.{config}, .{}, 1);
-    provider.install(snapshot);
+    try provider.install(snapshot);
 
     var selection = testSelection("allocator.example.test", &.{0x0807});
     const selected = try syncSelect(provider.provider(), &selection);

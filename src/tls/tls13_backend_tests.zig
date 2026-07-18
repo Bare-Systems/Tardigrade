@@ -937,7 +937,41 @@ test "record engine pins selected SNI generation across provider reload" {
 
     const chain_one = [_][]const u8{tls_backend.testdata.certificate_der};
     const chain_two = [_][]const u8{ tls_backend.testdata.certificate_der, tls_backend.testdata.certificate_der };
-    try provider.reload(&.{sniIdentityConfig(&.{"pin.example.test"}, chain_one[0..], true)}, .{});
+    var first_deinit = std.atomic.Value(usize).init(0);
+    const BlockingSigner = struct {
+        entered: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        release_sign: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        release_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+
+        fn sign(ctx: *anyopaque, scheme: credentials.SignatureScheme, input: []const u8, out: []u8) credentials.SignError!usize {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (scheme != .ed25519) return error.InvalidCallbackBehavior;
+            self.entered.store(true, .release);
+            while (!self.release_sign.load(.acquire)) {
+                std.atomic.spinLoopHint();
+            }
+            var identity = fixtureIdentity();
+            defer std.crypto.secureZero(u8, std.mem.asBytes(&identity.key));
+            return identity.sign(input, out);
+        }
+
+        fn release(ctx: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            _ = self.release_count.fetchAdd(1, .monotonic);
+        }
+    };
+    var blocking = BlockingSigner{};
+    const blocking_config = sni_provider.CredentialBundleConfig{
+        .chain = chain_one[0..],
+        .patterns = &.{"pin.example.test"},
+        .signer = sni_provider.SignAdapter.fromExternal(&blocking, BlockingSigner.sign, BlockingSigner.release),
+        .key_kind = .ed25519,
+        .supported_schemes = &.{.ed25519},
+        .is_default = true,
+    };
+    const first = try sni_provider.Snapshot.build(std.testing.allocator, &.{blocking_config}, .{}, 1);
+    first.deinit_count = &first_deinit;
+    try provider.install(first);
 
     var verifier = credentials.MockVerifier.init(.accepted);
     var client = tls_backend.Tls13Backend.initClientWithVerifier(
@@ -958,9 +992,54 @@ test "record engine pins selected SNI generation across provider reload" {
     var client_hello_buf: [1024]u8 = undefined;
     const client_hello = firstInitialCrypto(&client_sink, &client_hello_buf);
     try server.backend().start(.server, {}, &server_sink);
-    try server.backend().receive(.initial, client_hello, &server_sink);
+
+    const ServerReceiveThread = struct {
+        server_backend: *tls_backend.Tls13Backend,
+        hello: []const u8,
+        sink: *DirectSink,
+        result: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.server_backend.backend().receive(.initial, self.hello, self.sink) catch |err| {
+                self.result = err;
+            };
+        }
+    };
+    var receive_ctx = ServerReceiveThread{
+        .server_backend = &server,
+        .hello = client_hello,
+        .sink = &server_sink,
+    };
+    var thread = try std.Thread.spawn(.{}, ServerReceiveThread.run, .{&receive_ctx});
+    var thread_joined = false;
+    defer {
+        if (!thread_joined) {
+            blocking.release_sign.store(true, .release);
+            thread.join();
+        }
+    }
+
+    var spins: usize = 0;
+    while (!blocking.entered.load(.acquire) and spins < 1_000_000) : (spins += 1) {
+        std.Thread.yield() catch {};
+    }
+    if (!blocking.entered.load(.acquire)) {
+        blocking.release_sign.store(true, .release);
+        thread.join();
+        thread_joined = true;
+        if (receive_ctx.result) |err| return err;
+        return error.TestTimeout;
+    }
 
     try provider.reload(&.{sniIdentityConfig(&.{"pin.example.test"}, chain_two[0..], true)}, .{});
+    try std.testing.expectEqual(@as(usize, 0), first_deinit.load(.monotonic));
+
+    blocking.release_sign.store(true, .release);
+    thread.join();
+    thread_joined = true;
+    if (receive_ctx.result) |err| return err;
+    try std.testing.expectEqual(@as(usize, 1), first_deinit.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 1), blocking.release_count.load(.monotonic));
 
     var server_hello_buf: [512]u8 = undefined;
     const server_hello = firstInitialCrypto(&server_sink, &server_hello_buf);
@@ -970,6 +1049,11 @@ test "record engine pins selected SNI generation across provider reload" {
     try client.backend().receive(.initial, server_hello, &client_sink);
     try client.backend().receive(.handshake, server_flight, &client_sink);
     try std.testing.expectEqual(@as(usize, 1), verifier.last_chain_len);
+
+    var client_flight_buf: [8192]u8 = undefined;
+    const client_flight = collectHandshakeCrypto(&client_sink, &client_flight_buf);
+    try deliverClientFlightToServer(&server, &server_sink, client_flight, false);
+    try std.testing.expectEqual(tls_core.handshake.HandshakeLifecycle.complete, server.core.handshake_lifecycle);
 
     var later_verifier = credentials.MockVerifier.init(.accepted);
     const h = try SocketHarness.create(.{
@@ -2462,7 +2546,21 @@ test "a malformed async client selection completion is rejected as invalid callb
 
 test "an invalid configured server name is rejected at start rather than emitted" {
     var verifier = credentials.MockVerifier.init(.accepted);
-    for ([_][]const u8{ "", &([_]u8{'a'} ** 257) }) |name| {
+    const too_long = [_]u8{'a'} ** 254;
+    const too_long_label = [_]u8{'b'} ** 64;
+    const invalid_names = [_][]const u8{
+        "",
+        &too_long,
+        "bad..example",
+        "bad host.example",
+        "bad\x00host.example",
+        "-bad.example",
+        "bad-.example",
+        "bad.-example",
+        "bad.example-",
+        &too_long_label,
+    };
+    for (invalid_names) |name| {
         var client = tls_backend.Tls13Backend.initClientWithVerifier(
             clientEntropy(),
             verifier.verifier(),
@@ -2484,8 +2582,8 @@ test "a ClientHello combining maximum ALPN, SNI, and transport extension seriali
     // #334 review: with maximum-length ALPN (255, the largest a u8 length
     // prefix allows), SNI (256, max_server_name_len), and a maximum transport
     // extension (tls_backend.max_transport_extension_len = 512), the encoded
-    // ClientHello is roughly 1.15 KiB. The buffer that serializes it must be
-    // sized for this combination, not just the common case.
+    // ClientHello is roughly 1.15 KiB. This bypasses public client options to
+    // exercise the serializer's raw bounded buffer, not semantic DNS policy.
     const max_alpn = [_]u8{'a'} ** 255;
     const max_sni = [_]u8{'s'} ** 256;
     var max_transport_ext = [_]u8{0xab} ** tls_backend.max_transport_extension_len;

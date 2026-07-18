@@ -347,15 +347,14 @@ pub const Tls13Backend = struct {
 
     fn applyClientOptions(self: *Tls13Backend, options: ClientOptions) void {
         if (options.server_name) |name| {
-            // A name too long for the bounded buffer is a caller error. Record
-            // the overflow and reject at `start` rather than truncating it to a
-            // different host (see `server_name_overflow`).
-            if (name.len == 0 or name.len > self.server_name.len) {
-                self.server_name_overflow = true;
-            } else {
+            // Invalid configured SNI is a caller error. Record it and reject at
+            // `start` rather than emitting malformed or truncated host_name.
+            if (dns_name.validateHostName(name)) |_| {
                 @memcpy(self.server_name[0..name.len], name);
                 self.server_name_len = name.len;
                 self.server_name_present = true;
+            } else |_| {
+                self.server_name_overflow = true;
             }
         }
     }

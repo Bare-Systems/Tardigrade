@@ -49,6 +49,7 @@ mkdir -p "${WORK_DIR}"/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
 cp "$BINARY"                                                  "${WORK_DIR}/SOURCES/tardi"
 cp "${REPO_ROOT}/LICENSE"                                     "${WORK_DIR}/SOURCES/LICENSE"
 cp "${REPO_ROOT}/packaging/systemd/tardigrade.service"        "${WORK_DIR}/SOURCES/tardigrade.service"
+cp "${REPO_ROOT}/packaging/tardigrade.conf"                   "${WORK_DIR}/SOURCES/tardigrade.conf"
 cp "${REPO_ROOT}/packaging/rpm/tardigrade.spec"               "${WORK_DIR}/SPECS/tardigrade.spec"
 
 cat > "${WORK_DIR}/SOURCES/tardigrade.env" <<'ENVEOF'

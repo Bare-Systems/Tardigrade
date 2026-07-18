@@ -263,6 +263,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
             .acme_renew_days_before_expiry = cfg.tls_acme_renew_days_before_expiry,
             .acme_challenge_store = if (state.acme_challenge_store) |*s| s else null,
             .http2_enabled = cfg.http2_enabled,
+            .http1_alpn_fallback_enabled = cfg.tls_http1_no_alpn_fallback,
         });
     }
     defer if (tls_terminator) |*tls| tls.deinit();
@@ -863,25 +864,16 @@ fn startNewConnection(ctx: *WorkerContext, client_fd: std.posix.fd_t) void {
             };
         }
 
-        if (tls_conn.negotiatedProtocol() == .http2 and cfg.http2_enabled) {
-            // HTTP/2 multiplexes many streams over one connection internally and
-            // is not parked (out of scope for #138); the teardown defer closes it.
-            handleHttp2Connection(&tls_conn, session, cfg, ctx.state, connection_ip) catch |err| {
-                ctx.state.logger.err(null, "http2 connection error: {}", .{err});
-            };
-            return;
-        }
-
         var served: u32 = 0;
-        while (true) switch (serveOneRequest(ctx, &tls_conn, session, connection_ip, &served, false)) {
-            .serve_again => {},
-            .park => {
-                transferred = true;
-                parkConnection(ctx, client_fd, session, tls_conn, served, connection_ip);
-                return;
-            },
-            .close => return,
+        const dispatch_result = dispatchNegotiatedHttp(ctx, &tls_conn, session, cfg, connection_ip, &served) catch |err| {
+            ctx.state.logger.err(null, "negotiated HTTP dispatch error: {}", .{err});
+            return;
         };
+        if (dispatch_result == .park) {
+            transferred = true;
+            parkConnection(ctx, client_fd, session, tls_conn, served, connection_ip);
+        }
+        return;
     } else {
         // Plaintext path: apply read and write timeouts immediately (no separate
         // handshake phase).
@@ -934,6 +926,38 @@ fn resumeParkedConnection(ctx: *WorkerContext, pc: *http.keepalive_park.ParkedCo
             },
         };
     }
+}
+
+fn negotiatedProtocolForConn(conn: anytype) !http.tls_termination.NegotiatedProtocol {
+    const T = @TypeOf(conn);
+    if (comptime std.meta.activeTag(@typeInfo(T)) == .pointer) {
+        const Child = std.meta.Child(T);
+        if (comptime @hasDecl(Child, "validatedNegotiatedProtocol")) return conn.validatedNegotiatedProtocol();
+        if (comptime @hasDecl(Child, "negotiatedProtocol")) return conn.negotiatedProtocol();
+    }
+    return error.NoApplicationProtocol;
+}
+
+fn dispatchNegotiatedHttp(
+    ctx: *WorkerContext,
+    conn: anytype,
+    session: *ConnectionSession,
+    cfg: *const edge_config.EdgeConfig,
+    connection_ip: []const u8,
+    served: *u32,
+) !ServeOutcome {
+    const negotiated = try negotiatedProtocolForConn(conn);
+    if (negotiated == .http2) {
+        if (!cfg.http2_enabled) return error.ProtocolDisabled;
+        try handleHttp2Connection(conn, session, cfg, ctx.state, connection_ip);
+        return .close;
+    }
+
+    while (true) switch (serveOneRequest(ctx, conn, session, connection_ip, served, false)) {
+        .serve_again => {},
+        .park => return .park,
+        .close => return .close,
+    };
 }
 
 /// Tear down a connection that was never parked: TLS shutdown, socket close,

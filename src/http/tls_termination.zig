@@ -2,6 +2,7 @@ const std = @import("std");
 const compat = @import("../zig_compat.zig");
 const acme_client = @import("acme_client.zig");
 const encrypted_stream = @import("tls_core").encrypted_stream;
+const negotiated_dispatch = @import("negotiated_dispatch.zig");
 
 const c = @cImport({
     @cInclude("openssl/ssl.h");
@@ -98,6 +99,7 @@ pub const TlsOptions = struct {
     /// Pointer to the HTTP-01 challenge token store shared with the gateway.
     acme_challenge_store: ?*@import("acme_client.zig").ChallengeStore = null,
     http2_enabled: bool = true,
+    http1_alpn_fallback_enabled: bool = false,
 };
 
 pub const NegotiatedProtocol = enum {
@@ -146,7 +148,7 @@ const State = struct {
     acme_next_check_ms: u64 = 0,
     static_sni_specs: []SniCertSpec,
     sni_certs: std.ArrayList(ManagedSniCert),
-    http2_enabled: bool,
+    protocol_policy: negotiated_dispatch.ListenerProtocolPolicy,
 
     fn deinit(self: *State) void {
         if (self.ocsp_response) |resp| self.allocator.free(resp);
@@ -205,7 +207,11 @@ pub const TlsTerminator = struct {
             .acme_challenge_store = opts.acme_challenge_store,
             .static_sni_specs = owned_sni_specs,
             .sni_certs = .empty,
-            .http2_enabled = opts.http2_enabled,
+            .protocol_policy = .{
+                .http1_enabled = true,
+                .http2_enabled = opts.http2_enabled,
+                .allow_http1_without_alpn = opts.http1_alpn_fallback_enabled,
+            },
         };
         errdefer st.deinit();
 
@@ -306,7 +312,14 @@ pub const TlsTerminator = struct {
         _ = rebuildSniCertificates(self.state) catch {}; // SNI cert rebuild is best-effort; existing certificate mappings remain active
     }
 
+    pub fn protocolPolicySnapshot(self: *TlsTerminator) negotiated_dispatch.ListenerProtocolPolicy {
+        self.state.mutex.lock();
+        defer self.state.mutex.unlock();
+        return self.state.protocol_policy;
+    }
+
     pub fn accept(self: *TlsTerminator, fd: std.posix.fd_t) TlsError!TlsConnection {
+        const policy = self.protocolPolicySnapshot();
         const ssl = c.SSL_new(self.ctx) orelse return error.ContextInitFailed;
         errdefer c.SSL_free(ssl);
         _ = c.SSL_ctrl(ssl, c.SSL_CTRL_MODE, openssl_stream_mode, null);
@@ -325,7 +338,7 @@ pub const TlsTerminator = struct {
         }
 
         if (c.SSL_accept(ssl) != 1) return error.HandshakeFailed;
-        return .{ .ssl = ssl };
+        return .{ .ssl = ssl, .protocol_policy = policy };
     }
 };
 
@@ -341,6 +354,7 @@ pub const TlsConnection = struct {
     stream_peak_total: usize = 0,
     stream_pause_state: encrypted_stream.PauseState = .{},
     stream_buffer_counters: encrypted_stream.BufferCounters = .{},
+    protocol_policy: negotiated_dispatch.ListenerProtocolPolicy = .{},
 
     pub fn deinit(self: *TlsConnection) void {
         if (opensslShouldShutdownOnDeinit(self)) {
@@ -407,12 +421,20 @@ pub const TlsConnection = struct {
         return .{ .ptr = self, .vtable = &openssl_stream_vtable };
     }
 
-    pub fn negotiatedProtocol(self: *const TlsConnection) NegotiatedProtocol {
+    pub fn negotiatedAlpn(self: *const TlsConnection) ?[]const u8 {
         var data: [*c]const u8 = null;
         var len: c_uint = 0;
         c.SSL_get0_alpn_selected(self.ssl, &data, &len);
-        if (data != null and len == 2 and std.mem.eql(u8, data[0..2], "h2")) return .http2;
-        return .http1_1;
+        if (data == null or len == 0) return null;
+        return data[0..@intCast(len)];
+    }
+
+    pub fn negotiatedProtocol(self: *const TlsConnection) NegotiatedProtocol {
+        return negotiated_dispatch.selectNegotiatedProtocol(self.negotiatedAlpn(), self.protocol_policy) catch .http1_1;
+    }
+
+    pub fn validatedNegotiatedProtocol(self: *const TlsConnection) negotiated_dispatch.Error!NegotiatedProtocol {
+        return negotiated_dispatch.selectNegotiatedProtocol(self.negotiatedAlpn(), self.protocol_policy);
     }
 
     fn writeFn(self: *TlsConnection, data: []const u8) TlsError!usize {
@@ -998,11 +1020,12 @@ fn alpnSelectCallback(
 ) callconv(.c) c_int {
     _ = _ssl;
     const state: *State = @ptrCast(@alignCast(arg orelse return c.SSL_TLSEXT_ERR_NOACK));
-    const h2_and_http11 = "\x02h2\x08http/1.1";
-    const http11_only = "\x08http/1.1";
-    const server_protos = if (state.http2_enabled) h2_and_http11 else http11_only;
+    state.mutex.lock();
+    const server_protos = state.protocol_policy.encodedAdvertisedAlpns();
+    state.mutex.unlock();
+    if (server_protos.len == 0) return c.SSL_TLSEXT_ERR_ALERT_FATAL;
     const rc = c.SSL_select_next_proto(out, outlen, server_protos.ptr, @intCast(server_protos.len), in, inlen);
-    return if (rc == openssl_npn_negotiated) c.SSL_TLSEXT_ERR_OK else c.SSL_TLSEXT_ERR_NOACK;
+    return if (rc == openssl_npn_negotiated) c.SSL_TLSEXT_ERR_OK else c.SSL_TLSEXT_ERR_ALERT_FATAL;
 }
 
 fn fileMtime(path: []const u8) !i128 {

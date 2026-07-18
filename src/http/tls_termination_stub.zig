@@ -15,6 +15,7 @@
 
 const std = @import("std");
 const encrypted_stream = @import("tls_core").encrypted_stream;
+const negotiated_dispatch = @import("negotiated_dispatch.zig");
 
 pub const TlsError = error{
     OutOfMemory,
@@ -72,6 +73,7 @@ pub const TlsOptions = struct {
     acme_renew_days_before_expiry: u32 = 30,
     acme_challenge_store: ?*@import("acme_challenge_store.zig").ChallengeStore = null,
     http2_enabled: bool = true,
+    http1_alpn_fallback_enabled: bool = false,
 };
 
 pub const NegotiatedProtocol = enum {
@@ -99,6 +101,11 @@ pub const TlsTerminator = struct {
     pub fn runMaintenance(self: *TlsTerminator, now_ms: u64) void {
         _ = self;
         _ = now_ms;
+    }
+
+    pub fn protocolPolicySnapshot(self: *TlsTerminator) negotiated_dispatch.ListenerProtocolPolicy {
+        _ = self;
+        return .{};
     }
 
     pub fn accept(self: *TlsTerminator, fd: std.posix.fd_t) TlsError!TlsConnection {

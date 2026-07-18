@@ -831,9 +831,10 @@ fn writeConfigSummary(writer: anytype, resolved_config_path: ?[]const u8, cfg: *
         cfg.upstream_response_timeout_ms,
         cfg.upstream_timeout_budget_ms,
     });
-    try writer.print("protocols: http2={s} http3={s}\n", .{
+    try writer.print("protocols: http2={s} http3={s} tls_http1_no_alpn_fallback={s}\n", .{
         if (cfg.http2_enabled) "on" else "off",
         if (cfg.http3_enabled) "on" else "off",
+        if (cfg.tls_http1_no_alpn_fallback) "on" else "off",
     });
     try writer.print("rate limit rps: {d}\n", .{@as(i64, @intFromFloat(cfg.rate_limit_rps))});
 }

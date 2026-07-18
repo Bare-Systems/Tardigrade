@@ -47,6 +47,8 @@ pub const worker_pool = @import("http/worker_pool.zig");
 pub const buffer_pool = @import("http/buffer_pool.zig");
 pub const proxy_buffer_account = @import("http/proxy_buffer_account.zig");
 pub const keepalive_park = @import("http/keepalive_park.zig");
+pub const encrypted_stream_connection = @import("http/encrypted_stream_connection.zig");
+pub const negotiated_dispatch = @import("http/negotiated_dispatch.zig");
 pub const upstream_pool = @import("http/upstream_pool.zig");
 /// TLS termination backend selected by `-Dtls-profile` (#379): the OpenSSL
 /// adapter in the general profile, a no-OpenSSL stub in the Bare Systems

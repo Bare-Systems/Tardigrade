@@ -198,6 +198,7 @@ pub const EdgeConfig = struct {
     /// Days before certificate expiry at which renewal is triggered.
     tls_acme_renew_days_before_expiry: u32,
     http2_enabled: bool,
+    tls_http1_no_alpn_fallback: bool,
     /// Preferred application protocol for HTTPS upstream connections (#145).
     upstream_protocol: UpstreamProtocol,
     /// Verify TLS certificates presented by HTTPS upstream backends (default: true).
@@ -784,6 +785,7 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     const upstream_tls_client_key = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_TLS_CLIENT_KEY", "") catch unreachable;
     errdefer allocator.free(upstream_tls_client_key);
     const http2_enabled = parseBoolEnv(allocator, "TARDIGRADE_HTTP2_ENABLED", true);
+    const tls_http1_no_alpn_fallback = parseBoolEnv(allocator, "TARDIGRADE_TLS_HTTP1_NO_ALPN_FALLBACK", false);
     const http3_enabled = parseBoolEnv(allocator, "TARDIGRADE_HTTP3_ENABLED", false);
     const quic_port_str = envOrDefault(allocator, "TARDIGRADE_QUIC_PORT", "443") catch unreachable;
     defer allocator.free(quic_port_str);
@@ -1432,6 +1434,7 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .tls_acme_account_key_path = tls_acme_account_key_path,
         .tls_acme_renew_days_before_expiry = tls_acme_renew_days_before_expiry,
         .http2_enabled = http2_enabled,
+        .tls_http1_no_alpn_fallback = tls_http1_no_alpn_fallback,
         .upstream_protocol = upstream_protocol,
         .upstream_tls_verify = upstream_tls_verify,
         .upstream_tls_ca_bundle = upstream_tls_ca_bundle,

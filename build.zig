@@ -17,6 +17,7 @@ pub fn build(b: *std.Build) void {
     const require_static_system_libs = b.option(bool, "require-static-system-libs", "Require static linking for system libraries") orelse false;
     const static_executable = b.option(bool, "static-executable", "Build the tardi executable as a static binary") orelse false;
     const app_version = b.option([]const u8, "version", "Version string embedded in the tardi binary") orelse "dev";
+    const go_bin = b.option([]const u8, "go-bin", "Go command used to build the PKI crypto/x509 oracle") orelse "go";
     const tls_profile = b.option(
         TlsProfile,
         "tls-profile",
@@ -456,6 +457,28 @@ pub fn build(b: *std.Build) void {
     // OpenSSL and Go crypto/x509 are invoked as independent processes. These
     // targets stay opt-in because the external validators are test tools, not
     // production dependencies.
+    const pki_process_helper_mod = b.createModule(.{
+        .root_source_file = b.path("tests/pki_process_helper.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    const pki_process_helper = b.addExecutable(.{
+        .name = "pki_process_helper",
+        .root_module = pki_process_helper_mod,
+    });
+    const pki_process_helper_install = b.addInstallArtifact(pki_process_helper, .{});
+    const pki_go_validator_build = b.addSystemCommand(&.{ go_bin, "build", "-trimpath", "-o" });
+    const pki_go_validator_output = pki_go_validator_build.addOutputFileArg("pki_go_validator");
+    pki_go_validator_build.addFileArg(b.path("tests/pki_go_validator.go"));
+    const pki_go_validator_install = b.addInstallBinFile(pki_go_validator_output, "pki_go_validator");
+    const pki_diff_options = b.addOptions();
+    pki_diff_options.addOption([]const u8, "process_helper_path", b.getInstallPath(.bin, "pki_process_helper"));
+    pki_diff_options.addOption([]const u8, "go_validator_path", b.getInstallPath(.bin, "pki_go_validator"));
+    pki_diff_options.addOption([]const u8, "go_bin", go_bin);
+    pki_diff_options.addOption(u32, "stable_validator_deadline_ms", 10_000);
+    pki_diff_options.addOption(u32, "extended_validator_deadline_ms", 30_000);
+
     const pki_differential_mod = b.createModule(.{
         .root_source_file = b.path("tests/pki_differential.zig"),
         .target = target,
@@ -464,6 +487,7 @@ pub fn build(b: *std.Build) void {
     pki_differential_mod.addImport("crypto", crypto_mod);
     pki_differential_mod.addImport("pki", pki_mod);
     pki_differential_mod.addImport("zig_compat", compat_mod);
+    pki_differential_mod.addImport("pki_diff_options", pki_diff_options.createModule());
     pki_differential_mod.addAnonymousImport("pki_root_crt", .{
         .root_source_file = b.path("tests/vectors/pki/root.crt"),
     });
@@ -482,6 +506,7 @@ pub fn build(b: *std.Build) void {
         .filters = &.{"pki differential core corpus"},
     });
     const run_pki_differential_core_tests = b.addRunArtifact(pki_differential_core_tests);
+    run_pki_differential_core_tests.step.dependOn(&pki_go_validator_install.step);
     const pki_differential_step = b.step("test-pki-differential", "Run stable PKI differential corpus against OpenSSL and Go");
     pki_differential_step.dependOn(&run_pki_differential_core_tests.step);
 
@@ -490,6 +515,7 @@ pub fn build(b: *std.Build) void {
         .filters = &.{"pki differential full corpus"},
     });
     const run_pki_differential_full_tests = b.addRunArtifact(pki_differential_full_tests);
+    run_pki_differential_full_tests.step.dependOn(&pki_go_validator_install.step);
     const pki_differential_extended_step = b.step("test-pki-differential-extended", "Run full PKI differential corpus against OpenSSL and Go");
     pki_differential_extended_step.dependOn(&run_pki_differential_full_tests.step);
 
@@ -501,6 +527,7 @@ pub fn build(b: *std.Build) void {
         .filters = &.{"pki reduce"},
     });
     const run_pki_reduce_tests = b.addRunArtifact(pki_reduce_tests);
+    run_pki_reduce_tests.step.dependOn(&pki_process_helper_install.step);
     const pki_reduce_step = b.step("test-pki-reduce", "Run offline PKI mismatch-minimization tests");
     pki_reduce_step.dependOn(&run_pki_reduce_tests.step);
     test_step.dependOn(&run_pki_reduce_tests.step);

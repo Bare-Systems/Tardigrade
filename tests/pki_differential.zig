@@ -19,11 +19,15 @@ const crypto = @import("crypto");
 const pki = @import("pki");
 const manifest = @import("pki_differential_manifest.zig");
 const reduce_mod = @import("pki_reduce.zig");
+const bounded_process = @import("bounded_process.zig");
+const pki_diff_options = @import("pki_diff_options");
 
 const testing = std.testing;
 const validation_time: i64 = 1_784_332_800; // 2026-07-18T00:00:00Z
 const validation_time_argument = std.fmt.comptimePrint("{d}", .{validation_time});
 const max_oracle_output = 64 * 1024;
+const oracle_deadline_ms: u32 = pki_diff_options.stable_validator_deadline_ms;
+const extended_oracle_deadline_ms: u32 = pki_diff_options.extended_validator_deadline_ms;
 const max_fixture_size = 1024 * 1024;
 const default_artifact_dir = "zig-out/pki-differential-artifacts";
 const max_total_reduction_oracle_calls = 512;
@@ -102,6 +106,13 @@ fn observation(
     return .{
         .status = status,
         .diagnostic = try std.fmt.allocPrint(allocator, format, args),
+    };
+}
+
+fn processFailureObservation(allocator: std.mem.Allocator, result: bounded_process.Result) !Observation {
+    return .{
+        .status = .tool_failure,
+        .diagnostic = try allocator.dupe(u8, result.diagnostic[0..@min(result.diagnostic.len, 2048)]),
     };
 }
 
@@ -229,24 +240,22 @@ fn externalDiagnostic(allocator: std.mem.Allocator, stdout: []const u8, stderr: 
 }
 
 fn commandSummary(allocator: std.mem.Allocator, argv: []const []const u8) ![]u8 {
-    const result = std.process.run(allocator, compat.io(), .{
+    var result = try bounded_process.run(allocator, .{
         .argv = argv,
-        .stdout_limit = .limited(2048),
-        .stderr_limit = .limited(2048),
-    }) catch |err| return std.fmt.allocPrint(allocator, "unavailable: {s}", .{@errorName(err)});
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
+        .stdout_limit = 2048,
+        .stderr_limit = 2048,
+        .deadline_ms = oracle_deadline_ms,
+    });
+    defer result.deinit(allocator);
 
-    return switch (result.term) {
-        .exited => |code| if (code == 0)
-            externalDiagnostic(allocator, result.stdout, result.stderr)
-        else
-            std.fmt.allocPrint(
-                allocator,
-                "exited {d}: {s}",
-                .{ code, std.mem.trim(u8, if (result.stderr.len != 0) result.stderr else result.stdout, " \t\r\n") },
-            ),
-        else => allocator.dupe(u8, "terminated before producing a version string"),
+    return switch (result.outcome) {
+        .normal_exit => externalDiagnostic(allocator, result.stdout, result.stderr),
+        .unexpected_exit_code => |code| std.fmt.allocPrint(
+            allocator,
+            "exited {d}: {s}",
+            .{ code, std.mem.trim(u8, if (result.stderr.len != 0) result.stderr else result.stdout, " \t\r\n") },
+        ),
+        else => allocator.dupe(u8, result.diagnostic),
     };
 }
 
@@ -261,10 +270,11 @@ fn loadRuntimeIdentity(allocator: std.mem.Allocator) !RuntimeIdentity {
     const openssl_version = try commandSummary(allocator, &.{ openssl, "version" });
     errdefer allocator.free(openssl_version);
 
-    const go_binary = compat.getEnvVarOwned(allocator, "GO_BIN") catch
-        try allocator.dupe(u8, "go");
-    defer allocator.free(go_binary);
-    const go_version = try commandSummary(allocator, &.{ go_binary, "version" });
+    const go_version = try commandSummary(allocator, &.{
+        pki_diff_options.go_bin,
+        "version",
+        pki_diff_options.go_validator_path,
+    });
     errdefer allocator.free(go_version);
 
     return .{
@@ -275,7 +285,7 @@ fn loadRuntimeIdentity(allocator: std.mem.Allocator) !RuntimeIdentity {
     };
 }
 
-fn opensslDecision(allocator: std.mem.Allocator, case: manifest.Case) !Observation {
+fn opensslDecision(allocator: std.mem.Allocator, case: manifest.Case, deadline_ms: u32) !Observation {
     const openssl = compat.getEnvVarOwned(allocator, "OPENSSL_BIN") catch
         try allocator.dupe(u8, "openssl");
     defer allocator.free(openssl);
@@ -296,16 +306,17 @@ fn opensslDecision(allocator: std.mem.Allocator, case: manifest.Case) !Observati
     if (case.dns_name) |dns_name| try argv.appendSlice(allocator, &.{ "-verify_hostname", dns_name });
     try argv.append(allocator, case.leaf_file);
 
-    const result = std.process.run(allocator, compat.io(), .{
+    var result = try bounded_process.run(allocator, .{
         .argv = argv.items,
-        .stdout_limit = .limited(max_oracle_output),
-        .stderr_limit = .limited(max_oracle_output),
-    }) catch |err| return observation(allocator, .tool_failure, "spawn failed: {s}", .{@errorName(err)});
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
+        .stdout_limit = max_oracle_output,
+        .stderr_limit = max_oracle_output,
+        .deadline_ms = deadline_ms,
+        .accepted_exit_codes = &.{ 0, 2 },
+    });
+    defer result.deinit(allocator);
 
-    const status: Status = switch (result.term) {
-        .exited => |code| switch (code) {
+    const status: Status = switch (result.outcome) {
+        .normal_exit => |code| switch (code) {
             0 => .accept,
             // `openssl verify` reserves 2 for a completed verification that
             // rejected the candidate. Usage, file, and setup failures use a
@@ -313,7 +324,7 @@ fn opensslDecision(allocator: std.mem.Allocator, case: manifest.Case) !Observati
             2 => .reject,
             else => .tool_failure,
         },
-        else => .tool_failure,
+        else => return processFailureObservation(allocator, result),
     };
     return .{
         .status = status,
@@ -327,17 +338,11 @@ const GoDecision = struct {
     diagnostic: []const u8,
 };
 
-fn goDecision(allocator: std.mem.Allocator, case: manifest.Case) !Observation {
-    const go_binary = compat.getEnvVarOwned(allocator, "GO_BIN") catch
-        try allocator.dupe(u8, "go");
-    defer allocator.free(go_binary);
-
+fn goDecision(allocator: std.mem.Allocator, case: manifest.Case, deadline_ms: u32) !Observation {
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(allocator);
     try argv.appendSlice(allocator, &.{
-        go_binary,
-        "run",
-        "tests/pki_go_validator.go",
+        pki_diff_options.go_validator_path,
         "--root",
         case.root_file,
     });
@@ -350,30 +355,32 @@ fn goDecision(allocator: std.mem.Allocator, case: manifest.Case) !Observation {
     });
     if (case.dns_name) |dns_name| try argv.appendSlice(allocator, &.{ "--dns-name", dns_name });
 
-    const result = std.process.run(allocator, compat.io(), .{
+    var result = try bounded_process.run(allocator, .{
         .argv = argv.items,
-        .stdout_limit = .limited(max_oracle_output),
-        .stderr_limit = .limited(max_oracle_output),
-    }) catch |err| return observation(allocator, .tool_failure, "spawn failed: {s}", .{@errorName(err)});
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
+        .stdout_limit = max_oracle_output,
+        .stderr_limit = max_oracle_output,
+        .deadline_ms = deadline_ms,
+    });
+    defer result.deinit(allocator);
 
-    switch (result.term) {
-        .exited => |code| if (code != 0) {
-            return .{
-                .status = .tool_failure,
-                .diagnostic = try externalDiagnostic(allocator, result.stdout, result.stderr),
-            };
-        },
-        else => return .{
-            .status = .tool_failure,
-            .diagnostic = try externalDiagnostic(allocator, result.stdout, result.stderr),
-        },
+    switch (result.outcome) {
+        .normal_exit => {},
+        else => return processFailureObservation(allocator, result),
     }
 
     var parsed = std.json.parseFromSlice(GoDecision, allocator, result.stdout, .{
         .ignore_unknown_fields = false,
-    }) catch |err| return observation(allocator, .tool_failure, "invalid Go oracle JSON: {s}", .{@errorName(err)});
+    }) catch |err| {
+        var malformed = try bounded_process.Result.malformedValidatorOutput(
+            allocator,
+            result.stdout,
+            result.stderr,
+            "malformed Go oracle JSON: {s}",
+            .{@errorName(err)},
+        );
+        defer malformed.deinit(allocator);
+        return processFailureObservation(allocator, malformed);
+    };
     defer parsed.deinit();
     if (!std.mem.eql(u8, parsed.value.validator, "go-crypto-x509")) {
         return observation(allocator, .tool_failure, "unexpected Go oracle identity: {s}", .{parsed.value.validator});
@@ -1045,6 +1052,7 @@ fn verifyReducedCase(
     dir: compat.DirCompat,
     case: manifest.Case,
     paths: *const ReducedPaths,
+    deadline_ms: u32,
 ) !struct { Observation, Observation, Observation } {
     _ = dir;
     var reduced_case = case;
@@ -1053,9 +1061,9 @@ fn verifyReducedCase(
     reduced_case.leaf_file = paths.leaf_file;
     var tardigrade = try tardigradeDecision(allocator, reduced_case);
     errdefer tardigrade.deinit(allocator);
-    var openssl = try opensslDecision(allocator, reduced_case);
+    var openssl = try opensslDecision(allocator, reduced_case, deadline_ms);
     errdefer openssl.deinit(allocator);
-    const go = try goDecision(allocator, reduced_case);
+    const go = try goDecision(allocator, reduced_case, deadline_ms);
     return .{ tardigrade, openssl, go };
 }
 
@@ -1074,18 +1082,20 @@ fn verifyAndPersistReduced(
     case: manifest.Case,
     r: *Reduction,
     original_statuses: [3]Status,
+    deadline_ms: u32,
 ) !ReducedVerification {
-    return verifyAndPersistReducedWithVerifier(verifyReducedCase, allocator, dir, artifact_dir, case, r, original_statuses);
+    return verifyAndPersistReducedWithVerifier(verifyReducedCase, allocator, dir, artifact_dir, case, r, original_statuses, deadline_ms);
 }
 
 fn verifyAndPersistReducedWithVerifier(
-    comptime verifier: fn (std.mem.Allocator, compat.DirCompat, manifest.Case, *const ReducedPaths) anyerror!struct { Observation, Observation, Observation },
+    comptime verifier: fn (std.mem.Allocator, compat.DirCompat, manifest.Case, *const ReducedPaths, u32) anyerror!struct { Observation, Observation, Observation },
     allocator: std.mem.Allocator,
     dir: compat.DirCompat,
     artifact_dir: []const u8,
     case: manifest.Case,
     r: *Reduction,
     original_statuses: [3]Status,
+    deadline_ms: u32,
 ) !ReducedVerification {
     var best_index: ?usize = null;
     var best_tardigrade: ?Observation = null;
@@ -1113,7 +1123,7 @@ fn verifyAndPersistReducedWithVerifier(
             deleteProbeFiles(dir, &paths) catch {};
             paths.deinit(allocator);
         };
-        var tardigrade, var openssl, var go = try verifier(allocator, dir, case, &paths);
+        var tardigrade, var openssl, var go = try verifier(allocator, dir, case, &paths, deadline_ms);
         var owns_observations = true;
         errdefer if (owns_observations) {
             tardigrade.deinit(allocator);
@@ -1212,7 +1222,7 @@ fn verifyAndPersistReducedWithVerifier(
     var probe_paths = try persistReducedCase(allocator, dir, artifact_dir, case, r, "fallback-original");
     defer probe_paths.deinit(allocator);
     defer deleteProbeFiles(dir, &probe_paths) catch {};
-    var reverted_tardigrade, var reverted_openssl, var reverted_go = try verifier(allocator, dir, case, &probe_paths);
+    var reverted_tardigrade, var reverted_openssl, var reverted_go = try verifier(allocator, dir, case, &probe_paths, deadline_ms);
     errdefer reverted_tardigrade.deinit(allocator);
     errdefer reverted_openssl.deinit(allocator);
     errdefer reverted_go.deinit(allocator);
@@ -1356,12 +1366,12 @@ fn writeArtifact(
     return path;
 }
 
-fn runCase(allocator: std.mem.Allocator, runtime_identity: RuntimeIdentity, case: manifest.Case) !void {
+fn runCase(allocator: std.mem.Allocator, runtime_identity: RuntimeIdentity, case: manifest.Case, deadline_ms: u32) !void {
     var tardigrade = try tardigradeDecision(allocator, case);
     defer tardigrade.deinit(allocator);
-    var openssl = try opensslDecision(allocator, case);
+    var openssl = try opensslDecision(allocator, case, deadline_ms);
     defer openssl.deinit(allocator);
-    var go = try goDecision(allocator, case);
+    var go = try goDecision(allocator, case, deadline_ms);
     defer go.deinit(allocator);
 
     const matches = tardigrade.status == expectedStatus(case.expected.tardigrade) and
@@ -1381,7 +1391,7 @@ fn runCase(allocator: std.mem.Allocator, runtime_identity: RuntimeIdentity, case
             tardigrade.status,
             openssl.status,
             go.status,
-        }) catch |err| blk: {
+        }, deadline_ms) catch |err| blk: {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             std.debug.print(
                 "failed to persist reduced inputs for {s}: {s}\n",
@@ -1491,7 +1501,8 @@ fn runCorpus(include_extended: bool) !void {
             if (!std.mem.eql(u8, id, case.id)) continue;
         }
         errdefer std.debug.print("failed PKI differential case: {s}\n", .{case.id});
-        try runCase(testing.allocator, runtime_identity, case);
+        const deadline_ms = if (case.profile == .extended) extended_oracle_deadline_ms else oracle_deadline_ms;
+        try runCase(testing.allocator, runtime_identity, case, deadline_ms);
         executed += 1;
     }
     try testing.expect(executed > 0);
@@ -1499,6 +1510,315 @@ fn runCorpus(include_extended: bool) !void {
 
 test "pki differential manifest is bounded and fully normalized" {
     try validateManifest();
+}
+
+fn expectNormalExit(result: bounded_process.Result, expected_code: u8) !void {
+    switch (result.outcome) {
+        .normal_exit => |code| try testing.expectEqual(expected_code, code),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+fn expectOutcomeTag(result: bounded_process.Result, expected: std.meta.Tag(bounded_process.Outcome)) !void {
+    try testing.expectEqual(expected, std.meta.activeTag(result.outcome));
+}
+
+fn parseHelperPid(stdout: []const u8) !std.posix.pid_t {
+    return parsePidField(stdout, "pid");
+}
+
+fn parsePidField(stdout: []const u8, field: []const u8) !std.posix.pid_t {
+    var lines = std.mem.splitScalar(u8, stdout, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (trimmed.len <= field.len + 1) continue;
+        if (!std.mem.startsWith(u8, trimmed, field)) continue;
+        if (trimmed[field.len] != '=') continue;
+        return std.fmt.parseInt(std.posix.pid_t, trimmed[field.len + 1 ..], 10);
+    }
+    return error.InvalidPidLine;
+}
+
+fn expectNoProcess(allocator: std.mem.Allocator, pid: std.posix.pid_t) !void {
+    const pid_text = try std.fmt.allocPrint(allocator, "{d}", .{pid});
+    defer allocator.free(pid_text);
+    var result = try bounded_process.run(allocator, .{
+        .argv = &.{ "ps", "-p", pid_text },
+        .stdout_limit = 4096,
+        .stderr_limit = 4096,
+        .deadline_ms = 1000,
+        .accepted_exit_codes = &.{1},
+    });
+    defer result.deinit(allocator);
+    try expectNormalExit(result, 1);
+}
+
+const ProcessTempDir = struct {
+    rel_path: []u8,
+    abs_path: []u8,
+
+    fn init(allocator: std.mem.Allocator, label: []const u8) !ProcessTempDir {
+        const rel_path = try std.fmt.allocPrint(
+            allocator,
+            ".zig-cache/pki-process-{s}-{d}",
+            .{ label, compat.nanoTimestamp() },
+        );
+        errdefer allocator.free(rel_path);
+        try compat.cwd().makePath(rel_path);
+        errdefer compat.cwd().deleteTree(rel_path) catch {};
+        const abs_path = try compat.cwd().realpathAlloc(allocator, rel_path);
+        errdefer allocator.free(abs_path);
+        return .{ .rel_path = rel_path, .abs_path = abs_path };
+    }
+
+    fn deinit(self: *ProcessTempDir, allocator: std.mem.Allocator) void {
+        compat.cwd().deleteTree(self.rel_path) catch {};
+        allocator.free(self.rel_path);
+        allocator.free(self.abs_path);
+        self.* = undefined;
+    }
+};
+
+fn expectDirEmptyPath(path: []const u8) !void {
+    var dir = try compat.cwd().openDir(path, .{ .iterate = true });
+    defer dir.close();
+    var it = dir.iterate();
+    while (try it.next(compat.io())) |entry| {
+        std.debug.print("unexpected temp entry left by bounded process runner: {s}\n", .{entry.name});
+        return error.TestUnexpectedResult;
+    }
+}
+
+fn readRecordedPid(allocator: std.mem.Allocator, tmp_path: []const u8, file_name: []const u8) !?std.posix.pid_t {
+    const path = try std.fs.path.join(allocator, &.{ tmp_path, file_name });
+    defer allocator.free(path);
+    const raw = compat.cwd().readFileAlloc(allocator, path, 128) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer allocator.free(raw);
+    return try std.fmt.parseInt(std.posix.pid_t, std.mem.trim(u8, raw, " \t\r\n"), 10);
+}
+
+fn deleteRecordedPidFiles(tmp_path: []const u8) void {
+    var dir = compat.cwd().openDir(tmp_path, .{}) catch return;
+    defer dir.close();
+    dir.deleteFile("parent.pid") catch {};
+    dir.deleteFile("grandchild.pid") catch {};
+}
+
+fn expectRecordedProcessesGone(allocator: std.mem.Allocator, tmp_path: []const u8) !void {
+    const parent_pid = try readRecordedPid(allocator, tmp_path, "parent.pid");
+    const grandchild_pid = try readRecordedPid(allocator, tmp_path, "grandchild.pid");
+    if (parent_pid) |pid| try expectNoProcess(allocator, pid);
+    if (grandchild_pid) |pid| try expectNoProcess(allocator, pid);
+}
+
+test "pki reduce: bounded process captures successful output" {
+    var result = try bounded_process.run(testing.allocator, .{
+        .argv = &.{ pki_diff_options.process_helper_path, "success" },
+        .stdout_limit = 64,
+        .stderr_limit = 64,
+        .deadline_ms = 1000,
+    });
+    defer result.deinit(testing.allocator);
+    try expectNormalExit(result, 0);
+    try testing.expectEqualStrings("ok\n", result.stdout);
+    try testing.expectEqualStrings("", result.stderr);
+}
+
+test "pki reduce: bounded process treats configured nonzero rejection as normal exit" {
+    var result = try bounded_process.run(testing.allocator, .{
+        .argv = &.{ pki_diff_options.process_helper_path, "exit", "2" },
+        .stdout_limit = 64,
+        .stderr_limit = 64,
+        .deadline_ms = 1000,
+        .accepted_exit_codes = &.{ 0, 2 },
+    });
+    defer result.deinit(testing.allocator);
+    try expectNormalExit(result, 2);
+}
+
+test "pki reduce: bounded process reports launch failure" {
+    var result = try bounded_process.run(testing.allocator, .{
+        .argv = &.{"definitely-not-a-tardigrade-test-helper"},
+        .stdout_limit = 64,
+        .stderr_limit = 64,
+        .deadline_ms = 1000,
+    });
+    defer result.deinit(testing.allocator);
+    try expectOutcomeTag(result, .launch_failure);
+}
+
+test "pki reduce: bounded process timeout kills and reaps child" {
+    var tmp = try ProcessTempDir.init(testing.allocator, "timeout");
+    defer tmp.deinit(testing.allocator);
+    var result = try bounded_process.run(testing.allocator, .{
+        .argv = &.{ pki_diff_options.process_helper_path, "hang" },
+        .stdout_limit = 64,
+        .stderr_limit = 64,
+        .deadline_ms = 100,
+        .cwd = .{ .path = tmp.abs_path },
+    });
+    defer result.deinit(testing.allocator);
+    try expectOutcomeTag(result, .timeout);
+    const pid = try parseHelperPid(result.stdout);
+    try expectNoProcess(testing.allocator, pid);
+    try expectDirEmptyPath(tmp.rel_path);
+}
+
+test "pki reduce: bounded process deadline covers wait after pipe EOF" {
+    var result = try bounded_process.run(testing.allocator, .{
+        .argv = &.{ pki_diff_options.process_helper_path, "close-stdio-hang" },
+        .stdout_limit = 64,
+        .stderr_limit = 64,
+        .deadline_ms = 100,
+    });
+    defer result.deinit(testing.allocator);
+    try expectOutcomeTag(result, .timeout);
+    try expectNoProcess(testing.allocator, try parseHelperPid(result.stdout));
+}
+
+test "pki reduce: bounded process timeout terminates process group" {
+    var tmp = try ProcessTempDir.init(testing.allocator, "process-group");
+    defer tmp.deinit(testing.allocator);
+    var result = try bounded_process.run(testing.allocator, .{
+        .argv = &.{ pki_diff_options.process_helper_path, "spawn-grandchild-and-hang", tmp.abs_path },
+        .stdout_limit = 256,
+        .stderr_limit = 256,
+        .deadline_ms = 100,
+    });
+    defer result.deinit(testing.allocator);
+    try expectOutcomeTag(result, .timeout);
+    try expectNoProcess(testing.allocator, try parsePidField(result.stdout, "pid"));
+    try expectNoProcess(testing.allocator, try parsePidField(result.stdout, "grandchild_pid"));
+    try expectDirEmptyPath(tmp.rel_path);
+}
+
+test "pki reduce: bounded process reports abnormal signal termination" {
+    var result = try bounded_process.run(testing.allocator, .{
+        .argv = &.{ pki_diff_options.process_helper_path, "abort" },
+        .stdout_limit = 64,
+        .stderr_limit = 1024,
+        .deadline_ms = 1000,
+    });
+    defer result.deinit(testing.allocator);
+    try expectOutcomeTag(result, .signal);
+}
+
+test "pki reduce: bounded process kills stdout overflow and keeps bounded output" {
+    var result = try bounded_process.run(testing.allocator, .{
+        .argv = &.{ pki_diff_options.process_helper_path, "stdout", "128" },
+        .stdout_limit = 32,
+        .stderr_limit = 64,
+        .deadline_ms = 1000,
+    });
+    defer result.deinit(testing.allocator);
+    try expectOutcomeTag(result, .stdout_limit_exceeded);
+    try testing.expect(result.stdout.len <= 32);
+}
+
+test "pki reduce: bounded process kills stderr overflow and keeps bounded output" {
+    var result = try bounded_process.run(testing.allocator, .{
+        .argv = &.{ pki_diff_options.process_helper_path, "stderr", "128" },
+        .stdout_limit = 64,
+        .stderr_limit = 32,
+        .deadline_ms = 1000,
+    });
+    defer result.deinit(testing.allocator);
+    try expectOutcomeTag(result, .stderr_limit_exceeded);
+    try testing.expect(result.stderr.len <= 32);
+}
+
+fn expectFailureModeLeavesTmpEmpty(argv: []const []const u8, expected: std.meta.Tag(bounded_process.Outcome)) !void {
+    var tmp = try ProcessTempDir.init(testing.allocator, @tagName(expected));
+    defer tmp.deinit(testing.allocator);
+    var result = try bounded_process.run(testing.allocator, .{
+        .argv = argv,
+        .stdout_limit = 32,
+        .stderr_limit = 32,
+        .deadline_ms = 100,
+        .cwd = .{ .path = tmp.abs_path },
+    });
+    defer result.deinit(testing.allocator);
+    try expectOutcomeTag(result, expected);
+    try expectDirEmptyPath(tmp.rel_path);
+}
+
+test "pki reduce: bounded process leaves no temp files after failure modes" {
+    try expectFailureModeLeavesTmpEmpty(&.{"definitely-not-a-tardigrade-test-helper"}, .launch_failure);
+    try expectFailureModeLeavesTmpEmpty(&.{ pki_diff_options.process_helper_path, "exit", "7" }, .unexpected_exit_code);
+    try expectFailureModeLeavesTmpEmpty(&.{ pki_diff_options.process_helper_path, "stdout", "128" }, .stdout_limit_exceeded);
+    try expectFailureModeLeavesTmpEmpty(&.{ pki_diff_options.process_helper_path, "stderr", "128" }, .stderr_limit_exceeded);
+    try expectFailureModeLeavesTmpEmpty(&.{ pki_diff_options.process_helper_path, "hang" }, .timeout);
+}
+
+test "pki reduce: malformed validator output has a structured outcome" {
+    var raw = try bounded_process.run(testing.allocator, .{
+        .argv = &.{ pki_diff_options.process_helper_path, "malformed" },
+        .stdout_limit = 64,
+        .stderr_limit = 64,
+        .deadline_ms = 1000,
+    });
+    defer raw.deinit(testing.allocator);
+    try expectNormalExit(raw, 0);
+    var malformed = try bounded_process.Result.malformedValidatorOutput(
+        testing.allocator,
+        raw.stdout,
+        raw.stderr,
+        "malformed helper output",
+        .{},
+    );
+    defer malformed.deinit(testing.allocator);
+    try expectOutcomeTag(malformed, .malformed_validator_output);
+}
+
+test "pki reduce: bounded process classification is deterministic" {
+    var first = try bounded_process.run(testing.allocator, .{
+        .argv = &.{ pki_diff_options.process_helper_path, "exit", "7" },
+        .stdout_limit = 64,
+        .stderr_limit = 64,
+        .deadline_ms = 1000,
+    });
+    defer first.deinit(testing.allocator);
+    var second = try bounded_process.run(testing.allocator, .{
+        .argv = &.{ pki_diff_options.process_helper_path, "exit", "7" },
+        .stdout_limit = 64,
+        .stderr_limit = 64,
+        .deadline_ms = 1000,
+    });
+    defer second.deinit(testing.allocator);
+    try expectOutcomeTag(first, .unexpected_exit_code);
+    try expectOutcomeTag(second, .unexpected_exit_code);
+    try testing.expectEqual(std.meta.activeTag(first.outcome), std.meta.activeTag(second.outcome));
+}
+
+test "pki reduce: bounded process allocation failures clean up child state" {
+    try testing.checkAllAllocationFailures(testing.allocator, struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var tmp = try ProcessTempDir.init(testing.allocator, "allocation-process-group");
+            defer tmp.deinit(testing.allocator);
+
+            var result = bounded_process.run(allocator, .{
+                .argv = &.{ pki_diff_options.process_helper_path, "spawn-grandchild-record-and-hang", tmp.abs_path },
+                .stdout_limit = 64,
+                .stderr_limit = 64,
+                .deadline_ms = 100,
+            }) catch |err| {
+                if (err == error.OutOfMemory) {
+                    try expectRecordedProcessesGone(testing.allocator, tmp.rel_path);
+                    deleteRecordedPidFiles(tmp.rel_path);
+                    try expectDirEmptyPath(tmp.rel_path);
+                }
+                return err;
+            };
+            defer result.deinit(allocator);
+            try expectOutcomeTag(result, .timeout);
+            try expectRecordedProcessesGone(testing.allocator, tmp.rel_path);
+            deleteRecordedPidFiles(tmp.rel_path);
+            try expectDirEmptyPath(tmp.rel_path);
+        }
+    }.run, .{});
 }
 
 // The "pki reduce" tests below are offline: they classify with the in-process
@@ -1766,7 +2086,9 @@ fn fabricatedReducedVerifier(
     dir: compat.DirCompat,
     case: manifest.Case,
     paths: *const ReducedPaths,
+    deadline_ms: u32,
 ) !struct { Observation, Observation, Observation } {
+    _ = deadline_ms;
     const raw = try dir.readFileAlloc(allocator, paths.der_path, 1024);
     defer allocator.free(raw);
     const preserves = if (std.mem.eql(u8, case.id, "artifact-policy-fallback-succeeds"))
@@ -1938,6 +2260,7 @@ test "pki reduce: verification materializes the winning candidate to canonical a
         case,
         &reduction,
         .{ .reject, .reject, .accept },
+        oracle_deadline_ms,
     );
     defer verification.deinit(allocator);
     try testing.expect(verification.preserves);
@@ -2043,6 +2366,7 @@ test "pki reduce: non-reproducing original fallback fails instead of returning a
         case,
         &reduction,
         .{ .reject, .reject, .accept },
+        oracle_deadline_ms,
     ));
     try expectMissing(dir, "artifacts/artifact-policy-fallback-fails.candidate-0.candidate.der");
     try expectMissing(dir, "artifacts/artifact-policy-fallback-fails.candidate-0.candidate.crt");
@@ -2100,6 +2424,7 @@ test "pki reduce: successful original fallback uses the real verification state 
         case,
         &reduction,
         .{ .reject, .reject, .accept },
+        oracle_deadline_ms,
     );
     defer verification.deinit(allocator);
     try testing.expect(verification.preserves);

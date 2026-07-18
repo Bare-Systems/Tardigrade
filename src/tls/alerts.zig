@@ -45,6 +45,9 @@ pub fn fromHandshakeError(err: events.HandshakeError) AlertDescription {
         error.NoApplicableCredential => .handshake_failure,
         // A local credential provider, signer, or verifier failed.
         error.CredentialProviderFailed => .internal_error,
+        // The client declined mandatory handshake-time authentication
+        // (RFC 8446 §4.4.2.4).
+        error.ClientCertificateRequired => .certificate_required,
     };
 }
 

@@ -66,6 +66,12 @@ pub const HandshakeError = error{
     /// overflow, verifier internal error, or an invalid callback contract).
     /// Our own fault, never the peer's — maps to the `internal_error` alert.
     CredentialProviderFailed,
+    /// The server required handshake-time client authentication but the client
+    /// presented no certificate (an empty Certificate). Peer-attributed and
+    /// distinct from a rejected/invalid chain: the client simply declined when
+    /// a certificate was mandatory. Maps to the `certificate_required` alert
+    /// (RFC 8446 §4.4.2.4).
+    ClientCertificateRequired,
 };
 
 pub const Event = union(enum) {

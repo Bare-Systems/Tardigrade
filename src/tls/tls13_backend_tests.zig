@@ -259,6 +259,29 @@ const DirectHarness = struct {
     observed: DirectObserved = .{},
     drivers_ready: bool = false,
     deinitialized: bool = false,
+    // Handshake-time client-authentication storage (#334). Held by the harness
+    // so the provider/verifier vtables outlive the handshake; their stable
+    // addresses are captured into the backends by `configureClientAuth`.
+    client_credential: ?credentials.FixedCredentialProvider = null,
+    server_client_verifier: ?credentials.FixedVerifier = null,
+
+    /// Wire up handshake-time client authentication before `run`. `mode` is the
+    /// server's request policy; `client_cert` decides whether the client offers
+    /// a credential (false models a client declining with an empty Certificate);
+    /// `verifier_trust` is how the server judges a presented client certificate.
+    fn configureClientAuth(
+        self: *DirectHarness,
+        mode: tls_backend.ClientAuthMode,
+        client_cert: bool,
+        verifier_trust: credentials.Trust,
+    ) void {
+        self.server_client_verifier = credentials.FixedVerifier.init(verifier_trust);
+        self.server_backend.requestClientAuthentication(mode, self.server_client_verifier.?.verifier());
+        if (client_cert) {
+            self.client_credential = credentials.FixedCredentialProvider.init(fixtureIdentity());
+            self.client_backend.setLocalCredentialProvider(self.client_credential.?.provider());
+        }
+    }
 
     fn init() DirectHarness {
         return initProfiles(
@@ -321,6 +344,9 @@ const DirectHarness = struct {
             self.client_backend.deinit();
             self.server_backend.deinit();
         }
+        // The client credential provider is external to the backend, so the
+        // harness wipes its key material.
+        if (self.client_credential) |*credential| credential.deinit();
     }
 };
 
@@ -457,6 +483,73 @@ test "record and extension profiles preserve independent traffic-secret goldens"
 
 fn recordOrEmpty(bytes: ?[]const u8) []const u8 {
     return bytes orelse "";
+}
+
+// ===========================================================================
+// #334: handshake-time client authentication over the record transport. The
+// server issues a CertificateRequest; the client answers with its own
+// Certificate / CertificateVerify / Finished flight (or declines with an empty
+// Certificate), and the server verifies it before completing.
+// ===========================================================================
+
+test "required client authentication completes with a valid client certificate" {
+    var harness = DirectHarness.init();
+    defer harness.deinit();
+    harness.configureClientAuth(.required, true, .{ .pinned_certificate = tls_backend.testdata.certificate_der });
+    try harness.run();
+
+    try std.testing.expect(harness.client_driver.isComplete());
+    try std.testing.expect(harness.server_driver.isComplete());
+    // The last certificate verdict observed is the server's over the client's
+    // presented certificate: accepted against the pin.
+    try std.testing.expectEqual(events.CertificateState.valid, harness.observed.certificate_state.?);
+
+    // Application data still flows in both directions after mutual auth.
+    var protected: [record_codec.max_ciphertext_record_len]u8 = undefined;
+    var plaintext: [record_codec.max_ciphertext_fragment_len]u8 = undefined;
+    const request = try harness.client_bridge.sealApplicationData("mutually authenticated", &protected);
+    const opened = try harness.server_bridge.openApplicationData(try parseSingleRecord(.ciphertext, request), &plaintext);
+    try std.testing.expectEqualStrings("mutually authenticated", opened.inner.content);
+}
+
+test "optional client authentication completes when the client declines" {
+    var harness = DirectHarness.init();
+    defer harness.deinit();
+    // No client credential configured: the client answers with an empty
+    // Certificate and no CertificateVerify; optional mode accepts it.
+    harness.configureClientAuth(.optional, false, .{ .pinned_certificate = tls_backend.testdata.certificate_der });
+    try harness.run();
+
+    try std.testing.expect(harness.client_driver.isComplete());
+    try std.testing.expect(harness.server_driver.isComplete());
+}
+
+test "required client authentication fails closed when the client declines" {
+    var harness = DirectHarness.init();
+    defer harness.deinit();
+    // Required mode with no client credential: the empty client Certificate is
+    // rejected with certificate_required.
+    harness.configureClientAuth(.required, false, .{ .pinned_certificate = tls_backend.testdata.certificate_der });
+    try std.testing.expectError(error.ClientCertificateRequired, harness.run());
+    try std.testing.expectEqual(
+        tls_backend.CredentialFailure.client_certificate_required,
+        harness.server_backend.credentialFailure().?,
+    );
+}
+
+test "client authentication fails when the server rejects the client certificate" {
+    var harness = DirectHarness.init();
+    defer harness.deinit();
+    // The client presents a valid certificate whose proof-of-possession checks
+    // out, but the server's verifier is pinned to a different certificate and
+    // rejects it (bad_certificate).
+    var wrong = [_]u8{0} ** 4;
+    harness.configureClientAuth(.required, true, .{ .pinned_certificate = &wrong });
+    try std.testing.expectError(error.CertificateInvalid, harness.run());
+    try std.testing.expectEqual(
+        tls_backend.CredentialFailure.peer_verification_rejected,
+        harness.server_backend.credentialFailure().?,
+    );
 }
 
 // ===========================================================================

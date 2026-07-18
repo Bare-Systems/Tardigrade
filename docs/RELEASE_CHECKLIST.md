@@ -23,7 +23,10 @@ Use this checklist before tagging and distributing a Tardigrade release.
 - [ ] Update `docs/SUPPORT_MATRIX.md` when public behavior or maturity claims changed
 - [ ] Run `./scripts/test-install.sh` against a ReleaseFast build
 - [ ] Run `./scripts/test-deb-package.sh` on a Linux host with Docker
+- [ ] Run `./scripts/test-rpm-package.sh` on a Linux host with Docker
 - [ ] Verify release packaging paths and checksums
+- [ ] Note in the release that DEB/RPM/Homebrew/launchd are not published release
+      assets; only the Linux `.tar.gz` archives, `install.sh`, and checksums are
 - [ ] Confirm changelog entries for operator-visible changes are complete
 
 ## Branch Hygiene

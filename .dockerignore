@@ -4,7 +4,7 @@
 zig-out/*
 !zig-out/bin/
 zig-out/bin/*
-!zig-out/bin/tardigrade
+!zig-out/bin/tardi
 docs
 tests
 examples

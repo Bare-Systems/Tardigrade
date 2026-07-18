@@ -75,12 +75,23 @@ curl -fsSL https://github.com/Bare-Systems/Tardigrade/releases/latest/download/i
 ```
 
 The installer downloads the matching Linux release archive (`x86_64` or
-`aarch64`), verifies it against `tardigrade-checksums.txt`, and installs
-`tardigrade` into `$HOME/.local/bin` by default.
+`aarch64`), verifies it against `tardigrade-checksums.txt`, and installs the
+`tardi` binary (with a `tardigrade` compatibility alias) into
+`$HOME/.local/bin` by default. Published archives currently cover Linux
+only; macOS is not yet built or published by the release workflow (see
+[packaging/README.md](packaging/README.md#current-status) for exact status).
+
+Published release binaries use the default "general" TLS profile, which
+links OpenSSL at runtime — installing via this script or the raw archive
+requires OpenSSL 1.1/3.x already present on the target host, the same
+runtime dependency the DEB/RPM packages declare explicitly.
 
 Other install paths:
 
 - Download release archives directly from [GitHub Releases](https://github.com/Bare-Systems/Tardigrade/releases).
+- Native DEB/RPM packages, systemd/launchd service files, and a Homebrew
+  formula — see [packaging/README.md](packaging/README.md) for current
+  status and build instructions.
 - Build from source (see below).
 
 ## Build from source

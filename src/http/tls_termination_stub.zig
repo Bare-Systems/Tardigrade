@@ -165,9 +165,18 @@ pub const TlsConnection = struct {
         return .{ .ptr = self, .vtable = &stub_stream_vtable };
     }
 
-    pub fn negotiatedProtocol(self: *const TlsConnection) NegotiatedProtocol {
+    pub fn negotiatedAlpn(self: *const TlsConnection) ?[]const u8 {
         _ = self;
-        return .http1_1;
+        return null;
+    }
+
+    pub fn negotiatedProtocol(self: *const TlsConnection) negotiated_dispatch.Error!NegotiatedProtocol {
+        return self.validatedNegotiatedProtocol();
+    }
+
+    pub fn validatedNegotiatedProtocol(self: *const TlsConnection) negotiated_dispatch.Error!NegotiatedProtocol {
+        _ = self;
+        return error.NoApplicationProtocol;
     }
 };
 

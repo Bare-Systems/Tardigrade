@@ -463,8 +463,8 @@ pub const TlsConnection = struct {
         return data[0..@intCast(len)];
     }
 
-    pub fn negotiatedProtocol(self: *const TlsConnection) NegotiatedProtocol {
-        return negotiated_dispatch.selectNegotiatedProtocol(self.negotiatedAlpn(), self.protocol_policy) catch .http1_1;
+    pub fn negotiatedProtocol(self: *const TlsConnection) negotiated_dispatch.Error!NegotiatedProtocol {
+        return self.validatedNegotiatedProtocol();
     }
 
     pub fn validatedNegotiatedProtocol(self: *const TlsConnection) negotiated_dispatch.Error!NegotiatedProtocol {

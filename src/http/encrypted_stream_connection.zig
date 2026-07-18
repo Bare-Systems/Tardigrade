@@ -88,6 +88,11 @@ pub const EncryptedStreamHttpConnection = struct {
     }
 
     fn write(self: *EncryptedStreamHttpConnection, bytes: []const u8) encrypted_stream.Error!usize {
+        if (self.pending_write_len != 0) return error.RetryOperationPending;
+        return self.writeRaw(bytes);
+    }
+
+    fn writeRaw(self: *EncryptedStreamHttpConnection, bytes: []const u8) encrypted_stream.Error!usize {
         if (bytes.len == 0) return 0;
         while (true) {
             if (self.stream.readiness().can_write_plaintext) {
@@ -111,7 +116,7 @@ pub const EncryptedStreamHttpConnection = struct {
         }
 
         while (self.pending_write_offset < self.pending_write_len) {
-            const n = self.write(self.pending_write_buf[self.pending_write_offset..self.pending_write_len]) catch |err| switch (err) {
+            const n = self.writeRaw(self.pending_write_buf[self.pending_write_offset..self.pending_write_len]) catch |err| switch (err) {
                 error.WouldBlock => return error.WouldBlock,
                 else => return err,
             };
@@ -176,6 +181,22 @@ test "adapter writeAll resumes partial writes without duplicating prefix" {
     try conn.writer().writeAll("abcdef");
     try std.testing.expectEqualStrings("abcdef", fake.written[0..fake.written_len]);
     try std.testing.expectEqual(@as(usize, 0), conn.pending_write_len);
+}
+
+test "adapter rejects public write while writeAll has pending bytes" {
+    var fake = FakeStream{
+        .readiness_state = .{ .can_write_plaintext = true },
+        .write_budget = 3,
+    };
+    var conn = EncryptedStreamHttpConnection.init(fake.stream());
+
+    try std.testing.expectError(error.WouldBlock, conn.writer().writeAll("abcdef"));
+    try std.testing.expectError(error.RetryOperationPending, conn.writer().write("X"));
+
+    fake.readiness_state.can_write_plaintext = true;
+    fake.write_budget = 3;
+    try conn.writer().writeAll("abcdef");
+    try std.testing.expectEqualStrings("abcdef", fake.written[0..fake.written_len]);
 }
 
 const FakeStream = struct {

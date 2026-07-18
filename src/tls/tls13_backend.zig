@@ -906,8 +906,7 @@ pub const Tls13Backend = struct {
         // The verifier may resolve synchronously or return a pending operation
         // (an async Web-PKI/OCSP lookup); park the latter and resume later.
         switch (verifier.verifyPeer(&context) catch |err|
-            return self.failCredential(credentials.classifyVerifyError(err)))
-        {
+            return self.failCredential(credentials.classifyVerifyError(err))) {
             .complete => |verdict| return self.applyClientVerdict(verdict, sink),
             .pending => |op| return self.parkAuth(op, .client_verify),
         }
@@ -1206,8 +1205,7 @@ pub const Tls13Backend = struct {
         // Selection may complete synchronously or return a pending operation
         // (e.g. an async SNI lookup); park the latter and resume later.
         switch (provider.selectCredential(&selection) catch |err|
-            return self.failCredential(credentials.classifySelectError(err)))
-        {
+            return self.failCredential(credentials.classifySelectError(err))) {
             .complete => |credential| return self.emitServerAuthFlight(credential, sink),
             .pending => |op| return self.parkAuth(op, .server_select),
         }
@@ -1322,8 +1320,7 @@ pub const Tls13Backend = struct {
         // private key never enters the engine. An async signer parks here.
         const content = certificateVerifyContent(.server, self.core.transcriptHash());
         switch (credential.sign(content.slice(), &self.pending_signature) catch |err|
-            return self.failCredential(credentials.classifySignError(err)))
-        {
+            return self.failCredential(credentials.classifySignError(err))) {
             .complete => |len| {
                 owned = false; // ownership passes to serverFinishFlight
                 return self.serverFinishFlight(credential, len, sink);

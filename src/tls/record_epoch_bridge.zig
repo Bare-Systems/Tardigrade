@@ -200,7 +200,7 @@ pub const Bridge = struct {
                 break :blk try write.seal(content_type, bytes, 0, out);
             },
             .application => blk: {
-                if (!self.handshake_complete) return error.HandshakeNotComplete;
+                if (!self.handshake_complete and content_type != .alert) return error.HandshakeNotComplete;
                 const write = self.writeApplication() orelse return error.MissingWriteKeys;
                 break :blk try write.seal(content_type, bytes, 0, out);
             },

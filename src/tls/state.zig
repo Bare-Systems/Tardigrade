@@ -15,6 +15,10 @@ pub const HandshakeState = enum {
     client_hello,
     server_hello,
     encrypted_extensions,
+    /// Server outbound: an optional CertificateRequest sits between
+    /// EncryptedExtensions and Certificate when the server asks the client to
+    /// authenticate (handshake-time client authentication, #334).
+    certificate_request,
     certificate,
     certificate_verify,
     finished,

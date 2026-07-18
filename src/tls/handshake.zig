@@ -64,9 +64,49 @@ pub const Core = struct {
     expected_inbound: ?MessageType = null,
     transcript: transcript_mod.Transcript = .{},
     secrets: SecretLifecycle = .{},
+    /// Handshake-time client authentication (#334). The server sets
+    /// `request_client_certificate` before its flight so it may emit
+    /// CertificateRequest and then expect the client's certificate flight after
+    /// its own Finished. The client sets `client_certificate_requested` when it
+    /// receives that CertificateRequest, so it sends its own certificate flight
+    /// before Finished. Both default off — the common no-client-auth path and
+    /// QUIC are unchanged. Post-handshake client authentication is deferred.
+    request_client_certificate: bool = false,
+    client_certificate_requested: bool = false,
+    /// Server inbound sub-state for the client's post-Finished certificate
+    /// flight; `inactive` unless client auth was requested.
+    client_auth_inbound: ClientAuthInbound = .inactive,
+    /// Client outbound sub-state for its own certificate flight.
+    client_auth_outbound: ClientAuthOutbound = .inactive,
+
+    pub const ClientAuthInbound = enum { inactive, expect_certificate, expect_certificate_verify, expect_finished };
+    pub const ClientAuthOutbound = enum { inactive, send_certificate, send_certificate_verify, send_finished };
 
     pub fn init(role: state.Role) Core {
         return .{ .role = role };
+    }
+
+    /// Server: request that the client authenticate. Call before the server
+    /// flight so CertificateRequest is emitted and the client certificate
+    /// flight is expected after the server Finished.
+    pub fn requestClientCertificate(self: *Core) void {
+        self.request_client_certificate = true;
+    }
+
+    /// Server: after parsing the client's Certificate, declare whether it was
+    /// empty (no client cert). An empty certificate skips CertificateVerify, so
+    /// the server expects the client Finished next; a non-empty one expects
+    /// CertificateVerify.
+    pub fn clientCertificateWasEmpty(self: *Core, empty: bool) void {
+        self.client_auth_inbound = if (empty) .expect_finished else .expect_certificate_verify;
+    }
+
+    /// Client: begin the local certificate flight after the server Finished.
+    /// The client always sends a Certificate first (possibly empty); whether a
+    /// CertificateVerify follows depends on whether that certificate was empty,
+    /// which the outbound sequence permits either way.
+    pub fn beginClientCertificateFlight(self: *Core) void {
+        self.client_auth_outbound = .send_certificate;
     }
 
     pub fn start(self: *Core) Error!void {
@@ -88,6 +128,30 @@ pub const Core = struct {
             self.transcript.update(message.raw);
             return message;
         }
+        // A CertificateRequest (server->client, #334) is an optional message the
+        // server inserts before its Certificate. Accept it transparently while
+        // the client is still expecting the server's Certificate; the client
+        // remembers it and will authenticate after the server Finished.
+        if (message.kind == .certificate_request) {
+            // At most one CertificateRequest may appear in this position of the
+            // server flight (RFC 8446 §4.3.2). `expected_inbound` stays
+            // `.certificate` after the first, so the remembered flag is what
+            // rejects a duplicate rather than accepting and re-hashing it.
+            if (self.role != .client or
+                self.expected_inbound != .certificate or
+                self.client_certificate_requested)
+                return error.UnexpectedHandshakeMessage;
+            self.client_certificate_requested = true;
+            self.transcript.update(message.raw);
+            return message;
+        }
+        // Server inbound for the client's post-Finished certificate flight.
+        if (self.client_auth_inbound != .inactive) {
+            try self.checkClientAuthInbound(message.kind);
+            self.transcript.update(message.raw);
+            self.advanceClientAuthInbound(message.kind);
+            return message;
+        }
         if (!self.isExpectedClientFinished(message.kind)) {
             if (self.expected_inbound != message.kind)
                 return error.UnexpectedHandshakeMessage;
@@ -95,6 +159,32 @@ pub const Core = struct {
         self.transcript.update(message.raw);
         self.advanceAfterReceive(message.kind);
         return message;
+    }
+
+    fn checkClientAuthInbound(self: *const Core, kind: MessageType) Error!void {
+        const ok = switch (self.client_auth_inbound) {
+            .inactive => false,
+            .expect_certificate => kind == .certificate,
+            // Set by the backend once it has parsed the client's Certificate:
+            // a non-empty cert requires CertificateVerify, an empty one skips it.
+            .expect_certificate_verify => kind == .certificate_verify,
+            .expect_finished => kind == .finished,
+        };
+        if (!ok) return error.UnexpectedHandshakeMessage;
+    }
+
+    fn advanceClientAuthInbound(self: *Core, kind: MessageType) void {
+        switch (kind) {
+            // After the Certificate the backend refines the next expectation via
+            // `clientCertificateWasEmpty`; default to expecting CertificateVerify.
+            .certificate => self.client_auth_inbound = .expect_certificate_verify,
+            .certificate_verify => self.client_auth_inbound = .expect_finished,
+            .finished => {
+                self.client_auth_inbound = .inactive;
+                self.handshake_lifecycle = .complete;
+            },
+            else => {},
+        }
     }
 
     pub fn recordSent(self: *Core, raw: []const u8) Error!void {
@@ -121,11 +211,21 @@ pub const Core = struct {
 
     fn validOutbound(self: *const Core, kind: MessageType) bool {
         return switch (self.role) {
-            .client => (self.handshake_state == .idle and kind == .client_hello) or
-                (self.handshake_state == .finished and self.expected_inbound == null and kind == .finished),
+            .client => switch (self.client_auth_outbound) {
+                // No client auth: the original client sequence.
+                .inactive => (self.handshake_state == .idle and kind == .client_hello) or
+                    (self.handshake_state == .finished and self.expected_inbound == null and kind == .finished),
+                // Client certificate flight (#334): Certificate, then either
+                // CertificateVerify (non-empty cert) or straight to Finished
+                // (empty cert), then Finished.
+                .send_certificate => kind == .certificate,
+                .send_certificate_verify => kind == .certificate_verify or kind == .finished,
+                .send_finished => kind == .finished,
+            },
             .server => switch (self.handshake_state) {
                 .server_hello => kind == .server_hello,
                 .encrypted_extensions => kind == .encrypted_extensions,
+                .certificate_request => kind == .certificate_request,
                 .certificate => kind == .certificate,
                 .certificate_verify => kind == .certificate_verify,
                 .finished => kind == .finished,
@@ -169,18 +269,36 @@ pub const Core = struct {
 
     fn advanceAfterSend(self: *Core, kind: MessageType) void {
         switch (self.role) {
-            .client => switch (kind) {
-                .client_hello => {
-                    self.expected_inbound = .server_hello;
+            .client => switch (self.client_auth_outbound) {
+                .inactive => switch (kind) {
+                    .client_hello => self.expected_inbound = .server_hello,
+                    .finished => self.handshake_lifecycle = .complete,
+                    else => {},
                 },
-                .finished => self.handshake_lifecycle = .complete,
-                else => {},
+                else => switch (kind) {
+                    .certificate => self.client_auth_outbound = .send_certificate_verify,
+                    .certificate_verify => self.client_auth_outbound = .send_finished,
+                    .finished => {
+                        self.client_auth_outbound = .inactive;
+                        self.handshake_lifecycle = .complete;
+                    },
+                    else => {},
+                },
             },
             .server => switch (kind) {
                 .server_hello => self.handshake_state = .encrypted_extensions,
-                .encrypted_extensions => self.handshake_state = .certificate,
+                .encrypted_extensions => self.handshake_state =
+                    if (self.request_client_certificate) .certificate_request else .certificate,
+                .certificate_request => self.handshake_state = .certificate,
                 .certificate => self.handshake_state = .certificate_verify,
-                .certificate_verify, .finished => self.handshake_state = .finished,
+                .certificate_verify => self.handshake_state = .finished,
+                // After its own Finished the server either completes, or (when
+                // it requested client auth) begins expecting the client's
+                // certificate flight.
+                .finished => {
+                    self.handshake_state = .finished;
+                    if (self.request_client_certificate) self.client_auth_inbound = .expect_certificate;
+                },
                 else => {},
             },
         }
@@ -220,6 +338,25 @@ test "core records both directions of a client and server flight" {
     const client_hash = client.transcriptHash();
     const server_hash = server.transcriptHash();
     try std.testing.expectEqualSlices(u8, &client_hash, &server_hash);
+}
+
+test "a duplicate CertificateRequest in the server flight is rejected" {
+    var client = Core.init(.client);
+    try client.start();
+    var bytes: [8]u8 = undefined;
+    const ch = try messages.encode(.client_hello, "", &bytes);
+    try client.recordSent(ch);
+    const sh = try messages.encode(.server_hello, "", &bytes);
+    _ = try client.acceptReceived(sh);
+    const ee = try messages.encode(.encrypted_extensions, "", &bytes);
+    _ = try client.acceptReceived(ee);
+
+    // The first CertificateRequest is accepted (client auth requested).
+    const cr = try messages.encode(.certificate_request, "", &bytes);
+    _ = try client.acceptReceived(cr);
+    try std.testing.expect(client.client_certificate_requested);
+    // A second one in the same position is illegal (RFC 8446 §4.3.2).
+    try std.testing.expectError(error.UnexpectedHandshakeMessage, client.acceptReceived(cr));
 }
 
 test "secret lifecycle tracks directions and rejects repeated discard" {

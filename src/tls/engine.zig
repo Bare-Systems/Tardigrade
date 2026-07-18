@@ -138,6 +138,35 @@ pub fn Driver(comptime Transport: type) type {
             return self.state == .complete;
         }
 
+        /// True while the backend has parked an asynchronous authentication
+        /// operation (#334). The driver owner polls `resumeAuth` until this
+        /// clears before treating the handshake as stalled.
+        pub fn authPending(self: *const Self) bool {
+            return self.backend.authPending();
+        }
+
+        /// Poll a parked authentication operation, returning the driver's event
+        /// sink with whatever progress the backend emitted. Resets the sink like
+        /// `receive`, so borrowed payload slices are valid only until the next
+        /// `start`/`receive`/`resumeAuth`. On backend failure the driver is
+        /// marked failed and the error returned.
+        pub fn resumeAuth(self: *Self) Transport.Error!*Transport.EventSink {
+            if (self.state == .failed) return self.failure_reason.?;
+            self.sink.reset();
+            self.backend.resumeAuth(&self.sink) catch |err| return self.fail(err);
+            return &self.sink;
+        }
+
+        /// Like `resumeAuth`, but on backend failure returns the sink alongside
+        /// the error (preserving any fatal alert emitted before failing), for
+        /// production drivers that flush terminal output. See `receiveOutcome`.
+        pub fn resumeAuthOutcome(self: *Self) Outcome {
+            if (self.state == .failed) return .{ .sink = &self.sink, .terminal_error = self.failure_reason };
+            self.sink.reset();
+            self.backend.resumeAuth(&self.sink) catch |err| self.markFailed(err);
+            return .{ .sink = &self.sink, .terminal_error = self.failure_reason };
+        }
+
         pub fn failure(self: *const Self) ?Transport.Error {
             return self.failure_reason;
         }

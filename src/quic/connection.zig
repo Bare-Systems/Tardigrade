@@ -27,6 +27,7 @@ const packet = @import("packet.zig");
 const frame = @import("frame.zig");
 const tls_adapter = @import("tls_adapter.zig");
 const tls_handshake = @import("tls_handshake.zig");
+const tls_core = @import("tls_core");
 const recovery = @import("recovery.zig");
 const quic_stream = @import("stream.zig");
 const quic_cid = @import("cid.zig");
@@ -106,6 +107,7 @@ pub const Event = union(enum) {
 
 pub const DropReason = enum {
     unknown_cid,
+    keys_unavailable,
     undecryptable,
     malformed,
     unsupported_version,
@@ -644,6 +646,10 @@ pub const Connection = struct {
             else => unreachable,
         };
         const space = spaceForLevel(level);
+        if (level == .application and !self.handshake_complete) {
+            self.dropPacket(.keys_unavailable, bytes.len);
+            return;
+        }
 
         // Header protection removal needs a sample 4 bytes past pn_offset.
         var work: [2048]u8 = undefined;
@@ -772,6 +778,15 @@ pub const Connection = struct {
             .ack => |ack| self.processAck(space, ack, now_us),
             .crypto => |c| {
                 self.handshake.onCrypto(level, c.offset, c.data) catch |err| {
+                    self.failHandshake(err);
+                    self.startClose(.{ .error_code = cryptoErrorCode(err), .is_application = false, .local = true }, @errorName(err), now_us);
+                    return;
+                };
+                // Poll any parked asynchronous authentication (#334) so a
+                // resolved external signer/verifier/selector progresses the
+                // handshake as this packet is processed. A no-op when nothing is
+                // suspended.
+                self.handshake.resumeAuth() catch |err| {
                     self.failHandshake(err);
                     self.startClose(.{ .error_code = cryptoErrorCode(err), .is_application = false, .local = true }, @errorName(err), now_us);
                     return;
@@ -1122,6 +1137,34 @@ pub const Connection = struct {
         }
     }
 
+    /// True while the TLS handshake has suspended awaiting an asynchronous
+    /// authentication operation (#334). The event loop can poll this to know
+    /// the connection is waiting on an external signer/verifier/selector; each
+    /// `pollTransmit` (or an explicit `driveAuthentication`) advances it.
+    pub fn authPending(self: *const Connection) bool {
+        return self.handshake.authPending();
+    }
+
+    /// Drive a parked asynchronous authentication operation forward without
+    /// requiring another inbound CRYPTO frame: poll it, queue any handshake
+    /// output it produced, and complete the handshake if it resolved. Safe to
+    /// call unconditionally; a no-op unless the backend is suspended.
+    pub fn driveAuthentication(self: *Connection, now_us: u64) void {
+        if (self.state_ == .closed or self.state_ == .draining or self.state_ == .closing) return;
+        if (!self.handshake.authPending()) return;
+        self.handshake.resumeAuth() catch |err| {
+            self.failHandshake(err);
+            self.startClose(.{ .error_code = cryptoErrorCode(err), .is_application = false, .local = true }, @errorName(err), now_us);
+            return;
+        };
+        self.collectCryptoOutput() catch {
+            self.failHandshake(error.HandshakeBufferOverflow);
+            self.startClose(.{ .error_code = error_crypto_buffer_exceeded, .is_application = false, .local = true }, "crypto buffer", now_us);
+            return;
+        };
+        self.afterHandshakeProgress(now_us);
+    }
+
     fn afterHandshakeProgress(self: *Connection, now_us: u64) void {
         if (self.handshake_complete or !self.handshake.isComplete()) return;
         self.handshake_complete = true;
@@ -1223,17 +1266,21 @@ pub const Connection = struct {
         self.events.emit(.{ .keys_discarded = space });
     }
 
+    /// TLS alert mapping (RFC 9001 §4.8). QUIC-only failures (not part of the
+    /// shared protocol-neutral vocabulary) are mapped explicitly; every other
+    /// error is a member of `tls_core.events.HandshakeError` and is delegated to
+    /// the canonical `alerts.fromHandshakeError` mapper, so this table cannot
+    /// silently drift from the shared one the way it previously did for
+    /// `NoApplicableCredential` (missing here meant every credential-selection
+    /// failure surfaced as `internal_error` instead of `handshake_failure`).
     fn cryptoErrorCode(err: tls_handshake.HandshakeError) u64 {
-        // TLS alert mapping (RFC 9001 §4.8).
-        return switch (err) {
-            error.AlpnMismatch => error_crypto_base + 120, // no_application_protocol
-            error.CertificateInvalid => error_crypto_base + 42, // bad_certificate
-            error.MissingTransportParameters, error.InvalidTransportParameters => error_transport_parameter,
-            error.UnexpectedHandshakeMessage => error_crypto_base + 10, // unexpected_message
-            error.IllegalParameter => error_crypto_base + 47, // illegal_parameter
-            error.MalformedHandshake => error_crypto_base + 50, // decode_error
-            else => error_crypto_base + 80, // internal_error
-        };
+        switch (err) {
+            error.MissingTransportParameters, error.InvalidTransportParameters => return error_transport_parameter,
+            error.UnexpectedCryptoLevel, error.HandshakeBufferOverflow => return error_crypto_base + 80, // internal_error
+            else => {},
+        }
+        const shared_err: tls_core.events.HandshakeError = @errorCast(err);
+        return error_crypto_base + @as(u64, @intFromEnum(tls_core.alerts.fromHandshakeError(shared_err)));
     }
 
     // -- close ----------------------------------------------------------------
@@ -1525,6 +1572,19 @@ pub const Connection = struct {
             self.close_needs_send = false;
             self.close_resend_allowed_at_us = now_us + self.ptoDurationNow() / 2;
             return self.buildCloseDatagram(out, now_us);
+        }
+
+        // Advance any parked asynchronous authentication (#334) before building
+        // packets, so a resolved external signer/verifier/selector emits its
+        // next flight here even when no further peer CRYPTO frame will arrive.
+        self.driveAuthentication(now_us);
+        if (self.state_ == .closing or self.state_ == .closed or self.state_ == .draining) {
+            if (self.state_ == .closing and self.close_needs_send) {
+                self.close_needs_send = false;
+                self.close_resend_allowed_at_us = now_us + self.ptoDurationNow() / 2;
+                return self.buildCloseDatagram(out, now_us);
+            }
+            return null;
         }
 
         // Force the delayed app-space ACK when its timer expired.
@@ -2086,6 +2146,48 @@ const TestPair = struct {
         return pair;
     }
 
+    fn initClientAuth(
+        allocator: std.mem.Allocator,
+        client_provider: tls_core.credentials.CredentialProvider,
+        server_verifier: tls_core.credentials.PeerVerifier,
+    ) !*TestPair {
+        const pair = try allocator.create(TestPair);
+        pair.* = .{
+            .client_backend = tls_backend_mod.Tls13Backend.initClient(
+                .{ .hello_random = [_]u8{0xc1} ** 32, .key_share_seed = [_]u8{0x11} ** 32 },
+                .{ .pinned_certificate = tls_backend_mod.testdata.certificate_der },
+            ),
+            .server_backend = tls_backend_mod.Tls13Backend.initServer(
+                .{ .hello_random = [_]u8{0x51} ** 32, .key_share_seed = [_]u8{0x22} ** 32 },
+                try tls_backend_mod.Identity.initPkcs8(
+                    tls_backend_mod.testdata.certificate_der,
+                    tls_backend_mod.testdata.private_key_pkcs8_der,
+                ),
+            ),
+        };
+        errdefer allocator.destroy(pair);
+        pair.client_backend.engine.setLocalCredentialProvider(client_provider);
+        pair.server_backend.engine.requestClientAuthentication(.required, server_verifier);
+        pair.client = try Connection.init(allocator, .{
+            .role = .client,
+            .local_cid = &client_cid,
+            .original_dcid = &odcid,
+            .peer_cid = &odcid,
+            .tls = pair.client_backend.backend(),
+            .now_us = pair.now_us,
+        });
+        errdefer pair.client.deinit();
+        pair.server = try Connection.init(allocator, .{
+            .role = .server,
+            .local_cid = &odcid,
+            .original_dcid = &odcid,
+            .peer_cid = &client_cid,
+            .tls = pair.server_backend.backend(),
+            .now_us = pair.now_us,
+        });
+        return pair;
+    }
+
     fn deinit(self: *TestPair, allocator: std.mem.Allocator) void {
         self.client.deinit();
         self.server.deinit();
@@ -2292,6 +2394,131 @@ test "handshake failures map to their RFC 9001 CRYPTO_ERROR alert codes" {
     try testing.expectEqual(error_crypto_base + 50, Connection.cryptoErrorCode(error.MalformedHandshake));
     try testing.expectEqual(error_crypto_base + 120, Connection.cryptoErrorCode(error.AlpnMismatch));
     try testing.expectEqual(error_crypto_base + 42, Connection.cryptoErrorCode(error.CertificateInvalid));
+    try testing.expectEqual(error_crypto_base + 43, Connection.cryptoErrorCode(error.UnsupportedCertificate));
+    try testing.expectEqual(error_crypto_base + 109, Connection.cryptoErrorCode(error.MissingExtension));
+    // #334 review: NoApplicableCredential was missing from this table and fell
+    // through to the generic internal_error(80) code instead of the canonical
+    // handshake_failure(40) `alerts.fromHandshakeError` maps it to.
+    try testing.expectEqual(error_crypto_base + 40, Connection.cryptoErrorCode(error.NoApplicableCredential));
+    try testing.expectEqual(error_crypto_base + 116, Connection.cryptoErrorCode(error.ClientCertificateRequired));
+    try testing.expectEqual(error_crypto_base + 51, Connection.cryptoErrorCode(error.DecryptError));
+}
+
+test "driver: 1-RTT packets are dropped before deprotection until TLS handshake complete" {
+    const allocator = testing.allocator;
+    var pair = try TestPair.init(allocator);
+    defer pair.deinit(allocator);
+    try pair.pump();
+
+    const id = try pair.client.openStream(.bidi);
+    try testing.expectEqual(@as(usize, 5), try pair.client.writeStream(id, "hello", false));
+    var datagram: [max_datagram_size]u8 = undefined;
+    const one_rtt = pair.client.pollTransmit(&datagram, pair.now_us) orelse return error.TestExpectedEqual;
+
+    const received_before = pair.server.metrics.packets_received;
+    const dropped_before = pair.server.metrics.packets_dropped;
+    pair.server.handshake_complete = false;
+    try pair.server.ingest(one_rtt, pair.now_us);
+    try testing.expectEqual(received_before, pair.server.metrics.packets_received);
+    try testing.expectEqual(dropped_before + 1, pair.server.metrics.packets_dropped);
+}
+
+fn expectConnectionRejectsExtraCryptoWhileClientAuthPending(async_sign: bool) !void {
+    const allocator = testing.allocator;
+    const credentials = tls_core.credentials;
+    var mock = credentials.MockCredentialProvider.init(
+        try tls_backend_mod.Identity.initPkcs8(tls_backend_mod.testdata.certificate_der, tls_backend_mod.testdata.private_key_pkcs8_der),
+    );
+    mock.pending_polls = 64;
+    if (async_sign) {
+        mock.async_sign = true;
+    } else {
+        mock.async_select = true;
+    }
+    var verifier = credentials.MockVerifier.init(.accepted);
+    const pair = try TestPair.initClientAuth(allocator, mock.provider(), verifier.verifier());
+    defer pair.deinit(allocator);
+
+    try pair.pump();
+    try testing.expect(pair.client.authPending());
+    try testing.expect(!pair.client.isEstablished());
+
+    const stray = [_]u8{@intFromEnum(tls_core.handshake.MessageType.finished)};
+    const handshake_index = @intFromEnum(EncryptionLevel.handshake);
+    const offset = pair.client.adapter.reassembler.streams[handshake_index].consumed_offset;
+    try pair.client.applyFrame(.handshake, .{ .crypto = .{ .offset = offset, .data = &stray } }, pair.now_us);
+
+    try testing.expect(!pair.client.authPending());
+    try testing.expectEqual(tls_handshake.HandshakeError.UnexpectedHandshakeMessage, pair.client.handshakeFailure().?);
+    const info = pair.client.closeInfo() orelse return error.TestExpectedCloseInfo;
+    try testing.expect(info.local);
+    try testing.expect(!info.is_application);
+    try testing.expectEqual(@as(u64, error_crypto_base + 10), info.error_code);
+    try testing.expectEqual(@as(usize, 1), mock.cancel_count);
+    try testing.expectEqual(@as(usize, 1), mock.op_release_count);
+    if (async_sign) try testing.expectEqual(@as(usize, 1), mock.release_count);
+}
+
+test "a real Connection rejects extra Handshake CRYPTO while client credential selection is pending" {
+    try expectConnectionRejectsExtraCryptoWhileClientAuthPending(false);
+}
+
+test "a real Connection rejects extra Handshake CRYPTO while client signing is pending" {
+    try expectConnectionRejectsExtraCryptoWhileClientAuthPending(true);
+}
+
+test "a real Connection closes with handshake_failure when the server has no applicable credential" {
+    // #334 review: exercise NoApplicableCredential through an actual
+    // Connection, both synchronously and via an asynchronous selector, rather
+    // than only the direct-backend/handshake-adapter tests.
+    const allocator = testing.allocator;
+    const credentials = tls_core.credentials;
+    for ([_]bool{ false, true }) |async_select| {
+        var mock = credentials.MockCredentialProvider.init(
+            try tls_backend_mod.Identity.initPkcs8(tls_backend_mod.testdata.certificate_der, tls_backend_mod.testdata.private_key_pkcs8_der),
+        );
+        mock.force_select_error = error.NoCredentialAvailable;
+        mock.async_select = async_select;
+        mock.pending_polls = 1;
+
+        const pair = try allocator.create(TestPair);
+        pair.* = .{
+            .client_backend = tls_backend_mod.Tls13Backend.initClient(
+                .{ .hello_random = [_]u8{0xc1} ** 32, .key_share_seed = [_]u8{0x11} ** 32 },
+                .{ .pinned_certificate = tls_backend_mod.testdata.certificate_der },
+            ),
+            .server_backend = tls_backend_mod.Tls13Backend.initServer(
+                .{ .hello_random = [_]u8{0x51} ** 32, .key_share_seed = [_]u8{0x22} ** 32 },
+                try tls_backend_mod.Identity.initPkcs8(tls_backend_mod.testdata.certificate_der, tls_backend_mod.testdata.private_key_pkcs8_der),
+            ),
+        };
+        pair.server_backend.engine.external_provider = mock.provider();
+        defer pair.deinit(allocator);
+        pair.client = try Connection.init(allocator, .{
+            .role = .client,
+            .local_cid = &TestPair.client_cid,
+            .original_dcid = &TestPair.odcid,
+            .peer_cid = &TestPair.odcid,
+            .tls = pair.client_backend.backend(),
+            .now_us = pair.now_us,
+        });
+        pair.server = try Connection.init(allocator, .{
+            .role = .server,
+            .local_cid = &TestPair.odcid,
+            .original_dcid = &TestPair.odcid,
+            .peer_cid = &TestPair.client_cid,
+            .tls = pair.server_backend.backend(),
+            .now_us = pair.now_us,
+        });
+
+        try pair.pump();
+        // The client observes the server's synthesized close with the correct
+        // wire alert; the server latches the typed NoApplicableCredential
+        // failure it maps from.
+        const info = pair.client.closeInfo() orelse return error.TestExpectedCloseInfo;
+        try testing.expectEqual(@as(u64, error_crypto_base + 40), info.error_code);
+        try testing.expectEqual(tls_handshake.HandshakeError.NoApplicableCredential, pair.server.handshakeFailure().?);
+    }
 }
 
 test {

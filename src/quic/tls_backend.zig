@@ -216,10 +216,34 @@ pub const Tls13Backend = struct {
 
     pub fn backend(self: *Tls13Backend) tls_handshake.TlsBackend {
         return .{
-            .transport = .{ .ptr = self, .startFn = start, .receiveFn = receive, .deinitFn = deinitImpl },
+            .transport = .{
+                .ptr = self,
+                .startFn = start,
+                .receiveFn = receive,
+                .deinitFn = deinitImpl,
+                // Forward asynchronous authentication progression (#334) to the
+                // inner engine so a QUIC connection can drive a parked signer,
+                // verifier, or selector without another inbound CRYPTO frame.
+                .authPendingFn = authPending,
+                .resumeFn = resumeAuth,
+            },
             .setCidBindingFn = setCidBinding,
             .peerCidBindingFn = peerCidBinding,
         };
+    }
+
+    fn authPending(ptr: *anyopaque) bool {
+        const self: *Tls13Backend = @ptrCast(@alignCast(ptr));
+        return self.engine.authPending();
+    }
+
+    fn resumeAuth(ptr: *anyopaque, sink: *EventSink) HandshakeError!void {
+        const self: *Tls13Backend = @ptrCast(@alignCast(ptr));
+        self.scratch.reset();
+        const result = self.engine.resumeAuth(&self.scratch);
+        try self.forwardPeerTransportParameters(sink);
+        try translate(&self.scratch, sink);
+        result catch |err| return mapError(err);
     }
 
     pub fn deinit(self: *Tls13Backend) void {
@@ -494,4 +518,74 @@ test "QUIC handshake owner tears down shared and adapter storage when abandoned"
     harness.deinit();
     try expectQuicBackendWiped(&harness.client_backend);
     try expectQuicBackendWiped(&harness.server_backend);
+}
+
+test "the QUIC production driver resumes an async server signature without another peer CRYPTO frame (#334)" {
+    // A genuinely asynchronous server signer parks after ClientHello. No further
+    // client CRYPTO will arrive until the server sends its Finished, so progress
+    // must come from resumeAuth alone — the QUIC backend forwards pending/resume
+    // to the inner engine, and the driver exposes it.
+    var mock = tls_core.credentials.MockCredentialProvider.init(
+        try Identity.initPkcs8(testdata.certificate_der, testdata.private_key_pkcs8_der),
+    );
+    mock.async_sign = true;
+    mock.pending_polls = 2;
+
+    var client_adapter = tls_adapter.QuicTlsAdapter{};
+    var server_adapter = tls_adapter.QuicTlsAdapter{};
+    var client_backend = Tls13Backend.initClient(
+        .{ .hello_random = [_]u8{0xc1} ** 32, .key_share_seed = [_]u8{0x11} ** 32 },
+        .{ .pinned_certificate = testdata.certificate_der },
+    );
+    var server_backend = Tls13Backend.initServer(
+        .{ .hello_random = [_]u8{0x51} ** 32, .key_share_seed = [_]u8{0x22} ** 32 },
+        try Identity.initPkcs8(testdata.certificate_der, testdata.private_key_pkcs8_der),
+    );
+    // Serve the server credential through the async mock rather than the fixed
+    // identity's synchronous signer.
+    server_backend.engine.external_provider = mock.provider();
+
+    var client = tls_handshake.Handshake.initClient(&client_adapter, client_backend.backend());
+    var server = tls_handshake.Handshake.initServer(&server_adapter, server_backend.backend());
+    defer client.deinit();
+    defer server.deinit();
+
+    const params = (config.Config{}).transportParameters() catch unreachable;
+    try server.start(params);
+    try client.start(params);
+
+    // Deliver the ClientHello; the server emits ServerHello/EncryptedExtensions/
+    // Certificate and then parks awaiting the asynchronous signature.
+    var buf: [2048]u8 = undefined;
+    while (try client.pollOutput(.initial, &buf)) |out| {
+        try server.onCrypto(.initial, out.offset, out.bytes);
+    }
+    try std.testing.expect(server.authPending());
+
+    // Advance the signature purely through resumeAuth — no further peer CRYPTO.
+    var guard: usize = 0;
+    while (server.authPending()) : (guard += 1) {
+        if (guard > 16) return error.TestResumeStuck;
+        try server.resumeAuth();
+    }
+    try std.testing.expect(!server.authPending());
+
+    // With the flight now produced, the remaining exchange completes both sides.
+    var rounds: usize = 0;
+    while (rounds < 64) : (rounds += 1) {
+        var progressed = false;
+        inline for (.{ EncryptionLevel.initial, EncryptionLevel.handshake }) |level| {
+            while (try server.pollOutput(level, &buf)) |out| {
+                try client.onCrypto(level, out.offset, out.bytes);
+                progressed = true;
+            }
+            while (try client.pollOutput(level, &buf)) |out| {
+                try server.onCrypto(level, out.offset, out.bytes);
+                progressed = true;
+            }
+        }
+        if (!progressed) break;
+    }
+    try std.testing.expect(client.isComplete());
+    try std.testing.expect(server.isComplete());
 }

@@ -11,6 +11,7 @@ const events = @import("events.zig");
 pub const AlertDescription = enum(u8) {
     close_notify = 0,
     unexpected_message = 10,
+    handshake_failure = 40,
     bad_certificate = 42,
     unsupported_certificate = 43,
     illegal_parameter = 47,
@@ -35,10 +36,23 @@ pub fn fromHandshakeError(err: events.HandshakeError) AlertDescription {
         error.MalformedHandshake => .decode_error,
         error.IllegalParameter => .illegal_parameter,
         error.UnexpectedHandshakeMessage => .unexpected_message,
+        error.MissingExtension => .missing_extension,
         error.CertificateInvalid => .bad_certificate,
+        error.UnsupportedCertificate => .unsupported_certificate,
         error.SecretExportFailed => .internal_error,
         error.InvalidHandshakeState => .internal_error,
         error.AlpnMismatch => .no_application_protocol,
+        // This side could not produce an acceptable credential/signature for
+        // the negotiated parameters (RFC 8446 §4.4.2.2).
+        error.NoApplicableCredential => .handshake_failure,
+        // A local credential provider, signer, or verifier failed.
+        error.CredentialProviderFailed => .internal_error,
+        // The client declined mandatory handshake-time authentication
+        // (RFC 8446 §4.4.2.4).
+        error.ClientCertificateRequired => .certificate_required,
+        // A CertificateVerify signature failed proof of possession
+        // (RFC 8446 §4.4.3).
+        error.DecryptError => .decrypt_error,
     };
 }
 
@@ -58,6 +72,14 @@ test "a semantically invalid field value maps to illegal_parameter" {
 
 test "invalid peer certificate maps to bad_certificate" {
     try testing.expectEqual(AlertDescription.bad_certificate, fromHandshakeError(error.CertificateInvalid));
+}
+
+test "unsupported peer certificate maps to unsupported_certificate" {
+    try testing.expectEqual(AlertDescription.unsupported_certificate, fromHandshakeError(error.UnsupportedCertificate));
+}
+
+test "missing required extension maps to missing_extension" {
+    try testing.expectEqual(AlertDescription.missing_extension, fromHandshakeError(error.MissingExtension));
 }
 
 test "secret export failure maps to internal_error" {

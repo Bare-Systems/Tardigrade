@@ -46,8 +46,16 @@ pub const HandshakeError = error{
     /// concern (`UnexpectedCryptoLevel`), not this. Maps to the
     /// `unexpected_message` alert (RFC 8446 §6).
     UnexpectedHandshakeMessage,
+    /// A required TLS extension was absent. Distinct from a present extension
+    /// whose vector is empty or malformed, which remains a decode or parameter
+    /// failure. Maps to `missing_extension` (RFC 8446 §6).
+    MissingExtension,
     /// ALPN did not negotiate an acceptable application protocol.
     AlpnMismatch,
+    /// The peer presented a certificate or public key type this implementation
+    /// cannot use for the selected authentication operation. Maps to
+    /// `unsupported_certificate`.
+    UnsupportedCertificate,
     /// The peer certificate was rejected by local policy or failed proof of key
     /// possession.
     CertificateInvalid,
@@ -55,6 +63,28 @@ pub const HandshakeError = error{
     SecretExportFailed,
     /// A local caller attempted an invalid handshake lifecycle transition.
     InvalidHandshakeState,
+    /// This side cannot authenticate itself for the negotiated parameters: no
+    /// local credential is available, or none is compatible with the peer's
+    /// offered signature algorithms. A *local* configuration/selection failure,
+    /// distinct from a peer-certificate rejection (`CertificateInvalid`). Maps
+    /// to the `handshake_failure` alert (RFC 8446 §4.4.2.2).
+    NoApplicableCredential,
+    /// A local credential provider, signer, or peer verifier failed
+    /// deterministically (malformed local chain, signing fault, output
+    /// overflow, verifier internal error, or an invalid callback contract).
+    /// Our own fault, never the peer's — maps to the `internal_error` alert.
+    CredentialProviderFailed,
+    /// The server required handshake-time client authentication but the client
+    /// presented no certificate (an empty Certificate). Peer-attributed and
+    /// distinct from a rejected/invalid chain: the client simply declined when
+    /// a certificate was mandatory. Maps to the `certificate_required` alert
+    /// (RFC 8446 §4.4.2.4).
+    ClientCertificateRequired,
+    /// A peer's CertificateVerify signature did not validate against its
+    /// presented leaf (proof-of-possession failure). RFC 8446 §4.4.3 mandates
+    /// terminating with the `decrypt_error` alert, distinct from a trust
+    /// rejection (`CertificateInvalid`/bad_certificate).
+    DecryptError,
 };
 
 pub const Event = union(enum) {

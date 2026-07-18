@@ -81,6 +81,21 @@ pub fn hotReloadConfig(
         return;
     };
 
+    if (worker_ctx.tls) |tls| {
+        tls.updateProtocolPolicy(protocolPolicyFromConfig(cfg_ptr)) catch |err| {
+            worker_ctx.config_store.destroyVersion(prepared_version);
+            const msg = std.fmt.bufPrint(&state.last_reload_error, "TLS policy update failed: {}", .{err}) catch "TLS policy update failed";
+            state.reload_mutex.lock();
+            state.last_reload_ok = false;
+            state.last_reload_at_ms = now_ms;
+            state.last_reload_error_len = msg.len;
+            state.reload_mutex.unlock();
+            state.metricsRecordReloadFailure();
+            state.logger.warn(null, "config reload rejected by TLS protocol policy update: {}", .{err});
+            return;
+        };
+    }
+
     applyReloadedRuntimeConfig(cfg_ptr, state);
     worker_ctx.config_store.installPrepared(prepared_version);
     http3_dispatch_ctx.cfg = cfg_ptr;
@@ -100,6 +115,14 @@ pub fn hotReloadConfig(
     state.reload_mutex.unlock();
     state.metricsRecordReloadSuccess();
     state.logger.info(null, "configuration hot-reload applied", .{});
+}
+
+fn protocolPolicyFromConfig(cfg: *const edge_config.EdgeConfig) http.negotiated_dispatch.ListenerProtocolPolicy {
+    return .{
+        .http1_enabled = cfg.http1_enabled,
+        .http2_enabled = cfg.http2_enabled,
+        .allow_http1_without_alpn = cfg.tls_http1_no_alpn_fallback,
+    };
 }
 
 pub fn applyReloadedRuntimeConfig(cfg: *const edge_config.EdgeConfig, state: *GatewayState) void {

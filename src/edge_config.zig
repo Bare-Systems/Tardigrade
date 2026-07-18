@@ -2563,10 +2563,7 @@ pub fn validate(cfg: *const EdgeConfig) !void {
         std.log.err("config validation failed: quic_port must be between 1 and 65535 when HTTP/3 is enabled", .{});
         return error.InvalidConfigPort;
     }
-    if (!cfg.http1_enabled and !cfg.http2_enabled) {
-        std.log.err("config validation failed: at least one of HTTP/1.1 or HTTP/2 must be enabled", .{});
-        return error.InvalidConfigValue;
-    }
+    try validateListenerProtocolPolicy(cfg.http1_enabled, cfg.http2_enabled, hasTlsFiles(cfg), true);
 
     if (std.mem.eql(u8, cfg.tls_min_version, "1.0") or std.mem.eql(u8, cfg.tls_min_version, "1.1") or
         std.mem.eql(u8, cfg.tls_max_version, "1.0") or std.mem.eql(u8, cfg.tls_max_version, "1.1"))
@@ -2747,6 +2744,17 @@ pub fn warnRiskyConfig(cfg: *const EdgeConfig) void {
     }
     if (cfg.tls_client_ca_path.len > 0 and !cfg.tls_client_verify) {
         std.log.warn("config warning: TARDIGRADE_TLS_CLIENT_CA_PATH is set but TARDIGRADE_TLS_CLIENT_VERIFY is false — the CA path is ignored", .{});
+    }
+}
+
+fn validateListenerProtocolPolicy(http1_enabled: bool, http2_enabled: bool, tls_enabled: bool, log_errors: bool) !void {
+    if (!http1_enabled and !http2_enabled) {
+        if (log_errors) std.log.err("config validation failed: at least one of HTTP/1.1 or HTTP/2 must be enabled", .{});
+        return error.InvalidConfigValue;
+    }
+    if (!tls_enabled and !http1_enabled) {
+        if (log_errors) std.log.err("config validation failed: plaintext listener requires HTTP/1.1; h2c is not supported", .{});
+        return error.InvalidConfigValue;
     }
 }
 
@@ -2972,6 +2980,14 @@ test "config enum parsers reject invalid values" {
     try std.testing.expectError(error.InvalidConfigValue, parseProxyProtocolModeConfig("v3"));
     try std.testing.expectEqual(UpstreamProtocol.h2c, try parseUpstreamProtocolConfig("h2c"));
     try std.testing.expectError(error.InvalidConfigValue, parseUpstreamProtocolConfig("spdy"));
+}
+
+test "listener protocol validation rejects plaintext h2-only" {
+    try validateListenerProtocolPolicy(true, false, false, false);
+    try validateListenerProtocolPolicy(true, true, false, false);
+    try validateListenerProtocolPolicy(false, true, true, false);
+    try std.testing.expectError(error.InvalidConfigValue, validateListenerProtocolPolicy(false, true, false, false));
+    try std.testing.expectError(error.InvalidConfigValue, validateListenerProtocolPolicy(false, false, true, false));
 }
 
 test "sensitive config values are redacted for logs" {

@@ -1704,7 +1704,7 @@ test "pki reduce: bounded process reports abnormal signal termination" {
         .argv = &.{ pki_diff_options.process_helper_path, "abort" },
         .stdout_limit = 64,
         .stderr_limit = 1024,
-        .deadline_ms = 1000,
+        .deadline_ms = bounded_process.default_deadline_ms,
     });
     defer result.deinit(testing.allocator);
     try expectOutcomeTag(result, .signal);

@@ -1,5 +1,6 @@
 const std = @import("std");
 const tls = @import("tls_core");
+const encrypted_stream_connection = @import("encrypted_stream_connection.zig");
 const tls_termination = @import("tls_backend.zig");
 
 pub const AlpnFallbackPolicy = enum {
@@ -134,26 +135,49 @@ test "pinned listener policy validates selected protocol and fallback" {
     try std.testing.expectError(error.NoApplicationProtocol, selectNegotiatedProtocol(null, .{ .http1_enabled = false, .allow_http1_without_alpn = true }));
 }
 
-test "shared runtime dispatch accepts OpenSSL and pure-Zig encrypted stream adapters" {
+test "shared runtime dispatch accepts OpenSSL-shaped and EncryptedStream connection shapes" {
     var runtime = TestRuntime{};
-    var openssl_conn = TestConn{ .backend = .openssl };
+    var openssl_conn = TestOpenSslConn{ .fd = 11 };
     try std.testing.expectEqual(TestOutcome.park, try dispatchToRuntime(&runtime, &openssl_conn, .http1_1, TestRuntime));
     try std.testing.expectEqual(@as(usize, 1), runtime.http1_calls);
-    try std.testing.expectEqual(tls.encrypted_stream.BackendKind.openssl, runtime.last_backend.?);
+    try std.testing.expectEqual(@as(std.posix.fd_t, 11), runtime.last_fd);
+    try std.testing.expectEqualStrings("h", openssl_conn.written[0..openssl_conn.written_len]);
 
-    var pure_zig_conn = TestConn{ .backend = .pure_zig_record };
+    var fake_stream = TestEncryptedStream{ .readiness_state = .{ .can_write_plaintext = true } };
+    var pure_zig_conn = encrypted_stream_connection.EncryptedStreamHttpConnection.initWithFd(fake_stream.stream(), 22);
     try std.testing.expectEqual(TestOutcome.close, try dispatchToRuntime(&runtime, &pure_zig_conn, .http2, TestRuntime));
     try std.testing.expectEqual(@as(usize, 1), runtime.http2_calls);
-    try std.testing.expectEqual(tls.encrypted_stream.BackendKind.pure_zig_record, runtime.last_backend.?);
+    try std.testing.expectEqual(@as(std.posix.fd_t, 22), runtime.last_fd);
+    try std.testing.expectEqualStrings("2", fake_stream.written[0..fake_stream.written_len]);
 }
 
 const TestOutcome = enum { serve_again, park, close };
 
-const TestConn = struct {
-    backend: tls.encrypted_stream.BackendKind,
+const TestOpenSslConn = struct {
+    fd: std.posix.fd_t,
+    pending_plaintext: usize = 0,
+    written: [8]u8 = undefined,
+    written_len: usize = 0,
 
-    fn streamBackend(self: *const TestConn) tls.encrypted_stream.BackendKind {
-        return self.backend;
+    pub fn pending(self: *const TestOpenSslConn) usize {
+        return self.pending_plaintext;
+    }
+
+    pub fn rawFd(self: *const TestOpenSslConn) std.posix.fd_t {
+        return self.fd;
+    }
+
+    pub const Writer = struct {
+        conn: *TestOpenSslConn,
+
+        pub fn writeByte(self: Writer, byte: u8) !void {
+            self.conn.written[self.conn.written_len] = byte;
+            self.conn.written_len += 1;
+        }
+    };
+
+    pub fn writer(self: *TestOpenSslConn) Writer {
+        return .{ .conn = self };
     }
 };
 
@@ -162,16 +186,74 @@ const TestRuntime = struct {
 
     http1_calls: usize = 0,
     http2_calls: usize = 0,
-    last_backend: ?tls.encrypted_stream.BackendKind = null,
+    last_fd: std.posix.fd_t = -1,
+    last_pending: usize = 0,
 
     pub fn serveHttp1(self: *@This(), conn: anytype) !Outcome {
         self.http1_calls += 1;
-        self.last_backend = conn.streamBackend();
+        self.last_fd = conn.rawFd();
+        self.last_pending = conn.pending();
+        try conn.writer().writeByte('h');
         return .park;
     }
 
     pub fn handleHttp2(self: *@This(), conn: anytype) !void {
         self.http2_calls += 1;
-        self.last_backend = conn.streamBackend();
+        self.last_fd = conn.rawFd();
+        self.last_pending = conn.pending();
+        try conn.writer().writeByte('2');
     }
+};
+
+const TestEncryptedStream = struct {
+    readiness_state: tls.encrypted_stream.Readiness = .{},
+    written: [8]u8 = undefined,
+    written_len: usize = 0,
+
+    fn stream(self: *TestEncryptedStream) tls.encrypted_stream.EncryptedStream {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn backend(_: *anyopaque) tls.encrypted_stream.BackendKind {
+        return .pure_zig_record;
+    }
+
+    fn read(_: *anyopaque, _: []u8) tls.encrypted_stream.Error!usize {
+        return error.WouldBlock;
+    }
+
+    fn write(ptr: *anyopaque, bytes: []const u8) tls.encrypted_stream.Error!usize {
+        const self: *TestEncryptedStream = @ptrCast(@alignCast(ptr));
+        if (!self.readiness_state.can_write_plaintext) return error.WouldBlock;
+        const n = @min(bytes.len, self.written.len - self.written_len);
+        @memcpy(self.written[self.written_len .. self.written_len + n], bytes[0..n]);
+        self.written_len += n;
+        return n;
+    }
+
+    fn close(_: *anyopaque) void {}
+
+    fn readiness(ptr: *anyopaque) tls.encrypted_stream.Readiness {
+        const self: *TestEncryptedStream = @ptrCast(@alignCast(ptr));
+        return self.readiness_state;
+    }
+
+    fn drive(ptr: *anyopaque) tls.encrypted_stream.Error!tls.encrypted_stream.DriveResult {
+        const self: *TestEncryptedStream = @ptrCast(@alignCast(ptr));
+        return .{ .made_progress = false, .readiness = self.readiness_state };
+    }
+
+    fn bufferSnapshot(_: *anyopaque) tls.encrypted_stream.BufferSnapshot {
+        return .{};
+    }
+
+    const vtable = tls.encrypted_stream.EncryptedStream.VTable{
+        .backendFn = backend,
+        .readFn = read,
+        .writeFn = write,
+        .closeFn = close,
+        .readinessFn = readiness,
+        .driveFn = drive,
+        .bufferSnapshotFn = bufferSnapshot,
+    };
 };

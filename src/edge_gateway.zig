@@ -880,6 +880,10 @@ fn startNewConnection(ctx: *WorkerContext, client_fd: std.posix.fd_t) void {
         }
         return;
     } else {
+        if (!cfg.http1_enabled) {
+            ctx.state.logger.err(null, "plaintext HTTP/1.1 parser disabled and h2c is not supported", .{});
+            return;
+        }
         // Plaintext path: apply read and write timeouts immediately (no separate
         // handshake phase).
         if (header_timeout_ms > 0 or write_timeout_ms > 0) {

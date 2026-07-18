@@ -338,6 +338,13 @@ pub const TlsTerminator = struct {
         return self.state.protocol_policy;
     }
 
+    pub fn updateProtocolPolicy(self: *TlsTerminator, policy: negotiated_dispatch.ListenerProtocolPolicy) TlsError!void {
+        if (!policy.http1_enabled and !policy.http2_enabled) return error.ProtocolConfigFailed;
+        self.state.mutex.lock();
+        defer self.state.mutex.unlock();
+        self.state.protocol_policy = policy;
+    }
+
     pub fn accept(self: *TlsTerminator, fd: std.posix.fd_t) TlsError!TlsConnection {
         const policy_box = try self.allocator.create(negotiated_dispatch.ListenerProtocolPolicy);
         errdefer self.allocator.destroy(policy_box);
@@ -1522,6 +1529,38 @@ test "tls terminator copies sni specs for maintenance reload" {
 
     tls.runMaintenance(1);
     tls.runMaintenance(2);
+}
+
+test "tls terminator updates protocol policy for future snapshots" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "test_server.crt", .data = embedded_server_crt });
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "test_server.key", .data = embedded_server_key });
+
+    const cert_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, "test_server.crt");
+    defer allocator.free(cert_path);
+    const key_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, "test_server.key");
+    defer allocator.free(key_path);
+
+    var tls = try TlsTerminator.init(allocator, .{
+        .cert_path = cert_path,
+        .key_path = key_path,
+        .http1_enabled = true,
+        .http2_enabled = true,
+    });
+    defer tls.deinit();
+
+    const initial = tls.protocolPolicySnapshot();
+    try std.testing.expect(initial.http1_enabled);
+    try std.testing.expect(initial.http2_enabled);
+
+    try tls.updateProtocolPolicy(.{ .http1_enabled = true, .http2_enabled = false });
+    const reloaded = tls.protocolPolicySnapshot();
+    try std.testing.expect(reloaded.http1_enabled);
+    try std.testing.expect(!reloaded.http2_enabled);
+    try std.testing.expectError(error.ProtocolConfigFailed, tls.updateProtocolPolicy(.{ .http1_enabled = false, .http2_enabled = false }));
 }
 
 test "openssl encrypted stream adapter conforms over production connection" {

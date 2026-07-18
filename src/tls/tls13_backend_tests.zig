@@ -13,6 +13,8 @@ const std = @import("std");
 const crypto = @import("crypto");
 const tls_core = @import("tls_core");
 const tls_backend = tls_core.tls13_backend;
+const encrypted_stream_connection = @import("http_encrypted_stream_connection");
+const http_request = @import("http_request");
 
 const record_codec = tls_core.record_codec;
 const events = tls_core.events;
@@ -870,6 +872,118 @@ test "record stream completes a real TLS 1.3 handshake over a nonblocking socket
         }.done);
         try std.testing.expectError(error.EndOfStream, h.server.stream().read(&buf));
     }
+}
+
+test "pure-Zig HTTPS HTTP/1.1 bytes enter existing parser through EncryptedStream adapter" {
+    const h = try SocketHarness.create(.{
+        .client_chunk = 3,
+        .server_chunk = 5,
+        .client_alpn = "http/1.1",
+        .server_alpn = "http/1.1",
+    });
+    defer h.destroy();
+
+    try h.driveUntil(SocketHarness.bothComplete);
+    try std.testing.expectEqualStrings("http/1.1", h.server.negotiatedAlpn().?);
+
+    var client_conn = encrypted_stream_connection.EncryptedStreamHttpConnection.init(h.client.stream());
+    var server_conn = encrypted_stream_connection.EncryptedStreamHttpConnection.init(h.server.stream());
+
+    const request_bytes = "GET /adapter-h1 HTTP/1.1\r\nHost: tardigrade.test\r\n\r\n";
+    try client_conn.writer().writeAll(request_bytes);
+    try h.driveUntil(struct {
+        fn done(hh: *SocketHarness) bool {
+            return hh.server.bufferSnapshot().current.inbound_plaintext >= request_bytes.len;
+        }
+    }.done);
+
+    var req_buf: [128]u8 = undefined;
+    const req_len = try server_conn.read(&req_buf);
+    var parsed = try http_request.Request.parse(std.testing.allocator, req_buf[0..req_len], http_request.DEFAULT_MAX_BODY_SIZE);
+    defer parsed.request.deinit();
+    try std.testing.expectEqualStrings("/adapter-h1", parsed.request.uri.path);
+    try std.testing.expectEqual(req_len, parsed.bytes_consumed);
+
+    const response_bytes = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok";
+    try server_conn.writer().writeAll(response_bytes);
+    try h.driveUntil(struct {
+        fn done(hh: *SocketHarness) bool {
+            return hh.client.bufferSnapshot().current.inbound_plaintext >= response_bytes.len;
+        }
+    }.done);
+
+    var resp_buf: [128]u8 = undefined;
+    const resp_len = try client_conn.read(&resp_buf);
+    try std.testing.expect(std.mem.startsWith(u8, resp_buf[0..resp_len], "HTTP/1.1 200 OK\r\n"));
+    try std.testing.expect(std.mem.endsWith(u8, resp_buf[0..resp_len], "\r\n\r\nok"));
+}
+
+test "pure-Zig HTTPS HTTP/2 preface and settings enter frame runtime through EncryptedStream adapter" {
+    const h = try SocketHarness.create(.{
+        .client_chunk = 2,
+        .server_chunk = 7,
+        .client_alpn = "h2",
+        .server_alpn = "h2",
+    });
+    defer h.destroy();
+
+    try h.driveUntil(SocketHarness.bothComplete);
+    try std.testing.expectEqualStrings("h2", h.server.negotiatedAlpn().?);
+
+    var client_conn = encrypted_stream_connection.EncryptedStreamHttpConnection.init(h.client.stream());
+    var server_conn = encrypted_stream_connection.EncryptedStreamHttpConnection.init(h.server.stream());
+
+    const preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+    try client_conn.writer().writeAll(preface);
+    const client_settings = h2SettingsFrame(0);
+    try client_conn.writer().writeAll(&client_settings);
+    try h.driveUntil(struct {
+        fn done(hh: *SocketHarness) bool {
+            return hh.server.bufferSnapshot().current.inbound_plaintext >= preface.len + h2_frame_header_len;
+        }
+    }.done);
+
+    var preface_buf: [preface.len]u8 = undefined;
+    try readExactAdapter(&server_conn, preface_buf[0..]);
+    try std.testing.expectEqualStrings(preface, preface_buf[0..]);
+    var settings_header: [h2_frame_header_len]u8 = undefined;
+    try readExactAdapter(&server_conn, &settings_header);
+    try std.testing.expectEqual(@as(u8, h2_frame_type_settings), settings_header[3]);
+    try std.testing.expectEqual(@as(u8, 0), settings_header[4]);
+    try std.testing.expectEqual(@as(usize, 0), h2PayloadLen(settings_header));
+
+    const server_ack = h2SettingsFrame(h2_flag_ack);
+    try server_conn.writer().writeAll(&server_ack);
+    try h.driveUntil(struct {
+        fn done(hh: *SocketHarness) bool {
+            return hh.client.bufferSnapshot().current.inbound_plaintext >= h2_frame_header_len;
+        }
+    }.done);
+    var ack_header: [h2_frame_header_len]u8 = undefined;
+    try readExactAdapter(&client_conn, &ack_header);
+    try std.testing.expectEqual(@as(u8, h2_frame_type_settings), ack_header[3]);
+    try std.testing.expectEqual(@as(u8, h2_flag_ack), ack_header[4]);
+}
+
+fn readExactAdapter(conn: *encrypted_stream_connection.EncryptedStreamHttpConnection, out: []u8) !void {
+    var offset: usize = 0;
+    while (offset < out.len) {
+        const n = try conn.read(out[offset..]);
+        if (n == 0) return error.ConnectionClosed;
+        offset += n;
+    }
+}
+
+const h2_frame_header_len: usize = 9;
+const h2_frame_type_settings: u8 = 0x4;
+const h2_flag_ack: u8 = 0x1;
+
+fn h2SettingsFrame(flags: u8) [h2_frame_header_len]u8 {
+    return .{ 0, 0, 0, h2_frame_type_settings, flags, 0, 0, 0, 0 };
+}
+
+fn h2PayloadLen(header: [h2_frame_header_len]u8) usize {
+    return (@as(usize, header[0]) << 16) | (@as(usize, header[1]) << 8) | @as(usize, header[2]);
 }
 
 fn sniIdentityConfig(patterns: []const []const u8, chain: []const []const u8, default: bool) sni_provider.CredentialBundleConfig {

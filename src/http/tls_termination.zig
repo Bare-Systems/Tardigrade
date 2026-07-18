@@ -322,6 +322,7 @@ pub const TlsTerminator = struct {
         const policy = self.protocolPolicySnapshot();
         const ssl = c.SSL_new(self.ctx) orelse return error.ContextInitFailed;
         errdefer c.SSL_free(ssl);
+        if (c.SSL_set_ex_data(ssl, 0, @constCast(&policy)) != 1) return error.ProtocolConfigFailed;
         _ = c.SSL_ctrl(ssl, c.SSL_CTRL_MODE, openssl_stream_mode, null);
         if (c.SSL_set_fd(ssl, fd) != 1) return error.HandshakeFailed;
 
@@ -1018,11 +1019,11 @@ fn alpnSelectCallback(
     inlen: c_uint,
     arg: ?*anyopaque,
 ) callconv(.c) c_int {
-    _ = _ssl;
-    const state: *State = @ptrCast(@alignCast(arg orelse return c.SSL_TLSEXT_ERR_NOACK));
-    state.mutex.lock();
-    const server_protos = state.protocol_policy.encodedAdvertisedAlpns();
-    state.mutex.unlock();
+    const s = _ssl orelse return c.SSL_TLSEXT_ERR_ALERT_FATAL;
+    _ = arg;
+    const policy_ptr: ?*const negotiated_dispatch.ListenerProtocolPolicy = @ptrCast(@alignCast(c.SSL_get_ex_data(s, 0)));
+    const policy = policy_ptr orelse return c.SSL_TLSEXT_ERR_ALERT_FATAL;
+    const server_protos = policy.encodedAdvertisedAlpns();
     if (server_protos.len == 0) return c.SSL_TLSEXT_ERR_ALERT_FATAL;
     const rc = c.SSL_select_next_proto(out, outlen, server_protos.ptr, @intCast(server_protos.len), in, inlen);
     return if (rc == openssl_npn_negotiated) c.SSL_TLSEXT_ERR_OK else c.SSL_TLSEXT_ERR_ALERT_FATAL;
@@ -1191,6 +1192,16 @@ const TestTlsPair = struct {
     }
 };
 
+const TestTlsPairOptions = struct {
+    server_http2_enabled: bool = true,
+    server_http1_alpn_fallback_enabled: bool = false,
+    client_alpn_wire: ?[]const u8 = http11_only_wire_for_tests,
+};
+
+const h2_and_http11_wire_for_tests = "\x02h2\x08http/1.1";
+const http11_and_h2_wire_for_tests = "\x08http/1.1\x02h2";
+const http11_only_wire_for_tests = "\x08http/1.1";
+
 const ServerAcceptContext = struct {
     terminator: *TlsTerminator,
     fd: std.posix.fd_t,
@@ -1214,6 +1225,10 @@ fn testSetNonBlocking(fd: std.posix.fd_t, nonblocking: bool) !void {
 }
 
 fn makeTestTlsPair(allocator: std.mem.Allocator) !TestTlsPair {
+    return makeTestTlsPairWithOptions(allocator, .{});
+}
+
+fn makeTestTlsPairWithOptions(allocator: std.mem.Allocator, opts: TestTlsPairOptions) !TestTlsPair {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -1228,6 +1243,8 @@ fn makeTestTlsPair(allocator: std.mem.Allocator) !TestTlsPair {
         .cert_path = cert_path,
         .key_path = key_path,
         .dynamic_reload_interval_ms = 0,
+        .http2_enabled = opts.server_http2_enabled,
+        .http1_alpn_fallback_enabled = opts.server_http1_alpn_fallback_enabled,
     });
     defer terminator.deinit();
 
@@ -1244,6 +1261,9 @@ fn makeTestTlsPair(allocator: std.mem.Allocator) !TestTlsPair {
     c.SSL_CTX_set_verify(client_ctx, c.SSL_VERIFY_NONE, null);
     const client_ssl = c.SSL_new(client_ctx) orelse return error.ContextInitFailed;
     errdefer c.SSL_free(client_ssl);
+    if (opts.client_alpn_wire) |wire| {
+        if (c.SSL_set_alpn_protos(client_ssl, wire.ptr, @intCast(wire.len)) != 0) return error.ProtocolConfigFailed;
+    }
     if (c.SSL_set_fd(client_ssl, fds[0]) != 1) return error.HandshakeFailed;
     if (c.SSL_connect(client_ssl) != 1) return error.HandshakeFailed;
 
@@ -1454,6 +1474,48 @@ test "openssl encrypted stream adapter conforms over production connection" {
     var client_buf: ["server-reply".len]u8 = undefined;
     try clientReadExact(pair.client_ssl, &client_buf);
     try std.testing.expectEqualStrings("server-reply", &client_buf);
+}
+
+test "openssl listener ALPN follows server preference" {
+    const allocator = std.testing.allocator;
+    var pair = try makeTestTlsPairWithOptions(allocator, .{
+        .client_alpn_wire = http11_and_h2_wire_for_tests,
+    });
+    defer pair.deinit();
+
+    try std.testing.expectEqual(NegotiatedProtocol.http2, try pair.server.validatedNegotiatedProtocol());
+    try std.testing.expectEqualStrings("h2", pair.server.negotiatedAlpn().?);
+}
+
+test "openssl h1-only listener advertises only HTTP/1.1" {
+    const allocator = std.testing.allocator;
+    var pair = try makeTestTlsPairWithOptions(allocator, .{
+        .server_http2_enabled = false,
+        .client_alpn_wire = h2_and_http11_wire_for_tests,
+    });
+    defer pair.deinit();
+
+    try std.testing.expectEqual(NegotiatedProtocol.http1_1, try pair.server.validatedNegotiatedProtocol());
+    try std.testing.expectEqualStrings("http/1.1", pair.server.negotiatedAlpn().?);
+}
+
+test "openssl absent ALPN requires explicit HTTP/1.1 fallback before dispatch" {
+    const allocator = std.testing.allocator;
+    var strict = try makeTestTlsPairWithOptions(allocator, .{
+        .client_alpn_wire = null,
+        .server_http1_alpn_fallback_enabled = false,
+    });
+    defer strict.deinit();
+    try std.testing.expect(strict.server.negotiatedAlpn() == null);
+    try std.testing.expectError(error.NoApplicationProtocol, strict.server.validatedNegotiatedProtocol());
+
+    var fallback = try makeTestTlsPairWithOptions(allocator, .{
+        .client_alpn_wire = null,
+        .server_http1_alpn_fallback_enabled = true,
+    });
+    defer fallback.deinit();
+    try std.testing.expect(fallback.server.negotiatedAlpn() == null);
+    try std.testing.expectEqual(NegotiatedProtocol.http1_1, try fallback.server.validatedNegotiatedProtocol());
 }
 
 test "openssl encrypted stream preserves write retry direction under socket backpressure" {

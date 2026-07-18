@@ -70,6 +70,17 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const http_encrypted_stream_connection_mod = b.createModule(.{
+        .root_source_file = b.path("src/http/encrypted_stream_connection.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    http_encrypted_stream_connection_mod.addImport("tls_core", tls_core_mod);
+    const http_request_mod = b.createModule(.{
+        .root_source_file = b.path("src/http/request.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
 
     // Native QUIC transport and HTTP/3 packages (#240): the production
     // HTTP/3 backend since #328. No system libraries.
@@ -324,6 +335,8 @@ pub fn build(b: *std.Build) void {
     record_mode_handshake_test_mod.addImport("tls_core", tls_core_mod);
     record_mode_handshake_test_mod.addImport("crypto_secrets", crypto_secrets_mod);
     record_mode_handshake_test_mod.addImport("crypto", crypto_mod);
+    record_mode_handshake_test_mod.addImport("http_encrypted_stream_connection", http_encrypted_stream_connection_mod);
+    record_mode_handshake_test_mod.addImport("http_request", http_request_mod);
     const record_mode_handshake_tests = b.addTest(.{ .root_module = record_mode_handshake_test_mod });
     const run_record_mode_handshake_tests = b.addRunArtifact(record_mode_handshake_tests);
     tls_step.dependOn(&run_record_mode_handshake_tests.step);

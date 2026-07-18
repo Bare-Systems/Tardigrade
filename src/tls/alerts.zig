@@ -48,6 +48,9 @@ pub fn fromHandshakeError(err: events.HandshakeError) AlertDescription {
         // The client declined mandatory handshake-time authentication
         // (RFC 8446 §4.4.2.4).
         error.ClientCertificateRequired => .certificate_required,
+        // A CertificateVerify signature failed proof of possession
+        // (RFC 8446 §4.4.3).
+        error.DecryptError => .decrypt_error,
     };
 }
 

@@ -249,6 +249,11 @@ pub const Tls13Backend = struct {
     server_name: [max_server_name_len]u8 = undefined,
     server_name_len: usize = 0,
     server_name_present: bool = false,
+    /// A configured (client) server name that did not fit the bounded buffer.
+    /// Rather than truncate it — which would emit SNI for a different host and
+    /// hand the wrong name to the verifier — construction records the overflow
+    /// and `start` fails closed before any ClientHello is emitted.
+    server_name_overflow: bool = false,
     peer_transport_extension: [max_transport_extension_len]u8 = undefined,
     peer_transport_extension_len: usize = 0,
     peer_transport_extension_pending: bool = false,
@@ -365,12 +370,16 @@ pub const Tls13Backend = struct {
             .core = tls_handshake_codec.Core.init(.client),
         };
         if (options.server_name) |name| {
-            // A name too long for the bounded buffer is a caller error; clamp
-            // defensively (callers pass real hostnames, well under the bound).
-            const n = @min(name.len, self.server_name.len);
-            @memcpy(self.server_name[0..n], name[0..n]);
-            self.server_name_len = n;
-            self.server_name_present = true;
+            // A name too long for the bounded buffer is a caller error. Record
+            // the overflow and reject at `start` rather than truncating it to a
+            // different host (see `server_name_overflow`).
+            if (name.len > self.server_name.len) {
+                self.server_name_overflow = true;
+            } else {
+                @memcpy(self.server_name[0..name.len], name);
+                self.server_name_len = name.len;
+                self.server_name_present = true;
+            }
         }
         return self;
     }
@@ -407,7 +416,19 @@ pub const Tls13Backend = struct {
             .startFn = startImpl,
             .receiveFn = receiveImpl,
             .deinitFn = deinitImpl,
+            .authPendingFn = authPendingImpl,
+            .resumeFn = resumeImpl,
         };
+    }
+
+    fn authPendingImpl(ptr: *anyopaque) bool {
+        const self: *Tls13Backend = @ptrCast(@alignCast(ptr));
+        return self.authPending();
+    }
+
+    fn resumeImpl(ptr: *anyopaque, sink: *EventSink) HandshakeError!void {
+        const self: *Tls13Backend = @ptrCast(@alignCast(ptr));
+        return self.resumeAuth(sink);
     }
 
     pub fn alpn(self: *const Tls13Backend) []const u8 {
@@ -506,6 +527,10 @@ pub const Tls13Backend = struct {
         std.debug.assert(role == self.role);
         std.debug.assert(self.core.handshake_lifecycle == .idle);
         try self.profile.validate();
+        // A configured client server name that overflowed the bound is a caller
+        // configuration error; fail closed before any lifecycle or transcript
+        // advance rather than emitting SNI for a truncated (wrong) host.
+        if (self.server_name_overflow) return error.InvalidHandshakeState;
         self.core.start() catch |err| return mapCoreError(err);
         switch (self.role) {
             .client => {
@@ -594,6 +619,7 @@ pub const Tls13Backend = struct {
             error.NoApplicableCredential => error.NoApplicableCredential,
             error.CredentialProviderFailed => error.CredentialProviderFailed,
             error.ClientCertificateRequired => error.ClientCertificateRequired,
+            error.DecryptError => error.DecryptError,
         };
     }
 
@@ -973,11 +999,11 @@ pub const Tls13Backend = struct {
 
         // The signature covers the transcript through Certificate (RFC 8446
         // §4.4.3) — before this message is added. Proof of key possession is
-        // transcript crypto, not PKI policy, so it stays in the engine; a
-        // failure is peer-originated (bad_certificate).
+        // transcript crypto, not PKI policy: a failure is a `decrypt_error`, a
+        // distinct crypto failure from a trust rejection, so it does NOT emit a
+        // certificate-invalid (bad_certificate) verdict — it fails directly.
         const content = certificateVerifyContent(signer_role, transcript_before);
         if (!self.checkProofOfPossession(algorithm, signature, content.slice())) {
-            try sink.emitCertificate(.invalid);
             return self.failCredential(.certificate_verify_invalid);
         }
 
@@ -1164,6 +1190,27 @@ pub const Tls13Backend = struct {
         var owned = credential != null;
         errdefer if (owned) if (credential) |c| c.release();
 
+        // Validate the credential's chain and its exact encoded size up front,
+        // before any transcript mutation (`recordSent`) or output emission, so a
+        // credential that cannot be serialized within bounds fails closed rather
+        // than being partially recorded or emitted.
+        if (credential) |c| {
+            const chain = c.certificateChain();
+            if (chain.count() == 0 or chain.count() > credentials.max_chain_entries)
+                return self.failCredential(.malformed_credential_chain);
+            var encoded_len: usize = 0;
+            for (chain.entries) |entry| {
+                if (entry.len == 0 or entry.len > max_certificate_len)
+                    return self.failCredential(.malformed_credential_chain);
+                // CertificateEntry overhead: 3-byte cert_data length + 2-byte
+                // extensions length.
+                encoded_len = std.math.add(usize, encoded_len, entry.len + 5) catch
+                    return self.failCredential(.malformed_credential_chain);
+                if (encoded_len > max_message_len)
+                    return self.failCredential(.malformed_credential_chain);
+            }
+        }
+
         var buf: [max_message_len]u8 = undefined;
         var w = Writer{ .buf = &buf };
         try w.u8_(@intFromEnum(MessageType.certificate));
@@ -1171,12 +1218,7 @@ pub const Tls13Backend = struct {
         try w.u8_(0); // certificate_request_context: empty (echoes the request)
         const list_len = try w.reserve(3);
         if (credential) |c| {
-            const chain = c.certificateChain();
-            if (chain.count() == 0 or chain.count() > credentials.max_chain_entries)
-                return self.failCredential(.malformed_credential_chain);
-            for (chain.entries) |entry| {
-                if (entry.len == 0 or entry.len > max_certificate_len)
-                    return self.failCredential(.malformed_credential_chain);
+            for (c.certificateChain().entries) |entry| {
                 const entry_len = try w.reserve(3);
                 try w.bytes(entry);
                 w.patch(3, entry_len);

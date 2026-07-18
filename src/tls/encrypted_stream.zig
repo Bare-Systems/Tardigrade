@@ -489,6 +489,21 @@ pub const PureZigRecordStream = struct {
         try self.applyDriverOutcome(outcome);
     }
 
+    /// Poll a parked asynchronous authentication operation (#334) once and apply
+    /// whatever the backend emits — the client's certificate flight, the
+    /// server's, or a peer-verification verdict. A no-op unless the backend has
+    /// suspended; requires output headroom so an emitted flight serializes
+    /// atomically. Returns true if it polled (progress toward resolution).
+    fn resumeAuthIfPending(self: *PureZigRecordStream) Error!bool {
+        if (!self.driverPresent()) return false;
+        const driver = &self.handshake_driver.?;
+        if (!driver.authPending()) return false;
+        if (self.outbound_ciphertext.available() < handshake_output_reserve) return false;
+        const outcome = driver.resumeAuthOutcome();
+        try self.applyDriverOutcome(outcome);
+        return true;
+    }
+
     /// Apply one borrowed driver event batch. Every payload slice is consumed,
     /// copied, or serialized here, before any subsequent driver call resets the
     /// sink. A terminal backend error is deferred (with its fatal alert queued)
@@ -826,6 +841,11 @@ pub const PureZigRecordStream = struct {
         // initial flight; server: arms the responder). The carrier write loop
         // below flushes whatever it queued.
         if (try self.startHandshakeIfNeeded()) made_progress = true;
+
+        // Poll a parked asynchronous authentication operation (#334): an
+        // external signer/verifier/selector may have suspended the handshake,
+        // and each drive tick advances it toward resolution.
+        if (try self.resumeAuthIfPending()) made_progress = true;
 
         if (self.carrier) |carrier| {
             var written_total: usize = 0;

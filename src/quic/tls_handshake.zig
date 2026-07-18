@@ -180,6 +180,26 @@ pub const Handshake = struct {
         return self.driver.isComplete();
     }
 
+    /// True while the TLS backend has suspended awaiting an asynchronous
+    /// authentication operation (#334): an external signer, verifier, or
+    /// credential selector. The owning connection polls `resumeAuth` until it
+    /// clears.
+    pub fn authPending(self: *const Handshake) bool {
+        return self.driver.authPending();
+    }
+
+    /// Poll a parked asynchronous authentication operation and apply any
+    /// handshake bytes, secrets, certificate state, or completion it emits into
+    /// the adapter's CRYPTO streams. A no-op unless the backend is suspended, so
+    /// the connection may call it unconditionally whenever it processes the
+    /// handshake (after feeding CRYPTO, or on a wakeup signalling the external
+    /// operation resolved).
+    pub fn resumeAuth(self: *Handshake) HandshakeError!void {
+        if (self.driver.state == .failed) return self.driver.failure().?;
+        if (!self.driver.authPending()) return;
+        try self.applyEvents(try self.driver.resumeAuth());
+    }
+
     pub fn failure(self: *const Handshake) ?HandshakeError {
         return self.driver.failure();
     }

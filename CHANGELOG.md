@@ -505,6 +505,20 @@ All notable user-facing changes to Tardigrade are documented here.
   pacing hints in `src/quic/recovery.zig`. ACK state is scoped per QUIC packet
   number space so Initial, Handshake, and Application ranges cannot merge.
 
+### Fixed
+- **Default static `index` fallback for `root`/`alias` locations (#437)** — a
+  `location` block with `root` (or `alias`) set but no explicit `index`
+  directive now defaults `index` to `index.html` (nginx-compatible) instead
+  of 404ing on directory-style requests. The
+  index candidate is resolved relative to the requested directory, not just
+  the location root, so `GET /docs/` correctly checks `docs/index.html`
+  rather than falling back to the root's `index.html`; a request for a
+  nonexistent directory still 404s. `try_files` directory candidates and the
+  final directory-style fallback both try the directory-relative index
+  before falling back to `autoindex`, so an existing `index.html` takes
+  priority over a directory listing. Set `index "";` to opt out of the
+  default and rely solely on `try_files`/`autoindex`.
+
 ## [0.5.0] - 2026-07-08
 
 ### Testing

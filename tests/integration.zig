@@ -4670,6 +4670,196 @@ test "static file integration serves configured index html" {
     try assertContains(response.body, "index fixture");
 }
 
+test "static file integration serves default index.html when root is set without index or try_files (#437)" {
+    const allocator = std.testing.allocator;
+    var fixture = try GenericFixtureDir.create(allocator, "static-root-default-index");
+    defer fixture.deinit();
+    try fixture.writeRel("public/index.html", "<html><body>default index fixture</body></html>\n");
+
+    const public_abs = try fixture.joinAbs("public");
+    defer allocator.free(public_abs);
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location / {{
+        \\    root {s};
+        \\}}
+    , .{public_abs});
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{ .config_text = config_text });
+    defer tardigrade.stop();
+
+    var response = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/",
+        .body = null,
+        .headers = &.{},
+    });
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status_code);
+    try assertContains(response.body, "default index fixture");
+}
+
+test "static file integration resolves nested directory index relative to the requested directory (#437)" {
+    const allocator = std.testing.allocator;
+    var fixture = try GenericFixtureDir.create(allocator, "static-root-nested-index");
+    defer fixture.deinit();
+    try fixture.writeRel("public/index.html", "root index\n");
+    try fixture.writeRel("public/docs/index.html", "docs index\n");
+
+    const public_abs = try fixture.joinAbs("public");
+    defer allocator.free(public_abs);
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location / {{
+        \\    root {s};
+        \\}}
+    , .{public_abs});
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{ .config_text = config_text });
+    defer tardigrade.stop();
+
+    var root_response = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/",
+        .body = null,
+        .headers = &.{},
+    });
+    defer root_response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), root_response.status_code);
+    try assertContains(root_response.body, "root index");
+
+    var docs_response = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/docs/",
+        .body = null,
+        .headers = &.{},
+    });
+    defer docs_response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), docs_response.status_code);
+    try assertContains(docs_response.body, "docs index");
+}
+
+test "static file integration resolves nested directory index under alias prefix (#437)" {
+    const allocator = std.testing.allocator;
+    var fixture = try GenericFixtureDir.create(allocator, "static-alias-nested-index");
+    defer fixture.deinit();
+    try fixture.writeRel("assets/docs/index.html", "alias docs index\n");
+
+    const assets_abs = try fixture.joinAbs("assets");
+    defer allocator.free(assets_abs);
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location /assets/ {{
+        \\    alias {s};
+        \\}}
+    , .{assets_abs});
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{ .config_text = config_text });
+    defer tardigrade.stop();
+
+    var response = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/assets/docs/",
+        .body = null,
+        .headers = &.{},
+    });
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status_code);
+    try assertContains(response.body, "alias docs index");
+}
+
+test "static file integration does not fall back to the root index for a nonexistent directory (#437)" {
+    const allocator = std.testing.allocator;
+    var fixture = try GenericFixtureDir.create(allocator, "static-root-missing-dir");
+    defer fixture.deinit();
+    try fixture.writeRel("public/index.html", "root index\n");
+
+    const public_abs = try fixture.joinAbs("public");
+    defer allocator.free(public_abs);
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location / {{
+        \\    root {s};
+        \\}}
+    , .{public_abs});
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{ .config_text = config_text });
+    defer tardigrade.stop();
+
+    var response = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/missing/",
+        .body = null,
+        .headers = &.{},
+    });
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 404), response.status_code);
+}
+
+test "static file integration prefers an existing index over autoindex when both are enabled (#437)" {
+    const allocator = std.testing.allocator;
+    var fixture = try GenericFixtureDir.create(allocator, "static-index-over-autoindex");
+    defer fixture.deinit();
+    try fixture.writeRel("public/index.html", "index wins\n");
+    try fixture.writeRel("public/other.txt", "other");
+
+    const public_abs = try fixture.joinAbs("public");
+    defer allocator.free(public_abs);
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location / {{
+        \\    root {s};
+        \\    try_files $uri;
+        \\    autoindex on;
+        \\}}
+    , .{public_abs});
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{ .config_text = config_text });
+    defer tardigrade.stop();
+
+    var response = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/",
+        .body = null,
+        .headers = &.{},
+    });
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status_code);
+    try assertContains(response.body, "index wins");
+}
+
+test "static file integration index opt-out allows autoindex to run (#437)" {
+    const allocator = std.testing.allocator;
+    var fixture = try GenericFixtureDir.create(allocator, "static-index-optout-autoindex");
+    defer fixture.deinit();
+    try fixture.writeRel("public/index.html", "should not be served\n");
+    try fixture.writeRel("public/other.txt", "other");
+
+    const public_abs = try fixture.joinAbs("public");
+    defer allocator.free(public_abs);
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location / {{
+        \\    root {s};
+        \\    index "";
+        \\    autoindex on;
+        \\}}
+    , .{public_abs});
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{ .config_text = config_text });
+    defer tardigrade.stop();
+
+    var response = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/",
+        .body = null,
+        .headers = &.{},
+    });
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status_code);
+    try assertContains(response.body, "other.txt");
+}
+
 test "static file integration serves large files over plain http" {
     const allocator = std.testing.allocator;
     var fixture = try GenericFixtureDir.create(allocator, "static-large");

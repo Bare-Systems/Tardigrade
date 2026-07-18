@@ -118,13 +118,14 @@ IDs against the `tg-<decimal>-<lowercase-hex>` format. Arbitrary client values
 are discarded and a fresh ID is generated. Covered by unit tests in
 `correlation_id.zig`.
 
-**F-07 — Static file serving via catch-all `location /` non-functional** ✅ ROOT-CAUSED, TRACKED SEPARATELY
-Root-caused by code trace: a `location` block with `root` but no `index` or
-`try_files` directive 404s on directory requests because static serving has
-no default index value (unlike nginx's implicit `index index.html;`). The
-fix requires a maintainer decision (default index vs. fail-fast config
-validation vs. document as intentional), so it now has its own tracked issue,
-#437, with the full reproduction and code references.
+**F-07 — Static file serving via catch-all `location /` non-functional** ✅ RESOLVED
+A `location` block with `root` but no `index` or `try_files` directive used
+to 404 on directory requests because static serving had no default index
+value. Maintainer decision (#437): default `index` to `index.html` when not
+explicitly configured (nginx-compatible). See `docs/PROXY_SECURITY.md` §12a
+for the full `root`/`index`/`try_files` resolution order. Covered by a unit
+test in `src/http/config_file.zig` and an integration test in
+`tests/integration.zig`.
 
 ### Open Gaps
 

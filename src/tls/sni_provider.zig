@@ -928,6 +928,160 @@ test "allocation failure during snapshot build does not leak" {
     }.run, .{});
 }
 
+test "fuzz: SNI pattern parsing and matching never panic" {
+    try testing.fuzz({}, fuzzPatternParsing, .{ .corpus = &.{
+        "",
+        "*",
+        "*.example.test",
+        "api.example.test",
+        "foo*.example.test",
+        "a.b.example.test",
+        "UPPER.Example.Test",
+        "\x00\xff.example.test",
+    } });
+}
+
+fn fuzzPatternParsing(_: void, smith: *testing.Smith) !void {
+    var input_buf: [max_host_pattern_len + 8]u8 = undefined;
+    const len = smith.slice(&input_buf);
+    var storage: [1024]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&storage);
+    const allocator = fba.allocator();
+    if (parseHostPattern(allocator, input_buf[0..len])) |pattern| {
+        defer freePattern(allocator, pattern);
+        _ = wildcardMatchesSuffix(input_buf[0..len], pattern.text());
+        _ = asciiEqlIgnoreCase(input_buf[0..len], pattern.text());
+    } else |_| {}
+}
+
+test "fuzz: SNI selection is deterministic and wildcard consumes one label" {
+    try testing.fuzz({}, fuzzSelectionDeterminism, .{ .corpus = &.{
+        "",
+        "api.example.test",
+        "API.Example.Test",
+        "www.example.test",
+        "a.b.example.test",
+        "missing.example.net",
+    } });
+}
+
+const SelectionOutcome = union(enum) {
+    selected: struct {
+        scheme: credentials.SignatureScheme,
+        chain_count: usize,
+    },
+    err: credentials.SelectError,
+};
+
+fn selectOutcome(provider: credentials.CredentialProvider, selection: *const credentials.SelectionContext) SelectionOutcome {
+    const progress = provider.selectCredential(selection) catch |err| return .{ .err = err };
+    return switch (progress) {
+        .complete => |credential| blk: {
+            const chain_count = credential.certificateChain().count();
+            const scheme = credential.scheme;
+            credential.release();
+            break :blk .{ .selected = .{ .scheme = scheme, .chain_count = chain_count } };
+        },
+        .pending => |op| blk: {
+            op.cancel();
+            op.release();
+            break :blk .{ .err = error.ProviderInternalFailure };
+        },
+    };
+}
+
+fn expectSameOutcome(a: SelectionOutcome, b: SelectionOutcome) !void {
+    try testing.expectEqual(@as(std.meta.Tag(SelectionOutcome), a), @as(std.meta.Tag(SelectionOutcome), b));
+    switch (a) {
+        .selected => |selected| {
+            try testing.expectEqual(selected.scheme, b.selected.scheme);
+            try testing.expectEqual(selected.chain_count, b.selected.chain_count);
+        },
+        .err => |err| try testing.expectEqual(err, b.err),
+    }
+}
+
+fn fuzzSelectionDeterminism(_: void, smith: *testing.Smith) !void {
+    var raw_name: [max_host_pattern_len]u8 = undefined;
+    const name_len = smith.slice(&raw_name);
+    const sni: ?[]const u8 = if (name_len == 0) null else raw_name[0..name_len];
+    var provider = ReloadableProvider.init(testing.allocator);
+    defer provider.deinit();
+
+    const chain_one = [_][]const u8{credentials.testdata.certificate_der};
+    const chain_two = [_][]const u8{ credentials.testdata.certificate_der, credentials.testdata.certificate_der };
+    const configs = [_]CredentialBundleConfig{
+        sniIdentityConfigForFuzz(&.{"api.example.test"}, chain_one[0..], false),
+        sniIdentityConfigForFuzz(&.{"*.example.test"}, chain_two[0..], true),
+    };
+    try provider.reload(&configs, .{ .unknown_sni_policy = .fail_handshake });
+
+    var schemes = [_]u16{ 0xffff, 0x0807 };
+    var first = testSelection(sni, schemes[0..]);
+    var second = testSelection(sni, schemes[0..]);
+    try expectSameOutcome(selectOutcome(provider.provider(), &first), selectOutcome(provider.provider(), &second));
+}
+
+fn sniIdentityConfigForFuzz(patterns: []const []const u8, chain: []const []const u8, default: bool) CredentialBundleConfig {
+    return .{
+        .chain = chain,
+        .patterns = patterns,
+        .signer = SignAdapter.fromIdentity(credentials.testdata.identity()),
+        .key_kind = .ed25519,
+        .is_default = default,
+    };
+}
+
+test "ECDSA P-256 certificate metadata is selectable with a P-256 signer handle" {
+    const ecdsa_pem =
+        \\-----BEGIN CERTIFICATE-----
+        \\MIIBmzCCAUGgAwIBAgIURydPBx1vjDTJUssyVTi74k48qnIwCgYIKoZIzj0EAwIw
+        \\IzEhMB8GA1UEAwwYVGFyZGlncmFkZSBUZXN0IEVDRFNBIENBMB4XDTI2MDcxMzAy
+        \\MDUxOFoXDTM0MDkyOTAyMDUxOFowIzEhMB8GA1UEAwwYVGFyZGlncmFkZSBUZXN0
+        \\IEVDRFNBIENBMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEFjO2x/y3R5vvZdls
+        \\KPVExKzZR9mdUMqPOXp/SfN4Z7of1ddxFWzxLFOdHLTzlQb09zZT5V5WoQXrhTA3
+        \\pmhI0aNTMFEwHQYDVR0OBBYEFKe7pGrj6TrDR8CnvdL6MNPwkdKbMB8GA1UdIwQY
+        \\MBaAFKe7pGrj6TrDR8CnvdL6MNPwkdKbMA8GA1UdEwEB/wQFMAMBAf8wCgYIKoZI
+        \\zj0EAwIDSAAwRQIhAKPR86FA40f3W8x1OOMGerLsB4jN61BdmM4HRZGj9syMAiAc
+        \\i+PZtkI67r6m/9cgMaix6IarU20mIJdvt0bM4+4uqA==
+        \\-----END CERTIFICATE-----
+    ;
+    const ecdsa_der = try decodeSinglePemCertificate(testing.allocator, ecdsa_pem);
+    defer testing.allocator.free(ecdsa_der);
+
+    var ext = CountingExternal{};
+    const config = CredentialBundleConfig{
+        .chain = &.{ecdsa_der},
+        .patterns = &.{"p256.example.test"},
+        .signer = SignAdapter.fromExternal(&ext, CountingExternal.sign, CountingExternal.release),
+        .key_kind = .ecdsa_p256,
+        .supported_schemes = &.{.ecdsa_secp256r1_sha256},
+        .is_default = true,
+    };
+    const snapshot = try Snapshot.build(testing.allocator, &.{config}, .{}, 1);
+    snapshot.release();
+    try testing.expectEqual(@as(usize, 1), ext.release_count);
+}
+
+fn decodeSinglePemCertificate(allocator: std.mem.Allocator, pem: []const u8) ![]u8 {
+    const begin = "-----BEGIN CERTIFICATE-----";
+    const end = "-----END CERTIFICATE-----";
+    const begin_at = std.mem.indexOf(u8, pem, begin) orelse return error.PemBlockNotFound;
+    const body_start = begin_at + begin.len;
+    const end_at = std.mem.indexOfPos(u8, pem, body_start, end) orelse return error.PemBlockNotFound;
+    var b64: std.ArrayList(u8) = .empty;
+    defer b64.deinit(allocator);
+    for (pem[body_start..end_at]) |ch| switch (ch) {
+        '\n', '\r', ' ', '\t' => {},
+        else => try b64.append(allocator, ch),
+    };
+    const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(b64.items) catch return error.InvalidPemBase64;
+    const der = try allocator.alloc(u8, decoded_len);
+    errdefer allocator.free(der);
+    std.base64.standard.Decoder.decode(der, b64.items) catch return error.InvalidPemBase64;
+    return der;
+}
+
 const CountingExternal = struct {
     release_count: usize = 0,
 

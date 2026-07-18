@@ -78,6 +78,39 @@ sudo rpm -i dist/tardigrade-0.50-1.x86_64.rpm
 sudo systemctl enable --now tardigrade
 ```
 
+The RPM package, unlike the DEB package, does **not** install a starter
+`/etc/tardigrade/tardigrade.conf` or create `/var/lib/tardigrade` (the
+systemd unit's `WorkingDirectory`). Create both before starting the service
+for the first time:
+
+```bash
+sudo install -d -o tardigrade -g tardigrade /var/lib/tardigrade
+sudo install -m 0644 packaging/tardigrade.conf /etc/tardigrade/tardigrade.conf
+```
+
+## Upgrading
+
+For both DEB and RPM installs, validate the new config before reloading or
+restarting the service, so a bad edit surfaces before the running process is
+affected:
+
+```bash
+sudo -u tardigrade tardi check /etc/tardigrade/tardigrade.conf
+sudo systemctl reload tardigrade   # or: restart, if reload is insufficient
+```
+
+- DEB upgrades (`sudo apt install ./new-package.deb`) preserve
+  `/etc/tardigrade/tardigrade.conf` and `/etc/tardigrade/tardigrade.env` as
+  declared in `DEBIAN/conffiles`; `dpkg`/`apt` will prompt on conflicting
+  local edits rather than silently overwriting them.
+- RPM upgrades (`sudo rpm -U` or `dnf upgrade`) preserve
+  `/etc/tardigrade/tardigrade.env` via `%config(noreplace)`; since the RPM
+  does not package `tardigrade.conf` at all, there is nothing for `rpm` to
+  manage there — it is entirely operator-owned.
+- For the plain release archive / `install.sh` path, replace the `tardi`
+  binary, then run `tardi check <config>` against the existing config before
+  restarting whatever process supervisor you are using.
+
 ## Homebrew (macOS and Linux)
 
 The `on_macos` blocks in this formula cannot resolve today: the release

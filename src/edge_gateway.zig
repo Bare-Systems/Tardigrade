@@ -942,18 +942,33 @@ fn dispatchNegotiatedHttp(
     connection_ip: []const u8,
     served: *u32,
 ) !ServeOutcome {
-    if (negotiated == .http2) {
-        if (!cfg.http2_enabled) return error.ProtocolDisabled;
-        try handleHttp2Connection(conn, session, cfg, ctx.state, connection_ip);
-        return .close;
+    var runtime = GatewayHttpRuntime{
+        .ctx = ctx,
+        .session = session,
+        .cfg = cfg,
+        .connection_ip = connection_ip,
+        .served = served,
+    };
+    return http.negotiated_dispatch.dispatchToRuntime(&runtime, conn, negotiated, GatewayHttpRuntime);
+}
+
+const GatewayHttpRuntime = struct {
+    pub const Outcome = ServeOutcome;
+
+    ctx: *WorkerContext,
+    session: *ConnectionSession,
+    cfg: *const edge_config.EdgeConfig,
+    connection_ip: []const u8,
+    served: *u32,
+
+    pub fn serveHttp1(self: *@This(), conn: anytype) !Outcome {
+        return serveOneRequest(self.ctx, conn, self.session, self.connection_ip, self.served, false);
     }
 
-    while (true) switch (serveOneRequest(ctx, conn, session, connection_ip, served, false)) {
-        .serve_again => {},
-        .park => return .park,
-        .close => return .close,
-    };
-}
+    pub fn handleHttp2(self: *@This(), conn: anytype) !void {
+        try handleHttp2Connection(conn, self.session, self.cfg, self.ctx.state, self.connection_ip);
+    }
+};
 
 /// Tear down a connection that was never parked: TLS shutdown, socket close,
 /// pooled-session release, and connection-slot release. Mirrors the registry's

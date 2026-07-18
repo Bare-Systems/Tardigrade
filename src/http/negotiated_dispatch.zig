@@ -90,6 +90,27 @@ pub fn selectNegotiatedProtocol(
     return protocol;
 }
 
+pub fn dispatchToRuntime(
+    runtime: anytype,
+    conn: anytype,
+    negotiated: tls_termination.NegotiatedProtocol,
+    comptime Runtime: type,
+) !Runtime.Outcome {
+    return switch (negotiated) {
+        .http2 => blk: {
+            try Runtime.handleHttp2(runtime, conn);
+            break :blk .close;
+        },
+        .http1_1 => while (true) {
+            switch (try Runtime.serveHttp1(runtime, conn)) {
+                .serve_again => {},
+                .park => break .park,
+                .close => break .close,
+            }
+        },
+    };
+}
+
 test "ALPN mapping is explicit" {
     try std.testing.expectEqual(tls_termination.NegotiatedProtocol.http2, try mapNegotiatedHttpProtocol(tls.algorithms.alpn.h2.bytes, .require_match));
     try std.testing.expectEqual(tls_termination.NegotiatedProtocol.http1_1, try mapNegotiatedHttpProtocol(tls.algorithms.alpn.http_1_1.bytes, .require_match));
@@ -112,3 +133,45 @@ test "pinned listener policy validates selected protocol and fallback" {
     try std.testing.expectEqual(tls_termination.NegotiatedProtocol.http1_1, try selectNegotiatedProtocol(null, .{ .allow_http1_without_alpn = true }));
     try std.testing.expectError(error.NoApplicationProtocol, selectNegotiatedProtocol(null, .{ .http1_enabled = false, .allow_http1_without_alpn = true }));
 }
+
+test "shared runtime dispatch accepts OpenSSL and pure-Zig encrypted stream adapters" {
+    var runtime = TestRuntime{};
+    var openssl_conn = TestConn{ .backend = .openssl };
+    try std.testing.expectEqual(TestOutcome.park, try dispatchToRuntime(&runtime, &openssl_conn, .http1_1, TestRuntime));
+    try std.testing.expectEqual(@as(usize, 1), runtime.http1_calls);
+    try std.testing.expectEqual(tls.encrypted_stream.BackendKind.openssl, runtime.last_backend.?);
+
+    var pure_zig_conn = TestConn{ .backend = .pure_zig_record };
+    try std.testing.expectEqual(TestOutcome.close, try dispatchToRuntime(&runtime, &pure_zig_conn, .http2, TestRuntime));
+    try std.testing.expectEqual(@as(usize, 1), runtime.http2_calls);
+    try std.testing.expectEqual(tls.encrypted_stream.BackendKind.pure_zig_record, runtime.last_backend.?);
+}
+
+const TestOutcome = enum { serve_again, park, close };
+
+const TestConn = struct {
+    backend: tls.encrypted_stream.BackendKind,
+
+    fn streamBackend(self: *const TestConn) tls.encrypted_stream.BackendKind {
+        return self.backend;
+    }
+};
+
+const TestRuntime = struct {
+    const Outcome = TestOutcome;
+
+    http1_calls: usize = 0,
+    http2_calls: usize = 0,
+    last_backend: ?tls.encrypted_stream.BackendKind = null,
+
+    pub fn serveHttp1(self: *@This(), conn: anytype) !Outcome {
+        self.http1_calls += 1;
+        self.last_backend = conn.streamBackend();
+        return .park;
+    }
+
+    pub fn handleHttp2(self: *@This(), conn: anytype) !void {
+        self.http2_calls += 1;
+        self.last_backend = conn.streamBackend();
+    }
+};

@@ -982,16 +982,27 @@ pub const PureZigRecordStream = struct {
         return emitted;
     }
 
-    /// Handshake secrets advance the explicit record epoch one step. Application
-    /// secrets do NOT advance the epoch here: the peer may still be sending
-    /// handshake-epoch records (its Finished) after this side installs its
-    /// application read secret. The `.application` transition happens only at
-    /// authenticated `handshake_complete`.
+    /// Handshake secrets advance the explicit record epoch one step. TLS 1.3
+    /// then advances each application direction when that side has installed
+    /// the corresponding traffic secret, not only when the whole handshake is
+    /// complete: after a server sends Finished it must seal client-auth alerts
+    /// with application write keys, while it still reads the client's Finished
+    /// under handshake keys.
     fn advanceEpochOnSecret(self: *PureZigRecordStream, epoch: events.EncryptionEpoch, direction: events.SecretDirection) void {
-        if (epoch != .handshake) return;
-        switch (direction) {
-            .read => self.read_epoch = .handshake,
-            .write => self.write_epoch = .handshake,
+        switch (epoch) {
+            .handshake => switch (direction) {
+                .read => self.read_epoch = epoch,
+                .write => self.write_epoch = epoch,
+            },
+            .application => switch (direction) {
+                .read => {
+                    if (self.role == .client) self.read_epoch = .application;
+                },
+                .write => {
+                    if (self.role == .server) self.write_epoch = .application;
+                },
+            },
+            .initial, .zero_rtt => {},
         }
     }
 
@@ -1032,6 +1043,8 @@ pub const PureZigRecordStream = struct {
             error.CredentialProviderFailed,
             error.ClientCertificateRequired,
             error.DecryptError,
+            error.MissingExtension,
+            error.UnsupportedCertificate,
             => alerts.fromHandshakeError(@errorCast(err)),
             else => null,
         };
@@ -1293,10 +1306,12 @@ pub const PureZigRecordStream = struct {
             }
 
             var record_budget_remaining: usize = drive_record_budget;
-            if (try self.processCarrierInputBudget(&record_budget_remaining)) made_progress = true;
+            if (!self.authStillPending()) {
+                if (try self.processCarrierInputBudget(&record_budget_remaining)) made_progress = true;
+            }
 
             var read_total: usize = 0;
-            while (!self.carrier_eof and read_total < drive_read_budget and self.canAcceptCarrierRead() and self.inbound_carrier.available() > 0) {
+            while (!self.authStillPending() and !self.carrier_eof and read_total < drive_read_budget and self.canAcceptCarrierRead() and self.inbound_carrier.available() > 0) {
                 var buf: [drive_read_chunk]u8 = undefined;
                 const read_room = self.inboundCiphertextReadRoom() catch |err| return self.fail(err);
                 const read_cap = @min(buf.len, @min(self.inbound_carrier.available(), @min(drive_read_budget - read_total, read_room)));
@@ -1327,7 +1342,7 @@ pub const PureZigRecordStream = struct {
                     break;
                 }
             }
-            if (self.carrier_eof) {
+            if (!self.authStillPending() and self.carrier_eof) {
                 if (try self.handleCarrierEof(&record_budget_remaining)) made_progress = true;
             }
         } else if (self.lifecycle == .closing) {
@@ -1337,7 +1352,7 @@ pub const PureZigRecordStream = struct {
                 self.lifecycle = .closed;
                 made_progress = true;
             }
-        } else {
+        } else if (!self.authStillPending()) {
             if (try self.processCarrierInput(drive_record_budget)) made_progress = true;
         }
 
@@ -1450,6 +1465,11 @@ pub const PureZigRecordStream = struct {
         return consumed;
     }
 
+    fn authStillPending(self: *const PureZigRecordStream) bool {
+        if (self.handshake_driver) |*driver| return driver.authPending();
+        return false;
+    }
+
     /// Best-effort nonblocking flush of a queued fatal alert to the carrier
     /// before the stream latches closed. Returns bytes written.
     fn flushPendingAlert(self: *PureZigRecordStream) usize {
@@ -1498,7 +1518,7 @@ pub const PureZigRecordStream = struct {
 
     fn processCarrierInputBudget(self: *PureZigRecordStream, record_budget_remaining: *usize) Error!bool {
         const initial_budget = record_budget_remaining.*;
-        while (record_budget_remaining.* > 0 and self.inbound_carrier.len > 0 and self.canProcessCarrierInput()) {
+        while (!self.authStillPending() and record_budget_remaining.* > 0 and self.inbound_carrier.len > 0 and self.canProcessCarrierInput()) {
             const pending = self.inbound_carrier.slice();
             const consumed = self.feedCarrierCiphertext(pending) catch |err| switch (err) {
                 error.WouldBlock => break,

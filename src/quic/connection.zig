@@ -107,6 +107,7 @@ pub const Event = union(enum) {
 
 pub const DropReason = enum {
     unknown_cid,
+    keys_unavailable,
     undecryptable,
     malformed,
     unsupported_version,
@@ -645,6 +646,10 @@ pub const Connection = struct {
             else => unreachable,
         };
         const space = spaceForLevel(level);
+        if (level == .application and !self.handshake_complete) {
+            self.dropPacket(.keys_unavailable, bytes.len);
+            return;
+        }
 
         // Header protection removal needs a sample 4 bytes past pn_offset.
         var work: [2048]u8 = undefined;
@@ -2347,12 +2352,33 @@ test "handshake failures map to their RFC 9001 CRYPTO_ERROR alert codes" {
     try testing.expectEqual(error_crypto_base + 50, Connection.cryptoErrorCode(error.MalformedHandshake));
     try testing.expectEqual(error_crypto_base + 120, Connection.cryptoErrorCode(error.AlpnMismatch));
     try testing.expectEqual(error_crypto_base + 42, Connection.cryptoErrorCode(error.CertificateInvalid));
+    try testing.expectEqual(error_crypto_base + 43, Connection.cryptoErrorCode(error.UnsupportedCertificate));
+    try testing.expectEqual(error_crypto_base + 109, Connection.cryptoErrorCode(error.MissingExtension));
     // #334 review: NoApplicableCredential was missing from this table and fell
     // through to the generic internal_error(80) code instead of the canonical
     // handshake_failure(40) `alerts.fromHandshakeError` maps it to.
     try testing.expectEqual(error_crypto_base + 40, Connection.cryptoErrorCode(error.NoApplicableCredential));
     try testing.expectEqual(error_crypto_base + 116, Connection.cryptoErrorCode(error.ClientCertificateRequired));
     try testing.expectEqual(error_crypto_base + 51, Connection.cryptoErrorCode(error.DecryptError));
+}
+
+test "driver: 1-RTT packets are dropped before deprotection until TLS handshake complete" {
+    const allocator = testing.allocator;
+    var pair = try TestPair.init(allocator);
+    defer pair.deinit(allocator);
+    try pair.pump();
+
+    const id = try pair.client.openStream(.bidi);
+    try testing.expectEqual(@as(usize, 5), try pair.client.writeStream(id, "hello", false));
+    var datagram: [max_datagram_size]u8 = undefined;
+    const one_rtt = pair.client.pollTransmit(&datagram, pair.now_us) orelse return error.TestExpectedEqual;
+
+    const received_before = pair.server.metrics.packets_received;
+    const dropped_before = pair.server.metrics.packets_dropped;
+    pair.server.handshake_complete = false;
+    try pair.server.ingest(one_rtt, pair.now_us);
+    try testing.expectEqual(received_before, pair.server.metrics.packets_received);
+    try testing.expectEqual(dropped_before + 1, pair.server.metrics.packets_dropped);
 }
 
 test "a real Connection closes with handshake_failure when the server has no applicable credential" {

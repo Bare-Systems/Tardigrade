@@ -370,6 +370,7 @@ pub const FailureClass = enum {
     /// failure, so diagnostics name the right subsystem).
     provider_internal_failure,
     invalid_peer_certificate_chain,
+    unsupported_peer_certificate,
     /// The peer's CertificateVerify signature did not check out against its
     /// presented leaf (proof-of-possession failure). Peer-originated, but a
     /// distinct reason from a structurally invalid chain.
@@ -384,6 +385,7 @@ pub const FailureClass = enum {
     pub fn origin(self: FailureClass) Origin {
         return switch (self) {
             .invalid_peer_certificate_chain,
+            .unsupported_peer_certificate,
             .certificate_verify_invalid,
             .peer_verification_rejected,
             .client_certificate_required,
@@ -422,6 +424,7 @@ pub const FailureClass = enum {
             .invalid_peer_certificate_chain,
             .peer_verification_rejected,
             => .bad_certificate,
+            .unsupported_peer_certificate => .unsupported_certificate,
             // A CertificateVerify signature that fails proof of possession is a
             // decrypt_error, not a trust rejection (RFC 8446 §4.4.3).
             .certificate_verify_invalid => .decrypt_error,
@@ -438,6 +441,7 @@ pub const FailureClass = enum {
             .invalid_peer_certificate_chain,
             .peer_verification_rejected,
             => error.CertificateInvalid,
+            .unsupported_peer_certificate => error.UnsupportedCertificate,
             .certificate_verify_invalid => error.DecryptError,
             .client_certificate_required => error.ClientCertificateRequired,
             .no_credential_available,
@@ -1298,6 +1302,9 @@ test "every failure class maps to a deterministic alert, origin, and engine erro
         try testing.expectEqual(alerts.AlertDescription.bad_certificate, class.alert());
         try testing.expectEqual(@as(events.HandshakeError, error.CertificateInvalid), class.engineError());
     }
+    try testing.expectEqual(Origin.peer, FailureClass.unsupported_peer_certificate.origin());
+    try testing.expectEqual(alerts.AlertDescription.unsupported_certificate, FailureClass.unsupported_peer_certificate.alert());
+    try testing.expectEqual(@as(events.HandshakeError, error.UnsupportedCertificate), FailureClass.unsupported_peer_certificate.engineError());
     // A CertificateVerify proof-of-possession failure is peer-originated but
     // carries the distinct decrypt_error alert (RFC 8446 §4.4.3).
     try testing.expectEqual(Origin.peer, FailureClass.certificate_verify_invalid.origin());

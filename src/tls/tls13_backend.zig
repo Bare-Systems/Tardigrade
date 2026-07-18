@@ -378,7 +378,7 @@ pub const Tls13Backend = struct {
             // A name too long for the bounded buffer is a caller error. Record
             // the overflow and reject at `start` rather than truncating it to a
             // different host (see `server_name_overflow`).
-            if (name.len > self.server_name.len) {
+            if (name.len == 0 or name.len > self.server_name.len) {
                 self.server_name_overflow = true;
             } else {
                 @memcpy(self.server_name[0..name.len], name);
@@ -561,6 +561,9 @@ pub const Tls13Backend = struct {
                 break :blk &self.application_input;
             },
         };
+        if (level != .application and self.core.handshake_lifecycle == .complete) {
+            return error.UnexpectedHandshakeMessage;
+        }
         input.append(bytes) catch |err| return mapCoreError(err);
         // Never begin dispatching while an authentication operation is parked:
         // buffer the freshly received bytes and wait for `resumeAuth`. Without
@@ -587,6 +590,9 @@ pub const Tls13Backend = struct {
             // even if this loop is somehow re-entered mid-suspend.
             if (self.pending_op != null) break;
             if (level != try expectedLevel(message.kind)) return error.UnexpectedTransportEpoch;
+            if (level == .handshake and message.kind == .finished and input.len != message.raw.len) {
+                return error.UnexpectedHandshakeMessage;
+            }
             const transcript_before = self.core.transcriptHash();
             _ = self.core.acceptReceived(message.raw) catch |err| return mapCoreError(err);
             try self.onMessage(message, level, transcript_before, sink);
@@ -627,7 +633,9 @@ pub const Tls13Backend = struct {
             error.HandshakeBufferOverflow => error.HandshakeBufferOverflow,
             error.IllegalParameter => error.IllegalParameter,
             error.UnexpectedHandshakeMessage => error.UnexpectedHandshakeMessage,
+            error.MissingExtension => error.MissingExtension,
             error.AlpnMismatch => error.AlpnMismatch,
+            error.UnsupportedCertificate => error.UnsupportedCertificate,
             error.CertificateInvalid => error.CertificateInvalid,
             error.SecretExportFailed => error.SecretExportFailed,
             error.InvalidHandshakeState => error.InvalidHandshakeState,
@@ -919,7 +927,8 @@ pub const Tls13Backend = struct {
         }
         // signature_algorithms is mandatory in a CertificateRequest
         // (RFC 8446 §4.3.2); its absence is a malformed/missing peer extension.
-        if (!saw_signature_algorithms or self.peer_sig_scheme_count == 0) return error.MalformedHandshake;
+        if (!saw_signature_algorithms) return error.MissingExtension;
+        if (self.peer_sig_scheme_count == 0) return error.MalformedHandshake;
     }
 
     fn onCertificate(self: *Tls13Backend, body: []const u8) HandshakeError!void {
@@ -1024,13 +1033,16 @@ pub const Tls13Backend = struct {
         const signer_role: Role = if (self.role == .client) .server else .client;
 
         // The signature covers the transcript through Certificate (RFC 8446
-        // §4.4.3) — before this message is added. Proof of key possession is
-        // transcript crypto, not PKI policy: a failure is a `decrypt_error`, a
-        // distinct crypto failure from a trust rejection, so it does NOT emit a
-        // certificate-invalid (bad_certificate) verdict — it fails directly.
+        // §4.4.3) — before this message is added. Keep structural certificate
+        // failures, unsupported key material, unoffered algorithms, and actual
+        // signature mismatches distinct so alert mapping remains faithful.
         const content = certificateVerifyContent(signer_role, transcript_before);
-        if (!self.checkProofOfPossession(algorithm, signature, content.slice())) {
-            return self.failCredential(.certificate_verify_invalid);
+        switch (self.checkProofOfPossession(algorithm, signature, content.slice())) {
+            .valid => {},
+            .invalid_certificate => return self.failCredential(.invalid_peer_certificate_chain),
+            .unsupported_certificate => return self.failCredential(.unsupported_peer_certificate),
+            .unoffered_algorithm => return error.IllegalParameter,
+            .invalid_signature => return self.failCredential(.certificate_verify_invalid),
         }
 
         // Delegate the trust verdict to the peer verifier — the fixed pin/
@@ -1086,37 +1098,49 @@ pub const Tls13Backend = struct {
         }
     }
 
+    const ProofResult = enum {
+        valid,
+        invalid_signature,
+        invalid_certificate,
+        unsupported_certificate,
+        unoffered_algorithm,
+    };
+
+    fn locallyOfferedSignatureAlgorithm(algorithm: u16) bool {
+        return algorithm == sigalg_ed25519 or algorithm == sigalg_ecdsa_secp256r1_sha256;
+    }
+
     /// Verify the CertificateVerify signature against the peer leaf's public
     /// key: proof that the peer holds the private key for the presented
-    /// certificate. Returns false on any mismatch. This is not a trust decision
-    /// — that is the verifier's job.
-    fn checkProofOfPossession(self: *const Tls13Backend, algorithm: u16, signature: []const u8, content: []const u8) bool {
-        if (self.peer_chain_count == 0) return false;
+    /// certificate. This is not a trust decision — that is the verifier's job.
+    fn checkProofOfPossession(self: *const Tls13Backend, algorithm: u16, signature: []const u8, content: []const u8) ProofResult {
+        if (!locallyOfferedSignatureAlgorithm(algorithm)) return .unoffered_algorithm;
+        if (self.peer_chain_count == 0) return .invalid_certificate;
         const e = self.peer_chain_entries[0];
         const leaf = self.peer_chain[e.start..][0..e.len];
-        const parsed = (Certificate{ .buffer = leaf, .index = 0 }).parse() catch return false;
+        const parsed = (Certificate{ .buffer = leaf, .index = 0 }).parse() catch return .invalid_certificate;
         switch (algorithm) {
             sigalg_ed25519 => {
-                if (signature.len != Ed25519.Signature.encoded_length) return false;
-                if (parsed.pub_key_algo != .curveEd25519) return false;
+                if (signature.len != Ed25519.Signature.encoded_length) return .invalid_signature;
+                if (parsed.pub_key_algo != .curveEd25519) return .unsupported_certificate;
                 const pub_key_bytes = parsed.pubKey();
-                if (pub_key_bytes.len != Ed25519.PublicKey.encoded_length) return false;
-                const public_key = Ed25519.PublicKey.fromBytes(pub_key_bytes[0..Ed25519.PublicKey.encoded_length].*) catch return false;
+                if (pub_key_bytes.len != Ed25519.PublicKey.encoded_length) return .unsupported_certificate;
+                const public_key = Ed25519.PublicKey.fromBytes(pub_key_bytes[0..Ed25519.PublicKey.encoded_length].*) catch return .unsupported_certificate;
                 const sig = Ed25519.Signature.fromBytes(signature[0..Ed25519.Signature.encoded_length].*);
-                sig.verify(content, public_key) catch return false;
+                sig.verify(content, public_key) catch return .invalid_signature;
             },
             sigalg_ecdsa_secp256r1_sha256 => {
                 switch (parsed.pub_key_algo) {
-                    .X9_62_id_ecPublicKey => |curve| if (curve != .X9_62_prime256v1) return false,
-                    else => return false,
+                    .X9_62_id_ecPublicKey => |curve| if (curve != .X9_62_prime256v1) return .unsupported_certificate,
+                    else => return .unsupported_certificate,
                 }
-                const public_key = EcdsaP256.PublicKey.fromSec1(parsed.pubKey()) catch return false;
-                const sig = EcdsaP256.Signature.fromDer(signature) catch return false;
-                sig.verify(content, public_key) catch return false;
+                const public_key = EcdsaP256.PublicKey.fromSec1(parsed.pubKey()) catch return .unsupported_certificate;
+                const sig = EcdsaP256.Signature.fromDer(signature) catch return .invalid_signature;
+                sig.verify(content, public_key) catch return .invalid_signature;
             },
-            else => return false,
+            else => unreachable,
         }
-        return true;
+        return .valid;
     }
 
     fn onServerFinished(self: *Tls13Backend, transcript_before: [hash_len]u8, body: []const u8, sink: *EventSink) HandshakeError!void {
@@ -1124,9 +1148,7 @@ pub const Tls13Backend = struct {
         if (body.len != hash_len) return error.MalformedHandshake;
         var expected = KeySchedule.verifyData(&schedule.server_handshake_traffic, transcript_before);
         defer crypto.secureZero(u8, &expected);
-        if (!crypto.timing_safe.eql([hash_len]u8, expected, body[0..hash_len].*)) {
-            return error.MalformedHandshake;
-        }
+        if (!crypto.timing_safe.eql([hash_len]u8, expected, body[0..hash_len].*)) return error.DecryptError;
 
         // 1-RTT secrets exist from the transcript through server Finished,
         // independent of any client certificate flight that follows.
@@ -1475,7 +1497,8 @@ pub const Tls13Backend = struct {
         // with a certificate (RFC 8446 §9.2). A missing or empty list is a
         // malformed/missing required *peer* extension — attribute it to the
         // peer (decode_error), not to local credential configuration.
-        if (!saw_signature_algorithms or self.peer_sig_scheme_count == 0) return error.MalformedHandshake;
+        if (!saw_signature_algorithms) return error.MissingExtension;
+        if (self.peer_sig_scheme_count == 0) return error.MalformedHandshake;
         const client_share = peer_share orelse return error.MalformedHandshake;
 
         // Validate the peer share before emitting anything: X25519.scalarmult
@@ -1839,7 +1862,7 @@ pub const Tls13Backend = struct {
                 .no_credential => return self.failCredential(.no_credential_available),
                 else => {
                     releaseCompletionCredentials(completion, null);
-                    return self.failCredential(.provider_internal_failure);
+                    return self.failCredential(.invalid_callback_behavior);
                 },
             },
             .client_select => switch (completion) {
@@ -1849,7 +1872,7 @@ pub const Tls13Backend = struct {
                 .no_credential => return self.emitClientCertificate(null, sink),
                 else => {
                     releaseCompletionCredentials(completion, null);
-                    return self.failCredential(.provider_internal_failure);
+                    return self.failCredential(.invalid_callback_behavior);
                 },
             },
             .server_sign, .client_sign => {
@@ -1872,7 +1895,7 @@ pub const Tls13Backend = struct {
                 .verdict => |v| return self.applyPeerVerdict(v, sink),
                 else => {
                     releaseCompletionCredentials(completion, null);
-                    return self.failCredential(.verifier_internal_failure);
+                    return self.failCredential(.invalid_callback_behavior);
                 },
             },
         }
@@ -1929,9 +1952,7 @@ pub const Tls13Backend = struct {
         // server flight was sent.
         var expected = KeySchedule.verifyData(&schedule.client_handshake_traffic, transcript_before);
         defer crypto.secureZero(u8, &expected);
-        if (!crypto.timing_safe.eql([hash_len]u8, expected, body[0..hash_len].*)) {
-            return error.MalformedHandshake;
-        }
+        if (!crypto.timing_safe.eql([hash_len]u8, expected, body[0..hash_len].*)) return error.DecryptError;
         // Client Finished confirms the handshake for the server (RFC 8446 §4.4.4).
         try self.emitDiscardKeys(sink, .handshake);
         try sink.emitHandshakeComplete();

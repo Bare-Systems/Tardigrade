@@ -1059,6 +1059,7 @@ const ClientHelloOptions = struct {
     /// Raw bytes to place verbatim as the server_name extension body (the
     /// ServerNameList), for crafting malformed/duplicate SNI. Overrides `sni`.
     sni_raw: ?[]const u8 = null,
+    include_signature_algorithms: bool = true,
     sig_schemes: []const u16 = &.{ 0x0807, 0x0403 },
     alpn: []const u8 = "h2",
 };
@@ -1092,10 +1093,12 @@ fn buildClientHello(buf: []u8, opts: ClientHelloOptions) ![]const u8 {
     try w.u16_(2);
     try w.u16_(0x001d);
     // signature_algorithms
-    try w.u16_(13);
-    try w.u16_(@intCast(2 + 2 * opts.sig_schemes.len));
-    try w.u16_(@intCast(2 * opts.sig_schemes.len));
-    for (opts.sig_schemes) |scheme| try w.u16_(scheme);
+    if (opts.include_signature_algorithms) {
+        try w.u16_(13);
+        try w.u16_(@intCast(2 + 2 * opts.sig_schemes.len));
+        try w.u16_(@intCast(2 * opts.sig_schemes.len));
+        for (opts.sig_schemes) |scheme| try w.u16_(scheme);
+    }
     // key_share
     try w.u16_(51);
     try w.u16_(2 + 2 + 2 + X25519.public_length);
@@ -1393,6 +1396,12 @@ test "an empty signature_algorithms list is a peer-attributed malformed ClientHe
     try expectServerReceiveError(&server, .{ .sig_schemes = &.{} }, error.MalformedHandshake);
 }
 
+test "an absent signature_algorithms extension maps to missing_extension" {
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .{ .record = .{ .alpn = "h2" } });
+    defer server.deinit();
+    try expectServerReceiveError(&server, .{ .include_signature_algorithms = false }, error.MissingExtension);
+}
+
 test "malformed SNI is rejected rather than collapsed into the default path" {
     // Empty host_name.
     {
@@ -1530,6 +1539,13 @@ fn certificateStateIn(sink: *const DirectSink) ?events.CertificateState {
         }
     }
     return found;
+}
+
+fn handshakeCompleteIn(sink: *const DirectSink) bool {
+    for (sink.items[0..sink.len]) |event| {
+        if (event == .handshake_complete) return true;
+    }
+    return false;
 }
 
 fn firstInitialCrypto(sink: *const DirectSink, out: []u8) []const u8 {
@@ -1756,6 +1772,58 @@ test "a cancelled async peer verification cancels and releases the operation onc
     client.deinit();
     try std.testing.expectEqual(@as(usize, 1), verifier.cancel_count);
     try std.testing.expectEqual(@as(usize, 1), verifier.op_release_count);
+}
+
+test "a client rejects trailing handshake bytes after the server Finished" {
+    var verifier = credentials.MockVerifier.init(.accepted);
+    var client = tls_backend.Tls13Backend.initClientWithVerifier(clientEntropy(), verifier.verifier(), .{ .record = .{ .alpn = "h2" } }, .{});
+    defer client.deinit();
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .{ .record = .{ .alpn = "h2" } });
+    defer server.deinit();
+    var client_sink = DirectSink{};
+    defer client_sink.deinit();
+    var server_sink = DirectSink{};
+    defer server_sink.deinit();
+
+    try client.backend().start(.client, {}, &client_sink);
+    var ch_buf: [1024]u8 = undefined;
+    const client_hello = firstInitialCrypto(&client_sink, &ch_buf);
+    try server.backend().start(.server, {}, &server_sink);
+    try server.backend().receive(.initial, client_hello, &server_sink);
+
+    var sh_buf: [512]u8 = undefined;
+    const server_hello = firstInitialCrypto(&server_sink, &sh_buf);
+    var flight_buf: [8192]u8 = undefined;
+    const flight = collectHandshakeCrypto(&server_sink, &flight_buf);
+    var suffixed: [8193]u8 = undefined;
+    @memcpy(suffixed[0..flight.len], flight);
+    suffixed[flight.len] = @intFromEnum(HsMessageType.finished);
+
+    client_sink.reset();
+    try client.backend().receive(.initial, server_hello, &client_sink);
+    try std.testing.expectError(error.UnexpectedHandshakeMessage, client.backend().receive(.handshake, suffixed[0 .. flight.len + 1], &client_sink));
+    try std.testing.expect(!handshakeCompleteIn(&client_sink));
+}
+
+test "a server rejects trailing handshake bytes after the client Finished" {
+    var client = tls_backend.Tls13Backend.initClient(clientEntropy(), .{ .pinned_certificate = tls_backend.testdata.certificate_der }, .{ .record = .{ .alpn = "h2" } });
+    defer client.deinit();
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .{ .record = .{ .alpn = "h2" } });
+    defer server.deinit();
+    var client_sink = DirectSink{};
+    defer client_sink.deinit();
+    var server_sink = DirectSink{};
+    defer server_sink.deinit();
+
+    try deliverServerFlightToClient(&client, &server, &client_sink, &server_sink);
+    var finished_buf: [512]u8 = undefined;
+    const client_finished = collectHandshakeCrypto(&client_sink, &finished_buf);
+    var suffixed: [513]u8 = undefined;
+    @memcpy(suffixed[0..client_finished.len], client_finished);
+    suffixed[client_finished.len] = @intFromEnum(HsMessageType.certificate);
+
+    try std.testing.expectError(error.UnexpectedHandshakeMessage, server.backend().receive(.handshake, suffixed[0 .. client_finished.len + 1], &server_sink));
+    try std.testing.expect(!handshakeCompleteIn(&server_sink));
 }
 
 // ===========================================================================
@@ -2024,7 +2092,7 @@ const WrongKindSelectProvider = struct {
     }
 };
 
-test "a malformed async client selection completion is rejected as a provider failure" {
+test "a malformed async client selection completion is rejected as invalid callback behavior" {
     var wrong = WrongKindSelectProvider{};
     var client = clientWithLocalCredential(wrong.provider());
     defer client.deinit();
@@ -2042,27 +2110,28 @@ test "a malformed async client selection completion is rejected as a provider fa
     // The resume observes a signature-length completion where a credential was
     // required and fails closed without emitting a client flight.
     try std.testing.expectError(error.CredentialProviderFailed, client.resumeAuth(&client_sink));
-    try std.testing.expectEqual(tls_backend.CredentialFailure.provider_internal_failure, client.credentialFailure().?);
+    try std.testing.expectEqual(tls_backend.CredentialFailure.invalid_callback_behavior, client.credentialFailure().?);
     try std.testing.expectEqual(@as(usize, 1), wrong.release_count);
 }
 
-test "an oversized configured server name is rejected at start rather than truncated" {
+test "an invalid configured server name is rejected at start rather than emitted" {
     var verifier = credentials.MockVerifier.init(.accepted);
-    // One byte past the bounded SNI buffer (max_server_name_len is 256).
-    const too_long = [_]u8{'a'} ** 257;
-    var client = tls_backend.Tls13Backend.initClientWithVerifier(
-        clientEntropy(),
-        verifier.verifier(),
-        .{ .record = .{ .alpn = "h2" } },
-        .{ .server_name = &too_long },
-    );
-    defer client.deinit();
-    var sink = DirectSink{};
-    defer sink.deinit();
-    // Fails closed before any ClientHello is emitted; nothing is truncated.
-    try std.testing.expectError(error.InvalidHandshakeState, client.backend().start(.client, {}, &sink));
-    try std.testing.expectEqual(@as(usize, 0), sink.len);
-    try std.testing.expect(!client.key_pair_present);
+    for ([_][]const u8{ "", &([_]u8{'a'} ** 257) }) |name| {
+        var client = tls_backend.Tls13Backend.initClientWithVerifier(
+            clientEntropy(),
+            verifier.verifier(),
+            .{ .record = .{ .alpn = "h2" } },
+            .{ .server_name = name },
+        );
+        defer client.deinit();
+        var sink = DirectSink{};
+        defer sink.deinit();
+        // Fails closed before any ClientHello is emitted; nothing is truncated
+        // or encoded as an empty host_name.
+        try std.testing.expectError(error.InvalidHandshakeState, client.backend().start(.client, {}, &sink));
+        try std.testing.expectEqual(@as(usize, 0), sink.len);
+        try std.testing.expect(!client.key_pair_present);
+    }
 }
 
 test "a ClientHello combining maximum ALPN, SNI, and transport extension serializes successfully" {
@@ -2460,14 +2529,11 @@ test "record mode delivers a fatal alert to the client when required client auth
     h.server_engine.requestClientAuthentication(.required, verifier.verifier());
 
     const failures = driveUntilBothErrors(h);
-    // The server fails with certificate_required and synthesizes the alert
-    // (previously it emitted none and the peer only saw a stall/EOF). The client
-    // terminates on the delivered alert rather than hanging. (The client has
-    // already reached 1-RTT here, so the exact received-alert surface depends on
-    // epoch timing; the decrypt_error test above covers the clean PeerFatalAlert
-    // path end to end.)
+    // The server fails with certificate_required and synthesizes an
+    // application-key alert after its Finished. The client must receive the
+    // alert, not just hit EOF or an AEAD failure.
     try std.testing.expectEqual(@as(?anyerror, error.ClientCertificateRequired), failures.server);
-    try std.testing.expect(failures.client != null);
+    try std.testing.expectEqual(@as(?anyerror, error.PeerFatalAlert), failures.client);
     try std.testing.expect(!h.server.bridge.handshake_complete);
     try std.testing.expectEqual(tls_backend.CredentialFailure.client_certificate_required, h.server_engine.credentialFailure().?);
 }

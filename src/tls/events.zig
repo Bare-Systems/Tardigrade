@@ -46,8 +46,16 @@ pub const HandshakeError = error{
     /// concern (`UnexpectedCryptoLevel`), not this. Maps to the
     /// `unexpected_message` alert (RFC 8446 §6).
     UnexpectedHandshakeMessage,
+    /// A required TLS extension was absent. Distinct from a present extension
+    /// whose vector is empty or malformed, which remains a decode or parameter
+    /// failure. Maps to `missing_extension` (RFC 8446 §6).
+    MissingExtension,
     /// ALPN did not negotiate an acceptable application protocol.
     AlpnMismatch,
+    /// The peer presented a certificate or public key type this implementation
+    /// cannot use for the selected authentication operation. Maps to
+    /// `unsupported_certificate`.
+    UnsupportedCertificate,
     /// The peer certificate was rejected by local policy or failed proof of key
     /// possession.
     CertificateInvalid,

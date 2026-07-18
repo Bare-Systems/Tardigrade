@@ -10,6 +10,7 @@ const std = @import("std");
 const std_crypto = std.crypto;
 const crypto_provider = @import("crypto").provider;
 const credentials = @import("credentials.zig");
+const dns_name = @import("dns_name.zig");
 
 pub const max_bundles = 64;
 pub const max_patterns_per_bundle = 16;
@@ -80,8 +81,16 @@ pub const SignAdapter = union(enum) {
     pub const SigningKeyAdapter = struct {
         key: crypto_provider.SigningKey,
         entropy: crypto_provider.Entropy,
-        release_context: ?*anyopaque = null,
-        release: ?*const fn (context: *anyopaque) void = null,
+        ownership: SigningKeyOwnership = .borrowed,
+    };
+
+    pub const SigningKeyOwnership = union(enum) {
+        borrowed,
+        owned: struct {
+            context: *anyopaque,
+            release: *const fn (context: *anyopaque) void,
+        },
+        invalid_release_contract,
     };
 
     pub fn fromIdentity(identity: credentials.Identity) SignAdapter {
@@ -102,7 +111,11 @@ pub const SignAdapter = union(enum) {
         release_context: ?*anyopaque,
         release_fn: ?*const fn (*anyopaque) void,
     ) SignAdapter {
-        return .{ .signing_key = .{ .key = key, .entropy = entropy, .release_context = release_context, .release = release_fn } };
+        const ownership: SigningKeyOwnership = if (release_fn) |release_callback| blk: {
+            const context = release_context orelse break :blk .invalid_release_contract;
+            break :blk .{ .owned = .{ .context = context, .release = release_callback } };
+        } else .borrowed;
+        return .{ .signing_key = .{ .key = key, .entropy = entropy, .ownership = ownership } };
     }
 
     fn sign(self: *SignAdapter, scheme: credentials.SignatureScheme, input: []const u8, out: []u8) credentials.SignError!usize {
@@ -131,8 +144,9 @@ pub const SignAdapter = union(enum) {
         switch (self.*) {
             .identity => |*identity| std_crypto.secureZero(u8, std.mem.asBytes(&identity.key)),
             .external => |external| external.release(external.context),
-            .signing_key => |adapter| if (adapter.release) |release_fn| {
-                release_fn(adapter.release_context.?);
+            .signing_key => |adapter| switch (adapter.ownership) {
+                .borrowed, .invalid_release_contract => {},
+                .owned => |owned| owned.release(owned.context),
             },
         }
     }
@@ -198,9 +212,7 @@ pub const Snapshot = struct {
     generation: u64,
     bundles: []CredentialBundle,
     ref_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(1),
-    deinit_count: *usize = &noop_deinit_count,
-
-    var noop_deinit_count: usize = 0;
+    deinit_count: ?*std.atomic.Value(usize) = null,
 
     pub fn build(
         allocator: std.mem.Allocator,
@@ -208,6 +220,14 @@ pub const Snapshot = struct {
         options: SnapshotOptions,
         generation: u64,
     ) BuildError!*Snapshot {
+        var consumed: usize = 0;
+        errdefer {
+            for (configs[consumed..]) |config| {
+                var signer = config.signer;
+                signer.release();
+            }
+        }
+
         if (configs.len == 0) return error.EmptyCredentialSet;
         if (configs.len > max_bundles) return error.EmptyCredentialSet;
 
@@ -232,6 +252,7 @@ pub const Snapshot = struct {
 
         var default_count: usize = 0;
         for (configs, 0..) |config, index| {
+            consumed = index + 1;
             bundles[index] = try buildBundle(allocator, config, index);
             initialized += 1;
             if (bundles[index].is_default) default_count += 1;
@@ -259,7 +280,9 @@ pub const Snapshot = struct {
     }
 
     fn deinit(self: *Snapshot) void {
-        self.deinit_count.* += 1;
+        if (self.deinit_count) |counter| {
+            _ = counter.fetchAdd(1, .monotonic);
+        }
         for (self.bundles) |*bundle| bundle.deinit(self.allocator);
         self.allocator.free(self.bundles);
         self.bundles = &.{};
@@ -360,6 +383,17 @@ pub const ReloadableProvider = struct {
 
     pub fn install(self: *ReloadableProvider, replacement: *Snapshot) void {
         self.mutex.lock();
+        if (self.current) |current| {
+            if (current == replacement) {
+                self.mutex.unlock();
+                return;
+            }
+            if (replacement.generation <= current.generation) {
+                self.mutex.unlock();
+                replacement.release();
+                return;
+            }
+        }
         const retired = self.current;
         self.current = replacement;
         self.mutex.unlock();
@@ -486,7 +520,10 @@ fn buildBundle(
     switch (signer) {
         .external => {},
         .signing_key => |adapter| {
-            if (adapter.release != null and adapter.release_context == null) return error.InvalidOwnershipContract;
+            if (adapter.ownership == .invalid_release_contract) return error.InvalidOwnershipContract;
+            const actual = providerToTlsScheme(adapter.key.scheme()) orelse return error.NoSupportedSignatureScheme;
+            if (!schemeLegalForKeyKind(config.key_kind, actual) or !containsScheme(schemes, actual))
+                return error.KeySignerMismatch;
         },
         .identity => |*identity| if (identity.signatureScheme() != schemes[0] or !schemeLegalForKeyKind(config.key_kind, identity.signatureScheme()))
             return error.KeySignerMismatch,
@@ -565,43 +602,16 @@ fn parseHostPattern(allocator: std.mem.Allocator, raw: []const u8) BuildError!Ho
         if (star != 0 or raw.len < 3 or raw[1] != '.') return error.InvalidWildcardPattern;
         if (std.mem.indexOfScalar(u8, raw[1..], '*') != null) return error.InvalidWildcardPattern;
         const suffix_raw = raw[1..];
-        try validateDnsName(suffix_raw[1..], true);
+        dns_name.validateWildcardSuffix(suffix_raw[1..]) catch return error.InvalidWildcardPattern;
         const suffix = allocator.alloc(u8, suffix_raw.len) catch return error.OutOfMemory;
         for (suffix_raw, 0..) |ch, i| suffix[i] = asciiLower(ch);
         return .{ .wildcard_suffix = suffix };
     }
 
-    try validateDnsName(raw, false);
+    dns_name.validateHostName(raw) catch return error.InvalidHostPattern;
     const exact = allocator.alloc(u8, raw.len) catch return error.OutOfMemory;
     for (raw, 0..) |ch, i| exact[i] = asciiLower(ch);
     return .{ .exact = exact };
-}
-
-fn validateDnsName(name: []const u8, wildcard_suffix: bool) BuildError!void {
-    if (name.len == 0 or name.len > max_host_pattern_len) return error.InvalidHostPattern;
-    if (name[0] == '.' or name[name.len - 1] == '.') return if (wildcard_suffix) error.InvalidWildcardPattern else error.InvalidHostPattern;
-    var label_len: usize = 0;
-    var labels: usize = 0;
-    for (name) |ch| {
-        if (ch == '.') {
-            if (label_len == 0 or label_len > 63) return if (wildcard_suffix) error.InvalidWildcardPattern else error.InvalidHostPattern;
-            labels += 1;
-            label_len = 0;
-            continue;
-        }
-        if (!isDnsLabelByte(ch)) return if (wildcard_suffix) error.InvalidWildcardPattern else error.InvalidHostPattern;
-        label_len += 1;
-    }
-    if (label_len == 0 or label_len > 63) return if (wildcard_suffix) error.InvalidWildcardPattern else error.InvalidHostPattern;
-    labels += 1;
-    if (wildcard_suffix and labels < 2) return error.InvalidWildcardPattern;
-}
-
-fn isDnsLabelByte(ch: u8) bool {
-    return (ch >= 'A' and ch <= 'Z') or
-        (ch >= 'a' and ch <= 'z') or
-        (ch >= '0' and ch <= '9') or
-        ch == '-';
 }
 
 fn hasDuplicatePatternIn(patterns: []const HostPattern, candidate: HostPattern) bool {
@@ -642,9 +652,14 @@ pub fn wildcardMatchesSuffix(server_name: []const u8, suffix: []const u8) bool {
 
 fn lowerHostInto(raw: []const u8, out: *[max_host_pattern_len]u8) BuildError![]const u8 {
     if (raw.len == 0 or raw.len > out.len) return error.InvalidHostPattern;
-    try validateDnsName(raw, false);
+    dns_name.validateHostName(raw) catch return error.InvalidHostPattern;
     for (raw, 0..) |ch, i| out[i] = asciiLower(ch);
     return out[0..raw.len];
+}
+
+fn containsScheme(schemes: []const credentials.SignatureScheme, needle: credentials.SignatureScheme) bool {
+    for (schemes) |scheme| if (scheme == needle) return true;
+    return false;
 }
 
 fn chooseCompatibleScheme(bundle: *const CredentialBundle, offered: []const u16) ?credentials.SignatureScheme {
@@ -937,8 +952,8 @@ test "snapshot owns chain and pattern copies after caller mutation" {
 }
 
 test "reload keeps selected generation alive until handle release" {
-    var first_deinit: usize = 0;
-    var second_deinit: usize = 0;
+    var first_deinit = std.atomic.Value(usize).init(0);
+    var second_deinit = std.atomic.Value(usize).init(0);
     var provider = ReloadableProvider.init(testing.allocator);
     defer provider.deinit();
 
@@ -948,22 +963,42 @@ test "reload keeps selected generation alive until handle release" {
 
     var selection = testSelection("first.example.test", &.{0x0807});
     const selected = try syncSelect(provider.provider(), &selection);
-    try testing.expectEqual(@as(usize, 0), first_deinit);
+    try testing.expectEqual(@as(usize, 0), first_deinit.load(.monotonic));
 
     var second = try provider.buildSnapshot(&.{identityConfig(&.{"second.example.test"}, true)}, .{});
     second.deinit_count = &second_deinit;
     provider.install(second);
-    try testing.expectEqual(@as(usize, 0), first_deinit);
+    try testing.expectEqual(@as(usize, 0), first_deinit.load(.monotonic));
 
     var old_sig: [128]u8 = undefined;
     _ = try syncSign(selected, "still generation 1", &old_sig);
     selected.release();
-    try testing.expectEqual(@as(usize, 1), first_deinit);
+    try testing.expectEqual(@as(usize, 1), first_deinit.load(.monotonic));
 
     var new_selection = testSelection("second.example.test", &.{0x0807});
     const new_selected = try syncSelect(provider.provider(), &new_selection);
     new_selected.release();
-    try testing.expectEqual(@as(usize, 0), second_deinit);
+    try testing.expectEqual(@as(usize, 0), second_deinit.load(.monotonic));
+}
+
+test "install rejects stale generations without rolling back current snapshot" {
+    var stale_deinit = std.atomic.Value(usize).init(0);
+    var provider = ReloadableProvider.init(testing.allocator);
+    defer provider.deinit();
+
+    const stale = try Snapshot.build(testing.allocator, &.{identityConfig(&.{"stale.example.test"}, true)}, .{}, 1);
+    stale.deinit_count = &stale_deinit;
+    const current = try Snapshot.build(testing.allocator, &.{identityConfig(&.{"current.example.test"}, true)}, .{}, 2);
+    provider.install(current);
+    provider.install(stale);
+    try testing.expectEqual(@as(usize, 1), stale_deinit.load(.monotonic));
+
+    var old_selection = testSelection("stale.example.test", &.{0x0807});
+    try testing.expectError(error.NoCredentialAvailable, provider.provider().selectCredential(&old_selection));
+
+    var current_selection = testSelection("current.example.test", &.{0x0807});
+    const selected = try syncSelect(provider.provider(), &current_selection);
+    selected.release();
 }
 
 test "failed reload leaves current snapshot usable" {
@@ -1131,6 +1166,72 @@ test "ECDSA P-256 certificate metadata is selectable with a P-256 signer handle"
     try testing.expectEqual(@as(usize, 1), ext.release_count);
 }
 
+test "SigningKeyAdapter validates actual key scheme and ownership at build time" {
+    var fake_key = FakeSigningKey{ .scheme_value = .ecdsa_secp256r1_sha256 };
+    const mismatched = CredentialBundleConfig{
+        .chain = &.{credentials.testdata.certificate_der},
+        .patterns = &.{"mismatch.example.test"},
+        .signer = SignAdapter.fromSigningKey(fake_key.key(), fakeEntropy(), null, null),
+        .key_kind = .ed25519,
+        .supported_schemes = &.{.ed25519},
+        .is_default = true,
+    };
+    try testing.expectError(error.KeySignerMismatch, Snapshot.build(testing.allocator, &.{mismatched}, .{}, 1));
+
+    var release_count: usize = 0;
+    fake_key.scheme_value = .ed25519;
+    const invalid_owner = CredentialBundleConfig{
+        .chain = &.{credentials.testdata.certificate_der},
+        .patterns = &.{"invalid-owner.example.test"},
+        .signer = SignAdapter.fromSigningKey(fake_key.key(), fakeEntropy(), null, invalidSigningKeyRelease),
+        .key_kind = .ed25519,
+        .supported_schemes = &.{.ed25519},
+        .is_default = true,
+    };
+    invalid_release_count = &release_count;
+    defer invalid_release_count = null;
+    try testing.expectError(error.InvalidOwnershipContract, Snapshot.build(testing.allocator, &.{invalid_owner}, .{}, 1));
+    try testing.expectEqual(@as(usize, 0), release_count);
+}
+
+const FakeSigningKey = struct {
+    scheme_value: crypto_provider.SignatureScheme,
+
+    fn key(self: *FakeSigningKey) crypto_provider.SigningKey {
+        return .{ .context = self, .vtable = &vtable };
+    }
+
+    const vtable = crypto_provider.SigningKey.VTable{
+        .scheme = scheme,
+        .sign = sign,
+    };
+
+    fn scheme(ctx: *anyopaque) crypto_provider.SignatureScheme {
+        const self: *FakeSigningKey = @ptrCast(@alignCast(ctx));
+        return self.scheme_value;
+    }
+
+    fn sign(_: *anyopaque, _: []const u8, _: crypto_provider.Entropy, _: []u8) crypto_provider.SignError!usize {
+        return error.ProviderFailure;
+    }
+};
+
+var fake_entropy_context: u8 = 0;
+
+fn fakeEntropy() crypto_provider.Entropy {
+    return .{ .context = &fake_entropy_context, .fillFn = fakeEntropyFill };
+}
+
+fn fakeEntropyFill(_: *anyopaque, buffer: []u8) crypto_provider.EntropyError!void {
+    @memset(buffer, 0);
+}
+
+var invalid_release_count: ?*usize = null;
+
+fn invalidSigningKeyRelease(_: *anyopaque) void {
+    if (invalid_release_count) |count| count.* += 1;
+}
+
 fn decodeSinglePemCertificate(allocator: std.mem.Allocator, pem: []const u8) ![]u8 {
     const begin = "-----BEGIN CERTIFICATE-----";
     const end = "-----END CERTIFICATE-----";
@@ -1163,6 +1264,17 @@ const CountingExternal = struct {
     }
 };
 
+fn countedExternalConfig(ctx: *CountingExternal, patterns: []const []const u8, default: bool) CredentialBundleConfig {
+    return .{
+        .chain = &.{credentials.testdata.certificate_der},
+        .patterns = patterns,
+        .signer = SignAdapter.fromExternal(ctx, CountingExternal.sign, CountingExternal.release),
+        .key_kind = .ed25519,
+        .supported_schemes = &.{.ed25519},
+        .is_default = default,
+    };
+}
+
 var noop_external_context: u8 = 0;
 
 fn noopExternalSign(_: *anyopaque, _: credentials.SignatureScheme, _: []const u8, _: []u8) credentials.SignError!usize {
@@ -1188,6 +1300,48 @@ test "external signer owner release callback runs exactly once" {
         try testing.expectEqual(@as(usize, 0), ext.release_count);
     }
     try testing.expectEqual(@as(usize, 1), ext.release_count);
+}
+
+test "failed multi-bundle build releases every configured signer exactly once" {
+    {
+        var ext = [_]CountingExternal{ .{}, .{}, .{} };
+        const configs = [_]CredentialBundleConfig{
+            countedExternalConfig(&ext[0], &.{"bad*.example.test"}, false),
+            countedExternalConfig(&ext[1], &.{"later-one.example.test"}, false),
+            countedExternalConfig(&ext[2], &.{"later-two.example.test"}, true),
+        };
+        try testing.expectError(error.InvalidWildcardPattern, Snapshot.build(testing.allocator, &configs, .{}, 1));
+        for (&ext) |item| try testing.expectEqual(@as(usize, 1), item.release_count);
+    }
+    {
+        var ext = [_]CountingExternal{ .{}, .{}, .{} };
+        const configs = [_]CredentialBundleConfig{
+            countedExternalConfig(&ext[0], &.{"first.example.test"}, false),
+            countedExternalConfig(&ext[1], &.{"bad*.example.test"}, false),
+            countedExternalConfig(&ext[2], &.{"later.example.test"}, true),
+        };
+        try testing.expectError(error.InvalidWildcardPattern, Snapshot.build(testing.allocator, &configs, .{}, 1));
+        for (&ext) |item| try testing.expectEqual(@as(usize, 1), item.release_count);
+    }
+}
+
+test "allocation failure during external multi-bundle build releases every signer" {
+    try testing.checkAllAllocationFailures(testing.allocator, struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var ext = [_]CountingExternal{ .{}, .{}, .{} };
+            const configs = [_]CredentialBundleConfig{
+                countedExternalConfig(&ext[0], &.{"one.example.test"}, false),
+                countedExternalConfig(&ext[1], &.{"two.example.test"}, false),
+                countedExternalConfig(&ext[2], &.{"default.example.test"}, true),
+            };
+            const snapshot = Snapshot.build(allocator, &configs, .{}, 1) catch |err| {
+                for (&ext) |item| try testing.expectEqual(@as(usize, 1), item.release_count);
+                return err;
+            };
+            snapshot.release();
+            for (&ext) |item| try testing.expectEqual(@as(usize, 1), item.release_count);
+        }
+    }.run, .{});
 }
 
 test "external signer is released when unpublished snapshot validation fails" {

@@ -931,6 +931,57 @@ test "record stream uses reloadable SNI provider for exact wildcard and default 
     }
 }
 
+test "record engine pins selected SNI generation across provider reload" {
+    var provider = sni_provider.ReloadableProvider.init(std.testing.allocator);
+    defer provider.deinit();
+
+    const chain_one = [_][]const u8{tls_backend.testdata.certificate_der};
+    const chain_two = [_][]const u8{ tls_backend.testdata.certificate_der, tls_backend.testdata.certificate_der };
+    try provider.reload(&.{sniIdentityConfig(&.{"pin.example.test"}, chain_one[0..], true)}, .{});
+
+    var verifier = credentials.MockVerifier.init(.accepted);
+    var client = tls_backend.Tls13Backend.initClientWithVerifier(
+        clientEntropy(),
+        verifier.verifier(),
+        .{ .record = .{ .alpn = "h2" } },
+        .{ .server_name = "pin.example.test", .policy = .{ .require_peer_authentication = true } },
+    );
+    defer client.deinit();
+    var server = tls_backend.Tls13Backend.initServerWithProvider(serverEntropy(), provider.provider(), .{ .record = .{ .alpn = "h2" } });
+    defer server.deinit();
+    var client_sink = DirectSink{};
+    defer client_sink.deinit();
+    var server_sink = DirectSink{};
+    defer server_sink.deinit();
+
+    try client.backend().start(.client, {}, &client_sink);
+    var client_hello_buf: [1024]u8 = undefined;
+    const client_hello = firstInitialCrypto(&client_sink, &client_hello_buf);
+    try server.backend().start(.server, {}, &server_sink);
+    try server.backend().receive(.initial, client_hello, &server_sink);
+
+    try provider.reload(&.{sniIdentityConfig(&.{"pin.example.test"}, chain_two[0..], true)}, .{});
+
+    var server_hello_buf: [512]u8 = undefined;
+    const server_hello = firstInitialCrypto(&server_sink, &server_hello_buf);
+    var server_flight_buf: [8192]u8 = undefined;
+    const server_flight = collectHandshakeCrypto(&server_sink, &server_flight_buf);
+    client_sink.reset();
+    try client.backend().receive(.initial, server_hello, &client_sink);
+    try client.backend().receive(.handshake, server_flight, &client_sink);
+    try std.testing.expectEqual(@as(usize, 1), verifier.last_chain_len);
+
+    var later_verifier = credentials.MockVerifier.init(.accepted);
+    const h = try SocketHarness.create(.{
+        .server_provider = provider.provider(),
+        .client_verifier = later_verifier.verifier(),
+        .client_options = .{ .server_name = "pin.example.test", .policy = .{ .require_peer_authentication = true } },
+    });
+    defer h.destroy();
+    try h.driveUntil(SocketHarness.bothComplete);
+    try std.testing.expectEqual(@as(usize, 2), later_verifier.last_chain_len);
+}
+
 test "record stream fails unknown SNI before application data is possible" {
     var provider = sni_provider.ReloadableProvider.init(std.testing.allocator);
     defer provider.deinit();
@@ -954,6 +1005,26 @@ test "record stream fails unknown SNI before application data is possible" {
     try std.testing.expectEqual(@as(usize, 0), verifier.verify_count);
 }
 
+test "unknown SNI fails before emitting ServerHello" {
+    var provider = sni_provider.ReloadableProvider.init(std.testing.allocator);
+    defer provider.deinit();
+
+    const chain = [_][]const u8{tls_backend.testdata.certificate_der};
+    const config = sniIdentityConfig(&.{"known.example.test"}, chain[0..], true);
+    try provider.reload(&.{config}, .{ .unknown_sni_policy = .fail_handshake });
+
+    var server = tls_backend.Tls13Backend.initServerWithProvider(serverEntropy(), provider.provider(), .{ .record = .{ .alpn = "h2" } });
+    defer server.deinit();
+    var sink = DirectSink{};
+    defer sink.deinit();
+    try server.backend().start(.server, {}, &sink);
+
+    var buf: [1024]u8 = undefined;
+    const hello = try buildClientHello(&buf, .{ .sni = "missing.example.test" });
+    try std.testing.expectError(error.NoApplicableCredential, server.backend().receive(.initial, hello, &sink));
+    try std.testing.expectEqual(@as(usize, 0), countCryptoEvents(&sink, .initial));
+}
+
 test "record stream SNI provider fails exact incompatible signature without wildcard fallback" {
     var provider = sni_provider.ReloadableProvider.init(std.testing.allocator);
     defer provider.deinit();
@@ -974,6 +1045,32 @@ test "record stream SNI provider fails exact incompatible signature without wild
     const hello = try buildClientHello(&buf, .{ .sni = "api.example.test", .sig_schemes = &.{0x0403} });
     try std.testing.expectError(error.NoApplicableCredential, server.backend().receive(.initial, hello, &sink));
     try std.testing.expectEqual(tls_backend.CredentialFailure.no_compatible_signature_algorithm, server.credentialFailure().?);
+}
+
+test "pending server credential selection emits no ServerHello until resume" {
+    var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
+    mock.async_select = true;
+    mock.pending_polls = 1;
+    var server = serverWithProvider(&mock);
+    defer server.deinit();
+    var sink = DirectSink{};
+    defer sink.deinit();
+    try server.backend().start(.server, {}, &sink);
+
+    var buf: [1024]u8 = undefined;
+    const hello = try buildClientHello(&buf, .{ .sni = "pending.example.test" });
+    try server.backend().receive(.initial, hello, &sink);
+    try std.testing.expect(server.authPending());
+    try std.testing.expectEqual(@as(usize, 1), mock.select_count);
+    try std.testing.expectEqual(@as(usize, 0), countCryptoEvents(&sink, .initial));
+
+    try server.backend().resumeAuth(&sink);
+    try std.testing.expect(server.authPending());
+    try std.testing.expectEqual(@as(usize, 0), countCryptoEvents(&sink, .initial));
+
+    try server.backend().resumeAuth(&sink);
+    try std.testing.expect(!server.authPending());
+    try std.testing.expectEqual(@as(usize, 1), countCryptoEvents(&sink, .initial));
 }
 
 test "record stream handshake fails closed when a ClientHello is corrupted in flight" {
@@ -1521,6 +1618,31 @@ fn expectServerReceiveError(server: *tls_backend.Tls13Backend, opts: ClientHello
     try std.testing.expectError(want, server.backend().receive(.initial, hello, &sink));
 }
 
+fn countCryptoEvents(sink: *const DirectSink, epoch: events.EncryptionEpoch) usize {
+    var count: usize = 0;
+    for (sink.items[0..sink.len]) |event| switch (event) {
+        .handshake_bytes => |bytes| {
+            if (bytes.epoch == epoch) count += 1;
+        },
+        else => {},
+    };
+    return count;
+}
+
+fn expectMalformedSniRejectedBeforeSelection(raw_sni: []const u8) !void {
+    var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
+    var server = serverWithProvider(&mock);
+    defer server.deinit();
+    var sink = DirectSink{};
+    defer sink.deinit();
+    try server.backend().start(.server, {}, &sink);
+    var buf: [2048]u8 = undefined;
+    const hello = try buildClientHello(&buf, .{ .sni = raw_sni });
+    try std.testing.expectError(error.IllegalParameter, server.backend().receive(.initial, hello, &sink));
+    try std.testing.expectEqual(@as(usize, 0), mock.select_count);
+    try std.testing.expectEqual(@as(usize, 0), countCryptoEvents(&sink, .initial));
+}
+
 test "a compatible signature scheme past the legacy cap is still selected" {
     // 17 filler schemes, then Ed25519 in slot 18: truncation at 16 would have
     // hidden it and produced a false NoCompatibleSignatureAlgorithm.
@@ -1579,6 +1701,22 @@ test "malformed SNI is rejected rather than collapsed into the default path" {
         const empty_list = [_]u8{ 0x00, 0x00 }; // ServerNameList<len=0>{}
         try expectServerReceiveError(&server, .{ .sni_raw = &empty_list }, error.IllegalParameter);
     }
+    try expectMalformedSniRejectedBeforeSelection("bad..example");
+    try expectMalformedSniRejectedBeforeSelection("bad host.example");
+    try expectMalformedSniRejectedBeforeSelection("bad\x00host.example");
+    try expectMalformedSniRejectedBeforeSelection("-bad.example");
+    try expectMalformedSniRejectedBeforeSelection("bad-.example");
+    try expectMalformedSniRejectedBeforeSelection("bad.-example");
+    try expectMalformedSniRejectedBeforeSelection("bad.example-");
+    const long_label = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.example";
+    try expectMalformedSniRejectedBeforeSelection(long_label);
+    const too_long_name =
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa." ++
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb." ++
+        "ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc." ++
+        "ddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd." ++
+        "e.example";
+    try expectMalformedSniRejectedBeforeSelection(too_long_name);
 }
 
 test "a provider returning an unoffered scheme is rejected before signing" {

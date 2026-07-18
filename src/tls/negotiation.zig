@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const algorithms = @import("algorithms.zig");
+const dns_name = @import("dns_name.zig");
 const messages = @import("messages.zig");
 const policy_mod = @import("policy.zig");
 
@@ -231,7 +232,10 @@ fn parseServerName(bytes: []const u8, offers: *ClientHelloOffers) Error!void {
     while (names.remaining() > 0) {
         const name_type = try names.u8_();
         const name = try names.slice(try names.u16_());
-        if (name_type == 0 and offers.server_name == null) offers.server_name = name;
+        if (name_type == 0 and offers.server_name == null) {
+            dns_name.validateHostName(name) catch return error.MalformedExtension;
+            offers.server_name = name;
+        }
     }
 }
 

@@ -87,11 +87,13 @@ true while queued ciphertext can drain.
 
 The backend-neutral `EncryptedStream.bufferSnapshot()` reports allocation-free
 state for metrics and HTTP integration: current and peak owned bytes by queue,
-peak total owned bytes, configured limits, pause state, pause/resume counters,
-hard-limit counters, and stalled-drive count. The pure-Zig record stream reports
-only bytes it owns. An OpenSSL adapter must report only measurable adapter/BIO
-state and mark opaque internal OpenSSL memory as outside the complete
-stream-owned accounting boundary rather than describing unknown memory as zero.
+peak total owned bytes, optional configured limits plus whether those limits are
+enforced by the backend, pause state, pause/resume counters, hard-limit counters,
+and stalled-drive count. The pure-Zig record stream reports complete owned bytes
+and enforced limits. An OpenSSL adapter must report only measurable adapter/BIO
+state, leave unknown limits unset, and mark opaque internal OpenSSL memory as
+outside the complete stream-owned accounting boundary rather than describing
+unknown memory as zero.
 
 Pure-Zig application writes seal accepted plaintext directly into the outbound
 ciphertext queue; there is no hidden pending-plaintext staging queue. HTTP/1.1

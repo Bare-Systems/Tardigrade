@@ -51,13 +51,14 @@ logs are written through `src/http/logger.zig`.
 - TLS record-stream backpressure state is exposed to runtime consumers through
   the allocation-free `EncryptedStream.bufferSnapshot()` seam. The snapshot
   contains current and peak stream-owned bytes for inbound carrier ciphertext,
-  decrypted plaintext, outbound ciphertext, and handshake bytes; configured
-  low/high/hard limits; latched carrier-read and plaintext-write pause state;
-  pause/resume counters; hard-limit counters by TLS queue; and stalled-drive
-  counts. These values are per TLS connection and deliberately carry no SNI,
-  URL, request ID, stream ID, or arbitrary protocol labels. OpenSSL-backed
-  adapters may expose measurable BIO/adapter bytes only; opaque internal
-  OpenSSL memory is outside the complete stream-owned accounting boundary.
+  decrypted plaintext, outbound ciphertext, and handshake bytes; optional
+  low/high/hard limits plus whether the backend enforces them; latched
+  carrier-read and plaintext-write pause state; pause/resume counters;
+  hard-limit counters by TLS queue; and stalled-drive counts. These values are
+  per TLS connection and deliberately carry no SNI, URL, request ID, stream ID,
+  or arbitrary protocol labels. OpenSSL-backed adapters may expose measurable
+  BIO/adapter bytes only and leave unknown limits unset; opaque internal OpenSSL
+  memory is outside the complete stream-owned accounting boundary.
 - reverse-proxy abort counters:
   `tardigrade_proxy_client_aborts_total` and
   `tardigrade_proxy_upstream_aborts_total`

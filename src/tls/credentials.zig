@@ -371,12 +371,16 @@ pub const FailureClass = enum {
     peer_verification_rejected,
     verifier_internal_failure,
     invalid_callback_behavior,
+    /// The server requires handshake-time client authentication and the client
+    /// presented no certificate. Peer-attributed (certificate_required).
+    client_certificate_required,
 
     pub fn origin(self: FailureClass) Origin {
         return switch (self) {
             .invalid_peer_certificate_chain,
             .certificate_verify_invalid,
             .peer_verification_rejected,
+            .client_certificate_required,
             => .peer,
             .no_credential_available,
             .no_compatible_signature_algorithm,
@@ -413,6 +417,8 @@ pub const FailureClass = enum {
             .certificate_verify_invalid,
             .peer_verification_rejected,
             => .bad_certificate,
+            // The client declined mandatory authentication.
+            .client_certificate_required => .certificate_required,
         };
     }
 
@@ -425,6 +431,7 @@ pub const FailureClass = enum {
             .certificate_verify_invalid,
             .peer_verification_rejected,
             => error.CertificateInvalid,
+            .client_certificate_required => error.ClientCertificateRequired,
             .no_credential_available,
             .no_compatible_signature_algorithm,
             => error.NoApplicableCredential,
@@ -1264,6 +1271,11 @@ test "every failure class maps to a deterministic alert, origin, and engine erro
         try testing.expectEqual(alerts.AlertDescription.bad_certificate, class.alert());
         try testing.expectEqual(@as(events.HandshakeError, error.CertificateInvalid), class.engineError());
     }
+    // A client that declines mandatory authentication is peer-attributed but
+    // carries the distinct certificate_required alert (RFC 8446 §4.4.2.4).
+    try testing.expectEqual(Origin.peer, FailureClass.client_certificate_required.origin());
+    try testing.expectEqual(alerts.AlertDescription.certificate_required, FailureClass.client_certificate_required.alert());
+    try testing.expectEqual(@as(events.HandshakeError, error.ClientCertificateRequired), FailureClass.client_certificate_required.engineError());
     // Local "cannot authenticate ourselves" failures use handshake_failure.
     for ([_]FailureClass{ .no_credential_available, .no_compatible_signature_algorithm }) |class| {
         try testing.expectEqual(Origin.local, class.origin());

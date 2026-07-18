@@ -1228,6 +1228,7 @@ pub const Connection = struct {
         return switch (err) {
             error.AlpnMismatch => error_crypto_base + 120, // no_application_protocol
             error.CertificateInvalid => error_crypto_base + 42, // bad_certificate
+            error.ClientCertificateRequired => error_crypto_base + 116, // certificate_required
             error.MissingTransportParameters, error.InvalidTransportParameters => error_transport_parameter,
             error.UnexpectedHandshakeMessage => error_crypto_base + 10, // unexpected_message
             error.IllegalParameter => error_crypto_base + 47, // illegal_parameter

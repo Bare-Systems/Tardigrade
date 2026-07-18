@@ -62,3 +62,39 @@ one before closing. The contract only carries it; deciding *when* to
 synthesize an alert from a handshake failure — and the rest of alert /
 `close_notify` / truncation policy — is transport-specific and, for TCP record
 mode, tracked by #354.
+
+## Record-stream buffer limits
+
+`PureZigRecordStream` keeps its hot path allocation-free: inbound carrier
+ciphertext, decrypted application plaintext, outbound ciphertext, and inbound
+handshake bytes live in fixed-capacity queues owned by the stream. Runtime
+`BufferLimits` add effective low/high/hard watermarks inside those compile-time
+capacities; they do not replace the queues with dynamically growing buffers.
+
+Validation rejects zero or nonsensical watermarks (`low < high <= hard` is
+required), hard limits above the fixed queue capacity, and policies that cannot
+hold a maximum legal TLS fragment or the complete borrowed handshake event batch
+that record mode must serialize atomically. Existing constructors use safe
+defaults derived from the fixed capacities; callers that need tighter appliance
+profiles can use the explicit `init*WithLimits` constructors.
+
+Readiness uses latched hysteresis. Carrier reads pause when inbound ciphertext,
+plaintext, or handshake ownership reaches the relevant high watermark, and they
+resume only after all inbound queues drain to their low watermarks. Plaintext
+writes pause when outbound ciphertext reaches its high watermark and resume
+only after the ciphertext queue drains to or below low. `wants_write` remains
+true while queued ciphertext can drain.
+
+The backend-neutral `EncryptedStream.bufferSnapshot()` reports allocation-free
+state for metrics and HTTP integration: current and peak owned bytes by queue,
+peak total owned bytes, configured limits, pause state, pause/resume counters,
+hard-limit counters, and stalled-drive count. The pure-Zig record stream reports
+only bytes it owns. An OpenSSL adapter must report only measurable adapter/BIO
+state and mark opaque internal OpenSSL memory as outside the complete
+stream-owned accounting boundary rather than describing unknown memory as zero.
+
+Pure-Zig application writes seal accepted plaintext directly into the outbound
+ciphertext queue; there is no hidden pending-plaintext staging queue. HTTP/1.1
+and HTTP/2 consumers should use `can_write_plaintext`, `can_read_plaintext`,
+`wants_read`, `wants_write`, and the buffer snapshot to register only socket
+readiness that can make progress.

@@ -5,6 +5,14 @@ All notable user-facing changes to Tardigrade are documented here.
 ## [Unreleased]
 
 ### Features
+- **Bounded TLS stream watermarks and backpressure (#355, epic #325)** — adds
+  validated per-connection TLS buffer limits for inbound carrier ciphertext,
+  decrypted plaintext, outbound ciphertext, and handshake bytes while
+  preserving the fixed-capacity, allocation-free `PureZigRecordStream` queues.
+  TLS readiness now uses latched high/low hysteresis for carrier reads and
+  plaintext writes, exposes backend-neutral buffer snapshots with current and
+  peak owned bytes plus pause/resume/stall/hard-limit counters, and documents
+  the OpenSSL adapter accounting boundary for opaque backend-owned memory.
 - **TLS-owned reusable TLS 1.3 engine (#442, epic #325)** — relocates the
   concrete native handshake engine from `src/quic/` to
   `src/tls/tls13_backend.zig`. An explicit transport profile now separates

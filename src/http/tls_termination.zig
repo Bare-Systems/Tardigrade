@@ -337,6 +337,8 @@ pub const TlsConnection = struct {
     close_requested: bool = false,
     peer_closed: bool = false,
     stream_failure: ?encrypted_stream.Error = null,
+    stream_buffer_peaks: encrypted_stream.QueueBytes = .{},
+    stream_peak_total: usize = 0,
 
     pub fn deinit(self: *TlsConnection) void {
         if (opensslShouldShutdownOnDeinit(self)) {
@@ -648,6 +650,26 @@ fn opensslStreamDrive(ptr: *anyopaque) encrypted_stream.Error!encrypted_stream.D
     return .{ .made_progress = made_progress, .readiness = opensslStreamReadiness(ptr) };
 }
 
+fn opensslStreamBufferSnapshot(ptr: *anyopaque) encrypted_stream.BufferSnapshot {
+    const self: *TlsConnection = @ptrCast(@alignCast(ptr));
+    const readiness = opensslStreamReadiness(ptr);
+    const current = encrypted_stream.QueueBytes{
+        .inbound_plaintext = if (self.stream_lifecycle == .open) self.pending() else 0,
+    };
+    self.stream_buffer_peaks.inbound_plaintext = @max(self.stream_buffer_peaks.inbound_plaintext, current.inbound_plaintext);
+    self.stream_peak_total = @max(self.stream_peak_total, current.total());
+    return .{
+        .current = current,
+        .peak = self.stream_buffer_peaks,
+        .peak_total = self.stream_peak_total,
+        .pause_state = .{
+            .inbound_read_paused = self.stream_lifecycle == .open and !self.peer_closed and !readiness.wants_read and !readiness.can_read_plaintext,
+            .plaintext_write_paused = self.stream_lifecycle == .open and !readiness.can_write_plaintext,
+        },
+        .accounting_boundary = .backend_opaque,
+    };
+}
+
 const openssl_stream_vtable = encrypted_stream.EncryptedStream.VTable{
     .backendFn = opensslStreamBackend,
     .readFn = opensslStreamRead,
@@ -655,6 +677,7 @@ const openssl_stream_vtable = encrypted_stream.EncryptedStream.VTable{
     .closeFn = opensslStreamClose,
     .readinessFn = opensslStreamReadiness,
     .driveFn = opensslStreamDrive,
+    .bufferSnapshotFn = opensslStreamBufferSnapshot,
 };
 
 pub fn lastOpenSslError(allocator: std.mem.Allocator) ?[]u8 {

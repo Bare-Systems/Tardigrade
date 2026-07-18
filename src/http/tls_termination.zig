@@ -1552,14 +1552,16 @@ test "tls terminator updates protocol policy for future snapshots" {
     });
     defer tls.deinit();
 
-    const initial = tls.protocolPolicySnapshot();
-    try std.testing.expect(initial.http1_enabled);
-    try std.testing.expect(initial.http2_enabled);
+    const handshake_a_snapshot = tls.protocolPolicySnapshot();
+    try std.testing.expect(handshake_a_snapshot.http1_enabled);
+    try std.testing.expect(handshake_a_snapshot.http2_enabled);
 
     try tls.updateProtocolPolicy(.{ .http1_enabled = true, .http2_enabled = false });
-    const reloaded = tls.protocolPolicySnapshot();
-    try std.testing.expect(reloaded.http1_enabled);
-    try std.testing.expect(!reloaded.http2_enabled);
+    const handshake_b_snapshot = tls.protocolPolicySnapshot();
+    try std.testing.expect(handshake_b_snapshot.http1_enabled);
+    try std.testing.expect(!handshake_b_snapshot.http2_enabled);
+    try std.testing.expectEqual(NegotiatedProtocol.http2, try negotiated_dispatch.selectNegotiatedProtocol("h2", handshake_a_snapshot));
+    try std.testing.expectError(error.ProtocolDisabled, negotiated_dispatch.selectNegotiatedProtocol("h2", handshake_b_snapshot));
     try std.testing.expectError(error.ProtocolConfigFailed, tls.updateProtocolPolicy(.{ .http1_enabled = false, .http2_enabled = false }));
 }
 

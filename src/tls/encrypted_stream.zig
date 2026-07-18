@@ -1030,6 +1030,8 @@ pub const PureZigRecordStream = struct {
             error.InvalidHandshakeState,
             error.NoApplicableCredential,
             error.CredentialProviderFailed,
+            error.ClientCertificateRequired,
+            error.DecryptError,
             => alerts.fromHandshakeError(@errorCast(err)),
             else => null,
         };

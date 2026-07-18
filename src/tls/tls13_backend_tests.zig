@@ -1314,6 +1314,9 @@ test "a bad CertificateVerify signature fails proof of possession at the client"
     // A CertificateVerify proof-of-possession failure is a decrypt_error
     // (RFC 8446 §4.4.3), distinct from a trust rejection.
     try std.testing.expectEqual(@as(?anyerror, error.DecryptError), failures.client);
+    // The client synthesizes the decrypt_error alert and the server receives it
+    // (rather than a silent stall/EOF).
+    try std.testing.expectEqual(@as(?anyerror, error.PeerFatalAlert), failures.server);
     try std.testing.expect(!h.client.bridge.handshake_complete);
     try std.testing.expectEqual(tls_backend.CredentialFailure.certificate_verify_invalid, h.client_engine.credentialFailure().?);
 }
@@ -2060,4 +2063,326 @@ test "the generic engine driver exposes authPending and resumeAuth for the concr
     _ = try driver.resumeAuth(); // poll #2: completes the flight
     try std.testing.expect(!driver.authPending());
     try std.testing.expect(server.credentialFailure() == null);
+}
+
+// ===========================================================================
+// #334 review round: adversarial async progression, client-auth policy, exact
+// serialization bounds, and resource ownership.
+// ===========================================================================
+
+// --- F1: a Finished delivered in a separate receive while verification is
+//         pending must not be processed until an accepted resume. ---
+
+test "a Finished in a separate receive while client verification is pending is not processed early" {
+    var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
+    var client = clientWithLocalCredential(mock.provider());
+    defer client.deinit();
+    var verifier = credentials.MockVerifier.init(.accepted);
+    verifier.async_mode = true;
+    verifier.pending_polls = 1;
+    var server = serverRequestingClientAuth(.required, verifier.verifier());
+    defer server.deinit();
+
+    var client_sink = DirectSink{};
+    defer client_sink.deinit();
+    var server_sink = DirectSink{};
+    defer server_sink.deinit();
+
+    try deliverServerFlightToClient(&client, &server, &client_sink, &server_sink);
+    try resumeUntilSettled(&client, &client_sink);
+    var flight_buf: [8192]u8 = undefined;
+    const flight = collectHandshakeCrypto(&client_sink, &flight_buf);
+
+    const finished_message_len = 4 + tls_backend.hash_len; // type+len+verify_data
+    const split = flight.len - finished_message_len;
+
+    // First receive: Certificate + CertificateVerify. The server parks on the
+    // async verifier with the Finished not yet delivered.
+    server_sink.reset();
+    try server.backend().receive(.handshake, flight[0..split], &server_sink);
+    try std.testing.expect(server.authPending());
+    try std.testing.expectEqual(tls_core.handshake.HandshakeLifecycle.running, server.core.handshake_lifecycle);
+
+    // Second receive delivers Finished WHILE verification is still pending. It
+    // must be buffered, never dispatched: no completion, still pending.
+    try server.backend().receive(.handshake, flight[split..], &server_sink);
+    try std.testing.expect(server.authPending());
+    try std.testing.expectEqual(tls_core.handshake.HandshakeLifecycle.running, server.core.handshake_lifecycle);
+
+    // Only the accepted resume drains the buffered Finished and completes.
+    try resumeUntilSettled(&server, &server_sink);
+    try std.testing.expectEqual(tls_core.handshake.HandshakeLifecycle.complete, server.core.handshake_lifecycle);
+    try std.testing.expect(server.credentialFailure() == null);
+}
+
+test "a rejected client verification never processes the buffered Finished" {
+    var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
+    var client = clientWithLocalCredential(mock.provider());
+    defer client.deinit();
+    var verifier = credentials.MockVerifier.init(.rejected);
+    verifier.async_mode = true;
+    verifier.pending_polls = 1;
+    var server = serverRequestingClientAuth(.required, verifier.verifier());
+    defer server.deinit();
+
+    var client_sink = DirectSink{};
+    defer client_sink.deinit();
+    var server_sink = DirectSink{};
+    defer server_sink.deinit();
+
+    try deliverServerFlightToClient(&client, &server, &client_sink, &server_sink);
+    try resumeUntilSettled(&client, &client_sink);
+    var flight_buf: [8192]u8 = undefined;
+    const flight = collectHandshakeCrypto(&client_sink, &flight_buf);
+
+    // Deliver the whole flight coalesced: Certificate/CertificateVerify park the
+    // verifier, Finished is buffered behind the suspend point.
+    server_sink.reset();
+    try server.backend().receive(.handshake, flight, &server_sink);
+    try std.testing.expect(server.authPending());
+
+    // Resume rejects: the handshake fails and the buffered Finished is never
+    // processed into a completion.
+    try std.testing.expectError(error.CertificateInvalid, resumeUntilSettled(&server, &server_sink));
+    try std.testing.expectEqual(tls_core.handshake.HandshakeLifecycle.failed, server.core.handshake_lifecycle);
+    try std.testing.expectEqual(tls_backend.CredentialFailure.peer_verification_rejected, server.credentialFailure().?);
+}
+
+// --- F3: a .not_checked verdict must not satisfy required or optional client
+//         authentication of a presented certificate. ---
+
+test "a not_checked verdict fails a presented client certificate under optional and required" {
+    for ([_]tls_backend.ClientAuthMode{ .optional, .required }) |mode| {
+        var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
+        var client = clientWithLocalCredential(mock.provider());
+        defer client.deinit();
+        var verifier = credentials.MockVerifier.init(.not_checked);
+        var server = serverRequestingClientAuth(mode, verifier.verifier());
+        defer server.deinit();
+
+        var client_sink = DirectSink{};
+        defer client_sink.deinit();
+        var server_sink = DirectSink{};
+        defer server_sink.deinit();
+
+        try deliverServerFlightToClient(&client, &server, &client_sink, &server_sink);
+        try resumeUntilSettled(&client, &client_sink);
+        var flight_buf: [8192]u8 = undefined;
+        const flight = collectHandshakeCrypto(&client_sink, &flight_buf);
+
+        // The client presented a real certificate; a verifier that declines to
+        // evaluate trust must not silently establish mutual authentication.
+        try std.testing.expectError(error.CertificateInvalid, deliverClientFlightToServer(&server, &server_sink, flight, false));
+        try std.testing.expectEqual(tls_backend.CredentialFailure.peer_verification_rejected, server.credentialFailure().?);
+    }
+}
+
+// --- F4: a client with no suitable credential sends an empty Certificate. ---
+
+test "a client with no credential declines with an empty Certificate (optional completes, required fails)" {
+    // Optional: the empty Certificate is accepted and the handshake completes.
+    {
+        var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
+        mock.force_select_error = error.NoCredentialAvailable;
+        var client = clientWithLocalCredential(mock.provider());
+        defer client.deinit();
+        var verifier = credentials.MockVerifier.init(.accepted);
+        var server = serverRequestingClientAuth(.optional, verifier.verifier());
+        defer server.deinit();
+
+        var client_sink = DirectSink{};
+        defer client_sink.deinit();
+        var server_sink = DirectSink{};
+        defer server_sink.deinit();
+
+        try deliverServerFlightToClient(&client, &server, &client_sink, &server_sink);
+        try resumeUntilSettled(&client, &client_sink);
+        var flight_buf: [8192]u8 = undefined;
+        const flight = collectHandshakeCrypto(&client_sink, &flight_buf);
+        try deliverClientFlightToServer(&server, &server_sink, flight, false);
+        try resumeUntilSettled(&server, &server_sink);
+        try std.testing.expectEqual(tls_core.handshake.HandshakeLifecycle.complete, server.core.handshake_lifecycle);
+        // The client declined without signing.
+        try std.testing.expectEqual(@as(usize, 0), mock.sign_count);
+    }
+    // Required: the empty Certificate is certificate_required.
+    {
+        var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
+        mock.force_select_error = error.NoCompatibleSignatureAlgorithm;
+        var client = clientWithLocalCredential(mock.provider());
+        defer client.deinit();
+        var verifier = credentials.MockVerifier.init(.accepted);
+        var server = serverRequestingClientAuth(.required, verifier.verifier());
+        defer server.deinit();
+
+        var client_sink = DirectSink{};
+        defer client_sink.deinit();
+        var server_sink = DirectSink{};
+        defer server_sink.deinit();
+
+        try deliverServerFlightToClient(&client, &server, &client_sink, &server_sink);
+        try resumeUntilSettled(&client, &client_sink);
+        var flight_buf: [8192]u8 = undefined;
+        const flight = collectHandshakeCrypto(&client_sink, &flight_buf);
+        try std.testing.expectError(error.ClientCertificateRequired, deliverClientFlightToServer(&server, &server_sink, flight, false));
+        try std.testing.expectEqual(tls_backend.CredentialFailure.client_certificate_required, server.credentialFailure().?);
+    }
+}
+
+test "an async selector that resolves to no credential declines with an empty Certificate" {
+    var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
+    mock.async_select = true;
+    mock.async_no_credential = true;
+    mock.pending_polls = 1;
+    var client = clientWithLocalCredential(mock.provider());
+    defer client.deinit();
+    var verifier = credentials.MockVerifier.init(.accepted);
+    var server = serverRequestingClientAuth(.optional, verifier.verifier());
+    defer server.deinit();
+
+    var client_sink = DirectSink{};
+    defer client_sink.deinit();
+    var server_sink = DirectSink{};
+    defer server_sink.deinit();
+
+    try deliverServerFlightToClient(&client, &server, &client_sink, &server_sink);
+    try std.testing.expect(client.authPending()); // suspended in selection
+    try resumeUntilSettled(&client, &client_sink); // resolves to "no credential"
+    try std.testing.expectEqual(@as(usize, 0), mock.sign_count);
+
+    var flight_buf: [8192]u8 = undefined;
+    const flight = collectHandshakeCrypto(&client_sink, &flight_buf);
+    try deliverClientFlightToServer(&server, &server_sink, flight, false);
+    try resumeUntilSettled(&server, &server_sink);
+    try std.testing.expectEqual(tls_core.handshake.HandshakeLifecycle.complete, server.core.handshake_lifecycle);
+}
+
+// --- F5: exact serialized-flight preflight rejects a chain that overflows once
+//         message and surrounding-flight framing is counted. ---
+
+/// A provider returning `entry_count` certificate entries of `entry_len` bytes,
+/// to probe the exact flight-size boundary. Never actually signs (the preflight
+/// rejects the chain first).
+const BigChainProvider = struct {
+    entry_len: usize,
+    entry_count: usize,
+    storage: [tls_backend.max_certificate_len]u8 = [_]u8{0x2c} ** tls_backend.max_certificate_len,
+    entries: [credentials.max_chain_entries][]const u8 = undefined,
+    release_count: usize = 0,
+
+    fn provider(self: *BigChainProvider) credentials.CredentialProvider {
+        return .{ .ctx = self, .vtable = &prov_vtable };
+    }
+    const prov_vtable = credentials.CredentialProvider.VTable{ .select = select };
+    fn select(ctx: *anyopaque, _: *const credentials.SelectionContext) credentials.SelectError!credentials.Progress(credentials.SelectedCredential) {
+        const self: *BigChainProvider = @ptrCast(@alignCast(ctx));
+        return .{ .complete = .{ .handle = self, .scheme = .ed25519, .vtable = &cred_vtable } };
+    }
+    const cred_vtable = credentials.SelectedCredential.VTable{ .chain = chain, .sign = sign, .release = release };
+    fn chain(handle: *anyopaque) credentials.CertificateChain {
+        const self: *BigChainProvider = @ptrCast(@alignCast(handle));
+        for (0..self.entry_count) |i| self.entries[i] = self.storage[0..self.entry_len];
+        return .{ .entries = self.entries[0..self.entry_count] };
+    }
+    fn sign(_: *anyopaque, _: credentials.SignatureScheme, _: []const u8, _: []u8) credentials.SignError!credentials.Progress(usize) {
+        return .{ .complete = 0 }; // unreachable: the size preflight fails first
+    }
+    fn release(handle: *anyopaque) void {
+        const self: *BigChainProvider = @ptrCast(@alignCast(handle));
+        self.release_count += 1;
+    }
+};
+
+test "the server flight preflight rejects a chain that fits entries but overflows with framing" {
+    // Four 2043-byte entries sum to exactly max_message_len once each entry's
+    // 5-byte framing is added, but the Certificate message header pushes it over.
+    var big = BigChainProvider{ .entry_len = 2043, .entry_count = 4 };
+    var server = tls_backend.Tls13Backend.initServerWithProvider(serverEntropy(), big.provider(), .{ .record = .{ .alpn = "h2" } });
+    defer server.deinit();
+    var sink = DirectSink{};
+    defer sink.deinit();
+    try server.backend().start(.server, {}, &sink);
+    var buf: [1024]u8 = undefined;
+    const hello = try buildClientHello(&buf, .{});
+    try std.testing.expectError(error.CredentialProviderFailed, server.backend().receive(.initial, hello, &sink));
+    try std.testing.expectEqual(tls_backend.CredentialFailure.malformed_credential_chain, server.credentialFailure().?);
+    try std.testing.expectEqual(@as(usize, 1), big.release_count);
+}
+
+test "the client flight preflight rejects a chain that overflows with the message header" {
+    var big = BigChainProvider{ .entry_len = 2043, .entry_count = 4 };
+    var client = tls_backend.Tls13Backend.initClient(
+        clientEntropy(),
+        .{ .pinned_certificate = tls_backend.testdata.certificate_der },
+        .{ .record = .{ .alpn = "h2" } },
+    );
+    client.setLocalCredentialProvider(big.provider());
+    defer client.deinit();
+    var verifier = credentials.MockVerifier.init(.accepted);
+    var server = serverRequestingClientAuth(.required, verifier.verifier());
+    defer server.deinit();
+
+    var client_sink = DirectSink{};
+    defer client_sink.deinit();
+    var server_sink = DirectSink{};
+    defer server_sink.deinit();
+
+    // The client parks/emits nothing valid: building its Certificate fails the
+    // exact-size preflight before any transcript mutation or emission.
+    try std.testing.expectError(error.CredentialProviderFailed, deliverServerFlightToClient(&client, &server, &client_sink, &server_sink));
+    try std.testing.expectEqual(tls_backend.CredentialFailure.malformed_credential_chain, client.credentialFailure().?);
+    try std.testing.expectEqual(@as(usize, 1), big.release_count);
+}
+
+// --- F8: a wrong-kind async completion releases every owned handle once. ---
+
+test "a sign stage that completes with a credential releases the held and returned handles once" {
+    var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
+    mock.async_sign = true;
+    mock.pending_polls = 0;
+    mock.sign_returns_credential = true; // contract violation
+    var client = clientWithLocalCredential(mock.provider());
+    defer client.deinit();
+    var verifier = credentials.MockVerifier.init(.accepted);
+    var server = serverRequestingClientAuth(.required, verifier.verifier());
+    defer server.deinit();
+
+    var client_sink = DirectSink{};
+    defer client_sink.deinit();
+    var server_sink = DirectSink{};
+    defer server_sink.deinit();
+
+    try deliverServerFlightToClient(&client, &server, &client_sink, &server_sink);
+    try std.testing.expect(client.authPending()); // parked awaiting the signature
+
+    // The resume observes a credential where a signature length was required and
+    // fails closed, releasing the held signing credential and the (aliased)
+    // returned one exactly once between them.
+    try std.testing.expectError(error.CredentialProviderFailed, client.resumeAuth(&client_sink));
+    try std.testing.expectEqual(tls_backend.CredentialFailure.invalid_callback_behavior, client.credentialFailure().?);
+    try std.testing.expectEqual(@as(usize, 1), mock.release_count);
+    try std.testing.expectEqual(@as(usize, 1), mock.op_release_count);
+}
+
+// --- F6: record mode synthesizes the certificate_required alert end to end. ---
+
+test "record mode delivers a fatal alert to the client when required client auth is declined" {
+    var verifier = credentials.MockVerifier.init(.accepted);
+    const h = try SocketHarness.create(.{});
+    defer h.destroy();
+    // The server requires client authentication; the client has no local
+    // credential and answers with an empty Certificate.
+    h.server_engine.requestClientAuthentication(.required, verifier.verifier());
+
+    const failures = driveUntilBothErrors(h);
+    // The server fails with certificate_required and synthesizes the alert
+    // (previously it emitted none and the peer only saw a stall/EOF). The client
+    // terminates on the delivered alert rather than hanging. (The client has
+    // already reached 1-RTT here, so the exact received-alert surface depends on
+    // epoch timing; the decrypt_error test above covers the clean PeerFatalAlert
+    // path end to end.)
+    try std.testing.expectEqual(@as(?anyerror, error.ClientCertificateRequired), failures.server);
+    try std.testing.expect(failures.client != null);
+    try std.testing.expect(!h.server.bridge.handshake_complete);
+    try std.testing.expectEqual(tls_backend.CredentialFailure.client_certificate_required, h.server_engine.credentialFailure().?);
 }

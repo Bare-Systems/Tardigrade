@@ -45,6 +45,11 @@ pub const hash_len = tls_key_schedule.hash_len;
 /// single-certificate Ed25519 flight is far below this).
 pub const max_message_len = 8 * 1024;
 pub const max_certificate_len = 2048;
+/// The Certificate handshake message's fixed framing overhead, counted in the
+/// flight-size preflight so a chain cannot pass validation and then overflow the
+/// writer once the message header is added: 1-byte msg_type + 3-byte length +
+/// 1-byte certificate_request_context length + 3-byte CertificateList length.
+const certificate_message_overhead = 1 + 3 + 1 + 3;
 /// Caller-owned bound on a CertificateVerify signature. The engine hands the
 /// signing provider a buffer this size; a provider whose signature would not
 /// fit reports overflow rather than exceeding the bound (#334). Comfortably
@@ -392,13 +397,16 @@ pub const Tls13Backend = struct {
         std.debug.assert(self.role == .server);
         self.client_auth = mode;
         self.external_verifier = verifier;
-        // The policy handed to the client-certificate verifier: `required`
-        // demands a valid client certificate; `optional` explicitly tolerates an
-        // unverified/absent one.
+        // The policy handed to the client-certificate verifier. `required`
+        // demands the client present a certificate. `optional` permits an
+        // *absent* certificate (an empty Certificate, handled in `onCertificate`)
+        // — but a certificate that IS presented must still verify, so neither
+        // mode allows an unverified peer. A `.not_checked` verdict on a presented
+        // chain is rejected in `applyPeerVerdict` for both modes.
         self.auth_policy = switch (mode) {
             .disabled => self.auth_policy,
             .required => .{ .require_peer_authentication = true },
-            .optional => .{ .allow_unverified_peer = true },
+            .optional => .{},
         };
     }
 
@@ -554,6 +562,12 @@ pub const Tls13Backend = struct {
             },
         };
         input.append(bytes) catch |err| return mapCoreError(err);
+        // Never begin dispatching while an authentication operation is parked:
+        // buffer the freshly received bytes and wait for `resumeAuth`. Without
+        // this, a Finished arriving in a separate transport read while a peer
+        // verification is still pending would be processed here — completing the
+        // handshake before the verdict resolves.
+        if (self.pending_op != null) return;
         try self.drainInput(input, level, sink);
     }
 
@@ -569,6 +583,9 @@ pub const Tls13Backend = struct {
         sink: *EventSink,
     ) HandshakeError!void {
         while (input.peek() catch |err| return mapCoreError(err)) |message| {
+            // Defensive: never dispatch a message while an operation is parked,
+            // even if this loop is somehow re-entered mid-suspend.
+            if (self.pending_op != null) break;
             if (level != try expectedLevel(message.kind)) return error.UnexpectedTransportEpoch;
             const transcript_before = self.core.transcriptHash();
             _ = self.core.acceptReceived(message.raw) catch |err| return mapCoreError(err);
@@ -1036,14 +1053,28 @@ pub const Tls13Backend = struct {
 
     /// Apply a peer-verification verdict: emit the certificate state and fail
     /// closed on rejection. Reachable synchronously and after resume.
+    ///
+    /// A `.not_checked` verdict — the verifier deliberately did not evaluate
+    /// trust — is only acceptable when policy explicitly permits an unverified
+    /// peer (the insecure client opt-in). Every other case, including any server
+    /// verifying a client certificate under optional or required authentication,
+    /// treats it as a verification failure: policy that requires authentication
+    /// must not be satisfied by "no trust decision was made".
     fn applyPeerVerdict(self: *Tls13Backend, verdict: credentials.Verdict, sink: *EventSink) HandshakeError!void {
-        const state: CertificateState = switch (verdict) {
-            .accepted => .valid,
-            .not_checked => .not_checked,
-            .rejected => .invalid,
-        };
-        try sink.emitCertificate(state);
-        if (state == .invalid) return self.failCredential(.peer_verification_rejected);
+        switch (verdict) {
+            .accepted => try sink.emitCertificate(.valid),
+            .rejected => {
+                try sink.emitCertificate(.invalid);
+                return self.failCredential(.peer_verification_rejected);
+            },
+            .not_checked => {
+                if (!self.auth_policy.allow_unverified_peer) {
+                    try sink.emitCertificate(.invalid);
+                    return self.failCredential(.peer_verification_rejected);
+                }
+                try sink.emitCertificate(.not_checked);
+            },
+        }
     }
 
     /// Verify the CertificateVerify signature against the peer leaf's public
@@ -1160,8 +1191,18 @@ pub const Tls13Backend = struct {
         const provider = self.external_provider orelse
             return self.emitClientCertificate(null, sink);
         var selection = self.clientSelectionContext();
-        switch (provider.selectCredential(&selection) catch |err|
-            return self.failCredential(credentials.classifySelectError(err))) {
+        // A provider that deterministically has no usable credential is not a
+        // failure: TLS 1.3 requires the client to answer a CertificateRequest
+        // with an empty Certificate (RFC 8446 §4.4.2). That is how optional auth
+        // succeeds and how required auth yields the peer-attributed
+        // certificate_required outcome on the server.
+        const progress = provider.selectCredential(&selection) catch |err| switch (err) {
+            error.NoCredentialAvailable,
+            error.NoCompatibleSignatureAlgorithm,
+            => return self.emitClientCertificate(null, sink),
+            else => return self.failCredential(credentials.classifySelectError(err)),
+        };
+        switch (progress) {
             .complete => |credential| return self.emitSelectedClientCertificate(credential, sink),
             .pending => |op| return self.parkAuth(op, .client_select),
         }
@@ -1198,7 +1239,11 @@ pub const Tls13Backend = struct {
             const chain = c.certificateChain();
             if (chain.count() == 0 or chain.count() > credentials.max_chain_entries)
                 return self.failCredential(.malformed_credential_chain);
-            var encoded_len: usize = 0;
+            // The Certificate message's own framing must be counted too:
+            // 1-byte type + 3-byte length + 1-byte request context + 3-byte
+            // CertificateList length. Omitting it lets a chain that fits the
+            // entry sum overflow the writer after the message header is added.
+            var encoded_len: usize = certificate_message_overhead;
             for (chain.entries) |entry| {
                 if (entry.len == 0 or entry.len > max_certificate_len)
                     return self.failCredential(.malformed_credential_chain);
@@ -1526,23 +1571,22 @@ pub const Tls13Backend = struct {
         const chain = credential.certificateChain();
         if (chain.count() == 0 or chain.count() > credentials.max_chain_entries)
             return self.failCredential(.malformed_credential_chain);
-        var encoded_len: usize = 0;
+        // Sum the CertificateList entry encoding (each entry + its 5-byte
+        // framing) and the Certificate message's own header. The remaining
+        // preflight — that this plus EncryptedExtensions and CertificateRequest
+        // all fit one flight buffer — is completed after those messages are
+        // built, below, and before any state mutation.
+        var certificate_message_len: usize = certificate_message_overhead;
         for (chain.entries) |entry| {
             if (entry.len == 0 or entry.len > max_certificate_len)
                 return self.failCredential(.malformed_credential_chain);
             // CertificateEntry framing overhead: 3-byte cert_data length +
             // 2-byte extensions length.
-            encoded_len = std.math.add(usize, encoded_len, entry.len + 5) catch
+            certificate_message_len = std.math.add(usize, certificate_message_len, entry.len + 5) catch
                 return self.failCredential(.malformed_credential_chain);
-            if (encoded_len > max_message_len)
+            if (certificate_message_len > max_message_len)
                 return self.failCredential(.malformed_credential_chain);
         }
-
-        // Ask the client to authenticate (handshake-time client auth, #334)
-        // before recording the flight, so the Core inserts CertificateRequest
-        // after EncryptedExtensions and expects the client certificate flight
-        // after the server Finished.
-        if (self.client_auth != .disabled) self.core.requestClientCertificate();
 
         var buf: [max_message_len]u8 = undefined;
         var w = Writer{ .buf = &buf };
@@ -1589,6 +1633,23 @@ pub const Tls13Backend = struct {
             w.patch(3, cr_len);
             certificate_request = buf[cr_start..w.len];
         }
+
+        // Exact whole-flight preflight: EncryptedExtensions and the optional
+        // CertificateRequest are now serialized (`w.len`); confirm the remaining
+        // Certificate message also fits before any state mutation, so a provider
+        // chain can never overflow the writer after `requestClientCertificate`,
+        // a `recordSent`, output emission, or signing. A provider-caused
+        // overflow is a malformed local chain.
+        const flight_len = std.math.add(usize, w.len, certificate_message_len) catch
+            return self.failCredential(.malformed_credential_chain);
+        if (flight_len > max_message_len)
+            return self.failCredential(.malformed_credential_chain);
+
+        // Ask the client to authenticate (handshake-time client auth, #334)
+        // before recording the flight, so the Core inserts CertificateRequest
+        // after EncryptedExtensions and expects the client certificate flight
+        // after the server Finished.
+        if (self.client_auth != .disabled) self.core.requestClientCertificate();
 
         // Certificate: the selected credential's validated public DER chain,
         // valid until `release`.
@@ -1725,31 +1786,65 @@ pub const Tls13Backend = struct {
     /// handshake message twice.
     fn dispatchResume(self: *Tls13Backend, stage: PendingStage, completion: credentials.Completion, sink: *EventSink) HandshakeError!void {
         switch (stage) {
-            .server_select => {
-                if (completion != .credential) return self.failCredential(.provider_internal_failure);
-                return self.emitServerAuthFlight(completion.credential, sink);
+            .server_select => switch (completion) {
+                .credential => |c| return self.emitServerAuthFlight(c, sink),
+                else => {
+                    releaseCompletionCredentials(completion, null);
+                    return self.failCredential(.provider_internal_failure);
+                },
             },
-            .server_sign => {
-                if (completion != .signature_len) return self.failCredential(.invalid_callback_behavior);
-                const credential = self.pending_credential orelse return error.InvalidHandshakeState;
+            .client_select => switch (completion) {
+                .credential => |c| return self.emitSelectedClientCertificate(c, sink),
+                // A selector that resolved to "no credential" declines with an
+                // empty Certificate, exactly like the synchronous path.
+                .no_credential => return self.emitClientCertificate(null, sink),
+                else => {
+                    releaseCompletionCredentials(completion, null);
+                    return self.failCredential(.provider_internal_failure);
+                },
+            },
+            .server_sign, .client_sign => {
+                // Take the signing credential now so it is released on every
+                // path — including a malformed (wrong-kind) completion.
+                const held = self.pending_credential;
                 self.pending_credential = null;
-                return self.serverFinishFlight(credential, completion.signature_len, sink);
+                if (completion != .signature_len) {
+                    releaseCompletionCredentials(completion, held);
+                    return self.failCredential(.invalid_callback_behavior);
+                }
+                const credential = held orelse return error.InvalidHandshakeState;
+                return switch (stage) {
+                    .server_sign => self.serverFinishFlight(credential, completion.signature_len, sink),
+                    .client_sign => self.finishClientAuthFlight(credential, completion.signature_len, sink),
+                    else => unreachable,
+                };
             },
-            .client_select => {
-                if (completion != .credential) return self.failCredential(.provider_internal_failure);
-                return self.emitSelectedClientCertificate(completion.credential, sink);
-            },
-            .client_sign => {
-                if (completion != .signature_len) return self.failCredential(.invalid_callback_behavior);
-                const credential = self.pending_credential orelse return error.InvalidHandshakeState;
-                self.pending_credential = null;
-                return self.finishClientAuthFlight(credential, completion.signature_len, sink);
-            },
-            .peer_verify => {
-                if (completion != .verdict) return self.failCredential(.verifier_internal_failure);
-                return self.applyPeerVerdict(completion.verdict, sink);
+            .peer_verify => switch (completion) {
+                .verdict => |v| return self.applyPeerVerdict(v, sink),
+                else => {
+                    releaseCompletionCredentials(completion, null);
+                    return self.failCredential(.verifier_internal_failure);
+                },
             },
         }
+    }
+
+    /// Release the credential handles owned by a rejected completion and/or a
+    /// held signing credential exactly once each, deduping when both aliases
+    /// refer to the same provider handle (a malformed callback may hand back the
+    /// very credential the engine already holds).
+    fn releaseCompletionCredentials(completion: credentials.Completion, held: ?credentials.SelectedCredential) void {
+        var from_completion: ?credentials.SelectedCredential = switch (completion) {
+            .credential => |c| c,
+            else => null,
+        };
+        if (held) |h| {
+            h.release();
+            if (from_completion) |c| {
+                if (c.handle == h.handle) from_completion = null;
+            }
+        }
+        if (from_completion) |c| c.release();
     }
 
     /// The failure class for a pending operation that reported an error, by

@@ -4670,6 +4670,35 @@ test "static file integration serves configured index html" {
     try assertContains(response.body, "index fixture");
 }
 
+test "static file integration serves default index.html when root is set without index or try_files (#437)" {
+    const allocator = std.testing.allocator;
+    var fixture = try GenericFixtureDir.create(allocator, "static-root-default-index");
+    defer fixture.deinit();
+    try fixture.writeRel("public/index.html", "<html><body>default index fixture</body></html>\n");
+
+    const public_abs = try fixture.joinAbs("public");
+    defer allocator.free(public_abs);
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location / {{
+        \\    root {s};
+        \\}}
+    , .{public_abs});
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{ .config_text = config_text });
+    defer tardigrade.stop();
+
+    var response = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/",
+        .body = null,
+        .headers = &.{},
+    });
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status_code);
+    try assertContains(response.body, "default index fixture");
+}
+
 test "static file integration serves large files over plain http" {
     const allocator = std.testing.allocator;
     var fixture = try GenericFixtureDir.create(allocator, "static-large");

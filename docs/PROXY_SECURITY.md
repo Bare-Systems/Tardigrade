@@ -248,6 +248,33 @@ normalized filesystem namespace.
 Implementation: `resolvePath()` in `src/http/static_file.zig`.
 Tests: see the `serve rejects traversal …` test cases in the same file.
 
+## 12a. `root` / `index` / `try_files` Interaction (#437)
+
+A `location` block that sets `root` (or `alias`) is served through
+`resolvePath()` in the following order for a directory-style request (the
+request path is empty after stripping the location prefix, or ends in `/`):
+
+1. **`try_files`**, if configured — each candidate is tried in order; `$uri`
+   resolves to the request path.
+2. **`index`** — tried next if no `try_files` candidate resolved to a file.
+   If `index` is not explicitly configured, it **defaults to `index.html`**
+   (nginx-compatible), so `location / { root ...; }` alone serves
+   `index.html` from that root instead of 404ing.
+3. **`autoindex`**, if `on` — a directory listing is generated as a final
+   fallback when neither of the above resolved to a file.
+
+To opt out of the default index fallback entirely (e.g. to rely solely on
+`autoindex` or a custom `error_page`), set an explicit empty index:
+`index "";`.
+
+Implementation: `buildLocationBlockEntry()` in `src/http/config_file.zig`
+(default applied at config-parse time) and `resolvePath()` in
+`src/http/static_file.zig` (fallback resolution order).
+Tests: `location block with root and no index or try_files defaults index to
+index.html` in `src/http/config_file.zig`, and `static file integration
+serves default index.html when root is set without index or try_files
+(#437)` in `tests/integration.zig`.
+
 ## 13. TRACE Method Rejection
 
 **RFC 7231 §4.3.8 / ASVS-14.5.1.** The `TRACE` method is rejected globally

@@ -844,7 +844,11 @@ fn buildLocationBlockEntry(allocator: std.mem.Allocator, builder: *LocationBlock
                 builder.alias orelse builder.root orelse "",
                 if (builder.alias != null) "on" else "off",
                 if (builder.autoindex orelse false) "on" else "off",
-                builder.index orelse "",
+                // nginx-compatible default: a `root`/`alias` location with no
+                // explicit `index` directive falls back to `index.html` for
+                // directory-style requests (#437). Operators can still opt out
+                // of any index fallback with an explicit `index "";`.
+                builder.index orelse "index.html",
                 builder.try_files orelse "",
             },
         )
@@ -1333,6 +1337,46 @@ test "location block supports alias and fastcgi pass serialization" {
 
     try std.testing.expectEqualStrings(
         "prefix|/php/|fastcgi_pass|unix:/tmp/php-fpm.sock;prefix|/images/|static_root|/srv/images|on|off|home.html|",
+        overrides.map.get("TARDIGRADE_LOCATION_BLOCKS").?,
+    );
+}
+
+test "location block with root and no index or try_files defaults index to index.html" {
+    // Regression test for #437: `root` set without an explicit `index` (or
+    // `try_files`) directive used to serialize an empty index, causing
+    // directory-style requests (e.g. `/`) to 404 even when an `index.html`
+    // existed in the root. The default now matches nginx's `index index.html;`.
+    const allocator = std.testing.allocator;
+    var cfg_dir = std.testing.tmpDir(.{});
+    defer cfg_dir.cleanup();
+
+    try compat.wrapDir(cfg_dir.dir).writeFile(.{
+        .sub_path = "location-default-index.conf",
+        .data =
+        \\location / {
+        \\    root /srv/www;
+        \\}
+        ,
+    });
+
+    const absolute = try compat.wrapDir(cfg_dir.dir).realpathAlloc(allocator, "location-default-index.conf");
+    defer allocator.free(absolute);
+
+    var overrides = Overrides.init(allocator);
+    defer overrides.deinit(allocator);
+    var vars = std.StringHashMap([]const u8).init(allocator);
+    defer vars.deinit();
+    var visited = std.StringHashMap(void).init(allocator);
+    defer {
+        var it = visited.iterator();
+        while (it.next()) |entry| allocator.free(entry.key_ptr.*);
+        visited.deinit();
+    }
+
+    try parseFile(allocator, absolute, &overrides, &vars, &visited);
+
+    try std.testing.expectEqualStrings(
+        "prefix|/|static_root|/srv/www|off|off|index.html|",
         overrides.map.get("TARDIGRADE_LOCATION_BLOCKS").?,
     );
 }

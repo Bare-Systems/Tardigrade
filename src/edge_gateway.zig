@@ -262,6 +262,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
             .acme_account_key_path = cfg.tls_acme_account_key_path,
             .acme_renew_days_before_expiry = cfg.tls_acme_renew_days_before_expiry,
             .acme_challenge_store = if (state.acme_challenge_store) |*s| s else null,
+            .http1_enabled = cfg.http1_enabled,
             .http2_enabled = cfg.http2_enabled,
             .http1_alpn_fallback_enabled = cfg.tls_http1_no_alpn_fallback,
         });
@@ -865,7 +866,11 @@ fn startNewConnection(ctx: *WorkerContext, client_fd: std.posix.fd_t) void {
         }
 
         var served: u32 = 0;
-        const dispatch_result = dispatchNegotiatedHttp(ctx, &tls_conn, session, cfg, connection_ip, &served) catch |err| {
+        const negotiated = tls_conn.validatedNegotiatedProtocol() catch |err| {
+            ctx.state.logger.err(null, "negotiated HTTP protocol error: {}", .{err});
+            return;
+        };
+        const dispatch_result = dispatchNegotiatedHttp(ctx, &tls_conn, negotiated, session, cfg, connection_ip, &served) catch |err| {
             ctx.state.logger.err(null, "negotiated HTTP dispatch error: {}", .{err});
             return;
         };
@@ -928,25 +933,15 @@ fn resumeParkedConnection(ctx: *WorkerContext, pc: *http.keepalive_park.ParkedCo
     }
 }
 
-fn negotiatedProtocolForConn(conn: anytype) !http.tls_termination.NegotiatedProtocol {
-    const T = @TypeOf(conn);
-    if (comptime std.meta.activeTag(@typeInfo(T)) == .pointer) {
-        const Child = std.meta.Child(T);
-        if (comptime @hasDecl(Child, "validatedNegotiatedProtocol")) return conn.validatedNegotiatedProtocol();
-        if (comptime @hasDecl(Child, "negotiatedProtocol")) return conn.negotiatedProtocol();
-    }
-    return error.NoApplicationProtocol;
-}
-
 fn dispatchNegotiatedHttp(
     ctx: *WorkerContext,
     conn: anytype,
+    negotiated: http.tls_termination.NegotiatedProtocol,
     session: *ConnectionSession,
     cfg: *const edge_config.EdgeConfig,
     connection_ip: []const u8,
     served: *u32,
 ) !ServeOutcome {
-    const negotiated = try negotiatedProtocolForConn(conn);
     if (negotiated == .http2) {
         if (!cfg.http2_enabled) return error.ProtocolDisabled;
         try handleHttp2Connection(conn, session, cfg, ctx.state, connection_ip);

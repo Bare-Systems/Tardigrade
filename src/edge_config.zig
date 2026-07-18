@@ -197,6 +197,7 @@ pub const EdgeConfig = struct {
     tls_acme_account_key_path: []const u8,
     /// Days before certificate expiry at which renewal is triggered.
     tls_acme_renew_days_before_expiry: u32,
+    http1_enabled: bool,
     http2_enabled: bool,
     tls_http1_no_alpn_fallback: bool,
     /// Preferred application protocol for HTTPS upstream connections (#145).
@@ -784,6 +785,7 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     errdefer allocator.free(upstream_tls_client_cert);
     const upstream_tls_client_key = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_TLS_CLIENT_KEY", "") catch unreachable;
     errdefer allocator.free(upstream_tls_client_key);
+    const http1_enabled = parseBoolEnv(allocator, "TARDIGRADE_HTTP1_ENABLED", true);
     const http2_enabled = parseBoolEnv(allocator, "TARDIGRADE_HTTP2_ENABLED", true);
     const tls_http1_no_alpn_fallback = parseBoolEnv(allocator, "TARDIGRADE_TLS_HTTP1_NO_ALPN_FALLBACK", false);
     const http3_enabled = parseBoolEnv(allocator, "TARDIGRADE_HTTP3_ENABLED", false);
@@ -1433,6 +1435,7 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .tls_acme_email = tls_acme_email,
         .tls_acme_account_key_path = tls_acme_account_key_path,
         .tls_acme_renew_days_before_expiry = tls_acme_renew_days_before_expiry,
+        .http1_enabled = http1_enabled,
         .http2_enabled = http2_enabled,
         .tls_http1_no_alpn_fallback = tls_http1_no_alpn_fallback,
         .upstream_protocol = upstream_protocol,
@@ -2559,6 +2562,10 @@ pub fn validate(cfg: *const EdgeConfig) !void {
     if (cfg.http3_enabled and cfg.quic_port == 0) {
         std.log.err("config validation failed: quic_port must be between 1 and 65535 when HTTP/3 is enabled", .{});
         return error.InvalidConfigPort;
+    }
+    if (!cfg.http1_enabled and !cfg.http2_enabled) {
+        std.log.err("config validation failed: at least one of HTTP/1.1 or HTTP/2 must be enabled", .{});
+        return error.InvalidConfigValue;
     }
 
     if (std.mem.eql(u8, cfg.tls_min_version, "1.0") or std.mem.eql(u8, cfg.tls_min_version, "1.1") or

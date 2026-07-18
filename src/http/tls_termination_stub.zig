@@ -72,6 +72,7 @@ pub const TlsOptions = struct {
     acme_account_key_path: []const u8 = "",
     acme_renew_days_before_expiry: u32 = 30,
     acme_challenge_store: ?*@import("acme_challenge_store.zig").ChallengeStore = null,
+    http1_enabled: bool = true,
     http2_enabled: bool = true,
     http1_alpn_fallback_enabled: bool = false,
 };

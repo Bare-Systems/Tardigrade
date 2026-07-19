@@ -1321,12 +1321,26 @@ const WaitingEncryptedHttpConnection = struct {
 
     pub fn write(self: *WaitingEncryptedHttpConnection, bytes: []const u8) !usize {
         while (true) {
-            return self.inner.write(bytes) catch |err| switch (err) {
+            const n = self.inner.write(bytes) catch |err| switch (err) {
                 error.WouldBlock => {
                     try self.waitFor(.{ .write = true }, self.write_timeout_ms);
                     continue;
                 },
                 else => err,
+            };
+            try self.flush();
+            return n;
+        }
+    }
+
+    pub fn flush(self: *WaitingEncryptedHttpConnection) !void {
+        while (self.inner.readiness().wants_write) {
+            self.inner.flush() catch |err| switch (err) {
+                error.WouldBlock => {
+                    try self.waitFor(.{ .write = true }, self.write_timeout_ms);
+                    continue;
+                },
+                else => return err,
             };
         }
     }
@@ -1369,6 +1383,7 @@ const WaitingEncryptedHttpConnection = struct {
                 if (n == 0) return error.WouldBlock;
                 offset += n;
             }
+            try self.conn.flush();
         }
 
         pub fn writeByte(self: Writer, byte: u8) !void {
@@ -1440,6 +1455,11 @@ fn advanceNativeHttp1(ctx: *WorkerContext, managed: *http.downstream_connection.
                         managed.lifecycle.idle_timeout_ms,
                     );
                 }
+                _ = native.drive() catch |err| {
+                    ctx.state.logger.warn(null, "native http/1.1 post-request drive failed: {}", .{err});
+                    managed.deinit();
+                    return;
+                };
                 if (adapter.pending() > 0 or managed.transport.pendingPlaintext() > 0) continue;
                 rearmActiveConnection(ctx, managed, .{ .read = true });
                 return;

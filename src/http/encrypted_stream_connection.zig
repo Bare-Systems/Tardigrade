@@ -88,11 +88,23 @@ pub const EncryptedStreamHttpConnection = struct {
         return self.writeRaw(bytes);
     }
 
+    pub fn flush(self: *EncryptedStreamHttpConnection) encrypted_stream.Error!void {
+        while (self.stream.readiness().wants_write) {
+            const driven = try self.stream.drive();
+            if (!driven.made_progress and driven.readiness.wants_write) return error.WouldBlock;
+        }
+    }
+
     fn writeRaw(self: *EncryptedStreamHttpConnection, bytes: []const u8) encrypted_stream.Error!usize {
         if (bytes.len == 0) return 0;
         while (true) {
             if (self.stream.readiness().can_write_plaintext) {
-                return self.stream.write(bytes);
+                const n = try self.stream.write(bytes);
+                self.flush() catch |err| switch (err) {
+                    error.WouldBlock => {},
+                    else => return err,
+                };
+                return n;
             }
             const driven = try self.stream.drive();
             if (!driven.made_progress and !driven.readiness.can_write_plaintext) return error.WouldBlock;

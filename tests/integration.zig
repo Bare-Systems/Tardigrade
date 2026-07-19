@@ -3,6 +3,8 @@ const builtin = @import("builtin");
 const build_options = @import("build_options");
 const integration_options = @import("integration_options");
 const compat = @import("zig_compat");
+const hpack = @import("hpack");
+const tls_core = @import("tls_core");
 
 const test_host = "127.0.0.1";
 const valid_bearer_token = "integration-token";
@@ -999,9 +1001,10 @@ fn prepareBearClawFixture(
         transcript_file.close();
     }
 
-    const server_cert_abs = try std.fmt.allocPrint(allocator, "{s}/tests/fixtures/tls/server.crt", .{cwd});
+    const fixture_name = if (build_options.tls_openssl_adapter) "server" else "native_p256";
+    const server_cert_abs = try std.fmt.allocPrint(allocator, "{s}/tests/fixtures/tls/{s}.crt", .{ cwd, fixture_name });
     defer allocator.free(server_cert_abs);
-    const server_key_abs = try std.fmt.allocPrint(allocator, "{s}/tests/fixtures/tls/server.key", .{cwd});
+    const server_key_abs = try std.fmt.allocPrint(allocator, "{s}/tests/fixtures/tls/{s}.key", .{ cwd, fixture_name });
     defer allocator.free(server_key_abs);
     const cert_line = try std.fmt.allocPrint(allocator, "tls_cert_path {s};\n", .{server_cert_abs});
     defer allocator.free(cert_line);
@@ -1990,13 +1993,16 @@ fn waitUntilReady(port: u16, log_path: []const u8, options: TardigradeOptions) !
     var attempts: usize = 0;
     while (attempts < 100) : (attempts += 1) {
         if (ready_over_https) {
-            var resp = sendCurlRequest(std.testing.allocator, port, .{
-                .scheme = "https",
-                .path = ready_path,
-                .insecure = true,
-                .cert = options.ready_client_cert,
-                .key = options.ready_client_key,
-            }) catch |err| {
+            var resp = (if (!build_options.tls_openssl_adapter and options.ready_client_cert == null and options.ready_client_key == null)
+                sendPureZigTlsHttp1Request(std.testing.allocator, port, ready_path)
+            else
+                sendCurlRequest(std.testing.allocator, port, .{
+                    .scheme = "https",
+                    .path = ready_path,
+                    .insecure = true,
+                    .cert = options.ready_client_cert,
+                    .key = options.ready_client_key,
+                })) catch |err| {
                 if (attempts == 99) {
                     const log_data = compat.cwd().readFileAlloc(std.testing.allocator, log_path, 256 * 1024) catch "";
                     defer if (log_data.len > 0) std.testing.allocator.free(log_data);
@@ -2209,6 +2215,37 @@ fn sendCurlRequest(allocator: std.mem.Allocator, port: u16, spec: CurlRequestSpe
     };
 }
 
+fn sendPureZigTlsHttp1Request(allocator: std.mem.Allocator, port: u16, path: []const u8) !HttpResponse {
+    const client = try PureZigTlsClient.create(allocator, port, "http/1.1");
+    defer client.destroy();
+
+    var request = std.array_list.Managed(u8).init(allocator);
+    defer request.deinit();
+    try request.print(
+        "GET {s} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+        .{path},
+    );
+    try client.writeAllPlain(request.items);
+
+    const raw = try client.readPlainToEnd(allocator, 64 * 1024, 5_000);
+    errdefer allocator.free(raw);
+    return httpResponseFromOwnedRaw(allocator, raw);
+}
+
+fn httpResponseFromOwnedRaw(allocator: std.mem.Allocator, raw: []u8) !HttpResponse {
+    const start = std.mem.find(u8, raw, "HTTP/1.") orelse return error.InvalidHttpResponse;
+    if (start != 0) return error.InvalidHttpResponse;
+    const header_end = std.mem.find(u8, raw, "\r\n\r\n") orelse return error.InvalidHttpResponse;
+    const status_code = try parseStatusCode(raw);
+    return .{
+        .allocator = allocator,
+        .raw = raw,
+        .status_code = status_code,
+        .headers_raw = raw[0 .. header_end + 2],
+        .body = raw[header_end + 4 ..],
+    };
+}
+
 fn sendHttp3CurlRequestWithSpec(allocator: std.mem.Allocator, port: u16, spec: CurlRequestSpec) !HttpResponse {
     var last_err: ?anyerror = null;
     for (0..http3_retry_attempts) |_| {
@@ -2326,6 +2363,358 @@ fn findFreePort() !u16 {
     var server = try compat.listenTcp(test_host, 0);
     defer server.deinit();
     return server.port();
+}
+
+const NativeTlsFixturePaths = struct {
+    allocator: std.mem.Allocator,
+    cert_path: []u8,
+    key_path: []u8,
+
+    fn deinit(self: *NativeTlsFixturePaths) void {
+        self.allocator.free(self.cert_path);
+        self.allocator.free(self.key_path);
+        self.* = undefined;
+    }
+};
+
+fn nativeTlsFixturePaths(allocator: std.mem.Allocator) !NativeTlsFixturePaths {
+    const cwd = try compat.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(cwd);
+    const cert_path = try std.fmt.allocPrint(allocator, "{s}/tests/fixtures/tls/native_p256.crt", .{cwd});
+    errdefer allocator.free(cert_path);
+    const key_path = try std.fmt.allocPrint(allocator, "{s}/tests/fixtures/tls/native_p256.key", .{cwd});
+    return .{
+        .allocator = allocator,
+        .cert_path = cert_path,
+        .key_path = key_path,
+    };
+}
+
+fn listenerTlsFixturePaths(allocator: std.mem.Allocator) !NativeTlsFixturePaths {
+    if (!build_options.tls_openssl_adapter) return nativeTlsFixturePaths(allocator);
+    const cwd = try compat.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(cwd);
+    const cert_path = try std.fmt.allocPrint(allocator, "{s}/tests/fixtures/tls/server.crt", .{cwd});
+    errdefer allocator.free(cert_path);
+    const key_path = try std.fmt.allocPrint(allocator, "{s}/tests/fixtures/tls/server.key", .{cwd});
+    return .{
+        .allocator = allocator,
+        .cert_path = cert_path,
+        .key_path = key_path,
+    };
+}
+
+fn requireNativeTlsProfile() !void {
+    if (build_options.tls_openssl_adapter) return error.SkipZigTest;
+}
+
+const PureZigTlsClient = struct {
+    allocator: std.mem.Allocator,
+    stream: compat.NetStream,
+    entropy_source: tls_core.production_crypto.OsEntropy = .{},
+    crypto_provider_state: tls_core.production_crypto.Provider = undefined,
+    backend: tls_core.tls13_backend.Tls13Backend = undefined,
+    record: tls_core.encrypted_stream.PureZigRecordStream = undefined,
+
+    fn create(allocator: std.mem.Allocator, port: u16, alpn: []const u8) !*PureZigTlsClient {
+        const self = try allocator.create(PureZigTlsClient);
+        errdefer allocator.destroy(self);
+        self.* = .{
+            .allocator = allocator,
+            .stream = try compat.tcpConnectToHost(allocator, test_host, port),
+        };
+        errdefer self.stream.close();
+        try setNonBlockingFd(self.stream.handle);
+
+        self.crypto_provider_state = tls_core.production_crypto.Provider.init(self.entropy_source.entropy());
+        self.backend = tls_core.tls13_backend.Tls13Backend.initClient(
+            try tls_core.production_crypto.freshHandshakeEntropy(),
+            .insecure_no_verification,
+            .{ .record = .{ .alpn = alpnPolicy(alpn) } },
+        );
+        self.record = tls_core.encrypted_stream.PureZigRecordStream.initWithCarrierAndBackend(
+            .client,
+            self.cryptoProviderState().cryptoProvider(),
+            .tls_aes_128_gcm_sha256,
+            self.carrier(),
+            self.backend.backend(),
+        );
+        self.record.allow_unverified_certificate = true;
+        try self.record.setExpectedAlpn(alpn);
+        try self.driveUntilOpen(5_000);
+        return self;
+    }
+
+    fn expectHandshakeFailure(allocator: std.mem.Allocator, port: u16, alpn: []const u8) !void {
+        const self = try allocator.create(PureZigTlsClient);
+        errdefer allocator.destroy(self);
+        self.* = .{
+            .allocator = allocator,
+            .stream = try compat.tcpConnectToHost(allocator, test_host, port),
+        };
+        defer self.destroy();
+        try setNonBlockingFd(self.stream.handle);
+
+        self.crypto_provider_state = tls_core.production_crypto.Provider.init(self.entropy_source.entropy());
+        self.backend = tls_core.tls13_backend.Tls13Backend.initClient(
+            try tls_core.production_crypto.freshHandshakeEntropy(),
+            .insecure_no_verification,
+            .{ .record = .{ .alpn = alpnPolicy(alpn) } },
+        );
+        self.record = tls_core.encrypted_stream.PureZigRecordStream.initWithCarrierAndBackend(
+            .client,
+            self.cryptoProviderState().cryptoProvider(),
+            .tls_aes_128_gcm_sha256,
+            self.carrier(),
+            self.backend.backend(),
+        );
+        self.record.allow_unverified_certificate = true;
+        try self.record.setExpectedAlpn(alpn);
+
+        const deadline = compat.milliTimestamp() + 5_000;
+        while (compat.milliTimestamp() < deadline) {
+            _ = self.record.drive() catch return;
+            if (self.record.applicationDataOpen()) return error.TestUnexpectedResult;
+            try self.waitForReadiness(100);
+        }
+        return error.ReadTimeout;
+    }
+
+    fn destroy(self: *PureZigTlsClient) void {
+        self.record.deinit();
+        self.backend.deinit();
+        self.stream.close();
+        const allocator = self.allocator;
+        self.* = undefined;
+        allocator.destroy(self);
+    }
+
+    fn cryptoProviderState(self: *PureZigTlsClient) *tls_core.production_crypto.Provider {
+        return &self.crypto_provider_state;
+    }
+
+    fn carrier(self: *PureZigTlsClient) tls_core.encrypted_stream.Carrier {
+        return .{
+            .ptr = self,
+            .readFn = carrierRead,
+            .writeFn = carrierWrite,
+            .closeFn = null,
+            .owns_handle = false,
+        };
+    }
+
+    fn driveUntilOpen(self: *PureZigTlsClient, timeout_ms: u64) !void {
+        const deadline = compat.milliTimestamp() + @as(i64, @intCast(timeout_ms));
+        while (compat.milliTimestamp() < deadline) {
+            const driven = try self.record.drive();
+            if (self.record.applicationDataOpen()) return;
+            if (!driven.made_progress) try self.waitForReadiness(100);
+        }
+        return error.ReadTimeout;
+    }
+
+    fn writeAllPlain(self: *PureZigTlsClient, bytes: []const u8) !void {
+        var offset: usize = 0;
+        const deadline = compat.milliTimestamp() + 5_000;
+        while (offset < bytes.len and compat.milliTimestamp() < deadline) {
+            const encrypted = self.record.stream();
+            const n = encrypted.write(bytes[offset..]) catch |err| switch (err) {
+                error.WouldBlock => {
+                    try self.driveAndWait(100);
+                    continue;
+                },
+                else => return err,
+            };
+            offset += n;
+            _ = try self.record.drive();
+        }
+        if (offset < bytes.len) return error.WriteFailed;
+    }
+
+    fn readPlainToEnd(self: *PureZigTlsClient, allocator: std.mem.Allocator, max_bytes: usize, timeout_ms: u64) ![]u8 {
+        const deadline = compat.milliTimestamp() + @as(i64, @intCast(timeout_ms));
+        var out = std.array_list.Managed(u8).init(allocator);
+        errdefer out.deinit();
+        var tmp: [4096]u8 = undefined;
+        while (compat.milliTimestamp() < deadline) {
+            const encrypted = self.record.stream();
+            const n = encrypted.read(&tmp) catch |err| switch (err) {
+                error.WouldBlock => {
+                    self.driveAndWait(100) catch |drive_err| switch (drive_err) {
+                        error.EndOfStream, error.TruncatedStream => break,
+                        error.WouldBlock => if (out.items.len > 0) break else continue,
+                        else => return drive_err,
+                    };
+                    continue;
+                },
+                error.EndOfStream, error.TruncatedStream => break,
+                else => return err,
+            };
+            if (n == 0) break;
+            try out.appendSlice(tmp[0..n]);
+            if (out.items.len > max_bytes) return error.MessageTooLarge;
+        }
+        if (out.items.len == 0) return error.ReadTimeout;
+        return out.toOwnedSlice();
+    }
+
+    fn readExactPlain(self: *PureZigTlsClient, out: []u8, timeout_ms: u64) !void {
+        const deadline = compat.milliTimestamp() + @as(i64, @intCast(timeout_ms));
+        var offset: usize = 0;
+        while (offset < out.len and compat.milliTimestamp() < deadline) {
+            const encrypted = self.record.stream();
+            const n = encrypted.read(out[offset..]) catch |err| switch (err) {
+                error.WouldBlock => {
+                    try self.driveAndWait(100);
+                    continue;
+                },
+                else => return err,
+            };
+            if (n == 0) return error.ConnectionClosed;
+            offset += n;
+        }
+        if (offset < out.len) return error.ReadTimeout;
+    }
+
+    fn writeHttp2Frame(self: *PureZigTlsClient, typ: u8, flags: u8, stream_id: u31, payload: []const u8) !void {
+        var header: [9]u8 = undefined;
+        header[0] = @intCast((payload.len >> 16) & 0xff);
+        header[1] = @intCast((payload.len >> 8) & 0xff);
+        header[2] = @intCast(payload.len & 0xff);
+        header[3] = typ;
+        header[4] = flags;
+        std.mem.writeInt(u32, header[5..9], @as(u32, stream_id) & 0x7fff_ffff, .big);
+        try self.writeAllPlain(header[0..]);
+        try self.writeAllPlain(payload);
+    }
+
+    fn readHttp2Frame(self: *PureZigTlsClient, allocator: std.mem.Allocator, max_payload: usize, timeout_ms: u64) !Http2WireFrame {
+        var header: [9]u8 = undefined;
+        try self.readExactPlain(header[0..], timeout_ms);
+        const len = (@as(usize, header[0]) << 16) | (@as(usize, header[1]) << 8) | @as(usize, header[2]);
+        if (len > max_payload) return error.MessageTooLarge;
+        const sid = std.mem.readInt(u32, header[5..9], .big) & 0x7fff_ffff;
+        const payload = try allocator.alloc(u8, len);
+        errdefer allocator.free(payload);
+        try self.readExactPlain(payload, timeout_ms);
+        return .{
+            .typ = header[3],
+            .flags = header[4],
+            .stream_id = @intCast(sid),
+            .payload = payload,
+        };
+    }
+
+    fn driveAndWait(self: *PureZigTlsClient, timeout_ms: u64) !void {
+        const driven = try self.record.drive();
+        if (!driven.made_progress) try self.waitForReadiness(timeout_ms);
+    }
+
+    fn waitForReadiness(self: *PureZigTlsClient, timeout_ms: u64) !void {
+        const readiness = self.record.readiness();
+        var events: i16 = std.posix.POLL.ERR | std.posix.POLL.HUP;
+        if (readiness.wants_read) events |= std.posix.POLL.IN;
+        if (readiness.wants_write) events |= std.posix.POLL.OUT;
+        var fds = [_]std.posix.pollfd{.{
+            .fd = self.stream.handle,
+            .events = events,
+            .revents = 0,
+        }};
+        const ready = try std.posix.poll(&fds, @intCast(@max(@as(u64, 1), timeout_ms)));
+        if (ready == 0) return error.WouldBlock;
+        if ((fds[0].revents & std.posix.POLL.ERR) != 0) return error.ConnectionResetByPeer;
+    }
+
+    fn carrierRead(ptr: *anyopaque, out: []u8) tls_core.encrypted_stream.Error!usize {
+        const self: *PureZigTlsClient = @ptrCast(@alignCast(ptr));
+        return readFdNonblocking(self.stream.handle, out);
+    }
+
+    fn carrierWrite(ptr: *anyopaque, bytes: []const u8) tls_core.encrypted_stream.Error!usize {
+        const self: *PureZigTlsClient = @ptrCast(@alignCast(ptr));
+        return writeFdNonblocking(self.stream.handle, bytes);
+    }
+};
+
+fn alpnPolicy(alpn: []const u8) tls_core.tls13_backend.AlpnPolicy {
+    if (std.mem.eql(u8, alpn, "h2")) return tls_core.tls13_backend.recordAlpnPolicy("h2");
+    if (std.mem.eql(u8, alpn, "http/1.1")) return tls_core.tls13_backend.recordAlpnPolicy("http/1.1");
+    if (std.mem.eql(u8, alpn, "tardigrade-test")) return tls_core.tls13_backend.recordAlpnPolicy("tardigrade-test");
+    return .{ .protocols = &.{} };
+}
+
+const Http2WireFrame = struct {
+    typ: u8,
+    flags: u8,
+    stream_id: u31,
+    payload: []u8,
+
+    fn deinit(self: *Http2WireFrame, allocator: std.mem.Allocator) void {
+        allocator.free(self.payload);
+        self.* = undefined;
+    }
+};
+
+fn setNonBlockingFd(fd: std.posix.fd_t) !void {
+    if (builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        const status_flags = linux.fcntl(fd, linux.F.GETFL, 0);
+        if (linux.errno(status_flags) != .SUCCESS) return error.FcntlFailed;
+        const nonblock: usize = @intCast(@as(u32, @bitCast(linux.O{ .NONBLOCK = true })));
+        const rc = linux.fcntl(fd, linux.F.SETFL, status_flags | nonblock);
+        if (linux.errno(rc) != .SUCCESS) return error.FcntlFailed;
+    } else {
+        const status_flags = std.c.fcntl(fd, std.c.F.GETFL, @as(c_int, 0));
+        if (status_flags < 0) return error.FcntlFailed;
+        const nonblock = @as(c_int, @bitCast(std.posix.O{ .NONBLOCK = true }));
+        if (std.c.fcntl(fd, std.c.F.SETFL, status_flags | nonblock) < 0) return error.FcntlFailed;
+    }
+}
+
+fn readFdNonblocking(fd: std.posix.fd_t, out: []u8) tls_core.encrypted_stream.Error!usize {
+    if (builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        const rc = linux.read(fd, out.ptr, out.len);
+        return switch (linux.errno(rc)) {
+            .SUCCESS => rc,
+            .AGAIN => error.WouldBlock,
+            else => error.SocketReadFailed,
+        };
+    }
+    const rc = std.c.read(fd, out.ptr, out.len);
+    if (rc < 0) {
+        if (std.posix.errno(rc) == .AGAIN) return error.WouldBlock;
+        return error.SocketReadFailed;
+    }
+    return @intCast(rc);
+}
+
+fn writeFdNonblocking(fd: std.posix.fd_t, bytes: []const u8) tls_core.encrypted_stream.Error!usize {
+    if (builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        const rc = linux.write(fd, bytes.ptr, bytes.len);
+        return switch (linux.errno(rc)) {
+            .SUCCESS => rc,
+            .AGAIN => error.WouldBlock,
+            else => error.SocketWriteFailed,
+        };
+    }
+    const rc = std.c.write(fd, bytes.ptr, bytes.len);
+    if (rc < 0) {
+        if (std.posix.errno(rc) == .AGAIN) return error.WouldBlock;
+        return error.SocketWriteFailed;
+    }
+    return @intCast(rc);
+}
+
+fn countOccurrences(haystack: []const u8, needle: []const u8) usize {
+    var count: usize = 0;
+    var start: usize = 0;
+    while (std.mem.find(u8, haystack[start..], needle)) |rel| {
+        count += 1;
+        start += rel + needle.len;
+    }
+    return count;
 }
 
 fn hs256Jwt(allocator: std.mem.Allocator, secret: []const u8, payload_json: []const u8) ![]u8 {
@@ -2638,6 +3027,7 @@ test "prometheus metrics endpoint exposes counters and can require auth" {
 }
 
 test "bearclaw fixture serves chat over https with bearer auth and transcript persistence" {
+    if (!build_options.tls_openssl_adapter) return error.SkipZigTest;
     const allocator = std.testing.allocator;
 
     var upstream = try UpstreamServer.start(allocator, &.{.{
@@ -2724,6 +3114,7 @@ test "bearclaw fixture serves chat over https with bearer auth and transcript pe
 }
 
 test "bearclaw transcript append path errors do not fail the request" {
+    if (!build_options.tls_openssl_adapter) return error.SkipZigTest;
     const allocator = std.testing.allocator;
 
     var upstream = try UpstreamServer.start(allocator, &.{.{
@@ -2761,6 +3152,7 @@ test "bearclaw transcript append path errors do not fail the request" {
 
 // TC-TARDIGRADE-002 + TC-TARDIGRADE-004
 test "bearclaw edge prefix routes health without auth and enforces auth on v1 paths" {
+    if (!build_options.tls_openssl_adapter) return error.SkipZigTest;
     const allocator = std.testing.allocator;
 
     var upstream = try UpstreamServer.start(allocator, &.{
@@ -5052,12 +5444,8 @@ test "security headers do not override or duplicate upstream-provided values (#1
 
 test "HSTS header is emitted on HTTPS responses when enabled (#175)" {
     const allocator = std.testing.allocator;
-    const cwd = try compat.cwd().realpathAlloc(allocator, ".");
-    defer allocator.free(cwd);
-    const cert_path = try std.fmt.allocPrint(allocator, "{s}/tests/fixtures/tls/server.crt", .{cwd});
-    defer allocator.free(cert_path);
-    const key_path = try std.fmt.allocPrint(allocator, "{s}/tests/fixtures/tls/server.key", .{cwd});
-    defer allocator.free(key_path);
+    var tls_paths = try listenerTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
 
     var tardigrade = try TardigradeProcess.start(allocator, .{
         .config_text =
@@ -5068,18 +5456,21 @@ test "HSTS header is emitted on HTTPS responses when enabled (#175)" {
         .ready_https_insecure = true,
         .ready_path = "/healthz",
         .extra_env = &.{
-            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = cert_path },
-            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = key_path },
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
             .{ .name = "TARDIGRADE_HSTS_ENABLED", .value = "true" },
         },
     });
     defer tardigrade.stop();
 
-    var response = try sendCurlRequest(allocator, tardigrade.port, .{
-        .scheme = "https",
-        .path = "/healthz",
-        .insecure = true,
-    });
+    var response = if (build_options.tls_openssl_adapter)
+        try sendCurlRequest(allocator, tardigrade.port, .{
+            .scheme = "https",
+            .path = "/healthz",
+            .insecure = true,
+        })
+    else
+        try sendPureZigTlsHttp1Request(allocator, tardigrade.port, "/healthz");
     defer response.deinit();
     try std.testing.expectEqual(@as(u16, 200), response.status_code);
     // Default HSTS is a 1-year max-age with includeSubDomains on (preload off).
@@ -5089,6 +5480,7 @@ test "HSTS header is emitted on HTTPS responses when enabled (#175)" {
 }
 
 test "TLS 1.1 client is rejected when the minimum version is 1.2 (#175)" {
+    if (!build_options.tls_openssl_adapter) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const cwd = try compat.cwd().realpathAlloc(allocator, ".");
     defer allocator.free(cwd);
@@ -6428,17 +6820,194 @@ test "failure: metrics endpoint stays responsive under concurrent proxy load" {
     }
 }
 
+test "native TLS listener dispatches ALPN http/1.1 through keepalive requests" {
+    try requireNativeTlsProfile();
+    const allocator = std.testing.allocator;
+
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+
+    var upstream = try UpstreamServer.start(allocator, &.{
+        .{ .body = "native-h1-first", .connection_header = "keep-alive" },
+        .{ .body = "native-h1-second", .connection_header = "close" },
+    });
+    defer upstream.stop();
+    try upstream.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\
+        \\location /proxy/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+    , .{ test_host, upstream.port() });
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_HTTP2_ENABLED", .value = "false" },
+        },
+    });
+    defer tardigrade.stop();
+    try upstream.resetCapture();
+
+    const client = try PureZigTlsClient.create(allocator, tardigrade.port, "http/1.1");
+    defer client.destroy();
+    try client.writeAllPlain("GET /proxy/one HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: keep-alive\r\n\r\n");
+
+    const first_raw = try client.readPlainToEnd(allocator, 64 * 1024, 5_000);
+    defer allocator.free(first_raw);
+    try waitForUpstreamCount(&upstream, 1, 2_000);
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(first_raw, "HTTP/1.1 200 OK"));
+    try assertContains(first_raw, "native-h1-first");
+
+    try client.writeAllPlain("GET /proxy/two HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+
+    const second_raw = try client.readPlainToEnd(allocator, 64 * 1024, 5_000);
+    defer allocator.free(second_raw);
+
+    try waitForUpstreamCount(&upstream, 2, 2_000);
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(second_raw, "HTTP/1.1 200 OK"));
+    try assertContains(second_raw, "native-h1-second");
+}
+
+test "native TLS listener dispatches ALPN h2 through HTTP/2 frames" {
+    try requireNativeTlsProfile();
+    const allocator = std.testing.allocator;
+
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text =
+        \\location = /healthz {
+        \\    return 200 alive;
+        \\}
+        ,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_HTTP1_ENABLED", .value = "true" },
+            .{ .name = "TARDIGRADE_HTTP2_ENABLED", .value = "true" },
+        },
+    });
+    defer tardigrade.stop();
+
+    const client = try PureZigTlsClient.create(allocator, tardigrade.port, "h2");
+    defer client.destroy();
+
+    try client.writeAllPlain("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+    try client.writeHttp2Frame(0x4, 0, 0, &.{}); // client SETTINGS
+
+    const request_headers = [_]hpack.HeaderField{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":path", .value = "/h2-listener" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "127.0.0.1" },
+    };
+    const request_block = try hpack.encodeLiteralHeaderBlock(allocator, request_headers[0..]);
+    defer allocator.free(request_block);
+    try client.writeHttp2Frame(0x1, 0x1 | 0x4, 1, request_block); // END_STREAM | END_HEADERS
+
+    var saw_settings = false;
+    var saw_response_headers = false;
+    var response_body = std.array_list.Managed(u8).init(allocator);
+    defer response_body.deinit();
+
+    var frame_count: usize = 0;
+    while (frame_count < 8) : (frame_count += 1) {
+        var frame = try client.readHttp2Frame(allocator, 16 * 1024, 5_000);
+        defer frame.deinit(allocator);
+
+        switch (frame.typ) {
+            0x4 => {
+                if ((frame.flags & 0x1) == 0) {
+                    saw_settings = true;
+                    try client.writeHttp2Frame(0x4, 0x1, 0, &.{}); // SETTINGS ACK
+                }
+            },
+            0x1 => {
+                if (frame.stream_id == 1) saw_response_headers = true;
+            },
+            0x0 => {
+                if (frame.stream_id == 1) {
+                    try response_body.appendSlice(frame.payload);
+                    if ((frame.flags & 0x1) != 0) break;
+                }
+            },
+            else => {},
+        }
+    }
+
+    try std.testing.expect(saw_settings);
+    try std.testing.expect(saw_response_headers);
+    try assertContains(response_body.items, "\"error\":\"not_found\"");
+}
+
+test "native TLS listener rejects unsupported ALPN before HTTP dispatch" {
+    try requireNativeTlsProfile();
+    const allocator = std.testing.allocator;
+
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+
+    var upstream = try UpstreamServer.start(allocator, &.{
+        .{ .body = "negative-control", .connection_header = "close" },
+    });
+    defer upstream.stop();
+    try upstream.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\
+        \\location /proxy/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+    , .{ test_host, upstream.port() });
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_HTTP2_ENABLED", .value = "false" },
+        },
+    });
+    defer tardigrade.stop();
+    try upstream.resetCapture();
+
+    try PureZigTlsClient.expectHandshakeFailure(allocator, tardigrade.port, "tardigrade-test");
+    compat.sleepNs(200 * std.time.ns_per_ms);
+    try std.testing.expectEqual(@as(u32, 0), upstream.requestCount());
+
+    var control = try sendPureZigTlsHttp1Request(allocator, tardigrade.port, "/proxy/control");
+    defer control.deinit();
+    try std.testing.expectEqual(@as(u16, 200), control.status_code);
+    try assertContains(control.body, "negative-control");
+    try waitForUpstreamCount(&upstream, 1, 2_000);
+}
+
 test "failure: malformed and stalled TLS handshakes are rejected without wedging the listener (#270)" {
     const allocator = std.testing.allocator;
 
     // Absolute paths to the shared TLS fixture; presence of both cert and key is
     // what enables TLS termination on the listener (edge_config.hasTlsFiles).
-    const cwd = try compat.cwd().realpathAlloc(allocator, ".");
-    defer allocator.free(cwd);
-    const cert_path = try std.fmt.allocPrint(allocator, "{s}/tests/fixtures/tls/server.crt", .{cwd});
-    defer allocator.free(cert_path);
-    const key_path = try std.fmt.allocPrint(allocator, "{s}/tests/fixtures/tls/server.key", .{cwd});
-    defer allocator.free(key_path);
+    var tls_paths = try listenerTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
 
     var tardigrade = try TardigradeProcess.start(allocator, .{
         .config_text =
@@ -6450,8 +7019,8 @@ test "failure: malformed and stalled TLS handshakes are rejected without wedging
         .ready_https_insecure = true,
         .ready_path = "/healthz",
         .extra_env = &.{
-            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = cert_path },
-            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = key_path },
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
             // Bound a stalled handshake tightly so the (single, harness-default)
             // worker cannot be pinned by a peer that never finishes the
             // handshake.
@@ -6489,24 +7058,35 @@ test "failure: malformed and stalled TLS handshakes are rejected without wedging
     try stalled.writeAll("\x16\x03\x01\x00\x50\x01\x00\x00\x4c\x03\x03");
 
     // The listener still terminates a valid TLS request end-to-end.
-    var response = try sendCurlRequest(allocator, tardigrade.port, .{
-        .scheme = "https",
-        .path = "/healthz",
-        .insecure = true,
-    });
+    var response = if (build_options.tls_openssl_adapter)
+        try sendCurlRequest(allocator, tardigrade.port, .{
+            .scheme = "https",
+            .path = "/healthz",
+            .insecure = true,
+        })
+    else
+        try sendPureZigTlsHttp1Request(allocator, tardigrade.port, "/healthz");
     defer response.deinit();
     try std.testing.expectEqual(@as(u16, 200), response.status_code);
     try assertContains(response.body, "alive");
 
     // The failure is observable: broken handshakes are logged.
-    try waitForLogSubstring(allocator, tardigrade.log_path, "tls handshake error", 3_000);
+    try waitForLogSubstring(
+        allocator,
+        tardigrade.log_path,
+        if (build_options.tls_openssl_adapter) "tls handshake error" else "native tls handshake failed",
+        3_000,
+    );
 
     // And no half-open handshakes leaked — active connections stay bounded.
-    var metrics = try sendCurlRequest(allocator, tardigrade.port, .{
-        .scheme = "https",
-        .path = "/status/metrics",
-        .insecure = true,
-    });
+    var metrics = if (build_options.tls_openssl_adapter)
+        try sendCurlRequest(allocator, tardigrade.port, .{
+            .scheme = "https",
+            .path = "/status/metrics",
+            .insecure = true,
+        })
+    else
+        try sendPureZigTlsHttp1Request(allocator, tardigrade.port, "/status/metrics");
     defer metrics.deinit();
     try std.testing.expectEqual(@as(u16, 200), metrics.status_code);
     const active = prometheusMetricValue(metrics.body, "tardigrade_active_connections") orelse

@@ -23,8 +23,10 @@ All notable user-facing changes to Tardigrade are documented here.
   accounting and pause/resume behavior introduced by #355. Tests now cover the
   OpenSSL ALPN policy matrix, strict and fallback absent-ALPN behavior,
   malformed on-wire ALPN alerts, reload-pinned negotiation, shared dispatch
-  entrypoint shape, encrypted-stream adapter conformance, and #355
-  backpressure propagation evidence.
+  entrypoint shape, production native-listener HTTP/1.1 keepalive and HTTP/2
+  request/response dispatch, unsupported-ALPN pre-dispatch rejection,
+  encrypted-stream adapter conformance, and #355 backpressure propagation
+  evidence.
 - **Bounded TLS stream watermarks and backpressure (#355, epic #325)** — adds
   validated per-connection TLS buffer limits for inbound carrier ciphertext,
   decrypted plaintext, outbound ciphertext, and handshake bytes while

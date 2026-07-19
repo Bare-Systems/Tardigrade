@@ -1356,11 +1356,6 @@ fn makeTestTlsPairWithOptions(allocator: std.mem.Allocator, opts: TestTlsPairOpt
     errdefer _ = std.c.close(fds[0]);
     errdefer _ = std.c.close(fds[1]);
 
-    var accept_ctx = ServerAcceptContext{ .terminator = &terminator, .fd = fds[1], .accept_policy = opts.server_accept_policy };
-    const thread = try std.Thread.spawn(.{}, serverAcceptThread, .{&accept_ctx});
-    var thread_joined = false;
-    defer if (!thread_joined) thread.join();
-
     const client_ctx = c.SSL_CTX_new(c.TLS_client_method() orelse return error.ContextInitFailed) orelse return error.ContextInitFailed;
     errdefer c.SSL_CTX_free(client_ctx);
     c.SSL_CTX_set_verify(client_ctx, c.SSL_VERIFY_NONE, null);
@@ -1370,6 +1365,17 @@ fn makeTestTlsPairWithOptions(allocator: std.mem.Allocator, opts: TestTlsPairOpt
         if (c.SSL_set_alpn_protos(client_ssl, wire.ptr, @intCast(wire.len)) != 0) return error.ProtocolConfigFailed;
     }
     if (c.SSL_set_fd(client_ssl, fds[0]) != 1) return error.HandshakeFailed;
+
+    var accept_ctx = ServerAcceptContext{ .terminator = &terminator, .fd = fds[1], .accept_policy = opts.server_accept_policy };
+    const thread = try std.Thread.spawn(.{}, serverAcceptThread, .{&accept_ctx});
+    var thread_joined = false;
+    errdefer if (!thread_joined) {
+        _ = std.c.shutdown(fds[0], std.posix.SHUT.RDWR);
+        _ = std.c.shutdown(fds[1], std.posix.SHUT.RDWR);
+        thread.join();
+        thread_joined = true;
+    };
+
     if (c.SSL_connect(client_ssl) != 1) return error.HandshakeFailed;
 
     thread.join();
@@ -1613,6 +1619,12 @@ test "acceptWithPolicy pins policy from connection config generation" {
 
         try std.testing.expectEqual(NegotiatedProtocol.http2, try pair.server.validatedNegotiatedProtocol());
     }
+}
+
+test "test TLS pair rejects malformed local ALPN before spawning accept thread" {
+    try std.testing.expectError(error.ProtocolConfigFailed, makeTestTlsPairWithOptions(std.testing.allocator, .{
+        .client_alpn_wire = "\x08http",
+    }));
 }
 
 test "openssl encrypted stream adapter conforms over production connection" {

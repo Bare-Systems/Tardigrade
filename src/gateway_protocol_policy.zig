@@ -39,8 +39,8 @@ test "listener policy follows acquired config lease across reload publication" {
     defer lease_b.release();
     const policy_b = listenerPolicyFromConfig(lease_b.cfg);
 
-    try std.testing.expectEqual(http.negotiated_dispatch.NegotiatedProtocol.http1_1, try http.negotiated_dispatch.selectNegotiatedProtocol("http/1.1", policy_a));
+    try std.testing.expectEqual(http.tls_termination.NegotiatedProtocol.http1_1, try http.negotiated_dispatch.selectNegotiatedProtocol("http/1.1", policy_a));
     try std.testing.expectError(error.ProtocolDisabled, http.negotiated_dispatch.selectNegotiatedProtocol("h2", policy_a));
-    try std.testing.expectEqual(http.negotiated_dispatch.NegotiatedProtocol.http2, try http.negotiated_dispatch.selectNegotiatedProtocol("h2", policy_b));
+    try std.testing.expectEqual(http.tls_termination.NegotiatedProtocol.http2, try http.negotiated_dispatch.selectNegotiatedProtocol("h2", policy_b));
     try std.testing.expectError(error.ProtocolDisabled, http.negotiated_dispatch.selectNegotiatedProtocol("http/1.1", policy_b));
 }

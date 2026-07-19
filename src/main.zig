@@ -1254,6 +1254,7 @@ test {
     _ = @import("http.zig");
     _ = @import("edge_config.zig");
     _ = @import("edge_gateway.zig");
+    _ = @import("gateway_protocol_policy.zig");
 }
 
 test "rotateLogFiles shifts generations" {

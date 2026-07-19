@@ -86,6 +86,15 @@ pub const NativeHandshakeState = struct {
     deadline_ms: u64 = 0,
 };
 
+pub const NativeHttp1State = struct {
+    served: u32 = 0,
+    idle_deadline_ms: u64 = 0,
+};
+
+pub const NativeHttp2State = struct {
+    idle_or_io_deadline_ms: u64 = 0,
+};
+
 pub const Http1ConnectionState = struct {
     allocator: std.mem.Allocator,
     input: []u8,
@@ -201,6 +210,8 @@ pub const Http2ConnectionState = struct {
 
 pub const ConnectionPhase = union(enum) {
     native_handshake: NativeHandshakeState,
+    native_http1: NativeHttp1State,
+    native_http2: NativeHttp2State,
     http1: Http1ConnectionState,
     http2: Http2ConnectionState,
     idle_http1,
@@ -291,6 +302,8 @@ pub const ManagedConnection = struct {
     pub fn expired(self: *const ManagedConnection, now_ms: u64) bool {
         return switch (self.phase) {
             .native_handshake => |h| h.deadline_ms != 0 and now_ms >= h.deadline_ms,
+            .native_http1 => |h| h.idle_deadline_ms != 0 and now_ms >= h.idle_deadline_ms,
+            .native_http2 => |h| h.idle_or_io_deadline_ms != 0 and now_ms >= h.idle_or_io_deadline_ms,
             .http1 => |h| h.phase_deadline_ms != 0 and now_ms >= h.phase_deadline_ms,
             .http2 => |h| h.idle_or_io_deadline_ms != 0 and now_ms >= h.idle_or_io_deadline_ms,
             .idle_http1 => false,
@@ -547,6 +560,17 @@ test "managed connection preserves protocol write interest for plaintext wait-wr
     const interest = managed.updateInterestFor(.{ .write = true });
     try std.testing.expect(interest.write);
     try std.testing.expect(!interest.read);
+}
+
+test "native http1 managed phase does not allocate request buffer state" {
+    try std.testing.expect(@sizeOf(NativeHttp1State) <= 16);
+    var managed = ManagedConnection.init(
+        .{ .plaintext = -1 },
+        .{ .native_http1 = .{ .served = 1 } },
+    );
+    defer managed.deinit();
+
+    try std.testing.expectEqual(@as(u32, 1), managed.phase.native_http1.served);
 }
 
 test "combined interest keeps phase demand and TLS carrier readiness" {

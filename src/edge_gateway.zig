@@ -1205,6 +1205,8 @@ fn rearmActiveConnection(ctx: *WorkerContext, managed: *http.downstream_connecti
 fn advanceActiveConnection(ctx: *WorkerContext, managed: *http.downstream_connection.ManagedConnection) void {
     switch (managed.phase) {
         .native_handshake => advanceNativeHandshake(ctx, managed),
+        .native_http1 => advanceNativeHttp1(ctx, managed),
+        .native_http2 => advanceNativeHttp2(ctx, managed),
         .http1 => advanceNativeHttp1(ctx, managed),
         .http2 => advanceNativeHttp2(ctx, managed),
         .idle_http1 => managed.deinit(),
@@ -1245,16 +1247,11 @@ fn advanceNativeHandshake(ctx: *WorkerContext, managed: *http.downstream_connect
 
     switch (negotiated) {
         .http1_1 => {
-            const h1 = http.downstream_connection.Http1ConnectionState.init(ctx.state.allocator, MAX_REQUEST_SIZE) catch |err| {
-                ctx.state.logger.warn(null, "native http/1 state allocation failed: {}", .{err});
-                managed.deinit();
-                return;
-            };
-            managed.phase = .{ .http1 = h1 };
+            managed.phase = .{ .native_http1 = .{} };
             if (managed.transport.pendingPlaintext() > 0) {
                 advanceActiveConnection(ctx, managed);
             } else {
-                managed.phase.http1.phase_deadline_ms = deadlineFromNow(
+                managed.phase.native_http1.idle_deadline_ms = deadlineFromNow(
                     http.event_loop.monotonicMs(),
                     managed.lifecycle.header_timeout_ms,
                 );
@@ -1262,12 +1259,11 @@ fn advanceNativeHandshake(ctx: *WorkerContext, managed: *http.downstream_connect
             }
         },
         .http2 => {
-            const h2 = http.downstream_connection.Http2ConnectionState.init(ctx.state.allocator);
-            managed.phase = .{ .http2 = h2 };
+            managed.phase = .{ .native_http2 = .{} };
             if (managed.transport.pendingPlaintext() > 0) {
                 advanceActiveConnection(ctx, managed);
             } else {
-                managed.phase.http2.idle_or_io_deadline_ms = deadlineFromNow(
+                managed.phase.native_http2.idle_or_io_deadline_ms = deadlineFromNow(
                     http.event_loop.monotonicMs(),
                     managed.lifecycle.header_timeout_ms,
                 );
@@ -1340,6 +1336,10 @@ const WaitingEncryptedHttpConnection = struct {
         return self.inner.rawFd();
     }
 
+    pub fn setReadTimeoutMs(self: *WaitingEncryptedHttpConnection, timeout_ms: u32) void {
+        self.read_timeout_ms = timeout_ms;
+    }
+
     pub fn writer(self: *WaitingEncryptedHttpConnection) Writer {
         return .{ .conn = self };
     }
@@ -1407,10 +1407,6 @@ fn advanceNativeHttp1(ctx: *WorkerContext, managed: *http.downstream_connection.
         managed.deinit();
         return;
     };
-    const cfg = activeConfig(managed) orelse {
-        managed.deinit();
-        return;
-    };
     var adapter = WaitingEncryptedHttpConnection.init(
         native.httpConnection(),
         managed.lifecycle.header_timeout_ms,
@@ -1418,17 +1414,17 @@ fn advanceNativeHttp1(ctx: *WorkerContext, managed: *http.downstream_connection.
     );
     const connection_ip = managed.lifecycle.connectionIp();
     var served = switch (managed.phase) {
-        .http1 => |*h1| h1.served,
+        .native_http1 => |*h1| h1.served,
         else => 0,
     };
 
     while (true) {
-        switch (serveOneRequestWithConfig(ctx, &adapter, session, cfg, connection_ip, &served, false)) {
+        switch (serveOneRequest(ctx, &adapter, session, connection_ip, &served, false)) {
             .serve_again => continue,
             .park => {
-                if (managed.phase == .http1) {
-                    managed.phase.http1.served = served;
-                    managed.phase.http1.phase_deadline_ms = deadlineFromNow(
+                if (managed.phase == .native_http1) {
+                    managed.phase.native_http1.served = served;
+                    managed.phase.native_http1.idle_deadline_ms = deadlineFromNow(
                         http.event_loop.monotonicMs(),
                         managed.lifecycle.idle_timeout_ms,
                     );
@@ -1900,6 +1896,20 @@ fn connRawFd(conn: anytype) ?std.posix.fd_t {
     return null;
 }
 
+fn setConnReadTimeout(conn: anytype, read_timeout_ms: u32, write_timeout_ms: u32) void {
+    const T = @TypeOf(conn);
+    if (comptime std.meta.activeTag(@typeInfo(T)) == .pointer) {
+        const Child = std.meta.Child(T);
+        if (comptime @hasDecl(Child, "setReadTimeoutMs")) {
+            conn.setReadTimeoutMs(read_timeout_ms);
+            return;
+        }
+    }
+    if (connRawFd(conn)) |fd| {
+        gconn.setSocketTimeoutMs(fd, read_timeout_ms, write_timeout_ms) catch {};
+    }
+}
+
 fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge_config.EdgeConfig, state: *GatewayState, keep_alive_out: *bool, connection_ip: []const u8, enable_proxy_protocol: bool) !void {
     var keep_alive = false;
     keep_alive_out.* = false;
@@ -1975,13 +1985,11 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
                 // Switch SO_RCVTIMEO from header phase to body read phase.
                 const body_timeout_ms = cfg.request_limits.effectiveBodyTimeout();
                 if (body_timeout_ms > 0) {
-                    if (connRawFd(conn)) |fd| {
-                        const write_timeout_ms = if (cfg.downstream_write_timeout_ms > 0)
-                            cfg.downstream_write_timeout_ms
-                        else
-                            cfg.request_limits.effectiveHeaderTimeout();
-                        gconn.setSocketTimeoutMs(fd, body_timeout_ms, write_timeout_ms) catch {};
-                    }
+                    const write_timeout_ms = if (cfg.downstream_write_timeout_ms > 0)
+                        cfg.downstream_write_timeout_ms
+                    else
+                        cfg.request_limits.effectiveHeaderTimeout();
+                    setConnReadTimeout(conn, body_timeout_ms, write_timeout_ms);
                 }
                 const total_read = try gconn.readHttpRequest(conn, pending_buf, &session.pending_len);
                 if (total_read == 0) return;

@@ -1205,6 +1205,18 @@ test "upstream ALPN policy validates selected protocol strictly" {
     try std.testing.expectError(error.NoApplicationProtocol, UpstreamAlpnPolicy.prefer_h2_allow_http1.select(null));
 }
 
+test "upstream auto permits HTTP/1.1 ALPN while strict h2 rejects it" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectEqual(
+        NegotiatedProtocol.http1_1,
+        try testUpstreamHandshakeProtocol(allocator, .prefer_h2_allow_http1, .{ .server_http2_enabled = false }),
+    );
+    try std.testing.expectError(
+        error.HandshakeFailed,
+        testUpstreamHandshakeProtocol(allocator, .require_h2, .{ .server_http2_enabled = false }),
+    );
+}
+
 /// An OpenSSL-backed TLS client connection to a TCP stream.
 /// Used for upstream HTTPS connections that require mTLS or custom CA/SNI.
 pub const UpstreamTlsConn = struct {
@@ -1506,6 +1518,82 @@ fn makeTestTlsPairWithOptions(allocator: std.mem.Allocator, opts: TestTlsPairOpt
         .server_fd = fds[1],
         .server = server,
     };
+}
+
+fn testUpstreamHandshakeProtocol(
+    allocator: std.mem.Allocator,
+    upstream_policy: UpstreamAlpnPolicy,
+    opts: TestTlsPairOptions,
+) !NegotiatedProtocol {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "test_server.crt", .data = embedded_server_crt });
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "test_server.key", .data = embedded_server_key });
+    const cert_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, "test_server.crt");
+    defer allocator.free(cert_path);
+    const key_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, "test_server.key");
+    defer allocator.free(key_path);
+
+    var terminator = try TlsTerminator.init(allocator, .{
+        .cert_path = cert_path,
+        .key_path = key_path,
+        .dynamic_reload_interval_ms = 0,
+        .http1_enabled = opts.server_http1_enabled,
+        .http2_enabled = opts.server_http2_enabled,
+        .http1_alpn_fallback_enabled = opts.server_http1_alpn_fallback_enabled,
+    });
+    defer terminator.deinit();
+
+    var fds: [2]std.posix.fd_t = undefined;
+    if (std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds) != 0) return error.SocketPairFailed;
+    var client_fd_open = true;
+    var server_fd_open = true;
+    defer {
+        if (client_fd_open) _ = std.c.close(fds[0]);
+    }
+    defer {
+        if (server_fd_open) _ = std.c.close(fds[1]);
+    }
+    try testSetSocketTimeoutMs(fds[0], 1_000);
+    try testSetSocketTimeoutMs(fds[1], 1_000);
+
+    var accept_ctx = ServerAcceptContext{ .terminator = &terminator, .fd = fds[1], .accept_policy = opts.server_accept_policy };
+    const thread = try std.Thread.spawn(.{}, serverAcceptThread, .{&accept_ctx});
+    var thread_joined = false;
+    errdefer if (!thread_joined) {
+        _ = std.c.shutdown(fds[0], std.posix.SHUT.RDWR);
+        _ = std.c.shutdown(fds[1], std.posix.SHUT.RDWR);
+        thread.join();
+        thread_joined = true;
+    };
+
+    var upstream = UpstreamTlsConn.connect(fds[0], "localhost", .{
+        .skip_verify = true,
+        .alpn_policy = upstream_policy,
+    }) catch |err| {
+        _ = std.c.shutdown(fds[0], std.posix.SHUT.RDWR);
+        _ = std.c.shutdown(fds[1], std.posix.SHUT.RDWR);
+        thread.join();
+        thread_joined = true;
+        if (accept_ctx.conn) |*conn| conn.deinit();
+        return err;
+    };
+    thread.join();
+    thread_joined = true;
+    if (accept_ctx.err) |err| {
+        upstream.deinit();
+        return err;
+    }
+    if (accept_ctx.conn) |*conn| conn.deinit();
+
+    const protocol = upstream.negotiatedProtocol();
+    upstream.deinit();
+    client_fd_open = false;
+    server_fd_open = false;
+    _ = std.c.close(fds[0]);
+    _ = std.c.close(fds[1]);
+    return protocol;
 }
 
 fn clientWriteAll(ssl: *c.SSL, bytes: []const u8) !void {

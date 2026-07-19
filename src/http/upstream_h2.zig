@@ -1548,8 +1548,7 @@ pub const H2ConnPool = struct {
                 _ = std.c.close(fd);
                 return error.OutOfMemory;
             };
-            var opts = base_opts;
-            opts.alpn_policy = .require_h2;
+            const opts = base_opts;
             tls_ptr.* = tls_termination.UpstreamTlsConn.connect(fd, host, opts) catch |e| {
                 self.allocator.destroy(tls_ptr);
                 self.allocator.destroy(transport);

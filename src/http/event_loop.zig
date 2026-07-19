@@ -141,8 +141,9 @@ pub const EventLoop = struct {
     }
 
     fn waitKqueue(self: *EventLoop, out_events: []Event, timeout_ms: i32) !usize {
-        var kq_events: [64]std.c.Kevent = undefined;
-        const cap = @min(out_events.len, kq_events.len);
+        var kq_events: [128]std.c.Kevent = undefined;
+        const requested = std.math.mul(usize, out_events.len, 2) catch out_events.len;
+        const cap = @min(requested, kq_events.len);
 
         var ts: std.c.timespec = undefined;
         const timeout_ptr: ?*const std.c.timespec = if (timeout_ms < 0)
@@ -166,16 +167,27 @@ pub const EventLoop = struct {
             if (std.posix.errno(n) == .INTR) return 0;
             return error.Unexpected;
         }
-        for (kq_events[0..@intCast(n)], 0..) |ev, idx| {
+        var out_len: usize = 0;
+        for (kq_events[0..@intCast(n)]) |ev| {
             const errored = (ev.flags & (std.c.EV.ERROR | std.c.EV.EOF)) != 0;
-            out_events[idx] = .{
-                .fd = @intCast(ev.ident),
-                .readable = ev.filter == std.c.EVFILT.READ or errored,
-                .writable = ev.filter == std.c.EVFILT.WRITE,
-                .errored = errored,
-            };
+            const fd: std.posix.fd_t = @intCast(ev.ident);
+            const slot = findOrAppendByFd(out_events, &out_len, fd) orelse continue;
+            slot.readable = slot.readable or ev.filter == std.c.EVFILT.READ or errored;
+            slot.writable = slot.writable or ev.filter == std.c.EVFILT.WRITE;
+            slot.errored = slot.errored or errored;
         }
-        return @intCast(n);
+        return out_len;
+    }
+
+    fn findOrAppendByFd(out_events: []Event, out_len: *usize, fd: std.posix.fd_t) ?*Event {
+        for (out_events[0..out_len.*]) |*event| {
+            if (event.fd == fd) return event;
+        }
+        if (out_len.* == out_events.len) return null;
+        const slot = &out_events[out_len.*];
+        slot.* = .{ .fd = fd };
+        out_len.* += 1;
+        return slot;
     }
 
     fn applyKqueueInterest(self: *EventLoop, fd: std.posix.fd_t, interest: Interest, op: enum { add, modify, remove }) !void {
@@ -329,6 +341,25 @@ test "event loop modify replaces write interest with read interest" {
     }
     try std.testing.expect(saw_read);
     try std.testing.expect(!saw_write);
+}
+
+test "event loop coalesces simultaneous read and write readiness by fd" {
+    var loop = try EventLoop.init();
+    defer loop.deinit();
+    const fds = try testSocketPair();
+    defer closeFd(fds[0]);
+    defer closeFd(fds[1]);
+
+    try loop.add(fds[0], .{ .read = true, .write = true });
+    defer loop.remove(fds[0]) catch {};
+    try writeFd(fds[1], "x");
+
+    var events: [1]Event = undefined;
+    const count = try loop.wait(&events, 50);
+    try std.testing.expectEqual(@as(usize, 1), count);
+    try std.testing.expectEqual(fds[0], events[0].fd);
+    try std.testing.expect(events[0].readable);
+    try std.testing.expect(events[0].writable);
 }
 
 fn testSocketPair() ![2]std.posix.fd_t {

@@ -1906,11 +1906,7 @@ pub fn executeStreamingHttpProxyRequest(
     const stream_h2 = h2_requested_for_streaming;
     if (stream_h2) {
         if (h2_pool) |hp| {
-            const h2_opts: ?http.tls_termination.UpstreamTlsOptions = if (is_https) blk: {
-                var o = tls_options.?;
-                o.alpn_policy = .require_h2;
-                break :blk o;
-            } else null;
+            const h2_opts: ?http.tls_termination.UpstreamTlsOptions = if (is_https) tls_options.? else null;
             return streamViaH2Pool(allocator, hp, pool, host, port, h2_opts, uri, method, extra_headers.items, buffered_body, streaming_body, read_buf, downstream_conn, downstream_writer, security, sticky_set_cookie, correlation_id, connect_timeout_ms, read_deadline_ms, cancel_token, cfg.proxy_buffer_limits, proxy_buffer_observer);
         }
         if (streaming_body != null) {

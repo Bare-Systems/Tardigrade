@@ -57,6 +57,10 @@ const certificate_message_overhead = 1 + 3 + 1 + 3;
 /// above Ed25519 (64) and DER-encoded ECDSA P-256 (~72).
 pub const max_signature_len = 256;
 
+fn checkedAdd(a: usize, b: usize) HandshakeError!usize {
+    return std.math.add(usize, a, b) catch return error.InvalidTransportProfile;
+}
+
 const tls13_version: u16 = 0x0304;
 const legacy_version: u16 = 0x0303;
 const cipher_tls_aes_128_gcm_sha256: u16 = 0x1301;
@@ -179,6 +183,20 @@ pub const TransportProfile = union(enum) {
                 w.patch(2, alpn_ext_len);
             },
         }
+    }
+
+    fn alpnOfferEncodedLen(self: TransportProfile) HandshakeError!usize {
+        return switch (self) {
+            .record => |options| blk: {
+                if (options.alpn.protocols.len == 0) break :blk 0;
+                var list_len: usize = 0;
+                for (options.alpn.protocols) |protocol| {
+                    list_len = try checkedAdd(list_len, 1 + protocol.len);
+                }
+                break :blk try checkedAdd(6, list_len);
+            },
+            .extension => |options| try checkedAdd(7, options.alpn.len),
+        };
     }
 
     fn extensionType(self: TransportProfile) ?u16 {
@@ -663,6 +681,8 @@ pub const Tls13Backend = struct {
         // configuration error; fail closed before any lifecycle or transcript
         // advance rather than emitting SNI for a truncated (wrong) host.
         if (self.server_name_overflow) return error.InvalidHandshakeState;
+        if (self.role == .client and try self.clientHelloEncodedLen() > max_message_len)
+            return error.InvalidTransportProfile;
         self.core.start() catch |err| return mapCoreError(err);
         switch (self.role) {
             .client => {
@@ -935,6 +955,30 @@ pub const Tls13Backend = struct {
         const message = buf[0..w.len];
         self.core.recordSent(message) catch |err| return mapCoreError(err);
         try sink.emitCrypto(.initial, message);
+    }
+
+    fn clientHelloEncodedLen(self: *const Tls13Backend) HandshakeError!usize {
+        var len: usize = 0;
+        len = try checkedAdd(len, 1 + 3); // handshake header
+        len = try checkedAdd(len, 2); // legacy_version
+        len = try checkedAdd(len, 32); // random
+        len = try checkedAdd(len, 1); // legacy_session_id
+        len = try checkedAdd(len, 2 + 2); // cipher_suites vector + one suite
+        len = try checkedAdd(len, 1 + 1); // compression_methods vector + null
+        len = try checkedAdd(len, 2); // extensions vector length
+        len = try checkedAdd(len, 2 + 2 + 3); // supported_versions
+        len = try checkedAdd(len, 2 + 2 + 4); // supported_groups
+        len = try checkedAdd(len, 2 + 2 + 6); // signature_algorithms
+        len = try checkedAdd(len, 2 + 2 + 2 + 2 + 2 + X25519.public_length); // key_share
+        len = try checkedAdd(len, try self.profile.alpnOfferEncodedLen());
+        if (self.serverNameSlice()) |name| {
+            len = try checkedAdd(len, 2 + 2 + 2 + 1 + 2 + name.len);
+        }
+        if (self.profile.extensionType() != null) {
+            const payload = self.profile.localExtension() orelse return error.MissingTransportExtension;
+            len = try checkedAdd(len, 2 + 2 + payload.len);
+        }
+        return len;
     }
 
     fn onServerHello(self: *Tls13Backend, body: []const u8, sink: *EventSink) HandshakeError!void {
@@ -2286,6 +2330,29 @@ test "transport profile validation fails before lifecycle or transcript advance"
         names[i] = name[0..];
     }
     try std.testing.expectError(error.InvalidTransportProfile, (AlpnPolicy{ .protocols = &names }).validate());
+
+    var near_storage: [32][255]u8 = undefined;
+    var near_names: [32][]const u8 = undefined;
+    for (near_storage[0..31], 0..) |*name, i| {
+        @memset(name[0..], 'a');
+        name[0] = @intCast('A' + i);
+        near_names[i] = name[0..];
+    }
+    @memset(near_storage[31][0..], 'b');
+    near_storage[31][0] = 'z';
+    near_names[31] = near_storage[31][0..139];
+    try (AlpnPolicy{ .protocols = &near_names }).validate();
+    var near_backend = Tls13Backend.initClient(
+        entropy,
+        .{ .pinned_certificate = testdata.certificate_der },
+        .{ .record = .{ .alpn = .{ .protocols = &near_names } } },
+    );
+    var near_sink = EventSink{};
+    defer near_sink.deinit();
+    try std.testing.expectError(error.InvalidTransportProfile, near_backend.backend().start(.client, {}, &near_sink));
+    try std.testing.expectEqual(tls_handshake_codec.HandshakeLifecycle.idle, near_backend.core.handshake_lifecycle);
+    try std.testing.expect(!near_backend.key_pair_present);
+    near_backend.deinit();
 
     var oversized = [_]u8{0xa5} ** (max_transport_extension_len + 1);
     var extension_backend = Tls13Backend.initClient(

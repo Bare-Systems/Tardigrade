@@ -82,7 +82,10 @@ pub fn keyDerFromPemOrDer(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
 
 pub fn pemBlockToDer(allocator: std.mem.Allocator, pem: []const u8, block_name: []const u8) ![]u8 {
     var next: usize = 0;
-    return pemBlockToDerFrom(allocator, pem, block_name, &next);
+    return pemBlockToDerFrom(allocator, pem, block_name, &next) catch |err| switch (err) {
+        error.NoMorePemBlocks => error.PemBlockNotFound,
+        else => err,
+    };
 }
 
 pub fn pemBlocksToDer(allocator: std.mem.Allocator, pem: []const u8, block_name: []const u8) ![][]u8 {
@@ -99,7 +102,7 @@ pub fn pemBlocksToDer(allocator: std.mem.Allocator, pem: []const u8, block_name:
             return err;
         };
     } else |err| switch (err) {
-        error.PemBlockNotFound => {},
+        error.NoMorePemBlocks => {},
         else => return err,
     }
     if (chain.items.len == 0) return error.PemBlockNotFound;
@@ -111,9 +114,9 @@ fn pemBlockToDerFrom(allocator: std.mem.Allocator, pem: []const u8, block_name: 
     var end_buf: [64]u8 = undefined;
     const begin = try std.fmt.bufPrint(&begin_buf, "-----BEGIN {s}-----", .{block_name});
     const end = try std.fmt.bufPrint(&end_buf, "-----END {s}-----", .{block_name});
-    const begin_at = std.mem.findPos(u8, pem, next.*, begin) orelse return error.PemBlockNotFound;
+    const begin_at = std.mem.findPos(u8, pem, next.*, begin) orelse return error.NoMorePemBlocks;
     const body_start = begin_at + begin.len;
-    const end_at = std.mem.findPos(u8, pem, body_start, end) orelse return error.PemBlockNotFound;
+    const end_at = std.mem.findPos(u8, pem, body_start, end) orelse return error.MalformedPemBlock;
     next.* = end_at + end.len;
     const body = pem[body_start..end_at];
 
@@ -163,4 +166,16 @@ test "PEM certificate chain decoding preserves every certificate block in order"
     try std.testing.expectEqual(@as(usize, 2), chain.len);
     try std.testing.expectEqualSlices(u8, &[_]u8{ 0x30, 0x03, 0x02, 0x01, 0x00 }, chain[0]);
     try std.testing.expectEqualSlices(u8, &[_]u8{ 0x30, 0x03, 0x02, 0x01, 0x01 }, chain[1]);
+}
+
+test "PEM certificate chain decoding rejects truncated trailing certificate" {
+    const allocator = std.testing.allocator;
+    const pem =
+        "-----BEGIN CERTIFICATE-----\n" ++
+        "MAMCAQA=\n" ++
+        "-----END CERTIFICATE-----\n" ++
+        "-----BEGIN CERTIFICATE-----\n" ++
+        "MAMCAQE=\n";
+
+    try std.testing.expectError(error.MalformedPemBlock, certChainFromPemOrDer(allocator, pem));
 }

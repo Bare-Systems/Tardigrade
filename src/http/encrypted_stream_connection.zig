@@ -2,14 +2,9 @@ const std = @import("std");
 const encrypted_stream = @import("tls_core").encrypted_stream;
 
 pub const EncryptedStreamHttpConnection = struct {
-    const max_pending_write = 64 * 1024;
-
     stream: encrypted_stream.EncryptedStream,
     fd: std.posix.fd_t = -1,
     close_on_deinit: bool = false,
-    pending_write_buf: [max_pending_write]u8 = undefined,
-    pending_write_len: usize = 0,
-    pending_write_offset: usize = 0,
 
     pub fn init(stream: encrypted_stream.EncryptedStream) EncryptedStreamHttpConnection {
         return .{ .stream = stream };
@@ -21,7 +16,6 @@ pub const EncryptedStreamHttpConnection = struct {
 
     pub fn deinit(self: *EncryptedStreamHttpConnection) void {
         if (self.close_on_deinit) self.stream.close();
-        self.clearPendingWrite();
         self.* = undefined;
     }
 
@@ -87,8 +81,7 @@ pub const EncryptedStreamHttpConnection = struct {
         return .{ .conn = self };
     }
 
-    fn write(self: *EncryptedStreamHttpConnection, bytes: []const u8) encrypted_stream.Error!usize {
-        if (self.pending_write_len != 0) return error.RetryOperationPending;
+    pub fn write(self: *EncryptedStreamHttpConnection, bytes: []const u8) encrypted_stream.Error!usize {
         return self.writeRaw(bytes);
     }
 
@@ -104,33 +97,14 @@ pub const EncryptedStreamHttpConnection = struct {
     }
 
     fn writeAll(self: *EncryptedStreamHttpConnection, data: []const u8) encrypted_stream.Error!void {
-        if (data.len == 0) return;
-        if (self.pending_write_len == 0) {
-            if (data.len > max_pending_write) return error.PlaintextBufferFull;
-            @memcpy(self.pending_write_buf[0..data.len], data);
-            self.pending_write_len = data.len;
-            self.pending_write_offset = 0;
-        } else {
-            const pending_bytes = self.pending_write_buf[0..self.pending_write_len];
-            if (!std.mem.eql(u8, pending_bytes, data)) return error.RetryOperationPending;
-        }
-
-        while (self.pending_write_offset < self.pending_write_len) {
-            const n = self.writeRaw(self.pending_write_buf[self.pending_write_offset..self.pending_write_len]) catch |err| switch (err) {
+        var offset: usize = 0;
+        while (offset < data.len) {
+            const n = self.writeRaw(data[offset..]) catch |err| switch (err) {
                 error.WouldBlock => return error.WouldBlock,
                 else => return err,
             };
             if (n == 0) return error.WouldBlock;
-            self.pending_write_offset += n;
-        }
-        self.clearPendingWrite();
-    }
-
-    fn clearPendingWrite(self: *EncryptedStreamHttpConnection) void {
-        if (self.pending_write_len > 0) {
-            @memset(self.pending_write_buf[0..self.pending_write_len], 0);
-            self.pending_write_len = 0;
-            self.pending_write_offset = 0;
+            offset += n;
         }
     }
 
@@ -162,7 +136,41 @@ test "adapter returns WouldBlock when drive makes no progress" {
     try std.testing.expectEqual(@as(usize, 1), fake.drive_calls);
 }
 
-test "adapter writeAll resumes partial writes without duplicating prefix" {
+test "adapter write reports partial progress without retaining serializer state" {
+    var fake = FakeStream{
+        .readiness_state = .{ .can_write_plaintext = true },
+        .write_budget = 3,
+    };
+    var conn = EncryptedStreamHttpConnection.init(fake.stream());
+
+    try std.testing.expectEqual(@as(usize, 3), try conn.write("abcdef"));
+    try std.testing.expectEqualStrings("abc", fake.written[0..fake.written_len]);
+    try std.testing.expectError(error.WouldBlock, conn.write("def"));
+
+    fake.readiness_state.can_write_plaintext = true;
+    fake.write_budget = 3;
+    try std.testing.expectEqual(@as(usize, 3), try conn.write("def"));
+    try std.testing.expectEqualStrings("abcdef", fake.written[0..fake.written_len]);
+}
+
+test "adapter writeAll has no artificial per-call cap" {
+    const large_len = 96 * 1024;
+    var fake = FakeStream{
+        .readiness_state = .{ .can_write_plaintext = true },
+        .write_budget = large_len,
+        .max_chunk = 4096,
+    };
+    var conn = EncryptedStreamHttpConnection.init(fake.stream());
+
+    var data: [large_len]u8 = undefined;
+    @memset(&data, 'x');
+    try conn.writer().writeAll(&data);
+
+    try std.testing.expectEqual(@as(usize, large_len), fake.written_len);
+    try std.testing.expectEqual(@as(usize, 0), fake.write_budget);
+}
+
+test "adapter writeAll returns WouldBlock without owning response cursor" {
     var fake = FakeStream{
         .readiness_state = .{ .can_write_plaintext = true },
         .write_budget = 3,
@@ -171,31 +179,10 @@ test "adapter writeAll resumes partial writes without duplicating prefix" {
 
     try std.testing.expectError(error.WouldBlock, conn.writer().writeAll("abcdef"));
     try std.testing.expectEqualStrings("abc", fake.written[0..fake.written_len]);
-    try std.testing.expectEqual(@as(usize, 6), conn.pending_write_len);
-    try std.testing.expectEqual(@as(usize, 3), conn.pending_write_offset);
-
-    try std.testing.expectError(error.RetryOperationPending, conn.writer().writeAll("abcxyz"));
 
     fake.readiness_state.can_write_plaintext = true;
     fake.write_budget = 3;
-    try conn.writer().writeAll("abcdef");
-    try std.testing.expectEqualStrings("abcdef", fake.written[0..fake.written_len]);
-    try std.testing.expectEqual(@as(usize, 0), conn.pending_write_len);
-}
-
-test "adapter rejects public write while writeAll has pending bytes" {
-    var fake = FakeStream{
-        .readiness_state = .{ .can_write_plaintext = true },
-        .write_budget = 3,
-    };
-    var conn = EncryptedStreamHttpConnection.init(fake.stream());
-
-    try std.testing.expectError(error.WouldBlock, conn.writer().writeAll("abcdef"));
-    try std.testing.expectError(error.RetryOperationPending, conn.writer().write("X"));
-
-    fake.readiness_state.can_write_plaintext = true;
-    fake.write_budget = 3;
-    try conn.writer().writeAll("abcdef");
+    try std.testing.expectEqual(@as(usize, 3), try conn.write("def"));
     try std.testing.expectEqualStrings("abcdef", fake.written[0..fake.written_len]);
 }
 
@@ -204,7 +191,8 @@ const FakeStream = struct {
     readiness_state: encrypted_stream.Readiness = .{},
     drive_calls: usize = 0,
     write_budget: usize = std.math.maxInt(usize),
-    written: [64]u8 = undefined,
+    max_chunk: usize = std.math.maxInt(usize),
+    written: [128 * 1024]u8 = undefined,
     written_len: usize = 0,
 
     fn stream(self: *FakeStream) encrypted_stream.EncryptedStream {
@@ -230,7 +218,7 @@ const FakeStream = struct {
             self.readiness_state.can_write_plaintext = false;
             return error.WouldBlock;
         }
-        const n = @min(bytes.len, @min(self.write_budget, self.written.len - self.written_len));
+        const n = @min(bytes.len, @min(self.max_chunk, @min(self.write_budget, self.written.len - self.written_len)));
         @memcpy(self.written[self.written_len .. self.written_len + n], bytes[0..n]);
         self.written_len += n;
         self.write_budget -= n;

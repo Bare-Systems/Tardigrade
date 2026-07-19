@@ -2618,6 +2618,10 @@ pub const WorkerContext = struct {
     /// Event loop used to (un)watch idle keepalive connections (#138). A worker
     /// re-arms a parked fd here; the loop thread dispatches it back on readiness.
     event_loop: *http.event_loop.EventLoop,
+    /// Active nonblocking downstream connections keyed by fd. Native TLS and
+    /// resumable HTTP phases park here while waiting for carrier or protocol
+    /// readiness; idle HTTP/1.1 keepalive still uses `parked`.
+    active: *http.downstream_connection.ActiveRegistry,
     /// Registry of idle keepalive connections parked off the worker pool (#138).
     parked: *http.keepalive_park.ParkedRegistry,
 

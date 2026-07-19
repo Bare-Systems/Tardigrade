@@ -241,6 +241,67 @@ pub const ManagedConnection = struct {
     }
 };
 
+pub const ActiveRegistry = struct {
+    allocator: std.mem.Allocator,
+    map: std.AutoHashMap(std.posix.fd_t, ManagedConnection),
+
+    pub fn init(allocator: std.mem.Allocator) ActiveRegistry {
+        return .{
+            .allocator = allocator,
+            .map = std.AutoHashMap(std.posix.fd_t, ManagedConnection).init(allocator),
+        };
+    }
+
+    pub fn deinit(self: *ActiveRegistry) void {
+        self.closeAll();
+        self.map.deinit();
+        self.* = undefined;
+    }
+
+    pub fn insert(self: *ActiveRegistry, conn: ManagedConnection) !void {
+        const fd = conn.fd;
+        if (self.map.fetchRemove(fd)) |removed| {
+            var old = removed.value;
+            old.deinit();
+        }
+        try self.map.put(fd, conn);
+    }
+
+    pub fn contains(self: *const ActiveRegistry, fd: std.posix.fd_t) bool {
+        return self.map.contains(fd);
+    }
+
+    pub fn checkout(self: *ActiveRegistry, fd: std.posix.fd_t) ?ManagedConnection {
+        const removed = self.map.fetchRemove(fd) orelse return null;
+        return removed.value;
+    }
+
+    pub fn rearm(self: *ActiveRegistry, conn: ManagedConnection) !event_loop.Interest {
+        const interest = conn.interest;
+        try self.insert(conn);
+        return interest;
+    }
+
+    pub fn close(self: *ActiveRegistry, fd: std.posix.fd_t) bool {
+        const removed = self.map.fetchRemove(fd) orelse return false;
+        var conn = removed.value;
+        conn.deinit();
+        return true;
+    }
+
+    pub fn closeAll(self: *ActiveRegistry) void {
+        var it = self.map.iterator();
+        while (it.next()) |entry| {
+            entry.value_ptr.deinit();
+        }
+        self.map.clearRetainingCapacity();
+    }
+
+    pub fn count(self: *const ActiveRegistry) usize {
+        return self.map.count();
+    }
+};
+
 fn deinitPhase(phase: *ConnectionPhase) void {
     switch (phase.*) {
         .http1 => |*h1| h1.deinit(),
@@ -286,6 +347,33 @@ test "managed connection captures fd phase and initial interest" {
     try std.testing.expectEqual(@as(u32, 2), managed.phase.http1.served);
     _ = managed.updateInterest();
     try std.testing.expectEqual(event_loop.Interest{ .read = true }, managed.interest);
+}
+
+test "active registry checks out and rearms fd keyed connection ownership" {
+    var registry = ActiveRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+
+    const h1 = try Http1ConnectionState.init(std.testing.allocator, 1024);
+    var managed = ManagedConnection.init(
+        .{ .plaintext = -1 },
+        .{ .http1 = h1 },
+    );
+    _ = managed.updateInterestFor(.{ .write = true });
+
+    try registry.insert(managed);
+    try std.testing.expect(registry.contains(-1));
+    try std.testing.expectEqual(@as(usize, 1), registry.count());
+
+    var checked_out = registry.checkout(-1) orelse return error.TestExpectedConnection;
+    try std.testing.expect(!registry.contains(-1));
+    try std.testing.expect(checked_out.interest.write);
+    try std.testing.expect(!checked_out.interest.read);
+
+    _ = checked_out.updateInterestFor(.{ .read = true });
+    const interest = try registry.rearm(checked_out);
+    try std.testing.expect(interest.read);
+    try std.testing.expect(registry.close(-1));
+    try std.testing.expectEqual(@as(usize, 0), registry.count());
 }
 
 test "managed connection preserves protocol write interest for plaintext wait-write" {

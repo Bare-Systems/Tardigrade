@@ -315,11 +315,16 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         .tls = if (tls_terminator) |*tls| tls else null,
         .session_pool = undefined,
         .event_loop = &event_loop,
+        .active = undefined,
         .parked = undefined,
     };
     var session_pool = ConnectionSessionPool.init(state_allocator, &state.request_buffer_pool, cfg.connection_pool_size);
     defer session_pool.deinit();
     worker_ctx.session_pool = &session_pool;
+
+    var active = http.downstream_connection.ActiveRegistry.init(state_allocator);
+    defer active.deinit();
+    worker_ctx.active = &active;
 
     // Registry of idle keepalive connections parked off the worker pool (#138).
     // Its close hook releases the connection slot held since accept, so parked

@@ -346,9 +346,18 @@ pub const TlsTerminator = struct {
     }
 
     pub fn accept(self: *TlsTerminator, fd: std.posix.fd_t) TlsError!TlsConnection {
+        return self.acceptWithPolicy(fd, self.protocolPolicySnapshot());
+    }
+
+    pub fn acceptWithPolicy(
+        self: *TlsTerminator,
+        fd: std.posix.fd_t,
+        policy: negotiated_dispatch.ListenerProtocolPolicy,
+    ) TlsError!TlsConnection {
+        if (!policy.http1_enabled and !policy.http2_enabled) return error.ProtocolConfigFailed;
         const policy_box = try self.allocator.create(negotiated_dispatch.ListenerProtocolPolicy);
         errdefer self.allocator.destroy(policy_box);
-        policy_box.* = self.protocolPolicySnapshot();
+        policy_box.* = policy;
         const ssl = c.SSL_new(self.ctx) orelse return error.ContextInitFailed;
         errdefer c.SSL_free(ssl);
         if (c.SSL_set_ex_data(ssl, self.state.policy_ex_index, policy_box) != 1) return error.ProtocolConfigFailed;
@@ -371,7 +380,7 @@ pub const TlsTerminator = struct {
         return .{
             .ssl = ssl,
             .allocator = self.allocator,
-            .protocol_policy = policy_box.*,
+            .protocol_policy = policy,
             .policy_box = policy_box,
             .policy_ex_index = self.state.policy_ex_index,
         };
@@ -1281,22 +1290,29 @@ const TestTlsPairOptions = struct {
     server_http1_enabled: bool = true,
     server_http2_enabled: bool = true,
     server_http1_alpn_fallback_enabled: bool = false,
+    server_accept_policy: ?negotiated_dispatch.ListenerProtocolPolicy = null,
     client_alpn_wire: ?[]const u8 = http11_only_wire_for_tests,
 };
 
 const h2_and_http11_wire_for_tests = "\x02h2\x08http/1.1";
 const http11_and_h2_wire_for_tests = "\x08http/1.1\x02h2";
 const http11_only_wire_for_tests = "\x08http/1.1";
+const h2_only_wire_for_tests = "\x02h2";
 
 const ServerAcceptContext = struct {
     terminator: *TlsTerminator,
     fd: std.posix.fd_t,
+    accept_policy: ?negotiated_dispatch.ListenerProtocolPolicy = null,
     conn: ?TlsConnection = null,
     err: ?TlsError = null,
 };
 
 fn serverAcceptThread(ctx: *ServerAcceptContext) void {
-    ctx.conn = ctx.terminator.accept(ctx.fd) catch |err| {
+    const conn = if (ctx.accept_policy) |policy|
+        ctx.terminator.acceptWithPolicy(ctx.fd, policy)
+    else
+        ctx.terminator.accept(ctx.fd);
+    ctx.conn = conn catch |err| {
         ctx.err = err;
         return;
     };
@@ -1340,7 +1356,7 @@ fn makeTestTlsPairWithOptions(allocator: std.mem.Allocator, opts: TestTlsPairOpt
     errdefer _ = std.c.close(fds[0]);
     errdefer _ = std.c.close(fds[1]);
 
-    var accept_ctx = ServerAcceptContext{ .terminator = &terminator, .fd = fds[1] };
+    var accept_ctx = ServerAcceptContext{ .terminator = &terminator, .fd = fds[1], .accept_policy = opts.server_accept_policy };
     const thread = try std.Thread.spawn(.{}, serverAcceptThread, .{&accept_ctx});
     var thread_joined = false;
     defer if (!thread_joined) thread.join();
@@ -1563,6 +1579,40 @@ test "tls terminator updates protocol policy for future snapshots" {
     try std.testing.expectEqual(NegotiatedProtocol.http2, try negotiated_dispatch.selectNegotiatedProtocol("h2", handshake_a_snapshot));
     try std.testing.expectError(error.ProtocolDisabled, negotiated_dispatch.selectNegotiatedProtocol("h2", handshake_b_snapshot));
     try std.testing.expectError(error.ProtocolConfigFailed, tls.updateProtocolPolicy(.{ .http1_enabled = false, .http2_enabled = false }));
+}
+
+test "acceptWithPolicy pins policy from connection config generation" {
+    const allocator = std.testing.allocator;
+
+    {
+        var pair = try makeTestTlsPairWithOptions(allocator, .{
+            .server_http1_enabled = false,
+            .server_http2_enabled = true,
+            .server_accept_policy = .{
+                .http1_enabled = true,
+                .http2_enabled = false,
+            },
+            .client_alpn_wire = http11_only_wire_for_tests,
+        });
+        defer pair.deinit();
+
+        try std.testing.expectEqual(NegotiatedProtocol.http1_1, try pair.server.validatedNegotiatedProtocol());
+    }
+
+    {
+        var pair = try makeTestTlsPairWithOptions(allocator, .{
+            .server_http1_enabled = true,
+            .server_http2_enabled = false,
+            .server_accept_policy = .{
+                .http1_enabled = false,
+                .http2_enabled = true,
+            },
+            .client_alpn_wire = h2_only_wire_for_tests,
+        });
+        defer pair.deinit();
+
+        try std.testing.expectEqual(NegotiatedProtocol.http2, try pair.server.validatedNegotiatedProtocol());
+    }
 }
 
 test "openssl encrypted stream adapter conforms over production connection" {

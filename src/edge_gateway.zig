@@ -18,6 +18,7 @@ const gconn = @import("gateway_connection.zig");
 const gshutdown = @import("gateway_shutdown.zig");
 const ghandlers = @import("gateway_handlers.zig");
 const gproxy_runtime = @import("gateway_proxy_runtime.zig");
+const gprotocol_policy = @import("gateway_protocol_policy.zig");
 const gp = @import("gateway_proxy.zig");
 const ga = @import("gateway_auth.zig");
 
@@ -844,7 +845,8 @@ fn startNewConnection(ctx: *WorkerContext, client_fd: std.posix.fd_t) void {
             };
             session.proxy_protocol_checked = true;
         }
-        var tls_conn = tls.accept(client_fd) catch |err| {
+        const tls_protocol_policy = gprotocol_policy.listenerPolicyFromConfig(cfg);
+        var tls_conn = tls.acceptWithPolicy(client_fd, tls_protocol_policy) catch |err| {
             if (http.tls_termination.lastOpenSslError(ctx.state.allocator)) |openssl_err| {
                 defer ctx.state.allocator.free(openssl_err);
                 ctx.state.logger.warn(null, "tls handshake error: {} ({s})", .{ err, openssl_err });

@@ -115,8 +115,13 @@ pub const TlsTerminator = struct {
     }
 
     pub fn accept(self: *TlsTerminator, fd: std.posix.fd_t) TlsError!TlsConnection {
+        return self.acceptWithPolicy(fd, .{});
+    }
+
+    pub fn acceptWithPolicy(self: *TlsTerminator, fd: std.posix.fd_t, policy: negotiated_dispatch.ListenerProtocolPolicy) TlsError!TlsConnection {
         _ = self;
         _ = fd;
+        if (!policy.http1_enabled and !policy.http2_enabled) return error.ProtocolConfigFailed;
         return error.HandshakeFailed;
     }
 };

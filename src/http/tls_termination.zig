@@ -1475,7 +1475,10 @@ fn buildMalformedAlpnClientHello(allocator: std.mem.Allocator) ![]u8 {
     defer c.SSL_free(client_ssl);
 
     const rbio = c.BIO_new(c.BIO_s_mem()) orelse return error.ContextInitFailed;
-    const wbio = c.BIO_new(c.BIO_s_mem()) orelse return error.ContextInitFailed;
+    const wbio = c.BIO_new(c.BIO_s_mem()) orelse {
+        _ = c.BIO_free(rbio);
+        return error.ContextInitFailed;
+    };
     c.SSL_set_bio(client_ssl, rbio, wbio);
 
     if (c.SSL_set_alpn_protos(client_ssl, h2_only_wire_for_tests.ptr, @intCast(h2_only_wire_for_tests.len)) != 0) return error.ProtocolConfigFailed;

@@ -755,8 +755,15 @@ const ServeOutcome = enum {
     close,
 };
 
-fn isTlsConnPtr(comptime T: type) bool {
-    return T == *http.tls_termination.TlsConnection;
+fn hasBufferedHttp1Work(conn: anytype, session: *const ConnectionSession) bool {
+    if (session.pending_len > 0) return true;
+    const T = @TypeOf(conn);
+    if (comptime std.meta.activeTag(@typeInfo(T)) == .pointer) {
+        const Child = std.meta.Child(T);
+        if (comptime @hasDecl(Child, "pending")) return conn.pending() > 0;
+        if (comptime @hasDecl(Child, "pendingPlaintext")) return conn.pendingPlaintext() > 0;
+    }
+    return false;
 }
 
 /// Errors that just mean the peer closed/reset the connection. Common at the
@@ -803,6 +810,13 @@ fn serveOneRequestWithConfig(
     served: *u32,
     enable_proxy_protocol: bool,
 ) ServeOutcome {
+    const header_timeout_ms = cfg.request_limits.effectiveHeaderTimeout();
+    const write_timeout_ms = if (cfg.downstream_write_timeout_ms > 0)
+        cfg.downstream_write_timeout_ms
+    else
+        header_timeout_ms;
+    setConnTimeouts(conn, header_timeout_ms, write_timeout_ms);
+
     var keep_alive = false;
     handleConnection(conn, session, cfg, ctx.state, &keep_alive, connection_ip, enable_proxy_protocol) catch |err| {
         if (isBenignDisconnect(err)) {
@@ -817,14 +831,7 @@ fn serveOneRequestWithConfig(
 
     if (!keep_alive or http.shutdown.isShutdownRequested()) return .close;
     if (max_requests_per_connection > 0 and served.* >= max_requests_per_connection) return .close;
-
-    // TLS may have already-decrypted pipelined bytes buffered inside OpenSSL; a
-    // socket-readiness event never fires for those, so serve them now. Plaintext
-    // pipelined bytes sit in the socket buffer and the level-triggered event loop
-    // re-fires immediately after parking, so no special case is needed there.
-    if (comptime isTlsConnPtr(@TypeOf(conn))) {
-        if (conn.pending() > 0) return .serve_again;
-    }
+    if (hasBufferedHttp1Work(conn, session)) return .serve_again;
     return .park;
 }
 
@@ -1338,6 +1345,10 @@ const WaitingEncryptedHttpConnection = struct {
 
     pub fn setReadTimeoutMs(self: *WaitingEncryptedHttpConnection, timeout_ms: u32) void {
         self.read_timeout_ms = timeout_ms;
+    }
+
+    pub fn setWriteTimeoutMs(self: *WaitingEncryptedHttpConnection, timeout_ms: u32) void {
+        self.write_timeout_ms = timeout_ms;
     }
 
     pub fn writer(self: *WaitingEncryptedHttpConnection) Writer {
@@ -1896,12 +1907,15 @@ fn connRawFd(conn: anytype) ?std.posix.fd_t {
     return null;
 }
 
-fn setConnReadTimeout(conn: anytype, read_timeout_ms: u32, write_timeout_ms: u32) void {
+fn setConnTimeouts(conn: anytype, read_timeout_ms: u32, write_timeout_ms: u32) void {
     const T = @TypeOf(conn);
     if (comptime std.meta.activeTag(@typeInfo(T)) == .pointer) {
         const Child = std.meta.Child(T);
         if (comptime @hasDecl(Child, "setReadTimeoutMs")) {
             conn.setReadTimeoutMs(read_timeout_ms);
+            if (comptime @hasDecl(Child, "setWriteTimeoutMs")) {
+                conn.setWriteTimeoutMs(write_timeout_ms);
+            }
             return;
         }
     }
@@ -1989,7 +2003,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
                         cfg.downstream_write_timeout_ms
                     else
                         cfg.request_limits.effectiveHeaderTimeout();
-                    setConnReadTimeout(conn, body_timeout_ms, write_timeout_ms);
+                    setConnTimeouts(conn, body_timeout_ms, write_timeout_ms);
                 }
                 const total_read = try gconn.readHttpRequest(conn, pending_buf, &session.pending_len);
                 if (total_read == 0) return;
@@ -2444,6 +2458,48 @@ test "streaming upload pre-read scan includes server block routes" {
     cfg.server_blocks = &server_block_entries;
 
     try std.testing.expect(mayNeedStreamingRequestBodyPreRead(&cfg));
+}
+
+const HelperProbeConn = struct {
+    pending_value: usize = 0,
+    read_timeout_ms: u32 = 0,
+    write_timeout_ms: u32 = 0,
+
+    pub fn pending(self: *const HelperProbeConn) usize {
+        return self.pending_value;
+    }
+
+    pub fn setReadTimeoutMs(self: *HelperProbeConn, timeout_ms: u32) void {
+        self.read_timeout_ms = timeout_ms;
+    }
+
+    pub fn setWriteTimeoutMs(self: *HelperProbeConn, timeout_ms: u32) void {
+        self.write_timeout_ms = timeout_ms;
+    }
+};
+
+test "http1 keepalive detects session buffered pipelined request" {
+    var conn = HelperProbeConn{};
+    var session = ConnectionSession{};
+
+    try std.testing.expect(!hasBufferedHttp1Work(&conn, &session));
+    session.pending_len = 1;
+    try std.testing.expect(hasBufferedHttp1Work(&conn, &session));
+
+    session.pending_len = 0;
+    conn.pending_value = 1;
+    try std.testing.expect(hasBufferedHttp1Work(&conn, &session));
+}
+
+test "connection timeout helper resets read and write timeouts" {
+    var conn = HelperProbeConn{ .read_timeout_ms = 5000, .write_timeout_ms = 5000 };
+    setConnTimeouts(&conn, 100, 250);
+    try std.testing.expectEqual(@as(u32, 100), conn.read_timeout_ms);
+    try std.testing.expectEqual(@as(u32, 250), conn.write_timeout_ms);
+
+    setConnTimeouts(&conn, 0, 0);
+    try std.testing.expectEqual(@as(u32, 0), conn.read_timeout_ms);
+    try std.testing.expectEqual(@as(u32, 0), conn.write_timeout_ms);
 }
 
 // Pull gateway_handlers (and its transitive imports, including

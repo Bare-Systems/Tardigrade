@@ -4,6 +4,7 @@ const http = @import("http.zig");
 const edge_config = @import("edge_config.zig");
 const runtime_allocator = @import("runtime_allocator.zig");
 const build_options = @import("build_options");
+const tls_core = @import("tls_core");
 
 const STREAM_RELAY_BUFFER_SIZE: usize = 16 * 1024;
 const JSON_CONTENT_TYPE = "application/json";
@@ -203,6 +204,26 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         state.logger.info(null, "upstream mTLS client cert and/or SNI override configured; applies to OpenSSL-backed connections", .{});
     }
 
+    // Appliance TLS profile (#392): load and fully validate the one
+    // provisioned Ed25519 identity before any TCP or UDP listener is bound.
+    // Invalid credentials abort startup before HTTP dispatch is possible. The
+    // owner outlives every TCP connection, QUIC connection, and the HTTP/3
+    // runtime (all torn down by later-declared defers).
+    var appliance_identity: ?tls_core.appliance_credentials.ApplianceCredentials = null;
+    defer if (appliance_identity) |*owner| owner.deinit();
+    if (edge_config.is_appliance_tls_profile and edge_config.hasTlsFiles(cfg)) {
+        appliance_identity = tls_core.appliance_credentials.ApplianceCredentials.initFromFiles(
+            state_allocator,
+            cfg.tls_cert_path,
+            cfg.tls_key_path,
+            .{ .server_name = cfg.tls_server_name },
+        ) catch |err| {
+            state.logger.err(null, "appliance TLS credential rejected ({s}); refusing to start", .{@errorName(err)});
+            return error.ApplianceCredentialInvalid;
+        };
+        state.logger.info(null, "appliance TLS identity loaded and validated", .{});
+    }
+
     const address = try std.Io.net.IpAddress.parse(cfg.listen_host, cfg.listen_port);
     var server = try address.listen(compat.io(), .{ .reuse_address = true });
     defer server.deinit(compat.io());
@@ -227,6 +248,8 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         .cfg = cfg,
         .state = &state,
     };
+    var native_tls_provider: ?tls_core.credentials.CredentialProvider = null;
+    var h3_credential_provider: ?tls_core.credentials.CredentialProvider = null;
     if (edge_config.hasTlsFiles(cfg)) {
         var sni_specs = try state_allocator.alloc(http.tls_termination.SniCertSpec, cfg.tls_sni_certs.len);
         defer state_allocator.free(sni_specs);
@@ -234,13 +257,22 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
             sni_specs[i] = .{ .server_name = sc.server_name, .cert_path = sc.cert_path, .key_path = sc.key_path };
         }
         if (!build_options.tls_openssl_adapter) {
-            var native_sni_specs = try state_allocator.alloc(http.native_tls_connection.SniCertSpec, cfg.tls_sni_certs.len);
-            defer state_allocator.free(native_sni_specs);
-            for (cfg.tls_sni_certs, 0..) |sc, i| {
-                native_sni_specs[i] = .{ .server_name = sc.server_name, .cert_path = sc.cert_path, .key_path = sc.key_path };
+            if (appliance_identity) |*owner| {
+                // Appliance profile: the strict owner is the only credential
+                // source for both native TCP TLS and HTTP/3.
+                native_tls_provider = owner.provider();
+                h3_credential_provider = owner.provider();
+            } else {
+                var native_sni_specs = try state_allocator.alloc(http.native_tls_connection.SniCertSpec, cfg.tls_sni_certs.len);
+                defer state_allocator.free(native_sni_specs);
+                for (cfg.tls_sni_certs, 0..) |sc, i| {
+                    native_sni_specs[i] = .{ .server_name = sc.server_name, .cert_path = sc.cert_path, .key_path = sc.key_path };
+                }
+                native_credentials = http.native_tls_connection.NativeCredentialStore.init(state_allocator);
+                try native_credentials.?.reloadFromFiles(cfg.tls_cert_path, cfg.tls_key_path, native_sni_specs);
+                native_tls_provider = native_credentials.?.provider();
+                h3_credential_provider = native_credentials.?.provider();
             }
-            native_credentials = http.native_tls_connection.NativeCredentialStore.init(state_allocator);
-            try native_credentials.?.reloadFromFiles(cfg.tls_cert_path, cfg.tls_key_path, native_sni_specs);
         } else {
             tls_terminator = try http.tls_termination.TlsTerminator.init(state_allocator, .{
                 .cert_path = cfg.tls_cert_path,
@@ -280,6 +312,25 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
             });
         }
     }
+    if (build_options.tls_openssl_adapter and cfg.http3_enabled and edge_config.hasTlsFiles(cfg)) {
+        // The native QUIC stack cannot use the OpenSSL terminator's identity
+        // objects; load the same files through the generic native store so
+        // HTTP/3 shares one provider-based credential architecture in every
+        // profile. Failure leaves QUIC unbootstrapped while TCP serves.
+        var native_sni_specs = try state_allocator.alloc(http.native_tls_connection.SniCertSpec, cfg.tls_sni_certs.len);
+        defer state_allocator.free(native_sni_specs);
+        for (cfg.tls_sni_certs, 0..) |sc, i| {
+            native_sni_specs[i] = .{ .server_name = sc.server_name, .cert_path = sc.cert_path, .key_path = sc.key_path };
+        }
+        native_credentials = http.native_tls_connection.NativeCredentialStore.init(state_allocator);
+        if (native_credentials.?.reloadFromFiles(cfg.tls_cert_path, cfg.tls_key_path, native_sni_specs)) |_| {
+            h3_credential_provider = native_credentials.?.provider();
+        } else |err| {
+            state.logger.warn(null, "http3: TLS identity unusable for QUIC ({s}); QUIC bootstrap will remain incomplete", .{@errorName(err)});
+            native_credentials.?.deinit();
+            native_credentials = null;
+        }
+    }
     defer if (native_credentials) |*store| store.deinit();
     defer if (tls_terminator) |*tls| tls.deinit();
     if (cfg.http3_enabled) {
@@ -289,8 +340,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         http3_runtime = http.http3_runtime.Runtime.init(state_allocator, &state.logger, .{
             .listen_host = cfg.listen_host,
             .quic_port = cfg.quic_port,
-            .tls_cert_path = cfg.tls_cert_path,
-            .tls_key_path = cfg.tls_key_path,
+            .credential_provider = h3_credential_provider,
             .tls_min_version = "1.3",
             .tls_max_version = "1.3",
             .enable_0rtt = cfg.http3_enable_0rtt,
@@ -327,6 +377,8 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         .state = &state,
         .tls = if (tls_terminator) |*tls| tls else null,
         .native_credentials = if (native_credentials) |*store| store else null,
+        .native_tls_provider = native_tls_provider,
+        .appliance_credentials = if (appliance_identity) |*owner| owner else null,
         .session_pool = undefined,
         .event_loop = &event_loop,
         .active = undefined,
@@ -941,7 +993,7 @@ fn startNewConnection(ctx: *WorkerContext, client_fd: std.posix.fd_t) void {
             parkConnection(ctx, client_fd, session, tls_conn, served, connection_ip);
         }
         return;
-    } else if (ctx.native_credentials) |native_store| {
+    } else if (ctx.native_tls_provider) |native_provider| {
         if (cfg.proxy_protocol_mode != .off) {
             ctx.state.logger.warn(null, "native TLS path does not support PROXY protocol preface parsing yet", .{});
             return;
@@ -955,7 +1007,7 @@ fn startNewConnection(ctx: *WorkerContext, client_fd: std.posix.fd_t) void {
             ctx.state.allocator,
             client_fd,
             tls_protocol_policy,
-            native_store.provider(),
+            native_provider,
         ) catch |err| {
             ctx.state.logger.warn(null, "native tls connection setup failed: {}", .{err});
             return;

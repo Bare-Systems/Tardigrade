@@ -414,6 +414,7 @@ pub fn build(b: *std.Build) void {
     quic_h3_udp_mod.addImport("quic", quic_mod);
     quic_h3_udp_mod.addImport("http3", http3_mod);
     quic_h3_udp_mod.addImport("stream_transport", stream_transport_mod);
+    quic_h3_udp_mod.addImport("tls_core", tls_core_mod);
     const quic_h3_udp_tests = b.addTest(.{ .root_module = quic_h3_udp_mod });
     const run_quic_h3_udp_tests = b.addRunArtifact(quic_h3_udp_tests);
     quic_step.dependOn(&run_quic_h3_udp_tests.step);

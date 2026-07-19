@@ -876,6 +876,15 @@ const TardigradeProcess = struct {
         for (options.extra_env) |pair| {
             try env_map.put(pair.name, pair.value);
         }
+        // Appliance TLS profile: whenever a test enables TLS files without
+        // choosing its own server name, supply the fixture identity's name so
+        // startup passes the mandatory single-identity policy.
+        if (!build_options.tls_openssl_adapter and
+            env_map.get("TARDIGRADE_TLS_CERT_PATH") != null and
+            env_map.get("TARDIGRADE_TLS_SERVER_NAME") == null)
+        {
+            try env_map.put("TARDIGRADE_TLS_SERVER_NAME", "tardigrade.test");
+        }
 
         // Pre-create the log file and pass it as the child's initial stderr so
         // that early startup failures (panics or config errors that occur
@@ -1001,7 +1010,7 @@ fn prepareBearClawFixture(
         transcript_file.close();
     }
 
-    const fixture_name = if (build_options.tls_openssl_adapter) "server" else "native_p256";
+    const fixture_name = if (build_options.tls_openssl_adapter) "server" else "native_ed25519";
     const server_cert_abs = try std.fmt.allocPrint(allocator, "{s}/tests/fixtures/tls/{s}.crt", .{ cwd, fixture_name });
     defer allocator.free(server_cert_abs);
     const server_key_abs = try std.fmt.allocPrint(allocator, "{s}/tests/fixtures/tls/{s}.key", .{ cwd, fixture_name });
@@ -1056,6 +1065,11 @@ fn prepareBearClawFixture(
     if (fixture_tls_enabled) {
         try env_map.put("TARDIGRADE_TLS_CERT_PATH", server_cert_abs);
         try env_map.put("TARDIGRADE_TLS_KEY_PATH", server_key_abs);
+        if (!build_options.tls_openssl_adapter) {
+            // Appliance TLS profile: exactly one configured server name is
+            // mandatory whenever TLS files are set.
+            try env_map.put("TARDIGRADE_TLS_SERVER_NAME", "tardigrade.test");
+        }
     } else {
         _ = env_map.swapRemove("TARDIGRADE_TLS_CERT_PATH");
         _ = env_map.swapRemove("TARDIGRADE_TLS_KEY_PATH");
@@ -2380,9 +2394,9 @@ const NativeTlsFixturePaths = struct {
 fn nativeTlsFixturePaths(allocator: std.mem.Allocator) !NativeTlsFixturePaths {
     const cwd = try compat.cwd().realpathAlloc(allocator, ".");
     defer allocator.free(cwd);
-    const cert_path = try std.fmt.allocPrint(allocator, "{s}/tests/fixtures/tls/native_p256.crt", .{cwd});
+    const cert_path = try std.fmt.allocPrint(allocator, "{s}/tests/fixtures/tls/native_ed25519.crt", .{cwd});
     errdefer allocator.free(cert_path);
-    const key_path = try std.fmt.allocPrint(allocator, "{s}/tests/fixtures/tls/native_p256.key", .{cwd});
+    const key_path = try std.fmt.allocPrint(allocator, "{s}/tests/fixtures/tls/native_ed25519.key", .{cwd});
     return .{
         .allocator = allocator,
         .cert_path = cert_path,
@@ -2417,6 +2431,10 @@ const PureZigTlsClient = struct {
     record: tls_core.encrypted_stream.PureZigRecordStream = undefined,
 
     fn create(allocator: std.mem.Allocator, port: u16, alpn: []const u8) !*PureZigTlsClient {
+        return createWithServerName(allocator, port, alpn, null);
+    }
+
+    fn createWithServerName(allocator: std.mem.Allocator, port: u16, alpn: []const u8, server_name: ?[]const u8) !*PureZigTlsClient {
         const self = try allocator.create(PureZigTlsClient);
         errdefer allocator.destroy(self);
         self.* = .{
@@ -2427,10 +2445,11 @@ const PureZigTlsClient = struct {
         try setNonBlockingFd(self.stream.handle);
 
         self.crypto_provider_state = tls_core.production_crypto.Provider.init(self.entropy_source.entropy());
-        self.backend = tls_core.tls13_backend.Tls13Backend.initClient(
+        self.backend = tls_core.tls13_backend.Tls13Backend.initClientWithOptions(
             try tls_core.production_crypto.freshHandshakeEntropy(),
             .insecure_no_verification,
             .{ .record = .{ .alpn = alpnPolicy(alpn) } },
+            .{ .server_name = server_name },
         );
         self.record = tls_core.encrypted_stream.PureZigRecordStream.initWithCarrierAndBackend(
             .client,
@@ -2446,6 +2465,10 @@ const PureZigTlsClient = struct {
     }
 
     fn expectHandshakeFailure(allocator: std.mem.Allocator, port: u16, alpn: []const u8) !void {
+        return expectHandshakeFailureWithServerName(allocator, port, alpn, null);
+    }
+
+    fn expectHandshakeFailureWithServerName(allocator: std.mem.Allocator, port: u16, alpn: []const u8, server_name: ?[]const u8) !void {
         const self = try allocator.create(PureZigTlsClient);
         errdefer allocator.destroy(self);
         self.* = .{
@@ -2456,10 +2479,11 @@ const PureZigTlsClient = struct {
         try setNonBlockingFd(self.stream.handle);
 
         self.crypto_provider_state = tls_core.production_crypto.Provider.init(self.entropy_source.entropy());
-        self.backend = tls_core.tls13_backend.Tls13Backend.initClient(
+        self.backend = tls_core.tls13_backend.Tls13Backend.initClientWithOptions(
             try tls_core.production_crypto.freshHandshakeEntropy(),
             .insecure_no_verification,
             .{ .record = .{ .alpn = alpnPolicy(alpn) } },
+            .{ .server_name = server_name },
         );
         self.record = tls_core.encrypted_stream.PureZigRecordStream.initWithCarrierAndBackend(
             .client,
@@ -7092,4 +7116,250 @@ test "failure: malformed and stalled TLS handshakes are rejected without wedging
     const active = prometheusMetricValue(metrics.body, "tardigrade_active_connections") orelse
         return error.MissingActiveConnectionsMetric;
     try std.testing.expect(active <= 4);
+}
+
+// ---------------------------------------------------------------------------
+// Appliance TLS profile (#392): the strict Ed25519 provisioned identity
+// through the production native listener.
+// ---------------------------------------------------------------------------
+
+fn applianceFixturePath(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
+    const cwd = try compat.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(cwd);
+    return std.fmt.allocPrint(allocator, "{s}/tests/fixtures/tls/{s}", .{ cwd, name });
+}
+
+/// Spawn tardigrade with the given TLS env and expect startup to fail before
+/// the listener ever accepts a connection, with `expected_log` in the error
+/// log. Used for credential preflight failures (mismatched or malformed key).
+fn expectApplianceStartupFailure(
+    allocator: std.mem.Allocator,
+    key_fixture: []const u8,
+    expected_log: []const u8,
+) !void {
+    const cert_path = try applianceFixturePath(allocator, "native_ed25519.crt");
+    defer allocator.free(cert_path);
+    const key_path = try applianceFixturePath(allocator, key_fixture);
+    defer allocator.free(key_path);
+
+    const port = try findFreePort();
+    const cwd = try compat.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(cwd);
+    const log_path = try std.fmt.allocPrint(allocator, "{s}/.zig-cache/tardigrade-appliance-fail-{d}.log", .{ cwd, port });
+    defer allocator.free(log_path);
+    const config_rel = try std.fmt.allocPrint(allocator, ".zig-cache/tardigrade-appliance-fail-{d}.conf", .{port});
+    defer {
+        compat.cwd().deleteFile(config_rel) catch {};
+        allocator.free(config_rel);
+    }
+    try compat.cwd().writeFile(.{ .sub_path = config_rel, .data = "" });
+
+    const port_str = try std.fmt.allocPrint(allocator, "{d}", .{port});
+    defer allocator.free(port_str);
+
+    var env_map = try inheritedEnvMap(allocator);
+    defer env_map.deinit();
+    try env_map.put("TARDIGRADE_CONFIG_PATH", config_rel);
+    try env_map.put("TARDIGRADE_LISTEN_HOST", test_host);
+    try env_map.put("TARDIGRADE_LISTEN_PORT", port_str);
+    try env_map.put("TARDIGRADE_ERROR_LOG_PATH", log_path);
+    try env_map.put("TARDIGRADE_WORKER_THREADS", "1");
+    try env_map.put("TARDIGRADE_TLS_CERT_PATH", cert_path);
+    try env_map.put("TARDIGRADE_TLS_KEY_PATH", key_path);
+    try env_map.put("TARDIGRADE_TLS_SERVER_NAME", "tardigrade.test");
+
+    var argv = [_][]const u8{integration_options.tardigrade_bin_path};
+    const early_stderr: ?std.Io.File = std.Io.Dir.createFileAbsolute(compat.io(), log_path, .{ .truncate = true }) catch null;
+    var child = try std.process.spawn(compat.io(), .{
+        .argv = &argv,
+        .environ_map = &env_map,
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = if (early_stderr) |f| .{ .file = f } else .ignore,
+    });
+    if (early_stderr) |f| f.close(compat.io());
+
+    const term = try child.wait(compat.io());
+    switch (term) {
+        .exited => |code| try std.testing.expect(code != 0),
+        else => {},
+    }
+    try waitForLogSubstring(allocator, log_path, expected_log, 3_000);
+
+    // The listener never came up: connecting must fail.
+    if (compat.tcpConnectToHost(allocator, test_host, port)) |conn| {
+        var open_stream = conn;
+        open_stream.close();
+        return error.TestUnexpectedResult;
+    } else |_| {}
+}
+
+test "native TLS listener appliance identity serves the exact configured SNI" {
+    try requireNativeTlsProfile();
+    const allocator = std.testing.allocator;
+
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text =
+        \\location = /healthz {
+        \\    return 200 alive;
+        \\}
+        ,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = "tardigrade.test" },
+            .{ .name = "TARDIGRADE_HTTP2_ENABLED", .value = "false" },
+        },
+    });
+    defer tardigrade.stop();
+
+    const client = try PureZigTlsClient.createWithServerName(allocator, tardigrade.port, "http/1.1", "tardigrade.test");
+    defer client.destroy();
+    try client.writeAllPlain("GET /healthz HTTP/1.1\r\nHost: tardigrade.test\r\nConnection: close\r\n\r\n");
+    const raw = try client.readPlainToEnd(allocator, 64 * 1024, 5_000);
+    defer allocator.free(raw);
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(raw, "HTTP/1.1 200 OK"));
+    try assertContains(raw, "alive");
+}
+
+test "native TLS listener appliance rejects unknown SNI before HTTP dispatch" {
+    try requireNativeTlsProfile();
+    const allocator = std.testing.allocator;
+
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+
+    var upstream = try UpstreamServer.start(allocator, &.{
+        .{ .body = "sni-negative-control", .connection_header = "close" },
+    });
+    defer upstream.stop();
+    try upstream.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\
+        \\location /proxy/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+    , .{ test_host, upstream.port() });
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = "tardigrade.test" },
+            .{ .name = "TARDIGRADE_HTTP2_ENABLED", .value = "false" },
+        },
+    });
+    defer tardigrade.stop();
+    try upstream.resetCapture();
+
+    // An unknown non-empty SNI fails the handshake; no HTTP parser or
+    // upstream request is ever reached.
+    try PureZigTlsClient.expectHandshakeFailureWithServerName(allocator, tardigrade.port, "http/1.1", "unknown.example.test");
+    compat.sleepNs(200 * std.time.ns_per_ms);
+    try std.testing.expectEqual(@as(u32, 0), upstream.requestCount());
+
+    // Control: absent SNI selects the one default identity.
+    var control = try sendPureZigTlsHttp1Request(allocator, tardigrade.port, "/proxy/control");
+    defer control.deinit();
+    try std.testing.expectEqual(@as(u16, 200), control.status_code);
+    try assertContains(control.body, "sni-negative-control");
+    try waitForUpstreamCount(&upstream, 1, 2_000);
+}
+
+test "native TLS listener appliance refuses startup with a mismatched key" {
+    try requireNativeTlsProfile();
+    const allocator = std.testing.allocator;
+    try expectApplianceStartupFailure(allocator, "native_ed25519_mismatch.key", "appliance TLS credential rejected (KeyCertificateMismatch)");
+}
+
+test "native TLS listener appliance refuses startup with an unsupported key algorithm" {
+    try requireNativeTlsProfile();
+    const allocator = std.testing.allocator;
+    try expectApplianceStartupFailure(allocator, "native_p256.key", "appliance TLS credential rejected (UnsupportedPrivateKeyAlgorithm)");
+}
+
+test "native TLS listener appliance check command validates credentials without binding" {
+    try requireNativeTlsProfile();
+    const allocator = std.testing.allocator;
+
+    const cert_path = try applianceFixturePath(allocator, "native_ed25519.crt");
+    defer allocator.free(cert_path);
+    const key_path = try applianceFixturePath(allocator, "native_ed25519.key");
+    defer allocator.free(key_path);
+    const mismatch_key_path = try applianceFixturePath(allocator, "native_ed25519_mismatch.key");
+    defer allocator.free(mismatch_key_path);
+
+    const config_rel = try std.fmt.allocPrint(allocator, ".zig-cache/tardigrade-appliance-check-{d}.conf", .{compat.nanoTimestamp()});
+    defer {
+        compat.cwd().deleteFile(config_rel) catch {};
+        allocator.free(config_rel);
+    }
+    try compat.cwd().writeFile(.{ .sub_path = config_rel, .data = "" });
+
+    // Occupy the configured listen port ourselves: a passing check proves the
+    // command never binds a listener socket.
+    const port = try findFreePort();
+    const address = try std.Io.net.IpAddress.parse(test_host, port);
+    var occupied = try address.listen(compat.io(), .{ .reuse_address = false });
+    defer occupied.deinit(compat.io());
+    const port_str = try std.fmt.allocPrint(allocator, "{d}", .{port});
+    defer allocator.free(port_str);
+
+    var env_map = try inheritedEnvMap(allocator);
+    defer env_map.deinit();
+    try env_map.put("TARDIGRADE_LISTEN_HOST", test_host);
+    try env_map.put("TARDIGRADE_LISTEN_PORT", port_str);
+    try env_map.put("TARDIGRADE_TLS_CERT_PATH", cert_path);
+    try env_map.put("TARDIGRADE_TLS_KEY_PATH", key_path);
+    try env_map.put("TARDIGRADE_TLS_SERVER_NAME", "tardigrade.test");
+
+    const valid = try std.process.run(allocator, compat.io(), .{
+        .argv = &.{ integration_options.tardigrade_bin_path, "check", config_rel },
+        .environ_map = &env_map,
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    });
+    defer allocator.free(valid.stdout);
+    defer allocator.free(valid.stderr);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, valid.term);
+    try assertContains(valid.stdout, "configuration valid");
+
+    // Mismatched key: deterministic configuration-invalid failure.
+    try env_map.put("TARDIGRADE_TLS_KEY_PATH", mismatch_key_path);
+    const mismatched = try std.process.run(allocator, compat.io(), .{
+        .argv = &.{ integration_options.tardigrade_bin_path, "check", config_rel },
+        .environ_map = &env_map,
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    });
+    defer allocator.free(mismatched.stdout);
+    defer allocator.free(mismatched.stderr);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 2 }, mismatched.term);
+    try assertContains(mismatched.stderr, "KeyCertificateMismatch");
+
+    // Missing server name: rejected by the appliance configuration policy.
+    try env_map.put("TARDIGRADE_TLS_KEY_PATH", key_path);
+    _ = env_map.swapRemove("TARDIGRADE_TLS_SERVER_NAME");
+    const unnamed = try std.process.run(allocator, compat.io(), .{
+        .argv = &.{ integration_options.tardigrade_bin_path, "check", config_rel },
+        .environ_map = &env_map,
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    });
+    defer allocator.free(unnamed.stdout);
+    defer allocator.free(unnamed.stderr);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 2 }, unnamed.term);
 }

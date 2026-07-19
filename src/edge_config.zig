@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const build_options = @import("build_options");
 const compat = @import("zig_compat.zig");
 const http = @import("http.zig");
 
@@ -168,6 +169,10 @@ pub const EdgeConfig = struct {
     tls_max_version: []const u8,
     tls_cipher_list: []const u8,
     tls_cipher_suites: []const u8,
+    /// The one exact DNS host name served by the fixed appliance TLS identity
+    /// (#392). Required (and strictly validated) in the appliance TLS profile;
+    /// unused by the general OpenSSL terminator.
+    tls_server_name: []const u8,
     tls_sni_certs: []TlsSniCert,
     tls_session_cache_enabled: bool,
     tls_session_cache_size: u32,
@@ -542,6 +547,7 @@ pub const EdgeConfig = struct {
         allocator.free(self.tls_max_version);
         allocator.free(self.tls_cipher_list);
         allocator.free(self.tls_cipher_suites);
+        allocator.free(self.tls_server_name);
         for (self.tls_sni_certs) |sc| {
             allocator.free(sc.server_name);
             allocator.free(sc.cert_path);
@@ -726,6 +732,8 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     errdefer allocator.free(tls_cipher_list);
     const tls_cipher_suites = envOrDefault(allocator, "TARDIGRADE_TLS_CIPHER_SUITES", "") catch unreachable;
     errdefer allocator.free(tls_cipher_suites);
+    const tls_server_name = envOrDefault(allocator, "TARDIGRADE_TLS_SERVER_NAME", "") catch unreachable;
+    errdefer allocator.free(tls_server_name);
     const tls_sni_certs_raw = envOrDefault(allocator, "TARDIGRADE_TLS_SNI_CERTS", "") catch unreachable;
     defer allocator.free(tls_sni_certs_raw);
     var tls_sni_certs = try parseTlsSniCerts(allocator, tls_sni_certs_raw);
@@ -1411,6 +1419,7 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .tls_max_version = tls_max_version,
         .tls_cipher_list = tls_cipher_list,
         .tls_cipher_suites = tls_cipher_suites,
+        .tls_server_name = tls_server_name,
         .tls_sni_certs = tls_sni_certs,
         .tls_session_cache_enabled = tls_session_cache_enabled,
         .tls_session_cache_size = tls_session_cache_size,
@@ -2553,6 +2562,37 @@ pub fn hasTlsFiles(cfg: *const EdgeConfig) bool {
     return cfg.tls_cert_path.len > 0 and cfg.tls_key_path.len > 0;
 }
 
+/// True when this binary was built with the Bare Systems appliance TLS
+/// profile (#379/#392): pure-Zig TLS only, fixed single-identity credential
+/// contract, no OpenSSL linkage.
+pub const is_appliance_tls_profile =
+    std.mem.eql(u8, build_options.tls_profile, "appliance");
+
+/// Server-name policy for the downstream TLS identity (#392). A configured
+/// name must always be one valid, non-wildcard DNS host name. The appliance
+/// profile additionally requires exactly one identity: a server name must be
+/// present when TLS is enabled and the multi-identity `tls_sni_certs`
+/// mechanism is rejected.
+fn validateTlsServerNamePolicy(cfg: *const EdgeConfig) !void {
+    const tls_core = @import("tls_core");
+    if (cfg.tls_server_name.len > 0) {
+        tls_core.appliance_credentials.validateServerName(cfg.tls_server_name) catch {
+            std.log.err("config validation failed: TARDIGRADE_TLS_SERVER_NAME must be a single non-wildcard DNS host name", .{});
+            return error.InvalidConfigValue;
+        };
+    }
+    if (is_appliance_tls_profile and hasTlsFiles(cfg)) {
+        if (cfg.tls_server_name.len == 0) {
+            std.log.err("config validation failed: the appliance TLS profile requires TARDIGRADE_TLS_SERVER_NAME when TLS is enabled", .{});
+            return error.InvalidConfigValue;
+        }
+        if (cfg.tls_sni_certs.len > 0) {
+            std.log.err("config validation failed: the appliance TLS profile supports exactly one identity; TARDIGRADE_TLS_SNI_CERTS (and per-server-block TLS certificates) must be empty", .{});
+            return error.InvalidConfigValue;
+        }
+    }
+}
+
 pub fn validate(cfg: *const EdgeConfig) !void {
     if (cfg.listen_port == 0) {
         std.log.err("config validation failed: listen_port must be between 1 and 65535", .{});
@@ -2572,6 +2612,7 @@ pub fn validate(cfg: *const EdgeConfig) !void {
     }
     try validateOptionalFile(cfg.tls_cert_path, "tls_cert_path");
     try validateOptionalFile(cfg.tls_key_path, "tls_key_path");
+    try validateTlsServerNamePolicy(cfg);
     for (cfg.tls_sni_certs) |entry| {
         try validateOptionalFile(entry.cert_path, "tls_sni_cert.cert_path");
         try validateOptionalFile(entry.key_path, "tls_sni_cert.key_path");

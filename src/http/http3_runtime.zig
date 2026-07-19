@@ -10,10 +10,12 @@
 //! ngtcp2/nghttp3 are gone from the build (#328); they remain available only
 //! as out-of-process interop peers under `scripts/interop/`.
 //!
-//! TLS identity: the native TLS 1.3 backend authenticates with an Ed25519 or
-//! ECDSA P-256 certificate (PEM or DER). Other key types (e.g. RSA) leave the
-//! QUIC listener unbootstrapped with a logged warning while TCP continues to
-//! serve — mirroring the previous behavior when HTTP/3 support was absent.
+//! TLS identity: the runtime owns no certificate or key material. It borrows
+//! a provider-neutral `tls_core.credentials.CredentialProvider` from the
+//! composition root (#392) — the same provider instance that authenticates
+//! native TCP TLS — and hands it to each accepted QUIC connection's TLS
+//! backend. Without a provider the QUIC listener stays unbootstrapped with a
+//! logged warning while TCP continues to serve.
 
 const compat = @import("../zig_compat.zig");
 const std = @import("std");
@@ -48,8 +50,9 @@ pub const RequestHandler = *const fn (
 pub const Config = struct {
     listen_host: []const u8,
     quic_port: u16,
-    tls_cert_path: []const u8 = "",
-    tls_key_path: []const u8 = "",
+    /// Borrowed local credential provider shared with the TCP TLS path. The
+    /// owner must outlive this runtime and every QUIC connection it accepts.
+    credential_provider: ?tls_core.credentials.CredentialProvider = null,
     tls_min_version: []const u8 = "1.3",
     tls_max_version: []const u8 = "1.3",
     enable_0rtt: bool = false,
@@ -128,10 +131,8 @@ pub const Runtime = struct {
     quic_port: u16,
     request_handler: ?RequestHandler,
     request_handler_ctx: ?*anyopaque,
-    identity: ?quic.tls_backend.Identity,
+    credential_provider: ?tls_core.credentials.CredentialProvider,
     quic_config: quic.config.Config,
-    cert_der: []u8,
-    key_der: []u8,
     snapshot_mutex: compat.Mutex = .{},
     snapshot_state: Snapshot,
     stopping: std.atomic.Value(bool),
@@ -161,10 +162,8 @@ pub const Runtime = struct {
             .quic_port = cfg.quic_port,
             .request_handler = cfg.request_handler,
             .request_handler_ctx = cfg.request_handler_ctx,
-            .identity = null,
+            .credential_provider = cfg.credential_provider,
             .quic_config = quicConfigFrom(cfg),
-            .cert_der = &.{},
-            .key_der = &.{},
             .snapshot_state = .{ .quic_port = cfg.quic_port },
             .stopping = std.atomic.Value(bool).init(false),
         };
@@ -178,25 +177,11 @@ pub const Runtime = struct {
         if (!std.mem.eql(u8, cfg.tls_min_version, "1.3") or !std.mem.eql(u8, cfg.tls_max_version, "1.3")) {
             logger.warn(null, "http3: native QUIC requires TLS 1.3; ignoring tls_min_version={s}/tls_max_version={s}", .{ cfg.tls_min_version, cfg.tls_max_version });
         }
-        if (cfg.tls_cert_path.len > 0 and cfg.tls_key_path.len > 0) {
-            runtime.loadIdentity(cfg.tls_cert_path, cfg.tls_key_path) catch |err| {
-                logger.warn(null, "http3: TLS identity unusable for QUIC ({s}); the native stack needs an Ed25519 or ECDSA P-256 certificate. QUIC bootstrap incomplete.", .{@errorName(err)});
-            };
+        if (cfg.credential_provider == null) {
+            logger.warn(null, "http3: no TLS credential provider configured; QUIC bootstrap incomplete.", .{});
         }
-        runtime.snapshot_state.server_bootstrapped = runtime.identity != null;
+        runtime.snapshot_state.server_bootstrapped = runtime.credential_provider != null;
         return runtime;
-    }
-
-    fn loadIdentity(self: *Runtime, cert_path: []const u8, key_path: []const u8) !void {
-        var loaded = try tls_core.identity_loader.loadIdentity(self.allocator, cert_path, key_path);
-        defer loaded.deinit();
-
-        self.cert_der = loaded.cert_chain[0];
-        self.key_der = loaded.key_der;
-        self.identity = loaded.identity;
-        std.crypto.secureZero(u8, std.mem.asBytes(&loaded.identity.key));
-        loaded.cert_chain[0] = &.{};
-        loaded.key_der = &.{};
     }
 
     pub fn start(self: *Runtime) void {
@@ -208,8 +193,6 @@ pub const Runtime = struct {
         self.stopping.store(true, .release);
         if (self.thread) |thread| thread.join();
         _ = std.c.close(self.socket_fd);
-        if (self.cert_der.len > 0) self.allocator.free(self.cert_der);
-        if (self.key_der.len > 0) self.allocator.free(self.key_der);
         self.* = undefined;
     }
 
@@ -406,7 +389,7 @@ pub const Runtime = struct {
         peer: std.c.sockaddr.in,
         now: u64,
     ) ?u64 {
-        const identity = self.identity orelse return null;
+        const credential_provider = self.credential_provider orelse return null;
         if (parsed.version != quic.packet.quic_v1) return null;
         if (parsed.dcid.len < 8 or parsed.scid.len == 0) return null;
         // Bound half-open state before allocating anything for this Initial.
@@ -417,7 +400,7 @@ pub const Runtime = struct {
         var entropy: quic.tls_backend.Entropy = undefined;
         compat.randomBytes(&entropy.hello_random);
         compat.randomBytes(&entropy.key_share_seed);
-        backend.* = quic.tls_backend.Tls13Backend.initServer(entropy, identity);
+        backend.* = quic.tls_backend.Tls13Backend.initServerWithProvider(entropy, credential_provider);
 
         const conn = Connection.init(allocator, .{
             .role = .server,
@@ -809,6 +792,53 @@ test "per-source admission counter increments and prunes to empty" {
     try testing.expect(per_ip.get(0x0100007f) == null);
     // Decrementing an unknown address is a no-op, not a crash.
     decPerIp(&per_ip, 0xdeadbeef);
+}
+
+test "runtime borrows the credential provider and owns no key material" {
+    // Structural guarantee (#392): the runtime has no owned identity, DER, or
+    // key buffers to leak — only the borrowed provider handle.
+    comptime {
+        for (@typeInfo(Runtime).@"struct".fields) |field| {
+            std.debug.assert(!std.mem.eql(u8, field.name, "identity"));
+            std.debug.assert(!std.mem.eql(u8, field.name, "cert_der"));
+            std.debug.assert(!std.mem.eql(u8, field.name, "key_der"));
+        }
+    }
+
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity());
+    defer fixed.deinit();
+    var logger = logger_mod.Logger.init(.err, "http3-test");
+
+    var runtime = try Runtime.init(testing.allocator, &logger, .{
+        .listen_host = "127.0.0.1",
+        .quic_port = 0,
+        .credential_provider = fixed.provider(),
+    });
+    try testing.expect(runtime.snapshot().server_bootstrapped);
+    runtime.deinit();
+
+    // Tearing the runtime down must not release the shared provider: the
+    // same instance keeps serving native TCP TLS selections.
+    var selection = tls_core.credentials.SelectionContext{
+        .role = .server,
+        .server_name = null,
+        .peer_signature_schemes = &.{0x0807},
+        .negotiated_version = 0x0304,
+        .cipher_suite = 0x1301,
+        .application_protocol = "h2",
+        .auth_policy = .{},
+    };
+    switch (try fixed.provider().selectCredential(&selection)) {
+        .complete => |credential| credential.release(),
+        .pending => return error.TestUnexpectedPending,
+    }
+
+    var unbootstrapped = try Runtime.init(testing.allocator, &logger, .{
+        .listen_host = "127.0.0.1",
+        .quic_port = 0,
+    });
+    try testing.expect(!unbootstrapped.snapshot().server_bootstrapped);
+    unbootstrapped.deinit();
 }
 
 test {

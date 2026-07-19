@@ -5,6 +5,7 @@ const edge_config = @import("edge_config.zig");
 const edge_gateway = @import("edge_gateway.zig");
 const http = @import("http.zig");
 const runtime_allocator = @import("runtime_allocator.zig");
+const tls_core = @import("tls_core");
 
 const ENV_CONFIG_PATH = "TARDIGRADE_CONFIG_PATH";
 const CHECK_DEFAULT_CONFIG_PATH = "./tardigrade.toml";
@@ -414,6 +415,18 @@ fn executeValidateCommand(allocator: std.mem.Allocator, options: CommonOptions, 
     var cfg = try edge_config.loadFromEnv(allocator);
     defer cfg.deinit(allocator);
     try edge_config.validate(&cfg);
+    // Appliance TLS profile (#392): `check` performs the complete credential
+    // preflight — exact PEM/PKCS#8 contract, chain parse, Ed25519 key parse,
+    // leaf/key match, server-name policy, flight bounds, provider snapshot
+    // construction and clean teardown — without binding any socket.
+    if (edge_config.is_appliance_tls_profile and edge_config.hasTlsFiles(&cfg)) {
+        try tls_core.appliance_credentials.validateFiles(
+            allocator,
+            cfg.tls_cert_path,
+            cfg.tls_key_path,
+            .{ .server_name = cfg.tls_server_name },
+        );
+    }
     edge_config.warnRiskyConfig(&cfg);
     var stdout_buf: [2048]u8 = undefined;
     var stdout = compat.stdoutWriter(&stdout_buf);
@@ -491,6 +504,30 @@ fn isConfigValidationError(err: anyerror) bool {
         error.InvalidTokenHashHex,
         error.InvalidHealthStatusRange,
         error.InvalidHealthStatusOverride,
+        // Appliance TLS credential preflight (#392): every class is an
+        // operator-actionable configuration failure, not an internal error.
+        error.MissingCertificateChain,
+        error.MissingPrivateKey,
+        error.CertificateFileTooLarge,
+        error.PrivateKeyFileTooLarge,
+        error.EmptyCertificateChain,
+        error.TooManyCertificates,
+        error.MalformedCertificatePem,
+        error.AmbiguousCertificateInput,
+        error.CertificateTooLarge,
+        error.MalformedCertificateDer,
+        error.MalformedPrivateKeyPem,
+        error.AmbiguousPrivateKeyInput,
+        error.MalformedPrivateKeyDer,
+        error.UnsupportedPrivateKeyAlgorithm,
+        error.UnsupportedPrivateKeyParameters,
+        error.InvalidPrivateKeySize,
+        error.InvalidPrivateKey,
+        error.UnsupportedLeafKeyAlgorithm,
+        error.KeyCertificateMismatch,
+        error.CertificateFlightTooLarge,
+        error.InvalidServerName,
+        error.UnsupportedApplianceConfiguration,
         => true,
         else => false,
     };

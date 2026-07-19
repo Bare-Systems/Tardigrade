@@ -1,6 +1,7 @@
 const compat = @import("zig_compat.zig");
 const std = @import("std");
 const http = @import("http.zig");
+const tls_core = @import("tls_core");
 const edge_config = @import("edge_config.zig");
 
 /// Shared inbound request buffer size limit, also used as a default proxy
@@ -2615,6 +2616,13 @@ pub const WorkerContext = struct {
     state: *GatewayState,
     tls: ?*http.tls_termination.TlsTerminator,
     native_credentials: ?*http.native_tls_connection.NativeCredentialStore,
+    /// Borrowed credential provider used by the native TCP TLS accept path.
+    /// Appliance profile: borrowed from the `ApplianceCredentials` owner.
+    /// Otherwise: borrowed from the generic native credential store.
+    native_tls_provider: ?tls_core.credentials.CredentialProvider = null,
+    /// Set only in the appliance TLS profile; hot reload consults it to
+    /// reject credential-affecting configuration changes (#392).
+    appliance_credentials: ?*tls_core.appliance_credentials.ApplianceCredentials = null,
     session_pool: *ConnectionSessionPool,
     /// Event loop used to (un)watch idle keepalive connections (#138). A worker
     /// re-arms a parked fd here; the loop thread dispatches it back on readiness.

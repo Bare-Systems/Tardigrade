@@ -96,6 +96,28 @@ pub fn hotReloadConfig(
             return;
         };
     }
+    if (worker_ctx.appliance_credentials != null) {
+        // Appliance TLS profile (#392): the identity is startup-loaded and a
+        // hot reload must never silently accept changed credential inputs
+        // while continuing to serve the old credentials. Reject the whole
+        // reload when any credential-affecting field changes; the previous
+        // configuration and provider remain active and coherent.
+        var current_lease = worker_ctx.config_store.acquire();
+        const credential_config_changed = applianceCredentialConfigChanged(current_lease.cfg, cfg_ptr);
+        current_lease.release();
+        if (credential_config_changed) {
+            worker_ctx.config_store.destroyVersion(prepared_version);
+            const msg = std.fmt.bufPrint(&state.last_reload_error, "appliance TLS credential configuration changed; restart required", .{}) catch "appliance TLS credential configuration changed";
+            state.reload_mutex.lock();
+            state.last_reload_ok = false;
+            state.last_reload_at_ms = now_ms;
+            state.last_reload_error_len = msg.len;
+            state.reload_mutex.unlock();
+            state.metricsRecordReloadFailure();
+            state.logger.warn(null, "config reload rejected: appliance TLS credential configuration (certificate/key path, tls_server_name, or SNI certificates) changed; restart the appliance to rotate credentials", .{});
+            return;
+        }
+    }
     if (worker_ctx.native_credentials) |store| {
         var sni_specs = allocator.alloc(http.native_tls_connection.SniCertSpec, cfg_ptr.tls_sni_certs.len) catch {
             worker_ctx.config_store.destroyVersion(prepared_version);
@@ -146,6 +168,46 @@ pub fn hotReloadConfig(
     state.reload_mutex.unlock();
     state.metricsRecordReloadSuccess();
     state.logger.info(null, "configuration hot-reload applied", .{});
+}
+
+/// True when a proposed configuration changes any input that feeds the
+/// startup-loaded appliance TLS credential (#392): certificate path, key
+/// path, configured TLS server name, or the (necessarily empty) SNI
+/// credential set.
+pub fn applianceCredentialConfigChanged(
+    current: *const edge_config.EdgeConfig,
+    proposed: *const edge_config.EdgeConfig,
+) bool {
+    if (!std.mem.eql(u8, current.tls_cert_path, proposed.tls_cert_path)) return true;
+    if (!std.mem.eql(u8, current.tls_key_path, proposed.tls_key_path)) return true;
+    if (!std.mem.eql(u8, current.tls_server_name, proposed.tls_server_name)) return true;
+    if (current.tls_sni_certs.len != proposed.tls_sni_certs.len) return true;
+    for (current.tls_sni_certs, proposed.tls_sni_certs) |a, b| {
+        if (!std.mem.eql(u8, a.server_name, b.server_name)) return true;
+        if (!std.mem.eql(u8, a.cert_path, b.cert_path)) return true;
+        if (!std.mem.eql(u8, a.key_path, b.key_path)) return true;
+    }
+    return false;
+}
+
+test "applianceCredentialConfigChanged detects credential-affecting fields" {
+    const allocator = std.testing.allocator;
+    var base = try edge_config.loadFromEnv(allocator);
+    defer base.deinit(allocator);
+    var proposed = try edge_config.loadFromEnv(allocator);
+    defer proposed.deinit(allocator);
+
+    try std.testing.expect(!applianceCredentialConfigChanged(&base, &proposed));
+
+    const original_cert = proposed.tls_cert_path;
+    proposed.tls_cert_path = "/changed/cert.pem";
+    try std.testing.expect(applianceCredentialConfigChanged(&base, &proposed));
+    proposed.tls_cert_path = original_cert;
+
+    const original_name = proposed.tls_server_name;
+    proposed.tls_server_name = "changed.example.test";
+    try std.testing.expect(applianceCredentialConfigChanged(&base, &proposed));
+    proposed.tls_server_name = original_name;
 }
 
 pub fn applyReloadedRuntimeConfig(cfg: *const edge_config.EdgeConfig, state: *GatewayState) void {

@@ -5,6 +5,27 @@ All notable user-facing changes to Tardigrade are documented here.
 ## [Unreleased]
 
 ### Features
+- **Fixed-profile Bare Systems appliance TLS credential provider (#392, epic
+  #391)** — appliance-profile builds (`-Dtls-profile=appliance`) now load
+  exactly one provisioned Ed25519 identity through a strict provisioning
+  loader (`src/tls/appliance_credentials.zig`): strict RFC 7468 PEM
+  certificate chains (leaf first, certificate blocks and whitespace only),
+  exactly one unencrypted RFC 5958/8410 PKCS#8 `PRIVATE KEY` block, exact
+  leaf/private public-key matching plus a sign/verify probe, and a TLS
+  Certificate-flight preflight using the handshake writer's bounds — all
+  validated before any TCP or UDP listener binds, with a deterministic
+  operator-facing error taxonomy and typed secret zeroization on every path.
+  The identity publishes through the existing reloadable SNI provider as one
+  default bundle: exact `TARDIGRADE_TLS_SERVER_NAME` (new setting, also the
+  `tls_server_name` directive) or absent SNI selects it, and any unknown SNI
+  fails before HTTP parsing. The same borrowed `CredentialProvider` now
+  authenticates native TCP TLS (`h2`/`http/1.1`) and native HTTP/3: the
+  HTTP/3 runtime no longer loads or retains its own certificate/key material
+  in any profile. `tardi check` performs the complete credential preflight
+  without binding sockets, and hot reload rejects credential-affecting
+  configuration changes in the appliance profile instead of silently keeping
+  stale credentials. See `docs/BARE_APPLIANCE_TLS.md` for the full supported
+  and unsupported contract.
 - **Negotiated HTTPS protocol dispatch foundation (#356, refs #355, epic #325)** —
   adds a transport-neutral HTTP dispatch seam that receives only an
   authenticated encrypted byte stream plus a typed negotiated protocol

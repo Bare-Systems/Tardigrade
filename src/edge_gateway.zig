@@ -257,9 +257,11 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
             sni_specs[i] = .{ .server_name = sc.server_name, .cert_path = sc.cert_path, .key_path = sc.key_path };
         }
         if (!build_options.tls_openssl_adapter) {
-            if (appliance_identity) |*owner| {
+            if (edge_config.is_appliance_tls_profile) {
                 // Appliance profile: the strict owner is the only credential
-                // source for both native TCP TLS and HTTP/3.
+                // source for both native TCP TLS and HTTP/3. There is no
+                // fallback through the permissive generic identity loader.
+                const owner = &appliance_identity.?;
                 native_tls_provider = owner.provider();
                 h3_credential_provider = owner.provider();
             } else {

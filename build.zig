@@ -65,8 +65,25 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const hpack_mod = b.createModule(.{
+        .root_source_file = b.path("src/http/hpack.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    hpack_mod.addImport("hpack_huffman", hpack_huffman_mod);
     const stream_transport_mod = b.createModule(.{
         .root_source_file = b.path("src/http/stream_transport.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const http_encrypted_stream_connection_mod = b.createModule(.{
+        .root_source_file = b.path("src/http/encrypted_stream_connection.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    http_encrypted_stream_connection_mod.addImport("tls_core", tls_core_mod);
+    const http_request_mod = b.createModule(.{
+        .root_source_file = b.path("src/http/request.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -175,6 +192,9 @@ pub fn build(b: *std.Build) void {
     integration_mod.addImport("integration_options", integration_options.createModule());
     integration_mod.addImport("build_options", build_options.createModule());
     integration_mod.addImport("zig_compat", compat_mod);
+    integration_mod.addImport("hpack_huffman", hpack_huffman_mod);
+    integration_mod.addImport("hpack", hpack_mod);
+    integration_mod.addImport("tls_core", tls_core_mod);
 
     const integration_tests = b.addTest(.{
         .root_module = integration_mod,
@@ -184,6 +204,15 @@ pub fn build(b: *std.Build) void {
 
     const integration_step = b.step("test-integration", "Run live-process integration tests");
     integration_step.dependOn(&run_integration_tests.step);
+
+    const native_listener_integration_tests = b.addTest(.{
+        .root_module = integration_mod,
+        .filters = &.{"native TLS listener"},
+    });
+    const run_native_listener_integration_tests = b.addRunArtifact(native_listener_integration_tests);
+    run_native_listener_integration_tests.step.dependOn(b.getInstallStep());
+    const native_listener_integration_step = b.step("test-integration-native-tls", "Run native TLS listener HTTP integration tests");
+    native_listener_integration_step.dependOn(&run_native_listener_integration_tests.step);
 
     // Failure-mode / chaos harness (#169): the same live-process harness filtered
     // to the `failure:`-prefixed tests so operators can exercise broken origins
@@ -196,6 +225,9 @@ pub fn build(b: *std.Build) void {
     failure_mode_mod.addImport("integration_options", integration_options.createModule());
     failure_mode_mod.addImport("build_options", build_options.createModule());
     failure_mode_mod.addImport("zig_compat", compat_mod);
+    failure_mode_mod.addImport("hpack_huffman", hpack_huffman_mod);
+    failure_mode_mod.addImport("hpack", hpack_mod);
+    failure_mode_mod.addImport("tls_core", tls_core_mod);
 
     const failure_mode_tests = b.addTest(.{
         .root_module = failure_mode_mod,
@@ -324,6 +356,8 @@ pub fn build(b: *std.Build) void {
     record_mode_handshake_test_mod.addImport("tls_core", tls_core_mod);
     record_mode_handshake_test_mod.addImport("crypto_secrets", crypto_secrets_mod);
     record_mode_handshake_test_mod.addImport("crypto", crypto_mod);
+    record_mode_handshake_test_mod.addImport("http_encrypted_stream_connection", http_encrypted_stream_connection_mod);
+    record_mode_handshake_test_mod.addImport("http_request", http_request_mod);
     const record_mode_handshake_tests = b.addTest(.{ .root_module = record_mode_handshake_test_mod });
     const run_record_mode_handshake_tests = b.addRunArtifact(record_mode_handshake_tests);
     tls_step.dependOn(&run_record_mode_handshake_tests.step);

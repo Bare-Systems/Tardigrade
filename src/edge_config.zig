@@ -60,10 +60,9 @@ pub const ProxyStreamingMode = enum {
 };
 
 /// Preferred application protocol for HTTPS upstream connections (#145).
-/// `http1` keeps the HTTP/1.1 path; `h2` and `auto` offer HTTP/2 via ALPN.
-/// In PR 1 `h2`/`auto` behave identically (offer h2; use it when the origin
-/// negotiates it, else fall back to HTTP/1.1). They diverge once an h2-only
-/// mode is added. Only applies to TLS upstreams (ALPN requires TLS).
+/// `http1` requires HTTP/1.1 via ALPN, `h2` requires HTTP/2 via ALPN, and
+/// `auto` prefers h2 while allowing HTTP/1.1 fallback. Only applies to TLS
+/// upstreams (ALPN requires TLS).
 pub const UpstreamProtocol = enum {
     http1,
     h2,
@@ -197,7 +196,9 @@ pub const EdgeConfig = struct {
     tls_acme_account_key_path: []const u8,
     /// Days before certificate expiry at which renewal is triggered.
     tls_acme_renew_days_before_expiry: u32,
+    http1_enabled: bool,
     http2_enabled: bool,
+    tls_http1_no_alpn_fallback: bool,
     /// Preferred application protocol for HTTPS upstream connections (#145).
     upstream_protocol: UpstreamProtocol,
     /// Verify TLS certificates presented by HTTPS upstream backends (default: true).
@@ -783,7 +784,9 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     errdefer allocator.free(upstream_tls_client_cert);
     const upstream_tls_client_key = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_TLS_CLIENT_KEY", "") catch unreachable;
     errdefer allocator.free(upstream_tls_client_key);
+    const http1_enabled = parseBoolEnv(allocator, "TARDIGRADE_HTTP1_ENABLED", true);
     const http2_enabled = parseBoolEnv(allocator, "TARDIGRADE_HTTP2_ENABLED", true);
+    const tls_http1_no_alpn_fallback = parseBoolEnv(allocator, "TARDIGRADE_TLS_HTTP1_NO_ALPN_FALLBACK", false);
     const http3_enabled = parseBoolEnv(allocator, "TARDIGRADE_HTTP3_ENABLED", false);
     const quic_port_str = envOrDefault(allocator, "TARDIGRADE_QUIC_PORT", "443") catch unreachable;
     defer allocator.free(quic_port_str);
@@ -1431,7 +1434,9 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .tls_acme_email = tls_acme_email,
         .tls_acme_account_key_path = tls_acme_account_key_path,
         .tls_acme_renew_days_before_expiry = tls_acme_renew_days_before_expiry,
+        .http1_enabled = http1_enabled,
         .http2_enabled = http2_enabled,
+        .tls_http1_no_alpn_fallback = tls_http1_no_alpn_fallback,
         .upstream_protocol = upstream_protocol,
         .upstream_tls_verify = upstream_tls_verify,
         .upstream_tls_ca_bundle = upstream_tls_ca_bundle,
@@ -2557,6 +2562,7 @@ pub fn validate(cfg: *const EdgeConfig) !void {
         std.log.err("config validation failed: quic_port must be between 1 and 65535 when HTTP/3 is enabled", .{});
         return error.InvalidConfigPort;
     }
+    try validateListenerProtocolPolicy(cfg.http1_enabled, cfg.http2_enabled, hasTlsFiles(cfg), true);
 
     if (std.mem.eql(u8, cfg.tls_min_version, "1.0") or std.mem.eql(u8, cfg.tls_min_version, "1.1") or
         std.mem.eql(u8, cfg.tls_max_version, "1.0") or std.mem.eql(u8, cfg.tls_max_version, "1.1"))
@@ -2737,6 +2743,17 @@ pub fn warnRiskyConfig(cfg: *const EdgeConfig) void {
     }
     if (cfg.tls_client_ca_path.len > 0 and !cfg.tls_client_verify) {
         std.log.warn("config warning: TARDIGRADE_TLS_CLIENT_CA_PATH is set but TARDIGRADE_TLS_CLIENT_VERIFY is false — the CA path is ignored", .{});
+    }
+}
+
+fn validateListenerProtocolPolicy(http1_enabled: bool, http2_enabled: bool, tls_enabled: bool, log_errors: bool) !void {
+    if (!http1_enabled and !http2_enabled) {
+        if (log_errors) std.log.err("config validation failed: at least one of HTTP/1.1 or HTTP/2 must be enabled", .{});
+        return error.InvalidConfigValue;
+    }
+    if (!tls_enabled and !http1_enabled) {
+        if (log_errors) std.log.err("config validation failed: plaintext listener requires HTTP/1.1; h2c is not supported", .{});
+        return error.InvalidConfigValue;
     }
 }
 
@@ -2962,6 +2979,14 @@ test "config enum parsers reject invalid values" {
     try std.testing.expectError(error.InvalidConfigValue, parseProxyProtocolModeConfig("v3"));
     try std.testing.expectEqual(UpstreamProtocol.h2c, try parseUpstreamProtocolConfig("h2c"));
     try std.testing.expectError(error.InvalidConfigValue, parseUpstreamProtocolConfig("spdy"));
+}
+
+test "listener protocol validation rejects plaintext h2-only" {
+    try validateListenerProtocolPolicy(true, false, false, false);
+    try validateListenerProtocolPolicy(true, true, false, false);
+    try validateListenerProtocolPolicy(false, true, true, false);
+    try std.testing.expectError(error.InvalidConfigValue, validateListenerProtocolPolicy(false, true, false, false));
+    try std.testing.expectError(error.InvalidConfigValue, validateListenerProtocolPolicy(false, false, true, false));
 }
 
 test "sensitive config values are redacted for logs" {

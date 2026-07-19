@@ -20,6 +20,7 @@ secrets.txt
 !src/http/testdata/test_server.key
 !src/http/testdata/test_alt_server.key
 !tests/fixtures/tls/server.key
+!tests/fixtures/tls/native_p256.key
 !tests/fixtures/tls/ca.key
 !tests/fixtures/tls/client.key
 !tests/fixtures/tls/rogue_ca.key

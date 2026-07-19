@@ -24,6 +24,7 @@ const shutdown = @import("shutdown.zig");
 const stream_transport = @import("stream_transport");
 const quic = @import("quic");
 const http3 = @import("http3");
+const tls_core = @import("tls_core");
 
 const Connection = quic.connection.Connection;
 const H3 = http3.conn.Conn(Connection);
@@ -187,20 +188,15 @@ pub const Runtime = struct {
     }
 
     fn loadIdentity(self: *Runtime, cert_path: []const u8, key_path: []const u8) !void {
-        const cert_raw = try readSmallFile(self.allocator, cert_path);
-        defer self.allocator.free(cert_raw);
-        const key_raw = try readSmallFile(self.allocator, key_path);
-        defer self.allocator.free(key_raw);
+        var loaded = try tls_core.identity_loader.loadIdentity(self.allocator, cert_path, key_path);
+        defer loaded.deinit();
 
-        const cert_der = try derFromPemOrDer(self.allocator, cert_raw, "CERTIFICATE");
-        errdefer self.allocator.free(cert_der);
-        const key_der = try keyDerFromPemOrDer(self.allocator, key_raw);
-        errdefer self.allocator.free(key_der);
-
-        const identity = try quic.tls_backend.Identity.initPkcs8(cert_der, key_der);
-        self.cert_der = cert_der;
-        self.key_der = key_der;
-        self.identity = identity;
+        self.cert_der = loaded.cert_chain[0];
+        self.key_der = loaded.key_der;
+        self.identity = loaded.identity;
+        std.crypto.secureZero(u8, std.mem.asBytes(&loaded.identity.key));
+        loaded.cert_chain[0] = &.{};
+        loaded.key_der = &.{};
     }
 
     pub fn start(self: *Runtime) void {
@@ -721,60 +717,7 @@ fn openUdpSocket(sa_family: u32) std.c.fd_t {
     return fd;
 }
 
-fn readSmallFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    return compat.cwd().readFileAlloc(allocator, path, 256 * 1024);
-}
-
-/// Accept PEM (first matching block) or raw DER for the certificate.
-fn derFromPemOrDer(allocator: std.mem.Allocator, raw: []const u8, block_name: []const u8) ![]u8 {
-    if (raw.len > 0 and raw[0] == 0x30) return allocator.dupe(u8, raw);
-    return pemBlockToDer(allocator, raw, block_name);
-}
-
-/// Accept PEM ("PRIVATE KEY" or "EC PRIVATE KEY") or raw DER for the key.
-fn keyDerFromPemOrDer(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
-    if (raw.len > 0 and raw[0] == 0x30) return allocator.dupe(u8, raw);
-    if (pemBlockToDer(allocator, raw, "PRIVATE KEY")) |der| return der else |_| {}
-    return pemBlockToDer(allocator, raw, "EC PRIVATE KEY");
-}
-
-fn pemBlockToDer(allocator: std.mem.Allocator, pem: []const u8, block_name: []const u8) ![]u8 {
-    var begin_buf: [64]u8 = undefined;
-    var end_buf: [64]u8 = undefined;
-    const begin = try std.fmt.bufPrint(&begin_buf, "-----BEGIN {s}-----", .{block_name});
-    const end = try std.fmt.bufPrint(&end_buf, "-----END {s}-----", .{block_name});
-    const begin_at = std.mem.find(u8, pem, begin) orelse return error.PemBlockNotFound;
-    const body_start = begin_at + begin.len;
-    const end_at = std.mem.findPos(u8, pem, body_start, end) orelse return error.PemBlockNotFound;
-    const body = pem[body_start..end_at];
-
-    var compact = try allocator.alloc(u8, body.len);
-    defer allocator.free(compact);
-    var len: usize = 0;
-    for (body) |char| {
-        if (char == '\n' or char == '\r' or char == ' ' or char == '\t') continue;
-        compact[len] = char;
-        len += 1;
-    }
-    const decoder = std.base64.standard.Decoder;
-    const der_len = try decoder.calcSizeForSlice(compact[0..len]);
-    const der = try allocator.alloc(u8, der_len);
-    errdefer allocator.free(der);
-    try decoder.decode(der, compact[0..len]);
-    return der;
-}
-
 const testing = std.testing;
-
-test "PEM block decoding extracts DER bytes" {
-    const allocator = testing.allocator;
-    // "0\x03\x02\x01\x00" is a tiny DER SEQUENCE; base64 "MAMCAQA=".
-    const pem = "junk\n-----BEGIN CERTIFICATE-----\nMAMCAQA=\n-----END CERTIFICATE-----\n";
-    const der = try pemBlockToDer(allocator, pem, "CERTIFICATE");
-    defer allocator.free(der);
-    try testing.expectEqualSlices(u8, &[_]u8{ 0x30, 0x03, 0x02, 0x01, 0x00 }, der);
-    try testing.expectError(error.PemBlockNotFound, pemBlockToDer(allocator, pem, "PRIVATE KEY"));
-}
 
 test "stream request bridge maps exchange fields and Host" {
     const allocator = testing.allocator;

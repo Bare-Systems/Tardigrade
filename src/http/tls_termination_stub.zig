@@ -15,6 +15,7 @@
 
 const std = @import("std");
 const encrypted_stream = @import("tls_core").encrypted_stream;
+const negotiated_dispatch = @import("negotiated_dispatch.zig");
 
 pub const TlsError = error{
     OutOfMemory,
@@ -29,6 +30,7 @@ pub const TlsError = error{
     CrlLoadFailed,
     OcspLoadFailed,
     HandshakeFailed,
+    NoApplicationProtocol,
     TlsReadFailed,
     TlsWriteFailed,
 };
@@ -71,7 +73,9 @@ pub const TlsOptions = struct {
     acme_account_key_path: []const u8 = "",
     acme_renew_days_before_expiry: u32 = 30,
     acme_challenge_store: ?*@import("acme_challenge_store.zig").ChallengeStore = null,
+    http1_enabled: bool = true,
     http2_enabled: bool = true,
+    http1_alpn_fallback_enabled: bool = false,
 };
 
 pub const NegotiatedProtocol = enum {
@@ -101,9 +105,24 @@ pub const TlsTerminator = struct {
         _ = now_ms;
     }
 
+    pub fn protocolPolicySnapshot(self: *TlsTerminator) negotiated_dispatch.ListenerProtocolPolicy {
+        _ = self;
+        return .{};
+    }
+
+    pub fn updateProtocolPolicy(self: *TlsTerminator, policy: negotiated_dispatch.ListenerProtocolPolicy) TlsError!void {
+        _ = self;
+        if (!policy.http1_enabled and !policy.http2_enabled) return error.ProtocolConfigFailed;
+    }
+
     pub fn accept(self: *TlsTerminator, fd: std.posix.fd_t) TlsError!TlsConnection {
+        return self.acceptWithPolicy(fd, .{});
+    }
+
+    pub fn acceptWithPolicy(self: *TlsTerminator, fd: std.posix.fd_t, policy: negotiated_dispatch.ListenerProtocolPolicy) TlsError!TlsConnection {
         _ = self;
         _ = fd;
+        if (!policy.http1_enabled and !policy.http2_enabled) return error.ProtocolConfigFailed;
         return error.HandshakeFailed;
     }
 };
@@ -157,9 +176,18 @@ pub const TlsConnection = struct {
         return .{ .ptr = self, .vtable = &stub_stream_vtable };
     }
 
-    pub fn negotiatedProtocol(self: *const TlsConnection) NegotiatedProtocol {
+    pub fn negotiatedAlpn(self: *const TlsConnection) ?[]const u8 {
         _ = self;
-        return .http1_1;
+        return null;
+    }
+
+    pub fn negotiatedProtocol(self: *const TlsConnection) negotiated_dispatch.Error!NegotiatedProtocol {
+        return self.validatedNegotiatedProtocol();
+    }
+
+    pub fn validatedNegotiatedProtocol(self: *const TlsConnection) negotiated_dispatch.Error!NegotiatedProtocol {
+        _ = self;
+        return error.NoApplicationProtocol;
     }
 };
 
@@ -185,6 +213,10 @@ fn stubStreamDrive(ptr: *anyopaque) encrypted_stream.Error!encrypted_stream.Driv
     return .{ .made_progress = false, .readiness = stubStreamReadiness(ptr) };
 }
 
+fn stubStreamBufferSnapshot(_: *anyopaque) encrypted_stream.BufferSnapshot {
+    return .{};
+}
+
 const stub_stream_vtable = encrypted_stream.EncryptedStream.VTable{
     .backendFn = stubStreamBackend,
     .readFn = stubStreamRead,
@@ -192,6 +224,7 @@ const stub_stream_vtable = encrypted_stream.EncryptedStream.VTable{
     .closeFn = stubStreamClose,
     .readinessFn = stubStreamReadiness,
     .driveFn = stubStreamDrive,
+    .bufferSnapshotFn = stubStreamBufferSnapshot,
 };
 
 /// In the OpenSSL adapter this drains the error queue; here it reports why
@@ -206,11 +239,22 @@ pub const UpstreamTlsOptions = struct {
     sni_override: []const u8 = "",
     client_cert_path: []const u8 = "",
     client_key_path: []const u8 = "",
-    offer_h2: bool = false,
+    alpn_policy: UpstreamAlpnPolicy = .require_http1,
+};
+
+pub const UpstreamAlpnPolicy = enum {
+    require_http1,
+    require_h2,
+    prefer_h2_allow_http1,
+
+    pub fn offersH2(self: UpstreamAlpnPolicy) bool {
+        return self != .require_http1;
+    }
 };
 
 pub const UpstreamTlsConn = struct {
     fd: std.posix.fd_t = -1,
+    protocol: NegotiatedProtocol = .http1_1,
 
     pub fn connect(
         fd: std.posix.fd_t,
@@ -251,8 +295,7 @@ pub const UpstreamTlsConn = struct {
     }
 
     pub fn negotiatedProtocol(self: *const UpstreamTlsConn) NegotiatedProtocol {
-        _ = self;
-        return .http1_1;
+        return self.protocol;
     }
 };
 

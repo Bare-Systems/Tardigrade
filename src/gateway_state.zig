@@ -2614,10 +2614,15 @@ pub const WorkerContext = struct {
     config_store: *ReloadableConfigStore,
     state: *GatewayState,
     tls: ?*http.tls_termination.TlsTerminator,
+    native_credentials: ?*http.native_tls_connection.NativeCredentialStore,
     session_pool: *ConnectionSessionPool,
     /// Event loop used to (un)watch idle keepalive connections (#138). A worker
     /// re-arms a parked fd here; the loop thread dispatches it back on readiness.
     event_loop: *http.event_loop.EventLoop,
+    /// Active nonblocking downstream connections keyed by fd. Native TLS and
+    /// resumable HTTP phases park here while waiting for carrier or protocol
+    /// readiness; idle HTTP/1.1 keepalive still uses `parked`.
+    active: *http.downstream_connection.ActiveRegistry,
     /// Registry of idle keepalive connections parked off the worker pool (#138).
     parked: *http.keepalive_park.ParkedRegistry,
 
@@ -2630,6 +2635,7 @@ pub const ManagedConfigVersion = struct {
     cfg: *const edge_config.EdgeConfig,
     owned_cfg: ?*edge_config.EdgeConfig,
     ref_count: usize,
+    generation: u64,
 };
 
 pub const ConfigLease = struct {
@@ -2648,6 +2654,7 @@ pub const ReloadableConfigStore = struct {
     mutex: compat.Mutex = .{},
     current: *ManagedConfigVersion,
     retired: std.ArrayList(*ManagedConfigVersion),
+    next_generation: u64 = 1,
 
     pub fn initBorrowed(allocator: std.mem.Allocator, cfg: *const edge_config.EdgeConfig) !ReloadableConfigStore {
         return .{
@@ -2686,6 +2693,8 @@ pub const ReloadableConfigStore = struct {
             self.destroyVersion(version);
             return err;
         };
+        self.next_generation += 1;
+        version.generation = self.next_generation;
         return version;
     }
 
@@ -2694,6 +2703,10 @@ pub const ReloadableConfigStore = struct {
         defer self.mutex.unlock();
 
         const old_version = self.current;
+        if (new_version.generation <= old_version.generation) {
+            new_version.generation = old_version.generation + 1;
+        }
+        self.next_generation = @max(self.next_generation, new_version.generation);
         self.current = new_version;
         self.retired.appendAssumeCapacity(old_version);
         std.debug.assert(old_version.ref_count > 0);
@@ -2737,6 +2750,7 @@ pub const ReloadableConfigStore = struct {
             .cfg = cfg,
             .owned_cfg = null,
             .ref_count = 1,
+            .generation = 1,
         };
         return version;
     }
@@ -2747,6 +2761,7 @@ pub const ReloadableConfigStore = struct {
             .cfg = cfg_ptr,
             .owned_cfg = cfg_ptr,
             .ref_count = 1,
+            .generation = 0,
         };
         return version;
     }
@@ -3098,6 +3113,7 @@ test "reloadable config store retires old config after last lease" {
     const new_version = try ReloadableConfigStore.createBorrowedVersion(std.testing.allocator, &second_cfg);
     store.installPrepared(new_version);
 
+    try std.testing.expectEqual(@as(u64, 2), store.current.generation);
     try std.testing.expectEqual(@as(usize, 1), store.retired.items.len);
     lease.release();
     try std.testing.expectEqual(@as(usize, 0), store.retired.items.len);

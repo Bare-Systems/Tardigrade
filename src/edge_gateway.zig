@@ -3,6 +3,7 @@ const std = @import("std");
 const http = @import("http.zig");
 const edge_config = @import("edge_config.zig");
 const runtime_allocator = @import("runtime_allocator.zig");
+const build_options = @import("build_options");
 
 const STREAM_RELAY_BUFFER_SIZE: usize = 16 * 1024;
 const JSON_CONTENT_TYPE = "application/json";
@@ -18,6 +19,7 @@ const gconn = @import("gateway_connection.zig");
 const gshutdown = @import("gateway_shutdown.zig");
 const ghandlers = @import("gateway_handlers.zig");
 const gproxy_runtime = @import("gateway_proxy_runtime.zig");
+const gprotocol_policy = @import("gateway_protocol_policy.zig");
 const gp = @import("gateway_proxy.zig");
 const ga = @import("gateway_auth.zig");
 
@@ -219,6 +221,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     defer config_store.deinit();
     var http3_runtime: ?http.http3_runtime.Runtime = null;
     var tls_terminator: ?http.tls_termination.TlsTerminator = null;
+    var native_credentials: ?http.native_tls_connection.NativeCredentialStore = null;
     var http3_dispatch_ctx = ghandlers.Http3DispatchContext{
         .config_store = &config_store,
         .cfg = cfg,
@@ -230,41 +233,54 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         for (cfg.tls_sni_certs, 0..) |sc, i| {
             sni_specs[i] = .{ .server_name = sc.server_name, .cert_path = sc.cert_path, .key_path = sc.key_path };
         }
-        tls_terminator = try http.tls_termination.TlsTerminator.init(state_allocator, .{
-            .cert_path = cfg.tls_cert_path,
-            .key_path = cfg.tls_key_path,
-            .min_version = cfg.tls_min_version,
-            .max_version = cfg.tls_max_version,
-            .cipher_list = cfg.tls_cipher_list,
-            .cipher_suites = cfg.tls_cipher_suites,
-            .sni_certs = sni_specs,
-            .session_cache_enabled = cfg.tls_session_cache_enabled,
-            .session_cache_size = cfg.tls_session_cache_size,
-            .session_timeout_seconds = cfg.tls_session_timeout_seconds,
-            .session_tickets_enabled = cfg.tls_session_tickets_enabled,
-            .ocsp_stapling_enabled = cfg.tls_ocsp_stapling_enabled,
-            .ocsp_response_path = cfg.tls_ocsp_response_path,
-            .ocsp_auto_refresh_enabled = cfg.tls_ocsp_auto_refresh,
-            .ocsp_refresh_interval_ms = cfg.tls_ocsp_refresh_interval_ms,
-            .ocsp_refresh_timeout_ms = cfg.tls_ocsp_refresh_timeout_ms,
-            .client_ca_path = cfg.tls_client_ca_path,
-            .client_verify = cfg.tls_client_verify,
-            .client_verify_depth = cfg.tls_client_verify_depth,
-            .crl_path = cfg.tls_crl_path,
-            .crl_check = cfg.tls_crl_check,
-            .dynamic_reload_interval_ms = cfg.tls_dynamic_reload_interval_ms,
-            .acme_enabled = cfg.tls_acme_enabled,
-            .acme_cert_dir = cfg.tls_acme_cert_dir,
-            .acme_auto_issue = cfg.tls_acme_enabled and cfg.tls_acme_domains.len > 0,
-            .acme_directory_url = cfg.tls_acme_directory_url,
-            .acme_domains = cfg.tls_acme_domains,
-            .acme_email = cfg.tls_acme_email,
-            .acme_account_key_path = cfg.tls_acme_account_key_path,
-            .acme_renew_days_before_expiry = cfg.tls_acme_renew_days_before_expiry,
-            .acme_challenge_store = if (state.acme_challenge_store) |*s| s else null,
-            .http2_enabled = cfg.http2_enabled,
-        });
+        if (!build_options.tls_openssl_adapter) {
+            var native_sni_specs = try state_allocator.alloc(http.native_tls_connection.SniCertSpec, cfg.tls_sni_certs.len);
+            defer state_allocator.free(native_sni_specs);
+            for (cfg.tls_sni_certs, 0..) |sc, i| {
+                native_sni_specs[i] = .{ .server_name = sc.server_name, .cert_path = sc.cert_path, .key_path = sc.key_path };
+            }
+            native_credentials = http.native_tls_connection.NativeCredentialStore.init(state_allocator);
+            try native_credentials.?.reloadFromFiles(cfg.tls_cert_path, cfg.tls_key_path, native_sni_specs);
+        } else {
+            tls_terminator = try http.tls_termination.TlsTerminator.init(state_allocator, .{
+                .cert_path = cfg.tls_cert_path,
+                .key_path = cfg.tls_key_path,
+                .min_version = cfg.tls_min_version,
+                .max_version = cfg.tls_max_version,
+                .cipher_list = cfg.tls_cipher_list,
+                .cipher_suites = cfg.tls_cipher_suites,
+                .sni_certs = sni_specs,
+                .session_cache_enabled = cfg.tls_session_cache_enabled,
+                .session_cache_size = cfg.tls_session_cache_size,
+                .session_timeout_seconds = cfg.tls_session_timeout_seconds,
+                .session_tickets_enabled = cfg.tls_session_tickets_enabled,
+                .ocsp_stapling_enabled = cfg.tls_ocsp_stapling_enabled,
+                .ocsp_response_path = cfg.tls_ocsp_response_path,
+                .ocsp_auto_refresh_enabled = cfg.tls_ocsp_auto_refresh,
+                .ocsp_refresh_interval_ms = cfg.tls_ocsp_refresh_interval_ms,
+                .ocsp_refresh_timeout_ms = cfg.tls_ocsp_refresh_timeout_ms,
+                .client_ca_path = cfg.tls_client_ca_path,
+                .client_verify = cfg.tls_client_verify,
+                .client_verify_depth = cfg.tls_client_verify_depth,
+                .crl_path = cfg.tls_crl_path,
+                .crl_check = cfg.tls_crl_check,
+                .dynamic_reload_interval_ms = cfg.tls_dynamic_reload_interval_ms,
+                .acme_enabled = cfg.tls_acme_enabled,
+                .acme_cert_dir = cfg.tls_acme_cert_dir,
+                .acme_auto_issue = cfg.tls_acme_enabled and cfg.tls_acme_domains.len > 0,
+                .acme_directory_url = cfg.tls_acme_directory_url,
+                .acme_domains = cfg.tls_acme_domains,
+                .acme_email = cfg.tls_acme_email,
+                .acme_account_key_path = cfg.tls_acme_account_key_path,
+                .acme_renew_days_before_expiry = cfg.tls_acme_renew_days_before_expiry,
+                .acme_challenge_store = if (state.acme_challenge_store) |*s| s else null,
+                .http1_enabled = cfg.http1_enabled,
+                .http2_enabled = cfg.http2_enabled,
+                .http1_alpn_fallback_enabled = cfg.tls_http1_no_alpn_fallback,
+            });
+        }
     }
+    defer if (native_credentials) |*store| store.deinit();
     defer if (tls_terminator) |*tls| tls.deinit();
     if (cfg.http3_enabled) {
         if (!edge_config.hasTlsFiles(cfg)) {
@@ -310,13 +326,19 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         .config_store = &config_store,
         .state = &state,
         .tls = if (tls_terminator) |*tls| tls else null,
+        .native_credentials = if (native_credentials) |*store| store else null,
         .session_pool = undefined,
         .event_loop = &event_loop,
+        .active = undefined,
         .parked = undefined,
     };
     var session_pool = ConnectionSessionPool.init(state_allocator, &state.request_buffer_pool, cfg.connection_pool_size);
     defer session_pool.deinit();
     worker_ctx.session_pool = &session_pool;
+
+    var active = http.downstream_connection.ActiveRegistry.init(state_allocator);
+    defer active.deinit();
+    worker_ctx.active = &active;
 
     // Registry of idle keepalive connections parked off the worker pool (#138).
     // Its close hook releases the connection slot held since accept, so parked
@@ -569,6 +591,17 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         var i: usize = 0;
         while (i < event_count) : (i += 1) {
             const ev = ready_events[i];
+            if (active.contains(ev.fd)) {
+                event_loop.remove(ev.fd) catch {};
+                worker_pool.submit(ev.fd) catch |err| {
+                    state.logger.warn(null, "active connection worker submit failed: {}", .{err});
+                    if (active.checkout(ev.fd)) |taken| {
+                        var conn = taken;
+                        conn.deinit();
+                    }
+                };
+                continue;
+            }
             if (!ev.readable) continue;
             if (ev.fd == listen_fd) {
                 gaccept.acceptReadyConnections(listen_fd, &worker_pool, &state);
@@ -611,6 +644,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
             // Close keepalive connections idle longer than the keepalive timeout
             // while parked off the worker pool (#138).
             _ = parked.reapIdle(http.event_loop.monotonicMs(), current_cfg.keep_alive_timeout_ms);
+            reapActiveConnections(&active, &state, &event_loop);
             // Evict idle upstream keep-alive connections past their idle/lifetime
             // caps (#141).
             state.upstream_pool.reapIdle(http.event_loop.monotonicMs());
@@ -694,6 +728,12 @@ fn workerQueueWaitCallback(raw_ctx: *anyopaque, wait_ns: i64) void {
 fn handleAcceptedClient(raw_ctx: *anyopaque, client_fd: std.posix.fd_t) void {
     const ctx: *WorkerContext = @ptrCast(@alignCast(raw_ctx));
 
+    if (ctx.active.checkout(client_fd)) |taken| {
+        var conn = taken;
+        advanceActiveConnection(ctx, &conn);
+        return;
+    }
+
     // Resume path (#138): the event loop dispatched a parked keepalive
     // connection that became readable. Its session, TLS state, and connection
     // slot are already established and owned by the parked registry.
@@ -715,8 +755,15 @@ const ServeOutcome = enum {
     close,
 };
 
-fn isTlsConnPtr(comptime T: type) bool {
-    return T == *http.tls_termination.TlsConnection;
+fn hasBufferedHttp1Work(conn: anytype, session: *const ConnectionSession) bool {
+    if (session.pending_len > 0) return true;
+    const T = @TypeOf(conn);
+    if (comptime std.meta.activeTag(@typeInfo(T)) == .pointer) {
+        const Child = std.meta.Child(T);
+        if (comptime @hasDecl(Child, "pending")) return conn.pending() > 0;
+        if (comptime @hasDecl(Child, "pendingPlaintext")) return conn.pendingPlaintext() > 0;
+    }
+    return false;
 }
 
 /// Errors that just mean the peer closed/reset the connection. Common at the
@@ -748,11 +795,30 @@ fn serveOneRequest(
     served: *u32,
     enable_proxy_protocol: bool,
 ) ServeOutcome {
-    var keep_alive = false;
     var live_cfg_lease = ctx.acquireConfig();
+    defer live_cfg_lease.release();
     const live_cfg = live_cfg_lease.cfg;
-    handleConnection(conn, session, live_cfg, ctx.state, &keep_alive, connection_ip, enable_proxy_protocol) catch |err| {
-        live_cfg_lease.release();
+    return serveOneRequestWithConfig(ctx, conn, session, live_cfg, connection_ip, served, enable_proxy_protocol);
+}
+
+fn serveOneRequestWithConfig(
+    ctx: *WorkerContext,
+    conn: anytype,
+    session: *ConnectionSession,
+    cfg: *const edge_config.EdgeConfig,
+    connection_ip: []const u8,
+    served: *u32,
+    enable_proxy_protocol: bool,
+) ServeOutcome {
+    const header_timeout_ms = cfg.request_limits.effectiveHeaderTimeout();
+    const write_timeout_ms = if (cfg.downstream_write_timeout_ms > 0)
+        cfg.downstream_write_timeout_ms
+    else
+        header_timeout_ms;
+    setConnTimeouts(conn, header_timeout_ms, write_timeout_ms);
+
+    var keep_alive = false;
+    handleConnection(conn, session, cfg, ctx.state, &keep_alive, connection_ip, enable_proxy_protocol) catch |err| {
         if (isBenignDisconnect(err)) {
             ctx.state.logger.debug(null, "keepalive connection closed by peer: {}", .{err});
         } else {
@@ -761,19 +827,11 @@ fn serveOneRequest(
         return .close;
     };
     served.* += 1;
-    const max_requests_per_connection = live_cfg.max_requests_per_connection;
-    live_cfg_lease.release();
+    const max_requests_per_connection = cfg.max_requests_per_connection;
 
     if (!keep_alive or http.shutdown.isShutdownRequested()) return .close;
     if (max_requests_per_connection > 0 and served.* >= max_requests_per_connection) return .close;
-
-    // TLS may have already-decrypted pipelined bytes buffered inside OpenSSL; a
-    // socket-readiness event never fires for those, so serve them now. Plaintext
-    // pipelined bytes sit in the socket buffer and the level-triggered event loop
-    // re-fires immediately after parking, so no special case is needed there.
-    if (comptime isTlsConnPtr(@TypeOf(conn))) {
-        if (conn.pending() > 0) return .serve_again;
-    }
+    if (hasBufferedHttp1Work(conn, session)) return .serve_again;
     return .park;
 }
 
@@ -793,16 +851,16 @@ fn startNewConnection(ctx: *WorkerContext, client_fd: std.posix.fd_t) void {
     defer if (!transferred) closeNewConnection(ctx, client_fd, session, tls_to_park);
 
     const owned_connection_ip = gconn.clientIpFromFd(ctx.state.allocator, client_fd) catch null;
-    defer if (owned_connection_ip) |ip| ctx.state.allocator.free(ip);
+    var transferred_ip = false;
+    defer if (!transferred_ip) {
+        if (owned_connection_ip) |ip| ctx.state.allocator.free(ip);
+    };
     const connection_ip = owned_connection_ip orelse "unknown";
 
     var cfg_lease = ctx.acquireConfig();
-    defer cfg_lease.release();
+    var cfg_lease_transferred = false;
+    defer if (!cfg_lease_transferred) cfg_lease.release();
     const cfg = cfg_lease.cfg;
-    gconn.setNonBlocking(client_fd, false) catch |err| {
-        ctx.state.logger.warn(null, "failed to switch client fd to blocking mode: {}", .{err});
-        return;
-    };
 
     gconn.setNoDelay(client_fd) catch |err| {
         ctx.state.logger.warn(null, "failed to set TCP_NODELAY on client fd: {}", .{err});
@@ -810,17 +868,22 @@ fn startNewConnection(ctx: *WorkerContext, client_fd: std.posix.fd_t) void {
 
     // Effective per-phase timeouts used throughout this connection's lifetime.
     const header_timeout_ms = cfg.request_limits.effectiveHeaderTimeout();
+    const body_timeout_ms = cfg.request_limits.effectiveBodyTimeout();
     const write_timeout_ms = if (cfg.downstream_write_timeout_ms > 0) cfg.downstream_write_timeout_ms else header_timeout_ms;
+    const handshake_timeout_ms = if (cfg.tls_handshake_timeout_ms > 0)
+        cfg.tls_handshake_timeout_ms
+    else
+        cfg.keep_alive_timeout_ms;
 
     if (ctx.tls) |tls| {
+        gconn.setNonBlocking(client_fd, false) catch |err| {
+            ctx.state.logger.warn(null, "failed to switch client fd to blocking mode: {}", .{err});
+            return;
+        };
         // Apply the TLS handshake timeout before PROXY protocol parsing and
         // SSL_accept. Falls back to keep_alive_timeout_ms when not explicitly
         // configured so the old behavior is preserved for operators that haven't
         // set the new field.
-        const handshake_timeout_ms = if (cfg.tls_handshake_timeout_ms > 0)
-            cfg.tls_handshake_timeout_ms
-        else
-            cfg.keep_alive_timeout_ms;
         if (handshake_timeout_ms > 0) {
             gconn.setSocketTimeoutMs(client_fd, handshake_timeout_ms, handshake_timeout_ms) catch |err| {
                 ctx.state.logger.warn(null, "failed to set client handshake timeout: {}", .{err});
@@ -842,7 +905,8 @@ fn startNewConnection(ctx: *WorkerContext, client_fd: std.posix.fd_t) void {
             };
             session.proxy_protocol_checked = true;
         }
-        var tls_conn = tls.accept(client_fd) catch |err| {
+        const tls_protocol_policy = gprotocol_policy.listenerPolicyFromConfig(cfg);
+        var tls_conn = tls.acceptWithPolicy(client_fd, tls_protocol_policy) catch |err| {
             if (http.tls_termination.lastOpenSslError(ctx.state.allocator)) |openssl_err| {
                 defer ctx.state.allocator.free(openssl_err);
                 ctx.state.logger.warn(null, "tls handshake error: {} ({s})", .{ err, openssl_err });
@@ -863,26 +927,90 @@ fn startNewConnection(ctx: *WorkerContext, client_fd: std.posix.fd_t) void {
             };
         }
 
-        if (tls_conn.negotiatedProtocol() == .http2 and cfg.http2_enabled) {
-            // HTTP/2 multiplexes many streams over one connection internally and
-            // is not parked (out of scope for #138); the teardown defer closes it.
-            handleHttp2Connection(&tls_conn, session, cfg, ctx.state, connection_ip) catch |err| {
-                ctx.state.logger.err(null, "http2 connection error: {}", .{err});
-            };
+        var served: u32 = 0;
+        const negotiated = tls_conn.validatedNegotiatedProtocol() catch |err| {
+            ctx.state.logger.err(null, "negotiated HTTP protocol error: {}", .{err});
+            return;
+        };
+        const dispatch_result = dispatchNegotiatedHttp(ctx, &tls_conn, negotiated, session, cfg, connection_ip, &served) catch |err| {
+            ctx.state.logger.err(null, "negotiated HTTP dispatch error: {}", .{err});
+            return;
+        };
+        if (dispatch_result == .park) {
+            transferred = true;
+            parkConnection(ctx, client_fd, session, tls_conn, served, connection_ip);
+        }
+        return;
+    } else if (ctx.native_credentials) |native_store| {
+        if (cfg.proxy_protocol_mode != .off) {
+            ctx.state.logger.warn(null, "native TLS path does not support PROXY protocol preface parsing yet", .{});
             return;
         }
-
-        var served: u32 = 0;
-        while (true) switch (serveOneRequest(ctx, &tls_conn, session, connection_ip, &served, false)) {
-            .serve_again => {},
-            .park => {
-                transferred = true;
-                parkConnection(ctx, client_fd, session, tls_conn, served, connection_ip);
-                return;
-            },
-            .close => return,
+        if (cfg.tls_client_verify) {
+            ctx.state.logger.warn(null, "native TLS path does not support downstream client certificate verification yet", .{});
+            return;
+        }
+        const tls_protocol_policy = gprotocol_policy.listenerPolicyFromConfig(cfg);
+        const native = http.native_tls_connection.NativeTlsConnection.create(
+            ctx.state.allocator,
+            client_fd,
+            tls_protocol_policy,
+            native_store.provider(),
+        ) catch |err| {
+            ctx.state.logger.warn(null, "native tls connection setup failed: {}", .{err});
+            return;
         };
+        var managed = http.downstream_connection.ManagedConnection.init(
+            .{ .native = native },
+            .{ .native_handshake = .{
+                .deadline_ms = deadlineFromNow(http.event_loop.monotonicMs(), handshake_timeout_ms),
+            } },
+        );
+        managed.lifecycle = .{
+            .session = session,
+            .release_session_ctx = ctx,
+            .release_session_fn = activeReleaseSession,
+            .config = cfg,
+            .release_config_ctx = ctx.config_store,
+            .release_config_version = cfg_lease.version,
+            .release_config_fn = activeReleaseConfig,
+            .close_ctx = ctx.state,
+            .close_fn = activeConnectionCloseHook,
+            .owned_ip = if (owned_connection_ip) |ip| @constCast(ip) else null,
+            .allocator = ctx.state.allocator,
+            .config_generation = cfg_lease.version.generation,
+            .handshake_timeout_ms = handshake_timeout_ms,
+            .header_timeout_ms = header_timeout_ms,
+            .body_timeout_ms = body_timeout_ms,
+            .write_timeout_ms = write_timeout_ms,
+            .idle_timeout_ms = cfg.keep_alive_timeout_ms,
+        };
+        cfg_lease_transferred = true;
+        transferred = true;
+        if (owned_connection_ip != null) transferred_ip = true;
+        const interest = managed.interest;
+        ctx.active.insert(&managed) catch |err| {
+            ctx.state.logger.warn(null, "native tls active registry insert failed: {}", .{err});
+            managed.deinit();
+            return;
+        };
+        ctx.event_loop.add(client_fd, interest) catch |err| {
+            ctx.state.logger.warn(null, "native tls event registration failed: {}", .{err});
+            if (ctx.active.checkout(client_fd)) |taken| {
+                var conn = taken;
+                conn.deinit();
+            }
+        };
+        return;
     } else {
+        gconn.setNonBlocking(client_fd, false) catch |err| {
+            ctx.state.logger.warn(null, "failed to switch client fd to blocking mode: {}", .{err});
+            return;
+        };
+        if (!cfg.http1_enabled) {
+            ctx.state.logger.err(null, "plaintext HTTP/1.1 parser disabled and h2c is not supported", .{});
+            return;
+        }
         // Plaintext path: apply read and write timeouts immediately (no separate
         // handshake phase).
         if (header_timeout_ms > 0 or write_timeout_ms > 0) {
@@ -936,6 +1064,43 @@ fn resumeParkedConnection(ctx: *WorkerContext, pc: *http.keepalive_park.ParkedCo
     }
 }
 
+fn dispatchNegotiatedHttp(
+    ctx: *WorkerContext,
+    conn: anytype,
+    negotiated: http.tls_termination.NegotiatedProtocol,
+    session: *ConnectionSession,
+    cfg: *const edge_config.EdgeConfig,
+    connection_ip: []const u8,
+    served: *u32,
+) !ServeOutcome {
+    var runtime = GatewayHttpRuntime{
+        .ctx = ctx,
+        .session = session,
+        .cfg = cfg,
+        .connection_ip = connection_ip,
+        .served = served,
+    };
+    return http.negotiated_dispatch.dispatchToRuntime(&runtime, conn, negotiated, GatewayHttpRuntime);
+}
+
+const GatewayHttpRuntime = struct {
+    pub const Outcome = ServeOutcome;
+
+    ctx: *WorkerContext,
+    session: *ConnectionSession,
+    cfg: *const edge_config.EdgeConfig,
+    connection_ip: []const u8,
+    served: *u32,
+
+    pub fn serveHttp1(self: *@This(), conn: anytype) !Outcome {
+        return serveOneRequest(self.ctx, conn, self.session, self.connection_ip, self.served, false);
+    }
+
+    pub fn handleHttp2(self: *@This(), conn: anytype) !void {
+        try handleHttp2Connection(conn, self.session, self.cfg, self.ctx.state, self.connection_ip);
+    }
+};
+
 /// Tear down a connection that was never parked: TLS shutdown, socket close,
 /// pooled-session release, and connection-slot release. Mirrors the registry's
 /// teardown so a connection is accounted identically whichever path closes it.
@@ -965,12 +1130,12 @@ fn parkConnection(
     connection_ip: []const u8,
 ) void {
     const now = http.event_loop.monotonicMs();
-    ctx.parked.parkNew(fd, session, tls_conn, served, connection_ip, now) catch {
+    const pc = ctx.parked.parkNew(fd, session, tls_conn, served, connection_ip, now) catch {
         closeNewConnection(ctx, fd, session, tls_conn);
         return;
     };
-    ctx.event_loop.addReadFd(fd) catch {
-        if (ctx.parked.checkout(fd)) |pc| ctx.parked.closeSlot(pc, .@"error");
+    ctx.event_loop.add(fd, pc.eventInterest()) catch {
+        if (ctx.parked.checkout(fd)) |taken| ctx.parked.closeSlot(taken, .@"error");
     };
 }
 
@@ -982,9 +1147,365 @@ fn reparkConnection(ctx: *WorkerContext, pc: *http.keepalive_park.ParkedConnecti
         ctx.parked.closeSlot(pc, .@"error");
         return;
     };
-    ctx.event_loop.addReadFd(pc.fd) catch {
+    ctx.event_loop.add(pc.fd, pc.eventInterest()) catch {
         if (ctx.parked.checkout(pc.fd)) |taken| ctx.parked.closeSlot(taken, .@"error");
     };
+}
+
+fn activeReleaseSession(raw_ctx: *anyopaque, raw_session: *anyopaque) void {
+    const ctx: *WorkerContext = @ptrCast(@alignCast(raw_ctx));
+    const session: *ConnectionSession = @ptrCast(@alignCast(raw_session));
+    ctx.session_pool.release(session);
+}
+
+fn activeReleaseConfig(raw_store: *anyopaque, raw_version: *anyopaque) void {
+    const store: *ReloadableConfigStore = @ptrCast(@alignCast(raw_store));
+    const version: *gs.ManagedConfigVersion = @ptrCast(@alignCast(raw_version));
+    store.release(version);
+}
+
+fn activeConnectionCloseHook(raw_state: *anyopaque, fd: std.posix.fd_t) void {
+    const state: *GatewayState = @ptrCast(@alignCast(raw_state));
+    state.releaseConnectionSlot(fd);
+}
+
+fn deadlineFromNow(now_ms: u64, timeout_ms: u32) u64 {
+    return if (timeout_ms == 0) 0 else now_ms + @as(u64, timeout_ms);
+}
+
+fn reapActiveConnections(
+    active: *http.downstream_connection.ActiveRegistry,
+    state: *GatewayState,
+    event_loop: *http.event_loop.EventLoop,
+) void {
+    var expired: [32]http.downstream_connection.ManagedConnection = undefined;
+    while (true) {
+        const count = active.reapExpired(http.event_loop.monotonicMs(), expired[0..]);
+        if (count == 0) break;
+        for (expired[0..count]) |taken| {
+            var conn = taken;
+            event_loop.remove(conn.fd) catch {};
+            state.logger.debug(null, "active native downstream connection deadline expired fd={d}", .{conn.fd});
+            conn.deinit();
+        }
+        if (count < expired.len) break;
+    }
+}
+
+fn rearmActiveConnection(ctx: *WorkerContext, managed: *http.downstream_connection.ManagedConnection, requested: http.event_loop.Interest) void {
+    const fd = managed.fd;
+    const interest = managed.updateInterestFor(requested);
+    _ = ctx.active.rearm(managed) catch |err| {
+        ctx.state.logger.warn(null, "active connection rearm failed: {}", .{err});
+        managed.deinit();
+        return;
+    };
+    ctx.event_loop.add(fd, interest) catch |err| {
+        ctx.state.logger.warn(null, "active connection event registration failed: {}", .{err});
+        if (ctx.active.checkout(fd)) |taken| {
+            var conn = taken;
+            conn.deinit();
+        }
+    };
+}
+
+fn advanceActiveConnection(ctx: *WorkerContext, managed: *http.downstream_connection.ManagedConnection) void {
+    switch (managed.phase) {
+        .native_handshake => advanceNativeHandshake(ctx, managed),
+        .native_http1 => advanceNativeHttp1(ctx, managed),
+        .native_http2 => advanceNativeHttp2(ctx, managed),
+        .http1 => advanceNativeHttp1(ctx, managed),
+        .http2 => advanceNativeHttp2(ctx, managed),
+        .idle_http1 => managed.deinit(),
+    }
+}
+
+fn advanceNativeHandshake(ctx: *WorkerContext, managed: *http.downstream_connection.ManagedConnection) void {
+    const native = switch (managed.transport) {
+        .native => |conn| conn,
+        else => {
+            managed.deinit();
+            return;
+        },
+    };
+
+    while (!native.record.applicationDataOpen()) {
+        const driven = native.drive() catch |err| {
+            ctx.state.logger.warn(null, "native tls handshake failed: {}", .{err});
+            managed.deinit();
+            return;
+        };
+        if (native.record.applicationDataOpen()) break;
+        if (!driven.made_progress) {
+            managed.phase.native_handshake.deadline_ms = deadlineFromNow(
+                http.event_loop.monotonicMs(),
+                managed.lifecycle.handshake_timeout_ms,
+            );
+            rearmActiveConnection(ctx, managed, .{ .read = true });
+            return;
+        }
+    }
+
+    const negotiated = native.validatedNegotiatedProtocol() catch |err| {
+        ctx.state.logger.warn(null, "native tls negotiated protocol rejected: {}", .{err});
+        managed.deinit();
+        return;
+    };
+
+    switch (negotiated) {
+        .http1_1 => {
+            managed.phase = .{ .native_http1 = .{} };
+            if (managed.transport.pendingPlaintext() > 0) {
+                advanceActiveConnection(ctx, managed);
+            } else {
+                managed.phase.native_http1.idle_deadline_ms = deadlineFromNow(
+                    http.event_loop.monotonicMs(),
+                    managed.lifecycle.header_timeout_ms,
+                );
+                rearmActiveConnection(ctx, managed, .{ .read = true });
+            }
+        },
+        .http2 => {
+            managed.phase = .{ .native_http2 = .{} };
+            if (managed.transport.pendingPlaintext() > 0) {
+                advanceActiveConnection(ctx, managed);
+            } else {
+                managed.phase.native_http2.idle_or_io_deadline_ms = deadlineFromNow(
+                    http.event_loop.monotonicMs(),
+                    managed.lifecycle.header_timeout_ms,
+                );
+                rearmActiveConnection(ctx, managed, .{ .read = true });
+            }
+        },
+    }
+}
+
+fn activeSession(managed: *http.downstream_connection.ManagedConnection) ?*ConnectionSession {
+    const raw = managed.lifecycle.session orelse return null;
+    return @ptrCast(@alignCast(raw));
+}
+
+fn activeConfig(managed: *http.downstream_connection.ManagedConnection) ?*const edge_config.EdgeConfig {
+    const raw = managed.lifecycle.config orelse return null;
+    return @ptrCast(@alignCast(raw));
+}
+
+const WaitingEncryptedHttpConnection = struct {
+    inner: http.encrypted_stream_connection.EncryptedStreamHttpConnection,
+    read_timeout_ms: u32,
+    write_timeout_ms: u32,
+
+    fn init(
+        inner: http.encrypted_stream_connection.EncryptedStreamHttpConnection,
+        read_timeout_ms: u32,
+        write_timeout_ms: u32,
+    ) WaitingEncryptedHttpConnection {
+        return .{
+            .inner = inner,
+            .read_timeout_ms = read_timeout_ms,
+            .write_timeout_ms = write_timeout_ms,
+        };
+    }
+
+    pub fn read(self: *WaitingEncryptedHttpConnection, out: []u8) !usize {
+        while (true) {
+            return self.inner.read(out) catch |err| switch (err) {
+                error.WouldBlock => {
+                    try self.waitFor(.{ .read = true }, self.read_timeout_ms);
+                    continue;
+                },
+                else => err,
+            };
+        }
+    }
+
+    pub fn write(self: *WaitingEncryptedHttpConnection, bytes: []const u8) !usize {
+        while (true) {
+            const n = self.inner.write(bytes) catch |err| switch (err) {
+                error.WouldBlock => {
+                    try self.waitFor(.{ .write = true }, self.write_timeout_ms);
+                    continue;
+                },
+                else => err,
+            };
+            try self.flush();
+            return n;
+        }
+    }
+
+    pub fn flush(self: *WaitingEncryptedHttpConnection) !void {
+        while (self.inner.readiness().wants_write) {
+            self.inner.flush() catch |err| switch (err) {
+                error.WouldBlock => {
+                    try self.waitFor(.{ .write = true }, self.write_timeout_ms);
+                    continue;
+                },
+                else => return err,
+            };
+        }
+    }
+
+    pub fn pending(self: *const WaitingEncryptedHttpConnection) usize {
+        return self.inner.pending();
+    }
+
+    pub fn pendingPlaintext(self: *const WaitingEncryptedHttpConnection) usize {
+        return self.inner.pendingPlaintext();
+    }
+
+    pub fn rawFd(self: *const WaitingEncryptedHttpConnection) std.posix.fd_t {
+        return self.inner.rawFd();
+    }
+
+    pub fn setReadTimeoutMs(self: *WaitingEncryptedHttpConnection, timeout_ms: u32) void {
+        self.read_timeout_ms = timeout_ms;
+    }
+
+    pub fn setWriteTimeoutMs(self: *WaitingEncryptedHttpConnection, timeout_ms: u32) void {
+        self.write_timeout_ms = timeout_ms;
+    }
+
+    pub fn writer(self: *WaitingEncryptedHttpConnection) Writer {
+        return .{ .conn = self };
+    }
+
+    const Writer = struct {
+        conn: *WaitingEncryptedHttpConnection,
+
+        pub fn write(self: Writer, bytes: []const u8) !usize {
+            return self.conn.write(bytes);
+        }
+
+        pub fn writeAll(self: Writer, bytes: []const u8) !void {
+            var offset: usize = 0;
+            while (offset < bytes.len) {
+                const n = try self.write(bytes[offset..]);
+                if (n == 0) return error.WouldBlock;
+                offset += n;
+            }
+            try self.conn.flush();
+        }
+
+        pub fn writeByte(self: Writer, byte: u8) !void {
+            try self.writeAll(&[_]u8{byte});
+        }
+
+        pub fn print(self: Writer, comptime fmt: []const u8, args: anytype) !void {
+            var buf: [4096]u8 = undefined;
+            const rendered = try std.fmt.bufPrint(&buf, fmt, args);
+            try self.writeAll(rendered);
+        }
+    };
+
+    fn waitFor(self: *WaitingEncryptedHttpConnection, requested: http.event_loop.Interest, timeout_ms: u32) !void {
+        const readiness = self.inner.readiness();
+        var interest = http.downstream_connection.combinedInterest(requested, readiness);
+        if (!interest.read and !interest.write) interest = requested;
+
+        var events: i16 = std.posix.POLL.ERR | std.posix.POLL.HUP;
+        if (interest.read) events |= std.posix.POLL.IN;
+        if (interest.write) events |= std.posix.POLL.OUT;
+        var fds = [_]std.posix.pollfd{.{
+            .fd = self.inner.rawFd(),
+            .events = events,
+            .revents = 0,
+        }};
+        const bounded_ms: i32 = if (timeout_ms == 0)
+            30_000
+        else
+            @intCast(@min(timeout_ms, @as(u32, @intCast(std.math.maxInt(i32)))));
+        const ready = try std.posix.poll(&fds, bounded_ms);
+        if (ready == 0) return error.WouldBlock;
+        if ((fds[0].revents & std.posix.POLL.ERR) != 0) return error.ConnectionResetByPeer;
+        if ((fds[0].revents & std.posix.POLL.HUP) != 0 and (fds[0].revents & (std.posix.POLL.IN | std.posix.POLL.OUT)) == 0) return error.ConnectionClosed;
+    }
+};
+
+fn advanceNativeHttp1(ctx: *WorkerContext, managed: *http.downstream_connection.ManagedConnection) void {
+    const native = switch (managed.transport) {
+        .native => |conn| conn,
+        else => {
+            managed.deinit();
+            return;
+        },
+    };
+    const session = activeSession(managed) orelse {
+        managed.deinit();
+        return;
+    };
+    var adapter = WaitingEncryptedHttpConnection.init(
+        native.httpConnection(),
+        managed.lifecycle.header_timeout_ms,
+        managed.lifecycle.write_timeout_ms,
+    );
+    const connection_ip = managed.lifecycle.connectionIp();
+    var served = switch (managed.phase) {
+        .native_http1 => |*h1| h1.served,
+        else => 0,
+    };
+
+    while (true) {
+        switch (serveOneRequest(ctx, &adapter, session, connection_ip, &served, false)) {
+            .serve_again => continue,
+            .park => {
+                if (managed.phase == .native_http1) {
+                    managed.phase.native_http1.served = served;
+                    managed.phase.native_http1.idle_deadline_ms = deadlineFromNow(
+                        http.event_loop.monotonicMs(),
+                        managed.lifecycle.idle_timeout_ms,
+                    );
+                }
+                _ = native.drive() catch |err| {
+                    ctx.state.logger.warn(null, "native http/1.1 post-request drive failed: {}", .{err});
+                    managed.deinit();
+                    return;
+                };
+                if (adapter.pending() > 0 or managed.transport.pendingPlaintext() > 0) continue;
+                rearmActiveConnection(ctx, managed, .{ .read = true });
+                return;
+            },
+            .close => {
+                managed.deinit();
+                return;
+            },
+        }
+    }
+}
+
+fn advanceNativeHttp2(ctx: *WorkerContext, managed: *http.downstream_connection.ManagedConnection) void {
+    const native = switch (managed.transport) {
+        .native => |conn| conn,
+        else => {
+            managed.deinit();
+            return;
+        },
+    };
+    _ = activeSession(managed) orelse {
+        managed.deinit();
+        return;
+    };
+    const session = activeSession(managed) orelse {
+        managed.deinit();
+        return;
+    };
+    const cfg = activeConfig(managed) orelse {
+        managed.deinit();
+        return;
+    };
+
+    var adapter = WaitingEncryptedHttpConnection.init(
+        native.httpConnection(),
+        managed.lifecycle.header_timeout_ms,
+        managed.lifecycle.write_timeout_ms,
+    );
+    handleHttp2Connection(&adapter, session, cfg, ctx.state, managed.lifecycle.connectionIp()) catch |err| {
+        if (isBenignDisconnect(err)) {
+            ctx.state.logger.debug(null, "native http/2 connection closed: {}", .{err});
+        } else {
+            ctx.state.logger.warn(null, "native http/2 connection failed: {}", .{err});
+        }
+    };
+    managed.deinit();
 }
 
 /// Registry teardown hook: release the connection slot held since accept when a
@@ -1406,6 +1927,23 @@ fn connRawFd(conn: anytype) ?std.posix.fd_t {
     return null;
 }
 
+fn setConnTimeouts(conn: anytype, read_timeout_ms: u32, write_timeout_ms: u32) void {
+    const T = @TypeOf(conn);
+    if (comptime std.meta.activeTag(@typeInfo(T)) == .pointer) {
+        const Child = std.meta.Child(T);
+        if (comptime @hasDecl(Child, "setReadTimeoutMs")) {
+            conn.setReadTimeoutMs(read_timeout_ms);
+            if (comptime @hasDecl(Child, "setWriteTimeoutMs")) {
+                conn.setWriteTimeoutMs(write_timeout_ms);
+            }
+            return;
+        }
+    }
+    if (connRawFd(conn)) |fd| {
+        gconn.setSocketTimeoutMs(fd, read_timeout_ms, write_timeout_ms) catch {};
+    }
+}
+
 fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge_config.EdgeConfig, state: *GatewayState, keep_alive_out: *bool, connection_ip: []const u8, enable_proxy_protocol: bool) !void {
     var keep_alive = false;
     keep_alive_out.* = false;
@@ -1481,13 +2019,11 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
                 // Switch SO_RCVTIMEO from header phase to body read phase.
                 const body_timeout_ms = cfg.request_limits.effectiveBodyTimeout();
                 if (body_timeout_ms > 0) {
-                    if (connRawFd(conn)) |fd| {
-                        const write_timeout_ms = if (cfg.downstream_write_timeout_ms > 0)
-                            cfg.downstream_write_timeout_ms
-                        else
-                            cfg.request_limits.effectiveHeaderTimeout();
-                        gconn.setSocketTimeoutMs(fd, body_timeout_ms, write_timeout_ms) catch {};
-                    }
+                    const write_timeout_ms = if (cfg.downstream_write_timeout_ms > 0)
+                        cfg.downstream_write_timeout_ms
+                    else
+                        cfg.request_limits.effectiveHeaderTimeout();
+                    setConnTimeouts(conn, body_timeout_ms, write_timeout_ms);
                 }
                 const total_read = try gconn.readHttpRequest(conn, pending_buf, &session.pending_len);
                 if (total_read == 0) return;
@@ -1942,6 +2478,48 @@ test "streaming upload pre-read scan includes server block routes" {
     cfg.server_blocks = &server_block_entries;
 
     try std.testing.expect(mayNeedStreamingRequestBodyPreRead(&cfg));
+}
+
+const HelperProbeConn = struct {
+    pending_value: usize = 0,
+    read_timeout_ms: u32 = 0,
+    write_timeout_ms: u32 = 0,
+
+    pub fn pending(self: *const HelperProbeConn) usize {
+        return self.pending_value;
+    }
+
+    pub fn setReadTimeoutMs(self: *HelperProbeConn, timeout_ms: u32) void {
+        self.read_timeout_ms = timeout_ms;
+    }
+
+    pub fn setWriteTimeoutMs(self: *HelperProbeConn, timeout_ms: u32) void {
+        self.write_timeout_ms = timeout_ms;
+    }
+};
+
+test "http1 keepalive detects session buffered pipelined request" {
+    var conn = HelperProbeConn{};
+    var session = ConnectionSession{};
+
+    try std.testing.expect(!hasBufferedHttp1Work(&conn, &session));
+    session.pending_len = 1;
+    try std.testing.expect(hasBufferedHttp1Work(&conn, &session));
+
+    session.pending_len = 0;
+    conn.pending_value = 1;
+    try std.testing.expect(hasBufferedHttp1Work(&conn, &session));
+}
+
+test "connection timeout helper resets read and write timeouts" {
+    var conn = HelperProbeConn{ .read_timeout_ms = 5000, .write_timeout_ms = 5000 };
+    setConnTimeouts(&conn, 100, 250);
+    try std.testing.expectEqual(@as(u32, 100), conn.read_timeout_ms);
+    try std.testing.expectEqual(@as(u32, 250), conn.write_timeout_ms);
+
+    setConnTimeouts(&conn, 0, 0);
+    try std.testing.expectEqual(@as(u32, 0), conn.read_timeout_ms);
+    try std.testing.expectEqual(@as(u32, 0), conn.write_timeout_ms);
 }
 
 // Pull gateway_handlers (and its transitive imports, including

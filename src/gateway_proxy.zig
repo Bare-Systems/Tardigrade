@@ -17,6 +17,14 @@ const gpt = @import("gateway_proxy_target.zig");
 const gconn = @import("gateway_connection.zig");
 const proxy_buffer_account = http.proxy_buffer_account;
 
+fn upstreamAlpnPolicy(protocol: edge_config.UpstreamProtocol) http.tls_termination.UpstreamAlpnPolicy {
+    return switch (protocol) {
+        .http1 => .require_http1,
+        .h2, .h2c => .require_h2,
+        .auto => .prefer_h2_allow_http1,
+    };
+}
+
 // Compatibility re-exports of the split-out proxy helper APIs (headers /
 // response / target modules) so existing callers that import this module keep
 // compiling. New code should import from the owning module directly
@@ -363,7 +371,7 @@ pub fn executeBoundedBufferedTcpHttpRequest(
     // else fall back to a fresh single-stream connection. h1 origins are
     // detected via ALPN and handled on the HTTP/1.1 path.
     if (tls_options) |opts| {
-        if (opts.offer_h2) {
+        if (opts.alpn_policy.offersH2()) {
             if (h2_pool) |hp| {
                 return executeBufferedViaH2Pool(allocator, hp, host, port, opts, uri, method, extra_headers, body, content_type_override, max_buffered_response_bytes, connect_timeout_ms, response_timeout_ms, pool);
             }
@@ -1376,10 +1384,7 @@ pub fn executeBoundedBufferedHttpProxyRequest(
         .sni_override = cfg.upstream_tls_server_name,
         .client_cert_path = cfg.upstream_tls_client_cert,
         .client_key_path = cfg.upstream_tls_client_key,
-        // Offer HTTP/2 via ALPN when configured (#145). The streaming path
-        // offers h2 too (executeStreamingHttpProxyRequest sets it on its own
-        // TLS options when routing through the h2 pool).
-        .offer_h2 = cfg.upstream_protocol.offersH2(),
+        .alpn_policy = upstreamAlpnPolicy(cfg.upstream_protocol),
     } else null;
     const base_timeout_ms = if (attempt_timeout_ms > 0) attempt_timeout_ms else connect_timeout_ms;
     const effective_send_timeout_ms = if (cancel_token) |tok|
@@ -1901,11 +1906,7 @@ pub fn executeStreamingHttpProxyRequest(
     const stream_h2 = h2_requested_for_streaming;
     if (stream_h2) {
         if (h2_pool) |hp| {
-            const h2_opts: ?http.tls_termination.UpstreamTlsOptions = if (is_https) blk: {
-                var o = tls_options.?;
-                o.offer_h2 = true;
-                break :blk o;
-            } else null;
+            const h2_opts: ?http.tls_termination.UpstreamTlsOptions = if (is_https) tls_options.? else null;
             return streamViaH2Pool(allocator, hp, pool, host, port, h2_opts, uri, method, extra_headers.items, buffered_body, streaming_body, read_buf, downstream_conn, downstream_writer, security, sticky_set_cookie, correlation_id, connect_timeout_ms, read_deadline_ms, cancel_token, cfg.proxy_buffer_limits, proxy_buffer_observer);
         }
         if (streaming_body != null) {

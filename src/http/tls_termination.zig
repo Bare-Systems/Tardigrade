@@ -2,6 +2,7 @@ const std = @import("std");
 const compat = @import("../zig_compat.zig");
 const acme_client = @import("acme_client.zig");
 const encrypted_stream = @import("tls_core").encrypted_stream;
+const negotiated_dispatch = @import("negotiated_dispatch.zig");
 
 const c = @cImport({
     @cInclude("openssl/ssl.h");
@@ -20,6 +21,19 @@ extern fn SSL_CTX_set_alpn_select_cb(
     cb: *const fn (?*c.SSL, [*c][*c]u8, [*c]u8, [*c]const u8, c_uint, ?*anyopaque) callconv(.c) c_int,
     arg: ?*anyopaque,
 ) void;
+
+extern fn SSL_CTX_set_client_hello_cb(
+    ctx: *c.SSL_CTX,
+    cb: *const fn (?*c.SSL, [*c]c_int, ?*anyopaque) callconv(.c) c_int,
+    arg: ?*anyopaque,
+) void;
+
+extern fn SSL_client_hello_get0_ext(
+    s: ?*c.SSL,
+    typ: c_uint,
+    out: *[*c]const u8,
+    outlen: *usize,
+) c_int;
 
 const ssl_op_no_ticket: c_ulong = @as(c_ulong, 1) << @as(u6, 14);
 const openssl_npn_negotiated: c_int = 1;
@@ -42,6 +56,7 @@ pub const TlsError = error{
     CrlLoadFailed,
     OcspLoadFailed,
     HandshakeFailed,
+    NoApplicationProtocol,
     TlsReadFailed,
     TlsWriteFailed,
 };
@@ -97,7 +112,9 @@ pub const TlsOptions = struct {
     acme_renew_days_before_expiry: u32 = 30,
     /// Pointer to the HTTP-01 challenge token store shared with the gateway.
     acme_challenge_store: ?*@import("acme_client.zig").ChallengeStore = null,
+    http1_enabled: bool = true,
     http2_enabled: bool = true,
+    http1_alpn_fallback_enabled: bool = false,
 };
 
 pub const NegotiatedProtocol = enum {
@@ -146,7 +163,8 @@ const State = struct {
     acme_next_check_ms: u64 = 0,
     static_sni_specs: []SniCertSpec,
     sni_certs: std.ArrayList(ManagedSniCert),
-    http2_enabled: bool,
+    protocol_policy: negotiated_dispatch.ListenerProtocolPolicy,
+    policy_ex_index: c_int,
 
     fn deinit(self: *State) void {
         if (self.ocsp_response) |resp| self.allocator.free(resp);
@@ -172,6 +190,9 @@ pub const TlsTerminator = struct {
         const method = c.TLS_server_method() orelse return error.ContextInitFailed;
         const ctx = c.SSL_CTX_new(method) orelse return error.ContextInitFailed;
         errdefer c.SSL_CTX_free(ctx);
+        if (!opts.http1_enabled and !opts.http2_enabled) return error.ProtocolConfigFailed;
+        const policy_ex_index = c.CRYPTO_get_ex_new_index(c.CRYPTO_EX_INDEX_SSL, 0, null, null, null, null);
+        if (policy_ex_index < 0) return error.ProtocolConfigFailed;
         const owned_sni_specs = owned: {
             const specs = try allocator.alloc(SniCertSpec, opts.sni_certs.len);
             errdefer allocator.free(specs);
@@ -205,7 +226,12 @@ pub const TlsTerminator = struct {
             .acme_challenge_store = opts.acme_challenge_store,
             .static_sni_specs = owned_sni_specs,
             .sni_certs = .empty,
-            .http2_enabled = opts.http2_enabled,
+            .protocol_policy = .{
+                .http1_enabled = opts.http1_enabled,
+                .http2_enabled = opts.http2_enabled,
+                .allow_http1_without_alpn = opts.http1_alpn_fallback_enabled,
+            },
+            .policy_ex_index = policy_ex_index,
         };
         errdefer st.deinit();
 
@@ -236,6 +262,7 @@ pub const TlsTerminator = struct {
                 st,
             );
         }
+        SSL_CTX_set_client_hello_cb(ctx, clientHelloCallback, st);
         SSL_CTX_set_alpn_select_cb(ctx, alpnSelectCallback, st);
 
         return .{ .allocator = allocator, .ctx = ctx, .state = st };
@@ -306,9 +333,35 @@ pub const TlsTerminator = struct {
         _ = rebuildSniCertificates(self.state) catch {}; // SNI cert rebuild is best-effort; existing certificate mappings remain active
     }
 
+    pub fn protocolPolicySnapshot(self: *TlsTerminator) negotiated_dispatch.ListenerProtocolPolicy {
+        self.state.mutex.lock();
+        defer self.state.mutex.unlock();
+        return self.state.protocol_policy;
+    }
+
+    pub fn updateProtocolPolicy(self: *TlsTerminator, policy: negotiated_dispatch.ListenerProtocolPolicy) TlsError!void {
+        if (!policy.http1_enabled and !policy.http2_enabled) return error.ProtocolConfigFailed;
+        self.state.mutex.lock();
+        defer self.state.mutex.unlock();
+        self.state.protocol_policy = policy;
+    }
+
     pub fn accept(self: *TlsTerminator, fd: std.posix.fd_t) TlsError!TlsConnection {
+        return self.acceptWithPolicy(fd, self.protocolPolicySnapshot());
+    }
+
+    pub fn acceptWithPolicy(
+        self: *TlsTerminator,
+        fd: std.posix.fd_t,
+        policy: negotiated_dispatch.ListenerProtocolPolicy,
+    ) TlsError!TlsConnection {
+        if (!policy.http1_enabled and !policy.http2_enabled) return error.ProtocolConfigFailed;
+        const policy_box = try self.allocator.create(negotiated_dispatch.ListenerProtocolPolicy);
+        errdefer self.allocator.destroy(policy_box);
+        policy_box.* = policy;
         const ssl = c.SSL_new(self.ctx) orelse return error.ContextInitFailed;
         errdefer c.SSL_free(ssl);
+        if (c.SSL_set_ex_data(ssl, self.state.policy_ex_index, policy_box) != 1) return error.ProtocolConfigFailed;
         _ = c.SSL_ctrl(ssl, c.SSL_CTRL_MODE, openssl_stream_mode, null);
         if (c.SSL_set_fd(ssl, fd) != 1) return error.HandshakeFailed;
 
@@ -325,12 +378,19 @@ pub const TlsTerminator = struct {
         }
 
         if (c.SSL_accept(ssl) != 1) return error.HandshakeFailed;
-        return .{ .ssl = ssl };
+        return .{
+            .ssl = ssl,
+            .allocator = self.allocator,
+            .protocol_policy = policy,
+            .policy_box = policy_box,
+            .policy_ex_index = self.state.policy_ex_index,
+        };
     }
 };
 
 pub const TlsConnection = struct {
     ssl: *c.SSL,
+    allocator: std.mem.Allocator = undefined,
     stream_lifecycle: OpenSslStreamLifecycle = .open,
     retry_direction: OpenSslRetryDirection = .none,
     pending_write: ?OpenSslPendingWrite = null,
@@ -341,13 +401,18 @@ pub const TlsConnection = struct {
     stream_peak_total: usize = 0,
     stream_pause_state: encrypted_stream.PauseState = .{},
     stream_buffer_counters: encrypted_stream.BufferCounters = .{},
+    protocol_policy: negotiated_dispatch.ListenerProtocolPolicy = .{},
+    policy_box: ?*negotiated_dispatch.ListenerProtocolPolicy = null,
+    policy_ex_index: c_int = -1,
 
     pub fn deinit(self: *TlsConnection) void {
+        if (self.policy_ex_index >= 0) _ = c.SSL_set_ex_data(self.ssl, self.policy_ex_index, null);
         if (opensslShouldShutdownOnDeinit(self)) {
             c.ERR_clear_error();
             _ = c.SSL_shutdown(self.ssl);
         }
         c.SSL_free(self.ssl);
+        if (self.policy_box) |box| self.allocator.destroy(box);
         self.* = undefined;
     }
 
@@ -407,12 +472,20 @@ pub const TlsConnection = struct {
         return .{ .ptr = self, .vtable = &openssl_stream_vtable };
     }
 
-    pub fn negotiatedProtocol(self: *const TlsConnection) NegotiatedProtocol {
+    pub fn negotiatedAlpn(self: *const TlsConnection) ?[]const u8 {
         var data: [*c]const u8 = null;
         var len: c_uint = 0;
         c.SSL_get0_alpn_selected(self.ssl, &data, &len);
-        if (data != null and len == 2 and std.mem.eql(u8, data[0..2], "h2")) return .http2;
-        return .http1_1;
+        if (data == null or len == 0) return null;
+        return data[0..@intCast(len)];
+    }
+
+    pub fn negotiatedProtocol(self: *const TlsConnection) negotiated_dispatch.Error!NegotiatedProtocol {
+        return self.validatedNegotiatedProtocol();
+    }
+
+    pub fn validatedNegotiatedProtocol(self: *const TlsConnection) negotiated_dispatch.Error!NegotiatedProtocol {
+        return negotiated_dispatch.selectNegotiatedProtocol(self.negotiatedAlpn(), self.protocol_policy);
     }
 
     fn writeFn(self: *TlsConnection, data: []const u8) TlsError!usize {
@@ -988,6 +1061,52 @@ fn sniCallback(ssl: ?*c.SSL, alert: ?*c_int, arg: ?*anyopaque) callconv(.c) c_in
     return c.SSL_TLSEXT_ERR_NOACK;
 }
 
+fn clientHelloCallback(ssl: ?*c.SSL, alert: [*c]c_int, arg: ?*anyopaque) callconv(.c) c_int {
+    const s = ssl orelse return c.SSL_CLIENT_HELLO_ERROR;
+    const state: *State = @ptrCast(@alignCast(arg orelse return c.SSL_CLIENT_HELLO_ERROR));
+    const policy = policyForSsl(s, state.policy_ex_index) orelse return c.SSL_CLIENT_HELLO_ERROR;
+
+    var ext_ptr: [*c]const u8 = null;
+    var ext_len: usize = 0;
+    const present = SSL_client_hello_get0_ext(
+        s,
+        c.TLSEXT_TYPE_application_layer_protocol_negotiation,
+        &ext_ptr,
+        &ext_len,
+    ) == 1;
+    if (!present) {
+        if (policy.fallbackPolicy() == .allow_http1_default) return c.SSL_CLIENT_HELLO_SUCCESS;
+        alert.* = c.SSL_AD_NO_APPLICATION_PROTOCOL;
+        return c.SSL_CLIENT_HELLO_ERROR;
+    }
+    const ext = ext_ptr[0..ext_len];
+    if (!isValidAlpnExtension(ext)) {
+        alert.* = c.SSL_AD_NO_APPLICATION_PROTOCOL;
+        return c.SSL_CLIENT_HELLO_ERROR;
+    }
+    return c.SSL_CLIENT_HELLO_SUCCESS;
+}
+
+fn policyForSsl(s: *c.SSL, policy_ex_index: c_int) ?*const negotiated_dispatch.ListenerProtocolPolicy {
+    if (policy_ex_index < 0) return null;
+    return @ptrCast(@alignCast(c.SSL_get_ex_data(s, policy_ex_index)));
+}
+
+fn isValidAlpnExtension(ext: []const u8) bool {
+    if (ext.len < 2) return false;
+    const list_len = std.mem.readInt(u16, ext[0..2], .big);
+    if (list_len == 0 or list_len != ext.len - 2) return false;
+    var offset: usize = 2;
+    while (offset < ext.len) {
+        const name_len = ext[offset];
+        offset += 1;
+        if (name_len == 0) return false;
+        if (offset + name_len > ext.len) return false;
+        offset += name_len;
+    }
+    return offset == ext.len;
+}
+
 fn alpnSelectCallback(
     _ssl: ?*c.SSL,
     out: [*c][*c]u8,
@@ -996,13 +1115,13 @@ fn alpnSelectCallback(
     inlen: c_uint,
     arg: ?*anyopaque,
 ) callconv(.c) c_int {
-    _ = _ssl;
-    const state: *State = @ptrCast(@alignCast(arg orelse return c.SSL_TLSEXT_ERR_NOACK));
-    const h2_and_http11 = "\x02h2\x08http/1.1";
-    const http11_only = "\x08http/1.1";
-    const server_protos = if (state.http2_enabled) h2_and_http11 else http11_only;
+    const s = _ssl orelse return c.SSL_TLSEXT_ERR_ALERT_FATAL;
+    const state: *State = @ptrCast(@alignCast(arg orelse return c.SSL_TLSEXT_ERR_ALERT_FATAL));
+    const policy = policyForSsl(s, state.policy_ex_index) orelse return c.SSL_TLSEXT_ERR_ALERT_FATAL;
+    const server_protos = policy.encodedAdvertisedAlpns();
+    if (server_protos.len == 0) return c.SSL_TLSEXT_ERR_ALERT_FATAL;
     const rc = c.SSL_select_next_proto(out, outlen, server_protos.ptr, @intCast(server_protos.len), in, inlen);
-    return if (rc == openssl_npn_negotiated) c.SSL_TLSEXT_ERR_OK else c.SSL_TLSEXT_ERR_NOACK;
+    return if (rc == openssl_npn_negotiated) c.SSL_TLSEXT_ERR_OK else c.SSL_TLSEXT_ERR_ALERT_FATAL;
 }
 
 fn fileMtime(path: []const u8) !i128 {
@@ -1027,10 +1146,76 @@ pub const UpstreamTlsOptions = struct {
     client_cert_path: []const u8 = "",
     /// PEM path to the client private key for mTLS (optional).
     client_key_path: []const u8 = "",
-    /// Offer HTTP/2 via ALPN ("h2", "http/1.1"). When false only "http/1.1"
-    /// is offered. The negotiated protocol is read via `negotiatedProtocol`.
-    offer_h2: bool = false,
+    /// Explicit HTTPS upstream ALPN policy. Required modes fail when the peer
+    /// omits ALPN, selects the wrong protocol, or selects an unknown protocol.
+    alpn_policy: UpstreamAlpnPolicy = .require_http1,
 };
+
+pub const UpstreamAlpnPolicy = enum {
+    require_http1,
+    require_h2,
+    prefer_h2_allow_http1,
+
+    pub fn offersH2(self: UpstreamAlpnPolicy) bool {
+        return self != .require_http1;
+    }
+
+    pub fn wire(self: UpstreamAlpnPolicy) []const u8 {
+        return switch (self) {
+            .require_http1 => "\x08http/1.1",
+            .require_h2 => "\x02h2",
+            .prefer_h2_allow_http1 => "\x02h2\x08http/1.1",
+        };
+    }
+
+    pub fn select(self: UpstreamAlpnPolicy, selected_alpn: ?[]const u8) TlsError!NegotiatedProtocol {
+        const selected = selected_alpn orelse return error.NoApplicationProtocol;
+        if (std.mem.eql(u8, selected, "h2")) {
+            return switch (self) {
+                .require_http1 => error.NoApplicationProtocol,
+                .require_h2, .prefer_h2_allow_http1 => .http2,
+            };
+        }
+        if (std.mem.eql(u8, selected, "http/1.1")) {
+            return switch (self) {
+                .require_http1, .prefer_h2_allow_http1 => .http1_1,
+                .require_h2 => error.NoApplicationProtocol,
+            };
+        }
+        return error.NoApplicationProtocol;
+    }
+};
+
+test "upstream ALPN policy validates selected protocol strictly" {
+    try std.testing.expect(!UpstreamAlpnPolicy.require_http1.offersH2());
+    try std.testing.expect(UpstreamAlpnPolicy.require_h2.offersH2());
+    try std.testing.expect(UpstreamAlpnPolicy.prefer_h2_allow_http1.offersH2());
+
+    try std.testing.expectEqual(NegotiatedProtocol.http1_1, try UpstreamAlpnPolicy.require_http1.select("http/1.1"));
+    try std.testing.expectError(error.NoApplicationProtocol, UpstreamAlpnPolicy.require_http1.select("h2"));
+    try std.testing.expectError(error.NoApplicationProtocol, UpstreamAlpnPolicy.require_http1.select(null));
+
+    try std.testing.expectEqual(NegotiatedProtocol.http2, try UpstreamAlpnPolicy.require_h2.select("h2"));
+    try std.testing.expectError(error.NoApplicationProtocol, UpstreamAlpnPolicy.require_h2.select("http/1.1"));
+    try std.testing.expectError(error.NoApplicationProtocol, UpstreamAlpnPolicy.require_h2.select(null));
+
+    try std.testing.expectEqual(NegotiatedProtocol.http2, try UpstreamAlpnPolicy.prefer_h2_allow_http1.select("h2"));
+    try std.testing.expectEqual(NegotiatedProtocol.http1_1, try UpstreamAlpnPolicy.prefer_h2_allow_http1.select("http/1.1"));
+    try std.testing.expectError(error.NoApplicationProtocol, UpstreamAlpnPolicy.prefer_h2_allow_http1.select("spdy/3"));
+    try std.testing.expectError(error.NoApplicationProtocol, UpstreamAlpnPolicy.prefer_h2_allow_http1.select(null));
+}
+
+test "upstream auto permits HTTP/1.1 ALPN while strict h2 rejects it" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectEqual(
+        NegotiatedProtocol.http1_1,
+        try testUpstreamHandshakeProtocol(allocator, .prefer_h2_allow_http1, .{ .server_http2_enabled = false }),
+    );
+    try std.testing.expectError(
+        error.HandshakeFailed,
+        testUpstreamHandshakeProtocol(allocator, .require_h2, .{ .server_http2_enabled = false }),
+    );
+}
 
 /// An OpenSSL-backed TLS client connection to a TCP stream.
 /// Used for upstream HTTPS connections that require mTLS or custom CA/SNI.
@@ -1038,6 +1223,7 @@ pub const UpstreamTlsConn = struct {
     ssl: *c.SSL,
     ctx: *c.SSL_CTX,
     fd: std.posix.fd_t = -1,
+    protocol: NegotiatedProtocol,
 
     pub fn connect(
         fd: std.posix.fd_t,
@@ -1081,9 +1267,8 @@ pub const UpstreamTlsConn = struct {
         defer std.heap.c_allocator.free(sni_z);
         _ = c.SSL_set_tlsext_host_name(ssl, sni_z.ptr);
 
-        // Offer ALPN. h2 must precede http/1.1 (client preference order).
-        const alpn_wire: []const u8 = if (opts.offer_h2) "\x02h2\x08http/1.1" else "\x08http/1.1";
-        _ = c.SSL_set_alpn_protos(ssl, alpn_wire.ptr, @intCast(alpn_wire.len));
+        const alpn_wire = opts.alpn_policy.wire();
+        if (c.SSL_set_alpn_protos(ssl, alpn_wire.ptr, @intCast(alpn_wire.len)) != 0) return error.ProtocolConfigFailed;
 
         if (!opts.skip_verify) {
             const verify_host_z = try std.heap.c_allocator.dupeZ(u8, sni_host);
@@ -1095,8 +1280,9 @@ pub const UpstreamTlsConn = struct {
 
         if (c.SSL_set_fd(ssl, fd) != 1) return error.HandshakeFailed;
         if (c.SSL_connect(ssl) != 1) return error.HandshakeFailed;
+        const protocol = try opts.alpn_policy.select(negotiatedAlpn(ssl));
 
-        return .{ .ssl = ssl, .ctx = ctx, .fd = fd };
+        return .{ .ssl = ssl, .ctx = ctx, .fd = fd, .protocol = protocol };
     }
 
     pub fn deinit(self: *UpstreamTlsConn) void {
@@ -1140,16 +1326,19 @@ pub const UpstreamTlsConn = struct {
         return if (n > 0) @intCast(n) else 0;
     }
 
-    /// The ALPN protocol the handshake selected (`.http2` if the peer chose h2,
-    /// else `.http1_1`).
+    /// The ALPN protocol validated immediately after `SSL_connect`.
     pub fn negotiatedProtocol(self: *const UpstreamTlsConn) NegotiatedProtocol {
-        var data: [*c]const u8 = null;
-        var len: c_uint = 0;
-        c.SSL_get0_alpn_selected(self.ssl, &data, &len);
-        if (data != null and len == 2 and std.mem.eql(u8, data[0..2], "h2")) return .http2;
-        return .http1_1;
+        return self.protocol;
     }
 };
+
+fn negotiatedAlpn(ssl: *c.SSL) ?[]const u8 {
+    var data: [*c]const u8 = null;
+    var len: c_uint = 0;
+    c.SSL_get0_alpn_selected(ssl, &data, &len);
+    if (data == null or len == 0) return null;
+    return data[0..len];
+}
 
 const TestTlsPair = struct {
     client_ssl: *c.SSL,
@@ -1168,15 +1357,78 @@ const TestTlsPair = struct {
     }
 };
 
+const TestClientSsl = struct {
+    ssl: *c.SSL,
+    ctx: *c.SSL_CTX,
+
+    fn deinit(self: *TestClientSsl) void {
+        c.SSL_free(self.ssl);
+        c.SSL_CTX_free(self.ctx);
+        self.* = undefined;
+    }
+};
+
+fn initTestClientSsl(fd: std.posix.fd_t, alpn_wire: ?[]const u8) !TestClientSsl {
+    const client_ctx = c.SSL_CTX_new(c.TLS_client_method() orelse return error.ContextInitFailed) orelse return error.ContextInitFailed;
+    errdefer c.SSL_CTX_free(client_ctx);
+    c.SSL_CTX_set_verify(client_ctx, c.SSL_VERIFY_NONE, null);
+    const client_ssl = c.SSL_new(client_ctx) orelse return error.ContextInitFailed;
+    errdefer c.SSL_free(client_ssl);
+    if (alpn_wire) |wire| {
+        if (c.SSL_set_alpn_protos(client_ssl, wire.ptr, @intCast(wire.len)) != 0) return error.ProtocolConfigFailed;
+    }
+    if (c.SSL_set_fd(client_ssl, fd) != 1) return error.HandshakeFailed;
+    return .{ .ssl = client_ssl, .ctx = client_ctx };
+}
+
+const TestTlsPairOptions = struct {
+    server_http1_enabled: bool = true,
+    server_http2_enabled: bool = true,
+    server_http1_alpn_fallback_enabled: bool = false,
+    server_accept_policy: ?negotiated_dispatch.ListenerProtocolPolicy = null,
+    client_alpn_wire: ?[]const u8 = http11_only_wire_for_tests,
+};
+
+const h2_and_http11_wire_for_tests = "\x02h2\x08http/1.1";
+const http11_and_h2_wire_for_tests = "\x08http/1.1\x02h2";
+const http11_only_wire_for_tests = "\x08http/1.1";
+const h2_only_wire_for_tests = "\x02h2";
+
 const ServerAcceptContext = struct {
     terminator: *TlsTerminator,
     fd: std.posix.fd_t,
+    accept_policy: ?negotiated_dispatch.ListenerProtocolPolicy = null,
     conn: ?TlsConnection = null,
     err: ?TlsError = null,
 };
 
 fn serverAcceptThread(ctx: *ServerAcceptContext) void {
-    ctx.conn = ctx.terminator.accept(ctx.fd) catch |err| {
+    const conn = if (ctx.accept_policy) |policy|
+        ctx.terminator.acceptWithPolicy(ctx.fd, policy)
+    else
+        ctx.terminator.accept(ctx.fd);
+    ctx.conn = conn catch |err| {
+        ctx.err = err;
+        return;
+    };
+}
+
+const BarrierAcceptContext = struct {
+    terminator: *TlsTerminator,
+    fd: std.posix.fd_t,
+    policy: negotiated_dispatch.ListenerProtocolPolicy,
+    ready: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    release: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    conn: ?TlsConnection = null,
+    err: ?TlsError = null,
+};
+
+fn barrierAcceptThread(ctx: *BarrierAcceptContext) void {
+    ctx.ready.store(true, .release);
+    while (!ctx.release.load(.acquire)) {
+        std.Thread.yield() catch {};
+    }
+    ctx.conn = ctx.terminator.acceptWithPolicy(ctx.fd, ctx.policy) catch |err| {
         ctx.err = err;
         return;
     };
@@ -1190,7 +1442,20 @@ fn testSetNonBlocking(fd: std.posix.fd_t, nonblocking: bool) !void {
     if (std.c.fcntl(fd, std.c.F.SETFL, new_flags) < 0) return error.FcntlFailed;
 }
 
+fn testSetSocketTimeoutMs(fd: std.posix.fd_t, timeout_ms: u32) !void {
+    const tv = std.posix.timeval{
+        .sec = @intCast(timeout_ms / 1000),
+        .usec = @intCast((timeout_ms % 1000) * 1000),
+    };
+    try std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv));
+    try std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&tv));
+}
+
 fn makeTestTlsPair(allocator: std.mem.Allocator) !TestTlsPair {
+    return makeTestTlsPairWithOptions(allocator, .{});
+}
+
+fn makeTestTlsPairWithOptions(allocator: std.mem.Allocator, opts: TestTlsPairOptions) !TestTlsPair {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -1205,6 +1470,9 @@ fn makeTestTlsPair(allocator: std.mem.Allocator) !TestTlsPair {
         .cert_path = cert_path,
         .key_path = key_path,
         .dynamic_reload_interval_ms = 0,
+        .http1_enabled = opts.server_http1_enabled,
+        .http2_enabled = opts.server_http2_enabled,
+        .http1_alpn_fallback_enabled = opts.server_http1_alpn_fallback_enabled,
     });
     defer terminator.deinit();
 
@@ -1213,18 +1481,30 @@ fn makeTestTlsPair(allocator: std.mem.Allocator) !TestTlsPair {
     errdefer _ = std.c.close(fds[0]);
     errdefer _ = std.c.close(fds[1]);
 
-    var accept_ctx = ServerAcceptContext{ .terminator = &terminator, .fd = fds[1] };
-    const thread = try std.Thread.spawn(.{}, serverAcceptThread, .{&accept_ctx});
-
     const client_ctx = c.SSL_CTX_new(c.TLS_client_method() orelse return error.ContextInitFailed) orelse return error.ContextInitFailed;
     errdefer c.SSL_CTX_free(client_ctx);
     c.SSL_CTX_set_verify(client_ctx, c.SSL_VERIFY_NONE, null);
     const client_ssl = c.SSL_new(client_ctx) orelse return error.ContextInitFailed;
     errdefer c.SSL_free(client_ssl);
+    if (opts.client_alpn_wire) |wire| {
+        if (c.SSL_set_alpn_protos(client_ssl, wire.ptr, @intCast(wire.len)) != 0) return error.ProtocolConfigFailed;
+    }
     if (c.SSL_set_fd(client_ssl, fds[0]) != 1) return error.HandshakeFailed;
+
+    var accept_ctx = ServerAcceptContext{ .terminator = &terminator, .fd = fds[1], .accept_policy = opts.server_accept_policy };
+    const thread = try std.Thread.spawn(.{}, serverAcceptThread, .{&accept_ctx});
+    var thread_joined = false;
+    errdefer if (!thread_joined) {
+        _ = std.c.shutdown(fds[0], std.posix.SHUT.RDWR);
+        _ = std.c.shutdown(fds[1], std.posix.SHUT.RDWR);
+        thread.join();
+        thread_joined = true;
+    };
+
     if (c.SSL_connect(client_ssl) != 1) return error.HandshakeFailed;
 
     thread.join();
+    thread_joined = true;
     if (accept_ctx.err) |err| return err;
     var server = accept_ctx.conn orelse return error.HandshakeFailed;
     errdefer server.deinit();
@@ -1238,6 +1518,82 @@ fn makeTestTlsPair(allocator: std.mem.Allocator) !TestTlsPair {
         .server_fd = fds[1],
         .server = server,
     };
+}
+
+fn testUpstreamHandshakeProtocol(
+    allocator: std.mem.Allocator,
+    upstream_policy: UpstreamAlpnPolicy,
+    opts: TestTlsPairOptions,
+) !NegotiatedProtocol {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "test_server.crt", .data = embedded_server_crt });
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "test_server.key", .data = embedded_server_key });
+    const cert_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, "test_server.crt");
+    defer allocator.free(cert_path);
+    const key_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, "test_server.key");
+    defer allocator.free(key_path);
+
+    var terminator = try TlsTerminator.init(allocator, .{
+        .cert_path = cert_path,
+        .key_path = key_path,
+        .dynamic_reload_interval_ms = 0,
+        .http1_enabled = opts.server_http1_enabled,
+        .http2_enabled = opts.server_http2_enabled,
+        .http1_alpn_fallback_enabled = opts.server_http1_alpn_fallback_enabled,
+    });
+    defer terminator.deinit();
+
+    var fds: [2]std.posix.fd_t = undefined;
+    if (std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds) != 0) return error.SocketPairFailed;
+    var client_fd_open = true;
+    var server_fd_open = true;
+    defer {
+        if (client_fd_open) _ = std.c.close(fds[0]);
+    }
+    defer {
+        if (server_fd_open) _ = std.c.close(fds[1]);
+    }
+    try testSetSocketTimeoutMs(fds[0], 1_000);
+    try testSetSocketTimeoutMs(fds[1], 1_000);
+
+    var accept_ctx = ServerAcceptContext{ .terminator = &terminator, .fd = fds[1], .accept_policy = opts.server_accept_policy };
+    const thread = try std.Thread.spawn(.{}, serverAcceptThread, .{&accept_ctx});
+    var thread_joined = false;
+    errdefer if (!thread_joined) {
+        _ = std.c.shutdown(fds[0], std.posix.SHUT.RDWR);
+        _ = std.c.shutdown(fds[1], std.posix.SHUT.RDWR);
+        thread.join();
+        thread_joined = true;
+    };
+
+    var upstream = UpstreamTlsConn.connect(fds[0], "localhost", .{
+        .skip_verify = true,
+        .alpn_policy = upstream_policy,
+    }) catch |err| {
+        _ = std.c.shutdown(fds[0], std.posix.SHUT.RDWR);
+        _ = std.c.shutdown(fds[1], std.posix.SHUT.RDWR);
+        thread.join();
+        thread_joined = true;
+        if (accept_ctx.conn) |*conn| conn.deinit();
+        return err;
+    };
+    thread.join();
+    thread_joined = true;
+    if (accept_ctx.err) |err| {
+        upstream.deinit();
+        return err;
+    }
+    if (accept_ctx.conn) |*conn| conn.deinit();
+
+    const protocol = upstream.negotiatedProtocol();
+    upstream.deinit();
+    client_fd_open = false;
+    server_fd_open = false;
+    _ = std.c.close(fds[0]);
+    _ = std.c.close(fds[1]);
+    return protocol;
 }
 
 fn clientWriteAll(ssl: *c.SSL, bytes: []const u8) !void {
@@ -1256,6 +1612,105 @@ fn clientReadExact(ssl: *c.SSL, out: []u8) !void {
         if (rc <= 0) return error.TlsReadFailed;
         offset += @intCast(rc);
     }
+}
+
+fn buildMalformedAlpnClientHello(allocator: std.mem.Allocator) ![]u8 {
+    const client_ctx = c.SSL_CTX_new(c.TLS_client_method() orelse return error.ContextInitFailed) orelse return error.ContextInitFailed;
+    defer c.SSL_CTX_free(client_ctx);
+    c.SSL_CTX_set_verify(client_ctx, c.SSL_VERIFY_NONE, null);
+    const client_ssl = c.SSL_new(client_ctx) orelse return error.ContextInitFailed;
+    defer c.SSL_free(client_ssl);
+
+    const rbio = c.BIO_new(c.BIO_s_mem()) orelse return error.ContextInitFailed;
+    const wbio = c.BIO_new(c.BIO_s_mem()) orelse {
+        _ = c.BIO_free(rbio);
+        return error.ContextInitFailed;
+    };
+    c.SSL_set_bio(client_ssl, rbio, wbio);
+
+    if (c.SSL_set_alpn_protos(client_ssl, h2_only_wire_for_tests.ptr, @intCast(h2_only_wire_for_tests.len)) != 0) return error.ProtocolConfigFailed;
+    const rc = c.SSL_connect(client_ssl);
+    if (rc == 1) return error.HandshakeFailed;
+    const ssl_error = c.SSL_get_error(client_ssl, rc);
+    if (ssl_error != c.SSL_ERROR_WANT_READ and ssl_error != c.SSL_ERROR_WANT_WRITE) return error.HandshakeFailed;
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var chunk: [4096]u8 = undefined;
+    while (true) {
+        const n = c.BIO_read(wbio, &chunk, chunk.len);
+        if (n <= 0) break;
+        try out.appendSlice(allocator, chunk[0..@intCast(n)]);
+    }
+    if (out.items.len == 0) return error.HandshakeFailed;
+    try mutateAlpnNameLength(out.items);
+    return try out.toOwnedSlice(allocator);
+}
+
+fn mutateAlpnNameLength(record_bytes: []u8) !void {
+    if (record_bytes.len < 5 or record_bytes[0] != 22) return error.MalformedHandshake;
+    const record_len = std.mem.readInt(u16, record_bytes[3..5], .big);
+    if (record_bytes.len < 5 + @as(usize, record_len)) return error.MalformedHandshake;
+    var pos: usize = 5;
+    if (record_bytes[pos] != 1) return error.MalformedHandshake;
+    pos += 1;
+    const handshake_len = (@as(usize, record_bytes[pos]) << 16) | (@as(usize, record_bytes[pos + 1]) << 8) | record_bytes[pos + 2];
+    pos += 3;
+    const handshake_end = pos + handshake_len;
+    if (handshake_end > record_bytes.len) return error.MalformedHandshake;
+
+    pos += 2 + 32;
+    if (pos >= handshake_end) return error.MalformedHandshake;
+    const session_id_len = record_bytes[pos];
+    pos += 1 + @as(usize, session_id_len);
+    if (pos + 2 > handshake_end) return error.MalformedHandshake;
+    const cipher_suites_len = std.mem.readInt(u16, record_bytes[pos..][0..2], .big);
+    pos += 2 + @as(usize, cipher_suites_len);
+    if (pos >= handshake_end) return error.MalformedHandshake;
+    const compression_methods_len = record_bytes[pos];
+    pos += 1 + @as(usize, compression_methods_len);
+    if (pos + 2 > handshake_end) return error.MalformedHandshake;
+    const extensions_len = std.mem.readInt(u16, record_bytes[pos..][0..2], .big);
+    pos += 2;
+    const extensions_end = pos + @as(usize, extensions_len);
+    if (extensions_end > handshake_end) return error.MalformedHandshake;
+
+    while (pos + 4 <= extensions_end) {
+        const ext_type = std.mem.readInt(u16, record_bytes[pos..][0..2], .big);
+        const ext_len = std.mem.readInt(u16, record_bytes[pos + 2 ..][0..2], .big);
+        pos += 4;
+        const ext_end = pos + @as(usize, ext_len);
+        if (ext_end > extensions_end) return error.MalformedHandshake;
+        if (ext_type == c.TLSEXT_TYPE_application_layer_protocol_negotiation) {
+            if (pos + 3 > ext_end) return error.MalformedHandshake;
+            record_bytes[pos + 2] = record_bytes[pos + 2] +% 1;
+            return;
+        }
+        pos = ext_end;
+    }
+    return error.ProtocolConfigFailed;
+}
+
+fn writeAllFd(fd: std.posix.fd_t, bytes: []const u8) !void {
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        const n = std.c.write(fd, bytes.ptr + offset, bytes.len - offset);
+        if (n <= 0) return error.Unexpected;
+        offset += @intCast(n);
+    }
+}
+
+fn containsNoApplicationProtocolAlert(bytes: []const u8) bool {
+    var pos: usize = 0;
+    while (pos + 7 <= bytes.len) {
+        const content_type = bytes[pos];
+        const len = std.mem.readInt(u16, bytes[pos + 3 ..][0..2], .big);
+        const end = pos + 5 + @as(usize, len);
+        if (end > bytes.len) return false;
+        if (content_type == 21 and len >= 2 and bytes[pos + 5] == 2 and bytes[pos + 6] == c.SSL_AD_NO_APPLICATION_PROTOCOL) return true;
+        pos = end;
+    }
+    return false;
 }
 
 const ClientReadContext = struct {
@@ -1398,6 +1853,222 @@ test "tls terminator copies sni specs for maintenance reload" {
     tls.runMaintenance(2);
 }
 
+test "tls terminator updates protocol policy for future snapshots" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "test_server.crt", .data = embedded_server_crt });
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "test_server.key", .data = embedded_server_key });
+
+    const cert_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, "test_server.crt");
+    defer allocator.free(cert_path);
+    const key_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, "test_server.key");
+    defer allocator.free(key_path);
+
+    var tls = try TlsTerminator.init(allocator, .{
+        .cert_path = cert_path,
+        .key_path = key_path,
+        .http1_enabled = true,
+        .http2_enabled = true,
+    });
+    defer tls.deinit();
+
+    const handshake_a_snapshot = tls.protocolPolicySnapshot();
+    try std.testing.expect(handshake_a_snapshot.http1_enabled);
+    try std.testing.expect(handshake_a_snapshot.http2_enabled);
+
+    try tls.updateProtocolPolicy(.{ .http1_enabled = true, .http2_enabled = false });
+    const handshake_b_snapshot = tls.protocolPolicySnapshot();
+    try std.testing.expect(handshake_b_snapshot.http1_enabled);
+    try std.testing.expect(!handshake_b_snapshot.http2_enabled);
+    try std.testing.expectEqual(NegotiatedProtocol.http2, try negotiated_dispatch.selectNegotiatedProtocol("h2", handshake_a_snapshot));
+    try std.testing.expectError(error.ProtocolDisabled, negotiated_dispatch.selectNegotiatedProtocol("h2", handshake_b_snapshot));
+    try std.testing.expectError(error.ProtocolConfigFailed, tls.updateProtocolPolicy(.{ .http1_enabled = false, .http2_enabled = false }));
+}
+
+test "acceptWithPolicy pins policy from connection config generation" {
+    const allocator = std.testing.allocator;
+
+    {
+        var pair = try makeTestTlsPairWithOptions(allocator, .{
+            .server_http1_enabled = false,
+            .server_http2_enabled = true,
+            .server_accept_policy = .{
+                .http1_enabled = true,
+                .http2_enabled = false,
+            },
+            .client_alpn_wire = http11_only_wire_for_tests,
+        });
+        defer pair.deinit();
+
+        try std.testing.expectEqual(NegotiatedProtocol.http1_1, try pair.server.validatedNegotiatedProtocol());
+    }
+
+    {
+        var pair = try makeTestTlsPairWithOptions(allocator, .{
+            .server_http1_enabled = true,
+            .server_http2_enabled = false,
+            .server_accept_policy = .{
+                .http1_enabled = false,
+                .http2_enabled = true,
+            },
+            .client_alpn_wire = h2_only_wire_for_tests,
+        });
+        defer pair.deinit();
+
+        try std.testing.expectEqual(NegotiatedProtocol.http2, try pair.server.validatedNegotiatedProtocol());
+    }
+}
+
+test "acceptWithPolicy keeps leased policy when reload publishes before handshake" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "test_server.crt", .data = embedded_server_crt });
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "test_server.key", .data = embedded_server_key });
+    const cert_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, "test_server.crt");
+    defer allocator.free(cert_path);
+    const key_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, "test_server.key");
+    defer allocator.free(key_path);
+
+    var tls = try TlsTerminator.init(allocator, .{
+        .cert_path = cert_path,
+        .key_path = key_path,
+        .http1_enabled = true,
+        .http2_enabled = false,
+    });
+    defer tls.deinit();
+
+    const policy_a = negotiated_dispatch.ListenerProtocolPolicy{ .http1_enabled = true, .http2_enabled = false };
+    const policy_b = negotiated_dispatch.ListenerProtocolPolicy{ .http1_enabled = false, .http2_enabled = true };
+
+    var fds_a: [2]std.posix.fd_t = undefined;
+    if (std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds_a) != 0) return error.SocketPairFailed;
+    defer _ = std.c.close(fds_a[0]);
+    defer _ = std.c.close(fds_a[1]);
+    try testSetSocketTimeoutMs(fds_a[0], 1000);
+    try testSetSocketTimeoutMs(fds_a[1], 1000);
+
+    var client_a = try initTestClientSsl(fds_a[0], http11_only_wire_for_tests);
+    defer client_a.deinit();
+
+    var accept_a = BarrierAcceptContext{ .terminator = &tls, .fd = fds_a[1], .policy = policy_a };
+    const thread_a = try std.Thread.spawn(.{}, barrierAcceptThread, .{&accept_a});
+    var thread_a_joined = false;
+    defer if (!thread_a_joined) {
+        accept_a.release.store(true, .release);
+        _ = std.c.shutdown(fds_a[0], std.posix.SHUT.RDWR);
+        _ = std.c.shutdown(fds_a[1], std.posix.SHUT.RDWR);
+        thread_a.join();
+    };
+
+    var spins: usize = 0;
+    while (!accept_a.ready.load(.acquire) and spins < 1_000_000) : (spins += 1) {
+        std.Thread.yield() catch {};
+    }
+    try std.testing.expect(accept_a.ready.load(.acquire));
+
+    try tls.updateProtocolPolicy(policy_b);
+    accept_a.release.store(true, .release);
+    if (c.SSL_connect(client_a.ssl) != 1) return error.HandshakeFailed;
+    thread_a.join();
+    thread_a_joined = true;
+    if (accept_a.err) |err| return err;
+    var server_a = accept_a.conn orelse return error.HandshakeFailed;
+    defer server_a.deinit();
+    try std.testing.expectEqual(NegotiatedProtocol.http1_1, try server_a.validatedNegotiatedProtocol());
+
+    var fds_b: [2]std.posix.fd_t = undefined;
+    if (std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds_b) != 0) return error.SocketPairFailed;
+    defer _ = std.c.close(fds_b[0]);
+    defer _ = std.c.close(fds_b[1]);
+    try testSetSocketTimeoutMs(fds_b[0], 1000);
+    try testSetSocketTimeoutMs(fds_b[1], 1000);
+
+    var client_b = try initTestClientSsl(fds_b[0], h2_only_wire_for_tests);
+    defer client_b.deinit();
+    var accept_b = ServerAcceptContext{ .terminator = &tls, .fd = fds_b[1] };
+    const thread_b = try std.Thread.spawn(.{}, serverAcceptThread, .{&accept_b});
+    var thread_b_joined = false;
+    defer if (!thread_b_joined) {
+        _ = std.c.shutdown(fds_b[0], std.posix.SHUT.RDWR);
+        _ = std.c.shutdown(fds_b[1], std.posix.SHUT.RDWR);
+        thread_b.join();
+    };
+    if (c.SSL_connect(client_b.ssl) != 1) return error.HandshakeFailed;
+    thread_b.join();
+    thread_b_joined = true;
+    if (accept_b.err) |err| return err;
+    var server_b = accept_b.conn orelse return error.HandshakeFailed;
+    defer server_b.deinit();
+    try std.testing.expectEqual(NegotiatedProtocol.http2, try server_b.validatedNegotiatedProtocol());
+}
+
+test "test TLS pair rejects malformed local ALPN before spawning accept thread" {
+    try std.testing.expectError(error.ProtocolConfigFailed, makeTestTlsPairWithOptions(std.testing.allocator, .{
+        .client_alpn_wire = "\x08http",
+    }));
+}
+
+test "malformed on-wire ALPN sends no_application_protocol alert" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "test_server.crt", .data = embedded_server_crt });
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "test_server.key", .data = embedded_server_key });
+    const cert_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, "test_server.crt");
+    defer allocator.free(cert_path);
+    const key_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, "test_server.key");
+    defer allocator.free(key_path);
+
+    var tls = try TlsTerminator.init(allocator, .{
+        .cert_path = cert_path,
+        .key_path = key_path,
+        .http1_enabled = true,
+        .http2_enabled = true,
+    });
+    defer tls.deinit();
+
+    const malformed_hello = try buildMalformedAlpnClientHello(allocator);
+    defer allocator.free(malformed_hello);
+
+    var fds: [2]std.posix.fd_t = undefined;
+    if (std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds) != 0) return error.SocketPairFailed;
+    defer _ = std.c.close(fds[0]);
+    defer _ = std.c.close(fds[1]);
+    try testSetSocketTimeoutMs(fds[0], 1000);
+    try testSetSocketTimeoutMs(fds[1], 1000);
+
+    var accept_ctx = ServerAcceptContext{ .terminator = &tls, .fd = fds[1] };
+    const thread = try std.Thread.spawn(.{}, serverAcceptThread, .{&accept_ctx});
+    var thread_joined = false;
+    defer if (!thread_joined) {
+        _ = std.c.shutdown(fds[0], std.posix.SHUT.RDWR);
+        _ = std.c.shutdown(fds[1], std.posix.SHUT.RDWR);
+        thread.join();
+    };
+
+    try writeAllFd(fds[0], malformed_hello);
+    var alert_buf: [128]u8 = undefined;
+    const n = std.c.read(fds[0], &alert_buf, alert_buf.len);
+    if (n <= 0) return error.TlsReadFailed;
+    _ = std.c.shutdown(fds[0], std.posix.SHUT.RDWR);
+    _ = std.c.shutdown(fds[1], std.posix.SHUT.RDWR);
+    thread.join();
+    thread_joined = true;
+
+    try std.testing.expect(accept_ctx.conn == null);
+    if (accept_ctx.err) |err| {
+        try std.testing.expectEqual(error.HandshakeFailed, err);
+    } else {
+        return error.HandshakeFailed;
+    }
+    try std.testing.expect(containsNoApplicationProtocolAlert(alert_buf[0..@intCast(n)]));
+}
+
 test "openssl encrypted stream adapter conforms over production connection" {
     const allocator = std.testing.allocator;
     var pair = try makeTestTlsPair(allocator);
@@ -1431,6 +2102,64 @@ test "openssl encrypted stream adapter conforms over production connection" {
     var client_buf: ["server-reply".len]u8 = undefined;
     try clientReadExact(pair.client_ssl, &client_buf);
     try std.testing.expectEqualStrings("server-reply", &client_buf);
+}
+
+test "openssl listener ALPN follows server preference" {
+    const allocator = std.testing.allocator;
+    var pair = try makeTestTlsPairWithOptions(allocator, .{
+        .client_alpn_wire = http11_and_h2_wire_for_tests,
+    });
+    defer pair.deinit();
+
+    try std.testing.expectEqual(NegotiatedProtocol.http2, try pair.server.validatedNegotiatedProtocol());
+    try std.testing.expectEqualStrings("h2", pair.server.negotiatedAlpn().?);
+}
+
+test "openssl h1-only listener advertises only HTTP/1.1" {
+    const allocator = std.testing.allocator;
+    var pair = try makeTestTlsPairWithOptions(allocator, .{
+        .server_http2_enabled = false,
+        .client_alpn_wire = h2_and_http11_wire_for_tests,
+    });
+    defer pair.deinit();
+
+    try std.testing.expectEqual(NegotiatedProtocol.http1_1, try pair.server.validatedNegotiatedProtocol());
+    try std.testing.expectEqualStrings("http/1.1", pair.server.negotiatedAlpn().?);
+}
+
+test "openssl h2-only listener accepts only h2" {
+    const allocator = std.testing.allocator;
+    var pair = try makeTestTlsPairWithOptions(allocator, .{
+        .server_http1_enabled = false,
+        .server_http2_enabled = true,
+        .client_alpn_wire = h2_and_http11_wire_for_tests,
+    });
+    defer pair.deinit();
+
+    try std.testing.expectEqual(NegotiatedProtocol.http2, try pair.server.validatedNegotiatedProtocol());
+    try std.testing.expectEqualStrings("h2", pair.server.negotiatedAlpn().?);
+
+    try std.testing.expectError(error.HandshakeFailed, makeTestTlsPairWithOptions(allocator, .{
+        .server_http1_enabled = false,
+        .server_http2_enabled = true,
+        .client_alpn_wire = http11_only_wire_for_tests,
+    }));
+}
+
+test "openssl absent ALPN requires explicit HTTP/1.1 fallback during handshake" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.HandshakeFailed, makeTestTlsPairWithOptions(allocator, .{
+        .client_alpn_wire = null,
+        .server_http1_alpn_fallback_enabled = false,
+    }));
+
+    var fallback = try makeTestTlsPairWithOptions(allocator, .{
+        .client_alpn_wire = null,
+        .server_http1_alpn_fallback_enabled = true,
+    });
+    defer fallback.deinit();
+    try std.testing.expect(fallback.server.negotiatedAlpn() == null);
+    try std.testing.expectEqual(NegotiatedProtocol.http1_1, try fallback.server.validatedNegotiatedProtocol());
 }
 
 test "openssl encrypted stream preserves write retry direction under socket backpressure" {

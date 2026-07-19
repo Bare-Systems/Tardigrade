@@ -28,6 +28,7 @@
 const std = @import("std");
 const compat = @import("../zig_compat.zig");
 const gateway_state = @import("../gateway_state.zig");
+const downstream_connection = @import("downstream_connection.zig");
 const tls_termination = @import("tls_backend.zig");
 
 const ConnectionSession = gateway_state.ConnectionSession;
@@ -51,6 +52,18 @@ pub const ParkedConnection = struct {
 
     pub fn ip(self: *const ParkedConnection) []const u8 {
         return self.ip_buf[0..self.ip_len];
+    }
+
+    pub fn transportView(self: *ParkedConnection) downstream_connection.DownstreamTransport {
+        if (self.tls) |*tls| {
+            return .{ .openssl = .{ .conn = tls } };
+        }
+        return .{ .plaintext = self.fd };
+    }
+
+    pub fn eventInterest(self: *ParkedConnection) @import("event_loop.zig").Interest {
+        var transport = self.transportView();
+        return transport.interest();
     }
 
     fn setIp(self: *ParkedConnection, value: []const u8) void {
@@ -106,7 +119,7 @@ pub const ParkedRegistry = struct {
         served: u32,
         client_ip: []const u8,
         now_ms: u64,
-    ) !void {
+    ) !*ParkedConnection {
         const pc = try self.allocator.create(ParkedConnection);
         errdefer self.allocator.destroy(pc);
         pc.* = .{
@@ -122,6 +135,7 @@ pub const ParkedRegistry = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         try self.map.put(self.allocator, fd, pc);
+        return pc;
     }
 
     /// Re-park a connection that a worker just finished serving on resume. The
@@ -274,7 +288,8 @@ test "parkNew, resumeReady, checkout, repark transitions" {
     // Use a harmless dummy fd; closeSlot/reap will call close() which just
     // returns EBADF on a non-socket fd.
     const dummy_fd: std.posix.fd_t = 90001;
-    try reg.parkNew(dummy_fd, s1, null, 0, "127.0.0.1", 1000);
+    const parked = try reg.parkNew(dummy_fd, s1, null, 0, "127.0.0.1", 1000);
+    try testing.expectEqual(@import("event_loop.zig").Interest{ .read = true }, parked.eventInterest());
     try testing.expectEqual(@as(usize, 1), reg.count());
 
     // Unknown fd is not a parked connection.
@@ -311,8 +326,8 @@ test "reapIdle closes only sufficiently-idle parked connections" {
     var reg = ParkedRegistry.init(allocator, &pool);
     defer reg.deinit();
 
-    try reg.parkNew(90010, try pool.acquire(), null, 0, "10.0.0.1", 1000); // old
-    try reg.parkNew(90011, try pool.acquire(), null, 0, "10.0.0.2", 5000); // fresh
+    _ = try reg.parkNew(90010, try pool.acquire(), null, 0, "10.0.0.1", 1000); // old
+    _ = try reg.parkNew(90011, try pool.acquire(), null, 0, "10.0.0.2", 5000); // fresh
     try testing.expectEqual(@as(usize, 2), reg.count());
 
     // now=5500, timeout=1000: fd 90010 (age 4500) reaped, 90011 (age 500) kept.

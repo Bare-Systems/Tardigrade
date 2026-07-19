@@ -14,23 +14,98 @@ pub const Category = enum {
     algorithm_failure,
 };
 
-pub const Decision = enum { accept, reject };
+pub const Validator = enum { tardigrade, openssl, go_crypto_x509 };
 
-pub const Decisions = struct {
-    tardigrade: Decision,
-    openssl: Decision,
-    go: Decision,
+pub const Status = enum { accept, reject, tool_failure };
 
-    pub fn all(decision: Decision) Decisions {
+/// Validator-neutral, bounded semantic identity for one validation outcome.
+/// Native diagnostics are retained by the harness, but are never comparison
+/// keys or long-term manifest expectations.
+pub const Reason = enum {
+    accepted,
+    malformed_certificate,
+    malformed_der,
+    duplicate_extension,
+    unknown_critical_extension,
+    identity_mismatch,
+    name_constraints_violation,
+    path_length_violation,
+    signature_algorithm_invalid,
+    signature_invalid,
+    issuer_key_or_spki_invalid,
+    validity_failure,
+    key_usage_failure,
+    extended_key_usage_failure,
+    policy_failure,
+    untrusted_or_incomplete_path,
+    resource_limit,
+    oracle_launch_failure,
+    oracle_timeout,
+    oracle_signal,
+    oracle_stdout_limit,
+    oracle_stderr_limit,
+    oracle_malformed_output,
+    oracle_unexpected_exit,
+    oracle_failure,
+    unclassified_rejection,
+
+    pub fn isTool(self: Reason) bool {
+        return switch (self) {
+            .resource_limit,
+            .oracle_launch_failure,
+            .oracle_timeout,
+            .oracle_signal,
+            .oracle_stdout_limit,
+            .oracle_stderr_limit,
+            .oracle_malformed_output,
+            .oracle_unexpected_exit,
+            .oracle_failure,
+            => true,
+            else => false,
+        };
+    }
+};
+
+pub const Expected = struct {
+    status: Status,
+    reason: Reason,
+
+    pub fn accepted() Expected {
+        return .{ .status = .accept, .reason = .accepted };
+    }
+
+    pub fn rejected(reason: Reason) Expected {
+        return .{ .status = .reject, .reason = reason };
+    }
+
+    pub fn eql(self: Expected, other: Expected) bool {
+        return self.status == other.status and self.reason == other.reason;
+    }
+};
+
+pub const Expectations = struct {
+    tardigrade: Expected,
+    openssl: Expected,
+    go: Expected,
+
+    pub fn allAccepted() Expectations {
         return .{
-            .tardigrade = decision,
-            .openssl = decision,
-            .go = decision,
+            .tardigrade = .accepted(),
+            .openssl = .accepted(),
+            .go = .accepted(),
         };
     }
 
-    pub fn agree(self: Decisions) bool {
-        return self.tardigrade == self.openssl and self.openssl == self.go;
+    pub fn allRejected(reason: Reason) Expectations {
+        return .{
+            .tardigrade = .rejected(reason),
+            .openssl = .rejected(reason),
+            .go = .rejected(reason),
+        };
+    }
+
+    pub fn agree(self: Expectations) bool {
+        return self.tardigrade.eql(self.openssl) and self.openssl.eql(self.go);
     }
 };
 
@@ -42,7 +117,7 @@ pub const Case = struct {
     intermediate_file: ?[]const u8 = null,
     leaf_file: []const u8,
     dns_name: ?[]const u8 = null,
-    expected: Decisions,
+    expected: Expectations,
     /// Required whenever the three expected decisions differ. This is the
     /// explicit policy-normalization record, never an implicit waiver.
     normalization: ?[]const u8 = null,
@@ -64,7 +139,7 @@ pub const cases = [_]Case{
         .intermediate_file = hostile ++ "/intermediate.crt",
         .leaf_file = hostile ++ "/valid-leaf.crt",
         .dns_name = "api.example.test",
-        .expected = .all(.accept),
+        .expected = .allAccepted(),
         .provenance = "Deterministic project-owned Ed25519 fixture; see tests/vectors/pki/README.md",
         .license = "Apache-2.0",
         .regression_target = "src/pki/path_builder_tests.zig and src/pki/path_validator_tests.zig",
@@ -77,7 +152,7 @@ pub const cases = [_]Case{
         .intermediate_file = hostile ++ "/intermediate.crt",
         .leaf_file = hostile ++ "/wildcard-leaf.crt",
         .dns_name = "api.example.test",
-        .expected = .all(.accept),
+        .expected = .allAccepted(),
         .provenance = "Deterministic project-owned Ed25519 fixture; see tests/vectors/pki/README.md",
         .license = "Apache-2.0",
         .regression_target = "src/pki/identity_tests.zig",
@@ -90,7 +165,7 @@ pub const cases = [_]Case{
         .intermediate_file = hostile ++ "/intermediate.crt",
         .leaf_file = hostile ++ "/wildcard-leaf.crt",
         .dns_name = "example.test",
-        .expected = .all(.reject),
+        .expected = .allRejected(.identity_mismatch),
         .provenance = "Deterministic project-owned Ed25519 fixture; see tests/vectors/pki/README.md",
         .license = "Apache-2.0",
         .regression_target = "src/pki/identity_tests.zig",
@@ -103,7 +178,7 @@ pub const cases = [_]Case{
         .intermediate_file = hostile ++ "/intermediate.crt",
         .leaf_file = hostile ++ "/wildcard-leaf.crt",
         .dns_name = "deep.api.example.test",
-        .expected = .all(.reject),
+        .expected = .allRejected(.identity_mismatch),
         .provenance = "Deterministic project-owned Ed25519 fixture; see tests/vectors/pki/README.md",
         .license = "Apache-2.0",
         .regression_target = "src/pki/identity_tests.zig",
@@ -116,7 +191,7 @@ pub const cases = [_]Case{
         .intermediate_file = hostile ++ "/intermediate.crt",
         .leaf_file = hostile ++ "/unknown-critical-leaf.crt",
         .dns_name = "critical.example.test",
-        .expected = .all(.reject),
+        .expected = .allRejected(.unknown_critical_extension),
         .provenance = "Deterministic project-owned Ed25519 fixture; see tests/vectors/pki/README.md",
         .license = "Apache-2.0",
         .regression_target = "src/pki/path_validator_tests.zig",
@@ -129,7 +204,12 @@ pub const cases = [_]Case{
         .intermediate_file = hostile ++ "/intermediate.crt",
         .leaf_file = hostile ++ "/duplicate-extension-leaf.crt",
         .dns_name = "duplicate.example.test",
-        .expected = .all(.reject),
+        .expected = .{
+            .tardigrade = .rejected(.duplicate_extension),
+            .openssl = .rejected(.unknown_critical_extension),
+            .go = .rejected(.duplicate_extension),
+        },
+        .normalization = "OpenSSL reason=unknown_critical_extension while Tardigrade and Go crypto/x509 reason=duplicate_extension: OpenSSL reports numeric verify code 34 after parsing the duplicate critical extension.",
         .provenance = "Deterministic project-owned DER-mutated Ed25519 fixture; see tests/vectors/pki/README.md",
         .license = "Apache-2.0",
         .regression_target = "src/pki/x509_tests.zig and src/pki/path_validator_tests.zig",
@@ -142,7 +222,12 @@ pub const cases = [_]Case{
         .intermediate_file = hostile ++ "/intermediate.crt",
         .leaf_file = hostile ++ "/signature-corrupt-leaf.crt",
         .dns_name = "api.example.test",
-        .expected = .all(.reject),
+        .expected = .{
+            .tardigrade = .rejected(.signature_invalid),
+            .openssl = .rejected(.signature_invalid),
+            .go = .rejected(.untrusted_or_incomplete_path),
+        },
+        .normalization = "Go crypto/x509 reason=untrusted_or_incomplete_path while Tardigrade and OpenSSL reason=signature_invalid: Go exposes the failed candidate chain as UnknownAuthorityError rather than a stable signature-failure type.",
         .provenance = "Deterministic project-owned Ed25519 fixture with one signature bit changed; see tests/vectors/pki/README.md",
         .license = "Apache-2.0",
         .regression_target = "src/pki/verify_tests.zig",
@@ -155,7 +240,7 @@ pub const cases = [_]Case{
         .intermediate_file = hostile ++ "/pathlen-chain.crt",
         .leaf_file = hostile ++ "/pathlen-leaf.crt",
         .dns_name = "pathlen.example.test",
-        .expected = .all(.reject),
+        .expected = .allRejected(.path_length_violation),
         .provenance = "Deterministic project-owned Ed25519 fixture; see tests/vectors/pki/README.md",
         .license = "Apache-2.0",
         .regression_target = "src/pki/path_validator_tests.zig",
@@ -168,7 +253,7 @@ pub const cases = [_]Case{
         .intermediate_file = hostile ++ "/cross-untrusted-b-first.crt",
         .leaf_file = hostile ++ "/cross-leaf.crt",
         .dns_name = "cross.example.test",
-        .expected = .all(.accept),
+        .expected = .allAccepted(),
         .provenance = "Deterministic project-owned dual-root Ed25519 fixture; see tests/vectors/pki/README.md",
         .license = "Apache-2.0",
         .regression_target = "src/pki/path_builder_tests.zig",
@@ -179,7 +264,7 @@ pub const cases = [_]Case{
         .category = .malformed_der,
         .root_file = hostile ++ "/root.crt",
         .leaf_file = hostile ++ "/malformed-truncated.crt",
-        .expected = .all(.reject),
+        .expected = .allRejected(.malformed_der),
         .provenance = "Project-owned reduced malformed DER seed; see tests/vectors/pki/README.md",
         .license = "Apache-2.0",
         .regression_target = "src/pki/x509_tests.zig fuzz corpus",
@@ -192,8 +277,8 @@ pub const cases = [_]Case{
         .intermediate_file = nc ++ "/intermediate.crt",
         .leaf_file = nc ++ "/dns-good.crt",
         .dns_name = "api.example.com",
-        .expected = .{ .tardigrade = .accept, .openssl = .accept, .go = .reject },
-        .normalization = "Go crypto/x509 rejects the intermediate's critical directoryName constraint as an unhandled extension; Tardigrade and OpenSSL implement this RFC 5280 form.",
+        .expected = .{ .tardigrade = .accepted(), .openssl = .accepted(), .go = .rejected(.unknown_critical_extension) },
+        .normalization = "Go crypto/x509 status=reject reason=unknown_critical_extension while Tardigrade and OpenSSL status=accept reason=accepted: Go does not handle the intermediate's critical directoryName constraint.",
         .provenance = "Project-owned OpenSSL-generated RFC 5280 fixture; see src/pki/testdata/name_constraints/README.md",
         .license = "Apache-2.0",
         .regression_target = "src/pki/name_constraints.zig and src/pki/identity_tests.zig",
@@ -206,7 +291,12 @@ pub const cases = [_]Case{
         .intermediate_file = nc ++ "/intermediate.crt",
         .leaf_file = nc ++ "/dns-excluded.crt",
         .dns_name = "blocked.example.com",
-        .expected = .all(.reject),
+        .expected = .{
+            .tardigrade = .rejected(.name_constraints_violation),
+            .openssl = .rejected(.name_constraints_violation),
+            .go = .rejected(.unknown_critical_extension),
+        },
+        .normalization = "Go crypto/x509 reason=unknown_critical_extension while Tardigrade and OpenSSL reason=name_constraints_violation: the legacy intermediate also contains a critical directoryName constraint unsupported by Go.",
         .provenance = "Project-owned OpenSSL-generated RFC 5280 fixture; see src/pki/testdata/name_constraints/README.md",
         .license = "Apache-2.0",
         .regression_target = "src/pki/name_constraints.zig",
@@ -219,7 +309,7 @@ pub const cases = [_]Case{
         .intermediate_file = nc ++ "/intermediate.crt",
         .leaf_file = nc ++ "/dns-good.crt",
         .dns_name = "wrong.example.com",
-        .expected = .all(.reject),
+        .expected = .allRejected(.identity_mismatch),
         .provenance = "Project-owned OpenSSL-generated RFC 5280 fixture; see src/pki/testdata/name_constraints/README.md",
         .license = "Apache-2.0",
         .regression_target = "src/pki/identity_tests.zig",
@@ -231,8 +321,8 @@ pub const cases = [_]Case{
         .root_file = nc ++ "/root.crt",
         .intermediate_file = nc ++ "/intermediate.crt",
         .leaf_file = nc ++ "/ip-good.crt",
-        .expected = .{ .tardigrade = .accept, .openssl = .accept, .go = .reject },
-        .normalization = "Go crypto/x509 rejects the intermediate's critical directoryName constraint as an unhandled extension; Tardigrade and OpenSSL implement this RFC 5280 form.",
+        .expected = .{ .tardigrade = .accepted(), .openssl = .accepted(), .go = .rejected(.unknown_critical_extension) },
+        .normalization = "Go crypto/x509 status=reject reason=unknown_critical_extension while Tardigrade and OpenSSL status=accept reason=accepted: Go does not handle the intermediate's critical directoryName constraint.",
         .provenance = "Project-owned OpenSSL-generated RFC 5280 fixture; see src/pki/testdata/name_constraints/README.md",
         .license = "Apache-2.0",
         .regression_target = "src/pki/name_constraints.zig",
@@ -244,7 +334,12 @@ pub const cases = [_]Case{
         .root_file = nc ++ "/root.crt",
         .intermediate_file = nc ++ "/intermediate.crt",
         .leaf_file = nc ++ "/ip-bad.crt",
-        .expected = .all(.reject),
+        .expected = .{
+            .tardigrade = .rejected(.name_constraints_violation),
+            .openssl = .rejected(.name_constraints_violation),
+            .go = .rejected(.unknown_critical_extension),
+        },
+        .normalization = "Go crypto/x509 reason=unknown_critical_extension while Tardigrade and OpenSSL reason=name_constraints_violation: the legacy intermediate also contains a critical directoryName constraint unsupported by Go.",
         .provenance = "Project-owned OpenSSL-generated RFC 5280 fixture; see src/pki/testdata/name_constraints/README.md",
         .license = "Apache-2.0",
         .regression_target = "src/pki/name_constraints.zig",
@@ -257,7 +352,7 @@ pub const cases = [_]Case{
         .intermediate_file = nc ++ "/leading-dot-intermediate.crt",
         .leaf_file = nc ++ "/leading-dot-subdomain.crt",
         .dns_name = "sub.example.com",
-        .expected = .all(.accept),
+        .expected = .allAccepted(),
         .provenance = "Project-owned OpenSSL-generated RFC 5280 fixture; see src/pki/testdata/name_constraints/README.md",
         .license = "Apache-2.0",
         .regression_target = "src/pki/name_constraints.zig",
@@ -270,7 +365,7 @@ pub const cases = [_]Case{
         .intermediate_file = nc ++ "/leading-dot-intermediate.crt",
         .leaf_file = nc ++ "/leading-dot-exact.crt",
         .dns_name = "example.com",
-        .expected = .all(.reject),
+        .expected = .allRejected(.name_constraints_violation),
         .provenance = "Project-owned OpenSSL-generated RFC 5280 fixture; see src/pki/testdata/name_constraints/README.md",
         .license = "Apache-2.0",
         .regression_target = "src/pki/name_constraints.zig",

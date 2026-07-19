@@ -506,6 +506,9 @@ pub fn build(b: *std.Build) void {
     const pki_go_validator_output = pki_go_validator_build.addOutputFileArg("pki_go_validator");
     pki_go_validator_build.addFileArg(b.path("tests/pki_go_validator.go"));
     const pki_go_validator_install = b.addInstallBinFile(pki_go_validator_output, "pki_go_validator");
+    const pki_go_validator_tests = b.addSystemCommand(&.{ go_bin, "test" });
+    pki_go_validator_tests.addFileArg(b.path("tests/pki_go_validator.go"));
+    pki_go_validator_tests.addFileArg(b.path("tests/pki_go_validator_test.go"));
     const pki_diff_options = b.addOptions();
     pki_diff_options.addOption([]const u8, "process_helper_path", b.getInstallPath(.bin, "pki_process_helper"));
     pki_diff_options.addOption([]const u8, "go_validator_path", b.getInstallPath(.bin, "pki_go_validator"));
@@ -541,6 +544,7 @@ pub fn build(b: *std.Build) void {
     });
     const run_pki_differential_core_tests = b.addRunArtifact(pki_differential_core_tests);
     run_pki_differential_core_tests.step.dependOn(&pki_go_validator_install.step);
+    run_pki_differential_core_tests.step.dependOn(&pki_go_validator_tests.step);
     const pki_differential_step = b.step("test-pki-differential", "Run stable PKI differential corpus against OpenSSL and Go");
     pki_differential_step.dependOn(&run_pki_differential_core_tests.step);
 
@@ -550,6 +554,7 @@ pub fn build(b: *std.Build) void {
     });
     const run_pki_differential_full_tests = b.addRunArtifact(pki_differential_full_tests);
     run_pki_differential_full_tests.step.dependOn(&pki_go_validator_install.step);
+    run_pki_differential_full_tests.step.dependOn(&pki_go_validator_tests.step);
     const pki_differential_extended_step = b.step("test-pki-differential-extended", "Run full PKI differential corpus against OpenSSL and Go");
     pki_differential_extended_step.dependOn(&run_pki_differential_full_tests.step);
 

@@ -84,10 +84,10 @@ pub const entries = [_]Entry{
         .placement = .leaf,
         .provenance = "DER payload of tests/vectors/pki/signature-corrupt-leaf.crt, " ++
             "minimized by tests/pki_reduce.zig under the full-pipeline class oracle " ++
-            "(reject|signature_invalid at the leaf); the certificate parses, so the " ++
+            "(reject|signature_invalid|0 at the leaf); the certificate parses, so the " ++
             "regression replays the recorded class through path building and " ++
             "validation rather than asserting a parse error.",
         .license = "Apache-2.0",
-        .expected = .{ .tardigrade_class = "reject|signature_invalid certificate_index=0" },
+        .expected = .{ .tardigrade_class = "reject|signature_invalid|0" },
     }),
 };

@@ -63,22 +63,23 @@ minimization (`tests/pki_reduce.zig`): deterministic greedy delta debugging
 under a hard per-component oracle-call budget. The mismatch can live anywhere
 in the chain, so every component — the leaf, each intermediate, and each
 trust anchor — gets its own reduction pass that substitutes only that
-certificate's DER while Tardigrade's exact classification (status plus
-diagnostic, never just accept/reject) must be preserved; the component with
+certificate's DER while Tardigrade's semantic classification (status, bounded
+reason, and certificate index when known) must be preserved; the component with
 the largest shrink wins deterministically.
 
 An emitted reduced fixture is always a reproduction of the observed
 disagreement. The harness writes the reduced component
 (`<case-id>.reduced.der`/`.crt`, plus a substituted bundle file when the
 component is an intermediate or root) and re-verifies the reduced case
-against all three validators. If any validator's status diverges from the
-original tuple, the reduction is reverted to the original component bytes and
-the disqualifying decisions are recorded (`candidate_observed`,
-`reverted_external_divergence`). The schema-v3 artifact records the
+against all three validators. If any validator's semantic tuple diverges from
+the original tuple, the reduction is reverted to the original component bytes
+and the disqualifying observations are recorded (`candidate_observed`,
+`reverted_external_divergence`). The schema-v4 artifact records the
 component, sizes, oracle budget spent, `budget_exhausted` and `one_minimal`
 flags (1-minimality is only claimed after a completed single-byte sweep),
-SHA-256, per-validator reduced decisions, and a `promotable` verdict that
-requires the observed statuses to survive.
+SHA-256, per-validator reduced semantic observations, validator identities,
+runtime OS/architecture, subprocess bounds, and a `promotable` verdict that
+requires the observed status/reason/index tuples to survive.
 
 Promotable inputs land in `reduced/manifest.zig`, the registry the build
 embeds into the PKI unit-test module. Every seed automatically joins the DER

@@ -49,8 +49,29 @@ type config struct {
 type decision struct {
 	Validator  string `json:"validator"`
 	Accepted   bool   `json:"accepted"`
+	Status     string `json:"status"`
+	Reason     string `json:"reason"`
 	Diagnostic string `json:"diagnostic"`
 }
+
+const (
+	statusAccept      = "accept"
+	statusReject      = "reject"
+	statusToolFailure = "tool_failure"
+)
+
+type classifiedError struct {
+	status string
+	reason string
+}
+
+type certificateParseError struct {
+	reason string
+	err    error
+}
+
+func (e *certificateParseError) Error() string { return e.err.Error() }
+func (e *certificateParseError) Unwrap() error { return e.err }
 
 type certificateFile struct {
 	path         string
@@ -165,7 +186,10 @@ func validate(cfg config) (decision, error) {
 		return rejected(err), nil
 	}
 	if len(leafCertificates) != 1 {
-		return rejected(fmt.Errorf("leaf %q contains %d certificates; expected exactly one", leafFile.path, len(leafCertificates))), nil
+		return rejected(&certificateParseError{
+			reason: "malformed_certificate",
+			err:    fmt.Errorf("leaf %q contains %d certificates; expected exactly one", leafFile.path, len(leafCertificates)),
+		}), nil
 	}
 
 	chains, err := leafCertificates[0].Verify(x509.VerifyOptions{
@@ -181,6 +205,8 @@ func validate(cfg config) (decision, error) {
 	return decision{
 		Validator:  validatorName,
 		Accepted:   true,
+		Status:     statusAccept,
+		Reason:     "accepted",
 		Diagnostic: boundedDiagnostic(fmt.Sprintf("verified %d chain(s)", len(chains))),
 	}, nil
 }
@@ -218,7 +244,7 @@ func readCertificateFile(path string) (certificateFile, error) {
 
 func parsePEMCertificates(file certificateFile) ([]*x509.Certificate, error) {
 	if file.contentIssue != "" {
-		return nil, errors.New(file.contentIssue)
+		return nil, &certificateParseError{reason: "resource_limit", err: errors.New(file.contentIssue)}
 	}
 
 	remaining := file.contents
@@ -226,29 +252,131 @@ func parsePEMCertificates(file certificateFile) ([]*x509.Certificate, error) {
 	for len(bytes.TrimSpace(remaining)) != 0 {
 		block, rest := pem.Decode(remaining)
 		if block == nil {
-			return nil, fmt.Errorf("certificate file %q contains malformed PEM data", file.path)
+			return nil, &certificateParseError{
+				reason: "malformed_certificate",
+				err:    fmt.Errorf("certificate file %q contains malformed PEM data", file.path),
+			}
 		}
 		remaining = rest
 		if block.Type != "CERTIFICATE" {
-			return nil, fmt.Errorf("certificate file %q contains unexpected PEM block %q", file.path, block.Type)
+			return nil, &certificateParseError{
+				reason: "malformed_certificate",
+				err:    fmt.Errorf("certificate file %q contains unexpected PEM block %q", file.path, block.Type),
+			}
 		}
 		certificate, err := x509.ParseCertificate(block.Bytes)
 		if err != nil {
-			return nil, fmt.Errorf("parse certificate in %q: %w", file.path, err)
+			return nil, &certificateParseError{
+				reason: classifyParseError(err),
+				err:    fmt.Errorf("parse certificate in %q: %w", file.path, err),
+			}
 		}
 		certificates = append(certificates, certificate)
 	}
 	if len(certificates) == 0 {
-		return nil, fmt.Errorf("certificate file %q contains no CERTIFICATE PEM block", file.path)
+		return nil, &certificateParseError{
+			reason: "malformed_certificate",
+			err:    fmt.Errorf("certificate file %q contains no CERTIFICATE PEM block", file.path),
+		}
 	}
 	return certificates, nil
 }
 
 func rejected(reason error) decision {
+	classification := classifyError(reason)
 	return decision{
 		Validator:  validatorName,
 		Accepted:   false,
+		Status:     classification.status,
+		Reason:     classification.reason,
 		Diagnostic: boundedDiagnostic(reason.Error()),
+	}
+}
+
+func classifyError(err error) classifiedError {
+	var parseErr *certificateParseError
+	if errors.As(err, &parseErr) {
+		status := statusReject
+		if parseErr.reason == "resource_limit" {
+			status = statusToolFailure
+		}
+		return classifiedError{status: status, reason: parseErr.reason}
+	}
+
+	var hostname x509.HostnameError
+	if errors.As(err, &hostname) {
+		return classifiedError{status: statusReject, reason: "identity_mismatch"}
+	}
+	var unknownAuthority x509.UnknownAuthorityError
+	if errors.As(err, &unknownAuthority) {
+		return classifiedError{status: statusReject, reason: "untrusted_or_incomplete_path"}
+	}
+	var invalid x509.CertificateInvalidError
+	if errors.As(err, &invalid) {
+		return classifyInvalidReason(invalid.Reason)
+	}
+	var constraint x509.ConstraintViolationError
+	if errors.As(err, &constraint) {
+		return classifiedError{status: statusReject, reason: "key_usage_failure"}
+	}
+	var insecure x509.InsecureAlgorithmError
+	if errors.As(err, &insecure) {
+		return classifiedError{status: statusReject, reason: "signature_algorithm_invalid"}
+	}
+	var unhandled x509.UnhandledCriticalExtension
+	if errors.As(err, &unhandled) {
+		return classifiedError{status: statusReject, reason: "unknown_critical_extension"}
+	}
+	var systemRoots x509.SystemRootsError
+	if errors.As(err, &systemRoots) {
+		return classifiedError{status: statusToolFailure, reason: "oracle_failure"}
+	}
+	return classifiedError{status: statusReject, reason: "unclassified_rejection"}
+}
+
+func classifyInvalidReason(reason x509.InvalidReason) classifiedError {
+	switch reason {
+	case x509.NotAuthorizedToSign:
+		return classifiedError{status: statusReject, reason: "key_usage_failure"}
+	case x509.Expired:
+		return classifiedError{status: statusReject, reason: "validity_failure"}
+	case x509.CANotAuthorizedForThisName, x509.NameConstraintsWithoutSANs, x509.UnconstrainedName:
+		return classifiedError{status: statusReject, reason: "name_constraints_violation"}
+	case x509.TooManyIntermediates:
+		return classifiedError{status: statusReject, reason: "path_length_violation"}
+	case x509.IncompatibleUsage, x509.CANotAuthorizedForExtKeyUsage:
+		return classifiedError{status: statusReject, reason: "extended_key_usage_failure"}
+	case x509.NameMismatch, x509.NoValidChains:
+		return classifiedError{status: statusReject, reason: "untrusted_or_incomplete_path"}
+	case x509.TooManyConstraints:
+		return classifiedError{status: statusToolFailure, reason: "resource_limit"}
+	default:
+		return classifiedError{status: statusReject, reason: "unclassified_rejection"}
+	}
+}
+
+// Go does not export typed parse reasons. Keep the compatibility seam small,
+// centralized, and bounded; any new diagnostic stays unclassified until a
+// fixture and focused test deliberately add it.
+func classifyParseError(err error) string {
+	message := boundedDiagnostic(err.Error())
+	switch {
+	case strings.Contains(message, "duplicate extension"):
+		return "duplicate_extension"
+	case strings.Contains(message, "inner and outer signature algorithm identifiers don't match"):
+		return "signature_algorithm_invalid"
+	case strings.Contains(message, "Ed25519 key encoded with illegal parameters"),
+		strings.Contains(message, "malformed public key"),
+		strings.Contains(message, "invalid RSA public key"):
+		return "issuer_key_or_spki_invalid"
+	case strings.Contains(message, "malformed signature"):
+		return "signature_algorithm_invalid"
+	case strings.Contains(message, "malformed certificate"),
+		strings.Contains(message, "asn1:"),
+		strings.Contains(message, "trailing data"):
+		return "malformed_der"
+	default:
+		return "unclassified_rejection"
 	}
 }
 

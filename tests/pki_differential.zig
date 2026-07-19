@@ -33,7 +33,9 @@ const default_artifact_dir = "zig-out/pki-differential-artifacts";
 const max_total_reduction_oracle_calls = 512;
 const promotion_registry = "tests/vectors/pki/reduced/manifest.zig";
 
-const Status = enum { accept, reject, tool_failure };
+const Validator = manifest.Validator;
+const Status = manifest.Status;
+const Reason = manifest.Reason;
 
 const RuntimeIdentity = struct {
     git_sha: []u8,
@@ -51,8 +53,11 @@ const RuntimeIdentity = struct {
 };
 
 const Observation = struct {
+    validator: Validator,
     status: Status,
+    reason: Reason,
     diagnostic: []u8,
+    certificate_index: ?usize = null,
 
     fn deinit(self: *Observation, allocator: std.mem.Allocator) void {
         allocator.free(self.diagnostic);
@@ -99,27 +104,107 @@ const ParsedChain = struct {
 
 fn observation(
     allocator: std.mem.Allocator,
+    validator: Validator,
     status: Status,
+    reason: Reason,
+    certificate_index: ?usize,
     comptime format: []const u8,
     args: anytype,
-) !Observation {
+) error{OutOfMemory}!Observation {
+    validateObservation(status, reason) catch unreachable;
     return .{
+        .validator = validator,
         .status = status,
+        .reason = reason,
         .diagnostic = try std.fmt.allocPrint(allocator, format, args),
+        .certificate_index = certificate_index,
     };
 }
 
-fn processFailureObservation(allocator: std.mem.Allocator, result: bounded_process.Result) !Observation {
+fn validateObservation(status: Status, reason: Reason) !void {
+    switch (status) {
+        .accept => if (reason != .accepted) return error.InvalidObservation,
+        .reject => if (reason == .accepted or reason.isTool()) return error.InvalidObservation,
+        .tool_failure => if (!reason.isTool()) return error.InvalidObservation,
+    }
+}
+
+fn processFailureReason(outcome: bounded_process.Outcome) Reason {
+    return switch (outcome) {
+        .normal_exit => .oracle_failure,
+        .launch_failure => .oracle_launch_failure,
+        .timeout => .oracle_timeout,
+        .signal => .oracle_signal,
+        .unexpected_exit_code => .oracle_unexpected_exit,
+        .stdout_limit_exceeded => .oracle_stdout_limit,
+        .stderr_limit_exceeded => .oracle_stderr_limit,
+        .malformed_validator_output => .oracle_malformed_output,
+    };
+}
+
+fn processFailureObservation(
+    allocator: std.mem.Allocator,
+    validator: Validator,
+    result: bounded_process.Result,
+) !Observation {
     return .{
+        .validator = validator,
         .status = .tool_failure,
+        .reason = processFailureReason(result.outcome),
         .diagnostic = try allocator.dupe(u8, result.diagnostic[0..@min(result.diagnostic.len, 2048)]),
+    };
+}
+
+fn tardigradeErrorReason(err: anyerror) Reason {
+    return switch (err) {
+        error.MalformedCertificateDer,
+        error.Truncated,
+        error.InvalidTag,
+        error.InvalidLength,
+        error.NonMinimalLength,
+        error.IndefiniteLength,
+        error.LengthOverflow,
+        error.LengthBeyondInput,
+        error.UnexpectedTag,
+        error.MalformedInteger,
+        error.MalformedBoolean,
+        error.MalformedBitString,
+        error.MalformedOid,
+        error.MalformedString,
+        error.MalformedTime,
+        error.TrailingData,
+        => .malformed_der,
+        error.DuplicateExtension => .duplicate_extension,
+        error.MalformedAlgorithm,
+        error.SignatureAlgorithmMismatch,
+        error.MalformedSignature,
+        => .signature_algorithm_invalid,
+        error.MalformedPublicKeyInfo => .issuer_key_or_spki_invalid,
+        error.NoCandidatePath => .untrusted_or_incomplete_path,
+        error.MalformedCertificate,
+        error.UnsupportedVersion,
+        error.MalformedSerialNumber,
+        error.MalformedName,
+        error.MalformedValidity,
+        error.MalformedUniqueId,
+        error.MalformedExtension,
+        error.NamePreparationFailed,
+        error.NoCertificates,
+        error.MalformedPemBoundary,
+        error.MismatchedPemLabel,
+        error.UnterminatedPemBlock,
+        error.InvalidPemBase64,
+        error.EmptyPemBlock,
+        => .malformed_certificate,
+        else => if (isResourceLimitError(err)) .resource_limit else .unclassified_rejection,
     };
 }
 
 fn rejectionFromError(allocator: std.mem.Allocator, err: anyerror) !Observation {
     if (err == error.OutOfMemory) return error.OutOfMemory;
-    const status: Status = if (isResourceLimitError(err)) .tool_failure else .reject;
-    return observation(allocator, status, "{s}", .{@errorName(err)});
+    const reason = tardigradeErrorReason(err);
+    const status: Status = if (reason.isTool()) .tool_failure else .reject;
+    return observation(allocator, .tardigrade, status, reason, null, "{s}", .{@errorName(err)});
 }
 
 fn isResourceLimitError(err: anyerror) bool {
@@ -145,6 +230,36 @@ fn isResourceLimitReason(reason: pki.path_validator.FailureReason) bool {
     };
 }
 
+fn tardigradeFailureReason(reason: pki.path_validator.FailureReason) Reason {
+    return switch (reason) {
+        .malformed_path => .malformed_certificate,
+        .invalid_anchor_termination, .untrusted_anchor => .untrusted_or_incomplete_path,
+        .signature_invalid => .signature_invalid,
+        .signature_algorithm_unsupported, .signature_key_mismatch, .signature_malformed => .signature_algorithm_invalid,
+        .issuer_public_key_malformed => .issuer_key_or_spki_invalid,
+        .certificate_not_yet_valid, .certificate_expired => .validity_failure,
+        .issuer_is_not_ca, .key_usage_violation => .key_usage_failure,
+        .path_length_exceeded => .path_length_violation,
+        .extended_key_usage_violation => .extended_key_usage_failure,
+        .unknown_critical_extension => .unknown_critical_extension,
+        .duplicate_extension => .duplicate_extension,
+        .name_constraints_violation, .name_constraints_unsupported => .name_constraints_violation,
+        .certificate_policy_invalid,
+        .certificate_policy_required,
+        .certificate_policy_unsupported_qualifier,
+        .policy_mapping_invalid,
+        .policy_constraints_invalid,
+        .inhibit_any_policy_invalid,
+        => .policy_failure,
+        .identity_mismatch, .invalid_identity_reference => .identity_mismatch,
+        .name_constraints_resource_limit_exceeded,
+        .certificate_policy_resource_limit_exceeded,
+        .validation_resource_limit_exceeded,
+        .out_of_memory,
+        => .resource_limit,
+    };
+}
+
 fn tardigradeDecision(allocator: std.mem.Allocator, case: manifest.Case) !Observation {
     const anchor_inputs = [_]pki.trust_store.FileInput{.{ .pem = case.root_file }};
     var anchors = pki.trust_store.Snapshot.loadFiles(
@@ -160,7 +275,7 @@ fn tardigradeDecision(allocator: std.mem.Allocator, case: manifest.Case) !Observ
         return rejectionFromError(allocator, err);
     defer leaf_chain.deinit(allocator);
     if (leaf_chain.certificates.len != 1) {
-        return observation(allocator, .reject, "leaf bundle contains {d} certificates", .{leaf_chain.certificates.len});
+        return observation(allocator, .tardigrade, .reject, .malformed_certificate, null, "leaf bundle contains {d} certificates", .{leaf_chain.certificates.len});
     }
 
     var intermediates: ?ParsedChain = null;
@@ -218,16 +333,21 @@ fn tardigradeLeafObservation(
     );
     defer result.deinit(allocator);
     return switch (result) {
-        .accepted => observation(allocator, .accept, "accepted", .{}),
-        .rejected => |failure| if (isResourceLimitReason(failure.reason))
-            observation(allocator, .tool_failure, "validator resource failure: {s}", .{@tagName(failure.reason)})
-        else
-            observation(
+        .accepted => observation(allocator, .tardigrade, .accept, .accepted, null, "accepted", .{}),
+        .rejected => |failure| blk: {
+            if (failure.reason == .out_of_memory) return error.OutOfMemory;
+            const reason = tardigradeFailureReason(failure.reason);
+            const status: Status = if (isResourceLimitReason(failure.reason)) .tool_failure else .reject;
+            break :blk observation(
                 allocator,
-                .reject,
+                .tardigrade,
+                status,
+                reason,
+                failure.certificate_index,
                 "{s} certificate_index={?d}",
                 .{ @tagName(failure.reason), failure.certificate_index },
-            ),
+            );
+        },
     };
 }
 
@@ -315,26 +435,94 @@ fn opensslDecision(allocator: std.mem.Allocator, case: manifest.Case, deadline_m
     });
     defer result.deinit(allocator);
 
-    const status: Status = switch (result.outcome) {
+    const exit_code = switch (result.outcome) {
         .normal_exit => |code| switch (code) {
-            0 => .accept,
+            0, 2 => code,
             // `openssl verify` reserves 2 for a completed verification that
             // rejected the candidate. Usage, file, and setup failures use a
             // different exit and must never masquerade as negative vectors.
-            2 => .reject,
-            else => .tool_failure,
+            else => return processFailureObservation(allocator, .openssl, result),
         },
-        else => return processFailureObservation(allocator, result),
+        else => return processFailureObservation(allocator, .openssl, result),
     };
+    const diagnostic = try externalDiagnostic(allocator, result.stdout, result.stderr);
+    errdefer allocator.free(diagnostic);
+    const classified = if (exit_code == 0)
+        OpenSSLClassification{ .status = .accept, .reason = .accepted }
+    else
+        classifyOpenSSLRejection(case, diagnostic);
     return .{
-        .status = status,
-        .diagnostic = try externalDiagnostic(allocator, result.stdout, result.stderr),
+        .validator = .openssl,
+        .status = classified.status,
+        .reason = classified.reason,
+        .diagnostic = diagnostic,
     };
+}
+
+const OpenSSLClassification = struct { status: Status, reason: Reason };
+
+fn parseOpenSSLVerifyCode(diagnostic: []const u8) ?u16 {
+    var rest = diagnostic;
+    while (std.mem.indexOf(u8, rest, "error ")) |offset| {
+        rest = rest[offset + "error ".len ..];
+        var end: usize = 0;
+        while (end < rest.len and std.ascii.isDigit(rest[end])) : (end += 1) {}
+        if (end != 0 and std.mem.startsWith(u8, rest[end..], " at ")) {
+            return std.fmt.parseInt(u16, rest[0..end], 10) catch null;
+        }
+        if (rest.len == 0) break;
+        rest = rest[1..];
+    }
+    return null;
+}
+
+fn opensslReasonForCode(code: u16) Reason {
+    return switch (code) {
+        2, 18, 19, 20, 21, 27, 28, 30, 31, 56 => .untrusted_or_incomplete_path,
+        4, 7 => .signature_invalid,
+        6, 76 => .issuer_key_or_spki_invalid,
+        9, 10 => .validity_failure,
+        22, 25 => .path_length_violation,
+        24, 32, 35 => .key_usage_failure,
+        26 => .extended_key_usage_failure,
+        34 => .unknown_critical_extension,
+        37, 38, 39, 49 => .policy_failure,
+        41, 42, 57, 58, 59, 60, 61, 75, 77, 78 => .signature_algorithm_invalid,
+        47, 48, 50, 51, 52, 53, 54 => .name_constraints_violation,
+        62, 63, 64, 65 => .identity_mismatch,
+        else => .unclassified_rejection,
+    };
+}
+
+fn classifyOpenSSLRejection(case: manifest.Case, diagnostic: []const u8) OpenSSLClassification {
+    if (parseOpenSSLVerifyCode(diagnostic)) |code| return .{
+        .status = .reject,
+        .reason = opensslReasonForCode(code),
+    };
+    // OpenSSL's STORE layer reports a committed, present certificate whose
+    // DER cannot be decoded as "Could not find certificate file". Restrict
+    // this exception to manifest-declared malformed inputs; missing files,
+    // command usage failures, and setup errors remain harness failures.
+    if (case.category == .malformed_der and
+        std.mem.indexOf(u8, diagnostic, "Could not find certificate file from ") != null)
+    {
+        return .{ .status = .reject, .reason = .malformed_der };
+    }
+    if (std.mem.startsWith(u8, diagnostic, "verify:") or
+        std.mem.indexOf(u8, diagnostic, "No such file") != null or
+        std.mem.indexOf(u8, diagnostic, "Could not open file") != null or
+        std.mem.indexOf(u8, diagnostic, "Could not find certificate file") != null)
+    {
+        return .{ .status = .tool_failure, .reason = .oracle_failure };
+    }
+    return .{ .status = .reject, .reason = .unclassified_rejection };
 }
 
 const GoDecision = struct {
     validator: []const u8,
     accepted: bool,
+    status: Status,
+    reason: Reason,
     diagnostic: []const u8,
 };
 
@@ -365,44 +553,52 @@ fn goDecision(allocator: std.mem.Allocator, case: manifest.Case, deadline_ms: u3
 
     switch (result.outcome) {
         .normal_exit => {},
-        else => return processFailureObservation(allocator, result),
+        else => return processFailureObservation(allocator, .go_crypto_x509, result),
     }
 
-    var parsed = std.json.parseFromSlice(GoDecision, allocator, result.stdout, .{
+    return goObservationFromOutput(allocator, result.stdout);
+}
+
+fn goObservationFromOutput(allocator: std.mem.Allocator, output: []const u8) !Observation {
+    var parsed = std.json.parseFromSlice(GoDecision, allocator, output, .{
         .ignore_unknown_fields = false,
     }) catch |err| {
-        var malformed = try bounded_process.Result.malformedValidatorOutput(
+        return observation(
             allocator,
-            result.stdout,
-            result.stderr,
+            .go_crypto_x509,
+            .tool_failure,
+            .oracle_malformed_output,
+            null,
             "malformed Go oracle JSON: {s}",
             .{@errorName(err)},
         );
-        defer malformed.deinit(allocator);
-        return processFailureObservation(allocator, malformed);
     };
     defer parsed.deinit();
     if (!std.mem.eql(u8, parsed.value.validator, "go-crypto-x509")) {
-        return observation(allocator, .tool_failure, "unexpected Go oracle identity: {s}", .{parsed.value.validator});
+        return observation(allocator, .go_crypto_x509, .tool_failure, .oracle_malformed_output, null, "unexpected Go oracle identity: {s}", .{parsed.value.validator});
+    }
+    validateObservation(parsed.value.status, parsed.value.reason) catch {
+        return observation(allocator, .go_crypto_x509, .tool_failure, .oracle_malformed_output, null, "invalid Go observation status={s} reason={s}", .{ @tagName(parsed.value.status), @tagName(parsed.value.reason) });
+    };
+    if (parsed.value.accepted != (parsed.value.status == .accept)) {
+        return observation(allocator, .go_crypto_x509, .tool_failure, .oracle_malformed_output, null, "inconsistent Go accepted/status fields", .{});
     }
     return .{
-        .status = if (parsed.value.accepted) .accept else .reject,
+        .validator = .go_crypto_x509,
+        .status = parsed.value.status,
+        .reason = parsed.value.reason,
         .diagnostic = try allocator.dupe(u8, parsed.value.diagnostic[0..@min(parsed.value.diagnostic.len, 2048)]),
     };
 }
 
-fn expectedStatus(decision: manifest.Decision) Status {
-    return switch (decision) {
-        .accept => .accept,
-        .reject => .reject,
-    };
-}
-
-/// One stable string per observation class: status plus the deterministic
-/// diagnostic. Minimization preserves this exact class, never just the
-/// accept/reject bit, so a reduced input reproduces the same failure path.
+/// Stable semantic reduction identity. Diagnostics are intentionally omitted;
+/// they remain bounded evidence but vary across validator/library versions.
 fn classString(allocator: std.mem.Allocator, obs: Observation) error{OutOfMemory}![]u8 {
-    return std.fmt.allocPrint(allocator, "{s}|{s}", .{ @tagName(obs.status), obs.diagnostic });
+    return std.fmt.allocPrint(
+        allocator,
+        "{s}|{s}|{?d}",
+        .{ @tagName(obs.status), @tagName(obs.reason), obs.certificate_index },
+    );
 }
 
 const LeafOracle = struct {
@@ -812,11 +1008,40 @@ fn pemEncodeCertificate(allocator: std.mem.Allocator, der_bytes: []const u8) err
 }
 
 const ObservationView = struct {
+    validator: Validator,
     status: Status,
+    reason: Reason,
     diagnostic: []const u8,
+    certificate_index: ?usize,
 
     fn of(obs: Observation) ObservationView {
-        return .{ .status = obs.status, .diagnostic = obs.diagnostic };
+        return .{
+            .validator = obs.validator,
+            .status = obs.status,
+            .reason = obs.reason,
+            .diagnostic = obs.diagnostic,
+            .certificate_index = obs.certificate_index,
+        };
+    }
+};
+
+const ObservationKey = struct {
+    status: Status,
+    reason: Reason,
+    certificate_index: ?usize,
+
+    fn of(obs: Observation) ObservationKey {
+        return .{
+            .status = obs.status,
+            .reason = obs.reason,
+            .certificate_index = obs.certificate_index,
+        };
+    }
+
+    fn eql(self: ObservationKey, other: ObservationKey) bool {
+        return self.status == other.status and
+            self.reason == other.reason and
+            self.certificate_index == other.certificate_index;
     }
 };
 
@@ -852,7 +1077,7 @@ const ReductionJson = struct {
     /// Present only after an external-divergence revert: the decisions that
     /// disqualified the in-process minimum.
     candidate_observed: ?ObservedTriple,
-    preserves_observed_statuses: bool,
+    preserves_observed_semantics: bool,
     promotable: bool,
     promotion_registry: []const u8,
     regression_target: []const u8,
@@ -863,11 +1088,12 @@ fn observationsPreserveTarget(
     tardigrade: Observation,
     openssl: Observation,
     go: Observation,
-    original_statuses: [3]Status,
+    original_semantics: [3]ObservationKey,
     target_class: []const u8,
 ) error{OutOfMemory}!bool {
-    if (openssl.status != original_statuses[1] or go.status != original_statuses[2]) return false;
-    if (tardigrade.status != original_statuses[0]) return false;
+    if (!ObservationKey.of(openssl).eql(original_semantics[1]) or
+        !ObservationKey.of(go).eql(original_semantics[2]) or
+        !ObservationKey.of(tardigrade).eql(original_semantics[0])) return false;
     const class = try classString(allocator, tardigrade);
     defer allocator.free(class);
     return std.mem.eql(u8, class, target_class);
@@ -1081,10 +1307,10 @@ fn verifyAndPersistReduced(
     artifact_dir: []const u8,
     case: manifest.Case,
     r: *Reduction,
-    original_statuses: [3]Status,
+    original_semantics: [3]ObservationKey,
     deadline_ms: u32,
 ) !ReducedVerification {
-    return verifyAndPersistReducedWithVerifier(verifyReducedCase, allocator, dir, artifact_dir, case, r, original_statuses, deadline_ms);
+    return verifyAndPersistReducedWithVerifier(verifyReducedCase, allocator, dir, artifact_dir, case, r, original_semantics, deadline_ms);
 }
 
 fn verifyAndPersistReducedWithVerifier(
@@ -1094,7 +1320,7 @@ fn verifyAndPersistReducedWithVerifier(
     artifact_dir: []const u8,
     case: manifest.Case,
     r: *Reduction,
-    original_statuses: [3]Status,
+    original_semantics: [3]ObservationKey,
     deadline_ms: u32,
 ) !ReducedVerification {
     var best_index: ?usize = null;
@@ -1135,7 +1361,7 @@ fn verifyAndPersistReducedWithVerifier(
             tardigrade,
             openssl,
             go,
-            original_statuses,
+            original_semantics,
             r.target_class,
         );
         const shrink = candidate.shrink();
@@ -1231,7 +1457,7 @@ fn verifyAndPersistReducedWithVerifier(
         reverted_tardigrade,
         reverted_openssl,
         reverted_go,
-        original_statuses,
+        original_semantics,
         r.target_class,
     );
     if (!preserves) return error.TestUnexpectedResult;
@@ -1316,7 +1542,7 @@ fn writeArtifact(
                 .openssl = .of(verified.candidate_openssl.?),
                 .go = .of(verified.candidate_go.?),
             } else null,
-            .preserves_observed_statuses = verified.preserves,
+            .preserves_observed_semantics = verified.preserves,
             .promotable = reductionIsPromotable(r, verified),
             .promotion_registry = promotion_registry,
             .regression_target = case.regression_target,
@@ -1333,7 +1559,7 @@ fn writeArtifact(
     );
     defer allocator.free(reproduce);
     const payload = try compat.stringifyAlloc(allocator, .{
-        .schema_version = 3,
+        .schema_version = 4,
         .case_id = case.id,
         .profile = case.profile,
         .category = case.category,
@@ -1343,6 +1569,13 @@ fn writeArtifact(
             .openssl_version = runtime_identity.openssl_version,
             .go_version = runtime_identity.go_version,
             .zig_version = runtime_identity.zig_version,
+            .os = @tagName(builtin.os.tag),
+            .architecture = @tagName(builtin.cpu.arch),
+        },
+        .process_limits = .{
+            .deadline_ms = if (case.profile == .extended) extended_oracle_deadline_ms else oracle_deadline_ms,
+            .stdout_limit = max_oracle_output,
+            .stderr_limit = max_oracle_output,
         },
         .root_file = case.root_file,
         .intermediate_file = case.intermediate_file,
@@ -1374,9 +1607,9 @@ fn runCase(allocator: std.mem.Allocator, runtime_identity: RuntimeIdentity, case
     var go = try goDecision(allocator, case, deadline_ms);
     defer go.deinit(allocator);
 
-    const matches = tardigrade.status == expectedStatus(case.expected.tardigrade) and
-        openssl.status == expectedStatus(case.expected.openssl) and
-        go.status == expectedStatus(case.expected.go);
+    const matches = observationMatchesExpected(tardigrade, case.expected.tardigrade) and
+        observationMatchesExpected(openssl, case.expected.openssl) and
+        observationMatchesExpected(go, case.expected.go);
     if (matches) return;
 
     const artifact_dir = try artifactDir(allocator);
@@ -1388,9 +1621,9 @@ fn runCase(allocator: std.mem.Allocator, runtime_identity: RuntimeIdentity, case
     defer if (reduced) |*verification| verification.deinit(allocator);
     if (reduction) |*r| {
         reduced = verifyAndPersistReduced(allocator, compat.cwd(), artifact_dir, case, r, .{
-            tardigrade.status,
-            openssl.status,
-            go.status,
+            ObservationKey.of(tardigrade),
+            ObservationKey.of(openssl),
+            ObservationKey.of(go),
         }, deadline_ms) catch |err| blk: {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             std.debug.print(
@@ -1437,19 +1670,62 @@ fn runCase(allocator: std.mem.Allocator, runtime_identity: RuntimeIdentity, case
         );
     }
     std.debug.print(
-        "PKI differential mismatch case={s} expected=({s},{s},{s}) observed=({s},{s},{s}) artifact={s}\n",
+        "PKI differential mismatch case={s} expected=({s}/{s},{s}/{s},{s}/{s}) observed=({s}/{s},{s}/{s},{s}/{s}) artifact={s}\n",
         .{
             case.id,
-            @tagName(case.expected.tardigrade),
-            @tagName(case.expected.openssl),
-            @tagName(case.expected.go),
+            @tagName(case.expected.tardigrade.status),
+            @tagName(case.expected.tardigrade.reason),
+            @tagName(case.expected.openssl.status),
+            @tagName(case.expected.openssl.reason),
+            @tagName(case.expected.go.status),
+            @tagName(case.expected.go.reason),
             @tagName(tardigrade.status),
+            @tagName(tardigrade.reason),
             @tagName(openssl.status),
+            @tagName(openssl.reason),
             @tagName(go.status),
+            @tagName(go.reason),
             artifact_path,
         },
     );
     return error.TestUnexpectedResult;
+}
+
+fn observationMatchesExpected(obs: Observation, expected: manifest.Expected) bool {
+    if (obs.status == .tool_failure or obs.reason == .unclassified_rejection) return false;
+    return obs.status == expected.status and obs.reason == expected.reason;
+}
+
+fn expectedIsValid(expected: manifest.Expected) bool {
+    return switch (expected.status) {
+        .accept => expected.reason == .accepted,
+        .reject => expected.reason != .accepted and
+            expected.reason != .unclassified_rejection and
+            !expected.reason.isTool(),
+        .tool_failure => false,
+    };
+}
+
+fn normalizationIsNarrow(case: manifest.Case) bool {
+    if (case.expected.agree()) return true;
+    const text = case.normalization orelse return false;
+    if (text.len == 0 or text.len > 1024 or std.mem.indexOfScalar(u8, text, '*') != null) return false;
+
+    const fields = [_]struct { name: []const u8, value: manifest.Expected }{
+        .{ .name = "Tardigrade", .value = case.expected.tardigrade },
+        .{ .name = "OpenSSL", .value = case.expected.openssl },
+        .{ .name = "Go", .value = case.expected.go },
+    };
+    for (fields, 0..) |field, index| {
+        var differs = false;
+        for (fields, 0..) |other, other_index| {
+            if (index != other_index and !field.value.eql(other.value)) differs = true;
+        }
+        if (!differs) continue;
+        if (std.mem.indexOf(u8, text, field.name) == null) return false;
+        if (std.mem.indexOf(u8, text, @tagName(field.value.reason)) == null) return false;
+    }
+    return true;
 }
 
 fn validateManifest() !void {
@@ -1468,10 +1744,10 @@ fn validateManifest() !void {
         try testing.expect(!std.fs.path.isAbsolute(case.root_file));
         try testing.expect(!std.fs.path.isAbsolute(case.leaf_file));
         if (case.intermediate_file) |path| try testing.expect(!std.fs.path.isAbsolute(path));
-        if (!case.expected.agree()) {
-            try testing.expect(case.normalization != null);
-            try testing.expect(case.normalization.?.len > 0);
-        }
+        try testing.expect(expectedIsValid(case.expected.tardigrade));
+        try testing.expect(expectedIsValid(case.expected.openssl));
+        try testing.expect(expectedIsValid(case.expected.go));
+        try testing.expect(normalizationIsNarrow(case));
         try expectFixtureBounded(case.root_file);
         try expectFixtureBounded(case.leaf_file);
         if (case.intermediate_file) |path| try expectFixtureBounded(path);
@@ -1510,6 +1786,144 @@ fn runCorpus(include_extended: bool) !void {
 
 test "pki differential manifest is bounded and fully normalized" {
     try validateManifest();
+}
+
+test "pki reduce: observation invariants reject invalid status reason pairs" {
+    try validateObservation(.accept, .accepted);
+    try validateObservation(.reject, .identity_mismatch);
+    try validateObservation(.tool_failure, .oracle_timeout);
+    try testing.expectError(error.InvalidObservation, validateObservation(.accept, .identity_mismatch));
+    try testing.expectError(error.InvalidObservation, validateObservation(.reject, .accepted));
+    try testing.expectError(error.InvalidObservation, validateObservation(.reject, .oracle_timeout));
+    try testing.expectError(error.InvalidObservation, validateObservation(.tool_failure, .identity_mismatch));
+}
+
+test "pki reduce: Tardigrade failure reasons map structurally" {
+    const cases = [_]struct { pki.path_validator.FailureReason, Reason }{
+        .{ .signature_invalid, .signature_invalid },
+        .{ .signature_algorithm_unsupported, .signature_algorithm_invalid },
+        .{ .issuer_public_key_malformed, .issuer_key_or_spki_invalid },
+        .{ .certificate_expired, .validity_failure },
+        .{ .key_usage_violation, .key_usage_failure },
+        .{ .extended_key_usage_violation, .extended_key_usage_failure },
+        .{ .path_length_exceeded, .path_length_violation },
+        .{ .unknown_critical_extension, .unknown_critical_extension },
+        .{ .duplicate_extension, .duplicate_extension },
+        .{ .name_constraints_violation, .name_constraints_violation },
+        .{ .certificate_policy_invalid, .policy_failure },
+        .{ .identity_mismatch, .identity_mismatch },
+        .{ .untrusted_anchor, .untrusted_or_incomplete_path },
+        .{ .validation_resource_limit_exceeded, .resource_limit },
+    };
+    for (cases) |case| try testing.expectEqual(case[1], tardigradeFailureReason(case[0]));
+    try testing.expectEqual(Reason.malformed_der, tardigradeErrorReason(error.NonMinimalLength));
+    try testing.expectEqual(Reason.duplicate_extension, tardigradeErrorReason(error.DuplicateExtension));
+    try testing.expectEqual(Reason.unclassified_rejection, tardigradeErrorReason(error.NotDir));
+}
+
+test "pki reduce: OpenSSL numeric verification codes have stable semantic mappings" {
+    const cases = [_]struct { u16, Reason }{
+        .{ 2, .untrusted_or_incomplete_path },  .{ 18, .untrusted_or_incomplete_path },
+        .{ 19, .untrusted_or_incomplete_path }, .{ 20, .untrusted_or_incomplete_path },
+        .{ 21, .untrusted_or_incomplete_path }, .{ 27, .untrusted_or_incomplete_path },
+        .{ 28, .untrusted_or_incomplete_path }, .{ 30, .untrusted_or_incomplete_path },
+        .{ 31, .untrusted_or_incomplete_path }, .{ 56, .untrusted_or_incomplete_path },
+        .{ 4, .signature_invalid },             .{ 7, .signature_invalid },
+        .{ 6, .issuer_key_or_spki_invalid },    .{ 76, .issuer_key_or_spki_invalid },
+        .{ 9, .validity_failure },              .{ 10, .validity_failure },
+        .{ 22, .path_length_violation },        .{ 25, .path_length_violation },
+        .{ 24, .key_usage_failure },            .{ 32, .key_usage_failure },
+        .{ 35, .key_usage_failure },            .{ 26, .extended_key_usage_failure },
+        .{ 34, .unknown_critical_extension },   .{ 37, .policy_failure },
+        .{ 38, .policy_failure },               .{ 39, .policy_failure },
+        .{ 49, .policy_failure },               .{ 41, .signature_algorithm_invalid },
+        .{ 42, .signature_algorithm_invalid },  .{ 57, .signature_algorithm_invalid },
+        .{ 58, .signature_algorithm_invalid },  .{ 59, .signature_algorithm_invalid },
+        .{ 60, .signature_algorithm_invalid },  .{ 61, .signature_algorithm_invalid },
+        .{ 75, .signature_algorithm_invalid },  .{ 77, .signature_algorithm_invalid },
+        .{ 78, .signature_algorithm_invalid },  .{ 47, .name_constraints_violation },
+        .{ 48, .name_constraints_violation },   .{ 50, .name_constraints_violation },
+        .{ 51, .name_constraints_violation },   .{ 52, .name_constraints_violation },
+        .{ 53, .name_constraints_violation },   .{ 54, .name_constraints_violation },
+        .{ 62, .identity_mismatch },            .{ 63, .identity_mismatch },
+        .{ 64, .identity_mismatch },            .{ 65, .identity_mismatch },
+    };
+    for (cases) |case| try testing.expectEqual(case[1], opensslReasonForCode(case[0]));
+    try testing.expectEqual(Reason.unclassified_rejection, opensslReasonForCode(999));
+    try testing.expectEqual(@as(?u16, 62), parseOpenSSLVerifyCode("error 62 at 0 depth lookup: hostname mismatch"));
+    try testing.expectEqual(@as(?u16, null), parseOpenSSLVerifyCode("setup failed without verification code"));
+}
+
+test "pki reduce: malformed and wrong-identity Go JSON are tool failures" {
+    var malformed = try goObservationFromOutput(testing.allocator, "not-json");
+    defer malformed.deinit(testing.allocator);
+    try testing.expectEqual(Status.tool_failure, malformed.status);
+    try testing.expectEqual(Reason.oracle_malformed_output, malformed.reason);
+
+    var wrong = try goObservationFromOutput(
+        testing.allocator,
+        "{\"validator\":\"other\",\"accepted\":false,\"status\":\"reject\",\"reason\":\"identity_mismatch\",\"diagnostic\":\"no\"}",
+    );
+    defer wrong.deinit(testing.allocator);
+    try testing.expectEqual(Status.tool_failure, wrong.status);
+    try testing.expectEqual(Reason.oracle_malformed_output, wrong.reason);
+}
+
+test "pki reduce: reason mismatch fails despite equal rejection status" {
+    var obs = try fabricatedObservationFor(testing.allocator, .tardigrade, .reject, .identity_mismatch, "native detail");
+    defer obs.deinit(testing.allocator);
+    try testing.expect(observationMatchesExpected(obs, .rejected(.identity_mismatch)));
+    try testing.expect(!observationMatchesExpected(obs, .rejected(.name_constraints_violation)));
+
+    var tool = try fabricatedObservationFor(testing.allocator, .openssl, .tool_failure, .oracle_timeout, "deadline");
+    defer tool.deinit(testing.allocator);
+    try testing.expect(!observationMatchesExpected(tool, .rejected(.identity_mismatch)));
+
+    var unknown = try fabricatedObservationFor(testing.allocator, .openssl, .reject, .unclassified_rejection, "new code");
+    defer unknown.deinit(testing.allocator);
+    try testing.expect(!observationMatchesExpected(unknown, .rejected(.identity_mismatch)));
+}
+
+test "pki reduce: manifest rejects invalid expectations and broad normalizations" {
+    try testing.expect(expectedIsValid(.accepted()));
+    try testing.expect(expectedIsValid(.rejected(.identity_mismatch)));
+    try testing.expect(!expectedIsValid(.{ .status = .accept, .reason = .identity_mismatch }));
+    try testing.expect(!expectedIsValid(.{ .status = .reject, .reason = .unclassified_rejection }));
+    try testing.expect(!expectedIsValid(.{ .status = .tool_failure, .reason = .oracle_timeout }));
+
+    const broad = manifest.Case{
+        .id = "normalization-drill",
+        .profile = .core,
+        .category = .identity,
+        .root_file = "root",
+        .leaf_file = "leaf",
+        .expected = .{
+            .tardigrade = .rejected(.identity_mismatch),
+            .openssl = .rejected(.identity_mismatch),
+            .go = .rejected(.untrusted_or_incomplete_path),
+        },
+        .normalization = "all differences are allowed *",
+        .provenance = "test",
+        .license = "Apache-2.0",
+        .regression_target = "test",
+    };
+    try testing.expect(!normalizationIsNarrow(broad));
+    var missing = broad;
+    missing.normalization = null;
+    try testing.expect(!normalizationIsNarrow(missing));
+    var narrow = broad;
+    narrow.normalization = "Go reason=untrusted_or_incomplete_path differs from Tardigrade and OpenSSL reason=identity_mismatch for this exact fixture.";
+    try testing.expect(normalizationIsNarrow(narrow));
+}
+
+test "pki reduce: every bounded process outcome has a distinct tool reason" {
+    try testing.expectEqual(Reason.oracle_launch_failure, processFailureReason(.launch_failure));
+    try testing.expectEqual(Reason.oracle_timeout, processFailureReason(.timeout));
+    try testing.expectEqual(Reason.oracle_signal, processFailureReason(.{ .signal = .ABRT }));
+    try testing.expectEqual(Reason.oracle_stdout_limit, processFailureReason(.stdout_limit_exceeded));
+    try testing.expectEqual(Reason.oracle_stderr_limit, processFailureReason(.stderr_limit_exceeded));
+    try testing.expectEqual(Reason.oracle_malformed_output, processFailureReason(.malformed_validator_output));
+    try testing.expectEqual(Reason.oracle_unexpected_exit, processFailureReason(.{ .unexpected_exit_code = 7 }));
 }
 
 fn expectNormalExit(result: bounded_process.Result, expected_code: u8) !void {
@@ -1999,8 +2413,31 @@ test "pki reduce: registry entries resolve to real cases and replay their class"
     }
 }
 
+fn fabricatedObservationFor(
+    allocator: std.mem.Allocator,
+    validator: Validator,
+    status: Status,
+    reason: Reason,
+    text: []const u8,
+) !Observation {
+    return observation(allocator, validator, status, reason, null, "{s}", .{text});
+}
+
 fn fabricatedObservation(allocator: std.mem.Allocator, status: Status, text: []const u8) !Observation {
-    return observation(allocator, status, "{s}", .{text});
+    const reason: Reason = switch (status) {
+        .accept => .accepted,
+        .reject => if (std.mem.eql(u8, text, "DifferentReject")) .malformed_der else .malformed_certificate,
+        .tool_failure => .oracle_failure,
+    };
+    return fabricatedObservationFor(allocator, .tardigrade, status, reason, text);
+}
+
+fn fabricatedOriginalSemantics() [3]ObservationKey {
+    return .{
+        .{ .status = .reject, .reason = .malformed_certificate, .certificate_index = null },
+        .{ .status = .reject, .reason = .malformed_certificate, .certificate_index = null },
+        .{ .status = .accept, .reason = .accepted, .certificate_index = null },
+    };
 }
 
 // Minimal valid DER values (a SEQUENCE of INTEGERs) so the drill's PEM
@@ -2058,7 +2495,7 @@ fn drillReductionFromCandidates(
         .components_tried = candidate_configs.len,
         .budget_exhausted = initial.budget_exhausted,
         .one_minimal = initial.one_minimal,
-        .target_class = try allocator.dupe(u8, "reject|OriginalReject"),
+        .target_class = try allocator.dupe(u8, "reject|malformed_certificate|null"),
     };
 }
 
@@ -2190,8 +2627,8 @@ test "pki reduce: observation comparison cleanup is leak-free on allocation fail
                 tardigrade,
                 openssl,
                 go,
-                .{ .reject, .reject, .accept },
-                "reject|OriginalReject",
+                .{ ObservationKey.of(tardigrade), ObservationKey.of(openssl), ObservationKey.of(go) },
+                "reject|malformed_certificate|null",
             ));
             tardigrade.deinit(allocator);
             openssl.deinit(allocator);
@@ -2217,7 +2654,7 @@ test "pki reduce: verification materializes the winning candidate to canonical a
         .intermediate_file = "tests/vectors/pki/intermediate.crt",
         .leaf_file = "tests/vectors/pki/drill-leaf.crt",
         .dns_name = "drill.example.test",
-        .expected = .all(.reject),
+        .expected = .allRejected(.malformed_der),
         .provenance = "fabricated artifact-policy drill",
         .license = "Apache-2.0",
         .regression_target = "src/pki/x509_tests.zig",
@@ -2263,7 +2700,7 @@ test "pki reduce: verification materializes the winning candidate to canonical a
         "artifacts",
         case,
         &reduction,
-        .{ .reject, .reject, .accept },
+        fabricatedOriginalSemantics(),
         oracle_deadline_ms,
     );
     defer verification.deinit(allocator);
@@ -2334,7 +2771,7 @@ test "pki reduce: non-reproducing original fallback fails instead of returning a
         .intermediate_file = "tests/vectors/pki/intermediate.crt",
         .leaf_file = "tests/vectors/pki/drill-leaf.crt",
         .dns_name = "drill.example.test",
-        .expected = .all(.reject),
+        .expected = .allRejected(.malformed_der),
         .provenance = "fabricated artifact-policy fallback drill",
         .license = "Apache-2.0",
         .regression_target = "src/pki/x509_tests.zig",
@@ -2369,7 +2806,7 @@ test "pki reduce: non-reproducing original fallback fails instead of returning a
         "artifacts",
         case,
         &reduction,
-        .{ .reject, .reject, .accept },
+        fabricatedOriginalSemantics(),
         oracle_deadline_ms,
     ));
     try expectMissing(dir, "artifacts/artifact-policy-fallback-fails.candidate-0.candidate.der");
@@ -2392,7 +2829,7 @@ test "pki reduce: successful original fallback uses the real verification state 
         .intermediate_file = "tests/vectors/pki/intermediate.crt",
         .leaf_file = "tests/vectors/pki/drill-leaf.crt",
         .dns_name = "drill.example.test",
-        .expected = .all(.reject),
+        .expected = .allRejected(.malformed_der),
         .provenance = "fabricated artifact-policy fallback drill",
         .license = "Apache-2.0",
         .regression_target = "src/pki/x509_tests.zig",
@@ -2427,7 +2864,7 @@ test "pki reduce: successful original fallback uses the real verification state 
         "artifacts",
         case,
         &reduction,
-        .{ .reject, .reject, .accept },
+        fabricatedOriginalSemantics(),
         oracle_deadline_ms,
     );
     defer verification.deinit(allocator);
@@ -2498,7 +2935,7 @@ test "pki reduce: successful original fallback uses the real verification state 
     );
 }
 
-test "pki reduce: schema-v3 artifact is complete and reproducible" {
+test "pki reduce: schema-v4 artifact is complete and reproducible" {
     const allocator = testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2512,7 +2949,7 @@ test "pki reduce: schema-v3 artifact is complete and reproducible" {
         .intermediate_file = "tests/vectors/pki/intermediate.crt",
         .leaf_file = "tests/vectors/pki/drill-leaf.crt",
         .dns_name = "drill.example.test",
-        .expected = .all(.reject),
+        .expected = .allRejected(.malformed_der),
         .provenance = "fabricated artifact-schema drill",
         .license = "Apache-2.0",
         .regression_target = "src/pki/x509_tests.zig",
@@ -2599,7 +3036,7 @@ test "pki reduce: schema-v3 artifact is complete and reproducible" {
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
         defer parsed.deinit();
         const object = parsed.value.object;
-        try testing.expectEqual(@as(i64, 3), object.get("schema_version").?.integer);
+        try testing.expectEqual(@as(i64, 4), object.get("schema_version").?.integer);
         try testing.expectEqualStrings("artifact-schema-drill", object.get("case_id").?.string);
         const reduction_json = object.get("reduction").?.object;
         try testing.expectEqualStrings("leaf", reduction_json.get("component").?.string);
@@ -2612,7 +3049,7 @@ test "pki reduce: schema-v3 artifact is complete and reproducible" {
         try testing.expectEqual(true, reduction_json.get("one_minimal").?.bool);
         try testing.expectEqual(false, reduction_json.get("budget_exhausted").?.bool);
         try testing.expectEqual(false, reduction_json.get("reverted_external_divergence").?.bool);
-        try testing.expectEqual(true, reduction_json.get("preserves_observed_statuses").?.bool);
+        try testing.expectEqual(true, reduction_json.get("preserves_observed_semantics").?.bool);
         try testing.expectEqual(true, reduction_json.get("promotable").?.bool);
         try testing.expect(reduction_json.get("candidate_observed").? == .null);
         var expected_sha: [64]u8 = undefined;
@@ -2768,7 +3205,7 @@ test "pki reduce: schema-v3 artifact is complete and reproducible" {
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
         defer parsed.deinit();
         const reduction_json = parsed.value.object.get("reduction").?.object;
-        try testing.expectEqual(true, reduction_json.get("preserves_observed_statuses").?.bool);
+        try testing.expectEqual(true, reduction_json.get("preserves_observed_semantics").?.bool);
         try testing.expectEqual(true, reduction_json.get("budget_exhausted").?.bool);
         try testing.expectEqual(false, reduction_json.get("one_minimal").?.bool);
         try testing.expectEqual(false, reduction_json.get("promotable").?.bool);

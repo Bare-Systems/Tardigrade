@@ -605,7 +605,9 @@ fn classifyOpenSSLRejection(
     // DER cannot be decoded as "Could not find certificate file". Restrict
     // this exception to manifest-declared malformed inputs; missing files,
     // command usage failures, and setup errors remain harness failures.
-    if (std.mem.indexOf(u8, diagnostic, "Could not find certificate file from ") != null) {
+    if (std.mem.indexOf(u8, diagnostic, "Could not find certificate file from ") != null or
+        std.mem.indexOf(u8, diagnostic, "Could not read certificate file from ") != null)
+    {
         if (opensslCommittedParseFailureReason(case.id)) |reason| {
             return .{ .status = .reject, .reason = reason };
         }
@@ -2085,6 +2087,19 @@ test "pki reduce: missing and non-file fixtures are tool failures while malforme
     defer malformed.deinit(allocator);
     try testing.expectEqual(Status.reject, malformed.status);
     try testing.expectEqual(Reason.malformed_der, malformed.reason);
+
+    const openssl30_malformed = classifyOpenSSLRejection(
+        manifestCaseById("malformed-truncated-certificate"),
+        "",
+        "Could not read certificate file from tests/vectors/pki/malformed-truncated.crt\n" ++
+            "40C7D313947F0000:error:1608010C:STORE routines:ossl_store_handle_load_result:unsupported:../crypto/store/store_result.c:151:\n" ++
+            "Unable to load certificate file",
+        "Could not read certificate file from tests/vectors/pki/malformed-truncated.crt\n" ++
+            "40C7D313947F0000:error:1608010C:STORE routines:ossl_store_handle_load_result:unsupported:../crypto/store/store_result.c:151:\n" ++
+            "Unable to load certificate file",
+    );
+    try testing.expectEqual(Status.reject, openssl30_malformed.status);
+    try testing.expectEqual(Reason.malformed_der, openssl30_malformed.reason);
 }
 
 test "pki reduce: malformed and wrong-identity Go JSON are tool failures" {

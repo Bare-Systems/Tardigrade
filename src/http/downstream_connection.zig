@@ -83,6 +83,7 @@ pub const DownstreamTransport = union(enum) {
 
 pub const NativeHandshakeState = struct {
     attempts: u32 = 0,
+    deadline_ms: u64 = 0,
 };
 
 pub const Http1ConnectionState = struct {
@@ -99,6 +100,9 @@ pub const Http1ConnectionState = struct {
     keep_alive: bool = false,
     close_after_response: bool = false,
     served: u32 = 0,
+    phase_deadline_ms: u64 = 0,
+    outbound: std.ArrayList(u8) = .empty,
+    outbound_offset: usize = 0,
 
     pub const RequestParserState = struct {
         request_line_end: ?usize = null,
@@ -153,6 +157,7 @@ pub const Http1ConnectionState = struct {
         if (self.write_state) |*write| write.deinit();
         if (self.response) |*response| response.deinit();
         if (self.request) |*request| request.deinit();
+        self.outbound.deinit(self.allocator);
         self.request_arena.deinit();
         self.allocator.destroy(self.request_arena);
         self.allocator.free(self.input);
@@ -166,6 +171,10 @@ pub const Http2ConnectionState = struct {
     preface_offset: usize = 0,
     frame_header: [9]u8 = undefined,
     frame_header_offset: usize = 0,
+    frame_payload_len: usize = 0,
+    frame_type: u8 = 0,
+    frame_flags: u8 = 0,
+    frame_stream_id: u31 = 0,
     frame_payload: std.ArrayList(u8) = .empty,
     frame_payload_offset: usize = 0,
     outbound: std.ArrayList(u8) = .empty,
@@ -175,7 +184,9 @@ pub const Http2ConnectionState = struct {
     conn_recv_window: i64 = 65_535,
     conn_send_window: i64 = 65_535,
     last_stream_id: u31 = 0,
+    next_server_stream_id: u31 = 2,
     closing: bool = false,
+    idle_or_io_deadline_ms: u64 = 0,
 
     pub const Phase = enum {
         preface,
@@ -211,10 +222,20 @@ pub const ManagedConnection = struct {
         session: ?*anyopaque = null,
         release_session_ctx: ?*anyopaque = null,
         release_session_fn: ?*const fn (*anyopaque, *anyopaque) void = null,
+        config: ?*const anyopaque = null,
+        release_config_ctx: ?*anyopaque = null,
+        release_config_version: ?*anyopaque = null,
+        release_config_fn: ?*const fn (*anyopaque, *anyopaque) void = null,
         close_ctx: ?*anyopaque = null,
         close_fn: ?*const fn (*anyopaque, std.posix.fd_t) void = null,
         owned_ip: ?[]u8 = null,
         allocator: ?std.mem.Allocator = null,
+        config_generation: u64 = 0,
+        handshake_timeout_ms: u32 = 0,
+        header_timeout_ms: u32 = 0,
+        body_timeout_ms: u32 = 0,
+        write_timeout_ms: u32 = 0,
+        idle_timeout_ms: u32 = 0,
 
         pub fn connectionIp(self: *const Lifecycle) []const u8 {
             return self.owned_ip orelse "unknown";
@@ -224,6 +245,11 @@ pub const ManagedConnection = struct {
             if (self.release_session_fn) |release| {
                 if (self.release_session_ctx) |ctx| {
                     if (self.session) |session| release(ctx, session);
+                }
+            }
+            if (self.release_config_fn) |release| {
+                if (self.release_config_ctx) |ctx| {
+                    if (self.release_config_version) |version| release(ctx, version);
                 }
             }
             if (self.owned_ip) |ip| {
@@ -271,6 +297,15 @@ pub const ManagedConnection = struct {
         self.transport.deinit();
         self.lifecycle.deinit(fd);
         self.* = undefined;
+    }
+
+    pub fn expired(self: *const ManagedConnection, now_ms: u64) bool {
+        return switch (self.phase) {
+            .native_handshake => |h| h.deadline_ms != 0 and now_ms >= h.deadline_ms,
+            .http1 => |h| h.phase_deadline_ms != 0 and now_ms >= h.phase_deadline_ms,
+            .http2 => |h| h.idle_or_io_deadline_ms != 0 and now_ms >= h.idle_or_io_deadline_ms,
+            .idle_http1 => false,
+        };
     }
 };
 
@@ -352,6 +387,27 @@ pub const ActiveRegistry = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.map.count();
+    }
+
+    pub fn reapExpired(self: *ActiveRegistry, now_ms: u64, out: []ManagedConnection) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var out_len: usize = 0;
+        while (out_len < out.len) {
+            var expired_fd: ?std.posix.fd_t = null;
+            var it = self.map.iterator();
+            while (it.next()) |entry| {
+                if (!entry.value_ptr.expired(now_ms)) continue;
+                expired_fd = entry.key_ptr.*;
+                break;
+            }
+            const fd = expired_fd orelse break;
+            const removed = self.map.fetchRemove(fd).?;
+            out[out_len] = removed.value;
+            out_len += 1;
+        }
+        return out_len;
     }
 };
 
@@ -462,6 +518,34 @@ test "active registry insertion failure leaves ownership with caller" {
 
     try std.testing.expectError(error.OutOfMemory, registry.insert(&managed));
     try std.testing.expectEqual(@as(std.posix.fd_t, -1), managed.fd);
+}
+
+test "active registry reaps expired protocol deadlines" {
+    var registry = ActiveRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+
+    var expired = ManagedConnection.init(
+        .{ .plaintext = -1 },
+        .{ .native_handshake = .{ .deadline_ms = 10 } },
+    );
+    try registry.insert(&expired);
+
+    var live_h1 = try Http1ConnectionState.init(std.testing.allocator, 1024);
+    live_h1.phase_deadline_ms = 50;
+    var live = ManagedConnection.init(
+        .{ .plaintext = -2 },
+        .{ .http1 = live_h1 },
+    );
+    try registry.insert(&live);
+
+    var out: [2]ManagedConnection = undefined;
+    const count = registry.reapExpired(11, out[0..]);
+    try std.testing.expectEqual(@as(usize, 1), count);
+    var taken = out[0];
+    defer taken.deinit();
+    try std.testing.expectEqual(@as(std.posix.fd_t, -1), taken.fd);
+    try std.testing.expect(!registry.contains(-1));
+    try std.testing.expect(registry.contains(-2));
 }
 
 test "managed connection preserves protocol write interest for plaintext wait-write" {

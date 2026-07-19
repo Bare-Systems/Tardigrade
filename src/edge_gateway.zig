@@ -644,6 +644,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
             // Close keepalive connections idle longer than the keepalive timeout
             // while parked off the worker pool (#138).
             _ = parked.reapIdle(http.event_loop.monotonicMs(), current_cfg.keep_alive_timeout_ms);
+            reapActiveConnections(&active, &state, &event_loop);
             // Evict idle upstream keep-alive connections past their idle/lifetime
             // caps (#141).
             state.upstream_pool.reapIdle(http.event_loop.monotonicMs());
@@ -839,7 +840,8 @@ fn startNewConnection(ctx: *WorkerContext, client_fd: std.posix.fd_t) void {
     const connection_ip = owned_connection_ip orelse "unknown";
 
     var cfg_lease = ctx.acquireConfig();
-    defer cfg_lease.release();
+    var cfg_lease_transferred = false;
+    defer if (!cfg_lease_transferred) cfg_lease.release();
     const cfg = cfg_lease.cfg;
 
     gconn.setNoDelay(client_fd) catch |err| {
@@ -848,7 +850,12 @@ fn startNewConnection(ctx: *WorkerContext, client_fd: std.posix.fd_t) void {
 
     // Effective per-phase timeouts used throughout this connection's lifetime.
     const header_timeout_ms = cfg.request_limits.effectiveHeaderTimeout();
+    const body_timeout_ms = cfg.request_limits.effectiveBodyTimeout();
     const write_timeout_ms = if (cfg.downstream_write_timeout_ms > 0) cfg.downstream_write_timeout_ms else header_timeout_ms;
+    const handshake_timeout_ms = if (cfg.tls_handshake_timeout_ms > 0)
+        cfg.tls_handshake_timeout_ms
+    else
+        cfg.keep_alive_timeout_ms;
 
     if (ctx.tls) |tls| {
         gconn.setNonBlocking(client_fd, false) catch |err| {
@@ -859,10 +866,6 @@ fn startNewConnection(ctx: *WorkerContext, client_fd: std.posix.fd_t) void {
         // SSL_accept. Falls back to keep_alive_timeout_ms when not explicitly
         // configured so the old behavior is preserved for operators that haven't
         // set the new field.
-        const handshake_timeout_ms = if (cfg.tls_handshake_timeout_ms > 0)
-            cfg.tls_handshake_timeout_ms
-        else
-            cfg.keep_alive_timeout_ms;
         if (handshake_timeout_ms > 0) {
             gconn.setSocketTimeoutMs(client_fd, handshake_timeout_ms, handshake_timeout_ms) catch |err| {
                 ctx.state.logger.warn(null, "failed to set client handshake timeout: {}", .{err});
@@ -941,17 +944,30 @@ fn startNewConnection(ctx: *WorkerContext, client_fd: std.posix.fd_t) void {
         };
         var managed = http.downstream_connection.ManagedConnection.init(
             .{ .native = native },
-            .{ .native_handshake = .{} },
+            .{ .native_handshake = .{
+                .deadline_ms = deadlineFromNow(http.event_loop.monotonicMs(), handshake_timeout_ms),
+            } },
         );
         managed.lifecycle = .{
             .session = session,
             .release_session_ctx = ctx,
             .release_session_fn = activeReleaseSession,
+            .config = cfg,
+            .release_config_ctx = ctx.config_store,
+            .release_config_version = cfg_lease.version,
+            .release_config_fn = activeReleaseConfig,
             .close_ctx = ctx.state,
             .close_fn = activeConnectionCloseHook,
             .owned_ip = if (owned_connection_ip) |ip| @constCast(ip) else null,
             .allocator = ctx.state.allocator,
+            .config_generation = cfg_lease.version.generation,
+            .handshake_timeout_ms = handshake_timeout_ms,
+            .header_timeout_ms = header_timeout_ms,
+            .body_timeout_ms = body_timeout_ms,
+            .write_timeout_ms = write_timeout_ms,
+            .idle_timeout_ms = cfg.keep_alive_timeout_ms,
         };
+        cfg_lease_transferred = true;
         transferred = true;
         if (owned_connection_ip != null) transferred_ip = true;
         const interest = managed.interest;
@@ -1124,9 +1140,38 @@ fn activeReleaseSession(raw_ctx: *anyopaque, raw_session: *anyopaque) void {
     ctx.session_pool.release(session);
 }
 
+fn activeReleaseConfig(raw_store: *anyopaque, raw_version: *anyopaque) void {
+    const store: *ReloadableConfigStore = @ptrCast(@alignCast(raw_store));
+    const version: *gs.ManagedConfigVersion = @ptrCast(@alignCast(raw_version));
+    store.release(version);
+}
+
 fn activeConnectionCloseHook(raw_state: *anyopaque, fd: std.posix.fd_t) void {
     const state: *GatewayState = @ptrCast(@alignCast(raw_state));
     state.releaseConnectionSlot(fd);
+}
+
+fn deadlineFromNow(now_ms: u64, timeout_ms: u32) u64 {
+    return if (timeout_ms == 0) 0 else now_ms + @as(u64, timeout_ms);
+}
+
+fn reapActiveConnections(
+    active: *http.downstream_connection.ActiveRegistry,
+    state: *GatewayState,
+    event_loop: *http.event_loop.EventLoop,
+) void {
+    var expired: [32]http.downstream_connection.ManagedConnection = undefined;
+    while (true) {
+        const count = active.reapExpired(http.event_loop.monotonicMs(), expired[0..]);
+        if (count == 0) break;
+        for (expired[0..count]) |taken| {
+            var conn = taken;
+            event_loop.remove(conn.fd) catch {};
+            state.logger.debug(null, "active native downstream connection deadline expired fd={d}", .{conn.fd});
+            conn.deinit();
+        }
+        if (count < expired.len) break;
+    }
 }
 
 fn rearmActiveConnection(ctx: *WorkerContext, managed: *http.downstream_connection.ManagedConnection, requested: http.event_loop.Interest) void {
@@ -1172,6 +1217,10 @@ fn advanceNativeHandshake(ctx: *WorkerContext, managed: *http.downstream_connect
         };
         if (native.record.applicationDataOpen()) break;
         if (!driven.made_progress) {
+            managed.phase.native_handshake.deadline_ms = deadlineFromNow(
+                http.event_loop.monotonicMs(),
+                managed.lifecycle.handshake_timeout_ms,
+            );
             rearmActiveConnection(ctx, managed, .{ .read = true });
             return;
         }
@@ -1191,12 +1240,28 @@ fn advanceNativeHandshake(ctx: *WorkerContext, managed: *http.downstream_connect
                 return;
             };
             managed.phase = .{ .http1 = h1 };
-            rearmActiveConnection(ctx, managed, .{ .read = true });
+            if (managed.transport.pendingPlaintext() > 0) {
+                advanceActiveConnection(ctx, managed);
+            } else {
+                managed.phase.http1.phase_deadline_ms = deadlineFromNow(
+                    http.event_loop.monotonicMs(),
+                    managed.lifecycle.header_timeout_ms,
+                );
+                rearmActiveConnection(ctx, managed, .{ .read = true });
+            }
         },
         .http2 => {
             const h2 = http.downstream_connection.Http2ConnectionState.init(ctx.state.allocator);
             managed.phase = .{ .http2 = h2 };
-            rearmActiveConnection(ctx, managed, .{ .read = true });
+            if (managed.transport.pendingPlaintext() > 0) {
+                advanceActiveConnection(ctx, managed);
+            } else {
+                managed.phase.http2.idle_or_io_deadline_ms = deadlineFromNow(
+                    http.event_loop.monotonicMs(),
+                    managed.lifecycle.header_timeout_ms,
+                );
+                rearmActiveConnection(ctx, managed, .{ .read = true });
+            }
         },
     }
 }
@@ -1204,6 +1269,111 @@ fn advanceNativeHandshake(ctx: *WorkerContext, managed: *http.downstream_connect
 fn activeSession(managed: *http.downstream_connection.ManagedConnection) ?*ConnectionSession {
     const raw = managed.lifecycle.session orelse return null;
     return @ptrCast(@alignCast(raw));
+}
+
+fn activeConfig(managed: *http.downstream_connection.ManagedConnection) ?*const edge_config.EdgeConfig {
+    const raw = managed.lifecycle.config orelse return null;
+    return @ptrCast(@alignCast(raw));
+}
+
+const BufferedHttpConnection = struct {
+    allocator: std.mem.Allocator,
+    input: []const u8,
+    input_offset: usize = 0,
+    output: std.ArrayList(u8) = .empty,
+
+    fn init(allocator: std.mem.Allocator, input: []const u8) BufferedHttpConnection {
+        return .{ .allocator = allocator, .input = input };
+    }
+
+    fn deinit(self: *BufferedHttpConnection) void {
+        self.output.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    pub fn read(self: *BufferedHttpConnection, out: []u8) !usize {
+        if (out.len == 0) return 0;
+        if (self.input_offset >= self.input.len) return 0;
+        const n = @min(out.len, self.input.len - self.input_offset);
+        @memcpy(out[0..n], self.input[self.input_offset .. self.input_offset + n]);
+        self.input_offset += n;
+        return n;
+    }
+
+    pub fn pending(self: *const BufferedHttpConnection) usize {
+        return self.input.len - self.input_offset;
+    }
+
+    pub fn rawFd(self: *const BufferedHttpConnection) std.posix.fd_t {
+        _ = self;
+        return -1;
+    }
+
+    const Writer = struct {
+        conn: *BufferedHttpConnection,
+
+        pub fn write(self: Writer, bytes: []const u8) !usize {
+            try self.conn.output.appendSlice(self.conn.allocator, bytes);
+            return bytes.len;
+        }
+
+        pub fn writeAll(self: Writer, bytes: []const u8) !void {
+            _ = try self.write(bytes);
+        }
+
+        pub fn writeByte(self: Writer, byte: u8) !void {
+            try self.conn.output.append(self.conn.allocator, byte);
+        }
+
+        pub fn print(self: Writer, comptime fmt: []const u8, args: anytype) !void {
+            const rendered = try std.fmt.allocPrint(self.conn.allocator, fmt, args);
+            defer self.conn.allocator.free(rendered);
+            try self.writeAll(rendered);
+        }
+    };
+
+    pub fn writer(self: *BufferedHttpConnection) Writer {
+        return .{ .conn = self };
+    }
+};
+
+fn captureNativeHttp1Response(
+    ctx: *WorkerContext,
+    h1: *http.downstream_connection.Http1ConnectionState,
+    session: *ConnectionSession,
+    cfg: *const edge_config.EdgeConfig,
+    connection_ip: []const u8,
+) !void {
+    const request_len = gconn.firstRequestCompleteLen(h1.input[0..h1.filled]) orelse return error.IncompleteRequest;
+
+    var replay = BufferedHttpConnection.init(ctx.state.allocator, h1.input[0..request_len]);
+    defer replay.deinit();
+
+    var replay_session = ConnectionSession{
+        .proxy_protocol_checked = true,
+        .proxy_client_ip_len = session.proxy_client_ip_len,
+        .proxy_client_ip_buf = session.proxy_client_ip_buf,
+    };
+    defer if (replay_session.pending_buf) |buf| ctx.state.request_buffer_pool.release(buf);
+
+    var keep_alive = false;
+    try handleConnection(&replay, &replay_session, cfg, ctx.state, &keep_alive, connection_ip, false);
+
+    h1.outbound.deinit(h1.allocator);
+    h1.outbound = replay.output;
+    replay.output = .empty;
+    h1.outbound_offset = 0;
+    h1.keep_alive = keep_alive;
+    h1.served += 1;
+    h1.close_after_response = !keep_alive or http.shutdown.isShutdownRequested() or
+        (cfg.max_requests_per_connection > 0 and h1.served >= cfg.max_requests_per_connection);
+
+    const remaining = h1.filled - request_len;
+    if (remaining > 0) {
+        std.mem.copyForwards(u8, h1.input[0..remaining], h1.input[request_len..h1.filled]);
+    }
+    h1.filled = remaining;
+    h1.consumed = 0;
 }
 
 fn advanceNativeHttp1(ctx: *WorkerContext, managed: *http.downstream_connection.ManagedConnection) void {
@@ -1218,27 +1388,92 @@ fn advanceNativeHttp1(ctx: *WorkerContext, managed: *http.downstream_connection.
         managed.deinit();
         return;
     };
+    const cfg = activeConfig(managed) orelse {
+        managed.deinit();
+        return;
+    };
 
     var adapter = native.httpConnection();
-    var served = switch (managed.phase) {
-        .http1 => |*h1| h1.served,
-        else => 0,
-    };
     const connection_ip = managed.lifecycle.connectionIp();
 
     while (true) {
-        switch (serveOneRequest(ctx, &adapter, session, connection_ip, &served, false)) {
-            .serve_again => continue,
-            .park => {
-                if (managed.phase == .http1) managed.phase.http1.served = served;
-                rearmActiveConnection(ctx, managed, .{ .read = true });
-                return;
-            },
-            .close => {
+        const h1 = switch (managed.phase) {
+            .http1 => |*h| h,
+            else => {
                 managed.deinit();
                 return;
             },
+        };
+
+        while (h1.outbound_offset < h1.outbound.items.len) {
+            const n = adapter.write(h1.outbound.items[h1.outbound_offset..]) catch |err| switch (err) {
+                error.WouldBlock => {
+                    h1.phase_deadline_ms = deadlineFromNow(http.event_loop.monotonicMs(), managed.lifecycle.write_timeout_ms);
+                    rearmActiveConnection(ctx, managed, .{ .write = true });
+                    return;
+                },
+                else => {
+                    ctx.state.logger.warn(null, "native http/1 response write failed: {}", .{err});
+                    managed.deinit();
+                    return;
+                },
+            };
+            if (n == 0) {
+                h1.phase_deadline_ms = deadlineFromNow(http.event_loop.monotonicMs(), managed.lifecycle.write_timeout_ms);
+                rearmActiveConnection(ctx, managed, .{ .write = true });
+                return;
+            }
+            h1.outbound_offset += n;
         }
+
+        if (h1.outbound.items.len > 0) {
+            h1.outbound.clearRetainingCapacity();
+            h1.outbound_offset = 0;
+            if (h1.close_after_response) {
+                managed.deinit();
+                return;
+            }
+            if (h1.filled > 0 or managed.transport.pendingPlaintext() > 0) continue;
+            h1.phase_deadline_ms = deadlineFromNow(http.event_loop.monotonicMs(), managed.lifecycle.idle_timeout_ms);
+            rearmActiveConnection(ctx, managed, .{ .read = true });
+            return;
+        }
+
+        const read_len = gconn.readHttpRequest(&adapter, h1.input, &h1.filled) catch |err| switch (err) {
+            error.WouldBlock => {
+                if (managed.transport.pendingPlaintext() > 0) continue;
+                h1.phase_deadline_ms = deadlineFromNow(http.event_loop.monotonicMs(), managed.lifecycle.header_timeout_ms);
+                rearmActiveConnection(ctx, managed, .{ .read = true });
+                return;
+            },
+            else => {
+                if (isBenignDisconnect(err)) {
+                    ctx.state.logger.debug(null, "native http/1 connection closed: {}", .{err});
+                } else {
+                    ctx.state.logger.warn(null, "native http/1 request read failed: {}", .{err});
+                }
+                managed.deinit();
+                return;
+            },
+        };
+        if (read_len == 0 and h1.filled == 0) {
+            managed.deinit();
+            return;
+        }
+        if (gconn.firstRequestCompleteLen(h1.input[0..h1.filled]) == null) {
+            h1.phase_deadline_ms = deadlineFromNow(http.event_loop.monotonicMs(), managed.lifecycle.header_timeout_ms);
+            rearmActiveConnection(ctx, managed, .{ .read = true });
+            return;
+        }
+        captureNativeHttp1Response(ctx, h1, session, cfg, connection_ip) catch |err| {
+            if (isBenignDisconnect(err)) {
+                ctx.state.logger.debug(null, "native http/1 handler closed connection: {}", .{err});
+            } else {
+                ctx.state.logger.warn(null, "native http/1 handler failed: {}", .{err});
+            }
+            managed.deinit();
+            return;
+        };
     }
 }
 
@@ -1250,22 +1485,280 @@ fn advanceNativeHttp2(ctx: *WorkerContext, managed: *http.downstream_connection.
             return;
         },
     };
-    const session = activeSession(managed) orelse {
+    _ = activeSession(managed) orelse {
         managed.deinit();
         return;
     };
-    var cfg_lease = ctx.acquireConfig();
-    defer cfg_lease.release();
+    const cfg = activeConfig(managed) orelse {
+        managed.deinit();
+        return;
+    };
 
     var adapter = native.httpConnection();
-    handleHttp2Connection(&adapter, session, cfg_lease.cfg, ctx.state, managed.lifecycle.connectionIp()) catch |err| {
-        if (isBenignDisconnect(err)) {
-            ctx.state.logger.debug(null, "native http/2 connection closed: {}", .{err});
-        } else {
-            ctx.state.logger.warn(null, "native http/2 connection failed: {}", .{err});
+    while (true) {
+        const h2 = switch (managed.phase) {
+            .http2 => |*h| h,
+            else => {
+                managed.deinit();
+                return;
+            },
+        };
+
+        while (h2.outbound_offset < h2.outbound.items.len) {
+            const n = adapter.write(h2.outbound.items[h2.outbound_offset..]) catch |err| switch (err) {
+                error.WouldBlock => {
+                    h2.idle_or_io_deadline_ms = deadlineFromNow(http.event_loop.monotonicMs(), managed.lifecycle.write_timeout_ms);
+                    rearmActiveConnection(ctx, managed, .{ .write = true });
+                    return;
+                },
+                else => {
+                    ctx.state.logger.warn(null, "native http/2 write failed: {}", .{err});
+                    managed.deinit();
+                    return;
+                },
+            };
+            if (n == 0) {
+                h2.idle_or_io_deadline_ms = deadlineFromNow(http.event_loop.monotonicMs(), managed.lifecycle.write_timeout_ms);
+                rearmActiveConnection(ctx, managed, .{ .write = true });
+                return;
+            }
+            h2.outbound_offset += n;
         }
-    };
-    managed.deinit();
+        if (h2.outbound.items.len > 0) {
+            h2.outbound.clearRetainingCapacity();
+            h2.outbound_offset = 0;
+        }
+
+        switch (h2.phase) {
+            .preface => {
+                while (h2.preface_offset < HTTP2_PREFACE.len) {
+                    var buf: [HTTP2_PREFACE.len]u8 = undefined;
+                    const want = @min(buf.len, HTTP2_PREFACE.len - h2.preface_offset);
+                    const n = adapter.read(buf[0..want]) catch |err| switch (err) {
+                        error.WouldBlock => {
+                            if (managed.transport.pendingPlaintext() > 0) continue;
+                            h2.idle_or_io_deadline_ms = deadlineFromNow(http.event_loop.monotonicMs(), managed.lifecycle.header_timeout_ms);
+                            rearmActiveConnection(ctx, managed, .{ .read = true });
+                            return;
+                        },
+                        else => {
+                            ctx.state.logger.warn(null, "native http/2 preface read failed: {}", .{err});
+                            managed.deinit();
+                            return;
+                        },
+                    };
+                    if (n == 0) {
+                        managed.deinit();
+                        return;
+                    }
+                    const expected = HTTP2_PREFACE[h2.preface_offset .. h2.preface_offset + n];
+                    if (!std.mem.eql(u8, buf[0..n], expected)) {
+                        ctx.state.logger.warn(null, "native http/2 invalid preface", .{});
+                        managed.deinit();
+                        return;
+                    }
+                    h2.preface_offset += n;
+                }
+                h2.phase = .server_settings;
+                continue;
+            },
+            .server_settings => {
+                queueHttp2Settings(ctx.state.allocator, &h2.outbound) catch |err| {
+                    ctx.state.logger.warn(null, "native http/2 settings allocation failed: {}", .{err});
+                    managed.deinit();
+                    return;
+                };
+                h2.phase = .frame_header;
+                continue;
+            },
+            .frame_header => {
+                while (h2.frame_header_offset < http.http2_frame.HEADER_LEN) {
+                    const n = adapter.read(h2.frame_header[h2.frame_header_offset..]) catch |err| switch (err) {
+                        error.WouldBlock => {
+                            if (managed.transport.pendingPlaintext() > 0) continue;
+                            h2.idle_or_io_deadline_ms = deadlineFromNow(http.event_loop.monotonicMs(), managed.lifecycle.idle_timeout_ms);
+                            rearmActiveConnection(ctx, managed, .{ .read = true });
+                            return;
+                        },
+                        else => {
+                            if (isBenignDisconnect(err)) {
+                                ctx.state.logger.debug(null, "native http/2 connection closed: {}", .{err});
+                            } else {
+                                ctx.state.logger.warn(null, "native http/2 frame header read failed: {}", .{err});
+                            }
+                            managed.deinit();
+                            return;
+                        },
+                    };
+                    if (n == 0) {
+                        managed.deinit();
+                        return;
+                    }
+                    h2.frame_header_offset += n;
+                }
+                h2.frame_payload_len = (@as(usize, h2.frame_header[0]) << 16) |
+                    (@as(usize, h2.frame_header[1]) << 8) |
+                    @as(usize, h2.frame_header[2]);
+                if (h2.frame_payload_len > HTTP2_MAX_FRAME_SIZE) {
+                    managed.deinit();
+                    return;
+                }
+                h2.frame_type = h2.frame_header[3];
+                h2.frame_flags = h2.frame_header[4];
+                const sid = std.mem.readInt(u32, h2.frame_header[5..9], .big) & 0x7FFF_FFFF;
+                h2.frame_stream_id = @intCast(sid);
+                h2.frame_payload.clearRetainingCapacity();
+                h2.frame_payload_offset = 0;
+                h2.frame_header_offset = 0;
+                if (h2.frame_payload_len == 0) {
+                    h2.phase = .dispatch;
+                } else {
+                    h2.frame_payload.resize(ctx.state.allocator, h2.frame_payload_len) catch |err| {
+                        ctx.state.logger.warn(null, "native http/2 payload allocation failed: {}", .{err});
+                        managed.deinit();
+                        return;
+                    };
+                    h2.phase = .frame_payload;
+                }
+                continue;
+            },
+            .frame_payload => {
+                while (h2.frame_payload_offset < h2.frame_payload_len) {
+                    const n = adapter.read(h2.frame_payload.items[h2.frame_payload_offset..h2.frame_payload_len]) catch |err| switch (err) {
+                        error.WouldBlock => {
+                            if (managed.transport.pendingPlaintext() > 0) continue;
+                            h2.idle_or_io_deadline_ms = deadlineFromNow(http.event_loop.monotonicMs(), managed.lifecycle.header_timeout_ms);
+                            rearmActiveConnection(ctx, managed, .{ .read = true });
+                            return;
+                        },
+                        else => {
+                            ctx.state.logger.warn(null, "native http/2 frame payload read failed: {}", .{err});
+                            managed.deinit();
+                            return;
+                        },
+                    };
+                    if (n == 0) {
+                        managed.deinit();
+                        return;
+                    }
+                    h2.frame_payload_offset += n;
+                }
+                h2.phase = .dispatch;
+                continue;
+            },
+            .dispatch => {
+                dispatchNativeHttp2Frame(ctx, cfg, h2) catch |err| {
+                    ctx.state.logger.warn(null, "native http/2 frame dispatch failed: {}", .{err});
+                    managed.deinit();
+                    return;
+                };
+                h2.frame_payload.clearRetainingCapacity();
+                h2.frame_payload_len = 0;
+                h2.frame_payload_offset = 0;
+                h2.phase = .frame_header;
+                continue;
+            },
+            .closing => {
+                managed.deinit();
+                return;
+            },
+        }
+    }
+}
+
+const Http2BufferWriter = struct {
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+
+    pub fn write(self: Http2BufferWriter, bytes: []const u8) !usize {
+        try self.out.appendSlice(self.allocator, bytes);
+        return bytes.len;
+    }
+
+    pub fn writeAll(self: Http2BufferWriter, bytes: []const u8) !void {
+        _ = try self.write(bytes);
+    }
+};
+
+fn queueHttp2Settings(allocator: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
+    const writer = Http2BufferWriter{ .allocator = allocator, .out = out };
+    try http.http2_frame.writeSettings(allocator, writer, &[_][2]u32{
+        .{ 0x3, 100 },
+        .{ 0x4, 1024 * 1024 },
+    });
+}
+
+fn dispatchNativeHttp2Frame(
+    ctx: *WorkerContext,
+    cfg: *const edge_config.EdgeConfig,
+    h2: *http.downstream_connection.Http2ConnectionState,
+) !void {
+    const typ: http.http2_frame.Type = @enumFromInt(h2.frame_type);
+    const writer = Http2BufferWriter{ .allocator = ctx.state.allocator, .out = &h2.outbound };
+    switch (typ) {
+        .settings => {
+            if ((h2.frame_flags & http.http2_frame.Flags.ACK) == 0) try http.http2_frame.writeSettingsAck(writer);
+        },
+        .ping => {
+            if ((h2.frame_flags & http.http2_frame.Flags.ACK) == 0) try http.http2_frame.writePingAck(writer, h2.frame_payload.items);
+        },
+        .headers => {
+            if (h2.frame_stream_id == 0) return error.InvalidHttp2StreamId;
+            h2.last_stream_id = @max(h2.last_stream_id, h2.frame_stream_id);
+            var payload_offset: usize = 0;
+            if ((h2.frame_flags & http.http2_frame.Flags.PRIORITY) != 0) {
+                _ = try http.http2_frame.parsePriority(h2.frame_payload.items);
+                payload_offset = 5;
+            }
+            var decoded = h2.decoder.decode(ctx.state.allocator, h2.frame_payload.items[payload_offset..]) catch {
+                try http.http2_frame.writeGoaway(writer, h2.last_stream_id, http.http2_stream.ErrorCode.compression_error.value());
+                return error.Http2CompressionError;
+            };
+            defer http.hpack.deinitDecoded(ctx.state.allocator, &decoded);
+
+            var ps = Http2PendingStream.init(ctx.state.allocator);
+            defer ps.deinit(ctx.state.allocator);
+            for (decoded.headers) |header| {
+                if (std.mem.eql(u8, header.name, ":method")) {
+                    if (ps.method) |m| ctx.state.allocator.free(m);
+                    ps.method = try ctx.state.allocator.dupe(u8, header.value);
+                } else if (std.mem.eql(u8, header.name, ":path")) {
+                    if (ps.path) |p| ctx.state.allocator.free(p);
+                    ps.path = try ctx.state.allocator.dupe(u8, header.value);
+                } else if (header.name.len > 0 and header.name[0] != ':') {
+                    try ps.headers.append(header.name, header.value);
+                }
+            }
+            if ((h2.frame_flags & http.http2_frame.Flags.END_STREAM) != 0) {
+                var conn_send_window: i32 = @intCast(h2.conn_send_window);
+                try respondHttp2Stream(
+                    writer,
+                    ctx.state.allocator,
+                    ctx.state,
+                    cfg,
+                    h2.frame_stream_id,
+                    &ps,
+                    &h2.next_server_stream_id,
+                    &conn_send_window,
+                    65_535,
+                );
+                h2.conn_send_window = conn_send_window;
+            }
+        },
+        .data => {
+            if (h2.frame_stream_id == 0) return error.InvalidHttp2StreamId;
+            h2.conn_recv_window -= @intCast(h2.frame_payload.items.len);
+            try http.http2_frame.writeWindowUpdate(writer, h2.frame_stream_id, @intCast(h2.frame_payload.items.len));
+            try http.http2_frame.writeWindowUpdate(writer, 0, @intCast(h2.frame_payload.items.len));
+            h2.conn_recv_window += @intCast(h2.frame_payload.items.len);
+        },
+        .window_update => {
+            const inc = try http.http2_frame.parseWindowUpdateIncrement(h2.frame_payload.items);
+            if (h2.frame_stream_id == 0) h2.conn_send_window += @intCast(inc);
+        },
+        .goaway => h2.phase = .closing,
+        .priority, .rst_stream, .continuation, .push_promise => {},
+    }
 }
 
 /// Registry teardown hook: release the connection slot held since accept when a

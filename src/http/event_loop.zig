@@ -9,7 +9,18 @@ pub const Backend = enum {
 
 pub const Event = struct {
     fd: std.posix.fd_t,
-    readable: bool,
+    readable: bool = false,
+    writable: bool = false,
+    errored: bool = false,
+};
+
+pub const Interest = packed struct {
+    read: bool = false,
+    write: bool = false,
+
+    pub fn any(self: Interest) bool {
+        return self.read or self.write;
+    }
 };
 
 pub const EventLoop = struct {
@@ -42,25 +53,36 @@ pub const EventLoop = struct {
     }
 
     pub fn addReadFd(self: *EventLoop, fd: std.posix.fd_t) !void {
+        return self.add(fd, .{ .read = true });
+    }
+
+    pub fn add(self: *EventLoop, fd: std.posix.fd_t, interest: Interest) !void {
+        if (!interest.any()) return error.InvalidEventInterest;
         if (builtin.os.tag == .linux) {
             const linux = std.os.linux;
             var event = linux.epoll_event{
-                .events = linux.EPOLL.IN,
+                .events = epollEventsFor(interest),
                 .data = .{ .fd = @intCast(fd) },
             };
             const rc = linux.epoll_ctl(@intCast(self.fd), linux.EPOLL.CTL_ADD, @intCast(fd), &event);
             if (linux.errno(rc) != .SUCCESS) return error.Unexpected;
         } else {
-            const changes = [_]std.c.Kevent{.{
-                .ident = @intCast(fd),
-                .filter = std.c.EVFILT.READ,
-                .flags = std.c.EV.ADD | std.c.EV.ENABLE,
-                .fflags = 0,
-                .data = 0,
-                .udata = 0,
-            }};
-            const ret = std.c.kevent(self.fd, &changes, @intCast(changes.len), @as([*]std.c.Kevent, @ptrCast(@constCast(&changes))), 0, null);
-            if (ret < 0) return error.Unexpected;
+            try self.applyKqueueInterest(fd, interest, .add);
+        }
+    }
+
+    pub fn modify(self: *EventLoop, fd: std.posix.fd_t, interest: Interest) !void {
+        if (!interest.any()) return error.InvalidEventInterest;
+        if (builtin.os.tag == .linux) {
+            const linux = std.os.linux;
+            var event = linux.epoll_event{
+                .events = epollEventsFor(interest),
+                .data = .{ .fd = @intCast(fd) },
+            };
+            const rc = linux.epoll_ctl(@intCast(self.fd), linux.EPOLL.CTL_MOD, @intCast(fd), &event);
+            if (linux.errno(rc) != .SUCCESS) return error.Unexpected;
+        } else {
+            try self.applyKqueueInterest(fd, interest, .modify);
         }
     }
 
@@ -70,6 +92,10 @@ pub const EventLoop = struct {
     /// from a worker thread concurrently with `wait` on the loop thread, since
     /// both epoll_ctl and kevent change-list updates are thread-safe.
     pub fn removeReadFd(self: *EventLoop, fd: std.posix.fd_t) !void {
+        return self.remove(fd);
+    }
+
+    pub fn remove(self: *EventLoop, fd: std.posix.fd_t) !void {
         if (builtin.os.tag == .linux) {
             const linux = std.os.linux;
             // EPOLL_CTL_DEL ignores the event argument on modern kernels, but a
@@ -81,16 +107,7 @@ pub const EventLoop = struct {
             const rc = linux.epoll_ctl(@intCast(self.fd), linux.EPOLL.CTL_DEL, @intCast(fd), &event);
             if (linux.errno(rc) != .SUCCESS) return error.Unexpected;
         } else {
-            const changes = [_]std.c.Kevent{.{
-                .ident = @intCast(fd),
-                .filter = std.c.EVFILT.READ,
-                .flags = std.c.EV.DELETE,
-                .fflags = 0,
-                .data = 0,
-                .udata = 0,
-            }};
-            const ret = std.c.kevent(self.fd, &changes, @intCast(changes.len), @as([*]std.c.Kevent, @ptrCast(@constCast(&changes))), 0, null);
-            if (ret < 0) return error.Unexpected;
+            try self.applyKqueueInterest(fd, .{}, .remove);
         }
     }
 
@@ -112,10 +129,12 @@ pub const EventLoop = struct {
         const n: usize = @intCast(rc);
 
         for (epoll_events[0..n], 0..) |ev, idx| {
-            const readable = (ev.events & (linux.EPOLL.IN | linux.EPOLL.HUP | linux.EPOLL.ERR)) != 0;
+            const errored = (ev.events & (linux.EPOLL.HUP | linux.EPOLL.ERR)) != 0;
             out_events[idx] = .{
                 .fd = @intCast(ev.data.fd),
-                .readable = readable,
+                .readable = (ev.events & linux.EPOLL.IN) != 0 or errored,
+                .writable = (ev.events & linux.EPOLL.OUT) != 0,
+                .errored = errored,
             };
         }
         return n;
@@ -148,14 +167,57 @@ pub const EventLoop = struct {
             return error.Unexpected;
         }
         for (kq_events[0..@intCast(n)], 0..) |ev, idx| {
+            const errored = (ev.flags & (std.c.EV.ERROR | std.c.EV.EOF)) != 0;
             out_events[idx] = .{
                 .fd = @intCast(ev.ident),
-                .readable = ev.filter == std.c.EVFILT.READ,
+                .readable = ev.filter == std.c.EVFILT.READ or errored,
+                .writable = ev.filter == std.c.EVFILT.WRITE,
+                .errored = errored,
             };
         }
         return @intCast(n);
     }
+
+    fn applyKqueueInterest(self: *EventLoop, fd: std.posix.fd_t, interest: Interest, op: enum { add, modify, remove }) !void {
+        if (op == .modify or op == .remove) {
+            try self.kqueueFilterChange(fd, std.c.EVFILT.READ, std.c.EV.DELETE, true);
+            try self.kqueueFilterChange(fd, std.c.EVFILT.WRITE, std.c.EV.DELETE, true);
+        }
+        if (op == .remove) return;
+        if (interest.read) try self.kqueueFilterChange(fd, std.c.EVFILT.READ, std.c.EV.ADD | std.c.EV.ENABLE, false);
+        if (interest.write) try self.kqueueFilterChange(fd, std.c.EVFILT.WRITE, std.c.EV.ADD | std.c.EV.ENABLE, false);
+    }
+
+    fn kqueueFilterChange(
+        self: *EventLoop,
+        fd: std.posix.fd_t,
+        filter: i16,
+        flags: u16,
+        ignore_missing: bool,
+    ) !void {
+        const changes = [_]std.c.Kevent{.{
+            .ident = @intCast(fd),
+            .filter = filter,
+            .flags = flags,
+            .fflags = 0,
+            .data = 0,
+            .udata = 0,
+        }};
+        const ret = std.c.kevent(self.fd, &changes, @intCast(changes.len), @as([*]std.c.Kevent, @ptrCast(@constCast(&changes))), 0, null);
+        if (ret < 0) {
+            if (ignore_missing and std.posix.errno(ret) == .NOENT) return;
+            return error.Unexpected;
+        }
+    }
 };
+
+fn epollEventsFor(interest: Interest) u32 {
+    const linux = std.os.linux;
+    var events: u32 = linux.EPOLL.HUP | linux.EPOLL.ERR;
+    if (interest.read) events |= linux.EPOLL.IN;
+    if (interest.write) events |= linux.EPOLL.OUT;
+    return events;
+}
 
 pub const TimerManager = struct {
     interval_ms: u64,
@@ -220,4 +282,86 @@ test "timer manager ticks on interval" {
     try std.testing.expect(!timer.consumeTick(999));
     try std.testing.expect(timer.consumeTick(1_000));
     try std.testing.expectEqual(@as(u64, 1_100), timer.next_tick_ms);
+}
+
+test "event loop reports write readiness" {
+    var loop = try EventLoop.init();
+    defer loop.deinit();
+    const fds = try testSocketPair();
+    defer closeFd(fds[0]);
+    defer closeFd(fds[1]);
+
+    try loop.add(fds[0], .{ .write = true });
+    defer loop.remove(fds[0]) catch {};
+
+    var events: [4]Event = undefined;
+    const count = try loop.wait(&events, 50);
+    try std.testing.expect(count > 0);
+    var saw_write = false;
+    for (events[0..count]) |ev| {
+        if (ev.fd == fds[0] and ev.writable) saw_write = true;
+    }
+    try std.testing.expect(saw_write);
+}
+
+test "event loop modify replaces write interest with read interest" {
+    var loop = try EventLoop.init();
+    defer loop.deinit();
+    const fds = try testSocketPair();
+    defer closeFd(fds[0]);
+    defer closeFd(fds[1]);
+
+    try loop.add(fds[0], .{ .write = true });
+    defer loop.remove(fds[0]) catch {};
+    try loop.modify(fds[0], .{ .read = true });
+
+    var events: [4]Event = undefined;
+    try std.testing.expectEqual(@as(usize, 0), try loop.wait(&events, 10));
+    try writeFd(fds[1], "x");
+    const count = try loop.wait(&events, 50);
+    try std.testing.expect(count > 0);
+    var saw_read = false;
+    var saw_write = false;
+    for (events[0..count]) |ev| {
+        if (ev.fd != fds[0]) continue;
+        saw_read = saw_read or ev.readable;
+        saw_write = saw_write or ev.writable;
+    }
+    try std.testing.expect(saw_read);
+    try std.testing.expect(!saw_write);
+}
+
+fn testSocketPair() ![2]std.posix.fd_t {
+    var fds: [2]std.posix.fd_t = undefined;
+    if (builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        const rc = linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM, 0, &fds);
+        if (linux.errno(rc) != .SUCCESS) return error.SocketPairFailed;
+    } else {
+        if (std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds) != 0) return error.SocketPairFailed;
+    }
+    errdefer closeFd(fds[0]);
+    errdefer closeFd(fds[1]);
+    return fds;
+}
+
+fn writeFd(fd: std.posix.fd_t, bytes: []const u8) !void {
+    if (builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        const rc = linux.write(fd, bytes.ptr, bytes.len);
+        if (linux.errno(rc) != .SUCCESS) return error.SocketWriteFailed;
+        if (rc != bytes.len) return error.ShortWrite;
+        return;
+    }
+    const rc = std.c.write(fd, bytes.ptr, bytes.len);
+    if (rc < 0) return error.SocketWriteFailed;
+    if (@as(usize, @intCast(rc)) != bytes.len) return error.ShortWrite;
+}
+
+fn closeFd(fd: std.posix.fd_t) void {
+    if (builtin.os.tag == .linux) {
+        _ = std.os.linux.close(fd);
+    } else {
+        _ = std.c.close(fd);
+    }
 }

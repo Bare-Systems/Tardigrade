@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const tls = @import("tls_core");
 const encrypted_stream_connection = @import("encrypted_stream_connection.zig");
+const event_loop = @import("event_loop.zig");
 const negotiated_dispatch = @import("negotiated_dispatch.zig");
 
 const encrypted_stream = tls.encrypted_stream;
@@ -217,6 +218,10 @@ pub const NativeTlsConnection = struct {
         return self.record.readiness();
     }
 
+    pub fn interest(self: *const NativeTlsConnection) event_loop.Interest {
+        return interestForReadiness(self.readiness());
+    }
+
     pub fn drive(self: *NativeTlsConnection) encrypted_stream.Error!encrypted_stream.DriveResult {
         return self.record.drive();
     }
@@ -260,6 +265,13 @@ pub const NativeTlsConnection = struct {
         self.fd = -1;
     }
 };
+
+pub fn interestForReadiness(readiness: encrypted_stream.Readiness) event_loop.Interest {
+    return .{
+        .read = readiness.wants_read,
+        .write = readiness.wants_write,
+    };
+}
 
 fn readFd(fd: std.posix.fd_t, out: []u8) encrypted_stream.Error!usize {
     if (builtin.os.tag == .linux) {
@@ -340,6 +352,21 @@ test "native ALPN policy follows listener preference and fallback" {
     try std.testing.expectEqual(@as(usize, 1), h2_only.protocols.len);
     try std.testing.expectEqualStrings("h2", h2_only.protocols[0]);
     try std.testing.expect(!h2_only.allow_absent);
+}
+
+test "native readiness maps directly to event-loop interest" {
+    try std.testing.expectEqual(
+        event_loop.Interest{ .read = true, .write = false },
+        interestForReadiness(.{ .wants_read = true }),
+    );
+    try std.testing.expectEqual(
+        event_loop.Interest{ .read = false, .write = true },
+        interestForReadiness(.{ .wants_write = true }),
+    );
+    try std.testing.expectEqual(
+        event_loop.Interest{ .read = true, .write = true },
+        interestForReadiness(.{ .wants_read = true, .wants_write = true }),
+    );
 }
 
 test "native TLS owner heap-stabilizes backend record and owns fd close" {

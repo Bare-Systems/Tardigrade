@@ -5,6 +5,26 @@ All notable user-facing changes to Tardigrade are documented here.
 ## [Unreleased]
 
 ### Features
+- **Negotiated HTTPS protocol dispatch foundation (#356, refs #355, epic #325)** —
+  adds a transport-neutral HTTP dispatch seam that receives only an
+  authenticated encrypted byte stream plus a typed negotiated protocol
+  (`http/1.1` or `h2`). OpenSSL downstream TLS now pins one listener protocol
+  policy snapshot per accepted connection, advertises only enabled protocols
+  with documented server preference, allows absent-ALPN HTTP/1.1 fallback only
+  when explicitly configured, and rejects unknown, malformed, or no-overlap
+  ALPN with `no_application_protocol` before HTTP parsing begins. Reloaded
+  listener protocol policy is derived from the same config lease used by each
+  connection, so in-flight handshakes keep their generation's policy while
+  future connections observe the reloaded policy. A new
+  `EncryptedStream`-backed HTTP adapter exposes the narrow read/write,
+  readiness, pending, and buffer-snapshot surface needed by HTTP runtimes,
+  delegates carrier progress to `EncryptedStream.drive()`, drains buffered
+  plaintext before requesting carrier input, and preserves the TLS watermark
+  accounting and pause/resume behavior introduced by #355. Tests now cover the
+  OpenSSL ALPN policy matrix, strict and fallback absent-ALPN behavior,
+  malformed on-wire ALPN alerts, reload-pinned negotiation, shared dispatch
+  entrypoint shape, encrypted-stream adapter conformance, and #355
+  backpressure propagation evidence.
 - **Bounded TLS stream watermarks and backpressure (#355, epic #325)** — adds
   validated per-connection TLS buffer limits for inbound carrier ciphertext,
   decrypted plaintext, outbound ciphertext, and handshake bytes while

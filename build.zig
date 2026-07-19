@@ -458,6 +458,9 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     pki_mod.addImport("pki_reduced_corpus", pki_reduced_corpus_mod);
+    // The appliance credential loader (#392) reuses the PKI PEM/X.509
+    // machinery; pki does not import tls_core, so this stays acyclic.
+    tls_core_mod.addImport("pki", pki_mod);
     const pki_tests = b.addTest(.{ .root_module = pki_mod });
     const run_pki_tests = b.addRunArtifact(pki_tests);
     const pki_step = b.step("test-pki", "Run pure-Zig PKI DER unit tests");

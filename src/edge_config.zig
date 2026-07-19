@@ -60,10 +60,9 @@ pub const ProxyStreamingMode = enum {
 };
 
 /// Preferred application protocol for HTTPS upstream connections (#145).
-/// `http1` keeps the HTTP/1.1 path; `h2` and `auto` offer HTTP/2 via ALPN.
-/// In PR 1 `h2`/`auto` behave identically (offer h2; use it when the origin
-/// negotiates it, else fall back to HTTP/1.1). They diverge once an h2-only
-/// mode is added. Only applies to TLS upstreams (ALPN requires TLS).
+/// `http1` requires HTTP/1.1 via ALPN, `h2` requires HTTP/2 via ALPN, and
+/// `auto` prefers h2 while allowing HTTP/1.1 fallback. Only applies to TLS
+/// upstreams (ALPN requires TLS).
 pub const UpstreamProtocol = enum {
     http1,
     h2,

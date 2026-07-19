@@ -30,6 +30,7 @@ pub const TlsError = error{
     CrlLoadFailed,
     OcspLoadFailed,
     HandshakeFailed,
+    NoApplicationProtocol,
     TlsReadFailed,
     TlsWriteFailed,
 };
@@ -238,11 +239,22 @@ pub const UpstreamTlsOptions = struct {
     sni_override: []const u8 = "",
     client_cert_path: []const u8 = "",
     client_key_path: []const u8 = "",
-    offer_h2: bool = false,
+    alpn_policy: UpstreamAlpnPolicy = .require_http1,
+};
+
+pub const UpstreamAlpnPolicy = enum {
+    require_http1,
+    require_h2,
+    prefer_h2_allow_http1,
+
+    pub fn offersH2(self: UpstreamAlpnPolicy) bool {
+        return self != .require_http1;
+    }
 };
 
 pub const UpstreamTlsConn = struct {
     fd: std.posix.fd_t = -1,
+    protocol: NegotiatedProtocol = .http1_1,
 
     pub fn connect(
         fd: std.posix.fd_t,
@@ -283,8 +295,7 @@ pub const UpstreamTlsConn = struct {
     }
 
     pub fn negotiatedProtocol(self: *const UpstreamTlsConn) NegotiatedProtocol {
-        _ = self;
-        return .http1_1;
+        return self.protocol;
     }
 };
 

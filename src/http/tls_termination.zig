@@ -56,6 +56,7 @@ pub const TlsError = error{
     CrlLoadFailed,
     OcspLoadFailed,
     HandshakeFailed,
+    NoApplicationProtocol,
     TlsReadFailed,
     TlsWriteFailed,
 };
@@ -1145,10 +1146,64 @@ pub const UpstreamTlsOptions = struct {
     client_cert_path: []const u8 = "",
     /// PEM path to the client private key for mTLS (optional).
     client_key_path: []const u8 = "",
-    /// Offer HTTP/2 via ALPN ("h2", "http/1.1"). When false only "http/1.1"
-    /// is offered. The negotiated protocol is read via `negotiatedProtocol`.
-    offer_h2: bool = false,
+    /// Explicit HTTPS upstream ALPN policy. Required modes fail when the peer
+    /// omits ALPN, selects the wrong protocol, or selects an unknown protocol.
+    alpn_policy: UpstreamAlpnPolicy = .require_http1,
 };
+
+pub const UpstreamAlpnPolicy = enum {
+    require_http1,
+    require_h2,
+    prefer_h2_allow_http1,
+
+    pub fn offersH2(self: UpstreamAlpnPolicy) bool {
+        return self != .require_http1;
+    }
+
+    pub fn wire(self: UpstreamAlpnPolicy) []const u8 {
+        return switch (self) {
+            .require_http1 => "\x08http/1.1",
+            .require_h2 => "\x02h2",
+            .prefer_h2_allow_http1 => "\x02h2\x08http/1.1",
+        };
+    }
+
+    pub fn select(self: UpstreamAlpnPolicy, selected_alpn: ?[]const u8) TlsError!NegotiatedProtocol {
+        const selected = selected_alpn orelse return error.NoApplicationProtocol;
+        if (std.mem.eql(u8, selected, "h2")) {
+            return switch (self) {
+                .require_http1 => error.NoApplicationProtocol,
+                .require_h2, .prefer_h2_allow_http1 => .http2,
+            };
+        }
+        if (std.mem.eql(u8, selected, "http/1.1")) {
+            return switch (self) {
+                .require_http1, .prefer_h2_allow_http1 => .http1_1,
+                .require_h2 => error.NoApplicationProtocol,
+            };
+        }
+        return error.NoApplicationProtocol;
+    }
+};
+
+test "upstream ALPN policy validates selected protocol strictly" {
+    try std.testing.expect(!UpstreamAlpnPolicy.require_http1.offersH2());
+    try std.testing.expect(UpstreamAlpnPolicy.require_h2.offersH2());
+    try std.testing.expect(UpstreamAlpnPolicy.prefer_h2_allow_http1.offersH2());
+
+    try std.testing.expectEqual(NegotiatedProtocol.http1_1, try UpstreamAlpnPolicy.require_http1.select("http/1.1"));
+    try std.testing.expectError(error.NoApplicationProtocol, UpstreamAlpnPolicy.require_http1.select("h2"));
+    try std.testing.expectError(error.NoApplicationProtocol, UpstreamAlpnPolicy.require_http1.select(null));
+
+    try std.testing.expectEqual(NegotiatedProtocol.http2, try UpstreamAlpnPolicy.require_h2.select("h2"));
+    try std.testing.expectError(error.NoApplicationProtocol, UpstreamAlpnPolicy.require_h2.select("http/1.1"));
+    try std.testing.expectError(error.NoApplicationProtocol, UpstreamAlpnPolicy.require_h2.select(null));
+
+    try std.testing.expectEqual(NegotiatedProtocol.http2, try UpstreamAlpnPolicy.prefer_h2_allow_http1.select("h2"));
+    try std.testing.expectEqual(NegotiatedProtocol.http1_1, try UpstreamAlpnPolicy.prefer_h2_allow_http1.select("http/1.1"));
+    try std.testing.expectError(error.NoApplicationProtocol, UpstreamAlpnPolicy.prefer_h2_allow_http1.select("spdy/3"));
+    try std.testing.expectError(error.NoApplicationProtocol, UpstreamAlpnPolicy.prefer_h2_allow_http1.select(null));
+}
 
 /// An OpenSSL-backed TLS client connection to a TCP stream.
 /// Used for upstream HTTPS connections that require mTLS or custom CA/SNI.
@@ -1156,6 +1211,7 @@ pub const UpstreamTlsConn = struct {
     ssl: *c.SSL,
     ctx: *c.SSL_CTX,
     fd: std.posix.fd_t = -1,
+    protocol: NegotiatedProtocol,
 
     pub fn connect(
         fd: std.posix.fd_t,
@@ -1199,9 +1255,8 @@ pub const UpstreamTlsConn = struct {
         defer std.heap.c_allocator.free(sni_z);
         _ = c.SSL_set_tlsext_host_name(ssl, sni_z.ptr);
 
-        // Offer ALPN. h2 must precede http/1.1 (client preference order).
-        const alpn_wire: []const u8 = if (opts.offer_h2) "\x02h2\x08http/1.1" else "\x08http/1.1";
-        _ = c.SSL_set_alpn_protos(ssl, alpn_wire.ptr, @intCast(alpn_wire.len));
+        const alpn_wire = opts.alpn_policy.wire();
+        if (c.SSL_set_alpn_protos(ssl, alpn_wire.ptr, @intCast(alpn_wire.len)) != 0) return error.ProtocolConfigFailed;
 
         if (!opts.skip_verify) {
             const verify_host_z = try std.heap.c_allocator.dupeZ(u8, sni_host);
@@ -1213,8 +1268,9 @@ pub const UpstreamTlsConn = struct {
 
         if (c.SSL_set_fd(ssl, fd) != 1) return error.HandshakeFailed;
         if (c.SSL_connect(ssl) != 1) return error.HandshakeFailed;
+        const protocol = try opts.alpn_policy.select(negotiatedAlpn(ssl));
 
-        return .{ .ssl = ssl, .ctx = ctx, .fd = fd };
+        return .{ .ssl = ssl, .ctx = ctx, .fd = fd, .protocol = protocol };
     }
 
     pub fn deinit(self: *UpstreamTlsConn) void {
@@ -1258,16 +1314,19 @@ pub const UpstreamTlsConn = struct {
         return if (n > 0) @intCast(n) else 0;
     }
 
-    /// The ALPN protocol the handshake selected (`.http2` if the peer chose h2,
-    /// else `.http1_1`).
+    /// The ALPN protocol validated immediately after `SSL_connect`.
     pub fn negotiatedProtocol(self: *const UpstreamTlsConn) NegotiatedProtocol {
-        var data: [*c]const u8 = null;
-        var len: c_uint = 0;
-        c.SSL_get0_alpn_selected(self.ssl, &data, &len);
-        if (data != null and len == 2 and std.mem.eql(u8, data[0..2], "h2")) return .http2;
-        return .http1_1;
+        return self.protocol;
     }
 };
+
+fn negotiatedAlpn(ssl: *c.SSL) ?[]const u8 {
+    var data: [*c]const u8 = null;
+    var len: c_uint = 0;
+    c.SSL_get0_alpn_selected(ssl, &data, &len);
+    if (data == null or len == 0) return null;
+    return data[0..len];
+}
 
 const TestTlsPair = struct {
     client_ssl: *c.SSL,

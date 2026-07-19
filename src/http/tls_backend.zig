@@ -21,6 +21,7 @@ pub const NegotiatedProtocol = selected.NegotiatedProtocol;
 pub const TlsTerminator = selected.TlsTerminator;
 pub const TlsConnection = selected.TlsConnection;
 pub const UpstreamTlsOptions = selected.UpstreamTlsOptions;
+pub const UpstreamAlpnPolicy = selected.UpstreamAlpnPolicy;
 pub const UpstreamTlsConn = selected.UpstreamTlsConn;
 pub const lastOpenSslError = selected.lastOpenSslError;
 

@@ -3,6 +3,8 @@ const tls = @import("tls_core");
 const encrypted_stream_connection = @import("encrypted_stream_connection.zig");
 const tls_termination = @import("tls_backend.zig");
 
+pub const NegotiatedProtocol = tls_termination.NegotiatedProtocol;
+
 pub const AlpnFallbackPolicy = enum {
     require_match,
     allow_http1_default,
@@ -52,6 +54,22 @@ pub const ListenerProtocolPolicy = struct {
         if (self.http2_enabled) return h2_only_wire;
         if (self.http1_enabled) return http11_only_wire;
         return "";
+    }
+
+    pub fn nativeAlpnPolicy(self: ListenerProtocolPolicy) tls.tls13_backend.AlpnPolicy {
+        if (self.http2_enabled and self.http1_enabled) {
+            return .{
+                .protocols = &.{ "h2", "http/1.1" },
+                .allow_absent = self.allow_http1_without_alpn,
+            };
+        }
+        if (self.http2_enabled) {
+            return .{ .protocols = &.{"h2"} };
+        }
+        return .{
+            .protocols = &.{"http/1.1"},
+            .allow_absent = self.allow_http1_without_alpn,
+        };
     }
 };
 

@@ -457,6 +457,23 @@ fn fuzzDerParse(_: void, smith: *testing.Smith) !void {
     der.fuzzParseInput(buf[0..len]);
 }
 
+test "reduced differential DER seeds keep their exact DER parse outcome" {
+    const reduced_corpus = @import("pki_reduced_corpus");
+    for (reduced_corpus.entries) |entry| {
+        switch (entry.expected) {
+            .der_parse_error => |expected| {
+                var reader = der.Reader.init(entry.seed, der.default_limits);
+                const expected_error = if (std.mem.eql(u8, expected, "NonMinimalLength"))
+                    error.NonMinimalLength
+                else
+                    return error.TestUnexpectedResult;
+                try testing.expectError(expected_error, reader.readElement());
+            },
+            else => {},
+        }
+    }
+}
+
 fn parseInteger(allocator: std.mem.Allocator, content: []const u8) !void {
     var b = Builder.init();
     defer b.deinit(allocator);

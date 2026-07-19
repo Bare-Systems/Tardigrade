@@ -373,7 +373,10 @@ func classifyParseError(err error) string {
 		return "signature_algorithm_invalid"
 	case strings.Contains(message, "malformed certificate"),
 		strings.Contains(message, "asn1:"),
-		strings.Contains(message, "trailing data"):
+		strings.Contains(message, "trailing data"),
+		strings.Contains(message, "malformed OID"),
+		strings.Contains(message, "malformed extension value field"),
+		strings.Contains(message, "malformed serial number"):
 		return "malformed_der"
 	default:
 		return "unclassified_rejection"

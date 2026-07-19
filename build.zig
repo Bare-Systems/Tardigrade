@@ -537,6 +537,12 @@ pub fn build(b: *std.Build) void {
     pki_differential_mod.addAnonymousImport("pki_signature_corrupt_crt", .{
         .root_source_file = b.path("tests/vectors/pki/signature-corrupt-leaf.crt"),
     });
+    pki_differential_mod.addAnonymousImport("pki_der_non_minimal_long_length_crt", .{
+        .root_source_file = b.path("tests/vectors/pki/der-non-minimal-long-length.crt"),
+    });
+    pki_differential_mod.addAnonymousImport("pki_der_non_minimal_long_length_der", .{
+        .root_source_file = b.path("tests/vectors/pki/der-non-minimal-long-length.der"),
+    });
     pki_differential_mod.addImport("pki_reduced_corpus", pki_reduced_corpus_mod);
     const pki_differential_core_tests = b.addTest(.{
         .root_module = pki_differential_mod,

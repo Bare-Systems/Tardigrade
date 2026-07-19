@@ -33,8 +33,15 @@ Ed25519 signatures make generated output byte-for-byte reproducible.
 | Corrupt Ed25519 signature | `root.crt`, `intermediate.crt`, `signature-corrupt-leaf.crt` | `api.example.test` | reject validation | reject validation |
 | `pathLenConstraint` violation | `root.crt`, `pathlen-chain.crt`, `pathlen-leaf.crt` | `pathlen.example.test` | reject validation | reject validation |
 | Ambiguous cross-sign path | `cross-roots.crt`, `cross-untrusted-b-first.crt`, `cross-leaf.crt` | `cross.example.test` | accept | accept |
+| DNS-only Name Constraints permitted | `root.crt`, `dns-constraints-intermediate.crt`, `dns-permitted-leaf.crt` | `api.example.test` | accept | accept |
+| DNS-only Name Constraints excluded | `root.crt`, `dns-constraints-intermediate.crt`, `dns-excluded-leaf.crt` | `blocked.example.test` | reject Name Constraints | reject Name Constraints |
+| IP-only Name Constraints permitted | `root.crt`, `ip-constraints-intermediate.crt`, `ip-permitted-leaf.crt` | n/a | accept | accept |
+| IP-only Name Constraints excluded | `root.crt`, `ip-constraints-intermediate.crt`, `ip-excluded-leaf.crt` | n/a | reject Name Constraints | reject Name Constraints |
+| Isolated identity mismatch | `root.crt`, `intermediate.crt`, `identity-mismatch-leaf.crt` | `wrong.example.test` | reject identity | reject identity |
 | Duplicate critical extension | `duplicate-extension-leaf.crt` | `duplicate.example.test` | reject parsing or validation | reject parsing |
 | Truncated certificate seed | `malformed-truncated.crt` (`malformed-truncated.der` is the raw fuzz input) | n/a | reject parsing | reject parsing |
+| Algorithm-confusion fixtures | `algorithm-*.crt` plus matching raw `.der` files | n/a | reject validation/parsing by pinned semantic reason | reject validation/parsing by pinned semantic reason |
+| Hostile DER encoding fixtures | `der-*.crt` plus matching raw `.der` files | n/a | reject or accept by pinned parser policy | reject malformed DER or algorithm encoding by pinned semantic reason |
 
 `pathlen-chain.crt` orders `pathlen-subordinate-ca.crt` before
 `pathlen-zero-ca.crt`. The latter permits no non-self-issued CA below it, so the
@@ -55,6 +62,24 @@ never accept it.
 `malformed-truncated.crt` wraps `malformed-truncated.der` in a PEM
 `CERTIFICATE` block so every differential validator can consume one file
 format. The byte-identical raw DER remains available for parser fuzzing.
+
+The DNS-only and IP-only Name Constraints chains avoid unrelated critical name
+forms, so their negative cases prove each validator reached the rule named by
+the case. The legacy directoryName fixtures remain in the extended corpus with
+an explicit normalization for Go's unsupported critical directoryName
+constraint.
+
+The `algorithm-*` family mutates Ed25519 certificate AlgorithmIdentifier,
+SubjectPublicKeyInfo, and signature BIT STRING encodings without adding
+production support for new algorithms. Unsupported or incompatible algorithms
+therefore exercise fail-closed parser/path behavior.
+
+The `der-*` family records strict DER policy boundaries such as non-minimal
+lengths, indefinite lengths, malformed INTEGER/BIT STRING encodings,
+constructed primitive encodings, trailing bytes, and malformed nested
+extension lengths. The `.crt` files let external validators consume the same
+bytes through PEM while the raw `.der` files remain available for parser and
+reducer coverage.
 
 ## Mismatch minimization and the reduced regression corpus
 

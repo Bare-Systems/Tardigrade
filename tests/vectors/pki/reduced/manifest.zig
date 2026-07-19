@@ -30,6 +30,9 @@ pub const Expected = union(enum) {
     /// `pki.x509.Certificate.parse` under default limits fails with this
     /// error name.
     parse_error: []const u8,
+    /// `pki.der.Reader.readElement` under default limits fails with this
+    /// exact DER error before the X.509 layer normalizes it.
+    der_parse_error: []const u8,
     /// The seed parses; the full in-process pipeline — path building,
     /// RFC 5280 validation, identity matching — yields exactly this
     /// `status|diagnostic` class in the source case's chain context.
@@ -89,5 +92,15 @@ pub const entries = [_]Entry{
             "validation rather than asserting a parse error.",
         .license = "Apache-2.0",
         .expected = .{ .tardigrade_class = "reject|signature_invalid|0" },
+    }),
+    entry("non-minimal-long-length", .{
+        .source_case = "der-non-minimal-long-length",
+        .placement = .leaf,
+        .provenance = "DER payload of tests/vectors/pki/der-non-minimal-long-length.crt, " ++
+            "minimized by tests/pki_reduce.zig under the NonMinimalLength parse " ++
+            "oracle; the reducer's completed single-byte sweep proves the seed is " ++
+            "the 1-minimal reproduction of the strict-DER rejection.",
+        .license = "Apache-2.0",
+        .expected = .{ .der_parse_error = "NonMinimalLength" },
     }),
 };

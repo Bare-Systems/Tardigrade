@@ -101,8 +101,6 @@ pub const Http1ConnectionState = struct {
     close_after_response: bool = false,
     served: u32 = 0,
     phase_deadline_ms: u64 = 0,
-    outbound: std.ArrayList(u8) = .empty,
-    outbound_offset: usize = 0,
 
     pub const RequestParserState = struct {
         request_line_end: ?usize = null,
@@ -157,7 +155,6 @@ pub const Http1ConnectionState = struct {
         if (self.write_state) |*write| write.deinit();
         if (self.response) |*response| response.deinit();
         if (self.request) |*request| request.deinit();
-        self.outbound.deinit(self.allocator);
         self.request_arena.deinit();
         self.allocator.destroy(self.request_arena);
         self.allocator.free(self.input);
@@ -171,20 +168,13 @@ pub const Http2ConnectionState = struct {
     preface_offset: usize = 0,
     frame_header: [9]u8 = undefined,
     frame_header_offset: usize = 0,
-    frame_payload_len: usize = 0,
-    frame_type: u8 = 0,
-    frame_flags: u8 = 0,
-    frame_stream_id: u31 = 0,
     frame_payload: std.ArrayList(u8) = .empty,
     frame_payload_offset: usize = 0,
-    outbound: std.ArrayList(u8) = .empty,
-    outbound_offset: usize = 0,
     decoder: hpack.Decoder = hpack.Decoder.init(),
     header_block: std.ArrayList(u8) = .empty,
     conn_recv_window: i64 = 65_535,
     conn_send_window: i64 = 65_535,
     last_stream_id: u31 = 0,
-    next_server_stream_id: u31 = 2,
     closing: bool = false,
     idle_or_io_deadline_ms: u64 = 0,
 
@@ -203,7 +193,6 @@ pub const Http2ConnectionState = struct {
 
     pub fn deinit(self: *Http2ConnectionState) void {
         self.frame_payload.deinit(self.allocator);
-        self.outbound.deinit(self.allocator);
         self.header_block.deinit(self.allocator);
         self.decoder.deinit(self.allocator);
         self.* = undefined;
@@ -609,20 +598,17 @@ test "http1 beginResponse is transactional on write-state allocation failure" {
     try std.testing.expect(state.write_state == null);
 }
 
-test "http2 connection state owns frame header payload hpack and outbound cursors" {
+test "http2 connection state owns frame and hpack storage" {
     var h2 = Http2ConnectionState.init(std.testing.allocator);
     defer h2.deinit();
 
     try h2.frame_payload.appendSlice(std.testing.allocator, "payload");
     try h2.header_block.appendSlice(std.testing.allocator, "headers");
-    try h2.outbound.appendSlice(std.testing.allocator, "frame");
     h2.frame_header_offset = 4;
     h2.frame_payload_offset = 3;
-    h2.outbound_offset = 2;
 
     try std.testing.expectEqual(@as(usize, 4), h2.frame_header_offset);
     try std.testing.expectEqual(@as(usize, 3), h2.frame_payload_offset);
-    try std.testing.expectEqual(@as(usize, 2), h2.outbound_offset);
 }
 
 const PartialWriter = struct {

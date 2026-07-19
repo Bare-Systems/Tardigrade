@@ -1286,6 +1286,30 @@ const TestTlsPair = struct {
     }
 };
 
+const TestClientSsl = struct {
+    ssl: *c.SSL,
+    ctx: *c.SSL_CTX,
+
+    fn deinit(self: *TestClientSsl) void {
+        c.SSL_free(self.ssl);
+        c.SSL_CTX_free(self.ctx);
+        self.* = undefined;
+    }
+};
+
+fn initTestClientSsl(fd: std.posix.fd_t, alpn_wire: ?[]const u8) !TestClientSsl {
+    const client_ctx = c.SSL_CTX_new(c.TLS_client_method() orelse return error.ContextInitFailed) orelse return error.ContextInitFailed;
+    errdefer c.SSL_CTX_free(client_ctx);
+    c.SSL_CTX_set_verify(client_ctx, c.SSL_VERIFY_NONE, null);
+    const client_ssl = c.SSL_new(client_ctx) orelse return error.ContextInitFailed;
+    errdefer c.SSL_free(client_ssl);
+    if (alpn_wire) |wire| {
+        if (c.SSL_set_alpn_protos(client_ssl, wire.ptr, @intCast(wire.len)) != 0) return error.ProtocolConfigFailed;
+    }
+    if (c.SSL_set_fd(client_ssl, fd) != 1) return error.HandshakeFailed;
+    return .{ .ssl = client_ssl, .ctx = client_ctx };
+}
+
 const TestTlsPairOptions = struct {
     server_http1_enabled: bool = true,
     server_http2_enabled: bool = true,
@@ -1318,12 +1342,42 @@ fn serverAcceptThread(ctx: *ServerAcceptContext) void {
     };
 }
 
+const BarrierAcceptContext = struct {
+    terminator: *TlsTerminator,
+    fd: std.posix.fd_t,
+    policy: negotiated_dispatch.ListenerProtocolPolicy,
+    ready: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    release: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    conn: ?TlsConnection = null,
+    err: ?TlsError = null,
+};
+
+fn barrierAcceptThread(ctx: *BarrierAcceptContext) void {
+    ctx.ready.store(true, .release);
+    while (!ctx.release.load(.acquire)) {
+        std.Thread.yield() catch {};
+    }
+    ctx.conn = ctx.terminator.acceptWithPolicy(ctx.fd, ctx.policy) catch |err| {
+        ctx.err = err;
+        return;
+    };
+}
+
 fn testSetNonBlocking(fd: std.posix.fd_t, nonblocking: bool) !void {
     const status_flags = std.c.fcntl(fd, std.c.F.GETFL, @as(c_int, 0));
     if (status_flags < 0) return error.FcntlFailed;
     const nonblock = @as(c_int, @bitCast(std.posix.O{ .NONBLOCK = true }));
     const new_flags = if (nonblocking) status_flags | nonblock else status_flags & ~nonblock;
     if (std.c.fcntl(fd, std.c.F.SETFL, new_flags) < 0) return error.FcntlFailed;
+}
+
+fn testSetSocketTimeoutMs(fd: std.posix.fd_t, timeout_ms: u32) !void {
+    const tv = std.posix.timeval{
+        .sec = @intCast(timeout_ms / 1000),
+        .usec = @intCast((timeout_ms % 1000) * 1000),
+    };
+    try std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv));
+    try std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&tv));
 }
 
 fn makeTestTlsPair(allocator: std.mem.Allocator) !TestTlsPair {
@@ -1411,6 +1465,102 @@ fn clientReadExact(ssl: *c.SSL, out: []u8) !void {
         if (rc <= 0) return error.TlsReadFailed;
         offset += @intCast(rc);
     }
+}
+
+fn buildMalformedAlpnClientHello(allocator: std.mem.Allocator) ![]u8 {
+    const client_ctx = c.SSL_CTX_new(c.TLS_client_method() orelse return error.ContextInitFailed) orelse return error.ContextInitFailed;
+    defer c.SSL_CTX_free(client_ctx);
+    c.SSL_CTX_set_verify(client_ctx, c.SSL_VERIFY_NONE, null);
+    const client_ssl = c.SSL_new(client_ctx) orelse return error.ContextInitFailed;
+    defer c.SSL_free(client_ssl);
+
+    const rbio = c.BIO_new(c.BIO_s_mem()) orelse return error.ContextInitFailed;
+    const wbio = c.BIO_new(c.BIO_s_mem()) orelse return error.ContextInitFailed;
+    c.SSL_set_bio(client_ssl, rbio, wbio);
+
+    if (c.SSL_set_alpn_protos(client_ssl, h2_only_wire_for_tests.ptr, @intCast(h2_only_wire_for_tests.len)) != 0) return error.ProtocolConfigFailed;
+    const rc = c.SSL_connect(client_ssl);
+    if (rc == 1) return error.HandshakeFailed;
+    const ssl_error = c.SSL_get_error(client_ssl, rc);
+    if (ssl_error != c.SSL_ERROR_WANT_READ and ssl_error != c.SSL_ERROR_WANT_WRITE) return error.HandshakeFailed;
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var chunk: [4096]u8 = undefined;
+    while (true) {
+        const n = c.BIO_read(wbio, &chunk, chunk.len);
+        if (n <= 0) break;
+        try out.appendSlice(allocator, chunk[0..@intCast(n)]);
+    }
+    if (out.items.len == 0) return error.HandshakeFailed;
+    try mutateAlpnNameLength(out.items);
+    return try out.toOwnedSlice(allocator);
+}
+
+fn mutateAlpnNameLength(record_bytes: []u8) !void {
+    if (record_bytes.len < 5 or record_bytes[0] != 22) return error.MalformedHandshake;
+    const record_len = std.mem.readInt(u16, record_bytes[3..5], .big);
+    if (record_bytes.len < 5 + @as(usize, record_len)) return error.MalformedHandshake;
+    var pos: usize = 5;
+    if (record_bytes[pos] != 1) return error.MalformedHandshake;
+    pos += 1;
+    const handshake_len = (@as(usize, record_bytes[pos]) << 16) | (@as(usize, record_bytes[pos + 1]) << 8) | record_bytes[pos + 2];
+    pos += 3;
+    const handshake_end = pos + handshake_len;
+    if (handshake_end > record_bytes.len) return error.MalformedHandshake;
+
+    pos += 2 + 32;
+    if (pos >= handshake_end) return error.MalformedHandshake;
+    const session_id_len = record_bytes[pos];
+    pos += 1 + @as(usize, session_id_len);
+    if (pos + 2 > handshake_end) return error.MalformedHandshake;
+    const cipher_suites_len = std.mem.readInt(u16, record_bytes[pos..][0..2], .big);
+    pos += 2 + @as(usize, cipher_suites_len);
+    if (pos >= handshake_end) return error.MalformedHandshake;
+    const compression_methods_len = record_bytes[pos];
+    pos += 1 + @as(usize, compression_methods_len);
+    if (pos + 2 > handshake_end) return error.MalformedHandshake;
+    const extensions_len = std.mem.readInt(u16, record_bytes[pos..][0..2], .big);
+    pos += 2;
+    const extensions_end = pos + @as(usize, extensions_len);
+    if (extensions_end > handshake_end) return error.MalformedHandshake;
+
+    while (pos + 4 <= extensions_end) {
+        const ext_type = std.mem.readInt(u16, record_bytes[pos..][0..2], .big);
+        const ext_len = std.mem.readInt(u16, record_bytes[pos + 2 ..][0..2], .big);
+        pos += 4;
+        const ext_end = pos + @as(usize, ext_len);
+        if (ext_end > extensions_end) return error.MalformedHandshake;
+        if (ext_type == c.TLSEXT_TYPE_application_layer_protocol_negotiation) {
+            if (pos + 3 > ext_end) return error.MalformedHandshake;
+            record_bytes[pos + 2] = record_bytes[pos + 2] +% 1;
+            return;
+        }
+        pos = ext_end;
+    }
+    return error.ProtocolConfigFailed;
+}
+
+fn writeAllFd(fd: std.posix.fd_t, bytes: []const u8) !void {
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        const n = std.c.write(fd, bytes.ptr + offset, bytes.len - offset);
+        if (n <= 0) return error.Unexpected;
+        offset += @intCast(n);
+    }
+}
+
+fn containsNoApplicationProtocolAlert(bytes: []const u8) bool {
+    var pos: usize = 0;
+    while (pos + 7 <= bytes.len) {
+        const content_type = bytes[pos];
+        const len = std.mem.readInt(u16, bytes[pos + 3 ..][0..2], .big);
+        const end = pos + 5 + @as(usize, len);
+        if (end > bytes.len) return false;
+        if (content_type == 21 and len >= 2 and bytes[pos + 5] == 2 and bytes[pos + 6] == c.SSL_AD_NO_APPLICATION_PROTOCOL) return true;
+        pos = end;
+    }
+    return false;
 }
 
 const ClientReadContext = struct {
@@ -1621,10 +1771,152 @@ test "acceptWithPolicy pins policy from connection config generation" {
     }
 }
 
+test "acceptWithPolicy keeps leased policy when reload publishes before handshake" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "test_server.crt", .data = embedded_server_crt });
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "test_server.key", .data = embedded_server_key });
+    const cert_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, "test_server.crt");
+    defer allocator.free(cert_path);
+    const key_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, "test_server.key");
+    defer allocator.free(key_path);
+
+    var tls = try TlsTerminator.init(allocator, .{
+        .cert_path = cert_path,
+        .key_path = key_path,
+        .http1_enabled = true,
+        .http2_enabled = false,
+    });
+    defer tls.deinit();
+
+    const policy_a = negotiated_dispatch.ListenerProtocolPolicy{ .http1_enabled = true, .http2_enabled = false };
+    const policy_b = negotiated_dispatch.ListenerProtocolPolicy{ .http1_enabled = false, .http2_enabled = true };
+
+    var fds_a: [2]std.posix.fd_t = undefined;
+    if (std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds_a) != 0) return error.SocketPairFailed;
+    defer _ = std.c.close(fds_a[0]);
+    defer _ = std.c.close(fds_a[1]);
+    try testSetSocketTimeoutMs(fds_a[0], 1000);
+    try testSetSocketTimeoutMs(fds_a[1], 1000);
+
+    var client_a = try initTestClientSsl(fds_a[0], http11_only_wire_for_tests);
+    defer client_a.deinit();
+
+    var accept_a = BarrierAcceptContext{ .terminator = &tls, .fd = fds_a[1], .policy = policy_a };
+    const thread_a = try std.Thread.spawn(.{}, barrierAcceptThread, .{&accept_a});
+    var thread_a_joined = false;
+    defer if (!thread_a_joined) {
+        accept_a.release.store(true, .release);
+        _ = std.c.shutdown(fds_a[0], std.posix.SHUT.RDWR);
+        _ = std.c.shutdown(fds_a[1], std.posix.SHUT.RDWR);
+        thread_a.join();
+    };
+
+    var spins: usize = 0;
+    while (!accept_a.ready.load(.acquire) and spins < 1_000_000) : (spins += 1) {
+        std.Thread.yield() catch {};
+    }
+    try std.testing.expect(accept_a.ready.load(.acquire));
+
+    try tls.updateProtocolPolicy(policy_b);
+    accept_a.release.store(true, .release);
+    if (c.SSL_connect(client_a.ssl) != 1) return error.HandshakeFailed;
+    thread_a.join();
+    thread_a_joined = true;
+    if (accept_a.err) |err| return err;
+    var server_a = accept_a.conn orelse return error.HandshakeFailed;
+    defer server_a.deinit();
+    try std.testing.expectEqual(NegotiatedProtocol.http1_1, try server_a.validatedNegotiatedProtocol());
+
+    var fds_b: [2]std.posix.fd_t = undefined;
+    if (std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds_b) != 0) return error.SocketPairFailed;
+    defer _ = std.c.close(fds_b[0]);
+    defer _ = std.c.close(fds_b[1]);
+    try testSetSocketTimeoutMs(fds_b[0], 1000);
+    try testSetSocketTimeoutMs(fds_b[1], 1000);
+
+    var client_b = try initTestClientSsl(fds_b[0], h2_only_wire_for_tests);
+    defer client_b.deinit();
+    var accept_b = ServerAcceptContext{ .terminator = &tls, .fd = fds_b[1] };
+    const thread_b = try std.Thread.spawn(.{}, serverAcceptThread, .{&accept_b});
+    var thread_b_joined = false;
+    defer if (!thread_b_joined) {
+        _ = std.c.shutdown(fds_b[0], std.posix.SHUT.RDWR);
+        _ = std.c.shutdown(fds_b[1], std.posix.SHUT.RDWR);
+        thread_b.join();
+    };
+    if (c.SSL_connect(client_b.ssl) != 1) return error.HandshakeFailed;
+    thread_b.join();
+    thread_b_joined = true;
+    if (accept_b.err) |err| return err;
+    var server_b = accept_b.conn orelse return error.HandshakeFailed;
+    defer server_b.deinit();
+    try std.testing.expectEqual(NegotiatedProtocol.http2, try server_b.validatedNegotiatedProtocol());
+}
+
 test "test TLS pair rejects malformed local ALPN before spawning accept thread" {
     try std.testing.expectError(error.ProtocolConfigFailed, makeTestTlsPairWithOptions(std.testing.allocator, .{
         .client_alpn_wire = "\x08http",
     }));
+}
+
+test "malformed on-wire ALPN sends no_application_protocol alert" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "test_server.crt", .data = embedded_server_crt });
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "test_server.key", .data = embedded_server_key });
+    const cert_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, "test_server.crt");
+    defer allocator.free(cert_path);
+    const key_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, "test_server.key");
+    defer allocator.free(key_path);
+
+    var tls = try TlsTerminator.init(allocator, .{
+        .cert_path = cert_path,
+        .key_path = key_path,
+        .http1_enabled = true,
+        .http2_enabled = true,
+    });
+    defer tls.deinit();
+
+    const malformed_hello = try buildMalformedAlpnClientHello(allocator);
+    defer allocator.free(malformed_hello);
+
+    var fds: [2]std.posix.fd_t = undefined;
+    if (std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds) != 0) return error.SocketPairFailed;
+    defer _ = std.c.close(fds[0]);
+    defer _ = std.c.close(fds[1]);
+    try testSetSocketTimeoutMs(fds[0], 1000);
+    try testSetSocketTimeoutMs(fds[1], 1000);
+
+    var accept_ctx = ServerAcceptContext{ .terminator = &tls, .fd = fds[1] };
+    const thread = try std.Thread.spawn(.{}, serverAcceptThread, .{&accept_ctx});
+    var thread_joined = false;
+    defer if (!thread_joined) {
+        _ = std.c.shutdown(fds[0], std.posix.SHUT.RDWR);
+        _ = std.c.shutdown(fds[1], std.posix.SHUT.RDWR);
+        thread.join();
+    };
+
+    try writeAllFd(fds[0], malformed_hello);
+    var alert_buf: [128]u8 = undefined;
+    const n = std.c.read(fds[0], &alert_buf, alert_buf.len);
+    if (n <= 0) return error.TlsReadFailed;
+    _ = std.c.shutdown(fds[0], std.posix.SHUT.RDWR);
+    _ = std.c.shutdown(fds[1], std.posix.SHUT.RDWR);
+    thread.join();
+    thread_joined = true;
+
+    try std.testing.expect(accept_ctx.conn == null);
+    if (accept_ctx.err) |err| {
+        try std.testing.expectEqual(error.HandshakeFailed, err);
+    } else {
+        return error.HandshakeFailed;
+    }
+    try std.testing.expect(containsNoApplicationProtocolAlert(alert_buf[0..@intCast(n)]));
 }
 
 test "openssl encrypted stream adapter conforms over production connection" {

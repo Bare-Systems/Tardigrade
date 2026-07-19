@@ -76,8 +76,9 @@ pub const NativeCredentialStore = struct {
 
 const LoadedBundle = struct {
     loaded: tls.identity_loader.LoadedIdentity = undefined,
-    chain: [1][]const u8 = undefined,
+    chain: []const []const u8 = &.{},
     patterns: [1][]const u8 = undefined,
+    supported_schemes: [1]credentials.SignatureScheme = undefined,
     is_default: bool = false,
 
     fn initDefault(
@@ -103,19 +104,19 @@ const LoadedBundle = struct {
     ) !void {
         self.* = .{};
         self.loaded = try tls.identity_loader.loadIdentity(allocator, cert_path, key_path);
-        self.chain = .{self.loaded.cert_der};
+        self.chain = self.loaded.cert_chain;
         self.patterns = .{pattern};
+        self.supported_schemes = .{self.loaded.identity.signatureScheme()};
         self.is_default = is_default;
     }
 
     fn config(self: *const LoadedBundle) sni_provider.CredentialBundleConfig {
-        const scheme = self.loaded.identity.signatureScheme();
         return .{
-            .chain = self.chain[0..],
+            .chain = self.chain,
             .patterns = self.patterns[0..],
             .signer = sni_provider.SignAdapter.fromIdentity(self.loaded.identity),
-            .key_kind = keyKindForScheme(scheme),
-            .supported_schemes = &.{scheme},
+            .key_kind = keyKindForScheme(self.supported_schemes[0]),
+            .supported_schemes = self.supported_schemes[0..],
             .is_default = self.is_default,
         };
     }
@@ -151,6 +152,7 @@ pub const NativeTlsConnection = struct {
     ) !*NativeTlsConnection {
         if (!policy.http1_enabled and !policy.http2_enabled) return error.ProtocolConfigFailed;
         try setNonBlocking(fd);
+        const handshake_entropy = try production_crypto.freshHandshakeEntropy();
 
         const self = try allocator.create(NativeTlsConnection);
         errdefer allocator.destroy(self);
@@ -162,7 +164,7 @@ pub const NativeTlsConnection = struct {
             allocator.destroy(backend);
         };
         backend.* = tls_backend.Tls13Backend.initServerWithProvider(
-            try production_crypto.freshHandshakeEntropy(),
+            handshake_entropy,
             provider,
             .{ .record = .{ .alpn = policy.nativeAlpnPolicy() } },
         );
@@ -228,6 +230,7 @@ pub const NativeTlsConnection = struct {
 
     pub fn validatedNegotiatedProtocol(self: *NativeTlsConnection) negotiated_dispatch.Error!NegotiatedProtocol {
         if (self.negotiated) |protocol| return protocol;
+        if (!self.record.applicationDataOpen()) return error.HandshakeNotComplete;
         const protocol = try negotiated_dispatch.selectNegotiatedProtocol(
             self.record.negotiatedAlpn(),
             self.policy,
@@ -352,6 +355,15 @@ test "native ALPN policy follows listener preference and fallback" {
     try std.testing.expectEqual(@as(usize, 1), h2_only.protocols.len);
     try std.testing.expectEqualStrings("h2", h2_only.protocols[0]);
     try std.testing.expect(!h2_only.allow_absent);
+
+    const disabled = (ListenerProtocolPolicy{
+        .http1_enabled = false,
+        .http2_enabled = false,
+        .allow_http1_without_alpn = true,
+    }).nativeAlpnPolicy();
+    try std.testing.expectEqual(@as(usize, 0), disabled.protocols.len);
+    try std.testing.expect(!disabled.allow_absent);
+    try std.testing.expectError(error.InvalidTransportProfile, disabled.validate());
 }
 
 test "native readiness maps directly to event-loop interest" {
@@ -388,6 +400,28 @@ test "native TLS owner heap-stabilizes backend record and owns fd close" {
     conn.destroy();
 
     try std.testing.expectError(error.SocketWriteFailed, writeFd(original_fd, "x"));
+}
+
+test "native TLS negotiated protocol is unavailable before application data opens" {
+    var fixed = credentials.FixedCredentialProvider.init(credentials.testdata.identity());
+    defer fixed.deinit();
+    const fds = try testSocketPair();
+    defer closeFd(fds[1]);
+
+    const conn = try NativeTlsConnection.create(
+        std.testing.allocator,
+        fds[0],
+        .{
+            .http1_enabled = true,
+            .http2_enabled = true,
+            .allow_http1_without_alpn = true,
+        },
+        fixed.provider(),
+    );
+    defer conn.destroy();
+
+    try std.testing.expectError(error.HandshakeNotComplete, conn.validatedNegotiatedProtocol());
+    try std.testing.expect(conn.negotiated == null);
 }
 
 fn testSocketPair() ![2]std.posix.fd_t {

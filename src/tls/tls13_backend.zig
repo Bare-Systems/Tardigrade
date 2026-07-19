@@ -83,6 +83,7 @@ pub const AlpnPolicy = struct {
             if (name.len == 0 or name.len > std.math.maxInt(u8)) return error.InvalidTransportProfile;
             total = std.math.add(usize, total, 1 + name.len) catch return error.InvalidTransportProfile;
             if (total > std.math.maxInt(u16)) return error.InvalidTransportProfile;
+            if (total + 6 > max_message_len) return error.InvalidTransportProfile;
             for (self.protocols[0..i]) |prior| {
                 if (std.mem.eql(u8, prior, name)) return error.InvalidTransportProfile;
             }
@@ -995,7 +996,10 @@ pub const Tls13Backend = struct {
             var ext = Reader{ .bytes = try extensions.slice(try extensions.u16_()) };
             switch (ext_id) {
                 ext_alpn => {
-                    var list = Reader{ .bytes = try ext.slice(try ext.u16_()) };
+                    const list_len = try ext.u16_();
+                    if (list_len == 0) return error.MalformedHandshake;
+                    var list = Reader{ .bytes = try ext.slice(list_len) };
+                    try ext.expectEnd();
                     const name_len = try list.u8_();
                     if (name_len == 0) return error.MalformedHandshake;
                     const name = try list.slice(name_len);
@@ -1616,7 +1620,10 @@ pub const Tls13Backend = struct {
                     }
                 },
                 ext_alpn => {
-                    var list = Reader{ .bytes = try ext.slice(try ext.u16_()) };
+                    const list_len = try ext.u16_();
+                    if (list_len == 0) return error.MalformedHandshake;
+                    var list = Reader{ .bytes = try ext.slice(list_len) };
+                    try ext.expectEnd();
                     while (list.remaining() > 0) {
                         const name_len = try list.u8_();
                         if (name_len == 0) return error.MalformedHandshake;
@@ -2271,6 +2278,15 @@ test "transport profile validation fails before lifecycle or transcript advance"
         backend.deinit();
     }
 
+    var names_storage: [40][255]u8 = undefined;
+    var names: [40][]const u8 = undefined;
+    for (&names_storage, 0..) |*name, i| {
+        @memset(name[0..], 'a');
+        name[0] = @intCast(i);
+        names[i] = name[0..];
+    }
+    try std.testing.expectError(error.InvalidTransportProfile, (AlpnPolicy{ .protocols = &names }).validate());
+
     var oversized = [_]u8{0xa5} ** (max_transport_extension_len + 1);
     var extension_backend = Tls13Backend.initClient(
         entropy,
@@ -2296,6 +2312,37 @@ test "transport profile validation fails before lifecycle or transcript advance"
     try std.testing.expectEqual(tls_handshake_codec.HandshakeLifecycle.idle, collision_backend.core.handshake_lifecycle);
     try std.testing.expectEqual(@as(usize, 0), collision_sink.len);
     collision_backend.deinit();
+}
+
+test "client rejects malformed encrypted extensions ALPN framing" {
+    var backend = Tls13Backend.initClient(
+        Entropy{ .hello_random = [_]u8{0x51} ** 32, .key_share_seed = [_]u8{0x52} ** 32 },
+        .{ .pinned_certificate = testdata.certificate_der },
+        .{ .record = .{ .alpn = recordAlpnPolicy("h2") } },
+    );
+    defer backend.deinit();
+
+    var sink = EventSink{};
+    defer sink.deinit();
+
+    const empty_list = [_]u8{
+        0x00, 0x06, // extensions length
+        0x00, ext_alpn, // extension type
+        0x00, 0x02, // extension length
+        0x00, 0x00, // empty ProtocolNameList
+    };
+    try std.testing.expectError(error.MalformedHandshake, backend.onEncryptedExtensions(&empty_list, &sink));
+
+    const trailing_extension_byte = [_]u8{
+        0x00, 0x0a, // extensions length
+        0x00, ext_alpn, // extension type
+        0x00, 0x06, // extension length
+        0x00, 0x03, // ProtocolNameList length
+        0x02, 'h',
+        '2',
+        0x00, // trailing byte outside the declared list
+    };
+    try std.testing.expectError(error.MalformedHandshake, backend.onEncryptedExtensions(&trailing_extension_byte, &sink));
 }
 
 test "abandoned backend teardown wipes ephemeral and server identity storage" {

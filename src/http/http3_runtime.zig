@@ -189,13 +189,13 @@ pub const Runtime = struct {
 
     fn loadIdentity(self: *Runtime, cert_path: []const u8, key_path: []const u8) !void {
         var loaded = try tls_core.identity_loader.loadIdentity(self.allocator, cert_path, key_path);
-        errdefer loaded.deinit();
+        defer loaded.deinit();
 
-        self.cert_der = loaded.cert_der;
+        self.cert_der = loaded.cert_chain[0];
         self.key_der = loaded.key_der;
         self.identity = loaded.identity;
         std.crypto.secureZero(u8, std.mem.asBytes(&loaded.identity.key));
-        loaded.cert_der = &.{};
+        loaded.cert_chain[0] = &.{};
         loaded.key_der = &.{};
     }
 

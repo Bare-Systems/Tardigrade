@@ -513,6 +513,13 @@ pub const PureZigRecordStream = struct {
         return self.alpn_storage[0..self.alpn_len];
     }
 
+    /// True only after the TLS handshake has authenticated and application
+    /// data is legal. ALPN may be absent for explicit HTTP/1.1 fallback, so
+    /// protocol dispatch must gate on this state rather than ALPN presence.
+    pub fn applicationDataOpen(self: *const PureZigRecordStream) bool {
+        return self.lifecycle == .open and self.bridge.handshake_complete;
+    }
+
     /// Require the peer to negotiate exactly `protocol`. Configure this before
     /// the handshake starts; the value is copied because caller storage need
     /// not outlive construction.

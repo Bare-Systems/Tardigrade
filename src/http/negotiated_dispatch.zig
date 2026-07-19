@@ -11,6 +11,7 @@ pub const AlpnFallbackPolicy = enum {
 };
 
 pub const Error = error{
+    HandshakeNotComplete,
     NoApplicationProtocol,
     ProtocolDisabled,
 };
@@ -65,6 +66,9 @@ pub const ListenerProtocolPolicy = struct {
         }
         if (self.http2_enabled) {
             return .{ .protocols = &.{"h2"} };
+        }
+        if (!self.http1_enabled) {
+            return .{ .protocols = &.{}, .allow_absent = false };
         }
         return .{
             .protocols = &.{"http/1.1"},

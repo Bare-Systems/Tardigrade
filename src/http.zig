@@ -50,6 +50,7 @@ pub const keepalive_park = @import("http/keepalive_park.zig");
 pub const encrypted_stream_connection = @import("http/encrypted_stream_connection.zig");
 pub const negotiated_dispatch = @import("http/negotiated_dispatch.zig");
 pub const native_tls_connection = @import("http/native_tls_connection.zig");
+pub const downstream_connection = @import("http/downstream_connection.zig");
 pub const upstream_pool = @import("http/upstream_pool.zig");
 /// TLS termination backend selected by `-Dtls-profile` (#379): the OpenSSL
 /// adapter in the general profile, a no-OpenSSL stub in the Bare Systems

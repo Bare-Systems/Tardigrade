@@ -1005,12 +1005,12 @@ fn parkConnection(
     connection_ip: []const u8,
 ) void {
     const now = http.event_loop.monotonicMs();
-    ctx.parked.parkNew(fd, session, tls_conn, served, connection_ip, now) catch {
+    const pc = ctx.parked.parkNew(fd, session, tls_conn, served, connection_ip, now) catch {
         closeNewConnection(ctx, fd, session, tls_conn);
         return;
     };
-    ctx.event_loop.addReadFd(fd) catch {
-        if (ctx.parked.checkout(fd)) |pc| ctx.parked.closeSlot(pc, .@"error");
+    ctx.event_loop.add(fd, pc.eventInterest()) catch {
+        if (ctx.parked.checkout(fd)) |taken| ctx.parked.closeSlot(taken, .@"error");
     };
 }
 
@@ -1022,7 +1022,7 @@ fn reparkConnection(ctx: *WorkerContext, pc: *http.keepalive_park.ParkedConnecti
         ctx.parked.closeSlot(pc, .@"error");
         return;
     };
-    ctx.event_loop.addReadFd(pc.fd) catch {
+    ctx.event_loop.add(pc.fd, pc.eventInterest()) catch {
         if (ctx.parked.checkout(pc.fd)) |taken| ctx.parked.closeSlot(taken, .@"error");
     };
 }

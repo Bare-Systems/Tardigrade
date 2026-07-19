@@ -212,6 +212,10 @@ fn stubStreamDrive(ptr: *anyopaque) encrypted_stream.Error!encrypted_stream.Driv
     return .{ .made_progress = false, .readiness = stubStreamReadiness(ptr) };
 }
 
+fn stubStreamBufferSnapshot(_: *anyopaque) encrypted_stream.BufferSnapshot {
+    return .{};
+}
+
 const stub_stream_vtable = encrypted_stream.EncryptedStream.VTable{
     .backendFn = stubStreamBackend,
     .readFn = stubStreamRead,
@@ -219,6 +223,7 @@ const stub_stream_vtable = encrypted_stream.EncryptedStream.VTable{
     .closeFn = stubStreamClose,
     .readinessFn = stubStreamReadiness,
     .driveFn = stubStreamDrive,
+    .bufferSnapshotFn = stubStreamBufferSnapshot,
 };
 
 /// In the OpenSSL adapter this drains the error queue; here it reports why

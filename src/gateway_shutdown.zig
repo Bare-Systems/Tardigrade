@@ -96,6 +96,36 @@ pub fn hotReloadConfig(
             return;
         };
     }
+    if (worker_ctx.native_credentials) |store| {
+        var sni_specs = allocator.alloc(http.native_tls_connection.SniCertSpec, cfg_ptr.tls_sni_certs.len) catch {
+            worker_ctx.config_store.destroyVersion(prepared_version);
+            state.reload_mutex.lock();
+            state.last_reload_ok = false;
+            state.last_reload_at_ms = now_ms;
+            @memcpy(state.last_reload_error[0..21], "bookkeeping failed   ");
+            state.last_reload_error_len = 21;
+            state.reload_mutex.unlock();
+            state.metricsRecordReloadFailure();
+            state.logger.warn(null, "config reload native TLS SNI allocation failed", .{});
+            return;
+        };
+        defer allocator.free(sni_specs);
+        for (cfg_ptr.tls_sni_certs, 0..) |sc, i| {
+            sni_specs[i] = .{ .server_name = sc.server_name, .cert_path = sc.cert_path, .key_path = sc.key_path };
+        }
+        store.reloadFromFiles(cfg_ptr.tls_cert_path, cfg_ptr.tls_key_path, sni_specs) catch |err| {
+            worker_ctx.config_store.destroyVersion(prepared_version);
+            const msg = std.fmt.bufPrint(&state.last_reload_error, "native TLS credential reload failed: {}", .{err}) catch "native TLS credential reload failed";
+            state.reload_mutex.lock();
+            state.last_reload_ok = false;
+            state.last_reload_at_ms = now_ms;
+            state.last_reload_error_len = msg.len;
+            state.reload_mutex.unlock();
+            state.metricsRecordReloadFailure();
+            state.logger.warn(null, "config reload rejected by native TLS credential reload: {}", .{err});
+            return;
+        };
+    }
 
     applyReloadedRuntimeConfig(cfg_ptr, state);
     worker_ctx.config_store.installPrepared(prepared_version);

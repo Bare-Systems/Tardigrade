@@ -1,5 +1,6 @@
 const std = @import("std");
 const tls_core = @import("tls_core");
+const compat = @import("../zig_compat.zig");
 const event_loop = @import("event_loop.zig");
 const native_tls_connection = @import("native_tls_connection.zig");
 const request_mod = @import("request.zig");
@@ -206,10 +207,40 @@ pub const ConnectionPhase = union(enum) {
 };
 
 pub const ManagedConnection = struct {
+    pub const Lifecycle = struct {
+        session: ?*anyopaque = null,
+        release_session_ctx: ?*anyopaque = null,
+        release_session_fn: ?*const fn (*anyopaque, *anyopaque) void = null,
+        close_ctx: ?*anyopaque = null,
+        close_fn: ?*const fn (*anyopaque, std.posix.fd_t) void = null,
+        owned_ip: ?[]u8 = null,
+        allocator: ?std.mem.Allocator = null,
+
+        pub fn connectionIp(self: *const Lifecycle) []const u8 {
+            return self.owned_ip orelse "unknown";
+        }
+
+        fn deinit(self: *Lifecycle, fd: std.posix.fd_t) void {
+            if (self.release_session_fn) |release| {
+                if (self.release_session_ctx) |ctx| {
+                    if (self.session) |session| release(ctx, session);
+                }
+            }
+            if (self.owned_ip) |ip| {
+                if (self.allocator) |allocator| allocator.free(ip);
+            }
+            if (self.close_fn) |close_hook| {
+                if (self.close_ctx) |ctx| close_hook(ctx, fd);
+            }
+            self.* = .{};
+        }
+    };
+
     fd: std.posix.fd_t,
     transport: DownstreamTransport,
     phase: ConnectionPhase,
     interest: event_loop.Interest,
+    lifecycle: Lifecycle = .{},
 
     pub fn init(transport: DownstreamTransport, phase: ConnectionPhase) ManagedConnection {
         var mutable = transport;
@@ -235,14 +266,17 @@ pub const ManagedConnection = struct {
     }
 
     pub fn deinit(self: *ManagedConnection) void {
+        const fd = self.fd;
         deinitPhase(&self.phase);
         self.transport.deinit();
+        self.lifecycle.deinit(fd);
         self.* = undefined;
     }
 };
 
 pub const ActiveRegistry = struct {
     allocator: std.mem.Allocator,
+    mutex: compat.Mutex = .{},
     map: std.AutoHashMap(std.posix.fd_t, ManagedConnection),
 
     pub fn init(allocator: std.mem.Allocator) ActiveRegistry {
@@ -258,46 +292,65 @@ pub const ActiveRegistry = struct {
         self.* = undefined;
     }
 
-    pub fn insert(self: *ActiveRegistry, conn: ManagedConnection) !void {
-        const fd = conn.fd;
-        if (self.map.fetchRemove(fd)) |removed| {
-            var old = removed.value;
-            old.deinit();
-        }
-        try self.map.put(fd, conn);
+    pub fn insert(self: *ActiveRegistry, conn: *ManagedConnection) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (self.map.contains(conn.fd)) return error.DuplicateConnection;
+        try self.map.ensureUnusedCapacity(1);
+        self.map.putAssumeCapacity(conn.fd, conn.*);
+        conn.* = undefined;
     }
 
-    pub fn contains(self: *const ActiveRegistry, fd: std.posix.fd_t) bool {
+    pub fn contains(self: *ActiveRegistry, fd: std.posix.fd_t) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         return self.map.contains(fd);
     }
 
     pub fn checkout(self: *ActiveRegistry, fd: std.posix.fd_t) ?ManagedConnection {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         const removed = self.map.fetchRemove(fd) orelse return null;
         return removed.value;
     }
 
-    pub fn rearm(self: *ActiveRegistry, conn: ManagedConnection) !event_loop.Interest {
+    pub fn rearm(self: *ActiveRegistry, conn: *ManagedConnection) !event_loop.Interest {
         const interest = conn.interest;
         try self.insert(conn);
         return interest;
     }
 
     pub fn close(self: *ActiveRegistry, fd: std.posix.fd_t) bool {
-        const removed = self.map.fetchRemove(fd) orelse return false;
-        var conn = removed.value;
+        self.mutex.lock();
+        const removed = self.map.fetchRemove(fd);
+        self.mutex.unlock();
+        if (removed == null) return false;
+        var conn = removed.?.value;
         conn.deinit();
         return true;
     }
 
-    pub fn closeAll(self: *ActiveRegistry) void {
+    fn takeOne(self: *ActiveRegistry) ?ManagedConnection {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         var it = self.map.iterator();
-        while (it.next()) |entry| {
-            entry.value_ptr.deinit();
-        }
-        self.map.clearRetainingCapacity();
+        const entry = it.next() orelse return null;
+        const fd = entry.key_ptr.*;
+        const removed = self.map.fetchRemove(fd).?;
+        return removed.value;
     }
 
-    pub fn count(self: *const ActiveRegistry) usize {
+    pub fn closeAll(self: *ActiveRegistry) void {
+        while (self.takeOne()) |taken| {
+            var conn = taken;
+            conn.deinit();
+        }
+    }
+
+    pub fn count(self: *ActiveRegistry) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         return self.map.count();
     }
 };
@@ -360,7 +413,7 @@ test "active registry checks out and rearms fd keyed connection ownership" {
     );
     _ = managed.updateInterestFor(.{ .write = true });
 
-    try registry.insert(managed);
+    try registry.insert(&managed);
     try std.testing.expect(registry.contains(-1));
     try std.testing.expectEqual(@as(usize, 1), registry.count());
 
@@ -370,10 +423,45 @@ test "active registry checks out and rearms fd keyed connection ownership" {
     try std.testing.expect(!checked_out.interest.read);
 
     _ = checked_out.updateInterestFor(.{ .read = true });
-    const interest = try registry.rearm(checked_out);
+    const interest = try registry.rearm(&checked_out);
     try std.testing.expect(interest.read);
     try std.testing.expect(registry.close(-1));
     try std.testing.expectEqual(@as(usize, 0), registry.count());
+}
+
+test "active registry rejects duplicate fd without taking replacement ownership" {
+    var registry = ActiveRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+
+    var first = ManagedConnection.init(
+        .{ .plaintext = -1 },
+        .{ .native_handshake = .{} },
+    );
+    try registry.insert(&first);
+
+    var duplicate = ManagedConnection.init(
+        .{ .plaintext = -1 },
+        .{ .native_handshake = .{} },
+    );
+    defer duplicate.deinit();
+
+    try std.testing.expectError(error.DuplicateConnection, registry.insert(&duplicate));
+    try std.testing.expect(registry.contains(-1));
+}
+
+test "active registry insertion failure leaves ownership with caller" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var registry = ActiveRegistry.init(failing.allocator());
+    defer registry.deinit();
+
+    var managed = ManagedConnection.init(
+        .{ .plaintext = -1 },
+        .{ .native_handshake = .{} },
+    );
+    defer managed.deinit();
+
+    try std.testing.expectError(error.OutOfMemory, registry.insert(&managed));
+    try std.testing.expectEqual(@as(std.posix.fd_t, -1), managed.fd);
 }
 
 test "managed connection preserves protocol write interest for plaintext wait-write" {

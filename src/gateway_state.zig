@@ -2614,6 +2614,7 @@ pub const WorkerContext = struct {
     config_store: *ReloadableConfigStore,
     state: *GatewayState,
     tls: ?*http.tls_termination.TlsTerminator,
+    native_credentials: ?*http.native_tls_connection.NativeCredentialStore,
     session_pool: *ConnectionSessionPool,
     /// Event loop used to (un)watch idle keepalive connections (#138). A worker
     /// re-arms a parked fd here; the loop thread dispatches it back on readiness.

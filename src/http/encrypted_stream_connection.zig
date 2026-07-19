@@ -62,6 +62,9 @@ pub const EncryptedStreamHttpConnection = struct {
             return self.conn.write(data);
         }
 
+        /// Compatibility helper for existing synchronous serializers. A caller
+        /// that needs to resume after WouldBlock must retain its own operation
+        /// cursor and call `write()` instead.
         pub fn writeAll(self: Writer, data: []const u8) encrypted_stream.Error!void {
             return self.conn.writeAll(data);
         }

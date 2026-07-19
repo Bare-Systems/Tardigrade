@@ -3,6 +3,7 @@ const std = @import("std");
 const http = @import("http.zig");
 const edge_config = @import("edge_config.zig");
 const runtime_allocator = @import("runtime_allocator.zig");
+const build_options = @import("build_options");
 
 const STREAM_RELAY_BUFFER_SIZE: usize = 16 * 1024;
 const JSON_CONTENT_TYPE = "application/json";
@@ -220,6 +221,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     defer config_store.deinit();
     var http3_runtime: ?http.http3_runtime.Runtime = null;
     var tls_terminator: ?http.tls_termination.TlsTerminator = null;
+    var native_credentials: ?http.native_tls_connection.NativeCredentialStore = null;
     var http3_dispatch_ctx = ghandlers.Http3DispatchContext{
         .config_store = &config_store,
         .cfg = cfg,
@@ -231,43 +233,54 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         for (cfg.tls_sni_certs, 0..) |sc, i| {
             sni_specs[i] = .{ .server_name = sc.server_name, .cert_path = sc.cert_path, .key_path = sc.key_path };
         }
-        tls_terminator = try http.tls_termination.TlsTerminator.init(state_allocator, .{
-            .cert_path = cfg.tls_cert_path,
-            .key_path = cfg.tls_key_path,
-            .min_version = cfg.tls_min_version,
-            .max_version = cfg.tls_max_version,
-            .cipher_list = cfg.tls_cipher_list,
-            .cipher_suites = cfg.tls_cipher_suites,
-            .sni_certs = sni_specs,
-            .session_cache_enabled = cfg.tls_session_cache_enabled,
-            .session_cache_size = cfg.tls_session_cache_size,
-            .session_timeout_seconds = cfg.tls_session_timeout_seconds,
-            .session_tickets_enabled = cfg.tls_session_tickets_enabled,
-            .ocsp_stapling_enabled = cfg.tls_ocsp_stapling_enabled,
-            .ocsp_response_path = cfg.tls_ocsp_response_path,
-            .ocsp_auto_refresh_enabled = cfg.tls_ocsp_auto_refresh,
-            .ocsp_refresh_interval_ms = cfg.tls_ocsp_refresh_interval_ms,
-            .ocsp_refresh_timeout_ms = cfg.tls_ocsp_refresh_timeout_ms,
-            .client_ca_path = cfg.tls_client_ca_path,
-            .client_verify = cfg.tls_client_verify,
-            .client_verify_depth = cfg.tls_client_verify_depth,
-            .crl_path = cfg.tls_crl_path,
-            .crl_check = cfg.tls_crl_check,
-            .dynamic_reload_interval_ms = cfg.tls_dynamic_reload_interval_ms,
-            .acme_enabled = cfg.tls_acme_enabled,
-            .acme_cert_dir = cfg.tls_acme_cert_dir,
-            .acme_auto_issue = cfg.tls_acme_enabled and cfg.tls_acme_domains.len > 0,
-            .acme_directory_url = cfg.tls_acme_directory_url,
-            .acme_domains = cfg.tls_acme_domains,
-            .acme_email = cfg.tls_acme_email,
-            .acme_account_key_path = cfg.tls_acme_account_key_path,
-            .acme_renew_days_before_expiry = cfg.tls_acme_renew_days_before_expiry,
-            .acme_challenge_store = if (state.acme_challenge_store) |*s| s else null,
-            .http1_enabled = cfg.http1_enabled,
-            .http2_enabled = cfg.http2_enabled,
-            .http1_alpn_fallback_enabled = cfg.tls_http1_no_alpn_fallback,
-        });
+        if (!build_options.tls_openssl_adapter) {
+            var native_sni_specs = try state_allocator.alloc(http.native_tls_connection.SniCertSpec, cfg.tls_sni_certs.len);
+            defer state_allocator.free(native_sni_specs);
+            for (cfg.tls_sni_certs, 0..) |sc, i| {
+                native_sni_specs[i] = .{ .server_name = sc.server_name, .cert_path = sc.cert_path, .key_path = sc.key_path };
+            }
+            native_credentials = http.native_tls_connection.NativeCredentialStore.init(state_allocator);
+            try native_credentials.?.reloadFromFiles(cfg.tls_cert_path, cfg.tls_key_path, native_sni_specs);
+        } else {
+            tls_terminator = try http.tls_termination.TlsTerminator.init(state_allocator, .{
+                .cert_path = cfg.tls_cert_path,
+                .key_path = cfg.tls_key_path,
+                .min_version = cfg.tls_min_version,
+                .max_version = cfg.tls_max_version,
+                .cipher_list = cfg.tls_cipher_list,
+                .cipher_suites = cfg.tls_cipher_suites,
+                .sni_certs = sni_specs,
+                .session_cache_enabled = cfg.tls_session_cache_enabled,
+                .session_cache_size = cfg.tls_session_cache_size,
+                .session_timeout_seconds = cfg.tls_session_timeout_seconds,
+                .session_tickets_enabled = cfg.tls_session_tickets_enabled,
+                .ocsp_stapling_enabled = cfg.tls_ocsp_stapling_enabled,
+                .ocsp_response_path = cfg.tls_ocsp_response_path,
+                .ocsp_auto_refresh_enabled = cfg.tls_ocsp_auto_refresh,
+                .ocsp_refresh_interval_ms = cfg.tls_ocsp_refresh_interval_ms,
+                .ocsp_refresh_timeout_ms = cfg.tls_ocsp_refresh_timeout_ms,
+                .client_ca_path = cfg.tls_client_ca_path,
+                .client_verify = cfg.tls_client_verify,
+                .client_verify_depth = cfg.tls_client_verify_depth,
+                .crl_path = cfg.tls_crl_path,
+                .crl_check = cfg.tls_crl_check,
+                .dynamic_reload_interval_ms = cfg.tls_dynamic_reload_interval_ms,
+                .acme_enabled = cfg.tls_acme_enabled,
+                .acme_cert_dir = cfg.tls_acme_cert_dir,
+                .acme_auto_issue = cfg.tls_acme_enabled and cfg.tls_acme_domains.len > 0,
+                .acme_directory_url = cfg.tls_acme_directory_url,
+                .acme_domains = cfg.tls_acme_domains,
+                .acme_email = cfg.tls_acme_email,
+                .acme_account_key_path = cfg.tls_acme_account_key_path,
+                .acme_renew_days_before_expiry = cfg.tls_acme_renew_days_before_expiry,
+                .acme_challenge_store = if (state.acme_challenge_store) |*s| s else null,
+                .http1_enabled = cfg.http1_enabled,
+                .http2_enabled = cfg.http2_enabled,
+                .http1_alpn_fallback_enabled = cfg.tls_http1_no_alpn_fallback,
+            });
+        }
     }
+    defer if (native_credentials) |*store| store.deinit();
     defer if (tls_terminator) |*tls| tls.deinit();
     if (cfg.http3_enabled) {
         if (!edge_config.hasTlsFiles(cfg)) {
@@ -313,6 +326,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         .config_store = &config_store,
         .state = &state,
         .tls = if (tls_terminator) |*tls| tls else null,
+        .native_credentials = if (native_credentials) |*store| store else null,
         .session_pool = undefined,
         .event_loop = &event_loop,
         .active = undefined,
@@ -577,6 +591,17 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         var i: usize = 0;
         while (i < event_count) : (i += 1) {
             const ev = ready_events[i];
+            if (active.contains(ev.fd)) {
+                event_loop.remove(ev.fd) catch {};
+                worker_pool.submit(ev.fd) catch |err| {
+                    state.logger.warn(null, "active connection worker submit failed: {}", .{err});
+                    if (active.checkout(ev.fd)) |taken| {
+                        var conn = taken;
+                        conn.deinit();
+                    }
+                };
+                continue;
+            }
             if (!ev.readable) continue;
             if (ev.fd == listen_fd) {
                 gaccept.acceptReadyConnections(listen_fd, &worker_pool, &state);
@@ -702,6 +727,12 @@ fn workerQueueWaitCallback(raw_ctx: *anyopaque, wait_ns: i64) void {
 fn handleAcceptedClient(raw_ctx: *anyopaque, client_fd: std.posix.fd_t) void {
     const ctx: *WorkerContext = @ptrCast(@alignCast(raw_ctx));
 
+    if (ctx.active.checkout(client_fd)) |taken| {
+        var conn = taken;
+        advanceActiveConnection(ctx, &conn);
+        return;
+    }
+
     // Resume path (#138): the event loop dispatched a parked keepalive
     // connection that became readable. Its session, TLS state, and connection
     // slot are already established and owned by the parked registry.
@@ -801,16 +832,15 @@ fn startNewConnection(ctx: *WorkerContext, client_fd: std.posix.fd_t) void {
     defer if (!transferred) closeNewConnection(ctx, client_fd, session, tls_to_park);
 
     const owned_connection_ip = gconn.clientIpFromFd(ctx.state.allocator, client_fd) catch null;
-    defer if (owned_connection_ip) |ip| ctx.state.allocator.free(ip);
+    var transferred_ip = false;
+    defer if (!transferred_ip) {
+        if (owned_connection_ip) |ip| ctx.state.allocator.free(ip);
+    };
     const connection_ip = owned_connection_ip orelse "unknown";
 
     var cfg_lease = ctx.acquireConfig();
     defer cfg_lease.release();
     const cfg = cfg_lease.cfg;
-    gconn.setNonBlocking(client_fd, false) catch |err| {
-        ctx.state.logger.warn(null, "failed to switch client fd to blocking mode: {}", .{err});
-        return;
-    };
 
     gconn.setNoDelay(client_fd) catch |err| {
         ctx.state.logger.warn(null, "failed to set TCP_NODELAY on client fd: {}", .{err});
@@ -821,6 +851,10 @@ fn startNewConnection(ctx: *WorkerContext, client_fd: std.posix.fd_t) void {
     const write_timeout_ms = if (cfg.downstream_write_timeout_ms > 0) cfg.downstream_write_timeout_ms else header_timeout_ms;
 
     if (ctx.tls) |tls| {
+        gconn.setNonBlocking(client_fd, false) catch |err| {
+            ctx.state.logger.warn(null, "failed to switch client fd to blocking mode: {}", .{err});
+            return;
+        };
         // Apply the TLS handshake timeout before PROXY protocol parsing and
         // SSL_accept. Falls back to keep_alive_timeout_ms when not explicitly
         // configured so the old behavior is preserved for operators that haven't
@@ -886,7 +920,59 @@ fn startNewConnection(ctx: *WorkerContext, client_fd: std.posix.fd_t) void {
             parkConnection(ctx, client_fd, session, tls_conn, served, connection_ip);
         }
         return;
+    } else if (ctx.native_credentials) |native_store| {
+        if (cfg.proxy_protocol_mode != .off) {
+            ctx.state.logger.warn(null, "native TLS path does not support PROXY protocol preface parsing yet", .{});
+            return;
+        }
+        if (cfg.tls_client_verify) {
+            ctx.state.logger.warn(null, "native TLS path does not support downstream client certificate verification yet", .{});
+            return;
+        }
+        const tls_protocol_policy = gprotocol_policy.listenerPolicyFromConfig(cfg);
+        const native = http.native_tls_connection.NativeTlsConnection.create(
+            ctx.state.allocator,
+            client_fd,
+            tls_protocol_policy,
+            native_store.provider(),
+        ) catch |err| {
+            ctx.state.logger.warn(null, "native tls connection setup failed: {}", .{err});
+            return;
+        };
+        var managed = http.downstream_connection.ManagedConnection.init(
+            .{ .native = native },
+            .{ .native_handshake = .{} },
+        );
+        managed.lifecycle = .{
+            .session = session,
+            .release_session_ctx = ctx,
+            .release_session_fn = activeReleaseSession,
+            .close_ctx = ctx.state,
+            .close_fn = activeConnectionCloseHook,
+            .owned_ip = if (owned_connection_ip) |ip| @constCast(ip) else null,
+            .allocator = ctx.state.allocator,
+        };
+        transferred = true;
+        if (owned_connection_ip != null) transferred_ip = true;
+        const interest = managed.interest;
+        ctx.active.insert(&managed) catch |err| {
+            ctx.state.logger.warn(null, "native tls active registry insert failed: {}", .{err});
+            managed.deinit();
+            return;
+        };
+        ctx.event_loop.add(client_fd, interest) catch |err| {
+            ctx.state.logger.warn(null, "native tls event registration failed: {}", .{err});
+            if (ctx.active.checkout(client_fd)) |taken| {
+                var conn = taken;
+                conn.deinit();
+            }
+        };
+        return;
     } else {
+        gconn.setNonBlocking(client_fd, false) catch |err| {
+            ctx.state.logger.warn(null, "failed to switch client fd to blocking mode: {}", .{err});
+            return;
+        };
         if (!cfg.http1_enabled) {
             ctx.state.logger.err(null, "plaintext HTTP/1.1 parser disabled and h2c is not supported", .{});
             return;
@@ -1030,6 +1116,156 @@ fn reparkConnection(ctx: *WorkerContext, pc: *http.keepalive_park.ParkedConnecti
     ctx.event_loop.add(pc.fd, pc.eventInterest()) catch {
         if (ctx.parked.checkout(pc.fd)) |taken| ctx.parked.closeSlot(taken, .@"error");
     };
+}
+
+fn activeReleaseSession(raw_ctx: *anyopaque, raw_session: *anyopaque) void {
+    const ctx: *WorkerContext = @ptrCast(@alignCast(raw_ctx));
+    const session: *ConnectionSession = @ptrCast(@alignCast(raw_session));
+    ctx.session_pool.release(session);
+}
+
+fn activeConnectionCloseHook(raw_state: *anyopaque, fd: std.posix.fd_t) void {
+    const state: *GatewayState = @ptrCast(@alignCast(raw_state));
+    state.releaseConnectionSlot(fd);
+}
+
+fn rearmActiveConnection(ctx: *WorkerContext, managed: *http.downstream_connection.ManagedConnection, requested: http.event_loop.Interest) void {
+    const fd = managed.fd;
+    const interest = managed.updateInterestFor(requested);
+    _ = ctx.active.rearm(managed) catch |err| {
+        ctx.state.logger.warn(null, "active connection rearm failed: {}", .{err});
+        managed.deinit();
+        return;
+    };
+    ctx.event_loop.add(fd, interest) catch |err| {
+        ctx.state.logger.warn(null, "active connection event registration failed: {}", .{err});
+        if (ctx.active.checkout(fd)) |taken| {
+            var conn = taken;
+            conn.deinit();
+        }
+    };
+}
+
+fn advanceActiveConnection(ctx: *WorkerContext, managed: *http.downstream_connection.ManagedConnection) void {
+    switch (managed.phase) {
+        .native_handshake => advanceNativeHandshake(ctx, managed),
+        .http1 => advanceNativeHttp1(ctx, managed),
+        .http2 => advanceNativeHttp2(ctx, managed),
+        .idle_http1 => managed.deinit(),
+    }
+}
+
+fn advanceNativeHandshake(ctx: *WorkerContext, managed: *http.downstream_connection.ManagedConnection) void {
+    const native = switch (managed.transport) {
+        .native => |conn| conn,
+        else => {
+            managed.deinit();
+            return;
+        },
+    };
+
+    while (!native.record.applicationDataOpen()) {
+        const driven = native.drive() catch |err| {
+            ctx.state.logger.warn(null, "native tls handshake failed: {}", .{err});
+            managed.deinit();
+            return;
+        };
+        if (native.record.applicationDataOpen()) break;
+        if (!driven.made_progress) {
+            rearmActiveConnection(ctx, managed, .{ .read = true });
+            return;
+        }
+    }
+
+    const negotiated = native.validatedNegotiatedProtocol() catch |err| {
+        ctx.state.logger.warn(null, "native tls negotiated protocol rejected: {}", .{err});
+        managed.deinit();
+        return;
+    };
+
+    switch (negotiated) {
+        .http1_1 => {
+            const h1 = http.downstream_connection.Http1ConnectionState.init(ctx.state.allocator, MAX_REQUEST_SIZE) catch |err| {
+                ctx.state.logger.warn(null, "native http/1 state allocation failed: {}", .{err});
+                managed.deinit();
+                return;
+            };
+            managed.phase = .{ .http1 = h1 };
+            rearmActiveConnection(ctx, managed, .{ .read = true });
+        },
+        .http2 => {
+            const h2 = http.downstream_connection.Http2ConnectionState.init(ctx.state.allocator);
+            managed.phase = .{ .http2 = h2 };
+            rearmActiveConnection(ctx, managed, .{ .read = true });
+        },
+    }
+}
+
+fn activeSession(managed: *http.downstream_connection.ManagedConnection) ?*ConnectionSession {
+    const raw = managed.lifecycle.session orelse return null;
+    return @ptrCast(@alignCast(raw));
+}
+
+fn advanceNativeHttp1(ctx: *WorkerContext, managed: *http.downstream_connection.ManagedConnection) void {
+    const native = switch (managed.transport) {
+        .native => |conn| conn,
+        else => {
+            managed.deinit();
+            return;
+        },
+    };
+    const session = activeSession(managed) orelse {
+        managed.deinit();
+        return;
+    };
+
+    var adapter = native.httpConnection();
+    var served = switch (managed.phase) {
+        .http1 => |*h1| h1.served,
+        else => 0,
+    };
+    const connection_ip = managed.lifecycle.connectionIp();
+
+    while (true) {
+        switch (serveOneRequest(ctx, &adapter, session, connection_ip, &served, false)) {
+            .serve_again => continue,
+            .park => {
+                if (managed.phase == .http1) managed.phase.http1.served = served;
+                rearmActiveConnection(ctx, managed, .{ .read = true });
+                return;
+            },
+            .close => {
+                managed.deinit();
+                return;
+            },
+        }
+    }
+}
+
+fn advanceNativeHttp2(ctx: *WorkerContext, managed: *http.downstream_connection.ManagedConnection) void {
+    const native = switch (managed.transport) {
+        .native => |conn| conn,
+        else => {
+            managed.deinit();
+            return;
+        },
+    };
+    const session = activeSession(managed) orelse {
+        managed.deinit();
+        return;
+    };
+    var cfg_lease = ctx.acquireConfig();
+    defer cfg_lease.release();
+
+    var adapter = native.httpConnection();
+    handleHttp2Connection(&adapter, session, cfg_lease.cfg, ctx.state, managed.lifecycle.connectionIp()) catch |err| {
+        if (isBenignDisconnect(err)) {
+            ctx.state.logger.debug(null, "native http/2 connection closed: {}", .{err});
+        } else {
+            ctx.state.logger.warn(null, "native http/2 connection failed: {}", .{err});
+        }
+    };
+    managed.deinit();
 }
 
 /// Registry teardown hook: release the connection slot held since accept when a

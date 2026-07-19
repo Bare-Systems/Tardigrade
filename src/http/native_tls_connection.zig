@@ -131,6 +131,7 @@ fn keyKindForScheme(scheme: credentials.SignatureScheme) sni_provider.KeyKind {
     return switch (scheme) {
         .ed25519 => .ed25519,
         .ecdsa_secp256r1_sha256 => .ecdsa_p256,
+        else => unreachable,
     };
 }
 

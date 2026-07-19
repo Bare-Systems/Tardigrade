@@ -165,6 +165,35 @@ pub const Response = struct {
         }
     }
 
+    pub fn buildHeaderBytes(self: *Response, allocator: Allocator) ![]u8 {
+        var output: std.Io.Writer.Allocating = .init(allocator);
+        defer output.deinit();
+        const writer = &output.writer;
+
+        try writer.print("{s} {d} {s}\r\n", .{
+            self.version.toString(),
+            self.status.code(),
+            self.status.phrase(),
+        });
+        try self.writeDate(writer);
+        try writer.print("Server: {s}\r\n", .{SERVER_NAME});
+        if (self.headers.get("content-length")) |content_length| {
+            try writer.print("Content-Length: {s}\r\n", .{content_length});
+        } else {
+            const body_len = if (self.body) |b| b.len else 0;
+            try writer.print("Content-Length: {d}\r\n", .{body_len});
+        }
+        try self.writeRequestIdHeaders(writer);
+        for (self.headers.iterator()) |header| {
+            if (std.ascii.eqlIgnoreCase(header.name, "content-length")) continue;
+            if (std.ascii.eqlIgnoreCase(header.name, correlation.HEADER_NAME) or
+                std.ascii.eqlIgnoreCase(header.name, correlation.REQUEST_HEADER_NAME)) continue;
+            try writer.print("{s}: {s}\r\n", .{ header.name, header.value });
+        }
+        try writer.writeAll("\r\n");
+        return try allocator.dupe(u8, output.written());
+    }
+
     /// Write the response without body (for HEAD requests)
     pub fn writeHead(self: *Response, writer: anytype) !void {
         // Status line
@@ -448,6 +477,95 @@ pub const Response = struct {
     }
 };
 
+pub const ResponseWriteOutcome = enum {
+    done,
+    wait_write,
+};
+
+pub const ResponseWriteState = struct {
+    allocator: Allocator,
+    header_bytes: []u8,
+    header_offset: usize = 0,
+    body: []const u8,
+    body_offset: usize = 0,
+
+    pub fn init(allocator: Allocator, response: *Response, include_body: bool) !ResponseWriteState {
+        const header_bytes = try response.buildHeaderBytes(allocator);
+        errdefer allocator.free(header_bytes);
+        return .{
+            .allocator = allocator,
+            .header_bytes = header_bytes,
+            .body = if (include_body) response.body orelse "" else "",
+        };
+    }
+
+    pub fn deinit(self: *ResponseWriteState) void {
+        self.allocator.free(self.header_bytes);
+        self.* = undefined;
+    }
+
+    pub fn advance(self: *ResponseWriteState, conn: anytype) !ResponseWriteOutcome {
+        while (self.header_offset < self.header_bytes.len) {
+            const n = conn.write(self.header_bytes[self.header_offset..]) catch |err| switch (err) {
+                error.WouldBlock => return .wait_write,
+                else => return err,
+            };
+            if (n == 0) return .wait_write;
+            self.header_offset += n;
+        }
+        while (self.body_offset < self.body.len) {
+            const n = conn.write(self.body[self.body_offset..]) catch |err| switch (err) {
+                error.WouldBlock => return .wait_write,
+                else => return err,
+            };
+            if (n == 0) return .wait_write;
+            self.body_offset += n;
+        }
+        return .done;
+    }
+
+    pub fn done(self: *const ResponseWriteState) bool {
+        return self.header_offset == self.header_bytes.len and self.body_offset == self.body.len;
+    }
+};
+
+const TestPartialWriter = struct {
+    allocator: Allocator,
+    output: std.ArrayList(u8) = .empty,
+    max_chunk: usize,
+    writes_before_block: usize,
+    remaining_writes: usize,
+    blocks: usize = 0,
+
+    fn init(allocator: Allocator, max_chunk: usize, writes_before_block: usize) TestPartialWriter {
+        return .{
+            .allocator = allocator,
+            .max_chunk = max_chunk,
+            .writes_before_block = writes_before_block,
+            .remaining_writes = writes_before_block,
+        };
+    }
+
+    fn deinit(self: *TestPartialWriter) void {
+        self.output.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    fn write(self: *TestPartialWriter, bytes: []const u8) !usize {
+        if (bytes.len == 0) return 0;
+        if (self.remaining_writes == 0) {
+            self.remaining_writes = self.writes_before_block;
+            self.blocks += 1;
+            return error.WouldBlock;
+        }
+
+        self.remaining_writes -= 1;
+        const n = @min(self.max_chunk, bytes.len);
+        try self.output.appendSlice(self.allocator, bytes[0..n]);
+        return n;
+    }
+};
+
 // Tests
 test "build simple 200 response" {
     const testing = std.testing;
@@ -663,6 +781,73 @@ test "response writeHead emits only headers to in-memory buffer" {
     try testing.expect(std.mem.startsWith(u8, out, "HTTP/1.1 204 No Content\r\n"));
     // writeHead should not emit a body
     try testing.expect(std.mem.endsWith(u8, out, "\r\n"));
+}
+
+test "response write state resumes partial body writes after WouldBlock" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const body = try allocator.alloc(u8, 96 * 1024);
+    defer allocator.free(body);
+    for (body, 0..) |*b, i| {
+        b.* = @intCast('a' + (i % 26));
+    }
+
+    var response = Response.init(allocator);
+    defer response.deinit();
+    _ = response.setStatus(.ok).setBody(body).setContentType("text/plain");
+
+    var state = try ResponseWriteState.init(allocator, &response, true);
+    defer state.deinit();
+
+    var writer = TestPartialWriter.init(allocator, 4097, 2);
+    defer writer.deinit();
+
+    var waits: usize = 0;
+    while (true) {
+        switch (try state.advance(&writer)) {
+            .done => break,
+            .wait_write => waits += 1,
+        }
+    }
+
+    try testing.expect(state.done());
+    try testing.expect(waits > 1);
+    try testing.expect(writer.blocks == waits);
+    const out = writer.output.items;
+    try testing.expect(std.mem.find(u8, out, "Content-Length: 98304\r\n") != null);
+
+    const header_end = std.mem.indexOf(u8, out, "\r\n\r\n") orelse return error.TestExpectedHeaders;
+    try testing.expectEqualSlices(u8, body, out[header_end + 4 ..]);
+}
+
+test "response write state can emit headers without consuming body" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var response = Response.init(allocator);
+    defer response.deinit();
+    _ = response.setStatus(.ok).setBody("This body should not be written");
+
+    var state = try ResponseWriteState.init(allocator, &response, false);
+    defer state.deinit();
+
+    var writer = TestPartialWriter.init(allocator, 1024, 16);
+    defer writer.deinit();
+
+    while (true) {
+        switch (try state.advance(&writer)) {
+            .done => break,
+            .wait_write => {},
+        }
+    }
+
+    try testing.expect(state.done());
+    const out = writer.output.items;
+    try testing.expect(std.mem.find(u8, out, "Content-Length: 31\r\n") != null);
+    const header_end = std.mem.indexOf(u8, out, "\r\n\r\n") orelse return error.TestExpectedHeaders;
+    try testing.expectEqual(@as(usize, 0), out[header_end + 4 ..].len);
+    try testing.expect(std.mem.find(u8, out, "This body should not be written") == null);
 }
 
 test "request parse is transport-agnostic: in-memory slice" {

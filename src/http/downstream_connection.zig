@@ -126,6 +126,14 @@ pub const Http1ConnectionState = struct {
     /// cursor against the retained object. The caller must not deinit
     /// `response` after a successful call.
     pub fn beginResponse(self: *Http1ConnectionState, response: response_mod.Response, include_body: bool) !void {
+        var next_response = response;
+        var next_write = try response_mod.ResponseWriteState.init(
+            self.allocator,
+            &next_response,
+            include_body,
+        );
+        errdefer next_write.deinit();
+
         if (self.write_state) |*write| {
             write.deinit();
             self.write_state = null;
@@ -135,13 +143,9 @@ pub const Http1ConnectionState = struct {
             self.response = null;
         }
 
-        self.response = response;
+        self.response = next_response;
         self.include_response_body = include_body;
-        self.write_state = try response_mod.ResponseWriteState.init(
-            self.allocator,
-            &self.response.?,
-            include_body,
-        );
+        self.write_state = next_write;
     }
 
     pub fn deinit(self: *Http1ConnectionState) void {
@@ -223,7 +227,10 @@ pub const ManagedConnection = struct {
     }
 
     pub fn updateInterestFor(self: *ManagedConnection, requested: event_loop.Interest) event_loop.Interest {
-        self.interest = combinedInterest(requested, self.transport.readiness());
+        self.interest = switch (self.transport) {
+            .plaintext => requested,
+            else => combinedInterest(requested, self.transport.readiness()),
+        };
         return self.interest;
     }
 
@@ -290,6 +297,7 @@ test "managed connection preserves protocol write interest for plaintext wait-wr
     defer managed.deinit();
     const interest = managed.updateInterestFor(.{ .write = true });
     try std.testing.expect(interest.write);
+    try std.testing.expect(!interest.read);
 }
 
 test "combined interest keeps phase demand and TLS carrier readiness" {
@@ -323,6 +331,22 @@ test "http1 connection state retains arena backed response body across wait-writ
     const header_end = std.mem.indexOf(u8, out, "\r\n\r\n") orelse return error.TestExpectedHeaders;
     const body = state.response.?.body.?;
     try std.testing.expectEqualSlices(u8, body, out[header_end + 4 ..]);
+}
+
+test "http1 beginResponse is transactional on write-state allocation failure" {
+    var fail = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 2 });
+    var state = try Http1ConnectionState.init(fail.allocator(), 1024);
+    defer state.deinit();
+
+    var response = response_mod.Response.init(std.testing.allocator);
+    defer response.deinit();
+    _ = response.setStatus(.ok)
+        .setHeader("X-Owned", "yes")
+        .setBodyOwned(try std.testing.allocator.dupe(u8, "owned body"));
+
+    try std.testing.expectError(error.WriteFailed, state.beginResponse(response, true));
+    try std.testing.expect(state.response == null);
+    try std.testing.expect(state.write_state == null);
 }
 
 test "http2 connection state owns frame header payload hpack and outbound cursors" {

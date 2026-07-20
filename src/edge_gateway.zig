@@ -1,5 +1,6 @@
 const compat = @import("zig_compat.zig");
 const std = @import("std");
+const builtin = @import("builtin");
 const http = @import("http.zig");
 const edge_config = @import("edge_config.zig");
 const runtime_allocator = @import("runtime_allocator.zig");
@@ -39,6 +40,9 @@ const Http2PendingStream = gs.Http2PendingStream;
 const CommandLifecycleEntry = gs.CommandLifecycleEntry;
 const ApprovalEntry = gs.ApprovalEntry;
 const MuxResumeState = gs.MuxResumeState;
+
+const ActiveDrivePollRemoveFn = *const fn (*anyopaque, std.posix.fd_t) anyerror!void;
+const ActiveDrivePollSubmitFn = *const fn (*anyopaque, std.posix.fd_t) anyerror!void;
 
 pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     const state_allocator = runtime_allocator.runtimeAllocator();
@@ -798,15 +802,38 @@ fn handleAcceptedClient(raw_ctx: *anyopaque, item: http.worker_pool.WorkItem) vo
             if (ctx.parked.checkout(fd)) |pc| resumeParkedConnection(ctx, pc);
         },
         .active_socket_ready, .active_drive_poll => |fd| {
-            var conn = ctx.active.checkout(fd) orelse return;
-            if (conn.expired(http.event_loop.monotonicMs())) {
-                ctx.state.logger.debug(null, "active native downstream connection deadline expired before worker dispatch fd={d}", .{fd});
-                conn.deinit();
-                return;
+            switch (checkoutActiveForWorkerAt(ctx.active, fd, http.event_loop.monotonicMs())) {
+                .missing => return,
+                .expired => {
+                    ctx.state.logger.debug(null, "active native downstream connection deadline expired before worker dispatch fd={d}", .{fd});
+                    return;
+                },
+                .ready => |conn| {
+                    var mutable = conn;
+                    advanceActiveConnection(ctx, &mutable);
+                },
             }
-            advanceActiveConnection(ctx, &conn);
         },
     }
+}
+
+const ActiveCheckoutResult = union(enum) {
+    missing,
+    expired,
+    ready: http.downstream_connection.ManagedConnection,
+};
+
+fn checkoutActiveForWorkerAt(
+    active: *http.downstream_connection.ActiveRegistry,
+    fd: std.posix.fd_t,
+    now_ms: u64,
+) ActiveCheckoutResult {
+    var conn = active.checkout(fd) orelse return .missing;
+    if (conn.expired(now_ms)) {
+        conn.deinit();
+        return .expired;
+    }
+    return .{ .ready = conn };
 }
 
 /// Outcome of serving one request on a keepalive HTTP/1.1 connection.
@@ -1268,13 +1295,33 @@ fn dispatchDueActiveDrivePolls(
     event_loop: *http.event_loop.EventLoop,
     worker_pool: *http.worker_pool.WorkerPool,
 ) void {
+    dispatchDueActiveDrivePollsAt(
+        active,
+        state,
+        http.event_loop.monotonicMs(),
+        event_loop,
+        removeActiveDrivePollFd,
+        worker_pool,
+        submitActiveDrivePollWork,
+    );
+}
+
+fn dispatchDueActiveDrivePollsAt(
+    active: *http.downstream_connection.ActiveRegistry,
+    state: *GatewayState,
+    now_ms: u64,
+    remove_ctx: *anyopaque,
+    remove_fn: ActiveDrivePollRemoveFn,
+    submit_ctx: *anyopaque,
+    submit_fn: ActiveDrivePollSubmitFn,
+) void {
     var fds: [32]std.posix.fd_t = undefined;
     while (true) {
-        const count = active.dueDrivePollFds(http.event_loop.monotonicMs(), fds[0..]);
+        const count = active.dueDrivePollFds(now_ms, fds[0..]);
         if (count == 0) break;
         for (fds[0..count]) |fd| {
-            event_loop.remove(fd) catch {};
-            worker_pool.submitActiveDrivePoll(fd) catch |err| {
+            remove_fn(remove_ctx, fd) catch {};
+            submit_fn(submit_ctx, fd) catch |err| {
                 state.logger.warn(null, "active connection drive-poll submit failed: {}", .{err});
                 if (active.checkout(fd)) |taken| {
                     var conn = taken;
@@ -1284,6 +1331,16 @@ fn dispatchDueActiveDrivePolls(
         }
         if (count < fds.len) break;
     }
+}
+
+fn removeActiveDrivePollFd(raw_ctx: *anyopaque, fd: std.posix.fd_t) !void {
+    const event_loop: *http.event_loop.EventLoop = @ptrCast(@alignCast(raw_ctx));
+    try event_loop.remove(fd);
+}
+
+fn submitActiveDrivePollWork(raw_ctx: *anyopaque, fd: std.posix.fd_t) !void {
+    const worker_pool: *http.worker_pool.WorkerPool = @ptrCast(@alignCast(raw_ctx));
+    try worker_pool.submitActiveDrivePoll(fd);
 }
 
 fn rearmActiveConnection(ctx: *WorkerContext, managed: *http.downstream_connection.ManagedConnection, requested: http.event_loop.Interest) void {
@@ -2671,6 +2728,296 @@ test "connection timeout helper resets read and write timeouts" {
     setConnTimeouts(&conn, 0, 0);
     try std.testing.expectEqual(@as(u32, 0), conn.read_timeout_ms);
     try std.testing.expectEqual(@as(u32, 0), conn.write_timeout_ms);
+}
+
+const GatewaySchedulerTestSubmit = struct {
+    submitted: usize = 0,
+    item: ?http.worker_pool.WorkItem = null,
+
+    fn submit(raw_ctx: *anyopaque, fd: std.posix.fd_t) !void {
+        const self: *GatewaySchedulerTestSubmit = @ptrCast(@alignCast(raw_ctx));
+        self.submitted += 1;
+        self.item = .{ .active_drive_poll = fd };
+    }
+};
+
+const GatewaySchedulerTestRemove = struct {
+    removed: usize = 0,
+    fd: std.posix.fd_t = -1,
+
+    fn remove(raw_ctx: *anyopaque, fd: std.posix.fd_t) !void {
+        const self: *GatewaySchedulerTestRemove = @ptrCast(@alignCast(raw_ctx));
+        self.removed += 1;
+        self.fd = fd;
+    }
+};
+
+const GatewaySchedulerCloseProbe = struct {
+    closes: usize = 0,
+    last_fd: std.posix.fd_t = -1,
+
+    fn close(raw_ctx: *anyopaque, fd: std.posix.fd_t) void {
+        const self: *GatewaySchedulerCloseProbe = @ptrCast(@alignCast(raw_ctx));
+        self.closes += 1;
+        self.last_fd = fd;
+    }
+};
+
+const GatewayTestFdCarrier = struct {
+    fd: std.posix.fd_t,
+
+    fn carrier(self: *GatewayTestFdCarrier) tls_core.encrypted_stream.Carrier {
+        return .{ .ptr = self, .readFn = read, .writeFn = write };
+    }
+
+    fn read(raw_ctx: *anyopaque, out: []u8) tls_core.encrypted_stream.Error!usize {
+        const self: *GatewayTestFdCarrier = @ptrCast(@alignCast(raw_ctx));
+        return gatewayTestReadFd(self.fd, out);
+    }
+
+    fn write(raw_ctx: *anyopaque, bytes: []const u8) tls_core.encrypted_stream.Error!usize {
+        const self: *GatewayTestFdCarrier = @ptrCast(@alignCast(raw_ctx));
+        return gatewayTestWriteFd(self.fd, bytes);
+    }
+};
+
+const GatewayPendingNative = struct {
+    allocator: std.mem.Allocator,
+    fd: std.posix.fd_t,
+    peer_fd: std.posix.fd_t,
+    mock: *tls_core.credentials.MockCredentialProvider,
+    client_entropy_source: tls_core.production_crypto.OsEntropy = .{},
+    client_provider: tls_core.production_crypto.Provider = undefined,
+    client_backend: tls_core.tls13_backend.Tls13Backend = undefined,
+    client_carrier: GatewayTestFdCarrier = undefined,
+    client_stream: tls_core.encrypted_stream.PureZigRecordStream = undefined,
+    native: *http.native_tls_connection.NativeTlsConnection,
+
+    fn create(allocator: std.mem.Allocator, pending_polls: usize) !*GatewayPendingNative {
+        const self = try allocator.create(GatewayPendingNative);
+        errdefer allocator.destroy(self);
+
+        const fds = try gatewayTestSocketPair();
+        errdefer gatewayTestCloseFd(fds[0]);
+        errdefer gatewayTestCloseFd(fds[1]);
+
+        const mock = try allocator.create(tls_core.credentials.MockCredentialProvider);
+        errdefer allocator.destroy(mock);
+        mock.* = tls_core.credentials.MockCredentialProvider.init(tls_core.credentials.testdata.identity());
+        mock.async_select = true;
+        mock.pending_polls = pending_polls;
+
+        const native = try http.native_tls_connection.NativeTlsConnection.create(
+            allocator,
+            fds[0],
+            .{ .http1_enabled = true, .http2_enabled = true },
+            mock.provider(),
+        );
+        errdefer native.destroy();
+
+        self.* = GatewayPendingNative{
+            .allocator = allocator,
+            .fd = fds[0],
+            .peer_fd = fds[1],
+            .mock = mock,
+            .native = native,
+        };
+        self.client_provider = tls_core.production_crypto.Provider.init(self.client_entropy_source.entropy());
+        self.client_backend = tls_core.tls13_backend.Tls13Backend.initClientWithOptions(
+            .{ .hello_random = [_]u8{0xc1} ** 32, .key_share_seed = [_]u8{0x11} ** 32 },
+            .{ .pinned_certificate = tls_core.tls13_backend.testdata.certificate_der },
+            .{ .record = .{ .alpn = tls_core.tls13_backend.recordAlpnPolicy("h2") } },
+            .{ .server_name = "tardigrade.test" },
+        );
+        self.client_carrier = .{ .fd = fds[1] };
+        self.client_stream = tls_core.encrypted_stream.PureZigRecordStream.initWithCarrierAndBackend(
+            .client,
+            self.client_provider.cryptoProvider(),
+            .tls_aes_128_gcm_sha256,
+            self.client_carrier.carrier(),
+            self.client_backend.backend(),
+        );
+
+        var rounds: usize = 0;
+        while (!native.backend.authPending()) : (rounds += 1) {
+            if (rounds >= 20) return error.Stalled;
+            const client_result = try self.client_stream.drive();
+            const server_result = try native.drive();
+            if (!client_result.made_progress and !server_result.made_progress) return error.Stalled;
+        }
+        try std.testing.expect(native.backend.authPending());
+        try std.testing.expectEqual(@as(usize, 1), self.mock.select_count);
+        return self;
+    }
+
+    fn deinitPeer(self: *GatewayPendingNative) void {
+        self.client_stream.deinit();
+        self.client_backend.deinit();
+        gatewayTestCloseFd(self.peer_fd);
+        const allocator = self.allocator;
+        allocator.destroy(self.mock);
+        self.* = undefined;
+        allocator.destroy(self);
+    }
+};
+
+test "gateway active-drive scheduler polls pending native auth and expires queued work without fd reuse (#355)" {
+    const allocator = std.testing.allocator;
+
+    const pending = try GatewayPendingNative.create(allocator, 2);
+    defer pending.deinitPeer();
+
+    var registry = http.downstream_connection.ActiveRegistry.init(allocator);
+    defer registry.deinit();
+
+    var close_probe = GatewaySchedulerCloseProbe{};
+    var managed = http.downstream_connection.ManagedConnection.init(
+        .{ .native = pending.native },
+        .{ .native_handshake = .{ .deadline_ms = 1_000 } },
+    );
+    managed.lifecycle.close_ctx = &close_probe;
+    managed.lifecycle.close_fn = GatewaySchedulerCloseProbe.close;
+    const wait = managed.updateWaitFor(.{ .read = true }, 100, ACTIVE_DRIVE_POLL_INTERVAL_MS) orelse
+        return error.TestExpectedEncryptedWait;
+    try std.testing.expectEqual(http.downstream_connection.EncryptedWait{ .retry_at_ms = 350 }, wait);
+    try registry.insert(&managed);
+
+    var state: GatewayState = undefined;
+    var remove_probe = GatewaySchedulerTestRemove{};
+    var submit_probe = GatewaySchedulerTestSubmit{};
+    dispatchDueActiveDrivePollsAt(&registry, &state, 349, &remove_probe, GatewaySchedulerTestRemove.remove, &submit_probe, GatewaySchedulerTestSubmit.submit);
+    try std.testing.expectEqual(@as(usize, 0), submit_probe.submitted);
+    try std.testing.expect(registry.contains(pending.fd));
+
+    dispatchDueActiveDrivePollsAt(&registry, &state, 350, &remove_probe, GatewaySchedulerTestRemove.remove, &submit_probe, GatewaySchedulerTestSubmit.submit);
+    try std.testing.expectEqual(@as(usize, 1), submit_probe.submitted);
+    try std.testing.expectEqual(http.worker_pool.WorkItem{ .active_drive_poll = pending.fd }, submit_probe.item.?);
+    try std.testing.expectEqual(pending.fd, remove_probe.fd);
+    try std.testing.expect(registry.contains(pending.fd));
+
+    var expired_out: [1]http.downstream_connection.ManagedConnection = undefined;
+    try std.testing.expectEqual(@as(usize, 0), registry.reapExpired(1_001, expired_out[0..]));
+
+    var ready = switch (checkoutActiveForWorkerAt(&registry, pending.fd, 600)) {
+        .ready => |conn| conn,
+        .missing, .expired => return error.TestExpectedReadyActiveConnection,
+    };
+    _ = try ready.transport.native.drive();
+    try std.testing.expect(ready.transport.native.backend.authPending());
+    try std.testing.expectEqual(@as(usize, 1), pending.mock.poll_count);
+    try std.testing.expectEqual(@as(usize, 0), close_probe.closes);
+    ready.deinit();
+
+    const expired_pending = try GatewayPendingNative.create(allocator, 5);
+    defer expired_pending.deinitPeer();
+    var expired_probe = GatewaySchedulerCloseProbe{};
+    var expired_managed = http.downstream_connection.ManagedConnection.init(
+        .{ .native = expired_pending.native },
+        .{ .native_handshake = .{ .deadline_ms = 1_000 } },
+    );
+    expired_managed.lifecycle.close_ctx = &expired_probe;
+    expired_managed.lifecycle.close_fn = GatewaySchedulerCloseProbe.close;
+    _ = expired_managed.updateWaitFor(.{ .read = true }, 100, ACTIVE_DRIVE_POLL_INTERVAL_MS);
+    try registry.insert(&expired_managed);
+
+    submit_probe = .{};
+    dispatchDueActiveDrivePollsAt(&registry, &state, 350, &remove_probe, GatewaySchedulerTestRemove.remove, &submit_probe, GatewaySchedulerTestSubmit.submit);
+    try std.testing.expectEqual(@as(usize, 1), submit_probe.submitted);
+    try std.testing.expectEqual(@as(usize, 0), registry.reapExpired(1_001, expired_out[0..]));
+
+    const stale_fd = expired_pending.fd;
+    try std.testing.expectEqual(ActiveCheckoutResult.expired, checkoutActiveForWorkerAt(&registry, stale_fd, 1_001));
+    try std.testing.expectEqual(@as(usize, 1), expired_probe.closes);
+    try std.testing.expectEqual(stale_fd, expired_probe.last_fd);
+    try std.testing.expectEqual(@as(usize, 1), expired_pending.mock.cancel_count);
+    try std.testing.expectEqual(@as(usize, 1), expired_pending.mock.op_release_count);
+
+    const reused = try gatewayTestSocketPair();
+    defer gatewayTestCloseFd(reused[1]);
+    defer gatewayTestCloseFd(stale_fd);
+    if (reused[0] != stale_fd) {
+        if (std.c.dup2(reused[0], stale_fd) < 0) return error.Dup2Failed;
+        gatewayTestCloseFd(reused[0]);
+    }
+    try std.testing.expectEqual(ActiveCheckoutResult.missing, checkoutActiveForWorkerAt(&registry, stale_fd, 1_001));
+    try std.testing.expectEqual(@as(usize, 1), expired_probe.closes);
+    _ = try gatewayTestWriteFd(stale_fd, "x");
+}
+
+fn gatewayTestSocketPair() ![2]std.posix.fd_t {
+    var fds: [2]std.posix.fd_t = undefined;
+    if (builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        const rc = linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM, 0, &fds);
+        if (linux.errno(rc) != .SUCCESS) return error.SocketPairFailed;
+    } else {
+        if (std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds) != 0) return error.SocketPairFailed;
+    }
+    errdefer gatewayTestCloseFd(fds[0]);
+    errdefer gatewayTestCloseFd(fds[1]);
+    try gatewayTestSetNonBlocking(fds[0]);
+    try gatewayTestSetNonBlocking(fds[1]);
+    return fds;
+}
+
+fn gatewayTestCloseFd(fd: std.posix.fd_t) void {
+    if (builtin.os.tag == .linux) {
+        _ = std.os.linux.close(fd);
+    } else {
+        _ = std.c.close(fd);
+    }
+}
+
+fn gatewayTestSetNonBlocking(fd: std.posix.fd_t) !void {
+    if (builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        const status_flags = linux.fcntl(fd, linux.F.GETFL, 0);
+        if (linux.errno(status_flags) != .SUCCESS) return error.FcntlFailed;
+        const nonblock: usize = @intCast(@as(u32, @bitCast(linux.O{ .NONBLOCK = true })));
+        const rc = linux.fcntl(fd, linux.F.SETFL, status_flags | nonblock);
+        if (linux.errno(rc) != .SUCCESS) return error.FcntlFailed;
+    } else {
+        const status_flags = std.c.fcntl(fd, std.c.F.GETFL, @as(c_int, 0));
+        if (status_flags < 0) return error.FcntlFailed;
+        const nonblock = @as(c_int, @bitCast(std.posix.O{ .NONBLOCK = true }));
+        if (std.c.fcntl(fd, std.c.F.SETFL, status_flags | nonblock) < 0) return error.FcntlFailed;
+    }
+}
+
+fn gatewayTestReadFd(fd: std.posix.fd_t, out: []u8) tls_core.encrypted_stream.Error!usize {
+    if (builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        const rc = linux.read(fd, out.ptr, out.len);
+        return switch (linux.errno(rc)) {
+            .SUCCESS => rc,
+            .AGAIN => error.WouldBlock,
+            else => error.SocketReadFailed,
+        };
+    }
+    const rc = std.c.read(fd, out.ptr, out.len);
+    if (rc < 0) {
+        if (std.posix.errno(rc) == .AGAIN) return error.WouldBlock;
+        return error.SocketReadFailed;
+    }
+    return @intCast(rc);
+}
+
+fn gatewayTestWriteFd(fd: std.posix.fd_t, bytes: []const u8) tls_core.encrypted_stream.Error!usize {
+    if (builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        const rc = linux.write(fd, bytes.ptr, bytes.len);
+        return switch (linux.errno(rc)) {
+            .SUCCESS => rc,
+            .AGAIN => error.WouldBlock,
+            else => error.SocketWriteFailed,
+        };
+    }
+    const rc = std.c.write(fd, bytes.ptr, bytes.len);
+    if (rc < 0) {
+        if (std.posix.errno(rc) == .AGAIN) return error.WouldBlock;
+        return error.SocketWriteFailed;
+    }
+    return @intCast(rc);
 }
 
 // Pull gateway_handlers (and its transitive imports, including

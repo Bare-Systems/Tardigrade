@@ -504,10 +504,14 @@ pub const ClientTicketState = struct {
     pub const InitError = error{ OutOfMemory, InvalidLimits, TicketTooLarge, NonceTooLarge };
 
     /// Initializes `self` in place and takes ownership of `common` by
-    /// moving it out of the caller's variable: on every path (success or
-    /// failure) `common.*` becomes zero-valued and safe to `deinit` or
-    /// reinitialize, and it is never left duplicated between caller and
-    /// callee. `self` must be zero-valued or a previously-initialized,
+    /// moving it out of the caller's variable — but **only on success**:
+    /// every fallible step (ticket/nonce validation and allocation) runs
+    /// first against a `common`-free temporary, and `common` is moved out
+    /// of the caller as the last, non-failing step. On failure `common.*`
+    /// is left completely untouched (still owned by the caller), and
+    /// `self` (if already live) is also left unchanged; only on success
+    /// does `common.*` become zero-valued and `self` take on the new
+    /// value. `self` must be zero-valued or a previously-initialized,
     /// live value — never `undefined` memory. The new value is built in a
     /// private temporary and only committed into `self` (via `moveFrom`)
     /// after every fallible step succeeds, so a `params.ticket`/
@@ -522,14 +526,11 @@ pub const ClientTicketState = struct {
         params: InitParams,
     ) InitError!void {
         try limits.validate();
-
-        var next: ClientTicketState = .{};
-        next.common.moveFrom(common);
-        errdefer next.deinit();
-
         if (params.ticket.len == 0 or params.ticket.len > limits.max_ticket_len) return error.TicketTooLarge;
         if (params.ticket_nonce.len > max_ticket_nonce_len) return error.NonceTooLarge;
 
+        var next: ClientTicketState = .{};
+        errdefer next.deinit();
         next.ticket.init(allocator, params.ticket.len, params.ticket) catch |err| switch (err) {
             error.SecretTooLarge => return error.TicketTooLarge,
             else => return error.OutOfMemory,
@@ -538,6 +539,10 @@ pub const ClientTicketState = struct {
         next.ticket_age_add = params.ticket_age_add;
         next.received_at_unix_ms = params.received_at_unix_ms;
 
+        // Last, non-failing operation: only now do we take ownership of
+        // `common`, and only now does the caller's `common` become
+        // zero-valued.
+        next.common.moveFrom(common);
         self.moveFrom(&next);
     }
 
@@ -934,7 +939,14 @@ fn checkCommonAgainstLimits(common: *const ResumableSessionCommon, limits: Limit
 /// early-data-capable policy with a zero byte allowance — all of which
 /// `ResumableSessionCommon.init` itself would reject, but which the public
 /// struct fields do not prevent someone from producing directly).
+///
+/// Every field's *raw length* is checked against its backing capacity
+/// before `.slice()` is ever called on it: these length fields are public
+/// (Zig has no field-level privacy), so in-process code could otherwise
+/// corrupt one directly and turn a `.slice()` call here into an
+/// out-of-bounds panic instead of a deterministic `InvalidState` error.
 fn validateCommonForEncoding(common: *const ResumableSessionCommon) EncodeError!void {
+    if (common.resumption_psk.len > max_psk_len) return error.InvalidState;
     const expected_psk_len = algorithms.transcriptHash(common.cipher_suite).digestLength();
     if (common.resumption_psk.slice().len != expected_psk_len) return error.InvalidState;
     if (common.lifetime_seconds == 0 or common.lifetime_seconds > max_lifetime_seconds) return error.InvalidState;
@@ -942,8 +954,27 @@ fn validateCommonForEncoding(common: *const ResumableSessionCommon) EncodeError!
         .resume_only => {},
         .early_data_capable => |max| if (max == 0) return error.InvalidState,
     }
-    if (common.server_name) |*s| if (s.slice().len == 0) return error.InvalidState;
-    if (common.application_protocol) |*a| if (a.slice().len == 0) return error.InvalidState;
+    if (common.server_name) |*s| {
+        if (s.len == 0 or s.len > max_sni_len) return error.InvalidState;
+        const raw = s.slice();
+        dns_name.validateHostName(raw) catch return error.InvalidState;
+        // The stored bytes must already be canonical ASCII-lowercase (as
+        // `SniName.init` always produces): a directly-mutated uppercase
+        // byte would otherwise encode a non-canonical record that decode
+        // re-lowercases, breaking encode/decode/encode byte stability.
+        for (raw) |ch| {
+            if (ch != sni_provider.asciiLower(ch)) return error.InvalidState;
+        }
+    }
+    if (common.application_protocol) |*a| {
+        if (a.len == 0 or a.len > max_alpn_len) return error.InvalidState;
+    }
+    if (common.transport_compat) |*snap| {
+        if (snap.blob.len > snap.blob.bytes.len) return error.InvalidState;
+    }
+    if (common.application_compat) |*snap| {
+        if (snap.blob.len > snap.blob.bytes.len) return error.InvalidState;
+    }
 }
 
 /// The single source of truth for whether `state` can be encoded under
@@ -956,6 +987,10 @@ pub fn clientEncodedLenWithLimits(state: *const ClientTicketState, limits: Limit
     try limits.validate();
     try validateCommonForEncoding(&state.common);
     try checkCommonAgainstLimits(&state.common, limits);
+    // Guard raw length fields against their backing capacity before ever
+    // calling `.slice()` on them (see `validateCommonForEncoding`).
+    if (state.ticket.len > state.ticket.bytes.len) return error.InvalidState;
+    if (state.ticket_nonce.len > max_ticket_nonce_len) return error.InvalidState;
     if (state.ticket.slice().len == 0) return error.InvalidState;
     if (state.ticket.slice().len > limits.max_ticket_len) return error.FieldTooLarge;
     const field_count = commonFieldCount(&state.common) + 4; // ticket, ticket_age_add, ticket_nonce, received_at
@@ -1999,9 +2034,9 @@ test "decode rejects state larger than the configured serialized-length limit" {
     try testing.expectError(error.StateTooLarge, decodeDefault(testing.allocator, &oversized));
 }
 
-test "constructing a ticket larger than the configured limit is rejected" {
+test "constructing a ticket larger than the configured limit leaves common and self untouched" {
     var common = try sampleCommon(testing.allocator, &([_]u8{0xab} ** 32));
-    errdefer common.deinit();
+    defer common.deinit();
 
     var oversized_ticket: [Limits.default.max_ticket_len + 1]u8 = undefined;
     @memset(&oversized_ticket, 0x42);
@@ -2013,9 +2048,51 @@ test "constructing a ticket larger than the configured limit is rejected" {
         .ticket_nonce = "",
         .received_at_unix_ms = 0,
     }));
-    // `common` was moved into `state` regardless of the subsequent failure;
-    // it is now zero-valued and safe to deinit.
-    common.deinit();
+    // Only a *successful* init transfers ownership: on this failure path
+    // `common` must remain completely untouched (still owned by the
+    // caller, still live), not consumed/zeroed, and `state` must remain
+    // whatever it was before the failed call (here, zero-valued).
+    try testing.expectEqual(@as(usize, 32), common.resumption_psk.slice().len);
+    try testing.expectEqualStrings("example.test", common.server_name.?.slice());
+    try testing.expectEqual(@as(usize, 0), state.ticket.slice().len);
+}
+
+test "constructing with an oversized ticket nonce leaves common and self untouched" {
+    var common = try sampleCommon(testing.allocator, &([_]u8{0xab} ** 32));
+    defer common.deinit();
+
+    var oversized_nonce: [max_ticket_nonce_len + 1]u8 = undefined;
+    @memset(&oversized_nonce, 0x24);
+
+    var state: ClientTicketState = .{};
+    try testing.expectError(error.NonceTooLarge, state.init(testing.allocator, Limits.default, &common, .{
+        .ticket = "some-ticket",
+        .ticket_age_add = 0,
+        .ticket_nonce = &oversized_nonce,
+        .received_at_unix_ms = 0,
+    }));
+    try testing.expectEqual(@as(usize, 32), common.resumption_psk.slice().len);
+    try testing.expectEqualStrings("example.test", common.server_name.?.slice());
+    try testing.expectEqual(@as(usize, 0), state.ticket.slice().len);
+}
+
+test "allocation failure during ticket construction leaves common and self untouched" {
+    var common = try sampleCommon(testing.allocator, &([_]u8{0xab} ** 32));
+    defer common.deinit();
+
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    var state: ClientTicketState = .{};
+    try testing.expectError(error.OutOfMemory, state.init(failing.allocator(), Limits.default, &common, .{
+        .ticket = "some-ticket",
+        .ticket_age_add = 0,
+        .ticket_nonce = "nonce",
+        .received_at_unix_ms = 0,
+    }));
+    // The ticket allocation itself failed, before `common` was ever moved:
+    // `common` must remain fully live and untouched.
+    try testing.expectEqual(@as(usize, 32), common.resumption_psk.slice().len);
+    try testing.expectEqualStrings("example.test", common.server_name.?.slice());
+    try testing.expectEqual(@as(usize, 0), state.ticket.slice().len);
 }
 
 test "encoding into an undersized buffer fails before writing any partial state" {
@@ -2466,6 +2543,94 @@ test "encoding a zero-valued or moved-from ServerRecoverableState is rejected, n
     try testing.expectError(error.InvalidState, serverEncodedLenWithLimits(&empty, Limits.default));
 }
 
+test "encode preflight rejects a directly-corrupted invalid stored SNI instead of panicking" {
+    var common = try sampleCommon(testing.allocator, &([_]u8{0xab} ** 32));
+    defer common.deinit();
+
+    // Corrupt the stored SNI bytes to something `dns_name.validateHostName`
+    // rejects (a leading dot). The public fields make this possible even
+    // though `SniName.init` itself would never produce it.
+    common.server_name.?.bytes[0] = '.';
+
+    var out: [4096]u8 = undefined;
+    const server = ServerRecoverableState{ .common = common };
+    try testing.expectError(error.InvalidState, encodeServer(&server, Limits.default, &out));
+}
+
+test "encode preflight rejects a non-canonical (uppercase) stored SNI" {
+    var common = try sampleCommon(testing.allocator, &([_]u8{0xab} ** 32));
+    defer common.deinit();
+
+    // `SniName.init` always lowercases; directly mutating a byte to
+    // uppercase produces a non-canonical stored value that must be
+    // rejected rather than silently encoded (which would break
+    // encode/decode/encode byte stability, since decode re-lowercases).
+    common.server_name.?.bytes[0] = 'E';
+
+    var out: [4096]u8 = undefined;
+    const server = ServerRecoverableState{ .common = common };
+    try testing.expectError(error.InvalidState, encodeServer(&server, Limits.default, &out));
+}
+
+test "encode preflight rejects an over-capacity stored SNI length rather than panicking" {
+    var common = try sampleCommon(testing.allocator, &([_]u8{0xab} ** 32));
+    defer common.deinit();
+
+    // Corrupt the raw length field beyond the backing array's capacity;
+    // `.slice()` would otherwise index out of bounds.
+    common.server_name.?.len = @as(u8, @intCast(max_sni_len)) +% 1;
+
+    var out: [4096]u8 = undefined;
+    const server = ServerRecoverableState{ .common = common };
+    try testing.expectError(error.InvalidState, encodeServer(&server, Limits.default, &out));
+}
+
+test "encode preflight rejects an over-capacity stored PSK/ticket/nonce length rather than panicking" {
+    var common = try sampleCommon(testing.allocator, &([_]u8{0xab} ** 32));
+    common.resumption_psk.len = max_psk_len + 1;
+    var out: [4096]u8 = undefined;
+    const server = ServerRecoverableState{ .common = common };
+    try testing.expectError(error.InvalidState, encodeServer(&server, Limits.default, &out));
+    common.resumption_psk.len = 32;
+    common.deinit();
+
+    var client = try sampleClient(testing.allocator);
+    client.ticket.len = client.ticket.bytes.len + 1;
+    try testing.expectError(error.InvalidState, encodeClient(&client, Limits.default, &out));
+    client.ticket.len = "opaque-ticket-bytes".len;
+    client.deinit();
+
+    var client2 = try sampleClient(testing.allocator);
+    client2.ticket_nonce.len = max_ticket_nonce_len + 1;
+    try testing.expectError(error.InvalidState, encodeClient(&client2, Limits.default, &out));
+    client2.ticket_nonce.len = "nonce".len;
+    client2.deinit();
+}
+
+test "encode/decode/encode is byte-stable for a canonical fully-populated record" {
+    var common: ResumableSessionCommon = .{};
+    try common.init(testing.allocator, Limits.default, fixtureCommonParams(&([_]u8{0xab} ** 32)));
+    var client: ClientTicketState = .{};
+    try client.init(testing.allocator, Limits.default, &common, .{
+        .ticket = "opaque-ticket-bytes",
+        .ticket_age_add = 12345,
+        .ticket_nonce = "nonce",
+        .received_at_unix_ms = 1_500_000,
+    });
+    defer client.deinit();
+
+    var buf1: [Limits.default.max_serialized_len]u8 = undefined;
+    const encoded1 = try encodeClient(&client, Limits.default, &buf1);
+
+    var decoded = try decodeDefault(testing.allocator, encoded1);
+    defer decoded.deinit();
+
+    var buf2: [Limits.default.max_serialized_len]u8 = undefined;
+    const encoded2 = try encodeClient(&decoded.client, Limits.default, &buf2);
+
+    try testing.expectEqualSlices(u8, encoded1, encoded2);
+}
+
 test "clientEncodedLenWithLimits rejects invalid Limits rather than silently succeeding" {
     var client = try sampleClient(testing.allocator);
     defer client.deinit();
@@ -2804,4 +2969,434 @@ test "removing an optional-presence server field (server_name/application_protoc
     var decoded_no_application = try decodeDefault(testing.allocator, without_application[0..application_len]);
     defer decoded_no_application.deinit();
     try testing.expect(decoded_no_application.server.common.application_compat == null);
+}
+
+// -----------------------------------------------------------------------
+// Malformed-input matrix
+// -----------------------------------------------------------------------
+
+fn expectDecodeFailsWithoutLeaking(bytes: []const u8) !void {
+    if (decodeDefault(testing.allocator, bytes)) |result| {
+        var mutable = result;
+        mutable.deinit();
+        try testing.expect(false); // must not have decoded successfully
+    } else |_| {}
+}
+
+/// Calls `decodeDefault` purely to prove it neither panics nor leaks,
+/// without asserting success or failure either way (used for mutations
+/// whose outcome is not semantically guaranteed, such as widening a
+/// field that has no upper content constraint beyond its own byte cap).
+fn expectDecodeDoesNotPanicOrLeak(bytes: []const u8) !void {
+    if (decodeDefault(testing.allocator, bytes)) |result| {
+        var mutable = result;
+        mutable.deinit();
+    } else |_| {}
+}
+
+test "decode rejects both literal fixtures truncated at every byte boundary" {
+    var i: usize = 0;
+    while (i < client_fixture.len) : (i += 1) {
+        try expectDecodeFailsWithoutLeaking(client_fixture[0..i]);
+    }
+    i = 0;
+    while (i < server_fixture.len) : (i += 1) {
+        try expectDecodeFailsWithoutLeaking(server_fixture[0..i]);
+    }
+}
+
+/// Rebuilds `fixture` with the TLV whose field id is `field_id` given a new
+/// declared length (`new_length`), copying as much of its original value as
+/// fits and leaving any excess unspecified. Every other TLV is copied
+/// unchanged. `out` must have at least `fixture.len + 8` bytes of room.
+fn withTlvLengthOverride(fixture: []const u8, field_id: u16, new_length: u16, out: []u8) usize {
+    @memcpy(out[0..header_len], fixture[0..header_len]);
+    var pos: usize = header_len;
+    var offset: usize = header_len;
+    while ((nextTlv(fixture, &offset) catch unreachable)) |tlv| {
+        if (tlv.field_id == field_id) {
+            std.mem.writeInt(u16, out[pos..][0..2], tlv.field_id, .big);
+            std.mem.writeInt(u16, out[pos + 2 ..][0..2], new_length, .big);
+            const copy_len = @min(new_length, tlv.value.len);
+            @memcpy(out[pos + 4 ..][0..copy_len], tlv.value[0..copy_len]);
+            pos += 4 + @as(usize, new_length);
+        } else {
+            writeTlv(out, &pos, tlv.field_id, tlv.value);
+        }
+    }
+    patchSectionLen(out, pos);
+    return pos;
+}
+
+fn originalTlvLen(fixture: []const u8, field_id: u16) ?u16 {
+    var offset: usize = header_len;
+    while ((nextTlv(fixture, &offset) catch unreachable)) |tlv| {
+        if (tlv.field_id == field_id) return @intCast(tlv.value.len);
+    }
+    return null;
+}
+
+test "decode rejects zero-length and one-over-length mutations for exact-width fields" {
+    // These fields require an exact byte count (2/32/8/4/4/8, or the {1,5}
+    // early-data set); any other declared length must always fail.
+    const exact_width_ids = [_]u16{
+        field_cipher_suite,     field_auth_binding, field_issued_at,
+        field_lifetime_seconds, field_early_data,   field_ticket_age_add,
+        field_received_at,
+    };
+    for (exact_width_ids) |field_id| {
+        const original = originalTlvLen(&client_fixture, field_id).?;
+
+        var zero_buf: [client_fixture.len + 8]u8 = undefined;
+        const zero_len = withTlvLengthOverride(&client_fixture, field_id, 0, &zero_buf);
+        try expectDecodeFailsWithoutLeaking(zero_buf[0..zero_len]);
+
+        var over_buf: [client_fixture.len + 8]u8 = undefined;
+        const over_len = withTlvLengthOverride(&client_fixture, field_id, original + 1, &over_buf);
+        try expectDecodeFailsWithoutLeaking(over_buf[0..over_len]);
+
+        if (original > 0) {
+            var under_buf: [client_fixture.len + 8]u8 = undefined;
+            const under_len = withTlvLengthOverride(&client_fixture, field_id, original - 1, &under_buf);
+            try expectDecodeFailsWithoutLeaking(under_buf[0..under_len]);
+        }
+    }
+}
+
+test "decode rejects zero-length mutations for fields required to be non-empty" {
+    const must_be_nonempty_ids = [_]u16{
+        field_resumption_psk,   field_server_name,        field_application_protocol,
+        field_transport_compat, field_application_compat, field_ticket,
+    };
+    for (must_be_nonempty_ids) |field_id| {
+        var zero_buf: [client_fixture.len + 8]u8 = undefined;
+        const zero_len = withTlvLengthOverride(&client_fixture, field_id, 0, &zero_buf);
+        try expectDecodeFailsWithoutLeaking(zero_buf[0..zero_len]);
+
+        // Widening by one byte has no upper semantic constraint here
+        // beyond the field's own byte cap; only prove it cannot panic or
+        // leak, without asserting a specific success/failure outcome.
+        const original = originalTlvLen(&client_fixture, field_id).?;
+        var over_buf: [client_fixture.len + 8]u8 = undefined;
+        const over_len = withTlvLengthOverride(&client_fixture, field_id, original + 1, &over_buf);
+        try expectDecodeDoesNotPanicOrLeak(over_buf[0..over_len]);
+    }
+}
+
+test "decode never panics or leaks on any length mutation of ticket_nonce" {
+    // ticket_nonce<0..255> legitimately allows a zero-length value, so
+    // neither zero nor one-over is guaranteed to fail; only prove decode
+    // stays deterministic (no panic, no leak) either way.
+    const original = originalTlvLen(&client_fixture, field_ticket_nonce).?;
+
+    var zero_buf: [client_fixture.len + 8]u8 = undefined;
+    const zero_len = withTlvLengthOverride(&client_fixture, field_ticket_nonce, 0, &zero_buf);
+    try expectDecodeDoesNotPanicOrLeak(zero_buf[0..zero_len]);
+
+    var over_buf: [client_fixture.len + 8]u8 = undefined;
+    const over_len = withTlvLengthOverride(&client_fixture, field_ticket_nonce, original + 1, &over_buf);
+    try expectDecodeDoesNotPanicOrLeak(over_buf[0..over_len]);
+}
+
+test "decode rejects an invalid (unassigned) cipher-suite enum value" {
+    var mutated: [client_fixture.len]u8 = client_fixture;
+    // The cipher_suite TLV value is bytes [14..16): header(10) + id(2) + len(2).
+    std.mem.writeInt(u16, mutated[14..16], 0x9999, .big);
+    try testing.expectError(error.InvalidCipherSuite, decodeDefault(testing.allocator, &mutated));
+}
+
+test "decode rejects a PSK length that does not match the declared cipher suite" {
+    // Swap the cipher suite to the SHA-384 suite while keeping the
+    // fixture's 32-byte (SHA-256-length) PSK: the combination is
+    // internally inconsistent and must be rejected, not silently accepted.
+    var mutated: [client_fixture.len]u8 = client_fixture;
+    std.mem.writeInt(u16, mutated[14..16], @intFromEnum(algorithms.CipherSuite.tls_aes_256_gcm_sha384), .big);
+    try testing.expectError(error.InvalidPskLength, decodeDefault(testing.allocator, &mutated));
+}
+
+test "SHA-256 PSK length construction boundary: 31 and 33 bytes are rejected, 32 succeeds" {
+    var common: ResumableSessionCommon = .{};
+    try testing.expectError(error.InvalidPskLength, common.init(testing.allocator, Limits.default, .{
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .resumption_psk = &([_]u8{0xab} ** 31),
+        .auth_binding = AuthBinding.fromLeafCertificateDer("leaf"),
+        .issued_at_unix_ms = 0,
+        .lifetime_seconds = 100,
+    }));
+    try testing.expectError(error.InvalidPskLength, common.init(testing.allocator, Limits.default, .{
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .resumption_psk = &([_]u8{0xab} ** 33),
+        .auth_binding = AuthBinding.fromLeafCertificateDer("leaf"),
+        .issued_at_unix_ms = 0,
+        .lifetime_seconds = 100,
+    }));
+    try common.init(testing.allocator, Limits.default, .{
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .resumption_psk = &([_]u8{0xab} ** 32),
+        .auth_binding = AuthBinding.fromLeafCertificateDer("leaf"),
+        .issued_at_unix_ms = 0,
+        .lifetime_seconds = 100,
+    });
+    common.deinit();
+}
+
+test "SHA-384 PSK length construction boundary: 47 and 49 bytes are rejected, 48 succeeds" {
+    var common: ResumableSessionCommon = .{};
+    try testing.expectError(error.InvalidPskLength, common.init(testing.allocator, Limits.default, .{
+        .cipher_suite = .tls_aes_256_gcm_sha384,
+        .resumption_psk = &([_]u8{0xcd} ** 47),
+        .auth_binding = AuthBinding.fromLeafCertificateDer("leaf"),
+        .issued_at_unix_ms = 0,
+        .lifetime_seconds = 100,
+    }));
+    try testing.expectError(error.InvalidPskLength, common.init(testing.allocator, Limits.default, .{
+        .cipher_suite = .tls_aes_256_gcm_sha384,
+        .resumption_psk = &([_]u8{0xcd} ** 49),
+        .auth_binding = AuthBinding.fromLeafCertificateDer("leaf"),
+        .issued_at_unix_ms = 0,
+        .lifetime_seconds = 100,
+    }));
+    try common.init(testing.allocator, Limits.default, .{
+        .cipher_suite = .tls_aes_256_gcm_sha384,
+        .resumption_psk = &([_]u8{0xcd} ** 48),
+        .auth_binding = AuthBinding.fromLeafCertificateDer("leaf"),
+        .issued_at_unix_ms = 0,
+        .lifetime_seconds = 100,
+    });
+    common.deinit();
+}
+
+test "decoding an unknown-optional field then re-encoding omits it" {
+    var with_optional: [client_fixture.len + 32]u8 = undefined;
+    @memcpy(with_optional[0..client_fixture.len], &client_fixture);
+    var pos: usize = client_fixture.len;
+    writeTlv(&with_optional, &pos, 0x9abc, "future-extension-payload");
+    patchSectionLen(&with_optional, pos);
+
+    var decoded = try decodeDefault(testing.allocator, with_optional[0..pos]);
+    defer decoded.deinit();
+
+    var buf: [Limits.default.max_serialized_len]u8 = undefined;
+    const re_encoded = try encodeClient(&decoded.client, Limits.default, &buf);
+    // Canonical re-encoding must exactly reproduce the original fixture:
+    // the unknown optional field was skipped, not preserved.
+    try testing.expectEqualSlices(u8, &client_fixture, re_encoded);
+}
+
+test "SNI construction exact-boundary: 253 bytes succeeds, 254 bytes is rejected" {
+    // dns_name validation caps individual labels at 63 bytes; build dotted
+    // 63-byte labels to reach exactly max_sni_len (253) validly.
+    var buf: [max_sni_len]u8 = undefined;
+    var pos: usize = 0;
+    var labels_written: usize = 0;
+    while (pos < max_sni_len) {
+        if (labels_written > 0) {
+            buf[pos] = '.';
+            pos += 1;
+        }
+        const remaining = max_sni_len - pos;
+        const label_len = @min(@as(usize, 63), remaining);
+        if (label_len == 0) break;
+        @memset(buf[pos..][0..label_len], 'a');
+        pos += label_len;
+        labels_written += 1;
+    }
+    try testing.expectEqual(@as(usize, max_sni_len), pos);
+
+    var ok = try SniName.init(buf[0..pos]);
+    _ = &ok;
+
+    // One byte over the maximum must be rejected outright by
+    // `dns_name.validateHostName` (length check).
+    var too_long: [max_sni_len + 1]u8 = undefined;
+    @memset(&too_long, 'b');
+    try testing.expectError(error.InvalidDnsName, SniName.init(&too_long));
+}
+
+test "ALPN construction exact-boundary: 255 bytes succeeds, 256 bytes is rejected" {
+    var name_255: [max_alpn_len]u8 = undefined;
+    @memset(&name_255, 'x');
+    var ok = try AlpnProtocol.init(&name_255);
+    _ = &ok;
+
+    var too_long: [max_alpn_len + 1]u8 = undefined;
+    @memset(&too_long, 'y');
+    try testing.expectError(error.AlpnProtocolTooLarge, AlpnProtocol.init(&too_long));
+}
+
+test "encoding at exactly max_serialized_len succeeds, one byte over is rejected" {
+    var client = try sampleClient(testing.allocator);
+    defer client.deinit();
+
+    const needed = clientEncodedLen(&client);
+
+    var exact_limits = Limits.default;
+    exact_limits.max_serialized_len = needed;
+    var buf: [Limits.default.max_serialized_len]u8 = undefined;
+    const encoded = try encodeClient(&client, exact_limits, &buf);
+    try testing.expectEqual(needed, encoded.len);
+
+    var one_under_limits = Limits.default;
+    one_under_limits.max_serialized_len = needed - 1;
+    try testing.expectError(error.StateTooLarge, encodeClient(&client, one_under_limits, &buf));
+}
+
+// -----------------------------------------------------------------------
+// Zeroization verification (backing-memory inspection, not just leak checks)
+// -----------------------------------------------------------------------
+//
+// `checkAllAllocationFailures` (used elsewhere in this file) proves
+// allocations are not leaked; it says nothing about whether secret bytes
+// were wiped before being freed. The tests below use a real, inspectable
+// backing buffer (`std.heap.FixedBufferAllocator` over a sentinel-filled
+// array) so freed/cleared memory can be checked directly for leftover
+// plaintext.
+
+test "ClientTicketState.deinit zeroizes the complete ticket allocation" {
+    var backing = [_]u8{0xcc} ** 4096;
+    var fba = std.heap.FixedBufferAllocator.init(&backing);
+    const allocator = fba.allocator();
+
+    var common: ResumableSessionCommon = .{};
+    try common.init(allocator, Limits.default, .{
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .resumption_psk = &([_]u8{0xab} ** 32),
+        .auth_binding = AuthBinding.fromLeafCertificateDer("leaf"),
+        .issued_at_unix_ms = 0,
+        .lifetime_seconds = 100,
+    });
+    var client: ClientTicketState = .{};
+    try client.init(allocator, Limits.default, &common, .{
+        .ticket = "super-secret-ticket-bytes-marker",
+        .ticket_age_add = 0,
+        .ticket_nonce = "n",
+        .received_at_unix_ms = 0,
+    });
+
+    // Sanity check: the ticket bytes are actually in the backing buffer
+    // we're about to inspect.
+    try testing.expect(std.mem.indexOf(u8, &backing, "super-secret-ticket-bytes-marker") != null);
+
+    client.deinit();
+
+    try testing.expect(std.mem.indexOf(u8, &backing, "super-secret-ticket-bytes-marker") == null);
+}
+
+test "ResumableSessionCommon.deinit zeroizes compatibility blob backing memory" {
+    var backing = [_]u8{0xcc} ** 4096;
+    var fba = std.heap.FixedBufferAllocator.init(&backing);
+    const allocator = fba.allocator();
+
+    var common: ResumableSessionCommon = .{};
+    try common.init(allocator, Limits.default, .{
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .resumption_psk = &([_]u8{0xab} ** 32),
+        .auth_binding = AuthBinding.fromLeafCertificateDer("leaf"),
+        .issued_at_unix_ms = 0,
+        .lifetime_seconds = 100,
+        .transport_compat = .{ .format_id = 1, .format_version = 1, .bytes = "super-secret-transport-blob-marker" },
+    });
+
+    try testing.expect(std.mem.indexOf(u8, &backing, "super-secret-transport-blob-marker") != null);
+    common.deinit();
+    try testing.expect(std.mem.indexOf(u8, &backing, "super-secret-transport-blob-marker") == null);
+}
+
+test "reinitializing ResumableSessionCommon's PSK clears the old bytes and the full unused capacity" {
+    var common: ResumableSessionCommon = .{};
+    try common.init(testing.allocator, Limits.default, .{
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .resumption_psk = &([_]u8{0xaa} ** 32),
+        .auth_binding = AuthBinding.fromLeafCertificateDer("leaf"),
+        .issued_at_unix_ms = 0,
+        .lifetime_seconds = 100,
+    });
+    defer common.deinit();
+
+    try common.init(testing.allocator, Limits.default, .{
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .resumption_psk = &([_]u8{0xbb} ** 32),
+        .auth_binding = AuthBinding.fromLeafCertificateDer("leaf"),
+        .issued_at_unix_ms = 0,
+        .lifetime_seconds = 100,
+    });
+
+    // The old 0xaa PSK bytes must not remain anywhere in the FixedSecret's
+    // inline backing array (this is `max_psk_len` = 48 bytes wide, but the
+    // suite only uses 32 of them).
+    try testing.expect(std.mem.indexOfScalar(u8, &common.resumption_psk.bytes, 0xaa) == null);
+    try testing.expectEqualSlices(u8, &([_]u8{0xbb} ** 32), common.resumption_psk.slice());
+    for (common.resumption_psk.bytes[32..]) |byte| try testing.expectEqual(@as(u8, 0), byte);
+}
+
+test "decode allocation-failure sweep zeroizes ticket and compatibility blob backing memory" {
+    var common: ResumableSessionCommon = .{};
+    try common.init(testing.allocator, Limits.default, fixtureCommonParams(&([_]u8{0xab} ** 32)));
+    var client: ClientTicketState = .{};
+    try client.init(testing.allocator, Limits.default, &common, .{
+        .ticket = "super-secret-decode-ticket-value",
+        .ticket_age_add = 1,
+        .ticket_nonce = "n",
+        .received_at_unix_ms = 0,
+    });
+    defer client.deinit();
+    var buf: [Limits.default.max_serialized_len]u8 = undefined;
+    const encoded = try encodeClient(&client, Limits.default, &buf);
+
+    // `fixtureCommonParams` gives this record both a transport and an
+    // application compatibility snapshot, so sweeping the allocation index
+    // this way exercises failure after 0, 1, and 2 successful allocations
+    // — i.e. failure during each of the transport-compat, application-
+    // compat, and ticket allocations in turn.
+    var fail_index: usize = 0;
+    while (fail_index < 8) : (fail_index += 1) {
+        var backing = [_]u8{0xcc} ** 8192;
+        var fba = std.heap.FixedBufferAllocator.init(&backing);
+        var failing = std.testing.FailingAllocator.init(fba.allocator(), .{ .fail_index = fail_index });
+
+        if (decodeDefault(failing.allocator(), encoded)) |result| {
+            // This fail_index no longer induces a failure; nothing further
+            // to sweep.
+            var mutable = result;
+            mutable.deinit();
+            break;
+        } else |_| {
+            try testing.expect(std.mem.indexOf(u8, &backing, "super-secret-decode-ticket-value") == null);
+            try testing.expect(std.mem.indexOf(u8, &backing, "quic-params") == null);
+            try testing.expect(std.mem.indexOf(u8, &backing, "h3-settings") == null);
+        }
+    }
+}
+
+test "a failed cloneInto leaves the destination's prior value completely unchanged" {
+    var dest = try sampleClient(testing.allocator);
+    defer dest.deinit();
+    const original_ticket_ptr = dest.ticket.bytes.ptr;
+
+    var source = try sampleClient(testing.allocator);
+    defer source.deinit();
+
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    try testing.expectError(error.OutOfMemory, source.cloneInto(failing.allocator(), &dest));
+
+    // `dest` must be exactly what it was before the failed clone attempt:
+    // the same allocation (not freed-then-reallocated), same content.
+    try testing.expectEqual(original_ticket_ptr, dest.ticket.bytes.ptr);
+    try testing.expectEqualStrings("opaque-ticket-bytes", dest.ticket.slice());
+}
+
+test "a failed CompatSnapshot.init replacement leaves the live destination completely unchanged" {
+    var snap: CompatSnapshot = .{};
+    try snap.init(testing.allocator, 1, 1, "original-live-value", hard_max_compat_len);
+    defer snap.deinit();
+    const original_ptr = snap.blob.bytes.ptr;
+
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    try testing.expectError(error.OutOfMemory, snap.init(failing.allocator(), 2, 2, "attempted-replacement-value", hard_max_compat_len));
+
+    // The failed reinitialization must not have touched the live value at
+    // all: same allocation, same format ids, same content.
+    try testing.expectEqual(original_ptr, snap.blob.bytes.ptr);
+    try testing.expectEqual(@as(u16, 1), snap.format_id);
+    try testing.expectEqualStrings("original-live-value", snap.slice());
 }

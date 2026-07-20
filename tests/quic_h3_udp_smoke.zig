@@ -9,6 +9,7 @@
 const std = @import("std");
 const quic = @import("quic");
 const http3 = @import("http3");
+const tls_core = @import("tls_core");
 
 const connection = quic.connection;
 const tls_backend = quic.tls_backend;
@@ -235,4 +236,180 @@ test "udp smoke: native client/server complete an H3 exchange over loopback" {
         }
     }
     try testing.expectEqual(connection.State.draining, server.state());
+}
+
+// ---------------------------------------------------------------------------
+// Appliance credential provider over native QUIC (#392): the same strict
+// Ed25519 owner that authenticates native TCP TLS drives a real loopback QUIC
+// handshake through `initServerWithProvider`. The client pins the provisioned
+// leaf certificate, so an established connection proves the full chain was
+// emitted and the Ed25519 CertificateVerify was accepted.
+// ---------------------------------------------------------------------------
+
+const native_ed25519_cert_pem = @embedFile("fixtures/tls/native_ed25519.crt");
+const native_ed25519_key_pem = @embedFile("fixtures/tls/native_ed25519.key");
+
+fn decodeSinglePemCertificate(allocator: std.mem.Allocator, pem: []const u8) ![]u8 {
+    const begin = "-----BEGIN CERTIFICATE-----";
+    const end = "-----END CERTIFICATE-----";
+    const begin_at = std.mem.indexOf(u8, pem, begin) orelse return error.PemBlockNotFound;
+    const body_start = begin_at + begin.len;
+    const end_at = std.mem.indexOfPos(u8, pem, body_start, end) orelse return error.PemBlockNotFound;
+    var b64: std.ArrayList(u8) = .empty;
+    defer b64.deinit(allocator);
+    for (pem[body_start..end_at]) |ch| switch (ch) {
+        '\n', '\r', ' ', '\t' => {},
+        else => try b64.append(allocator, ch),
+    };
+    const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(b64.items) catch return error.InvalidPemBase64;
+    const der = try allocator.alloc(u8, decoded_len);
+    errdefer allocator.free(der);
+    std.base64.standard.Decoder.decode(der, b64.items) catch return error.InvalidPemBase64;
+    return der;
+}
+
+test "udp smoke: appliance credential provider authenticates native QUIC/H3" {
+    const allocator = testing.allocator;
+
+    var appliance = try tls_core.appliance_credentials.ApplianceCredentials.initFromBytes(
+        allocator,
+        native_ed25519_cert_pem,
+        native_ed25519_key_pem,
+        .{ .server_name = "tardigrade.test" },
+    );
+    defer appliance.deinit();
+    const leaf_der = try decodeSinglePemCertificate(allocator, native_ed25519_cert_pem);
+    defer allocator.free(leaf_der);
+
+    var client_socket = try UdpSocket.open();
+    defer client_socket.close();
+    var server_socket = try UdpSocket.open();
+    defer server_socket.close();
+
+    const client_cid = [_]u8{ 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8 };
+    const odcid = [_]u8{ 0x18, 0x27, 0x36, 0x45, 0x54, 0x63, 0x72, 0x81 };
+
+    var client_backend = tls_backend.Tls13Backend.initClient(
+        .{ .hello_random = [_]u8{0xa9} ** 32, .key_share_seed = [_]u8{0x33} ** 32 },
+        .{ .pinned_certificate = leaf_der },
+    );
+    var server_backend = tls_backend.Tls13Backend.initServerWithProvider(
+        .{ .hello_random = [_]u8{0x77} ** 32, .key_share_seed = [_]u8{0x44} ** 32 },
+        appliance.provider(),
+    );
+
+    const client = try Connection.init(allocator, .{
+        .role = .client,
+        .local_cid = &client_cid,
+        .original_dcid = &odcid,
+        .tls = client_backend.backend(),
+        .now_us = nowUs(),
+    });
+    defer client.deinit();
+    const server = try Connection.init(allocator, .{
+        .role = .server,
+        .local_cid = &odcid,
+        .original_dcid = &odcid,
+        .peer_cid = &client_cid,
+        .tls = server_backend.backend(),
+        .now_us = nowUs(),
+    });
+    defer server.deinit();
+
+    var client_h3 = H3.init(allocator, .client);
+    defer client_h3.deinit();
+    var server_h3 = H3.init(allocator, .server);
+    defer server_h3.deinit();
+
+    var h3_started = false;
+    var request_id: ?u64 = null;
+    var responded = false;
+    var response_done = false;
+
+    const deadline = nowUs() + 10_000_000;
+    var iterations: usize = 0;
+    while (nowUs() < deadline and !response_done) : (iterations += 1) {
+        try testing.expect(iterations < 5_000);
+        const now = nowUs();
+
+        var out: [2048]u8 = undefined;
+        while (client.pollTransmit(&out, now)) |datagram| {
+            try client_socket.sendTo(server_socket.addr, datagram);
+        }
+        while (server.pollTransmit(&out, now)) |datagram| {
+            try server_socket.sendTo(client_socket.addr, datagram);
+        }
+
+        var next: u64 = now + 100_000;
+        if (client.nextTimeoutUs()) |t| next = @min(next, t);
+        if (server.nextTimeoutUs()) |t| next = @min(next, t);
+        const timeout_ms: i32 = @intCast(@min((next -| now) / 1_000 + 1, 100));
+        var fds = [_]posix.pollfd{
+            .{ .fd = client_socket.fd, .events = posix.POLL.IN, .revents = 0 },
+            .{ .fd = server_socket.fd, .events = posix.POLL.IN, .revents = 0 },
+        };
+        _ = try posix.poll(&fds, timeout_ms);
+
+        var in: [2048]u8 = undefined;
+        while (try client_socket.recv(&in)) |datagram| {
+            try client.ingest(datagram, nowUs());
+        }
+        while (try server_socket.recv(&in)) |datagram| {
+            try server.ingest(datagram, nowUs());
+        }
+
+        client.onTimeout(nowUs());
+        server.onTimeout(nowUs());
+
+        if (!h3_started and client.isEstablished() and server.isEstablished()) {
+            try client_h3.start(client);
+            try server_h3.start(server);
+            h3_started = true;
+        }
+        if (h3_started) {
+            try server_h3.pump(server);
+            if (!responded) {
+                if (try server_h3.pollRequest()) |incoming| {
+                    try server_h3.sendResponse(server, incoming.stream_id, 200, &.{}, "appliance-h3-response");
+                    responded = true;
+                }
+            }
+            if (request_id == null) {
+                request_id = try client_h3.sendRequest(client, .{
+                    .authority = "tardigrade.test",
+                    .path = "/appliance",
+                    .body = "",
+                });
+            }
+            try client_h3.pump(client);
+            if (request_id) |id| {
+                if (try client_h3.pollResponse(id)) |response| {
+                    try testing.expectEqual(@as(u16, 200), response.status);
+                    try testing.expectEqualStrings("appliance-h3-response", response.body);
+                    response_done = true;
+                    client_h3.releaseResponse(id);
+                }
+            }
+        }
+    }
+
+    // Pinned-leaf establishment proves the provisioned chain and Ed25519
+    // CertificateVerify were accepted by an independent verifier.
+    try testing.expect(response_done);
+
+    // Provider lifetime: the owner remains selectable while (and after)
+    // connections exist — teardown order is connections, then owner.
+    var selection = tls_core.credentials.SelectionContext{
+        .role = .server,
+        .server_name = "tardigrade.test",
+        .peer_signature_schemes = &.{0x0807},
+        .negotiated_version = 0x0304,
+        .cipher_suite = 0x1301,
+        .application_protocol = "h3",
+        .auth_policy = .{},
+    };
+    switch (try appliance.provider().selectCredential(&selection)) {
+        .complete => |credential| credential.release(),
+        .pending => return error.TestUnexpectedPending,
+    }
 }

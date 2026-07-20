@@ -96,6 +96,34 @@ pub fn hotReloadConfig(
             return;
         };
     }
+    if (edge_config.is_appliance_tls_profile) {
+        // Appliance TLS profile (#392): the identity is startup-loaded and a
+        // hot reload must never silently accept changed credential inputs
+        // while continuing to serve the old credentials. Reject the whole
+        // reload when any credential-affecting field changes; the previous
+        // configuration and provider remain active and coherent.
+        //
+        // Gate on the build-time profile, not `worker_ctx.appliance_credentials
+        // != null`: a server that *started* without TLS configured (no owner
+        // constructed) must still reject a reload that turns TLS on, rather
+        // than publishing a TLS-marked config while `native_tls_provider`
+        // stays null and new connections silently continue over plaintext.
+        var current_lease = worker_ctx.config_store.acquire();
+        const credential_config_changed = applianceCredentialConfigChanged(current_lease.cfg, cfg_ptr);
+        current_lease.release();
+        if (credential_config_changed) {
+            worker_ctx.config_store.destroyVersion(prepared_version);
+            const msg = std.fmt.bufPrint(&state.last_reload_error, "appliance TLS credential configuration changed; restart required", .{}) catch "appliance TLS credential configuration changed";
+            state.reload_mutex.lock();
+            state.last_reload_ok = false;
+            state.last_reload_at_ms = now_ms;
+            state.last_reload_error_len = msg.len;
+            state.reload_mutex.unlock();
+            state.metricsRecordReloadFailure();
+            state.logger.warn(null, "config reload rejected: appliance TLS credential configuration (certificate/key path, tls_server_name, or SNI certificates) changed; restart the appliance to rotate credentials", .{});
+            return;
+        }
+    }
     if (worker_ctx.native_credentials) |store| {
         var sni_specs = allocator.alloc(http.native_tls_connection.SniCertSpec, cfg_ptr.tls_sni_certs.len) catch {
             worker_ctx.config_store.destroyVersion(prepared_version);
@@ -146,6 +174,94 @@ pub fn hotReloadConfig(
     state.reload_mutex.unlock();
     state.metricsRecordReloadSuccess();
     state.logger.info(null, "configuration hot-reload applied", .{});
+}
+
+/// True when a proposed configuration changes any input that feeds the
+/// startup-loaded appliance TLS credential (#392): certificate path, key
+/// path, configured TLS server name, or the (necessarily empty) SNI
+/// credential set.
+pub fn applianceCredentialConfigChanged(
+    current: *const edge_config.EdgeConfig,
+    proposed: *const edge_config.EdgeConfig,
+) bool {
+    if (!std.mem.eql(u8, current.tls_cert_path, proposed.tls_cert_path)) return true;
+    if (!std.mem.eql(u8, current.tls_key_path, proposed.tls_key_path)) return true;
+    if (!std.mem.eql(u8, current.tls_server_name, proposed.tls_server_name)) return true;
+    if (current.tls_sni_certs.len != proposed.tls_sni_certs.len) return true;
+    for (current.tls_sni_certs, proposed.tls_sni_certs) |a, b| {
+        if (!std.mem.eql(u8, a.server_name, b.server_name)) return true;
+        if (!std.mem.eql(u8, a.cert_path, b.cert_path)) return true;
+        if (!std.mem.eql(u8, a.key_path, b.key_path)) return true;
+    }
+    return false;
+}
+
+test "applianceCredentialConfigChanged detects credential-affecting fields" {
+    const allocator = std.testing.allocator;
+    var base = try edge_config.loadFromEnv(allocator);
+    defer base.deinit(allocator);
+    var proposed = try edge_config.loadFromEnv(allocator);
+    defer proposed.deinit(allocator);
+
+    try std.testing.expect(!applianceCredentialConfigChanged(&base, &proposed));
+
+    const original_cert = proposed.tls_cert_path;
+    proposed.tls_cert_path = "/changed/cert.pem";
+    try std.testing.expect(applianceCredentialConfigChanged(&base, &proposed));
+    proposed.tls_cert_path = original_cert;
+
+    const original_name = proposed.tls_server_name;
+    proposed.tls_server_name = "changed.example.test";
+    try std.testing.expect(applianceCredentialConfigChanged(&base, &proposed));
+    proposed.tls_server_name = original_name;
+}
+
+test "applianceCredentialConfigChanged rejects plaintext-to-TLS and TLS-to-plaintext reloads" {
+    const allocator = std.testing.allocator;
+
+    // Server started without TLS configured (both paths empty, as
+    // `loadFromEnv` defaults to when no TARDIGRADE_TLS_* env is set).
+    var plaintext = try edge_config.loadFromEnv(allocator);
+    defer plaintext.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 0), plaintext.tls_cert_path.len);
+    try std.testing.expectEqual(@as(usize, 0), plaintext.tls_key_path.len);
+
+    // Reloaded config now turns TLS on. `hotReloadConfig` must reject this
+    // reload in the appliance profile regardless of whether the running
+    // process ever constructed an `ApplianceCredentials` owner at startup —
+    // there is no owner to safely graft new credentials onto at runtime.
+    // Mutated fields are restored to their original owned allocations before
+    // scope exit so the deferred `deinit()` frees the right pointers.
+    var now_tls = try edge_config.loadFromEnv(allocator);
+    defer now_tls.deinit(allocator);
+    const now_tls_orig_cert = now_tls.tls_cert_path;
+    const now_tls_orig_key = now_tls.tls_key_path;
+    const now_tls_orig_name = now_tls.tls_server_name;
+    now_tls.tls_cert_path = "/etc/appliance/tls.crt";
+    now_tls.tls_key_path = "/etc/appliance/tls.key";
+    now_tls.tls_server_name = "appliance.example.test";
+    try std.testing.expect(applianceCredentialConfigChanged(&plaintext, &now_tls));
+    now_tls.tls_cert_path = now_tls_orig_cert;
+    now_tls.tls_key_path = now_tls_orig_key;
+    now_tls.tls_server_name = now_tls_orig_name;
+
+    // The reverse direction: a server that started with TLS configured must
+    // also reject a reload that removes it (keeps serving the old,
+    // still-valid credentials rather than silently going plaintext).
+    var with_tls = try edge_config.loadFromEnv(allocator);
+    defer with_tls.deinit(allocator);
+    const with_tls_orig_cert = with_tls.tls_cert_path;
+    const with_tls_orig_key = with_tls.tls_key_path;
+    const with_tls_orig_name = with_tls.tls_server_name;
+    with_tls.tls_cert_path = "/etc/appliance/tls.crt";
+    with_tls.tls_key_path = "/etc/appliance/tls.key";
+    with_tls.tls_server_name = "appliance.example.test";
+    var now_plaintext = try edge_config.loadFromEnv(allocator);
+    defer now_plaintext.deinit(allocator);
+    try std.testing.expect(applianceCredentialConfigChanged(&with_tls, &now_plaintext));
+    with_tls.tls_cert_path = with_tls_orig_cert;
+    with_tls.tls_key_path = with_tls_orig_key;
+    with_tls.tls_server_name = with_tls_orig_name;
 }
 
 pub fn applyReloadedRuntimeConfig(cfg: *const edge_config.EdgeConfig, state: *GatewayState) void {

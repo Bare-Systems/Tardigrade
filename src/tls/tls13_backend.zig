@@ -50,12 +50,45 @@ pub const max_certificate_len = 2048;
 /// flight-size preflight so a chain cannot pass validation and then overflow the
 /// writer once the message header is added: 1-byte msg_type + 3-byte length +
 /// 1-byte certificate_request_context length + 3-byte CertificateList length.
-const certificate_message_overhead = 1 + 3 + 1 + 3;
+pub const certificate_message_overhead = 1 + 3 + 1 + 3;
+/// Per-CertificateEntry framing the writer adds around each raw DER
+/// certificate: 3-byte cert_data length + 2-byte per-certificate extensions
+/// length (RFC 8446 §4.4.2). Exported so a caller preflighting a chain (#392)
+/// sums the exact same per-entry cost the writer below does, rather than
+/// duplicating this literal.
+pub const certificate_entry_overhead = 3 + 2;
 /// Caller-owned bound on a CertificateVerify signature. The engine hands the
 /// signing provider a buffer this size; a provider whose signature would not
 /// fit reports overflow rather than exceeding the bound (#334). Comfortably
 /// above Ed25519 (64) and DER-encoded ECDSA P-256 (~72).
 pub const max_signature_len = 256;
+
+/// Worst-case size of everything the server flight buffer carries *besides*
+/// the Certificate message, so a caller can preflight how much of
+/// `max_message_len` a certificate chain may actually occupy without
+/// duplicating the writer's own arithmetic (#392). Conservatively sums, for
+/// any transport profile and any client-auth policy this engine supports:
+///
+///   - EncryptedExtensions framing: 1-byte msg_type + 3-byte length +
+///     2-byte extensions-vector length = 6 bytes.
+///   - The ALPN extension at its legal maximum: 2-byte extension type +
+///     2-byte extension length + 2-byte protocol-list length + 1-byte
+///     protocol length + up to 255 protocol bytes (`AlpnPolicy.validate`'s
+///     own `name.len > std.math.maxInt(u8)` bound) = 262 bytes.
+///   - The opaque transport extension (QUIC/H3 profile only; record mode
+///     carries none): 2-byte type + 2-byte length + `max_transport_extension_len`
+///     payload = 516 bytes.
+///   - CertificateRequest, for a profile that requests client
+///     authentication: 1-byte msg_type + 3-byte length + 1-byte empty
+///     context + 2-byte extensions length + 2-byte ext type + 2-byte ext
+///     length + 2-byte sigalg-list length + 4 bytes for the two advertised
+///     signature algorithms = 17 bytes.
+///
+/// The appliance profile (#392) never requests client authentication and
+/// uses at most one short ALPN protocol name, so this bound has headroom to
+/// spare; it is deliberately not narrowed to that specific configuration so
+/// it stays correct if either changes.
+pub const max_non_certificate_server_flight_bytes: usize = 6 + 262 + (4 + max_transport_extension_len) + 17;
 
 fn checkedAdd(a: usize, b: usize) HandshakeError!usize {
     return std.math.add(usize, a, b) catch return error.InvalidTransportProfile;

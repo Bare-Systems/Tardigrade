@@ -5,6 +5,7 @@ const edge_config = @import("edge_config.zig");
 const edge_gateway = @import("edge_gateway.zig");
 const http = @import("http.zig");
 const runtime_allocator = @import("runtime_allocator.zig");
+const tls_core = @import("tls_core");
 
 const ENV_CONFIG_PATH = "TARDIGRADE_CONFIG_PATH";
 const CHECK_DEFAULT_CONFIG_PATH = "./tardigrade.toml";
@@ -136,7 +137,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 try executeValidationCommandOrExit(control_allocator, options.common, .legacy);
                 return;
             }
-            try executeRunCommand(runtime_allocator.runtimeAllocator(), args, options);
+            try executeRunCommandOrExit(runtime_allocator.runtimeAllocator(), args, options);
         },
     }
 }
@@ -406,6 +407,27 @@ fn executeValidationCommandOrExit(allocator: std.mem.Allocator, options: CommonO
     };
 }
 
+/// Appliance TLS profile (#392): the complete credential preflight — exact
+/// PEM/PKCS#8 contract, chain parse, Ed25519 key parse, leaf/key match,
+/// server-name policy, flight bounds, provider snapshot construction and
+/// clean teardown — without binding any socket. Shared by `check` and by
+/// `run` (called before any daemon fork, PID file, or master/worker
+/// startup, so invalid credentials are reported synchronously to the
+/// invoking shell rather than surfacing later as a silently failed
+/// background process or a master respawn loop). The long-lived credential
+/// owner actually serving connections is still constructed separately in
+/// `edge_gateway.run`.
+fn preflightApplianceCredentials(allocator: std.mem.Allocator, cfg: *const edge_config.EdgeConfig) !void {
+    if (edge_config.is_appliance_tls_profile and edge_config.hasTlsFiles(cfg)) {
+        try tls_core.appliance_credentials.validateFiles(
+            allocator,
+            cfg.tls_cert_path,
+            cfg.tls_key_path,
+            .{ .server_name = cfg.tls_server_name },
+        );
+    }
+}
+
 fn executeValidateCommand(allocator: std.mem.Allocator, options: CommonOptions, mode: ValidationMode) !void {
     const resolved_config_path = try resolveValidationConfigPath(allocator, options.config_path, mode);
     defer if (resolved_config_path) |path| allocator.free(path);
@@ -414,6 +436,7 @@ fn executeValidateCommand(allocator: std.mem.Allocator, options: CommonOptions, 
     var cfg = try edge_config.loadFromEnv(allocator);
     defer cfg.deinit(allocator);
     try edge_config.validate(&cfg);
+    try preflightApplianceCredentials(allocator, &cfg);
     edge_config.warnRiskyConfig(&cfg);
     var stdout_buf: [2048]u8 = undefined;
     var stdout = compat.stdoutWriter(&stdout_buf);
@@ -491,6 +514,40 @@ fn isConfigValidationError(err: anyerror) bool {
         error.InvalidTokenHashHex,
         error.InvalidHealthStatusRange,
         error.InvalidHealthStatusOverride,
+        // Appliance TLS credential preflight (#392): every class is an
+        // operator-actionable configuration failure, not an internal error.
+        error.MissingCertificateChain,
+        error.MissingPrivateKey,
+        error.CertificateFileTooLarge,
+        error.PrivateKeyFileTooLarge,
+        error.EmptyCertificateChain,
+        error.TooManyCertificates,
+        error.MalformedCertificatePem,
+        error.AmbiguousCertificateInput,
+        error.CertificateTooLarge,
+        error.MalformedCertificateDer,
+        error.MalformedPrivateKeyPem,
+        error.AmbiguousPrivateKeyInput,
+        error.MalformedPrivateKeyDer,
+        error.UnsupportedPrivateKeyAlgorithm,
+        error.UnsupportedPrivateKeyParameters,
+        error.InvalidPrivateKeySize,
+        error.InvalidPrivateKey,
+        error.UnsupportedLeafKeyAlgorithm,
+        error.UnsupportedLeafKeyParameters,
+        error.KeyCertificateMismatch,
+        error.CertificateFlightTooLarge,
+        error.InvalidServerName,
+        error.CertificateNameMismatch,
+        error.IntermediateNotCa,
+        error.InvalidLeafCertificate,
+        error.CertificateKeyUsageViolation,
+        error.CertificateExtendedKeyUsageViolation,
+        error.UnhandledCriticalCertificateExtension,
+        error.DuplicateCertificateEntry,
+        error.InvalidCertificateChainOrder,
+        error.CertificateSignatureInvalid,
+        error.UnsupportedApplianceConfiguration,
         => true,
         else => false,
     };
@@ -749,35 +806,107 @@ fn executeStatusCommand(allocator: std.mem.Allocator, options: SignalOptions) !v
     try stdout.flush();
 }
 
-fn executeRunCommand(allocator: std.mem.Allocator, args: []const []const u8, options: RunOptions) !void {
+/// Classify a `run` startup failure exactly like `tardi check` does — a
+/// deterministic configuration error (including every
+/// `appliance_credentials.Error` class the composition root can now
+/// propagate unwrapped) reports the same message shape and
+/// `EXIT_CONFIG_INVALID` exit code, rather than an opaque generic failure.
+/// Post-startup errors (the server crashing after already accepting
+/// connections) are comparatively rare in practice and still fall through to
+/// the internal-error exit code with `@errorName`.
+/// Config discovery, validation, and the appliance credential preflight are
+/// one config-error-classified stage; everything after — daemon fork, PID
+/// file, master/worker startup, the long-running gateway itself — is a
+/// separate runtime stage whose failures must never be relabeled as
+/// "configuration validation failed" merely because a runtime error (e.g.
+/// `FileNotFound`/`AccessDenied` from unrelated post-start filesystem work)
+/// happens to share a name with one of the config error classes.
+const RunPlan = struct {
+    cfg: edge_config.EdgeConfig,
+    resolved_config_path: ?[]u8,
+    worker_mode: bool,
+    worker_id: usize,
+
+    fn deinit(self: *RunPlan, allocator: std.mem.Allocator) void {
+        self.cfg.deinit(allocator);
+        if (self.resolved_config_path) |path| allocator.free(path);
+        self.* = undefined;
+    }
+};
+
+/// Resolve, load, and fully validate configuration — including the
+/// appliance credential preflight — before any daemon fork, PID file, or
+/// master/worker startup. `spawnDaemonizedProcess` backgrounds a child and
+/// cannot itself report the child's later failure to the invoking shell,
+/// and `runMaster` respawns every worker that exits, so invalid credentials
+/// discovered only after this point would either print a false "started"
+/// message or loop respawning a worker that can never start. The long-lived
+/// credential owner that actually serves connections is still constructed
+/// separately in `edge_gateway.run`. Every error this returns is a
+/// configuration error by construction.
+fn prepareRunPlan(allocator: std.mem.Allocator, args: []const []const u8, options: RunOptions) !RunPlan {
     const resolved_config_path = try resolveRuntimeConfigPath(allocator, options.common.config_path);
-    defer if (resolved_config_path) |path| allocator.free(path);
+    errdefer if (resolved_config_path) |path| allocator.free(path);
     if (resolved_config_path) |path| try setProcessEnv(allocator, ENV_CONFIG_PATH, path);
 
     const worker_mode = hasArg(args, "--worker");
     const worker_id = parseWorkerIdArg(args) orelse 0;
 
-    if (options.daemon and !options.daemonized and !worker_mode) {
-        try spawnDaemonizedProcess(allocator, resolved_config_path);
-        return;
-    }
-
     var cfg = try edge_config.loadFromEnv(allocator);
-    defer cfg.deinit(allocator);
+    errdefer cfg.deinit(allocator);
     try edge_config.validate(&cfg);
+    try preflightApplianceCredentials(allocator, &cfg);
     edge_config.warnRiskyConfig(&cfg);
-    try configureErrorLog(&cfg);
-    try writePidFile(&cfg);
-    defer removePidFile(&cfg);
 
-    if (cfg.master_process_enabled and !worker_mode) {
-        try runMaster(allocator, &cfg);
+    return .{
+        .cfg = cfg,
+        .resolved_config_path = resolved_config_path,
+        .worker_mode = worker_mode,
+        .worker_id = worker_id,
+    };
+}
+
+/// Execute the validated plan: daemon fork, PID file, master/worker
+/// startup, and the long-running gateway. Every error here is a runtime
+/// failure, not a configuration failure — config was already proven valid
+/// by `prepareRunPlan`.
+fn runPlan(allocator: std.mem.Allocator, plan: *RunPlan, options: RunOptions) !void {
+    if (options.daemon and !options.daemonized and !plan.worker_mode) {
+        try spawnDaemonizedProcess(allocator, plan.resolved_config_path);
         return;
     }
 
-    applyWorkerCpuAffinity(&cfg, worker_id) catch {}; // CPU affinity is optional; worker runs on any core if unavailable
-    startWorkerRecycleTimer(&cfg);
-    try edge_gateway.run(&cfg);
+    try configureErrorLog(&plan.cfg);
+    try writePidFile(&plan.cfg);
+    defer removePidFile(&plan.cfg);
+
+    if (plan.cfg.master_process_enabled and !plan.worker_mode) {
+        try runMaster(allocator, &plan.cfg);
+        return;
+    }
+
+    applyWorkerCpuAffinity(&plan.cfg, plan.worker_id) catch {}; // CPU affinity is optional; worker runs on any core if unavailable
+    startWorkerRecycleTimer(&plan.cfg);
+    try edge_gateway.run(&plan.cfg);
+}
+
+fn executeRunCommandOrExit(allocator: std.mem.Allocator, args: []const []const u8, options: RunOptions) !void {
+    var plan = prepareRunPlan(allocator, args, options) catch |err| {
+        var stderr_buf: [2048]u8 = undefined;
+        var stderr = compat.stderrWriter(&stderr_buf);
+        try printConfigCommandError(&stderr, err, options.common, .legacy);
+        try stderr.flush();
+        std.process.exit(configCommandExitCode(err));
+    };
+    defer plan.deinit(allocator);
+
+    runPlan(allocator, &plan, options) catch |err| {
+        var stderr_buf: [2048]u8 = undefined;
+        var stderr = compat.stderrWriter(&stderr_buf);
+        try stderr.print("error: tardigrade exited: {}\n", .{err});
+        try stderr.flush();
+        std.process.exit(EXIT_INTERNAL_ERROR);
+    };
 }
 
 fn executeSignalCommand(

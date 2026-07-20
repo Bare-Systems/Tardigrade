@@ -335,6 +335,18 @@ fn parseStatement(
         try putOverride(allocator, &overrides.map, "TARDIGRADE_SERVER_NAMES", trimmed_value);
         return;
     }
+    if (std.ascii.eqlIgnoreCase(directive, "tls_server_name")) {
+        try putOverride(allocator, &overrides.map, "TARDIGRADE_TLS_SERVER_NAME", trimmed_value);
+        return;
+    }
+    if (std.ascii.eqlIgnoreCase(directive, "tls_cert_path")) {
+        try putOverride(allocator, &overrides.map, "TARDIGRADE_TLS_CERT_PATH", trimmed_value);
+        return;
+    }
+    if (std.ascii.eqlIgnoreCase(directive, "tls_key_path")) {
+        try putOverride(allocator, &overrides.map, "TARDIGRADE_TLS_KEY_PATH", trimmed_value);
+        return;
+    }
     if (std.ascii.eqlIgnoreCase(directive, "root")) {
         try putOverride(allocator, &overrides.map, "TARDIGRADE_DOC_ROOT", trimmed_value);
         return;

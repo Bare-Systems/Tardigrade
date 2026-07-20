@@ -53,6 +53,11 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/tls/root.zig"),
         .target = target,
         .optimize = optimize,
+        // appliance_credentials.zig's own unit tests exercise the file-reading
+        // path (std.c.close) directly inside this module's test binary,
+        // unlike identity_loader.zig's file helpers which were previously
+        // only reached through exe_mod (already link_libc = true).
+        .link_libc = true,
     });
     tls_core_mod.addImport("crypto_secrets", crypto_secrets_mod);
 
@@ -414,6 +419,7 @@ pub fn build(b: *std.Build) void {
     quic_h3_udp_mod.addImport("quic", quic_mod);
     quic_h3_udp_mod.addImport("http3", http3_mod);
     quic_h3_udp_mod.addImport("stream_transport", stream_transport_mod);
+    quic_h3_udp_mod.addImport("tls_core", tls_core_mod);
     const quic_h3_udp_tests = b.addTest(.{ .root_module = quic_h3_udp_mod });
     const run_quic_h3_udp_tests = b.addRunArtifact(quic_h3_udp_tests);
     quic_step.dependOn(&run_quic_h3_udp_tests.step);
@@ -458,6 +464,9 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     pki_mod.addImport("pki_reduced_corpus", pki_reduced_corpus_mod);
+    // The appliance credential loader (#392) reuses the PKI PEM/X.509
+    // machinery; pki does not import tls_core, so this stays acyclic.
+    tls_core_mod.addImport("pki", pki_mod);
     const pki_tests = b.addTest(.{ .root_module = pki_mod });
     const run_pki_tests = b.addRunArtifact(pki_tests);
     const pki_step = b.step("test-pki", "Run pure-Zig PKI DER unit tests");

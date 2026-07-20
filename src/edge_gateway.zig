@@ -2848,7 +2848,7 @@ const GatewayPendingNative = struct {
             .{ .server_name = "tardigrade.test" },
         );
         self.client_carrier = .{ .fd = fds[1] };
-        self.client_stream = try tls_core.encrypted_stream.PureZigRecordStream.initWithCarrierBackendAndAllocator(
+        self.client_stream = try tls_core.encrypted_stream.PureZigRecordStream.initWithCarrierAndBackend(
             allocator,
             .client,
             self.client_provider.cryptoProvider(),

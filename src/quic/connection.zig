@@ -262,6 +262,23 @@ const CryptoTx = struct {
     acked: RangeList = .{},
     base: u64 = 0,
 
+    const Reservation = struct {
+        allocator: std.mem.Allocator,
+        data: ?[]u8 = null,
+        pending: ?[]Range = null,
+        acked: ?[]Range = null,
+
+        fn deinit(self: *Reservation) void {
+            if (self.data) |buf| {
+                crypto_secrets.secureZero(buf);
+                self.allocator.free(buf);
+            }
+            if (self.pending) |buf| self.allocator.free(buf);
+            if (self.acked) |buf| self.allocator.free(buf);
+            self.* = .{ .allocator = self.allocator };
+        }
+    };
+
     fn deinit(self: *CryptoTx, allocator: std.mem.Allocator) void {
         crypto_secrets.secureZero(self.data.allocatedSlice());
         self.data.deinit(allocator);
@@ -339,6 +356,12 @@ const CryptoTx = struct {
     }
 
     fn reserveAppend(self: *CryptoTx, allocator: std.mem.Allocator, bytes_len: usize, max_outstanding: usize) !void {
+        var reservation = try self.prepareAppend(allocator, bytes_len, max_outstanding);
+        errdefer reservation.deinit();
+        self.commitReservation(&reservation);
+    }
+
+    fn prepareAppend(self: *CryptoTx, allocator: std.mem.Allocator, bytes_len: usize, max_outstanding: usize) !Reservation {
         if (bytes_len > max_outstanding) return error.CryptoBufferTooLarge;
         if (self.data.items.len > max_outstanding - bytes_len) return error.CryptoBufferTooLarge;
 
@@ -347,44 +370,41 @@ const CryptoTx = struct {
         const pending_capacity = self.pending.items.items.len + range_budget + 1;
         const acked_capacity = self.acked.items.items.len + range_budget;
 
-        var new_data: ?[]u8 = null;
-        errdefer if (new_data) |buf| {
-            crypto_secrets.secureZero(buf);
-            allocator.free(buf);
-        };
+        var reservation = Reservation{ .allocator = allocator };
+        errdefer reservation.deinit();
         if (self.data.capacity < new_total) {
             const replacement = try allocator.alloc(u8, new_total);
             @memcpy(replacement[0..self.data.items.len], self.data.items);
-            new_data = replacement;
+            reservation.data = replacement;
         }
 
-        var new_pending: ?[]Range = null;
-        errdefer if (new_pending) |buf| allocator.free(buf);
         if (self.pending.items.capacity < pending_capacity) {
             const replacement = try allocator.alloc(Range, pending_capacity);
             @memcpy(replacement[0..self.pending.items.items.len], self.pending.items.items);
-            new_pending = replacement;
+            reservation.pending = replacement;
         }
 
-        var new_acked: ?[]Range = null;
-        errdefer if (new_acked) |buf| allocator.free(buf);
         if (self.acked.items.capacity < acked_capacity) {
             const replacement = try allocator.alloc(Range, acked_capacity);
             @memcpy(replacement[0..self.acked.items.items.len], self.acked.items.items);
-            new_acked = replacement;
+            reservation.acked = replacement;
         }
 
-        if (new_pending) |replacement| {
-            self.replaceRangeCapacity(allocator, &self.pending, replacement);
-            new_pending = null;
+        return reservation;
+    }
+
+    fn commitReservation(self: *CryptoTx, reservation: *Reservation) void {
+        if (reservation.pending) |replacement| {
+            self.replaceRangeCapacity(reservation.allocator, &self.pending, replacement);
+            reservation.pending = null;
         }
-        if (new_acked) |replacement| {
-            self.replaceRangeCapacity(allocator, &self.acked, replacement);
-            new_acked = null;
+        if (reservation.acked) |replacement| {
+            self.replaceRangeCapacity(reservation.allocator, &self.acked, replacement);
+            reservation.acked = null;
         }
-        if (new_data) |replacement| {
-            self.replaceDataCapacity(allocator, replacement);
-            new_data = null;
+        if (reservation.data) |replacement| {
+            self.replaceDataCapacity(reservation.allocator, replacement);
+            reservation.data = null;
         }
     }
 
@@ -1379,12 +1399,14 @@ pub const Connection = struct {
         const body_len = tls_core.new_session_ticket.encodedLen(emit_params) catch return error.IllegalParameter;
         const message_len = 4 + body_len;
         const tx = &self.crypto_tx[2];
-        tx.reserveAppend(self.allocator, message_len, max_application_crypto_outstanding) catch return error.HandshakeBufferOverflow;
+        var reservation = tx.prepareAppend(self.allocator, message_len, max_application_crypto_outstanding) catch return error.HandshakeBufferOverflow;
+        defer reservation.deinit();
 
         var sink = tls_handshake.EventSink{};
         defer sink.deinit();
         var ticket_state = try self.tls.emitNewSessionTicket(self.allocator, &sink, params, limits);
         errdefer ticket_state.deinit();
+        tx.commitReservation(&reservation);
         try self.queueApplicationCryptoEventsReserved(&sink, message_len);
         return ticket_state;
     }
@@ -2877,6 +2899,35 @@ test "driver: ticket model limit refusal happens before CRYPTO allocation" {
     try testing.expectEqual(@as(usize, 0), pair.server.crypto_tx[2].data.items.len);
     try testing.expectEqual(@as(usize, 0), pair.server.crypto_tx[2].data.capacity);
     try testing.expect(pair.server.crypto_tx[2].pending.isEmpty());
+}
+
+test "driver: backend ticket rejection leaves CRYPTO reservation uncommitted" {
+    const allocator = testing.allocator;
+    var pair = try TestPair.init(allocator);
+    defer pair.deinit(allocator);
+    try pair.pump();
+
+    try testing.expectError(error.InvalidHandshakeState, pair.server.emitNewSessionTicket(.{
+        .ticket_lifetime = 0,
+        .ticket_age_add = 1,
+        .ticket_nonce = "\x01",
+        .opaque_ticket = "ticket",
+        .issued_at_unix_ms = 10,
+    }, tls_core.session.Limits.default));
+    try testing.expectEqual(@as(usize, 0), pair.server.crypto_tx[2].data.items.len);
+    try testing.expectEqual(@as(usize, 0), pair.server.crypto_tx[2].data.capacity);
+    try testing.expect(pair.server.crypto_tx[2].pending.isEmpty());
+    try testing.expect(pair.server.crypto_tx[2].acked.isEmpty());
+
+    var state = try pair.server.emitNewSessionTicket(.{
+        .ticket_lifetime = 60,
+        .ticket_age_add = 1,
+        .ticket_nonce = "\x01",
+        .opaque_ticket = "ticket",
+        .issued_at_unix_ms = 10,
+    }, tls_core.session.Limits.default);
+    defer state.deinit();
+    try testing.expect(pair.server.crypto_tx[2].data.items.len > 0);
 }
 
 test "driver: local close reaches the peer and both sides drain" {

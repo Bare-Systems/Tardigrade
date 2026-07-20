@@ -460,17 +460,6 @@ pub const PureZigRecordStream = struct {
     /// injected `backend`. `drive()` then starts and progresses the real
     /// handshake itself rather than relying on callers to hand-apply events.
     pub fn initWithBackend(
-        role: tls_state.Role,
-        crypto_provider: provider.CryptoProvider,
-        cipher_suite: algorithms.CipherSuite,
-        backend: RecordHandshakeBackend,
-    ) PureZigRecordStream {
-        var stream_state = init(role, crypto_provider, cipher_suite);
-        stream_state.handshake_driver = RecordHandshakeDriver.init(role, backend);
-        return stream_state;
-    }
-
-    pub fn initWithBackendAndAllocator(
         allocator: std.mem.Allocator,
         role: tls_state.Role,
         crypto_provider: provider.CryptoProvider,
@@ -484,18 +473,6 @@ pub const PureZigRecordStream = struct {
     }
 
     pub fn initWithBackendAndLimits(
-        role: tls_state.Role,
-        crypto_provider: provider.CryptoProvider,
-        cipher_suite: algorithms.CipherSuite,
-        backend: RecordHandshakeBackend,
-        limits: BufferLimits,
-    ) Error!PureZigRecordStream {
-        var stream_state = try initWithLimits(role, crypto_provider, cipher_suite, limits);
-        stream_state.handshake_driver = RecordHandshakeDriver.init(role, backend);
-        return stream_state;
-    }
-
-    pub fn initWithBackendAllocatorAndLimits(
         allocator: std.mem.Allocator,
         role: tls_state.Role,
         crypto_provider: provider.CryptoProvider,
@@ -512,19 +489,6 @@ pub const PureZigRecordStream = struct {
     /// `initWithBackend` plus a nonblocking carrier, the production shape: a
     /// real backend driving a real handshake over a real byte-stream carrier.
     pub fn initWithCarrierAndBackend(
-        role: tls_state.Role,
-        crypto_provider: provider.CryptoProvider,
-        cipher_suite: algorithms.CipherSuite,
-        carrier: Carrier,
-        backend: RecordHandshakeBackend,
-    ) PureZigRecordStream {
-        std.debug.assert(!carrier.owns_handle or carrier.closeFn != null);
-        var stream_state = initWithBackend(role, crypto_provider, cipher_suite, backend);
-        stream_state.carrier = carrier;
-        return stream_state;
-    }
-
-    pub fn initWithCarrierBackendAndAllocator(
         allocator: std.mem.Allocator,
         role: tls_state.Role,
         crypto_provider: provider.CryptoProvider,
@@ -533,26 +497,12 @@ pub const PureZigRecordStream = struct {
         backend: RecordHandshakeBackend,
     ) Error!PureZigRecordStream {
         std.debug.assert(!carrier.owns_handle or carrier.closeFn != null);
-        var stream_state = try initWithBackendAndAllocator(allocator, role, crypto_provider, cipher_suite, backend);
+        var stream_state = try initWithBackend(allocator, role, crypto_provider, cipher_suite, backend);
         stream_state.carrier = carrier;
         return stream_state;
     }
 
     pub fn initWithCarrierBackendAndLimits(
-        role: tls_state.Role,
-        crypto_provider: provider.CryptoProvider,
-        cipher_suite: algorithms.CipherSuite,
-        carrier: Carrier,
-        backend: RecordHandshakeBackend,
-        limits: BufferLimits,
-    ) Error!PureZigRecordStream {
-        std.debug.assert(!carrier.owns_handle or carrier.closeFn != null);
-        var stream_state = try initWithBackendAndLimits(role, crypto_provider, cipher_suite, backend, limits);
-        stream_state.carrier = carrier;
-        return stream_state;
-    }
-
-    pub fn initWithCarrierBackendAllocatorAndLimits(
         allocator: std.mem.Allocator,
         role: tls_state.Role,
         crypto_provider: provider.CryptoProvider,
@@ -562,7 +512,7 @@ pub const PureZigRecordStream = struct {
         limits: BufferLimits,
     ) Error!PureZigRecordStream {
         std.debug.assert(!carrier.owns_handle or carrier.closeFn != null);
-        var stream_state = try initWithBackendAllocatorAndLimits(allocator, role, crypto_provider, cipher_suite, backend, limits);
+        var stream_state = try initWithBackendAndLimits(allocator, role, crypto_provider, cipher_suite, backend, limits);
         stream_state.carrier = carrier;
         return stream_state;
     }
@@ -3586,7 +3536,7 @@ test "pending authentication empty poll suppresses read readiness and makes no p
     var duplex = Duplex{ .max_chunk = record_codec.max_ciphertext_record_len };
     try duplex.s2c.append("peer bytes waiting");
     var backend = ScriptedRecordBackend{ .role = .client, .auth_pending = true, .auth_pending_polls = 10 };
-    var stream_state = PureZigRecordStream.initWithCarrierAndBackend(.client, cp, .tls_aes_128_gcm_sha256, duplex.clientCarrier(), backend.recordBackend());
+    var stream_state = try PureZigRecordStream.initWithCarrierAndBackend(std.testing.allocator, .client, cp, .tls_aes_128_gcm_sha256, duplex.clientCarrier(), backend.recordBackend());
     defer stream_state.deinit();
     stream_state.handshake_started = true;
     const stream = stream_state.stream();
@@ -4081,10 +4031,10 @@ test "pure-Zig encrypted stream completes a driver-owned handshake over a fragme
         var duplex = Duplex{ .max_chunk = chunk };
         var client_backend = ScriptedRecordBackend{ .role = .client };
         var server_backend = ScriptedRecordBackend{ .role = .server };
-        var client = PureZigRecordStream.initWithCarrierAndBackend(.client, cp, .tls_aes_128_gcm_sha256, duplex.clientCarrier(), client_backend.recordBackend());
+        var client = try PureZigRecordStream.initWithCarrierAndBackend(std.testing.allocator, .client, cp, .tls_aes_128_gcm_sha256, duplex.clientCarrier(), client_backend.recordBackend());
         defer client.deinit();
         try client.setExpectedAlpn("h1");
-        var server = PureZigRecordStream.initWithCarrierAndBackend(.server, cp, .tls_aes_128_gcm_sha256, duplex.serverCarrier(), server_backend.recordBackend());
+        var server = try PureZigRecordStream.initWithCarrierAndBackend(std.testing.allocator, .server, cp, .tls_aes_128_gcm_sha256, duplex.serverCarrier(), server_backend.recordBackend());
         defer server.deinit();
 
         // No test-only establish(): both sides install genuine derived secrets
@@ -4131,10 +4081,10 @@ test "driver-owned client rejects an unoffered ALPN before sending Finished" {
     var duplex = Duplex{ .max_chunk = record_codec.max_ciphertext_record_len };
     var client_backend = ScriptedRecordBackend{ .role = .client, .selected_alpn = "h2" };
     var server_backend = ScriptedRecordBackend{ .role = .server };
-    var client = PureZigRecordStream.initWithCarrierAndBackend(.client, cp, .tls_aes_128_gcm_sha256, duplex.clientCarrier(), client_backend.recordBackend());
+    var client = try PureZigRecordStream.initWithCarrierAndBackend(std.testing.allocator, .client, cp, .tls_aes_128_gcm_sha256, duplex.clientCarrier(), client_backend.recordBackend());
     defer client.deinit();
     try client.setExpectedAlpn("h1");
-    var server = PureZigRecordStream.initWithCarrierAndBackend(.server, cp, .tls_aes_128_gcm_sha256, duplex.serverCarrier(), server_backend.recordBackend());
+    var server = try PureZigRecordStream.initWithCarrierAndBackend(std.testing.allocator, .server, cp, .tls_aes_128_gcm_sha256, duplex.serverCarrier(), server_backend.recordBackend());
     defer server.deinit();
 
     const errors = driveDriverPairUntilBothErrors(&client, &server);
@@ -4152,10 +4102,10 @@ test "driver-owned client requires ALPN before completion" {
     var duplex = Duplex{ .max_chunk = record_codec.max_ciphertext_record_len };
     var client_backend = ScriptedRecordBackend{ .role = .client, .selected_alpn = null };
     var server_backend = ScriptedRecordBackend{ .role = .server };
-    var client = PureZigRecordStream.initWithCarrierAndBackend(.client, cp, .tls_aes_128_gcm_sha256, duplex.clientCarrier(), client_backend.recordBackend());
+    var client = try PureZigRecordStream.initWithCarrierAndBackend(std.testing.allocator, .client, cp, .tls_aes_128_gcm_sha256, duplex.clientCarrier(), client_backend.recordBackend());
     defer client.deinit();
     try client.setExpectedAlpn("h1");
-    var server = PureZigRecordStream.initWithCarrierAndBackend(.server, cp, .tls_aes_128_gcm_sha256, duplex.serverCarrier(), server_backend.recordBackend());
+    var server = try PureZigRecordStream.initWithCarrierAndBackend(std.testing.allocator, .server, cp, .tls_aes_128_gcm_sha256, duplex.serverCarrier(), server_backend.recordBackend());
     defer server.deinit();
 
     const errors = driveDriverPairUntilBothErrors(&client, &server);
@@ -4172,10 +4122,10 @@ test "completion policy preflight rejects a missing certificate before sending F
     var duplex = Duplex{ .max_chunk = record_codec.max_ciphertext_record_len };
     var client_backend = ScriptedRecordBackend{ .role = .client, .emit_certificate = false };
     var server_backend = ScriptedRecordBackend{ .role = .server };
-    var client = PureZigRecordStream.initWithCarrierAndBackend(.client, cp, .tls_aes_128_gcm_sha256, duplex.clientCarrier(), client_backend.recordBackend());
+    var client = try PureZigRecordStream.initWithCarrierAndBackend(std.testing.allocator, .client, cp, .tls_aes_128_gcm_sha256, duplex.clientCarrier(), client_backend.recordBackend());
     defer client.deinit();
     try client.setExpectedAlpn("h1");
-    var server = PureZigRecordStream.initWithCarrierAndBackend(.server, cp, .tls_aes_128_gcm_sha256, duplex.serverCarrier(), server_backend.recordBackend());
+    var server = try PureZigRecordStream.initWithCarrierAndBackend(std.testing.allocator, .server, cp, .tls_aes_128_gcm_sha256, duplex.serverCarrier(), server_backend.recordBackend());
     defer server.deinit();
 
     const errors = driveDriverPairUntilBothErrors(&client, &server);
@@ -4192,9 +4142,9 @@ test "driver-owned handshake latches a terminal failure and flushes its fatal al
     var duplex = Duplex{ .max_chunk = record_codec.max_ciphertext_record_len };
     var client_backend = ScriptedRecordBackend{ .role = .client, .bad_hello = true };
     var server_backend = ScriptedRecordBackend{ .role = .server };
-    var client = PureZigRecordStream.initWithCarrierAndBackend(.client, cp, .tls_aes_128_gcm_sha256, duplex.clientCarrier(), client_backend.recordBackend());
+    var client = try PureZigRecordStream.initWithCarrierAndBackend(std.testing.allocator, .client, cp, .tls_aes_128_gcm_sha256, duplex.clientCarrier(), client_backend.recordBackend());
     defer client.deinit();
-    var server = PureZigRecordStream.initWithCarrierAndBackend(.server, cp, .tls_aes_128_gcm_sha256, duplex.serverCarrier(), server_backend.recordBackend());
+    var server = try PureZigRecordStream.initWithCarrierAndBackend(std.testing.allocator, .server, cp, .tls_aes_128_gcm_sha256, duplex.serverCarrier(), server_backend.recordBackend());
     defer server.deinit();
 
     // Client sends its (rejected) hello.
@@ -4323,7 +4273,7 @@ test "driver-owned cancellation releases owned carrier, driver, and secrets exac
     inline for (.{ true, false }) |install_keys| {
         var backend = CountingRecordBackend{ .install_keys = install_keys };
         var carrier = CountingOwnedCarrier{};
-        var stream = PureZigRecordStream.initWithCarrierAndBackend(.client, cp, .tls_aes_128_gcm_sha256, carrier.carrier(), backend.recordBackend());
+        var stream = try PureZigRecordStream.initWithCarrierAndBackend(std.testing.allocator, .client, cp, .tls_aes_128_gcm_sha256, carrier.carrier(), backend.recordBackend());
 
         // Start the driver: it installs sensitive state (keys and/or a queued
         // flight) that a blocked carrier keeps undrained.
@@ -4369,9 +4319,9 @@ test "driver-owned handshake preserves a pending fatal alert across write backpr
     var duplex = Duplex{ .max_chunk = record_codec.max_ciphertext_record_len, .block_s2c = true };
     var client_backend = ScriptedRecordBackend{ .role = .client, .bad_hello = true };
     var server_backend = ScriptedRecordBackend{ .role = .server };
-    var client = PureZigRecordStream.initWithCarrierAndBackend(.client, cp, .tls_aes_128_gcm_sha256, duplex.clientCarrier(), client_backend.recordBackend());
+    var client = try PureZigRecordStream.initWithCarrierAndBackend(std.testing.allocator, .client, cp, .tls_aes_128_gcm_sha256, duplex.clientCarrier(), client_backend.recordBackend());
     defer client.deinit();
-    var server = PureZigRecordStream.initWithCarrierAndBackend(.server, cp, .tls_aes_128_gcm_sha256, duplex.serverCarrier(), server_backend.recordBackend());
+    var server = try PureZigRecordStream.initWithCarrierAndBackend(std.testing.allocator, .server, cp, .tls_aes_128_gcm_sha256, duplex.serverCarrier(), server_backend.recordBackend());
     defer server.deinit();
 
     // Client sends its rejected hello.
@@ -4472,9 +4422,9 @@ test "driver-owned handshake latches on the flush deadline when a fatal alert ca
     var duplex = Duplex{ .max_chunk = record_codec.max_ciphertext_record_len, .block_s2c = true };
     var client_backend = ScriptedRecordBackend{ .role = .client, .bad_hello = true };
     var server_backend = ScriptedRecordBackend{ .role = .server };
-    var client = PureZigRecordStream.initWithCarrierAndBackend(.client, cp, .tls_aes_128_gcm_sha256, duplex.clientCarrier(), client_backend.recordBackend());
+    var client = try PureZigRecordStream.initWithCarrierAndBackend(std.testing.allocator, .client, cp, .tls_aes_128_gcm_sha256, duplex.clientCarrier(), client_backend.recordBackend());
     defer client.deinit();
-    var server = PureZigRecordStream.initWithCarrierAndBackend(.server, cp, .tls_aes_128_gcm_sha256, duplex.serverCarrier(), server_backend.recordBackend());
+    var server = try PureZigRecordStream.initWithCarrierAndBackend(std.testing.allocator, .server, cp, .tls_aes_128_gcm_sha256, duplex.serverCarrier(), server_backend.recordBackend());
     defer server.deinit();
 
     _ = try client.stream().drive();

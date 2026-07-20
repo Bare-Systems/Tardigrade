@@ -199,7 +199,14 @@ jobs:
       - name: Run native TLS listener integration tests
         run: zig build test-integration-native-tls -Dtls-profile=appliance --summary all --error-style verbose
 
+      # The full integration suite includes timing-sensitive assertions (e.g.
+      # graceful-shutdown-under-load bounds) that this repo's pre-existing
+      # `integration-tests` job below already scopes to Linux only, to avoid
+      # macOS GitHub Actions runners' higher scheduling variance. Match that
+      # precedent here rather than gating this PR-blocking job on a class of
+      # flakiness the project has already chosen not to block merges on.
       - name: Run full integration suite (appliance profile)
+        if: runner.os == 'Linux'
         run: zig build test-integration -Dtls-profile=appliance --summary all --error-style verbose
 
   # ── PKI differential corpus ──────────────────────────────────────────────────

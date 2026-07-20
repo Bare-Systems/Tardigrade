@@ -33,8 +33,15 @@ Ed25519 signatures make generated output byte-for-byte reproducible.
 | Corrupt Ed25519 signature | `root.crt`, `intermediate.crt`, `signature-corrupt-leaf.crt` | `api.example.test` | reject validation | reject validation |
 | `pathLenConstraint` violation | `root.crt`, `pathlen-chain.crt`, `pathlen-leaf.crt` | `pathlen.example.test` | reject validation | reject validation |
 | Ambiguous cross-sign path | `cross-roots.crt`, `cross-untrusted-b-first.crt`, `cross-leaf.crt` | `cross.example.test` | accept | accept |
+| DNS-only Name Constraints permitted | `root.crt`, `dns-constraints-intermediate.crt`, `dns-permitted-leaf.crt` | `api.example.test` | accept | accept |
+| DNS-only Name Constraints excluded | `root.crt`, `dns-constraints-intermediate.crt`, `dns-excluded-leaf.crt` | `blocked.example.test` | reject Name Constraints | reject Name Constraints |
+| IP-only Name Constraints permitted | `root.crt`, `ip-constraints-intermediate.crt`, `ip-permitted-leaf.crt` | n/a | accept | accept |
+| IP-only Name Constraints excluded | `root.crt`, `ip-constraints-intermediate.crt`, `ip-excluded-leaf.crt` | n/a | reject Name Constraints | reject Name Constraints |
+| Isolated identity mismatch | `root.crt`, `intermediate.crt`, `identity-mismatch-leaf.crt` | `wrong.example.test` | reject identity | reject identity |
 | Duplicate critical extension | `duplicate-extension-leaf.crt` | `duplicate.example.test` | reject parsing or validation | reject parsing |
 | Truncated certificate seed | `malformed-truncated.crt` (`malformed-truncated.der` is the raw fuzz input) | n/a | reject parsing | reject parsing |
+| Algorithm-confusion fixtures | `algorithm-*.crt` plus matching raw `.der` files | n/a | reject validation/parsing by pinned semantic reason | reject validation/parsing by pinned semantic reason |
+| Hostile DER encoding fixtures | `der-*.crt` plus matching raw `.der` files | n/a | reject or accept by pinned parser policy | reject malformed DER or algorithm encoding by pinned semantic reason |
 
 `pathlen-chain.crt` orders `pathlen-subordinate-ca.crt` before
 `pathlen-zero-ca.crt`. The latter permits no non-self-issued CA below it, so the
@@ -56,6 +63,25 @@ never accept it.
 `CERTIFICATE` block so every differential validator can consume one file
 format. The byte-identical raw DER remains available for parser fuzzing.
 
+The DNS-only and IP-only Name Constraints chains avoid unrelated critical name
+forms, so their negative cases prove each validator reached the rule named by
+the case. The legacy directoryName fixtures remain in the extended corpus with
+an explicit normalization for Go's unsupported critical directoryName
+constraint.
+
+The `algorithm-*` family mutates Ed25519 certificate AlgorithmIdentifier and
+SubjectPublicKeyInfo OID encodings without adding production support for new
+algorithms. The generated TBS bytes are re-signed whenever the mutation leaves
+a certificate-shaped object, so these cases do not depend on stale-signature
+rejection.
+
+The `der-*` family records strict DER policy boundaries such as non-minimal
+lengths, indefinite lengths, malformed INTEGER/BIT STRING encodings,
+constructed primitive encodings, trailing bytes, and malformed nested
+extension lengths. The `.crt` files let external validators consume the same
+bytes through PEM while the raw `.der` files remain available for parser and
+reducer coverage.
+
 ## Mismatch minimization and the reduced regression corpus
 
 Every unexplained differential mismatch triggers bounded automated
@@ -63,22 +89,23 @@ minimization (`tests/pki_reduce.zig`): deterministic greedy delta debugging
 under a hard per-component oracle-call budget. The mismatch can live anywhere
 in the chain, so every component — the leaf, each intermediate, and each
 trust anchor — gets its own reduction pass that substitutes only that
-certificate's DER while Tardigrade's exact classification (status plus
-diagnostic, never just accept/reject) must be preserved; the component with
+certificate's DER while Tardigrade's semantic classification (status, bounded
+reason, and certificate index when known) must be preserved; the component with
 the largest shrink wins deterministically.
 
 An emitted reduced fixture is always a reproduction of the observed
 disagreement. The harness writes the reduced component
 (`<case-id>.reduced.der`/`.crt`, plus a substituted bundle file when the
 component is an intermediate or root) and re-verifies the reduced case
-against all three validators. If any validator's status diverges from the
-original tuple, the reduction is reverted to the original component bytes and
-the disqualifying decisions are recorded (`candidate_observed`,
-`reverted_external_divergence`). The schema-v3 artifact records the
+against all three validators. If any validator's semantic tuple diverges from
+the original tuple, the reduction is reverted to the original component bytes
+and the disqualifying observations are recorded (`candidate_observed`,
+`reverted_external_divergence`). The schema-v4 artifact records the
 component, sizes, oracle budget spent, `budget_exhausted` and `one_minimal`
 flags (1-minimality is only claimed after a completed single-byte sweep),
-SHA-256, per-validator reduced decisions, and a `promotable` verdict that
-requires the observed statuses to survive.
+SHA-256, per-validator reduced semantic observations, validator identities,
+runtime OS/architecture, subprocess bounds, and a `promotable` verdict that
+requires the observed status/reason/index tuples to survive.
 
 Promotable inputs land in `reduced/manifest.zig`, the registry the build
 embeds into the PKI unit-test module. Every seed automatically joins the DER

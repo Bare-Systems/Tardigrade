@@ -1091,6 +1091,7 @@ test "reduced differential corpus is bounded and documented" {
         try testing.expect(entry.license.len > 0);
         switch (entry.expected) {
             .parse_error => |name| try testing.expect(name.len > 0),
+            .der_parse_error => |name| try testing.expect(name.len > 0),
             .tardigrade_class => |class| try testing.expect(class.len > 0),
         }
         for (reduced_corpus.entries[0..index]) |earlier| {
@@ -1113,6 +1114,7 @@ test "reduced differential seeds keep their recorded parse outcome" {
         } else |err| {
             switch (entry.expected) {
                 .parse_error => |expected| try testing.expectEqualStrings(expected, @errorName(err)),
+                .der_parse_error => {},
                 .tardigrade_class => return error.TestUnexpectedResult,
             }
         }

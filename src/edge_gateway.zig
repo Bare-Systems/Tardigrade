@@ -11,6 +11,7 @@ const JSON_CONTENT_TYPE = "application/json";
 const HTTP2_PREFACE = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 const HTTP2_MAX_FRAME_SIZE: usize = 16 * 1024;
 const WS_MUX_MAX_CHANNELS: usize = 32;
+const ACTIVE_DRIVE_POLL_INTERVAL_MS: u64 = 250;
 /// Fallback approval TTL when no config value is provided (5 minutes).
 const APPROVAL_TIMEOUT_MS_DEFAULT: i64 = 300_000;
 
@@ -702,6 +703,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
             // Close keepalive connections idle longer than the keepalive timeout
             // while parked off the worker pool (#138).
             _ = parked.reapIdle(http.event_loop.monotonicMs(), current_cfg.keep_alive_timeout_ms);
+            dispatchDueActiveDrivePolls(&active, &state, &event_loop, &worker_pool);
             reapActiveConnections(&active, &state, &event_loop);
             // Evict idle upstream keep-alive connections past their idle/lifetime
             // caps (#141).
@@ -973,6 +975,7 @@ fn startNewConnection(ctx: *WorkerContext, client_fd: std.posix.fd_t) void {
             }
             return;
         };
+        tls_conn.attachBufferMetrics(&ctx.state.metrics, &ctx.state.metrics_mutex);
         // The TLS object now needs teardown on every exit; record it so the
         // teardown defer (or a failed park) frees it exactly once.
         tls_to_park = tls_conn;
@@ -991,9 +994,11 @@ fn startNewConnection(ctx: *WorkerContext, client_fd: std.posix.fd_t) void {
             return;
         };
         const dispatch_result = dispatchNegotiatedHttp(ctx, &tls_conn, negotiated, session, cfg, connection_ip, &served) catch |err| {
+            tls_to_park = tls_conn;
             ctx.state.logger.err(null, "negotiated HTTP dispatch error: {}", .{err});
             return;
         };
+        tls_to_park = tls_conn;
         if (dispatch_result == .park) {
             transferred = true;
             parkConnection(ctx, client_fd, session, tls_conn, served, connection_ip);
@@ -1253,16 +1258,45 @@ fn reapActiveConnections(
     }
 }
 
+fn dispatchDueActiveDrivePolls(
+    active: *http.downstream_connection.ActiveRegistry,
+    state: *GatewayState,
+    event_loop: *http.event_loop.EventLoop,
+    worker_pool: *http.worker_pool.WorkerPool,
+) void {
+    var fds: [32]std.posix.fd_t = undefined;
+    while (true) {
+        const count = active.dueDrivePollFds(http.event_loop.monotonicMs(), fds[0..]);
+        if (count == 0) break;
+        for (fds[0..count]) |fd| {
+            event_loop.remove(fd) catch {};
+            worker_pool.submit(fd) catch |err| {
+                state.logger.warn(null, "active connection drive-poll submit failed: {}", .{err});
+                if (active.checkout(fd)) |taken| {
+                    var conn = taken;
+                    conn.deinit();
+                }
+            };
+        }
+        if (count < fds.len) break;
+    }
+}
+
 fn rearmActiveConnection(ctx: *WorkerContext, managed: *http.downstream_connection.ManagedConnection, requested: http.event_loop.Interest) void {
     const fd = managed.fd;
-    if (managed.encryptedWaitFor(requested)) |wait| switch (wait) {
+    const now_ms = http.event_loop.monotonicMs();
+    if (managed.encryptedWaitForAt(requested, now_ms, ACTIVE_DRIVE_POLL_INTERVAL_MS)) |wait| switch (wait) {
         .ready_now => {
             advanceActiveConnection(ctx, managed);
             return;
         },
-        .socket, .stalled => {},
+        .socket, .retry_at_ms, .stalled => {},
     };
-    const interest = managed.updateInterestFor(requested);
+    const interest = switch (managed.updateWaitFor(requested, now_ms, ACTIVE_DRIVE_POLL_INTERVAL_MS) orelse
+        http.downstream_connection.EncryptedWait{ .socket = requested }) {
+        .socket => |socket_interest| socket_interest,
+        .ready_now, .retry_at_ms, .stalled => http.event_loop.Interest{},
+    };
     _ = ctx.active.rearm(managed) catch |err| {
         ctx.state.logger.warn(null, "active connection rearm failed: {}", .{err});
         managed.deinit();
@@ -1306,10 +1340,6 @@ fn advanceNativeHandshake(ctx: *WorkerContext, managed: *http.downstream_connect
         };
         if (native.record.applicationDataOpen()) break;
         if (!driven.made_progress) {
-            managed.phase.native_handshake.deadline_ms = deadlineFromNow(
-                http.event_loop.monotonicMs(),
-                managed.lifecycle.handshake_timeout_ms,
-            );
             rearmActiveConnection(ctx, managed, .{ .read = true });
             return;
         }
@@ -1363,6 +1393,9 @@ const WaitingEncryptedHttpConnection = struct {
     inner: http.encrypted_stream_connection.EncryptedStreamHttpConnection,
     read_timeout_ms: u32,
     write_timeout_ms: u32,
+    tls_metrics: ?*http.metrics.Metrics = null,
+    tls_metrics_mutex: ?*compat.Mutex = null,
+    tls_metrics_state: ?*http.metrics.TlsBufferConnectionMetrics = null,
 
     fn init(
         inner: http.encrypted_stream_connection.EncryptedStreamHttpConnection,
@@ -1376,15 +1409,45 @@ const WaitingEncryptedHttpConnection = struct {
         };
     }
 
+    fn initWithMetrics(
+        inner: http.encrypted_stream_connection.EncryptedStreamHttpConnection,
+        read_timeout_ms: u32,
+        write_timeout_ms: u32,
+        metrics: ?*http.metrics.Metrics,
+        metrics_mutex: ?*compat.Mutex,
+        metrics_state: ?*http.metrics.TlsBufferConnectionMetrics,
+    ) WaitingEncryptedHttpConnection {
+        var adapter = init(inner, read_timeout_ms, write_timeout_ms);
+        adapter.tls_metrics = metrics;
+        adapter.tls_metrics_mutex = metrics_mutex;
+        adapter.tls_metrics_state = metrics_state;
+        return adapter;
+    }
+
+    fn observeTlsBufferMetrics(self: *WaitingEncryptedHttpConnection) void {
+        const metrics = self.tls_metrics orelse return;
+        const mutex = self.tls_metrics_mutex orelse return;
+        const state = self.tls_metrics_state orelse return;
+        const snapshot = self.inner.bufferSnapshot();
+        const backend = self.inner.stream.backend();
+        mutex.lock();
+        defer mutex.unlock();
+        metrics.observeTlsBufferSnapshot(state, backend, snapshot) catch
+            @panic("TLS buffer accounting underflow");
+    }
+
     pub fn read(self: *WaitingEncryptedHttpConnection, out: []u8) !usize {
         while (true) {
-            return self.inner.read(out) catch |err| switch (err) {
+            const n = self.inner.read(out) catch |err| switch (err) {
                 error.WouldBlock => {
+                    self.observeTlsBufferMetrics();
                     try self.waitFor(.{ .read = true }, self.read_timeout_ms);
                     continue;
                 },
-                else => err,
+                else => return err,
             };
+            self.observeTlsBufferMetrics();
+            return n;
         }
     }
 
@@ -1392,11 +1455,13 @@ const WaitingEncryptedHttpConnection = struct {
         while (true) {
             const n = self.inner.write(bytes) catch |err| switch (err) {
                 error.WouldBlock => {
+                    self.observeTlsBufferMetrics();
                     try self.waitFor(.{ .write = true }, self.write_timeout_ms);
                     continue;
                 },
-                else => err,
+                else => return err,
             };
+            self.observeTlsBufferMetrics();
             try self.flush();
             return n;
         }
@@ -1406,11 +1471,13 @@ const WaitingEncryptedHttpConnection = struct {
         while (self.inner.readiness().wants_write) {
             self.inner.flush() catch |err| switch (err) {
                 error.WouldBlock => {
+                    self.observeTlsBufferMetrics();
                     try self.waitFor(.{ .write = true }, self.write_timeout_ms);
                     continue;
                 },
                 else => return err,
             };
+            self.observeTlsBufferMetrics();
         }
     }
 
@@ -1471,6 +1538,7 @@ const WaitingEncryptedHttpConnection = struct {
         const interest = switch (http.downstream_connection.encryptedWaitForInterest(readiness, requested)) {
             .ready_now => return,
             .socket => |socket_interest| socket_interest,
+            .retry_at_ms => return error.WouldBlock,
             .stalled => return error.WouldBlock,
         };
 
@@ -1505,10 +1573,13 @@ fn advanceNativeHttp1(ctx: *WorkerContext, managed: *http.downstream_connection.
         managed.deinit();
         return;
     };
-    var adapter = WaitingEncryptedHttpConnection.init(
+    var adapter = WaitingEncryptedHttpConnection.initWithMetrics(
         native.httpConnection(),
         managed.lifecycle.header_timeout_ms,
         managed.lifecycle.write_timeout_ms,
+        managed.lifecycle.metrics,
+        managed.lifecycle.metrics_mutex,
+        &managed.lifecycle.tls_buffer_metrics,
     );
     const connection_ip = managed.lifecycle.connectionIp();
     var served = switch (managed.phase) {
@@ -1532,6 +1603,7 @@ fn advanceNativeHttp1(ctx: *WorkerContext, managed: *http.downstream_connection.
                     managed.deinit();
                     return;
                 };
+                managed.observeTlsBufferMetrics();
                 if (adapter.pending() > 0 or managed.transport.pendingPlaintext() > 0) continue;
                 rearmActiveConnection(ctx, managed, .{ .read = true });
                 return;
@@ -1565,10 +1637,13 @@ fn advanceNativeHttp2(ctx: *WorkerContext, managed: *http.downstream_connection.
         return;
     };
 
-    var adapter = WaitingEncryptedHttpConnection.init(
+    var adapter = WaitingEncryptedHttpConnection.initWithMetrics(
         native.httpConnection(),
         managed.lifecycle.header_timeout_ms,
         managed.lifecycle.write_timeout_ms,
+        managed.lifecycle.metrics,
+        managed.lifecycle.metrics_mutex,
+        &managed.lifecycle.tls_buffer_metrics,
     );
     handleHttp2Connection(&adapter, session, cfg, ctx.state, managed.lifecycle.connectionIp()) catch |err| {
         if (isBenignDisconnect(err)) {

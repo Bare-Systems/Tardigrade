@@ -27,6 +27,7 @@ pub const EncryptedOperation = enum {
 pub const EncryptedWait = union(enum) {
     ready_now,
     socket: event_loop.Interest,
+    retry_at_ms: u64,
     stalled,
 };
 
@@ -244,6 +245,7 @@ pub const ManagedConnection = struct {
         metrics: ?*metrics_mod.Metrics = null,
         metrics_mutex: ?*compat.Mutex = null,
         tls_buffer_metrics: metrics_mod.TlsBufferConnectionMetrics = .{},
+        drive_poll_due_ms: u64 = 0,
         owned_ip: ?[]u8 = null,
         allocator: ?std.mem.Allocator = null,
         config_generation: u64 = 0,
@@ -300,21 +302,45 @@ pub const ManagedConnection = struct {
     }
 
     pub fn updateInterestFor(self: *ManagedConnection, requested: event_loop.Interest) event_loop.Interest {
-        self.interest = switch (self.transport) {
-            .plaintext => requested,
-            else => switch (encryptedWaitForInterest(self.transport.readiness(), requested)) {
-                .socket => |interest| interest,
-                .ready_now, .stalled => .{},
-            },
-        };
-        self.observeTlsBufferMetrics();
+        _ = self.updateWaitFor(requested, 0, 0);
         return self.interest;
     }
 
+    pub fn updateWaitFor(
+        self: *ManagedConnection,
+        requested: event_loop.Interest,
+        now_ms: u64,
+        retry_interval_ms: u64,
+    ) ?EncryptedWait {
+        const wait: ?EncryptedWait = switch (self.transport) {
+            .plaintext => null,
+            else => encryptedWaitForInterestAt(self.transport.readiness(), requested, now_ms, retry_interval_ms),
+        };
+        self.interest = switch (wait orelse EncryptedWait{ .socket = requested }) {
+            .socket => |interest| interest,
+            .ready_now, .retry_at_ms, .stalled => .{},
+        };
+        self.lifecycle.drive_poll_due_ms = switch (wait orelse EncryptedWait{ .socket = requested }) {
+            .retry_at_ms => |due| due,
+            else => 0,
+        };
+        self.observeTlsBufferMetrics();
+        return wait;
+    }
+
     pub fn encryptedWaitFor(self: *ManagedConnection, requested: event_loop.Interest) ?EncryptedWait {
+        return self.encryptedWaitForAt(requested, 0, 0);
+    }
+
+    pub fn encryptedWaitForAt(
+        self: *ManagedConnection,
+        requested: event_loop.Interest,
+        now_ms: u64,
+        retry_interval_ms: u64,
+    ) ?EncryptedWait {
         return switch (self.transport) {
             .plaintext => null,
-            else => encryptedWaitForInterest(self.transport.readiness(), requested),
+            else => encryptedWaitForInterestAt(self.transport.readiness(), requested, now_ms, retry_interval_ms),
         };
     }
 
@@ -328,7 +354,7 @@ pub const ManagedConnection = struct {
         self.* = undefined;
     }
 
-    fn observeTlsBufferMetrics(self: *ManagedConnection) void {
+    pub fn observeTlsBufferMetrics(self: *ManagedConnection) void {
         const metrics = self.lifecycle.metrics orelse return;
         const mutex = self.lifecycle.metrics_mutex orelse return;
         var transport = self.transport;
@@ -336,15 +362,17 @@ pub const ManagedConnection = struct {
         const snapshot = stream.bufferSnapshot();
         mutex.lock();
         defer mutex.unlock();
-        metrics.observeTlsBufferSnapshot(&self.lifecycle.tls_buffer_metrics, stream.backend(), snapshot);
+        metrics.observeTlsBufferSnapshot(&self.lifecycle.tls_buffer_metrics, stream.backend(), snapshot) catch
+            @panic("TLS buffer accounting underflow");
     }
 
-    fn releaseTlsBufferMetrics(self: *ManagedConnection) void {
+    pub fn releaseTlsBufferMetrics(self: *ManagedConnection) void {
         const metrics = self.lifecycle.metrics orelse return;
         const mutex = self.lifecycle.metrics_mutex orelse return;
         mutex.lock();
         defer mutex.unlock();
-        metrics.releaseTlsBufferSnapshot(&self.lifecycle.tls_buffer_metrics);
+        metrics.releaseTlsBufferSnapshot(&self.lifecycle.tls_buffer_metrics) catch
+            @panic("TLS buffer accounting underflow");
     }
 
     pub fn expired(self: *const ManagedConnection, now_ms: u64) bool {
@@ -459,6 +487,24 @@ pub const ActiveRegistry = struct {
         }
         return out_len;
     }
+
+    pub fn dueDrivePollFds(self: *ActiveRegistry, now_ms: u64, out: []std.posix.fd_t) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var out_len: usize = 0;
+        var it = self.map.iterator();
+        while (it.next()) |entry| {
+            if (out_len >= out.len) break;
+            if (entry.value_ptr.expired(now_ms)) continue;
+            const due = entry.value_ptr.lifecycle.drive_poll_due_ms;
+            if (due == 0 or now_ms < due) continue;
+            entry.value_ptr.lifecycle.drive_poll_due_ms = 0;
+            out[out_len] = entry.key_ptr.*;
+            out_len += 1;
+        }
+        return out_len;
+    }
 };
 
 fn deinitPhase(phase: *ConnectionPhase) void {
@@ -471,6 +517,15 @@ fn deinitPhase(phase: *ConnectionPhase) void {
 }
 
 pub fn encryptedWait(readiness: encrypted_stream.Readiness, operation: EncryptedOperation) EncryptedWait {
+    return encryptedWaitAt(readiness, operation, 0, 0);
+}
+
+pub fn encryptedWaitAt(
+    readiness: encrypted_stream.Readiness,
+    operation: EncryptedOperation,
+    now_ms: u64,
+    retry_interval_ms: u64,
+) EncryptedWait {
     switch (operation) {
         .read_plaintext => if (readiness.can_read_plaintext) return .ready_now,
         .write_plaintext => if (readiness.can_write_plaintext) return .ready_now,
@@ -478,17 +533,29 @@ pub fn encryptedWait(readiness: encrypted_stream.Readiness, operation: Encrypted
     }
     const interest = native_tls_connection.interestForReadiness(readiness);
     if (interest.read or interest.write) return .{ .socket = interest };
+    if (retry_interval_ms > 0) {
+        return .{ .retry_at_ms = std.math.add(u64, now_ms, retry_interval_ms) catch std.math.maxInt(u64) };
+    }
     return .stalled;
 }
 
 pub fn encryptedWaitForInterest(readiness: encrypted_stream.Readiness, requested: event_loop.Interest) EncryptedWait {
+    return encryptedWaitForInterestAt(readiness, requested, 0, 0);
+}
+
+pub fn encryptedWaitForInterestAt(
+    readiness: encrypted_stream.Readiness,
+    requested: event_loop.Interest,
+    now_ms: u64,
+    retry_interval_ms: u64,
+) EncryptedWait {
     const operation: EncryptedOperation = if (requested.read and !requested.write)
         .read_plaintext
     else if (requested.write and !requested.read)
         .write_plaintext
     else
         .drive;
-    return encryptedWait(readiness, operation);
+    return encryptedWaitAt(readiness, operation, now_ms, retry_interval_ms);
 }
 
 fn closeFd(fd: std.posix.fd_t) void {
@@ -612,6 +679,28 @@ test "active registry reaps expired protocol deadlines" {
     try std.testing.expect(registry.contains(-2));
 }
 
+test "active registry returns due drive polls exactly once without extending deadlines" {
+    var registry = ActiveRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+
+    var pending = ManagedConnection.init(
+        .{ .plaintext = -1 },
+        .{ .native_handshake = .{ .deadline_ms = 100 } },
+    );
+    pending.lifecycle.drive_poll_due_ms = 10;
+    try registry.insert(&pending);
+
+    var out: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(usize, 0), registry.dueDrivePollFds(9, out[0..]));
+    try std.testing.expectEqual(@as(usize, 1), registry.dueDrivePollFds(10, out[0..]));
+    try std.testing.expectEqual(@as(std.posix.fd_t, -1), out[0]);
+    try std.testing.expectEqual(@as(usize, 0), registry.dueDrivePollFds(10, out[0..]));
+
+    var checked_out = registry.checkout(-1) orelse return error.TestExpectedConnection;
+    defer checked_out.deinit();
+    try std.testing.expectEqual(@as(u64, 100), checked_out.phase.native_handshake.deadline_ms);
+}
+
 test "managed connection preserves protocol write interest for plaintext wait-write" {
     const h1 = try Http1ConnectionState.init(std.testing.allocator, 1024);
     var managed = ManagedConnection.init(
@@ -651,6 +740,10 @@ test "encrypted wait maps blocked operations to TLS raw readiness only" {
     try std.testing.expectEqual(
         EncryptedWait.stalled,
         encryptedWaitForInterest(.{}, .{ .read = true }),
+    );
+    try std.testing.expectEqual(
+        EncryptedWait{ .retry_at_ms = 1250 },
+        encryptedWaitForInterestAt(.{}, .{ .read = true }, 1000, 250),
     );
 }
 

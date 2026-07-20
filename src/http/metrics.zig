@@ -457,8 +457,8 @@ pub const Metrics = struct {
         state: *TlsBufferConnectionMetrics,
         backend: encrypted_stream.BackendKind,
         snapshot: encrypted_stream.BufferSnapshot,
-    ) void {
-        if (state.active) self.releaseTlsCurrentBytes(state.backend, state.current);
+    ) !void {
+        if (state.active) try self.releaseTlsCurrentBytes(state.backend, state.current);
         self.recordTlsCurrentBytes(backend, snapshot.current);
         if (state.active and state.backend == backend) {
             self.recordTlsCounterDeltas(backend, state.counters, snapshot.counters);
@@ -473,9 +473,9 @@ pub const Metrics = struct {
         };
     }
 
-    pub fn releaseTlsBufferSnapshot(self: *Metrics, state: *TlsBufferConnectionMetrics) void {
+    pub fn releaseTlsBufferSnapshot(self: *Metrics, state: *TlsBufferConnectionMetrics) !void {
         if (!state.active) return;
-        self.releaseTlsCurrentBytes(state.backend, state.current);
+        try self.releaseTlsCurrentBytes(state.backend, state.current);
         state.* = .{};
     }
 
@@ -487,12 +487,12 @@ pub const Metrics = struct {
         self.tls_buffered_bytes_current[backend_idx][tlsQueueIndex(.handshake)] += @intCast(current.handshake);
     }
 
-    fn releaseTlsCurrentBytes(self: *Metrics, backend: encrypted_stream.BackendKind, current: encrypted_stream.QueueBytes) void {
+    fn releaseTlsCurrentBytes(self: *Metrics, backend: encrypted_stream.BackendKind, current: encrypted_stream.QueueBytes) !void {
         const backend_idx = tlsBackendIndex(backend);
-        subtractGauge(&self.tls_buffered_bytes_current[backend_idx][tlsQueueIndex(.inbound_ciphertext)], current.inbound_ciphertext);
-        subtractGauge(&self.tls_buffered_bytes_current[backend_idx][tlsQueueIndex(.inbound_plaintext)], current.inbound_plaintext);
-        subtractGauge(&self.tls_buffered_bytes_current[backend_idx][tlsQueueIndex(.outbound_ciphertext)], current.outbound_ciphertext);
-        subtractGauge(&self.tls_buffered_bytes_current[backend_idx][tlsQueueIndex(.handshake)], current.handshake);
+        try subtractGauge(&self.tls_buffered_bytes_current[backend_idx][tlsQueueIndex(.inbound_ciphertext)], current.inbound_ciphertext);
+        try subtractGauge(&self.tls_buffered_bytes_current[backend_idx][tlsQueueIndex(.inbound_plaintext)], current.inbound_plaintext);
+        try subtractGauge(&self.tls_buffered_bytes_current[backend_idx][tlsQueueIndex(.outbound_ciphertext)], current.outbound_ciphertext);
+        try subtractGauge(&self.tls_buffered_bytes_current[backend_idx][tlsQueueIndex(.handshake)], current.handshake);
     }
 
     fn recordTlsCounterDeltas(
@@ -1219,9 +1219,10 @@ fn monotonicDelta(previous: u64, next: u64) u64 {
     return if (next >= previous) next - previous else next;
 }
 
-fn subtractGauge(slot: *u64, amount: usize) void {
+fn subtractGauge(slot: *u64, amount: usize) !void {
     const value: u64 = @intCast(amount);
-    slot.* = if (value >= slot.*) 0 else slot.* - value;
+    if (value > slot.*) return error.BufferAccountingUnderflow;
+    slot.* -= value;
 }
 
 // Tests
@@ -1345,8 +1346,8 @@ test "Metrics TLS buffer observation applies current bytes and counter deltas on
         },
     };
 
-    m.observeTlsBufferSnapshot(&state, backend, snapshot);
-    m.observeTlsBufferSnapshot(&state, backend, snapshot);
+    try m.observeTlsBufferSnapshot(&state, backend, snapshot);
+    try m.observeTlsBufferSnapshot(&state, backend, snapshot);
 
     try std.testing.expectEqual(@as(u64, 11), m.tls_buffered_bytes_current[backend_idx][tlsQueueIndex(.inbound_ciphertext)]);
     try std.testing.expectEqual(@as(u64, 13), m.tls_buffered_bytes_current[backend_idx][tlsQueueIndex(.outbound_ciphertext)]);
@@ -1355,9 +1356,33 @@ test "Metrics TLS buffer observation applies current bytes and counter deltas on
     try std.testing.expectEqual(@as(u64, 1), m.tls_buffer_limit_exceeded[backend_idx][tlsQueueIndex(.outbound_ciphertext)]);
     try std.testing.expectEqual(@as(u64, 4), m.tls_buffer_stalled_drives[backend_idx]);
 
-    m.releaseTlsBufferSnapshot(&state);
+    try m.releaseTlsBufferSnapshot(&state);
     try std.testing.expectEqual(@as(u64, 0), m.tls_buffered_bytes_current[backend_idx][tlsQueueIndex(.inbound_ciphertext)]);
     try std.testing.expectEqual(@as(u64, 0), m.tls_buffered_bytes_current[backend_idx][tlsQueueIndex(.outbound_ciphertext)]);
+}
+
+test "Metrics TLS buffer current bytes remain per connection and underflow reports" {
+    var m = Metrics.init();
+    var first = TlsBufferConnectionMetrics{};
+    var second = TlsBufferConnectionMetrics{};
+    const backend = encrypted_stream.BackendKind.pure_zig_record;
+    const backend_idx = tlsBackendIndex(backend);
+
+    try m.observeTlsBufferSnapshot(&first, backend, .{ .current = .{ .inbound_plaintext = 10 } });
+    try m.observeTlsBufferSnapshot(&second, backend, .{ .current = .{ .inbound_plaintext = 7 } });
+    try std.testing.expectEqual(@as(u64, 17), m.tls_buffered_bytes_current[backend_idx][tlsQueueIndex(.inbound_plaintext)]);
+
+    try m.releaseTlsBufferSnapshot(&first);
+    try std.testing.expectEqual(@as(u64, 7), m.tls_buffered_bytes_current[backend_idx][tlsQueueIndex(.inbound_plaintext)]);
+    try m.releaseTlsBufferSnapshot(&second);
+    try std.testing.expectEqual(@as(u64, 0), m.tls_buffered_bytes_current[backend_idx][tlsQueueIndex(.inbound_plaintext)]);
+
+    var corrupted = TlsBufferConnectionMetrics{
+        .active = true,
+        .backend = backend,
+        .current = .{ .inbound_plaintext = 1 },
+    };
+    try std.testing.expectError(error.BufferAccountingUnderflow, m.releaseTlsBufferSnapshot(&corrupted));
 }
 
 test "recordErrorCode counts only the canonical overload label" {

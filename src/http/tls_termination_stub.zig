@@ -138,6 +138,12 @@ pub const TlsConnection = struct {
         return error.TlsReadFailed;
     }
 
+    pub fn attachBufferMetrics(self: *TlsConnection, metrics: anytype, mutex: anytype) void {
+        _ = self;
+        _ = metrics;
+        _ = mutex;
+    }
+
     pub fn pending(self: *const TlsConnection) usize {
         _ = self;
         return 0;

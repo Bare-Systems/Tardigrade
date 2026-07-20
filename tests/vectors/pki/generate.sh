@@ -160,6 +160,18 @@ if openssl x509 -in "$out/malformed-truncated.crt" -noout >/dev/null 2>&1; then
   exit 1
 fi
 
+hostile_der_files=("$out"/algorithm-*.der "$out"/der-*.der)
+for ((i = 0; i < ${#hostile_der_files[@]}; i++)); do
+  left="${hostile_der_files[$i]}"
+  for ((j = i + 1; j < ${#hostile_der_files[@]}; j++)); do
+    right="${hostile_der_files[$j]}"
+    if cmp -s "$left" "$right"; then
+      echo "byte-identical hostile DER fixtures: ${left##*/} and ${right##*/}" >&2
+      exit 1
+    fi
+  done
+done
+
 # Refuse stale files and any persisted private-key material. This directory is
 # deliberately closed: every regular file must be authored here or generated
 # by the manifest above.

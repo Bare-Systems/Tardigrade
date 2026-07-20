@@ -542,7 +542,6 @@ fn opensslReasonForCode(code: u16) Reason {
         7, // X509_V_ERR_CERT_SIGNATURE_FAILURE
         => .signature_invalid,
         6, // X509_V_ERR_UNABLE_TO_DECODE_ISSUER_PUBLIC_KEY
-        24, // X509_V_ERR_NO_ISSUER_PUBLIC_KEY
         => .issuer_key_or_spki_invalid,
         9, // X509_V_ERR_CERT_NOT_YET_VALID
         10, // X509_V_ERR_CERT_HAS_EXPIRED
@@ -556,6 +555,7 @@ fn opensslReasonForCode(code: u16) Reason {
         => .path_length_violation,
         32, // X509_V_ERR_KEYUSAGE_NO_CERTSIGN
         39, // X509_V_ERR_KEYUSAGE_NO_DIGITAL_SIGNATURE
+        24, // X509_V_ERR_INVALID_CA
         81, // X509_V_ERR_PATHLEN_WITHOUT_KU_KEY_CERT_SIGN
         82, // X509_V_ERR_KU_KEY_CERT_SIGN_INVALID_FOR_NON_CA
         92, // X509_V_ERR_CA_CERT_MISSING_KEY_USAGE
@@ -1922,6 +1922,57 @@ fn expectFixtureBounded(path: []const u8) !void {
     try testing.expect(stat.size > 0 and stat.size <= max_fixture_size);
 }
 
+fn hostileDerPathForCase(allocator: std.mem.Allocator, case: manifest.Case) !?[]u8 {
+    const prefix = if (std.mem.startsWith(u8, case.id, "algorithm-"))
+        "algorithm-"
+    else if (std.mem.startsWith(u8, case.id, "der-"))
+        "der-"
+    else
+        return null;
+
+    switch (case.category) {
+        .algorithm_failure => try testing.expect(std.mem.eql(u8, prefix, "algorithm-")),
+        .malformed_der => try testing.expect(std.mem.eql(u8, prefix, "der-")),
+        else => return error.TestUnexpectedResult,
+    }
+
+    const expected_leaf = try std.fmt.allocPrint(allocator, "tests/vectors/pki/{s}.crt", .{case.id});
+    defer allocator.free(expected_leaf);
+    try testing.expectEqualStrings(expected_leaf, case.leaf_file);
+    return try std.fmt.allocPrint(allocator, "tests/vectors/pki/{s}.der", .{case.id});
+}
+
+test "pki differential hostile DER fixtures are byte-unique and case-bound" {
+    const allocator = testing.allocator;
+    var seen: std.ArrayList(struct {
+        id: []const u8,
+        der: []u8,
+    }) = .empty;
+    defer {
+        for (seen.items) |entry| allocator.free(entry.der);
+        seen.deinit(allocator);
+    }
+
+    for (manifest.cases) |case| {
+        const der_path = try hostileDerPathForCase(allocator, case) orelse continue;
+        defer allocator.free(der_path);
+        const der = try compat.cwd().readFileAlloc(allocator, der_path, max_fixture_size);
+        errdefer allocator.free(der);
+        try testing.expect(der.len > 0);
+        for (seen.items) |entry| {
+            if (std.mem.eql(u8, entry.der, der)) {
+                std.debug.print(
+                    "duplicate hostile DER fixture bytes: {s} and {s}\n",
+                    .{ entry.id, case.id },
+                );
+                return error.TestUnexpectedResult;
+            }
+        }
+        try seen.append(allocator, .{ .id = case.id, .der = der });
+    }
+    try testing.expect(seen.items.len > 0);
+}
+
 fn runCorpus(include_extended: bool) !void {
     try validateManifest();
     var runtime_identity = try loadRuntimeIdentity(testing.allocator);
@@ -1990,7 +2041,7 @@ test "pki reduce: OpenSSL numeric verification codes have stable semantic mappin
         .{ 28, .untrusted_or_incomplete_path }, .{ 29, .untrusted_or_incomplete_path },
         .{ 30, .untrusted_or_incomplete_path }, .{ 31, .untrusted_or_incomplete_path },
         .{ 4, .signature_invalid },             .{ 7, .signature_invalid },
-        .{ 6, .issuer_key_or_spki_invalid },    .{ 24, .issuer_key_or_spki_invalid },
+        .{ 6, .issuer_key_or_spki_invalid },    .{ 24, .key_usage_failure },
         .{ 9, .validity_failure },              .{ 10, .validity_failure },
         .{ 13, .validity_failure },             .{ 14, .validity_failure },
         .{ 22, .path_length_violation },        .{ 25, .path_length_violation },

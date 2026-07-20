@@ -2460,7 +2460,8 @@ const PureZigTlsClient = struct {
             .{ .record = .{ .alpn = alpnPolicy(alpn) } },
             .{ .server_name = server_name },
         );
-        self.record = tls_core.encrypted_stream.PureZigRecordStream.initWithCarrierAndBackend(
+        self.record = try tls_core.encrypted_stream.PureZigRecordStream.initWithCarrierBackendAndAllocator(
+            allocator,
             .client,
             self.cryptoProviderState().cryptoProvider(),
             .tls_aes_128_gcm_sha256,
@@ -2494,7 +2495,8 @@ const PureZigTlsClient = struct {
             .{ .record = .{ .alpn = alpnPolicy(alpn) } },
             .{ .server_name = server_name },
         );
-        self.record = tls_core.encrypted_stream.PureZigRecordStream.initWithCarrierAndBackend(
+        self.record = try tls_core.encrypted_stream.PureZigRecordStream.initWithCarrierBackendAndAllocator(
+            allocator,
             .client,
             self.cryptoProviderState().cryptoProvider(),
             .tls_aes_128_gcm_sha256,

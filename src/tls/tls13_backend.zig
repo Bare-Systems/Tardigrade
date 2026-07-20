@@ -692,6 +692,7 @@ pub const Tls13Backend = struct {
     pub fn setPostHandshakeAllocator(self: *Tls13Backend, allocator: std.mem.Allocator) HandshakeError!void {
         if (self.role != .client) return error.InvalidHandshakeState;
         if (self.core.handshake_lifecycle != .idle) return error.InvalidHandshakeState;
+        if (self.application_input.allocator != null) return;
         try self.application_input.setAllocator(allocator);
     }
 

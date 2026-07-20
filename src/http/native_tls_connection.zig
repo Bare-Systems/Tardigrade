@@ -196,7 +196,8 @@ pub const NativeTlsConnection = struct {
             .policy = policy,
         };
         self.crypto_provider_state = production_crypto.Provider.init(self.entropy_source.entropy());
-        record.* = try encrypted_stream.PureZigRecordStream.initWithCarrierBackendAndLimits(
+        record.* = try encrypted_stream.PureZigRecordStream.initWithCarrierBackendAllocatorAndLimits(
+            allocator,
             .server,
             self.crypto_provider_state.cryptoProvider(),
             .tls_aes_128_gcm_sha256,

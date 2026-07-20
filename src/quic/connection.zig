@@ -341,20 +341,75 @@ const CryptoTx = struct {
     fn reserveAppend(self: *CryptoTx, allocator: std.mem.Allocator, bytes_len: usize, max_outstanding: usize) !void {
         if (bytes_len > max_outstanding) return error.CryptoBufferTooLarge;
         if (self.data.items.len > max_outstanding - bytes_len) return error.CryptoBufferTooLarge;
-        if (self.data.capacity == 0) {
-            try self.data.ensureTotalCapacityPrecise(allocator, bytes_len);
-        } else if (self.data.capacity < self.data.items.len + bytes_len) {
-            return error.CryptoBufferTooLarge;
+
+        const new_total = self.data.items.len + bytes_len;
+        const range_budget = applicationCryptoRangeBudget(new_total);
+        const pending_capacity = self.pending.items.items.len + range_budget + 1;
+        const acked_capacity = self.acked.items.items.len + range_budget;
+
+        var new_data: ?[]u8 = null;
+        errdefer if (new_data) |buf| {
+            crypto_secrets.secureZero(buf);
+            allocator.free(buf);
+        };
+        if (self.data.capacity < new_total) {
+            const replacement = try allocator.alloc(u8, new_total);
+            @memcpy(replacement[0..self.data.items.len], self.data.items);
+            new_data = replacement;
         }
-        const range_budget = applicationCryptoRangeBudget(bytes_len);
-        try self.pending.ensureUnusedCapacity(allocator, range_budget + 1);
-        try self.acked.ensureUnusedCapacity(allocator, range_budget);
+
+        var new_pending: ?[]Range = null;
+        errdefer if (new_pending) |buf| allocator.free(buf);
+        if (self.pending.items.capacity < pending_capacity) {
+            const replacement = try allocator.alloc(Range, pending_capacity);
+            @memcpy(replacement[0..self.pending.items.items.len], self.pending.items.items);
+            new_pending = replacement;
+        }
+
+        var new_acked: ?[]Range = null;
+        errdefer if (new_acked) |buf| allocator.free(buf);
+        if (self.acked.items.capacity < acked_capacity) {
+            const replacement = try allocator.alloc(Range, acked_capacity);
+            @memcpy(replacement[0..self.acked.items.items.len], self.acked.items.items);
+            new_acked = replacement;
+        }
+
+        if (new_pending) |replacement| {
+            self.replaceRangeCapacity(allocator, &self.pending, replacement);
+            new_pending = null;
+        }
+        if (new_acked) |replacement| {
+            self.replaceRangeCapacity(allocator, &self.acked, replacement);
+            new_acked = null;
+        }
+        if (new_data) |replacement| {
+            self.replaceDataCapacity(allocator, replacement);
+            new_data = null;
+        }
+    }
+
+    fn replaceRangeCapacity(self: *CryptoTx, allocator: std.mem.Allocator, list: *RangeList, replacement: []Range) void {
+        _ = self;
+        const old_len = list.items.items.len;
+        if (list.items.capacity > 0) allocator.free(list.items.allocatedSlice());
+        list.items.items = replacement[0..old_len];
+        list.items.capacity = replacement.len;
+    }
+
+    fn replaceDataCapacity(self: *CryptoTx, allocator: std.mem.Allocator, replacement: []u8) void {
+        const old_len = self.data.items.len;
+        if (self.data.capacity > 0) {
+            crypto_secrets.secureZero(self.data.allocatedSlice());
+            allocator.free(self.data.allocatedSlice());
+        }
+        self.data.items = replacement[0..old_len];
+        self.data.capacity = replacement.len;
     }
 
     fn appendReserved(self: *CryptoTx, bytes: []const u8) void {
         const start = self.bufferedEnd();
         self.data.appendSliceAssumeCapacity(bytes);
-        self.pending.items.appendAssumeCapacity(.{
+        self.pending.insertAssumeCapacity(.{
             .start = start,
             .end = start + bytes.len,
         });
@@ -2360,6 +2415,42 @@ test "application CRYPTO transmit allocates exact storage and frees after ACK" {
     try testing.expect(tx.acked.isEmpty());
 }
 
+test "application CRYPTO transmit allows second outstanding ticket" {
+    const allocator = testing.allocator;
+    var tx = CryptoTx{};
+    defer tx.deinit(allocator);
+
+    try tx.reserveAppend(allocator, 12, max_application_crypto_outstanding);
+    tx.appendReserved("first-ticket");
+    try tx.reserveAppend(allocator, 13, max_application_crypto_outstanding);
+    tx.appendReserved("second-ticket");
+
+    try testing.expectEqual(@as(usize, 25), tx.data.items.len);
+    try testing.expectEqual(@as(usize, 25), tx.data.capacity);
+    try testing.expectEqualStrings("first-ticketsecond-ticket", tx.data.items);
+    try testing.expect(tx.pending.coversPrefix(25));
+}
+
+test "application CRYPTO reservation failure leaves empty state retryable" {
+    for (0..3) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_index });
+        var tx = CryptoTx{};
+        defer tx.deinit(testing.allocator);
+
+        try testing.expectError(error.OutOfMemory, tx.reserveAppend(failing.allocator(), 12, max_application_crypto_outstanding));
+        try testing.expectEqual(@as(usize, 0), tx.data.items.len);
+        try testing.expectEqual(@as(usize, 0), tx.data.capacity);
+        try testing.expect(tx.pending.isEmpty());
+        try testing.expect(tx.acked.isEmpty());
+
+        const retry = "larger-ticket-after-failed-reserve";
+        try tx.reserveAppend(testing.allocator, retry.len, max_application_crypto_outstanding);
+        tx.appendReserved(retry);
+        try testing.expectEqual(retry.len, tx.data.items.len);
+        tx.markAcked(testing.allocator, .{ .start = 0, .end = retry.len });
+    }
+}
+
 const TestPair = struct {
     client_backend: tls_backend_mod.Tls13Backend,
     server_backend: tls_backend_mod.Tls13Backend,
@@ -2635,6 +2726,76 @@ test "driver: server NewSessionTicket uses application CRYPTO retransmission and
     try pair.pump();
     try testing.expectEqual(@as(usize, 1), capture.count);
     try testing.expectEqual(@as(usize, "connection-ticket".len), capture.ticket_len);
+
+    const id = try pair.client.openStream(.bidi);
+    try testing.expectEqual(@as(usize, 5), try pair.client.writeStream(id, "after", true));
+    try pair.pump();
+    try testing.expectEqual(@as(?StreamId, id), pair.server.acceptStream());
+    var buf: [16]u8 = undefined;
+    const request = try pair.server.readStream(id, &buf);
+    try testing.expectEqualStrings("after", buf[0..request.len]);
+}
+
+test "driver: server emits two outstanding tickets in order before ACK" {
+    const Capture = struct {
+        count: usize = 0,
+        ticket_lens: [2]usize = .{ 0, 0 },
+        psks: [2][tls_core.session.max_psk_len]u8 = .{ [_]u8{0} ** tls_core.session.max_psk_len, [_]u8{0} ** tls_core.session.max_psk_len },
+        psk_lens: [2]usize = .{ 0, 0 },
+
+        fn now(_: *anyopaque) i64 {
+            return 10;
+        }
+
+        fn onTicket(ctx: *anyopaque, ticket: *const tls_core.session.ClientTicketState) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            const index = self.count;
+            if (index < self.ticket_lens.len) {
+                self.ticket_lens[index] = ticket.ticket.slice().len;
+                const psk = ticket.common.resumption_psk.slice();
+                @memcpy(self.psks[index][0..psk.len], psk);
+                self.psk_lens[index] = psk.len;
+            }
+            self.count += 1;
+        }
+    };
+
+    const allocator = testing.allocator;
+    var capture = Capture{};
+    var pair = try TestPair.initWithTicketConsumer(allocator, tls_core.session.Limits.default, .{
+        .ctx = &capture,
+        .nowUnixMsFn = Capture.now,
+        .onTicketFn = Capture.onTicket,
+    });
+    defer pair.deinit(allocator);
+    try pair.pump();
+
+    var state_a = try pair.server.emitNewSessionTicket(.{
+        .ticket_lifetime = 60,
+        .ticket_age_add = 1,
+        .ticket_nonce = "\x01",
+        .opaque_ticket = "ticket-a",
+        .issued_at_unix_ms = 10,
+    }, tls_core.session.Limits.default);
+    defer state_a.deinit();
+    var state_b = try pair.server.emitNewSessionTicket(.{
+        .ticket_lifetime = 60,
+        .ticket_age_add = 2,
+        .ticket_nonce = "\x02",
+        .opaque_ticket = "ticket-b",
+        .issued_at_unix_ms = 10,
+    }, tls_core.session.Limits.default);
+    defer state_b.deinit();
+
+    try pair.pump();
+    try testing.expectEqual(@as(usize, 2), capture.count);
+    try testing.expectEqual(@as(usize, "ticket-a".len), capture.ticket_lens[0]);
+    try testing.expectEqual(@as(usize, "ticket-b".len), capture.ticket_lens[1]);
+    try testing.expectEqual(state_a.common.resumption_psk.slice().len, capture.psk_lens[0]);
+    try testing.expectEqual(state_b.common.resumption_psk.slice().len, capture.psk_lens[1]);
+    try testing.expectEqualSlices(u8, state_a.common.resumption_psk.slice(), capture.psks[0][0..capture.psk_lens[0]]);
+    try testing.expectEqualSlices(u8, state_b.common.resumption_psk.slice(), capture.psks[1][0..capture.psk_lens[1]]);
+    try testing.expect(!std.mem.eql(u8, capture.psks[0][0..capture.psk_lens[0]], capture.psks[1][0..capture.psk_lens[1]]));
 
     const id = try pair.client.openStream(.bidi);
     try testing.expectEqual(@as(usize, 5), try pair.client.writeStream(id, "after", true));

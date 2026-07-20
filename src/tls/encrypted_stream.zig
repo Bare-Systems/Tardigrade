@@ -466,7 +466,19 @@ pub const PureZigRecordStream = struct {
         backend: RecordHandshakeBackend,
     ) PureZigRecordStream {
         var stream_state = init(role, crypto_provider, cipher_suite);
-        if (role == .client) backend.setPostHandshakeAllocator(std.heap.smp_allocator) catch unreachable;
+        stream_state.handshake_driver = RecordHandshakeDriver.init(role, backend);
+        return stream_state;
+    }
+
+    pub fn initWithBackendAndAllocator(
+        allocator: std.mem.Allocator,
+        role: tls_state.Role,
+        crypto_provider: provider.CryptoProvider,
+        cipher_suite: algorithms.CipherSuite,
+        backend: RecordHandshakeBackend,
+    ) Error!PureZigRecordStream {
+        var stream_state = init(role, crypto_provider, cipher_suite);
+        if (role == .client) try backend.setPostHandshakeAllocator(allocator);
         stream_state.handshake_driver = RecordHandshakeDriver.init(role, backend);
         return stream_state;
     }
@@ -479,7 +491,20 @@ pub const PureZigRecordStream = struct {
         limits: BufferLimits,
     ) Error!PureZigRecordStream {
         var stream_state = try initWithLimits(role, crypto_provider, cipher_suite, limits);
-        if (role == .client) try backend.setPostHandshakeAllocator(std.heap.smp_allocator);
+        stream_state.handshake_driver = RecordHandshakeDriver.init(role, backend);
+        return stream_state;
+    }
+
+    pub fn initWithBackendAllocatorAndLimits(
+        allocator: std.mem.Allocator,
+        role: tls_state.Role,
+        crypto_provider: provider.CryptoProvider,
+        cipher_suite: algorithms.CipherSuite,
+        backend: RecordHandshakeBackend,
+        limits: BufferLimits,
+    ) Error!PureZigRecordStream {
+        var stream_state = try initWithLimits(role, crypto_provider, cipher_suite, limits);
+        if (role == .client) try backend.setPostHandshakeAllocator(allocator);
         stream_state.handshake_driver = RecordHandshakeDriver.init(role, backend);
         return stream_state;
     }
@@ -499,6 +524,20 @@ pub const PureZigRecordStream = struct {
         return stream_state;
     }
 
+    pub fn initWithCarrierBackendAndAllocator(
+        allocator: std.mem.Allocator,
+        role: tls_state.Role,
+        crypto_provider: provider.CryptoProvider,
+        cipher_suite: algorithms.CipherSuite,
+        carrier: Carrier,
+        backend: RecordHandshakeBackend,
+    ) Error!PureZigRecordStream {
+        std.debug.assert(!carrier.owns_handle or carrier.closeFn != null);
+        var stream_state = try initWithBackendAndAllocator(allocator, role, crypto_provider, cipher_suite, backend);
+        stream_state.carrier = carrier;
+        return stream_state;
+    }
+
     pub fn initWithCarrierBackendAndLimits(
         role: tls_state.Role,
         crypto_provider: provider.CryptoProvider,
@@ -509,6 +548,21 @@ pub const PureZigRecordStream = struct {
     ) Error!PureZigRecordStream {
         std.debug.assert(!carrier.owns_handle or carrier.closeFn != null);
         var stream_state = try initWithBackendAndLimits(role, crypto_provider, cipher_suite, backend, limits);
+        stream_state.carrier = carrier;
+        return stream_state;
+    }
+
+    pub fn initWithCarrierBackendAllocatorAndLimits(
+        allocator: std.mem.Allocator,
+        role: tls_state.Role,
+        crypto_provider: provider.CryptoProvider,
+        cipher_suite: algorithms.CipherSuite,
+        carrier: Carrier,
+        backend: RecordHandshakeBackend,
+        limits: BufferLimits,
+    ) Error!PureZigRecordStream {
+        std.debug.assert(!carrier.owns_handle or carrier.closeFn != null);
+        var stream_state = try initWithBackendAllocatorAndLimits(allocator, role, crypto_provider, cipher_suite, backend, limits);
         stream_state.carrier = carrier;
         return stream_state;
     }

@@ -828,7 +828,7 @@ const SocketHarness = struct {
         self.client_carrier = .{ .fd = self.fds[0], .max_chunk = opts.client_chunk, .one_write_per_drive = opts.one_write_per_drive };
         self.server_carrier = .{ .fd = self.fds[1], .max_chunk = opts.server_chunk, .one_write_per_drive = opts.one_write_per_drive };
 
-        self.client = es.PureZigRecordStream.initWithCarrierAndBackend(.client, clientProvider(), suite, self.client_carrier.carrier(), self.client_engine.backend());
+        self.client = try es.PureZigRecordStream.initWithCarrierBackendAndAllocator(allocator, .client, clientProvider(), suite, self.client_carrier.carrier(), self.client_engine.backend());
         self.server = es.PureZigRecordStream.initWithCarrierAndBackend(.server, serverProvider(), suite, self.server_carrier.carrier(), self.server_engine.backend());
         self.client.setExpectedAlpn(opts.client_alpn) catch unreachable;
         return self;

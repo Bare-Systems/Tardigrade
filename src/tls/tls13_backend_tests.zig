@@ -2813,7 +2813,7 @@ test "the record stream production driver resumes async client authentication en
     // over a real socket pair.
     var client_credential = credentials.MockCredentialProvider.init(fixtureIdentity());
     client_credential.async_sign = true;
-    client_credential.pending_polls = 0;
+    client_credential.pending_polls = 2;
     var server_verifier = credentials.MockVerifier.init(.accepted);
     var client_verifier = credentials.MockVerifier.init(.accepted);
 
@@ -2824,13 +2824,33 @@ test "the record stream production driver resumes async client authentication en
     h.client_engine.setLocalCredentialProvider(client_credential.provider());
     h.server_engine.requestClientAuthentication(.required, server_verifier.verifier());
 
+    while (!h.client_engine.authPending()) {
+        const c = try h.driveClient();
+        const s = try h.driveServer();
+        if (!c.made_progress and !s.made_progress) return error.Stalled;
+    }
+    try std.testing.expectEqual(@as(usize, 0), client_credential.poll_count);
+
+    _ = try h.driveClient();
+    try std.testing.expect(h.client_engine.authPending());
+    try std.testing.expectEqual(@as(usize, 1), client_credential.poll_count);
+
+    _ = try h.driveClient();
+    try std.testing.expect(h.client_engine.authPending());
+    try std.testing.expectEqual(@as(usize, 2), client_credential.poll_count);
+
+    const completion_poll = try h.driveClient();
+    try std.testing.expect(completion_poll.made_progress);
+    try std.testing.expect(!h.client_engine.authPending());
     try h.driveUntil(SocketHarness.bothComplete);
     try std.testing.expect(h.client.bridge.handshake_complete);
     try std.testing.expect(h.server.bridge.handshake_complete);
     // The async signature was polled to completion through the driver, and the
     // server verified the client certificate.
     try std.testing.expectEqual(@as(usize, 1), client_credential.sign_count);
+    try std.testing.expectEqual(@as(usize, 3), client_credential.poll_count);
     try std.testing.expectEqual(@as(usize, 1), client_credential.op_release_count);
+    try std.testing.expectEqual(@as(usize, 0), client_credential.cancel_count);
     try std.testing.expectEqual(@as(usize, 1), server_verifier.verify_count);
     try std.testing.expect(h.client_engine.credentialFailure() == null);
     try std.testing.expect(h.server_engine.credentialFailure() == null);

@@ -6204,6 +6204,95 @@ test "invalid reload leaves the previous config active (#170)" {
     try assertContains(status.body, "\"ok\":false");
 }
 
+test "invalid TLS buffer reload keeps previous config limits active (#355)" {
+    const allocator = std.testing.allocator;
+    const defaults = tls_core.encrypted_stream.BufferLimits.defaults();
+    const custom_high = defaults.outbound_ciphertext.low + 1;
+
+    const valid_config = try std.fmt.allocPrint(allocator,
+        \\location /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\tls_outbound_ciphertext_low_watermark_bytes {d};
+        \\tls_outbound_ciphertext_high_watermark_bytes {d};
+        \\tls_outbound_ciphertext_hard_limit_bytes {d};
+    , .{
+        defaults.outbound_ciphertext.low,
+        custom_high,
+        defaults.outbound_ciphertext.hard,
+    });
+    defer allocator.free(valid_config);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = valid_config,
+        .ready_path = "/healthz",
+    });
+    defer tardigrade.stop();
+
+    const active_high_line = try std.fmt.allocPrint(allocator, "tardigrade_tls_buffer_config_limit_bytes{{queue=\"outbound_ciphertext\",limit=\"high\"}} {d}\n", .{custom_high});
+    defer allocator.free(active_high_line);
+    const rejected_high_line = try std.fmt.allocPrint(allocator, "tardigrade_tls_buffer_config_limit_bytes{{queue=\"outbound_ciphertext\",limit=\"high\"}} {d}\n", .{defaults.outbound_ciphertext.low});
+    defer allocator.free(rejected_high_line);
+    const rejected_hard_line = try std.fmt.allocPrint(allocator, "tardigrade_tls_buffer_config_limit_bytes{{queue=\"outbound_ciphertext\",limit=\"hard\"}} {d}\n", .{std.math.maxInt(usize)});
+    defer allocator.free(rejected_hard_line);
+
+    var initial_metrics = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/status/metrics", .body = null, .headers = &.{} });
+    defer initial_metrics.deinit();
+    try std.testing.expectEqual(@as(u16, 200), initial_metrics.status_code);
+    try assertContains(initial_metrics.body, active_high_line);
+
+    const invalid_configs = [_][]const u8{
+        \\location /healthz {
+        \\    return 200 alive;
+        \\}
+        \\tls_outbound_ciphertext_high_watermark_bytes not-a-number;
+        ,
+        try std.fmt.allocPrint(allocator,
+            \\location /healthz {{
+            \\    return 200 alive;
+            \\}}
+            \\tls_outbound_ciphertext_low_watermark_bytes {d};
+            \\tls_outbound_ciphertext_high_watermark_bytes {d};
+            \\tls_outbound_ciphertext_hard_limit_bytes {d};
+        , .{
+            defaults.outbound_ciphertext.low,
+            defaults.outbound_ciphertext.low,
+            defaults.outbound_ciphertext.hard,
+        }),
+        try std.fmt.allocPrint(allocator,
+            \\location /healthz {{
+            \\    return 200 alive;
+            \\}}
+            \\tls_outbound_ciphertext_low_watermark_bytes 1;
+            \\tls_outbound_ciphertext_high_watermark_bytes 2;
+            \\tls_outbound_ciphertext_hard_limit_bytes {d};
+        , .{std.math.maxInt(usize)}),
+    };
+    defer allocator.free(invalid_configs[1]);
+    defer allocator.free(invalid_configs[2]);
+
+    for (invalid_configs, 1..) |invalid_config, expected_failures| {
+        try tardigrade.rewriteConfig(invalid_config);
+        tardigrade.sendSignal(std.posix.SIG.HUP);
+        try waitForMetricAtLeast(allocator, tardigrade.port, "tardigrade_reload_failure_total", expected_failures, 3_000);
+
+        var status = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/tardigrade/reload/status", .body = null, .headers = &.{} });
+        defer status.deinit();
+        try assertContains(status.body, "\"ok\":false");
+
+        var health = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/healthz", .body = null, .headers = &.{} });
+        defer health.deinit();
+        try std.testing.expectEqual(@as(u16, 200), health.status_code);
+        try assertContains(health.body, "alive");
+
+        var metrics = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/status/metrics", .body = null, .headers = &.{} });
+        defer metrics.deinit();
+        try assertContains(metrics.body, active_high_line);
+        try std.testing.expect(std.mem.find(u8, metrics.body, rejected_high_line) == null);
+        try std.testing.expect(std.mem.find(u8, metrics.body, rejected_hard_line) == null);
+    }
+}
+
 test "hot reload does not warn about restart-only store paths when they are unchanged (#191)" {
     const allocator = std.testing.allocator;
 

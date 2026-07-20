@@ -2277,18 +2277,13 @@ fn parsePidField(stdout: []const u8, field: []const u8) !std.posix.pid_t {
     return error.InvalidPidLine;
 }
 
-fn expectNoProcess(allocator: std.mem.Allocator, pid: std.posix.pid_t) !void {
-    const pid_text = try std.fmt.allocPrint(allocator, "{d}", .{pid});
-    defer allocator.free(pid_text);
-    var result = try bounded_process.run(allocator, .{
-        .argv = &.{ "ps", "-p", pid_text },
-        .stdout_limit = 4096,
-        .stderr_limit = 4096,
-        .deadline_ms = 1000,
-        .accepted_exit_codes = &.{1},
-    });
-    defer result.deinit(allocator);
-    try expectNormalExit(result, 1);
+fn expectNoProcess(pid: std.posix.pid_t) !void {
+    std.posix.kill(pid, @enumFromInt(0)) catch |err| switch (err) {
+        error.ProcessNotFound => return,
+        error.PermissionDenied => return error.TestUnexpectedResult,
+        else => return err,
+    };
+    return error.TestUnexpectedResult;
 }
 
 const ProcessTempDir = struct {
@@ -2352,8 +2347,8 @@ fn deleteRecordedPidFiles(tmp_path: []const u8) void {
 fn expectRecordedProcessesGone(allocator: std.mem.Allocator, tmp_path: []const u8) !void {
     const parent_pid = try readRecordedPid(allocator, tmp_path, "parent.pid");
     const grandchild_pid = try readRecordedPid(allocator, tmp_path, "grandchild.pid");
-    if (parent_pid) |pid| try expectNoProcess(allocator, pid);
-    if (grandchild_pid) |pid| try expectNoProcess(allocator, pid);
+    if (parent_pid) |pid| try expectNoProcess(pid);
+    if (grandchild_pid) |pid| try expectNoProcess(pid);
 }
 
 test "pki reduce: bounded process captures successful output" {
@@ -2405,7 +2400,7 @@ test "pki reduce: bounded process timeout kills and reaps child" {
     defer result.deinit(testing.allocator);
     try expectOutcomeTag(result, .timeout);
     const pid = try parseHelperPid(result.stdout);
-    try expectNoProcess(testing.allocator, pid);
+    try expectNoProcess(pid);
     try expectDirEmptyPath(tmp.rel_path);
 }
 
@@ -2418,7 +2413,7 @@ test "pki reduce: bounded process deadline covers wait after pipe EOF" {
     });
     defer result.deinit(testing.allocator);
     try expectOutcomeTag(result, .timeout);
-    try expectNoProcess(testing.allocator, try parseHelperPid(result.stdout));
+    try expectNoProcess(try parseHelperPid(result.stdout));
 }
 
 test "pki reduce: bounded process timeout terminates process group" {
@@ -2432,8 +2427,8 @@ test "pki reduce: bounded process timeout terminates process group" {
     });
     defer result.deinit(testing.allocator);
     try expectOutcomeTag(result, .timeout);
-    try expectNoProcess(testing.allocator, try parsePidField(result.stdout, "pid"));
-    try expectNoProcess(testing.allocator, try parsePidField(result.stdout, "grandchild_pid"));
+    try expectNoProcess(try parsePidField(result.stdout, "pid"));
+    try expectNoProcess(try parsePidField(result.stdout, "grandchild_pid"));
     try expectDirEmptyPath(tmp.rel_path);
 }
 

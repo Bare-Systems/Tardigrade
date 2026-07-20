@@ -284,6 +284,7 @@ pub const ManagedConnection = struct {
     transport: DownstreamTransport,
     phase: ConnectionPhase,
     interest: event_loop.Interest,
+    active_work_queued: bool = false,
     lifecycle: Lifecycle = .{},
 
     pub fn init(transport: DownstreamTransport, phase: ConnectionPhase) ManagedConnection {
@@ -411,6 +412,7 @@ pub const ActiveRegistry = struct {
 
         if (self.map.contains(conn.fd)) return error.DuplicateConnection;
         try self.map.ensureUnusedCapacity(1);
+        conn.active_work_queued = false;
         self.map.putAssumeCapacity(conn.fd, conn.*);
         conn.* = undefined;
     }
@@ -432,6 +434,15 @@ pub const ActiveRegistry = struct {
         const interest = conn.interest;
         try self.insert(conn);
         return interest;
+    }
+
+    pub fn reserveWork(self: *ActiveRegistry, fd: std.posix.fd_t) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const conn = self.map.getPtr(fd) orelse return false;
+        if (conn.active_work_queued) return false;
+        conn.active_work_queued = true;
+        return true;
     }
 
     pub fn close(self: *ActiveRegistry, fd: std.posix.fd_t) bool {
@@ -476,6 +487,7 @@ pub const ActiveRegistry = struct {
             var expired_fd: ?std.posix.fd_t = null;
             var it = self.map.iterator();
             while (it.next()) |entry| {
+                if (entry.value_ptr.active_work_queued) continue;
                 if (!entry.value_ptr.expired(now_ms)) continue;
                 expired_fd = entry.key_ptr.*;
                 break;
@@ -497,9 +509,11 @@ pub const ActiveRegistry = struct {
         while (it.next()) |entry| {
             if (out_len >= out.len) break;
             if (entry.value_ptr.expired(now_ms)) continue;
+            if (entry.value_ptr.active_work_queued) continue;
             const due = entry.value_ptr.lifecycle.drive_poll_due_ms;
             if (due == 0 or now_ms < due) continue;
             entry.value_ptr.lifecycle.drive_poll_due_ms = 0;
+            entry.value_ptr.active_work_queued = true;
             out[out_len] = entry.key_ptr.*;
             out_len += 1;
         }
@@ -695,10 +709,35 @@ test "active registry returns due drive polls exactly once without extending dea
     try std.testing.expectEqual(@as(usize, 1), registry.dueDrivePollFds(10, out[0..]));
     try std.testing.expectEqual(@as(std.posix.fd_t, -1), out[0]);
     try std.testing.expectEqual(@as(usize, 0), registry.dueDrivePollFds(10, out[0..]));
+    var expired: [1]ManagedConnection = undefined;
+    try std.testing.expectEqual(@as(usize, 0), registry.reapExpired(101, expired[0..]));
 
     var checked_out = registry.checkout(-1) orelse return error.TestExpectedConnection;
     defer checked_out.deinit();
     try std.testing.expectEqual(@as(u64, 100), checked_out.phase.native_handshake.deadline_ms);
+    try std.testing.expect(checked_out.expired(101));
+}
+
+test "active registry reserves socket-ready work and skips duplicate queueing" {
+    var registry = ActiveRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+
+    var managed = ManagedConnection.init(
+        .{ .plaintext = -1 },
+        .{ .native_handshake = .{ .deadline_ms = 10 } },
+    );
+    try registry.insert(&managed);
+
+    try std.testing.expect(registry.reserveWork(-1));
+    try std.testing.expect(!registry.reserveWork(-1));
+    try std.testing.expect(!registry.reserveWork(-2));
+
+    var expired: [1]ManagedConnection = undefined;
+    try std.testing.expectEqual(@as(usize, 0), registry.reapExpired(11, expired[0..]));
+
+    var checked_out = registry.checkout(-1) orelse return error.TestExpectedConnection;
+    defer checked_out.deinit();
+    try std.testing.expect(checked_out.expired(11));
 }
 
 test "managed connection preserves protocol write interest for plaintext wait-write" {

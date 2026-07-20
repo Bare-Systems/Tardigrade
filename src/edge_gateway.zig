@@ -652,7 +652,8 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
             const ev = ready_events[i];
             if (active.contains(ev.fd)) {
                 event_loop.remove(ev.fd) catch {};
-                worker_pool.submit(ev.fd) catch |err| {
+                if (!active.reserveWork(ev.fd)) continue;
+                worker_pool.submitActiveSocketReady(ev.fd) catch |err| {
                     state.logger.warn(null, "active connection worker submit failed: {}", .{err});
                     if (active.checkout(ev.fd)) |taken| {
                         var conn = taken;
@@ -670,7 +671,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
                 // request and re-parks or closes. The connection slot acquired
                 // at accept stays held across the park/resume cycle.
                 event_loop.removeReadFd(ev.fd) catch {};
-                worker_pool.submit(ev.fd) catch {
+                worker_pool.submitParkedReady(ev.fd) catch {
                     if (parked.checkout(ev.fd)) |pc| parked.closeSlot(pc, .@"error");
                 };
             }
@@ -785,24 +786,27 @@ fn workerQueueWaitCallback(raw_ctx: *anyopaque, wait_ns: i64) void {
     state.metricsRecordWorkerQueueWaitNs(wait_ns);
 }
 
-fn handleAcceptedClient(raw_ctx: *anyopaque, client_fd: std.posix.fd_t) void {
+fn handleAcceptedClient(raw_ctx: *anyopaque, item: http.worker_pool.WorkItem) void {
     const ctx: *WorkerContext = @ptrCast(@alignCast(raw_ctx));
 
-    if (ctx.active.checkout(client_fd)) |taken| {
-        var conn = taken;
-        advanceActiveConnection(ctx, &conn);
-        return;
+    switch (item) {
+        .accepted => |client_fd| startNewConnection(ctx, client_fd),
+        .parked_ready => |fd| {
+            // Resume path (#138): the event loop dispatched a parked keepalive
+            // connection that became readable. Its session, TLS state, and
+            // connection slot are already owned by the parked registry.
+            if (ctx.parked.checkout(fd)) |pc| resumeParkedConnection(ctx, pc);
+        },
+        .active_socket_ready, .active_drive_poll => |fd| {
+            var conn = ctx.active.checkout(fd) orelse return;
+            if (conn.expired(http.event_loop.monotonicMs())) {
+                ctx.state.logger.debug(null, "active native downstream connection deadline expired before worker dispatch fd={d}", .{fd});
+                conn.deinit();
+                return;
+            }
+            advanceActiveConnection(ctx, &conn);
+        },
     }
-
-    // Resume path (#138): the event loop dispatched a parked keepalive
-    // connection that became readable. Its session, TLS state, and connection
-    // slot are already established and owned by the parked registry.
-    if (ctx.parked.checkout(client_fd)) |pc| {
-        resumeParkedConnection(ctx, pc);
-        return;
-    }
-
-    startNewConnection(ctx, client_fd);
 }
 
 /// Outcome of serving one request on a keepalive HTTP/1.1 connection.
@@ -1270,7 +1274,7 @@ fn dispatchDueActiveDrivePolls(
         if (count == 0) break;
         for (fds[0..count]) |fd| {
             event_loop.remove(fd) catch {};
-            worker_pool.submit(fd) catch |err| {
+            worker_pool.submitActiveDrivePoll(fd) catch |err| {
                 state.logger.warn(null, "active connection drive-poll submit failed: {}", .{err});
                 if (active.checkout(fd)) |taken| {
                     var conn = taken;

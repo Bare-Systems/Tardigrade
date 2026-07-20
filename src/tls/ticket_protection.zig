@@ -19,6 +19,7 @@ pub const fixed_header_len = 36;
 pub const tag_len = provider.aead_tag_len;
 pub const envelope_overhead = fixed_header_len + tag_len;
 pub const max_keys = 16;
+pub const max_lease_history = max_keys * 4;
 
 const aad_prefix = "tardigrade/tls-ticket/v1\x00";
 
@@ -327,10 +328,13 @@ pub const Snapshot = struct {
         for (configs, 0..) |config, i| {
             for (configs[0..i]) |prior| {
                 if (std.mem.eql(u8, &prior.id, &config.id)) return error.DuplicateKeyId;
+                if (prior.aead == config.aead and std.mem.eql(u8, prior.key_bytes, config.key_bytes))
+                    return error.DuplicateKeyId;
             }
             keys[i] = try KeyRecord.build(config, caps);
             initialized += 1;
         }
+        try validateEncryptionWindows(keys);
 
         snapshot.keys = keys;
         return snapshot;
@@ -388,6 +392,24 @@ const LeaseHighWater = struct {
     key_id: KeyId,
     prefix: [4]u8,
     end_exclusive: u64,
+    has_lease: bool,
+    aead: provider.Aead,
+    key: TicketKeySecret,
+
+    fn init(record: *const KeyRecord) LeaseHighWater {
+        return .{
+            .key_id = record.id,
+            .prefix = if (record.nonce_lease) |*value| value.prefix else [_]u8{0} ** 4,
+            .end_exclusive = if (record.nonce_lease) |*value| value.currentEnd() else 0,
+            .has_lease = record.nonce_lease != null,
+            .aead = record.aead,
+            .key = record.key.copy(),
+        };
+    }
+
+    fn deinit(self: *LeaseHighWater) void {
+        self.key.deinit();
+    }
 };
 
 pub const ReloadableKeyRing = struct {
@@ -395,7 +417,7 @@ pub const ReloadableKeyRing = struct {
     mutex: SpinMutex = .{},
     current: ?*Snapshot = null,
     next_generation: u64 = 1,
-    ledger: [max_keys]LeaseHighWater = undefined,
+    ledger: [max_lease_history]LeaseHighWater = undefined,
     ledger_len: usize = 0,
     observer: ?Observer = null,
 
@@ -407,9 +429,11 @@ pub const ReloadableKeyRing = struct {
         self.mutex.lock();
         const retired = self.current;
         self.current = null;
+        const ledger_len = self.ledger_len;
         self.ledger_len = 0;
         self.mutex.unlock();
         if (retired) |snapshot| snapshot.release();
+        for (self.ledger[0..ledger_len]) |*entry| entry.deinit();
     }
 
     pub fn buildSnapshot(self: *ReloadableKeyRing, configs: []const KeyConfig, caps: provider.Capabilities) SnapshotError!*Snapshot {
@@ -461,7 +485,7 @@ pub const ReloadableKeyRing = struct {
         const retired = self.current;
         self.current = replacement;
         self.next_generation = @max(self.next_generation, replacement.generation + 1);
-        self.rebuildLedgerLocked();
+        self.updateLedgerLocked(replacement);
         self.mutex.unlock();
 
         self.record(.{ .snapshot_installed = replacement.generation });
@@ -481,6 +505,19 @@ pub const ReloadableKeyRing = struct {
 
     fn validateReplacementLocked(self: *ReloadableKeyRing, replacement: *Snapshot) SnapshotError!void {
         for (replacement.keys, 0..) |*key, i| {
+            for (replacement.keys[0..i]) |*prior| {
+                if (prior.aead == key.aead and prior.key.eql(&key.key)) return error.DuplicateKeyId;
+            }
+
+            if (self.findLedger(&key.id)) |entry| {
+                if (entry.aead != key.aead or !entry.key.eql(&key.key)) return error.DuplicateKeyId;
+            } else {
+                for (self.ledger[0..self.ledger_len]) |*entry| {
+                    if (entry.aead == key.aead and entry.key.eql(&key.key)) return error.DuplicateKeyId;
+                }
+                if (self.ledger_len >= self.ledger.len) return error.TooManyKeys;
+            }
+
             if (key.nonce_lease) |*lease| {
                 for (replacement.keys[0..i]) |*prior| {
                     if (!std.mem.eql(u8, &prior.id, &key.id)) continue;
@@ -491,8 +528,10 @@ pub const ReloadableKeyRing = struct {
                     }
                 }
                 if (self.findLedger(&key.id)) |entry| {
-                    if (!std.mem.eql(u8, &entry.prefix, &lease.prefix)) return error.OverlappingNonceLease;
-                    if (lease.next_counter.load(.acquire) < entry.end_exclusive) return error.OverlappingNonceLease;
+                    if (entry.has_lease) {
+                        if (!std.mem.eql(u8, &entry.prefix, &lease.prefix)) return error.OverlappingNonceLease;
+                        if (lease.next_counter.load(.acquire) < entry.end_exclusive) return error.OverlappingNonceLease;
+                    }
                 }
             }
 
@@ -504,26 +543,23 @@ pub const ReloadableKeyRing = struct {
         }
     }
 
-    fn rebuildLedgerLocked(self: *ReloadableKeyRing) void {
-        self.ledger_len = 0;
-        const snapshot = self.current orelse return;
+    fn updateLedgerLocked(self: *ReloadableKeyRing, snapshot: *Snapshot) void {
         for (snapshot.keys) |*key| {
-            const lease = if (key.nonce_lease) |*lease| lease else continue;
             if (self.findLedgerIndex(&key.id)) |idx| {
-                self.ledger[idx].end_exclusive = @max(self.ledger[idx].end_exclusive, lease.currentEnd());
+                if (key.nonce_lease) |*lease| {
+                    self.ledger[idx].has_lease = true;
+                    self.ledger[idx].prefix = lease.prefix;
+                    self.ledger[idx].end_exclusive = @max(self.ledger[idx].end_exclusive, lease.currentEnd());
+                }
             } else if (self.ledger_len < self.ledger.len) {
-                self.ledger[self.ledger_len] = .{
-                    .key_id = key.id,
-                    .prefix = lease.prefix,
-                    .end_exclusive = lease.currentEnd(),
-                };
+                self.ledger[self.ledger_len] = LeaseHighWater.init(key);
                 self.ledger_len += 1;
             }
         }
     }
 
-    fn findLedger(self: *const ReloadableKeyRing, key_id: *const KeyId) ?LeaseHighWater {
-        if (self.findLedgerIndex(key_id)) |idx| return self.ledger[idx];
+    fn findLedger(self: *const ReloadableKeyRing, key_id: *const KeyId) ?*const LeaseHighWater {
+        if (self.findLedgerIndex(key_id)) |idx| return &self.ledger[idx];
         return null;
     }
 
@@ -538,6 +574,18 @@ pub const ReloadableKeyRing = struct {
         if (self.observer) |observer| observer.record(event);
     }
 };
+
+fn validateEncryptionWindows(keys: []const KeyRecord) SnapshotError!void {
+    for (keys, 0..) |*a, i| {
+        if (a.nonce_lease == null) continue;
+        for (keys[i + 1 ..]) |*b| {
+            if (b.nonce_lease == null) continue;
+            if (a.not_before_unix_ms < b.encrypt_until_unix_ms and
+                b.not_before_unix_ms < a.encrypt_until_unix_ms)
+                return error.AmbiguousEncryptionWindow;
+        }
+    }
+}
 
 pub const Protector = struct {
     provider: provider.CryptoProvider,
@@ -638,6 +686,7 @@ pub const Protector = struct {
         now_unix_ms: i64,
         out: *session.ServerRecoverableState,
     ) ResolveError!bool {
+        self.limits.validate() catch return error.InvalidInternalState;
         const parsed = parseEnvelope(identity, self.limits) catch |err| {
             self.record(.{ .resolve_rejected = parseReason(err) });
             return false;
@@ -687,9 +736,13 @@ pub const Protector = struct {
             error.InvalidInput => return error.InvalidInternalState,
         };
 
-        var decoded = session.decode(allocator, self.limits, plaintext) catch {
-            self.record(.{ .resolve_rejected = .invalid_plaintext });
-            return false;
+        var decoded = session.decode(allocator, self.limits, plaintext) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvalidLimits => return error.InvalidInternalState,
+            else => {
+                self.record(.{ .resolve_rejected = .invalid_plaintext });
+                return false;
+            },
         };
         defer decoded.deinit();
 
@@ -842,17 +895,36 @@ fn keyId(byte: u8) KeyId {
 }
 
 fn sampleKeyConfig(id: KeyId, aead: provider.Aead, lease: ?NonceLeaseConfig) KeyConfig {
+    return sampleKeyConfigWithByte(id, aead, lease, switch (aead) {
+        .aes_128_gcm => 0x11,
+        .aes_256_gcm, .chacha20_poly1305 => 0x22,
+    });
+}
+
+fn sampleKeyConfigWithByte(id: KeyId, aead: provider.Aead, lease: ?NonceLeaseConfig, byte: u8) KeyConfig {
     return .{
         .id = id,
         .aead = aead,
-        .key_bytes = switch (aead) {
-            .aes_128_gcm => &([_]u8{0x11} ** 16),
-            .aes_256_gcm, .chacha20_poly1305 => &([_]u8{0x22} ** 32),
-        },
+        .key_bytes = testKeyBytes(aead, byte),
         .not_before_unix_ms = 1_000,
         .encrypt_until_unix_ms = 5_000,
         .decrypt_until_unix_ms = 20_000,
         .nonce_lease = lease,
+    };
+}
+
+fn testKeyBytes(aead: provider.Aead, byte: u8) []const u8 {
+    return switch (aead) {
+        .aes_128_gcm => switch (byte) {
+            0x10 => &([_]u8{0x10} ** 16),
+            0x11 => &([_]u8{0x11} ** 16),
+            0x13 => &([_]u8{0x13} ** 16),
+            else => &([_]u8{0x22} ** 16),
+        },
+        .aes_256_gcm, .chacha20_poly1305 => switch (byte) {
+            0x22 => &([_]u8{0x22} ** 32),
+            else => &([_]u8{0x33} ** 32),
+        },
     };
 }
 
@@ -867,9 +939,10 @@ fn sampleServerState(allocator: std.mem.Allocator) !session.ServerRecoverableSta
         .issued_at_unix_ms = 1_000,
         .lifetime_seconds = 10,
         .early_data = .resume_only,
+        .transport_compat = .{ .format_id = 1, .format_version = 1, .bytes = "transport" },
     });
     var state: session.ServerRecoverableState = .{};
-    state.init(&common);
+    state.init(&common, 0x11223344);
     return state;
 }
 
@@ -939,6 +1012,7 @@ test "seal and resolve round trip and authenticate header fields" {
     var recovered: session.ServerRecoverableState = .{};
     defer recovered.deinit();
     try testing.expect(try protector.resolve(allocator, ticket, 2_000, &recovered));
+    try testing.expectEqual(state.ticket_age_add, recovered.ticket_age_add);
     try testing.expectEqual(state.common.lifetime_seconds, recovered.common.lifetime_seconds);
     try testing.expectEqualSlices(u8, state.common.resumption_psk.slice(), recovered.common.resumption_psk.slice());
 
@@ -979,6 +1053,89 @@ test "replacement snapshot rejects overlapping nonce lease and accepts adjacent 
 
     const changed_prefix = sampleKeyConfig(keyId(3), .aes_128_gcm, .{ .prefix = .{ 2, 1, 1, 1 }, .start = 20, .end_exclusive = 30 });
     try testing.expectError(error.OverlappingNonceLease, keyring.install(try keyring.buildSnapshot(&.{changed_prefix}, testCapabilities())));
+}
+
+test "ambiguous encryption windows are rejected before publication" {
+    const adjacent_a = sampleKeyConfigWithByte(keyId(10), .aes_128_gcm, .{ .prefix = .{ 1, 0, 0, 0 }, .start = 0, .end_exclusive = 10 }, 0x10);
+    var adjacent_b = sampleKeyConfigWithByte(keyId(11), .aes_128_gcm, .{ .prefix = .{ 2, 0, 0, 0 }, .start = 0, .end_exclusive = 10 }, 0x11);
+    adjacent_b.not_before_unix_ms = adjacent_a.encrypt_until_unix_ms;
+    adjacent_b.encrypt_until_unix_ms = 8_000;
+    var snap = try Snapshot.build(testing.allocator, &.{ adjacent_a, adjacent_b }, 1, testCapabilities());
+    snap.release();
+
+    var overlap = adjacent_b;
+    overlap.not_before_unix_ms = adjacent_a.encrypt_until_unix_ms - 1;
+    try testing.expectError(error.AmbiguousEncryptionWindow, Snapshot.build(testing.allocator, &.{ adjacent_a, overlap }, 2, testCapabilities()));
+
+    var future_overlap = adjacent_b;
+    future_overlap.not_before_unix_ms = 4_000;
+    future_overlap.encrypt_until_unix_ms = 9_000;
+    try testing.expectError(error.AmbiguousEncryptionWindow, Snapshot.build(testing.allocator, &.{ adjacent_a, future_overlap }, 3, testCapabilities()));
+}
+
+test "nonce ledger persists through decrypt-only and removed snapshots" {
+    const allocator = testing.allocator;
+    var keyring = ReloadableKeyRing.init(allocator);
+    defer keyring.deinit();
+
+    const active = sampleKeyConfig(keyId(12), .aes_128_gcm, .{ .prefix = .{ 5, 5, 5, 5 }, .start = 0, .end_exclusive = 10 });
+    try keyring.install(try keyring.buildSnapshot(&.{active}, testCapabilities()));
+
+    var decrypt_only = active;
+    decrypt_only.nonce_lease = null;
+    decrypt_only.encrypt_until_unix_ms = 1_500;
+    decrypt_only.decrypt_until_unix_ms = 20_000;
+    try keyring.install(try keyring.buildSnapshot(&.{decrypt_only}, testCapabilities()));
+
+    const rollback = sampleKeyConfig(keyId(12), .aes_128_gcm, .{ .prefix = .{ 5, 5, 5, 5 }, .start = 0, .end_exclusive = 10 });
+    try testing.expectError(error.OverlappingNonceLease, keyring.install(try keyring.buildSnapshot(&.{rollback}, testCapabilities())));
+
+    const adjacent = sampleKeyConfig(keyId(12), .aes_128_gcm, .{ .prefix = .{ 5, 5, 5, 5 }, .start = 10, .end_exclusive = 20 });
+    try keyring.install(try keyring.buildSnapshot(&.{adjacent}, testCapabilities()));
+
+    const other = sampleKeyConfigWithByte(keyId(13), .aes_128_gcm, .{ .prefix = .{ 6, 6, 6, 6 }, .start = 0, .end_exclusive = 10 }, 0x13);
+    try keyring.install(try keyring.buildSnapshot(&.{other}, testCapabilities()));
+
+    const reintroduced = sampleKeyConfig(keyId(12), .aes_128_gcm, .{ .prefix = .{ 5, 5, 5, 5 }, .start = 0, .end_exclusive = 10 });
+    try testing.expectError(error.OverlappingNonceLease, keyring.install(try keyring.buildSnapshot(&.{reintroduced}, testCapabilities())));
+}
+
+test "nonce ledger rejects same key under a different id" {
+    const allocator = testing.allocator;
+    var keyring = ReloadableKeyRing.init(allocator);
+    defer keyring.deinit();
+    const first = sampleKeyConfig(keyId(14), .aes_128_gcm, .{ .prefix = .{ 7, 7, 7, 7 }, .start = 0, .end_exclusive = 10 });
+    try keyring.install(try keyring.buildSnapshot(&.{first}, testCapabilities()));
+
+    const changed_id = sampleKeyConfig(keyId(15), .aes_128_gcm, .{ .prefix = .{ 8, 8, 8, 8 }, .start = 0, .end_exclusive = 10 });
+    try testing.expectError(error.DuplicateKeyId, keyring.install(try keyring.buildSnapshot(&.{changed_id}, testCapabilities())));
+}
+
+test "resolve treats invalid limits and decode allocation failure as local errors" {
+    const allocator = testing.allocator;
+    var keyring = ReloadableKeyRing.init(allocator);
+    defer keyring.deinit();
+    const config = sampleKeyConfig(keyId(16), .aes_128_gcm, .{ .prefix = .{ 9, 9, 9, 9 }, .start = 0, .end_exclusive = 3 });
+    try keyring.install(try keyring.buildSnapshot(&.{config}, testCapabilities()));
+
+    var state = try sampleServerState(allocator);
+    defer state.deinit();
+    var protector = Protector{ .provider = testProvider(), .keyring = &keyring, .limits = session.Limits.default };
+    var ticket_buf = [_]u8{0} ** 512;
+    const ticket = try protector.seal(allocator, &state, 2_000, &ticket_buf);
+
+    var invalid_limits = session.Limits.default;
+    invalid_limits.max_fields = 0;
+    protector.limits = invalid_limits;
+    var out: session.ServerRecoverableState = .{};
+    defer out.deinit();
+    try testing.expectError(error.InvalidInternalState, protector.resolve(allocator, ticket, 2_000, &out));
+
+    protector.limits = session.Limits.default;
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 1 });
+    try testing.expectError(error.OutOfMemory, protector.resolve(failing.allocator(), ticket, 2_000, &out));
+    try testing.expectEqual(@as(u32, 0), out.ticket_age_add);
+    try testing.expectEqual(@as(usize, 0), out.common.resumption_psk.len);
 }
 
 test "key windows and ticket lifetime are enforced" {

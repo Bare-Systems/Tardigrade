@@ -2724,9 +2724,10 @@ test "secret-bearing types expose no ordinary formatting path" {
 // auth_binding = SHA-256("leaf-der-bytes"), issued_at_unix_ms 1_000_000,
 // lifetime_seconds 3600, early_data_capable(16384), transport_compat
 // {format_id=1, format_version=1, "quic-params"}, application_compat
-// {format_id=2, format_version=1, "h3-settings"}) plus, for the client
-// record, ticket "opaque-ticket-bytes", ticket_age_add 12345, ticket_nonce
-// "nonce", received_at_unix_ms 1_500_000 — all under `Limits.default`.
+// {format_id=2, format_version=1, "h3-settings"}) plus, for the server
+// record, ticket_age_add 0, and for the client record, ticket
+// "opaque-ticket-bytes", ticket_age_add 12345, ticket_nonce "nonce",
+// received_at_unix_ms 1_500_000 — all under `Limits.default`.
 // Every known field id (including both compatibility snapshots and a
 // non-default early-data policy) is present so the duplicate/missing-field
 // matrix below can exercise all of them. Pinned as literal bytes — not

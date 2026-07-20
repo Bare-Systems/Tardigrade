@@ -2294,6 +2294,57 @@ test "openssl encrypted stream records pending plaintext peak before first snaps
     try std.testing.expect(snapshot.limits == null);
 }
 
+test "openssl TLS metrics export measurable pending and retry state then release" {
+    const allocator = std.testing.allocator;
+    var metrics = metrics_mod.Metrics.init();
+    var metrics_mutex = compat.Mutex{};
+
+    var pair = try makeTestTlsPair(allocator);
+    pair.server.attachBufferMetrics(&metrics, &metrics_mutex);
+    const stream = pair.server.stream();
+
+    try clientWriteAll(pair.client_ssl, "client-payload");
+    var scratch: [6]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 6), try stream.read(&scratch));
+    try std.testing.expectEqualStrings("client", &scratch);
+
+    {
+        const prom = try metrics.toPrometheus(allocator);
+        defer allocator.free(prom);
+        try std.testing.expect(std.mem.find(u8, prom, "tardigrade_tls_buffered_bytes_current{backend=\"openssl\",queue=\"inbound_plaintext\"} 8\n") != null);
+    }
+
+    var rest: [16]u8 = undefined;
+    const rest_len = try stream.read(&rest);
+    try std.testing.expectEqualStrings("-payload", rest[0..rest_len]);
+
+    {
+        const prom = try metrics.toPrometheus(allocator);
+        defer allocator.free(prom);
+        try std.testing.expect(std.mem.find(u8, prom, "tardigrade_tls_buffered_bytes_current{backend=\"openssl\",queue=\"inbound_plaintext\"} 0\n") != null);
+    }
+
+    var blocked: ForcedWriteBlock = .{};
+    defer blocked.deinit(allocator);
+    try forceOpenSslWriteBackpressure(allocator, &pair, stream, &blocked);
+    _ = try stream.drive();
+
+    {
+        const prom = try metrics.toPrometheus(allocator);
+        defer allocator.free(prom);
+        try std.testing.expect(std.mem.find(u8, prom, "tardigrade_tls_buffer_pause_events_total{backend=\"openssl\",direction=\"plaintext_write\"} 1\n") != null);
+        try std.testing.expect(std.mem.find(u8, prom, "tardigrade_tls_buffer_stalled_drives_total{backend=\"openssl\"} 1\n") != null);
+        try std.testing.expect(std.mem.find(u8, prom, "tardigrade_tls_buffer_pause_events_total{backend=\"pure_zig_record\",direction=\"plaintext_write\"} 0\n") != null);
+    }
+
+    pair.deinit();
+    {
+        const prom = try metrics.toPrometheus(allocator);
+        defer allocator.free(prom);
+        try std.testing.expect(std.mem.find(u8, prom, "tardigrade_tls_buffered_bytes_current{backend=\"openssl\",queue=\"inbound_plaintext\"} 0\n") != null);
+    }
+}
+
 test "openssl encrypted stream preserves close requested during pending write retry" {
     const allocator = std.testing.allocator;
     var pair = try makeTestTlsPair(allocator);

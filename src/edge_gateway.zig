@@ -1353,12 +1353,13 @@ fn rearmActiveConnection(ctx: *WorkerContext, managed: *http.downstream_connecti
         },
         .socket, .retry_at_ms, .stalled => {},
     };
-    const interest = switch (managed.updateWaitFor(requested, now_ms, ACTIVE_DRIVE_POLL_INTERVAL_MS) orelse
-        http.downstream_connection.EncryptedWait{ .socket = requested }) {
-        .socket => |socket_interest| socket_interest,
-        .ready_now, .retry_at_ms, .stalled => http.event_loop.Interest{},
-    };
-    _ = ctx.active.rearm(managed) catch |err| {
+    const interest = rearmActiveConnectionInRegistryAt(
+        ctx.active,
+        managed,
+        requested,
+        now_ms,
+        ACTIVE_DRIVE_POLL_INTERVAL_MS,
+    ) catch |err| {
         ctx.state.logger.warn(null, "active connection rearm failed: {}", .{err});
         managed.deinit();
         return;
@@ -1371,6 +1372,23 @@ fn rearmActiveConnection(ctx: *WorkerContext, managed: *http.downstream_connecti
             conn.deinit();
         }
     };
+}
+
+fn rearmActiveConnectionInRegistryAt(
+    active: *http.downstream_connection.ActiveRegistry,
+    managed: *http.downstream_connection.ManagedConnection,
+    requested: http.event_loop.Interest,
+    now_ms: u64,
+    retry_interval_ms: u64,
+) !http.event_loop.Interest {
+    const wait = managed.updateWaitFor(requested, now_ms, retry_interval_ms) orelse
+        http.downstream_connection.EncryptedWait{ .socket = requested };
+    const interest = switch (wait) {
+        .socket => |socket_interest| socket_interest,
+        .ready_now, .retry_at_ms, .stalled => http.event_loop.Interest{},
+    };
+    _ = try active.rearm(managed);
+    return interest;
 }
 
 fn advanceActiveConnection(ctx: *WorkerContext, managed: *http.downstream_connection.ManagedConnection) void {
@@ -2898,15 +2916,45 @@ test "gateway active-drive scheduler polls pending native auth and expires queue
     var expired_out: [1]http.downstream_connection.ManagedConnection = undefined;
     try std.testing.expectEqual(@as(usize, 0), registry.reapExpired(1_001, expired_out[0..]));
 
-    var ready = switch (checkoutActiveForWorkerAt(&registry, pending.fd, 600)) {
-        .ready => |conn| conn,
-        .missing, .expired => return error.TestExpectedReadyActiveConnection,
-    };
-    _ = try ready.transport.native.drive();
-    try std.testing.expect(ready.transport.native.backend.authPending());
-    try std.testing.expectEqual(@as(usize, 1), pending.mock.poll_count);
-    try std.testing.expectEqual(@as(usize, 0), close_probe.closes);
-    ready.deinit();
+    const poll_times = [_]u64{ 350, 600, 850 };
+    for (poll_times, 1..) |poll_time, expected_poll_count| {
+        var ready = switch (checkoutActiveForWorkerAt(&registry, pending.fd, poll_time)) {
+            .ready => |conn| conn,
+            .missing, .expired => return error.TestExpectedReadyActiveConnection,
+        };
+        try std.testing.expectEqual(@as(u64, 1_000), ready.phase.native_handshake.deadline_ms);
+
+        const driven = try ready.transport.native.drive();
+        try std.testing.expectEqual(expected_poll_count, pending.mock.poll_count);
+        try std.testing.expectEqual(@as(u64, 1_000), ready.phase.native_handshake.deadline_ms);
+        try std.testing.expectEqual(@as(usize, 0), close_probe.closes);
+
+        if (expected_poll_count < poll_times.len) {
+            try std.testing.expect(ready.transport.native.backend.authPending());
+            const interest = try rearmActiveConnectionInRegistryAt(
+                &registry,
+                &ready,
+                .{ .read = true },
+                poll_time,
+                ACTIVE_DRIVE_POLL_INTERVAL_MS,
+            );
+            try std.testing.expectEqual(http.event_loop.Interest{}, interest);
+
+            submit_probe = .{};
+            dispatchDueActiveDrivePollsAt(&registry, &state, poll_time + ACTIVE_DRIVE_POLL_INTERVAL_MS - 1, &remove_probe, GatewaySchedulerTestRemove.remove, &submit_probe, GatewaySchedulerTestSubmit.submit);
+            try std.testing.expectEqual(@as(usize, 0), submit_probe.submitted);
+            dispatchDueActiveDrivePollsAt(&registry, &state, poll_time + ACTIVE_DRIVE_POLL_INTERVAL_MS, &remove_probe, GatewaySchedulerTestRemove.remove, &submit_probe, GatewaySchedulerTestSubmit.submit);
+            try std.testing.expectEqual(@as(usize, 1), submit_probe.submitted);
+            try std.testing.expectEqual(http.worker_pool.WorkItem{ .active_drive_poll = pending.fd }, submit_probe.item.?);
+        } else {
+            try std.testing.expect(driven.made_progress);
+            try std.testing.expect(!ready.transport.native.backend.authPending());
+            try std.testing.expectEqual(@as(usize, 3), pending.mock.poll_count);
+            try std.testing.expectEqual(@as(usize, 1), pending.mock.op_release_count);
+            try std.testing.expectEqual(@as(usize, 0), pending.mock.cancel_count);
+            ready.deinit();
+        }
+    }
 
     const expired_pending = try GatewayPendingNative.create(allocator, 5);
     defer expired_pending.deinitPeer();
@@ -2942,6 +2990,178 @@ test "gateway active-drive scheduler polls pending native auth and expires queue
     try std.testing.expectEqual(ActiveCheckoutResult.missing, checkoutActiveForWorkerAt(&registry, stale_fd, 1_001));
     try std.testing.expectEqual(@as(usize, 1), expired_probe.closes);
     _ = try gatewayTestWriteFd(stale_fd, "x");
+}
+
+const GatewayMetricStream = struct {
+    snapshot: tls_core.encrypted_stream.BufferSnapshot = .{},
+    readiness_state: tls_core.encrypted_stream.Readiness = .{ .can_write_plaintext = true },
+    read_payload: []const u8 = "",
+    read_offset: usize = 0,
+    write_count: usize = 0,
+
+    fn stream(self: *GatewayMetricStream) tls_core.encrypted_stream.EncryptedStream {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn backend(_: *anyopaque) tls_core.encrypted_stream.BackendKind {
+        return .pure_zig_record;
+    }
+
+    fn read(raw_ctx: *anyopaque, out: []u8) tls_core.encrypted_stream.Error!usize {
+        const self: *GatewayMetricStream = @ptrCast(@alignCast(raw_ctx));
+        if (self.read_offset >= self.read_payload.len) return error.WouldBlock;
+        const n = @min(out.len, self.read_payload.len - self.read_offset);
+        @memcpy(out[0..n], self.read_payload[self.read_offset..][0..n]);
+        self.read_offset += n;
+        self.snapshot.current.inbound_plaintext = self.read_payload.len - self.read_offset;
+        self.readiness_state.can_read_plaintext = self.read_offset < self.read_payload.len;
+        return n;
+    }
+
+    fn write(raw_ctx: *anyopaque, bytes: []const u8) tls_core.encrypted_stream.Error!usize {
+        const self: *GatewayMetricStream = @ptrCast(@alignCast(raw_ctx));
+        self.write_count += 1;
+        return bytes.len;
+    }
+
+    fn close(_: *anyopaque) void {}
+
+    fn readiness(raw_ctx: *anyopaque) tls_core.encrypted_stream.Readiness {
+        const self: *GatewayMetricStream = @ptrCast(@alignCast(raw_ctx));
+        return self.readiness_state;
+    }
+
+    fn drive(raw_ctx: *anyopaque) tls_core.encrypted_stream.Error!tls_core.encrypted_stream.DriveResult {
+        const self: *GatewayMetricStream = @ptrCast(@alignCast(raw_ctx));
+        return .{ .made_progress = false, .readiness = self.readiness_state };
+    }
+
+    fn bufferSnapshot(raw_ctx: *anyopaque) tls_core.encrypted_stream.BufferSnapshot {
+        const self: *GatewayMetricStream = @ptrCast(@alignCast(raw_ctx));
+        return self.snapshot;
+    }
+
+    const vtable = tls_core.encrypted_stream.EncryptedStream.VTable{
+        .backendFn = backend,
+        .readFn = read,
+        .writeFn = write,
+        .closeFn = close,
+        .readinessFn = readiness,
+        .driveFn = drive,
+        .bufferSnapshotFn = bufferSnapshot,
+    };
+};
+
+test "waiting encrypted HTTP adapter records live HTTP/1 writer TLS gauge pause resume and teardown zero (#355)" {
+    const allocator = std.testing.allocator;
+    var metrics = http.metrics.Metrics.init();
+    var metrics_mutex = compat.Mutex{};
+    var metrics_state = http.metrics.TlsBufferConnectionMetrics{};
+    var fake = GatewayMetricStream{ .snapshot = .{
+        .current = .{ .outbound_ciphertext = 9 },
+        .pause_state = .{ .plaintext_write_paused = true },
+        .counters = .{ .plaintext_write_pauses = 1 },
+        .limits_enforced = true,
+        .limits = tls_core.encrypted_stream.BufferLimits.defaults(),
+    } };
+    const inner = http.encrypted_stream_connection.EncryptedStreamHttpConnection.init(fake.stream());
+    var adapter = WaitingEncryptedHttpConnection.initWithMetrics(
+        inner,
+        1,
+        1,
+        &metrics,
+        &metrics_mutex,
+        &metrics_state,
+    );
+
+    try std.testing.expectEqual(@as(usize, 9), try adapter.write("http-body"));
+    try std.testing.expectEqual(@as(usize, 1), fake.write_count);
+    {
+        const prom = try metrics.toPrometheus(allocator);
+        defer allocator.free(prom);
+        try std.testing.expect(std.mem.find(u8, prom, "tardigrade_tls_buffered_bytes_current{backend=\"pure_zig_record\",queue=\"outbound_ciphertext\"} 9\n") != null);
+        try std.testing.expect(std.mem.find(u8, prom, "tardigrade_tls_buffer_pause_events_total{backend=\"pure_zig_record\",direction=\"plaintext_write\"} 1\n") != null);
+    }
+
+    fake.snapshot = .{
+        .current = .{},
+        .pause_state = .{},
+        .counters = .{
+            .plaintext_write_pauses = 1,
+            .plaintext_write_resumes = 1,
+        },
+        .limits_enforced = true,
+        .limits = tls_core.encrypted_stream.BufferLimits.defaults(),
+    };
+    try std.testing.expectEqual(@as(usize, 5), try adapter.write("drain"));
+    {
+        const prom = try metrics.toPrometheus(allocator);
+        defer allocator.free(prom);
+        try std.testing.expect(std.mem.find(u8, prom, "tardigrade_tls_buffered_bytes_current{backend=\"pure_zig_record\",queue=\"outbound_ciphertext\"} 0\n") != null);
+        try std.testing.expect(std.mem.find(u8, prom, "tardigrade_tls_buffer_pause_events_total{backend=\"pure_zig_record\",direction=\"plaintext_write\"} 1\n") != null);
+        try std.testing.expect(std.mem.find(u8, prom, "tardigrade_tls_buffer_resume_events_total{backend=\"pure_zig_record\",direction=\"plaintext_write\"} 1\n") != null);
+    }
+
+    metrics_mutex.lock();
+    defer metrics_mutex.unlock();
+    try metrics.releaseTlsBufferSnapshot(&metrics_state);
+}
+
+test "waiting encrypted HTTP adapter records live HTTP/2 writer TLS metrics through frame serializer (#355)" {
+    const allocator = std.testing.allocator;
+    var metrics = http.metrics.Metrics.init();
+    var metrics_mutex = compat.Mutex{};
+    var metrics_state = http.metrics.TlsBufferConnectionMetrics{};
+    var fake = GatewayMetricStream{ .snapshot = .{
+        .current = .{ .outbound_ciphertext = 13 },
+        .pause_state = .{ .plaintext_write_paused = true },
+        .counters = .{ .plaintext_write_pauses = 1 },
+        .limits_enforced = true,
+        .limits = tls_core.encrypted_stream.BufferLimits.defaults(),
+    } };
+    const inner = http.encrypted_stream_connection.EncryptedStreamHttpConnection.init(fake.stream());
+    var adapter = WaitingEncryptedHttpConnection.initWithMetrics(
+        inner,
+        1,
+        1,
+        &metrics,
+        &metrics_mutex,
+        &metrics_state,
+    );
+
+    try http.http2_frame.writeSettings(allocator, adapter.writer(), &[_][2]u32{
+        .{ 0x3, 100 },
+        .{ 0x4, 1024 },
+    });
+    try std.testing.expect(fake.write_count > 0);
+    {
+        const prom = try metrics.toPrometheus(allocator);
+        defer allocator.free(prom);
+        try std.testing.expect(std.mem.find(u8, prom, "tardigrade_tls_buffered_bytes_current{backend=\"pure_zig_record\",queue=\"outbound_ciphertext\"} 13\n") != null);
+        try std.testing.expect(std.mem.find(u8, prom, "tardigrade_tls_buffer_pause_events_total{backend=\"pure_zig_record\",direction=\"plaintext_write\"} 1\n") != null);
+    }
+
+    fake.snapshot = .{
+        .current = .{},
+        .pause_state = .{},
+        .counters = .{
+            .plaintext_write_pauses = 1,
+            .plaintext_write_resumes = 1,
+        },
+        .limits_enforced = true,
+        .limits = tls_core.encrypted_stream.BufferLimits.defaults(),
+    };
+    try http.http2_frame.writeSettingsAck(adapter.writer());
+    {
+        const prom = try metrics.toPrometheus(allocator);
+        defer allocator.free(prom);
+        try std.testing.expect(std.mem.find(u8, prom, "tardigrade_tls_buffered_bytes_current{backend=\"pure_zig_record\",queue=\"outbound_ciphertext\"} 0\n") != null);
+        try std.testing.expect(std.mem.find(u8, prom, "tardigrade_tls_buffer_resume_events_total{backend=\"pure_zig_record\",direction=\"plaintext_write\"} 1\n") != null);
+    }
+
+    metrics_mutex.lock();
+    defer metrics_mutex.unlock();
+    try metrics.releaseTlsBufferSnapshot(&metrics_state);
 }
 
 fn gatewayTestSocketPair() ![2]std.posix.fd_t {

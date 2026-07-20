@@ -19,6 +19,7 @@ const http_request = @import("http_request");
 const record_codec = tls_core.record_codec;
 const events = tls_core.events;
 const credentials = tls_core.credentials;
+const session = tls_core.session;
 const sni_provider = tls_core.sni_provider;
 
 fn clientEntropy() tls_backend.Entropy {
@@ -413,6 +414,75 @@ test "direct shared driver preserves derivation, sequence, discard, and teardown
     try std.testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&harness.server_backend.identity), 0));
 }
 
+test "direct record handshake delivers large post-handshake ticket once" {
+    const Capture = struct {
+        count: usize = 0,
+        psk: [tls_backend.hash_len]u8 = undefined,
+        ticket_len: usize = 0,
+
+        fn now(_: *anyopaque) i64 {
+            return 10;
+        }
+
+        fn onTicket(ctx: *anyopaque, ticket: *const session.ClientTicketState) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.count += 1;
+            @memcpy(&self.psk, ticket.common.resumption_psk.slice());
+            self.ticket_len = ticket.ticket.slice().len;
+        }
+    };
+
+    var harness = DirectHarness.init();
+    defer harness.deinit();
+    var capture = Capture{};
+    const limits = session.Limits{ .max_ticket_len = session.absolute_ticket_wire_max, .max_serialized_len = 128 * 1024 };
+    try harness.client_backend.setSessionTicketConsumer(std.testing.allocator, limits, .{
+        .ctx = &capture,
+        .nowUnixMsFn = Capture.now,
+        .onTicketFn = Capture.onTicket,
+    });
+    try harness.run();
+
+    const opaque_ticket = try std.testing.allocator.alloc(u8, session.absolute_ticket_wire_max);
+    defer std.testing.allocator.free(opaque_ticket);
+    @memset(opaque_ticket, 0xa5);
+
+    var sink = DirectSink{};
+    defer sink.deinit();
+    var server_state = try harness.server_backend.emitNewSessionTicket(std.testing.allocator, &sink, .{
+        .ticket_lifetime = 60,
+        .ticket_age_add = 1,
+        .ticket_nonce = "\x01",
+        .opaque_ticket = opaque_ticket,
+        .issued_at_unix_ms = 10,
+    }, limits);
+    defer server_state.deinit();
+    try std.testing.expectEqual(@as(usize, 1), sink.len);
+
+    const ticket_event = sink.items[0].handshake_bytes;
+    try std.testing.expect(ticket_event.data.len > record_codec.max_plaintext_fragment_len);
+    var protected: [record_codec.max_ciphertext_record_len * 8]u8 = undefined;
+    const records = (try harness.server_bridge.applyEvent(.{ .handshake_bytes = .{
+        .epoch = ticket_event.epoch,
+        .data = ticket_event.data,
+    } }, &protected)).?;
+
+    var parser = record_codec.Parser.init(.ciphertext);
+    var record_sink = record_codec.RecordSink(8, record_codec.max_ciphertext_fragment_len * 8){};
+    try parser.feed(records, &record_sink);
+    try std.testing.expect(record_sink.len > 1);
+
+    var plaintext: [record_codec.max_ciphertext_fragment_len]u8 = undefined;
+    for (record_sink.items[0..record_sink.len]) |record| {
+        const opened = try harness.client_bridge.openHandshake(.application, record, &plaintext);
+        const next = try harness.client_driver.receive(.application, opened.inner.content);
+        try std.testing.expectEqual(@as(usize, 0), next.len);
+    }
+    try std.testing.expectEqual(@as(usize, 1), capture.count);
+    try std.testing.expectEqual(opaque_ticket.len, capture.ticket_len);
+    try std.testing.expectEqualSlices(u8, server_state.common.resumption_psk.slice(), &capture.psk);
+}
+
 test "direct shared driver cleanup wipes secrets after record authentication failure" {
     var harness = DirectHarness.init();
     defer harness.deinit();
@@ -726,6 +796,7 @@ const SocketHarness = struct {
         server_provider: ?tls_backend.CredentialProvider = null,
         client_verifier: ?tls_backend.PeerVerifier = null,
         client_options: tls_backend.Tls13Backend.ClientOptions = .{},
+        client_post_handshake_allocator: ?std.mem.Allocator = null,
     };
 
     fn create(opts: Options) !*SocketHarness {
@@ -751,11 +822,14 @@ const SocketHarness = struct {
             tls_backend.Tls13Backend.initServerWithProvider(serverEntropy(), provider, server_record_profile)
         else
             tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), server_record_profile);
+        if (opts.client_post_handshake_allocator) |post_allocator| {
+            try self.client_engine.setPostHandshakeAllocator(post_allocator);
+        }
         self.client_carrier = .{ .fd = self.fds[0], .max_chunk = opts.client_chunk, .one_write_per_drive = opts.one_write_per_drive };
         self.server_carrier = .{ .fd = self.fds[1], .max_chunk = opts.server_chunk, .one_write_per_drive = opts.one_write_per_drive };
 
-        self.client = es.PureZigRecordStream.initWithCarrierAndBackend(.client, clientProvider(), suite, self.client_carrier.carrier(), self.client_engine.backend());
-        self.server = es.PureZigRecordStream.initWithCarrierAndBackend(.server, serverProvider(), suite, self.server_carrier.carrier(), self.server_engine.backend());
+        self.client = try es.PureZigRecordStream.initWithCarrierAndBackend(allocator, .client, clientProvider(), suite, self.client_carrier.carrier(), self.client_engine.backend());
+        self.server = try es.PureZigRecordStream.initWithCarrierAndBackend(allocator, .server, serverProvider(), suite, self.server_carrier.carrier(), self.server_engine.backend());
         self.client.setExpectedAlpn(opts.client_alpn) catch unreachable;
         return self;
     }
@@ -878,6 +952,246 @@ test "record stream completes a real TLS 1.3 handshake over a nonblocking socket
         }.done);
         try std.testing.expectError(error.EndOfStream, h.server.stream().read(&buf));
     }
+}
+
+test "record stream delivers maximum post-handshake ticket and remains usable" {
+    const Capture = struct {
+        count: usize = 0,
+        ticket_len: usize = 0,
+        psk: [tls_backend.hash_len]u8 = undefined,
+
+        fn now(_: *anyopaque) i64 {
+            return 10;
+        }
+
+        fn onTicket(ctx: *anyopaque, ticket: *const session.ClientTicketState) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.count += 1;
+            self.ticket_len = ticket.ticket.slice().len;
+            @memcpy(&self.psk, ticket.common.resumption_psk.slice());
+        }
+    };
+
+    const h = try SocketHarness.create(.{ .client_chunk = 4096, .server_chunk = 4096 });
+    defer h.destroy();
+    var capture = Capture{};
+    const limits = session.Limits{ .max_ticket_len = session.absolute_ticket_wire_max, .max_serialized_len = 128 * 1024 };
+    try h.client_engine.setSessionTicketConsumer(std.testing.allocator, limits, .{
+        .ctx = &capture,
+        .nowUnixMsFn = Capture.now,
+        .onTicketFn = Capture.onTicket,
+    });
+    try h.driveUntil(SocketHarness.bothComplete);
+
+    try std.testing.expectEqual(@as(usize, 13), try h.client.stream().write("before-ticket"));
+    try h.driveUntil(struct {
+        fn done(hh: *SocketHarness) bool {
+            return hh.server.readiness().can_read_plaintext;
+        }
+    }.done);
+    var app_buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("before-ticket", app_buf[0..try h.server.stream().read(&app_buf)]);
+
+    const opaque_ticket = try std.testing.allocator.alloc(u8, session.absolute_ticket_wire_max);
+    defer std.testing.allocator.free(opaque_ticket);
+    @memset(opaque_ticket, 0xa5);
+    var sink = DirectSink{};
+    defer sink.deinit();
+    var server_state = try h.server_engine.emitNewSessionTicket(std.testing.allocator, &sink, .{
+        .ticket_lifetime = 60,
+        .ticket_age_add = 1,
+        .ticket_nonce = "\x01",
+        .opaque_ticket = opaque_ticket,
+        .issued_at_unix_ms = 10,
+    }, limits);
+    defer server_state.deinit();
+    const ticket_event = sink.items[0].handshake_bytes;
+    try h.server.applyEvent(.{ .handshake_bytes = .{
+        .epoch = ticket_event.epoch,
+        .data = ticket_event.data,
+    } });
+
+    var rounds: usize = 0;
+    while (rounds < 5000 and capture.count == 0) : (rounds += 1) {
+        _ = try h.server.stream().drive();
+        _ = try h.client.stream().drive();
+    }
+    try std.testing.expectEqual(@as(usize, 1), capture.count);
+    try std.testing.expectEqual(opaque_ticket.len, capture.ticket_len);
+    try std.testing.expectEqualSlices(u8, server_state.common.resumption_psk.slice(), &capture.psk);
+
+    try std.testing.expectEqual(@as(usize, 12), try h.server.stream().write("after-ticket"));
+    try h.driveUntil(struct {
+        fn done(hh: *SocketHarness) bool {
+            return hh.client.readiness().can_read_plaintext;
+        }
+    }.done);
+    try std.testing.expectEqualStrings("after-ticket", app_buf[0..try h.client.stream().read(&app_buf)]);
+}
+
+test "record stream drops valid ticket with no consumer and remains usable" {
+    const h = try SocketHarness.create(.{
+        .client_chunk = 1024,
+        .server_chunk = 1024,
+    });
+    defer h.destroy();
+    try h.driveUntil(SocketHarness.bothComplete);
+
+    var sink = DirectSink{};
+    defer sink.deinit();
+    var server_state = try h.server_engine.emitNewSessionTicket(std.testing.allocator, &sink, .{
+        .ticket_lifetime = 60,
+        .ticket_age_add = 1,
+        .ticket_nonce = "\x01",
+        .opaque_ticket = "drop-ticket",
+        .issued_at_unix_ms = 10,
+    }, session.Limits.default);
+    defer server_state.deinit();
+    const ticket_event = sink.items[0].handshake_bytes;
+    try h.server.applyEvent(.{ .handshake_bytes = .{
+        .epoch = ticket_event.epoch,
+        .data = ticket_event.data,
+    } });
+
+    var rounds: usize = 0;
+    while (rounds < 1000) : (rounds += 1) {
+        const s = try h.server.stream().drive();
+        const c = try h.client.stream().drive();
+        if (!s.made_progress and !c.made_progress) break;
+    }
+
+    try std.testing.expectEqual(@as(usize, 9), try h.client.stream().write("afterdrop"));
+    try h.driveUntil(struct {
+        fn done(hh: *SocketHarness) bool {
+            return hh.server.readiness().can_read_plaintext;
+        }
+    }.done);
+    var app_buf: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("afterdrop", app_buf[0..try h.server.stream().read(&app_buf)]);
+}
+
+test "record stream ticket callback clone survives callback return" {
+    const Capture = struct {
+        allocator: std.mem.Allocator,
+        retained: session.ClientTicketState = .{},
+        count: usize = 0,
+
+        fn now(_: *anyopaque) i64 {
+            return 10;
+        }
+
+        fn onTicket(ctx: *anyopaque, ticket: *const session.ClientTicketState) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            ticket.cloneInto(self.allocator, &self.retained) catch unreachable;
+            self.count += 1;
+        }
+    };
+
+    const h = try SocketHarness.create(.{ .client_chunk = 1024, .server_chunk = 1024 });
+    defer h.destroy();
+    var capture = Capture{ .allocator = std.testing.allocator };
+    defer capture.retained.deinit();
+    try h.client_engine.setSessionTicketConsumer(std.testing.allocator, session.Limits.default, .{
+        .ctx = &capture,
+        .nowUnixMsFn = Capture.now,
+        .onTicketFn = Capture.onTicket,
+    });
+    try h.driveUntil(SocketHarness.bothComplete);
+
+    var sink = DirectSink{};
+    defer sink.deinit();
+    var server_state = try h.server_engine.emitNewSessionTicket(std.testing.allocator, &sink, .{
+        .ticket_lifetime = 60,
+        .ticket_age_add = 0x11223344,
+        .ticket_nonce = "\x01\x02",
+        .opaque_ticket = "clone-ticket",
+        .max_early_data_size = 32,
+        .issued_at_unix_ms = 10,
+    }, session.Limits.default);
+    defer server_state.deinit();
+    const ticket_event = sink.items[0].handshake_bytes;
+    try h.server.applyEvent(.{ .handshake_bytes = .{ .epoch = ticket_event.epoch, .data = ticket_event.data } });
+
+    var rounds: usize = 0;
+    while (rounds < 1000 and capture.count == 0) : (rounds += 1) {
+        _ = try h.server.stream().drive();
+        _ = try h.client.stream().drive();
+    }
+    try std.testing.expectEqual(@as(usize, 1), capture.count);
+    try std.testing.expectEqualSlices(u8, "clone-ticket", capture.retained.ticket.slice());
+    try std.testing.expectEqualSlices(u8, "\x01\x02", capture.retained.ticket_nonce.slice());
+    try std.testing.expectEqual(@as(u32, 0x11223344), capture.retained.ticket_age_add);
+    try std.testing.expectEqual(@as(i64, 10), capture.retained.received_at_unix_ms);
+    try std.testing.expectEqual(@as(u32, 60), capture.retained.common.lifetime_seconds);
+    try std.testing.expectEqual(session.EarlyDataPolicy{ .early_data_capable = 32 }, capture.retained.common.early_data);
+    try std.testing.expectEqualSlices(u8, server_state.common.resumption_psk.slice(), capture.retained.common.resumption_psk.slice());
+    try std.testing.expect(capture.retained.common.application_protocol != null);
+    try std.testing.expectEqualSlices(u8, "h2", capture.retained.common.application_protocol.?.slice());
+}
+
+test "record stream ticket callback clone refusal is nonfatal" {
+    const Capture = struct {
+        allocator: std.mem.Allocator,
+        storage_refused: bool = false,
+        callbacks: usize = 0,
+
+        fn now(_: *anyopaque) i64 {
+            return 10;
+        }
+
+        fn onTicket(ctx: *anyopaque, ticket: *const session.ClientTicketState) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            var retained: session.ClientTicketState = .{};
+            ticket.cloneInto(self.allocator, &retained) catch {
+                self.storage_refused = true;
+                self.callbacks += 1;
+                return;
+            };
+            retained.deinit();
+            self.callbacks += 1;
+        }
+    };
+
+    const h = try SocketHarness.create(.{ .client_chunk = 1024, .server_chunk = 1024 });
+    defer h.destroy();
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var capture = Capture{ .allocator = failing.allocator() };
+    try h.client_engine.setSessionTicketConsumer(std.testing.allocator, session.Limits.default, .{
+        .ctx = &capture,
+        .nowUnixMsFn = Capture.now,
+        .onTicketFn = Capture.onTicket,
+    });
+    try h.driveUntil(SocketHarness.bothComplete);
+
+    var sink = DirectSink{};
+    defer sink.deinit();
+    var server_state = try h.server_engine.emitNewSessionTicket(std.testing.allocator, &sink, .{
+        .ticket_lifetime = 60,
+        .ticket_age_add = 1,
+        .ticket_nonce = "\x01",
+        .opaque_ticket = "refuse-clone",
+        .issued_at_unix_ms = 10,
+    }, session.Limits.default);
+    defer server_state.deinit();
+    const ticket_event = sink.items[0].handshake_bytes;
+    try h.server.applyEvent(.{ .handshake_bytes = .{ .epoch = ticket_event.epoch, .data = ticket_event.data } });
+
+    var rounds: usize = 0;
+    while (rounds < 1000 and capture.callbacks == 0) : (rounds += 1) {
+        _ = try h.server.stream().drive();
+        _ = try h.client.stream().drive();
+    }
+    try std.testing.expect(capture.storage_refused);
+    try std.testing.expectEqual(@as(usize, 1), capture.callbacks);
+
+    try std.testing.expectEqual(@as(usize, 8), try h.client.stream().write("still-ok"));
+    try h.driveUntil(struct {
+        fn done(hh: *SocketHarness) bool {
+            return hh.server.readiness().can_read_plaintext;
+        }
+    }.done);
+    var buf: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("still-ok", buf[0..try h.server.stream().read(&buf)]);
 }
 
 test "pure-Zig HTTPS HTTP/1.1 bytes enter existing parser through EncryptedStream adapter" {

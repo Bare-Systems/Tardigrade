@@ -11,6 +11,7 @@ pub const algorithms = @import("algorithms.zig");
 pub const crypto_profile = @import("crypto_profile.zig");
 pub const key_schedule = @import("key_schedule.zig");
 pub const messages = @import("messages.zig");
+pub const new_session_ticket = @import("new_session_ticket.zig");
 pub const negotiation = @import("negotiation.zig");
 pub const policy = @import("policy.zig");
 pub const identity_loader = @import("identity_loader.zig");

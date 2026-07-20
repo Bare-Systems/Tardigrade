@@ -222,13 +222,26 @@ pub fn Reassembler(comptime capacity: usize) type {
 
         pub fn discard(self: *Self, count: usize) ReassemblerError!void {
             if (count > self.len) return error.MalformedHandshake;
-            std.mem.copyForwards(u8, self.data[0 .. self.len - count], self.data[count..self.len]);
-            self.len -= count;
+            const old_len = self.len;
+            std.mem.copyForwards(u8, self.data[0 .. old_len - count], self.data[count..old_len]);
+            self.len = old_len - count;
+            std.crypto.secureZero(u8, self.data[self.len..old_len]);
         }
     };
 }
 
 const testing = std.testing;
+
+test "reassembler discard clears consumed tail bytes" {
+    var r = Reassembler(32){};
+    const first = [_]u8{ @intFromEnum(MessageType.finished), 0, 0, 4, 0xaa, 0xbb, 0xcc, 0xdd };
+    const second = [_]u8{ @intFromEnum(MessageType.finished), 0, 0, 1, 0xee };
+    try r.append(&first);
+    try r.append(&second);
+    try r.discard(first.len);
+    try testing.expectEqualSlices(u8, &second, r.data[0..r.len]);
+    try testing.expect(std.mem.allEqual(u8, r.data[r.len .. first.len + second.len], 0));
+}
 
 test "encode and decode exact handshake bytes" {
     var out: [16]u8 = undefined;

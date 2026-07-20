@@ -20,8 +20,12 @@ const std = @import("std");
 const dns_name = @import("dns_name.zig");
 const events = @import("events.zig");
 const credentials = @import("credentials.zig");
+const tls_algorithms = @import("algorithms.zig");
+const crypto_pkg = @import("crypto");
 const tls_handshake_codec = @import("handshake.zig");
 const tls_key_schedule = @import("key_schedule.zig");
+const new_session_ticket = @import("new_session_ticket.zig");
+const session = @import("session.zig");
 const tls_state = @import("state.zig");
 const tls13_transport = @import("tls13_transport.zig");
 
@@ -42,9 +46,86 @@ const Reader = tls_handshake_codec.Reader;
 const Writer = tls_handshake_codec.Writer;
 
 pub const hash_len = tls_key_schedule.hash_len;
-/// Largest handshake message body we accept (u24 wire limit is 16 MiB; a
-/// single-certificate Ed25519 flight is far below this).
+/// Largest framed handshake message we accept during the main handshake.
 pub const max_message_len = 8 * 1024;
+/// Largest framed post-handshake NewSessionTicket message: a 65535-byte opaque
+/// ticket identity plus its handshake header and small fixed/vector fields.
+pub const max_new_session_ticket_message_len = tls13_transport.max_new_session_ticket_message_len;
+const handshake_header_len = 4;
+
+const PostHandshakeInput = struct {
+    allocator: ?std.mem.Allocator = null,
+    buf_allocator: ?std.mem.Allocator = null,
+    header: [handshake_header_len]u8 = undefined,
+    header_len: usize = 0,
+    buf: []u8 = &.{},
+    len: usize = 0,
+
+    fn setAllocator(self: *PostHandshakeInput, allocator: std.mem.Allocator) HandshakeError!void {
+        if (self.buf.len > 0 and !sameAllocator(self.buf_allocator.?, allocator)) return error.InvalidHandshakeState;
+        self.allocator = allocator;
+    }
+
+    fn deinit(self: *PostHandshakeInput) void {
+        if (self.buf.len > 0) {
+            crypto.secureZero(u8, self.buf);
+            self.buf_allocator.?.free(self.buf);
+        }
+        if (self.header_len > 0) crypto.secureZero(u8, self.header[0..self.header_len]);
+        self.* = .{};
+    }
+
+    fn append(self: *PostHandshakeInput, bytes: []const u8) HandshakeError!usize {
+        if (self.buf.len > 0 and self.len == self.buf.len) return 0;
+        var rest = bytes;
+        const original_len = bytes.len;
+        while (rest.len > 0) {
+            if (self.buf.len == 0) {
+                if (self.header_len < handshake_header_len) {
+                    const take = @min(handshake_header_len - self.header_len, rest.len);
+                    @memcpy(self.header[self.header_len..][0..take], rest[0..take]);
+                    self.header_len += take;
+                    rest = rest[take..];
+                    if (self.header_len < handshake_header_len) return original_len - rest.len;
+                }
+                const body_len: usize = @intCast(std.mem.readInt(u24, self.header[1..4], .big));
+                const frame_len = handshake_header_len + body_len;
+                if (frame_len > max_new_session_ticket_message_len) return error.HandshakeBufferOverflow;
+                const allocator = self.allocator orelse return error.InvalidHandshakeState;
+                self.buf = allocator.alloc(u8, frame_len) catch return error.CredentialProviderFailed;
+                self.buf_allocator = allocator;
+                @memcpy(self.buf[0..handshake_header_len], &self.header);
+                self.len = handshake_header_len;
+                crypto.secureZero(u8, &self.header);
+                self.header_len = 0;
+            }
+            const take = @min(self.buf.len - self.len, rest.len);
+            @memcpy(self.buf[self.len..][0..take], rest[0..take]);
+            self.len += take;
+            rest = rest[take..];
+            if (self.len == self.buf.len) break;
+        }
+        return original_len - rest.len;
+    }
+
+    fn peek(self: *PostHandshakeInput) tls_handshake_codec.Error!?tls_handshake_codec.Message {
+        if (self.buf.len == 0 or self.len < self.buf.len) return null;
+        return try tls_handshake_codec.decode(self.buf[0..self.len]);
+    }
+
+    fn discard(self: *PostHandshakeInput, len: usize) tls_handshake_codec.Error!void {
+        if (self.buf.len == 0 or len != self.buf.len) return error.MalformedHandshake;
+        crypto.secureZero(u8, self.buf);
+        self.buf_allocator.?.free(self.buf);
+        self.buf_allocator = null;
+        self.buf = &.{};
+        self.len = 0;
+    }
+};
+
+fn sameAllocator(a: std.mem.Allocator, b: std.mem.Allocator) bool {
+    return a.ptr == b.ptr and a.vtable == b.vtable;
+}
 pub const max_certificate_len = 2048;
 /// The Certificate handshake message's fixed framing overhead, counted in the
 /// flight-size preflight so a chain cannot pass validation and then overflow the
@@ -403,18 +484,18 @@ pub const Tls13Backend = struct {
     key_pair_present: bool = false,
     core: tls_handshake_codec.Core,
     schedule: ?KeySchedule = null,
+    resumption_master_secret: crypto_pkg.secrets.FixedSecret(session.max_psk_len) = .{},
+    session_ticket_consumer: ?ConfiguredSessionTicketConsumer = null,
     /// The client Finished verify_data the server expects (computed when its
     /// own flight is sent).
     expected_client_verify: [hash_len]u8 = undefined,
     /// Reassembled-but-unparsed handshake bytes per transport epoch; a message
-    /// may arrive split across TLS records or QUIC CRYPTO frames. The
-    /// application-level
-    /// buffer exists because post-handshake messages (NewSessionTicket) may be
-    /// fragmented across application-epoch transport chunks like any other
-    /// handshake message.
+    /// may arrive split across TLS records or QUIC CRYPTO frames.
     initial_input: tls_handshake_codec.Reassembler(max_message_len + 4) = .{},
     handshake_input: tls_handshake_codec.Reassembler(max_message_len + 4) = .{},
-    application_input: tls_handshake_codec.Reassembler(max_message_len + 4) = .{},
+    /// Post-handshake messages can be much larger than main-handshake flights,
+    /// so their storage is allocated lazily after the declared length is known.
+    application_input: PostHandshakeInput = .{},
     /// The peer's reassembled certificate chain (immutable DER, surfaced to the
     /// verifier as views). `entries` index into `peer_chain`.
     peer_chain: [max_peer_chain_bytes]u8 = undefined,
@@ -440,6 +521,27 @@ pub const Tls13Backend = struct {
 
     const Slice = struct { start: usize, len: usize };
     const PendingStage = enum { server_select, server_sign, client_select, client_sign, peer_verify };
+
+    pub const SessionTicketConsumer = struct {
+        ctx: *anyopaque,
+        nowUnixMsFn: *const fn (*anyopaque) i64,
+        onTicketFn: *const fn (*anyopaque, *const session.ClientTicketState) void,
+    };
+
+    const ConfiguredSessionTicketConsumer = struct {
+        allocator: std.mem.Allocator,
+        limits: session.Limits,
+        consumer: SessionTicketConsumer,
+    };
+
+    pub const EmitNewSessionTicketParams = struct {
+        ticket_lifetime: u32,
+        ticket_age_add: u32,
+        ticket_nonce: []const u8,
+        opaque_ticket: []const u8,
+        max_early_data_size: ?u32 = null,
+        issued_at_unix_ms: i64,
+    };
 
     /// Options for a client that verifies its peer through an external verifier:
     /// the exact intended server name (emitted as SNI and handed to the
@@ -570,6 +672,30 @@ pub const Tls13Backend = struct {
         self.external_provider = provider;
     }
 
+    pub fn setSessionTicketConsumer(
+        self: *Tls13Backend,
+        allocator: std.mem.Allocator,
+        limits: session.Limits,
+        consumer: SessionTicketConsumer,
+    ) HandshakeError!void {
+        if (self.role != .client) return error.InvalidHandshakeState;
+        if (self.core.handshake_lifecycle != .idle) return error.InvalidHandshakeState;
+        limits.validate() catch return error.InvalidTransportProfile;
+        try self.application_input.setAllocator(allocator);
+        self.session_ticket_consumer = .{
+            .allocator = allocator,
+            .limits = limits,
+            .consumer = consumer,
+        };
+    }
+
+    pub fn setPostHandshakeAllocator(self: *Tls13Backend, allocator: std.mem.Allocator) HandshakeError!void {
+        if (self.role != .client) return error.InvalidHandshakeState;
+        if (self.core.handshake_lifecycle != .idle) return error.InvalidHandshakeState;
+        if (self.application_input.allocator != null) return;
+        try self.application_input.setAllocator(allocator);
+    }
+
     pub fn backend(self: *Tls13Backend) TlsBackend {
         return .{
             .ptr = self,
@@ -578,6 +704,7 @@ pub const Tls13Backend = struct {
             .deinitFn = deinitImpl,
             .authPendingFn = authPendingImpl,
             .resumeFn = resumeImpl,
+            .setPostHandshakeAllocatorFn = setPostHandshakeAllocatorImpl,
         };
     }
 
@@ -589,6 +716,11 @@ pub const Tls13Backend = struct {
     fn resumeImpl(ptr: *anyopaque, sink: *EventSink) HandshakeError!void {
         const self: *Tls13Backend = @ptrCast(@alignCast(ptr));
         return self.resumeAuth(sink);
+    }
+
+    fn setPostHandshakeAllocatorImpl(ptr: *anyopaque, allocator: std.mem.Allocator) HandshakeError!void {
+        const self: *Tls13Backend = @ptrCast(@alignCast(ptr));
+        return self.setPostHandshakeAllocator(allocator);
     }
 
     pub fn alpn(self: *const Tls13Backend) []const u8 {
@@ -659,6 +791,8 @@ pub const Tls13Backend = struct {
         self.pending_client_hello_ready = false;
         if (self.schedule) |*schedule| schedule.wipe();
         self.schedule = null;
+        self.resumption_master_secret.deinit();
+        self.session_ticket_consumer = null;
         crypto.secureZero(u8, &self.expected_client_verify);
         self.wipeEphemeral();
         self.wipeIdentity();
@@ -683,10 +817,9 @@ pub const Tls13Backend = struct {
         self.peer_transport_extension_pending = false;
         crypto.secureZero(u8, std.mem.asBytes(&self.initial_input));
         crypto.secureZero(u8, std.mem.asBytes(&self.handshake_input));
-        crypto.secureZero(u8, std.mem.asBytes(&self.application_input));
+        self.application_input.deinit();
         self.initial_input = .{};
         self.handshake_input = .{};
-        self.application_input = .{};
         crypto.secureZero(u8, std.mem.asBytes(&self.core));
         self.core = tls_handshake_codec.Core.init(self.role);
         self.core.handshake_lifecycle = .failed;
@@ -727,24 +860,27 @@ pub const Tls13Backend = struct {
 
     fn receiveImpl(ptr: *anyopaque, level: EncryptionLevel, bytes: []const u8, sink: *EventSink) HandshakeError!void {
         const self: *Tls13Backend = @ptrCast(@alignCast(ptr));
-        const input = switch (level) {
-            .initial => &self.initial_input,
-            .handshake => &self.handshake_input,
-            // This deliberately narrow TLS profile does not implement 0-RTT.
+        switch (level) {
             .zero_rtt => return error.UnexpectedTransportEpoch,
-            // Application-epoch handshake input carries post-handshake messages.
-            .application => blk: {
+            .application => {
                 if (self.core.handshake_lifecycle != .complete) return error.UnexpectedTransportEpoch;
-                break :blk &self.application_input;
+                if (self.pending_op != null) return;
+                return self.receivePostHandshake(bytes, sink);
             },
-        };
-        if (level != .application and self.core.handshake_lifecycle == .complete) {
+            .initial, .handshake => {},
+        }
+        if (self.core.handshake_lifecycle == .complete) {
             return error.UnexpectedHandshakeMessage;
         }
         if (self.rejectPeerHandshakeWhileClientAuthPending(level, bytes.len)) {
             self.cancelPendingAuth();
             return error.UnexpectedHandshakeMessage;
         }
+        const input = switch (level) {
+            .initial => &self.initial_input,
+            .handshake => &self.handshake_input,
+            .zero_rtt, .application => unreachable,
+        };
         input.append(bytes) catch |err| return mapCoreError(err);
         // Never begin dispatching while an authentication operation is parked:
         // buffer the freshly received bytes and wait for `resumeAuth`. Without
@@ -755,6 +891,17 @@ pub const Tls13Backend = struct {
         try self.drainInput(input, level, sink);
     }
 
+    fn receivePostHandshake(self: *Tls13Backend, bytes: []const u8, sink: *EventSink) HandshakeError!void {
+        var rest = bytes;
+        while (rest.len > 0) {
+            const consumed = try self.application_input.append(rest);
+            rest = rest[consumed..];
+            try self.drainInput(&self.application_input, .application, sink);
+            if (consumed == 0) break;
+            if (self.pending_op != null) break;
+        }
+    }
+
     /// Consume whole handshake messages from a reassembly buffer, dispatching
     /// each. Stops early when an async authentication operation parks (so the
     /// suspend point is never crossed) or when the handshake completes or fails.
@@ -762,7 +909,7 @@ pub const Tls13Backend = struct {
     /// suspend point are drained automatically once the operation resolves.
     fn drainInput(
         self: *Tls13Backend,
-        input: *tls_handshake_codec.Reassembler(max_message_len + 4),
+        input: anytype,
         level: EncryptionLevel,
         sink: *EventSink,
     ) HandshakeError!void {
@@ -825,6 +972,7 @@ pub const Tls13Backend = struct {
             error.CertificateInvalid => error.CertificateInvalid,
             error.SecretExportFailed => error.SecretExportFailed,
             error.InvalidHandshakeState => error.InvalidHandshakeState,
+            error.TicketTooLarge => error.TicketTooLarge,
             // Surfaced only by this backend's credential/verification path, not
             // the codec core, but they are part of the shared error set.
             error.NoApplicableCredential => error.NoApplicableCredential,
@@ -854,11 +1002,7 @@ pub const Tls13Backend = struct {
             // server that receives one has been sent a message it must never
             // get, which is an ordering violation, not malformed bytes.
             if (self.role != .client) return error.UnexpectedHandshakeMessage;
-            // This backend does not implement resumption, so the ticket is
-            // ignored — but a compliant peer must still send a structurally
-            // valid one. Validate the framing so malformed wire data is
-            // rejected as `decode_error` rather than silently accepted.
-            try validateNewSessionTicket(body);
+            try self.onNewSessionTicket(body);
             return;
         }
 
@@ -880,28 +1024,23 @@ pub const Tls13Backend = struct {
         }
     }
 
-    /// Minimally validate a NewSessionTicket's framing (RFC 8446 §4.6.1):
-    ///
-    ///   struct {
-    ///     uint32 ticket_lifetime;
-    ///     uint32 ticket_age_add;
-    ///     opaque ticket_nonce<0..255>;
-    ///     opaque ticket<1..2^16-1>;
-    ///     Extension extensions<0..2^16-2>;
-    ///   } NewSessionTicket;
-    ///
-    /// This backend does not implement resumption and ignores the ticket, but a
-    /// structurally invalid one is still malformed wire data. Any framing error
-    /// (including an empty `ticket`, which the spec forbids, or trailing bytes)
-    /// is a `MalformedHandshake` / `decode_error`.
-    fn validateNewSessionTicket(body: []const u8) HandshakeError!void {
-        var r = Reader{ .bytes = body };
-        _ = try r.slice(4); // ticket_lifetime
-        _ = try r.slice(4); // ticket_age_add
-        _ = try r.slice(try r.u8_()); // ticket_nonce
-        if ((try r.slice(try r.u16_())).len == 0) return error.MalformedHandshake; // ticket<1..>
-        _ = try r.slice(try r.u16_()); // extensions
-        try r.expectEnd();
+    fn onNewSessionTicket(self: *Tls13Backend, body: []const u8) HandshakeError!void {
+        const parsed = new_session_ticket.decode(body) catch |err| return mapTicketDecodeError(err);
+        const configured = self.session_ticket_consumer orelse return;
+        if (self.resumption_master_secret.slice().len == 0) return error.InvalidHandshakeState;
+        const received_at = configured.consumer.nowUnixMsFn(configured.consumer.ctx);
+        var state = new_session_ticket.buildClientTicketState(
+            configured.allocator,
+            parsed,
+            self.resumptionContext(),
+            self.resumption_master_secret.slice(),
+            received_at,
+            configured.limits,
+        ) catch |err| return mapTicketBuildClientError(err);
+        if (state) |*ticket| {
+            defer ticket.deinit();
+            configured.consumer.onTicketFn(configured.consumer.ctx, ticket);
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1410,6 +1549,7 @@ pub const Tls13Backend = struct {
     /// Terminal steps shared by every client completion path: discard the
     /// handshake epoch, signal completion, and wipe the key schedule.
     fn completeClientHandshake(self: *Tls13Backend, sink: *EventSink) HandshakeError!void {
+        try self.captureResumptionMasterSecret();
         try self.emitDiscardKeys(sink, .handshake);
         try sink.emitHandshakeComplete();
         self.finish();
@@ -2214,6 +2354,7 @@ pub const Tls13Backend = struct {
         defer crypto.secureZero(u8, &expected);
         if (!crypto.timing_safe.eql([hash_len]u8, expected, body[0..hash_len].*)) return error.DecryptError;
         // Client Finished confirms the handshake for the server (RFC 8446 §4.4.4).
+        try self.captureResumptionMasterSecret();
         try self.emitDiscardKeys(sink, .handshake);
         try sink.emitHandshakeComplete();
         self.finish();
@@ -2264,6 +2405,92 @@ pub const Tls13Backend = struct {
         self.peer_transport_extension_pending = true;
     }
 
+    fn captureResumptionMasterSecret(self: *Tls13Backend) HandshakeError!void {
+        if (self.resumption_master_secret.slice().len != 0) return error.InvalidHandshakeState;
+        const schedule = &(self.schedule orelse return error.InvalidHandshakeState);
+        var rms: [hash_len]u8 = undefined;
+        defer crypto.secureZero(u8, &rms);
+        schedule.resumptionMasterSecret(&self.core.transcriptHash(), &rms) catch return error.SecretExportFailed;
+        self.resumption_master_secret.replace(&rms) catch return error.SecretExportFailed;
+    }
+
+    fn resumptionContext(self: *const Tls13Backend) new_session_ticket.ConnectionResumptionContext {
+        return .{
+            .cipher_suite = tls_algorithms.CipherSuite.tls_aes_128_gcm_sha256,
+            .server_name = if (self.server_name_present) self.server_name[0..self.server_name_len] else null,
+            .application_protocol = self.selectedAlpn(),
+            .auth_binding = self.peerAuthBinding(),
+            .transport_compat = self.peerTransportCompat(),
+        };
+    }
+
+    fn peerAuthBinding(self: *const Tls13Backend) session.AuthBinding {
+        if (self.peer_chain_count == 0) return session.AuthBinding.fromLeafCertificateDer("");
+        const leaf = self.peer_chain_entries[0];
+        return session.AuthBinding.fromLeafCertificateDer(self.peer_chain[leaf.start..][0..leaf.len]);
+    }
+
+    fn peerTransportCompat(self: *const Tls13Backend) ?new_session_ticket.CompatBlob {
+        if (self.peer_transport_extension_len == 0) return null;
+        const ext_type = self.profile.extensionType() orelse return null;
+        return .{
+            .format_id = ext_type,
+            .format_version = 1,
+            .bytes = self.peer_transport_extension[0..self.peer_transport_extension_len],
+        };
+    }
+
+    pub fn emitNewSessionTicket(
+        self: *Tls13Backend,
+        allocator: std.mem.Allocator,
+        sink: *EventSink,
+        params: EmitNewSessionTicketParams,
+        limits: session.Limits,
+    ) HandshakeError!session.ServerRecoverableState {
+        if (self.role != .server or self.core.handshake_lifecycle != .complete)
+            return error.InvalidHandshakeState;
+        if (self.resumption_master_secret.slice().len == 0)
+            return error.InvalidHandshakeState;
+        limits.validate() catch return error.InvalidTransportProfile;
+
+        const emit_params: new_session_ticket.EmitParams = .{
+            .ticket_lifetime = params.ticket_lifetime,
+            .ticket_age_add = params.ticket_age_add,
+            .ticket_nonce = params.ticket_nonce,
+            .ticket = params.opaque_ticket,
+            .max_early_data_size = params.max_early_data_size,
+        };
+        const body_len = new_session_ticket.encodedLen(emit_params) catch |err| return mapTicketEncodeError(err);
+        if (body_len > max_new_session_ticket_message_len - 4) return error.TransportBufferOverflow;
+        const message_len = handshake_header_len + body_len;
+
+        var state = new_session_ticket.buildServerRecoverableState(
+            allocator,
+            emit_params,
+            self.resumptionContext(),
+            self.resumption_master_secret.slice(),
+            params.issued_at_unix_ms,
+            limits,
+        ) catch |err| return mapTicketBuildServerError(err);
+        errdefer state.deinit();
+
+        const buf = allocator.alloc(u8, message_len) catch return error.CredentialProviderFailed;
+        errdefer {
+            crypto.secureZero(u8, buf);
+            allocator.free(buf);
+        }
+        var w = Writer{ .buf = buf };
+        try w.u8_(@intFromEnum(MessageType.new_session_ticket));
+        const body_len_index = try w.reserve(3);
+        const body = new_session_ticket.encode(emit_params, buf[w.len..]) catch |err| return mapTicketEncodeError(err);
+        w.len += body.len;
+        w.patch(3, body_len_index);
+        const message = buf[0..w.len];
+        try sink.emitOwnedCrypto(allocator, .application, message);
+        self.core.transcript.update(message);
+        return state;
+    }
+
     /// The handshake is over: the transport sink owns every exported live
     /// secret, so wipe the engine's key schedule immediately.
     fn finish(self: *Tls13Backend) void {
@@ -2272,6 +2499,60 @@ pub const Tls13Backend = struct {
         crypto.secureZero(u8, &self.expected_client_verify);
     }
 };
+
+fn mapTicketDecodeError(err: new_session_ticket.DecodeError) HandshakeError {
+    return switch (err) {
+        error.MalformedHandshake => error.MalformedHandshake,
+        error.IllegalParameter => error.IllegalParameter,
+    };
+}
+
+fn mapTicketEncodeError(err: new_session_ticket.EncodeError) HandshakeError {
+    return switch (err) {
+        error.IllegalParameter => error.IllegalParameter,
+        error.OutputTooSmall, error.LengthOverflow => error.TransportBufferOverflow,
+    };
+}
+
+fn mapTicketBuildServerError(err: new_session_ticket.BuildServerError) HandshakeError {
+    return switch (err) {
+        error.IllegalParameter => error.IllegalParameter,
+        error.InvalidSecretLength => error.SecretExportFailed,
+        error.TicketTooLarge => error.TicketTooLarge,
+        error.InvalidLimits => error.InvalidTransportProfile,
+        error.OutOfMemory => error.CredentialProviderFailed,
+        error.InvalidDnsName,
+        error.EmptyServerName,
+        error.AlpnProtocolTooLarge,
+        error.EmptyApplicationProtocol,
+        error.InvalidPskLength,
+        error.InvalidLifetime,
+        error.InvalidEarlyDataPolicy,
+        error.CompatSnapshotTooLarge,
+        => error.InvalidTransportProfile,
+    };
+}
+
+fn mapTicketBuildClientError(err: new_session_ticket.BuildError) HandshakeError!void {
+    return switch (err) {
+        error.OutOfMemory,
+        error.TicketTooLarge,
+        error.CompatSnapshotTooLarge,
+        => {},
+        error.InvalidSecretLength,
+        error.InvalidPskLength,
+        => error.SecretExportFailed,
+        error.InvalidLimits,
+        error.InvalidDnsName,
+        error.EmptyServerName,
+        error.AlpnProtocolTooLarge,
+        error.EmptyApplicationProtocol,
+        error.NonceTooLarge,
+        error.InvalidLifetime,
+        error.InvalidEarlyDataPolicy,
+        => error.InvalidTransportProfile,
+    };
+}
 
 /// RFC 8446 §4.4.3 CertificateVerify content: 64 spaces, context string,
 /// separator, transcript hash.
@@ -2303,9 +2584,62 @@ fn certificateVerifyContent(signer: Role, transcript_hash: [hash_len]u8) Certifi
     return content;
 }
 
+fn buildMaxNewSessionTicketMessage(allocator: std.mem.Allocator) ![]u8 {
+    const body_len = max_new_session_ticket_message_len - 4;
+    var message = try allocator.alloc(u8, max_new_session_ticket_message_len);
+    errdefer allocator.free(message);
+    var pos: usize = 0;
+    message[pos] = @intFromEnum(MessageType.new_session_ticket);
+    pos += 1;
+    std.mem.writeInt(u24, message[pos..][0..3], @intCast(body_len), .big);
+    pos += 3;
+    std.mem.writeInt(u32, message[pos..][0..4], 1, .big);
+    pos += 4;
+    std.mem.writeInt(u32, message[pos..][0..4], 0, .big);
+    pos += 4;
+    message[pos] = session.max_ticket_nonce_len;
+    pos += 1;
+    @memset(message[pos..][0..session.max_ticket_nonce_len], 0x01);
+    pos += session.max_ticket_nonce_len;
+    std.mem.writeInt(u16, message[pos..][0..2], @intCast(session.absolute_ticket_wire_max), .big);
+    pos += 2;
+    @memset(message[pos..][0..session.absolute_ticket_wire_max], 0xa5);
+    pos += session.absolute_ticket_wire_max;
+    std.mem.writeInt(u16, message[pos..][0..2], std.math.maxInt(u16) - 1, .big);
+    pos += 2;
+
+    var written: usize = 0;
+    var ext_id: u16 = 1000;
+    while (written + 4 <= (std.math.maxInt(u16) - 1) - 6) : ({
+        written += 4;
+        ext_id += 1;
+    }) {
+        std.mem.writeInt(u16, message[pos..][0..2], ext_id, .big);
+        pos += 2;
+        std.mem.writeInt(u16, message[pos..][0..2], 0, .big);
+        pos += 2;
+    }
+    std.mem.writeInt(u16, message[pos..][0..2], ext_id, .big);
+    pos += 2;
+    std.mem.writeInt(u16, message[pos..][0..2], 2, .big);
+    pos += 2;
+    message[pos] = 0xaa;
+    message[pos + 1] = 0xbb;
+    pos += 2;
+    written += 6;
+    std.debug.assert(written == std.math.maxInt(u16) - 1);
+    std.debug.assert(pos == message.len);
+    return message;
+}
+
 /// Deterministic local server identity fixture — see `credentials.testdata`.
 /// Re-exported here so existing callers and tests keep their spelling.
 pub const testdata = credentials.testdata;
+
+test "TLS-owned backend does not embed maximum ticket storage" {
+    try std.testing.expect(@sizeOf(Tls13Backend) < 64 * 1024);
+    try std.testing.expect(@sizeOf(Tls13Backend) + EventSink.max_bytes < max_new_session_ticket_message_len);
+}
 
 test "TLS-owned backend teardown clears transcript-adjacent and peer scratch" {
     var backend = Tls13Backend.initClient(
@@ -2443,6 +2777,378 @@ test "client rejects malformed encrypted extensions ALPN framing" {
         0x00, // trailing byte outside the declared list
     };
     try std.testing.expectError(error.MalformedHandshake, backend.onEncryptedExtensions(&trailing_extension_byte, &sink));
+}
+
+test "client NewSessionTicket callback receives owned state and lifetime zero is dropped" {
+    const TicketCapture = struct {
+        count: usize = 0,
+        received_at: i64 = 123_456,
+        last_lifetime: u32 = 0,
+        last_age_add: u32 = 0,
+        last_ticket: [16]u8 = undefined,
+        last_ticket_len: usize = 0,
+        last_psk: [hash_len]u8 = undefined,
+
+        fn now(ctx: *anyopaque) i64 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.received_at;
+        }
+
+        fn onTicket(ctx: *anyopaque, ticket: *const session.ClientTicketState) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.count += 1;
+            self.last_lifetime = ticket.common.lifetime_seconds;
+            self.last_age_add = ticket.ticket_age_add;
+            const raw_ticket = ticket.ticket.slice();
+            self.last_ticket_len = raw_ticket.len;
+            @memcpy(self.last_ticket[0..raw_ticket.len], raw_ticket);
+            @memcpy(&self.last_psk, ticket.common.resumption_psk.slice());
+        }
+    };
+
+    var capture = TicketCapture{};
+    var backend = Tls13Backend.initClient(
+        .{ .hello_random = [_]u8{0x41} ** 32, .key_share_seed = [_]u8{0x42} ** 32 },
+        .{ .pinned_certificate = testdata.certificate_der },
+        .{ .record = .{ .alpn = recordAlpnPolicy("h2") } },
+    );
+    defer backend.deinit();
+    try backend.setSessionTicketConsumer(std.testing.allocator, session.Limits.default, .{
+        .ctx = &capture,
+        .nowUnixMsFn = TicketCapture.now,
+        .onTicketFn = TicketCapture.onTicket,
+    });
+    backend.core.handshake_lifecycle = .complete;
+    try backend.resumption_master_secret.replace(&([_]u8{0x42} ** hash_len));
+
+    var body_buf: [128]u8 = undefined;
+    const body = try new_session_ticket.encode(.{
+        .ticket_lifetime = 120,
+        .ticket_age_add = 0xaabbccdd,
+        .ticket_nonce = "\x01",
+        .ticket = "opaque",
+    }, &body_buf);
+    try backend.onNewSessionTicket(body);
+    try std.testing.expectEqual(@as(usize, 1), capture.count);
+    try std.testing.expectEqual(@as(u32, 120), capture.last_lifetime);
+    try std.testing.expectEqual(@as(u32, 0xaabbccdd), capture.last_age_add);
+    try std.testing.expectEqualSlices(u8, "opaque", capture.last_ticket[0..capture.last_ticket_len]);
+    try std.testing.expect(!std.mem.allEqual(u8, &capture.last_psk, 0));
+
+    const discard_body = try new_session_ticket.encode(.{
+        .ticket_lifetime = 0,
+        .ticket_age_add = 0,
+        .ticket_nonce = "",
+        .ticket = "discard",
+    }, &body_buf);
+    try backend.onNewSessionTicket(discard_body);
+    try std.testing.expectEqual(@as(usize, 1), capture.count);
+}
+
+test "client parses and drops NewSessionTicket when no consumer is configured" {
+    var backend = Tls13Backend.initClient(
+        .{ .hello_random = [_]u8{0x45} ** 32, .key_share_seed = [_]u8{0x46} ** 32 },
+        .{ .pinned_certificate = testdata.certificate_der },
+        .{ .record = .{ .alpn = recordAlpnPolicy("h2") } },
+    );
+    defer backend.deinit();
+    try backend.setPostHandshakeAllocator(std.testing.allocator);
+    backend.core.handshake_lifecycle = .complete;
+
+    var body_buf: [128]u8 = undefined;
+    const body = try new_session_ticket.encode(.{
+        .ticket_lifetime = 120,
+        .ticket_age_add = 0,
+        .ticket_nonce = "\x01",
+        .ticket = "drop-me",
+    }, &body_buf);
+    var msg_buf: [132]u8 = undefined;
+    var w = Writer{ .buf = &msg_buf };
+    try w.u8_(@intFromEnum(MessageType.new_session_ticket));
+    const body_len = try w.reserve(3);
+    try w.bytes(body);
+    w.patch(3, body_len);
+    const message = w.written();
+    var sink = EventSink{};
+    defer sink.deinit();
+    try backend.backend().receive(.application, message[0..5], &sink);
+    try backend.backend().receive(.application, message[5..], &sink);
+    try std.testing.expectEqual(@as(usize, 0), backend.application_input.len);
+    try std.testing.expectEqual(@as(usize, 0), backend.application_input.buf.len);
+}
+
+test "post-handshake input rejects allocator replacement while a frame is active" {
+    var backing_a: [64]u8 = undefined;
+    var backing_b: [64]u8 = undefined;
+    var fba_a = std.heap.FixedBufferAllocator.init(&backing_a);
+    var fba_b = std.heap.FixedBufferAllocator.init(&backing_b);
+    var input = PostHandshakeInput{};
+    defer input.deinit();
+    try input.setAllocator(fba_a.allocator());
+
+    const prefix = [_]u8{
+        @intFromEnum(MessageType.new_session_ticket),
+        0,
+        0,
+        4,
+        1,
+    };
+    try std.testing.expectEqual(prefix.len, try input.append(&prefix));
+    try std.testing.expect(input.buf.len > 0);
+    try std.testing.expectError(error.InvalidHandshakeState, input.setAllocator(fba_b.allocator()));
+    try std.testing.expectEqual(@as(usize, 3), try input.append(&.{ 2, 3, 4 }));
+    try input.discard(input.buf.len);
+}
+
+test "server explicitly emits NewSessionTicket and returns recoverable state" {
+    var server = Tls13Backend.initServer(
+        .{ .hello_random = [_]u8{0x51} ** 32, .key_share_seed = [_]u8{0x52} ** 32 },
+        try Identity.initPkcs8(testdata.certificate_der, testdata.private_key_pkcs8_der),
+        .{ .record = .{ .alpn = recordAlpnPolicy("h2") } },
+    );
+    defer server.deinit();
+
+    var sink = EventSink{};
+    defer sink.deinit();
+    try std.testing.expectError(error.InvalidHandshakeState, server.emitNewSessionTicket(std.testing.allocator, &sink, .{
+        .ticket_lifetime = 60,
+        .ticket_age_add = 1,
+        .ticket_nonce = "\x01",
+        .opaque_ticket = "ticket",
+        .issued_at_unix_ms = 10,
+    }, session.Limits.default));
+
+    server.core.handshake_lifecycle = .complete;
+    try server.resumption_master_secret.replace(&([_]u8{0x33} ** hash_len));
+    var state = try server.emitNewSessionTicket(std.testing.allocator, &sink, .{
+        .ticket_lifetime = 60,
+        .ticket_age_add = 1,
+        .ticket_nonce = "\x01",
+        .opaque_ticket = "ticket",
+        .max_early_data_size = 32,
+        .issued_at_unix_ms = 10,
+    }, session.Limits.default);
+    defer state.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), sink.len);
+    try std.testing.expectEqual(EncryptionLevel.application, sink.items[0].handshake_bytes.epoch);
+    const message = try tls_handshake_codec.decode(sink.items[0].handshake_bytes.data);
+    try std.testing.expectEqual(MessageType.new_session_ticket, message.kind);
+    const parsed = try new_session_ticket.decode(message.body);
+    try std.testing.expectEqual(@as(u32, 60), parsed.ticket_lifetime);
+    try std.testing.expectEqualSlices(u8, "ticket", parsed.ticket);
+    try std.testing.expectEqual(@as(?u32, 32), parsed.max_early_data_size);
+    try std.testing.expectEqual(@as(u32, 60), state.common.lifetime_seconds);
+    try std.testing.expectEqual(session.EarlyDataPolicy{ .early_data_capable = 32 }, state.common.early_data);
+    try std.testing.expect(!std.mem.allEqual(u8, state.common.resumption_psk.slice(), 0));
+}
+
+test "server ticket output failure is atomic and retryable" {
+    var server = Tls13Backend.initServer(
+        .{ .hello_random = [_]u8{0x61} ** 32, .key_share_seed = [_]u8{0x62} ** 32 },
+        try Identity.initPkcs8(testdata.certificate_der, testdata.private_key_pkcs8_der),
+        .{ .record = .{ .alpn = recordAlpnPolicy("h2") } },
+    );
+    defer server.deinit();
+    server.core.handshake_lifecycle = .complete;
+    try server.resumption_master_secret.replace(&([_]u8{0x33} ** hash_len));
+
+    var full_sink = EventSink{};
+    defer full_sink.deinit();
+    for (0..EventSink.max_events) |_| try full_sink.emitHandshakeComplete();
+    const before = server.core.transcriptHash();
+    try std.testing.expectError(error.TransportBufferOverflow, server.emitNewSessionTicket(std.testing.allocator, &full_sink, .{
+        .ticket_lifetime = 60,
+        .ticket_age_add = 1,
+        .ticket_nonce = "\x01",
+        .opaque_ticket = "ticket",
+        .issued_at_unix_ms = 10,
+    }, session.Limits.default));
+    try std.testing.expectEqualSlices(u8, &before, &server.core.transcriptHash());
+
+    full_sink.reset();
+    var state = try server.emitNewSessionTicket(std.testing.allocator, &full_sink, .{
+        .ticket_lifetime = 60,
+        .ticket_age_add = 1,
+        .ticket_nonce = "\x01",
+        .opaque_ticket = "ticket",
+        .issued_at_unix_ms = 10,
+    }, session.Limits.default);
+    defer state.deinit();
+    try std.testing.expectEqual(@as(usize, 1), full_sink.len);
+}
+
+test "server ticket emission allocation failures leave transcript and sink clean" {
+    var saw_injected_failure = false;
+    var saw_success = false;
+
+    for (0..16) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        var server = Tls13Backend.initServer(
+            .{ .hello_random = [_]u8{0x63} ** 32, .key_share_seed = [_]u8{0x64} ** 32 },
+            try Identity.initPkcs8(testdata.certificate_der, testdata.private_key_pkcs8_der),
+            .{ .record = .{ .alpn = recordAlpnPolicy("h2") } },
+        );
+        server.core.handshake_lifecycle = .complete;
+        try server.resumption_master_secret.replace(&([_]u8{0x33} ** hash_len));
+        var sink = EventSink{};
+        const before = server.core.transcriptHash();
+
+        var state = server.emitNewSessionTicket(failing.allocator(), &sink, .{
+            .ticket_lifetime = 60,
+            .ticket_age_add = 1,
+            .ticket_nonce = "\x01",
+            .opaque_ticket = "ticket",
+            .max_early_data_size = 32,
+            .issued_at_unix_ms = 10,
+        }, session.Limits.default) catch |err| {
+            if (!failing.has_induced_failure) return err;
+            saw_injected_failure = true;
+            try std.testing.expectEqual(error.CredentialProviderFailed, err);
+            try std.testing.expectEqualSlices(u8, &before, &server.core.transcriptHash());
+            try std.testing.expectEqual(@as(usize, 0), sink.len);
+            sink.deinit();
+            server.deinit();
+            try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+            continue;
+        };
+        saw_success = true;
+        try std.testing.expect(!failing.has_induced_failure);
+        try std.testing.expectEqual(@as(usize, 1), sink.len);
+        state.deinit();
+        sink.deinit();
+        server.deinit();
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+        break;
+    }
+
+    try std.testing.expect(saw_injected_failure);
+    try std.testing.expect(saw_success);
+}
+
+test "large emitted ticket is delivered once after fragmented application receives" {
+    const Capture = struct {
+        count: usize = 0,
+        psk: [hash_len]u8 = undefined,
+        ticket_len: usize = 0,
+
+        fn now(_: *anyopaque) i64 {
+            return 10;
+        }
+
+        fn onTicket(ctx: *anyopaque, ticket: *const session.ClientTicketState) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.count += 1;
+            @memcpy(&self.psk, ticket.common.resumption_psk.slice());
+            self.ticket_len = ticket.ticket.slice().len;
+        }
+    };
+
+    const limits = session.Limits{ .max_ticket_len = session.absolute_ticket_wire_max, .max_serialized_len = 128 * 1024 };
+    const opaque_ticket = try std.testing.allocator.alloc(u8, session.absolute_ticket_wire_max);
+    defer std.testing.allocator.free(opaque_ticket);
+    @memset(opaque_ticket, 0xa5);
+
+    var server = Tls13Backend.initServer(
+        .{ .hello_random = [_]u8{0x71} ** 32, .key_share_seed = [_]u8{0x72} ** 32 },
+        try Identity.initPkcs8(testdata.certificate_der, testdata.private_key_pkcs8_der),
+        .{ .record = .{ .alpn = recordAlpnPolicy("h2") } },
+    );
+    defer server.deinit();
+    server.core.handshake_lifecycle = .complete;
+    try server.resumption_master_secret.replace(&([_]u8{0x44} ** hash_len));
+
+    var client = Tls13Backend.initClient(
+        .{ .hello_random = [_]u8{0x73} ** 32, .key_share_seed = [_]u8{0x74} ** 32 },
+        .{ .pinned_certificate = testdata.certificate_der },
+        .{ .record = .{ .alpn = recordAlpnPolicy("h2") } },
+    );
+    defer client.deinit();
+    var capture = Capture{};
+    try client.setSessionTicketConsumer(std.testing.allocator, limits, .{
+        .ctx = &capture,
+        .nowUnixMsFn = Capture.now,
+        .onTicketFn = Capture.onTicket,
+    });
+    client.core.handshake_lifecycle = .complete;
+    try client.resumption_master_secret.replace(&([_]u8{0x44} ** hash_len));
+
+    var sink = EventSink{};
+    defer sink.deinit();
+    var server_state = try server.emitNewSessionTicket(std.testing.allocator, &sink, .{
+        .ticket_lifetime = 60,
+        .ticket_age_add = 1,
+        .ticket_nonce = "\x01",
+        .opaque_ticket = opaque_ticket,
+        .issued_at_unix_ms = 10,
+    }, limits);
+    defer server_state.deinit();
+    const emitted = sink.items[0].handshake_bytes.data;
+    try std.testing.expect(emitted.len > 16 * 1024);
+
+    var client_sink = EventSink{};
+    defer client_sink.deinit();
+    try client.backend().receive(.application, emitted[0..17], &client_sink);
+    try client.backend().receive(.application, emitted[17..8191], &client_sink);
+    try client.backend().receive(.application, emitted[8191..], &client_sink);
+    try std.testing.expectEqual(@as(usize, 1), capture.count);
+    try std.testing.expectEqual(opaque_ticket.len, capture.ticket_len);
+    try std.testing.expectEqualSlices(u8, server_state.common.resumption_psk.slice(), &capture.psk);
+}
+
+test "application reassembler accepts exact maximum ticket and rejects one byte over" {
+    var client = Tls13Backend.initClient(
+        .{ .hello_random = [_]u8{0x81} ** 32, .key_share_seed = [_]u8{0x82} ** 32 },
+        .{ .pinned_certificate = testdata.certificate_der },
+        .{ .record = .{ .alpn = recordAlpnPolicy("h2") } },
+    );
+    defer client.deinit();
+    try client.setPostHandshakeAllocator(std.testing.allocator);
+    client.core.handshake_lifecycle = .complete;
+
+    const max_message = try buildMaxNewSessionTicketMessage(std.testing.allocator);
+    defer std.testing.allocator.free(max_message);
+    try std.testing.expectEqual(max_new_session_ticket_message_len, max_message.len);
+    var sink = EventSink{};
+    defer sink.deinit();
+    try client.backend().receive(.application, max_message[0..3], &sink);
+    try client.backend().receive(.application, max_message[3..4099], &sink);
+    try client.backend().receive(.application, max_message[4099..], &sink);
+
+    var over_client = Tls13Backend.initClient(
+        .{ .hello_random = [_]u8{0x83} ** 32, .key_share_seed = [_]u8{0x84} ** 32 },
+        .{ .pinned_certificate = testdata.certificate_der },
+        .{ .record = .{ .alpn = recordAlpnPolicy("h2") } },
+    );
+    defer over_client.deinit();
+    try over_client.setPostHandshakeAllocator(std.testing.allocator);
+    over_client.core.handshake_lifecycle = .complete;
+    const over = try std.testing.allocator.alloc(u8, max_new_session_ticket_message_len + 1);
+    defer std.testing.allocator.free(over);
+    @memset(over, 0);
+    over[0] = @intFromEnum(MessageType.new_session_ticket);
+    std.mem.writeInt(u24, over[1..4], max_new_session_ticket_message_len - 3, .big);
+    try std.testing.expectError(error.HandshakeBufferOverflow, over_client.backend().receive(.application, over, &sink));
+}
+
+test "client cannot emit NewSessionTicket" {
+    var client = Tls13Backend.initClient(
+        .{ .hello_random = [_]u8{0x91} ** 32, .key_share_seed = [_]u8{0x92} ** 32 },
+        .{ .pinned_certificate = testdata.certificate_der },
+        .{ .record = .{ .alpn = recordAlpnPolicy("h2") } },
+    );
+    defer client.deinit();
+    client.core.handshake_lifecycle = .complete;
+    try client.resumption_master_secret.replace(&([_]u8{0x44} ** hash_len));
+    var sink = EventSink{};
+    defer sink.deinit();
+    try std.testing.expectError(error.InvalidHandshakeState, client.emitNewSessionTicket(std.testing.allocator, &sink, .{
+        .ticket_lifetime = 60,
+        .ticket_age_add = 1,
+        .ticket_nonce = "\x01",
+        .opaque_ticket = "ticket",
+        .issued_at_unix_ms = 10,
+    }, session.Limits.default));
 }
 
 test "abandoned backend teardown wipes ephemeral and server identity storage" {

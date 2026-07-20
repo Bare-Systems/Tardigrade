@@ -193,6 +193,7 @@ fn integerParameter(value_bytes: []const u8) HandshakeError!u64 {
 }
 
 pub const Tls13Backend = struct {
+    allocator: ?std.mem.Allocator = null,
     engine: shared.Tls13Backend,
     alpn: []const u8 = "h3",
     cid_binding: config.CidBinding = .{},
@@ -212,6 +213,17 @@ pub const Tls13Backend = struct {
         } }, options) };
     }
 
+    pub fn initClientWithAllocator(allocator: std.mem.Allocator, entropy: Entropy, trust: Trust) HandshakeError!Tls13Backend {
+        return initClientWithAllocatorAndOptions(allocator, entropy, trust, .{});
+    }
+
+    pub fn initClientWithAllocatorAndOptions(allocator: std.mem.Allocator, entropy: Entropy, trust: Trust, options: ClientOptions) HandshakeError!Tls13Backend {
+        var self = initClientWithOptions(entropy, trust, options);
+        self.allocator = allocator;
+        self.engine.setPostHandshakeAllocator(allocator) catch |err| return mapError(err);
+        return self;
+    }
+
     pub fn initServer(entropy: Entropy, identity: Identity) Tls13Backend {
         return .{ .engine = shared.Tls13Backend.initServer(entropy, identity, .{ .extension = .{
             .alpn = "h3",
@@ -220,12 +232,24 @@ pub const Tls13Backend = struct {
         } }) };
     }
 
+    pub fn initServerWithAllocator(allocator: std.mem.Allocator, entropy: Entropy, identity: Identity) Tls13Backend {
+        var self = initServer(entropy, identity);
+        self.allocator = allocator;
+        return self;
+    }
+
     pub fn initServerWithProvider(entropy: Entropy, provider: CredentialProvider) Tls13Backend {
         return .{ .engine = shared.Tls13Backend.initServerWithProvider(entropy, provider, .{ .extension = .{
             .alpn = "h3",
             .extension_type = ext_quic_transport_parameters,
             .local = "",
         } }) };
+    }
+
+    pub fn initServerWithAllocatorAndProvider(allocator: std.mem.Allocator, entropy: Entropy, provider: CredentialProvider) Tls13Backend {
+        var self = initServerWithProvider(entropy, provider);
+        self.allocator = allocator;
+        return self;
     }
 
     pub fn backend(self: *Tls13Backend) tls_handshake.TlsBackend {
@@ -243,6 +267,8 @@ pub const Tls13Backend = struct {
             },
             .setCidBindingFn = setCidBinding,
             .peerCidBindingFn = peerCidBinding,
+            .setPostHandshakeAllocatorFn = setPostHandshakeAllocator,
+            .emitNewSessionTicketFn = emitNewSessionTicket,
         };
     }
 
@@ -256,7 +282,7 @@ pub const Tls13Backend = struct {
         self.scratch.reset();
         const result = self.engine.resumeAuth(&self.scratch);
         try self.forwardPeerTransportParameters(sink);
-        try translate(&self.scratch, sink);
+        try translate(self.allocator, &self.scratch, sink);
         result catch |err| return mapError(err);
     }
 
@@ -281,6 +307,31 @@ pub const Tls13Backend = struct {
         return self.peer_cid_binding;
     }
 
+    fn setPostHandshakeAllocator(ptr: *anyopaque, allocator: std.mem.Allocator) HandshakeError!void {
+        const self: *Tls13Backend = @ptrCast(@alignCast(ptr));
+        if (self.engine.role != .client) return;
+        if (self.allocator) |existing| {
+            if (existing.ptr == allocator.ptr and existing.vtable == allocator.vtable) return;
+        }
+        self.allocator = allocator;
+        self.engine.setPostHandshakeAllocator(allocator) catch |err| return mapError(err);
+    }
+
+    fn emitNewSessionTicket(
+        ptr: *anyopaque,
+        allocator: std.mem.Allocator,
+        sink: *EventSink,
+        params: tls_handshake.EmitNewSessionTicketParams,
+        limits: tls_core.session.Limits,
+    ) HandshakeError!tls_core.session.ServerRecoverableState {
+        const self: *Tls13Backend = @ptrCast(@alignCast(ptr));
+        self.scratch.reset();
+        var state = self.engine.emitNewSessionTicket(allocator, &self.scratch, params, limits) catch |err| return mapError(err);
+        errdefer state.deinit();
+        try translate(self.allocator, &self.scratch, sink);
+        return state;
+    }
+
     fn start(ptr: *anyopaque, role: tls_handshake.Role, params: config.TransportParameters, sink: *EventSink) HandshakeError!void {
         const self: *Tls13Backend = @ptrCast(@alignCast(ptr));
         const encoded = try encodeTransportParametersBound(params, self.cid_binding, &self.local_transport_parameters);
@@ -292,7 +343,7 @@ pub const Tls13Backend = struct {
         self.scratch.reset();
         const result = self.engine.backend().start(role, {}, &self.scratch);
         try self.forwardPeerTransportParameters(sink);
-        try translate(&self.scratch, sink);
+        try translate(self.allocator, &self.scratch, sink);
         result catch |err| return mapError(err);
     }
 
@@ -301,7 +352,7 @@ pub const Tls13Backend = struct {
         self.scratch.reset();
         const result = self.engine.backend().receive(toEpoch(level), bytes, &self.scratch);
         try self.forwardPeerTransportParameters(sink);
-        try translate(&self.scratch, sink);
+        try translate(self.allocator, &self.scratch, sink);
         result catch |err| return mapError(err);
     }
 
@@ -311,10 +362,25 @@ pub const Tls13Backend = struct {
     }
 };
 
-fn translate(source: *const RecordSink, destination: *EventSink) HandshakeError!void {
-    for (source.items[0..source.len]) |event| {
+fn translate(allocator: ?std.mem.Allocator, source: *RecordSink, destination: *EventSink) HandshakeError!void {
+    var index: usize = 0;
+    while (index < source.len) : (index += 1) {
+        const event = source.items[index];
         switch (event) {
-            .handshake_bytes => |item| try destination.emitHandshakeBytes(toLevel(item.epoch), item.data),
+            .handshake_bytes => |item| {
+                if (item.data.len <= EventSink.max_bytes) {
+                    try destination.emitHandshakeBytes(toLevel(item.epoch), item.data);
+                } else if (source.takeOwnedHandshakePayload(index)) |payload| {
+                    destination.emitOwnedHandshakeBytes(payload.allocator, toLevel(item.epoch), payload.bytes) catch |err| {
+                        std.crypto.secureZero(u8, payload.bytes);
+                        payload.allocator.free(payload.bytes);
+                        return err;
+                    };
+                } else {
+                    const explicit_allocator = allocator orelse return error.InvalidHandshakeState;
+                    try destination.emitOwnedHandshakeBytesCopy(explicit_allocator, toLevel(item.epoch), item.data);
+                }
+            },
             .traffic_secret => |item| try destination.emitSecret(toLevel(item.epoch), item.direction, item.data),
             .peer_transport_parameters => {},
             .alpn => |protocol| try destination.emitAlpn(protocol),
@@ -402,6 +468,11 @@ test "QUIC adapter owns CID binding round trip" {
     try std.testing.expectEqualDeep(local, peer);
 }
 
+test "QUIC TLS backend does not embed maximum ticket storage" {
+    try std.testing.expect(@sizeOf(Tls13Backend) < 128 * 1024);
+    try std.testing.expect(@sizeOf(Tls13Backend) < tls_core.tls13_transport.max_new_session_ticket_message_len);
+}
+
 test "QUIC adapter teardown wipes private scratch, parameters, and shared engine ownership" {
     const entropy = Entropy{ .hello_random = [_]u8{0x31} ** 32, .key_share_seed = [_]u8{0x32} ** 32 };
     var backend = Tls13Backend.initServer(
@@ -437,11 +508,13 @@ const RealHandshakeHarness = struct {
 
     fn init() !RealHandshakeHarness {
         return .{
-            .client_backend = Tls13Backend.initClient(
+            .client_backend = try Tls13Backend.initClientWithAllocator(
+                std.testing.allocator,
                 .{ .hello_random = [_]u8{0xc1} ** 32, .key_share_seed = [_]u8{0x11} ** 32 },
                 .{ .pinned_certificate = testdata.certificate_der },
             ),
-            .server_backend = Tls13Backend.initServer(
+            .server_backend = Tls13Backend.initServerWithAllocator(
+                std.testing.allocator,
                 .{ .hello_random = [_]u8{0x51} ** 32, .key_share_seed = [_]u8{0x22} ** 32 },
                 try Identity.initPkcs8(testdata.certificate_der, testdata.private_key_pkcs8_der),
             ),
@@ -450,12 +523,14 @@ const RealHandshakeHarness = struct {
 
     fn initWithSniProvider(server_name: []const u8, provider: tls_core.credentials.CredentialProvider) !RealHandshakeHarness {
         const harness = RealHandshakeHarness{
-            .client_backend = Tls13Backend.initClientWithOptions(
+            .client_backend = try Tls13Backend.initClientWithAllocatorAndOptions(
+                std.testing.allocator,
                 .{ .hello_random = [_]u8{0xc1} ** 32, .key_share_seed = [_]u8{0x11} ** 32 },
                 .{ .pinned_certificate = testdata.certificate_der },
                 .{ .server_name = server_name },
             ),
-            .server_backend = Tls13Backend.initServerWithProvider(
+            .server_backend = Tls13Backend.initServerWithAllocatorAndProvider(
+                std.testing.allocator,
                 .{ .hello_random = [_]u8{0x51} ** 32, .key_share_seed = [_]u8{0x22} ** 32 },
                 provider,
             ),
@@ -527,6 +602,109 @@ test "QUIC handshake owner tears down shared and adapter storage on success" {
     harness.deinit();
     try expectQuicBackendWiped(&harness.client_backend);
     try expectQuicBackendWiped(&harness.server_backend);
+}
+
+test "QUIC TLS backend delivers large post-handshake tickets through application CRYPTO chunks" {
+    const Capture = struct {
+        count: usize = 0,
+        psk: [hash_len]u8 = undefined,
+        ticket_len: usize = 0,
+
+        fn now(_: *anyopaque) i64 {
+            return 10;
+        }
+
+        fn onTicket(ctx: *anyopaque, ticket: *const tls_core.session.ClientTicketState) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.count += 1;
+            @memcpy(&self.psk, ticket.common.resumption_psk.slice());
+            self.ticket_len = ticket.ticket.slice().len;
+        }
+    };
+
+    var harness = try RealHandshakeHarness.init();
+    defer harness.deinit();
+    var capture = Capture{};
+    const limits = tls_core.session.Limits{ .max_ticket_len = tls_core.session.absolute_ticket_wire_max, .max_serialized_len = 128 * 1024 };
+    try harness.client_backend.engine.setSessionTicketConsumer(std.testing.allocator, limits, .{
+        .ctx = &capture,
+        .nowUnixMsFn = Capture.now,
+        .onTicketFn = Capture.onTicket,
+    });
+    try harness.wire();
+    try harness.run();
+
+    const opaque_ticket = try std.testing.allocator.alloc(u8, tls_core.session.absolute_ticket_wire_max);
+    defer std.testing.allocator.free(opaque_ticket);
+    @memset(opaque_ticket, 0xa5);
+
+    var shared_sink = RecordSink{};
+    defer shared_sink.deinit();
+    var server_state = try harness.server_backend.engine.emitNewSessionTicket(std.testing.allocator, &shared_sink, .{
+        .ticket_lifetime = 60,
+        .ticket_age_add = 1,
+        .ticket_nonce = "\x01",
+        .opaque_ticket = opaque_ticket,
+        .issued_at_unix_ms = 10,
+    }, limits);
+    defer server_state.deinit();
+    try std.testing.expect(shared_sink.items[0].handshake_bytes.data.len > 16 * 1024);
+
+    var quic_sink = EventSink{};
+    defer quic_sink.deinit();
+    try translate(std.testing.allocator, &shared_sink, &quic_sink);
+    try std.testing.expectEqual(@as(usize, 1), quic_sink.len);
+    try harness.server_adapter.queueHandshakeOutput(
+        quic_sink.items[0].handshake_bytes.epoch,
+        quic_sink.items[0].handshake_bytes.data,
+    );
+
+    var chunks: usize = 0;
+    var buf: [4096]u8 = undefined;
+    while (try harness.server.pollOutput(.application, &buf)) |out| {
+        chunks += 1;
+        try harness.client.onCrypto(.application, out.offset, out.bytes);
+    }
+    try std.testing.expect(chunks > 1);
+    try std.testing.expectEqual(@as(usize, 1), capture.count);
+    try std.testing.expectEqual(opaque_ticket.len, capture.ticket_len);
+    try std.testing.expectEqualSlices(u8, server_state.common.resumption_psk.slice(), &capture.psk);
+}
+
+test "QUIC TLS backend drops valid post-handshake ticket with no consumer" {
+    var harness = try RealHandshakeHarness.init();
+    defer harness.deinit();
+    try harness.wire();
+    try harness.run();
+
+    var shared_sink = RecordSink{};
+    defer shared_sink.deinit();
+    var server_state = try harness.server_backend.engine.emitNewSessionTicket(std.testing.allocator, &shared_sink, .{
+        .ticket_lifetime = 60,
+        .ticket_age_add = 1,
+        .ticket_nonce = "\x01",
+        .opaque_ticket = "drop-ticket",
+        .issued_at_unix_ms = 10,
+    }, tls_core.session.Limits.default);
+    defer server_state.deinit();
+
+    var quic_sink = EventSink{};
+    defer quic_sink.deinit();
+    try translate(std.testing.allocator, &shared_sink, &quic_sink);
+    try harness.server_adapter.queueHandshakeOutput(
+        quic_sink.items[0].handshake_bytes.epoch,
+        quic_sink.items[0].handshake_bytes.data,
+    );
+
+    var chunks: usize = 0;
+    var buf: [4]u8 = undefined;
+    while (try harness.server.pollOutput(.application, &buf)) |out| {
+        chunks += 1;
+        try harness.client.onCrypto(.application, out.offset, out.bytes);
+    }
+    try std.testing.expect(chunks > 1);
+    try std.testing.expect(harness.client.isComplete());
+    try std.testing.expect(harness.server.isComplete());
 }
 
 fn quicSniConfig(patterns: []const []const u8, chain: []const []const u8) tls_core.sni_provider.CredentialBundleConfig {

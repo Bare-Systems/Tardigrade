@@ -21,6 +21,7 @@
 //! adapter's AEAD seal.
 
 const std = @import("std");
+const crypto_secrets = @import("crypto_secrets");
 const varint = @import("quic_varint");
 const config = @import("config.zig");
 const packet = @import("packet.zig");
@@ -55,6 +56,8 @@ pub const State = enum {
 /// The datagram size this driver sends. Conservative (RFC 9000 §14.1 minimum)
 /// until DPLPMTUD lands under #256.
 pub const max_datagram_size: usize = recovery.max_datagram_size;
+pub const max_application_crypto_outstanding: usize = 2 * tls_core.tls13_transport.max_emitted_new_session_ticket_message_len;
+const min_application_crypto_payload: usize = max_datagram_size / 2;
 /// RFC 9000 §14.1: datagrams carrying Initial packets are padded to 1200.
 pub const min_initial_datagram: usize = 1200;
 
@@ -206,6 +209,28 @@ const RangeList = struct {
         try self.items.insert(allocator, index, merged);
     }
 
+    fn ensureUnusedCapacity(self: *RangeList, allocator: std.mem.Allocator, additional_count: usize) !void {
+        try self.items.ensureUnusedCapacity(allocator, additional_count);
+    }
+
+    fn insertAssumeCapacity(self: *RangeList, incoming: Range) void {
+        if (incoming.start >= incoming.end) return;
+        var merged = incoming;
+        var index: usize = 0;
+        while (index < self.items.items.len) {
+            const current = self.items.items[index];
+            if (merged.end < current.start) break;
+            if (current.end < merged.start) {
+                index += 1;
+                continue;
+            }
+            merged.start = @min(merged.start, current.start);
+            merged.end = @max(merged.end, current.end);
+            _ = self.items.orderedRemove(index);
+        }
+        self.items.insertAssumeCapacity(index, merged);
+    }
+
     /// Remove and return up to `max_len` bytes from the lowest range.
     fn takeFirst(self: *RangeList, max_len: u64) ?Range {
         if (self.items.items.len == 0) return null;
@@ -234,12 +259,186 @@ const RangeList = struct {
 const CryptoTx = struct {
     data: std.ArrayList(u8) = .empty,
     pending: RangeList = .{},
+    acked: RangeList = .{},
+    base: u64 = 0,
+
+    const Reservation = struct {
+        allocator: std.mem.Allocator,
+        data: ?[]u8 = null,
+        pending: ?[]Range = null,
+        acked: ?[]Range = null,
+
+        fn deinit(self: *Reservation) void {
+            if (self.data) |buf| {
+                crypto_secrets.secureZero(buf);
+                self.allocator.free(buf);
+            }
+            if (self.pending) |buf| self.allocator.free(buf);
+            if (self.acked) |buf| self.allocator.free(buf);
+            self.* = .{ .allocator = self.allocator };
+        }
+    };
 
     fn deinit(self: *CryptoTx, allocator: std.mem.Allocator) void {
+        crypto_secrets.secureZero(self.data.allocatedSlice());
         self.data.deinit(allocator);
         self.pending.deinit(allocator);
+        self.acked.deinit(allocator);
+    }
+
+    fn bufferedEnd(self: *const CryptoTx) u64 {
+        return self.base + self.data.items.len;
+    }
+
+    fn slice(self: *const CryptoTx, range: Range) []const u8 {
+        const start: usize = @intCast(range.start - self.base);
+        const end: usize = @intCast(range.end - self.base);
+        return self.data.items[start..end];
+    }
+
+    fn liveRange(self: *const CryptoTx, incoming: Range) ?Range {
+        if (incoming.end <= self.base) return null;
+        var range = incoming;
+        if (range.start < self.base) range.start = self.base;
+        if (range.start >= range.end) return null;
+        return range;
+    }
+
+    fn markAcked(self: *CryptoTx, allocator: std.mem.Allocator, range: Range) void {
+        const live = self.liveRange(range) orelse return;
+        self.acked.insertAssumeCapacity(live);
+        self.compactAcked(allocator);
+    }
+
+    fn compactAcked(self: *CryptoTx, allocator: std.mem.Allocator) void {
+        while (self.acked.items.items.len > 0 and self.acked.items.items[0].end <= self.base) {
+            _ = self.acked.items.orderedRemove(0);
+        }
+        if (self.acked.items.items.len == 0) {
+            self.trimPendingBelowBase();
+            return;
+        }
+        const first = self.acked.items.items[0];
+        if (first.start != self.base or first.end <= self.base) return;
+        const release_len: usize = @intCast(@min(first.end, self.bufferedEnd()) - self.base);
+        if (release_len == 0) return;
+        const old_len = self.data.items.len;
+        crypto_secrets.secureZero(self.data.items[0..release_len]);
+        const keep_len = self.data.items.len - release_len;
+        if (keep_len > 0) std.mem.copyForwards(u8, self.data.items[0..keep_len], self.data.items[release_len..]);
+        crypto_secrets.secureZero(self.data.items[keep_len..old_len]);
+        self.data.shrinkRetainingCapacity(keep_len);
+        self.base += release_len;
+        if (first.end <= self.base) {
+            _ = self.acked.items.orderedRemove(0);
+        } else {
+            self.acked.items.items[0].start = self.base;
+        }
+        self.trimPendingBelowBase();
+        if (self.data.items.len == 0 and self.data.capacity > 0) {
+            crypto_secrets.secureZero(self.data.allocatedSlice());
+            self.data.clearAndFree(allocator);
+            self.pending.items.clearAndFree(allocator);
+            self.acked.items.clearAndFree(allocator);
+        }
+    }
+
+    fn trimPendingBelowBase(self: *CryptoTx) void {
+        var out: usize = 0;
+        var index: usize = 0;
+        while (index < self.pending.items.items.len) : (index += 1) {
+            if (self.liveRange(self.pending.items.items[index])) |range| {
+                self.pending.items.items[out] = range;
+                out += 1;
+            }
+        }
+        self.pending.items.shrinkRetainingCapacity(out);
+    }
+
+    fn reserveAppend(self: *CryptoTx, allocator: std.mem.Allocator, bytes_len: usize, max_outstanding: usize) !void {
+        var reservation = try self.prepareAppend(allocator, bytes_len, max_outstanding);
+        errdefer reservation.deinit();
+        self.commitReservation(&reservation);
+    }
+
+    fn prepareAppend(self: *CryptoTx, allocator: std.mem.Allocator, bytes_len: usize, max_outstanding: usize) !Reservation {
+        if (bytes_len > max_outstanding) return error.CryptoBufferTooLarge;
+        if (self.data.items.len > max_outstanding - bytes_len) return error.CryptoBufferTooLarge;
+
+        const new_total = self.data.items.len + bytes_len;
+        const range_budget = applicationCryptoRangeBudget(new_total);
+        const pending_capacity = self.pending.items.items.len + range_budget + 1;
+        const acked_capacity = self.acked.items.items.len + range_budget;
+
+        var reservation = Reservation{ .allocator = allocator };
+        errdefer reservation.deinit();
+        if (self.data.capacity < new_total) {
+            const replacement = try allocator.alloc(u8, new_total);
+            @memcpy(replacement[0..self.data.items.len], self.data.items);
+            reservation.data = replacement;
+        }
+
+        if (self.pending.items.capacity < pending_capacity) {
+            const replacement = try allocator.alloc(Range, pending_capacity);
+            @memcpy(replacement[0..self.pending.items.items.len], self.pending.items.items);
+            reservation.pending = replacement;
+        }
+
+        if (self.acked.items.capacity < acked_capacity) {
+            const replacement = try allocator.alloc(Range, acked_capacity);
+            @memcpy(replacement[0..self.acked.items.items.len], self.acked.items.items);
+            reservation.acked = replacement;
+        }
+
+        return reservation;
+    }
+
+    fn commitReservation(self: *CryptoTx, reservation: *Reservation) void {
+        if (reservation.pending) |replacement| {
+            self.replaceRangeCapacity(reservation.allocator, &self.pending, replacement);
+            reservation.pending = null;
+        }
+        if (reservation.acked) |replacement| {
+            self.replaceRangeCapacity(reservation.allocator, &self.acked, replacement);
+            reservation.acked = null;
+        }
+        if (reservation.data) |replacement| {
+            self.replaceDataCapacity(reservation.allocator, replacement);
+            reservation.data = null;
+        }
+    }
+
+    fn replaceRangeCapacity(self: *CryptoTx, allocator: std.mem.Allocator, list: *RangeList, replacement: []Range) void {
+        _ = self;
+        const old_len = list.items.items.len;
+        if (list.items.capacity > 0) allocator.free(list.items.allocatedSlice());
+        list.items.items = replacement[0..old_len];
+        list.items.capacity = replacement.len;
+    }
+
+    fn replaceDataCapacity(self: *CryptoTx, allocator: std.mem.Allocator, replacement: []u8) void {
+        const old_len = self.data.items.len;
+        if (self.data.capacity > 0) {
+            crypto_secrets.secureZero(self.data.allocatedSlice());
+            allocator.free(self.data.allocatedSlice());
+        }
+        self.data.items = replacement[0..old_len];
+        self.data.capacity = replacement.len;
+    }
+
+    fn appendReserved(self: *CryptoTx, bytes: []const u8) void {
+        const start = self.bufferedEnd();
+        self.data.appendSliceAssumeCapacity(bytes);
+        self.pending.insertAssumeCapacity(.{
+            .start = start,
+            .end = start + bytes.len,
+        });
     }
 };
+
+fn applicationCryptoRangeBudget(bytes_len: usize) usize {
+    return (bytes_len + min_application_crypto_payload - 1) / min_application_crypto_payload + 8;
+}
 
 /// Driver-owned transmit buffer for one stream: bytes the application handed
 /// to `writeStream` that are unsent or unacked. `base` is the stream offset
@@ -364,7 +563,7 @@ pub const Connection = struct {
     known_streams: std.AutoHashMap(StreamId, void),
     accept_queue: std.ArrayList(StreamId) = .empty,
 
-    crypto_tx: [2]CryptoTx = .{ .{}, .{} },
+    crypto_tx: [3]CryptoTx = .{ .{}, .{}, .{} },
     sent_records: std.ArrayList(SentRecord) = .empty,
 
     next_pn: [3]u64 = .{ 0, 0, 0 },
@@ -482,6 +681,12 @@ pub const Connection = struct {
         );
         conn.handshake.manual_key_discard = true;
         conn.handshake.allow_unverified_certificate = options.allow_unverified_certificate;
+        if (options.role == .client) {
+            options.tls.setPostHandshakeAllocator(allocator) catch |err| {
+                conn.failHandshake(err);
+                return conn;
+            };
+        }
         conn.handshake.start(params) catch |err| {
             conn.failHandshake(err);
             return conn;
@@ -496,6 +701,7 @@ pub const Connection = struct {
 
     fn deinitPartial(self: *Connection) void {
         self.handshake.deinit();
+        self.adapter.deinit();
         if (self.streams) |*manager| manager.deinit();
         var it = self.send_queues.valueIterator();
         while (it.next()) |queue| {
@@ -959,6 +1165,9 @@ pub const Connection = struct {
 
     fn onRecordAcked(self: *Connection, record: SentRecord) void {
         if (record.carried_handshake_done) self.handshake_done_acked = true;
+        if (record.crypto) |range| {
+            if (record.space == .application) self.crypto_tx[2].markAcked(self.allocator, range);
+        }
         for (record.streams[0..record.stream_count]) |sr| {
             if (self.send_queues.get(sr.id)) |queue| {
                 queue.acked.insert(self.allocator, sr.range) catch {};
@@ -1006,11 +1215,17 @@ pub const Connection = struct {
             const tx = switch (record.space) {
                 .initial => &self.crypto_tx[0],
                 .handshake => &self.crypto_tx[1],
-                .application => return,
+                .application => &self.crypto_tx[2],
             };
             // If the level's keys are already discarded the buffer is gone.
             if (tx.data.items.len > 0) {
-                tx.pending.insert(self.allocator, range) catch {};
+                if (tx.liveRange(range)) |live| {
+                    if (record.space == .application) {
+                        tx.pending.insertAssumeCapacity(live);
+                    } else {
+                        tx.pending.insert(self.allocator, live) catch {};
+                    }
+                }
             }
         }
         for (record.streams[0..record.stream_count]) |sr| {
@@ -1125,9 +1340,10 @@ pub const Connection = struct {
     fn collectCryptoOutput(self: *Connection) !void {
         inline for (.{ EncryptionLevel.initial, EncryptionLevel.handshake }, 0..) |level, tx_index| {
             var chunk: [2048]u8 = undefined;
+            defer crypto_secrets.secureZero(&chunk);
             while (self.handshake.pollOutput(level, &chunk) catch null) |output| {
                 const tx = &self.crypto_tx[tx_index];
-                std.debug.assert(output.offset == tx.data.items.len);
+                std.debug.assert(output.offset == tx.bufferedEnd());
                 try tx.data.appendSlice(self.allocator, output.bytes);
                 try tx.pending.insert(self.allocator, .{
                     .start = output.offset,
@@ -1163,6 +1379,51 @@ pub const Connection = struct {
             return;
         };
         self.afterHandshakeProgress(now_us);
+    }
+
+    pub fn emitNewSessionTicket(
+        self: *Connection,
+        params: tls_handshake.EmitNewSessionTicketParams,
+        limits: tls_core.session.Limits,
+    ) tls_handshake.HandshakeError!tls_core.session.ServerRecoverableState {
+        if (self.state_ != .established or self.role != .server) return error.InvalidHandshakeState;
+        limits.validate() catch return error.IllegalParameter;
+        if (params.opaque_ticket.len == 0 or params.opaque_ticket.len > limits.max_ticket_len) return error.TicketTooLarge;
+        const emit_params: tls_core.new_session_ticket.EmitParams = .{
+            .ticket_lifetime = params.ticket_lifetime,
+            .ticket_age_add = params.ticket_age_add,
+            .ticket_nonce = params.ticket_nonce,
+            .ticket = params.opaque_ticket,
+            .max_early_data_size = params.max_early_data_size,
+        };
+        const body_len = tls_core.new_session_ticket.encodedLen(emit_params) catch return error.IllegalParameter;
+        const message_len = 4 + body_len;
+        const tx = &self.crypto_tx[2];
+        var reservation = tx.prepareAppend(self.allocator, message_len, max_application_crypto_outstanding) catch return error.HandshakeBufferOverflow;
+        defer reservation.deinit();
+
+        var sink = tls_handshake.EventSink{};
+        defer sink.deinit();
+        var ticket_state = try self.tls.emitNewSessionTicket(self.allocator, &sink, params, limits);
+        errdefer ticket_state.deinit();
+        tx.commitReservation(&reservation);
+        try self.queueApplicationCryptoEventsReserved(&sink, message_len);
+        return ticket_state;
+    }
+
+    fn queueApplicationCryptoEventsReserved(self: *Connection, sink: *tls_handshake.EventSink, expected_bytes: usize) tls_handshake.HandshakeError!void {
+        var appended: usize = 0;
+        for (sink.items[0..sink.len]) |event| {
+            switch (event) {
+                .handshake_bytes => |hb| {
+                    if (hb.epoch != .application) return error.UnexpectedCryptoLevel;
+                    self.crypto_tx[2].appendReserved(hb.data);
+                    appended += hb.data.len;
+                },
+                else => {},
+            }
+        }
+        if (appended != expected_bytes) return error.HandshakeBufferOverflow;
     }
 
     fn afterHandshakeProgress(self: *Connection, now_us: u64) void {
@@ -1682,7 +1943,7 @@ pub const Connection = struct {
         const has_crypto = switch (space) {
             .initial => !self.crypto_tx[0].pending.isEmpty(),
             .handshake => !self.crypto_tx[1].pending.isEmpty(),
-            .application => false,
+            .application => !self.crypto_tx[2].pending.isEmpty(),
         };
         const has_app = space == .application and self.hasAppContent();
         if (!want_ack and !has_crypto and !(has_app and can_send_data) and !probe) return null;
@@ -1741,14 +2002,29 @@ pub const Connection = struct {
             const tx = switch (space) {
                 .initial => &self.crypto_tx[0],
                 .handshake => &self.crypto_tx[1],
-                .application => unreachable,
+                .application => &self.crypto_tx[2],
             };
             while (!tx.pending.isEmpty() and plain_len + frame.max_crypto_overhead + 16 < plain_budget) {
                 const room: u64 = @intCast(plain_budget - plain_len - frame.max_crypto_overhead);
-                const range = tx.pending.takeFirst(room) orelse break;
-                const data = tx.data.items[@intCast(range.start)..@intCast(range.end)];
+                var range = tx.pending.takeFirst(room) orelse break;
+                range = tx.liveRange(range) orelse continue;
+                if (record.crypto) |existing| {
+                    if (existing.end != range.start) {
+                        if (space == .application) {
+                            tx.pending.insertAssumeCapacity(range);
+                        } else {
+                            tx.pending.insert(self.allocator, range) catch {};
+                        }
+                        break;
+                    }
+                }
+                const data = tx.slice(range);
                 const n = frame.encodeCrypto(range.start, data, plain[plain_len..plain_budget]) catch {
-                    tx.pending.insert(self.allocator, range) catch {};
+                    if (space == .application) {
+                        tx.pending.insertAssumeCapacity(range);
+                    } else {
+                        tx.pending.insert(self.allocator, range) catch {};
+                    }
                     break;
                 };
                 plain_len += n;
@@ -1756,9 +2032,7 @@ pub const Connection = struct {
                 // One crypto range per record keeps requeue simple; merge by
                 // extending when contiguous.
                 if (record.crypto) |existing| {
-                    if (existing.end == range.start) {
-                        record.crypto = .{ .start = existing.start, .end = range.end };
-                    }
+                    record.crypto = .{ .start = existing.start, .end = range.end };
                 } else {
                     record.crypto = range;
                 }
@@ -2100,6 +2374,105 @@ pub const Connection = struct {
 const testing = std.testing;
 const tls_backend_mod = @import("tls_backend.zig");
 
+test "application CRYPTO transmit ignores stale PTO ranges after original ACK" {
+    const allocator = testing.allocator;
+    var tx = CryptoTx{};
+    defer tx.deinit(allocator);
+
+    try tx.reserveAppend(allocator, 8, max_application_crypto_outstanding);
+    tx.appendReserved("ticket-1");
+    try tx.pending.insert(allocator, .{ .start = 0, .end = 8 });
+
+    tx.markAcked(allocator, .{ .start = 0, .end = 8 });
+    try testing.expectEqual(@as(u64, 8), tx.base);
+    try testing.expectEqual(@as(usize, 0), tx.data.items.len);
+    try testing.expect(tx.pending.isEmpty());
+}
+
+test "application CRYPTO transmit ignores late duplicate ACKs and compacts later data" {
+    const allocator = testing.allocator;
+    var tx = CryptoTx{};
+    defer tx.deinit(allocator);
+
+    try tx.reserveAppend(allocator, 16, max_application_crypto_outstanding);
+    tx.appendReserved("ticket-1ticket-2");
+
+    tx.markAcked(allocator, .{ .start = 0, .end = 8 });
+    tx.markAcked(allocator, .{ .start = 0, .end = 8 });
+    tx.markAcked(allocator, .{ .start = 8, .end = 16 });
+
+    try testing.expectEqual(@as(u64, 16), tx.base);
+    try testing.expectEqual(@as(usize, 0), tx.data.items.len);
+    try testing.expect(tx.acked.isEmpty());
+    try testing.expect(tx.pending.isEmpty());
+}
+
+test "application CRYPTO transmit clamps lost duplicate ranges below base" {
+    const allocator = testing.allocator;
+    var tx = CryptoTx{};
+    defer tx.deinit(allocator);
+
+    try tx.reserveAppend(allocator, 16, max_application_crypto_outstanding);
+    tx.appendReserved("ticket-ticket-12");
+    tx.markAcked(allocator, .{ .start = 0, .end = 8 });
+
+    const live = tx.liveRange(.{ .start = 0, .end = 16 }) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(Range{ .start = 8, .end = 16 }, live);
+}
+
+test "application CRYPTO transmit allocates exact storage and frees after ACK" {
+    const allocator = testing.allocator;
+    var tx = CryptoTx{};
+    defer tx.deinit(allocator);
+
+    try tx.reserveAppend(allocator, 12, max_application_crypto_outstanding);
+    tx.appendReserved("small-ticket");
+    try testing.expectEqual(@as(usize, 12), tx.data.capacity);
+    try testing.expect(tx.data.capacity < max_application_crypto_outstanding);
+
+    tx.markAcked(allocator, .{ .start = 0, .end = 12 });
+    try testing.expectEqual(@as(usize, 0), tx.data.items.len);
+    try testing.expectEqual(@as(usize, 0), tx.data.capacity);
+    try testing.expect(tx.pending.isEmpty());
+    try testing.expect(tx.acked.isEmpty());
+}
+
+test "application CRYPTO transmit allows second outstanding ticket" {
+    const allocator = testing.allocator;
+    var tx = CryptoTx{};
+    defer tx.deinit(allocator);
+
+    try tx.reserveAppend(allocator, 12, max_application_crypto_outstanding);
+    tx.appendReserved("first-ticket");
+    try tx.reserveAppend(allocator, 13, max_application_crypto_outstanding);
+    tx.appendReserved("second-ticket");
+
+    try testing.expectEqual(@as(usize, 25), tx.data.items.len);
+    try testing.expectEqual(@as(usize, 25), tx.data.capacity);
+    try testing.expectEqualStrings("first-ticketsecond-ticket", tx.data.items);
+    try testing.expect(tx.pending.coversPrefix(25));
+}
+
+test "application CRYPTO reservation failure leaves empty state retryable" {
+    for (0..3) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_index });
+        var tx = CryptoTx{};
+        defer tx.deinit(testing.allocator);
+
+        try testing.expectError(error.OutOfMemory, tx.reserveAppend(failing.allocator(), 12, max_application_crypto_outstanding));
+        try testing.expectEqual(@as(usize, 0), tx.data.items.len);
+        try testing.expectEqual(@as(usize, 0), tx.data.capacity);
+        try testing.expect(tx.pending.isEmpty());
+        try testing.expect(tx.acked.isEmpty());
+
+        const retry = "larger-ticket-after-failed-reserve";
+        try tx.reserveAppend(testing.allocator, retry.len, max_application_crypto_outstanding);
+        tx.appendReserved(retry);
+        try testing.expectEqual(retry.len, tx.data.items.len);
+        tx.markAcked(testing.allocator, .{ .start = 0, .end = retry.len });
+    }
+}
+
 const TestPair = struct {
     client_backend: tls_backend_mod.Tls13Backend,
     server_backend: tls_backend_mod.Tls13Backend,
@@ -2146,6 +2519,49 @@ const TestPair = struct {
         return pair;
     }
 
+    fn initWithTicketConsumer(
+        allocator: std.mem.Allocator,
+        limits: tls_core.session.Limits,
+        consumer: tls_core.tls13_backend.Tls13Backend.SessionTicketConsumer,
+    ) !*TestPair {
+        const pair = try allocator.create(TestPair);
+        pair.* = .{
+            .client_backend = try tls_backend_mod.Tls13Backend.initClientWithAllocator(
+                allocator,
+                .{ .hello_random = [_]u8{0xc1} ** 32, .key_share_seed = [_]u8{0x11} ** 32 },
+                .{ .pinned_certificate = tls_backend_mod.testdata.certificate_der },
+            ),
+            .server_backend = tls_backend_mod.Tls13Backend.initServerWithAllocator(
+                allocator,
+                .{ .hello_random = [_]u8{0x51} ** 32, .key_share_seed = [_]u8{0x22} ** 32 },
+                try tls_backend_mod.Identity.initPkcs8(
+                    tls_backend_mod.testdata.certificate_der,
+                    tls_backend_mod.testdata.private_key_pkcs8_der,
+                ),
+            ),
+        };
+        errdefer allocator.destroy(pair);
+        try pair.client_backend.engine.setSessionTicketConsumer(allocator, limits, consumer);
+        pair.client = try Connection.init(allocator, .{
+            .role = .client,
+            .local_cid = &client_cid,
+            .original_dcid = &odcid,
+            .peer_cid = &odcid,
+            .tls = pair.client_backend.backend(),
+            .now_us = pair.now_us,
+        });
+        errdefer pair.client.deinit();
+        pair.server = try Connection.init(allocator, .{
+            .role = .server,
+            .local_cid = &odcid,
+            .original_dcid = &odcid,
+            .peer_cid = &client_cid,
+            .tls = pair.server_backend.backend(),
+            .now_us = pair.now_us,
+        });
+        return pair;
+    }
+
     fn initClientAuth(
         allocator: std.mem.Allocator,
         client_provider: tls_core.credentials.CredentialProvider,
@@ -2153,11 +2569,13 @@ const TestPair = struct {
     ) !*TestPair {
         const pair = try allocator.create(TestPair);
         pair.* = .{
-            .client_backend = tls_backend_mod.Tls13Backend.initClient(
+            .client_backend = try tls_backend_mod.Tls13Backend.initClientWithAllocator(
+                allocator,
                 .{ .hello_random = [_]u8{0xc1} ** 32, .key_share_seed = [_]u8{0x11} ** 32 },
                 .{ .pinned_certificate = tls_backend_mod.testdata.certificate_der },
             ),
-            .server_backend = tls_backend_mod.Tls13Backend.initServer(
+            .server_backend = tls_backend_mod.Tls13Backend.initServerWithAllocator(
+                allocator,
                 .{ .hello_random = [_]u8{0x51} ** 32, .key_share_seed = [_]u8{0x22} ** 32 },
                 try tls_backend_mod.Identity.initPkcs8(
                     tls_backend_mod.testdata.certificate_der,
@@ -2223,7 +2641,8 @@ test "Connection.init failure before the handshake is assigned does not deinit u
     // was assigned -- deinitPartial()'s errdefer would then call
     // .deinit() on undefined storage. This must fail cleanly instead.
     const too_short_dcid = [_]u8{0xaa} ** (tls_adapter.min_initial_dcid_len - 1);
-    var backend = tls_backend_mod.Tls13Backend.initClient(
+    var backend = try tls_backend_mod.Tls13Backend.initClientWithAllocator(
+        allocator,
         .{ .hello_random = [_]u8{0xc1} ** 32, .key_share_seed = [_]u8{0x11} ** 32 },
         .{ .pinned_certificate = tls_backend_mod.testdata.certificate_der },
     );
@@ -2281,6 +2700,356 @@ test "driver: bidirectional stream data round-trips with FIN" {
 
     try testing.expectEqual(quic_stream.StreamState.closed, pair.client.streamState(id).?);
     try testing.expectEqual(quic_stream.StreamState.closed, pair.server.streamState(id).?);
+}
+
+test "driver: server NewSessionTicket uses application CRYPTO retransmission and stream traffic continues" {
+    const Capture = struct {
+        count: usize = 0,
+        ticket_len: usize = 0,
+
+        fn now(_: *anyopaque) i64 {
+            return 10;
+        }
+
+        fn onTicket(ctx: *anyopaque, ticket: *const tls_core.session.ClientTicketState) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.count += 1;
+            self.ticket_len = ticket.ticket.slice().len;
+        }
+    };
+
+    const allocator = testing.allocator;
+    var capture = Capture{};
+    var pair = try TestPair.initWithTicketConsumer(allocator, tls_core.session.Limits.default, .{
+        .ctx = &capture,
+        .nowUnixMsFn = Capture.now,
+        .onTicketFn = Capture.onTicket,
+    });
+    defer pair.deinit(allocator);
+    try pair.pump();
+
+    var server_state = try pair.server.emitNewSessionTicket(.{
+        .ticket_lifetime = 60,
+        .ticket_age_add = 1,
+        .ticket_nonce = "\x01",
+        .opaque_ticket = "connection-ticket",
+        .issued_at_unix_ms = 10,
+    }, tls_core.session.Limits.default);
+    defer server_state.deinit();
+
+    var datagram: [2048]u8 = undefined;
+    const dropped = pair.server.pollTransmit(&datagram, pair.now_us) orelse return error.TestExpectedEqual;
+    try testing.expect(dropped.len > 0);
+    const sent = pair.server.sent_records.items[pair.server.sent_records.items.len - 1];
+    try testing.expectEqual(PacketNumberSpace.application, sent.space);
+    try testing.expect(sent.crypto != null);
+    pair.server.requeueRecord(sent);
+
+    try pair.pump();
+    try testing.expectEqual(@as(usize, 1), capture.count);
+    try testing.expectEqual(@as(usize, "connection-ticket".len), capture.ticket_len);
+
+    const id = try pair.client.openStream(.bidi);
+    try testing.expectEqual(@as(usize, 5), try pair.client.writeStream(id, "after", true));
+    try pair.pump();
+    try testing.expectEqual(@as(?StreamId, id), pair.server.acceptStream());
+    var buf: [16]u8 = undefined;
+    const request = try pair.server.readStream(id, &buf);
+    try testing.expectEqualStrings("after", buf[0..request.len]);
+}
+
+test "driver: maximum NewSessionTicket survives real loss reordering PTO and ACK cleanup" {
+    const Capture = struct {
+        allocator: std.mem.Allocator,
+        retained: tls_core.session.ClientTicketState = .{},
+        count: usize = 0,
+
+        fn now(_: *anyopaque) i64 {
+            return 10;
+        }
+
+        fn onTicket(ctx: *anyopaque, ticket: *const tls_core.session.ClientTicketState) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            ticket.cloneInto(self.allocator, &self.retained) catch unreachable;
+            self.count += 1;
+        }
+    };
+
+    const allocator = testing.allocator;
+    const limits = tls_core.session.Limits{
+        .max_ticket_len = tls_core.session.absolute_ticket_wire_max,
+        .max_serialized_len = 128 * 1024,
+    };
+    const opaque_ticket = try allocator.alloc(u8, tls_core.session.absolute_ticket_wire_max);
+    defer allocator.free(opaque_ticket);
+    for (opaque_ticket, 0..) |*byte, index| byte.* = @intCast(index % 251);
+
+    var capture = Capture{ .allocator = allocator };
+    defer capture.retained.deinit();
+    var pair = try TestPair.initWithTicketConsumer(allocator, limits, .{
+        .ctx = &capture,
+        .nowUnixMsFn = Capture.now,
+        .onTicketFn = Capture.onTicket,
+    });
+    defer pair.deinit(allocator);
+    try pair.pump();
+
+    var server_state = try pair.server.emitNewSessionTicket(.{
+        .ticket_lifetime = 60,
+        .ticket_age_add = 0x11223344,
+        .ticket_nonce = "\x01\x02",
+        .opaque_ticket = opaque_ticket,
+        .issued_at_unix_ms = 10,
+    }, limits);
+    defer server_state.deinit();
+    try testing.expect(pair.server.crypto_tx[2].data.items.len > max_datagram_size);
+
+    var datagrams = std.ArrayList([]u8).empty;
+    defer {
+        for (datagrams.items) |copy| allocator.free(copy);
+        datagrams.deinit(allocator);
+    }
+    var buf: [max_datagram_size]u8 = undefined;
+    while (pair.server.pollTransmit(&buf, pair.now_us)) |datagram| {
+        const copy = try allocator.dupe(u8, datagram);
+        errdefer allocator.free(copy);
+        try datagrams.append(allocator, copy);
+        pair.now_us += 500;
+    }
+    try testing.expect(datagrams.items.len > 5);
+
+    var index = datagrams.items.len;
+    while (index > 0) {
+        index -= 1;
+        if (index == 1 or index == 3) continue;
+        try pair.client.ingest(datagrams.items[index], pair.now_us);
+        pair.now_us += 500;
+    }
+
+    while (pair.client.pollTransmit(&buf, pair.now_us)) |ack| {
+        try pair.server.ingest(ack, pair.now_us);
+        pair.now_us += 500;
+    }
+    if (pair.server.metrics.packets_lost == 0) {
+        if (pair.server.nextTimeoutUs()) |deadline| pair.now_us = @max(pair.now_us + 1, deadline);
+        pair.server.onTimeout(pair.now_us);
+    }
+    try testing.expect(pair.server.metrics.packets_lost > 0 or pair.server.metrics.pto_count_total > 0);
+
+    var rounds: usize = 0;
+    while (rounds < 400 and capture.count == 0) : (rounds += 1) {
+        try pair.pump();
+        if (capture.count != 0) break;
+        if (pair.server.nextTimeoutUs()) |deadline| {
+            pair.now_us = @max(pair.now_us + 1, deadline);
+            pair.server.onTimeout(pair.now_us);
+        }
+        if (pair.client.nextTimeoutUs()) |deadline| {
+            pair.now_us = @max(pair.now_us + 1, deadline);
+            pair.client.onTimeout(pair.now_us);
+        }
+    }
+    try testing.expectEqual(@as(usize, 1), capture.count);
+    try testing.expectEqualSlices(u8, opaque_ticket, capture.retained.ticket.slice());
+    try testing.expectEqualSlices(u8, "\x01\x02", capture.retained.ticket_nonce.slice());
+    try testing.expectEqualSlices(u8, server_state.common.resumption_psk.slice(), capture.retained.common.resumption_psk.slice());
+
+    rounds = 0;
+    while (rounds < 200 and pair.server.crypto_tx[2].data.capacity > 0) : (rounds += 1) {
+        if (pair.client.nextTimeoutUs()) |deadline| {
+            pair.now_us = @max(pair.now_us + 1, deadline);
+            pair.client.onTimeout(pair.now_us);
+        }
+        try pair.pump();
+        if (pair.server.nextTimeoutUs()) |deadline| {
+            pair.now_us = @max(pair.now_us + 1, deadline);
+            pair.server.onTimeout(pair.now_us);
+        }
+    }
+    try testing.expectEqual(@as(usize, 0), pair.server.crypto_tx[2].data.items.len);
+    try testing.expectEqual(@as(usize, 0), pair.server.crypto_tx[2].data.capacity);
+    try testing.expect(pair.server.crypto_tx[2].pending.isEmpty());
+    try testing.expect(pair.server.crypto_tx[2].acked.isEmpty());
+
+    const stream_id = try pair.client.openStream(.bidi);
+    try testing.expectEqual(@as(usize, 5), try pair.client.writeStream(stream_id, "after", true));
+    try pair.pump();
+    try testing.expectEqual(@as(?StreamId, stream_id), pair.server.acceptStream());
+    var stream_buf: [16]u8 = undefined;
+    const request = try pair.server.readStream(stream_id, &stream_buf);
+    try testing.expectEqualStrings("after", stream_buf[0..request.len]);
+}
+
+test "driver: server emits two outstanding tickets in order before ACK" {
+    const Capture = struct {
+        count: usize = 0,
+        ticket_lens: [2]usize = .{ 0, 0 },
+        psks: [2][tls_core.session.max_psk_len]u8 = .{ [_]u8{0} ** tls_core.session.max_psk_len, [_]u8{0} ** tls_core.session.max_psk_len },
+        psk_lens: [2]usize = .{ 0, 0 },
+
+        fn now(_: *anyopaque) i64 {
+            return 10;
+        }
+
+        fn onTicket(ctx: *anyopaque, ticket: *const tls_core.session.ClientTicketState) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            const index = self.count;
+            if (index < self.ticket_lens.len) {
+                self.ticket_lens[index] = ticket.ticket.slice().len;
+                const psk = ticket.common.resumption_psk.slice();
+                @memcpy(self.psks[index][0..psk.len], psk);
+                self.psk_lens[index] = psk.len;
+            }
+            self.count += 1;
+        }
+    };
+
+    const allocator = testing.allocator;
+    var capture = Capture{};
+    var pair = try TestPair.initWithTicketConsumer(allocator, tls_core.session.Limits.default, .{
+        .ctx = &capture,
+        .nowUnixMsFn = Capture.now,
+        .onTicketFn = Capture.onTicket,
+    });
+    defer pair.deinit(allocator);
+    try pair.pump();
+
+    var state_a = try pair.server.emitNewSessionTicket(.{
+        .ticket_lifetime = 60,
+        .ticket_age_add = 1,
+        .ticket_nonce = "\x01",
+        .opaque_ticket = "ticket-a",
+        .issued_at_unix_ms = 10,
+    }, tls_core.session.Limits.default);
+    defer state_a.deinit();
+    var state_b = try pair.server.emitNewSessionTicket(.{
+        .ticket_lifetime = 60,
+        .ticket_age_add = 2,
+        .ticket_nonce = "\x02",
+        .opaque_ticket = "ticket-b",
+        .issued_at_unix_ms = 10,
+    }, tls_core.session.Limits.default);
+    defer state_b.deinit();
+
+    try pair.pump();
+    try testing.expectEqual(@as(usize, 2), capture.count);
+    try testing.expectEqual(@as(usize, "ticket-a".len), capture.ticket_lens[0]);
+    try testing.expectEqual(@as(usize, "ticket-b".len), capture.ticket_lens[1]);
+    try testing.expectEqual(state_a.common.resumption_psk.slice().len, capture.psk_lens[0]);
+    try testing.expectEqual(state_b.common.resumption_psk.slice().len, capture.psk_lens[1]);
+    try testing.expectEqualSlices(u8, state_a.common.resumption_psk.slice(), capture.psks[0][0..capture.psk_lens[0]]);
+    try testing.expectEqualSlices(u8, state_b.common.resumption_psk.slice(), capture.psks[1][0..capture.psk_lens[1]]);
+    try testing.expect(!std.mem.eql(u8, capture.psks[0][0..capture.psk_lens[0]], capture.psks[1][0..capture.psk_lens[1]]));
+
+    const id = try pair.client.openStream(.bidi);
+    try testing.expectEqual(@as(usize, 5), try pair.client.writeStream(id, "after", true));
+    try pair.pump();
+    try testing.expectEqual(@as(?StreamId, id), pair.server.acceptStream());
+    var buf: [16]u8 = undefined;
+    const request = try pair.server.readStream(id, &buf);
+    try testing.expectEqualStrings("after", buf[0..request.len]);
+}
+
+test "driver: ordinary no-consumer client drops server ticket and remains usable" {
+    const allocator = testing.allocator;
+    var pair = try TestPair.init(allocator);
+    defer pair.deinit(allocator);
+    try pair.pump();
+
+    var server_state = try pair.server.emitNewSessionTicket(.{
+        .ticket_lifetime = 60,
+        .ticket_age_add = 1,
+        .ticket_nonce = "\x01",
+        .opaque_ticket = "drop-this-ticket",
+        .issued_at_unix_ms = 10,
+    }, tls_core.session.Limits.default);
+    defer server_state.deinit();
+    try pair.pump();
+
+    try testing.expectEqual(State.established, pair.client.state());
+    try testing.expectEqual(State.established, pair.server.state());
+
+    const id = try pair.client.openStream(.bidi);
+    try testing.expectEqual(@as(usize, 4), try pair.client.writeStream(id, "ping", true));
+    try pair.pump();
+    try testing.expectEqual(@as(?StreamId, id), pair.server.acceptStream());
+    var buf: [16]u8 = undefined;
+    const request = try pair.server.readStream(id, &buf);
+    try testing.expectEqualStrings("ping", buf[0..request.len]);
+}
+
+test "driver: application CRYPTO ticket budget refuses one-over before queueing" {
+    const allocator = testing.allocator;
+    var pair = try TestPair.init(allocator);
+    defer pair.deinit(allocator);
+    try pair.pump();
+
+    var tx = &pair.server.crypto_tx[2];
+    try tx.reserveAppend(allocator, max_application_crypto_outstanding, max_application_crypto_outstanding);
+    const filler = try allocator.alloc(u8, max_application_crypto_outstanding);
+    defer allocator.free(filler);
+    @memset(filler, 0xa5);
+    tx.appendReserved(filler);
+
+    try testing.expectError(error.HandshakeBufferOverflow, pair.server.emitNewSessionTicket(.{
+        .ticket_lifetime = 60,
+        .ticket_age_add = 1,
+        .ticket_nonce = "\x01",
+        .opaque_ticket = "one-over",
+        .issued_at_unix_ms = 10,
+    }, tls_core.session.Limits.default));
+    try testing.expectEqual(max_application_crypto_outstanding, pair.server.crypto_tx[2].data.items.len);
+}
+
+test "driver: ticket model limit refusal happens before CRYPTO allocation" {
+    const allocator = testing.allocator;
+    var pair = try TestPair.init(allocator);
+    defer pair.deinit(allocator);
+    try pair.pump();
+
+    const too_large = try allocator.alloc(u8, tls_core.session.Limits.default.max_ticket_len + 1);
+    defer allocator.free(too_large);
+    @memset(too_large, 0x5a);
+
+    try testing.expectError(error.TicketTooLarge, pair.server.emitNewSessionTicket(.{
+        .ticket_lifetime = 60,
+        .ticket_age_add = 1,
+        .ticket_nonce = "\x01",
+        .opaque_ticket = too_large,
+        .issued_at_unix_ms = 10,
+    }, tls_core.session.Limits.default));
+    try testing.expectEqual(@as(usize, 0), pair.server.crypto_tx[2].data.items.len);
+    try testing.expectEqual(@as(usize, 0), pair.server.crypto_tx[2].data.capacity);
+    try testing.expect(pair.server.crypto_tx[2].pending.isEmpty());
+}
+
+test "driver: backend ticket rejection leaves CRYPTO reservation uncommitted" {
+    const allocator = testing.allocator;
+    var pair = try TestPair.init(allocator);
+    defer pair.deinit(allocator);
+    try pair.pump();
+
+    try testing.expectError(error.InvalidHandshakeState, pair.server.emitNewSessionTicket(.{
+        .ticket_lifetime = 0,
+        .ticket_age_add = 1,
+        .ticket_nonce = "\x01",
+        .opaque_ticket = "ticket",
+        .issued_at_unix_ms = 10,
+    }, tls_core.session.Limits.default));
+    try testing.expectEqual(@as(usize, 0), pair.server.crypto_tx[2].data.items.len);
+    try testing.expectEqual(@as(usize, 0), pair.server.crypto_tx[2].data.capacity);
+    try testing.expect(pair.server.crypto_tx[2].pending.isEmpty());
+    try testing.expect(pair.server.crypto_tx[2].acked.isEmpty());
+
+    var state = try pair.server.emitNewSessionTicket(.{
+        .ticket_lifetime = 60,
+        .ticket_age_add = 1,
+        .ticket_nonce = "\x01",
+        .opaque_ticket = "ticket",
+        .issued_at_unix_ms = 10,
+    }, tls_core.session.Limits.default);
+    defer state.deinit();
+    try testing.expect(pair.server.crypto_tx[2].data.items.len > 0);
 }
 
 test "driver: local close reaches the peer and both sides drain" {
@@ -2483,11 +3252,13 @@ test "a real Connection closes with handshake_failure when the server has no app
 
         const pair = try allocator.create(TestPair);
         pair.* = .{
-            .client_backend = tls_backend_mod.Tls13Backend.initClient(
+            .client_backend = try tls_backend_mod.Tls13Backend.initClientWithAllocator(
+                allocator,
                 .{ .hello_random = [_]u8{0xc1} ** 32, .key_share_seed = [_]u8{0x11} ** 32 },
                 .{ .pinned_certificate = tls_backend_mod.testdata.certificate_der },
             ),
-            .server_backend = tls_backend_mod.Tls13Backend.initServer(
+            .server_backend = tls_backend_mod.Tls13Backend.initServerWithAllocator(
+                allocator,
                 .{ .hello_random = [_]u8{0x51} ** 32, .key_share_seed = [_]u8{0x22} ** 32 },
                 try tls_backend_mod.Identity.initPkcs8(tls_backend_mod.testdata.certificate_der, tls_backend_mod.testdata.private_key_pkcs8_der),
             ),

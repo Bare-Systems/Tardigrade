@@ -2277,12 +2277,20 @@ fn parsePidField(stdout: []const u8, field: []const u8) !std.posix.pid_t {
     return error.InvalidPidLine;
 }
 
-fn expectNoProcess(pid: std.posix.pid_t) !void {
+fn processExists(pid: std.posix.pid_t) !bool {
     std.posix.kill(pid, @enumFromInt(0)) catch |err| switch (err) {
-        error.ProcessNotFound => return,
-        error.PermissionDenied => return error.TestUnexpectedResult,
+        error.ProcessNotFound => return false,
+        error.PermissionDenied => return true,
         else => return err,
     };
+    return true;
+}
+
+fn expectNoProcess(pid: std.posix.pid_t) !void {
+    for (0..20) |_| {
+        if (!try processExists(pid)) return;
+        compat.sleepNs(50 * std.time.ns_per_ms);
+    }
     return error.TestUnexpectedResult;
 }
 

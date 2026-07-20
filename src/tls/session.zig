@@ -122,11 +122,14 @@ pub const CompatSnapshot = struct {
     pub const InitError = error{ OutOfMemory, CompatSnapshotTooLarge, InvalidLimits };
 
     /// `self` must be zero-valued (`.{}`) or a previously-initialized,
-    /// live `CompatSnapshot` — never `undefined` memory: on entry this
-    /// safely releases whatever `self` currently owns (a no-op if `self`
-    /// is already zero-valued) before installing the new blob, so calling
-    /// `init` again on an already-live snapshot cannot leak the prior
-    /// allocation.
+    /// live `CompatSnapshot` — never `undefined` memory. The new value is
+    /// built in a private temporary and only committed into `self` (via
+    /// `moveFrom`) after every fallible step succeeds, so `data` is fully
+    /// copied *before* anything `self` currently owns is touched — this
+    /// makes it safe to reinitialize from a slice borrowed from `self`'s
+    /// own current storage (e.g. `snap.init(alloc, id, v, snap.slice(),
+    /// limit)`), which an eager `self.deinit()` at the top would otherwise
+    /// wipe out from under `data` before it was copied.
     ///
     /// `limit` is still checked against the absolute module cap
     /// (`hard_max_compat_len`) here, not just against `data.len`: this
@@ -143,13 +146,16 @@ pub const CompatSnapshot = struct {
     ) InitError!void {
         if (limit > hard_max_compat_len) return error.InvalidLimits;
         if (data.len > limit) return error.CompatSnapshotTooLarge;
-        self.deinit();
-        self.format_id = format_id;
-        self.format_version = snapshot_version;
-        self.blob.init(allocator, data.len, data) catch |err| switch (err) {
+
+        var next: CompatSnapshot = .{};
+        errdefer next.deinit();
+        next.format_id = format_id;
+        next.format_version = snapshot_version;
+        next.blob.init(allocator, data.len, data) catch |err| switch (err) {
             error.SecretTooLarge => return error.CompatSnapshotTooLarge,
             else => return error.OutOfMemory,
         };
+        self.moveFrom(&next);
     }
 
     pub fn deinit(self: *CompatSnapshot) void {
@@ -167,12 +173,20 @@ pub const CompatSnapshot = struct {
     }
 
     /// `out` must be zero-valued or a previously-initialized, live
-    /// `CompatSnapshot` — never `undefined` memory (see `init`).
+    /// `CompatSnapshot` — never `undefined` memory (see `init`). Cloning
+    /// into itself (`self == out`) is a safe no-op: `self`'s data is
+    /// fully copied into a private temporary before `out` (which may be
+    /// `self`) is ever touched, so there is no risk of erasing the only
+    /// source before it has been read.
     pub fn cloneInto(self: *const CompatSnapshot, allocator: std.mem.Allocator, out: *CompatSnapshot) error{OutOfMemory}!void {
-        out.deinit();
-        out.format_id = self.format_id;
-        out.format_version = self.format_version;
-        out.blob.init(allocator, self.blob.slice().len, self.blob.slice()) catch return error.OutOfMemory;
+        if (@intFromPtr(self) == @intFromPtr(out)) return;
+
+        var next: CompatSnapshot = .{};
+        errdefer next.deinit();
+        next.format_id = self.format_id;
+        next.format_version = self.format_version;
+        next.blob.init(allocator, self.blob.slice().len, self.blob.slice()) catch return error.OutOfMemory;
+        out.moveFrom(&next);
     }
 
     /// Transfers ownership of `source`'s allocation into `self`. `source`
@@ -326,6 +340,13 @@ pub const ResumableSessionCommon = struct {
         CompatSnapshotTooLarge,
     };
 
+    /// `self` must be zero-valued or a previously-initialized, live value
+    /// — never `undefined` memory. The new value is built in a private
+    /// temporary and only committed into `self` (via `moveFrom`) after
+    /// every fallible step succeeds, so any `params` slice borrowed from
+    /// `self`'s own current storage (e.g. reinitializing with
+    /// `self.resumption_psk.slice()`) is fully copied before anything
+    /// `self` currently owns is touched.
     pub fn init(
         self: *ResumableSessionCommon,
         allocator: std.mem.Allocator,
@@ -343,42 +364,38 @@ pub const ResumableSessionCommon = struct {
             .early_data_capable => |max| if (max == 0) return error.InvalidEarlyDataPolicy,
         }
 
-        // `self` must be zero-valued or a previously-initialized, live
-        // value — never `undefined` memory. `deinit` safely releases
-        // whatever `self` currently owns (a no-op if already zero-valued)
-        // before this reinitializes it, so calling `init` again on an
-        // already-live value cannot leak the prior PSK/compat allocations.
-        self.deinit();
-        self.* = .{};
-        errdefer self.deinit();
+        var next: ResumableSessionCommon = .{};
+        errdefer next.deinit();
 
-        self.cipher_suite = params.cipher_suite;
-        self.auth_binding = params.auth_binding;
-        self.issued_at_unix_ms = params.issued_at_unix_ms;
-        self.lifetime_seconds = params.lifetime_seconds;
-        self.early_data = params.early_data;
+        next.cipher_suite = params.cipher_suite;
+        next.auth_binding = params.auth_binding;
+        next.issued_at_unix_ms = params.issued_at_unix_ms;
+        next.lifetime_seconds = params.lifetime_seconds;
+        next.early_data = params.early_data;
 
         if (params.server_name) |raw| {
             if (raw.len == 0) return error.EmptyServerName;
-            self.server_name = try SniName.init(raw);
+            next.server_name = try SniName.init(raw);
         }
         if (params.application_protocol) |raw| {
             if (raw.len == 0) return error.EmptyApplicationProtocol;
-            self.application_protocol = try AlpnProtocol.init(raw);
+            next.application_protocol = try AlpnProtocol.init(raw);
         }
 
-        self.resumption_psk.replace(params.resumption_psk) catch unreachable;
+        next.resumption_psk.replace(params.resumption_psk) catch unreachable;
 
         if (params.transport_compat) |blob| {
-            var snap = CompatSnapshot{};
+            var snap: CompatSnapshot = .{};
             try snap.init(allocator, blob.format_id, blob.format_version, blob.bytes, limits.max_transport_compat_len);
-            self.transport_compat = snap;
+            next.transport_compat = snap;
         }
         if (params.application_compat) |blob| {
-            var snap = CompatSnapshot{};
+            var snap: CompatSnapshot = .{};
             try snap.init(allocator, blob.format_id, blob.format_version, blob.bytes, limits.max_application_compat_len);
-            self.application_compat = snap;
+            next.application_compat = snap;
         }
+
+        self.moveFrom(&next);
     }
 
     pub fn deinit(self: *ResumableSessionCommon) void {
@@ -390,35 +407,40 @@ pub const ResumableSessionCommon = struct {
     }
 
     /// `out` must be zero-valued or a previously-initialized, live value —
-    /// never `undefined` memory (see `init`).
+    /// never `undefined` memory (see `init`). Cloning into itself (`self
+    /// == out`) is a safe no-op: `self` is fully read into a private
+    /// temporary before `out` (which may be `self`) is ever touched.
     pub fn cloneInto(
         self: *const ResumableSessionCommon,
         allocator: std.mem.Allocator,
         out: *ResumableSessionCommon,
     ) error{OutOfMemory}!void {
-        out.deinit();
-        out.* = .{};
-        errdefer out.deinit();
+        if (@intFromPtr(self) == @intFromPtr(out)) return;
 
-        out.cipher_suite = self.cipher_suite;
-        out.server_name = self.server_name;
-        out.application_protocol = self.application_protocol;
-        out.auth_binding = self.auth_binding;
-        out.issued_at_unix_ms = self.issued_at_unix_ms;
-        out.lifetime_seconds = self.lifetime_seconds;
-        out.early_data = self.early_data;
-        out.resumption_psk = self.resumption_psk.copy();
+        var next: ResumableSessionCommon = .{};
+        errdefer next.deinit();
+
+        next.cipher_suite = self.cipher_suite;
+        next.server_name = self.server_name;
+        next.application_protocol = self.application_protocol;
+        next.auth_binding = self.auth_binding;
+        next.issued_at_unix_ms = self.issued_at_unix_ms;
+        next.lifetime_seconds = self.lifetime_seconds;
+        next.early_data = self.early_data;
+        next.resumption_psk = self.resumption_psk.copy();
 
         if (self.transport_compat) |*snap| {
-            var cloned = CompatSnapshot{};
+            var cloned: CompatSnapshot = .{};
             try snap.cloneInto(allocator, &cloned);
-            out.transport_compat = cloned;
+            next.transport_compat = cloned;
         }
         if (self.application_compat) |*snap| {
-            var cloned = CompatSnapshot{};
+            var cloned: CompatSnapshot = .{};
             try snap.cloneInto(allocator, &cloned);
-            out.application_compat = cloned;
+            next.application_compat = cloned;
         }
+
+        out.moveFrom(&next);
     }
 
     /// Transfers ownership of `source`'s secret/blob storage into `self`.
@@ -485,7 +507,13 @@ pub const ClientTicketState = struct {
     /// moving it out of the caller's variable: on every path (success or
     /// failure) `common.*` becomes zero-valued and safe to `deinit` or
     /// reinitialize, and it is never left duplicated between caller and
-    /// callee.
+    /// callee. `self` must be zero-valued or a previously-initialized,
+    /// live value — never `undefined` memory. The new value is built in a
+    /// private temporary and only committed into `self` (via `moveFrom`)
+    /// after every fallible step succeeds, so a `params.ticket`/
+    /// `params.ticket_nonce` slice borrowed from `self`'s own current
+    /// storage is fully copied before anything `self` currently owns is
+    /// touched.
     pub fn init(
         self: *ClientTicketState,
         allocator: std.mem.Allocator,
@@ -495,24 +523,22 @@ pub const ClientTicketState = struct {
     ) InitError!void {
         try limits.validate();
 
-        // `self` must be zero-valued or a previously-initialized, live
-        // value — never `undefined` memory (see
-        // `ResumableSessionCommon.init`).
-        self.deinit();
-        self.* = .{};
-        self.common.moveFrom(common);
-        errdefer self.deinit();
+        var next: ClientTicketState = .{};
+        next.common.moveFrom(common);
+        errdefer next.deinit();
 
         if (params.ticket.len == 0 or params.ticket.len > limits.max_ticket_len) return error.TicketTooLarge;
         if (params.ticket_nonce.len > max_ticket_nonce_len) return error.NonceTooLarge;
 
-        self.ticket.init(allocator, params.ticket.len, params.ticket) catch |err| switch (err) {
+        next.ticket.init(allocator, params.ticket.len, params.ticket) catch |err| switch (err) {
             error.SecretTooLarge => return error.TicketTooLarge,
             else => return error.OutOfMemory,
         };
-        self.ticket_nonce.replace(params.ticket_nonce) catch return error.NonceTooLarge;
-        self.ticket_age_add = params.ticket_age_add;
-        self.received_at_unix_ms = params.received_at_unix_ms;
+        next.ticket_nonce.replace(params.ticket_nonce) catch return error.NonceTooLarge;
+        next.ticket_age_add = params.ticket_age_add;
+        next.received_at_unix_ms = params.received_at_unix_ms;
+
+        self.moveFrom(&next);
     }
 
     pub fn deinit(self: *ClientTicketState) void {
@@ -522,21 +548,26 @@ pub const ClientTicketState = struct {
     }
 
     /// `out` must be zero-valued or a previously-initialized, live value —
-    /// never `undefined` memory (see `init`).
+    /// never `undefined` memory (see `init`). Cloning into itself (`self
+    /// == out`) is a safe no-op: `self` is fully read into a private
+    /// temporary before `out` (which may be `self`) is ever touched.
     pub fn cloneInto(
         self: *const ClientTicketState,
         allocator: std.mem.Allocator,
         out: *ClientTicketState,
     ) error{OutOfMemory}!void {
-        out.deinit();
-        out.* = .{};
-        errdefer out.deinit();
+        if (@intFromPtr(self) == @intFromPtr(out)) return;
 
-        try self.common.cloneInto(allocator, &out.common);
-        out.ticket.init(allocator, self.ticket.slice().len, self.ticket.slice()) catch return error.OutOfMemory;
-        out.ticket_nonce = self.ticket_nonce.copy();
-        out.ticket_age_add = self.ticket_age_add;
-        out.received_at_unix_ms = self.received_at_unix_ms;
+        var next: ClientTicketState = .{};
+        errdefer next.deinit();
+
+        try self.common.cloneInto(allocator, &next.common);
+        next.ticket.init(allocator, self.ticket.slice().len, self.ticket.slice()) catch return error.OutOfMemory;
+        next.ticket_nonce = self.ticket_nonce.copy();
+        next.ticket_age_add = self.ticket_age_add;
+        next.received_at_unix_ms = self.received_at_unix_ms;
+
+        out.moveFrom(&next);
     }
 
     /// `self` must be zero-valued or a previously-initialized, live value
@@ -585,9 +616,9 @@ pub const ServerRecoverableState = struct {
     /// `self` must be zero-valued or a previously-initialized, live value
     /// — never `undefined` memory.
     pub fn init(self: *ServerRecoverableState, common: *ResumableSessionCommon) void {
-        self.deinit();
-        self.* = .{};
-        self.common.moveFrom(common);
+        var next: ServerRecoverableState = .{};
+        next.common.moveFrom(common);
+        self.moveFrom(&next);
     }
 
     pub fn deinit(self: *ServerRecoverableState) void {
@@ -595,16 +626,20 @@ pub const ServerRecoverableState = struct {
     }
 
     /// `out` must be zero-valued or a previously-initialized, live value —
-    /// never `undefined` memory (see `init`).
+    /// never `undefined` memory (see `init`). Cloning into itself (`self
+    /// == out`) is a safe no-op: `self` is fully read into a private
+    /// temporary before `out` (which may be `self`) is ever touched.
     pub fn cloneInto(
         self: *const ServerRecoverableState,
         allocator: std.mem.Allocator,
         out: *ServerRecoverableState,
     ) error{OutOfMemory}!void {
-        out.deinit();
-        out.* = .{};
-        errdefer out.deinit();
-        try self.common.cloneInto(allocator, &out.common);
+        if (@intFromPtr(self) == @intFromPtr(out)) return;
+
+        var next: ServerRecoverableState = .{};
+        errdefer next.deinit();
+        try self.common.cloneInto(allocator, &next.common);
+        out.moveFrom(&next);
     }
 
     /// `self` must be zero-valued or a previously-initialized, live value
@@ -791,7 +826,7 @@ const field_ticket_age_add: u16 = 0x0011;
 const field_ticket_nonce: u16 = 0x0012;
 const field_received_at: u16 = 0x0013;
 
-pub const EncodeError = error{ BufferTooSmall, StateTooLarge, InvalidLimits, TooManyFields, FieldTooLarge };
+pub const EncodeError = error{ BufferTooSmall, StateTooLarge, InvalidLimits, TooManyFields, FieldTooLarge, InvalidState };
 
 pub const DecodeError = error{
     InvalidLimits,
@@ -891,24 +926,54 @@ fn checkCommonAgainstLimits(common: *const ResumableSessionCommon, limits: Limit
     }
 }
 
-/// Computes the exact encoded length for `state`, but first validates every
-/// field against `limits` (ticket length, compatibility blob lengths, and
-/// total field count) rather than only checking the final byte total. This
-/// is what prevents encoding a state built under wider limits into a record
-/// a matching decoder using tighter limits would reject.
+/// Validates the model's own semantic invariants before encoding. A
+/// zero-valued or moved-from `ResumableSessionCommon` is intentionally safe
+/// to *hold* (it is what `deinit`/`moveFrom` leave behind), but it must
+/// never be allowed to serialize into a record this same codec would then
+/// refuse to decode (e.g. a zero-length PSK, a zero lifetime, or an
+/// early-data-capable policy with a zero byte allowance — all of which
+/// `ResumableSessionCommon.init` itself would reject, but which the public
+/// struct fields do not prevent someone from producing directly).
+fn validateCommonForEncoding(common: *const ResumableSessionCommon) EncodeError!void {
+    const expected_psk_len = algorithms.transcriptHash(common.cipher_suite).digestLength();
+    if (common.resumption_psk.slice().len != expected_psk_len) return error.InvalidState;
+    if (common.lifetime_seconds == 0 or common.lifetime_seconds > max_lifetime_seconds) return error.InvalidState;
+    switch (common.early_data) {
+        .resume_only => {},
+        .early_data_capable => |max| if (max == 0) return error.InvalidState,
+    }
+    if (common.server_name) |*s| if (s.slice().len == 0) return error.InvalidState;
+    if (common.application_protocol) |*a| if (a.slice().len == 0) return error.InvalidState;
+}
+
+/// The single source of truth for whether `state` can be encoded under
+/// `limits`: validates `limits` itself, the model's semantic invariants,
+/// every field against `limits`, and the total field count and byte size,
+/// then returns the exact length `encodeClient` will write. Guarantees that
+/// any length successfully returned here decodes cleanly under the same
+/// `limits`.
 pub fn clientEncodedLenWithLimits(state: *const ClientTicketState, limits: Limits) EncodeError!usize {
+    try limits.validate();
+    try validateCommonForEncoding(&state.common);
     try checkCommonAgainstLimits(&state.common, limits);
+    if (state.ticket.slice().len == 0) return error.InvalidState;
     if (state.ticket.slice().len > limits.max_ticket_len) return error.FieldTooLarge;
     const field_count = commonFieldCount(&state.common) + 4; // ticket, ticket_age_add, ticket_nonce, received_at
     if (field_count > limits.max_fields) return error.TooManyFields;
-    return clientEncodedLen(state);
+    const needed = clientEncodedLen(state);
+    if (needed > limits.max_serialized_len) return error.StateTooLarge;
+    return needed;
 }
 
 pub fn serverEncodedLenWithLimits(state: *const ServerRecoverableState, limits: Limits) EncodeError!usize {
+    try limits.validate();
+    try validateCommonForEncoding(&state.common);
     try checkCommonAgainstLimits(&state.common, limits);
     const field_count = commonFieldCount(&state.common);
     if (field_count > limits.max_fields) return error.TooManyFields;
-    return serverEncodedLen(state);
+    const needed = serverEncodedLen(state);
+    if (needed > limits.max_serialized_len) return error.StateTooLarge;
+    return needed;
 }
 
 fn writeTlv(out: []u8, pos: *usize, field_id: u16, value: []const u8) void {
@@ -971,14 +1036,14 @@ fn writeHeader(out: []u8, kind: RecordType, field_section_len: u32) void {
     std.mem.writeInt(u32, out[6..10], field_section_len, .big);
 }
 
-/// Encodes `state` into `out`. The complete required length is computed and
-/// validated against `limits.max_serialized_len` and `out.len` before any
-/// byte is written, so an undersized buffer or over-limit state fails
-/// without ever leaving partial plaintext secret state in `out`.
+/// Encodes `state` into `out`. `clientEncodedLenWithLimits` is the single
+/// source of truth for whether `state` may be encoded under `limits` at
+/// all (limits validity, model invariants, per-field/compat/ticket bounds,
+/// field count, and total size); this function only adds the output-buffer
+/// check, so an undersized buffer or over-limit state fails without ever
+/// leaving partial plaintext secret state in `out`.
 pub fn encodeClient(state: *const ClientTicketState, limits: Limits, out: []u8) EncodeError![]const u8 {
-    try limits.validate();
     const needed = try clientEncodedLenWithLimits(state, limits);
-    if (needed > limits.max_serialized_len) return error.StateTooLarge;
     if (out.len < needed) return error.BufferTooSmall;
 
     const field_section_len = needed - header_len;
@@ -1003,10 +1068,10 @@ pub fn encodeClient(state: *const ClientTicketState, limits: Limits, out: []u8) 
     return out[0..pos];
 }
 
+/// See `encodeClient`: `serverEncodedLenWithLimits` is the single source of
+/// truth for encodability; this only adds the output-buffer check.
 pub fn encodeServer(state: *const ServerRecoverableState, limits: Limits, out: []u8) EncodeError![]const u8 {
-    try limits.validate();
     const needed = try serverEncodedLenWithLimits(state, limits);
-    if (needed > limits.max_serialized_len) return error.StateTooLarge;
     if (out.len < needed) return error.BufferTooSmall;
 
     const field_section_len = needed - header_len;
@@ -1235,16 +1300,26 @@ fn decodeClient(allocator: std.mem.Allocator, limits: Limits, bytes: []const u8)
         }
     }
 
+    // Resolve every client-only mandatory borrowed field before any owned
+    // allocation happens (below, in `buildCommon`/`state.init`): a
+    // structurally invalid record missing one of these must fail with
+    // `MissingField` without ever allocating the PSK/compat/ticket
+    // storage for the fields that *were* present.
+    const ticket_bytes = ticket orelse return error.MissingField;
+    const age_add = ticket_age_add orelse return error.MissingField;
+    const nonce = ticket_nonce orelse return error.MissingField;
+    const received = received_at_unix_ms orelse return error.MissingField;
+
     var common: ResumableSessionCommon = .{};
     try buildCommon(allocator, limits, common_fields, &common);
     errdefer common.deinit();
 
     var state: ClientTicketState = .{};
     state.init(allocator, limits, &common, .{
-        .ticket = ticket orelse return error.MissingField,
-        .ticket_age_add = ticket_age_add orelse return error.MissingField,
-        .ticket_nonce = ticket_nonce orelse return error.MissingField,
-        .received_at_unix_ms = received_at_unix_ms orelse return error.MissingField,
+        .ticket = ticket_bytes,
+        .ticket_age_add = age_add,
+        .ticket_nonce = nonce,
+        .received_at_unix_ms = received,
     }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.InvalidLimits => return error.InvalidLimits,
@@ -2011,10 +2086,9 @@ test "encode enforces max_ticket_len even when the state was built under wider l
     try testing.expectEqualStrings(state.ticket.slice(), decoded.client.ticket.slice());
 }
 
-test "encode enforces max_transport_compat_len and max_application_compat_len symmetrically with decode" {
+test "encode enforces max_transport_compat_len symmetrically with decode" {
     var wide = Limits.default;
     wide.max_transport_compat_len = 2048;
-    wide.max_application_compat_len = 2048;
     wide.max_serialized_len = 8192;
 
     var common: ResumableSessionCommon = .{};
@@ -2045,6 +2119,41 @@ test "encode enforces max_transport_compat_len and max_application_compat_len sy
     // Decoding the same bytes under the tighter transport-compat limit must
     // also fail, proving encode and decode agree on every limit.
     try testing.expectError(error.FieldTooLarge, decode(testing.allocator, tight_transport, encoded));
+}
+
+test "encode enforces max_application_compat_len symmetrically with decode" {
+    var wide = Limits.default;
+    wide.max_application_compat_len = 2048;
+    wide.max_serialized_len = 8192;
+
+    var common: ResumableSessionCommon = .{};
+    var wide_blob: [1500]u8 = undefined;
+    @memset(&wide_blob, 0x22);
+    try common.init(testing.allocator, wide, .{
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .resumption_psk = &([_]u8{0xab} ** 32),
+        .auth_binding = AuthBinding.fromLeafCertificateDer("leaf"),
+        .issued_at_unix_ms = 0,
+        .lifetime_seconds = 100,
+        .application_compat = .{ .format_id = 2, .format_version = 1, .bytes = &wide_blob },
+    });
+    var server: ServerRecoverableState = .{};
+    server.init(&common);
+    defer server.deinit();
+
+    var tight_application = wide;
+    tight_application.max_application_compat_len = 1024;
+    var buf: [8192]u8 = undefined;
+    try testing.expectError(error.FieldTooLarge, encodeServer(&server, tight_application, &buf));
+
+    const encoded = try encodeServer(&server, wide, &buf);
+    var decoded = try decode(testing.allocator, wide, encoded);
+    defer decoded.deinit();
+    try testing.expectEqualSlices(u8, &wide_blob, decoded.server.common.application_compat.?.slice());
+
+    // Decoding the same bytes under the tighter application-compat limit
+    // must also fail, proving encode and decode agree on every limit.
+    try testing.expectError(error.FieldTooLarge, decode(testing.allocator, tight_application, encoded));
 }
 
 test "encode enforces max_fields symmetrically with decode" {
@@ -2219,6 +2328,201 @@ test "ClientTicketState.moveFrom into itself is a safe no-op" {
     try testing.expectEqualStrings("opaque-ticket-bytes", client.ticket.slice());
 }
 
+test "cloneInto is a safe no-op on every owning type when self == out" {
+    var snap: CompatSnapshot = .{};
+    try snap.init(testing.allocator, 1, 1, "self-clone-value", hard_max_compat_len);
+    defer snap.deinit();
+    try snap.cloneInto(testing.allocator, &snap);
+    try testing.expectEqualStrings("self-clone-value", snap.slice());
+
+    var common = try sampleCommon(testing.allocator, &([_]u8{0xab} ** 32));
+    defer common.deinit();
+    try common.cloneInto(testing.allocator, &common);
+    try testing.expectEqualStrings("example.test", common.server_name.?.slice());
+
+    var client = try sampleClient(testing.allocator);
+    defer client.deinit();
+    try client.cloneInto(testing.allocator, &client);
+    try testing.expectEqualStrings("opaque-ticket-bytes", client.ticket.slice());
+
+    var server_common = try sampleCommon(testing.allocator, &([_]u8{0xef} ** 32));
+    var server: ServerRecoverableState = .{};
+    server.init(&server_common);
+    defer server.deinit();
+    try server.cloneInto(testing.allocator, &server);
+    try testing.expectEqualStrings("example.test", server.common.server_name.?.slice());
+}
+
+test "cloneInto into an already-live destination on every owning aggregate releases the prior allocation" {
+    var common = try sampleCommon(testing.allocator, &([_]u8{0xab} ** 32));
+    defer common.deinit();
+
+    var stale_common = try sampleCommon(testing.allocator, &([_]u8{0xff} ** 32));
+    try common.cloneInto(testing.allocator, &stale_common);
+    defer stale_common.deinit();
+    try testing.expect(stale_common.resumption_psk.eql(&common.resumption_psk));
+
+    var client = try sampleClient(testing.allocator);
+    defer client.deinit();
+
+    var stale_client = try sampleClient(testing.allocator);
+    try client.cloneInto(testing.allocator, &stale_client);
+    defer stale_client.deinit();
+    try testing.expectEqualStrings(client.ticket.slice(), stale_client.ticket.slice());
+
+    var server_common = try sampleCommon(testing.allocator, &([_]u8{0xcd} ** 32));
+    var server: ServerRecoverableState = .{};
+    server.init(&server_common);
+    defer server.deinit();
+
+    var stale_server_common = try sampleCommon(testing.allocator, &([_]u8{0xee} ** 32));
+    var stale_server: ServerRecoverableState = .{};
+    stale_server.init(&stale_server_common);
+    try server.cloneInto(testing.allocator, &stale_server);
+    defer stale_server.deinit();
+    try testing.expectEqualStrings(
+        server.common.server_name.?.slice(),
+        stale_server.common.server_name.?.slice(),
+    );
+}
+
+test "reinitializing CompatSnapshot from its own borrowed slice copies before wiping" {
+    var snap: CompatSnapshot = .{};
+    try snap.init(testing.allocator, 1, 1, "original-value", hard_max_compat_len);
+    defer snap.deinit();
+
+    // `old` borrows from `snap`'s own live storage; `init` must copy it
+    // into the new blob before releasing the storage `old` points into.
+    const old = snap.slice();
+    try snap.init(testing.allocator, 2, 2, old, hard_max_compat_len);
+    try testing.expectEqualStrings("original-value", snap.slice());
+}
+
+test "reinitializing ResumableSessionCommon from its own borrowed PSK copies before wiping" {
+    var common = try sampleCommon(testing.allocator, &([_]u8{0xab} ** 32));
+    defer common.deinit();
+
+    // `old_psk` borrows from `common`'s own live resumption_psk storage;
+    // `init` must copy it into the new value before releasing `common`'s
+    // prior storage.
+    const old_psk = common.resumption_psk.slice();
+    try common.init(testing.allocator, Limits.default, .{
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .resumption_psk = old_psk,
+        .server_name = "other.test",
+        .auth_binding = AuthBinding.fromLeafCertificateDer("leaf-der-bytes"),
+        .issued_at_unix_ms = 2_000,
+        .lifetime_seconds = 200,
+    });
+    try testing.expectEqualSlices(u8, &([_]u8{0xab} ** 32), common.resumption_psk.slice());
+    try testing.expectEqualStrings("other.test", common.server_name.?.slice());
+}
+
+test "reinitializing ResumableSessionCommon from its own borrowed compat blob copies before wiping" {
+    var common: ResumableSessionCommon = .{};
+    try common.init(testing.allocator, Limits.default, .{
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .resumption_psk = &([_]u8{0xab} ** 32),
+        .auth_binding = AuthBinding.fromLeafCertificateDer("leaf"),
+        .issued_at_unix_ms = 0,
+        .lifetime_seconds = 100,
+        .transport_compat = .{ .format_id = 1, .format_version = 1, .bytes = "original-blob" },
+    });
+    defer common.deinit();
+
+    // `old_blob` borrows from `common`'s own live transport_compat storage.
+    const old_blob = common.transport_compat.?.slice();
+    try common.init(testing.allocator, Limits.default, .{
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .resumption_psk = &([_]u8{0xab} ** 32),
+        .auth_binding = AuthBinding.fromLeafCertificateDer("leaf"),
+        .issued_at_unix_ms = 0,
+        .lifetime_seconds = 100,
+        .transport_compat = .{ .format_id = 1, .format_version = 1, .bytes = old_blob },
+    });
+    try testing.expectEqualStrings("original-blob", common.transport_compat.?.slice());
+}
+
+test "encoding a zero-valued or moved-from ClientTicketState is rejected, not silently accepted" {
+    var empty: ClientTicketState = .{};
+    var out: [4096]u8 = undefined;
+    try testing.expectError(error.InvalidState, encodeClient(&empty, Limits.default, &out));
+    try testing.expectError(error.InvalidState, clientEncodedLenWithLimits(&empty, Limits.default));
+
+    var client = try sampleClient(testing.allocator);
+    var moved_from: ClientTicketState = .{};
+    moved_from.moveFrom(&client);
+    defer moved_from.deinit();
+    // `client` is now the zero-valued moved-from side; it must be safe to
+    // hold and deinit, but not to encode.
+    try testing.expectError(error.InvalidState, encodeClient(&client, Limits.default, &out));
+    client.deinit();
+}
+
+test "encoding a zero-valued or moved-from ServerRecoverableState is rejected, not silently accepted" {
+    var empty: ServerRecoverableState = .{};
+    var out: [4096]u8 = undefined;
+    try testing.expectError(error.InvalidState, encodeServer(&empty, Limits.default, &out));
+    try testing.expectError(error.InvalidState, serverEncodedLenWithLimits(&empty, Limits.default));
+}
+
+test "clientEncodedLenWithLimits rejects invalid Limits rather than silently succeeding" {
+    var client = try sampleClient(testing.allocator);
+    defer client.deinit();
+
+    var invalid_limits = Limits.default;
+    invalid_limits.max_fields = hard_max_fields + 1;
+    try testing.expectError(error.InvalidLimits, clientEncodedLenWithLimits(&client, invalid_limits));
+
+    var out: [4096]u8 = undefined;
+    try testing.expectError(error.InvalidLimits, encodeClient(&client, invalid_limits, &out));
+}
+
+test "every successfully encoded record decodes cleanly under the same Limits" {
+    const limit_variants = [_]Limits{
+        Limits.default,
+        .{ .max_fields = 16, .max_ticket_len = 512, .max_transport_compat_len = 256, .max_application_compat_len = 256, .max_serialized_len = 2048 },
+        .{ .max_fields = hard_max_fields, .max_ticket_len = absolute_ticket_wire_max, .max_transport_compat_len = hard_max_compat_len, .max_application_compat_len = hard_max_compat_len, .max_serialized_len = hard_max_serialized_len },
+    };
+    for (limit_variants) |limits| {
+        var common: ResumableSessionCommon = .{};
+        try common.init(testing.allocator, limits, fixtureCommonParams(&([_]u8{0xab} ** 32)));
+        var client: ClientTicketState = .{};
+        try client.init(testing.allocator, limits, &common, .{
+            .ticket = "opaque-ticket-bytes",
+            .ticket_age_add = 1,
+            .ticket_nonce = "n",
+            .received_at_unix_ms = 0,
+        });
+        defer client.deinit();
+
+        var buf: [hard_max_serialized_len]u8 = undefined;
+        const encoded = try encodeClient(&client, limits, &buf);
+        var decoded = try decode(testing.allocator, limits, encoded);
+        defer decoded.deinit();
+        try testing.expectEqualStrings(client.ticket.slice(), decoded.client.ticket.slice());
+    }
+}
+
+test "missing client-only mandatory fields fail before any allocation" {
+    var seed = try sampleClient(testing.allocator);
+    defer seed.deinit();
+    var buf: [Limits.default.max_serialized_len]u8 = undefined;
+    const encoded = try encodeClient(&seed, Limits.default, &buf);
+
+    const client_only_mandatory_ids = [_]u16{
+        field_ticket, field_ticket_age_add, field_ticket_nonce, field_received_at,
+    };
+    for (client_only_mandatory_ids) |field_id| {
+        var removed: [Limits.default.max_serialized_len]u8 = undefined;
+        const len = fixtureWithFieldRemoved(encoded, field_id, &removed);
+
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+        try testing.expectError(error.MissingField, decodeDefault(failing.allocator(), removed[0..len]));
+        try testing.expectEqual(@as(usize, 0), failing.allocations);
+    }
+}
+
 test "secret-bearing types expose no ordinary formatting path" {
     try testing.expect(@hasDecl(ResumableSessionCommon, "format"));
     try testing.expect(@hasDecl(ClientTicketState, "format"));
@@ -2226,18 +2530,23 @@ test "secret-bearing types expose no ordinary formatting path" {
     try testing.expect(@hasDecl(CompatSnapshot, "format"));
 }
 
-// Checked-in literal byte fixtures, generated once from `sampleClient`
-// (cipher tls_aes_128_gcm_sha256, PSK 0xab*32, sni "example.test", alpn
-// "h3", auth_binding = SHA-256("leaf-der-bytes"), issued_at_unix_ms
-// 1_000_000, lifetime_seconds 3600, resume_only, ticket
-// "opaque-ticket-bytes", ticket_age_add 12345, ticket_nonce "nonce",
-// received_at_unix_ms 1_500_000) and the equivalent server-only common
-// metadata (PSK 0xcd*32, otherwise identical), both under `Limits.default`.
-// Pinned as literal bytes — not re-derived from the encoder under test — so
-// an accidental field-id/order/integer-encoding change is caught even if
-// the round-trip test above is (incorrectly) also changed to match.
-const client_fixture: [187]u8 = .{
-    0x54, 0x52, 0x53, 0x31, 0x01, 0x01, 0x00, 0x00, 0x00, 0xb1, 0x00, 0x01,
+// Checked-in literal byte fixtures, generated once from a fully-populated
+// `ResumableSessionCommon` (cipher tls_aes_128_gcm_sha256, PSK 0xab*32 for
+// the client / 0xcd*32 for the server, sni "example.test", alpn "h3",
+// auth_binding = SHA-256("leaf-der-bytes"), issued_at_unix_ms 1_000_000,
+// lifetime_seconds 3600, early_data_capable(16384), transport_compat
+// {format_id=1, format_version=1, "quic-params"}, application_compat
+// {format_id=2, format_version=1, "h3-settings"}) plus, for the client
+// record, ticket "opaque-ticket-bytes", ticket_age_add 12345, ticket_nonce
+// "nonce", received_at_unix_ms 1_500_000 — all under `Limits.default`.
+// Every known field id (including both compatibility snapshots and a
+// non-default early-data policy) is present so the duplicate/missing-field
+// matrix below can exercise all of them. Pinned as literal bytes — not
+// re-derived from the encoder under test — so an accidental field-id/
+// order/integer-encoding change is caught even if the round-trip test
+// above is (incorrectly) also changed to match.
+const client_fixture: [229]u8 = .{
+    0x54, 0x52, 0x53, 0x31, 0x01, 0x01, 0x00, 0x00, 0x00, 0xdb, 0x00, 0x01,
     0x00, 0x02, 0x13, 0x01, 0x00, 0x02, 0x00, 0x20, 0xab, 0xab, 0xab, 0xab,
     0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab,
     0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab,
@@ -2248,15 +2557,19 @@ const client_fixture: [187]u8 = .{
     0xb8, 0x8b, 0x79, 0xd0, 0x30, 0x7b, 0x6d, 0xcf, 0x18, 0x98, 0xa0, 0xcc,
     0xe5, 0xf7, 0x00, 0x06, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0f,
     0x42, 0x40, 0x00, 0x07, 0x00, 0x04, 0x00, 0x00, 0x0e, 0x10, 0x00, 0x08,
-    0x00, 0x01, 0x00, 0x00, 0x10, 0x00, 0x13, 0x6f, 0x70, 0x61, 0x71, 0x75,
-    0x65, 0x2d, 0x74, 0x69, 0x63, 0x6b, 0x65, 0x74, 0x2d, 0x62, 0x79, 0x74,
-    0x65, 0x73, 0x00, 0x11, 0x00, 0x04, 0x00, 0x00, 0x30, 0x39, 0x00, 0x12,
-    0x00, 0x05, 0x6e, 0x6f, 0x6e, 0x63, 0x65, 0x00, 0x13, 0x00, 0x08, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x16, 0xe3, 0x60,
+    0x00, 0x05, 0x01, 0x00, 0x00, 0x40, 0x00, 0x80, 0x01, 0x00, 0x0f, 0x00,
+    0x01, 0x00, 0x01, 0x71, 0x75, 0x69, 0x63, 0x2d, 0x70, 0x61, 0x72, 0x61,
+    0x6d, 0x73, 0x80, 0x02, 0x00, 0x0f, 0x00, 0x02, 0x00, 0x01, 0x68, 0x33,
+    0x2d, 0x73, 0x65, 0x74, 0x74, 0x69, 0x6e, 0x67, 0x73, 0x00, 0x10, 0x00,
+    0x13, 0x6f, 0x70, 0x61, 0x71, 0x75, 0x65, 0x2d, 0x74, 0x69, 0x63, 0x6b,
+    0x65, 0x74, 0x2d, 0x62, 0x79, 0x74, 0x65, 0x73, 0x00, 0x11, 0x00, 0x04,
+    0x00, 0x00, 0x30, 0x39, 0x00, 0x12, 0x00, 0x05, 0x6e, 0x6f, 0x6e, 0x63,
+    0x65, 0x00, 0x13, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x16, 0xe3,
+    0x60,
 };
 
-const server_fixture: [135]u8 = .{
-    0x54, 0x52, 0x53, 0x31, 0x01, 0x02, 0x00, 0x00, 0x00, 0x7d, 0x00, 0x01,
+const server_fixture: [177]u8 = .{
+    0x54, 0x52, 0x53, 0x31, 0x01, 0x02, 0x00, 0x00, 0x00, 0xa7, 0x00, 0x01,
     0x00, 0x02, 0x13, 0x01, 0x00, 0x02, 0x00, 0x20, 0xcd, 0xcd, 0xcd, 0xcd,
     0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd,
     0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd,
@@ -2267,8 +2580,26 @@ const server_fixture: [135]u8 = .{
     0xb8, 0x8b, 0x79, 0xd0, 0x30, 0x7b, 0x6d, 0xcf, 0x18, 0x98, 0xa0, 0xcc,
     0xe5, 0xf7, 0x00, 0x06, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0f,
     0x42, 0x40, 0x00, 0x07, 0x00, 0x04, 0x00, 0x00, 0x0e, 0x10, 0x00, 0x08,
-    0x00, 0x01, 0x00,
+    0x00, 0x05, 0x01, 0x00, 0x00, 0x40, 0x00, 0x80, 0x01, 0x00, 0x0f, 0x00,
+    0x01, 0x00, 0x01, 0x71, 0x75, 0x69, 0x63, 0x2d, 0x70, 0x61, 0x72, 0x61,
+    0x6d, 0x73, 0x80, 0x02, 0x00, 0x0f, 0x00, 0x02, 0x00, 0x01, 0x68, 0x33,
+    0x2d, 0x73, 0x65, 0x74, 0x74, 0x69, 0x6e, 0x67, 0x73,
 };
+
+fn fixtureCommonParams(psk: []const u8) ResumableSessionCommon.InitParams {
+    return .{
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .resumption_psk = psk,
+        .server_name = "example.test",
+        .application_protocol = "h3",
+        .auth_binding = AuthBinding.fromLeafCertificateDer("leaf-der-bytes"),
+        .issued_at_unix_ms = 1_000_000,
+        .lifetime_seconds = 3600,
+        .early_data = .{ .early_data_capable = 16384 },
+        .transport_compat = .{ .format_id = 1, .format_version = 1, .bytes = "quic-params" },
+        .application_compat = .{ .format_id = 2, .format_version = 1, .bytes = "h3-settings" },
+    };
+}
 
 test "checked-in literal client-record byte fixture decodes to every expected field" {
     var decoded = try decodeDefault(testing.allocator, &client_fixture);
@@ -2283,9 +2614,11 @@ test "checked-in literal client-record byte fixture decodes to every expected fi
     try testing.expect(c.common.auth_binding.eql(AuthBinding.fromLeafCertificateDer("leaf-der-bytes")));
     try testing.expectEqual(@as(i64, 1_000_000), c.common.issued_at_unix_ms);
     try testing.expectEqual(@as(u32, 3600), c.common.lifetime_seconds);
-    try testing.expectEqual(EarlyDataPolicy.resume_only, c.common.early_data);
-    try testing.expect(c.common.transport_compat == null);
-    try testing.expect(c.common.application_compat == null);
+    try testing.expectEqual(@as(u32, 16384), c.common.early_data.maxEarlyData());
+    try testing.expectEqual(@as(u16, 1), c.common.transport_compat.?.format_id);
+    try testing.expectEqualStrings("quic-params", c.common.transport_compat.?.slice());
+    try testing.expectEqual(@as(u16, 2), c.common.application_compat.?.format_id);
+    try testing.expectEqualStrings("h3-settings", c.common.application_compat.?.slice());
     try testing.expectEqualStrings("opaque-ticket-bytes", c.ticket.slice());
     try testing.expectEqual(@as(u32, 12345), c.ticket_age_add);
     try testing.expectEqualStrings("nonce", c.ticket_nonce.slice());
@@ -2305,17 +2638,30 @@ test "checked-in literal server-record byte fixture decodes to every expected fi
     try testing.expect(s.common.auth_binding.eql(AuthBinding.fromLeafCertificateDer("leaf-der-bytes")));
     try testing.expectEqual(@as(i64, 1_000_000), s.common.issued_at_unix_ms);
     try testing.expectEqual(@as(u32, 3600), s.common.lifetime_seconds);
-    try testing.expectEqual(EarlyDataPolicy.resume_only, s.common.early_data);
+    try testing.expectEqual(@as(u32, 16384), s.common.early_data.maxEarlyData());
+    try testing.expectEqual(@as(u16, 1), s.common.transport_compat.?.format_id);
+    try testing.expectEqualStrings("quic-params", s.common.transport_compat.?.slice());
+    try testing.expectEqual(@as(u16, 2), s.common.application_compat.?.format_id);
+    try testing.expectEqualStrings("h3-settings", s.common.application_compat.?.slice());
 }
 
 test "current encoder output exactly equals the checked-in fixtures" {
-    var client = try sampleClient(testing.allocator);
+    var common: ResumableSessionCommon = .{};
+    try common.init(testing.allocator, Limits.default, fixtureCommonParams(&([_]u8{0xab} ** 32)));
+    var client: ClientTicketState = .{};
+    try client.init(testing.allocator, Limits.default, &common, .{
+        .ticket = "opaque-ticket-bytes",
+        .ticket_age_add = 12345,
+        .ticket_nonce = "nonce",
+        .received_at_unix_ms = 1_500_000,
+    });
     defer client.deinit();
     var buf: [Limits.default.max_serialized_len]u8 = undefined;
     const encoded = try encodeClient(&client, Limits.default, &buf);
     try testing.expectEqualSlices(u8, &client_fixture, encoded);
 
-    var server_common = try sampleCommon(testing.allocator, &([_]u8{0xcd} ** 32));
+    var server_common: ResumableSessionCommon = .{};
+    try server_common.init(testing.allocator, Limits.default, fixtureCommonParams(&([_]u8{0xcd} ** 32)));
     var server: ServerRecoverableState = .{};
     server.init(&server_common);
     defer server.deinit();
@@ -2356,9 +2702,10 @@ fn fixtureWithFieldDuplicated(fixture: []const u8, field_id_to_duplicate: u16, o
 
 test "duplicating any known client field, mandatory or optional, is rejected" {
     const all_client_field_ids = [_]u16{
-        field_cipher_suite, field_resumption_psk, field_server_name,      field_application_protocol,
-        field_auth_binding, field_issued_at,      field_lifetime_seconds, field_early_data,
-        field_ticket,       field_ticket_age_add, field_ticket_nonce,     field_received_at,
+        field_cipher_suite,     field_resumption_psk,     field_server_name,      field_application_protocol,
+        field_auth_binding,     field_issued_at,          field_lifetime_seconds, field_early_data,
+        field_transport_compat, field_application_compat, field_ticket,           field_ticket_age_add,
+        field_ticket_nonce,     field_received_at,
     };
     for (all_client_field_ids) |field_id| {
         var buf: [client_fixture.len + 64]u8 = undefined;
@@ -2380,7 +2727,7 @@ test "removing any mandatory client field is rejected as missing" {
     }
 }
 
-test "removing an optional-presence client field (server_name/application_protocol) leaves it null, not missing" {
+test "removing an optional-presence client field (server_name/application_protocol/compat) leaves it null, not missing" {
     var without_sni: [client_fixture.len]u8 = undefined;
     const sni_len = fixtureWithFieldRemoved(&client_fixture, field_server_name, &without_sni);
     var decoded_no_sni = try decodeDefault(testing.allocator, without_sni[0..sni_len]);
@@ -2394,12 +2741,25 @@ test "removing an optional-presence client field (server_name/application_protoc
     var decoded_no_alpn = try decodeDefault(testing.allocator, without_alpn[0..alpn_len]);
     defer decoded_no_alpn.deinit();
     try testing.expect(decoded_no_alpn.client.common.application_protocol == null);
+
+    var without_transport: [client_fixture.len]u8 = undefined;
+    const transport_len = fixtureWithFieldRemoved(&client_fixture, field_transport_compat, &without_transport);
+    var decoded_no_transport = try decodeDefault(testing.allocator, without_transport[0..transport_len]);
+    defer decoded_no_transport.deinit();
+    try testing.expect(decoded_no_transport.client.common.transport_compat == null);
+
+    var without_application: [client_fixture.len]u8 = undefined;
+    const application_len = fixtureWithFieldRemoved(&client_fixture, field_application_compat, &without_application);
+    var decoded_no_application = try decodeDefault(testing.allocator, without_application[0..application_len]);
+    defer decoded_no_application.deinit();
+    try testing.expect(decoded_no_application.client.common.application_compat == null);
 }
 
 test "duplicating any known server field is rejected" {
     const all_server_field_ids = [_]u16{
-        field_cipher_suite, field_resumption_psk, field_server_name,      field_application_protocol,
-        field_auth_binding, field_issued_at,      field_lifetime_seconds, field_early_data,
+        field_cipher_suite,     field_resumption_psk,     field_server_name,      field_application_protocol,
+        field_auth_binding,     field_issued_at,          field_lifetime_seconds, field_early_data,
+        field_transport_compat, field_application_compat,
     };
     for (all_server_field_ids) |field_id| {
         var buf: [server_fixture.len + 64]u8 = undefined;
@@ -2420,7 +2780,7 @@ test "removing any mandatory server field is rejected as missing" {
     }
 }
 
-test "removing an optional-presence server field (server_name/application_protocol) leaves it null, not missing" {
+test "removing an optional-presence server field (server_name/application_protocol/compat) leaves it null, not missing" {
     var without_sni: [server_fixture.len]u8 = undefined;
     const sni_len = fixtureWithFieldRemoved(&server_fixture, field_server_name, &without_sni);
     var decoded_no_sni = try decodeDefault(testing.allocator, without_sni[0..sni_len]);
@@ -2432,4 +2792,16 @@ test "removing an optional-presence server field (server_name/application_protoc
     var decoded_no_alpn = try decodeDefault(testing.allocator, without_alpn[0..alpn_len]);
     defer decoded_no_alpn.deinit();
     try testing.expect(decoded_no_alpn.server.common.application_protocol == null);
+
+    var without_transport: [server_fixture.len]u8 = undefined;
+    const transport_len = fixtureWithFieldRemoved(&server_fixture, field_transport_compat, &without_transport);
+    var decoded_no_transport = try decodeDefault(testing.allocator, without_transport[0..transport_len]);
+    defer decoded_no_transport.deinit();
+    try testing.expect(decoded_no_transport.server.common.transport_compat == null);
+
+    var without_application: [server_fixture.len]u8 = undefined;
+    const application_len = fixtureWithFieldRemoved(&server_fixture, field_application_compat, &without_application);
+    var decoded_no_application = try decodeDefault(testing.allocator, without_application[0..application_len]);
+    defer decoded_no_application.deinit();
+    try testing.expect(decoded_no_application.server.common.application_compat == null);
 }

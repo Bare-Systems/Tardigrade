@@ -137,7 +137,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 try executeValidationCommandOrExit(control_allocator, options.common, .legacy);
                 return;
             }
-            try executeRunCommand(runtime_allocator.runtimeAllocator(), args, options);
+            try executeRunCommandOrExit(runtime_allocator.runtimeAllocator(), args, options);
         },
     }
 }
@@ -784,6 +784,24 @@ fn executeStatusCommand(allocator: std.mem.Allocator, options: SignalOptions) !v
     }
     try writeConfigSummary(&stdout, resolved_config_path, &cfg);
     try stdout.flush();
+}
+
+/// Classify a `run` startup failure exactly like `tardi check` does — a
+/// deterministic configuration error (including every
+/// `appliance_credentials.Error` class the composition root can now
+/// propagate unwrapped) reports the same message shape and
+/// `EXIT_CONFIG_INVALID` exit code, rather than an opaque generic failure.
+/// Post-startup errors (the server crashing after already accepting
+/// connections) are comparatively rare in practice and still fall through to
+/// the internal-error exit code with `@errorName`.
+fn executeRunCommandOrExit(allocator: std.mem.Allocator, args: []const []const u8, options: RunOptions) !void {
+    executeRunCommand(allocator, args, options) catch |err| {
+        var stderr_buf: [2048]u8 = undefined;
+        var stderr = compat.stderrWriter(&stderr_buf);
+        try printConfigCommandError(&stderr, err, options.common, .legacy);
+        try stderr.flush();
+        std.process.exit(configCommandExitCode(err));
+    };
 }
 
 fn executeRunCommand(allocator: std.mem.Allocator, args: []const []const u8, options: RunOptions) !void {

@@ -2620,9 +2620,6 @@ pub const WorkerContext = struct {
     /// Appliance profile: borrowed from the `ApplianceCredentials` owner.
     /// Otherwise: borrowed from the generic native credential store.
     native_tls_provider: ?tls_core.credentials.CredentialProvider = null,
-    /// Set only in the appliance TLS profile; hot reload consults it to
-    /// reject credential-affecting configuration changes (#392).
-    appliance_credentials: ?*tls_core.appliance_credentials.ApplianceCredentials = null,
     session_pool: *ConnectionSessionPool,
     /// Event loop used to (un)watch idle keepalive connections (#138). A worker
     /// re-arms a parked fd here; the loop thread dispatches it back on readiness.

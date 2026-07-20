@@ -426,7 +426,13 @@ pub const SoftwareSigningKey = struct {
 
     /// Load from a 32-byte Ed25519 seed (RFC 8032 secret scalar seed).
     pub fn fromSeed(seed: [Ed25519.KeyPair.seed_length]u8) provider.SignError!SoftwareSigningKey {
-        const key_pair = Ed25519.KeyPair.generateDeterministic(seed) catch return error.ProviderFailure;
+        // The by-value parameter is itself a caller-owned copy of secret seed
+        // bytes; wipe this frame's copy once the deterministic key pair has
+        // been derived from it, matching the wipe-after-use pattern used for
+        // key-share seeds elsewhere in this file.
+        var local_seed = seed;
+        defer crypto.secureZero(u8, &local_seed);
+        const key_pair = Ed25519.KeyPair.generateDeterministic(local_seed) catch return error.ProviderFailure;
         return .{ .key_pair = key_pair };
     }
 

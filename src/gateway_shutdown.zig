@@ -96,12 +96,18 @@ pub fn hotReloadConfig(
             return;
         };
     }
-    if (worker_ctx.appliance_credentials != null) {
+    if (edge_config.is_appliance_tls_profile) {
         // Appliance TLS profile (#392): the identity is startup-loaded and a
         // hot reload must never silently accept changed credential inputs
         // while continuing to serve the old credentials. Reject the whole
         // reload when any credential-affecting field changes; the previous
         // configuration and provider remain active and coherent.
+        //
+        // Gate on the build-time profile, not `worker_ctx.appliance_credentials
+        // != null`: a server that *started* without TLS configured (no owner
+        // constructed) must still reject a reload that turns TLS on, rather
+        // than publishing a TLS-marked config while `native_tls_provider`
+        // stays null and new connections silently continue over plaintext.
         var current_lease = worker_ctx.config_store.acquire();
         const credential_config_changed = applianceCredentialConfigChanged(current_lease.cfg, cfg_ptr);
         current_lease.release();
@@ -208,6 +214,54 @@ test "applianceCredentialConfigChanged detects credential-affecting fields" {
     proposed.tls_server_name = "changed.example.test";
     try std.testing.expect(applianceCredentialConfigChanged(&base, &proposed));
     proposed.tls_server_name = original_name;
+}
+
+test "applianceCredentialConfigChanged rejects plaintext-to-TLS and TLS-to-plaintext reloads" {
+    const allocator = std.testing.allocator;
+
+    // Server started without TLS configured (both paths empty, as
+    // `loadFromEnv` defaults to when no TARDIGRADE_TLS_* env is set).
+    var plaintext = try edge_config.loadFromEnv(allocator);
+    defer plaintext.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 0), plaintext.tls_cert_path.len);
+    try std.testing.expectEqual(@as(usize, 0), plaintext.tls_key_path.len);
+
+    // Reloaded config now turns TLS on. `hotReloadConfig` must reject this
+    // reload in the appliance profile regardless of whether the running
+    // process ever constructed an `ApplianceCredentials` owner at startup —
+    // there is no owner to safely graft new credentials onto at runtime.
+    // Mutated fields are restored to their original owned allocations before
+    // scope exit so the deferred `deinit()` frees the right pointers.
+    var now_tls = try edge_config.loadFromEnv(allocator);
+    defer now_tls.deinit(allocator);
+    const now_tls_orig_cert = now_tls.tls_cert_path;
+    const now_tls_orig_key = now_tls.tls_key_path;
+    const now_tls_orig_name = now_tls.tls_server_name;
+    now_tls.tls_cert_path = "/etc/appliance/tls.crt";
+    now_tls.tls_key_path = "/etc/appliance/tls.key";
+    now_tls.tls_server_name = "appliance.example.test";
+    try std.testing.expect(applianceCredentialConfigChanged(&plaintext, &now_tls));
+    now_tls.tls_cert_path = now_tls_orig_cert;
+    now_tls.tls_key_path = now_tls_orig_key;
+    now_tls.tls_server_name = now_tls_orig_name;
+
+    // The reverse direction: a server that started with TLS configured must
+    // also reject a reload that removes it (keeps serving the old,
+    // still-valid credentials rather than silently going plaintext).
+    var with_tls = try edge_config.loadFromEnv(allocator);
+    defer with_tls.deinit(allocator);
+    const with_tls_orig_cert = with_tls.tls_cert_path;
+    const with_tls_orig_key = with_tls.tls_key_path;
+    const with_tls_orig_name = with_tls.tls_server_name;
+    with_tls.tls_cert_path = "/etc/appliance/tls.crt";
+    with_tls.tls_key_path = "/etc/appliance/tls.key";
+    with_tls.tls_server_name = "appliance.example.test";
+    var now_plaintext = try edge_config.loadFromEnv(allocator);
+    defer now_plaintext.deinit(allocator);
+    try std.testing.expect(applianceCredentialConfigChanged(&with_tls, &now_plaintext));
+    with_tls.tls_cert_path = with_tls_orig_cert;
+    with_tls.tls_key_path = with_tls_orig_key;
+    with_tls.tls_server_name = with_tls_orig_name;
 }
 
 pub fn applyReloadedRuntimeConfig(cfg: *const edge_config.EdgeConfig, state: *GatewayState) void {

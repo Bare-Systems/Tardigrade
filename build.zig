@@ -53,6 +53,11 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/tls/root.zig"),
         .target = target,
         .optimize = optimize,
+        // appliance_credentials.zig's own unit tests exercise the file-reading
+        // path (std.c.close) directly inside this module's test binary,
+        // unlike identity_loader.zig's file helpers which were previously
+        // only reached through exe_mod (already link_libc = true).
+        .link_libc = true,
     });
     tls_core_mod.addImport("crypto_secrets", crypto_secrets_mod);
 

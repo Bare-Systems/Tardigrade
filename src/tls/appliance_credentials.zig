@@ -161,7 +161,7 @@ pub const ApplianceCredentials = struct {
         var chain = pki.pem.loadChainPem(self.allocator, certificate_pem, pemLimits(limits)) catch |err|
             return mapChainPemError(err);
         defer chain.deinit(self.allocator);
-        try preflightChain(&chain, limits);
+        try preflightChain(self.allocator, &chain, limits);
 
         // Leaf certificate: must carry a canonical RFC 8410 Ed25519 SPKI.
         var leaf_public: [Ed25519.PublicKey.encoded_length]u8 = undefined;
@@ -355,7 +355,7 @@ fn mapChainPemError(err: pki.pem.Error) Error {
     };
 }
 
-fn preflightChain(chain: *const pki.pem.CertificateChain, limits: Limits) Error!void {
+fn preflightChain(allocator: std.mem.Allocator, chain: *const pki.pem.CertificateChain, limits: Limits) Error!void {
     const count = chain.certificates.len;
     if (count == 0) return error.EmptyCertificateChain;
     if (count > limits.max_chain_entries or count > credentials.max_chain_entries)
@@ -368,6 +368,23 @@ fn preflightChain(chain: *const pki.pem.CertificateChain, limits: Limits) Error!
         flight = std.math.add(usize, flight, cert.der.len + certificate_entry_overhead) catch
             return error.CertificateFlightTooLarge;
         if (flight > limits.max_certificate_flight_bytes) return error.CertificateFlightTooLarge;
+    }
+
+    // Every entry — not only the leaf — must be a structurally well-formed
+    // X.509 certificate object, validated with the same pure-Zig parser used
+    // for the leaf (no second SPKI/X.509 parser). This deterministically
+    // rejects a malformed intermediate as `MalformedCertificateDer` here,
+    // before `sni_provider.reload` ever sees it, rather than surfacing as an
+    // undifferentiated `ProviderPublicationFailed` from its own (leaf-only)
+    // DER check. Chain-of-trust policy — issuer/subject linkage, CA-bit
+    // enforcement, duplicate/reorder detection — remains outside #392's
+    // scope (no public-PKI path validation); this only proves parse validity.
+    for (chain.certificates[1..]) |cert| {
+        var parsed = pki.x509.Certificate.parse(allocator, cert.der, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.MalformedCertificateDer,
+        };
+        parsed.deinit(allocator);
     }
 }
 
@@ -675,8 +692,11 @@ fn readFileIntoSecret(
     while (true) {
         if (used == secret.bytes.len) {
             // Probe for one extra byte: a file exactly at the limit is fine,
-            // anything longer is rejected without buffering it.
+            // anything longer is rejected without buffering it. The probed
+            // byte is private-key material read into an ordinary stack
+            // buffer, so it is wiped on every exit from this scope.
             var probe: [1]u8 = undefined;
+            defer secrets.secureZero(&probe);
             const extra = std.posix.read(fd, &probe) catch return error.FileNotFound;
             if (extra != 0) return too_large;
             break;
@@ -715,6 +735,17 @@ const test_key_pkcs8_bytes = hexBytes(
 const test_seed_hex = "bfa19b67713278fd5be2639dd1bec0a1cfebae6ef671304f3b2c7df4fd894f23";
 const test_certificate_der: []const u8 = &test_certificate_bytes;
 const test_key_pkcs8_der: []const u8 = &test_key_pkcs8_bytes;
+
+// A genuinely distinct, well-formed Ed25519 certificate (a self-signed CA,
+// CN=tardigrade-appliance-test-ca) — unrelated to `test_certificate_der` and
+// signed by a different key pair. Used as a real second chain entry so
+// "leaf plus intermediate" tests exercise actual per-entry X.509 parsing
+// rather than the leaf certificate concatenated with itself. Matches
+// tests/fixtures/tls/native_ed25519_ca.crt. Test-only material.
+const test_intermediate_bytes = hexBytes(
+    "3082017330820125a00302010202144d6912bb8891217b860072374c89988d7b4f1ea7300506032b657030273125302306035504030c1c746172646967726164652d6170706c69616e63652d746573742d6361301e170d3236303732303032313633315a170d3436303731353032313633315a30273125302306035504030c1c746172646967726164652d6170706c69616e63652d746573742d6361302a300506032b6570032100a8981092bd43b60e31c558261f905d21536fe3697d3c21640b8866c3c7856cfaa3633061301d0603551d0e04160414799aa1f0d9d10847d595a837622ddd18cc107d23301f0603551d23041830168014799aa1f0d9d10847d595a837622ddd18cc107d23300f0603551d130101ff040530030101ff300e0603551d0f0101ff040403020106300506032b657003410079a9f4b24f84c5773c8bc462a900e594b8376b46791854f2e7871e3bdd4d63e428626d34df9fe2d9fc238d943f54701b37abca52e38f7d63409a4c9ba22ed805",
+);
+const test_intermediate_der: []const u8 = &test_intermediate_bytes;
 
 fn pemEncode(allocator: std.mem.Allocator, label: []const u8, der: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
@@ -881,11 +912,17 @@ test "byte and file APIs produce equivalent provider behavior" {
     );
 }
 
-test "leaf plus intermediate chain preserves transmission order" {
+test "leaf plus a genuinely distinct intermediate preserves transmission order" {
     const allocator = testing.allocator;
-    const single = try testCertificatePem(allocator);
-    defer allocator.free(single);
-    const chain_pem = try std.mem.concat(allocator, u8, &.{ single, single });
+    const leaf_pem = try testCertificatePem(allocator);
+    defer allocator.free(leaf_pem);
+    // A real second certificate — a different key pair, different subject,
+    // different signature — not the leaf concatenated with itself. Proves
+    // the intermediate is actually parsed as its own X.509 object rather
+    // than trivially accepted because it happens to equal the leaf.
+    const intermediate_pem = try pemEncode(allocator, "CERTIFICATE", test_intermediate_der);
+    defer allocator.free(intermediate_pem);
+    const chain_pem = try std.mem.concat(allocator, u8, &.{ leaf_pem, intermediate_pem });
     defer allocator.free(chain_pem);
     const key_pem = try testPrivateKeyPem(allocator);
     defer allocator.free(key_pem);
@@ -896,7 +933,58 @@ test "leaf plus intermediate chain preserves transmission order" {
     var exact = testSelection("tardigrade.test", &.{0x0807});
     const selected = try syncSelect(owner.provider(), &exact);
     defer selected.release();
-    try testing.expectEqual(@as(usize, 2), selected.certificateChain().count());
+    const chain = selected.certificateChain();
+    try testing.expectEqual(@as(usize, 2), chain.count());
+    try testing.expectEqualSlices(u8, test_certificate_der, chain.entries[0]);
+    try testing.expectEqualSlices(u8, test_intermediate_der, chain.entries[1]);
+}
+
+test "a structurally malformed intermediate is rejected deterministically, not as a provider-publication failure" {
+    const allocator = testing.allocator;
+    const leaf_pem = try testCertificatePem(allocator);
+    defer allocator.free(leaf_pem);
+    const key_pem = try testPrivateKeyPem(allocator);
+    defer allocator.free(key_pem);
+
+    // Well-formed outer DER SEQUENCE/length (passes pki.pem's structural
+    // check) but garbage TBSCertificate content, so only a real per-entry
+    // X.509 parse — not just DER-shape validation — catches it.
+    var garbage_tbs = test_intermediate_der[0..test_intermediate_der.len].*;
+    // Corrupt bytes inside the TBSCertificate body without touching the
+    // outer SEQUENCE header, so the DER shape itself stays well-formed.
+    for (garbage_tbs[40..80]) |*byte| byte.* ^= 0xff;
+    const malformed_intermediate_pem = try pemEncode(allocator, "CERTIFICATE", &garbage_tbs);
+    defer allocator.free(malformed_intermediate_pem);
+    const chain_pem = try std.mem.concat(allocator, u8, &.{ leaf_pem, malformed_intermediate_pem });
+    defer allocator.free(chain_pem);
+
+    try testing.expectError(
+        error.MalformedCertificateDer,
+        ApplianceCredentials.initFromBytes(allocator, chain_pem, key_pem, test_options),
+    );
+}
+
+test "a reordered chain (intermediate first) fails key/certificate matching, not silent acceptance" {
+    const allocator = testing.allocator;
+    const leaf_pem = try testCertificatePem(allocator);
+    defer allocator.free(leaf_pem);
+    const intermediate_pem = try pemEncode(allocator, "CERTIFICATE", test_intermediate_der);
+    defer allocator.free(intermediate_pem);
+    // Intermediate first, leaf second — violates the documented "leaf
+    // first" contract. #392 does not implement chain-order/path validation,
+    // but the mandatory leaf/key match still fails closed here because
+    // entries[0] is no longer the certificate for the configured key: it is
+    // also Ed25519, so the key-type check passes, but its public key differs
+    // from the one derived from the configured private key.
+    const reordered_pem = try std.mem.concat(allocator, u8, &.{ intermediate_pem, leaf_pem });
+    defer allocator.free(reordered_pem);
+    const key_pem = try testPrivateKeyPem(allocator);
+    defer allocator.free(key_pem);
+
+    try testing.expectError(
+        error.KeyCertificateMismatch,
+        ApplianceCredentials.initFromBytes(allocator, reordered_pem, key_pem, test_options),
+    );
 }
 
 test "certificate contract rejections are deterministic" {

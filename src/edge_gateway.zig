@@ -218,8 +218,12 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
             cfg.tls_key_path,
             .{ .server_name = cfg.tls_server_name },
         ) catch |err| {
+            // Propagate the real typed error (not a synthetic wrapper) so the
+            // caller can classify it exactly like `tardi check` does — every
+            // appliance_credentials.Error class is a deterministic
+            // configuration failure, not an internal error.
             state.logger.err(null, "appliance TLS credential rejected ({s}); refusing to start", .{@errorName(err)});
-            return error.ApplianceCredentialInvalid;
+            return err;
         };
         state.logger.info(null, "appliance TLS identity loaded and validated", .{});
     }
@@ -380,7 +384,6 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         .tls = if (tls_terminator) |*tls| tls else null,
         .native_credentials = if (native_credentials) |*store| store else null,
         .native_tls_provider = native_tls_provider,
-        .appliance_credentials = if (appliance_identity) |*owner| owner else null,
         .session_pool = undefined,
         .event_loop = &event_loop,
         .active = undefined,

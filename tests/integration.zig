@@ -7363,3 +7363,137 @@ test "native TLS listener appliance check command validates credentials without 
     defer allocator.free(unnamed.stderr);
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 2 }, unnamed.term);
 }
+
+test "appliance hot reload rejects turning TLS on for a server that started plaintext" {
+    try requireNativeTlsProfile();
+    const allocator = std.testing.allocator;
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text =
+        \\location = /healthz {
+        \\    return 200 alive;
+        \\}
+        ,
+        // No TLS env at all: the process starts in plaintext, so
+        // `worker_ctx.native_tls_provider`/`ApplianceCredentials` are never
+        // constructed. `TardigradeProcess.start`'s auto-injected
+        // TARDIGRADE_TLS_SERVER_NAME only fires when a TLS cert path is
+        // also present in the environment, so it stays unset here too.
+    });
+    defer tardigrade.stop();
+
+    var before = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/healthz",
+        .body = null,
+        .headers = &.{},
+    });
+    defer before.deinit();
+    try std.testing.expectEqual(@as(u16, 200), before.status_code);
+    try assertContains(before.body, "alive");
+
+    // Rewrite the config file to turn TLS on with a fully valid appliance
+    // identity, then reload. The reload must be rejected (there is no
+    // `ApplianceCredentials` owner to construct or graft onto a running
+    // WorkerContext at runtime) rather than publishing a TLS-marked config
+    // while new connections silently continue over plaintext.
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+    const updated_config = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\tls_cert_path {s};
+        \\tls_key_path {s};
+        \\tls_server_name tardigrade.test;
+    , .{ tls_paths.cert_path, tls_paths.key_path });
+    defer allocator.free(updated_config);
+    try tardigrade.rewriteConfig(updated_config);
+    tardigrade.sendSignal(std.posix.SIG.HUP);
+
+    try waitForLogSubstring(
+        allocator,
+        tardigrade.log_path,
+        "config reload rejected: appliance TLS credential configuration",
+        3_000,
+    );
+
+    // New connections still succeed over plain HTTP: the reload never
+    // took effect, so the listener's behavior is unchanged.
+    var after = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/healthz",
+        .body = null,
+        .headers = &.{},
+    });
+    defer after.deinit();
+    try std.testing.expectEqual(@as(u16, 200), after.status_code);
+    try assertContains(after.body, "alive");
+}
+
+test "appliance hot reload rejects turning TLS off for a server that started with TLS" {
+    try requireNativeTlsProfile();
+    const allocator = std.testing.allocator;
+
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+
+    // The TLS identity is configured entirely through config-file directives
+    // (no TARDIGRADE_TLS_* in the process environment): a live process's
+    // environment cannot be changed by editing the config file, so an
+    // env-seeded identity would make a reload that edits the file a no-op
+    // rather than a genuine test of the rejection path. With no competing
+    // env var, `edge_config.loadFromEnv` reads the file override both at
+    // startup and at reload, so removing the directive is a real change.
+    const initial_config = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\tls_cert_path {s};
+        \\tls_key_path {s};
+        \\tls_server_name tardigrade.test;
+    , .{ tls_paths.cert_path, tls_paths.key_path });
+    defer allocator.free(initial_config);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = initial_config,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+    });
+    defer tardigrade.stop();
+
+    const client = try PureZigTlsClient.createWithServerName(allocator, tardigrade.port, "http/1.1", "tardigrade.test");
+    defer client.destroy();
+    try client.writeAllPlain("GET /healthz HTTP/1.1\r\nHost: tardigrade.test\r\nConnection: close\r\n\r\n");
+    const before = try client.readPlainToEnd(allocator, 64 * 1024, 5_000);
+    defer allocator.free(before);
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(before, "HTTP/1.1 200 OK"));
+    try assertContains(before, "alive");
+
+    // Rewrite the config file dropping every TLS directive, then reload.
+    // This must be rejected — the running provider and identity stay active.
+    const updated_config =
+        \\location = /healthz {
+        \\    return 200 alive;
+        \\}
+    ;
+    try tardigrade.rewriteConfig(updated_config);
+    tardigrade.sendSignal(std.posix.SIG.HUP);
+
+    try waitForLogSubstring(
+        allocator,
+        tardigrade.log_path,
+        "config reload rejected: appliance TLS credential configuration",
+        3_000,
+    );
+
+    // The TLS listener is still there and still authenticates with the
+    // original identity.
+    const second_client = try PureZigTlsClient.createWithServerName(allocator, tardigrade.port, "http/1.1", "tardigrade.test");
+    defer second_client.destroy();
+    try second_client.writeAllPlain("GET /healthz HTTP/1.1\r\nHost: tardigrade.test\r\nConnection: close\r\n\r\n");
+    const after = try second_client.readPlainToEnd(allocator, 64 * 1024, 5_000);
+    defer allocator.free(after);
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(after, "HTTP/1.1 200 OK"));
+    try assertContains(after, "alive");
+}

@@ -2581,15 +2581,36 @@ fn validateTlsServerNamePolicy(cfg: *const EdgeConfig) !void {
             return error.InvalidConfigValue;
         };
     }
-    if (is_appliance_tls_profile and hasTlsFiles(cfg)) {
-        if (cfg.tls_server_name.len == 0) {
-            std.log.err("config validation failed: the appliance TLS profile requires TARDIGRADE_TLS_SERVER_NAME when TLS is enabled", .{});
+    if (!is_appliance_tls_profile) return;
+
+    // Self-contained cert/key cardinality check: the appliance profile must
+    // never treat a cert-only or key-only configuration as "TLS disabled"
+    // and silently fall through to plaintext. This does not rely on
+    // `hasTlsFiles()` (AND semantics: false for either half missing) or on
+    // `validateTlsCertKeyPair` running later in `validate()`.
+    if ((cfg.tls_cert_path.len == 0) != (cfg.tls_key_path.len == 0)) {
+        std.log.err("config validation failed: the appliance TLS profile requires TARDIGRADE_TLS_CERT_PATH and TARDIGRADE_TLS_KEY_PATH to both be set or both be empty", .{});
+        return error.InvalidConfigPath;
+    }
+
+    // Exactly one identity, configured directly: no SNI bundle, and no
+    // per-server-block TLS certificates (even a single "default" block,
+    // which `applyServerBlockTlsConfig` folds into the top-level cert/key
+    // path and would otherwise pass unnoticed).
+    if (cfg.tls_sni_certs.len > 0) {
+        std.log.err("config validation failed: the appliance TLS profile supports exactly one identity; TARDIGRADE_TLS_SNI_CERTS must be empty", .{});
+        return error.InvalidConfigValue;
+    }
+    for (cfg.server_blocks) |block| {
+        if (block.tls_cert_path.len > 0 or block.tls_key_path.len > 0) {
+            std.log.err("config validation failed: the appliance TLS profile does not support per-server-block TLS certificates; configure TARDIGRADE_TLS_CERT_PATH/TARDIGRADE_TLS_KEY_PATH directly", .{});
             return error.InvalidConfigValue;
         }
-        if (cfg.tls_sni_certs.len > 0) {
-            std.log.err("config validation failed: the appliance TLS profile supports exactly one identity; TARDIGRADE_TLS_SNI_CERTS (and per-server-block TLS certificates) must be empty", .{});
-            return error.InvalidConfigValue;
-        }
+    }
+
+    if (hasTlsFiles(cfg) and cfg.tls_server_name.len == 0) {
+        std.log.err("config validation failed: the appliance TLS profile requires TARDIGRADE_TLS_SERVER_NAME when TLS is enabled", .{});
+        return error.InvalidConfigValue;
     }
 }
 
